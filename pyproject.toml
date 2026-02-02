@@ -44,11 +44,17 @@ default = { features = [] }
 
 [tool.pixi.tasks]
 test = { cmd = "cargo test --workspace && test -d tests && python -m pytest tests/ -v || echo 'No Python tests yet'", description = "Run all tests (Rust + Python)" }
+test-rust = { cmd = "cargo test --workspace", description = "Run Rust workspace tests" }
+test-python = { cmd = "test -d tests && python -m pytest tests/ -v || echo 'No Python tests yet'", description = "Run Python tests if present" }
 clippy = { cmd = "cargo clippy --workspace --all-targets --all-features", description = "Run clippy for all Rust crates/targets/features" }
 fmt = { cmd = "cargo fmt --all", description = "Format all Rust crates" }
+fmt-check = { cmd = "cargo fmt --all -- --check", description = "Verify Rust formatting (no changes)" }
 lint = { cmd = "cargo fmt --all && cargo clippy --workspace --all-targets --all-features", description = "Format and clippy all Rust crates/targets/features" }
+check = { cmd = "cargo check --workspace", description = "Type-check all Rust crates" }
+check-all = { cmd = "cargo check --workspace --all-targets --all-features", description = "Type-check all Rust crates/targets/features" }
 build = { cmd = "maturin develop --release --strip", env = { RUSTFLAGS = "-C target-cpu=native" }, description = "Build with highest optimization + editable install" }
 build-debug = { cmd = "maturin develop", description = "Build in debug mode + editable install" }
+py-import = { cmd = "python -c 'import nereids; print(f\"nereids imported: {nereids.__version__}\")'", description = "Quick import smoke test for Python bindings" }
 gui = { cmd = "cargo run -p nereids-gui --release", env = { RUSTFLAGS = "-C target-cpu=native" }, description = "Build and run GUI in release mode" }
 gui-debug = { cmd = "cargo run -p nereids-gui", description = "Build and run GUI in debug mode" }
 docs = { cmd = "cargo doc --workspace --no-deps", description = "Build Rust documentation" }

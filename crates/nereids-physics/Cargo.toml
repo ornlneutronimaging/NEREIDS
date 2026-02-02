@@ -1,0 +1,9 @@
+[package]
+name = "nereids-physics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Physics kernels for NEREIDS (stub)."
+
+[dependencies]
+nereids-core = { path = "../nereids-core" }

@@ -1,0 +1,18 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "nereids"
+version = "0.1.0"
+requires-python = ">=3.11"
+description = "Python bindings for NEREIDS (stub)."
+classifiers = [
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: Implementation :: CPython",
+]
+dependencies = ["numpy"]
+
+[tool.maturin]
+module-name = "nereids"
+features = ["pyo3/extension-module"]

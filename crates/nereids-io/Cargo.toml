@@ -1,0 +1,8 @@
+[package]
+name = "nereids-io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NeXus/HDF5 I/O for NEREIDS (stub)."
+
+[dependencies]

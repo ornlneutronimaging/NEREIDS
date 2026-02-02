@@ -1,0 +1,13 @@
+[package]
+name = "nereids"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Python bindings for NEREIDS (stub)."
+
+[lib]
+name = "nereids"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.28", features = ["extension-module"] }
