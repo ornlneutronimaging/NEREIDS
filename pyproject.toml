@@ -1,0 +1,56 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "nereids"
+version = "0.1.0"
+requires-python = ">=3.11"
+description = "NEREIDS (NEutron REsonance Imaging Diagnostic Suite) - neutron resonance imaging toolkit."
+classifiers = [
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: Implementation :: CPython",
+]
+dependencies = ["numpy"]
+
+[tool.maturin]
+manifest-path = "bindings/python/Cargo.toml"
+features = ["pyo3/extension-module"]
+module-name = "nereids"
+
+[tool.pixi.workspace]
+name = "nereids"
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "linux-64"]
+
+[tool.pixi.dependencies]
+python = ">=3.11,<3.14"
+numpy = "*"
+pyarrow = "*"
+h5py = "*"
+maturin = "*"
+rust = "*"
+pip = "*"
+cmake = "*"
+pre-commit = "*"
+taplo = "*"
+pytest = "*"
+jupyterlab = "*"
+ipykernel = "*"
+matplotlib = "*"
+
+[tool.pixi.environments]
+default = { features = [] }
+
+[tool.pixi.tasks]
+test = { cmd = "cargo test --workspace && test -d tests && python -m pytest tests/ -v || echo 'No Python tests yet'", description = "Run all tests (Rust + Python)" }
+clippy = { cmd = "cargo clippy --workspace --all-targets --all-features", description = "Run clippy for all Rust crates/targets/features" }
+fmt = { cmd = "cargo fmt --all", description = "Format all Rust crates" }
+lint = { cmd = "cargo fmt --all && cargo clippy --workspace --all-targets --all-features", description = "Format and clippy all Rust crates/targets/features" }
+build = { cmd = "maturin develop --release --strip", env = { RUSTFLAGS = "-C target-cpu=native" }, description = "Build with highest optimization + editable install" }
+build-debug = { cmd = "maturin develop", description = "Build in debug mode + editable install" }
+gui = { cmd = "cargo run -p nereids-gui --release", env = { RUSTFLAGS = "-C target-cpu=native" }, description = "Build and run GUI in release mode" }
+gui-debug = { cmd = "cargo run -p nereids-gui", description = "Build and run GUI in debug mode" }
+docs = { cmd = "cargo doc --workspace --no-deps", description = "Build Rust documentation" }
+clean = { cmd = "cargo clean && rm -rf target/ dist/ .pytest_cache __pycache__ && find . -name '*.egg-info' -type d -exec rm -rf '{}' + 2>/dev/null || true", description = "Remove all build artifacts" }
+notebook = { cmd = "jupyter lab", description = "Launch JupyterLab" }
