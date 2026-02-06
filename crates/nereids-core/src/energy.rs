@@ -1,6 +1,7 @@
 //! Energy grid representation with TOF conversion.
 
 use crate::constants::TOF_TO_ENERGY_FACTOR;
+use crate::error::PhysicsError;
 
 /// An energy grid in eV, stored as a sorted `Vec<f64>`.
 #[derive(Debug, Clone)]
@@ -18,22 +19,40 @@ impl EnergyGrid {
     /// Create an energy grid from time-of-flight values.
     ///
     /// Converts TOF (in microseconds) to energy (in eV) using:
-    /// `E = TOF_TO_ENERGY_FACTOR / (flight_path_m^2 * tof_us^2)`
+    /// `E = TOF_TO_ENERGY_FACTOR * flight_path_m^2 / tof_us^2`
     ///
     /// The resulting energies are sorted in ascending order (TOF is inverted
     /// relative to energy).
-    pub fn from_tof(tof_us: &[f64], flight_path_m: f64, tof_offset_us: f64) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns `PhysicsError::InvalidParameter` if `flight_path_m` is not
+    /// positive or if any corrected TOF value (`tof - tof_offset_us`) is not
+    /// positive.
+    pub fn from_tof(
+        tof_us: &[f64],
+        flight_path_m: f64,
+        tof_offset_us: f64,
+    ) -> Result<Self, PhysicsError> {
+        if flight_path_m <= 0.0 {
+            return Err(PhysicsError::InvalidParameter(format!(
+                "flight_path_m must be positive, got {flight_path_m}"
+            )));
+        }
         let l_sq = flight_path_m * flight_path_m;
-        let mut values: Vec<f64> = tof_us
-            .iter()
-            .map(|&t| {
-                let t_corrected = t - tof_offset_us;
-                TOF_TO_ENERGY_FACTOR / (l_sq * t_corrected * t_corrected)
-            })
-            .collect();
+        let mut values: Vec<f64> = Vec::with_capacity(tof_us.len());
+        for &t in tof_us {
+            let t_corrected = t - tof_offset_us;
+            if t_corrected <= 0.0 {
+                return Err(PhysicsError::InvalidParameter(format!(
+                    "corrected TOF must be positive, got {t_corrected} (tof={t}, offset={tof_offset_us})"
+                )));
+            }
+            values.push(TOF_TO_ENERGY_FACTOR * l_sq / (t_corrected * t_corrected));
+        }
         // Energy is inversely proportional to TOF^2, so reverse to get ascending order.
         values.reverse();
-        Self { values }
+        Ok(Self { values })
     }
 
     /// Number of energy points.
