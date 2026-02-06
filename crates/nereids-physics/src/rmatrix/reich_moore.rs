@@ -119,15 +119,19 @@ pub fn reich_moore_cross_sections(
 
     // Special case: if there are no resonances, return potential-only scattering when requested.
     if resonances.is_empty() {
-        let g_j = (2.0 * spin_group.j + 1.0) / (2.0 * (2.0 * config.target_spin + 1.0));
-        let k_sq = k_inv_fm * k_inv_fm;
-        let norm = std::f64::consts::PI / k_sq * g_j * 0.01; // π·g_J / K² in barns
-
-        if !apply_potential_correction {
+        if !config.include_potential {
             return Ok(CrossSections::default());
         }
 
-        let sigma_el = norm * 2.0 * (1.0 - cos_2phi);
+        let g_j = (2.0 * spin_group.j + 1.0) / (2.0 * (2.0 * config.target_spin + 1.0));
+        let k_sq = k_inv_fm * k_inv_fm;
+        let norm = std::f64::consts::PI / k_sq * g_j * 0.01; // π·g_J / K² in barns
+        let sigma_el_baseline = norm * 2.0 * (1.0 - cos_2phi);
+        let sigma_el = if apply_potential_correction {
+            sigma_el_baseline + norm * 2.0 * (1.0 - cos_2phi)
+        } else {
+            sigma_el_baseline
+        };
         return Ok(CrossSections {
             elastic: sigma_el,
             capture: 0.0,
@@ -519,11 +523,11 @@ mod tests {
         };
 
         let result = reich_moore_cross_sections(1.0e6, &[], &spin_group, &config).unwrap();
-        // For s-wave boundary J groups, SAMMY does not apply the extra potential term.
-        assert_eq!(result.elastic, 0.0);
+        // Boundary groups still include the hard-sphere baseline term.
+        assert!(result.elastic > 0.0);
         assert_eq!(result.capture, 0.0);
         assert_eq!(result.fission, 0.0);
-        assert_eq!(result.total, 0.0);
+        assert!((result.total - result.elastic).abs() < 1e-14);
     }
 
     #[test]

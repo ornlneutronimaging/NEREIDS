@@ -15,9 +15,9 @@ fn approx_eq(a: f64, b: f64, tol: f64) -> bool {
 ///
 /// This relation is only valid for s-wave (`l=0`) entrance channels.
 /// For ambiguous single-J isotopes, choose the smaller physically valid solution.
-/// If no s-wave spin groups are present, return 0.0 rather than inferring from
+/// If no s-wave spin groups are present, fail rather than inferring from
 /// non-s-wave J values.
-fn infer_target_spin(isotope: &IsotopeParams) -> f64 {
+fn infer_target_spin(isotope: &IsotopeParams) -> Result<f64, PhysicsError> {
     let s_wave_groups: Vec<_> = isotope
         .spin_groups
         .iter()
@@ -25,7 +25,10 @@ fn infer_target_spin(isotope: &IsotopeParams) -> f64 {
         .collect();
 
     let Some(first_group) = s_wave_groups.first() else {
-        return 0.0;
+        return Err(PhysicsError::InvalidParameter(format!(
+            "cannot infer target spin for isotope '{}' without at least one s-wave (l=0) spin group",
+            isotope.name
+        )));
     };
 
     let tol = 1e-8;
@@ -48,7 +51,12 @@ fn infer_target_spin(isotope: &IsotopeParams) -> f64 {
             Some(curr) if curr <= v => Some(curr),
             _ => Some(v),
         })
-        .unwrap_or(0.0)
+        .ok_or_else(|| {
+            PhysicsError::InvalidParameter(format!(
+                "inconsistent s-wave spin-group J values for isotope '{}'; cannot infer target spin",
+                isotope.name
+            ))
+        })
 }
 
 /// Compute 0K Reich-Moore cross sections over an energy grid.
@@ -133,7 +141,7 @@ fn compute_isotope_cross_sections(
     let n_energies = energy_grid.len();
     let mut cross_sections = vec![CrossSections::default(); n_energies];
 
-    let target_spin = infer_target_spin(isotope);
+    let target_spin = infer_target_spin(isotope)?;
 
     // Create R-matrix configuration
     let rmatrix_config = RMatrixConfig {
@@ -386,11 +394,12 @@ mod tests {
             ],
         };
 
-        assert!((infer_target_spin(&isotope) - 0.0).abs() < 1e-12);
+        let inferred = infer_target_spin(&isotope).unwrap();
+        assert!((inferred - 0.0).abs() < 1e-12);
     }
 
     #[test]
-    fn test_infer_target_spin_no_s_wave_defaults_zero() {
+    fn test_infer_target_spin_no_s_wave_returns_error() {
         let isotope = IsotopeParams {
             name: "Infer-None".to_string(),
             awr: 10.0,
@@ -409,6 +418,85 @@ mod tests {
             }],
         };
 
-        assert_eq!(infer_target_spin(&isotope), 0.0);
+        assert!(infer_target_spin(&isotope).is_err());
+    }
+
+    #[test]
+    fn test_compute_0k_no_s_wave_spin_groups_returns_error() {
+        let energy_grid = EnergyGrid::new(vec![1.0]).unwrap();
+
+        let isotope = IsotopeParams {
+            name: "No-S-wave".to_string(),
+            awr: 10.0,
+            abundance: Parameter::fixed(1.0),
+            thickness_cm: 0.1,
+            number_density: 1e-3,
+            spin_groups: vec![SpinGroup {
+                j: 1.5,
+                channels: vec![Channel {
+                    l: 1,
+                    channel_spin: 0.5,
+                    radius: 2.908,
+                    effective_radius: 2.908,
+                }],
+                resonances: vec![],
+            }],
+        };
+
+        let params = RMatrixParameters {
+            isotopes: vec![isotope],
+        };
+        let config = ForwardModelConfig::default();
+
+        let result = compute_0k_cross_sections(&energy_grid, &params, &config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_infer_target_spin_inconsistent_s_wave_returns_error() {
+        let isotope = IsotopeParams {
+            name: "Inconsistent-S-wave".to_string(),
+            awr: 10.0,
+            abundance: Parameter::fixed(1.0),
+            thickness_cm: 0.1,
+            number_density: 1e-3,
+            spin_groups: vec![
+                // Implies I in {0.0, 1.0}
+                SpinGroup {
+                    j: 0.5,
+                    channels: vec![Channel {
+                        l: 0,
+                        channel_spin: 0.5,
+                        radius: 2.908,
+                        effective_radius: 2.908,
+                    }],
+                    resonances: vec![],
+                },
+                // Implies I in {1.0, 2.0}
+                SpinGroup {
+                    j: 1.5,
+                    channels: vec![Channel {
+                        l: 0,
+                        channel_spin: 0.5,
+                        radius: 2.908,
+                        effective_radius: 2.908,
+                    }],
+                    resonances: vec![],
+                },
+                // Implies I in {3.0, 4.0}; no overlap with above sets.
+                SpinGroup {
+                    j: 3.5,
+                    channels: vec![Channel {
+                        l: 0,
+                        channel_spin: 0.5,
+                        radius: 2.908,
+                        effective_radius: 2.908,
+                    }],
+                    resonances: vec![],
+                },
+            ],
+        };
+
+        assert!(infer_target_spin(&isotope).is_err());
     }
 }
