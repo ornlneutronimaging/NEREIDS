@@ -150,13 +150,6 @@ fn test_ex003c_capture() {
     // Extract capture cross section
     let sigma_capture: Vec<f64> = cross_sections.iter().map(|cs| cs.capture).collect();
 
-    // Debug: print first 10 values
-    println!("First 10 computed capture cross sections:");
-    for (i, &sigma) in sigma_capture.iter().take(10).enumerate() {
-        println!("  [{}] E={:.6e} eV: σ={:.6e} barns (expected {:.6e})",
-                 i, exp_data.energies[i], sigma, exp_data.data[i]);
-    }
-
     // Compute chi-squared
     let chi2 = compute_chi_squared(&sigma_capture, &exp_data.data, &exp_data.uncertainties);
 

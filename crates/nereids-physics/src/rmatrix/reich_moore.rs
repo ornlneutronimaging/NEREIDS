@@ -112,7 +112,6 @@ pub fn reich_moore_cross_sections(
     if resonances.is_empty() {
         // With no resonances, R = 0, so U = exp(2iφ) (hard-sphere scattering only)
         // For now, return zero cross sections (potential scattering is a small correction)
-        eprintln!("WARNING: No resonances at E={} eV", energy);
         return Ok(CrossSections::default());
     }
 
@@ -121,8 +120,13 @@ pub fn reich_moore_cross_sections(
 
     // Step 3: Construct R-matrix (3×3 complex symmetric)
     // R = R_real + i*R_imag where we represent as two separate 3×3 matrices
+    // Initialize with identity on diagonal (matches SAMMY dopush1.f90 line 83)
     let mut r_mat = [[0.0_f64; 3]; 3]; // Real part
     let mut s_mat = [[0.0_f64; 3]; 3]; // Imaginary part (with sign convention)
+
+    for i in 0..3 {
+        r_mat[i][i] = 1.0; // Identity diagonal prevents singularity when Γ_fa = Γ_fb
+    }
 
     // Accumulate contributions from all resonances
     for res in resonances {
@@ -202,16 +206,6 @@ pub fn reich_moore_cross_sections(
     // Special case: if no fission channels, reduce to 1×1
     let has_fission = resonances.iter().any(|r| r.fission.is_some());
 
-    // Debug: print R-matrix for first energy point
-    if energy < 0.00002 {
-        eprintln!("DEBUG at E={:.6e} eV:", energy);
-        eprintln!("  has_fission = {}", has_fission);
-        eprintln!("  R-matrix:");
-        for i in 0..3 {
-            eprintln!("    [{:.6e}, {:.6e}, {:.6e}]", r_mat[i][0], r_mat[i][1], r_mat[i][2]);
-        }
-    }
-
     let (ri_mat, si_mat) = if !has_fission {
         // 1×1 inversion: (R + iS)^(-1) = (R - iS) / (R² + S²)
         let r = r_mat[0][0];
@@ -220,7 +214,6 @@ pub fn reich_moore_cross_sections(
 
         if denom < 1e-100 {
             // R-matrix is effectively zero - treat like no resonances (potential scattering only)
-            eprintln!("WARNING: Singular 1×1 R-matrix at E={} eV (r={}, s={})", energy, r, s);
             return Ok(CrossSections::default());
         }
 
@@ -231,14 +224,7 @@ pub fn reich_moore_cross_sections(
         (ri, si)
     } else {
         // Full 3×3 inversion using Frobenius-Schur
-        match frobenius_schur_invert_3x3(r_mat, s_mat) {
-            Ok(result) => result,
-            Err(e) => {
-                // Matrix is singular - treat like no resonances
-                eprintln!("WARNING: Singular 3×3 R-matrix at E={} eV: {}", energy, e);
-                return Ok(CrossSections::default());
-            }
-        }
+        frobenius_schur_invert_3x3(r_mat, s_mat)?
     };
 
     // Step 5: Extract S-matrix element U_11
