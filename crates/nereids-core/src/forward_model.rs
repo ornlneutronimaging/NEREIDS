@@ -11,6 +11,8 @@ pub struct ForwardModelConfig {
     pub temperature_k: f64,
     /// Normalization factor (multiplicative). Default 1.0.
     pub normalization: f64,
+    /// Whether to include hard-sphere/potential scattering in 0K cross sections.
+    pub include_potential_scattering: bool,
     /// Whether to apply self-shielding corrections.
     pub self_shielding: bool,
 }
@@ -20,6 +22,7 @@ impl Default for ForwardModelConfig {
         Self {
             temperature_k: 0.0,
             normalization: 1.0,
+            include_potential_scattering: false,
             self_shielding: false,
         }
     }

@@ -1,0 +1,14 @@
+Example # 003c
+element       10.000
+twenty
+do not solve bayes equations
+broadening is not wanted
+generate odf file automatically
+
+    2.9080
+capture cross section
+  1      1    2  0.5       1.0   .0
+    1    1    0    0       0.5
+    2    0    0    0       0.5
+    3    0    0    0       0.5
+

@@ -66,6 +66,7 @@ pub struct SpinGroup {
     /// Total angular momentum J.
     pub j: f64,
     /// Reaction channels for this spin group.
+    /// The first channel (`channels[0]`) is the incident neutron entrance channel.
     pub channels: Vec<Channel>,
     /// Resonances belonging to this spin group.
     pub resonances: Vec<Resonance>,
@@ -76,7 +77,7 @@ pub struct SpinGroup {
 pub struct IsotopeParams {
     /// Isotope name (e.g., "Fe-56", "U-235").
     pub name: String,
-    /// Atomic weight ratio (mass relative to neutron).
+    /// Target mass in amu (SAMMY `DefTargetMass` convention).
     pub awr: f64,
     /// Abundance (fraction, 0.0 to 1.0). Primary fit parameter in Mode 1.
     pub abundance: Parameter,
