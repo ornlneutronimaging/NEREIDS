@@ -13,6 +13,35 @@ use nereids_core::{
     ResolutionFunction,
 };
 
+/// Count the total number of free (vary=true) parameters in the R-matrix problem.
+fn count_free_params(params: &RMatrixParameters) -> usize {
+    let mut count = 0;
+    for isotope in &params.isotopes {
+        for sg in &isotope.spin_groups {
+            for res in &sg.resonances {
+                if res.energy.vary {
+                    count += 1;
+                }
+                if res.gamma_n.vary {
+                    count += 1;
+                }
+                if res.gamma_g.vary {
+                    count += 1;
+                }
+                if let Some(ref f) = res.fission {
+                    if f.gamma_f1.vary {
+                        count += 1;
+                    }
+                    if f.gamma_f2.vary {
+                        count += 1;
+                    }
+                }
+            }
+        }
+    }
+    count
+}
+
 /// The default forward model that composes all physics pipeline stages.
 pub struct DefaultForwardModel {
     /// Optional resolution function. If `None`, no resolution broadening is applied.
@@ -38,9 +67,10 @@ impl ForwardModel for DefaultForwardModel {
         config: &ForwardModelConfig,
     ) -> Result<(Vec<f64>, Vec<Vec<f64>>), PhysicsError> {
         let t = self.transmission(energy, params, config)?;
-        // Stub: return zero Jacobian.
-        let n_params = params.isotopes.len();
-        let jacobian = vec![vec![0.0; energy.len()]; n_params];
+        // Count free parameters across all isotopes and spin groups.
+        let n_params = count_free_params(params);
+        // Stub: return zero Jacobian with shape [n_energy][n_params].
+        let jacobian = vec![vec![0.0; n_params]; energy.len()];
         Ok((t, jacobian))
     }
 }
