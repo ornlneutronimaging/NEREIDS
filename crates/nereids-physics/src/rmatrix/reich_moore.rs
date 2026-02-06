@@ -3,7 +3,7 @@
 //! Teacher reference: `sammy/src/clm/dopush1.f90`
 
 use nereids_core::error::PhysicsError;
-use nereids_core::nuclear::{Resonance, SpinGroup};
+use nereids_core::nuclear::{Channel, Resonance, SpinGroup};
 
 use super::penetration::{hard_sphere_phase, penetration_shift_factors};
 
@@ -94,13 +94,8 @@ pub fn reich_moore_cross_sections(
     let a_ratio = config.awr / (config.awr + ANEUTR_AMU);
     let k_inv_fm = TWOMHB * a_ratio * energy.sqrt();
 
-    // Get first channel (entrance channel for neutrons)
-    if spin_group.channels.is_empty() {
-        return Err(PhysicsError::InvalidParameter(
-            "spin group must have at least one channel".into(),
-        ));
-    }
-    let entrance_channel = &spin_group.channels[0];
+    // Select entrance channel for neutron penetrability/phase terms.
+    let entrance_channel = select_entrance_channel(spin_group)?;
     // Channel radii in our model are already in SAMMY working units (fm).
     let ap_penetration = entrance_channel.radius;
     let ap_phase = entrance_channel.effective_radius;
@@ -109,7 +104,11 @@ pub fn reich_moore_cross_sections(
     let rho_e = k_inv_fm * ap_penetration; // dimensionless ρ = ka (penetration radius)
     let rho_phase_e = k_inv_fm * ap_phase; // phase radius for hard-sphere phase
     let (p_e, _s_e) = penetration_shift_factors(entrance_channel.l, rho_e)?;
-    let (cos_2phi, sin_2phi) = hard_sphere_phase(entrance_channel.l, rho_phase_e)?;
+    let (cos_2phi, sin_2phi) = if config.include_potential {
+        hard_sphere_phase(entrance_channel.l, rho_phase_e)?
+    } else {
+        (1.0, 0.0)
+    };
     let apply_potential_correction = config.include_potential
         && sammy_potential_correction_applies(
             spin_group.j,
@@ -372,6 +371,51 @@ fn sammy_potential_correction_applies(spin_j: f64, target_spin: f64, l: u32) -> 
     jj > jjl && jj < numj
 }
 
+/// Select the neutron entrance channel in an order-independent way.
+///
+/// Current data model does not label channel type explicitly, so we choose the
+/// lowest-l channel and require tied candidates to be physically equivalent.
+fn select_entrance_channel(spin_group: &SpinGroup) -> Result<&Channel, PhysicsError> {
+    if spin_group.channels.is_empty() {
+        return Err(PhysicsError::InvalidParameter(
+            "spin group must have at least one channel".into(),
+        ));
+    }
+
+    let min_l = spin_group
+        .channels
+        .iter()
+        .map(|ch| ch.l)
+        .min()
+        .expect("non-empty channels");
+    let candidates: Vec<&Channel> = spin_group
+        .channels
+        .iter()
+        .filter(|ch| ch.l == min_l)
+        .collect();
+
+    if candidates.len() == 1 {
+        return Ok(candidates[0]);
+    }
+
+    let first = candidates[0];
+    let tol = 1e-12;
+    let equivalent = candidates.iter().skip(1).all(|ch| {
+        (ch.channel_spin - first.channel_spin).abs() <= tol
+            && (ch.radius - first.radius).abs() <= tol
+            && (ch.effective_radius - first.effective_radius).abs() <= tol
+    });
+
+    if equivalent {
+        Ok(first)
+    } else {
+        Err(PhysicsError::InvalidParameter(
+            "ambiguous entrance channel: multiple lowest-l channels with differing parameters"
+                .into(),
+        ))
+    }
+}
+
 /// Complex 3x3 inversion that mirrors SAMMY `Frobns` + `Thrinv` in `dopush1.f90`.
 fn sammy_frobns_invert_3x3(
     r: [[f64; 3]; 3],
@@ -592,6 +636,123 @@ mod tests {
         assert!(sammy_potential_correction_applies(1.5, 1.0, 1));
         // p-wave (l=1), I=1 => J=2.5 max boundary; no correction.
         assert!(!sammy_potential_correction_applies(2.5, 1.0, 1));
+    }
+
+    #[test]
+    fn test_select_entrance_channel_is_order_independent() {
+        let channels_a = vec![
+            Channel {
+                l: 0,
+                channel_spin: 0.5,
+                radius: 2.908,
+                effective_radius: 2.908,
+            },
+            Channel {
+                l: 1,
+                channel_spin: 0.5,
+                radius: 2.908,
+                effective_radius: 2.908,
+            },
+        ];
+        let channels_b = vec![channels_a[1].clone(), channels_a[0].clone()];
+
+        let resonance = Resonance {
+            energy: Parameter::fixed(10.0),
+            gamma_n: Parameter::fixed(1e-3),
+            gamma_g: Parameter::fixed(1e-3),
+            fission: None,
+        };
+
+        let sg_a = SpinGroup {
+            j: 0.5,
+            channels: channels_a,
+            resonances: vec![resonance.clone()],
+        };
+        let sg_b = SpinGroup {
+            j: 0.5,
+            channels: channels_b,
+            resonances: vec![resonance],
+        };
+        let config = RMatrixConfig {
+            target_spin: 0.0,
+            awr: 10.0,
+            include_potential: false,
+        };
+
+        let a = reich_moore_cross_sections(10.0, &sg_a.resonances, &sg_a, &config).unwrap();
+        let b = reich_moore_cross_sections(10.0, &sg_b.resonances, &sg_b, &config).unwrap();
+        assert!((a.elastic - b.elastic).abs() < 1e-12);
+        assert!((a.capture - b.capture).abs() < 1e-12);
+        assert!((a.total - b.total).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_select_entrance_channel_ambiguous_lowest_l_errors() {
+        let sg = SpinGroup {
+            j: 0.5,
+            channels: vec![
+                Channel {
+                    l: 0,
+                    channel_spin: 0.5,
+                    radius: 2.0,
+                    effective_radius: 2.0,
+                },
+                Channel {
+                    l: 0,
+                    channel_spin: 0.5,
+                    radius: 3.0,
+                    effective_radius: 3.0,
+                },
+            ],
+            resonances: vec![Resonance {
+                energy: Parameter::fixed(10.0),
+                gamma_n: Parameter::fixed(1e-3),
+                gamma_g: Parameter::fixed(1e-3),
+                fission: None,
+            }],
+        };
+        let config = RMatrixConfig {
+            target_spin: 0.0,
+            awr: 10.0,
+            include_potential: false,
+        };
+
+        let result = reich_moore_cross_sections(10.0, &sg.resonances, &sg, &config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resonant_path_respects_include_potential_toggle() {
+        let sg = SpinGroup {
+            j: 0.5,
+            channels: vec![Channel {
+                l: 0,
+                channel_spin: 0.5,
+                radius: 2.908,
+                effective_radius: 2.908,
+            }],
+            resonances: vec![Resonance {
+                energy: Parameter::fixed(10.0),
+                gamma_n: Parameter::fixed(1e-3),
+                gamma_g: Parameter::fixed(1e-3),
+                fission: None,
+            }],
+        };
+        let config_off = RMatrixConfig {
+            target_spin: 0.0,
+            awr: 10.0,
+            include_potential: false,
+        };
+        let config_on = RMatrixConfig {
+            target_spin: 0.0,
+            awr: 10.0,
+            include_potential: true,
+        };
+
+        let off = reich_moore_cross_sections(1.0e6, &sg.resonances, &sg, &config_off).unwrap();
+        let on = reich_moore_cross_sections(1.0e6, &sg.resonances, &sg, &config_on).unwrap();
+        assert!((off.elastic - on.elastic).abs() > 1e-12);
+        assert!((off.total - on.total).abs() > 1e-12);
     }
 
     #[test]

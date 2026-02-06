@@ -40,6 +40,13 @@ fn relative_error(computed: f64, expected: f64, cutoff: f64) -> f64 {
 const CHI2_ABS_CUTOFF: f64 = 1e-4;
 const CHI2_TOLERANCE: f64 = 5e-4;
 
+fn ex003_config() -> ForwardModelConfig {
+    ForwardModelConfig {
+        include_potential_scattering: true,
+        ..ForwardModelConfig::default()
+    }
+}
+
 /// Build R-matrix parameters from parsed resonances for ex003
 fn build_ex003_params(resonances: Vec<nereids_core::nuclear::Resonance>) -> RMatrixParameters {
     // ex003 parameters (from documentation)
@@ -105,7 +112,7 @@ fn test_ex003a_absorption() {
         EnergyGrid::new(exp_data.energies.clone()).expect("Failed to create energy grid");
 
     // Compute cross sections
-    let config = ForwardModelConfig::default();
+    let config = ex003_config();
     let cross_sections = compute_0k_cross_sections(&energy_grid, &params, &config)
         .expect("Failed to compute cross sections");
 
@@ -163,7 +170,7 @@ fn test_ex003c_capture() {
         EnergyGrid::new(exp_data.energies.clone()).expect("Failed to create energy grid");
 
     // Compute cross sections
-    let config = ForwardModelConfig::default();
+    let config = ex003_config();
     let cross_sections = compute_0k_cross_sections(&energy_grid, &params, &config)
         .expect("Failed to compute cross sections");
 
@@ -218,7 +225,7 @@ fn test_ex003e_elastic() {
         EnergyGrid::new(exp_data.energies.clone()).expect("Failed to create energy grid");
 
     // Compute cross sections
-    let config = ForwardModelConfig::default();
+    let config = ex003_config();
     let cross_sections = compute_0k_cross_sections(&energy_grid, &params, &config)
         .expect("Failed to compute cross sections");
 
@@ -273,7 +280,7 @@ fn test_ex003f_fission() {
         EnergyGrid::new(exp_data.energies.clone()).expect("Failed to create energy grid");
 
     // Compute cross sections
-    let config = ForwardModelConfig::default();
+    let config = ex003_config();
     let cross_sections = compute_0k_cross_sections(&energy_grid, &params, &config)
         .expect("Failed to compute cross sections");
 
@@ -328,7 +335,7 @@ fn test_ex003x_transmission() {
         EnergyGrid::new(exp_data.energies.clone()).expect("Failed to create energy grid");
 
     // Compute cross sections
-    let config = ForwardModelConfig::default();
+    let config = ex003_config();
     let cross_sections = compute_0k_cross_sections(&energy_grid, &params, &config)
         .expect("Failed to compute cross sections");
 
@@ -388,7 +395,7 @@ fn test_ex003t_total() {
         EnergyGrid::new(exp_data.energies.clone()).expect("Failed to create energy grid");
 
     // Compute cross sections
-    let config = ForwardModelConfig::default();
+    let config = ex003_config();
     let cross_sections = compute_0k_cross_sections(&energy_grid, &params, &config)
         .expect("Failed to compute cross sections");
 

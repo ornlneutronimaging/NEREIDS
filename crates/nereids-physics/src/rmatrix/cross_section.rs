@@ -21,7 +21,7 @@ fn infer_target_spin(isotope: &IsotopeParams) -> Result<f64, PhysicsError> {
     let s_wave_groups: Vec<_> = isotope
         .spin_groups
         .iter()
-        .filter(|sg| sg.channels.first().map(|ch| ch.l == 0).unwrap_or(false))
+        .filter(|sg| sg.channels.iter().any(|ch| ch.l == 0))
         .collect();
 
     let Some(first_group) = s_wave_groups.first() else {
@@ -392,6 +392,38 @@ mod tests {
                     resonances: vec![],
                 },
             ],
+        };
+
+        let inferred = infer_target_spin(&isotope).unwrap();
+        assert!((inferred - 0.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_infer_target_spin_detects_s_wave_when_not_first_channel() {
+        let isotope = IsotopeParams {
+            name: "Infer-S-wave-reordered".to_string(),
+            awr: 10.0,
+            abundance: Parameter::fixed(1.0),
+            thickness_cm: 0.1,
+            number_density: 1e-3,
+            spin_groups: vec![SpinGroup {
+                j: 0.5,
+                channels: vec![
+                    Channel {
+                        l: 1,
+                        channel_spin: 0.5,
+                        radius: 2.908,
+                        effective_radius: 2.908,
+                    },
+                    Channel {
+                        l: 0,
+                        channel_spin: 0.5,
+                        radius: 2.908,
+                        effective_radius: 2.908,
+                    },
+                ],
+                resonances: vec![],
+            }],
         };
 
         let inferred = infer_target_spin(&isotope).unwrap();
