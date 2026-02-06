@@ -58,9 +58,9 @@ pub struct RMatrixConfig {
 /// 3. Construct 3×3 complex R-matrix (real R and imaginary S parts)
 /// 4. Accumulate contributions from all resonances
 /// 5. Invert complex matrix using Frobenius-Schur method
-/// 6. Extract S-matrix element U_11
-/// 7. Compute cross sections from U_11
-/// 8. Apply statistical weight G_J = (2J+1)/(2I+1)
+/// 6. Extract S-matrix element `U_11`
+/// 7. Compute cross sections from `U_11`
+/// 8. Apply statistical weight `G_J` = (2J+1)/(2I+1)
 /// 9. Add potential scattering if requested
 ///
 /// # References
@@ -88,8 +88,8 @@ pub fn reich_moore_cross_sections(
         )));
     }
     const TWOMHB: f64 = 2.196_807_132_5e-4; // 1/(fm*sqrt(eV)); SAMMY mmas7.f90 (Kvendf=2)
-    // SAMMY constants use neutron mass in amu (Aneutr), so the reduced-mass
-    // factor is A / (A + m_n) with m_n ~= 1.008664904.
+                                            // SAMMY constants use neutron mass in amu (Aneutr), so the reduced-mass
+                                            // factor is A / (A + m_n) with m_n ~= 1.008664904.
     const ANEUTR_AMU: f64 = 1.008_664_904;
     let a_ratio = config.awr / (config.awr + ANEUTR_AMU);
     let k_inv_fm = TWOMHB * a_ratio * energy.sqrt();
@@ -102,17 +102,32 @@ pub fn reich_moore_cross_sections(
     }
     let entrance_channel = &spin_group.channels[0];
     // Channel radii in our model are already in SAMMY working units (fm).
-    let ap = entrance_channel.radius;
+    let ap_penetration = entrance_channel.radius;
+    let ap_phase = entrance_channel.effective_radius;
 
     // Step 2: Compute penetration factors at energy E and at resonance energy E_r
-    let rho_e = k_inv_fm * ap; // dimensionless ρ = ka
+    let rho_e = k_inv_fm * ap_penetration; // dimensionless ρ = ka (penetration radius)
+    let rho_phase_e = k_inv_fm * ap_phase; // phase radius for hard-sphere phase
     let (p_e, _s_e) = penetration_shift_factors(entrance_channel.l, rho_e)?;
+    let (cos_2phi, sin_2phi) = hard_sphere_phase(entrance_channel.l, rho_phase_e)?;
 
-    // Special case: if there are no resonances, return only potential scattering
+    // Special case: if there are no resonances, return potential-only scattering when requested.
     if resonances.is_empty() {
-        // With no resonances, R = 0, so U = exp(2iφ) (hard-sphere scattering only)
-        // For now, return zero cross sections (potential scattering is a small correction)
-        return Ok(CrossSections::default());
+        let g_j = (2.0 * spin_group.j + 1.0) / (2.0 * (2.0 * config.target_spin + 1.0));
+        let k_sq = k_inv_fm * k_inv_fm;
+        let norm = std::f64::consts::PI / k_sq * g_j * 0.01; // π·g_J / K² in barns
+
+        if !config.include_potential {
+            return Ok(CrossSections::default());
+        }
+
+        let sigma_el = norm * 2.0 * (1.0 - cos_2phi);
+        return Ok(CrossSections {
+            elastic: sigma_el,
+            capture: 0.0,
+            fission: 0.0,
+            total: sigma_el,
+        });
     }
 
     // For channels beyond neutron channel, we need fission channels
@@ -152,8 +167,8 @@ pub fn reich_moore_cross_sections(
 
         // Penetration correction for neutron width
         // At resonance energy E_r
-        let k_r_inv_fm = TWOMHB * a_ratio * e_lambda.sqrt();
-        let rho_r = k_r_inv_fm * ap;
+        let k_r_inv_fm = TWOMHB * a_ratio * e_lambda.abs().sqrt();
+        let rho_r = k_r_inv_fm * ap_penetration;
         let (p_r, _) = penetration_shift_factors(entrance_channel.l, rho_r)?;
 
         // Channel amplitude for neutron channel
@@ -209,7 +224,10 @@ pub fn reich_moore_cross_sections(
     // Special case: if no fission channels, reduce to 1×1
     let has_fission = resonances.iter().any(|r| r.fission.is_some());
 
-    let (ri_mat, si_mat) = if !has_fission {
+    let (ri_mat, si_mat) = if has_fission {
+        // Full 3×3 inversion using SAMMY Frobns/Thrinv path.
+        sammy_frobns_invert_3x3(r_mat, s_mat)?
+    } else {
         // 1×1 inversion: (R + iS)^(-1) = (R - iS) / (R² + S²)
         let r = r_mat[0][0];
         let s = s_mat[0][0];
@@ -226,9 +244,6 @@ pub fn reich_moore_cross_sections(
         ri[0][0] = r / denom;
         si[0][0] = -s / denom;
         (ri, si)
-    } else {
-        // Full 3×3 inversion using SAMMY Frobns/Thrinv path.
-        sammy_frobns_invert_3x3(r_mat, s_mat)?
     };
 
     // Step 5: Extract S-matrix element U_11
@@ -248,8 +263,6 @@ pub fn reich_moore_cross_sections(
     // U11i = P2*(1 - 2*RI) + 2*P1*SI
     //
     // This factors as: U = exp(2iφ)*[2*(RI + iSI) - 1]
-    let (cos_2phi, sin_2phi) = hard_sphere_phase(entrance_channel.l, rho_e)?;
-
     let u_re = cos_2phi * (2.0 * ri_11 - 1.0) + 2.0 * sin_2phi * si_11;
     let u_im = sin_2phi * (1.0 - 2.0 * ri_11) + 2.0 * cos_2phi * si_11;
 
@@ -319,7 +332,11 @@ fn sammy_frobns_invert_3x3(
     let mut d;
 
     let ind = sammy_thrinv_3x3(&mut a)?;
-    if ind != 1 {
+    if ind == 1 {
+        Err(PhysicsError::InvalidParameter(
+            "singular matrix in SAMMY Thrinv inversion".into(),
+        ))
+    } else {
         let q = matmul_3x3(a, b);
         d = matmul_3x3(b, q);
         for i in 0..3 {
@@ -335,10 +352,6 @@ fn sammy_frobns_invert_3x3(
             }
         }
         Ok((c, d))
-    } else {
-        Err(PhysicsError::InvalidParameter(
-            "singular matrix in SAMMY Thrinv inversion".into(),
-        ))
     }
 }
 
@@ -366,7 +379,7 @@ fn sammy_thrinv_3x3(d: &mut [[f64; 3]; 3]) -> Result<i32, PhysicsError> {
             d[i][j] = -d[i][j];
             d[j][i] = d[i][j];
         }
-        d[j][j] = 1.0 + d[j][j];
+        d[j][j] += 1.0;
     }
 
     for lr in 0..3 {
@@ -405,11 +418,11 @@ fn sammy_thrinv_3x3(d: &mut [[f64; 3]; 3]) -> Result<i32, PhysicsError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nereids_core::nuclear::Channel;
+    use nereids_core::nuclear::{Channel, Parameter, Resonance};
 
     #[test]
     fn test_cross_sections_zero_resonances() {
-        // With no resonances, should get potential scattering only
+        // With no resonances and no potential term, all channels are zero.
         let spin_group = SpinGroup {
             j: 0.5,
             channels: vec![Channel {
@@ -427,7 +440,91 @@ mod tests {
             include_potential: false,
         };
 
-        let result = reich_moore_cross_sections(1.0, &[], &spin_group, &config);
+        let result = reich_moore_cross_sections(1.0, &[], &spin_group, &config).unwrap();
+        assert_eq!(result.elastic, 0.0);
+        assert_eq!(result.capture, 0.0);
+        assert_eq!(result.fission, 0.0);
+        assert_eq!(result.total, 0.0);
+    }
+
+    #[test]
+    fn test_cross_sections_zero_resonances_with_potential() {
+        let spin_group = SpinGroup {
+            j: 0.5,
+            channels: vec![Channel {
+                l: 0,
+                channel_spin: 0.5,
+                radius: 2.908,
+                effective_radius: 2.908,
+            }],
+            resonances: vec![],
+        };
+
+        let config = RMatrixConfig {
+            target_spin: 0.0,
+            awr: 10.0,
+            include_potential: true,
+        };
+
+        let result = reich_moore_cross_sections(1.0, &[], &spin_group, &config).unwrap();
+        assert!(result.elastic > 0.0);
+        assert_eq!(result.capture, 0.0);
+        assert_eq!(result.fission, 0.0);
+        assert!((result.total - result.elastic).abs() < 1e-14);
+    }
+
+    #[test]
+    fn test_cross_sections_use_effective_radius_for_phase() {
+        let spin_group_a = SpinGroup {
+            j: 0.5,
+            channels: vec![Channel {
+                l: 0,
+                channel_spin: 0.5,
+                radius: 2.0,
+                effective_radius: 2.0,
+            }],
+            resonances: vec![],
+        };
+        let mut spin_group_b = spin_group_a.clone();
+        spin_group_b.channels[0].effective_radius = 4.0;
+
+        let config = RMatrixConfig {
+            target_spin: 0.0,
+            awr: 10.0,
+            include_potential: true,
+        };
+
+        let a = reich_moore_cross_sections(1.0, &[], &spin_group_a, &config).unwrap();
+        let b = reich_moore_cross_sections(1.0, &[], &spin_group_b, &config).unwrap();
+
+        assert!((a.elastic - b.elastic).abs() > 1e-12);
+    }
+
+    #[test]
+    fn test_negative_resonance_energy_is_supported() {
+        let spin_group = SpinGroup {
+            j: 0.5,
+            channels: vec![Channel {
+                l: 0,
+                channel_spin: 0.5,
+                radius: 2.908,
+                effective_radius: 2.908,
+            }],
+            resonances: vec![Resonance {
+                energy: Parameter::fixed(-1.0),
+                gamma_n: Parameter::fixed(1e-3),
+                gamma_g: Parameter::fixed(1e-3),
+                fission: None,
+            }],
+        };
+
+        let config = RMatrixConfig {
+            target_spin: 0.0,
+            awr: 10.0,
+            include_potential: false,
+        };
+
+        let result = reich_moore_cross_sections(1.0, &spin_group.resonances, &spin_group, &config);
         assert!(result.is_ok());
     }
 
