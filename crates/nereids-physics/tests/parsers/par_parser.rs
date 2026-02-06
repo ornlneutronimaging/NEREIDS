@@ -2,7 +2,7 @@
 //!
 //! PAR format: 5 floating-point columns (11 characters each) plus variation flags.
 //! - Column 1: E_r (resonance energy in eV)
-//! - Column 2: J (total angular momentum)
+//! - Column 2: Γ_γ (capture width in milliEV)
 //! - Column 3: Γ_n (neutron width in milliEV)
 //! - Column 4: Γ_fa (first fission width in milliEV)
 //! - Column 5: Γ_fb (second fission width in milliEV)
@@ -61,9 +61,9 @@ pub fn parse_par_file(path: &Path) -> Result<Vec<Resonance>, Box<dyn std::error:
             format!("Line {}: failed to parse energy: {}", line_num + 1, e)
         })?;
 
-        let j: f64 = parts[1].parse().map_err(|e| {
+        let gamma_g_milliev: f64 = parts[1].parse().map_err(|e| {
             format!(
-                "Line {}: failed to parse angular momentum: {}",
+                "Line {}: failed to parse capture width: {}",
                 line_num + 1,
                 e
             )
@@ -90,13 +90,10 @@ pub fn parse_par_file(path: &Path) -> Result<Vec<Resonance>, Box<dyn std::error:
         })?;
 
         // Convert milliEV to eV
+        let gamma_g = gamma_g_milliev / 1000.0;
         let gamma_n = gamma_n_milliev / 1000.0;
         let gamma_fa = gamma_fa_milliev / 1000.0;
         let gamma_fb = gamma_fb_milliev / 1000.0;
-
-        // SAMMY ex003 uses a constant capture width of 1.0 eV (not in PAR file)
-        // This is specified in the INP file, but for ex003 it's always 1.0
-        let gamma_g = 1.0;
 
         // Create fission widths if non-zero
         let fission = if gamma_fa.abs() > 1e-30 || gamma_fb.abs() > 1e-30 {
@@ -145,14 +142,11 @@ mod tests {
         // First resonance should be at 0.25 eV
         assert!((resonances[0].energy.value - 0.25).abs() < 1e-10);
 
-        // All resonances should have J = 1.0
-        // (not stored in Resonance struct, but inferred from spin group)
-
         // Check neutron width for first resonance (0.5 milliEV → 0.0005 eV)
         assert!((resonances[0].gamma_n.value - 0.0005).abs() < 1e-10);
 
-        // Check capture width (constant 1.0 eV for ex003)
-        assert!((resonances[0].gamma_g.value - 1.0).abs() < 1e-10);
+        // Check capture width from PAR col2 (1.0 milliEV → 0.001 eV)
+        assert!((resonances[0].gamma_g.value - 0.001).abs() < 1e-10);
 
         // Check fission widths exist
         assert!(resonances[0].fission.is_some());

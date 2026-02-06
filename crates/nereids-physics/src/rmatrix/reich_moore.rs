@@ -2,11 +2,10 @@
 //!
 //! Teacher reference: `sammy/src/clm/dopush1.f90`
 
-use nereids_core::constants::NEUTRON_MASS_AMU;
 use nereids_core::error::PhysicsError;
 use nereids_core::nuclear::{Resonance, SpinGroup};
 
-use super::penetration::penetration_shift_factors;
+use super::penetration::{hard_sphere_phase, penetration_shift_factors};
 
 /// Cross sections for a single energy point.
 #[derive(Debug, Clone, Copy, Default)]
@@ -79,22 +78,18 @@ pub fn reich_moore_cross_sections(
         )));
     }
 
-    // Step 1: Compute wave number K = sqrt(2 * m_r * E) / hbar
-    // where m_r = m_n * m_target / (m_n + m_target) = m_n * AWR / (1 + AWR)
-    // Units: energy in eV, hbar in eV·s, mass in AMU
-    // K is in units of inverse length (need to convert to 1/fm)
-
-    let reduced_mass_amu = NEUTRON_MASS_AMU * config.awr / (1.0 + config.awr);
-    let reduced_mass_ev = reduced_mass_amu * 931.494_102e6; // AMU to eV/c²
-
-    // K² = 2 * m_r * E / (hbar * c)²
-    // But we want K in 1/fm, so we need proper unit conversion
-    // E in eV, m_r in eV/c², hbar in eV·s, c in m/s
-    // K = sqrt(2 * m_r * E) / (hbar * c) where hbar*c = 197.327 MeV·fm
-    const HBAR_C_MEV_FM: f64 = 197.326_980_4; // MeV·fm
-    let hbar_c_ev_fm = HBAR_C_MEV_FM * 1e6; // eV·fm
-
-    let k_inv_fm = (2.0 * reduced_mass_ev * energy).sqrt() / hbar_c_ev_fm;
+    // Step 1: Compute wave number K in SAMMY convention:
+    // K = Twomhb * A_rat * sqrt(E),
+    // where A_rat = AWR / (1 + AWR), E in eV, K in 1/fm.
+    if !config.awr.is_finite() || config.awr <= 0.0 {
+        return Err(PhysicsError::InvalidParameter(format!(
+            "awr must be finite and positive, got {}",
+            config.awr
+        )));
+    }
+    const TWOMHB: f64 = 2.196_807_122_623e-4; // 1/(fm*sqrt(eV))
+    let a_ratio = config.awr / (1.0 + config.awr);
+    let k_inv_fm = TWOMHB * a_ratio * energy.sqrt();
 
     // Get first channel (entrance channel for neutrons)
     if spin_group.channels.is_empty() {
@@ -136,8 +131,8 @@ pub fn reich_moore_cross_sections(
 
         // Energy-dependent factors
         let delta = e_lambda - energy;
-        let gamma_g_half = gamma_g / 2.0;
-        let denominator = delta * delta + gamma_g_half * gamma_g_half;
+        let gamma_g_quarter = gamma_g / 4.0;
+        let denominator = delta * delta + gamma_g_quarter * gamma_g_quarter;
 
         if denominator < 1e-100 {
             return Err(PhysicsError::InvalidParameter(format!(
@@ -145,12 +140,13 @@ pub fn reich_moore_cross_sections(
             )));
         }
 
-        let r_factor = gamma_g_half / denominator;
+        let r_factor = gamma_g_quarter / denominator;
         let s_factor = delta / (2.0 * denominator);
 
         // Penetration correction for neutron width
         // At resonance energy E_r
-        let rho_r = (2.0 * reduced_mass_ev * e_lambda).sqrt() / hbar_c_ev_fm * entrance_channel.radius;
+        let k_r_inv_fm = TWOMHB * a_ratio * e_lambda.sqrt();
+        let rho_r = k_r_inv_fm * entrance_channel.radius;
         let (p_r, _) = penetration_shift_factors(entrance_channel.l, rho_r)?;
 
         // Channel amplitude for neutron channel
@@ -213,8 +209,9 @@ pub fn reich_moore_cross_sections(
         let denom = r * r + s * s;
 
         if denom < 1e-100 {
-            // R-matrix is effectively zero - treat like no resonances (potential scattering only)
-            return Ok(CrossSections::default());
+            return Err(PhysicsError::InvalidParameter(format!(
+                "near-singular 1x1 R-matrix (denom={denom}) at E={energy}"
+            )));
         }
 
         let mut ri = [[0.0; 3]; 3];
@@ -236,22 +233,27 @@ pub fn reich_moore_cross_sections(
     let ri_11 = ri_mat[0][0];
     let si_11 = si_mat[0][0];
 
-    // The collision matrix element (without hard-sphere phase)
-    // U = 1 - 2iP(RI + iSI) = 1 - 2iP·RI + 2P·SI
-    //   = (1 + 2P·SI) + i(-2P·RI)
-    let u_re = 1.0 + 2.0 * p_e * si_11;
-    let u_im = -2.0 * p_e * ri_11;
+    // The S-matrix (collision matrix) element from SAMMY dopush1.f90 lines 162-163:
+    // U_11 = exp(2iφ_l) * [2*(RI + iSI) - 1]
+    // Where P1 = cos(2φ), P2 = sin(2φ) (NOT penetration factors!)
+    //
+    // U11r = P1*(2*RI - 1) + 2*P2*SI
+    // U11i = P2*(1 - 2*RI) + 2*P1*SI
+    //
+    // This factors as: U = exp(2iφ)*[2*(RI + iSI) - 1]
+    let (cos_2phi, sin_2phi) = hard_sphere_phase(entrance_channel.l, rho_e)?;
 
-    // For hard-sphere phase: U → exp(2iφ) * U
-    // We'll skip this for now as it's a higher-order correction
+    let u_re = cos_2phi * (2.0 * ri_11 - 1.0) + 2.0 * sin_2phi * si_11;
+    let u_im = sin_2phi * (1.0 - 2.0 * ri_11) + 2.0 * cos_2phi * si_11;
 
     // Step 6: Compute cross sections
     // σ_el = (2G_J / K²) · |1 - U_11|²
     // σ_trans = (2G_J / K²) · (1 - Re{U_11})
     // σ_c = σ_trans - σ_f - σ_el (capture = transmission - fission - elastic)
 
-    // Statistical weight G_J = (2J + 1) / (2I + 1)
-    let g_j = (2.0 * spin_group.j + 1.0) / (2.0 * config.target_spin + 1.0);
+    // Statistical weight G_J = (2J + 1) / [2(2I + 1)]
+    // From SAMMY dopush1.f90 lines 40, 76: Gjd = 2*(2*I+1), Gj = (2*J+1)/Gjd
+    let g_j = (2.0 * spin_group.j + 1.0) / (2.0 * (2.0 * config.target_spin + 1.0));
 
     // Normalization: convert to barns
     // σ has units of area, K² has units of 1/length²
@@ -266,15 +268,15 @@ pub fn reich_moore_cross_sections(
     // Transmission (related to total via optical theorem)
     let sigma_trans = norm * 2.0 * one_minus_u_re;
 
-    // Fission: σ_f = (4G_J / K²) · Σ T_i²
-    // where T_i are transmission coefficients for fission channels
-    // T_i = 2·P_e · |U_1i|² but we need to compute U_12, U_13
-    // For now, approximate as 0 if no fission resonances
+    // Fission uses off-diagonal inverse matrix terms for channels 2 and 3.
+    // This follows the Reich-Moore/SAMMY structure where channel couplings
+    // into fission channels contribute via RI/SI(1,2) and RI/SI(1,3).
     let sigma_f = if has_fission {
-        // Fission cross section from other matrix elements
-        // This requires U_12 and U_13 which we haven't computed yet
-        // For now, use a placeholder - we'll need to extend this
-        0.0
+        let ri_12 = ri_mat[0][1];
+        let si_12 = si_mat[0][1];
+        let ri_13 = ri_mat[0][2];
+        let si_13 = si_mat[0][2];
+        norm * 4.0 * (ri_12 * ri_12 + si_12 * si_12 + ri_13 * ri_13 + si_13 * si_13)
     } else {
         0.0
     };
@@ -282,16 +284,14 @@ pub fn reich_moore_cross_sections(
     // Capture: σ_c = σ_trans - σ_f - σ_el
     let sigma_c = sigma_trans - sigma_f - sigma_el;
 
-    // Total: σ_tot = σ_el + σ_c + σ_f
-    let sigma_tot = sigma_el + sigma_c + sigma_f;
-
-    // Potential scattering correction (for intermediate J)
+    // Potential scattering correction.
     let sigma_el_corrected = if config.include_potential {
-        // Add (1 - P_e) contribution
-        sigma_el + norm * (1.0 - p_e)
+        sigma_el + norm * 2.0 * (1.0 - cos_2phi)
     } else {
         sigma_el
     };
+    // Total: σ_tot = σ_el + σ_c + σ_f (using returned elastic channel).
+    let sigma_tot = sigma_el_corrected + sigma_c + sigma_f;
 
     Ok(CrossSections {
         elastic: sigma_el_corrected.max(0.0),

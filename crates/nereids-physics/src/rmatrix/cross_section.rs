@@ -7,6 +7,41 @@ use nereids_core::nuclear::{IsotopeParams, RMatrixParameters};
 
 use super::reich_moore::{reich_moore_cross_sections, CrossSections, RMatrixConfig};
 
+fn approx_eq(a: f64, b: f64, tol: f64) -> bool {
+    (a - b).abs() <= tol
+}
+
+/// Infer target spin I from spin-group J values using J = I ± 1/2.
+///
+/// For ambiguous single-J isotopes, choose the smaller physically valid solution.
+fn infer_target_spin(isotope: &IsotopeParams) -> f64 {
+    let Some(first_group) = isotope.spin_groups.first() else {
+        return 0.0;
+    };
+
+    let tol = 1e-8;
+    let j0 = first_group.j;
+    let mut candidates = vec![(j0 - 0.5).abs(), j0 + 0.5];
+    candidates.sort_unstable_by(|a, b| a.partial_cmp(b).expect("finite target-spin candidates"));
+    candidates.dedup_by(|a, b| approx_eq(*a, *b, tol));
+
+    for sg in isotope.spin_groups.iter().skip(1) {
+        let j = sg.j;
+        candidates.retain(|i| approx_eq(j, i + 0.5, tol) || approx_eq(j, (i - 0.5).abs(), tol));
+        if candidates.is_empty() {
+            break;
+        }
+    }
+
+    candidates
+        .into_iter()
+        .fold(None, |best: Option<f64>, v| match best {
+            Some(curr) if curr <= v => Some(curr),
+            _ => Some(v),
+        })
+        .unwrap_or_else(|| (j0 - 0.5).max(0.0))
+}
+
 /// Compute 0K Reich-Moore cross sections over an energy grid.
 ///
 /// Evaluates cross sections at each energy point in the grid, summing contributions
@@ -93,19 +128,7 @@ fn compute_isotope_cross_sections(
     let n_energies = energy_grid.len();
     let mut cross_sections = vec![CrossSections::default(); n_energies];
 
-    // Determine target spin from first spin group
-    // (all spin groups for an isotope share the same target)
-    let target_spin = if !isotope.spin_groups.is_empty() {
-        // Infer from J values: for neutron (s=1/2), J = I ± 1/2
-        // So I = J_min + 1/2 or I = J_max - 1/2
-        // Use the first spin group's J to infer I
-        let j = isotope.spin_groups[0].j;
-        // Assume I = j - 0.5 for simplicity (could be j + 0.5)
-        // This should be provided explicitly in the isotope params in production code
-        (j - 0.5).max(0.0)
-    } else {
-        0.0
-    };
+    let target_spin = infer_target_spin(isotope);
 
     // Create R-matrix configuration
     let rmatrix_config = RMatrixConfig {

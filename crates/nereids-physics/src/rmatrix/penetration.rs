@@ -283,9 +283,9 @@ mod tests {
 
     #[test]
     fn test_penetration_shift_p_wave() {
-        // l = 1, ρ = 1: B_1 = 2, P_1 = 1/4, S_1 = -1/2
+        // l = 1, ρ = 1: B_1 = 2, P_1 = ρ³/B_1 = 1/2, S_1 = -1/B_1 = -1/2
         let (p, s) = penetration_shift_factors(1, 1.0).unwrap();
-        assert!((p - 0.25).abs() < 1e-15);
+        assert!((p - 0.5).abs() < 1e-15);
         assert!((s + 0.5).abs() < 1e-15);
     }
 

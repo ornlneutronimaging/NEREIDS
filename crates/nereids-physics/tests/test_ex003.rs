@@ -47,13 +47,28 @@ fn build_ex003_params(resonances: Vec<nereids_core::nuclear::Resonance>) -> RMat
         thickness_cm: 0.1,
         number_density: 1e-3,
         spin_groups: vec![SpinGroup {
-            j: 1.0, // All resonances have J = 1.0
-            channels: vec![Channel {
-                l: 0, // s-wave
-                channel_spin: 0.5,
-                radius: 2.908,
-                effective_radius: 2.908,
-            }],
+            // ex003 reference: single spin group with J=0.5 and three channels.
+            j: 0.5,
+            channels: vec![
+                Channel {
+                    l: 0, // entrance neutron channel
+                    channel_spin: 0.5,
+                    radius: 2.908,
+                    effective_radius: 2.908,
+                },
+                Channel {
+                    l: 0, // fission channel A
+                    channel_spin: 0.5,
+                    radius: 2.908,
+                    effective_radius: 2.908,
+                },
+                Channel {
+                    l: 0, // fission channel B
+                    channel_spin: 0.5,
+                    radius: 2.908,
+                    effective_radius: 2.908,
+                },
+            ],
             resonances,
         }],
     };
@@ -149,14 +164,6 @@ fn test_ex003c_capture() {
 
     // Extract capture cross section
     let sigma_capture: Vec<f64> = cross_sections.iter().map(|cs| cs.capture).collect();
-
-    // Debug: print first few values to check scale
-    println!("\nFirst 5 computed vs expected (barns):");
-    for i in 0..5.min(sigma_capture.len()) {
-        println!("  E={:.3e} eV: σ_computed={:.3e}, σ_expected={:.3e}, ratio={:.3e}",
-                 exp_data.energies[i], sigma_capture[i], exp_data.data[i],
-                 sigma_capture[i] / exp_data.data[i]);
-    }
 
     // Compute chi-squared
     let chi2 = compute_chi_squared(&sigma_capture, &exp_data.data, &exp_data.uncertainties);
