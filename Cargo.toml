@@ -2,7 +2,11 @@
 members = [
   "crates/nereids-core",
   "crates/nereids-physics",
+  "crates/nereids-fit",
+  "crates/nereids-endf",
   "crates/nereids-io",
+  "apps/nereids-cli",
+  "apps/nereids-gui",
   "bindings/python",
 ]
 resolver = "2"
@@ -11,3 +15,68 @@ resolver = "2"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+repository = "https://github.com/ornlneutronimaging/NEREIDS"
+
+[workspace.dependencies]
+# Internal crates
+nereids-core = { path = "crates/nereids-core" }
+nereids-physics = { path = "crates/nereids-physics" }
+nereids-fit = { path = "crates/nereids-fit" }
+nereids-endf = { path = "crates/nereids-endf" }
+nereids-io = { path = "crates/nereids-io" }
+
+# Error handling
+thiserror = "2"
+
+# Numerics
+num-complex = "0.4"
+nalgebra = "0.33"
+ndarray = "0.16"
+
+# Parallelism
+rayon = "1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# HTTP (for ENDF retrieval)
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+
+# HDF5 (static build via hdf5-metno, following rustpix)
+hdf5 = { package = "hdf5-metno", version = "0.12", features = [
+  "static",
+  "zlib",
+] }
+
+# Image formats
+tiff = "0.9"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# GUI
+eframe = "0.31"
+egui = "0.31"
+egui_plot = "0.31"
+rfd = "0.15"
+image = "0.25"
+
+# Python bindings
+pyo3 = { version = "0.23", features = ["extension-module"] }
+numpy = "0.23"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"

@@ -1,0 +1,15 @@
+[package]
+name = "nereids-fit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Optimizer and pixel-dispatch fitting for NEREIDS."
+
+[dependencies]
+nereids-core = { workspace = true }
+nereids-physics = { workspace = true }
+rayon = { workspace = true }
+nalgebra = { workspace = true }
+
+[lints]
+workspace = true

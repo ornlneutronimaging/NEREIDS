@@ -1,47 +1,26 @@
 //! Core data models and traits for NEREIDS.
+//!
+//! This crate defines the shared types, traits, and error hierarchy used
+//! throughout the NEREIDS workspace. It has minimal dependencies (only `thiserror`)
+//! to keep it lightweight and widely usable.
 
-pub type Energy = f64;
+pub mod background;
+pub mod constants;
+pub mod energy;
+pub mod error;
+pub mod forward_model;
+pub mod nuclear;
+pub mod optimizer;
+pub mod resolution;
+pub mod transmission;
 
-#[derive(Debug, Clone, Default)]
-pub struct Resonance {
-    pub energy: Energy,
-    pub gamma_n: f64,
-    pub gamma_g: f64,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct SpinGroup {
-    pub spin: f64,
-    pub resonances: Vec<Resonance>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct Isotope {
-    pub name: String,
-    pub spin_groups: Vec<SpinGroup>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct RMatrixParameters {
-    pub isotopes: Vec<Isotope>,
-}
-
-#[derive(Debug, Clone)]
-pub struct TransmissionRequest {
-    pub energy: Vec<Energy>,
-    pub thickness_cm: f64,
-    pub number_density: f64,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct TransmissionResult {
-    pub transmission: Vec<f64>,
-}
-
-pub trait TransmissionModel {
-    fn transmission(
-        &self,
-        params: &RMatrixParameters,
-        request: &TransmissionRequest,
-    ) -> TransmissionResult;
-}
+// Re-export key types at crate root for convenience.
+pub use background::{BackgroundModel, ConstantBackground, PolynomialBackground};
+pub use constants::*;
+pub use energy::EnergyGrid;
+pub use error::{Error, FitError, IoError, PhysicsError};
+pub use forward_model::{ForwardModel, ForwardModelConfig};
+pub use nuclear::{Channel, IsotopeParams, RMatrixParameters, Resonance, SpinGroup};
+pub use optimizer::{FitConfig, FitResult, Optimizer};
+pub use resolution::ResolutionFunction;
+pub use transmission::{PixelData, TransmissionSpectrum};

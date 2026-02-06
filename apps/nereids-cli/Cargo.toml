@@ -1,13 +1,9 @@
 [package]
-name = "nereids"
+name = "nereids-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Python bindings for NEREIDS."
-
-[lib]
-name = "nereids"
-crate-type = ["cdylib"]
+description = "Command-line interface for NEREIDS."
 
 [dependencies]
 nereids-core = { workspace = true }
@@ -15,8 +11,7 @@ nereids-physics = { workspace = true }
 nereids-fit = { workspace = true }
 nereids-endf = { workspace = true }
 nereids-io = { workspace = true }
-pyo3 = { workspace = true }
-numpy = { workspace = true }
+clap = { workspace = true }
 
 [lints]
 workspace = true

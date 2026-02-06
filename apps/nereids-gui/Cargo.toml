@@ -1,13 +1,9 @@
 [package]
-name = "nereids"
+name = "nereids-gui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Python bindings for NEREIDS."
-
-[lib]
-name = "nereids"
-crate-type = ["cdylib"]
+description = "GUI application for NEREIDS."
 
 [dependencies]
 nereids-core = { workspace = true }
@@ -15,8 +11,11 @@ nereids-physics = { workspace = true }
 nereids-fit = { workspace = true }
 nereids-endf = { workspace = true }
 nereids-io = { workspace = true }
-pyo3 = { workspace = true }
-numpy = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+egui_plot = { workspace = true }
+rfd = { workspace = true }
+image = { workspace = true }
 
 [lints]
 workspace = true
