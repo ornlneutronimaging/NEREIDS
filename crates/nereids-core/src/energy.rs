@@ -61,6 +61,11 @@ impl EnergyGrid {
                 )));
             }
             let t_corrected = t - tof_offset_us;
+            if !t_corrected.is_finite() {
+                return Err(PhysicsError::InvalidParameter(format!(
+                    "corrected TOF must be finite, got {t_corrected} (tof={t}, offset={tof_offset_us})"
+                )));
+            }
             if t_corrected <= 0.0 {
                 return Err(PhysicsError::InvalidParameter(format!(
                     "corrected TOF must be positive, got {t_corrected} (tof={t}, offset={tof_offset_us})"
