@@ -24,13 +24,17 @@ use nereids_core::error::PhysicsError;
 /// Returns `PhysicsError::InvalidParameter` if:
 /// - `l > 4` (only s, p, d, f, g waves supported)
 /// - `rho` is not finite
-/// - Division by zero in denominators (B_l singularities)
+/// - Division by zero in denominators (`B_l` singularities)
 ///
 /// # Edge cases
 ///
 /// For very small ρ (< 1e-10), uses Taylor series expansion:
-/// - P_l → ρ^(2l+1) / (1·3·5·...·(2l+1))²
-/// - S_l → -l for l > 0, S_0 = 0
+/// - `P_0` → ρ
+/// - `P_1` → ρ³
+/// - `P_2` → ρ⁵ / 9
+/// - `P_3` → ρ⁷ / 225
+/// - `P_4` → ρ⁹ / 11025
+/// - `S_l` → -l for l > 0, `S_0` = 0
 ///
 /// # References
 ///
@@ -46,10 +50,10 @@ pub fn penetration_shift_factors(l: u32, rho: f64) -> Result<(f64, f64), Physics
     if rho.abs() < 1e-10 {
         return match l {
             0 => Ok((rho, 0.0)),
-            1 => Ok((rho.powi(3) / 3.0, -1.0)),
-            2 => Ok((rho.powi(5) / 225.0, -2.0)),
-            3 => Ok((rho.powi(7) / 11025.0, -3.0)),
-            4 => Ok((rho.powi(9) / 893025.0, -4.0)),
+            1 => Ok((rho.powi(3), -1.0)),
+            2 => Ok((rho.powi(5) / 9.0, -2.0)),
+            3 => Ok((rho.powi(7) / 225.0, -3.0)),
+            4 => Ok((rho.powi(9) / 11025.0, -4.0)),
             _ => Err(PhysicsError::InvalidParameter(format!(
                 "l > 4 not supported, got {l}"
             ))),
@@ -130,7 +134,7 @@ pub fn penetration_shift_factors(l: u32, rho: f64) -> Result<(f64, f64), Physics
 
 /// Compute hard-sphere phase shift for a given orbital angular momentum.
 ///
-/// Returns `(cos(2φ_l), sin(2φ_l))` where φ_l is the hard-sphere phase shift.
+/// Returns `(cos(2φ_l), sin(2φ_l))` where `φ_l` is the hard-sphere phase shift.
 ///
 /// # Arguments
 ///
@@ -146,12 +150,6 @@ pub fn penetration_shift_factors(l: u32, rho: f64) -> Result<(f64, f64), Physics
 /// Returns `PhysicsError::InvalidParameter` if:
 /// - `l > 4`
 /// - `rho` is not finite
-/// - `cos(rho) = 0` (critical singularity in tan(rho))
-///
-/// # Critical Singularity
-///
-/// ⚠️ When cos(ρ) = 0 (i.e., ρ = ±π/2, ±3π/2, ...), tan(ρ) is undefined.
-/// This occurs at high energies and MUST be checked before computing phase shifts.
 ///
 /// # References
 ///
@@ -163,102 +161,29 @@ pub fn hard_sphere_phase(l: u32, rho: f64) -> Result<(f64, f64), PhysicsError> {
         )));
     }
 
-    // Check for critical singularity: cos(rho) = 0
-    let cos_rho = rho.cos();
-    if cos_rho.abs() < 1e-15 {
-        return Err(PhysicsError::InvalidParameter(format!(
-            "cos(rho) = 0 singularity (tan undefined) at rho={rho}"
-        )));
-    }
-
-    let sin_rho = rho.sin();
     let rho_sq = rho * rho;
 
-    match l {
-        0 => {
-            // l = 0: φ_0 = ρ
-            // cos(2φ_0) = cos(2ρ) = 2cos²(ρ) - 1
-            // sin(2φ_0) = sin(2ρ) = 2sin(ρ)cos(ρ)
-            let cos_2phi = 2.0 * cos_rho * cos_rho - 1.0;
-            let sin_2phi = 2.0 * sin_rho * cos_rho;
-            Ok((cos_2phi, sin_2phi))
-        }
-        1 => {
-            // l = 1: φ_1 = ρ - arctan(ρ)
-            // B_1 = 1 + ρ²
-            // cos(φ_1) = (cos(ρ) + ρ·sin(ρ)) / B_1
-            // sin(φ_1) = (sin(ρ) - ρ·cos(ρ)) / B_1
-            let b1 = 1.0 + rho_sq;
-            let cos_phi = (cos_rho + rho * sin_rho) / b1;
-            let sin_phi = (sin_rho - rho * cos_rho) / b1;
-            // Double-angle formulas
-            let cos_2phi = cos_phi * cos_phi - sin_phi * sin_phi;
-            let sin_2phi = 2.0 * sin_phi * cos_phi;
-            Ok((cos_2phi, sin_2phi))
-        }
-        2 => {
-            // l = 2: φ_2 = ρ - arctan(3ρ/(3-ρ²))
-            // B_2 = 9 + 3ρ² + ρ⁴
-            // cos(φ_2) = (cos(ρ)(9-ρ²) + 3ρ·sin(ρ)) / B_2
-            // sin(φ_2) = (sin(ρ)(9-ρ²) - 3ρ·cos(ρ)) / B_2
-            let b2 = rho_sq * (rho_sq + 3.0) + 9.0;
-            if b2.abs() < 1e-30 {
-                return Err(PhysicsError::InvalidParameter(format!(
-                    "B_2 singularity at rho={rho}"
-                )));
-            }
-            let nine_minus_rho_sq = 9.0 - rho_sq;
-            let cos_phi = (cos_rho * nine_minus_rho_sq + 3.0 * rho * sin_rho) / b2;
-            let sin_phi = (sin_rho * nine_minus_rho_sq - 3.0 * rho * cos_rho) / b2;
-            let cos_2phi = cos_phi * cos_phi - sin_phi * sin_phi;
-            let sin_2phi = 2.0 * sin_phi * cos_phi;
-            Ok((cos_2phi, sin_2phi))
-        }
+    // SAMMY Facphi_NML defines φ_l = ρ - atan(B_l), then returns cos(2φ_l), sin(2φ_l).
+    let b = match l {
+        0 => 0.0,
+        1 => rho,
+        2 => rho * (3.0 / (3.0 - rho_sq)),
         3 => {
-            // l = 3: φ_3 = ρ - arctan(ρ(15-ρ²)/(15-6ρ²))
-            // B_3 = 225 + 45ρ² + 6ρ⁴ + ρ⁶
-            // Numerator for cos: cos(ρ)(225-105ρ²+ρ⁴) + ρ·sin(ρ)(60-ρ²)
-            // Numerator for sin: sin(ρ)(225-105ρ²+ρ⁴) - ρ·cos(ρ)(60-ρ²)
-            let rho_4 = rho_sq * rho_sq;
-            let b3 = rho_sq * (rho_sq * (rho_sq + 6.0) + 45.0) + 225.0;
-            if b3.abs() < 1e-30 {
-                return Err(PhysicsError::InvalidParameter(format!(
-                    "B_3 singularity at rho={rho}"
-                )));
-            }
-            let term1 = 225.0 - 105.0 * rho_sq + rho_4;
-            let term2 = 60.0 - rho_sq;
-            let cos_phi = (cos_rho * term1 + rho * sin_rho * term2) / b3;
-            let sin_phi = (sin_rho * term1 - rho * cos_rho * term2) / b3;
-            let cos_2phi = cos_phi * cos_phi - sin_phi * sin_phi;
-            let sin_2phi = 2.0 * sin_phi * cos_phi;
-            Ok((cos_2phi, sin_2phi))
+            let c = 15.0 - 6.0 * rho_sq;
+            rho * ((15.0 - rho_sq) / c)
         }
         4 => {
-            // l = 4: φ_4 = ρ - arctan(ρ(105-10ρ²)/(105-45ρ²+ρ⁴))
-            // B_4 = 11025 + 1575ρ² + 135ρ⁴ + 10ρ⁶ + ρ⁸
-            // Numerator for cos: cos(ρ)(11025-9450ρ²+630ρ⁴-ρ⁶) + ρ·sin(ρ)(4725-315ρ²+ρ⁴)
-            // Numerator for sin: sin(ρ)(11025-9450ρ²+630ρ⁴-ρ⁶) - ρ·cos(ρ)(4725-315ρ²+ρ⁴)
             let rho_4 = rho_sq * rho_sq;
-            let rho_6 = rho_4 * rho_sq;
-            let b4 = rho_sq * (rho_sq * (rho_sq * (rho_sq + 10.0) + 135.0) + 1575.0) + 11025.0;
-            if b4.abs() < 1e-30 {
-                return Err(PhysicsError::InvalidParameter(format!(
-                    "B_4 singularity at rho={rho}"
-                )));
-            }
-            let term1 = 11025.0 - 9450.0 * rho_sq + 630.0 * rho_4 - rho_6;
-            let term2 = 4725.0 - 315.0 * rho_sq + rho_4;
-            let cos_phi = (cos_rho * term1 + rho * sin_rho * term2) / b4;
-            let sin_phi = (sin_rho * term1 - rho * cos_rho * term2) / b4;
-            let cos_2phi = cos_phi * cos_phi - sin_phi * sin_phi;
-            let sin_2phi = 2.0 * sin_phi * cos_phi;
-            Ok((cos_2phi, sin_2phi))
+            let c = 105.0 - 45.0 * rho_sq + rho_4;
+            rho * ((105.0 - 10.0 * rho_sq) / c)
         }
         _ => Err(PhysicsError::InvalidParameter(format!(
             "l > 4 not supported, got {l}"
-        ))),
-    }
+        )))?,
+    };
+
+    let phi = rho - b.atan();
+    Ok(((2.0 * phi).cos(), (2.0 * phi).sin()))
 }
 
 #[cfg(test)]
@@ -277,7 +202,7 @@ mod tests {
     fn test_penetration_shift_small_rho() {
         // For small ρ, should use Taylor series
         let (p, s) = penetration_shift_factors(1, 1e-12).unwrap();
-        assert!(p.abs() < 1e-30); // ρ³/3 ≈ 0
+        assert!((p - 1e-36).abs() < 1e-45); // P1 ~ ρ^3
         assert!((s + 1.0).abs() < 1e-15); // S_1 → -1
     }
 
@@ -300,10 +225,21 @@ mod tests {
     }
 
     #[test]
-    fn test_hard_sphere_phase_singularity() {
-        // At ρ = π/2, cos(ρ) = 0, should return error
-        let result = hard_sphere_phase(0, std::f64::consts::FRAC_PI_2);
-        assert!(result.is_err());
+    fn test_hard_sphere_phase_p_wave_reference() {
+        // l = 1: φ_1 = ρ - atan(ρ)
+        let rho = 1.0_f64;
+        let phi = rho - rho.atan();
+        let (cos_2phi, sin_2phi) = hard_sphere_phase(1, rho).unwrap();
+        assert!((cos_2phi - (2.0 * phi).cos()).abs() < 1e-15);
+        assert!((sin_2phi - (2.0 * phi).sin()).abs() < 1e-15);
+    }
+
+    #[test]
+    fn test_hard_sphere_phase_at_cos_zero_is_finite() {
+        // ρ = π/2 is a valid point; phase factors remain finite.
+        let (cos_2phi, sin_2phi) = hard_sphere_phase(0, std::f64::consts::FRAC_PI_2).unwrap();
+        assert!((cos_2phi + 1.0).abs() < 1e-15);
+        assert!(sin_2phi.abs() < 1e-15);
     }
 
     #[test]

@@ -67,13 +67,9 @@ pub fn parse_dat_file(path: &Path) -> Result<ExperimentalData, Box<dyn std::erro
             .parse()
             .map_err(|e| format!("Line {}: failed to parse data: {}", line_num + 1, e))?;
 
-        let uncertainty: f64 = parts[2].parse().map_err(|e| {
-            format!(
-                "Line {}: failed to parse uncertainty: {}",
-                line_num + 1,
-                e
-            )
-        })?;
+        let uncertainty: f64 = parts[2]
+            .parse()
+            .map_err(|e| format!("Line {}: failed to parse uncertainty: {}", line_num + 1, e))?;
 
         energies.push(energy);
         data.push(datum);

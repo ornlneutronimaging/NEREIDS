@@ -1,11 +1,11 @@
 //! Parser for SAMMY .par files (resonance parameters).
 //!
 //! PAR format: 5 floating-point columns (11 characters each) plus variation flags.
-//! - Column 1: E_r (resonance energy in eV)
-//! - Column 2: Γ_γ (capture width in milliEV)
-//! - Column 3: Γ_n (neutron width in milliEV)
-//! - Column 4: Γ_fa (first fission width in milliEV)
-//! - Column 5: Γ_fb (second fission width in milliEV)
+//! - Column 1: `E_r` (resonance energy in eV)
+//! - Column 2: `Γ_γ` (capture width in milliEV)
+//! - Column 3: `Γ_n` (neutron width in milliEV)
+//! - Column 4: `Γ_fa` (first fission width in milliEV)
+//! - Column 5: `Γ_fb` (second fission width in milliEV)
 //! - Columns 6+: Variation flags (1 = fixed, 0 = vary)
 
 use nereids_core::nuclear::{FissionWidths, Parameter, Resonance};
@@ -57,9 +57,9 @@ pub fn parse_par_file(path: &Path) -> Result<Vec<Resonance>, Box<dyn std::error:
         }
 
         // Parse floating point values
-        let e_r: f64 = parts[0].parse().map_err(|e| {
-            format!("Line {}: failed to parse energy: {}", line_num + 1, e)
-        })?;
+        let e_r: f64 = parts[0]
+            .parse()
+            .map_err(|e| format!("Line {}: failed to parse energy: {}", line_num + 1, e))?;
 
         let gamma_g_milliev: f64 = parts[1].parse().map_err(|e| {
             format!(
@@ -70,7 +70,11 @@ pub fn parse_par_file(path: &Path) -> Result<Vec<Resonance>, Box<dyn std::error:
         })?;
 
         let gamma_n_milliev: f64 = parts[2].parse().map_err(|e| {
-            format!("Line {}: failed to parse neutron width: {}", line_num + 1, e)
+            format!(
+                "Line {}: failed to parse neutron width: {}",
+                line_num + 1,
+                e
+            )
         })?;
 
         let gamma_fa_milliev: f64 = parts[3].parse().map_err(|e| {

@@ -101,12 +101,13 @@ fn test_ex003a_absorption() {
     let exp_data = parse_dat_file(&dat_path).expect("Failed to parse DAT file");
 
     // Create energy grid
-    let energy_grid = EnergyGrid::new(exp_data.energies.clone()).expect("Failed to create energy grid");
+    let energy_grid =
+        EnergyGrid::new(exp_data.energies.clone()).expect("Failed to create energy grid");
 
     // Compute cross sections
     let config = ForwardModelConfig::default();
-    let cross_sections =
-        compute_0k_cross_sections(&energy_grid, &params, &config).expect("Failed to compute cross sections");
+    let cross_sections = compute_0k_cross_sections(&energy_grid, &params, &config)
+        .expect("Failed to compute cross sections");
 
     // Extract absorption cross section (σ_a = σ_c + σ_f)
     let sigma_absorption: Vec<f64> = cross_sections
@@ -125,9 +126,9 @@ fn test_ex003a_absorption() {
     let rel_error = relative_error(chi2, expected_stats.chi_squared, CHI2_ABS_CUTOFF);
 
     println!("ex003a (absorption):");
-    println!("  Computed χ² = {}", chi2);
+    println!("  Computed χ² = {chi2}");
     println!("  Expected χ² = {}", expected_stats.chi_squared);
-    println!("  Relative error = {:.6e}", rel_error);
+    println!("  Relative error = {rel_error:.6e}");
 
     assert!(
         rel_error < CHI2_TOLERANCE,
@@ -158,12 +159,13 @@ fn test_ex003c_capture() {
     let exp_data = parse_dat_file(&dat_path).expect("Failed to parse DAT file");
 
     // Create energy grid
-    let energy_grid = EnergyGrid::new(exp_data.energies.clone()).expect("Failed to create energy grid");
+    let energy_grid =
+        EnergyGrid::new(exp_data.energies.clone()).expect("Failed to create energy grid");
 
     // Compute cross sections
     let config = ForwardModelConfig::default();
-    let cross_sections =
-        compute_0k_cross_sections(&energy_grid, &params, &config).expect("Failed to compute cross sections");
+    let cross_sections = compute_0k_cross_sections(&energy_grid, &params, &config)
+        .expect("Failed to compute cross sections");
 
     // Extract capture cross section
     let sigma_capture: Vec<f64> = cross_sections.iter().map(|cs| cs.capture).collect();
@@ -179,9 +181,9 @@ fn test_ex003c_capture() {
     let rel_error = relative_error(chi2, expected_stats.chi_squared, CHI2_ABS_CUTOFF);
 
     println!("ex003c (capture):");
-    println!("  Computed χ² = {}", chi2);
+    println!("  Computed χ² = {chi2}");
     println!("  Expected χ² = {}", expected_stats.chi_squared);
-    println!("  Relative error = {:.6e}", rel_error);
+    println!("  Relative error = {rel_error:.6e}");
 
     assert!(
         rel_error < CHI2_TOLERANCE,
@@ -212,12 +214,13 @@ fn test_ex003e_elastic() {
     let exp_data = parse_dat_file(&dat_path).expect("Failed to parse DAT file");
 
     // Create energy grid
-    let energy_grid = EnergyGrid::new(exp_data.energies.clone()).expect("Failed to create energy grid");
+    let energy_grid =
+        EnergyGrid::new(exp_data.energies.clone()).expect("Failed to create energy grid");
 
     // Compute cross sections
     let config = ForwardModelConfig::default();
-    let cross_sections =
-        compute_0k_cross_sections(&energy_grid, &params, &config).expect("Failed to compute cross sections");
+    let cross_sections = compute_0k_cross_sections(&energy_grid, &params, &config)
+        .expect("Failed to compute cross sections");
 
     // Extract elastic cross section
     let sigma_elastic: Vec<f64> = cross_sections.iter().map(|cs| cs.elastic).collect();
@@ -233,9 +236,9 @@ fn test_ex003e_elastic() {
     let rel_error = relative_error(chi2, expected_stats.chi_squared, CHI2_ABS_CUTOFF);
 
     println!("ex003e (elastic):");
-    println!("  Computed χ² = {}", chi2);
+    println!("  Computed χ² = {chi2}");
     println!("  Expected χ² = {}", expected_stats.chi_squared);
-    println!("  Relative error = {:.6e}", rel_error);
+    println!("  Relative error = {rel_error:.6e}");
 
     assert!(
         rel_error < CHI2_TOLERANCE,
@@ -266,12 +269,13 @@ fn test_ex003f_fission() {
     let exp_data = parse_dat_file(&dat_path).expect("Failed to parse DAT file");
 
     // Create energy grid
-    let energy_grid = EnergyGrid::new(exp_data.energies.clone()).expect("Failed to create energy grid");
+    let energy_grid =
+        EnergyGrid::new(exp_data.energies.clone()).expect("Failed to create energy grid");
 
     // Compute cross sections
     let config = ForwardModelConfig::default();
-    let cross_sections =
-        compute_0k_cross_sections(&energy_grid, &params, &config).expect("Failed to compute cross sections");
+    let cross_sections = compute_0k_cross_sections(&energy_grid, &params, &config)
+        .expect("Failed to compute cross sections");
 
     // Extract fission cross section
     let sigma_fission: Vec<f64> = cross_sections.iter().map(|cs| cs.fission).collect();
@@ -287,9 +291,9 @@ fn test_ex003f_fission() {
     let rel_error = relative_error(chi2, expected_stats.chi_squared, CHI2_ABS_CUTOFF);
 
     println!("ex003f (fission):");
-    println!("  Computed χ² = {}", chi2);
+    println!("  Computed χ² = {chi2}");
     println!("  Expected χ² = {}", expected_stats.chi_squared);
-    println!("  Relative error = {:.6e}", rel_error);
+    println!("  Relative error = {rel_error:.6e}");
 
     assert!(
         rel_error < CHI2_TOLERANCE,
@@ -320,12 +324,13 @@ fn test_ex003x_transmission() {
     let exp_data = parse_dat_file(&dat_path).expect("Failed to parse DAT file");
 
     // Create energy grid
-    let energy_grid = EnergyGrid::new(exp_data.energies.clone()).expect("Failed to create energy grid");
+    let energy_grid =
+        EnergyGrid::new(exp_data.energies.clone()).expect("Failed to create energy grid");
 
     // Compute cross sections
     let config = ForwardModelConfig::default();
-    let cross_sections =
-        compute_0k_cross_sections(&energy_grid, &params, &config).expect("Failed to compute cross sections");
+    let cross_sections = compute_0k_cross_sections(&energy_grid, &params, &config)
+        .expect("Failed to compute cross sections");
 
     // Compute transmission: T = exp(-n·d·σ_tot)
     // ex003x LPT reports Target Thickness = 0.5000E-04 (areal density n·d).
@@ -346,9 +351,9 @@ fn test_ex003x_transmission() {
     let rel_error = relative_error(chi2, expected_stats.chi_squared, CHI2_ABS_CUTOFF);
 
     println!("ex003x (transmission):");
-    println!("  Computed χ² = {}", chi2);
+    println!("  Computed χ² = {chi2}");
     println!("  Expected χ² = {}", expected_stats.chi_squared);
-    println!("  Relative error = {:.6e}", rel_error);
+    println!("  Relative error = {rel_error:.6e}");
 
     assert!(
         rel_error < CHI2_TOLERANCE,
@@ -379,12 +384,13 @@ fn test_ex003t_total() {
     let exp_data = parse_dat_file(&dat_path).expect("Failed to parse DAT file");
 
     // Create energy grid
-    let energy_grid = EnergyGrid::new(exp_data.energies.clone()).expect("Failed to create energy grid");
+    let energy_grid =
+        EnergyGrid::new(exp_data.energies.clone()).expect("Failed to create energy grid");
 
     // Compute cross sections
     let config = ForwardModelConfig::default();
-    let cross_sections =
-        compute_0k_cross_sections(&energy_grid, &params, &config).expect("Failed to compute cross sections");
+    let cross_sections = compute_0k_cross_sections(&energy_grid, &params, &config)
+        .expect("Failed to compute cross sections");
 
     // Extract total cross section
     let sigma_total: Vec<f64> = cross_sections.iter().map(|cs| cs.total).collect();
@@ -400,9 +406,9 @@ fn test_ex003t_total() {
     let rel_error = relative_error(chi2, expected_stats.chi_squared, CHI2_ABS_CUTOFF);
 
     println!("ex003t (total):");
-    println!("  Computed χ² = {}", chi2);
+    println!("  Computed χ² = {chi2}");
     println!("  Expected χ² = {}", expected_stats.chi_squared);
-    println!("  Relative error = {:.6e}", rel_error);
+    println!("  Relative error = {rel_error:.6e}");
 
     assert!(
         rel_error < CHI2_TOLERANCE,

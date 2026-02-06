@@ -71,7 +71,7 @@ fn infer_target_spin(isotope: &IsotopeParams) -> f64 {
 /// 1. For each isotope:
 ///    a. For each spin group J:
 ///       - Compute cross sections for resonances with this J
-///       - Apply statistical weight G_J = (2J+1)/(2I+1)
+///       - Apply statistical weight `G_J` = (2J+1)/(2I+1)
 ///    b. Sum weighted contributions from all spin groups
 /// 2. Weight by isotope abundance
 /// 3. Return array of cross sections
@@ -101,11 +101,7 @@ pub fn compute_0k_cross_sections(
         }
 
         // Compute cross sections for this isotope at all energies
-        let iso_cross_sections = compute_isotope_cross_sections(
-            energy_grid,
-            isotope,
-            config,
-        )?;
+        let iso_cross_sections = compute_isotope_cross_sections(energy_grid, isotope, config)?;
 
         // Accumulate weighted contributions
         for (i, iso_cs) in iso_cross_sections.iter().enumerate() {
@@ -150,12 +146,7 @@ fn compute_isotope_cross_sections(
             }
 
             // Compute cross sections for this spin group at this energy
-            let cs = reich_moore_cross_sections(
-                energy,
-                resonances,
-                spin_group,
-                &rmatrix_config,
-            )?;
+            let cs = reich_moore_cross_sections(energy, resonances, spin_group, &rmatrix_config)?;
 
             // Add to total (statistical weight already applied in reich_moore_cross_sections)
             cross_sections[i].elastic += cs.elastic;

@@ -50,7 +50,7 @@ pub fn parse_lpt_chi_squared(path: &Path) -> Result<ChiSquaredStats, Box<dyn std
                 chi_squared_per_point = Some(
                     value_str
                         .parse::<f64>()
-                        .map_err(|e| format!("Failed to parse chi²/NDAT: {}", e))?,
+                        .map_err(|e| format!("Failed to parse chi²/NDAT: {e}"))?,
                 );
             }
         } else if line.contains("CUSTOMARY CHI SQUARED") && !line.contains("DIVIDED BY NDAT") {
@@ -60,7 +60,7 @@ pub fn parse_lpt_chi_squared(path: &Path) -> Result<ChiSquaredStats, Box<dyn std
                 chi_squared = Some(
                     value_str
                         .parse::<f64>()
-                        .map_err(|e| format!("Failed to parse chi²: {}", e))?,
+                        .map_err(|e| format!("Failed to parse chi²: {e}"))?,
                 );
             }
         }
@@ -115,8 +115,9 @@ mod tests {
         let variants = ["ex003a", "ex003c", "ex003e", "ex003f", "ex003x", "ex003t"];
 
         for variant in &variants {
-            let path =
-                PathBuf::from(format!("tests/fixtures/sammy_reference/ex003/expected/{variant}.lpt"));
+            let path = PathBuf::from(format!(
+                "tests/fixtures/sammy_reference/ex003/expected/{variant}.lpt"
+            ));
 
             // Skip test if file doesn't exist
             if !path.exists() {
