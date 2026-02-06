@@ -47,7 +47,7 @@ pub struct RMatrixConfig {
 /// # Errors
 ///
 /// Returns `PhysicsError::InvalidParameter` if:
-/// - Energy is not finite or positive
+/// - Energy is not finite or zero
 /// - Matrix inversion fails (singular or near-singular R-matrix)
 /// - Channel parameters are invalid
 ///
@@ -72,9 +72,9 @@ pub fn reich_moore_cross_sections(
     spin_group: &SpinGroup,
     config: &RMatrixConfig,
 ) -> Result<CrossSections, PhysicsError> {
-    if !energy.is_finite() || energy <= 0.0 {
+    if !energy.is_finite() || energy == 0.0 {
         return Err(PhysicsError::InvalidParameter(format!(
-            "energy must be finite and positive, got {energy}"
+            "energy must be finite and non-zero, got {energy}"
         )));
     }
 
@@ -92,7 +92,7 @@ pub fn reich_moore_cross_sections(
     // Arat = DefTargetMass / (DefTargetMass + Aneutr)
     const ANEUTR_AMU: f64 = 1.008_664_904;
     let a_ratio = config.awr / (config.awr + ANEUTR_AMU);
-    let k_inv_fm = TWOMHB * a_ratio * energy.sqrt();
+    let k_inv_fm = TWOMHB * a_ratio * energy.abs().sqrt();
 
     // Select entrance channel for neutron penetrability/phase terms.
     let entrance_channel = select_entrance_channel(spin_group)?;
@@ -752,9 +752,37 @@ mod tests {
             include_potential: false,
         };
 
-        // Negative energy should fail
-        let result = reich_moore_cross_sections(-1.0, &[], &spin_group, &config);
+        // Zero incident energy is invalid (non-finite 1/K^2 normalization).
+        let result = reich_moore_cross_sections(0.0, &[], &spin_group, &config);
         assert!(result.is_err());
+
+        // NaN should fail.
+        let result = reich_moore_cross_sections(f64::NAN, &[], &spin_group, &config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_negative_incident_energy_is_supported() {
+        let spin_group = SpinGroup {
+            j: 0.5,
+            channels: vec![Channel {
+                l: 0,
+                channel_spin: 0.5,
+                radius: 2.908,
+                effective_radius: 2.908,
+            }],
+            resonances: vec![],
+        };
+
+        let config = RMatrixConfig {
+            target_spin: 0.0,
+            awr: 10.0,
+            include_potential: false,
+        };
+
+        // SAMMY uses sqrt(abs(E)) for K, so negative non-zero E remains computable.
+        let result = reich_moore_cross_sections(-1.0, &[], &spin_group, &config);
+        assert!(result.is_ok());
     }
 
     #[test]

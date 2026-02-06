@@ -87,10 +87,9 @@ where P₁ = cos(2φ_L), P₂ = sin(2φ_L) from hard-sphere phase shift.
 
 **Source**: Lines 164-175 in `dopush1.f90`
 
-Notation used below follows SAMMY internals:
-`G_J^SAMMY = (2J + 1) / (2I + 1) = 2 * g_J`,
-where the canonical statistical factor is
-`g_J = (2J + 1) / ((2s + 1)(2I + 1))` with neutron spin `s = 1/2`.
+Notation used below:
+`G_J = (2J + 1) / ((2s + 1)(2I + 1))` with neutron spin `s = 1/2`.
+For neutrons (`s = 1/2`), this is `G_J = (2J + 1) / (2(2I + 1))`.
 
 ### 2.1 Partial Cross Sections
 
@@ -159,18 +158,19 @@ J_min = |I - 1/2|
 J_max = I + 1/2
 ```
 
-Canonical neutron statistical weight:
+Canonical neutron statistical weight (used in the Rust implementation):
 ```
 g_J = (2J + 1) / ((2s + 1)(2I + 1)) = (2J + 1) / (2(2I + 1))
 ```
 with `s = 1/2`.
 
-SAMMY's internal factor (line 76):
+SAMMY line 76 computes the same quantity as:
 ```
-G_J^SAMMY = (2J + 1) / (2I + 1) = 2g_J
+Gj = (2J + 1) / (2(2I + 1)) = g_J
 ```
 
-The implemented formulas above use `G_J^SAMMY` consistently.
+Some SAMMY documentation/writeups define an intermediate `G_J^SAMMY = (2J+1)/(2I+1) = 2g_J`,
+but then pair it with matching prefactors. The Rust code keeps the canonical `g_J` directly.
 
 ---
 

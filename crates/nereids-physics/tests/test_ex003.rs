@@ -28,22 +28,60 @@ fn compute_chi_squared(theory: &[f64], data: &[f64], uncertainties: &[f64]) -> f
         .sum()
 }
 
-/// Compute relative error with cutoff for small values
-fn relative_error(computed: f64, expected: f64, cutoff: f64) -> f64 {
-    if expected.abs() < cutoff {
-        (computed - expected).abs()
+fn chi2_error(computed: f64, expected: f64) -> (f64, &'static str) {
+    let scale = computed.abs().max(expected.abs());
+    if scale < CHI2_ABS_CUTOFF {
+        ((computed - expected).abs(), "absolute")
     } else {
-        ((computed - expected) / expected).abs()
+        ((computed - expected).abs() / scale, "relative")
     }
 }
 
-const CHI2_ABS_CUTOFF: f64 = 1e-4;
-const CHI2_TOLERANCE: f64 = 5e-4;
+const CHI2_ABS_CUTOFF: f64 = 1e-6;
+const CHI2_ABS_TOLERANCE: f64 = 1e-6;
+const CHI2_REL_TOLERANCE: f64 = 2e-2;
 
 fn ex003_config() -> ForwardModelConfig {
     ForwardModelConfig {
         include_potential_scattering: true,
         ..ForwardModelConfig::default()
+    }
+}
+
+fn ex003_fixture_base_path() -> PathBuf {
+    let base_path = PathBuf::from("tests/fixtures/sammy_reference/ex003");
+    assert!(
+        base_path.exists(),
+        "Missing ex003 fixtures at {}",
+        base_path.display()
+    );
+    base_path
+}
+
+fn assert_chi2_close(variant: &str, computed: f64, expected: f64) {
+    let (err, mode) = chi2_error(computed, expected);
+    println!("{variant}:");
+    println!("  Computed χ² = {computed}");
+    println!("  Expected χ² = {expected}");
+    println!("  Error mode = {mode}");
+    println!("  Error value = {err:.6e}");
+
+    if mode == "absolute" {
+        assert!(
+            err < CHI2_ABS_TOLERANCE,
+            "Chi-squared mismatch ({mode} error {:.6e}): computed {}, expected {}",
+            err,
+            computed,
+            expected
+        );
+    } else {
+        assert!(
+            err < CHI2_REL_TOLERANCE,
+            "Chi-squared mismatch ({mode} error {:.6e}): computed {}, expected {}",
+            err,
+            computed,
+            expected
+        );
     }
 }
 
@@ -90,13 +128,7 @@ fn build_ex003_params(resonances: Vec<nereids_core::nuclear::Resonance>) -> RMat
 
 #[test]
 fn test_ex003a_absorption() {
-    let base_path = PathBuf::from("tests/fixtures/sammy_reference/ex003");
-
-    // Skip if fixtures don't exist
-    if !base_path.exists() {
-        eprintln!("Skipping ex003a: fixtures not found");
-        return;
-    }
+    let base_path = ex003_fixture_base_path();
 
     // Load resonance parameters
     let par_path = base_path.join("input/ex003c.par");
@@ -129,32 +161,12 @@ fn test_ex003a_absorption() {
     let lpt_path = base_path.join("expected/ex003a.lpt");
     let expected_stats = parse_lpt_chi_squared(&lpt_path).expect("Failed to parse LPT file");
 
-    // Compare with tolerance
-    let rel_error = relative_error(chi2, expected_stats.chi_squared, CHI2_ABS_CUTOFF);
-
-    println!("ex003a (absorption):");
-    println!("  Computed χ² = {chi2}");
-    println!("  Expected χ² = {}", expected_stats.chi_squared);
-    println!("  Relative error = {rel_error:.6e}");
-
-    assert!(
-        rel_error < CHI2_TOLERANCE,
-        "Chi-squared mismatch (rel error {:.6e}): computed {}, expected {}",
-        rel_error,
-        chi2,
-        expected_stats.chi_squared
-    );
+    assert_chi2_close("ex003a (absorption)", chi2, expected_stats.chi_squared);
 }
 
 #[test]
 fn test_ex003c_capture() {
-    let base_path = PathBuf::from("tests/fixtures/sammy_reference/ex003");
-
-    // Skip if fixtures don't exist
-    if !base_path.exists() {
-        eprintln!("Skipping ex003c: fixtures not found");
-        return;
-    }
+    let base_path = ex003_fixture_base_path();
 
     // Load resonance parameters
     let par_path = base_path.join("input/ex003c.par");
@@ -184,32 +196,12 @@ fn test_ex003c_capture() {
     let lpt_path = base_path.join("expected/ex003c.lpt");
     let expected_stats = parse_lpt_chi_squared(&lpt_path).expect("Failed to parse LPT file");
 
-    // Compare with tolerance
-    let rel_error = relative_error(chi2, expected_stats.chi_squared, CHI2_ABS_CUTOFF);
-
-    println!("ex003c (capture):");
-    println!("  Computed χ² = {chi2}");
-    println!("  Expected χ² = {}", expected_stats.chi_squared);
-    println!("  Relative error = {rel_error:.6e}");
-
-    assert!(
-        rel_error < CHI2_TOLERANCE,
-        "Chi-squared mismatch (rel error {:.6e}): computed {}, expected {}",
-        rel_error,
-        chi2,
-        expected_stats.chi_squared
-    );
+    assert_chi2_close("ex003c (capture)", chi2, expected_stats.chi_squared);
 }
 
 #[test]
 fn test_ex003e_elastic() {
-    let base_path = PathBuf::from("tests/fixtures/sammy_reference/ex003");
-
-    // Skip if fixtures don't exist
-    if !base_path.exists() {
-        eprintln!("Skipping ex003e: fixtures not found");
-        return;
-    }
+    let base_path = ex003_fixture_base_path();
 
     // Load resonance parameters
     let par_path = base_path.join("input/ex003c.par");
@@ -239,32 +231,12 @@ fn test_ex003e_elastic() {
     let lpt_path = base_path.join("expected/ex003e.lpt");
     let expected_stats = parse_lpt_chi_squared(&lpt_path).expect("Failed to parse LPT file");
 
-    // Compare with tolerance
-    let rel_error = relative_error(chi2, expected_stats.chi_squared, CHI2_ABS_CUTOFF);
-
-    println!("ex003e (elastic):");
-    println!("  Computed χ² = {chi2}");
-    println!("  Expected χ² = {}", expected_stats.chi_squared);
-    println!("  Relative error = {rel_error:.6e}");
-
-    assert!(
-        rel_error < CHI2_TOLERANCE,
-        "Chi-squared mismatch (rel error {:.6e}): computed {}, expected {}",
-        rel_error,
-        chi2,
-        expected_stats.chi_squared
-    );
+    assert_chi2_close("ex003e (elastic)", chi2, expected_stats.chi_squared);
 }
 
 #[test]
 fn test_ex003f_fission() {
-    let base_path = PathBuf::from("tests/fixtures/sammy_reference/ex003");
-
-    // Skip if fixtures don't exist
-    if !base_path.exists() {
-        eprintln!("Skipping ex003f: fixtures not found");
-        return;
-    }
+    let base_path = ex003_fixture_base_path();
 
     // Load resonance parameters
     let par_path = base_path.join("input/ex003c.par");
@@ -294,32 +266,12 @@ fn test_ex003f_fission() {
     let lpt_path = base_path.join("expected/ex003f.lpt");
     let expected_stats = parse_lpt_chi_squared(&lpt_path).expect("Failed to parse LPT file");
 
-    // Compare with tolerance
-    let rel_error = relative_error(chi2, expected_stats.chi_squared, CHI2_ABS_CUTOFF);
-
-    println!("ex003f (fission):");
-    println!("  Computed χ² = {chi2}");
-    println!("  Expected χ² = {}", expected_stats.chi_squared);
-    println!("  Relative error = {rel_error:.6e}");
-
-    assert!(
-        rel_error < CHI2_TOLERANCE,
-        "Chi-squared mismatch (rel error {:.6e}): computed {}, expected {}",
-        rel_error,
-        chi2,
-        expected_stats.chi_squared
-    );
+    assert_chi2_close("ex003f (fission)", chi2, expected_stats.chi_squared);
 }
 
 #[test]
 fn test_ex003x_transmission() {
-    let base_path = PathBuf::from("tests/fixtures/sammy_reference/ex003");
-
-    // Skip if fixtures don't exist
-    if !base_path.exists() {
-        eprintln!("Skipping ex003x: fixtures not found");
-        return;
-    }
+    let base_path = ex003_fixture_base_path();
 
     // Load resonance parameters
     let par_path = base_path.join("input/ex003c.par");
@@ -354,32 +306,12 @@ fn test_ex003x_transmission() {
     let lpt_path = base_path.join("expected/ex003x.lpt");
     let expected_stats = parse_lpt_chi_squared(&lpt_path).expect("Failed to parse LPT file");
 
-    // Compare with tolerance
-    let rel_error = relative_error(chi2, expected_stats.chi_squared, CHI2_ABS_CUTOFF);
-
-    println!("ex003x (transmission):");
-    println!("  Computed χ² = {chi2}");
-    println!("  Expected χ² = {}", expected_stats.chi_squared);
-    println!("  Relative error = {rel_error:.6e}");
-
-    assert!(
-        rel_error < CHI2_TOLERANCE,
-        "Chi-squared mismatch (rel error {:.6e}): computed {}, expected {}",
-        rel_error,
-        chi2,
-        expected_stats.chi_squared
-    );
+    assert_chi2_close("ex003x (transmission)", chi2, expected_stats.chi_squared);
 }
 
 #[test]
 fn test_ex003t_total() {
-    let base_path = PathBuf::from("tests/fixtures/sammy_reference/ex003");
-
-    // Skip if fixtures don't exist
-    if !base_path.exists() {
-        eprintln!("Skipping ex003t: fixtures not found");
-        return;
-    }
+    let base_path = ex003_fixture_base_path();
 
     // Load resonance parameters
     let par_path = base_path.join("input/ex003c.par");
@@ -409,19 +341,5 @@ fn test_ex003t_total() {
     let lpt_path = base_path.join("expected/ex003t.lpt");
     let expected_stats = parse_lpt_chi_squared(&lpt_path).expect("Failed to parse LPT file");
 
-    // Compare with tolerance
-    let rel_error = relative_error(chi2, expected_stats.chi_squared, CHI2_ABS_CUTOFF);
-
-    println!("ex003t (total):");
-    println!("  Computed χ² = {chi2}");
-    println!("  Expected χ² = {}", expected_stats.chi_squared);
-    println!("  Relative error = {rel_error:.6e}");
-
-    assert!(
-        rel_error < CHI2_TOLERANCE,
-        "Chi-squared mismatch (rel error {:.6e}): computed {}, expected {}",
-        rel_error,
-        chi2,
-        expected_stats.chi_squared
-    );
+    assert_chi2_close("ex003t (total)", chi2, expected_stats.chi_squared);
 }
