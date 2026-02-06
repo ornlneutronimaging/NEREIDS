@@ -8,7 +8,7 @@
 
 ## 1. Core R-Matrix Equation
 
-**Source**: `/Users/chenzhang/code.ornl.gov/SAMMY/SAMMY/sammy/src/clm/dopush1.f90` (lines 8-184)
+**Source**: SAMMY Fortran file `sammy/src/clm/dopush1.f90` (lines 8-184)
 
 ### 1.1 Single Energy Point Evaluation
 
@@ -87,6 +87,11 @@ where P₁ = cos(2φ_L), P₂ = sin(2φ_L) from hard-sphere phase shift.
 
 **Source**: Lines 164-175 in `dopush1.f90`
 
+Notation used below follows SAMMY internals:
+`G_J^SAMMY = (2J + 1) / (2I + 1) = 2 * g_J`,
+where the canonical statistical factor is
+`g_J = (2J + 1) / ((2s + 1)(2I + 1))` with neutron spin `s = 1/2`.
+
 ### 2.1 Partial Cross Sections
 
 **Elastic scattering** (line 164):
@@ -154,18 +159,24 @@ J_min = |I - 1/2|
 J_max = I + 1/2
 ```
 
-Each J contributes with statistical weight (line 76):
+Canonical neutron statistical weight:
 ```
-G_J = (2J + 1) / (2I + 1)
+g_J = (2J + 1) / ((2s + 1)(2I + 1)) = (2J + 1) / (2(2I + 1))
+```
+with `s = 1/2`.
+
+SAMMY's internal factor (line 76):
+```
+G_J^SAMMY = (2J + 1) / (2I + 1) = 2g_J
 ```
 
-**Total cross section** = Σ_J [G_J · σ_J(E)]
+The implemented formulas above use `G_J^SAMMY` consistently.
 
 ---
 
 ## 4. Key Physical Constants
 
-**Source**: `/Users/chenzhang/code.ornl.gov/SAMMY/SAMMY/sammy/src/mmas7.f90` (lines 7-108)
+**Source**: SAMMY Fortran file `sammy/src/mmas7.f90` (lines 7-108)
 
 ```
 Neutron mass:     m_n ≈ 1.00866 amu
@@ -224,15 +235,14 @@ Specialized for 3×3 real symmetric matrices:
 
 **Test case**: SAMMY `ex003` (synthetic nuclide)
 - 12 resonances: 0.25, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000 eV
-- J = 1.0 (total angular momentum, column 2 in PAR file)
-- All widths: Γ_n = 0.5, Γ_fa = 0.5, Γ_fb = 0.5 milliEV
-- **PAR file format**: E_r (eV), J (dimensionless), Γ_n, Γ_fa, Γ_fb (milliEV)
+- Example PAR widths: Γ_γ = 1.0, Γ_n = 0.5, Γ_fa = 0.5, Γ_fb = 0.5 milliEV
+- **PAR file format used in tests**: E_r (eV), Γ_γ, Γ_n, Γ_fa, Γ_fb (milliEV), followed by variation flags
 - Expected output: capture, elastic, fission, transmission, total cross sections
 - Tolerance: 1e-4 relative error
 
 **Files**:
-- Input: `/Users/chenzhang/code.ornl.gov/SAMMY/SAMMY/samexm/samexm/ex003/ex003c.par`
-- Reference: `/Users/chenzhang/code.ornl.gov/SAMMY/SAMMY/samexm/samexm/ex003/answers/ex003*.lpt`
+- Input fixture: `crates/nereids-physics/tests/fixtures/sammy_reference/ex003/input/ex003c.par`
+- Reference fixture: `crates/nereids-physics/tests/fixtures/sammy_reference/ex003/expected/ex003*.lpt`
 
 ---
 

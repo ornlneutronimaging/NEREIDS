@@ -24,7 +24,7 @@ Penetration factors **P_l** and shift factors **S_l** are energy- and angular-mo
 
 ## 2. Penetration Factors P_l
 
-**Source**: `/Users/chenzhang/code.ornl.gov/SAMMY/SAMMY/sammy/src/xxx/mxxxb.f90`
+**Source**: SAMMY Fortran file `sammy/src/xxx/mxxxb.f90`
 **Subroutine**: `Facts_NML(L, Rho, Sf, Pf)` (lines 6-62)
 
 ### 2.1 Formulas
@@ -104,7 +104,7 @@ E_eff = E_0 - (Γ_n / 2P_l) · S_l
 
 ## 4. Hard-Sphere Phase Shifts φ_l
 
-**Source**: `/Users/chenzhang/code.ornl.gov/SAMMY/SAMMY/sammy/src/xxx/mxxxa.f90`
+**Source**: SAMMY Fortran file `sammy/src/xxx/mxxxa.f90`
 **Subroutine**: `Facphi_NML(Lspin, Rho, Cs, Si)` (lines 6-66)
 
 ### 4.1 Intermediate Variable B_l
@@ -135,20 +135,21 @@ These correspond to **hard-sphere resonances** where the approximation breaks do
 
 But we need **cos(2φ_l)** and **sin(2φ_l)** for scattering amplitude, not φ itself.
 
-### 4.3 Double-Angle Formulas
+### 4.3 Phase Evaluation in Code
 
-**Source**: Lines 56-63
+**Source**: SAMMY `Facphi_NML` lines 55-63
 
-```fortran
-C = cos²(ρ)                          ! Line 57: C = C1*C1
-D = sin(ρ)/cos(ρ) = tan(ρ)          ! Line 57: D = S1/C1
-E = 2cos²(ρ)/(1+B²)                  ! Line 59: E = 2*C/(1.0d0+B*B)
+SAMMY's Fortran computes `cos(2φ)`/`sin(2φ)` through an algebraic expansion that includes `tan(ρ)`.
+In NEREIDS, the implementation uses the mathematically equivalent and numerically simpler route:
 
-cos(2φ) = E(1+BD)² - 1              ! Line 60: Cs = E*(1.0d0+B*D)**2 - 1.0d0
-sin(2φ) = E(-B+D)(1+BD)             ! Line 62: Si = E*(-B+D)*(1.0d0+B*D)
-```
+1. Compute `B_l(ρ)` from the table above.
+2. Compute phase `φ_l = ρ - arctan(B_l)`.
+3. Return `cos(2φ_l)` and `sin(2φ_l)` directly.
 
-**Derivation** (using arctan addition formulas):
+This matches the current Rust implementation in `crates/nereids-physics/src/rmatrix/penetration.rs`
+and avoids introducing an explicit `tan(ρ)` singularity path.
+
+**Equivalent identity**:
 ```
 2φ = 2ρ - 2arctan(B)
 cos(2φ) = cos(2ρ)cos(2arctan B) + sin(2ρ)sin(2arctan B)
@@ -161,7 +162,7 @@ cos(2arctan B) = (1-B²)/(1+B²)
 sin(2arctan B) = 2B/(1+B²)
 ```
 
-Substitute and simplify → formulas above.
+which is algebraically equivalent to SAMMY's expanded form.
 
 ---
 
@@ -190,15 +191,13 @@ fn compute_factors(l: u32, rho: f64) -> (f64, f64, f64, f64) {
         0 => {
             let pf = a;
             let sf = 0.0;
-            let b = 0.0;
-            let (cos_2phi, sin_2phi) = double_angle(a, b);
+            let (cos_2phi, sin_2phi) = hard_sphere_phase_direct(0, a);
             (pf, sf, cos_2phi, sin_2phi)
         },
         1 => {
             let pf = a * a2 / (1.0 + a2);
             let sf = -1.0 / (1.0 + a2);
-            let b = a;
-            let (cos_2phi, sin_2phi) = double_angle(a, b);
+            let (cos_2phi, sin_2phi) = hard_sphere_phase_direct(1, a);
             (pf, sf, cos_2phi, sin_2phi)
         },
         2 => {
@@ -206,8 +205,7 @@ fn compute_factors(l: u32, rho: f64) -> (f64, f64, f64, f64) {
             let d = 9.0 + a2 * (3.0 + a2);  // Horner
             let pf = a * a4 / d;
             let sf = -(18.0 + 3.0 * a2) / d;
-            let b = 3.0 * a / (3.0 - a2);    // ⚠️ Check denominator != 0
-            let (cos_2phi, sin_2phi) = double_angle(a, b);
+            let (cos_2phi, sin_2phi) = hard_sphere_phase_direct(2, a);
             (pf, sf, cos_2phi, sin_2phi)
         },
         // ... cases 3, 4 similar
@@ -215,15 +213,10 @@ fn compute_factors(l: u32, rho: f64) -> (f64, f64, f64, f64) {
     }
 }
 
-fn double_angle(rho: f64, b: f64) -> (f64, f64) {
-    let c1 = rho.cos();
-    let s1 = rho.sin();
-    let c = c1 * c1;
-    let d = s1 / c1;  // tan(rho)
-    let e = 2.0 * c / (1.0 + b * b);
-    let cos_2phi = e * (1.0 + b * d).powi(2) - 1.0;
-    let sin_2phi = e * (-b + d) * (1.0 + b * d);
-    (cos_2phi, sin_2phi)
+fn hard_sphere_phase_direct(l: u32, rho: f64) -> (f64, f64) {
+    let b = compute_b_l(l, rho); // includes denominator checks
+    let phi = rho - b.atan();
+    ((2.0 * phi).cos(), (2.0 * phi).sin())
 }
 ```
 
@@ -232,11 +225,9 @@ fn double_angle(rho: f64, b: f64) -> (f64, f64) {
 | Issue | Condition | Mitigation |
 |---|---|---|
 | **Division by zero in B_l** | ρ² = 3 (l=2), ρ² = 2.5 (l=3) | Return error or use limiting value |
-| **⚠️ CRITICAL: cos(ρ) = 0** | ρ = π/2, 3π/2, ... | **MUST CHECK** before tan(ρ) computation in double_angle |
+| **cos(ρ) = 0 points** | ρ = π/2, 3π/2, ... | Finite in implemented direct-`φ` method (`φ = ρ - atan(B)`) |
 | **Very small ρ** | ρ < 1e-10 | Use Taylor series: P_l → ρ^(2l+1), S_l → -l for l > 0 |
 | **Very large ρ** | ρ > 100 | Asymptotic forms (beyond scope for resonance region) |
-
-**Note on cos(ρ) singularity**: For high energies (E > 10 keV) or large channel radii (a > 10 fm), ρ can exceed π/2. The double-angle formula requires d = tan(ρ) = sin(ρ)/cos(ρ), which **diverges** when cos(ρ) = 0. This must be checked explicitly before computation.
 
 ---
 
@@ -289,7 +280,7 @@ Use SAMMY `ex003` test case:
 - [ ] P_l formulas for l=0,1,2,3,4 (Horner scheme)
 - [ ] S_l formulas for l=0,1,2,3,4 (Horner scheme)
 - [ ] B_l intermediate values
-- [ ] Double-angle formulas for cos(2φ), sin(2φ)
+- [ ] Compute `φ_l = ρ - atan(B_l)` and then `cos(2φ_l)`, `sin(2φ_l)`
 - [ ] Edge case handling (division by zero, very small/large ρ)
 - [ ] Unit tests with known values
 - [ ] Validation against SAMMY ex003

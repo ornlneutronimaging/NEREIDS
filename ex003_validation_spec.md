@@ -8,7 +8,8 @@
 
 ## 1. Test Case Overview
 
-**Location**: `/Users/chenzhang/code.ornl.gov/SAMMY/SAMMY/samexm/samexm/ex003/`
+**Location in this repository**: `crates/nereids-physics/tests/fixtures/sammy_reference/ex003/`
+**Upstream SAMMY example**: `samexm/samexm/ex003/`
 
 **Physics**: Synthetic nuclide with 3 scattering channels (neutron + 2 fission)
 - Tests all cross-section types: capture, elastic, fission, transmission, total
@@ -33,14 +34,14 @@
 ### 2.1 Resonance Parameters
 
 **File**: `ex003c.par` (shared across all variants)
-**Location**: `/Users/chenzhang/code.ornl.gov/SAMMY/SAMMY/samexm/samexm/ex003/ex003c.par`
+**Location**: `crates/nereids-physics/tests/fixtures/sammy_reference/ex003/input/ex003c.par`
 
 **Format**: Fixed-width, 5 columns of 11 characters each
 
 | Column | Content | Units |
 |---|---|---|
 | 1 | Resonance energy E_λ | eV |
-| 2 | Total width Γ_tot | milliEV |
+| 2 | Capture width Γ_γ | milliEV |
 | 3 | Neutron width Γ_n | milliEV |
 | 4 | Fission width A (Γ_fa) | milliEV |
 | 5 | Fission width B (Γ_fb) | milliEV |
@@ -48,16 +49,13 @@
 **12 Resonances**:
 ```
 Energy (eV):  0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0
-All widths:   Γ_tot = 1.0, Γ_n = 0.5, Γ_fa = 0.5, Γ_fb = 0.5 milliEV
+Example widths: Γ_γ = 1.0, Γ_n = 0.5, Γ_fa = 0.5, Γ_fb = 0.5 milliEV
 ```
-
-**Gamma width Γ_γ**: Derived from Γ_tot - Γ_n - Γ_fa - Γ_fb = 1.0 - 0.5 - 0.5 - 0.5 = -0.5 milliEV (!)
-- **Note**: Negative gamma width is physically unusual but handled by SAMMY (sign preserved in amplitude)
 
 ### 2.2 Input Configuration
 
 **File**: `ex003c.inp` (example for capture cross section)
-**Location**: `/Users/chenzhang/code.ornl.gov/SAMMY/SAMMY/samexm/samexm/ex003/ex003c.inp`
+**Location**: `crates/nereids-physics/tests/fixtures/sammy_reference/ex003/input/ex003c.inp`
 
 **Key Parameters** (from LPT analysis):
 - Element name: Synthetic
@@ -75,7 +73,7 @@ All widths:   Γ_tot = 1.0, Γ_n = 0.5, Γ_fa = 0.5, Γ_fb = 0.5 milliEV
 ### 2.3 Experimental Data
 
 **File**: `ex003c.dat` (synthetic data)
-**Location**: `/Users/chenzhang/code.ornl.gov/SAMMY/SAMMY/samexm/samexm/ex003/ex003c.dat`
+**Location**: `crates/nereids-physics/tests/fixtures/sammy_reference/ex003/input/ex003c.dat`
 
 **Format**: "Twenty" format (20 characters per field, 3 fields per line)
 
@@ -96,7 +94,7 @@ All widths:   Γ_tot = 1.0, Γ_n = 0.5, Γ_fa = 0.5, Γ_fb = 0.5 milliEV
 
 ### 3.1 Main Reference: LPT Files
 
-**Location**: `/Users/chenzhang/code.ornl.gov/SAMMY/SAMMY/samexm/samexm/ex003/answers/`
+**Location**: `crates/nereids-physics/tests/fixtures/sammy_reference/ex003/expected/`
 
 **Files**:
 - `ex003c.lpt` (capture)
@@ -119,7 +117,7 @@ All widths:   Γ_tot = 1.0, Γ_n = 0.5, Γ_fa = 0.5, Γ_fb = 0.5 milliEV
    - 12 resonances
 8. **Resonance parameter table** (lines 93-113):
    - Energy (eV)
-   - Gamma widths (milliEV): Γ_tot, Γ_n, Γ_fa, Γ_fb
+   - Gamma widths (milliEV): Γ_γ, Γ_n, Γ_fa, Γ_fb
 9. **Energy range** (lines 122-135):
    - Emin: 9.90350×10⁻⁶ eV
    - Emax: 1200.0 eV
@@ -142,7 +140,7 @@ All widths:   Γ_tot = 1.0, Γ_n = 0.5, Γ_fa = 0.5, Γ_fb = 0.5 milliEV
 
 **Step 2**: Extract resonance parameters (lines 93-113)
 - Pattern: Lines starting with resonance energy values
-- Parse 5 columns: E_λ, Γ_tot, Γ_n, Γ_fa, Γ_fb
+- Parse 5 columns: E_λ, Γ_γ, Γ_n, Γ_fa, Γ_fb
 
 **Step 3**: Extract chi-squared (lines 146-147)
 - Pattern 1: Line containing "CHI SQUARED" followed by float
@@ -161,23 +159,23 @@ fn parse_lpt_chi_squared(path: &Path) -> Result<(f64, f64), Error> {
     let mut chi2 = None;
     let mut chi2_per_point = None;
 
-    for (i, line) in contents.lines().enumerate() {
-        if line.contains("CHI SQUARED") && chi2.is_none() {
-            // Extract first float after "CHI SQUARED"
+    for line in contents.lines() {
+        if line.contains("CUSTOMARY CHI SQUARED")
+            && !line.contains("DIVIDED BY NDAT")
+        {
             if let Some(val) = extract_float(line) {
                 chi2 = Some(val);
             }
         }
-        if chi2.is_some() && chi2_per_point.is_none() {
-            // Next line after chi2 contains per-point value
+        if line.contains("CUSTOMARY CHI SQUARED DIVIDED BY NDAT") {
             if let Some(val) = extract_float(line) {
                 chi2_per_point = Some(val);
-                break;
             }
         }
     }
 
-    Ok((chi2.unwrap(), chi2_per_point.unwrap()))
+    // Keep the final block for iterative outputs.
+    Ok((chi2.ok_or(Error::MissingChi2)?, chi2_per_point.ok_or(Error::MissingChi2PerPoint)?))
 }
 ```
 
@@ -202,7 +200,7 @@ fn parse_lpt_chi_squared(path: &Path) -> Result<(f64, f64), Error> {
 
 ## 4. Validation Tolerance
 
-**Source**: `/Users/chenzhang/github.com/NEREIDS/NEREIDS_claude/docs/adr/0002-sammy-reference-validation.md`
+**Source**: `docs/adr/0002-sammy-reference-validation.md`
 
 **Default**: 1.0e-4 relative error
 
@@ -370,15 +368,14 @@ For future fitted cases:
 
 ## 8. Known Issues and Expected Behaviors
 
-### 8.1 Negative Gamma Width
+### 8.1 Negative Fission Width
 
-ex003 has Γ_γ = -0.5 milliEV (derived from total width balance).
+If a fitted dataset provides negative fission widths, SAMMY preserves the sign
+in channel amplitudes (`A_f = sign(Γ_f) * sqrt(|Γ_f|)`).
 
-**SAMMY handling**: Sign preserved in amplitude calculations (lines 102-106 in dopush1.f90)
-
-**NEREIDS**: Must match this behavior:
+**NEREIDS**: matches this behavior:
 ```rust
-let a_gamma = gamma_width.value.signum() * gamma_width.value.abs().sqrt();
+let a_f = gamma_f.value.signum() * gamma_f.value.abs().sqrt();
 ```
 
 ### 8.2 ex003t Chi-Squared Mismatch
@@ -422,6 +419,6 @@ All ex003 variants have temperature = 0 K (no Doppler broadening).
 ---
 
 **Source Files Referenced**:
-- Input: `/Users/chenzhang/code.ornl.gov/SAMMY/SAMMY/samexm/samexm/ex003/*.{par,inp,dat}`
-- Expected: `/Users/chenzhang/code.ornl.gov/SAMMY/SAMMY/samexm/samexm/ex003/answers/*.lpt`
+- Input fixtures: `crates/nereids-physics/tests/fixtures/sammy_reference/ex003/input/*.{par,inp,dat}`
+- Expected fixtures: `crates/nereids-physics/tests/fixtures/sammy_reference/ex003/expected/*.lpt`
 - NEREIDS Docs: `docs/adr/0002-sammy-reference-validation.md`, `docs/sammy-validation-map.md`
