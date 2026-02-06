@@ -68,18 +68,17 @@ pub fn penetration_shift_factors(l: u32, rho: f64) -> Result<(f64, f64), Physics
         1 => {
             // l = 1 (p-wave)
             // B_1 = 1 + ρ²
-            // P_1 = ρ³ / B_1²
+            // P_1 = ρ³ / B_1 (NOT B_1²!)
             // S_1 = -1 / B_1
             let b1 = 1.0 + rho_sq;
-            let b1_sq = b1 * b1;
-            let p1 = rho_sq * rho / b1_sq;
+            let p1 = rho_sq * rho / b1;
             let s1 = -1.0 / b1;
             Ok((p1, s1))
         }
         2 => {
             // l = 2 (d-wave)
             // B_2 = 9 + 3ρ² + ρ⁴ (using Horner: ρ²(ρ² + 3) + 9)
-            // P_2 = ρ⁵ / B_2²
+            // P_2 = ρ⁵ / B_2 (NOT B_2²!)
             // S_2 = -(18 + 3ρ²) / B_2
             let b2 = rho_sq * (rho_sq + 3.0) + 9.0;
             if b2.abs() < 1e-30 {
@@ -87,15 +86,14 @@ pub fn penetration_shift_factors(l: u32, rho: f64) -> Result<(f64, f64), Physics
                     "B_2 singularity at rho={rho}"
                 )));
             }
-            let b2_sq = b2 * b2;
-            let p2 = rho_sq * rho_sq * rho / b2_sq;
+            let p2 = rho_sq * rho_sq * rho / b2;
             let s2 = -(18.0 + 3.0 * rho_sq) / b2;
             Ok((p2, s2))
         }
         3 => {
             // l = 3 (f-wave)
             // B_3 = 225 + 45ρ² + 6ρ⁴ + ρ⁶ (using Horner: ρ²(ρ²(ρ² + 6) + 45) + 225)
-            // P_3 = ρ⁷ / B_3²
+            // P_3 = ρ⁷ / B_3 (NOT B_3²!)
             // S_3 = -(675 + 90ρ² + 6ρ⁴) / B_3
             let b3 = rho_sq * (rho_sq * (rho_sq + 6.0) + 45.0) + 225.0;
             if b3.abs() < 1e-30 {
@@ -103,8 +101,7 @@ pub fn penetration_shift_factors(l: u32, rho: f64) -> Result<(f64, f64), Physics
                     "B_3 singularity at rho={rho}"
                 )));
             }
-            let b3_sq = b3 * b3;
-            let p3 = rho_sq * rho_sq * rho_sq * rho / b3_sq;
+            let p3 = rho_sq * rho_sq * rho_sq * rho / b3;
             let s3 = -(675.0 + 90.0 * rho_sq + 6.0 * rho_sq * rho_sq) / b3;
             Ok((p3, s3))
         }
@@ -112,7 +109,7 @@ pub fn penetration_shift_factors(l: u32, rho: f64) -> Result<(f64, f64), Physics
             // l = 4 (g-wave)
             // B_4 = 11025 + 1575ρ² + 135ρ⁴ + 10ρ⁶ + ρ⁸
             //     = ρ²(ρ²(ρ²(ρ² + 10) + 135) + 1575) + 11025 (Horner)
-            // P_4 = ρ⁹ / B_4²
+            // P_4 = ρ⁹ / B_4 (NOT B_4²!)
             // S_4 = -(44100 + 4725ρ² + 270ρ⁴ + 10ρ⁶) / B_4
             let rho_4 = rho_sq * rho_sq;
             let b4 = rho_sq * (rho_sq * (rho_sq * (rho_sq + 10.0) + 135.0) + 1575.0) + 11025.0;
@@ -121,8 +118,7 @@ pub fn penetration_shift_factors(l: u32, rho: f64) -> Result<(f64, f64), Physics
                     "B_4 singularity at rho={rho}"
                 )));
             }
-            let b4_sq = b4 * b4;
-            let p4 = rho_4 * rho_4 * rho / b4_sq;
+            let p4 = rho_4 * rho_4 * rho / b4;
             let s4 = -(44100.0 + 4725.0 * rho_sq + 270.0 * rho_4 + 10.0 * rho_4 * rho_sq) / b4;
             Ok((p4, s4))
         }

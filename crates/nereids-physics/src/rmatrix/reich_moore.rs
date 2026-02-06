@@ -255,9 +255,9 @@ pub fn reich_moore_cross_sections(
 
     // Normalization: convert to barns
     // σ has units of area, K² has units of 1/length²
-    // π / K² gives an area in fm², convert to barns (1 barn = 100 fm²)
+    // π / K² gives an area in fm², convert to barns (1 barn = 100 fm², so divide by 100)
     let k_sq = k_inv_fm * k_inv_fm;
-    let norm = std::f64::consts::PI / k_sq * g_j * 100.0; // π·g_J / K² in barns
+    let norm = std::f64::consts::PI / k_sq * g_j * 0.01; // π·g_J / K² in barns
 
     // Elastic: |1 - U|² = (1 - U_re)² + U_im²
     let one_minus_u_re = 1.0 - u_re;
