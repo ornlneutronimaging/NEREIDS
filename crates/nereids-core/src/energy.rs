@@ -50,8 +50,9 @@ impl EnergyGrid {
             }
             values.push(TOF_TO_ENERGY_FACTOR * l_sq / (t_corrected * t_corrected));
         }
-        // Energy is inversely proportional to TOF^2, so reverse to get ascending order.
-        values.reverse();
+        // Sort ascending — TOF and energy are inversely related, but we don't
+        // assume the input TOF array is in any particular order.
+        values.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         Ok(Self { values })
     }
 

@@ -78,8 +78,8 @@ pub struct IsotopeParams {
     pub name: String,
     /// Atomic weight ratio (mass relative to neutron).
     pub awr: f64,
-    /// Abundance (fraction, 0.0 to 1.0). This is a primary fit parameter in Mode 1.
-    pub abundance: f64,
+    /// Abundance (fraction, 0.0 to 1.0). Primary fit parameter in Mode 1.
+    pub abundance: Parameter,
     /// Sample thickness in cm.
     pub thickness_cm: f64,
     /// Number density in atoms/barn-cm.

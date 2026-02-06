@@ -17,6 +17,9 @@ use nereids_core::{
 fn count_free_params(params: &RMatrixParameters) -> usize {
     let mut count = 0;
     for isotope in &params.isotopes {
+        if isotope.abundance.vary {
+            count += 1;
+        }
         for sg in &isotope.spin_groups {
             for res in &sg.resonances {
                 if res.energy.vary {
