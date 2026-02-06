@@ -3,6 +3,18 @@ name = "nereids-io"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "NeXus/HDF5 I/O for NEREIDS (stub)."
+description = "Data I/O for NEREIDS: NeXus/HDF5, TIFF, spectra, resolution files."
 
 [dependencies]
+nereids-core = { workspace = true }
+hdf5 = { workspace = true, optional = true }
+ndarray = { workspace = true, optional = true }
+tiff = { workspace = true, optional = true }
+
+[features]
+default = []
+hdf5 = ["dep:hdf5", "dep:ndarray"]
+tiff = ["dep:tiff"]
+
+[lints]
+workspace = true

@@ -34,3 +34,7 @@ node_modules/
 
 # Pixi
 .pixi/
+
+# Working documents (not tracked)
+WORKLOG.md
+CLAUDE.md

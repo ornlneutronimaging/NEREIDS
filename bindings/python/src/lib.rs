@@ -1,4 +1,4 @@
-//! Python bindings for NEREIDS (stub).
+//! Python bindings for NEREIDS.
 
 use pyo3::prelude::*;
 
