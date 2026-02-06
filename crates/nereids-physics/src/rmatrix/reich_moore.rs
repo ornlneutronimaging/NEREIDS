@@ -344,7 +344,12 @@ fn sammy_frobns_invert_3x3(
                 c[i][j] += d[i][j];
             }
         }
-        let _ = sammy_thrinv_3x3(&mut c)?;
+        let ind = sammy_thrinv_3x3(&mut c)?;
+        if ind == 1 {
+            return Err(PhysicsError::InvalidParameter(
+                "singular matrix in SAMMY Thrinv second inversion".into(),
+            ));
+        }
         d = matmul_3x3(q, c);
         for row in &mut d {
             for x in row {

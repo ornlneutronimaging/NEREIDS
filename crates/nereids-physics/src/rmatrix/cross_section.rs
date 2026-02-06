@@ -119,7 +119,7 @@ pub fn compute_0k_cross_sections(
 fn compute_isotope_cross_sections(
     energy_grid: &EnergyGrid,
     isotope: &IsotopeParams,
-    _config: &ForwardModelConfig,
+    config: &ForwardModelConfig,
 ) -> Result<Vec<CrossSections>, PhysicsError> {
     let n_energies = energy_grid.len();
     let mut cross_sections = vec![CrossSections::default(); n_energies];
@@ -130,7 +130,7 @@ fn compute_isotope_cross_sections(
     let rmatrix_config = RMatrixConfig {
         target_spin,
         awr: isotope.awr,
-        include_potential: false, // Will be controlled by config later
+        include_potential: config.include_potential_scattering,
     };
 
     // Loop over each energy point
@@ -140,8 +140,8 @@ fn compute_isotope_cross_sections(
             // Get resonances for this spin group
             let resonances = &spin_group.resonances;
 
-            // Skip if no resonances in this spin group
-            if resonances.is_empty() {
+            // Skip only when there is neither resonance contribution nor potential scattering.
+            if resonances.is_empty() && !rmatrix_config.include_potential {
                 continue;
             }
 
@@ -290,5 +290,42 @@ mod tests {
         for cs in &result {
             assert!(cs.total >= 0.0);
         }
+    }
+
+    #[test]
+    fn test_compute_0k_potential_scattering_for_empty_spin_group() {
+        let energy_grid = EnergyGrid::new(vec![1.0]).unwrap();
+
+        let isotope = IsotopeParams {
+            name: "Potential-Only".to_string(),
+            awr: 10.0,
+            abundance: Parameter::fixed(1.0),
+            thickness_cm: 0.1,
+            number_density: 1e-3,
+            spin_groups: vec![SpinGroup {
+                j: 0.5,
+                channels: vec![Channel {
+                    l: 0,
+                    channel_spin: 0.5,
+                    radius: 2.908,
+                    effective_radius: 2.908,
+                }],
+                resonances: vec![],
+            }],
+        };
+
+        let params = RMatrixParameters {
+            isotopes: vec![isotope],
+        };
+
+        let config = ForwardModelConfig {
+            include_potential_scattering: true,
+            ..ForwardModelConfig::default()
+        };
+
+        let result = compute_0k_cross_sections(&energy_grid, &params, &config).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].elastic > 0.0);
+        assert!(result[0].total > 0.0);
     }
 }
