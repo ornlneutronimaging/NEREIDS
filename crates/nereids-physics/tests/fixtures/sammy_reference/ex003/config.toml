@@ -1,0 +1,55 @@
+# SAMMY ex003 test configuration
+# Validation test cases for Reich-Moore R-matrix cross sections
+
+[metadata]
+name = "ex003"
+description = "SAMMY R-matrix validation - Reich-Moore formalism with synthetic data"
+
+[physics]
+formalism = "reich-moore"
+temperature = 0.0  # 0K (no Doppler broadening)
+element = "synthetic"
+atomic_weight = 10.0
+effective_radius_fm = 2.908
+
+[[test_cases]]
+id = "ex003a"
+data_type = "absorption"
+description = "Total absorption cross section (σ_a = σ_c + σ_f)"
+tolerance = 1e-4
+cutoff = 1e-30
+
+[[test_cases]]
+id = "ex003c"
+data_type = "capture"
+description = "Radiative capture cross section (σ_c)"
+tolerance = 1e-4
+cutoff = 1e-30
+
+[[test_cases]]
+id = "ex003e"
+data_type = "elastic"
+description = "Elastic scattering cross section (σ_el)"
+tolerance = 1e-4
+cutoff = 1e-30
+
+[[test_cases]]
+id = "ex003f"
+data_type = "fission"
+description = "Fission cross section (σ_f)"
+tolerance = 1e-4
+cutoff = 1e-30
+
+[[test_cases]]
+id = "ex003x"
+data_type = "transmission"
+description = "Transmission (T = exp(-n·d·σ_tot))"
+tolerance = 1e-4
+cutoff = 1e-30
+
+[[test_cases]]
+id = "ex003t"
+data_type = "total"
+description = "Total cross section (σ_tot = σ_el + σ_c + σ_f)"
+tolerance = 1e-4
+cutoff = 1e-30
