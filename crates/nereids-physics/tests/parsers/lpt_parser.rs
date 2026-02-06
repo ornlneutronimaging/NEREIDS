@@ -65,10 +65,8 @@ pub fn parse_lpt_chi_squared(path: &Path) -> Result<ChiSquaredStats, Box<dyn std
             }
         }
 
-        // Stop if we've found both values
-        if chi_squared.is_some() && chi_squared_per_point.is_some() {
-            break;
-        }
+        // Keep scanning the full file and retain the latest values.
+        // Iterative SAMMY outputs can contain multiple chi-squared blocks.
     }
 
     match (chi_squared, chi_squared_per_point) {
@@ -84,7 +82,17 @@ pub fn parse_lpt_chi_squared(path: &Path) -> Result<ChiSquaredStats, Box<dyn std
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_path(suffix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!("nereids_lpt_{nanos}_{suffix}"))
+    }
 
     #[test]
     fn test_parse_ex003c_lpt() {
@@ -141,5 +149,23 @@ mod tests {
                 "{variant}: chi² should be positive"
             );
         }
+    }
+
+    #[test]
+    fn test_parse_lpt_uses_last_chi_squared_block() {
+        let path = unique_temp_path("iter.lpt");
+        let content = "\
+CUSTOMARY CHI SQUARED = 1.0
+CUSTOMARY CHI SQUARED DIVIDED BY NDAT = 0.1
+CUSTOMARY CHI SQUARED = 2.0
+CUSTOMARY CHI SQUARED DIVIDED BY NDAT = 0.2
+";
+        fs::write(&path, content).unwrap();
+
+        let stats = parse_lpt_chi_squared(&path).unwrap();
+        assert!((stats.chi_squared - 2.0).abs() < 1e-12);
+        assert!((stats.chi_squared_per_point - 0.2).abs() < 1e-12);
+
+        let _ = fs::remove_file(path);
     }
 }

@@ -13,6 +13,42 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
+fn parse_par_first_five_fields(line: &str) -> Option<[f64; 5]> {
+    // Canonical SAMMY PAR layout: first 5 values in fixed-width 11-char fields.
+    if line.len() >= 55 {
+        let mut vals = [0.0_f64; 5];
+        let mut ok = true;
+        for (i, slot) in vals.iter_mut().enumerate() {
+            let start = i * 11;
+            let end = start + 11;
+            let field = line.get(start..end).unwrap_or("").trim();
+            match field.parse::<f64>() {
+                Ok(v) => *slot = v,
+                Err(_) => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            return Some(vals);
+        }
+    }
+
+    // Fallback for whitespace-delimited fixtures/variants.
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 5 {
+        return None;
+    }
+    Some([
+        parts[0].parse::<f64>().ok()?,
+        parts[1].parse::<f64>().ok()?,
+        parts[2].parse::<f64>().ok()?,
+        parts[3].parse::<f64>().ok()?,
+        parts[4].parse::<f64>().ok()?,
+    ])
+}
+
 /// Parse a SAMMY .par file and extract resonance parameters.
 ///
 /// # Arguments
@@ -44,54 +80,13 @@ pub fn parse_par_file(path: &Path) -> Result<Vec<Resonance>, Box<dyn std::error:
             continue;
         }
 
-        // Parse the line
-        let parts: Vec<&str> = trimmed.split_whitespace().collect();
-
-        if parts.len() < 5 {
-            return Err(format!(
-                "Line {}: expected at least 5 columns, got {}",
-                line_num + 1,
-                parts.len()
-            )
-            .into());
-        }
-
-        // Parse floating point values
-        let e_r: f64 = parts[0]
-            .parse()
-            .map_err(|e| format!("Line {}: failed to parse energy: {}", line_num + 1, e))?;
-
-        let gamma_g_milliev: f64 = parts[1].parse().map_err(|e| {
-            format!(
-                "Line {}: failed to parse capture width: {}",
-                line_num + 1,
-                e
-            )
-        })?;
-
-        let gamma_n_milliev: f64 = parts[2].parse().map_err(|e| {
-            format!(
-                "Line {}: failed to parse neutron width: {}",
-                line_num + 1,
-                e
-            )
-        })?;
-
-        let gamma_fa_milliev: f64 = parts[3].parse().map_err(|e| {
-            format!(
-                "Line {}: failed to parse fission width 1: {}",
-                line_num + 1,
-                e
-            )
-        })?;
-
-        let gamma_fb_milliev: f64 = parts[4].parse().map_err(|e| {
-            format!(
-                "Line {}: failed to parse fission width 2: {}",
-                line_num + 1,
-                e
-            )
-        })?;
+        let [e_r, gamma_g_milliev, gamma_n_milliev, gamma_fa_milliev, gamma_fb_milliev] =
+            parse_par_first_five_fields(&line).ok_or_else(|| {
+                format!(
+                    "Line {}: failed to parse first five PAR fields as fixed-width or whitespace-delimited values",
+                    line_num + 1
+                )
+            })?;
 
         // Convert milliEV to eV
         let gamma_g = gamma_g_milliev / 1000.0;
@@ -126,7 +121,17 @@ pub fn parse_par_file(path: &Path) -> Result<Vec<Resonance>, Box<dyn std::error:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_path(suffix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!("nereids_par_{nanos}_{suffix}"))
+    }
 
     #[test]
     fn test_parse_ex003c_par() {
@@ -157,5 +162,23 @@ mod tests {
         let fission = resonances[0].fission.as_ref().unwrap();
         assert!((fission.gamma_f1.value - 0.0005).abs() < 1e-10); // 0.5 milliEV
         assert!((fission.gamma_f2.value - 0.0005).abs() < 1e-10); // 0.5 milliEV
+    }
+
+    #[test]
+    fn test_parse_fixed_width_par_without_whitespace_delimiters() {
+        let path = unique_temp_path("fixed.par");
+        let line = format!(
+            "{:>11}{:>11}{:>11}{:>11}{:>11}{:>11}\n",
+            "2.5E-1", "1.0", "0.5", "0.5", "0.5", "1"
+        );
+        fs::write(&path, line).unwrap();
+
+        let resonances = parse_par_file(&path).unwrap();
+        assert_eq!(resonances.len(), 1);
+        assert!((resonances[0].energy.value - 0.25).abs() < 1e-12);
+        assert!((resonances[0].gamma_g.value - 0.001).abs() < 1e-12);
+        assert!((resonances[0].gamma_n.value - 0.0005).abs() < 1e-12);
+
+        let _ = fs::remove_file(path);
     }
 }
