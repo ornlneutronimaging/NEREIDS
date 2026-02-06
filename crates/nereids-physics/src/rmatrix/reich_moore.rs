@@ -158,6 +158,12 @@ pub fn reich_moore_cross_sections(
         let gamma_g = res.gamma_g.value;
         let gamma_n = res.gamma_n.value;
 
+        if !gamma_n.is_finite() || gamma_n < 0.0 {
+            return Err(PhysicsError::InvalidParameter(format!(
+                "neutron width gamma_n must be finite and non-negative, got {gamma_n}"
+            )));
+        }
+
         // Energy-dependent factors
         let delta = e_lambda - energy;
         // SAMMY dopush1.f90:
@@ -697,6 +703,34 @@ mod tests {
 
         let result = reich_moore_cross_sections(1.0, &spin_group.resonances, &spin_group, &config);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_negative_neutron_width_returns_error() {
+        let spin_group = SpinGroup {
+            j: 0.5,
+            channels: vec![Channel {
+                l: 0,
+                channel_spin: 0.5,
+                radius: 2.908,
+                effective_radius: 2.908,
+            }],
+            resonances: vec![Resonance {
+                energy: Parameter::fixed(1.0),
+                gamma_n: Parameter::fixed(-1e-3),
+                gamma_g: Parameter::fixed(1e-3),
+                fission: None,
+            }],
+        };
+
+        let config = RMatrixConfig {
+            target_spin: 0.0,
+            awr: 10.0,
+            include_potential: false,
+        };
+
+        let result = reich_moore_cross_sections(1.0, &spin_group.resonances, &spin_group, &config);
+        assert!(result.is_err());
     }
 
     #[test]
