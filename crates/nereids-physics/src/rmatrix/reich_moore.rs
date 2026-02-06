@@ -87,8 +87,11 @@ pub fn reich_moore_cross_sections(
             config.awr
         )));
     }
-    const TWOMHB: f64 = 2.196_807_122_623e-4; // 1/(fm*sqrt(eV))
-    let a_ratio = config.awr / (1.0 + config.awr);
+    const TWOMHB: f64 = 2.196_807_132_5e-4; // 1/(fm*sqrt(eV)); SAMMY mmas7.f90 (Kvendf=2)
+    // SAMMY constants use neutron mass in amu (Aneutr), so the reduced-mass
+    // factor is A / (A + m_n) with m_n ~= 1.008664904.
+    const ANEUTR_AMU: f64 = 1.008_664_904;
+    let a_ratio = config.awr / (config.awr + ANEUTR_AMU);
     let k_inv_fm = TWOMHB * a_ratio * energy.sqrt();
 
     // Get first channel (entrance channel for neutrons)
@@ -98,9 +101,11 @@ pub fn reich_moore_cross_sections(
         ));
     }
     let entrance_channel = &spin_group.channels[0];
+    // Channel radii in our model are already in SAMMY working units (fm).
+    let ap = entrance_channel.radius;
 
     // Step 2: Compute penetration factors at energy E and at resonance energy E_r
-    let rho_e = k_inv_fm * entrance_channel.radius; // dimensionless ρ = ka
+    let rho_e = k_inv_fm * ap; // dimensionless ρ = ka
     let (p_e, _s_e) = penetration_shift_factors(entrance_channel.l, rho_e)?;
 
     // Special case: if there are no resonances, return only potential scattering
@@ -131,8 +136,10 @@ pub fn reich_moore_cross_sections(
 
         // Energy-dependent factors
         let delta = e_lambda - energy;
-        let gamma_g_quarter = gamma_g / 4.0;
-        let denominator = delta * delta + gamma_g_quarter * gamma_g_quarter;
+        // SAMMY dopush1.f90:
+        //   Den = Diff*Diff + 0.25*Gg*Gg
+        //   Gg4 = 0.25*Gg / Den
+        let denominator = delta * delta + 0.25 * gamma_g * gamma_g;
 
         if denominator < 1e-100 {
             return Err(PhysicsError::InvalidParameter(format!(
@@ -140,13 +147,13 @@ pub fn reich_moore_cross_sections(
             )));
         }
 
-        let r_factor = gamma_g_quarter / denominator;
+        let r_factor = 0.25 * gamma_g / denominator;
         let s_factor = delta / (2.0 * denominator);
 
         // Penetration correction for neutron width
         // At resonance energy E_r
         let k_r_inv_fm = TWOMHB * a_ratio * e_lambda.sqrt();
-        let rho_r = k_r_inv_fm * entrance_channel.radius;
+        let rho_r = k_r_inv_fm * ap;
         let (p_r, _) = penetration_shift_factors(entrance_channel.l, rho_r)?;
 
         // Channel amplitude for neutron channel
@@ -220,8 +227,8 @@ pub fn reich_moore_cross_sections(
         si[0][0] = -s / denom;
         (ri, si)
     } else {
-        // Full 3×3 inversion using Frobenius-Schur
-        frobenius_schur_invert_3x3(r_mat, s_mat)?
+        // Full 3×3 inversion using SAMMY Frobns/Thrinv path.
+        sammy_frobns_invert_3x3(r_mat, s_mat)?
     };
 
     // Step 5: Extract S-matrix element U_11
@@ -294,125 +301,105 @@ pub fn reich_moore_cross_sections(
     let sigma_tot = sigma_el_corrected + sigma_c + sigma_f;
 
     Ok(CrossSections {
-        elastic: sigma_el_corrected.max(0.0),
-        capture: sigma_c.max(0.0),
-        fission: sigma_f.max(0.0),
-        total: sigma_tot.max(0.0),
+        elastic: sigma_el_corrected,
+        capture: sigma_c,
+        fission: sigma_f,
+        total: sigma_tot,
     })
 }
 
-/// Invert a 3×3 complex matrix represented as real and imaginary parts.
-///
-/// Uses the Frobenius-Schur method to invert a complex symmetric matrix
-/// (R + iS)^(-1) = RI + iSI
-///
-/// # Arguments
-///
-/// * `r` - Real part of 3×3 complex matrix
-/// * `s` - Imaginary part of 3×3 complex matrix
-///
-/// # Returns
-///
-/// `(RI, SI)` where RI and SI are real and imaginary parts of the inverse
-///
-/// # Errors
-///
-/// Returns `PhysicsError::InvalidParameter` if matrix is singular or near-singular
-///
-/// # References
-///
-/// SAMMY `dopush1.f90` (Frobenius-Schur inversion section)
-fn frobenius_schur_invert_3x3(
+/// Complex 3x3 inversion that mirrors SAMMY `Frobns` + `Thrinv` in `dopush1.f90`.
+fn sammy_frobns_invert_3x3(
     r: [[f64; 3]; 3],
     s: [[f64; 3]; 3],
 ) -> Result<([[f64; 3]; 3], [[f64; 3]; 3]), PhysicsError> {
-    // Frobenius-Schur: (R + iS)^(-1) = (R + S·R^(-1)·S)^(-1) - i·R^(-1)·S·(R + S·R^(-1)·S)^(-1)
+    let mut a = r;
+    let mut c = a;
+    let b = s;
+    let mut d;
 
-    // First invert R (real symmetric matrix)
-    let r_inv = invert_real_3x3_symmetric(r)?;
-
-    // Compute S·R^(-1)·S
-    let mut srs = [[0.0; 3]; 3];
-    for i in 0..3 {
-        for j in 0..3 {
-            let mut sum = 0.0;
-            for k in 0..3 {
-                for l in 0..3 {
-                    sum += s[i][k] * r_inv[k][l] * s[l][j];
-                }
+    let ind = sammy_thrinv_3x3(&mut a)?;
+    if ind != 1 {
+        let q = matmul_3x3(a, b);
+        d = matmul_3x3(b, q);
+        for i in 0..3 {
+            for j in 0..3 {
+                c[i][j] += d[i][j];
             }
-            srs[i][j] = sum;
         }
-    }
-
-    // Compute R + S·R^(-1)·S
-    let mut r_plus_srs = [[0.0; 3]; 3];
-    for i in 0..3 {
-        for j in 0..3 {
-            r_plus_srs[i][j] = r[i][j] + srs[i][j];
-        }
-    }
-
-    // Invert (R + S·R^(-1)·S)
-    let r_plus_srs_inv = invert_real_3x3_symmetric(r_plus_srs)?;
-
-    // RI = (R + S·R^(-1)·S)^(-1)
-    let ri = r_plus_srs_inv;
-
-    // SI = -R^(-1)·S·(R + S·R^(-1)·S)^(-1)
-    let mut si = [[0.0; 3]; 3];
-    for i in 0..3 {
-        for j in 0..3 {
-            let mut sum = 0.0;
-            for k in 0..3 {
-                for l in 0..3 {
-                    sum += r_inv[i][k] * s[k][l] * ri[l][j];
-                }
+        let _ = sammy_thrinv_3x3(&mut c)?;
+        d = matmul_3x3(q, c);
+        for row in &mut d {
+            for x in row {
+                *x = -*x;
             }
-            si[i][j] = -sum;
         }
+        Ok((c, d))
+    } else {
+        Err(PhysicsError::InvalidParameter(
+            "singular matrix in SAMMY Thrinv inversion".into(),
+        ))
     }
-
-    Ok((ri, si))
 }
 
-/// Invert a real 3×3 symmetric matrix using cofactor method.
-fn invert_real_3x3_symmetric(m: [[f64; 3]; 3]) -> Result<[[f64; 3]; 3], PhysicsError> {
-    // Compute determinant
-    let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
-        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
-        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
-
-    if det.abs() < 1e-100 {
-        return Err(PhysicsError::InvalidParameter(format!(
-            "singular matrix (det = {det})"
-        )));
-    }
-
-    // Compute adjugate matrix (cofactor matrix transposed)
-    let mut adj = [[0.0; 3]; 3];
-
-    adj[0][0] = m[1][1] * m[2][2] - m[1][2] * m[2][1];
-    adj[0][1] = -(m[0][1] * m[2][2] - m[0][2] * m[2][1]);
-    adj[0][2] = m[0][1] * m[1][2] - m[0][2] * m[1][1];
-
-    adj[1][0] = -(m[1][0] * m[2][2] - m[1][2] * m[2][0]);
-    adj[1][1] = m[0][0] * m[2][2] - m[0][2] * m[2][0];
-    adj[1][2] = -(m[0][0] * m[1][2] - m[0][2] * m[1][0]);
-
-    adj[2][0] = m[1][0] * m[2][1] - m[1][1] * m[2][0];
-    adj[2][1] = -(m[0][0] * m[2][1] - m[0][1] * m[2][0]);
-    adj[2][2] = m[0][0] * m[1][1] - m[0][1] * m[1][0];
-
-    // Inverse = adjugate / determinant
-    let mut inv = [[0.0; 3]; 3];
+/// Matrix multiply C = A * B for 3x3 matrices.
+fn matmul_3x3(a: [[f64; 3]; 3], b: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    let mut c = [[0.0; 3]; 3];
     for i in 0..3 {
         for j in 0..3 {
-            inv[i][j] = adj[i][j] / det;
+            let mut sum = 0.0;
+            for k in 0..3 {
+                sum += a[i][k] * b[k][j];
+            }
+            c[i][j] = sum;
+        }
+    }
+    c
+}
+
+/// Real symmetric inversion used by SAMMY `Thrinv`.
+///
+/// Returns `0` on success and `1` on singularity to mirror SAMMY behavior.
+fn sammy_thrinv_3x3(d: &mut [[f64; 3]; 3]) -> Result<i32, PhysicsError> {
+    for j in 0..3 {
+        for i in 0..=j {
+            d[i][j] = -d[i][j];
+            d[j][i] = d[i][j];
+        }
+        d[j][j] = 1.0 + d[j][j];
+    }
+
+    for lr in 0..3 {
+        let fooey = 1.0 - d[lr][lr];
+        if fooey == 0.0 {
+            return Ok(1);
+        }
+
+        d[lr][lr] = 1.0 / fooey;
+        let mut s = [0.0; 3];
+        for j in 0..3 {
+            s[j] = d[lr][j];
+            if j != lr {
+                d[j][lr] *= d[lr][lr];
+                d[lr][j] = d[j][lr];
+            }
+        }
+
+        for j in 0..3 {
+            if j == lr {
+                continue;
+            }
+            for i in 0..=j {
+                if i == lr {
+                    continue;
+                }
+                d[i][j] += d[i][lr] * s[j];
+                d[j][i] = d[i][j];
+            }
         }
     }
 
-    Ok(inv)
+    Ok(0)
 }
 
 #[cfg(test)]
@@ -469,15 +456,21 @@ mod tests {
     }
 
     #[test]
-    fn test_matrix_inversion_identity() {
-        // Test inverting identity matrix
-        let identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-        let inv = invert_real_3x3_symmetric(identity).unwrap();
+    fn test_sammy_thrinv_singularity_flag() {
+        // Zero matrix hits Fooey = 0 in SAMMY Thrinv and reports singularity.
+        let mut zero = [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]];
+        let ind = sammy_thrinv_3x3(&mut zero).unwrap();
+        assert_eq!(ind, 1);
+    }
 
-        for i in 0..3 {
-            for j in 0..3 {
-                let expected = if i == j { 1.0 } else { 0.0 };
-                assert!((inv[i][j] - expected).abs() < 1e-15);
+    #[test]
+    fn test_sammy_thrinv_non_singular() {
+        let mut m = [[1.2, 0.0, 0.0], [0.0, 1.3, 0.0], [0.0, 0.0, 1.4]];
+        let ind = sammy_thrinv_3x3(&mut m).unwrap();
+        assert_eq!(ind, 0);
+        for row in m {
+            for v in row {
+                assert!(v.is_finite());
             }
         }
     }
