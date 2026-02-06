@@ -13,9 +13,18 @@ fn approx_eq(a: f64, b: f64, tol: f64) -> bool {
 
 /// Infer target spin I from spin-group J values using J = I ± 1/2.
 ///
+/// This relation is only valid for s-wave (`l=0`) entrance channels.
 /// For ambiguous single-J isotopes, choose the smaller physically valid solution.
+/// If no s-wave spin groups are present, return 0.0 rather than inferring from
+/// non-s-wave J values.
 fn infer_target_spin(isotope: &IsotopeParams) -> f64 {
-    let Some(first_group) = isotope.spin_groups.first() else {
+    let s_wave_groups: Vec<_> = isotope
+        .spin_groups
+        .iter()
+        .filter(|sg| sg.channels.first().map(|ch| ch.l == 0).unwrap_or(false))
+        .collect();
+
+    let Some(first_group) = s_wave_groups.first() else {
         return 0.0;
     };
 
@@ -25,7 +34,7 @@ fn infer_target_spin(isotope: &IsotopeParams) -> f64 {
     candidates.sort_unstable_by(|a, b| a.partial_cmp(b).expect("finite target-spin candidates"));
     candidates.dedup_by(|a, b| approx_eq(*a, *b, tol));
 
-    for sg in isotope.spin_groups.iter().skip(1) {
+    for sg in s_wave_groups.iter().skip(1) {
         let j = sg.j;
         candidates.retain(|i| approx_eq(j, i + 0.5, tol) || approx_eq(j, (i - 0.5).abs(), tol));
         if candidates.is_empty() {
@@ -39,7 +48,7 @@ fn infer_target_spin(isotope: &IsotopeParams) -> f64 {
             Some(curr) if curr <= v => Some(curr),
             _ => Some(v),
         })
-        .unwrap_or_else(|| (j0 - 0.5).max(0.0))
+        .unwrap_or(0.0)
 }
 
 /// Compute 0K Reich-Moore cross sections over an energy grid.
@@ -294,7 +303,7 @@ mod tests {
 
     #[test]
     fn test_compute_0k_potential_scattering_for_empty_spin_group() {
-        let energy_grid = EnergyGrid::new(vec![1.0]).unwrap();
+        let energy_grid = EnergyGrid::new(vec![1.0e6]).unwrap();
 
         let isotope = IsotopeParams {
             name: "Potential-Only".to_string(),
@@ -302,16 +311,30 @@ mod tests {
             abundance: Parameter::fixed(1.0),
             thickness_cm: 0.1,
             number_density: 1e-3,
-            spin_groups: vec![SpinGroup {
-                j: 0.5,
-                channels: vec![Channel {
-                    l: 0,
-                    channel_spin: 0.5,
-                    radius: 2.908,
-                    effective_radius: 2.908,
-                }],
-                resonances: vec![],
-            }],
+            spin_groups: vec![
+                // s-wave group pins inferred target spin at I=1 (from J=1.5).
+                SpinGroup {
+                    j: 1.5,
+                    channels: vec![Channel {
+                        l: 0,
+                        channel_spin: 0.5,
+                        radius: 2.908,
+                        effective_radius: 2.908,
+                    }],
+                    resonances: vec![],
+                },
+                // p-wave interior J group where SAMMY applies extra potential correction.
+                SpinGroup {
+                    j: 1.5,
+                    channels: vec![Channel {
+                        l: 1,
+                        channel_spin: 0.5,
+                        radius: 2.908,
+                        effective_radius: 2.908,
+                    }],
+                    resonances: vec![],
+                },
+            ],
         };
 
         let params = RMatrixParameters {
@@ -327,5 +350,65 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert!(result[0].elastic > 0.0);
         assert!(result[0].total > 0.0);
+    }
+
+    #[test]
+    fn test_infer_target_spin_uses_only_s_wave_groups() {
+        let isotope = IsotopeParams {
+            name: "Infer-S-wave".to_string(),
+            awr: 10.0,
+            abundance: Parameter::fixed(1.0),
+            thickness_cm: 0.1,
+            number_density: 1e-3,
+            spin_groups: vec![
+                // s-wave group implies I=0 for J=0.5
+                SpinGroup {
+                    j: 0.5,
+                    channels: vec![Channel {
+                        l: 0,
+                        channel_spin: 0.5,
+                        radius: 2.908,
+                        effective_radius: 2.908,
+                    }],
+                    resonances: vec![],
+                },
+                // non-s-wave J that would mislead if used.
+                SpinGroup {
+                    j: 3.5,
+                    channels: vec![Channel {
+                        l: 2,
+                        channel_spin: 0.5,
+                        radius: 2.908,
+                        effective_radius: 2.908,
+                    }],
+                    resonances: vec![],
+                },
+            ],
+        };
+
+        assert!((infer_target_spin(&isotope) - 0.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_infer_target_spin_no_s_wave_defaults_zero() {
+        let isotope = IsotopeParams {
+            name: "Infer-None".to_string(),
+            awr: 10.0,
+            abundance: Parameter::fixed(1.0),
+            thickness_cm: 0.1,
+            number_density: 1e-3,
+            spin_groups: vec![SpinGroup {
+                j: 1.5,
+                channels: vec![Channel {
+                    l: 1,
+                    channel_spin: 0.5,
+                    radius: 2.908,
+                    effective_radius: 2.908,
+                }],
+                resonances: vec![],
+            }],
+        };
+
+        assert_eq!(infer_target_spin(&isotope), 0.0);
     }
 }

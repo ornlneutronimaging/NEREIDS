@@ -110,6 +110,12 @@ pub fn reich_moore_cross_sections(
     let rho_phase_e = k_inv_fm * ap_phase; // phase radius for hard-sphere phase
     let (p_e, _s_e) = penetration_shift_factors(entrance_channel.l, rho_e)?;
     let (cos_2phi, sin_2phi) = hard_sphere_phase(entrance_channel.l, rho_phase_e)?;
+    let apply_potential_correction = config.include_potential
+        && sammy_potential_correction_applies(
+            spin_group.j,
+            config.target_spin,
+            entrance_channel.l,
+        );
 
     // Special case: if there are no resonances, return potential-only scattering when requested.
     if resonances.is_empty() {
@@ -117,7 +123,7 @@ pub fn reich_moore_cross_sections(
         let k_sq = k_inv_fm * k_inv_fm;
         let norm = std::f64::consts::PI / k_sq * g_j * 0.01; // π·g_J / K² in barns
 
-        if !config.include_potential {
+        if !apply_potential_correction {
             return Ok(CrossSections::default());
         }
 
@@ -305,7 +311,7 @@ pub fn reich_moore_cross_sections(
     let sigma_c = sigma_trans - sigma_f - sigma_el;
 
     // Potential scattering correction.
-    let sigma_el_corrected = if config.include_potential {
+    let sigma_el_corrected = if apply_potential_correction {
         sigma_el + norm * 2.0 * (1.0 - cos_2phi)
     } else {
         sigma_el
@@ -319,6 +325,47 @@ pub fn reich_moore_cross_sections(
         fission: sigma_f,
         total: sigma_tot,
     })
+}
+
+/// Whether SAMMY adds the hard-sphere potential correction for this spin group.
+///
+/// Mirrors `dopush1.f90` logic:
+/// - `Ajmin = abs(abs(I - l) - 1/2)`
+/// - `Ajmax = I + l + 1/2`
+/// - `Numj = (Ajmax - Ajmin) + 1.001`
+/// - `Jjl = 0` only in the special non-s-wave branch, otherwise `1`
+/// - correction applies when `JJ > Jjl && JJ < Numj`
+fn sammy_potential_correction_applies(spin_j: f64, target_spin: f64, l: u32) -> bool {
+    let fl = l as f64;
+    let ajmin = ((target_spin - fl).abs() - 0.5).abs();
+    let ajmax = target_spin + fl + 0.5;
+    let numj = ((ajmax - ajmin) + 1.001).floor() as i32;
+    if numj <= 0 {
+        return false;
+    }
+
+    let jjl = if l != 0 && (fl > target_spin - 0.5 && fl <= target_spin) {
+        0
+    } else {
+        1
+    };
+
+    // Map the actual J to SAMMY's JJ index (1-based).
+    let tol = 1e-8;
+    let mut jj_index = None;
+    for jj in 1..=numj {
+        let ajc = ajmin + (jj - 1) as f64;
+        if (spin_j - ajc).abs() <= tol {
+            jj_index = Some(jj);
+            break;
+        }
+    }
+
+    let Some(jj) = jj_index else {
+        return false;
+    };
+
+    jj > jjl && jj < numj
 }
 
 /// Complex 3x3 inversion that mirrors SAMMY `Frobns` + `Thrinv` in `dopush1.f90`.
@@ -445,7 +492,7 @@ mod tests {
             include_potential: false,
         };
 
-        let result = reich_moore_cross_sections(1.0, &[], &spin_group, &config).unwrap();
+        let result = reich_moore_cross_sections(1.0e6, &[], &spin_group, &config).unwrap();
         assert_eq!(result.elastic, 0.0);
         assert_eq!(result.capture, 0.0);
         assert_eq!(result.fission, 0.0);
@@ -471,19 +518,47 @@ mod tests {
             include_potential: true,
         };
 
-        let result = reich_moore_cross_sections(1.0, &[], &spin_group, &config).unwrap();
+        let result = reich_moore_cross_sections(1.0e6, &[], &spin_group, &config).unwrap();
+        // For s-wave boundary J groups, SAMMY does not apply the extra potential term.
+        assert_eq!(result.elastic, 0.0);
+        assert_eq!(result.capture, 0.0);
+        assert_eq!(result.fission, 0.0);
+        assert_eq!(result.total, 0.0);
+    }
+
+    #[test]
+    fn test_cross_sections_zero_resonances_with_potential_interior_j() {
+        let spin_group = SpinGroup {
+            // For I=1 and l=1, J={0.5,1.5,2.5}; J=1.5 is interior and gets correction.
+            j: 1.5,
+            channels: vec![Channel {
+                l: 1,
+                channel_spin: 0.5,
+                radius: 2.908,
+                effective_radius: 2.908,
+            }],
+            resonances: vec![],
+        };
+
+        let config = RMatrixConfig {
+            target_spin: 1.0,
+            awr: 10.0,
+            include_potential: true,
+        };
+
+        let result = reich_moore_cross_sections(1.0e6, &[], &spin_group, &config).unwrap();
         assert!(result.elastic > 0.0);
         assert_eq!(result.capture, 0.0);
         assert_eq!(result.fission, 0.0);
-        assert!((result.total - result.elastic).abs() < 1e-14);
+        assert!(result.total > 0.0);
     }
 
     #[test]
     fn test_cross_sections_use_effective_radius_for_phase() {
         let spin_group_a = SpinGroup {
-            j: 0.5,
+            j: 1.5,
             channels: vec![Channel {
-                l: 0,
+                l: 1,
                 channel_spin: 0.5,
                 radius: 2.0,
                 effective_radius: 2.0,
@@ -494,15 +569,25 @@ mod tests {
         spin_group_b.channels[0].effective_radius = 4.0;
 
         let config = RMatrixConfig {
-            target_spin: 0.0,
+            target_spin: 1.0,
             awr: 10.0,
             include_potential: true,
         };
 
-        let a = reich_moore_cross_sections(1.0, &[], &spin_group_a, &config).unwrap();
-        let b = reich_moore_cross_sections(1.0, &[], &spin_group_b, &config).unwrap();
+        let a = reich_moore_cross_sections(1.0e6, &[], &spin_group_a, &config).unwrap();
+        let b = reich_moore_cross_sections(1.0e6, &[], &spin_group_b, &config).unwrap();
 
         assert!((a.elastic - b.elastic).abs() > 1e-12);
+    }
+
+    #[test]
+    fn test_sammy_potential_correction_gating() {
+        // s-wave (l=0), I=0 => J=0.5 is boundary-only; no correction.
+        assert!(!sammy_potential_correction_applies(0.5, 0.0, 0));
+        // p-wave (l=1), I=1 => J=1.5 interior; correction applies.
+        assert!(sammy_potential_correction_applies(1.5, 1.0, 1));
+        // p-wave (l=1), I=1 => J=2.5 max boundary; no correction.
+        assert!(!sammy_potential_correction_applies(2.5, 1.0, 1));
     }
 
     #[test]
