@@ -11,9 +11,14 @@ pub struct FitConfig {
     pub max_iterations: usize,
     /// Convergence tolerance on chi-squared change.
     pub tolerance: f64,
-    /// Prior parameter values (for Bayesian fitting).
+    /// Prior parameter values for Bayesian fitting (length `n_params`).
     pub prior_values: Option<Vec<f64>>,
-    /// Prior covariance matrix (diagonal, for Bayesian fitting).
+    /// Prior covariance matrix for Bayesian fitting
+    /// (flattened row-major, `n_params` x `n_params`).
+    ///
+    /// This is the M matrix in SAMMY's (M+W) inversion. For independent
+    /// priors, only the diagonal is non-zero, but the full matrix is stored
+    /// to support correlated priors.
     pub prior_covariance: Option<Vec<f64>>,
 }
 

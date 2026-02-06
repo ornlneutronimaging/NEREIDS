@@ -20,7 +20,9 @@ pub use constants::*;
 pub use energy::EnergyGrid;
 pub use error::{Error, FitError, IoError, PhysicsError};
 pub use forward_model::{ForwardModel, ForwardModelConfig};
-pub use nuclear::{Channel, IsotopeParams, RMatrixParameters, Resonance, SpinGroup};
+pub use nuclear::{
+    Channel, FissionWidths, IsotopeParams, Parameter, RMatrixParameters, Resonance, SpinGroup,
+};
 pub use optimizer::{FitConfig, FitResult, Optimizer};
 pub use resolution::ResolutionFunction;
 pub use transmission::{PixelData, TransmissionSpectrum};

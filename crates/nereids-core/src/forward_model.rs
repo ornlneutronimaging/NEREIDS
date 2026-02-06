@@ -46,7 +46,10 @@ pub trait ForwardModel: Send + Sync {
     /// Compute predicted transmission spectrum with Jacobian (partial derivatives
     /// with respect to fitted parameters).
     ///
-    /// Returns `(transmission, jacobian)` where jacobian\[i\]\[j\] = `dT_j` / `dp_i`.
+    /// Returns `(transmission, jacobian)` where the Jacobian has shape
+    /// `[n_energy][n_params]`: `jacobian[i][j]` = `dT_i` / `dp_j`.
+    /// This follows the standard convention where rows are observations and
+    /// columns are parameters.
     fn transmission_with_jacobian(
         &self,
         energy: &EnergyGrid,

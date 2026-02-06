@@ -1,31 +1,50 @@
 //! Nuclear data types for R-matrix parameterization.
 
-/// Flags indicating which resonance parameters are allowed to vary during fitting.
-#[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, Default)]
-pub struct VaryFlags {
-    pub energy: bool,
-    pub gamma_n: bool,
-    pub gamma_g: bool,
-    pub gamma_f1: bool,
-    pub gamma_f2: bool,
+/// A single fit parameter: a value paired with whether it varies during optimization.
+#[derive(Debug, Clone, Copy)]
+pub struct Parameter {
+    pub value: f64,
+    pub vary: bool,
+}
+
+impl Parameter {
+    /// Create a fixed parameter (will not vary during fitting).
+    pub fn fixed(value: f64) -> Self {
+        Self { value, vary: false }
+    }
+
+    /// Create a free parameter (will vary during fitting).
+    pub fn free(value: f64) -> Self {
+        Self { value, vary: true }
+    }
+}
+
+impl Default for Parameter {
+    fn default() -> Self {
+        Self::fixed(0.0)
+    }
+}
+
+/// Fission widths for fissile isotopes.
+#[derive(Debug, Clone, Copy)]
+pub struct FissionWidths {
+    /// First fission width (`Γ_f1`) in eV.
+    pub gamma_f1: Parameter,
+    /// Second fission width (`Γ_f2`) in eV.
+    pub gamma_f2: Parameter,
 }
 
 /// A single nuclear resonance with its parameters.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Resonance {
     /// Resonance energy in eV.
-    pub energy: f64,
+    pub energy: Parameter,
     /// Neutron width (`Γ_n`) in eV.
-    pub gamma_n: f64,
+    pub gamma_n: Parameter,
     /// Capture width (`Γ_γ`) in eV.
-    pub gamma_g: f64,
-    /// First fission width (`Γ_f1`) in eV. Zero for non-fissile isotopes.
-    pub gamma_f1: f64,
-    /// Second fission width (`Γ_f2`) in eV. Zero for non-fissile isotopes.
-    pub gamma_f2: f64,
-    /// Which parameters may vary during fitting.
-    pub vary: VaryFlags,
+    pub gamma_g: Parameter,
+    /// Fission widths. `None` for non-fissile isotopes.
+    pub fission: Option<FissionWidths>,
 }
 
 /// A reaction channel defined by angular momentum and spin quantum numbers.
