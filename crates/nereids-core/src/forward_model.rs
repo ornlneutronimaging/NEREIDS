@@ -57,6 +57,9 @@ pub trait ForwardModel: Send + Sync {
     /// `[n_energy][n_params]`: `jacobian[i][j]` = `dT_i` / `dp_j`.
     /// This follows the standard convention where rows are observations and
     /// columns are parameters.
+    ///
+    /// Performance note: implementations may use finite-difference fallback
+    /// Jacobians when analytic derivatives are not yet available.
     fn transmission_with_jacobian(
         &self,
         energy: &EnergyGrid,

@@ -23,16 +23,14 @@
 //!
 //! # Jacobian Derivatives
 //!
-//! For fitting, we compute partial derivatives:
+//! Current Phase 1b implementation supports only normalization derivatives:
 //!
 //! ```text
 //! dFinal/d(Norm) = T(E)
-//! dFinal/d(BackA) = 1
-//! dFinal/d(BackB) = 1 / √E
-//! dFinal/d(BackC) = √E
-//! dFinal/d(BackD) = exp(-BackF / √E)
-//! dFinal/d(BackF) = -BackD * exp(-BackF / √E) / √E
 //! ```
+//!
+//! Background-parameter Jacobians are not yet parameterized in `NormalizationConfig`
+//! and are deferred to a later fitting phase.
 //!
 //! # References
 //!
@@ -120,7 +118,6 @@ pub fn apply_normalization(
 ///
 /// Columns correspond to free parameters (where `vary=true`):
 /// - Normalization (if varied)
-/// - Background parameters (depending on model, if varied)
 ///
 /// Shape: `[n_energy × n_norm_params]`
 ///
@@ -132,7 +129,10 @@ pub fn apply_normalization(
 ///
 /// # Jacobian Formulas
 ///
-/// See module documentation for derivatives of each background model.
+/// Current implementation:
+/// - `dFinal/d(Norm) = T(E)` when `normalization.vary=true`
+///
+/// Background-parameter derivatives are not implemented yet.
 ///
 /// # References
 ///

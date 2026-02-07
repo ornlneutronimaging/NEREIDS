@@ -57,7 +57,7 @@ Following the rustpix pattern, use `hdf5-metno` (MET Norway's fork) aliased as `
 
 - `ForwardModel` trait: central abstraction replacing `TransmissionModel`. Computes predicted transmission spectrum from energy grid + R-matrix parameters + configuration. Supports Jacobian computation for gradient-based fitting.
 - `ResolutionFunction` trait: pluggable instrument response (Gaussian for testing, tabulated for VENUS MC data).
-- `BackgroundModel` trait: constant, polynomial, or energy-dependent background.
+- `Background` enum: SAMMY-aligned background terms (none, constant, `1/sqrt(E)`, `sqrt(E)`, exponential).
 - `Optimizer` trait: pluggable fitting algorithm. Default implementation is Bayes/GLS from SAMMY.
 
 ### GUI distribution

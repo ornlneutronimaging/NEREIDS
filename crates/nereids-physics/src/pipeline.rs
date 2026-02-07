@@ -324,6 +324,8 @@ impl ForwardModel for DefaultForwardModel {
         // 2. Finite-difference Jacobian for free R-matrix parameters.
         // This keeps derivatives physically coupled to the current transmission path
         // until analytic cross-section Jacobians are introduced.
+        // Cost scales with number of free parameters; optimize with analytic/cached
+        // derivatives in future phases.
         let n_free_params = count_free_params(params);
         let free_paths = collect_free_param_paths(params);
         debug_assert_eq!(free_paths.len(), n_free_params);
