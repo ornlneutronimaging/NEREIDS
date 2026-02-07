@@ -48,7 +48,9 @@ const KERNEL_CUTOFF: f64 = 4.0;
 ///
 /// where AWR = target mass / neutron mass (dimensionless).
 pub fn doppler_width(energy_ev: f64, temp_k: f64, awr: f64) -> f64 {
-    (4.0 * BOLTZMANN_EV_PER_K * temp_k * energy_ev / awr).sqrt()
+    // Use |E| so negative incident energies (supported by Reich-Moore) produce
+    // a real Doppler width instead of NaN.
+    (4.0 * BOLTZMANN_EV_PER_K * temp_k * energy_ev.abs() / awr).sqrt()
 }
 
 /// Apply free-gas Doppler broadening to cross sections.
@@ -91,15 +93,15 @@ pub fn broaden_cross_sections(
         )));
     }
 
-    // No broadening at T <= 0
-    if temperature_k <= 0.0 {
-        return Ok(xs_0k.to_vec());
-    }
-
     if !temperature_k.is_finite() {
         return Err(PhysicsError::InvalidParameter(format!(
             "temperature must be finite, got {temperature_k}"
         )));
+    }
+
+    // No broadening at T <= 0
+    if temperature_k <= 0.0 {
+        return Ok(xs_0k.to_vec());
     }
 
     let mut broadened = vec![0.0; n];
