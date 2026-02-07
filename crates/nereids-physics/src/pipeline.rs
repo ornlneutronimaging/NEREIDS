@@ -275,8 +275,12 @@ fn compute_beer_lambert_transmission_multi_isotope(
         };
         let isotope_cs = compute_0k_cross_sections(energy, &single_params, config)?;
 
-        // Apply Doppler broadening if temperature > 0
-        let total_xs: Vec<f64> = if config.temperature_k > 0.0 {
+        // Apply Doppler broadening if temperature > 0.
+        // Route through broaden_cross_sections unconditionally when temperature
+        // is non-zero or non-finite so its validation catches NaN/Inf.
+        let total_xs: Vec<f64> = if config.temperature_k > 0.0
+            || !config.temperature_k.is_finite()
+        {
             let xs_0k: Vec<f64> = isotope_cs.iter().map(|cs| cs.total).collect();
             broaden_cross_sections(&xs_0k, &energy.values, isotope.awr, config.temperature_k)?
         } else {

@@ -229,8 +229,12 @@ pub fn create_auxiliary_grid(
         // Span: max of 5*Γ (resolve resonance) or 5*Δ (cover Doppler kernel)
         let span = (5.0 * gamma).max(5.0 * delta).max(0.01);
 
-        // Fine spacing: Γ/10 or Δ/20, whichever is smaller, minimum 1e-5 eV
-        let spacing = (gamma / 10.0).min(delta / 20.0 + 1e-30).max(1e-5);
+        // Fine spacing: min of Γ/10 and Δ/20 (only consider Δ when broadening is active)
+        let spacing = if delta > 0.0 {
+            (gamma / 10.0).min(delta / 20.0).max(1e-5)
+        } else {
+            (gamma / 10.0).max(1e-5)
+        };
 
         let e_lo = (e_res - span).max(0.0);
         let e_hi = e_res + span;
