@@ -186,7 +186,8 @@ fn test_ex005b_50k() {
 
     // Create auxiliary fine grid that resolves the narrow resonance (meV-scale)
     let aux_grid =
-        create_auxiliary_grid(&exp_data.energies, &res_energies, &res_widths, 50.0, 10.0);
+        create_auxiliary_grid(&exp_data.energies, &res_energies, &res_widths, 50.0, 10.0)
+            .expect("Failed to create auxiliary grid");
     println!(
         "\n=== ex005b: auxiliary grid has {} points (data grid has {}) ===",
         aux_grid.len(),

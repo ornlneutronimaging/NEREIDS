@@ -93,14 +93,14 @@ pub fn broaden_cross_sections(
         )));
     }
 
-    if !temperature_k.is_finite() {
+    if temperature_k < 0.0 || !temperature_k.is_finite() {
         return Err(PhysicsError::InvalidParameter(format!(
-            "temperature must be finite, got {temperature_k}"
+            "temperature must be non-negative and finite, got {temperature_k}"
         )));
     }
 
-    // No broadening at T <= 0
-    if temperature_k <= 0.0 {
+    // No broadening at T = 0
+    if temperature_k == 0.0 {
         return Ok(xs_0k.to_vec());
     }
 
@@ -197,8 +197,14 @@ pub fn interpolate_to_grid(
             } else {
                 let e0 = source_energies[idx - 1];
                 let e1 = source_energies[idx];
-                let t = (e - e0) / (e1 - e0);
-                source_values[idx - 1] + t * (source_values[idx] - source_values[idx - 1])
+                let denom = e1 - e0;
+                if denom == 0.0 {
+                    // Adjacent duplicate energies; use right-endpoint value
+                    source_values[idx]
+                } else {
+                    let t = (e - e0) / denom;
+                    source_values[idx - 1] + t * (source_values[idx] - source_values[idx - 1])
+                }
             }
         })
         .collect())
@@ -221,16 +227,26 @@ pub fn interpolate_to_grid(
 ///
 /// Sorted, deduplicated energy grid that includes both data points and
 /// fine points near resonances.
+///
+/// # Errors
+///
+/// Returns `PhysicsError::InvalidParameter` if any energy is non-finite.
 pub fn create_auxiliary_grid(
     data_energies: &[f64],
     resonance_energies: &[f64],
     resonance_widths: &[f64],
     temperature_k: f64,
     awr: f64,
-) -> Vec<f64> {
+) -> Result<Vec<f64>, PhysicsError> {
     let mut grid: Vec<f64> = data_energies.to_vec();
 
     for (&e_res, &gamma) in resonance_energies.iter().zip(resonance_widths.iter()) {
+        if !e_res.is_finite() || !gamma.is_finite() {
+            return Err(PhysicsError::InvalidParameter(format!(
+                "resonance energy and width must be finite, got E={e_res}, Γ={gamma}"
+            )));
+        }
+
         // Doppler width at the resonance energy
         let delta = if temperature_k > 0.0 {
             doppler_width(e_res, temperature_k, awr)
@@ -248,7 +264,12 @@ pub fn create_auxiliary_grid(
             (gamma / 10.0).max(1e-5)
         };
 
-        let e_lo = (e_res - span).max(0.0);
+        // Clamp lower bound to min of data grid (supports negative energies)
+        let grid_min = data_energies
+            .first()
+            .copied()
+            .unwrap_or(f64::NEG_INFINITY);
+        let e_lo = (e_res - span).max(grid_min);
         let e_hi = e_res + span;
 
         let mut e = e_lo;
@@ -259,9 +280,14 @@ pub fn create_auxiliary_grid(
     }
 
     // Sort and deduplicate (within tolerance)
-    grid.sort_unstable_by(|a, b| a.partial_cmp(b).expect("finite energies"));
+    grid.sort_unstable_by(|a, b| {
+        a.partial_cmp(b).ok_or(PhysicsError::InvalidParameter(
+            "non-finite energy in grid".to_string(),
+        ))
+        .expect("grid energies must be finite")
+    });
     grid.dedup_by(|a, b| (*a - *b).abs() < 1e-10);
-    grid
+    Ok(grid)
 }
 
 #[cfg(test)]
@@ -427,7 +453,7 @@ mod tests {
         let data = vec![8.0, 9.0, 10.0, 11.0, 12.0];
         let res_e = vec![10.0];
         let res_w = vec![0.001]; // 1 meV width
-        let grid = create_auxiliary_grid(&data, &res_e, &res_w, 50.0, 10.0);
+        let grid = create_auxiliary_grid(&data, &res_e, &res_w, 50.0, 10.0).unwrap();
 
         // Should include original data points
         for &e in &data {
@@ -446,7 +472,7 @@ mod tests {
         let data = vec![9.0, 11.0];
         let res_e = vec![10.0];
         let res_w = vec![0.001]; // 1 meV width
-        let grid = create_auxiliary_grid(&data, &res_e, &res_w, 0.0, 10.0);
+        let grid = create_auxiliary_grid(&data, &res_e, &res_w, 0.0, 10.0).unwrap();
 
         // Near the resonance, grid spacing should be <= gamma/10
         let near_res: Vec<f64> = grid

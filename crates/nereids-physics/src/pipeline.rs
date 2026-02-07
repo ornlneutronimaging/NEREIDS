@@ -275,17 +275,11 @@ fn compute_beer_lambert_transmission_multi_isotope(
         };
         let isotope_cs = compute_0k_cross_sections(energy, &single_params, config)?;
 
-        // Apply Doppler broadening if temperature > 0.
-        // Route through broaden_cross_sections unconditionally when temperature
-        // is non-zero or non-finite so its validation catches NaN/Inf.
-        let total_xs: Vec<f64> = if config.temperature_k > 0.0
-            || !config.temperature_k.is_finite()
-        {
-            let xs_0k: Vec<f64> = isotope_cs.iter().map(|cs| cs.total).collect();
-            broaden_cross_sections(&xs_0k, &energy.values, isotope.awr, config.temperature_k)?
-        } else {
-            isotope_cs.iter().map(|cs| cs.total).collect()
-        };
+        // Apply Doppler broadening (broaden_cross_sections validates temperature
+        // and returns xs_0k unchanged at T=0, so always route through it).
+        let xs_0k: Vec<f64> = isotope_cs.iter().map(|cs| cs.total).collect();
+        let total_xs =
+            broaden_cross_sections(&xs_0k, &energy.values, isotope.awr, config.temperature_k)?;
 
         for (i, &sigma_total) in total_xs.iter().enumerate() {
             if sigma_total < 0.0 {
@@ -776,5 +770,51 @@ mod tests {
 
         // 1 abundance + 1 energy + 1 gamma_g + 1 gamma_n = 4 free params
         assert_eq!(count_free_params(&params), 4);
+    }
+
+    #[test]
+    fn test_pipeline_with_doppler_broadening() {
+        let model = DefaultForwardModel { resolution: None };
+        let energy = EnergyGrid::new(vec![1.0, 5.0, 10.0, 15.0, 20.0]).unwrap();
+        let params = RMatrixParameters {
+            isotopes: vec![create_test_isotope()],
+        };
+
+        // Without broadening (T=0)
+        let config_0k = ForwardModelConfig::default();
+        let t_0k = model.transmission(&energy, &params, &config_0k).unwrap();
+
+        // With broadening (T=300K) — exercises the Doppler code path
+        let config_300k = ForwardModelConfig {
+            temperature_k: 300.0,
+            ..ForwardModelConfig::default()
+        };
+        let t_300k = model.transmission(&energy, &params, &config_300k).unwrap();
+
+        // Both should return valid transmission values
+        assert_eq!(t_0k.len(), 5);
+        assert_eq!(t_300k.len(), 5);
+        for (&t0, &t3) in t_0k.iter().zip(t_300k.iter()) {
+            assert!(t0 >= 0.0 && t0 <= 1.0);
+            assert!(t3 >= 0.0 && t3 <= 1.0);
+        }
+        // Note: on a coarse grid the broadening effect may be negligible.
+        // Broadening accuracy is validated by ex005 integration tests.
+    }
+
+    #[test]
+    fn test_pipeline_rejects_negative_temperature() {
+        let model = DefaultForwardModel { resolution: None };
+        let energy = EnergyGrid::new(vec![1.0, 5.0]).unwrap();
+        let params = RMatrixParameters {
+            isotopes: vec![create_test_isotope()],
+        };
+        let config = ForwardModelConfig {
+            temperature_k: -50.0,
+            ..ForwardModelConfig::default()
+        };
+
+        let result = model.transmission(&energy, &params, &config);
+        assert!(result.is_err());
     }
 }

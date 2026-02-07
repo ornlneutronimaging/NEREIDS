@@ -87,9 +87,10 @@ pub fn reich_moore_cross_sections(
             config.awr
         )));
     }
-    const TWOMHB: f64 = 2.196_807_132_5e-4; // 1/(fm*sqrt(eV)); SAMMY mmas7.f90 (Kvendf=2)
-                                            // SAMMY Csrmat uses DefTargetMass in amu:
-                                            // Arat = DefTargetMass / (DefTargetMass + Aneutr)
+    // SAMMY mmas7.f90 (Kvendf=2): 1/(fm*sqrt(eV))
+    // SAMMY Csrmat uses DefTargetMass in amu:
+    // Arat = DefTargetMass / (DefTargetMass + Aneutr)
+    const TWOMHB: f64 = 2.196_807_132_5e-4;
     const ANEUTR_AMU: f64 = 1.008_664_904;
     let a_ratio = config.awr / (config.awr + ANEUTR_AMU);
     let k_inv_fm = TWOMHB * a_ratio * energy.abs().sqrt();
