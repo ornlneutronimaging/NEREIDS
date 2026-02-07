@@ -214,7 +214,8 @@ fn test_ex005b_50k() {
         broaden_cross_sections(&capture_0k, &aux_grid, 10.0, 50.0).expect("Broadening failed");
 
     // Interpolate broadened result to data energies
-    let theory = interpolate_to_grid(&aux_grid, &capture_50k, &exp_data.energies);
+    let theory = interpolate_to_grid(&aux_grid, &capture_50k, &exp_data.energies)
+        .expect("Interpolation failed");
 
     // Print diagnostics near the resonance
     println!("=== ex005b diagnostics (50K broadened) ===");

@@ -174,9 +174,19 @@ pub fn interpolate_to_grid(
     source_energies: &[f64],
     source_values: &[f64],
     target_energies: &[f64],
-) -> Vec<f64> {
+) -> Result<Vec<f64>, PhysicsError> {
+    if source_energies.is_empty() {
+        return Err(PhysicsError::EmptyEnergyGrid);
+    }
+    if source_values.len() != source_energies.len() {
+        return Err(PhysicsError::DimensionMismatch {
+            expected: source_energies.len(),
+            got: source_values.len(),
+        });
+    }
+
     let n_src = source_energies.len();
-    target_energies
+    Ok(target_energies
         .iter()
         .map(|&e| {
             let idx = source_energies.partition_point(|&x| x < e);
@@ -191,7 +201,7 @@ pub fn interpolate_to_grid(
                 source_values[idx - 1] + t * (source_values[idx] - source_values[idx - 1])
             }
         })
-        .collect()
+        .collect())
 }
 
 /// Create an auxiliary energy grid that resolves narrow resonances.
@@ -380,7 +390,7 @@ mod tests {
         let src_xs = vec![10.0, 20.0, 30.0, 40.0];
         let tgt_e = vec![1.5, 2.5, 3.5];
 
-        let result = interpolate_to_grid(&src_e, &src_xs, &tgt_e);
+        let result = interpolate_to_grid(&src_e, &src_xs, &tgt_e).unwrap();
         assert!((result[0] - 15.0).abs() < 1e-10);
         assert!((result[1] - 25.0).abs() < 1e-10);
         assert!((result[2] - 35.0).abs() < 1e-10);
@@ -392,11 +402,11 @@ mod tests {
         let src_xs = vec![20.0, 40.0];
 
         // Below range: returns first value
-        let result = interpolate_to_grid(&src_e, &src_xs, &[1.0]);
+        let result = interpolate_to_grid(&src_e, &src_xs, &[1.0]).unwrap();
         assert!((result[0] - 20.0).abs() < 1e-10);
 
         // Above range: returns last value
-        let result = interpolate_to_grid(&src_e, &src_xs, &[5.0]);
+        let result = interpolate_to_grid(&src_e, &src_xs, &[5.0]).unwrap();
         assert!((result[0] - 40.0).abs() < 1e-10);
     }
 
