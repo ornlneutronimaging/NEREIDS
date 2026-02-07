@@ -76,7 +76,9 @@ impl Default for NormalizationConfig {
 ///
 /// # Errors
 ///
-/// Returns `PhysicsError` if transmission and energy grid lengths don't match
+/// Returns `PhysicsError` if transmission and energy grid lengths don't match,
+/// or if the configured background model cannot be evaluated on the energy grid
+/// (for example, non-positive energies with `sqrt`-based backgrounds).
 ///
 /// # References
 ///
@@ -95,7 +97,7 @@ pub fn apply_normalization(
     }
 
     // Evaluate background at all energies
-    let background = config.background.evaluate(energy);
+    let background = config.background.evaluate(energy)?;
 
     // Apply normalization and background
     let mut final_spectrum = Vec::with_capacity(transmission.len());
@@ -161,16 +163,12 @@ pub fn apply_normalization_with_jacobian(
     // Initialize Jacobian matrix
     let mut jacobian = vec![vec![0.0; n_free_params]; n_energy];
 
-    // Column index tracker
-    let mut col_idx = 0;
-
     // Derivative with respect to normalization
     if config.normalization.vary {
         for (i, &t) in transmission.iter().enumerate() {
             // dFinal/d(Norm) = T(E)
-            jacobian[i][col_idx] = t;
+            jacobian[i][0] = t;
         }
-        col_idx += 1;
     }
 
     // TODO: Add derivatives for background parameters when needed
