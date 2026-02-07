@@ -1,0 +1,152 @@
+
+ **********************************************************
+ ***                                                    ***
+ ***                 SAMMY Version 8.0.0                ***
+ ***                                                    ***
+ **********************************************************
+
+ Name of input file: 
+ >>> ex005b.inp                                                             <<<
+ Name of parameter file: 
+ >>> ex005a.par                                                             <<<
+ Values used for constants -- Kvendf=1
+   mass of neutron =   1.008664915600000 in amu
+   sqrt(m/2)       =  72.298252179105063
+   sqrt(2m)/hbar   =   0.000219680775849
+   Boltzman        =   0.000086173430000
+   finestructure   =   0.034447599938334 in 1/(amu*F)
+ GENERATE ODF FILE AUtomatically                                               
+ Name of experimental data file is: 
+ >>> ex005a.dat                                                             <<<
+ Emin and Emax =    8.00000       12.0000    
+
+
+ *****************************************************************************
+ *****                                                                   *****
+ ***** Example # 005b                                                    *****
+ *****                                                                   *****
+ *****************************************************************************
+
+
+ Input quantities from line number 2 are:
+   Alfnm1, Alfnm2 = ##element   ##       Atomic Weight =  10.000000
+   Nepnts Itmax  Icorr  Nxtra  Iptdop Iptwid Ixxchn
+        0      0      0      0      0      0      0
+   Ndigit Idropp Matnum Kkkkza
+        2      2      0      0
+Adjusted  Itmax  Icorr  Nxtra  Iptdop Iptwid Ixxchn
+        0      0     50      0      9      5      0
+   Ndigit Idropp Matnum Kkkkza
+        2      2      0      0
+
+
+ TARGET ELEMENT IS element   
+ ATOMIC WEIGHT IS  10.000000
+
+
+ *********** Alphanumeric Control Information *********
+
+ USE CSISRS FORMAT FOr data              
+ DO NOT SOLVE BAYES EQUATIONS            
+ ODF FILE IS WANTED--SAMMY.ODF ,ZERO-TH O
+ PRINT VARIED INPUT PARAMETERS           
+ CHI SQUARED IS WANTED                   
+                                         
+ **** end of Alphanumeric Control Information *********
+
+
+ ### Estimated array size for SAMMY-INP is       1024 ###
+
+ Effective Temperature=  50.00000
+    Flight Path=   0.00000 Meters +/-   0.00000/2 Meters
+      Deltae=     0.00000    Deltag=     0.00000
+      Delttt=     0.00000    Elowbr=  0.00000000
+
+ Target Thickness=   0.000    
+
+ **** Data type is <<< CAPTUre              >>> ****
+
+ Spin of incident particle is  0.5
+
+ TARGET SPIN=  0.0
+ __________________________
+       #of  #of
+ Group Ent  Exit Jspin Relative  Ispin  g    Chn Lpnt Ishift eL Chspn
+    #  Chn  Chn         Abndnc                 #
+    1    1    0    0.5  1.0000    0.0 1.0000
+                                               1   1   0     0   0.5    
+__________________________
+ 
+ ### Array size used for SAMMY-INP is        582 ###
+ ### Estimated array size for SAMMY-PAR is        603 ###
+
+ Total  number of resonances is    1
+ Number of particle channels is    1
+ Number of spin groups is          1
+ Number of flagged parametrs is    0
+ Number of varied parameters is    0
+ ### Array size used for SAMMY-PAR is        588 ###
+ ### Estimated array size for SAMMY-NEW is        585 ###
+
+
+
+
+ ***** INITIAL VALUES FOR PARAMETERS                     
+
+
+    RADIUS          TEMPERATURE     THICKNESS
+  2.9080E+00       5.0000E+01       0.0000E+00     
+
+    DELTA-L         DELTA-T-GAUS     DELTA-T-EXP
+  0.0000E+00       0.0000E+00       0.0000E+00     
+ ### Array size used for SAMMY-NEW is        584 ###
+ Emin   8.00000     is less than the minimum energy in the data set
+ Emin has been changed to   8.03684    
+ First 5 energies=
+     8.046600       8.124700       8.202800       8.280900       8.358900    
+ Last  5 energies=
+     11.95400       11.87600       11.79800       11.75900       11.68100    
+ Emax   12.0000     is greater than the maximum energy in the data set
+ Emax has been changed to   11.9638    
+ First 5 energies=
+     8.046600       8.124700       8.202800       8.280900       8.358900    
+ Last  5 energies=
+     11.95400       11.87600       11.79800       11.75900       11.68100    
+     Emind               Emins               Eminr               Emin
+        7.4561328981        8.0368375000        8.0368375000        8.0368375000
+     Emax                Emaxr               Emaxs               Emaxd
+       11.9637500000       11.9637500000       11.9637500000       12.6964301305
+
+ Doppler Width at Emin =  0.118200     and at Emax =  0.144214     eV
+  
+      E(keV)    Dopp_FWHM(keV)
+      0.008037         0.1968
+      0.010000         0.2195
+      0.011964         0.2401
+  
+ ### Estimated array size for SAMMY-DAT is   32498706 +    32500000 ###
+
+ Energy range of data is from 8.03684E+00 to 1.19638E+01 eV.
+ Number of experimental data points =     315
+
+
+** One resonance has fewer than 9 points across width
+ Number of points in auxiliary grid =     370
+ ### Array size used for SAMMY-DAT is   32498703 +    32500000 ###
+ ### Estimated array size for SAMMY-THE is       2210 ###
+ ### Array size used for SAMMY-THE is       2209 ###
+ ### Estimated array size for SAMMY-XCT is       2409 ###
+ ### Array size used for SAMMY-XCT is       2339 ###
+ ### Estimated array size for SAMMY-FGM is       3078 ###
+ ### Array size used for SAMMY-FGM is       3078 ###
+ ### Estimated array size for SAMMY-INT is       3026 ###
+ ### Array size used for SAMMY-INT is       3027 ###
+ ### Estimated array size for SAMMY-IPQ is       2846 ###
+
+ CUSTOMARY CHI SQUARED =   52514.8    
+ CUSTOMARY CHI SQUARED DIVIDED BY NDAT =   166.714    
+ ### Array size used for SAMMY-IPQ is       2850 ###
+ ### Estimated array size for SAMMY-FIN is       1899 ###
+ ### Array size used for SAMMY-FIN is        574 ###
+                              Total time =     0.09 seconds
+ Normal finish to SAMMY

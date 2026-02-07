@@ -1,20 +1,22 @@
 //! Default forward model composing all pipeline stages.
 //!
-//! Pipeline order (Phase 1b):
+//! Pipeline order (Phase 1c):
 //! 1. 0K cross sections (R-matrix)
-//! 2. Beer-Lambert transmission
-//! 3. Normalization + background
+//! 2. Doppler broadening (if temperature > 0)
+//! 3. Beer-Lambert transmission
+//! 4. Normalization + background
 //!
 //! Beer-Lambert is evaluated as:
-//! `T(E) = exp(-Σ_i [n_i * d_i * σ_i(E)])`
+//! `T(E) = exp(-Σ_i [n_i * d_i * σ_i(E; T)])`
 //! where each isotope contributes its own areal density (`n_i*d_i`) and
-//! abundance-weighted isotope cross section `σ_i(E)`.
+//! abundance-weighted isotope cross section `σ_i(E; T)`, Doppler-broadened
+//! at the configured temperature.
 //!
 //! Future phases will add:
-//! - Doppler broadening (Phase 1c)
 //! - Self-shielding (optional)
 //! - Resolution convolution
 
+use crate::broadening::doppler::broaden_cross_sections;
 use crate::rmatrix::cross_section::compute_0k_cross_sections;
 use crate::transmission::normalization::{
     apply_normalization, apply_normalization_with_jacobian, NormalizationConfig,
@@ -272,14 +274,23 @@ fn compute_beer_lambert_transmission_multi_isotope(
             isotopes: vec![isotope.clone()],
         };
         let isotope_cs = compute_0k_cross_sections(energy, &single_params, config)?;
-        for (i, cs) in isotope_cs.iter().enumerate() {
-            if cs.total < 0.0 {
+
+        // Apply Doppler broadening if temperature > 0
+        let total_xs: Vec<f64> = if config.temperature_k > 0.0 {
+            let xs_0k: Vec<f64> = isotope_cs.iter().map(|cs| cs.total).collect();
+            broaden_cross_sections(&xs_0k, &energy.values, isotope.awr, config.temperature_k)?
+        } else {
+            isotope_cs.iter().map(|cs| cs.total).collect()
+        };
+
+        for (i, &sigma_total) in total_xs.iter().enumerate() {
+            if sigma_total < 0.0 {
                 return Err(PhysicsError::InvalidParameter(format!(
                     "negative isotope total cross section for '{}' at energy index {}: {}",
-                    isotope.name, i, cs.total
+                    isotope.name, i, sigma_total
                 )));
             }
-            optical_depth[i] += areal_density * cs.total;
+            optical_depth[i] += areal_density * sigma_total;
         }
     }
 
