@@ -15,7 +15,7 @@ pub mod resolution;
 pub mod transmission;
 
 // Re-export key types at crate root for convenience.
-pub use background::{BackgroundModel, ConstantBackground, PolynomialBackground};
+pub use background::Background;
 pub use constants::*;
 pub use energy::EnergyGrid;
 pub use error::{Error, FitError, IoError, PhysicsError};

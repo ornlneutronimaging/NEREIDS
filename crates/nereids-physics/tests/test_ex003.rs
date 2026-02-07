@@ -6,8 +6,9 @@
 mod parsers;
 
 use nereids_core::energy::EnergyGrid;
-use nereids_core::forward_model::ForwardModelConfig;
+use nereids_core::forward_model::{ForwardModel, ForwardModelConfig};
 use nereids_core::nuclear::{Channel, IsotopeParams, Parameter, RMatrixParameters, SpinGroup};
+use nereids_physics::pipeline::DefaultForwardModel;
 use nereids_physics::rmatrix::compute_0k_cross_sections;
 use parsers::{parse_dat_file, parse_lpt_chi_squared, parse_par_file};
 use std::path::PathBuf;
@@ -276,7 +277,16 @@ fn test_ex003x_transmission() {
     // Load resonance parameters
     let par_path = base_path.join("input/ex003c.par");
     let resonances = parse_par_file(&par_path).expect("Failed to parse PAR file");
-    let params = build_ex003_params(resonances);
+
+    // Build parameters with ex003x-specific areal density
+    // ex003x LPT reports Target Thickness = 0.5000E-04 (areal density n·d)
+    let areal_density = 5.0e-5; // atoms/barn
+    let number_density = 1.0; // atoms/(barn*cm) - arbitrary choice
+    let thickness_cm = areal_density / number_density; // cm
+
+    let mut params = build_ex003_params(resonances);
+    params.isotopes[0].number_density = number_density;
+    params.isotopes[0].thickness_cm = thickness_cm;
 
     // Load experimental data
     let dat_path = base_path.join("input/ex003x.dat");
@@ -286,18 +296,12 @@ fn test_ex003x_transmission() {
     let energy_grid =
         EnergyGrid::new(exp_data.energies.clone()).expect("Failed to create energy grid");
 
-    // Compute cross sections
+    // Compute transmission using full pipeline (Phase 1b)
     let config = ex003_config();
-    let cross_sections = compute_0k_cross_sections(&energy_grid, &params, &config)
-        .expect("Failed to compute cross sections");
-
-    // Compute transmission: T = exp(-n·d·σ_tot)
-    // ex003x LPT reports Target Thickness = 0.5000E-04 (areal density n·d).
-    let areal_density = 5.0e-5; // atoms/barn
-    let transmission: Vec<f64> = cross_sections
-        .iter()
-        .map(|cs| (-areal_density * cs.total).exp())
-        .collect();
+    let model = DefaultForwardModel { resolution: None };
+    let transmission = model
+        .transmission(&energy_grid, &params, &config)
+        .expect("Failed to compute transmission");
 
     // Compute chi-squared
     let chi2 = compute_chi_squared(&transmission, &exp_data.data, &exp_data.uncertainties);

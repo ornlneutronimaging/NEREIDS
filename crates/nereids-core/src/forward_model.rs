@@ -1,5 +1,6 @@
 //! Forward model trait — the central abstraction for transmission computation.
 
+use crate::background::Background;
 use crate::energy::EnergyGrid;
 use crate::error::PhysicsError;
 use crate::nuclear::RMatrixParameters;
@@ -15,6 +16,8 @@ pub struct ForwardModelConfig {
     pub include_potential_scattering: bool,
     /// Whether to apply self-shielding corrections.
     pub self_shielding: bool,
+    /// Background model for additive corrections.
+    pub background: Background,
 }
 
 impl Default for ForwardModelConfig {
@@ -24,6 +27,7 @@ impl Default for ForwardModelConfig {
             normalization: 1.0,
             include_potential_scattering: false,
             self_shielding: false,
+            background: Background::None,
         }
     }
 }
@@ -53,6 +57,9 @@ pub trait ForwardModel: Send + Sync {
     /// `[n_energy][n_params]`: `jacobian[i][j]` = `dT_i` / `dp_j`.
     /// This follows the standard convention where rows are observations and
     /// columns are parameters.
+    ///
+    /// Performance note: implementations may use finite-difference fallback
+    /// Jacobians when analytic derivatives are not yet available.
     fn transmission_with_jacobian(
         &self,
         energy: &EnergyGrid,
