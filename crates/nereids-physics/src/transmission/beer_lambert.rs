@@ -36,11 +36,6 @@
 use crate::rmatrix::reich_moore::CrossSections;
 use nereids_core::PhysicsError;
 
-/// Maximum optical depth to avoid numerical underflow in exp().
-///
-/// exp(-50) ≈ 1.9e-22 is effectively zero for transmission.
-const MAX_OPTICAL_DEPTH: f64 = 50.0;
-
 /// Compute Beer-Lambert transmission for a sample.
 ///
 /// # Formula
@@ -81,10 +76,7 @@ pub fn compute_transmission(
         }
 
         // Compute optical depth: n * d * σ(E)
-        let mut optical_depth: f64 = number_density * thickness_cm * xs.total;
-
-        // Clamp optical depth to avoid underflow
-        optical_depth = optical_depth.min(MAX_OPTICAL_DEPTH);
+        let optical_depth: f64 = number_density * thickness_cm * xs.total;
 
         // Apply Beer-Lambert law
         transmission.push((-optical_depth).exp());
@@ -215,15 +207,14 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_transmission_large_optical_depth_clamped() {
-        // Large cross section to trigger clamping
-        // n=1.0, d=10.0, σ=100.0 → optical_depth = 1000 > 50 (clamped)
-        // T = exp(-50) ≈ 1.9e-22
+    fn test_compute_transmission_large_optical_depth_not_clamped() {
+        // Large optical depth should use the physical Beer-Lambert value directly.
+        // n=1.0, d=10.0, σ=100.0 → optical_depth = 1000
         let xs = const_cross_sections(1, 100.0);
         let result = compute_transmission(&xs, 1.0, 10.0).unwrap();
 
-        let expected = (-MAX_OPTICAL_DEPTH).exp();
-        assert!((result[0] - expected).abs() < 1e-30);
+        let expected = (-1000.0_f64).exp();
+        assert!((result[0] - expected).abs() < f64::EPSILON);
     }
 
     #[test]
