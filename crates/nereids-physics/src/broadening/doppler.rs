@@ -238,6 +238,18 @@ pub fn create_auxiliary_grid(
     temperature_k: f64,
     awr: f64,
 ) -> Result<Vec<f64>, PhysicsError> {
+    if resonance_energies.len() != resonance_widths.len() {
+        return Err(PhysicsError::DimensionMismatch {
+            expected: resonance_energies.len(),
+            got: resonance_widths.len(),
+        });
+    }
+    if data_energies.iter().any(|e| !e.is_finite()) {
+        return Err(PhysicsError::InvalidParameter(
+            "data energies must be finite".to_string(),
+        ));
+    }
+
     let mut grid: Vec<f64> = data_energies.to_vec();
 
     for (&e_res, &gamma) in resonance_energies.iter().zip(resonance_widths.iter()) {
@@ -280,12 +292,12 @@ pub fn create_auxiliary_grid(
     }
 
     // Sort and deduplicate (within tolerance)
-    grid.sort_unstable_by(|a, b| {
-        a.partial_cmp(b).ok_or(PhysicsError::InvalidParameter(
+    if grid.iter().any(|e| !e.is_finite()) {
+        return Err(PhysicsError::InvalidParameter(
             "non-finite energy in grid".to_string(),
-        ))
-        .expect("grid energies must be finite")
-    });
+        ));
+    }
+    grid.sort_unstable_by(f64::total_cmp);
     grid.dedup_by(|a, b| (*a - *b).abs() < 1e-10);
     Ok(grid)
 }
@@ -485,5 +497,23 @@ mod tests {
             "not enough points near resonance: {}",
             near_res.len()
         );
+    }
+
+    #[test]
+    fn test_create_auxiliary_grid_mismatched_resonance_arrays_error() {
+        let result = create_auxiliary_grid(&[8.0, 12.0], &[10.0, 11.0], &[0.001], 50.0, 10.0);
+        assert!(matches!(
+            result,
+            Err(PhysicsError::DimensionMismatch {
+                expected: 2,
+                got: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn test_create_auxiliary_grid_non_finite_data_energy_error() {
+        let result = create_auxiliary_grid(&[8.0, f64::NAN, 12.0], &[10.0], &[0.001], 50.0, 10.0);
+        assert!(matches!(result, Err(PhysicsError::InvalidParameter(_))));
     }
 }
