@@ -1,5 +1,6 @@
 //! Forward model trait — the central abstraction for transmission computation.
 
+use crate::background::Background;
 use crate::energy::EnergyGrid;
 use crate::error::PhysicsError;
 use crate::nuclear::RMatrixParameters;
@@ -15,6 +16,8 @@ pub struct ForwardModelConfig {
     pub include_potential_scattering: bool,
     /// Whether to apply self-shielding corrections.
     pub self_shielding: bool,
+    /// Background model for additive corrections.
+    pub background: Background,
 }
 
 impl Default for ForwardModelConfig {
@@ -24,6 +27,7 @@ impl Default for ForwardModelConfig {
             normalization: 1.0,
             include_potential_scattering: false,
             self_shielding: false,
+            background: Background::None,
         }
     }
 }

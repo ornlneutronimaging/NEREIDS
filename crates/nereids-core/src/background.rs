@@ -1,45 +1,207 @@
 //! Background model types for transmission fitting.
+//!
+//! SAMMY supports multiple background models that add energy-dependent corrections
+//! to the theoretical transmission spectrum. These account for detector response,
+//! scattered neutrons, and other experimental effects.
+//!
+//! # Background Models
+//!
+//! - **None**: No background (zero contribution)
+//! - **Constant**: Energy-independent offset `BackA`
+//! - **`InverseSqrt`**: Inverse square-root term `BackB / √E`
+//! - **Sqrt**: Square-root term `BackC * √E`
+//! - **Exponential**: Exponential decay `BackD * exp(-BackF / √E)`
+//!
+//! # References
+//!
+//! SAMMY `mnrm1.f90` lines 64-68 (background evaluation)
 
 use crate::energy::EnergyGrid;
 
-/// A background model that contributes an additive term to the transmission.
-pub trait BackgroundModel: Send + Sync {
+/// Background model for transmission normalization.
+///
+/// The background is added to the normalized transmission:
+/// `Final(E) = Norm * T(E) + Background(E)`
+///
+/// Each variant corresponds to a term in SAMMY's background model.
+///
+/// # Design Note
+///
+/// Uses enum instead of trait to enable `Clone` (required by `ForwardModelConfig`)
+/// and to allow exhaustive pattern matching in derivative calculations.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Background {
+    /// No background contribution.
+    None,
+
+    /// Constant background (energy-independent).
+    ///
+    /// Formula: `BackA`
+    Constant {
+        /// Background amplitude (dimensionless).
+        value: f64,
+    },
+
+    /// Inverse square-root background.
+    ///
+    /// Formula: `BackB / √E`
+    ///
+    /// Common for detector efficiency corrections.
+    InverseSqrt {
+        /// Coefficient `BackB` [dimensionless or eV^(1/2)].
+        coefficient: f64,
+    },
+
+    /// Square-root background.
+    ///
+    /// Formula: `BackC * √E`
+    ///
+    /// Models energy-dependent scattering.
+    Sqrt {
+        /// Coefficient `BackC` [dimensionless or eV^(-1/2)].
+        coefficient: f64,
+    },
+
+    /// Exponential decay background.
+    ///
+    /// Formula: `BackD * exp(-BackF / √E)`
+    ///
+    /// Models fast-neutron contamination or detector dead-time effects.
+    Exponential {
+        /// Amplitude `BackD` (dimensionless).
+        amplitude: f64,
+        /// Decay factor `BackF` [eV^(1/2)].
+        decay_factor: f64,
+    },
+}
+
+impl Background {
     /// Evaluate the background at each energy point.
-    fn evaluate(&self, energy: &EnergyGrid) -> Vec<f64>;
-}
+    ///
+    /// # Arguments
+    ///
+    /// * `energy` - Energy grid [eV]
+    ///
+    /// # Returns
+    ///
+    /// Background values (same length as energy grid, dimensionless)
+    ///
+    /// # Panics
+    ///
+    /// Panics if any energy value is non-positive (required for sqrt).
+    ///
+    /// # References
+    ///
+    /// SAMMY `mnrm1.f90` lines 64-68
+    pub fn evaluate(&self, energy: &EnergyGrid) -> Vec<f64> {
+        match self {
+            Background::None => vec![0.0; energy.len()],
 
-/// Constant background (energy-independent).
-#[derive(Debug, Clone)]
-pub struct ConstantBackground {
-    pub value: f64,
-}
+            Background::Constant { value } => vec![*value; energy.len()],
 
-impl BackgroundModel for ConstantBackground {
-    fn evaluate(&self, energy: &EnergyGrid) -> Vec<f64> {
-        vec![self.value; energy.len()]
+            Background::InverseSqrt { coefficient } => energy
+                .values
+                .iter()
+                .map(|&e| {
+                    assert!(
+                        e > 0.0,
+                        "Energy must be positive for InverseSqrt background"
+                    );
+                    coefficient / e.sqrt()
+                })
+                .collect(),
+
+            Background::Sqrt { coefficient } => energy
+                .values
+                .iter()
+                .map(|&e| {
+                    assert!(e > 0.0, "Energy must be positive for Sqrt background");
+                    coefficient * e.sqrt()
+                })
+                .collect(),
+
+            Background::Exponential {
+                amplitude,
+                decay_factor,
+            } => energy
+                .values
+                .iter()
+                .map(|&e| {
+                    assert!(
+                        e > 0.0,
+                        "Energy must be positive for Exponential background"
+                    );
+                    amplitude * (-decay_factor / e.sqrt()).exp()
+                })
+                .collect(),
+        }
     }
 }
 
-/// Polynomial background: `b0 + b1*E + b2*E^2 + ...`
-#[derive(Debug, Clone)]
-pub struct PolynomialBackground {
-    /// Coefficients in ascending power order: \[b0, b1, b2, ...\].
-    pub coefficients: Vec<f64>,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl BackgroundModel for PolynomialBackground {
-    #[allow(clippy::cast_possible_wrap)]
-    fn evaluate(&self, energy: &EnergyGrid) -> Vec<f64> {
-        energy
-            .values
-            .iter()
-            .map(|&e| {
-                self.coefficients
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &c)| c * e.powi(i as i32))
-                    .sum()
-            })
-            .collect()
+    #[test]
+    fn test_background_none() {
+        let energy = EnergyGrid::new(vec![1.0, 10.0, 100.0]).unwrap();
+        let bg = Background::None;
+        let result = bg.evaluate(&energy);
+        assert_eq!(result, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn test_background_constant() {
+        let energy = EnergyGrid::new(vec![1.0, 10.0, 100.0]).unwrap();
+        let bg = Background::Constant { value: 0.5 };
+        let result = bg.evaluate(&energy);
+        assert_eq!(result, vec![0.5, 0.5, 0.5]);
+    }
+
+    #[test]
+    fn test_background_inverse_sqrt() {
+        let energy = EnergyGrid::new(vec![1.0, 4.0, 9.0]).unwrap();
+        let bg = Background::InverseSqrt { coefficient: 2.0 };
+        let result = bg.evaluate(&energy);
+        assert_eq!(result, vec![2.0, 1.0, 2.0 / 3.0]);
+    }
+
+    #[test]
+    fn test_background_sqrt() {
+        let energy = EnergyGrid::new(vec![1.0, 4.0, 9.0]).unwrap();
+        let bg = Background::Sqrt { coefficient: 2.0 };
+        let result = bg.evaluate(&energy);
+        assert_eq!(result, vec![2.0, 4.0, 6.0]);
+    }
+
+    #[test]
+    fn test_background_exponential() {
+        let energy = EnergyGrid::new(vec![1.0, 4.0]).unwrap();
+        let bg = Background::Exponential {
+            amplitude: 1.0,
+            decay_factor: 2.0,
+        };
+        let result = bg.evaluate(&energy);
+        // exp(-2/1) ≈ 0.1353, exp(-2/2) ≈ 0.3679
+        assert!((result[0] - (-2.0_f64).exp()).abs() < 1e-10);
+        assert!((result[1] - (-1.0_f64).exp()).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_background_clone() {
+        let bg1 = Background::Exponential {
+            amplitude: 1.5,
+            decay_factor: 3.0,
+        };
+        let bg2 = bg1.clone();
+        assert_eq!(bg1, bg2);
+    }
+
+    #[test]
+    #[should_panic(expected = "Energy must be positive")]
+    fn test_background_negative_energy() {
+        let energy = EnergyGrid::new(vec![1.0, -1.0, 100.0]).unwrap();
+        let bg = Background::InverseSqrt { coefficient: 1.0 };
+        let _ = bg.evaluate(&energy);
     }
 }
