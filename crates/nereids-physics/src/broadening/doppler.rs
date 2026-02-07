@@ -184,6 +184,16 @@ pub fn interpolate_to_grid(
             got: source_values.len(),
         });
     }
+    if source_energies.iter().any(|e| !e.is_finite()) {
+        return Err(PhysicsError::InvalidParameter(
+            "source energies must be finite".to_string(),
+        ));
+    }
+    if source_energies.windows(2).any(|w| w[1] < w[0]) {
+        return Err(PhysicsError::InvalidParameter(
+            "source energies must be sorted ascending".to_string(),
+        ));
+    }
 
     let n_src = source_energies.len();
     Ok(target_energies
@@ -458,6 +468,12 @@ mod tests {
     fn test_interpolate_mismatched_source_errors() {
         let result = interpolate_to_grid(&[1.0, 2.0], &[10.0], &[1.5]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_interpolate_unsorted_source_energies_error() {
+        let result = interpolate_to_grid(&[2.0, 1.0], &[20.0, 10.0], &[1.5]);
+        assert!(matches!(result, Err(PhysicsError::InvalidParameter(_))));
     }
 
     #[test]
