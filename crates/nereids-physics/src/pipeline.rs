@@ -106,9 +106,10 @@ impl ForwardModel for DefaultForwardModel {
         // 1. Compute 0K cross sections (Phase 1a)
         let cross_sections = compute_0k_cross_sections(energy, params, config)?;
 
-        // Cross-section Jacobian not yet implemented (Phase 1a TODO)
-        // For now, use empty Jacobian
-        let cross_section_jacobian = vec![vec![0.0; 0]; energy.len()];
+        // Cross-section Jacobian values are not yet implemented (Phase 1a TODO),
+        // but we must preserve the Jacobian contract shape [n_energy][n_params].
+        let n_free_params = count_free_params(params);
+        let cross_section_jacobian = vec![vec![0.0; n_free_params]; energy.len()];
 
         // 2. Apply Beer-Lambert law with Jacobian
         let (number_density, thickness_cm) = if params.isotopes.is_empty() {
@@ -309,6 +310,46 @@ mod tests {
         // Jacobian shape should be [3 energies × 0 params] (no free params)
         assert_eq!(jac.len(), 3);
         assert_eq!(jac[0].len(), 0);
+    }
+
+    #[test]
+    fn test_pipeline_with_jacobian_preserves_free_param_width() {
+        let model = DefaultForwardModel { resolution: None };
+        let energy = EnergyGrid::new(vec![1.0, 5.0, 20.0]).unwrap();
+        let isotope = IsotopeParams {
+            name: "Test-1".to_string(),
+            awr: 1.0,
+            abundance: Parameter::free(1.0),
+            thickness_cm: 1.0,
+            number_density: 0.05,
+            spin_groups: vec![SpinGroup {
+                j: 0.5,
+                channels: vec![Channel {
+                    l: 0,
+                    channel_spin: 0.0,
+                    radius: 5.0,
+                    effective_radius: 5.0,
+                }],
+                resonances: vec![Resonance {
+                    energy: Parameter::free(10.0),
+                    gamma_n: Parameter::free(0.1),
+                    gamma_g: Parameter::fixed(0.05),
+                    fission: None,
+                }],
+            }],
+        };
+        let params = RMatrixParameters {
+            isotopes: vec![isotope],
+        };
+        let config = ForwardModelConfig::default();
+
+        let (_t, jac) = model
+            .transmission_with_jacobian(&energy, &params, &config)
+            .unwrap();
+
+        // 3 free params: abundance + resonance energy + gamma_n
+        assert_eq!(jac.len(), energy.len());
+        assert_eq!(jac[0].len(), 3);
     }
 
     #[test]

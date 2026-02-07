@@ -141,12 +141,22 @@ pub fn compute_transmission_with_jacobian(
 
     let n_energy = transmission.len();
 
-    // Get number of free parameters from Jacobian shape
-    let n_free_params = if !cross_section_jacobian.is_empty() {
-        cross_section_jacobian[0].len()
-    } else {
-        0
-    };
+    // Validate Jacobian shape: one row per energy point and consistent width.
+    if cross_section_jacobian.len() != n_energy {
+        return Err(PhysicsError::InvalidParameter(format!(
+            "cross_section_jacobian row count ({}) must match number of energy points ({n_energy})",
+            cross_section_jacobian.len()
+        )));
+    }
+    let n_free_params = cross_section_jacobian.first().map_or(0, Vec::len);
+    for (i, row) in cross_section_jacobian.iter().enumerate() {
+        if row.len() != n_free_params {
+            return Err(PhysicsError::InvalidParameter(format!(
+                "cross_section_jacobian row {i} has length {}, expected {n_free_params}",
+                row.len()
+            )));
+        }
+    }
 
     // Initialize Jacobian matrix
     let mut jacobian = vec![vec![0.0; n_free_params]; n_energy];
@@ -281,6 +291,28 @@ mod tests {
         // dT/dp = -n * d * T * (dσ/dp) = -0.1 * 1.0 * exp(-1) * 1.0
         let expected_deriv = -0.1 * 1.0 * expected_t * 1.0;
         assert!((jac[0][0] - expected_deriv).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_compute_transmission_with_jacobian_row_count_mismatch_errors() {
+        let xs = const_cross_sections(2, 10.0);
+        let jac_xs = vec![vec![1.0]]; // 1 row, but 2 energies
+
+        let result = compute_transmission_with_jacobian(&xs, &jac_xs, 0.1, 1.0);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("row count"));
+    }
+
+    #[test]
+    fn test_compute_transmission_with_jacobian_ragged_rows_error() {
+        let xs = const_cross_sections(2, 10.0);
+        let jac_xs = vec![vec![1.0, 2.0], vec![1.0]]; // ragged
+
+        let result = compute_transmission_with_jacobian(&xs, &jac_xs, 0.1, 1.0);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("row 1"));
     }
 
     #[test]
