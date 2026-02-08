@@ -14,7 +14,7 @@ pub struct TabulatedResolution {
     /// Kernel energy offsets (eV), sorted ascending.
     ///
     /// Each output value at `E` uses kernel samples over `[E + offset_i]`.
-    pub energy: Vec<f64>,
+    pub offsets_ev: Vec<f64>,
     /// Kernel values at each energy-offset point.
     pub kernel: Vec<f64>,
 }
@@ -73,18 +73,18 @@ impl ResolutionFunction for TabulatedResolution {
         }
         validate_sorted_finite(energies, "energy grid")?;
 
-        if self.energy.len() != self.kernel.len() {
+        if self.offsets_ev.len() != self.kernel.len() {
             return Err(PhysicsError::DimensionMismatch {
-                expected: self.energy.len(),
+                expected: self.offsets_ev.len(),
                 got: self.kernel.len(),
             });
         }
-        if self.energy.len() < 2 {
+        if self.offsets_ev.len() < 2 {
             return Err(PhysicsError::InvalidParameter(
                 "tabulated kernel requires at least two offset points".to_string(),
             ));
         }
-        validate_sorted_finite(&self.energy, "kernel offsets")?;
+        validate_sorted_finite(&self.offsets_ev, "kernel offsets")?;
         if self.kernel.iter().any(|k| !k.is_finite()) {
             return Err(PhysicsError::InvalidParameter(
                 "kernel values must be finite".to_string(),
@@ -103,9 +103,9 @@ impl ResolutionFunction for TabulatedResolution {
             let mut weighted = 0.0;
             let mut norm = 0.0;
 
-            for j in 1..self.energy.len() {
-                let o0 = self.energy[j - 1];
-                let o1 = self.energy[j];
+            for j in 1..self.offsets_ev.len() {
+                let o0 = self.offsets_ev[j - 1];
+                let o1 = self.offsets_ev[j];
                 let dx = o1 - o0;
                 if dx <= 0.0 {
                     continue;
@@ -155,7 +155,7 @@ mod tests {
         let energy = EnergyGrid::new((0..201).map(|i| 1.0 + i as f64 * 0.05).collect()).unwrap();
         let spectrum = vec![3.5; energy.len()];
         let res = TabulatedResolution {
-            energy: vec![-0.2, 0.0, 0.2],
+            offsets_ev: vec![-0.2, 0.0, 0.2],
             kernel: vec![0.0, 1.0, 0.0],
         };
         let out = res.convolve(&energy, &spectrum).unwrap();
@@ -172,7 +172,7 @@ mod tests {
         spectrum[mid] = 100.0;
 
         let res = TabulatedResolution {
-            energy: vec![-0.002, -0.001, 0.0, 0.001, 0.002],
+            offsets_ev: vec![-0.002, -0.001, 0.0, 0.001, 0.002],
             kernel: vec![0.0, 0.5, 1.0, 0.5, 0.0],
         };
         let out = res.convolve(&energy, &spectrum).unwrap();
@@ -186,7 +186,7 @@ mod tests {
         let energy = EnergyGrid::new(vec![1.0, 2.0]).unwrap();
         let spectrum = vec![1.0, 2.0];
         let res = TabulatedResolution {
-            energy: vec![-0.1, 0.1],
+            offsets_ev: vec![-0.1, 0.1],
             kernel: vec![1.0],
         };
         assert!(matches!(
@@ -200,7 +200,7 @@ mod tests {
         let energy = EnergyGrid::new(vec![1.0, 2.0]).unwrap();
         let spectrum = vec![1.0, 2.0];
         let res = TabulatedResolution {
-            energy: vec![0.1, -0.1],
+            offsets_ev: vec![0.1, -0.1],
             kernel: vec![1.0, 1.0],
         };
         assert!(matches!(
@@ -214,7 +214,7 @@ mod tests {
         let energy = EnergyGrid::new(vec![1.0, 2.0]).unwrap();
         let spectrum = vec![1.0, 2.0];
         let res = TabulatedResolution {
-            energy: vec![-0.1, 0.1],
+            offsets_ev: vec![-0.1, 0.1],
             kernel: vec![1.0, -1.0],
         };
         assert!(matches!(
@@ -228,7 +228,7 @@ mod tests {
         let energy = EnergyGrid::new(vec![0.0, 1.0, 2.0]).unwrap();
         let spectrum = vec![0.0, 1.0, 2.0];
         let res = TabulatedResolution {
-            energy: vec![-1.0, 0.0, 1.0],
+            offsets_ev: vec![-1.0, 0.0, 1.0],
             kernel: vec![1.0, 1.0, 1.0],
         };
         let out = res.convolve(&energy, &spectrum).unwrap();

@@ -9,6 +9,8 @@ use nereids_core::{EnergyGrid, PhysicsError, ResolutionFunction};
 
 const SM2: f64 = 72.298_252_179_105_06; // SAMMY sqrt(m/2) constant, us*sqrt(eV)/m
 const MIN_NORM: f64 = 1e-300;
+const WATERM_SERIES_MAX_TERMS: usize = 4096;
+const WATERM_SERIES_REL_TOL: f64 = 1e-14;
 
 /// Channel-width region: use `width_ns` for `E <= max_energy_ev`.
 #[derive(Debug, Clone, Copy)]
@@ -933,12 +935,16 @@ impl OrrResolution {
                     let mut sumj = 1.0_f64;
                     let mut atj = 1.0_f64;
                     if !approx_eq(a, f) {
-                        for j in 1..=1_000_000_i32 {
-                            atj *= amft / ((j + m + 1) as f64);
-                            if (sumj + atj) == sumj {
+                        for term in 1..=WATERM_SERIES_MAX_TERMS {
+                            atj *= amft / ((m + term as i32 + 1) as f64);
+                            let updated = sumj + atj;
+                            if updated == sumj
+                                || atj.abs() <= WATERM_SERIES_REL_TOL * (updated.abs() + 1.0)
+                            {
+                                sumj = updated;
                                 break;
                             }
-                            sumj += atj;
+                            sumj = updated;
                         }
                     }
                     sum += atk * sumj * h1 * eat;

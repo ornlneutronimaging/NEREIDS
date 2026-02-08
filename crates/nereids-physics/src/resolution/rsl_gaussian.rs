@@ -79,27 +79,6 @@ fn validate_energy_grid(energies: &[f64]) -> Result<(), PhysicsError> {
     Ok(())
 }
 
-fn interpolate_clamped(energies: &[f64], values: &[f64], x: f64) -> f64 {
-    let n = energies.len();
-    let idx = energies.partition_point(|&e| e < x);
-    if idx == 0 {
-        values[0]
-    } else if idx >= n {
-        values[n - 1]
-    } else {
-        let x0 = energies[idx - 1];
-        let x1 = energies[idx];
-        let y0 = values[idx - 1];
-        let y1 = values[idx];
-        if x1 == x0 {
-            y1
-        } else {
-            let t = (x - x0) / (x1 - x0);
-            y0 + t * (y1 - y0)
-        }
-    }
-}
-
 impl ResolutionFunction for RslGaussianResolution {
     fn convolve(&self, energy: &EnergyGrid, spectrum: &[f64]) -> Result<Vec<f64>, PhysicsError> {
         let energies = &energy.values;
@@ -137,14 +116,29 @@ impl ResolutionFunction for RslGaussianResolution {
                 for j in (left + 1)..=right {
                     let seg_e0 = energies[j - 1];
                     let seg_e1 = energies[j];
+                    let s0 = spectrum[j - 1];
+                    let s1 = spectrum[j];
                     let a = seg_e0.max(e_low);
                     let b = seg_e1.min(e_high);
                     if b <= a {
                         continue;
                     }
 
-                    let s_a = interpolate_clamped(energies, spectrum, a);
-                    let s_b = interpolate_clamped(energies, spectrum, b);
+                    let seg_de = seg_e1 - seg_e0;
+                    let s_a = if a <= seg_e0 {
+                        s0
+                    } else if a >= seg_e1 {
+                        s1
+                    } else {
+                        s0 + (s1 - s0) * (a - seg_e0) / seg_de
+                    };
+                    let s_b = if b <= seg_e0 {
+                        s0
+                    } else if b >= seg_e1 {
+                        s1
+                    } else {
+                        s0 + (s1 - s0) * (b - seg_e0) / seg_de
+                    };
                     let z_a = (a - e_center) / sigma;
                     let z_b = (b - e_center) / sigma;
                     let g_a = (-0.5 * z_a * z_a).exp();
