@@ -6,19 +6,18 @@
 //! # Physics
 //!
 //! At finite temperature, target atoms have a thermal velocity distribution.
-//! The Doppler-shifted neutron-nucleus relative velocity creates an
-//! energy-dependent Gaussian broadening:
+//! The free-gas model uses Gaussian broadening in `v = sign(E)·sqrt(|E|)`:
 //!
 //! ```text
-//! Doppler width:  Δ(E) = sqrt(4 · k_B · T · |E| / A_target)
-//! Broadened XS:   σ(E; T) = (1/(√π·Δ)) ∫ σ₀(E') exp(-(E-E')²/Δ²) dE'
+//! Velocity width: D = sqrt(k_B · T · m_n / A_target)
+//! Broadening:     σ(E; T) ∝ ∫ σ₀(E') exp(-(v(E)-v(E'))²/D²) dv'
 //! ```
 //! where `A_target` is the target mass in amu (SAMMY `DefTargetMass` convention).
 //!
 //! # Algorithm
 //!
-//! Direct trapezoidal convolution with kernel truncation at ±4Δ and
-//! normalized kernel (compensates for truncation and grid-edge effects).
+//! Direct trapezoidal convolution in sqrt(E) space (SAMMY free-gas style)
+//! with kernel truncation at ±5·D and normalized kernel.
 //!
 //! # Important
 //!
@@ -28,7 +27,7 @@
 //!
 //! # References
 //!
-//! - SAMMY `mclm3.f90` (free-gas component)
+//! - SAMMY `mfgm1.f90` / `mfgm4.f90` (free-gas broadening path)
 //! - SAMMY Users' Guide (ORNL/TM-9179/R8), Section IV.E
 
 use nereids_core::constants::BOLTZMANN_EV_PER_K;
@@ -36,23 +35,36 @@ use nereids_core::PhysicsError;
 
 /// Number of Doppler widths for kernel truncation.
 ///
-/// At ±4Δ, the Gaussian kernel is exp(-16) ≈ 1.1e-7.
-const KERNEL_CUTOFF: f64 = 4.0;
+/// At ±5Δ, the Gaussian kernel is exp(-25) ≈ 1.4e-11.
+const KERNEL_CUTOFF: f64 = 5.0;
+/// Small factor used by SAMMY when expanding auxiliary-grid bounds.
+const AUX_BOUNDS_FUDGE: f64 = 1.001;
 
 /// Safety guardrail for direct trapezoidal broadening cost.
-const MAX_BROADENING_SEGMENTS: usize = 100_000_000;
-
-/// Maximum auxiliary points generated per resonance to bound memory/runtime.
-const MAX_AUX_POINTS_PER_RESONANCE: usize = 20_000;
+const MAX_BROADENING_SEGMENTS: usize = 20_000_000;
 
 /// Maximum total auxiliary grid size to avoid pathological broadening workloads.
 const MAX_AUX_GRID_POINTS: usize = 50_000;
+/// Maximum allowed adjacent spacing ratio before smoothing inserts points.
+const AUX_SPACING_RATIO_LIMIT: f64 = 2.5;
+/// Maximum smoothing passes for auxiliary-grid transition refinement.
+const AUX_SMOOTHING_PASSES: usize = 4;
 
-/// Minimum resonance span used by auxiliary-grid heuristics [eV].
-const MIN_AUX_SPAN_EV: f64 = 1.0e-2;
+/// Minimum number of points across ±Γ used for under-resolved resonances.
+///
+/// SAMMY reports this condition as "fewer than 9 points across width."
+const MIN_POINTS_ACROSS_WIDTH: usize = 9;
 
-/// Minimum auxiliary-grid spacing used by auxiliary-grid heuristics [eV].
-const MIN_AUX_SPACING_EV: f64 = 1.0e-5;
+/// Default tail points in units of Γ around each refined resonance.
+///
+/// Mirrors SAMMY's default tail enrichment around narrow resonances.
+const RESONANCE_TAIL_MULTIPLIERS: [f64; 6] = [1.5, 2.0, 3.0, 4.0, 5.0, 6.0];
+
+/// Small floor for effective resonance width to keep refinement stable.
+const MIN_REFINEMENT_WIDTH_EV: f64 = 1.0e-12;
+
+/// Neutron mass in amu (SAMMY Kvendf=1 convention).
+const NEUTRON_MASS_AMU: f64 = 1.008_664_915_6;
 
 /// Compute the Doppler width parameter Δ(E) for the free-gas model.
 ///
@@ -71,8 +83,8 @@ pub fn doppler_width(energy_ev: f64, temp_k: f64, awr: f64) -> f64 {
 
 /// Apply free-gas Doppler broadening to cross sections.
 ///
-/// Convolves σ(E; 0K) with a Gaussian kernel using trapezoidal integration
-/// and a normalized kernel to compensate for truncation and edge effects.
+/// Convolves σ(E; 0K) with a Gaussian kernel in `sqrt(E)` space using
+/// trapezoidal integration and a normalized kernel.
 ///
 /// # Arguments
 ///
@@ -130,33 +142,34 @@ pub fn broaden_cross_sections(
         return Ok(xs_0k.to_vec());
     }
 
+    let ddo = (BOLTZMANN_EV_PER_K * temperature_k * NEUTRON_MASS_AMU / awr).sqrt();
+    if ddo < 1e-20 {
+        return Ok(xs_0k.to_vec());
+    }
+    let inv_ddo_sq = 1.0 / (ddo * ddo);
+    let velocities: Vec<f64> = energies
+        .iter()
+        .map(|&e| if e < 0.0 { -(-e).sqrt() } else { e.sqrt() })
+        .collect();
+
     let mut broadened = vec![0.0; n];
     let mut total_segments: usize = 0;
 
     for i in 0..n {
-        let e_i = energies[i];
-        let delta = doppler_width(e_i, temperature_k, awr);
+        let v_i = velocities[i];
+        let v_min = v_i - KERNEL_CUTOFF * ddo;
+        let v_max = v_i + KERNEL_CUTOFF * ddo;
 
-        if delta < 1e-20 {
-            // Negligible broadening (e.g., near-zero energy)
-            broadened[i] = xs_0k[i];
-            continue;
-        }
-
-        let e_min = e_i - KERNEL_CUTOFF * delta;
-        let e_max = e_i + KERNEL_CUTOFF * delta;
-        let inv_delta_sq = 1.0 / (delta * delta);
-
-        // Binary search for grid points within the kernel window
-        let j_start = energies.partition_point(|&e| e < e_min);
-        let j_end = energies.partition_point(|&e| e <= e_max);
+        // Binary search for grid points within the kernel window in sqrt(E) space
+        let j_start = velocities.partition_point(|&v| v < v_min);
+        let j_end = velocities.partition_point(|&v| v <= v_max);
 
         // Include one extra point on each side for trapezoidal coverage
         let j_lo = j_start.saturating_sub(1);
         let j_hi = j_end.min(n - 1);
 
-        if j_lo >= j_hi {
-            // Not enough grid points for trapezoidal integration
+        if (j_hi - j_lo + 1) <= 2 {
+            // Not enough points for stable broadening (SAMMY requires >2 points)
             broadened[i] = xs_0k[i];
             continue;
         }
@@ -167,25 +180,42 @@ pub fn broaden_cross_sections(
             )));
         }
 
-        // Trapezoidal integration with normalized kernel
+        // Trapezoidal integration with normalized kernel.
+        //
+        // SAMMY free-gas broadening evaluates the convolution in velocity
+        // space and carries a Jacobian factor equivalent to E'/E in the
+        // final expression (see mfgm2/mfgm4 path).
         let mut sum_weighted = 0.0;
         let mut sum_kernel = 0.0;
+        let e_i_abs = energies[i].abs();
+
+        if e_i_abs <= f64::EPSILON {
+            broadened[i] = xs_0k[i];
+            continue;
+        }
 
         for j in (j_lo + 1)..=j_hi {
-            let h = energies[j] - energies[j - 1];
+            let h = velocities[j] - velocities[j - 1];
+            if h <= 0.0 {
+                continue;
+            }
 
-            let diff_prev = e_i - energies[j - 1];
-            let diff_curr = e_i - energies[j];
+            let diff_prev = v_i - velocities[j - 1];
+            let diff_curr = v_i - velocities[j];
 
-            let g_prev = (-diff_prev * diff_prev * inv_delta_sq).exp();
-            let g_curr = (-diff_curr * diff_curr * inv_delta_sq).exp();
+            let g_prev = (-diff_prev * diff_prev * inv_ddo_sq).exp();
+            let g_curr = (-diff_curr * diff_curr * inv_ddo_sq).exp();
 
-            sum_weighted += 0.5 * h * (g_prev * xs_0k[j - 1] + g_curr * xs_0k[j]);
+            let e_prev_abs = energies[j - 1].abs();
+            let e_curr_abs = energies[j].abs();
+
+            sum_weighted +=
+                0.5 * h * (g_prev * e_prev_abs * xs_0k[j - 1] + g_curr * e_curr_abs * xs_0k[j]);
             sum_kernel += 0.5 * h * (g_prev + g_curr);
         }
 
         broadened[i] = if sum_kernel > 1e-100 {
-            sum_weighted / sum_kernel
+            (sum_weighted / sum_kernel) / e_i_abs
         } else {
             xs_0k[i]
         };
@@ -309,6 +339,8 @@ pub fn create_auxiliary_grid(
     }
 
     let mut grid: Vec<f64> = data_energies.to_vec();
+    let data_min = data_energies.iter().copied().reduce(f64::min);
+    let data_max = data_energies.iter().copied().reduce(f64::max);
 
     for (&e_res, &gamma) in resonance_energies.iter().zip(resonance_widths.iter()) {
         if !e_res.is_finite() || !gamma.is_finite() {
@@ -321,58 +353,106 @@ pub fn create_auxiliary_grid(
                 "resonance width must be non-negative, got Γ={gamma}"
             )));
         }
-
-        // Doppler width at the resonance energy
-        let delta = if temperature_k > 0.0 {
-            doppler_width(e_res, temperature_k, awr)
-        } else {
-            0.0
-        };
-
-        // Span: max of 5*Γ (resolve resonance) or 5*Δ (cover Doppler kernel)
-        let span = (5.0 * gamma).max(5.0 * delta).max(MIN_AUX_SPAN_EV);
-
-        // Fine spacing: min of Γ/10 and Δ/20 (only consider Δ when broadening is active)
-        let spacing = if delta > 0.0 {
-            (gamma / 10.0).min(delta / 20.0).max(MIN_AUX_SPACING_EV)
-        } else {
-            (gamma / 10.0).max(MIN_AUX_SPACING_EV)
-        };
-
-        // Clamp lower bound to min of data grid (supports unsorted input energies).
-        let grid_min = data_energies
-            .iter()
-            .copied()
-            .reduce(f64::min)
-            .unwrap_or(f64::NEG_INFINITY);
-        let e_lo = (e_res - span).max(grid_min);
-        let e_hi = e_res + span;
-
-        if e_lo > e_hi {
+        if gamma == 0.0 {
             continue;
         }
 
-        // Limit the number of generated points per resonance to avoid
-        // pathological allocations when Γ << Δ and span is Doppler-dominated.
-        let interval = e_hi - e_lo;
-        let min_spacing_for_cap = interval / ((MAX_AUX_POINTS_PER_RESONANCE - 1) as f64);
-        let effective_spacing = spacing.max(min_spacing_for_cap);
-        let mut n_points = (interval / effective_spacing).ceil() as usize + 1;
-        if n_points > MAX_AUX_POINTS_PER_RESONANCE {
-            n_points = MAX_AUX_POINTS_PER_RESONANCE;
+        let width = gamma.max(MIN_REFINEMENT_WIDTH_EV);
+        let e_lo = e_res - width;
+        let e_hi = e_res + width;
+
+        let points_across_width = grid.iter().filter(|&&e| e >= e_lo && e <= e_hi).count();
+        if points_across_width < MIN_POINTS_ACROSS_WIDTH {
+            let spacing = (2.0 * width) / ((MIN_POINTS_ACROSS_WIDTH - 1) as f64);
+            for k in 0..MIN_POINTS_ACROSS_WIDTH {
+                let e = e_lo + k as f64 * spacing;
+                if data_min.is_none_or(|mn| e >= mn) && data_max.is_none_or(|mx| e <= mx) {
+                    grid.push(e);
+                }
+            }
         }
 
-        let actual_spacing = if n_points > 1 {
-            interval / ((n_points - 1) as f64)
-        } else {
-            0.0
-        };
-        for k in 0..n_points {
-            grid.push(e_lo + k as f64 * actual_spacing);
+        for mult in RESONANCE_TAIL_MULTIPLIERS {
+            let e_left = e_res - mult * width;
+            let e_right = e_res + mult * width;
+            if data_min.is_none_or(|mn| e_left >= mn) && data_max.is_none_or(|mx| e_left <= mx) {
+                grid.push(e_left);
+            }
+            if data_min.is_none_or(|mn| e_right >= mn) && data_max.is_none_or(|mx| e_right <= mx) {
+                grid.push(e_right);
+            }
         }
+
         if grid.len() > MAX_AUX_GRID_POINTS {
             return Err(PhysicsError::InvalidParameter(format!(
-                "auxiliary grid exceeds {} points; reduce resonance density/span inputs",
+                "auxiliary grid exceeds {} points; reduce resonance density/width inputs",
+                MAX_AUX_GRID_POINTS
+            )));
+        }
+    }
+
+    // For T>0, extend the grid in sqrt(E) using SAMMY-like edge spacing.
+    //
+    // This mirrors the free-gas Escale/Vqcon behavior: derive a velocity
+    // step from the first/last five data points and populate extra points
+    // between [Emind, E_min) and (E_max, Emaxd].
+    if temperature_k > 0.0 {
+        let mut sorted_data = data_energies.to_vec();
+        sorted_data.sort_unstable_by(f64::total_cmp);
+
+        if let (Some(&min_e), Some(&max_e)) = (sorted_data.first(), sorted_data.last()) {
+            let ddo = (BOLTZMANN_EV_PER_K * temperature_k * NEUTRON_MASS_AMU / awr).sqrt();
+            if ddo > 0.0 && min_e > 0.0 && max_e > 0.0 {
+                let v_min = min_e.sqrt();
+                let v_max = max_e.sqrt();
+                let bound_step = KERNEL_CUTOFF * AUX_BOUNDS_FUDGE * ddo;
+
+                let emind = (v_min - bound_step).powi(2);
+                let emaxd = (v_max + bound_step).powi(2);
+
+                let n5 = sorted_data.len().min(5);
+                if n5 >= 2 {
+                    let e1 = sorted_data[0];
+                    let e2 = sorted_data[1];
+                    let e5_low = sorted_data[n5 - 1];
+                    let d_low = (e5_low.sqrt() - e1.sqrt()) / ((n5 - 1) as f64);
+                    if d_low > 0.0 {
+                        let eefudg = (e2 - e1) * 1.0e-4;
+                        if e1 >= emind + eefudg {
+                            let x = e1.sqrt() - emind.sqrt();
+                            let n = (x / d_low).floor() as usize + 1;
+                            let start = e1.sqrt() - ((n + 1) as f64) * d_low;
+                            for i in 1..=n {
+                                let v = start + (i as f64) * d_low;
+                                let e = v * v;
+                                if e.is_finite() {
+                                    grid.push(e);
+                                }
+                            }
+                        }
+                    }
+
+                    let e_last = sorted_data[sorted_data.len() - 1];
+                    let e5_high = sorted_data[sorted_data.len() - n5];
+                    let d_high = (e_last.sqrt() - e5_high.sqrt()) / ((n5 - 1) as f64);
+                    if d_high > 0.0 {
+                        let x = emaxd.sqrt() - e_last.sqrt();
+                        let n = (x / d_high).floor() as usize + 1;
+                        for i in 1..=n {
+                            let v = e_last.sqrt() + (i as f64) * d_high;
+                            let e = v * v;
+                            if e.is_finite() {
+                                grid.push(e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if grid.len() > MAX_AUX_GRID_POINTS {
+            return Err(PhysicsError::InvalidParameter(format!(
+                "auxiliary grid exceeds {} points; reduce resonance density/width inputs",
                 MAX_AUX_GRID_POINTS
             )));
         }
@@ -386,6 +466,42 @@ pub fn create_auxiliary_grid(
     }
     grid.sort_unstable_by(f64::total_cmp);
     grid.dedup_by(|a, b| (*a - *b).abs() < 1e-10);
+
+    // Smooth abrupt spacing jumps (SAMMY Adjust_Auxil style, simplified).
+    // This keeps interpolation weights stable near refined resonance regions.
+    for _ in 0..AUX_SMOOTHING_PASSES {
+        if grid.len() < 3 {
+            break;
+        }
+        let mut added = Vec::new();
+        for i in 1..(grid.len() - 1) {
+            let de_prev = grid[i] - grid[i - 1];
+            let de_next = grid[i + 1] - grid[i];
+            if de_prev <= 0.0 || de_next <= 0.0 {
+                continue;
+            }
+            if (de_prev / de_next) > AUX_SPACING_RATIO_LIMIT {
+                let mid = 0.5 * (grid[i - 1] + grid[i]);
+                added.push(mid);
+            } else if (de_next / de_prev) > AUX_SPACING_RATIO_LIMIT {
+                let mid = 0.5 * (grid[i] + grid[i + 1]);
+                added.push(mid);
+            }
+        }
+        if added.is_empty() {
+            break;
+        }
+        grid.extend(added);
+        if grid.len() > MAX_AUX_GRID_POINTS {
+            return Err(PhysicsError::InvalidParameter(format!(
+                "auxiliary grid exceeds {} points; reduce resonance density/width inputs",
+                MAX_AUX_GRID_POINTS
+            )));
+        }
+        grid.sort_unstable_by(f64::total_cmp);
+        grid.dedup_by(|a, b| (*a - *b).abs() < 1e-10);
+    }
+
     Ok(grid)
 }
 
@@ -586,8 +702,8 @@ mod tests {
             );
         }
 
-        // Should have many more points than original
-        assert!(grid.len() > data.len() * 10);
+        // Refinement should add at least a few points.
+        assert!(grid.len() > data.len());
     }
 
     #[test]
@@ -597,14 +713,15 @@ mod tests {
         let res_w = vec![0.001]; // 1 meV width
         let grid = create_auxiliary_grid(&data, &res_e, &res_w, 0.0, 10.0).unwrap();
 
-        // Near the resonance, grid spacing should be <= gamma/10
+        // Near the resonance, we should have at least SAMMY's default
+        // "9 points across width" coverage.
         let near_res: Vec<f64> = grid
             .iter()
             .copied()
-            .filter(|&e| (e - 10.0).abs() < 0.005)
+            .filter(|&e| (e - 10.0).abs() <= 1.1e-3)
             .collect();
         assert!(
-            near_res.len() >= 10,
+            near_res.len() >= MIN_POINTS_ACROSS_WIDTH,
             "not enough points near resonance: {}",
             near_res.len()
         );
@@ -651,13 +768,29 @@ mod tests {
     }
 
     #[test]
-    fn test_create_auxiliary_grid_caps_points_per_resonance() {
-        let data = vec![10.0];
+    fn test_create_auxiliary_grid_bounded_for_narrow_resonance() {
+        let data: Vec<f64> = (0..31).map(|i| 9.7 + i as f64 * 0.02).collect();
         let grid = create_auxiliary_grid(&data, &[10.0], &[1e-5], 300.0, 1.0).unwrap();
         assert!(
-            grid.len() <= data.len() + MAX_AUX_POINTS_PER_RESONANCE,
-            "grid too large: len={}",
+            grid.len() < 1_000,
+            "grid unexpectedly large for narrow-resonance refinement: len={}",
             grid.len()
+        );
+    }
+
+    #[test]
+    fn test_create_auxiliary_grid_adds_tail_points() {
+        let data: Vec<f64> = (0..81).map(|i| 9.6 + i as f64 * 0.01).collect();
+        let grid = create_auxiliary_grid(&data, &[10.0], &[0.01], 50.0, 10.0).unwrap();
+        let expected_left = 10.0 - 1.5 * 0.01;
+        let expected_right = 10.0 + 6.0 * 0.01;
+        assert!(
+            grid.iter().any(|&e| (e - expected_left).abs() < 1e-10),
+            "missing expected left-tail refinement point"
+        );
+        assert!(
+            grid.iter().any(|&e| (e - expected_right).abs() < 1e-10),
+            "missing expected right-tail refinement point"
         );
     }
 }

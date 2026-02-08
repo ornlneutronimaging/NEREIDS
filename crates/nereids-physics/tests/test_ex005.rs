@@ -196,6 +196,13 @@ fn test_ex005b_50k() {
     let aux_grid =
         create_auxiliary_grid(&exp_data.energies, &res_energies, &res_widths, 50.0, 10.0)
             .expect("Failed to create auxiliary grid");
+    // SAMMY ex005bb reports 370 auxiliary points for this case.
+    // Keep this in the same regime to avoid pathological over-refinement.
+    assert!(
+        (320..=420).contains(&aux_grid.len()),
+        "unexpected auxiliary-grid size for ex005b: got {}, expected near SAMMY's 370",
+        aux_grid.len()
+    );
     if debug_log_enabled() {
         println!(
             "\n=== ex005b: auxiliary grid has {} points (data grid has {}) ===",
