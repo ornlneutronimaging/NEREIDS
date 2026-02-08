@@ -87,9 +87,10 @@ pub fn reich_moore_cross_sections(
             config.awr
         )));
     }
-    const TWOMHB: f64 = 2.196_807_132_5e-4; // 1/(fm*sqrt(eV)); SAMMY mmas7.f90 (Kvendf=2)
+    // SAMMY mmas7.f90 (Kvendf=2): 1/(fm*sqrt(eV))
     // SAMMY Csrmat uses DefTargetMass in amu:
     // Arat = DefTargetMass / (DefTargetMass + Aneutr)
+    const TWOMHB: f64 = 2.196_807_132_5e-4;
     const ANEUTR_AMU: f64 = 1.008_664_904;
     let a_ratio = config.awr / (config.awr + ANEUTR_AMU);
     let k_inv_fm = TWOMHB * a_ratio * energy.abs().sqrt();
@@ -110,11 +111,7 @@ pub fn reich_moore_cross_sections(
         (1.0, 0.0)
     };
     let apply_potential_correction = config.include_potential
-        && sammy_potential_correction_applies(
-            spin_group.j,
-            config.target_spin,
-            entrance_channel.l,
-        );
+        && sammy_potential_correction_applies(spin_group.j, config.target_spin, entrance_channel.l);
 
     // Special case: if there are no resonances, return potential-only scattering when requested.
     if resonances.is_empty() {

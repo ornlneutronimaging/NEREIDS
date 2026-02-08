@@ -29,18 +29,18 @@ fn compute_chi_squared(theory: &[f64], data: &[f64], uncertainties: &[f64]) -> f
         .sum()
 }
 
-fn chi2_error(computed: f64, expected: f64) -> (f64, &'static str) {
-    let scale = computed.abs().max(expected.abs());
-    if scale < CHI2_ABS_CUTOFF {
-        ((computed - expected).abs(), "absolute")
-    } else {
-        ((computed - expected).abs() / scale, "relative")
-    }
+fn chi2_errors(computed: f64, expected: f64) -> (f64, f64) {
+    let abs_err = (computed - expected).abs();
+    let scale = computed.abs().max(expected.abs()).max(1e-30);
+    let rel_err = abs_err / scale;
+    (abs_err, rel_err)
 }
 
-const CHI2_ABS_CUTOFF: f64 = 1e-6;
-const CHI2_ABS_TOLERANCE: f64 = 1e-6;
-const CHI2_REL_TOLERANCE: f64 = 2e-2;
+// Tightened acceptance criteria:
+// - Relative error guards large-chi2 cases.
+// - Absolute error guards tiny-chi2 cases where relative can be misleading.
+const CHI2_ABS_TOLERANCE: f64 = 2e-7;
+const CHI2_REL_TOLERANCE: f64 = 5e-3;
 
 fn ex003_config() -> ForwardModelConfig {
     ForwardModelConfig {
@@ -60,30 +60,17 @@ fn ex003_fixture_base_path() -> PathBuf {
 }
 
 fn assert_chi2_close(variant: &str, computed: f64, expected: f64) {
-    let (err, mode) = chi2_error(computed, expected);
+    let (abs_err, rel_err) = chi2_errors(computed, expected);
     println!("{variant}:");
     println!("  Computed χ² = {computed}");
     println!("  Expected χ² = {expected}");
-    println!("  Error mode = {mode}");
-    println!("  Error value = {err:.6e}");
+    println!("  Absolute error = {abs_err:.6e}");
+    println!("  Relative error = {rel_err:.6e}");
 
-    if mode == "absolute" {
-        assert!(
-            err < CHI2_ABS_TOLERANCE,
-            "Chi-squared mismatch ({mode} error {:.6e}): computed {}, expected {}",
-            err,
-            computed,
-            expected
-        );
-    } else {
-        assert!(
-            err < CHI2_REL_TOLERANCE,
-            "Chi-squared mismatch ({mode} error {:.6e}): computed {}, expected {}",
-            err,
-            computed,
-            expected
-        );
-    }
+    assert!(
+        abs_err < CHI2_ABS_TOLERANCE || rel_err < CHI2_REL_TOLERANCE,
+        "Chi-squared mismatch: abs_err={abs_err:.6e} (tol={CHI2_ABS_TOLERANCE:.6e}), rel_err={rel_err:.6e} (tol={CHI2_REL_TOLERANCE:.6e}), computed={computed}, expected={expected}"
+    );
 }
 
 /// Build R-matrix parameters from parsed resonances for ex003

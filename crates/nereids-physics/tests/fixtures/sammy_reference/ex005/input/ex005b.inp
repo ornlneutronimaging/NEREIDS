@@ -1,0 +1,12 @@
+Example # 005b
+element       10.000  0.000009  1200.
+use csisrs format for data
+do not solve bayes equations
+generate odf file automatically
+
+       50.
+    2.9080
+capture
+  1      1    0  0.5       1.0   .0
+    1    1    0    0       0.5
+

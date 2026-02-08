@@ -1,0 +1,136 @@
+
+ **********************************************************
+ ***                                                    ***
+ ***                 SAMMY Version 8.0.0                ***
+ ***                                                    ***
+ **********************************************************
+
+ Name of input file: 
+ >>> ex005a.inpnew                                                          <<<
+ Name of parameter file: 
+ >>> ex005a.par                                                             <<<
+ Values used for constants -- Kvendf=1
+   mass of neutron =   1.008664915600000 in amu
+   sqrt(m/2)       =  72.298252179105063
+   sqrt(2m)/hbar   =   0.000219680775849
+   Boltzman        =   0.000086173430000
+   finestructure   =   0.034447599938334 in 1/(amu*F)
+ GENERATE ODF FILE AUtomatically                                               
+ BROADENING IS NOT WAnted                                                      
+ Name of experimental data file is: 
+ >>> ex005a.dat                                                             <<<
+ Emin and Emax =    8.00000       12.0000    
+
+
+ *****************************************************************************
+ *****                                                                   *****
+ ***** Example # 005                                                     *****
+ *****                                                                   *****
+ *****************************************************************************
+
+
+ Input quantities from line number 2 are:
+   Alfnm1, Alfnm2 = ##element   ##       Atomic Weight =  10.000000
+   Nepnts Itmax  Icorr  Nxtra  Iptdop Iptwid Ixxchn
+        0      0      0      0      0      0      0
+   Ndigit Idropp Matnum Kkkkza
+        2      2      0      0
+Adjusted  Itmax  Icorr  Nxtra  Iptdop Iptwid Ixxchn
+        0      0     50      0      9      5      0
+   Ndigit Idropp Matnum Kkkkza
+        2      2      0      0
+
+
+ TARGET ELEMENT IS element   
+ ATOMIC WEIGHT IS  10.000000
+
+
+ *********** Alphanumeric Control Information *********
+
+ USE CSISRS FORMAT FOr data              
+ DO NOT SOLVE BAYES EQUATIONS            
+ BROADENING IS NOT WAnted                
+ ODF FILE IS WANTED--SAMMY.ODF ,ZERO-TH O
+ PRINT VARIED INPUT PARAMETERS           
+ CHI SQUARED IS WANTED                   
+                                         
+ **** end of Alphanumeric Control Information *********
+
+
+ ### Estimated array size for SAMMY-INP is       1024 ###
+
+ Target Thickness=   0.000    
+
+ **** Data type is <<< CAPTUre              >>> ****
+
+ Spin of incident particle is  0.5
+
+ TARGET SPIN=  0.0
+ __________________________
+       #of  #of
+ Group Ent  Exit Jspin Relative  Ispin  g    Chn Lpnt Ishift eL Chspn
+    #  Chn  Chn         Abndnc                 #
+    1    1    0    0.5  1.0000    0.0 1.0000
+                                               1   1   0     0   0.5    
+__________________________
+ 
+ ### Array size used for SAMMY-INP is        582 ###
+ ### Estimated array size for SAMMY-PAR is        603 ###
+
+ Total  number of resonances is    1
+ Number of particle channels is    1
+ Number of spin groups is          1
+ Number of flagged parametrs is    0
+ Number of varied parameters is    0
+ ### Array size used for SAMMY-PAR is        588 ###
+ ### Estimated array size for SAMMY-NEW is        585 ###
+
+
+
+
+ ***** INITIAL VALUES FOR PARAMETERS                     
+
+
+    RADIUS          TEMPERATURE     THICKNESS
+  2.9080E+00       0.0000E+00       0.0000E+00     
+
+    DELTA-L         DELTA-T-GAUS     DELTA-T-EXP
+  0.0000E+00       0.0000E+00       0.0000E+00     
+ ### Array size used for SAMMY-NEW is        584 ###
+ Emin   8.00000     is less than the minimum energy in the data set
+ Emin has been changed to   8.03684    
+ First 5 energies=
+     8.046600       8.124700       8.202800       8.280900       8.358900    
+ Last  5 energies=
+     11.95400       11.87600       11.79800       11.75900       11.68100    
+ Emax   12.0000     is greater than the maximum energy in the data set
+ Emax has been changed to   11.9638    
+ First 5 energies=
+     8.046600       8.124700       8.202800       8.280900       8.358900    
+ Last  5 energies=
+     11.95400       11.87600       11.79800       11.75900       11.68100    
+     Emind               Emins               Eminr               Emin
+        8.0368375000        8.0368375000        8.0368375000        8.0368375000
+     Emax                Emaxr               Emaxs               Emaxd
+       11.9637500000       11.9637500000       11.9637500000       11.9637500000
+ ### Estimated array size for SAMMY-DAT is        287 +    32500000 ###
+
+ Energy range of data is from 8.03684E+00 to 1.19638E+01 eV.
+ Number of experimental data points =     315
+
+ ### Array size used for SAMMY-DAT is       2468 ###
+ ### Estimated array size for SAMMY-THE is       2156 ###
+ ### Array size used for SAMMY-THE is       2155 ###
+ ### Estimated array size for SAMMY-XCT is       2245 ###
+ ### Array size used for SAMMY-XCT is       2175 ###
+ ### Estimated array size for SAMMY-INT is       2807 ###
+ ### Array size used for SAMMY-INT is       2808 ###
+ ### Estimated array size for SAMMY-IPQ is       2793 ###
+
+ CUSTOMARY CHI SQUARED =   53241.1    
+ CUSTOMARY CHI SQUARED DIVIDED BY NDAT =   169.019    
+ ### Array size used for SAMMY-IPQ is       2797 ###
+ ### Estimated array size for SAMMY-FIN is       1846 ###
+ ### Array size used for SAMMY-FIN is        574 ###
+                              Total time =     0.02 seconds
+ Normal finish to SAMMY
