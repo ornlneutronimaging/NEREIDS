@@ -21,6 +21,10 @@ use nereids_physics::rmatrix::compute_0k_cross_sections;
 use parsers::{parse_dat_file, parse_lpt_chi_squared, parse_par_file};
 use std::path::PathBuf;
 
+fn debug_log_enabled() -> bool {
+    std::env::var_os("NEREIDS_TEST_DEBUG").is_some()
+}
+
 /// Compute chi-squared: χ² = Σ [(theory - data) / uncertainty]²
 fn compute_chi_squared(theory: &[f64], data: &[f64], uncertainties: &[f64]) -> f64 {
     assert_eq!(theory.len(), data.len());
@@ -93,10 +97,12 @@ fn build_ex005_params(mut resonances: Vec<nereids_core::nuclear::Resonance>) -> 
 
 fn assert_chi2_close(label: &str, computed: f64, expected: f64) {
     let rel_err = (computed - expected).abs() / expected;
-    println!("{label}:");
-    println!("  Computed χ² = {computed:.1}");
-    println!("  Expected χ² = {expected:.1}");
-    println!("  Relative error = {rel_err:.4e}");
+    if debug_log_enabled() {
+        println!("{label}:");
+        println!("  Computed χ² = {computed:.1}");
+        println!("  Expected χ² = {expected:.1}");
+        println!("  Relative error = {rel_err:.4e}");
+    }
     assert!(
         rel_err < CHI2_REL_TOLERANCE,
         "{label}: chi-squared mismatch (rel_err={rel_err:.4e}): computed={computed:.1}, expected={expected:.1}"
@@ -133,13 +139,15 @@ fn test_ex005a_no_broadening() {
     let sigma_capture: Vec<f64> = xs.iter().map(|cs| cs.capture).collect();
 
     // Print diagnostic values near the resonance
-    println!("\n=== ex005a diagnostics (0K, no broadening) ===");
-    for (i, e) in exp_data.energies.iter().enumerate() {
-        if (*e - 10.0).abs() < 0.05 {
-            println!(
-                "  E={:.4}  σ_cap={:.4}  data={:.4}  unc={:.4}",
-                e, sigma_capture[i], exp_data.data[i], exp_data.uncertainties[i]
-            );
+    if debug_log_enabled() {
+        println!("\n=== ex005a diagnostics (0K, no broadening) ===");
+        for (i, e) in exp_data.energies.iter().enumerate() {
+            if (*e - 10.0).abs() < 0.05 {
+                println!(
+                    "  E={:.4}  σ_cap={:.4}  data={:.4}  unc={:.4}",
+                    e, sigma_capture[i], exp_data.data[i], exp_data.uncertainties[i]
+                );
+            }
         }
     }
 
@@ -188,11 +196,13 @@ fn test_ex005b_50k() {
     let aux_grid =
         create_auxiliary_grid(&exp_data.energies, &res_energies, &res_widths, 50.0, 10.0)
             .expect("Failed to create auxiliary grid");
-    println!(
-        "\n=== ex005b: auxiliary grid has {} points (data grid has {}) ===",
-        aux_grid.len(),
-        exp_data.energies.len()
-    );
+    if debug_log_enabled() {
+        println!(
+            "\n=== ex005b: auxiliary grid has {} points (data grid has {}) ===",
+            aux_grid.len(),
+            exp_data.energies.len()
+        );
+    }
 
     // Compute 0K capture cross sections on fine grid
     let fine_grid = EnergyGrid::new(aux_grid.clone()).unwrap();
@@ -205,10 +215,12 @@ fn test_ex005b_50k() {
     // Print 0K peak value for diagnostics
     let max_0k = capture_0k.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let max_idx = capture_0k.iter().position(|&v| v == max_0k).unwrap_or(0);
-    println!(
-        "  0K peak: σ_cap={:.1} barns at E={:.6} eV",
-        max_0k, aux_grid[max_idx]
-    );
+    if debug_log_enabled() {
+        println!(
+            "  0K peak: σ_cap={:.1} barns at E={:.6} eV",
+            max_0k, aux_grid[max_idx]
+        );
+    }
 
     // Apply Doppler broadening at 50K
     let capture_50k =
@@ -219,13 +231,15 @@ fn test_ex005b_50k() {
         .expect("Interpolation failed");
 
     // Print diagnostics near the resonance
-    println!("=== ex005b diagnostics (50K broadened) ===");
-    for (i, e) in exp_data.energies.iter().enumerate() {
-        if (*e - 10.0).abs() < 0.05 {
-            println!(
-                "  E={:.4}  σ_cap(50K)={:.4}  data={:.4}  unc={:.4}",
-                e, theory[i], exp_data.data[i], exp_data.uncertainties[i]
-            );
+    if debug_log_enabled() {
+        println!("=== ex005b diagnostics (50K broadened) ===");
+        for (i, e) in exp_data.energies.iter().enumerate() {
+            if (*e - 10.0).abs() < 0.05 {
+                println!(
+                    "  E={:.4}  σ_cap(50K)={:.4}  data={:.4}  unc={:.4}",
+                    e, theory[i], exp_data.data[i], exp_data.uncertainties[i]
+                );
+            }
         }
     }
 

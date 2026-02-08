@@ -19,7 +19,7 @@
 use crate::broadening::doppler::{
     broaden_cross_sections, create_auxiliary_grid, interpolate_to_grid,
 };
-use crate::rmatrix::cross_section::compute_0k_cross_sections;
+use crate::rmatrix::cross_section::compute_0k_cross_sections_single_isotope;
 use crate::transmission::normalization::{
     apply_normalization, apply_normalization_with_jacobian, NormalizationConfig,
 };
@@ -261,10 +261,6 @@ fn compute_isotope_total_xs(
     isotope: &nereids_core::nuclear::IsotopeParams,
     config: &ForwardModelConfig,
 ) -> Result<Vec<f64>, PhysicsError> {
-    let single_params = RMatrixParameters {
-        isotopes: vec![isotope.clone()],
-    };
-
     if config.temperature_k > 0.0 {
         let (res_energies, res_widths) = resonance_centers_and_widths(isotope);
         if !res_energies.is_empty() {
@@ -276,7 +272,8 @@ fn compute_isotope_total_xs(
                 isotope.awr,
             )?;
             let aux_grid = EnergyGrid::new(aux_values)?;
-            let isotope_cs_fine = compute_0k_cross_sections(&aux_grid, &single_params, config)?;
+            let isotope_cs_fine =
+                compute_0k_cross_sections_single_isotope(&aux_grid, isotope, config)?;
             let xs_0k_fine: Vec<f64> = isotope_cs_fine.iter().map(|cs| cs.total).collect();
             let total_xs_fine = broaden_cross_sections(
                 &xs_0k_fine,
@@ -288,7 +285,7 @@ fn compute_isotope_total_xs(
         }
     }
 
-    let isotope_cs = compute_0k_cross_sections(energy, &single_params, config)?;
+    let isotope_cs = compute_0k_cross_sections_single_isotope(energy, isotope, config)?;
     let xs_0k: Vec<f64> = isotope_cs.iter().map(|cs| cs.total).collect();
     broaden_cross_sections(&xs_0k, &energy.values, isotope.awr, config.temperature_k)
 }
@@ -496,6 +493,7 @@ fn combine_jacobians(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rmatrix::cross_section::compute_0k_cross_sections;
     use nereids_core::{Background, Channel, IsotopeParams, Parameter, Resonance, SpinGroup};
 
     fn create_test_isotope() -> IsotopeParams {

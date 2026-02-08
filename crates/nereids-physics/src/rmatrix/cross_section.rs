@@ -132,6 +132,31 @@ pub fn compute_0k_cross_sections(
     Ok(cross_sections)
 }
 
+/// Compute abundance-weighted 0K cross sections for one isotope.
+pub(crate) fn compute_0k_cross_sections_single_isotope(
+    energy_grid: &EnergyGrid,
+    isotope: &IsotopeParams,
+    config: &ForwardModelConfig,
+) -> Result<Vec<CrossSections>, PhysicsError> {
+    if energy_grid.is_empty() {
+        return Err(PhysicsError::EmptyEnergyGrid);
+    }
+
+    let abundance = isotope.abundance.value;
+    if abundance.abs() < 1e-30 {
+        return Ok(vec![CrossSections::default(); energy_grid.len()]);
+    }
+
+    let mut cross_sections = compute_isotope_cross_sections(energy_grid, isotope, config)?;
+    for cs in &mut cross_sections {
+        cs.elastic *= abundance;
+        cs.capture *= abundance;
+        cs.fission *= abundance;
+        cs.total *= abundance;
+    }
+    Ok(cross_sections)
+}
+
 /// Compute cross sections for a single isotope over an energy grid.
 fn compute_isotope_cross_sections(
     energy_grid: &EnergyGrid,

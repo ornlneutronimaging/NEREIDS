@@ -10,9 +10,10 @@
 //! energy-dependent Gaussian broadening:
 //!
 //! ```text
-//! Doppler width:  Δ(E) = sqrt(4 · k_B · T · E / AWR)
+//! Doppler width:  Δ(E) = sqrt(4 · k_B · T · |E| / A_target)
 //! Broadened XS:   σ(E; T) = (1/(√π·Δ)) ∫ σ₀(E') exp(-(E-E')²/Δ²) dE'
 //! ```
+//! where `A_target` is the target mass in amu (SAMMY `DefTargetMass` convention).
 //!
 //! # Algorithm
 //!
@@ -38,18 +39,30 @@ use nereids_core::PhysicsError;
 /// At ±4Δ, the Gaussian kernel is exp(-16) ≈ 1.1e-7.
 const KERNEL_CUTOFF: f64 = 4.0;
 
+/// Safety guardrail for direct trapezoidal broadening cost.
+const MAX_BROADENING_SEGMENTS: usize = 100_000_000;
+
 /// Maximum auxiliary points generated per resonance to bound memory/runtime.
-const MAX_AUX_POINTS_PER_RESONANCE: usize = 100_000;
+const MAX_AUX_POINTS_PER_RESONANCE: usize = 20_000;
+
+/// Maximum total auxiliary grid size to avoid pathological broadening workloads.
+const MAX_AUX_GRID_POINTS: usize = 50_000;
+
+/// Minimum resonance span used by auxiliary-grid heuristics [eV].
+const MIN_AUX_SPAN_EV: f64 = 1.0e-2;
+
+/// Minimum auxiliary-grid spacing used by auxiliary-grid heuristics [eV].
+const MIN_AUX_SPACING_EV: f64 = 1.0e-5;
 
 /// Compute the Doppler width parameter Δ(E) for the free-gas model.
 ///
 /// # Formula
 ///
 /// ```text
-/// Δ = sqrt(4 · k_B · T · E / AWR)
+/// Δ = sqrt(4 · k_B · T · |E| / A_target)
 /// ```
 ///
-/// where AWR = target mass / neutron mass (dimensionless).
+/// where `A_target` is the target mass in amu (SAMMY `DefTargetMass` convention).
 pub fn doppler_width(energy_ev: f64, temp_k: f64, awr: f64) -> f64 {
     // Use |E| so negative incident energies (supported by Reich-Moore) produce
     // a real Doppler width instead of NaN.
@@ -65,7 +78,7 @@ pub fn doppler_width(energy_ev: f64, temp_k: f64, awr: f64) -> f64 {
 ///
 /// * `xs_0k` - 0K cross sections \[barns\], same length as `energies`
 /// * `energies` - Energy grid \[eV\], finite and sorted ascending
-/// * `awr` - Atomic weight ratio (target mass / neutron mass, dimensionless)
+/// * `awr` - Target mass in amu (SAMMY `DefTargetMass`)
 /// * `temperature_k` - Sample temperature in Kelvin; 0 means no broadening
 ///
 /// # Returns
@@ -118,6 +131,7 @@ pub fn broaden_cross_sections(
     }
 
     let mut broadened = vec![0.0; n];
+    let mut total_segments: usize = 0;
 
     for i in 0..n {
         let e_i = energies[i];
@@ -145,6 +159,12 @@ pub fn broaden_cross_sections(
             // Not enough grid points for trapezoidal integration
             broadened[i] = xs_0k[i];
             continue;
+        }
+        total_segments = total_segments.saturating_add(j_hi - j_lo);
+        if total_segments > MAX_BROADENING_SEGMENTS {
+            return Err(PhysicsError::InvalidParameter(format!(
+                "broadening workload too large for direct trapezoidal convolution (>{MAX_BROADENING_SEGMENTS} segments); reduce auxiliary-grid density"
+            )));
         }
 
         // Trapezoidal integration with normalized kernel
@@ -249,7 +269,7 @@ pub fn interpolate_to_grid(
 /// * `resonance_energies` - Resonance center energies \[eV\]
 /// * `resonance_widths` - Total resonance widths \[eV\] (Γ = Γγ + Γn + ...)
 /// * `temperature_k` - Sample temperature in Kelvin
-/// * `awr` - Atomic weight ratio
+/// * `awr` - Target mass in amu (SAMMY `DefTargetMass`)
 ///
 /// # Returns
 ///
@@ -277,6 +297,16 @@ pub fn create_auxiliary_grid(
             "data energies must be finite".to_string(),
         ));
     }
+    if temperature_k < 0.0 || !temperature_k.is_finite() {
+        return Err(PhysicsError::InvalidParameter(format!(
+            "temperature_k must be non-negative and finite, got {temperature_k}"
+        )));
+    }
+    if awr <= 0.0 || !awr.is_finite() {
+        return Err(PhysicsError::InvalidParameter(format!(
+            "awr must be positive and finite, got {awr}"
+        )));
+    }
 
     let mut grid: Vec<f64> = data_energies.to_vec();
 
@@ -300,13 +330,13 @@ pub fn create_auxiliary_grid(
         };
 
         // Span: max of 5*Γ (resolve resonance) or 5*Δ (cover Doppler kernel)
-        let span = (5.0 * gamma).max(5.0 * delta).max(0.01);
+        let span = (5.0 * gamma).max(5.0 * delta).max(MIN_AUX_SPAN_EV);
 
         // Fine spacing: min of Γ/10 and Δ/20 (only consider Δ when broadening is active)
         let spacing = if delta > 0.0 {
-            (gamma / 10.0).min(delta / 20.0).max(1e-5)
+            (gamma / 10.0).min(delta / 20.0).max(MIN_AUX_SPACING_EV)
         } else {
-            (gamma / 10.0).max(1e-5)
+            (gamma / 10.0).max(MIN_AUX_SPACING_EV)
         };
 
         // Clamp lower bound to min of data grid (supports unsorted input energies).
@@ -339,6 +369,12 @@ pub fn create_auxiliary_grid(
         };
         for k in 0..n_points {
             grid.push(e_lo + k as f64 * actual_spacing);
+        }
+        if grid.len() > MAX_AUX_GRID_POINTS {
+            return Err(PhysicsError::InvalidParameter(format!(
+                "auxiliary grid exceeds {} points; reduce resonance density/span inputs",
+                MAX_AUX_GRID_POINTS
+            )));
         }
     }
 
@@ -589,6 +625,18 @@ mod tests {
     #[test]
     fn test_create_auxiliary_grid_non_finite_data_energy_error() {
         let result = create_auxiliary_grid(&[8.0, f64::NAN, 12.0], &[10.0], &[0.001], 50.0, 10.0);
+        assert!(matches!(result, Err(PhysicsError::InvalidParameter(_))));
+    }
+
+    #[test]
+    fn test_create_auxiliary_grid_invalid_temperature_error() {
+        let result = create_auxiliary_grid(&[8.0, 12.0], &[10.0], &[0.001], -1.0, 10.0);
+        assert!(matches!(result, Err(PhysicsError::InvalidParameter(_))));
+    }
+
+    #[test]
+    fn test_create_auxiliary_grid_invalid_awr_error() {
+        let result = create_auxiliary_grid(&[8.0, 12.0], &[10.0], &[0.001], 50.0, 0.0);
         assert!(matches!(result, Err(PhysicsError::InvalidParameter(_))));
     }
 
