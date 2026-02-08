@@ -289,6 +289,12 @@ impl OrrResolution {
                         )));
                     }
                 }
+                let mapped_m = map_m_value(*m);
+                if mapped_m <= 1 {
+                    return Err(PhysicsError::InvalidParameter(format!(
+                        "ORR water m maps to unsupported order {mapped_m}; requires mapped m >= 2"
+                    )));
+                }
             }
             OrrTarget::Tantalum {
                 a_prime,
@@ -1140,6 +1146,23 @@ mod tests {
             d_ns: -1.0,
             f_inv_ns: 0.392_235,
             g: 1.009,
+        };
+        assert!(matches!(
+            res.convolve(&energy, &spectrum),
+            Err(PhysicsError::InvalidParameter(_))
+        ));
+    }
+
+    #[test]
+    fn test_orr_water_m_one_is_rejected() {
+        let energy = EnergyGrid::new(vec![180_000.0, 180_100.0]).unwrap();
+        let spectrum = vec![0.31, 0.32];
+        let mut res = sample_orr();
+        res.target = OrrTarget::Water {
+            lambda0_mm: 0.200,
+            lambda1_mm: 0.0,
+            lambda2_mm: 0.0,
+            m: 1.0,
         };
         assert!(matches!(
             res.convolve(&energy, &spectrum),
