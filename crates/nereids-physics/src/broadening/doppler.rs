@@ -38,6 +38,9 @@ use nereids_core::PhysicsError;
 /// At ±4Δ, the Gaussian kernel is exp(-16) ≈ 1.1e-7.
 const KERNEL_CUTOFF: f64 = 4.0;
 
+/// Maximum auxiliary points generated per resonance to bound memory/runtime.
+const MAX_AUX_POINTS_PER_RESONANCE: usize = 100_000;
+
 /// Compute the Doppler width parameter Δ(E) for the free-gas model.
 ///
 /// # Formula
@@ -61,7 +64,7 @@ pub fn doppler_width(energy_ev: f64, temp_k: f64, awr: f64) -> f64 {
 /// # Arguments
 ///
 /// * `xs_0k` - 0K cross sections \[barns\], same length as `energies`
-/// * `energies` - Energy grid \[eV\], sorted ascending
+/// * `energies` - Energy grid \[eV\], finite and sorted ascending
 /// * `awr` - Atomic weight ratio (target mass / neutron mass, dimensionless)
 /// * `temperature_k` - Sample temperature in Kelvin; 0 means no broadening
 ///
@@ -85,6 +88,16 @@ pub fn broaden_cross_sections(
             expected: n,
             got: xs_0k.len(),
         });
+    }
+    if energies.iter().any(|e| !e.is_finite()) {
+        return Err(PhysicsError::InvalidParameter(
+            "energies must be finite".to_string(),
+        ));
+    }
+    if energies.windows(2).any(|w| w[1] < w[0]) {
+        return Err(PhysicsError::InvalidParameter(
+            "energies must be sorted ascending".to_string(),
+        ));
     }
 
     if awr <= 0.0 || !awr.is_finite() {
@@ -169,7 +182,7 @@ pub fn broaden_cross_sections(
 ///
 /// * `source_energies` - Source energy grid (sorted ascending)
 /// * `source_values` - Source values, same length as `source_energies`
-/// * `target_energies` - Target energies to interpolate to
+/// * `target_energies` - Target energies to interpolate to (finite)
 pub fn interpolate_to_grid(
     source_energies: &[f64],
     source_values: &[f64],
@@ -192,6 +205,11 @@ pub fn interpolate_to_grid(
     if source_energies.windows(2).any(|w| w[1] < w[0]) {
         return Err(PhysicsError::InvalidParameter(
             "source energies must be sorted ascending".to_string(),
+        ));
+    }
+    if target_energies.iter().any(|e| !e.is_finite()) {
+        return Err(PhysicsError::InvalidParameter(
+            "target energies must be finite".to_string(),
         ));
     }
 
@@ -268,6 +286,11 @@ pub fn create_auxiliary_grid(
                 "resonance energy and width must be finite, got E={e_res}, Γ={gamma}"
             )));
         }
+        if gamma < 0.0 {
+            return Err(PhysicsError::InvalidParameter(format!(
+                "resonance width must be non-negative, got Γ={gamma}"
+            )));
+        }
 
         // Doppler width at the resonance energy
         let delta = if temperature_k > 0.0 {
@@ -286,18 +309,36 @@ pub fn create_auxiliary_grid(
             (gamma / 10.0).max(1e-5)
         };
 
-        // Clamp lower bound to min of data grid (supports negative energies)
+        // Clamp lower bound to min of data grid (supports unsorted input energies).
         let grid_min = data_energies
-            .first()
+            .iter()
             .copied()
+            .reduce(f64::min)
             .unwrap_or(f64::NEG_INFINITY);
         let e_lo = (e_res - span).max(grid_min);
         let e_hi = e_res + span;
 
-        let mut e = e_lo;
-        while e <= e_hi {
-            grid.push(e);
-            e += spacing;
+        if e_lo > e_hi {
+            continue;
+        }
+
+        // Limit the number of generated points per resonance to avoid
+        // pathological allocations when Γ << Δ and span is Doppler-dominated.
+        let interval = e_hi - e_lo;
+        let min_spacing_for_cap = interval / ((MAX_AUX_POINTS_PER_RESONANCE - 1) as f64);
+        let effective_spacing = spacing.max(min_spacing_for_cap);
+        let mut n_points = (interval / effective_spacing).ceil() as usize + 1;
+        if n_points > MAX_AUX_POINTS_PER_RESONANCE {
+            n_points = MAX_AUX_POINTS_PER_RESONANCE;
+        }
+
+        let actual_spacing = if n_points > 1 {
+            interval / ((n_points - 1) as f64)
+        } else {
+            0.0
+        };
+        for k in 0..n_points {
+            grid.push(e_lo + k as f64 * actual_spacing);
         }
     }
 
@@ -379,6 +420,18 @@ mod tests {
     fn test_broaden_dimension_mismatch_errors() {
         let result = broaden_cross_sections(&[1.0, 2.0], &[10.0], 10.0, 300.0);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_broaden_unsorted_energies_error() {
+        let result = broaden_cross_sections(&[1.0, 2.0], &[2.0, 1.0], 10.0, 300.0);
+        assert!(matches!(result, Err(PhysicsError::InvalidParameter(_))));
+    }
+
+    #[test]
+    fn test_broaden_non_finite_energies_error() {
+        let result = broaden_cross_sections(&[1.0, 2.0], &[1.0, f64::NAN], 10.0, 300.0);
+        assert!(matches!(result, Err(PhysicsError::InvalidParameter(_))));
     }
 
     #[test]
@@ -477,6 +530,12 @@ mod tests {
     }
 
     #[test]
+    fn test_interpolate_non_finite_target_energies_error() {
+        let result = interpolate_to_grid(&[1.0, 2.0], &[10.0, 20.0], &[f64::NAN]);
+        assert!(matches!(result, Err(PhysicsError::InvalidParameter(_))));
+    }
+
+    #[test]
     fn test_create_auxiliary_grid_includes_data_points() {
         let data = vec![8.0, 9.0, 10.0, 11.0, 12.0];
         let res_e = vec![10.0];
@@ -531,5 +590,26 @@ mod tests {
     fn test_create_auxiliary_grid_non_finite_data_energy_error() {
         let result = create_auxiliary_grid(&[8.0, f64::NAN, 12.0], &[10.0], &[0.001], 50.0, 10.0);
         assert!(matches!(result, Err(PhysicsError::InvalidParameter(_))));
+    }
+
+    #[test]
+    fn test_create_auxiliary_grid_uses_true_min_from_unsorted_data() {
+        let data = vec![12.0, 8.0, 10.0];
+        let grid = create_auxiliary_grid(&data, &[9.0], &[0.001], 0.0, 10.0).unwrap();
+        assert!(
+            grid.iter().any(|&e| e < 9.0),
+            "auxiliary grid should include points below resonance when min(data)<E_res"
+        );
+    }
+
+    #[test]
+    fn test_create_auxiliary_grid_caps_points_per_resonance() {
+        let data = vec![10.0];
+        let grid = create_auxiliary_grid(&data, &[10.0], &[1e-5], 300.0, 1.0).unwrap();
+        assert!(
+            grid.len() <= data.len() + MAX_AUX_POINTS_PER_RESONANCE,
+            "grid too large: len={}",
+            grid.len()
+        );
     }
 }
