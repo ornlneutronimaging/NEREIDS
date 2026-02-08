@@ -16,6 +16,46 @@ pub struct ChiSquaredStats {
     pub chi_squared_per_point: f64,
 }
 
+/// One tabulated theoretical value from an LPT "THEORETICAL VALUES" block.
+#[derive(Debug, Clone, Copy)]
+pub struct TheoryPoint {
+    pub energy_ev: f64,
+    pub theory: f64,
+}
+
+fn parse_float_prefix(s: &str) -> Option<(f64, usize)> {
+    let trimmed_start = s.len() - s.trim_start().len();
+    let s = &s[trimmed_start..];
+    if s.is_empty() {
+        return None;
+    }
+    let end = s.find(char::is_whitespace).unwrap_or(s.len());
+    let token = &s[..end];
+    let val = token.parse::<f64>().ok()?;
+    Some((val, trimmed_start + end))
+}
+
+fn parse_theory_points_from_line(mut line: &str) -> Vec<TheoryPoint> {
+    let mut out = Vec::new();
+    while let Some(close_idx) = line.find(')') {
+        let after = &line[close_idx + 1..];
+        let Some((energy, used_e)) = parse_float_prefix(after) else {
+            line = after;
+            continue;
+        };
+        let Some((theory, used_t)) = parse_float_prefix(&after[used_e..]) else {
+            line = after;
+            continue;
+        };
+        out.push(TheoryPoint {
+            energy_ev: energy,
+            theory,
+        });
+        line = &after[used_e + used_t..];
+    }
+    out
+}
+
 /// Parse a SAMMY .lpt file and extract chi-squared statistics.
 ///
 /// # Arguments
@@ -77,6 +117,53 @@ pub fn parse_lpt_chi_squared(path: &Path) -> Result<ChiSquaredStats, Box<dyn std
         (None, _) => Err("Chi-squared value not found in LPT file".into()),
         (_, None) => Err("Chi-squared per point not found in LPT file".into()),
     }
+}
+
+/// Parse the final "THEORETICAL VALUES" table from a SAMMY LPT file.
+pub fn parse_lpt_theory_points(
+    path: &Path,
+) -> Result<Vec<TheoryPoint>, Box<dyn std::error::Error>> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+
+    let mut in_block = false;
+    let mut current = Vec::new();
+    let mut last_complete: Option<Vec<TheoryPoint>> = None;
+
+    for line_result in reader.lines() {
+        let line = line_result?;
+        if line.contains("THEORETICAL VALUES") {
+            in_block = true;
+            current.clear();
+            continue;
+        }
+
+        if !in_block {
+            continue;
+        }
+
+        if line.contains("CUSTOMARY CHI SQUARED")
+            || line.contains("### Array size used")
+            || line.contains("BAYESIAN CHI SQUARED")
+        {
+            if !current.is_empty() {
+                last_complete = Some(current.clone());
+            }
+            in_block = false;
+            continue;
+        }
+
+        let parsed = parse_theory_points_from_line(&line);
+        if !parsed.is_empty() {
+            current.extend(parsed);
+        }
+    }
+
+    if in_block && !current.is_empty() {
+        last_complete = Some(current);
+    }
+
+    last_complete.ok_or_else(|| "No theoretical-values table found in LPT file".into())
 }
 
 #[cfg(test)]
@@ -167,5 +254,21 @@ CUSTOMARY CHI SQUARED DIVIDED BY NDAT = 0.2
         assert!((stats.chi_squared_per_point - 0.2).abs() < 1e-12);
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_parse_ex007_theory_points() {
+        let path = PathBuf::from("tests/fixtures/sammy_reference/ex007/expected/ex007awl.lpt");
+        if !path.exists() {
+            eprintln!("Skipping test: file not found");
+            return;
+        }
+
+        let pts = parse_lpt_theory_points(&path).unwrap();
+        assert_eq!(pts.len(), 56);
+        assert!(pts[0].energy_ev > 180_000.0);
+        assert!(pts[0].theory > 0.0);
+        assert!(pts[55].energy_ev < 183_000.5);
+        assert!(pts[55].theory > 0.0);
     }
 }

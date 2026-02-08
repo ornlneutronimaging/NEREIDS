@@ -1,0 +1,184 @@
+
+ **********************************************************
+ ***                                                    ***
+ ***                 SAMMY Version 8.0.0                ***
+ ***                                                    ***
+ **********************************************************
+
+ Name of input file: 
+ >>> ex006a.inp                                                             <<<
+ Name of parameter file: 
+ >>> ex006a.par                                                             <<<
+ Values used for constants -- Kvendf=1
+   mass of neutron =   1.008664915600000 in amu
+   sqrt(m/2)       =  72.298252179105063
+   sqrt(2m)/hbar   =   0.000219680775849
+   Boltzman        =   0.000086173430000
+   finestructure   =   0.034447599938334 in 1/(amu*F)
+ GENERATE PLOT FILE Automatically                                              
+ Name of experimental data file is: 
+ >>> ex006a.dat                                                             <<<
+ Emin and Emax =    315.000       330.000    
+
+
+ *****************************************************************************
+ *****                                                                   *****
+ ***** example ex006                                                     *****
+ *****                                                                   *****
+ *****************************************************************************
+
+
+ Input quantities from line number 2 are:
+   Alfnm1, Alfnm2 = ##     PU239##       Atomic Weight = 239.000000
+   Nepnts Itmax  Icorr  Nxtra  Iptdop Iptwid Ixxchn
+        0      0      0      0      0      0      0
+   Ndigit Idropp Matnum Kkkkza
+        2      2      0      0
+Adjusted  Itmax  Icorr  Nxtra  Iptdop Iptwid Ixxchn
+        0      0     50      0      9      5      0
+   Ndigit Idropp Matnum Kkkkza
+        2      2      0      0
+
+
+ TARGET ELEMENT IS      PU239
+ ATOMIC WEIGHT IS 239.000000
+
+
+ *********** Alphanumeric Control Information *********
+
+ PRINT THEORETICAL VALUES                
+ DO NOT SOLVE BAYES EQUATIONS            
+ ODF FILE IS WANTED--SAMMY.ODF ,ZERO-TH O
+ PRINT VARIED INPUT PARAMETERS           
+ CHI SQUARED IS WANTED                   
+                                         
+ **** end of Alphanumeric Control Information *********
+
+
+ ### Estimated array size for SAMMY-INP is       8255 ###
+
+ Effective Temperature=   0.00000
+    Flight Path=  18.90000 Meters +/-   0.02500/2 Meters
+      Deltae=     0.00000    Deltag=     0.05000
+      Delttt=     0.00000    Elowbr=  0.00000000
+
+ Target Thickness=   0.000    
+
+ **** Data type is <<< FISSI                >>> ****
+
+ Spin of incident particle is  0.5
+       #of  #of
+ Group Ent  Exit Jspin Relative  Ispin  g    Chn Lpnt Ishift eL Chspn
+    #  Chn  Chn         Abndnc                 #
+    1    1    2    0.0  1.0000    0.5 0.2500
+                                               1   1   0     0   0.0    
+                                               2   0   0     0   0.0    
+                                               3   0   0     0   0.0    
+    2    1    1    1.0  1.0000    0.5 0.7500
+                                               1   1   0     0   1.0    
+                                               2   0   0     0   1.0    
+__________________________
+ 
+ ### Array size used for SAMMY-INP is       9109 ###
+ ### Estimated array size for SAMMY-PAR is      12682 ###
+
+ Total  number of resonances is  376
+ Number of particle channels is    3
+ Number of spin groups is          2
+ Number of flagged parametrs is    0
+ Number of varied parameters is    0
+ ### Array size used for SAMMY-PAR is      12667 ###
+ ### Estimated array size for SAMMY-NEW is       9100 ###
+
+
+
+
+ ***** INITIAL VALUES FOR PARAMETERS                     
+
+
+    RADIUS          TEMPERATURE     THICKNESS
+  9.5400E+00       0.0000E+00       0.0000E+00     
+
+    DELTA-L         DELTA-T-GAUS     DELTA-T-EXP
+  2.5000E-02       5.0000E-02       0.0000E+00     
+ ### Array size used for SAMMY-NEW is      10225 ###
+     Emind               Emins               Eminr               Emin
+      312.9016845356      312.9016845356      312.9016845356      315.0000000000
+     Emax                Emaxr               Emaxs               Emaxd
+      330.0000000000      332.2161054168      332.2161054168      332.2161054168
+
+ Gaussian Resolution Width at Emin =  0.419663     and at Emax =  0.443221    
+  
+      E(eV)      Resol_FWHM(eV)
+    315.000000         0.6988
+    322.500000         0.7183
+    330.000000         0.7380
+  
+ ### Estimated array size for SAMMY-DAT is   32499445 +    32500000 ###
+
+ Energy range of data is from 3.15000E+02 to 3.30000E+02 eV.
+ Number of experimental data points =     111
+
+
+ **  4 resonances have fewer than 9 points across width
+ Number of points in auxiliary grid =     262
+ ### Array size used for SAMMY-DAT is   32499442 +    32500000 ###
+ ### Estimated array size for SAMMY-THE is      10188 ###
+ ### Array size used for SAMMY-THE is      10187 ###
+ ### Estimated array size for SAMMY-XCT is      19584 ###
+ ### Array size used for SAMMY-XCT is      19316 ###
+ ### Estimated array size for SAMMY-RSL is      11818 ###
+ ### Array size used for SAMMY-RSL is      11556 ###
+ ### Estimated array size for SAMMY-INT is      10884 ###
+
+
+ ***** THEORETICAL VALUES (broadnd,normed,...as required)
+
+      ENERGY    THEORY          ENERGY    THEORY          ENERGY    THEORY    
+ (  1)315.0047  1.39334    ( 38)319.9046  2.95665    ( 75)324.9198  7.97209    
+ (  2)315.1356  1.29736    ( 39)320.0386  3.03809    ( 76)325.0570  10.4862    
+ (  3)315.2666  1.27597    ( 40)320.1727  3.12415    ( 77)325.1942  15.2663    
+ (  4)315.3977  1.28048    ( 41)320.3069  3.21495    ( 78)325.3316  22.1753    
+ (  5)315.5289  1.29638    ( 42)320.4412  3.31078    ( 79)325.4690  29.5211    
+ (  6)315.6602  1.32069    ( 43)320.5755  3.41185    ( 80)325.6065  34.3816    
+ (  7)315.7916  1.35753    ( 44)320.7100  3.51856    ( 81)325.7441  34.3903    
+ (  8)315.9230  1.42609    ( 45)320.8445  3.63117    ( 82)325.8819  29.5264    
+ (  9)316.0545  1.58953    ( 46)320.9791  3.75015    ( 83)326.0197  22.1179    
+ ( 10)316.1861  2.01741    ( 47)321.1138  3.87608    ( 84)326.1575  15.0351    
+ ( 11)316.3178  3.06408    ( 48)321.2486  4.00956    ( 85)326.2955  9.94565    
+ ( 12)316.4496  5.25397    ( 49)321.3834  4.15144    ( 86)326.4336  6.98263    
+ ( 13)316.5814  8.99118    ( 50)321.5184  4.30281    ( 87)326.5717  5.47625    
+ ( 14)316.7133  13.9884    ( 51)321.6534  4.46509    ( 88)326.7099  4.72336    
+ ( 15)316.8454  18.8762    ( 52)321.7885  4.64025    ( 89)326.8482  4.29114    
+ ( 16)316.9775  21.6713    ( 53)321.9237  4.83121    ( 90)326.9866  3.98317    
+ ( 17)317.1096  21.0656    ( 54)322.0590  5.04229    ( 91)327.1251  3.72725    
+ ( 18)317.2419  17.4280    ( 55)322.1944  5.28062    ( 92)327.2637  3.50053    
+ ( 19)317.3743  12.4937    ( 56)322.3298  5.55899    ( 93)327.4024  3.29622    
+ ( 20)317.5067  8.08396    ( 57)322.4654  5.90417    ( 94)327.5411  3.11305    
+ ( 21)317.6392  5.09897    ( 58)322.6010  6.38042    ( 95)327.6800  2.95225    
+ ( 22)317.7718  3.48330    ( 59)322.7367  7.14825    ( 96)327.8189  2.81655    
+ ( 23)317.9045  2.75766    ( 60)322.8725  8.57813    ( 97)327.9579  2.71037    
+ ( 24)318.0372  2.47796    ( 61)323.0084  11.3741    ( 98)328.0970  2.63970    
+ ( 25)318.1701  2.38444    ( 62)323.1443  16.5096    ( 99)328.2362  2.61235    
+ ( 26)318.3030  2.36244    ( 63)323.2804  24.6439    (100)328.3755  2.63794    
+ ( 27)318.4360  2.36982    ( 64)323.4165  35.0553    (101)328.5149  2.72747    
+ ( 28)318.5691  2.39219    ( 65)323.5528  44.9433    (102)328.6543  2.89188    
+ ( 29)318.7022  2.42424    ( 66)323.6891  50.3494    (103)328.7939  3.13993    
+ ( 30)318.8355  2.46356    ( 67)323.8255  48.6579    (104)328.9335  3.47430    
+ ( 31)318.9688  2.50887    ( 68)323.9620  40.5960    (105)329.0732  3.88722    
+ ( 32)319.1023  2.55941    ( 69)324.0986  29.7078    (106)329.2130  4.35723    
+ ( 33)319.2358  2.61471    ( 70)324.2352  19.8224    (107)329.3530  4.84829    
+ ( 34)319.3694  2.67450    ( 71)324.3720  12.9611    (108)329.4930  5.31311    
+ ( 35)319.5030  2.73860    ( 72)324.5088  9.14012    (109)329.6331  5.70200    
+ ( 36)319.6368  2.80700    ( 73)324.6457  7.45036    (110)329.7732  5.97360    
+ ( 37)319.7707  2.87965    ( 74)324.7827  7.11290    (111)329.9135  6.10394    
+ ### Array size used for SAMMY-INT is      10885 ###
+ ### Estimated array size for SAMMY-IPQ is      10508 ###
+
+ CUSTOMARY CHI SQUARED =   2497.31    
+ CUSTOMARY CHI SQUARED DIVIDED BY NDAT =   22.4983    
+ ### Array size used for SAMMY-IPQ is      10420 ###
+ ### Estimated array size for SAMMY-FIN is      10081 ###
+ ### Array size used for SAMMY-FIN is       9089 ###
+                              Total time =     0.05 seconds
+ Normal finish to SAMMY

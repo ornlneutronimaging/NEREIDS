@@ -22,6 +22,11 @@ fn parse_par_first_five_fields(line: &str) -> Option<[f64; 5]> {
             let start = i * 11;
             let end = start + 11;
             let field = line.get(start..end).unwrap_or("").trim();
+            if field.is_empty() {
+                // Some SAMMY PAR variants leave optional width columns blank.
+                *slot = 0.0;
+                continue;
+            }
             match field.parse::<f64>() {
                 Ok(v) => *slot = v,
                 Err(_) => {
@@ -71,7 +76,7 @@ pub fn parse_par_file(path: &Path) -> Result<Vec<Resonance>, Box<dyn std::error:
 
     let mut resonances = Vec::new();
 
-    for (line_num, line_result) in reader.lines().enumerate() {
+    for line_result in reader.lines() {
         let line = line_result?;
         let trimmed = line.trim();
 
@@ -80,13 +85,19 @@ pub fn parse_par_file(path: &Path) -> Result<Vec<Resonance>, Box<dyn std::error:
             continue;
         }
 
-        let [e_r, gamma_g_milliev, gamma_n_milliev, gamma_fa_milliev, gamma_fb_milliev] =
-            parse_par_first_five_fields(&line).ok_or_else(|| {
-                format!(
-                    "Line {}: failed to parse first five PAR fields as fixed-width or whitespace-delimited values",
-                    line_num + 1
-                )
-            })?;
+        let Some([e_r, gamma_g_milliev, gamma_n_milliev, gamma_fa_milliev, gamma_fb_milliev]) =
+            parse_par_first_five_fields(&line)
+        else {
+            // Ignore non-resonance records (e.g., trailing temperature or
+            // ORR-related sections in some PAR variants).
+            continue;
+        };
+        // Resonance records in our SAMMY fixtures carry additional control/index
+        // fields beyond the first 5 numeric columns. This skips short numeric
+        // records used by non-resonance sections (e.g., relative uncertainties).
+        if line.split_whitespace().count() < 6 {
+            continue;
+        }
 
         // Convert milliEV to eV
         let gamma_g = gamma_g_milliev / 1000.0;

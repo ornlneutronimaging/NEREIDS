@@ -17,7 +17,34 @@ pub struct ExperimentalData {
     pub uncertainties: Vec<f64>,
 }
 
-fn parse_dat_values_from_line(line: &str) -> Option<(f64, f64, f64)> {
+fn parse_dat_values_from_line(line: &str) -> Option<Vec<(f64, f64, f64)>> {
+    // Compact fixed-block format used by ex006/ex007 fixtures:
+    // repeated records of width 37 = [15-char energy][15-char data][7-char unc].
+    if line.len() >= 37 && line.len().is_multiple_of(37) {
+        let mut out = Vec::with_capacity(line.len() / 37);
+        let mut ok = true;
+        for k in 0..(line.len() / 37) {
+            let base = k * 37;
+            let e_field = line.get(base..base + 15).unwrap_or("").trim();
+            let d_field = line.get(base + 15..base + 30).unwrap_or("").trim();
+            let u_field = line.get(base + 30..base + 37).unwrap_or("").trim();
+            match (
+                e_field.parse::<f64>(),
+                d_field.parse::<f64>(),
+                u_field.parse::<f64>(),
+            ) {
+                (Ok(e), Ok(d), Ok(u)) => out.push((e, d, u)),
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok && !out.is_empty() {
+            return Some(out);
+        }
+    }
+
     // SAMMY "twenty" format: 3 fixed-width 20-char fields.
     if line.len() >= 60 {
         let mut vals = [0.0_f64; 3];
@@ -35,11 +62,11 @@ fn parse_dat_values_from_line(line: &str) -> Option<(f64, f64, f64)> {
             }
         }
         if ok {
-            return Some((vals[0], vals[1], vals[2]));
+            return Some(vec![(vals[0], vals[1], vals[2])]);
         }
     }
 
-    // Fallback for whitespace-delimited variants.
+    // Fallback for whitespace-delimited variants (single row).
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() < 3 {
         return None;
@@ -47,7 +74,7 @@ fn parse_dat_values_from_line(line: &str) -> Option<(f64, f64, f64)> {
     let energy = parts[0].parse::<f64>().ok()?;
     let datum = parts[1].parse::<f64>().ok()?;
     let uncertainty = parts[2].parse::<f64>().ok()?;
-    Some((energy, datum, uncertainty))
+    Some(vec![(energy, datum, uncertainty)])
 }
 
 /// Parse a SAMMY .dat file and extract experimental data.
@@ -83,16 +110,22 @@ pub fn parse_dat_file(path: &Path) -> Result<ExperimentalData, Box<dyn std::erro
             continue;
         }
 
-        let (energy, datum, uncertainty) = parse_dat_values_from_line(&line).ok_or_else(|| {
+        let rows = parse_dat_values_from_line(&line).ok_or_else(|| {
             format!(
                 "Line {}: failed to parse DAT row as fixed-width or whitespace-delimited numeric fields",
                 line_num + 1
             )
         })?;
 
-        energies.push(energy);
-        data.push(datum);
-        uncertainties.push(uncertainty);
+        for (energy, datum, uncertainty) in rows {
+            // Some SAMMY fixtures terminate with a sentinel row of zeros.
+            if energy <= 0.0 {
+                continue;
+            }
+            energies.push(energy);
+            data.push(datum);
+            uncertainties.push(uncertainty);
+        }
     }
 
     Ok(ExperimentalData {

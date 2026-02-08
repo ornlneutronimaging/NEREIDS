@@ -1,0 +1,18 @@
+example ex006
+     PU239      239.     315.       330.
+USE NEW SPIN GROUP FORMAT
+PRINT THEORETICAL VALUES
+generate plot file automatically
+do not solve bayes equations
+  
+     000.      18.90      .025       0.0      0.05
+     9.540        0.
+FISSI
+        .5        0.    0    1
+  1      1    2   .0       1.0   .5
+    1    1    0    0      .000      .000      .000
+    2    0    0    0      .000      .000      .000
+    3    0    0    0      .000      .000      .000
+  2      1    1  1.0       1.0   .5
+    1    1    0    0     1.000      .000      .000
+    2    0    0    0     1.000      .000      .000
