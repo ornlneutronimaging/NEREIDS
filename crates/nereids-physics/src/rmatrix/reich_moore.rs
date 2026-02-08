@@ -119,7 +119,7 @@ pub fn reich_moore_cross_sections(
             return Ok(CrossSections::default());
         }
 
-        let g_j = (2.0 * spin_group.j + 1.0) / (2.0 * (2.0 * config.target_spin + 1.0));
+        let g_j = (2.0 * spin_group.j.abs() + 1.0) / (2.0 * (2.0 * config.target_spin + 1.0));
         let k_sq = k_inv_fm * k_inv_fm;
         let norm = std::f64::consts::PI / k_sq * g_j * 0.01; // π·g_J / K² in barns
         let sigma_el_baseline = norm * 2.0 * (1.0 - cos_2phi);
@@ -285,7 +285,7 @@ pub fn reich_moore_cross_sections(
 
     // Statistical weight G_J = (2J + 1) / [2(2I + 1)]
     // From SAMMY dopush1.f90 lines 40, 76: Gjd = 2*(2*I+1), Gj = (2*J+1)/Gjd
-    let g_j = (2.0 * spin_group.j + 1.0) / (2.0 * (2.0 * config.target_spin + 1.0));
+    let g_j = (2.0 * spin_group.j.abs() + 1.0) / (2.0 * (2.0 * config.target_spin + 1.0));
 
     // Normalization: convert to barns
     // σ has units of area, K² has units of 1/length²
@@ -342,6 +342,7 @@ pub fn reich_moore_cross_sections(
 /// - `Jjl = 0` only in the special non-s-wave branch, otherwise `1`
 /// - correction applies when `JJ > Jjl && JJ < Numj`
 fn sammy_potential_correction_applies(spin_j: f64, target_spin: f64, l: u32) -> bool {
+    let spin_j = spin_j.abs();
     let fl = l as f64;
     let ajmin = ((target_spin - fl).abs() - 0.5).abs();
     let ajmax = target_spin + fl + 0.5;

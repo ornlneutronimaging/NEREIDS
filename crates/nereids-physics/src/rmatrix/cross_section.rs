@@ -32,13 +32,13 @@ fn infer_target_spin(isotope: &IsotopeParams) -> Result<f64, PhysicsError> {
     };
 
     let tol = 1e-8;
-    let j0 = first_group.j;
+    let j0 = first_group.j.abs();
     let mut candidates = vec![(j0 - 0.5).abs(), j0 + 0.5];
     candidates.sort_unstable_by(|a, b| a.partial_cmp(b).expect("finite target-spin candidates"));
     candidates.dedup_by(|a, b| approx_eq(*a, *b, tol));
 
     for sg in s_wave_groups.iter().skip(1) {
-        let j = sg.j;
+        let j = sg.j.abs();
         candidates.retain(|i| approx_eq(j, i + 0.5, tol) || approx_eq(j, (i - 0.5).abs(), tol));
         if candidates.is_empty() {
             break;
