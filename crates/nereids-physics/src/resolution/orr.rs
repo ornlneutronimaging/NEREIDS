@@ -258,6 +258,11 @@ impl OrrResolution {
                     "ORR {name} must be finite"
                 )));
             }
+            if value < 0.0 {
+                return Err(PhysicsError::InvalidParameter(format!(
+                    "ORR {name} must be non-negative"
+                )));
+            }
         }
         match &self.target {
             OrrTarget::Water {
@@ -315,6 +320,11 @@ impl OrrResolution {
                 if !d_ns.is_finite() || !f_inv_ns.is_finite() || !g.is_finite() {
                     return Err(PhysicsError::InvalidParameter(
                         "ORR lithium detector parameters must be finite".to_string(),
+                    ));
+                }
+                if *d_ns < 0.0 {
+                    return Err(PhysicsError::InvalidParameter(
+                        "ORR lithium detector d_ns must be non-negative".to_string(),
                     ));
                 }
                 if *f_inv_ns <= 0.0 {
@@ -629,9 +639,7 @@ impl OrrResolution {
             b_tail += 5.0 / a_us_inv + x0_us;
         }
         if detector_mode == DetectorMode::Ne110 {
-            if f_us_inv != 0.0 {
-                b_tail += d_us;
-            }
+            b_tail += d_us;
         } else {
             b_tail += 20.0 / f_us_inv + d_us;
         }
@@ -963,13 +971,11 @@ impl ResolutionFunction for OrrResolution {
         let mut out = vec![0.0; energies.len()];
 
         for (j, &em) in energies.iter().enumerate() {
-            let p = match self.gen_energy_params(em) {
-                Ok(v) => v,
-                Err(_) => {
-                    out[j] = spectrum[j];
-                    continue;
-                }
-            };
+            let p = self.gen_energy_params(em).map_err(|e| {
+                PhysicsError::InvalidParameter(format!(
+                    "ORR failed to generate parameters at index {j} for E={em} eV: {e:?}"
+                ))
+            })?;
             let piecewise = self.set_hhh_case_standard(&p);
 
             let ilow_raw = energies.partition_point(|&e| e < p.elow_ev);
@@ -1096,5 +1102,81 @@ mod tests {
         for y in out {
             assert!((y - 0.31).abs() < 1e-8);
         }
+    }
+
+    #[test]
+    fn test_orr_negative_burst_width_error() {
+        let energy = EnergyGrid::new(vec![180_000.0, 180_100.0]).unwrap();
+        let spectrum = vec![0.31, 0.32];
+        let mut res = sample_orr();
+        res.burst_width_ns = -1.0;
+        assert!(matches!(
+            res.convolve(&energy, &spectrum),
+            Err(PhysicsError::InvalidParameter(_))
+        ));
+    }
+
+    #[test]
+    fn test_orr_negative_lithium_d_errors() {
+        let energy = EnergyGrid::new(vec![180_000.0, 180_100.0]).unwrap();
+        let spectrum = vec![0.31, 0.32];
+        let mut res = sample_orr();
+        res.detector = OrrDetector::LithiumGlass {
+            d_ns: -1.0,
+            f_inv_ns: 0.392_235,
+            g: 1.009,
+        };
+        assert!(matches!(
+            res.convolve(&energy, &spectrum),
+            Err(PhysicsError::InvalidParameter(_))
+        ));
+    }
+
+    #[test]
+    fn test_orr_ne110_zero_f_tail_includes_detector_width() {
+        let res = OrrResolution {
+            flight_path_m: 201.578,
+            burst_width_ns: 2.2,
+            target: OrrTarget::Water {
+                lambda0_mm: 1e-9,
+                lambda1_mm: 0.0,
+                lambda2_mm: 0.0,
+                m: 4.0,
+            },
+            detector: OrrDetector::Ne110 {
+                delta_mm: 1.0,
+                lambda_sigma_constant_mm: 0.0,
+                lambda_sigma_mm: vec![],
+            },
+            channel_widths: vec![OrrChannelWidth {
+                max_energy_ev: 200_000.0,
+                width_ns: 8.54,
+            }],
+        };
+        let p = res.gen_energy_params(180_000.0).unwrap();
+        let tlow_us = SM2 * res.flight_path_m / p.eup_ev.sqrt();
+        let b_tail = p.timej_us - tlow_us;
+        let expected_min = p.p_us + p.c_us + p.d_us;
+        assert!(
+            b_tail >= expected_min * 0.99,
+            "expected b_tail to include detector width for NE110 with f=0: b_tail={b_tail}, expected_min={expected_min}"
+        );
+    }
+
+    #[test]
+    fn test_orr_param_generation_error_propagates() {
+        let energy = EnergyGrid::new(vec![180_000.0, 180_100.0]).unwrap();
+        let spectrum = vec![0.31, 0.32];
+        let mut res = sample_orr();
+        res.target = OrrTarget::Water {
+            lambda0_mm: -0.1,
+            lambda1_mm: 0.0,
+            lambda2_mm: 0.0,
+            m: 4.0,
+        };
+        assert!(matches!(
+            res.convolve(&energy, &spectrum),
+            Err(PhysicsError::InvalidParameter(_))
+        ));
     }
 }

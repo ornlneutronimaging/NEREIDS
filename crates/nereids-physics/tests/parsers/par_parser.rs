@@ -14,6 +14,10 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 fn parse_par_first_five_fields(line: &str) -> Option<[f64; 5]> {
+    parse_par_first_five_fields_fixed_width(line).or_else(|| parse_par_first_five_fields_ws(line))
+}
+
+fn parse_par_first_five_fields_fixed_width(line: &str) -> Option<[f64; 5]> {
     // Canonical SAMMY PAR layout: first 5 values in fixed-width 11-char fields.
     if line.len() >= 55 {
         let mut vals = [0.0_f64; 5];
@@ -39,7 +43,10 @@ fn parse_par_first_five_fields(line: &str) -> Option<[f64; 5]> {
             return Some(vals);
         }
     }
+    None
+}
 
+fn parse_par_first_five_fields_ws(line: &str) -> Option<[f64; 5]> {
     // Fallback for whitespace-delimited fixtures/variants.
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() < 5 {
@@ -85,6 +92,7 @@ pub fn parse_par_file(path: &Path) -> Result<Vec<Resonance>, Box<dyn std::error:
             continue;
         }
 
+        let from_fixed_width = parse_par_first_five_fields_fixed_width(&line).is_some();
         let Some([e_r, gamma_g_milliev, gamma_n_milliev, gamma_fa_milliev, gamma_fb_milliev]) =
             parse_par_first_five_fields(&line)
         else {
@@ -95,7 +103,7 @@ pub fn parse_par_file(path: &Path) -> Result<Vec<Resonance>, Box<dyn std::error:
         // Resonance records in our SAMMY fixtures carry additional control/index
         // fields beyond the first 5 numeric columns. This skips short numeric
         // records used by non-resonance sections (e.g., relative uncertainties).
-        if line.split_whitespace().count() < 6 {
+        if !from_fixed_width && line.split_whitespace().count() < 6 {
             continue;
         }
 
@@ -181,6 +189,29 @@ mod tests {
         let line = format!(
             "{:>11}{:>11}{:>11}{:>11}{:>11}{:>11}\n",
             "2.5E-1", "1.0", "0.5", "0.5", "0.5", "1"
+        );
+        fs::write(&path, line).unwrap();
+
+        let resonances = parse_par_file(&path).unwrap();
+        assert_eq!(resonances.len(), 1);
+        assert!((resonances[0].energy.value - 0.25).abs() < 1e-12);
+        assert!((resonances[0].gamma_g.value - 0.001).abs() < 1e-12);
+        assert!((resonances[0].gamma_n.value - 0.0005).abs() < 1e-12);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_parse_compact_fixed_width_par_without_token_boundaries() {
+        let path = unique_temp_path("compact_fixed.par");
+        let line = format!(
+            "{}{}{}{}{}{}\n",
+            format!("{:011.4E}", 2.5e-1),
+            format!("{:011.4E}", 1.0),
+            format!("{:011.4E}", 0.5),
+            format!("{:011.4E}", 0.5),
+            format!("{:011.4E}", 0.5),
+            "00000000001"
         );
         fs::write(&path, line).unwrap();
 
