@@ -6,19 +6,202 @@
 
 use nereids_core::{EnergyGrid, PhysicsError, ResolutionFunction};
 
+const MIN_NORMALIZATION: f64 = 1e-300;
+
 /// Tabulated resolution function loaded from user-provided data.
 #[derive(Debug, Clone)]
 pub struct TabulatedResolution {
-    /// Energy points of the tabulated kernel.
+    /// Kernel energy offsets (eV), sorted ascending.
+    ///
+    /// Each output value at `E` uses kernel samples over `[E + offset_i]`.
     pub energy: Vec<f64>,
-    /// Resolution kernel values at each energy point.
+    /// Kernel values at each energy-offset point.
     pub kernel: Vec<f64>,
 }
 
+fn validate_sorted_finite(values: &[f64], name: &str) -> Result<(), PhysicsError> {
+    if values.is_empty() {
+        return Err(PhysicsError::InvalidParameter(format!(
+            "{name} must not be empty"
+        )));
+    }
+    if values.iter().any(|v| !v.is_finite()) {
+        return Err(PhysicsError::InvalidParameter(format!(
+            "{name} must contain only finite values"
+        )));
+    }
+    if values.windows(2).any(|w| w[1] < w[0]) {
+        return Err(PhysicsError::InvalidParameter(format!(
+            "{name} must be sorted ascending"
+        )));
+    }
+    Ok(())
+}
+
+fn interpolate_clamped(energies: &[f64], values: &[f64], x: f64) -> f64 {
+    let n = energies.len();
+    let idx = energies.partition_point(|&e| e < x);
+    if idx == 0 {
+        values[0]
+    } else if idx >= n {
+        values[n - 1]
+    } else {
+        let e0 = energies[idx - 1];
+        let e1 = energies[idx];
+        let y0 = values[idx - 1];
+        let y1 = values[idx];
+        if e1 == e0 {
+            y1
+        } else {
+            let t = (x - e0) / (e1 - e0);
+            y0 + t * (y1 - y0)
+        }
+    }
+}
+
 impl ResolutionFunction for TabulatedResolution {
-    fn convolve(&self, _energy: &EnergyGrid, spectrum: &[f64]) -> Result<Vec<f64>, PhysicsError> {
-        // Stub: return spectrum unchanged.
-        // Full implementation will interpolate and convolve.
-        Ok(spectrum.to_vec())
+    fn convolve(&self, energy: &EnergyGrid, spectrum: &[f64]) -> Result<Vec<f64>, PhysicsError> {
+        let energies = &energy.values;
+        if energies.is_empty() {
+            return Err(PhysicsError::EmptyEnergyGrid);
+        }
+        if spectrum.len() != energies.len() {
+            return Err(PhysicsError::DimensionMismatch {
+                expected: energies.len(),
+                got: spectrum.len(),
+            });
+        }
+        validate_sorted_finite(energies, "energy grid")?;
+
+        if self.energy.len() != self.kernel.len() {
+            return Err(PhysicsError::DimensionMismatch {
+                expected: self.energy.len(),
+                got: self.kernel.len(),
+            });
+        }
+        if self.energy.len() < 2 {
+            return Err(PhysicsError::InvalidParameter(
+                "tabulated kernel requires at least two offset points".to_string(),
+            ));
+        }
+        validate_sorted_finite(&self.energy, "kernel offsets")?;
+        if self.kernel.iter().any(|k| !k.is_finite()) {
+            return Err(PhysicsError::InvalidParameter(
+                "kernel values must be finite".to_string(),
+            ));
+        }
+        if self.kernel.iter().any(|&k| k < 0.0) {
+            return Err(PhysicsError::InvalidParameter(
+                "kernel values must be non-negative".to_string(),
+            ));
+        }
+
+        let mut convolved = Vec::with_capacity(energies.len());
+        for (i, &e_center) in energies.iter().enumerate() {
+            let mut weighted = 0.0;
+            let mut norm = 0.0;
+
+            for j in 1..self.energy.len() {
+                let dx = self.energy[j] - self.energy[j - 1];
+                if dx <= 0.0 {
+                    continue;
+                }
+
+                let e0 = e_center + self.energy[j - 1];
+                let e1 = e_center + self.energy[j];
+                let s0 = interpolate_clamped(energies, spectrum, e0);
+                let s1 = interpolate_clamped(energies, spectrum, e1);
+                let w0 = self.kernel[j - 1];
+                let w1 = self.kernel[j];
+                weighted += 0.5 * dx * (w0 * s0 + w1 * s1);
+                norm += 0.5 * dx * (w0 + w1);
+            }
+
+            if norm > MIN_NORMALIZATION {
+                convolved.push(weighted / norm);
+            } else {
+                convolved.push(spectrum[i]);
+            }
+        }
+
+        Ok(convolved)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tabulated_constant_signal_preserved() {
+        let energy = EnergyGrid::new((0..201).map(|i| 1.0 + i as f64 * 0.05).collect()).unwrap();
+        let spectrum = vec![3.5; energy.len()];
+        let res = TabulatedResolution {
+            energy: vec![-0.2, 0.0, 0.2],
+            kernel: vec![0.0, 1.0, 0.0],
+        };
+        let out = res.convolve(&energy, &spectrum).unwrap();
+        for y in out {
+            assert!((y - 3.5).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn test_tabulated_spreads_peak() {
+        let energy = EnergyGrid::new((0..2001).map(|i| 9.0 + i as f64 * 0.001).collect()).unwrap();
+        let mut spectrum = vec![0.0; energy.len()];
+        let mid = spectrum.len() / 2;
+        spectrum[mid] = 100.0;
+
+        let res = TabulatedResolution {
+            energy: vec![-0.002, -0.001, 0.0, 0.001, 0.002],
+            kernel: vec![0.0, 0.5, 1.0, 0.5, 0.0],
+        };
+        let out = res.convolve(&energy, &spectrum).unwrap();
+        assert!(out[mid] < spectrum[mid]);
+        assert!(out[mid - 1] > 0.0);
+        assert!(out[mid + 1] > 0.0);
+    }
+
+    #[test]
+    fn test_tabulated_dimension_mismatch_errors() {
+        let energy = EnergyGrid::new(vec![1.0, 2.0]).unwrap();
+        let spectrum = vec![1.0, 2.0];
+        let res = TabulatedResolution {
+            energy: vec![-0.1, 0.1],
+            kernel: vec![1.0],
+        };
+        assert!(matches!(
+            res.convolve(&energy, &spectrum),
+            Err(PhysicsError::DimensionMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_tabulated_unsorted_offsets_error() {
+        let energy = EnergyGrid::new(vec![1.0, 2.0]).unwrap();
+        let spectrum = vec![1.0, 2.0];
+        let res = TabulatedResolution {
+            energy: vec![0.1, -0.1],
+            kernel: vec![1.0, 1.0],
+        };
+        assert!(matches!(
+            res.convolve(&energy, &spectrum),
+            Err(PhysicsError::InvalidParameter(_))
+        ));
+    }
+
+    #[test]
+    fn test_tabulated_negative_kernel_error() {
+        let energy = EnergyGrid::new(vec![1.0, 2.0]).unwrap();
+        let spectrum = vec![1.0, 2.0];
+        let res = TabulatedResolution {
+            energy: vec![-0.1, 0.1],
+            kernel: vec![1.0, -1.0],
+        };
+        assert!(matches!(
+            res.convolve(&energy, &spectrum),
+            Err(PhysicsError::InvalidParameter(_))
+        ));
     }
 }

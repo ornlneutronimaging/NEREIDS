@@ -1,10 +1,11 @@
 //! Default forward model composing all pipeline stages.
 //!
-//! Pipeline order (Phase 1c):
+//! Pipeline order (Phase 1d):
 //! 1. 0K cross sections (R-matrix)
 //! 2. Doppler broadening (if temperature > 0)
 //! 3. Beer-Lambert transmission
-//! 4. Normalization + background
+//! 4. Resolution convolution (optional)
+//! 5. Normalization + background
 //!
 //! Beer-Lambert is evaluated as:
 //! `T(E) = exp(-Σ_i [n_i * d_i * σ_i(E; T)])`
@@ -14,7 +15,6 @@
 //!
 //! Future phases will add:
 //! - Self-shielding (optional)
-//! - Resolution convolution
 
 use crate::broadening::doppler::{
     broaden_cross_sections, broaden_cross_sections_to_grid, create_auxiliary_grid,
@@ -345,6 +345,20 @@ fn compute_beer_lambert_transmission_multi_isotope(
     Ok(optical_depth.into_iter().map(|tau| (-tau).exp()).collect())
 }
 
+fn compute_transmission_pre_normalization(
+    energy: &EnergyGrid,
+    params: &RMatrixParameters,
+    config: &ForwardModelConfig,
+    resolution: Option<&dyn ResolutionFunction>,
+) -> Result<Vec<f64>, PhysicsError> {
+    let transmission = compute_beer_lambert_transmission_multi_isotope(energy, params, config)?;
+    if let Some(resolution_fn) = resolution {
+        resolution_fn.convolve(energy, &transmission)
+    } else {
+        Ok(transmission)
+    }
+}
+
 /// The default forward model that composes all physics pipeline stages.
 pub struct DefaultForwardModel {
     /// Optional resolution function. If `None`, no resolution broadening is applied.
@@ -358,10 +372,15 @@ impl ForwardModel for DefaultForwardModel {
         params: &RMatrixParameters,
         config: &ForwardModelConfig,
     ) -> Result<Vec<f64>, PhysicsError> {
-        // 1. Beer-Lambert transmission with per-isotope areal density.
-        let transmission = compute_beer_lambert_transmission_multi_isotope(energy, params, config)?;
+        // 1. Beer-Lambert + optional resolution convolution.
+        let transmission = compute_transmission_pre_normalization(
+            energy,
+            params,
+            config,
+            self.resolution.as_deref(),
+        )?;
 
-        // 3. Apply normalization and background
+        // 2. Apply normalization and background.
         let norm_config = NormalizationConfig {
             normalization: Parameter::fixed(config.normalization),
             background: config.background.clone(),
@@ -377,8 +396,13 @@ impl ForwardModel for DefaultForwardModel {
         params: &RMatrixParameters,
         config: &ForwardModelConfig,
     ) -> Result<(Vec<f64>, Vec<Vec<f64>>), PhysicsError> {
-        // 1. Base Beer-Lambert transmission.
-        let transmission = compute_beer_lambert_transmission_multi_isotope(energy, params, config)?;
+        // 1. Base transmission (Beer-Lambert + optional resolution convolution).
+        let transmission = compute_transmission_pre_normalization(
+            energy,
+            params,
+            config,
+            self.resolution.as_deref(),
+        )?;
 
         // 2. Finite-difference Jacobian for free R-matrix parameters.
         // This keeps derivatives physically coupled to the current transmission path
@@ -395,13 +419,21 @@ impl ForwardModel for DefaultForwardModel {
 
             let mut params_plus = params.clone();
             set_param_value(&mut params_plus, path, base_value + h);
-            let t_plus =
-                compute_beer_lambert_transmission_multi_isotope(energy, &params_plus, config);
+            let t_plus = compute_transmission_pre_normalization(
+                energy,
+                &params_plus,
+                config,
+                self.resolution.as_deref(),
+            );
 
             let mut params_minus = params.clone();
             set_param_value(&mut params_minus, path, base_value - h);
-            let t_minus =
-                compute_beer_lambert_transmission_multi_isotope(energy, &params_minus, config);
+            let t_minus = compute_transmission_pre_normalization(
+                energy,
+                &params_minus,
+                config,
+                self.resolution.as_deref(),
+            );
 
             match (t_plus, t_minus) {
                 (Ok(tp), Ok(tm)) => {
@@ -494,6 +526,7 @@ fn combine_jacobians(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resolution::gaussian::GaussianResolution;
     use crate::rmatrix::cross_section::compute_0k_cross_sections;
     use nereids_core::{Background, Channel, IsotopeParams, Parameter, Resonance, SpinGroup};
 
@@ -611,6 +644,97 @@ mod tests {
         for t in &result {
             assert!(*t >= 0.05, "Transmission less than background: {}", t);
         }
+    }
+
+    #[test]
+    fn test_pipeline_applies_resolution_when_present() {
+        let energy_values: Vec<f64> = (0..301).map(|i| 9.7 + i as f64 * 0.002).collect();
+        let energy = EnergyGrid::new(energy_values).unwrap();
+        let isotope = IsotopeParams {
+            name: "Narrow-Res".to_string(),
+            awr: 10.0,
+            abundance: Parameter::fixed(1.0),
+            thickness_cm: 1.0,
+            number_density: 1e-2,
+            spin_groups: vec![SpinGroup {
+                j: 0.5,
+                channels: vec![Channel {
+                    l: 0,
+                    channel_spin: 0.5,
+                    radius: 2.908,
+                    effective_radius: 2.908,
+                }],
+                resonances: vec![Resonance {
+                    energy: Parameter::fixed(10.005),
+                    gamma_n: Parameter::fixed(3e-4),
+                    gamma_g: Parameter::fixed(3e-4),
+                    fission: None,
+                }],
+            }],
+        };
+        let params = RMatrixParameters {
+            isotopes: vec![isotope],
+        };
+        let config = ForwardModelConfig::default();
+
+        let model_no_res = DefaultForwardModel { resolution: None };
+        let model_with_res = DefaultForwardModel {
+            resolution: Some(Box::new(GaussianResolution { sigma: 0.02 })),
+        };
+
+        let t_no_res = model_no_res
+            .transmission(&energy, &params, &config)
+            .unwrap();
+        let t_with_res = model_with_res
+            .transmission(&energy, &params, &config)
+            .unwrap();
+
+        let max_delta = t_no_res
+            .iter()
+            .zip(t_with_res.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_delta > 1e-8,
+            "expected resolution convolution to change the spectrum, max_delta={max_delta}"
+        );
+    }
+
+    #[test]
+    fn test_pipeline_with_resolution_jacobian_shape_and_finiteness() {
+        let model = DefaultForwardModel {
+            resolution: Some(Box::new(GaussianResolution { sigma: 0.05 })),
+        };
+        let energy = EnergyGrid::new(vec![1.0, 5.0, 20.0]).unwrap();
+        let mut isotope = create_test_isotope();
+        isotope.abundance = Parameter::free(1.0);
+        let params = RMatrixParameters {
+            isotopes: vec![isotope],
+        };
+        let config = ForwardModelConfig::default();
+
+        let (_t, jac) = model
+            .transmission_with_jacobian(&energy, &params, &config)
+            .unwrap();
+
+        assert_eq!(jac.len(), energy.len());
+        assert_eq!(jac[0].len(), 1);
+        assert!(jac.iter().all(|row| row.iter().all(|v| v.is_finite())));
+    }
+
+    #[test]
+    fn test_pipeline_resolution_error_propagates() {
+        let model = DefaultForwardModel {
+            resolution: Some(Box::new(GaussianResolution { sigma: -0.1 })),
+        };
+        let energy = EnergyGrid::new(vec![1.0, 5.0, 20.0]).unwrap();
+        let params = RMatrixParameters {
+            isotopes: vec![create_test_isotope()],
+        };
+        let config = ForwardModelConfig::default();
+
+        let result = model.transmission(&energy, &params, &config);
+        assert!(matches!(result, Err(PhysicsError::InvalidParameter(_))));
     }
 
     #[test]
