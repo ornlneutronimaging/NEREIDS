@@ -82,6 +82,7 @@ pub fn parse_par_file(path: &Path) -> Result<Vec<Resonance>, Box<dyn std::error:
     let reader = BufReader::new(file);
 
     let mut resonances = Vec::new();
+    let mut seen_resonance_block = false;
 
     for line_result in reader.lines() {
         let line = line_result?;
@@ -96,16 +97,24 @@ pub fn parse_par_file(path: &Path) -> Result<Vec<Resonance>, Box<dyn std::error:
         let Some([e_r, gamma_g_milliev, gamma_n_milliev, gamma_fa_milliev, gamma_fb_milliev]) =
             parse_par_first_five_fields(&line)
         else {
-            // Ignore non-resonance records (e.g., trailing temperature or
-            // ORR-related sections in some PAR variants).
+            // Resonance records are expected as one contiguous block at the
+            // top of these SAMMY PAR fixtures. Once that block ends, stop so
+            // later numeric control sections are not misinterpreted.
+            if seen_resonance_block {
+                break;
+            }
             continue;
         };
         // Resonance records in our SAMMY fixtures carry additional control/index
         // fields beyond the first 5 numeric columns. This skips short numeric
         // records used by non-resonance sections (e.g., relative uncertainties).
         if !from_fixed_width && line.split_whitespace().count() < 6 {
+            if seen_resonance_block {
+                break;
+            }
             continue;
         }
+        seen_resonance_block = true;
 
         // Convert milliEV to eV
         let gamma_g = gamma_g_milliev / 1000.0;
@@ -220,6 +229,26 @@ mod tests {
         assert!((resonances[0].energy.value - 0.25).abs() < 1e-12);
         assert!((resonances[0].gamma_g.value - 0.001).abs() < 1e-12);
         assert!((resonances[0].gamma_n.value - 0.0005).abs() < 1e-12);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_parse_ignores_post_resonance_numeric_control_sections() {
+        let path = unique_temp_path("post_block_controls.par");
+        let contents = concat!(
+            " 0.25      1.         0.5        0.5       0.5          1 0 0 0 0 1\n",
+            "\n",
+            ".150000000\n",
+            "ORRESolution function parameters follow\n",
+            "NORMAlization and \"constant\" background follow\n",
+            "1.00191245 .09055000 0.        0.        0.        0.        1 1 0 0 0 0\n",
+        );
+        fs::write(&path, contents).unwrap();
+
+        let resonances = parse_par_file(&path).unwrap();
+        assert_eq!(resonances.len(), 1);
+        assert!((resonances[0].energy.value - 0.25).abs() < 1e-12);
 
         let _ = fs::remove_file(path);
     }

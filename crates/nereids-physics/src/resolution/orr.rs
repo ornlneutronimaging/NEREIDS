@@ -217,6 +217,12 @@ impl OrrResolution {
         if tab.len() == 1 {
             return tab[0].1;
         }
+        if em_ev <= tab[0].0 {
+            return tab[0].1;
+        }
+        if em_ev >= tab[tab.len() - 1].0 {
+            return tab[tab.len() - 1].1;
+        }
 
         let mut idx = tab.partition_point(|(e, _)| *e < em_ev);
         if idx == 0 {
@@ -1178,5 +1184,31 @@ mod tests {
             res.convolve(&energy, &spectrum),
             Err(PhysicsError::InvalidParameter(_))
         ));
+    }
+
+    #[test]
+    fn test_ne110_lambda_sigma_interpolation_clamps_out_of_range() {
+        let res = sample_orr_ne110();
+        if let OrrDetector::Ne110 {
+            lambda_sigma_constant_mm,
+            lambda_sigma_mm,
+            ..
+        } = &res.detector
+        {
+            let below = res.interpolate_ne110_lambda_sigma_mm(
+                1.0,
+                lambda_sigma_mm,
+                *lambda_sigma_constant_mm,
+            );
+            let above = res.interpolate_ne110_lambda_sigma_mm(
+                5.0e7,
+                lambda_sigma_mm,
+                *lambda_sigma_constant_mm,
+            );
+            assert_eq!(below, 27.2);
+            assert_eq!(above, 14.8);
+        } else {
+            panic!("expected NE110 detector in sample_orr_ne110");
+        }
     }
 }
