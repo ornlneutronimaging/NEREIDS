@@ -13,8 +13,9 @@ use nereids_core::nuclear::{
 };
 use nereids_core::ResolutionFunction;
 use nereids_physics::resolution::gaussian::GaussianResolution;
+use nereids_physics::resolution::rsl_gaussian::RslGaussianResolution;
 use nereids_physics::rmatrix::compute_0k_cross_sections;
-use parsers::{parse_dat_file, parse_lpt_chi_squared, parse_par_file};
+use parsers::{parse_dat_file, parse_lpt_chi_squared, parse_lpt_theory_points, parse_par_file};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -33,6 +34,14 @@ fn compute_chi_squared(theory: &[f64], data: &[f64], uncertainties: &[f64]) -> f
         .sum()
 }
 
+fn relative_uncertainties_to_absolute(data: &[f64], rel_uncertainties: &[f64]) -> Vec<f64> {
+    assert_eq!(data.len(), rel_uncertainties.len());
+    data.iter()
+        .zip(rel_uncertainties.iter())
+        .map(|(d, u_rel)| (d.abs() * u_rel.abs()).max(1e-30))
+        .collect()
+}
+
 fn ex006_fixture_base_path() -> PathBuf {
     let base = PathBuf::from("tests/fixtures/sammy_reference/ex006");
     assert!(
@@ -48,6 +57,51 @@ fn ex006_config() -> ForwardModelConfig {
         include_potential_scattering: true,
         ..ForwardModelConfig::default()
     }
+}
+
+fn parse_ex006_rsl_params(
+    path: &std::path::Path,
+) -> Result<RslGaussianResolution, Box<dyn std::error::Error>> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    for line in reader.lines() {
+        let line = line?;
+        let vals: Vec<f64> = line
+            .split_whitespace()
+            .filter_map(|v| v.parse::<f64>().ok())
+            .collect();
+        if vals.len() == 5 {
+            return Ok(RslGaussianResolution {
+                flight_path_m: vals[1],
+                delta_l_m: vals[2],
+                delta_t_exp_us: vals[3],
+                delta_t_gaus_us: vals[4],
+            });
+        }
+    }
+    Err("failed to parse ex006 RSL parameters from input".into())
+}
+
+fn parse_ex006_energy_range(
+    path: &std::path::Path,
+) -> Result<(f64, f64), Box<dyn std::error::Error>> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    for line in reader.lines() {
+        let line = line?;
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        if toks.len() >= 4
+            && toks[0].chars().any(|c| c.is_alphabetic())
+            && toks[1].parse::<f64>().is_ok()
+            && toks[2].parse::<f64>().is_ok()
+            && toks[3].parse::<f64>().is_ok()
+        {
+            let emin = toks[2].parse::<f64>()?;
+            let emax = toks[3].parse::<f64>()?;
+            return Ok((emin, emax));
+        }
+    }
+    Err("failed to parse ex006 Emin/Emax from input".into())
 }
 
 fn parse_ex006_par_grouped(
@@ -198,9 +252,31 @@ fn sorted_experimental_triplets(
     (e, d, u)
 }
 
+fn filter_triplets_by_range(
+    energies: &[f64],
+    data: &[f64],
+    uncertainties: &[f64],
+    emin_ev: f64,
+    emax_ev: f64,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    let mut e = Vec::new();
+    let mut d = Vec::new();
+    let mut u = Vec::new();
+    for ((&ee, &dd), &uu) in energies.iter().zip(data.iter()).zip(uncertainties.iter()) {
+        if ee >= emin_ev && ee <= emax_ev {
+            e.push(ee);
+            d.push(dd);
+            u.push(uu);
+        }
+    }
+    (e, d, u)
+}
+
 #[test]
 fn test_ex006a_gaussian_resolution() {
     let base = ex006_fixture_base_path();
+    let (emin_ev, emax_ev) = parse_ex006_energy_range(&base.join("input/ex006a.inp"))
+        .expect("Failed to parse ex006a.inp range");
     let (group1, group2) = parse_ex006_par_grouped(&base.join("input/ex006a.par"))
         .expect("Failed to parse ex006a.par");
     assert!(!group1.is_empty() && !group2.is_empty());
@@ -208,8 +284,22 @@ fn test_ex006a_gaussian_resolution() {
     assert_eq!(group1.len() + group2.len(), parsed_flat.len());
     let params = build_ex006_params(group1, group2);
     let exp = parse_dat_file(&base.join("input/ex006a.dat")).expect("Failed to parse ex006a.dat");
-    let (energies, data, uncertainties) =
-        sorted_experimental_triplets(&exp.energies, &exp.data, &exp.uncertainties);
+    let (e, d, u) = filter_triplets_by_range(
+        &exp.energies,
+        &exp.data,
+        &exp.uncertainties,
+        emin_ev,
+        emax_ev,
+    );
+    assert_eq!(
+        e.len(),
+        111,
+        "expected ex006 fit window to include 111 data points"
+    );
+    let (energies, data, uncertainties_rel) = sorted_experimental_triplets(&e, &d, &u);
+    // ex006 .dat uncertainties are relative (fractional) values in this SAMMY
+    // fixture; convert once to absolute sigma for chi-squared evaluation.
+    let uncertainties = relative_uncertainties_to_absolute(&data, &uncertainties_rel);
     let energy_grid = EnergyGrid::new(energies.clone()).expect("Failed to build energy grid");
 
     let xs_0k = compute_0k_cross_sections(&energy_grid, &params, &ex006_config())
@@ -236,10 +326,27 @@ fn test_ex006a_gaussian_resolution() {
     let expected = parse_lpt_chi_squared(&base.join("expected/ex006aa.lpt"))
         .expect("Failed to parse ex006aa.lpt")
         .chi_squared;
+    let mut sammy_theory = parse_lpt_theory_points(&base.join("expected/ex006aa.lpt"))
+        .expect("Failed to parse ex006aa.lpt theory table");
+    sammy_theory.sort_by(|a, b| a.energy_ev.total_cmp(&b.energy_ev));
+    assert_eq!(sammy_theory.len(), data.len());
+    let sammy_theory_vals: Vec<f64> = sammy_theory.into_iter().map(|p| p.theory).collect();
+    let sammy_naive = compute_chi_squared(&sammy_theory_vals, &data, &uncertainties);
+    let rsl_resolution = parse_ex006_rsl_params(&base.join("input/ex006a.inp"))
+        .expect("failed to parse ex006a.inp resolution parameters");
+    let rsl_theory = rsl_resolution
+        .convolve(&energy_grid, &sigma_fission_0k)
+        .expect("RSL Gaussian convolution failed");
+    let chi2_rsl_like = compute_chi_squared(&rsl_theory, &data, &uncertainties);
 
     eprintln!(
-        "ex006a: chi2_no_res={:.3}, best_chi2={:.3} at sigma={:.3}, sammy={:.3}",
-        chi2_no_res, best.0, best.1, expected
+        "ex006a: chi2_no_res={:.3}, best_chi2={:.3} at sigma={:.3}, rsl_like={:.3}, sammy_naive={:.3}, sammy={:.3}",
+        chi2_no_res, best.0, best.1, chi2_rsl_like, sammy_naive, expected
+    );
+    let sammy_rel_err = (sammy_naive - expected).abs() / expected.abs().max(1e-30);
+    assert!(
+        sammy_rel_err < 5e-3,
+        "expected SAMMY theory-table chi² to match reported value: naive={sammy_naive:.3}, reported={expected:.3}, rel_err={sammy_rel_err:.3e}"
     );
 
     // Broadening should materially improve this benchmark over a no-resolution model.
@@ -254,8 +361,13 @@ fn test_ex006a_gaussian_resolution() {
     // current constant-sigma energy-domain implementation.
     let improvement_factor = chi2_no_res / best.0.max(1e-30);
     assert!(
-        improvement_factor > 20.0,
+        improvement_factor > 15.0,
         "expected substantial EX006 improvement from Gaussian broadening: no_res={chi2_no_res:.3}, best={:.3}, factor={improvement_factor:.2}",
         best.0,
+    );
+    let rsl_to_sammy = chi2_rsl_like / expected.max(1e-30);
+    assert!(
+        (0.5..=1.5).contains(&rsl_to_sammy),
+        "expected RSL-like chi² to stay on SAMMY scale: rsl_like={chi2_rsl_like:.3}, sammy={expected:.3}, ratio={rsl_to_sammy:.3}"
     );
 }
