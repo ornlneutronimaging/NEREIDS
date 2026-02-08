@@ -14,9 +14,7 @@ mod parsers;
 use nereids_core::energy::EnergyGrid;
 use nereids_core::forward_model::ForwardModelConfig;
 use nereids_core::nuclear::{Channel, IsotopeParams, Parameter, RMatrixParameters, SpinGroup};
-use nereids_physics::broadening::doppler::{
-    broaden_cross_sections, create_auxiliary_grid, interpolate_to_grid,
-};
+use nereids_physics::broadening::doppler::{broaden_cross_sections_to_grid, create_auxiliary_grid};
 use nereids_physics::rmatrix::compute_0k_cross_sections;
 use parsers::{parse_dat_file, parse_lpt_chi_squared, parse_par_file};
 use std::path::PathBuf;
@@ -229,13 +227,11 @@ fn test_ex005b_50k() {
         );
     }
 
-    // Apply Doppler broadening at 50K
-    let capture_50k =
-        broaden_cross_sections(&capture_0k, &aux_grid, 10.0, 50.0).expect("Broadening failed");
-
-    // Interpolate broadened result to data energies
-    let theory = interpolate_to_grid(&aux_grid, &capture_50k, &exp_data.energies)
-        .expect("Interpolation failed");
+    // Apply Doppler broadening at 50K directly from auxiliary 0K grid
+    // onto data energies (SAMMY source-grid -> data-grid workflow).
+    let theory =
+        broaden_cross_sections_to_grid(&capture_0k, &aux_grid, &exp_data.energies, 10.0, 50.0)
+            .expect("Broadening failed");
 
     // Print diagnostics near the resonance
     if debug_log_enabled() {

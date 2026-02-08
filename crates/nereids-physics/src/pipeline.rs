@@ -17,7 +17,7 @@
 //! - Resolution convolution
 
 use crate::broadening::doppler::{
-    broaden_cross_sections, create_auxiliary_grid, interpolate_to_grid,
+    broaden_cross_sections, broaden_cross_sections_to_grid, create_auxiliary_grid,
 };
 use crate::rmatrix::cross_section::compute_0k_cross_sections_single_isotope;
 use crate::transmission::normalization::{
@@ -275,13 +275,14 @@ fn compute_isotope_total_xs(
             let isotope_cs_fine =
                 compute_0k_cross_sections_single_isotope(&aux_grid, isotope, config)?;
             let xs_0k_fine: Vec<f64> = isotope_cs_fine.iter().map(|cs| cs.total).collect();
-            let total_xs_fine = broaden_cross_sections(
+            let total_xs = broaden_cross_sections_to_grid(
                 &xs_0k_fine,
                 &aux_grid.values,
+                &energy.values,
                 isotope.awr,
                 config.temperature_k,
             )?;
-            return interpolate_to_grid(&aux_grid.values, &total_xs_fine, &energy.values);
+            return Ok(total_xs);
         }
     }
 
@@ -925,15 +926,14 @@ mod tests {
         let aux_grid = EnergyGrid::new(aux_values).unwrap();
         let xs_0k_fine = compute_0k_cross_sections(&aux_grid, &single_params, &config).unwrap();
         let total_0k_fine: Vec<f64> = xs_0k_fine.iter().map(|cs| cs.total).collect();
-        let total_50k_fine = broaden_cross_sections(
+        let total_50k_interp = broaden_cross_sections_to_grid(
             &total_0k_fine,
             &aux_grid.values,
+            &energy.values,
             isotope.awr,
             config.temperature_k,
         )
         .unwrap();
-        let total_50k_interp =
-            interpolate_to_grid(&aux_grid.values, &total_50k_fine, &energy.values).unwrap();
         let areal_density = isotope.number_density * isotope.thickness_cm;
         let expected: Vec<f64> = total_50k_interp
             .iter()

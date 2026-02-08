@@ -48,7 +48,7 @@ const MAX_AUX_GRID_POINTS: usize = 50_000;
 /// Maximum allowed adjacent spacing ratio before smoothing inserts points.
 const AUX_SPACING_RATIO_LIMIT: f64 = 2.5;
 /// Maximum smoothing passes for auxiliary-grid transition refinement.
-const AUX_SMOOTHING_PASSES: usize = 4;
+const AUX_SMOOTHING_PASSES: usize = 6;
 
 /// Minimum number of points across ±Γ used for under-resolved resonances.
 ///
@@ -66,6 +66,84 @@ const MIN_REFINEMENT_WIDTH_EV: f64 = 1.0e-12;
 /// Neutron mass in amu (SAMMY Kvendf=1 convention).
 const NEUTRON_MASS_AMU: f64 = 1.008_664_915_6;
 
+/// Build extra points between two grid locations using a SAMMY-style
+/// geometric-halving transition.
+fn geometric_transition_points(
+    start: f64,
+    diff: f64,
+    target_spacing: f64,
+    direction: f64,
+) -> Vec<f64> {
+    if !(diff > 0.0 && target_spacing > 0.0) {
+        return Vec::new();
+    }
+
+    let mut delta = diff;
+    let mut cumulative = Vec::new();
+
+    // Mirror mdat5 addedPointsUDGrad: repeatedly halve until comparable
+    // to the target spacing, then accumulate partial sums.
+    while cumulative.len() < 30 {
+        delta *= 0.5;
+        if delta < target_spacing {
+            break;
+        }
+        cumulative.push(delta);
+    }
+
+    for i in 1..cumulative.len() {
+        let prev = cumulative[i - 1];
+        cumulative[i] += prev;
+    }
+
+    if let Some(&last) = cumulative.last() {
+        if last > (diff - target_spacing) {
+            cumulative.pop();
+        }
+    }
+
+    cumulative
+        .into_iter()
+        .map(|x| start + direction * x)
+        .filter(|x| x.is_finite())
+        .collect()
+}
+
+/// Single refinement pass for abrupt spacing transitions.
+fn refine_auxiliary_spacing_transitions(grid: &[f64]) -> Vec<f64> {
+    if grid.len() < 3 {
+        return Vec::new();
+    }
+
+    let mut added = Vec::new();
+    for i in 1..(grid.len() - 1) {
+        let de_prev = grid[i] - grid[i - 1];
+        let de_next = grid[i + 1] - grid[i];
+        if de_prev <= 0.0 || de_next <= 0.0 {
+            continue;
+        }
+
+        if (de_prev / de_next) > AUX_SPACING_RATIO_LIMIT {
+            // Previous interval is much larger; insert points between [i-1, i].
+            added.extend(geometric_transition_points(
+                grid[i - 1],
+                de_prev,
+                de_next,
+                1.0,
+            ));
+        } else if (de_next / de_prev) > AUX_SPACING_RATIO_LIMIT {
+            // Next interval is much larger; insert points between [i, i+1].
+            added.extend(geometric_transition_points(
+                grid[i + 1],
+                de_next,
+                de_prev,
+                -1.0,
+            ));
+        }
+    }
+    added
+}
+
 /// Compute the Doppler width parameter Δ(E) for the free-gas model.
 ///
 /// # Formula
@@ -81,47 +159,62 @@ pub fn doppler_width(energy_ev: f64, temp_k: f64, awr: f64) -> f64 {
     (4.0 * BOLTZMANN_EV_PER_K * temp_k * energy_ev.abs() / awr).sqrt()
 }
 
-/// Apply free-gas Doppler broadening to cross sections.
+/// Apply free-gas Doppler broadening to cross sections on the same grid.
 ///
-/// Convolves σ(E; 0K) with a Gaussian kernel in `sqrt(E)` space using
-/// trapezoidal integration and a normalized kernel.
-///
-/// # Arguments
-///
-/// * `xs_0k` - 0K cross sections \[barns\], same length as `energies`
-/// * `energies` - Energy grid \[eV\], finite and sorted ascending
-/// * `awr` - Target mass in amu (SAMMY `DefTargetMass`)
-/// * `temperature_k` - Sample temperature in Kelvin; 0 means no broadening
-///
-/// # Returns
-///
-/// Broadened cross sections \[barns\], same length as input.
+/// This is a convenience wrapper around [`broaden_cross_sections_to_grid`]
+/// with identical source/target energy grids.
 pub fn broaden_cross_sections(
     xs_0k: &[f64],
     energies: &[f64],
     awr: f64,
     temperature_k: f64,
 ) -> Result<Vec<f64>, PhysicsError> {
-    let n = energies.len();
+    broaden_cross_sections_to_grid(xs_0k, energies, energies, awr, temperature_k)
+}
 
-    if n == 0 {
+/// Apply free-gas Doppler broadening from a source grid onto a target grid.
+///
+/// Convolves `xs_0k_source(E'; 0K)` over `source_energies` and evaluates the
+/// broadened result on `target_energies`. This matches SAMMY's workflow where
+/// auxiliary-grid values are integrated directly onto the data grid.
+pub fn broaden_cross_sections_to_grid(
+    xs_0k_source: &[f64],
+    source_energies: &[f64],
+    target_energies: &[f64],
+    awr: f64,
+    temperature_k: f64,
+) -> Result<Vec<f64>, PhysicsError> {
+    let n_src = source_energies.len();
+    let n_tgt = target_energies.len();
+
+    if n_src == 0 || n_tgt == 0 {
         return Err(PhysicsError::EmptyEnergyGrid);
     }
 
-    if xs_0k.len() != n {
+    if xs_0k_source.len() != n_src {
         return Err(PhysicsError::DimensionMismatch {
-            expected: n,
-            got: xs_0k.len(),
+            expected: n_src,
+            got: xs_0k_source.len(),
         });
     }
-    if energies.iter().any(|e| !e.is_finite()) {
+    if source_energies.iter().any(|e| !e.is_finite()) {
         return Err(PhysicsError::InvalidParameter(
-            "energies must be finite".to_string(),
+            "source energies must be finite".to_string(),
         ));
     }
-    if energies.windows(2).any(|w| w[1] < w[0]) {
+    if source_energies.windows(2).any(|w| w[1] < w[0]) {
         return Err(PhysicsError::InvalidParameter(
-            "energies must be sorted ascending".to_string(),
+            "source energies must be sorted ascending".to_string(),
+        ));
+    }
+    if target_energies.iter().any(|e| !e.is_finite()) {
+        return Err(PhysicsError::InvalidParameter(
+            "target energies must be finite".to_string(),
+        ));
+    }
+    if target_energies.windows(2).any(|w| w[1] < w[0]) {
+        return Err(PhysicsError::InvalidParameter(
+            "target energies must be sorted ascending".to_string(),
         ));
     }
 
@@ -139,38 +232,49 @@ pub fn broaden_cross_sections(
 
     // No broadening at T = 0
     if temperature_k == 0.0 {
-        return Ok(xs_0k.to_vec());
+        if source_energies == target_energies {
+            return Ok(xs_0k_source.to_vec());
+        }
+        return interpolate_to_grid(source_energies, xs_0k_source, target_energies);
     }
 
     let ddo = (BOLTZMANN_EV_PER_K * temperature_k * NEUTRON_MASS_AMU / awr).sqrt();
     if ddo < 1e-20 {
-        return Ok(xs_0k.to_vec());
+        if source_energies == target_energies {
+            return Ok(xs_0k_source.to_vec());
+        }
+        return interpolate_to_grid(source_energies, xs_0k_source, target_energies);
     }
     let inv_ddo_sq = 1.0 / (ddo * ddo);
-    let velocities: Vec<f64> = energies
+    let source_velocities: Vec<f64> = source_energies
         .iter()
         .map(|&e| if e < 0.0 { -(-e).sqrt() } else { e.sqrt() })
         .collect();
 
-    let mut broadened = vec![0.0; n];
+    let mut broadened = Vec::with_capacity(n_tgt);
     let mut total_segments: usize = 0;
 
-    for i in 0..n {
-        let v_i = velocities[i];
+    for &e_tgt in target_energies {
+        let v_i = if e_tgt < 0.0 {
+            -(-e_tgt).sqrt()
+        } else {
+            e_tgt.sqrt()
+        };
         let v_min = v_i - KERNEL_CUTOFF * ddo;
         let v_max = v_i + KERNEL_CUTOFF * ddo;
 
         // Binary search for grid points within the kernel window in sqrt(E) space
-        let j_start = velocities.partition_point(|&v| v < v_min);
-        let j_end = velocities.partition_point(|&v| v <= v_max);
+        let j_start = source_velocities.partition_point(|&v| v < v_min);
+        let j_end = source_velocities.partition_point(|&v| v <= v_max);
 
         // Include one extra point on each side for trapezoidal coverage
         let j_lo = j_start.saturating_sub(1);
-        let j_hi = j_end.min(n - 1);
+        let j_hi = j_end.min(n_src - 1);
 
         if (j_hi - j_lo + 1) <= 2 {
             // Not enough points for stable broadening (SAMMY requires >2 points)
-            broadened[i] = xs_0k[i];
+            let val = interpolate_to_grid(source_energies, xs_0k_source, &[e_tgt])?[0];
+            broadened.push(val);
             continue;
         }
         total_segments = total_segments.saturating_add(j_hi - j_lo);
@@ -187,38 +291,42 @@ pub fn broaden_cross_sections(
         // final expression (see mfgm2/mfgm4 path).
         let mut sum_weighted = 0.0;
         let mut sum_kernel = 0.0;
-        let e_i_abs = energies[i].abs();
+        let e_i_abs = e_tgt.abs();
 
         if e_i_abs <= f64::EPSILON {
-            broadened[i] = xs_0k[i];
+            let val = interpolate_to_grid(source_energies, xs_0k_source, &[e_tgt])?[0];
+            broadened.push(val);
             continue;
         }
 
         for j in (j_lo + 1)..=j_hi {
-            let h = velocities[j] - velocities[j - 1];
+            let h = source_velocities[j] - source_velocities[j - 1];
             if h <= 0.0 {
                 continue;
             }
 
-            let diff_prev = v_i - velocities[j - 1];
-            let diff_curr = v_i - velocities[j];
+            let diff_prev = v_i - source_velocities[j - 1];
+            let diff_curr = v_i - source_velocities[j];
 
             let g_prev = (-diff_prev * diff_prev * inv_ddo_sq).exp();
             let g_curr = (-diff_curr * diff_curr * inv_ddo_sq).exp();
 
-            let e_prev_abs = energies[j - 1].abs();
-            let e_curr_abs = energies[j].abs();
+            let e_prev_abs = source_energies[j - 1].abs();
+            let e_curr_abs = source_energies[j].abs();
 
-            sum_weighted +=
-                0.5 * h * (g_prev * e_prev_abs * xs_0k[j - 1] + g_curr * e_curr_abs * xs_0k[j]);
+            sum_weighted += 0.5
+                * h
+                * (g_prev * e_prev_abs * xs_0k_source[j - 1]
+                    + g_curr * e_curr_abs * xs_0k_source[j]);
             sum_kernel += 0.5 * h * (g_prev + g_curr);
         }
 
-        broadened[i] = if sum_kernel > 1e-100 {
+        let val = if sum_kernel > 1e-100 {
             (sum_weighted / sum_kernel) / e_i_abs
         } else {
-            xs_0k[i]
+            interpolate_to_grid(source_energies, xs_0k_source, &[e_tgt])?[0]
         };
+        broadened.push(val);
     }
 
     Ok(broadened)
@@ -467,27 +575,10 @@ pub fn create_auxiliary_grid(
     grid.sort_unstable_by(f64::total_cmp);
     grid.dedup_by(|a, b| (*a - *b).abs() < 1e-10);
 
-    // Smooth abrupt spacing jumps (SAMMY Adjust_Auxil style, simplified).
-    // This keeps interpolation weights stable near refined resonance regions.
+    // Smooth abrupt spacing jumps (SAMMY Adjust_Auxil-inspired geometric transition).
+    // This keeps interpolation/broadening weights stable near refined regions.
     for _ in 0..AUX_SMOOTHING_PASSES {
-        if grid.len() < 3 {
-            break;
-        }
-        let mut added = Vec::new();
-        for i in 1..(grid.len() - 1) {
-            let de_prev = grid[i] - grid[i - 1];
-            let de_next = grid[i + 1] - grid[i];
-            if de_prev <= 0.0 || de_next <= 0.0 {
-                continue;
-            }
-            if (de_prev / de_next) > AUX_SPACING_RATIO_LIMIT {
-                let mid = 0.5 * (grid[i - 1] + grid[i]);
-                added.push(mid);
-            } else if (de_next / de_prev) > AUX_SPACING_RATIO_LIMIT {
-                let mid = 0.5 * (grid[i] + grid[i + 1]);
-                added.push(mid);
-            }
-        }
+        let added = refine_auxiliary_spacing_transitions(&grid);
         if added.is_empty() {
             break;
         }
