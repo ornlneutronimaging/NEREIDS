@@ -96,25 +96,43 @@ impl ResolutionFunction for TabulatedResolution {
             ));
         }
 
+        let emin = energies[0];
+        let emax = energies[energies.len() - 1];
         let mut convolved = Vec::with_capacity(energies.len());
         for (i, &e_center) in energies.iter().enumerate() {
             let mut weighted = 0.0;
             let mut norm = 0.0;
 
             for j in 1..self.energy.len() {
-                let dx = self.energy[j] - self.energy[j - 1];
+                let o0 = self.energy[j - 1];
+                let o1 = self.energy[j];
+                let dx = o1 - o0;
                 if dx <= 0.0 {
                     continue;
                 }
 
-                let e0 = e_center + self.energy[j - 1];
-                let e1 = e_center + self.energy[j];
-                let s0 = interpolate_clamped(energies, spectrum, e0);
-                let s1 = interpolate_clamped(energies, spectrum, e1);
+                let e0 = e_center + o0;
+                let e1 = e_center + o1;
+                let clip_start = e0.max(emin);
+                let clip_end = e1.min(emax);
+                if clip_end <= clip_start {
+                    continue;
+                }
+
+                let oc0 = clip_start - e_center;
+                let oc1 = clip_end - e_center;
                 let w0 = self.kernel[j - 1];
                 let w1 = self.kernel[j];
-                weighted += 0.5 * dx * (w0 * s0 + w1 * s1);
-                norm += 0.5 * dx * (w0 + w1);
+                let t0 = (oc0 - o0) / dx;
+                let t1 = (oc1 - o0) / dx;
+                let k0 = w0 + t0 * (w1 - w0);
+                let k1 = w0 + t1 * (w1 - w0);
+                let s0 = interpolate_clamped(energies, spectrum, clip_start);
+                let s1 = interpolate_clamped(energies, spectrum, clip_end);
+                let dx_eff = oc1 - oc0;
+
+                weighted += 0.5 * dx_eff * (k0 * s0 + k1 * s1);
+                norm += 0.5 * dx_eff * (k0 + k1);
             }
 
             if norm > MIN_NORMALIZATION {
@@ -203,5 +221,19 @@ mod tests {
             res.convolve(&energy, &spectrum),
             Err(PhysicsError::InvalidParameter(_))
         ));
+    }
+
+    #[test]
+    fn test_tabulated_truncates_kernel_at_energy_edges() {
+        let energy = EnergyGrid::new(vec![0.0, 1.0, 2.0]).unwrap();
+        let spectrum = vec![0.0, 1.0, 2.0];
+        let res = TabulatedResolution {
+            energy: vec![-1.0, 0.0, 1.0],
+            kernel: vec![1.0, 1.0, 1.0],
+        };
+        let out = res.convolve(&energy, &spectrum).unwrap();
+        assert!((out[0] - 0.5).abs() < 1e-12);
+        assert!((out[1] - 1.0).abs() < 1e-12);
+        assert!((out[2] - 1.5).abs() < 1e-12);
     }
 }
