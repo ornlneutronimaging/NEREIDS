@@ -66,6 +66,10 @@ const MIN_REFINEMENT_WIDTH_EV: f64 = 1.0e-12;
 /// Neutron mass in amu (SAMMY Kvendf=1 convention).
 const NEUTRON_MASS_AMU: f64 = 1.008_664_915_6;
 
+fn aux_debug_enabled() -> bool {
+    std::env::var_os("NEREIDS_AUX_DEBUG").is_some()
+}
+
 /// SAMMY `Pointr`: index of largest `a[i] < b` in an ascending grid.
 fn pointr(a: &[f64], b: f64) -> isize {
     if a.is_empty() {
@@ -243,6 +247,115 @@ fn qmerge(base: &[f64], dense: &[f64], tol: f64) -> Vec<f64> {
     out
 }
 
+/// SAMMY `Fspken/Add_Pnts`-style local refinement around one resonance.
+///
+/// This complements `Fgpwid/Qmerge` by adding geometric transitions between
+/// resonance-local fine spacing and the neighboring coarse data spacing.
+fn add_fspken_transition_points(grid: &mut Vec<f64>, center: f64, width: f64) {
+    if grid.len() < 2 || !(center.is_finite() && width.is_finite() && width > 0.0) {
+        return;
+    }
+
+    let jres = pointr(grid, center);
+    if jres < 0 {
+        return;
+    }
+    let jres = jres as usize;
+    if jres + 1 >= grid.len() {
+        return;
+    }
+
+    let j_down = jres;
+    let j_up = jres + 1;
+
+    // SAMMY Fspken default: Fractn = 2 / (iptdop + 5), with iptdop=9.
+    let eg = 2.0 * width / ((MIN_POINTS_ACROSS_WIDTH + EXTRA_TAIL_POINTS) as f64);
+    if eg <= 0.0 {
+        return;
+    }
+
+    let qmid = center;
+    let qd = qmid - grid[j_down];
+    let qu = grid[j_up] - qmid;
+
+    let mut added = Vec::new();
+
+    // Down-side points.
+    if qd > 0.4 * eg {
+        added.push(qmid - 0.2 * eg);
+    }
+    if qd / width > 2.0 {
+        let kd = (width / eg).floor() as usize + 1;
+        let egd = width / (kd as f64);
+        for kk in 1..=kd {
+            added.push(qmid - egd * (kk as f64));
+        }
+        let q = qmid - width;
+        if q > grid[j_down] {
+            let diff = q - grid[j_down];
+            if diff / egd >= 4.0 {
+                added.extend(geometric_transition_points(grid[j_down], diff, egd, 1.0));
+            }
+            added.push(grid[j_down]);
+        }
+    } else {
+        if qd / eg > 1.2 {
+            let kd = (qd / eg).floor() as usize + 1;
+            let egd = qd / (kd as f64);
+            if kd > 1 {
+                for kk in 1..kd {
+                    added.push(qmid - egd * (kk as f64));
+                }
+            }
+        }
+        added.push(grid[j_down]);
+    }
+
+    // Up-side points.
+    if qu > 0.4 * eg {
+        added.push(qmid + 0.2 * eg);
+    }
+    if qu / width >= 2.0 {
+        let ku = (width / eg).floor() as usize + 1;
+        let egu = width / (ku as f64);
+        for kk in 1..=ku {
+            added.push(qmid + egu * (kk as f64));
+        }
+        let q = qmid + width;
+        if grid[j_up] > q {
+            let diff = grid[j_up] - q;
+            if diff / egu >= 4.0 {
+                added.extend(geometric_transition_points(grid[j_up], diff, egu, -1.0));
+            }
+            added.push(grid[j_up]);
+        }
+    } else {
+        if qu / eg > 1.2 {
+            let ku = (qu / eg).floor() as usize + 1;
+            let egu = qu / (ku as f64);
+            if ku > 1 {
+                for kk in 1..ku {
+                    added.push(qmid + egu * (kk as f64));
+                }
+            }
+        }
+        added.push(grid[j_up]);
+    }
+
+    let before = grid.len();
+    grid.extend(added.into_iter().filter(|e| e.is_finite()));
+    grid.sort_unstable_by(f64::total_cmp);
+    grid.dedup_by(|a, b| (*a - *b).abs() < 1e-10);
+    if aux_debug_enabled() {
+        eprintln!(
+            "[aux-grid] fspken transitions at E={:.6e}: added={} total={}",
+            center,
+            grid.len().saturating_sub(before),
+            grid.len()
+        );
+    }
+}
+
 /// Mirror SAMMY `DopplerAndResolutionBroadener::calcIntegralSpan` (oneExtra=true).
 fn calc_integral_span(
     energies: &[f64],
@@ -346,39 +459,151 @@ fn geometric_transition_points(
         .collect()
 }
 
-/// Single refinement pass for abrupt spacing transitions.
-fn refine_auxiliary_spacing_transitions(grid: &[f64]) -> Vec<f64> {
+/// Single SAMMY `RefineGrid`-style refinement pass for abrupt spacing transitions.
+fn refine_auxiliary_grid_transitions(grid: &[f64]) -> Vec<f64> {
     if grid.len() < 3 {
-        return Vec::new();
+        return grid.to_vec();
     }
 
-    let mut added = Vec::new();
+    let mut new_grid = Vec::with_capacity(grid.len() + 32);
+    new_grid.push(grid[0]);
+
     for i in 1..(grid.len() - 1) {
-        let de_prev = grid[i] - grid[i - 1];
-        let de_next = grid[i + 1] - grid[i];
-        if de_prev <= 0.0 || de_next <= 0.0 {
+        let de3e2 = grid[i + 1] - grid[i];
+        let de2e1 = grid[i] - new_grid[new_grid.len() - 1];
+        if de2e1 <= 0.0 || de3e2 <= 0.0 {
+            new_grid.push(grid[i]);
             continue;
         }
 
-        if (de_prev / de_next) > AUX_SPACING_RATIO_LIMIT {
-            // Previous interval is much larger; insert points between [i-1, i].
-            added.extend(geometric_transition_points(
-                grid[i - 1],
-                de_prev,
-                de_next,
-                1.0,
-            ));
-        } else if (de_next / de_prev) > AUX_SPACING_RATIO_LIMIT {
-            // Next interval is much larger; insert points between [i, i+1].
-            added.extend(geometric_transition_points(
-                grid[i + 1],
-                de_next,
-                de_prev,
-                -1.0,
-            ));
+        if (de2e1 / de3e2) > AUX_SPACING_RATIO_LIMIT {
+            // Previous interval is much larger than next; add points in [prev, curr].
+            let estart = new_grid[new_grid.len() - 1];
+            let mut diff = de2e1;
+            if new_grid.len() > 1 {
+                diff = estart - new_grid[new_grid.len() - 2];
+            }
+            let de2e1_new = de2e1 * 0.5;
+
+            // SAMMY special case: if this creates another abrupt jump, retroactively
+            // smooth the previous interval too.
+            if new_grid.len() > 1 && de2e1_new > 0.0 && (diff / de2e1_new) > AUX_SPACING_RATIO_LIMIT
+            {
+                let estart_prev = new_grid[new_grid.len() - 2];
+                let rethink = geometric_transition_points(estart_prev, diff, de2e1_new, 1.0);
+                if !rethink.is_empty() {
+                    let old_last = new_grid[new_grid.len() - 1];
+                    let last_idx = new_grid.len() - 1;
+                    new_grid[last_idx] = rethink[0];
+                    new_grid.extend(rethink.into_iter().skip(1));
+                    new_grid.push(old_last);
+                }
+            }
+
+            let added = geometric_transition_points(estart, de2e1, de3e2, 1.0);
+            new_grid.extend(added);
+            new_grid.push(grid[i]);
+        } else if (de3e2 / de2e1) > AUX_SPACING_RATIO_LIMIT {
+            // Next interval is much larger than previous; add points in [curr, next].
+            new_grid.push(grid[i]);
+            let added = geometric_transition_points(grid[i + 1], de3e2, de2e1, -1.0);
+            new_grid.extend(added.into_iter().rev());
+        } else {
+            new_grid.push(grid[i]);
         }
     }
-    added
+
+    new_grid.push(grid[grid.len() - 1]);
+    new_grid
+}
+
+/// SAMMY `Adjust_Auxil/calculateWeights` diagnostic weights.
+fn calculate_auxiliary_weights(grid: &[f64]) -> (Vec<f64>, f64, usize) {
+    let n = grid.len();
+    if n == 0 {
+        return (Vec::new(), 0.0, 0);
+    }
+    let mut weights = vec![0.0; n];
+    let mut sum_pos = 0.0;
+    let mut num_pos = 0usize;
+    let mut neg = 0usize;
+
+    for k in 0..n {
+        let mut x21_1 = 0.0;
+        let mut x21_2 = 0.0;
+        let mut x21_3 = 0.0;
+        let mut x21_4 = 0.0;
+        let mut x21_1_2 = 0.0;
+        let mut x21_2_2 = 0.0;
+        let mut x21_3_2 = 0.0;
+        let mut x21_4_2 = 0.0;
+        let mut x2_1 = 0.0;
+        let mut x2_2 = 0.0;
+        let mut r1 = 0.0;
+        let mut r2 = 0.0;
+
+        if k > 1 {
+            x21_1 = grid[k - 1] - grid[k - 2];
+            x21_1_2 = x21_1 * x21_1;
+        }
+        if k > 0 {
+            x21_2 = grid[k] - grid[k - 1];
+            x21_2_2 = x21_2 * x21_2;
+            if x21_2 != 0.0 {
+                r1 = 1.0 / x21_2;
+            }
+        }
+        if k + 1 < n {
+            x21_3 = grid[k + 1] - grid[k];
+            x21_3_2 = x21_3 * x21_3;
+            if x21_3 != 0.0 {
+                r2 = 1.0 / x21_3;
+            }
+        }
+        if k + 2 < n {
+            x21_4 = grid[k + 2] - grid[k + 1];
+            x21_4_2 = x21_4 * x21_4;
+        }
+
+        if k > 1 {
+            x2_1 = r1 * (x21_3_2 - x21_1_2);
+        }
+        if k + 1 >= n - 1 {
+            x2_1 = x21_1_2;
+        }
+
+        if k > 0 {
+            x2_2 = r2 * (x21_4_2 - x21_2_2);
+        }
+        if k >= n - 2 {
+            x2_2 = x21_2_2;
+        }
+
+        let mut w = x21_1 + 5.0 * x21_2 + 5.0 * x21_3 + x21_4 + x2_1 - x2_2;
+        if k == n.saturating_sub(2) {
+            w = x21_1 + 5.0 * x21_2 + 5.0 * x21_3 + x2_1;
+        }
+        if k == n.saturating_sub(1) {
+            w = x21_1 + 5.0 * x21_2;
+        }
+        weights[k] = w;
+
+        if (1..(n.saturating_sub(1))).contains(&k) {
+            if w > 0.0 {
+                sum_pos += w;
+                num_pos += 1;
+            } else {
+                neg += 1;
+            }
+        }
+    }
+
+    let average = if num_pos > 0 {
+        -sum_pos / (num_pos as f64)
+    } else {
+        0.0
+    };
+    (weights, average, neg)
 }
 
 /// Compute the Doppler width parameter Δ(E) for the free-gas model.
@@ -544,11 +769,15 @@ pub fn broaden_cross_sections_to_grid(
             continue;
         }
 
-        if let Some(sum) = fgm_weighted_sum(&source_velocities, xs_0k_source, j_lo, ipnts, v_i, ddo)
-        {
-            // Match SAMMY Xdofgm post-processing: divide weighted sum by |E|.
-            broadened.push(sum / e_i_abs);
-            continue;
+        let use_fgm_weights = std::env::var_os("NEREIDS_DISABLE_FGM_WEIGHTS").is_none();
+        if use_fgm_weights {
+            if let Some(sum) =
+                fgm_weighted_sum(&source_velocities, xs_0k_source, j_lo, ipnts, v_i, ddo)
+            {
+                // Match SAMMY Xdofgm post-processing: divide weighted sum by |E|.
+                broadened.push(sum / e_i_abs);
+                continue;
+            }
         }
 
         // Fallback: normalized Gaussian trapezoid if weight generation fails.
@@ -699,6 +928,13 @@ pub fn create_auxiliary_grid(
     // Use sorted unique view while building resonance-centered refinements.
     grid.sort_unstable_by(f64::total_cmp);
     grid.dedup_by(|a, b| (*a - *b).abs() < 1e-10);
+    if aux_debug_enabled() {
+        eprintln!(
+            "[aux-grid] start: data={} unique_sorted={}",
+            data_energies.len(),
+            grid.len()
+        );
+    }
 
     for (&e_res, &gamma) in resonance_energies.iter().zip(resonance_widths.iter()) {
         if !e_res.is_finite() || !gamma.is_finite() {
@@ -734,10 +970,38 @@ pub fn create_auxiliary_grid(
         };
 
         if needs_refine {
-            let dense = fgpwid_points(e_res, width);
-            let eg = 2.0 * width / ((MIN_POINTS_ACROSS_WIDTH - 1) as f64);
-            let merged = qmerge(&grid, &dense, eg * 0.2);
-            grid = merged;
+            let use_fspken = data_energies.len() >= (MIN_POINTS_ACROSS_WIDTH + 2);
+            let mut fspken_added = 0usize;
+            if use_fspken {
+                let before_fspken = grid.len();
+                add_fspken_transition_points(&mut grid, e_res, width);
+                fspken_added = grid.len().saturating_sub(before_fspken);
+            }
+            let mut qmerge_added = 0usize;
+            if fspken_added == 0 {
+                let dense = fgpwid_points(e_res, width);
+                let eg = 2.0 * width / ((MIN_POINTS_ACROSS_WIDTH - 1) as f64);
+                let merged = qmerge(&grid, &dense, eg * 0.2);
+                qmerge_added = merged.len().saturating_sub(grid.len());
+                grid = merged;
+            }
+            if aux_debug_enabled() {
+                eprintln!(
+                    "[aux-grid] resonance E={:.6e} Gamma={:.6e}: qmerge_added={} fspken_added={} total={}",
+                    e_res,
+                    width,
+                    qmerge_added,
+                    fspken_added,
+                    grid.len()
+                );
+            }
+        } else if aux_debug_enabled() {
+            eprintln!(
+                "[aux-grid] resonance E={:.6e} Gamma={:.6e}: refine=no total={}",
+                e_res,
+                width,
+                grid.len()
+            );
         }
 
         if grid.len() > MAX_AUX_GRID_POINTS {
@@ -754,6 +1018,7 @@ pub fn create_auxiliary_grid(
     // step from the first/last five data points and populate extra points
     // between [Emind, E_min) and (E_max, Emaxd].
     if temperature_k > 0.0 {
+        let before_temp = grid.len();
         let mut sorted_data = data_energies.to_vec();
         sorted_data.sort_unstable_by(f64::total_cmp);
 
@@ -813,6 +1078,13 @@ pub fn create_auxiliary_grid(
                 MAX_AUX_GRID_POINTS
             )));
         }
+        if aux_debug_enabled() {
+            eprintln!(
+                "[aux-grid] edge extension: added={} total={}",
+                grid.len().saturating_sub(before_temp),
+                grid.len()
+            );
+        }
     }
 
     // Sort and deduplicate (within tolerance)
@@ -823,23 +1095,52 @@ pub fn create_auxiliary_grid(
     }
     grid.sort_unstable_by(f64::total_cmp);
     grid.dedup_by(|a, b| (*a - *b).abs() < 1e-10);
+    if aux_debug_enabled() {
+        eprintln!("[aux-grid] pre-smoothing sorted+dedup total={}", grid.len());
+    }
 
-    // Smooth abrupt spacing jumps (SAMMY Adjust_Auxil-inspired geometric transition).
-    // This keeps interpolation/broadening weights stable near refined regions.
-    for _ in 0..AUX_SMOOTHING_PASSES {
-        let added = refine_auxiliary_spacing_transitions(&grid);
-        if added.is_empty() {
+    // Smooth abrupt spacing jumps using SAMMY `RefineGrid`-style transitions.
+    for pass in 0..AUX_SMOOTHING_PASSES {
+        let previous_len = grid.len();
+        let mut refined = refine_auxiliary_grid_transitions(&grid);
+        refined.sort_unstable_by(f64::total_cmp);
+        refined.dedup_by(|a, b| (*a - *b).abs() < 1e-10);
+        let added_count = refined.len().saturating_sub(previous_len);
+        grid = refined;
+        if added_count == 0 {
+            if aux_debug_enabled() {
+                eprintln!("[aux-grid] smoothing pass {}: no additions", pass + 1);
+            }
             break;
         }
-        grid.extend(added);
         if grid.len() > MAX_AUX_GRID_POINTS {
             return Err(PhysicsError::InvalidParameter(format!(
                 "auxiliary grid exceeds {} points; reduce resonance density/width inputs",
                 MAX_AUX_GRID_POINTS
             )));
         }
-        grid.sort_unstable_by(f64::total_cmp);
-        grid.dedup_by(|a, b| (*a - *b).abs() < 1e-10);
+        if aux_debug_enabled() {
+            eprintln!(
+                "[aux-grid] smoothing pass {}: added={} total={}",
+                pass + 1,
+                added_count,
+                grid.len()
+            );
+        }
+    }
+    if aux_debug_enabled() {
+        let (weights, avg, neg) = calculate_auxiliary_weights(&grid);
+        let flagged = weights
+            .iter()
+            .skip(1)
+            .take(grid.len().saturating_sub(2))
+            .filter(|&&w| w <= avg)
+            .count();
+        eprintln!("[aux-grid] final total={}", grid.len());
+        eprintln!(
+            "[aux-grid] weights: negative={} flagged(<=avg={:.6e})={}",
+            neg, avg, flagged
+        );
     }
 
     Ok(grid)
@@ -848,6 +1149,70 @@ pub fn create_auxiliary_grid(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn linspace(start: f64, end: f64, n: usize) -> Vec<f64> {
+        if n <= 1 {
+            return vec![start];
+        }
+        let h = (end - start) / ((n - 1) as f64);
+        (0..n).map(|i| start + (i as f64) * h).collect()
+    }
+
+    fn bruteforce_velocity_convolution(
+        target_e: f64,
+        awr: f64,
+        temperature_k: f64,
+        e_min: f64,
+        e_max: f64,
+        sigma0: impl Fn(f64) -> f64,
+    ) -> f64 {
+        let vi = target_e.sqrt();
+        let ddo = (BOLTZMANN_EV_PER_K * temperature_k * NEUTRON_MASS_AMU / awr).sqrt();
+        let vmin = e_min.sqrt().max(vi - KERNEL_CUTOFF * ddo);
+        let vmax = e_max.sqrt().min(vi + KERNEL_CUTOFF * ddo);
+        let n = 20_000usize;
+        let h = (vmax - vmin) / (n as f64);
+
+        let mut sum_w = 0.0;
+        let mut sum_k = 0.0;
+        for i in 0..=n {
+            let v = vmin + (i as f64) * h;
+            let e = v * v;
+            let g = (-((vi - v) / ddo).powi(2)).exp();
+            let weight = if i == 0 || i == n { 0.5 } else { 1.0 };
+            sum_w += weight * g * e * sigma0(e);
+            sum_k += weight * g;
+        }
+        let sum_w = sum_w * h;
+        let sum_k = sum_k * h;
+        (sum_w / sum_k) / target_e
+    }
+
+    fn naive_energy_gaussian_broadening(
+        xs_0k: &[f64],
+        energies: &[f64],
+        target_energies: &[f64],
+        awr: f64,
+        temperature_k: f64,
+    ) -> Vec<f64> {
+        let mut out = Vec::with_capacity(target_energies.len());
+        for &e_tgt in target_energies {
+            let delta = doppler_width(e_tgt, temperature_k, awr).max(1e-16);
+            let mut num = 0.0;
+            let mut den = 0.0;
+            for j in 1..energies.len() {
+                let e0 = energies[j - 1];
+                let e1 = energies[j];
+                let h = e1 - e0;
+                let g0 = (-((e_tgt - e0) / delta).powi(2)).exp();
+                let g1 = (-((e_tgt - e1) / delta).powi(2)).exp();
+                num += 0.5 * h * (g0 * xs_0k[j - 1] + g1 * xs_0k[j]);
+                den += 0.5 * h * (g0 + g1);
+            }
+            out.push(if den > 0.0 { num / den } else { xs_0k[0] });
+        }
+        out
+    }
 
     #[test]
     fn test_doppler_width_values() {
@@ -974,6 +1339,78 @@ mod tests {
         assert!(
             rel_error < 0.01,
             "area not preserved: before={area_before:.4}, after={area_after:.4}, rel_err={rel_error:.6}"
+        );
+    }
+
+    #[test]
+    fn test_broaden_matches_bruteforce_velocity_convolution() {
+        let awr = 10.0;
+        let temperature_k = 300.0;
+        let energies = linspace(1.0, 25.0, 6001);
+        let sigma0 = |e: f64| 5.0 + 0.8 * (0.7 * e.sqrt()).sin() + 0.3 * (0.2 * e).cos() + 0.02 * e;
+        let xs_0k: Vec<f64> = energies.iter().map(|&e| sigma0(e)).collect();
+        let targets = vec![2.0, 5.0, 10.0, 20.0];
+
+        let model = broaden_cross_sections_to_grid(&xs_0k, &energies, &targets, awr, temperature_k)
+            .unwrap();
+        let reference: Vec<f64> = targets
+            .iter()
+            .map(|&e| bruteforce_velocity_convolution(e, awr, temperature_k, 1.0, 25.0, sigma0))
+            .collect();
+
+        for (m, r) in model.iter().zip(reference.iter()) {
+            let rel = (m - r).abs() / r.abs().max(1e-12);
+            assert!(rel < 6e-3, "model={m}, reference={r}, rel={rel}");
+        }
+    }
+
+    #[test]
+    fn test_broaden_preserves_one_over_e_law() {
+        let awr = 10.0;
+        let temperature_k = 300.0;
+        let source = linspace(0.5, 30.0, 4001);
+        let xs_0k: Vec<f64> = source.iter().map(|&e| 1.0 / e).collect();
+        let target = linspace(1.0, 25.0, 80);
+        let broad =
+            broaden_cross_sections_to_grid(&xs_0k, &source, &target, awr, temperature_k).unwrap();
+
+        for (&e, &b) in target.iter().zip(broad.iter()) {
+            let expected = 1.0 / e;
+            let rel = (b - expected).abs() / expected;
+            assert!(rel < 7e-3, "E={e}, got={b}, expected={expected}, rel={rel}");
+        }
+    }
+
+    #[test]
+    fn test_naive_energy_gaussian_breaks_one_over_e_law() {
+        let awr = 10.0;
+        let temperature_k = 300.0;
+        let source = linspace(0.5, 30.0, 4001);
+        let xs_0k: Vec<f64> = source.iter().map(|&e| 1.0 / e).collect();
+        let target = linspace(1.0, 25.0, 80);
+
+        let fgm =
+            broaden_cross_sections_to_grid(&xs_0k, &source, &target, awr, temperature_k).unwrap();
+        let naive = naive_energy_gaussian_broadening(&xs_0k, &source, &target, awr, temperature_k);
+
+        let max_rel_between_methods = fgm
+            .iter()
+            .zip(naive.iter())
+            .map(|(a, b)| (a - b).abs() / a.abs().max(1e-12))
+            .fold(0.0, f64::max);
+        let max_rel_naive_vs_expected = target
+            .iter()
+            .zip(naive.iter())
+            .map(|(&e, &n)| (n - 1.0 / e).abs() / (1.0 / e))
+            .fold(0.0, f64::max);
+
+        assert!(
+            max_rel_between_methods > 3e-3,
+            "naive and velocity-space methods unexpectedly close: max_rel_between_methods={max_rel_between_methods}"
+        );
+        assert!(
+            max_rel_naive_vs_expected > 3e-3,
+            "naive method unexpectedly preserved 1/E law: max_rel_naive_vs_expected={max_rel_naive_vs_expected}"
         );
     }
 
