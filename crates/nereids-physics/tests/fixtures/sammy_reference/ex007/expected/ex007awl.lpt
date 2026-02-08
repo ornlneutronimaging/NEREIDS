@@ -1,0 +1,804 @@
+
+ **********************************************************
+ ***                                                    ***
+ ***                 SAMMY Version 8.0.0                ***
+ ***                                                    ***
+ **********************************************************
+
+ Name of input file: 
+ >>> ex007.inp                                                              <<<
+ Name of parameter file: 
+ >>> ex007wl.par                                                            <<<
+ Values used for constants -- Kvendf=1
+   mass of neutron =   1.008664915600000 in amu
+   sqrt(m/2)       =  72.298252179105063
+   sqrt(2m)/hbar   =   0.000219680775849
+   Boltzman        =   0.000086173430000
+   finestructure   =   0.034447599938334 in 1/(amu*F)
+ GENERATE PLOT FILE A                                                          
+ Name of experimental data file is: 
+ >>> ex007.dat                                                              <<<
+ Emin and Emax =    180000.       183000.    
+
+
+ *****************************************************************************
+ *****                                                                   *****
+ ***** example ex007:  TESTING ORR (OAK RIDGE RESOLUTION FUNCTION)       *****
+ *****                                                                   *****
+ *****************************************************************************
+
+
+ Input quantities from line number 2 are:
+   Alfnm1, Alfnm2 = ##      58NI##       Atomic Weight =  57.935000
+   Nepnts Itmax  Icorr  Nxtra  Iptdop Iptwid Ixxchn
+      140      0      0      1      0      0      0
+   Ndigit Idropp Matnum Kkkkza
+        2      2      0      0
+Adjusted  Itmax  Icorr  Nxtra  Iptdop Iptwid Ixxchn
+      140      0     50      1      9      5      0
+   Ndigit Idropp Matnum Kkkkza
+        2      2      0      0
+
+
+ TARGET ELEMENT IS       58NI
+ ATOMIC WEIGHT IS  57.935000
+
+
+ *********** Alphanumeric Control Information *********
+
+ PRINT VARIED INPUT PARAMETERS           
+ DO NOT SUPPRESS ANY INTERMEDIATE RESULTS
+ PRINT THEORETICAL VALUES                
+ DO NOT PRINT PARTIAL DERIVATIVES        
+ ENERGY UNCERTAINTIES ARE AT THE END OF L
+ PRINT BAYES CHI SQUARED                 
+ ODF FILE IS WANTED--SAMMY.ODF ,ZERO-TH O
+ SOLVE BAYES EQUATIONS                   
+ CHI SQUARED IS WANTED                   
+                                         
+ **** end of Alphanumeric Control Information *********
+
+
+ ### Estimated array size for SAMMY-INP is       1032 ###
+
+ Effective Temperature= 300.00000
+    Flight Path= 201.57800 Meters +/-   0.02900/2 Meters
+      Deltae=     0.00000    Deltag=     0.00500
+      Delttt=     0.00000    Elowbr=  0.00000000
+
+ Target Thickness=  0.1724    
+
+ **** Data type is <<< TRANSMISSION         >>> ****
+
+ Spin of incident particle is  0.5
+
+ TARGET SPIN=  0.0
+ __________________________
+       #of  #of
+ Group Ent  Exit Jspin Relative  Ispin  g    Chn Lpnt Ishift eL Chspn
+    #  Chn  Chn         Abndnc                 #
+    1    1    0    0.5  1.0000    0.0 1.0000
+                                               1   1   0     0   0.5    
+    2    1    0   -0.5  1.0000    0.0 1.0000
+                                               1   1   0     1   0.5    
+    3    1    0   -1.5  1.0000    0.0 2.0000
+                                               1   1   0     1   0.5    
+    4    1    0    1.5  1.0000    0.0 2.0000
+                                               1   1   0     2   0.5    
+    5    1    0    2.5  1.0000    0.0 3.0000
+                                               1   1   0     2   0.5    
+    6    1    0   -2.5  1.0000    0.0 3.0000
+                                               1   1   0     3   0.5    
+__________________________
+ 
+ ### Array size used for SAMMY-INP is       1037 ###
+ ### Estimated array size for SAMMY-PAR is       1159 ###
+ Number of ORELA-Resolution parameters is   12
+                 and the number varied is    6
+ RELATIVE UNCERTAINTIES INCLUDED IN PARAMETER FILE
+
+ Total  number of resonances is   14
+ Number of particle channels is    1
+ Number of spin groups is          6
+ Number of flagged parametrs is   29
+ Number of varied parameters is   29
+ ### Array size used for SAMMY-PAR is       1140 ###
+ ### Estimated array size for SAMMY-NEW is       1940 ###
+
+
+
+
+ ***** INITIAL VALUES FOR PARAMETERS                     
+
+ SPIN GROUP NUMBER  1  WITH SPIN=  0.5, ABUNDANCE=  1.0000, AND G= 1.0000
+                effective radius =  6.3606E+00( 20)
+                   "true" radius =  6.3606E+00( 20)
+      ENERGY          GAMMA-          GAMMA-
+                      GAMMA          Inc Chan
+                                    L=0  SPIN= 0.5
+       (eV)        (MILLI-EV)       (MILLI-EV)
+ -5.99510E+04(  1) 4.0000E+03       2.2705E+07(  2)
+ -4.40000E+03      8.0000E+03       7.6538E+05(  3)
+  8.20570E+05(  4) 2.0000E+03       9.3727E+06(  5)
+  8.68000E+05      2.0000E+03       6.6888E+06(  6)
+  1.00000E+06      2.0000E+03       3.2125E+08(  7)
+
+ SPIN GROUP NUMBER  2  WITH SPIN= -0.5, ABUNDANCE=  1.0000, AND G= 1.0000
+                effective radius =  4.0376E+00( 21)
+                   "true" radius =  4.0376E+00( 21)
+      ENERGY          GAMMA-          GAMMA-
+                      GAMMA          Inc Chan
+                                    L=1  SPIN= 0.5
+       (eV)        (MILLI-EV)       (MILLI-EV)
+  1.81301E+05(  8) 7.1000E+02       3.0369E+04(  9)
+
+ SPIN GROUP NUMBER  3  WITH SPIN= -1.5, ABUNDANCE=  1.0000, AND G= 2.0000
+                effective radius =  4.0376E+00( 21)
+                   "true" radius =  4.0376E+00( 21)
+      ENERGY          GAMMA-          GAMMA-
+                      GAMMA          Inc Chan
+                                    L=1  SPIN= 0.5
+       (eV)        (MILLI-EV)       (MILLI-EV)
+  1.75230E+05( 10) 7.5000E+02       4.8649E+04( 11)
+  1.84611E+05( 12) 8.1000E+02       1.0211E+05( 13)
+  1.86000E+05( 14) 6.1000E+02       2.5134E+04( 15)
+
+ SPIN GROUP NUMBER  4  WITH SPIN=  1.5, ABUNDANCE=  1.0000, AND G= 2.0000
+                effective radius =  6.3606E+00( 20)
+                   "true" radius =  6.3606E+00( 20)
+      ENERGY          GAMMA-          GAMMA-
+                      GAMMA          Inc Chan
+                                    L=2  SPIN= 0.5
+       (eV)        (MILLI-EV)       (MILLI-EV)
+  1.80656E+05( 16) 6.4000E+02       2.9348E+04( 17)
+  1.83940E+05      1.0600E+03       5.3410E+03( 18)
+
+ SPIN GROUP NUMBER  5  WITH SPIN=  2.5, ABUNDANCE=  1.0000, AND G= 3.0000
+                effective radius =  6.3606E+00( 20)
+                   "true" radius =  6.3606E+00( 20)
+      ENERGY          GAMMA-          GAMMA-
+                      GAMMA          Inc Chan
+                                    L=2  SPIN= 0.5
+       (eV)        (MILLI-EV)       (MILLI-EV)
+  1.72530E+05      1.1000E+03       5.5672E+03( 19)
+
+
+ EFFECTIVE RADIUS    "TRUE" RADIUS  SPIN GROUP NUMBERS FOR THESE RADII
+    6.3605600( 20)   6.3605600( 20)  1  4  5  6
+    4.0375500( 21)   4.0375500( 21)  2  3
+
+
+  TEMPERATURE      THICKNESS
+  3.0000E+02       1.7240E-01     
+
+    DELTA-L         DELTA-T-GAUS     DELTA-T-EXP
+  2.9000E-02       5.0000E-03       0.0000E+00     
+
+
+ ORELA Resolution PARAMETERS ARE --
+ Burst width                   p (nanosec) =   1.775    ( 22)
+ Mean free path (mm) for water moderator   =  0.2000    ( 23)
+                                   + ln(E) *   0.000         
+                              + (ln(E))**2 *   0.000         
+         with 2(m+1) degrees of freedom; m =  4
+ Lithium glass detector params:   d (nsec) =   5.000    ( 24)
+                                f (1/nsec) =  0.3922    ( 25)
+                         g (dimensionless) =   1.009    ( 26)
+ Channel width parameters (widths in nsec):
+     min Energy     max Energy     Chan Width
+         0.0          infinity     7.179    ( 27)
+
+
+   NORMALIZATION      BCKG(CONST)  BCKG/SQRT(E)    BCKG*SQRT(E)
+  1.0033E+00( 28)  7.2390E-02( 29)  0.0000E+00       0.0000E+00     
+
+    BCKG*EXP(.)      .*EXP(BCKG/SQRT(E))
+  0.0000E+00       0.0000E+00     
+
+
+
+ ***** CORRELATION MATRIX FOR INPUT PARAMETERS           
+
+ ***** STANDARD DEVIATION (SQRT OF DIAGONAL OF COV MATRX)
+
+        STD. DEV.           STD. DEV.           STD. DEV.           STD. DEV. 
+ (  1)   2000.       (  9)   4555.       ( 17)   4402.       ( 25)  0.2000    
+ (  2)  1.1352E+06   ( 10)   10.00       ( 18)   1068.       ( 26)  0.5000    
+ (  3)  7.6538E+04   ( 11)   7297.       ( 19)   1113.       ( 27)  0.7000    
+ (  4)   1000.       ( 12)   10.00       ( 20)  6.0000E-02   ( 28)  5.0000E-03
+ (  5)  1.8745E+06   ( 13)  1.5316E+04   ( 21)  6.0000E-02   ( 29)  2.0000E-02
+ (  6)  2.6755E+06   ( 14)   10.00       ( 22)  0.5000    
+ (  7)  2.2488E+07   ( 15)   5027.       ( 23)  0.1000    
+ (  8)   10.00       ( 16)   10.00       ( 24)   2.000    
+ 
+ ### Array size used for SAMMY-NEW is       1990 ###
+
+ At energy  1.8000E+05 total resolution time is  8.8425E-03
+ Resolution time associated with burst width is  8.8750E-04
+ Resolution time assoc. with water moderator is  1.7041E-04
+ Resolutn time associated with channel width is  3.5895E-03
+ Resolution time for  Lithium-glass detector is  4.1951E-03
+ Eup, Em, Elow =   1.8060E+05  1.8000E+05  1.7991E+05
+
+ At energy  1.8300E+05 total resolution time is  8.8411E-03
+ Resolution time associated with burst width is  8.8750E-04
+ Resolution time assoc. with water moderator is  1.6901E-04
+ Resolutn time associated with channel width is  3.5895E-03
+ Resolution time for  Lithium-glass detector is  4.1951E-03
+ Eup, Em, Elow =   1.8362E+05  1.8300E+05  1.8291E+05
+     Emind               Emins               Eminr               Emin
+   179817.2999184688   179907.3645866732   179907.3645866732   180000.0000000000
+     Emax                Emaxr               Emaxs               Emaxd
+   183000.0000000000   183615.1660724178   183615.1660724178   183706.1767666210
+
+ Doppler Width at Emin =   18.0018     and at Emax =   18.1512     eV
+  
+      E(keV)    Dopp_FWHM(keV)
+    180.000009        29.9750
+    181.500009        30.0996
+    183.000009        30.2238
+  
+ ### Estimated array size for SAMMY-DAT is   32499707 +    32500000 ###
+
+ Energy range of data is from 1.80000E+05 to 1.83000E+05 eV.
+ Number of experimental data points =      56
+
+ Number of points in auxiliary grid =     129
+ ### Array size used for SAMMY-DAT is   32499704 +    32500000 ###
+ ### Estimated array size for SAMMY-THE is       1420 ###
+ Number of parameters affected by this data set=   23
+ ### Array size used for SAMMY-THE is       1419 ###
+ ### Estimated array size for SAMMY-XCT is       8064 ###
+ ### Array size used for SAMMY-XCT is       7515 ###
+ ### Estimated array size for SAMMY-FGM is       7772 ###
+ ### Array size used for SAMMY-FGM is       7772 ###
+ ### Estimated array size for SAMMY-ORR is       7916 ###
+
+ At energy  1.8003E+05 total resolution time is  8.8425E-03
+ Resolution time associated with burst width is  8.8750E-04
+ Resolution time assoc. with water moderator is  1.7039E-04
+ Resolutn time associated with channel width is  3.5895E-03
+ Resolution time for  Lithium-glass detector is  4.1951E-03
+ Eup, Em, Elow =   1.8063E+05  1.8003E+05  1.7994E+05
+ ### Array size used for SAMMY-ORR is       8002 ###
+ ### Estimated array size for SAMMY-INT is       7702 ###
+
+
+ ***** THEORETICAL VALUES (broadnd,normed,...as required)
+
+      ENERGY    THEORY          ENERGY    THEORY          ENERGY    THEORY    
+ (  1)180034.2 0.522393    ( 20)180699.1 0.273421    ( 39)181312.1 0.284360    
+ (  2)180133.3 0.521966    ( 21)180709.6 0.309694    ( 40)181322.7 0.293898    
+ (  3)180241.2 0.520973    ( 22)180720.2 0.346977    ( 41)181333.3 0.312787    
+ (  4)180348.2 0.518485    ( 23)180730.7 0.381970    ( 42)181343.9 0.338703    
+ (  5)180451.6 0.509774    ( 24)180751.2 0.436665    ( 43)181354.5 0.368411    
+ (  6)180520.1 0.484822    ( 25)180783.5 0.482874    ( 44)181365.1 0.398567    
+ (  7)180551.9 0.452062    ( 26)180815.1 0.500049    ( 45)181375.7 0.426235    
+ (  8)180572.6 0.414840    ( 27)180885.2 0.513258    ( 46)181408.2 0.482027    
+ (  9)180583.1 0.391181    ( 28)180985.9 0.518212    ( 47)181460.6 0.507696    
+ ( 10)180593.7 0.362022    ( 29)181097.8 0.516381    ( 48)181513.5 0.514851    
+ ( 11)180604.2 0.329036    ( 30)181163.9 0.503812    ( 49)181566.7 0.518062    
+ ( 12)180614.8 0.296181    ( 31)181195.8 0.483608    ( 50)181619.3 0.519821    
+ ( 13)180625.3 0.264423    ( 32)181227.3 0.441665    ( 51)181758.9 0.522097    
+ ( 14)180635.8 0.236331    ( 33)181248.5 0.394324    ( 52)181962.0 0.523499    
+ ( 15)180646.3 0.215718    ( 34)181259.1 0.367541    ( 53)182176.1 0.524207    
+ ( 16)180656.9 0.205146    ( 35)181269.7 0.340493    ( 54)182388.1 0.524635    
+ ( 17)180667.4 0.206036    ( 36)181280.3 0.315755    ( 55)182611.5 0.524922    
+ ( 18)180678.0 0.218625    ( 37)181290.9 0.296409    ( 56)182820.1 0.525059    
+ ( 19)180688.5 0.241863    ( 38)181301.5 0.285340    
+ ### Array size used for SAMMY-INT is       7703 ###
+ ### Estimated array size for SAMMY-SQU is       8413 ###
+ ### Array size used for SAMMY-SQU is       8413 ###
+ ### Estimated array size for SAMMY-IPQ is       7514 ###
+
+ CUSTOMARY CHI SQUARED =   334.948    
+ CUSTOMARY CHI SQUARED DIVIDED BY NDAT =   5.98122    
+
+ BAYESIAN CHI SQUARED =   303.261    
+ BAYESIAN CHI SQUARED DIVIDED BY NDAT =   5.41537    
+ ### Array size used for SAMMY-IPQ is       7168 ###
+ ### Estimated array size for SAMMY-FIN is       5081 ###
+
+
+
+
+ ***** INTERMEDIATE VALUES FOR RESONANCE PARAMETERS      
+
+ SPIN GROUP NUMBER  1  WITH SPIN=  0.5, ABUNDANCE=  1.0000, AND G= 1.0000
+                effective radius =  6.3758E+00( 20)
+                   "true" radius =  6.3758E+00( 20)
+      ENERGY          GAMMA-          GAMMA-
+                      GAMMA          Inc Chan
+                                    L=0  SPIN= 0.5
+       (eV)        (MILLI-EV)       (MILLI-EV)
+ -5.98357E+04(  1) 4.0000E+03       2.2999E+07(  2)
+ -4.40000E+03      8.0000E+03       7.7380E+05(  3)
+  8.20570E+05(  4) 2.0000E+03       9.3745E+06(  5)
+  8.68000E+05      2.0000E+03       6.6650E+06(  6)
+  1.00000E+06      2.0000E+03       3.1960E+08(  7)
+
+ SPIN GROUP NUMBER  2  WITH SPIN= -0.5, ABUNDANCE=  1.0000, AND G= 1.0000
+                effective radius =  4.0273E+00( 21)
+                   "true" radius =  4.0273E+00( 21)
+      ENERGY          GAMMA-          GAMMA-
+                      GAMMA          Inc Chan
+                                    L=1  SPIN= 0.5
+       (eV)        (MILLI-EV)       (MILLI-EV)
+  1.81293E+05(  8) 7.1000E+02       3.2105E+04(  9)
+
+ SPIN GROUP NUMBER  3  WITH SPIN= -1.5, ABUNDANCE=  1.0000, AND G= 2.0000
+                effective radius =  4.0273E+00( 21)
+                   "true" radius =  4.0273E+00( 21)
+      ENERGY          GAMMA-          GAMMA-
+                      GAMMA          Inc Chan
+                                    L=1  SPIN= 0.5
+       (eV)        (MILLI-EV)       (MILLI-EV)
+  1.75230E+05( 10) 7.5000E+02       4.8309E+04( 11)
+  1.84611E+05( 12) 8.1000E+02       9.6837E+04( 13)
+  1.86000E+05( 14) 6.1000E+02       2.4959E+04( 15)
+
+ SPIN GROUP NUMBER  4  WITH SPIN=  1.5, ABUNDANCE=  1.0000, AND G= 2.0000
+                effective radius =  6.3758E+00( 20)
+                   "true" radius =  6.3758E+00( 20)
+      ENERGY          GAMMA-          GAMMA-
+                      GAMMA          Inc Chan
+                                    L=2  SPIN= 0.5
+       (eV)        (MILLI-EV)       (MILLI-EV)
+  1.80650E+05( 16) 6.4000E+02       3.1670E+04( 17)
+  1.83940E+05      1.0600E+03       5.4022E+03( 18)
+
+ SPIN GROUP NUMBER  5  WITH SPIN=  2.5, ABUNDANCE=  1.0000, AND G= 3.0000
+                effective radius =  6.3758E+00( 20)
+                   "true" radius =  6.3758E+00( 20)
+      ENERGY          GAMMA-          GAMMA-
+                      GAMMA          Inc Chan
+                                    L=2  SPIN= 0.5
+       (eV)        (MILLI-EV)       (MILLI-EV)
+  1.72530E+05      1.1000E+03       5.6312E+03( 19)
+
+
+ EFFECTIVE RADIUS    "TRUE" RADIUS  SPIN GROUP NUMBERS FOR THESE RADII
+    6.3758424( 20)   6.3758424( 20)  1  4  5  6
+    4.0273200( 21)   4.0273200( 21)  2  3
+
+
+  TEMPERATURE      THICKNESS
+  3.0000E+02       1.7240E-01     
+
+    DELTA-L         DELTA-T-GAUS     DELTA-T-EXP
+  2.9000E-02       5.0000E-03       0.0000E+00     
+
+
+ ORELA Resolution PARAMETERS ARE --
+ Burst width                   p (nanosec) =   1.769    ( 22)
+ Mean free path (mm) for water moderator   =  0.1999    ( 23)
+                                   + ln(E) *   0.000         
+                              + (ln(E))**2 *   0.000         
+         with 2(m+1) degrees of freedom; m =  4
+ Lithium glass detector params:   d (nsec) =   3.233    ( 24)
+                                f (1/nsec) =  0.3528    ( 25)
+                         g (dimensionless) =   1.291    ( 26)
+ Channel width parameters (widths in nsec):
+     min Energy     max Energy     Chan Width
+         0.0          infinity     6.947    ( 27)
+
+
+   NORMALIZATION      BCKG(CONST)  BCKG/SQRT(E)    BCKG*SQRT(E)
+  1.0031E+00( 28)  8.0964E-02( 29)  0.0000E+00       0.0000E+00     
+
+    BCKG*EXP(.)      .*EXP(BCKG/SQRT(E))
+  0.0000E+00       0.0000E+00     
+ ### Array size used for SAMMY-FIN is       5531 ###
+ ### Estimated array size for SAMMY-THE is       1529 ###
+ Number of parameters affected by this data set=   23
+ ### Array size used for SAMMY-THE is       1528 ###
+ ### Estimated array size for SAMMY-XCT is       8173 ###
+ ### Array size used for SAMMY-XCT is       7624 ###
+ ### Estimated array size for SAMMY-FGM is       7881 ###
+ ### Array size used for SAMMY-FGM is       7881 ###
+ ### Estimated array size for SAMMY-ORR is       8025 ###
+
+ At energy  1.8003E+05 total resolution time is  7.9444E-03
+ Resolution time associated with burst width is  8.8434E-04
+ Resolution time assoc. with water moderator is  1.7032E-04
+ Resolutn time associated with channel width is  3.4735E-03
+ Resolution time for  Lithium-glass detector is  3.4163E-03
+ Eup, Em, Elow =   1.8068E+05  1.8003E+05  1.7995E+05
+ ### Array size used for SAMMY-ORR is       8111 ###
+ ### Estimated array size for SAMMY-INT is       7811 ###
+
+
+ ***** THEORETICAL VALUES (broadnd,normed,...as required)
+
+      ENERGY    THEORY          ENERGY    THEORY          ENERGY    THEORY    
+ (  1)180034.2 0.527274    ( 20)180699.1 0.288886    ( 39)181312.1 0.279441    
+ (  2)180133.3 0.526747    ( 21)180709.6 0.328546    ( 40)181322.7 0.297640    
+ (  3)180241.2 0.525520    ( 22)180720.2 0.367042    ( 41)181333.3 0.324944    
+ (  4)180348.2 0.522449    ( 23)180730.7 0.401458    ( 42)181343.9 0.357600    
+ (  5)180451.6 0.511438    ( 24)180751.2 0.451174    ( 43)181354.5 0.391229    
+ (  6)180520.1 0.480079    ( 25)180783.5 0.489331    ( 44)181365.1 0.422241    
+ (  7)180551.9 0.442365    ( 26)180815.1 0.504500    ( 45)181375.7 0.448330    
+ (  8)180572.6 0.402800    ( 27)180885.2 0.517484    ( 46)181408.2 0.492888    
+ (  9)180583.1 0.375257    ( 28)180985.9 0.522418    ( 47)181460.6 0.513183    
+ ( 10)180593.7 0.342073    ( 29)181097.8 0.519544    ( 48)181513.5 0.519802    
+ ( 11)180604.2 0.307540    ( 30)181163.9 0.503370    ( 49)181566.7 0.522933    
+ ( 12)180614.8 0.272928    ( 31)181195.8 0.479800    ( 50)181619.3 0.524699    
+ ( 13)180625.3 0.240285    ( 32)181227.3 0.432769    ( 51)181758.9 0.527088    
+ ( 14)180635.8 0.213749    ( 33)181248.5 0.379821    ( 52)181962.0 0.528516    
+ ( 15)180646.3 0.196602    ( 34)181259.1 0.350163    ( 53)182176.1 0.529271    
+ ( 16)180656.9 0.191176    ( 35)181269.7 0.320891    ( 54)182388.1 0.529735    
+ ( 17)180667.4 0.199106    ( 36)181280.3 0.295800    ( 55)182611.5 0.530057    
+ ( 18)180678.0 0.219972    ( 37)181290.9 0.278927    ( 56)182820.1 0.530233    
+ ( 19)180688.5 0.251258    ( 38)181301.5 0.273033    
+ ### Array size used for SAMMY-INT is       7625 ###
+ ### Estimated array size for SAMMY-IPQ is       7623 ###
+
+ CUSTOMARY CHI SQUARED =   301.471    
+ CUSTOMARY CHI SQUARED DIVIDED BY NDAT =   5.38340    
+ ### Array size used for SAMMY-IPQ is       7277 ###
+ ### Estimated array size for SAMMY-FIN is       5190 ###
+
+
+
+
+ ***** NEW VALUES FOR RESONANCE PARAMETERS               
+
+ SPIN GROUP NUMBER  1  WITH SPIN=  0.5, ABUNDANCE=  1.0000, AND G= 1.0000
+                effective radius =  6.3718E+00( 20)
+                   "true" radius =  6.3718E+00( 20)
+      ENERGY          GAMMA-          GAMMA-
+                      GAMMA          Inc Chan
+                                    L=0  SPIN= 0.5
+       (eV)        (MILLI-EV)       (MILLI-EV)
+ -5.98528E+04(  1) 4.0000E+03       2.2927E+07(  2)
+ -4.40000E+03      8.0000E+03       7.7198E+05(  3)
+  8.20570E+05(  4) 2.0000E+03       9.3855E+06(  5)
+  8.68000E+05      2.0000E+03       6.6918E+06(  6)
+  1.00000E+06      2.0000E+03       3.2112E+08(  7)
+ Expected          0.0000E+00       8.4504E+05
+  Value       +/-  0.0000E+00  +/-  7.6564E+04
+ EV changed        0.0000E+00       2.2172E+07
+ parameters   +/-  0.0000E+00  +/-  1.1833E+06
+
+ SPIN GROUP NUMBER  2  WITH SPIN= -0.5, ABUNDANCE=  1.0000, AND G= 1.0000
+                effective radius =  4.0280E+00( 21)
+                   "true" radius =  4.0280E+00( 21)
+      ENERGY          GAMMA-          GAMMA-
+                      GAMMA          Inc Chan
+                                    L=1  SPIN= 0.5
+       (eV)        (MILLI-EV)       (MILLI-EV)
+  1.81294E+05(  8) 7.1000E+02       3.2180E+04(  9)
+ Expected          0.0000E+00       3.2180E+04
+  Value       +/-  0.0000E+00  +/-  1.7837E+03
+ EV changed        0.0000E+00       3.2180E+04
+ parameters   +/-  0.0000E+00  +/-  1.7837E+03
+
+ SPIN GROUP NUMBER  3  WITH SPIN= -1.5, ABUNDANCE=  1.0000, AND G= 2.0000
+                effective radius =  4.0280E+00( 21)
+                   "true" radius =  4.0280E+00( 21)
+      ENERGY          GAMMA-          GAMMA-
+                      GAMMA          Inc Chan
+                                    L=1  SPIN= 0.5
+       (eV)        (MILLI-EV)       (MILLI-EV)
+  1.75230E+05( 10) 7.5000E+02       4.8332E+04( 11)
+  1.84611E+05( 12) 8.1000E+02       9.7695E+04( 13)
+  1.86000E+05( 14) 6.1000E+02       2.4971E+04( 15)
+ Expected          0.0000E+00       3.5690E+04
+  Value       +/-  0.0000E+00  +/-  4.2208E+03
+ EV changed        0.0000E+00       0.0000E+00
+ parameters   +/-  0.0000E+00  +/-  0.0000E+00
+
+ SPIN GROUP NUMBER  4  WITH SPIN=  1.5, ABUNDANCE=  1.0000, AND G= 2.0000
+                effective radius =  6.3718E+00( 20)
+                   "true" radius =  6.3718E+00( 20)
+      ENERGY          GAMMA-          GAMMA-
+                      GAMMA          Inc Chan
+                                    L=2  SPIN= 0.5
+       (eV)        (MILLI-EV)       (MILLI-EV)
+  1.80650E+05( 16) 6.4000E+02       3.1718E+04( 17)
+  1.83940E+05      1.0600E+03       5.3860E+03( 18)
+ Expected          0.0000E+00       1.3925E+04
+  Value       +/-  0.0000E+00  +/-  9.2553E+02
+ EV changed        0.0000E+00       3.1718E+04
+ parameters   +/-  0.0000E+00  +/-  1.5484E+03
+
+ SPIN GROUP NUMBER  5  WITH SPIN=  2.5, ABUNDANCE=  1.0000, AND G= 3.0000
+                effective radius =  6.3718E+00( 20)
+                   "true" radius =  6.3718E+00( 20)
+      ENERGY          GAMMA-          GAMMA-
+                      GAMMA          Inc Chan
+                                    L=2  SPIN= 0.5
+       (eV)        (MILLI-EV)       (MILLI-EV)
+  1.72530E+05      1.1000E+03       5.6143E+03( 19)
+ Expected          0.0000E+00       5.6143E+03
+  Value       +/-  0.0000E+00  +/-  1.1475E+03
+ EV changed        0.0000E+00       0.0000E+00
+ parameters   +/-  0.0000E+00  +/-  0.0000E+00
+
+
+ EFFECTIVE RADIUS    "TRUE" RADIUS  SPIN GROUP NUMBERS FOR THESE RADII
+    6.3718192( 20)   6.3718192( 20)  1  4  5  6
+    4.0280217( 21)   4.0280217( 21)  2  3
+
+
+  TEMPERATURE      THICKNESS
+  3.0000E+02       1.7240E-01     
+
+    DELTA-L         DELTA-T-GAUS     DELTA-T-EXP
+  2.9000E-02       5.0000E-03       0.0000E+00     
+
+
+ ORELA Resolution PARAMETERS ARE --
+ Burst width                   p (nanosec) =   1.731    ( 22)
+ Mean free path (mm) for water moderator   =  0.1997    ( 23)
+                                   + ln(E) *   0.000         
+                              + (ln(E))**2 *   0.000         
+         with 2(m+1) degrees of freedom; m =  4
+ Lithium glass detector params:   d (nsec) =   3.255    ( 24)
+                                f (1/nsec) =  0.3552    ( 25)
+                         g (dimensionless) =   1.352    ( 26)
+ Channel width parameters (widths in nsec):
+     min Energy     max Energy     Chan Width
+         0.0          infinity     6.565    ( 27)
+
+
+   NORMALIZATION      BCKG(CONST)  BCKG/SQRT(E)    BCKG*SQRT(E)
+  1.0033E+00( 28)  7.9952E-02( 29)  0.0000E+00       0.0000E+00     
+
+    BCKG*EXP(.)      .*EXP(BCKG/SQRT(E))
+  0.0000E+00       0.0000E+00     
+
+
+
+ ***** CORRELATION MATRIX FOR OUTPUT PARAMETERS          
+
+    STD.DEV.  (REL.)   CORRELATION*100
+
+                       1   2   3   4   5   6   7   8   9  10  11  12  13  14  15
+   1  1997.     .033 100
+   2 1.1846E+06 .052 -33 100
+   3 7.6905E+04 .100   0  -1 100
+   4 1000.0     .001   0   0   0 100
+   5 1.8786E+06 .200   0   1   1   0 100
+   6 2.6765E+06 .400   0   2   1   0   0 100
+   7 2.1673E+07 .067   1  10   4   0   0  -1 100
+   8  2.958     .000   1   6   2   0  -1  -1  -7 100
+   9  1784.     .055   2  15   6   0  -1  -2 -15  -5 100
+  10  10.00     .000   0   0   0   0   0   0   0   0   0 100
+  11  7501.     .155   0   0   0   0   0   0   0  -1   3   0 100
+  12 10.000     .000   0   0   0   0   0   0   0   0   0   0   0 100
+  13 1.5423E+04 .158   0   0   0   0   0   0   0  -1   3   0   6   0 100
+  14  10.00     .000   0   0   0   0   0   0   0   0   0   0   0   0   0 100
+  15  5092.     .204   0   0   0   0   0   0   0  -1   2   0   5   0   5   0 100
+  16  2.443     .000   1   7   3   0  -1  -1  -8  37  -9   0   0   0   0   0   0
+  17  1548.     .049   3  21   8   0  -1  -3 -21  -6  42   0   1   0   2   0   1
+  18  1101.     .204   0   2   1   0   1   1   4   1   4   0   0   0   0   0   0
+  19  1147.     .204   0   2   1   0   1   1   4   1   4   0   0   0   0   0   0
+  20 5.6313E-02 .009  -1  12   7   0   5   3  21   6  20   0   1   0   1   0   0
+  21 5.8055E-02 .014   0   1   1   0   0   0  -1  -4  11   0  26   0  25   0  19
+  22 0.4991     .288   0   0   0   0   0   0   0   4  -1   0   0   0   0   0   0
+  23 1.0000E-01 .501   0   0   0   0   0   0   0   0   0   0   0   0   0   0   0
+  24  1.809     .556   0  -3  -1   0   0   0   3  23  -2   0   0   0   0   0   0
+  25 6.5788E-02 .185   1   9   4   0  -1  -2 -11  57 -14   0  -1   0  -1   0   0
+  26 0.4790     .354   0   1   1   0   0   0  -1 -15   3   0   0   0   0   0   0
+  27 0.6458     .098   0  -2  -1   0   0   0   2  20  -3   0   0   0   0   0   0
+  28 4.9653E-03 .005   0   3   1   0   0  -1  -4  -3  -6   0   0   0   0   0   0
+  29 8.9666E-03 .112   6  42  16   0  -4  -7 -46  12  43   0   1   0   2   0   1
+
+                      16  17  18  19  20  21  22  23  24  25  26  27  28  29
+  17  1548.     .049  -7 100
+  18  1101.     .204   1   7 100
+  19  1147.     .204   1   7   4 100
+  20 5.6313E-02 .009   7  34  21  21 100
+  21 5.8055E-02 .014  -1   5   0   0   2 100
+  22 0.4991     .288   4  -1   0   0   0   0 100
+  24  1.809     .556  25  -5  -1  -1  -3   0  -3   0 100
+  25 6.5788E-02 .185  63 -12   2   2  10  -2   5   0  40 100
+  26 0.4790     .354 -17   5   0   0   2   0   2   0  14 -40 100
+  27 0.6458     .098  21  -5  -1  -1  -3  -1  -2   0 -19  27  12 100
+  28 4.9653E-03 .005  -3  -9   1   1   3  -1   0   0   1  -4  -1   1 100
+  29 8.9666E-03 .112  13  60  11  11  54   5  -1   0  -6  18   4  -5 -18 100
+ *** NOTE -- MISSING LINES HAVE ZERO OFF-DIAGONAL CORRELATION ***
+
+
+
+
+ ***** RATIO OF UNCERTAINTIES ON VARIED PARAMETERS       
+
+        NEW/OLD             NEW/OLD             NEW/OLD             NEW/OLD   
+ (  1)  0.9984       (  9)  0.3916       ( 17)  0.3517       ( 25)  0.3289    
+ (  2)   1.043       ( 10)   1.000       ( 18)   1.030       ( 26)  0.9579    
+ (  3)   1.005       ( 11)   1.028       ( 19)   1.031       ( 27)  0.9226    
+ (  4)  1.0000       ( 12)  1.0000       ( 20)  0.9385       ( 28)  0.9931    
+ (  5)   1.002       ( 13)   1.007       ( 21)  0.9676       ( 29)  0.4483    
+ (  6)   1.000       ( 14)   1.000       ( 22)  0.9983    
+ (  7)  0.9638       ( 15)   1.013       ( 23)  1.0000    
+ (  8)  0.2958       ( 16)  0.2443       ( 24)  0.9046    
+ 
+
+ ***** RATIO OF UNCERTAINTIES ON VARIED U-PARAMETERS     
+
+        NEW/OLD             NEW/OLD             NEW/OLD             NEW/OLD   
+ (  1)  0.9993       (  9)  0.4446       ( 17)  0.3635       ( 25)  0.3289    
+ (  2)  0.9728       ( 10)   1.000       ( 18)   1.000       ( 26)  0.9579    
+ (  3)  0.9972       ( 11)   1.000       ( 19)   1.000       ( 27)  0.9226    
+ (  4)  1.0000       ( 12)  1.0000       ( 20)  0.9385       ( 28)  0.9931    
+ (  5)  0.9993       ( 13)  0.9995       ( 21)  0.9676       ( 29)  0.4483    
+ (  6)  0.9988       ( 14)   1.000       ( 22)  0.9983    
+ (  7)  0.9448       ( 15)   1.000       ( 23)  1.0000    
+ (  8)  0.2958       ( 16)  0.2443       ( 24)  0.9046    
+ 
+ ### Array size used for SAMMY-FIN is       6076 ###
+
+
+ *****************************************************************************
+ *****                                                                   *****
+ ***** example ex007:  TESTING ORR (OAK RIDGE RESOLUTION FUNCTION)       *****
+ *****                                                                   *****
+ *****************************************************************************
+
+
+ Input quantities from line number 2 are:
+   Alfnm1, Alfnm2 = ##      58NI##       Atomic Weight =  57.935000
+   Nepnts Itmax  Icorr  Nxtra  Iptdop Iptwid Ixxchn
+      140      0      0      1      0      0      0
+   Ndigit Idropp Matnum Kkkkza
+        2      2      0      0
+Adjusted  Itmax  Icorr  Nxtra  Iptdop Iptwid Ixxchn
+      140      0     50      1      9      5      0
+   Ndigit Idropp Matnum Kkkkza
+        2      2      0      0
+
+
+ TARGET ELEMENT IS       58NI
+ ATOMIC WEIGHT IS  57.935000
+
+
+ *********** Alphanumeric Control Information *********
+
+ DO NOT PRINT ANY INPUT PARAMETERS       
+ DO NOT SUPPRESS ANY INTERMEDIATE RESULTS
+ PRINT THEORETICAL VALUES                
+ DO NOT PRINT PARTIAL DERIVATIVES        
+ ENERGY UNCERTAINTIES ARE AT THE END OF L
+ PRINT BAYES CHI SQUARED                 
+ ODF FILE IS WANTED--SAMMY.ODF ,FINAL VAL
+ DO NOT ALLOW VALUES FOR DATA-RELATED PAR
+ DO NOT SOLVE BAYES EQUATIONS            
+ PRINT LS CHI SQUARED                    
+                                         
+ **** end of Alphanumeric Control Information *********
+
+
+ Name of initial parameter covariance file is: 
+ >>> SAMMY.COV                                                              <<<
+ ### Estimated array size for SAMMY-INP is       1032 ###
+
+ Effective Temperature= 300.00000
+    Flight Path= 201.57800 Meters +/-   0.02900/2 Meters
+      Deltae=     0.00000    Deltag=     0.00500
+      Delttt=     0.00000    Elowbr=  0.00000000
+
+ Target Thickness=  0.1724    
+
+ **** Data type is <<< TRANSMISSION         >>> ****
+
+ Spin of incident particle is  0.5
+__________________________
+ 
+ ### Array size used for SAMMY-INP is       1037 ###
+ ### Estimated array size for SAMMY-PAR is       1152 ###
+ Number of ORELA-Resolution parameters is   12
+                 and the number varied is    6
+
+ Total  number of resonances is   14
+ Number of particle channels is    1
+ Number of spin groups is          6
+ Number of flagged parametrs is   29
+ Number of varied parameters is   29
+ ### Array size used for SAMMY-PAR is       1133 ###
+ ### Estimated array size for SAMMY-OLD is       1179 ###
+ Number of non-zero off-diagonal cov matrix elements is     253
+
+
+ Broadening (etc.) parameters actually used for this run
+
+     Effective Temperature =   300.000    
+          Sample Thickness =  0.172400    
+ FLIGHT PATH LENGTH (Dist) =   201.578    
+                     Anorm =   1.00326    
+                     BackA =  7.995182E-02
+                     BackB =   0.00000    
+                     BackC =   0.00000    
+                     BackD =   0.00000    
+                     BackF =   0.00000    
+ ### Array size used for SAMMY-OLD is       5467 ###
+
+ At energy  1.8000E+05 total resolution time is  7.6793E-03
+ Resolution time associated with burst width is  8.6530E-04
+ Resolution time assoc. with water moderator is  1.7013E-04
+ Resolutn time associated with channel width is  3.2827E-03
+ Resolution time for  Lithium-glass detector is  3.3611E-03
+ Eup, Em, Elow =   1.8064E+05  1.8000E+05  1.7992E+05
+
+ At energy  1.8300E+05 total resolution time is  7.6779E-03
+ Resolution time associated with burst width is  8.6530E-04
+ Resolution time assoc. with water moderator is  1.6873E-04
+ Resolutn time associated with channel width is  3.2827E-03
+ Resolution time for  Lithium-glass detector is  3.3611E-03
+ Eup, Em, Elow =   1.8366E+05  1.8300E+05  1.8292E+05
+     Emind               Emins               Eminr               Emin
+   179829.4794548158   179919.5471727547   179919.5471727547   180000.0000000000
+     Emax                Emaxr               Emaxs               Emaxd
+   183000.0000000000   183659.1192013627   183659.1192013627   183750.1407864687
+
+ Doppler Width at Emin =   18.0018     and at Emax =   18.1512     eV
+  
+      E(keV)    Dopp_FWHM(keV)
+    180.000009        29.9750
+    181.500009        30.0996
+    183.000009        30.2238
+  
+ ### Estimated array size for SAMMY-DAT is   32499707 +    32500000 ###
+
+ Energy range of data is from 1.80000E+05 to 1.83000E+05 eV.
+ Number of experimental data points =      56
+
+ Number of points in auxiliary grid =     127
+ ### Array size used for SAMMY-DAT is   32499704 +    32500000 ###
+ ### Estimated array size for SAMMY-THE is       1418 ###
+ Number of parameters affected by this data set=   23
+ ### Array size used for SAMMY-THE is       1417 ###
+ ### Estimated array size for SAMMY-XCT is       7966 ###
+ ### Array size used for SAMMY-XCT is       7417 ###
+ ### Estimated array size for SAMMY-FGM is       7670 ###
+ ### Array size used for SAMMY-FGM is       7670 ###
+ ### Estimated array size for SAMMY-ORR is       7818 ###
+
+ At energy  1.8003E+05 total resolution time is  7.6792E-03
+ Resolution time associated with burst width is  8.6530E-04
+ Resolution time assoc. with water moderator is  1.7011E-04
+ Resolutn time associated with channel width is  3.2827E-03
+ Resolution time for  Lithium-glass detector is  3.3611E-03
+ Eup, Em, Elow =   1.8068E+05  1.8003E+05  1.7995E+05
+ ### Array size used for SAMMY-ORR is       7904 ###
+ ### Estimated array size for SAMMY-INT is       7602 ###
+
+
+ ***** THEORETICAL VALUES (broadnd,normed,...as required)
+
+      ENERGY    THEORY          ENERGY    THEORY          ENERGY    THEORY    
+ (  1)180034.2 0.527480    ( 20)180699.1 0.286823    ( 39)181312.1 0.273341    
+ (  2)180133.3 0.526951    ( 21)180709.6 0.327842    ( 40)181322.7 0.291754    
+ (  3)180241.2 0.525717    ( 22)180720.2 0.367426    ( 41)181333.3 0.320160    
+ (  4)180348.2 0.522645    ( 23)180730.7 0.402467    ( 42)181343.9 0.354288    
+ (  5)180451.6 0.511730    ( 24)180751.2 0.452173    ( 43)181354.5 0.389298    
+ (  6)180520.1 0.480749    ( 25)180783.5 0.489656    ( 44)181365.1 0.421342    
+ (  7)180551.9 0.443700    ( 26)180815.1 0.504702    ( 45)181375.7 0.448016    
+ (  8)180572.6 0.404735    ( 27)180885.2 0.517657    ( 46)181408.2 0.492831    
+ (  9)180583.1 0.376457    ( 28)180985.9 0.522613    ( 47)181460.6 0.513216    
+ ( 10)180593.7 0.343167    ( 29)181097.8 0.519856    ( 48)181513.5 0.519887    
+ ( 11)180604.2 0.308380    ( 30)181163.9 0.504192    ( 49)181566.7 0.523060    
+ ( 12)180614.8 0.272350    ( 31)181195.8 0.481589    ( 50)181619.3 0.524850    
+ ( 13)180625.3 0.237994    ( 32)181227.3 0.435447    ( 51)181758.9 0.527279    
+ ( 14)180635.8 0.210088    ( 33)181248.5 0.382954    ( 52)181962.0 0.528706    
+ ( 15)180646.3 0.191711    ( 34)181259.1 0.352290    ( 53)182176.1 0.529465    
+ ( 16)180656.9 0.185683    ( 35)181269.7 0.321445    ( 54)182388.1 0.529930    
+ ( 17)180667.4 0.193651    ( 36)181280.3 0.294413    ( 55)182611.5 0.530251    
+ ( 18)180678.0 0.215244    ( 37)181290.9 0.275364    ( 56)182820.1 0.530423    
+ ( 19)180688.5 0.247757    ( 38)181301.5 0.267629    
+ ### Array size used for SAMMY-INT is       7603 ###
+ ### Estimated array size for SAMMY-SQU is       8315 ###
+ ### Array size used for SAMMY-SQU is       8315 ###
+ ### Estimated array size for SAMMY-IPQ is       7416 ###
+
+ CUSTOMARY CHI SQUARED =   299.688    
+ CUSTOMARY CHI SQUARED DIVIDED BY NDAT =   5.35158    
+
+ BAYESIAN CHI SQUARED =   297.854    
+ BAYESIAN CHI SQUARED DIVIDED BY NDAT =   5.31883    
+ ### Array size used for SAMMY-IPQ is       7118 ###
+ ### Estimated array size for SAMMY-FIN is       4335 ###
+ ### Array size used for SAMMY-FIN is        987 ###
+                              Total time =     0.22 seconds
+ Normal finish to SAMMY
