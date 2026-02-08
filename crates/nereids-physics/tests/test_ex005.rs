@@ -39,8 +39,8 @@ fn compute_chi_squared(theory: &[f64], data: &[f64], uncertainties: &[f64]) -> f
         .sum()
 }
 
-/// 2% relative tolerance for chi-squared comparison.
-const CHI2_REL_TOLERANCE: f64 = 2e-2;
+const CHI2_ABS_TOLERANCE: f64 = 1e-4;
+const CHI2_REL_TOLERANCE: f64 = 2e-3;
 
 fn ex005_fixture_base_path() -> PathBuf {
     let base = PathBuf::from("tests/fixtures/sammy_reference/ex005");
@@ -94,16 +94,18 @@ fn build_ex005_params(mut resonances: Vec<nereids_core::nuclear::Resonance>) -> 
 }
 
 fn assert_chi2_close(label: &str, computed: f64, expected: f64) {
-    let rel_err = (computed - expected).abs() / expected;
+    let abs_err = (computed - expected).abs();
+    let rel_err = abs_err / expected.abs().max(1e-30);
     if debug_log_enabled() {
         println!("{label}:");
         println!("  Computed χ² = {computed:.1}");
         println!("  Expected χ² = {expected:.1}");
+        println!("  Absolute error = {abs_err:.4e}");
         println!("  Relative error = {rel_err:.4e}");
     }
     assert!(
-        rel_err < CHI2_REL_TOLERANCE,
-        "{label}: chi-squared mismatch (rel_err={rel_err:.4e}): computed={computed:.1}, expected={expected:.1}"
+        abs_err < CHI2_ABS_TOLERANCE || rel_err < CHI2_REL_TOLERANCE,
+        "{label}: chi-squared mismatch (abs_err={abs_err:.4e}, rel_err={rel_err:.4e}): computed={computed:.1}, expected={expected:.1}"
     );
 }
 
@@ -195,9 +197,9 @@ fn test_ex005b_50k() {
         create_auxiliary_grid(&exp_data.energies, &res_energies, &res_widths, 50.0, 10.0)
             .expect("Failed to create auxiliary grid");
     // SAMMY ex005bb reports 370 auxiliary points for this case.
-    // Keep this in the same regime to avoid pathological over-refinement.
+    // Keep this tightly bounded near SAMMY's 370-point reference.
     assert!(
-        (320..=420).contains(&aux_grid.len()),
+        (355..=375).contains(&aux_grid.len()),
         "unexpected auxiliary-grid size for ex005b: got {}, expected near SAMMY's 370",
         aux_grid.len()
     );
