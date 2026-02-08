@@ -5,9 +5,10 @@
 //! - tantalum target (`kwatta=1`) with numeric convolution using the same
 //!   parameter transforms and component kernels (`morr3/morr4/morr6`)
 
-use nereids_core::{EnergyGrid, PhysicsError, ResolutionFunction};
+use nereids_core::{
+    EnergyGrid, PhysicsError, ResolutionFunction, SAMMY_SM2_US_SQRT_EV_PER_M as SM2,
+};
 
-const SM2: f64 = 72.298_252_179_105_06; // SAMMY sqrt(m/2) constant, us*sqrt(eV)/m
 const MIN_NORM: f64 = 1e-300;
 const WATERM_SERIES_MAX_TERMS: usize = 4096;
 const WATERM_SERIES_REL_TOL: f64 = 1e-14;
@@ -112,7 +113,7 @@ struct KernelPiecewise {
 }
 
 fn qexp(x: f64) -> f64 {
-    if -x < 100.0 {
+    if x > -100.0 {
         x.exp()
     } else {
         0.0
@@ -125,6 +126,78 @@ fn approx_eq(a: f64, b: f64) -> bool {
 
 fn time_from_energy_us(energy_ev: f64, flight_path_m: f64) -> f64 {
     SM2 * flight_path_m / energy_ev.sqrt()
+}
+
+fn simpson_integrate<F: Fn(f64) -> f64>(
+    lower: f64,
+    upper: f64,
+    n_even: usize,
+    integrand: F,
+) -> f64 {
+    if upper <= lower || n_even < 2 {
+        return 0.0;
+    }
+    let n = if n_even.is_multiple_of(2) {
+        n_even
+    } else {
+        n_even + 1
+    };
+    let h = (upper - lower) / n as f64;
+    let mut sum = integrand(lower) + integrand(upper);
+    for i in 1..n {
+        let x = lower + h * i as f64;
+        if i.is_multiple_of(2) {
+            sum += 2.0 * integrand(x);
+        } else {
+            sum += 4.0 * integrand(x);
+        }
+    }
+    sum * h / 3.0
+}
+
+fn tantalum_target_value_raw(
+    a_us_inv: f64,
+    w_us_inv: f64,
+    x1_us: f64,
+    x2_us: f64,
+    x3_us: f64,
+    x0_us: f64,
+    alpha: f64,
+    t_us: f64,
+) -> f64 {
+    if t_us <= 0.0 || t_us <= x1_us {
+        return 0.0;
+    }
+    let mut sum = 0.0;
+    if t_us <= x3_us {
+        if a_us_inv == 0.0 {
+            sum += 1.0;
+        } else {
+            let at = a_us_inv * (t_us - x0_us);
+            sum += (-(at * at)).exp();
+        }
+    }
+    if alpha != 0.0 {
+        let exp_term = (-(w_us_inv * (t_us - x2_us))).exp();
+        if x2_us > 0.0 && t_us <= x2_us {
+            sum += exp_term * alpha * t_us / x2_us;
+        } else {
+            sum += exp_term * alpha;
+        }
+    }
+    sum
+}
+
+fn find_jjj(timeij_us: f64, piecewise: &KernelPiecewise) -> usize {
+    if timeij_us <= 0.0 {
+        return 0;
+    }
+    for j in 0..piecewise.numtim {
+        if timeij_us < piecewise.tsubm_us[j] {
+            return j + 1; // SAMMY 1-based equivalent
+        }
+    }
+    piecewise.numtim + 1
 }
 
 fn compute_xcoef_weights(energies: &[f64]) -> Vec<f64> {
@@ -207,12 +280,7 @@ fn map_m_value(raw_m: f64) -> i32 {
 }
 
 impl OrrResolution {
-    fn interpolate_ne110_lambda_sigma_mm(
-        &self,
-        em_ev: f64,
-        tab: &[(f64, f64)],
-        fallback: f64,
-    ) -> f64 {
+    fn interpolate_ne110_lambda_sigma_mm(em_ev: f64, tab: &[(f64, f64)], fallback: f64) -> f64 {
         if tab.is_empty() {
             return fallback;
         }
@@ -404,7 +472,7 @@ impl OrrResolution {
         Ok(())
     }
 
-    fn t4b_mean_us(&self, d_us: f64, f_us_inv: f64, g: f64) -> f64 {
+    fn t4b_mean_us(d_us: f64, f_us_inv: f64, g: f64) -> f64 {
         if d_us == 0.0 {
             return 1.0 / f_us_inv;
         }
@@ -417,7 +485,7 @@ impl OrrResolution {
         (0.5 * gfd * fd + 1.0 + fd) / h
     }
 
-    fn t4a_mean_us(&self, d_us: f64, f_us_inv: f64) -> f64 {
+    fn t4a_mean_us(d_us: f64, f_us_inv: f64) -> f64 {
         if f_us_inv == 0.0 {
             return 0.5 * d_us;
         }
@@ -429,63 +497,7 @@ impl OrrResolution {
         1.0 / f_us_inv - d_us * h * exp_term
     }
 
-    fn simpson_integrate<F: Fn(f64) -> f64>(a: f64, b: f64, n_even: usize, f: F) -> f64 {
-        if b <= a || n_even < 2 {
-            return 0.0;
-        }
-        let n = if n_even.is_multiple_of(2) {
-            n_even
-        } else {
-            n_even + 1
-        };
-        let h = (b - a) / n as f64;
-        let mut sum = f(a) + f(b);
-        for i in 1..n {
-            let x = a + h * i as f64;
-            if i.is_multiple_of(2) {
-                sum += 2.0 * f(x);
-            } else {
-                sum += 4.0 * f(x);
-            }
-        }
-        sum * h / 3.0
-    }
-
-    fn tantalum_target_value_raw(
-        a_us_inv: f64,
-        w_us_inv: f64,
-        x1_us: f64,
-        x2_us: f64,
-        x3_us: f64,
-        x0_us: f64,
-        alpha: f64,
-        t_us: f64,
-    ) -> f64 {
-        if t_us <= 0.0 || t_us <= x1_us {
-            return 0.0;
-        }
-        let mut sum = 0.0;
-        if t_us <= x3_us {
-            if a_us_inv == 0.0 {
-                sum += 1.0;
-            } else {
-                let at = a_us_inv * (t_us - x0_us);
-                sum += (-(at * at)).exp();
-            }
-        }
-        if alpha != 0.0 {
-            let exp_term = (-(w_us_inv * (t_us - x2_us))).exp();
-            if x2_us > 0.0 && t_us <= x2_us {
-                sum += exp_term * alpha * t_us / x2_us;
-            } else {
-                sum += exp_term * alpha;
-            }
-        }
-        sum
-    }
-
     fn t2b_numerical(
-        &self,
         a_us_inv: f64,
         w_us_inv: f64,
         x1_us: f64,
@@ -512,24 +524,22 @@ impl OrrResolution {
                 "ORR tantalum produced invalid support bounds".to_string(),
             ));
         }
-        let m0 = Self::simpson_integrate(0.0, upper, 256, |t| {
-            Self::tantalum_target_value_raw(
-                a_us_inv, w_us_inv, x1_us, x2_us, x3_us, x0_us, alpha, t,
-            )
+        let m0 = simpson_integrate(0.0, upper, 256, |t| {
+            tantalum_target_value_raw(a_us_inv, w_us_inv, x1_us, x2_us, x3_us, x0_us, alpha, t)
         });
         if !m0.is_finite() || m0.abs() <= MIN_NORM {
             return Err(PhysicsError::InvalidParameter(
                 "ORR tantalum produced near-zero normalization".to_string(),
             ));
         }
-        let m1 = Self::simpson_integrate(0.0, upper, 256, |t| {
-            t * Self::tantalum_target_value_raw(
-                a_us_inv, w_us_inv, x1_us, x2_us, x3_us, x0_us, alpha, t,
-            )
+        let m1 = simpson_integrate(0.0, upper, 256, |t| {
+            t * tantalum_target_value_raw(a_us_inv, w_us_inv, x1_us, x2_us, x3_us, x0_us, alpha, t)
         });
         Ok(m1 / m0)
     }
 
+    // SAMMY-faithful parameter path; keep structure aligned with teacher code.
+    #[allow(clippy::too_many_lines)]
     fn gen_energy_params(&self, em_ev: f64) -> Result<EnergyParams, PhysicsError> {
         if em_ev <= 0.0 || !em_ev.is_finite() {
             return Err(PhysicsError::InvalidParameter(format!(
@@ -568,7 +578,7 @@ impl OrrResolution {
                         0.0,
                         0.0,
                         0.0,
-                        (m_i as f64 + 1.0) / a_us_inv,
+                        (f64::from(m_i) + 1.0) / a_us_inv,
                     )
                 }
                 OrrTarget::Tantalum {
@@ -587,8 +597,9 @@ impl OrrResolution {
                     let x3_us = *x3_prime / b1000;
                     let x0_us = *x0_prime / b1000;
                     let alpha_v = *alpha;
-                    let x2_mean_us = self
-                        .t2b_numerical(a_us_inv, w_us_inv, x1_us, x2_us, x3_us, x0_us, alpha_v)?;
+                    let x2_mean_us = Self::t2b_numerical(
+                        a_us_inv, w_us_inv, x1_us, x2_us, x3_us, x0_us, alpha_v,
+                    )?;
                     (
                         TargetMode::Tantalum,
                         a_us_inv,
@@ -617,7 +628,7 @@ impl OrrResolution {
                 lambda_sigma_constant_mm,
                 lambda_sigma_mm,
             } => {
-                let lambda_sigma_mm = self.interpolate_ne110_lambda_sigma_mm(
+                let lambda_sigma_mm = Self::interpolate_ne110_lambda_sigma_mm(
                     em_ev,
                     lambda_sigma_mm,
                     *lambda_sigma_constant_mm,
@@ -636,9 +647,9 @@ impl OrrResolution {
         let x2 = x2_mean_us;
         let x3 = 0.5 * c_us;
         let x4 = if detector_mode == DetectorMode::Ne110 {
-            self.t4a_mean_us(d_us, f_us_inv)
+            Self::t4a_mean_us(d_us, f_us_inv)
         } else {
-            self.t4b_mean_us(d_us, f_us_inv, g)
+            Self::t4b_mean_us(d_us, f_us_inv, g)
         };
         let timej_us = time_us + x1 + x2 + x3 + x4;
 
@@ -690,7 +701,7 @@ impl OrrResolution {
         })
     }
 
-    fn set_hhh_case_standard(&self, p: &EnergyParams) -> KernelPiecewise {
+    fn set_hhh_case_standard(p: &EnergyParams) -> KernelPiecewise {
         let mut tsubm = [0.0; 8];
         tsubm[0] = 0.0;
         tsubm[1] = p.p_us;
@@ -745,6 +756,7 @@ impl OrrResolution {
         }
 
         let mut iflip = false;
+        // Two passes bubble neighboring boundaries into SAMMY's required ordering.
         for _ in 0..2 {
             let mut any = false;
             for i1 in [3usize, 4usize] {
@@ -787,19 +799,7 @@ impl OrrResolution {
         }
     }
 
-    fn find_jjj(timeij_us: f64, piecewise: &KernelPiecewise) -> usize {
-        if timeij_us <= 0.0 {
-            return 0;
-        }
-        for j in 0..piecewise.numtim {
-            if timeij_us < piecewise.tsubm_us[j] {
-                return j + 1; // SAMMY 1-based equivalent
-            }
-        }
-        piecewise.numtim + 1
-    }
-
-    fn bcd_value(&self, p: &EnergyParams, piecewise: &KernelPiecewise, t_us: f64) -> f64 {
+    fn bcd_value(p: &EnergyParams, piecewise: &KernelPiecewise, t_us: f64) -> f64 {
         if t_us <= 0.0 {
             return 0.0;
         }
@@ -825,13 +825,13 @@ impl OrrResolution {
         row[0] * (-p.f_us_inv * t_us).exp() + row[1] * t_us * t_us + row[2] * t_us + row[3]
     }
 
-    fn tantalum_target_value(&self, p: &EnergyParams, t_us: f64) -> f64 {
-        Self::tantalum_target_value_raw(
+    fn tantalum_target_value(p: &EnergyParams, t_us: f64) -> f64 {
+        tantalum_target_value_raw(
             p.a_us_inv, p.w_us_inv, p.x1_us, p.x2_us, p.x3_us, p.x0_us, p.alpha, t_us,
         )
     }
 
-    fn tantalum_sum(&self, p: &EnergyParams, piecewise: &KernelPiecewise, timeij_us: f64) -> f64 {
+    fn tantalum_sum(p: &EnergyParams, piecewise: &KernelPiecewise, timeij_us: f64) -> f64 {
         if timeij_us <= 0.0 {
             return 0.0;
         }
@@ -839,18 +839,19 @@ impl OrrResolution {
         if u_max <= 0.0 {
             return 0.0;
         }
-        Self::simpson_integrate(0.0, u_max, 80, |u| {
-            let bcd = self.bcd_value(p, piecewise, u);
+        simpson_integrate(0.0, u_max, 80, |u| {
+            let bcd = Self::bcd_value(p, piecewise, u);
             if bcd == 0.0 {
                 return 0.0;
             }
-            let target = self.tantalum_target_value(p, timeij_us - u);
+            let target = Self::tantalum_target_value(p, timeij_us - u);
             bcd * target
         })
     }
 
+    // SAMMY-faithful series expansion; split would make validation harder.
+    #[allow(clippy::too_many_lines)]
     fn waterm_sum(
-        &self,
         p: &EnergyParams,
         piecewise: &KernelPiecewise,
         timeij_us: f64,
@@ -859,8 +860,8 @@ impl OrrResolution {
         let m = p.m;
         let a = p.a_us_inv;
         let f = p.f_us_inv;
-        let c1 = (m as f64 + 1.0) * f / a;
-        let c2 = (m as f64 + 2.0) * c1 * f / a;
+        let c1 = (f64::from(m) + 1.0) * f / a;
+        let c2 = (f64::from(m) + 2.0) * c1 * f / a;
         let c6 = if !approx_eq(a, f) {
             (a / (a - f)).powi(m + 1)
         } else {
@@ -898,14 +899,14 @@ impl OrrResolution {
                 let mut sumk = 1.0_f64;
                 if m > 2 {
                     for k in 1..=(m - 2) {
-                        atk *= at / (k as f64);
+                        atk *= at / f64::from(k);
                         sumk += atk;
                     }
                 }
                 if h2 != 0.0 {
                     sum -= h2 * sumk * eat * ft * ft;
                 }
-                atk *= at / ((m - 1) as f64);
+                atk *= at / f64::from(m - 1);
                 sumk += atk;
                 if h2 != 0.0 {
                     sum += h2 * sumk * eat * 2.0 * c1 * ft;
@@ -913,7 +914,7 @@ impl OrrResolution {
                 if h3 != 0.0 {
                     sum -= h3 * sumk * eat * ft;
                 }
-                atk *= at / (m as f64);
+                atk *= at / f64::from(m);
                 sumk += atk;
                 if h2 != 0.0 {
                     sum -= h2 * sumk * eat * c2;
@@ -931,16 +932,17 @@ impl OrrResolution {
             }
             if abamft <= small {
                 if eat != 0.0 {
-                    atk *= at / ((m + 1) as f64);
+                    atk *= at / f64::from(m + 1);
                     let mut sumj = 1.0_f64;
                     let mut atj = 1.0_f64;
                     if !approx_eq(a, f) {
                         for term in 1..=WATERM_SERIES_MAX_TERMS {
-                            atj *= amft / ((m + term as i32 + 1) as f64);
+                            let Ok(term_i32) = i32::try_from(term) else {
+                                break;
+                            };
+                            atj *= amft / f64::from(m + term_i32 + 1);
                             let updated = sumj + atj;
-                            if updated == sumj
-                                || atj.abs() <= WATERM_SERIES_REL_TOL * (updated.abs() + 1.0)
-                            {
+                            if atj.abs() <= WATERM_SERIES_REL_TOL * (updated.abs() + 1.0) {
                                 sumj = updated;
                                 break;
                             }
@@ -959,7 +961,7 @@ impl OrrResolution {
                     let mut sumk = 1.0_f64;
                     let mut aftk = 1.0_f64;
                     for k in 1..=m {
-                        aftk *= aft / (k as f64);
+                        aftk *= aft / f64::from(k);
                         sumk += aftk;
                     }
                     sum -= c6 * h1 * eat * sumk;
@@ -1003,7 +1005,7 @@ impl ResolutionFunction for OrrResolution {
                     "ORR failed to generate parameters at index {j} for E={em} eV: {e:?}"
                 ))
             })?;
-            let piecewise = self.set_hhh_case_standard(&p);
+            let piecewise = Self::set_hhh_case_standard(&p);
 
             let ilow_raw = energies.partition_point(|&e| e < p.elow_ev);
             let ilow = ilow_raw.saturating_sub(2);
@@ -1022,14 +1024,14 @@ impl ResolutionFunction for OrrResolution {
             for i in ilow..=iup {
                 let ee = energies[i];
                 let timeij = p.timej_us - time_from_energy_us(ee, self.flight_path_m);
-                let jjj = Self::find_jjj(timeij, &piecewise);
+                let jjj = find_jjj(timeij, &piecewise);
                 if jjj <= 1 {
                     continue;
                 }
                 let sum = if p.target_mode == TargetMode::Water {
-                    self.waterm_sum(&p, &piecewise, timeij, jjj)
+                    Self::waterm_sum(&p, &piecewise, timeij, jjj)
                 } else {
-                    self.tantalum_sum(&p, &piecewise, timeij)
+                    Self::tantalum_sum(&p, &piecewise, timeij)
                 };
                 let w = xcoef[i] * sum;
                 if w == 0.0 || !w.is_finite() {
@@ -1100,7 +1102,7 @@ mod tests {
     #[test]
     fn test_orr_constant_signal_preserved() {
         let energy =
-            EnergyGrid::new((0..200).map(|i| 180_000.0 + i as f64 * 10.0).collect()).unwrap();
+            EnergyGrid::new((0..200).map(|i| 180_000.0 + f64::from(i) * 10.0).collect()).unwrap();
         let spectrum = vec![0.42; energy.len()];
         let res = sample_orr();
         let out = res.convolve(&energy, &spectrum).unwrap();
@@ -1122,7 +1124,7 @@ mod tests {
     #[test]
     fn test_orr_ne110_constant_signal_preserved() {
         let energy =
-            EnergyGrid::new((0..200).map(|i| 180_000.0 + i as f64 * 10.0).collect()).unwrap();
+            EnergyGrid::new((0..200).map(|i| 180_000.0 + f64::from(i) * 10.0).collect()).unwrap();
         let spectrum = vec![0.31; energy.len()];
         let res = sample_orr_ne110();
         let out = res.convolve(&energy, &spectrum).unwrap();
@@ -1233,12 +1235,12 @@ mod tests {
             ..
         } = &res.detector
         {
-            let below = res.interpolate_ne110_lambda_sigma_mm(
+            let below = OrrResolution::interpolate_ne110_lambda_sigma_mm(
                 1.0,
                 lambda_sigma_mm,
                 *lambda_sigma_constant_mm,
             );
-            let above = res.interpolate_ne110_lambda_sigma_mm(
+            let above = OrrResolution::interpolate_ne110_lambda_sigma_mm(
                 5.0e7,
                 lambda_sigma_mm,
                 *lambda_sigma_constant_mm,

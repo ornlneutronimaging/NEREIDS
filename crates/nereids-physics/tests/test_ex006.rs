@@ -15,24 +15,13 @@ use nereids_core::ResolutionFunction;
 use nereids_physics::resolution::gaussian::GaussianResolution;
 use nereids_physics::resolution::rsl_gaussian::RslGaussianResolution;
 use nereids_physics::rmatrix::compute_0k_cross_sections;
-use parsers::{parse_dat_file, parse_lpt_chi_squared, parse_lpt_theory_points, parse_par_file};
+use parsers::{
+    compute_chi_squared, filter_triplets_by_range, parse_dat_file, parse_lpt_chi_squared,
+    parse_lpt_theory_points, parse_par_file, sorted_experimental_triplets,
+};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-
-fn compute_chi_squared(theory: &[f64], data: &[f64], uncertainties: &[f64]) -> f64 {
-    assert_eq!(theory.len(), data.len());
-    assert_eq!(theory.len(), uncertainties.len());
-    theory
-        .iter()
-        .zip(data.iter())
-        .zip(uncertainties.iter())
-        .map(|((t, d), u)| {
-            let r = (t - d) / u;
-            r * r
-        })
-        .sum()
-}
 
 fn relative_uncertainties_to_absolute(data: &[f64], rel_uncertainties: &[f64]) -> Vec<f64> {
     assert_eq!(data.len(), rel_uncertainties.len());
@@ -226,50 +215,6 @@ fn build_ex006_params(group1: Vec<Resonance>, group2: Vec<Resonance>) -> RMatrix
     RMatrixParameters {
         isotopes: vec![isotope],
     }
-}
-
-fn sorted_experimental_triplets(
-    energies: &[f64],
-    data: &[f64],
-    uncertainties: &[f64],
-) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
-    let mut rows: Vec<(f64, f64, f64)> = energies
-        .iter()
-        .copied()
-        .zip(data.iter().copied())
-        .zip(uncertainties.iter().copied())
-        .map(|((e, d), u)| (e, d, u))
-        .collect();
-    rows.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-    let mut e = Vec::with_capacity(rows.len());
-    let mut d = Vec::with_capacity(rows.len());
-    let mut u = Vec::with_capacity(rows.len());
-    for (ee, dd, uu) in rows {
-        e.push(ee);
-        d.push(dd);
-        u.push(uu);
-    }
-    (e, d, u)
-}
-
-fn filter_triplets_by_range(
-    energies: &[f64],
-    data: &[f64],
-    uncertainties: &[f64],
-    emin_ev: f64,
-    emax_ev: f64,
-) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
-    let mut e = Vec::new();
-    let mut d = Vec::new();
-    let mut u = Vec::new();
-    for ((&ee, &dd), &uu) in energies.iter().zip(data.iter()).zip(uncertainties.iter()) {
-        if ee >= emin_ev && ee <= emax_ev {
-            e.push(ee);
-            d.push(dd);
-            u.push(uu);
-        }
-    }
-    (e, d, u)
 }
 
 #[test]

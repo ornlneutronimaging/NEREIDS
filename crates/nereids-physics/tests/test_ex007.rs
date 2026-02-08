@@ -11,7 +11,10 @@ use nereids_core::nuclear::{
 };
 use nereids_physics::pipeline::DefaultForwardModel;
 use nereids_physics::resolution::orr::{OrrChannelWidth, OrrDetector, OrrResolution, OrrTarget};
-use parsers::{parse_dat_file, parse_lpt_chi_squared, parse_lpt_theory_points};
+use parsers::{
+    compute_chi_squared, filter_triplets_by_range, parse_dat_file, parse_lpt_chi_squared,
+    parse_lpt_theory_points, sorted_experimental_triplets,
+};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -50,64 +53,6 @@ fn ex007_fixture_base_path() -> PathBuf {
         base.display()
     );
     base
-}
-
-fn compute_chi_squared(theory: &[f64], data: &[f64], uncertainties: &[f64]) -> f64 {
-    assert_eq!(theory.len(), data.len());
-    assert_eq!(theory.len(), uncertainties.len());
-    theory
-        .iter()
-        .zip(data.iter())
-        .zip(uncertainties.iter())
-        .map(|((t, d), u)| {
-            let r = (t - d) / u;
-            r * r
-        })
-        .sum()
-}
-
-fn sorted_experimental_triplets(
-    energies: &[f64],
-    data: &[f64],
-    uncertainties: &[f64],
-) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
-    let mut rows: Vec<(f64, f64, f64)> = energies
-        .iter()
-        .copied()
-        .zip(data.iter().copied())
-        .zip(uncertainties.iter().copied())
-        .map(|((e, d), u)| (e, d, u))
-        .collect();
-    rows.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-    let mut e = Vec::with_capacity(rows.len());
-    let mut d = Vec::with_capacity(rows.len());
-    let mut u = Vec::with_capacity(rows.len());
-    for (ee, dd, uu) in rows {
-        e.push(ee);
-        d.push(dd);
-        u.push(uu);
-    }
-    (e, d, u)
-}
-
-fn filter_triplets_by_range(
-    energies: &[f64],
-    data: &[f64],
-    uncertainties: &[f64],
-    emin_ev: f64,
-    emax_ev: f64,
-) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
-    let mut e = Vec::new();
-    let mut d = Vec::new();
-    let mut u = Vec::new();
-    for ((&ee, &dd), &uu) in energies.iter().zip(data.iter()).zip(uncertainties.iter()) {
-        if ee >= emin_ev && ee <= emax_ev {
-            e.push(ee);
-            d.push(dd);
-            u.push(uu);
-        }
-    }
-    (e, d, u)
 }
 
 fn parse_ex007_input_spec(path: &Path) -> Result<Ex007InputSpec, Box<dyn std::error::Error>> {
@@ -351,6 +296,8 @@ fn parse_ex007_par_grouped(
     Ok(groups.into_iter().collect())
 }
 
+// Keep this parser close to SAMMY fixture layout for easier validation/debugging.
+#[allow(clippy::too_many_lines)]
 fn parse_orr_params(path: &Path) -> Result<OrrParams, Box<dyn std::error::Error>> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
@@ -691,8 +638,9 @@ fn test_ex007_fitted_parameters_replay_sammy_chi_squared() {
     for (suffix, reported_scale_limit) in [
         ("awl", 4.0_f64),
         ("awn", 4.0_f64),
-        // Tantalum + lithium path should now stay within a reasonably tight
-        // scale of SAMMY reported chi² for this fixture.
+        // TODO: tighten as ORR model fidelity improves.
+        // Tantalum + lithium path should stay within a reasonable scale of
+        // SAMMY reported chi² for this fixture.
         ("atl", 2.0_f64),
         ("atn", 4.0_f64),
     ] {
@@ -723,9 +671,14 @@ fn test_ex007_fitted_parameters_replay_sammy_chi_squared() {
         let sammy_reported = parse_lpt_chi_squared(&lpt_path)
             .expect("failed ex007 variant lpt chi² parse")
             .chi_squared;
-        let mut sammy_theory = parse_lpt_theory_points(&lpt_path).expect("failed ex007 theory table parse");
+        let mut sammy_theory =
+            parse_lpt_theory_points(&lpt_path).expect("failed ex007 theory table parse");
         sammy_theory.sort_by(|a, b| a.energy_ev.total_cmp(&b.energy_ev));
-        assert_eq!(sammy_theory.len(), data.len(), "unexpected theory-point count for {suffix}");
+        assert_eq!(
+            sammy_theory.len(),
+            data.len(),
+            "unexpected theory-point count for {suffix}"
+        );
         let sammy_theory_vals: Vec<f64> = sammy_theory.into_iter().map(|p| p.theory).collect();
         let sammy_naive = compute_chi_squared(&sammy_theory_vals, &data, &uncertainties);
 

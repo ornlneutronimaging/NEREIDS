@@ -23,3 +23,8 @@ pub const EV_TO_JOULE: f64 = 1.602_176_634e-19;
 /// Derived from E = (`m_n` / 2) * (L / t)^2 with unit conversions:
 /// FACTOR = `m_n` [kg] * 10^12 / (2 * e [C]) ≈ 5227.04.
 pub const TOF_TO_ENERGY_FACTOR: f64 = 5_227.037_589_040_3;
+
+/// SAMMY `SM2` constant in units of us*sqrt(eV)/m.
+///
+/// Used in time-of-flight conversions: `t_us = SM2 * L_m / sqrt(E_eV)`.
+pub const SAMMY_SM2_US_SQRT_EV_PER_M: f64 = 72.298_252_179_105_06;

@@ -130,7 +130,8 @@ mod tests {
 
     #[test]
     fn test_gaussian_constant_signal_preserved() {
-        let energy = EnergyGrid::new((0..201).map(|i| 5.0 + i as f64 * 0.05).collect()).unwrap();
+        let energy =
+            EnergyGrid::new((0..201).map(|i| 5.0 + f64::from(i) * 0.05).collect()).unwrap();
         let spectrum = vec![7.5; energy.len()];
         let r = GaussianResolution { sigma: 0.2 };
         let out = r.convolve(&energy, &spectrum).unwrap();
@@ -141,7 +142,8 @@ mod tests {
 
     #[test]
     fn test_gaussian_spreads_peak() {
-        let energy = EnergyGrid::new((0..401).map(|i| 9.0 + i as f64 * 0.005).collect()).unwrap();
+        let energy =
+            EnergyGrid::new((0..401).map(|i| 9.0 + f64::from(i) * 0.005).collect()).unwrap();
         let mut spectrum = vec![0.0; energy.len()];
         let mid = spectrum.len() / 2;
         spectrum[mid] = 1000.0;

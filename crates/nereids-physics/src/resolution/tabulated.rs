@@ -38,27 +38,6 @@ fn validate_sorted_finite(values: &[f64], name: &str) -> Result<(), PhysicsError
     Ok(())
 }
 
-fn interpolate_clamped(energies: &[f64], values: &[f64], x: f64) -> f64 {
-    let n = energies.len();
-    let idx = energies.partition_point(|&e| e < x);
-    if idx == 0 {
-        values[0]
-    } else if idx >= n {
-        values[n - 1]
-    } else {
-        let e0 = energies[idx - 1];
-        let e1 = energies[idx];
-        let y0 = values[idx - 1];
-        let y1 = values[idx];
-        if e1 == e0 {
-            y1
-        } else {
-            let t = (x - e0) / (e1 - e0);
-            y0 + t * (y1 - y0)
-        }
-    }
-}
-
 impl ResolutionFunction for TabulatedResolution {
     fn convolve(&self, energy: &EnergyGrid, spectrum: &[f64]) -> Result<Vec<f64>, PhysicsError> {
         let energies = &energy.values;
@@ -98,6 +77,26 @@ impl ResolutionFunction for TabulatedResolution {
 
         let emin = energies[0];
         let emax = energies[energies.len() - 1];
+        let sample_on_grid = |x: f64| {
+            let n = energies.len();
+            let idx = energies.partition_point(|&e| e < x);
+            if idx == 0 {
+                spectrum[0]
+            } else if idx >= n {
+                spectrum[n - 1]
+            } else {
+                let e0 = energies[idx - 1];
+                let e1 = energies[idx];
+                let y0 = spectrum[idx - 1];
+                let y1 = spectrum[idx];
+                if e1 == e0 {
+                    y1
+                } else {
+                    let t = (x - e0) / (e1 - e0);
+                    y0 + t * (y1 - y0)
+                }
+            }
+        };
         let mut convolved = Vec::with_capacity(energies.len());
         for (i, &e_center) in energies.iter().enumerate() {
             let mut weighted = 0.0;
@@ -127,8 +126,8 @@ impl ResolutionFunction for TabulatedResolution {
                 let t1 = (oc1 - o0) / dx;
                 let k0 = w0 + t0 * (w1 - w0);
                 let k1 = w0 + t1 * (w1 - w0);
-                let s0 = interpolate_clamped(energies, spectrum, clip_start);
-                let s1 = interpolate_clamped(energies, spectrum, clip_end);
+                let s0 = sample_on_grid(clip_start);
+                let s1 = sample_on_grid(clip_end);
                 let dx_eff = oc1 - oc0;
 
                 weighted += 0.5 * dx_eff * (k0 * s0 + k1 * s1);
@@ -152,7 +151,8 @@ mod tests {
 
     #[test]
     fn test_tabulated_constant_signal_preserved() {
-        let energy = EnergyGrid::new((0..201).map(|i| 1.0 + i as f64 * 0.05).collect()).unwrap();
+        let energy =
+            EnergyGrid::new((0..201).map(|i| 1.0 + f64::from(i) * 0.05).collect()).unwrap();
         let spectrum = vec![3.5; energy.len()];
         let res = TabulatedResolution {
             offsets_ev: vec![-0.2, 0.0, 0.2],
@@ -166,7 +166,8 @@ mod tests {
 
     #[test]
     fn test_tabulated_spreads_peak() {
-        let energy = EnergyGrid::new((0..2001).map(|i| 9.0 + i as f64 * 0.001).collect()).unwrap();
+        let energy =
+            EnergyGrid::new((0..2001).map(|i| 9.0 + f64::from(i) * 0.001).collect()).unwrap();
         let mut spectrum = vec![0.0; energy.len()];
         let mid = spectrum.len() / 2;
         spectrum[mid] = 100.0;

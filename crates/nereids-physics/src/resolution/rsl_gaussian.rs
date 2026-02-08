@@ -3,9 +3,10 @@
 //! This models the legacy DELTAL/DELTAG/DELTTT pathway where the broadening
 //! width depends on energy through flight-path and timing terms.
 
-use nereids_core::{EnergyGrid, PhysicsError, ResolutionFunction};
+use nereids_core::{
+    EnergyGrid, PhysicsError, ResolutionFunction, SAMMY_SM2_US_SQRT_EV_PER_M as SM2,
+};
 
-const SM2: f64 = 72.298_252_179_105_06;
 const GAUSSIAN_CUTOFF_SIGMAS: f64 = 5.0;
 const MIN_NORMALIZATION: f64 = 1e-300;
 
@@ -181,7 +182,8 @@ mod tests {
 
     #[test]
     fn test_rsl_gaussian_constant_signal_preserved() {
-        let energy = EnergyGrid::new((0..301).map(|i| 315.0 + i as f64 * 0.05).collect()).unwrap();
+        let energy =
+            EnergyGrid::new((0..301).map(|i| 315.0 + f64::from(i) * 0.05).collect()).unwrap();
         let spectrum = vec![7.5; energy.len()];
         let r = RslGaussianResolution {
             flight_path_m: 18.9,
