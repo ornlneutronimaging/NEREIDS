@@ -33,6 +33,8 @@
 use nereids_core::constants::BOLTZMANN_EV_PER_K;
 use nereids_core::PhysicsError;
 
+use super::fgm_weights::fgm_weighted_sum;
+
 /// Number of Doppler widths for kernel truncation.
 ///
 /// At ±5Δ, the Gaussian kernel is exp(-25) ≈ 1.4e-11.
@@ -55,16 +57,251 @@ const AUX_SMOOTHING_PASSES: usize = 6;
 /// SAMMY reports this condition as "fewer than 9 points across width."
 const MIN_POINTS_ACROSS_WIDTH: usize = 9;
 
-/// Default tail points in units of Γ around each refined resonance.
-///
-/// Mirrors SAMMY's default tail enrichment around narrow resonances.
-const RESONANCE_TAIL_MULTIPLIERS: [f64; 6] = [1.5, 2.0, 3.0, 4.0, 5.0, 6.0];
+/// Number of tail-width multiples on each side for SAMMY `Fgpwid` defaults.
+const EXTRA_TAIL_POINTS: usize = 5;
 
 /// Small floor for effective resonance width to keep refinement stable.
 const MIN_REFINEMENT_WIDTH_EV: f64 = 1.0e-12;
 
 /// Neutron mass in amu (SAMMY Kvendf=1 convention).
 const NEUTRON_MASS_AMU: f64 = 1.008_664_915_6;
+
+/// SAMMY `Pointr`: index of largest `a[i] < b` in an ascending grid.
+fn pointr(a: &[f64], b: f64) -> isize {
+    if a.is_empty() {
+        return -1;
+    }
+    if b < a[0] {
+        return -1;
+    }
+    if b > a[a.len() - 1] {
+        return a.len() as isize;
+    }
+    let idx = a.partition_point(|&x| x < b);
+    idx as isize - 1
+}
+
+/// SAMMY `Fgpwid` resonance-centered refinement points.
+fn fgpwid_points(center: f64, width: f64) -> Vec<f64> {
+    // SAMMY defaults from InputInfoData: iptdop=9 (odd), iptwid=5.
+    let iptdop = MIN_POINTS_ACROSS_WIDTH;
+    let iptwid = EXTRA_TAIL_POINTS;
+    let eg = 2.0 * width / ((iptdop - 1) as f64);
+    let s = center - width - eg;
+
+    let mut sadd = Vec::with_capacity(iptdop + 2 + 2 * iptwid);
+
+    // -(iptwid+1)Γ ... -2Γ
+    for nk in (1..=iptwid).rev() {
+        sadd.push(center - ((nk + 1) as f64) * width);
+    }
+
+    // -1.5Γ, then -Γ
+    if let Some(&last) = sadd.last() {
+        sadd.push(last + 0.5 * width);
+    }
+    sadd.push(s + eg);
+
+    // (iptdop-1) points from -Γ to +Γ with step eg.
+    for _ in 2..=iptdop {
+        let next = sadd[sadd.len() - 1] + eg;
+        sadd.push(next);
+    }
+
+    // +1.5Γ and +2Γ
+    let next = sadd[sadd.len() - 1] + 0.5 * width;
+    sadd.push(next);
+    let next = sadd[sadd.len() - 1] + 0.5 * width;
+    sadd.push(next);
+
+    // +3Γ ... +(iptwid+1)Γ
+    if iptwid > 1 {
+        let mut nk = 1;
+        loop {
+            nk += 1;
+            let next = sadd[sadd.len() - 1] + width;
+            sadd.push(next);
+            if nk >= iptwid {
+                break;
+            }
+        }
+    }
+
+    sadd
+}
+
+/// SAMMY `Qmerge`: merge dense resonance points into a base monotonic grid.
+fn qmerge(base: &[f64], dense: &[f64], tol: f64) -> Vec<f64> {
+    if base.is_empty() || dense.is_empty() {
+        return base.to_vec();
+    }
+
+    // Keep only dense points that lie within base bounds.
+    let mut ibs = 0usize;
+    while ibs < dense.len() && dense[ibs] <= base[0] {
+        ibs += 1;
+    }
+    let mut ibe = dense.len();
+    while ibe > ibs && dense[ibe - 1] > base[base.len() - 1] {
+        ibe -= 1;
+    }
+    if ibs >= ibe {
+        return base.to_vec();
+    }
+
+    let ja = pointr(base, dense[ibs]);
+    if ja < 0 {
+        return base.to_vec();
+    }
+    let mut ka = (ja as usize) + 1;
+    if ka >= base.len() {
+        return base.to_vec();
+    }
+
+    let mut kb = ibs;
+    let mut out = Vec::with_capacity(base.len() + (ibe - ibs) + 4);
+    out.extend_from_slice(&base[..=ja as usize]);
+
+    // Equivalent to Fortran label 170 path.
+    if (base[ka - 1] - dense[kb]).abs() > tol {
+        let d1 = dense[kb] - out[out.len() - 1];
+        let d2 = base[ka] - dense[kb];
+        if d1 >= d2 || out.len() <= 2 {
+            out.push(out[out.len() - 1] + 0.75 * d1);
+        } else {
+            let tmp = out[out.len() - 1];
+            let d3 = tmp - out[out.len() - 2];
+            let last_idx = out.len() - 1;
+            out[last_idx] = tmp - 0.25 * d3;
+            out.push(tmp);
+        }
+    } else {
+        kb += 1;
+        if kb >= ibe {
+            // Dense points exhausted; append rest of base.
+            out.extend_from_slice(&base[ka..]);
+            return out;
+        }
+    }
+
+    loop {
+        // Fortran label 70.
+        if base[ka] > dense[kb] {
+            // Fortran label 150: candidate dense point.
+            if (dense[kb] - base[ka]).abs() <= tol {
+                kb += 1;
+                if kb >= ibe {
+                    break;
+                }
+                continue;
+            }
+            out.push(dense[kb]);
+            kb += 1;
+            if kb >= ibe {
+                break;
+            }
+            continue;
+        }
+
+        // Copy base point.
+        out.push(base[ka]);
+        ka += 1;
+        if kb < ibe && (dense[kb] - base[ka - 1]).abs() <= tol {
+            kb += 1;
+            if kb >= ibe {
+                break;
+            }
+        }
+        if ka >= base.len() {
+            return out;
+        }
+    }
+
+    // Fortran label 100: append remaining base with one transition point.
+    if ka >= base.len() {
+        return out;
+    }
+    if ka == base.len() - 1 {
+        out.push(base[ka]);
+        return out;
+    }
+
+    let d1 = out[out.len() - 1] - out[out.len() - 2];
+    let d2 = base[ka] - out[out.len() - 1];
+    if d1 <= d2 {
+        out.push(out[out.len() - 1] + 0.25 * d2);
+    } else {
+        out.push(base[ka]);
+        ka += 1;
+        if ka >= base.len() {
+            return out;
+        }
+        let d1n = base[ka] - out[out.len() - 1];
+        out.push(out[out.len() - 1] + 0.25 * d1n);
+    }
+    out.extend_from_slice(&base[ka..]);
+    out
+}
+
+/// Mirror SAMMY `DopplerAndResolutionBroadener::calcIntegralSpan` (oneExtra=true).
+fn calc_integral_span(
+    energies: &[f64],
+    mut integral_start: usize,
+    integral_pts: usize,
+    elow: f64,
+    ehigh: f64,
+) -> (usize, usize) {
+    let nener = energies.len();
+    if nener == 0 {
+        return (0, 0);
+    }
+
+    let mut ihigh = integral_start.saturating_add(integral_pts);
+    if ihigh >= nener {
+        ihigh = nener - 1;
+    }
+    if energies[ihigh] > ehigh {
+        ihigh = 0;
+    }
+
+    if integral_start >= nener {
+        integral_start = nener - 1;
+    }
+
+    // Assume ascending energies.
+    while energies[integral_start] > elow && integral_start > 0 {
+        integral_start -= 1;
+    }
+
+    let mut ee = energies[integral_start];
+    for (i, &e) in energies.iter().enumerate().skip(integral_start) {
+        if e > elow {
+            break;
+        }
+        integral_start = i;
+        ee = e;
+    }
+
+    // oneExtra=true path
+    if integral_start > 0 {
+        integral_start -= 1;
+    } else if ee == elow && integral_start > 0 {
+        integral_start -= 1;
+    }
+
+    let mut pts = 1usize;
+    for i in integral_start..(nener - 1) {
+        pts += 1;
+        if i < ihigh {
+            continue;
+        }
+        if energies[i] >= ehigh {
+            break;
+        }
+    }
+
+    (integral_start, pts)
+}
 
 /// Build extra points between two grid locations using a SAMMY-style
 /// geometric-halving transition.
@@ -253,6 +490,8 @@ pub fn broaden_cross_sections_to_grid(
 
     let mut broadened = Vec::with_capacity(n_tgt);
     let mut total_segments: usize = 0;
+    let mut integral_start: usize = 0;
+    let mut integral_pts: usize = 0;
 
     for &e_tgt in target_energies {
         let v_i = if e_tgt < 0.0 {
@@ -260,37 +499,43 @@ pub fn broaden_cross_sections_to_grid(
         } else {
             e_tgt.sqrt()
         };
-        let v_min = v_i - KERNEL_CUTOFF * ddo;
-        let v_max = v_i + KERNEL_CUTOFF * ddo;
+        let mut v_low = v_i - KERNEL_CUTOFF * ddo;
+        let mut v_up = v_i + KERNEL_CUTOFF * ddo;
+        if v_low < source_velocities[0] {
+            v_low = source_velocities[0];
+        }
+        if v_up > source_velocities[n_src - 1] {
+            v_up = source_velocities[n_src - 1];
+        }
 
-        // Binary search for grid points within the kernel window in sqrt(E) space
-        let j_start = source_velocities.partition_point(|&v| v < v_min);
-        let j_end = source_velocities.partition_point(|&v| v <= v_max);
+        let mut e_low = v_low * v_low;
+        if v_low < 0.0 {
+            e_low = -e_low;
+        }
+        let mut e_high = v_up * v_up;
+        if v_up < 0.0 {
+            e_high = -e_high;
+        }
 
-        // Include one extra point on each side for trapezoidal coverage
-        let j_lo = j_start.saturating_sub(1);
-        let j_hi = j_end.min(n_src - 1);
+        let (j_lo, ipnts) =
+            calc_integral_span(source_energies, integral_start, integral_pts, e_low, e_high);
+        integral_start = j_lo;
+        integral_pts = ipnts;
+        let j_hi = j_lo + ipnts.saturating_sub(1);
 
-        if (j_hi - j_lo + 1) <= 2 {
+        if ipnts <= 2 || j_hi >= n_src {
             // Not enough points for stable broadening (SAMMY requires >2 points)
             let val = interpolate_to_grid(source_energies, xs_0k_source, &[e_tgt])?[0];
             broadened.push(val);
             continue;
         }
-        total_segments = total_segments.saturating_add(j_hi - j_lo);
+        total_segments = total_segments.saturating_add(ipnts - 1);
         if total_segments > MAX_BROADENING_SEGMENTS {
             return Err(PhysicsError::InvalidParameter(format!(
                 "broadening workload too large for direct trapezoidal convolution (>{MAX_BROADENING_SEGMENTS} segments); reduce auxiliary-grid density"
             )));
         }
 
-        // Trapezoidal integration with normalized kernel.
-        //
-        // SAMMY free-gas broadening evaluates the convolution in velocity
-        // space and carries a Jacobian factor equivalent to E'/E in the
-        // final expression (see mfgm2/mfgm4 path).
-        let mut sum_weighted = 0.0;
-        let mut sum_kernel = 0.0;
         let e_i_abs = e_tgt.abs();
 
         if e_i_abs <= f64::EPSILON {
@@ -299,34 +544,38 @@ pub fn broaden_cross_sections_to_grid(
             continue;
         }
 
+        if let Some(sum) = fgm_weighted_sum(&source_velocities, xs_0k_source, j_lo, ipnts, v_i, ddo)
+        {
+            // Match SAMMY Xdofgm post-processing: divide weighted sum by |E|.
+            broadened.push(sum / e_i_abs);
+            continue;
+        }
+
+        // Fallback: normalized Gaussian trapezoid if weight generation fails.
+        let mut sum_weighted = 0.0;
+        let mut sum_kernel = 0.0;
         for j in (j_lo + 1)..=j_hi {
             let h = source_velocities[j] - source_velocities[j - 1];
             if h <= 0.0 {
                 continue;
             }
-
             let diff_prev = v_i - source_velocities[j - 1];
             let diff_curr = v_i - source_velocities[j];
-
             let g_prev = (-diff_prev * diff_prev * inv_ddo_sq).exp();
             let g_curr = (-diff_curr * diff_curr * inv_ddo_sq).exp();
-
             let e_prev_abs = source_energies[j - 1].abs();
             let e_curr_abs = source_energies[j].abs();
-
             sum_weighted += 0.5
                 * h
                 * (g_prev * e_prev_abs * xs_0k_source[j - 1]
                     + g_curr * e_curr_abs * xs_0k_source[j]);
             sum_kernel += 0.5 * h * (g_prev + g_curr);
         }
-
-        let val = if sum_kernel > 1e-100 {
+        broadened.push(if sum_kernel > 1e-100 {
             (sum_weighted / sum_kernel) / e_i_abs
         } else {
             interpolate_to_grid(source_energies, xs_0k_source, &[e_tgt])?[0]
-        };
-        broadened.push(val);
+        });
     }
 
     Ok(broadened)
@@ -447,8 +696,9 @@ pub fn create_auxiliary_grid(
     }
 
     let mut grid: Vec<f64> = data_energies.to_vec();
-    let data_min = data_energies.iter().copied().reduce(f64::min);
-    let data_max = data_energies.iter().copied().reduce(f64::max);
+    // Use sorted unique view while building resonance-centered refinements.
+    grid.sort_unstable_by(f64::total_cmp);
+    grid.dedup_by(|a, b| (*a - *b).abs() < 1e-10);
 
     for (&e_res, &gamma) in resonance_energies.iter().zip(resonance_widths.iter()) {
         if !e_res.is_finite() || !gamma.is_finite() {
@@ -466,29 +716,28 @@ pub fn create_auxiliary_grid(
         }
 
         let width = gamma.max(MIN_REFINEMENT_WIDTH_EV);
-        let e_lo = e_res - width;
-        let e_hi = e_res + width;
-
-        let points_across_width = grid.iter().filter(|&&e| e >= e_lo && e <= e_hi).count();
-        if points_across_width < MIN_POINTS_ACROSS_WIDTH {
-            let spacing = (2.0 * width) / ((MIN_POINTS_ACROSS_WIDTH - 1) as f64);
-            for k in 0..MIN_POINTS_ACROSS_WIDTH {
-                let e = e_lo + k as f64 * spacing;
-                if data_min.is_none_or(|mn| e >= mn) && data_max.is_none_or(|mx| e <= mx) {
-                    grid.push(e);
-                }
-            }
+        if grid.is_empty() {
+            continue;
         }
 
-        for mult in RESONANCE_TAIL_MULTIPLIERS {
-            let e_left = e_res - mult * width;
-            let e_right = e_res + mult * width;
-            if data_min.is_none_or(|mn| e_left >= mn) && data_max.is_none_or(|mx| e_left <= mx) {
-                grid.push(e_left);
-            }
-            if data_min.is_none_or(|mn| e_right >= mn) && data_max.is_none_or(|mx| e_right <= mx) {
-                grid.push(e_right);
-            }
+        // SAMMY Weeres criterion: if there are not enough points in [E-Γ, E+Γ],
+        // generate Fgpwid points and merge with transition points (Qmerge).
+        let e_lo = e_res - width;
+        let e_hi = e_res + width;
+        let needs_refine = if grid[0] <= e_lo {
+            let k = pointr(&grid, e_lo);
+            let k = if k < 0 { 0usize } else { k as usize };
+            let k_check = k + MIN_POINTS_ACROSS_WIDTH + 1;
+            !(k_check < grid.len() && grid[k_check] <= e_hi)
+        } else {
+            true
+        };
+
+        if needs_refine {
+            let dense = fgpwid_points(e_res, width);
+            let eg = 2.0 * width / ((MIN_POINTS_ACROSS_WIDTH - 1) as f64);
+            let merged = qmerge(&grid, &dense, eg * 0.2);
+            grid = merged;
         }
 
         if grid.len() > MAX_AUX_GRID_POINTS {
