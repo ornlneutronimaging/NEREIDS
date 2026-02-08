@@ -691,9 +691,9 @@ fn test_ex007_fitted_parameters_replay_sammy_chi_squared() {
     for (suffix, reported_scale_limit) in [
         ("awl", 4.0_f64),
         ("awn", 4.0_f64),
-        // Tantalum + lithium path still uses a simplified convolution fallback;
-        // keep this replay check coarse until a full morr4::Tantal parity port lands.
-        ("atl", 7.0_f64),
+        // Tantalum + lithium path should now stay within a reasonably tight
+        // scale of SAMMY reported chi² for this fixture.
+        ("atl", 2.0_f64),
         ("atn", 4.0_f64),
     ] {
         let (par_path, lpt_path) = ex007_variant_paths(&base, suffix);
@@ -747,7 +747,7 @@ fn test_ex007_fitted_parameters_match_sammy_theory_table() {
     for (suffix, mae_limit) in [
         ("awl", 0.15_f64),
         ("awn", 0.25_f64),
-        ("atl", 0.25_f64),
+        ("atl", 0.15_f64),
         ("atn", 0.25_f64),
     ] {
         let (par_path, lpt_path) = ex007_variant_paths(&base, suffix);

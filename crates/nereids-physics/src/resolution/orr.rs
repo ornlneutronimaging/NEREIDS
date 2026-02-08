@@ -799,11 +799,20 @@ impl OrrResolution {
         if t_us > tmax {
             return 0.0;
         }
-        let idx = piecewise
-            .tsubm_us
-            .as_slice()
-            .partition_point(|&x| x < t_us)
-            .min(piecewise.numtim.saturating_sub(1));
+        let idx = if p.detector_mode == DetectorMode::LithiumGlass {
+            piecewise
+                .tsubm_us
+                .as_slice()
+                .partition_point(|&x| x <= t_us)
+                .saturating_sub(1)
+                .min(piecewise.numtim.saturating_sub(1))
+        } else {
+            piecewise
+                .tsubm_us
+                .as_slice()
+                .partition_point(|&x| x < t_us)
+                .min(piecewise.numtim.saturating_sub(1))
+        };
         let row = piecewise.hhh[idx];
         row[0] * (-p.f_us_inv * t_us).exp() + row[1] * t_us * t_us + row[2] * t_us + row[3]
     }
