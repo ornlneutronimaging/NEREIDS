@@ -27,7 +27,12 @@ fn parse_par_first_five_fields_fixed_width(line: &str) -> Option<[f64; 5]> {
             let end = start + 11;
             let field = line.get(start..end).unwrap_or("").trim();
             if field.is_empty() {
-                // Some SAMMY PAR variants leave optional width columns blank.
+                if i < 3 {
+                    // E_r, gamma_g, and gamma_n are required fields.
+                    ok = false;
+                    break;
+                }
+                // Some SAMMY PAR variants leave optional fission-width columns blank.
                 *slot = 0.0;
                 continue;
             }
@@ -245,6 +250,25 @@ mod tests {
             "1.00191245 .09055000 0.        0.        0.        0.        1 1 0 0 0 0\n",
         );
         fs::write(&path, contents).unwrap();
+
+        let resonances = parse_par_file(&path).unwrap();
+        assert_eq!(resonances.len(), 1);
+        assert!((resonances[0].energy.value - 0.25).abs() < 1e-12);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_parse_ignores_fixed_width_control_rows_with_blank_gamma_columns() {
+        let path = unique_temp_path("fixed_width_controls.par");
+        let resonance = format!(
+            "{:>11}{:>11}{:>11}{:>11}{:>11}{:>11}\n",
+            "2.5E-1", "1.0", "0.5", "0.5", "0.5", "1"
+        );
+        // Matches the ex007 control-row shape: fixed-width line with blank
+        // gamma columns and a single numeric uncertainty term later in the row.
+        let control = "-5.9951E+04                             0.05                       0 0 1\n";
+        fs::write(&path, format!("{resonance}{control}")).unwrap();
 
         let resonances = parse_par_file(&path).unwrap();
         assert_eq!(resonances.len(), 1);
