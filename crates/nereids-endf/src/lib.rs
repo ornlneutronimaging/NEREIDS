@@ -2,11 +2,10 @@
 //!
 //! ENDF file retrieval, local caching, and resonance parameter parsing.
 //!
-//! This crate handles:
-//! - Downloading ENDF files from IAEA (HTTP/FTP)
-//! - Local file caching for offline use
-//! - Parsing ENDF-6 File 2 (resonance parameters)
-//! - Extracting resolved resonance region (RRR) data
+//! ## Modules
+//! - [`retrieval`] — Download ENDF files from IAEA, with local caching
+//! - [`parser`] — Parse ENDF-6 File 2 (resonance parameters)
+//! - [`resonance`] — Data structures for resonance parameters
 //!
 //! ## SAMMY Reference
 //! - SAMMY manual Section 9 (ENDF-6 format)
@@ -14,3 +13,7 @@
 //!
 //! ## PLEIADES Reference
 //! - `pleiades/nuclear/manager.py` for URL patterns and caching strategy
+
+pub mod parser;
+pub mod resonance;
+pub mod retrieval;

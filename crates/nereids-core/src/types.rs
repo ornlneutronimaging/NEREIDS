@@ -1,7 +1,7 @@
 //! Core domain types for neutron resonance imaging.
 
 /// Identifies an isotope by atomic number Z and mass number A.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Isotope {
     /// Atomic number (number of protons).
     pub z: u32,

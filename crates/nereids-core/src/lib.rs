@@ -5,5 +5,6 @@
 //! foundation for all other NEREIDS crates.
 
 pub mod constants;
+pub mod elements;
 pub mod error;
 pub mod types;
