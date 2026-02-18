@@ -1,0 +1,11 @@
+[package]
+name = "nereids-fitting"
+description = "Optimization engine for resonance fitting (LM, Poisson/BFGS)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nereids-core = { workspace = true }
+nereids-physics = { workspace = true }
+ndarray = { workspace = true }

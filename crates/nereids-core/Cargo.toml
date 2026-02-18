@@ -1,0 +1,10 @@
+[package]
+name = "nereids-core"
+description = "Core types, constants, and traits for NEREIDS neutron resonance imaging"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+ndarray = { workspace = true }

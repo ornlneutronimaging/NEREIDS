@@ -1,0 +1,37 @@
+[project]
+name = "nereids"
+version = "0.1.0"
+description = "Neutron Resonance Imaging Data Analysis Library"
+requires-python = ">= 3.10"
+license = "BSD-3-Clause"
+
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+manifest-path = "bindings/python/Cargo.toml"
+python-source = "bindings/python/python"
+module-name = "nereids"
+features = ["pyo3/extension-module"]
+
+[tool.pixi.project]
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "linux-64"]
+
+[tool.pixi.dependencies]
+python = ">=3.10"
+pip = "*"
+maturin = ">=1.0"
+numpy = ">=1.24"
+matplotlib = ">=3.7"
+jupyter = ">=1.0"
+
+[tool.pixi.tasks]
+build = "maturin develop --manifest-path bindings/python/Cargo.toml"
+test-rust = "cargo test --workspace"
+test-python = "python -m pytest tests/"
+test = { depends-on = ["test-rust", "test-python"] }
+fmt = "cargo fmt --all"
+clippy = "cargo clippy --workspace -- -D warnings"
+check = { depends-on = ["fmt", "clippy", "test"] }

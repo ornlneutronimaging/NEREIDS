@@ -1,0 +1,14 @@
+[package]
+name = "nereids-gui"
+description = "egui desktop application for NEREIDS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "nereids-gui"
+path = "src/main.rs"
+
+[dependencies]
+nereids-core = { workspace = true }
+nereids-pipeline = { workspace = true }

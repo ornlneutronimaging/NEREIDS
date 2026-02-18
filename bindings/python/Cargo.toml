@@ -1,0 +1,14 @@
+[package]
+name = "nereids-python"
+description = "PyO3 Python bindings for NEREIDS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "nereids"
+crate-type = ["cdylib"]
+
+[dependencies]
+nereids-core = { workspace = true }
+nereids-pipeline = { workspace = true }

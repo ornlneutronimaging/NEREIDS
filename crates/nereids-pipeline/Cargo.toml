@@ -1,0 +1,15 @@
+[package]
+name = "nereids-pipeline"
+description = "End-to-end orchestration and spatial mapping pipeline"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nereids-core = { workspace = true }
+nereids-endf = { workspace = true }
+nereids-physics = { workspace = true }
+nereids-io = { workspace = true }
+nereids-fitting = { workspace = true }
+ndarray = { workspace = true }
+rayon = { workspace = true }

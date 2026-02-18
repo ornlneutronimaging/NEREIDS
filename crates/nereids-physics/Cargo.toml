@@ -1,0 +1,12 @@
+[package]
+name = "nereids-physics"
+description = "Cross-section calculation, broadening, and transmission forward model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nereids-core = { workspace = true }
+nereids-endf = { workspace = true }
+ndarray = { workspace = true }
+num-complex = { workspace = true }

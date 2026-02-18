@@ -1,0 +1,12 @@
+[package]
+name = "nereids-endf"
+description = "ENDF file retrieval, caching, and resonance parameter parsing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nereids-core = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
