@@ -15,8 +15,16 @@ pub fn fitting_panel(ui: &mut egui::Ui, state: &mut AppState) {
         egui::ComboBox::from_id_salt("endf_lib")
             .selected_text(library_name(state.endf_library))
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut state.endf_library, EndfLibrary::EndfB8_0, "ENDF/B-VIII.0");
-                ui.selectable_value(&mut state.endf_library, EndfLibrary::EndfB8_1, "ENDF/B-VIII.1");
+                ui.selectable_value(
+                    &mut state.endf_library,
+                    EndfLibrary::EndfB8_0,
+                    "ENDF/B-VIII.0",
+                );
+                ui.selectable_value(
+                    &mut state.endf_library,
+                    EndfLibrary::EndfB8_1,
+                    "ENDF/B-VIII.1",
+                );
                 ui.selectable_value(&mut state.endf_library, EndfLibrary::Jeff3_3, "JEFF-3.3");
                 ui.selectable_value(&mut state.endf_library, EndfLibrary::Jendl5, "JENDL-5");
             });
@@ -45,10 +53,18 @@ pub fn fitting_panel(ui: &mut egui::Ui, state: &mut AppState) {
             ui.checkbox(&mut entry.enabled, "");
 
             let z_changed = ui
-                .add(egui::DragValue::new(&mut entry.z).prefix("Z=").range(1..=118))
+                .add(
+                    egui::DragValue::new(&mut entry.z)
+                        .prefix("Z=")
+                        .range(1..=118),
+                )
                 .changed();
             let a_changed = ui
-                .add(egui::DragValue::new(&mut entry.a).prefix("A=").range(1..=300))
+                .add(
+                    egui::DragValue::new(&mut entry.a)
+                        .prefix("A=")
+                        .range(1..=300),
+                )
                 .changed();
 
             if z_changed || a_changed {
@@ -98,7 +114,11 @@ pub fn fitting_panel(ui: &mut egui::Ui, state: &mut AppState) {
     ui.heading("Fit Parameters");
     ui.horizontal(|ui| {
         ui.label("Temperature (K):");
-        ui.add(egui::DragValue::new(&mut state.temperature_k).range(0.0..=3000.0).speed(1.0));
+        ui.add(
+            egui::DragValue::new(&mut state.temperature_k)
+                .range(0.0..=3000.0)
+                .speed(1.0),
+        );
     });
     ui.horizontal(|ui| {
         ui.label("Max iter:");
@@ -126,16 +146,32 @@ pub fn fitting_panel(ui: &mut egui::Ui, state: &mut AppState) {
             .horizontal(|ui| {
                 let mut changed = false;
                 changed |= ui
-                    .add(egui::DragValue::new(&mut roi.y_start).prefix("y0=").range(0..=height))
+                    .add(
+                        egui::DragValue::new(&mut roi.y_start)
+                            .prefix("y0=")
+                            .range(0..=height),
+                    )
                     .changed();
                 changed |= ui
-                    .add(egui::DragValue::new(&mut roi.y_end).prefix("y1=").range(0..=height))
+                    .add(
+                        egui::DragValue::new(&mut roi.y_end)
+                            .prefix("y1=")
+                            .range(0..=height),
+                    )
                     .changed();
                 changed |= ui
-                    .add(egui::DragValue::new(&mut roi.x_start).prefix("x0=").range(0..=width))
+                    .add(
+                        egui::DragValue::new(&mut roi.x_start)
+                            .prefix("x0=")
+                            .range(0..=width),
+                    )
                     .changed();
                 changed |= ui
-                    .add(egui::DragValue::new(&mut roi.x_end).prefix("x1=").range(0..=width))
+                    .add(
+                        egui::DragValue::new(&mut roi.x_end)
+                            .prefix("x1=")
+                            .range(0..=width),
+                    )
                     .changed();
                 changed
             })
@@ -154,7 +190,10 @@ pub fn fitting_panel(ui: &mut egui::Ui, state: &mut AppState) {
 
     let ready = state.normalized.is_some()
         && state.energies.is_some()
-        && state.isotope_entries.iter().any(|e| e.enabled && e.resonance_data.is_some());
+        && state
+            .isotope_entries
+            .iter()
+            .any(|e| e.enabled && e.resonance_data.is_some());
 
     ui.add_enabled_ui(ready && !state.is_fitting, |ui| {
         if ui.button("Fit Selected Pixel").clicked() {
@@ -197,8 +236,10 @@ fn fetch_endf_data(state: &mut AppState) {
             let mat = match retrieval::mat_number(&isotope) {
                 Some(m) => m,
                 None => {
-                    state.status_message =
-                        format!("No MAT number for {} — isotope not in database", entry.symbol);
+                    state.status_message = format!(
+                        "No MAT number for {} — isotope not in database",
+                        entry.symbol
+                    );
                     continue;
                 }
             };
@@ -278,7 +319,9 @@ fn fit_pixel(state: &mut AppState) {
     };
 
     let n_energies = norm.transmission.shape()[0];
-    let t_spectrum: Vec<f64> = (0..n_energies).map(|e| norm.transmission[[e, y, x]]).collect();
+    let t_spectrum: Vec<f64> = (0..n_energies)
+        .map(|e| norm.transmission[[e, y, x]])
+        .collect();
     let sigma: Vec<f64> = (0..n_energies)
         .map(|e| norm.uncertainty[[e, y, x]].max(1e-10))
         .collect();
@@ -286,7 +329,10 @@ fn fit_pixel(state: &mut AppState) {
     let result = nereids_pipeline::pipeline::fit_spectrum(&t_spectrum, &sigma, &config);
 
     state.status_message = if result.converged {
-        format!("Pixel ({},{}) fit converged, chi2_r = {:.4}", y, x, result.reduced_chi_squared)
+        format!(
+            "Pixel ({},{}) fit converged, chi2_r = {:.4}",
+            y, x, result.reduced_chi_squared
+        )
     } else {
         format!("Pixel ({},{}) fit did NOT converge", y, x)
     };
@@ -317,6 +363,17 @@ fn fit_roi(state: &mut AppState) {
         }
     };
 
+    if roi.y_start >= roi.y_end || roi.x_start >= roi.x_end {
+        state.status_message = "Invalid ROI: start must be less than end".into();
+        return;
+    }
+
+    let shape = norm.transmission.shape();
+    if roi.y_end > shape[1] || roi.x_end > shape[2] {
+        state.status_message = "ROI exceeds image dimensions".into();
+        return;
+    }
+
     let result = nereids_pipeline::spatial::fit_roi(
         &norm.transmission,
         &norm.uncertainty,
@@ -326,7 +383,10 @@ fn fit_roi(state: &mut AppState) {
     );
 
     state.status_message = if result.converged {
-        format!("ROI fit converged, chi2_r = {:.4}", result.reduced_chi_squared)
+        format!(
+            "ROI fit converged, chi2_r = {:.4}",
+            result.reduced_chi_squared
+        )
     } else {
         "ROI fit did NOT converge".into()
     };

@@ -108,9 +108,7 @@ pub fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
 
         use nereids_fitting::lm::FitModel;
         let fitted_t = model.evaluate(&result.densities);
-        let fit_points: PlotPoints = (0..n_plot)
-            .map(|i| [energies[i], fitted_t[i]])
-            .collect();
+        let fit_points: PlotPoints = (0..n_plot).map(|i| [energies[i], fitted_t[i]]).collect();
         Some(Line::new("Fit", fit_points).width(2.0))
     });
 

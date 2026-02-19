@@ -482,13 +482,13 @@ mod tests {
         // SAMMY ex001a.lst reference points: (energy, broadened capture σ in barns).
         // Focus on the core region where our grid has good coverage.
         let sammy_ref = [
-            (9.3594, 5.4125807788),   // lower shoulder
-            (9.8572, 238.1729827317), // near peak
-            (9.9869, 285.6111456228), // peak
+            (9.3594, 5.4125807788),    // lower shoulder
+            (9.8572, 238.1729827317),  // near peak
+            (9.9869, 285.6111456228),  // peak
             (10.0092, 285.2175881633), // just past peak
             (10.1282, 241.3304410052), // upper shoulder
-            (10.3430, 91.4783098707), // falling slope
-            (10.5382, 18.3744223751), // upper wing
+            (10.3430, 91.4783098707),  // falling slope
+            (10.5382, 18.3744223751),  // upper wing
         ];
 
         // Interpolate our broadened result onto SAMMY energy points and compare.
@@ -562,9 +562,7 @@ mod tests {
             .map(|i| 0.5 * (xs[i] + xs[i + 1]) * (energies[i + 1] - energies[i]))
             .sum();
         let area_broad: f64 = (0..n - 1)
-            .map(|i| {
-                0.5 * (broadened[i] + broadened[i + 1]) * (energies[i + 1] - energies[i])
-            })
+            .map(|i| 0.5 * (broadened[i] + broadened[i + 1]) * (energies[i + 1] - energies[i]))
             .sum();
 
         let rel_diff = (area_orig - area_broad).abs() / area_orig;

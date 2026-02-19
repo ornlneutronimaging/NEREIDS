@@ -106,7 +106,10 @@ pub fn estimate_nuisance(
 
     // Average open-beam over ROI to get flux estimate
     let (y_range, x_range) = roi.unwrap_or_else(|| {
-        (0..open_beam_counts.shape()[1], 0..open_beam_counts.shape()[2])
+        (
+            0..open_beam_counts.shape()[1],
+            0..open_beam_counts.shape()[2],
+        )
     });
 
     let n_pixels = (y_range.end - y_range.start) * (x_range.end - x_range.start);
@@ -123,8 +126,8 @@ pub fn estimate_nuisance(
         }
     }
 
-    for e in 0..n_energies {
-        flux[e] /= n_pix_f;
+    for f in &mut flux {
+        *f /= n_pix_f;
     }
 
     // Estimate background: use the difference between sample and
@@ -132,9 +135,7 @@ pub fn estimate_nuisance(
     // For simplicity, assume background is a small fraction of flux.
     // A more sophisticated approach would fit this, but for now use a
     // conservative estimate of 0 (can be refined later).
-    for e in 0..n_energies {
-        background[e] = 0.0;
-    }
+    background.fill(0.0);
 
     NuisanceParams { flux, background }
 }
@@ -159,13 +160,15 @@ pub fn sparse_reconstruct(
     assert_eq!(n_energies, config.energies.len());
 
     // Build the transmission model (shared across pixels)
-    let instrument = config.resolution.map(|r| InstrumentParams { resolution: r });
+    let instrument = config
+        .resolution
+        .map(|r| InstrumentParams { resolution: r });
 
     // Collect pixel coordinates
     let mut pixel_coords: Vec<(usize, usize)> = Vec::new();
     for y in 0..height {
         for x in 0..width {
-            let is_dead = dead_pixels.map_or(false, |m| m[[y, x]]);
+            let is_dead = dead_pixels.is_some_and(|m| m[[y, x]]);
             if !is_dead {
                 pixel_coords.push((y, x));
             }
@@ -217,12 +220,8 @@ pub fn sparse_reconstruct(
                     .collect(),
             );
 
-            let result = poisson::poisson_fit(
-                &counts_model,
-                &y_obs,
-                &mut params,
-                &config.poisson_config,
-            );
+            let result =
+                poisson::poisson_fit(&counts_model, &y_obs, &mut params, &config.poisson_config);
 
             let pixel_result = PixelResult {
                 densities: (0..n_isotopes).map(|i| result.params[i]).collect(),
@@ -242,8 +241,8 @@ pub fn sparse_reconstruct(
     let mut n_converged = 0;
 
     for ((y, x), result) in &results {
-        for i in 0..n_isotopes {
-            density_maps[i][[*y, *x]] = result.densities[i];
+        for (i, map) in density_maps.iter_mut().enumerate() {
+            map[[*y, *x]] = result.densities[i];
         }
         converged_map[[*y, *x]] = result.converged;
         if result.converged {
@@ -371,7 +370,10 @@ mod tests {
                     assert!(
                         (fitted - true_density).abs() / true_density < 0.2,
                         "Pixel ({},{}) density = {}, expected ~{}",
-                        y, x, fitted, true_density,
+                        y,
+                        x,
+                        fitted,
+                        true_density,
                     );
                 }
             }

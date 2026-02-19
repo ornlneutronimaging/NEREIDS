@@ -119,11 +119,7 @@ fn cross_sections_for_range(
 
     for l_group in &range.l_groups {
         let l = l_group.l;
-        let awr_l = if l_group.awr > 0.0 {
-            l_group.awr
-        } else {
-            awr
-        };
+        let awr_l = if l_group.awr > 0.0 { l_group.awr } else { awr };
 
         // Channel radius: use L-dependent radius if available, else range radius.
         let channel_radius = if l_group.apl > 0.0 {
@@ -170,7 +166,6 @@ fn cross_sections_for_range(
                 }
             }
         }
-
     }
 
     (total, elastic, capture, fission)
@@ -203,6 +198,7 @@ fn cross_sections_for_range(
 ///   σ_capture = σ_total - σ_elastic (unitarity deficit)
 ///
 /// Reference: SAMMY `rml/mrml11.f` Sectio routine
+#[allow(clippy::too_many_arguments)]
 fn reich_moore_spin_group(
     resonances: &[&nereids_endf::resonance::Resonance],
     energy_ev: f64,
@@ -362,6 +358,7 @@ fn reich_moore_spin_group(
 /// eliminated into the imaginary denominator.
 ///
 /// Reference: SAMMY `rml/mrml09.f` Twoch/Three routines
+#[allow(clippy::too_many_arguments)]
 fn reich_moore_with_fission(
     resonances: &[&nereids_endf::resonance::Resonance],
     energy_ev: f64,
@@ -494,12 +491,22 @@ fn reich_moore_with_fission(
         // 3-channel: neutron + two fission channels.
         // Use general complex matrix inversion.
         reich_moore_3channel(
-            resonances, energy_ev, awr, channel_radius, l, g_j, p_l, s_l, phi_l, pi_over_k2,
+            resonances,
+            energy_ev,
+            awr,
+            channel_radius,
+            l,
+            g_j,
+            p_l,
+            s_l,
+            phi_l,
+            pi_over_k2,
         )
     }
 }
 
 /// 3-channel Reich-Moore (neutron + 2 fission channels).
+#[allow(clippy::too_many_arguments)]
 fn reich_moore_3channel(
     resonances: &[&nereids_endf::resonance::Resonance],
     energy_ev: f64,
@@ -735,9 +742,8 @@ mod tests {
     fn test_1_over_v_behavior() {
         // Far from resonances, capture cross-section should follow 1/v ∝ 1/√E.
         // The 6.674 eV resonance tail should dominate at low energies.
-        let data = make_single_resonance_data(
-            6.674, 1.493e-3, 23.0e-3, 0.5, 0, 236.006, 0.0, 9.4285,
-        );
+        let data =
+            make_single_resonance_data(6.674, 1.493e-3, 23.0e-3, 0.5, 0, 236.006, 0.0, 9.4285);
 
         let xs_01 = cross_sections_at_energy(&data, 0.1);
         let xs_04 = cross_sections_at_energy(&data, 0.4);
@@ -755,9 +761,8 @@ mod tests {
     #[test]
     fn test_cross_sections_positive() {
         // All cross-sections must be non-negative at all energies.
-        let data = make_single_resonance_data(
-            6.674, 1.493e-3, 23.0e-3, 0.5, 0, 236.006, 0.0, 9.4285,
-        );
+        let data =
+            make_single_resonance_data(6.674, 1.493e-3, 23.0e-3, 0.5, 0, 236.006, 0.0, 9.4285);
 
         for &e in &[0.01, 0.1, 1.0, 5.0, 6.0, 6.674, 7.0, 10.0, 100.0, 1000.0] {
             let xs = cross_sections_at_energy(&data, e);
@@ -818,7 +823,12 @@ mod tests {
             assert!(xs.total >= 0.0, "Total negative at E={}", e);
             assert!(xs.elastic >= 0.0, "Elastic negative at E={}", e);
             // Capture can be very slightly negative due to floating point.
-            assert!(xs.capture >= -0.01, "Capture negative at E={}: {}", e, xs.capture);
+            assert!(
+                xs.capture >= -0.01,
+                "Capture negative at E={}: {}",
+                e,
+                xs.capture
+            );
         }
 
         // Check the 6.674 eV resonance peak.

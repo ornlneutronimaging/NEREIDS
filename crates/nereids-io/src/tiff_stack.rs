@@ -33,15 +33,15 @@ use crate::error::IoError;
 pub fn load_tiff_stack(path: &Path) -> Result<Array3<f64>, IoError> {
     let file = std::fs::File::open(path)
         .map_err(|e| IoError::FileNotFound(path.to_string_lossy().into_owned(), e))?;
-    let mut decoder = Decoder::new(file)
-        .map_err(|e| IoError::TiffDecode(format!("{}", e)))?;
+    let mut decoder = Decoder::new(file).map_err(|e| IoError::TiffDecode(format!("{}", e)))?;
 
     let mut frames: Vec<Vec<f64>> = Vec::new();
     let mut width = 0u32;
     let mut height = 0u32;
 
     loop {
-        let (w, h) = decoder.dimensions()
+        let (w, h) = decoder
+            .dimensions()
             .map_err(|e| IoError::TiffDecode(format!("{}", e)))?;
 
         if frames.is_empty() {
@@ -55,7 +55,8 @@ pub fn load_tiff_stack(path: &Path) -> Result<Array3<f64>, IoError> {
             });
         }
 
-        let data = decoder.read_image()
+        let data = decoder
+            .read_image()
             .map_err(|e| IoError::TiffDecode(format!("{}", e)))?;
 
         let pixels = decode_to_f64(data)?;
@@ -73,7 +74,8 @@ pub fn load_tiff_stack(path: &Path) -> Result<Array3<f64>, IoError> {
         if !decoder.more_images() {
             break;
         }
-        decoder.next_image()
+        decoder
+            .next_image()
             .map_err(|e| IoError::TiffDecode(format!("{}", e)))?;
     }
 
@@ -84,11 +86,8 @@ pub fn load_tiff_stack(path: &Path) -> Result<Array3<f64>, IoError> {
 
     // Flatten all frames into a single Vec and reshape to 3D
     let flat: Vec<f64> = frames.into_iter().flatten().collect();
-    Array3::from_shape_vec(
-        (n_frames, height as usize, width as usize),
-        flat,
-    )
-    .map_err(|e| IoError::TiffDecode(format!("Shape error: {}", e)))
+    Array3::from_shape_vec((n_frames, height as usize, width as usize), flat)
+        .map_err(|e| IoError::TiffDecode(format!("Shape error: {}", e)))
 }
 
 /// Load a directory of single-frame TIFFs as a 3D stack.
@@ -110,7 +109,9 @@ pub fn load_tiff_directory(dir: &Path) -> Result<Array3<f64>, IoError> {
         .map_err(|e| IoError::FileNotFound(dir.to_string_lossy().into_owned(), e))?
         .filter_map(|entry| entry.ok())
         .filter(|entry| {
-            entry.path().extension()
+            entry
+                .path()
+                .extension()
                 .and_then(|ext| ext.to_str())
                 .map(|ext| matches!(ext.to_lowercase().as_str(), "tif" | "tiff"))
                 .unwrap_or(false)
@@ -133,10 +134,10 @@ pub fn load_tiff_directory(dir: &Path) -> Result<Array3<f64>, IoError> {
     for (i, path) in paths.iter().enumerate() {
         let file = std::fs::File::open(path)
             .map_err(|e| IoError::FileNotFound(path.to_string_lossy().into_owned(), e))?;
-        let mut decoder = Decoder::new(file)
-            .map_err(|e| IoError::TiffDecode(format!("{}", e)))?;
+        let mut decoder = Decoder::new(file).map_err(|e| IoError::TiffDecode(format!("{}", e)))?;
 
-        let (w, h) = decoder.dimensions()
+        let (w, h) = decoder
+            .dimensions()
             .map_err(|e| IoError::TiffDecode(format!("{}", e)))?;
 
         if i == 0 {
@@ -150,18 +151,16 @@ pub fn load_tiff_directory(dir: &Path) -> Result<Array3<f64>, IoError> {
             });
         }
 
-        let data = decoder.read_image()
+        let data = decoder
+            .read_image()
             .map_err(|e| IoError::TiffDecode(format!("{}", e)))?;
         frames.push(decode_to_f64(data)?);
     }
 
     let n_frames = frames.len();
     let flat: Vec<f64> = frames.into_iter().flatten().collect();
-    Array3::from_shape_vec(
-        (n_frames, height as usize, width as usize),
-        flat,
-    )
-    .map_err(|e| IoError::TiffDecode(format!("Shape error: {}", e)))
+    Array3::from_shape_vec((n_frames, height as usize, width as usize), flat)
+        .map_err(|e| IoError::TiffDecode(format!("Shape error: {}", e)))
 }
 
 /// Convert TIFF decoded data to f64 values.
@@ -177,7 +176,7 @@ fn decode_to_f64(data: DecodingResult) -> Result<Vec<f64>, IoError> {
         DecodingResult::I16(v) => Ok(v.into_iter().map(|x| x as f64).collect()),
         DecodingResult::I32(v) => Ok(v.into_iter().map(|x| x as f64).collect()),
         DecodingResult::I64(v) => Ok(v.into_iter().map(|x| x as f64).collect()),
-        DecodingResult::F16(v) => Ok(v.into_iter().map(|x| f64::from(x)).collect()),
+        DecodingResult::F16(v) => Ok(v.into_iter().map(f64::from).collect()),
     }
 }
 
@@ -214,9 +213,9 @@ mod tests {
         let file = std::fs::File::create(path).unwrap();
         let mut encoder = TiffEncoder::new(file).unwrap();
         for frame in frames {
-            encoder.write_image::<tiff::encoder::colortype::Gray16>(
-                width, height, frame,
-            ).unwrap();
+            encoder
+                .write_image::<tiff::encoder::colortype::Gray16>(width, height, frame)
+                .unwrap();
         }
     }
 

@@ -12,17 +12,23 @@ pub fn data_panel(ui: &mut egui::Ui, state: &mut AppState) {
     ui.horizontal(|ui| {
         ui.label("Sample:");
         if let Some(ref path) = state.sample_path {
-            ui.label(path.file_name().unwrap_or_default().to_string_lossy().to_string());
+            ui.label(
+                path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+            );
         } else {
             ui.label("(none)");
         }
-        if ui.button("Browse...").clicked() {
-            if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                state.sample_path = Some(dir);
-                state.sample_data = None;
-                state.normalized = None;
-                state.status_message = "Sample directory selected".into();
-            }
+        if ui.button("Browse...").clicked()
+            && let Some(dir) = rfd::FileDialog::new().pick_folder()
+        {
+            state.sample_path = Some(dir);
+            state.sample_data = None;
+            state.normalized = None;
+            invalidate_results(state);
+            state.status_message = "Sample directory selected".into();
         }
     });
 
@@ -30,17 +36,23 @@ pub fn data_panel(ui: &mut egui::Ui, state: &mut AppState) {
     ui.horizontal(|ui| {
         ui.label("Open Beam:");
         if let Some(ref path) = state.open_beam_path {
-            ui.label(path.file_name().unwrap_or_default().to_string_lossy().to_string());
+            ui.label(
+                path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+            );
         } else {
             ui.label("(none)");
         }
-        if ui.button("Browse...").clicked() {
-            if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                state.open_beam_path = Some(dir);
-                state.open_beam_data = None;
-                state.normalized = None;
-                state.status_message = "Open beam directory selected".into();
-            }
+        if ui.button("Browse...").clicked()
+            && let Some(dir) = rfd::FileDialog::new().pick_folder()
+        {
+            state.open_beam_path = Some(dir);
+            state.open_beam_data = None;
+            state.normalized = None;
+            invalidate_results(state);
+            state.status_message = "Open beam directory selected".into();
         }
     });
 
@@ -77,19 +89,35 @@ pub fn data_panel(ui: &mut egui::Ui, state: &mut AppState) {
     ui.heading("Beamline");
     ui.horizontal(|ui| {
         ui.label("Flight path (m):");
-        ui.add(egui::DragValue::new(&mut state.beamline.flight_path_m).range(1.0..=100.0).speed(0.1));
+        ui.add(
+            egui::DragValue::new(&mut state.beamline.flight_path_m)
+                .range(1.0..=100.0)
+                .speed(0.1),
+        );
     });
     ui.horizontal(|ui| {
         ui.label("Delay (us):");
-        ui.add(egui::DragValue::new(&mut state.beamline.delay_us).range(0.0..=1000.0).speed(0.1));
+        ui.add(
+            egui::DragValue::new(&mut state.beamline.delay_us)
+                .range(0.0..=1000.0)
+                .speed(0.1),
+        );
     });
     ui.horizontal(|ui| {
         ui.label("PC sample:");
-        ui.add(egui::DragValue::new(&mut state.proton_charge_sample).range(0.001..=1e6).speed(0.01));
+        ui.add(
+            egui::DragValue::new(&mut state.proton_charge_sample)
+                .range(0.001..=1e6)
+                .speed(0.01),
+        );
     });
     ui.horizontal(|ui| {
         ui.label("PC open beam:");
-        ui.add(egui::DragValue::new(&mut state.proton_charge_ob).range(0.001..=1e6).speed(0.01));
+        ui.add(
+            egui::DragValue::new(&mut state.proton_charge_ob)
+                .range(0.001..=1e6)
+                .speed(0.01),
+        );
     });
 
     ui.add_space(8.0);
@@ -111,7 +139,18 @@ pub fn data_panel(ui: &mut egui::Ui, state: &mut AppState) {
     }
 }
 
+/// Clear pixel selection, ROI, and all fit results when data changes.
+fn invalidate_results(state: &mut AppState) {
+    state.selected_pixel = None;
+    state.roi = None;
+    state.pixel_fit_result = None;
+    state.spatial_result = None;
+    state.preview_image = None;
+    state.energies = None;
+}
+
 fn load_tiff_data(state: &mut AppState) {
+    invalidate_results(state);
     if let Some(ref sample_dir) = state.sample_path {
         match nereids_io::tiff_stack::load_tiff_directory(sample_dir) {
             Ok(data) => {
@@ -163,11 +202,8 @@ fn normalize_data(state: &mut AppState) {
 
             // Compute energy grid from TOF bins
             let n_tof = sample.shape()[0];
-            let tof_edges = nereids_io::tof::linspace_tof_edges(
-                state.tof_min_us,
-                state.tof_max_us,
-                n_tof,
-            );
+            let tof_edges =
+                nereids_io::tof::linspace_tof_edges(state.tof_min_us, state.tof_max_us, n_tof);
             match nereids_io::tof::tof_edges_to_energy_centers(&tof_edges, &state.beamline) {
                 Ok(e) => state.energies = Some(e.to_vec()),
                 Err(e) => {

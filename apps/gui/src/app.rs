@@ -19,7 +19,9 @@ impl NereidsApp {
 impl eframe::App for NereidsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Check for pixel clicks from map panel
-        if let Some((y, x)) = ctx.data(|d| d.get_temp::<(usize, usize)>(egui::Id::new("clicked_pixel"))) {
+        if let Some((y, x)) =
+            ctx.data(|d| d.get_temp::<(usize, usize)>(egui::Id::new("clicked_pixel")))
+        {
             self.state.selected_pixel = Some((y, x));
             self.state.pixel_fit_result = None;
             ctx.data_mut(|d| {

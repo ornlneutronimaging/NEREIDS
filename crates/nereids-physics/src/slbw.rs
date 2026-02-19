@@ -62,11 +62,7 @@ pub fn slbw_cross_sections(data: &ResonanceData, energy_ev: f64) -> SlbwCrossSec
 
         for l_group in &range.l_groups {
             let l = l_group.l;
-            let awr_l = if l_group.awr > 0.0 {
-                l_group.awr
-            } else {
-                awr
-            };
+            let awr_l = if l_group.awr > 0.0 { l_group.awr } else { awr };
 
             let channel_radius = if l_group.apl > 0.0 {
                 l_group.apl
@@ -141,8 +137,7 @@ pub fn slbw_cross_sections(data: &ResonanceData, energy_ev: f64) -> SlbwCrossSec
                         * g_j
                         * 2.0
                         * gamma_n
-                        * (de * cos_phi * 2.0 * sin_phi
-                            + (gamma_total / 2.0) * 2.0 * sin2_phi)
+                        * (de * cos_phi * 2.0 * sin_phi + (gamma_total / 2.0) * 2.0 * sin2_phi)
                         / denom;
                     elastic += interf;
                     total += interf;
@@ -279,8 +274,8 @@ mod tests {
             let rm = reich_moore::cross_sections_at_energy(&rm_data, e);
             let slbw = slbw_cross_sections(&slbw_data, e);
 
-            let rel_diff_cap = (rm.capture - slbw.capture).abs()
-                / rm.capture.max(slbw.capture).max(1e-10);
+            let rel_diff_cap =
+                (rm.capture - slbw.capture).abs() / rm.capture.max(slbw.capture).max(1e-10);
 
             println!(
                 "E={:.3}: RM_cap={:.2}, SLBW_cap={:.2}, rel_diff={:.4}",

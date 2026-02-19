@@ -122,7 +122,8 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
 
             match formalism {
                 ResonanceFormalism::MLBW | ResonanceFormalism::SLBW => {
-                    let range = parse_bw_range(&lines, &mut pos, energy_low, energy_high, formalism)?;
+                    let range =
+                        parse_bw_range(&lines, &mut pos, energy_low, energy_high, formalism)?;
                     all_ranges.push(range);
                 }
                 ResonanceFormalism::ReichMoore => {
@@ -188,13 +189,13 @@ fn parse_bw_range(
         for i in 0..nrs {
             let base = i * 6;
             resonances.push(Resonance {
-                energy: values[base],      // ER
-                j: values[base + 1],       // AJ
-                gn: values[base + 3],      // GN (neutron width)
-                gg: values[base + 4],      // GG (gamma width)
-                gfa: values[base + 5],     // GF (fission width)
-                gfb: 0.0,                  // Not used in BW
-                // Note: values[base+2] is GT (total width) — derived, not stored
+                energy: values[base],  // ER
+                j: values[base + 1],   // AJ
+                gn: values[base + 3],  // GN (neutron width)
+                gg: values[base + 4],  // GG (gamma width)
+                gfa: values[base + 5], // GF (fission width)
+                gfb: 0.0,              // Not used in BW
+                                       // Note: values[base+2] is GT (total width) — derived, not stored
             });
         }
 
@@ -258,12 +259,12 @@ fn parse_reich_moore_range(
         for i in 0..nrs {
             let base = i * 6;
             resonances.push(Resonance {
-                energy: values[base],      // ER (eV)
-                j: values[base + 1],       // AJ (total J)
-                gn: values[base + 2],      // GN (neutron width, eV)
-                gg: values[base + 3],      // GG (gamma width, eV)
-                gfa: values[base + 4],     // GFA (fission width 1, eV)
-                gfb: values[base + 5],     // GFB (fission width 2, eV)
+                energy: values[base],  // ER (eV)
+                j: values[base + 1],   // AJ (total J)
+                gn: values[base + 2],  // GN (neutron width, eV)
+                gg: values[base + 3],  // GG (gamma width, eV)
+                gfa: values[base + 4], // GFA (fission width 1, eV)
+                gfb: values[base + 5], // GFB (fission width 2, eV)
             });
         }
 
@@ -329,7 +330,7 @@ fn parse_list_values(
     n_values: usize,
 ) -> Result<Vec<f64>, EndfParseError> {
     let mut values = Vec::with_capacity(n_values);
-    let n_lines = (n_values + 5) / 6; // ceiling division
+    let n_lines = n_values.div_ceil(6);
 
     for _ in 0..n_lines {
         if *pos >= lines.len() {
@@ -439,11 +440,7 @@ fn parse_endf_int(line: &str, field_index: usize) -> Result<i32, EndfParseError>
 }
 
 /// Skip an unresolved resonance range (we don't parse URR yet).
-fn skip_unresolved_range(
-    lines: &[&str],
-    pos: &mut usize,
-    _lrf: i32,
-) -> Result<(), EndfParseError> {
+fn skip_unresolved_range(lines: &[&str], pos: &mut usize, _lrf: i32) -> Result<(), EndfParseError> {
     // Simplified: skip until we hit a SEND record (all zeros in fields 1-4)
     // or until the MF/MT changes. For robustness, skip the subsection CONT
     // and its data by reading NLS and skipping.
@@ -457,7 +454,7 @@ fn skip_unresolved_range(
             let j_cont = parse_cont(lines, pos)?;
             let ne = j_cont.n2 as usize;
             // Each J-block has NE lines of data (6 values each).
-            let n_lines = (ne * 6 + 5) / 6;
+            let n_lines = (ne * 6).div_ceil(6);
             *pos += n_lines;
         }
     }
@@ -471,11 +468,11 @@ fn skip_tab1(lines: &[&str], pos: &mut usize) -> Result<(), EndfParseError> {
     let np = cont.n2 as usize; // number of points
 
     // Interpolation ranges: 2 integers per range, 6 per line
-    let interp_lines = (nr * 2 + 5) / 6;
+    let interp_lines = (nr * 2).div_ceil(6);
     *pos += interp_lines;
 
     // Data points: 2 floats per point, 6 per line → np*2 values total
-    let data_lines = (np * 2 + 5) / 6;
+    let data_lines = (np * 2).div_ceil(6);
     *pos += data_lines;
 
     Ok(())
@@ -549,7 +546,10 @@ mod tests {
             .join("../SAMMY/SAMMY/samexm_new/ex027_new/ex027.endf");
 
         if !endf_path.exists() {
-            eprintln!("Skipping test: SAMMY ENDF file not found at {:?}", endf_path);
+            eprintln!(
+                "Skipping test: SAMMY ENDF file not found at {:?}",
+                endf_path
+            );
             return;
         }
 
@@ -581,10 +581,15 @@ mod tests {
         // Check first L-group (L=0).
         let l0 = &range.l_groups[0];
         assert_eq!(l0.l, 0, "First group should be L=0");
-        assert!(l0.resonances.len() > 500, "L=0 should have hundreds of resonances");
+        assert!(
+            l0.resonances.len() > 500,
+            "L=0 should have hundreds of resonances"
+        );
 
         // Find the famous 6.674 eV resonance of U-238.
-        let first_positive = l0.resonances.iter()
+        let first_positive = l0
+            .resonances
+            .iter()
             .find(|r| r.energy > 0.0)
             .expect("Should have positive-energy resonances");
         assert!(

@@ -123,11 +123,7 @@ mod tests {
         // ρ = k·a ≈ 2.188e-4 × √6.674 × 9.4285 ≈ 5.33e-3
         let awr = 236.006;
         let r = rho(6.674, awr, 9.4285);
-        assert!(
-            (r - 5.33e-3).abs() < 1e-4,
-            "ρ = {}, expected ~5.33e-3",
-            r
-        );
+        assert!((r - 5.33e-3).abs() < 1e-4, "ρ = {}, expected ~5.33e-3", r);
     }
 
     #[test]

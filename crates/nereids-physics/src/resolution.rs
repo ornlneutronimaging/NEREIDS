@@ -60,8 +60,8 @@ impl ResolutionParams {
         }
 
         // Timing contribution: σ_t = 2 × Δt × E^(3/2) / (TOF_FACTOR × L)
-        let timing = 2.0 * self.delta_t_us * energy_ev.powf(1.5)
-            / (TOF_FACTOR * self.flight_path_m);
+        let timing =
+            2.0 * self.delta_t_us * energy_ev.powf(1.5) / (TOF_FACTOR * self.flight_path_m);
 
         // Path length contribution: σ_L = 2 × ΔL × E / L
         let path = 2.0 * self.delta_l_m * energy_ev / self.flight_path_m;
@@ -275,7 +275,7 @@ mod tests {
 
         let params = ResolutionParams {
             flight_path_m: 25.0,
-            delta_t_us: 5.0,  // Fairly large timing uncertainty
+            delta_t_us: 5.0, // Fairly large timing uncertainty
             delta_l_m: 0.01,
         };
         let broadened = resolution_broaden(&energies, &xs, &params);
@@ -324,9 +324,7 @@ mod tests {
             .map(|i| 0.5 * (xs[i] + xs[i + 1]) * (energies[i + 1] - energies[i]))
             .sum();
         let area_broad: f64 = (0..n - 1)
-            .map(|i| {
-                0.5 * (broadened[i] + broadened[i + 1]) * (energies[i + 1] - energies[i])
-            })
+            .map(|i| 0.5 * (broadened[i] + broadened[i + 1]) * (energies[i + 1] - energies[i]))
             .sum();
 
         let rel_diff = (area_orig - area_broad).abs() / area_orig;
@@ -383,8 +381,7 @@ mod tests {
 
         // Kernel std dev = W/√2
         let sigma_kernel = w_kernel / 2.0_f64.sqrt();
-        let sigma_expected =
-            (sigma_input * sigma_input + sigma_kernel * sigma_kernel).sqrt();
+        let sigma_expected = (sigma_input * sigma_input + sigma_kernel * sigma_kernel).sqrt();
         let fwhm_expected = 2.0 * (2.0_f64.ln() * 2.0).sqrt() * sigma_expected;
 
         // Measure FWHM from the broadened output

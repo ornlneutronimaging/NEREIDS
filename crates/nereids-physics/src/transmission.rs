@@ -56,10 +56,7 @@ pub fn beer_lambert(cross_sections: &[f64], thickness: f64) -> Vec<f64> {
 ///
 /// # Returns
 /// Combined transmission values at each energy point.
-pub fn beer_lambert_multi(
-    cross_sections_per_isotope: &[&[f64]],
-    thicknesses: &[f64],
-) -> Vec<f64> {
+pub fn beer_lambert_multi(cross_sections_per_isotope: &[&[f64]], thicknesses: &[f64]) -> Vec<f64> {
     assert_eq!(cross_sections_per_isotope.len(), thicknesses.len());
     assert!(!cross_sections_per_isotope.is_empty());
 
@@ -154,10 +151,7 @@ pub fn forward_model(
     }
 
     // 5. Beer-Lambert: T = exp(-attenuation)
-    total_attenuation
-        .iter()
-        .map(|&att| (-att).exp())
-        .collect()
+    total_attenuation.iter().map(|&att| (-att).exp()).collect()
 }
 
 #[cfg(test)]

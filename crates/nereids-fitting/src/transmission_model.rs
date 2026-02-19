@@ -4,8 +4,8 @@
 //! that the LM optimizer can call. The fit parameters are the areal densities
 //! (thicknesses) of each isotope in the sample.
 
-use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
 use nereids_endf::resonance::ResonanceData;
+use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
 
 use crate::lm::FitModel;
 
@@ -42,11 +42,7 @@ impl FitModel for TransmissionFitModel {
             isotopes,
         };
 
-        transmission::forward_model(
-            &self.energies,
-            &sample,
-            self.instrument.as_ref(),
-        )
+        transmission::forward_model(&self.energies, &sample, self.instrument.as_ref())
     }
 }
 
@@ -110,7 +106,8 @@ mod tests {
             FitParameter::non_negative("thickness", 0.001), // initial guess 2× off
         ]);
 
-        let result = lm::levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &LmConfig::default());
+        let result =
+            lm::levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &LmConfig::default());
 
         assert!(result.converged, "Fit did not converge");
         let fitted = result.params[0];
@@ -176,20 +173,29 @@ mod tests {
             FitParameter::non_negative("Other thickness", 0.001),
         ]);
 
-        let result = lm::levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &LmConfig::default());
+        let result =
+            lm::levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &LmConfig::default());
 
-        assert!(result.converged, "Fit did not converge after {} iterations", result.iterations);
+        assert!(
+            result.converged,
+            "Fit did not converge after {} iterations",
+            result.iterations
+        );
 
         let (fit_t1, fit_t2) = (result.params[0], result.params[1]);
         assert!(
             (fit_t1 - true_t1).abs() / true_t1 < 0.05,
             "U-238: fitted={}, true={}, error={:.1}%",
-            fit_t1, true_t1, (fit_t1 - true_t1).abs() / true_t1 * 100.0,
+            fit_t1,
+            true_t1,
+            (fit_t1 - true_t1).abs() / true_t1 * 100.0,
         );
         assert!(
             (fit_t2 - true_t2).abs() / true_t2 < 0.05,
             "Other: fitted={}, true={}, error={:.1}%",
-            fit_t2, true_t2, (fit_t2 - true_t2).abs() / true_t2 * 100.0,
+            fit_t2,
+            true_t2,
+            (fit_t2 - true_t2).abs() / true_t2 * 100.0,
         );
     }
 }

@@ -195,7 +195,11 @@ fn phase_shift_general(l: u32, rho: f64) -> f64 {
 /// j_l and n_l are spherical Bessel functions of the first and second kind.
 fn bessel_fg(l: u32, rho: f64) -> (f64, f64) {
     if rho.abs() < 1e-30 {
-        return if l == 0 { (0.0, -1.0) } else { (0.0, f64::NEG_INFINITY) };
+        return if l == 0 {
+            (0.0, -1.0)
+        } else {
+            (0.0, f64::NEG_INFINITY)
+        };
     }
 
     // Start with l=0:

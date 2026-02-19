@@ -50,9 +50,7 @@ pub fn map_panel(ui: &mut egui::Ui, state: &mut AppState) {
 
     // Show convergence info
     ui.label("Convergence map:");
-    let conv_f64 = result
-        .converged_map
-        .mapv(|b| if b { 1.0 } else { 0.0 });
+    let conv_f64 = result.converged_map.mapv(|b| if b { 1.0 } else { 0.0 });
     show_grayscale_image(ui, &conv_f64, "conv_tex");
 
     ui.label(format!(
@@ -116,18 +114,20 @@ fn show_grayscale_image(ui: &mut egui::Ui, data: &ndarray::Array2<f64>, tex_id: 
     let response = ui.image(egui::load::SizedTexture::new(texture.id(), display_size));
 
     // Click on image to select pixel
-    if response.clicked() {
-        if let Some(pos) = response.interact_pointer_pos() {
-            let rect = response.rect;
-            let rel_x = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-            let rel_y = ((pos.y - rect.top()) / rect.height()).clamp(0.0, 1.0);
-            let px_x = (rel_x * width as f32) as usize;
-            let px_y = (rel_y * height as f32) as usize;
-            // We don't have direct access to state here — handled by caller
-            ui.ctx().data_mut(|d| {
-                d.insert_temp(egui::Id::new("clicked_pixel"), (px_y.min(height - 1), px_x.min(width - 1)));
-            });
-        }
+    if response.clicked()
+        && let Some(pos) = response.interact_pointer_pos()
+    {
+        let rect = response.rect;
+        let rel_x = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+        let rel_y = ((pos.y - rect.top()) / rect.height()).clamp(0.0, 1.0);
+        let px_x = (rel_x * width as f32) as usize;
+        let px_y = (rel_y * height as f32) as usize;
+        ui.ctx().data_mut(|d| {
+            d.insert_temp(
+                egui::Id::new("clicked_pixel"),
+                (px_y.min(height - 1), px_x.min(width - 1)),
+            );
+        });
     }
 }
 

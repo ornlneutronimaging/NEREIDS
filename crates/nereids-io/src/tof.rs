@@ -91,9 +91,7 @@ pub fn tof_edges_to_energy_centers(
 ) -> Result<Array1<f64>, IoError> {
     let edges = tof_edges_to_energy(tof_edges, params)?;
     let n = edges.len() - 1;
-    let centers: Vec<f64> = (0..n)
-        .map(|i| (edges[i] * edges[i + 1]).sqrt())
-        .collect();
+    let centers: Vec<f64> = (0..n).map(|i| (edges[i] * edges[i + 1]).sqrt()).collect();
     Ok(Array1::from_vec(centers))
 }
 

@@ -55,14 +55,12 @@ pub struct SpectrumFitResult {
 ///
 /// # Returns
 /// Fit result with densities, uncertainties, and fit quality metrics.
-pub fn fit_spectrum(
-    measured_t: &[f64],
-    sigma: &[f64],
-    config: &FitConfig,
-) -> SpectrumFitResult {
+pub fn fit_spectrum(measured_t: &[f64], sigma: &[f64], config: &FitConfig) -> SpectrumFitResult {
     let n_isotopes = config.resonance_data.len();
 
-    let instrument = config.resolution.map(|r| InstrumentParams { resolution: r });
+    let instrument = config
+        .resolution
+        .map(|r| InstrumentParams { resolution: r });
 
     let model = TransmissionFitModel {
         energies: config.energies.clone(),

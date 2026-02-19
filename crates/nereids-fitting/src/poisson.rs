@@ -201,7 +201,7 @@ pub fn poisson_fit(
 
         if !accepted {
             params.set_free_values(&old_free);
-            converged = true; // Can't make progress
+            // Cannot make progress — this is NOT convergence, it's a stall.
             break;
         }
 
@@ -335,9 +335,7 @@ mod tests {
 
         let y_obs = model.evaluate(&[true_b]);
 
-        let mut params = ParameterSet::new(vec![
-            FitParameter::non_negative("b", 0.1),
-        ]);
+        let mut params = ParameterSet::new(vec![FitParameter::non_negative("b", 0.1)]);
 
         let result = poisson_fit(&model, &y_obs, &mut params, &PoissonConfig::default());
 
@@ -364,9 +362,7 @@ mod tests {
         // Generate data with b=0 (constant), but start with b=1
         let y_obs: Vec<f64> = vec![100.0; x.len()];
 
-        let mut params = ParameterSet::new(vec![
-            FitParameter::non_negative("b", 1.0),
-        ]);
+        let mut params = ParameterSet::new(vec![FitParameter::non_negative("b", 1.0)]);
 
         let result = poisson_fit(&model, &y_obs, &mut params, &PoissonConfig::default());
 

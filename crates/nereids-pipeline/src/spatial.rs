@@ -6,7 +6,7 @@
 use ndarray::{Array2, Array3};
 use rayon::prelude::*;
 
-use crate::pipeline::{fit_spectrum, FitConfig, SpectrumFitResult};
+use crate::pipeline::{FitConfig, SpectrumFitResult, fit_spectrum};
 
 /// Result of spatial mapping over a 2D image.
 #[derive(Debug)]
@@ -52,7 +52,7 @@ pub fn spatial_map(
     let mut pixel_coords: Vec<(usize, usize)> = Vec::new();
     for y in 0..height {
         for x in 0..width {
-            let is_dead = dead_pixels.map_or(false, |m| m[[y, x]]);
+            let is_dead = dead_pixels.is_some_and(|m| m[[y, x]]);
             if !is_dead {
                 pixel_coords.push((y, x));
             }
@@ -64,9 +64,7 @@ pub fn spatial_map(
         .par_iter()
         .map(|&(y, x)| {
             // Extract spectrum for this pixel
-            let t_spectrum: Vec<f64> = (0..n_energies)
-                .map(|e| transmission[[e, y, x]])
-                .collect();
+            let t_spectrum: Vec<f64> = (0..n_energies).map(|e| transmission[[e, y, x]]).collect();
             let sigma: Vec<f64> = (0..n_energies)
                 .map(|e| uncertainty[[e, y, x]].max(1e-10)) // Avoid zero uncertainty
                 .collect();
@@ -128,6 +126,25 @@ pub fn fit_roi(
     config: &FitConfig,
 ) -> SpectrumFitResult {
     let n_energies = transmission.shape()[0];
+
+    assert!(
+        y_range.start < y_range.end && x_range.start < x_range.end,
+        "ROI ranges must be non-empty: y={}..{}, x={}..{}",
+        y_range.start,
+        y_range.end,
+        x_range.start,
+        x_range.end,
+    );
+    let shape = transmission.shape();
+    assert!(
+        y_range.end <= shape[1] && x_range.end <= shape[2],
+        "ROI exceeds image dimensions: y_end={} (max {}), x_end={} (max {})",
+        y_range.end,
+        shape[1],
+        x_range.end,
+        shape[2],
+    );
+
     let n_pixels = (y_range.end - y_range.start) * (x_range.end - x_range.start);
 
     // Average transmission over ROI
@@ -244,7 +261,10 @@ mod tests {
                 assert!(
                     (fitted - true_density).abs() / true_density < 0.05,
                     "Pixel ({},{}) density = {}, expected {}",
-                    y, x, fitted, true_density,
+                    y,
+                    x,
+                    fitted,
+                    true_density,
                 );
             }
         }
@@ -339,13 +359,7 @@ mod tests {
         };
 
         // Fit a 2×2 ROI
-        let result = fit_roi(
-            &transmission,
-            &uncertainty,
-            1..3,
-            1..3,
-            &config,
-        );
+        let result = fit_roi(&transmission, &uncertainty, 1..3, 1..3, &config);
 
         assert!(result.converged);
         assert!(

@@ -128,6 +128,7 @@ fn compute_jacobian(
 ///
 /// A is n×n symmetric positive definite (approximately).
 /// Returns the solution vector x.
+#[allow(clippy::needless_range_loop)]
 fn solve_damped_system(a: &[Vec<f64>], b: &[f64], lambda: f64) -> Option<Vec<f64>> {
     let n = b.len();
     if n == 0 {
@@ -185,6 +186,7 @@ fn solve_damped_system(a: &[Vec<f64>], b: &[f64], lambda: f64) -> Option<Vec<f64
 }
 
 /// Invert a symmetric positive definite matrix (for covariance).
+#[allow(clippy::needless_range_loop)]
 fn invert_matrix(a: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
     let n = a.len();
     if n == 0 {
@@ -232,10 +234,7 @@ fn invert_matrix(a: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
         }
     }
 
-    let inv: Vec<Vec<f64>> = aug
-        .into_iter()
-        .map(|row| row[n..].to_vec())
-        .collect();
+    let inv: Vec<Vec<f64>> = aug.into_iter().map(|row| row[n..].to_vec()).collect();
 
     Some(inv)
 }
@@ -259,6 +258,15 @@ pub fn levenberg_marquardt(
     config: &LmConfig,
 ) -> LmResult {
     let n_data = y_obs.len();
+    assert!(n_data > 0, "y_obs must not be empty",);
+    assert_eq!(
+        sigma.len(),
+        n_data,
+        "sigma length ({}) must match y_obs length ({})",
+        sigma.len(),
+        n_data,
+    );
+
     let n_free = params.n_free();
     let dof = if n_data > n_free { n_data - n_free } else { 1 };
 
@@ -514,9 +522,7 @@ mod tests {
         let sigma = vec![1.0; 9];
 
         let model = SlopeModel { x };
-        let mut params = ParameterSet::new(vec![
-            FitParameter::non_negative("a", 1.0),
-        ]);
+        let mut params = ParameterSet::new(vec![FitParameter::non_negative("a", 1.0)]);
 
         let result = levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &LmConfig::default());
 

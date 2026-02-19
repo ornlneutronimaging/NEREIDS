@@ -27,7 +27,9 @@ use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
 use nereids_core::types::Isotope;
-use nereids_endf::resonance::{LGroup, Resonance, ResonanceData, ResonanceFormalism, ResonanceRange};
+use nereids_endf::resonance::{
+    LGroup, Resonance, ResonanceData, ResonanceFormalism, ResonanceRange,
+};
 use nereids_fitting::lm::{self, LmConfig};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
 use nereids_fitting::transmission_model::TransmissionFitModel;
@@ -252,10 +254,38 @@ fn fit_spectrum(
     let t = measured_t.as_slice()?;
     let s = sigma.as_slice()?;
 
+    if t.len() != s.len() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "measured_t length ({}) must match sigma length ({})",
+            t.len(),
+            s.len(),
+        )));
+    }
+    if t.len() != e.len() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "measured_t length ({}) must match energies length ({})",
+            t.len(),
+            e.len(),
+        )));
+    }
+    if isotopes.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "isotopes list must not be empty",
+        ));
+    }
+
     let n_isotopes = isotopes.len();
     let res_data: Vec<ResonanceData> = isotopes.into_iter().map(|d| d.inner).collect();
 
     let init = initial_densities.unwrap_or_else(|| vec![0.001; n_isotopes]);
+
+    if init.len() != n_isotopes {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "initial_densities length ({}) must match isotopes length ({})",
+            init.len(),
+            n_isotopes,
+        )));
+    }
 
     let model = TransmissionFitModel {
         energies: e.to_vec(),
