@@ -1,8 +1,9 @@
 //! Fitting controls panel: isotope selection, parameters, run fit.
 
-use crate::state::{AppState, IsotopeEntry, RoiSelection, Tab};
+use crate::state::{AppState, EndfFetchResult, IsotopeEntry, RoiSelection, Tab};
 use nereids_endf::retrieval::EndfLibrary;
 use nereids_pipeline::pipeline::FitConfig;
+use std::sync::mpsc;
 
 /// Draw the fitting controls panel.
 pub fn fitting_panel(ui: &mut egui::Ui, state: &mut AppState) {
@@ -103,8 +104,13 @@ pub fn fitting_panel(ui: &mut egui::Ui, state: &mut AppState) {
         .isotope_entries
         .iter()
         .any(|e| e.enabled && e.resonance_data.is_none());
-    if has_missing && ui.button("Fetch ENDF Data").clicked() {
-        fetch_endf_data(state);
+    ui.add_enabled_ui(has_missing && !state.is_fetching_endf, |ui| {
+        if ui.button("Fetch ENDF Data").clicked() {
+            fetch_endf_data(state);
+        }
+    });
+    if state.is_fetching_endf {
+        ui.spinner();
     }
 
     ui.add_space(8.0);
@@ -224,45 +230,54 @@ fn library_name(lib: EndfLibrary) -> &'static str {
 
 fn fetch_endf_data(state: &mut AppState) {
     use nereids_core::types::Isotope;
-    use nereids_endf::retrieval::{self, EndfRetriever};
+    use nereids_endf::retrieval;
 
-    let retriever = EndfRetriever::new();
-
-    for entry in &mut state.isotope_entries {
+    // Collect work items: (index, isotope, symbol, mat_number)
+    let mut work: Vec<(usize, Isotope, String, EndfLibrary)> = Vec::new();
+    for (i, entry) in state.isotope_entries.iter().enumerate() {
         if entry.enabled && entry.resonance_data.is_none() {
             let isotope = Isotope::new(entry.z, entry.a);
-            state.status_message = format!("Fetching ENDF data for {}...", entry.symbol);
-
-            let mat = match retrieval::mat_number(&isotope) {
-                Some(m) => m,
-                None => {
-                    state.status_message = format!(
-                        "No MAT number for {} — isotope not in database",
-                        entry.symbol
-                    );
-                    continue;
-                }
-            };
-
-            match retriever.get_endf_file(&isotope, state.endf_library, mat) {
-                Ok((_path, endf_text)) => {
-                    match nereids_endf::parser::parse_endf_file2(&endf_text) {
-                        Ok(data) => {
-                            entry.resonance_data = Some(data);
-                            state.status_message = format!("Loaded {}", entry.symbol);
-                        }
-                        Err(e) => {
-                            state.status_message =
-                                format!("Parse error for {}: {}", entry.symbol, e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    state.status_message = format!("Fetch error for {}: {}", entry.symbol, e);
-                }
+            if retrieval::mat_number(&isotope).is_none() {
+                state.status_message = format!(
+                    "No MAT number for {} — isotope not in database",
+                    entry.symbol
+                );
+                continue;
             }
+            work.push((i, isotope, entry.symbol.clone(), state.endf_library));
         }
     }
+
+    if work.is_empty() {
+        return;
+    }
+
+    let (tx, rx) = mpsc::channel();
+    state.pending_endf = Some(rx);
+    state.is_fetching_endf = true;
+    state.status_message = "Fetching ENDF data...".into();
+
+    std::thread::spawn(move || {
+        let retriever = nereids_endf::retrieval::EndfRetriever::new();
+        for (index, isotope, symbol, library) in work {
+            let mat = retrieval::mat_number(&isotope).unwrap();
+            let result = match retriever.get_endf_file(&isotope, library, mat) {
+                Ok((_path, endf_text)) => {
+                    match nereids_endf::parser::parse_endf_file2(&endf_text) {
+                        Ok(data) => Ok(data),
+                        Err(e) => Err(format!("Parse error for {}: {}", symbol, e)),
+                    }
+                }
+                Err(e) => Err(format!("Fetch error for {}: {}", symbol, e)),
+            };
+            let _ = tx.send(EndfFetchResult {
+                index,
+                symbol,
+                result,
+            });
+        }
+        // tx drops here, closing the channel
+    });
 }
 
 fn build_fit_config(state: &AppState) -> Option<FitConfig> {
@@ -409,21 +424,22 @@ fn run_spatial_map(state: &mut AppState) {
         None => return,
     };
 
+    let transmission = norm.transmission.clone();
+    let uncertainty = norm.uncertainty.clone();
+    let dead_pixels = state.dead_pixels.clone();
+
+    let (tx, rx) = mpsc::channel();
+    state.pending_spatial = Some(rx);
     state.is_fitting = true;
     state.status_message = "Running spatial mapping...".into();
 
-    let result = nereids_pipeline::spatial::spatial_map(
-        &norm.transmission,
-        &norm.uncertainty,
-        &config,
-        state.dead_pixels.as_ref(),
-    );
-
-    state.status_message = format!(
-        "Spatial map: {}/{} converged",
-        result.n_converged, result.n_total
-    );
-    state.spatial_result = Some(result);
-    state.is_fitting = false;
-    state.active_tab = Tab::Map;
+    std::thread::spawn(move || {
+        let result = nereids_pipeline::spatial::spatial_map(
+            &transmission,
+            &uncertainty,
+            &config,
+            dead_pixels.as_ref(),
+        );
+        let _ = tx.send(result);
+    });
 }

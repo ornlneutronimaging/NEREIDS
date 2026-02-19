@@ -2,6 +2,7 @@
 
 use ndarray::{Array2, Array3};
 use std::path::PathBuf;
+use std::sync::mpsc;
 
 use nereids_endf::resonance::ResonanceData;
 use nereids_endf::retrieval::EndfLibrary;
@@ -10,6 +11,13 @@ use nereids_io::normalization::NormalizedData;
 use nereids_io::tof::BeamlineParams;
 use nereids_pipeline::pipeline::SpectrumFitResult;
 use nereids_pipeline::spatial::SpatialResult;
+
+/// Result of a background ENDF fetch for a single isotope.
+pub struct EndfFetchResult {
+    pub index: usize,
+    pub symbol: String,
+    pub result: Result<ResonanceData, String>,
+}
 
 /// Main application state.
 pub struct AppState {
@@ -51,6 +59,11 @@ pub struct AppState {
     pub active_tab: Tab,
     pub status_message: String,
     pub is_fitting: bool,
+    pub is_fetching_endf: bool,
+
+    // -- Background task receivers --
+    pub pending_spatial: Option<mpsc::Receiver<SpatialResult>>,
+    pub pending_endf: Option<mpsc::Receiver<EndfFetchResult>>,
 
     // -- Preview image texture --
     pub preview_image: Option<Array2<f64>>,
@@ -116,6 +129,10 @@ impl Default for AppState {
             active_tab: Tab::Spectrum,
             status_message: "Ready".into(),
             is_fitting: false,
+            is_fetching_endf: false,
+
+            pending_spatial: None,
+            pending_endf: None,
 
             preview_image: None,
             map_display_isotope: 0,

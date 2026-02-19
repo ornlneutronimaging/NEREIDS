@@ -158,6 +158,20 @@ pub fn sparse_reconstruct(
     let n_isotopes = config.resonance_data.len();
 
     assert_eq!(n_energies, config.energies.len());
+    assert_eq!(
+        nuisance.flux.len(),
+        n_energies,
+        "nuisance flux length ({}) must match n_energies ({})",
+        nuisance.flux.len(),
+        n_energies,
+    );
+    assert_eq!(
+        nuisance.background.len(),
+        n_energies,
+        "nuisance background length ({}) must match n_energies ({})",
+        nuisance.background.len(),
+        n_energies,
+    );
 
     // Build the transmission model (shared across pixels)
     let instrument = config

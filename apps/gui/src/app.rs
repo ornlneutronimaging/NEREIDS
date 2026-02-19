@@ -18,6 +18,14 @@ impl NereidsApp {
 
 impl eframe::App for NereidsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Poll background tasks
+        poll_pending_tasks(&mut self.state);
+
+        // Keep repainting while background work is in progress
+        if self.state.is_fitting || self.state.is_fetching_endf {
+            ctx.request_repaint();
+        }
+
         // Check for pixel clicks from map panel
         if let Some((y, x)) =
             ctx.data(|d| d.get_temp::<(usize, usize)>(egui::Id::new("clicked_pixel")))
@@ -68,5 +76,72 @@ impl eframe::App for NereidsApp {
                 Tab::Map => panels::map::map_panel(ui, &mut self.state),
             }
         });
+    }
+}
+
+/// Poll background task channels and apply results to state.
+fn poll_pending_tasks(state: &mut AppState) {
+    // Poll spatial map result
+    if let Some(ref rx) = state.pending_spatial {
+        match rx.try_recv() {
+            Ok(result) => {
+                state.status_message = format!(
+                    "Spatial map: {}/{} converged",
+                    result.n_converged, result.n_total
+                );
+                state.spatial_result = Some(result);
+                state.is_fitting = false;
+                state.active_tab = Tab::Map;
+                state.pending_spatial = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                state.status_message = "Spatial map task failed".into();
+                state.is_fitting = false;
+                state.pending_spatial = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {} // Still running
+        }
+    }
+
+    // Poll ENDF fetch results (streamed one per isotope)
+    if let Some(ref rx) = state.pending_endf {
+        let mut any_received = false;
+        let mut all_done = false;
+        // Drain all available results this frame
+        loop {
+            match rx.try_recv() {
+                Ok(fetch) => {
+                    any_received = true;
+                    if let Some(entry) = state.isotope_entries.get_mut(fetch.index) {
+                        match fetch.result {
+                            Ok(data) => {
+                                entry.resonance_data = Some(data);
+                                state.status_message = format!("Loaded {}", fetch.symbol);
+                            }
+                            Err(msg) => {
+                                state.status_message = msg;
+                            }
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    all_done = true;
+                    break;
+                }
+            }
+        }
+        if all_done || (any_received && rx.try_recv().is_err()) {
+            // Channel closed = thread finished
+            if !state
+                .isotope_entries
+                .iter()
+                .any(|e| e.enabled && e.resonance_data.is_none())
+            {
+                state.status_message = "All ENDF data loaded".into();
+            }
+            state.is_fetching_endf = false;
+            state.pending_endf = None;
+        }
     }
 }
