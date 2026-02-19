@@ -12,7 +12,7 @@
 //! All quantities in natural units: energies in eV, lengths in fm.
 //!
 //! ## Key Relations
-//! - k = √(2·μ·E) / ℏc, where μ = reduced mass
+//! - k = √(2·μ·E_cm) / ℏc = [AWR/(1+AWR)] × √(2·m_n·E_lab) / ℏc
 //! - ρ = k·a, where a = channel radius
 //! - g_J = (2J+1) / ((2I+1)·(2s+1))
 
@@ -20,23 +20,29 @@ use nereids_core::constants;
 
 /// Neutron wave number squared k² in fm⁻².
 ///
-/// k² = 2·μ·E / (ℏc)²
+/// k² = 2·μ·E_cm / (ℏc)² = 2·m_n·[AWR/(1+AWR)]²·E_lab / (ℏc)²
 ///
-/// where μ = m_n · AWR / (1 + AWR) is the reduced mass (in amu),
-/// and the conversion uses m_n(amu) × 931.494 MeV/amu → MeV/c².
+/// where μ = m_n · AWR / (1 + AWR) is the reduced mass,
+/// E_cm = E_lab · AWR / (1 + AWR) is the center-of-mass energy,
+/// and the two factors of AWR/(1+AWR) come from μ and E_cm respectively.
+///
+/// ## SAMMY Reference
+/// - `rml/mrml03.f` Fxradi: Zke = Twomhb × √(Redmas × Factor)
+///   where Redmas = AWR/(1+AWR) and Factor = AWR/(1+AWR).
 ///
 /// # Arguments
-/// * `energy_ev` — Neutron energy in eV (center-of-mass).
+/// * `energy_ev` — Neutron energy in eV (lab frame, as stored in ENDF).
 /// * `awr` — Ratio of target mass to neutron mass (from ENDF).
 pub fn k_squared(energy_ev: f64, awr: f64) -> f64 {
     // μ/m_n = AWR / (1 + AWR)
-    let reduced_mass_ratio = awr / (1.0 + awr);
+    let mass_ratio = awr / (1.0 + awr);
 
-    // k² = 2 · m_n(eV/c²) · (μ/m_n) · E(eV) / (ℏc)²(eV·fm)²
+    // k² = 2 · m_n · (AWR/(1+AWR))² · E_lab / (ℏc)²
+    // One factor from reduced mass, one from lab→CM energy conversion.
     let mn_ev = constants::NEUTRON_MASS_MEV * 1e6; // MeV → eV
     let hbar_c = constants::HBAR_EV_S * constants::SPEED_OF_LIGHT * 1e15; // eV·fm
 
-    2.0 * mn_ev * reduced_mass_ratio * energy_ev / (hbar_c * hbar_c)
+    2.0 * mn_ev * mass_ratio * mass_ratio * energy_ev / (hbar_c * hbar_c)
 }
 
 /// Neutron wave number k in fm⁻¹.
@@ -99,13 +105,14 @@ mod tests {
     #[test]
     fn test_wave_number_u238() {
         // U-238: AWR ≈ 236.006
-        // At E = 1 eV, k should be approximately 2.197e-4 fm⁻¹ × √(AWR/(1+AWR))
+        // k = sqrt(2 m_n / (ℏc)²) × AWR/(1+AWR) × sqrt(E)
+        // At E = 1 eV: k_free = 2.197e-4 fm⁻¹, mass_ratio = 236.006/237.006 = 0.99578
+        // k = 2.197e-4 × 0.99578 ≈ 2.188e-4 fm⁻¹
         let awr = 236.006;
         let k = wave_number(1.0, awr);
-        // Expected: k ≈ 2.197e-4 × 0.99789 ≈ 2.192e-4 fm⁻¹
         assert!(
-            (k - 2.192e-4).abs() < 1e-6,
-            "k = {} fm⁻¹, expected ~2.192e-4",
+            (k - 2.188e-4).abs() < 1e-6,
+            "k = {} fm⁻¹, expected ~2.188e-4",
             k
         );
     }
@@ -113,12 +120,12 @@ mod tests {
     #[test]
     fn test_rho_u238() {
         // U-238 at 6.674 eV, channel radius 9.4285 fm
+        // ρ = k·a ≈ 2.188e-4 × √6.674 × 9.4285 ≈ 5.33e-3
         let awr = 236.006;
         let r = rho(6.674, awr, 9.4285);
-        // ρ = k·a ≈ 2.192e-4 × √6.674 × 9.4285 ≈ 5.34e-3
         assert!(
-            (r - 5.34e-3).abs() < 1e-4,
-            "ρ = {}, expected ~5.34e-3",
+            (r - 5.33e-3).abs() < 1e-4,
+            "ρ = {}, expected ~5.33e-3",
             r
         );
     }
@@ -136,12 +143,13 @@ mod tests {
     #[test]
     fn test_pi_over_k2_u238() {
         // At 6.674 eV for U-238:
-        // k² ≈ (2.192e-4)² × 6.674 ≈ 3.2e-7 fm⁻²
-        // π/k² ≈ 9.82e6 fm² = 9.82e4 barns
+        // k² = 2·m_n·(AWR/(1+AWR))²·E / (ℏc)²
+        // With corrected formula: π/k² ≈ 9.86e4 barns
+        // (factor of (1+AWR)/AWR = 1.0042 larger than uncorrected)
         let val = pi_over_k_squared_barns(6.674, 236.006);
         assert!(
-            (val - 9.82e4).abs() < 1e3,
-            "π/k² = {} barns, expected ~9.82e4",
+            (val - 9.86e4).abs() < 1e3,
+            "π/k² = {} barns, expected ~9.86e4",
             val
         );
     }

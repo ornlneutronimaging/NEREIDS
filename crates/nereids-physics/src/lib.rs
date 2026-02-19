@@ -8,9 +8,10 @@
 //! - [`channel`] — Wave number, ρ parameter, statistical weight calculations
 //! - [`reich_moore`] — Reich-Moore R-matrix cross-section formalism
 //! - [`slbw`] — Single-Level Breit-Wigner formalism (validation/comparison)
+//! - [`doppler`] — Free Gas Model Doppler broadening
+//! - [`resolution`] — Instrument resolution broadening (Gaussian convolution)
 //!
 //! ## Planned Modules
-//! - `broadening` — Doppler (FGM, Leal-Hwang) and resolution broadening
 //! - `transmission` — Beer-Lambert transmission forward model
 //!
 //! ## SAMMY Reference
@@ -20,6 +21,8 @@
 //! - Resolution: `convolution/` module, manual Sec 3.2
 
 pub mod channel;
+pub mod doppler;
 pub mod penetrability;
 pub mod reich_moore;
+pub mod resolution;
 pub mod slbw;
