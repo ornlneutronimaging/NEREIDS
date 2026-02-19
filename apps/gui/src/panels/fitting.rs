@@ -177,7 +177,7 @@ pub fn fitting_panel(ui: &mut egui::Ui, state: &mut AppState) {
             })
             .inner;
 
-        if changed {
+        if changed || state.roi.is_none() {
             state.roi = Some(roi);
         }
     }

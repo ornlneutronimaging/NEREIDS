@@ -26,7 +26,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy (Rust crates + GUI)
-        run: cargo clippy --workspace --exclude nereids-python -- -D warnings
+        run: cargo clippy --workspace --exclude nereids-python --all-targets -- -D warnings
 
   test:
     name: Test

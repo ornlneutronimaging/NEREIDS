@@ -243,7 +243,7 @@ mod tests {
         let thickness = 0.001; // atoms/barn (thin)
 
         // Evaluate at a few energies
-        let energies = vec![1.0, 3.0, 6.674, 10.0, 20.0];
+        let energies = [1.0, 3.0, 6.674, 10.0, 20.0];
         let xs: Vec<f64> = energies
             .iter()
             .map(|&e| reich_moore::cross_sections_at_energy(&data, e).total)

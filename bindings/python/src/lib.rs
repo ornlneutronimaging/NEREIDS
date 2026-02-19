@@ -254,6 +254,11 @@ fn fit_spectrum(
     let t = measured_t.as_slice()?;
     let s = sigma.as_slice()?;
 
+    if t.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "measured_t must not be empty",
+        ));
+    }
     if t.len() != s.len() {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
             "measured_t length ({}) must match sigma length ({})",

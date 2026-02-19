@@ -663,6 +663,7 @@ mod tests {
     use nereids_endf::resonance::{LGroup, Resonance, ResonanceRange};
 
     /// Create a simple single-resonance test case for validation.
+    #[allow(clippy::too_many_arguments)]
     fn make_single_resonance_data(
         energy: f64,
         gamma_n: f64,

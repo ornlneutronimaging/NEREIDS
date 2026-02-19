@@ -58,6 +58,21 @@ pub struct SpectrumFitResult {
 pub fn fit_spectrum(measured_t: &[f64], sigma: &[f64], config: &FitConfig) -> SpectrumFitResult {
     let n_isotopes = config.resonance_data.len();
 
+    assert_eq!(
+        config.initial_densities.len(),
+        n_isotopes,
+        "initial_densities length ({}) must match resonance_data length ({})",
+        config.initial_densities.len(),
+        n_isotopes,
+    );
+    assert_eq!(
+        measured_t.len(),
+        config.energies.len(),
+        "measured_t length ({}) must match energies length ({})",
+        measured_t.len(),
+        config.energies.len(),
+    );
+
     let instrument = config
         .resolution
         .map(|r| InstrumentParams { resolution: r });
