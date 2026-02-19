@@ -3,6 +3,7 @@
 use ndarray::{Array2, Array3};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
 use nereids_endf::resonance::ResonanceData;
@@ -62,9 +63,10 @@ pub struct AppState {
     pub is_fitting: bool,
     pub is_fetching_endf: bool,
 
-    // -- Background task receivers --
+    // -- Background task receivers and cancellation --
     pub pending_spatial: Option<mpsc::Receiver<SpatialResult>>,
     pub pending_endf: Option<mpsc::Receiver<EndfFetchResult>>,
+    pub cancel_token: Arc<AtomicBool>,
 
     // -- Preview image texture --
     pub preview_image: Option<Array2<f64>>,
@@ -98,9 +100,14 @@ pub enum Tab {
 }
 
 impl AppState {
-    /// Cancel any in-flight background tasks by dropping their receivers.
-    /// The background threads will notice the closed channel and exit.
+    /// Cancel any in-flight background tasks.
+    /// Signals the cancellation token so threads exit early, drops receivers,
+    /// and issues a fresh token for future tasks.
     pub fn cancel_pending_tasks(&mut self) {
+        // Signal existing threads to stop
+        self.cancel_token.store(true, Ordering::Relaxed);
+        // Replace with a fresh token for future tasks
+        self.cancel_token = Arc::new(AtomicBool::new(false));
         self.pending_spatial = None;
         self.pending_endf = None;
         self.is_fitting = false;
@@ -157,6 +164,7 @@ impl Default for AppState {
 
             pending_spatial: None,
             pending_endf: None,
+            cancel_token: Arc::new(AtomicBool::new(false)),
 
             preview_image: None,
             map_display_isotope: 0,

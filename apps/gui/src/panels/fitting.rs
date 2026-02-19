@@ -4,6 +4,7 @@ use crate::state::{AppState, EndfFetchResult, IsotopeEntry, RoiSelection, Tab};
 use nereids_endf::retrieval::EndfLibrary;
 use nereids_pipeline::pipeline::FitConfig;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 
 /// Draw the fitting controls panel.
@@ -269,10 +270,14 @@ fn fetch_endf_data(state: &mut AppState) {
     state.pending_endf = Some(rx);
     state.is_fetching_endf = true;
     state.status_message = "Fetching ENDF data...".into();
+    let cancel = Arc::clone(&state.cancel_token);
 
     std::thread::spawn(move || {
         let retriever = nereids_endf::retrieval::EndfRetriever::new();
         for (index, isotope, symbol, library) in work {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
             let mat = retrieval::mat_number(&isotope).unwrap();
             let result = match retriever.get_endf_file(&isotope, library, mat) {
                 Ok((_path, endf_text)) => {
@@ -283,6 +288,9 @@ fn fetch_endf_data(state: &mut AppState) {
                 }
                 Err(e) => Err(format!("Fetch error for {}: {}", symbol, e)),
             };
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
             let _ = tx.send(EndfFetchResult {
                 index,
                 symbol,
@@ -443,6 +451,7 @@ fn run_spatial_map(state: &mut AppState) {
     state.pending_spatial = Some(rx);
     state.is_fitting = true;
     state.status_message = "Running spatial mapping...".into();
+    let cancel = Arc::clone(&state.cancel_token);
 
     std::thread::spawn(move || {
         let result = nereids_pipeline::spatial::spatial_map(
@@ -451,6 +460,9 @@ fn run_spatial_map(state: &mut AppState) {
             &config,
             dead_pixels.as_ref(),
         );
-        let _ = tx.send(result);
+        // Only send result if not cancelled — receiver may already be dropped
+        if !cancel.load(Ordering::Relaxed) {
+            let _ = tx.send(result);
+        }
     });
 }

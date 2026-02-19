@@ -124,7 +124,9 @@ pub fn data_panel(ui: &mut egui::Ui, state: &mut AppState) {
     ui.add_space(8.0);
 
     // --- Normalize button ---
-    let can_normalize = state.sample_data.is_some() && state.open_beam_data.is_some();
+    // Disable while fitting is in progress to prevent replacing data under an active task.
+    let can_normalize =
+        state.sample_data.is_some() && state.open_beam_data.is_some() && !state.is_fitting;
     ui.add_enabled_ui(can_normalize, |ui| {
         if ui.button("Normalize").clicked() {
             normalize_data(state);
@@ -172,6 +174,11 @@ fn load_tiff_data(state: &mut AppState) {
 }
 
 fn normalize_data(state: &mut AppState) {
+    // Cancel any in-flight tasks that depend on the old normalization
+    state.cancel_pending_tasks();
+    state.pixel_fit_result = None;
+    state.spatial_result = None;
+
     let sample = match state.sample_data {
         Some(ref d) => d,
         None => return,
