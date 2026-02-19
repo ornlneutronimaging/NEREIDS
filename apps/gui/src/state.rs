@@ -2,6 +2,7 @@
 
 use ndarray::{Array2, Array3};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::mpsc;
 
 use nereids_endf::resonance::ResonanceData;
@@ -26,7 +27,7 @@ pub struct AppState {
     pub open_beam_path: Option<PathBuf>,
     pub sample_data: Option<Array3<f64>>,
     pub open_beam_data: Option<Array3<f64>>,
-    pub normalized: Option<NormalizedData>,
+    pub normalized: Option<Arc<NormalizedData>>,
     pub dead_pixels: Option<Array2<bool>>,
 
     // -- Beamline parameters --
@@ -94,6 +95,29 @@ pub struct RoiSelection {
 pub enum Tab {
     Spectrum,
     Map,
+}
+
+impl AppState {
+    /// Cancel any in-flight background tasks by dropping their receivers.
+    /// The background threads will notice the closed channel and exit.
+    pub fn cancel_pending_tasks(&mut self) {
+        self.pending_spatial = None;
+        self.pending_endf = None;
+        self.is_fitting = false;
+        self.is_fetching_endf = false;
+    }
+
+    /// Clear pixel selection, ROI, results, and cancel pending tasks.
+    /// Called when the underlying data changes.
+    pub fn invalidate_results(&mut self) {
+        self.cancel_pending_tasks();
+        self.selected_pixel = None;
+        self.roi = None;
+        self.pixel_fit_result = None;
+        self.spatial_result = None;
+        self.preview_image = None;
+        self.energies = None;
+    }
 }
 
 impl Default for AppState {

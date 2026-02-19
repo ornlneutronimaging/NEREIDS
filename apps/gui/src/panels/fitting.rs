@@ -3,6 +3,7 @@
 use crate::state::{AppState, EndfFetchResult, IsotopeEntry, RoiSelection, Tab};
 use nereids_endf::retrieval::EndfLibrary;
 use nereids_pipeline::pipeline::FitConfig;
+use std::sync::Arc;
 use std::sync::mpsc;
 
 /// Draw the fitting controls panel.
@@ -33,66 +34,78 @@ pub fn fitting_panel(ui: &mut egui::Ui, state: &mut AppState) {
 
     ui.add_space(4.0);
 
+    // Disable isotope add/remove/edit while ENDF fetch is in progress
+    // to prevent index mismatch between fetch results and modified list.
+    let isotope_locked = state.is_fetching_endf;
+
     // Add isotope row
-    ui.horizontal(|ui| {
-        if ui.button("Add Isotope").clicked() {
-            state.isotope_entries.push(IsotopeEntry {
-                z: 92,
-                a: 238,
-                symbol: "U-238".into(),
-                initial_density: 0.001,
-                resonance_data: None,
-                enabled: true,
-            });
-        }
+    ui.add_enabled_ui(!isotope_locked, |ui| {
+        ui.horizontal(|ui| {
+            if ui.button("Add Isotope").clicked() {
+                state.isotope_entries.push(IsotopeEntry {
+                    z: 92,
+                    a: 238,
+                    symbol: "U-238".into(),
+                    initial_density: 0.001,
+                    resonance_data: None,
+                    enabled: true,
+                });
+            }
+        });
     });
 
     // Isotope list
     let mut to_remove = None;
     for (idx, entry) in state.isotope_entries.iter_mut().enumerate() {
         ui.horizontal(|ui| {
-            ui.checkbox(&mut entry.enabled, "");
+            ui.add_enabled_ui(!isotope_locked, |ui| {
+                ui.checkbox(&mut entry.enabled, "");
 
-            let z_changed = ui
-                .add(
-                    egui::DragValue::new(&mut entry.z)
-                        .prefix("Z=")
-                        .range(1..=118),
-                )
-                .changed();
-            let a_changed = ui
-                .add(
-                    egui::DragValue::new(&mut entry.a)
-                        .prefix("A=")
-                        .range(1..=300),
-                )
-                .changed();
+                let z_changed = ui
+                    .add(
+                        egui::DragValue::new(&mut entry.z)
+                            .prefix("Z=")
+                            .range(1..=118),
+                    )
+                    .changed();
+                let a_changed = ui
+                    .add(
+                        egui::DragValue::new(&mut entry.a)
+                            .prefix("A=")
+                            .range(1..=300),
+                    )
+                    .changed();
 
-            if z_changed || a_changed {
-                entry.symbol = format!(
-                    "{}-{}",
-                    nereids_core::elements::element_symbol(entry.z).unwrap_or("??"),
-                    entry.a
-                );
-                entry.resonance_data = None;
-            }
+                if z_changed || a_changed {
+                    entry.symbol = format!(
+                        "{}-{}",
+                        nereids_core::elements::element_symbol(entry.z).unwrap_or("??"),
+                        entry.a
+                    );
+                    entry.resonance_data = None;
+                }
+            });
 
             ui.label(&entry.symbol);
 
-            ui.add(
-                egui::DragValue::new(&mut entry.initial_density)
-                    .prefix("rho0=")
-                    .speed(0.0001)
-                    .range(0.0..=1.0),
-            );
+            ui.add_enabled_ui(!isotope_locked, |ui| {
+                ui.add(
+                    egui::DragValue::new(&mut entry.initial_density)
+                        .prefix("rho0=")
+                        .speed(0.0001)
+                        .range(0.0..=1.0),
+                );
+            });
 
             if entry.resonance_data.is_some() {
                 ui.label("OK");
             }
 
-            if ui.small_button("X").clicked() {
-                to_remove = Some(idx);
-            }
+            ui.add_enabled_ui(!isotope_locked, |ui| {
+                if ui.small_button("X").clicked() {
+                    to_remove = Some(idx);
+                }
+            });
         });
     }
     if let Some(idx) = to_remove {
@@ -420,12 +433,10 @@ fn run_spatial_map(state: &mut AppState) {
     };
 
     let norm = match state.normalized {
-        Some(ref n) => n,
+        Some(ref n) => Arc::clone(n),
         None => return,
     };
 
-    let transmission = norm.transmission.clone();
-    let uncertainty = norm.uncertainty.clone();
     let dead_pixels = state.dead_pixels.clone();
 
     let (tx, rx) = mpsc::channel();
@@ -435,8 +446,8 @@ fn run_spatial_map(state: &mut AppState) {
 
     std::thread::spawn(move || {
         let result = nereids_pipeline::spatial::spatial_map(
-            &transmission,
-            &uncertainty,
+            &norm.transmission,
+            &norm.uncertainty,
             &config,
             dead_pixels.as_ref(),
         );

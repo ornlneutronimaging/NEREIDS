@@ -2,6 +2,7 @@
 
 use crate::state::AppState;
 use ndarray::Axis;
+use std::sync::Arc;
 
 /// Draw the data loading panel in the left sidebar.
 pub fn data_panel(ui: &mut egui::Ui, state: &mut AppState) {
@@ -27,7 +28,7 @@ pub fn data_panel(ui: &mut egui::Ui, state: &mut AppState) {
             state.sample_path = Some(dir);
             state.sample_data = None;
             state.normalized = None;
-            invalidate_results(state);
+            state.invalidate_results();
             state.status_message = "Sample directory selected".into();
         }
     });
@@ -51,7 +52,7 @@ pub fn data_panel(ui: &mut egui::Ui, state: &mut AppState) {
             state.open_beam_path = Some(dir);
             state.open_beam_data = None;
             state.normalized = None;
-            invalidate_results(state);
+            state.invalidate_results();
             state.status_message = "Open beam directory selected".into();
         }
     });
@@ -139,18 +140,8 @@ pub fn data_panel(ui: &mut egui::Ui, state: &mut AppState) {
     }
 }
 
-/// Clear pixel selection, ROI, and all fit results when data changes.
-fn invalidate_results(state: &mut AppState) {
-    state.selected_pixel = None;
-    state.roi = None;
-    state.pixel_fit_result = None;
-    state.spatial_result = None;
-    state.preview_image = None;
-    state.energies = None;
-}
-
 fn load_tiff_data(state: &mut AppState) {
-    invalidate_results(state);
+    state.invalidate_results();
     if let Some(ref sample_dir) = state.sample_path {
         match nereids_io::tiff_stack::load_tiff_directory(sample_dir) {
             Ok(data) => {
@@ -212,7 +203,7 @@ fn normalize_data(state: &mut AppState) {
                 }
             }
 
-            state.normalized = Some(norm);
+            state.normalized = Some(Arc::new(norm));
             state.status_message = "Normalization complete".into();
         }
         Err(e) => {

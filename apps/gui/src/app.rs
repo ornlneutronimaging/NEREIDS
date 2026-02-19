@@ -105,13 +105,11 @@ fn poll_pending_tasks(state: &mut AppState) {
 
     // Poll ENDF fetch results (streamed one per isotope)
     if let Some(ref rx) = state.pending_endf {
-        let mut any_received = false;
-        let mut all_done = false;
+        let mut disconnected = false;
         // Drain all available results this frame
         loop {
             match rx.try_recv() {
                 Ok(fetch) => {
-                    any_received = true;
                     if let Some(entry) = state.isotope_entries.get_mut(fetch.index) {
                         match fetch.result {
                             Ok(data) => {
@@ -126,13 +124,13 @@ fn poll_pending_tasks(state: &mut AppState) {
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    all_done = true;
+                    disconnected = true;
                     break;
                 }
             }
         }
-        if all_done || (any_received && rx.try_recv().is_err()) {
-            // Channel closed = thread finished
+        // Only finalize when the sender is dropped (thread finished)
+        if disconnected {
             if !state
                 .isotope_entries
                 .iter()
