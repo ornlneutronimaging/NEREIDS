@@ -5,6 +5,7 @@
 
 use ndarray::{Array2, Array3};
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::pipeline::{FitConfig, SpectrumFitResult, fit_spectrum};
 
@@ -33,14 +34,19 @@ pub struct SpatialResult {
 /// * `uncertainty` — 3D array (n_energies, height, width) of measurement uncertainties.
 /// * `config` — Fit configuration (shared across all pixels).
 /// * `dead_pixels` — Optional dead pixel mask. Dead pixels are skipped.
+/// * `cancel` — Optional cancellation token. When set to `true`, in-flight
+///   rayon tasks finish but no new pixels are started. The function returns
+///   partial results for pixels completed before cancellation.
 ///
 /// # Returns
 /// Spatial result with density maps, uncertainty maps, and fit quality.
+/// If cancelled, only pixels completed before the signal are included.
 pub fn spatial_map(
     transmission: &Array3<f64>,
     uncertainty: &Array3<f64>,
     config: &FitConfig,
     dead_pixels: Option<&Array2<bool>>,
+    cancel: Option<&AtomicBool>,
 ) -> SpatialResult {
     let shape = transmission.shape();
     let (n_energies, height, width) = (shape[0], shape[1], shape[2]);
@@ -59,10 +65,15 @@ pub fn spatial_map(
         }
     }
 
-    // Fit all pixels in parallel
+    // Fit all pixels in parallel, skipping new work when cancelled
     let results: Vec<((usize, usize), SpectrumFitResult)> = pixel_coords
         .par_iter()
-        .map(|&(y, x)| {
+        .filter_map(|&(y, x)| {
+            // Check cancellation before starting each pixel
+            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                return None;
+            }
+
             // Extract spectrum for this pixel
             let t_spectrum: Vec<f64> = (0..n_energies).map(|e| transmission[[e, y, x]]).collect();
             let sigma: Vec<f64> = (0..n_energies)
@@ -70,7 +81,7 @@ pub fn spatial_map(
                 .collect();
 
             let result = fit_spectrum(&t_spectrum, &sigma, config);
-            ((y, x), result)
+            Some(((y, x), result))
         })
         .collect();
 
@@ -248,7 +259,7 @@ mod tests {
             lm_config: LmConfig::default(),
         };
 
-        let result = spatial_map(&transmission, &uncertainty, &config, None);
+        let result = spatial_map(&transmission, &uncertainty, &config, None, None);
 
         assert_eq!(result.n_total, 9);
         assert_eq!(result.n_converged, 9);
@@ -312,7 +323,7 @@ mod tests {
             lm_config: LmConfig::default(),
         };
 
-        let result = spatial_map(&transmission, &uncertainty, &config, Some(&dead));
+        let result = spatial_map(&transmission, &uncertainty, &config, Some(&dead), None);
 
         assert_eq!(result.n_total, 3); // 4 pixels - 1 dead = 3
         assert_eq!(result.density_maps[0][[0, 0]], 0.0); // dead pixel stays at 0

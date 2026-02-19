@@ -459,6 +459,7 @@ fn run_spatial_map(state: &mut AppState) {
             &norm.uncertainty,
             &config,
             dead_pixels.as_ref(),
+            Some(&cancel),
         );
         // Only send result if not cancelled — receiver may already be dropped
         if !cancel.load(Ordering::Relaxed) {

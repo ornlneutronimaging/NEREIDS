@@ -25,6 +25,7 @@
 
 use ndarray::{Array2, Array3};
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use nereids_endf::resonance::ResonanceData;
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
@@ -147,11 +148,13 @@ pub fn estimate_nuisance(
 /// * `nuisance` — Nuisance parameters from Stage 1.
 /// * `config` — Sparse reconstruction configuration.
 /// * `dead_pixels` — Optional dead pixel mask.
+/// * `cancel` — Optional cancellation token. Checked per-pixel to stop early.
 pub fn sparse_reconstruct(
     sample_counts: &Array3<f64>,
     nuisance: &NuisanceParams,
     config: &SparseConfig,
     dead_pixels: Option<&Array2<bool>>,
+    cancel: Option<&AtomicBool>,
 ) -> SparseResult {
     let shape = sample_counts.shape();
     let (n_energies, height, width) = (shape[0], shape[1], shape[2]);
@@ -189,10 +192,15 @@ pub fn sparse_reconstruct(
         }
     }
 
-    // Fit all pixels in parallel
+    // Fit all pixels in parallel, skipping new work when cancelled
     let results: Vec<((usize, usize), PixelResult)> = pixel_coords
         .par_iter()
-        .map(|&(y, x)| {
+        .filter_map(|&(y, x)| {
+            // Check cancellation before starting each pixel
+            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                return None;
+            }
+
             // Extract counts for this pixel
             let y_obs: Vec<f64> = (0..n_energies)
                 .map(|e| sample_counts[[e, y, x]].max(0.0))
@@ -243,7 +251,7 @@ pub fn sparse_reconstruct(
                 converged: result.converged,
             };
 
-            ((y, x), pixel_result)
+            Some(((y, x), pixel_result))
         })
         .collect();
 
@@ -366,7 +374,7 @@ mod tests {
             poisson_config: PoissonConfig::default(),
         };
 
-        let result = sparse_reconstruct(&sample_counts, &nuisance, &config, None);
+        let result = sparse_reconstruct(&sample_counts, &nuisance, &config, None, None);
 
         assert_eq!(result.n_total, 4);
         assert!(
