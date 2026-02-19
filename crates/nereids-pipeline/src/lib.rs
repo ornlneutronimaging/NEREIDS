@@ -5,7 +5,9 @@
 //! This crate ties together all NEREIDS components into a complete pipeline:
 //! data loading → normalization → forward model → fitting → spatial mapping.
 //!
-//! ## Modules (planned)
-//! - `pipeline` — Single-spectrum analysis pipeline
-//! - `spatial` — Per-pixel/voxel parallel mapping (rayon)
-//! - `sparse` — TRINIDI-inspired two-stage reconstruction for low-count data
+//! ## Modules
+//! - [`pipeline`] — Single-spectrum analysis pipeline (fit_spectrum)
+//! - [`spatial`] — Per-pixel parallel mapping with rayon, ROI fitting
+
+pub mod pipeline;
+pub mod spatial;
