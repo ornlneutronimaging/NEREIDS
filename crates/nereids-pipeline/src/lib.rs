@@ -8,6 +8,8 @@
 //! ## Modules
 //! - [`pipeline`] — Single-spectrum analysis pipeline (fit_spectrum)
 //! - [`spatial`] — Per-pixel parallel mapping with rayon, ROI fitting
+//! - [`sparse`] — TRINIDI-inspired two-stage reconstruction for low-count data
 
 pub mod pipeline;
+pub mod sparse;
 pub mod spatial;

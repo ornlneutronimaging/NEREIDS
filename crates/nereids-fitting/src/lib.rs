@@ -5,6 +5,7 @@
 //! ## Modules
 //! - [`parameters`] — Fit parameter types, bounds, constraints
 //! - [`lm`] — Levenberg-Marquardt least-squares optimizer
+//! - [`poisson`] — Poisson-likelihood optimizer for low-count data
 //! - [`transmission_model`] — Transmission forward model adapter for fitting
 //!
 //! ## SAMMY Reference
@@ -15,4 +16,5 @@
 
 pub mod lm;
 pub mod parameters;
+pub mod poisson;
 pub mod transmission_model;
