@@ -1,0 +1,316 @@
+//! Transmission normalization from raw neutron counts.
+//!
+//! Converts raw sample and open-beam (OB) neutron counts into a transmission
+//! spectrum, following the ORNL Method 2 approach used in PLEIADES.
+//!
+//! ## Method 2 Normalization
+//!
+//! For each TOF bin and pixel:
+//!
+//!   T[tof, y, x] = (C_sample / C_ob) × (PC_ob / PC_sample)
+//!
+//! where:
+//! - C_sample = raw sample counts (dark-current subtracted)
+//! - C_ob = open-beam counts (dark-current subtracted)
+//! - PC_sample = proton charge for sample run
+//! - PC_ob = proton charge for open-beam run
+//!
+//! The proton charge ratio corrects for different beam exposures.
+//!
+//! ## Uncertainty
+//!
+//! Assuming Poisson counting statistics:
+//!
+//!   σ_T / T = √(1/C_sample + 1/C_ob)
+//!
+//! ## PLEIADES Reference
+//! - `processing/normalization_ornl.py` — Method 2 implementation
+
+use ndarray::{Array1, Array3, Axis};
+
+use crate::error::IoError;
+
+/// Parameters for transmission normalization.
+#[derive(Debug, Clone)]
+pub struct NormalizationParams {
+    /// Proton charge for the sample measurement.
+    pub proton_charge_sample: f64,
+    /// Proton charge for the open-beam measurement.
+    pub proton_charge_ob: f64,
+}
+
+/// Result of normalization: transmission and its uncertainty.
+#[derive(Debug)]
+pub struct NormalizedData {
+    /// Transmission values, shape (n_tof, height, width).
+    pub transmission: Array3<f64>,
+    /// Uncertainty on transmission, shape (n_tof, height, width).
+    pub uncertainty: Array3<f64>,
+}
+
+/// Normalize raw data to transmission using Method 2.
+///
+/// T = (C_sample / C_ob) × (PC_ob / PC_sample)
+///
+/// # Arguments
+/// * `sample` — Raw sample counts, shape (n_tof, height, width).
+/// * `open_beam` — Open-beam counts, shape (n_tof, height, width).
+/// * `params` — Normalization parameters (proton charges).
+/// * `dark_current` — Optional dark-current image to subtract, shape (height, width).
+///   If provided, it is subtracted from each TOF frame of both sample and OB.
+///
+/// # Returns
+/// Normalized transmission and uncertainty arrays.
+pub fn normalize(
+    sample: &Array3<f64>,
+    open_beam: &Array3<f64>,
+    params: &NormalizationParams,
+    dark_current: Option<&ndarray::Array2<f64>>,
+) -> Result<NormalizedData, IoError> {
+    if sample.shape() != open_beam.shape() {
+        return Err(IoError::ShapeMismatch(format!(
+            "Sample shape {:?} != open-beam shape {:?}",
+            sample.shape(),
+            open_beam.shape()
+        )));
+    }
+
+    if params.proton_charge_sample <= 0.0 || params.proton_charge_ob <= 0.0 {
+        return Err(IoError::InvalidParameter(
+            "Proton charges must be positive".into(),
+        ));
+    }
+
+    let shape = sample.shape();
+    let (n_tof, height, width) = (shape[0], shape[1], shape[2]);
+
+    let pc_ratio = params.proton_charge_ob / params.proton_charge_sample;
+
+    let mut transmission = Array3::<f64>::zeros((n_tof, height, width));
+    let mut uncertainty = Array3::<f64>::zeros((n_tof, height, width));
+
+    for t in 0..n_tof {
+        for y in 0..height {
+            for x in 0..width {
+                let dc = dark_current.map_or(0.0, |dc| dc[[y, x]]);
+                let c_s = (sample[[t, y, x]] - dc).max(0.0);
+                let c_o = (open_beam[[t, y, x]] - dc).max(0.0);
+
+                if c_o > 0.0 {
+                    let t_val = (c_s / c_o) * pc_ratio;
+                    transmission[[t, y, x]] = t_val;
+
+                    // Poisson uncertainty: σ_T/T = √(1/C_s + 1/C_o)
+                    let rel_err = if c_s > 0.0 {
+                        (1.0 / c_s + 1.0 / c_o).sqrt()
+                    } else {
+                        f64::INFINITY
+                    };
+                    uncertainty[[t, y, x]] = t_val * rel_err;
+                } else {
+                    // No open-beam counts: mark as invalid
+                    transmission[[t, y, x]] = 0.0;
+                    uncertainty[[t, y, x]] = f64::INFINITY;
+                }
+            }
+        }
+    }
+
+    Ok(NormalizedData {
+        transmission,
+        uncertainty,
+    })
+}
+
+/// Extract a single spectrum (all TOF bins) from a pixel in the 3D array.
+///
+/// # Arguments
+/// * `data` — 3D array with shape (n_tof, height, width).
+/// * `y` — Pixel row.
+/// * `x` — Pixel column.
+///
+/// # Returns
+/// 1D array of length n_tof.
+pub fn extract_spectrum(data: &Array3<f64>, y: usize, x: usize) -> Array1<f64> {
+    data.slice(ndarray::s![.., y, x]).to_owned()
+}
+
+/// Average spectra over a rectangular region of interest.
+///
+/// # Arguments
+/// * `data` — 3D array with shape (n_tof, height, width).
+/// * `y_range` — Row range (start..end).
+/// * `x_range` — Column range (start..end).
+///
+/// # Returns
+/// Averaged 1D spectrum of length n_tof.
+pub fn average_roi(
+    data: &Array3<f64>,
+    y_range: std::ops::Range<usize>,
+    x_range: std::ops::Range<usize>,
+) -> Array1<f64> {
+    let roi = data.slice(ndarray::s![.., y_range, x_range]);
+    // Mean over spatial dimensions (axes 1 and 2)
+    roi.mean_axis(Axis(2)).unwrap().mean_axis(Axis(1)).unwrap()
+}
+
+/// Detect dead pixels (zero counts across all TOF bins).
+///
+/// # Arguments
+/// * `data` — 3D array with shape (n_tof, height, width).
+///
+/// # Returns
+/// 2D boolean mask, shape (height, width). `true` = dead pixel.
+pub fn detect_dead_pixels(data: &Array3<f64>) -> ndarray::Array2<bool> {
+    let shape = data.shape();
+    let (height, width) = (shape[1], shape[2]);
+    let mut mask = ndarray::Array2::from_elem((height, width), false);
+
+    for y in 0..height {
+        for x in 0..width {
+            let all_zero = (0..shape[0]).all(|t| data[[t, y, x]] == 0.0);
+            mask[[y, x]] = all_zero;
+        }
+    }
+
+    mask
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::Array2;
+
+    #[test]
+    fn test_normalize_equal_charges() {
+        // Equal proton charges, PC ratio = 1
+        // C_s = 50, C_o = 100 → T = 0.5
+        let sample = Array3::from_elem((1, 1, 1), 50.0);
+        let ob = Array3::from_elem((1, 1, 1), 100.0);
+        let params = NormalizationParams {
+            proton_charge_sample: 1.0,
+            proton_charge_ob: 1.0,
+        };
+
+        let result = normalize(&sample, &ob, &params, None).unwrap();
+        assert!((result.transmission[[0, 0, 0]] - 0.5).abs() < 1e-10);
+
+        // Uncertainty: σ_T = T × √(1/50 + 1/100) = 0.5 × √(0.03) ≈ 0.0866
+        let expected_unc = 0.5 * (1.0 / 50.0 + 1.0 / 100.0_f64).sqrt();
+        assert!(
+            (result.uncertainty[[0, 0, 0]] - expected_unc).abs() < 1e-10,
+            "got {}, expected {}",
+            result.uncertainty[[0, 0, 0]],
+            expected_unc,
+        );
+    }
+
+    #[test]
+    fn test_normalize_proton_charge_correction() {
+        // PC_sample = 2, PC_ob = 1 → ratio = 0.5
+        // C_s = 100, C_o = 100 → T = 1.0 × 0.5 = 0.5
+        let sample = Array3::from_elem((1, 1, 1), 100.0);
+        let ob = Array3::from_elem((1, 1, 1), 100.0);
+        let params = NormalizationParams {
+            proton_charge_sample: 2.0,
+            proton_charge_ob: 1.0,
+        };
+
+        let result = normalize(&sample, &ob, &params, None).unwrap();
+        assert!((result.transmission[[0, 0, 0]] - 0.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_normalize_with_dark_current() {
+        // C_s_raw = 60, C_o_raw = 110, DC = 10
+        // C_s = 50, C_o = 100 → T = 0.5
+        let sample = Array3::from_elem((1, 1, 1), 60.0);
+        let ob = Array3::from_elem((1, 1, 1), 110.0);
+        let dc = Array2::from_elem((1, 1), 10.0);
+        let params = NormalizationParams {
+            proton_charge_sample: 1.0,
+            proton_charge_ob: 1.0,
+        };
+
+        let result = normalize(&sample, &ob, &params, Some(&dc)).unwrap();
+        assert!((result.transmission[[0, 0, 0]] - 0.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_normalize_zero_ob() {
+        // Zero open-beam counts → T = 0, uncertainty = INF
+        let sample = Array3::from_elem((1, 1, 1), 50.0);
+        let ob = Array3::from_elem((1, 1, 1), 0.0);
+        let params = NormalizationParams {
+            proton_charge_sample: 1.0,
+            proton_charge_ob: 1.0,
+        };
+
+        let result = normalize(&sample, &ob, &params, None).unwrap();
+        assert_eq!(result.transmission[[0, 0, 0]], 0.0);
+        assert!(result.uncertainty[[0, 0, 0]].is_infinite());
+    }
+
+    #[test]
+    fn test_normalize_shape_mismatch() {
+        let sample = Array3::from_elem((2, 3, 4), 1.0);
+        let ob = Array3::from_elem((2, 3, 5), 1.0);
+        let params = NormalizationParams {
+            proton_charge_sample: 1.0,
+            proton_charge_ob: 1.0,
+        };
+
+        let result = normalize(&sample, &ob, &params, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_spectrum() {
+        // 3 TOF bins, 2×2 image
+        let mut data = Array3::<f64>::zeros((3, 2, 2));
+        data[[0, 1, 0]] = 10.0;
+        data[[1, 1, 0]] = 20.0;
+        data[[2, 1, 0]] = 30.0;
+
+        let spectrum = extract_spectrum(&data, 1, 0);
+        assert_eq!(spectrum.len(), 3);
+        assert_eq!(spectrum[0], 10.0);
+        assert_eq!(spectrum[1], 20.0);
+        assert_eq!(spectrum[2], 30.0);
+    }
+
+    #[test]
+    fn test_average_roi() {
+        // 2 TOF bins, 4×4 image. Set a 2×2 region to known values.
+        let mut data = Array3::<f64>::zeros((2, 4, 4));
+        // TOF bin 0: region [1..3, 1..3] = 100
+        for y in 1..3 {
+            for x in 1..3 {
+                data[[0, y, x]] = 100.0;
+                data[[1, y, x]] = 200.0;
+            }
+        }
+
+        let avg = average_roi(&data, 1..3, 1..3);
+        assert_eq!(avg.len(), 2);
+        assert!((avg[0] - 100.0).abs() < 1e-10);
+        assert!((avg[1] - 200.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_detect_dead_pixels() {
+        let mut data = Array3::<f64>::zeros((3, 2, 2));
+        // Pixel (0,0) is dead (all zeros)
+        // Pixel (0,1) has a count in frame 1
+        data[[1, 0, 1]] = 5.0;
+        // Pixel (1,0) has counts
+        data[[0, 1, 0]] = 10.0;
+        // Pixel (1,1) is dead
+
+        let mask = detect_dead_pixels(&data);
+        assert!(mask[[0, 0]]); // dead
+        assert!(!mask[[0, 1]]); // alive
+        assert!(!mask[[1, 0]]); // alive
+        assert!(mask[[1, 1]]); // dead
+    }
+}
