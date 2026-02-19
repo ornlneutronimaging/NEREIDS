@@ -15,7 +15,7 @@ python-source = "bindings/python/python"
 module-name = "nereids"
 features = ["pyo3/extension-module"]
 
-[tool.pixi.project]
+[tool.pixi.workspace]
 channels = ["conda-forge"]
 platforms = ["osx-arm64", "linux-64"]
 
@@ -28,8 +28,8 @@ matplotlib = ">=3.7"
 jupyter = ">=1.0"
 
 [tool.pixi.tasks]
-build = "maturin develop --manifest-path bindings/python/Cargo.toml"
-test-rust = "cargo test --workspace"
+build = { cmd = "env -u VIRTUAL_ENV maturin develop --manifest-path bindings/python/Cargo.toml" }
+test-rust = { cmd = "env -u VIRTUAL_ENV cargo test --workspace" }
 test-python = "python -m pytest tests/"
 test = { depends-on = ["test-rust", "test-python"] }
 fmt = "cargo fmt --all"

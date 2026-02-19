@@ -11,4 +11,11 @@ crate-type = ["cdylib"]
 
 [dependencies]
 nereids-core = { workspace = true }
+nereids-endf = { workspace = true }
+nereids-physics = { workspace = true }
+nereids-io = { workspace = true }
+nereids-fitting = { workspace = true }
 nereids-pipeline = { workspace = true }
+pyo3 = { workspace = true }
+numpy = { workspace = true }
+ndarray = { workspace = true }
