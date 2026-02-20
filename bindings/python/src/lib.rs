@@ -400,7 +400,7 @@ fn energy_to_tof(energy_ev: f64, flight_path_m: f64) -> f64 {
 /// Args:
 ///     z: Atomic number (e.g. 92 for uranium).
 ///     a: Mass number (e.g. 238).
-///     library: ENDF library name. One of "endf8.0" (default), "endf8.1",
+///     library: ENDF library name. One of "endf8.0", "endf8.1" (default),
 ///              "jeff3.3", "jendl5".
 ///     mat: ENDF MAT (material) number. If None, looks up from built-in table
 ///          (~40 common isotopes). Provide explicitly for uncommon isotopes.
@@ -408,7 +408,7 @@ fn energy_to_tof(energy_ev: f64, flight_path_m: f64) -> f64 {
 /// Returns:
 ///     ResonanceData parsed from the ENDF file.
 #[pyfunction]
-#[pyo3(signature = (z, a, library="endf8.0", mat=None))]
+#[pyo3(signature = (z, a, library="endf8.1", mat=None))]
 fn load_endf(z: u32, a: u32, library: &str, mat: Option<u32>) -> PyResult<PyResonanceData> {
     let lib = match library {
         "endf8.0" | "endf/b-viii.0" => EndfLibrary::EndfB8_0,
