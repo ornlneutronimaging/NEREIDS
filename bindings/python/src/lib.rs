@@ -102,13 +102,24 @@ impl PyResonanceData {
             .unwrap_or(0.0)
     }
 
-    /// Scattering radius (fm) of the first resonance range.
+    /// Effective scattering radius (fm).
+    ///
+    /// Returns the global AP from the first range. If AP=0 (common in
+    /// ENDF Reich-Moore data that uses energy-dependent radii), falls back
+    /// to the first L-group's channel radius APL.
     #[getter]
     fn scattering_radius(&self) -> f64 {
         self.inner
             .ranges
             .first()
-            .map(|r| r.scattering_radius)
+            .map(|r| {
+                if r.scattering_radius != 0.0 {
+                    r.scattering_radius
+                } else {
+                    // Fall back to first L-group's channel radius
+                    r.l_groups.first().map(|lg| lg.apl).unwrap_or(0.0)
+                }
+            })
             .unwrap_or(0.0)
     }
 
@@ -442,6 +453,14 @@ fn load_endf(z: u32, a: u32, library: &str, mat: Option<u32>) -> PyResult<PyReso
 
     let data = parse_endf_file2(&contents)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("ENDF parse error: {}", e)))?;
+
+    // Validate that the parsed ENDF data matches the requested isotope.
+    if data.isotope.z != z || data.isotope.a != a {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "ENDF data mismatch: requested Z={} A={} but file contains Z={} A={}",
+            z, a, data.isotope.z, data.isotope.a
+        )));
+    }
 
     Ok(PyResonanceData { inner: data })
 }
