@@ -492,14 +492,14 @@ fn doppler_broaden<'py>(
         )));
     }
     validate_energy_grid(e)?;
-    if awr <= 0.0 {
+    if !awr.is_finite() || awr <= 0.0 {
         return Err(pyo3::exceptions::PyValueError::new_err(
-            "awr must be positive",
+            "awr must be finite and positive",
         ));
     }
-    if temperature_k < 0.0 {
+    if !temperature_k.is_finite() || temperature_k < 0.0 {
         return Err(pyo3::exceptions::PyValueError::new_err(
-            "temperature_k must be non-negative",
+            "temperature_k must be finite and non-negative",
         ));
     }
 
@@ -552,19 +552,19 @@ fn resolution_broaden<'py>(
         )));
     }
     validate_energy_grid(e)?;
-    if flight_path_m <= 0.0 {
+    if !flight_path_m.is_finite() || flight_path_m <= 0.0 {
         return Err(pyo3::exceptions::PyValueError::new_err(
-            "flight_path_m must be positive",
+            "flight_path_m must be finite and positive",
         ));
     }
-    if delta_t_us < 0.0 {
+    if !delta_t_us.is_finite() || delta_t_us < 0.0 {
         return Err(pyo3::exceptions::PyValueError::new_err(
-            "delta_t_us must be non-negative",
+            "delta_t_us must be finite and non-negative",
         ));
     }
-    if delta_l_m < 0.0 {
+    if !delta_l_m.is_finite() || delta_l_m < 0.0 {
         return Err(pyo3::exceptions::PyValueError::new_err(
-            "delta_l_m must be non-negative",
+            "delta_l_m must be finite and non-negative",
         ));
     }
 
