@@ -33,7 +33,8 @@ use nereids_endf::resonance::{
 use nereids_fitting::lm::{self, LmConfig};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
 use nereids_fitting::transmission_model::TransmissionFitModel;
-use nereids_physics::resolution::ResolutionParams;
+use nereids_physics::doppler::{self, DopplerParams};
+use nereids_physics::resolution::{self, ResolutionParams};
 use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
 
 /// Python wrapper for ENDF resonance data.
@@ -427,6 +428,159 @@ fn beer_lambert<'py>(
     Ok(PyArray1::from_vec(py, t))
 }
 
+/// Validate that an energy grid is finite, positive, and sorted ascending.
+fn validate_energy_grid(e: &[f64]) -> PyResult<()> {
+    if e.is_empty() {
+        return Ok(());
+    }
+    if !e[0].is_finite() || e[0] <= 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "energies must be finite and positive",
+        ));
+    }
+    for i in 1..e.len() {
+        if !e[i].is_finite() || e[i] <= 0.0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "energies must be finite and positive",
+            ));
+        }
+        if e[i] <= e[i - 1] {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "energies must be sorted in strictly ascending order",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Apply Free Gas Model (FGM) Doppler broadening to a cross-section array.
+///
+/// Convolves the input cross-sections with a Gaussian kernel whose width
+/// depends on the sample temperature and atomic weight ratio. This is the
+/// same broadening applied internally by `forward_model()`, but exposed here
+/// so users can broaden individual components (capture, elastic, fission)
+/// independently.
+///
+/// Args:
+///     energies: Energy grid in eV (1D numpy array, sorted ascending).
+///     cross_sections: Cross-sections in barns (1D numpy array, same length).
+///     awr: Atomic weight ratio (target mass / neutron mass).
+///     temperature_k: Sample temperature in Kelvin.
+///
+/// Returns:
+///     1D numpy array of Doppler-broadened cross-sections in barns.
+///
+/// Reference:
+///     SAMMY Manual Section III.B.1 (Free-Gas Model of Doppler Broadening).
+#[pyfunction]
+#[pyo3(signature = (energies, cross_sections, awr, temperature_k))]
+fn doppler_broaden<'py>(
+    py: Python<'py>,
+    energies: PyReadonlyArray1<f64>,
+    cross_sections: PyReadonlyArray1<f64>,
+    awr: f64,
+    temperature_k: f64,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let e = energies.as_slice()?;
+    let xs = cross_sections.as_slice()?;
+
+    if e.len() != xs.len() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "energies length ({}) must match cross_sections length ({})",
+            e.len(),
+            xs.len(),
+        )));
+    }
+    validate_energy_grid(e)?;
+    if !awr.is_finite() || awr <= 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "awr must be finite and positive",
+        ));
+    }
+    if !temperature_k.is_finite() || temperature_k < 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "temperature_k must be finite and non-negative",
+        ));
+    }
+
+    if temperature_k == 0.0 {
+        return Ok(PyArray1::from_vec(py, xs.to_vec()));
+    }
+
+    let params = DopplerParams { temperature_k, awr };
+    let result = doppler::doppler_broaden(e, xs, &params);
+    Ok(PyArray1::from_vec(py, result))
+}
+
+/// Apply Gaussian resolution broadening to a cross-section or spectrum array.
+///
+/// Convolves the input with an energy-dependent Gaussian kernel derived from
+/// the instrument's timing uncertainty and flight path length uncertainty.
+/// This is the same broadening applied internally by `forward_model()`, but
+/// exposed here for independent use on arbitrary arrays.
+///
+/// Args:
+///     energies: Energy grid in eV (1D numpy array, sorted ascending).
+///     cross_sections: Values to broaden (1D numpy array, same length).
+///     flight_path_m: Flight path length in meters (source to detector).
+///     delta_t_us: Total timing uncertainty (1σ Gaussian) in microseconds.
+///     delta_l_m: Flight path uncertainty (1σ Gaussian) in meters.
+///
+/// Returns:
+///     1D numpy array of resolution-broadened values.
+///
+/// Reference:
+///     SAMMY Manual Section 3.2 (Resolution Broadening).
+#[pyfunction]
+#[pyo3(signature = (energies, cross_sections, flight_path_m, delta_t_us, delta_l_m))]
+fn resolution_broaden<'py>(
+    py: Python<'py>,
+    energies: PyReadonlyArray1<f64>,
+    cross_sections: PyReadonlyArray1<f64>,
+    flight_path_m: f64,
+    delta_t_us: f64,
+    delta_l_m: f64,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let e = energies.as_slice()?;
+    let xs = cross_sections.as_slice()?;
+
+    if e.len() != xs.len() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "energies length ({}) must match cross_sections length ({})",
+            e.len(),
+            xs.len(),
+        )));
+    }
+    validate_energy_grid(e)?;
+    if !flight_path_m.is_finite() || flight_path_m <= 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "flight_path_m must be finite and positive",
+        ));
+    }
+    if !delta_t_us.is_finite() || delta_t_us < 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "delta_t_us must be finite and non-negative",
+        ));
+    }
+    if !delta_l_m.is_finite() || delta_l_m < 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "delta_l_m must be finite and non-negative",
+        ));
+    }
+
+    if delta_t_us == 0.0 && delta_l_m == 0.0 {
+        return Ok(PyArray1::from_vec(py, xs.to_vec()));
+    }
+
+    let params = ResolutionParams {
+        flight_path_m,
+        delta_t_us,
+        delta_l_m,
+    };
+    let result = resolution::resolution_broaden(e, xs, &params);
+    Ok(PyArray1::from_vec(py, result))
+}
+
 /// NEREIDS Python module.
 #[pymodule]
 fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -439,5 +593,7 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(energy_to_tof, m)?)?;
     m.add_function(wrap_pyfunction!(create_resonance_data, m)?)?;
     m.add_function(wrap_pyfunction!(beer_lambert, m)?)?;
+    m.add_function(wrap_pyfunction!(doppler_broaden, m)?)?;
+    m.add_function(wrap_pyfunction!(resolution_broaden, m)?)?;
     Ok(())
 }
