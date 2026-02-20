@@ -27,9 +27,11 @@ use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
 use nereids_core::types::Isotope;
+use nereids_endf::parser::parse_endf_file2;
 use nereids_endf::resonance::{
     LGroup, Resonance, ResonanceData, ResonanceFormalism, ResonanceRange,
 };
+use nereids_endf::retrieval::{EndfLibrary, EndfRetriever, mat_number};
 use nereids_fitting::lm::{self, LmConfig};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
 use nereids_fitting::transmission_model::TransmissionFitModel;
@@ -88,6 +90,41 @@ impl PyResonanceData {
             .flat_map(|r| &r.l_groups)
             .map(|lg| lg.resonances.len())
             .sum()
+    }
+
+    /// Target spin (I) of the first resonance range.
+    #[getter]
+    fn target_spin(&self) -> f64 {
+        self.inner
+            .ranges
+            .first()
+            .map(|r| r.target_spin)
+            .unwrap_or(0.0)
+    }
+
+    /// Scattering radius (fm) of the first resonance range.
+    #[getter]
+    fn scattering_radius(&self) -> f64 {
+        self.inner
+            .ranges
+            .first()
+            .map(|r| r.scattering_radius)
+            .unwrap_or(0.0)
+    }
+
+    /// Orbital angular momentum values (L) present in the data.
+    #[getter]
+    fn l_values(&self) -> Vec<u32> {
+        let mut ls: Vec<u32> = self
+            .inner
+            .ranges
+            .iter()
+            .flat_map(|r| &r.l_groups)
+            .map(|lg| lg.l)
+            .collect();
+        ls.sort();
+        ls.dedup();
+        ls
     }
 }
 
@@ -355,6 +392,79 @@ fn energy_to_tof(energy_ev: f64, flight_path_m: f64) -> f64 {
     nereids_core::constants::energy_to_tof(energy_ev, flight_path_m)
 }
 
+/// Load ENDF resonance data for an isotope from the IAEA database.
+///
+/// Downloads and parses the ENDF file, caching it locally at
+/// ``~/.cache/nereids/endf/`` for subsequent calls.
+///
+/// Args:
+///     z: Atomic number (e.g. 92 for uranium).
+///     a: Mass number (e.g. 238).
+///     library: ENDF library name. One of "endf8.0" (default), "endf8.1",
+///              "jeff3.3", "jendl5".
+///     mat: ENDF MAT (material) number. If None, looks up from built-in table
+///          (~40 common isotopes). Provide explicitly for uncommon isotopes.
+///
+/// Returns:
+///     ResonanceData parsed from the ENDF file.
+#[pyfunction]
+#[pyo3(signature = (z, a, library="endf8.0", mat=None))]
+fn load_endf(z: u32, a: u32, library: &str, mat: Option<u32>) -> PyResult<PyResonanceData> {
+    let lib = match library {
+        "endf8.0" | "endf/b-viii.0" => EndfLibrary::EndfB8_0,
+        "endf8.1" | "endf/b-viii.1" => EndfLibrary::EndfB8_1,
+        "jeff3.3" => EndfLibrary::Jeff3_3,
+        "jendl5" => EndfLibrary::Jendl5,
+        _ => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Unknown library '{}'. Use one of: endf8.0, endf8.1, jeff3.3, jendl5",
+                library
+            )));
+        }
+    };
+
+    let isotope = Isotope::new(z, a);
+
+    let mat_num = match mat {
+        Some(m) => m,
+        None => mat_number(&isotope).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "MAT number not found for Z={} A={}; provide mat= explicitly",
+                z, a
+            ))
+        })?,
+    };
+
+    let retriever = EndfRetriever::new();
+    let (_path, contents) = retriever
+        .get_endf_file(&isotope, lib, mat_num)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{}", e)))?;
+
+    let data = parse_endf_file2(&contents)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("ENDF parse error: {}", e)))?;
+
+    Ok(PyResonanceData { inner: data })
+}
+
+/// Load ENDF resonance data from a local file.
+///
+/// Args:
+///     path: Path to an ENDF-format file on disk.
+///
+/// Returns:
+///     ResonanceData parsed from the file.
+#[pyfunction]
+fn load_endf_file(path: &str) -> PyResult<PyResonanceData> {
+    let contents = std::fs::read_to_string(path).map_err(|e| {
+        pyo3::exceptions::PyIOError::new_err(format!("Cannot read '{}': {}", path, e))
+    })?;
+
+    let data = parse_endf_file2(&contents)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("ENDF parse error: {}", e)))?;
+
+    Ok(PyResonanceData { inner: data })
+}
+
 /// Create ResonanceData from parameters (for testing/custom isotopes).
 ///
 /// Args:
@@ -362,29 +472,65 @@ fn energy_to_tof(energy_ev: f64, flight_path_m: f64) -> f64 {
 ///     a: Mass number.
 ///     awr: Atomic weight ratio.
 ///     scattering_radius: Scattering radius in fm.
-///     resonances: List of (energy_eV, j, gn, gg) tuples.
+///     resonances: List of (energy_eV, j, gn, gg) tuples for L=0.
+///     target_spin: Target nuclear spin (default 0.0).
+///     l_groups: Optional list of (l_value, [(energy, j, gn, gg), ...]) tuples
+///               for multiple L-groups. If provided, the ``resonances`` parameter
+///               is ignored.
 ///
 /// Returns:
 ///     ResonanceData object.
 #[pyfunction]
+#[pyo3(signature = (z, a, awr, scattering_radius, resonances, target_spin=0.0, l_groups=None))]
 fn create_resonance_data(
     z: u32,
     a: u32,
     awr: f64,
     scattering_radius: f64,
     resonances: Vec<(f64, f64, f64, f64)>,
+    target_spin: f64,
+    l_groups: Option<Vec<(u32, Vec<(f64, f64, f64, f64)>)>>,
 ) -> PyResonanceData {
-    let res: Vec<Resonance> = resonances
-        .into_iter()
-        .map(|(energy, j, gn, gg)| Resonance {
-            energy,
-            j,
-            gn,
-            gg,
-            gfa: 0.0,
-            gfb: 0.0,
-        })
-        .collect();
+    let groups = match l_groups {
+        Some(lg) => lg
+            .into_iter()
+            .map(|(l_val, res_list)| LGroup {
+                l: l_val,
+                awr,
+                apl: 0.0,
+                resonances: res_list
+                    .into_iter()
+                    .map(|(energy, j, gn, gg)| Resonance {
+                        energy,
+                        j,
+                        gn,
+                        gg,
+                        gfa: 0.0,
+                        gfb: 0.0,
+                    })
+                    .collect(),
+            })
+            .collect(),
+        None => {
+            let res: Vec<Resonance> = resonances
+                .into_iter()
+                .map(|(energy, j, gn, gg)| Resonance {
+                    energy,
+                    j,
+                    gn,
+                    gg,
+                    gfa: 0.0,
+                    gfb: 0.0,
+                })
+                .collect();
+            vec![LGroup {
+                l: 0,
+                awr,
+                apl: 0.0,
+                resonances: res,
+            }]
+        }
+    };
 
     PyResonanceData {
         inner: ResonanceData {
@@ -396,14 +542,9 @@ fn create_resonance_data(
                 energy_high: 1e6,
                 resolved: true,
                 formalism: ResonanceFormalism::ReichMoore,
-                target_spin: 0.0,
+                target_spin,
                 scattering_radius,
-                l_groups: vec![LGroup {
-                    l: 0,
-                    awr,
-                    apl: 0.0,
-                    resonances: res,
-                }],
+                l_groups: groups,
             }],
         },
     }
@@ -591,6 +732,8 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fit_spectrum, m)?)?;
     m.add_function(wrap_pyfunction!(tof_to_energy, m)?)?;
     m.add_function(wrap_pyfunction!(energy_to_tof, m)?)?;
+    m.add_function(wrap_pyfunction!(load_endf, m)?)?;
+    m.add_function(wrap_pyfunction!(load_endf_file, m)?)?;
     m.add_function(wrap_pyfunction!(create_resonance_data, m)?)?;
     m.add_function(wrap_pyfunction!(beer_lambert, m)?)?;
     m.add_function(wrap_pyfunction!(doppler_broaden, m)?)?;
