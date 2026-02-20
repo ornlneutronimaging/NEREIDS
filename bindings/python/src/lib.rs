@@ -428,6 +428,31 @@ fn beer_lambert<'py>(
     Ok(PyArray1::from_vec(py, t))
 }
 
+/// Validate that an energy grid is finite, positive, and sorted ascending.
+fn validate_energy_grid(e: &[f64]) -> PyResult<()> {
+    if e.is_empty() {
+        return Ok(());
+    }
+    if !e[0].is_finite() || e[0] <= 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "energies must be finite and positive",
+        ));
+    }
+    for i in 1..e.len() {
+        if !e[i].is_finite() || e[i] <= 0.0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "energies must be finite and positive",
+            ));
+        }
+        if e[i] <= e[i - 1] {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "energies must be sorted in strictly ascending order",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Apply Free Gas Model (FGM) Doppler broadening to a cross-section array.
 ///
 /// Convolves the input cross-sections with a Gaussian kernel whose width
@@ -466,6 +491,7 @@ fn doppler_broaden<'py>(
             xs.len(),
         )));
     }
+    validate_energy_grid(e)?;
     if awr <= 0.0 {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "awr must be positive",
@@ -525,6 +551,7 @@ fn resolution_broaden<'py>(
             xs.len(),
         )));
     }
+    validate_energy_grid(e)?;
     if flight_path_m <= 0.0 {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "flight_path_m must be positive",
