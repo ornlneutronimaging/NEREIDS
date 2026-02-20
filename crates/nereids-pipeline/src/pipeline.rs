@@ -9,7 +9,7 @@ use nereids_endf::resonance::ResonanceData;
 use nereids_fitting::lm::{self, LmConfig};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
 use nereids_fitting::transmission_model::TransmissionFitModel;
-use nereids_physics::resolution::ResolutionParams;
+use nereids_physics::resolution::ResolutionFunction;
 use nereids_physics::transmission::InstrumentParams;
 
 /// Configuration for a single-spectrum fit.
@@ -23,8 +23,8 @@ pub struct FitConfig {
     pub isotope_names: Vec<String>,
     /// Sample temperature in Kelvin.
     pub temperature_k: f64,
-    /// Optional instrument resolution parameters.
-    pub resolution: Option<ResolutionParams>,
+    /// Optional instrument resolution function (Gaussian or tabulated).
+    pub resolution: Option<ResolutionFunction>,
     /// Initial guess for areal densities (atoms/barn), one per isotope.
     pub initial_densities: Vec<f64>,
     /// LM optimizer configuration.
@@ -75,6 +75,7 @@ pub fn fit_spectrum(measured_t: &[f64], sigma: &[f64], config: &FitConfig) -> Sp
 
     let instrument = config
         .resolution
+        .clone()
         .map(|r| InstrumentParams { resolution: r });
 
     let model = TransmissionFitModel {

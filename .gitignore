@@ -45,5 +45,8 @@ dist/
 # Pixi lock (regenerated)
 pixi.lock
 
+# Instrument resolution files (not approved for public release)
+_fts_*.txt
+
 # Cargo lock for libraries is debatable; we keep it for reproducibility
 # (do NOT gitignore Cargo.lock)

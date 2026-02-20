@@ -31,7 +31,7 @@ use nereids_endf::resonance::ResonanceData;
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
 use nereids_fitting::poisson::{self, CountsModel, PoissonConfig};
 use nereids_fitting::transmission_model::TransmissionFitModel;
-use nereids_physics::resolution::ResolutionParams;
+use nereids_physics::resolution::ResolutionFunction;
 use nereids_physics::transmission::InstrumentParams;
 
 /// Configuration for two-stage sparse reconstruction.
@@ -45,8 +45,8 @@ pub struct SparseConfig {
     pub isotope_names: Vec<String>,
     /// Sample temperature in Kelvin.
     pub temperature_k: f64,
-    /// Optional resolution parameters.
-    pub resolution: Option<ResolutionParams>,
+    /// Optional resolution function (Gaussian or tabulated).
+    pub resolution: Option<ResolutionFunction>,
     /// Initial guess for areal densities.
     pub initial_densities: Vec<f64>,
     /// Poisson optimizer configuration.
@@ -179,6 +179,7 @@ pub fn sparse_reconstruct(
     // Build the transmission model (shared across pixels)
     let instrument = config
         .resolution
+        .clone()
         .map(|r| InstrumentParams { resolution: r });
 
     // Collect pixel coordinates
@@ -211,7 +212,7 @@ pub fn sparse_reconstruct(
                 energies: config.energies.clone(),
                 resonance_data: config.resonance_data.clone(),
                 temperature_k: config.temperature_k,
-                instrument,
+                instrument: instrument.clone(),
                 density_indices: (0..n_isotopes).collect(),
             };
 
