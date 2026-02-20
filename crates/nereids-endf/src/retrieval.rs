@@ -49,15 +49,20 @@ impl EndfLibrary {
 
     /// Construct the ZIP filename for a given isotope.
     ///
-    /// ENDF/B-VIII.0 uses MAT-first format: `n_{mat}_{z}-{Element}-{a}.zip`
-    /// ENDF/B-VIII.1 and others use element-first: `n_{z}-{Element}-{a}_{mat}.zip`
+    /// IAEA uses two naming conventions (MAT always 4-digit zero-padded):
+    /// - VIII.0, JEFF-3.3: MAT-first `n_{mat:04}_{z}-{Sym}-{a}.zip` (Z unpadded)
+    /// - VIII.1, JENDL-5: Z-first   `n_{z:03}-{Sym}-{a}_{mat:04}.zip` (Z 3-digit)
     fn zip_filename(&self, isotope: &Isotope, mat: u32) -> String {
         let sym = elements::element_symbol(isotope.z).unwrap_or("X");
         let z = isotope.z;
         let a = isotope.a;
         match self {
-            Self::EndfB8_0 => format!("n_{mat}_{z}-{sym}-{a}.zip"),
-            _ => format!("n_{z}-{sym}-{a}_{mat}.zip"),
+            Self::EndfB8_0 | Self::Jeff3_3 => {
+                format!("n_{mat:04}_{z}-{sym}-{a}.zip")
+            }
+            Self::EndfB8_1 | Self::Jendl5 => {
+                format!("n_{z:03}-{sym}-{a}_{mat:04}.zip")
+            }
         }
     }
 }
