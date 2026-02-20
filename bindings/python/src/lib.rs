@@ -36,7 +36,9 @@ use nereids_fitting::lm::{self, LmConfig};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
 use nereids_fitting::transmission_model::TransmissionFitModel;
 use nereids_physics::doppler::{self, DopplerParams};
-use nereids_physics::resolution::{self, ResolutionFunction, ResolutionParams, TabulatedResolution};
+use nereids_physics::resolution::{
+    self, ResolutionFunction, ResolutionParams, TabulatedResolution,
+};
 use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
 
 /// Python wrapper for ENDF resonance data.
@@ -871,9 +873,8 @@ fn load_resolution(path: &str, flight_path_m: f64) -> PyResult<PyTabulatedResolu
         ));
     }
 
-    let tab = TabulatedResolution::from_file(path, flight_path_m).map_err(|e| {
-        pyo3::exceptions::PyIOError::new_err(format!("{}", e))
-    })?;
+    let tab = TabulatedResolution::from_file(path, flight_path_m)
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))?;
 
     Ok(PyTabulatedResolution { inner: tab })
 }

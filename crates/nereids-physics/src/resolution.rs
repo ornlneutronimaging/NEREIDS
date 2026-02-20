@@ -233,9 +233,9 @@ impl TabulatedResolution {
         let _header = lines
             .next()
             .ok_or(ResolutionParseError::InvalidFormat("Empty file".into()))?;
-        let _sep = lines
-            .next()
-            .ok_or(ResolutionParseError::InvalidFormat("Missing separator".into()))?;
+        let _sep = lines.next().ok_or(ResolutionParseError::InvalidFormat(
+            "Missing separator".into(),
+        ))?;
 
         let mut ref_energies = Vec::new();
         let mut kernels = Vec::new();
@@ -299,9 +299,8 @@ impl TabulatedResolution {
 
     /// Parse a VENUS/FTS resolution file from disk.
     pub fn from_file(path: &str, flight_path_m: f64) -> Result<Self, ResolutionParseError> {
-        let text = std::fs::read_to_string(path).map_err(|e| {
-            ResolutionParseError::IoError(format!("Cannot read '{}': {}", path, e))
-        })?;
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| ResolutionParseError::IoError(format!("Cannot read '{}': {}", path, e)))?;
         Self::from_text(&text, flight_path_m)
     }
 
@@ -351,8 +350,7 @@ impl TabulatedResolution {
                 }
 
                 // Convert TOF to energy: E' = (TOF_FACTOR * L / t')^2
-                let e_prime =
-                    (TOF_FACTOR * self.flight_path_m / tof_prime).powi(2);
+                let e_prime = (TOF_FACTOR * self.flight_path_m / tof_prime).powi(2);
 
                 // Interpolate spectrum at e_prime
                 let s = interp_spectrum(energies, spectrum, e_prime);
@@ -373,7 +371,11 @@ impl TabulatedResolution {
                 norm += weight;
             }
 
-            result[i] = if norm > 1e-50 { sum / norm } else { spectrum[i] };
+            result[i] = if norm > 1e-50 {
+                sum / norm
+            } else {
+                spectrum[i]
+            };
         }
 
         result
