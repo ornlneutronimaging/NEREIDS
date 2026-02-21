@@ -54,6 +54,30 @@ pub fn wave_number(energy_ev: f64, awr: f64) -> f64 {
     k_squared(energy_ev, awr).sqrt()
 }
 
+/// Wave number k_c from reduced mass ratio and center-of-mass kinetic energy.
+///
+/// k_c = √(2·m_n·μ·E_cm) / ℏc
+///
+/// Used for non-elastic channels in LRF=7 (R-Matrix Limited) where each
+/// channel may have a different particle pair (masses, Q-value).
+///
+/// For the elastic channel (MA=1 neutron, MB=AWR target):
+///   μ = AWR/(1+AWR),  E_cm = E_lab·AWR/(1+AWR)
+///   → k = `wave_number(E_lab, AWR)` (algebraically identical).
+///
+/// ## SAMMY Reference
+/// - `rml/mrml03.f` Fxradi: `Zke = Twomhb × √(Redmas × Factor)`
+///   where Redmas = MA·MB/(MA+MB) and Factor = E_cm for the channel.
+///
+/// # Arguments
+/// * `e_cm` — Center-of-mass kinetic energy in this channel (eV). Must be ≥ 0.
+/// * `reduced_mass_ratio` — μ = MA·MB/(MA+MB) in neutron mass units.
+pub fn wave_number_from_cm(e_cm: f64, reduced_mass_ratio: f64) -> f64 {
+    let mn_ev = constants::NEUTRON_MASS_MEV * 1e6; // MeV → eV
+    let hbar_c = constants::HBAR_EV_S * constants::SPEED_OF_LIGHT * 1e15; // eV·fm
+    (2.0 * mn_ev * reduced_mass_ratio * e_cm / (hbar_c * hbar_c)).sqrt()
+}
+
 /// Channel parameter ρ = k·a.
 ///
 /// # Arguments

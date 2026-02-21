@@ -102,10 +102,16 @@ fn spin_group_cross_sections(
     let mut is_entrance = vec![false; nch];
     let mut is_fission = vec![false; nch];
 
-    let k = channel::wave_number(energy_ev, awr);
+    // Entrance-channel CM energy: E_cm = E_lab × AWR/(1+AWR).
+    // Each exit channel adds its Q-value to get its own available energy.
+    // Reference: SAMMY rml/mrml03.f Fxradi — channel thresholds via Q.
+    let e_cm = channel::lab_to_cm_energy(energy_ev, awr);
 
     for (c, ch) in sg.channels.iter().enumerate() {
-        let pp = &particle_pairs[ch.particle_pair_idx.min(particle_pairs.len() - 1)];
+        // P3: particle_pair_idx must be a valid index. The old `.min(len-1)` clamped
+        // silently, misclassifying any channel with an OOB index as the last pair.
+        // An OOB value indicates corrupted ENDF data; let Rust's bounds check panic.
+        let pp = &particle_pairs[ch.particle_pair_idx];
         is_entrance[c] = pp.mt == 2;
         is_fission[c] = pp.mt == 18;
 
@@ -117,14 +123,28 @@ fn spin_group_cross_sections(
             s_c[c] = 0.0;
             phi_c[c] = 0.0;
         } else {
-            // Massive particle: standard Blatt-Weisskopf penetrability / phase.
-            // APE (effective radius) used for P_c, S_c; APT (true radius) for φ_c.
-            // Reference: SAMMY rml/mrml07.f (Pgh, Sinsix, Pf subroutines)
-            let rho_eff = k * ch.effective_radius;
-            let rho_true = k * ch.true_radius;
-            p_c[c] = penetrability::penetrability(ch.l, rho_eff);
-            s_c[c] = penetrability::shift_factor(ch.l, rho_eff);
-            phi_c[c] = penetrability::phase_shift(ch.l, rho_true);
+            // Massive particle channel: channel-specific kinematics (P1).
+            // E_c = E_cm + Q (CM kinetic energy in this exit channel).
+            // Reference: SAMMY rml/mrml03.f Fxradi — Zke = Twomhb*sqrt(Redmas*Factor)
+            let e_c = e_cm + pp.q;
+            if e_c <= 0.0 {
+                // Closed channel (below threshold): penetrability → 0.
+                p_c[c] = 0.0;
+                s_c[c] = 0.0;
+                phi_c[c] = 0.0;
+            } else {
+                // Channel wave number from reduced mass μ = MA·MB/(MA+MB).
+                // For elastic (MA=1, MB=AWR): k_c = wave_number(E_lab, AWR) [identical].
+                let redmas = pp.ma * pp.mb / (pp.ma + pp.mb);
+                let k_c = channel::wave_number_from_cm(e_c, redmas);
+                // APE (effective radius) for P_c, S_c; APT (true radius) for φ_c.
+                // Reference: SAMMY rml/mrml07.f (Pgh, Sinsix, Pf subroutines)
+                let rho_eff = k_c * ch.effective_radius;
+                let rho_true = k_c * ch.true_radius;
+                p_c[c] = penetrability::penetrability(ch.l, rho_eff);
+                s_c[c] = penetrability::shift_factor(ch.l, rho_eff);
+                phi_c[c] = penetrability::phase_shift(ch.l, rho_true);
+            }
         }
     }
 
@@ -134,10 +154,13 @@ fn spin_group_cross_sections(
     let mut r = vec![vec![0.0f64; nch]; nch];
     for res in &sg.resonances {
         let denom = res.energy - energy_ev;
-        if denom.abs() < 1e-100 {
-            continue; // skip exact pole (vanishingly rare in practice)
-        }
-        let inv_denom = 1.0 / denom;
+        // P2: Retain the pole term even when denom → 0. The old `continue` dropped
+        // the resonance entirely, causing a non-physical dip in σ at that energy.
+        // The level matrix's imaginary diagonal i·P_c provides Lorentzian width
+        // regularization so cross-sections remain finite at resonance energies.
+        // Guard only against exact IEEE 754 zero (vanishingly rare in practice).
+        // Reference: SAMMY rml/mrml07.f Setr — no special-casing for near-pole.
+        let inv_denom = 1.0 / if denom == 0.0 { 1e-50_f64 } else { denom };
         for c in 0..nch {
             for cp in 0..nch {
                 r[c][cp] += res.widths[c] * res.widths[cp] * inv_denom;
