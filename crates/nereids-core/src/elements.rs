@@ -9,7 +9,7 @@ use crate::types::Isotope;
 
 /// Element symbol lookup by atomic number Z.
 ///
-/// Returns `None` for Z > 118.
+/// Returns `Some("n")` for Z=0 (neutron). Returns `None` for Z > 118.
 pub fn element_symbol(z: u32) -> Option<&'static str> {
     endf_mat::element_symbol(z)
 }

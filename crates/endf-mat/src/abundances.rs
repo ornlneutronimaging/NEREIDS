@@ -8,13 +8,16 @@
 
 /// Natural isotopic abundance (mole fraction) for a given isotope.
 ///
-/// Returns `None` if the isotope has no natural abundance (synthetic isotopes,
-/// or isotopes not in the IUPAC database).
+/// Returns `None` for isotopes with no natural occurrence (synthetic elements
+/// such as Tc, Pm, or transuranic elements like Pu) or isotopes not in the
+/// IUPAC 2016 database. Callers requiring reactor/engineered material compositions
+/// (e.g. Pu-239 in fuel) must supply the abundance explicitly.
 ///
 /// # Examples
 /// ```
 /// assert!((endf_mat::natural_abundance(92, 238).unwrap() - 0.992742).abs() < 1e-6);
 /// assert_eq!(endf_mat::natural_abundance(43, 99), None); // Tc is synthetic
+/// assert_eq!(endf_mat::natural_abundance(94, 239), None); // Pu has no natural abundance
 /// ```
 pub fn natural_abundance(z: u32, a: u32) -> Option<f64> {
     NATURAL_ABUNDANCES
@@ -503,8 +506,6 @@ static NATURAL_ABUNDANCES: &[(u32, u32, f64)] = &[
     (92, 235, 0.007204),
     (92, 238, 0.992742),
 
-    // Plutonium (Pu, Z=94) — no natural abundance; placeholder for reactor default
-    (94, 239, 1.0),
 ];
 
 #[cfg(test)]
@@ -530,6 +531,8 @@ mod tests {
         assert_eq!(natural_abundance(43, 99), None);
         // Promethium (Z=61) has no stable isotopes
         assert_eq!(natural_abundance(61, 147), None);
+        // Plutonium: synthetic, no natural abundance (reactor compositions must be supplied explicitly)
+        assert_eq!(natural_abundance(94, 239), None);
     }
 
     #[test]
@@ -576,7 +579,7 @@ mod tests {
 
     #[test]
     fn test_table_size() {
-        assert_eq!(NATURAL_ABUNDANCES.len(), 289);
+        assert_eq!(NATURAL_ABUNDANCES.len(), 288);
     }
 
     #[test]

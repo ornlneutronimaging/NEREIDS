@@ -614,6 +614,31 @@ mod tests {
     }
 
     #[test]
+    fn test_mat_number_corrected_regressions() {
+        // Regression tests for isotopes whose MAT values were incorrect in the
+        // old hand-coded 47-entry table (off by one isotope offset each).
+        // Correct values sourced from PLEIADES neutrons.list (ENDF/B-VIII.0).
+
+        // Cd-113: old table had 4849 (actually Cd-114), correct is 4846
+        assert_eq!(mat_number(48, 113), Some(4846));
+        assert_eq!(isotope_from_mat(4846), Some((48, 113)));
+
+        // Hf-177: old table had 7231 (actually Hf-176), correct is 7234
+        assert_eq!(mat_number(72, 177), Some(7234));
+        assert_eq!(isotope_from_mat(7234), Some((72, 177)));
+
+        // Hf-178: old table had 7234 (actually Hf-177), correct is 7237
+        assert_eq!(mat_number(72, 178), Some(7237));
+        assert_eq!(isotope_from_mat(7237), Some((72, 178)));
+
+        // W-182/183/184/186: old table was shifted by one isotope
+        assert_eq!(mat_number(74, 182), Some(7431));
+        assert_eq!(mat_number(74, 183), Some(7434));
+        assert_eq!(mat_number(74, 184), Some(7437));
+        assert_eq!(mat_number(74, 186), Some(7443));
+    }
+
+    #[test]
     fn test_mat_number_unknown() {
         assert_eq!(mat_number(200, 400), None);
         assert_eq!(mat_number(0, 0), None);

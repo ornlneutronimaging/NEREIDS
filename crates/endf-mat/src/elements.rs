@@ -19,9 +19,12 @@ pub fn element_name(z: u32) -> Option<&'static str> {
     ELEMENT_NAMES.get(z as usize).copied()
 }
 
-/// Atomic number Z from element symbol (case-insensitive).
+/// Atomic number Z from element symbol (case-insensitive for elements Z≥1).
 ///
 /// Accepts "U", "u", "Fe", "fe", etc.
+///
+/// **Neutron special case**: the neutron symbol `"n"` (Z=0) is matched
+/// case-sensitively. Passing `"N"` returns `Some(7)` (Nitrogen), not Z=0.
 pub fn symbol_to_z(symbol: &str) -> Option<u32> {
     // Neutron "n" is exact-match only to avoid shadowing Nitrogen "N"
     if symbol == "n" {
@@ -110,6 +113,9 @@ mod tests {
         assert_eq!(symbol_to_z("U"), Some(92));
         assert_eq!(symbol_to_z("fe"), Some(26)); // case-insensitive
         assert_eq!(symbol_to_z("Xx"), None);
+        // Neutron: exact lowercase match only
+        assert_eq!(symbol_to_z("n"), Some(0));
+        assert_eq!(symbol_to_z("N"), Some(7)); // "N" is Nitrogen, not neutron
     }
 
     #[test]
