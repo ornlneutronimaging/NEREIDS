@@ -25,9 +25,10 @@
 
 use std::sync::Arc;
 
-use numpy::{PyArray1, PyReadonlyArray1};
+use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3};
 use pyo3::prelude::*;
 
+use nereids_core::elements::element_symbol;
 use nereids_core::types::Isotope;
 use nereids_endf::parser::parse_endf_file2;
 use nereids_endf::resonance::{
@@ -42,6 +43,7 @@ use nereids_physics::resolution::{
     self, ResolutionFunction, ResolutionParams, TabulatedResolution,
 };
 use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
+use nereids_pipeline::pipeline::FitConfig;
 
 /// Python wrapper for ENDF resonance data.
 #[pyclass(name = "ResonanceData", from_py_object)]
@@ -247,6 +249,81 @@ impl PyTabulatedResolution {
     }
 }
 
+/// Result of spatial (per-pixel) mapping.
+#[pyclass(name = "SpatialResult")]
+struct PySpatialResult {
+    density_maps: Vec<ndarray::Array2<f64>>,
+    uncertainty_maps: Vec<ndarray::Array2<f64>>,
+    chi_squared_map: ndarray::Array2<f64>,
+    converged_map: ndarray::Array2<bool>,
+    n_converged: usize,
+    n_total: usize,
+    isotope_names: Vec<String>,
+}
+
+#[pymethods]
+impl PySpatialResult {
+    /// Density maps as a list of 2D numpy arrays, one per isotope.
+    #[getter]
+    fn density_maps<'py>(&self, py: Python<'py>) -> Vec<Bound<'py, PyArray2<f64>>> {
+        self.density_maps
+            .iter()
+            .map(|m| PyArray2::from_owned_array(py, m.clone()))
+            .collect()
+    }
+
+    /// Uncertainty maps as a list of 2D numpy arrays.
+    #[getter]
+    fn uncertainty_maps<'py>(&self, py: Python<'py>) -> Vec<Bound<'py, PyArray2<f64>>> {
+        self.uncertainty_maps
+            .iter()
+            .map(|m| PyArray2::from_owned_array(py, m.clone()))
+            .collect()
+    }
+
+    /// Reduced chi-squared map.
+    #[getter]
+    fn chi_squared_map<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
+        PyArray2::from_owned_array(py, self.chi_squared_map.clone())
+    }
+
+    /// Convergence map (True = converged).
+    #[getter]
+    fn converged_map<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<bool>> {
+        PyArray2::from_owned_array(py, self.converged_map.clone())
+    }
+
+    /// Number of converged pixels.
+    #[getter]
+    fn n_converged(&self) -> usize {
+        self.n_converged
+    }
+
+    /// Total number of fitted pixels.
+    #[getter]
+    fn n_total(&self) -> usize {
+        self.n_total
+    }
+
+    /// Isotope names.
+    #[getter]
+    fn isotope_names(&self) -> Vec<String> {
+        self.isotope_names.clone()
+    }
+
+    fn __repr__(&self) -> String {
+        let shape = self.converged_map.shape();
+        format!(
+            "SpatialResult(shape={}x{}, isotopes={}, converged={}/{})",
+            shape[0],
+            shape[1],
+            self.isotope_names.len(),
+            self.n_converged,
+            self.n_total,
+        )
+    }
+}
+
 /// Compute cross-sections at given energies for an isotope.
 ///
 /// Args:
@@ -324,35 +401,8 @@ fn forward_model<'py>(
         isotopes: sample_isotopes,
     };
 
-    let has_gaussian = flight_path_m.is_some() || delta_t_us.is_some() || delta_l_m.is_some();
-    if has_gaussian && resolution.is_some() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "Cannot specify both Gaussian resolution parameters and tabulated resolution",
-        ));
-    }
-    let all_gaussian = flight_path_m.is_some() && delta_t_us.is_some() && delta_l_m.is_some();
-    if has_gaussian && !all_gaussian {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "Gaussian resolution requires all three parameters: flight_path_m, delta_t_us, and delta_l_m",
-        ));
-    }
-
-    let instrument = if let Some(tab) = resolution {
-        Some(InstrumentParams {
-            resolution: ResolutionFunction::Tabulated(tab.inner),
-        })
-    } else if let (Some(fp), Some(dt), Some(dl)) = (flight_path_m, delta_t_us, delta_l_m) {
-        validate_gaussian_params(fp, dt, dl)?;
-        Some(InstrumentParams {
-            resolution: ResolutionFunction::Gaussian(ResolutionParams {
-                flight_path_m: fp,
-                delta_t_us: dt,
-                delta_l_m: dl,
-            }),
-        })
-    } else {
-        None
-    };
+    let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution)?;
+    let instrument = res_fn.map(|r| InstrumentParams { resolution: r });
 
     let t = transmission::forward_model(e, &sample, instrument.as_ref());
     Ok(PyArray1::from_vec(py, t))
@@ -436,36 +486,8 @@ fn fit_spectrum(
         )));
     }
 
-    let has_gaussian = flight_path_m.is_some() || delta_t_us.is_some() || delta_l_m.is_some();
-    if has_gaussian && resolution.is_some() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "Cannot specify both Gaussian resolution parameters and tabulated resolution",
-        ));
-    }
-
-    let all_gaussian = flight_path_m.is_some() && delta_t_us.is_some() && delta_l_m.is_some();
-    if has_gaussian && !all_gaussian {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "Gaussian resolution requires all three parameters: flight_path_m, delta_t_us, and delta_l_m",
-        ));
-    }
-
-    let instrument = if let Some(tab) = resolution {
-        Some(Arc::new(InstrumentParams {
-            resolution: ResolutionFunction::Tabulated(tab.inner),
-        }))
-    } else if let (Some(fp), Some(dt), Some(dl)) = (flight_path_m, delta_t_us, delta_l_m) {
-        validate_gaussian_params(fp, dt, dl)?;
-        Some(Arc::new(InstrumentParams {
-            resolution: ResolutionFunction::Gaussian(ResolutionParams {
-                flight_path_m: fp,
-                delta_t_us: dt,
-                delta_l_m: dl,
-            }),
-        }))
-    } else {
-        None
-    };
+    let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution)?;
+    let instrument = res_fn.map(|r| Arc::new(InstrumentParams { resolution: r }));
 
     let model = TransmissionFitModel {
         energies: e.to_vec(),
@@ -760,6 +782,42 @@ fn validate_energy_grid(e: &[f64]) -> PyResult<()> {
     Ok(())
 }
 
+/// Build a `ResolutionFunction` from Python arguments.
+///
+/// Validates mutual exclusivity (Gaussian vs. tabulated) and completeness
+/// of Gaussian parameters. Returns `None` when no resolution is requested.
+fn build_resolution(
+    flight_path_m: Option<f64>,
+    delta_t_us: Option<f64>,
+    delta_l_m: Option<f64>,
+    resolution: Option<PyTabulatedResolution>,
+) -> PyResult<Option<ResolutionFunction>> {
+    let has_gaussian = flight_path_m.is_some() || delta_t_us.is_some() || delta_l_m.is_some();
+    if has_gaussian && resolution.is_some() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Cannot specify both Gaussian resolution parameters and tabulated resolution",
+        ));
+    }
+    let all_gaussian = flight_path_m.is_some() && delta_t_us.is_some() && delta_l_m.is_some();
+    if has_gaussian && !all_gaussian {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Gaussian resolution requires all three parameters: flight_path_m, delta_t_us, and delta_l_m",
+        ));
+    }
+    if let Some(tab) = resolution {
+        Ok(Some(ResolutionFunction::Tabulated(tab.inner)))
+    } else if let (Some(fp), Some(dt), Some(dl)) = (flight_path_m, delta_t_us, delta_l_m) {
+        validate_gaussian_params(fp, dt, dl)?;
+        Ok(Some(ResolutionFunction::Gaussian(ResolutionParams {
+            flight_path_m: fp,
+            delta_t_us: dt,
+            delta_l_m: dl,
+        })))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Apply Free Gas Model (FGM) Doppler broadening to a cross-section array.
 ///
 /// Convolves the input cross-sections with a Gaussian kernel whose width
@@ -953,12 +1011,222 @@ fn py_apply_resolution<'py>(
     Ok(PyArray1::from_vec(py, result))
 }
 
+/// Run per-pixel fitting across a transmission image stack.
+///
+/// Each pixel's transmission spectrum is fitted independently (in parallel
+/// via rayon) to recover areal densities for all specified isotopes.
+///
+/// Args:
+///     transmission: 3D numpy array (n_energies, height, width).
+///     uncertainty: 3D numpy array (n_energies, height, width).
+///     energies: 1D numpy array of energy values in eV.
+///     isotopes: List of ResonanceData objects.
+///     temperature_k: Sample temperature in Kelvin (default 300.0).
+///     initial_densities: Initial guesses for areal densities (optional).
+///     dead_pixels: 2D bool numpy array marking dead pixels (optional).
+///     flight_path_m: Flight path for Gaussian resolution (optional).
+///     delta_t_us: Timing uncertainty for Gaussian resolution (optional).
+///     delta_l_m: Path length uncertainty for Gaussian resolution (optional).
+///     resolution: TabulatedResolution for tabulated broadening (optional).
+///     max_iter: Maximum LM iterations per pixel (default 100).
+///
+/// Returns:
+///     SpatialResult with density maps, uncertainty maps, and diagnostics.
+#[pyfunction]
+#[pyo3(name = "spatial_map", signature = (transmission, uncertainty, energies, isotopes, temperature_k=300.0, initial_densities=None, dead_pixels=None, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, max_iter=100))]
+fn py_spatial_map(
+    transmission: PyReadonlyArray3<f64>,
+    uncertainty: PyReadonlyArray3<f64>,
+    energies: PyReadonlyArray1<f64>,
+    isotopes: Vec<PyResonanceData>,
+    temperature_k: f64,
+    initial_densities: Option<Vec<f64>>,
+    dead_pixels: Option<PyReadonlyArray2<bool>>,
+    flight_path_m: Option<f64>,
+    delta_t_us: Option<f64>,
+    delta_l_m: Option<f64>,
+    resolution: Option<PyTabulatedResolution>,
+    max_iter: usize,
+) -> PyResult<PySpatialResult> {
+    let trans = transmission.as_array().to_owned();
+    let unc = uncertainty.as_array().to_owned();
+    let e = energies.as_slice()?;
+
+    if isotopes.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "isotopes list must not be empty",
+        ));
+    }
+
+    let n_isotopes = isotopes.len();
+    let isotope_names: Vec<String> = isotopes
+        .iter()
+        .map(|d| {
+            let sym = element_symbol(d.inner.isotope.z).unwrap_or("?");
+            format!("{}-{}", sym, d.inner.isotope.a)
+        })
+        .collect();
+    let res_data: Vec<ResonanceData> = isotopes.into_iter().map(|d| d.inner).collect();
+
+    let init = initial_densities.unwrap_or_else(|| vec![0.001; n_isotopes]);
+    if init.len() != n_isotopes {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "initial_densities length ({}) must match isotopes length ({})",
+            init.len(),
+            n_isotopes,
+        )));
+    }
+
+    let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution)?;
+
+    let config = FitConfig {
+        energies: e.to_vec(),
+        resonance_data: res_data,
+        isotope_names: isotope_names.clone(),
+        temperature_k,
+        resolution: res_fn,
+        initial_densities: init,
+        lm_config: LmConfig {
+            max_iter,
+            ..LmConfig::default()
+        },
+    };
+
+    let dead = dead_pixels.map(|d| d.as_array().to_owned());
+
+    let result = nereids_pipeline::spatial::spatial_map(&trans, &unc, &config, dead.as_ref(), None);
+
+    Ok(PySpatialResult {
+        density_maps: result.density_maps,
+        uncertainty_maps: result.uncertainty_maps,
+        chi_squared_map: result.chi_squared_map,
+        converged_map: result.converged_map,
+        n_converged: result.n_converged,
+        n_total: result.n_total,
+        isotope_names,
+    })
+}
+
+/// Fit a single spectrum averaged over a region of interest.
+///
+/// Averages the transmission and uncertainty across the specified rectangular
+/// region, then fits the resulting high-statistics spectrum. Useful for
+/// getting reference densities before per-pixel mapping.
+///
+/// Args:
+///     transmission: 3D numpy array (n_energies, height, width).
+///     uncertainty: 3D numpy array (n_energies, height, width).
+///     y_range: (start, end) row range for the ROI.
+///     x_range: (start, end) column range for the ROI.
+///     energies: 1D numpy array of energy values in eV.
+///     isotopes: List of ResonanceData objects.
+///     temperature_k: Sample temperature in Kelvin (default 300.0).
+///     initial_densities: Initial guesses for areal densities (optional).
+///     flight_path_m: Flight path for Gaussian resolution (optional).
+///     delta_t_us: Timing uncertainty for Gaussian resolution (optional).
+///     delta_l_m: Path length uncertainty for Gaussian resolution (optional).
+///     resolution: TabulatedResolution for tabulated broadening (optional).
+///     max_iter: Maximum LM iterations (default 100).
+///
+/// Returns:
+///     FitResult with densities, uncertainties, and fit quality.
+#[pyfunction]
+#[pyo3(name = "fit_roi", signature = (transmission, uncertainty, y_range, x_range, energies, isotopes, temperature_k=300.0, initial_densities=None, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, max_iter=100))]
+fn py_fit_roi(
+    transmission: PyReadonlyArray3<f64>,
+    uncertainty: PyReadonlyArray3<f64>,
+    y_range: (usize, usize),
+    x_range: (usize, usize),
+    energies: PyReadonlyArray1<f64>,
+    isotopes: Vec<PyResonanceData>,
+    temperature_k: f64,
+    initial_densities: Option<Vec<f64>>,
+    flight_path_m: Option<f64>,
+    delta_t_us: Option<f64>,
+    delta_l_m: Option<f64>,
+    resolution: Option<PyTabulatedResolution>,
+    max_iter: usize,
+) -> PyResult<PyFitResult> {
+    let trans = transmission.as_array().to_owned();
+    let unc = uncertainty.as_array().to_owned();
+    let e = energies.as_slice()?;
+
+    if isotopes.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "isotopes list must not be empty",
+        ));
+    }
+    if y_range.0 >= y_range.1 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "y_range must be non-empty: start ({}) >= end ({})",
+            y_range.0, y_range.1,
+        )));
+    }
+    if x_range.0 >= x_range.1 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "x_range must be non-empty: start ({}) >= end ({})",
+            x_range.0, x_range.1,
+        )));
+    }
+
+    let n_isotopes = isotopes.len();
+    let isotope_names: Vec<String> = isotopes
+        .iter()
+        .map(|d| {
+            let sym = element_symbol(d.inner.isotope.z).unwrap_or("?");
+            format!("{}-{}", sym, d.inner.isotope.a)
+        })
+        .collect();
+    let res_data: Vec<ResonanceData> = isotopes.into_iter().map(|d| d.inner).collect();
+
+    let init = initial_densities.unwrap_or_else(|| vec![0.001; n_isotopes]);
+    if init.len() != n_isotopes {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "initial_densities length ({}) must match isotopes length ({})",
+            init.len(),
+            n_isotopes,
+        )));
+    }
+
+    let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution)?;
+
+    let config = FitConfig {
+        energies: e.to_vec(),
+        resonance_data: res_data,
+        isotope_names,
+        temperature_k,
+        resolution: res_fn,
+        initial_densities: init,
+        lm_config: LmConfig {
+            max_iter,
+            ..LmConfig::default()
+        },
+    };
+
+    let result = nereids_pipeline::spatial::fit_roi(
+        &trans,
+        &unc,
+        y_range.0..y_range.1,
+        x_range.0..x_range.1,
+        &config,
+    );
+
+    Ok(PyFitResult {
+        densities: result.densities,
+        uncertainties: result.uncertainties,
+        reduced_chi_squared: result.reduced_chi_squared,
+        converged: result.converged,
+        iterations: result.iterations,
+    })
+}
+
 /// NEREIDS Python module.
 #[pymodule]
 fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyResonanceData>()?;
     m.add_class::<PyFitResult>()?;
     m.add_class::<PyTabulatedResolution>()?;
+    m.add_class::<PySpatialResult>()?;
     m.add_function(wrap_pyfunction!(cross_sections, m)?)?;
     m.add_function(wrap_pyfunction!(forward_model, m)?)?;
     m.add_function(wrap_pyfunction!(fit_spectrum, m)?)?;
@@ -972,5 +1240,7 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(resolution_broaden, m)?)?;
     m.add_function(wrap_pyfunction!(load_resolution, m)?)?;
     m.add_function(wrap_pyfunction!(py_apply_resolution, m)?)?;
+    m.add_function(wrap_pyfunction!(py_spatial_map, m)?)?;
+    m.add_function(wrap_pyfunction!(py_fit_roi, m)?)?;
     Ok(())
 }
