@@ -636,8 +636,19 @@ mod tests {
     #[test]
     fn test_mat_roundtrip() {
         for &(z, a, mat) in ENDF_MAT_TABLE.iter() {
-            assert_eq!(mat_number(z, a), Some(mat), "mat_number({}, {}) failed", z, a);
-            assert_eq!(isotope_from_mat(mat), Some((z, a)), "isotope_from_mat({}) failed", mat);
+            assert_eq!(
+                mat_number(z, a),
+                Some(mat),
+                "mat_number({}, {}) failed",
+                z,
+                a
+            );
+            assert_eq!(
+                isotope_from_mat(mat),
+                Some((z, a)),
+                "isotope_from_mat({}) failed",
+                mat
+            );
         }
     }
 
@@ -654,7 +665,11 @@ mod tests {
             assert!(
                 (z1, a1) < (z2, a2),
                 "Table not sorted at index {}: ({}, {}) >= ({}, {})",
-                i, z1, a1, z2, a2
+                i,
+                z1,
+                a1,
+                z2,
+                a2
             );
         }
     }

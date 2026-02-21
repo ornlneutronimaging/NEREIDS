@@ -587,7 +587,11 @@ mod tests {
             assert!(
                 (z1, a1) < (z2, a2),
                 "Table not sorted at index {}: ({}, {}) >= ({}, {})",
-                i, z1, a1, z2, a2
+                i,
+                z1,
+                a1,
+                z2,
+                a2
             );
         }
     }
