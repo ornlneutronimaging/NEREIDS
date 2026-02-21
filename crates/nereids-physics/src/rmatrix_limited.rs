@@ -161,9 +161,9 @@ fn spin_group_cross_sections(
         // Guard only against exact IEEE 754 zero (vanishingly rare in practice).
         // Reference: SAMMY rml/mrml07.f Setr — no special-casing for near-pole.
         let inv_denom = 1.0 / if denom == 0.0 { 1e-50_f64 } else { denom };
-        for c in 0..nch {
-            for cp in 0..nch {
-                r[c][cp] += res.widths[c] * res.widths[cp] * inv_denom;
+        for (c, row) in r.iter_mut().enumerate() {
+            for (cp, elem) in row.iter_mut().enumerate() {
+                *elem += res.widths[c] * res.widths[cp] * inv_denom;
             }
         }
     }
@@ -171,7 +171,7 @@ fn spin_group_cross_sections(
     // ── Level matrix A (complex, NCH×NCH) ────────────────────────────────────
     // A_cc'(E) = δ_cc'(S_c - B_c + i·P_c) - R_cc'
     // Reference: SAMMY rml/mrml09.f Yinvrs subroutine (builds level matrix)
-    let mut a: Vec<Vec<Complex64>> = (0..nch)
+    let a: Vec<Vec<Complex64>> = (0..nch)
         .map(|c| {
             (0..nch)
                 .map(|cp| {
@@ -187,7 +187,7 @@ fn spin_group_cross_sections(
         .collect();
 
     // ── Invert level matrix ───────────────────────────────────────────────────
-    let a_inv = match invert_complex_matrix(&mut a, nch) {
+    let a_inv = match invert_complex_matrix(&a, nch) {
         Some(inv) => inv,
         None => return (0.0, 0.0, 0.0, 0.0), // singular level matrix → skip
     };
@@ -257,7 +257,7 @@ fn spin_group_cross_sections(
 // SAMMY uses a specialized complex symmetric factorization (Xspfa/Xspsl in
 // rml/mrml10.f), but Gauss-Jordan is correct and sufficient for our purposes.
 
-fn invert_complex_matrix(a: &mut Vec<Vec<Complex64>>, n: usize) -> Option<Vec<Vec<Complex64>>> {
+fn invert_complex_matrix(a: &[Vec<Complex64>], n: usize) -> Option<Vec<Vec<Complex64>>> {
     // Build augmented matrix [A | I] of size n × 2n
     let mut aug: Vec<Vec<Complex64>> = (0..n)
         .map(|r| {
@@ -290,8 +290,8 @@ fn invert_complex_matrix(a: &mut Vec<Vec<Complex64>>, n: usize) -> Option<Vec<Ve
 
         // Scale pivot row so leading entry becomes 1
         let inv_pivot = pivot.inv();
-        for j in 0..2 * n {
-            aug[col][j] *= inv_pivot;
+        for elem in aug[col].iter_mut() {
+            *elem *= inv_pivot;
         }
 
         // Eliminate this column from all other rows
@@ -303,9 +303,9 @@ fn invert_complex_matrix(a: &mut Vec<Vec<Complex64>>, n: usize) -> Option<Vec<Ve
             if factor.norm() < 1e-300 {
                 continue;
             }
-            for j in 0..2 * n {
-                let sub = factor * aug[col][j];
-                aug[row][j] -= sub;
+            let col_scaled: Vec<Complex64> = aug[col].iter().map(|&x| factor * x).collect();
+            for (r_elem, sub) in aug[row].iter_mut().zip(col_scaled) {
+                *r_elem -= sub;
             }
         }
     }
@@ -321,7 +321,7 @@ mod tests {
     #[test]
     fn test_identity_inversion() {
         let n = 3;
-        let mut a: Vec<Vec<Complex64>> = (0..n)
+        let a: Vec<Vec<Complex64>> = (0..n)
             .map(|r| {
                 (0..n)
                     .map(|c| {
@@ -334,19 +334,19 @@ mod tests {
                     .collect()
             })
             .collect();
-        let inv = invert_complex_matrix(&mut a, n).unwrap();
-        for r in 0..n {
-            for c in 0..n {
+        let inv = invert_complex_matrix(&a, n).unwrap();
+        for (r, row) in inv.iter().enumerate() {
+            for (c, val) in row.iter().enumerate() {
                 let expected = if r == c { 1.0 } else { 0.0 };
                 assert!(
-                    (inv[r][c].re - expected).abs() < 1e-12,
+                    (val.re - expected).abs() < 1e-12,
                     "inv[{r}][{c}].re = {}, expected {expected}",
-                    inv[r][c].re
+                    val.re
                 );
                 assert!(
-                    inv[r][c].im.abs() < 1e-12,
+                    val.im.abs() < 1e-12,
                     "inv[{r}][{c}].im = {} should be 0",
-                    inv[r][c].im
+                    val.im
                 );
             }
         }
@@ -358,8 +358,8 @@ mod tests {
         let a00 = Complex64::new(2.0, 1.0);
         let a01 = Complex64::new(1.0, 0.0);
         let a11 = Complex64::new(3.0, -2.0);
-        let mut a = vec![vec![a00, a01], vec![Complex64::ZERO, a11]];
-        let inv = invert_complex_matrix(&mut a, 2).unwrap();
+        let a = vec![vec![a00, a01], vec![Complex64::ZERO, a11]];
+        let inv = invert_complex_matrix(&a, 2).unwrap();
 
         // Verify A · A⁻¹ ≈ I
         let i00 = a00 * inv[0][0] + a01 * inv[1][0];
@@ -373,11 +373,11 @@ mod tests {
 
     #[test]
     fn test_singular_returns_none() {
-        let mut a = vec![
+        let a = vec![
             vec![Complex64::new(1.0, 0.0), Complex64::new(2.0, 0.0)],
             vec![Complex64::new(2.0, 0.0), Complex64::new(4.0, 0.0)],
         ];
-        assert!(invert_complex_matrix(&mut a, 2).is_none());
+        assert!(invert_complex_matrix(&a, 2).is_none());
     }
 
     /// Verify W-184 cross-sections show resonance structure.

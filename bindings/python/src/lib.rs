@@ -720,6 +720,7 @@ fn create_resonance_data(
                 target_spin,
                 scattering_radius,
                 l_groups: groups,
+                rml: None,
             }],
         },
     }
