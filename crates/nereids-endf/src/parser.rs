@@ -317,8 +317,9 @@ fn parse_reich_moore_range(
 ///         First 6 values: header row [0, 0, 0, 0, 0, NCH]
 ///         NCH × 6 values: [IPP, L, SCH, BND, APE, APT] per channel
 ///
-///   LIST: [0, 0, 0, 0, NRS*(NCH+1), NRS]           ← resonance parameters
-///         Per resonance: [ER, γ_1, γ_2, ..., γ_NCH]
+///   LIST: [0, 0, 0, 0, NPL, NRS]                    ← resonance parameters
+///         Stride = NPL/NRS (≥ NCH+1; may be 6 for KRM=3 padding).
+///         Per resonance: [ER, γ_1, ..., γ_NCH, <padding zeros>]
 /// ```
 ///
 /// Reference: ENDF-6 Formats Manual §2.2.1.6; SAMMY rml/mrml01.f
@@ -333,6 +334,7 @@ fn parse_rmatrix_limited_range(
     let cont = parse_cont(lines, pos)?;
     let target_spin = cont.c1;
     let scattering_radius = cont.c2;
+    let krm = cont.l2 as u32; // R-matrix type: 2=standard, 3=Reich-Moore approx
     let njs = cont.n1 as usize; // number of spin groups
 
     // LIST: [0, 0, NPP, 0, 12*NPP, NPP]  — particle pair definitions
@@ -402,10 +404,20 @@ fn parse_rmatrix_limited_range(
         // LIST: [AJ, PJ, KBK, KPS, 6*(NCH+1), NCH+1]
         // First 6*(NCH+1) values: header row [0,0,0,0,0,NCH] then NCH×6 channel defs.
         let sg_cont = parse_cont(lines, pos)?;
-        let j = sg_cont.c1;
-        let parity = sg_cont.c2;
+        let aj = sg_cont.c1;
+        let pj = sg_cont.c2; // explicit parity field; may be 0.0 when parity is in sign(AJ)
         let kbk = sg_cont.l1; // background R-matrix flag
         let kps = sg_cont.l2; // phase shift flag
+
+        // AJ encodes both the spin and, in some evaluations, the parity.
+        // ENDF/B-VIII.0 evaluations such as W-184 use negative AJ for odd-parity
+        // spin groups (e.g., AJ=-0.5, AJ=-1.5) and set PJ=0.
+        // Statistical weight formula (2J+1)/... requires J > 0; negative J yields
+        // zero or negative weights and drives non-physical cross-sections.
+        // Fix: J = |AJ|; parity from sign(AJ) when PJ is absent (PJ=0).
+        // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f Scan_File_2.
+        let j = aj.abs();
+        let parity = if pj != 0.0 { pj.signum() } else if aj < 0.0 { -1.0 } else { 1.0 };
         let npl = sg_cont.n1 as usize; // 6*(NCH+1)
         let nch_plus_one = sg_cont.n2 as usize; // NCH+1
         let nch = nch_plus_one.saturating_sub(1);
@@ -442,20 +454,40 @@ fn parse_rmatrix_limited_range(
             }
         }
 
-        // LIST: [0, 0, 0, 0, NRS*(NCH+1), NRS]  — resonance parameters
+        // LIST: [0, 0, 0, 0, NPL, NRS]  — resonance parameters
+        // NPL = total values = NRS × (values-per-resonance).
+        // For standard LRF=7, values-per-resonance = NCH+1.
+        // For KRM=3 (e.g. W-184 ENDF/B-VIII.0), evaluators pad each resonance row
+        // to a fixed 6 values per ENDF line, so NPL/NRS = 6 even when NCH=1.
+        // Using hardcoded nch+1 drifts the offset and misreads zeros as energies.
+        // Fix: derive stride directly from NPL/NRS; read only NCH widths per row.
+        // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f (Scan_File_2 resonance loop).
         let res_cont = parse_cont(lines, pos)?;
         let nrs = res_cont.n2 as usize;
-        let res_npl = res_cont.n1 as usize; // NRS * (NCH+1)
+        let res_npl = res_cont.n1 as usize;
         let res_values = parse_list_values(lines, pos, res_npl)?;
 
+        let stride = if nrs > 0 { res_npl / nrs } else { nch + 1 };
         let mut resonances = Vec::with_capacity(nrs);
-        let stride = nch + 1; // values per resonance: ER + NCH widths
         for r in 0..nrs {
             let b = r * stride;
-            let widths: Vec<f64> = res_values[b + 1..b + stride].to_vec();
+            // Only the first NCH values after ER are widths; remainder is padding or gamma_gamma.
+            let widths: Vec<f64> = res_values[b + 1..b + 1 + nch].to_vec();
+            // KRM=3 (Reich-Moore approximation): an extra Γ_γ (capture width, eV) is
+            // stored at position b+1+nch, immediately after the NCH partial widths.
+            // This capture width is used to form complex pole energies:
+            //   Ẽ_n = E_n - i·Γ_γ/2
+            // For KRM=2 (standard R-matrix), gamma_gamma = 0.0.
+            // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f.
+            let gamma_gamma = if krm == 3 && b + 1 + nch < res_values.len() {
+                res_values[b + 1 + nch]
+            } else {
+                0.0
+            };
             resonances.push(RmlResonance {
                 energy: res_values[b],
                 widths,
+                gamma_gamma,
             });
         }
 
@@ -489,6 +521,7 @@ fn parse_rmatrix_limited_range(
         target_spin,
         awr,
         scattering_radius,
+        krm,
         particle_pairs,
         spin_groups,
     };

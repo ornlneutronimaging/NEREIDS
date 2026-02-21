@@ -178,20 +178,29 @@ pub struct RmlChannel {
 
 /// A single resonance in LRF=7 format.
 ///
-/// Unlike LRF=1/2/3 where widths are formal widths Γ (eV), LRF=7 stores
-/// **reduced width amplitudes** γ (eV^{1/2}). Formal widths are recovered via
-/// Γ_c = 2 · P_c(E_n) · γ²_c, where P_c is the penetrability at resonance energy.
+/// For KRM=2 (standard R-matrix), `widths` contains reduced width amplitudes
+/// γ_c (eV^{1/2}) and `gamma_gamma = 0.0`.
 ///
-/// Reference: SAMMY manual §3.1; ENDF-6 Formats Manual §2.2.1.6
+/// For KRM=3 (Reich-Moore approximation), `widths` contains formal partial widths
+/// Γ_c (eV) and `gamma_gamma` is the capture width Γ_γ (eV) used to form complex
+/// pole energies: Ẽ_n = E_n - i·Γ_γn/2. The reduced amplitudes are derived as
+/// γ_nc = √(Γ_nc / (2·P_c(E_n))).
+///
+/// Reference: ENDF-6 Formats Manual §2.2.1.6; SAMMY manual §3.1
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RmlResonance {
     /// Resonance energy (eV).
     pub energy: f64,
-    /// Reduced width amplitudes γ_c (eV^{1/2}), one per channel.
+    /// Width amplitudes per channel (eV^{1/2} for KRM=2; eV for KRM=3).
     ///
     /// Sign convention: sign(γ) encodes interference between resonances.
     /// `widths.len()` equals the number of channels in the parent `SpinGroup`.
     pub widths: Vec<f64>,
+    /// Capture (gamma) width Γ_γ (eV) for KRM=3 Reich-Moore approximation.
+    ///
+    /// Used to make the R-matrix denominator complex: E_n → E_n - i·Γ_γ/2.
+    /// Zero for KRM=2 (standard R-matrix, no complex energy shift).
+    pub gamma_gamma: f64,
 }
 
 /// A spin group (J, π) in LRF=7 R-Matrix Limited format.
@@ -225,6 +234,13 @@ pub struct RmlData {
     pub awr: f64,
     /// Global scattering radius AP (fm); used as fallback when per-channel APE = 0.
     pub scattering_radius: f64,
+    /// R-matrix type flag from ENDF CONT header.
+    ///
+    /// KRM=2: Standard multi-channel R-matrix (widths are reduced amplitudes γ).
+    /// KRM=3: Reich-Moore approximation (widths are formal partial widths Γ;
+    ///        capture enters via complex pole energies Ẽ_n = E_n - i·Γ_γ/2).
+    /// Reference: ENDF-6 Formats Manual §2.2.1.6; SAMMY rml/mrml01.f
+    pub krm: u32,
     /// Particle pair definitions (NPP entries).
     pub particle_pairs: Vec<ParticlePair>,
     /// Spin groups (NJS entries), one per (J, π) combination.
