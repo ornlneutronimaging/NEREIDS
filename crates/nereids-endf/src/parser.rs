@@ -329,8 +329,11 @@ fn parse_rmatrix_limited_range(
     let njs = cont.n1 as usize; // number of spin groups
 
     // LIST: [0, 0, NPP, 0, 12*NPP, NPP]  — particle pair definitions
+    // NPP is authoritative in L1; N2 is nominally equal but can encode a
+    // different count in some files (e.g. N2 = 2*NPP).  Always derive from L1.
+    // Reference: ENDF-6 Formats Manual §2.2.1.6 Table 2.1.
     let pp_cont = parse_cont(lines, pos)?;
-    let npp = pp_cont.n2 as usize;
+    let npp = pp_cont.l1 as usize;
     let pp_values = parse_list_values(lines, pos, npp * 12)?;
 
     let mut particle_pairs = Vec::with_capacity(npp);
@@ -350,6 +353,25 @@ fn parse_rmatrix_limited_range(
             pa: pp_values[b + 10],
             pb: pp_values[b + 11],
         });
+    }
+
+    // PNT/SHF validation: non-zero means tabulated penetrability/shift functions,
+    // which require KPS-style interpolation not yet implemented.  Reject early so
+    // the error is clear rather than silently using wrong analytic values.
+    // Reference: ENDF-6 Formats Manual §2.2.1.6; SAMMY rml/mrml07.f Pgh subroutine.
+    for (i, pp) in particle_pairs.iter().enumerate() {
+        if pp.pnt != 0 {
+            return Err(EndfParseError::UnsupportedFormat(format!(
+                "LRF=7 particle pair {i}: tabulated penetrability (PNT={}) not yet supported",
+                pp.pnt
+            )));
+        }
+        if pp.shf != 0 {
+            return Err(EndfParseError::UnsupportedFormat(format!(
+                "LRF=7 particle pair {i}: tabulated shift factor (SHF={}) not yet supported",
+                pp.shf
+            )));
+        }
     }
 
     let mut spin_groups = Vec::with_capacity(njs);
