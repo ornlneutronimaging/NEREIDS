@@ -342,6 +342,7 @@ fn forward_model<'py>(
             resolution: ResolutionFunction::Tabulated(tab.inner),
         })
     } else if let (Some(fp), Some(dt), Some(dl)) = (flight_path_m, delta_t_us, delta_l_m) {
+        validate_gaussian_params(fp, dt, dl)?;
         Some(InstrumentParams {
             resolution: ResolutionFunction::Gaussian(ResolutionParams {
                 flight_path_m: fp,
@@ -454,6 +455,7 @@ fn fit_spectrum(
             resolution: ResolutionFunction::Tabulated(tab.inner),
         }))
     } else if let (Some(fp), Some(dt), Some(dl)) = (flight_path_m, delta_t_us, delta_l_m) {
+        validate_gaussian_params(fp, dt, dl)?;
         Some(Arc::new(InstrumentParams {
             resolution: ResolutionFunction::Gaussian(ResolutionParams {
                 flight_path_m: fp,
@@ -710,6 +712,27 @@ fn beer_lambert<'py>(
     let xs = cross_sections.as_slice()?;
     let t = transmission::beer_lambert(xs, thickness);
     Ok(PyArray1::from_vec(py, t))
+}
+
+/// Validate Gaussian resolution parameters: finite, positive flight path,
+/// non-negative timing and path length uncertainties.
+fn validate_gaussian_params(fp: f64, dt: f64, dl: f64) -> PyResult<()> {
+    if !fp.is_finite() || fp <= 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "flight_path_m must be finite and positive",
+        ));
+    }
+    if !dt.is_finite() || dt < 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "delta_t_us must be finite and non-negative",
+        ));
+    }
+    if !dl.is_finite() || dl < 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "delta_l_m must be finite and non-negative",
+        ));
+    }
+    Ok(())
 }
 
 /// Validate that an energy grid is finite, positive, and sorted ascending.

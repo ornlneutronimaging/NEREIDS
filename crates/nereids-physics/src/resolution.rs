@@ -259,6 +259,14 @@ impl TabulatedResolution {
 
             let parts: Vec<&str> = trimmed.split_whitespace().collect();
             if parts.len() != 2 {
+                if current_energy.is_some() {
+                    return Err(ResolutionParseError::InvalidFormat(format!(
+                        "Expected 2 columns inside energy block, got {}: '{}'",
+                        parts.len(),
+                        trimmed
+                    )));
+                }
+                // Outside a data block (e.g. extra header lines) — skip
                 continue;
             }
 
