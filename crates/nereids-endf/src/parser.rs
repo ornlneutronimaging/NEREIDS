@@ -417,7 +417,13 @@ fn parse_rmatrix_limited_range(
         // Fix: J = |AJ|; parity from sign(AJ) when PJ is absent (PJ=0).
         // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f Scan_File_2.
         let j = aj.abs();
-        let parity = if pj != 0.0 { pj.signum() } else if aj < 0.0 { -1.0 } else { 1.0 };
+        let parity = if pj != 0.0 {
+            pj.signum()
+        } else if aj < 0.0 {
+            -1.0
+        } else {
+            1.0
+        };
         let npl = sg_cont.n1 as usize; // 6*(NCH+1)
         let nch_plus_one = sg_cont.n2 as usize; // NCH+1
         let nch = nch_plus_one.saturating_sub(1);

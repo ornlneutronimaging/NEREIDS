@@ -489,5 +489,4 @@ mod tests {
             xs_on_res.capture, xs_on_res.elastic
         );
     }
-
 }
