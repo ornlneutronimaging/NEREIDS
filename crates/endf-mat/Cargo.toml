@@ -1,0 +1,11 @@
+[package]
+name = "endf-mat"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "ENDF MAT number lookup, element symbols, and natural isotopic abundances"
+repository = "https://github.com/ornlneutronimaging/NEREIDS"
+keywords = ["endf", "nuclear", "isotope", "neutron", "element"]
+categories = ["science"]
+
+# No external dependencies — pure data + lookup

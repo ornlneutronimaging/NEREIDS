@@ -243,60 +243,14 @@ impl Default for EndfRetriever {
     }
 }
 
-/// Well-known ENDF MAT numbers for commonly used isotopes.
+/// Look up the ENDF MAT number for a ground-state isotope.
 ///
-/// Reference: ENDF-6 Formats Manual, Appendix B.
+/// Covers 535 isotopes from the ENDF/B-VIII.0 neutrons sublibrary
+/// (via the `endf-mat` crate). This replaces the previous hand-coded
+/// 47-entry table and fixes several incorrect MAT values (Cd-113,
+/// Hf-177/178, W-182/183/184/186 were off by one isotope offset).
 pub fn mat_number(isotope: &Isotope) -> Option<u32> {
-    // MAT numbers follow: MAT = Z*100 + iso_index
-    // These are the standard values from the ENDF database.
-    let za = isotope.z * 1000 + isotope.a;
-    match za {
-        1001 => Some(125),   // H-1
-        1002 => Some(128),   // H-2
-        3006 => Some(325),   // Li-6
-        3007 => Some(328),   // Li-7
-        5010 => Some(525),   // B-10
-        5011 => Some(528),   // B-11
-        6012 => Some(625),   // C-12
-        13027 => Some(1325), // Al-27
-        26054 => Some(2625), // Fe-54
-        26056 => Some(2631), // Fe-56
-        26057 => Some(2634), // Fe-57
-        26058 => Some(2637), // Fe-58
-        28058 => Some(2825), // Ni-58
-        28060 => Some(2831), // Ni-60
-        29063 => Some(2925), // Cu-63
-        29065 => Some(2931), // Cu-65
-        40090 => Some(4025), // Zr-90
-        40091 => Some(4028), // Zr-91
-        40092 => Some(4031), // Zr-92
-        40094 => Some(4037), // Zr-94
-        40096 => Some(4043), // Zr-96
-        41093 => Some(4125), // Nb-93
-        47107 => Some(4725), // Ag-107
-        47109 => Some(4731), // Ag-109
-        48113 => Some(4849), // Cd-113
-        49115 => Some(4931), // In-115
-        72177 => Some(7231), // Hf-177
-        72178 => Some(7234), // Hf-178
-        73181 => Some(7328), // Ta-181
-        74182 => Some(7425), // W-182
-        74183 => Some(7428), // W-183
-        74184 => Some(7431), // W-184
-        74186 => Some(7437), // W-186
-        79197 => Some(7925), // Au-197
-        82206 => Some(8231), // Pb-206
-        82207 => Some(8234), // Pb-207
-        82208 => Some(8237), // Pb-208
-        90232 => Some(9040), // Th-232
-        92234 => Some(9225), // U-234
-        92235 => Some(9228), // U-235
-        92238 => Some(9237), // U-238
-        94239 => Some(9437), // Pu-239
-        94240 => Some(9440), // Pu-240
-        94241 => Some(9443), // Pu-241
-        _ => None,
-    }
+    endf_mat::mat_number(isotope.z, isotope.a)
 }
 
 /// Errors from ENDF retrieval operations.

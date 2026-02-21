@@ -1132,6 +1132,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "endf-mat"
+version = "0.1.0"
+
+[[package]]
 name = "endi"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2327,6 +2331,7 @@ dependencies = [
 name = "nereids-core"
 version = "0.1.0"
 dependencies = [
+ "endf-mat",
  "ndarray",
  "serde",
  "thiserror 2.0.18",
@@ -2337,6 +2342,7 @@ name = "nereids-endf"
 version = "0.1.0"
 dependencies = [
  "dirs",
+ "endf-mat",
  "nereids-core",
  "reqwest",
  "serde",

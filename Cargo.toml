@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/endf-mat",
     "crates/nereids-core",
     "crates/nereids-endf",
     "crates/nereids-physics",
@@ -19,6 +20,7 @@ repository = "https://github.com/ornlneutronimaging/NEREIDS"
 
 [workspace.dependencies]
 # Internal crates
+endf-mat = { path = "crates/endf-mat" }
 nereids-core = { path = "crates/nereids-core" }
 nereids-endf = { path = "crates/nereids-endf" }
 nereids-physics = { path = "crates/nereids-physics" }
