@@ -25,7 +25,7 @@
 
 use std::sync::Arc;
 
-use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3};
+use numpy::{PyArray1, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3};
 use pyo3::prelude::*;
 
 use nereids_core::elements::element_symbol;
@@ -38,6 +38,8 @@ use nereids_endf::retrieval::{EndfLibrary, EndfRetriever, mat_number};
 use nereids_fitting::lm::{self, LmConfig};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
 use nereids_fitting::transmission_model::TransmissionFitModel;
+use nereids_io::normalization::{self as norm, NormalizationParams};
+use nereids_io::tof::BeamlineParams;
 use nereids_physics::doppler::{self, DopplerParams};
 use nereids_physics::resolution::{
     self, ResolutionFunction, ResolutionParams, TabulatedResolution,
@@ -1220,6 +1222,98 @@ fn py_fit_roi(
     })
 }
 
+/// Load a multi-frame TIFF file into a 3D numpy array.
+///
+/// Each TIFF frame becomes one slice along the first axis.
+/// Data is converted to float64 regardless of the source pixel type.
+///
+/// Args:
+///     path: Path to the multi-frame TIFF file.
+///
+/// Returns:
+///     3D numpy array with shape (n_frames, height, width).
+#[pyfunction]
+fn load_tiff_stack<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyArray3<f64>>> {
+    let arr = nereids_io::tiff_stack::load_tiff_stack(std::path::Path::new(path))
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))?;
+    Ok(PyArray3::from_owned_array(py, arr))
+}
+
+/// Normalize raw sample and open-beam data to transmission.
+///
+/// Computes T = (C_sample / C_ob) × (PC_ob / PC_sample) with Poisson
+/// uncertainty propagation.
+///
+/// Args:
+///     sample: 3D numpy array of raw sample counts (n_tof, height, width).
+///     open_beam: 3D numpy array of open-beam counts (same shape).
+///     pc_sample: Proton charge for the sample measurement.
+///     pc_ob: Proton charge for the open-beam measurement.
+///     dark_current: Optional 2D numpy array (height, width) to subtract.
+///
+/// Returns:
+///     Tuple of (transmission, uncertainty) as 3D numpy arrays.
+#[pyfunction]
+#[pyo3(signature = (sample, open_beam, pc_sample, pc_ob, dark_current=None))]
+fn normalize<'py>(
+    py: Python<'py>,
+    sample: PyReadonlyArray3<f64>,
+    open_beam: PyReadonlyArray3<f64>,
+    pc_sample: f64,
+    pc_ob: f64,
+    dark_current: Option<PyReadonlyArray2<f64>>,
+) -> PyResult<(Bound<'py, PyArray3<f64>>, Bound<'py, PyArray3<f64>>)> {
+    let s = sample.as_array().to_owned();
+    let ob = open_beam.as_array().to_owned();
+    let dc = dark_current.map(|d| d.as_array().to_owned());
+
+    let params = NormalizationParams {
+        proton_charge_sample: pc_sample,
+        proton_charge_ob: pc_ob,
+    };
+
+    let result = norm::normalize(&s, &ob, &params, dc.as_ref())
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
+
+    Ok((
+        PyArray3::from_owned_array(py, result.transmission),
+        PyArray3::from_owned_array(py, result.uncertainty),
+    ))
+}
+
+/// Convert TOF bin edges to energy bin centers.
+///
+/// Returns the geometric mean of adjacent energy bin edges (ascending order).
+/// This is the standard energy grid for neutron resonance analysis.
+///
+/// Args:
+///     tof_edges: 1D numpy array of TOF bin edges in microseconds (ascending).
+///     flight_path_m: Total flight path in meters.
+///     delay_us: Electronic/moderator delay in microseconds (default 0.0).
+///
+/// Returns:
+///     1D numpy array of energy bin centers in eV (ascending).
+///     Length = len(tof_edges) - 1.
+#[pyfunction]
+#[pyo3(signature = (tof_edges, flight_path_m, delay_us=0.0))]
+fn tof_to_energy_centers<'py>(
+    py: Python<'py>,
+    tof_edges: PyReadonlyArray1<f64>,
+    flight_path_m: f64,
+    delay_us: f64,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let edges = tof_edges.as_slice()?;
+    let params = BeamlineParams {
+        flight_path_m,
+        delay_us,
+    };
+
+    let centers = nereids_io::tof::tof_edges_to_energy_centers(edges, &params)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
+
+    Ok(PyArray1::from_owned_array(py, centers))
+}
+
 /// NEREIDS Python module.
 #[pymodule]
 fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -1242,5 +1336,8 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_apply_resolution, m)?)?;
     m.add_function(wrap_pyfunction!(py_spatial_map, m)?)?;
     m.add_function(wrap_pyfunction!(py_fit_roi, m)?)?;
+    m.add_function(wrap_pyfunction!(load_tiff_stack, m)?)?;
+    m.add_function(wrap_pyfunction!(normalize, m)?)?;
+    m.add_function(wrap_pyfunction!(tof_to_energy_centers, m)?)?;
     Ok(())
 }
