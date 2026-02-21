@@ -66,8 +66,14 @@ pub fn cross_sections_for_rml_range(rml: &RmlData, energy_ev: f64) -> (f64, f64,
     let mut fission = 0.0;
 
     for sg in &rml.spin_groups {
-        let (t, e, cap, fis) =
-            spin_group_cross_sections(sg, &rml.particle_pairs, energy_ev, rml.awr, rml.target_spin);
+        let (t, e, cap, fis) = spin_group_cross_sections(
+            sg,
+            &rml.particle_pairs,
+            energy_ev,
+            rml.awr,
+            rml.target_spin,
+            rml.krm,
+        );
         total += t;
         elastic += e;
         capture += cap;
@@ -86,6 +92,7 @@ fn spin_group_cross_sections(
     energy_ev: f64,
     awr: f64,
     target_spin: f64,
+    krm: u32,
 ) -> (f64, f64, f64, f64) {
     let nch = sg.channels.len();
     if nch == 0 || sg.resonances.is_empty() {
@@ -156,22 +163,59 @@ fn spin_group_cross_sections(
         }
     }
 
-    // ── R-matrix (real, NCH×NCH symmetric) ───────────────────────────────────
-    // R_cc'(E) = Σ_n γ_nc · γ_nc' / (E_n - E)
-    // Reference: SAMMY rml/mrml07.f Setr subroutine
-    let mut r = vec![vec![0.0f64; nch]; nch];
+    // ── R-matrix (complex for KRM=3, real for KRM=2) ─────────────────────────
+    // KRM=2 (standard R-matrix):
+    //   R_cc'(E) = Σ_n γ_nc · γ_nc' / (E_n - E)   [real, reduced amplitude widths]
+    //
+    // KRM=3 (Reich-Moore approximation):
+    //   R_cc'(E) = Σ_n γ_nc · γ_nc' / (Ẽ_n - E)   [complex, Ẽ_n = E_n - i·Γ_γn/2]
+    //   where γ_nc = √(Γ_nc / (2·P_c(E_n))) (partial width → reduced amplitude).
+    //   The imaginary shift makes capture implicit — |U| < 1, with missing flux
+    //   going to capture.
+    //
+    // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml07.f Setr subroutine
+    let mut r_cplx = vec![vec![Complex64::ZERO; nch]; nch];
     for res in &sg.resonances {
-        let denom = res.energy - energy_ev;
-        // P2: Retain the pole term even when denom → 0. The old `continue` dropped
-        // the resonance entirely, causing a non-physical dip in σ at that energy.
-        // The level matrix's imaginary diagonal i·P_c provides Lorentzian width
-        // regularization so cross-sections remain finite at resonance energies.
-        // Guard only against exact IEEE 754 zero (vanishingly rare in practice).
-        // Reference: SAMMY rml/mrml07.f Setr — no special-casing for near-pole.
-        let inv_denom = 1.0 / if denom == 0.0 { 1e-50_f64 } else { denom };
-        for (c, row) in r.iter_mut().enumerate() {
+        let (gamma_vals, e_tilde) = if krm == 3 {
+            // KRM=3: convert formal partial widths to reduced amplitudes.
+            // γ_nc = √(|Γ_nc| / (2·P_c(E_n))).  Sign preserved from Γ_nc.
+            // For closed channels or P=0 (e.g. bound states at E_n<0): use
+            // γ_nc = √(|Γ_nc|) directly (SAMMY convention for bound states).
+            // Complex energy Ẽ_n = E_n - i·Γ_γ/2.
+            // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f
+            let e_tilde = Complex64::new(res.energy, -res.gamma_gamma / 2.0);
+            let gamma_vals: Vec<f64> = (0..nch)
+                .map(|c| {
+                    let gamma_formal = res.widths[c];
+                    if p_c[c] < 1e-30 {
+                        // Closed channel or bound-state: P≈0, use formal width directly
+                        // as a proxy for the reduced amplitude (SAMMY bound-state handling).
+                        gamma_formal.abs().sqrt().copysign(gamma_formal)
+                    } else {
+                        // Open channel: γ = √(|Γ| / (2P)) with sign of Γ.
+                        let magnitude = (gamma_formal.abs() / (2.0 * p_c[c])).sqrt();
+                        magnitude.copysign(gamma_formal)
+                    }
+                })
+                .collect();
+            (gamma_vals, e_tilde)
+        } else {
+            // KRM=2: widths are already reduced amplitudes; real denominator.
+            // P2: Guard only against exact IEEE 754 zero; complex infrastructure
+            // handles the Lorentzian width naturally via i·P_c in level matrix.
+            let e_tilde = Complex64::new(res.energy, 0.0);
+            (res.widths.clone(), e_tilde)
+        };
+
+        let denom = e_tilde - energy_ev;
+        let inv_denom = if denom.norm() < 1e-300 {
+            Complex64::new(1.0 / 1e-50_f64, 0.0)
+        } else {
+            denom.inv()
+        };
+        for (c, row) in r_cplx.iter_mut().enumerate() {
             for (cp, elem) in row.iter_mut().enumerate() {
-                *elem += res.widths[c] * res.widths[cp] * inv_denom;
+                *elem += gamma_vals[c] * gamma_vals[cp] * inv_denom;
             }
         }
     }
@@ -188,7 +232,7 @@ fn spin_group_cross_sections(
                     } else {
                         Complex64::ZERO
                     };
-                    diag - r[c][cp]
+                    diag - r_cplx[c][cp]
                 })
                 .collect()
         })
@@ -411,26 +455,39 @@ mod tests {
 
         let data = parse_endf_file2(&text).expect("Failed to parse W-184 ENDF");
 
-        // σ_total at first resonance (~7.6 eV) should be much larger than background
-        let xs_on_res = cross_sections_at_energy(&data, 7.6);
-        let xs_off_res = cross_sections_at_energy(&data, 5.0);
+        // W-184 ENDF/B-VIII.0 (KRM=3, 3 spin groups J=1/2+, J=1/2-, J=3/2-):
+        //   First positive resonance in J=1/2+ spin group: ~101.9 eV
+        //   Background between the -386 eV bound state and 101.9 eV resonance: ~0.07 b
+        // Test that σ_total at the 101.9 eV resonance peak >> background at 50 eV.
+        let xs_on_res = cross_sections_at_energy(&data, 101.9);
+        let xs_off_res = cross_sections_at_energy(&data, 50.0);
 
         assert!(
             xs_on_res.total > 0.0,
-            "σ_total at 7.6 eV should be positive, got {}",
+            "σ_total at 101.9 eV should be positive, got {}",
             xs_on_res.total
         );
         assert!(
+            xs_on_res.capture >= 0.0,
+            "σ_capture at 101.9 eV should be non-negative, got {}",
+            xs_on_res.capture
+        );
+        assert!(
             xs_on_res.total > xs_off_res.total * 5.0,
-            "Resonance peak at 7.6 eV should be >5× the 5 eV background: \
-             σ(7.6)={:.1} vs σ(5.0)={:.1} barns",
+            "Resonance peak at 101.9 eV should be >5× the 50 eV background: \
+             σ(101.9)={:.3} vs σ(50.0)={:.3} barns",
             xs_on_res.total,
             xs_off_res.total
         );
 
         println!(
-            "W-184 σ_total: {:.1} b at 7.6 eV (resonance), {:.1} b at 5.0 eV (background)",
+            "W-184 σ_total: {:.3} b at 101.9 eV (resonance), {:.3} b at 50.0 eV (background)",
             xs_on_res.total, xs_off_res.total
         );
+        println!(
+            "W-184 σ_capture: {:.4} b, σ_elastic: {:.4} b at 101.9 eV",
+            xs_on_res.capture, xs_on_res.elastic
+        );
     }
+
 }
