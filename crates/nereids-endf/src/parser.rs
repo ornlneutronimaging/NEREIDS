@@ -375,11 +375,11 @@ fn parse_rmatrix_limited_range(
             let b = 6 + c * 6; // skip the 6-value header row
             channels.push(RmlChannel {
                 particle_pair_idx: sg_values[b] as usize, // IPP (1-based in ENDF, convert below)
-                l: sg_values[b + 1] as u32,                // L
-                channel_spin: sg_values[b + 2],            // SCH
-                boundary: sg_values[b + 3],                // BND
-                effective_radius: sg_values[b + 4],        // APE (fm)
-                true_radius: sg_values[b + 5],             // APT (fm)
+                l: sg_values[b + 1] as u32,               // L
+                channel_spin: sg_values[b + 2],           // SCH
+                boundary: sg_values[b + 3],               // BND
+                effective_radius: sg_values[b + 4],       // APE (fm)
+                true_radius: sg_values[b + 5],            // APT (fm)
             });
         }
 
@@ -457,6 +457,7 @@ fn parse_rmatrix_limited_range(
 }
 
 /// Skip a LIST record (CONT header + data lines).
+#[allow(dead_code)] // Reserved for KBK/KPS background term support (issue #39)
 fn skip_list(lines: &[&str], pos: &mut usize) -> Result<(), EndfParseError> {
     let cont = parse_cont(lines, pos)?;
     let npl = cont.n1 as usize;
@@ -802,6 +803,69 @@ mod tests {
             "  L=0: {} resonances, L=1: {} resonances",
             l0.resonances.len(),
             range.l_groups[1].resonances.len()
+        );
+    }
+
+    /// Parse a real LRF=7 ENDF file (W-184) downloaded from IAEA.
+    ///
+    /// Run with: cargo test -p nereids-endf -- --ignored test_parse_w184_rml
+    ///
+    /// Validates: formalism == RMatrixLimited, spin groups non-empty,
+    /// first positive resonance energy in plausible range (W-184: ~7.6 eV).
+    #[test]
+    #[ignore = "requires network: downloads W-184 ENDF from IAEA (~50 kB)"]
+    fn test_parse_w184_rml() {
+        use crate::retrieval::{EndfLibrary, EndfRetriever};
+        use nereids_core::types::Isotope;
+
+        let retriever = EndfRetriever::new();
+        let isotope = Isotope::new(74, 184);
+        let (_, text) = retriever
+            .get_endf_file(&isotope, EndfLibrary::EndfB8_0, 7437)
+            .expect("Failed to download W-184 ENDF/B-VIII.0");
+
+        let data = parse_endf_file2(&text).expect("Failed to parse W-184 ENDF");
+
+        assert!(
+            !data.ranges.is_empty(),
+            "W-184 should have at least one energy range"
+        );
+        let range = &data.ranges[0];
+        assert_eq!(
+            range.formalism,
+            crate::resonance::ResonanceFormalism::RMatrixLimited,
+            "W-184 uses LRF=7 (R-Matrix Limited) in ENDF/B-VIII.0"
+        );
+
+        let rml = range.rml.as_ref().expect("LRF=7 range should have RmlData");
+        assert!(!rml.particle_pairs.is_empty(), "Should have particle pairs");
+        assert!(!rml.spin_groups.is_empty(), "Should have spin groups");
+
+        let total_resonances: usize = rml.spin_groups.iter().map(|sg| sg.resonances.len()).sum();
+        assert!(
+            total_resonances > 10,
+            "W-184 should have many resonances, got {total_resonances}"
+        );
+
+        // First positive-energy resonance should be around 7.6 eV for W-184
+        let first_pos_e = rml
+            .spin_groups
+            .iter()
+            .flat_map(|sg| &sg.resonances)
+            .map(|r| r.energy)
+            .filter(|&e| e > 0.0)
+            .fold(f64::MAX, f64::min);
+        assert!(
+            first_pos_e > 1.0 && first_pos_e < 50.0,
+            "First W-184 resonance expected ~7.6 eV, got {first_pos_e:.2} eV"
+        );
+
+        println!(
+            "W-184 LRF=7 parsed: {} spin groups, {} total resonances, \
+             first resonance at {:.2} eV",
+            rml.spin_groups.len(),
+            total_resonances,
+            first_pos_e
         );
     }
 }

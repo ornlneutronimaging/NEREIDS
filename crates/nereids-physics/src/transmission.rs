@@ -185,6 +185,7 @@ mod tests {
                         gfb: 0.0,
                     }],
                 }],
+                rml: None,
             }],
         }
     }
@@ -369,6 +370,7 @@ mod tests {
                         gfb: 0.0,
                     }],
                 }],
+                rml: None,
             }],
         };
 

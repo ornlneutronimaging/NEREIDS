@@ -260,15 +260,9 @@ impl ResonanceRange {
     /// Total resonance count for this range (works for both LRF=1/2/3 and LRF=7).
     pub fn resonance_count(&self) -> usize {
         if let Some(rml) = &self.rml {
-            rml.spin_groups
-                .iter()
-                .map(|sg| sg.resonances.len())
-                .sum()
+            rml.spin_groups.iter().map(|sg| sg.resonances.len()).sum()
         } else {
-            self.l_groups
-                .iter()
-                .map(|lg| lg.resonances.len())
-                .sum()
+            self.l_groups.iter().map(|lg| lg.resonances.len()).sum()
         }
     }
 }

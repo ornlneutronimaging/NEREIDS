@@ -28,6 +28,7 @@ use nereids_endf::resonance::{ResonanceData, ResonanceFormalism, ResonanceRange}
 
 use crate::channel;
 use crate::penetrability;
+use crate::rmatrix_limited;
 
 /// Cross-section results at a single energy point.
 #[derive(Debug, Clone, Copy)]
@@ -106,12 +107,18 @@ pub fn cross_sections_on_grid(data: &ResonanceData, energies: &[f64]) -> Vec<Cro
 /// Cross-sections for a single resolved resonance range.
 ///
 /// Returns (total, elastic, capture, fission) in barns.
+/// Dispatches to the R-Matrix Limited calculator for LRF=7 ranges.
 fn cross_sections_for_range(
     range: &ResonanceRange,
     energy_ev: f64,
     awr: f64,
     target_spin: f64,
 ) -> (f64, f64, f64, f64) {
+    // LRF=7 (R-Matrix Limited): dispatch to multi-channel calculator.
+    if let Some(rml) = &range.rml {
+        return rmatrix_limited::cross_sections_for_rml_range(rml, energy_ev);
+    }
+
     let mut total = 0.0;
     let mut elastic = 0.0;
     let mut capture = 0.0;
@@ -698,6 +705,7 @@ mod tests {
                         gfb: 0.0,
                     }],
                 }],
+                rml: None,
             }],
         }
     }
