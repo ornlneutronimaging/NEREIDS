@@ -355,11 +355,13 @@ fn parse_rmatrix_limited_range(
         });
     }
 
-    // PNT/SHF validation: non-zero means tabulated penetrability/shift functions,
-    // which require KPS-style interpolation not yet implemented.  Reject early so
-    // the error is clear rather than silently using wrong analytic values.
-    // Reference: ENDF-6 Formats Manual §2.2.1.6; SAMMY rml/mrml07.f Pgh subroutine.
+    // Particle-pair capability validation.
+    // Reject early with a clear error rather than silently computing wrong results.
+    // Consistent with KBK/KPS rejection above.
     for (i, pp) in particle_pairs.iter().enumerate() {
+        // PNT/SHF: non-zero flags indicate tabulated penetrability/shift functions
+        // (KPS-style interpolation).  Only analytic Blatt-Weisskopf is implemented.
+        // Reference: ENDF-6 Formats Manual §2.2.1.6; SAMMY rml/mrml07.f Pgh subroutine.
         if pp.pnt != 0 {
             return Err(EndfParseError::UnsupportedFormat(format!(
                 "LRF=7 particle pair {i}: tabulated penetrability (PNT={}) not yet supported",
@@ -370,6 +372,22 @@ fn parse_rmatrix_limited_range(
             return Err(EndfParseError::UnsupportedFormat(format!(
                 "LRF=7 particle pair {i}: tabulated shift factor (SHF={}) not yet supported",
                 pp.shf
+            )));
+        }
+        // Coulomb channels: both particles carry charge (ZA ≠ 0 and ZB ≠ 0).
+        // Per ENDF-6 §2.2.1.6 Table 2.2, ZA = Z·A of the particle; ZA=0 for
+        // neutrons and photons.  Coulomb penetrability/shift/phase require Coulomb
+        // wave functions (F_l, G_l) rather than the hard-sphere Blatt-Weisskopf
+        // functions; using the wrong functions produces incorrect P_c/S_c.
+        // Applies to charged-particle channels (fission fragments, (n,p), (n,α), …).
+        // Not present in VENUS targets (W, Ta, Zr) where exit channels are photons.
+        // Reference: SAMMY rml/mrml07.f Pgh — branches on Coulomb vs. hard-sphere.
+        if pp.za.abs() > 0.0 && pp.zb.abs() > 0.0 {
+            return Err(EndfParseError::UnsupportedFormat(format!(
+                "LRF=7 particle pair {i}: Coulomb channel \
+                 (ZA={}, ZB={}) not yet supported; \
+                 requires Coulomb wave functions",
+                pp.za, pp.zb
             )));
         }
     }
