@@ -359,21 +359,18 @@ fn parse_rmatrix_limited_range(
     // Reject early with a clear error rather than silently computing wrong results.
     // Consistent with KBK/KPS rejection above.
     for (i, pp) in particle_pairs.iter().enumerate() {
-        // PNT/SHF: non-zero flags indicate tabulated penetrability/shift functions
-        // (KPS-style interpolation).  Only analytic Blatt-Weisskopf is implemented.
+        // PNT semantics (SAMMY rml/mrml01.f, stored as Lpent):
+        //   PNT=0 → penetrability NOT calculated (photon/fission channels, MA=0)
+        //   PNT=1 → penetrability calculated analytically (neutron elastic, MA=1)
+        // Both values are fully supported: the physics code uses pp.ma to distinguish
+        // the two cases (see rmatrix_limited.rs).  No rejection needed.
+        //
+        // SHF semantics (SAMMY rml/mrml01.f, stored as Ishift):
+        //   SHF=0 → shift factor NOT calculated; S_c = B_c (boundary condition)
+        //   SHF=1 → shift factor calculated analytically
+        // Both values are fully supported: rmatrix_limited.rs respects pp.shf.
         // Reference: ENDF-6 Formats Manual §2.2.1.6; SAMMY rml/mrml07.f Pgh subroutine.
-        if pp.pnt != 0 {
-            return Err(EndfParseError::UnsupportedFormat(format!(
-                "LRF=7 particle pair {i}: tabulated penetrability (PNT={}) not yet supported",
-                pp.pnt
-            )));
-        }
-        if pp.shf != 0 {
-            return Err(EndfParseError::UnsupportedFormat(format!(
-                "LRF=7 particle pair {i}: tabulated shift factor (SHF={}) not yet supported",
-                pp.shf
-            )));
-        }
+
         // Coulomb channels: both particles carry charge (ZA ≠ 0 and ZB ≠ 0).
         // Per ENDF-6 §2.2.1.6 Table 2.2, ZA = Z·A of the particle; ZA=0 for
         // neutrons and photons.  Coulomb penetrability/shift/phase require Coulomb

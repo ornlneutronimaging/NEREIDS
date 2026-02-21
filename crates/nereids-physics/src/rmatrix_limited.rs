@@ -142,7 +142,15 @@ fn spin_group_cross_sections(
                 let rho_eff = k_c * ch.effective_radius;
                 let rho_true = k_c * ch.true_radius;
                 p_c[c] = penetrability::penetrability(ch.l, rho_eff);
-                s_c[c] = penetrability::shift_factor(ch.l, rho_eff);
+                // SHF=0: shift factor not calculated; S_c = B_c so (S_c - B_c) = 0
+                // in the level matrix diagonal.
+                // SHF=1: calculate S_c analytically (Blatt-Weisskopf).
+                // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml07.f Pgh (Ishift check)
+                s_c[c] = if pp.shf == 1 {
+                    penetrability::shift_factor(ch.l, rho_eff)
+                } else {
+                    ch.boundary
+                };
                 phi_c[c] = penetrability::phase_shift(ch.l, rho_true);
             }
         }
