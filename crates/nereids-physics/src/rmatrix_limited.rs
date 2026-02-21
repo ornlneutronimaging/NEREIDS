@@ -14,20 +14,28 @@
 //!
 //! ## Key Formulas
 //!
-//! (ENDF-6 Formats Manual Appendix D; SAMMY manual §3.1)
+//! (ENDF-6 Formats Manual Appendix D; SAMMY manual §3.1; SAMMY `rml/mrml07.f` Pgh + `mrml11.f` Setxqx)
 //!
 //! ```text
 //! R-matrix:
-//!   R_cc'(E) = Σ_n γ_nc · γ_nc' / (E_n - E)   [real, NCH×NCH, symmetric]
+//!   R_cc'(E) = Σ_n γ_nc · γ_nc' / (E_n - E)   [complex for KRM=3, NCH×NCH, symmetric]
 //!   γ_nc = reduced width amplitude for resonance n in channel c (eV^{1/2})
 //!
-//! Level matrix:
-//!   A_cc'(E) = δ_cc'(S_c(E) - B_c + i·P_c(E)) - R_cc'(E)   [complex, NCH×NCH]
+//! Level denominator per channel:
+//!   L_c(E) = S_c(E) - B_c + i·P_c(E)
 //!   P_c = penetrability,  S_c = shift factor,  B_c = boundary condition
 //!
-//! Collision matrix:
-//!   U_cc'(E) = Ω_c · [δ_cc' + 2i·√P_c · (A⁻¹)_cc' · √P_c'] · Ω_c'
-//!   Ω_c = exp(iφ_c)  [hard-sphere phase factor]
+//! Reduced level matrix (SAMMY "Ymat"):
+//!   Ỹ_cc'(E) = δ_cc' / L_c(E) - R_cc'(E)   [complex, NCH×NCH]
+//!   → Ỹinv = Ỹ⁻¹  (invert Ỹ)
+//!
+//! Intermediate matrix (SAMMY "XXXX"):
+//!   Ξ_cc'(E) = (√P_c / L_c) · (Ỹinv · R)_cc' · √P_c'
+//!
+//! Collision matrix (SAMMY manual eq. III.D.4):
+//!   W_cc' = δ_cc' + 2i·Ξ_cc'
+//!   U_cc' = Ω_c · W_cc' · Ω_c'    where Ω_c = exp(iφ_c)
+//!   Unitarity: |U| ≤ 1 always; hard sphere (R=0) → U = exp(2iφ)·I  ✓
 //!
 //! Cross sections per spin group (J,π), summed over entrance neutron channels c0:
 //!   σ_total   = Σ_{c0} 2·(π/k²)·g_J·(1 - Re(U_{c0,c0}))
@@ -108,6 +116,7 @@ fn spin_group_cross_sections(
     let mut phi_c = vec![0.0f64; nch]; // hard-sphere phase φ_c
     let mut is_entrance = vec![false; nch];
     let mut is_fission = vec![false; nch];
+    let mut is_capture = vec![false; nch]; // photon/gamma channels (MT=102)
 
     // Entrance-channel CM energy: E_cm = E_lab × AWR/(1+AWR).
     // Each exit channel adds its Q-value to get its own available energy.
@@ -121,6 +130,7 @@ fn spin_group_cross_sections(
         let pp = &particle_pairs[ch.particle_pair_idx];
         is_entrance[c] = pp.mt == 2;
         is_fission[c] = pp.mt == 18;
+        is_capture[c] = pp.mt == 102;
 
         if pp.ma < 0.5 {
             // Photon channel (MA = 0): P=1, S=0, φ=0.
@@ -184,16 +194,37 @@ fn spin_group_cross_sections(
             // Complex energy Ẽ_n = E_n - i·Γ_γ/2.
             // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f
             let e_tilde = Complex64::new(res.energy, -res.gamma_gamma / 2.0);
+            // P_c must be evaluated at the resonance energy E_n, not at the
+            // incident energy E.  γ_nc = √(Γ_nc / (2·P_c(E_n))) is a property
+            // of the resonance and must be energy-independent.  Using P_c(E)
+            // would make γ_nc depend on the evaluation point, distorting the
+            // resonance shape away from the peak.
+            // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f (reads Γ_nc then
+            // converts via P at resonance energy in Pgh subroutine).
             let gamma_vals: Vec<f64> = (0..nch)
                 .map(|c| {
                     let gamma_formal = res.widths[c];
-                    if p_c[c] < 1e-30 {
+                    let ch = &sg.channels[c];
+                    let pp_c = &particle_pairs[ch.particle_pair_idx];
+                    let p_at_en = if pp_c.ma < 0.5 {
+                        1.0 // photon: P = 1 by convention
+                    } else {
+                        let e_c_n = res.energy + pp_c.q; // channel energy at resonance
+                        if e_c_n <= 0.0 {
+                            0.0 // closed or sub-threshold (bound state)
+                        } else {
+                            let redmas = pp_c.ma * pp_c.mb / (pp_c.ma + pp_c.mb);
+                            let k_cn = channel::wave_number_from_cm(e_c_n, redmas);
+                            penetrability::penetrability(ch.l, k_cn * ch.effective_radius)
+                        }
+                    };
+                    if p_at_en < 1e-30 {
                         // Closed channel or bound-state: P≈0, use formal width directly
                         // as a proxy for the reduced amplitude (SAMMY bound-state handling).
                         gamma_formal.abs().sqrt().copysign(gamma_formal)
                     } else {
-                        // Open channel: γ = √(|Γ| / (2P)) with sign of Γ.
-                        let magnitude = (gamma_formal.abs() / (2.0 * p_c[c])).sqrt();
+                        // Open channel: γ = √(|Γ| / (2·P_c(E_n))) with sign of Γ.
+                        let magnitude = (gamma_formal.abs() / (2.0 * p_at_en)).sqrt();
                         magnitude.copysign(gamma_formal)
                     }
                 })
@@ -220,39 +251,81 @@ fn spin_group_cross_sections(
         }
     }
 
-    // ── Level matrix A (complex, NCH×NCH) ────────────────────────────────────
-    // A_cc'(E) = δ_cc'(S_c - B_c + i·P_c) - R_cc'
-    // Reference: SAMMY rml/mrml09.f Yinvrs subroutine (builds level matrix)
-    let a: Vec<Vec<Complex64>> = (0..nch)
+    // ── L_c = (S_c - B_c) + i·P_c (per-channel level denominator) ───────────
+    // Reference: SAMMY rml/mrml07.f Pgh subroutine, "PH = 1/(S-B+IP)"
+    let l_c: Vec<Complex64> = (0..nch)
+        .map(|c| Complex64::new(s_c[c] - sg.channels[c].boundary, p_c[c]))
+        .collect();
+
+    // ── Reduced level matrix Ỹ = L⁻¹ - R (SAMMY "Ymat") ─────────────────────
+    // Ỹ_cc'(E) = (1/L_c)·δ_cc' - R_cc'
+    // Reference: SAMMY rml/mrml07.f — "Ymat = (1/(S-B+IP) - Rmat)"
+    //
+    // NOTE: This is NOT (L - R). The SAMMY formulation inverts L⁻¹ - R, not
+    // L - R. Using L - R gives |U| = 3 for the hard sphere (R=0, A=iP,
+    // A⁻¹·P = -i/P·P = -i, W = 1+2i²·(−1)=3) — catastrophically wrong.
+    // Using L⁻¹ - R gives |U| = 1 for R=0 (Ỹ = 1/L, Ỹinv = L, XQ = L·0 = 0,
+    // XXXX = 0, W = 1, U = exp(2iφ)) — correct hard-sphere limit.
+    let y_tilde: Vec<Vec<Complex64>> = (0..nch)
         .map(|c| {
             (0..nch)
                 .map(|cp| {
-                    let diag = if c == cp {
-                        Complex64::new(s_c[c] - sg.channels[c].boundary, p_c[c])
-                    } else {
+                    // Guard against L_c = 0 (closed channel: P_c=0, S_c=B_c).
+                    // In this limit 1/L_c → ∞, effectively decoupling the channel.
+                    // We treat it as if 1/L_c = 0 (channel removed from active set).
+                    let inv_l = if l_c[c].norm() < 1e-30 {
                         Complex64::ZERO
+                    } else {
+                        Complex64::new(1.0, 0.0) / l_c[c]
                     };
+                    let diag = if c == cp { inv_l } else { Complex64::ZERO };
                     diag - r_cplx[c][cp]
                 })
                 .collect()
         })
         .collect();
 
-    // ── Invert level matrix ───────────────────────────────────────────────────
-    let a_inv = match invert_complex_matrix(&a, nch) {
+    // ── Invert Ỹ to get Ỹinv (SAMMY "Yinv") ─────────────────────────────────
+    // Reference: SAMMY rml/mrml09.f Yinvrs subroutine
+    let y_inv = match invert_complex_matrix(&y_tilde, nch) {
         Some(inv) => inv,
-        None => return (0.0, 0.0, 0.0, 0.0), // singular level matrix → skip
+        None => return (0.0, 0.0, 0.0, 0.0), // singular → skip spin group
     };
 
-    // ── Collision matrix U (complex, NCH×NCH) ────────────────────────────────
-    // U_cc' = Ω_c · [δ_cc' + 2i·√P_c · (A⁻¹)_cc' · √P_c'] · Ω_c'
-    // where Ω_c = exp(iφ_c) is the hard-sphere S-matrix element.
-    // Reference: SAMMY rml/mrml11.f Setxqx subroutine
+    // ── XQ = Ỹinv · R (matrix product, SAMMY "Xqr/Xqi") ─────────────────────
+    // Reference: SAMMY rml/mrml11.f Setxqx — "Xqr(k,i) = (L**-1-R)**-1 * R"
+    let xq: Vec<Vec<Complex64>> = (0..nch)
+        .map(|c| {
+            (0..nch)
+                .map(|cp| (0..nch).map(|k| y_inv[c][k] * r_cplx[k][cp]).sum())
+                .collect()
+        })
+        .collect();
+
+    // ── XXXX = (√P_c / L_c) · XQ · √P_c' ────────────────────────────────────
+    // Reference: SAMMY rml/mrml11.f Setxqx — "Xxxx = sqrt(P)/L * xq * sqrt(P)"
+    let sqrt_p: Vec<f64> = p_c.iter().map(|&x| x.sqrt()).collect();
+    let xxxx: Vec<Vec<Complex64>> = (0..nch)
+        .map(|c| {
+            // Guard against L_c = 0 (same as above).
+            let sqrt_p_over_l = if l_c[c].norm() < 1e-30 {
+                Complex64::ZERO
+            } else {
+                sqrt_p[c] / l_c[c]
+            };
+            (0..nch)
+                .map(|cp| sqrt_p_over_l * xq[c][cp] * sqrt_p[cp])
+                .collect()
+        })
+        .collect();
+
+    // ── Collision matrix U = Ω · W · Ω, W = I + 2i·Ξ ────────────────────────
+    // Reference: SAMMY manual eq. III.D.4; SAMMY rml/mrml11.f Setxqx/Sectio
+    // Hard-sphere check: R=0 → XQ=0 → XXXX=0 → W=I → U = exp(2iφ)·I, |U|=1 ✓
     let omega: Vec<Complex64> = phi_c
         .iter()
         .map(|&phi| Complex64::from_polar(1.0, phi))
         .collect();
-    let sqrt_p: Vec<f64> = p_c.iter().map(|&x| x.sqrt()).collect();
 
     let u: Vec<Vec<Complex64>> = (0..nch)
         .map(|c| {
@@ -263,8 +336,8 @@ fn spin_group_cross_sections(
                     } else {
                         Complex64::ZERO
                     };
-                    let coupling = Complex64::new(0.0, 2.0) * sqrt_p[c] * a_inv[c][cp] * sqrt_p[cp];
-                    omega[c] * (delta + coupling) * omega[cp]
+                    let w_cc = delta + Complex64::new(0.0, 2.0) * xxxx[c][cp];
+                    omega[c] * w_cc * omega[cp]
                 })
                 .collect()
         })
@@ -275,27 +348,44 @@ fn spin_group_cross_sections(
     // Reference: SAMMY rml/mrml11.f Sectio subroutine; SAMMY manual §3.1 Eq. 3.4
     let mut tot = 0.0;
     let mut elas = 0.0;
+    let mut cap = 0.0;
     let mut fis = 0.0;
+
+    // Whether this spin group has explicit capture (photon) channels in the
+    // level matrix.  KRM=2 with photon channels: yes.  KRM=3: no (capture is
+    // implicit via complex poles; no MT=102 channel appears in NCH).
+    let has_explicit_capture = is_capture.iter().any(|&x| x);
 
     for c0 in 0..nch {
         if !is_entrance[c0] {
             continue;
         }
         let u_diag = u[c0][c0];
-        // σ_total contribution (optical theorem, per entrance channel)
+        // σ_total (optical theorem, per entrance channel)
         tot += 2.0 * pok2 * g_j * (1.0 - u_diag.re);
         // σ_elastic: |1 - U_{c0,c0}|²
         elas += pok2 * g_j * (Complex64::new(1.0, 0.0) - u_diag).norm_sqr();
-        // σ_fission: |U_{c0,c'}|² for fission channels c'
+
         for cp in 0..nch {
             if is_fission[cp] {
+                // σ_fission: |U_{c0,c'}|² for fission channels c'
                 fis += pok2 * g_j * u[c0][cp].norm_sqr();
+            }
+            if has_explicit_capture && is_capture[cp] {
+                // σ_capture (explicit): |U_{c0,c'}|² for photon channels c'.
+                // Avoids lumping inelastic neutron channels (MT=51+) into capture.
+                // Reference: SAMMY rml/mrml11.f Sectio — explicit sum over γ channels.
+                cap += pok2 * g_j * u[c0][cp].norm_sqr();
             }
         }
     }
 
-    // σ_capture = σ_total - σ_elastic - σ_fission (non-negative by unitarity)
-    let cap = (tot - elas - fis).max(0.0);
+    if !has_explicit_capture {
+        // KRM=3 or ranges with no explicit capture channels: capture = residual.
+        // The imaginary poles already encode the capture width; flux not going to
+        // elastic or fission must go to capture.  Clamp to ≥0 for numerical safety.
+        cap = (tot - elas - fis).max(0.0);
+    }
 
     (tot, elas, cap, fis)
 }
@@ -432,6 +522,79 @@ mod tests {
         assert!(invert_complex_matrix(&a, 2).is_none());
     }
 
+    /// Hard-sphere unitarity check: with R = 0, U must equal exp(2iφ)·I
+    /// and σ_total = 2·(π/k²)·g_J·(1 − cos 2φ) ≥ 0.
+    ///
+    /// This test is purely local (no network) and guards against the
+    /// classic sign error where U = 3·exp(2iφ)·I (|U| = 3) that arises
+    /// when using A = L − R instead of SAMMY's Ỹ = L⁻¹ − R.
+    #[test]
+    fn test_hard_sphere_unitarity() {
+        use nereids_endf::resonance::{ParticlePair, RmlChannel, RmlData, SpinGroup};
+
+        // Minimal synthetic LRF=7 / KRM=2 with a single elastic channel
+        // and NO resonances.  Result must be pure hard-sphere scattering.
+        let pp = ParticlePair {
+            ma: 1.0,
+            mb: 184.0,
+            za: 0.0,
+            zb: 74.0 * 184.0,
+            ia: 0.5,
+            ib: 0.0,
+            q: 0.0,
+            pnt: 1,
+            shf: 0, // SHF=0 → S_c = B_c → L_c = iP_c
+            mt: 2,
+            pa: 1.0,
+            pb: 1.0,
+        };
+        let channel = RmlChannel {
+            particle_pair_idx: 0,
+            l: 0,
+            channel_spin: 0.5,
+            boundary: 0.0,
+            effective_radius: 8.3,
+            true_radius: 8.3,
+        };
+        let sg = SpinGroup {
+            j: 0.5,
+            parity: 1.0,
+            channels: vec![channel],
+            resonances: vec![], // no resonances: pure hard sphere
+        };
+        let rml = RmlData {
+            target_spin: 0.0,
+            awr: 183.0,
+            scattering_radius: 8.3,
+            krm: 2,
+            particle_pairs: vec![pp],
+            spin_groups: vec![sg],
+        };
+
+        // Evaluate at several energies.  σ_total must be non-negative,
+        // and σ_capture/σ_fission must be exactly zero (no absorption).
+        for &e_ev in &[10.0, 50.0, 100.0, 500.0, 1000.0] {
+            let (tot, elas, cap, fis) = cross_sections_for_rml_range(&rml, e_ev);
+            assert!(
+                tot >= 0.0,
+                "hard sphere σ_total < 0 at {e_ev} eV: {tot:.6} b"
+            );
+            assert!(
+                (cap).abs() < 1e-12,
+                "hard sphere σ_capture ≠ 0 at {e_ev} eV: {cap:.6} b"
+            );
+            assert!(
+                fis.abs() < 1e-12,
+                "hard sphere σ_fission ≠ 0 at {e_ev} eV: {fis:.6} b"
+            );
+            // σ_elastic ≈ σ_total (capture=fission=0)
+            assert!(
+                (tot - elas).abs() < 1e-10,
+                "σ_total ≠ σ_elastic at {e_ev} eV: tot={tot:.6}, elas={elas:.6}"
+            );
+        }
+    }
+
     /// Verify W-184 cross-sections show resonance structure.
     ///
     /// Downloads W-184 ENDF/B-VIII.0, parses LRF=7 parameters,
@@ -462,6 +625,13 @@ mod tests {
         let xs_on_res = cross_sections_at_energy(&data, 101.9);
         let xs_off_res = cross_sections_at_energy(&data, 50.0);
 
+        // Background must be non-negative (guards against the A=L-R sign error
+        // that gave σ(50 eV) = −0.228 b).
+        assert!(
+            xs_off_res.total >= 0.0,
+            "σ_total at 50 eV must be non-negative (hard-sphere background), got {:.4} b",
+            xs_off_res.total
+        );
         assert!(
             xs_on_res.total > 0.0,
             "σ_total at 101.9 eV should be positive, got {}",
