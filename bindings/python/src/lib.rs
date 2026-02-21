@@ -1057,6 +1057,12 @@ fn py_spatial_map(
     let unc = uncertainty.as_array().to_owned();
     let e = energies.as_slice()?;
 
+    if e.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "energies must not be empty",
+        ));
+    }
+
     // Validate shapes before passing to Rust pipeline (which uses assert!/indexing)
     let t_shape = trans.shape();
     let u_shape = unc.shape();
@@ -1181,6 +1187,12 @@ fn py_fit_roi(
     let trans = transmission.as_array().to_owned();
     let unc = uncertainty.as_array().to_owned();
     let e = energies.as_slice()?;
+
+    if e.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "energies must not be empty",
+        ));
+    }
 
     // Validate shapes before passing to Rust pipeline (which uses assert!/indexing)
     let t_shape = trans.shape();
