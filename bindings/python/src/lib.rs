@@ -23,6 +23,8 @@
 //! result = nereids.fit_spectrum(measured_t, sigma, energies, [isotope])
 //! ```
 
+use std::sync::Arc;
+
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
@@ -328,22 +330,27 @@ fn forward_model<'py>(
             "Cannot specify both Gaussian resolution parameters and tabulated resolution",
         ));
     }
+    let all_gaussian = flight_path_m.is_some() && delta_t_us.is_some() && delta_l_m.is_some();
+    if has_gaussian && !all_gaussian {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Gaussian resolution requires all three parameters: flight_path_m, delta_t_us, and delta_l_m",
+        ));
+    }
 
     let instrument = if let Some(tab) = resolution {
         Some(InstrumentParams {
             resolution: ResolutionFunction::Tabulated(tab.inner),
         })
-    } else {
-        match (flight_path_m, delta_t_us, delta_l_m) {
-            (Some(fp), Some(dt), Some(dl)) => Some(InstrumentParams {
-                resolution: ResolutionFunction::Gaussian(ResolutionParams {
-                    flight_path_m: fp,
-                    delta_t_us: dt,
-                    delta_l_m: dl,
-                }),
+    } else if let (Some(fp), Some(dt), Some(dl)) = (flight_path_m, delta_t_us, delta_l_m) {
+        Some(InstrumentParams {
+            resolution: ResolutionFunction::Gaussian(ResolutionParams {
+                flight_path_m: fp,
+                delta_t_us: dt,
+                delta_l_m: dl,
             }),
-            _ => None,
-        }
+        })
+    } else {
+        None
     };
 
     let t = transmission::forward_model(e, &sample, instrument.as_ref());
@@ -435,21 +442,27 @@ fn fit_spectrum(
         ));
     }
 
+    let all_gaussian = flight_path_m.is_some() && delta_t_us.is_some() && delta_l_m.is_some();
+    if has_gaussian && !all_gaussian {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Gaussian resolution requires all three parameters: flight_path_m, delta_t_us, and delta_l_m",
+        ));
+    }
+
     let instrument = if let Some(tab) = resolution {
-        Some(InstrumentParams {
+        Some(Arc::new(InstrumentParams {
             resolution: ResolutionFunction::Tabulated(tab.inner),
-        })
-    } else {
-        match (flight_path_m, delta_t_us, delta_l_m) {
-            (Some(fp), Some(dt), Some(dl)) => Some(InstrumentParams {
-                resolution: ResolutionFunction::Gaussian(ResolutionParams {
-                    flight_path_m: fp,
-                    delta_t_us: dt,
-                    delta_l_m: dl,
-                }),
+        }))
+    } else if let (Some(fp), Some(dt), Some(dl)) = (flight_path_m, delta_t_us, delta_l_m) {
+        Some(Arc::new(InstrumentParams {
+            resolution: ResolutionFunction::Gaussian(ResolutionParams {
+                flight_path_m: fp,
+                delta_t_us: dt,
+                delta_l_m: dl,
             }),
-            _ => None,
-        }
+        }))
+    } else {
+        None
     };
 
     let model = TransmissionFitModel {

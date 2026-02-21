@@ -5,6 +5,8 @@
 //!
 //! This is the building block for the spatial mapping pipeline.
 
+use std::sync::Arc;
+
 use nereids_endf::resonance::ResonanceData;
 use nereids_fitting::lm::{self, LmConfig};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
@@ -76,7 +78,7 @@ pub fn fit_spectrum(measured_t: &[f64], sigma: &[f64], config: &FitConfig) -> Sp
     let instrument = config
         .resolution
         .clone()
-        .map(|r| InstrumentParams { resolution: r });
+        .map(|r| Arc::new(InstrumentParams { resolution: r }));
 
     let model = TransmissionFitModel {
         energies: config.energies.clone(),

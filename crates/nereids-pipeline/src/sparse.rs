@@ -23,9 +23,11 @@
 //! ## TRINIDI Reference
 //! - `trinidi/reconstruct.py` — Two-stage reconstruction with APGM
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use ndarray::{Array2, Array3};
 use rayon::prelude::*;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use nereids_endf::resonance::ResonanceData;
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
@@ -176,11 +178,12 @@ pub fn sparse_reconstruct(
         n_energies,
     );
 
-    // Build the transmission model (shared across pixels)
+    // Build the instrument params once, wrapped in Arc for cheap sharing
+    // across the parallel pixel loop (avoids deep-cloning tabulated kernels).
     let instrument = config
         .resolution
         .clone()
-        .map(|r| InstrumentParams { resolution: r });
+        .map(|r| Arc::new(InstrumentParams { resolution: r }));
 
     // Collect pixel coordinates
     let mut pixel_coords: Vec<(usize, usize)> = Vec::new();
