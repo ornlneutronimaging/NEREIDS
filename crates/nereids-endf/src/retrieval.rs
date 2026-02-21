@@ -153,19 +153,29 @@ impl EndfRetriever {
         let url = format!("{}/{}/{}", self.base_url, library.url_path(), zip_filename);
 
         let response = reqwest::blocking::get(&url).map_err(|e| {
-            EndfRetrievalError::Download(format!("Failed to download {}: {}", url, e))
+            EndfRetrievalError::NetworkError(format!("Failed to connect to {}: {}", url, e))
         })?;
 
-        if !response.status().is_success() {
-            return Err(EndfRetrievalError::Download(format!(
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(EndfRetrievalError::NotInLibrary {
+                isotope: format!(
+                    "{}-{}",
+                    nereids_core::elements::element_symbol(isotope.z).unwrap_or("?"),
+                    isotope.a
+                ),
+                library: library.cache_dir_name().to_string(),
+            });
+        }
+        if !status.is_success() {
+            return Err(EndfRetrievalError::NetworkError(format!(
                 "HTTP {} for {}",
-                response.status(),
-                url
+                status, url
             )));
         }
 
         let bytes = response.bytes().map_err(|e| {
-            EndfRetrievalError::Download(format!("Failed to read response body: {}", e))
+            EndfRetrievalError::NetworkError(format!("Failed to read response body: {}", e))
         })?;
 
         // Extract ENDF file from ZIP archive.
@@ -256,8 +266,13 @@ pub fn mat_number(isotope: &Isotope) -> Option<u32> {
 /// Errors from ENDF retrieval operations.
 #[derive(Debug, thiserror::Error)]
 pub enum EndfRetrievalError {
-    #[error("Download failed: {0}")]
-    Download(String),
+    /// Transport-level failure (connection refused, DNS error, non-404 HTTP error, etc.).
+    #[error("Network error: {0}")]
+    NetworkError(String),
+
+    /// The isotope exists in ENDF/B-VIII.0 but is not available in the requested library.
+    #[error("{isotope} is not available in the {library} library")]
+    NotInLibrary { isotope: String, library: String },
 
     #[error("Parse error: {0}")]
     Parse(String),
