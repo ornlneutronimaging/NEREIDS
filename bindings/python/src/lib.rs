@@ -255,15 +255,19 @@ impl PyTabulatedResolution {
 }
 
 /// Result of spatial (per-pixel) mapping.
+///
+/// Numpy arrays are constructed once and cached; property access returns
+/// cheap references (refcount bump) rather than copying data.
 #[pyclass(name = "SpatialResult")]
 struct PySpatialResult {
-    density_maps: Vec<ndarray::Array2<f64>>,
-    uncertainty_maps: Vec<ndarray::Array2<f64>>,
-    chi_squared_map: ndarray::Array2<f64>,
-    converged_map: ndarray::Array2<bool>,
+    density_maps: Vec<Py<PyArray2<f64>>>,
+    uncertainty_maps: Vec<Py<PyArray2<f64>>>,
+    chi_squared_map: Py<PyArray2<f64>>,
+    converged_map: Py<PyArray2<bool>>,
     n_converged: usize,
     n_total: usize,
     isotope_names: Vec<String>,
+    shape: (usize, usize),
 }
 
 #[pymethods]
@@ -273,7 +277,7 @@ impl PySpatialResult {
     fn density_maps<'py>(&self, py: Python<'py>) -> Vec<Bound<'py, PyArray2<f64>>> {
         self.density_maps
             .iter()
-            .map(|m| PyArray2::from_owned_array(py, m.clone()))
+            .map(|m| m.bind(py).clone())
             .collect()
     }
 
@@ -282,20 +286,20 @@ impl PySpatialResult {
     fn uncertainty_maps<'py>(&self, py: Python<'py>) -> Vec<Bound<'py, PyArray2<f64>>> {
         self.uncertainty_maps
             .iter()
-            .map(|m| PyArray2::from_owned_array(py, m.clone()))
+            .map(|m| m.bind(py).clone())
             .collect()
     }
 
     /// Reduced chi-squared map.
     #[getter]
     fn chi_squared_map<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
-        PyArray2::from_owned_array(py, self.chi_squared_map.clone())
+        self.chi_squared_map.bind(py).clone()
     }
 
     /// Convergence map (True = converged).
     #[getter]
     fn converged_map<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<bool>> {
-        PyArray2::from_owned_array(py, self.converged_map.clone())
+        self.converged_map.bind(py).clone()
     }
 
     /// Number of converged pixels.
@@ -317,11 +321,10 @@ impl PySpatialResult {
     }
 
     fn __repr__(&self) -> String {
-        let shape = self.converged_map.shape();
         format!(
             "SpatialResult(shape={}x{}, isotopes={}, converged={}/{})",
-            shape[0],
-            shape[1],
+            self.shape.0,
+            self.shape.1,
             self.isotope_names.len(),
             self.n_converged,
             self.n_total,
@@ -1040,6 +1043,7 @@ fn py_apply_resolution<'py>(
 #[pyfunction]
 #[pyo3(name = "spatial_map", signature = (transmission, uncertainty, energies, isotopes, temperature_k=300.0, initial_densities=None, dead_pixels=None, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, max_iter=100))]
 fn py_spatial_map(
+    py: Python<'_>,
     transmission: PyReadonlyArray3<f64>,
     uncertainty: PyReadonlyArray3<f64>,
     energies: PyReadonlyArray1<f64>,
@@ -1053,8 +1057,6 @@ fn py_spatial_map(
     resolution: Option<PyTabulatedResolution>,
     max_iter: usize,
 ) -> PyResult<PySpatialResult> {
-    let trans = transmission.as_array().to_owned();
-    let unc = uncertainty.as_array().to_owned();
     let e = energies.as_slice()?;
 
     if e.is_empty() {
@@ -1063,9 +1065,9 @@ fn py_spatial_map(
         ));
     }
 
-    // Validate shapes before passing to Rust pipeline (which uses assert!/indexing)
-    let t_shape = trans.shape();
-    let u_shape = unc.shape();
+    // Validate shapes using cheap PyReadonly views before cloning
+    let t_shape = transmission.shape();
+    let u_shape = uncertainty.shape();
     if t_shape != u_shape {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
             "transmission shape {:?} must match uncertainty shape {:?}",
@@ -1129,18 +1131,34 @@ fn py_spatial_map(
         },
     };
 
+    // Clone arrays only after all validation passes
+    let trans = transmission.as_array().to_owned();
+    let unc = uncertainty.as_array().to_owned();
     let dead = dead_pixels.map(|d| d.as_array().to_owned());
 
     let result = nereids_pipeline::spatial::spatial_map(&trans, &unc, &config, dead.as_ref(), None);
 
+    let shape = (
+        result.converged_map.shape()[0],
+        result.converged_map.shape()[1],
+    );
     Ok(PySpatialResult {
-        density_maps: result.density_maps,
-        uncertainty_maps: result.uncertainty_maps,
-        chi_squared_map: result.chi_squared_map,
-        converged_map: result.converged_map,
+        density_maps: result
+            .density_maps
+            .into_iter()
+            .map(|m| PyArray2::from_owned_array(py, m).unbind())
+            .collect(),
+        uncertainty_maps: result
+            .uncertainty_maps
+            .into_iter()
+            .map(|m| PyArray2::from_owned_array(py, m).unbind())
+            .collect(),
+        chi_squared_map: PyArray2::from_owned_array(py, result.chi_squared_map).unbind(),
+        converged_map: PyArray2::from_owned_array(py, result.converged_map).unbind(),
         n_converged: result.n_converged,
         n_total: result.n_total,
         isotope_names,
+        shape,
     })
 }
 
@@ -1184,8 +1202,6 @@ fn py_fit_roi(
     resolution: Option<PyTabulatedResolution>,
     max_iter: usize,
 ) -> PyResult<PyFitResult> {
-    let trans = transmission.as_array().to_owned();
-    let unc = uncertainty.as_array().to_owned();
     let e = energies.as_slice()?;
 
     if e.is_empty() {
@@ -1194,9 +1210,9 @@ fn py_fit_roi(
         ));
     }
 
-    // Validate shapes before passing to Rust pipeline (which uses assert!/indexing)
-    let t_shape = trans.shape();
-    let u_shape = unc.shape();
+    // Validate shapes using cheap PyReadonly views before cloning
+    let t_shape = transmission.shape();
+    let u_shape = uncertainty.shape();
     if t_shape != u_shape {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
             "transmission shape {:?} must match uncertainty shape {:?}",
@@ -1269,6 +1285,10 @@ fn py_fit_roi(
         },
     };
 
+    // Clone arrays only after all validation passes
+    let trans = transmission.as_array().to_owned();
+    let unc = uncertainty.as_array().to_owned();
+
     let result = nereids_pipeline::spatial::fit_roi(
         &trans,
         &unc,
@@ -1327,13 +1347,18 @@ fn normalize<'py>(
     pc_ob: f64,
     dark_current: Option<PyReadonlyArray2<f64>>,
 ) -> PyResult<(Bound<'py, PyArray3<f64>>, Bound<'py, PyArray3<f64>>)> {
-    let s = sample.as_array().to_owned();
-    let ob = open_beam.as_array().to_owned();
+    // Validate shapes using cheap PyReadonly views before cloning
+    let s_shape = sample.shape();
+    let ob_shape = open_beam.shape();
+    if s_shape != ob_shape {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "sample shape {:?} must match open_beam shape {:?}",
+            s_shape, ob_shape,
+        )));
+    }
 
-    // Validate dark_current spatial dimensions match sample before Rust code indexes dc[[y, x]]
     if let Some(ref dc_arr) = dark_current {
         let dc_shape = dc_arr.shape();
-        let s_shape = s.shape();
         if dc_shape[0] != s_shape[1] || dc_shape[1] != s_shape[2] {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "dark_current shape ({}, {}) must match spatial dimensions ({}, {}) of sample",
@@ -1342,6 +1367,9 @@ fn normalize<'py>(
         }
     }
 
+    // Clone arrays only after all validation passes
+    let s = sample.as_array().to_owned();
+    let ob = open_beam.as_array().to_owned();
     let dc = dark_current.map(|d| d.as_array().to_owned());
 
     let params = NormalizationParams {
