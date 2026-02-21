@@ -4,6 +4,8 @@
 //! that the LM optimizer can call. The fit parameters are the areal densities
 //! (thicknesses) of each isotope in the sample.
 
+use std::sync::Arc;
+
 use nereids_endf::resonance::ResonanceData;
 use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
 
@@ -14,6 +16,10 @@ use crate::lm::FitModel;
 /// The model computes T(E) for a set of isotopes with variable areal densities.
 /// Each isotope's resonance data and the energy grid are fixed; only the
 /// areal densities are adjusted during fitting.
+///
+/// `instrument` uses `Arc` so that parallel pixel loops (e.g. in `sparse.rs`)
+/// can share one copy of a potentially large tabulated resolution kernel
+/// via cheap reference-count increments instead of deep-cloning per pixel.
 pub struct TransmissionFitModel {
     /// Energy grid (eV), ascending.
     pub energies: Vec<f64>,
@@ -21,8 +27,8 @@ pub struct TransmissionFitModel {
     pub resonance_data: Vec<ResonanceData>,
     /// Sample temperature in Kelvin.
     pub temperature_k: f64,
-    /// Optional instrument resolution parameters.
-    pub instrument: Option<InstrumentParams>,
+    /// Optional instrument resolution parameters (Arc-shared for parallel use).
+    pub instrument: Option<Arc<InstrumentParams>>,
     /// Index mapping: which `params` indices correspond to areal densities.
     /// params[density_indices[i]] = areal density of isotope i.
     pub density_indices: Vec<usize>,
@@ -42,7 +48,7 @@ impl FitModel for TransmissionFitModel {
             isotopes,
         };
 
-        transmission::forward_model(&self.energies, &sample, self.instrument.as_ref())
+        transmission::forward_model(&self.energies, &sample, self.instrument.as_deref())
     }
 }
 

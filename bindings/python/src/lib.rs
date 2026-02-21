@@ -23,6 +23,8 @@
 //! result = nereids.fit_spectrum(measured_t, sigma, energies, [isotope])
 //! ```
 
+use std::sync::Arc;
+
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
@@ -36,7 +38,9 @@ use nereids_fitting::lm::{self, LmConfig};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
 use nereids_fitting::transmission_model::TransmissionFitModel;
 use nereids_physics::doppler::{self, DopplerParams};
-use nereids_physics::resolution::{self, ResolutionParams};
+use nereids_physics::resolution::{
+    self, ResolutionFunction, ResolutionParams, TabulatedResolution,
+};
 use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
 
 /// Python wrapper for ENDF resonance data.
@@ -189,6 +193,60 @@ impl PyFitResult {
     }
 }
 
+/// Python wrapper for tabulated resolution function.
+#[pyclass(name = "TabulatedResolution", from_py_object)]
+#[derive(Clone)]
+struct PyTabulatedResolution {
+    inner: TabulatedResolution,
+}
+
+#[pymethods]
+impl PyTabulatedResolution {
+    /// Number of reference energies.
+    #[getter]
+    fn n_energies(&self) -> usize {
+        self.inner.ref_energies.len()
+    }
+
+    /// Energy range (min, max) of the reference kernels in eV.
+    #[getter]
+    fn energy_range(&self) -> (f64, f64) {
+        let e = &self.inner.ref_energies;
+        if e.is_empty() {
+            (0.0, 0.0)
+        } else {
+            (e[0], e[e.len() - 1])
+        }
+    }
+
+    /// Flight path length in meters.
+    #[getter]
+    fn flight_path_m(&self) -> f64 {
+        self.inner.flight_path_m
+    }
+
+    /// Number of points per kernel.
+    #[getter]
+    fn points_per_kernel(&self) -> usize {
+        self.inner
+            .kernels
+            .first()
+            .map(|(o, _)| o.len())
+            .unwrap_or(0)
+    }
+
+    fn __repr__(&self) -> String {
+        let (lo, hi) = self.energy_range();
+        format!(
+            "TabulatedResolution(n_energies={}, range=[{:.4e}, {:.4e}] eV, flight_path={:.1} m)",
+            self.n_energies(),
+            lo,
+            hi,
+            self.inner.flight_path_m,
+        )
+    }
+}
+
 /// Compute cross-sections at given energies for an isotope.
 ///
 /// Args:
@@ -227,18 +285,23 @@ fn cross_sections<'py>(
 
 /// Compute theoretical transmission spectrum.
 ///
+/// Resolution broadening can be applied via either Gaussian parameters
+/// (``flight_path_m``, ``delta_t_us``, ``delta_l_m``) or a tabulated
+/// resolution function (``resolution``). Providing both is an error.
+///
 /// Args:
 ///     energies: Energy grid in eV (1D numpy array).
 ///     isotopes: List of (ResonanceData, areal_density) tuples.
 ///     temperature_k: Sample temperature in Kelvin (default 0.0).
-///     flight_path_m: Flight path in meters for resolution (optional).
+///     flight_path_m: Flight path in meters for Gaussian resolution (optional).
 ///     delta_t_us: Timing uncertainty in microseconds (optional).
 ///     delta_l_m: Path length uncertainty in meters (optional).
+///     resolution: TabulatedResolution from ``load_resolution()`` (optional).
 ///
 /// Returns:
 ///     1D numpy array of transmission values.
 #[pyfunction]
-#[pyo3(signature = (energies, isotopes, temperature_k=0.0, flight_path_m=None, delta_t_us=None, delta_l_m=None))]
+#[pyo3(signature = (energies, isotopes, temperature_k=0.0, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None))]
 fn forward_model<'py>(
     py: Python<'py>,
     energies: PyReadonlyArray1<f64>,
@@ -247,6 +310,7 @@ fn forward_model<'py>(
     flight_path_m: Option<f64>,
     delta_t_us: Option<f64>,
     delta_l_m: Option<f64>,
+    resolution: Option<PyTabulatedResolution>,
 ) -> PyResult<Bound<'py, PyArray1<f64>>> {
     let e = energies.as_slice()?;
 
@@ -260,15 +324,34 @@ fn forward_model<'py>(
         isotopes: sample_isotopes,
     };
 
-    let instrument = match (flight_path_m, delta_t_us, delta_l_m) {
-        (Some(fp), Some(dt), Some(dl)) => Some(InstrumentParams {
-            resolution: ResolutionParams {
+    let has_gaussian = flight_path_m.is_some() || delta_t_us.is_some() || delta_l_m.is_some();
+    if has_gaussian && resolution.is_some() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Cannot specify both Gaussian resolution parameters and tabulated resolution",
+        ));
+    }
+    let all_gaussian = flight_path_m.is_some() && delta_t_us.is_some() && delta_l_m.is_some();
+    if has_gaussian && !all_gaussian {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Gaussian resolution requires all three parameters: flight_path_m, delta_t_us, and delta_l_m",
+        ));
+    }
+
+    let instrument = if let Some(tab) = resolution {
+        Some(InstrumentParams {
+            resolution: ResolutionFunction::Tabulated(tab.inner),
+        })
+    } else if let (Some(fp), Some(dt), Some(dl)) = (flight_path_m, delta_t_us, delta_l_m) {
+        validate_gaussian_params(fp, dt, dl)?;
+        Some(InstrumentParams {
+            resolution: ResolutionFunction::Gaussian(ResolutionParams {
                 flight_path_m: fp,
                 delta_t_us: dt,
                 delta_l_m: dl,
-            },
-        }),
-        _ => None,
+            }),
+        })
+    } else {
+        None
     };
 
     let t = transmission::forward_model(e, &sample, instrument.as_ref());
@@ -276,6 +359,10 @@ fn forward_model<'py>(
 }
 
 /// Fit a measured transmission spectrum to recover isotopic areal densities.
+///
+/// Resolution broadening can be applied via either Gaussian parameters
+/// (``flight_path_m``, ``delta_t_us``, ``delta_l_m``) or a tabulated
+/// resolution function (``resolution``). Providing both is an error.
 ///
 /// Args:
 ///     measured_t: Measured transmission (1D numpy array).
@@ -285,11 +372,15 @@ fn forward_model<'py>(
 ///     temperature_k: Sample temperature in Kelvin (default 0.0).
 ///     initial_densities: Initial guess for areal densities (optional).
 ///     max_iter: Maximum LM iterations (default 100).
+///     flight_path_m: Flight path in meters for Gaussian resolution (optional).
+///     delta_t_us: Timing uncertainty in microseconds (optional).
+///     delta_l_m: Path length uncertainty in meters (optional).
+///     resolution: TabulatedResolution from ``load_resolution()`` (optional).
 ///
 /// Returns:
 ///     FitResult with densities, uncertainties, and fit quality.
 #[pyfunction]
-#[pyo3(signature = (measured_t, sigma, energies, isotopes, temperature_k=0.0, initial_densities=None, max_iter=100))]
+#[pyo3(signature = (measured_t, sigma, energies, isotopes, temperature_k=0.0, initial_densities=None, max_iter=100, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None))]
 fn fit_spectrum(
     measured_t: PyReadonlyArray1<f64>,
     sigma: PyReadonlyArray1<f64>,
@@ -298,6 +389,10 @@ fn fit_spectrum(
     temperature_k: f64,
     initial_densities: Option<Vec<f64>>,
     max_iter: usize,
+    flight_path_m: Option<f64>,
+    delta_t_us: Option<f64>,
+    delta_l_m: Option<f64>,
+    resolution: Option<PyTabulatedResolution>,
 ) -> PyResult<PyFitResult> {
     let e = energies.as_slice()?;
     let t = measured_t.as_slice()?;
@@ -341,11 +436,42 @@ fn fit_spectrum(
         )));
     }
 
+    let has_gaussian = flight_path_m.is_some() || delta_t_us.is_some() || delta_l_m.is_some();
+    if has_gaussian && resolution.is_some() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Cannot specify both Gaussian resolution parameters and tabulated resolution",
+        ));
+    }
+
+    let all_gaussian = flight_path_m.is_some() && delta_t_us.is_some() && delta_l_m.is_some();
+    if has_gaussian && !all_gaussian {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Gaussian resolution requires all three parameters: flight_path_m, delta_t_us, and delta_l_m",
+        ));
+    }
+
+    let instrument = if let Some(tab) = resolution {
+        Some(Arc::new(InstrumentParams {
+            resolution: ResolutionFunction::Tabulated(tab.inner),
+        }))
+    } else if let (Some(fp), Some(dt), Some(dl)) = (flight_path_m, delta_t_us, delta_l_m) {
+        validate_gaussian_params(fp, dt, dl)?;
+        Some(Arc::new(InstrumentParams {
+            resolution: ResolutionFunction::Gaussian(ResolutionParams {
+                flight_path_m: fp,
+                delta_t_us: dt,
+                delta_l_m: dl,
+            }),
+        }))
+    } else {
+        None
+    };
+
     let model = TransmissionFitModel {
         energies: e.to_vec(),
         resonance_data: res_data,
         temperature_k,
-        instrument: None,
+        instrument,
         density_indices: (0..n_isotopes).collect(),
     };
 
@@ -588,6 +714,27 @@ fn beer_lambert<'py>(
     Ok(PyArray1::from_vec(py, t))
 }
 
+/// Validate Gaussian resolution parameters: finite, positive flight path,
+/// non-negative timing and path length uncertainties.
+fn validate_gaussian_params(fp: f64, dt: f64, dl: f64) -> PyResult<()> {
+    if !fp.is_finite() || fp <= 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "flight_path_m must be finite and positive",
+        ));
+    }
+    if !dt.is_finite() || dt < 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "delta_t_us must be finite and non-negative",
+        ));
+    }
+    if !dl.is_finite() || dl < 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "delta_l_m must be finite and non-negative",
+        ));
+    }
+    Ok(())
+}
+
 /// Validate that an energy grid is finite, positive, and sorted ascending.
 fn validate_energy_grid(e: &[f64]) -> PyResult<()> {
     if e.is_empty() {
@@ -741,11 +888,77 @@ fn resolution_broaden<'py>(
     Ok(PyArray1::from_vec(py, result))
 }
 
+/// Load a tabulated resolution function from a VENUS/FTS-format file.
+///
+/// The file contains reference kernels R(Δt; E_ref) at discrete energies,
+/// stored as (TOF_offset_μs, weight) pairs. Kernels are interpolated between
+/// reference energies and converted from TOF to energy space during broadening.
+///
+/// Args:
+///     path: Path to the resolution file.
+///     flight_path_m: Flight path length in meters (source to detector).
+///
+/// Returns:
+///     TabulatedResolution object for use with ``forward_model()`` or
+///     ``fit_spectrum()``.
+#[pyfunction]
+fn load_resolution(path: &str, flight_path_m: f64) -> PyResult<PyTabulatedResolution> {
+    if !flight_path_m.is_finite() || flight_path_m <= 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "flight_path_m must be finite and positive",
+        ));
+    }
+
+    let tab = TabulatedResolution::from_file(path, flight_path_m)
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))?;
+
+    Ok(PyTabulatedResolution { inner: tab })
+}
+
+/// Apply tabulated resolution broadening to a spectrum.
+///
+/// Convolves the input spectrum with the tabulated instrument resolution
+/// function. For each energy point, the kernel is interpolated between
+/// reference energies and converted from TOF-offset space to energy space.
+///
+/// Args:
+///     energies: Energy grid in eV (1D numpy array, sorted ascending).
+///     spectrum: Values to broaden (1D numpy array, same length).
+///     resolution: TabulatedResolution from ``load_resolution()``.
+///
+/// Returns:
+///     1D numpy array of resolution-broadened values.
+#[pyfunction]
+#[pyo3(name = "apply_resolution")]
+fn py_apply_resolution<'py>(
+    py: Python<'py>,
+    energies: PyReadonlyArray1<f64>,
+    spectrum: PyReadonlyArray1<f64>,
+    resolution: &PyTabulatedResolution,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let e = energies.as_slice()?;
+    let s = spectrum.as_slice()?;
+
+    if e.len() != s.len() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "energies length ({}) must match spectrum length ({})",
+            e.len(),
+            s.len(),
+        )));
+    }
+    validate_energy_grid(e)?;
+
+    let res_fn = ResolutionFunction::Tabulated(resolution.inner.clone());
+    let result = resolution::apply_resolution(e, s, &res_fn);
+    Ok(PyArray1::from_vec(py, result))
+}
+
 /// NEREIDS Python module.
 #[pymodule]
 fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyResonanceData>()?;
     m.add_class::<PyFitResult>()?;
+    m.add_class::<PyTabulatedResolution>()?;
     m.add_function(wrap_pyfunction!(cross_sections, m)?)?;
     m.add_function(wrap_pyfunction!(forward_model, m)?)?;
     m.add_function(wrap_pyfunction!(fit_spectrum, m)?)?;
@@ -757,5 +970,7 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(beer_lambert, m)?)?;
     m.add_function(wrap_pyfunction!(doppler_broaden, m)?)?;
     m.add_function(wrap_pyfunction!(resolution_broaden, m)?)?;
+    m.add_function(wrap_pyfunction!(load_resolution, m)?)?;
+    m.add_function(wrap_pyfunction!(py_apply_resolution, m)?)?;
     Ok(())
 }

@@ -29,6 +29,7 @@
 //! with energy-dependent width W(E).
 
 use nereids_core::constants;
+use std::fmt;
 
 /// TOF conversion factor: t[μs] = TOF_FACTOR × L[m] / √(E[eV]).
 ///
@@ -180,6 +181,343 @@ pub fn resolution_broaden_transmission(
     // The convolution kernel is the same; only the interpretation differs.
     resolution_broaden(energies, transmission, params)
 }
+
+/// A tabulated resolution function from Monte Carlo instrument simulation.
+///
+/// Contains reference kernels R(Δt; E_ref) at discrete energies, stored in
+/// TOF-offset space (μs). Kernels are interpolated between reference energies
+/// and converted from TOF to energy space when applied.
+///
+/// ## File Format (VENUS/FTS)
+///
+/// ```text
+/// FTS BL10 case i00dd folded triang FWHM 350 ns PSR   ← header
+/// -----                                                 ← separator
+///    5.00000e-004   0.00000e+000                        ← energy block start
+/// -53.458917835671329 2.051764258257523e-04             ← (tof_offset_μs, weight)
+/// ...
+///                                                       ← blank line separates blocks
+///    1.00000e-003   0.00000e+000                        ← next energy block
+/// ...
+/// ```
+#[derive(Debug, Clone)]
+pub struct TabulatedResolution {
+    /// Reference energies (eV), sorted ascending.
+    pub ref_energies: Vec<f64>,
+    /// For each reference energy: (tof_offsets_μs, weights) pairs.
+    /// Weights are peak-normalized (max=1.0).
+    pub kernels: Vec<(Vec<f64>, Vec<f64>)>,
+    /// Flight path length in meters (needed for TOF↔energy conversion).
+    pub flight_path_m: f64,
+}
+
+/// Resolution function: either analytical Gaussian or tabulated from Monte Carlo.
+#[derive(Debug, Clone)]
+pub enum ResolutionFunction {
+    /// Analytical Gaussian resolution from instrument parameters.
+    Gaussian(ResolutionParams),
+    /// Tabulated resolution from Monte Carlo instrument simulation.
+    Tabulated(TabulatedResolution),
+}
+
+impl TabulatedResolution {
+    /// Parse a VENUS/FTS resolution file.
+    ///
+    /// # Arguments
+    /// * `text` — File contents as a string.
+    /// * `flight_path_m` — Flight path length in meters.
+    pub fn from_text(text: &str, flight_path_m: f64) -> Result<Self, ResolutionParseError> {
+        let mut lines = text.lines();
+
+        // Skip header and separator
+        let _header = lines
+            .next()
+            .ok_or(ResolutionParseError::InvalidFormat("Empty file".into()))?;
+        let _sep = lines.next().ok_or(ResolutionParseError::InvalidFormat(
+            "Missing separator".into(),
+        ))?;
+
+        let mut ref_energies = Vec::new();
+        let mut kernels = Vec::new();
+        let mut current_energy: Option<f64> = None;
+        let mut current_offsets: Vec<f64> = Vec::new();
+        let mut current_weights: Vec<f64> = Vec::new();
+
+        for line in lines {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                // End of current block
+                if let Some(e) = current_energy.take() {
+                    ref_energies.push(e);
+                    kernels.push((
+                        std::mem::take(&mut current_offsets),
+                        std::mem::take(&mut current_weights),
+                    ));
+                }
+                continue;
+            }
+
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if parts.len() != 2 {
+                if current_energy.is_some() {
+                    return Err(ResolutionParseError::InvalidFormat(format!(
+                        "Expected 2 columns inside energy block, got {}: '{}'",
+                        parts.len(),
+                        trimmed
+                    )));
+                }
+                // Outside a data block (e.g. extra header lines) — skip
+                continue;
+            }
+
+            let x: f64 = parts[0].parse().map_err(|_| {
+                ResolutionParseError::InvalidFormat(format!("Cannot parse float: '{}'", parts[0]))
+            })?;
+            let y: f64 = parts[1].parse().map_err(|_| {
+                ResolutionParseError::InvalidFormat(format!("Cannot parse float: '{}'", parts[1]))
+            })?;
+
+            if current_energy.is_none() {
+                // First line of block: energy + 0.0 marker
+                current_energy = Some(x);
+            } else {
+                current_offsets.push(x);
+                current_weights.push(y);
+            }
+        }
+
+        // Flush last block
+        if let Some(e) = current_energy.take() {
+            ref_energies.push(e);
+            kernels.push((current_offsets, current_weights));
+        }
+
+        if ref_energies.is_empty() {
+            return Err(ResolutionParseError::InvalidFormat(
+                "No energy blocks found".into(),
+            ));
+        }
+
+        // Validate strictly ascending reference energies
+        for i in 1..ref_energies.len() {
+            if ref_energies[i] <= ref_energies[i - 1] {
+                return Err(ResolutionParseError::InvalidFormat(format!(
+                    "Reference energies must be strictly ascending, but E[{}]={} <= E[{}]={}",
+                    i,
+                    ref_energies[i],
+                    i - 1,
+                    ref_energies[i - 1],
+                )));
+            }
+        }
+
+        Ok(TabulatedResolution {
+            ref_energies,
+            kernels,
+            flight_path_m,
+        })
+    }
+
+    /// Parse a VENUS/FTS resolution file from disk.
+    pub fn from_file(path: &str, flight_path_m: f64) -> Result<Self, ResolutionParseError> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| ResolutionParseError::IoError(format!("Cannot read '{}': {}", path, e)))?;
+        Self::from_text(&text, flight_path_m)
+    }
+
+    /// Apply tabulated resolution broadening to a spectrum.
+    ///
+    /// For each energy point:
+    /// 1. Find bracketing reference energies and interpolate kernel (log-space)
+    /// 2. Convert TOF offsets to energy offsets using exact TOF↔energy relation
+    /// 3. Convolve spectrum with interpolated kernel (trapezoidal integration)
+    pub fn broaden(&self, energies: &[f64], spectrum: &[f64]) -> Vec<f64> {
+        assert_eq!(energies.len(), spectrum.len());
+        let n = energies.len();
+        if n == 0 {
+            return vec![];
+        }
+
+        let mut result = vec![0.0f64; n];
+
+        for i in 0..n {
+            let e = energies[i];
+            if e <= 0.0 {
+                result[i] = spectrum[i];
+                continue;
+            }
+
+            // TOF at this energy: t = TOF_FACTOR * L / sqrt(E)
+            let tof_center = TOF_FACTOR * self.flight_path_m / e.sqrt();
+
+            // Find bracketing reference energies (log-space interpolation)
+            let (offsets, weights) = self.interpolated_kernel(e);
+
+            // Convolve: for each kernel point, find the energy corresponding to
+            // tof_center + dt_offset, then interpolate spectrum at that energy.
+            let mut sum = 0.0;
+            let mut norm = 0.0;
+
+            for k in 0..offsets.len() {
+                let dt = offsets[k];
+                let w = weights[k];
+                if w <= 0.0 {
+                    continue;
+                }
+
+                let tof_prime = tof_center + dt;
+                if tof_prime <= 0.0 {
+                    continue;
+                }
+
+                // Convert TOF to energy: E' = (TOF_FACTOR * L / t')^2
+                let e_prime = (TOF_FACTOR * self.flight_path_m / tof_prime).powi(2);
+
+                // Interpolate spectrum at e_prime; skip if outside the grid
+                let s = match interp_spectrum(energies, spectrum, e_prime) {
+                    Some(v) => v,
+                    None => continue,
+                };
+
+                // Trapezoidal weight for the TOF integral
+                let dt_width = if k > 0 && k < offsets.len() - 1 {
+                    (offsets[k + 1] - offsets[k - 1]) * 0.5
+                } else if k == 0 && offsets.len() > 1 {
+                    offsets[1] - offsets[0]
+                } else if k == offsets.len() - 1 && offsets.len() > 1 {
+                    offsets[k] - offsets[k - 1]
+                } else {
+                    1.0
+                };
+
+                let weight = w * dt_width.abs();
+                sum += weight * s;
+                norm += weight;
+            }
+
+            result[i] = if norm > 1e-50 {
+                sum / norm
+            } else {
+                spectrum[i]
+            };
+        }
+
+        result
+    }
+
+    /// Interpolate kernel at an arbitrary energy using log-space linear interpolation
+    /// between the two nearest reference energies.
+    fn interpolated_kernel(&self, energy: f64) -> (Vec<f64>, Vec<f64>) {
+        let n_ref = self.ref_energies.len();
+
+        // Clamp to nearest reference if outside range
+        if energy <= self.ref_energies[0] || n_ref == 1 {
+            return self.kernels[0].clone();
+        }
+        if energy >= self.ref_energies[n_ref - 1] {
+            return self.kernels[n_ref - 1].clone();
+        }
+
+        // Find bracketing indices
+        let mut idx = 0;
+        for j in 0..n_ref - 1 {
+            if self.ref_energies[j + 1] >= energy {
+                idx = j;
+                break;
+            }
+        }
+
+        let e_lo = self.ref_energies[idx];
+        let e_hi = self.ref_energies[idx + 1];
+
+        // Log-space interpolation fraction
+        let frac = (energy.ln() - e_lo.ln()) / (e_hi.ln() - e_lo.ln());
+
+        let (off_lo, w_lo) = &self.kernels[idx];
+        let (off_hi, w_hi) = &self.kernels[idx + 1];
+
+        // If both kernels have the same number of points, interpolate element-wise
+        if off_lo.len() == off_hi.len() {
+            let offsets: Vec<f64> = off_lo
+                .iter()
+                .zip(off_hi.iter())
+                .map(|(&a, &b)| a + frac * (b - a))
+                .collect();
+            let weights: Vec<f64> = w_lo
+                .iter()
+                .zip(w_hi.iter())
+                .map(|(&a, &b)| a + frac * (b - a))
+                .collect();
+            (offsets, weights)
+        } else {
+            // Different sizes: use nearest
+            if frac < 0.5 {
+                self.kernels[idx].clone()
+            } else {
+                self.kernels[idx + 1].clone()
+            }
+        }
+    }
+}
+
+/// Linear interpolation of spectrum at an arbitrary energy.
+///
+/// Returns `None` if `e` is outside the grid range, so callers can
+/// exclude off-grid kernel samples instead of clamping to boundary values.
+fn interp_spectrum(energies: &[f64], spectrum: &[f64], e: f64) -> Option<f64> {
+    let n = energies.len();
+    if n == 0 {
+        return None;
+    }
+    if e < energies[0] || e > energies[n - 1] {
+        return None;
+    }
+
+    // Binary search for bracketing index
+    let mut lo = 0;
+    let mut hi = n - 1;
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2;
+        if energies[mid] <= e {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+
+    let frac = (e - energies[lo]) / (energies[hi] - energies[lo]);
+    Some(spectrum[lo] + frac * (spectrum[hi] - spectrum[lo]))
+}
+
+/// Apply resolution broadening using either Gaussian or tabulated kernel.
+pub fn apply_resolution(
+    energies: &[f64],
+    spectrum: &[f64],
+    resolution: &ResolutionFunction,
+) -> Vec<f64> {
+    match resolution {
+        ResolutionFunction::Gaussian(params) => resolution_broaden(energies, spectrum, params),
+        ResolutionFunction::Tabulated(tab) => tab.broaden(energies, spectrum),
+    }
+}
+
+/// Errors from resolution file parsing.
+#[derive(Debug)]
+pub enum ResolutionParseError {
+    InvalidFormat(String),
+    IoError(String),
+}
+
+impl fmt::Display for ResolutionParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidFormat(msg) => write!(f, "Invalid resolution file format: {}", msg),
+            Self::IoError(msg) => write!(f, "I/O error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for ResolutionParseError {}
 
 /// Verify that the TOF conversion factor is consistent with the constants module.
 fn _verify_tof_factor() {

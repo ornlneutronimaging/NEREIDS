@@ -26,7 +26,7 @@ use nereids_endf::resonance::ResonanceData;
 
 use crate::doppler::{self, DopplerParams};
 use crate::reich_moore;
-use crate::resolution::{self, ResolutionParams};
+use crate::resolution::{self, ResolutionFunction};
 
 /// Compute transmission from cross-sections via Beer-Lambert law.
 ///
@@ -84,10 +84,10 @@ pub struct SampleParams {
 }
 
 /// Optional instrument resolution parameters.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct InstrumentParams {
-    /// Resolution broadening parameters.
-    pub resolution: ResolutionParams,
+    /// Resolution broadening function (Gaussian or tabulated).
+    pub resolution: ResolutionFunction,
 }
 
 /// Compute a complete theoretical transmission spectrum.
@@ -139,7 +139,7 @@ pub fn forward_model(
 
         // 3. Apply resolution broadening
         let after_resolution = if let Some(inst) = instrument {
-            resolution::resolution_broaden(energies, &after_doppler, &inst.resolution)
+            resolution::apply_resolution(energies, &after_doppler, &inst.resolution)
         } else {
             after_doppler
         };
