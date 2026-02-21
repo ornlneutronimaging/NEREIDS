@@ -25,7 +25,10 @@
 
 use std::sync::Arc;
 
-use numpy::{PyArray1, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3};
+use numpy::{
+    PyArray1, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3,
+    PyUntypedArrayMethods,
+};
 use pyo3::prelude::*;
 
 use nereids_core::elements::element_symbol;
@@ -1054,6 +1057,32 @@ fn py_spatial_map(
     let unc = uncertainty.as_array().to_owned();
     let e = energies.as_slice()?;
 
+    // Validate shapes before passing to Rust pipeline (which uses assert!/indexing)
+    let t_shape = trans.shape();
+    let u_shape = unc.shape();
+    if t_shape != u_shape {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "transmission shape {:?} must match uncertainty shape {:?}",
+            t_shape, u_shape,
+        )));
+    }
+    if e.len() != t_shape[0] {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "energies length ({}) must match spectral axis ({}) of transmission",
+            e.len(),
+            t_shape[0],
+        )));
+    }
+    if let Some(ref dead) = dead_pixels {
+        let d_shape = dead.shape();
+        if d_shape[0] != t_shape[1] || d_shape[1] != t_shape[2] {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "dead_pixels shape ({}, {}) must match spatial dimensions ({}, {}) of transmission",
+                d_shape[0], d_shape[1], t_shape[1], t_shape[2],
+            )));
+        }
+    }
+
     if isotopes.is_empty() {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "isotopes list must not be empty",
@@ -1153,6 +1182,23 @@ fn py_fit_roi(
     let unc = uncertainty.as_array().to_owned();
     let e = energies.as_slice()?;
 
+    // Validate shapes before passing to Rust pipeline (which uses assert!/indexing)
+    let t_shape = trans.shape();
+    let u_shape = unc.shape();
+    if t_shape != u_shape {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "transmission shape {:?} must match uncertainty shape {:?}",
+            t_shape, u_shape,
+        )));
+    }
+    if e.len() != t_shape[0] {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "energies length ({}) must match spectral axis ({}) of transmission",
+            e.len(),
+            t_shape[0],
+        )));
+    }
+
     if isotopes.is_empty() {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "isotopes list must not be empty",
@@ -1168,6 +1214,12 @@ fn py_fit_roi(
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
             "x_range must be non-empty: start ({}) >= end ({})",
             x_range.0, x_range.1,
+        )));
+    }
+    if y_range.1 > t_shape[1] || x_range.1 > t_shape[2] {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "ROI exceeds image dimensions: y_end={} (max {}), x_end={} (max {})",
+            y_range.1, t_shape[1], x_range.1, t_shape[2],
         )));
     }
 
@@ -1265,6 +1317,19 @@ fn normalize<'py>(
 ) -> PyResult<(Bound<'py, PyArray3<f64>>, Bound<'py, PyArray3<f64>>)> {
     let s = sample.as_array().to_owned();
     let ob = open_beam.as_array().to_owned();
+
+    // Validate dark_current spatial dimensions match sample before Rust code indexes dc[[y, x]]
+    if let Some(ref dc_arr) = dark_current {
+        let dc_shape = dc_arr.shape();
+        let s_shape = s.shape();
+        if dc_shape[0] != s_shape[1] || dc_shape[1] != s_shape[2] {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "dark_current shape ({}, {}) must match spatial dimensions ({}, {}) of sample",
+                dc_shape[0], dc_shape[1], s_shape[1], s_shape[2],
+            )));
+        }
+    }
+
     let dc = dark_current.map(|d| d.as_array().to_owned());
 
     let params = NormalizationParams {
