@@ -929,7 +929,8 @@ mod tests {
             "W-184 should have many resonances, got {total_resonances}"
         );
 
-        // First positive-energy resonance should be around 7.6 eV for W-184
+        // First positive-energy resonance in W-184 ENDF/B-VIII.0 (KRM=3, J=1/2+ group)
+        // is at ~101.95 eV.  The previously assumed 7.6 eV belongs to W-182, not W-184.
         let first_pos_e = rml
             .spin_groups
             .iter()
@@ -938,8 +939,8 @@ mod tests {
             .filter(|&e| e > 0.0)
             .fold(f64::MAX, f64::min);
         assert!(
-            first_pos_e > 1.0 && first_pos_e < 50.0,
-            "First W-184 resonance expected ~7.6 eV, got {first_pos_e:.2} eV"
+            first_pos_e > 50.0 && first_pos_e < 200.0,
+            "First W-184 positive resonance expected ~101.95 eV, got {first_pos_e:.2} eV"
         );
 
         println!(
