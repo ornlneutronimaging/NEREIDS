@@ -130,11 +130,15 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
                     let range = parse_reich_moore_range(&lines, &mut pos, energy_low, energy_high)?;
                     all_ranges.push(range);
                 }
-                _ => {
-                    return Err(EndfParseError::UnsupportedFormat(format!(
-                        "Formalism {:?} parsing not yet implemented",
-                        formalism
-                    )));
+                ResonanceFormalism::RMatrixLimited => {
+                    let range = parse_rmatrix_limited_range(
+                        &lines,
+                        &mut pos,
+                        energy_low,
+                        energy_high,
+                        awr,
+                    )?;
+                    all_ranges.push(range);
                 }
             }
         }
@@ -215,6 +219,7 @@ fn parse_bw_range(
         target_spin,
         scattering_radius,
         l_groups,
+        rml: None,
     })
 }
 
@@ -284,7 +289,179 @@ fn parse_reich_moore_range(
         target_spin,
         scattering_radius,
         l_groups,
+        rml: None,
     })
+}
+
+/// Parse an R-Matrix Limited (LRF=7) resolved resonance range.
+///
+/// ## ENDF-6 Record Layout (File 2, MT=151, after range CONT + optional TAB1)
+///
+/// ```text
+/// CONT:  [SPI, AP, IFG, KRM, NJS, KRL]
+///        SPI = target spin, AP = global scattering radius (fm),
+///        NJS = number of spin groups (J,π)
+///
+/// LIST:  [0, 0, NPP, 0, 12*NPP, NPP]   ← particle pair definitions
+///        12 values per pair: [MA, MB, ZA, ZB, IA, IB, Q, PNT, SHF, MT, PA, PB]
+///
+/// For each spin group j = 1..NJS:
+///   LIST: [AJ, PJ, KBK, KPS, 6*(NCH+1), NCH+1]   ← header + channels
+///         First 6 values: header row [0, 0, 0, 0, 0, NCH]
+///         NCH × 6 values: [IPP, L, SCH, BND, APE, APT] per channel
+///
+///   LIST: [0, 0, 0, 0, NRS*(NCH+1), NRS]           ← resonance parameters
+///         Per resonance: [ER, γ_1, γ_2, ..., γ_NCH]
+/// ```
+///
+/// Reference: ENDF-6 Formats Manual §2.2.1.6; SAMMY rml/mrml01.f
+fn parse_rmatrix_limited_range(
+    lines: &[&str],
+    pos: &mut usize,
+    energy_low: f64,
+    energy_high: f64,
+    awr: f64,
+) -> Result<ResonanceRange, EndfParseError> {
+    // CONT: [SPI, AP, IFG, KRM, NJS, KRL]
+    let cont = parse_cont(lines, pos)?;
+    let target_spin = cont.c1;
+    let scattering_radius = cont.c2;
+    let njs = cont.n1 as usize; // number of spin groups
+
+    // LIST: [0, 0, NPP, 0, 12*NPP, NPP]  — particle pair definitions
+    let pp_cont = parse_cont(lines, pos)?;
+    let npp = pp_cont.n2 as usize;
+    let pp_values = parse_list_values(lines, pos, npp * 12)?;
+
+    let mut particle_pairs = Vec::with_capacity(npp);
+    for i in 0..npp {
+        let b = i * 12;
+        particle_pairs.push(ParticlePair {
+            ma: pp_values[b],
+            mb: pp_values[b + 1],
+            za: pp_values[b + 2],
+            zb: pp_values[b + 3],
+            ia: pp_values[b + 4],
+            ib: pp_values[b + 5],
+            q: pp_values[b + 6],
+            pnt: pp_values[b + 7] as i32,
+            shf: pp_values[b + 8] as i32,
+            mt: pp_values[b + 9] as u32,
+            pa: pp_values[b + 10],
+            pb: pp_values[b + 11],
+        });
+    }
+
+    let mut spin_groups = Vec::with_capacity(njs);
+
+    for _ in 0..njs {
+        // LIST: [AJ, PJ, KBK, KPS, 6*(NCH+1), NCH+1]
+        // First 6*(NCH+1) values: header row [0,0,0,0,0,NCH] then NCH×6 channel defs.
+        let sg_cont = parse_cont(lines, pos)?;
+        let j = sg_cont.c1;
+        let parity = sg_cont.c2;
+        let kbk = sg_cont.l1; // background R-matrix flag
+        let kps = sg_cont.l2; // phase shift flag
+        let npl = sg_cont.n1 as usize; // 6*(NCH+1)
+        let nch_plus_one = sg_cont.n2 as usize; // NCH+1
+        let nch = nch_plus_one.saturating_sub(1);
+
+        let sg_values = parse_list_values(lines, pos, npl)?;
+
+        // First 6 values are the header row — NCH is also encoded there (field 6).
+        // Subsequent NCH×6 values are channel definitions.
+        let mut channels = Vec::with_capacity(nch);
+        for c in 0..nch {
+            let b = 6 + c * 6; // skip the 6-value header row
+            channels.push(RmlChannel {
+                particle_pair_idx: sg_values[b] as usize, // IPP (1-based in ENDF, convert below)
+                l: sg_values[b + 1] as u32,                // L
+                channel_spin: sg_values[b + 2],            // SCH
+                boundary: sg_values[b + 3],                // BND
+                effective_radius: sg_values[b + 4],        // APE (fm)
+                true_radius: sg_values[b + 5],             // APT (fm)
+            });
+        }
+
+        // IPP is 1-based in ENDF — convert to 0-based index
+        for ch in &mut channels {
+            ch.particle_pair_idx = ch.particle_pair_idx.saturating_sub(1);
+        }
+
+        // Apply global scattering radius for channels where APE/APT == 0
+        for ch in &mut channels {
+            if ch.effective_radius == 0.0 {
+                ch.effective_radius = scattering_radius;
+            }
+            if ch.true_radius == 0.0 {
+                ch.true_radius = scattering_radius;
+            }
+        }
+
+        // LIST: [0, 0, 0, 0, NRS*(NCH+1), NRS]  — resonance parameters
+        let res_cont = parse_cont(lines, pos)?;
+        let nrs = res_cont.n2 as usize;
+        let res_npl = res_cont.n1 as usize; // NRS * (NCH+1)
+        let res_values = parse_list_values(lines, pos, res_npl)?;
+
+        let mut resonances = Vec::with_capacity(nrs);
+        let stride = nch + 1; // values per resonance: ER + NCH widths
+        for r in 0..nrs {
+            let b = r * stride;
+            let widths: Vec<f64> = res_values[b + 1..b + stride].to_vec();
+            resonances.push(RmlResonance {
+                energy: res_values[b],
+                widths,
+            });
+        }
+
+        // KBK and KPS: background R-matrix and tabulated phase shifts.
+        // Both are rare in ENDF/B-VIII.0; error clearly rather than silently misbehave.
+        if kbk != 0 {
+            return Err(EndfParseError::UnsupportedFormat(format!(
+                "LRF=7 background R-matrix (KBK={kbk}) not yet supported"
+            )));
+        }
+        if kps != 0 {
+            return Err(EndfParseError::UnsupportedFormat(format!(
+                "LRF=7 tabulated phase shifts (KPS={kps}) not yet supported"
+            )));
+        }
+
+        spin_groups.push(SpinGroup {
+            j,
+            parity,
+            channels,
+            resonances,
+        });
+    }
+
+    let rml = RmlData {
+        target_spin,
+        awr,
+        scattering_radius,
+        particle_pairs,
+        spin_groups,
+    };
+
+    Ok(ResonanceRange {
+        energy_low,
+        energy_high,
+        resolved: true,
+        formalism: ResonanceFormalism::RMatrixLimited,
+        target_spin,
+        scattering_radius,
+        l_groups: Vec::new(),
+        rml: Some(Box::new(rml)),
+    })
+}
+
+/// Skip a LIST record (CONT header + data lines).
+fn skip_list(lines: &[&str], pos: &mut usize) -> Result<(), EndfParseError> {
+    let cont = parse_cont(lines, pos)?;
+    let npl = cont.n1 as usize;
+    *pos += npl.div_ceil(6);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

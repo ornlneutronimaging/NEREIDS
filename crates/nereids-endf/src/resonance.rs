@@ -17,14 +17,13 @@ use serde::{Deserialize, Serialize};
 pub enum ResonanceFormalism {
     /// Single-Level Breit-Wigner (LRF=1 with SLBW treatment, or SAMMY LRF=-1).
     SLBW,
-    /// Multi-Level Breit-Wigner (LRF=1).
+    /// Multi-Level Breit-Wigner (LRF=2).
     MLBW,
-    /// Reich-Moore (LRF=2). This is the primary formalism for NEREIDS.
+    /// Reich-Moore (LRF=3). Primary formalism for light and actinide isotopes.
     ReichMoore,
-    /// R-Matrix Limited (LRF=3).
+    /// R-Matrix Limited (LRF=7). General multi-channel formalism; used for
+    /// many medium-heavy isotopes (W, Ta, Zr, etc.) in ENDF/B-VIII.0.
     RMatrixLimited,
-    /// General R-Matrix (LRF=7).
-    GeneralRMatrix,
 }
 
 /// Top-level container for all resonance data parsed from an ENDF file.
@@ -55,13 +54,15 @@ pub struct ResonanceRange {
     pub target_spin: f64,
     /// Scattering radius (fm).
     pub scattering_radius: f64,
-    /// Spin groups containing the actual resonance parameters.
+    /// Spin groups for LRF=1/2/3 (L-grouped). Empty for LRF=7.
     pub l_groups: Vec<LGroup>,
+    /// R-Matrix Limited data for LRF=7. `None` for LRF=1/2/3.
+    pub rml: Option<Box<RmlData>>,
 }
 
 /// Parameters grouped by orbital angular momentum L.
 ///
-/// In ENDF File 2 (LRF=2, Reich-Moore), resonances are grouped by L-value.
+/// In ENDF File 2 (LRF=3, Reich-Moore), resonances are grouped by L-value.
 /// Each L-group contains resonances with different J values.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LGroup {
@@ -79,13 +80,13 @@ pub struct LGroup {
 ///
 /// The meaning of the width fields depends on the formalism:
 ///
-/// ## Reich-Moore (LRF=2)
+/// ## Reich-Moore (LRF=3)
 /// - `gn`: Neutron width Γn (eV)
 /// - `gg`: Radiation (gamma) width Γγ (eV)
 /// - `gfa`: First fission width Γf1 (eV), 0.0 if non-fissile
 /// - `gfb`: Second fission width Γf2 (eV), 0.0 if non-fissile
 ///
-/// ## SLBW/MLBW (LRF=1)
+/// ## SLBW/MLBW (LRF=1/2)
 /// - `gn`: Neutron width Γn (eV)
 /// - `gg`: Radiation width Γγ (eV)
 /// - `gfa`: Fission width Γf (eV)
@@ -109,27 +110,166 @@ pub struct Resonance {
     pub gfb: f64,
 }
 
+// ─── LRF=7 (R-Matrix Limited) Data Structures ────────────────────────────────
+//
+// LRF=7 organizes resonances by spin group (J,π) rather than L-value.
+// Each spin group has multiple explicit reaction channels. Resonances carry
+// reduced width amplitudes γ per channel, not formal widths Γ.
+//
+// Reference: ENDF-6 Formats Manual §2.2.1.6; SAMMY manual Ch. 3
+// SAMMY source: rml/mrml01.f (reader), rml/mrml11.f (cross-section calc)
+
+/// Particle pair definition for LRF=7 R-Matrix Limited.
+///
+/// Identifies the two particles in a reaction channel (e.g., neutron + W-184,
+/// or gamma + W-185). Used to determine which channels are entrance (neutron)
+/// channels and which are exit (fission, capture) channels.
+///
+/// Reference: ENDF-6 Formats Manual §2.2.1.6, Table 2.2
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParticlePair {
+    /// Mass of particle a (neutron = 1.0, in neutron mass units).
+    pub ma: f64,
+    /// Mass of particle b (target nucleus, in neutron mass units).
+    pub mb: f64,
+    /// Z*A of particle a (0 for neutron).
+    pub za: f64,
+    /// Z*A of particle b (target).
+    pub zb: f64,
+    /// Spin of particle a (1/2 for neutron).
+    pub ia: f64,
+    /// Spin of particle b (target spin I).
+    pub ib: f64,
+    /// Q-value for this reaction (eV). 0 for elastic.
+    pub q: f64,
+    /// Penetrability flag: 0 = calculated, 1 = tabulated.
+    pub pnt: i32,
+    /// Shift factor flag: 0 = calculated, 1 = tabulated.
+    pub shf: i32,
+    /// ENDF MT number identifying the reaction (2=elastic, 18=fission, 102=capture).
+    pub mt: u32,
+    /// Parity of particle a.
+    pub pa: f64,
+    /// Parity of particle b.
+    pub pb: f64,
+}
+
+/// A single reaction channel within an LRF=7 spin group.
+///
+/// Specifies which particle pair, what orbital angular momentum, and the
+/// radii used to compute penetrabilities and hard-sphere phase shifts.
+///
+/// Reference: ENDF-6 Formats Manual §2.2.1.6, Table 2.3
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RmlChannel {
+    /// Index into the parent `RmlData::particle_pairs` vector.
+    pub particle_pair_idx: usize,
+    /// Orbital angular momentum quantum number L.
+    pub l: u32,
+    /// Channel spin S = |I ± 1/2|.
+    pub channel_spin: f64,
+    /// Boundary condition B (usually 0.0; shifts the shift factor reference).
+    pub boundary: f64,
+    /// Effective channel radius APE (fm), used to compute P_l and S_l.
+    pub effective_radius: f64,
+    /// True channel radius APT (fm), used to compute hard-sphere phase φ_l.
+    pub true_radius: f64,
+}
+
+/// A single resonance in LRF=7 format.
+///
+/// Unlike LRF=1/2/3 where widths are formal widths Γ (eV), LRF=7 stores
+/// **reduced width amplitudes** γ (eV^{1/2}). Formal widths are recovered via
+/// Γ_c = 2 · P_c(E_n) · γ²_c, where P_c is the penetrability at resonance energy.
+///
+/// Reference: SAMMY manual §3.1; ENDF-6 Formats Manual §2.2.1.6
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RmlResonance {
+    /// Resonance energy (eV).
+    pub energy: f64,
+    /// Reduced width amplitudes γ_c (eV^{1/2}), one per channel.
+    ///
+    /// Sign convention: sign(γ) encodes interference between resonances.
+    /// `widths.len()` equals the number of channels in the parent `SpinGroup`.
+    pub widths: Vec<f64>,
+}
+
+/// A spin group (J, π) in LRF=7 R-Matrix Limited format.
+///
+/// Groups all resonances with the same total angular momentum J and parity π.
+/// Each spin group has its own set of reaction channels.
+///
+/// Reference: ENDF-6 Formats Manual §2.2.1.6; SAMMY rml/mrml01.f
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpinGroup {
+    /// Total angular momentum J.
+    pub j: f64,
+    /// Parity: +1.0 (even) or -1.0 (odd).
+    pub parity: f64,
+    /// Reaction channels for this spin group.
+    pub channels: Vec<RmlChannel>,
+    /// Resonances in this spin group.
+    pub resonances: Vec<RmlResonance>,
+}
+
+/// Complete R-Matrix Limited data for one energy range (LRF=7).
+///
+/// Stored in `ResonanceRange::rml` when the formalism is `RMatrixLimited`.
+///
+/// Reference: ENDF-6 Formats Manual §2.2.1.6; SAMMY rml/mrml01.f
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RmlData {
+    /// Target spin I.
+    pub target_spin: f64,
+    /// Atomic weight ratio (mass of target / neutron mass).
+    pub awr: f64,
+    /// Global scattering radius AP (fm); used as fallback when per-channel APE = 0.
+    pub scattering_radius: f64,
+    /// Particle pair definitions (NPP entries).
+    pub particle_pairs: Vec<ParticlePair>,
+    /// Spin groups (NJS entries), one per (J, π) combination.
+    pub spin_groups: Vec<SpinGroup>,
+}
+
 impl ResonanceData {
     /// Total number of resonances across all ranges and groups.
+    ///
+    /// For LRF=7 ranges, counts resonances across all spin groups.
     pub fn total_resonance_count(&self) -> usize {
-        self.ranges
-            .iter()
-            .flat_map(|r| &r.l_groups)
-            .map(|lg| lg.resonances.len())
-            .sum()
+        self.ranges.iter().map(|r| r.resonance_count()).sum()
     }
 
-    /// Get all resonances in the resolved region, sorted by energy.
+    /// Get all resonances in the resolved region (LRF=1/2/3 only), sorted by energy.
+    ///
+    /// Returns an empty vec for LRF=7 ranges; use `ResonanceRange::rml` directly
+    /// to access R-Matrix Limited resonances.
     pub fn all_resolved_resonances(&self) -> Vec<&Resonance> {
         let mut resonances: Vec<&Resonance> = self
             .ranges
             .iter()
-            .filter(|r| r.resolved)
+            .filter(|r| r.resolved && r.rml.is_none())
             .flat_map(|r| &r.l_groups)
             .flat_map(|lg| &lg.resonances)
             .collect();
         resonances.sort_by(|a, b| a.energy.partial_cmp(&b.energy).unwrap());
         resonances
+    }
+}
+
+impl ResonanceRange {
+    /// Total resonance count for this range (works for both LRF=1/2/3 and LRF=7).
+    pub fn resonance_count(&self) -> usize {
+        if let Some(rml) = &self.rml {
+            rml.spin_groups
+                .iter()
+                .map(|sg| sg.resonances.len())
+                .sum()
+        } else {
+            self.l_groups
+                .iter()
+                .map(|lg| lg.resonances.len())
+                .sum()
+        }
     }
 }
 
