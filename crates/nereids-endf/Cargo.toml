@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+endf-mat = { workspace = true }
 nereids-core = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
