@@ -298,6 +298,19 @@ impl TabulatedResolution {
             ));
         }
 
+        // Validate strictly ascending reference energies
+        for i in 1..ref_energies.len() {
+            if ref_energies[i] <= ref_energies[i - 1] {
+                return Err(ResolutionParseError::InvalidFormat(format!(
+                    "Reference energies must be strictly ascending, but E[{}]={} <= E[{}]={}",
+                    i,
+                    ref_energies[i],
+                    i - 1,
+                    ref_energies[i - 1],
+                )));
+            }
+        }
+
         Ok(TabulatedResolution {
             ref_energies,
             kernels,
@@ -360,8 +373,11 @@ impl TabulatedResolution {
                 // Convert TOF to energy: E' = (TOF_FACTOR * L / t')^2
                 let e_prime = (TOF_FACTOR * self.flight_path_m / tof_prime).powi(2);
 
-                // Interpolate spectrum at e_prime
-                let s = interp_spectrum(energies, spectrum, e_prime);
+                // Interpolate spectrum at e_prime; skip if outside the grid
+                let s = match interp_spectrum(energies, spectrum, e_prime) {
+                    Some(v) => v,
+                    None => continue,
+                };
 
                 // Trapezoidal weight for the TOF integral
                 let dt_width = if k > 0 && k < offsets.len() - 1 {
@@ -445,16 +461,16 @@ impl TabulatedResolution {
 }
 
 /// Linear interpolation of spectrum at an arbitrary energy.
-fn interp_spectrum(energies: &[f64], spectrum: &[f64], e: f64) -> f64 {
+///
+/// Returns `None` if `e` is outside the grid range, so callers can
+/// exclude off-grid kernel samples instead of clamping to boundary values.
+fn interp_spectrum(energies: &[f64], spectrum: &[f64], e: f64) -> Option<f64> {
     let n = energies.len();
     if n == 0 {
-        return 0.0;
+        return None;
     }
-    if e <= energies[0] {
-        return spectrum[0];
-    }
-    if e >= energies[n - 1] {
-        return spectrum[n - 1];
+    if e < energies[0] || e > energies[n - 1] {
+        return None;
     }
 
     // Binary search for bracketing index
@@ -470,7 +486,7 @@ fn interp_spectrum(energies: &[f64], spectrum: &[f64], e: f64) -> f64 {
     }
 
     let frac = (e - energies[lo]) / (energies[hi] - energies[lo]);
-    spectrum[lo] + frac * (spectrum[hi] - spectrum[lo])
+    Some(spectrum[lo] + frac * (spectrum[hi] - spectrum[lo]))
 }
 
 /// Apply resolution broadening using either Gaussian or tabulated kernel.
