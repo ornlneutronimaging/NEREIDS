@@ -80,8 +80,10 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
             let lrf = range_cont.l2; // resonance formalism
 
             if lru == 2 {
-                // Unresolved resonance region — skip for now.
-                // We need to skip all lines in this subsection.
+                // Unresolved resonance region (LRU=2) — parse past but do not evaluate.
+                // URR uses average level-spacing/width parameters and probability tables
+                // rather than discrete resonances.  SAMMY implements URR cross-sections
+                // via urr/murr*.f90.  Tracked in issue #44.
                 skip_unresolved_range(&lines, &mut pos, lrf)?;
                 continue;
             }
@@ -96,7 +98,12 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
             let nro = range_cont.n1; // energy-dependent scattering radius flag
             let _naps = range_cont.n2; // scattering radius calculation flag
 
-            // If NRO != 0, there's a TAB1 record for energy-dependent radius.
+            // If NRO != 0, there's a TAB1 record for energy-dependent scattering
+            // radius AP(E).  We parse past it but do not apply it — the constant AP
+            // from the CONT header is used instead.  This is a known silent inaccuracy:
+            // cross-sections in ranges with NRO=1 may have a slightly wrong potential
+            // scattering background.  SAMMY correctly interpolates AP(E); tracked in
+            // issue #43.
             if nro != 0 {
                 skip_tab1(&lines, &mut pos)?;
             }
@@ -377,8 +384,8 @@ fn parse_rmatrix_limited_range(
         // wave functions (F_l, G_l) rather than the hard-sphere Blatt-Weisskopf
         // functions; using the wrong functions produces incorrect P_c/S_c.
         // Applies to charged-particle channels (fission fragments, (n,p), (n,α), …).
-        // Not present in VENUS targets (W, Ta, Zr) where exit channels are photons.
-        // Reference: SAMMY rml/mrml07.f Pgh — branches on Coulomb vs. hard-sphere.
+        // SAMMY implements Coulomb wave functions via Steed's method (rml/mrml07.f,
+        // coulomb/mrml08.f90).  Tracked in issue #42.
         if pp.za.abs() > 0.0 && pp.zb.abs() > 0.0 {
             return Err(EndfParseError::UnsupportedFormat(format!(
                 "LRF=7 particle pair {i}: Coulomb channel \
@@ -452,13 +459,18 @@ fn parse_rmatrix_limited_range(
             });
         }
 
-        // KBK and KPS: background R-matrix and tabulated phase shifts.
-        // Both are rare in ENDF/B-VIII.0; error clearly rather than silently misbehave.
+        // KBK: background R-matrix correction (pole-free or smooth background terms).
+        // SAMMY implements via rml/mrml10.f.  Tracked in issue #41.
+        // Rare in ENDF/B-VIII.0; fail loud rather than silently drop the background.
         if kbk != 0 {
             return Err(EndfParseError::UnsupportedFormat(format!(
-                "LRF=7 background R-matrix (KBK={kbk}) not yet supported"
+                "LRF=7 background R-matrix (KBK={kbk}) not yet supported (issue #41)"
             )));
         }
+        // KPS: tabulated penetrability/phase-shift override.
+        // Note: SAMMY itself does NOT implement KPS (mrml07.f always computes phases
+        // analytically via Sinsix, ignoring any tabulated override).  This is consistent
+        // with SAMMY; KPS is vestigial in ENDF/B-VIII.0 practice.
         if kps != 0 {
             return Err(EndfParseError::UnsupportedFormat(format!(
                 "LRF=7 tabulated phase shifts (KPS={kps}) not yet supported"

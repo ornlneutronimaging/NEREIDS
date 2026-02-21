@@ -167,8 +167,16 @@ fn cross_sections_for_range(
                     capture += c;
                     fission += f;
                 }
+                ResonanceFormalism::SLBW | ResonanceFormalism::MLBW => {
+                    // SLBW/MLBW are parsed and stored but the physics evaluation
+                    // is not yet wired up here.  The `slbw` crate module exists but
+                    // is not called from this dispatcher.  Cross-section contribution
+                    // is silently zero — a known gap relative to SAMMY.
+                    // TODO: dispatch to slbw::cross_sections_for_range() (issue #12).
+                    continue;
+                }
                 _ => {
-                    // Other formalisms handled elsewhere.
+                    // Other formalisms (Adler-Adler LRF=4, etc.) not supported.
                     continue;
                 }
             }
