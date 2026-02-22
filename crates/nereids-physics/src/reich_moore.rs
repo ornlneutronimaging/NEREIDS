@@ -24,7 +24,7 @@
 
 use num_complex::Complex64;
 
-use nereids_endf::resonance::{ResonanceData, ResonanceFormalism, ResonanceRange};
+use nereids_endf::resonance::{ResonanceData, ResonanceFormalism, ResonanceRange, Tab1};
 
 use crate::channel;
 use crate::penetrability;
@@ -136,6 +136,16 @@ fn cross_sections_for_range(
             range.scattering_radius_at(energy_ev)
         };
 
+        // AP table for per-resonance radius: only applicable when the global
+        // NRO=1 table is in use (i.e., no L-group override via APL).
+        // When NRO=1, ENDF widths are defined at AP(E_r), not AP(energy_ev),
+        // so p_at_er must use the radius evaluated at the resonance energy.
+        let ap_table_ref: Option<&Tab1> = if l_group.apl > 0.0 {
+            None
+        } else {
+            range.ap_table.as_ref()
+        };
+
         // Compute channel parameters at this energy.
         let rho = channel::rho(energy_ev, awr_l, channel_radius);
         let p_l = penetrability::penetrability(l, rho);
@@ -162,6 +172,7 @@ fn cross_sections_for_range(
                         p_l,
                         s_l,
                         phi_l,
+                        ap_table_ref,
                     );
                     total += t;
                     elastic += e;
@@ -225,6 +236,7 @@ fn reich_moore_spin_group(
     p_l: f64,
     s_l: f64,
     phi_l: f64,
+    ap_table: Option<&Tab1>,
 ) -> (f64, f64, f64, f64) {
     let pi_over_k2 = channel::pi_over_k_squared_barns(energy_ev, awr);
 
@@ -246,6 +258,7 @@ fn reich_moore_spin_group(
             s_l,
             phi_l,
             pi_over_k2,
+            ap_table,
         );
     }
 
@@ -274,9 +287,13 @@ fn reich_moore_spin_group(
         let gamma_g = res.gg; // capture width (eV)
 
         // Reduced width amplitude squared.
-        // For negative-energy (bound) resonances, use |E_r| for the penetrability.
+        // ENDF widths are defined as Γ_n = 2·P_l(AP(E_r), E_r)·γ²_n,
+        // so the penetrability must be evaluated at the resonance energy
+        // using the channel radius AP(E_r) — not the incident-energy AP(E).
+        // For NRO=0 (constant AP) this makes no difference.
         let p_at_er = if e_r.abs() > 1e-30 {
-            let rho_r = channel::rho(e_r.abs(), awr, channel_radius);
+            let radius_at_er = ap_table.map_or(channel_radius, |t| t.evaluate(e_r.abs()));
+            let rho_r = channel::rho(e_r.abs(), awr, radius_at_er);
             penetrability::penetrability(l, rho_r)
         } else {
             p_l // Fallback: use current-energy penetrability
@@ -386,6 +403,7 @@ fn reich_moore_with_fission(
     s_l: f64,
     phi_l: f64,
     pi_over_k2: f64,
+    ap_table: Option<&Tab1>,
 ) -> (f64, f64, f64, f64) {
     // Determine number of fission channels (1 or 2).
     let has_two_fission = resonances.iter().any(|r| r.gfb.abs() > 1e-30);
@@ -405,8 +423,10 @@ fn reich_moore_with_fission(
             let gamma_f = res.gfa;
 
             // Reduced width amplitudes.
+            // Use AP(E_r) for the resonance-energy penetrability (ENDF width convention).
             let p_at_er = if e_r.abs() > 1e-30 {
-                let rho_r = channel::rho(e_r.abs(), awr, channel_radius);
+                let radius_at_er = ap_table.map_or(channel_radius, |t| t.evaluate(e_r.abs()));
+                let rho_r = channel::rho(e_r.abs(), awr, radius_at_er);
                 penetrability::penetrability(l, rho_r)
             } else {
                 p_l
@@ -517,6 +537,7 @@ fn reich_moore_with_fission(
             s_l,
             phi_l,
             pi_over_k2,
+            ap_table,
         )
     }
 }
@@ -534,6 +555,7 @@ fn reich_moore_3channel(
     s_l: f64,
     phi_l: f64,
     pi_over_k2: f64,
+    ap_table: Option<&Tab1>,
 ) -> (f64, f64, f64, f64) {
     let boundary = 0.0;
 
@@ -546,8 +568,10 @@ fn reich_moore_3channel(
         let gamma_fa = res.gfa;
         let gamma_fb = res.gfb;
 
+        // Use AP(E_r) for the resonance-energy penetrability (ENDF width convention).
         let p_at_er = if e_r.abs() > 1e-30 {
-            let rho_r = channel::rho(e_r.abs(), awr, channel_radius);
+            let radius_at_er = ap_table.map_or(channel_radius, |t| t.evaluate(e_r.abs()));
+            let rho_r = channel::rho(e_r.abs(), awr, radius_at_er);
             penetrability::penetrability(l, rho_r)
         } else {
             p_l
