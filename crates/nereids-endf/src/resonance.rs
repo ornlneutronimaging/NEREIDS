@@ -71,6 +71,17 @@ impl Tab1 {
             );
             return 0.0;
         }
+        // NaN/±inf: partition_point's comparisons are all false for NaN,
+        // returning index 0, and pts[0 - 1] would underflow.  Clamp to the
+        // nearest finite endpoint instead.
+        if !x.is_finite() {
+            debug_assert!(x.is_finite(), "Tab1::evaluate: non-finite argument {x}");
+            return if x > 0.0 {
+                pts[pts.len() - 1].1
+            } else {
+                pts[0].1
+            };
+        }
         if x <= pts[0].0 {
             return pts[0].1;
         }
@@ -204,6 +215,7 @@ pub struct ResonanceRange {
     /// `None` when the range has NRO=0 (constant AP).
     ///
     /// Reference: ENDF-6 Formats Manual §2.2.1; SAMMY `mlb/mmlb1.f90`
+    #[serde(default)]
     pub ap_table: Option<Tab1>,
     /// Spin groups for LRF=1/2/3 (L-grouped). Empty for LRF=7.
     pub l_groups: Vec<LGroup>,

@@ -881,9 +881,10 @@ fn parse_tab1(lines: &[&str], pos: &mut usize) -> Result<Tab1, EndfParseError> {
         // ENDF stores integers as floats (e.g. "2.000000+0").  They must be
         // exact whole numbers.  Use a small epsilon (1e-6) rather than the
         // half-unit tolerance 0.5, which would silently accept 1.4 or 2.49.
-        if (nbt_raw - nbt_raw.round()).abs() > 1e-6 || nbt_raw < 0.0 {
+        // NBT is a 1-based index (ENDF §0.5), so 0 is invalid.
+        if (nbt_raw - nbt_raw.round()).abs() > 1e-6 || nbt_raw < 1.0 {
             return Err(EndfParseError::UnsupportedFormat(format!(
-                "TAB1 NBT[{}] is not a non-negative integer: {}",
+                "TAB1 NBT[{}] is not a positive integer: {}",
                 i, nbt_raw
             )));
         }
