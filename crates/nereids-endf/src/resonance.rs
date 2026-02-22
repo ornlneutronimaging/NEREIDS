@@ -440,7 +440,10 @@ mod tests {
         assert!((v - 20.0).abs() < 1e-10, "lin-lin midpoint, got {v}");
         // midpoint of [5,10]: x=7.5 → 30 + (7.5-5)/(10-5) * (5-30) = 30 + 0.5*(-25) = 17.5
         let v2 = table.evaluate(7.5);
-        assert!((v2 - 17.5).abs() < 1e-10, "lin-lin second interval, got {v2}");
+        assert!(
+            (v2 - 17.5).abs() < 1e-10,
+            "lin-lin second interval, got {v2}"
+        );
     }
 
     /// Values outside the table range clamp to the boundary value.
@@ -461,7 +464,11 @@ mod tests {
             interp_codes: vec![1],
             points: vec![(0.0, 10.0), (5.0, 20.0), (10.0, 30.0)],
         };
-        assert_eq!(table.evaluate(2.5), 10.0, "histogram: should return left value");
+        assert_eq!(
+            table.evaluate(2.5),
+            10.0,
+            "histogram: should return left value"
+        );
         assert_eq!(table.evaluate(7.5), 20.0, "histogram: second interval");
     }
 
@@ -477,7 +484,10 @@ mod tests {
             points: vec![(1.0, 1.0), (3.0, 3.0), (10.0, 3.0), (100.0, 30.0)],
         };
         // Interval 0 ([1,3], INT=2): x=2 → lin-lin: 1 + (2-1)/(3-1) * (3-1) = 2
-        assert!((table.evaluate(2.0) - 2.0).abs() < 1e-10, "region 0 lin-lin");
+        assert!(
+            (table.evaluate(2.0) - 2.0).abs() < 1e-10,
+            "region 0 lin-lin"
+        );
         // Interval 2 ([10,100], INT=3 lin-log): x=31.62 (~sqrt(10*100))
         // t = (31.62-10)/(100-10) = 0.2402
         // y = exp(ln3 + 0.2402*(ln30 - ln3)) = exp(1.0986 + 0.2402*2.3026) = exp(1.6522) ≈ 5.22

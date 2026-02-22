@@ -133,13 +133,9 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
                 ResonanceFormalism::ReichMoore => {
                     parse_reich_moore_range(&lines, &mut pos, energy_low, energy_high)?
                 }
-                ResonanceFormalism::RMatrixLimited => parse_rmatrix_limited_range(
-                    &lines,
-                    &mut pos,
-                    energy_low,
-                    energy_high,
-                    awr,
-                )?,
+                ResonanceFormalism::RMatrixLimited => {
+                    parse_rmatrix_limited_range(&lines, &mut pos, energy_low, energy_high, awr)?
+                }
             };
             range.ap_table = ap_table;
             all_ranges.push(range);
