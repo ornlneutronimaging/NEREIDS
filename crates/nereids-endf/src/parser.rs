@@ -555,7 +555,7 @@ fn parse_rmatrix_limited_range(
         let stride = if nrs == 0 {
             min_stride // no resonances; stride unused
         } else {
-            if res_npl % nrs != 0 {
+            if !res_npl.is_multiple_of(nrs) {
                 return Err(EndfParseError::UnsupportedFormat(format!(
                     "LRF=7 resonance block NPL={res_npl} is not divisible by NRS={nrs}"
                 )));
@@ -1124,7 +1124,7 @@ mod tests {
     /// Run with: cargo test -p nereids-endf -- --ignored test_parse_w184_rml
     ///
     /// Validates: formalism == RMatrixLimited, spin groups non-empty,
-    /// first positive resonance energy in plausible range (W-184: ~7.6 eV).
+    /// first positive resonance energy in plausible range (W-184: ~101.9 eV).
     #[test]
     #[ignore = "requires network: downloads W-184 ENDF from IAEA (~50 kB)"]
     fn test_parse_w184_rml() {
