@@ -103,9 +103,25 @@ fn spin_group_cross_sections(
     krm: u32,
 ) -> (f64, f64, f64, f64) {
     let nch = sg.channels.len();
-    if nch == 0 || sg.resonances.is_empty() {
+    if nch == 0 {
         return (0.0, 0.0, 0.0, 0.0);
     }
+
+    // P2a: Reject unsupported KRM types before doing any calculation.
+    // KRM=2 (standard R-matrix, reduced amplitudes) and KRM=3 (Reich-Moore
+    // approximation, formal widths + complex poles) are the only ENDF/B-VIII.0
+    // types encountered in practice.  Any other value indicates a malformed or
+    // unsupported evaluation; returning zeros fails fast and visibly instead of
+    // silently producing cross sections under the wrong formalism.
+    // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f (KRM field description).
+    if krm != 2 && krm != 3 {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+
+    // P2b: NRS=0 is valid — the R-matrix is zero but the hard-sphere phase shift
+    // still produces nonzero potential-scattering cross sections (σ_el = 4π|Ω-1|²/k²
+    // per spin group).  Do NOT return early here; the resonance loop simply executes
+    // zero iterations, leaving R = 0, which is exactly the hard-sphere limit.
 
     let g_j = channel::statistical_weight(sg.j, target_spin);
     let pok2 = channel::pi_over_k_squared_barns(energy_ev, awr);
@@ -209,12 +225,17 @@ fn spin_group_cross_sections(
                     let p_at_en = if pp_c.ma < 0.5 {
                         1.0 // photon: P = 1 by convention
                     } else {
-                        let e_c_n = res.energy + pp_c.q; // channel energy at resonance
-                        if e_c_n <= 0.0 {
+                        // P1: res.energy is lab-frame; convert to CM before adding Q.
+                        // wave_number_from_cm requires CM kinetic energy, so we must
+                        // first apply the lab→CM transform (E_cm = E_lab × AWR/(1+AWR))
+                        // and then add the channel Q-value.
+                        // Reference: SAMMY rml/mrml03.f Fxradi; ENDF-6 §2.2.1.6.
+                        let e_cm_n = channel::lab_to_cm_energy(res.energy, awr) + pp_c.q;
+                        if e_cm_n <= 0.0 {
                             0.0 // closed or sub-threshold (bound state)
                         } else {
                             let redmas = pp_c.ma * pp_c.mb / (pp_c.ma + pp_c.mb);
-                            let k_cn = channel::wave_number_from_cm(e_c_n, redmas);
+                            let k_cn = channel::wave_number_from_cm(e_cm_n, redmas);
                             penetrability::penetrability(ch.l, k_cn * ch.effective_radius)
                         }
                     };
@@ -579,24 +600,30 @@ mod tests {
         };
 
         // Evaluate at several energies.  σ_total must be non-negative,
-        // and σ_capture/σ_fission must be exactly zero (no absorption).
+        // and σ_capture/σ_fission must be zero (no absorption channels).
+        //
+        // Note: cap is computed as (tot - elas - fis); since tot and elas are
+        // calculated via different floating-point paths they may differ by
+        // ~1e-15 × pok2 (where pok2 can be ~1e5 b at low energy), giving a
+        // residual |cap| ~ 1e-10 b.  Use a relative tolerance of 1e-9.
         for &e_ev in &[10.0, 50.0, 100.0, 500.0, 1000.0] {
             let (tot, elas, cap, fis) = cross_sections_for_rml_range(&rml, e_ev);
             assert!(
                 tot >= 0.0,
                 "hard sphere σ_total < 0 at {e_ev} eV: {tot:.6} b"
             );
+            let tol = 1e-9 * tot.abs().max(1.0);
             assert!(
-                (cap).abs() < 1e-12,
-                "hard sphere σ_capture ≠ 0 at {e_ev} eV: {cap:.6} b"
+                cap.abs() < tol,
+                "hard sphere σ_capture ≠ 0 at {e_ev} eV: {cap:.3e} b (tol={tol:.3e})"
             );
             assert!(
-                fis.abs() < 1e-12,
-                "hard sphere σ_fission ≠ 0 at {e_ev} eV: {fis:.6} b"
+                fis.abs() < tol,
+                "hard sphere σ_fission ≠ 0 at {e_ev} eV: {fis:.3e} b (tol={tol:.3e})"
             );
             // σ_elastic ≈ σ_total (capture=fission=0)
             assert!(
-                (tot - elas).abs() < 1e-10,
+                (tot - elas).abs() < tol,
                 "σ_total ≠ σ_elastic at {e_ev} eV: tot={tot:.6}, elas={elas:.6}"
             );
         }
