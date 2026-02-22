@@ -554,13 +554,21 @@ mod tests {
             (table.evaluate(2.0) - 2.0).abs() < 1e-10,
             "region 0 lin-lin"
         );
-        // Interval 1 ([10,100], INT=3 log-x/lin-y): x=31.62 ≈ sqrt(10*100) = geometric midpoint.
+        // Interval 1 ([3,10], INT=3 log-x/lin-y): x=5.
+        // y0==y1==3.0, so any interpolation mode yields 3.0 regardless.
+        // This verifies the region boundary is crossed correctly and that
+        // x=5 routes to interval 1 (not interval 0 or 2).
+        assert!(
+            (table.evaluate(5.0) - 3.0).abs() < 1e-10,
+            "region 1 INT=3 (constant y segment): x=5 should give 3.0"
+        );
+        // Interval 2 ([10,100], INT=3 log-x/lin-y): x=31.62 ≈ sqrt(10*100) = geometric midpoint.
         // INT=3: t = ln(x/x0) / ln(x1/x0) = ln(31.62/10) / ln(100/10) = ln(3.162)/ln(10) ≈ 0.5
         // y = y0 + t*(y1 - y0) = 3 + 0.5*(30 - 3) = 16.5
         let v = table.evaluate(31.62);
         assert!(
             (v - 16.5).abs() < 0.1,
-            "region 1 INT=3 at geometric midpoint: expected 16.5, got {v}"
+            "region 2 INT=3 at geometric midpoint: expected 16.5, got {v}"
         );
     }
 
