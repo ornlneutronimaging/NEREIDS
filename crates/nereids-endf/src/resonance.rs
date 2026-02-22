@@ -23,14 +23,18 @@ use serde::{Deserialize, Serialize};
 /// Stores piecewise-interpolated y(x) data.  Multiple interpolation regions
 /// are supported via ENDF NBT/INT boundary pairs.
 ///
-/// Interpolation law codes (ENDF INT):
-/// - 1: Histogram (y = y_left for all x in interval)
+/// Interpolation law codes (ENDF INT), per ENDF-6 Formats Manual §0.5:
+/// - 1: Histogram (y constant = y_left)
 /// - 2: Linear-linear
-/// - 3: Linear in x, log in y
-/// - 4: Log in x, linear in y
+/// - 3: Log in x, linear in y  (y linear in ln(x))
+/// - 4: Linear in x, log in y  (ln(y) linear in x)
 /// - 5: Log-log
 ///
-/// Reference: ENDF-6 Formats Manual §0.5; SAMMY `inp/minp2.f90`
+/// Verified against SAMMY OpenScale `CELibrary/Interpolate.h`:
+///   case 3 → `LinByLog` = log-x/linear-y
+///   case 4 → `LogByLin` = linear-x/log-y
+///
+/// Reference: ENDF-6 Formats Manual §0.5; SAMMY OpenScale `CELibrary/Interpolate.h`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tab1 {
     /// Interpolation region boundaries (NBT, 1-based index of the last point
@@ -84,19 +88,21 @@ impl Tab1 {
         match self.interp_code_for_interval(i - 1) {
             1 => y0, // histogram: constant left value
             3 => {
-                // lin-log: linear in x, log in y; requires y0, y1 > 0
-                if y0 > 0.0 && y1 > 0.0 {
-                    let t = (x - x0) / (x1 - x0);
-                    (y0.ln() + t * (y1.ln() - y0.ln())).exp()
+                // INT=3: y linear in ln(x) — log in x, linear in y.
+                // SAMMY OpenScale: case 3 → LinByLog (requires x0, x1, x > 0).
+                if x0 > 0.0 && x1 > 0.0 && x > 0.0 {
+                    let t = (x.ln() - x0.ln()) / (x1.ln() - x0.ln());
+                    y0 + t * (y1 - y0)
                 } else {
                     lin_lin()
                 }
             }
             4 => {
-                // log-lin: log in x, linear in y; requires x0, x1, x > 0
-                if x0 > 0.0 && x1 > 0.0 && x > 0.0 {
-                    let t = (x.ln() - x0.ln()) / (x1.ln() - x0.ln());
-                    y0 + t * (y1 - y0)
+                // INT=4: ln(y) linear in x — linear in x, log in y.
+                // SAMMY OpenScale: case 4 → LogByLin (requires y0, y1 > 0).
+                if y0 > 0.0 && y1 > 0.0 {
+                    let t = (x - x0) / (x1 - x0);
+                    (y0.ln() + t * (y1.ln() - y0.ln())).exp()
                 } else {
                     lin_lin()
                 }
@@ -579,15 +585,34 @@ mod tests {
         assert!((mid - 9.0).abs() < 0.01, "midpoint AP ≈ 9.0, got {mid}");
     }
 
-    /// Log-guard fallback: if a y-value is non-positive in a lin-log (INT=3)
-    /// interval, evaluate() must not panic or return NaN; it falls back to
-    /// lin-lin.
+    /// Log-guard fallback: if an x-coordinate is non-positive in an INT=3
+    /// (log-x, linear-y) interval, evaluate() falls back to lin-lin.
     #[test]
-    fn test_tab1_log_guard_nonpositive_y() {
-        // INT=3 (lin-log) with y0=0.0 — would call 0.0_f64.ln() = -inf without guard.
+    fn test_tab1_log_guard_nonpositive_x() {
+        // INT=3 (log in x, linear in y) with x0=0.0 — 0.0_f64.ln() = -inf without guard.
         let table = Tab1 {
             boundaries: vec![2],
-            interp_codes: vec![3], // lin-log
+            interp_codes: vec![3], // log in x, linear in y
+            points: vec![(0.0, 8.0), (10.0, 10.0)],
+        };
+        // x=0.0 is at the left boundary; evaluate() clamps to y=8.0 before interpolation.
+        assert!((table.evaluate(0.0) - 8.0).abs() < 1e-10);
+        // x=5.0 is interior; x0=0.0 triggers the log guard → lin-lin fallback.
+        let result = table.evaluate(5.0);
+        assert!(
+            result.is_finite(),
+            "fallback to lin-lin should give finite result, got {result}"
+        );
+    }
+
+    /// Log-guard fallback: if a y-value is non-positive in an INT=4
+    /// (linear-x, log-y) interval, evaluate() falls back to lin-lin.
+    #[test]
+    fn test_tab1_log_guard_nonpositive_y() {
+        // INT=4 (linear in x, log in y) with y0=0.0 — 0.0_f64.ln() = -inf without guard.
+        let table = Tab1 {
+            boundaries: vec![2],
+            interp_codes: vec![4], // linear in x, log in y
             points: vec![(1.0, 0.0), (10.0, 1.0)],
         };
         let result = table.evaluate(5.0);
@@ -597,24 +622,38 @@ mod tests {
         );
     }
 
-    /// Log-guard fallback: if an x-coordinate is non-positive in a log-lin (INT=4)
-    /// interval, evaluate() falls back to lin-lin rather than panicking.
+    /// INT=3 (log in x, linear in y): verify correct formula against analytic values.
     #[test]
-    fn test_tab1_log_guard_nonpositive_x() {
-        // INT=4 (log-lin) with x0=0.0 — would call 0.0_f64.ln() = -inf without guard.
+    fn test_tab1_logx_linear_y() {
+        // Points at x=1 (y=0) and x=100 (y=2.0).
+        // At x=10: t = ln(10)/ln(100) = 1/2, y = 0 + 0.5*2 = 1.0
         let table = Tab1 {
             boundaries: vec![2],
-            interp_codes: vec![4], // log-lin
-            points: vec![(0.0, 8.0), (10.0, 10.0)],
+            interp_codes: vec![3], // log in x, linear in y
+            points: vec![(1.0, 0.0), (100.0, 2.0)],
         };
-        // x=0.0 is at the left boundary, so evaluate() clamps to y=8.0 before
-        // reaching the interpolation branch — no guard needed there.
-        assert!((table.evaluate(0.0) - 8.0).abs() < 1e-10);
-        // x=5.0 is interior; x0=0.0 triggers the log guard → lin-lin fallback.
-        let result = table.evaluate(5.0);
+        let y = table.evaluate(10.0);
         assert!(
-            result.is_finite(),
-            "fallback to lin-lin should give finite result, got {result}"
+            (y - 1.0).abs() < 1e-12,
+            "INT=3 at geometric midpoint x=10: expected y=1.0, got {y}"
+        );
+    }
+
+    /// INT=4 (linear in x, log in y): verify correct formula against analytic values.
+    #[test]
+    fn test_tab1_linear_x_logy() {
+        // Points at x=0 (y=1) and x=2 (y=e²).
+        // At x=1 (midpoint): t=0.5, y = exp(0 + 0.5*2) = exp(1) = e
+        let e = std::f64::consts::E;
+        let table = Tab1 {
+            boundaries: vec![2],
+            interp_codes: vec![4], // linear in x, log in y
+            points: vec![(0.0, 1.0), (2.0, e * e)],
+        };
+        let y = table.evaluate(1.0);
+        assert!(
+            (y - e).abs() < 1e-12,
+            "INT=4 at midpoint x=1: expected y=e={e:.6}, got {y:.6}"
         );
     }
 }
