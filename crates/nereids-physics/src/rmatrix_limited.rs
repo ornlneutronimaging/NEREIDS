@@ -132,6 +132,7 @@ fn spin_group_cross_sections(
     let mut is_entrance = vec![false; nch];
     let mut is_fission = vec![false; nch];
     let mut is_capture = vec![false; nch]; // photon/gamma channels (MT=102)
+    let mut is_closed = vec![false; nch]; // channel below threshold (e_c ≤ 0)
 
     // Entrance-channel CM energy: E_cm = E_lab × AWR/(1+AWR).
     // Each exit channel adds its Q-value to get its own available energy.
@@ -164,6 +165,7 @@ fn spin_group_cross_sections(
                 p_c[c] = 0.0;
                 s_c[c] = 0.0;
                 phi_c[c] = 0.0;
+                is_closed[c] = true;
             } else {
                 // Channel wave number from reduced mass μ = MA·MB/(MA+MB).
                 // For elastic (MA=1, MB=AWR): k_c = wave_number(E_lab, AWR) [identical].
@@ -297,11 +299,20 @@ fn spin_group_cross_sections(
         .map(|c| {
             (0..nch)
                 .map(|cp| {
-                    // Guard against L_c = 0 (closed channel: P_c=0, S_c=B_c).
-                    // In this limit 1/L_c → ∞, effectively decoupling the channel.
-                    // We treat it as if 1/L_c = 0 (channel removed from active set).
-                    let inv_l = if l_c[c].norm() < 1e-30 {
-                        Complex64::ZERO
+                    // Closed-channel limit: L_c = (S_c − B_c) + i·P_c = 0 when
+                    // P_c = 0 and S_c = B_c (SHF=0, channel below threshold).
+                    // The correct physical limit is 1/L_c → ∞, NOT 0.
+                    //   • 1/L_c → ∞  ⇒  Ỹ[c,c] >> R[c,c]  ⇒  Ỹ⁻¹[c,c] ≈ L_c ≈ 0
+                    //     ⇒  XXXX ≈ 0 for closed channels: correct decoupling.
+                    //   • 1/L_c = 0  ⇒  Ỹ[c,c] = −R[c,c]  ⇒  Ỹ may be singular or
+                    //     dominated by off-diagonal R entries: wrong coupling.
+                    // Use a finite-but-large sentinel (1e30) to model the ∞ limit
+                    // without causing overflow in the matrix inversion.
+                    // Reference: SAMMY rml/mrml07.f — PH = 1/(S−B+iP); no explicit
+                    // guard because SAMMY avoids exact zero via analytic penetrability.
+                    let inv_l = if is_closed[c] {
+                        // L_c = 0: use large real sentinel so diagonal dominates.
+                        Complex64::new(1e30, 0.0)
                     } else {
                         Complex64::new(1.0, 0.0) / l_c[c]
                     };
@@ -334,8 +345,13 @@ fn spin_group_cross_sections(
     let sqrt_p: Vec<f64> = p_c.iter().map(|&x| x.sqrt()).collect();
     let xxxx: Vec<Vec<Complex64>> = (0..nch)
         .map(|c| {
-            // Guard against L_c = 0 (same as above).
-            let sqrt_p_over_l = if l_c[c].norm() < 1e-30 {
+            // For a closed channel: sqrt_p[c] = 0 and L_c = 0 (0/0 indeterminate).
+            // The full XXXX[c,cp] = (√P_c / L_c) · XQ[c,cp] · √P_c'.
+            // Since √P_c = 0 for any closed channel c, the entire row is zero
+            // regardless of the value of L_c. Setting sqrt_p_over_l = 0 is correct.
+            // (The Ỹ sentinel handles Ỹ inversion correctly; this row zeroing is
+            //  consistent: a closed channel contributes nothing to XXXX/U.)
+            let sqrt_p_over_l = if is_closed[c] {
                 Complex64::ZERO
             } else {
                 sqrt_p[c] / l_c[c]
