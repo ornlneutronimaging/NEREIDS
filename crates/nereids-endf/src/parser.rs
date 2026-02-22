@@ -676,10 +676,24 @@ fn parse_rmatrix_limited_range(
 /// Skip a TAB1 record (CONT + NR interpolation pairs + NP data pairs).
 fn skip_tab1(lines: &[&str], pos: &mut usize) -> Result<(), EndfParseError> {
     let cont = parse_cont(lines, pos)?;
+    if cont.n1 < 0 || cont.n2 < 0 {
+        return Err(EndfParseError::UnsupportedFormat(format!(
+            "TAB1 skip: negative count NR={} or NP={}",
+            cont.n1, cont.n2
+        )));
+    }
     let nr = cont.n1 as usize; // number of interpolation regions
     let np = cont.n2 as usize; // number of data points
-    *pos += (nr * 2).div_ceil(6); // NR×2 integer values (NBT, INT pairs)
-    *pos += (np * 2).div_ceil(6); // NP×2 float values (x, y pairs)
+    let nr_lines = (nr * 2).div_ceil(6); // NR×2 integer values (NBT, INT pairs)
+    let np_lines = (np * 2).div_ceil(6); // NP×2 float values (x, y pairs)
+    let needed = nr_lines + np_lines;
+    if *pos + needed > lines.len() {
+        return Err(EndfParseError::UnexpectedEof(format!(
+            "TAB1 skip needs {needed} lines but only {} remain",
+            lines.len() - *pos
+        )));
+    }
+    *pos += needed;
     Ok(())
 }
 
@@ -695,8 +709,21 @@ fn skip_tab1(lines: &[&str], pos: &mut usize) -> Result<(), EndfParseError> {
 fn skip_background_subrecord(lines: &[&str], pos: &mut usize) -> Result<(), EndfParseError> {
     let cont = parse_cont(lines, pos)?;
     let lbk_or_lps = cont.l1;
+    if cont.n1 < 0 {
+        return Err(EndfParseError::UnsupportedFormat(format!(
+            "Background sub-record skip: negative N1={}",
+            cont.n1
+        )));
+    }
     let n1 = cont.n1 as usize;
-    *pos += n1.div_ceil(6);
+    let list_lines = n1.div_ceil(6);
+    if *pos + list_lines > lines.len() {
+        return Err(EndfParseError::UnexpectedEof(format!(
+            "Background sub-record LIST needs {list_lines} lines but only {} remain",
+            lines.len() - *pos
+        )));
+    }
+    *pos += list_lines;
     if lbk_or_lps == 1 {
         skip_tab1(lines, pos)?;
         skip_tab1(lines, pos)?;
