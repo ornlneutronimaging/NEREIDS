@@ -132,6 +132,7 @@ fn spin_group_cross_sections(
     let mut is_entrance = vec![false; nch];
     let mut is_fission = vec![false; nch];
     let mut is_capture = vec![false; nch]; // photon/gamma channels (MT=102)
+    let mut is_inelastic = vec![false; nch]; // massive non-elastic/non-fission/non-capture (MT=51+)
     let mut is_closed = vec![false; nch]; // channel below threshold (e_c ≤ 0)
 
     // Entrance-channel CM energy: E_cm = E_lab × AWR/(1+AWR).
@@ -147,6 +148,10 @@ fn spin_group_cross_sections(
         is_entrance[c] = pp.mt == 2;
         is_fission[c] = pp.mt == 18;
         is_capture[c] = pp.mt == 102;
+        // Inelastic neutron channels (MT=51+): massive particle, not elastic/fission/capture.
+        // Their flux appears in σ_total (optical theorem) but must not be assigned to capture.
+        // Reference: ENDF MT number conventions, §3.4; SAMMY rml/mrml11.f Sectio.
+        is_inelastic[c] = pp.ma >= 0.5 && !is_entrance[c] && !is_fission[c] && !is_capture[c];
 
         if pp.ma < 0.5 {
             // Photon channel (MA = 0): P=1, S=0, φ=0.
@@ -416,6 +421,7 @@ fn spin_group_cross_sections(
     let mut elas = 0.0;
     let mut cap = 0.0;
     let mut fis = 0.0;
+    let mut inel = 0.0; // inelastic neutron channels (MT=51+): tracked separately
 
     // Whether this spin group has explicit capture (photon) channels in the
     // level matrix.  KRM=2 with photon channels: yes.  KRM=3: no (capture is
@@ -443,15 +449,23 @@ fn spin_group_cross_sections(
                 // Reference: SAMMY rml/mrml11.f Sectio — explicit sum over γ channels.
                 cap += pok2 * g_j * u[c0][cp].norm_sqr();
             }
+            if is_inelastic[cp] {
+                // σ_inelastic: |U_{c0,c'}|² for inelastic neutron channels (MT=51+).
+                // Tracked separately so KRM=3 capture residual excludes this flux.
+                // Reference: ENDF MT conventions §3.4; SAMMY rml/mrml11.f Sectio.
+                inel += pok2 * g_j * u[c0][cp].norm_sqr();
+            }
         }
     }
 
     if krm == 3 && !has_explicit_capture {
         // KRM=3 (Reich-Moore approximation): capture is implicit via complex poles
-        // (Ẽ_n = E_n - i·Γγ/2).  Flux not going to elastic or fission must be capture.
+        // (Ẽ_n = E_n - i·Γγ/2).  Flux not going to elastic, fission, or inelastic
+        // channels is capture.  Inelastic flux must be excluded; folding it into
+        // capture would mislabel σ_capture when MT=51+ channels are present.
         // Clamp to ≥0 for floating-point safety near pole energies.
         // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml11.f Sectio.
-        cap = (tot - elas - fis).max(0.0);
+        cap = (tot - elas - fis - inel).max(0.0);
     }
     // KRM=2: capture was accumulated explicitly above from MT=102 channels.
     // Do NOT add residual flux — it may include inelastic (MT=51+) contributions
