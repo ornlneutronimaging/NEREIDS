@@ -318,8 +318,8 @@ fn parse_reich_moore_range(
 ///         NCH × 6 values: [IPP, L, SCH, BND, APE, APT] per channel
 ///
 ///   LIST: [0, 0, 0, 0, NPL, NRS]                    ← resonance parameters
-///         Stride = NPL/NRS (≥ NCH+1; may be 6 for KRM=3 padding).
-///         Per resonance: [ER, γ_1, ..., γ_NCH, <padding zeros>]
+///         KRM=2: stride ≥ NCH+1; per resonance: [ER, γ_1, ..., γ_NCH, <padding>]
+///         KRM=3: stride ≥ NCH+2; per resonance: [ER, Γγ, Γ_1, ..., Γ_NCH, <padding>]
 /// ```
 ///
 /// Reference: ENDF-6 Formats Manual §2.2.1.6; SAMMY rml/mrml01.f
@@ -536,10 +536,19 @@ fn parse_rmatrix_limited_range(
         let res_values = parse_list_values(lines, pos, res_npl)?;
 
         // C4: Validate stride before use — NPL must divide evenly by NRS, and each row
-        // must be at least NCH+1 values wide (energy + NCH widths).
-        // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f resonance loop.
+        // must be at least min_stride values wide.
+        //
+        // KRM=2: per-resonance layout is [ER, Γ_1, ..., Γ_NCH, <padding>]
+        //        → min_stride = NCH+1 (energy + NCH reduced width amplitudes)
+        // KRM=3: per-resonance layout is [ER, Γγ, Γ_1, ..., Γ_NCH, <padding>]
+        //        → min_stride = NCH+2 (energy + Gamgam + NCH partial widths)
+        //
+        // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f ENDF123 subroutine —
+        //   reads Gamgam at position 1 (immediately after ER), then
+        //   (Gamma,I=1,Ichan) at positions 2..NCH+1.
+        let min_stride = if krm == 3 { nch + 2 } else { nch + 1 };
         let stride = if nrs == 0 {
-            nch + 1 // no resonances; stride unused
+            min_stride // no resonances; stride unused
         } else {
             if res_npl % nrs != 0 {
                 return Err(EndfParseError::UnsupportedFormat(format!(
@@ -547,10 +556,11 @@ fn parse_rmatrix_limited_range(
                 )));
             }
             let s = res_npl / nrs;
-            if s < nch + 1 {
+            if s < min_stride {
                 return Err(EndfParseError::UnsupportedFormat(format!(
-                    "LRF=7 resonance stride={s} < NCH+1={} (NPL={res_npl}, NRS={nrs})",
-                    nch + 1
+                    "LRF=7 resonance stride={s} < {}={min_stride} \
+                     (KRM={krm}, NPL={res_npl}, NRS={nrs})",
+                    if krm == 3 { "NCH+2" } else { "NCH+1" }
                 )));
             }
             s
@@ -558,25 +568,25 @@ fn parse_rmatrix_limited_range(
         let mut resonances = Vec::with_capacity(nrs);
         for r in 0..nrs {
             let b = r * stride;
-            // Only the first NCH values after ER are widths; remainder is padding or gamma_gamma.
-            let widths: Vec<f64> = res_values[b + 1..b + 1 + nch].to_vec();
-            // KRM=3 (Reich-Moore approximation): an extra Γ_γ (capture width, eV) is
-            // stored at position b+1+nch, immediately after the NCH partial widths,
-            // when the resonance row has a dedicated Γγ slot (stride > nch+1).
-            // This capture width is used to form complex pole energies:
-            //   Ẽ_n = E_n - i·Γ_γ/2
-            // For KRM=2 (standard R-matrix), gamma_gamma = 0.0.
+            // Parse resonance row according to KRM column order.
             //
-            // P1 fix: the bound must be row-local, not global.  The old check
-            // `b + 1 + nch < res_values.len()` is true for every non-final
-            // resonance even when stride == nch+1 (no Γγ column), causing the
-            // code to read the *next* row's ER as gamma_gamma.  Guard instead on
-            // whether the current row's layout actually includes a Γγ slot.
-            // Reference: SAMMY rml/mrml01.f ENDF123 — reads Gamgam then (Gamma,I=1,Ichan).
-            let gamma_gamma = if krm == 3 && stride > nch + 1 {
-                res_values[b + 1 + nch]
+            // KRM=2: [ER, γ_1, ..., γ_NCH, <padding>]
+            //   widths (reduced amplitudes γ) start at b+1.
+            //   No capture width column; gamma_gamma = 0.
+            //
+            // KRM=3: [ER, Γγ, Γ_1, ..., Γ_NCH, <padding>]
+            //   Gamgam (radiation width, eV) is at b+1.
+            //   Partial widths Γ_c start at b+2.
+            //   Gamgam forms complex pole energies: Ẽ_n = E_n - i·Γγ/2.
+            //
+            // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f ENDF123 subroutine.
+            let (widths, gamma_gamma) = if krm == 3 {
+                let gamma_gamma = res_values[b + 1]; // Gamgam at position 1
+                let widths = res_values[b + 2..b + 2 + nch].to_vec(); // Γ_c at positions 2..NCH+1
+                (widths, gamma_gamma)
             } else {
-                0.0
+                // KRM=2: widths immediately follow ER; no capture-width column.
+                (res_values[b + 1..b + 1 + nch].to_vec(), 0.0)
             };
             resonances.push(RmlResonance {
                 energy: res_values[b],
@@ -979,6 +989,99 @@ mod tests {
             "  L=0: {} resonances, L=1: {} resonances",
             l0.resonances.len(),
             range.l_groups[1].resonances.len()
+        );
+    }
+
+    /// Verify KRM=3 resonance column order (offline fixture — no network needed).
+    ///
+    /// For KRM=3 the per-resonance ENDF layout is [ER, Γγ, Γ_1, ..., Γ_NCH, padding].
+    /// The regression checks that `gamma_gamma` comes from position b+1 (Γγ) and
+    /// `widths[0]` from position b+2 (Γ_1), NOT the other way round.
+    ///
+    /// Constructed values:
+    ///   res0: ER=10 eV, Γγ=0.025 eV, Γ_1=0.001 eV
+    ///   res1: ER=20 eV, Γγ=0.030 eV, Γ_1=0.002 eV
+    ///
+    /// The fixture is a minimal but fully valid ENDF MF=2/MT=151 block:
+    ///   1 isotope, 1 energy range, LRF=7, KRM=3, 1 particle pair, 1 spin group,
+    ///   2 resonances, NCH=1 (single elastic neutron channel).
+    #[test]
+    fn test_krm3_resonance_column_order() {
+        // Each ENDF line is exactly 80 chars:
+        //   positions  0-65: six 11-char data fields
+        //   positions 66-69: MAT (4 chars)
+        //   positions 70-71: MF (2 chars)
+        //   positions 72-74: MT (3 chars)
+        //   positions 75-79: NS (5 chars)
+        //
+        // Floats use Fortran notation, e.g. "1.000000+1" = 1e1 = 10.0.
+        // Integer fields written as right-justified 11-char strings.
+        const ENDF: &str = concat!(
+            // ── HEAD: ZA=74184, AWR=182, NIS=1 ──────────────────────────────
+            " 7.418400+4 1.820000+2          0          0          1          07437 2151    1\n",
+            // ── Isotope CONT: NER=1 ──────────────────────────────────────────
+            " 7.418400+4 1.000000+0          0          0          1          07437 2151    2\n",
+            // ── Range CONT: EL=1e-5, EH=1e3, LRU=1, LRF=7, NRO=0, NAPS=0 ──
+            " 1.000000-5 1.000000+3          1          7          0          07437 2151    3\n",
+            // ── LRF=7 CONT: SPI=0, AP=0.7, IFG=0, KRM=3, NJS=1, KRL=0 ─────
+            " 0.000000+0 7.000000-1          0          3          1          07437 2151    4\n",
+            // ── Particle-pair LIST CONT: NPP=1, NPL=12 ───────────────────────
+            " 0.000000+0 0.000000+0          1          0         12          17437 2151    5\n",
+            // Particle pair 1: MA=1, MB=182, ZA=0, ZB=0, IA=0.5, IB=0
+            " 1.000000+0 1.820000+2 0.000000+0 0.000000+0 5.000000-1 0.000000+07437 2151    6\n",
+            // Q=0, PNT=1, SHF=0, MT=2, PA=1, PB=1
+            " 0.000000+0 1.000000+0 0.000000+0 2.000000+0 1.000000+0 1.000000+07437 2151    7\n",
+            // ── Spin-group LIST CONT: AJ=0.5, KBK=0, KPS=0, NPL=12, NCH+1=2
+            " 5.000000-1 0.000000+0          0          0         12          27437 2151    8\n",
+            // Header row (6 zeros, ignored by parser)
+            " 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+07437 2151    9\n",
+            // Channel 0: IPP=1, L=0, SCH=0.5, BND=0, APE=0.7, APT=0.7
+            " 1.000000+0 0.000000+0 5.000000-1 0.000000+0 7.000000-1 7.000000-17437 2151   10\n",
+            // ── Resonance LIST CONT: NPL=12, NRS=2 ───────────────────────────
+            " 0.000000+0 0.000000+0          0          0         12          27437 2151   11\n",
+            // res0: ER=10 eV, Γγ=0.025 eV, Γ_1=0.001 eV, (3 padding zeros)
+            " 1.000000+1 2.500000-2 1.000000-3 0.000000+0 0.000000+0 0.000000+07437 2151   12\n",
+            // res1: ER=20 eV, Γγ=0.030 eV, Γ_1=0.002 eV, (3 padding zeros)
+            " 2.000000+1 3.000000-2 2.000000-3 0.000000+0 0.000000+0 0.000000+07437 2151   13\n",
+        );
+
+        let data = parse_endf_file2(ENDF).expect("fixture must parse without error");
+        let rml = data.ranges[0].rml.as_ref().expect("LRF=7 range must have RmlData");
+        let sg = &rml.spin_groups[0];
+
+        assert_eq!(sg.resonances.len(), 2, "spin group must have 2 resonances");
+
+        let res0 = &sg.resonances[0];
+        assert!(
+            (res0.energy - 10.0).abs() < 1e-10,
+            "res0 energy must be 10.0 eV, got {}",
+            res0.energy
+        );
+        // The critical assertions: Γγ must come from column b+1, Γ_1 from column b+2.
+        // With the old (buggy) code these two values were swapped.
+        assert!(
+            (res0.gamma_gamma - 0.025).abs() < 1e-10,
+            "res0 gamma_gamma must be 0.025 eV (Gamgam at b+1), got {}",
+            res0.gamma_gamma
+        );
+        assert_eq!(res0.widths.len(), 1, "NCH=1 so widths must have 1 element");
+        assert!(
+            (res0.widths[0] - 0.001).abs() < 1e-10,
+            "res0 widths[0] must be 0.001 eV (Γ_1 at b+2), got {}",
+            res0.widths[0]
+        );
+
+        let res1 = &sg.resonances[1];
+        assert!((res1.energy - 20.0).abs() < 1e-10, "res1 energy must be 20.0 eV");
+        assert!(
+            (res1.gamma_gamma - 0.030).abs() < 1e-10,
+            "res1 gamma_gamma must be 0.030 eV, got {}",
+            res1.gamma_gamma
+        );
+        assert!(
+            (res1.widths[0] - 0.002).abs() < 1e-10,
+            "res1 widths[0] must be 0.002 eV, got {}",
+            res1.widths[0]
         );
     }
 
