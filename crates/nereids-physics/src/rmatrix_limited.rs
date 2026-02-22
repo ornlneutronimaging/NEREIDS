@@ -260,7 +260,10 @@ fn spin_group_cross_sections(
                         } else {
                             let redmas = pp_c.ma * pp_c.mb / (pp_c.ma + pp_c.mb);
                             let k_cn = channel::wave_number_from_cm(e_cm_n, redmas);
-                            Some(penetrability::penetrability(ch.l, k_cn * ch.effective_radius))
+                            Some(penetrability::penetrability(
+                                ch.l,
+                                k_cn * ch.effective_radius,
+                            ))
                         }
                     };
                     match p_at_en {

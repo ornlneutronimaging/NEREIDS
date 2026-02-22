@@ -487,7 +487,10 @@ mod tests {
         // S_1(i·0.5) = −1/(1−0.25) = −4/3
         let expected = -4.0 / 3.0;
         let got = shift_factor_closed(1, 0.5);
-        assert!((got - expected).abs() < 1e-12, "got {got}, expected {expected}");
+        assert!(
+            (got - expected).abs() < 1e-12,
+            "got {got}, expected {expected}"
+        );
     }
 
     #[test]
@@ -497,7 +500,10 @@ mod tests {
         // den = 9−3·0.25+0.0625 = 9−0.75+0.0625 = 8.3125
         let expected = -17.25 / 8.3125;
         let got = shift_factor_closed(2, 0.5);
-        assert!((got - expected).abs() < 1e-12, "got {got}, expected {expected}");
+        assert!(
+            (got - expected).abs() < 1e-12,
+            "got {got}, expected {expected}"
+        );
     }
 
     #[test]
