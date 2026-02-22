@@ -418,6 +418,19 @@ impl ResonanceRange {
     }
 }
 
+impl std::fmt::Display for ResonanceData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ResonanceData(ZA={}, AWR={:.4}, ranges={}, total_resonances={})",
+            self.za,
+            self.awr,
+            self.ranges.len(),
+            self.total_resonance_count()
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,18 +550,5 @@ mod tests {
         // At 500.5 eV (midpoint): 9.0 fm
         let mid = range.scattering_radius_at(500.5);
         assert!((mid - 9.0).abs() < 0.01, "midpoint AP ≈ 9.0, got {mid}");
-    }
-}
-
-impl std::fmt::Display for ResonanceData {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "ResonanceData(ZA={}, AWR={:.4}, ranges={}, total_resonances={})",
-            self.za,
-            self.awr,
-            self.ranges.len(),
-            self.total_resonance_count()
-        )
     }
 }
