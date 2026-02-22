@@ -518,28 +518,30 @@ mod tests {
         assert_eq!(table.evaluate(7.5), 20.0, "histogram: second interval");
     }
 
-    /// Two-region table: lin-lin for low energies, lin-log for high.
+    /// Two-region table: lin-lin for low energies, log-x/lin-y (INT=3) for high.
     #[test]
     fn test_tab1_multiregion() {
         // Region 0 (INT=2, lin-lin): points 0..2  (NBT=2)
-        // Region 1 (INT=3, lin-log): points 2..4  (NBT=4)
+        // Region 1 (INT=3, log in x / linear in y): points 2..4  (NBT=4)
         // Points: (1,1), (3,3), (10,3), (100,30)
         let table = Tab1 {
             boundaries: vec![2, 4],
             interp_codes: vec![2, 3],
             points: vec![(1.0, 1.0), (3.0, 3.0), (10.0, 3.0), (100.0, 30.0)],
         };
-        // Interval 0 ([1,3], INT=2): x=2 → lin-lin: 1 + (2-1)/(3-1) * (3-1) = 2
+        // Interval 0 ([1,3], INT=2 lin-lin): x=2 → 1 + (2-1)/(3-1) * (3-1) = 2
         assert!(
             (table.evaluate(2.0) - 2.0).abs() < 1e-10,
             "region 0 lin-lin"
         );
-        // Interval 2 ([10,100], INT=3 lin-log): x=31.62 (~sqrt(10*100))
-        // t = (31.62-10)/(100-10) = 0.2402
-        // y = exp(ln3 + 0.2402*(ln30 - ln3)) = exp(1.0986 + 0.2402*2.3026) = exp(1.6522) ≈ 5.22
-        // Not exact; just verify result is strictly between 3 and 30.
+        // Interval 1 ([10,100], INT=3 log-x/lin-y): x=31.62 ≈ sqrt(10*100) = geometric midpoint.
+        // INT=3: t = ln(x/x0) / ln(x1/x0) = ln(31.62/10) / ln(100/10) = ln(3.162)/ln(10) ≈ 0.5
+        // y = y0 + t*(y1 - y0) = 3 + 0.5*(30 - 3) = 16.5
         let v = table.evaluate(31.62);
-        assert!(v > 3.0 && v < 30.0, "region 1 lin-log: {v}");
+        assert!(
+            (v - 16.5).abs() < 0.1,
+            "region 1 INT=3 at geometric midpoint: expected 16.5, got {v}"
+        );
     }
 
     /// scattering_radius_at falls back to constant when ap_table is None.

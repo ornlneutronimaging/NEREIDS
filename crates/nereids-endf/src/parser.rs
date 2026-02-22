@@ -856,7 +856,7 @@ fn skip_unresolved_range(lines: &[&str], pos: &mut usize, _lrf: i32) -> Result<(
 /// NP×2 float values:   (x_i,   y_i)   pairs  — 6 per line
 /// ```
 ///
-/// INT codes: 1=histogram, 2=lin-lin, 3=lin-log, 4=log-lin, 5=log-log.
+/// INT codes: 1=histogram, 2=lin-lin, 3=log-x/lin-y, 4=lin-x/log-y, 5=log-log.
 fn parse_tab1(lines: &[&str], pos: &mut usize) -> Result<Tab1, EndfParseError> {
     let cont = parse_cont(lines, pos)?;
     let nr = cont.n1 as usize; // number of interpolation regions
