@@ -62,6 +62,13 @@ impl Tab1 {
     pub fn evaluate(&self, x: f64) -> f64 {
         let pts = &self.points;
         if pts.is_empty() {
+            // The parser rejects NP=0, so an empty table indicates a bug in
+            // test-code construction.  Panic in debug builds; return 0.0 in
+            // release to avoid UB.
+            debug_assert!(
+                !pts.is_empty(),
+                "Tab1::evaluate called with empty points table"
+            );
             return 0.0;
         }
         if x <= pts[0].0 {

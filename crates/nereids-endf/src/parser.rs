@@ -929,11 +929,31 @@ fn parse_tab1(lines: &[&str], pos: &mut usize) -> Result<Tab1, EndfParseError> {
         }
     }
 
+    if np == 0 {
+        return Err(EndfParseError::UnsupportedFormat(
+            "TAB1 NP=0: table must have at least one point".to_string(),
+        ));
+    }
+
     // Read NP×2 floats: (E, AP) pairs.
     let data_raw = parse_list_values(lines, pos, np * 2)?;
     let mut points = Vec::with_capacity(np);
     for i in 0..np {
-        points.push((data_raw[i * 2], data_raw[i * 2 + 1]));
+        let x = data_raw[i * 2];
+        let y = data_raw[i * 2 + 1];
+        // x-values must be strictly increasing; Tab1::evaluate() relies on this.
+        if let Some(&(x_prev, _)) = points.last()
+            && x <= x_prev
+        {
+            return Err(EndfParseError::UnsupportedFormat(format!(
+                "TAB1 x[{}]={} is not greater than x[{}]={} (x must be strictly increasing)",
+                i,
+                x,
+                i - 1,
+                x_prev
+            )));
+        }
+        points.push((x, y));
     }
 
     Ok(Tab1 {
