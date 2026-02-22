@@ -689,7 +689,7 @@ mod tests {
     /// Verify W-184 cross-sections show resonance structure.
     ///
     /// Downloads W-184 ENDF/B-VIII.0, parses LRF=7 parameters,
-    /// then checks that σ_total at the first resonance (~7.6 eV) is
+    /// then checks that σ_total at the first resonance (~101.9 eV) is
     /// significantly larger than the background off-resonance.
     ///
     /// Run with: cargo test -p nereids-physics -- --ignored test_w184_cross_section_peak

@@ -580,12 +580,35 @@ fn parse_rmatrix_limited_range(
             //   Gamgam forms complex pole energies: Ẽ_n = E_n - i·Γγ/2.
             //
             // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f ENDF123 subroutine.
+            //
+            // Bounds safety: stride ≥ min_stride (verified above), b = r·stride,
+            // and r < nrs, so b + stride ≤ res_npl = res_values.len().
+            // For KRM=3: b+2+nch ≤ b+min_stride ≤ b+stride; guaranteed in bounds.
+            // For KRM=2: b+1+nch ≤ b+min_stride ≤ b+stride; guaranteed in bounds.
+            // Explicit error checks below make the safety locally verifiable and
+            // guard against future changes that might weaken the stride invariant.
             let (widths, gamma_gamma) = if krm == 3 {
+                let need = b + 2 + nch;
+                if need > res_values.len() {
+                    return Err(EndfParseError::UnsupportedFormat(format!(
+                        "LRF=7 KRM=3 resonance row {r}: need {need} values, \
+                         have {} (stride={stride}, NCH={nch})",
+                        res_values.len()
+                    )));
+                }
                 let gamma_gamma = res_values[b + 1]; // Gamgam at position 1
                 let widths = res_values[b + 2..b + 2 + nch].to_vec(); // Γ_c at positions 2..NCH+1
                 (widths, gamma_gamma)
             } else {
                 // KRM=2: widths immediately follow ER; no capture-width column.
+                let need = b + 1 + nch;
+                if need > res_values.len() {
+                    return Err(EndfParseError::UnsupportedFormat(format!(
+                        "LRF=7 KRM=2 resonance row {r}: need {need} values, \
+                         have {} (stride={stride}, NCH={nch})",
+                        res_values.len()
+                    )));
+                }
                 (res_values[b + 1..b + 1 + nch].to_vec(), 0.0)
             };
             resonances.push(RmlResonance {
