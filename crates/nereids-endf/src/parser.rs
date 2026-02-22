@@ -334,6 +334,18 @@ fn parse_rmatrix_limited_range(
     let cont = parse_cont(lines, pos)?;
     let target_spin = cont.c1;
     let scattering_radius = cont.c2;
+    // IFG (L1): radius unit flag.
+    //   IFG=0: AP, APE, APT are in fm (10⁻¹² cm) — universal in ENDF/B-VIII.0.
+    //   IFG=1: radii are in units of ℏ/k (energy-dependent) — not supported here.
+    // SAMMY's WriteRrEndf.cpp always writes IFG=0 and its reader never checks it,
+    // confirming IFG=1 is not used in practice.
+    // Reference: ENDF-6 §2.2.1.6; SAMMY ndf/WriteRrEndf.cpp line 363.
+    let ifg = cont.l1;
+    if ifg != 0 {
+        return Err(EndfParseError::UnsupportedFormat(format!(
+            "LRF=7 IFG={ifg} (energy-dependent radii) is not supported (only IFG=0)"
+        )));
+    }
     let krm = cont.l2 as u32; // R-matrix type: 2=standard, 3=Reich-Moore approx
     // P2: Validate KRM at parse time so the physics code never sees an unknown type.
     // KRM=0/1/4 are defined in the ENDF spec but not supported here.
@@ -344,6 +356,17 @@ fn parse_rmatrix_limited_range(
         )));
     }
     let njs = cont.n1 as usize; // number of spin groups
+    // KRL (N2): kinematics flag.
+    //   KRL=0: non-relativistic kinematics — universal in ENDF/B-VIII.0.
+    //   KRL=1: relativistic kinematics — not supported here.
+    // SAMMY's WriteRrEndf.cpp always writes KRL=0.
+    // Reference: ENDF-6 §2.2.1.6; SAMMY ndf/WriteRrEndf.cpp line 366.
+    let krl = cont.n2;
+    if krl != 0 {
+        return Err(EndfParseError::UnsupportedFormat(format!(
+            "LRF=7 KRL={krl} (relativistic kinematics) is not supported (only KRL=0)"
+        )));
+    }
 
     // LIST: [0, 0, NPP, 0, 12*NPP, NPP]  — particle pair definitions
     // NPP is authoritative in L1; N2 is nominally equal but can encode a
