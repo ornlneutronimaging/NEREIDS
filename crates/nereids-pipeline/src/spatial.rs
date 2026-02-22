@@ -215,6 +215,7 @@ mod tests {
                     }],
                 }],
                 rml: None,
+                ap_table: None,
             }],
         }
     }

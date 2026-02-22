@@ -128,11 +128,12 @@ fn cross_sections_for_range(
         let l = l_group.l;
         let awr_l = if l_group.awr > 0.0 { l_group.awr } else { awr };
 
-        // Channel radius: use L-dependent radius if available, else range radius.
+        // Channel radius: use L-dependent radius if available, else the
+        // energy-dependent (or constant) global radius from the range.
         let channel_radius = if l_group.apl > 0.0 {
             l_group.apl
         } else {
-            range.scattering_radius
+            range.scattering_radius_at(energy_ev)
         };
 
         // Compute channel parameters at this energy.
@@ -714,6 +715,7 @@ mod tests {
                     }],
                 }],
                 rml: None,
+                ap_table: None,
             }],
         }
     }
