@@ -154,6 +154,7 @@ mod tests {
                         gfb: 0.0,
                     }],
                 }],
+                rml: None,
             }],
         }
     }

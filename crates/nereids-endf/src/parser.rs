@@ -80,8 +80,10 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
             let lrf = range_cont.l2; // resonance formalism
 
             if lru == 2 {
-                // Unresolved resonance region — skip for now.
-                // We need to skip all lines in this subsection.
+                // Unresolved resonance region (LRU=2) — parse past but do not evaluate.
+                // URR uses average level-spacing/width parameters and probability tables
+                // rather than discrete resonances.  SAMMY implements URR cross-sections
+                // via urr/murr*.f90.  Tracked in issue #44.
                 skip_unresolved_range(&lines, &mut pos, lrf)?;
                 continue;
             }
@@ -96,7 +98,12 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
             let nro = range_cont.n1; // energy-dependent scattering radius flag
             let _naps = range_cont.n2; // scattering radius calculation flag
 
-            // If NRO != 0, there's a TAB1 record for energy-dependent radius.
+            // If NRO != 0, there's a TAB1 record for energy-dependent scattering
+            // radius AP(E).  We parse past it but do not apply it — the constant AP
+            // from the CONT header is used instead.  This is a known silent inaccuracy:
+            // cross-sections in ranges with NRO=1 may have a slightly wrong potential
+            // scattering background.  SAMMY correctly interpolates AP(E); tracked in
+            // issue #43.
             if nro != 0 {
                 skip_tab1(&lines, &mut pos)?;
             }
@@ -130,11 +137,15 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
                     let range = parse_reich_moore_range(&lines, &mut pos, energy_low, energy_high)?;
                     all_ranges.push(range);
                 }
-                _ => {
-                    return Err(EndfParseError::UnsupportedFormat(format!(
-                        "Formalism {:?} parsing not yet implemented",
-                        formalism
-                    )));
+                ResonanceFormalism::RMatrixLimited => {
+                    let range = parse_rmatrix_limited_range(
+                        &lines,
+                        &mut pos,
+                        energy_low,
+                        energy_high,
+                        awr,
+                    )?;
+                    all_ranges.push(range);
                 }
             }
         }
@@ -215,6 +226,7 @@ fn parse_bw_range(
         target_spin,
         scattering_radius,
         l_groups,
+        rml: None,
     })
 }
 
@@ -284,7 +296,387 @@ fn parse_reich_moore_range(
         target_spin,
         scattering_radius,
         l_groups,
+        rml: None,
     })
+}
+
+/// Parse an R-Matrix Limited (LRF=7) resolved resonance range.
+///
+/// ## ENDF-6 Record Layout (File 2, MT=151, after range CONT + optional TAB1)
+///
+/// ```text
+/// CONT:  [SPI, AP, IFG, KRM, NJS, KRL]
+///        SPI = target spin, AP = global scattering radius (fm),
+///        NJS = number of spin groups (J,π)
+///
+/// LIST:  [0, 0, NPP, 0, 12*NPP, NPP]   ← particle pair definitions
+///        12 values per pair: [MA, MB, ZA, ZB, IA, IB, Q, PNT, SHF, MT, PA, PB]
+///
+/// For each spin group j = 1..NJS:
+///   LIST: [AJ, PJ, KBK, KPS, 6*(NCH+1), NCH+1]   ← header + channels
+///         First 6 values: header row [0, 0, 0, 0, 0, NCH]
+///         NCH × 6 values: [IPP, L, SCH, BND, APE, APT] per channel
+///
+///   LIST: [0, 0, 0, 0, NPL, NRS]                    ← resonance parameters
+///         KRM=2: stride ≥ NCH+1; per resonance: [ER, γ_1, ..., γ_NCH, <padding>]
+///         KRM=3: stride ≥ NCH+2; per resonance: [ER, Γγ, Γ_1, ..., Γ_NCH, <padding>]
+/// ```
+///
+/// Reference: ENDF-6 Formats Manual §2.2.1.6; SAMMY rml/mrml01.f
+fn parse_rmatrix_limited_range(
+    lines: &[&str],
+    pos: &mut usize,
+    energy_low: f64,
+    energy_high: f64,
+    awr: f64,
+) -> Result<ResonanceRange, EndfParseError> {
+    // CONT: [SPI, AP, IFG, KRM, NJS, KRL]
+    let cont = parse_cont(lines, pos)?;
+    let target_spin = cont.c1;
+    let scattering_radius = cont.c2;
+    // IFG (L1): radius unit flag.
+    //   IFG=0: AP, APE, APT are in fm (10⁻¹² cm) — universal in ENDF/B-VIII.0.
+    //   IFG=1: radii are in units of ℏ/k (energy-dependent) — not supported here.
+    // SAMMY's WriteRrEndf.cpp always writes IFG=0 and its reader never checks it,
+    // confirming IFG=1 is not used in practice.
+    // Reference: ENDF-6 §2.2.1.6; SAMMY ndf/WriteRrEndf.cpp line 363.
+    let ifg = cont.l1;
+    if ifg != 0 {
+        return Err(EndfParseError::UnsupportedFormat(format!(
+            "LRF=7 IFG={ifg} (energy-dependent radii) is not supported (only IFG=0)"
+        )));
+    }
+    let krm = cont.l2 as u32; // R-matrix type: 2=standard, 3=Reich-Moore approx
+    // P2: Validate KRM at parse time so the physics code never sees an unknown type.
+    // KRM=0/1/4 are defined in the ENDF spec but not supported here.
+    // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f KRM field.
+    if krm != 2 && krm != 3 {
+        return Err(EndfParseError::UnsupportedFormat(format!(
+            "LRF=7 KRM={krm} is not supported (only KRM=2 and KRM=3)"
+        )));
+    }
+    let njs = cont.n1 as usize; // number of spin groups
+    // KRL (N2): kinematics flag.
+    //   KRL=0: non-relativistic kinematics — universal in ENDF/B-VIII.0.
+    //   KRL=1: relativistic kinematics — not supported here.
+    // SAMMY's WriteRrEndf.cpp always writes KRL=0.
+    // Reference: ENDF-6 §2.2.1.6; SAMMY ndf/WriteRrEndf.cpp line 366.
+    let krl = cont.n2;
+    if krl != 0 {
+        return Err(EndfParseError::UnsupportedFormat(format!(
+            "LRF=7 KRL={krl} (relativistic kinematics) is not supported (only KRL=0)"
+        )));
+    }
+
+    // LIST: [0, 0, NPP, 0, 12*NPP, NPP]  — particle pair definitions
+    // NPP is authoritative in L1; N2 is nominally equal but can encode a
+    // different count in some files (e.g. N2 = 2*NPP).  Always derive from L1.
+    // Reference: ENDF-6 Formats Manual §2.2.1.6 Table 2.1.
+    let pp_cont = parse_cont(lines, pos)?;
+    let npp = pp_cont.l1 as usize;
+    let pp_values = parse_list_values(lines, pos, npp * 12)?;
+
+    let mut particle_pairs = Vec::with_capacity(npp);
+    for i in 0..npp {
+        let b = i * 12;
+        particle_pairs.push(ParticlePair {
+            ma: pp_values[b],
+            mb: pp_values[b + 1],
+            za: pp_values[b + 2],
+            zb: pp_values[b + 3],
+            ia: pp_values[b + 4],
+            ib: pp_values[b + 5],
+            q: pp_values[b + 6],
+            pnt: pp_values[b + 7] as i32,
+            shf: pp_values[b + 8] as i32,
+            mt: pp_values[b + 9] as u32,
+            pa: pp_values[b + 10],
+            pb: pp_values[b + 11],
+        });
+    }
+
+    // Particle-pair capability validation.
+    // Reject early with a clear error rather than silently computing wrong results.
+    // Consistent with KBK/KPS rejection above.
+    for (i, pp) in particle_pairs.iter().enumerate() {
+        // PNT semantics (SAMMY rml/mrml01.f, stored as Lpent):
+        //   PNT=0 → penetrability NOT calculated (photon/fission channels, MA=0)
+        //   PNT=1 → penetrability calculated analytically (neutron elastic, MA=1)
+        // Both values are fully supported: the physics code uses pp.ma to distinguish
+        // the two cases (see rmatrix_limited.rs).  No rejection needed.
+        //
+        // SHF semantics (SAMMY rml/mrml01.f, stored as Ishift):
+        //   SHF=0 → shift factor NOT calculated; S_c = B_c (boundary condition)
+        //   SHF=1 → shift factor calculated analytically
+        // Both values are fully supported: rmatrix_limited.rs respects pp.shf.
+        // Reference: ENDF-6 Formats Manual §2.2.1.6; SAMMY rml/mrml07.f Pgh subroutine.
+
+        // Coulomb channels: both particles carry charge (ZA ≠ 0 and ZB ≠ 0).
+        // Per ENDF-6 §2.2.1.6 Table 2.2, ZA = Z·A of the particle; ZA=0 for
+        // neutrons and photons.  Coulomb penetrability/shift/phase require Coulomb
+        // wave functions (F_l, G_l) rather than the hard-sphere Blatt-Weisskopf
+        // functions; using the wrong functions produces incorrect P_c/S_c.
+        // Applies to charged-particle channels (fission fragments, (n,p), (n,α), …).
+        // SAMMY implements Coulomb wave functions via Steed's method (rml/mrml07.f,
+        // coulomb/mrml08.f90).  Tracked in issue #42.
+        if pp.za.abs() > 0.0 && pp.zb.abs() > 0.0 {
+            return Err(EndfParseError::UnsupportedFormat(format!(
+                "LRF=7 particle pair {i}: Coulomb channel \
+                 (ZA={}, ZB={}) not yet supported; \
+                 requires Coulomb wave functions",
+                pp.za, pp.zb
+            )));
+        }
+    }
+
+    let mut spin_groups = Vec::with_capacity(njs);
+
+    for _ in 0..njs {
+        // LIST: [AJ, PJ, KBK, KPS, 6*(NCH+1), NCH+1]
+        // First 6*(NCH+1) values: header row [0,0,0,0,0,NCH] then NCH×6 channel defs.
+        let sg_cont = parse_cont(lines, pos)?;
+        let aj = sg_cont.c1;
+        let pj = sg_cont.c2; // explicit parity field; may be 0.0 when parity is in sign(AJ)
+        let kbk = sg_cont.l1; // background R-matrix flag
+        let kps = sg_cont.l2; // phase shift flag
+
+        // AJ encodes both the spin and, in some evaluations, the parity.
+        // ENDF/B-VIII.0 evaluations such as W-184 use negative AJ for odd-parity
+        // spin groups (e.g., AJ=-0.5, AJ=-1.5) and set PJ=0.
+        // Statistical weight formula (2J+1)/... requires J > 0; negative J yields
+        // zero or negative weights and drives non-physical cross-sections.
+        // Fix: J = |AJ|; parity from sign(AJ) when PJ is absent (PJ=0).
+        // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f Scan_File_2.
+        let j = aj.abs();
+        let parity = if pj != 0.0 {
+            pj.signum()
+        } else if aj < 0.0 {
+            -1.0
+        } else {
+            1.0
+        };
+        let npl = sg_cont.n1 as usize; // 6*(NCH+1)
+        let nch_plus_one = sg_cont.n2 as usize; // NCH+1
+        let nch = nch_plus_one.saturating_sub(1);
+
+        let sg_values = parse_list_values(lines, pos, npl)?;
+
+        // C3: Validate that the LIST record carries at least 6*(NCH+1) values.
+        // NCH is derived from N2 in the LIST header (N2 = NCH+1); the first data row
+        // is a dummy/header row of zeros that ENDF evaluators may fill arbitrarily.
+        // SAMMY (mrml01.f Scan_File_2/ENDF123) reads NCH from N2 and ignores row[5].
+        // Reference: ENDF-6 §2.2.1.6 Table 2.3; SAMMY rml/mrml01.f lines 104-107.
+        let expected_npl = 6 * (nch + 1);
+        if npl < expected_npl {
+            return Err(EndfParseError::UnsupportedFormat(format!(
+                "LRF=7 spin-group LIST: NPL={npl} < 6*(NCH+1)={expected_npl}"
+            )));
+        }
+
+        // First 6 values are the dummy header row (zeros); subsequent NCH×6 values
+        // are channel definitions [IPP, L, SCH, BND, APE, APT] per channel.
+        let npp = particle_pairs.len();
+        let mut channels = Vec::with_capacity(nch);
+        for c in 0..nch {
+            let b = 6 + c * 6; // skip the 6-value header row
+            // C2: IPP is 1-based in ENDF; validate range before converting.
+            let ipp_raw = sg_values[b] as usize;
+            if ipp_raw == 0 || ipp_raw > npp {
+                return Err(EndfParseError::UnsupportedFormat(format!(
+                    "LRF=7 spin-group channel IPP={ipp_raw} is out of range 1..={npp}"
+                )));
+            }
+            // Reject explicit massless (photon) channels identified by MA < 0.5.
+            // PNT=0 is NOT the right discriminant — it means "do not compute
+            // penetrability analytically" and also appears on fission-fragment
+            // channels where P is intentionally set to zero.  Using PNT=0 would
+            // incorrectly reject valid massive-particle channels.
+            // The correct check is MA < 0.5: photons have MA=0; all massive
+            // particles have MA ≥ 1.  Matches SAMMY mrml01.f which identifies
+            // photon channels by particle mass, not by the PNT flag.
+            // SAMMY (mrml01.f lines 390-408) excludes photons from the R-matrix
+            // channel array, reading their widths into the Gamgam slot instead of
+            // the per-channel Gamma positions.  That stride/mapping is not yet
+            // implemented here; see GitHub issue #45.
+            let pp = &particle_pairs[ipp_raw - 1];
+            if pp.ma < 0.5 {
+                return Err(EndfParseError::UnsupportedFormat(format!(
+                    "LRF=7 spin-group has an explicit photon channel \
+                     (IPP={ipp_raw}, MA={}).  Requires Gamgam-slot width \
+                     mapping not yet implemented (see GitHub issue #45).",
+                    pp.ma
+                )));
+            }
+            channels.push(RmlChannel {
+                particle_pair_idx: ipp_raw - 1, // convert 1-based ENDF index to 0-based
+                l: sg_values[b + 1] as u32,     // L
+                channel_spin: sg_values[b + 2], // SCH
+                boundary: sg_values[b + 3],     // BND
+                effective_radius: sg_values[b + 4], // APE (fm)
+                true_radius: sg_values[b + 5],  // APT (fm)
+            });
+        }
+
+        // Apply global scattering radius for channels where APE/APT == 0
+        for ch in &mut channels {
+            if ch.effective_radius == 0.0 {
+                ch.effective_radius = scattering_radius;
+            }
+            if ch.true_radius == 0.0 {
+                ch.true_radius = scattering_radius;
+            }
+        }
+
+        // LIST: [0, 0, 0, 0, NPL, NRS]  — resonance parameters
+        // NPL = total values = NRS × (values-per-resonance).
+        // For standard LRF=7, values-per-resonance = NCH+1.
+        // For KRM=3 (e.g. W-184 ENDF/B-VIII.0), evaluators pad each resonance row
+        // to a fixed 6 values per ENDF line, so NPL/NRS = 6 even when NCH=1.
+        // Using hardcoded nch+1 drifts the offset and misreads zeros as energies.
+        // Fix: derive stride directly from NPL/NRS; read only NCH widths per row.
+        // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f (Scan_File_2 resonance loop).
+        let res_cont = parse_cont(lines, pos)?;
+        let nrs = res_cont.n2 as usize;
+        let res_npl = res_cont.n1 as usize;
+        let res_values = parse_list_values(lines, pos, res_npl)?;
+
+        // C4: Validate stride before use — NPL must divide evenly by NRS, and each row
+        // must be at least min_stride values wide.
+        //
+        // KRM=2: per-resonance layout is [ER, Γ_1, ..., Γ_NCH, <padding>]
+        //        → min_stride = NCH+1 (energy + NCH reduced width amplitudes)
+        // KRM=3: per-resonance layout is [ER, Γγ, Γ_1, ..., Γ_NCH, <padding>]
+        //        → min_stride = NCH+2 (energy + Gamgam + NCH partial widths)
+        //
+        // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f ENDF123 subroutine —
+        //   reads Gamgam at position 1 (immediately after ER), then
+        //   (Gamma,I=1,Ichan) at positions 2..NCH+1.
+        let min_stride = if krm == 3 { nch + 2 } else { nch + 1 };
+        let stride = if nrs == 0 {
+            min_stride // no resonances; stride unused
+        } else {
+            if !res_npl.is_multiple_of(nrs) {
+                return Err(EndfParseError::UnsupportedFormat(format!(
+                    "LRF=7 resonance block NPL={res_npl} is not divisible by NRS={nrs}"
+                )));
+            }
+            let s = res_npl / nrs;
+            if s < min_stride {
+                return Err(EndfParseError::UnsupportedFormat(format!(
+                    "LRF=7 resonance stride={s} < {}={min_stride} \
+                     (KRM={krm}, NPL={res_npl}, NRS={nrs})",
+                    if krm == 3 { "NCH+2" } else { "NCH+1" }
+                )));
+            }
+            s
+        };
+        let mut resonances = Vec::with_capacity(nrs);
+        for r in 0..nrs {
+            let b = r * stride;
+            // Parse resonance row according to KRM column order.
+            //
+            // KRM=2: [ER, γ_1, ..., γ_NCH, <padding>]
+            //   widths (reduced amplitudes γ) start at b+1.
+            //   No capture width column; gamma_gamma = 0.
+            //
+            // KRM=3: [ER, Γγ, Γ_1, ..., Γ_NCH, <padding>]
+            //   Gamgam (radiation width, eV) is at b+1.
+            //   Partial widths Γ_c start at b+2.
+            //   Gamgam forms complex pole energies: Ẽ_n = E_n - i·Γγ/2.
+            //
+            // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f ENDF123 subroutine.
+            //
+            // Bounds safety: stride ≥ min_stride (verified above), b = r·stride,
+            // and r < nrs, so b + stride ≤ res_npl = res_values.len().
+            // For KRM=3: b+2+nch ≤ b+min_stride ≤ b+stride; guaranteed in bounds.
+            // For KRM=2: b+1+nch ≤ b+min_stride ≤ b+stride; guaranteed in bounds.
+            // Explicit error checks below make the safety locally verifiable and
+            // guard against future changes that might weaken the stride invariant.
+            let (widths, gamma_gamma) = if krm == 3 {
+                let need = b + 2 + nch;
+                if need > res_values.len() {
+                    return Err(EndfParseError::UnsupportedFormat(format!(
+                        "LRF=7 KRM=3 resonance row {r}: need {need} values, \
+                         have {} (stride={stride}, NCH={nch})",
+                        res_values.len()
+                    )));
+                }
+                let gamma_gamma = res_values[b + 1]; // Gamgam at position 1
+                let widths = res_values[b + 2..b + 2 + nch].to_vec(); // Γ_c at positions 2..NCH+1
+                (widths, gamma_gamma)
+            } else {
+                // KRM=2: widths immediately follow ER; no capture-width column.
+                let need = b + 1 + nch;
+                if need > res_values.len() {
+                    return Err(EndfParseError::UnsupportedFormat(format!(
+                        "LRF=7 KRM=2 resonance row {r}: need {need} values, \
+                         have {} (stride={stride}, NCH={nch})",
+                        res_values.len()
+                    )));
+                }
+                (res_values[b + 1..b + 1 + nch].to_vec(), 0.0)
+            };
+            resonances.push(RmlResonance {
+                energy: res_values[b],
+                widths,
+                gamma_gamma,
+            });
+        }
+
+        // KBK: background R-matrix correction (pole-free or smooth background terms).
+        // SAMMY implements via rml/mrml10.f.  Tracked in issue #41.
+        // Rare in ENDF/B-VIII.0; fail loud rather than silently drop the background.
+        if kbk != 0 {
+            return Err(EndfParseError::UnsupportedFormat(format!(
+                "LRF=7 background R-matrix (KBK={kbk}) not yet supported (issue #41)"
+            )));
+        }
+        // KPS: tabulated penetrability/phase-shift override.
+        // Note: SAMMY itself does NOT implement KPS (mrml07.f always computes phases
+        // analytically via Sinsix, ignoring any tabulated override).  This is consistent
+        // with SAMMY; KPS is vestigial in ENDF/B-VIII.0 practice.
+        if kps != 0 {
+            return Err(EndfParseError::UnsupportedFormat(format!(
+                "LRF=7 tabulated phase shifts (KPS={kps}) not yet supported"
+            )));
+        }
+
+        spin_groups.push(SpinGroup {
+            j,
+            parity,
+            channels,
+            resonances,
+        });
+    }
+
+    let rml = RmlData {
+        target_spin,
+        awr,
+        scattering_radius,
+        krm,
+        particle_pairs,
+        spin_groups,
+    };
+
+    Ok(ResonanceRange {
+        energy_low,
+        energy_high,
+        resolved: true,
+        formalism: ResonanceFormalism::RMatrixLimited,
+        target_spin,
+        scattering_radius,
+        l_groups: Vec::new(),
+        rml: Some(Box::new(rml)),
+    })
+}
+
+/// Skip a LIST record (CONT header + data lines).
+#[allow(dead_code)] // Reserved for KBK/KPS background term support (issue #39)
+fn skip_list(lines: &[&str], pos: &mut usize) -> Result<(), EndfParseError> {
+    let cont = parse_cont(lines, pos)?;
+    let npl = cont.n1 as usize;
+    *pos += npl.div_ceil(6);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -625,6 +1017,169 @@ mod tests {
             "  L=0: {} resonances, L=1: {} resonances",
             l0.resonances.len(),
             range.l_groups[1].resonances.len()
+        );
+    }
+
+    /// Verify KRM=3 resonance column order (offline fixture — no network needed).
+    ///
+    /// For KRM=3 the per-resonance ENDF layout is [ER, Γγ, Γ_1, ..., Γ_NCH, padding].
+    /// The regression checks that `gamma_gamma` comes from position b+1 (Γγ) and
+    /// `widths[0]` from position b+2 (Γ_1), NOT the other way round.
+    ///
+    /// Constructed values:
+    ///   res0: ER=10 eV, Γγ=0.025 eV, Γ_1=0.001 eV
+    ///   res1: ER=20 eV, Γγ=0.030 eV, Γ_1=0.002 eV
+    ///
+    /// The fixture is a minimal but fully valid ENDF MF=2/MT=151 block:
+    ///   1 isotope, 1 energy range, LRF=7, KRM=3, 1 particle pair, 1 spin group,
+    ///   2 resonances, NCH=1 (single elastic neutron channel).
+    #[test]
+    fn test_krm3_resonance_column_order() {
+        // Each ENDF line is exactly 80 chars:
+        //   positions  0-65: six 11-char data fields
+        //   positions 66-69: MAT (4 chars)
+        //   positions 70-71: MF (2 chars)
+        //   positions 72-74: MT (3 chars)
+        //   positions 75-79: NS (5 chars)
+        //
+        // Floats use Fortran notation, e.g. "1.000000+1" = 1e1 = 10.0.
+        // Integer fields written as right-justified 11-char strings.
+        const ENDF: &str = concat!(
+            // ── HEAD: ZA=74184, AWR=182, NIS=1 ──────────────────────────────
+            " 7.418400+4 1.820000+2          0          0          1          07437 2151    1\n",
+            // ── Isotope CONT: NER=1 ──────────────────────────────────────────
+            " 7.418400+4 1.000000+0          0          0          1          07437 2151    2\n",
+            // ── Range CONT: EL=1e-5, EH=1e3, LRU=1, LRF=7, NRO=0, NAPS=0 ──
+            " 1.000000-5 1.000000+3          1          7          0          07437 2151    3\n",
+            // ── LRF=7 CONT: SPI=0, AP=0.7, IFG=0, KRM=3, NJS=1, KRL=0 ─────
+            " 0.000000+0 7.000000-1          0          3          1          07437 2151    4\n",
+            // ── Particle-pair LIST CONT: NPP=1, NPL=12 ───────────────────────
+            " 0.000000+0 0.000000+0          1          0         12          17437 2151    5\n",
+            // Particle pair 1: MA=1, MB=182, ZA=0, ZB=0, IA=0.5, IB=0
+            " 1.000000+0 1.820000+2 0.000000+0 0.000000+0 5.000000-1 0.000000+07437 2151    6\n",
+            // Q=0, PNT=1, SHF=0, MT=2, PA=1, PB=1
+            " 0.000000+0 1.000000+0 0.000000+0 2.000000+0 1.000000+0 1.000000+07437 2151    7\n",
+            // ── Spin-group LIST CONT: AJ=0.5, KBK=0, KPS=0, NPL=12, NCH+1=2
+            " 5.000000-1 0.000000+0          0          0         12          27437 2151    8\n",
+            // Header row (6 zeros, ignored by parser)
+            " 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+07437 2151    9\n",
+            // Channel 0: IPP=1, L=0, SCH=0.5, BND=0, APE=0.7, APT=0.7
+            " 1.000000+0 0.000000+0 5.000000-1 0.000000+0 7.000000-1 7.000000-17437 2151   10\n",
+            // ── Resonance LIST CONT: NPL=12, NRS=2 ───────────────────────────
+            " 0.000000+0 0.000000+0          0          0         12          27437 2151   11\n",
+            // res0: ER=10 eV, Γγ=0.025 eV, Γ_1=0.001 eV, (3 padding zeros)
+            " 1.000000+1 2.500000-2 1.000000-3 0.000000+0 0.000000+0 0.000000+07437 2151   12\n",
+            // res1: ER=20 eV, Γγ=0.030 eV, Γ_1=0.002 eV, (3 padding zeros)
+            " 2.000000+1 3.000000-2 2.000000-3 0.000000+0 0.000000+0 0.000000+07437 2151   13\n",
+        );
+
+        let data = parse_endf_file2(ENDF).expect("fixture must parse without error");
+        let rml = data.ranges[0]
+            .rml
+            .as_ref()
+            .expect("LRF=7 range must have RmlData");
+        let sg = &rml.spin_groups[0];
+
+        assert_eq!(sg.resonances.len(), 2, "spin group must have 2 resonances");
+
+        let res0 = &sg.resonances[0];
+        assert!(
+            (res0.energy - 10.0).abs() < 1e-10,
+            "res0 energy must be 10.0 eV, got {}",
+            res0.energy
+        );
+        // The critical assertions: Γγ must come from column b+1, Γ_1 from column b+2.
+        // With the old (buggy) code these two values were swapped.
+        assert!(
+            (res0.gamma_gamma - 0.025).abs() < 1e-10,
+            "res0 gamma_gamma must be 0.025 eV (Gamgam at b+1), got {}",
+            res0.gamma_gamma
+        );
+        assert_eq!(res0.widths.len(), 1, "NCH=1 so widths must have 1 element");
+        assert!(
+            (res0.widths[0] - 0.001).abs() < 1e-10,
+            "res0 widths[0] must be 0.001 eV (Γ_1 at b+2), got {}",
+            res0.widths[0]
+        );
+
+        let res1 = &sg.resonances[1];
+        assert!(
+            (res1.energy - 20.0).abs() < 1e-10,
+            "res1 energy must be 20.0 eV"
+        );
+        assert!(
+            (res1.gamma_gamma - 0.030).abs() < 1e-10,
+            "res1 gamma_gamma must be 0.030 eV, got {}",
+            res1.gamma_gamma
+        );
+        assert!(
+            (res1.widths[0] - 0.002).abs() < 1e-10,
+            "res1 widths[0] must be 0.002 eV, got {}",
+            res1.widths[0]
+        );
+    }
+
+    /// Parse a real LRF=7 ENDF file (W-184) downloaded from IAEA.
+    ///
+    /// Run with: cargo test -p nereids-endf -- --ignored test_parse_w184_rml
+    ///
+    /// Validates: formalism == RMatrixLimited, spin groups non-empty,
+    /// first positive resonance energy in plausible range (W-184: ~101.9 eV).
+    #[test]
+    #[ignore = "requires network: downloads W-184 ENDF from IAEA (~50 kB)"]
+    fn test_parse_w184_rml() {
+        use crate::retrieval::{EndfLibrary, EndfRetriever};
+        use nereids_core::types::Isotope;
+
+        let retriever = EndfRetriever::new();
+        let isotope = Isotope::new(74, 184);
+        let (_, text) = retriever
+            .get_endf_file(&isotope, EndfLibrary::EndfB8_0, 7437)
+            .expect("Failed to download W-184 ENDF/B-VIII.0");
+
+        let data = parse_endf_file2(&text).expect("Failed to parse W-184 ENDF");
+
+        assert!(
+            !data.ranges.is_empty(),
+            "W-184 should have at least one energy range"
+        );
+        let range = &data.ranges[0];
+        assert_eq!(
+            range.formalism,
+            crate::resonance::ResonanceFormalism::RMatrixLimited,
+            "W-184 uses LRF=7 (R-Matrix Limited) in ENDF/B-VIII.0"
+        );
+
+        let rml = range.rml.as_ref().expect("LRF=7 range should have RmlData");
+        assert!(!rml.particle_pairs.is_empty(), "Should have particle pairs");
+        assert!(!rml.spin_groups.is_empty(), "Should have spin groups");
+
+        let total_resonances: usize = rml.spin_groups.iter().map(|sg| sg.resonances.len()).sum();
+        assert!(
+            total_resonances > 10,
+            "W-184 should have many resonances, got {total_resonances}"
+        );
+
+        // First positive-energy resonance in W-184 ENDF/B-VIII.0 (KRM=3, J=1/2+ group)
+        // is at ~101.95 eV.  The previously assumed 7.6 eV belongs to W-182, not W-184.
+        let first_pos_e = rml
+            .spin_groups
+            .iter()
+            .flat_map(|sg| &sg.resonances)
+            .map(|r| r.energy)
+            .filter(|&e| e > 0.0)
+            .fold(f64::MAX, f64::min);
+        assert!(
+            first_pos_e > 50.0 && first_pos_e < 200.0,
+            "First W-184 positive resonance expected ~101.95 eV, got {first_pos_e:.2} eV"
+        );
+
+        println!(
+            "W-184 LRF=7 parsed: {} spin groups, {} total resonances, \
+             first resonance at {:.2} eV",
+            rml.spin_groups.len(),
+            total_resonances,
+            first_pos_e
         );
     }
 }

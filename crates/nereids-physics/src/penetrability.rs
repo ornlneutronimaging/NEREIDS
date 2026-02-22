@@ -111,6 +111,132 @@ pub fn phase_shift(l: u32, rho: f64) -> f64 {
     }
 }
 
+/// Shift factor at imaginary channel argument S_l(iκ) for a closed channel.
+///
+/// For a channel with energy E_c < 0 (below threshold), the wave number is
+/// imaginary: k_c = iκ with κ = sqrt(2μ|E_c|) / ħ. The penetrability is
+/// zero by definition, but the shift factor S_l(iκ) is real and finite and
+/// must be included in the level matrix diagonal `L_c = (S_c − B_c) + i·P_c`.
+///
+/// S_l(iκ) is obtained by analytic continuation of S_l(ρ) to imaginary
+/// argument, i.e. substituting ρ² → −κ² in the Blatt-Weisskopf formula.
+/// For l ≤ 4 the result is a closed-form rational function of κ².
+/// For l > 4 a complex Bessel recursion is used.
+///
+/// Note: at κ = 1 for l = 1 the denominator vanishes (virtual-state pole).
+/// This is a genuine physical singularity; the caller receives ±∞ from
+/// floating-point arithmetic and should handle it via the normal `|L_c|`
+/// guard in the Y-matrix construction.
+///
+/// Reference: Lane & Thomas, Rev. Mod. Phys. 30 (1958);
+/// SAMMY `rml/mrml07.f` Pgh — PH = 1/(S−B+iP).
+pub fn shift_factor_closed(l: u32, kappa: f64) -> f64 {
+    // Substitute ρ² → −κ² in the explicit S_l(ρ) formulas.
+    let k2 = kappa * kappa;
+    match l {
+        0 => 0.0,
+        1 => -1.0 / (1.0 - k2),
+        2 => {
+            let k4 = k2 * k2;
+            let denom = 9.0 - 3.0 * k2 + k4;
+            -(18.0 - 3.0 * k2) / denom
+        }
+        3 => {
+            let k4 = k2 * k2;
+            let k6 = k4 * k2;
+            let denom = 225.0 - 45.0 * k2 + 6.0 * k4 - k6;
+            -(675.0 - 90.0 * k2 + 6.0 * k4) / denom
+        }
+        4 => {
+            let k4 = k2 * k2;
+            let k6 = k4 * k2;
+            let k8 = k4 * k4;
+            let denom = 11025.0 - 1575.0 * k2 + 135.0 * k4 - 10.0 * k6 + k8;
+            -(44100.0 - 4725.0 * k2 + 270.0 * k4 - 10.0 * k6) / denom
+        }
+        _ => shift_factor_closed_general(l, kappa),
+    }
+}
+
+/// General imaginary-argument shift factor for l > 4 via complex Bessel recursion.
+///
+/// Evaluates S_l(iκ) = Re[ρ(f∂f/∂ρ + g∂g/∂ρ)/(f²+g²)] at ρ = iκ
+/// using the complex Bessel functions f_l(iκ) and g_l(iκ) computed via
+/// upward recursion from the l=0 seed values:
+///   f_0(iκ) = i·sinh(κ),  g_0(iκ) = cosh(κ)
+fn shift_factor_closed_general(l: u32, kappa: f64) -> f64 {
+    if kappa < 1e-30 {
+        return 0.0;
+    }
+
+    let (f, g) = bessel_fg_imaginary(l, kappa);
+    let h = kappa * 1e-6 + 1e-12;
+    let (fp, gp) = bessel_fg_imaginary(l, kappa + h);
+    let (fm, gm) = bessel_fg_imaginary(l, kappa - h);
+
+    // Numerical ∂/∂κ
+    let df_re = (fp.0 - fm.0) / (2.0 * h);
+    let df_im = (fp.1 - fm.1) / (2.0 * h);
+    let dg_re = (gp.0 - gm.0) / (2.0 * h);
+    let dg_im = (gp.1 - gm.1) / (2.0 * h);
+
+    // ∂/∂ρ = (1/i)·∂/∂κ = −i·∂/∂κ
+    // f·∂f/∂ρ = (f_re + i·f_im)·(df_im − i·df_re)
+    //   Im part = f_im·df_im − f_re·df_re
+    // ρ·(f·∂f/∂ρ + …): ρ = iκ, so Re[iκ·z] = −κ·Im[z]
+    let num_im = (f.1 * df_im - f.0 * df_re) + (g.1 * dg_im - g.0 * dg_re);
+    let numerator = -kappa * num_im;
+
+    // f² + g² (complex square, not modulus squared); result is real
+    let denom = f.0 * f.0 - f.1 * f.1 + g.0 * g.0 - g.1 * g.1;
+    if denom.abs() < 1e-60 {
+        return 0.0;
+    }
+    numerator / denom
+}
+
+/// Bessel functions f_l(iκ) = iκ·j_l(iκ) and g_l(iκ) = −iκ·n_l(iκ)
+/// evaluated at imaginary argument ρ = iκ (κ > 0), returned as
+/// (f_re, f_im) and (g_re, g_im).
+///
+/// Seed values (l = 0):  f = (0, sinh κ),  g = (cosh κ, 0).
+/// The upward factor (2n+1)/ρ = (2n+1)/(iκ) is purely imaginary.
+fn bessel_fg_imaginary(l: u32, kappa: f64) -> ((f64, f64), (f64, f64)) {
+    let sh = kappa.sinh();
+    let ch = kappa.cosh();
+    let inv_k = 1.0 / kappa;
+
+    let mut f_prev = (0.0_f64, sh); // f_0 = i·sinh κ
+    let mut g_prev = (ch, 0.0_f64); // g_0 = cosh κ
+
+    if l == 0 {
+        return (f_prev, g_prev);
+    }
+
+    // l = 1: f_1 = f_0/(iκ) − g_0 = sinh(κ)/κ − cosh(κ)  [real]
+    //         g_1 = g_0/(iκ) + f_0 = i·(sinh(κ) − cosh(κ)/κ) [imaginary]
+    let mut f_curr = (sh * inv_k - ch, 0.0);
+    let mut g_curr = (0.0, sh - ch * inv_k);
+
+    if l == 1 {
+        return (f_curr, g_curr);
+    }
+
+    // Upward recursion: factor = (2n+1)/(iκ), purely imaginary with imaginary part a.
+    // (a·i)·(r + i·s) = −a·s + i·a·r
+    for n in 1..(l as usize) {
+        let a = -((2 * n + 1) as f64) * inv_k; // imaginary part of (2n+1)/(iκ)
+        let f_next = (-a * f_curr.1 - f_prev.0, a * f_curr.0 - f_prev.1);
+        let g_next = (-a * g_curr.1 - g_prev.0, a * g_curr.0 - g_prev.1);
+        f_prev = f_curr;
+        g_prev = g_curr;
+        f_curr = f_next;
+        g_curr = g_next;
+    }
+
+    (f_curr, g_curr)
+}
+
 /// Derivative of penetrability dP_l/dρ.
 ///
 /// Needed for converting between observed and reduced widths when
@@ -336,6 +462,59 @@ mod tests {
             "explicit={}, general={}",
             p_explicit,
             p_general
+        );
+    }
+
+    // ── shift_factor_closed tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_shift_factor_closed_l0() {
+        // S_0 = 0 regardless of κ
+        assert_eq!(shift_factor_closed(0, 0.0), 0.0);
+        assert_eq!(shift_factor_closed(0, 2.0), 0.0);
+    }
+
+    #[test]
+    fn test_shift_factor_closed_l1_continuity() {
+        // At κ → 0: S_1(iκ) = −1/(1−κ²) → −1 = S_1(0) from the real-ρ formula.
+        // Continuity: S_1(ρ=0) = −1/(1+0) = −1; S_1(i·0) = −1/(1−0) = −1.
+        let s = shift_factor_closed(1, 1e-10);
+        assert!((s - (-1.0)).abs() < 1e-8, "got {s}");
+    }
+
+    #[test]
+    fn test_shift_factor_closed_l1_exact() {
+        // S_1(i·0.5) = −1/(1−0.25) = −4/3
+        let expected = -4.0 / 3.0;
+        let got = shift_factor_closed(1, 0.5);
+        assert!(
+            (got - expected).abs() < 1e-12,
+            "got {got}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn test_shift_factor_closed_l2_exact() {
+        // S_2(i·0.5): k2=0.25, k4=0.0625
+        // num = -(18−3·0.25) = -(18−0.75) = −17.25
+        // den = 9−3·0.25+0.0625 = 9−0.75+0.0625 = 8.3125
+        let expected = -17.25 / 8.3125;
+        let got = shift_factor_closed(2, 0.5);
+        assert!(
+            (got - expected).abs() < 1e-12,
+            "got {got}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn test_shift_factor_closed_general_matches_explicit_l4() {
+        // Verify general recursion against closed-form for l=4.
+        let kappa = 0.3;
+        let explicit = shift_factor_closed(4, kappa);
+        let general = shift_factor_closed_general(4, kappa);
+        assert!(
+            (explicit - general).abs() < 1e-8,
+            "l=4 kappa={kappa}: explicit={explicit}, general={general}"
         );
     }
 

@@ -202,6 +202,7 @@ mod tests {
                         gfb: 0.0,
                     }],
                 }],
+                rml: None,
             }],
         };
 
@@ -247,6 +248,7 @@ mod tests {
                 target_spin: 0.0,
                 scattering_radius: 9.4285,
                 l_groups: resonances.clone(),
+                rml: None,
             }],
         };
 
@@ -262,6 +264,7 @@ mod tests {
                 target_spin: 0.0,
                 scattering_radius: 9.4285,
                 l_groups: resonances,
+                rml: None,
             }],
         };
 

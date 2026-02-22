@@ -24,5 +24,6 @@ pub mod doppler;
 pub mod penetrability;
 pub mod reich_moore;
 pub mod resolution;
+pub mod rmatrix_limited;
 pub mod slbw;
 pub mod transmission;
