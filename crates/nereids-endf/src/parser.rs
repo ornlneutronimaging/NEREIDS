@@ -617,21 +617,30 @@ fn parse_rmatrix_limited_range(
         }
 
         // KBK: background R-matrix correction (pole-free or smooth background terms).
-        // SAMMY implements via rml/mrml10.f.  Tracked in issue #41.
-        // Rare in ENDF/B-VIII.0; fail loud rather than silently drop the background.
+        // Per ENDF-6 §2.2.1.6 and OpenScale File2Lrf7.f90: when KBK > 0 there are
+        // NCH+1 background sub-records per spin group, each consisting of a CONT+LIST
+        // pair; if LBK==1 in that CONT, two TAB1 records (real and imaginary parts)
+        // follow.  The records are consumed to advance the file position correctly.
+        // The background correction is NOT applied to the cross-section calculation —
+        // matching SAMMY behaviour (mrml10.f is a matrix factorisation utility, not a
+        // background R-matrix reader).
+        // Reference: OpenScale File2Lrf7.f90 lines 269–298; ENDF-6 §2.2.1.6 Table 2.4.
         if kbk != 0 {
-            return Err(EndfParseError::UnsupportedFormat(format!(
-                "LRF=7 background R-matrix (KBK={kbk}) not yet supported (issue #41)"
-            )));
+            for _ in 0..nch_plus_one {
+                skip_background_subrecord(lines, pos)?;
+            }
         }
+
         // KPS: tabulated penetrability/phase-shift override.
-        // Note: SAMMY itself does NOT implement KPS (mrml07.f always computes phases
-        // analytically via Sinsix, ignoring any tabulated override).  This is consistent
-        // with SAMMY; KPS is vestigial in ENDF/B-VIII.0 practice.
+        // Same record structure as KBK: NCH+1 CONT+LIST pairs, with optional TAB1s
+        // when LPS==1.  SAMMY always computes penetrabilities and phase shifts
+        // analytically (mrml07.f, Sinsix subroutine) and ignores KPS entirely.
+        // We match that behaviour: consume the records, do not apply them.
+        // Reference: OpenScale File2Lrf7.f90 lines 301–331; ENDF-6 §2.2.1.6 Table 2.5.
         if kps != 0 {
-            return Err(EndfParseError::UnsupportedFormat(format!(
-                "LRF=7 tabulated phase shifts (KPS={kps}) not yet supported"
-            )));
+            for _ in 0..nch_plus_one {
+                skip_background_subrecord(lines, pos)?;
+            }
         }
 
         spin_groups.push(SpinGroup {
@@ -639,6 +648,7 @@ fn parse_rmatrix_limited_range(
             parity,
             channels,
             resonances,
+            has_background_correction: kbk != 0 || kps != 0,
         });
     }
 
@@ -664,12 +674,34 @@ fn parse_rmatrix_limited_range(
     })
 }
 
-/// Skip a LIST record (CONT header + data lines).
-#[allow(dead_code)] // Reserved for KBK/KPS background term support (issue #39)
-fn skip_list(lines: &[&str], pos: &mut usize) -> Result<(), EndfParseError> {
+/// Skip a TAB1 record (CONT + NR interpolation pairs + NP data pairs).
+fn skip_tab1(lines: &[&str], pos: &mut usize) -> Result<(), EndfParseError> {
     let cont = parse_cont(lines, pos)?;
-    let npl = cont.n1 as usize;
-    *pos += npl.div_ceil(6);
+    let nr = cont.n1 as usize; // number of interpolation regions
+    let np = cont.n2 as usize; // number of data points
+    *pos += (nr * 2).div_ceil(6); // NR×2 integer values (NBT, INT pairs)
+    *pos += (np * 2).div_ceil(6); // NP×2 float values (x, y pairs)
+    Ok(())
+}
+
+/// Skip one background sub-record: a CONT+LIST pair plus (if LBK/LPS == 1)
+/// two TAB1 records for the real and imaginary tabulated parts.
+///
+/// Used to consume KBK and KPS background blocks in LRF=7 spin groups.
+///
+/// Per ENDF-6 §2.2.1.6 and OpenScale File2Lrf7.f90:
+/// - CONT: [ED, EU, LBK, LPS, N1, N2]  — LBK/LPS type in L1
+/// - LIST: N1 data values
+/// - If LBK/LPS == 1: real TAB1 + imaginary TAB1
+fn skip_background_subrecord(lines: &[&str], pos: &mut usize) -> Result<(), EndfParseError> {
+    let cont = parse_cont(lines, pos)?;
+    let lbk_or_lps = cont.l1;
+    let n1 = cont.n1 as usize;
+    *pos += n1.div_ceil(6);
+    if lbk_or_lps == 1 {
+        skip_tab1(lines, pos)?;
+        skip_tab1(lines, pos)?;
+    }
     Ok(())
 }
 

@@ -649,6 +649,7 @@ mod tests {
             parity: 1.0,
             channels: vec![channel],
             resonances: vec![], // no resonances: pure hard sphere
+            has_background_correction: false,
         };
         let rml = RmlData {
             target_spin: 0.0,
