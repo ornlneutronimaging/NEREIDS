@@ -107,16 +107,15 @@ fn spin_group_cross_sections(
         return (0.0, 0.0, 0.0, 0.0);
     }
 
-    // P2a: Reject unsupported KRM types before doing any calculation.
-    // KRM=2 (standard R-matrix, reduced amplitudes) and KRM=3 (Reich-Moore
-    // approximation, formal widths + complex poles) are the only ENDF/B-VIII.0
-    // types encountered in practice.  Any other value indicates a malformed or
-    // unsupported evaluation; returning zeros fails fast and visibly instead of
-    // silently producing cross sections under the wrong formalism.
-    // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f (KRM field description).
-    if krm != 2 && krm != 3 {
-        return (0.0, 0.0, 0.0, 0.0);
-    }
+    // KRM guard: the parser rejects KRM values other than 2 and 3 at load time,
+    // so reaching here with an unsupported KRM indicates a programming error.
+    // Panic rather than silently returning zero physics, which would look valid
+    // to callers.  Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f KRM field.
+    assert!(
+        krm == 2 || krm == 3,
+        "spin_group_cross_sections called with unsupported KRM={krm}; \
+         should have been rejected at parse time"
+    );
 
     // P2b: NRS=0 is valid — the R-matrix is zero but the hard-sphere phase shift
     // still produces nonzero potential-scattering cross sections (σ_el = 4π|Ω-1|²/k²
@@ -408,12 +407,17 @@ fn spin_group_cross_sections(
         }
     }
 
-    if !has_explicit_capture {
-        // KRM=3 or ranges with no explicit capture channels: capture = residual.
-        // The imaginary poles already encode the capture width; flux not going to
-        // elastic or fission must go to capture.  Clamp to ≥0 for numerical safety.
+    if krm == 3 && !has_explicit_capture {
+        // KRM=3 (Reich-Moore approximation): capture is implicit via complex poles
+        // (Ẽ_n = E_n - i·Γγ/2).  Flux not going to elastic or fission must be capture.
+        // Clamp to ≥0 for floating-point safety near pole energies.
+        // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml11.f Sectio.
         cap = (tot - elas - fis).max(0.0);
     }
+    // KRM=2: capture was accumulated explicitly above from MT=102 channels.
+    // Do NOT add residual flux — it may include inelastic (MT=51+) contributions
+    // and would mislabel them as capture, biasing channel-resolved fits.
+    // Reference: SAMMY rml/mrml11.f Sectio (explicit γ-channel sum for KRM=2).
 
     (tot, elas, cap, fis)
 }

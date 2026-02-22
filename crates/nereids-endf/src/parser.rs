@@ -335,6 +335,14 @@ fn parse_rmatrix_limited_range(
     let target_spin = cont.c1;
     let scattering_radius = cont.c2;
     let krm = cont.l2 as u32; // R-matrix type: 2=standard, 3=Reich-Moore approx
+    // P2: Validate KRM at parse time so the physics code never sees an unknown type.
+    // KRM=0/1/4 are defined in the ENDF spec but not supported here.
+    // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f KRM field.
+    if krm != 2 && krm != 3 {
+        return Err(EndfParseError::UnsupportedFormat(format!(
+            "LRF=7 KRM={krm} is not supported (only KRM=2 and KRM=3)"
+        )));
+    }
     let njs = cont.n1 as usize; // number of spin groups
 
     // LIST: [0, 0, NPP, 0, 12*NPP, NPP]  — particle pair definitions
@@ -514,12 +522,19 @@ fn parse_rmatrix_limited_range(
             // Only the first NCH values after ER are widths; remainder is padding or gamma_gamma.
             let widths: Vec<f64> = res_values[b + 1..b + 1 + nch].to_vec();
             // KRM=3 (Reich-Moore approximation): an extra Γ_γ (capture width, eV) is
-            // stored at position b+1+nch, immediately after the NCH partial widths.
+            // stored at position b+1+nch, immediately after the NCH partial widths,
+            // when the resonance row has a dedicated Γγ slot (stride > nch+1).
             // This capture width is used to form complex pole energies:
             //   Ẽ_n = E_n - i·Γ_γ/2
             // For KRM=2 (standard R-matrix), gamma_gamma = 0.0.
-            // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f.
-            let gamma_gamma = if krm == 3 && b + 1 + nch < res_values.len() {
+            //
+            // P1 fix: the bound must be row-local, not global.  The old check
+            // `b + 1 + nch < res_values.len()` is true for every non-final
+            // resonance even when stride == nch+1 (no Γγ column), causing the
+            // code to read the *next* row's ER as gamma_gamma.  Guard instead on
+            // whether the current row's layout actually includes a Γγ slot.
+            // Reference: SAMMY rml/mrml01.f ENDF123 — reads Gamgam then (Gamma,I=1,Ichan).
+            let gamma_gamma = if krm == 3 && stride > nch + 1 {
                 res_values[b + 1 + nch]
             } else {
                 0.0
