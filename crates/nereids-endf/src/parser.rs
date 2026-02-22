@@ -869,12 +869,62 @@ fn parse_tab1(lines: &[&str], pos: &mut usize) -> Result<Tab1, EndfParseError> {
     // When NR=0, the loop below is a no-op and the interp_raw vec stays empty.
 
     // Read NR×2 integers: (NBT, INT) pairs packed as ENDF floats.
+    // Validate that values are integers, INT codes are in 1..=5, boundaries
+    // are strictly increasing, and the last boundary equals NP.
     let interp_raw = parse_list_values(lines, pos, nr * 2)?;
     let mut boundaries = Vec::with_capacity(nr);
     let mut interp_codes = Vec::with_capacity(nr);
     for i in 0..nr {
-        boundaries.push(interp_raw[i * 2] as usize);
-        interp_codes.push(interp_raw[i * 2 + 1] as u32);
+        let nbt_raw = interp_raw[i * 2];
+        let int_raw = interp_raw[i * 2 + 1];
+
+        // ENDF stores integers as floats — verify there is no fractional part.
+        if (nbt_raw - nbt_raw.round()).abs() > 0.5 || nbt_raw < 0.0 {
+            return Err(EndfParseError::UnsupportedFormat(format!(
+                "TAB1 NBT[{}] is not a non-negative integer: {}",
+                i, nbt_raw
+            )));
+        }
+        if (int_raw - int_raw.round()).abs() > 0.5 {
+            return Err(EndfParseError::UnsupportedFormat(format!(
+                "TAB1 INT[{}] is not an integer: {}",
+                i, int_raw
+            )));
+        }
+        let int_code = int_raw.round() as u32;
+        if !(1..=5).contains(&int_code) {
+            return Err(EndfParseError::UnsupportedFormat(format!(
+                "TAB1 INT[{}]={} is out of range 1..=5",
+                i, int_code
+            )));
+        }
+        let nbt = nbt_raw.round() as usize;
+
+        // Boundaries must be strictly increasing (ENDF §0.5).
+        if let Some(&prev) = boundaries.last() {
+            if nbt <= prev {
+                return Err(EndfParseError::UnsupportedFormat(format!(
+                    "TAB1 NBT[{}]={} is not greater than NBT[{}]={}",
+                    i,
+                    nbt,
+                    i - 1,
+                    prev
+                )));
+            }
+        }
+        boundaries.push(nbt);
+        interp_codes.push(int_code);
+    }
+
+    // The final boundary must equal NP (ENDF §0.5: last NBT is 1-based index of last point).
+    if nr > 0 {
+        let last_nbt = *boundaries.last().unwrap();
+        if last_nbt != np {
+            return Err(EndfParseError::UnsupportedFormat(format!(
+                "TAB1 last NBT={} does not equal NP={}",
+                last_nbt, np
+            )));
+        }
     }
 
     // Read NP×2 floats: (E, AP) pairs.

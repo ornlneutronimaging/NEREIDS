@@ -184,7 +184,8 @@ pub struct ResonanceRange {
     /// Constant value from the ENDF CONT header AP field.
     /// When `ap_table` is `Some`, use `scattering_radius_at(energy_ev)` instead
     /// of reading this field directly — the table provides the energy-dependent
-    /// value and only falls back to this constant outside the table range.
+    /// value, clamping to the nearest endpoint for energies outside the table
+    /// range.  This constant is only used when `ap_table` is `None` (NRO=0).
     pub scattering_radius: f64,
     /// Energy-dependent scattering radius AP(E) (fm), present when NRO=1.
     ///
