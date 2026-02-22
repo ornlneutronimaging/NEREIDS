@@ -486,6 +486,22 @@ fn parse_rmatrix_limited_range(
                     "LRF=7 spin-group channel IPP={ipp_raw} is out of range 1..={npp}"
                 )));
             }
+            // Reject explicit photon channels (IPP pointing to particle pair with MA=0,
+            // identified by PNT=0 flag in the particle pair definition).
+            // SAMMY (mrml01.f lines 390-408) handles these by recording Igamma and
+            // excluding the photon from the R-matrix channel array, reading its width
+            // into the Gamgam slot instead of the per-channel Gamma positions.
+            // This requires a different stride/width-mapping convention that is not yet
+            // implemented; see GitHub issue #42.  Fail loud rather than silently wrong.
+            let pp = &particle_pairs[ipp_raw - 1];
+            if pp.pnt == 0 {
+                return Err(EndfParseError::UnsupportedFormat(format!(
+                    "LRF=7 spin-group has an explicit photon/massless channel (IPP={ipp_raw}, \
+                     PNT=0).  This requires special Gamgam-slot width mapping that is not yet \
+                     implemented (see GitHub issue #42).  Affect: KRM=2 evaluations with \
+                     explicit capture channels.  VENUS targets (W, Ta, Zr, Fe) are not affected."
+                )));
+            }
             channels.push(RmlChannel {
                 particle_pair_idx: ipp_raw - 1, // convert 1-based ENDF index to 0-based
                 l: sg_values[b + 1] as u32,     // L
