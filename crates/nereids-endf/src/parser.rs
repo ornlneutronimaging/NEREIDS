@@ -906,7 +906,10 @@ fn parse_tab1(lines: &[&str], pos: &mut usize) -> Result<Tab1, EndfParseError> {
         {
             return Err(EndfParseError::UnsupportedFormat(format!(
                 "TAB1 NBT[{}]={} is not greater than NBT[{}]={}",
-                i, nbt, i - 1, prev
+                i,
+                nbt,
+                i - 1,
+                prev
             )));
         }
         boundaries.push(nbt);
