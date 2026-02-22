@@ -142,9 +142,16 @@ pub struct ParticlePair {
     pub ib: f64,
     /// Q-value for this reaction (eV). 0 for elastic.
     pub q: f64,
-    /// Penetrability flag: 0 = calculated, 1 = tabulated.
+    /// Penetrability flag.
+    ///
+    /// `PNT=1`: calculate penetrability P_c analytically (Blatt-Weisskopf).
+    /// Used for massive-particle channels (neutron elastic).
+    /// `PNT=0`: do not calculate penetrability; set P_c = 0 (photon/massless channels).
     pub pnt: i32,
-    /// Shift factor flag: 0 = calculated, 1 = tabulated.
+    /// Shift factor flag.
+    ///
+    /// `SHF=1`: calculate shift factor S_c analytically (Blatt-Weisskopf).
+    /// `SHF=0`: do not calculate; treat S_c = B_c so (S_c − B_c) = 0 in level matrix.
     pub shf: i32,
     /// ENDF MT number identifying the reaction (2=elastic, 18=fission, 102=capture).
     pub mt: u32,

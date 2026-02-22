@@ -430,24 +430,39 @@ fn parse_rmatrix_limited_range(
 
         let sg_values = parse_list_values(lines, pos, npl)?;
 
-        // First 6 values are the header row — NCH is also encoded there (field 6).
-        // Subsequent NCH×6 values are channel definitions.
+        // C3: Validate that the LIST record carries at least 6*(NCH+1) values.
+        // NCH is derived from N2 in the LIST header (N2 = NCH+1); the first data row
+        // is a dummy/header row of zeros that ENDF evaluators may fill arbitrarily.
+        // SAMMY (mrml01.f Scan_File_2/ENDF123) reads NCH from N2 and ignores row[5].
+        // Reference: ENDF-6 §2.2.1.6 Table 2.3; SAMMY rml/mrml01.f lines 104-107.
+        let expected_npl = 6 * (nch + 1);
+        if npl < expected_npl {
+            return Err(EndfParseError::UnsupportedFormat(format!(
+                "LRF=7 spin-group LIST: NPL={npl} < 6*(NCH+1)={expected_npl}"
+            )));
+        }
+
+        // First 6 values are the dummy header row (zeros); subsequent NCH×6 values
+        // are channel definitions [IPP, L, SCH, BND, APE, APT] per channel.
+        let npp = particle_pairs.len();
         let mut channels = Vec::with_capacity(nch);
         for c in 0..nch {
             let b = 6 + c * 6; // skip the 6-value header row
+            // C2: IPP is 1-based in ENDF; validate range before converting.
+            let ipp_raw = sg_values[b] as usize;
+            if ipp_raw == 0 || ipp_raw > npp {
+                return Err(EndfParseError::UnsupportedFormat(format!(
+                    "LRF=7 spin-group channel IPP={ipp_raw} is out of range 1..={npp}"
+                )));
+            }
             channels.push(RmlChannel {
-                particle_pair_idx: sg_values[b] as usize, // IPP (1-based in ENDF, convert below)
-                l: sg_values[b + 1] as u32,               // L
-                channel_spin: sg_values[b + 2],           // SCH
-                boundary: sg_values[b + 3],               // BND
-                effective_radius: sg_values[b + 4],       // APE (fm)
-                true_radius: sg_values[b + 5],            // APT (fm)
+                particle_pair_idx: ipp_raw - 1, // convert 1-based ENDF index to 0-based
+                l: sg_values[b + 1] as u32,     // L
+                channel_spin: sg_values[b + 2], // SCH
+                boundary: sg_values[b + 3],     // BND
+                effective_radius: sg_values[b + 4], // APE (fm)
+                true_radius: sg_values[b + 5],  // APT (fm)
             });
-        }
-
-        // IPP is 1-based in ENDF — convert to 0-based index
-        for ch in &mut channels {
-            ch.particle_pair_idx = ch.particle_pair_idx.saturating_sub(1);
         }
 
         // Apply global scattering radius for channels where APE/APT == 0
@@ -473,7 +488,26 @@ fn parse_rmatrix_limited_range(
         let res_npl = res_cont.n1 as usize;
         let res_values = parse_list_values(lines, pos, res_npl)?;
 
-        let stride = if nrs > 0 { res_npl / nrs } else { nch + 1 };
+        // C4: Validate stride before use — NPL must divide evenly by NRS, and each row
+        // must be at least NCH+1 values wide (energy + NCH widths).
+        // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f resonance loop.
+        let stride = if nrs == 0 {
+            nch + 1 // no resonances; stride unused
+        } else {
+            if res_npl % nrs != 0 {
+                return Err(EndfParseError::UnsupportedFormat(format!(
+                    "LRF=7 resonance block NPL={res_npl} is not divisible by NRS={nrs}"
+                )));
+            }
+            let s = res_npl / nrs;
+            if s < nch + 1 {
+                return Err(EndfParseError::UnsupportedFormat(format!(
+                    "LRF=7 resonance stride={s} < NCH+1={} (NPL={res_npl}, NRS={nrs})",
+                    nch + 1
+                )));
+            }
+            s
+        };
         let mut resonances = Vec::with_capacity(nrs);
         for r in 0..nrs {
             let b = r * stride;

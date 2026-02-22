@@ -239,8 +239,15 @@ fn spin_group_cross_sections(
         };
 
         let denom = e_tilde - energy_ev;
-        let inv_denom = if denom.norm() < 1e-300 {
-            Complex64::new(1.0 / 1e-50_f64, 0.0)
+        // Near-pole regularization: add a tiny imaginary offset ε to the denominator
+        // so that evaluating exactly at E = E_n (where denom → 0 for real KRM=2 poles)
+        // gives a finite, physically meaningful result via the Cauchy principal value.
+        // For KRM=3, e_tilde already carries −iΓ_γ/2 so the denominator is never zero;
+        // the correction is negligible (ε << Γ_γ/2).
+        // Reference: Cauchy PV regularisation; SAMMY avoids the exact pole by perturbing
+        // the resonance energy during input processing.
+        let inv_denom = if denom.norm() < 1e-10 {
+            (denom + Complex64::new(0.0, 1e-10)).inv()
         } else {
             denom.inv()
         };
