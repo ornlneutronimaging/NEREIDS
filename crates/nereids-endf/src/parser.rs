@@ -492,13 +492,13 @@ fn parse_rmatrix_limited_range(
             // excluding the photon from the R-matrix channel array, reading its width
             // into the Gamgam slot instead of the per-channel Gamma positions.
             // This requires a different stride/width-mapping convention that is not yet
-            // implemented; see GitHub issue #42.  Fail loud rather than silently wrong.
+            // implemented; see GitHub issue #45.  Fail loud rather than silently wrong.
             let pp = &particle_pairs[ipp_raw - 1];
             if pp.pnt == 0 {
                 return Err(EndfParseError::UnsupportedFormat(format!(
                     "LRF=7 spin-group has an explicit photon/massless channel (IPP={ipp_raw}, \
                      PNT=0).  This requires special Gamgam-slot width mapping that is not yet \
-                     implemented (see GitHub issue #42).  Affect: KRM=2 evaluations with \
+                     implemented (see GitHub issue #45).  Affect: KRM=2 evaluations with \
                      explicit capture channels.  VENUS targets (W, Ta, Zr, Fe) are not affected."
                 )));
             }
