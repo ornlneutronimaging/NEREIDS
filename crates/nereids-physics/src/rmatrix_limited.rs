@@ -235,31 +235,40 @@ fn spin_group_cross_sections(
                     let gamma_formal = res.widths[c];
                     let ch = &sg.channels[c];
                     let pp_c = &particle_pairs[ch.particle_pair_idx];
-                    let p_at_en = if pp_c.ma < 0.5 {
-                        1.0 // photon: P = 1 by convention
+                    // P_c at the resonance energy E_n.  Returns None when the channel
+                    // is closed at E_n (bound-state resonance), Some(P) otherwise.
+                    //
+                    // The fallback must be gated on whether e_cm_n ≤ 0, NOT on
+                    // whether P is numerically small.  For genuinely open channels
+                    // near threshold (high-l, small ρ), P is positive but tiny;
+                    // a magnitude guard would replace √(|Γ|/(2P)) ≫ 1 with √|Γ| ≪ 1,
+                    // underestimating the reduced amplitude by orders of magnitude.
+                    // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f Pgh.
+                    let p_at_en: Option<f64> = if pp_c.ma < 0.5 {
+                        Some(1.0) // photon: P = 1 by convention
                     } else {
                         // P1: res.energy is lab-frame; convert to CM before adding Q.
-                        // wave_number_from_cm requires CM kinetic energy, so we must
-                        // first apply the lab→CM transform (E_cm = E_lab × AWR/(1+AWR))
-                        // and then add the channel Q-value.
                         // Reference: SAMMY rml/mrml03.f Fxradi; ENDF-6 §2.2.1.6.
                         let e_cm_n = channel::lab_to_cm_energy(res.energy, awr) + pp_c.q;
                         if e_cm_n <= 0.0 {
-                            0.0 // closed or sub-threshold (bound state)
+                            None // channel closed at resonance energy (bound state)
                         } else {
                             let redmas = pp_c.ma * pp_c.mb / (pp_c.ma + pp_c.mb);
                             let k_cn = channel::wave_number_from_cm(e_cm_n, redmas);
-                            penetrability::penetrability(ch.l, k_cn * ch.effective_radius)
+                            Some(penetrability::penetrability(ch.l, k_cn * ch.effective_radius))
                         }
                     };
-                    if p_at_en < 1e-30 {
-                        // Closed channel or bound-state: P≈0, use formal width directly
-                        // as a proxy for the reduced amplitude (SAMMY bound-state handling).
-                        gamma_formal.abs().sqrt().copysign(gamma_formal)
-                    } else {
-                        // Open channel: γ = √(|Γ| / (2·P_c(E_n))) with sign of Γ.
-                        let magnitude = (gamma_formal.abs() / (2.0 * p_at_en)).sqrt();
-                        magnitude.copysign(gamma_formal)
+                    match p_at_en {
+                        None => {
+                            // Closed channel at E_n: formal width used directly as reduced
+                            // amplitude (SAMMY convention for bound-state resonances).
+                            gamma_formal.abs().sqrt().copysign(gamma_formal)
+                        }
+                        Some(p) => {
+                            // Open channel: γ = √(|Γ| / (2·P_c(E_n))) with sign of Γ.
+                            let magnitude = (gamma_formal.abs() / (2.0 * p)).sqrt();
+                            magnitude.copysign(gamma_formal)
+                        }
                     }
                 })
                 .collect();
