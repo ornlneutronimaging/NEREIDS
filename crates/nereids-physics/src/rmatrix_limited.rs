@@ -162,18 +162,22 @@ fn spin_group_cross_sections(
             let e_c = e_cm + pp.q;
             if e_c <= 0.0 {
                 // Closed channel (below threshold): P_c = 0, φ_c = 0.
+                // S_c depends on SHF:
+                //   SHF=0: convention is S_c = B_c; L_c = 0 when B_c = 0 (common).
+                //   SHF=1: S_c is the analytic shift factor at imaginary argument
+                //     ρ = iκ, which is real and finite.  L_c = (S_c − B_c) is generally
+                //     non-zero and its dispersive contribution must be preserved.
+                // Reference: SAMMY rml/mrml07.f Pgh — PH = 1/(S−B+iP).
                 p_c[c] = 0.0;
                 phi_c[c] = 0.0;
                 is_closed[c] = true;
-                // SHF=0: convention is S_c = B_c (identical to the open-channel branch).
-                // This gives L_c = (S_c − B_c) + i·P_c = 0, so 1/L_c → ∞ and the Ỹ
-                // diagonal is handled by the near-zero guard below.
-                // SHF=1: the analytic shift factor at imaginary ρ (evanescent wave) is
-                // not yet implemented.  Setting S_c = 0 gives L_c = −B_c, which is finite
-                // for B_c ≠ 0 and allows 1/L_c to be computed; for B_c = 0 the guard
-                // below applies.  TODO: implement imaginary-ρ shift factors (#46).
-                // Reference: SAMMY rml/mrml07.f Pgh — PH = 1/(S−B+iP).
-                s_c[c] = if pp.shf == 0 { ch.boundary } else { 0.0 };
+                s_c[c] = if pp.shf == 0 {
+                    ch.boundary
+                } else {
+                    let redmas = pp.ma * pp.mb / (pp.ma + pp.mb);
+                    let kappa = channel::wave_number_from_cm(e_c.abs(), redmas);
+                    penetrability::shift_factor_closed(ch.l, kappa * ch.effective_radius)
+                };
             } else {
                 // Channel wave number from reduced mass μ = MA·MB/(MA+MB).
                 // For elastic (MA=1, MB=AWR): k_c = wave_number(E_lab, AWR) [identical].
