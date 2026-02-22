@@ -878,14 +878,16 @@ fn parse_tab1(lines: &[&str], pos: &mut usize) -> Result<Tab1, EndfParseError> {
         let nbt_raw = interp_raw[i * 2];
         let int_raw = interp_raw[i * 2 + 1];
 
-        // ENDF stores integers as floats — verify there is no fractional part.
-        if (nbt_raw - nbt_raw.round()).abs() > 0.5 || nbt_raw < 0.0 {
+        // ENDF stores integers as floats (e.g. "2.000000+0").  They must be
+        // exact whole numbers.  Use a small epsilon (1e-6) rather than the
+        // half-unit tolerance 0.5, which would silently accept 1.4 or 2.49.
+        if (nbt_raw - nbt_raw.round()).abs() > 1e-6 || nbt_raw < 0.0 {
             return Err(EndfParseError::UnsupportedFormat(format!(
                 "TAB1 NBT[{}] is not a non-negative integer: {}",
                 i, nbt_raw
             )));
         }
-        if (int_raw - int_raw.round()).abs() > 0.5 {
+        if (int_raw - int_raw.round()).abs() > 1e-6 {
             return Err(EndfParseError::UnsupportedFormat(format!(
                 "TAB1 INT[{}] is not an integer: {}",
                 i, int_raw
