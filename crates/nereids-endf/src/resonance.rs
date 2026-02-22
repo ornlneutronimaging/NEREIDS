@@ -10,6 +10,151 @@
 use nereids_core::types::Isotope;
 use serde::{Deserialize, Serialize};
 
+// ─── ENDF TAB1: one-dimensional interpolation table ──────────────────────────
+//
+// TAB1 records encode a piecewise function y(x) with up to 5 interpolation laws
+// (ENDF INT codes 1–5).  Used here for the energy-dependent scattering radius
+// AP(E) when NRO=1.
+//
+// Reference: ENDF-6 Formats Manual §0.5 (TAB1 record type)
+
+/// One-dimensional interpolation table (ENDF TAB1 record).
+///
+/// Stores piecewise-interpolated y(x) data.  Multiple interpolation regions
+/// are supported via ENDF NBT/INT boundary pairs.
+///
+/// Interpolation law codes (ENDF INT), per ENDF-6 Formats Manual §0.5:
+/// - 1: Histogram (y constant = y_left)
+/// - 2: Linear-linear
+/// - 3: Log in x, linear in y  (y linear in ln(x))
+/// - 4: Linear in x, log in y  (ln(y) linear in x)
+/// - 5: Log-log
+///
+/// Verified against SAMMY OpenScale `CELibrary/Interpolate.h`:
+///   case 3 → `LinByLog` = log-x/linear-y
+///   case 4 → `LogByLin` = linear-x/log-y
+///
+/// Reference: ENDF-6 Formats Manual §0.5; SAMMY OpenScale `CELibrary/Interpolate.h`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Tab1 {
+    /// Interpolation region boundaries (NBT, 1-based index of the last point
+    /// in each region).  `boundaries.len() == interp_codes.len()`.
+    pub boundaries: Vec<usize>,
+    /// Interpolation law codes (INT) for each region.
+    pub interp_codes: Vec<u32>,
+    /// Data points as (x, y) pairs, sorted ascending in x.
+    pub points: Vec<(f64, f64)>,
+}
+
+impl Tab1 {
+    /// Evaluate the tabulated function at `x` by piecewise interpolation.
+    ///
+    /// Values outside the tabulated range are clamped to the nearest endpoint
+    /// (no extrapolation).
+    ///
+    /// Log-interpolation modes (INT=3, 4, 5) require strictly positive
+    /// arguments for the logarithm.  If a tabulated value or x-coordinate
+    /// is non-positive where a logarithm would be taken, the function
+    /// transparently falls back to lin-lin interpolation for that interval
+    /// rather than producing NaN or panicking.  In practice, ENDF AP(E)
+    /// tables always have positive x (energy) and positive y (radius in fm),
+    /// so this guard is defensive only.
+    pub fn evaluate(&self, x: f64) -> f64 {
+        let pts = &self.points;
+        if pts.is_empty() {
+            // The parser rejects NP=0, so an empty table indicates a bug in
+            // test-code construction.  Panic in debug builds; return 0.0 in
+            // release to avoid UB.
+            debug_assert!(
+                !pts.is_empty(),
+                "Tab1::evaluate called with empty points table"
+            );
+            return 0.0;
+        }
+        // NaN/±inf: partition_point's comparisons are all false for NaN,
+        // returning index 0, and pts[0 - 1] would underflow.  Clamp to the
+        // nearest finite endpoint instead.
+        if !x.is_finite() {
+            debug_assert!(x.is_finite(), "Tab1::evaluate: non-finite argument {x}");
+            return if x > 0.0 {
+                pts[pts.len() - 1].1
+            } else {
+                pts[0].1
+            };
+        }
+        if x <= pts[0].0 {
+            return pts[0].1;
+        }
+        if x >= pts[pts.len() - 1].0 {
+            return pts[pts.len() - 1].1;
+        }
+
+        // Binary search: find the first index where pts[i].0 > x.
+        // The interval containing x is [pts[i-1], pts[i]].
+        // Because the outer clamps ensure pts[0].0 < x < pts[last].0,
+        // we are guaranteed x0 < x1 (strict), so (x1 - x0) > 0.
+        let i = pts.partition_point(|(xi, _)| *xi <= x);
+        let (x0, y0) = pts[i - 1];
+        let (x1, y1) = pts[i];
+
+        // Fallback to lin-lin for any interval; used when log guards fire.
+        let lin_lin = || {
+            let t = (x - x0) / (x1 - x0);
+            y0 + t * (y1 - y0)
+        };
+
+        match self.interp_code_for_interval(i - 1) {
+            1 => y0, // histogram: constant left value
+            3 => {
+                // INT=3: y linear in ln(x) — log in x, linear in y.
+                // SAMMY OpenScale: case 3 → LinByLog (requires x0, x1, x > 0).
+                if x0 > 0.0 && x1 > 0.0 && x > 0.0 {
+                    let t = (x.ln() - x0.ln()) / (x1.ln() - x0.ln());
+                    y0 + t * (y1 - y0)
+                } else {
+                    lin_lin()
+                }
+            }
+            4 => {
+                // INT=4: ln(y) linear in x — linear in x, log in y.
+                // SAMMY OpenScale: case 4 → LogByLin (requires y0, y1 > 0).
+                if y0 > 0.0 && y1 > 0.0 {
+                    let t = (x - x0) / (x1 - x0);
+                    (y0.ln() + t * (y1.ln() - y0.ln())).exp()
+                } else {
+                    lin_lin()
+                }
+            }
+            5 => {
+                // log-log; requires x0, x1, x, y0, y1 > 0
+                if x0 > 0.0 && x1 > 0.0 && x > 0.0 && y0 > 0.0 && y1 > 0.0 {
+                    let t = (x.ln() - x0.ln()) / (x1.ln() - x0.ln());
+                    (y0.ln() + t * (y1.ln() - y0.ln())).exp()
+                } else {
+                    lin_lin()
+                }
+            }
+            _ => {
+                // INT=2 (lin-lin) and any unknown code: linear interpolation
+                lin_lin()
+            }
+        }
+    }
+
+    /// Return the ENDF interpolation code for the interval [pts[idx], pts[idx+1]].
+    ///
+    /// ENDF NBT boundaries are 1-based indices of the *last point* in each region.
+    /// Interval `idx` (0-based) belongs to the first region j where `idx + 2 <= NBT[j]`.
+    fn interp_code_for_interval(&self, idx: usize) -> u32 {
+        for (j, &nbt) in self.boundaries.iter().enumerate() {
+            if idx + 2 <= nbt {
+                return self.interp_codes[j];
+            }
+        }
+        self.interp_codes.last().copied().unwrap_or(2)
+    }
+}
+
 /// Resonance formalism flag (ENDF LRF values).
 ///
 /// Reference: ENDF-6 Formats Manual, File 2.
@@ -53,7 +198,25 @@ pub struct ResonanceRange {
     /// Target spin (I).
     pub target_spin: f64,
     /// Scattering radius (fm).
+    ///
+    /// Constant value from the ENDF CONT header AP field.
+    /// When `ap_table` is `Some`, use `scattering_radius_at(energy_ev)` instead
+    /// of reading this field directly — the table provides the energy-dependent
+    /// value, clamping to the nearest endpoint for energies outside the table
+    /// range.  This constant is only used when `ap_table` is `None` (NRO=0).
     pub scattering_radius: f64,
+    /// Energy-dependent scattering radius AP(E) (fm), present when NRO=1.
+    ///
+    /// ENDF-6 §2.2.1: when NRO≠0 a TAB1 record immediately follows the range
+    /// CONT header to give AP(E) as a piecewise function.  At each energy the
+    /// table value replaces the constant `scattering_radius` in penetrability,
+    /// shift, and hard-sphere phase calculations.
+    ///
+    /// `None` when the range has NRO=0 (constant AP).
+    ///
+    /// Reference: ENDF-6 Formats Manual §2.2.1; SAMMY `mlb/mmlb1.f90`
+    #[serde(default)]
+    pub ap_table: Option<Tab1>,
     /// Spin groups for LRF=1/2/3 (L-grouped). Empty for LRF=7.
     pub l_groups: Vec<LGroup>,
     /// R-Matrix Limited data for LRF=7. `None` for LRF=1/2/3.
@@ -280,6 +443,24 @@ impl ResonanceData {
 }
 
 impl ResonanceRange {
+    /// Scattering radius at a given neutron energy.
+    ///
+    /// Returns the interpolated value from `ap_table` when NRO=1 (energy-dependent
+    /// radius), or the constant `scattering_radius` when NRO=0.
+    ///
+    /// Use this method in all physics calculations that need the channel radius,
+    /// rather than reading `scattering_radius` directly.
+    ///
+    /// # Arguments
+    /// * `energy_ev` — Lab-frame neutron energy in eV.
+    pub fn scattering_radius_at(&self, energy_ev: f64) -> f64 {
+        if let Some(table) = &self.ap_table {
+            table.evaluate(energy_ev)
+        } else {
+            self.scattering_radius
+        }
+    }
+
     /// Total resonance count for this range (works for both LRF=1/2/3 and LRF=7).
     pub fn resonance_count(&self) -> usize {
         if let Some(rml) = &self.rml {
@@ -300,5 +481,209 @@ impl std::fmt::Display for ResonanceData {
             self.ranges.len(),
             self.total_resonance_count()
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_linlin_table(points: Vec<(f64, f64)>) -> Tab1 {
+        let n = points.len();
+        Tab1 {
+            boundaries: vec![n],
+            interp_codes: vec![2],
+            points,
+        }
+    }
+
+    /// Linear-linear interpolation in the interior of the table.
+    #[test]
+    fn test_tab1_linlin_interior() {
+        let table = make_linlin_table(vec![(1.0, 10.0), (5.0, 30.0), (10.0, 5.0)]);
+        // midpoint of [1,5]: x=3 → 10 + (3-1)/(5-1) * (30-10) = 10 + 0.5*20 = 20
+        let v = table.evaluate(3.0);
+        assert!((v - 20.0).abs() < 1e-10, "lin-lin midpoint, got {v}");
+        // midpoint of [5,10]: x=7.5 → 30 + (7.5-5)/(10-5) * (5-30) = 30 + 0.5*(-25) = 17.5
+        let v2 = table.evaluate(7.5);
+        assert!(
+            (v2 - 17.5).abs() < 1e-10,
+            "lin-lin second interval, got {v2}"
+        );
+    }
+
+    /// Values outside the table range clamp to the boundary value.
+    #[test]
+    fn test_tab1_clamping() {
+        let table = make_linlin_table(vec![(2.0, 5.0), (8.0, 15.0)]);
+        assert_eq!(table.evaluate(0.0), 5.0, "below low bound");
+        assert_eq!(table.evaluate(100.0), 15.0, "above high bound");
+        assert_eq!(table.evaluate(2.0), 5.0, "at low bound");
+        assert_eq!(table.evaluate(8.0), 15.0, "at high bound");
+    }
+
+    /// Histogram interpolation (INT=1): y stays constant from left endpoint.
+    #[test]
+    fn test_tab1_histogram() {
+        let table = Tab1 {
+            boundaries: vec![3],
+            interp_codes: vec![1],
+            points: vec![(0.0, 10.0), (5.0, 20.0), (10.0, 30.0)],
+        };
+        assert_eq!(
+            table.evaluate(2.5),
+            10.0,
+            "histogram: should return left value"
+        );
+        assert_eq!(table.evaluate(7.5), 20.0, "histogram: second interval");
+    }
+
+    /// Two-region table: lin-lin for low energies, log-x/lin-y (INT=3) for high.
+    #[test]
+    fn test_tab1_multiregion() {
+        // Region 0 (INT=2, lin-lin): points 0..2  (NBT=2)
+        // Region 1 (INT=3, log in x / linear in y): points 2..4  (NBT=4)
+        // Points: (1,1), (3,3), (10,3), (100,30)
+        let table = Tab1 {
+            boundaries: vec![2, 4],
+            interp_codes: vec![2, 3],
+            points: vec![(1.0, 1.0), (3.0, 3.0), (10.0, 3.0), (100.0, 30.0)],
+        };
+        // Interval 0 ([1,3], INT=2 lin-lin): x=2 → 1 + (2-1)/(3-1) * (3-1) = 2
+        assert!(
+            (table.evaluate(2.0) - 2.0).abs() < 1e-10,
+            "region 0 lin-lin"
+        );
+        // Interval 1 ([3,10], INT=3 log-x/lin-y): x=5.
+        // y0==y1==3.0, so any interpolation mode yields 3.0 regardless.
+        // This verifies the region boundary is crossed correctly and that
+        // x=5 routes to interval 1 (not interval 0 or 2).
+        assert!(
+            (table.evaluate(5.0) - 3.0).abs() < 1e-10,
+            "region 1 INT=3 (constant y segment): x=5 should give 3.0"
+        );
+        // Interval 2 ([10,100], INT=3 log-x/lin-y): x=31.62 ≈ sqrt(10*100) = geometric midpoint.
+        // INT=3: t = ln(x/x0) / ln(x1/x0) = ln(31.62/10) / ln(100/10) = ln(3.162)/ln(10) ≈ 0.5
+        // y = y0 + t*(y1 - y0) = 3 + 0.5*(30 - 3) = 16.5
+        let v = table.evaluate(31.62);
+        assert!(
+            (v - 16.5).abs() < 0.1,
+            "region 2 INT=3 at geometric midpoint: expected 16.5, got {v}"
+        );
+    }
+
+    /// scattering_radius_at falls back to constant when ap_table is None.
+    #[test]
+    fn test_scattering_radius_at_constant() {
+        let range = ResonanceRange {
+            energy_low: 1e-5,
+            energy_high: 1e4,
+            resolved: true,
+            formalism: crate::resonance::ResonanceFormalism::ReichMoore,
+            target_spin: 0.0,
+            scattering_radius: 9.4285,
+            ap_table: None,
+            l_groups: vec![],
+            rml: None,
+        };
+        assert_eq!(range.scattering_radius_at(1.0), 9.4285);
+        assert_eq!(range.scattering_radius_at(1000.0), 9.4285);
+    }
+
+    /// scattering_radius_at interpolates from ap_table when NRO=1.
+    #[test]
+    fn test_scattering_radius_at_energy_dependent() {
+        // AP goes from 8.0 fm at 1 eV to 10.0 fm at 1000 eV (lin-lin).
+        let table = make_linlin_table(vec![(1.0, 8.0), (1000.0, 10.0)]);
+        let range = ResonanceRange {
+            energy_low: 1e-5,
+            energy_high: 1e4,
+            resolved: true,
+            formalism: crate::resonance::ResonanceFormalism::ReichMoore,
+            target_spin: 0.0,
+            scattering_radius: 9.0, // constant fallback (ignored when table is Some)
+            ap_table: Some(table),
+            l_groups: vec![],
+            rml: None,
+        };
+        // At 1 eV: 8.0 fm
+        assert!((range.scattering_radius_at(1.0) - 8.0).abs() < 1e-10);
+        // At 1000 eV: 10.0 fm
+        assert!((range.scattering_radius_at(1000.0) - 10.0).abs() < 1e-10);
+        // At 500.5 eV (midpoint): 9.0 fm
+        let mid = range.scattering_radius_at(500.5);
+        assert!((mid - 9.0).abs() < 0.01, "midpoint AP ≈ 9.0, got {mid}");
+    }
+
+    /// Log-guard fallback: if an x-coordinate is non-positive in an INT=3
+    /// (log-x, linear-y) interval, evaluate() falls back to lin-lin.
+    #[test]
+    fn test_tab1_log_guard_nonpositive_x() {
+        // INT=3 (log in x, linear in y) with x0=0.0 — 0.0_f64.ln() = -inf without guard.
+        let table = Tab1 {
+            boundaries: vec![2],
+            interp_codes: vec![3], // log in x, linear in y
+            points: vec![(0.0, 8.0), (10.0, 10.0)],
+        };
+        // x=0.0 is at the left boundary; evaluate() clamps to y=8.0 before interpolation.
+        assert!((table.evaluate(0.0) - 8.0).abs() < 1e-10);
+        // x=5.0 is interior; x0=0.0 triggers the log guard → lin-lin fallback.
+        let result = table.evaluate(5.0);
+        assert!(
+            result.is_finite(),
+            "fallback to lin-lin should give finite result, got {result}"
+        );
+    }
+
+    /// Log-guard fallback: if a y-value is non-positive in an INT=4
+    /// (linear-x, log-y) interval, evaluate() falls back to lin-lin.
+    #[test]
+    fn test_tab1_log_guard_nonpositive_y() {
+        // INT=4 (linear in x, log in y) with y0=0.0 — 0.0_f64.ln() = -inf without guard.
+        let table = Tab1 {
+            boundaries: vec![2],
+            interp_codes: vec![4], // linear in x, log in y
+            points: vec![(1.0, 0.0), (10.0, 1.0)],
+        };
+        let result = table.evaluate(5.0);
+        assert!(
+            result.is_finite(),
+            "fallback to lin-lin should give finite result, got {result}"
+        );
+    }
+
+    /// INT=3 (log in x, linear in y): verify correct formula against analytic values.
+    #[test]
+    fn test_tab1_logx_linear_y() {
+        // Points at x=1 (y=0) and x=100 (y=2.0).
+        // At x=10: t = ln(10)/ln(100) = 1/2, y = 0 + 0.5*2 = 1.0
+        let table = Tab1 {
+            boundaries: vec![2],
+            interp_codes: vec![3], // log in x, linear in y
+            points: vec![(1.0, 0.0), (100.0, 2.0)],
+        };
+        let y = table.evaluate(10.0);
+        assert!(
+            (y - 1.0).abs() < 1e-12,
+            "INT=3 at geometric midpoint x=10: expected y=1.0, got {y}"
+        );
+    }
+
+    /// INT=4 (linear in x, log in y): verify correct formula against analytic values.
+    #[test]
+    fn test_tab1_linear_x_logy() {
+        // Points at x=0 (y=1) and x=2 (y=e²).
+        // At x=1 (midpoint): t=0.5, y = exp(0 + 0.5*2) = exp(1) = e
+        let e = std::f64::consts::E;
+        let table = Tab1 {
+            boundaries: vec![2],
+            interp_codes: vec![4], // linear in x, log in y
+            points: vec![(0.0, 1.0), (2.0, e * e)],
+        };
+        let y = table.evaluate(1.0);
+        assert!(
+            (y - e).abs() < 1e-12,
+            "INT=4 at midpoint x=1: expected y=e={e:.6}, got {y:.6}"
+        );
     }
 }

@@ -721,6 +721,7 @@ fn create_resonance_data(
                 scattering_radius,
                 l_groups: groups,
                 rml: None,
+                ap_table: None,
             }],
         },
     }

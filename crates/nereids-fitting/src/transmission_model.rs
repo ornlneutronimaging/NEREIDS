@@ -86,6 +86,7 @@ mod tests {
                     }],
                 }],
                 rml: None,
+                ap_table: None,
             }],
         }
     }
@@ -157,6 +158,7 @@ mod tests {
                     }],
                 }],
                 rml: None,
+                ap_table: None,
             }],
         };
 

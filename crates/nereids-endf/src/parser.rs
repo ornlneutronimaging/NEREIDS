@@ -98,15 +98,14 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
             let nro = range_cont.n1; // energy-dependent scattering radius flag
             let _naps = range_cont.n2; // scattering radius calculation flag
 
-            // If NRO != 0, there's a TAB1 record for energy-dependent scattering
-            // radius AP(E).  We parse past it but do not apply it — the constant AP
-            // from the CONT header is used instead.  This is a known silent inaccuracy:
-            // cross-sections in ranges with NRO=1 may have a slightly wrong potential
-            // scattering background.  SAMMY correctly interpolates AP(E); tracked in
-            // issue #43.
-            if nro != 0 {
-                skip_tab1(&lines, &mut pos)?;
-            }
+            // If NRO != 0, a TAB1 record immediately follows giving AP(E).
+            // Parse and store it; scattering_radius_at(E) will interpolate it
+            // at each energy point.  Reference: ENDF-6 §2.2.1; SAMMY mlb/mmlb1.f90.
+            let ap_table = if nro != 0 {
+                Some(parse_tab1(&lines, &mut pos)?)
+            } else {
+                None
+            };
 
             // ENDF-6 Formats Manual: LRF values for resolved resonance region
             // LRF=1: Single-Level Breit-Wigner (SLBW)
@@ -127,27 +126,19 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
                 }
             };
 
-            match formalism {
+            let mut range = match formalism {
                 ResonanceFormalism::MLBW | ResonanceFormalism::SLBW => {
-                    let range =
-                        parse_bw_range(&lines, &mut pos, energy_low, energy_high, formalism)?;
-                    all_ranges.push(range);
+                    parse_bw_range(&lines, &mut pos, energy_low, energy_high, formalism)?
                 }
                 ResonanceFormalism::ReichMoore => {
-                    let range = parse_reich_moore_range(&lines, &mut pos, energy_low, energy_high)?;
-                    all_ranges.push(range);
+                    parse_reich_moore_range(&lines, &mut pos, energy_low, energy_high)?
                 }
                 ResonanceFormalism::RMatrixLimited => {
-                    let range = parse_rmatrix_limited_range(
-                        &lines,
-                        &mut pos,
-                        energy_low,
-                        energy_high,
-                        awr,
-                    )?;
-                    all_ranges.push(range);
+                    parse_rmatrix_limited_range(&lines, &mut pos, energy_low, energy_high, awr)?
                 }
-            }
+            };
+            range.ap_table = ap_table;
+            all_ranges.push(range);
         }
     }
 
@@ -225,6 +216,7 @@ fn parse_bw_range(
         formalism,
         target_spin,
         scattering_radius,
+        ap_table: None, // set by caller from NRO TAB1 if present
         l_groups,
         rml: None,
     })
@@ -295,6 +287,7 @@ fn parse_reich_moore_range(
         formalism: ResonanceFormalism::ReichMoore,
         target_spin,
         scattering_radius,
+        ap_table: None, // set by caller from NRO TAB1 if present
         l_groups,
         rml: None,
     })
@@ -665,6 +658,7 @@ fn parse_rmatrix_limited_range(
         formalism: ResonanceFormalism::RMatrixLimited,
         target_spin,
         scattering_radius,
+        ap_table: None, // set by caller from NRO TAB1 if present
         l_groups: Vec::new(),
         rml: Some(Box::new(rml)),
     })
@@ -853,21 +847,121 @@ fn skip_unresolved_range(lines: &[&str], pos: &mut usize, _lrf: i32) -> Result<(
     Ok(())
 }
 
-/// Skip a TAB1 record (interpolation table + function values).
-fn skip_tab1(lines: &[&str], pos: &mut usize) -> Result<(), EndfParseError> {
+/// Parse a TAB1 record into a `Tab1` interpolation table.
+///
+/// ENDF TAB1 layout (Reference: ENDF-6 Formats Manual §0.5):
+/// ```text
+/// CONT: [C1, C2, L1, L2, NR, NP]
+/// NR×2 integer values: (NBT_i, INT_i) pairs  — 6 per line
+/// NP×2 float values:   (x_i,   y_i)   pairs  — 6 per line
+/// ```
+///
+/// INT codes: 1=histogram, 2=lin-lin, 3=log-x/lin-y, 4=lin-x/log-y, 5=log-log.
+fn parse_tab1(lines: &[&str], pos: &mut usize) -> Result<Tab1, EndfParseError> {
     let cont = parse_cont(lines, pos)?;
-    let nr = cont.n1 as usize; // number of interpolation ranges
-    let np = cont.n2 as usize; // number of points
+    let nr = cont.n1 as usize; // number of interpolation regions
+    let np = cont.n2 as usize; // number of data points
 
-    // Interpolation ranges: 2 integers per range, 6 per line
-    let interp_lines = (nr * 2).div_ceil(6);
-    *pos += interp_lines;
+    // NR=0 is valid ENDF: it means a single implicit interpolation region
+    // covering all NP points with no explicit boundary record.  The
+    // evaluate() call will fall through to the `unwrap_or(2)` default in
+    // interp_code_for_interval(), which correctly returns INT=2 (lin-lin).
+    // When NR=0, the loop below is a no-op and the interp_raw vec stays empty.
 
-    // Data points: 2 floats per point, 6 per line → np*2 values total
-    let data_lines = (np * 2).div_ceil(6);
-    *pos += data_lines;
+    // Read NR×2 integers: (NBT, INT) pairs packed as ENDF floats.
+    // Validate that values are integers, INT codes are in 1..=5, boundaries
+    // are strictly increasing, and the last boundary equals NP.
+    let interp_raw = parse_list_values(lines, pos, nr * 2)?;
+    let mut boundaries = Vec::with_capacity(nr);
+    let mut interp_codes = Vec::with_capacity(nr);
+    for i in 0..nr {
+        let nbt_raw = interp_raw[i * 2];
+        let int_raw = interp_raw[i * 2 + 1];
 
-    Ok(())
+        // ENDF stores integers as floats (e.g. "2.000000+0").  They must be
+        // exact whole numbers.  Use a small epsilon (1e-6) rather than the
+        // half-unit tolerance 0.5, which would silently accept 1.4 or 2.49.
+        // NBT is a 1-based index (ENDF §0.5), so 0 is invalid.
+        if (nbt_raw - nbt_raw.round()).abs() > 1e-6 || nbt_raw < 1.0 {
+            return Err(EndfParseError::UnsupportedFormat(format!(
+                "TAB1 NBT[{}] is not a positive integer: {}",
+                i, nbt_raw
+            )));
+        }
+        if (int_raw - int_raw.round()).abs() > 1e-6 {
+            return Err(EndfParseError::UnsupportedFormat(format!(
+                "TAB1 INT[{}] is not an integer: {}",
+                i, int_raw
+            )));
+        }
+        let int_code = int_raw.round() as u32;
+        if !(1..=5).contains(&int_code) {
+            return Err(EndfParseError::UnsupportedFormat(format!(
+                "TAB1 INT[{}]={} is out of range 1..=5",
+                i, int_code
+            )));
+        }
+        let nbt = nbt_raw.round() as usize;
+
+        // Boundaries must be strictly increasing (ENDF §0.5).
+        if let Some(&prev) = boundaries.last()
+            && nbt <= prev
+        {
+            return Err(EndfParseError::UnsupportedFormat(format!(
+                "TAB1 NBT[{}]={} is not greater than NBT[{}]={}",
+                i,
+                nbt,
+                i - 1,
+                prev
+            )));
+        }
+        boundaries.push(nbt);
+        interp_codes.push(int_code);
+    }
+
+    // The final boundary must equal NP (ENDF §0.5: last NBT is 1-based index of last point).
+    if nr > 0 {
+        let last_nbt = *boundaries.last().unwrap();
+        if last_nbt != np {
+            return Err(EndfParseError::UnsupportedFormat(format!(
+                "TAB1 last NBT={} does not equal NP={}",
+                last_nbt, np
+            )));
+        }
+    }
+
+    if np == 0 {
+        return Err(EndfParseError::UnsupportedFormat(
+            "TAB1 NP=0: table must have at least one point".to_string(),
+        ));
+    }
+
+    // Read NP×2 floats: (E, AP) pairs.
+    let data_raw = parse_list_values(lines, pos, np * 2)?;
+    let mut points = Vec::with_capacity(np);
+    for i in 0..np {
+        let x = data_raw[i * 2];
+        let y = data_raw[i * 2 + 1];
+        // x-values must be strictly increasing; Tab1::evaluate() relies on this.
+        if let Some(&(x_prev, _)) = points.last()
+            && x <= x_prev
+        {
+            return Err(EndfParseError::UnsupportedFormat(format!(
+                "TAB1 x[{}]={} is not greater than x[{}]={} (x must be strictly increasing)",
+                i,
+                x,
+                i - 1,
+                x_prev
+            )));
+        }
+        points.push((x, y));
+    }
+
+    Ok(Tab1 {
+        boundaries,
+        interp_codes,
+        points,
+    })
 }
 
 /// Errors from ENDF parsing.
@@ -1181,5 +1275,103 @@ mod tests {
             total_resonances,
             first_pos_e
         );
+    }
+
+    /// Parse a minimal hand-crafted ENDF snippet with NRO=1 (energy-dependent
+    /// scattering radius).
+    ///
+    /// The fixture encodes:
+    /// - LRF=3 (Reich-Moore), NRO=1
+    /// - AP TAB1: 2 points — AP(1 eV)=8.0 fm, AP(1000 eV)=10.0 fm (lin-lin)
+    /// - One L-group (L=0) with one resonance at 6.674 eV
+    ///
+    /// Verifies:
+    /// - ap_table is Some after parsing
+    /// - ap_table.evaluate(1.0) ≈ 8.0 fm
+    /// - ap_table.evaluate(500.5) ≈ 9.0 fm (midpoint, lin-lin)
+    /// - ap_table.evaluate(1000.0) ≈ 10.0 fm
+    /// - scattering_radius_at() delegates to the table
+    #[test]
+    fn test_parse_nro1_tab1() {
+        // Each ENDF line is exactly 80 chars: 66 data chars + 14 MAT/MF/MT/SEQ.
+        // Cols 67-70: MAT=9237, Cols 71-72: MF=2, Cols 73-75: MT=151, Cols 76-80: seq
+        //
+        // Line layout (11 chars per field × 6 fields = 66 chars, then 14 control chars):
+        //   HEAD:  ZA=92238  AWR=236.006  0  0  NIS=1  0
+        //   CONT:  ZAI=92238 ABN=1.0      0  LFW=0 NER=1  0
+        //   CONT:  EL=1e-5   EH=1e4    LRU=1  LRF=3  NRO=1  NAPS=0
+        //   TAB1 CONT: 0  0  0  0  NR=1  NP=2
+        //   TAB1 interp: NBT=2, INT=2  (plus 4 padding zeros)
+        //   TAB1 data:   (1.0, 8.0), (1000.0, 10.0)
+        //   RM CONT:  SPI=0.0  AP=9.0  0  0  NLS=1  0
+        //   L CONT:  AWRI=236.006  0  L=0  0  6*NRS=6  NRS=1
+        //   Resonance: ER=6.674  AJ=0.5  GN=1.493e-3  GG=23e-3  GFA=0  GFB=0
+        //   SEND: all zeros
+        // Each ENDF line: 66 data chars + 4-char MAT(9237) + 2-char MF(" 2")
+        //   + 3-char MT("151") + 5-char SEQ = 80 chars total.
+        let endf = concat!(
+            // HEAD: ZA=92238, AWR=236.006, 0, 0, NIS=1, 0
+            " 9.223800+4 2.360060+2          0          0          1          09237 2151    1\n",
+            // Isotope CONT: ZAI=92238, ABN=1.0, 0, LFW=0, NER=1, 0
+            " 9.223800+4 1.000000+0          0          0          1          09237 2151    2\n",
+            // Range CONT: EL=1e-5, EH=1e4, LRU=1, LRF=3, NRO=1, NAPS=0
+            " 1.000000-5 1.000000+4          1          3          1          09237 2151    3\n",
+            // TAB1 CONT: C1=0, C2=0, L1=0, L2=0, NR=1, NP=2
+            " 0.000000+0 0.000000+0          0          0          1          29237 2151    4\n",
+            // TAB1 interp: NBT=2, INT=2 (4 padding zeros fill the 6-field line)
+            "          2          2          0          0          0          09237 2151    5\n",
+            // TAB1 data: (1.0, 8.0), (1000.0, 10.0); remaining 2 slots are padding
+            " 1.000000+0 8.000000+0 1.000000+3 1.000000+1 0.000000+0 0.000000+09237 2151    6\n",
+            // RM CONT: SPI=0.0, AP=9.0, 0, 0, NLS=1, 0
+            " 0.000000+0 9.000000+0          0          0          1          09237 2151    7\n",
+            // L CONT: AWRI=236.006, 0, L=0, 0, 6*NRS=6, NRS=1
+            " 2.360060+2 0.000000+0          0          0          6          19237 2151    8\n",
+            // Resonance: ER=6.674, AJ=0.5, GN=1.493e-3, GG=23e-3, GFA=0, GFB=0
+            " 6.674000+0 5.000000-1 1.493000-3 2.300000-2 0.000000+0 0.000000+09237 2151    9\n",
+        );
+
+        let data = parse_endf_file2(endf).expect("NRO=1 fixture must parse cleanly");
+        assert_eq!(data.ranges.len(), 1, "one energy range");
+
+        let range = &data.ranges[0];
+        assert_eq!(
+            range.formalism,
+            ResonanceFormalism::ReichMoore,
+            "must be LRF=3"
+        );
+
+        let table = range
+            .ap_table
+            .as_ref()
+            .expect("NRO=1 range must have ap_table");
+        assert_eq!(table.points.len(), 2, "TAB1 must have 2 points");
+
+        // Exact boundary values.
+        assert!(
+            (table.evaluate(1.0) - 8.0).abs() < 1e-10,
+            "AP(1 eV) = 8.0 fm"
+        );
+        assert!(
+            (table.evaluate(1000.0) - 10.0).abs() < 1e-10,
+            "AP(1000 eV) = 10.0 fm"
+        );
+        // Lin-lin midpoint: AP(500.5 eV) ≈ 9.0 fm.
+        let mid = table.evaluate(500.5);
+        assert!((mid - 9.0).abs() < 0.01, "AP midpoint ≈ 9.0 fm, got {mid}");
+
+        // scattering_radius_at delegates to the table.
+        assert!(
+            (range.scattering_radius_at(1.0) - 8.0).abs() < 1e-10,
+            "scattering_radius_at(1 eV) = 8.0"
+        );
+        assert!(
+            (range.scattering_radius_at(1000.0) - 10.0).abs() < 1e-10,
+            "scattering_radius_at(1000 eV) = 10.0"
+        );
+
+        // Resonance is still parsed correctly.
+        assert_eq!(range.l_groups.len(), 1, "one L-group");
+        let res = &range.l_groups[0].resonances[0];
+        assert!((res.energy - 6.674).abs() < 1e-6);
     }
 }

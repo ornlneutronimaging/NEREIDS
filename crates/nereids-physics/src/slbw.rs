@@ -67,7 +67,7 @@ pub fn slbw_cross_sections(data: &ResonanceData, energy_ev: f64) -> SlbwCrossSec
             let channel_radius = if l_group.apl > 0.0 {
                 l_group.apl
             } else {
-                range.scattering_radius
+                range.scattering_radius_at(energy_ev)
             };
 
             let rho = channel::rho(energy_ev, awr_l, channel_radius);
@@ -95,8 +95,15 @@ pub fn slbw_cross_sections(data: &ResonanceData, energy_ev: f64) -> SlbwCrossSec
 
                     // Energy-dependent neutron width:
                     // Γ_n(E) = Γ_n(E_r) × √(E/E_r) × P_l(E)/P_l(E_r)
+                    // P_l(E_r) uses the channel radius evaluated at the resonance
+                    // energy (ENDF §2.2.1 NRO=1: AP is tabulated, not constant).
                     let gamma_n = if e_r.abs() > 1e-30 {
-                        let rho_r = channel::rho(e_r.abs(), awr_l, channel_radius);
+                        let radius_at_er = if l_group.apl > 0.0 {
+                            l_group.apl
+                        } else {
+                            range.scattering_radius_at(e_r.abs())
+                        };
+                        let rho_r = channel::rho(e_r.abs(), awr_l, radius_at_er);
                         let p_at_e = penetrability::penetrability(l, rho);
                         let p_at_er = penetrability::penetrability(l, rho_r);
                         if p_at_er > 1e-30 {
@@ -203,6 +210,7 @@ mod tests {
                     }],
                 }],
                 rml: None,
+                ap_table: None,
             }],
         };
 
@@ -249,6 +257,7 @@ mod tests {
                 scattering_radius: 9.4285,
                 l_groups: resonances.clone(),
                 rml: None,
+                ap_table: None,
             }],
         };
 
@@ -265,6 +274,7 @@ mod tests {
                 scattering_radius: 9.4285,
                 l_groups: resonances,
                 rml: None,
+                ap_table: None,
             }],
         };
 
