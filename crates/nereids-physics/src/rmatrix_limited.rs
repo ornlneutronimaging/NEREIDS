@@ -161,11 +161,19 @@ fn spin_group_cross_sections(
             // Reference: SAMMY rml/mrml03.f Fxradi — Zke = Twomhb*sqrt(Redmas*Factor)
             let e_c = e_cm + pp.q;
             if e_c <= 0.0 {
-                // Closed channel (below threshold): penetrability → 0.
+                // Closed channel (below threshold): P_c = 0, φ_c = 0.
                 p_c[c] = 0.0;
-                s_c[c] = 0.0;
                 phi_c[c] = 0.0;
                 is_closed[c] = true;
+                // SHF=0: convention is S_c = B_c (identical to the open-channel branch).
+                // This gives L_c = (S_c − B_c) + i·P_c = 0, so 1/L_c → ∞ and the Ỹ
+                // diagonal is handled by the near-zero guard below.
+                // SHF=1: the analytic shift factor at imaginary ρ (evanescent wave) is
+                // not yet implemented.  Setting S_c = 0 gives L_c = −B_c, which is finite
+                // for B_c ≠ 0 and allows 1/L_c to be computed; for B_c = 0 the guard
+                // below applies.  TODO: implement imaginary-ρ shift factors (#46).
+                // Reference: SAMMY rml/mrml07.f Pgh — PH = 1/(S−B+iP).
+                s_c[c] = if pp.shf == 0 { ch.boundary } else { 0.0 };
             } else {
                 // Channel wave number from reduced mass μ = MA·MB/(MA+MB).
                 // For elastic (MA=1, MB=AWR): k_c = wave_number(E_lab, AWR) [identical].
@@ -299,19 +307,21 @@ fn spin_group_cross_sections(
         .map(|c| {
             (0..nch)
                 .map(|cp| {
-                    // Closed-channel limit: L_c = (S_c − B_c) + i·P_c = 0 when
-                    // P_c = 0 and S_c = B_c (SHF=0, channel below threshold).
-                    // The correct physical limit is 1/L_c → ∞, NOT 0.
-                    //   • 1/L_c → ∞  ⇒  Ỹ[c,c] >> R[c,c]  ⇒  Ỹ⁻¹[c,c] ≈ L_c ≈ 0
-                    //     ⇒  XXXX ≈ 0 for closed channels: correct decoupling.
-                    //   • 1/L_c = 0  ⇒  Ỹ[c,c] = −R[c,c]  ⇒  Ỹ may be singular or
-                    //     dominated by off-diagonal R entries: wrong coupling.
-                    // Use a finite-but-large sentinel (1e30) to model the ∞ limit
-                    // without causing overflow in the matrix inversion.
-                    // Reference: SAMMY rml/mrml07.f — PH = 1/(S−B+iP); no explicit
-                    // guard because SAMMY avoids exact zero via analytic penetrability.
-                    let inv_l = if is_closed[c] {
-                        // L_c = 0: use large real sentinel so diagonal dominates.
+                    // L_c = (S_c − B_c) + i·P_c.
+                    // For SHF=0 closed channels: S_c = B_c and P_c = 0 ⇒ L_c = 0.
+                    // Correct limit: 1/L_c → ∞ ⇒ Ỹ[c,c] >> R[c,c] ⇒ Ỹ⁻¹[c,c] ≈ 0
+                    // ⇒ channel decouples from U.  Setting 1/L_c = 0 (old bug) removes
+                    // the diagonal and lets R dominate — wrong coupling / Ỹ singular.
+                    //
+                    // For SHF=1 or non-matching B_c, L_c is generally finite even when
+                    // P_c = 0; the dispersive (real) shift must be preserved.  Do NOT
+                    // force the sentinel just because the channel is sub-threshold; check
+                    // whether |L_c| is actually near zero.
+                    //
+                    // Reference: SAMMY rml/mrml07.f — PH = 1/(S−B+iP).
+                    let inv_l = if l_c[c].norm_sqr() < 1e-60 {
+                        // |L_c| < 1e-30: use finite-but-large sentinel so the diagonal
+                        // dominates and the channel decouples without overflow in inversion.
                         Complex64::new(1e30, 0.0)
                     } else {
                         Complex64::new(1.0, 0.0) / l_c[c]
