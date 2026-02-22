@@ -901,16 +901,13 @@ fn parse_tab1(lines: &[&str], pos: &mut usize) -> Result<Tab1, EndfParseError> {
         let nbt = nbt_raw.round() as usize;
 
         // Boundaries must be strictly increasing (ENDF §0.5).
-        if let Some(&prev) = boundaries.last() {
-            if nbt <= prev {
-                return Err(EndfParseError::UnsupportedFormat(format!(
-                    "TAB1 NBT[{}]={} is not greater than NBT[{}]={}",
-                    i,
-                    nbt,
-                    i - 1,
-                    prev
-                )));
-            }
+        if let Some(&prev) = boundaries.last()
+            && nbt <= prev
+        {
+            return Err(EndfParseError::UnsupportedFormat(format!(
+                "TAB1 NBT[{}]={} is not greater than NBT[{}]={}",
+                i, nbt, i - 1, prev
+            )));
         }
         boundaries.push(nbt);
         interp_codes.push(int_code);
