@@ -45,8 +45,16 @@ pub struct Tab1 {
 impl Tab1 {
     /// Evaluate the tabulated function at `x` by piecewise interpolation.
     ///
-    /// Values outside the tabulated range are extrapolated by clamping to the
-    /// nearest boundary value (no extrapolation beyond the table ends).
+    /// Values outside the tabulated range are clamped to the nearest endpoint
+    /// (no extrapolation).
+    ///
+    /// Log-interpolation modes (INT=3, 4, 5) require strictly positive
+    /// arguments for the logarithm.  If a tabulated value or x-coordinate
+    /// is non-positive where a logarithm would be taken, the function
+    /// transparently falls back to lin-lin interpolation for that interval
+    /// rather than producing NaN or panicking.  In practice, ENDF AP(E)
+    /// tables always have positive x (energy) and positive y (radius in fm),
+    /// so this guard is defensive only.
     pub fn evaluate(&self, x: f64) -> f64 {
         let pts = &self.points;
         if pts.is_empty() {
@@ -61,31 +69,50 @@ impl Tab1 {
 
         // Binary search: find the first index where pts[i].0 > x.
         // The interval containing x is [pts[i-1], pts[i]].
+        // Because the outer clamps ensure pts[0].0 < x < pts[last].0,
+        // we are guaranteed x0 < x1 (strict), so (x1 - x0) > 0.
         let i = pts.partition_point(|(xi, _)| *xi <= x);
         let (x0, y0) = pts[i - 1];
         let (x1, y1) = pts[i];
 
+        // Fallback to lin-lin for any interval; used when log guards fire.
+        let lin_lin = || {
+            let t = (x - x0) / (x1 - x0);
+            y0 + t * (y1 - y0)
+        };
+
         match self.interp_code_for_interval(i - 1) {
             1 => y0, // histogram: constant left value
             3 => {
-                // lin-log: linear in x, log in y
-                let t = (x - x0) / (x1 - x0);
-                (y0.ln() + t * (y1.ln() - y0.ln())).exp()
+                // lin-log: linear in x, log in y; requires y0, y1 > 0
+                if y0 > 0.0 && y1 > 0.0 {
+                    let t = (x - x0) / (x1 - x0);
+                    (y0.ln() + t * (y1.ln() - y0.ln())).exp()
+                } else {
+                    lin_lin()
+                }
             }
             4 => {
-                // log-lin: log in x, linear in y
-                let t = (x.ln() - x0.ln()) / (x1.ln() - x0.ln());
-                y0 + t * (y1 - y0)
+                // log-lin: log in x, linear in y; requires x0, x1, x > 0
+                if x0 > 0.0 && x1 > 0.0 && x > 0.0 {
+                    let t = (x.ln() - x0.ln()) / (x1.ln() - x0.ln());
+                    y0 + t * (y1 - y0)
+                } else {
+                    lin_lin()
+                }
             }
             5 => {
-                // log-log
-                let t = (x.ln() - x0.ln()) / (x1.ln() - x0.ln());
-                (y0.ln() + t * (y1.ln() - y0.ln())).exp()
+                // log-log; requires x0, x1, x, y0, y1 > 0
+                if x0 > 0.0 && x1 > 0.0 && x > 0.0 && y0 > 0.0 && y1 > 0.0 {
+                    let t = (x.ln() - x0.ln()) / (x1.ln() - x0.ln());
+                    (y0.ln() + t * (y1.ln() - y0.ln())).exp()
+                } else {
+                    lin_lin()
+                }
             }
             _ => {
                 // INT=2 (lin-lin) and any unknown code: linear interpolation
-                let t = (x - x0) / (x1 - x0);
-                y0 + t * (y1 - y0)
+                lin_lin()
             }
         }
     }
@@ -550,5 +577,44 @@ mod tests {
         // At 500.5 eV (midpoint): 9.0 fm
         let mid = range.scattering_radius_at(500.5);
         assert!((mid - 9.0).abs() < 0.01, "midpoint AP ≈ 9.0, got {mid}");
+    }
+
+    /// Log-guard fallback: if a y-value is non-positive in a lin-log (INT=3)
+    /// interval, evaluate() must not panic or return NaN; it falls back to
+    /// lin-lin.
+    #[test]
+    fn test_tab1_log_guard_nonpositive_y() {
+        // INT=3 (lin-log) with y0=0.0 — would call 0.0_f64.ln() = -inf without guard.
+        let table = Tab1 {
+            boundaries: vec![2],
+            interp_codes: vec![3], // lin-log
+            points: vec![(1.0, 0.0), (10.0, 1.0)],
+        };
+        let result = table.evaluate(5.0);
+        assert!(
+            result.is_finite(),
+            "fallback to lin-lin should give finite result, got {result}"
+        );
+    }
+
+    /// Log-guard fallback: if an x-coordinate is non-positive in a log-lin (INT=4)
+    /// interval, evaluate() falls back to lin-lin rather than panicking.
+    #[test]
+    fn test_tab1_log_guard_nonpositive_x() {
+        // INT=4 (log-lin) with x0=0.0 — would call 0.0_f64.ln() = -inf without guard.
+        let table = Tab1 {
+            boundaries: vec![2],
+            interp_codes: vec![4], // log-lin
+            points: vec![(0.0, 8.0), (10.0, 10.0)],
+        };
+        // x=0.0 is at the left boundary, so evaluate() clamps to y=8.0 before
+        // reaching the interpolation branch — no guard needed there.
+        assert!((table.evaluate(0.0) - 8.0).abs() < 1e-10);
+        // x=5.0 is interior; x0=0.0 triggers the log guard → lin-lin fallback.
+        let result = table.evaluate(5.0);
+        assert!(
+            result.is_finite(),
+            "fallback to lin-lin should give finite result, got {result}"
+        );
     }
 }

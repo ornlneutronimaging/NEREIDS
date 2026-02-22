@@ -862,6 +862,12 @@ fn parse_tab1(lines: &[&str], pos: &mut usize) -> Result<Tab1, EndfParseError> {
     let nr = cont.n1 as usize; // number of interpolation regions
     let np = cont.n2 as usize; // number of data points
 
+    // NR=0 is valid ENDF: it means a single implicit interpolation region
+    // covering all NP points with no explicit boundary record.  The
+    // evaluate() call will fall through to the `unwrap_or(2)` default in
+    // interp_code_for_interval(), which correctly returns INT=2 (lin-lin).
+    // When NR=0, the loop below is a no-op and the interp_raw vec stays empty.
+
     // Read NR×2 integers: (NBT, INT) pairs packed as ENDF floats.
     let interp_raw = parse_list_values(lines, pos, nr * 2)?;
     let mut boundaries = Vec::with_capacity(nr);
