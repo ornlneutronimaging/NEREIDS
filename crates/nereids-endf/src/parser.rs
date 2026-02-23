@@ -703,9 +703,10 @@ fn skip_tab1(lines: &[&str], pos: &mut usize) -> Result<(), EndfParseError> {
 /// Used to consume KBK and KPS background blocks in LRF=7 spin groups.
 ///
 /// Per ENDF-6 §2.2.1.6 and OpenScale File2Lrf7.f90:
-/// - CONT: [ED, EU, LBK, LPS, N1, N2]  — LBK/LPS type in L1
+/// - CONT: [ED, EU, LBK_or_LPS, <unused>, N1, N2]
+///   where L1 (LBK_or_LPS) is the type flag: LBK for KBK blocks, LPS for KPS blocks.
 /// - LIST: N1 data values
-/// - If LBK/LPS == 1: real TAB1 + imaginary TAB1
+/// - If LBK_or_LPS == 1: real TAB1 + imaginary TAB1
 fn skip_background_subrecord(lines: &[&str], pos: &mut usize) -> Result<(), EndfParseError> {
     let cont = parse_cont(lines, pos)?;
     let lbk_or_lps = cont.l1;
