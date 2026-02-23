@@ -479,27 +479,13 @@ fn parse_rmatrix_limited_range(
                     "LRF=7 spin-group channel IPP={ipp_raw} is out of range 1..={npp}"
                 )));
             }
-            // Reject explicit massless (photon) channels identified by MA < 0.5.
-            // PNT=0 is NOT the right discriminant — it means "do not compute
-            // penetrability analytically" and also appears on fission-fragment
-            // channels where P is intentionally set to zero.  Using PNT=0 would
-            // incorrectly reject valid massive-particle channels.
-            // The correct check is MA < 0.5: photons have MA=0; all massive
-            // particles have MA ≥ 1.  Matches SAMMY mrml01.f which identifies
-            // photon channels by particle mass, not by the PNT flag.
-            // SAMMY (mrml01.f lines 390-408) excludes photons from the R-matrix
-            // channel array, reading their widths into the Gamgam slot instead of
-            // the per-channel Gamma positions.  That stride/mapping is not yet
-            // implemented here; see GitHub issue #45.
-            let pp = &particle_pairs[ipp_raw - 1];
-            if pp.ma < 0.5 {
-                return Err(EndfParseError::UnsupportedFormat(format!(
-                    "LRF=7 spin-group has an explicit photon channel \
-                     (IPP={ipp_raw}, MA={}).  Requires Gamgam-slot width \
-                     mapping not yet implemented (see GitHub issue #45).",
-                    pp.ma
-                )));
-            }
+            // Photon channels (MA < 0.5, PNT=0) are stored as regular channels.
+            // The physics code sets P_c=1, S_c=0, φ_c=0 for massless particles
+            // (rmatrix_limited.rs, ENDF-6 §2.2.1.6 Note 4) and classifies them as
+            // capture channels via pp.mt == 102.  Their reduced width amplitudes
+            // appear at the corresponding column position in the resonance rows,
+            // exactly like any other channel.  Reference: ENDF-6 §2.2.1.6; SAMMY
+            // rml/mrml01.f (Ippx test, mrml07.f P=1 convention for massless).
             channels.push(RmlChannel {
                 particle_pair_idx: ipp_raw - 1, // convert 1-based ENDF index to 0-based
                 l: sg_values[b + 1] as u32,     // L
@@ -1269,6 +1255,96 @@ mod tests {
             (res1.widths[0] - 0.002).abs() < 1e-10,
             "res1 widths[0] must be 0.002 eV, got {}",
             res1.widths[0]
+        );
+    }
+
+    /// KRM=2 spin group with an explicit photon capture channel (IPP=2, MA=0).
+    ///
+    /// Before issue #45 the parser rejected MA<0.5 channels with UnsupportedFormat.
+    /// This test verifies that photon channels are now parsed and stored correctly:
+    ///   - channels[1] points to the photon particle pair (MT=102)
+    ///   - res.widths has two entries: [γ_elastic, γ_photon]
+    #[test]
+    fn test_krm2_explicit_photon_channel() {
+        // Minimal synthetic LRF=7, KRM=2, NJS=1 ENDF snippet.
+        // Two particle pairs: pair 1 = n+W184 (MT=2), pair 2 = γ+W185 (MT=102, MA=0).
+        // One spin group with 2 channels (elastic + photon); one resonance.
+        //
+        // Each ENDF line is 80 chars: 6×11-char fields + MAT(4)+MF(2)+MT(3)+NS(5).
+        const ENDF: &str = concat!(
+            // ── HEAD: ZA=74184, AWR=182, NIS=1 ─────────────────────────────────
+            " 7.418400+4 1.820000+2          0          0          1          07437 2151    1\n",
+            // ── Isotope CONT: NER=1 ─────────────────────────────────────────────
+            " 7.418400+4 1.000000+0          0          0          1          07437 2151    2\n",
+            // ── Range CONT: LRU=1, LRF=7, NRO=0 ────────────────────────────────
+            " 1.000000-5 1.000000+3          1          7          0          07437 2151    3\n",
+            // ── LRF=7 CONT: SPI=0, AP=0.7, IFG=0, KRM=2, NJS=1, KRL=0 ─────────
+            " 0.000000+0 7.000000-1          0          2          1          07437 2151    4\n",
+            // ── Particle-pair LIST CONT: NPP=2 in L1, N1=24, N2=2 ───────────────
+            " 0.000000+0 0.000000+0          2          0         24          27437 2151    5\n",
+            // Pair 1 (neutron+W184): MA=1, MB=182, ZA=0, ZB=0, IA=0.5, IB=0
+            " 1.000000+0 1.820000+2 0.000000+0 0.000000+0 5.000000-1 0.000000+07437 2151    6\n",
+            // Q=0, PNT=1, SHF=0, MT=2, PA=1, PB=1
+            " 0.000000+0 1.000000+0 0.000000+0 2.000000+0 1.000000+0 1.000000+07437 2151    7\n",
+            // Pair 2 (photon+W185): MA=0 (massless), MB=183, ZA=0, ZB=0, IA=0, IB=0.5
+            " 0.000000+0 1.830000+2 0.000000+0 0.000000+0 0.000000+0 5.000000-17437 2151    8\n",
+            // Q=6e6 eV (binding), PNT=0, SHF=0, MT=102 (capture), PA=1, PB=1
+            " 6.000000+6 0.000000+0 0.000000+0 1.020000+2 1.000000+0 1.000000+07437 2151    9\n",
+            // ── Spin-group LIST CONT: AJ=0.5, KBK=0, KPS=0, NPL=18, NCH+1=3 ────
+            " 5.000000-1 0.000000+0          0          0         18          37437 2151   10\n",
+            // Header row (6 zeros)
+            " 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+07437 2151   11\n",
+            // Channel 0 (elastic): IPP=1, L=0, SCH=0.5, BND=0, APE=0.7, APT=0.7
+            " 1.000000+0 0.000000+0 5.000000-1 0.000000+0 7.000000-1 7.000000-17437 2151   12\n",
+            // Channel 1 (photon): IPP=2, L=0, SCH=0, BND=0, APE=0, APT=0
+            " 2.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+07437 2151   13\n",
+            // ── Resonance LIST CONT: NPL=6, NRS=1 ───────────────────────────────
+            " 0.000000+0 0.000000+0          0          0          6          17437 2151   14\n",
+            // res0: ER=10 eV, γ_elastic=0.001, γ_photon=0.004, 3 padding zeros
+            " 1.000000+1 1.000000-3 4.000000-3 0.000000+0 0.000000+0 0.000000+07437 2151   15\n",
+        );
+
+        let data = parse_endf_file2(ENDF).expect("KRM=2 photon channel must parse without error");
+        let rml = data.ranges[0]
+            .rml
+            .as_ref()
+            .expect("LRF=7 range must have RmlData");
+
+        assert_eq!(rml.krm, 2, "KRM must be 2");
+        assert_eq!(rml.particle_pairs.len(), 2, "must have 2 particle pairs");
+        assert!(
+            rml.particle_pairs[1].ma < 0.5,
+            "pair 2 must be massless (photon)"
+        );
+        assert_eq!(
+            rml.particle_pairs[1].mt, 102,
+            "pair 2 must be MT=102 capture"
+        );
+
+        let sg = &rml.spin_groups[0];
+        assert_eq!(sg.channels.len(), 2, "spin group must have 2 channels");
+        assert_eq!(
+            sg.channels[0].particle_pair_idx, 0,
+            "channel 0 must point to pair 0 (elastic)"
+        );
+        assert_eq!(
+            sg.channels[1].particle_pair_idx, 1,
+            "channel 1 must point to pair 1 (photon)"
+        );
+
+        assert_eq!(sg.resonances.len(), 1, "must have 1 resonance");
+        let res = &sg.resonances[0];
+        assert!((res.energy - 10.0).abs() < 1e-10, "energy must be 10 eV");
+        assert_eq!(res.widths.len(), 2, "widths must have 2 entries (NCH=2)");
+        assert!(
+            (res.widths[0] - 0.001).abs() < 1e-10,
+            "widths[0] (elastic) must be 0.001, got {}",
+            res.widths[0]
+        );
+        assert!(
+            (res.widths[1] - 0.004).abs() < 1e-10,
+            "widths[1] (photon) must be 0.004, got {}",
+            res.widths[1]
         );
     }
 
