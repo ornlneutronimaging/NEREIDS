@@ -389,6 +389,14 @@ pub struct SpinGroup {
     pub channels: Vec<RmlChannel>,
     /// Resonances in this spin group.
     pub resonances: Vec<RmlResonance>,
+    /// True when the ENDF file contained KBK > 0 or KPS > 0 background correction
+    /// records for this spin group.  The records are consumed by the parser but
+    /// the background terms are **not applied** to the cross-section calculation
+    /// (matching SAMMY behaviour: mrml10.f is a matrix utility, not a background
+    /// reader; KPS is explicitly ignored in mrml07.f).  Cross-sections computed
+    /// for spin groups with background corrections are therefore approximate.
+    #[serde(default)]
+    pub has_background_correction: bool,
 }
 
 /// Complete R-Matrix Limited data for one energy range (LRF=7).
