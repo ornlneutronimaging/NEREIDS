@@ -211,11 +211,14 @@ fn spin_group_cross_sections(
                     // (different radii — cannot reuse the same (F,G) pair).
                     // Reference: SAMMY rml/mrml07.f Pgh — Pghcou, then Sinsix/Pf.
                     let eta = coulomb::sommerfeld_eta(pp.za, pp.zb, pp.ma, pp.mb, e_c);
-                    match (
-                        coulomb::coulomb_wave_functions(ch.l, eta, rho_eff),
-                        coulomb::coulomb_wave_functions(ch.l, eta, rho_true),
-                    ) {
-                        (Some((f, g, fp, gp)), Some((fl_t, gl_t, _, _))) => {
+                    // P_c/S_c depend only on rho_eff; φ_c depends only on rho_true.
+                    // The two solves are independent: a rho_true failure must not
+                    // close a channel that rho_eff confirmed is open.
+                    // Reference: SAMMY rml/mrml07.f Pgh — Pghcou (rho_eff),
+                    //   then Sinsix/Pf (rho_true).
+                    match coulomb::coulomb_wave_functions(ch.l, eta, rho_eff) {
+                        Some((f, g, fp, gp)) => {
+                            // rho_eff succeeded: channel is genuinely open.
                             let fg_sq = f * f + g * g;
                             p_c[c] = rho_eff / fg_sq;
                             // SHF=1: Coulomb shift ρ(F·F'+G·G')/(F²+G²).
@@ -227,14 +230,15 @@ fn spin_group_cross_sections(
                             } else {
                                 ch.boundary
                             };
-                            phi_c[c] = fl_t.atan2(gl_t);
+                            // φ_c from rho_true; if rho_true ≤ acch, default to 0
+                            // (hard-sphere limit φ → 0 as ρ → 0) without closing
+                            // the channel.
+                            phi_c[c] = coulomb::coulomb_wave_functions(ch.l, eta, rho_true)
+                                .map_or(0.0, |(fl_t, gl_t, _, _)| fl_t.atan2(gl_t));
                         }
-                        _ => {
-                            // rho ≤ acch (≈ 1e-8, SAMMY Coulfg threshold) or CF
-                            // non-convergence: penetrability → 0 as rho → 0.
-                            // Treat as closed rather than aborting evaluation;
-                            // this is the correct physical limit for channels
-                            // barely above threshold.
+                        None => {
+                            // rho_eff ≤ acch (≈ 1e-8, SAMMY Coulfg threshold):
+                            // penetrability → 0 at threshold; treat as closed.
                             // Reference: SAMMY coulomb/mrml08.f90 Coulfg — acch.
                             p_c[c] = 0.0;
                             s_c[c] = ch.boundary;
