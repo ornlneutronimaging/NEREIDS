@@ -91,19 +91,31 @@ pub fn spatial_map(
         return empty_result();
     }
 
-    // Precompute Doppler+resolution-broadened cross-sections once.
-    // These are independent of the per-pixel densities, so computing them
-    // inside the LM inner loop is wasteful.  Sharing via Arc is free
-    // (read-only) across rayon threads.
-    let instrument_params = config.resolution.as_ref().map(|r| InstrumentParams {
-        resolution: r.clone(),
-    });
-    let xs = Arc::new(broadened_cross_sections(
-        &config.energies,
-        &config.resonance_data,
-        config.temperature_k,
-        instrument_params.as_ref(),
-    ));
+    // Use caller-supplied precomputed cross-sections when available; only call
+    // broadened_cross_sections when none are provided.  This lets repeated
+    // spatial_map calls with the same isotopes/energy grid share one precompute
+    // result and avoids redundant Doppler+resolution broadening work.
+    let xs: Arc<Vec<Vec<f64>>> = match config.precomputed_cross_sections.clone() {
+        Some(cached) => cached,
+        None => {
+            let instrument_params = config.resolution.as_ref().map(|r| InstrumentParams {
+                resolution: r.clone(),
+            });
+            Arc::new(broadened_cross_sections(
+                &config.energies,
+                &config.resonance_data,
+                config.temperature_k,
+                instrument_params.as_ref(),
+            ))
+        }
+    };
+
+    // broadened_cross_sections has no internal cancellation checkpoints, so a
+    // cancel signal raised during precompute only takes effect here, after it
+    // completes.  Check once more before launching pixel fitting.
+    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+        return empty_result();
+    }
 
     // Build a config variant with the precomputed cross-sections injected.
     // fit_spectrum will use PrecomputedTransmissionModel when this field is Some.
