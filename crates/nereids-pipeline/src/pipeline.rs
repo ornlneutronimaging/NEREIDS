@@ -104,6 +104,24 @@ pub fn fit_spectrum(measured_t: &[f64], sigma: &[f64], config: &FitConfig) -> Sp
     // Use precomputed cross-sections when available (fast path for spatial_map).
     // Fall back to the full forward-model path for single-spectrum calls.
     let result = if let Some(xs) = &config.precomputed_cross_sections {
+        assert_eq!(
+            xs.len(),
+            n_isotopes,
+            "precomputed_cross_sections has {} isotope(s) but resonance_data has {}",
+            xs.len(),
+            n_isotopes,
+        );
+        let n_e = config.energies.len();
+        for (i, row) in xs.iter().enumerate() {
+            assert_eq!(
+                row.len(),
+                n_e,
+                "precomputed_cross_sections[{}] has {} energy points but energies has {}",
+                i,
+                row.len(),
+                n_e,
+            );
+        }
         let model = PrecomputedTransmissionModel {
             cross_sections: xs.clone(),
             density_indices: (0..n_isotopes).collect(),
