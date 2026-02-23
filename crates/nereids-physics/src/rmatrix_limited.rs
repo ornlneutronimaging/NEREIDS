@@ -241,8 +241,19 @@ fn spin_group_cross_sections(
                             ch.l
                         );
                     }
-                    let (sin_phi, cos_phi) = coulomb::coulomb_phase(ch.l, eta, rho_true);
-                    phi_c[c] = sin_phi.atan2(cos_phi);
+                    // coulomb_phase silently returns (0,1) on solver failure;
+                    // call coulomb_wave_functions directly so a non-convergence
+                    // at rho_true panics just like the P/S block above.
+                    let (fl_t, gl_t, _, _) = coulomb::coulomb_wave_functions(ch.l, eta, rho_true)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "coulomb_wave_functions did not converge for \
+                                     Coulomb phase at rho_true (L={}, eta={eta:.6}, \
+                                     rho_true={rho_true:.6e})",
+                                ch.l
+                            )
+                        });
+                    phi_c[c] = fl_t.atan2(gl_t);
                 } else {
                     // Hard-sphere (Blatt-Weisskopf) channel.
                     p_c[c] = penetrability::penetrability(ch.l, rho_eff);
