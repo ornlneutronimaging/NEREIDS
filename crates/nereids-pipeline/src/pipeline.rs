@@ -104,6 +104,7 @@ pub fn fit_spectrum(measured_t: &[f64], sigma: &[f64], config: &FitConfig) -> Sp
     // Use precomputed cross-sections when available (fast path for spatial_map).
     // Fall back to the full forward-model path for single-spectrum calls.
     let result = if let Some(xs) = &config.precomputed_cross_sections {
+        assert!(n_isotopes > 0, "resonance_data is empty — nothing to fit",);
         assert_eq!(
             xs.len(),
             n_isotopes,
