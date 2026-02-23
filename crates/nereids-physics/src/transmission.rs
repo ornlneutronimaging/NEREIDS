@@ -169,7 +169,7 @@ pub fn forward_model(
 /// * `temperature_k`   — Sample temperature for Doppler broadening.
 /// * `instrument`      — Optional instrument resolution parameters.
 /// * `cancel`          — Optional cancellation token.  When set, the function
-///                       returns `None` after completing the current isotope.
+///   returns `None` after completing the current isotope.
 ///
 /// # Returns
 /// `Some(xs)` — one cross-section vector per isotope — on success.
