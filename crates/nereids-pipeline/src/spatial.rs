@@ -57,20 +57,38 @@ pub fn spatial_map(
 
     assert_eq!(n_energies, config.energies.len());
 
-    // Bail out immediately if already cancelled — avoid the expensive precompute.
+    // Collect live pixel coordinates first (cheap).  We must know there is
+    // actual work to do before paying the expensive precompute cost below.
+    let mut pixel_coords: Vec<(usize, usize)> = Vec::new();
+    for y in 0..height {
+        for x in 0..width {
+            let is_dead = dead_pixels.is_some_and(|m| m[[y, x]]);
+            if !is_dead {
+                pixel_coords.push((y, x));
+            }
+        }
+    }
+
+    // Bail out before the expensive precompute if:
+    //   (a) the cancel flag is already set, or
+    //   (b) every pixel is masked dead — nothing to fit.
+    let empty_result = || SpatialResult {
+        density_maps: (0..n_isotopes)
+            .map(|_| Array2::zeros((height, width)))
+            .collect(),
+        uncertainty_maps: (0..n_isotopes)
+            .map(|_| Array2::from_elem((height, width), f64::NAN))
+            .collect(),
+        chi_squared_map: Array2::from_elem((height, width), f64::NAN),
+        converged_map: Array2::from_elem((height, width), false),
+        n_converged: 0,
+        n_total: 0,
+    };
     if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
-        return SpatialResult {
-            density_maps: (0..n_isotopes)
-                .map(|_| Array2::zeros((height, width)))
-                .collect(),
-            uncertainty_maps: (0..n_isotopes)
-                .map(|_| Array2::from_elem((height, width), f64::NAN))
-                .collect(),
-            chi_squared_map: Array2::from_elem((height, width), f64::NAN),
-            converged_map: Array2::from_elem((height, width), false),
-            n_converged: 0,
-            n_total: 0,
-        };
+        return empty_result();
+    }
+    if pixel_coords.is_empty() {
+        return empty_result();
     }
 
     // Precompute Doppler+resolution-broadened cross-sections once.
@@ -93,17 +111,6 @@ pub fn spatial_map(
         precomputed_cross_sections: Some(xs),
         ..config.clone()
     };
-
-    // Collect pixel coordinates to fit
-    let mut pixel_coords: Vec<(usize, usize)> = Vec::new();
-    for y in 0..height {
-        for x in 0..width {
-            let is_dead = dead_pixels.is_some_and(|m| m[[y, x]]);
-            if !is_dead {
-                pixel_coords.push((y, x));
-            }
-        }
-    }
 
     // Fit all pixels in parallel, skipping new work when cancelled
     let results: Vec<((usize, usize), SpectrumFitResult)> = pixel_coords
