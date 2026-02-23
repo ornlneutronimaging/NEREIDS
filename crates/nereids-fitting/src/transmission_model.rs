@@ -34,6 +34,10 @@ pub struct PrecomputedTransmissionModel {
 
 impl FitModel for PrecomputedTransmissionModel {
     fn evaluate(&self, params: &[f64]) -> Vec<f64> {
+        assert!(
+            !self.cross_sections.is_empty(),
+            "PrecomputedTransmissionModel.cross_sections must not be empty"
+        );
         let n_e = self.cross_sections[0].len();
         let mut neg_opt = vec![0.0f64; n_e];
         for (i, xs) in self.cross_sections.iter().enumerate() {
@@ -138,10 +142,93 @@ impl FitModel for TransmissionFitModel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lm::{self, LmConfig};
+    use crate::lm::{self, FitModel, LmConfig};
     use crate::parameters::{FitParameter, ParameterSet};
     use nereids_core::types::Isotope;
     use nereids_endf::resonance::{LGroup, Resonance, ResonanceFormalism, ResonanceRange};
+
+    // ── PrecomputedTransmissionModel ─────────────────────────────────────────
+
+    /// Verify Beer-Lambert: T(E) = exp(-Σᵢ nᵢ·σᵢ(E)).
+    #[test]
+    fn precomputed_evaluate_matches_beer_lambert() {
+        let xs = Arc::new(vec![
+            vec![1.0, 2.0, 3.0], // isotope 0
+            vec![0.5, 0.5, 0.5], // isotope 1
+        ]);
+        let model = PrecomputedTransmissionModel {
+            cross_sections: xs,
+            density_indices: vec![0, 1],
+        };
+
+        let params = [0.2f64, 0.4f64];
+        let y = model.evaluate(&params);
+
+        let expected: Vec<f64> = (0..3)
+            .map(|i| {
+                let s0 = [1.0, 2.0, 3.0][i];
+                let s1 = [0.5, 0.5, 0.5][i];
+                (-params[0] * s0 - params[1] * s1).exp()
+            })
+            .collect();
+
+        assert_eq!(y.len(), 3);
+        for (yi, ei) in y.iter().zip(expected.iter()) {
+            assert!(
+                (yi - ei).abs() < 1e-12,
+                "evaluate mismatch: got {yi}, expected {ei}"
+            );
+        }
+    }
+
+    /// Analytical Jacobian ∂T/∂nᵢ = -σᵢ(E)·T(E) must match central-difference FD.
+    #[test]
+    fn precomputed_analytical_jacobian_matches_finite_difference() {
+        let xs = Arc::new(vec![
+            vec![1.0, 2.0, 3.0], // isotope 0
+            vec![0.5, 0.5, 0.5], // isotope 1
+        ]);
+        let model = PrecomputedTransmissionModel {
+            cross_sections: xs,
+            density_indices: vec![0, 1],
+        };
+
+        let params = [0.2f64, 0.4f64];
+        let y = model.evaluate(&params);
+        let free = vec![0usize, 1usize];
+
+        let jac = model
+            .analytical_jacobian(&params, &free, &y)
+            .expect("analytical_jacobian should return Some(_)");
+
+        assert_eq!(jac.len(), 3); // n_energies
+        for row in &jac {
+            assert_eq!(row.len(), 2); // n_free_params
+        }
+
+        // Central-difference reference.
+        let h = 1e-6f64;
+        for (col, &p_idx) in free.iter().enumerate() {
+            let mut p_plus = params;
+            let mut p_minus = params;
+            p_plus[p_idx] += h;
+            p_minus[p_idx] -= h;
+
+            let y_plus = model.evaluate(&p_plus);
+            let y_minus = model.evaluate(&p_minus);
+
+            for i in 0..3 {
+                let fd = (y_plus[i] - y_minus[i]) / (2.0 * h);
+                let ana = jac[i][col];
+                assert!(
+                    (fd - ana).abs() < 1e-6,
+                    "Jacobian mismatch (row {i}, col {col}): FD={fd:.8}, analytical={ana:.8}"
+                );
+            }
+        }
+    }
+
+    // ── TransmissionFitModel ─────────────────────────────────────────────────
 
     fn u238_single_resonance() -> ResonanceData {
         ResonanceData {
