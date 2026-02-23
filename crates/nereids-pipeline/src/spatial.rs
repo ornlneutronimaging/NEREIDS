@@ -61,10 +61,9 @@ pub fn spatial_map(
     // These are independent of the per-pixel densities, so computing them
     // inside the LM inner loop is wasteful.  Sharing via Arc is free
     // (read-only) across rayon threads.
-    let instrument_params = config
-        .resolution
-        .as_ref()
-        .map(|r| InstrumentParams { resolution: r.clone() });
+    let instrument_params = config.resolution.as_ref().map(|r| InstrumentParams {
+        resolution: r.clone(),
+    });
     let xs = Arc::new(broadened_cross_sections(
         &config.energies,
         &config.resonance_data,
