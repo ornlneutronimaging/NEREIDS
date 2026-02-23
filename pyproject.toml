@@ -29,7 +29,7 @@ jupyter = ">=1.0"
 jupyterlab = ">=4.5.4,<5"
 
 [tool.pixi.tasks]
-build = { cmd = "env -u VIRTUAL_ENV maturin develop --manifest-path bindings/python/Cargo.toml" }
+build = { cmd = "env -u VIRTUAL_ENV maturin develop --release --manifest-path bindings/python/Cargo.toml" }
 test-rust = { cmd = "env -u VIRTUAL_ENV cargo test --workspace" }
 test-python = "python -m pytest tests/"
 test = { depends-on = ["test-rust", "test-python"] }

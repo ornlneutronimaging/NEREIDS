@@ -22,6 +22,8 @@
 //! - `cro/` and `xxx/` modules — cross-section to transmission conversion
 //! - Manual Section 2 (transmission definition), Section 5 (experimental corrections)
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use nereids_endf::resonance::ResonanceData;
 
 use crate::doppler::{self, DopplerParams};
@@ -152,6 +154,71 @@ pub fn forward_model(
 
     // 5. Beer-Lambert: T = exp(-attenuation)
     total_attenuation.iter().map(|&att| (-att).exp()).collect()
+}
+
+/// Compute Doppler- and resolution-broadened cross-sections for each isotope.
+///
+/// This is the expensive physics step that should be done **once** before
+/// fitting many pixels with the same isotopes and energy grid.  The result
+/// feeds directly into `nereids_fitting::transmission_model::PrecomputedTransmissionModel`,
+/// making per-pixel Beer-Lambert evaluation trivial.
+///
+/// # Arguments
+/// * `energies`        — Energy grid in eV (sorted ascending).
+/// * `resonance_data`  — Resonance parameters for each isotope.
+/// * `temperature_k`   — Sample temperature for Doppler broadening.
+/// * `instrument`      — Optional instrument resolution parameters.
+/// * `cancel`          — Optional cancellation token.  When set, the function
+///   returns `None` after completing the current isotope.
+///
+/// # Returns
+/// `Some(xs)` — one cross-section vector per isotope — on success.
+/// `None` if the `cancel` flag was observed between isotopes.
+pub fn broadened_cross_sections(
+    energies: &[f64],
+    resonance_data: &[ResonanceData],
+    temperature_k: f64,
+    instrument: Option<&InstrumentParams>,
+    cancel: Option<&AtomicBool>,
+) -> Option<Vec<Vec<f64>>> {
+    let mut result = Vec::with_capacity(resonance_data.len());
+
+    for rd in resonance_data {
+        // Check cancellation between isotopes — each per-isotope broadening
+        // step can be expensive (Doppler FGM × N_energy), so we bail here
+        // rather than inside the inner loop.
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return None;
+        }
+
+        // 1. Unbroadened total cross-sections
+        let unbroadened: Vec<f64> = energies
+            .iter()
+            .map(|&e| reich_moore::cross_sections_at_energy(rd, e).total)
+            .collect();
+
+        // 2. Doppler broadening
+        let after_doppler = if temperature_k > 0.0 {
+            let params = DopplerParams {
+                temperature_k,
+                awr: rd.awr,
+            };
+            doppler::doppler_broaden(energies, &unbroadened, &params)
+        } else {
+            unbroadened
+        };
+
+        // 3. Resolution broadening
+        let xs = if let Some(inst) = instrument {
+            resolution::apply_resolution(energies, &after_doppler, &inst.resolution)
+        } else {
+            after_doppler
+        };
+
+        result.push(xs);
+    }
+
+    Some(result)
 }
 
 #[cfg(test)]

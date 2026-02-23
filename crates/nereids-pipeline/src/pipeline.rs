@@ -10,7 +10,7 @@ use std::sync::Arc;
 use nereids_endf::resonance::ResonanceData;
 use nereids_fitting::lm::{self, LmConfig};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
-use nereids_fitting::transmission_model::TransmissionFitModel;
+use nereids_fitting::transmission_model::{PrecomputedTransmissionModel, TransmissionFitModel};
 use nereids_physics::resolution::ResolutionFunction;
 use nereids_physics::transmission::InstrumentParams;
 
@@ -31,6 +31,14 @@ pub struct FitConfig {
     pub initial_densities: Vec<f64>,
     /// LM optimizer configuration.
     pub lm_config: LmConfig,
+    /// Precomputed Doppler+resolution-broadened cross-sections, one `Vec<f64>`
+    /// per isotope.  When `Some`, `fit_spectrum` skips the expensive resonance
+    /// and broadening computation and uses `PrecomputedTransmissionModel` instead.
+    ///
+    /// Compute with `nereids_physics::transmission::broadened_cross_sections`
+    /// and wrap in `Arc` before the `spatial_map` / `fit_roi` loop so the
+    /// result is shared read-only across all rayon threads.
+    pub precomputed_cross_sections: Option<Arc<Vec<Vec<f64>>>>,
 }
 
 /// Result of fitting a single spectrum.
@@ -75,19 +83,6 @@ pub fn fit_spectrum(measured_t: &[f64], sigma: &[f64], config: &FitConfig) -> Sp
         config.energies.len(),
     );
 
-    let instrument = config
-        .resolution
-        .clone()
-        .map(|r| Arc::new(InstrumentParams { resolution: r }));
-
-    let model = TransmissionFitModel {
-        energies: config.energies.clone(),
-        resonance_data: config.resonance_data.clone(),
-        temperature_k: config.temperature_k,
-        instrument,
-        density_indices: (0..n_isotopes).collect(),
-    };
-
     let mut params = ParameterSet::new(
         config
             .initial_densities
@@ -106,7 +101,47 @@ pub fn fit_spectrum(measured_t: &[f64], sigma: &[f64], config: &FitConfig) -> Sp
             .collect(),
     );
 
-    let result = lm::levenberg_marquardt(&model, measured_t, sigma, &mut params, &config.lm_config);
+    // Use precomputed cross-sections when available (fast path for spatial_map).
+    // Fall back to the full forward-model path for single-spectrum calls.
+    let result = if let Some(xs) = &config.precomputed_cross_sections {
+        assert!(n_isotopes > 0, "resonance_data is empty — nothing to fit",);
+        assert_eq!(
+            xs.len(),
+            n_isotopes,
+            "precomputed_cross_sections has {} isotope(s) but resonance_data has {}",
+            xs.len(),
+            n_isotopes,
+        );
+        let n_e = config.energies.len();
+        for (i, row) in xs.iter().enumerate() {
+            assert_eq!(
+                row.len(),
+                n_e,
+                "precomputed_cross_sections[{}] has {} energy points but energies has {}",
+                i,
+                row.len(),
+                n_e,
+            );
+        }
+        let model = PrecomputedTransmissionModel {
+            cross_sections: xs.clone(),
+            density_indices: (0..n_isotopes).collect(),
+        };
+        lm::levenberg_marquardt(&model, measured_t, sigma, &mut params, &config.lm_config)
+    } else {
+        let instrument = config
+            .resolution
+            .clone()
+            .map(|r| Arc::new(InstrumentParams { resolution: r }));
+        let model = TransmissionFitModel {
+            energies: config.energies.clone(),
+            resonance_data: config.resonance_data.clone(),
+            temperature_k: config.temperature_k,
+            instrument,
+            density_indices: (0..n_isotopes).collect(),
+        };
+        lm::levenberg_marquardt(&model, measured_t, sigma, &mut params, &config.lm_config)
+    };
 
     let densities: Vec<f64> = (0..n_isotopes).map(|i| result.params[i]).collect();
     let uncertainties = result
@@ -185,6 +220,7 @@ mod tests {
             resolution: None,
             initial_densities: vec![0.001],
             lm_config: LmConfig::default(),
+            precomputed_cross_sections: None,
         };
 
         let result = fit_spectrum(&y_obs, &sigma, &config);

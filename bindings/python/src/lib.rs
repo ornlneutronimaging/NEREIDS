@@ -1131,6 +1131,7 @@ fn py_spatial_map(
             max_iter,
             ..LmConfig::default()
         },
+        precomputed_cross_sections: None,
     };
 
     // Clone arrays only after all validation passes
@@ -1285,6 +1286,7 @@ fn py_fit_roi(
             max_iter,
             ..LmConfig::default()
         },
+        precomputed_cross_sections: None,
     };
 
     // Clone arrays only after all validation passes

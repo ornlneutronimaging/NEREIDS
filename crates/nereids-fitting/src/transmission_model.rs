@@ -11,6 +11,98 @@ use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
 
 use crate::lm::FitModel;
 
+/// Transmission model backed by precomputed broadened cross-sections.
+///
+/// The expensive physics steps (resonance → σ(E), Doppler broadening,
+/// resolution broadening) are computed once and stored.  Each `evaluate()`
+/// call performs only the Beer-Lambert step:
+///
+///   T(E) = exp(−Σᵢ nᵢ · σ_D,i(E))
+///
+/// which is O(N_energy) instead of O(N_energy × N_resonances).  For a
+/// 128×128 spatial map this is ~100–1000× faster than `TransmissionFitModel`.
+///
+/// Construct via `nereids_physics::transmission::broadened_cross_sections`,
+/// then wrap in `Arc` so the same precomputed data is shared read-only
+/// across all rayon worker threads.
+pub struct PrecomputedTransmissionModel {
+    /// Broadened cross-sections σ_D(E) per isotope, shape [n_isotopes][n_energies].
+    pub cross_sections: Arc<Vec<Vec<f64>>>,
+    /// Mapping: `params[density_indices[i]]` is the density of isotope `i`.
+    pub density_indices: Vec<usize>,
+}
+
+impl FitModel for PrecomputedTransmissionModel {
+    fn evaluate(&self, params: &[f64]) -> Vec<f64> {
+        assert!(
+            !self.cross_sections.is_empty(),
+            "PrecomputedTransmissionModel.cross_sections must not be empty"
+        );
+        let n_e = self.cross_sections[0].len();
+        let mut neg_opt = vec![0.0f64; n_e];
+        for (i, xs) in self.cross_sections.iter().enumerate() {
+            let density = params[self.density_indices[i]];
+            if density > 0.0 {
+                for (j, &sigma) in xs.iter().enumerate() {
+                    neg_opt[j] -= density * sigma;
+                }
+            }
+        }
+        neg_opt.iter().map(|&d| d.exp()).collect()
+    }
+
+    /// Analytical Jacobian for the Beer-Lambert transmission model.
+    ///
+    /// T(E) = exp(-Σᵢ nᵢ · σᵢ(E))
+    /// ∂T/∂nᵢ = -σᵢ(E) · T(E)
+    ///
+    /// Costs O(N_energy × N_isotopes) with zero extra evaluate() calls,
+    /// because T(E) is already in `y_current` from the LM loop.
+    /// This eliminates N_free extra evaluate() calls per LM iteration
+    /// compared to finite-difference Jacobians.
+    fn analytical_jacobian(
+        &self,
+        _params: &[f64],
+        free_param_indices: &[usize],
+        y_current: &[f64],
+    ) -> Option<Vec<Vec<f64>>> {
+        let n_e = y_current.len();
+
+        // For each free parameter, sum the cross-sections of every isotope
+        // tied to that parameter index.  The Beer-Lambert derivative is:
+        //   ∂T/∂n_fp = -T(E) · Σ_{iso: density_indices[iso]==fp_idx} σ_iso(E)
+        // Using only the first match (via .position) would give the wrong
+        // gradient whenever multiple isotopes share one density parameter.
+        let fp_xs_sums: Vec<Vec<f64>> = free_param_indices
+            .iter()
+            .map(|&fp_idx| {
+                let mut sum = vec![0.0f64; n_e];
+                for (iso, &di) in self.density_indices.iter().enumerate() {
+                    if di == fp_idx {
+                        for (j, &sigma) in self.cross_sections[iso].iter().enumerate() {
+                            sum[j] += sigma;
+                        }
+                    }
+                }
+                sum
+            })
+            .collect();
+
+        // jacobian[i][j] = ∂T(E_i)/∂params[free_param_indices[j]]
+        //                = -(Σ σ_iso(E_i)) · T(E_i)   (Beer-Lambert derivative)
+        let jacobian: Vec<Vec<f64>> = (0..n_e)
+            .map(|i| {
+                fp_xs_sums
+                    .iter()
+                    .map(|xs_sum| -xs_sum[i] * y_current[i])
+                    .collect()
+            })
+            .collect();
+
+        Some(jacobian)
+    }
+}
+
 /// Forward model for fitting isotopic areal densities from transmission data.
 ///
 /// The model computes T(E) for a set of isotopes with variable areal densities.
@@ -55,10 +147,127 @@ impl FitModel for TransmissionFitModel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lm::{self, LmConfig};
+    use crate::lm::{self, FitModel, LmConfig};
     use crate::parameters::{FitParameter, ParameterSet};
     use nereids_core::types::Isotope;
     use nereids_endf::resonance::{LGroup, Resonance, ResonanceFormalism, ResonanceRange};
+
+    // ── PrecomputedTransmissionModel ─────────────────────────────────────────
+
+    /// Verify Beer-Lambert: T(E) = exp(-Σᵢ nᵢ·σᵢ(E)).
+    #[test]
+    fn precomputed_evaluate_matches_beer_lambert() {
+        let xs = Arc::new(vec![
+            vec![1.0, 2.0, 3.0], // isotope 0
+            vec![0.5, 0.5, 0.5], // isotope 1
+        ]);
+        let model = PrecomputedTransmissionModel {
+            cross_sections: xs,
+            density_indices: vec![0, 1],
+        };
+
+        let params = [0.2f64, 0.4f64];
+        let y = model.evaluate(&params);
+
+        let expected: Vec<f64> = (0..3)
+            .map(|i| {
+                let s0 = [1.0, 2.0, 3.0][i];
+                let s1 = [0.5, 0.5, 0.5][i];
+                (-params[0] * s0 - params[1] * s1).exp()
+            })
+            .collect();
+
+        assert_eq!(y.len(), 3);
+        for (yi, ei) in y.iter().zip(expected.iter()) {
+            assert!(
+                (yi - ei).abs() < 1e-12,
+                "evaluate mismatch: got {yi}, expected {ei}"
+            );
+        }
+    }
+
+    /// Analytical Jacobian ∂T/∂nᵢ = -σᵢ(E)·T(E) must match central-difference FD.
+    #[test]
+    fn precomputed_analytical_jacobian_matches_finite_difference() {
+        let xs = Arc::new(vec![
+            vec![1.0, 2.0, 3.0], // isotope 0
+            vec![0.5, 0.5, 0.5], // isotope 1
+        ]);
+        let model = PrecomputedTransmissionModel {
+            cross_sections: xs,
+            density_indices: vec![0, 1],
+        };
+
+        let params = [0.2f64, 0.4f64];
+        let y = model.evaluate(&params);
+        let free = vec![0usize, 1usize];
+
+        let jac = model
+            .analytical_jacobian(&params, &free, &y)
+            .expect("analytical_jacobian should return Some(_)");
+
+        assert_eq!(jac.len(), 3); // n_energies
+        for row in &jac {
+            assert_eq!(row.len(), 2); // n_free_params
+        }
+
+        // Central-difference reference.
+        let h = 1e-6f64;
+        for (col, &p_idx) in free.iter().enumerate() {
+            let mut p_plus = params;
+            let mut p_minus = params;
+            p_plus[p_idx] += h;
+            p_minus[p_idx] -= h;
+
+            let y_plus = model.evaluate(&p_plus);
+            let y_minus = model.evaluate(&p_minus);
+
+            for i in 0..3 {
+                let fd = (y_plus[i] - y_minus[i]) / (2.0 * h);
+                let ana = jac[i][col];
+                assert!(
+                    (fd - ana).abs() < 1e-6,
+                    "Jacobian mismatch (row {i}, col {col}): FD={fd:.8}, analytical={ana:.8}"
+                );
+            }
+        }
+    }
+
+    /// When two isotopes share a density parameter, the Jacobian column must
+    /// equal -T(E) * (σ₀(E) + σ₁(E)), not just the first isotope's σ.
+    #[test]
+    fn precomputed_jacobian_tied_parameters_sums_both_isotopes() {
+        // Two isotopes mapped to the same density parameter (index 0).
+        let xs = Arc::new(vec![
+            vec![1.0, 2.0, 3.0], // isotope 0
+            vec![0.5, 1.0, 1.5], // isotope 1 — tied to same param
+        ]);
+        let model = PrecomputedTransmissionModel {
+            cross_sections: xs,
+            density_indices: vec![0, 0], // both isotopes share param[0]
+        };
+
+        let params = [0.1f64];
+        let y = model.evaluate(&params);
+        let free = vec![0usize];
+
+        let jac = model
+            .analytical_jacobian(&params, &free, &y)
+            .expect("analytical_jacobian should return Some(_)");
+
+        // Expected: ∂T/∂n = -T(E) * (σ₀(E) + σ₁(E))
+        for i in 0..3 {
+            let sigma_sum = [1.0, 2.0, 3.0][i] + [0.5, 1.0, 1.5][i];
+            let expected = -y[i] * sigma_sum;
+            assert!(
+                (jac[i][0] - expected).abs() < 1e-12,
+                "Tied Jacobian mismatch at E[{i}]: got {}, expected {expected}",
+                jac[i][0]
+            );
+        }
+    }
+
+    // ── TransmissionFitModel ─────────────────────────────────────────────────
 
     fn u238_single_resonance() -> ResonanceData {
         ResonanceData {

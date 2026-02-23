@@ -5,7 +5,10 @@
 
 use ndarray::{Array2, Array3};
 use rayon::prelude::*;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+use nereids_physics::transmission::{InstrumentParams, broadened_cross_sections};
 
 use crate::pipeline::{FitConfig, SpectrumFitResult, fit_spectrum};
 
@@ -54,7 +57,8 @@ pub fn spatial_map(
 
     assert_eq!(n_energies, config.energies.len());
 
-    // Collect pixel coordinates to fit
+    // Collect live pixel coordinates first (cheap).  We must know there is
+    // actual work to do before paying the expensive precompute cost below.
     let mut pixel_coords: Vec<(usize, usize)> = Vec::new();
     for y in 0..height {
         for x in 0..width {
@@ -64,6 +68,60 @@ pub fn spatial_map(
             }
         }
     }
+
+    // Bail out before the expensive precompute if:
+    //   (a) the cancel flag is already set, or
+    //   (b) every pixel is masked dead — nothing to fit.
+    let empty_result = || SpatialResult {
+        density_maps: (0..n_isotopes)
+            .map(|_| Array2::zeros((height, width)))
+            .collect(),
+        uncertainty_maps: (0..n_isotopes)
+            .map(|_| Array2::from_elem((height, width), f64::NAN))
+            .collect(),
+        chi_squared_map: Array2::from_elem((height, width), f64::NAN),
+        converged_map: Array2::from_elem((height, width), false),
+        n_converged: 0,
+        n_total: 0,
+    };
+    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+        return empty_result();
+    }
+    if pixel_coords.is_empty() {
+        return empty_result();
+    }
+
+    // Use caller-supplied precomputed cross-sections when available; only call
+    // broadened_cross_sections when none are provided.  This lets repeated
+    // spatial_map calls with the same isotopes/energy grid share one precompute
+    // result and avoids redundant Doppler+resolution broadening work.
+    let xs: Arc<Vec<Vec<f64>>> = match config.precomputed_cross_sections.clone() {
+        Some(cached) => cached,
+        None => {
+            let instrument_params = config.resolution.as_ref().map(|r| InstrumentParams {
+                resolution: r.clone(),
+            });
+            // Pass the cancel token so precompute can bail between isotopes.
+            // Returns None if cancelled mid-precompute.
+            let Some(xs) = broadened_cross_sections(
+                &config.energies,
+                &config.resonance_data,
+                config.temperature_k,
+                instrument_params.as_ref(),
+                cancel,
+            ) else {
+                return empty_result();
+            };
+            Arc::new(xs)
+        }
+    };
+
+    // Build a config variant with the precomputed cross-sections injected.
+    // fit_spectrum will use PrecomputedTransmissionModel when this field is Some.
+    let fast_config = FitConfig {
+        precomputed_cross_sections: Some(xs),
+        ..config.clone()
+    };
 
     // Fit all pixels in parallel, skipping new work when cancelled
     let results: Vec<((usize, usize), SpectrumFitResult)> = pixel_coords
@@ -80,7 +138,7 @@ pub fn spatial_map(
                 .map(|e| uncertainty[[e, y, x]].max(1e-10)) // Avoid zero uncertainty
                 .collect();
 
-            let result = fit_spectrum(&t_spectrum, &sigma, config);
+            let result = fit_spectrum(&t_spectrum, &sigma, &fast_config);
             Some(((y, x), result))
         })
         .collect();
@@ -259,6 +317,7 @@ mod tests {
             resolution: None,
             initial_densities: vec![0.001],
             lm_config: LmConfig::default(),
+            precomputed_cross_sections: None,
         };
 
         let result = spatial_map(&transmission, &uncertainty, &config, None, None);
@@ -323,6 +382,7 @@ mod tests {
             resolution: None,
             initial_densities: vec![0.001],
             lm_config: LmConfig::default(),
+            precomputed_cross_sections: None,
         };
 
         let result = spatial_map(&transmission, &uncertainty, &config, Some(&dead), None);
@@ -369,6 +429,7 @@ mod tests {
             resolution: None,
             initial_densities: vec![0.001],
             lm_config: LmConfig::default(),
+            precomputed_cross_sections: None,
         };
 
         // Fit a 2×2 ROI

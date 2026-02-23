@@ -329,6 +329,7 @@ fn build_fit_config(state: &AppState) -> Option<FitConfig> {
         resolution: None,
         initial_densities,
         lm_config: state.lm_config.clone(),
+        precomputed_cross_sections: None,
     })
 }
 
