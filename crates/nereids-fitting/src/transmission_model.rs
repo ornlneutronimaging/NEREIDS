@@ -46,6 +46,52 @@ impl FitModel for PrecomputedTransmissionModel {
         }
         neg_opt.iter().map(|&d| d.exp()).collect()
     }
+
+    /// Analytical Jacobian for the Beer-Lambert transmission model.
+    ///
+    /// T(E) = exp(-Σᵢ nᵢ · σᵢ(E))
+    /// ∂T/∂nᵢ = -σᵢ(E) · T(E)
+    ///
+    /// Costs O(N_energy × N_isotopes) with zero extra evaluate() calls,
+    /// because T(E) is already in `y_current` from the LM loop.
+    /// This eliminates N_free extra evaluate() calls per LM iteration
+    /// compared to finite-difference Jacobians.
+    fn analytical_jacobian(
+        &self,
+        _params: &[f64],
+        free_param_indices: &[usize],
+        y_current: &[f64],
+    ) -> Option<Vec<Vec<f64>>> {
+        let n_e = y_current.len();
+
+        // Build lookup: column j (free param index) → cross-section slice.
+        // density_indices[iso] = parameter index that controls isotope `iso`.
+        let fp_to_xs: Vec<Option<&[f64]>> = free_param_indices
+            .iter()
+            .map(|&fp_idx| {
+                self.density_indices
+                    .iter()
+                    .position(|&di| di == fp_idx)
+                    .map(|iso| self.cross_sections[iso].as_slice())
+            })
+            .collect();
+
+        // jacobian[i][j] = ∂T(E_i)/∂params[free_param_indices[j]]
+        //                = -σ_j(E_i) · T(E_i)   (Beer-Lambert derivative)
+        let jacobian: Vec<Vec<f64>> = (0..n_e)
+            .map(|i| {
+                fp_to_xs
+                    .iter()
+                    .map(|xs_opt| match xs_opt {
+                        Some(xs) => -xs[i] * y_current[i],
+                        None => 0.0,
+                    })
+                    .collect()
+            })
+            .collect();
+
+        Some(jacobian)
+    }
 }
 
 /// Forward model for fitting isotopic areal densities from transmission data.
