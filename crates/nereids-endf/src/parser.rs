@@ -388,7 +388,22 @@ fn parse_rmatrix_limited_range(
         });
     }
 
-    // All particle-pair types are now fully supported:
+    // Coulomb + SHF=1: closed-channel Coulomb shift at imaginary argument is
+    // unimplemented.  Reject at parse time rather than silently producing wrong
+    // dispersive terms near threshold.
+    // Reference: SAMMY rml/mrml07.f — Pghcou is only called for open channels.
+    for (i, pp) in particle_pairs.iter().enumerate() {
+        if pp.za.abs() > 0.5 && pp.zb.abs() > 0.5 && pp.shf == 1 {
+            return Err(EndfParseError::UnsupportedFormat(format!(
+                "LRF=7 particle pair {i}: Coulomb channel (za={}, zb={}) with \
+                 SHF=1 is not supported; closed-channel Coulomb shift at \
+                 imaginary rho is not yet implemented",
+                pp.za, pp.zb
+            )));
+        }
+    }
+
+    // All particle-pair types are now fully supported (with the SHF=1 restriction above):
     // - PNT 0/1: distinguished by pp.ma in rmatrix_limited.rs.
     // - SHF 0/1: respected by the shf field in rmatrix_limited.rs.
     // - Coulomb channels (pp.za > 0 && pp.zb > 0): routed through

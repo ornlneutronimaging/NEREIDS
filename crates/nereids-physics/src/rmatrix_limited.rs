@@ -207,14 +207,34 @@ fn spin_group_cross_sections(
                 // One neutral (za=0 or zb=0) → hard-sphere Blatt-Weisskopf.
                 if pp.za.abs() > 0.5 && pp.zb.abs() > 0.5 {
                     // Coulomb channel (e.g. n+α→p+X, (n,p), fission fragments).
+                    // Run CF1+CF2 once for rho_eff; derive P_c and S_c from the
+                    // same (F, G, F', G') tuple — avoids three separate solves.
+                    // φ_c uses rho_true (distinct radius), so one additional solve.
+                    // Reference: SAMMY rml/mrml07.f Pgh — Pghcou, then Sinsix/Pf.
                     let eta = coulomb::sommerfeld_eta(pp.za, pp.zb, pp.ma, pp.mb, e_c);
-                    p_c[c] = coulomb::coulomb_penetrability(ch.l, eta, rho_eff);
-                    // SHF flag applies to Coulomb shift as well.
-                    s_c[c] = if pp.shf == 1 {
-                        coulomb::coulomb_shift(ch.l, eta, rho_eff)
+                    if let Some((f, g, fp, gp)) =
+                        coulomb::coulomb_wave_functions(ch.l, eta, rho_eff)
+                    {
+                        let fg_sq = f * f + g * g;
+                        p_c[c] = rho_eff / fg_sq;
+                        // SHF=1: Coulomb shift ρ(F·F'+G·G')/(F²+G²).
+                        // SHF=0: S_c = B_c so (S_c − B_c) = 0 in level matrix.
+                        // Note: parser rejects Coulomb + SHF=1, so this arm is
+                        // only reachable if that validation is later relaxed.
+                        s_c[c] = if pp.shf == 1 {
+                            rho_eff * (f * fp + g * gp) / fg_sq
+                        } else {
+                            ch.boundary
+                        };
                     } else {
-                        ch.boundary
-                    };
+                        // CF1+CF2 failed to converge (ρ ≈ 0); hard-sphere fallback.
+                        p_c[c] = penetrability::penetrability(ch.l, rho_eff);
+                        s_c[c] = if pp.shf == 1 {
+                            penetrability::shift_factor(ch.l, rho_eff)
+                        } else {
+                            ch.boundary
+                        };
+                    }
                     let (sin_phi, cos_phi) = coulomb::coulomb_phase(ch.l, eta, rho_true);
                     phi_c[c] = sin_phi.atan2(cos_phi);
                 } else {
