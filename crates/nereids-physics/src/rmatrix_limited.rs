@@ -279,10 +279,21 @@ fn spin_group_cross_sections(
                         } else {
                             let redmas = pp_c.ma * pp_c.mb / (pp_c.ma + pp_c.mb);
                             let k_cn = channel::wave_number_from_cm(e_cm_n, redmas);
-                            Some(penetrability::penetrability(
-                                ch.l,
-                                k_cn * ch.effective_radius,
-                            ))
+                            let rho_eff_n = k_cn * ch.effective_radius;
+                            // Must use the same penetrability type as the open-channel
+                            // block: Coulomb P_c(E_n) for charged pairs, hard-sphere
+                            // otherwise.  Mixing them produces inconsistent γ_nc
+                            // normalisation: γ_nc = √(Γ_nc / (2·P_c(E_n))).
+                            // SAMMY rml/mrml07.f Pgh — same Zeta check applies here.
+                            let p = if pp_c.za.abs() > 0.5 && pp_c.zb.abs() > 0.5 {
+                                let eta = coulomb::sommerfeld_eta(
+                                    pp_c.za, pp_c.zb, pp_c.ma, pp_c.mb, e_cm_n,
+                                );
+                                coulomb::coulomb_penetrability(ch.l, eta, rho_eff_n)
+                            } else {
+                                penetrability::penetrability(ch.l, rho_eff_n)
+                            };
+                            Some(p)
                         }
                     };
                     match p_at_en {
