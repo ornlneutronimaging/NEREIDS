@@ -101,21 +101,20 @@ pub fn spatial_map(
             let instrument_params = config.resolution.as_ref().map(|r| InstrumentParams {
                 resolution: r.clone(),
             });
-            Arc::new(broadened_cross_sections(
+            // Pass the cancel token so precompute can bail between isotopes.
+            // Returns None if cancelled mid-precompute.
+            let Some(xs) = broadened_cross_sections(
                 &config.energies,
                 &config.resonance_data,
                 config.temperature_k,
                 instrument_params.as_ref(),
-            ))
+                cancel,
+            ) else {
+                return empty_result();
+            };
+            Arc::new(xs)
         }
     };
-
-    // broadened_cross_sections has no internal cancellation checkpoints, so a
-    // cancel signal raised during precompute only takes effect here, after it
-    // completes.  Check once more before launching pixel fitting.
-    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
-        return empty_result();
-    }
 
     // Build a config variant with the precomputed cross-sections injected.
     // fit_spectrum will use PrecomputedTransmissionModel when this field is Some.
