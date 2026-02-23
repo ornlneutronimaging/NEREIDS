@@ -295,9 +295,12 @@ pub struct ParticlePair {
     pub ma: f64,
     /// Mass of particle b (target nucleus, in neutron mass units).
     pub mb: f64,
-    /// Z*A of particle a (0 for neutron).
+    /// ENDF ZA nuclide code of particle a: ZA = Z×1000 + A.
+    /// Neutrons and photons use ZA = 0; proton = 1001; alpha = 2004.
+    /// The charge number is recovered as Z = floor(ZA / 1000).
     pub za: f64,
-    /// Z*A of particle b (target).
+    /// ENDF ZA nuclide code of particle b: ZA = Z×1000 + A.
+    /// Neutrons and photons use ZA = 0.
     pub zb: f64,
     /// Spin of particle a (1/2 for neutron).
     pub ia: f64,

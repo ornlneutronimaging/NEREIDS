@@ -176,12 +176,21 @@ fn spin_group_cross_sections(
                 p_c[c] = 0.0;
                 phi_c[c] = 0.0;
                 is_closed[c] = true;
-                s_c[c] = if pp.shf == 0 {
-                    ch.boundary
-                } else {
+                // SHF=0: S_c = B_c so (S_c − B_c) = 0 in the level matrix.
+                // SHF=1: S_c is the analytic shift at imaginary argument ρ = iκ.
+                //   For non-Coulomb channels we use the Blatt-Weisskopf formula.
+                //   For Coulomb channels the imaginary-argument Coulomb shift is
+                //   not yet implemented; fall back to S_c = B_c.  This matches
+                //   SAMMY's convention: mrml07.f ELSE branch (Su ≤ Echan) sets
+                //   Elinvr=1/Elinvi=0 (i.e. L_c = 1) for all closed channels,
+                //   Coulomb and non-Coulomb alike, without calling Pghcou.
+                let is_coulomb = pp.za.abs() > 0.5 && pp.zb.abs() > 0.5;
+                s_c[c] = if pp.shf == 1 && !is_coulomb {
                     let redmas = pp.ma * pp.mb / (pp.ma + pp.mb);
                     let kappa = channel::wave_number_from_cm(e_c.abs(), redmas);
                     penetrability::shift_factor_closed(ch.l, kappa * ch.effective_radius)
+                } else {
+                    ch.boundary
                 };
             } else {
                 // Channel wave number from reduced mass μ = MA·MB/(MA+MB).
