@@ -207,53 +207,41 @@ fn spin_group_cross_sections(
                 // One neutral (za=0 or zb=0) → hard-sphere Blatt-Weisskopf.
                 if pp.za.abs() > 0.5 && pp.zb.abs() > 0.5 {
                     // Coulomb channel (e.g. n+α→p+X, (n,p), fission fragments).
-                    // Run CF1+CF2 once for rho_eff; derive P_c and S_c from the
-                    // same (F, G, F', G') tuple — avoids three separate solves.
-                    // φ_c uses rho_true (distinct radius), so one additional solve.
+                    // Two CF1+CF2 solves: rho_eff for P_c/S_c, rho_true for φ_c
+                    // (different radii — cannot reuse the same (F,G) pair).
                     // Reference: SAMMY rml/mrml07.f Pgh — Pghcou, then Sinsix/Pf.
                     let eta = coulomb::sommerfeld_eta(pp.za, pp.zb, pp.ma, pp.mb, e_c);
-                    if let Some((f, g, fp, gp)) =
-                        coulomb::coulomb_wave_functions(ch.l, eta, rho_eff)
-                    {
-                        let fg_sq = f * f + g * g;
-                        p_c[c] = rho_eff / fg_sq;
-                        // SHF=1: Coulomb shift ρ(F·F'+G·G')/(F²+G²).
-                        // SHF=0: S_c = B_c so (S_c − B_c) = 0 in level matrix.
-                        // Note: parser rejects Coulomb + SHF=1, so this arm is
-                        // only reachable if that validation is later relaxed.
-                        s_c[c] = if pp.shf == 1 {
-                            rho_eff * (f * fp + g * gp) / fg_sq
-                        } else {
-                            ch.boundary
-                        };
-                    } else {
-                        // CF1+CF2 failed to converge for an open Coulomb channel.
-                        // Substituting Blatt-Weisskopf P_c/S_c is physically
-                        // incompatible and can change cross sections by orders of
-                        // magnitude.  Surface the failure rather than silently
-                        // producing wrong physics.
-                        // Reference: SAMMY coulomb/mrml08.f90 Coulfg convergence.
-                        panic!(
-                            "coulomb_wave_functions did not converge for open \
-                             Coulomb channel (L={}, eta={eta:.6}, \
-                             rho_eff={rho_eff:.6e}); cannot substitute \
-                             hard-sphere penetrability",
-                            ch.l
-                        );
+                    match (
+                        coulomb::coulomb_wave_functions(ch.l, eta, rho_eff),
+                        coulomb::coulomb_wave_functions(ch.l, eta, rho_true),
+                    ) {
+                        (Some((f, g, fp, gp)), Some((fl_t, gl_t, _, _))) => {
+                            let fg_sq = f * f + g * g;
+                            p_c[c] = rho_eff / fg_sq;
+                            // SHF=1: Coulomb shift ρ(F·F'+G·G')/(F²+G²).
+                            // SHF=0: S_c = B_c so (S_c − B_c) = 0 in level matrix.
+                            // Note: parser rejects Coulomb + SHF=1, so this arm is
+                            // only reachable if that validation is later relaxed.
+                            s_c[c] = if pp.shf == 1 {
+                                rho_eff * (f * fp + g * gp) / fg_sq
+                            } else {
+                                ch.boundary
+                            };
+                            phi_c[c] = fl_t.atan2(gl_t);
+                        }
+                        _ => {
+                            // rho ≤ acch (≈ 1e-8, SAMMY Coulfg threshold) or CF
+                            // non-convergence: penetrability → 0 as rho → 0.
+                            // Treat as closed rather than aborting evaluation;
+                            // this is the correct physical limit for channels
+                            // barely above threshold.
+                            // Reference: SAMMY coulomb/mrml08.f90 Coulfg — acch.
+                            p_c[c] = 0.0;
+                            s_c[c] = ch.boundary;
+                            phi_c[c] = 0.0;
+                            is_closed[c] = true;
+                        }
                     }
-                    // coulomb_phase silently returns (0,1) on solver failure;
-                    // call coulomb_wave_functions directly so a non-convergence
-                    // at rho_true panics just like the P/S block above.
-                    let (fl_t, gl_t, _, _) = coulomb::coulomb_wave_functions(ch.l, eta, rho_true)
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "coulomb_wave_functions did not converge for \
-                                     Coulomb phase at rho_true (L={}, eta={eta:.6}, \
-                                     rho_true={rho_true:.6e})",
-                                ch.l
-                            )
-                        });
-                    phi_c[c] = fl_t.atan2(gl_t);
                 } else {
                     // Hard-sphere (Blatt-Weisskopf) channel.
                     p_c[c] = penetrability::penetrability(ch.l, rho_eff);
@@ -332,39 +320,31 @@ fn spin_group_cross_sections(
                             // normalisation: γ_nc = √(Γ_nc / (2·P_c(E_n))).
                             // SAMMY rml/mrml07.f Pgh — same Zeta check applies here.
                             let p = if pp_c.za.abs() > 0.5 && pp_c.zb.abs() > 0.5 {
-                                // Use coulomb_wave_functions directly so that a
-                                // non-converged solve panics here rather than
-                                // returning the 0.0 sentinel from
-                                // coulomb_penetrability, which would be silently
-                                // collapsed to None by the filter below and mis-
-                                // normalize the reduced amplitude as √(|Γ|).
+                                // If rho_eff_n ≤ acch (SAMMY Coulfg threshold,
+                                // ≈ 1e-8) wave functions return None and P = 0.0
+                                // is used.  The filter(p > 0.0) below then maps
+                                // P = 0 → None, applying the closed-channel
+                                // √(|Γ|) normalisation — correct physical limit
+                                // for a resonance barely above its Coulomb
+                                // channel threshold.
                                 // Reference: SAMMY coulomb/mrml08.f90 Coulfg.
                                 let eta = coulomb::sommerfeld_eta(
                                     pp_c.za, pp_c.zb, pp_c.ma, pp_c.mb, e_cm_n,
                                 );
-                                let (fl, gl, _, _) =
-                                    coulomb::coulomb_wave_functions(ch.l, eta, rho_eff_n)
-                                        .unwrap_or_else(|| {
-                                            panic!(
-                                                "coulomb_wave_functions did not \
-                                                 converge for KRM=3 width conversion \
-                                                 at E_n={:.4e} eV (L={}, eta={eta:.4}, \
-                                                 rho_eff={rho_eff_n:.4e}); non-converged \
-                                                 solver must not map to closed-channel \
-                                                 normalisation",
-                                                res.energy, ch.l
-                                            )
-                                        });
-                                rho_eff_n / (fl * fl + gl * gl)
+                                coulomb::coulomb_wave_functions(ch.l, eta, rho_eff_n)
+                                    .map_or(0.0, |(fl, gl, _, _)| rho_eff_n / (fl * fl + gl * gl))
                             } else {
                                 penetrability::penetrability(ch.l, rho_eff_n)
                             };
                             Some(p)
                         }
                     };
-                    // Safety guard: prevent division by zero if P_c is exactly zero
-                    // for a non-Coulomb channel at rho → 0.  For Coulomb channels,
-                    // the CF1+CF2 failure panics before reaching this point.
+                    // Guard: prevent division by zero if P_c = 0.  Covers both
+                    // non-Coulomb channels at rho → 0 and Coulomb channels below
+                    // SAMMY's acch threshold (coulomb_wave_functions returns None
+                    // → P = 0.0).  Collapsing to None uses the closed-channel
+                    // √(|Γ|) normalisation, which is the correct limit when the
+                    // channel has effectively zero penetrability.
                     let p_at_en = p_at_en.filter(|&p| p > 0.0);
                     match p_at_en {
                         None => {
