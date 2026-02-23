@@ -296,10 +296,15 @@ fn spin_group_cross_sections(
                             Some(p)
                         }
                     };
+                    // Guard: treat P_c = 0 as non-computable (Coulomb CF2 returns 0.0
+                    // when ρ ≤ acch ≈ 1e-8, i.e. barely above threshold).  Dividing by
+                    // 2·P → inf/NaN; collapse to None so the closed-channel path fires.
+                    // Reference: SAMMY rml/mrml01.f — same √(|Γ|) fallback for P=0.
+                    let p_at_en = p_at_en.filter(|&p| p > 0.0);
                     match p_at_en {
                         None => {
-                            // Closed channel at E_n: formal width used directly as reduced
-                            // amplitude (SAMMY convention for bound-state resonances).
+                            // Closed or non-computable channel at E_n: formal width used
+                            // directly as reduced amplitude (SAMMY bound-state convention).
                             gamma_formal.abs().sqrt().copysign(gamma_formal)
                         }
                         Some(p) => {
