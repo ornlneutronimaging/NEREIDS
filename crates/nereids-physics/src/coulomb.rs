@@ -20,29 +20,30 @@ use nereids_core::constants;
 /// η = Z_a · Z_b · α · √(m_n·c² · μ̃ / (2·E_c))
 ///
 /// where:
-/// - Z_a, Z_b are the charge numbers extracted from the ENDF ZA codes
-///   (ZA = Z×1000 + A; neutrons and photons have ZA = 0)
+/// - Z_a, Z_b are the charge numbers stored in `ParticlePair.za`/`.zb`
+///   (ENDF LRF=7 stores the charge Z directly: neutron/photon = 0,
+///   proton = 1, alpha = 2; see SAMMY rml/mrml03.f Zeta formula)
 /// - α = fine-structure constant ≈ 1/137.036
 /// - μ̃ = MA·MB/(MA+MB) is the reduced mass in neutron mass units
 /// - E_c is the CM kinetic energy in this channel (eV, must be > 0)
 /// - m_n·c² in eV
 ///
 /// ## SAMMY Reference
-/// `rml/mrml07.f` Zeta = Za·Zb · α · √(m_n·μ̃/(2·E_c))
+/// `rml/mrml03.f` — `Zeta = Etac * Kza * Kzb * Redmas / Zke`
+/// where `Kza`/`Kzb` are the charges read directly from the ENDF file.
 ///
 /// # Arguments
-/// * `za_code`, `zb_code` — ENDF ZA codes (Z×1000+A) of the two particles.
-///   Neutrons and photons have ZA=0; protons have ZA=1001; alphas have ZA=2004.
+/// * `za`, `zb` — Charge numbers Z of the two particles (from `ParticlePair.za`/`.zb`).
+///   Neutron and photon: 0; proton: 1; alpha: 2; oxygen-16: 8.
 /// * `ma`, `mb` — Particle masses in neutron mass units.
 /// * `e_cm_ev` — CM kinetic energy in eV (must be > 0).
-pub fn sommerfeld_eta(za_code: f64, zb_code: f64, ma: f64, mb: f64, e_cm_ev: f64) -> f64 {
+pub fn sommerfeld_eta(za: f64, zb: f64, ma: f64, mb: f64, e_cm_ev: f64) -> f64 {
     if e_cm_ev <= 0.0 {
         return 0.0;
     }
-    // Extract charge number Z from ENDF ZA code: Z = floor(ZA / 1000)
-    // Neutron ZA=0 → Z=0; proton ZA=1001 → Z=1; alpha ZA=2004 → Z=2.
-    let za = (za_code / 1000.0).floor(); // charge of particle a
-    let zb = (zb_code / 1000.0).floor(); // charge of particle b
+    // ENDF LRF=7 stores charge Z directly in the particle-pair ZA/ZB fields.
+    // Neutron/photon: Z=0; proton: Z=1; alpha: Z=2.
+    // Reference: SAMMY rml/mrml03.f — Docoul = Kzb*Kza (product of charges).
     if za == 0.0 || zb == 0.0 {
         return 0.0; // one particle is neutral → no Coulomb interaction
     }
@@ -432,38 +433,28 @@ mod tests {
         }
     }
 
-    /// A neutral particle (ZA=0 for one side) → η = 0.
+    /// A neutral particle (Z=0) → η = 0.
     #[test]
     fn sommerfeld_eta_neutral_is_zero() {
-        // Neutron exit channel: za_code = 0 (neutron), zb_code = anything
-        let eta = sommerfeld_eta(0.0, 92238.0, 1.0, 236.006, 1e4);
+        // Neutron (Z=0) on U-238 (Z=92): η must be zero.
+        // ENDF LRF=7 stores charge directly: neutron Z=0, U-238 Z=92.
+        let eta = sommerfeld_eta(0.0, 92.0, 1.0, 236.006, 1e4);
         assert_eq!(eta, 0.0, "Neutral particle should give η=0");
     }
 
-    /// Proton on O-16 at E_cm = 1 MeV: known η ≈ 0.53.
+    /// Proton on O-16 at E_cm = 1 MeV: known η ≈ 1.22.
     ///
     /// Formula: η = Z_a·Z_b·α·√(m_n·μ̃/(2·E_cm))
-    /// For p+O16: Z_a=1, Z_b=8, μ̃ = 1·16/(1+16) ≈ 0.9412, E_cm = 1e6 eV.
-    /// η = 1·8 · (1/137.036) · √(939.565e6 · 0.9412 / (2 · 1e6))
-    ///   = 8/137.036 · √(441.9)
-    ///   ≈ 0.05836 · 21.02 ≈ 1.226 / 2 ... let me compute more carefully.
+    /// For p+O16: Z_a=1, Z_b=8, μ̃ = 1·16/17 ≈ 0.9412, E_cm = 1e6 eV.
+    /// η = 1·8 · (1/137.036) · √(939565420 · 0.9412 / (2 · 1e6))
+    ///   = 8/137.036 · √(442.3)  ≈ 0.0584 · 21.03 ≈ 1.22
     ///
-    /// Actually: η = 8/137.036 * sqrt(939.565e6 * 16/(17*2) / 1e6)
-    ///            = 8/137.036 * sqrt(939.565 * 8/17)
-    ///            = 8/137.036 * sqrt(442.1)  [in natural units with MeV]
-    ///           Wait, let me use eV: mn = 939565420 eV, mu = 939565420*16/17
-    ///           η = 8/137.036 * sqrt(939565420 * 16/17 / (2 * 1e6))
-    ///             = 8/137.036 * sqrt(939565420 * 0.9412 / 2e6)
-    ///             = 8/137.036 * sqrt(442.3)   [sqrt(442.3) ≈ 21.03]
-    ///             ≈ 8/137.036 * 21.03 ≈ 1.226
-    ///
+    /// ENDF LRF=7 stores charge directly: proton Z=1, O-16 Z=8.
     /// Reference: standard nuclear physics textbook value for p+O-16 at 1 MeV ≈ 1.22.
     #[test]
     fn sommerfeld_eta_proton_oxygen_known_value() {
-        // Proton: ZA=1001, A=1, Z=1
-        // O-16: ZA=8016, A=16, Z=8
-        let za_proton = 1001.0f64;
-        let zb_oxygen = 8016.0f64;
+        let za_proton = 1.0f64; // proton charge Z=1
+        let zb_oxygen = 8.0f64; // O-16 charge Z=8
         let ma = 1.0f64; // proton mass in neutron mass units
         let mb = 16.0f64; // O-16 mass in neutron mass units (approx)
         let e_cm_ev = 1.0e6f64; // 1 MeV in eV

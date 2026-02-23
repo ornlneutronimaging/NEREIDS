@@ -669,8 +669,8 @@ mod tests {
         let pp = ParticlePair {
             ma: 1.0,
             mb: 184.0,
-            za: 0.0,
-            zb: 74.0 * 184.0,
+            za: 0.0,  // neutron charge Z=0
+            zb: 74.0, // W-184 charge Z=74 (ENDF LRF=7 stores charge directly)
             ia: 0.5,
             ib: 0.0,
             q: 0.0,
@@ -738,8 +738,10 @@ mod tests {
     /// not the hard-sphere Blatt-Weisskopf functions.
     ///
     /// Constructs a 2-channel spin group:
-    ///   ch0: neutron (za=0)   + target — hard-sphere entrance channel
-    ///   ch1: α (za=2004)      + O-16 (za=8016) — Coulomb exit, Q=+50 eV (always open)
+    ///   ch0: neutron (za=0)  + target — hard-sphere entrance channel
+    ///   ch1: α (za=2)        + O-16 (zb=8) — Coulomb exit, Q=+50 eV (always open)
+    ///
+    /// ENDF LRF=7 stores charge Z directly in ZA/ZB (neutron=0, alpha=2, O-16=8).
     ///
     /// Verifies σ_total ≥ 0 (physics sanity) and no panic at both an open
     /// and a closed Coulomb channel (Q very negative).
@@ -749,12 +751,13 @@ mod tests {
     fn test_coulomb_channel_open_and_closed_no_panic() {
         use nereids_endf::resonance::{ParticlePair, RmlChannel, RmlData, SpinGroup};
 
-        // Entrance channel: neutron (za=0) + target
+        // Entrance channel: neutron (Z=0) + W-184 target (Z=74).
+        // ENDF LRF=7 stores charge directly: neutron za=0, W-184 zb=74.
         let pp_entrance = ParticlePair {
             ma: 1.0,
             mb: 184.0,
-            za: 0.0,
-            zb: 74.0 * 1000.0 + 184.0, // ZA = Z*1000 + A
+            za: 0.0,  // neutron charge Z=0
+            zb: 74.0, // W-184 charge Z=74
             ia: 0.5,
             ib: 0.0,
             q: 0.0,
@@ -765,13 +768,13 @@ mod tests {
             pb: 1.0,
         };
 
-        // Coulomb exit channel: α(za=2004) + O-16(za=8016), Q=+50 eV → always open.
-        // sommerfeld_eta: Z_α=2, Z_O=8; η checks that we entered the Coulomb branch.
+        // Coulomb exit channel: α(Z=2) + O-16(Z=8), Q=+50 eV → always open.
+        // sommerfeld_eta(2, 8, ...) gives η > 0, confirming Coulomb branch.
         let pp_coulomb_open = ParticlePair {
             ma: 4.0,
             mb: 16.0,
-            za: 2004.0, // alpha: Z=2, A=4
-            zb: 8016.0, // O-16: Z=8, A=16
+            za: 2.0, // alpha charge Z=2
+            zb: 8.0, // O-16 charge Z=8
             ia: 0.0,
             ib: 0.0,
             q: 50.0, // Q > 0 → e_c = e_cm + 50 > 0 for all positive energies
@@ -786,8 +789,8 @@ mod tests {
         let pp_coulomb_closed = ParticlePair {
             ma: 4.0,
             mb: 16.0,
-            za: 2004.0,
-            zb: 8016.0,
+            za: 2.0, // alpha charge Z=2
+            zb: 8.0, // O-16 charge Z=8
             ia: 0.0,
             ib: 0.0,
             q: -1e6, // far below threshold
