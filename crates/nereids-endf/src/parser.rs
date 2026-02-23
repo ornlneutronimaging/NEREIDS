@@ -388,40 +388,11 @@ fn parse_rmatrix_limited_range(
         });
     }
 
-    // Particle-pair capability validation.
-    // Reject early with a clear error rather than silently computing wrong results.
-    // Consistent with KBK/KPS rejection above.
-    for (i, pp) in particle_pairs.iter().enumerate() {
-        // PNT semantics (SAMMY rml/mrml01.f, stored as Lpent):
-        //   PNT=0 → penetrability NOT calculated (photon/fission channels, MA=0)
-        //   PNT=1 → penetrability calculated analytically (neutron elastic, MA=1)
-        // Both values are fully supported: the physics code uses pp.ma to distinguish
-        // the two cases (see rmatrix_limited.rs).  No rejection needed.
-        //
-        // SHF semantics (SAMMY rml/mrml01.f, stored as Ishift):
-        //   SHF=0 → shift factor NOT calculated; S_c = B_c (boundary condition)
-        //   SHF=1 → shift factor calculated analytically
-        // Both values are fully supported: rmatrix_limited.rs respects pp.shf.
-        // Reference: ENDF-6 Formats Manual §2.2.1.6; SAMMY rml/mrml07.f Pgh subroutine.
-
-        // Coulomb channels: both particles carry charge (ZA ≠ 0 and ZB ≠ 0).
-        // Per ENDF-6 §2.2.1.6 Table 2.2, ZA = Z·A of the particle; ZA=0 for
-        // neutrons and photons.  Coulomb penetrability/shift/phase require Coulomb
-        // wave functions (F_l, G_l) rather than the hard-sphere Blatt-Weisskopf
-        // functions; using the wrong functions produces incorrect P_c/S_c.
-        // Applies to charged-particle channels (fission fragments, (n,p), (n,α), …).
-        // SAMMY implements Coulomb wave functions via Steed's method (rml/mrml07.f,
-        // coulomb/mrml08.f90).  Tracked in issue #42.
-        if pp.za.abs() > 0.0 && pp.zb.abs() > 0.0 {
-            return Err(EndfParseError::UnsupportedFormat(format!(
-                "LRF=7 particle pair {i}: Coulomb channel \
-                 (ZA={}, ZB={}) not yet supported; \
-                 requires Coulomb wave functions",
-                pp.za, pp.zb
-            )));
-        }
-    }
-
+    // All particle-pair types are now fully supported:
+    // - PNT 0/1: distinguished by pp.ma in rmatrix_limited.rs.
+    // - SHF 0/1: respected by the shf field in rmatrix_limited.rs.
+    // - Coulomb channels (pp.za > 0 && pp.zb > 0): routed through
+    //   nereids_physics::coulomb (Steed's CF1+CF2, SAMMY coulomb/mrml08.f90).
     let mut spin_groups = Vec::with_capacity(njs);
 
     for _ in 0..njs {

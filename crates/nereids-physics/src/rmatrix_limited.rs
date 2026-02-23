@@ -811,10 +811,7 @@ mod tests {
             };
 
             let (tot, _elas, _cap, _fis) = cross_sections_for_rml_range(&rml, 100.0);
-            assert!(
-                tot >= 0.0,
-                "{desc}: σ_total = {tot:.6} b must be ≥ 0"
-            );
+            assert!(tot >= 0.0, "{desc}: σ_total = {tot:.6} b must be ≥ 0");
             if expect_positive_total {
                 // Hard-sphere entrance channel alone gives positive σ_total
                 // (the Coulomb channel merely adds a second channel but no resonances).

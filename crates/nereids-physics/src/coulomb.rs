@@ -148,8 +148,8 @@ pub fn coulomb_wave_functions(l: u32, eta: f64, rho: f64) -> Option<(f64, f64, f
     // SAMMY: Pk = Pk1; Pk1 = Pk1 + One  (advance to next k before each step).
     let mut p_count = 1u32;
     loop {
-        pk = pk1;         // advance: current step uses previous pk1
-        pk1 = pk + 1.0;   // next step's pk1
+        pk = pk1; // advance: current step uses previous pk1
+        pk1 = pk + 1.0; // next step's pk1
         let ek = eta / pk;
         let tk = (pk + pk1) * (xi + ek / pk1);
         d = tk - d * (1.0 + ek * ek);
@@ -389,8 +389,8 @@ mod tests {
     fn coulomb_zero_eta_l0_matches_hard_sphere() {
         // CF1+CF2 achieves ~1e-13 for large ρ; tolerance 1e-7 covers small ρ too.
         for &rho in &[0.5f64, 1.0, 2.0, 5.0, 10.0] {
-            let (fl, gl, _, _) = coulomb_wave_functions(0, 0.0, rho)
-                .expect("Should compute for rho > 0");
+            let (fl, gl, _, _) =
+                coulomb_wave_functions(0, 0.0, rho).expect("Should compute for rho > 0");
             let f_exact = rho.sin();
             let g_exact = rho.cos(); // SAMMY convention: G_0 = +cos ρ
             assert!(
