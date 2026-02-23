@@ -5,7 +5,10 @@
 
 use ndarray::{Array2, Array3};
 use rayon::prelude::*;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+use nereids_physics::transmission::{InstrumentParams, broadened_cross_sections};
 
 use crate::pipeline::{FitConfig, SpectrumFitResult, fit_spectrum};
 
@@ -54,6 +57,28 @@ pub fn spatial_map(
 
     assert_eq!(n_energies, config.energies.len());
 
+    // Precompute Doppler+resolution-broadened cross-sections once.
+    // These are independent of the per-pixel densities, so computing them
+    // inside the LM inner loop is wasteful.  Sharing via Arc is free
+    // (read-only) across rayon threads.
+    let instrument_params = config
+        .resolution
+        .as_ref()
+        .map(|r| InstrumentParams { resolution: r.clone() });
+    let xs = Arc::new(broadened_cross_sections(
+        &config.energies,
+        &config.resonance_data,
+        config.temperature_k,
+        instrument_params.as_ref(),
+    ));
+
+    // Build a config variant with the precomputed cross-sections injected.
+    // fit_spectrum will use PrecomputedTransmissionModel when this field is Some.
+    let fast_config = FitConfig {
+        precomputed_cross_sections: Some(xs),
+        ..config.clone()
+    };
+
     // Collect pixel coordinates to fit
     let mut pixel_coords: Vec<(usize, usize)> = Vec::new();
     for y in 0..height {
@@ -80,7 +105,7 @@ pub fn spatial_map(
                 .map(|e| uncertainty[[e, y, x]].max(1e-10)) // Avoid zero uncertainty
                 .collect();
 
-            let result = fit_spectrum(&t_spectrum, &sigma, config);
+            let result = fit_spectrum(&t_spectrum, &sigma, &fast_config);
             Some(((y, x), result))
         })
         .collect();
@@ -259,6 +284,7 @@ mod tests {
             resolution: None,
             initial_densities: vec![0.001],
             lm_config: LmConfig::default(),
+            precomputed_cross_sections: None,
         };
 
         let result = spatial_map(&transmission, &uncertainty, &config, None, None);
@@ -323,6 +349,7 @@ mod tests {
             resolution: None,
             initial_densities: vec![0.001],
             lm_config: LmConfig::default(),
+            precomputed_cross_sections: None,
         };
 
         let result = spatial_map(&transmission, &uncertainty, &config, Some(&dead), None);
@@ -369,6 +396,7 @@ mod tests {
             resolution: None,
             initial_densities: vec![0.001],
             lm_config: LmConfig::default(),
+            precomputed_cross_sections: None,
         };
 
         // Fit a 2×2 ROI

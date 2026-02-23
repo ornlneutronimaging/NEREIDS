@@ -11,6 +11,43 @@ use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
 
 use crate::lm::FitModel;
 
+/// Transmission model backed by precomputed broadened cross-sections.
+///
+/// The expensive physics steps (resonance → σ(E), Doppler broadening,
+/// resolution broadening) are computed once and stored.  Each `evaluate()`
+/// call performs only the Beer-Lambert step:
+///
+///   T(E) = exp(−Σᵢ nᵢ · σ_D,i(E))
+///
+/// which is O(N_energy) instead of O(N_energy × N_resonances).  For a
+/// 128×128 spatial map this is ~100–1000× faster than `TransmissionFitModel`.
+///
+/// Construct via `nereids_physics::transmission::broadened_cross_sections`,
+/// then wrap in `Arc` so the same precomputed data is shared read-only
+/// across all rayon worker threads.
+pub struct PrecomputedTransmissionModel {
+    /// Broadened cross-sections σ_D(E) per isotope, shape [n_isotopes][n_energies].
+    pub cross_sections: Arc<Vec<Vec<f64>>>,
+    /// Mapping: `params[density_indices[i]]` is the density of isotope `i`.
+    pub density_indices: Vec<usize>,
+}
+
+impl FitModel for PrecomputedTransmissionModel {
+    fn evaluate(&self, params: &[f64]) -> Vec<f64> {
+        let n_e = self.cross_sections[0].len();
+        let mut neg_opt = vec![0.0f64; n_e];
+        for (i, xs) in self.cross_sections.iter().enumerate() {
+            let density = params[self.density_indices[i]];
+            if density > 0.0 {
+                for (j, &sigma) in xs.iter().enumerate() {
+                    neg_opt[j] -= density * sigma;
+                }
+            }
+        }
+        neg_opt.iter().map(|&d| d.exp()).collect()
+    }
+}
+
 /// Forward model for fitting isotopic areal densities from transmission data.
 ///
 /// The model computes T(E) for a set of isotopes with variable areal densities.
