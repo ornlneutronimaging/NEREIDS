@@ -60,7 +60,9 @@ pub fn spatial_map(
     // Bail out immediately if already cancelled — avoid the expensive precompute.
     if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
         return SpatialResult {
-            density_maps: (0..n_isotopes).map(|_| Array2::zeros((height, width))).collect(),
+            density_maps: (0..n_isotopes)
+                .map(|_| Array2::zeros((height, width)))
+                .collect(),
             uncertainty_maps: (0..n_isotopes)
                 .map(|_| Array2::from_elem((height, width), f64::NAN))
                 .collect(),
