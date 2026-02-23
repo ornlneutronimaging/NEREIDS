@@ -57,6 +57,20 @@ pub fn spatial_map(
 
     assert_eq!(n_energies, config.energies.len());
 
+    // Bail out immediately if already cancelled — avoid the expensive precompute.
+    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+        return SpatialResult {
+            density_maps: (0..n_isotopes).map(|_| Array2::zeros((height, width))).collect(),
+            uncertainty_maps: (0..n_isotopes)
+                .map(|_| Array2::from_elem((height, width), f64::NAN))
+                .collect(),
+            chi_squared_map: Array2::from_elem((height, width), f64::NAN),
+            converged_map: Array2::from_elem((height, width), false),
+            n_converged: 0,
+            n_total: 0,
+        };
+    }
+
     // Precompute Doppler+resolution-broadened cross-sections once.
     // These are independent of the per-pixel densities, so computing them
     // inside the LM inner loop is wasteful.  Sharing via Arc is free
