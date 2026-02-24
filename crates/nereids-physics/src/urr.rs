@@ -20,9 +20,10 @@
 //! σ_cn += (π/k²) · g_J · (2π · Γ_n · (GG + GF + GX)) / (D · Γ_tot)
 //! ```
 //!
-//! `σ_cn` is the compound-elastic/inelastic contribution (excluding potential
-//! scattering). Potential scattering is not included here; it would be added
-//! at the call site from the smooth hard-sphere background if needed.
+//! `σ_cn` is the compound-elastic/inelastic contribution. Potential scattering
+//! `σ_pot = 4π·AP²` is included in the returned `total` and `elastic` so
+//! that the URR band produces a physically consistent cross-section without
+//! requiring special handling at the call site.
 //!
 //! ## SAMMY Reference
 //! - `unr/munr03.f90` Csig3 subroutine
@@ -39,13 +40,15 @@ use crate::penetrability;
 
 /// Compute Hauser-Feshbach average cross-sections in the Unresolved Resonance Region.
 ///
-/// Returns `(total, elastic_compound, capture, fission)` in barns.
+/// Returns `(total, elastic, capture, fission)` in barns.
 /// All four are zero when `e_ev` falls outside the URR energy band
 /// `[urr.e_low, urr.e_high]`.
 ///
-/// The "elastic_compound" component contains only the compound-nuclear elastic
-/// contribution (Γ_n × (Γ_tot − Γ_n) / Γ_tot terms). Potential scattering
-/// (smooth hard-sphere background) is not included.
+/// `elastic` = compound-nuclear elastic + smooth potential scattering.
+/// `total`   = elastic + capture + fission.
+/// Potential scattering `σ_pot = 4π·AP²` is folded in here rather than at
+/// the call site; AP is in fm and 1 barn = 100 fm².
+/// SAMMY ref: `unr/munr03.f90` includes the hard-sphere background.
 ///
 /// ## SAMMY Reference
 /// `unr/munr03.f90` Csig3 — Hauser-Feshbach cross-section kernel.
@@ -83,19 +86,26 @@ pub fn urr_cross_sections(urr: &UrrData, e_ev: f64) -> (f64, f64, f64, f64) {
             //
             // LRF=1: Γ_n = 2·P_L(ρ)·GNO  (GNO = reduced neutron width, eV)
             //        D, GG, GF are energy-independent (single-element vecs).
-            // LRF=2: all widths are lin-lin interpolated from the energy table.
+            // LRF=2: widths interpolated from the energy table using the
+            //        INT code stored per J-group.
+            //        INT=2 (lin-lin) and INT=5 (log-log) are both supported.
             //
             // SAMMY ref: unr/munr03.f90 Csig3 — `Gn = Two*Pene*Gno` for LRF=1.
             let (gn_eff, d_eff, gx_eff, gg_eff, gf_eff) = if urr.lrf == 1 {
                 let gno = jg.gn[0]; // reduced neutron width (eV)
                 (2.0 * p_l * gno, jg.d[0], 0.0_f64, jg.gg[0], jg.gf[0])
             } else {
-                // LRF=2: lin-lin interpolation from the energy table.
-                let gn_i = lin_lin_interp(&jg.energies, &jg.gn, e_ev);
-                let d_i = lin_lin_interp(&jg.energies, &jg.d, e_ev);
-                let gx_i = lin_lin_interp(&jg.energies, &jg.gx, e_ev);
-                let gg_i = lin_lin_interp(&jg.energies, &jg.gg, e_ev);
-                let gf_i = lin_lin_interp(&jg.energies, &jg.gf, e_ev);
+                // LRF=2: dispatch on the stored interpolation law.
+                let interp = if jg.int_code == 5 {
+                    log_log_interp
+                } else {
+                    lin_lin_interp
+                };
+                let gn_i = interp(&jg.energies, &jg.gn, e_ev);
+                let d_i = interp(&jg.energies, &jg.d, e_ev);
+                let gx_i = interp(&jg.energies, &jg.gx, e_ev);
+                let gg_i = interp(&jg.energies, &jg.gg, e_ev);
+                let gf_i = interp(&jg.energies, &jg.gf, e_ev);
                 (gn_i, d_i, gx_i, gg_i, gf_i)
             };
 
@@ -128,13 +138,18 @@ pub fn urr_cross_sections(urr: &UrrData, e_ev: f64) -> (f64, f64, f64, f64) {
         }
     }
 
-    let total = sig_cap + sig_fiss + sig_compound_n;
-    (total, sig_compound_n, sig_cap, sig_fiss)
+    // Smooth potential scattering: σ_pot = 4π·AP²
+    // AP is in fm; 1 barn = 100 fm².
+    // SAMMY ref: unr/munr03.f90 adds hard-sphere background to elastic.
+    let sig_pot = 4.0 * std::f64::consts::PI * urr.ap * urr.ap / 100.0;
+    let elastic = sig_compound_n + sig_pot;
+    let total = elastic + sig_cap + sig_fiss;
+    (total, elastic, sig_cap, sig_fiss)
 }
 
 /// Linear-linear interpolation (clamped to table endpoints).
 ///
-/// Used for LRF=2 width tables (INT=2 in ENDF).  `xs` must be strictly
+/// Used for LRF=2 width tables with INT=2 in ENDF.  `xs` must be strictly
 /// ascending and of the same length as `ys`.
 fn lin_lin_interp(xs: &[f64], ys: &[f64], x: f64) -> f64 {
     debug_assert_eq!(xs.len(), ys.len());
@@ -153,6 +168,35 @@ fn lin_lin_interp(xs: &[f64], ys: &[f64], x: f64) -> f64 {
     let (x1, y1) = (xs[i], ys[i]);
     let t = (x - x0) / (x1 - x0);
     y0 + t * (y1 - y0)
+}
+
+/// Log-log interpolation (clamped to table endpoints).
+///
+/// Used for LRF=2 width tables with INT=5 in ENDF (common for heavy actinides
+/// such as U-238 where widths follow approximate power-law energy dependence).
+/// Returns `ys[0]` when any `y` value is ≤ 0 to avoid log-domain errors.
+fn log_log_interp(xs: &[f64], ys: &[f64], x: f64) -> f64 {
+    debug_assert_eq!(xs.len(), ys.len());
+    if xs.is_empty() {
+        return 0.0;
+    }
+    if x <= xs[0] {
+        return ys[0];
+    }
+    if x >= xs[xs.len() - 1] {
+        return ys[xs.len() - 1];
+    }
+    let i = xs.partition_point(|&xi| xi <= x);
+    let (x0, y0) = (xs[i - 1], ys[i - 1]);
+    let (x1, y1) = (xs[i], ys[i]);
+    // Guard against non-positive values (log undefined).
+    if x0 <= 0.0 || x1 <= 0.0 || y0 <= 0.0 || y1 <= 0.0 {
+        // Fall back to lin-lin for degenerate entries.
+        let t = (x - x0) / (x1 - x0);
+        return y0 + t * (y1 - y0);
+    }
+    let log_t = (x.ln() - x0.ln()) / (x1.ln() - x0.ln());
+    (y0.ln() + log_t * (y1.ln() - y0.ln())).exp()
 }
 
 #[cfg(test)]
@@ -210,11 +254,12 @@ mod tests {
                     gn: vec![gno],
                     gg: vec![gg],
                     gf: vec![0.0],
+                    int_code: 2,
                 }],
             }],
         };
 
-        let (total, compound_n, capture, fission) = urr_cross_sections(&urr, e_test);
+        let (total, elastic, capture, fission) = urr_cross_sections(&urr, e_test);
 
         // Hand-compute expected values.
         let pi_over_k2 = channel::pi_over_k_squared_barns(e_test, awri);
@@ -226,6 +271,8 @@ mod tests {
         let prefactor = pi_over_k2 * g_j * (2.0 * std::f64::consts::PI * gn_eff) / d;
         let expected_cap = prefactor * gg / gamma_tot;
         let expected_cn = prefactor * gg / gamma_tot; // Γ_abs = gg (no fission)
+        let expected_sig_pot = 4.0 * std::f64::consts::PI * ap * ap / 100.0;
+        let expected_elastic = expected_cn + expected_sig_pot;
 
         assert!(
             capture > 0.0,
@@ -237,13 +284,14 @@ mod tests {
             "Capture deviates from hand calculation: got {capture:.6e}, expected {expected_cap:.6e}"
         );
         assert!(
-            (compound_n - expected_cn).abs() / expected_cn < 1e-10,
-            "Compound-n deviates: got {compound_n:.6e}, expected {expected_cn:.6e}"
+            (elastic - expected_elastic).abs() / expected_elastic < 1e-10,
+            "Elastic deviates: got {elastic:.6e}, expected {expected_elastic:.6e} \
+             (compound_n={expected_cn:.6e} + sig_pot={expected_sig_pot:.6e})"
         );
         assert!(
-            (total - (capture + compound_n)).abs() < 1e-14,
-            "Total ≠ capture + compound_n: {total} ≠ {}",
-            capture + compound_n
+            (total - (capture + elastic)).abs() < 1e-14,
+            "Total ≠ capture + elastic: {total} ≠ {}",
+            capture + elastic
         );
     }
 
@@ -275,6 +323,7 @@ mod tests {
                     gn: vec![1.0e-3, 5.0e-3], // Γ_n increases with E
                     gg: vec![3.5e-2, 3.5e-2], // GG roughly constant
                     gf: vec![0.0, 0.0],
+                    int_code: 2,
                 }],
             }],
         };
@@ -333,6 +382,7 @@ mod tests {
                     gn: vec![1.0e-4],
                     gg: vec![3.5e-2],
                     gf: vec![0.0],
+                    int_code: 2,
                 }],
             }],
         }

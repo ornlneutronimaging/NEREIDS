@@ -89,6 +89,14 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
                         "LRU=2 LRF={lrf} is not supported (only LRF=1 and LRF=2)"
                     )));
                 }
+                // NRO=range_cont.n1: if non-zero a TAB1 AP(E) record immediately follows
+                // the range CONT before the URR SPI/AP/NLS CONT.
+                // ENDF-6 §2.2.2; SAMMY unr/munr01.f90.
+                // We skip it — the constant AP in the URR SPI/AP CONT is used instead.
+                let nro_urr = range_cont.n1;
+                if nro_urr != 0 {
+                    skip_tab1(&lines, &mut pos)?;
+                }
                 let urr_range = parse_urr_range(&lines, &mut pos, lrf, energy_low, energy_high)?;
                 all_ranges.push(urr_range);
                 continue;
@@ -947,6 +955,7 @@ fn parse_urr_range(
                     gn: vec![values[base + 3]], // GNO (reduced neutron width, eV)
                     gg: vec![values[base + 4]], // GG (gamma width, eV)
                     gf: vec![values[base + 5]], // GF (fission width, eV)
+                    int_code: 2,                // LRF=1 has no table; default lin-lin
                 });
             }
 
@@ -966,8 +975,17 @@ fn parse_urr_range(
                 // CONT: AJ, 0, INT, 0, N1=6*(NE+1), N2=NE
                 let j_cont = parse_cont(lines, pos)?;
                 let aj = j_cont.c1;
+                let int_code = j_cont.l1; // interpolation law (L1 field)
                 let n1 = j_cont.n1 as usize; // 6*(NE+1)
                 let ne = j_cont.n2 as usize; // NE (number of energy points)
+
+                // Supported interpolation laws: INT=2 (lin-lin) and INT=5 (log-log).
+                // ENDF-6 §2.2.2.2; SAMMY unr/munr01.f90.
+                if int_code != 2 && int_code != 5 {
+                    return Err(EndfParseError::UnsupportedFormat(format!(
+                        "URR LRF=2 J={aj}: INT={int_code} is not supported (only INT=2 or INT=5)"
+                    )));
+                }
 
                 let expected_n1 = 6 * (ne + 1);
                 if n1 != expected_n1 {
@@ -1010,6 +1028,7 @@ fn parse_urr_range(
                     gn,
                     gg,
                     gf,
+                    int_code: int_code as u32,
                 });
             }
 

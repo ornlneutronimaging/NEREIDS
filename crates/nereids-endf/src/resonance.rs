@@ -212,6 +212,14 @@ pub struct UrrJGroup {
     pub gg: Vec<f64>,
     /// Average fission width GF (eV). Single-element for LRF=1.
     pub gf: Vec<f64>,
+    /// Interpolation law for the energy table (LRF=2 only).
+    /// 2 = lin-lin, 5 = log-log.  Ignored for LRF=1 (no table).
+    #[serde(default = "default_int_code")]
+    pub int_code: u32,
+}
+
+fn default_int_code() -> u32 {
+    2
 }
 
 /// Average URR parameters for one L-value.
