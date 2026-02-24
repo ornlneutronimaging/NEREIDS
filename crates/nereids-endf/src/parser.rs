@@ -713,16 +713,30 @@ fn skip_tab1(lines: &[&str], pos: &mut usize) -> Result<(), EndfParseError> {
 ///   if N2 > 0  → LRF=1 style: one LIST record of N1 values
 ///   if N2 == 0 → LRF=2 style: N1 J-sub-blocks, each = CONT + LIST(N1_j values)
 /// ```
+/// Validate that an ENDF integer count is non-negative and return as `usize`.
+///
+/// Malformed records can contain negative counts which, if cast directly to
+/// `usize`, wrap to huge values and cause OOM panics in `Vec::with_capacity`
+/// or `parse_list_values`.
+fn checked_count(value: i32, label: &str) -> Result<usize, EndfParseError> {
+    if value < 0 {
+        return Err(EndfParseError::UnsupportedFormat(format!(
+            "Negative ENDF count: {label}={value}"
+        )));
+    }
+    Ok(value as usize)
+}
+
 fn skip_urr_body(lines: &[&str], pos: &mut usize) -> Result<(), EndfParseError> {
     // CONT: SPI, AP, 0, 0, NLS, 0
     let header = parse_cont(lines, pos)?;
-    let nls = header.n1 as usize;
+    let nls = checked_count(header.n1, "NLS")?;
 
     for _ in 0..nls {
         // L CONT: AWRI, 0, L, 0, N1, N2
         let l_cont = parse_cont(lines, pos)?;
-        let n1 = l_cont.n1 as usize;
-        let n2 = l_cont.n2 as usize;
+        let n1 = checked_count(l_cont.n1, "N1")?;
+        let n2 = checked_count(l_cont.n2, "N2")?;
 
         if n2 > 0 {
             // LRF=1 style: N2=NJS, N1=6*NJS — single LIST record.
@@ -732,7 +746,7 @@ fn skip_urr_body(lines: &[&str], pos: &mut usize) -> Result<(), EndfParseError> 
             // own CONT (carrying 6*(NE+1) in N1) followed by a LIST record.
             for _ in 0..n1 {
                 let j_cont = parse_cont(lines, pos)?;
-                let jn1 = j_cont.n1 as usize;
+                let jn1 = checked_count(j_cont.n1, "N1")?;
                 parse_list_values(lines, pos, jn1)?;
             }
         }
@@ -756,16 +770,16 @@ fn skip_remaining_lrf2(
     // Finish the current L-group's remaining J-blocks.
     for _ in 0..remaining_j {
         let j_cont = parse_cont(lines, pos)?;
-        let jn1 = j_cont.n1 as usize;
+        let jn1 = checked_count(j_cont.n1, "N1")?;
         parse_list_values(lines, pos, jn1)?;
     }
     // Consume subsequent L-groups in full.
     for _ in 0..remaining_l {
         let l_cont = parse_cont(lines, pos)?;
-        let njs = l_cont.n1 as usize;
+        let njs = checked_count(l_cont.n1, "NJS")?;
         for _ in 0..njs {
             let j_cont = parse_cont(lines, pos)?;
-            let jn1 = j_cont.n1 as usize;
+            let jn1 = checked_count(j_cont.n1, "N1")?;
             parse_list_values(lines, pos, jn1)?;
         }
     }
@@ -1011,13 +1025,7 @@ fn parse_urr_range(
     let spi_cont = parse_cont(lines, pos)?;
     let spi = spi_cont.c1;
     let ap = spi_cont.c2; // scattering radius (fm)
-    if spi_cont.n1 < 0 {
-        return Err(EndfParseError::UnsupportedFormat(format!(
-            "URR NLS={} is negative",
-            spi_cont.n1
-        )));
-    }
-    let nls = spi_cont.n1 as usize;
+    let nls = checked_count(spi_cont.n1, "NLS")?;
 
     let mut l_groups = Vec::with_capacity(nls);
 
@@ -1028,14 +1036,8 @@ fn parse_urr_range(
             let l_cont = parse_cont(lines, pos)?;
             let awri = l_cont.c1;
             let l = l_cont.l1 as u32;
-            if l_cont.n1 < 0 || l_cont.n2 < 0 {
-                return Err(EndfParseError::UnsupportedFormat(format!(
-                    "URR LRF=1 L={l}: negative count N1={} or NJS={}",
-                    l_cont.n1, l_cont.n2
-                )));
-            }
-            let n1 = l_cont.n1 as usize; // 6*NJS
-            let njs = l_cont.n2 as usize; // NJS
+            let n1 = checked_count(l_cont.n1, "N1")?; // 6*NJS
+            let njs = checked_count(l_cont.n2, "NJS")?;
 
             if njs == 0 || n1 != 6 * njs {
                 return Err(EndfParseError::UnsupportedFormat(format!(
