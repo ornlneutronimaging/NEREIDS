@@ -15,11 +15,13 @@
 //! ## SAMMY Reference
 //! - Cross-sections: `rml/` (Reich-Moore), `mlb/` (SLBW/MLBW), manual Sec 2
 //! - Penetrability: `rml/mrml07.f` (Pgh, Sinsix, Pf)
+//! - Coulomb: `coulomb/mrml08.f90` (Coulfg, Steed's CF1+CF2)
 //! - Doppler: `dop/` module, manual Sec 3.1
 //! - Resolution: `convolution/` module, manual Sec 3.2
 //! - Transmission: `cro/`, `xxx/` modules, manual Sec 2, Sec 5
 
 pub mod channel;
+pub mod coulomb;
 pub mod doppler;
 pub mod penetrability;
 pub mod reich_moore;

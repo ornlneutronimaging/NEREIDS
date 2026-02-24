@@ -295,9 +295,11 @@ pub struct ParticlePair {
     pub ma: f64,
     /// Mass of particle b (target nucleus, in neutron mass units).
     pub mb: f64,
-    /// Z*A of particle a (0 for neutron).
+    /// Charge number Z of particle a, as stored in the ENDF LRF=7 particle-pair list.
+    /// ENDF LRF=7 stores the charge directly: neutron/photon = 0, proton = 1, alpha = 2.
+    /// Reference: SAMMY rml/mrml03.f — `Docoul = Kzb * Kza` (product of charges).
     pub za: f64,
-    /// Z*A of particle b (target).
+    /// Charge number Z of particle b (target or recoil), as stored in ENDF LRF=7.
     pub zb: f64,
     /// Spin of particle a (1/2 for neutron).
     pub ia: f64,

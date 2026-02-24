@@ -60,7 +60,7 @@ use num_complex::Complex64;
 
 use nereids_endf::resonance::{ParticlePair, RmlData, SpinGroup};
 
-use crate::{channel, penetrability};
+use crate::{channel, coulomb, penetrability};
 
 /// Compute cross-section contributions from an LRF=7 energy range.
 ///
@@ -176,12 +176,21 @@ fn spin_group_cross_sections(
                 p_c[c] = 0.0;
                 phi_c[c] = 0.0;
                 is_closed[c] = true;
-                s_c[c] = if pp.shf == 0 {
-                    ch.boundary
-                } else {
+                // SHF=0: S_c = B_c so (S_c − B_c) = 0 in the level matrix.
+                // SHF=1: S_c is the analytic shift at imaginary argument ρ = iκ.
+                //   For non-Coulomb channels we use the Blatt-Weisskopf formula.
+                //   For Coulomb channels the imaginary-argument Coulomb shift is
+                //   not yet implemented; fall back to S_c = B_c.  This matches
+                //   SAMMY's convention: mrml07.f ELSE branch (Su ≤ Echan) sets
+                //   Elinvr=1/Elinvi=0 (i.e. L_c = 1) for all closed channels,
+                //   Coulomb and non-Coulomb alike, without calling Pghcou.
+                let is_coulomb = pp.za.abs() > 0.5 && pp.zb.abs() > 0.5;
+                s_c[c] = if pp.shf == 1 && !is_coulomb {
                     let redmas = pp.ma * pp.mb / (pp.ma + pp.mb);
                     let kappa = channel::wave_number_from_cm(e_c.abs(), redmas);
                     penetrability::shift_factor_closed(ch.l, kappa * ch.effective_radius)
+                } else {
+                    ch.boundary
                 };
             } else {
                 // Channel wave number from reduced mass μ = MA·MB/(MA+MB).
@@ -192,17 +201,65 @@ fn spin_group_cross_sections(
                 // Reference: SAMMY rml/mrml07.f (Pgh, Sinsix, Pf subroutines)
                 let rho_eff = k_c * ch.effective_radius;
                 let rho_true = k_c * ch.true_radius;
-                p_c[c] = penetrability::penetrability(ch.l, rho_eff);
-                // SHF=0: shift factor not calculated; S_c = B_c so (S_c - B_c) = 0
-                // in the level matrix diagonal.
-                // SHF=1: calculate S_c analytically (Blatt-Weisskopf).
-                // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml07.f Pgh (Ishift check)
-                s_c[c] = if pp.shf == 1 {
-                    penetrability::shift_factor(ch.l, rho_eff)
+                // ── Coulomb vs hard-sphere routing ───────────────────────────
+                // SAMMY rml/mrml07.f Pgh — `if (Zeta(I).NE.Zero)` branch.
+                // Both particles charged → Coulomb wave functions F_L / G_L.
+                // One neutral (za=0 or zb=0) → hard-sphere Blatt-Weisskopf.
+                if pp.za.abs() > 0.5 && pp.zb.abs() > 0.5 {
+                    // Coulomb channel (e.g. n+α→p+X, (n,p), fission fragments).
+                    // Two CF1+CF2 solves: rho_eff for P_c/S_c, rho_true for φ_c
+                    // (different radii — cannot reuse the same (F,G) pair).
+                    // Reference: SAMMY rml/mrml07.f Pgh — Pghcou, then Sinsix/Pf.
+                    let eta = coulomb::sommerfeld_eta(pp.za, pp.zb, pp.ma, pp.mb, e_c);
+                    // P_c/S_c depend only on rho_eff; φ_c depends only on rho_true.
+                    // The two solves are independent: a rho_true failure must not
+                    // close a channel that rho_eff confirmed is open.
+                    // Reference: SAMMY rml/mrml07.f Pgh — Pghcou (rho_eff),
+                    //   then Sinsix/Pf (rho_true).
+                    match coulomb::coulomb_wave_functions(ch.l, eta, rho_eff) {
+                        Some((f, g, fp, gp)) => {
+                            // rho_eff succeeded: channel is genuinely open.
+                            let fg_sq = f * f + g * g;
+                            p_c[c] = rho_eff / fg_sq;
+                            // SHF=1: Coulomb shift ρ(F·F'+G·G')/(F²+G²).
+                            // SHF=0: S_c = B_c so (S_c − B_c) = 0 in level matrix.
+                            // Note: parser rejects Coulomb + SHF=1, so this arm is
+                            // only reachable if that validation is later relaxed.
+                            s_c[c] = if pp.shf == 1 {
+                                rho_eff * (f * fp + g * gp) / fg_sq
+                            } else {
+                                ch.boundary
+                            };
+                            // φ_c from rho_true; if rho_true ≤ acch, default to 0
+                            // (hard-sphere limit φ → 0 as ρ → 0) without closing
+                            // the channel.
+                            phi_c[c] = coulomb::coulomb_wave_functions(ch.l, eta, rho_true)
+                                .map_or(0.0, |(fl_t, gl_t, _, _)| fl_t.atan2(gl_t));
+                        }
+                        None => {
+                            // rho_eff ≤ acch (≈ 1e-8, SAMMY Coulfg threshold):
+                            // penetrability → 0 at threshold; treat as closed.
+                            // Reference: SAMMY coulomb/mrml08.f90 Coulfg — acch.
+                            p_c[c] = 0.0;
+                            s_c[c] = ch.boundary;
+                            phi_c[c] = 0.0;
+                            is_closed[c] = true;
+                        }
+                    }
                 } else {
-                    ch.boundary
-                };
-                phi_c[c] = penetrability::phase_shift(ch.l, rho_true);
+                    // Hard-sphere (Blatt-Weisskopf) channel.
+                    p_c[c] = penetrability::penetrability(ch.l, rho_eff);
+                    // SHF=0: shift factor not calculated; S_c = B_c so (S_c - B_c) = 0
+                    // in the level matrix diagonal.
+                    // SHF=1: calculate S_c analytically (Blatt-Weisskopf).
+                    // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml07.f Pgh (Ishift check)
+                    s_c[c] = if pp.shf == 1 {
+                        penetrability::shift_factor(ch.l, rho_eff)
+                    } else {
+                        ch.boundary
+                    };
+                    phi_c[c] = penetrability::phase_shift(ch.l, rho_true);
+                }
             }
         }
     }
@@ -260,16 +317,43 @@ fn spin_group_cross_sections(
                         } else {
                             let redmas = pp_c.ma * pp_c.mb / (pp_c.ma + pp_c.mb);
                             let k_cn = channel::wave_number_from_cm(e_cm_n, redmas);
-                            Some(penetrability::penetrability(
-                                ch.l,
-                                k_cn * ch.effective_radius,
-                            ))
+                            let rho_eff_n = k_cn * ch.effective_radius;
+                            // Must use the same penetrability type as the open-channel
+                            // block: Coulomb P_c(E_n) for charged pairs, hard-sphere
+                            // otherwise.  Mixing them produces inconsistent γ_nc
+                            // normalisation: γ_nc = √(Γ_nc / (2·P_c(E_n))).
+                            // SAMMY rml/mrml07.f Pgh — same Zeta check applies here.
+                            let p = if pp_c.za.abs() > 0.5 && pp_c.zb.abs() > 0.5 {
+                                // If rho_eff_n ≤ acch (SAMMY Coulfg threshold,
+                                // ≈ 1e-8) wave functions return None and P = 0.0
+                                // is used.  The filter(p > 0.0) below then maps
+                                // P = 0 → None, applying the closed-channel
+                                // √(|Γ|) normalisation — correct physical limit
+                                // for a resonance barely above its Coulomb
+                                // channel threshold.
+                                // Reference: SAMMY coulomb/mrml08.f90 Coulfg.
+                                let eta = coulomb::sommerfeld_eta(
+                                    pp_c.za, pp_c.zb, pp_c.ma, pp_c.mb, e_cm_n,
+                                );
+                                coulomb::coulomb_wave_functions(ch.l, eta, rho_eff_n)
+                                    .map_or(0.0, |(fl, gl, _, _)| rho_eff_n / (fl * fl + gl * gl))
+                            } else {
+                                penetrability::penetrability(ch.l, rho_eff_n)
+                            };
+                            Some(p)
                         }
                     };
+                    // Guard: prevent division by zero if P_c = 0.  Covers both
+                    // non-Coulomb channels at rho → 0 and Coulomb channels below
+                    // SAMMY's acch threshold (coulomb_wave_functions returns None
+                    // → P = 0.0).  Collapsing to None uses the closed-channel
+                    // √(|Γ|) normalisation, which is the correct limit when the
+                    // channel has effectively zero penetrability.
+                    let p_at_en = p_at_en.filter(|&p| p > 0.0);
                     match p_at_en {
                         None => {
-                            // Closed channel at E_n: formal width used directly as reduced
-                            // amplitude (SAMMY convention for bound-state resonances).
+                            // Closed or non-computable channel at E_n: formal width used
+                            // directly as reduced amplitude (SAMMY bound-state convention).
                             gamma_formal.abs().sqrt().copysign(gamma_formal)
                         }
                         Some(p) => {
@@ -625,8 +709,8 @@ mod tests {
         let pp = ParticlePair {
             ma: 1.0,
             mb: 184.0,
-            za: 0.0,
-            zb: 74.0 * 184.0,
+            za: 0.0,  // neutron charge Z=0
+            zb: 74.0, // W-184 charge Z=74 (ENDF LRF=7 stores charge directly)
             ia: 0.5,
             ib: 0.0,
             q: 0.0,
@@ -687,6 +771,123 @@ mod tests {
                 (tot - elas).abs() < tol,
                 "σ_total ≠ σ_elastic at {e_ev} eV: tot={tot:.6}, elas={elas:.6}"
             );
+        }
+    }
+
+    /// Coulomb exit channels route through coulomb::coulomb_penetrability,
+    /// not the hard-sphere Blatt-Weisskopf functions.
+    ///
+    /// Constructs a 2-channel spin group:
+    ///   ch0: neutron (za=0)  + target — hard-sphere entrance channel
+    ///   ch1: α (za=2)        + O-16 (zb=8) — Coulomb exit, Q=+50 eV (always open)
+    ///
+    /// ENDF LRF=7 stores charge Z directly in ZA/ZB (neutron=0, alpha=2, O-16=8).
+    ///
+    /// Verifies σ_total ≥ 0 (physics sanity) and no panic at both an open
+    /// and a closed Coulomb channel (Q very negative).
+    ///
+    /// SAMMY ref: rml/mrml07.f Pgh — `if (Zeta(I).NE.Zero)` branch.
+    #[test]
+    fn test_coulomb_channel_open_and_closed_no_panic() {
+        use nereids_endf::resonance::{ParticlePair, RmlChannel, RmlData, SpinGroup};
+
+        // Entrance channel: neutron (Z=0) + W-184 target (Z=74).
+        // ENDF LRF=7 stores charge directly: neutron za=0, W-184 zb=74.
+        let pp_entrance = ParticlePair {
+            ma: 1.0,
+            mb: 184.0,
+            za: 0.0,  // neutron charge Z=0
+            zb: 74.0, // W-184 charge Z=74
+            ia: 0.5,
+            ib: 0.0,
+            q: 0.0,
+            pnt: 1,
+            shf: 0,
+            mt: 2,
+            pa: 1.0,
+            pb: 1.0,
+        };
+
+        // Coulomb exit channel: α(Z=2) + O-16(Z=8), Q=+50 eV → always open.
+        // sommerfeld_eta(2, 8, ...) gives η > 0, confirming Coulomb branch.
+        let pp_coulomb_open = ParticlePair {
+            ma: 4.0,
+            mb: 16.0,
+            za: 2.0, // alpha charge Z=2
+            zb: 8.0, // O-16 charge Z=8
+            ia: 0.0,
+            ib: 0.0,
+            q: 50.0, // Q > 0 → e_c = e_cm + 50 > 0 for all positive energies
+            pnt: 1,
+            shf: 0,
+            mt: 22, // (n,α)
+            pa: 1.0,
+            pb: 1.0,
+        };
+
+        // Coulomb exit channel with Q very negative → closed at all reasonable energies.
+        let pp_coulomb_closed = ParticlePair {
+            ma: 4.0,
+            mb: 16.0,
+            za: 2.0, // alpha charge Z=2
+            zb: 8.0, // O-16 charge Z=8
+            ia: 0.0,
+            ib: 0.0,
+            q: -1e6, // far below threshold
+            pnt: 1,
+            shf: 0,
+            mt: 22,
+            pa: 1.0,
+            pb: 1.0,
+        };
+
+        // Build and evaluate the open-channel case.
+        for (desc, pp_exit, expect_positive_total) in [
+            ("open Coulomb exit", &pp_coulomb_open, true),
+            ("closed Coulomb exit", &pp_coulomb_closed, false),
+        ] {
+            let ch0 = RmlChannel {
+                particle_pair_idx: 0,
+                l: 0,
+                channel_spin: 0.5,
+                boundary: 0.0,
+                effective_radius: 8.3,
+                true_radius: 8.3,
+            };
+            let ch1 = RmlChannel {
+                particle_pair_idx: 1,
+                l: 0,
+                channel_spin: 0.5,
+                boundary: 0.0,
+                effective_radius: 5.0,
+                true_radius: 5.0,
+            };
+            let sg = SpinGroup {
+                j: 0.5,
+                parity: 1.0,
+                channels: vec![ch0, ch1],
+                resonances: vec![],
+                has_background_correction: false,
+            };
+            let rml = RmlData {
+                target_spin: 0.0,
+                awr: 183.0,
+                scattering_radius: 8.3,
+                krm: 2,
+                particle_pairs: vec![pp_entrance.clone(), pp_exit.clone()],
+                spin_groups: vec![sg],
+            };
+
+            let (tot, _elas, _cap, _fis) = cross_sections_for_rml_range(&rml, 100.0);
+            assert!(tot >= 0.0, "{desc}: σ_total = {tot:.6} b must be ≥ 0");
+            if expect_positive_total {
+                // Hard-sphere entrance channel alone gives positive σ_total
+                // (the Coulomb channel merely adds a second channel but no resonances).
+                assert!(
+                    tot > 0.0,
+                    "{desc}: σ_total = {tot} b should be > 0 (hard-sphere entrance channel)"
+                );
+            }
         }
     }
 
