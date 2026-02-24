@@ -67,12 +67,14 @@ pub fn cross_sections_at_energy(data: &ResonanceData, energy_ev: f64) -> CrossSe
     for (range_idx, range) in data.ranges.iter().enumerate() {
         // Use half-open [low, high) only when the *next* range begins exactly at
         // this range's upper endpoint AND that next range can actually produce
-        // cross-sections.  An unevaluable URR placeholder (urr=None, !resolved)
-        // must not steal the boundary from the current range.
+        // cross-sections.  Ranges that parse successfully but whose physics is
+        // not yet wired up (SLBW/MLBW, or URR with urr=None) must not steal
+        // the boundary — otherwise the shared energy point falls into a gap.
         // ENDF-6 §2 — adjacent ranges share a single boundary energy.
-        let next_starts_here = data.ranges.get(range_idx + 1).is_some_and(|next| {
-            next.energy_low == range.energy_high && (next.resolved || next.urr.is_some())
-        });
+        let next_starts_here = data
+            .ranges
+            .get(range_idx + 1)
+            .is_some_and(|next| next.energy_low == range.energy_high && range_is_evaluable(next));
         let in_range = if next_starts_here {
             energy_ev >= range.energy_low && energy_ev < range.energy_high
         } else {
@@ -143,6 +145,28 @@ pub fn cross_sections_on_grid(data: &ResonanceData, energies: &[f64]) -> Vec<Cro
         .iter()
         .map(|&e| cross_sections_at_energy(data, e))
         .collect()
+}
+
+/// Can this range actually produce non-zero cross-sections?
+///
+/// Returns `true` for formalisms whose physics evaluation is implemented:
+/// - Reich-Moore (LRF=3) and R-Matrix Limited (LRF=7) resolved ranges
+/// - URR ranges with parsed data (`urr.is_some()`)
+///
+/// Returns `false` for ranges that parse successfully but whose physics
+/// evaluation is not yet wired up (SLBW/MLBW — see TODO issue #12) or
+/// URR placeholders created when unsupported INT codes force a skip.
+fn range_is_evaluable(range: &ResonanceRange) -> bool {
+    if range.urr.is_some() {
+        return true;
+    }
+    if !range.resolved {
+        return false;
+    }
+    matches!(
+        range.formalism,
+        ResonanceFormalism::ReichMoore | ResonanceFormalism::RMatrixLimited
+    )
 }
 
 /// Cross-sections for a single resolved resonance range.
