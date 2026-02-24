@@ -1071,6 +1071,19 @@ fn parse_urr_range(
                     gf.push(values[base + 5]);
                 }
 
+                // Validate that URR energy grid is strictly ascending to satisfy
+                // the precondition of table_interp ("xs must be strictly ascending").
+                for i in 0..energies.len().saturating_sub(1) {
+                    if energies[i] >= energies[i + 1] {
+                        return Err(EndfParseError::UnsupportedFormat(format!(
+                            "URR energy grid must be strictly ascending \
+                             (AJ={aj}, index {i}: {} >= {})",
+                            energies[i],
+                            energies[i + 1]
+                        )));
+                    }
+                }
+
                 j_groups.push(UrrJGroup {
                     j: aj,
                     amun,

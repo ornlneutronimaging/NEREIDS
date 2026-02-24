@@ -11,7 +11,8 @@
 //! g_J = (2J+1) / ((2I+1) · (2s+1))
 //!
 //! LRF=1: Γ_n(E) = 2 · P_L(ρ(E)) · GNO    [GNO = reduced neutron width]
-//! LRF=2: Γ_n(E) = lin-lin interpolation from energy table
+//! LRF=2: Γ_n(E) from tabulated energy grid using INT interpolation
+//!         (e.g. INT=2: lin-lin, INT=5: log-log)
 //!
 //! Γ_tot = Γ_n + GG + GF + GX
 //!
@@ -181,8 +182,12 @@ fn table_interp(
 
 /// Linear-linear interpolation (INT=2, clamped to table endpoints).
 fn lin_lin_interp(xs: &[f64], ys: &[f64], x: f64) -> f64 {
-    table_interp(xs, ys, x, |x, x0, y0, x1, y1| {
-        y0 + (x - x0) / (x1 - x0) * (y1 - y0)
+    table_interp(xs, ys, x, |x, x0, y0, _x1, y1| {
+        let dx = _x1 - x0;
+        if dx.abs() < f64::EPSILON {
+            return y0;
+        }
+        y0 + (x - x0) / dx * (y1 - y0)
     })
 }
 
@@ -190,15 +195,26 @@ fn lin_lin_interp(xs: &[f64], ys: &[f64], x: f64) -> f64 {
 ///
 /// Used for LRF=2 width tables in ENDF (common for heavy actinides such as
 /// U-238 where widths follow an approximate power-law energy dependence).
-/// Falls back to lin-lin when any bracket value is ≤ 0 (log undefined).
+/// Falls back to lin-lin when any bracket value is ≤ 0 (log undefined) or
+/// when the log-space denominator is too small for safe division.
 fn log_log_interp(xs: &[f64], ys: &[f64], x: f64) -> f64 {
     table_interp(xs, ys, x, |x, x0, y0, x1, y1| {
+        let dx = x1 - x0;
+        // Guard against degenerate x-intervals (duplicate energy points).
+        if dx.abs() < f64::EPSILON {
+            return y0;
+        }
         // Guard against non-positive values (log undefined).
         if x0 <= 0.0 || x1 <= 0.0 || y0 <= 0.0 || y1 <= 0.0 {
             // Fall back to lin-lin for degenerate (non-positive) bracket entries.
-            return y0 + (x - x0) / (x1 - x0) * (y1 - y0);
+            return y0 + (x - x0) / dx * (y1 - y0);
         }
-        let log_t = (x.ln() - x0.ln()) / (x1.ln() - x0.ln());
+        let denom_ln = x1.ln() - x0.ln();
+        // Guard against nearly equal log values to avoid numerical blow-up.
+        if denom_ln.abs() < f64::EPSILON {
+            return y0;
+        }
+        let log_t = (x.ln() - x0.ln()) / denom_ln;
         (y0.ln() + log_t * (y1.ln() - y0.ln())).exp()
     })
 }
