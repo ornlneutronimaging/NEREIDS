@@ -66,14 +66,13 @@ pub fn cross_sections_at_energy(data: &ResonanceData, energy_ev: f64) -> CrossSe
 
     for (range_idx, range) in data.ranges.iter().enumerate() {
         // Use half-open [low, high) only when the *next* range begins exactly at
-        // this range's upper endpoint — i.e. the two ranges share a boundary.
-        // Otherwise keep [low, high] so non-adjacent ranges (with a gap between
-        // them) still cover their own upper endpoint.
+        // this range's upper endpoint AND that next range can actually produce
+        // cross-sections.  An unevaluable URR placeholder (urr=None, !resolved)
+        // must not steal the boundary from the current range.
         // ENDF-6 §2 — adjacent ranges share a single boundary energy.
-        let next_starts_here = data
-            .ranges
-            .get(range_idx + 1)
-            .is_some_and(|next| next.energy_low == range.energy_high);
+        let next_starts_here = data.ranges.get(range_idx + 1).is_some_and(|next| {
+            next.energy_low == range.energy_high && (next.resolved || next.urr.is_some())
+        });
         let in_range = if next_starts_here {
             energy_ev >= range.energy_low && energy_ev < range.energy_high
         } else {
