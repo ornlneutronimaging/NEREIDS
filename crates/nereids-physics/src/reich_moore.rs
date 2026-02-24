@@ -29,6 +29,7 @@ use nereids_endf::resonance::{ResonanceData, ResonanceFormalism, ResonanceRange,
 use crate::channel;
 use crate::penetrability;
 use crate::rmatrix_limited;
+use crate::urr;
 
 /// Cross-section results at a single energy point.
 #[derive(Debug, Clone, Copy)]
@@ -64,10 +65,24 @@ pub fn cross_sections_at_energy(data: &ResonanceData, energy_ev: f64) -> CrossSe
     let mut fission = 0.0;
 
     for range in &data.ranges {
-        if !range.resolved {
+        if energy_ev < range.energy_low || energy_ev > range.energy_high {
             continue;
         }
-        if energy_ev < range.energy_low || energy_ev > range.energy_high {
+
+        // URR (LRU=2): Hauser-Feshbach average cross-sections.
+        // These ranges are not "resolved" so they must be handled before the
+        // resolved check below.  The URR energy band is authoritative via
+        // `urr.e_low`/`urr.e_high` and the band guard inside `urr_cross_sections`.
+        if let Some(urr_data) = &range.urr {
+            let (t, e, c, f) = urr::urr_cross_sections(urr_data, energy_ev);
+            total += t;
+            elastic += e;
+            capture += c;
+            fission += f;
+            continue;
+        }
+
+        if !range.resolved {
             continue;
         }
 
@@ -740,6 +755,7 @@ mod tests {
                 }],
                 rml: None,
                 ap_table: None,
+                urr: None,
             }],
         }
     }
