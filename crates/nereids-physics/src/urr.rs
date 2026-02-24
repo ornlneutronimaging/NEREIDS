@@ -21,10 +21,16 @@
 //! σ_cn += (π/k²) · g_J · (2π · Γ_n · Γ_n) / (D · Γ_tot)    [neutron-out]
 //! ```
 //!
-//! `σ_cn` is the compound-elastic/inelastic contribution. Potential scattering
-//! `σ_pot = 4π·AP²` is included in the returned `total` and `elastic` so
-//! that the URR band produces a physically consistent cross-section without
-//! requiring special handling at the call site.
+//! `σ_cn` is the compound-elastic contribution; the competitive (GX) channel
+//! contributes to `total` but not `elastic`.  Potential scattering
+//! `σ_pot = 4π·AP²/100` (AP in fm, result in barns) is included in the
+//! returned `total` and `elastic` so that the URR band produces a physically
+//! consistent cross-section without requiring special handling at the call site.
+//!
+//! ## Units
+//! All energies in eV, all lengths (AP, channel radii) in fm, cross-sections
+//! in barns.  AP is stored directly from the ENDF file (IFG=0 convention:
+//! radii in units of 10⁻¹² cm ≡ fm).  No conversion is needed.
 //!
 //! ## SAMMY Reference
 //! - `unr/munr03.f90` Csig3 subroutine
@@ -46,7 +52,7 @@ use crate::penetrability;
 /// `[urr.e_low, urr.e_high]`.
 ///
 /// `elastic` = compound-nuclear elastic + smooth potential scattering.
-/// `total`   = elastic + capture + fission.
+/// `total`   = elastic + capture + fission + competitive (GX).
 /// Potential scattering `σ_pot = 4π·AP²` is folded in here rather than at
 /// the call site; AP is in fm and 1 barn = 100 fm².
 /// SAMMY ref: `unr/munr03.f90` includes the hard-sphere background.
@@ -240,7 +246,7 @@ mod tests {
 
     /// LRF=1 formula check: σ_γ = (π/k²) · g_J · (2π · Γ_n · GG) / (D · Γ_tot).
     ///
-    /// Uses a single (L=0, J=2.5) group with known parameters; verifies
+    /// Uses a single (L=0, J=2.0) group with known parameters; verifies
     /// σ_γ matches the hand-computed value to within 0.1%.
     #[test]
     fn urr_lrf1_formula_check() {

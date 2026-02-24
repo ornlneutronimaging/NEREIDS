@@ -911,12 +911,15 @@ fn parse_endf_float(line: &str, field_index: usize) -> Result<f64, EndfParseErro
             && bytes[i - 1] != b'-'
         {
             let mantissa = &trimmed[..i];
-            // Strip any spaces from the exponent (some ENDF files write "+ 4" not "+4")
-            let exponent: String = trimmed[i..]
-                .chars()
-                .filter(|c| !c.is_whitespace())
-                .collect();
-            let with_e = format!("{}E{}", mantissa, exponent);
+            let exp_slice = &trimmed[i..];
+            // Strip spaces from the exponent only when present (some ENDF files
+            // write "+ 4" not "+4").  Avoid allocation on the common path.
+            let with_e = if exp_slice.contains(' ') {
+                let exponent: String = exp_slice.chars().filter(|c| !c.is_whitespace()).collect();
+                format!("{}E{}", mantissa, exponent)
+            } else {
+                format!("{}E{}", mantissa, exp_slice)
+            };
             if let Ok(v) = with_e.parse::<f64>() {
                 return Ok(v);
             }
@@ -966,6 +969,12 @@ fn parse_endf_int(line: &str, field_index: usize) -> Result<i32, EndfParseError>
 ///
 /// Supports LRF=1 (energy-independent widths) and LRF=2 (tabulated widths).
 ///
+/// ## Units
+/// AP (scattering radius) is stored as-is from the ENDF file.  With IFG=0
+/// (the universal convention in ENDF/B-VIII.0), AP is in units of 10⁻¹² cm
+/// which is identically 1 fm.  No conversion is needed; the physics layer
+/// (`channel::rho`, `urr_cross_sections`) expects fm throughout.
+///
 /// ## LRF=1 record layout (ENDF-6 §2.2.2.1)
 /// ```text
 /// CONT: SPI, AP, 0, 0, NLS, 0
@@ -996,9 +1005,10 @@ fn parse_urr_range(
     use crate::resonance::{UrrData, UrrJGroup, UrrLGroup};
 
     // CONT: SPI, AP, 0, 0, NLS, 0
+    // AP is in 10⁻¹² cm ≡ fm (IFG=0); no conversion needed.
     let spi_cont = parse_cont(lines, pos)?;
     let spi = spi_cont.c1;
-    let ap = spi_cont.c2;
+    let ap = spi_cont.c2; // scattering radius (fm)
     let nls = spi_cont.n1 as usize;
 
     let mut l_groups = Vec::with_capacity(nls);
