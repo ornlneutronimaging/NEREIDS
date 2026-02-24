@@ -17,7 +17,7 @@
 //!
 //! σ_γ  += (π/k²) · g_J · (2π · Γ_n · GG) / (D · Γ_tot)
 //! σ_f  += (π/k²) · g_J · (2π · Γ_n · GF) / (D · Γ_tot)
-//! σ_cn += (π/k²) · g_J · (2π · Γ_n · (GG + GF + GX)) / (D · Γ_tot)
+//! σ_cn += (π/k²) · g_J · (2π · Γ_n · Γ_n) / (D · Γ_tot)    [neutron-out]
 //! ```
 //!
 //! `σ_cn` is the compound-elastic/inelastic contribution. Potential scattering
@@ -128,13 +128,13 @@ pub fn urr_cross_sections(urr: &UrrData, e_ev: f64) -> (f64, f64, f64, f64) {
 
             sig_cap += prefactor * gg_eff / gamma_tot;
             sig_fiss += prefactor * gf_eff / gamma_tot;
-            // Compound-nuclear contribution to neutron channel (absorption minus
-            // re-emission of neutrons back into the neutron channel is zero here;
-            // this term accounts for neutrons that form compound nucleus and then
-            // emerge as neutrons into other partial waves / excitation modes).
-            // For our purposes: σ_cn ∝ Γ_n × (Γ_tot - Γ_n) / Γ_tot
-            let gamma_abs = gg_eff + gf_eff + gx_eff; // Γ_tot - Γ_n
-            sig_compound_n += prefactor * gamma_abs / gamma_tot;
+            // Compound-elastic contribution: neutron absorbed into the compound
+            // nucleus and re-emitted as a neutron.  The probability of re-emission
+            // into the neutron channel is Γ_n / Γ_tot, giving:
+            //   σ_cn = (π/k²) · g_J · (2π·Γ_n/D) · Γ_n / Γ_tot
+            // SAMMY ref: unr/munr03.f90 — `Sigxxx` uses Gn for both transmission
+            // coefficients in the neutron elastic formula.
+            sig_compound_n += prefactor * gn_eff / gamma_tot;
         }
     }
 
@@ -270,7 +270,7 @@ mod tests {
         let g_j = channel::statistical_weight(j, spi);
         let prefactor = pi_over_k2 * g_j * (2.0 * std::f64::consts::PI * gn_eff) / d;
         let expected_cap = prefactor * gg / gamma_tot;
-        let expected_cn = prefactor * gg / gamma_tot; // Γ_abs = gg (no fission)
+        let expected_cn = prefactor * gn_eff / gamma_tot; // neutron-out term
         let expected_sig_pot = 4.0 * std::f64::consts::PI * ap * ap / 100.0;
         let expected_elastic = expected_cn + expected_sig_pot;
 
