@@ -217,7 +217,7 @@ fn log_log_interp(xs: &[f64], ys: &[f64], x: f64) -> f64 {
             return y0;
         }
         // Guard against non-positive values (log undefined).
-        if x0 <= 0.0 || x1 <= 0.0 || y0 <= 0.0 || y1 <= 0.0 {
+        if x <= 0.0 || x0 <= 0.0 || x1 <= 0.0 || y0 <= 0.0 || y1 <= 0.0 {
             // Fall back to lin-lin for degenerate (non-positive) bracket entries.
             return y0 + (x - x0) / dx * (y1 - y0);
         }
