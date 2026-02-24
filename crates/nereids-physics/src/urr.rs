@@ -63,7 +63,10 @@ use crate::penetrability;
 /// # Arguments
 /// * `urr` — Parsed URR parameters (LRF=1 or LRF=2).
 /// * `e_ev` — Neutron lab-frame energy in eV.
-pub fn urr_cross_sections(urr: &UrrData, e_ev: f64) -> (f64, f64, f64, f64) {
+/// * `ap_fm` — Scattering radius in fm at this energy.  The caller is
+///   responsible for evaluating any AP(E) table (NRO≠0) or falling back
+///   to the constant `urr.ap`.
+pub fn urr_cross_sections(urr: &UrrData, e_ev: f64, ap_fm: f64) -> (f64, f64, f64, f64) {
     if e_ev < urr.e_low || e_ev > urr.e_high {
         return (0.0, 0.0, 0.0, 0.0);
     }
@@ -80,7 +83,7 @@ pub fn urr_cross_sections(urr: &UrrData, e_ev: f64) -> (f64, f64, f64, f64) {
         // π/k² in barns and channel parameter ρ = k·AP.
         // Uses the same channel formulas as the RRR calculator for consistency.
         let pi_over_k2 = channel::pi_over_k_squared_barns(e_ev, awri);
-        let rho = channel::rho(e_ev, awri, urr.ap);
+        let rho = channel::rho(e_ev, awri, ap_fm);
 
         // Blatt-Weisskopf penetrability P_L(ρ) for LRF=1 Γ_n calculation.
         let p_l = penetrability::penetrability(l, rho);
@@ -154,7 +157,7 @@ pub fn urr_cross_sections(urr: &UrrData, e_ev: f64) -> (f64, f64, f64, f64) {
     // Smooth potential scattering: σ_pot = 4π·AP²
     // AP is in fm; 1 barn = 100 fm².
     // SAMMY ref: unr/munr03.f90 adds hard-sphere background to elastic.
-    let sig_pot = 4.0 * std::f64::consts::PI * urr.ap * urr.ap / 100.0;
+    let sig_pot = 4.0 * std::f64::consts::PI * ap_fm * ap_fm / 100.0;
     let elastic = sig_compound_n + sig_pot;
     let total = elastic + sig_cap + sig_fiss + sig_competitive;
     (total, elastic, sig_cap, sig_fiss)
@@ -234,13 +237,13 @@ mod tests {
     #[test]
     fn urr_outside_band_returns_zero() {
         let urr = make_lrf1_urr(1000.0, 30_000.0);
-        let (t, e, c, f) = urr_cross_sections(&urr, 500.0); // below band
+        let (t, e, c, f) = urr_cross_sections(&urr, 500.0, urr.ap); // below band
         assert_eq!(t, 0.0);
         assert_eq!(e, 0.0);
         assert_eq!(c, 0.0);
         assert_eq!(f, 0.0);
 
-        let (t2, _, _, _) = urr_cross_sections(&urr, 50_000.0); // above band
+        let (t2, _, _, _) = urr_cross_sections(&urr, 50_000.0, urr.ap); // above band
         assert_eq!(t2, 0.0);
     }
 
@@ -285,7 +288,7 @@ mod tests {
             }],
         };
 
-        let (total, elastic, capture, fission) = urr_cross_sections(&urr, e_test);
+        let (total, elastic, capture, fission) = urr_cross_sections(&urr, e_test, ap);
 
         // Hand-compute expected values.
         let pi_over_k2 = channel::pi_over_k_squared_barns(e_test, awri);
@@ -354,9 +357,9 @@ mod tests {
             }],
         };
 
-        let (_, _, c1, _) = urr_cross_sections(&urr, e1);
-        let (_, _, c2, _) = urr_cross_sections(&urr, e2);
-        let (_, _, c_mid, _) = urr_cross_sections(&urr, 5_000.0);
+        let (_, _, c1, _) = urr_cross_sections(&urr, e1, urr.ap);
+        let (_, _, c2, _) = urr_cross_sections(&urr, e2, urr.ap);
+        let (_, _, c_mid, _) = urr_cross_sections(&urr, 5_000.0, urr.ap);
 
         assert!(c1 > 0.0, "σ_γ at {e1} eV must be positive, got {c1}");
         assert!(c2 > 0.0, "σ_γ at {e2} eV must be positive, got {c2}");
@@ -366,7 +369,7 @@ mod tests {
         );
 
         // Outside band returns zero.
-        let (t_out, _, _, _) = urr_cross_sections(&urr, 100.0);
+        let (t_out, _, _, _) = urr_cross_sections(&urr, 100.0, urr.ap);
         assert_eq!(t_out, 0.0, "Outside band must be zero");
     }
 

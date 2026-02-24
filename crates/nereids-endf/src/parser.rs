@@ -91,12 +91,12 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
                 // NRO=range_cont.n1: if non-zero a TAB1 AP(E) record immediately follows
                 // the range CONT before the URR SPI/AP/NLS CONT.
                 // ENDF-6 §2.2.2; SAMMY unr/munr01.f90.
-                // TODO: honour AP(E) in urr_cross_sections.  For now we skip the TAB1
-                // and parse with the constant AP from the SPI/AP CONT (approximation).
                 let nro_urr = range_cont.n1;
-                if nro_urr != 0 {
-                    skip_tab1(&lines, &mut pos)?;
-                }
+                let ap_table_urr = if nro_urr != 0 {
+                    Some(parse_tab1(&lines, &mut pos)?)
+                } else {
+                    None
+                };
 
                 // LRF=1 and LRF=2 are fully supported.
                 // Other values (LRF=3/4 are obsolete ENDF formats) are skipped so
@@ -106,7 +106,8 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
                     continue;
                 }
 
-                let urr_range = parse_urr_range(&lines, &mut pos, lrf, energy_low, energy_high)?;
+                let urr_range =
+                    parse_urr_range(&lines, &mut pos, lrf, energy_low, energy_high, ap_table_urr)?;
                 all_ranges.push(urr_range);
                 continue;
             }
@@ -1001,6 +1002,7 @@ fn parse_urr_range(
     lrf: i32,
     energy_low: f64,
     energy_high: f64,
+    ap_table: Option<Tab1>,
 ) -> Result<ResonanceRange, EndfParseError> {
     use crate::resonance::{UrrData, UrrJGroup, UrrLGroup};
 
@@ -1175,7 +1177,7 @@ fn parse_urr_range(
         formalism: ResonanceFormalism::Unresolved,
         target_spin: spi,
         scattering_radius: ap,
-        ap_table: None,
+        ap_table,
         l_groups: Vec::new(),
         rml: None,
         urr: Some(Box::new(urr)),

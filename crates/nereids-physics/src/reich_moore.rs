@@ -100,7 +100,8 @@ pub fn cross_sections_at_energy(data: &ResonanceData, energy_ev: f64) -> CrossSe
                 urr_data.e_high, range.energy_high,
                 "URR e_high must equal range.energy_high"
             );
-            let (t, e, c, f) = urr::urr_cross_sections(urr_data, energy_ev);
+            let ap_fm = range.scattering_radius_at(energy_ev);
+            let (t, e, c, f) = urr::urr_cross_sections(urr_data, energy_ev, ap_fm);
             total += t;
             elastic += e;
             capture += c;
