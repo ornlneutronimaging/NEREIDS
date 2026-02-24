@@ -1011,6 +1011,12 @@ fn parse_urr_range(
     let spi_cont = parse_cont(lines, pos)?;
     let spi = spi_cont.c1;
     let ap = spi_cont.c2; // scattering radius (fm)
+    if spi_cont.n1 < 0 {
+        return Err(EndfParseError::UnsupportedFormat(format!(
+            "URR NLS={} is negative",
+            spi_cont.n1
+        )));
+    }
     let nls = spi_cont.n1 as usize;
 
     let mut l_groups = Vec::with_capacity(nls);
@@ -1022,6 +1028,12 @@ fn parse_urr_range(
             let l_cont = parse_cont(lines, pos)?;
             let awri = l_cont.c1;
             let l = l_cont.l1 as u32;
+            if l_cont.n1 < 0 || l_cont.n2 < 0 {
+                return Err(EndfParseError::UnsupportedFormat(format!(
+                    "URR LRF=1 L={l}: negative count N1={} or NJS={}",
+                    l_cont.n1, l_cont.n2
+                )));
+            }
             let n1 = l_cont.n1 as usize; // 6*NJS
             let njs = l_cont.n2 as usize; // NJS
 
@@ -1061,6 +1073,12 @@ fn parse_urr_range(
             let l_cont = parse_cont(lines, pos)?;
             let awri = l_cont.c1;
             let l = l_cont.l1 as u32;
+            if l_cont.n1 < 0 {
+                return Err(EndfParseError::UnsupportedFormat(format!(
+                    "URR LRF=2 L={l}: negative NJS={}",
+                    l_cont.n1
+                )));
+            }
             let njs = l_cont.n1 as usize; // N1 = NJS for LRF=2
 
             let mut j_groups = Vec::with_capacity(njs);
@@ -1069,6 +1087,12 @@ fn parse_urr_range(
                 let j_cont = parse_cont(lines, pos)?;
                 let aj = j_cont.c1;
                 let int_code = j_cont.l1; // interpolation law (L1 field)
+                if j_cont.n1 < 0 || j_cont.n2 < 0 {
+                    return Err(EndfParseError::UnsupportedFormat(format!(
+                        "URR LRF=2 J={aj}: negative count N1={} or NE={}",
+                        j_cont.n1, j_cont.n2
+                    )));
+                }
                 let n1 = j_cont.n1 as usize; // 6*(NE+1)
                 let ne = j_cont.n2 as usize; // NE (number of energy points)
 
@@ -1092,7 +1116,7 @@ fn parse_urr_range(
                         formalism: ResonanceFormalism::Unresolved,
                         target_spin: spi,
                         scattering_radius: ap,
-                        ap_table: None,
+                        ap_table,
                         l_groups: Vec::new(),
                         rml: None,
                         urr: None,
