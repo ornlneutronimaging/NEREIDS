@@ -822,7 +822,8 @@ fn parse_endf_float(line: &str, field_index: usize) -> Result<f64, EndfParseErro
             && bytes[i - 1] != b'-'
         {
             let mantissa = &trimmed[..i];
-            let exponent = &trimmed[i..];
+            // Strip any spaces from the exponent (some ENDF files write "+ 4" not "+4")
+            let exponent: String = trimmed[i..].chars().filter(|c| !c.is_whitespace()).collect();
             let with_e = format!("{}E{}", mantissa, exponent);
             if let Ok(v) = with_e.parse::<f64>() {
                 return Ok(v);
@@ -1652,5 +1653,200 @@ mod tests {
         assert_eq!(range.l_groups.len(), 1, "one L-group");
         let res = &range.l_groups[0].resonances[0];
         assert!((res.energy - 6.674).abs() < 1e-6);
+    }
+
+    /// Parse the U-233 URR section (LRU=2, LRF=2) from the SAMMY test file tr149.
+    ///
+    /// Validates the full LRF=2 record structure against the known U-233 file:
+    /// - Two L-groups (L=0, L=1)
+    /// - Two J-groups per L
+    /// - NE=21 energy points per J-group
+    /// - First energy = 600 eV, last ≈ 30 000 eV
+    ///
+    /// Test data: ../SAMMY/SAMMY/sammy/samtry/tr149/t149a.endf (MAT=9222, ZA=92233)
+    #[test]
+    fn test_parse_u233_urr_lrf2() {
+        let endf_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("../SAMMY/SAMMY/sammy/samtry/tr149/t149a.endf");
+
+        if !endf_path.exists() {
+            eprintln!(
+                "Skipping test: U-233 ENDF file not found at {:?}",
+                endf_path
+            );
+            return;
+        }
+
+        let text = std::fs::read_to_string(&endf_path).unwrap();
+        let data = parse_endf_file2(&text).expect("U-233 ENDF must parse without error");
+
+        // U-233 has two energy ranges in MAT=9222:
+        //   range 0: LRU=1 (resolved, LRF=3 or LRF=2)
+        //   range 1: LRU=2 (unresolved, LRF=2)
+        let urr_range = data
+            .ranges
+            .iter()
+            .find(|r| r.urr.is_some())
+            .expect("U-233 must have at least one URR range");
+
+        let urr = urr_range.urr.as_ref().unwrap();
+        assert_eq!(urr.lrf, 2, "LRF must be 2 for U-233 URR");
+        assert!((urr.spi - 2.5).abs() < 1e-6, "SPI must be 2.5 for U-233");
+        assert!((urr.e_low - 600.0).abs() < 1.0, "e_low must be ~600 eV");
+        assert!(
+            (urr.e_high - 30_000.0).abs() < 100.0,
+            "e_high must be ~30 000 eV"
+        );
+
+        assert_eq!(
+            urr.l_groups.len(),
+            2,
+            "U-233 URR must have 2 L-groups (L=0, L=1)"
+        );
+
+        let lg0 = &urr.l_groups[0];
+        assert_eq!(lg0.l, 0, "First L-group must have L=0");
+        assert_eq!(lg0.j_groups.len(), 2, "L=0 must have 2 J-groups");
+
+        let jg0 = &lg0.j_groups[0];
+        assert!((jg0.j - 2.0).abs() < 1e-6, "First J-group must have J=2.0");
+        assert_eq!(
+            jg0.energies.len(),
+            21,
+            "J=2.0 group must have 21 energy points"
+        );
+        assert!(
+            (jg0.energies[0] - 600.0).abs() < 1.0,
+            "First energy must be ~600 eV, got {}",
+            jg0.energies[0]
+        );
+        assert!(
+            jg0.energies[20] > 20_000.0,
+            "Last energy must be >20 000 eV, got {}",
+            jg0.energies[20]
+        );
+
+        // Verify DOF is parsed (AMUN ≥ 1 for neutrons).
+        assert!(
+            jg0.amun >= 1.0,
+            "AMUN must be ≥ 1, got {}",
+            jg0.amun
+        );
+
+        // Verify widths are positive.
+        assert!(jg0.d[0] > 0.0, "Level spacing D must be positive");
+        assert!(jg0.gn[0] > 0.0, "Neutron width GN must be positive");
+        assert!(jg0.gg[0] > 0.0, "Gamma width GG must be positive");
+
+        println!(
+            "U-233 URR parsed: lrf={} spi={} e_low={} e_high={} l_groups={}",
+            urr.lrf,
+            urr.spi,
+            urr.e_low,
+            urr.e_high,
+            urr.l_groups.len()
+        );
+        println!(
+            "  L=0, J=2.0: NE={} energies[0]={:.0} eV, D[0]={:.4} eV, GN[0]={:.4e} eV, GG[0]={:.4e} eV",
+            jg0.energies.len(),
+            jg0.energies[0],
+            jg0.d[0],
+            jg0.gn[0],
+            jg0.gg[0]
+        );
+    }
+
+    /// Hand-crafted LRF=1 URR roundtrip test.
+    ///
+    /// Verifies that a minimal synthetic ENDF snippet with LRU=2, LRF=1 is
+    /// parsed correctly: one L-group (L=0), two J-groups with known D, AJ,
+    /// AMUN, GNO, GG, GF values.
+    #[test]
+    fn test_parse_lrf1_urr_roundtrip() {
+        // Minimal ENDF MF=2/MT=151 with one resolved range followed by one
+        // LRU=2 LRF=1 unresolved range.
+        //
+        // Resolved range: a simple RM LRF=3 with one resonance (gives the
+        // parser something valid to consume before the URR section).
+        //
+        // URR range: LRU=2, LRF=1, NLS=1 (L=0), NJS=2 J-groups.
+        //   J=2.0: D=0.5 eV, AMUN=1, GNO=3e-4 eV, GG=3.5e-2 eV, GF=0
+        //   J=3.0: D=0.4 eV, AMUN=1, GNO=2e-4 eV, GG=3.0e-2 eV, GF=1e-3 eV
+        //
+        // Each ENDF line: 66 data chars + MAT(4) MF(2) MT(3) SEQ(5) = 80 chars.
+        const ENDF: &str = concat!(
+            // ── HEAD: ZA=92233, AWR=231.038, NIS=1 ─────────────────────────
+            " 9.223300+4 2.310380+2          0          0          1          09222 2151    1\n",
+            // ── Isotope CONT: ZAI=92233, ABN=1.0, LFW=0, NER=2 ─────────────
+            " 9.223300+4 1.000000+0          0          0          2          09222 2151    2\n",
+            // ── Range 0: EL=1e-5, EH=600, LRU=1, LRF=3 (resolved RM) ───────
+            " 1.000000-5 6.000000+2          1          3          0          09222 2151    3\n",
+            // RM CONT: SPI=2.5, AP=0.96931, NLS=1
+            " 2.500000+0 9.693100-1          0          0          1          09222 2151    4\n",
+            // L CONT: AWRI=231.038, APL=0, L=0, NRS=1
+            " 2.310380+2 0.000000+0          0          0          6          19222 2151    5\n",
+            // One resonance: ER=10 eV, AJ=2.0, GN=1e-3, GG=3.5e-2, GFA=0, GFB=0
+            " 1.000000+1 2.000000+0 1.000000-3 3.500000-2 0.000000+0 0.000000+09222 2151    6\n",
+            // ── Range 1: EL=600, EH=3e4, LRU=2, LRF=1 (URR) ────────────────
+            " 6.000000+2 3.000000+4          2          1          0          09222 2151    7\n",
+            // URR CONT: SPI=2.5, AP=0.96931, NLS=1
+            " 2.500000+0 9.693100-1          0          0          1          09222 2151    8\n",
+            // L=0 CONT: AWRI=231.038, L=0, N1=12(=6*NJS), N2=2(=NJS)
+            " 2.310380+2 0.000000+0          0          0         12          29222 2151    9\n",
+            // J=2.0: D=0.5,  AJ=2.0, AMUN=1.0, GNO=3e-4,  GG=3.5e-2, GF=0
+            " 5.000000-1 2.000000+0 1.000000+0 3.000000-4 3.500000-2 0.000000+09222 2151   10\n",
+            // J=3.0: D=0.4,  AJ=3.0, AMUN=1.0, GNO=2e-4,  GG=3.0e-2, GF=1e-3
+            " 4.000000-1 3.000000+0 1.000000+0 2.000000-4 3.000000-2 1.000000-39222 2151   11\n",
+        );
+
+        let data = parse_endf_file2(ENDF).expect("LRF=1 URR fixture must parse cleanly");
+
+        // Should have 2 ranges: one resolved + one URR.
+        assert_eq!(data.ranges.len(), 2, "must have 2 ranges");
+
+        let urr_range = &data.ranges[1];
+        assert!(!urr_range.resolved, "URR range must not be resolved");
+        assert_eq!(
+            urr_range.formalism,
+            ResonanceFormalism::Unresolved,
+            "formalism must be Unresolved"
+        );
+
+        let urr = urr_range.urr.as_ref().expect("URR range must have urr data");
+        assert_eq!(urr.lrf, 1, "LRF must be 1");
+        assert!((urr.spi - 2.5).abs() < 1e-10, "SPI must be 2.5");
+        assert!(
+            (urr.e_low - 600.0).abs() < 1.0,
+            "e_low must be 600 eV"
+        );
+        assert!(
+            (urr.e_high - 30_000.0).abs() < 1.0,
+            "e_high must be 30 000 eV"
+        );
+
+        assert_eq!(urr.l_groups.len(), 1, "must have 1 L-group");
+        let lg = &urr.l_groups[0];
+        assert_eq!(lg.l, 0, "L must be 0");
+        assert!((lg.awri - 231.038).abs() < 0.001, "AWRI must be 231.038");
+        assert_eq!(lg.j_groups.len(), 2, "must have 2 J-groups");
+
+        let jg0 = &lg.j_groups[0];
+        assert!((jg0.j - 2.0).abs() < 1e-10, "first J must be 2.0");
+        assert!(jg0.energies.is_empty(), "LRF=1 energies must be empty");
+        assert!((jg0.d[0] - 0.5).abs() < 1e-10, "D must be 0.5 eV");
+        assert!((jg0.amun - 1.0).abs() < 1e-10, "AMUN must be 1.0");
+        assert!((jg0.gn[0] - 3e-4).abs() < 1e-14, "GNO must be 3e-4 eV");
+        assert!((jg0.gg[0] - 3.5e-2).abs() < 1e-12, "GG must be 3.5e-2 eV");
+        assert!((jg0.gf[0] - 0.0).abs() < 1e-14, "GF must be 0");
+
+        let jg1 = &lg.j_groups[1];
+        assert!((jg1.j - 3.0).abs() < 1e-10, "second J must be 3.0");
+        assert!((jg1.d[0] - 0.4).abs() < 1e-10, "D must be 0.4 eV");
+        assert!((jg1.gn[0] - 2e-4).abs() < 1e-14, "GNO must be 2e-4 eV");
+        assert!((jg1.gf[0] - 1e-3).abs() < 1e-14, "GF must be 1e-3 eV");
     }
 }
