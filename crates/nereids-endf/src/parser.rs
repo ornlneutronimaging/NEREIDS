@@ -1041,7 +1041,7 @@ fn parse_urr_range(
                 j_groups.push(UrrJGroup {
                     j: values[base + 1],        // AJ
                     amun: values[base + 2],     // AMUN (neutron DOF)
-                    amuf: 0.0,                  // No fission DOF in LRF=1
+                    amuf: 0.0,                  // AMUF not provided in LRF=1 format
                     energies: vec![],           // Energy-independent
                     d: vec![values[base]],      // D (level spacing, eV)
                     gx: vec![0.0],              // No competitive width in LRF=1

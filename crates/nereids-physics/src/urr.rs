@@ -250,7 +250,7 @@ mod tests {
     /// LRF=1 formula check: σ_γ = (π/k²) · g_J · (2π · Γ_n · GG) / (D · Γ_tot).
     ///
     /// Uses a single (L=0, J=2.0) group with known parameters; verifies
-    /// σ_γ matches the hand-computed value to within 0.1%.
+    /// σ_γ matches the hand-computed value within numerical precision (~1e-10 relative).
     #[test]
     fn urr_lrf1_formula_check() {
         // Hand-crafted parameters similar to U-233 URR (order of magnitude).

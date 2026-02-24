@@ -181,14 +181,17 @@ pub enum ResonanceFormalism {
 //
 // LRF=1: single energy-independent width set per (L, J); Γ_n derived from
 //        reduced neutron width GNO via Γ_n = 2·P_L·GNO.
-// LRF=2: tabulated energy-dependent widths with lin-lin interpolation.
+// LRF=2: tabulated energy-dependent widths with an interpolation law per
+//        J-group (INT=2 lin-lin, INT=5 log-log; other INT codes are valid
+//        ENDF but not yet implemented and cause the URR range to be skipped).
 //
 // Reference: ENDF-6 Formats Manual §2.2.2; SAMMY unr/munr03.f90 Csig3
 
 /// Average widths for one (L, J) combination in the Unresolved Resonance Region.
 ///
 /// For LRF=1: `energies` is empty; each width vector has exactly one element.
-/// For LRF=2: all vectors have length NE (lin-lin interpolation table).
+/// For LRF=2: all vectors have length NE; `int_code` selects the interpolation
+/// law (INT=2 lin-lin or INT=5 log-log).
 ///
 /// Reference: ENDF-6 Formats Manual §2.2.2; SAMMY `unr/munr03.f90`
 #[derive(Debug, Clone, Serialize, Deserialize)]
