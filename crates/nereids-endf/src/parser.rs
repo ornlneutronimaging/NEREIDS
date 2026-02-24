@@ -823,7 +823,10 @@ fn parse_endf_float(line: &str, field_index: usize) -> Result<f64, EndfParseErro
         {
             let mantissa = &trimmed[..i];
             // Strip any spaces from the exponent (some ENDF files write "+ 4" not "+4")
-            let exponent: String = trimmed[i..].chars().filter(|c| !c.is_whitespace()).collect();
+            let exponent: String = trimmed[i..]
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
             let with_e = format!("{}E{}", mantissa, exponent);
             if let Ok(v) = with_e.parse::<f64>() {
                 return Ok(v);
@@ -1731,11 +1734,7 @@ mod tests {
         );
 
         // Verify DOF is parsed (AMUN ≥ 1 for neutrons).
-        assert!(
-            jg0.amun >= 1.0,
-            "AMUN must be ≥ 1, got {}",
-            jg0.amun
-        );
+        assert!(jg0.amun >= 1.0, "AMUN must be ≥ 1, got {}", jg0.amun);
 
         // Verify widths are positive.
         assert!(jg0.d[0] > 0.0, "Level spacing D must be positive");
@@ -1816,13 +1815,13 @@ mod tests {
             "formalism must be Unresolved"
         );
 
-        let urr = urr_range.urr.as_ref().expect("URR range must have urr data");
+        let urr = urr_range
+            .urr
+            .as_ref()
+            .expect("URR range must have urr data");
         assert_eq!(urr.lrf, 1, "LRF must be 1");
         assert!((urr.spi - 2.5).abs() < 1e-10, "SPI must be 2.5");
-        assert!(
-            (urr.e_low - 600.0).abs() < 1.0,
-            "e_low must be 600 eV"
-        );
+        assert!((urr.e_low - 600.0).abs() < 1.0, "e_low must be 600 eV");
         assert!(
             (urr.e_high - 30_000.0).abs() < 1.0,
             "e_high must be 30 000 eV"
