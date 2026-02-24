@@ -190,6 +190,7 @@ mod tests {
                     }],
                 }],
                 rml: None,
+                urr: None,
                 ap_table: None,
             }],
         }

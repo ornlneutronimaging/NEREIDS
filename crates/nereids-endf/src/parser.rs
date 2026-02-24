@@ -80,11 +80,17 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
             let lrf = range_cont.l2; // resonance formalism
 
             if lru == 2 {
-                // Unresolved resonance region (LRU=2) — parse past but do not evaluate.
-                // URR uses average level-spacing/width parameters and probability tables
-                // rather than discrete resonances.  SAMMY implements URR cross-sections
-                // via urr/murr*.f90.  Tracked in issue #44.
-                skip_unresolved_range(&lines, &mut pos, lrf)?;
+                // Unresolved resonance region (LRU=2).
+                // URR uses average level-spacing/width parameters; cross-sections are
+                // computed via Hauser-Feshbach in nereids_physics::urr.
+                // Supported: LRF=1 (energy-independent widths) and LRF=2 (tabulated).
+                if lrf != 1 && lrf != 2 {
+                    return Err(EndfParseError::UnsupportedFormat(format!(
+                        "LRU=2 LRF={lrf} is not supported (only LRF=1 and LRF=2)"
+                    )));
+                }
+                let urr_range = parse_urr_range(&lines, &mut pos, lrf, energy_low, energy_high)?;
+                all_ranges.push(urr_range);
                 continue;
             }
 
@@ -135,6 +141,10 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
                 }
                 ResonanceFormalism::RMatrixLimited => {
                     parse_rmatrix_limited_range(&lines, &mut pos, energy_low, energy_high, awr)?
+                }
+                ResonanceFormalism::Unresolved => {
+                    // Unreachable: Unresolved is only assigned in the LRU=2 branch above.
+                    unreachable!("Unresolved formalism should not appear in LRU=1 dispatch");
                 }
             };
             range.ap_table = ap_table;
@@ -219,6 +229,7 @@ fn parse_bw_range(
         ap_table: None, // set by caller from NRO TAB1 if present
         l_groups,
         rml: None,
+        urr: None,
     })
 }
 
@@ -290,6 +301,7 @@ fn parse_reich_moore_range(
         ap_table: None, // set by caller from NRO TAB1 if present
         l_groups,
         rml: None,
+        urr: None,
     })
 }
 
@@ -642,6 +654,7 @@ fn parse_rmatrix_limited_range(
         ap_table: None, // set by caller from NRO TAB1 if present
         l_groups: Vec::new(),
         rml: Some(Box::new(rml)),
+        urr: None,
     })
 }
 
@@ -856,26 +869,171 @@ fn parse_endf_int(line: &str, field_index: usize) -> Result<i32, EndfParseError>
     )))
 }
 
-/// Skip an unresolved resonance range (we don't parse URR yet).
-fn skip_unresolved_range(lines: &[&str], pos: &mut usize, _lrf: i32) -> Result<(), EndfParseError> {
-    // Simplified: skip until we hit a SEND record (all zeros in fields 1-4)
-    // or until the MF/MT changes. For robustness, skip the subsection CONT
-    // and its data by reading NLS and skipping.
-    let cont = parse_cont(lines, pos)?;
-    let nls = cont.n1 as usize;
+/// Parse an Unresolved Resonance Region (LRU=2) range.
+///
+/// Supports LRF=1 (energy-independent widths) and LRF=2 (tabulated widths).
+///
+/// ## LRF=1 record layout (ENDF-6 §2.2.2.1)
+/// ```text
+/// CONT: SPI, AP, 0, 0, NLS, 0
+/// For each L:
+///   CONT: AWRI, 0, L, 0, N1=6*NJS, N2=NJS
+///   LIST: NJS × [D, AJ, AMUN, GNO, GG, GF]
+/// ```
+///
+/// ## LRF=2 record layout (ENDF-6 §2.2.2.2)
+/// ```text
+/// CONT: SPI, AP, 0, 0, NLS, 0
+/// For each L:
+///   CONT: AWRI, 0, L, 0, NJS, 0
+///   For each J:
+///     CONT: AJ, 0, INT, 0, N1=6*(NE+1), N2=NE
+///     LIST: row 0 = [0,0,0,AMUN,0,AMUF]   (DOF)
+///           rows 1..NE = [E,D,GX,GN,GG,GF]
+/// ```
+///
+/// Reference: ENDF-6 Formats Manual §2.2.2; SAMMY `unr/munr03.f90`
+fn parse_urr_range(
+    lines: &[&str],
+    pos: &mut usize,
+    lrf: i32,
+    energy_low: f64,
+    energy_high: f64,
+) -> Result<ResonanceRange, EndfParseError> {
+    use crate::resonance::{UrrData, UrrJGroup, UrrLGroup};
 
-    for _ in 0..nls {
-        let l_cont = parse_cont(lines, pos)?;
-        let njs = l_cont.n2 as usize;
-        for _ in 0..njs {
-            let j_cont = parse_cont(lines, pos)?;
-            let ne = j_cont.n2 as usize;
-            // Each J-block has NE lines of data (6 values each).
-            let n_lines = (ne * 6).div_ceil(6);
-            *pos += n_lines;
+    // CONT: SPI, AP, 0, 0, NLS, 0
+    let spi_cont = parse_cont(lines, pos)?;
+    let spi = spi_cont.c1;
+    let ap = spi_cont.c2;
+    let nls = spi_cont.n1 as usize;
+
+    let mut l_groups = Vec::with_capacity(nls);
+
+    if lrf == 1 {
+        // LRF=1: energy-independent widths, one LIST block per L covering all J.
+        for _ in 0..nls {
+            // CONT: AWRI, 0, L, 0, N1=6*NJS, N2=NJS
+            let l_cont = parse_cont(lines, pos)?;
+            let awri = l_cont.c1;
+            let l = l_cont.l1 as u32;
+            let n1 = l_cont.n1 as usize; // 6*NJS
+            let njs = l_cont.n2 as usize; // NJS
+
+            if njs == 0 || n1 != 6 * njs {
+                return Err(EndfParseError::UnsupportedFormat(format!(
+                    "URR LRF=1 L={l}: N1={n1} ≠ 6×NJS={} (NJS={njs})",
+                    6 * njs
+                )));
+            }
+
+            let values = parse_list_values(lines, pos, n1)?;
+
+            let mut j_groups = Vec::with_capacity(njs);
+            for j_idx in 0..njs {
+                let base = j_idx * 6;
+                // [D, AJ, AMUN, GNO, GG, GF]
+                j_groups.push(UrrJGroup {
+                    j: values[base + 1],        // AJ
+                    amun: values[base + 2],     // AMUN (neutron DOF)
+                    amuf: 0.0,                  // No fission DOF in LRF=1
+                    energies: vec![],           // Energy-independent
+                    d: vec![values[base]],      // D (level spacing, eV)
+                    gx: vec![0.0],              // No competitive width in LRF=1
+                    gn: vec![values[base + 3]], // GNO (reduced neutron width, eV)
+                    gg: vec![values[base + 4]], // GG (gamma width, eV)
+                    gf: vec![values[base + 5]], // GF (fission width, eV)
+                });
+            }
+
+            l_groups.push(UrrLGroup { l, awri, j_groups });
+        }
+    } else {
+        // LRF=2: energy-dependent width tables, one LIST per (L, J).
+        for _ in 0..nls {
+            // CONT: AWRI, 0, L, 0, NJS, 0
+            let l_cont = parse_cont(lines, pos)?;
+            let awri = l_cont.c1;
+            let l = l_cont.l1 as u32;
+            let njs = l_cont.n1 as usize; // N1 = NJS for LRF=2
+
+            let mut j_groups = Vec::with_capacity(njs);
+            for _ in 0..njs {
+                // CONT: AJ, 0, INT, 0, N1=6*(NE+1), N2=NE
+                let j_cont = parse_cont(lines, pos)?;
+                let aj = j_cont.c1;
+                let n1 = j_cont.n1 as usize; // 6*(NE+1)
+                let ne = j_cont.n2 as usize; // NE (number of energy points)
+
+                let expected_n1 = 6 * (ne + 1);
+                if n1 != expected_n1 {
+                    return Err(EndfParseError::UnsupportedFormat(format!(
+                        "URR LRF=2 J={aj}: N1={n1} ≠ 6*(NE+1)={expected_n1} (NE={ne})"
+                    )));
+                }
+
+                let values = parse_list_values(lines, pos, n1)?;
+
+                // Row 0 (DOF): [0, 0, 0, AMUN, 0, AMUF]
+                let amun = values[3];
+                let amuf = values[5];
+
+                // Rows 1..NE: [E_i, D_i, GX_i, GN_i, GG_i, GF_i]
+                let mut energies = Vec::with_capacity(ne);
+                let mut d = Vec::with_capacity(ne);
+                let mut gx = Vec::with_capacity(ne);
+                let mut gn = Vec::with_capacity(ne);
+                let mut gg = Vec::with_capacity(ne);
+                let mut gf = Vec::with_capacity(ne);
+
+                for row in 0..ne {
+                    let base = (row + 1) * 6; // +1 to skip the DOF row
+                    energies.push(values[base]);
+                    d.push(values[base + 1]);
+                    gx.push(values[base + 2]);
+                    gn.push(values[base + 3]);
+                    gg.push(values[base + 4]);
+                    gf.push(values[base + 5]);
+                }
+
+                j_groups.push(UrrJGroup {
+                    j: aj,
+                    amun,
+                    amuf,
+                    energies,
+                    d,
+                    gx,
+                    gn,
+                    gg,
+                    gf,
+                });
+            }
+
+            l_groups.push(UrrLGroup { l, awri, j_groups });
         }
     }
-    Ok(())
+
+    let urr = UrrData {
+        lrf: lrf as u32,
+        spi,
+        ap,
+        e_low: energy_low,
+        e_high: energy_high,
+        l_groups,
+    };
+
+    Ok(ResonanceRange {
+        energy_low,
+        energy_high,
+        resolved: false,
+        formalism: ResonanceFormalism::Unresolved,
+        target_spin: spi,
+        scattering_radius: ap,
+        ap_table: None,
+        l_groups: Vec::new(),
+        rml: None,
+        urr: Some(Box::new(urr)),
+    })
 }
 
 /// Parse a TAB1 record into a `Tab1` interpolation table.

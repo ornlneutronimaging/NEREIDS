@@ -253,6 +253,7 @@ mod tests {
                     }],
                 }],
                 rml: None,
+                urr: None,
                 ap_table: None,
             }],
         }
@@ -439,6 +440,7 @@ mod tests {
                     }],
                 }],
                 rml: None,
+                urr: None,
                 ap_table: None,
             }],
         };

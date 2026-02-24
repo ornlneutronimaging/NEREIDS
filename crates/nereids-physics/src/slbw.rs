@@ -210,6 +210,7 @@ mod tests {
                     }],
                 }],
                 rml: None,
+                urr: None,
                 ap_table: None,
             }],
         };
@@ -257,6 +258,7 @@ mod tests {
                 scattering_radius: 9.4285,
                 l_groups: resonances.clone(),
                 rml: None,
+                urr: None,
                 ap_table: None,
             }],
         };
@@ -274,6 +276,7 @@ mod tests {
                 scattering_radius: 9.4285,
                 l_groups: resonances,
                 rml: None,
+                urr: None,
                 ap_table: None,
             }],
         };
