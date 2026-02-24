@@ -997,10 +997,9 @@ fn parse_endf_int(line: &str, field_index: usize) -> Result<i32, EndfParseError>
 /// Supports LRF=1 (energy-independent widths) and LRF=2 (tabulated widths).
 ///
 /// ## Units
-/// AP (scattering radius) is stored as-is from the ENDF file.  With IFG=0
-/// (the universal convention in ENDF/B-VIII.0), AP is in units of 10⁻¹² cm
-/// which is identically 1 fm.  No conversion is needed; the physics layer
-/// (`channel::rho`, `urr_cross_sections`) expects fm throughout.
+/// AP (scattering radius) is in ENDF units of 10⁻¹² cm = 10 fm (since
+/// 1 fm = 10⁻¹³ cm).  Converted to physics fm via `ENDF_RADIUS_TO_FM`
+/// (×10) at parse time, matching SAMMY `FillSammyRmatrixFromRMat.cpp` l.422.
 ///
 /// ## LRF=1 record layout (ENDF-6 §2.2.2.1)
 /// ```text
