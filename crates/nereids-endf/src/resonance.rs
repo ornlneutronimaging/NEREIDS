@@ -250,7 +250,7 @@ pub struct UrrData {
     pub lrf: u32,
     /// Target spin I.
     pub spi: f64,
-    /// Scattering radius AP (same units as `ResonanceRange::scattering_radius`).
+    /// Scattering radius AP in fm (converted from ENDF 10⁻¹² cm at parse time).
     pub ap: f64,
     /// Lower URR energy bound (eV).
     pub e_low: f64,

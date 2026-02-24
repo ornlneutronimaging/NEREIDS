@@ -28,9 +28,12 @@
 //! consistent cross-section without requiring special handling at the call site.
 //!
 //! ## Units
-//! All energies in eV, all lengths (AP, channel radii) in fm, cross-sections
-//! in barns.  AP is stored directly from the ENDF file (IFG=0 convention:
-//! radii in units of 10⁻¹² cm ≡ fm).  No conversion is needed.
+//! All energies in eV, all lengths (AP, channel radii) in fm (true physics
+//! femtometers, 10⁻¹⁵ m), cross-sections in barns.
+//!
+//! ENDF stores radii in 10⁻¹² cm (= 10 fm); the parser converts to fm at
+//! parse time by multiplying by 10 (see `ENDF_RADIUS_TO_FM` in `parser.rs`),
+//! matching SAMMY's `FillSammyRmatrixFromRMat.cpp` line 422.
 //!
 //! ## SAMMY Reference
 //! - `unr/munr03.f90` Csig3 subroutine
@@ -256,7 +259,7 @@ mod tests {
         // Hand-crafted parameters similar to U-233 URR (order of magnitude).
         let e_test = 1_000.0_f64; // eV, mid-URR
         let awri = 231.038_f64;
-        let ap = 0.96931_f64; // ENDF scattering radius
+        let ap = 9.6931_f64; // scattering radius in fm (ENDF 0.96931 × 10)
         let spi = 2.5_f64; // U-233 target spin
 
         let gno = 3.0e-4; // reduced neutron width (eV)
@@ -336,7 +339,7 @@ mod tests {
         let urr = UrrData {
             lrf: 2,
             spi: 2.5,
-            ap: 0.96931,
+            ap: 9.6931,
             e_low: 600.0,
             e_high: 30_000.0,
             l_groups: vec![UrrLGroup {
@@ -435,7 +438,7 @@ mod tests {
         UrrData {
             lrf: 1,
             spi: 2.5,
-            ap: 0.96931,
+            ap: 9.6931,
             e_low,
             e_high,
             l_groups: vec![UrrLGroup {

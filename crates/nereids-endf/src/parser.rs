@@ -23,6 +23,17 @@
 use crate::resonance::*;
 use nereids_core::elements::isotope_from_za;
 
+/// ENDF radius unit conversion factor.
+///
+/// ENDF-6 Formats Manual §2.1: "AP, APE, APT are in units of 10⁻¹² cm."
+/// Physics convention: 1 fm = 10⁻¹³ cm, so 10⁻¹² cm = 10 fm.
+/// All ENDF radii (AP, APL, APE, APT, AP(E) tables) are multiplied by this
+/// factor at parse time so that downstream physics uses true femtometers.
+///
+/// SAMMY applies the identical ×10 conversion when reading ENDF:
+///   `FillSammyRmatrixFromRMat.cpp` line 422: `newChannel->getApe() * 10.0`
+const ENDF_RADIUS_TO_FM: f64 = 10.0;
+
 /// Parse ENDF-6 File 2 resonance parameters from raw ENDF text.
 ///
 /// Extracts all MF=2, MT=151 lines and parses the resolved resonance region.
@@ -93,7 +104,12 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
                 // ENDF-6 §2.2.2; SAMMY unr/munr01.f90.
                 let nro_urr = range_cont.n1;
                 let ap_table_urr = if nro_urr != 0 {
-                    Some(parse_tab1(&lines, &mut pos)?)
+                    let mut tab = parse_tab1(&lines, &mut pos)?;
+                    // AP(E) y-values are in 10⁻¹² cm; convert to fm.
+                    for pt in &mut tab.points {
+                        pt.1 *= ENDF_RADIUS_TO_FM;
+                    }
+                    Some(tab)
                 } else {
                     None
                 };
@@ -126,7 +142,12 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
             // Parse and store it; scattering_radius_at(E) will interpolate it
             // at each energy point.  Reference: ENDF-6 §2.2.1; SAMMY mlb/mmlb1.f90.
             let ap_table = if nro != 0 {
-                Some(parse_tab1(&lines, &mut pos)?)
+                let mut tab = parse_tab1(&lines, &mut pos)?;
+                // AP(E) y-values are in 10⁻¹² cm; convert to fm.
+                for pt in &mut tab.points {
+                    pt.1 *= ENDF_RADIUS_TO_FM;
+                }
+                Some(tab)
             } else {
                 None
             };
@@ -195,9 +216,10 @@ fn parse_bw_range(
     formalism: ResonanceFormalism,
 ) -> Result<ResonanceRange, EndfParseError> {
     // CONT: SPI, AP, 0, 0, NLS, 0
+    // ENDF AP is in 10⁻¹² cm; convert to fm (×10).
     let cont = parse_cont(lines, pos)?;
     let target_spin = cont.c1;
-    let scattering_radius = cont.c2;
+    let scattering_radius = cont.c2 * ENDF_RADIUS_TO_FM;
     let nls = cont.n1 as usize; // number of L-values
 
     let mut l_groups = Vec::with_capacity(nls);
@@ -268,9 +290,10 @@ fn parse_reich_moore_range(
     energy_high: f64,
 ) -> Result<ResonanceRange, EndfParseError> {
     // CONT: SPI, AP, 0, 0, NLS, 0
+    // ENDF AP is in 10⁻¹² cm; convert to fm (×10).
     let cont = parse_cont(lines, pos)?;
     let target_spin = cont.c1;
-    let scattering_radius = cont.c2;
+    let scattering_radius = cont.c2 * ENDF_RADIUS_TO_FM;
     let nls = cont.n1 as usize; // number of L-values
 
     let mut l_groups = Vec::with_capacity(nls);
@@ -279,7 +302,7 @@ fn parse_reich_moore_range(
         // CONT: AWRI, APL, L, 0, 6*NRS, NRS
         let l_cont = parse_cont(lines, pos)?;
         let awr_l = l_cont.c1;
-        let apl = l_cont.c2; // L-dependent scattering radius
+        let apl = l_cont.c2 * ENDF_RADIUS_TO_FM; // L-dependent scattering radius
         let l_val = l_cont.l1 as u32;
         let nrs = l_cont.n2 as usize; // number of resonances
 
@@ -354,11 +377,12 @@ fn parse_rmatrix_limited_range(
     awr: f64,
 ) -> Result<ResonanceRange, EndfParseError> {
     // CONT: [SPI, AP, IFG, KRM, NJS, KRL]
+    // ENDF AP is in 10⁻¹² cm; convert to fm (×10).
     let cont = parse_cont(lines, pos)?;
     let target_spin = cont.c1;
-    let scattering_radius = cont.c2;
+    let scattering_radius = cont.c2 * ENDF_RADIUS_TO_FM;
     // IFG (L1): radius unit flag.
-    //   IFG=0: AP, APE, APT are in fm (10⁻¹² cm) — universal in ENDF/B-VIII.0.
+    //   IFG=0: AP, APE, APT are in 10⁻¹² cm — universal in ENDF/B-VIII.0.
     //   IFG=1: radii are in units of ℏ/k (energy-dependent) — not supported here.
     // SAMMY's WriteRrEndf.cpp always writes IFG=0 and its reader never checks it,
     // confirming IFG=1 is not used in practice.
@@ -507,8 +531,8 @@ fn parse_rmatrix_limited_range(
                 l: sg_values[b + 1] as u32,     // L
                 channel_spin: sg_values[b + 2], // SCH
                 boundary: sg_values[b + 3],     // BND
-                effective_radius: sg_values[b + 4], // APE (fm)
-                true_radius: sg_values[b + 5],  // APT (fm)
+                effective_radius: sg_values[b + 4] * ENDF_RADIUS_TO_FM, // APE
+                true_radius: sg_values[b + 5] * ENDF_RADIUS_TO_FM, // APT
             });
         }
 
@@ -1009,10 +1033,10 @@ fn parse_urr_range(
     use crate::resonance::{UrrData, UrrJGroup, UrrLGroup};
 
     // CONT: SPI, AP, 0, 0, NLS, 0
-    // AP is in 10⁻¹² cm ≡ fm (IFG=0); no conversion needed.
+    // ENDF AP is in 10⁻¹² cm; convert to fm (×10).
     let spi_cont = parse_cont(lines, pos)?;
     let spi = spi_cont.c1;
-    let ap = spi_cont.c2; // scattering radius (fm)
+    let ap = spi_cont.c2 * ENDF_RADIUS_TO_FM; // scattering radius (fm)
     let nls = checked_count(spi_cont.n1, "NLS")?;
 
     let mut l_groups = Vec::with_capacity(nls);
@@ -1429,8 +1453,8 @@ mod tests {
             "U-238 target spin I=0"
         );
         assert!(
-            (range.scattering_radius - 0.94285).abs() < 0.001,
-            "Scattering radius ~0.94285 fm"
+            (range.scattering_radius - 9.4285).abs() < 0.01,
+            "Scattering radius ~9.4285 fm (ENDF 0.94285 × 10)"
         );
         assert_eq!(range.l_groups.len(), 2, "Should have L=0 and L=1 groups");
 
@@ -1742,14 +1766,15 @@ mod tests {
     ///
     /// The fixture encodes:
     /// - LRF=3 (Reich-Moore), NRO=1
-    /// - AP TAB1: 2 points — AP(1 eV)=8.0 fm, AP(1000 eV)=10.0 fm (lin-lin)
+    /// - AP TAB1: 2 points — ENDF values 8.0 and 10.0 (10⁻¹² cm),
+    ///   which become 80.0 fm and 100.0 fm after ×10 conversion
     /// - One L-group (L=0) with one resonance at 6.674 eV
     ///
     /// Verifies:
     /// - ap_table is Some after parsing
-    /// - ap_table.evaluate(1.0) ≈ 8.0 fm
-    /// - ap_table.evaluate(500.5) ≈ 9.0 fm (midpoint, lin-lin)
-    /// - ap_table.evaluate(1000.0) ≈ 10.0 fm
+    /// - ap_table.evaluate(1.0) ≈ 80.0 fm (8.0 × ENDF_RADIUS_TO_FM)
+    /// - ap_table.evaluate(500.5) ≈ 90.0 fm (midpoint, lin-lin)
+    /// - ap_table.evaluate(1000.0) ≈ 100.0 fm
     /// - scattering_radius_at() delegates to the table
     #[test]
     fn test_parse_nro1_tab1() {
@@ -1806,27 +1831,27 @@ mod tests {
             .expect("NRO=1 range must have ap_table");
         assert_eq!(table.points.len(), 2, "TAB1 must have 2 points");
 
-        // Exact boundary values.
+        // Exact boundary values (ENDF 8.0 × 10 = 80.0 fm).
         assert!(
-            (table.evaluate(1.0) - 8.0).abs() < 1e-10,
-            "AP(1 eV) = 8.0 fm"
+            (table.evaluate(1.0) - 80.0).abs() < 1e-10,
+            "AP(1 eV) = 80.0 fm"
         );
         assert!(
-            (table.evaluate(1000.0) - 10.0).abs() < 1e-10,
-            "AP(1000 eV) = 10.0 fm"
+            (table.evaluate(1000.0) - 100.0).abs() < 1e-10,
+            "AP(1000 eV) = 100.0 fm"
         );
-        // Lin-lin midpoint: AP(500.5 eV) ≈ 9.0 fm.
+        // Lin-lin midpoint: AP(500.5 eV) ≈ 90.0 fm.
         let mid = table.evaluate(500.5);
-        assert!((mid - 9.0).abs() < 0.01, "AP midpoint ≈ 9.0 fm, got {mid}");
+        assert!((mid - 90.0).abs() < 0.1, "AP midpoint ≈ 90.0 fm, got {mid}");
 
         // scattering_radius_at delegates to the table.
         assert!(
-            (range.scattering_radius_at(1.0) - 8.0).abs() < 1e-10,
-            "scattering_radius_at(1 eV) = 8.0"
+            (range.scattering_radius_at(1.0) - 80.0).abs() < 1e-10,
+            "scattering_radius_at(1 eV) = 80.0"
         );
         assert!(
-            (range.scattering_radius_at(1000.0) - 10.0).abs() < 1e-10,
-            "scattering_radius_at(1000 eV) = 10.0"
+            (range.scattering_radius_at(1000.0) - 100.0).abs() < 1e-10,
+            "scattering_radius_at(1000 eV) = 100.0"
         );
 
         // Resonance is still parsed correctly.
