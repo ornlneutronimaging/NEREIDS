@@ -1271,6 +1271,18 @@ mod tests {
         assert!((parse_endf_float(line, 1).unwrap() - (-0.234567)).abs() < 1e-6);
     }
 
+    /// Fortran exponents with a space between the sign and digit — e.g. "9.22330+ 4"
+    /// — appear in some older ENDF evaluations (observed in SAMMY tr149/t149a.endf
+    /// for U-233).  The parser strips the space before parsing the exponent.
+    #[test]
+    fn test_parse_endf_float_spaced_exponent() {
+        // " 9.22330+ 4" occupies 11 chars: space before mantissa, space before digit
+        let line =
+            " 9.22330+ 4 1.23400- 2                                                         ";
+        assert!((parse_endf_float(line, 0).unwrap() - 92_233.0).abs() < 1.0);
+        assert!((parse_endf_float(line, 1).unwrap() - 0.01234).abs() < 1e-6);
+    }
+
     #[test]
     fn test_parse_endf_int() {
         let line = "          0          1          2          3          4          5            ";

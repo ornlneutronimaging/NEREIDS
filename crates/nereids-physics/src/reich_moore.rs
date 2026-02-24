@@ -84,10 +84,22 @@ pub fn cross_sections_at_energy(data: &ResonanceData, energy_ev: f64) -> CrossSe
         }
 
         // URR (LRU=2): Hauser-Feshbach average cross-sections.
-        // These ranges are not "resolved" so they must be handled before the
-        // resolved check below.  The URR energy band is authoritative via
-        // `urr.e_low`/`urr.e_high` and the band guard inside `urr_cross_sections`.
+        // These ranges have `resolved = false` so they must be dispatched before
+        // the `!range.resolved` skip below.
+        //
+        // Note: `parse_urr_range` sets urr.e_low == range.energy_low and
+        // urr.e_high == range.energy_high, so the outer `in_range` check and the
+        // inner band guard in `urr_cross_sections` test the same interval.
+        // The inner guard is kept as a safety net for direct calls.
         if let Some(urr_data) = &range.urr {
+            debug_assert_eq!(
+                urr_data.e_low, range.energy_low,
+                "URR e_low must equal range.energy_low"
+            );
+            debug_assert_eq!(
+                urr_data.e_high, range.energy_high,
+                "URR e_high must equal range.energy_high"
+            );
             let (t, e, c, f) = urr::urr_cross_sections(urr_data, energy_ev);
             total += t;
             elastic += e;

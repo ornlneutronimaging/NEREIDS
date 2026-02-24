@@ -147,11 +147,18 @@ pub fn urr_cross_sections(urr: &UrrData, e_ev: f64) -> (f64, f64, f64, f64) {
     (total, elastic, sig_cap, sig_fiss)
 }
 
-/// Linear-linear interpolation (clamped to table endpoints).
+/// Shared binary-search kernel for the two interpolation modes.
 ///
-/// Used for LRF=2 width tables with INT=2 in ENDF.  `xs` must be strictly
-/// ascending and of the same length as `ys`.
-fn lin_lin_interp(xs: &[f64], ys: &[f64], x: f64) -> f64 {
+/// Handles empty-table, lower-clamp, and upper-clamp, then locates the
+/// bracketing interval and calls `interp_fn(x, x0, y0, x1, y1)`.
+/// `xs` must be strictly ascending and the same length as `ys`.
+#[inline]
+fn table_interp(
+    xs: &[f64],
+    ys: &[f64],
+    x: f64,
+    interp_fn: impl Fn(f64, f64, f64, f64, f64) -> f64,
+) -> f64 {
     debug_assert_eq!(xs.len(), ys.len());
     if xs.is_empty() {
         return 0.0;
@@ -162,41 +169,32 @@ fn lin_lin_interp(xs: &[f64], ys: &[f64], x: f64) -> f64 {
     if x >= xs[xs.len() - 1] {
         return ys[xs.len() - 1];
     }
-    // Binary search for the bracketing interval.
     let i = xs.partition_point(|&xi| xi <= x);
-    let (x0, y0) = (xs[i - 1], ys[i - 1]);
-    let (x1, y1) = (xs[i], ys[i]);
-    let t = (x - x0) / (x1 - x0);
-    y0 + t * (y1 - y0)
+    interp_fn(x, xs[i - 1], ys[i - 1], xs[i], ys[i])
 }
 
-/// Log-log interpolation (clamped to table endpoints).
+/// Linear-linear interpolation (INT=2, clamped to table endpoints).
+fn lin_lin_interp(xs: &[f64], ys: &[f64], x: f64) -> f64 {
+    table_interp(xs, ys, x, |x, x0, y0, x1, y1| {
+        y0 + (x - x0) / (x1 - x0) * (y1 - y0)
+    })
+}
+
+/// Log-log interpolation (INT=5, clamped to table endpoints).
 ///
-/// Used for LRF=2 width tables with INT=5 in ENDF (common for heavy actinides
-/// such as U-238 where widths follow approximate power-law energy dependence).
-/// Returns `ys[0]` when any `y` value is ≤ 0 to avoid log-domain errors.
+/// Used for LRF=2 width tables in ENDF (common for heavy actinides such as
+/// U-238 where widths follow an approximate power-law energy dependence).
+/// Falls back to lin-lin when any bracket value is ≤ 0 (log undefined).
 fn log_log_interp(xs: &[f64], ys: &[f64], x: f64) -> f64 {
-    debug_assert_eq!(xs.len(), ys.len());
-    if xs.is_empty() {
-        return 0.0;
-    }
-    if x <= xs[0] {
-        return ys[0];
-    }
-    if x >= xs[xs.len() - 1] {
-        return ys[xs.len() - 1];
-    }
-    let i = xs.partition_point(|&xi| xi <= x);
-    let (x0, y0) = (xs[i - 1], ys[i - 1]);
-    let (x1, y1) = (xs[i], ys[i]);
-    // Guard against non-positive values (log undefined).
-    if x0 <= 0.0 || x1 <= 0.0 || y0 <= 0.0 || y1 <= 0.0 {
-        // Fall back to lin-lin for degenerate entries.
-        let t = (x - x0) / (x1 - x0);
-        return y0 + t * (y1 - y0);
-    }
-    let log_t = (x.ln() - x0.ln()) / (x1.ln() - x0.ln());
-    (y0.ln() + log_t * (y1.ln() - y0.ln())).exp()
+    table_interp(xs, ys, x, |x, x0, y0, x1, y1| {
+        // Guard against non-positive values (log undefined).
+        if x0 <= 0.0 || x1 <= 0.0 || y0 <= 0.0 || y1 <= 0.0 {
+            // Fall back to lin-lin for degenerate (non-positive) bracket entries.
+            return y0 + (x - x0) / (x1 - x0) * (y1 - y0);
+        }
+        let log_t = (x.ln() - x0.ln()) / (x1.ln() - x0.ln());
+        (y0.ln() + log_t * (y1.ln() - y0.ln())).exp()
+    })
 }
 
 #[cfg(test)]
@@ -358,6 +356,42 @@ mod tests {
         assert!((lin_lin_interp(&xs, &ys, 2.0) - 1.0).abs() < 1e-12);
         // Interior: x=6.0, between [3,9], t=0.5 → y=5.0
         assert!((lin_lin_interp(&xs, &ys, 6.0) - 5.0).abs() < 1e-12);
+    }
+
+    /// log_log_interp: boundary clamping, power-law interior, and lin-lin fallback.
+    #[test]
+    fn log_log_interp_basic() {
+        // y = x^2: log-log should recover exact values.
+        let xs = vec![1.0, 10.0, 100.0];
+        let ys = vec![1.0, 100.0, 10_000.0]; // y = x^2
+
+        // Clamp below lower bound
+        assert!((log_log_interp(&xs, &ys, 0.5) - 1.0).abs() < 1e-12);
+        // Clamp above upper bound
+        assert!((log_log_interp(&xs, &ys, 200.0) - 10_000.0).abs() < 1e-12);
+        // Interior: x=sqrt(10)≈3.162, between [1,10]; exact power-law gives y=10
+        let x_mid = (1.0_f64 * 10.0_f64).sqrt(); // geometric mean → y = x_mid^2 = 10
+        assert!((log_log_interp(&xs, &ys, x_mid) - 10.0).abs() < 1e-10);
+        // At table points: exact values
+        assert!((log_log_interp(&xs, &ys, 10.0) - 100.0).abs() < 1e-10);
+    }
+
+    /// log_log_interp: falls back to lin-lin when a bracket value is ≤ 0.
+    #[test]
+    fn log_log_interp_nonpositive_fallback() {
+        // y[0] = 0 forces the lin-lin fallback in the first interval.
+        let xs = vec![1.0, 3.0, 9.0];
+        let ys = vec![0.0, 2.0, 8.0]; // y[0] = 0 → log undefined
+
+        // x=2 is in [1,3]; fallback: t=0.5, y = 0 + 0.5*(2-0) = 1.0
+        assert!((log_log_interp(&xs, &ys, 2.0) - 1.0).abs() < 1e-12);
+        // x=6 is in [3,9]; both y>0, so log-log applies (not a straight power law here,
+        // but result must be between 2 and 8)
+        let v = log_log_interp(&xs, &ys, 6.0);
+        assert!(
+            v > 2.0 && v < 8.0,
+            "log-log interior must be between endpoints: {v}"
+        );
     }
 
     // ─── Helpers ─────────────────────────────────────────────────────────────
