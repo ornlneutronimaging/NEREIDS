@@ -64,6 +64,7 @@ pub fn urr_cross_sections(urr: &UrrData, e_ev: f64) -> (f64, f64, f64, f64) {
     let mut sig_cap = 0.0_f64;
     let mut sig_fiss = 0.0_f64;
     let mut sig_compound_n = 0.0_f64;
+    let mut sig_competitive = 0.0_f64;
 
     for lg in &urr.l_groups {
         let awri = lg.awri;
@@ -135,6 +136,11 @@ pub fn urr_cross_sections(urr: &UrrData, e_ev: f64) -> (f64, f64, f64, f64) {
             // SAMMY ref: unr/munr03.f90 — `Sigxxx` uses Gn for both transmission
             // coefficients in the neutron elastic formula.
             sig_compound_n += prefactor * gn_eff / gamma_tot;
+            // Competitive (inelastic) channel: GX is included in Γ_tot but goes
+            // into neither capture nor fission.  It contributes to the total
+            // cross section without appearing in elastic, capture, or fission.
+            // SAMMY ref: unr/munr03.f90 — GX field in Gamma_total.
+            sig_competitive += prefactor * gx_eff / gamma_tot;
         }
     }
 
@@ -143,7 +149,7 @@ pub fn urr_cross_sections(urr: &UrrData, e_ev: f64) -> (f64, f64, f64, f64) {
     // SAMMY ref: unr/munr03.f90 adds hard-sphere background to elastic.
     let sig_pot = 4.0 * std::f64::consts::PI * urr.ap * urr.ap / 100.0;
     let elastic = sig_compound_n + sig_pot;
-    let total = elastic + sig_cap + sig_fiss;
+    let total = elastic + sig_cap + sig_fiss + sig_competitive;
     (total, elastic, sig_cap, sig_fiss)
 }
 
