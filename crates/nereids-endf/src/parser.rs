@@ -1029,11 +1029,15 @@ fn parse_urr_range(
                 let ne = j_cont.n2 as usize; // NE (number of energy points)
 
                 // Supported interpolation laws: INT=2 (lin-lin) and INT=5 (log-log).
-                // INT=1/3/4 are valid ENDF but not yet implemented; skip this J-block.
+                // INT=1/3/4 are valid ENDF but not yet implemented — reject
+                // explicitly so the caller knows the URR data is incomplete.
                 // ENDF-6 §2.2.2.2; SAMMY unr/munr01.f90.
                 if int_code != 2 && int_code != 5 {
-                    parse_list_values(lines, pos, n1)?;
-                    continue;
+                    return Err(EndfParseError::UnsupportedFormat(format!(
+                        "URR LRF=2 J={aj}: INT={int_code} is not supported \
+                         (only INT=2 or INT=5); implement this interpolation \
+                         law or file a bug"
+                    )));
                 }
 
                 let expected_n1 = 6 * (ne + 1);
