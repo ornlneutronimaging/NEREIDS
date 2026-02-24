@@ -83,24 +83,29 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
                 // Unresolved resonance region (LRU=2).
                 // URR uses average level-spacing/width parameters; cross-sections are
                 // computed via Hauser-Feshbach in nereids_physics::urr.
-                // Supported: LRF=1 (energy-independent widths) and LRF=2 (tabulated).
-                if lrf != 1 && lrf != 2 {
-                    return Err(EndfParseError::UnsupportedFormat(format!(
-                        "LRU=2 LRF={lrf} is not supported (only LRF=1 and LRF=2)"
-                    )));
-                }
+                //
+                // Unsupported sub-formats are skipped gracefully so that the resolved
+                // resonance ranges in the same evaluation remain accessible.
+                // Hard errors are reserved for genuinely malformed records.
+
                 // NRO=range_cont.n1: if non-zero a TAB1 AP(E) record immediately follows
-                // the range CONT and provides an energy-dependent scattering radius.
+                // the range CONT before the URR SPI/AP/NLS CONT.
                 // ENDF-6 §2.2.2; SAMMY unr/munr01.f90.
-                // urr_cross_sections currently uses only the constant AP from the
-                // URR SPI/AP CONT for both ρ(E) and σ_pot.  Silently ignoring AP(E)
-                // would produce wrong cross-sections; reject until AP(E) is honoured.
+                // TODO: honour AP(E) in urr_cross_sections.  For now we skip the TAB1
+                // and parse with the constant AP from the SPI/AP CONT (approximation).
                 let nro_urr = range_cont.n1;
                 if nro_urr != 0 {
-                    return Err(EndfParseError::UnsupportedFormat(
-                        "URR NRO!=0 (energy-dependent AP(E)) is not yet supported".to_string(),
-                    ));
+                    skip_tab1(&lines, &mut pos)?;
                 }
+
+                // LRF=1 and LRF=2 are fully supported.
+                // Other values (LRF=3/4 are obsolete ENDF formats) are skipped so
+                // the rest of the file still parses.
+                if lrf != 1 && lrf != 2 {
+                    skip_urr_body(&lines, &mut pos)?;
+                    continue;
+                }
+
                 let urr_range = parse_urr_range(&lines, &mut pos, lrf, energy_low, energy_high)?;
                 all_ranges.push(urr_range);
                 continue;
@@ -691,6 +696,46 @@ fn skip_tab1(lines: &[&str], pos: &mut usize) -> Result<(), EndfParseError> {
         )));
     }
     *pos += needed;
+    Ok(())
+}
+
+/// Skip an unsupported URR body (CONT + NLS L-groups with their LIST data).
+///
+/// Called when LRU=2 has an LRF value other than 1 or 2 so that the records
+/// for this range are consumed and subsequent ranges can still be parsed.
+///
+/// Structure consumed (ENDF-6 §2.2.2, all LRF variants share this skeleton):
+/// ```text
+/// CONT: SPI, AP, 0, 0, NLS, 0
+/// For each L (NLS times):
+///   CONT: AWRI, 0, L, 0, N1, N2
+///   if N2 > 0  → LRF=1 style: one LIST record of N1 values
+///   if N2 == 0 → LRF=2 style: N1 J-sub-blocks, each = CONT + LIST(N1_j values)
+/// ```
+fn skip_urr_body(lines: &[&str], pos: &mut usize) -> Result<(), EndfParseError> {
+    // CONT: SPI, AP, 0, 0, NLS, 0
+    let header = parse_cont(lines, pos)?;
+    let nls = header.n1 as usize;
+
+    for _ in 0..nls {
+        // L CONT: AWRI, 0, L, 0, N1, N2
+        let l_cont = parse_cont(lines, pos)?;
+        let n1 = l_cont.n1 as usize;
+        let n2 = l_cont.n2 as usize;
+
+        if n2 > 0 {
+            // LRF=1 style: N2=NJS, N1=6*NJS — single LIST record.
+            parse_list_values(lines, pos, n1)?;
+        } else {
+            // LRF=2 style: N1=NJS, N2=0 — N1 J-sub-blocks, each with their
+            // own CONT (carrying 6*(NE+1) in N1) followed by a LIST record.
+            for _ in 0..n1 {
+                let j_cont = parse_cont(lines, pos)?;
+                let jn1 = j_cont.n1 as usize;
+                parse_list_values(lines, pos, jn1)?;
+            }
+        }
+    }
     Ok(())
 }
 
