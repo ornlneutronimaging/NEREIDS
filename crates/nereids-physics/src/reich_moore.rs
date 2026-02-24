@@ -64,13 +64,17 @@ pub fn cross_sections_at_energy(data: &ResonanceData, energy_ev: f64) -> CrossSe
     let mut capture = 0.0;
     let mut fission = 0.0;
 
-    let n_ranges = data.ranges.len();
     for (range_idx, range) in data.ranges.iter().enumerate() {
-        // Half-open [low, high) for all but the last range so a boundary energy
-        // shared by adjacent ranges (e.g., RRR upper = URR lower = 600 eV) is
-        // counted exactly once.  The final range uses [low, high] to cover the
-        // maximum defined energy.  ENDF-6 §2 — adjacent ranges share endpoints.
-        let in_range = if range_idx + 1 < n_ranges {
+        // Use half-open [low, high) only when the *next* range begins exactly at
+        // this range's upper endpoint — i.e. the two ranges share a boundary.
+        // Otherwise keep [low, high] so non-adjacent ranges (with a gap between
+        // them) still cover their own upper endpoint.
+        // ENDF-6 §2 — adjacent ranges share a single boundary energy.
+        let next_starts_here = data
+            .ranges
+            .get(range_idx + 1)
+            .is_some_and(|next| next.energy_low == range.energy_high);
+        let in_range = if next_starts_here {
             energy_ev >= range.energy_low && energy_ev < range.energy_high
         } else {
             energy_ev >= range.energy_low && energy_ev <= range.energy_high

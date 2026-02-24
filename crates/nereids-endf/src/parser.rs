@@ -90,12 +90,16 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
                     )));
                 }
                 // NRO=range_cont.n1: if non-zero a TAB1 AP(E) record immediately follows
-                // the range CONT before the URR SPI/AP/NLS CONT.
+                // the range CONT and provides an energy-dependent scattering radius.
                 // ENDF-6 §2.2.2; SAMMY unr/munr01.f90.
-                // We skip it — the constant AP in the URR SPI/AP CONT is used instead.
+                // urr_cross_sections currently uses only the constant AP from the
+                // URR SPI/AP CONT for both ρ(E) and σ_pot.  Silently ignoring AP(E)
+                // would produce wrong cross-sections; reject until AP(E) is honoured.
                 let nro_urr = range_cont.n1;
                 if nro_urr != 0 {
-                    skip_tab1(&lines, &mut pos)?;
+                    return Err(EndfParseError::UnsupportedFormat(
+                        "URR NRO!=0 (energy-dependent AP(E)) is not yet supported".to_string(),
+                    ));
                 }
                 let urr_range = parse_urr_range(&lines, &mut pos, lrf, energy_low, energy_high)?;
                 all_ranges.push(urr_range);
