@@ -53,8 +53,8 @@ use crate::penetrability;
 ///
 /// `elastic` = compound-nuclear elastic + smooth potential scattering.
 /// `total`   = elastic + capture + fission + competitive (GX).
-/// Potential scattering `σ_pot = 4π·AP²` is folded in here rather than at
-/// the call site; AP is in fm and 1 barn = 100 fm².
+/// Potential scattering `σ_pot = 4π·AP²/100` (AP in fm, result in barns)
+/// is folded in here rather than at the call site.
 /// SAMMY ref: `unr/munr03.f90` includes the hard-sphere background.
 ///
 /// ## SAMMY Reference
@@ -363,9 +363,13 @@ mod tests {
 
         assert!(c1 > 0.0, "σ_γ at {e1} eV must be positive, got {c1}");
         assert!(c2 > 0.0, "σ_γ at {e2} eV must be positive, got {c2}");
+        // For a lin-lin table with two energy points, any interior energy
+        // should produce a σ_γ between the endpoint values.
+        let (c_lo, c_hi) = if c1 <= c2 { (c1, c2) } else { (c2, c1) };
         assert!(
-            c1 > c_mid || c2 > c_mid || c_mid > 0.0,
-            "σ_γ at midpoint must be between endpoints or positive; c1={c1:.3e} c_mid={c_mid:.3e} c2={c2:.3e}"
+            c_mid >= c_lo && c_mid <= c_hi,
+            "σ_γ at midpoint must lie between endpoint values; \
+             c1={c1:.3e} c_mid={c_mid:.3e} c2={c2:.3e}"
         );
 
         // Outside band returns zero.

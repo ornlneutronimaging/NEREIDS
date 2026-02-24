@@ -679,14 +679,8 @@ fn parse_rmatrix_limited_range(
 /// Skip a TAB1 record (CONT + NR interpolation pairs + NP data pairs).
 fn skip_tab1(lines: &[&str], pos: &mut usize) -> Result<(), EndfParseError> {
     let cont = parse_cont(lines, pos)?;
-    if cont.n1 < 0 || cont.n2 < 0 {
-        return Err(EndfParseError::UnsupportedFormat(format!(
-            "TAB1 skip: negative count NR={} or NP={}",
-            cont.n1, cont.n2
-        )));
-    }
-    let nr = cont.n1 as usize; // number of interpolation regions
-    let np = cont.n2 as usize; // number of data points
+    let nr = checked_count(cont.n1, "NR")?; // number of interpolation regions
+    let np = checked_count(cont.n2, "NP")?; // number of data points
     let nr_lines = (nr * 2).div_ceil(6); // NR×2 integer values (NBT, INT pairs)
     let np_lines = (np * 2).div_ceil(6); // NP×2 float values (x, y pairs)
     let needed = nr_lines + np_lines;
@@ -799,13 +793,7 @@ fn skip_remaining_lrf2(
 fn skip_background_subrecord(lines: &[&str], pos: &mut usize) -> Result<(), EndfParseError> {
     let cont = parse_cont(lines, pos)?;
     let lbk_or_lps = cont.l1;
-    if cont.n1 < 0 {
-        return Err(EndfParseError::UnsupportedFormat(format!(
-            "Background sub-record skip: negative N1={}",
-            cont.n1
-        )));
-    }
-    let n1 = cont.n1 as usize;
+    let n1 = checked_count(cont.n1, "N1")?;
     let list_lines = n1.div_ceil(6);
     if *pos + list_lines > lines.len() {
         return Err(EndfParseError::UnexpectedEof(format!(
@@ -1035,6 +1023,12 @@ fn parse_urr_range(
             // CONT: AWRI, 0, L, 0, N1=6*NJS, N2=NJS
             let l_cont = parse_cont(lines, pos)?;
             let awri = l_cont.c1;
+            if l_cont.l1 < 0 {
+                return Err(EndfParseError::UnsupportedFormat(format!(
+                    "URR LRF=1: negative L={}",
+                    l_cont.l1
+                )));
+            }
             let l = l_cont.l1 as u32;
             let n1 = checked_count(l_cont.n1, "N1")?; // 6*NJS
             let njs = checked_count(l_cont.n2, "NJS")?;
@@ -1055,7 +1049,7 @@ fn parse_urr_range(
                 j_groups.push(UrrJGroup {
                     j: values[base + 1],        // AJ
                     amun: values[base + 2],     // AMUN (neutron DOF)
-                    amuf: 0.0,                  // AMUF not provided in LRF=1 format
+                    amuf: 0.0,                  // LRF=1 format does not carry AMUF
                     energies: vec![],           // Energy-independent
                     d: vec![values[base]],      // D (level spacing, eV)
                     gx: vec![0.0],              // No competitive width in LRF=1
@@ -1074,14 +1068,14 @@ fn parse_urr_range(
             // CONT: AWRI, 0, L, 0, NJS, 0
             let l_cont = parse_cont(lines, pos)?;
             let awri = l_cont.c1;
-            let l = l_cont.l1 as u32;
-            if l_cont.n1 < 0 {
+            if l_cont.l1 < 0 {
                 return Err(EndfParseError::UnsupportedFormat(format!(
-                    "URR LRF=2 L={l}: negative NJS={}",
-                    l_cont.n1
+                    "URR LRF=2: negative L={}",
+                    l_cont.l1
                 )));
             }
-            let njs = l_cont.n1 as usize; // N1 = NJS for LRF=2
+            let l = l_cont.l1 as u32;
+            let njs = checked_count(l_cont.n1, "NJS")?; // N1 = NJS for LRF=2
 
             let mut j_groups = Vec::with_capacity(njs);
             for j_idx in 0..njs {
@@ -1089,14 +1083,15 @@ fn parse_urr_range(
                 let j_cont = parse_cont(lines, pos)?;
                 let aj = j_cont.c1;
                 let int_code = j_cont.l1; // interpolation law (L1 field)
-                if j_cont.n1 < 0 || j_cont.n2 < 0 {
+                // Negative INT is a malformed ENDF record, not merely an
+                // unimplemented mode — reject it outright.
+                if int_code < 0 {
                     return Err(EndfParseError::UnsupportedFormat(format!(
-                        "URR LRF=2 J={aj}: negative count N1={} or NE={}",
-                        j_cont.n1, j_cont.n2
+                        "URR LRF=2 J={aj}: negative INT={int_code}"
                     )));
                 }
-                let n1 = j_cont.n1 as usize; // 6*(NE+1)
-                let ne = j_cont.n2 as usize; // NE (number of energy points)
+                let n1 = checked_count(j_cont.n1, "N1")?; // 6*(NE+1)
+                let ne = checked_count(j_cont.n2, "NE")?; // NE (number of energy points)
 
                 // Supported interpolation laws: INT=2 (lin-lin) and INT=5 (log-log).
                 // INT=1/3/4 are valid ENDF but not yet implemented.  Rather
@@ -1222,8 +1217,8 @@ fn parse_urr_range(
 /// INT codes: 1=histogram, 2=lin-lin, 3=log-x/lin-y, 4=lin-x/log-y, 5=log-log.
 fn parse_tab1(lines: &[&str], pos: &mut usize) -> Result<Tab1, EndfParseError> {
     let cont = parse_cont(lines, pos)?;
-    let nr = cont.n1 as usize; // number of interpolation regions
-    let np = cont.n2 as usize; // number of data points
+    let nr = checked_count(cont.n1, "NR")?; // number of interpolation regions
+    let np = checked_count(cont.n2, "NP")?; // number of data points
 
     // NR=0 is valid ENDF: it means a single implicit interpolation region
     // covering all NP points with no explicit boundary record.  The
