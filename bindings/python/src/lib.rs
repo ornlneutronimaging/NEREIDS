@@ -352,6 +352,10 @@ fn cross_sections<'py>(
     let mut capture = Vec::with_capacity(e.len());
     let mut fission = Vec::with_capacity(e.len());
 
+    // The Rust dispatcher (`cross_sections_at_energy`) handles all supported
+    // resonance formalisms per range (Reich-Moore, SLBW, MLBW via an SLBW
+    // approximation, RML, URR), so no additional Python-side formalism
+    // dispatch is needed.
     for &energy in e {
         let xs = nereids_physics::reich_moore::cross_sections_at_energy(&data.inner, energy);
         total.push(xs.total);
@@ -652,11 +656,15 @@ fn load_endf_file(path: &str) -> PyResult<PyResonanceData> {
 ///     l_groups: Optional list of (l_value, [(energy, j, gn, gg), ...]) tuples
 ///               for multiple L-groups. If provided, the ``resonances`` parameter
 ///               is ignored.
+///     formalism: Resonance formalism to use. Accepted values:
+///                - ``None`` or ``"reich_moore"`` (also ``"ReichMoore"``, ``"rm"``,
+///                  ``"RM"``, ``"reich-moore"``) — Reich-Moore R-matrix (default).
+///                - ``"slbw"`` or ``"SLBW"`` — Single-Level Breit-Wigner.
 ///
 /// Returns:
 ///     ResonanceData object.
 #[pyfunction]
-#[pyo3(signature = (z, a, awr, scattering_radius, resonances, target_spin=0.0, l_groups=None))]
+#[pyo3(signature = (z, a, awr, scattering_radius, resonances, target_spin=0.0, l_groups=None, formalism=None))]
 fn create_resonance_data(
     z: u32,
     a: u32,
@@ -665,7 +673,19 @@ fn create_resonance_data(
     resonances: Vec<(f64, f64, f64, f64)>,
     target_spin: f64,
     l_groups: Option<Vec<(u32, Vec<(f64, f64, f64, f64)>)>>,
-) -> PyResonanceData {
+    formalism: Option<&str>,
+) -> PyResult<PyResonanceData> {
+    let res_formalism = match formalism {
+        Some("slbw" | "SLBW") => ResonanceFormalism::SLBW,
+        Some("reich_moore" | "ReichMoore" | "reich-moore" | "rm" | "RM") | None => {
+            ResonanceFormalism::ReichMoore
+        }
+        Some(other) => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Unknown formalism '{other}'. Use 'slbw' or 'reich_moore'."
+            )));
+        }
+    };
     let groups = match l_groups {
         Some(lg) => lg
             .into_iter()
@@ -707,7 +727,7 @@ fn create_resonance_data(
         }
     };
 
-    PyResonanceData {
+    Ok(PyResonanceData {
         inner: ResonanceData {
             isotope: Isotope::new(z, a),
             za: z * 1000 + a,
@@ -716,7 +736,7 @@ fn create_resonance_data(
                 energy_low: 1e-5,
                 energy_high: 1e6,
                 resolved: true,
-                formalism: ResonanceFormalism::ReichMoore,
+                formalism: res_formalism,
                 target_spin,
                 scattering_radius,
                 l_groups: groups,
@@ -725,7 +745,7 @@ fn create_resonance_data(
                 ap_table: None,
             }],
         },
-    }
+    })
 }
 
 /// Beer-Lambert transmission: T = exp(-thickness * sigma).

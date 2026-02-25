@@ -185,6 +185,10 @@ fn table_interp(
     interp_fn: impl Fn(f64, f64, f64, f64, f64) -> f64,
 ) -> f64 {
     debug_assert_eq!(xs.len(), ys.len());
+    debug_assert!(
+        !xs.is_empty(),
+        "URR interpolation table must not be empty (parser bug?)"
+    );
     if xs.is_empty() {
         return 0.0;
     }
