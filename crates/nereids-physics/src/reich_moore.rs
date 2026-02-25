@@ -1,8 +1,17 @@
-//! Reich-Moore R-matrix cross-section calculation.
+//! Multi-formalism cross-section dispatcher.
 //!
-//! Computes energy-dependent cross-sections (total, elastic, capture, fission)
-//! from resolved resonance parameters using the Reich-Moore approximation to
-//! the R-matrix formalism.
+//! `cross_sections_at_energy` is the primary entry point for computing
+//! energy-dependent cross-sections from ENDF resonance data.  It
+//! iterates over all resonance ranges in the data and dispatches each to
+//! the appropriate formalism-specific calculator:
+//!
+//! | ENDF LRF | Formalism                  | Implemented as              |
+//! |----------|----------------------------|-----------------------------|
+//! | 1        | SLBW                       | `slbw::slbw_cross_sections_for_range` |
+//! | 2        | MLBW (approx.)             | `slbw::slbw_cross_sections_for_range` (SLBW approximation; resonance interference ignored) |
+//! | 3        | Reich-Moore                | `reich_moore_spin_group` (this module) |
+//! | 7        | R-Matrix Limited           | `rmatrix_limited::cross_sections_for_rml_range` |
+//! | URR      | Hauser-Feshbach average    | `urr::urr_cross_sections` |
 //!
 //! ## Reich-Moore Approximation
 //! In the full R-matrix, all channels (neutron, capture, fission) appear
@@ -58,7 +67,6 @@ pub struct CrossSections {
 /// Cross-sections in barns.
 pub fn cross_sections_at_energy(data: &ResonanceData, energy_ev: f64) -> CrossSections {
     let awr = data.awr;
-    let target_spin = data.ranges.first().map(|r| r.target_spin).unwrap_or(0.0);
 
     let mut total = 0.0;
     let mut elastic = 0.0;
@@ -115,7 +123,9 @@ pub fn cross_sections_at_energy(data: &ResonanceData, energy_ev: f64) -> CrossSe
             continue;
         }
 
-        let (t, e, c, f) = cross_sections_for_range(range, energy_ev, awr, target_spin);
+        // Each range carries its own target_spin — pass per-range, not
+        // from the first range, to correctly compute statistical weights g_J.
+        let (t, e, c, f) = cross_sections_for_range(range, energy_ev, awr, range.target_spin);
         total += t;
         elastic += e;
         capture += c;
@@ -158,6 +168,10 @@ pub fn cross_sections_on_grid(data: &ResonanceData, energies: &[f64]) -> Vec<Cro
 ///
 /// Returns `false` for URR placeholders created when unsupported INT
 /// codes force a skip, or other unrecognized formalisms.
+///
+/// **Keep in sync with `cross_sections_for_range`.**  Whenever a new
+/// formalism is dispatched there, add it to the `matches!` pattern here so
+/// that energy boundary logic (`next_starts_here`) stays correct.
 fn range_is_evaluable(range: &ResonanceRange) -> bool {
     if range.urr.is_some() {
         return true;
@@ -190,11 +204,17 @@ fn cross_sections_for_range(
     }
 
     // SLBW/MLBW: dispatch to the SLBW per-range calculator.
-    // This must be checked before the l_group loop because the SLBW function
-    // handles all L-groups and J-groups internally (including potential
-    // scattering).  MLBW uses the same parameter layout — the only
-    // difference from SLBW is in how resonance interference is treated,
-    // which the SLBW formulas ignore.
+    //
+    // IMPORTANT: MLBW is *not* implemented as a true multi-level
+    // Breit–Wigner formalism.  MLBW ranges are evaluated using the
+    // single-level Breit–Wigner (SLBW) formulas as an approximation.
+    // This ignores resonance–resonance interference (the defining
+    // difference between SLBW and MLBW), so results may be physically
+    // incorrect for closely spaced or overlapping resonances.
+    //
+    // This check must precede the l_group loop because
+    // `slbw_cross_sections_for_range` handles all L-groups and J-groups
+    // internally (including potential scattering).
     if matches!(
         range.formalism,
         ResonanceFormalism::SLBW | ResonanceFormalism::MLBW
@@ -268,7 +288,11 @@ fn cross_sections_for_range(
                     unreachable!("SLBW/MLBW dispatched before l_group loop");
                 }
                 _ => {
-                    // Other formalisms (Adler-Adler LRF=4, etc.) not supported.
+                    // Other formalisms (e.g. Adler-Adler LRF=4) are not
+                    // implemented.  `range_is_evaluable` returns `false` for
+                    // these, so they should never reach here through the
+                    // normal dispatcher.  This arm exists only for
+                    // exhaustiveness; contribution is zero.
                     continue;
                 }
             }
@@ -983,6 +1007,103 @@ mod tests {
         assert!(
             xs_peak.capture > 339.0,
             "Unbroadened peak must exceed SAMMY broadened value"
+        );
+    }
+
+    /// Build a single-resonance `ResonanceData` with a chosen formalism.
+    fn make_slbw_data(formalism: ResonanceFormalism) -> ResonanceData {
+        ResonanceData {
+            isotope: nereids_core::types::Isotope::new(92, 238),
+            za: 92238,
+            awr: 236.006,
+            ranges: vec![ResonanceRange {
+                energy_low: 1e-5,
+                energy_high: 1e4,
+                resolved: true,
+                formalism,
+                target_spin: 0.0,
+                scattering_radius: 9.4285,
+                l_groups: vec![LGroup {
+                    l: 0,
+                    awr: 236.006,
+                    apl: 0.0,
+                    resonances: vec![Resonance {
+                        energy: 6.674,
+                        j: 0.5,
+                        gn: 1.493e-3,
+                        gg: 23.0e-3,
+                        gfa: 0.0,
+                        gfb: 0.0,
+                    }],
+                }],
+                rml: None,
+                ap_table: None,
+                urr: None,
+            }],
+        }
+    }
+
+    /// `cross_sections_at_energy` with an SLBW-formalism range must give
+    /// the same result as `slbw::slbw_cross_sections`.
+    #[test]
+    fn test_dispatcher_slbw_matches_slbw_module() {
+        let data = make_slbw_data(ResonanceFormalism::SLBW);
+
+        let test_energies = [0.1, 1.0, 5.0, 6.0, 6.674, 7.0, 10.0, 100.0];
+        for &e in &test_energies {
+            let via_dispatcher = cross_sections_at_energy(&data, e);
+            let via_slbw = crate::slbw::slbw_cross_sections(&data, e);
+
+            let eps = 1e-10;
+            assert!(
+                (via_dispatcher.total - via_slbw.total).abs() < eps,
+                "total mismatch at {e} eV: dispatcher={} slbw={}",
+                via_dispatcher.total,
+                via_slbw.total
+            );
+            assert!(
+                (via_dispatcher.capture - via_slbw.capture).abs() < eps,
+                "capture mismatch at {e} eV: dispatcher={} slbw={}",
+                via_dispatcher.capture,
+                via_slbw.capture
+            );
+            assert!(
+                (via_dispatcher.elastic - via_slbw.elastic).abs() < eps,
+                "elastic mismatch at {e} eV: dispatcher={} slbw={}",
+                via_dispatcher.elastic,
+                via_slbw.elastic
+            );
+        }
+    }
+
+    /// MLBW is dispatched as SLBW (approximation).  Verify that the
+    /// dispatcher returns the same values as the SLBW module when given
+    /// an MLBW-formalism range, and that the results are physically
+    /// reasonable (positive, peak at resonance energy).
+    #[test]
+    fn test_dispatcher_mlbw_uses_slbw_approximation() {
+        let data_mlbw = make_slbw_data(ResonanceFormalism::MLBW);
+        let data_slbw = make_slbw_data(ResonanceFormalism::SLBW);
+
+        let test_energies = [1.0, 6.674, 10.0];
+        for &e in &test_energies {
+            let xs_mlbw = cross_sections_at_energy(&data_mlbw, e);
+            let xs_slbw = cross_sections_at_energy(&data_slbw, e);
+            let eps = 1e-10;
+            assert!(
+                (xs_mlbw.total - xs_slbw.total).abs() < eps,
+                "MLBW/SLBW mismatch at {e} eV: mlbw={} slbw={}",
+                xs_mlbw.total,
+                xs_slbw.total
+            );
+        }
+
+        // Sanity: peak capture at resonance energy should be large.
+        let xs_peak = cross_sections_at_energy(&data_mlbw, 6.674);
+        assert!(
+            xs_peak.capture > 1000.0,
+            "MLBW capture at 6.674 eV should be substantial (got {})",
+            xs_peak.capture
         );
     }
 }

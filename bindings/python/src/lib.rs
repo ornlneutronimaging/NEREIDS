@@ -352,9 +352,10 @@ fn cross_sections<'py>(
     let mut capture = Vec::with_capacity(e.len());
     let mut fission = Vec::with_capacity(e.len());
 
-    // The Rust dispatcher (`cross_sections_at_energy`) handles all formalisms
-    // (Reich-Moore, SLBW, MLBW, RML, URR) per-range, so no Python-side
-    // formalism check is needed.
+    // The Rust dispatcher (`cross_sections_at_energy`) handles all supported
+    // resonance formalisms per range (Reich-Moore, SLBW, MLBW via an SLBW
+    // approximation, RML, URR), so no additional Python-side formalism
+    // dispatch is needed.
     for &energy in e {
         let xs = nereids_physics::reich_moore::cross_sections_at_energy(&data.inner, energy);
         total.push(xs.total);
@@ -655,6 +656,10 @@ fn load_endf_file(path: &str) -> PyResult<PyResonanceData> {
 ///     l_groups: Optional list of (l_value, [(energy, j, gn, gg), ...]) tuples
 ///               for multiple L-groups. If provided, the ``resonances`` parameter
 ///               is ignored.
+///     formalism: Resonance formalism to use. Accepted values:
+///                - ``None`` or ``"reich_moore"`` (also ``"ReichMoore"``, ``"rm"``,
+///                  ``"RM"``, ``"reich-moore"``) — Reich-Moore R-matrix (default).
+///                - ``"slbw"`` or ``"SLBW"`` — Single-Level Breit-Wigner.
 ///
 /// Returns:
 ///     ResonanceData object.

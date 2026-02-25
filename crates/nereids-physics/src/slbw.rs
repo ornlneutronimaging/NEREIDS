@@ -46,7 +46,6 @@ pub struct SlbwCrossSections {
 /// resonance parameters but applies the SLBW formulas).
 pub fn slbw_cross_sections(data: &ResonanceData, energy_ev: f64) -> SlbwCrossSections {
     let awr = data.awr;
-    let target_spin = data.ranges.first().map(|r| r.target_spin).unwrap_or(0.0);
 
     let mut total = 0.0;
     let mut elastic = 0.0;
@@ -58,7 +57,9 @@ pub fn slbw_cross_sections(data: &ResonanceData, energy_ev: f64) -> SlbwCrossSec
             continue;
         }
 
-        let (t, e, c, f) = slbw_cross_sections_for_range(range, energy_ev, awr, target_spin);
+        // Each range carries its own target_spin — pass per-range, not
+        // from the first range, to correctly compute statistical weights g_J.
+        let (t, e, c, f) = slbw_cross_sections_for_range(range, energy_ev, awr, range.target_spin);
         total += t;
         elastic += e;
         capture += c;
