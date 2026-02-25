@@ -175,19 +175,10 @@ pub fn cross_sections_on_grid(data: &ResonanceData, energies: &[f64]) -> Vec<Cro
 /// Returns `false` for URR placeholders created when unsupported INT
 /// codes force a skip, or other unrecognized formalisms.
 ///
-/// Returns `true` if `range` can produce cross-sections via the unified
-/// dispatcher.
-///
-/// Used by both `cross_sections_at_energy` (this module) and
-/// `slbw::slbw_cross_sections` to compute identical `next_starts_here`
-/// boundary logic.  A URR range has `resolved = false` but is still
-/// evaluable; checking only `.resolved` would produce a stale open/closed
-/// interval mismatch between the two call sites.
-///
 /// **Keep in sync with `cross_sections_for_range`.**  Whenever a new
 /// formalism is dispatched there, add it to the `matches!` pattern here so
 /// that energy boundary logic (`next_starts_here`) stays correct.
-pub(crate) fn range_is_evaluable(range: &ResonanceRange) -> bool {
+fn range_is_evaluable(range: &ResonanceRange) -> bool {
     if range.urr.is_some() {
         return true;
     }

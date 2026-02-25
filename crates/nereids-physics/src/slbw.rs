@@ -30,7 +30,6 @@ use nereids_endf::resonance::ResonanceData;
 
 use crate::channel;
 use crate::penetrability;
-use crate::reich_moore::range_is_evaluable;
 
 /// SLBW cross-section results at a single energy.
 #[derive(Debug, Clone, Copy)]
@@ -53,29 +52,18 @@ pub fn slbw_cross_sections(data: &ResonanceData, energy_ev: f64) -> SlbwCrossSec
     let mut capture = 0.0;
     let mut fission = 0.0;
 
-    // Mirror the half-open interval logic from `reich_moore::cross_sections_at_energy`.
-    // When two adjacent evaluable ranges share a boundary energy, the lower
-    // range uses [e_low, e_high) so the boundary point is counted exactly once.
-    // "Evaluable" includes URR ranges (resolved=false, urr.is_some()), so we
-    // use `range_is_evaluable` — not just `.resolved` — for `next_starts_here`.
-    for (range_idx, range) in data.ranges.iter().enumerate() {
-        if !range.resolved || energy_ev < range.energy_low {
-            continue;
-        }
-        // Use `range_is_evaluable` instead of `next.resolved` so that URR
-        // ranges (resolved=false but urr.is_some()) are correctly treated as
-        // an adjacent evaluable range — matching the boundary logic in
-        // `reich_moore::cross_sections_at_energy`.
-        let next_starts_here = data
-            .ranges
-            .get(range_idx + 1)
-            .is_some_and(|next| next.energy_low == range.energy_high && range_is_evaluable(next));
-        let in_range = if next_starts_here {
-            energy_ev < range.energy_high
-        } else {
-            energy_ev <= range.energy_high
-        };
-        if !in_range {
+    // Use simple closed-interval logic: energy_ev must be in [e_low, e_high].
+    //
+    // This function evaluates *only* resolved SLBW/MLBW ranges and skips
+    // everything else (including URR ranges where !range.resolved).  Using
+    // half-open [e_low, e_high) when the next range is a URR range would
+    // exclude the shared boundary energy from the resolved range while still
+    // skipping the URR range, producing zero XS at the boundary — an
+    // artificial dip.  Closed intervals prevent that gap.  A double-count at
+    // a shared boundary between two resolved ranges is a negligibly small
+    // effect compared to the gap that half-open logic would introduce.
+    for range in &data.ranges {
+        if !range.resolved || energy_ev < range.energy_low || energy_ev > range.energy_high {
             continue;
         }
 
