@@ -352,27 +352,15 @@ fn cross_sections<'py>(
     let mut capture = Vec::with_capacity(e.len());
     let mut fission = Vec::with_capacity(e.len());
 
-    // Dispatch based on the formalism stored in the resonance data.
-    let use_slbw = data
-        .inner
-        .ranges
-        .first()
-        .is_some_and(|r| r.formalism == ResonanceFormalism::SLBW);
-
+    // The Rust dispatcher (`cross_sections_at_energy`) handles all formalisms
+    // (Reich-Moore, SLBW, MLBW, RML, URR) per-range, so no Python-side
+    // formalism check is needed.
     for &energy in e {
-        if use_slbw {
-            let xs = nereids_physics::slbw::slbw_cross_sections(&data.inner, energy);
-            total.push(xs.total);
-            elastic.push(xs.elastic);
-            capture.push(xs.capture);
-            fission.push(xs.fission);
-        } else {
-            let xs = nereids_physics::reich_moore::cross_sections_at_energy(&data.inner, energy);
-            total.push(xs.total);
-            elastic.push(xs.elastic);
-            capture.push(xs.capture);
-            fission.push(xs.fission);
-        }
+        let xs = nereids_physics::reich_moore::cross_sections_at_energy(&data.inner, energy);
+        total.push(xs.total);
+        elastic.push(xs.elastic);
+        capture.push(xs.capture);
+        fission.push(xs.fission);
     }
 
     let dict = pyo3::types::PyDict::new(py);

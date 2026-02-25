@@ -29,6 +29,7 @@ use nereids_endf::resonance::{ResonanceData, ResonanceFormalism, ResonanceRange,
 use crate::channel;
 use crate::penetrability;
 use crate::rmatrix_limited;
+use crate::slbw;
 use crate::urr;
 
 /// Cross-section results at a single energy point.
@@ -68,8 +69,8 @@ pub fn cross_sections_at_energy(data: &ResonanceData, energy_ev: f64) -> CrossSe
         // Use half-open [low, high) only when the *next* range begins exactly at
         // this range's upper endpoint AND that next range can actually produce
         // cross-sections.  Ranges that parse successfully but whose physics is
-        // not yet wired up (SLBW/MLBW, or URR with urr=None) must not steal
-        // the boundary — otherwise the shared energy point falls into a gap.
+        // not yet wired up (URR with urr=None) must not steal the boundary —
+        // otherwise the shared energy point falls into a gap.
         // ENDF-6 §2 — adjacent ranges share a single boundary energy.
         let next_starts_here = data
             .ranges
@@ -150,12 +151,13 @@ pub fn cross_sections_on_grid(data: &ResonanceData, energies: &[f64]) -> Vec<Cro
 /// Can this range actually produce non-zero cross-sections?
 ///
 /// Returns `true` for formalisms whose physics evaluation is implemented:
-/// - Reich-Moore (LRF=3) and R-Matrix Limited (LRF=7) resolved ranges
+/// - SLBW (LRF=1) and MLBW (LRF=2) resolved ranges
+/// - Reich-Moore (LRF=3) resolved ranges
+/// - R-Matrix Limited (LRF=7) resolved ranges
 /// - URR ranges with parsed data (`urr.is_some()`)
 ///
-/// Returns `false` for ranges that parse successfully but whose physics
-/// evaluation is not yet wired up (SLBW/MLBW — see TODO issue #12) or
-/// URR placeholders created when unsupported INT codes force a skip.
+/// Returns `false` for URR placeholders created when unsupported INT
+/// codes force a skip, or other unrecognized formalisms.
 fn range_is_evaluable(range: &ResonanceRange) -> bool {
     if range.urr.is_some() {
         return true;
@@ -165,7 +167,10 @@ fn range_is_evaluable(range: &ResonanceRange) -> bool {
     }
     matches!(
         range.formalism,
-        ResonanceFormalism::ReichMoore | ResonanceFormalism::RMatrixLimited
+        ResonanceFormalism::SLBW
+            | ResonanceFormalism::MLBW
+            | ResonanceFormalism::ReichMoore
+            | ResonanceFormalism::RMatrixLimited
     )
 }
 
@@ -182,6 +187,19 @@ fn cross_sections_for_range(
     // LRF=7 (R-Matrix Limited): dispatch to multi-channel calculator.
     if let Some(rml) = &range.rml {
         return rmatrix_limited::cross_sections_for_rml_range(rml, energy_ev);
+    }
+
+    // SLBW/MLBW: dispatch to the SLBW per-range calculator.
+    // This must be checked before the l_group loop because the SLBW function
+    // handles all L-groups and J-groups internally (including potential
+    // scattering).  MLBW uses the same parameter layout — the only
+    // difference from SLBW is in how resonance interference is treated,
+    // which the SLBW formulas ignore.
+    if matches!(
+        range.formalism,
+        ResonanceFormalism::SLBW | ResonanceFormalism::MLBW
+    ) {
+        return slbw::slbw_cross_sections_for_range(range, energy_ev, awr, target_spin);
     }
 
     let mut total = 0.0;
@@ -245,12 +263,9 @@ fn cross_sections_for_range(
                     fission += f;
                 }
                 ResonanceFormalism::SLBW | ResonanceFormalism::MLBW => {
-                    // SLBW/MLBW are parsed and stored but the physics evaluation
-                    // is not yet wired up here.  The `slbw` crate module exists but
-                    // is not called from this dispatcher.  Cross-section contribution
-                    // is silently zero — a known gap relative to SAMMY.
-                    // TODO: dispatch to slbw::cross_sections_for_range() (issue #12).
-                    continue;
+                    // Unreachable: SLBW/MLBW ranges are dispatched before
+                    // entering this loop (see early return above).
+                    unreachable!("SLBW/MLBW dispatched before l_group loop");
                 }
                 _ => {
                     // Other formalisms (Adler-Adler LRF=4, etc.) not supported.
