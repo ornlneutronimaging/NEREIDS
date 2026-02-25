@@ -367,8 +367,7 @@ fn cross_sections<'py>(
             capture.push(xs.capture);
             fission.push(xs.fission);
         } else {
-            let xs =
-                nereids_physics::reich_moore::cross_sections_at_energy(&data.inner, energy);
+            let xs = nereids_physics::reich_moore::cross_sections_at_energy(&data.inner, energy);
             total.push(xs.total);
             elastic.push(xs.elastic);
             capture.push(xs.capture);
