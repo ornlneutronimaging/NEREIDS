@@ -11,6 +11,7 @@
 //! - [`doppler`] — Free Gas Model Doppler broadening
 //! - [`resolution`] — Instrument resolution broadening (Gaussian convolution)
 //! - [`transmission`] — Beer-Lambert transmission forward model
+//! - [`urr`] — Unresolved Resonance Region (LRU=2) Hauser-Feshbach cross-sections
 //!
 //! ## SAMMY Reference
 //! - Cross-sections: `rml/` (Reich-Moore), `mlb/` (SLBW/MLBW), manual Sec 2
@@ -29,3 +30,4 @@ pub mod resolution;
 pub mod rmatrix_limited;
 pub mod slbw;
 pub mod transmission;
+pub mod urr;

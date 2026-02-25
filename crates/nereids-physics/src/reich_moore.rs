@@ -29,6 +29,7 @@ use nereids_endf::resonance::{ResonanceData, ResonanceFormalism, ResonanceRange,
 use crate::channel;
 use crate::penetrability;
 use crate::rmatrix_limited;
+use crate::urr;
 
 /// Cross-section results at a single energy point.
 #[derive(Debug, Clone, Copy)]
@@ -63,11 +64,53 @@ pub fn cross_sections_at_energy(data: &ResonanceData, energy_ev: f64) -> CrossSe
     let mut capture = 0.0;
     let mut fission = 0.0;
 
-    for range in &data.ranges {
-        if !range.resolved {
+    for (range_idx, range) in data.ranges.iter().enumerate() {
+        // Use half-open [low, high) only when the *next* range begins exactly at
+        // this range's upper endpoint AND that next range can actually produce
+        // cross-sections.  Ranges that parse successfully but whose physics is
+        // not yet wired up (SLBW/MLBW, or URR with urr=None) must not steal
+        // the boundary — otherwise the shared energy point falls into a gap.
+        // ENDF-6 §2 — adjacent ranges share a single boundary energy.
+        let next_starts_here = data
+            .ranges
+            .get(range_idx + 1)
+            .is_some_and(|next| next.energy_low == range.energy_high && range_is_evaluable(next));
+        let in_range = if next_starts_here {
+            energy_ev >= range.energy_low && energy_ev < range.energy_high
+        } else {
+            energy_ev >= range.energy_low && energy_ev <= range.energy_high
+        };
+        if !in_range {
             continue;
         }
-        if energy_ev < range.energy_low || energy_ev > range.energy_high {
+
+        // URR (LRU=2): Hauser-Feshbach average cross-sections.
+        // These ranges have `resolved = false` so they must be dispatched before
+        // the `!range.resolved` skip below.
+        //
+        // Note: `parse_urr_range` sets urr.e_low == range.energy_low and
+        // urr.e_high == range.energy_high, so the outer `in_range` check and the
+        // inner band guard in `urr_cross_sections` test the same interval.
+        // The inner guard is kept as a safety net for direct calls.
+        if let Some(urr_data) = &range.urr {
+            debug_assert_eq!(
+                urr_data.e_low, range.energy_low,
+                "URR e_low must equal range.energy_low"
+            );
+            debug_assert_eq!(
+                urr_data.e_high, range.energy_high,
+                "URR e_high must equal range.energy_high"
+            );
+            let ap_fm = range.scattering_radius_at(energy_ev);
+            let (t, e, c, f) = urr::urr_cross_sections(urr_data, energy_ev, ap_fm);
+            total += t;
+            elastic += e;
+            capture += c;
+            fission += f;
+            continue;
+        }
+
+        if !range.resolved {
             continue;
         }
 
@@ -102,6 +145,28 @@ pub fn cross_sections_on_grid(data: &ResonanceData, energies: &[f64]) -> Vec<Cro
         .iter()
         .map(|&e| cross_sections_at_energy(data, e))
         .collect()
+}
+
+/// Can this range actually produce non-zero cross-sections?
+///
+/// Returns `true` for formalisms whose physics evaluation is implemented:
+/// - Reich-Moore (LRF=3) and R-Matrix Limited (LRF=7) resolved ranges
+/// - URR ranges with parsed data (`urr.is_some()`)
+///
+/// Returns `false` for ranges that parse successfully but whose physics
+/// evaluation is not yet wired up (SLBW/MLBW — see TODO issue #12) or
+/// URR placeholders created when unsupported INT codes force a skip.
+fn range_is_evaluable(range: &ResonanceRange) -> bool {
+    if range.urr.is_some() {
+        return true;
+    }
+    if !range.resolved {
+        return false;
+    }
+    matches!(
+        range.formalism,
+        ResonanceFormalism::ReichMoore | ResonanceFormalism::RMatrixLimited
+    )
 }
 
 /// Cross-sections for a single resolved resonance range.
@@ -740,6 +805,7 @@ mod tests {
                 }],
                 rml: None,
                 ap_table: None,
+                urr: None,
             }],
         }
     }
