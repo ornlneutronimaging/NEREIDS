@@ -83,6 +83,12 @@ pub fn urr_cross_sections(urr: &UrrData, e_ev: f64, ap_fm: f64) -> (f64, f64, f6
         let awri = lg.awri;
         let l = lg.l;
 
+        // Guard: non-positive AWRI makes k² = 0 → π/k² = inf.
+        // SAMMY skips URR entirely so never hits this; we must guard explicitly.
+        if awri <= 0.0 {
+            continue;
+        }
+
         // π/k² in barns and channel parameter ρ = k·AP.
         // Uses the same channel formulas as the RRR calculator for consistency.
         let pi_over_k2 = channel::pi_over_k_squared_barns(e_ev, awri);

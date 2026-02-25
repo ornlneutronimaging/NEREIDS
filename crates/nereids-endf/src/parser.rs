@@ -1116,6 +1116,18 @@ fn parse_urr_range(
                 let n1 = checked_count(j_cont.n1, "N1")?; // 6*(NE+1)
                 let ne = checked_count(j_cont.n2, "NE")?; // NE (number of energy points)
 
+                // Validate N1 = 6*(NE+1) before consuming any LIST body.
+                // This catches malformed records regardless of whether the INT
+                // code is supported, preventing over-/under-consumption of lines.
+                // SAMMY only validates this for LFW=1/LRF=1 (File2.cpp line 1031);
+                // we validate unconditionally since we actually parse URR data.
+                let expected_n1 = 6 * (ne + 1);
+                if n1 != expected_n1 {
+                    return Err(EndfParseError::UnsupportedFormat(format!(
+                        "URR LRF=2 J={aj}: N1={n1} ≠ 6*(NE+1)={expected_n1} (NE={ne})"
+                    )));
+                }
+
                 // Supported interpolation laws: INT=2 (lin-lin) and INT=5 (log-log).
                 // INT=1/3/4 are valid ENDF but not yet implemented.  Rather
                 // than aborting the whole file parse (which would hide usable
@@ -1141,13 +1153,6 @@ fn parse_urr_range(
                         rml: None,
                         urr: None,
                     });
-                }
-
-                let expected_n1 = 6 * (ne + 1);
-                if n1 != expected_n1 {
-                    return Err(EndfParseError::UnsupportedFormat(format!(
-                        "URR LRF=2 J={aj}: N1={n1} ≠ 6*(NE+1)={expected_n1} (NE={ne})"
-                    )));
                 }
 
                 let values = parse_list_values(lines, pos, n1)?;
