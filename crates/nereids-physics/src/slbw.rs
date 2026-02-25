@@ -30,6 +30,7 @@ use nereids_endf::resonance::ResonanceData;
 
 use crate::channel;
 use crate::penetrability;
+use crate::reich_moore::range_is_evaluable;
 
 /// SLBW cross-section results at a single energy.
 #[derive(Debug, Clone, Copy)]
@@ -53,16 +54,22 @@ pub fn slbw_cross_sections(data: &ResonanceData, energy_ev: f64) -> SlbwCrossSec
     let mut fission = 0.0;
 
     // Mirror the half-open interval logic from `reich_moore::cross_sections_at_energy`.
-    // When two adjacent resolved ranges share a boundary energy, the lower range
-    // uses [e_low, e_high) so the boundary point is counted exactly once.
+    // When two adjacent evaluable ranges share a boundary energy, the lower
+    // range uses [e_low, e_high) so the boundary point is counted exactly once.
+    // "Evaluable" includes URR ranges (resolved=false, urr.is_some()), so we
+    // use `range_is_evaluable` — not just `.resolved` — for `next_starts_here`.
     for (range_idx, range) in data.ranges.iter().enumerate() {
         if !range.resolved || energy_ev < range.energy_low {
             continue;
         }
+        // Use `range_is_evaluable` instead of `next.resolved` so that URR
+        // ranges (resolved=false but urr.is_some()) are correctly treated as
+        // an adjacent evaluable range — matching the boundary logic in
+        // `reich_moore::cross_sections_at_energy`.
         let next_starts_here = data
             .ranges
             .get(range_idx + 1)
-            .is_some_and(|next| next.energy_low == range.energy_high && next.resolved);
+            .is_some_and(|next| next.energy_low == range.energy_high && range_is_evaluable(next));
         let in_range = if next_starts_here {
             energy_ev < range.energy_high
         } else {
