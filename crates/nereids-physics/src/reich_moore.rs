@@ -54,10 +54,16 @@ pub struct CrossSections {
     pub fission: f64,
 }
 
-/// Compute cross-sections at a single energy using the Reich-Moore formalism.
+/// Compute cross-sections at a single energy.
 ///
-/// Iterates over all resolved resonance ranges that contain the given energy,
-/// sums contributions from all spin groups (L-groups in ENDF terminology).
+/// Dispatches each resonance range to the appropriate formalism-specific
+/// calculator (SLBW, MLBW, Reich-Moore, R-Matrix Limited, URR) based on the
+/// formalism stored in that range.  See the module-level table for the full
+/// dispatch map.
+///
+/// Adjacent ranges that share a boundary energy use half-open intervals
+/// `[e_low, e_high)` so the boundary point is counted exactly once
+/// (ENDF-6 §2 convention).
 ///
 /// # Arguments
 /// * `data` — Parsed resonance parameters from ENDF.

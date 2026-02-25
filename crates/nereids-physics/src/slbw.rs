@@ -52,8 +52,23 @@ pub fn slbw_cross_sections(data: &ResonanceData, energy_ev: f64) -> SlbwCrossSec
     let mut capture = 0.0;
     let mut fission = 0.0;
 
-    for range in &data.ranges {
-        if !range.resolved || energy_ev < range.energy_low || energy_ev > range.energy_high {
+    // Mirror the half-open interval logic from `reich_moore::cross_sections_at_energy`.
+    // When two adjacent resolved ranges share a boundary energy, the lower range
+    // uses [e_low, e_high) so the boundary point is counted exactly once.
+    for (range_idx, range) in data.ranges.iter().enumerate() {
+        if !range.resolved || energy_ev < range.energy_low {
+            continue;
+        }
+        let next_starts_here = data
+            .ranges
+            .get(range_idx + 1)
+            .is_some_and(|next| next.energy_low == range.energy_high && next.resolved);
+        let in_range = if next_starts_here {
+            energy_ev < range.energy_high
+        } else {
+            energy_ev <= range.energy_high
+        };
+        if !in_range {
             continue;
         }
 
