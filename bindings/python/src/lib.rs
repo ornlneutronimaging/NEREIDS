@@ -31,7 +31,7 @@ use numpy::{
 };
 use pyo3::prelude::*;
 
-use nereids_core::elements::element_symbol;
+use nereids_core::elements;
 use nereids_core::types::Isotope;
 use nereids_endf::parser::parse_endf_file2;
 use nereids_endf::resonance::{
@@ -1104,7 +1104,7 @@ fn py_spatial_map(
     let isotope_names: Vec<String> = isotopes
         .iter()
         .map(|d| {
-            let sym = element_symbol(d.inner.isotope.z).unwrap_or("?");
+            let sym = elements::element_symbol(d.inner.isotope.z).unwrap_or("?");
             format!("{}-{}", sym, d.inner.isotope.a)
         })
         .collect();
@@ -1259,7 +1259,7 @@ fn py_fit_roi(
     let isotope_names: Vec<String> = isotopes
         .iter()
         .map(|d| {
-            let sym = element_symbol(d.inner.isotope.z).unwrap_or("?");
+            let sym = elements::element_symbol(d.inner.isotope.z).unwrap_or("?");
             format!("{}-{}", sym, d.inner.isotope.a)
         })
         .collect();
@@ -1424,6 +1424,77 @@ fn tof_to_energy_centers<'py>(
     Ok(PyArray1::from_owned_array(py, centers))
 }
 
+// ── Element / isotope utilities ──────────────────────────────────────
+
+/// Get the element symbol for a given atomic number Z.
+///
+/// Args:
+///     z: Atomic number (e.g. 92 for uranium).
+///
+/// Returns:
+///     Element symbol (e.g. "U"), or None if Z is out of range.
+#[pyfunction]
+#[pyo3(name = "element_symbol")]
+fn py_element_symbol(z: u32) -> Option<String> {
+    elements::element_symbol(z).map(|s| s.to_string())
+}
+
+/// Get the element name for a given atomic number Z.
+///
+/// Args:
+///     z: Atomic number (e.g. 92 for uranium).
+///
+/// Returns:
+///     Element name (e.g. "Uranium"), or None if Z is out of range.
+#[pyfunction]
+#[pyo3(name = "element_name")]
+fn py_element_name(z: u32) -> Option<String> {
+    elements::element_name(z).map(|s| s.to_string())
+}
+
+/// Parse an isotope string like "U-238" into (Z, A).
+///
+/// Args:
+///     s: Isotope string in "Symbol-A" format (e.g. "U-238", "Fe-56").
+///
+/// Returns:
+///     Tuple (z, a) or None if the string cannot be parsed.
+#[pyfunction]
+#[pyo3(name = "parse_isotope_str")]
+fn py_parse_isotope_str(s: &str) -> Option<(u32, u32)> {
+    elements::parse_isotope_str(s).map(|iso| (iso.z, iso.a))
+}
+
+/// Get the natural isotopic abundance for a specific isotope.
+///
+/// Args:
+///     z: Atomic number.
+///     a: Mass number.
+///
+/// Returns:
+///     Abundance as a fraction (0.0 to 1.0), or None for synthetic isotopes.
+#[pyfunction]
+#[pyo3(name = "natural_abundance")]
+fn py_natural_abundance(z: u32, a: u32) -> Option<f64> {
+    elements::natural_abundance(&Isotope::new(z, a))
+}
+
+/// Get all naturally occurring isotopes for an element.
+///
+/// Args:
+///     z: Atomic number (e.g. 74 for tungsten).
+///
+/// Returns:
+///     List of ((z, a), abundance) tuples for all stable isotopes.
+#[pyfunction]
+#[pyo3(name = "natural_isotopes")]
+fn py_natural_isotopes(z: u32) -> Vec<((u32, u32), f64)> {
+    elements::natural_isotopes(z)
+        .into_iter()
+        .map(|(iso, frac)| ((iso.z, iso.a), frac))
+        .collect()
+}
+
 /// NEREIDS Python module.
 #[pymodule]
 fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -1449,5 +1520,10 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(load_tiff_stack, m)?)?;
     m.add_function(wrap_pyfunction!(normalize, m)?)?;
     m.add_function(wrap_pyfunction!(tof_to_energy_centers, m)?)?;
+    m.add_function(wrap_pyfunction!(py_element_symbol, m)?)?;
+    m.add_function(wrap_pyfunction!(py_element_name, m)?)?;
+    m.add_function(wrap_pyfunction!(py_parse_isotope_str, m)?)?;
+    m.add_function(wrap_pyfunction!(py_natural_abundance, m)?)?;
+    m.add_function(wrap_pyfunction!(py_natural_isotopes, m)?)?;
     Ok(())
 }
