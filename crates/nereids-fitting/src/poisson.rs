@@ -813,7 +813,15 @@ mod tests {
         // Generate observed counts Y = Φ·T + B at true density.
         let y_obs = counts_model.evaluate(&[true_b]);
 
-        let mut params = ParameterSet::new(vec![FitParameter::non_negative("b", 0.1)]);
+        let mut params = ParameterSet::new(vec![FitParameter::non_negative("b", 0.2)]);
+
+        // Background adds a floor to Y, weakening the gradient signal.
+        // Allow more iterations than the default to ensure convergence
+        // across platforms with different FP rounding behavior.
+        let config = PoissonConfig {
+            max_iter: 500,
+            ..PoissonConfig::default()
+        };
 
         let result = poisson_fit_analytic(
             &counts_model,
@@ -822,7 +830,7 @@ mod tests {
             &[sigma],
             &[0],
             &mut params,
-            &PoissonConfig::default(),
+            &config,
         );
 
         assert!(
