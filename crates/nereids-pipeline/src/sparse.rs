@@ -32,9 +32,9 @@ use rayon::prelude::*;
 use nereids_endf::resonance::ResonanceData;
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
 use nereids_fitting::poisson::{self, CountsModel, PoissonConfig};
-use nereids_fitting::transmission_model::TransmissionFitModel;
+use nereids_fitting::transmission_model::PrecomputedTransmissionModel;
 use nereids_physics::resolution::ResolutionFunction;
-use nereids_physics::transmission::InstrumentParams;
+use nereids_physics::transmission::{InstrumentParams, broadened_cross_sections};
 
 /// Configuration for two-stage sparse reconstruction.
 #[derive(Debug, Clone)]
@@ -80,6 +80,8 @@ pub struct PixelResult {
 pub struct SparseResult {
     /// Density maps, one per isotope. Shape (height, width).
     pub density_maps: Vec<Array2<f64>>,
+    /// Per-pixel Poisson NLL map (analogous to chi_squared_map in SpatialResult).
+    pub nll_map: Array2<f64>,
     /// Convergence map.
     pub converged_map: Array2<bool>,
     /// Number converged.
@@ -92,55 +94,82 @@ pub struct SparseResult {
 
 /// Stage 1: Estimate nuisance parameters from region-averaged data.
 ///
-/// Uses the open-beam counts directly as the flux estimate, and
-/// estimates background from high-energy tails where transmission → 1.
+/// Averages open-beam counts over the ROI (excluding dead pixels) to
+/// produce a per-energy-bin flux estimate.  Background is currently set
+/// to zero; a future version may fit it from a sample-free region.
 ///
 /// # Arguments
 /// * `sample_counts` — Raw sample counts (n_energies, height, width).
 /// * `open_beam_counts` — Raw open-beam counts (n_energies, height, width).
 /// * `roi` — Optional (y_range, x_range) for high-statistics region.
 ///   If None, uses the entire image.
+/// * `dead_pixels` — Optional dead-pixel mask.  Dead pixels are excluded
+///   from the ROI average so that suppressed open-beam counts do not bias
+///   the flux estimate.
+///
+/// # Errors
+/// Returns `Err` if every pixel in the ROI is dead, leaving zero live
+/// pixels to average over.
 pub fn estimate_nuisance(
     _sample_counts: &Array3<f64>,
     open_beam_counts: &Array3<f64>,
     roi: Option<(std::ops::Range<usize>, std::ops::Range<usize>)>,
-) -> NuisanceParams {
+    dead_pixels: Option<&Array2<bool>>,
+) -> Result<NuisanceParams, String> {
     let n_energies = open_beam_counts.shape()[0];
+    let height = open_beam_counts.shape()[1];
+    let width = open_beam_counts.shape()[2];
 
     // Average open-beam over ROI to get flux estimate
-    let (y_range, x_range) = roi.unwrap_or_else(|| {
-        (
-            0..open_beam_counts.shape()[1],
-            0..open_beam_counts.shape()[2],
-        )
-    });
-
-    let n_pixels = (y_range.end - y_range.start) * (x_range.end - x_range.start);
-    let n_pix_f = n_pixels as f64;
+    let (y_range, x_range) = match roi {
+        Some((y_r, x_r)) => {
+            if y_r.start >= y_r.end || x_r.start >= x_r.end {
+                return Err("ROI y-range or x-range is empty".into());
+            }
+            if y_r.start >= height || y_r.end > height || x_r.start >= width || x_r.end > width {
+                return Err("ROI is out of bounds of the open-beam data".into());
+            }
+            (y_r, x_r)
+        }
+        None => (0..height, 0..width),
+    };
 
     let mut flux = vec![0.0f64; n_energies];
     let mut background = vec![0.0f64; n_energies];
+    let mut n_pixels: usize = 0;
 
-    for y in y_range.clone() {
+    for y in y_range {
         for x in x_range.clone() {
+            if dead_pixels.is_some_and(|m| m[[y, x]]) {
+                continue;
+            }
             for e in 0..n_energies {
                 flux[e] += open_beam_counts[[e, y, x]];
             }
+            n_pixels += 1;
         }
     }
 
+    if n_pixels == 0 {
+        return Err(
+            "no live pixels in ROI after dead-pixel filtering; cannot estimate nuisance flux"
+                .into(),
+        );
+    }
+
+    let n_pix_f = n_pixels as f64;
     for f in &mut flux {
         *f /= n_pix_f;
     }
 
-    // Estimate background: use the difference between sample and
-    // open_beam × expected_transmission in a region where we expect T ≈ 1.
-    // For simplicity, assume background is a small fraction of flux.
-    // A more sophisticated approach would fit this, but for now use a
-    // conservative estimate of 0 (can be refined later).
+    // Background estimation: currently hardcoded to zero.  A future version
+    // could fit background from a sample-free ROI, but that requires knowing
+    // which pixels are sample-free.  Dead-pixel filtering above is still
+    // applied to both flux and background accumulators so that when real
+    // background estimation is added, the infrastructure is already in place.
     background.fill(0.0);
 
-    NuisanceParams { flux, background }
+    Ok(NuisanceParams { flux, background })
 }
 
 /// Stage 2: Per-pixel density reconstruction with Poisson likelihood.
@@ -162,6 +191,20 @@ pub fn sparse_reconstruct(
     let (n_energies, height, width) = (shape[0], shape[1], shape[2]);
     let n_isotopes = config.resonance_data.len();
 
+    // Guard against zero-isotope calls: with no isotopes, PrecomputedTransmissionModel
+    // would receive an empty cross_sections Vec and the first evaluate() would panic.
+    // Return a neutral result (T=1 everywhere) rather than crashing.
+    if n_isotopes == 0 {
+        return SparseResult {
+            density_maps: vec![],
+            nll_map: Array2::from_elem((height, width), f64::NAN),
+            converged_map: Array2::from_elem((height, width), false),
+            n_converged: 0,
+            n_total: 0,
+            nuisance: nuisance.clone(),
+        };
+    }
+
     assert_eq!(n_energies, config.energies.len());
     assert_eq!(
         nuisance.flux.len(),
@@ -178,12 +221,37 @@ pub fn sparse_reconstruct(
         n_energies,
     );
 
-    // Build the instrument params once, wrapped in Arc for cheap sharing
-    // across the parallel pixel loop (avoids deep-cloning tabulated kernels).
-    let instrument = config
-        .resolution
-        .clone()
-        .map(|r| Arc::new(InstrumentParams { resolution: r }));
+    // Precompute Doppler-broadened cross-sections once, outside the pixel loop.
+    // The same XS apply to every pixel (same isotopes, same temperature, same energy grid).
+    // Mirrors the pattern used in spatial.rs to avoid repeating expensive broadening work.
+    let instrument_params = config.resolution.as_ref().map(|r| InstrumentParams {
+        resolution: r.clone(),
+    });
+    let xs_raw = broadened_cross_sections(
+        &config.energies,
+        &config.resonance_data,
+        config.temperature_k,
+        instrument_params.as_ref(),
+        cancel,
+    );
+    // If cancelled during XS precomputation, return an empty result immediately.
+    let xs_raw = match xs_raw {
+        Some(v) => v,
+        None => {
+            return SparseResult {
+                density_maps: (0..n_isotopes)
+                    .map(|_| Array2::zeros((height, width)))
+                    .collect(),
+                nll_map: Array2::from_elem((height, width), f64::NAN),
+                converged_map: Array2::from_elem((height, width), false),
+                n_converged: 0,
+                n_total: 0,
+                nuisance: nuisance.clone(),
+            };
+        }
+    };
+    let xs: Arc<Vec<Vec<f64>>> = Arc::new(xs_raw);
+    let density_idx: Vec<usize> = (0..n_isotopes).collect();
 
     // Collect pixel coordinates
     let mut pixel_coords: Vec<(usize, usize)> = Vec::new();
@@ -210,24 +278,28 @@ pub fn sparse_reconstruct(
                 .map(|e| sample_counts[[e, y, x]].max(0.0))
                 .collect();
 
-            // Build per-pixel transmission model
-            let t_model = TransmissionFitModel {
-                energies: config.energies.clone(),
-                resonance_data: config.resonance_data.clone(),
-                temperature_k: config.temperature_k,
-                instrument: instrument.clone(),
-                density_indices: (0..n_isotopes).collect(),
+            // Build per-pixel transmission model reusing precomputed XS.
+            // Arc::clone shares the cross-section data (zero-copy) across all pixels,
+            // avoiding expensive repeated Doppler/resolution broadening.
+            let t_model = PrecomputedTransmissionModel {
+                cross_sections: Arc::clone(&xs),
+                density_indices: density_idx.clone(),
             };
 
-            // Wrap in counts model: Y = flux * T(θ) + background
+            // Wrap in counts model: Y = flux * T(θ) + background.
+            // flux/background are borrowed (zero-copy) — no per-pixel allocation.
             let counts_model = CountsModel {
                 transmission_model: &t_model,
-                flux: nuisance.flux.clone(),
-                background: nuisance.background.clone(),
+                flux: &nuisance.flux,
+                background: &nuisance.background,
                 density_param_range: 0..n_isotopes,
             };
 
-            // Fit with Poisson likelihood
+            // Fit with Poisson likelihood using analytical gradient.
+            // Passing the precomputed cross-sections and flux enables
+            // poisson_fit_analytic to compute the full ∂NLL/∂nₖ gradient vector
+            // in one model evaluation per iteration instead of N_isotopes+1
+            // evaluations with finite differences (one base + one per parameter).
             let mut params = ParameterSet::new(
                 config
                     .initial_densities
@@ -246,8 +318,15 @@ pub fn sparse_reconstruct(
                     .collect(),
             );
 
-            let result =
-                poisson::poisson_fit(&counts_model, &y_obs, &mut params, &config.poisson_config);
+            let result = poisson::poisson_fit_analytic(
+                &counts_model,
+                &y_obs,
+                &nuisance.flux,
+                &xs,
+                t_model.density_indices.as_slice(),
+                &mut params,
+                &config.poisson_config,
+            );
 
             let pixel_result = PixelResult {
                 densities: (0..n_isotopes).map(|i| result.params[i]).collect(),
@@ -263,6 +342,7 @@ pub fn sparse_reconstruct(
     let mut density_maps: Vec<Array2<f64>> = (0..n_isotopes)
         .map(|_| Array2::zeros((height, width)))
         .collect();
+    let mut nll_map = Array2::from_elem((height, width), f64::NAN);
     let mut converged_map = Array2::from_elem((height, width), false);
     let mut n_converged = 0;
 
@@ -270,6 +350,7 @@ pub fn sparse_reconstruct(
         for (i, map) in density_maps.iter_mut().enumerate() {
             map[[*y, *x]] = result.densities[i];
         }
+        nll_map[[*y, *x]] = result.nll;
         converged_map[[*y, *x]] = result.converged;
         if result.converged {
             n_converged += 1;
@@ -278,6 +359,7 @@ pub fn sparse_reconstruct(
 
     SparseResult {
         density_maps,
+        nll_map,
         converged_map,
         n_converged,
         n_total: results.len(),
@@ -291,6 +373,7 @@ mod tests {
     use nereids_core::types::Isotope;
     use nereids_endf::resonance::{LGroup, Resonance, ResonanceFormalism, ResonanceRange};
     use nereids_fitting::lm::FitModel;
+    use nereids_fitting::transmission_model::TransmissionFitModel;
 
     fn u238_single_resonance() -> ResonanceData {
         ResonanceData {
@@ -330,7 +413,7 @@ mod tests {
         let ob = Array3::from_elem((n_e, 2, 2), 100.0);
         let sample = Array3::from_elem((n_e, 2, 2), 50.0);
 
-        let nuisance = estimate_nuisance(&sample, &ob, None);
+        let nuisance = estimate_nuisance(&sample, &ob, None, None).unwrap();
         assert_eq!(nuisance.flux.len(), n_e);
         assert!((nuisance.flux[0] - 100.0).abs() < 1e-10);
     }
@@ -368,7 +451,7 @@ mod tests {
         }
 
         // Stage 1: estimate nuisance
-        let nuisance = estimate_nuisance(&sample_counts, &ob_counts, None);
+        let nuisance = estimate_nuisance(&sample_counts, &ob_counts, None, None).unwrap();
 
         // Stage 2: reconstruct
         let config = SparseConfig {
