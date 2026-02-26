@@ -158,11 +158,11 @@ pub fn estimate_nuisance(
         *f /= n_pix_f;
     }
 
-    // Estimate background: use the difference between sample and
-    // open_beam × expected_transmission in a region where we expect T ≈ 1.
-    // For simplicity, assume background is a small fraction of flux.
-    // A more sophisticated approach would fit this, but for now use a
-    // conservative estimate of 0 (can be refined later).
+    // Background estimation: currently hardcoded to zero.  A future version
+    // could fit background from a sample-free ROI, but that requires knowing
+    // which pixels are sample-free.  Dead-pixel filtering above is still
+    // applied to both flux and background accumulators so that when real
+    // background estimation is added, the infrastructure is already in place.
     background.fill(0.0);
 
     Ok(NuisanceParams { flux, background })
@@ -224,7 +224,7 @@ pub fn sparse_reconstruct(
                 density_maps: (0..n_isotopes)
                     .map(|_| Array2::zeros((height, width)))
                     .collect(),
-                nll_map: Array2::zeros((height, width)),
+                nll_map: Array2::from_elem((height, width), f64::NAN),
                 converged_map: Array2::from_elem((height, width), false),
                 n_converged: 0,
                 n_total: 0,
@@ -259,7 +259,9 @@ pub fn sparse_reconstruct(
                 .map(|e| sample_counts[[e, y, x]].max(0.0))
                 .collect();
 
-            // Build per-pixel transmission model reusing precomputed XS (cheap Arc clone).
+            // Build per-pixel transmission model reusing precomputed XS.
+            // Arc::clone shares the cross-section data (zero-copy) across all pixels,
+            // avoiding expensive repeated Doppler/resolution broadening.
             let t_model = PrecomputedTransmissionModel {
                 cross_sections: Arc::clone(&xs),
                 density_indices: (0..n_isotopes).collect(),
@@ -320,7 +322,7 @@ pub fn sparse_reconstruct(
     let mut density_maps: Vec<Array2<f64>> = (0..n_isotopes)
         .map(|_| Array2::zeros((height, width)))
         .collect();
-    let mut nll_map = Array2::<f64>::zeros((height, width));
+    let mut nll_map = Array2::from_elem((height, width), f64::NAN);
     let mut converged_map = Array2::from_elem((height, width), false);
     let mut n_converged = 0;
 

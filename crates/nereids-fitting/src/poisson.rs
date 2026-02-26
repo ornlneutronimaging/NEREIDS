@@ -272,7 +272,7 @@ pub fn poisson_fit_analytic(
     assert_eq!(
         density_indices.len(),
         cross_sections.len(),
-        "density_indices length ({}) must match cross_sections length ({})",
+        "density_indices length must match cross_sections length, got {} density indices and {} cross sections",
         density_indices.len(),
         cross_sections.len(),
     );
@@ -345,8 +345,10 @@ pub fn poisson_fit_analytic(
                     .zip(t_now.iter())
                     .enumerate()
                     .map(|(e, (((&obs, &ym), &phi), &t))| {
-                        let ym_safe = ym.max(1e-30);
-                        let residual_factor = 1.0 - obs / ym_safe;
+                        // Mirror the large-penalty behavior in `poisson_nll`:
+                        // non-positive model → large gradient pushing the optimizer
+                        // away from infeasible regions.
+                        let residual_factor = if ym <= 0.0 { 1e30 } else { 1.0 - obs / ym };
                         // Sum σₖ for all isotopes mapped to this param index.
                         // Handles the common case (one isotope per param) and
                         // tied parameters (multiple isotopes sharing one density).
@@ -611,5 +613,160 @@ mod tests {
         assert!((result[0] - 55.0).abs() < 1e-10);
         assert!((result[1] - 110.0).abs() < 1e-10);
         assert!((result[2] - 165.0).abs() < 1e-10);
+    }
+
+    // ---- Tests for poisson_fit_analytic ----
+
+    #[test]
+    fn test_analytic_matches_fd_result() {
+        // Both poisson_fit (finite-difference) and poisson_fit_analytic should
+        // converge to the same answer on a clean exponential model.
+        let x: Vec<f64> = (0..20).map(|i| i as f64 * 0.5).collect();
+        let true_b = 0.5;
+        let flux: Vec<f64> = vec![1000.0; x.len()];
+
+        let model = ExponentialModel {
+            x: x.clone(),
+            flux: flux.clone(),
+        };
+        let y_obs = model.evaluate(&[true_b]);
+        let cross_sections = vec![x.clone()]; // σ(E) = x
+
+        // FD path
+        let mut params_fd = ParameterSet::new(vec![FitParameter::non_negative("b", 1.0)]);
+        let res_fd = poisson_fit(&model, &y_obs, &mut params_fd, &PoissonConfig::default());
+
+        // Analytic path
+        let mut params_an = ParameterSet::new(vec![FitParameter::non_negative("b", 1.0)]);
+        let res_an = poisson_fit_analytic(
+            &model,
+            &y_obs,
+            &flux,
+            &cross_sections,
+            &[0],
+            &mut params_an,
+            &PoissonConfig::default(),
+        );
+
+        assert!(res_fd.converged, "FD did not converge");
+        assert!(res_an.converged, "Analytic did not converge");
+        assert!(
+            (res_fd.params[0] - res_an.params[0]).abs() < 1e-4,
+            "FD={}, Analytic={} should agree",
+            res_fd.params[0],
+            res_an.params[0],
+        );
+        // Analytic should use fewer or equal iterations (exact gradient).
+        assert!(
+            res_an.iterations <= res_fd.iterations,
+            "Analytic ({} iters) should not need more iterations than FD ({})",
+            res_an.iterations,
+            res_fd.iterations,
+        );
+    }
+
+    #[test]
+    fn test_analytic_two_isotopes() {
+        // Two-isotope model: Y = Φ · exp(−n₁·σ₁ − n₂·σ₂)
+        let n_e = 30;
+        let sigma1: Vec<f64> = (0..n_e).map(|i| 1.0 + 0.1 * i as f64).collect();
+        let sigma2: Vec<f64> = (0..n_e).map(|i| 0.5 + 0.05 * (n_e - i) as f64).collect();
+        let flux: Vec<f64> = vec![500.0; n_e];
+        let true_n1 = 0.3;
+        let true_n2 = 0.7;
+
+        // Forward model using both cross-sections
+        struct TwoIsotopeModel {
+            sigma1: Vec<f64>,
+            sigma2: Vec<f64>,
+            flux: Vec<f64>,
+        }
+        impl FitModel for TwoIsotopeModel {
+            fn evaluate(&self, params: &[f64]) -> Vec<f64> {
+                let (n1, n2) = (params[0], params[1]);
+                self.sigma1
+                    .iter()
+                    .zip(self.sigma2.iter())
+                    .zip(self.flux.iter())
+                    .map(|((&s1, &s2), &f)| f * (-n1 * s1 - n2 * s2).exp())
+                    .collect()
+            }
+        }
+
+        let model = TwoIsotopeModel {
+            sigma1: sigma1.clone(),
+            sigma2: sigma2.clone(),
+            flux: flux.clone(),
+        };
+        let y_obs = model.evaluate(&[true_n1, true_n2]);
+
+        let mut params = ParameterSet::new(vec![
+            FitParameter::non_negative("n1", 0.1),
+            FitParameter::non_negative("n2", 0.1),
+        ]);
+
+        let result = poisson_fit_analytic(
+            &model,
+            &y_obs,
+            &flux,
+            &[sigma1, sigma2],
+            &[0, 1],
+            &mut params,
+            &PoissonConfig::default(),
+        );
+
+        assert!(result.converged, "Two-isotope analytic did not converge");
+        assert!(
+            (result.params[0] - true_n1).abs() / true_n1 < 0.01,
+            "n1: fitted={}, true={}",
+            result.params[0],
+            true_n1,
+        );
+        assert!(
+            (result.params[1] - true_n2).abs() / true_n2 < 0.01,
+            "n2: fitted={}, true={}",
+            result.params[1],
+            true_n2,
+        );
+    }
+
+    #[test]
+    fn test_analytic_zero_density_convergence() {
+        // True density is ~0; verify the optimizer converges near zero
+        // without NaN or divergence.
+        let x: Vec<f64> = (0..20).map(|i| i as f64 * 0.5).collect();
+        let flux: Vec<f64> = vec![1000.0; x.len()];
+
+        let model = ExponentialModel {
+            x: x.clone(),
+            flux: flux.clone(),
+        };
+        // True b = 0 → y_obs = flux (constant)
+        let y_obs = model.evaluate(&[0.0]);
+        let cross_sections = vec![x.clone()];
+
+        let mut params = ParameterSet::new(vec![FitParameter::non_negative("b", 0.5)]);
+
+        let result = poisson_fit_analytic(
+            &model,
+            &y_obs,
+            &flux,
+            &cross_sections,
+            &[0],
+            &mut params,
+            &PoissonConfig::default(),
+        );
+
+        assert!(result.converged, "Zero-density fit did not converge");
+        assert!(
+            result.params[0] < 0.01,
+            "b should be ~0, got {}",
+            result.params[0],
+        );
+        assert!(
+            result.params[0] >= 0.0,
+            "b must be non-negative, got {}",
+            result.params[0],
+        );
     }
 }

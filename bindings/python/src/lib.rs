@@ -1123,8 +1123,9 @@ fn py_apply_resolution<'py>(
 ///         - fitter='lm':      normalised transmission T ∈ [0,1].
 ///         - fitter='poisson': raw sample counts (integer-valued floats).
 ///     uncertainty: 3D array (n_energies, height, width).
-///         - fitter='lm':      per-bin transmission uncertainty σ.
-///         - fitter='poisson': raw open-beam counts (same shape as sample).
+///         - fitter='lm':      per-bin transmission uncertainty σ (standard deviation).
+///         - fitter='poisson': raw open-beam counts (NOT uncertainty — this parameter is
+///                            reused to pass open-beam data; same shape as sample).
 ///     energies: 1D numpy array of energy values in eV.
 ///     isotopes: List of ResonanceData objects.
 ///     temperature_k: Sample temperature in Kelvin (default 300.0).
