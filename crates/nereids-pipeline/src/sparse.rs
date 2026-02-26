@@ -102,35 +102,39 @@ pub struct SparseResult {
 /// * `open_beam_counts` — Raw open-beam counts (n_energies, height, width).
 /// * `roi` — Optional (y_range, x_range) for high-statistics region.
 ///   If None, uses the entire image.
+/// * `dead_pixels` — Optional dead-pixel mask.  Dead pixels are excluded
+///   from the ROI average so that suppressed open-beam counts do not bias
+///   the flux estimate.
 pub fn estimate_nuisance(
     _sample_counts: &Array3<f64>,
     open_beam_counts: &Array3<f64>,
     roi: Option<(std::ops::Range<usize>, std::ops::Range<usize>)>,
+    dead_pixels: Option<&Array2<bool>>,
 ) -> NuisanceParams {
     let n_energies = open_beam_counts.shape()[0];
+    let height = open_beam_counts.shape()[1];
+    let width = open_beam_counts.shape()[2];
 
     // Average open-beam over ROI to get flux estimate
-    let (y_range, x_range) = roi.unwrap_or_else(|| {
-        (
-            0..open_beam_counts.shape()[1],
-            0..open_beam_counts.shape()[2],
-        )
-    });
-
-    let n_pixels = (y_range.end - y_range.start) * (x_range.end - x_range.start);
-    let n_pix_f = n_pixels as f64;
+    let (y_range, x_range) = roi.unwrap_or((0..height, 0..width));
 
     let mut flux = vec![0.0f64; n_energies];
     let mut background = vec![0.0f64; n_energies];
+    let mut n_pixels: usize = 0;
 
-    for y in y_range.clone() {
+    for y in y_range {
         for x in x_range.clone() {
+            if dead_pixels.is_some_and(|m| m[[y, x]]) {
+                continue;
+            }
             for e in 0..n_energies {
                 flux[e] += open_beam_counts[[e, y, x]];
             }
+            n_pixels += 1;
         }
     }
 
+    let n_pix_f = (n_pixels as f64).max(1.0); // guard against empty ROI
     for f in &mut flux {
         *f /= n_pix_f;
     }
@@ -366,7 +370,7 @@ mod tests {
         let ob = Array3::from_elem((n_e, 2, 2), 100.0);
         let sample = Array3::from_elem((n_e, 2, 2), 50.0);
 
-        let nuisance = estimate_nuisance(&sample, &ob, None);
+        let nuisance = estimate_nuisance(&sample, &ob, None, None);
         assert_eq!(nuisance.flux.len(), n_e);
         assert!((nuisance.flux[0] - 100.0).abs() < 1e-10);
     }
@@ -404,7 +408,7 @@ mod tests {
         }
 
         // Stage 1: estimate nuisance
-        let nuisance = estimate_nuisance(&sample_counts, &ob_counts, None);
+        let nuisance = estimate_nuisance(&sample_counts, &ob_counts, None, None);
 
         // Stage 2: reconstruct
         let config = SparseConfig {

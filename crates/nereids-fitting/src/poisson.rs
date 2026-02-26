@@ -272,22 +272,39 @@ pub fn poisson_fit_analytic(
     for _ in 0..config.max_iter {
         iter += 1;
 
-        // Compute the current transmission T(E) = Y_model / Φ  (since B = 0 in stage 1,
-        // Y = Φ·T).  Clamp flux to avoid division by zero; very small flux means the
-        // energy bin contributes negligibly to the gradient anyway.
+        // Evaluate the full model Y(E) = Φ·T + B so we can form (1 - y_obs/Y).
         let y_model_now = model.evaluate(&params.all_values());
-        let t_now: Vec<f64> = y_model_now
-            .iter()
-            .zip(flux.iter())
-            .map(|(&y, &phi)| if phi > 1e-30 { y / phi } else { 0.0 })
+
+        // Compute T(E) directly from cross-sections and current densities:
+        //   T(E) = exp(−Σₖ nₖ · σₖ(E))
+        //
+        // An earlier version derived T = Y/Φ, which is only correct when
+        // background B = 0.  Computing T from the Beer-Lambert definition
+        // is exact regardless of background and avoids a silent bias whenever
+        // a caller supplies a CountsModel with nonzero B(E).
+        let all_vals = params.all_values();
+        let t_now: Vec<f64> = (0..n_e)
+            .map(|e| {
+                let mut neg_opt = 0.0f64;
+                for (k, xs) in cross_sections.iter().enumerate() {
+                    let density = all_vals.get(k).copied().unwrap_or(0.0);
+                    if density > 0.0 {
+                        neg_opt -= density * xs.get(e).copied().unwrap_or(0.0);
+                    }
+                }
+                neg_opt.exp()
+            })
             .collect();
 
-        // Analytical gradient: ∂NLL/∂nₖ = Σ_E [(1 - y_obs/Y) · Φ · T · (-σₖ)]
+        // Analytical gradient: ∂NLL/∂nₖ = Σ_E [(1 − y_obs/Y) · (−Φ · σₖ · T)]
+        //
+        // Derivation:  Y = Φ·T + B,  T = exp(−Σ nₖ σₖ)
+        //   ∂Y/∂nₖ = Φ · ∂T/∂nₖ = −Φ · σₖ · T
+        //   ∂NLL/∂nₖ = Σ_E (1 − y_obs/Y) · ∂Y/∂nₖ
         let free_indices = params.free_indices();
         let grad: Vec<f64> = free_indices
             .iter()
             .map(|&param_idx| {
-                // sum over energy bins
                 y_obs
                     .iter()
                     .zip(y_model_now.iter())

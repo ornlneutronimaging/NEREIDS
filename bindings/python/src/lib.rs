@@ -1276,8 +1276,27 @@ fn py_spatial_map(
             let open_beam = uncertainty.as_array().to_owned();
             let dead = dead_pixels.map(|d| d.as_array().to_owned());
 
-            let roi_ranges = roi.map(|r| (r[0]..r[1], r[2]..r[3]));
-            let nuisance = estimate_nuisance(&sample, &open_beam, roi_ranges);
+            // Validate ROI bounds before feeding into estimate_nuisance.
+            let roi_ranges = match roi {
+                Some(r) => {
+                    let (height, width) = (sample.shape()[1], sample.shape()[2]);
+                    if r[0] >= r[1] || r[2] >= r[3] {
+                        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                            "roi must be [y0, y1, x0, x1] with y0<y1 and x0<x1, got {:?}",
+                            r,
+                        )));
+                    }
+                    if r[1] > height || r[3] > width {
+                        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                            "roi [{},{},{},{}] exceeds image dimensions ({}×{})",
+                            r[0], r[1], r[2], r[3], height, width,
+                        )));
+                    }
+                    Some((r[0]..r[1], r[2]..r[3]))
+                }
+                None => None,
+            };
+            let nuisance = estimate_nuisance(&sample, &open_beam, roi_ranges, dead.as_ref());
 
             let sparse_config = SparseConfig {
                 energies: e.to_vec(),
