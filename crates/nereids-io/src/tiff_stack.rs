@@ -507,6 +507,51 @@ mod tests {
     }
 
     #[test]
+    fn test_load_tiff_folder_not_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("frame_0001.tif");
+        write_test_tiff(&file_path, &[vec![1, 2, 3, 4]], 2, 2);
+
+        let result = load_tiff_folder(&file_path, None);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, IoError::NotADirectory(..)),
+            "Expected NotADirectory, got: {:?}",
+            err,
+        );
+    }
+
+    #[test]
+    fn test_load_tiff_folder_dimension_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Frame 0: 2x2
+        write_test_tiff(
+            &dir.path().join("frame_0000.tif"),
+            &[vec![1, 2, 3, 4]],
+            2,
+            2,
+        );
+        // Frame 1: 3x2 — different width
+        write_test_tiff(
+            &dir.path().join("frame_0001.tif"),
+            &[vec![1, 2, 3, 4, 5, 6]],
+            3,
+            2,
+        );
+
+        let result = load_tiff_folder(dir.path(), None);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, IoError::DimensionMismatch { .. }),
+            "Expected DimensionMismatch, got: {:?}",
+            err,
+        );
+    }
+
+    #[test]
     fn test_nonexistent_file() {
         let result = load_tiff_stack(Path::new("/nonexistent/file.tiff"));
         assert!(result.is_err());

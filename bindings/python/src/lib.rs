@@ -1525,7 +1525,9 @@ fn load_tiff_stack<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyAr
 ///
 /// Raises:
 ///     FileNotFoundError: If no files match the pattern.
+///     NotADirectoryError: If the provided path is not a directory.
 ///     ValueError: If matched frames have inconsistent dimensions.
+///     IOError: For TIFF decoding errors or other I/O failures.
 #[pyfunction]
 #[pyo3(signature = (folder, pattern=None))]
 fn load_tiff_folder<'py>(
