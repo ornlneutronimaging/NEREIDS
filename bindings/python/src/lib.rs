@@ -527,34 +527,34 @@ fn forward_model<'py>(
 ///     energies: Energy grid in eV (1D numpy array).
 ///     isotopes: List of ResonanceData objects.
 ///     temperature_k: Sample temperature in Kelvin (default 0.0).
-///     fit_temperature: If ``True``, treat ``temperature_k`` as the initial
-///         guess and include it as a free parameter in the LM fit.
-///         The fitted value and 1-sigma uncertainty are returned in
-///         ``result.temperature_k`` and ``result.temperature_k_unc``.
 ///     initial_densities: Initial guess for areal densities (optional).
 ///     max_iter: Maximum LM iterations (default 100).
 ///     flight_path_m: Flight path in meters for Gaussian resolution (optional).
 ///     delta_t_us: Timing uncertainty in microseconds (optional).
 ///     delta_l_m: Path length uncertainty in meters (optional).
 ///     resolution: TabulatedResolution from ``load_resolution()`` (optional).
+///     fit_temperature: If ``True``, treat ``temperature_k`` as the initial
+///         guess and include it as a free parameter in the LM fit.
+///         The fitted value and 1-sigma uncertainty are returned in
+///         ``result.temperature_k`` and ``result.temperature_k_unc``.
 ///
 /// Returns:
 ///     FitResult with densities, uncertainties, and fit quality.
 #[pyfunction]
-#[pyo3(signature = (measured_t, sigma, energies, isotopes, temperature_k=0.0, fit_temperature=false, initial_densities=None, max_iter=100, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None))]
+#[pyo3(signature = (measured_t, sigma, energies, isotopes, temperature_k=0.0, initial_densities=None, max_iter=100, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, fit_temperature=false))]
 fn fit_spectrum(
     measured_t: PyReadonlyArray1<f64>,
     sigma: PyReadonlyArray1<f64>,
     energies: PyReadonlyArray1<f64>,
     isotopes: Vec<PyResonanceData>,
     temperature_k: f64,
-    fit_temperature: bool,
     initial_densities: Option<Vec<f64>>,
     max_iter: usize,
     flight_path_m: Option<f64>,
     delta_t_us: Option<f64>,
     delta_l_m: Option<f64>,
     resolution: Option<PyTabulatedResolution>,
+    fit_temperature: bool,
 ) -> PyResult<PyFitResult> {
     let e = energies.as_slice()?;
     let t = measured_t.as_slice()?;
