@@ -101,33 +101,13 @@ pub fn load_tiff_stack(path: &Path) -> Result<Array3<f64>, IoError> {
 /// # Returns
 /// 3D array with shape (n_files, height, width) and f64 values.
 pub fn load_tiff_directory(dir: &Path) -> Result<Array3<f64>, IoError> {
-    if !dir.is_dir() {
-        return Err(IoError::NotADirectory(dir.to_string_lossy().into_owned()));
-    }
-
-    let mut paths: Vec<_> = std::fs::read_dir(dir)
-        .map_err(|e| IoError::FileNotFound(dir.to_string_lossy().into_owned(), e))?
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| {
-            entry
-                .path()
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| matches!(ext.to_lowercase().as_str(), "tif" | "tiff"))
-                .unwrap_or(false)
-        })
-        .map(|entry| entry.path())
-        .collect();
-
-    paths.sort();
-
-    if paths.is_empty() {
-        return Err(IoError::TiffDecode(
-            "No TIFF files found in directory".into(),
-        ));
-    }
-
-    load_frames_from_paths(&paths)
+    load_tiff_folder(dir, None).map_err(|e| match e {
+        // Preserve the original error message for backward compatibility.
+        IoError::NoMatchingFiles { .. } => {
+            IoError::TiffDecode("No TIFF files found in directory".into())
+        }
+        other => other,
+    })
 }
 
 /// Load a directory of TIFFs matching a glob pattern as a 3D stack.
@@ -166,26 +146,33 @@ pub fn load_tiff_folder(dir: &Path, pattern: Option<&str>) -> Result<Array3<f64>
 
     let mut paths: Vec<_> = entries
         .iter()
-        .filter(|entry| {
+        .filter_map(|entry| {
+            // Compute path once to avoid repeated PathBuf allocations.
+            let p = entry.path();
             // Use path().is_file() which follows symlinks, unlike file_type().is_file()
-            let is_file = entry.path().is_file();
-            let is_tiff = entry
-                .path()
+            if !p.is_file() {
+                return None;
+            }
+            let is_tiff = p
                 .extension()
                 .and_then(|ext| ext.to_str())
                 .map(|ext| matches!(ext.to_lowercase().as_str(), "tif" | "tiff"))
                 .unwrap_or(false);
-            let matches_pattern = match pattern {
-                Some(pat) => entry
+            if !is_tiff {
+                return None;
+            }
+            if let Some(pat) = pattern {
+                let matches = entry
                     .file_name()
                     .to_str()
                     .map(|name| glob_match(pat, name))
-                    .unwrap_or(false),
-                None => true,
-            };
-            is_file && is_tiff && matches_pattern
+                    .unwrap_or(false);
+                if !matches {
+                    return None;
+                }
+            }
+            Some(p)
         })
-        .map(|entry| entry.path())
         .collect();
 
     paths.sort();
@@ -206,6 +193,10 @@ pub fn load_tiff_folder(dir: &Path, pattern: Option<&str>) -> Result<Array3<f64>
 /// consistency across all files and pixel counts are validated against the
 /// reported image dimensions.
 fn load_frames_from_paths(paths: &[std::path::PathBuf]) -> Result<Array3<f64>, IoError> {
+    debug_assert!(
+        !paths.is_empty(),
+        "load_frames_from_paths called with empty paths"
+    );
     let mut frames: Vec<Vec<f64>> = Vec::new();
     let mut width = 0u32;
     let mut height = 0u32;
@@ -520,6 +511,13 @@ mod tests {
     #[test]
     fn test_glob_match_pattern_longer_than_name() {
         assert!(!glob_match("abcdef.tif", "a.tif"));
+    }
+
+    #[test]
+    fn test_glob_match_empty_strings() {
+        assert!(glob_match("", ""));
+        assert!(!glob_match("", "foo"));
+        assert!(glob_match("*", ""));
     }
 
     #[test]

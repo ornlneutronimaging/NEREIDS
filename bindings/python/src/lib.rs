@@ -1525,7 +1525,7 @@ fn load_tiff_stack<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyAr
 ///     3D numpy array with shape (n_frames, height, width), dtype float64.
 ///
 /// Raises:
-///     FileNotFoundError: If no files match the pattern.
+///     FileNotFoundError: If the folder does not exist or no files match.
 ///     NotADirectoryError: If the provided path is not a directory.
 ///     ValueError: If matched frames have inconsistent dimensions.
 ///     IOError: For TIFF decoding errors or other I/O failures.
