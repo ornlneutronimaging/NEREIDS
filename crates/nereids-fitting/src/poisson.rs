@@ -276,6 +276,16 @@ pub fn poisson_fit_analytic(
         density_indices.len(),
         cross_sections.len(),
     );
+    for (k, sigma) in cross_sections.iter().enumerate() {
+        assert_eq!(
+            sigma.len(),
+            n_e,
+            "cross_sections[{}] length ({}) must match energy grid length ({})",
+            k,
+            sigma.len(),
+            n_e,
+        );
+    }
 
     let y_model = model.evaluate(&params.all_values());
     let mut nll = poisson_nll(y_obs, &y_model);

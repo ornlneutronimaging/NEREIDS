@@ -120,7 +120,15 @@ pub fn estimate_nuisance(
     let width = open_beam_counts.shape()[2];
 
     // Average open-beam over ROI to get flux estimate
-    let (y_range, x_range) = roi.unwrap_or((0..height, 0..width));
+    let (y_range, x_range) = match roi {
+        Some((y_r, x_r)) => {
+            if y_r.start >= height || y_r.end > height || x_r.start >= width || x_r.end > width {
+                return Err("ROI is out of bounds of the open-beam data".into());
+            }
+            (y_r, x_r)
+        }
+        None => (0..height, 0..width),
+    };
 
     let mut flux = vec![0.0f64; n_energies];
     let mut background = vec![0.0f64; n_energies];
