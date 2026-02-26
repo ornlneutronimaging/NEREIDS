@@ -293,6 +293,7 @@ mod tests {
             temperature_k: 0.0,
             instrument: None,
             density_indices: vec![0],
+            temperature_index: None,
         };
         let spectrum = model.evaluate(&[true_density]);
 
@@ -355,6 +356,7 @@ mod tests {
             temperature_k: 0.0,
             instrument: None,
             density_indices: vec![0],
+            temperature_index: None,
         };
         let spectrum = model.evaluate(&[0.0005]);
 
@@ -405,6 +407,7 @@ mod tests {
             temperature_k: 0.0,
             instrument: None,
             density_indices: vec![0],
+            temperature_index: None,
         };
         let spectrum = model.evaluate(&[true_density]);
 

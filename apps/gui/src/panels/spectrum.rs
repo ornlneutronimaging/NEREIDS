@@ -104,6 +104,7 @@ pub fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
             temperature_k: state.temperature_k,
             instrument: None,
             density_indices: (0..result.densities.len()).collect(),
+            temperature_index: None,
         };
 
         use nereids_fitting::lm::FitModel;

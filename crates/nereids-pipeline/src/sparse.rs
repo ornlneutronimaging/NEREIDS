@@ -432,6 +432,7 @@ mod tests {
             temperature_k: 0.0,
             instrument: None,
             density_indices: vec![0],
+            temperature_index: None,
         };
         let transmission = t_model.evaluate(&[true_density]);
 

@@ -160,6 +160,10 @@ struct PyFitResult {
     reduced_chi_squared: f64,
     converged: bool,
     iterations: usize,
+    /// Fitted temperature in Kelvin (only meaningful when `fit_temperature=True`).
+    temperature_k: Option<f64>,
+    /// 1-sigma uncertainty on fitted temperature (K).
+    temperature_k_unc: Option<f64>,
 }
 
 #[pymethods]
@@ -194,11 +198,31 @@ impl PyFitResult {
         self.iterations
     }
 
+    /// Fitted sample temperature in Kelvin (``None`` when ``fit_temperature=False``).
+    #[getter]
+    fn temperature_k(&self) -> Option<f64> {
+        self.temperature_k
+    }
+
+    /// 1-sigma uncertainty on fitted temperature in Kelvin (``None`` when
+    /// ``fit_temperature=False``).
+    #[getter]
+    fn temperature_k_unc(&self) -> Option<f64> {
+        self.temperature_k_unc
+    }
+
     fn __repr__(&self) -> String {
-        format!(
-            "FitResult(converged={}, chi2_red={:.4}, densities={:?})",
-            self.converged, self.reduced_chi_squared, self.densities
-        )
+        if let Some(t) = self.temperature_k {
+            format!(
+                "FitResult(converged={}, chi2_red={:.4}, densities={:?}, temperature_k={:.1})",
+                self.converged, self.reduced_chi_squared, self.densities, t
+            )
+        } else {
+            format!(
+                "FitResult(converged={}, chi2_red={:.4}, densities={:?})",
+                self.converged, self.reduced_chi_squared, self.densities
+            )
+        }
     }
 }
 
@@ -503,6 +527,10 @@ fn forward_model<'py>(
 ///     energies: Energy grid in eV (1D numpy array).
 ///     isotopes: List of ResonanceData objects.
 ///     temperature_k: Sample temperature in Kelvin (default 0.0).
+///     fit_temperature: If ``True``, treat ``temperature_k`` as the initial
+///         guess and include it as a free parameter in the LM fit.
+///         The fitted value and 1-sigma uncertainty are returned in
+///         ``result.temperature_k`` and ``result.temperature_k_unc``.
 ///     initial_densities: Initial guess for areal densities (optional).
 ///     max_iter: Maximum LM iterations (default 100).
 ///     flight_path_m: Flight path in meters for Gaussian resolution (optional).
@@ -513,13 +541,14 @@ fn forward_model<'py>(
 /// Returns:
 ///     FitResult with densities, uncertainties, and fit quality.
 #[pyfunction]
-#[pyo3(signature = (measured_t, sigma, energies, isotopes, temperature_k=0.0, initial_densities=None, max_iter=100, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None))]
+#[pyo3(signature = (measured_t, sigma, energies, isotopes, temperature_k=0.0, fit_temperature=false, initial_densities=None, max_iter=100, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None))]
 fn fit_spectrum(
     measured_t: PyReadonlyArray1<f64>,
     sigma: PyReadonlyArray1<f64>,
     energies: PyReadonlyArray1<f64>,
     isotopes: Vec<PyResonanceData>,
     temperature_k: f64,
+    fit_temperature: bool,
     initial_densities: Option<Vec<f64>>,
     max_iter: usize,
     flight_path_m: Option<f64>,
@@ -572,20 +601,40 @@ fn fit_spectrum(
     let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution)?;
     let instrument = res_fn.map(|r| Arc::new(InstrumentParams { resolution: r }));
 
+    // When fitting temperature, append it as an extra parameter after the
+    // density parameters.  temperature_index points to params[n_isotopes].
+    let temperature_index = if fit_temperature {
+        Some(n_isotopes)
+    } else {
+        None
+    };
+
     let model = TransmissionFitModel {
         energies: e.to_vec(),
         resonance_data: res_data,
         temperature_k,
         instrument,
         density_indices: (0..n_isotopes).collect(),
+        temperature_index,
     };
 
-    let mut params = ParameterSet::new(
-        init.iter()
-            .enumerate()
-            .map(|(i, &d)| FitParameter::non_negative(format!("isotope_{}", i), d))
-            .collect(),
-    );
+    let mut param_vec: Vec<FitParameter> = init
+        .iter()
+        .enumerate()
+        .map(|(i, &d)| FitParameter::non_negative(format!("isotope_{}", i), d))
+        .collect();
+
+    if fit_temperature {
+        param_vec.push(FitParameter {
+            name: "temperature_k".into(),
+            value: temperature_k,
+            lower: 0.0,
+            upper: f64::INFINITY,
+            fixed: false,
+        });
+    }
+
+    let mut params = ParameterSet::new(param_vec);
 
     let config = LmConfig {
         max_iter,
@@ -595,9 +644,23 @@ fn fit_spectrum(
     let result = lm::levenberg_marquardt(&model, t, s, &mut params, &config);
 
     let densities: Vec<f64> = (0..n_isotopes).map(|i| result.params[i]).collect();
-    let uncertainties = result
+    let unc = result
         .uncertainties
-        .unwrap_or_else(|| vec![f64::NAN; n_isotopes]);
+        .unwrap_or_else(|| vec![f64::NAN; n_isotopes + if fit_temperature { 1 } else { 0 }]);
+    let uncertainties: Vec<f64> = unc[..n_isotopes].to_vec();
+
+    let (fitted_temperature, fitted_temperature_unc) = if fit_temperature {
+        (
+            Some(result.params[n_isotopes]),
+            Some(if unc.len() > n_isotopes {
+                unc[n_isotopes]
+            } else {
+                f64::NAN
+            }),
+        )
+    } else {
+        (None, None)
+    };
 
     Ok(PyFitResult {
         densities,
@@ -605,6 +668,8 @@ fn fit_spectrum(
         reduced_chi_squared: result.reduced_chi_squared,
         converged: result.converged,
         iterations: result.iterations,
+        temperature_k: fitted_temperature,
+        temperature_k_unc: fitted_temperature_unc,
     })
 }
 
@@ -1488,6 +1553,8 @@ fn py_fit_roi(
         reduced_chi_squared: result.reduced_chi_squared,
         converged: result.converged,
         iterations: result.iterations,
+        temperature_k: None,
+        temperature_k_unc: None,
     })
 }
 

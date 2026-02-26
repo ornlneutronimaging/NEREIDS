@@ -139,6 +139,7 @@ pub fn fit_spectrum(measured_t: &[f64], sigma: &[f64], config: &FitConfig) -> Sp
             temperature_k: config.temperature_k,
             instrument,
             density_indices: (0..n_isotopes).collect(),
+            temperature_index: None,
         };
         lm::levenberg_marquardt(&model, measured_t, sigma, &mut params, &config.lm_config)
     };
@@ -209,6 +210,7 @@ mod tests {
             temperature_k: 0.0,
             instrument: None,
             density_indices: vec![0],
+            temperature_index: None,
         };
         let y_obs = model.evaluate(&[true_density]);
         let sigma = vec![0.01; y_obs.len()];
