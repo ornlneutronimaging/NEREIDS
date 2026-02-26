@@ -138,7 +138,9 @@ pub struct TransmissionFitModel {
 
 impl FitModel for TransmissionFitModel {
     fn evaluate(&self, params: &[f64]) -> Vec<f64> {
-        debug_assert!(
+        // Configuration check — not in a hot loop, so use assert! to catch
+        // parameter setup errors in release builds too.
+        assert!(
             self.temperature_index
                 .is_none_or(|ti| !self.density_indices.contains(&ti)),
             "temperature_index must not overlap with density_indices"
@@ -541,15 +543,16 @@ mod tests {
         let fit_density = result.params[0];
         let fit_temp = result.params[1];
 
+        // Noise-free synthetic data: optimizer should converge to within 0.1%.
         assert!(
-            (fit_density - true_density).abs() / true_density < 0.05,
+            (fit_density - true_density).abs() / true_density < 0.001,
             "Density: fitted={}, true={}, error={:.1}%",
             fit_density,
             true_density,
             (fit_density - true_density).abs() / true_density * 100.0,
         );
         assert!(
-            (fit_temp - true_temp).abs() / true_temp < 0.05,
+            (fit_temp - true_temp).abs() / true_temp < 0.001,
             "Temperature: fitted={:.1} K, true={:.1} K, error={:.1}%",
             fit_temp,
             true_temp,

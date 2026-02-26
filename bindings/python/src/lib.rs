@@ -598,9 +598,9 @@ fn fit_spectrum(
         )));
     }
 
-    if temperature_k < 0.0 {
+    if !temperature_k.is_finite() || temperature_k < 0.0 {
         return Err(pyo3::exceptions::PyValueError::new_err(
-            "temperature_k must be non-negative",
+            "temperature_k must be finite and non-negative",
         ));
     }
     if fit_temperature && temperature_k < 1.0 {
@@ -671,16 +671,20 @@ fn fit_spectrum(
     let unc = result
         .uncertainties
         .unwrap_or_else(|| vec![f64::NAN; n_total_params]);
-    let uncertainties: Vec<f64> = unc[..n_isotopes].to_vec();
+    assert!(
+        unc.len() >= n_total_params,
+        "uncertainty vector length ({}) should be >= parameter count ({})",
+        unc.len(),
+        n_total_params
+    );
+    let uncertainties: Vec<f64> = (0..n_isotopes)
+        .map(|i| unc.get(i).copied().unwrap_or(f64::NAN))
+        .collect();
 
     let (fitted_temperature, fitted_temperature_unc) = if fit_temperature {
         (
             Some(result.params[n_isotopes]),
-            Some(if unc.len() > n_isotopes {
-                unc[n_isotopes]
-            } else {
-                f64::NAN
-            }),
+            Some(unc.get(n_isotopes).copied().unwrap_or(f64::NAN)),
         )
     } else {
         (None, None)
@@ -1448,13 +1452,20 @@ fn py_spatial_map(
 ///     x_range: (start, end) column range for the ROI.
 ///     energies: 1D numpy array of energy values in eV.
 ///     isotopes: List of ResonanceData objects.
-///     temperature_k: Sample temperature in Kelvin (default 300.0).
+///     temperature_k: Sample temperature in Kelvin (default 300.0, fixed).
 ///     initial_densities: Initial guesses for areal densities (optional).
 ///     flight_path_m: Flight path for Gaussian resolution (optional).
 ///     delta_t_us: Timing uncertainty for Gaussian resolution (optional).
 ///     delta_l_m: Path length uncertainty for Gaussian resolution (optional).
 ///     resolution: TabulatedResolution for tabulated broadening (optional).
 ///     max_iter: Maximum LM iterations (default 100).
+///
+/// Note:
+///     Temperature fitting (``fit_temperature``) is only available via
+///     ``fit_spectrum()``.  ``fit_roi()`` always treats temperature as fixed
+///     because the ROI-averaged spectrum already has high statistics,
+///     making a separate ``fit_spectrum()`` call with ``fit_temperature=True``
+///     the preferred workflow.
 ///
 /// Returns:
 ///     FitResult with densities, uncertainties, and fit quality.
