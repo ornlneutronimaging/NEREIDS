@@ -138,6 +138,12 @@ pub struct TransmissionFitModel {
 
 impl FitModel for TransmissionFitModel {
     fn evaluate(&self, params: &[f64]) -> Vec<f64> {
+        debug_assert!(
+            self.temperature_index
+                .is_none_or(|ti| !self.density_indices.contains(&ti)),
+            "temperature_index must not overlap with density_indices"
+        );
+
         let isotopes: Vec<(ResonanceData, f64)> = self
             .resonance_data
             .iter()

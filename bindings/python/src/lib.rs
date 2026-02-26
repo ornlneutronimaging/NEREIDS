@@ -598,6 +598,18 @@ fn fit_spectrum(
         )));
     }
 
+    if temperature_k < 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "temperature_k must be non-negative",
+        ));
+    }
+    if fit_temperature && temperature_k <= 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "temperature_k must be positive when fit_temperature=True \
+             (it is used as the initial guess for the optimizer)",
+        ));
+    }
+
     let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution)?;
     let instrument = res_fn.map(|r| Arc::new(InstrumentParams { resolution: r }));
 
@@ -625,10 +637,13 @@ fn fit_spectrum(
         .collect();
 
     if fit_temperature {
+        // Lower bound of 1 K keeps the optimizer in the physically meaningful
+        // regime where Doppler broadening is always active, avoiding the
+        // model discontinuity at T=0.
         param_vec.push(FitParameter {
             name: "temperature_k".into(),
             value: temperature_k,
-            lower: 0.0,
+            lower: 1.0,
             upper: f64::INFINITY,
             fixed: false,
         });
@@ -643,10 +658,19 @@ fn fit_spectrum(
 
     let result = lm::levenberg_marquardt(&model, t, s, &mut params, &config);
 
+    // All density + temperature parameters are free, so n_free == n_params
+    // and the uncertainty vector is indexed identically to result.params.
+    let n_total_params = n_isotopes + if fit_temperature { 1 } else { 0 };
+    debug_assert_eq!(
+        params.n_free(),
+        n_total_params,
+        "all fit parameters should be free"
+    );
+
     let densities: Vec<f64> = (0..n_isotopes).map(|i| result.params[i]).collect();
     let unc = result
         .uncertainties
-        .unwrap_or_else(|| vec![f64::NAN; n_isotopes + if fit_temperature { 1 } else { 0 }]);
+        .unwrap_or_else(|| vec![f64::NAN; n_total_params]);
     let uncertainties: Vec<f64> = unc[..n_isotopes].to_vec();
 
     let (fitted_temperature, fitted_temperature_unc) = if fit_temperature {
