@@ -40,6 +40,7 @@ use nereids_endf::resonance::{
 use nereids_endf::retrieval::{EndfLibrary, EndfRetriever, mat_number};
 use nereids_fitting::lm::{self, LmConfig};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
+use nereids_fitting::poisson::PoissonConfig;
 use nereids_fitting::transmission_model::TransmissionFitModel;
 use nereids_io::normalization::{self as norm, NormalizationParams};
 use nereids_io::tof::BeamlineParams;
@@ -49,6 +50,7 @@ use nereids_physics::resolution::{
 };
 use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
 use nereids_pipeline::pipeline::FitConfig;
+use nereids_pipeline::sparse::{SparseConfig, estimate_nuisance, sparse_reconstruct};
 
 /// Python wrapper for ENDF resonance data.
 #[pyclass(name = "ResonanceData", from_py_object)]
@@ -323,6 +325,75 @@ impl PySpatialResult {
     fn __repr__(&self) -> String {
         format!(
             "SpatialResult(shape={}x{}, isotopes={}, converged={}/{})",
+            self.shape.0,
+            self.shape.1,
+            self.isotope_names.len(),
+            self.n_converged,
+            self.n_total,
+        )
+    }
+}
+
+/// Python wrapper for sparse (Poisson/KL) reconstruction results.
+///
+/// Returned by `spatial_map(..., fitter='poisson')`.
+/// Uses raw count data and open-beam for statistically optimal fitting
+/// at all count levels including very low statistics (< ~10 counts/bin).
+#[pyclass(name = "SparseResult")]
+struct PySparseResult {
+    density_maps: Vec<Py<PyArray2<f64>>>,
+    nll_map: Py<PyArray2<f64>>,
+    converged_map: Py<PyArray2<bool>>,
+    n_converged: usize,
+    n_total: usize,
+    isotope_names: Vec<String>,
+    shape: (usize, usize),
+}
+
+#[pymethods]
+impl PySparseResult {
+    /// Density maps as a list of 2D numpy arrays, one per isotope.
+    #[getter]
+    fn density_maps<'py>(&self, py: Python<'py>) -> Vec<Bound<'py, PyArray2<f64>>> {
+        self.density_maps
+            .iter()
+            .map(|m| m.bind(py).clone())
+            .collect()
+    }
+
+    /// Poisson negative log-likelihood map (analogous to chi_squared_map for LM).
+    #[getter]
+    fn nll_map<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
+        self.nll_map.bind(py).clone()
+    }
+
+    /// Convergence map (True = converged).
+    #[getter]
+    fn converged_map<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<bool>> {
+        self.converged_map.bind(py).clone()
+    }
+
+    /// Number of converged pixels.
+    #[getter]
+    fn n_converged(&self) -> usize {
+        self.n_converged
+    }
+
+    /// Total number of fitted pixels.
+    #[getter]
+    fn n_total(&self) -> usize {
+        self.n_total
+    }
+
+    /// Isotope names.
+    #[getter]
+    fn isotope_names(&self) -> Vec<String> {
+        self.isotope_names.clone()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "SparseResult(shape={}x{}, isotopes={}, converged={}/{})",
             self.shape.0,
             self.shape.1,
             self.isotope_names.len(),
@@ -1044,12 +1115,16 @@ fn py_apply_resolution<'py>(
 
 /// Run per-pixel fitting across a transmission image stack.
 ///
-/// Each pixel's transmission spectrum is fitted independently (in parallel
-/// via rayon) to recover areal densities for all specified isotopes.
+/// Routes to either the Levenberg-Marquardt (LM/χ²) fitter or the
+/// Poisson/KL sparse fitter depending on the `fitter` argument.
 ///
 /// Args:
-///     transmission: 3D numpy array (n_energies, height, width).
-///     uncertainty: 3D numpy array (n_energies, height, width).
+///     transmission: 3D array (n_energies, height, width).
+///         - fitter='lm':      normalised transmission T ∈ [0,1].
+///         - fitter='poisson': raw sample counts (integer-valued floats).
+///     uncertainty: 3D array (n_energies, height, width).
+///         - fitter='lm':      per-bin transmission uncertainty σ.
+///         - fitter='poisson': raw open-beam counts (same shape as sample).
 ///     energies: 1D numpy array of energy values in eV.
 ///     isotopes: List of ResonanceData objects.
 ///     temperature_k: Sample temperature in Kelvin (default 300.0).
@@ -1060,11 +1135,14 @@ fn py_apply_resolution<'py>(
 ///     delta_l_m: Path length uncertainty for Gaussian resolution (optional).
 ///     resolution: TabulatedResolution for tabulated broadening (optional).
 ///     max_iter: Maximum LM iterations per pixel (default 100).
+///     fitter: 'lm' (default) for Gaussian χ² or 'poisson' for Poisson NLL.
+///     roi: [y0, y1, x0, x1] region for Stage-1 nuisance estimation
+///         (Poisson path only, default uses full image).
 ///
 /// Returns:
-///     SpatialResult with density maps, uncertainty maps, and diagnostics.
+///     SpatialResult (fitter='lm') or SparseResult (fitter='poisson').
 #[pyfunction]
-#[pyo3(name = "spatial_map", signature = (transmission, uncertainty, energies, isotopes, temperature_k=300.0, initial_densities=None, dead_pixels=None, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, max_iter=100))]
+#[pyo3(name = "spatial_map", signature = (transmission, uncertainty, energies, isotopes, temperature_k=300.0, initial_densities=None, dead_pixels=None, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, max_iter=100, fitter="lm", roi=None))]
 fn py_spatial_map(
     py: Python<'_>,
     transmission: PyReadonlyArray3<f64>,
@@ -1079,7 +1157,9 @@ fn py_spatial_map(
     delta_l_m: Option<f64>,
     resolution: Option<PyTabulatedResolution>,
     max_iter: usize,
-) -> PyResult<PySpatialResult> {
+    fitter: &str,
+    roi: Option<[usize; 4]>,
+) -> PyResult<Py<PyAny>> {
     let e = energies.as_slice()?;
 
     if e.is_empty() {
@@ -1141,49 +1221,100 @@ fn py_spatial_map(
 
     let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution)?;
 
-    let config = FitConfig {
-        energies: e.to_vec(),
-        resonance_data: res_data,
-        isotope_names: isotope_names.clone(),
-        temperature_k,
-        resolution: res_fn,
-        initial_densities: init,
-        lm_config: LmConfig {
-            max_iter,
-            ..LmConfig::default()
-        },
-        precomputed_cross_sections: None,
-    };
+    match fitter {
+        "lm" => {
+            let config = FitConfig {
+                energies: e.to_vec(),
+                resonance_data: res_data,
+                isotope_names: isotope_names.clone(),
+                temperature_k,
+                resolution: res_fn,
+                initial_densities: init,
+                lm_config: LmConfig {
+                    max_iter,
+                    ..LmConfig::default()
+                },
+                precomputed_cross_sections: None,
+            };
 
-    // Clone arrays only after all validation passes
-    let trans = transmission.as_array().to_owned();
-    let unc = uncertainty.as_array().to_owned();
-    let dead = dead_pixels.map(|d| d.as_array().to_owned());
+            // Clone arrays only after all validation passes
+            let trans = transmission.as_array().to_owned();
+            let unc = uncertainty.as_array().to_owned();
+            let dead = dead_pixels.map(|d| d.as_array().to_owned());
 
-    let result = nereids_pipeline::spatial::spatial_map(&trans, &unc, &config, dead.as_ref(), None);
+            let result =
+                nereids_pipeline::spatial::spatial_map(&trans, &unc, &config, dead.as_ref(), None);
 
-    let shape = (
-        result.converged_map.shape()[0],
-        result.converged_map.shape()[1],
-    );
-    Ok(PySpatialResult {
-        density_maps: result
-            .density_maps
-            .into_iter()
-            .map(|m| PyArray2::from_owned_array(py, m).unbind())
-            .collect(),
-        uncertainty_maps: result
-            .uncertainty_maps
-            .into_iter()
-            .map(|m| PyArray2::from_owned_array(py, m).unbind())
-            .collect(),
-        chi_squared_map: PyArray2::from_owned_array(py, result.chi_squared_map).unbind(),
-        converged_map: PyArray2::from_owned_array(py, result.converged_map).unbind(),
-        n_converged: result.n_converged,
-        n_total: result.n_total,
-        isotope_names,
-        shape,
-    })
+            let shape = (
+                result.converged_map.shape()[0],
+                result.converged_map.shape()[1],
+            );
+            let py_result = PySpatialResult {
+                density_maps: result
+                    .density_maps
+                    .into_iter()
+                    .map(|m| PyArray2::from_owned_array(py, m).unbind())
+                    .collect(),
+                uncertainty_maps: result
+                    .uncertainty_maps
+                    .into_iter()
+                    .map(|m| PyArray2::from_owned_array(py, m).unbind())
+                    .collect(),
+                chi_squared_map: PyArray2::from_owned_array(py, result.chi_squared_map).unbind(),
+                converged_map: PyArray2::from_owned_array(py, result.converged_map).unbind(),
+                n_converged: result.n_converged,
+                n_total: result.n_total,
+                isotope_names,
+                shape,
+            };
+            Py::new(py, py_result).map(|p| p.into_any())
+        }
+
+        "poisson" => {
+            // Stage 1: estimate flux + background from open-beam (second arg).
+            let sample = transmission.as_array().to_owned();
+            let open_beam = uncertainty.as_array().to_owned();
+            let dead = dead_pixels.map(|d| d.as_array().to_owned());
+
+            let roi_ranges = roi.map(|r| (r[0]..r[1], r[2]..r[3]));
+            let nuisance = estimate_nuisance(&sample, &open_beam, roi_ranges);
+
+            let sparse_config = SparseConfig {
+                energies: e.to_vec(),
+                resonance_data: res_data,
+                isotope_names: isotope_names.clone(),
+                temperature_k,
+                resolution: res_fn,
+                initial_densities: init,
+                poisson_config: PoissonConfig::default(),
+            };
+
+            // Stage 2: per-pixel Poisson NLL fitting.
+            let result =
+                sparse_reconstruct(&sample, &nuisance, &sparse_config, dead.as_ref(), None);
+
+            let shape = (result.nll_map.shape()[0], result.nll_map.shape()[1]);
+            let py_result = PySparseResult {
+                density_maps: result
+                    .density_maps
+                    .into_iter()
+                    .map(|m| PyArray2::from_owned_array(py, m).unbind())
+                    .collect(),
+                nll_map: PyArray2::from_owned_array(py, result.nll_map).unbind(),
+                converged_map: PyArray2::from_owned_array(py, result.converged_map).unbind(),
+                n_converged: result.n_converged,
+                n_total: result.n_total,
+                isotope_names,
+                shape,
+            };
+            Py::new(py, py_result).map(|p| p.into_any())
+        }
+
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "fitter must be 'lm' or 'poisson', got '{}'",
+            other,
+        ))),
+    }
 }
 
 /// Fit a single spectrum averaged over a region of interest.
@@ -1522,6 +1653,7 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyFitResult>()?;
     m.add_class::<PyTabulatedResolution>()?;
     m.add_class::<PySpatialResult>()?;
+    m.add_class::<PySparseResult>()?;
     m.add_function(wrap_pyfunction!(cross_sections, m)?)?;
     m.add_function(wrap_pyfunction!(forward_model, m)?)?;
     m.add_function(wrap_pyfunction!(fit_spectrum, m)?)?;

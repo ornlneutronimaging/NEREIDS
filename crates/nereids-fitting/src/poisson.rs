@@ -158,12 +158,19 @@ pub fn poisson_fit(
             break;
         }
 
-        // Backtracking line search with projected gradient
+        // Backtracking line search with projected gradient.
+        //
+        // Scale the initial step by the gradient norm so that the first trial
+        // moves parameters by approximately `step_size` regardless of how large
+        // the gradient is.  Without this normalisation, high-count Poisson data
+        // produces a large gradient (∝ √I₀), the fixed alpha=step_size initial
+        // step wildly overshoots, and 30 backtracking halvings are not enough to
+        // recover—causing the line search to fail even far from the optimum.
         let old_free = params.free_values();
-        let mut alpha = config.step_size;
+        let mut alpha = config.step_size / grad_norm.max(1.0);
         let mut accepted = false;
 
-        for _ in 0..30 {
+        for _ in 0..50 {
             // Trial step: x_new = project(x - α·∇f)
             let trial_free: Vec<f64> = old_free
                 .iter()
@@ -185,13 +192,8 @@ pub fn poisson_fit(
                 .sum::<f64>();
 
             if trial_nll <= nll - config.armijo_c * descent {
-                let rel_change = (nll - trial_nll) / (nll.abs() + 1e-30);
                 nll = trial_nll;
                 accepted = true;
-
-                if rel_change < config.tol_nll {
-                    converged = true;
-                }
                 break;
             }
 
@@ -201,11 +203,166 @@ pub fn poisson_fit(
 
         if !accepted {
             params.set_free_values(&old_free);
-            // Cannot make progress — this is NOT convergence, it's a stall.
+            // Can't improve from this point; stop without claiming convergence.
             break;
         }
 
-        if converged {
+        // Convergence check: step size in parameter space.
+        // Using relative NLL change is unreliable for Poisson NLL — at high
+        // photon counts the NLL is large (∝ I₀·n_bins) so even a productive
+        // step has a tiny relative change.  Parameter displacement is a
+        // scale-invariant and physically meaningful stopping criterion.
+        let step_norm: f64 = old_free
+            .iter()
+            .zip(params.free_values().iter())
+            .map(|(o, n)| (o - n).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        if step_norm < config.tol_nll {
+            converged = true;
+            break;
+        }
+    }
+
+    PoissonResult {
+        nll,
+        iterations: iter,
+        converged,
+        params: params.all_values(),
+    }
+}
+
+/// Run Poisson-likelihood optimization with an analytical gradient.
+///
+/// Equivalent to [`poisson_fit`] but replaces the finite-difference gradient
+/// with the closed-form derivative of the Poisson NLL for the forward model
+///
+///   Y(E) = Φ(E) · T(n, E) + B(E),   T = exp(−Σₖ nₖ · σₖ(E))
+///
+/// Analytical gradient w.r.t. density nₖ:
+///
+///   ∂NLL/∂nₖ = Σ_E [(1 − y_obs(E)/Y(E)) · Φ(E) · T(E) · (−σₖ(E))]
+///
+/// This costs one forward evaluation per iteration (vs N_isotopes+1 for FD),
+/// which is 3–5× faster for 2–4 isotopes at typical VENUS energy grids.
+///
+/// # Arguments
+/// * `model`          — Forward model Y = Φ·T(θ) + B.
+/// * `y_obs`          — Observed counts.
+/// * `flux`           — Incident flux Φ(E) (from nuisance estimation).
+/// * `cross_sections` — Precomputed Doppler-broadened σₖ(E), one slice per isotope.
+/// * `params`         — Parameter set (modified in place).
+/// * `config`         — Optimizer configuration.
+pub fn poisson_fit_analytic(
+    model: &dyn FitModel,
+    y_obs: &[f64],
+    flux: &[f64],
+    cross_sections: &[Vec<f64>],
+    params: &mut ParameterSet,
+    config: &PoissonConfig,
+) -> PoissonResult {
+    let n_e = y_obs.len();
+    assert_eq!(flux.len(), n_e, "flux length must match y_obs");
+
+    let y_model = model.evaluate(&params.all_values());
+    let mut nll = poisson_nll(y_obs, &y_model);
+    let mut converged = false;
+    let mut iter = 0;
+
+    for _ in 0..config.max_iter {
+        iter += 1;
+
+        // Compute the current transmission T(E) = Y_model / Φ  (since B = 0 in stage 1,
+        // Y = Φ·T).  Clamp flux to avoid division by zero; very small flux means the
+        // energy bin contributes negligibly to the gradient anyway.
+        let y_model_now = model.evaluate(&params.all_values());
+        let t_now: Vec<f64> = y_model_now
+            .iter()
+            .zip(flux.iter())
+            .map(|(&y, &phi)| if phi > 1e-30 { y / phi } else { 0.0 })
+            .collect();
+
+        // Analytical gradient: ∂NLL/∂nₖ = Σ_E [(1 - y_obs/Y) · Φ · T · (-σₖ)]
+        let free_indices = params.free_indices();
+        let grad: Vec<f64> = free_indices
+            .iter()
+            .map(|&param_idx| {
+                // sum over energy bins
+                y_obs
+                    .iter()
+                    .zip(y_model_now.iter())
+                    .zip(flux.iter())
+                    .zip(t_now.iter())
+                    .enumerate()
+                    .map(|(e, (((&obs, &ym), &phi), &t))| {
+                        let ym_safe = ym.max(1e-30);
+                        let residual_factor = 1.0 - obs / ym_safe;
+                        let sigma_k = cross_sections
+                            .get(param_idx)
+                            .and_then(|xs| xs.get(e))
+                            .copied()
+                            .unwrap_or(0.0);
+                        residual_factor * phi * t * (-sigma_k)
+                    })
+                    .sum::<f64>()
+            })
+            .collect();
+
+        // Check gradient norm for convergence
+        let grad_norm: f64 = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
+        if grad_norm < config.tol_nll {
+            converged = true;
+            break;
+        }
+
+        // Backtracking line search — same fix as poisson_fit:
+        // scale initial alpha by gradient norm for scale invariance.
+        let old_free = params.free_values();
+        let mut alpha = config.step_size / grad_norm.max(1.0);
+        let mut accepted = false;
+
+        for _ in 0..50 {
+            let trial_free: Vec<f64> = old_free
+                .iter()
+                .zip(grad.iter())
+                .map(|(&v, &g)| v - alpha * g)
+                .collect();
+            params.set_free_values(&trial_free);
+            project(params);
+
+            let trial_model = model.evaluate(&params.all_values());
+            let trial_nll = poisson_nll(y_obs, &trial_model);
+
+            let descent = grad
+                .iter()
+                .zip(old_free.iter())
+                .zip(params.free_values().iter())
+                .map(|((&g, &old), &new)| g * (old - new))
+                .sum::<f64>();
+
+            if trial_nll <= nll - config.armijo_c * descent {
+                nll = trial_nll;
+                accepted = true;
+                break;
+            }
+
+            alpha *= config.backtrack;
+        }
+
+        if !accepted {
+            params.set_free_values(&old_free);
+            break;
+        }
+
+        // Convergence: parameter displacement (see poisson_fit for rationale).
+        let step_norm: f64 = old_free
+            .iter()
+            .zip(params.free_values().iter())
+            .map(|(o, n)| (o - n).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        if step_norm < config.tol_nll {
+            converged = true;
             break;
         }
     }

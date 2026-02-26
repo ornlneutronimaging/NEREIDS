@@ -32,9 +32,9 @@ use rayon::prelude::*;
 use nereids_endf::resonance::ResonanceData;
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
 use nereids_fitting::poisson::{self, CountsModel, PoissonConfig};
-use nereids_fitting::transmission_model::TransmissionFitModel;
+use nereids_fitting::transmission_model::PrecomputedTransmissionModel;
 use nereids_physics::resolution::ResolutionFunction;
-use nereids_physics::transmission::InstrumentParams;
+use nereids_physics::transmission::{InstrumentParams, broadened_cross_sections};
 
 /// Configuration for two-stage sparse reconstruction.
 #[derive(Debug, Clone)]
@@ -80,6 +80,8 @@ pub struct PixelResult {
 pub struct SparseResult {
     /// Density maps, one per isotope. Shape (height, width).
     pub density_maps: Vec<Array2<f64>>,
+    /// Per-pixel Poisson NLL map (analogous to chi_squared_map in SpatialResult).
+    pub nll_map: Array2<f64>,
     /// Convergence map.
     pub converged_map: Array2<bool>,
     /// Number converged.
@@ -178,12 +180,36 @@ pub fn sparse_reconstruct(
         n_energies,
     );
 
-    // Build the instrument params once, wrapped in Arc for cheap sharing
-    // across the parallel pixel loop (avoids deep-cloning tabulated kernels).
-    let instrument = config
-        .resolution
-        .clone()
-        .map(|r| Arc::new(InstrumentParams { resolution: r }));
+    // Precompute Doppler-broadened cross-sections once, outside the pixel loop.
+    // The same XS apply to every pixel (same isotopes, same temperature, same energy grid).
+    // Mirrors the pattern used in spatial.rs to avoid repeating expensive broadening work.
+    let instrument_params = config.resolution.as_ref().map(|r| InstrumentParams {
+        resolution: r.clone(),
+    });
+    let xs_raw = broadened_cross_sections(
+        &config.energies,
+        &config.resonance_data,
+        config.temperature_k,
+        instrument_params.as_ref(),
+        cancel,
+    );
+    // If cancelled during XS precomputation, return an empty result immediately.
+    let xs_raw = match xs_raw {
+        Some(v) => v,
+        None => {
+            return SparseResult {
+                density_maps: (0..n_isotopes)
+                    .map(|_| Array2::zeros((height, width)))
+                    .collect(),
+                nll_map: Array2::zeros((height, width)),
+                converged_map: Array2::from_elem((height, width), false),
+                n_converged: 0,
+                n_total: 0,
+                nuisance: nuisance.clone(),
+            };
+        }
+    };
+    let xs: Arc<Vec<Vec<f64>>> = Arc::new(xs_raw);
 
     // Collect pixel coordinates
     let mut pixel_coords: Vec<(usize, usize)> = Vec::new();
@@ -210,12 +236,9 @@ pub fn sparse_reconstruct(
                 .map(|e| sample_counts[[e, y, x]].max(0.0))
                 .collect();
 
-            // Build per-pixel transmission model
-            let t_model = TransmissionFitModel {
-                energies: config.energies.clone(),
-                resonance_data: config.resonance_data.clone(),
-                temperature_k: config.temperature_k,
-                instrument: instrument.clone(),
+            // Build per-pixel transmission model reusing precomputed XS (cheap Arc clone).
+            let t_model = PrecomputedTransmissionModel {
+                cross_sections: Arc::clone(&xs),
                 density_indices: (0..n_isotopes).collect(),
             };
 
@@ -227,7 +250,10 @@ pub fn sparse_reconstruct(
                 density_param_range: 0..n_isotopes,
             };
 
-            // Fit with Poisson likelihood
+            // Fit with Poisson likelihood using analytical gradient.
+            // Passing the precomputed cross-sections and flux enables
+            // poisson_fit_analytic to compute ∂NLL/∂nₖ in a single forward
+            // pass instead of N_isotopes+1 finite-difference evaluations.
             let mut params = ParameterSet::new(
                 config
                     .initial_densities
@@ -246,8 +272,14 @@ pub fn sparse_reconstruct(
                     .collect(),
             );
 
-            let result =
-                poisson::poisson_fit(&counts_model, &y_obs, &mut params, &config.poisson_config);
+            let result = poisson::poisson_fit_analytic(
+                &counts_model,
+                &y_obs,
+                &nuisance.flux,
+                &xs,
+                &mut params,
+                &config.poisson_config,
+            );
 
             let pixel_result = PixelResult {
                 densities: (0..n_isotopes).map(|i| result.params[i]).collect(),
@@ -263,6 +295,7 @@ pub fn sparse_reconstruct(
     let mut density_maps: Vec<Array2<f64>> = (0..n_isotopes)
         .map(|_| Array2::zeros((height, width)))
         .collect();
+    let mut nll_map = Array2::<f64>::zeros((height, width));
     let mut converged_map = Array2::from_elem((height, width), false);
     let mut n_converged = 0;
 
@@ -270,6 +303,7 @@ pub fn sparse_reconstruct(
         for (i, map) in density_maps.iter_mut().enumerate() {
             map[[*y, *x]] = result.densities[i];
         }
+        nll_map[[*y, *x]] = result.nll;
         converged_map[[*y, *x]] = result.converged;
         if result.converged {
             n_converged += 1;
@@ -278,6 +312,7 @@ pub fn sparse_reconstruct(
 
     SparseResult {
         density_maps,
+        nll_map,
         converged_map,
         n_converged,
         n_total: results.len(),
@@ -291,6 +326,7 @@ mod tests {
     use nereids_core::types::Isotope;
     use nereids_endf::resonance::{LGroup, Resonance, ResonanceFormalism, ResonanceRange};
     use nereids_fitting::lm::FitModel;
+    use nereids_fitting::transmission_model::TransmissionFitModel;
 
     fn u238_single_resonance() -> ResonanceData {
         ResonanceData {
