@@ -603,10 +603,10 @@ fn fit_spectrum(
             "temperature_k must be non-negative",
         ));
     }
-    if fit_temperature && temperature_k <= 0.0 {
+    if fit_temperature && temperature_k < 1.0 {
         return Err(pyo3::exceptions::PyValueError::new_err(
-            "temperature_k must be positive when fit_temperature=True \
-             (it is used as the initial guess for the optimizer)",
+            "temperature_k must be >= 1.0 when fit_temperature=True \
+             (it is used as the initial guess; the optimizer lower bound is 1 K)",
         ));
     }
 
