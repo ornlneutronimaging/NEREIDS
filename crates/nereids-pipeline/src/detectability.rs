@@ -212,6 +212,7 @@ mod tests {
 
     /// Fe-56 + Mn-55 in 1–50 eV: no resolved resonances → NOT detectable at 2000 ppm.
     #[test]
+    #[ignore = "requires network: downloads ENDF data from IAEA"]
     fn test_fe56_mn55_narrow_window_not_detectable() {
         let fe56 = load_endf_data(26, 56);
         let mn55 = load_endf_data(25, 55);
@@ -244,6 +245,7 @@ mod tests {
     /// Demonstrates that a narrow window can miss resonances.
     /// Compare with `test_w182_hf178_wide_detectable` below.
     #[test]
+    #[ignore = "requires network: downloads ENDF data from IAEA"]
     fn test_w182_hf178_narrow_not_detectable() {
         let w182 = load_endf_data(74, 182);
         let hf178 = load_endf_data(72, 178);
@@ -274,6 +276,7 @@ mod tests {
     /// The wider window includes the Hf-178 resonance, enabling detection that was
     /// impossible in the 1–5 eV window. This is the core VENUS use case.
     #[test]
+    #[ignore = "requires network: downloads ENDF data from IAEA"]
     fn test_w182_hf178_wide_detectable() {
         let w182 = load_endf_data(74, 182);
         let hf178 = load_endf_data(72, 178);
@@ -308,6 +311,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires network: downloads ENDF data from IAEA"]
     fn test_survey_returns_sorted_by_snr() {
         let w182 = load_endf_data(74, 182);
         let hf178 = load_endf_data(72, 178);
