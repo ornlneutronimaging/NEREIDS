@@ -25,8 +25,8 @@ pub struct PoissonConfig {
     pub fd_step: f64,
     /// Initial step size for line search.
     pub step_size: f64,
-    /// Convergence tolerance on parameter displacement (L2 norm of step).
-    /// Also used as the gradient-norm threshold in `poisson_fit_analytic`.
+    /// Convergence tolerance used for both parameter displacement (L2 norm of step)
+    /// and gradient-norm convergence checks in `poisson_fit` and `poisson_fit_analytic`.
     pub tol_param: f64,
     /// Armijo line search parameter (sufficient decrease).
     pub armijo_c: f64,

@@ -251,6 +251,7 @@ pub fn sparse_reconstruct(
         }
     };
     let xs: Arc<Vec<Vec<f64>>> = Arc::new(xs_raw);
+    let density_idx: Vec<usize> = (0..n_isotopes).collect();
 
     // Collect pixel coordinates
     let mut pixel_coords: Vec<(usize, usize)> = Vec::new();
@@ -282,7 +283,7 @@ pub fn sparse_reconstruct(
             // avoiding expensive repeated Doppler/resolution broadening.
             let t_model = PrecomputedTransmissionModel {
                 cross_sections: Arc::clone(&xs),
-                density_indices: (0..n_isotopes).collect(),
+                density_indices: density_idx.clone(),
             };
 
             // Wrap in counts model: Y = flux * T(θ) + background.

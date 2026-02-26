@@ -1,3 +1,3 @@
-# Exclude Jupyter notebooks from GitHub language statistics so that
-# the repository is correctly detected as Rust, not "Jupyter Notebook".
-*.ipynb linguist-documentation
+# Exclude Jupyter notebooks from GitHub language statistics and diff
+# views so that the repository is correctly detected as Rust.
+*.ipynb linguist-generated
