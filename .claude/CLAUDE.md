@@ -45,6 +45,83 @@ documented reason in a comment.
 - `crates/nereids-python`  — PyO3 bindings (excluded from `--workspace` clippy/test runs)
 - `apps/gui`               — egui desktop application
 
+## Multi-AI Review Pipeline (mandatory before merging PRs)
+
+Every feature branch must pass a 3-stage review before merge.  Run each
+stage, fix all findings, then proceed to the next.
+
+### Stage 1 — Self-review (Claude sub-agent)
+
+After implementation and tests pass, spawn a separate review agent:
+
+```
+Task(subagent_type="general-purpose", prompt="""
+Audit <files> for: logic bugs, panics, missing validation, physics
+correctness, API consistency with existing patterns.  Report findings
+as P1 (must fix) / P2 (should fix) with file:line references.
+""")
+```
+
+Fix all P1s and re-run until clean.
+
+### Stage 2 — Independent AI review
+
+After committing, run a **different** AI provider's CLI for an independent
+second opinion.  Use Codex (primary) or Gemini CLI (fallback).
+
+**Codex** (primary — requires OpenAI subscription):
+```bash
+# Install: npm install -g @openai/codex
+codex review --base main
+# or for uncommitted work:
+codex review --uncommitted "Focus on panics, validation gaps, edge cases"
+```
+
+**Gemini CLI** (fallback — free with Google account):
+```bash
+# Install:  brew install gemini-cli
+# Auth:     export GEMINI_API_KEY=<key from https://aistudio.google.com/apikey>
+# Extension (one-time):
+#   gemini extensions install https://github.com/gemini-cli-extensions/code-review
+
+# Non-interactive review of branch diff:
+git diff main...HEAD | gemini -p "Review this diff for a Rust neutron physics \
+library. Focus on panics, validation gaps, edge cases, numerical stability. \
+Report findings as P1 (must fix) / P2 (should fix) with file:line references."
+```
+
+Fix all P1s, re-commit, and re-run until clean.
+
+### Stage 3 — GitHub Copilot PR review
+
+After pushing the branch and creating/updating a PR, Copilot auto-reviews:
+
+```bash
+# Fetch review comments:
+gh api repos/{owner}/{repo}/pulls/{pr}/comments \
+  --jq '.[] | {path, line, body, created_at}'
+```
+
+Address all actionable comments, push fixes, and re-fetch until clean.
+Dismiss comments that are: rehashing already-addressed issues, debating
+design choices with no clear improvement, or flagging edge cases that
+cannot occur in practice.
+
+### Review stage summary
+
+| Stage | Tool | When | Strength |
+|-------|------|------|----------|
+| 1 | Claude sub-agent | Before commit | Architecture, physics, design |
+| 2 | `codex review` or `gemini -p` | After commit | Fresh eyes, panic/edge-case detection |
+| 3 | Copilot (via `gh api`) | After push to PR | Diff-focused, code-centric |
+
+## Git Workflow
+
+- **Upstream**: `ornlneutronimaging/NEREIDS` — issues, releases, main branch
+- **Fork**: `KedoKudo/NEREIDS` — development branches, PRs
+- **Sync**: after merging a PR on the fork, push main to upstream:
+  `git push upstream main`
+
 ## Reference Codebases (siblings of this repo)
 
 - `../SAMMY`    — physics reference (resonance formalism, SAMMY source)
