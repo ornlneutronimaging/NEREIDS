@@ -64,20 +64,33 @@ as P1 (must fix) / P2 (should fix) with file:line references.
 
 Fix all P1s and re-run until clean.
 
-### Stage 2 — Codex independent review
+### Stage 2 — Independent AI review
 
-After committing, run the Codex CLI for an independent second opinion:
+After committing, run a **different** AI provider's CLI for an independent
+second opinion.  Use Codex (primary) or Gemini CLI (fallback).
 
+**Codex** (primary — requires OpenAI subscription):
 ```bash
-# Review uncommitted changes (before commit):
-codex review --uncommitted "Focus on panics, validation gaps, edge cases, numerical stability"
-
-# Review a branch against main (after commit):
+# Install: npm install -g @openai/codex
 codex review --base main
+# or for uncommitted work:
+codex review --uncommitted "Focus on panics, validation gaps, edge cases"
 ```
 
-Codex outputs `[P1]`/`[P2]` findings with file:line references.  Fix all
-P1s, re-commit, and re-run until clean.
+**Gemini CLI** (fallback — free with Google account):
+```bash
+# Install:  brew install gemini-cli
+# Auth:     export GEMINI_API_KEY=<key from https://aistudio.google.com/apikey>
+# Extension (one-time):
+#   gemini extensions install https://github.com/gemini-cli-extensions/code-review
+
+# Non-interactive review of branch diff:
+git diff main...HEAD | gemini -p "Review this diff for a Rust neutron physics \
+library. Focus on panics, validation gaps, edge cases, numerical stability. \
+Report findings as P1 (must fix) / P2 (should fix) with file:line references."
+```
+
+Fix all P1s, re-commit, and re-run until clean.
 
 ### Stage 3 — GitHub Copilot PR review
 
@@ -99,7 +112,7 @@ cannot occur in practice.
 | Stage | Tool | When | Strength |
 |-------|------|------|----------|
 | 1 | Claude sub-agent | Before commit | Architecture, physics, design |
-| 2 | `codex review` | After commit | Fresh eyes, panic/edge-case detection |
+| 2 | `codex review` or `gemini -p` | After commit | Fresh eyes, panic/edge-case detection |
 | 3 | Copilot (via `gh api`) | After push to PR | Diff-focused, code-centric |
 
 ## Git Workflow
