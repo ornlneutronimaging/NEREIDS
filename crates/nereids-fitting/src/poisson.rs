@@ -308,6 +308,22 @@ pub fn poisson_fit_analytic(
         );
     }
 
+    // Precompute param_idx → list of isotope indices once, outside the
+    // iteration loop.  free_indices and density_indices are invariant
+    // during optimization, so this avoids repeated allocations per step.
+    let free_indices = params.free_indices();
+    let param_isotopes: Vec<Vec<usize>> = free_indices
+        .iter()
+        .map(|&pi| {
+            density_indices
+                .iter()
+                .enumerate()
+                .filter(|&(_, &di)| di == pi)
+                .map(|(k, _)| k)
+                .collect()
+        })
+        .collect();
+
     let y_model = model.evaluate(&params.all_values());
     let mut nll = poisson_nll(y_obs, &y_model);
     let mut converged = false;
@@ -349,21 +365,6 @@ pub fn poisson_fit_analytic(
         // Derivation:  Y = Φ·T + B,  T = exp(−Σ nₖ σₖ)
         //   ∂Y/∂nₖ = Φ · ∂T/∂nₖ = −Φ · σₖ · T
         //   ∂NLL/∂nₖ = Σ_E (1 − y_obs/Y) · ∂Y/∂nₖ
-        let free_indices = params.free_indices();
-
-        // Precompute param_idx → list of isotope indices so the inner energy
-        // loop is O(n_free × n_energy) instead of O(n_free × n_energy × n_isotopes).
-        let param_isotopes: Vec<Vec<usize>> = free_indices
-            .iter()
-            .map(|&pi| {
-                density_indices
-                    .iter()
-                    .enumerate()
-                    .filter(|&(_, &di)| di == pi)
-                    .map(|(k, _)| k)
-                    .collect()
-            })
-            .collect();
 
         let grad: Vec<f64> = param_isotopes
             .iter()
@@ -464,9 +465,9 @@ pub struct CountsModel<'a> {
     /// Underlying transmission model.
     pub transmission_model: &'a dyn FitModel,
     /// Incident flux (counts per bin in open beam, after normalization).
-    pub flux: Vec<f64>,
+    pub flux: &'a [f64],
     /// Background counts per bin.
-    pub background: Vec<f64>,
+    pub background: &'a [f64],
     /// Indices into the full parameter vector for density parameters.
     /// Other parameters in the full vector are nuisance params.
     pub density_param_range: std::ops::Range<usize>,
@@ -624,10 +625,12 @@ mod tests {
         }
 
         let t_model = ConstTransmission;
+        let flux = [100.0, 200.0, 300.0];
+        let background = [5.0, 10.0, 15.0];
         let counts_model = CountsModel {
             transmission_model: &t_model,
-            flux: vec![100.0, 200.0, 300.0],
-            background: vec![5.0, 10.0, 15.0],
+            flux: &flux,
+            background: &background,
             density_param_range: 0..1,
         };
 
@@ -819,8 +822,8 @@ mod tests {
         };
         let counts_model = CountsModel {
             transmission_model: &t_model,
-            flux: flux.clone(),
-            background: background.clone(),
+            flux: &flux,
+            background: &background,
             density_param_range: 0..1,
         };
 

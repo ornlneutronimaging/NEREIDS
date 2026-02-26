@@ -94,8 +94,9 @@ pub struct SparseResult {
 
 /// Stage 1: Estimate nuisance parameters from region-averaged data.
 ///
-/// Uses the open-beam counts directly as the flux estimate, and
-/// estimates background from high-energy tails where transmission → 1.
+/// Averages open-beam counts over the ROI (excluding dead pixels) to
+/// produce a per-energy-bin flux estimate.  Background is currently set
+/// to zero; a future version may fit it from a sample-free region.
 ///
 /// # Arguments
 /// * `sample_counts` — Raw sample counts (n_energies, height, width).
@@ -284,11 +285,12 @@ pub fn sparse_reconstruct(
                 density_indices: (0..n_isotopes).collect(),
             };
 
-            // Wrap in counts model: Y = flux * T(θ) + background
+            // Wrap in counts model: Y = flux * T(θ) + background.
+            // flux/background are borrowed (zero-copy) — no per-pixel allocation.
             let counts_model = CountsModel {
                 transmission_model: &t_model,
-                flux: nuisance.flux.clone(),
-                background: nuisance.background.clone(),
+                flux: &nuisance.flux,
+                background: &nuisance.background,
                 density_param_range: 0..n_isotopes,
             };
 

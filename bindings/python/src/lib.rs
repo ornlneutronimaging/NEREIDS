@@ -1226,7 +1226,7 @@ fn py_spatial_map(
         "lm" => {
             if roi.is_some() {
                 return Err(pyo3::exceptions::PyValueError::new_err(
-                    "roi is only used with fitter='poisson'; it is ignored for fitter='lm'",
+                    "roi is only supported with fitter='poisson', not fitter='lm'",
                 ));
             }
             let config = FitConfig {
