@@ -163,6 +163,128 @@ pub fn load_tiff_directory(dir: &Path) -> Result<Array3<f64>, IoError> {
         .map_err(|e| IoError::TiffDecode(format!("Shape error: {}", e)))
 }
 
+/// Load a directory of TIFFs matching a glob pattern as a 3D stack.
+///
+/// Files are sorted lexicographically by name, so they should be named with
+/// zero-padded indices (e.g., `frame_0001.tif`, `frame_0002.tif`, ...).
+///
+/// Only files with `.tif` or `.tiff` extensions (case-insensitive) are considered.
+/// When `pattern` is `None`, all such files are loaded.  When `Some`, the pattern
+/// is additionally matched against each filename (not the full path) and supports
+/// `*` (matches any sequence of characters) and `?` (matches a single character).
+/// Examples: `"*.tif"`, `"frame_*.tiff"`, `"scan_*"` (the extension guard still
+/// applies, so non-TIFF files are never decoded).
+///
+/// # Arguments
+/// * `dir`     — Path to the directory containing TIFF files.
+/// * `pattern` — Optional glob pattern to filter filenames.
+///
+/// # Returns
+/// 3D array with shape (n_files, height, width) and f64 values.
+///
+/// # Errors
+/// * [`IoError::NoMatchingFiles`] if no files match the pattern.
+/// * [`IoError::DimensionMismatch`] if frames have inconsistent dimensions.
+pub fn load_tiff_folder(dir: &Path, pattern: Option<&str>) -> Result<Array3<f64>, IoError> {
+    if !dir.is_dir() {
+        return Err(IoError::NotADirectory(dir.to_string_lossy().into_owned()));
+    }
+
+    let mut paths: Vec<_> = std::fs::read_dir(dir)
+        .map_err(|e| IoError::FileNotFound(dir.to_string_lossy().into_owned(), e))?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            // Use path().is_file() which follows symlinks, unlike file_type().is_file()
+            let is_file = entry.path().is_file();
+            let is_tiff = entry
+                .path()
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| matches!(ext.to_lowercase().as_str(), "tif" | "tiff"))
+                .unwrap_or(false);
+            let matches_pattern = match pattern {
+                Some(pat) => entry
+                    .file_name()
+                    .to_str()
+                    .map(|name| glob_match(pat, name))
+                    .unwrap_or(false),
+                None => true,
+            };
+            is_file && is_tiff && matches_pattern
+        })
+        .map(|entry| entry.path())
+        .collect();
+
+    paths.sort();
+
+    if paths.is_empty() {
+        return Err(IoError::NoMatchingFiles {
+            directory: dir.to_string_lossy().into_owned(),
+            pattern: pattern.unwrap_or("*.tif / *.tiff").to_string(),
+        });
+    }
+
+    let mut frames: Vec<Vec<f64>> = Vec::new();
+    let mut width = 0u32;
+    let mut height = 0u32;
+
+    for (i, path) in paths.iter().enumerate() {
+        let file = std::fs::File::open(path)
+            .map_err(|e| IoError::FileNotFound(path.to_string_lossy().into_owned(), e))?;
+        let mut decoder = Decoder::new(file).map_err(|e| IoError::TiffDecode(format!("{}", e)))?;
+
+        let (w, h) = decoder
+            .dimensions()
+            .map_err(|e| IoError::TiffDecode(format!("{}", e)))?;
+
+        if i == 0 {
+            width = w;
+            height = h;
+        } else if w != width || h != height {
+            return Err(IoError::DimensionMismatch {
+                expected: (width, height),
+                got: (w, h),
+                frame: i,
+            });
+        }
+
+        let data = decoder
+            .read_image()
+            .map_err(|e| IoError::TiffDecode(format!("{}", e)))?;
+        frames.push(decode_to_f64(data)?);
+    }
+
+    let n_frames = frames.len();
+    let flat: Vec<f64> = frames.into_iter().flatten().collect();
+    Array3::from_shape_vec((n_frames, height as usize, width as usize), flat)
+        .map_err(|e| IoError::TiffDecode(format!("Shape error: {}", e)))
+}
+
+/// Simple glob pattern matching against a filename.
+///
+/// Supports `*` (matches zero or more characters) and `?` (matches exactly one
+/// Unicode character).  The match is case-insensitive to handle mixed-case
+/// extensions (`.TIF`, `.Tiff`, etc.).
+fn glob_match(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.to_lowercase().chars().collect();
+    let n: Vec<char> = name.to_lowercase().chars().collect();
+    glob_match_inner(&p, &n)
+}
+
+fn glob_match_inner(pattern: &[char], name: &[char]) -> bool {
+    match (pattern.first(), name.first()) {
+        (None, None) => true,
+        (Some(&'*'), _) => {
+            // '*' matches zero characters (skip the star) or one character (consume from name)
+            glob_match_inner(&pattern[1..], name)
+                || (!name.is_empty() && glob_match_inner(pattern, &name[1..]))
+        }
+        (Some(&'?'), Some(_)) => glob_match_inner(&pattern[1..], &name[1..]),
+        (Some(&p), Some(&n)) if p == n => glob_match_inner(&pattern[1..], &name[1..]),
+        _ => false,
+    }
+}
+
 /// Convert TIFF decoded data to f64 values.
 fn decode_to_f64(data: DecodingResult) -> Result<Vec<f64>, IoError> {
     match data {
@@ -274,6 +396,114 @@ mod tests {
         // frame_0002: 30, 31, 32, 33
         assert_eq!(arr[[2, 0, 0]], 30.0);
         assert_eq!(arr[[2, 1, 1]], 33.0);
+    }
+
+    #[test]
+    fn test_load_tiff_folder_no_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Mix of .tif and .tiff — both should be picked up
+        for i in 0..2u16 {
+            let path = dir.path().join(format!("frame_{:04}.tif", i));
+            let data: Vec<u16> = (0..4).map(|j| (i + 1) * 10 + j).collect();
+            write_test_tiff(&path, &[data], 2, 2);
+        }
+        let path = dir.path().join("frame_0002.tiff");
+        write_test_tiff(&path, &[vec![30, 31, 32, 33]], 2, 2);
+
+        // Non-TIFF sidecar should be ignored
+        std::fs::write(dir.path().join("frame_0001.tif.bak"), b"not a tiff").unwrap();
+
+        let arr = load_tiff_folder(dir.path(), None).unwrap();
+        assert_eq!(arr.shape(), &[3, 2, 2]);
+    }
+
+    #[test]
+    fn test_load_tiff_folder_with_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+
+        for i in 0..3u16 {
+            let path = dir.path().join(format!("frame_{:04}.tif", i));
+            let data: Vec<u16> = (0..4).map(|j| (i + 1) * 10 + j).collect();
+            write_test_tiff(&path, &[data], 2, 2);
+        }
+
+        let arr = load_tiff_folder(dir.path(), Some("*.tif")).unwrap();
+        assert_eq!(arr.shape(), &[3, 2, 2]);
+        assert_eq!(arr[[0, 0, 0]], 10.0);
+        assert_eq!(arr[[2, 1, 1]], 33.0);
+    }
+
+    #[test]
+    fn test_load_tiff_folder_custom_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Write files matching "scan_*.tif" and a non-matching file
+        for i in 0..2u16 {
+            let path = dir.path().join(format!("scan_{:04}.tif", i));
+            let data: Vec<u16> = (0..4).map(|j| (i + 1) * 10 + j).collect();
+            write_test_tiff(&path, &[data], 2, 2);
+        }
+        // This file should NOT be matched by "scan_*.tif"
+        let extra = dir.path().join("other_0001.tif");
+        write_test_tiff(&extra, &[vec![99, 99, 99, 99]], 2, 2);
+
+        let arr = load_tiff_folder(dir.path(), Some("scan_*.tif")).unwrap();
+        assert_eq!(arr.shape(), &[2, 2, 2]);
+        assert_eq!(arr[[0, 0, 0]], 10.0);
+    }
+
+    #[test]
+    fn test_load_tiff_folder_no_matching_files() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Write a .tiff file but search for .png
+        let path = dir.path().join("frame_0001.tiff");
+        write_test_tiff(&path, &[vec![1, 2, 3, 4]], 2, 2);
+
+        let result = load_tiff_folder(dir.path(), Some("*.png"));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, IoError::NoMatchingFiles { .. }),
+            "Expected NoMatchingFiles, got: {:?}",
+            err,
+        );
+    }
+
+    #[test]
+    fn test_load_tiff_folder_case_insensitive() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Write a file with uppercase extension
+        let path = dir.path().join("frame_0001.TIF");
+        write_test_tiff(&path, &[vec![1, 2, 3, 4]], 2, 2);
+
+        // Pattern with lowercase should still match
+        let arr = load_tiff_folder(dir.path(), Some("*.tif")).unwrap();
+        assert_eq!(arr.shape(), &[1, 2, 2]);
+    }
+
+    #[test]
+    fn test_glob_match_basic() {
+        assert!(glob_match("*.tif", "frame_0001.tif"));
+        assert!(glob_match("*.tif", "a.tif"));
+        assert!(!glob_match("*.tif", "frame_0001.tiff"));
+        assert!(!glob_match("*.tif", "frame_0001.png"));
+    }
+
+    #[test]
+    fn test_glob_match_question_mark() {
+        assert!(glob_match("frame_?.tif", "frame_1.tif"));
+        assert!(!glob_match("frame_?.tif", "frame_12.tif"));
+        // '?' should match a single Unicode character, not a single byte
+        assert!(glob_match("?.tif", "\u{00e9}.tif")); // é is multi-byte in UTF-8
+    }
+
+    #[test]
+    fn test_glob_match_case_insensitive() {
+        assert!(glob_match("*.tif", "FILE.TIF"));
+        assert!(glob_match("*.TIF", "file.tif"));
     }
 
     #[test]

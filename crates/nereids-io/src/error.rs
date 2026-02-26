@@ -28,6 +28,10 @@ pub enum IoError {
     #[error("Shape mismatch: {0}")]
     ShapeMismatch(String),
 
+    /// No files matched the given pattern.
+    #[error("No files matching pattern '{pattern}' in directory: {directory}")]
+    NoMatchingFiles { directory: String, pattern: String },
+
     /// Invalid parameter.
     #[error("Invalid parameter: {0}")]
     InvalidParameter(String),
