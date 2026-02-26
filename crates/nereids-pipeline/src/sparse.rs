@@ -291,6 +291,7 @@ pub fn sparse_reconstruct(
                 &y_obs,
                 &nuisance.flux,
                 &xs,
+                t_model.density_indices.as_slice(),
                 &mut params,
                 &config.poisson_config,
             );

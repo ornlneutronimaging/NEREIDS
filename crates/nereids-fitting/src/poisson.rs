@@ -247,22 +247,35 @@ pub fn poisson_fit(
 /// which is 3–5× faster for 2–4 isotopes at typical VENUS energy grids.
 ///
 /// # Arguments
-/// * `model`          — Forward model Y = Φ·T(θ) + B.
-/// * `y_obs`          — Observed counts.
-/// * `flux`           — Incident flux Φ(E) (from nuisance estimation).
-/// * `cross_sections` — Precomputed Doppler-broadened σₖ(E), one slice per isotope.
-/// * `params`         — Parameter set (modified in place).
-/// * `config`         — Optimizer configuration.
+/// * `model`           — Forward model Y = Φ·T(θ) + B.
+/// * `y_obs`           — Observed counts.
+/// * `flux`            — Incident flux Φ(E) (from nuisance estimation).
+/// * `cross_sections`  — Precomputed Doppler-broadened σₖ(E), one slice per isotope.
+/// * `density_indices` — Maps isotope `k` → parameter index: the density for
+///   isotope `k` is `params[density_indices[k]]`.  This decouples isotope
+///   ordering from the parameter vector layout, supporting callers that include
+///   additional nuisance parameters alongside densities (via `CountsModel`'s
+///   `density_param_range`).
+/// * `params`          — Parameter set (modified in place).
+/// * `config`          — Optimizer configuration.
 pub fn poisson_fit_analytic(
     model: &dyn FitModel,
     y_obs: &[f64],
     flux: &[f64],
     cross_sections: &[Vec<f64>],
+    density_indices: &[usize],
     params: &mut ParameterSet,
     config: &PoissonConfig,
 ) -> PoissonResult {
     let n_e = y_obs.len();
     assert_eq!(flux.len(), n_e, "flux length must match y_obs");
+    assert_eq!(
+        density_indices.len(),
+        cross_sections.len(),
+        "density_indices length ({}) must match cross_sections length ({})",
+        density_indices.len(),
+        cross_sections.len(),
+    );
 
     let y_model = model.evaluate(&params.all_values());
     let mut nll = poisson_nll(y_obs, &y_model);
@@ -282,14 +295,18 @@ pub fn poisson_fit_analytic(
         // background B = 0.  Computing T from the Beer-Lambert definition
         // is exact regardless of background and avoids a silent bias whenever
         // a caller supplies a CountsModel with nonzero B(E).
+        //
+        // `density_indices[k]` maps isotope k → parameter index, so the
+        // density lookup is correct even when the parameter vector contains
+        // additional nuisance parameters before/after the densities.
         let all_vals = params.all_values();
         let t_now: Vec<f64> = (0..n_e)
             .map(|e| {
                 let mut neg_opt = 0.0f64;
                 for (k, xs) in cross_sections.iter().enumerate() {
-                    let density = all_vals.get(k).copied().unwrap_or(0.0);
+                    let density = all_vals[density_indices[k]];
                     if density > 0.0 {
-                        neg_opt -= density * xs.get(e).copied().unwrap_or(0.0);
+                        neg_opt -= density * xs[e];
                     }
                 }
                 neg_opt.exp()
@@ -301,6 +318,12 @@ pub fn poisson_fit_analytic(
         // Derivation:  Y = Φ·T + B,  T = exp(−Σ nₖ σₖ)
         //   ∂Y/∂nₖ = Φ · ∂T/∂nₖ = −Φ · σₖ · T
         //   ∂NLL/∂nₖ = Σ_E (1 − y_obs/Y) · ∂Y/∂nₖ
+        //
+        // For each free parameter, we sum the cross-sections of every isotope
+        // whose density maps to that parameter index.  Free parameters that
+        // don't correspond to any density (nuisance params) get zero gradient
+        // from this formula — callers should ensure all free params are
+        // densities, or use `poisson_fit` (FD) for mixed parameter sets.
         let free_indices = params.free_indices();
         let grad: Vec<f64> = free_indices
             .iter()
@@ -314,12 +337,16 @@ pub fn poisson_fit_analytic(
                     .map(|(e, (((&obs, &ym), &phi), &t))| {
                         let ym_safe = ym.max(1e-30);
                         let residual_factor = 1.0 - obs / ym_safe;
-                        let sigma_k = cross_sections
-                            .get(param_idx)
-                            .and_then(|xs| xs.get(e))
-                            .copied()
-                            .unwrap_or(0.0);
-                        residual_factor * phi * t * (-sigma_k)
+                        // Sum σₖ for all isotopes mapped to this param index.
+                        // Handles the common case (one isotope per param) and
+                        // tied parameters (multiple isotopes sharing one density).
+                        let sigma_sum: f64 = density_indices
+                            .iter()
+                            .enumerate()
+                            .filter(|&(_, di)| *di == param_idx)
+                            .map(|(k, _)| cross_sections[k][e])
+                            .sum();
+                        residual_factor * phi * t * (-sigma_sum)
                     })
                     .sum::<f64>()
             })
