@@ -65,29 +65,33 @@ pub struct TraceDetectabilityConfig<'a> {
     pub snr_threshold: f64,
 }
 
-/// Compute the matrix-only baseline transmission.
-fn matrix_baseline(config: &TraceDetectabilityConfig) -> Vec<f64> {
-    let instrument = config.resolution.map(|r| InstrumentParams {
+/// Build an `InstrumentParams` from the config's optional resolution function.
+fn build_instrument(config: &TraceDetectabilityConfig) -> Option<InstrumentParams> {
+    config.resolution.map(|r| InstrumentParams {
         resolution: r.clone(),
-    });
+    })
+}
+
+/// Compute the matrix-only baseline transmission.
+fn matrix_baseline(
+    config: &TraceDetectabilityConfig,
+    instrument: Option<&InstrumentParams>,
+) -> Vec<f64> {
     let sample_matrix = SampleParams {
         temperature_k: config.temperature_k,
         isotopes: vec![(config.matrix.clone(), config.matrix_density)],
     };
-    transmission::forward_model(config.energies, &sample_matrix, instrument.as_ref())
+    transmission::forward_model(config.energies, &sample_matrix, instrument)
 }
 
 /// Build a report from a precomputed matrix-only baseline and a trace isotope.
 fn report_from_baseline(
     config: &TraceDetectabilityConfig,
+    instrument: Option<&InstrumentParams>,
     t_matrix: &[f64],
     trace: &ResonanceData,
     trace_ppm: f64,
 ) -> TraceDetectabilityReport {
-    let instrument = config.resolution.map(|r| InstrumentParams {
-        resolution: r.clone(),
-    });
-
     // T_combined: transmission through matrix + trace
     let trace_density = trace_ppm * 1e-6 * config.matrix_density;
     let sample_combined = SampleParams {
@@ -97,8 +101,7 @@ fn report_from_baseline(
             (trace.clone(), trace_density),
         ],
     };
-    let t_combined =
-        transmission::forward_model(config.energies, &sample_combined, instrument.as_ref());
+    let t_combined = transmission::forward_model(config.energies, &sample_combined, instrument);
 
     // |ΔT| spectrum
     let delta_t_spectrum: Vec<f64> = t_matrix
@@ -164,14 +167,16 @@ pub fn trace_detectability(
     trace: &ResonanceData,
     trace_ppm: f64,
 ) -> TraceDetectabilityReport {
-    let t_matrix = matrix_baseline(config);
-    report_from_baseline(config, &t_matrix, trace, trace_ppm)
+    let instrument = build_instrument(config);
+    let t_matrix = matrix_baseline(config, instrument.as_ref());
+    report_from_baseline(config, instrument.as_ref(), &t_matrix, trace, trace_ppm)
 }
 
 /// Survey multiple trace candidates against a single matrix.
 ///
-/// The matrix-only baseline transmission is computed once and reused for
-/// all candidates. Each candidate is then evaluated in parallel with rayon.
+/// The matrix-only baseline transmission and instrument resolution are
+/// computed once and reused for all candidates. Each candidate is then
+/// evaluated in parallel with rayon.
 ///
 /// # Returns
 /// Vec of (isotope_name, report) sorted by `peak_snr` descending.
@@ -180,8 +185,9 @@ pub fn trace_detectability_survey(
     trace_candidates: &[ResonanceData],
     trace_ppm: f64,
 ) -> Vec<(String, TraceDetectabilityReport)> {
-    // Precompute the matrix-only baseline once for all candidates.
-    let t_matrix = matrix_baseline(config);
+    // Build instrument and matrix baseline once for all candidates.
+    let instrument = build_instrument(config);
+    let t_matrix = matrix_baseline(config, instrument.as_ref());
 
     let mut results: Vec<(String, TraceDetectabilityReport)> = trace_candidates
         .par_iter()
@@ -190,7 +196,8 @@ pub fn trace_detectability_survey(
                 .map(|sym| format!("{}-{}", sym, trace.isotope.a))
                 .unwrap_or_else(|| format!("Z{}-{}", trace.isotope.z, trace.isotope.a));
 
-            let report = report_from_baseline(config, &t_matrix, trace, trace_ppm);
+            let report =
+                report_from_baseline(config, instrument.as_ref(), &t_matrix, trace, trace_ppm);
 
             (name, report)
         })

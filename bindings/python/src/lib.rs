@@ -1826,6 +1826,11 @@ fn py_trace_detectability(
     let e = energies.as_slice()?;
     validate_energy_grid(e)?;
 
+    if e.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "energies must not be empty",
+        ));
+    }
     if matrix_density <= 0.0 || !matrix_density.is_finite() {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "matrix_density must be finite and positive",
@@ -1914,6 +1919,11 @@ fn py_trace_detectability_survey(
     let e = energies.as_slice()?;
     validate_energy_grid(e)?;
 
+    if e.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "energies must not be empty",
+        ));
+    }
     if matrix_density <= 0.0 || !matrix_density.is_finite() {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "matrix_density must be finite and positive",
