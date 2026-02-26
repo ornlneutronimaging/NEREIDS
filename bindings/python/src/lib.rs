@@ -1296,7 +1296,8 @@ fn py_spatial_map(
                 }
                 None => None,
             };
-            let nuisance = estimate_nuisance(&sample, &open_beam, roi_ranges, dead.as_ref());
+            let nuisance = estimate_nuisance(&sample, &open_beam, roi_ranges, dead.as_ref())
+                .map_err(pyo3::exceptions::PyValueError::new_err)?;
 
             let sparse_config = SparseConfig {
                 energies: e.to_vec(),
@@ -1305,7 +1306,10 @@ fn py_spatial_map(
                 temperature_k,
                 resolution: res_fn,
                 initial_densities: init,
-                poisson_config: PoissonConfig::default(),
+                poisson_config: PoissonConfig {
+                    max_iter,
+                    ..PoissonConfig::default()
+                },
             };
 
             // Stage 2: per-pixel Poisson NLL fitting.
