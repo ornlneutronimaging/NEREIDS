@@ -1224,6 +1224,11 @@ fn py_spatial_map(
 
     match fitter {
         "lm" => {
+            if roi.is_some() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "roi is only used with fitter='poisson'; it is ignored for fitter='lm'",
+                ));
+            }
             let config = FitConfig {
                 energies: e.to_vec(),
                 resonance_data: res_data,

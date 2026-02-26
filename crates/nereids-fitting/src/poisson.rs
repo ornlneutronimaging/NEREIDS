@@ -25,8 +25,9 @@ pub struct PoissonConfig {
     pub fd_step: f64,
     /// Initial step size for line search.
     pub step_size: f64,
-    /// Convergence tolerance on relative NLL change.
-    pub tol_nll: f64,
+    /// Convergence tolerance on parameter displacement (L2 norm of step).
+    /// Also used as the gradient-norm threshold in `poisson_fit_analytic`.
+    pub tol_param: f64,
     /// Armijo line search parameter (sufficient decrease).
     pub armijo_c: f64,
     /// Line search backtracking factor.
@@ -39,7 +40,7 @@ impl Default for PoissonConfig {
             max_iter: 200,
             fd_step: 1e-7,
             step_size: 1.0,
-            tol_nll: 1e-8,
+            tol_param: 1e-8,
             armijo_c: 1e-4,
             backtrack: 0.5,
         }
@@ -153,7 +154,7 @@ pub fn poisson_fit(
 
         // Check gradient norm for convergence
         let grad_norm: f64 = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
-        if grad_norm < config.tol_nll {
+        if grad_norm < config.tol_param {
             converged = true;
             break;
         }
@@ -218,7 +219,7 @@ pub fn poisson_fit(
             .map(|(o, n)| (o - n).powi(2))
             .sum::<f64>()
             .sqrt();
-        if step_norm < config.tol_nll {
+        if step_norm < config.tol_param {
             converged = true;
             break;
         }
@@ -335,9 +336,24 @@ pub fn poisson_fit_analytic(
         // from this formula — callers should ensure all free params are
         // densities, or use `poisson_fit` (FD) for mixed parameter sets.
         let free_indices = params.free_indices();
-        let grad: Vec<f64> = free_indices
+
+        // Precompute param_idx → list of isotope indices so the inner energy
+        // loop is O(n_free × n_energy) instead of O(n_free × n_energy × n_isotopes).
+        let param_isotopes: Vec<Vec<usize>> = free_indices
             .iter()
-            .map(|&param_idx| {
+            .map(|&pi| {
+                density_indices
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &di)| di == pi)
+                    .map(|(k, _)| k)
+                    .collect()
+            })
+            .collect();
+
+        let grad: Vec<f64> = param_isotopes
+            .iter()
+            .map(|iso_indices| {
                 y_obs
                     .iter()
                     .zip(y_model_now.iter())
@@ -349,15 +365,8 @@ pub fn poisson_fit_analytic(
                         // non-positive model → large gradient pushing the optimizer
                         // away from infeasible regions.
                         let residual_factor = if ym <= 0.0 { 1e30 } else { 1.0 - obs / ym };
-                        // Sum σₖ for all isotopes mapped to this param index.
-                        // Handles the common case (one isotope per param) and
-                        // tied parameters (multiple isotopes sharing one density).
-                        let sigma_sum: f64 = density_indices
-                            .iter()
-                            .enumerate()
-                            .filter(|&(_, di)| *di == param_idx)
-                            .map(|(k, _)| cross_sections[k][e])
-                            .sum();
+                        let sigma_sum: f64 =
+                            iso_indices.iter().map(|&k| cross_sections[k][e]).sum();
                         residual_factor * phi * t * (-sigma_sum)
                     })
                     .sum::<f64>()
@@ -366,7 +375,7 @@ pub fn poisson_fit_analytic(
 
         // Check gradient norm for convergence
         let grad_norm: f64 = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
-        if grad_norm < config.tol_nll {
+        if grad_norm < config.tol_param {
             converged = true;
             break;
         }
@@ -417,7 +426,7 @@ pub fn poisson_fit_analytic(
             .map(|(o, n)| (o - n).powi(2))
             .sum::<f64>()
             .sqrt();
-        if step_norm < config.tol_nll {
+        if step_norm < config.tol_param {
             converged = true;
             break;
         }
@@ -767,6 +776,66 @@ mod tests {
             result.params[0] >= 0.0,
             "b must be non-negative, got {}",
             result.params[0],
+        );
+    }
+
+    #[test]
+    fn test_analytic_nonzero_background() {
+        // Verify the analytical gradient is correct when background B ≠ 0.
+        // Forward model: Y(E) = Φ(E)·exp(−b·σ(E)) + B(E)
+        let n_e = 20;
+        let sigma: Vec<f64> = (0..n_e).map(|i| 1.0 + 0.2 * i as f64).collect();
+        let flux: Vec<f64> = vec![500.0; n_e];
+        let background: Vec<f64> = vec![20.0; n_e]; // 4% of flux
+        let true_b = 0.4;
+
+        // Transmission-only model (no background); CountsModel adds flux+bg.
+        struct PureTransmission {
+            sigma: Vec<f64>,
+        }
+        impl FitModel for PureTransmission {
+            fn evaluate(&self, params: &[f64]) -> Vec<f64> {
+                let b = params[0];
+                self.sigma.iter().map(|&s| (-b * s).exp()).collect()
+            }
+        }
+
+        let t_model = PureTransmission {
+            sigma: sigma.clone(),
+        };
+        let counts_model = CountsModel {
+            transmission_model: &t_model,
+            flux: flux.clone(),
+            background: background.clone(),
+            density_param_range: 0..1,
+        };
+
+        // Generate observed counts Y = Φ·T + B at true density.
+        let y_obs = counts_model.evaluate(&[true_b]);
+
+        let mut params = ParameterSet::new(vec![FitParameter::non_negative("b", 0.1)]);
+
+        let result = poisson_fit_analytic(
+            &counts_model,
+            &y_obs,
+            &flux,
+            &[sigma],
+            &[0],
+            &mut params,
+            &PoissonConfig::default(),
+        );
+
+        assert!(
+            result.converged,
+            "Nonzero-background fit did not converge after {} iters",
+            result.iterations,
+        );
+        assert!(
+            (result.params[0] - true_b).abs() / true_b < 0.01,
+            "With B≠0: fitted={}, true={}, error={:.2}%",
+            result.params[0],
+            true_b,
+            (result.params[0] - true_b).abs() / true_b * 100.0,
         );
     }
 }
