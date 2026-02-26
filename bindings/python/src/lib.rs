@@ -1508,6 +1508,55 @@ fn load_tiff_stack<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyAr
     Ok(PyArray3::from_owned_array(py, arr))
 }
 
+/// Load a folder of single-frame TIFFs into a 3D numpy array.
+///
+/// Files are sorted lexicographically by name, so they should be named with
+/// zero-padded indices (e.g., ``frame_0001.tif``, ``frame_0002.tif``, ...).
+///
+/// Args:
+///     folder: Path to the directory containing TIFF files.
+///     pattern: Optional glob pattern matched against each filename (not the
+///              full path).  Supports ``*`` and ``?`` wildcards
+///              (case-insensitive).  Only files with ``.tif`` or ``.tiff``
+///              extensions are ever loaded; the pattern adds an additional
+///              filename filter on top of that.
+///
+/// Returns:
+///     3D numpy array with shape (n_frames, height, width), dtype float64.
+///
+/// Raises:
+///     FileNotFoundError: If the folder does not exist or no files match.
+///     NotADirectoryError: If the provided path is not a directory.
+///     ValueError: If matched frames have inconsistent dimensions.
+///     IOError: For TIFF decoding errors or other I/O failures.
+#[pyfunction]
+#[pyo3(signature = (folder, pattern=None))]
+fn load_tiff_folder<'py>(
+    py: Python<'py>,
+    folder: &str,
+    pattern: Option<&str>,
+) -> PyResult<Bound<'py, PyArray3<f64>>> {
+    let arr = nereids_io::tiff_stack::load_tiff_folder(std::path::Path::new(folder), pattern)
+        .map_err(|e| match &e {
+            nereids_io::error::IoError::NoMatchingFiles { .. } => {
+                pyo3::exceptions::PyFileNotFoundError::new_err(format!("{}", e))
+            }
+            nereids_io::error::IoError::NotADirectory(_) => {
+                pyo3::exceptions::PyNotADirectoryError::new_err(format!("{}", e))
+            }
+            nereids_io::error::IoError::FileNotFound(_, source)
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                pyo3::exceptions::PyFileNotFoundError::new_err(format!("{}", e))
+            }
+            nereids_io::error::IoError::DimensionMismatch { .. } => {
+                pyo3::exceptions::PyValueError::new_err(format!("{}", e))
+            }
+            _ => pyo3::exceptions::PyIOError::new_err(format!("{}", e)),
+        })?;
+    Ok(PyArray3::from_owned_array(py, arr))
+}
+
 /// Normalize raw sample and open-beam data to transmission.
 ///
 /// Computes T = (C_sample / C_ob) × (PC_ob / PC_sample) with Poisson
@@ -1699,6 +1748,7 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_spatial_map, m)?)?;
     m.add_function(wrap_pyfunction!(py_fit_roi, m)?)?;
     m.add_function(wrap_pyfunction!(load_tiff_stack, m)?)?;
+    m.add_function(wrap_pyfunction!(load_tiff_folder, m)?)?;
     m.add_function(wrap_pyfunction!(normalize, m)?)?;
     m.add_function(wrap_pyfunction!(tof_to_energy_centers, m)?)?;
     m.add_function(wrap_pyfunction!(py_element_symbol, m)?)?;
