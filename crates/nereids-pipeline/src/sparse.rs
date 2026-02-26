@@ -122,6 +122,9 @@ pub fn estimate_nuisance(
     // Average open-beam over ROI to get flux estimate
     let (y_range, x_range) = match roi {
         Some((y_r, x_r)) => {
+            if y_r.start >= y_r.end || x_r.start >= x_r.end {
+                return Err("ROI y-range or x-range is empty".into());
+            }
             if y_r.start >= height || y_r.end > height || x_r.start >= width || x_r.end > width {
                 return Err("ROI is out of bounds of the open-beam data".into());
             }

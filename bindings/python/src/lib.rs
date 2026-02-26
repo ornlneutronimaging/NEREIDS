@@ -1135,7 +1135,7 @@ fn py_apply_resolution<'py>(
 ///     delta_t_us: Timing uncertainty for Gaussian resolution (optional).
 ///     delta_l_m: Path length uncertainty for Gaussian resolution (optional).
 ///     resolution: TabulatedResolution for tabulated broadening (optional).
-///     max_iter: Maximum LM iterations per pixel (default 100).
+///     max_iter: Maximum iterations per pixel for LM or Poisson fitting (default 100).
 ///     fitter: 'lm' (default) for Gaussian χ² or 'poisson' for Poisson NLL.
 ///     roi: [y0, y1, x0, x1] region for Stage-1 nuisance estimation
 ///         (Poisson path only, default uses full image).
