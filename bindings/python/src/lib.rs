@@ -1286,7 +1286,7 @@ fn py_spatial_map(
                             r,
                         )));
                     }
-                    if r[1] > height || r[3] > width {
+                    if r[0] >= height || r[1] > height || r[2] >= width || r[3] > width {
                         return Err(pyo3::exceptions::PyValueError::new_err(format!(
                             "roi [{},{},{},{}] exceeds image dimensions ({}×{})",
                             r[0], r[1], r[2], r[3], height, width,

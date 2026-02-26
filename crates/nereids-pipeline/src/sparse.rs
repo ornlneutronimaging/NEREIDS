@@ -147,9 +147,10 @@ pub fn estimate_nuisance(
     }
 
     if n_pixels == 0 {
-        return Err("no live pixels in ROI after dead-pixel filtering; \
-             cannot estimate nuisance flux"
-            .into());
+        return Err(
+            "no live pixels in ROI after dead-pixel filtering; cannot estimate nuisance flux"
+                .into(),
+        );
     }
 
     let n_pix_f = n_pixels as f64;
@@ -274,8 +275,9 @@ pub fn sparse_reconstruct(
 
             // Fit with Poisson likelihood using analytical gradient.
             // Passing the precomputed cross-sections and flux enables
-            // poisson_fit_analytic to compute ∂NLL/∂nₖ in a single forward
-            // pass instead of N_isotopes+1 finite-difference evaluations.
+            // poisson_fit_analytic to compute the full ∂NLL/∂nₖ gradient vector
+            // in one model evaluation per iteration instead of N_isotopes+1
+            // evaluations with finite differences (one base + one per parameter).
             let mut params = ParameterSet::new(
                 config
                     .initial_densities
