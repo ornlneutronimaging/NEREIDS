@@ -1841,6 +1841,11 @@ fn py_trace_detectability(
             "i0 must be finite and positive",
         ));
     }
+    if !temperature_k.is_finite() || temperature_k < 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "temperature_k must be finite and non-negative",
+        ));
+    }
     if snr_threshold < 0.0 || !snr_threshold.is_finite() {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "snr_threshold must be finite and non-negative",
@@ -1922,6 +1927,16 @@ fn py_trace_detectability_survey(
     if i0 <= 0.0 || !i0.is_finite() {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "i0 must be finite and positive",
+        ));
+    }
+    if !temperature_k.is_finite() || temperature_k < 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "temperature_k must be finite and non-negative",
+        ));
+    }
+    if snr_threshold < 0.0 || !snr_threshold.is_finite() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "snr_threshold must be finite and non-negative",
         ));
     }
     if trace_candidates.is_empty() {
