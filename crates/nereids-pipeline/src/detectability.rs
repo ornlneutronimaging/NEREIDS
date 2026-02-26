@@ -65,36 +65,28 @@ pub struct TraceDetectabilityConfig<'a> {
     pub snr_threshold: f64,
 }
 
-/// Compute trace-detectability for a single matrix+trace isotope pair.
-///
-/// Two `forward_model` calls (with/without trace) + argmax over the
-/// difference spectrum. Resolution broadening is included when provided,
-/// so the SNR reflects realistic peak spreading at VENUS.
-///
-/// # Arguments
-/// * `config`    — Shared analysis parameters (matrix, energies, I₀, etc.).
-/// * `trace`     — Resonance data for the trace isotope.
-/// * `trace_ppm` — Trace concentration in ppm by atom.
-///
-/// # Returns
-/// [`TraceDetectabilityReport`] with peak SNR, peak energy, detectability
-/// flag, and the full |ΔT| spectrum.
-pub fn trace_detectability(
+/// Compute the matrix-only baseline transmission.
+fn matrix_baseline(config: &TraceDetectabilityConfig) -> Vec<f64> {
+    let instrument = config.resolution.map(|r| InstrumentParams {
+        resolution: r.clone(),
+    });
+    let sample_matrix = SampleParams {
+        temperature_k: config.temperature_k,
+        isotopes: vec![(config.matrix.clone(), config.matrix_density)],
+    };
+    transmission::forward_model(config.energies, &sample_matrix, instrument.as_ref())
+}
+
+/// Build a report from a precomputed matrix-only baseline and a trace isotope.
+fn report_from_baseline(
     config: &TraceDetectabilityConfig,
+    t_matrix: &[f64],
     trace: &ResonanceData,
     trace_ppm: f64,
 ) -> TraceDetectabilityReport {
     let instrument = config.resolution.map(|r| InstrumentParams {
         resolution: r.clone(),
     });
-
-    // T_matrix: transmission through matrix only
-    let sample_matrix = SampleParams {
-        temperature_k: config.temperature_k,
-        isotopes: vec![(config.matrix.clone(), config.matrix_density)],
-    };
-    let t_matrix =
-        transmission::forward_model(config.energies, &sample_matrix, instrument.as_ref());
 
     // T_combined: transmission through matrix + trace
     let trace_density = trace_ppm * 1e-6 * config.matrix_density;
@@ -153,10 +145,33 @@ pub fn trace_detectability(
     }
 }
 
+/// Compute trace-detectability for a single matrix+trace isotope pair.
+///
+/// Two `forward_model` calls (with/without trace) + argmax over the
+/// difference spectrum. Resolution broadening is included when provided,
+/// so the SNR reflects realistic peak spreading at VENUS.
+///
+/// # Arguments
+/// * `config`    — Shared analysis parameters (matrix, energies, I₀, etc.).
+/// * `trace`     — Resonance data for the trace isotope.
+/// * `trace_ppm` — Trace concentration in ppm by atom.
+///
+/// # Returns
+/// [`TraceDetectabilityReport`] with peak SNR, peak energy, detectability
+/// flag, and the full |ΔT| spectrum.
+pub fn trace_detectability(
+    config: &TraceDetectabilityConfig,
+    trace: &ResonanceData,
+    trace_ppm: f64,
+) -> TraceDetectabilityReport {
+    let t_matrix = matrix_baseline(config);
+    report_from_baseline(config, &t_matrix, trace, trace_ppm)
+}
+
 /// Survey multiple trace candidates against a single matrix.
 ///
-/// Parallelises over candidates with rayon — each candidate is independent,
-/// so this scales linearly with the number of cores.
+/// The matrix-only baseline transmission is computed once and reused for
+/// all candidates. Each candidate is then evaluated in parallel with rayon.
 ///
 /// # Returns
 /// Vec of (isotope_name, report) sorted by `peak_snr` descending.
@@ -165,6 +180,9 @@ pub fn trace_detectability_survey(
     trace_candidates: &[ResonanceData],
     trace_ppm: f64,
 ) -> Vec<(String, TraceDetectabilityReport)> {
+    // Precompute the matrix-only baseline once for all candidates.
+    let t_matrix = matrix_baseline(config);
+
     let mut results: Vec<(String, TraceDetectabilityReport)> = trace_candidates
         .par_iter()
         .map(|trace| {
@@ -172,7 +190,7 @@ pub fn trace_detectability_survey(
                 .map(|sym| format!("{}-{}", sym, trace.isotope.a))
                 .unwrap_or_else(|| format!("Z{}-{}", trace.isotope.z, trace.isotope.a));
 
-            let report = trace_detectability(config, trace, trace_ppm);
+            let report = report_from_baseline(config, &t_matrix, trace, trace_ppm);
 
             (name, report)
         })
