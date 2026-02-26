@@ -187,6 +187,20 @@ pub fn sparse_reconstruct(
     let (n_energies, height, width) = (shape[0], shape[1], shape[2]);
     let n_isotopes = config.resonance_data.len();
 
+    // Guard against zero-isotope calls: with no isotopes, PrecomputedTransmissionModel
+    // would receive an empty cross_sections Vec and the first evaluate() would panic.
+    // Return a neutral result (T=1 everywhere) rather than crashing.
+    if n_isotopes == 0 {
+        return SparseResult {
+            density_maps: vec![],
+            nll_map: Array2::from_elem((height, width), f64::NAN),
+            converged_map: Array2::from_elem((height, width), false),
+            n_converged: 0,
+            n_total: 0,
+            nuisance: nuisance.clone(),
+        };
+    }
+
     assert_eq!(n_energies, config.energies.len());
     assert_eq!(
         nuisance.flux.len(),

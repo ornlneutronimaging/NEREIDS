@@ -288,6 +288,26 @@ pub fn poisson_fit_analytic(
         );
     }
 
+    // Validate that every free parameter is referenced by at least one
+    // density_index.  Free parameters with no density mapping receive zero
+    // analytical gradient and will never move, causing silent convergence
+    // to the initial guess.  Callers with mixed free params (density +
+    // nuisance) should use `poisson_fit` (finite-difference) instead.
+    {
+        let free_set: std::collections::HashSet<usize> =
+            params.free_indices().into_iter().collect();
+        let density_set: std::collections::HashSet<usize> =
+            density_indices.iter().copied().collect();
+        let unmapped: Vec<usize> = free_set.difference(&density_set).copied().collect();
+        assert!(
+            unmapped.is_empty(),
+            "poisson_fit_analytic: free parameters {:?} are not mapped by density_indices; \
+             analytical gradient is zero for these params. Use poisson_fit (FD) for mixed \
+             parameter sets.",
+            unmapped,
+        );
+    }
+
     let y_model = model.evaluate(&params.all_values());
     let mut nll = poisson_nll(y_obs, &y_model);
     let mut converged = false;
@@ -329,12 +349,6 @@ pub fn poisson_fit_analytic(
         // Derivation:  Y = Φ·T + B,  T = exp(−Σ nₖ σₖ)
         //   ∂Y/∂nₖ = Φ · ∂T/∂nₖ = −Φ · σₖ · T
         //   ∂NLL/∂nₖ = Σ_E (1 − y_obs/Y) · ∂Y/∂nₖ
-        //
-        // For each free parameter, we sum the cross-sections of every isotope
-        // whose density maps to that parameter index.  Free parameters that
-        // don't correspond to any density (nuisance params) get zero gradient
-        // from this formula — callers should ensure all free params are
-        // densities, or use `poisson_fit` (FD) for mixed parameter sets.
         let free_indices = params.free_indices();
 
         // Precompute param_idx → list of isotope indices so the inner energy
