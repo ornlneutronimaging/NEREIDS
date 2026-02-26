@@ -1515,10 +1515,11 @@ fn load_tiff_stack<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyAr
 ///
 /// Args:
 ///     folder: Path to the directory containing TIFF files.
-///     pattern: Optional glob pattern to further filter filenames.  Supports
-///              ``*`` and ``?`` wildcards (case-insensitive).  Only files
-///              with ``.tif`` or ``.tiff`` extensions are ever loaded; the
-///              pattern adds an additional filename filter on top of that.
+///     pattern: Optional glob pattern matched against each filename (not the
+///              full path).  Supports ``*`` and ``?`` wildcards
+///              (case-insensitive).  Only files with ``.tif`` or ``.tiff``
+///              extensions are ever loaded; the pattern adds an additional
+///              filename filter on top of that.
 ///
 /// Returns:
 ///     3D numpy array with shape (n_frames, height, width), dtype float64.

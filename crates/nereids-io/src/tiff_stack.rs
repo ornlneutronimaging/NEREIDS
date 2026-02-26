@@ -127,40 +127,7 @@ pub fn load_tiff_directory(dir: &Path) -> Result<Array3<f64>, IoError> {
         ));
     }
 
-    let mut frames: Vec<Vec<f64>> = Vec::new();
-    let mut width = 0u32;
-    let mut height = 0u32;
-
-    for (i, path) in paths.iter().enumerate() {
-        let file = std::fs::File::open(path)
-            .map_err(|e| IoError::FileNotFound(path.to_string_lossy().into_owned(), e))?;
-        let mut decoder = Decoder::new(file).map_err(|e| IoError::TiffDecode(format!("{}", e)))?;
-
-        let (w, h) = decoder
-            .dimensions()
-            .map_err(|e| IoError::TiffDecode(format!("{}", e)))?;
-
-        if i == 0 {
-            width = w;
-            height = h;
-        } else if w != width || h != height {
-            return Err(IoError::DimensionMismatch {
-                expected: (width, height),
-                got: (w, h),
-                frame: i,
-            });
-        }
-
-        let data = decoder
-            .read_image()
-            .map_err(|e| IoError::TiffDecode(format!("{}", e)))?;
-        frames.push(decode_to_f64(data)?);
-    }
-
-    let n_frames = frames.len();
-    let flat: Vec<f64> = frames.into_iter().flatten().collect();
-    Array3::from_shape_vec((n_frames, height as usize, width as usize), flat)
-        .map_err(|e| IoError::TiffDecode(format!("Shape error: {}", e)))
+    load_frames_from_paths(&paths)
 }
 
 /// Load a directory of TIFFs matching a glob pattern as a 3D stack.
@@ -190,9 +157,15 @@ pub fn load_tiff_folder(dir: &Path, pattern: Option<&str>) -> Result<Array3<f64>
         return Err(IoError::NotADirectory(dir.to_string_lossy().into_owned()));
     }
 
-    let mut paths: Vec<_> = std::fs::read_dir(dir)
+    // Collect directory entries, propagating per-entry read errors instead of
+    // silently dropping them (which could produce incomplete stacks).
+    let entries: Vec<_> = std::fs::read_dir(dir)
         .map_err(|e| IoError::FileNotFound(dir.to_string_lossy().into_owned(), e))?
-        .filter_map(|entry| entry.ok())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| IoError::FileNotFound(dir.to_string_lossy().into_owned(), e))?;
+
+    let mut paths: Vec<_> = entries
+        .iter()
         .filter(|entry| {
             // Use path().is_file() which follows symlinks, unlike file_type().is_file()
             let is_file = entry.path().is_file();
@@ -224,6 +197,15 @@ pub fn load_tiff_folder(dir: &Path, pattern: Option<&str>) -> Result<Array3<f64>
         });
     }
 
+    load_frames_from_paths(&paths)
+}
+
+/// Shared helper: load a sorted slice of single-frame TIFF paths into a 3D array.
+///
+/// Each file must contain exactly one frame.  Dimensions are checked for
+/// consistency across all files and pixel counts are validated against the
+/// reported image dimensions.
+fn load_frames_from_paths(paths: &[std::path::PathBuf]) -> Result<Array3<f64>, IoError> {
     let mut frames: Vec<Vec<f64>> = Vec::new();
     let mut width = 0u32;
     let mut height = 0u32;
@@ -251,7 +233,18 @@ pub fn load_tiff_folder(dir: &Path, pattern: Option<&str>) -> Result<Array3<f64>
         let data = decoder
             .read_image()
             .map_err(|e| IoError::TiffDecode(format!("{}", e)))?;
-        frames.push(decode_to_f64(data)?);
+
+        let pixels = decode_to_f64(data)?;
+        let expected_len = (width as usize) * (height as usize);
+        if pixels.len() != expected_len {
+            return Err(IoError::TiffDecode(format!(
+                "Frame {} has {} pixels, expected {}",
+                i,
+                pixels.len(),
+                expected_len
+            )));
+        }
+        frames.push(pixels);
     }
 
     let n_frames = frames.len();
@@ -265,24 +258,42 @@ pub fn load_tiff_folder(dir: &Path, pattern: Option<&str>) -> Result<Array3<f64>
 /// Supports `*` (matches zero or more characters) and `?` (matches exactly one
 /// Unicode character).  The match is case-insensitive to handle mixed-case
 /// extensions (`.TIF`, `.Tiff`, etc.).
+///
+/// Uses an iterative two-pointer algorithm (O(p*n) worst case) to avoid
+/// exponential blowup on pathological patterns like `*a*a*a*b`.
 fn glob_match(pattern: &str, name: &str) -> bool {
     let p: Vec<char> = pattern.to_lowercase().chars().collect();
     let n: Vec<char> = name.to_lowercase().chars().collect();
-    glob_match_inner(&p, &n)
-}
 
-fn glob_match_inner(pattern: &[char], name: &[char]) -> bool {
-    match (pattern.first(), name.first()) {
-        (None, None) => true,
-        (Some(&'*'), _) => {
-            // '*' matches zero characters (skip the star) or one character (consume from name)
-            glob_match_inner(&pattern[1..], name)
-                || (!name.is_empty() && glob_match_inner(pattern, &name[1..]))
+    let (mut pi, mut ni) = (0usize, 0usize);
+    // Saved backtrack positions when we encounter a '*'.
+    let (mut star_pi, mut star_ni) = (None::<usize>, 0usize);
+
+    while ni < n.len() {
+        if pi < p.len() && p[pi] == '*' {
+            // Record the star position and current name index for backtracking.
+            star_pi = Some(pi);
+            star_ni = ni;
+            pi += 1; // Try matching '*' with zero characters first.
+        } else if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if let Some(sp) = star_pi {
+            // Mismatch — backtrack: let the last '*' consume one more character.
+            star_ni += 1;
+            ni = star_ni;
+            pi = sp + 1;
+        } else {
+            return false;
         }
-        (Some(&'?'), Some(_)) => glob_match_inner(&pattern[1..], &name[1..]),
-        (Some(&p), Some(&n)) if p == n => glob_match_inner(&pattern[1..], &name[1..]),
-        _ => false,
     }
+
+    // Consume any trailing '*' characters in the pattern.
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+
+    pi == p.len()
 }
 
 /// Convert TIFF decoded data to f64 values.
@@ -504,6 +515,33 @@ mod tests {
     fn test_glob_match_case_insensitive() {
         assert!(glob_match("*.tif", "FILE.TIF"));
         assert!(glob_match("*.TIF", "file.tif"));
+    }
+
+    #[test]
+    fn test_glob_match_pattern_longer_than_name() {
+        assert!(!glob_match("abcdef.tif", "a.tif"));
+    }
+
+    #[test]
+    fn test_glob_match_pathological_pattern() {
+        // Verify the iterative matcher handles patterns that would cause
+        // exponential blowup in a naive recursive implementation.
+        let pattern = "*a*a*a*a*a*b";
+        let name = "aaaaaaaaaaaaaaaaaaaac";
+        assert!(!glob_match(pattern, name));
+    }
+
+    #[test]
+    fn test_load_tiff_folder_empty_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = load_tiff_folder(dir.path(), None);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, IoError::NoMatchingFiles { .. }),
+            "Expected NoMatchingFiles, got: {:?}",
+            err,
+        );
     }
 
     #[test]
