@@ -321,6 +321,21 @@ pub fn levenberg_marquardt(
             })
             .collect();
         let y_model = model.evaluate(&params.all_values());
+
+        // #P1: If the model produces NaN/Inf with all-fixed parameters,
+        // return converged=false rather than silently propagating NaN chi².
+        if !y_model.iter().all(|v| v.is_finite()) {
+            return LmResult {
+                chi_squared: f64::NAN,
+                reduced_chi_squared: f64::NAN,
+                iterations: 0,
+                converged: false,
+                params: params.all_values(),
+                covariance: Some(vec![]),
+                uncertainties: Some(vec![]),
+            };
+        }
+
         let residuals: Vec<f64> = y_obs
             .iter()
             .zip(y_model.iter())

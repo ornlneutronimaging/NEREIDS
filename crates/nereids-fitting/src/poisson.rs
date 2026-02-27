@@ -205,6 +205,18 @@ pub fn poisson_fit(
     if params.n_free() == 0 {
         let y_model = model.evaluate(&params.all_values());
         let nll = poisson_nll(y_obs, &y_model);
+
+        // #P1: If the model produces non-finite NLL with all-fixed parameters,
+        // return converged=false rather than silently claiming success.
+        if !nll.is_finite() {
+            return PoissonResult {
+                nll,
+                iterations: 0,
+                converged: false,
+                params: params.all_values(),
+            };
+        }
+
         return PoissonResult {
             nll,
             iterations: 0,
@@ -399,6 +411,18 @@ pub fn poisson_fit_analytic(
     if params.n_free() == 0 {
         let y_model = model.evaluate(&params.all_values());
         let nll = poisson_nll(y_obs, &y_model);
+
+        // #P1: If the model produces non-finite NLL with all-fixed parameters,
+        // return converged=false rather than silently claiming success.
+        if !nll.is_finite() {
+            return PoissonResult {
+                nll,
+                iterations: 0,
+                converged: false,
+                params: params.all_values(),
+            };
+        }
+
         return PoissonResult {
             nll,
             iterations: 0,
