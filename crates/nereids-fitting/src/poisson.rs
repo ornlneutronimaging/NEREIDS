@@ -101,7 +101,10 @@ fn poisson_nll(y_obs: &[f64], y_model: &[f64]) -> f64 {
 fn poisson_nll_term(obs: f64, mdl: f64) -> f64 {
     // #125.3: Negative observed counts would produce wrong-signed NLL terms.
     // Release builds skip this check; callers must ensure non-negative counts. See #125 item 3.
-    debug_assert!(obs >= 0.0, "poisson_nll_term: obs must be >= 0, got {obs}");
+    debug_assert!(
+        obs.is_finite() && obs >= 0.0,
+        "poisson_nll_term: obs must be finite and >= 0, got {obs}"
+    );
     if mdl > POISSON_EPSILON {
         mdl - obs * mdl.ln()
     } else {
@@ -138,8 +141,8 @@ fn poisson_nll_grad_term(obs: f64, mdl: f64) -> f64 {
     // #125.3: Negative observed counts would produce wrong-signed gradient terms.
     // Release builds skip this check; callers must ensure non-negative counts. See #125 item 3.
     debug_assert!(
-        obs >= 0.0,
-        "poisson_nll_grad_term: obs must be >= 0, got {obs}"
+        obs.is_finite() && obs >= 0.0,
+        "poisson_nll_grad_term: obs must be finite and >= 0, got {obs}"
     );
     if mdl > POISSON_EPSILON {
         1.0 - obs / mdl
