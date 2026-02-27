@@ -42,9 +42,17 @@ pub struct SpatialResult {
 ///   rayon tasks finish but no new pixels are started. The function returns
 ///   `Err(PipelineError::Cancelled)`.
 ///
+/// # Cancellation semantics
+/// If cancellation occurs mid-flight, pixels that already completed are
+/// included in the result.  The function returns `Err(Cancelled)` only if
+/// **no** pixels completed before cancellation was detected.  When at least
+/// one pixel finished, the partial result is returned as `Ok(SpatialResult)`
+/// with `n_total` reflecting only the completed pixels.
+///
 /// # Errors
 /// Returns `PipelineError::ShapeMismatch` if array dimensions are inconsistent,
-/// or `PipelineError::Cancelled` if the cancellation token is set.
+/// or `PipelineError::Cancelled` if the cancellation token is set before any
+/// pixel completes.
 ///
 /// # Returns
 /// Spatial result with density maps, uncertainty maps, and fit quality.

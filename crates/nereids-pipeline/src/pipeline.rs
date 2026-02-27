@@ -103,6 +103,13 @@ pub fn fit_spectrum(
             config.energies.len(),
         )));
     }
+    if sigma.len() != measured_t.len() {
+        return Err(PipelineError::ShapeMismatch(format!(
+            "sigma length ({}) must match measured_t length ({})",
+            sigma.len(),
+            measured_t.len(),
+        )));
+    }
     if config.fit_temperature && config.temperature_k < 1.0 {
         return Err(PipelineError::InvalidParameter(format!(
             "temperature_k ({}) must be >= 1.0 K when fit_temperature is true",
@@ -225,9 +232,17 @@ pub fn fit_spectrum(
         (None, None)
     };
 
+    // Guard: the LM result should always produce at least n_isotopes uncertainties,
+    // but use a safe fallback to NaN if the invariant is ever violated (e.g. by a
+    // future optimizer change) rather than panicking on the slice.
+    let uncertainties = uncertainties_all
+        .get(..n_isotopes)
+        .map(|s| s.to_vec())
+        .unwrap_or_else(|| vec![f64::NAN; n_isotopes]);
+
     Ok(SpectrumFitResult {
         densities,
-        uncertainties: uncertainties_all[..n_isotopes].to_vec(),
+        uncertainties,
         reduced_chi_squared: result.reduced_chi_squared,
         converged: result.converged,
         iterations: result.iterations,
@@ -338,5 +353,31 @@ mod tests {
         // measured_t length (2) != energies length (3)
         let result = fit_spectrum(&[0.9, 0.8], &[0.01, 0.01], &config);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_fit_spectrum_rejects_sigma_length_mismatch() {
+        let data = u238_single_resonance();
+        let config = FitConfig {
+            energies: vec![1.0, 2.0, 3.0],
+            resonance_data: vec![data],
+            isotope_names: vec!["U-238".into()],
+            temperature_k: 0.0,
+            resolution: None,
+            initial_densities: vec![0.001],
+            lm_config: LmConfig::default(),
+            precomputed_cross_sections: None,
+            fit_temperature: false,
+        };
+
+        // sigma length (2) != measured_t length (3) — should return ShapeMismatch
+        let result = fit_spectrum(&[0.9, 0.8, 0.7], &[0.01, 0.01], &config);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("sigma length"),
+            "Expected sigma mismatch error, got: {}",
+            err_msg,
+        );
     }
 }

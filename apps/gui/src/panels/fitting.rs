@@ -499,9 +499,11 @@ fn run_spatial_map(state: &mut AppState) {
             Err(nereids_pipeline::error::PipelineError::Cancelled) => {
                 // Cancelled — do nothing, receiver may already be dropped
             }
-            Err(_e) => {
+            Err(e) => {
                 // Validation error — receiver is still alive but we have no result.
                 // The channel will be closed when tx drops, signalling the error.
+                // Log to stderr so the error is not silently swallowed.
+                eprintln!("spatial_map error: {e}");
             }
         }
     });

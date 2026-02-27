@@ -195,9 +195,17 @@ pub fn estimate_nuisance(
 /// * `dead_pixels` — Optional dead pixel mask.
 /// * `cancel` — Optional cancellation token. Checked per-pixel to stop early.
 ///
+/// # Cancellation semantics
+/// If cancellation occurs mid-flight, pixels that already completed are
+/// included in the result.  The function returns `Err(Cancelled)` only if
+/// **no** pixels completed before cancellation was detected.  When at least
+/// one pixel finished, the partial result is returned as `Ok(SparseResult)`
+/// with `n_total` reflecting only the completed pixels.
+///
 /// # Errors
 /// Returns `PipelineError::ShapeMismatch` if array dimensions are inconsistent,
-/// or `PipelineError::Cancelled` if the cancellation token is set.
+/// or `PipelineError::Cancelled` if the cancellation token is set before any
+/// pixel completes.
 pub fn sparse_reconstruct(
     sample_counts: &Array3<f64>,
     nuisance: &NuisanceParams,
