@@ -9,7 +9,9 @@
 //! - [`pipeline`] — Single-spectrum analysis pipeline (fit_spectrum)
 //! - [`spatial`] — Per-pixel parallel mapping with rayon, ROI fitting
 //! - [`sparse`] — TRINIDI-inspired two-stage reconstruction for low-count data
+//! - [`detectability`] — Trace-detectability analysis (pre-experiment SNR check)
 
+pub mod detectability;
 pub mod pipeline;
 pub mod sparse;
 pub mod spatial;

@@ -49,6 +49,7 @@ use nereids_physics::resolution::{
     self, ResolutionFunction, ResolutionParams, TabulatedResolution,
 };
 use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
+use nereids_pipeline::detectability;
 use nereids_pipeline::pipeline::FitConfig;
 use nereids_pipeline::sparse::{SparseConfig, estimate_nuisance, sparse_reconstruct};
 
@@ -1089,6 +1090,8 @@ fn validate_gaussian_params(fp: f64, dt: f64, dl: f64) -> PyResult<()> {
 }
 
 /// Validate that an energy grid is finite, positive, and sorted ascending.
+/// Empty grids are accepted (callers that need non-empty should use
+/// `require_non_empty_energy_grid` instead).
 fn validate_energy_grid(e: &[f64]) -> PyResult<()> {
     if e.is_empty() {
         return Ok(());
@@ -1111,6 +1114,16 @@ fn validate_energy_grid(e: &[f64]) -> PyResult<()> {
         }
     }
     Ok(())
+}
+
+/// Validate that an energy grid is **non-empty**, finite, positive, and sorted.
+fn require_non_empty_energy_grid(e: &[f64]) -> PyResult<()> {
+    if e.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "energies must not be empty",
+        ));
+    }
+    validate_energy_grid(e)
 }
 
 /// Build a `ResolutionFunction` from Python arguments.
@@ -1964,6 +1977,248 @@ fn py_natural_isotopes(z: u32) -> Vec<((u32, u32), f64)> {
         .collect()
 }
 
+/// Result of a trace-detectability analysis.
+///
+/// Returned by ``trace_detectability()`` and ``trace_detectability_survey()``.
+/// Contains the peak SNR, the energy at which peak contrast occurs, and the
+/// full |ΔT| spectrum for plotting.
+#[pyclass(name = "TraceDetectabilityReport")]
+struct PyTraceDetectabilityReport {
+    inner: detectability::TraceDetectabilityReport,
+}
+
+#[pymethods]
+impl PyTraceDetectabilityReport {
+    /// Peak |ΔT| per ppm concentration at the most sensitive energy.
+    #[getter]
+    fn peak_delta_t_per_ppm(&self) -> f64 {
+        self.inner.peak_delta_t_per_ppm
+    }
+
+    /// Energy at which peak contrast occurs (eV).
+    #[getter]
+    fn peak_energy_ev(&self) -> f64 {
+        self.inner.peak_energy_ev
+    }
+
+    /// Estimated peak SNR at the given concentration and I₀.
+    #[getter]
+    fn peak_snr(&self) -> f64 {
+        self.inner.peak_snr
+    }
+
+    /// Whether the combination is detectable (SNR > threshold).
+    #[getter]
+    fn detectable(&self) -> bool {
+        self.inner.detectable
+    }
+
+    /// Energy-resolved |ΔT| spectrum for the given concentration.
+    #[getter]
+    fn delta_t_spectrum<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        PyArray1::from_vec(py, self.inner.delta_t_spectrum.clone())
+    }
+
+    /// Energies used (eV).
+    #[getter]
+    fn energies<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        PyArray1::from_vec(py, self.inner.energies.clone())
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "TraceDetectabilityReport(detectable={}, peak_snr={:.2}, peak_energy_ev={:.2})",
+            self.inner.detectable, self.inner.peak_snr, self.inner.peak_energy_ev,
+        )
+    }
+}
+
+/// Compute trace-detectability for a matrix + trace isotope pair.
+///
+/// Determines whether a trace isotope is detectable at a given concentration
+/// (in ppm) within a matrix, by computing the peak spectral SNR over the
+/// supplied energy window.
+///
+/// Resolution broadening can be applied via either Gaussian parameters
+/// (``flight_path_m``, ``delta_t_us``, ``delta_l_m``) or a tabulated
+/// resolution function (``resolution``). Providing both is an error.
+///
+/// Args:
+///     matrix: ResonanceData for the matrix isotope.
+///     matrix_density: Matrix areal density in atoms/barn.
+///     trace: ResonanceData for the trace isotope.
+///     trace_ppm: Trace concentration in ppm by atom.
+///     energies: Energy grid in eV (1D numpy array, sorted ascending).
+///     i0: Expected counts per energy bin (for Poisson noise estimate).
+///     temperature_k: Sample temperature in Kelvin (default 293.6).
+///     flight_path_m: Flight path for Gaussian resolution (optional).
+///     delta_t_us: Timing uncertainty for Gaussian resolution (optional).
+///     delta_l_m: Path length uncertainty for Gaussian resolution (optional).
+///     resolution: TabulatedResolution for tabulated broadening (optional).
+///     snr_threshold: Detection threshold in σ (default 3.0).
+///
+/// Returns:
+///     TraceDetectabilityReport with peak SNR, peak energy, and |ΔT| spectrum.
+#[pyfunction]
+#[pyo3(name = "trace_detectability", signature = (matrix, matrix_density, trace, trace_ppm, energies, i0, temperature_k=293.6, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, snr_threshold=3.0))]
+fn py_trace_detectability(
+    matrix: &PyResonanceData,
+    matrix_density: f64,
+    trace: &PyResonanceData,
+    trace_ppm: f64,
+    energies: PyReadonlyArray1<f64>,
+    i0: f64,
+    temperature_k: f64,
+    flight_path_m: Option<f64>,
+    delta_t_us: Option<f64>,
+    delta_l_m: Option<f64>,
+    resolution: Option<PyTabulatedResolution>,
+    snr_threshold: f64,
+) -> PyResult<PyTraceDetectabilityReport> {
+    let e = energies.as_slice()?;
+    require_non_empty_energy_grid(e)?;
+
+    if matrix_density <= 0.0 || !matrix_density.is_finite() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "matrix_density must be finite and positive",
+        ));
+    }
+    if trace_ppm < 0.0 || !trace_ppm.is_finite() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "trace_ppm must be finite and non-negative",
+        ));
+    }
+    if i0 <= 0.0 || !i0.is_finite() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "i0 must be finite and positive",
+        ));
+    }
+    if !temperature_k.is_finite() || temperature_k < 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "temperature_k must be finite and non-negative",
+        ));
+    }
+    if snr_threshold < 0.0 || !snr_threshold.is_finite() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "snr_threshold must be finite and non-negative",
+        ));
+    }
+
+    let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution)?;
+
+    let config = detectability::TraceDetectabilityConfig {
+        matrix: &matrix.inner,
+        matrix_density,
+        energies: e,
+        i0,
+        temperature_k,
+        resolution: res_fn.as_ref(),
+        snr_threshold,
+    };
+
+    let report = detectability::trace_detectability(&config, &trace.inner, trace_ppm);
+
+    Ok(PyTraceDetectabilityReport { inner: report })
+}
+
+/// Survey multiple trace candidates against a single matrix.
+///
+/// Parallelises over candidates with rayon. Returns a list of
+/// ``(isotope_name, TraceDetectabilityReport)`` tuples sorted by
+/// ``peak_snr`` descending.
+///
+/// Resolution broadening can be applied via either Gaussian parameters
+/// (``flight_path_m``, ``delta_t_us``, ``delta_l_m``) or a tabulated
+/// resolution function (``resolution``). Providing both is an error.
+///
+/// Args:
+///     matrix: ResonanceData for the matrix isotope.
+///     matrix_density: Matrix areal density in atoms/barn.
+///     trace_candidates: List of ResonanceData for candidate trace isotopes.
+///     trace_ppm: Trace concentration in ppm by atom.
+///     energies: Energy grid in eV (1D numpy array, sorted ascending).
+///     i0: Expected counts per energy bin (for Poisson noise estimate).
+///     temperature_k: Sample temperature in Kelvin (default 293.6).
+///     flight_path_m: Flight path for Gaussian resolution (optional).
+///     delta_t_us: Timing uncertainty for Gaussian resolution (optional).
+///     delta_l_m: Path length uncertainty for Gaussian resolution (optional).
+///     resolution: TabulatedResolution for tabulated broadening (optional).
+///     snr_threshold: Detection threshold in σ (default 3.0).
+///
+/// Returns:
+///     List of (isotope_name, TraceDetectabilityReport) sorted by peak_snr descending.
+#[pyfunction]
+#[pyo3(name = "trace_detectability_survey", signature = (matrix, matrix_density, trace_candidates, trace_ppm, energies, i0, temperature_k=293.6, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, snr_threshold=3.0))]
+fn py_trace_detectability_survey(
+    matrix: &PyResonanceData,
+    matrix_density: f64,
+    trace_candidates: Vec<PyResonanceData>,
+    trace_ppm: f64,
+    energies: PyReadonlyArray1<f64>,
+    i0: f64,
+    temperature_k: f64,
+    flight_path_m: Option<f64>,
+    delta_t_us: Option<f64>,
+    delta_l_m: Option<f64>,
+    resolution: Option<PyTabulatedResolution>,
+    snr_threshold: f64,
+) -> PyResult<Vec<(String, PyTraceDetectabilityReport)>> {
+    let e = energies.as_slice()?;
+    require_non_empty_energy_grid(e)?;
+
+    if matrix_density <= 0.0 || !matrix_density.is_finite() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "matrix_density must be finite and positive",
+        ));
+    }
+    if trace_ppm < 0.0 || !trace_ppm.is_finite() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "trace_ppm must be finite and non-negative",
+        ));
+    }
+    if i0 <= 0.0 || !i0.is_finite() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "i0 must be finite and positive",
+        ));
+    }
+    if !temperature_k.is_finite() || temperature_k < 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "temperature_k must be finite and non-negative",
+        ));
+    }
+    if snr_threshold < 0.0 || !snr_threshold.is_finite() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "snr_threshold must be finite and non-negative",
+        ));
+    }
+    if trace_candidates.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "trace_candidates must not be empty",
+        ));
+    }
+
+    let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution)?;
+
+    let candidates: Vec<ResonanceData> = trace_candidates.into_iter().map(|d| d.inner).collect();
+
+    let config = detectability::TraceDetectabilityConfig {
+        matrix: &matrix.inner,
+        matrix_density,
+        energies: e,
+        i0,
+        temperature_k,
+        resolution: res_fn.as_ref(),
+        snr_threshold,
+    };
+
+    let results = detectability::trace_detectability_survey(&config, &candidates, trace_ppm);
+
+    Ok(results
+        .into_iter()
+        .map(|(name, report)| (name, PyTraceDetectabilityReport { inner: report }))
+        .collect())
+}
+
 /// NEREIDS Python module.
 #[pymodule]
 fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -1972,6 +2227,7 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTabulatedResolution>()?;
     m.add_class::<PySpatialResult>()?;
     m.add_class::<PySparseResult>()?;
+    m.add_class::<PyTraceDetectabilityReport>()?;
     m.add_function(wrap_pyfunction!(cross_sections, m)?)?;
     m.add_function(wrap_pyfunction!(forward_model, m)?)?;
     m.add_function(wrap_pyfunction!(fit_spectrum, m)?)?;
@@ -1996,5 +2252,7 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_parse_isotope_str, m)?)?;
     m.add_function(wrap_pyfunction!(py_natural_abundance, m)?)?;
     m.add_function(wrap_pyfunction!(py_natural_isotopes, m)?)?;
+    m.add_function(wrap_pyfunction!(py_trace_detectability, m)?)?;
+    m.add_function(wrap_pyfunction!(py_trace_detectability_survey, m)?)?;
     Ok(())
 }
