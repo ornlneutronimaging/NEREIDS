@@ -17,20 +17,34 @@ second opinion from a different AI provider.
 ## Execution
 
 Discover worktrees, then launch one `Bash` command per worktree **in parallel**
-(background mode):
+(background mode).
+
+### Codex CLI invocation (with fallback chain)
+
+The Codex CLI changes syntax between versions. Try these in order:
 
 ```bash
+# Primary — current stable syntax (no custom prompt with --base)
 cd {worktree_path} && codex review --base main 2>&1
+
+# If "unexpected argument" or similar → try without --base
+cd {worktree_path} && codex review 2>&1
 ```
+
+**Known CLI pitfalls** (as of Feb 2026):
+- `--approval` flag was removed — do not use
+- `--base` and positional `[PROMPT]` are mutually exclusive — use `--base main` alone
+- Piping a prompt via stdin (`echo "..." | codex review --base main -`) does not work
 
 ### Failure handling
 
 Codex may fail due to:
+- CLI syntax change — try fallback invocations above
 - Network issues — retry once, then skip
 - Xcode license (macOS) — inform user to run `sudo xcodebuild -license accept`
 - Timeout — note and skip
 
-If Codex is unavailable, offer to fall back to Gemini CLI:
+If Codex is entirely unavailable, offer to fall back to Gemini CLI:
 ```bash
 cd {worktree_path} && git diff main...HEAD | gemini -p "Review this diff for a Rust neutron physics library. Focus on panics, validation gaps, edge cases, numerical stability. Report findings as P1 (must fix) / P2 (should fix) with file:line references."
 ```

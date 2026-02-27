@@ -78,8 +78,12 @@ worktree in the same message:
 cd {worktree_path} && codex review --base main 2>&1
 ```
 
-If Codex fails (network, license, or timeout), note the failure and continue.
-Codex is supplementary, not blocking.
+**Known CLI pitfalls** (as of Feb 2026): `--approval` removed; `--base`
+and `[PROMPT]` are mutually exclusive — use `--base main` alone, no custom
+prompt. If this syntax fails, try `codex review` without flags.
+
+If Codex fails (network, license, syntax change, or timeout), note the
+failure and continue. Codex is supplementary, not blocking.
 
 **Fallback**: If Codex is unavailable, use Gemini CLI instead:
 ```bash
@@ -166,10 +170,28 @@ After committing and pushing, check:
   review. Consider whether the PR scope is too large or needs task
   decomposition."
 
-## Step 9: Track Deferred P2 Findings
+## Step 9: Post-Merge Integration Test
 
-After the pipeline completes (zero P1s), create GitHub issues to track the
-P2 findings that were deferred during consolidation:
+After all PRs in the batch are merged, verify the merged main:
+
+```bash
+git fetch origin && git checkout main && git pull origin main
+cargo test --workspace --exclude nereids-python
+```
+
+This catches cross-PR regressions (e.g., a test in crate A that depended
+on behavior changed by a PR in crate B). If tests fail, fix on main
+immediately — these are integration bugs, not review failures.
+
+**Lesson**: The U-233 LFW=1 test broke after merging 4 PRs because the
+test expected old behavior that was changed in a different PR. Each branch
+passed in isolation, but the merged state failed.
+
+## Step 10: Track Deferred P2 Findings
+
+**Do NOT skip this step.** After the pipeline completes (zero P1s and PRs
+merged), create GitHub issues for every P2 finding deferred during
+consolidation:
 
 1. Group deferred P2s by branch/crate
 2. Create one issue per group with:
@@ -178,7 +200,9 @@ P2 findings that were deferred during consolidation:
    - Reference the corresponding merged PR
 3. Report the created issue numbers to the user
 
-This ensures P2s aren't forgotten without blocking the merge.
+This ensures P2s aren't forgotten without blocking the merge. In the past
+two pipeline runs, ~20 P2s were identified but no tracking issues were
+created. This is a process gap.
 
 ## Pre-commit Checklist (per CLAUDE.md)
 

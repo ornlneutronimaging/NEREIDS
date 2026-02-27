@@ -55,64 +55,45 @@ The workspace run is fast (~2 s) and prevents cross-crate breakage.
 
 ## Multi-AI Review Pipeline (mandatory before merging PRs)
 
-Every feature branch must pass a two-phase review before merge.
+Every feature branch must pass a multi-stage review before merge.
+Run `/review-pipeline` to execute the full pipeline across active worktrees.
 
-### Phase A — Local iterative review (Claude + Codex)
+| Phase | Tool | Skill | When |
+|-------|------|-------|------|
+| A (local) | Claude subagent + Codex CLI | `/review-pipeline`, `/self-review`, `/codex-review` | Before push |
+| B (remote) | GitHub Copilot (manual trigger) | — | After push to PR |
 
-Run "review pipeline" to execute the local review loop. The pipeline runs
-these stages per iteration:
+**Phase A** iterates until zero P1s (max 4 rounds, then escalate to human).
+**Phase B** re-iterates if 3+ P1s or P1 ratio > 40%; otherwise fix inline
+and merge. Dismiss Copilot comments that rehash addressed issues or flag
+impossible edge cases.
 
-1. **Self-audit** (Claude subagent) — architecture, physics, design
-2. **External review** (Codex CLI) — fresh eyes, panic/edge-case detection
-3. **Consolidation** — merge findings, present P1/P2 report for approval
-4. **Fix** — parallel fix agents per worktree
-5. **Verification** — re-audit to confirm fixes
-6. **Commit & push**
+**Post-merge**: always run `cargo test --workspace --exclude nereids-python`
+on the merged main to catch cross-PR integration regressions.
 
-Individual stages: "self-review", "codex-review"
+## Validation Patterns
 
-**Iterate locally until zero P1s remain.** Then push to remote for Phase B.
+Lessons from review pipeline findings — apply these consistently:
 
-Maximum **4 local iterations** per branch. If P1s persist after 4 rounds,
-stop and escalate to human developer review — this signals systematic
-issues that need manual assessment (scope too large, task decomposition
-needed, or fundamental design problems).
-
-### Phase B — Copilot review (manual trigger on GitHub)
-
-After pushing, the developer manually triggers Copilot review on the PR.
-Fetch comments:
-```bash
-gh api repos/{owner}/{repo}/pulls/{pr}/comments \
-  --jq '.[] | {path, line, body, created_at}'
-```
-
-**Copilot re-iteration gate** (combined threshold):
-
-Re-iterate locally (back to Phase A) if **either** condition is met:
-- **3+ confirmed P1s** from Copilot review, OR
-- **P1 ratio > 40%** of total Copilot findings
-
-Otherwise (0-2 P1s and ratio ≤ 40%): fix the findings inline, push, and
-merge the PR.
-
-Dismiss Copilot comments that rehash addressed issues, debate design with
-no clear improvement, or flag impossible edge cases. These do not count
-toward the threshold.
-
-### Why these thresholds
-
-AI reviewers have higher false-positive rates than human reviewers, so a
-ratio-based gate (not "any P1 blocks") avoids infinite loops from
-hallucinated findings. The absolute count (3+) catches cases where few
-total findings exist but most are critical.
+- **Validate config up-front** in public entry points (`fit_spectrum`,
+  `spatial_map`, `fit_roi`, `sparse_reconstruct`). Check lengths,
+  emptiness, and finiteness *before* entering rayon parallel iterators.
+  Silent `Err(_) => None` in `filter_map` is acceptable only for
+  per-pixel numerical edge cases, never for config errors.
+- **NaN bypasses guards**: `NaN < 1.0` is `false`, so range checks like
+  `x < 1.0` don't catch NaN. Always pair with `.is_finite()`.
+- **Empty collections pass equality**: `0 == 0` passes length-match
+  checks. Guard `is_empty()` or `> 0` separately.
+- **`debug_assert!` for impossible states**: use `obs.is_finite() &&
+  obs >= 0.0` pattern — catches both NaN and negative in one assert.
 
 ## Git Workflow
 
 - **origin**: `ornlneutronimaging/NEREIDS` — primary repo, issues, releases,
   main branch.  All branches and PRs are pushed here directly.
-- **upstream** (secondary): `KedoKudo/NEREIDS` — personal fork, kept as
-  backup remote.
+- No other remotes configured.  The `KedoKudo/NEREIDS` fork exists on GitHub
+  but is not added as a local remote (removed to avoid `gh` targeting the
+  wrong repo).
 
 ## Reference Codebases (siblings of this repo)
 
