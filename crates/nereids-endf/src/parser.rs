@@ -292,7 +292,7 @@ struct RangeParseContext<'a> {
 
 /// Parse a Breit-Wigner (SLBW or MLBW) resolved resonance range.
 ///
-/// ENDF-6 File 2, LRF=1:
+/// ENDF-6 File 2, LRF=1 (SLBW) / LRF=2 (MLBW):
 /// - CONT: SPI, AP, 0, 0, NLS, 0
 /// - For each L-value:
 ///   - CONT: AWRI, 0.0, L, 0, 6*NRS, NRS
@@ -386,12 +386,13 @@ fn parse_bw_range(
 /// Parse a Reich-Moore resolved resonance range.
 ///
 /// ENDF-6 File 2, LRF=2:
+/// ENDF-6 File 2, LRF=3 (Reich-Moore):
 /// - CONT: SPI, AP, 0, 0, NLS, 0
 /// - For each L-value:
 ///   - CONT: AWRI, APL, L, 0, 6*NRS, NRS
 ///   - LIST: NRS resonances, each 6 values: ER, AJ, GN, GG, GFA, GFB
 ///
-/// Reference: ENDF-6 Formats Manual Section 2.2.1.2
+/// Reference: ENDF-6 Formats Manual Section 2.2.1.3
 /// Reference: SAMMY manual Section 2 (R-matrix theory)
 fn parse_reich_moore_range(
     ctx: &mut RangeParseContext<'_>,
@@ -872,9 +873,9 @@ fn checked_count(value: i32, label: &str) -> Result<usize, EndfParseError> {
 
 /// Skip an unsupported URR body (CONT + NLS L-groups with their LIST data).
 ///
-/// Called when LRU=2 has an LRF value other than 1 or 2 (or when LFW=1 is
-/// encountered) so that the records for this range are consumed and subsequent
-/// ranges can still be parsed.
+/// Called when LRU=2 has an LRF value other than 1 or 2 so that the records
+/// for this range are consumed and subsequent ranges can still be parsed.
+/// Note: LFW!=0 is rejected with a hard error before reaching this helper.
 ///
 /// Structure consumed (ENDF-6 §2.2.2, all LRF variants share this skeleton):
 /// ```text
