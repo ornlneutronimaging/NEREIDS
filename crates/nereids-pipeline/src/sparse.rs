@@ -237,6 +237,20 @@ pub fn sparse_reconstruct(
         });
     }
 
+    if config.initial_densities.len() != n_isotopes {
+        return Err(PipelineError::ShapeMismatch(format!(
+            "initial_densities length ({}) != resonance_data length ({})",
+            config.initial_densities.len(),
+            n_isotopes,
+        )));
+    }
+    if config.isotope_names.len() != n_isotopes {
+        return Err(PipelineError::ShapeMismatch(format!(
+            "isotope_names length ({}) != resonance_data length ({})",
+            config.isotope_names.len(),
+            n_isotopes,
+        )));
+    }
     if n_energies != config.energies.len() {
         return Err(PipelineError::ShapeMismatch(format!(
             "sample_counts spectral axis ({}) != config.energies length ({})",
@@ -550,6 +564,29 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_sparse_reconstruct_rejects_density_len_mismatch() {
+        let data = u238_single_resonance();
+        let config = SparseConfig {
+            energies: vec![1.0, 2.0, 3.0],
+            resonance_data: vec![data],
+            isotope_names: vec!["U-238".into()],
+            temperature_k: 0.0,
+            resolution: None,
+            initial_densities: vec![], // wrong: should be 1 element
+            poisson_config: PoissonConfig::default(),
+        };
+        let sample = Array3::from_elem((3, 2, 2), 50.0);
+        let nuisance = NuisanceParams {
+            flux: vec![100.0; 3],
+            background: vec![0.0; 3],
+        };
+        let result = sparse_reconstruct(&sample, &nuisance, &config, None, None);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("initial_densities"), "error: {msg}");
     }
 
     #[test]
