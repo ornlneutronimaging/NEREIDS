@@ -38,10 +38,10 @@ use nereids_endf::resonance::{
     LGroup, Resonance, ResonanceData, ResonanceFormalism, ResonanceRange,
 };
 use nereids_endf::retrieval::{EndfLibrary, EndfRetriever, mat_number};
-use nereids_fitting::lm::{self, LmConfig};
+use nereids_fitting::lm::{self, FitModel, LmConfig};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
-use nereids_fitting::poisson::PoissonConfig;
-use nereids_fitting::transmission_model::TransmissionFitModel;
+use nereids_fitting::poisson::{self, CountsModel, PoissonConfig, TemperatureContext};
+use nereids_fitting::transmission_model::{PrecomputedTransmissionModel, TransmissionFitModel};
 use nereids_io::normalization::{self as norm, NormalizationParams};
 use nereids_io::tof::BeamlineParams;
 use nereids_physics::doppler::{self, DopplerParams};
@@ -534,15 +534,23 @@ fn forward_model<'py>(
 ///     delta_l_m: Path length uncertainty in meters (optional).
 ///     resolution: TabulatedResolution from ``load_resolution()`` (optional).
 ///     fit_temperature: If ``True``, treat ``temperature_k`` as the initial
-///         guess and include it as a free parameter in the LM fit.
+///         guess and include it as a free parameter in the fit.
 ///         The fitted value and 1-sigma uncertainty are returned in
 ///         ``result.temperature_k`` and ``result.temperature_k_unc``.
+///     fitter: Optimizer to use.
+///
+///         - ``"lm"`` (default): Levenberg-Marquardt (chi-squared).
+///           ``measured_t`` is transmission, ``sigma`` is uncertainties.
+///         - ``"poisson"``: Poisson NLL with analytical gradient.
+///           ``measured_t`` is sample counts, ``sigma`` is open-beam/flux counts.
+///           ``result.reduced_chi_squared`` contains the final NLL (not chi-squared).
 ///
 /// Returns:
 ///     FitResult with densities, uncertainties, and fit quality.
 #[pyfunction]
-#[pyo3(signature = (measured_t, sigma, energies, isotopes, temperature_k=0.0, initial_densities=None, max_iter=100, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, fit_temperature=false))]
+#[pyo3(signature = (measured_t, sigma, energies, isotopes, temperature_k=0.0, initial_densities=None, max_iter=100, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, fit_temperature=false, fitter="lm"))]
 fn fit_spectrum(
+    py: Python<'_>,
     measured_t: PyReadonlyArray1<f64>,
     sigma: PyReadonlyArray1<f64>,
     energies: PyReadonlyArray1<f64>,
@@ -555,6 +563,7 @@ fn fit_spectrum(
     delta_l_m: Option<f64>,
     resolution: Option<PyTabulatedResolution>,
     fit_temperature: bool,
+    fitter: &str,
 ) -> PyResult<PyFitResult> {
     let e = energies.as_slice()?;
     let t = measured_t.as_slice()?;
@@ -611,94 +620,222 @@ fn fit_spectrum(
     }
 
     let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution)?;
-    let instrument = res_fn.map(|r| Arc::new(InstrumentParams { resolution: r }));
 
-    // When fitting temperature, append it as an extra parameter after the
-    // density parameters.  temperature_index points to params[n_isotopes].
-    let temperature_index = if fit_temperature {
-        Some(n_isotopes)
-    } else {
-        None
-    };
+    match fitter {
+        "lm" => {
+            let instrument = res_fn.map(|r| Arc::new(InstrumentParams { resolution: r }));
+            let temperature_index = if fit_temperature {
+                Some(n_isotopes)
+            } else {
+                None
+            };
 
-    let model = TransmissionFitModel {
-        energies: e.to_vec(),
-        resonance_data: res_data,
-        temperature_k,
-        instrument,
-        density_indices: (0..n_isotopes).collect(),
-        temperature_index,
-    };
+            // Copy numpy slices to owned vectors so we can release the GIL.
+            let e_owned = e.to_vec();
+            let t_owned = t.to_vec();
+            let s_owned = s.to_vec();
 
-    let mut param_vec: Vec<FitParameter> = init
-        .iter()
-        .enumerate()
-        .map(|(i, &d)| FitParameter::non_negative(format!("isotope_{}", i), d))
-        .collect();
+            // Release the GIL for the heavy computation.
+            py.allow_threads(move || {
+                let model = TransmissionFitModel {
+                    energies: e_owned,
+                    resonance_data: res_data,
+                    temperature_k,
+                    instrument,
+                    density_indices: (0..n_isotopes).collect(),
+                    temperature_index,
+                };
 
-    if fit_temperature {
-        // Lower bound of 1 K keeps the optimizer in the physically meaningful
-        // regime where Doppler broadening is always active, avoiding the
-        // model discontinuity at T=0.
-        param_vec.push(FitParameter {
-            name: "temperature_k".into(),
-            value: temperature_k,
-            lower: 1.0,
-            upper: f64::INFINITY,
-            fixed: false,
-        });
+                let mut param_vec: Vec<FitParameter> = init
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &d)| FitParameter::non_negative(format!("isotope_{}", i), d))
+                    .collect();
+
+                if fit_temperature {
+                    param_vec.push(FitParameter {
+                        name: "temperature_k".into(),
+                        value: temperature_k,
+                        lower: 1.0,
+                        upper: 5000.0,
+                        fixed: false,
+                    });
+                }
+
+                let mut params = ParameterSet::new(param_vec);
+                let config = LmConfig {
+                    max_iter,
+                    ..LmConfig::default()
+                };
+
+                let result =
+                    lm::levenberg_marquardt(&model, &t_owned, &s_owned, &mut params, &config);
+
+                let n_total = n_isotopes + if fit_temperature { 1 } else { 0 };
+                let densities: Vec<f64> = (0..n_isotopes).map(|i| result.params[i]).collect();
+                let unc = result
+                    .uncertainties
+                    .unwrap_or_else(|| vec![f64::NAN; n_total]);
+                assert!(
+                    unc.len() >= n_total,
+                    "uncertainty vector length ({}) should be >= parameter count ({})",
+                    unc.len(),
+                    n_total
+                );
+                let uncertainties: Vec<f64> = (0..n_isotopes)
+                    .map(|i| unc.get(i).copied().unwrap_or(f64::NAN))
+                    .collect();
+
+                let (fitted_temperature, fitted_temperature_unc) = if fit_temperature {
+                    (
+                        Some(result.params[n_isotopes]),
+                        Some(unc.get(n_isotopes).copied().unwrap_or(f64::NAN)),
+                    )
+                } else {
+                    (None, None)
+                };
+
+                Ok(PyFitResult {
+                    densities,
+                    uncertainties,
+                    reduced_chi_squared: result.reduced_chi_squared,
+                    converged: result.converged,
+                    iterations: result.iterations,
+                    temperature_k: fitted_temperature,
+                    temperature_k_unc: fitted_temperature_unc,
+                })
+            })
+        }
+
+        "poisson" => {
+            // Copy numpy slices to owned vectors so we can release the GIL.
+            let e_owned = e.to_vec();
+            let y_obs = t.to_vec();
+            let flux_owned = s.to_vec();
+
+            let instrument = res_fn.map(|r| InstrumentParams { resolution: r });
+
+            // Release the GIL for the heavy computation.
+            py.allow_threads(move || {
+                // Precompute broadened cross-sections at the initial temperature.
+                let xs = transmission::broadened_cross_sections(
+                    &e_owned,
+                    &res_data,
+                    temperature_k,
+                    instrument.as_ref(),
+                    None,
+                )
+                .expect("broadened_cross_sections should not be cancelled");
+
+                // Build density parameters.
+                let mut param_vec: Vec<FitParameter> = init
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &d)| FitParameter::non_negative(format!("isotope_{}", i), d))
+                    .collect();
+
+                // When fitting temperature, add it as an extra free parameter.
+                if fit_temperature {
+                    param_vec.push(FitParameter {
+                        name: "temperature_k".into(),
+                        value: temperature_k,
+                        lower: 1.0,
+                        upper: 5000.0,
+                        fixed: false,
+                    });
+                }
+
+                let mut params = ParameterSet::new(param_vec);
+
+                // The transmission model for CountsModel: uses precomputed xs
+                // (or full physics model when fitting temperature).
+                let density_indices: Vec<usize> = (0..n_isotopes).collect();
+                let xs_arc = Arc::new(xs.clone());
+                let precomputed = PrecomputedTransmissionModel {
+                    cross_sections: xs_arc,
+                    density_indices: density_indices.clone(),
+                };
+
+                // When fitting temperature, use TransmissionFitModel (full physics
+                // per evaluation) so the model sees the changing T.
+                let temp_ctx = if fit_temperature {
+                    Some(TemperatureContext {
+                        temperature_index: n_isotopes,
+                        resonance_data: res_data.clone(),
+                        energies: e_owned.clone(),
+                        instrument: instrument.clone(),
+                    })
+                } else {
+                    None
+                };
+
+                let full_model;
+                let t_model: &dyn FitModel = if fit_temperature {
+                    full_model = TransmissionFitModel {
+                        energies: e_owned,
+                        resonance_data: res_data,
+                        temperature_k,
+                        instrument: instrument.map(Arc::new),
+                        density_indices: density_indices.clone(),
+                        temperature_index: Some(n_isotopes),
+                    };
+                    &full_model
+                } else {
+                    &precomputed
+                };
+
+                let background = vec![0.0f64; flux_owned.len()];
+                let counts_model = CountsModel {
+                    transmission_model: t_model,
+                    flux: &flux_owned,
+                    background: &background,
+                    density_param_range: 0..n_isotopes,
+                };
+
+                let poisson_config = PoissonConfig {
+                    max_iter,
+                    ..PoissonConfig::default()
+                };
+
+                let result = poisson::poisson_fit_analytic(
+                    &counts_model,
+                    &y_obs,
+                    &flux_owned,
+                    &xs,
+                    &density_indices,
+                    &mut params,
+                    &poisson_config,
+                    temp_ctx.as_ref(),
+                );
+
+                let densities: Vec<f64> = (0..n_isotopes).map(|i| result.params[i]).collect();
+                // Poisson optimizer does not compute uncertainties from covariance;
+                // report NaN for now.
+                let uncertainties = vec![f64::NAN; n_isotopes];
+
+                let (fitted_temperature, fitted_temperature_unc) = if fit_temperature {
+                    (Some(result.params[n_isotopes]), Some(f64::NAN))
+                } else {
+                    (None, None)
+                };
+
+                Ok(PyFitResult {
+                    densities,
+                    uncertainties,
+                    reduced_chi_squared: result.nll,
+                    converged: result.converged,
+                    iterations: result.iterations,
+                    temperature_k: fitted_temperature,
+                    temperature_k_unc: fitted_temperature_unc,
+                })
+            })
+        }
+
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "fitter must be 'lm' or 'poisson', got '{}'",
+            other,
+        ))),
     }
-
-    let mut params = ParameterSet::new(param_vec);
-
-    let config = LmConfig {
-        max_iter,
-        ..LmConfig::default()
-    };
-
-    let result = lm::levenberg_marquardt(&model, t, s, &mut params, &config);
-
-    // All density + temperature parameters are free, so n_free == n_params
-    // and the uncertainty vector is indexed identically to result.params.
-    let n_total_params = n_isotopes + if fit_temperature { 1 } else { 0 };
-    debug_assert_eq!(
-        params.n_free(),
-        n_total_params,
-        "all fit parameters should be free"
-    );
-
-    let densities: Vec<f64> = (0..n_isotopes).map(|i| result.params[i]).collect();
-    let unc = result
-        .uncertainties
-        .unwrap_or_else(|| vec![f64::NAN; n_total_params]);
-    assert!(
-        unc.len() >= n_total_params,
-        "uncertainty vector length ({}) should be >= parameter count ({})",
-        unc.len(),
-        n_total_params
-    );
-    let uncertainties: Vec<f64> = (0..n_isotopes)
-        .map(|i| unc.get(i).copied().unwrap_or(f64::NAN))
-        .collect();
-
-    let (fitted_temperature, fitted_temperature_unc) = if fit_temperature {
-        (
-            Some(result.params[n_isotopes]),
-            Some(unc.get(n_isotopes).copied().unwrap_or(f64::NAN)),
-        )
-    } else {
-        (None, None)
-    };
-
-    Ok(PyFitResult {
-        densities,
-        uncertainties,
-        reduced_chi_squared: result.reduced_chi_squared,
-        converged: result.converged,
-        iterations: result.iterations,
-        temperature_k: fitted_temperature,
-        temperature_k_unc: fitted_temperature_unc,
-    })
 }
 
 /// Convert time-of-flight (μs) to energy (eV).
@@ -1334,6 +1471,7 @@ fn py_spatial_map(
                     ..LmConfig::default()
                 },
                 precomputed_cross_sections: None,
+                fit_temperature: false,
             };
 
             // Clone arrays only after all validation passes
@@ -1568,6 +1706,7 @@ fn py_fit_roi(
             ..LmConfig::default()
         },
         precomputed_cross_sections: None,
+        fit_temperature: false,
     };
 
     // Clone arrays only after all validation passes

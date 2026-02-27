@@ -221,6 +221,52 @@ pub fn broadened_cross_sections(
     Some(result)
 }
 
+/// Compute broadened cross-sections and their temperature derivative.
+///
+/// Returns `(sigma_k, dsigma_k_dT)` where `sigma_k[k][e]` is the
+/// Doppler+resolution-broadened cross-section for isotope `k` at energy
+/// index `e`, and `dsigma_k_dT[k][e]` is its central finite-difference
+/// derivative with respect to temperature.
+///
+/// The derivative uses step size `dT = 1e-4 * (1 + T)`, which balances
+/// truncation error and roundoff for the T ~ 1..2000 K regime relevant
+/// to neutron resonance experiments.
+///
+/// # Cost
+/// Three calls to `broadened_cross_sections` (at T, T+dT, T-dT).
+pub fn broadened_cross_sections_with_derivative(
+    energies: &[f64],
+    resonance_data: &[ResonanceData],
+    temperature_k: f64,
+    instrument: Option<&InstrumentParams>,
+) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
+    let dt = 1e-4 * (1.0 + temperature_k);
+    let t_up = temperature_k + dt;
+    let t_down = (temperature_k - dt).max(0.1); // stay physical
+    let actual_2dt = t_up - t_down;
+
+    let xs_center =
+        broadened_cross_sections(energies, resonance_data, temperature_k, instrument, None)
+            .expect("broadened_cross_sections should not be cancelled (no cancel token)");
+    let xs_up = broadened_cross_sections(energies, resonance_data, t_up, instrument, None)
+        .expect("broadened_cross_sections should not be cancelled (no cancel token)");
+    let xs_down = broadened_cross_sections(energies, resonance_data, t_down, instrument, None)
+        .expect("broadened_cross_sections should not be cancelled (no cancel token)");
+
+    let dxs_dt: Vec<Vec<f64>> = xs_up
+        .iter()
+        .zip(xs_down.iter())
+        .map(|(up, down)| {
+            up.iter()
+                .zip(down.iter())
+                .map(|(&u, &d)| (u - d) / actual_2dt)
+                .collect()
+        })
+        .collect();
+
+    (xs_center, dxs_dt)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,6 +527,67 @@ mod tests {
             "Other dip at 20 eV: T={}, off-res: T={}",
             t[idx_other],
             t[idx_off]
+        );
+    }
+
+    #[test]
+    fn test_broadened_xs_derivative() {
+        // Verify ∂σ/∂T via Richardson-like consistency: compute the derivative
+        // at two different step sizes and check they agree to reasonable
+        // tolerance (the internal step dT = 1e-4*(1+T) is O(h²)-accurate).
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..201).map(|i| 4.0 + (i as f64) * 0.025).collect();
+        let temperature = 300.0;
+
+        let (xs, dxs_dt) =
+            broadened_cross_sections_with_derivative(&energies, &[data.clone()], temperature, None);
+
+        // Basic shape checks
+        assert_eq!(xs.len(), 1, "one isotope");
+        assert_eq!(dxs_dt.len(), 1, "one isotope derivative");
+        assert_eq!(xs[0].len(), energies.len());
+        assert_eq!(dxs_dt[0].len(), energies.len());
+
+        // The derivative should be non-zero near the resonance at 6.674 eV
+        // where Doppler broadening has a strong effect.
+        let idx_res = energies
+            .iter()
+            .position(|&e| (e - 6.674).abs() < 0.05)
+            .unwrap();
+        assert!(
+            dxs_dt[0][idx_res].abs() > 0.0,
+            "dσ/dT should be non-zero near resonance, got {}",
+            dxs_dt[0][idx_res]
+        );
+
+        // Cross-check: compute a manual FD at a larger step (10×) and verify
+        // the two derivatives are consistent (within ~1% relative error on
+        // the derivative near the resonance peak).
+        let big_dt = 1.0; // 1 K step — much larger than internal 0.03 K
+        let xs_up =
+            broadened_cross_sections(&energies, &[data.clone()], temperature + big_dt, None, None)
+                .unwrap();
+        let xs_down =
+            broadened_cross_sections(&energies, &[data], temperature - big_dt, None, None).unwrap();
+
+        let manual_deriv: Vec<f64> = xs_up[0]
+            .iter()
+            .zip(xs_down[0].iter())
+            .map(|(&u, &d)| (u - d) / (2.0 * big_dt))
+            .collect();
+
+        // Compare near the resonance where the derivative is large.
+        // Allow up to 5% relative difference due to O(h²) truncation.
+        let deriv_fine = dxs_dt[0][idx_res];
+        let deriv_coarse = manual_deriv[idx_res];
+        let rel_err =
+            (deriv_fine - deriv_coarse).abs() / deriv_fine.abs().max(deriv_coarse.abs()).max(1e-30);
+        assert!(
+            rel_err < 0.05,
+            "FD derivatives at two step sizes disagree: fine={}, coarse={}, rel_err={}",
+            deriv_fine,
+            deriv_coarse,
+            rel_err,
         );
     }
 }

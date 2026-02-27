@@ -320,6 +320,7 @@ mod tests {
             initial_densities: vec![0.001],
             lm_config: LmConfig::default(),
             precomputed_cross_sections: None,
+            fit_temperature: false,
         };
 
         let result = spatial_map(&transmission, &uncertainty, &config, None, None);
@@ -386,6 +387,7 @@ mod tests {
             initial_densities: vec![0.001],
             lm_config: LmConfig::default(),
             precomputed_cross_sections: None,
+            fit_temperature: false,
         };
 
         let result = spatial_map(&transmission, &uncertainty, &config, Some(&dead), None);
@@ -434,6 +436,7 @@ mod tests {
             initial_densities: vec![0.001],
             lm_config: LmConfig::default(),
             precomputed_cross_sections: None,
+            fit_temperature: false,
         };
 
         // Fit a 2×2 ROI

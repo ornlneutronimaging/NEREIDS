@@ -326,6 +326,7 @@ pub fn sparse_reconstruct(
                 t_model.density_indices.as_slice(),
                 &mut params,
                 &config.poisson_config,
+                None,
             );
 
             let pixel_result = PixelResult {
