@@ -37,7 +37,10 @@ use rayon::prelude::*;
 pub struct TraceDetectabilityReport {
     /// Peak |ΔT| per ppm concentration at the most sensitive energy.
     ///
-    /// Linearized sensitivity metric, valid in the dilute-trace limit.
+    /// Linearized sensitivity metric: `peak_delta_t / trace_ppm`.
+    /// Accurate in the dilute-trace limit; at high concentrations the
+    /// actual per-ppm sensitivity is smaller due to Beer-Lambert
+    /// saturation (T = exp(−n·σ) is sub-linear in n).
     pub peak_delta_t_per_ppm: f64,
     /// Energy at which peak contrast occurs (eV).
     pub peak_energy_ev: f64,
