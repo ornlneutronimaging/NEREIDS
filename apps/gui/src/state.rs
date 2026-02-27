@@ -64,7 +64,7 @@ pub struct AppState {
     pub is_fetching_endf: bool,
 
     // -- Background task receivers and cancellation --
-    pub pending_spatial: Option<mpsc::Receiver<SpatialResult>>,
+    pub pending_spatial: Option<mpsc::Receiver<Result<SpatialResult, String>>>,
     pub pending_endf: Option<mpsc::Receiver<EndfFetchResult>>,
     pub cancel_token: Arc<AtomicBool>,
 

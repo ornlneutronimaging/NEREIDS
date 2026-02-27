@@ -84,7 +84,7 @@ fn poll_pending_tasks(state: &mut AppState) {
     // Poll spatial map result
     if let Some(ref rx) = state.pending_spatial {
         match rx.try_recv() {
-            Ok(result) => {
+            Ok(Ok(result)) => {
                 state.status_message = format!(
                     "Spatial map: {}/{} converged",
                     result.n_converged, result.n_total
@@ -92,6 +92,11 @@ fn poll_pending_tasks(state: &mut AppState) {
                 state.spatial_result = Some(result);
                 state.is_fitting = false;
                 state.active_tab = Tab::Map;
+                state.pending_spatial = None;
+            }
+            Ok(Err(err_msg)) => {
+                state.status_message = format!("Spatial map error: {err_msg}");
+                state.is_fitting = false;
                 state.pending_spatial = None;
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
