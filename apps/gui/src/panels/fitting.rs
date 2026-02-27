@@ -77,6 +77,14 @@ pub fn fitting_panel(ui: &mut egui::Ui, state: &mut AppState) {
                     )
                     .changed();
 
+                // Enforce Z <= A (physical constraint: protons cannot exceed nucleons).
+                if z_changed && entry.z > entry.a {
+                    entry.a = entry.z;
+                }
+                if a_changed && entry.a < entry.z {
+                    entry.z = entry.a;
+                }
+
                 if z_changed || a_changed {
                     entry.symbol = format!(
                         "{}-{}",

@@ -118,7 +118,16 @@ pub fn normalize(
                     let c_s_eff = c_s.max(0.5);
                     let c_o_eff = c_o.max(0.5);
                     let rel_err = (1.0 / c_s_eff + 1.0 / c_o_eff).sqrt();
-                    uncertainty[[t, y, x]] = t_val * rel_err;
+                    // Use the absolute uncertainty formula: σ_T = T * rel_err.
+                    // When t_val=0 (c_s=0), use the floor-based absolute value
+                    // so downstream weighted fits never see σ=0.
+                    uncertainty[[t, y, x]] = if t_val > 0.0 {
+                        t_val * rel_err
+                    } else {
+                        // c_s=0: T=0, but σ should reflect the Bayesian floor.
+                        // σ_T = (c_s_eff/c_o_eff) * pc_ratio * rel_err
+                        (c_s_eff / c_o_eff) * pc_ratio * rel_err
+                    };
                 } else {
                     // No open-beam counts: mark as invalid
                     transmission[[t, y, x]] = 0.0;
