@@ -276,6 +276,13 @@ fn interpolate_cross_section(energies: &[f64], cross_sections: &[f64], energy: f
         return 0.0;
     }
 
+    // Guard against NaN energy: NaN comparisons are always false, so the
+    // boundary checks below would both be skipped.  The binary search would
+    // then return Err(0), and `idx = 0 - 1` would underflow on usize.
+    if energy.is_nan() {
+        return 0.0;
+    }
+
     if energy <= energies[0] {
         // Extrapolate using 1/v law: σ ∝ 1/√E.
         // Guard: if energy <= 0, the ratio energies[0]/energy would be negative
