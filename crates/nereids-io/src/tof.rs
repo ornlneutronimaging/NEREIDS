@@ -51,9 +51,15 @@ pub fn tof_edges_to_energy(
         ));
     }
 
-    if params.flight_path_m <= 0.0 {
+    if !params.flight_path_m.is_finite() || params.flight_path_m <= 0.0 {
         return Err(IoError::InvalidParameter(
-            "Flight path must be positive".into(),
+            "Flight path must be finite and positive".into(),
+        ));
+    }
+
+    if !params.delay_us.is_finite() {
+        return Err(IoError::InvalidParameter(
+            "Delay time must be finite".into(),
         ));
     }
 
@@ -111,7 +117,12 @@ pub fn linspace_tof_edges(tof_min: f64, tof_max: f64, n_bins: usize) -> Result<V
     if n_bins == 0 {
         return Err(IoError::InvalidParameter("n_bins must be positive".into()));
     }
-    if tof_max <= tof_min || tof_max.is_nan() || tof_min.is_nan() {
+    if !tof_min.is_finite() || !tof_max.is_finite() {
+        return Err(IoError::InvalidParameter(
+            "TOF bounds must be finite".into(),
+        ));
+    }
+    if tof_max <= tof_min {
         return Err(IoError::InvalidParameter(format!(
             "tof_max ({}) must be greater than tof_min ({})",
             tof_max, tof_min
@@ -235,5 +246,58 @@ mod tests {
         let params = BeamlineParams::default();
         let result = tof_edges_to_energy(&[100.0], &params);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_linspace_tof_edges_rejects_inf() {
+        let result = linspace_tof_edges(f64::INFINITY, 200.0, 10);
+        assert!(result.is_err(), "should reject Inf tof_min");
+
+        let result = linspace_tof_edges(100.0, f64::INFINITY, 10);
+        assert!(result.is_err(), "should reject Inf tof_max");
+
+        let result = linspace_tof_edges(f64::NEG_INFINITY, 200.0, 10);
+        assert!(result.is_err(), "should reject -Inf tof_min");
+    }
+
+    #[test]
+    fn test_linspace_tof_edges_rejects_nan() {
+        let result = linspace_tof_edges(f64::NAN, 200.0, 10);
+        assert!(result.is_err(), "should reject NaN tof_min");
+
+        let result = linspace_tof_edges(100.0, f64::NAN, 10);
+        assert!(result.is_err(), "should reject NaN tof_max");
+    }
+
+    #[test]
+    fn test_tof_edges_to_energy_rejects_nan_flight_path() {
+        let tof_edges = vec![100.0, 200.0, 300.0];
+
+        let params_nan = BeamlineParams {
+            flight_path_m: f64::NAN,
+            delay_us: 0.0,
+        };
+        assert!(
+            tof_edges_to_energy(&tof_edges, &params_nan).is_err(),
+            "should reject NaN flight path"
+        );
+
+        let params_inf = BeamlineParams {
+            flight_path_m: f64::INFINITY,
+            delay_us: 0.0,
+        };
+        assert!(
+            tof_edges_to_energy(&tof_edges, &params_inf).is_err(),
+            "should reject Inf flight path"
+        );
+
+        let params_nan_delay = BeamlineParams {
+            flight_path_m: 25.0,
+            delay_us: f64::NAN,
+        };
+        assert!(
+            tof_edges_to_energy(&tof_edges, &params_nan_delay).is_err(),
+            "should reject NaN delay"
+        );
     }
 }

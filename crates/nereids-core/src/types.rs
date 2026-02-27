@@ -11,8 +11,8 @@ pub struct Isotope {
 
 impl Isotope {
     pub fn new(z: u32, a: u32) -> Self {
-        debug_assert!(a > 0, "mass number A must be positive");
-        debug_assert!(
+        assert!(a > 0, "mass number A must be positive");
+        assert!(
             z <= a,
             "atomic number Z ({}) cannot exceed mass number A ({})",
             z,
@@ -25,6 +25,18 @@ impl Isotope {
 impl std::fmt::Display for Isotope {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Z={}, A={}", self.z, self.a)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "atomic number Z (3) cannot exceed mass number A (2)")]
+    fn test_isotope_rejects_z_greater_than_a() {
+        // Z > A is a physical impossibility (more protons than nucleons).
+        Isotope::new(3, 2);
     }
 }
 

@@ -110,13 +110,14 @@ pub fn normalize(
                     // but we use the subtracted count as the variance estimate.
                     // This underestimates uncertainty when DC is a significant
                     // fraction of raw counts.
-                    let rel_err = if c_s < 1.0 {
-                        // For very low counts, use a conservative uncertainty
-                        // equivalent to 0.5 counts (Bayesian prior for Poisson)
-                        (1.0 / 0.5_f64 + 1.0 / c_o.max(0.5)).sqrt()
-                    } else {
-                        (1.0 / c_s + 1.0 / c_o.max(1.0)).sqrt()
-                    };
+                    //
+                    // Apply a Bayesian floor of 0.5 counts (Jeffreys prior for
+                    // Poisson) to both sample and OB counts. This avoids division
+                    // by zero and provides conservative uncertainty for low-count
+                    // bins without introducing a discontinuity.
+                    let c_s_eff = c_s.max(0.5);
+                    let c_o_eff = c_o.max(0.5);
+                    let rel_err = (1.0 / c_s_eff + 1.0 / c_o_eff).sqrt();
                     uncertainty[[t, y, x]] = t_val * rel_err;
                 } else {
                     // No open-beam counts: mark as invalid
@@ -306,6 +307,49 @@ mod tests {
         assert_eq!(avg.len(), 2);
         assert!((avg[0] - 100.0).abs() < 1e-10);
         assert!((avg[1] - 200.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_normalize_zero_sample_counts() {
+        // Zero sample counts should produce finite (not NaN) uncertainty
+        // thanks to the Bayesian floor of 0.5.
+        let sample = Array3::from_elem((1, 1, 1), 0.0);
+        let ob = Array3::from_elem((1, 1, 1), 100.0);
+        let params = NormalizationParams {
+            proton_charge_sample: 1.0,
+            proton_charge_ob: 1.0,
+        };
+
+        let result = normalize(&sample, &ob, &params, None).unwrap();
+        assert_eq!(result.transmission[[0, 0, 0]], 0.0);
+        assert!(
+            result.uncertainty[[0, 0, 0]].is_finite(),
+            "uncertainty should be finite for zero sample counts, got {}",
+            result.uncertainty[[0, 0, 0]]
+        );
+    }
+
+    #[test]
+    fn test_normalize_zero_open_beam() {
+        // Zero OB counts should produce infinite uncertainty (marking
+        // the pixel as invalid), and the uncertainty must not be NaN.
+        let sample = Array3::from_elem((1, 1, 1), 50.0);
+        let ob = Array3::from_elem((1, 1, 1), 0.0);
+        let params = NormalizationParams {
+            proton_charge_sample: 1.0,
+            proton_charge_ob: 1.0,
+        };
+
+        let result = normalize(&sample, &ob, &params, None).unwrap();
+        assert_eq!(result.transmission[[0, 0, 0]], 0.0);
+        assert!(
+            !result.uncertainty[[0, 0, 0]].is_nan(),
+            "uncertainty must not be NaN for zero OB counts"
+        );
+        assert!(
+            result.uncertainty[[0, 0, 0]].is_infinite(),
+            "uncertainty should be infinite for zero OB counts"
+        );
     }
 
     #[test]
