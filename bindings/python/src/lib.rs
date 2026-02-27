@@ -636,7 +636,7 @@ fn fit_spectrum(
             let s_owned = s.to_vec();
 
             // Release the GIL for the heavy computation.
-            py.allow_threads(move || {
+            py.detach(move || {
                 let model = TransmissionFitModel {
                     energies: e_owned,
                     resonance_data: res_data,
@@ -716,7 +716,7 @@ fn fit_spectrum(
             let instrument = res_fn.map(|r| InstrumentParams { resolution: r });
 
             // Release the GIL for the heavy computation.
-            py.allow_threads(move || {
+            py.detach(move || {
                 // Precompute broadened cross-sections at the initial temperature.
                 let xs = transmission::broadened_cross_sections(
                     &e_owned,
