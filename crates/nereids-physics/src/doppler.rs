@@ -636,11 +636,13 @@ mod tests {
     ///
     /// NOTE: This test exercises the `energy <= energies[0]` boundary path
     /// (1/v extrapolation), *not* the `Err(0)` binary-search guard itself.
-    /// See `test_interpolate_nan_grid_no_panic` for a test that verifies
-    /// no panic occurs when NaN values contaminate the energy grid.
     ///
-    /// We test the NaN query guard separately (test_interpolate_nan_energy)
-    /// and the duplicate-point guard separately (test_interpolate_duplicate_grid_points).
+    /// We test the NaN query guard separately (`test_interpolate_nan_energy`),
+    /// the NaN grid guard separately (`test_interpolate_nan_grid_no_panic`),
+    /// and the duplicate-point guard separately (`test_interpolate_duplicate_grid_points`).
+    ///
+    /// The `Err(0)` binary-search guard is primarily a defense-in-depth
+    /// safety net against unexpected grid or comparison behavior.
     #[test]
     fn test_interpolate_below_grid_minimum() {
         let energies = vec![5.0, 10.0, 15.0];

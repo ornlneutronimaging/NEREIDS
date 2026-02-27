@@ -159,13 +159,15 @@ pub fn coulomb_wave_functions(l: u32, eta: f64, rho: f64) -> Option<(f64, f64, f
             //
             // INTENTIONAL DEPARTURE from SAMMY (coulomb/mrml08.f90 lines 331–337):
             // SAMMY uses a cumulative counter Pcount that increments on every
-            // small denominator and never resets, bailing out after 2 total.
+            // small denominator and never resets, bailing out after more than
+            // 2 total (i.e., on the third small denominator).
             // We reset on healthy denominators, counting *consecutive* small
-            // denominators instead.  This is more lenient: a single healthy
-            // denominator between two small ones does not trigger failure.
-            // In nuclear-physics-relevant (η, ρ) regimes, both strategies
-            // converge identically; the difference only matters for exotic
-            // parameters outside our use cases.
+            // denominators instead, and also bail out after more than 2
+            // consecutive (on the third).  This is more lenient: a single
+            // healthy denominator between two small ones does not trigger
+            // failure.  In nuclear-physics-relevant (η, ρ) regimes, both
+            // strategies converge identically; the difference only matters
+            // for exotic parameters outside our use cases.
             //
             // NOTE: If a future comparison against SAMMY shows a discrepancy
             // in Coulomb wave functions for extreme parameters, this p_count
