@@ -115,11 +115,21 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
                     None
                 };
 
-                // LRF=1 and LRF=2 are fully supported.
-                // Other values (LRF=3/4 are obsolete ENDF formats) are skipped so
-                // the rest of the file still parses.
+                // LRF=1 and LRF=2 with LFW=0 are fully supported.
+                // Unsupported combinations are skipped so that the resolved
+                // resonance ranges in the same evaluation remain accessible.
                 if lrf != 1 && lrf != 2 {
                     skip_urr_body(&lines, &mut pos)?;
+                    continue;
+                }
+
+                // LFW=1 (energy-dependent fission widths) has a different
+                // record layout from LFW=0.  We cannot parse it yet, but we
+                // must advance the cursor correctly so subsequent ranges
+                // (including resolved resonances) are still accessible.
+                // Reference: ENDF-6 §2.2.2.1 Case B; SAMMY File2Unres.f90.
+                if lfw != 0 {
+                    skip_urr_lfw1_body(&lines, &mut pos, lrf)?;
                     continue;
                 }
 
@@ -131,7 +141,7 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
                     naps: naps_urr,
                     ap_table: ap_table_urr,
                 };
-                let urr_range = parse_urr_range(&mut urr_ctx, lrf, lfw)?;
+                let urr_range = parse_urr_range(&mut urr_ctx, lrf)?;
                 all_ranges.push(urr_range);
                 continue;
             }
@@ -871,13 +881,12 @@ fn checked_count(value: i32, label: &str) -> Result<usize, EndfParseError> {
     Ok(value as usize)
 }
 
-/// Skip an unsupported URR body (CONT + NLS L-groups with their LIST data).
+/// Skip an unsupported URR body **with LFW=0** layout.
 ///
 /// Called when LRU=2 has an LRF value other than 1 or 2 so that the records
 /// for this range are consumed and subsequent ranges can still be parsed.
-/// Note: LFW!=0 is rejected with a hard error before reaching this helper.
 ///
-/// Structure consumed (ENDF-6 §2.2.2, all LRF variants share this skeleton):
+/// Structure consumed (ENDF-6 §2.2.2, LFW=0):
 /// ```text
 /// CONT: SPI, AP, 0, 0, NLS, 0
 /// For each L (NLS times):
@@ -907,6 +916,55 @@ fn skip_urr_body(lines: &[&str], pos: &mut usize) -> Result<(), EndfParseError> 
                 let jn1 = checked_count(j_cont.n1, "N1")?;
                 parse_list_values(lines, pos, jn1)?;
             }
+        }
+    }
+    Ok(())
+}
+
+/// Skip a URR body with **LFW=1** (energy-dependent fission widths).
+///
+/// LFW=1 uses a fundamentally different record layout from LFW=0:
+/// an energy grid LIST record precedes the L-groups, and each J-group
+/// carries NE+6 values (6 header + NE fission widths) instead of the
+/// compact LFW=0 layout.
+///
+/// Structure consumed (ENDF-6 §2.2.2.1 Case B; SAMMY `File2Unres.f90` l.165):
+/// ```text
+/// CONT: SPI, AP, LSSF, 0, NE, NLS
+/// LIST: NE energy values (shared grid for all J-groups)
+/// For each L (NLS times):
+///   CONT: AWRI, 0, L, 0, NJS, 0
+///   For each J (NJS times):
+///     LIST: 6 header values + NE fission widths = NE+6 total
+/// ```
+///
+/// For LFW=1 with LRF=2 the layout is identical to the LFW=0/LRF=2 case
+/// (each J already has a full energy grid), so this function handles LRF=1
+/// specifically and delegates LRF=2 to the standard `skip_urr_body` logic.
+fn skip_urr_lfw1_body(lines: &[&str], pos: &mut usize, lrf: i32) -> Result<(), EndfParseError> {
+    if lrf != 1 {
+        // LFW=1 + LRF=2: same record layout as LFW=0/LRF=2.
+        // The existing generic skipper handles this correctly.
+        return skip_urr_body(lines, pos);
+    }
+
+    // LFW=1, LRF=1 (ENDF-6 "Case B"):
+    // CONT: SPI, AP, LSSF, 0, NE, NLS
+    let header = parse_cont(lines, pos)?;
+    let ne = checked_count(header.n1, "NE")?;
+    let nls = checked_count(header.n2, "NLS")?;
+
+    // LIST: NE energy values (shared energy grid).
+    parse_list_values(lines, pos, ne)?;
+
+    for _ in 0..nls {
+        // CONT: AWRI, 0, L, 0, NJS, 0
+        let l_cont = parse_cont(lines, pos)?;
+        let njs = checked_count(l_cont.n1, "NJS")?;
+
+        for _ in 0..njs {
+            // LIST: 6 header values + NE fission widths.
+            parse_list_values(lines, pos, ne + 6)?;
         }
     }
     Ok(())
@@ -1164,26 +1222,12 @@ fn parse_endf_int(line: &str, field_index: usize) -> Result<i32, EndfParseError>
 fn parse_urr_range(
     ctx: &mut RangeParseContext<'_>,
     lrf: i32,
-    lfw: i32,
 ) -> Result<ResonanceRange, EndfParseError> {
     use crate::resonance::{UrrData, UrrJGroup, UrrLGroup};
 
-    // LFW=1 indicates energy-dependent fission widths in the URR.  The
-    // record layout is fundamentally different from LFW=0: fission widths
-    // become tabulated (a full energy grid per J-group) instead of scalar
-    // constants.  Parsing LFW=1 data with the LFW=0 layout would silently
-    // produce corrupt resonance parameters because `skip_urr_body` assumes
-    // the LFW=0 record structure.
-    //
-    // Return a hard error instead of attempting to skip — a misaligned
-    // cursor is worse than a clear failure.
-    // Reference: ENDF-6 §2.2.2.1; SAMMY unr/munr01.f90.
-    if lfw != 0 {
-        return Err(EndfParseError::UnsupportedFormat(format!(
-            "LFW={lfw} (energy-dependent fission widths) in URR range is not supported; \
-             only LFW=0 (energy-independent fission widths) is implemented"
-        )));
-    }
+    // Caller guarantees LFW=0 before entering this function.
+    // LFW=1 (energy-dependent fission widths) is handled by
+    // skip_urr_lfw1_body in the caller.
 
     // CONT: SPI, AP, 0, 0, NLS, 0
     // ENDF AP is in 10⁻¹² cm; convert to fm (×10).
@@ -2047,20 +2091,20 @@ mod tests {
         assert!((res.energy - 6.674).abs() < 1e-6);
     }
 
-    /// Verify that the U-233 ENDF file (SAMMY test tr149) is correctly rejected.
+    /// Parse U-233 ENDF (SAMMY test tr149) which has LFW=1 in its URR.
     ///
-    /// U-233's URR section has LRU=2, LRF=2, **LFW=1** (energy-dependent
-    /// fission widths).  The known file properties:
-    /// - LFW=1 (energy-dependent fission widths), which is unsupported
+    /// U-233 has two energy ranges:
+    ///   - Range 0: LRU=1 (resolved, Reich-Moore / LRF=3)
+    ///   - Range 1: LRU=2, LRF=2, **LFW=1** (energy-dependent fission widths)
     ///
-    /// Since commit e661fa8, LFW!=0 is rejected with a hard error rather than
-    /// silently skipped (the old skip_urr_body assumed LFW=0 record layout and
-    /// would produce corrupt data on LFW=1 files).  This test verifies that
-    /// U-233 is correctly rejected with an `UnsupportedFormat` error.
+    /// The LFW=1 URR range is gracefully skipped (not parsed into UrrData)
+    /// because we don't yet support energy-dependent fission widths. The
+    /// resolved range must still be returned so fissile isotopes remain
+    /// usable for cross-section calculations.
     ///
     /// Test data: ../SAMMY/SAMMY/sammy/samtry/tr149/t149a.endf (MAT=9222, ZA=92233)
     #[test]
-    fn test_parse_u233_urr_lfw1_rejected() {
+    fn test_parse_u233_lfw1_urr_skipped() {
         let endf_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
@@ -2077,11 +2121,26 @@ mod tests {
         }
 
         let text = std::fs::read_to_string(&endf_path).unwrap();
-        let err = parse_endf_file2(&text).expect_err("U-233 LFW=1 must be rejected");
-        let msg = format!("{err}");
+        let data = parse_endf_file2(&text).expect("U-233 must parse (LFW=1 URR skipped)");
+
+        // The resolved range must be present.
         assert!(
-            msg.contains("LFW=1"),
-            "error must mention LFW=1, got: {msg}"
+            !data.ranges.is_empty(),
+            "U-233 must have at least one parsed range"
+        );
+
+        // The LFW=1 URR range is skipped, so no range should have urr data.
+        let urr_count = data.ranges.iter().filter(|r| r.urr.is_some()).count();
+        assert_eq!(
+            urr_count, 0,
+            "LFW=1 URR range must be skipped, but found {urr_count} URR ranges"
+        );
+
+        // At least one resolved range must exist.
+        let resolved_count = data.ranges.iter().filter(|r| r.resolved).count();
+        assert!(
+            resolved_count >= 1,
+            "U-233 must have at least one resolved range, found {resolved_count}"
         );
     }
 
@@ -2290,28 +2349,40 @@ mod tests {
         );
     }
 
-    /// LFW!=0 (energy-dependent fission widths) in URR is rejected.
+    /// LFW=1 (energy-dependent fission widths) URR is gracefully skipped.
     ///
-    /// ENDF-6 §2.2.2: LFW=1 uses a fundamentally different record layout
-    /// than LFW=0.  Since we don't support it, the parser must return a
-    /// hard error rather than attempting to skip the URR body (which would
-    /// misalign the cursor).
+    /// ENDF-6 §2.2.2.1 Case B: LFW=1, LRF=1 has a shared energy grid
+    /// followed by per-J LIST blocks of NE+6 values.  The parser skips this
+    /// layout correctly and returns no URR data.
+    ///
+    /// This synthetic snippet has: NE=2, NLS=1, NJS=1.
     #[test]
-    fn test_lfw_nonzero_rejected() {
+    fn test_lfw1_urr_gracefully_skipped() {
         const ENDF: &str = concat!(
             // HEAD: ZA=92233, AWR=231.038, NIS=1
             " 9.223300+4 2.310380+2          0          0          1          09222 2151    1\n",
-            // Isotope CONT: ZAI=92233, ABN=1.0, LFW=1 (energy-dependent fission widths), NER=1
+            // Isotope CONT: ZAI=92233, ABN=1.0, LFW=1, NER=1
             " 9.223300+4 1.000000+0          0          1          1          09222 2151    2\n",
             // Range CONT: EL=600, EH=3e4, LRU=2, LRF=1, NRO=0, NAPS=0
             " 6.000000+2 3.000000+4          2          1          0          09222 2151    3\n",
+            // --- LFW=1, LRF=1 body (Case B) ---
+            // CONT: SPI=3.5, AP=9.4, LSSF=0, 0, NE=2, NLS=1
+            " 3.500000+0 9.400000-1          0          0          2          19222 2151    4\n",
+            // LIST: 2 energy values (NE=2, padded to 6 per line)
+            " 6.000000+2 3.000000+4 0.000000+0 0.000000+0 0.000000+0 0.000000+09222 2151    5\n",
+            // L=0 CONT: AWRI=231, 0, L=0, 0, NJS=1, 0
+            " 2.310380+2 0.000000+0          0          0          1          09222 2151    6\n",
+            // J=3.0 LIST: 6 header + NE=2 fission widths = 8 values (→ 2 lines of 6)
+            " 1.000000+1 3.000000+0 1.000000+0 5.000000-2 4.000000-2 0.000000+09222 2151    7\n",
+            " 1.000000-1 2.000000-1 0.000000+0 0.000000+0 0.000000+0 0.000000+09222 2151    8\n",
+            // SEND
+            "                                                                  9222 0  0    0\n",
         );
 
-        let err = parse_endf_file2(ENDF).unwrap_err();
-        assert!(
-            err.to_string().contains("LFW=1"),
-            "expected LFW!=0 unsupported error, got: {err}"
-        );
+        let data = parse_endf_file2(ENDF).expect("LFW=1 URR must be skipped, not rejected");
+        // The URR range is skipped — no URR data returned.
+        let urr_count = data.ranges.iter().filter(|r| r.urr.is_some()).count();
+        assert_eq!(urr_count, 0, "LFW=1 URR must be skipped");
     }
 
     /// LRU=0 range with non-zero L1 in SPI/AP CONT is rejected.
