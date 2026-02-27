@@ -306,6 +306,38 @@ pub fn levenberg_marquardt(
 
     let n_free = params.n_free();
 
+    // Early return when all parameters are fixed: evaluate once and report the
+    // model's chi-squared.  There is nothing to optimize, so iterating would
+    // waste cycles.
+    if n_free == 0 {
+        let weights: Vec<f64> = sigma
+            .iter()
+            .map(|&s| {
+                if !s.is_finite() || s <= 0.0 {
+                    1.0 / 1e30
+                } else {
+                    1.0 / (s * s)
+                }
+            })
+            .collect();
+        let y_model = model.evaluate(&params.all_values());
+        let residuals: Vec<f64> = y_obs
+            .iter()
+            .zip(y_model.iter())
+            .map(|(&obs, &mdl)| obs - mdl)
+            .collect();
+        let chi2 = chi_squared(&residuals, &weights);
+        return LmResult {
+            chi_squared: chi2,
+            reduced_chi_squared: chi2 / n_data as f64,
+            iterations: 0,
+            converged: true,
+            params: params.all_values(),
+            covariance: Some(vec![]),
+            uncertainties: Some(vec![]),
+        };
+    }
+
     // #108.3: Underdetermined systems — when n_data <= n_free, the problem is
     // underdetermined and reduced chi-squared is meaningless.  Return early
     // with converged=false so callers can detect the problem.

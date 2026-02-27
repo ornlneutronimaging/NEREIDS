@@ -87,8 +87,11 @@ fn poisson_nll(y_obs: &[f64], y_model: &[f64]) -> f64 {
 ///
 /// For mdl > 0: NLL = mdl - obs * ln(mdl)
 /// For mdl <= epsilon: quadratic Taylor expansion about epsilon,
-///   NLL(ε) + NLL'(ε)·(ε−mdl) + ½·NLL''(ε)·(ε−mdl)²
+///   NLL(ε) + NLL'(ε)·(mdl−ε) + ½·NLL''(ε)·(mdl−ε)²
 /// where NLL'(x) = 1 − obs/x and NLL''(x) = obs/x².
+///
+/// Since delta = ε − mdl ≥ 0, this becomes:
+///   NLL(ε) − NLL'(ε)·delta + ½·NLL''(ε)·delta²
 #[inline]
 fn poisson_nll_term(obs: f64, mdl: f64) -> f64 {
     if mdl > POISSON_EPSILON {
@@ -99,7 +102,9 @@ fn poisson_nll_term(obs: f64, mdl: f64) -> f64 {
         let grad_eps = 1.0 - obs / eps;
         let hess_eps = obs / (eps * eps);
         let delta = eps - mdl;
-        nll_eps + grad_eps * delta + 0.5 * hess_eps * delta * delta
+        // Taylor expansion: f(eps) + f'(eps)*(mdl - eps) + 0.5*f''(eps)*(mdl - eps)^2
+        // Since (mdl - eps) = -delta, the linear term flips sign.
+        nll_eps - grad_eps * delta + 0.5 * hess_eps * delta * delta
     }
 }
 
@@ -107,7 +112,10 @@ fn poisson_nll_term(obs: f64, mdl: f64) -> f64 {
 ///
 /// For mdl > 0: ∂NLL/∂mdl = 1 − obs/mdl
 /// For mdl <= epsilon: linear extrapolation from epsilon,
-///   NLL'(ε) + NLL''(ε)·(ε−mdl) = (1 − obs/ε) + (obs/ε²)·(ε−mdl)
+///   NLL'(ε) + NLL''(ε)·(mdl−ε) = (1 − obs/ε) − (obs/ε²)·delta
+///
+/// Since delta = ε − mdl ≥ 0, the derivative of the NLL term w.r.t. mdl
+/// is the derivative of the quadratic extrapolation in poisson_nll_term.
 #[inline]
 fn poisson_nll_grad_term(obs: f64, mdl: f64) -> f64 {
     if mdl > POISSON_EPSILON {
@@ -117,7 +125,9 @@ fn poisson_nll_grad_term(obs: f64, mdl: f64) -> f64 {
         let grad_eps = 1.0 - obs / eps;
         let hess_eps = obs / (eps * eps);
         let delta = eps - mdl;
-        grad_eps + hess_eps * delta
+        // g(eps) + g'(eps)*(mdl - eps) = g(eps) - g'(eps)*delta
+        // where g'(x) = obs/x^2 = hess_eps
+        grad_eps - hess_eps * delta
     }
 }
 
@@ -191,6 +201,18 @@ pub fn poisson_fit(
     params: &mut ParameterSet,
     config: &PoissonConfig,
 ) -> PoissonResult {
+    // Early return when all parameters are fixed: evaluate once and report.
+    if params.n_free() == 0 {
+        let y_model = model.evaluate(&params.all_values());
+        let nll = poisson_nll(y_obs, &y_model);
+        return PoissonResult {
+            nll,
+            iterations: 0,
+            converged: true,
+            params: params.all_values(),
+        };
+    }
+
     let y_model = model.evaluate(&params.all_values());
     let mut nll = poisson_nll(y_obs, &y_model);
     let mut converged = false;
@@ -373,6 +395,18 @@ pub fn poisson_fit_analytic(
         );
     }
 
+    // Early return when all parameters are fixed: evaluate once and report.
+    if params.n_free() == 0 {
+        let y_model = model.evaluate(&params.all_values());
+        let nll = poisson_nll(y_obs, &y_model);
+        return PoissonResult {
+            nll,
+            iterations: 0,
+            converged: true,
+            params: params.all_values(),
+        };
+    }
+
     // Validate that every free parameter is referenced by density_indices
     // or the temperature context.  Free parameters with no analytical
     // gradient mapping will never move, causing silent convergence to the
@@ -466,9 +500,7 @@ pub fn poisson_fit_analytic(
                 let mut neg_opt = 0.0f64;
                 for (k, xs) in xs_owned.iter().enumerate() {
                     let density = all_vals[density_indices[k]];
-                    if density > 0.0 {
-                        neg_opt -= density * xs[e];
-                    }
+                    neg_opt -= density * xs[e];
                 }
                 neg_opt.exp()
             })
@@ -516,13 +548,7 @@ pub fn poisson_fit_analytic(
                     let dsigma_sum: f64 = (0..density_indices.len())
                         .map(|k| {
                             let density = all_vals[density_indices[k]];
-                            // Mirror the density > 0 guard from T(E) computation:
-                            // zero-density isotopes contribute nothing to ∂T/∂temp.
-                            if density > 0.0 {
-                                density * dxs_dt[k][e]
-                            } else {
-                                0.0
-                            }
+                            density * dxs_dt[k][e]
                         })
                         .sum();
                     residual_factor * phi * t * (-dsigma_sum)
@@ -578,11 +604,7 @@ pub fn poisson_fit_analytic(
                             let dsigma_sum: f64 = (0..density_indices.len())
                                 .map(|k| {
                                     let density = all_vals[density_indices[k]];
-                                    if density > 0.0 {
-                                        density * dxs_dt[k][e]
-                                    } else {
-                                        0.0
-                                    }
+                                    density * dxs_dt[k][e]
                                 })
                                 .sum();
                             phi * t * (-dsigma_sum)
