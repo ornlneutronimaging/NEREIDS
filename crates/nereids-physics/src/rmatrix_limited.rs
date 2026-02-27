@@ -442,7 +442,20 @@ fn spin_group_cross_sections(
     // Reference: SAMMY rml/mrml09.f Yinvrs subroutine
     let y_inv = match invert_complex_matrix(&y_tilde, nch) {
         Some(inv) => inv,
-        None => return (0.0, 0.0, 0.0, 0.0), // singular → skip spin group
+        None => {
+            // Singular Ỹ matrix — regularize by adding a small epsilon to the
+            // diagonal and retry.  This can happen when channels are near-degenerate
+            // (e.g. two channels at the same threshold).  The epsilon is small enough
+            // not to perturb physics but large enough to lift the singularity.
+            let mut y_reg = y_tilde.clone();
+            for (i, row) in y_reg.iter_mut().enumerate().take(nch) {
+                row[i] += Complex64::new(1e-10, 1e-10);
+            }
+            match invert_complex_matrix(&y_reg, nch) {
+                Some(inv) => inv,
+                None => return (0.0, 0.0, 0.0, 0.0), // truly degenerate
+            }
+        }
     };
 
     // ── XQ = Ỹinv · R (matrix product, SAMMY "Xqr/Xqi") ─────────────────────
@@ -466,7 +479,12 @@ fn spin_group_cross_sections(
             // regardless of the value of L_c. Setting sqrt_p_over_l = 0 is correct.
             // (The Ỹ sentinel handles Ỹ inversion correctly; this row zeroing is
             //  consistent: a closed channel contributes nothing to XXXX/U.)
-            let sqrt_p_over_l = if is_closed[c] {
+            // Guard: at exact channel threshold, both √P_c and L_c can be
+            // zero simultaneously, producing 0/0 = NaN.  The is_closed flag
+            // catches most cases, but a channel right at threshold might not
+            // be flagged closed yet have |L_c| ≈ 0.  The extra norm check
+            // prevents NaN propagation.
+            let sqrt_p_over_l = if is_closed[c] || l_c[c].norm() < 1e-30 {
                 Complex64::ZERO
             } else {
                 sqrt_p[c] / l_c[c]

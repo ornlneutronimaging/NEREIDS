@@ -731,7 +731,13 @@ fn reich_moore_3channel(
     }
 
     // Invert 3×3 via cofactor expansion.
-    let y_inv = invert_3x3(y_mat);
+    // Returns None if the Y-matrix is singular (degenerate spin group).
+    // In that case, return zero cross-sections — a singular Y-matrix means
+    // the channels are degenerate and contribute no resolvable physics.
+    let y_inv = match invert_3x3(y_mat) {
+        Some(inv) => inv,
+        None => return (0.0, 0.0, 0.0, 0.0),
+    };
 
     // X-matrix.
     let sqrt_p = [p_l.sqrt(), 1.0, 1.0];
@@ -768,10 +774,17 @@ fn reich_moore_3channel(
 }
 
 /// Invert a 3×3 complex matrix via cofactor expansion.
-fn invert_3x3(m: [[Complex64; 3]; 3]) -> [[Complex64; 3]; 3] {
+///
+/// Returns `None` if the matrix is singular (|det| < 1e-300), preventing
+/// NaN propagation from 1/det when det ≈ 0.
+fn invert_3x3(m: [[Complex64; 3]; 3]) -> Option<[[Complex64; 3]; 3]> {
     let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
         - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
         + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+
+    if det.norm() < 1e-300 {
+        return None; // singular — caller returns zero cross-sections
+    }
 
     let inv_det = 1.0 / det;
 
@@ -786,7 +799,7 @@ fn invert_3x3(m: [[Complex64; 3]; 3]) -> [[Complex64; 3]; 3] {
     result[2][1] = (m[0][1] * m[2][0] - m[0][0] * m[2][1]) * inv_det;
     result[2][2] = (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * inv_det;
 
-    result
+    Some(result)
 }
 
 /// Group resonances by their J value.

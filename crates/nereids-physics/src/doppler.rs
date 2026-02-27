@@ -277,7 +277,12 @@ fn interpolate_cross_section(energies: &[f64], cross_sections: &[f64], energy: f
     }
 
     if energy <= energies[0] {
-        // Extrapolate using 1/v law: σ ∝ 1/√E
+        // Extrapolate using 1/v law: σ ∝ 1/√E.
+        // Guard: if energy <= 0, the ratio energies[0]/energy would be negative
+        // or infinite, producing NaN from sqrt.  Return the boundary value directly.
+        if energy <= 0.0 {
+            return cross_sections[0];
+        }
         if energies[0] > 1e-30 {
             return cross_sections[0] * (energies[0] / energy).sqrt();
         }
@@ -293,8 +298,11 @@ fn interpolate_cross_section(energies: &[f64], cross_sections: &[f64], energy: f
         return cross_sections[last];
     }
 
-    // Binary search for the interval
-    let idx = match energies.binary_search_by(|e| e.partial_cmp(&energy).unwrap()) {
+    // Binary search for the interval.
+    // Use total_cmp-style fallback to avoid panic on NaN comparisons.
+    let idx = match energies
+        .binary_search_by(|e| e.partial_cmp(&energy).unwrap_or(std::cmp::Ordering::Less))
+    {
         Ok(i) => return cross_sections[i],
         Err(i) => i - 1,
     };

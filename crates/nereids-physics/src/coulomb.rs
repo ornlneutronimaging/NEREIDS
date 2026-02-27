@@ -147,8 +147,15 @@ pub fn coulomb_wave_functions(l: u32, eta: f64, rho: f64) -> Option<(f64, f64, f
 
     // CF1 main loop (Steed modified Lentz, SAMMY lines 320–343).
     // SAMMY: Pk = Pk1; Pk1 = Pk1 + One  (advance to next k before each step).
-    let mut p_count = 1u32;
+    let mut p_count: u32;
     loop {
+        // Reset p_count at the start of each iteration, matching SAMMY's
+        // Fortran behavior where the small-D counter is per-step, not
+        // cumulative.  Without this reset, a sequence of marginally small
+        // |D| values across non-consecutive iterations could falsely trip
+        // the CF1-failure check.
+        // Reference: SAMMY coulomb/mrml08.f90 Coulfg CF1 loop.
+        p_count = 0;
         pk = pk1; // advance: current step uses previous pk1
         pk1 = pk + 1.0; // next step's pk1
         let ek = eta / pk;
@@ -335,7 +342,14 @@ pub fn coulomb_wave_functions(l: u32, eta: f64, rho: f64) -> Option<(f64, f64, f
 pub fn coulomb_penetrability(l: u32, eta: f64, rho: f64) -> f64 {
     match coulomb_wave_functions(l, eta, rho) {
         Some((fl, gl, _, _)) => rho / (fl * fl + gl * gl),
-        None => 0.0,
+        None => {
+            // Coulomb wave functions failed (ρ too small).  For neutron channels,
+            // Coulomb effects are negligible at very small ρ, so fall back to the
+            // non-Coulomb (hard-sphere) penetrability as a physically reasonable
+            // approximation.  This avoids returning 0.0 which would silently
+            // close the channel.
+            crate::penetrability::penetrability(l, rho)
+        }
     }
 }
 

@@ -34,6 +34,14 @@ use nereids_core::constants;
 /// * `energy_ev` — Neutron energy in eV (lab frame, as stored in ENDF).
 /// * `awr` — Ratio of target mass to neutron mass (from ENDF).
 pub fn k_squared(energy_ev: f64, awr: f64) -> f64 {
+    // Guard: bound-state resonances have negative E_r in ENDF, but k² is
+    // evaluated at the lab energy which is always positive.  If a caller
+    // passes E ≤ 0 (e.g. during extrapolation or misuse), return 0.0 to
+    // prevent a negative k² from propagating NaN through sqrt downstream.
+    if energy_ev <= 0.0 {
+        return 0.0;
+    }
+
     // μ/m_n = AWR / (1 + AWR)
     let mass_ratio = awr / (1.0 + awr);
 
@@ -118,6 +126,13 @@ pub fn lab_to_cm_energy(energy_lab: f64, awr: f64) -> f64 {
 /// * `awr` — Mass ratio from ENDF.
 pub fn pi_over_k_squared_barns(energy_ev: f64, awr: f64) -> f64 {
     let k2 = k_squared(energy_ev, awr);
+    // Guard: at E=0 (or negative), k²=0 and π/k² → ∞.  Return a large
+    // but finite value to prevent Infinity from propagating.  1e10 barns
+    // is physically unreachable for any real cross-section and signals
+    // that the caller is evaluating at an unphysical energy.
+    if k2 <= 0.0 {
+        return 1e10;
+    }
     // π/k² in fm², convert to barns (1 barn = 100 fm²)
     std::f64::consts::PI / k2 / 100.0
 }
