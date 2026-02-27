@@ -169,7 +169,8 @@ pub fn extract_spectrum(data: &Array3<f64>, y: usize, x: usize) -> Array1<f64> {
 /// * `x_range` — Column range (start..end).
 ///
 /// # Errors
-/// Returns `IoError::InvalidParameter` if the ROI is empty.
+/// Returns `IoError::InvalidParameter` if the ROI is empty or exceeds the
+/// spatial dimensions of `data`.
 ///
 /// # Returns
 /// Averaged 1D spectrum of length n_tof.
@@ -182,6 +183,17 @@ pub fn average_roi(
         return Err(IoError::InvalidParameter(
             "ROI ranges must be non-empty for average_roi".into(),
         ));
+    }
+    if y_range.end > data.shape()[1] || x_range.end > data.shape()[2] {
+        return Err(IoError::InvalidParameter(format!(
+            "ROI range ({}..{}, {}..{}) exceeds data spatial dims ({}, {})",
+            y_range.start,
+            y_range.end,
+            x_range.start,
+            x_range.end,
+            data.shape()[1],
+            data.shape()[2],
+        )));
     }
     let roi = data.slice(ndarray::s![.., y_range, x_range]);
     // Mean over spatial dimensions (axes 1 and 2).

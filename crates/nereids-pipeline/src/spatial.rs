@@ -93,6 +93,23 @@ pub fn spatial_map(
         )));
     }
 
+    // Up-front config validation: catch configuration-level errors before
+    // entering the expensive precompute + pixel loop.  Per-pixel fit failures
+    // are extremely rare once these hold, but without this gate a config bug
+    // would be silently swallowed by the filter_map below.
+    if config.resonance_data.is_empty() {
+        return Err(PipelineError::InvalidParameter(
+            "resonance_data is empty — nothing to fit".into(),
+        ));
+    }
+    if config.initial_densities.len() != n_isotopes {
+        return Err(PipelineError::ShapeMismatch(format!(
+            "initial_densities length ({}) != resonance_data length ({})",
+            config.initial_densities.len(),
+            n_isotopes,
+        )));
+    }
+
     // Collect live pixel coordinates first (cheap).  We must know there is
     // actual work to do before paying the expensive precompute cost below.
     let mut pixel_coords: Vec<(usize, usize)> = Vec::new();
@@ -181,10 +198,13 @@ pub fn spatial_map(
                 .map(|e| uncertainty[[e, y, x]].max(1e-10)) // Avoid zero uncertainty
                 .collect();
 
-            // fit_spectrum validation has already passed for the config;
-            // per-pixel calls should not fail.
-            let result = fit_spectrum(&t_spectrum, &sigma, &fast_config).ok()?;
-            Some(((y, x), result))
+            // Config-level validation has passed up-front, so per-pixel
+            // fit failures should be extremely rare (numerical edge cases
+            // only).  Use an explicit match to make the skip intent clear.
+            match fit_spectrum(&t_spectrum, &sigma, &fast_config) {
+                Ok(result) => Some(((y, x), result)),
+                Err(_) => None, // per-pixel fit failure; skip pixel
+            }
         })
         .collect();
 
@@ -249,6 +269,23 @@ pub fn fit_roi(
     config: &FitConfig,
 ) -> Result<SpectrumFitResult, PipelineError> {
     let n_energies = transmission.shape()[0];
+
+    // Validate that uncertainty and transmission have the same shape.
+    if uncertainty.shape() != transmission.shape() {
+        return Err(PipelineError::ShapeMismatch(format!(
+            "uncertainty shape {:?} != transmission shape {:?}",
+            uncertainty.shape(),
+            transmission.shape(),
+        )));
+    }
+    // Validate spectral axis matches config.
+    if n_energies != config.energies.len() {
+        return Err(PipelineError::ShapeMismatch(format!(
+            "transmission spectral axis ({}) != config.energies length ({})",
+            n_energies,
+            config.energies.len(),
+        )));
+    }
 
     if y_range.start >= y_range.end || x_range.start >= x_range.end {
         return Err(PipelineError::InvalidParameter(format!(

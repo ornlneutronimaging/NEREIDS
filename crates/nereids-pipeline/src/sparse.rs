@@ -109,8 +109,13 @@ pub struct SparseResult {
 ///   the flux estimate.
 ///
 /// # Errors
-/// Returns `Err` if every pixel in the ROI is dead, leaving zero live
-/// pixels to average over, or if the dead_pixels shape is wrong.
+/// Returns `PipelineError::InvalidParameter` if:
+/// - The ROI y-range or x-range is empty.
+/// - The ROI exceeds the spatial bounds of `open_beam_counts`.
+/// - Every pixel in the ROI is dead, leaving zero live pixels to average over.
+///
+/// Returns `PipelineError::ShapeMismatch` if the `dead_pixels` mask shape
+/// does not match the spatial dimensions of `open_beam_counts`.
 pub fn estimate_nuisance(
     open_beam_counts: &Array3<f64>,
     roi: Option<(std::ops::Range<usize>, std::ops::Range<usize>)>,
@@ -219,7 +224,8 @@ pub fn sparse_reconstruct(
 
     // Guard against zero-isotope calls: with no isotopes, PrecomputedTransmissionModel
     // would receive an empty cross_sections Vec and the first evaluate() would panic.
-    // Return a neutral result (T=1 everywhere) rather than crashing.
+    // Return an empty result with no density maps, NaN-filled NLL, and zero
+    // converged/total counts rather than crashing.
     if n_isotopes == 0 {
         return Ok(SparseResult {
             density_maps: vec![],
