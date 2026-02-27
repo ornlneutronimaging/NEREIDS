@@ -135,12 +135,19 @@ fn compute_jacobian(
 
         params.params[idx].value = original + step;
         params.params[idx].clamp();
-        let actual_step = params.params[idx].value - original;
+        let mut actual_step = params.params[idx].value - original;
 
+        // #112: If the forward step is blocked by an upper bound, try the
+        // backward step so the Jacobian column is not frozen at zero.
         if actual_step.abs() < 1e-30 {
-            // Parameter is at a bound, cannot step forward.
-            params.params[idx].value = original;
-            continue;
+            params.params[idx].value = original - step;
+            params.params[idx].clamp();
+            actual_step = params.params[idx].value - original;
+            if actual_step.abs() < 1e-30 {
+                // Truly stuck at a point constraint — skip this parameter.
+                params.params[idx].value = original;
+                continue;
+            }
         }
 
         let perturbed = model.evaluate(&params.all_values());
@@ -298,10 +305,38 @@ pub fn levenberg_marquardt(
     );
 
     let n_free = params.n_free();
-    let dof = if n_data > n_free { n_data - n_free } else { 1 };
 
-    // Weights = 1/σ²
-    let weights: Vec<f64> = sigma.iter().map(|&s| 1.0 / (s * s)).collect();
+    // #108.3: Underdetermined systems — when n_data <= n_free, the problem is
+    // underdetermined and reduced chi-squared is meaningless.  Return early
+    // with converged=false so callers can detect the problem.
+    if n_data <= n_free {
+        return LmResult {
+            chi_squared: f64::NAN,
+            reduced_chi_squared: f64::NAN,
+            iterations: 0,
+            converged: false,
+            params: params.all_values(),
+            covariance: None,
+            uncertainties: None,
+        };
+    }
+    let dof = n_data - n_free;
+
+    // #104: Validate sigma — division by zero or non-finite sigma would produce
+    // NaN/Inf weights and silently corrupt the entire fit.  Clamp to a small
+    // floor instead of rejecting outright, so callers with a few zero-sigma
+    // bins still get a usable fit.
+    let weights: Vec<f64> = sigma
+        .iter()
+        .map(|&s| {
+            if !s.is_finite() || s <= 0.0 {
+                // Treat as negligible weight (huge sigma) rather than panicking.
+                1.0 / 1e30
+            } else {
+                1.0 / (s * s)
+            }
+        })
+        .collect();
 
     // Initial model output, residuals, and chi².
     // y_current is kept up-to-date after accepted steps so that the next
@@ -355,6 +390,19 @@ pub fn levenberg_marquardt(
         params.set_free_values(&trial_free);
 
         let y_trial = model.evaluate(&params.all_values());
+
+        // #113: If the model produced NaN/Inf, treat as a bad step (same as
+        // chi2 increase) — increase lambda and try again.
+        if y_trial.iter().any(|v| !v.is_finite()) {
+            params.set_free_values(&old_free);
+            lambda *= config.lambda_up;
+            if lambda > 1e16 {
+                converged = false;
+                break;
+            }
+            continue;
+        }
+
         let trial_residuals: Vec<f64> = y_obs
             .iter()
             .zip(y_trial.iter())
@@ -371,8 +419,10 @@ pub fn levenberg_marquardt(
             y_current = y_trial;
             lambda *= config.lambda_down;
 
-            // Check convergence: either relative chi2 change is tiny,
-            // or chi2 itself is essentially zero, or parameters stopped moving.
+            // Check convergence: relative chi2 change is tiny or parameters
+            // stopped moving.  The old third condition
+            // `chi2 < tol_chi2 * n_data` was scale-dependent and could cause
+            // premature convergence on data with small residuals.  (#108.2)
             let param_change: f64 = delta
                 .iter()
                 .zip(old_free.iter())
@@ -380,10 +430,7 @@ pub fn levenberg_marquardt(
                 .sum::<f64>()
                 .sqrt();
 
-            if rel_change < config.tol_chi2
-                || param_change < config.tol_param
-                || chi2 < config.tol_chi2 * n_data as f64
-            {
+            if rel_change < config.tol_chi2 || param_change < config.tol_param {
                 converged = true;
                 break;
             }
@@ -392,6 +439,14 @@ pub fn levenberg_marquardt(
             // y_current stays valid (parameters reverted to old_free).
             params.set_free_values(&old_free);
             lambda *= config.lambda_up;
+
+            // #108.4: If lambda is astronomically large, the optimizer is stuck
+            // in a region where no step improves chi2.  Break out rather than
+            // wasting iterations.
+            if lambda > 1e16 {
+                converged = false;
+                break;
+            }
         }
     }
 
@@ -406,8 +461,28 @@ pub fn levenberg_marquardt(
         }
     }
 
-    let (covariance, uncertainties) = if let Some(cov) = invert_matrix(&jtw_j) {
-        let unc: Vec<f64> = (0..n_free).map(|i| cov[i][i].max(0.0).sqrt()).collect();
+    // #108.1: Scale covariance by reduced chi-squared.
+    //
+    // The raw (JᵀWJ)⁻¹ gives the covariance only when the model is a perfect
+    // description and the weights are exact.  Multiplying by χ²/ν accounts for
+    // misfit (model inadequacy or underestimated errors).  This is the standard
+    // statistical prescription (see e.g. Numerical Recipes §15.6).
+    let reduced_chi2 = chi2 / dof as f64;
+    let (covariance, uncertainties) = if let Some(mut cov) = invert_matrix(&jtw_j) {
+        for row in cov.iter_mut() {
+            for elem in row.iter_mut() {
+                *elem *= reduced_chi2;
+            }
+        }
+        let unc: Vec<f64> = (0..n_free)
+            .map(|i| {
+                if cov[i][i].is_finite() && cov[i][i] > 0.0 {
+                    cov[i][i].sqrt()
+                } else {
+                    f64::NAN
+                }
+            })
+            .collect();
         (Some(cov), Some(unc))
     } else {
         (None, None)

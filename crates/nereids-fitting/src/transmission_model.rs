@@ -40,12 +40,16 @@ impl FitModel for PrecomputedTransmissionModel {
         );
         let n_e = self.cross_sections[0].len();
         let mut neg_opt = vec![0.0f64; n_e];
+        // #109.1: No density > 0 guard — let Beer-Lambert handle all densities
+        // naturally.  exp(−n·σ) is well-defined for negative n (gives T > 1,
+        // which is unphysical but the optimizer will reject it via chi2
+        // increase).  Removing the guard makes evaluate() consistent with
+        // the analytical Jacobian, which always computes ∂T/∂n = −σ·T
+        // regardless of the sign of n.
         for (i, xs) in self.cross_sections.iter().enumerate() {
             let density = params[self.density_indices[i]];
-            if density > 0.0 {
-                for (j, &sigma) in xs.iter().enumerate() {
-                    neg_opt[j] -= density * sigma;
-                }
+            for (j, &sigma) in xs.iter().enumerate() {
+                neg_opt[j] -= density * sigma;
             }
         }
         neg_opt.iter().map(|&d| d.exp()).collect()
