@@ -1506,7 +1506,8 @@ fn py_spatial_map(
             let dead = dead_pixels.map(|d| d.as_array().to_owned());
 
             let result =
-                nereids_pipeline::spatial::spatial_map(&trans, &unc, &config, dead.as_ref(), None);
+                nereids_pipeline::spatial::spatial_map(&trans, &unc, &config, dead.as_ref(), None)
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
             let shape = (
                 result.converged_map.shape()[0],
@@ -1559,8 +1560,8 @@ fn py_spatial_map(
                 }
                 None => None,
             };
-            let nuisance = estimate_nuisance(&sample, &open_beam, roi_ranges, dead.as_ref())
-                .map_err(pyo3::exceptions::PyValueError::new_err)?;
+            let nuisance = estimate_nuisance(&open_beam, roi_ranges, dead.as_ref())
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
             let sparse_config = SparseConfig {
                 energies: e.to_vec(),
@@ -1577,7 +1578,8 @@ fn py_spatial_map(
 
             // Stage 2: per-pixel Poisson NLL fitting.
             let result =
-                sparse_reconstruct(&sample, &nuisance, &sparse_config, dead.as_ref(), None);
+                sparse_reconstruct(&sample, &nuisance, &sparse_config, dead.as_ref(), None)
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
             let shape = (result.nll_map.shape()[0], result.nll_map.shape()[1]);
             let py_result = PySparseResult {
@@ -1745,7 +1747,8 @@ fn py_fit_roi(
         y_range.0..y_range.1,
         x_range.0..x_range.1,
         &config,
-    );
+    )
+    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
     Ok(PyFitResult {
         densities: result.densities,

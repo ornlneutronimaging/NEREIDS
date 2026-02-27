@@ -86,7 +86,18 @@ impl ParameterSet {
     }
 
     /// Set the values of free parameters from a vector.
+    ///
+    /// # Panics
+    /// Panics if `values.len() != self.n_free()`.
     pub fn set_free_values(&mut self, values: &[f64]) {
+        let n_free = self.n_free();
+        assert_eq!(
+            values.len(),
+            n_free,
+            "set_free_values: values length ({}) must match number of free parameters ({})",
+            values.len(),
+            n_free,
+        );
         let mut j = 0;
         for p in &mut self.params {
             if !p.fixed {
@@ -128,6 +139,17 @@ mod tests {
         assert_eq!(params.n_free(), 2);
         assert_eq!(params.free_values(), vec![1.0, 3.0]);
         assert_eq!(params.all_values(), vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "set_free_values: values length")]
+    fn test_set_free_values_length_mismatch() {
+        let mut params = ParameterSet::new(vec![
+            FitParameter::non_negative("a", 1.0),
+            FitParameter::non_negative("b", 2.0),
+        ]);
+        // 2 free params but only 1 value — should panic
+        params.set_free_values(&[1.0]);
     }
 
     #[test]

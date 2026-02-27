@@ -14,6 +14,8 @@ use nereids_fitting::transmission_model::{PrecomputedTransmissionModel, Transmis
 use nereids_physics::resolution::ResolutionFunction;
 use nereids_physics::transmission::InstrumentParams;
 
+use crate::error::PipelineError;
+
 /// Configuration for a single-spectrum fit.
 #[derive(Debug, Clone)]
 pub struct FitConfig {
@@ -74,31 +76,38 @@ pub struct SpectrumFitResult {
 /// * `sigma` — Uncertainties on measured transmission.
 /// * `config` — Fit configuration (isotopes, energy grid, etc.).
 ///
+/// # Errors
+/// Returns `PipelineError::ShapeMismatch` if array lengths are inconsistent,
+/// or `PipelineError::InvalidParameter` if configuration values are invalid.
+///
 /// # Returns
 /// Fit result with densities, uncertainties, and fit quality metrics.
-pub fn fit_spectrum(measured_t: &[f64], sigma: &[f64], config: &FitConfig) -> SpectrumFitResult {
+pub fn fit_spectrum(
+    measured_t: &[f64],
+    sigma: &[f64],
+    config: &FitConfig,
+) -> Result<SpectrumFitResult, PipelineError> {
     let n_isotopes = config.resonance_data.len();
 
-    assert_eq!(
-        config.initial_densities.len(),
-        n_isotopes,
-        "initial_densities length ({}) must match resonance_data length ({})",
-        config.initial_densities.len(),
-        n_isotopes,
-    );
-    assert_eq!(
-        measured_t.len(),
-        config.energies.len(),
-        "measured_t length ({}) must match energies length ({})",
-        measured_t.len(),
-        config.energies.len(),
-    );
-    if config.fit_temperature {
-        assert!(
-            config.temperature_k >= 1.0,
+    if config.initial_densities.len() != n_isotopes {
+        return Err(PipelineError::ShapeMismatch(format!(
+            "initial_densities length ({}) must match resonance_data length ({})",
+            config.initial_densities.len(),
+            n_isotopes,
+        )));
+    }
+    if measured_t.len() != config.energies.len() {
+        return Err(PipelineError::ShapeMismatch(format!(
+            "measured_t length ({}) must match energies length ({})",
+            measured_t.len(),
+            config.energies.len(),
+        )));
+    }
+    if config.fit_temperature && config.temperature_k < 1.0 {
+        return Err(PipelineError::InvalidParameter(format!(
             "temperature_k ({}) must be >= 1.0 K when fit_temperature is true",
             config.temperature_k,
-        );
+        )));
     }
 
     let mut param_vec: Vec<FitParameter> = config
@@ -141,24 +150,28 @@ pub fn fit_spectrum(measured_t: &[f64], sigma: &[f64], config: &FitConfig) -> Sp
     // precompute when T is free).
     let result = if !config.fit_temperature {
         if let Some(xs) = &config.precomputed_cross_sections {
-            assert!(n_isotopes > 0, "resonance_data is empty — nothing to fit",);
-            assert_eq!(
-                xs.len(),
-                n_isotopes,
-                "precomputed_cross_sections has {} isotope(s) but resonance_data has {}",
-                xs.len(),
-                n_isotopes,
-            );
+            if n_isotopes == 0 {
+                return Err(PipelineError::InvalidParameter(
+                    "resonance_data is empty — nothing to fit".into(),
+                ));
+            }
+            if xs.len() != n_isotopes {
+                return Err(PipelineError::ShapeMismatch(format!(
+                    "precomputed_cross_sections has {} isotope(s) but resonance_data has {}",
+                    xs.len(),
+                    n_isotopes,
+                )));
+            }
             let n_e = config.energies.len();
             for (i, row) in xs.iter().enumerate() {
-                assert_eq!(
-                    row.len(),
-                    n_e,
-                    "precomputed_cross_sections[{}] has {} energy points but energies has {}",
-                    i,
-                    row.len(),
-                    n_e,
-                );
+                if row.len() != n_e {
+                    return Err(PipelineError::ShapeMismatch(format!(
+                        "precomputed_cross_sections[{}] has {} energy points but energies has {}",
+                        i,
+                        row.len(),
+                        n_e,
+                    )));
+                }
             }
             let model = PrecomputedTransmissionModel {
                 cross_sections: xs.clone(),
@@ -212,7 +225,7 @@ pub fn fit_spectrum(measured_t: &[f64], sigma: &[f64], config: &FitConfig) -> Sp
         (None, None)
     };
 
-    SpectrumFitResult {
+    Ok(SpectrumFitResult {
         densities,
         uncertainties: uncertainties_all[..n_isotopes].to_vec(),
         reduced_chi_squared: result.reduced_chi_squared,
@@ -220,7 +233,7 @@ pub fn fit_spectrum(measured_t: &[f64], sigma: &[f64], config: &FitConfig) -> Sp
         iterations: result.iterations,
         temperature_k,
         temperature_k_unc,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -295,7 +308,7 @@ mod tests {
             fit_temperature: false,
         };
 
-        let result = fit_spectrum(&y_obs, &sigma, &config);
+        let result = fit_spectrum(&y_obs, &sigma, &config).unwrap();
 
         assert!(result.converged);
         assert!(
@@ -305,5 +318,25 @@ mod tests {
             true_density,
         );
         assert!(result.uncertainties[0] > 0.0);
+    }
+
+    #[test]
+    fn test_fit_spectrum_rejects_length_mismatch() {
+        let data = u238_single_resonance();
+        let config = FitConfig {
+            energies: vec![1.0, 2.0, 3.0],
+            resonance_data: vec![data],
+            isotope_names: vec!["U-238".into()],
+            temperature_k: 0.0,
+            resolution: None,
+            initial_densities: vec![0.001],
+            lm_config: LmConfig::default(),
+            precomputed_cross_sections: None,
+            fit_temperature: false,
+        };
+
+        // measured_t length (2) != energies length (3)
+        let result = fit_spectrum(&[0.9, 0.8], &[0.01, 0.01], &config);
+        assert!(result.is_err());
     }
 }

@@ -2411,6 +2411,7 @@ dependencies = [
  "nereids-io",
  "nereids-physics",
  "rayon",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

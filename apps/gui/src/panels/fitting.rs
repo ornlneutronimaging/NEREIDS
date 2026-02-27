@@ -378,7 +378,13 @@ fn fit_pixel(state: &mut AppState) {
         .map(|e| norm.uncertainty[[e, y, x]].max(1e-10))
         .collect();
 
-    let result = nereids_pipeline::pipeline::fit_spectrum(&t_spectrum, &sigma, &config);
+    let result = match nereids_pipeline::pipeline::fit_spectrum(&t_spectrum, &sigma, &config) {
+        Ok(r) => r,
+        Err(e) => {
+            state.status_message = format!("Fit error: {}", e);
+            return;
+        }
+    };
 
     state.status_message = if result.converged {
         format!(
@@ -426,13 +432,19 @@ fn fit_roi(state: &mut AppState) {
         return;
     }
 
-    let result = nereids_pipeline::spatial::fit_roi(
+    let result = match nereids_pipeline::spatial::fit_roi(
         &norm.transmission,
         &norm.uncertainty,
         roi.y_start..roi.y_end,
         roi.x_start..roi.x_end,
         &config,
-    );
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            state.status_message = format!("ROI fit error: {}", e);
+            return;
+        }
+    };
 
     state.status_message = if result.converged {
         format!(
@@ -477,9 +489,20 @@ fn run_spatial_map(state: &mut AppState) {
             dead_pixels.as_ref(),
             Some(&cancel),
         );
-        // Only send result if not cancelled — receiver may already be dropped
-        if !cancel.load(Ordering::Relaxed) {
-            let _ = tx.send(result);
+        match result {
+            Ok(r) => {
+                // Only send result if not cancelled — receiver may already be dropped
+                if !cancel.load(Ordering::Relaxed) {
+                    let _ = tx.send(r);
+                }
+            }
+            Err(nereids_pipeline::error::PipelineError::Cancelled) => {
+                // Cancelled — do nothing, receiver may already be dropped
+            }
+            Err(_e) => {
+                // Validation error — receiver is still alive but we have no result.
+                // The channel will be closed when tx drops, signalling the error.
+            }
         }
     });
 }

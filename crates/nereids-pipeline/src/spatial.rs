@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use nereids_physics::transmission::{InstrumentParams, broadened_cross_sections};
 
+use crate::error::PipelineError;
 use crate::pipeline::{FitConfig, SpectrumFitResult, fit_spectrum};
 
 /// Result of spatial mapping over a 2D image.
@@ -39,23 +40,50 @@ pub struct SpatialResult {
 /// * `dead_pixels` — Optional dead pixel mask. Dead pixels are skipped.
 /// * `cancel` — Optional cancellation token. When set to `true`, in-flight
 ///   rayon tasks finish but no new pixels are started. The function returns
-///   partial results for pixels completed before cancellation.
+///   `Err(PipelineError::Cancelled)`.
+///
+/// # Errors
+/// Returns `PipelineError::ShapeMismatch` if array dimensions are inconsistent,
+/// or `PipelineError::Cancelled` if the cancellation token is set.
 ///
 /// # Returns
 /// Spatial result with density maps, uncertainty maps, and fit quality.
-/// If cancelled, only pixels completed before the signal are included.
 pub fn spatial_map(
     transmission: &Array3<f64>,
     uncertainty: &Array3<f64>,
     config: &FitConfig,
     dead_pixels: Option<&Array2<bool>>,
     cancel: Option<&AtomicBool>,
-) -> SpatialResult {
+) -> Result<SpatialResult, PipelineError> {
     let shape = transmission.shape();
     let (n_energies, height, width) = (shape[0], shape[1], shape[2]);
     let n_isotopes = config.resonance_data.len();
 
-    assert_eq!(n_energies, config.energies.len());
+    // Validate shapes
+    if uncertainty.shape() != transmission.shape() {
+        return Err(PipelineError::ShapeMismatch(format!(
+            "uncertainty shape {:?} != transmission shape {:?}",
+            uncertainty.shape(),
+            transmission.shape(),
+        )));
+    }
+    if n_energies != config.energies.len() {
+        return Err(PipelineError::ShapeMismatch(format!(
+            "transmission spectral axis ({}) != config.energies length ({})",
+            n_energies,
+            config.energies.len(),
+        )));
+    }
+    if let Some(dp) = dead_pixels
+        && dp.shape() != [height, width]
+    {
+        return Err(PipelineError::ShapeMismatch(format!(
+            "dead_pixels shape {:?} != spatial dimensions ({}, {})",
+            dp.shape(),
+            height,
+            width,
+        )));
+    }
 
     // Collect live pixel coordinates first (cheap).  We must know there is
     // actual work to do before paying the expensive precompute cost below.
@@ -85,10 +113,10 @@ pub fn spatial_map(
         n_total: 0,
     };
     if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
-        return empty_result();
+        return Err(PipelineError::Cancelled);
     }
     if pixel_coords.is_empty() {
-        return empty_result();
+        return Ok(empty_result());
     }
 
     // When temperature is free, cross-sections are recomputed each iteration
@@ -116,7 +144,7 @@ pub fn spatial_map(
                     instrument_params.as_ref(),
                     cancel,
                 ) else {
-                    return empty_result();
+                    return Err(PipelineError::Cancelled);
                 };
                 Arc::new(xs)
             }
@@ -145,10 +173,17 @@ pub fn spatial_map(
                 .map(|e| uncertainty[[e, y, x]].max(1e-10)) // Avoid zero uncertainty
                 .collect();
 
-            let result = fit_spectrum(&t_spectrum, &sigma, &fast_config);
+            // fit_spectrum validation has already passed for the config;
+            // per-pixel calls should not fail.
+            let result = fit_spectrum(&t_spectrum, &sigma, &fast_config).ok()?;
             Some(((y, x), result))
         })
         .collect();
+
+    // If cancellation was triggered during pixel fitting, return Cancelled.
+    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) && results.is_empty() {
+        return Err(PipelineError::Cancelled);
+    }
 
     // Assemble output maps
     let mut density_maps: Vec<Array2<f64>> = (0..n_isotopes)
@@ -173,14 +208,14 @@ pub fn spatial_map(
         }
     }
 
-    SpatialResult {
+    Ok(SpatialResult {
         density_maps,
         uncertainty_maps,
         chi_squared_map,
         converged_map,
         n_converged,
         n_total: results.len(),
-    }
+    })
 }
 
 /// Fit a single spectrum averaged over a region of interest.
@@ -194,32 +229,32 @@ pub fn spatial_map(
 /// * `y_range` — Row range for the ROI.
 /// * `x_range` — Column range for the ROI.
 /// * `config` — Fit configuration.
+///
+/// # Errors
+/// Returns `PipelineError::InvalidParameter` if the ROI is empty or out of bounds,
+/// or `PipelineError::ShapeMismatch` if config dimensions are inconsistent.
 pub fn fit_roi(
     transmission: &Array3<f64>,
     uncertainty: &Array3<f64>,
     y_range: std::ops::Range<usize>,
     x_range: std::ops::Range<usize>,
     config: &FitConfig,
-) -> SpectrumFitResult {
+) -> Result<SpectrumFitResult, PipelineError> {
     let n_energies = transmission.shape()[0];
 
-    assert!(
-        y_range.start < y_range.end && x_range.start < x_range.end,
-        "ROI ranges must be non-empty: y={}..{}, x={}..{}",
-        y_range.start,
-        y_range.end,
-        x_range.start,
-        x_range.end,
-    );
+    if y_range.start >= y_range.end || x_range.start >= x_range.end {
+        return Err(PipelineError::InvalidParameter(format!(
+            "ROI ranges must be non-empty: y={}..{}, x={}..{}",
+            y_range.start, y_range.end, x_range.start, x_range.end,
+        )));
+    }
     let shape = transmission.shape();
-    assert!(
-        y_range.end <= shape[1] && x_range.end <= shape[2],
-        "ROI exceeds image dimensions: y_end={} (max {}), x_end={} (max {})",
-        y_range.end,
-        shape[1],
-        x_range.end,
-        shape[2],
-    );
+    if y_range.end > shape[1] || x_range.end > shape[2] {
+        return Err(PipelineError::InvalidParameter(format!(
+            "ROI exceeds image dimensions: y_end={} (max {}), x_end={} (max {})",
+            y_range.end, shape[1], x_range.end, shape[2],
+        )));
+    }
 
     let n_pixels = (y_range.end - y_range.start) * (x_range.end - x_range.start);
 
@@ -333,7 +368,7 @@ mod tests {
             fit_temperature: false,
         };
 
-        let result = spatial_map(&transmission, &uncertainty, &config, None, None);
+        let result = spatial_map(&transmission, &uncertainty, &config, None, None).unwrap();
 
         assert_eq!(result.n_total, 9);
         assert_eq!(result.n_converged, 9);
@@ -400,10 +435,55 @@ mod tests {
             fit_temperature: false,
         };
 
-        let result = spatial_map(&transmission, &uncertainty, &config, Some(&dead), None);
+        let result = spatial_map(&transmission, &uncertainty, &config, Some(&dead), None).unwrap();
 
         assert_eq!(result.n_total, 3); // 4 pixels - 1 dead = 3
         assert_eq!(result.density_maps[0][[0, 0]], 0.0); // dead pixel stays at 0
+    }
+
+    #[test]
+    fn test_spatial_map_rejects_shape_mismatch() {
+        let data = u238_single_resonance();
+        let config = FitConfig {
+            energies: vec![1.0, 2.0, 3.0],
+            resonance_data: vec![data],
+            isotope_names: vec!["U-238".into()],
+            temperature_k: 0.0,
+            resolution: None,
+            initial_densities: vec![0.001],
+            lm_config: LmConfig::default(),
+            precomputed_cross_sections: None,
+            fit_temperature: false,
+        };
+
+        let transmission = Array3::from_elem((3, 2, 2), 0.5);
+        let uncertainty = Array3::from_elem((3, 2, 3), 0.01); // different width
+
+        let result = spatial_map(&transmission, &uncertainty, &config, None, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_spatial_map_rejects_dead_pixel_shape_mismatch() {
+        let data = u238_single_resonance();
+        let config = FitConfig {
+            energies: vec![1.0, 2.0, 3.0],
+            resonance_data: vec![data],
+            isotope_names: vec!["U-238".into()],
+            temperature_k: 0.0,
+            resolution: None,
+            initial_densities: vec![0.001],
+            lm_config: LmConfig::default(),
+            precomputed_cross_sections: None,
+            fit_temperature: false,
+        };
+
+        let transmission = Array3::from_elem((3, 2, 2), 0.5);
+        let uncertainty = Array3::from_elem((3, 2, 2), 0.01);
+        let dead = Array2::from_elem((3, 2), false); // wrong shape
+
+        let result = spatial_map(&transmission, &uncertainty, &config, Some(&dead), None);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -450,7 +530,7 @@ mod tests {
         };
 
         // Fit a 2×2 ROI
-        let result = fit_roi(&transmission, &uncertainty, 1..3, 1..3, &config);
+        let result = fit_roi(&transmission, &uncertainty, 1..3, 1..3, &config).unwrap();
 
         assert!(result.converged);
         assert!(
@@ -459,5 +539,27 @@ mod tests {
             result.densities[0],
             true_density,
         );
+    }
+
+    #[test]
+    fn test_fit_roi_rejects_empty_range() {
+        let data = u238_single_resonance();
+        let config = FitConfig {
+            energies: vec![1.0, 2.0, 3.0],
+            resonance_data: vec![data],
+            isotope_names: vec!["U-238".into()],
+            temperature_k: 0.0,
+            resolution: None,
+            initial_densities: vec![0.001],
+            lm_config: LmConfig::default(),
+            precomputed_cross_sections: None,
+            fit_temperature: false,
+        };
+
+        let transmission = Array3::from_elem((3, 4, 4), 0.5);
+        let uncertainty = Array3::from_elem((3, 4, 4), 0.01);
+
+        let result = fit_roi(&transmission, &uncertainty, 2..2, 0..2, &config);
+        assert!(result.is_err());
     }
 }
