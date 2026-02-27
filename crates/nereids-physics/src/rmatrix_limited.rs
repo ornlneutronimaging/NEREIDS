@@ -448,11 +448,31 @@ fn spin_group_cross_sections(
             // near-degenerate (e.g. two channels at the same threshold).
             // The epsilon is real-only to preserve Hermitian symmetry of the
             // level matrix; an imaginary perturbation would break unitarity.
-            // The value is small enough not to perturb physics but large
-            // enough to lift the singularity.
+            //
+            // Use a *relative* epsilon: ε = |diag| × 1e-10, with a floor of
+            // 1e-30 for zero diagonals.  A fixed absolute epsilon (e.g. 1e-10)
+            // could be comparable to or larger than the diagonal value itself
+            // for high-L channels with very small penetrabilities (where
+            // 1/L_c ~ 1/P_c can be enormous, but R_cc' is also large, making
+            // the net diagonal small).  The relative approach perturbs the
+            // matrix by a fraction of its natural scale.
+            //
+            // Per-diagonal (not matrix-norm) regularization is intentional:
+            // each channel's diagonal element lives on its own physical scale
+            // (set by 1/L_c − R_cc), which can differ by orders of magnitude
+            // across channels (e.g. an s-wave elastic channel vs. a high-L
+            // fission channel).  A single matrix-norm epsilon would be
+            // dominated by the largest channel and could either over-perturb
+            // small channels or under-perturb large ones.  Per-diagonal
+            // epsilon ensures each channel is nudged proportionally to its
+            // own scale.
             let mut y_reg = y_tilde.clone();
             for (i, row) in y_reg.iter_mut().enumerate().take(nch) {
-                row[i] += Complex64::new(1e-10, 0.0);
+                let diag_norm = row[i].norm();
+                // Relative regularization (1e-10 × diagonal) with an
+                // absolute floor of 1e-30 for near-zero diagonals.
+                let eps = (diag_norm * 1e-10).max(1e-30);
+                row[i] += Complex64::new(eps, 0.0);
             }
             match invert_complex_matrix(&y_reg, nch) {
                 Some(inv) => inv,
@@ -910,6 +930,72 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Singular Y-matrix regularization: construct a KRM=2 spin group where
+    /// the R-matrix nearly cancels L⁻¹ at the resonance energy, making
+    /// the Y-matrix nearly singular.  The relative-epsilon regularization
+    /// must produce finite, non-negative cross-sections (no NaN/Inf).
+    #[test]
+    fn test_rml_singular_y_matrix_regularization() {
+        use nereids_endf::resonance::{ParticlePair, RmlChannel, RmlData, RmlResonance, SpinGroup};
+
+        let pp = ParticlePair {
+            ma: 1.0,
+            mb: 184.0,
+            za: 0.0,
+            zb: 74.0,
+            ia: 0.5,
+            ib: 0.0,
+            q: 0.0,
+            pnt: 1,
+            shf: 0,
+            mt: 2,
+            pa: 1.0,
+            pb: 1.0,
+        };
+        let ch = RmlChannel {
+            particle_pair_idx: 0,
+            l: 0,
+            channel_spin: 0.5,
+            boundary: 0.0,
+            effective_radius: 8.3,
+            true_radius: 8.3,
+        };
+        // KRM=2: widths are reduced amplitudes γ_nc.
+        // A very large reduced amplitude γ at E_r makes R ≈ γ²/(E_r - E)
+        // huge near E_r, potentially cancelling L⁻¹ on the diagonal.
+        let sg = SpinGroup {
+            j: 0.5,
+            parity: 1.0,
+            channels: vec![ch],
+            resonances: vec![RmlResonance {
+                energy: 100.0,
+                gamma_gamma: 0.0,  // KRM=2 has no implicit capture
+                widths: vec![1e5], // very large reduced amplitude
+            }],
+            has_background_correction: false,
+        };
+        let rml = RmlData {
+            target_spin: 0.0,
+            awr: 183.0,
+            scattering_radius: 8.3,
+            krm: 2,
+            particle_pairs: vec![pp],
+            spin_groups: vec![sg],
+        };
+
+        // Evaluate exactly at the resonance energy (worst case for singularity).
+        let (tot, elas, cap, _fis) = cross_sections_for_rml_range(&rml, 100.0);
+        assert!(
+            tot.is_finite() && tot >= 0.0,
+            "σ_total must be finite and ≥ 0 near singular Y-matrix, got {tot}"
+        );
+        assert!(
+            elas.is_finite() && elas >= 0.0,
+            "σ_elastic must be finite and ≥ 0, got {elas}"
+        );
+        assert!(cap.is_finite(), "σ_capture must be finite, got {cap}");
     }
 
     /// Verify W-184 cross-sections show resonance structure.

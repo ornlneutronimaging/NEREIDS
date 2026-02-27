@@ -307,22 +307,34 @@ fn interpolate_cross_section(energies: &[f64], cross_sections: &[f64], energy: f
 
     // Binary search for the interval.
     // Use total_cmp-style fallback to avoid panic on NaN comparisons.
+    // With the current comparator (NaNs treated as Ordering::Less), NaN
+    // values in the energy grid are pushed to the right, so Err(0) should
+    // not occur in normal operation. The Err(0) arm is kept as a
+    // defense-in-depth guard: if the NaN guard on `energy` is ever removed
+    // or the comparator behavior changes and Err(0) becomes possible, we
+    // avoid `0 - 1` underflow on usize by returning the first cross-section.
     let idx = match energies
         .binary_search_by(|e| e.partial_cmp(&energy).unwrap_or(std::cmp::Ordering::Less))
     {
         Ok(i) => return cross_sections[i],
+        Err(0) => return cross_sections[0],
         Err(i) => i - 1,
     };
 
     // Linear interpolation.
     // Guard against duplicate energy grid points: if e0 == e1 (or nearly so),
     // no interpolation is needed — use the value at that point directly.
+    // Use a combined relative+absolute threshold that works across the full
+    // energy range (meV to MeV): |de| < |e0|·ε_mach + 1e-30.
+    // The relative part handles large energies where f64::EPSILON alone would
+    // miss near-duplicates; the absolute part handles energies near zero.
+    // This is consistent with resolution.rs interp_spectrum (which uses 1e-30).
     let e0 = energies[idx];
     let e1 = energies[idx + 1];
     let s0 = cross_sections[idx];
     let s1 = cross_sections[idx + 1];
     let de = e1 - e0;
-    if de.abs() < f64::EPSILON {
+    if de.abs() < e0.abs() * f64::EPSILON + 1e-30 {
         return s0;
     }
     let t = (energy - e0) / de;
@@ -600,5 +612,131 @@ mod tests {
             area_broad,
             rel_diff
         );
+    }
+
+    /// NaN query energy: interpolate_cross_section must return 0.0 without
+    /// panicking (the NaN guard at line 282 catches this).
+    #[test]
+    fn test_interpolate_nan_energy() {
+        let energies = vec![1.0, 2.0, 3.0];
+        let xs = vec![10.0, 20.0, 30.0];
+        let result = interpolate_cross_section(&energies, &xs, f64::NAN);
+        assert_eq!(result, 0.0, "NaN energy should return 0.0");
+    }
+
+    /// Err(0) guard in binary search: if the binary search were to return
+    /// Err(0) (insertion point = 0), `i - 1` would underflow on usize.
+    /// The guard returns cross_sections[0] instead.
+    ///
+    /// This path is hard to trigger with well-formed grids (the boundary
+    /// check `energy <= energies[0]` catches it first), but can occur if
+    /// the grid or the comparison function behaves unexpectedly (e.g.
+    /// NaN contamination with a different comparison strategy).  The guard
+    /// is cheap defense-in-depth against arithmetic underflow.
+    ///
+    /// NOTE: This test exercises the `energy <= energies[0]` boundary path
+    /// (1/v extrapolation), *not* the `Err(0)` binary-search guard itself.
+    ///
+    /// We test the NaN query guard separately (`test_interpolate_nan_energy`),
+    /// the NaN grid guard separately (`test_interpolate_nan_grid_no_panic`),
+    /// and the duplicate-point guard separately (`test_interpolate_duplicate_grid_points`).
+    ///
+    /// The `Err(0)` binary-search guard is primarily a defense-in-depth
+    /// safety net against unexpected grid or comparison behavior.
+    #[test]
+    fn test_interpolate_below_grid_minimum() {
+        let energies = vec![5.0, 10.0, 15.0];
+        let xs = vec![50.0, 100.0, 150.0];
+        // Energy below the grid minimum: hits the `energy <= energies[0]` guard
+        // and returns via 1/v extrapolation, not the binary search.
+        let result = interpolate_cross_section(&energies, &xs, 2.0);
+        assert!(
+            result.is_finite() && result > 0.0,
+            "Below-grid query should return a finite positive value via 1/v extrapolation, got {result}"
+        );
+        // Check 1/v scaling: σ(2) ≈ σ(5) × √(5/2)
+        let expected = 50.0 * (5.0 / 2.0_f64).sqrt();
+        assert!(
+            (result - expected).abs() < 1e-10,
+            "Expected 1/v extrapolation: {expected}, got {result}"
+        );
+    }
+
+    /// Duplicate grid points: two adjacent energies are identical.
+    /// The combined relative+absolute threshold must detect this and
+    /// return the value at the duplicate point without division by zero.
+    #[test]
+    fn test_interpolate_duplicate_grid_points() {
+        let energies = vec![1.0, 2.0, 2.0, 3.0];
+        let xs = vec![10.0, 20.0, 25.0, 30.0];
+        // Query at exactly 2.0 should hit the Ok(i) branch.
+        let result = interpolate_cross_section(&energies, &xs, 2.0);
+        assert!(
+            (result - 20.0).abs() < 1e-10 || (result - 25.0).abs() < 1e-10,
+            "At duplicate point 2.0, should return one of the boundary values, got {result}"
+        );
+        // Query at 2.0 + tiny epsilon should trigger the duplicate guard.
+        let result2 = interpolate_cross_section(&energies, &xs, 2.0 + 1e-16);
+        assert!(
+            result2.is_finite(),
+            "Near-duplicate query should return finite result, got {result2}"
+        );
+
+        // Exercise the `de.abs() < |e0|*EPS + 1e-30` threshold with
+        // near-zero adjacent energies where de is essentially zero
+        // (triggers the absolute 1e-30 floor, not the relative part).
+        let tiny_energies = vec![1e-35, 1e-35 + 1e-50, 1.0];
+        let tiny_xs = vec![100.0, 200.0, 300.0];
+        // Query between the two near-zero points: de ≈ 1e-50 which is
+        // far below the absolute threshold 1e-30, so the guard fires.
+        let result3 = interpolate_cross_section(&tiny_energies, &tiny_xs, 1e-35 + 5e-51);
+        assert!(
+            result3.is_finite(),
+            "Near-zero de should be caught by the absolute threshold, got {result3}"
+        );
+        // Should return s0 (100.0) since the guard short-circuits.
+        assert!(
+            (result3 - 100.0).abs() < 1e-10,
+            "Expected s0=100.0 from the de threshold guard, got {result3}"
+        );
+    }
+
+    /// NaN-contaminated energy grid: verify no panic occurs and the NaN
+    /// query guard (line 282) protects against the `Err(0)` binary search
+    /// underflow path (line 317).
+    ///
+    /// With the current comparator (`unwrap_or(Ordering::Less)`), NaN grid
+    /// entries are treated as "less than" any query, pushing the binary
+    /// search rightward.  This means NaN *in the grid* alone cannot produce
+    /// `Err(0)` — it always produces `Err(k)` with k > 0.  However, a NaN
+    /// *query* bypasses comparisons entirely and could reach `Err(0)` if the
+    /// earlier NaN guard (line 282) were removed.  That guard returns 0.0
+    /// before the binary search, making `Err(0)` unreachable in practice.
+    ///
+    /// The `Err(0)` match arm is therefore pure defense-in-depth against
+    /// future comparator changes.  This test verifies:
+    ///   1. NaN query → returns 0.0 (guard fires, `Err(0)` never reached).
+    ///   2. NaN in grid → no panic (does not underflow).
+    #[test]
+    fn test_interpolate_nan_grid_no_panic() {
+        let xs = vec![10.0, 20.0, 30.0];
+
+        // Case 1: NaN query on a clean grid — the NaN guard at line 282
+        // returns 0.0 before reaching the binary search.  This is the only
+        // code path that *would* hit Err(0) if the guard were absent.
+        let clean_grid = vec![1.0, 2.0, 3.0];
+        let result = interpolate_cross_section(&clean_grid, &xs, f64::NAN);
+        assert_eq!(result, 0.0, "NaN query should return 0.0 via the guard");
+
+        // Case 2: NaN in the grid at position 0 — the boundary check
+        // `energy <= energies[0]` is false (NaN comparison), so we fall
+        // through to the binary search.  The search treats NaN as Less,
+        // returning Err(k>0), so the Err(0) arm is NOT reached.  The
+        // function should not panic.
+        let nan_grid = vec![f64::NAN, 2.0, 3.0];
+        let result2 = interpolate_cross_section(&nan_grid, &xs, 1.5);
+        // Result may be NaN (interpolating with a NaN grid point), but
+        // the important thing is no panic from usize underflow.
+        let _ = result2; // just verify no panic
     }
 }

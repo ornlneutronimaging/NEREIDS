@@ -81,9 +81,10 @@ pub fn wave_number(energy_ev: f64, awr: f64) -> f64 {
 /// * `e_cm` — Center-of-mass kinetic energy in this channel (eV). Must be ≥ 0.
 /// * `reduced_mass_ratio` — μ = MA·MB/(MA+MB) in neutron mass units.
 pub fn wave_number_from_cm(e_cm: f64, reduced_mass_ratio: f64) -> f64 {
-    // Guard against negative CM energies, which can arise from numerical noise
+    // Guard against non-positive CM energies, which can arise from numerical noise
     // near threshold energies. Zero wave number means no contribution from this channel.
-    if e_cm < 0.0 {
+    // Uses `<= 0.0` to match `k_squared` (line 41), which also catches zero.
+    if e_cm <= 0.0 {
         return 0.0;
     }
     let mn_ev = constants::NEUTRON_MASS_MEV * 1e6; // MeV → eV
@@ -130,6 +131,27 @@ pub fn lab_to_cm_energy(energy_lab: f64, awr: f64) -> f64 {
 /// * `energy_ev` — Neutron energy in eV.
 /// * `awr` — Mass ratio from ENDF.
 pub fn pi_over_k_squared_barns(energy_ev: f64, awr: f64) -> f64 {
+    // Catch non-positive energies in debug builds: k_squared(0.0) returns 0.0,
+    // and pi_over_k_squared_barns would silently map 0.0 → 1e-20 via the
+    // floor, producing a finite (wrong) result instead of the expected
+    // infinity/zero. Callers should never pass non-positive energy here.
+    //
+    // Note on debug_assert vs assert: the check `energy_ev > 0.0` fires
+    // for both zero and negative energies, but only in debug builds.
+    // In release builds, a non-positive energy is silently clamped to 1e-20
+    // by the floor below, yielding a large but finite π/k² (~10¹⁸ barns).
+    // This is acceptable because:
+    //   1. All call sites guarantee positive energies (ENDF grids, fitting
+    //      bounds, transmission forward model).
+    //   2. The 1e-20 floor is defense-in-depth: it prevents division by zero
+    //      and NaN propagation without paying for a branch in hot loops.
+    //   3. A full `assert!` would add a branch to the hottest inner loop of
+    //      cross-section evaluation for a condition that cannot occur in
+    //      correct usage.
+    debug_assert!(
+        energy_ev > 0.0,
+        "pi_over_k_squared_barns called with non-positive energy: {energy_ev}"
+    );
     // Apply a tiny energy floor (1e-20 eV) so that k² is never zero.
     // This preserves the correct 1/E functional form at very low energies
     // instead of returning an arbitrary sentinel value that could mislead
@@ -190,5 +212,27 @@ mod tests {
             "π/k² = {} barns, expected ~9.86e4",
             val
         );
+    }
+
+    /// k_squared must return 0.0 for negative energies (guard path).
+    /// Negative E_r can appear for bound-state resonances in ENDF; the guard
+    /// prevents a negative k² from propagating NaN through sqrt downstream.
+    #[test]
+    fn test_k_squared_negative_energy() {
+        assert_eq!(k_squared(-1.0, 236.006), 0.0);
+        assert_eq!(k_squared(-100.0, 10.0), 0.0);
+        assert_eq!(k_squared(0.0, 236.006), 0.0);
+    }
+
+    /// wave_number_from_cm must return 0.0 for negative CM energies.
+    /// Negative E_cm arises near threshold energies from numerical noise.
+    #[test]
+    fn test_wave_number_from_cm_negative_energy() {
+        assert_eq!(wave_number_from_cm(-1.0, 0.5), 0.0);
+        assert_eq!(wave_number_from_cm(-1e-10, 0.9412), 0.0);
+        // Zero CM energy → zero wave number
+        assert_eq!(wave_number_from_cm(0.0, 0.5), 0.0);
+        // Positive CM energy → positive wave number
+        assert!(wave_number_from_cm(1.0, 0.5) > 0.0);
     }
 }
