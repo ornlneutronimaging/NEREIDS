@@ -485,7 +485,14 @@ fn interp_spectrum(energies: &[f64], spectrum: &[f64], e: f64) -> Option<f64> {
         }
     }
 
-    let frac = (e - energies[lo]) / (energies[hi] - energies[lo]);
+    // Guard: if energies[hi] == energies[lo] (duplicate grid points or
+    // single-point grid where lo==hi), the denominator is zero.  Return the
+    // value at the lower bracket to avoid NaN.
+    let span = energies[hi] - energies[lo];
+    if span.abs() < 1e-30 {
+        return Some(spectrum[lo]);
+    }
+    let frac = (e - energies[lo]) / span;
     Some(spectrum[lo] + frac * (spectrum[hi] - spectrum[lo]))
 }
 

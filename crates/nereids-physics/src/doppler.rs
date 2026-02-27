@@ -276,8 +276,20 @@ fn interpolate_cross_section(energies: &[f64], cross_sections: &[f64], energy: f
         return 0.0;
     }
 
+    // Guard against NaN energy: NaN comparisons are always false, so the
+    // boundary checks below would both be skipped.  The binary search would
+    // then return Err(0), and `idx = 0 - 1` would underflow on usize.
+    if energy.is_nan() {
+        return 0.0;
+    }
+
     if energy <= energies[0] {
-        // Extrapolate using 1/v law: σ ∝ 1/√E
+        // Extrapolate using 1/v law: σ ∝ 1/√E.
+        // Guard: if energy <= 0, the ratio energies[0]/energy would be negative
+        // or infinite, producing NaN from sqrt.  Return the boundary value directly.
+        if energy <= 0.0 {
+            return cross_sections[0];
+        }
         if energies[0] > 1e-30 {
             return cross_sections[0] * (energies[0] / energy).sqrt();
         }
@@ -293,18 +305,27 @@ fn interpolate_cross_section(energies: &[f64], cross_sections: &[f64], energy: f
         return cross_sections[last];
     }
 
-    // Binary search for the interval
-    let idx = match energies.binary_search_by(|e| e.partial_cmp(&energy).unwrap()) {
+    // Binary search for the interval.
+    // Use total_cmp-style fallback to avoid panic on NaN comparisons.
+    let idx = match energies
+        .binary_search_by(|e| e.partial_cmp(&energy).unwrap_or(std::cmp::Ordering::Less))
+    {
         Ok(i) => return cross_sections[i],
         Err(i) => i - 1,
     };
 
-    // Linear interpolation
+    // Linear interpolation.
+    // Guard against duplicate energy grid points: if e0 == e1 (or nearly so),
+    // no interpolation is needed — use the value at that point directly.
     let e0 = energies[idx];
     let e1 = energies[idx + 1];
     let s0 = cross_sections[idx];
     let s1 = cross_sections[idx + 1];
-    let t = (energy - e0) / (e1 - e0);
+    let de = e1 - e0;
+    if de.abs() < f64::EPSILON {
+        return s0;
+    }
+    let t = (energy - e0) / de;
     s0 + t * (s1 - s0)
 }
 

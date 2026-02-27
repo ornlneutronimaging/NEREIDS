@@ -147,7 +147,7 @@ pub fn coulomb_wave_functions(l: u32, eta: f64, rho: f64) -> Option<(f64, f64, f
 
     // CF1 main loop (Steed modified Lentz, SAMMY lines 320–343).
     // SAMMY: Pk = Pk1; Pk1 = Pk1 + One  (advance to next k before each step).
-    let mut p_count = 1u32;
+    let mut p_count: u32 = 0;
     loop {
         pk = pk1; // advance: current step uses previous pk1
         pk1 = pk + 1.0; // next step's pk1
@@ -155,11 +155,16 @@ pub fn coulomb_wave_functions(l: u32, eta: f64, rho: f64) -> Option<(f64, f64, f
         let tk = (pk + pk1) * (xi + ek / pk1);
         d = tk - d * (1.0 + ek * ek);
         if d.abs() <= acch {
-            // D too small — accuracy warning (SAMMY lines 331–337)
+            // D too small — count consecutive small denominators
+            // (SAMMY lines 331–337).  Three or more in a row means
+            // the continued fraction has lost all precision.
             p_count += 1;
             if p_count > 2 {
                 return None; // CF1 failed
             }
+        } else {
+            // Denominator is healthy — reset the consecutive-small counter.
+            p_count = 0;
         }
         d = 1.0 / d;
         if d < 0.0 {
@@ -335,7 +340,20 @@ pub fn coulomb_wave_functions(l: u32, eta: f64, rho: f64) -> Option<(f64, f64, f
 pub fn coulomb_penetrability(l: u32, eta: f64, rho: f64) -> f64 {
     match coulomb_wave_functions(l, eta, rho) {
         Some((fl, gl, _, _)) => rho / (fl * fl + gl * gl),
-        None => 0.0,
+        None => {
+            // Coulomb wave functions failed (ρ too small).
+            if eta.abs() < 1e-30 {
+                // Neutral channel (η ≈ 0): fall back to the non-Coulomb
+                // (hard-sphere) penetrability, which is exact when η = 0.
+                crate::penetrability::penetrability(l, rho)
+            } else {
+                // Charged-particle channel (η > 0): the Coulomb barrier
+                // completely suppresses penetrability at very small ρ.
+                // Using the neutron fallback here would overestimate P_L
+                // by many orders of magnitude.
+                0.0
+            }
+        }
     }
 }
 

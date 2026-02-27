@@ -34,6 +34,14 @@ use nereids_core::constants;
 /// * `energy_ev` — Neutron energy in eV (lab frame, as stored in ENDF).
 /// * `awr` — Ratio of target mass to neutron mass (from ENDF).
 pub fn k_squared(energy_ev: f64, awr: f64) -> f64 {
+    // Guard: bound-state resonances have negative E_r in ENDF, but k² is
+    // evaluated at the lab energy which is always positive.  If a caller
+    // passes E ≤ 0 (e.g. during extrapolation or misuse), return 0.0 to
+    // prevent a negative k² from propagating NaN through sqrt downstream.
+    if energy_ev <= 0.0 {
+        return 0.0;
+    }
+
     // μ/m_n = AWR / (1 + AWR)
     let mass_ratio = awr / (1.0 + awr);
 
@@ -73,6 +81,11 @@ pub fn wave_number(energy_ev: f64, awr: f64) -> f64 {
 /// * `e_cm` — Center-of-mass kinetic energy in this channel (eV). Must be ≥ 0.
 /// * `reduced_mass_ratio` — μ = MA·MB/(MA+MB) in neutron mass units.
 pub fn wave_number_from_cm(e_cm: f64, reduced_mass_ratio: f64) -> f64 {
+    // Guard against negative CM energies, which can arise from numerical noise
+    // near threshold energies. Zero wave number means no contribution from this channel.
+    if e_cm < 0.0 {
+        return 0.0;
+    }
     let mn_ev = constants::NEUTRON_MASS_MEV * 1e6; // MeV → eV
     let hbar_c = constants::HBAR_EV_S * constants::SPEED_OF_LIGHT * 1e15; // eV·fm
     (2.0 * mn_ev * reduced_mass_ratio * e_cm / (hbar_c * hbar_c)).sqrt()
@@ -117,7 +130,12 @@ pub fn lab_to_cm_energy(energy_lab: f64, awr: f64) -> f64 {
 /// * `energy_ev` — Neutron energy in eV.
 /// * `awr` — Mass ratio from ENDF.
 pub fn pi_over_k_squared_barns(energy_ev: f64, awr: f64) -> f64 {
-    let k2 = k_squared(energy_ev, awr);
+    // Apply a tiny energy floor (1e-20 eV) so that k² is never zero.
+    // This preserves the correct 1/E functional form at very low energies
+    // instead of returning an arbitrary sentinel value that could mislead
+    // a fitting optimizer.
+    let e_safe = energy_ev.max(1e-20);
+    let k2 = k_squared(e_safe, awr);
     // π/k² in fm², convert to barns (1 barn = 100 fm²)
     std::f64::consts::PI / k2 / 100.0
 }
