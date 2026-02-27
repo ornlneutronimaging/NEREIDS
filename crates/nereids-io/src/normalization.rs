@@ -112,11 +112,13 @@ pub fn normalize(
                     // fraction of raw counts.
                     //
                     // Apply a Bayesian floor of 0.5 counts (Jeffreys prior for
-                    // Poisson) to both sample and OB counts. This avoids division
-                    // by zero and provides conservative uncertainty for low-count
-                    // bins without introducing a discontinuity.
-                    let c_s_eff = c_s.max(0.5);
-                    let c_o_eff = c_o.max(0.5);
+                    // Poisson) only when the count is exactly zero. For 0 < c < 0.5,
+                    // the true Poisson variance equals c, so replacing it with 0.5
+                    // would be anti-conservative (smaller 1/c_eff, thus smaller
+                    // relative uncertainty). The floor only makes sense as a prior
+                    // when no counts have been observed at all.
+                    let c_s_eff = if c_s > 0.0 { c_s } else { 0.5 };
+                    let c_o_eff = if c_o > 0.0 { c_o } else { 0.5 };
                     let rel_err = (1.0 / c_s_eff + 1.0 / c_o_eff).sqrt();
                     // Use the absolute uncertainty formula: σ_T = T * rel_err.
                     // When t_val=0 (c_s=0), use the floor-based absolute value

@@ -207,6 +207,10 @@ fn normalize_data(state: &mut AppState) {
             ) {
                 Ok(edges) => edges,
                 Err(e) => {
+                    // Invalidate stale results so the GUI cannot fit against
+                    // outdated data from a previous successful normalization.
+                    state.normalized = None;
+                    state.energies = None;
                     state.status_message = format!("TOF linspace error: {}", e);
                     return;
                 }
@@ -214,6 +218,9 @@ fn normalize_data(state: &mut AppState) {
             match nereids_io::tof::tof_edges_to_energy_centers(&tof_edges, &state.beamline) {
                 Ok(e) => state.energies = Some(e.to_vec()),
                 Err(e) => {
+                    // Invalidate stale results — same reasoning as TOF linspace error above.
+                    state.normalized = None;
+                    state.energies = None;
                     state.status_message = format!("TOF→energy error: {}", e);
                     return;
                 }
