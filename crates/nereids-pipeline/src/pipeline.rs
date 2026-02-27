@@ -93,6 +93,13 @@ pub fn fit_spectrum(measured_t: &[f64], sigma: &[f64], config: &FitConfig) -> Sp
         measured_t.len(),
         config.energies.len(),
     );
+    if config.fit_temperature {
+        assert!(
+            config.temperature_k >= 1.0,
+            "temperature_k ({}) must be >= 1.0 K when fit_temperature is true",
+            config.temperature_k,
+        );
+    }
 
     let mut param_vec: Vec<FitParameter> = config
         .initial_densities

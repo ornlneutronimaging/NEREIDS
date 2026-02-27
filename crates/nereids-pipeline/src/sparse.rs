@@ -292,7 +292,6 @@ pub fn sparse_reconstruct(
                 transmission_model: &t_model,
                 flux: &nuisance.flux,
                 background: &nuisance.background,
-                density_param_range: 0..n_isotopes,
             };
 
             // Fit with Poisson likelihood using analytical gradient.

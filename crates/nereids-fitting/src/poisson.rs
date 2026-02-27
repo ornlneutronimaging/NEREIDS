@@ -277,8 +277,7 @@ pub struct TemperatureContext {
 /// * `density_indices` — Maps isotope `k` → parameter index: the density for
 ///   isotope `k` is `params[density_indices[k]]`.  This decouples isotope
 ///   ordering from the parameter vector layout, supporting callers that include
-///   additional nuisance parameters alongside densities (via `CountsModel`'s
-///   `density_param_range`).
+///   additional nuisance parameters alongside densities.
 /// * `params`          — Parameter set (modified in place).
 /// * `config`          — Optimizer configuration.
 /// * `temp_ctx`        — Optional temperature-fitting context.  When `Some`,
@@ -463,7 +462,13 @@ pub fn poisson_fit_analytic(
                     let dsigma_sum: f64 = (0..density_indices.len())
                         .map(|k| {
                             let density = all_vals[density_indices[k]];
-                            density * dxs_dt[k][e]
+                            // Mirror the density > 0 guard from T(E) computation:
+                            // zero-density isotopes contribute nothing to ∂T/∂temp.
+                            if density > 0.0 {
+                                density * dxs_dt[k][e]
+                            } else {
+                                0.0
+                            }
                         })
                         .sum();
                     residual_factor * phi * t * (-dsigma_sum)
@@ -517,7 +522,14 @@ pub fn poisson_fit_analytic(
                         let dy = if is_temp {
                             // ∂Y/∂T = Φ · T · (−Σ_k n_k · ∂σ_k/∂T)
                             let dsigma_sum: f64 = (0..density_indices.len())
-                                .map(|k| all_vals[density_indices[k]] * dxs_dt[k][e])
+                                .map(|k| {
+                                    let density = all_vals[density_indices[k]];
+                                    if density > 0.0 {
+                                        density * dxs_dt[k][e]
+                                    } else {
+                                        0.0
+                                    }
+                                })
                                 .sum();
                             phi * t * (-dsigma_sum)
                         } else {
@@ -614,9 +626,6 @@ pub struct CountsModel<'a> {
     pub flux: &'a [f64],
     /// Background counts per bin.
     pub background: &'a [f64],
-    /// Indices into the full parameter vector for density parameters.
-    /// Other parameters in the full vector are nuisance params.
-    pub density_param_range: std::ops::Range<usize>,
 }
 
 impl<'a> FitModel for CountsModel<'a> {
@@ -777,7 +786,6 @@ mod tests {
             transmission_model: &t_model,
             flux: &flux,
             background: &background,
-            density_param_range: 0..1,
         };
 
         // T = 0.5 → counts = flux*0.5 + background
@@ -973,7 +981,6 @@ mod tests {
             transmission_model: &t_model,
             flux: &flux,
             background: &background,
-            density_param_range: 0..1,
         };
 
         // Generate observed counts Y = Φ·T + B at true density.

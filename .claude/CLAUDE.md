@@ -33,6 +33,9 @@ documented reason in a comment.
 - **Atomic commits**: commit early and often. Huge monolithic commits make it
   hard to catch off-rail behaviour.
 - **No temp file litter**: clean up all one-off scripts immediately.
+- **Do not touch `.claude/worktrees/`**: this directory is managed by
+  Claude Code for isolated worktree sessions. Never delete, modify, or
+  flag its contents during reviews.
 
 ## Project Layout
 

@@ -136,7 +136,7 @@ pub fn fitting_panel(ui: &mut egui::Ui, state: &mut AppState) {
         ui.label("Temperature (K):");
         ui.add(
             egui::DragValue::new(&mut state.temperature_k)
-                .range(0.0..=3000.0)
+                .range(1.0..=5000.0)
                 .speed(1.0),
         );
     });

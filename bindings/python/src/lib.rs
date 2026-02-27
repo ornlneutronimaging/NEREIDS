@@ -789,7 +789,6 @@ fn fit_spectrum(
                     transmission_model: t_model,
                     flux: &flux_owned,
                     background: &background,
-                    density_param_range: 0..n_isotopes,
                 };
 
                 let poisson_config = PoissonConfig {

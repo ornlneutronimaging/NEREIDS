@@ -154,7 +154,15 @@ impl FitModel for TransmissionFitModel {
             .collect();
 
         let temperature_k = match self.temperature_index {
-            Some(idx) => params[idx],
+            Some(idx) => {
+                assert!(
+                    idx < params.len(),
+                    "temperature_index ({}) out of bounds for params of length {}",
+                    idx,
+                    params.len(),
+                );
+                params[idx]
+            }
             None => self.temperature_k,
         };
 
