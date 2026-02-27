@@ -100,6 +100,7 @@ fn poisson_nll(y_obs: &[f64], y_model: &[f64]) -> f64 {
 #[inline]
 fn poisson_nll_term(obs: f64, mdl: f64) -> f64 {
     // #125.3: Negative observed counts would produce wrong-signed NLL terms.
+    // Release builds skip this check; callers must ensure non-negative counts. See #125 item 3.
     debug_assert!(obs >= 0.0, "poisson_nll_term: obs must be >= 0, got {obs}");
     if mdl > POISSON_EPSILON {
         mdl - obs * mdl.ln()
@@ -135,6 +136,7 @@ fn poisson_nll_term(obs: f64, mdl: f64) -> f64 {
 #[inline]
 fn poisson_nll_grad_term(obs: f64, mdl: f64) -> f64 {
     // #125.3: Negative observed counts would produce wrong-signed gradient terms.
+    // Release builds skip this check; callers must ensure non-negative counts. See #125 item 3.
     debug_assert!(
         obs >= 0.0,
         "poisson_nll_grad_term: obs must be >= 0, got {obs}"
@@ -679,7 +681,9 @@ pub fn poisson_fit_analytic(
                 if h > 1e-30 {
                     g / h
                 } else {
-                    g // fall back to unscaled gradient
+                    // Pre-existing floor; when dy is extremely small, h can underflow.
+                    // This falls back to unscaled gradient which is safe but slower to converge.
+                    g
                 }
             })
             .collect();
@@ -1385,6 +1389,44 @@ mod tests {
         assert!(
             !result.converged,
             "All-fixed NaN model should not converge in Poisson fit"
+        );
+        assert!(!result.nll.is_finite(), "NLL should be non-finite");
+        assert_eq!(result.iterations, 0);
+    }
+
+    #[test]
+    fn test_all_fixed_params_nan_model_poisson_analytic() {
+        // #FT-2: Exercise the NaN guard in poisson_fit_analytic (not just poisson_fit).
+        // When all parameters are fixed and the model produces NaN, the result
+        // must report converged=false.
+        struct NanModel;
+        impl FitModel for NanModel {
+            fn evaluate(&self, _params: &[f64]) -> Vec<f64> {
+                vec![f64::NAN; 5]
+            }
+        }
+
+        let y_obs = vec![10.0; 5];
+        let flux = vec![1000.0; 5];
+        // One isotope with trivial cross-sections.
+        let cross_sections = vec![vec![1.0; 5]];
+        let density_indices = vec![0];
+        let mut params = ParameterSet::new(vec![FitParameter::fixed("density", 0.5)]);
+
+        let result = poisson_fit_analytic(
+            &NanModel,
+            &y_obs,
+            &flux,
+            &cross_sections,
+            &density_indices,
+            &mut params,
+            &PoissonConfig::default(),
+            None,
+        );
+
+        assert!(
+            !result.converged,
+            "All-fixed NaN model should not converge in poisson_fit_analytic"
         );
         assert!(!result.nll.is_finite(), "NLL should be non-finite");
         assert_eq!(result.iterations, 0);

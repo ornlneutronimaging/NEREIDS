@@ -354,6 +354,8 @@ pub fn levenberg_marquardt(
         // When n_free == 0, dof == n_data, so this is equivalent to the old
         // `chi2 / n_data` but makes the formula visibly identical.
         let dof = n_data - n_free; // n_free == 0 here, so dof == n_data
+        // Note: dof > 0 is guaranteed here (n_free==0, n_data>0 from assert above),
+        // but we keep the guard for consistency with the main path.
         let reduced = if dof > 0 { chi2 / dof as f64 } else { f64::NAN };
         return LmResult {
             chi_squared: chi2,
@@ -795,7 +797,6 @@ mod tests {
         let y_obs = vec![1.0, 2.0]; // 2 data points
         let sigma = vec![1.0, 1.0];
 
-        let _model = LinearModel { x: vec![1.0, 2.0] };
         // 2 free params for 2 data points is exactly determined (ok),
         // but 3 free params for 2 data points is underdetermined.
         struct ThreeParamModel;
@@ -948,6 +949,20 @@ mod tests {
             result.chi_squared.is_finite(),
             "chi2 should be finite despite bad sigma, got {}",
             result.chi_squared
+        );
+        assert!(
+            result.converged,
+            "Fit should converge despite bad sigma values"
+        );
+        // The only valid data point with sigma=1.0 is (x=4, y=5).
+        // The fitted line y = a*x + b should pass near that point.
+        let y_at_4 = result.params[0] * 4.0 + result.params[1];
+        assert!(
+            (y_at_4 - 5.0).abs() < 1.0,
+            "Fitted line should pass near (4, 5): a={}, b={}, y(4)={}",
+            result.params[0],
+            result.params[1],
+            y_at_4,
         );
     }
 }
