@@ -110,6 +110,12 @@ pub fn fit_spectrum(
             measured_t.len(),
         )));
     }
+    if !config.temperature_k.is_finite() {
+        return Err(PipelineError::InvalidParameter(format!(
+            "temperature_k must be finite, got {}",
+            config.temperature_k,
+        )));
+    }
     if config.fit_temperature && config.temperature_k < 1.0 {
         return Err(PipelineError::InvalidParameter(format!(
             "temperature_k ({}) must be >= 1.0 K when fit_temperature is true",
