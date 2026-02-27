@@ -69,7 +69,7 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
     let head = parse_cont(&lines, &mut pos)?;
     let za = head.c1 as u32;
     let awr = head.c2;
-    let nis = head.n1 as usize; // number of isotopes (usually 1)
+    let nis = checked_count(head.n1, "NIS")?; // number of isotopes (usually 1)
 
     let isotope = isotope_from_za(za)?;
     let mut all_ranges = Vec::new();
@@ -80,7 +80,7 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
         let _zai = iso_cont.c1 as u32;
         let _abn = iso_cont.c2; // abundance
         let _lfw = iso_cont.l2; // fission width flag
-        let ner = iso_cont.n1 as usize; // number of energy ranges
+        let ner = checked_count(iso_cont.n1, "NER")?; // number of energy ranges
 
         for _ in 0..ner {
             // Range CONT: EL, EH, LRU, LRF, NRO, NAPS
@@ -103,6 +103,7 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
                 // the range CONT before the URR SPI/AP/NLS CONT.
                 // ENDF-6 §2.2.2; SAMMY unr/munr01.f90.
                 let nro_urr = range_cont.n1;
+                let naps_urr = range_cont.n2; // scattering radius calculation flag
                 let ap_table_urr = if nro_urr != 0 {
                     let mut tab = parse_tab1(&lines, &mut pos)?;
                     // AP(E) y-values are in 10⁻¹² cm; convert to fm.
@@ -122,21 +123,43 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
                     continue;
                 }
 
-                let urr_range =
-                    parse_urr_range(&lines, &mut pos, lrf, energy_low, energy_high, ap_table_urr)?;
+                let urr_range = parse_urr_range(
+                    &lines,
+                    &mut pos,
+                    lrf,
+                    energy_low,
+                    energy_high,
+                    naps_urr,
+                    ap_table_urr,
+                )?;
                 all_ranges.push(urr_range);
+                continue;
+            }
+
+            if lru == 0 {
+                // LRU=0: scattering-radius-only range (no resonance parameters).
+                // ENDF-6 §2.2: after the range CONT (and optional TAB1 if NRO!=0),
+                // a single CONT record follows: [SPI, AP, 0, 0, NLS=0, 0].
+                // We consume the NRO TAB1 if present, then the CONT, and skip.
+                let nro_lru0 = range_cont.n1;
+                if nro_lru0 != 0 {
+                    // TAB1 AP(E) already follows; consume it.
+                    let _tab = parse_tab1(&lines, &mut pos)?;
+                }
+                // CONT: SPI, AP, 0, 0, NLS=0, 0
+                let _spi_cont = parse_cont(&lines, &mut pos)?;
                 continue;
             }
 
             if lru != 1 {
                 return Err(EndfParseError::UnsupportedFormat(format!(
-                    "LRU={} not supported (expected 1=resolved)",
+                    "LRU={} not supported (expected 0=scattering-radius-only, 1=resolved, or 2=unresolved)",
                     lru
                 )));
             }
 
             let nro = range_cont.n1; // energy-dependent scattering radius flag
-            let _naps = range_cont.n2; // scattering radius calculation flag
+            let naps = range_cont.n2; // scattering radius calculation flag
 
             // If NRO != 0, a TAB1 record immediately follows giving AP(E).
             // Parse and store it; scattering_radius_at(E) will interpolate it
@@ -186,8 +209,37 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
                     unreachable!("Unresolved formalism should not appear in LRU=1 dispatch");
                 }
             };
+            range.naps = naps;
             range.ap_table = ap_table;
             all_ranges.push(range);
+        }
+    }
+
+    // Multi-MAT detection (#114): if there are unconsumed MF=2/MT=151 lines
+    // after the main parse loop, the file contains multiple materials.
+    // ENDF SEND/FEND/MEND/TEND records occupy lines but carry no resonance data;
+    // they have zeroed data fields. Skip any such trailing records and check for
+    // genuine leftover data lines.
+    if pos < lines.len() {
+        // Check if remaining lines are all section-end markers (all zero fields)
+        // or if there is genuine additional data.
+        let has_real_data = lines[pos..].iter().any(|line| {
+            // SEND/FEND/MEND/TEND records have zeroed C1-C2-L1-L2-N1-N2 fields.
+            // A genuine data line has at least one non-zero field in columns 1-66.
+            let data_part = if line.len() >= 66 { &line[..66] } else { line };
+            !data_part
+                .trim_matches(|c: char| {
+                    matches!(c, '0' | '.' | '+' | ' ' | '-' | 'E' | 'e' | 'D' | 'd')
+                })
+                .is_empty()
+        });
+        if has_real_data {
+            return Err(EndfParseError::UnsupportedFormat(
+                "Multiple materials detected in MF=2/MT=151: unconsumed data lines \
+                 remain after parsing the first material. Multi-MAT files are not \
+                 supported; split the file into single-material ENDF files."
+                    .to_string(),
+            ));
         }
     }
 
@@ -220,16 +272,18 @@ fn parse_bw_range(
     let cont = parse_cont(lines, pos)?;
     let target_spin = cont.c1;
     let scattering_radius = cont.c2 * ENDF_RADIUS_TO_FM;
-    let nls = cont.n1 as usize; // number of L-values
+    let nls = checked_count(cont.n1, "NLS")?; // number of L-values
 
     let mut l_groups = Vec::with_capacity(nls);
 
     for _ in 0..nls {
-        // CONT: AWRI, 0.0, L, 0, 6*NRS, NRS
+        // CONT: AWRI, QX, L, LRX, 6*NRS, NRS
         let l_cont = parse_cont(lines, pos)?;
         let awr_l = l_cont.c1;
+        let qx = l_cont.c2; // Q-value for competitive width (eV)
         let l_val = l_cont.l1 as u32;
-        let nrs = l_cont.n2 as usize; // number of resonances
+        let lrx = l_cont.l2; // competitive width flag
+        let nrs = checked_count(l_cont.n2, "NRS")?; // number of resonances
 
         let mut resonances = Vec::with_capacity(nrs);
 
@@ -255,6 +309,8 @@ fn parse_bw_range(
             l: l_val,
             awr: awr_l,
             apl: 0.0, // Not in BW format
+            qx,
+            lrx,
             resonances,
         });
     }
@@ -266,6 +322,7 @@ fn parse_bw_range(
         formalism,
         target_spin,
         scattering_radius,
+        naps: 0,        // set by caller
         ap_table: None, // set by caller from NRO TAB1 if present
         l_groups,
         rml: None,
@@ -294,7 +351,7 @@ fn parse_reich_moore_range(
     let cont = parse_cont(lines, pos)?;
     let target_spin = cont.c1;
     let scattering_radius = cont.c2 * ENDF_RADIUS_TO_FM;
-    let nls = cont.n1 as usize; // number of L-values
+    let nls = checked_count(cont.n1, "NLS")?; // number of L-values
 
     let mut l_groups = Vec::with_capacity(nls);
 
@@ -304,7 +361,7 @@ fn parse_reich_moore_range(
         let awr_l = l_cont.c1;
         let apl = l_cont.c2 * ENDF_RADIUS_TO_FM; // L-dependent scattering radius
         let l_val = l_cont.l1 as u32;
-        let nrs = l_cont.n2 as usize; // number of resonances
+        let nrs = checked_count(l_cont.n2, "NRS")?; // number of resonances
 
         let mut resonances = Vec::with_capacity(nrs);
 
@@ -328,6 +385,8 @@ fn parse_reich_moore_range(
             l: l_val,
             awr: awr_l,
             apl,
+            qx: 0.0, // Not used in Reich-Moore
+            lrx: 0,  // Not used in Reich-Moore
             resonances,
         });
     }
@@ -339,6 +398,7 @@ fn parse_reich_moore_range(
         formalism: ResonanceFormalism::ReichMoore,
         target_spin,
         scattering_radius,
+        naps: 0,        // set by caller
         ap_table: None, // set by caller from NRO TAB1 if present
         l_groups,
         rml: None,
@@ -402,7 +462,7 @@ fn parse_rmatrix_limited_range(
             "LRF=7 KRM={krm} is not supported (only KRM=2 and KRM=3)"
         )));
     }
-    let njs = cont.n1 as usize; // number of spin groups
+    let njs = checked_count(cont.n1, "NJS")?; // number of spin groups
     // KRL (N2): kinematics flag.
     //   KRL=0: non-relativistic kinematics — universal in ENDF/B-VIII.0.
     //   KRL=1: relativistic kinematics — not supported here.
@@ -420,7 +480,7 @@ fn parse_rmatrix_limited_range(
     // different count in some files (e.g. N2 = 2*NPP).  Always derive from L1.
     // Reference: ENDF-6 Formats Manual §2.2.1.6 Table 2.1.
     let pp_cont = parse_cont(lines, pos)?;
-    let npp = pp_cont.l1 as usize;
+    let npp = checked_count(pp_cont.l1, "NPP")?;
     let pp_values = parse_list_values(lines, pos, npp * 12)?;
 
     let mut particle_pairs = Vec::with_capacity(npp);
@@ -488,8 +548,8 @@ fn parse_rmatrix_limited_range(
         } else {
             1.0
         };
-        let npl = sg_cont.n1 as usize; // 6*(NCH+1)
-        let nch_plus_one = sg_cont.n2 as usize; // NCH+1
+        let npl = checked_count(sg_cont.n1, "NPL")?; // 6*(NCH+1)
+        let nch_plus_one = checked_count(sg_cont.n2, "NCH+1")?; // NCH+1
         let nch = nch_plus_one.saturating_sub(1);
 
         let sg_values = parse_list_values(lines, pos, npl)?;
@@ -555,8 +615,8 @@ fn parse_rmatrix_limited_range(
         // Fix: derive stride directly from NPL/NRS; read only NCH widths per row.
         // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f (Scan_File_2 resonance loop).
         let res_cont = parse_cont(lines, pos)?;
-        let nrs = res_cont.n2 as usize;
-        let res_npl = res_cont.n1 as usize;
+        let nrs = checked_count(res_cont.n2, "NRS")?;
+        let res_npl = checked_count(res_cont.n1, "NPL")?;
         let res_values = parse_list_values(lines, pos, res_npl)?;
 
         // C4: Validate stride before use — NPL must divide evenly by NRS, and each row
@@ -693,6 +753,7 @@ fn parse_rmatrix_limited_range(
         formalism: ResonanceFormalism::RMatrixLimited,
         target_spin,
         scattering_radius,
+        naps: 0,        // set by caller
         ap_table: None, // set by caller from NRO TAB1 if present
         l_groups: Vec::new(),
         rml: Some(Box::new(rml)),
@@ -1027,6 +1088,7 @@ fn parse_urr_range(
     lrf: i32,
     energy_low: f64,
     energy_high: f64,
+    naps: i32,
     ap_table: Option<Tab1>,
 ) -> Result<ResonanceRange, EndfParseError> {
     use crate::resonance::{UrrData, UrrJGroup, UrrLGroup};
@@ -1148,6 +1210,7 @@ fn parse_urr_range(
                         formalism: ResonanceFormalism::Unresolved,
                         target_spin: spi,
                         scattering_radius: ap,
+                        naps,
                         ap_table,
                         l_groups: Vec::new(),
                         rml: None,
@@ -1226,6 +1289,7 @@ fn parse_urr_range(
         formalism: ResonanceFormalism::Unresolved,
         target_spin: spi,
         scattering_radius: ap,
+        naps,
         ap_table,
         l_groups: Vec::new(),
         rml: None,

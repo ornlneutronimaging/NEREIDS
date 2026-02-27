@@ -450,10 +450,13 @@ mod tests {
                 formalism: ResonanceFormalism::SLBW,
                 target_spin: 0.0,
                 scattering_radius: 2.908,
+                naps: 0,
                 l_groups: vec![LGroup {
                     l: 0,
                     awr: 10.0,
                     apl: 2.908,
+                    qx: 0.0,
+                    lrx: 0,
                     resonances: vec![Resonance {
                         energy: 10.0,
                         j: 0.5,

@@ -418,10 +418,13 @@ mod tests {
                 formalism: ResonanceFormalism::ReichMoore,
                 target_spin: 0.0,
                 scattering_radius: 6.0,
+                naps: 0,
                 l_groups: vec![LGroup {
                     l: 0,
                     awr: a as f64 - 0.009,
                     apl: 0.0,
+                    qx: 0.0,
+                    lrx: 0,
                     resonances: vec![Resonance {
                         energy: res_energy,
                         j: 0.5,

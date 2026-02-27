@@ -234,10 +234,13 @@ mod tests {
                 formalism: ResonanceFormalism::SLBW,
                 target_spin: 0.0,
                 scattering_radius: 9.4285,
+                naps: 0,
                 l_groups: vec![LGroup {
                     l: 0,
                     awr: 236.006,
                     apl: 0.0,
+                    qx: 0.0,
+                    lrx: 0,
                     resonances: vec![Resonance {
                         energy: 6.674,
                         j: 0.5,
@@ -273,6 +276,8 @@ mod tests {
             l: 0,
             awr: 236.006,
             apl: 0.0,
+            qx: 0.0,
+            lrx: 0,
             resonances: vec![Resonance {
                 energy: 6.674,
                 j: 0.5,
@@ -294,6 +299,7 @@ mod tests {
                 formalism: ResonanceFormalism::ReichMoore,
                 target_spin: 0.0,
                 scattering_radius: 9.4285,
+                naps: 0,
                 l_groups: resonances.clone(),
                 rml: None,
                 urr: None,
@@ -312,6 +318,7 @@ mod tests {
                 formalism: ResonanceFormalism::SLBW,
                 target_spin: 0.0,
                 scattering_radius: 9.4285,
+                naps: 0,
                 l_groups: resonances,
                 rml: None,
                 urr: None,

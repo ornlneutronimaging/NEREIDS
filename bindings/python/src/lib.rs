@@ -1001,6 +1001,8 @@ fn create_resonance_data(
                 l: l_val,
                 awr,
                 apl: 0.0,
+                qx: 0.0,
+                lrx: 0,
                 resonances: res_list
                     .into_iter()
                     .map(|(energy, j, gn, gg)| Resonance {
@@ -1030,6 +1032,8 @@ fn create_resonance_data(
                 l: 0,
                 awr,
                 apl: 0.0,
+                qx: 0.0,
+                lrx: 0,
                 resonances: res,
             }]
         }
@@ -1049,6 +1053,7 @@ fn create_resonance_data(
                 formalism: res_formalism,
                 target_spin,
                 scattering_radius,
+                naps: 0,
                 l_groups: groups,
                 rml: None,
                 urr: None,
