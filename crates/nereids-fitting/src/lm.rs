@@ -12,6 +12,12 @@
 
 use crate::parameters::ParameterSet;
 
+/// #125.4: Maximum damping parameter before the optimizer gives up.
+///
+/// When λ exceeds this threshold, the optimizer is stuck in a region where no
+/// step improves chi-squared.  Breaking out avoids wasting iterations.
+const LAMBDA_BREAKOUT: f64 = 1e16;
+
 /// Configuration for the LM optimizer.
 #[derive(Debug, Clone)]
 pub struct LmConfig {
@@ -344,9 +350,14 @@ pub fn levenberg_marquardt(
             .map(|(&obs, &mdl)| obs - mdl)
             .collect();
         let chi2 = chi_squared(&residuals, &weights);
+        // #125.5: Compute dof explicitly for consistency with the main path.
+        // When n_free == 0, dof == n_data, so this is equivalent to the old
+        // `chi2 / n_data` but makes the formula visibly identical.
+        let dof = n_data - n_free; // n_free == 0 here, so dof == n_data
+        let reduced = if dof > 0 { chi2 / dof as f64 } else { f64::NAN };
         return LmResult {
             chi_squared: chi2,
-            reduced_chi_squared: chi2 / n_data as f64,
+            reduced_chi_squared: reduced,
             iterations: 0,
             converged: true,
             params: params.all_values(),
@@ -447,7 +458,7 @@ pub fn levenberg_marquardt(
         if y_trial.iter().any(|v| !v.is_finite()) {
             params.set_free_values(&old_free);
             lambda *= config.lambda_up;
-            if lambda > 1e16 {
+            if lambda > LAMBDA_BREAKOUT {
                 converged = false;
                 break;
             }
@@ -494,7 +505,7 @@ pub fn levenberg_marquardt(
             // #108.4: If lambda is astronomically large, the optimizer is stuck
             // in a region where no step improves chi2.  Break out rather than
             // wasting iterations.
-            if lambda > 1e16 {
+            if lambda > LAMBDA_BREAKOUT {
                 converged = false;
                 break;
             }
@@ -750,5 +761,193 @@ mod tests {
         assert!((inv[0][1] - (-0.7)).abs() < 1e-10);
         assert!((inv[1][0] - (-0.2)).abs() < 1e-10);
         assert!((inv[1][1] - 0.4).abs() < 1e-10);
+    }
+
+    // ---- Edge-case tests for issue #125 ----
+
+    #[test]
+    fn test_all_fixed_params_nan_model() {
+        // #125.1: When all parameters are fixed and the model produces NaN,
+        // the result must report converged=false (not converged=true with NaN chi2).
+        struct NanModel;
+        impl FitModel for NanModel {
+            fn evaluate(&self, _params: &[f64]) -> Vec<f64> {
+                vec![f64::NAN; 5]
+            }
+        }
+
+        let y_obs = vec![1.0; 5];
+        let sigma = vec![1.0; 5];
+        let mut params = ParameterSet::new(vec![FitParameter::fixed("a", 1.0)]);
+
+        let result =
+            levenberg_marquardt(&NanModel, &y_obs, &sigma, &mut params, &LmConfig::default());
+
+        assert!(!result.converged, "All-fixed NaN model should not converge");
+        assert!(result.chi_squared.is_nan(), "chi2 should be NaN");
+        assert_eq!(result.iterations, 0);
+    }
+
+    #[test]
+    fn test_underdetermined_system() {
+        // #125.6: More free parameters than data points → underdetermined.
+        // Should return converged=false immediately.
+        let y_obs = vec![1.0, 2.0]; // 2 data points
+        let sigma = vec![1.0, 1.0];
+
+        let _model = LinearModel { x: vec![1.0, 2.0] };
+        // 2 free params for 2 data points is exactly determined (ok),
+        // but 3 free params for 2 data points is underdetermined.
+        struct ThreeParamModel;
+        impl FitModel for ThreeParamModel {
+            fn evaluate(&self, params: &[f64]) -> Vec<f64> {
+                vec![params[0] + params[1] + params[2]; 2]
+            }
+        }
+
+        let mut params = ParameterSet::new(vec![
+            FitParameter::unbounded("a", 1.0),
+            FitParameter::unbounded("b", 1.0),
+            FitParameter::unbounded("c", 1.0),
+        ]);
+
+        let result = levenberg_marquardt(
+            &ThreeParamModel,
+            &y_obs,
+            &sigma,
+            &mut params,
+            &LmConfig::default(),
+        );
+
+        assert!(
+            !result.converged,
+            "Underdetermined system should not converge"
+        );
+        assert!(result.chi_squared.is_nan());
+        assert_eq!(result.iterations, 0);
+    }
+
+    #[test]
+    fn test_exactly_determined_dof_zero() {
+        // #125.6: n_data == n_free → dof=0, exactly determined.
+        // Should still converge but reduced_chi_squared is NaN (0/0).
+        let y_obs = vec![5.0, 11.0]; // y = 2x + 3 at x=1,4
+        let sigma = vec![1.0, 1.0];
+
+        let model = LinearModel { x: vec![1.0, 4.0] };
+        let mut params = ParameterSet::new(vec![
+            FitParameter::unbounded("a", 1.0),
+            FitParameter::unbounded("b", 1.0),
+        ]);
+
+        let result = levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &LmConfig::default());
+
+        assert!(
+            result.converged,
+            "Exactly-determined system should converge"
+        );
+        assert!(
+            result.chi_squared < 1e-6,
+            "chi2 should be ~0, got {}",
+            result.chi_squared
+        );
+        // dof=0 → reduced chi2 is NaN
+        assert!(
+            result.reduced_chi_squared.is_nan(),
+            "reduced_chi2 should be NaN for dof=0, got {}",
+            result.reduced_chi_squared
+        );
+        // No covariance when dof=0
+        assert!(result.covariance.is_none());
+        assert!(result.uncertainties.is_none());
+    }
+
+    #[test]
+    fn test_lambda_breakout() {
+        // #125.6: A model that never improves should trigger lambda breakout.
+        struct ConstantModel;
+        impl FitModel for ConstantModel {
+            fn evaluate(&self, _params: &[f64]) -> Vec<f64> {
+                // Returns constant output regardless of parameters,
+                // so the Jacobian is zero and no step can improve chi2.
+                vec![42.0; 5]
+            }
+        }
+
+        let y_obs = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let sigma = vec![1.0; 5];
+        let mut params = ParameterSet::new(vec![FitParameter::unbounded("a", 1.0)]);
+
+        let config = LmConfig {
+            max_iter: 1000,
+            ..LmConfig::default()
+        };
+
+        let result = levenberg_marquardt(&ConstantModel, &y_obs, &sigma, &mut params, &config);
+
+        assert!(
+            !result.converged,
+            "Flat model should not converge (lambda breakout)"
+        );
+    }
+
+    #[test]
+    fn test_nan_model_during_iteration() {
+        // #125.6: Model that produces NaN for certain parameter values.
+        // The optimizer should treat NaN steps as bad and try smaller steps.
+        struct NanAtLargeModel {
+            x: Vec<f64>,
+        }
+        impl FitModel for NanAtLargeModel {
+            fn evaluate(&self, params: &[f64]) -> Vec<f64> {
+                let a = params[0];
+                self.x
+                    .iter()
+                    .map(|&x| if a > 5.0 { f64::NAN } else { a * x + 1.0 })
+                    .collect()
+            }
+        }
+
+        let x: Vec<f64> = (0..10).map(|i| i as f64).collect();
+        let y_obs: Vec<f64> = x.iter().map(|&xi| 2.0 * xi + 1.0).collect();
+        let sigma = vec![1.0; 10];
+
+        let model = NanAtLargeModel { x };
+        let mut params = ParameterSet::new(vec![FitParameter::unbounded("a", 3.0)]);
+
+        let result = levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &LmConfig::default());
+
+        // Should converge to a≈2 while avoiding the NaN region a>5.
+        assert!(result.converged, "Should converge avoiding NaN region");
+        assert!(
+            (result.params[0] - 2.0).abs() < 0.1,
+            "a = {}, expected ~2.0",
+            result.params[0]
+        );
+    }
+
+    #[test]
+    fn test_zero_negative_sigma_clamping() {
+        // #125.6: Zero and negative sigma should be clamped to huge sigma (tiny weight),
+        // not cause NaN/panic.
+        let y_obs = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let sigma = vec![0.0, -1.0, f64::NAN, f64::INFINITY, 1.0];
+
+        let model = LinearModel {
+            x: vec![0.0, 1.0, 2.0, 3.0, 4.0],
+        };
+        let mut params = ParameterSet::new(vec![
+            FitParameter::unbounded("a", 1.0),
+            FitParameter::unbounded("b", 0.0),
+        ]);
+
+        // Should not panic and should produce a finite result.
+        let result = levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &LmConfig::default());
+
+        assert!(
+            result.chi_squared.is_finite(),
+            "chi2 should be finite despite bad sigma, got {}",
+            result.chi_squared
+        );
     }
 }
