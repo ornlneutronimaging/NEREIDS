@@ -590,7 +590,13 @@ fn reich_moore_with_fission(
         }
 
         // Invert 2×2 Y-matrix.
+        // Guard against singular matrix: if |det| ≈ 0, the channel makes no
+        // contribution at this energy (physically: perfect destructive interference
+        // or degenerate channel configuration). Return zero cross-sections.
         let det = y_mat[0][0] * y_mat[1][1] - y_mat[0][1] * y_mat[1][0];
+        if det.norm() < 1e-300 {
+            return (0.0, 0.0, 0.0, 0.0);
+        }
         let inv_det = 1.0 / det;
         let y_inv = [
             [y_mat[1][1] * inv_det, -y_mat[0][1] * inv_det],

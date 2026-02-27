@@ -81,6 +81,11 @@ pub fn wave_number(energy_ev: f64, awr: f64) -> f64 {
 /// * `e_cm` — Center-of-mass kinetic energy in this channel (eV). Must be ≥ 0.
 /// * `reduced_mass_ratio` — μ = MA·MB/(MA+MB) in neutron mass units.
 pub fn wave_number_from_cm(e_cm: f64, reduced_mass_ratio: f64) -> f64 {
+    // Guard against negative CM energies, which can arise from numerical noise
+    // near threshold energies. Zero wave number means no contribution from this channel.
+    if e_cm < 0.0 {
+        return 0.0;
+    }
     let mn_ev = constants::NEUTRON_MASS_MEV * 1e6; // MeV → eV
     let hbar_c = constants::HBAR_EV_S * constants::SPEED_OF_LIGHT * 1e15; // eV·fm
     (2.0 * mn_ev * reduced_mass_ratio * e_cm / (hbar_c * hbar_c)).sqrt()

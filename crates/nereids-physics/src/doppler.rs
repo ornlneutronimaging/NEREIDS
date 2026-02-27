@@ -314,12 +314,18 @@ fn interpolate_cross_section(energies: &[f64], cross_sections: &[f64], energy: f
         Err(i) => i - 1,
     };
 
-    // Linear interpolation
+    // Linear interpolation.
+    // Guard against duplicate energy grid points: if e0 == e1 (or nearly so),
+    // no interpolation is needed — use the value at that point directly.
     let e0 = energies[idx];
     let e1 = energies[idx + 1];
     let s0 = cross_sections[idx];
     let s1 = cross_sections[idx + 1];
-    let t = (energy - e0) / (e1 - e0);
+    let de = e1 - e0;
+    if de.abs() < f64::EPSILON {
+        return s0;
+    }
+    let t = (energy - e0) / de;
     s0 + t * (s1 - s0)
 }
 
