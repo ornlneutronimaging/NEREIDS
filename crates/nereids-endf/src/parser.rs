@@ -151,7 +151,12 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
             }
 
             // Validate LFW+LRF: LFW=1 (energy-dependent fission widths) combined
-            // with LRF=1 (SLBW) is not yet implemented. ENDF-6 §2.2.1.
+            // with LRF=1 (SLBW) requires a different record layout (fission width
+            // TAB1 per L-value) that is not yet implemented.  ENDF-6 §2.2.1.
+            //
+            // NOTE: LFW is per-isotope, not per-range — an isotope with LFW=1 may
+            // have other resolved ranges with LRF≠1 (e.g. LRF=3 Reich-Moore) that
+            // are perfectly valid.  Only reject the specific LRF=1 combination.
             if lfw == 1 && lrf == 1 {
                 return Err(EndfParseError::UnsupportedFormat(
                     "LFW=1 with LRF=1 (energy-dependent fission widths in SLBW) \
