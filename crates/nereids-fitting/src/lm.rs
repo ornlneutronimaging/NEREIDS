@@ -350,12 +350,12 @@ pub fn levenberg_marquardt(
             .map(|(&obs, &mdl)| obs - mdl)
             .collect();
         let chi2 = chi_squared(&residuals, &weights);
-        // #125.5: Compute dof explicitly for consistency with the main path.
-        // When n_free == 0, dof == n_data, so this is equivalent to the old
-        // `chi2 / n_data` but makes the formula visibly identical.
-        let dof = n_data - n_free; // n_free == 0 here, so dof == n_data
-        // Note: dof > 0 is guaranteed here (n_free==0, n_data>0 from assert above),
-        // but we keep the guard for consistency with the main path.
+        // #125.5: Compute dof via `n_data - n_free` (even though n_free == 0 here)
+        // to mirror the main path and keep a single visible formula.
+        let dof = n_data - n_free;
+        // Note: Given n_free == 0 and the earlier assert that n_data > 0,
+        // dof is always > 0 here; the guard below is a defensive check
+        // kept for consistency with the main path.
         let reduced = if dof > 0 { chi2 / dof as f64 } else { f64::NAN };
         return LmResult {
             chi_squared: chi2,

@@ -1396,7 +1396,7 @@ mod tests {
 
     #[test]
     fn test_all_fixed_params_nan_model_poisson_analytic() {
-        // #FT-2: Exercise the NaN guard in poisson_fit_analytic (not just poisson_fit).
+        // #125.1: Exercise the NaN guard in poisson_fit_analytic (not just poisson_fit).
         // When all parameters are fixed and the model produces NaN, the result
         // must report converged=false.
         struct NanModel;
