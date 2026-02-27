@@ -79,7 +79,7 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
         let iso_cont = parse_cont(&lines, &mut pos)?;
         let _zai = iso_cont.c1 as u32;
         let _abn = iso_cont.c2; // abundance
-        let lfw = iso_cont.l2; // fission width flag
+        let _lfw = iso_cont.l2; // fission width flag
         let ner = checked_count(iso_cont.n1, "NER")?; // number of energy ranges
 
         for _ in 0..ner {
@@ -174,34 +174,6 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
             } else {
                 None
             };
-
-            // Gracefully skip LFW=1+LRF=1: LFW is isotope-level metadata for
-            // unresolved-range fission handling.  When combined with LRF=1 (SLBW)
-            // in a resolved range, ENDF-6 §2.2.1 specifies a different record
-            // layout (energy-dependent fission width TAB1 per L-value) that is
-            // not yet implemented.  Rather than aborting the entire parse, we
-            // consume the standard BW records to advance `pos` and skip the
-            // range — consistent with how unsupported URR sub-formats are
-            // handled.  This lets other valid ranges in the same file parse
-            // successfully.
-            //
-            // NOTE: LFW is per-isotope, not per-range — an isotope with LFW=1
-            // may have other resolved ranges with LRF≠1 (e.g. LRF=3 Reich-Moore)
-            // that are perfectly valid.
-            if lfw == 1 && lrf == 1 {
-                // Consume the BW body records (CONT + LIST per L-value) so that
-                // `pos` advances past this range.  The standard SLBW layout is
-                // CONT: SPI, AP, 0, 0, NLS, 0 followed by NLS × (CONT + LIST),
-                // which is what parse_bw_range reads.  Discard the result.
-                let _skipped = parse_bw_range(
-                    &lines,
-                    &mut pos,
-                    energy_low,
-                    energy_high,
-                    ResonanceFormalism::SLBW,
-                )?;
-                continue;
-            }
 
             // ENDF-6 Formats Manual: LRF values for resolved resonance region
             // LRF=1: Single-Level Breit-Wigner (SLBW)
