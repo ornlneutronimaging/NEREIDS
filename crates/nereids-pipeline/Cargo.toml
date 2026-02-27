@@ -13,3 +13,4 @@ nereids-io = { workspace = true }
 nereids-fitting = { workspace = true }
 ndarray = { workspace = true }
 rayon = { workspace = true }
+thiserror = { workspace = true }

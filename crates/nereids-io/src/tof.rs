@@ -118,7 +118,11 @@ pub fn tof_edges_to_energy_centers(
 /// * `n_bins` — Number of bins (returns n_bins + 1 edges).
 ///
 /// # Errors
-/// Returns `IoError::InvalidParameter` if `n_bins` is zero or `tof_max <= tof_min`.
+/// Returns `IoError::InvalidParameter` if:
+/// - `n_bins` is zero
+/// - `tof_min` or `tof_max` is non-finite (NaN or Inf)
+/// - `tof_min` is negative
+/// - `tof_max <= tof_min`
 pub fn linspace_tof_edges(tof_min: f64, tof_max: f64, n_bins: usize) -> Result<Vec<f64>, IoError> {
     if n_bins == 0 {
         return Err(IoError::InvalidParameter("n_bins must be positive".into()));
@@ -127,6 +131,12 @@ pub fn linspace_tof_edges(tof_min: f64, tof_max: f64, n_bins: usize) -> Result<V
         return Err(IoError::InvalidParameter(
             "TOF bounds must be finite".into(),
         ));
+    }
+    if tof_min < 0.0 {
+        return Err(IoError::InvalidParameter(format!(
+            "tof_min ({}) must be non-negative",
+            tof_min
+        )));
     }
     if tof_max <= tof_min {
         return Err(IoError::InvalidParameter(format!(
@@ -334,5 +344,26 @@ mod tests {
             tof_edges_to_energy(&neg_inf_edges, &params).is_err(),
             "should reject -Inf in TOF edges"
         );
+    }
+
+    #[test]
+    fn test_linspace_tof_edges_rejects_zero_bins() {
+        let result = linspace_tof_edges(100.0, 200.0, 0);
+        assert!(result.is_err(), "should reject n_bins == 0");
+    }
+
+    #[test]
+    fn test_linspace_tof_edges_rejects_reversed_range() {
+        let result = linspace_tof_edges(200.0, 100.0, 10);
+        assert!(result.is_err(), "should reject tof_max <= tof_min");
+
+        let result = linspace_tof_edges(100.0, 100.0, 10);
+        assert!(result.is_err(), "should reject tof_max == tof_min");
+    }
+
+    #[test]
+    fn test_linspace_tof_edges_rejects_negative() {
+        let result = linspace_tof_edges(-10.0, 200.0, 10);
+        assert!(result.is_err(), "should reject negative tof_min");
     }
 }

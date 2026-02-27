@@ -12,6 +12,7 @@
 //! - [`detectability`] — Trace-detectability analysis (pre-experiment SNR check)
 
 pub mod detectability;
+pub mod error;
 pub mod pipeline;
 pub mod sparse;
 pub mod spatial;

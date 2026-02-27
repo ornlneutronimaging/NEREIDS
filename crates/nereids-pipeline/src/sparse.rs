@@ -11,14 +11,14 @@
 //! With nuisance parameters fixed, reconstruct per-pixel areal densities
 //! using Poisson-likelihood fitting. The forward model is:
 //!
-//!   Y_s(E) = α₁ · [Φ(E) · exp(-Σᵢ ρᵢ · σᵢ(E)) + α₂ · B(E)]
+//!   Y_s(E) = alpha_1 * [Phi(E) * exp(-sum_i rho_i * sigma_i(E)) + alpha_2 * B(E)]
 //!
 //! where:
-//! - Φ(E) = incident flux spectrum (estimated in Stage 1)
-//! - ρᵢ = areal density of isotope i (fit parameter)
-//! - σᵢ(E) = total cross-section of isotope i
+//! - Phi(E) = incident flux spectrum (estimated in Stage 1)
+//! - rho_i = areal density of isotope i (fit parameter)
+//! - sigma_i(E) = total cross-section of isotope i
 //! - B(E) = background spectrum (estimated in Stage 1)
-//! - α₁, α₂ = normalization scalers (estimated in Stage 1)
+//! - alpha_1, alpha_2 = normalization scalers (estimated in Stage 1)
 //!
 //! ## TRINIDI Reference
 //! - `trinidi/reconstruct.py` — Two-stage reconstruction with APGM
@@ -35,6 +35,8 @@ use nereids_fitting::poisson::{self, CountsModel, PoissonConfig};
 use nereids_fitting::transmission_model::PrecomputedTransmissionModel;
 use nereids_physics::resolution::ResolutionFunction;
 use nereids_physics::transmission::{InstrumentParams, broadened_cross_sections};
+
+use crate::error::PipelineError;
 
 /// Configuration for two-stage sparse reconstruction.
 #[derive(Debug, Clone)]
@@ -99,7 +101,6 @@ pub struct SparseResult {
 /// to zero; a future version may fit it from a sample-free region.
 ///
 /// # Arguments
-/// * `sample_counts` — Raw sample counts (n_energies, height, width).
 /// * `open_beam_counts` — Raw open-beam counts (n_energies, height, width).
 /// * `roi` — Optional (y_range, x_range) for high-statistics region.
 ///   If None, uses the entire image.
@@ -108,26 +109,45 @@ pub struct SparseResult {
 ///   the flux estimate.
 ///
 /// # Errors
-/// Returns `Err` if every pixel in the ROI is dead, leaving zero live
-/// pixels to average over.
+/// Returns `PipelineError::InvalidParameter` if:
+/// - The ROI y-range or x-range is empty.
+/// - The ROI exceeds the spatial bounds of `open_beam_counts`.
+/// - Every pixel in the ROI is dead, leaving zero live pixels to average over.
+///
+/// Returns `PipelineError::ShapeMismatch` if the `dead_pixels` mask shape
+/// does not match the spatial dimensions of `open_beam_counts`.
 pub fn estimate_nuisance(
-    _sample_counts: &Array3<f64>,
     open_beam_counts: &Array3<f64>,
     roi: Option<(std::ops::Range<usize>, std::ops::Range<usize>)>,
     dead_pixels: Option<&Array2<bool>>,
-) -> Result<NuisanceParams, String> {
+) -> Result<NuisanceParams, PipelineError> {
     let n_energies = open_beam_counts.shape()[0];
     let height = open_beam_counts.shape()[1];
     let width = open_beam_counts.shape()[2];
+
+    if let Some(dp) = dead_pixels
+        && dp.shape() != [height, width]
+    {
+        return Err(PipelineError::ShapeMismatch(format!(
+            "dead_pixels shape {:?} != spatial dimensions ({}, {})",
+            dp.shape(),
+            height,
+            width,
+        )));
+    }
 
     // Average open-beam over ROI to get flux estimate
     let (y_range, x_range) = match roi {
         Some((y_r, x_r)) => {
             if y_r.start >= y_r.end || x_r.start >= x_r.end {
-                return Err("ROI y-range or x-range is empty".into());
+                return Err(PipelineError::InvalidParameter(
+                    "ROI y-range or x-range is empty".into(),
+                ));
             }
             if y_r.start >= height || y_r.end > height || x_r.start >= width || x_r.end > width {
-                return Err("ROI is out of bounds of the open-beam data".into());
+                return Err(PipelineError::InvalidParameter(
+                    "ROI is out of bounds of the open-beam data".into(),
+                ));
             }
             (y_r, x_r)
         }
@@ -135,7 +155,6 @@ pub fn estimate_nuisance(
     };
 
     let mut flux = vec![0.0f64; n_energies];
-    let mut background = vec![0.0f64; n_energies];
     let mut n_pixels: usize = 0;
 
     for y in y_range {
@@ -151,10 +170,10 @@ pub fn estimate_nuisance(
     }
 
     if n_pixels == 0 {
-        return Err(
+        return Err(PipelineError::InvalidParameter(
             "no live pixels in ROI after dead-pixel filtering; cannot estimate nuisance flux"
                 .into(),
-        );
+        ));
     }
 
     let n_pix_f = n_pixels as f64;
@@ -167,7 +186,7 @@ pub fn estimate_nuisance(
     // which pixels are sample-free.  Dead-pixel filtering above is still
     // applied to both flux and background accumulators so that when real
     // background estimation is added, the infrastructure is already in place.
-    background.fill(0.0);
+    let background = vec![0.0f64; n_energies];
 
     Ok(NuisanceParams { flux, background })
 }
@@ -180,46 +199,89 @@ pub fn estimate_nuisance(
 /// * `config` — Sparse reconstruction configuration.
 /// * `dead_pixels` — Optional dead pixel mask.
 /// * `cancel` — Optional cancellation token. Checked per-pixel to stop early.
+///
+/// # Cancellation semantics
+/// If cancellation occurs mid-flight, pixels that already completed are
+/// included in the result.  The function returns `Err(Cancelled)` only if
+/// **no** pixels completed before cancellation was detected.  When at least
+/// one pixel finished, the partial result is returned as `Ok(SparseResult)`
+/// with `n_total` reflecting only the completed pixels.
+///
+/// # Errors
+/// Returns `PipelineError::ShapeMismatch` if array dimensions are inconsistent,
+/// or `PipelineError::Cancelled` if the cancellation token is set before any
+/// pixel completes.
 pub fn sparse_reconstruct(
     sample_counts: &Array3<f64>,
     nuisance: &NuisanceParams,
     config: &SparseConfig,
     dead_pixels: Option<&Array2<bool>>,
     cancel: Option<&AtomicBool>,
-) -> SparseResult {
+) -> Result<SparseResult, PipelineError> {
     let shape = sample_counts.shape();
     let (n_energies, height, width) = (shape[0], shape[1], shape[2]);
     let n_isotopes = config.resonance_data.len();
 
     // Guard against zero-isotope calls: with no isotopes, PrecomputedTransmissionModel
     // would receive an empty cross_sections Vec and the first evaluate() would panic.
-    // Return a neutral result (T=1 everywhere) rather than crashing.
+    // Return an empty result with no density maps, NaN-filled NLL, and zero
+    // converged/total counts rather than crashing.
     if n_isotopes == 0 {
-        return SparseResult {
+        return Ok(SparseResult {
             density_maps: vec![],
             nll_map: Array2::from_elem((height, width), f64::NAN),
             converged_map: Array2::from_elem((height, width), false),
             n_converged: 0,
             n_total: 0,
             nuisance: nuisance.clone(),
-        };
+        });
     }
 
-    assert_eq!(n_energies, config.energies.len());
-    assert_eq!(
-        nuisance.flux.len(),
-        n_energies,
-        "nuisance flux length ({}) must match n_energies ({})",
-        nuisance.flux.len(),
-        n_energies,
-    );
-    assert_eq!(
-        nuisance.background.len(),
-        n_energies,
-        "nuisance background length ({}) must match n_energies ({})",
-        nuisance.background.len(),
-        n_energies,
-    );
+    if config.initial_densities.len() != n_isotopes {
+        return Err(PipelineError::ShapeMismatch(format!(
+            "initial_densities length ({}) != resonance_data length ({})",
+            config.initial_densities.len(),
+            n_isotopes,
+        )));
+    }
+    if config.isotope_names.len() != n_isotopes {
+        return Err(PipelineError::ShapeMismatch(format!(
+            "isotope_names length ({}) != resonance_data length ({})",
+            config.isotope_names.len(),
+            n_isotopes,
+        )));
+    }
+    if n_energies != config.energies.len() {
+        return Err(PipelineError::ShapeMismatch(format!(
+            "sample_counts spectral axis ({}) != config.energies length ({})",
+            n_energies,
+            config.energies.len(),
+        )));
+    }
+    if nuisance.flux.len() != n_energies {
+        return Err(PipelineError::ShapeMismatch(format!(
+            "nuisance flux length ({}) must match n_energies ({})",
+            nuisance.flux.len(),
+            n_energies,
+        )));
+    }
+    if nuisance.background.len() != n_energies {
+        return Err(PipelineError::ShapeMismatch(format!(
+            "nuisance background length ({}) must match n_energies ({})",
+            nuisance.background.len(),
+            n_energies,
+        )));
+    }
+    if let Some(dp) = dead_pixels
+        && dp.shape() != [height, width]
+    {
+        return Err(PipelineError::ShapeMismatch(format!(
+            "dead_pixels shape {:?} != spatial dimensions ({}, {})",
+            dp.shape(),
+            height,
+            width,
+        )));
+    }
 
     // Precompute Doppler-broadened cross-sections once, outside the pixel loop.
     // The same XS apply to every pixel (same isotopes, same temperature, same energy grid).
@@ -234,21 +296,10 @@ pub fn sparse_reconstruct(
         instrument_params.as_ref(),
         cancel,
     );
-    // If cancelled during XS precomputation, return an empty result immediately.
+    // If cancelled during XS precomputation, return Cancelled.
     let xs_raw = match xs_raw {
         Some(v) => v,
-        None => {
-            return SparseResult {
-                density_maps: (0..n_isotopes)
-                    .map(|_| Array2::zeros((height, width)))
-                    .collect(),
-                nll_map: Array2::from_elem((height, width), f64::NAN),
-                converged_map: Array2::from_elem((height, width), false),
-                n_converged: 0,
-                n_total: 0,
-                nuisance: nuisance.clone(),
-            };
-        }
+        None => return Err(PipelineError::Cancelled),
     };
     let xs: Arc<Vec<Vec<f64>>> = Arc::new(xs_raw);
     let density_idx: Vec<usize> = (0..n_isotopes).collect();
@@ -262,6 +313,11 @@ pub fn sparse_reconstruct(
                 pixel_coords.push((y, x));
             }
         }
+    }
+
+    // Check cancellation before pixel loop
+    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+        return Err(PipelineError::Cancelled);
     }
 
     // Fit all pixels in parallel, skipping new work when cancelled
@@ -286,7 +342,7 @@ pub fn sparse_reconstruct(
                 density_indices: density_idx.clone(),
             };
 
-            // Wrap in counts model: Y = flux * T(θ) + background.
+            // Wrap in counts model: Y = flux * T(theta) + background.
             // flux/background are borrowed (zero-copy) — no per-pixel allocation.
             let counts_model = CountsModel {
                 transmission_model: &t_model,
@@ -296,7 +352,7 @@ pub fn sparse_reconstruct(
 
             // Fit with Poisson likelihood using analytical gradient.
             // Passing the precomputed cross-sections and flux enables
-            // poisson_fit_analytic to compute the full ∂NLL/∂nₖ gradient vector
+            // poisson_fit_analytic to compute the full dNLL/dn_k gradient vector
             // in one model evaluation per iteration instead of N_isotopes+1
             // evaluations with finite differences (one base + one per parameter).
             let mut params = ParameterSet::new(
@@ -338,6 +394,11 @@ pub fn sparse_reconstruct(
         })
         .collect();
 
+    // If cancellation was triggered during pixel fitting and no results, return Cancelled.
+    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) && results.is_empty() {
+        return Err(PipelineError::Cancelled);
+    }
+
     // Assemble output
     let mut density_maps: Vec<Array2<f64>> = (0..n_isotopes)
         .map(|_| Array2::zeros((height, width)))
@@ -357,14 +418,14 @@ pub fn sparse_reconstruct(
         }
     }
 
-    SparseResult {
+    Ok(SparseResult {
         density_maps,
         nll_map,
         converged_map,
         n_converged,
         n_total: results.len(),
         nuisance: nuisance.clone(),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -414,11 +475,20 @@ mod tests {
     fn test_estimate_nuisance_basic() {
         let n_e = 5;
         let ob = Array3::from_elem((n_e, 2, 2), 100.0);
-        let sample = Array3::from_elem((n_e, 2, 2), 50.0);
 
-        let nuisance = estimate_nuisance(&sample, &ob, None, None).unwrap();
+        let nuisance = estimate_nuisance(&ob, None, None).unwrap();
         assert_eq!(nuisance.flux.len(), n_e);
         assert!((nuisance.flux[0] - 100.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_estimate_nuisance_rejects_dead_pixel_shape_mismatch() {
+        let n_e = 5;
+        let ob = Array3::from_elem((n_e, 2, 2), 100.0);
+        let dead = Array2::from_elem((3, 2), false); // wrong shape
+
+        let result = estimate_nuisance(&ob, None, Some(&dead));
+        assert!(result.is_err());
     }
 
     #[test]
@@ -455,7 +525,7 @@ mod tests {
         }
 
         // Stage 1: estimate nuisance
-        let nuisance = estimate_nuisance(&sample_counts, &ob_counts, None, None).unwrap();
+        let nuisance = estimate_nuisance(&ob_counts, None, None).unwrap();
 
         // Stage 2: reconstruct
         let config = SparseConfig {
@@ -468,7 +538,7 @@ mod tests {
             poisson_config: PoissonConfig::default(),
         };
 
-        let result = sparse_reconstruct(&sample_counts, &nuisance, &config, None, None);
+        let result = sparse_reconstruct(&sample_counts, &nuisance, &config, None, None).unwrap();
 
         assert_eq!(result.n_total, 4);
         assert!(
@@ -494,5 +564,52 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_sparse_reconstruct_rejects_density_len_mismatch() {
+        let data = u238_single_resonance();
+        let config = SparseConfig {
+            energies: vec![1.0, 2.0, 3.0],
+            resonance_data: vec![data],
+            isotope_names: vec!["U-238".into()],
+            temperature_k: 0.0,
+            resolution: None,
+            initial_densities: vec![], // wrong: should be 1 element
+            poisson_config: PoissonConfig::default(),
+        };
+        let sample = Array3::from_elem((3, 2, 2), 50.0);
+        let nuisance = NuisanceParams {
+            flux: vec![100.0; 3],
+            background: vec![0.0; 3],
+        };
+        let result = sparse_reconstruct(&sample, &nuisance, &config, None, None);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("initial_densities"), "error: {msg}");
+    }
+
+    #[test]
+    fn test_sparse_reconstruct_rejects_dead_pixel_shape_mismatch() {
+        let data = u238_single_resonance();
+        let config = SparseConfig {
+            energies: vec![1.0, 2.0, 3.0],
+            resonance_data: vec![data],
+            isotope_names: vec!["U-238".into()],
+            temperature_k: 0.0,
+            resolution: None,
+            initial_densities: vec![0.001],
+            poisson_config: PoissonConfig::default(),
+        };
+
+        let sample = Array3::from_elem((3, 2, 2), 50.0);
+        let nuisance = NuisanceParams {
+            flux: vec![100.0; 3],
+            background: vec![0.0; 3],
+        };
+        let dead = Array2::from_elem((3, 2), false); // wrong shape
+
+        let result = sparse_reconstruct(&sample, &nuisance, &config, Some(&dead), None);
+        assert!(result.is_err());
     }
 }

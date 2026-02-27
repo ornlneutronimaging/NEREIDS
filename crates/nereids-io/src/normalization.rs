@@ -85,6 +85,17 @@ pub fn normalize(
         ));
     }
 
+    if let Some(dc) = dark_current {
+        let dc_shape = dc.shape();
+        let s_shape = sample.shape();
+        if dc_shape[0] != s_shape[1] || dc_shape[1] != s_shape[2] {
+            return Err(IoError::ShapeMismatch(format!(
+                "dark_current shape {:?} != spatial dimensions ({}, {})",
+                dc_shape, s_shape[1], s_shape[2],
+            )));
+        }
+    }
+
     let shape = sample.shape();
     let (n_tof, height, width) = (shape[0], shape[1], shape[2]);
 
@@ -104,32 +115,24 @@ pub fn normalize(
                     let t_val = (c_s / c_o) * pc_ratio;
                     transmission[[t, y, x]] = t_val;
 
-                    // Poisson uncertainty: σ_T/T = √(1/C_s + 1/C_o)
-                    // NOTE: When dark_current is provided, this formula is approximate.
-                    // True variance after DC subtraction is Var(C_raw) + Var(DC),
-                    // but we use the subtracted count as the variance estimate.
-                    // This underestimates uncertainty when DC is a significant
-                    // fraction of raw counts.
+                    // Poisson uncertainty via absolute error propagation.
                     //
-                    // Apply a Bayesian floor of 0.5 counts (Jeffreys prior for
-                    // Poisson) only when the count is exactly zero. For 0 < c < 0.5,
-                    // the true Poisson variance equals c, so replacing it with 0.5
-                    // would be anti-conservative (smaller 1/c_eff, thus smaller
-                    // relative uncertainty). The floor only makes sense as a prior
-                    // when no counts have been observed at all.
+                    // σ_T = pc_ratio / c_o * √(c_s_eff + c_s² / c_o)
+                    //
+                    // where c_s_eff is the Bayesian floor (Jeffreys prior,
+                    // 0.5 counts) when c_s == 0.  This formula follows from
+                    // propagating Var(c_s)=c_s_eff and Var(c_o)=c_o through
+                    // T = (c_s / c_o) * pc_ratio.
+                    //
+                    // Unlike the relative-error form σ_T = T * √(1/c_s + 1/c_o),
+                    // this absolute form produces σ > 0 even when c_s == 0 (T == 0),
+                    // ensuring downstream weighted fits never see zero uncertainty.
+                    //
+                    // NOTE: c_o is always > 0 here (we are inside the if branch),
+                    // so the old `c_o_eff` dead-code branch is removed.
                     let c_s_eff = if c_s > 0.0 { c_s } else { 0.5 };
-                    let c_o_eff = if c_o > 0.0 { c_o } else { 0.5 };
-                    let rel_err = (1.0 / c_s_eff + 1.0 / c_o_eff).sqrt();
-                    // Use the absolute uncertainty formula: σ_T = T * rel_err.
-                    // When t_val=0 (c_s=0), use the floor-based absolute value
-                    // so downstream weighted fits never see σ=0.
-                    uncertainty[[t, y, x]] = if t_val > 0.0 {
-                        t_val * rel_err
-                    } else {
-                        // c_s=0: T=0, but σ should reflect the Bayesian floor.
-                        // σ_T = (c_s_eff/c_o_eff) * pc_ratio * rel_err
-                        (c_s_eff / c_o_eff) * pc_ratio * rel_err
-                    };
+                    let abs_var_t = (pc_ratio / c_o).powi(2) * (c_s_eff + c_s * c_s / c_o);
+                    uncertainty[[t, y, x]] = abs_var_t.sqrt();
                 } else {
                     // No open-beam counts: mark as invalid
                     transmission[[t, y, x]] = 0.0;
@@ -165,16 +168,37 @@ pub fn extract_spectrum(data: &Array3<f64>, y: usize, x: usize) -> Array1<f64> {
 /// * `y_range` — Row range (start..end).
 /// * `x_range` — Column range (start..end).
 ///
+/// # Errors
+/// Returns `IoError::InvalidParameter` if the ROI is empty or exceeds the
+/// spatial dimensions of `data`.
+///
 /// # Returns
 /// Averaged 1D spectrum of length n_tof.
 pub fn average_roi(
     data: &Array3<f64>,
     y_range: std::ops::Range<usize>,
     x_range: std::ops::Range<usize>,
-) -> Array1<f64> {
+) -> Result<Array1<f64>, IoError> {
+    if y_range.is_empty() || x_range.is_empty() {
+        return Err(IoError::InvalidParameter(
+            "ROI ranges must be non-empty for average_roi".into(),
+        ));
+    }
+    if y_range.end > data.shape()[1] || x_range.end > data.shape()[2] {
+        return Err(IoError::InvalidParameter(format!(
+            "ROI range ({}..{}, {}..{}) exceeds data spatial dims ({}, {})",
+            y_range.start,
+            y_range.end,
+            x_range.start,
+            x_range.end,
+            data.shape()[1],
+            data.shape()[2],
+        )));
+    }
     let roi = data.slice(ndarray::s![.., y_range, x_range]);
-    // Mean over spatial dimensions (axes 1 and 2)
-    roi.mean_axis(Axis(2)).unwrap().mean_axis(Axis(1)).unwrap()
+    // Mean over spatial dimensions (axes 1 and 2).
+    // unwrap is safe here: the ROI is guaranteed non-empty by the check above.
+    Ok(roi.mean_axis(Axis(2)).unwrap().mean_axis(Axis(1)).unwrap())
 }
 
 /// Detect dead pixels (zero counts across all TOF bins).
@@ -314,7 +338,7 @@ mod tests {
             }
         }
 
-        let avg = average_roi(&data, 1..3, 1..3);
+        let avg = average_roi(&data, 1..3, 1..3).unwrap();
         assert_eq!(avg.len(), 2);
         assert!((avg[0] - 100.0).abs() < 1e-10);
         assert!((avg[1] - 200.0).abs() < 1e-10);
@@ -365,6 +389,23 @@ mod tests {
         assert!(
             result.uncertainty[[0, 0, 0]].is_infinite(),
             "uncertainty should be infinite for zero OB counts"
+        );
+    }
+
+    #[test]
+    fn test_normalize_dark_current_shape_mismatch() {
+        let sample = Array3::from_elem((2, 3, 4), 1.0);
+        let ob = Array3::from_elem((2, 3, 4), 1.0);
+        let dc = Array2::from_elem((2, 4), 0.0); // wrong shape
+        let params = NormalizationParams {
+            proton_charge_sample: 1.0,
+            proton_charge_ob: 1.0,
+        };
+
+        let result = normalize(&sample, &ob, &params, Some(&dc));
+        assert!(
+            result.is_err(),
+            "should reject mismatched dark_current shape"
         );
     }
 
