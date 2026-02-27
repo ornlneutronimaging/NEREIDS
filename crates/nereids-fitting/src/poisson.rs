@@ -63,23 +63,91 @@ pub struct PoissonResult {
     pub params: Vec<f64>,
 }
 
+/// Small positive floor for smooth Poisson NLL extrapolation (#109.2).
+const POISSON_EPSILON: f64 = 1e-10;
+
 /// Compute Poisson negative log-likelihood.
 ///
 /// NLL = Σᵢ [y_model - y_obs · ln(y_model)]
 ///
-/// Terms where y_model ≤ 0 are penalized heavily.
+/// #109.2: For y_model ≤ epsilon, use a smooth C¹ quadratic extrapolation
+/// instead of a hard 1e30 penalty.  This keeps the NLL and its gradient
+/// continuous, so gradient-based optimizers (projected gradient, L-BFGS)
+/// can smoothly steer back into the feasible region rather than hitting
+/// a discontinuous cliff that stalls the line search.
 fn poisson_nll(y_obs: &[f64], y_model: &[f64]) -> f64 {
     y_obs
         .iter()
         .zip(y_model.iter())
-        .map(|(&obs, &mdl)| {
-            if mdl > 0.0 {
-                mdl - obs * mdl.ln()
-            } else {
-                1e30 // Large penalty for non-positive model
-            }
-        })
+        .map(|(&obs, &mdl)| poisson_nll_term(obs, mdl))
         .sum()
+}
+
+/// Single-bin Poisson NLL with smooth extrapolation for mdl <= epsilon.
+///
+/// For mdl > 0: NLL = mdl - obs * ln(mdl)
+/// For mdl <= epsilon: quadratic Taylor expansion about epsilon,
+///   NLL(ε) + NLL'(ε)·(mdl−ε) + ½·NLL''(ε)·(mdl−ε)²
+/// where NLL'(x) = 1 − obs/x and NLL''(x) = obs/x².
+///
+/// Since delta = ε − mdl ≥ 0, this becomes:
+///   NLL(ε) − NLL'(ε)·delta + ½·NLL''(ε)·delta²
+///
+/// When obs == 0, the exact Hessian obs/ε² vanishes, leaving only a linear
+/// term that decreases without bound as mdl → −∞.  This can cause the
+/// optimizer to diverge.  We impose a minimum curvature of 1/ε so the
+/// quadratic penalty still curves upward for negative predictions.
+#[inline]
+fn poisson_nll_term(obs: f64, mdl: f64) -> f64 {
+    if mdl > POISSON_EPSILON {
+        mdl - obs * mdl.ln()
+    } else {
+        let eps = POISSON_EPSILON;
+        let nll_eps = eps - obs * eps.ln();
+        let grad_eps = 1.0 - obs / eps;
+        // Minimum curvature 1/eps ensures the penalty grows quadratically
+        // even when obs == 0 (where the exact Hessian obs/eps^2 vanishes).
+        let hess_eps = if obs > 0.0 {
+            obs / (eps * eps)
+        } else {
+            1.0 / eps
+        };
+        let delta = eps - mdl;
+        // Taylor expansion: f(eps) + f'(eps)*(mdl - eps) + 0.5*f''(eps)*(mdl - eps)^2
+        // Since (mdl - eps) = -delta, the linear term flips sign.
+        nll_eps - grad_eps * delta + 0.5 * hess_eps * delta * delta
+    }
+}
+
+/// Single-bin Poisson NLL gradient (∂NLL/∂y_model) with smooth extrapolation.
+///
+/// For mdl > 0: ∂NLL/∂mdl = 1 − obs/mdl
+/// For mdl <= epsilon: linear extrapolation from epsilon,
+///   NLL'(ε) + NLL''(ε)·(mdl−ε) = (1 − obs/ε) − (obs/ε²)·delta
+///
+/// Since delta = ε − mdl ≥ 0, the derivative of the NLL term w.r.t. mdl
+/// is the derivative of the quadratic extrapolation in poisson_nll_term.
+///
+/// The minimum curvature floor (1/ε when obs == 0) must match
+/// `poisson_nll_term` so the gradient is consistent with the objective.
+#[inline]
+fn poisson_nll_grad_term(obs: f64, mdl: f64) -> f64 {
+    if mdl > POISSON_EPSILON {
+        1.0 - obs / mdl
+    } else {
+        let eps = POISSON_EPSILON;
+        let grad_eps = 1.0 - obs / eps;
+        // Minimum curvature 1/eps, matching poisson_nll_term.
+        let hess_eps = if obs > 0.0 {
+            obs / (eps * eps)
+        } else {
+            1.0 / eps
+        };
+        let delta = eps - mdl;
+        // g(eps) + g'(eps)*(mdl - eps) = g(eps) - g'(eps)*delta
+        // where g'(x) = NLL''(x) = hess_eps at x=eps
+        grad_eps - hess_eps * delta
+    }
 }
 
 /// Compute gradient of Poisson NLL by finite differences.
@@ -101,11 +169,19 @@ fn compute_gradient(
 
         params.params[idx].value = original + step;
         params.params[idx].clamp();
-        let actual_step = params.params[idx].value - original;
+        let mut actual_step = params.params[idx].value - original;
 
+        // #112: If the forward step is blocked by an upper bound, try the
+        // backward step so the gradient component is not frozen at zero.
         if actual_step.abs() < 1e-30 {
-            params.params[idx].value = original;
-            continue;
+            params.params[idx].value = original - step;
+            params.params[idx].clamp();
+            actual_step = params.params[idx].value - original;
+            if actual_step.abs() < 1e-30 {
+                // Truly stuck at a point constraint — skip this parameter.
+                params.params[idx].value = original;
+                continue;
+            }
         }
 
         let perturbed_model = model.evaluate(&params.all_values());
@@ -144,6 +220,30 @@ pub fn poisson_fit(
     params: &mut ParameterSet,
     config: &PoissonConfig,
 ) -> PoissonResult {
+    // Early return when all parameters are fixed: evaluate once and report.
+    if params.n_free() == 0 {
+        let y_model = model.evaluate(&params.all_values());
+        let nll = poisson_nll(y_obs, &y_model);
+
+        // #P1: If the model produces non-finite NLL with all-fixed parameters,
+        // return converged=false rather than silently claiming success.
+        if !nll.is_finite() {
+            return PoissonResult {
+                nll,
+                iterations: 0,
+                converged: false,
+                params: params.all_values(),
+            };
+        }
+
+        return PoissonResult {
+            nll,
+            iterations: 0,
+            converged: true,
+            params: params.all_values(),
+        };
+    }
+
     let y_model = model.evaluate(&params.all_values());
     let mut nll = poisson_nll(y_obs, &y_model);
     let mut converged = false;
@@ -185,6 +285,14 @@ pub fn poisson_fit(
             project(params);
 
             let trial_model = model.evaluate(&params.all_values());
+
+            // #113: If the model produced NaN/Inf, reduce step size rather
+            // than accepting a garbage NLL.
+            if trial_model.iter().any(|v| !v.is_finite()) {
+                alpha *= config.backtrack;
+                continue;
+            }
+
             let trial_nll = poisson_nll(y_obs, &trial_model);
 
             // Armijo condition: f(x_new) <= f(x) - c·α·∇f·d
@@ -195,7 +303,7 @@ pub fn poisson_fit(
                 .map(|((&g, &old), &new)| g * (old - new))
                 .sum::<f64>();
 
-            if trial_nll <= nll - config.armijo_c * descent {
+            if trial_nll.is_finite() && trial_nll <= nll - config.armijo_c * descent {
                 nll = trial_nll;
                 accepted = true;
                 break;
@@ -318,6 +426,30 @@ pub fn poisson_fit_analytic(
         );
     }
 
+    // Early return when all parameters are fixed: evaluate once and report.
+    if params.n_free() == 0 {
+        let y_model = model.evaluate(&params.all_values());
+        let nll = poisson_nll(y_obs, &y_model);
+
+        // #P1: If the model produces non-finite NLL with all-fixed parameters,
+        // return converged=false rather than silently claiming success.
+        if !nll.is_finite() {
+            return PoissonResult {
+                nll,
+                iterations: 0,
+                converged: false,
+                params: params.all_values(),
+            };
+        }
+
+        return PoissonResult {
+            nll,
+            iterations: 0,
+            converged: true,
+            params: params.all_values(),
+        };
+    }
+
     // Validate that every free parameter is referenced by density_indices
     // or the temperature context.  Free parameters with no analytical
     // gradient mapping will never move, causing silent convergence to the
@@ -411,9 +543,7 @@ pub fn poisson_fit_analytic(
                 let mut neg_opt = 0.0f64;
                 for (k, xs) in xs_owned.iter().enumerate() {
                     let density = all_vals[density_indices[k]];
-                    if density > 0.0 {
-                        neg_opt -= density * xs[e];
-                    }
+                    neg_opt -= density * xs[e];
                 }
                 neg_opt.exp()
             })
@@ -435,10 +565,9 @@ pub fn poisson_fit_analytic(
                     .zip(t_now.iter())
                     .enumerate()
                     .map(|(e, (((&obs, &ym), &phi), &t))| {
-                        // Mirror the large-penalty behavior in `poisson_nll`:
-                        // non-positive model → large gradient pushing the optimizer
-                        // away from infeasible regions.
-                        let residual_factor = if ym <= 0.0 { 1e30 } else { 1.0 - obs / ym };
+                        // Use the smooth NLL gradient term consistent with
+                        // poisson_nll_grad_term (#109.2).
+                        let residual_factor = poisson_nll_grad_term(obs, ym);
                         let sigma_sum: f64 = iso_indices.iter().map(|&k| xs_owned[k][e]).sum();
                         residual_factor * phi * t * (-sigma_sum)
                     })
@@ -458,17 +587,11 @@ pub fn poisson_fit_analytic(
                 .zip(t_now.iter())
                 .enumerate()
                 .map(|(e, (((&obs, &ym), &phi), &t))| {
-                    let residual_factor = if ym <= 0.0 { 1e30 } else { 1.0 - obs / ym };
+                    let residual_factor = poisson_nll_grad_term(obs, ym);
                     let dsigma_sum: f64 = (0..density_indices.len())
                         .map(|k| {
                             let density = all_vals[density_indices[k]];
-                            // Mirror the density > 0 guard from T(E) computation:
-                            // zero-density isotopes contribute nothing to ∂T/∂temp.
-                            if density > 0.0 {
-                                density * dxs_dt[k][e]
-                            } else {
-                                0.0
-                            }
+                            density * dxs_dt[k][e]
                         })
                         .sum();
                     residual_factor * phi * t * (-dsigma_sum)
@@ -524,11 +647,7 @@ pub fn poisson_fit_analytic(
                             let dsigma_sum: f64 = (0..density_indices.len())
                                 .map(|k| {
                                     let density = all_vals[density_indices[k]];
-                                    if density > 0.0 {
-                                        density * dxs_dt[k][e]
-                                    } else {
-                                        0.0
-                                    }
+                                    density * dxs_dt[k][e]
                                 })
                                 .sum();
                             phi * t * (-dsigma_sum)
@@ -569,6 +688,13 @@ pub fn poisson_fit_analytic(
             project(params);
 
             let trial_model = model.evaluate(&params.all_values());
+
+            // #113: If the model produced NaN/Inf, reduce step size.
+            if trial_model.iter().any(|v| !v.is_finite()) {
+                alpha *= config.backtrack;
+                continue;
+            }
+
             let trial_nll = poisson_nll(y_obs, &trial_model);
 
             let descent = grad
@@ -578,7 +704,7 @@ pub fn poisson_fit_analytic(
                 .map(|((&g, &old), &new)| g * (old - new))
                 .sum::<f64>();
 
-            if trial_nll <= nll - config.armijo_c * descent {
+            if trial_nll.is_finite() && trial_nll <= nll - config.armijo_c * descent {
                 nll = trial_nll;
                 accepted = true;
                 break;
