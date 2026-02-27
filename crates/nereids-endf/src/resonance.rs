@@ -299,6 +299,7 @@ pub struct ResonanceRange {
     /// NAPS=0: use the channel radius for penetrability/shift calculations.
     /// NAPS=1: use the scattering radius (AP or AP(E)) for penetrability/shift.
     /// Reference: ENDF-6 Formats Manual §2.2.1
+    #[serde(default)]
     pub naps: i32,
     /// Energy-dependent scattering radius AP(E) (fm), present when NRO=1.
     ///
@@ -339,10 +340,12 @@ pub struct LGroup {
     /// Q-value for competitive width (eV). Only meaningful for BW formalisms
     /// (LRF=1/2) where LRX=1; zero otherwise.
     /// Reference: ENDF-6 Formats Manual §2.2.1.1, L-value CONT record (C2 field).
+    #[serde(default)]
     pub qx: f64,
     /// Competitive width flag. LRX=0: no competitive width; LRX=1: competitive
     /// reaction exists (width = GT - GN - GG - GF). Only used in BW formalisms.
     /// Reference: ENDF-6 Formats Manual §2.2.1.1, L-value CONT record (L2 field).
+    #[serde(default)]
     pub lrx: i32,
     /// Individual resonances in this L-group.
     pub resonances: Vec<Resonance>,
