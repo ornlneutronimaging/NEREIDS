@@ -172,6 +172,16 @@ fn report_from_baseline(
 /// * `trace`     — Resonance data for the trace isotope.
 /// * `trace_ppm` — Trace concentration in ppm by atom.
 ///
+/// # Preconditions
+/// * `config.energies` must be non-empty and sorted ascending.
+/// * `config.i0` must be positive (used as `1/√I₀` for noise estimate).
+/// * `config.matrix_density` must be positive.
+/// * `config.snr_threshold` must be non-negative.
+/// * `trace_ppm` must be non-negative.
+///
+/// The Python bindings validate all of these; Rust callers are responsible
+/// for ensuring valid inputs.
+///
 /// # Returns
 /// [`TraceDetectabilityReport`] with peak SNR, peak energy, detectability
 /// flag, and the full |ΔT| spectrum.
@@ -190,6 +200,10 @@ pub fn trace_detectability(
 /// The matrix-only baseline transmission and instrument resolution are
 /// computed once and reused for all candidates. Each candidate is then
 /// evaluated in parallel with rayon.
+///
+/// # Preconditions
+/// Same as [`trace_detectability`], plus `trace_candidates` must be
+/// non-empty.
 ///
 /// # Returns
 /// Vec of (isotope_name, report) sorted by `peak_snr` descending.
