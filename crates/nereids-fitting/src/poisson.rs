@@ -99,6 +99,12 @@ fn poisson_nll(y_obs: &[f64], y_model: &[f64]) -> f64 {
 /// quadratic penalty still curves upward for negative predictions.
 #[inline]
 fn poisson_nll_term(obs: f64, mdl: f64) -> f64 {
+    // #125.3: Negative observed counts would produce wrong-signed NLL terms.
+    // Release builds skip this check; callers must ensure non-negative counts. See #125 item 3.
+    debug_assert!(
+        obs.is_finite() && obs >= 0.0,
+        "poisson_nll_term: obs must be finite and >= 0, got {obs}"
+    );
     if mdl > POISSON_EPSILON {
         mdl - obs * mdl.ln()
     } else {
@@ -132,6 +138,12 @@ fn poisson_nll_term(obs: f64, mdl: f64) -> f64 {
 /// `poisson_nll_term` so the gradient is consistent with the objective.
 #[inline]
 fn poisson_nll_grad_term(obs: f64, mdl: f64) -> f64 {
+    // #125.3: Negative observed counts would produce wrong-signed gradient terms.
+    // Release builds skip this check; callers must ensure non-negative counts. See #125 item 3.
+    debug_assert!(
+        obs.is_finite() && obs >= 0.0,
+        "poisson_nll_grad_term: obs must be finite and >= 0, got {obs}"
+    );
     if mdl > POISSON_EPSILON {
         1.0 - obs / mdl
     } else {
@@ -639,9 +651,11 @@ pub fn poisson_fit_analytic(
                     .zip(t_now.iter())
                     .enumerate()
                     .map(|(e, ((&ym, &phi), &t))| {
-                        if ym <= 0.0 {
-                            return 0.0;
-                        }
+                        // #125.2: Use ym.max(POISSON_EPSILON) instead of
+                        // hard-returning 0.0, consistent with the gradient path
+                        // which uses smooth extrapolation for ym <= epsilon.
+                        // Hard-returning 0.0 loses curvature information.
+                        let ym_safe = ym.max(POISSON_EPSILON);
                         let dy = if is_temp {
                             // ∂Y/∂T = Φ · T · (−Σ_k n_k · ∂σ_k/∂T)
                             let dsigma_sum: f64 = (0..density_indices.len())
@@ -656,7 +670,7 @@ pub fn poisson_fit_analytic(
                             let sigma_sum: f64 = iso_indices.iter().map(|&k| xs_owned[k][e]).sum();
                             phi * t * (-sigma_sum)
                         };
-                        dy * dy / ym
+                        dy * dy / ym_safe
                     })
                     .sum::<f64>()
             })
@@ -670,7 +684,9 @@ pub fn poisson_fit_analytic(
                 if h > 1e-30 {
                     g / h
                 } else {
-                    g // fall back to unscaled gradient
+                    // Pre-existing floor; when dy is extremely small, h can underflow.
+                    // This falls back to unscaled gradient which is safe but slower to converge.
+                    g
                 }
             })
             .collect();
@@ -1318,5 +1334,127 @@ mod tests {
             true_temp,
             (fitted_temp - true_temp).abs() / true_temp * 100.0,
         );
+    }
+
+    // ---- Edge-case tests for issue #125 ----
+
+    #[test]
+    fn test_poisson_nll_term_negative_model() {
+        // #125.6: Negative model prediction should use smooth extrapolation,
+        // not produce NaN or panic.
+        let nll = poisson_nll_term(10.0, -5.0);
+        assert!(
+            nll.is_finite(),
+            "NLL should be finite for negative model, got {nll}"
+        );
+
+        // Should be larger than the NLL at epsilon (penalty grows for negative mdl).
+        let nll_at_eps = poisson_nll_term(10.0, POISSON_EPSILON);
+        assert!(
+            nll > nll_at_eps,
+            "NLL at mdl=-5 ({nll}) should exceed NLL at epsilon ({nll_at_eps})"
+        );
+    }
+
+    #[test]
+    fn test_poisson_nll_term_zero_obs() {
+        // Zero observed counts: NLL = mdl (no log term).
+        let nll = poisson_nll_term(0.0, 10.0);
+        assert!(
+            (nll - 10.0).abs() < 1e-10,
+            "NLL(obs=0, mdl=10) should be 10.0, got {nll}"
+        );
+
+        // Extrapolation region with obs=0: should still have upward curvature.
+        let nll_neg = poisson_nll_term(0.0, -1.0);
+        let nll_zero = poisson_nll_term(0.0, 0.0);
+        assert!(
+            nll_neg > nll_zero,
+            "NLL should grow as mdl goes more negative: nll(-1)={nll_neg} vs nll(0)={nll_zero}"
+        );
+    }
+
+    #[test]
+    fn test_all_fixed_params_nan_model_poisson() {
+        // #125.1: All-fixed parameters with NaN model → converged=false.
+        struct NanModel;
+        impl FitModel for NanModel {
+            fn evaluate(&self, _params: &[f64]) -> Vec<f64> {
+                vec![f64::NAN; 5]
+            }
+        }
+
+        let y_obs = vec![10.0; 5];
+        let mut params = ParameterSet::new(vec![FitParameter::fixed("a", 1.0)]);
+
+        let result = poisson_fit(&NanModel, &y_obs, &mut params, &PoissonConfig::default());
+
+        assert!(
+            !result.converged,
+            "All-fixed NaN model should not converge in Poisson fit"
+        );
+        assert!(!result.nll.is_finite(), "NLL should be non-finite");
+        assert_eq!(result.iterations, 0);
+    }
+
+    #[test]
+    fn test_all_fixed_params_nan_model_poisson_analytic() {
+        // #125.1: Exercise the NaN guard in poisson_fit_analytic (not just poisson_fit).
+        // When all parameters are fixed and the model produces NaN, the result
+        // must report converged=false.
+        struct NanModel;
+        impl FitModel for NanModel {
+            fn evaluate(&self, _params: &[f64]) -> Vec<f64> {
+                vec![f64::NAN; 5]
+            }
+        }
+
+        let y_obs = vec![10.0; 5];
+        let flux = vec![1000.0; 5];
+        // One isotope with trivial cross-sections.
+        let cross_sections = vec![vec![1.0; 5]];
+        let density_indices = vec![0];
+        let mut params = ParameterSet::new(vec![FitParameter::fixed("density", 0.5)]);
+
+        let result = poisson_fit_analytic(
+            &NanModel,
+            &y_obs,
+            &flux,
+            &cross_sections,
+            &density_indices,
+            &mut params,
+            &PoissonConfig::default(),
+            None,
+        );
+
+        assert!(
+            !result.converged,
+            "All-fixed NaN model should not converge in poisson_fit_analytic"
+        );
+        assert!(!result.nll.is_finite(), "NLL should be non-finite");
+        assert_eq!(result.iterations, 0);
+    }
+
+    #[test]
+    fn test_all_fixed_params_good_model_poisson() {
+        // #125.1: All-fixed parameters with a valid model → converged=true.
+        let x: Vec<f64> = (0..10).map(|i| i as f64 * 0.5).collect();
+        let flux: Vec<f64> = vec![100.0; x.len()];
+        let model = ExponentialModel {
+            x: x.clone(),
+            flux: flux.clone(),
+        };
+        let y_obs = model.evaluate(&[0.5]);
+
+        let mut params = ParameterSet::new(vec![FitParameter::fixed("b", 0.5)]);
+
+        let result = poisson_fit(&model, &y_obs, &mut params, &PoissonConfig::default());
+
+        assert!(
+            result.converged,
+            "All-fixed good model should converge in Poisson fit"
+        );
+        assert!(result.nll.is_finite(), "NLL should be finite");
+        assert_eq!(result.iterations, 0);
     }
 }
