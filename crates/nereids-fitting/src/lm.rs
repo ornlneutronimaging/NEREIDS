@@ -338,10 +338,12 @@ pub fn levenberg_marquardt(
         };
     }
 
-    // #108.3: Underdetermined systems — when n_data <= n_free, the problem is
-    // underdetermined and reduced chi-squared is meaningless.  Return early
+    // #108.3: Underdetermined systems — when n_data < n_free, the problem is
+    // underdetermined and the Jacobian cannot be full rank.  Return early
     // with converged=false so callers can detect the problem.
-    if n_data <= n_free {
+    // n_data == n_free is exactly determined (dof=0) and still solvable;
+    // we allow it and report reduced_chi_squared = NaN (0/0).
+    if n_data < n_free {
         return LmResult {
             chi_squared: f64::NAN,
             reduced_chi_squared: f64::NAN,
