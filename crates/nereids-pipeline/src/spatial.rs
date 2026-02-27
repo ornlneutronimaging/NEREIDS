@@ -109,6 +109,18 @@ pub fn spatial_map(
             n_isotopes,
         )));
     }
+    if config.fit_temperature && config.temperature_k < 1.0 {
+        return Err(PipelineError::InvalidParameter(format!(
+            "fit_temperature requires temperature_k >= 1.0, got {}",
+            config.temperature_k,
+        )));
+    }
+    if !config.temperature_k.is_finite() {
+        return Err(PipelineError::InvalidParameter(format!(
+            "temperature_k must be finite, got {}",
+            config.temperature_k,
+        )));
+    }
 
     // Collect live pixel coordinates first (cheap).  We must know there is
     // actual work to do before paying the expensive precompute cost below.
