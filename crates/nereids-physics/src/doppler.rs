@@ -419,7 +419,7 @@ mod tests {
         // Build the ex001 resonance data: single resonance at 10 eV.
         // SAMMY par file widths are in meV — convert to eV (×0.001).
         let data = ResonanceData {
-            isotope: Isotope { z: 1, a: 10 },
+            isotope: Isotope::new(1, 10).unwrap(),
             za: 1010,
             awr: 10.0,
             ranges: vec![ResonanceRange {

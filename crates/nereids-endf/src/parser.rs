@@ -1714,7 +1714,7 @@ mod tests {
         use nereids_core::types::Isotope;
 
         let retriever = EndfRetriever::new();
-        let isotope = Isotope::new(74, 184);
+        let isotope = Isotope::new(74, 184).unwrap();
         let (_, text) = retriever
             .get_endf_file(&isotope, EndfLibrary::EndfB8_0, 7437)
             .expect("Failed to download W-184 ENDF/B-VIII.0");

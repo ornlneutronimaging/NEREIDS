@@ -256,7 +256,7 @@ mod tests {
 
     fn u238_single_resonance() -> nereids_endf::resonance::ResonanceData {
         nereids_endf::resonance::ResonanceData {
-            isotope: Isotope::new(92, 238),
+            isotope: Isotope::new(92, 238).unwrap(),
             za: 92238,
             awr: 236.006,
             ranges: vec![ResonanceRange {

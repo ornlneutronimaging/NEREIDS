@@ -219,9 +219,9 @@ pub fn trace_detectability_survey(
     let mut results: Vec<(String, TraceDetectabilityReport)> = trace_candidates
         .par_iter()
         .map(|trace| {
-            let name = elements::element_symbol(trace.isotope.z)
-                .map(|sym| format!("{}-{}", sym, trace.isotope.a))
-                .unwrap_or_else(|| format!("Z{}-{}", trace.isotope.z, trace.isotope.a));
+            let name = elements::element_symbol(trace.isotope.z())
+                .map(|sym| format!("{}-{}", sym, trace.isotope.a()))
+                .unwrap_or_else(|| format!("Z{}-{}", trace.isotope.z(), trace.isotope.a()));
 
             let report =
                 report_from_baseline(config, instrument.as_ref(), &t_matrix, trace, trace_ppm);
@@ -251,7 +251,7 @@ mod tests {
         use nereids_core::types::Isotope;
         use nereids_endf::parser::parse_endf_file2;
 
-        let isotope = Isotope::new(z, a);
+        let isotope = Isotope::new(z, a).unwrap();
         let mat = mat_number(&isotope).unwrap_or_else(|| {
             panic!("No MAT number for Z={z} A={a}");
         });
@@ -408,7 +408,7 @@ mod tests {
     /// Build a minimal single-resonance isotope for offline testing.
     fn synthetic_isotope(z: u32, a: u32, res_energy: f64, gn: f64, gg: f64) -> ResonanceData {
         ResonanceData {
-            isotope: nereids_core::types::Isotope::new(z, a),
+            isotope: nereids_core::types::Isotope::new(z, a).unwrap(),
             za: z * 1000 + a,
             awr: a as f64 - 0.009, // approximate
             ranges: vec![ResonanceRange {

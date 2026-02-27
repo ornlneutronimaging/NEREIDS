@@ -73,20 +73,23 @@ impl PyResonanceData {
             .sum();
         format!(
             "ResonanceData(Z={}, A={}, AWR={:.3}, n_resonances={})",
-            self.inner.isotope.z, self.inner.isotope.a, self.inner.awr, n_res
+            self.inner.isotope.z(),
+            self.inner.isotope.a(),
+            self.inner.awr,
+            n_res
         )
     }
 
     /// Atomic number.
     #[getter]
     fn z(&self) -> u32 {
-        self.inner.isotope.z
+        self.inner.isotope.z()
     }
 
     /// Mass number.
     #[getter]
     fn a(&self) -> u32 {
-        self.inner.isotope.a
+        self.inner.isotope.a()
     }
 
     /// Atomic weight ratio.
@@ -895,7 +898,8 @@ fn load_endf(z: u32, a: u32, library: &str, mat: Option<u32>) -> PyResult<PyReso
         }
     };
 
-    let isotope = Isotope::new(z, a);
+    let isotope = Isotope::new(z, a)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid isotope: {}", e)))?;
 
     let mat_num = match mat {
         Some(m) => m,
@@ -916,10 +920,13 @@ fn load_endf(z: u32, a: u32, library: &str, mat: Option<u32>) -> PyResult<PyReso
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("ENDF parse error: {}", e)))?;
 
     // Validate that the parsed ENDF data matches the requested isotope.
-    if data.isotope.z != z || data.isotope.a != a {
+    if data.isotope.z() != z || data.isotope.a() != a {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
             "ENDF data mismatch: requested Z={} A={} but file contains Z={} A={}",
-            z, a, data.isotope.z, data.isotope.a
+            z,
+            a,
+            data.isotope.z(),
+            data.isotope.a()
         )));
     }
 
@@ -1030,7 +1037,9 @@ fn create_resonance_data(
 
     Ok(PyResonanceData {
         inner: ResonanceData {
-            isotope: Isotope::new(z, a),
+            isotope: Isotope::new(z, a).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!("Invalid isotope: {}", e))
+            })?,
             za: z * 1000 + a,
             awr,
             ranges: vec![ResonanceRange {
@@ -1447,8 +1456,8 @@ fn py_spatial_map(
     let isotope_names: Vec<String> = isotopes
         .iter()
         .map(|d| {
-            let sym = elements::element_symbol(d.inner.isotope.z).unwrap_or("?");
-            format!("{}-{}", sym, d.inner.isotope.a)
+            let sym = elements::element_symbol(d.inner.isotope.z()).unwrap_or("?");
+            format!("{}-{}", sym, d.inner.isotope.a())
         })
         .collect();
     let res_data: Vec<ResonanceData> = isotopes.into_iter().map(|d| d.inner).collect();
@@ -1689,8 +1698,8 @@ fn py_fit_roi(
     let isotope_names: Vec<String> = isotopes
         .iter()
         .map(|d| {
-            let sym = elements::element_symbol(d.inner.isotope.z).unwrap_or("?");
-            format!("{}-{}", sym, d.inner.isotope.a)
+            let sym = elements::element_symbol(d.inner.isotope.z()).unwrap_or("?");
+            format!("{}-{}", sym, d.inner.isotope.a())
         })
         .collect();
     let res_data: Vec<ResonanceData> = isotopes.into_iter().map(|d| d.inner).collect();
@@ -1944,7 +1953,7 @@ fn py_element_name(z: u32) -> Option<String> {
 #[pyfunction]
 #[pyo3(name = "parse_isotope_str")]
 fn py_parse_isotope_str(s: &str) -> Option<(u32, u32)> {
-    elements::parse_isotope_str(s).map(|iso| (iso.z, iso.a))
+    elements::parse_isotope_str(s).map(|iso| (iso.z(), iso.a()))
 }
 
 /// Get the natural isotopic abundance for a specific isotope.
@@ -1958,7 +1967,9 @@ fn py_parse_isotope_str(s: &str) -> Option<(u32, u32)> {
 #[pyfunction]
 #[pyo3(name = "natural_abundance")]
 fn py_natural_abundance(z: u32, a: u32) -> Option<f64> {
-    elements::natural_abundance(&Isotope::new(z, a))
+    Isotope::new(z, a)
+        .ok()
+        .and_then(|iso| elements::natural_abundance(&iso))
 }
 
 /// Get all naturally occurring isotopes for an element.
@@ -1973,7 +1984,7 @@ fn py_natural_abundance(z: u32, a: u32) -> Option<f64> {
 fn py_natural_isotopes(z: u32) -> Vec<((u32, u32), f64)> {
     elements::natural_isotopes(z)
         .into_iter()
-        .map(|(iso, frac)| ((iso.z, iso.a), frac))
+        .map(|(iso, frac)| ((iso.z(), iso.a()), frac))
         .collect()
 }
 

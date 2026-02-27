@@ -224,7 +224,7 @@ mod tests {
         // Single resonance at 6.674 eV (U-238).
         // SLBW and RM should agree well for an isolated resonance.
         let data = ResonanceData {
-            isotope: nereids_core::types::Isotope::new(92, 238),
+            isotope: nereids_core::types::Isotope::new(92, 238).unwrap(),
             za: 92238,
             awr: 236.006,
             ranges: vec![ResonanceRange {
@@ -284,7 +284,7 @@ mod tests {
         }];
 
         let rm_data = ResonanceData {
-            isotope: nereids_core::types::Isotope::new(92, 238),
+            isotope: nereids_core::types::Isotope::new(92, 238).unwrap(),
             za: 92238,
             awr: 236.006,
             ranges: vec![ResonanceRange {
@@ -302,7 +302,7 @@ mod tests {
         };
 
         let slbw_data = ResonanceData {
-            isotope: nereids_core::types::Isotope::new(92, 238),
+            isotope: nereids_core::types::Isotope::new(92, 238).unwrap(),
             za: 92238,
             awr: 236.006,
             ranges: vec![ResonanceRange {

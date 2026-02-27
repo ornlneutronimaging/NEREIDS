@@ -1,24 +1,49 @@
 //! Core domain types for neutron resonance imaging.
 
+use crate::error::NereidsError;
+
 /// Identifies an isotope by atomic number Z and mass number A.
+///
+/// Fields are private to enforce validation invariants (A > 0, Z <= A).
+/// Use [`Isotope::new`] to construct and the getter methods to read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Isotope {
     /// Atomic number (number of protons).
-    pub z: u32,
+    z: u32,
     /// Mass number (protons + neutrons).
-    pub a: u32,
+    a: u32,
 }
 
 impl Isotope {
-    pub fn new(z: u32, a: u32) -> Self {
-        assert!(a > 0, "mass number A must be positive");
-        assert!(
-            z <= a,
-            "atomic number Z ({}) cannot exceed mass number A ({})",
-            z,
-            a
-        );
-        Self { z, a }
+    /// Create a new isotope with validation.
+    ///
+    /// # Errors
+    /// Returns `NereidsError::InvalidParameter` if:
+    /// - `a` is zero (mass number must be positive)
+    /// - `z > a` (atomic number cannot exceed mass number)
+    pub fn new(z: u32, a: u32) -> Result<Self, NereidsError> {
+        if a == 0 {
+            return Err(NereidsError::InvalidParameter(
+                "mass number A must be positive".to_string(),
+            ));
+        }
+        if z > a {
+            return Err(NereidsError::InvalidParameter(format!(
+                "atomic number Z ({}) cannot exceed mass number A ({})",
+                z, a
+            )));
+        }
+        Ok(Self { z, a })
+    }
+
+    /// Atomic number (number of protons).
+    pub fn z(&self) -> u32 {
+        self.z
+    }
+
+    /// Mass number (protons + neutrons).
+    pub fn a(&self) -> u32 {
+        self.a
     }
 }
 
@@ -33,10 +58,31 @@ mod tests {
     use super::*;
 
     #[test]
-    #[should_panic(expected = "atomic number Z (3) cannot exceed mass number A (2)")]
     fn test_isotope_rejects_z_greater_than_a() {
         // Z > A is a physical impossibility (more protons than nucleons).
-        Isotope::new(3, 2);
+        let err = Isotope::new(3, 2).unwrap_err();
+        assert!(err.to_string().contains("cannot exceed"));
+    }
+
+    #[test]
+    fn test_isotope_rejects_zero_mass_number() {
+        let err = Isotope::new(0, 0).unwrap_err();
+        assert!(err.to_string().contains("must be positive"));
+    }
+
+    #[test]
+    fn test_isotope_valid() {
+        let iso = Isotope::new(92, 238).unwrap();
+        assert_eq!(iso.z(), 92);
+        assert_eq!(iso.a(), 238);
+    }
+
+    #[test]
+    fn test_isotope_neutron() {
+        // Z=0, A=1 is a neutron — valid.
+        let neutron = Isotope::new(0, 1).unwrap();
+        assert_eq!(neutron.z(), 0);
+        assert_eq!(neutron.a(), 1);
     }
 }
 
