@@ -103,6 +103,7 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
                 // the range CONT before the URR SPI/AP/NLS CONT.
                 // ENDF-6 §2.2.2; SAMMY unr/munr01.f90.
                 let nro_urr = range_cont.n1;
+                let naps_urr = range_cont.n2; // scattering radius calculation flag
                 let ap_table_urr = if nro_urr != 0 {
                     let mut tab = parse_tab1(&lines, &mut pos)?;
                     // AP(E) y-values are in 10⁻¹² cm; convert to fm.
@@ -122,8 +123,15 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
                     continue;
                 }
 
-                let urr_range =
-                    parse_urr_range(&lines, &mut pos, lrf, energy_low, energy_high, ap_table_urr)?;
+                let urr_range = parse_urr_range(
+                    &lines,
+                    &mut pos,
+                    lrf,
+                    energy_low,
+                    energy_high,
+                    naps_urr,
+                    ap_table_urr,
+                )?;
                 all_ranges.push(urr_range);
                 continue;
             }
@@ -235,7 +243,9 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
             // A genuine data line has at least one non-zero field in columns 1-66.
             let data_part = if line.len() >= 66 { &line[..66] } else { line };
             !data_part
-                .trim_matches(|c: char| c == '0' || c == '.' || c == '+' || c == ' ' || c == '-')
+                .trim_matches(|c: char| {
+                    matches!(c, '0' | '.' | '+' | ' ' | '-' | 'E' | 'e' | 'D' | 'd')
+                })
                 .is_empty()
         });
         if has_real_data {
@@ -1093,6 +1103,7 @@ fn parse_urr_range(
     lrf: i32,
     energy_low: f64,
     energy_high: f64,
+    naps: i32,
     ap_table: Option<Tab1>,
 ) -> Result<ResonanceRange, EndfParseError> {
     use crate::resonance::{UrrData, UrrJGroup, UrrLGroup};
@@ -1214,7 +1225,7 @@ fn parse_urr_range(
                         formalism: ResonanceFormalism::Unresolved,
                         target_spin: spi,
                         scattering_radius: ap,
-                        naps: 0,
+                        naps,
                         ap_table,
                         l_groups: Vec::new(),
                         rml: None,
@@ -1293,7 +1304,7 @@ fn parse_urr_range(
         formalism: ResonanceFormalism::Unresolved,
         target_spin: spi,
         scattering_radius: ap,
-        naps: 0,
+        naps,
         ap_table,
         l_groups: Vec::new(),
         rml: None,
