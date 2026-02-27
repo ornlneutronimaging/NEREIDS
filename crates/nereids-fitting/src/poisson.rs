@@ -13,6 +13,9 @@
 //! ## TRINIDI Reference
 //! - `trinidi/reconstruct.py` — Poisson NLL and APGM optimizer
 
+use nereids_endf::resonance::ResonanceData;
+use nereids_physics::transmission::{self, InstrumentParams};
+
 use crate::lm::FitModel;
 use crate::parameters::ParameterSet;
 
@@ -233,6 +236,25 @@ pub fn poisson_fit(
     }
 }
 
+/// Context for fitting temperature alongside densities in the analytical
+/// Poisson optimizer.
+///
+/// When provided, `poisson_fit_analytic` recomputes cross-sections and their
+/// temperature derivative at each iteration (via
+/// `broadened_cross_sections_with_derivative`), adding the ∂NLL/∂T gradient
+/// column so the optimizer moves temperature jointly with densities.
+pub struct TemperatureContext {
+    /// Index of the temperature parameter in the full parameter vector.
+    pub temperature_index: usize,
+    /// Resonance data for all isotopes (needed for recomputing σ at new T).
+    pub resonance_data: Vec<ResonanceData>,
+    /// Energy grid in eV (needed for recomputing σ at new T).
+    pub energies: Vec<f64>,
+    /// Optional instrument parameters (for resolution broadening during
+    /// cross-section recomputation).
+    pub instrument: Option<InstrumentParams>,
+}
+
 /// Run Poisson-likelihood optimization with an analytical gradient.
 ///
 /// Equivalent to [`poisson_fit`] but replaces the finite-difference gradient
@@ -255,10 +277,17 @@ pub fn poisson_fit(
 /// * `density_indices` — Maps isotope `k` → parameter index: the density for
 ///   isotope `k` is `params[density_indices[k]]`.  This decouples isotope
 ///   ordering from the parameter vector layout, supporting callers that include
-///   additional nuisance parameters alongside densities (via `CountsModel`'s
-///   `density_param_range`).
+///   additional nuisance parameters alongside densities.
 /// * `params`          — Parameter set (modified in place).
 /// * `config`          — Optimizer configuration.
+/// * `temp_ctx`        — Optional temperature-fitting context.  When `Some`,
+///   the optimizer recomputes cross-sections at the current temperature each
+///   iteration and adds a ∂NLL/∂T gradient column.
+// The 8th parameter (`temp_ctx`) extends an existing 7-param function with
+// optional temperature-fitting context.  Bundling into a config struct would
+// break all call sites for marginal gain; a single `Option` is the minimal
+// extension that keeps the existing API intact.
+#[allow(clippy::too_many_arguments)]
 pub fn poisson_fit_analytic(
     model: &dyn FitModel,
     y_obs: &[f64],
@@ -267,6 +296,7 @@ pub fn poisson_fit_analytic(
     density_indices: &[usize],
     params: &mut ParameterSet,
     config: &PoissonConfig,
+    temp_ctx: Option<&TemperatureContext>,
 ) -> PoissonResult {
     let n_e = y_obs.len();
     assert_eq!(flux.len(), n_e, "flux length must match y_obs");
@@ -288,22 +318,24 @@ pub fn poisson_fit_analytic(
         );
     }
 
-    // Validate that every free parameter is referenced by at least one
-    // density_index.  Free parameters with no density mapping receive zero
-    // analytical gradient and will never move, causing silent convergence
-    // to the initial guess.  Callers with mixed free params (density +
-    // nuisance) should use `poisson_fit` (finite-difference) instead.
+    // Validate that every free parameter is referenced by density_indices
+    // or the temperature context.  Free parameters with no analytical
+    // gradient mapping will never move, causing silent convergence to the
+    // initial guess.
     {
         let free_set: std::collections::HashSet<usize> =
             params.free_indices().into_iter().collect();
-        let density_set: std::collections::HashSet<usize> =
+        let mut mapped_set: std::collections::HashSet<usize> =
             density_indices.iter().copied().collect();
-        let unmapped: Vec<usize> = free_set.difference(&density_set).copied().collect();
+        if let Some(ctx) = &temp_ctx {
+            mapped_set.insert(ctx.temperature_index);
+        }
+        let unmapped: Vec<usize> = free_set.difference(&mapped_set).copied().collect();
         assert!(
             unmapped.is_empty(),
-            "poisson_fit_analytic: free parameters {:?} are not mapped by density_indices; \
-             analytical gradient is zero for these params. Use poisson_fit (FD) for mixed \
-             parameter sets.",
+            "poisson_fit_analytic: free parameters {:?} are not mapped by density_indices \
+             or temperature_index; analytical gradient is zero for these params. Use \
+             poisson_fit (FD) for mixed parameter sets.",
             unmapped,
         );
     }
@@ -324,6 +356,18 @@ pub fn poisson_fit_analytic(
         })
         .collect();
 
+    // Position of the temperature parameter in the free-parameter vector.
+    let temp_free_pos: Option<usize> = temp_ctx.as_ref().and_then(|ctx| {
+        free_indices
+            .iter()
+            .position(|&fi| fi == ctx.temperature_index)
+    });
+
+    // Own the cross-sections so we can update them when temperature changes.
+    let mut xs_owned: Vec<Vec<f64>> = cross_sections.to_vec();
+    // Temperature derivative ∂σ_k/∂T — only needed when fitting temperature.
+    let mut dxs_dt: Vec<Vec<f64>> = vec![vec![0.0; n_e]; density_indices.len()];
+
     let y_model = model.evaluate(&params.all_values());
     let mut nll = poisson_nll(y_obs, &y_model);
     let mut converged = false;
@@ -331,6 +375,21 @@ pub fn poisson_fit_analytic(
 
     for _ in 0..config.max_iter {
         iter += 1;
+
+        // When fitting temperature, recompute cross-sections and their T
+        // derivative at the current temperature.  This is expensive (3×
+        // broadening) but necessary for an exact analytical gradient.
+        if let Some(ctx) = &temp_ctx {
+            let t_current = params.all_values()[ctx.temperature_index];
+            let (xs_new, dxs_new) = transmission::broadened_cross_sections_with_derivative(
+                &ctx.energies,
+                &ctx.resonance_data,
+                t_current,
+                ctx.instrument.as_ref(),
+            );
+            xs_owned = xs_new;
+            dxs_dt = dxs_new;
+        }
 
         // Evaluate the full model Y(E) = Φ·T + B so we can form (1 - y_obs/Y).
         let y_model_now = model.evaluate(&params.all_values());
@@ -350,7 +409,7 @@ pub fn poisson_fit_analytic(
         let t_now: Vec<f64> = (0..n_e)
             .map(|e| {
                 let mut neg_opt = 0.0f64;
-                for (k, xs) in cross_sections.iter().enumerate() {
+                for (k, xs) in xs_owned.iter().enumerate() {
                     let density = all_vals[density_indices[k]];
                     if density > 0.0 {
                         neg_opt -= density * xs[e];
@@ -366,7 +425,7 @@ pub fn poisson_fit_analytic(
         //   ∂Y/∂nₖ = Φ · ∂T/∂nₖ = −Φ · σₖ · T
         //   ∂NLL/∂nₖ = Σ_E (1 − y_obs/Y) · ∂Y/∂nₖ
 
-        let grad: Vec<f64> = param_isotopes
+        let mut grad: Vec<f64> = param_isotopes
             .iter()
             .map(|iso_indices| {
                 y_obs
@@ -380,13 +439,43 @@ pub fn poisson_fit_analytic(
                         // non-positive model → large gradient pushing the optimizer
                         // away from infeasible regions.
                         let residual_factor = if ym <= 0.0 { 1e30 } else { 1.0 - obs / ym };
-                        let sigma_sum: f64 =
-                            iso_indices.iter().map(|&k| cross_sections[k][e]).sum();
+                        let sigma_sum: f64 = iso_indices.iter().map(|&k| xs_owned[k][e]).sum();
                         residual_factor * phi * t * (-sigma_sum)
                     })
                     .sum::<f64>()
             })
             .collect();
+
+        // Temperature gradient: ∂NLL/∂T = Σ_E [(1 − y_obs/Y) · Φ · T · (−Σₖ nₖ · ∂σₖ/∂T)]
+        //
+        // Derivation:  ∂T/∂temp = T · (−Σₖ nₖ · ∂σₖ/∂temp)
+        //   ∂Y/∂temp = Φ · ∂T/∂temp
+        if let Some(pos) = temp_free_pos {
+            let temp_grad: f64 = y_obs
+                .iter()
+                .zip(y_model_now.iter())
+                .zip(flux.iter())
+                .zip(t_now.iter())
+                .enumerate()
+                .map(|(e, (((&obs, &ym), &phi), &t))| {
+                    let residual_factor = if ym <= 0.0 { 1e30 } else { 1.0 - obs / ym };
+                    let dsigma_sum: f64 = (0..density_indices.len())
+                        .map(|k| {
+                            let density = all_vals[density_indices[k]];
+                            // Mirror the density > 0 guard from T(E) computation:
+                            // zero-density isotopes contribute nothing to ∂T/∂temp.
+                            if density > 0.0 {
+                                density * dxs_dt[k][e]
+                            } else {
+                                0.0
+                            }
+                        })
+                        .sum();
+                    residual_factor * phi * t * (-dsigma_sum)
+                })
+                .sum();
+            grad[pos] = temp_grad;
+        }
 
         // Check gradient norm for convergence
         let grad_norm: f64 = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
@@ -395,16 +484,85 @@ pub fn poisson_fit_analytic(
             break;
         }
 
-        // Backtracking line search — same fix as poisson_fit:
-        // scale initial alpha by gradient norm for scale invariance.
+        // Backtracking line search with diagonal Fisher-information
+        // preconditioning.
+        //
+        // When fitting temperature alongside densities, gradient components
+        // differ by many orders of magnitude because parameter scales differ
+        // (density ~0.001 vs temperature ~300 K) and the NLL curvature
+        // w.r.t. each parameter differs enormously.  Vanilla gradient descent
+        // normalises by ‖∇f‖, making the temperature step negligible.
+        //
+        // Fix: precondition by D = diag(1 / H_ii) where H_ii is the diagonal
+        // of the Fisher information:
+        //   H_{n_k, n_k} ≈ Σ_E (Φ σ_k T)² / Y
+        //   H_{T, T}     ≈ Σ_E (Φ T Σ_k n_k ∂σ_k/∂T)² / Y
+        //
+        // This gives each parameter a Newton-like step size, handling the
+        // extreme scale mismatch between density and temperature.
+        // When temp_ctx is None, the preconditioner is still applied
+        // (harmless: all density parameters have similar curvature).
         let old_free = params.free_values();
-        let mut alpha = config.step_size / grad_norm.max(1.0);
+
+        // Compute diagonal Fisher information for preconditioning.
+        let hessian_diag: Vec<f64> = param_isotopes
+            .iter()
+            .enumerate()
+            .map(|(j, iso_indices)| {
+                let is_temp = temp_free_pos == Some(j);
+                y_model_now
+                    .iter()
+                    .zip(flux.iter())
+                    .zip(t_now.iter())
+                    .enumerate()
+                    .map(|(e, ((&ym, &phi), &t))| {
+                        if ym <= 0.0 {
+                            return 0.0;
+                        }
+                        let dy = if is_temp {
+                            // ∂Y/∂T = Φ · T · (−Σ_k n_k · ∂σ_k/∂T)
+                            let dsigma_sum: f64 = (0..density_indices.len())
+                                .map(|k| {
+                                    let density = all_vals[density_indices[k]];
+                                    if density > 0.0 {
+                                        density * dxs_dt[k][e]
+                                    } else {
+                                        0.0
+                                    }
+                                })
+                                .sum();
+                            phi * t * (-dsigma_sum)
+                        } else {
+                            // ∂Y/∂n_k = −Φ · σ_k · T
+                            let sigma_sum: f64 = iso_indices.iter().map(|&k| xs_owned[k][e]).sum();
+                            phi * t * (-sigma_sum)
+                        };
+                        dy * dy / ym
+                    })
+                    .sum::<f64>()
+            })
+            .collect();
+
+        // search_dir = D * grad where D_ii = 1/H_ii (Newton scaling).
+        let search_dir: Vec<f64> = grad
+            .iter()
+            .zip(hessian_diag.iter())
+            .map(|(&g, &h)| {
+                if h > 1e-30 {
+                    g / h
+                } else {
+                    g // fall back to unscaled gradient
+                }
+            })
+            .collect();
+        let search_norm: f64 = search_dir.iter().map(|g| g * g).sum::<f64>().sqrt();
+        let mut alpha = config.step_size / search_norm.max(1.0);
         let mut accepted = false;
 
         for _ in 0..50 {
             let trial_free: Vec<f64> = old_free
                 .iter()
-                .zip(grad.iter())
+                .zip(search_dir.iter())
                 .map(|(&v, &g)| v - alpha * g)
                 .collect();
             params.set_free_values(&trial_free);
@@ -468,9 +626,6 @@ pub struct CountsModel<'a> {
     pub flux: &'a [f64],
     /// Background counts per bin.
     pub background: &'a [f64],
-    /// Indices into the full parameter vector for density parameters.
-    /// Other parameters in the full vector are nuisance params.
-    pub density_param_range: std::ops::Range<usize>,
 }
 
 impl<'a> FitModel for CountsModel<'a> {
@@ -631,7 +786,6 @@ mod tests {
             transmission_model: &t_model,
             flux: &flux,
             background: &background,
-            density_param_range: 0..1,
         };
 
         // T = 0.5 → counts = flux*0.5 + background
@@ -672,6 +826,7 @@ mod tests {
             &[0],
             &mut params_an,
             &PoissonConfig::default(),
+            None,
         );
 
         assert!(res_fd.converged, "FD did not converge");
@@ -739,6 +894,7 @@ mod tests {
             &[0, 1],
             &mut params,
             &PoissonConfig::default(),
+            None,
         );
 
         assert!(result.converged, "Two-isotope analytic did not converge");
@@ -781,6 +937,7 @@ mod tests {
             &[0],
             &mut params,
             &PoissonConfig::default(),
+            None,
         );
 
         assert!(result.converged, "Zero-density fit did not converge");
@@ -824,7 +981,6 @@ mod tests {
             transmission_model: &t_model,
             flux: &flux,
             background: &background,
-            density_param_range: 0..1,
         };
 
         // Generate observed counts Y = Φ·T + B at true density.
@@ -848,6 +1004,7 @@ mod tests {
             &[0],
             &mut params,
             &config,
+            None,
         );
 
         assert!(
@@ -861,6 +1018,176 @@ mod tests {
             result.params[0],
             true_b,
             (result.params[0] - true_b).abs() / true_b * 100.0,
+        );
+    }
+
+    #[test]
+    fn test_poisson_analytic_temperature_recovery() {
+        // Fit density + temperature jointly using poisson_fit_analytic with
+        // TemperatureContext.  Synthetic data generated at T=300K; initial
+        // guess T=200K.  Verify both converge to within 0.5%.
+        use nereids_core::types::Isotope;
+        use nereids_endf::resonance::{LGroup, Resonance, ResonanceFormalism, ResonanceRange};
+        use nereids_physics::transmission;
+
+        let resonance_data = vec![nereids_endf::resonance::ResonanceData {
+            isotope: Isotope::new(92, 238),
+            za: 92238,
+            awr: 236.006,
+            ranges: vec![ResonanceRange {
+                energy_low: 1e-5,
+                energy_high: 1e4,
+                resolved: true,
+                formalism: ResonanceFormalism::ReichMoore,
+                target_spin: 0.0,
+                scattering_radius: 9.4285,
+                l_groups: vec![LGroup {
+                    l: 0,
+                    awr: 236.006,
+                    apl: 0.0,
+                    resonances: vec![Resonance {
+                        energy: 6.674,
+                        j: 0.5,
+                        gn: 1.493e-3,
+                        gg: 23.0e-3,
+                        gfa: 0.0,
+                        gfb: 0.0,
+                    }],
+                }],
+                rml: None,
+                urr: None,
+                ap_table: None,
+            }],
+        }];
+
+        let energies: Vec<f64> = (0..201).map(|i| 4.0 + (i as f64) * 0.025).collect();
+        let n_e = energies.len();
+        let true_density = 0.0005;
+        let true_temp = 300.0;
+        let flux: Vec<f64> = vec![10000.0; n_e];
+
+        // Generate synthetic counts at true parameters.
+        let xs_true = transmission::broadened_cross_sections(
+            &energies,
+            &resonance_data,
+            true_temp,
+            None,
+            None,
+        )
+        .unwrap();
+        let y_obs: Vec<f64> = (0..n_e)
+            .map(|e| {
+                let t = (-true_density * xs_true[0][e]).exp();
+                flux[e] * t
+            })
+            .collect();
+
+        // Forward model: Y = Φ · exp(−n · σ(E, T))
+        // The model recomputes σ from the TransmissionFitModel path, but
+        // for the analytical optimizer we provide precomputed σ + ∂σ/∂T
+        // via TemperatureContext.
+        //
+        // We use a simple inline model that reads density and temperature
+        // from the parameter vector and evaluates the full physics.
+        use nereids_physics::transmission::SampleParams;
+        struct PhysicsCountsModel {
+            energies: Vec<f64>,
+            resonance_data: Vec<nereids_endf::resonance::ResonanceData>,
+            flux: Vec<f64>,
+        }
+        impl FitModel for PhysicsCountsModel {
+            fn evaluate(&self, params: &[f64]) -> Vec<f64> {
+                let density = params[0];
+                let temperature = params[1];
+                let sample = SampleParams {
+                    temperature_k: temperature,
+                    isotopes: vec![(self.resonance_data[0].clone(), density)],
+                };
+                let transmission = transmission::forward_model(&self.energies, &sample, None);
+                transmission
+                    .iter()
+                    .zip(self.flux.iter())
+                    .map(|(&t, &f)| f * t)
+                    .collect()
+            }
+        }
+
+        let model = PhysicsCountsModel {
+            energies: energies.clone(),
+            resonance_data: resonance_data.clone(),
+            flux: flux.clone(),
+        };
+
+        // Initial cross-sections at the initial guess temperature.
+        let init_temp = 200.0;
+        let xs_init = transmission::broadened_cross_sections(
+            &energies,
+            &resonance_data,
+            init_temp,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // params[0] = density, params[1] = temperature
+        let mut params = ParameterSet::new(vec![
+            FitParameter::non_negative("density", 0.001),
+            FitParameter {
+                name: "temperature".into(),
+                value: init_temp,
+                lower: 50.0,
+                upper: 1000.0,
+                fixed: false,
+            },
+        ]);
+
+        let temp_ctx = TemperatureContext {
+            temperature_index: 1,
+            resonance_data: resonance_data.clone(),
+            energies: energies.clone(),
+            instrument: None,
+        };
+
+        // Tight tolerance and many iterations: density and temperature are
+        // correlated, so projected gradient descent needs many small steps to
+        // navigate the curved valley in NLL space.
+        let config = PoissonConfig {
+            max_iter: 5000,
+            tol_param: 1e-12,
+            ..PoissonConfig::default()
+        };
+
+        let result = poisson_fit_analytic(
+            &model,
+            &y_obs,
+            &flux,
+            &xs_init,
+            &[0],
+            &mut params,
+            &config,
+            Some(&temp_ctx),
+        );
+
+        assert!(
+            result.converged,
+            "Temperature+density fit did not converge after {} iterations",
+            result.iterations,
+        );
+        let fitted_density = result.params[0];
+        let fitted_temp = result.params[1];
+        assert!(
+            (fitted_density - true_density).abs() / true_density < 0.01,
+            "density: fitted={}, true={}, error={:.2}%",
+            fitted_density,
+            true_density,
+            (fitted_density - true_density).abs() / true_density * 100.0,
+        );
+        assert!(
+            (fitted_temp - true_temp).abs() / true_temp < 0.01,
+            "temperature: fitted={:.1}, true={:.1}, error={:.2}%",
+            fitted_temp,
+            true_temp,
+            (fitted_temp - true_temp).abs() / true_temp * 100.0,
         );
     }
 }

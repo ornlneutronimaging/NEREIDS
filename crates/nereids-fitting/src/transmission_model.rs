@@ -109,6 +109,12 @@ impl FitModel for PrecomputedTransmissionModel {
 /// Each isotope's resonance data and the energy grid are fixed; only the
 /// areal densities are adjusted during fitting.
 ///
+/// Optionally, the sample temperature can also be fitted by setting
+/// `temperature_index` to the parameter slot holding the temperature value.
+/// When `temperature_index` is `Some(idx)`, the Doppler broadening kernel
+/// is recomputed at `params[idx]` on every `evaluate()` call, and the LM
+/// engine will compute a finite-difference Jacobian column for it.
+///
 /// `instrument` uses `Arc` so that parallel pixel loops (e.g. in `sparse.rs`)
 /// can share one copy of a potentially large tabulated resolution kernel
 /// via cheap reference-count increments instead of deep-cloning per pixel.
@@ -117,17 +123,29 @@ pub struct TransmissionFitModel {
     pub energies: Vec<f64>,
     /// Resonance data for each isotope.
     pub resonance_data: Vec<ResonanceData>,
-    /// Sample temperature in Kelvin.
+    /// Sample temperature in Kelvin (used when `temperature_index` is `None`).
     pub temperature_k: f64,
     /// Optional instrument resolution parameters (Arc-shared for parallel use).
     pub instrument: Option<Arc<InstrumentParams>>,
     /// Index mapping: which `params` indices correspond to areal densities.
     /// params[density_indices[i]] = areal density of isotope i.
     pub density_indices: Vec<usize>,
+    /// If `Some(idx)`, `params[idx]` is treated as the sample temperature (K)
+    /// and included as a free parameter in the fit. The Doppler broadening
+    /// kernel is recomputed at each `evaluate()` call.
+    pub temperature_index: Option<usize>,
 }
 
 impl FitModel for TransmissionFitModel {
     fn evaluate(&self, params: &[f64]) -> Vec<f64> {
+        // Configuration check — not in a hot loop, so use assert! to catch
+        // parameter setup errors in release builds too.
+        assert!(
+            self.temperature_index
+                .is_none_or(|ti| !self.density_indices.contains(&ti)),
+            "temperature_index must not overlap with density_indices"
+        );
+
         let isotopes: Vec<(ResonanceData, f64)> = self
             .resonance_data
             .iter()
@@ -135,8 +153,21 @@ impl FitModel for TransmissionFitModel {
             .map(|(rd, &idx): (&ResonanceData, &usize)| (rd.clone(), params[idx]))
             .collect();
 
+        let temperature_k = match self.temperature_index {
+            Some(idx) => {
+                assert!(
+                    idx < params.len(),
+                    "temperature_index ({}) out of bounds for params of length {}",
+                    idx,
+                    params.len(),
+                );
+                params[idx]
+            }
+            None => self.temperature_k,
+        };
+
         let sample = SampleParams {
-            temperature_k: self.temperature_k,
+            temperature_k,
             isotopes,
         };
 
@@ -315,6 +346,7 @@ mod tests {
             temperature_k: 0.0,
             instrument: None,
             density_indices: vec![0],
+            temperature_index: None,
         };
 
         let y_obs = model.evaluate(&[true_thickness]);
@@ -384,6 +416,7 @@ mod tests {
             temperature_k: 0.0,
             instrument: None,
             density_indices: vec![0, 1],
+            temperature_index: None,
         };
 
         let y_obs = model.evaluate(&[true_t1, true_t2]);
@@ -417,6 +450,136 @@ mod tests {
             fit_t2,
             true_t2,
             (fit_t2 - true_t2).abs() / true_t2 * 100.0,
+        );
+    }
+
+    // ── Temperature fitting ──────────────────────────────────────────────────
+
+    /// Verify that temperature_index makes evaluate() read T from the
+    /// parameter vector instead of the fixed `temperature_k` field.
+    #[test]
+    fn temperature_index_overrides_fixed_temperature() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
+
+        // Model with fixed temperature = 0 K but temperature_index pointing
+        // to params[1].
+        let model = TransmissionFitModel {
+            energies: energies.clone(),
+            resonance_data: vec![data.clone()],
+            temperature_k: 0.0,
+            instrument: None,
+            density_indices: vec![0],
+            temperature_index: Some(1),
+        };
+
+        // Model with fixed temperature = 300 K (no temperature_index).
+        let model_fixed = TransmissionFitModel {
+            energies: energies.clone(),
+            resonance_data: vec![data],
+            temperature_k: 300.0,
+            instrument: None,
+            density_indices: vec![0],
+            temperature_index: None,
+        };
+
+        let density = 0.0005;
+        let y_via_index = model.evaluate(&[density, 300.0]);
+        let y_via_fixed = model_fixed.evaluate(&[density]);
+
+        for (a, b) in y_via_index.iter().zip(y_via_fixed.iter()) {
+            assert!(
+                (a - b).abs() < 1e-12,
+                "temperature_index path disagrees with fixed path: {} vs {}",
+                a,
+                b
+            );
+        }
+    }
+
+    /// Recover temperature from Doppler-broadened synthetic data.
+    ///
+    /// Generates transmission at T_true with known density, then fits both
+    /// density and temperature simultaneously.
+    #[test]
+    fn test_recover_temperature() {
+        let data = u238_single_resonance();
+        let true_density = 0.0005;
+        let true_temp = 300.0; // K
+
+        // Energy grid around the 6.674 eV resonance.
+        let energies: Vec<f64> = (0..401).map(|i| 4.0 + (i as f64) * 0.025).collect();
+
+        // Generate synthetic data at the true temperature.
+        let model = TransmissionFitModel {
+            energies: energies.clone(),
+            resonance_data: vec![data],
+            temperature_k: 0.0, // ignored — temperature_index is set
+            instrument: None,
+            density_indices: vec![0],
+            temperature_index: Some(1), // params[1] = temperature
+        };
+
+        let y_obs = model.evaluate(&[true_density, true_temp]);
+        let sigma = vec![0.005; y_obs.len()];
+
+        // Fit with initial guesses offset from truth.
+        let mut params = ParameterSet::new(vec![
+            FitParameter::non_negative("density", 0.001),
+            FitParameter {
+                name: "temperature_k".into(),
+                value: 200.0, // initial guess 100 K off
+                lower: 1.0,
+                upper: 2000.0,
+                fixed: false,
+            },
+        ]);
+
+        let config = LmConfig {
+            max_iter: 200,
+            ..LmConfig::default()
+        };
+
+        let result = lm::levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &config);
+
+        assert!(
+            result.converged,
+            "Temperature fit did not converge after {} iterations",
+            result.iterations
+        );
+
+        let fit_density = result.params[0];
+        let fit_temp = result.params[1];
+
+        // Noise-free synthetic data: optimizer should converge to within 0.1%.
+        assert!(
+            (fit_density - true_density).abs() / true_density < 0.001,
+            "Density: fitted={}, true={}, error={:.1}%",
+            fit_density,
+            true_density,
+            (fit_density - true_density).abs() / true_density * 100.0,
+        );
+        assert!(
+            (fit_temp - true_temp).abs() / true_temp < 0.001,
+            "Temperature: fitted={:.1} K, true={:.1} K, error={:.1}%",
+            fit_temp,
+            true_temp,
+            (fit_temp - true_temp).abs() / true_temp * 100.0,
+        );
+
+        // Verify uncertainty is reported.
+        let unc = result
+            .uncertainties
+            .expect("uncertainties should be available");
+        assert!(
+            unc.len() == 2,
+            "expected 2 uncertainties, got {}",
+            unc.len()
+        );
+        assert!(
+            unc[1] > 0.0 && unc[1].is_finite(),
+            "temperature uncertainty should be positive and finite, got {}",
+            unc[1]
         );
     }
 }

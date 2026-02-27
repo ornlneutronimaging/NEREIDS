@@ -91,36 +91,43 @@ pub fn spatial_map(
         return empty_result();
     }
 
-    // Use caller-supplied precomputed cross-sections when available; only call
-    // broadened_cross_sections when none are provided.  This lets repeated
-    // spatial_map calls with the same isotopes/energy grid share one precompute
-    // result and avoids redundant Doppler+resolution broadening work.
-    let xs: Arc<Vec<Vec<f64>>> = match config.precomputed_cross_sections.clone() {
-        Some(cached) => cached,
-        None => {
-            let instrument_params = config.resolution.as_ref().map(|r| InstrumentParams {
-                resolution: r.clone(),
-            });
-            // Pass the cancel token so precompute can bail between isotopes.
-            // Returns None if cancelled mid-precompute.
-            let Some(xs) = broadened_cross_sections(
-                &config.energies,
-                &config.resonance_data,
-                config.temperature_k,
-                instrument_params.as_ref(),
-                cancel,
-            ) else {
-                return empty_result();
-            };
-            Arc::new(xs)
-        }
-    };
+    // When temperature is free, cross-sections are recomputed each iteration
+    // inside the forward model, so precomputing here would be wasted work.
+    // Only precompute when temperature is fixed.
+    let fast_config = if config.fit_temperature {
+        config.clone()
+    } else {
+        // Use caller-supplied precomputed cross-sections when available; only call
+        // broadened_cross_sections when none are provided.  This lets repeated
+        // spatial_map calls with the same isotopes/energy grid share one precompute
+        // result and avoids redundant Doppler+resolution broadening work.
+        let xs: Arc<Vec<Vec<f64>>> = match config.precomputed_cross_sections.clone() {
+            Some(cached) => cached,
+            None => {
+                let instrument_params = config.resolution.as_ref().map(|r| InstrumentParams {
+                    resolution: r.clone(),
+                });
+                // Pass the cancel token so precompute can bail between isotopes.
+                // Returns None if cancelled mid-precompute.
+                let Some(xs) = broadened_cross_sections(
+                    &config.energies,
+                    &config.resonance_data,
+                    config.temperature_k,
+                    instrument_params.as_ref(),
+                    cancel,
+                ) else {
+                    return empty_result();
+                };
+                Arc::new(xs)
+            }
+        };
 
-    // Build a config variant with the precomputed cross-sections injected.
-    // fit_spectrum will use PrecomputedTransmissionModel when this field is Some.
-    let fast_config = FitConfig {
-        precomputed_cross_sections: Some(xs),
-        ..config.clone()
+        // Build a config variant with the precomputed cross-sections injected.
+        // fit_spectrum will use PrecomputedTransmissionModel when this field is Some.
+        FitConfig {
+            precomputed_cross_sections: Some(xs),
+            ..config.clone()
+        }
     };
 
     // Fit all pixels in parallel, skipping new work when cancelled
@@ -293,6 +300,7 @@ mod tests {
             temperature_k: 0.0,
             instrument: None,
             density_indices: vec![0],
+            temperature_index: None,
         };
         let spectrum = model.evaluate(&[true_density]);
 
@@ -319,6 +327,7 @@ mod tests {
             initial_densities: vec![0.001],
             lm_config: LmConfig::default(),
             precomputed_cross_sections: None,
+            fit_temperature: false,
         };
 
         let result = spatial_map(&transmission, &uncertainty, &config, None, None);
@@ -355,6 +364,7 @@ mod tests {
             temperature_k: 0.0,
             instrument: None,
             density_indices: vec![0],
+            temperature_index: None,
         };
         let spectrum = model.evaluate(&[0.0005]);
 
@@ -384,6 +394,7 @@ mod tests {
             initial_densities: vec![0.001],
             lm_config: LmConfig::default(),
             precomputed_cross_sections: None,
+            fit_temperature: false,
         };
 
         let result = spatial_map(&transmission, &uncertainty, &config, Some(&dead), None);
@@ -405,6 +416,7 @@ mod tests {
             temperature_k: 0.0,
             instrument: None,
             density_indices: vec![0],
+            temperature_index: None,
         };
         let spectrum = model.evaluate(&[true_density]);
 
@@ -431,6 +443,7 @@ mod tests {
             initial_densities: vec![0.001],
             lm_config: LmConfig::default(),
             precomputed_cross_sections: None,
+            fit_temperature: false,
         };
 
         // Fit a 2×2 ROI

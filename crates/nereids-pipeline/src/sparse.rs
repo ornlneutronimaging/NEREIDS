@@ -292,7 +292,6 @@ pub fn sparse_reconstruct(
                 transmission_model: &t_model,
                 flux: &nuisance.flux,
                 background: &nuisance.background,
-                density_param_range: 0..n_isotopes,
             };
 
             // Fit with Poisson likelihood using analytical gradient.
@@ -326,6 +325,7 @@ pub fn sparse_reconstruct(
                 t_model.density_indices.as_slice(),
                 &mut params,
                 &config.poisson_config,
+                None,
             );
 
             let pixel_result = PixelResult {
@@ -432,6 +432,7 @@ mod tests {
             temperature_k: 0.0,
             instrument: None,
             density_indices: vec![0],
+            temperature_index: None,
         };
         let transmission = t_model.evaluate(&[true_density]);
 
