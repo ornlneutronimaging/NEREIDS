@@ -123,16 +123,15 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
                     continue;
                 }
 
-                let urr_range = parse_urr_range(
-                    &lines,
-                    &mut pos,
-                    lrf,
-                    lfw,
+                let mut urr_ctx = RangeParseContext {
+                    lines: &lines,
+                    pos: &mut pos,
                     energy_low,
                     energy_high,
-                    naps_urr,
-                    ap_table_urr,
-                )?;
+                    naps: naps_urr,
+                    ap_table: ap_table_urr,
+                };
+                let urr_range = parse_urr_range(&mut urr_ctx, lrf, lfw)?;
                 all_ranges.push(urr_range);
                 continue;
             }
@@ -211,33 +210,20 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
                 }
             };
 
+            let mut ctx = RangeParseContext {
+                lines: &lines,
+                pos: &mut pos,
+                energy_low,
+                energy_high,
+                naps,
+                ap_table,
+            };
             let range = match formalism {
-                ResonanceFormalism::MLBW | ResonanceFormalism::SLBW => parse_bw_range(
-                    &lines,
-                    &mut pos,
-                    energy_low,
-                    energy_high,
-                    formalism,
-                    naps,
-                    ap_table,
-                )?,
-                ResonanceFormalism::ReichMoore => parse_reich_moore_range(
-                    &lines,
-                    &mut pos,
-                    energy_low,
-                    energy_high,
-                    naps,
-                    ap_table,
-                )?,
-                ResonanceFormalism::RMatrixLimited => parse_rmatrix_limited_range(
-                    &lines,
-                    &mut pos,
-                    energy_low,
-                    energy_high,
-                    awr,
-                    naps,
-                    ap_table,
-                )?,
+                ResonanceFormalism::MLBW | ResonanceFormalism::SLBW => {
+                    parse_bw_range(&mut ctx, formalism)?
+                }
+                ResonanceFormalism::ReichMoore => parse_reich_moore_range(&mut ctx)?,
+                ResonanceFormalism::RMatrixLimited => parse_rmatrix_limited_range(&mut ctx, awr)?,
                 ResonanceFormalism::Unresolved => {
                     // Unreachable: Unresolved is only assigned in the LRU=2 branch above.
                     unreachable!("Unresolved formalism should not appear in LRU=1 dispatch");
@@ -252,6 +238,12 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
     // The previous character-based heuristic for distinguishing "real data" from
     // SEND/FEND/MEND/TEND records was overly complex — those section-end records
     // use different MF/MT codes and are already excluded by the filter above.
+    //
+    // Assumption: trailing whitespace-only lines that happen to pass the MF/MT
+    // filter (i.e. have " 2" at cols 70-72 and "151" at cols 72-75) would also
+    // trigger this check.  In practice, ENDF files do not contain such lines —
+    // trailing blanks either lack the MF/MT fields entirely or use MF=0/MT=0,
+    // both of which are excluded by the filter in `parse_endf_file2`.
     if pos < lines.len() {
         return Err(EndfParseError::UnsupportedFormat(
             "Multiple materials detected in MF=2/MT=151: unconsumed data lines \
@@ -269,6 +261,20 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
     })
 }
 
+/// Shared context for ENDF range parsers.
+///
+/// Groups the file-position state (`lines`, `pos`) with the fields from the
+/// range CONT record that every range parser needs, eliminating long argument
+/// lists.
+struct RangeParseContext<'a> {
+    lines: &'a [&'a str],
+    pos: &'a mut usize,
+    energy_low: f64,
+    energy_high: f64,
+    naps: i32,
+    ap_table: Option<Tab1>,
+}
+
 /// Parse a Breit-Wigner (SLBW or MLBW) resolved resonance range.
 ///
 /// ENDF-6 File 2, LRF=1:
@@ -278,22 +284,13 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
 ///   - LIST: NRS resonances, each 6 values: ER, AJ, GT, GN, GG, GF
 ///
 /// Reference: ENDF-6 Formats Manual Section 2.2.1.1
-// ENDF range parsers carry file-position state (lines, pos) plus all fields
-// from the range CONT record.  Grouping these into a struct would add
-// indirection without reducing complexity; allow the extra arguments.
-#[allow(clippy::too_many_arguments)]
 fn parse_bw_range(
-    lines: &[&str],
-    pos: &mut usize,
-    energy_low: f64,
-    energy_high: f64,
+    ctx: &mut RangeParseContext<'_>,
     formalism: ResonanceFormalism,
-    naps: i32,
-    ap_table: Option<Tab1>,
 ) -> Result<ResonanceRange, EndfParseError> {
     // CONT: SPI, AP, 0, 0, NLS, 0
     // ENDF AP is in 10⁻¹² cm; convert to fm (×10).
-    let cont = parse_cont(lines, pos)?;
+    let cont = parse_cont(ctx.lines, ctx.pos)?;
     let target_spin = cont.c1;
     let scattering_radius = cont.c2 * ENDF_RADIUS_TO_FM;
     let nls = checked_count(cont.n1, "NLS")?; // number of L-values
@@ -302,7 +299,7 @@ fn parse_bw_range(
 
     for _ in 0..nls {
         // CONT: AWRI, QX, L, LRX, 6*NRS, NRS
-        let l_cont = parse_cont(lines, pos)?;
+        let l_cont = parse_cont(ctx.lines, ctx.pos)?;
         let awr_l = l_cont.c1;
         let qx = l_cont.c2; // Q-value for competitive width (eV)
         // Validate L is non-negative (#123): negative L1 wraps to a huge u32.
@@ -331,7 +328,7 @@ fn parse_bw_range(
         // Each resonance is 6 values on one line (or spanning lines).
         // In ENDF format, LIST records pack 6 values per line.
         let total_values = nrs * 6;
-        let values = parse_list_values(lines, pos, total_values)?;
+        let values = parse_list_values(ctx.lines, ctx.pos, total_values)?;
 
         for i in 0..nrs {
             let base = i * 6;
@@ -357,14 +354,14 @@ fn parse_bw_range(
     }
 
     Ok(ResonanceRange {
-        energy_low,
-        energy_high,
+        energy_low: ctx.energy_low,
+        energy_high: ctx.energy_high,
         resolved: true,
         formalism,
         target_spin,
         scattering_radius,
-        naps,
-        ap_table,
+        naps: ctx.naps,
+        ap_table: ctx.ap_table.take(),
         l_groups,
         rml: None,
         urr: None,
@@ -382,16 +379,11 @@ fn parse_bw_range(
 /// Reference: ENDF-6 Formats Manual Section 2.2.1.2
 /// Reference: SAMMY manual Section 2 (R-matrix theory)
 fn parse_reich_moore_range(
-    lines: &[&str],
-    pos: &mut usize,
-    energy_low: f64,
-    energy_high: f64,
-    naps: i32,
-    ap_table: Option<Tab1>,
+    ctx: &mut RangeParseContext<'_>,
 ) -> Result<ResonanceRange, EndfParseError> {
     // CONT: SPI, AP, 0, 0, NLS, 0
     // ENDF AP is in 10⁻¹² cm; convert to fm (×10).
-    let cont = parse_cont(lines, pos)?;
+    let cont = parse_cont(ctx.lines, ctx.pos)?;
     let target_spin = cont.c1;
     let scattering_radius = cont.c2 * ENDF_RADIUS_TO_FM;
     let nls = checked_count(cont.n1, "NLS")?; // number of L-values
@@ -400,7 +392,7 @@ fn parse_reich_moore_range(
 
     for _ in 0..nls {
         // CONT: AWRI, APL, L, 0, 6*NRS, NRS
-        let l_cont = parse_cont(lines, pos)?;
+        let l_cont = parse_cont(ctx.lines, ctx.pos)?;
         let awr_l = l_cont.c1;
         let apl = l_cont.c2 * ENDF_RADIUS_TO_FM; // L-dependent scattering radius
         // Validate L is non-negative (#123): negative L1 wraps to a huge u32.
@@ -427,7 +419,7 @@ fn parse_reich_moore_range(
 
         // Each resonance is 6 values: ER, AJ, GN, GG, GFA, GFB
         let total_values = nrs * 6;
-        let values = parse_list_values(lines, pos, total_values)?;
+        let values = parse_list_values(ctx.lines, ctx.pos, total_values)?;
 
         for i in 0..nrs {
             let base = i * 6;
@@ -452,14 +444,14 @@ fn parse_reich_moore_range(
     }
 
     Ok(ResonanceRange {
-        energy_low,
-        energy_high,
+        energy_low: ctx.energy_low,
+        energy_high: ctx.energy_high,
         resolved: true,
         formalism: ResonanceFormalism::ReichMoore,
         target_spin,
         scattering_radius,
-        naps,
-        ap_table,
+        naps: ctx.naps,
+        ap_table: ctx.ap_table.take(),
         l_groups,
         rml: None,
         urr: None,
@@ -489,19 +481,13 @@ fn parse_reich_moore_range(
 /// ```
 ///
 /// Reference: ENDF-6 Formats Manual §2.2.1.6; SAMMY rml/mrml01.f
-#[allow(clippy::too_many_arguments)] // see comment on parse_bw_range
 fn parse_rmatrix_limited_range(
-    lines: &[&str],
-    pos: &mut usize,
-    energy_low: f64,
-    energy_high: f64,
+    ctx: &mut RangeParseContext<'_>,
     awr: f64,
-    naps: i32,
-    ap_table: Option<Tab1>,
 ) -> Result<ResonanceRange, EndfParseError> {
     // CONT: [SPI, AP, IFG, KRM, NJS, KRL]
     // ENDF AP is in 10⁻¹² cm; convert to fm (×10).
-    let cont = parse_cont(lines, pos)?;
+    let cont = parse_cont(ctx.lines, ctx.pos)?;
     let target_spin = cont.c1;
     let scattering_radius = cont.c2 * ENDF_RADIUS_TO_FM;
     // IFG (L1): radius unit flag.
@@ -542,9 +528,9 @@ fn parse_rmatrix_limited_range(
     // NPP is authoritative in L1; N2 is nominally equal but can encode a
     // different count in some files (e.g. N2 = 2*NPP).  Always derive from L1.
     // Reference: ENDF-6 Formats Manual §2.2.1.6 Table 2.1.
-    let pp_cont = parse_cont(lines, pos)?;
+    let pp_cont = parse_cont(ctx.lines, ctx.pos)?;
     let npp = checked_count(pp_cont.l1, "NPP")?;
-    let pp_values = parse_list_values(lines, pos, npp * 12)?;
+    let pp_values = parse_list_values(ctx.lines, ctx.pos, npp * 12)?;
 
     let mut particle_pairs = Vec::with_capacity(npp);
     for i in 0..npp {
@@ -590,7 +576,7 @@ fn parse_rmatrix_limited_range(
     for _ in 0..njs {
         // LIST: [AJ, PJ, KBK, KPS, 6*(NCH+1), NCH+1]
         // First 6*(NCH+1) values: header row [0,0,0,0,0,NCH] then NCH×6 channel defs.
-        let sg_cont = parse_cont(lines, pos)?;
+        let sg_cont = parse_cont(ctx.lines, ctx.pos)?;
         let aj = sg_cont.c1;
         let pj = sg_cont.c2; // explicit parity field; may be 0.0 when parity is in sign(AJ)
         let kbk = sg_cont.l1; // background R-matrix flag
@@ -615,7 +601,7 @@ fn parse_rmatrix_limited_range(
         let nch_plus_one = checked_count(sg_cont.n2, "NCH+1")?; // NCH+1
         let nch = nch_plus_one.saturating_sub(1);
 
-        let sg_values = parse_list_values(lines, pos, npl)?;
+        let sg_values = parse_list_values(ctx.lines, ctx.pos, npl)?;
 
         // C3: Validate that the LIST record carries at least 6*(NCH+1) values.
         // NCH is derived from N2 in the LIST header (N2 = NCH+1); the first data row
@@ -677,10 +663,10 @@ fn parse_rmatrix_limited_range(
         // Using hardcoded nch+1 drifts the offset and misreads zeros as energies.
         // Fix: derive stride directly from NPL/NRS; read only NCH widths per row.
         // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f (Scan_File_2 resonance loop).
-        let res_cont = parse_cont(lines, pos)?;
+        let res_cont = parse_cont(ctx.lines, ctx.pos)?;
         let nrs = checked_count(res_cont.n2, "NRS")?;
         let res_npl = checked_count(res_cont.n1, "NPL")?;
-        let res_values = parse_list_values(lines, pos, res_npl)?;
+        let res_values = parse_list_values(ctx.lines, ctx.pos, res_npl)?;
 
         // C4: Validate stride before use — NPL must divide evenly by NRS, and each row
         // must be at least min_stride values wide.
@@ -697,7 +683,7 @@ fn parse_rmatrix_limited_range(
         let stride = if nrs == 0 {
             min_stride // no resonances; stride unused
         } else {
-            if !res_npl.is_multiple_of(nrs) {
+            if res_npl % nrs != 0 {
                 return Err(EndfParseError::UnsupportedFormat(format!(
                     "LRF=7 resonance block NPL={res_npl} is not divisible by NRS={nrs}"
                 )));
@@ -775,7 +761,7 @@ fn parse_rmatrix_limited_range(
         // Reference: OpenScale File2Lrf7.f90 lines 269–298; ENDF-6 §2.2.1.6 Table 2.4.
         if kbk != 0 {
             for _ in 0..nch {
-                skip_background_subrecord(lines, pos)?;
+                skip_background_subrecord(ctx.lines, ctx.pos)?;
             }
         }
 
@@ -787,7 +773,7 @@ fn parse_rmatrix_limited_range(
         // Reference: OpenScale File2Lrf7.f90 lines 301–331; ENDF-6 §2.2.1.6 Table 2.5.
         if kps != 0 {
             for _ in 0..nch {
-                skip_background_subrecord(lines, pos)?;
+                skip_background_subrecord(ctx.lines, ctx.pos)?;
             }
         }
 
@@ -810,14 +796,14 @@ fn parse_rmatrix_limited_range(
     };
 
     Ok(ResonanceRange {
-        energy_low,
-        energy_high,
+        energy_low: ctx.energy_low,
+        energy_high: ctx.energy_high,
         resolved: true,
         formalism: ResonanceFormalism::RMatrixLimited,
         target_spin,
         scattering_radius,
-        naps,
-        ap_table,
+        naps: ctx.naps,
+        ap_table: ctx.ap_table.take(),
         l_groups: Vec::new(),
         rml: Some(Box::new(rml)),
         urr: None,
@@ -842,24 +828,6 @@ fn skip_tab1(lines: &[&str], pos: &mut usize) -> Result<(), EndfParseError> {
     Ok(())
 }
 
-/// Skip an unsupported URR body (CONT + NLS L-groups with their LIST data).
-///
-/// Called when LRU=2 has an LRF value other than 1 or 2 so that the records
-/// for this range are consumed and subsequent ranges can still be parsed.
-///
-/// Structure consumed (ENDF-6 §2.2.2, all LRF variants share this skeleton):
-/// ```text
-/// CONT: SPI, AP, 0, 0, NLS, 0
-/// For each L (NLS times):
-///   CONT: AWRI, 0, L, 0, N1, N2
-///   if N2 > 0  → LRF=1 style: one LIST record of N1 values
-///   if N2 == 0 → LRF=2 style: N1 J-sub-blocks, each = CONT + LIST(N1_j values)
-/// ```
-/// Validate that an ENDF integer count is non-negative and return as `usize`.
-///
-/// Malformed records can contain negative counts which, if cast directly to
-/// `usize`, wrap to huge values and cause OOM panics in `Vec::with_capacity`
-/// or `parse_list_values`.
 /// Maximum sane ENDF count value.
 ///
 /// ENDF files in practice never contain more than ~100k resonances per section.
@@ -868,6 +836,11 @@ fn skip_tab1(lines: &[&str], pos: &mut usize) -> Result<(), EndfParseError> {
 /// protecting against allocation bombs.
 const MAX_ENDF_COUNT: i32 = 1_000_000;
 
+/// Validate that an ENDF integer count is non-negative and return as `usize`.
+///
+/// Malformed records can contain negative counts which, if cast directly to
+/// `usize`, wrap to huge values and cause OOM panics in `Vec::with_capacity`
+/// or `parse_list_values`.
 fn checked_count(value: i32, label: &str) -> Result<usize, EndfParseError> {
     if value < 0 {
         return Err(EndfParseError::UnsupportedFormat(format!(
@@ -882,6 +855,20 @@ fn checked_count(value: i32, label: &str) -> Result<usize, EndfParseError> {
     Ok(value as usize)
 }
 
+/// Skip an unsupported URR body (CONT + NLS L-groups with their LIST data).
+///
+/// Called when LRU=2 has an LRF value other than 1 or 2 (or when LFW=1 is
+/// encountered) so that the records for this range are consumed and subsequent
+/// ranges can still be parsed.
+///
+/// Structure consumed (ENDF-6 §2.2.2, all LRF variants share this skeleton):
+/// ```text
+/// CONT: SPI, AP, 0, 0, NLS, 0
+/// For each L (NLS times):
+///   CONT: AWRI, 0, L, 0, N1, N2
+///   if N2 > 0  -> LRF=1 style: one LIST record of N1 values
+///   if N2 == 0 -> LRF=2 style: N1 J-sub-blocks, each = CONT + LIST(N1_j values)
+/// ```
 fn skip_urr_body(lines: &[&str], pos: &mut usize) -> Result<(), EndfParseError> {
     // CONT: SPI, AP, 0, 0, NLS, 0
     let header = parse_cont(lines, pos)?;
@@ -1158,30 +1145,43 @@ fn parse_endf_int(line: &str, field_index: usize) -> Result<i32, EndfParseError>
 /// ```
 ///
 /// Reference: ENDF-6 Formats Manual §2.2.2; SAMMY `unr/munr03.f90`
-#[allow(clippy::too_many_arguments)] // see comment on parse_bw_range
 fn parse_urr_range(
-    lines: &[&str],
-    pos: &mut usize,
+    ctx: &mut RangeParseContext<'_>,
     lrf: i32,
     lfw: i32,
-    energy_low: f64,
-    energy_high: f64,
-    naps: i32,
-    ap_table: Option<Tab1>,
 ) -> Result<ResonanceRange, EndfParseError> {
     use crate::resonance::{UrrData, UrrJGroup, UrrLGroup};
 
-    // TODO(#123): LFW=1 indicates energy-dependent fission widths in the URR.
-    // For LRF=1/LFW=1, the record layout changes: widths become tabulated
-    // rather than scalar.  Currently this parser only handles the LFW=0 case
-    // (energy-independent fission widths).  When LFW=1 support is added,
-    // branch on `lfw` here to select the correct record layout.
+    // LFW=1 indicates energy-dependent fission widths in the URR.  The
+    // record layout is fundamentally different from LFW=0: fission widths
+    // become tabulated (a full energy grid per J-group) instead of scalar
+    // constants.  Parsing LFW=1 data with the LFW=0 layout silently
+    // produces corrupt resonance parameters.
+    //
+    // Since we do not yet support LFW=1, skip the URR body so that `pos`
+    // advances correctly and return the range with `urr: None`.  The
+    // resolved ranges in the same evaluation remain accessible.
     // Reference: ENDF-6 §2.2.2.1; SAMMY unr/munr01.f90.
-    let _ = lfw;
+    if lfw != 0 {
+        skip_urr_body(ctx.lines, ctx.pos)?;
+        return Ok(ResonanceRange {
+            energy_low: ctx.energy_low,
+            energy_high: ctx.energy_high,
+            resolved: false,
+            formalism: ResonanceFormalism::Unresolved,
+            target_spin: 0.0,
+            scattering_radius: 0.0,
+            naps: ctx.naps,
+            ap_table: ctx.ap_table.take(),
+            l_groups: Vec::new(),
+            rml: None,
+            urr: None,
+        });
+    }
 
     // CONT: SPI, AP, 0, 0, NLS, 0
     // ENDF AP is in 10⁻¹² cm; convert to fm (×10).
-    let spi_cont = parse_cont(lines, pos)?;
+    let spi_cont = parse_cont(ctx.lines, ctx.pos)?;
     let spi = spi_cont.c1;
     let ap = spi_cont.c2 * ENDF_RADIUS_TO_FM; // scattering radius (fm)
     let nls = checked_count(spi_cont.n1, "NLS")?;
@@ -1192,7 +1192,7 @@ fn parse_urr_range(
         // LRF=1: energy-independent widths, one LIST block per L covering all J.
         for _ in 0..nls {
             // CONT: AWRI, 0, L, 0, N1=6*NJS, N2=NJS
-            let l_cont = parse_cont(lines, pos)?;
+            let l_cont = parse_cont(ctx.lines, ctx.pos)?;
             let awri = l_cont.c1;
             if l_cont.l1 < 0 {
                 return Err(EndfParseError::UnsupportedFormat(format!(
@@ -1211,7 +1211,7 @@ fn parse_urr_range(
                 )));
             }
 
-            let values = parse_list_values(lines, pos, n1)?;
+            let values = parse_list_values(ctx.lines, ctx.pos, n1)?;
 
             let mut j_groups = Vec::with_capacity(njs);
             for j_idx in 0..njs {
@@ -1237,7 +1237,7 @@ fn parse_urr_range(
         // LRF=2: energy-dependent width tables, one LIST per (L, J).
         for l_idx in 0..nls {
             // CONT: AWRI, 0, L, 0, NJS, 0
-            let l_cont = parse_cont(lines, pos)?;
+            let l_cont = parse_cont(ctx.lines, ctx.pos)?;
             let awri = l_cont.c1;
             if l_cont.l1 < 0 {
                 return Err(EndfParseError::UnsupportedFormat(format!(
@@ -1248,10 +1248,19 @@ fn parse_urr_range(
             let l = l_cont.l1 as u32;
             let njs = checked_count(l_cont.n1, "NJS")?; // N1 = NJS for LRF=2
 
+            // Zero NJS means no J-groups for this L-value, which is malformed
+            // (ENDF §2.2.2.2 requires at least one J-group per L-group).
+            // Consistent with the LRF=1 path which also rejects NJS=0.
+            if njs == 0 {
+                return Err(EndfParseError::UnsupportedFormat(format!(
+                    "URR LRF=2 L={l}: NJS=0 (at least one J-group required)"
+                )));
+            }
+
             let mut j_groups = Vec::with_capacity(njs);
             for j_idx in 0..njs {
                 // CONT: AJ, 0, INT, 0, N1=6*(NE+1), N2=NE
-                let j_cont = parse_cont(lines, pos)?;
+                let j_cont = parse_cont(ctx.lines, ctx.pos)?;
                 let aj = j_cont.c1;
                 let int_code = j_cont.l1; // interpolation law (L1 field)
                 // Negative INT is a malformed ENDF record, not merely an
@@ -1285,26 +1294,26 @@ fn parse_urr_range(
                 // ENDF-6 §2.2.2.2; SAMMY unr/munr01.f90.
                 if int_code != 2 && int_code != 5 {
                     // Consume this J-block's LIST record.
-                    parse_list_values(lines, pos, n1)?;
+                    parse_list_values(ctx.lines, ctx.pos, n1)?;
                     // Consume any remaining J-blocks in this L-group and
                     // all subsequent L-groups so `pos` is correctly advanced.
-                    skip_remaining_lrf2(lines, pos, njs - (j_idx + 1), nls - (l_idx + 1))?;
+                    skip_remaining_lrf2(ctx.lines, ctx.pos, njs - (j_idx + 1), nls - (l_idx + 1))?;
                     return Ok(ResonanceRange {
-                        energy_low,
-                        energy_high,
+                        energy_low: ctx.energy_low,
+                        energy_high: ctx.energy_high,
                         resolved: false,
                         formalism: ResonanceFormalism::Unresolved,
                         target_spin: spi,
                         scattering_radius: ap,
-                        naps,
-                        ap_table,
+                        naps: ctx.naps,
+                        ap_table: ctx.ap_table.take(),
                         l_groups: Vec::new(),
                         rml: None,
                         urr: None,
                     });
                 }
 
-                let values = parse_list_values(lines, pos, n1)?;
+                let values = parse_list_values(ctx.lines, ctx.pos, n1)?;
 
                 // Row 0 (DOF): [0, 0, 0, AMUN, 0, AMUF]
                 let amun = values[3];
@@ -1351,7 +1360,15 @@ fn parse_urr_range(
                     gn,
                     gg,
                     gf,
-                    int_code: int_code as u32,
+                    int_code: {
+                        // By this point we have verified int_code is 2 or 5
+                        // (the early-return above handles all other values).
+                        debug_assert!(
+                            int_code == 2 || int_code == 5,
+                            "int_code must be 2 or 5, got {int_code}"
+                        );
+                        int_code as u32
+                    },
                 });
             }
 
@@ -1363,20 +1380,20 @@ fn parse_urr_range(
         lrf: lrf as u32,
         spi,
         ap,
-        e_low: energy_low,
-        e_high: energy_high,
+        e_low: ctx.energy_low,
+        e_high: ctx.energy_high,
         l_groups,
     };
 
     Ok(ResonanceRange {
-        energy_low,
-        energy_high,
+        energy_low: ctx.energy_low,
+        energy_high: ctx.energy_high,
         resolved: false,
         formalism: ResonanceFormalism::Unresolved,
         target_spin: spi,
         scattering_radius: ap,
-        naps,
-        ap_table,
+        naps: ctx.naps,
+        ap_table: ctx.ap_table.take(),
         l_groups: Vec::new(),
         rml: None,
         urr: Some(Box::new(urr)),
@@ -1522,6 +1539,13 @@ pub enum EndfParseError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // NOTE: Every ENDF test fixture line must be at least 75 characters long.
+    // The MF/MT filter in `parse_endf_file2` checks `line.len() < 75` and
+    // discards shorter lines.  ENDF lines are exactly 80 characters in the
+    // real format.  If a test fixture line is truncated below 75 chars, it
+    // will be silently dropped and the test will fail with "No MF=2, MT=151
+    // data found" rather than a useful error.
 
     #[test]
     fn test_parse_endf_float_standard() {
