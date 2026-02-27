@@ -443,13 +443,16 @@ fn spin_group_cross_sections(
     let y_inv = match invert_complex_matrix(&y_tilde, nch) {
         Some(inv) => inv,
         None => {
-            // Singular Ỹ matrix — regularize by adding a small epsilon to the
-            // diagonal and retry.  This can happen when channels are near-degenerate
-            // (e.g. two channels at the same threshold).  The epsilon is small enough
-            // not to perturb physics but large enough to lift the singularity.
+            // Singular Ỹ matrix — regularize by adding a small real epsilon to
+            // the diagonal and retry.  This can happen when channels are
+            // near-degenerate (e.g. two channels at the same threshold).
+            // The epsilon is real-only to preserve Hermitian symmetry of the
+            // level matrix; an imaginary perturbation would break unitarity.
+            // The value is small enough not to perturb physics but large
+            // enough to lift the singularity.
             let mut y_reg = y_tilde.clone();
             for (i, row) in y_reg.iter_mut().enumerate().take(nch) {
-                row[i] += Complex64::new(1e-10, 1e-10);
+                row[i] += Complex64::new(1e-10, 0.0);
             }
             match invert_complex_matrix(&y_reg, nch) {
                 Some(inv) => inv,

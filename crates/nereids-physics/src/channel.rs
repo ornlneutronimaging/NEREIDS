@@ -125,14 +125,12 @@ pub fn lab_to_cm_energy(energy_lab: f64, awr: f64) -> f64 {
 /// * `energy_ev` — Neutron energy in eV.
 /// * `awr` — Mass ratio from ENDF.
 pub fn pi_over_k_squared_barns(energy_ev: f64, awr: f64) -> f64 {
-    let k2 = k_squared(energy_ev, awr);
-    // Guard: at E=0 (or negative), k²=0 and π/k² → ∞.  Return a large
-    // but finite value to prevent Infinity from propagating.  1e10 barns
-    // is physically unreachable for any real cross-section and signals
-    // that the caller is evaluating at an unphysical energy.
-    if k2 <= 0.0 {
-        return 1e10;
-    }
+    // Apply a tiny energy floor (1e-20 eV) so that k² is never zero.
+    // This preserves the correct 1/E functional form at very low energies
+    // instead of returning an arbitrary sentinel value that could mislead
+    // a fitting optimizer.
+    let e_safe = energy_ev.max(1e-20);
+    let k2 = k_squared(e_safe, awr);
     // π/k² in fm², convert to barns (1 barn = 100 fm²)
     std::f64::consts::PI / k2 / 100.0
 }
