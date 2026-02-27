@@ -87,6 +87,25 @@ Lessons from review pipeline findings — apply these consistently:
 - **`debug_assert!` for impossible states**: use `obs.is_finite() &&
   obs >= 0.0` pattern — catches both NaN and negative in one assert.
 
+## Execution Model (mandatory)
+
+When implementing fixes or features across multiple issues, crates, or files:
+
+- **ALWAYS use parallel worktrees + concurrent subagents.** Create one
+  worktree per PR/branch, launch Task subagents in parallel (one per
+  worktree), and let them work concurrently.  Never fall back to
+  sequential single-thread editing across multiple issues.
+- **Group related changes into PRs**, not individual commits.  Each PR
+  should map to a coherent scope (e.g., one issue, one crate, one theme).
+- **Launch subagents in a single message** so they run concurrently.
+  Do not serialize what can be parallelized.
+- **Close/comment on GitHub issues in parallel** with implementation work,
+  not sequentially before or after.
+
+This rule exists because sequential editing is slow, error-prone, and
+ignores the tooling we built.  If you catch yourself editing files one by
+one across multiple issues, STOP and switch to the parallel model.
+
 ## Git Workflow
 
 - **origin**: `ornlneutronimaging/NEREIDS` — primary repo, issues, releases,
