@@ -131,12 +131,13 @@ pub fn lab_to_cm_energy(energy_lab: f64, awr: f64) -> f64 {
 /// * `energy_ev` — Neutron energy in eV.
 /// * `awr` — Mass ratio from ENDF.
 pub fn pi_over_k_squared_barns(energy_ev: f64, awr: f64) -> f64 {
-    // Catch negative energies in debug builds: k_squared(-1.0) returns 0.0,
-    // but pi_over_k_squared_barns would silently map -1.0 → 1e-20 via the
+    // Catch non-positive energies in debug builds: k_squared(0.0) returns 0.0,
+    // and pi_over_k_squared_barns would silently map 0.0 → 1e-20 via the
     // floor, producing a finite (wrong) result instead of the expected
-    // infinity/zero. Callers should never pass negative energy here.
+    // infinity/zero. Callers should never pass non-positive energy here.
     //
-    // Note on debug_assert vs assert: this fires only in debug builds.
+    // Note on debug_assert vs assert: the check `energy_ev > 0.0` fires
+    // for both zero and negative energies, but only in debug builds.
     // In release builds, a non-positive energy is silently clamped to 1e-20
     // by the floor below, yielding a large but finite π/k² (~10¹⁸ barns).
     // This is acceptable because:

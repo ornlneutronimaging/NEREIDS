@@ -469,11 +469,9 @@ fn spin_group_cross_sections(
             let mut y_reg = y_tilde.clone();
             for (i, row) in y_reg.iter_mut().enumerate().take(nch) {
                 let diag_norm = row[i].norm();
-                let eps = if diag_norm > 1e-20 {
-                    diag_norm * 1e-10
-                } else {
-                    1e-30
-                };
+                // Relative regularization (1e-10 × diagonal) with an
+                // absolute floor of 1e-30 for near-zero diagonals.
+                let eps = (diag_norm * 1e-10).max(1e-30);
                 row[i] += Complex64::new(eps, 0.0);
             }
             match invert_complex_matrix(&y_reg, nch) {

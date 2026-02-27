@@ -307,9 +307,12 @@ fn interpolate_cross_section(energies: &[f64], cross_sections: &[f64], energy: f
 
     // Binary search for the interval.
     // Use total_cmp-style fallback to avoid panic on NaN comparisons.
-    // Guard: if NaN values exist in the energy grid, the binary search may
-    // return Err(0) (all NaN comparisons report Less), and `0 - 1` would
-    // underflow on usize.  Return the first cross-section as a safe fallback.
+    // With the current comparator (NaNs treated as Ordering::Less), NaN
+    // values in the energy grid are pushed to the right, so Err(0) should
+    // not occur in normal operation. The Err(0) arm is kept as a
+    // defense-in-depth guard: if the NaN guard on `energy` is ever removed
+    // or the comparator behavior changes and Err(0) becomes possible, we
+    // avoid `0 - 1` underflow on usize by returning the first cross-section.
     let idx = match energies
         .binary_search_by(|e| e.partial_cmp(&energy).unwrap_or(std::cmp::Ordering::Less))
     {
@@ -633,8 +636,8 @@ mod tests {
     ///
     /// NOTE: This test exercises the `energy <= energies[0]` boundary path
     /// (1/v extrapolation), *not* the `Err(0)` binary-search guard itself.
-    /// See `test_interpolate_nan_grid_triggers_err0` for a test that
-    /// actually exercises the `Err(0)` path via NaN injection.
+    /// See `test_interpolate_nan_grid_no_panic` for a test that verifies
+    /// no panic occurs when NaN values contaminate the energy grid.
     ///
     /// We test the NaN query guard separately (test_interpolate_nan_energy)
     /// and the duplicate-point guard separately (test_interpolate_duplicate_grid_points).
@@ -675,6 +678,24 @@ mod tests {
         assert!(
             result2.is_finite(),
             "Near-duplicate query should return finite result, got {result2}"
+        );
+
+        // Exercise the `de.abs() < |e0|*EPS + 1e-30` threshold with
+        // near-zero adjacent energies where de is essentially zero
+        // (triggers the absolute 1e-30 floor, not the relative part).
+        let tiny_energies = vec![1e-35, 1e-35 + 1e-50, 1.0];
+        let tiny_xs = vec![100.0, 200.0, 300.0];
+        // Query between the two near-zero points: de ≈ 1e-50 which is
+        // far below the absolute threshold 1e-30, so the guard fires.
+        let result3 = interpolate_cross_section(&tiny_energies, &tiny_xs, 1e-35 + 5e-51);
+        assert!(
+            result3.is_finite(),
+            "Near-zero de should be caught by the absolute threshold, got {result3}"
+        );
+        // Should return s0 (100.0) since the guard short-circuits.
+        assert!(
+            (result3 - 100.0).abs() < 1e-10,
+            "Expected s0=100.0 from the de threshold guard, got {result3}"
         );
     }
 
