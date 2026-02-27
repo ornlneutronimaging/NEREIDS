@@ -10,10 +10,14 @@
 //!
 //!   SNR_peak(c) = max_E |ΔT(E, c)| / σ_noise
 //!
-//! where
-//!   ΔT(E, c) = T(E, n_matrix, n_trace = c·n_matrix) − T(E, n_matrix, 0)
+//! where ΔT is the *signed* transmission difference:
+//!
+//!   ΔT(E, c) = T(E, n_matrix, 0) − T(E, n_matrix, n_trace = c·n_matrix)
 //!
 //! and σ_noise ≈ 1/√I₀ (off-resonance Poisson approximation).
+//!
+//! The stored `delta_t_spectrum` and all derived metrics (peak_delta_t_per_ppm,
+//! peak_snr) use **|ΔT|**, discarding the sign.
 //!
 //! ## Reference
 //!
@@ -73,6 +77,12 @@ fn build_instrument(config: &TraceDetectabilityConfig) -> Option<InstrumentParam
 }
 
 /// Compute the matrix-only baseline transmission.
+///
+/// NOTE: `SampleParams` owns its `ResonanceData`, so we clone here.
+/// For typical ENDF isotopes the data is small (a few KB) and the clone
+/// cost is negligible compared to the cross-section evaluation.  If
+/// `SampleParams` gains `Arc` support in the future, these clones can
+/// be eliminated.
 fn matrix_baseline(
     config: &TraceDetectabilityConfig,
     instrument: Option<&InstrumentParams>,
@@ -103,7 +113,7 @@ fn report_from_baseline(
     };
     let t_combined = transmission::forward_model(config.energies, &sample_combined, instrument);
 
-    // |ΔT| spectrum
+    // |ΔT| spectrum — absolute difference, sign discarded (see module docs).
     let delta_t_spectrum: Vec<f64> = t_matrix
         .iter()
         .zip(t_combined.iter())
@@ -216,6 +226,7 @@ pub fn trace_detectability_survey(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nereids_endf::resonance::{LGroup, Resonance, ResonanceFormalism, ResonanceRange};
     use nereids_endf::retrieval::{EndfLibrary, EndfRetriever, mat_number};
 
     /// Helper: load real ENDF data for a given (Z, A).
@@ -371,6 +382,125 @@ mod tests {
         assert_eq!(
             results[0].0, "Hf-178",
             "Hf-178 should rank highest, got '{}'",
+            results[0].0,
+        );
+    }
+
+    // --- Offline synthetic tests (no network required) ---
+
+    /// Build a minimal single-resonance isotope for offline testing.
+    fn synthetic_isotope(z: u32, a: u32, res_energy: f64, gn: f64, gg: f64) -> ResonanceData {
+        ResonanceData {
+            isotope: nereids_core::types::Isotope::new(z, a),
+            za: z * 1000 + a,
+            awr: a as f64 - 0.009, // approximate
+            ranges: vec![ResonanceRange {
+                energy_low: 1e-5,
+                energy_high: 1e4,
+                resolved: true,
+                formalism: ResonanceFormalism::ReichMoore,
+                target_spin: 0.0,
+                scattering_radius: 6.0,
+                l_groups: vec![LGroup {
+                    l: 0,
+                    awr: a as f64 - 0.009,
+                    apl: 0.0,
+                    resonances: vec![Resonance {
+                        energy: res_energy,
+                        j: 0.5,
+                        gn,
+                        gg,
+                        gfa: 0.0,
+                        gfb: 0.0,
+                    }],
+                }],
+                rml: None,
+                urr: None,
+                ap_table: None,
+            }],
+        }
+    }
+
+    /// Peak selection and SNR computation with synthetic data (offline).
+    #[test]
+    fn test_synthetic_peak_snr() {
+        // Matrix: weak resonance at 20 eV
+        let matrix = synthetic_isotope(74, 182, 20.0, 1e-3, 0.05);
+        // Trace: strong resonance at 8 eV (should dominate the |ΔT| spectrum)
+        let trace = synthetic_isotope(72, 178, 8.0, 0.5, 0.05);
+
+        let energies: Vec<f64> = (0..500).map(|i| 1.0 + (i as f64) * 49.0 / 499.0).collect();
+
+        let config = TraceDetectabilityConfig {
+            matrix: &matrix,
+            matrix_density: 6e-3,
+            energies: &energies,
+            i0: 1000.0,
+            temperature_k: 293.6,
+            resolution: None,
+            snr_threshold: 3.0,
+        };
+
+        let report = trace_detectability(&config, &trace, 1000.0);
+
+        // Basic sanity: spectrum has correct length
+        assert_eq!(report.delta_t_spectrum.len(), energies.len());
+        assert_eq!(report.energies.len(), energies.len());
+
+        // Peak should be near the trace resonance at 8 eV (not the matrix at 20 eV)
+        assert!(
+            report.peak_energy_ev > 5.0 && report.peak_energy_ev < 12.0,
+            "Peak energy should be near 8 eV, got {:.1} eV",
+            report.peak_energy_ev,
+        );
+
+        // With a strong trace resonance at 1000 ppm, SNR should be well above 3
+        assert!(
+            report.peak_snr > 3.0,
+            "Expected detectable (SNR > 3), got SNR={:.2}",
+            report.peak_snr,
+        );
+        assert!(report.detectable);
+
+        // peak_delta_t_per_ppm should be positive and consistent
+        assert!(report.peak_delta_t_per_ppm > 0.0);
+    }
+
+    /// Survey sorting with synthetic isotopes (offline).
+    #[test]
+    fn test_synthetic_survey_sorting() {
+        let matrix = synthetic_isotope(74, 182, 20.0, 1e-3, 0.05);
+        // Strong trace (big resonance at 8 eV)
+        let strong_trace = synthetic_isotope(72, 178, 8.0, 0.5, 0.05);
+        // Weak trace (tiny resonance at 30 eV)
+        let weak_trace = synthetic_isotope(26, 56, 30.0, 1e-5, 0.01);
+
+        let energies: Vec<f64> = (0..500).map(|i| 1.0 + (i as f64) * 49.0 / 499.0).collect();
+
+        let config = TraceDetectabilityConfig {
+            matrix: &matrix,
+            matrix_density: 6e-3,
+            energies: &energies,
+            i0: 1000.0,
+            temperature_k: 293.6,
+            resolution: None,
+            snr_threshold: 3.0,
+        };
+
+        // Pass weak first — survey should reorder by SNR descending
+        let results = trace_detectability_survey(&config, &[weak_trace, strong_trace], 500.0);
+
+        assert_eq!(results.len(), 2);
+        assert!(
+            results[0].1.peak_snr >= results[1].1.peak_snr,
+            "Survey should sort by SNR descending: {:.2} >= {:.2}",
+            results[0].1.peak_snr,
+            results[1].1.peak_snr,
+        );
+        // The strong isotope (Z=72) should rank first
+        assert!(
+            results[0].0.starts_with("Hf"),
+            "Strong trace (Hf) should rank first, got '{}'",
             results[0].0,
         );
     }

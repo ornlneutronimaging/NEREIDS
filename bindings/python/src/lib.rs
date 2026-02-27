@@ -861,6 +861,8 @@ fn validate_gaussian_params(fp: f64, dt: f64, dl: f64) -> PyResult<()> {
 }
 
 /// Validate that an energy grid is finite, positive, and sorted ascending.
+/// Empty grids are accepted (callers that need non-empty should use
+/// `require_non_empty_energy_grid` instead).
 fn validate_energy_grid(e: &[f64]) -> PyResult<()> {
     if e.is_empty() {
         return Ok(());
@@ -883,6 +885,16 @@ fn validate_energy_grid(e: &[f64]) -> PyResult<()> {
         }
     }
     Ok(())
+}
+
+/// Validate that an energy grid is **non-empty**, finite, positive, and sorted.
+fn require_non_empty_energy_grid(e: &[f64]) -> PyResult<()> {
+    if e.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "energies must not be empty",
+        ));
+    }
+    validate_energy_grid(e)
 }
 
 /// Build a `ResolutionFunction` from Python arguments.
@@ -1824,13 +1836,8 @@ fn py_trace_detectability(
     snr_threshold: f64,
 ) -> PyResult<PyTraceDetectabilityReport> {
     let e = energies.as_slice()?;
-    validate_energy_grid(e)?;
+    require_non_empty_energy_grid(e)?;
 
-    if e.is_empty() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "energies must not be empty",
-        ));
-    }
     if matrix_density <= 0.0 || !matrix_density.is_finite() {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "matrix_density must be finite and positive",
@@ -1917,13 +1924,8 @@ fn py_trace_detectability_survey(
     snr_threshold: f64,
 ) -> PyResult<Vec<(String, PyTraceDetectabilityReport)>> {
     let e = energies.as_slice()?;
-    validate_energy_grid(e)?;
+    require_non_empty_energy_grid(e)?;
 
-    if e.is_empty() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "energies must not be empty",
-        ));
-    }
     if matrix_density <= 0.0 || !matrix_density.is_finite() {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "matrix_density must be finite and positive",
