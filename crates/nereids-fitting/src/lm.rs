@@ -324,6 +324,8 @@ pub fn levenberg_marquardt(
 
         // #P1: If the model produces NaN/Inf with all-fixed parameters,
         // return converged=false rather than silently propagating NaN chi².
+        // Covariance/uncertainties are None because the fit did not converge —
+        // an unconverged result has no meaningful covariance to report.
         if !y_model.iter().all(|v| v.is_finite()) {
             return LmResult {
                 chi_squared: f64::NAN,
@@ -331,8 +333,8 @@ pub fn levenberg_marquardt(
                 iterations: 0,
                 converged: false,
                 params: params.all_values(),
-                covariance: Some(vec![]),
-                uncertainties: Some(vec![]),
+                covariance: None,
+                uncertainties: None,
             };
         }
 
