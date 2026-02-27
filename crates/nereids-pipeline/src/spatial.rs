@@ -97,6 +97,11 @@ pub fn spatial_map(
     // entering the expensive precompute + pixel loop.  Per-pixel fit failures
     // are extremely rare once these hold, but without this gate a config bug
     // would be silently swallowed by the filter_map below.
+    if n_energies == 0 {
+        return Err(PipelineError::InvalidParameter(
+            "spectral axis length is zero; at least one energy bin is required".into(),
+        ));
+    }
     if config.resonance_data.is_empty() {
         return Err(PipelineError::InvalidParameter(
             "resonance_data is empty — nothing to fit".into(),
@@ -299,6 +304,11 @@ pub fn fit_roi(
         )));
     }
 
+    if n_energies == 0 {
+        return Err(PipelineError::InvalidParameter(
+            "spectral axis length is zero; at least one energy bin is required".into(),
+        ));
+    }
     if y_range.start >= y_range.end || x_range.start >= x_range.end {
         return Err(PipelineError::InvalidParameter(format!(
             "ROI ranges must be non-empty: y={}..{}, x={}..{}",

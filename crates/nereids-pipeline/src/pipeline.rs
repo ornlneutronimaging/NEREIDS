@@ -89,6 +89,11 @@ pub fn fit_spectrum(
 ) -> Result<SpectrumFitResult, PipelineError> {
     let n_isotopes = config.resonance_data.len();
 
+    if config.energies.is_empty() {
+        return Err(PipelineError::InvalidParameter(
+            "config.energies must be non-empty".into(),
+        ));
+    }
     if config.initial_densities.len() != n_isotopes {
         return Err(PipelineError::ShapeMismatch(format!(
             "initial_densities length ({}) must match resonance_data length ({})",
