@@ -57,17 +57,20 @@ pub fn tof_edges_to_energy(
         ));
     }
 
-    let mut energies: Vec<f64> = tof_edges
-        .iter()
-        .map(|&tof| {
-            let corrected_tof = tof - params.delay_us;
-            if corrected_tof <= 0.0 {
-                f64::INFINITY
-            } else {
-                constants::tof_to_energy(corrected_tof, params.flight_path_m)
-            }
-        })
-        .collect();
+    let mut energies: Vec<f64> = Vec::with_capacity(tof_edges.len());
+    for (i, &tof) in tof_edges.iter().enumerate() {
+        let corrected_tof = tof - params.delay_us;
+        if corrected_tof <= 0.0 {
+            return Err(IoError::InvalidParameter(format!(
+                "TOF edge {:.6} us minus delay {:.6} us is non-positive at index {}",
+                tof, params.delay_us, i
+            )));
+        }
+        energies.push(constants::tof_to_energy(
+            corrected_tof,
+            params.flight_path_m,
+        ));
+    }
 
     // TOF ascending → energy descending. Reverse to get ascending energies.
     energies.reverse();
@@ -101,9 +104,21 @@ pub fn tof_edges_to_energy_centers(
 /// * `tof_min` — Minimum TOF in μs.
 /// * `tof_max` — Maximum TOF in μs.
 /// * `n_bins` — Number of bins (returns n_bins + 1 edges).
-pub fn linspace_tof_edges(tof_min: f64, tof_max: f64, n_bins: usize) -> Vec<f64> {
+///
+/// # Errors
+/// Returns `IoError::InvalidParameter` if `n_bins` is zero or `tof_max <= tof_min`.
+pub fn linspace_tof_edges(tof_min: f64, tof_max: f64, n_bins: usize) -> Result<Vec<f64>, IoError> {
+    if n_bins == 0 {
+        return Err(IoError::InvalidParameter("n_bins must be positive".into()));
+    }
+    if tof_max <= tof_min || tof_max.is_nan() || tof_min.is_nan() {
+        return Err(IoError::InvalidParameter(format!(
+            "tof_max ({}) must be greater than tof_min ({})",
+            tof_max, tof_min
+        )));
+    }
     let dt = (tof_max - tof_min) / n_bins as f64;
-    (0..=n_bins).map(|i| tof_min + i as f64 * dt).collect()
+    Ok((0..=n_bins).map(|i| tof_min + i as f64 * dt).collect())
 }
 
 #[cfg(test)]
@@ -123,7 +138,7 @@ mod tests {
         let tof_high = constants::energy_to_tof(e_low, params.flight_path_m);
         let tof_low = constants::energy_to_tof(e_high, params.flight_path_m);
 
-        let tof_edges = linspace_tof_edges(tof_low, tof_high, 100);
+        let tof_edges = linspace_tof_edges(tof_low, tof_high, 100).unwrap();
         let energy_edges = tof_edges_to_energy(&tof_edges, &params).unwrap();
 
         // After reversing: first energy ≈ e_low, last energy ≈ e_high (ascending)
@@ -208,7 +223,7 @@ mod tests {
 
     #[test]
     fn test_linspace_tof_edges() {
-        let edges = linspace_tof_edges(100.0, 200.0, 5);
+        let edges = linspace_tof_edges(100.0, 200.0, 5).unwrap();
         assert_eq!(edges.len(), 6);
         assert!((edges[0] - 100.0).abs() < 1e-10);
         assert!((edges[5] - 200.0).abs() < 1e-10);

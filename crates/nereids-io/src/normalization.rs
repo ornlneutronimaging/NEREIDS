@@ -75,9 +75,13 @@ pub fn normalize(
         )));
     }
 
-    if params.proton_charge_sample <= 0.0 || params.proton_charge_ob <= 0.0 {
+    if !(params.proton_charge_sample > 0.0
+        && params.proton_charge_sample.is_finite()
+        && params.proton_charge_ob > 0.0
+        && params.proton_charge_ob.is_finite())
+    {
         return Err(IoError::InvalidParameter(
-            "Proton charges must be positive".into(),
+            "Proton charges must be finite and positive".into(),
         ));
     }
 
@@ -101,10 +105,17 @@ pub fn normalize(
                     transmission[[t, y, x]] = t_val;
 
                     // Poisson uncertainty: σ_T/T = √(1/C_s + 1/C_o)
-                    let rel_err = if c_s > 0.0 {
-                        (1.0 / c_s + 1.0 / c_o).sqrt()
+                    // NOTE: When dark_current is provided, this formula is approximate.
+                    // True variance after DC subtraction is Var(C_raw) + Var(DC),
+                    // but we use the subtracted count as the variance estimate.
+                    // This underestimates uncertainty when DC is a significant
+                    // fraction of raw counts.
+                    let rel_err = if c_s < 1.0 {
+                        // For very low counts, use a conservative uncertainty
+                        // equivalent to 0.5 counts (Bayesian prior for Poisson)
+                        (1.0 / 0.5_f64 + 1.0 / c_o.max(0.5)).sqrt()
                     } else {
-                        f64::INFINITY
+                        (1.0 / c_s + 1.0 / c_o.max(1.0)).sqrt()
                     };
                     uncertainty[[t, y, x]] = t_val * rel_err;
                 } else {

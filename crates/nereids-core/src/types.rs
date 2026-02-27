@@ -11,6 +11,13 @@ pub struct Isotope {
 
 impl Isotope {
     pub fn new(z: u32, a: u32) -> Self {
+        debug_assert!(a > 0, "mass number A must be positive");
+        debug_assert!(
+            z <= a,
+            "atomic number Z ({}) cannot exceed mass number A ({})",
+            z,
+            a
+        );
         Self { z, a }
     }
 }
