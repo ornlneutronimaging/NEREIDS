@@ -2047,17 +2047,20 @@ mod tests {
         assert!((res.energy - 6.674).abs() < 1e-6);
     }
 
-    /// Parse the U-233 URR section (LRU=2, LRF=2) from the SAMMY test file tr149.
+    /// Verify that the U-233 ENDF file (SAMMY test tr149) is correctly rejected.
     ///
-    /// Validates the full LRF=2 record structure against the known U-233 file:
-    /// - Two L-groups (L=0, L=1)
-    /// - Two J-groups per L
-    /// - NE=21 energy points per J-group
-    /// - First energy = 600 eV, last ≈ 30 000 eV
+    /// U-233's URR section has LRU=2, LRF=2, **LFW=1** (energy-dependent
+    /// fission widths).  The known file properties:
+    /// - LFW=1 (energy-dependent fission widths), which is unsupported
+    ///
+    /// Since commit e661fa8, LFW!=0 is rejected with a hard error rather than
+    /// silently skipped (the old skip_urr_body assumed LFW=0 record layout and
+    /// would produce corrupt data on LFW=1 files).  This test verifies that
+    /// U-233 is correctly rejected with an `UnsupportedFormat` error.
     ///
     /// Test data: ../SAMMY/SAMMY/sammy/samtry/tr149/t149a.endf (MAT=9222, ZA=92233)
     #[test]
-    fn test_parse_u233_urr_lrf2() {
+    fn test_parse_u233_urr_lfw1_rejected() {
         let endf_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
@@ -2074,77 +2077,11 @@ mod tests {
         }
 
         let text = std::fs::read_to_string(&endf_path).unwrap();
-        let data = parse_endf_file2(&text).expect("U-233 ENDF must parse without error");
-
-        // U-233 has two energy ranges in MAT=9222:
-        //   range 0: LRU=1 (resolved, LRF=3 or LRF=2)
-        //   range 1: LRU=2 (unresolved, LRF=2)
-        let urr_range = data
-            .ranges
-            .iter()
-            .find(|r| r.urr.is_some())
-            .expect("U-233 must have at least one URR range");
-
-        let urr = urr_range.urr.as_ref().unwrap();
-        assert_eq!(urr.lrf, 2, "LRF must be 2 for U-233 URR");
-        assert!((urr.spi - 2.5).abs() < 1e-6, "SPI must be 2.5 for U-233");
-        assert!((urr.e_low - 600.0).abs() < 1.0, "e_low must be ~600 eV");
+        let err = parse_endf_file2(&text).expect_err("U-233 LFW=1 must be rejected");
+        let msg = format!("{err}");
         assert!(
-            (urr.e_high - 30_000.0).abs() < 100.0,
-            "e_high must be ~30 000 eV"
-        );
-
-        assert_eq!(
-            urr.l_groups.len(),
-            2,
-            "U-233 URR must have 2 L-groups (L=0, L=1)"
-        );
-
-        let lg0 = &urr.l_groups[0];
-        assert_eq!(lg0.l, 0, "First L-group must have L=0");
-        assert_eq!(lg0.j_groups.len(), 2, "L=0 must have 2 J-groups");
-
-        let jg0 = &lg0.j_groups[0];
-        assert!((jg0.j - 2.0).abs() < 1e-6, "First J-group must have J=2.0");
-        assert_eq!(
-            jg0.energies.len(),
-            21,
-            "J=2.0 group must have 21 energy points"
-        );
-        assert!(
-            (jg0.energies[0] - 600.0).abs() < 1.0,
-            "First energy must be ~600 eV, got {}",
-            jg0.energies[0]
-        );
-        assert!(
-            jg0.energies[20] > 20_000.0,
-            "Last energy must be >20 000 eV, got {}",
-            jg0.energies[20]
-        );
-
-        // Verify DOF is parsed (AMUN ≥ 1 for neutrons).
-        assert!(jg0.amun >= 1.0, "AMUN must be ≥ 1, got {}", jg0.amun);
-
-        // Verify widths are positive.
-        assert!(jg0.d[0] > 0.0, "Level spacing D must be positive");
-        assert!(jg0.gn[0] > 0.0, "Neutron width GN must be positive");
-        assert!(jg0.gg[0] > 0.0, "Gamma width GG must be positive");
-
-        println!(
-            "U-233 URR parsed: lrf={} spi={} e_low={} e_high={} l_groups={}",
-            urr.lrf,
-            urr.spi,
-            urr.e_low,
-            urr.e_high,
-            urr.l_groups.len()
-        );
-        println!(
-            "  L=0, J=2.0: NE={} energies[0]={:.0} eV, D[0]={:.4} eV, GN[0]={:.4e} eV, GG[0]={:.4e} eV",
-            jg0.energies.len(),
-            jg0.energies[0],
-            jg0.d[0],
-            jg0.gn[0],
-            jg0.gg[0]
+            msg.contains("LFW=1"),
+            "error must mention LFW=1, got: {msg}"
         );
     }
 
