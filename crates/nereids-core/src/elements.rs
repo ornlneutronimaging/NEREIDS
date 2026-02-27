@@ -5,6 +5,7 @@
 //!
 //! Delegates to the `endf-mat` crate for raw lookup data.
 
+use crate::error::NereidsError;
 use crate::types::Isotope;
 
 /// Element symbol lookup by atomic number Z.
@@ -62,14 +63,15 @@ pub fn za_from_isotope(isotope: &Isotope) -> u32 {
     endf_mat::za(isotope.z(), isotope.a())
 }
 
-/// Parse ENDF ZA identifier back to (Z, A).
+/// Parse ENDF ZA identifier back to an [`Isotope`].
 ///
-/// # Panics
-/// Panics if the ZA value produces an invalid isotope (Z > A or A == 0).
-/// This should never happen for well-formed ENDF data.
-pub fn isotope_from_za(za: u32) -> Isotope {
+/// # Errors
+/// Returns `NereidsError::InvalidParameter` when the ZA value produces
+/// an invalid isotope (Z > A, or A == 0 — e.g. ZA = 26000 for natural
+/// iron).  Callers should propagate or handle this gracefully instead of
+/// panicking, since real ENDF files may contain such entries.
+pub fn isotope_from_za(za: u32) -> Result<Isotope, NereidsError> {
     Isotope::new(endf_mat::z_from_za(za), endf_mat::a_from_za(za))
-        .unwrap_or_else(|e| panic!("invalid ZA={}: {}", za, e))
 }
 
 /// Format isotope as standard string, e.g. "U-238".
@@ -110,8 +112,25 @@ mod tests {
         let iso = Isotope::new(92, 238).unwrap();
         let za = za_from_isotope(&iso);
         assert_eq!(za, 92238);
-        let back = isotope_from_za(za);
+        let back = isotope_from_za(za).unwrap();
         assert_eq!(back, iso);
+    }
+
+    #[test]
+    fn test_isotope_from_za_natural_element_returns_error() {
+        // ZA=26000 → Z=26, A=0 (natural iron). A==0 fails validation.
+        let result = isotope_from_za(26000);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("must be positive"));
+    }
+
+    #[test]
+    fn test_isotope_from_za_invalid_z_greater_than_a() {
+        // Contrived ZA where Z > A (malformed data).
+        // ZA=999001 → Z=999, A=1 → Z > A.
+        let result = isotope_from_za(999001);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("cannot exceed"));
     }
 
     #[test]

@@ -71,7 +71,7 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
     let awr = head.c2;
     let nis = head.n1 as usize; // number of isotopes (usually 1)
 
-    let isotope = isotope_from_za(za);
+    let isotope = isotope_from_za(za)?;
     let mut all_ranges = Vec::new();
 
     for _ in 0..nis {
@@ -1364,6 +1364,9 @@ pub enum EndfParseError {
 
     #[error("Unexpected end of file: {0}")]
     UnexpectedEof(String),
+
+    #[error("Invalid isotope: {0}")]
+    InvalidIsotope(#[from] nereids_core::error::NereidsError),
 }
 
 #[cfg(test)]
