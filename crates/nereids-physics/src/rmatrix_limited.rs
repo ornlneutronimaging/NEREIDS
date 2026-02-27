@@ -456,6 +456,16 @@ fn spin_group_cross_sections(
             // 1/L_c ~ 1/P_c can be enormous, but R_cc' is also large, making
             // the net diagonal small).  The relative approach perturbs the
             // matrix by a fraction of its natural scale.
+            //
+            // Per-diagonal (not matrix-norm) regularization is intentional:
+            // each channel's diagonal element lives on its own physical scale
+            // (set by 1/L_c − R_cc), which can differ by orders of magnitude
+            // across channels (e.g. an s-wave elastic channel vs. a high-L
+            // fission channel).  A single matrix-norm epsilon would be
+            // dominated by the largest channel and could either over-perturb
+            // small channels or under-perturb large ones.  Per-diagonal
+            // epsilon ensures each channel is nudged proportionally to its
+            // own scale.
             let mut y_reg = y_tilde.clone();
             for (i, row) in y_reg.iter_mut().enumerate().take(nch) {
                 let diag_norm = row[i].norm();

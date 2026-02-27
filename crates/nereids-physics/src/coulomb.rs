@@ -166,6 +166,10 @@ pub fn coulomb_wave_functions(l: u32, eta: f64, rho: f64) -> Option<(f64, f64, f
             // In nuclear-physics-relevant (η, ρ) regimes, both strategies
             // converge identically; the difference only matters for exotic
             // parameters outside our use cases.
+            //
+            // NOTE: If a future comparison against SAMMY shows a discrepancy
+            // in Coulomb wave functions for extreme parameters, this p_count
+            // reset policy is the first place to check.
             p_count += 1;
             if p_count > 2 {
                 return None; // CF1 failed

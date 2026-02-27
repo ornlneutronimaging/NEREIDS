@@ -81,9 +81,10 @@ pub fn wave_number(energy_ev: f64, awr: f64) -> f64 {
 /// * `e_cm` — Center-of-mass kinetic energy in this channel (eV). Must be ≥ 0.
 /// * `reduced_mass_ratio` — μ = MA·MB/(MA+MB) in neutron mass units.
 pub fn wave_number_from_cm(e_cm: f64, reduced_mass_ratio: f64) -> f64 {
-    // Guard against negative CM energies, which can arise from numerical noise
+    // Guard against non-positive CM energies, which can arise from numerical noise
     // near threshold energies. Zero wave number means no contribution from this channel.
-    if e_cm < 0.0 {
+    // Uses `<= 0.0` to match `k_squared` (line 41), which also catches zero.
+    if e_cm <= 0.0 {
         return 0.0;
     }
     let mn_ev = constants::NEUTRON_MASS_MEV * 1e6; // MeV → eV
@@ -134,6 +135,18 @@ pub fn pi_over_k_squared_barns(energy_ev: f64, awr: f64) -> f64 {
     // but pi_over_k_squared_barns would silently map -1.0 → 1e-20 via the
     // floor, producing a finite (wrong) result instead of the expected
     // infinity/zero. Callers should never pass negative energy here.
+    //
+    // Note on debug_assert vs assert: this fires only in debug builds.
+    // In release builds, a non-positive energy is silently clamped to 1e-20
+    // by the floor below, yielding a large but finite π/k² (~10¹⁸ barns).
+    // This is acceptable because:
+    //   1. All call sites guarantee positive energies (ENDF grids, fitting
+    //      bounds, transmission forward model).
+    //   2. The 1e-20 floor is defense-in-depth: it prevents division by zero
+    //      and NaN propagation without paying for a branch in hot loops.
+    //   3. A full `assert!` would add a branch to the hottest inner loop of
+    //      cross-section evaluation for a condition that cannot occur in
+    //      correct usage.
     debug_assert!(
         energy_ev > 0.0,
         "pi_over_k_squared_barns called with non-positive energy: {energy_ev}"
