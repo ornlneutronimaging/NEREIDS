@@ -1151,7 +1151,7 @@ fn parse_endf_float(line: &str, field_index: usize) -> Result<f64, EndfParseErro
         }
     }
 
-    Err(EndfParseError::InvalidFloat(format!(
+    Err(EndfParseError::InvalidNumber(format!(
         "Cannot parse ENDF float: '{}'",
         field
     )))
@@ -1184,7 +1184,7 @@ fn parse_endf_int(line: &str, field_index: usize) -> Result<i32, EndfParseError>
         return Ok(v as i32);
     }
 
-    Err(EndfParseError::InvalidFloat(format!(
+    Err(EndfParseError::InvalidNumber(format!(
         "Cannot parse ENDF int: '{}'",
         field
     )))
@@ -1576,8 +1576,8 @@ pub enum EndfParseError {
     #[error("Unsupported format: {0}")]
     UnsupportedFormat(String),
 
-    #[error("Invalid float: {0}")]
-    InvalidFloat(String),
+    #[error("Invalid number: {0}")]
+    InvalidNumber(String),
 
     #[error("Unexpected end of file: {0}")]
     UnexpectedEof(String),

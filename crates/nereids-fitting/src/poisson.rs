@@ -16,6 +16,8 @@
 use nereids_endf::resonance::ResonanceData;
 use nereids_physics::transmission::{self, InstrumentParams};
 
+use nereids_core::constants::POISSON_EPSILON;
+
 use crate::lm::FitModel;
 use crate::parameters::ParameterSet;
 
@@ -62,9 +64,6 @@ pub struct PoissonResult {
     /// Final parameter values (all parameters, including fixed).
     pub params: Vec<f64>,
 }
-
-/// Small positive floor for smooth Poisson NLL extrapolation (#109.2).
-const POISSON_EPSILON: f64 = 1e-10;
 
 /// Compute Poisson negative log-likelihood.
 ///
@@ -213,6 +212,81 @@ fn project(params: &mut ParameterSet) {
     }
 }
 
+/// Backtracking line search with Armijo condition.
+///
+/// Both `poisson_fit` (vanilla gradient descent) and `poisson_fit_analytic`
+/// (Fisher-preconditioned descent) share the same line-search loop structure:
+/// try a step, reject NaN/Inf model outputs, check the Armijo sufficient-decrease
+/// condition, and backtrack if needed.
+///
+/// # Arguments
+/// * `model`        — Forward model (maps parameters -> predicted counts).
+/// * `params`       — Parameter set (modified in place on success).
+/// * `y_obs`        — Observed counts.
+/// * `old_free`     — Free parameter values before the step.
+/// * `search_dir`   — Search direction (gradient or preconditioned gradient).
+/// * `initial_alpha`— Initial step size.
+/// * `config`       — Optimizer configuration (backtrack factor, Armijo c).
+/// * `grad`         — Raw gradient (used for Armijo descent computation).
+/// * `nll`          — Current negative log-likelihood.
+///
+/// # Returns
+/// `Some(new_nll)` if a step was accepted, `None` if the line search exhausted
+/// all backtracking attempts without finding an acceptable step.
+// All 9 arguments are genuinely needed: this is an extraction of inline code
+// shared between two callers that differ only in search_dir vs. grad.
+#[allow(clippy::too_many_arguments)]
+fn backtracking_line_search(
+    model: &dyn FitModel,
+    params: &mut ParameterSet,
+    y_obs: &[f64],
+    old_free: &[f64],
+    search_dir: &[f64],
+    initial_alpha: f64,
+    config: &PoissonConfig,
+    grad: &[f64],
+    nll: f64,
+) -> Option<f64> {
+    let mut alpha = initial_alpha;
+    for _ in 0..50 {
+        // Trial step: x_new = project(x - alpha * search_dir)
+        let trial_free: Vec<f64> = old_free
+            .iter()
+            .zip(search_dir.iter())
+            .map(|(&v, &d)| v - alpha * d)
+            .collect();
+        params.set_free_values(&trial_free);
+        project(params);
+
+        let trial_model = model.evaluate(&params.all_values());
+
+        // #113: If the model produced NaN/Inf, reduce step size rather
+        // than accepting a garbage NLL.
+        if trial_model.iter().any(|v| !v.is_finite()) {
+            alpha *= config.backtrack;
+            continue;
+        }
+
+        let trial_nll = poisson_nll(y_obs, &trial_model);
+
+        // Armijo condition: f(x_new) <= f(x) - c * descent
+        let descent = grad
+            .iter()
+            .zip(old_free.iter())
+            .zip(params.free_values().iter())
+            .map(|((&g, &old), &new)| g * (old - new))
+            .sum::<f64>();
+
+        if trial_nll.is_finite() && trial_nll <= nll - config.armijo_c * descent {
+            return Some(trial_nll);
+        }
+
+        // Backtrack
+        alpha *= config.backtrack;
+    }
+    None
+}
+
 /// Run Poisson-likelihood optimization using projected gradient descent.
 ///
 /// Uses backtracking line search with Armijo condition and
@@ -283,52 +357,25 @@ pub fn poisson_fit(
         // step wildly overshoots, and 30 backtracking halvings are not enough to
         // recover—causing the line search to fail even far from the optimum.
         let old_free = params.free_values();
-        let mut alpha = config.step_size / grad_norm.max(1.0);
-        let mut accepted = false;
+        let initial_alpha = config.step_size / grad_norm.max(1.0);
 
-        for _ in 0..50 {
-            // Trial step: x_new = project(x - α·∇f)
-            let trial_free: Vec<f64> = old_free
-                .iter()
-                .zip(grad.iter())
-                .map(|(&v, &g)| v - alpha * g)
-                .collect();
-            params.set_free_values(&trial_free);
-            project(params);
-
-            let trial_model = model.evaluate(&params.all_values());
-
-            // #113: If the model produced NaN/Inf, reduce step size rather
-            // than accepting a garbage NLL.
-            if trial_model.iter().any(|v| !v.is_finite()) {
-                alpha *= config.backtrack;
-                continue;
-            }
-
-            let trial_nll = poisson_nll(y_obs, &trial_model);
-
-            // Armijo condition: f(x_new) <= f(x) - c·α·∇f·d
-            let descent = grad
-                .iter()
-                .zip(old_free.iter())
-                .zip(params.free_values().iter())
-                .map(|((&g, &old), &new)| g * (old - new))
-                .sum::<f64>();
-
-            if trial_nll.is_finite() && trial_nll <= nll - config.armijo_c * descent {
-                nll = trial_nll;
-                accepted = true;
+        match backtracking_line_search(
+            model,
+            params,
+            y_obs,
+            &old_free,
+            &grad,
+            initial_alpha,
+            config,
+            &grad,
+            nll,
+        ) {
+            Some(new_nll) => nll = new_nll,
+            None => {
+                params.set_free_values(&old_free);
+                // Can't improve from this point; stop without claiming convergence.
                 break;
             }
-
-            // Backtrack
-            alpha *= config.backtrack;
-        }
-
-        if !accepted {
-            params.set_free_values(&old_free);
-            // Can't improve from this point; stop without claiming convergence.
-            break;
         }
 
         // Convergence check: step size in parameter space.
@@ -691,47 +738,24 @@ pub fn poisson_fit_analytic(
             })
             .collect();
         let search_norm: f64 = search_dir.iter().map(|g| g * g).sum::<f64>().sqrt();
-        let mut alpha = config.step_size / search_norm.max(1.0);
-        let mut accepted = false;
+        let initial_alpha = config.step_size / search_norm.max(1.0);
 
-        for _ in 0..50 {
-            let trial_free: Vec<f64> = old_free
-                .iter()
-                .zip(search_dir.iter())
-                .map(|(&v, &g)| v - alpha * g)
-                .collect();
-            params.set_free_values(&trial_free);
-            project(params);
-
-            let trial_model = model.evaluate(&params.all_values());
-
-            // #113: If the model produced NaN/Inf, reduce step size.
-            if trial_model.iter().any(|v| !v.is_finite()) {
-                alpha *= config.backtrack;
-                continue;
-            }
-
-            let trial_nll = poisson_nll(y_obs, &trial_model);
-
-            let descent = grad
-                .iter()
-                .zip(old_free.iter())
-                .zip(params.free_values().iter())
-                .map(|((&g, &old), &new)| g * (old - new))
-                .sum::<f64>();
-
-            if trial_nll.is_finite() && trial_nll <= nll - config.armijo_c * descent {
-                nll = trial_nll;
-                accepted = true;
+        match backtracking_line_search(
+            model,
+            params,
+            y_obs,
+            &old_free,
+            &search_dir,
+            initial_alpha,
+            config,
+            &grad,
+            nll,
+        ) {
+            Some(new_nll) => nll = new_nll,
+            None => {
+                params.set_free_values(&old_free);
                 break;
             }
-
-            alpha *= config.backtrack;
-        }
-
-        if !accepted {
-            params.set_free_values(&old_free);
-            break;
         }
 
         // Convergence: parameter displacement (see poisson_fit for rationale).

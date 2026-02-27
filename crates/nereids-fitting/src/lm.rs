@@ -10,6 +10,8 @@
 //! ## SAMMY Reference
 //! - `fit/` module, manual Sec 4 (Bayes equations / generalized least-squares)
 
+use nereids_core::constants::{CROSS_SECTION_FLOOR, QUANTUM_NUMBER_EPS};
+
 use crate::parameters::ParameterSet;
 
 /// #125.4: Maximum damping parameter before the optimizer gives up.
@@ -145,11 +147,11 @@ fn compute_jacobian(
 
         // #112: If the forward step is blocked by an upper bound, try the
         // backward step so the Jacobian column is not frozen at zero.
-        if actual_step.abs() < 1e-30 {
+        if actual_step.abs() < CROSS_SECTION_FLOOR {
             params.params[idx].value = original - step;
             params.params[idx].clamp();
             actual_step = params.params[idx].value - original;
-            if actual_step.abs() < 1e-30 {
+            if actual_step.abs() < CROSS_SECTION_FLOOR {
                 // Truly stuck at a point constraint — skip this parameter.
                 params.params[idx].value = original;
                 continue;
@@ -184,7 +186,7 @@ fn solve_damped_system(a: &[Vec<f64>], b: &[f64], lambda: f64) -> Option<Vec<f64
         for j in 0..n {
             aug[i][j] = a[i][j];
         }
-        aug[i][i] += lambda * a[i][i].max(1e-10); // Ensure non-zero diagonal
+        aug[i][i] += lambda * a[i][i].max(QUANTUM_NUMBER_EPS); // Ensure non-zero diagonal
         aug[i][n] = b[i];
     }
 
@@ -200,7 +202,7 @@ fn solve_damped_system(a: &[Vec<f64>], b: &[f64], lambda: f64) -> Option<Vec<f64
             }
         }
 
-        if max_val < 1e-30 {
+        if max_val < CROSS_SECTION_FLOOR {
             return None; // Singular
         }
 
@@ -256,7 +258,7 @@ fn invert_matrix(a: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
             }
         }
 
-        if max_val < 1e-30 {
+        if max_val < CROSS_SECTION_FLOOR {
             return None;
         }
 
@@ -477,7 +479,7 @@ pub fn levenberg_marquardt(
         if trial_chi2 < chi2 {
             // Accept step — cache y_trial so the next iteration can skip
             // the base evaluate() inside compute_jacobian.
-            let rel_change = (chi2 - trial_chi2) / (chi2 + 1e-30);
+            let rel_change = (chi2 - trial_chi2) / (chi2 + CROSS_SECTION_FLOOR);
             chi2 = trial_chi2;
             residuals = trial_residuals;
             y_current = y_trial;
@@ -490,7 +492,7 @@ pub fn levenberg_marquardt(
             let param_change: f64 = delta
                 .iter()
                 .zip(old_free.iter())
-                .map(|(&d, &v)| (d / (v.abs() + 1e-30)).powi(2))
+                .map(|(&d, &v)| (d / (v.abs() + CROSS_SECTION_FLOOR)).powi(2))
                 .sum::<f64>()
                 .sqrt();
 

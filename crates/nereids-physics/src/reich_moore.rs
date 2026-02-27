@@ -33,7 +33,10 @@
 
 use num_complex::Complex64;
 
-use nereids_endf::resonance::{ResonanceData, ResonanceFormalism, ResonanceRange, Tab1};
+use nereids_core::constants::{CROSS_SECTION_FLOOR, DIVISION_FLOOR, LOG_FLOOR};
+use nereids_endf::resonance::{
+    ResonanceData, ResonanceFormalism, ResonanceRange, Tab1, group_by_j,
+};
 
 use crate::channel;
 use crate::penetrability;
@@ -148,8 +151,7 @@ pub fn cross_sections_at_energy(data: &ResonanceData, energy_ev: f64) -> CrossSe
 
 /// Compute cross-sections over a grid of energies.
 ///
-/// More efficient than calling `cross_sections_at_energy` in a loop because
-/// per-resonance quantities (reduced widths) are computed once.
+/// Convenience wrapper that calls [`cross_sections_at_energy`] for each energy.
 ///
 /// # Arguments
 /// * `data` — Parsed resonance parameters from ENDF.
@@ -353,7 +355,7 @@ fn reich_moore_spin_group(
     // Determine if any resonance has fission widths.
     let has_fission = resonances
         .iter()
-        .any(|r| r.gfa.abs() > 1e-30 || r.gfb.abs() > 1e-30);
+        .any(|r| r.gfa.abs() > CROSS_SECTION_FLOOR || r.gfb.abs() > CROSS_SECTION_FLOOR);
 
     if has_fission {
         // Multi-channel case: neutron + fission channels.
@@ -401,7 +403,7 @@ fn reich_moore_spin_group(
         // so the penetrability must be evaluated at the resonance energy
         // using the channel radius AP(E_r) — not the incident-energy AP(E).
         // For NRO=0 (constant AP) this makes no difference.
-        let p_at_er = if e_r.abs() > 1e-30 {
+        let p_at_er = if e_r.abs() > CROSS_SECTION_FLOOR {
             let radius_at_er = ap_table.map_or(channel_radius, |t| t.evaluate(e_r.abs()));
             let rho_r = channel::rho(e_r.abs(), awr, radius_at_er);
             penetrability::penetrability(l, rho_r)
@@ -409,7 +411,7 @@ fn reich_moore_spin_group(
             p_l // Fallback: use current-energy penetrability
         };
 
-        let gamma_n_reduced_sq = if p_at_er > 1e-30 {
+        let gamma_n_reduced_sq = if p_at_er > CROSS_SECTION_FLOOR {
             gamma_n.abs() / (2.0 * p_at_er)
         } else {
             0.0
@@ -425,7 +427,7 @@ fn reich_moore_spin_group(
         let half_gg = gamma_g / 2.0;
         let denom = de * de + half_gg * half_gg;
 
-        if denom > 1e-50 {
+        if denom > DIVISION_FLOOR {
             // R-matrix contribution:
             // R += γ²_n / (E_n - E - i·Γ_γ/2)
             //    = γ²_n · (E_n - E + i·Γ_γ/2) / denom
@@ -516,7 +518,7 @@ fn reich_moore_with_fission(
     ap_table: Option<&Tab1>,
 ) -> (f64, f64, f64, f64) {
     // Determine number of fission channels (1 or 2).
-    let has_two_fission = resonances.iter().any(|r| r.gfb.abs() > 1e-30);
+    let has_two_fission = resonances.iter().any(|r| r.gfb.abs() > CROSS_SECTION_FLOOR);
     let n_channels = if has_two_fission { 3 } else { 2 }; // neutron + fission(s)
 
     let boundary = 0.0;
@@ -534,7 +536,7 @@ fn reich_moore_with_fission(
 
             // Reduced width amplitudes.
             // Use AP(E_r) for the resonance-energy penetrability (ENDF width convention).
-            let p_at_er = if e_r.abs() > 1e-30 {
+            let p_at_er = if e_r.abs() > CROSS_SECTION_FLOOR {
                 let radius_at_er = ap_table.map_or(channel_radius, |t| t.evaluate(e_r.abs()));
                 let rho_r = channel::rho(e_r.abs(), awr, radius_at_er);
                 penetrability::penetrability(l, rho_r)
@@ -543,7 +545,7 @@ fn reich_moore_with_fission(
             };
 
             // β_n = sqrt(|Γ_n| / (2·P_l(E_r))), sign from Γ_n sign
-            let beta_n = if p_at_er > 1e-30 {
+            let beta_n = if p_at_er > CROSS_SECTION_FLOOR {
                 let sign = if gamma_n >= 0.0 { 1.0 } else { -1.0 };
                 sign * (gamma_n.abs() / (2.0 * p_at_er)).sqrt()
             } else {
@@ -594,7 +596,7 @@ fn reich_moore_with_fission(
         // contribution at this energy (physically: perfect destructive interference
         // or degenerate channel configuration). Return zero cross-sections.
         let det = y_mat[0][0] * y_mat[1][1] - y_mat[0][1] * y_mat[1][0];
-        if det.norm() < 1e-300 {
+        if det.norm() < LOG_FLOOR {
             return (0.0, 0.0, 0.0, 0.0);
         }
         let inv_det = 1.0 / det;
@@ -685,7 +687,7 @@ fn reich_moore_3channel(
         let gamma_fb = res.gfb;
 
         // Use AP(E_r) for the resonance-energy penetrability (ENDF width convention).
-        let p_at_er = if e_r.abs() > 1e-30 {
+        let p_at_er = if e_r.abs() > CROSS_SECTION_FLOOR {
             let radius_at_er = ap_table.map_or(channel_radius, |t| t.evaluate(e_r.abs()));
             let rho_r = channel::rho(e_r.abs(), awr, radius_at_er);
             penetrability::penetrability(l, rho_r)
@@ -693,7 +695,7 @@ fn reich_moore_3channel(
             p_l
         };
 
-        let beta_n = if p_at_er > 1e-30 {
+        let beta_n = if p_at_er > CROSS_SECTION_FLOOR {
             let sign = if gamma_n >= 0.0 { 1.0 } else { -1.0 };
             sign * (gamma_n.abs() / (2.0 * p_at_er)).sqrt()
         } else {
@@ -781,14 +783,14 @@ fn reich_moore_3channel(
 
 /// Invert a 3×3 complex matrix via cofactor expansion.
 ///
-/// Returns `None` if the matrix is singular (|det| < 1e-300), preventing
+/// Returns `None` if the matrix is singular (|det| < LOG_FLOOR), preventing
 /// NaN propagation from 1/det when det ≈ 0.
 fn invert_3x3(m: [[Complex64; 3]; 3]) -> Option<[[Complex64; 3]; 3]> {
     let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
         - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
         + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
 
-    if det.norm() < 1e-300 {
+    if det.norm() < LOG_FLOOR {
         return None; // singular — caller returns zero cross-sections
     }
 
@@ -808,23 +810,7 @@ fn invert_3x3(m: [[Complex64; 3]; 3]) -> Option<[[Complex64; 3]; 3]> {
     Some(result)
 }
 
-/// Group resonances by their J value.
-fn group_by_j(
-    resonances: &[nereids_endf::resonance::Resonance],
-) -> Vec<(f64, Vec<&nereids_endf::resonance::Resonance>)> {
-    let mut groups: Vec<(f64, Vec<&nereids_endf::resonance::Resonance>)> = Vec::new();
-
-    for res in resonances {
-        let j = res.j;
-        if let Some(group) = groups.iter_mut().find(|(gj, _)| (*gj - j).abs() < 1e-10) {
-            group.1.push(res);
-        } else {
-            groups.push((j, vec![res]));
-        }
-    }
-
-    groups
-}
+// group_by_j is defined in nereids_endf::resonance and imported at the top of this file.
 
 #[cfg(test)]
 mod tests {

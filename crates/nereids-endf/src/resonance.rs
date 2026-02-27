@@ -593,6 +593,29 @@ impl ResonanceRange {
     }
 }
 
+/// Group resonances by their total angular momentum J value.
+///
+/// Returns a vector of `(J, resonances)` pairs. Two J values are considered
+/// equal if they differ by less than [`nereids_core::constants::QUANTUM_NUMBER_EPS`].
+///
+/// Used by both the Reich-Moore and SLBW cross-section calculators to iterate
+/// over spin groups within an L-group.
+pub fn group_by_j(resonances: &[Resonance]) -> Vec<(f64, Vec<&Resonance>)> {
+    let mut groups: Vec<(f64, Vec<&Resonance>)> = Vec::new();
+    for res in resonances {
+        let j = res.j;
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|(gj, _)| (*gj - j).abs() < nereids_core::constants::QUANTUM_NUMBER_EPS)
+        {
+            group.1.push(res);
+        } else {
+            groups.push((j, vec![res]));
+        }
+    }
+    groups
+}
+
 impl std::fmt::Display for ResonanceData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
