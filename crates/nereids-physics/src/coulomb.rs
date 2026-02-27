@@ -155,9 +155,17 @@ pub fn coulomb_wave_functions(l: u32, eta: f64, rho: f64) -> Option<(f64, f64, f
         let tk = (pk + pk1) * (xi + ek / pk1);
         d = tk - d * (1.0 + ek * ek);
         if d.abs() <= acch {
-            // D too small — count consecutive small denominators
-            // (SAMMY lines 331–337).  Three or more in a row means
-            // the continued fraction has lost all precision.
+            // D too small — count consecutive small denominators.
+            //
+            // INTENTIONAL DEPARTURE from SAMMY (coulomb/mrml08.f90 lines 331–337):
+            // SAMMY uses a cumulative counter Pcount that increments on every
+            // small denominator and never resets, bailing out after 2 total.
+            // We reset on healthy denominators, counting *consecutive* small
+            // denominators instead.  This is more lenient: a single healthy
+            // denominator between two small ones does not trigger failure.
+            // In nuclear-physics-relevant (η, ρ) regimes, both strategies
+            // converge identically; the difference only matters for exotic
+            // parameters outside our use cases.
             p_count += 1;
             if p_count > 2 {
                 return None; // CF1 failed
@@ -506,6 +514,41 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Coulomb penetrability fallback at η = 0: when ρ is too small for
+    /// the CF1+CF2 algorithm (ρ ≤ acch ≈ 1e-8), the code falls back to
+    /// hard-sphere penetrability for η = 0 (neutral channels).
+    /// Verify the fallback produces the correct hard-sphere result.
+    #[test]
+    fn coulomb_penetrability_fallback_eta_zero() {
+        // ρ = 1e-10 is below acch (≈ 1e-8), so coulomb_wave_functions
+        // returns None.  The fallback for η ≈ 0 should use hard-sphere.
+        let rho_tiny = 1e-10;
+        for &l in &[0u32, 1, 2] {
+            let p_coulomb = coulomb_penetrability(l, 0.0, rho_tiny);
+            let p_hard = penetrability::penetrability(l, rho_tiny);
+            assert!(
+                (p_coulomb - p_hard).abs() < 1e-30 + 1e-6 * p_hard,
+                "Fallback mismatch at L={l}, ρ={rho_tiny}: Coulomb={p_coulomb}, hard-sphere={p_hard}"
+            );
+        }
+    }
+
+    /// Coulomb penetrability for charged particles at tiny ρ (below acch):
+    /// should return 0.0 (Coulomb barrier suppresses penetrability), NOT
+    /// the hard-sphere fallback.
+    #[test]
+    fn coulomb_penetrability_charged_tiny_rho_returns_zero() {
+        let rho_tiny = 1e-10;
+        let eta = 5.0; // charged channel
+        for &l in &[0u32, 1, 2] {
+            let p = coulomb_penetrability(l, eta, rho_tiny);
+            assert_eq!(
+                p, 0.0,
+                "Charged channel at tiny ρ should have P=0, got {p} at L={l}"
+            );
         }
     }
 }

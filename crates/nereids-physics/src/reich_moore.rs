@@ -1137,4 +1137,98 @@ mod tests {
             xs_peak.capture
         );
     }
+
+    /// Singular Y-matrix guard: when the R-matrix contribution nearly
+    /// cancels the L⁻¹ diagonal at a resonance energy, Y ≈ 0 and
+    /// Y⁻¹ diverges.  The cross-sections must remain finite and
+    /// non-negative (no NaN or Inf propagation).
+    ///
+    /// We construct a scenario where evaluation occurs exactly at E_r,
+    /// maximizing the R-matrix contribution.  With a very narrow
+    /// resonance (small Γ_γ), the imaginary denominator is tiny and
+    /// the R-matrix peak is enormous, stressing the Y inversion.
+    #[test]
+    fn test_reich_moore_singular_y_matrix_guard() {
+        // Very narrow resonance: Γ_γ = 1e-6 eV makes R huge at E = E_r.
+        let data = make_single_resonance_data(
+            10.0,    // E_r
+            1.0e-3,  // Γ_n (eV)
+            1.0e-6,  // Γ_γ (very small → large R at resonance)
+            0.5,     // J
+            0,       // L
+            236.006, // AWR
+            0.0,     // target spin
+            9.4285,  // radius
+        );
+
+        // Evaluate exactly at E_r where R is maximized.
+        let xs = cross_sections_at_energy(&data, 10.0);
+        assert!(
+            xs.total.is_finite() && xs.total >= 0.0,
+            "Total must be finite and non-negative at resonance peak, got {}",
+            xs.total
+        );
+        assert!(
+            xs.elastic.is_finite() && xs.elastic >= 0.0,
+            "Elastic must be finite and non-negative, got {}",
+            xs.elastic
+        );
+        assert!(
+            xs.capture.is_finite(),
+            "Capture must be finite, got {}",
+            xs.capture
+        );
+    }
+
+    /// Reich-Moore 2-channel (fission) with a singular det guard:
+    /// when both fission and neutron widths are tiny, the 2x2 Y-matrix
+    /// determinant can be near zero.  Results must be finite.
+    #[test]
+    fn test_reich_moore_fission_near_singular() {
+        let data = ResonanceData {
+            isotope: nereids_core::types::Isotope::new(94, 239).unwrap(),
+            za: 94239,
+            awr: 236.998,
+            ranges: vec![ResonanceRange {
+                energy_low: 1e-5,
+                energy_high: 1e4,
+                resolved: true,
+                formalism: ResonanceFormalism::ReichMoore,
+                target_spin: 0.5,
+                scattering_radius: 9.41,
+                naps: 0,
+                l_groups: vec![LGroup {
+                    l: 0,
+                    awr: 236.998,
+                    apl: 0.0,
+                    qx: 0.0,
+                    lrx: 0,
+                    resonances: vec![Resonance {
+                        energy: 10.0,
+                        j: 1.0,
+                        gn: 1.0e-8,  // very small neutron width
+                        gg: 1.0e-8,  // very small capture width
+                        gfa: 1.0e-8, // very small fission width
+                        gfb: 0.0,
+                    }],
+                }],
+                rml: None,
+                ap_table: None,
+                urr: None,
+            }],
+        };
+
+        // Evaluate at the resonance energy.
+        let xs = cross_sections_at_energy(&data, 10.0);
+        assert!(
+            xs.total.is_finite() && xs.total >= 0.0,
+            "Total must be finite, got {}",
+            xs.total
+        );
+        assert!(
+            xs.fission.is_finite() && xs.fission >= 0.0,
+            "Fission must be finite and non-negative, got {}",
+            xs.fission
+        );
+    }
 }

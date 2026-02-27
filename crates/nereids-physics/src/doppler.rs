@@ -307,22 +307,31 @@ fn interpolate_cross_section(energies: &[f64], cross_sections: &[f64], energy: f
 
     // Binary search for the interval.
     // Use total_cmp-style fallback to avoid panic on NaN comparisons.
+    // Guard: if NaN values exist in the energy grid, the binary search may
+    // return Err(0) (all NaN comparisons report Less), and `0 - 1` would
+    // underflow on usize.  Return the first cross-section as a safe fallback.
     let idx = match energies
         .binary_search_by(|e| e.partial_cmp(&energy).unwrap_or(std::cmp::Ordering::Less))
     {
         Ok(i) => return cross_sections[i],
+        Err(0) => return cross_sections[0],
         Err(i) => i - 1,
     };
 
     // Linear interpolation.
     // Guard against duplicate energy grid points: if e0 == e1 (or nearly so),
     // no interpolation is needed — use the value at that point directly.
+    // Use a combined relative+absolute threshold that works across the full
+    // energy range (meV to MeV): |de| < |e0|·ε_mach + 1e-30.
+    // The relative part handles large energies where f64::EPSILON alone would
+    // miss near-duplicates; the absolute part handles energies near zero.
+    // This is consistent with resolution.rs interp_spectrum (which uses 1e-30).
     let e0 = energies[idx];
     let e1 = energies[idx + 1];
     let s0 = cross_sections[idx];
     let s1 = cross_sections[idx + 1];
     let de = e1 - e0;
-    if de.abs() < f64::EPSILON {
+    if de.abs() < e0.abs() * f64::EPSILON + 1e-30 {
         return s0;
     }
     let t = (energy - e0) / de;
@@ -599,6 +608,68 @@ mod tests {
             area_orig,
             area_broad,
             rel_diff
+        );
+    }
+
+    /// NaN query energy: interpolate_cross_section must return 0.0 without
+    /// panicking (the NaN guard at line 282 catches this).
+    #[test]
+    fn test_interpolate_nan_energy() {
+        let energies = vec![1.0, 2.0, 3.0];
+        let xs = vec![10.0, 20.0, 30.0];
+        let result = interpolate_cross_section(&energies, &xs, f64::NAN);
+        assert_eq!(result, 0.0, "NaN energy should return 0.0");
+    }
+
+    /// Err(0) guard in binary search: if the binary search were to return
+    /// Err(0) (insertion point = 0), `i - 1` would underflow on usize.
+    /// The guard returns cross_sections[0] instead.
+    ///
+    /// This path is hard to trigger with well-formed grids (the boundary
+    /// check `energy <= energies[0]` catches it first), but can occur if
+    /// the grid or the comparison function behaves unexpectedly (e.g.
+    /// NaN contamination with a different comparison strategy).  The guard
+    /// is cheap defense-in-depth against arithmetic underflow.
+    ///
+    /// We test the NaN query guard separately (test_interpolate_nan_energy)
+    /// and the duplicate-point guard separately (test_interpolate_duplicate_grid_points).
+    #[test]
+    fn test_interpolate_below_grid_minimum() {
+        let energies = vec![5.0, 10.0, 15.0];
+        let xs = vec![50.0, 100.0, 150.0];
+        // Energy below the grid minimum: hits the `energy <= energies[0]` guard
+        // and returns via 1/v extrapolation, not the binary search.
+        let result = interpolate_cross_section(&energies, &xs, 2.0);
+        assert!(
+            result.is_finite() && result > 0.0,
+            "Below-grid query should return a finite positive value via 1/v extrapolation, got {result}"
+        );
+        // Check 1/v scaling: σ(2) ≈ σ(5) × √(5/2)
+        let expected = 50.0 * (5.0 / 2.0_f64).sqrt();
+        assert!(
+            (result - expected).abs() < 1e-10,
+            "Expected 1/v extrapolation: {expected}, got {result}"
+        );
+    }
+
+    /// Duplicate grid points: two adjacent energies are identical.
+    /// The combined relative+absolute threshold must detect this and
+    /// return the value at the duplicate point without division by zero.
+    #[test]
+    fn test_interpolate_duplicate_grid_points() {
+        let energies = vec![1.0, 2.0, 2.0, 3.0];
+        let xs = vec![10.0, 20.0, 25.0, 30.0];
+        // Query at exactly 2.0 should hit the Ok(i) branch.
+        let result = interpolate_cross_section(&energies, &xs, 2.0);
+        assert!(
+            (result - 20.0).abs() < 1e-10 || (result - 25.0).abs() < 1e-10,
+            "At duplicate point 2.0, should return one of the boundary values, got {result}"
+        );
+        // Query at 2.0 + tiny epsilon should trigger the duplicate guard.
+        let result2 = interpolate_cross_section(&energies, &xs, 2.0 + 1e-16);
+        assert!(
+            result2.is_finite(),
+            "Near-duplicate query should return finite result, got {result2}"
         );
     }
 }

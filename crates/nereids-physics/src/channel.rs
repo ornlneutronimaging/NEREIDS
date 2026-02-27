@@ -130,6 +130,14 @@ pub fn lab_to_cm_energy(energy_lab: f64, awr: f64) -> f64 {
 /// * `energy_ev` — Neutron energy in eV.
 /// * `awr` — Mass ratio from ENDF.
 pub fn pi_over_k_squared_barns(energy_ev: f64, awr: f64) -> f64 {
+    // Catch negative energies in debug builds: k_squared(-1.0) returns 0.0,
+    // but pi_over_k_squared_barns would silently map -1.0 → 1e-20 via the
+    // floor, producing a finite (wrong) result instead of the expected
+    // infinity/zero. Callers should never pass negative energy here.
+    debug_assert!(
+        energy_ev > 0.0,
+        "pi_over_k_squared_barns called with non-positive energy: {energy_ev}"
+    );
     // Apply a tiny energy floor (1e-20 eV) so that k² is never zero.
     // This preserves the correct 1/E functional form at very low energies
     // instead of returning an arbitrary sentinel value that could mislead
@@ -190,5 +198,27 @@ mod tests {
             "π/k² = {} barns, expected ~9.86e4",
             val
         );
+    }
+
+    /// k_squared must return 0.0 for negative energies (guard path).
+    /// Negative E_r can appear for bound-state resonances in ENDF; the guard
+    /// prevents a negative k² from propagating NaN through sqrt downstream.
+    #[test]
+    fn test_k_squared_negative_energy() {
+        assert_eq!(k_squared(-1.0, 236.006), 0.0);
+        assert_eq!(k_squared(-100.0, 10.0), 0.0);
+        assert_eq!(k_squared(0.0, 236.006), 0.0);
+    }
+
+    /// wave_number_from_cm must return 0.0 for negative CM energies.
+    /// Negative E_cm arises near threshold energies from numerical noise.
+    #[test]
+    fn test_wave_number_from_cm_negative_energy() {
+        assert_eq!(wave_number_from_cm(-1.0, 0.5), 0.0);
+        assert_eq!(wave_number_from_cm(-1e-10, 0.9412), 0.0);
+        // Zero CM energy → zero wave number
+        assert_eq!(wave_number_from_cm(0.0, 0.5), 0.0);
+        // Positive CM energy → positive wave number
+        assert!(wave_number_from_cm(1.0, 0.5) > 0.0);
     }
 }
