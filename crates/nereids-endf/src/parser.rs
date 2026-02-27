@@ -151,6 +151,21 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
                 // malformed and would cause the parser to look for L-groups that
                 // don't exist, misaligning the cursor for subsequent ranges.
                 let spi_cont = parse_cont(&lines, &mut pos)?;
+                // ENDF-6 §2.2: the SPI/AP CONT is [SPI, AP, 0, 0, NLS=0, 0].
+                // Validate that L1 and L2 are both zero — non-zero values
+                // indicate a malformed or mis-identified record.
+                if spi_cont.l1 != 0 {
+                    return Err(EndfParseError::UnsupportedFormat(format!(
+                        "LRU=0 range: L1={} in SPI/AP CONT record must be 0",
+                        spi_cont.l1
+                    )));
+                }
+                if spi_cont.l2 != 0 {
+                    return Err(EndfParseError::UnsupportedFormat(format!(
+                        "LRU=0 range: L2={} in SPI/AP CONT record must be 0",
+                        spi_cont.l2
+                    )));
+                }
                 if spi_cont.n1 != 0 {
                     return Err(EndfParseError::UnsupportedFormat(format!(
                         "LRU=0 range: NLS={} in SPI/AP CONT record must be 0 \
@@ -1155,28 +1170,18 @@ fn parse_urr_range(
     // LFW=1 indicates energy-dependent fission widths in the URR.  The
     // record layout is fundamentally different from LFW=0: fission widths
     // become tabulated (a full energy grid per J-group) instead of scalar
-    // constants.  Parsing LFW=1 data with the LFW=0 layout silently
-    // produces corrupt resonance parameters.
+    // constants.  Parsing LFW=1 data with the LFW=0 layout would silently
+    // produce corrupt resonance parameters because `skip_urr_body` assumes
+    // the LFW=0 record structure.
     //
-    // Since we do not yet support LFW=1, skip the URR body so that `pos`
-    // advances correctly and return the range with `urr: None`.  The
-    // resolved ranges in the same evaluation remain accessible.
+    // Return a hard error instead of attempting to skip — a misaligned
+    // cursor is worse than a clear failure.
     // Reference: ENDF-6 §2.2.2.1; SAMMY unr/munr01.f90.
     if lfw != 0 {
-        skip_urr_body(ctx.lines, ctx.pos)?;
-        return Ok(ResonanceRange {
-            energy_low: ctx.energy_low,
-            energy_high: ctx.energy_high,
-            resolved: false,
-            formalism: ResonanceFormalism::Unresolved,
-            target_spin: 0.0,
-            scattering_radius: 0.0,
-            naps: ctx.naps,
-            ap_table: ctx.ap_table.take(),
-            l_groups: Vec::new(),
-            rml: None,
-            urr: None,
-        });
+        return Err(EndfParseError::UnsupportedFormat(format!(
+            "LFW={lfw} (energy-dependent fission widths) in URR range is not supported; \
+             only LFW=0 (energy-independent fission widths) is implemented"
+        )));
     }
 
     // CONT: SPI, AP, 0, 0, NLS, 0
@@ -2344,6 +2349,55 @@ mod tests {
         assert!(
             err.to_string().contains("NLS=3"),
             "expected LRU=0 NLS validation error, got: {err}"
+        );
+    }
+
+    /// LFW!=0 (energy-dependent fission widths) in URR is rejected.
+    ///
+    /// ENDF-6 §2.2.2: LFW=1 uses a fundamentally different record layout
+    /// than LFW=0.  Since we don't support it, the parser must return a
+    /// hard error rather than attempting to skip the URR body (which would
+    /// misalign the cursor).
+    #[test]
+    fn test_lfw_nonzero_rejected() {
+        const ENDF: &str = concat!(
+            // HEAD: ZA=92233, AWR=231.038, NIS=1
+            " 9.223300+4 2.310380+2          0          0          1          09222 2151    1\n",
+            // Isotope CONT: ZAI=92233, ABN=1.0, LFW=1 (energy-dependent fission widths), NER=1
+            " 9.223300+4 1.000000+0          0          1          1          09222 2151    2\n",
+            // Range CONT: EL=600, EH=3e4, LRU=2, LRF=1, NRO=0, NAPS=0
+            " 6.000000+2 3.000000+4          2          1          0          09222 2151    3\n",
+        );
+
+        let err = parse_endf_file2(ENDF).unwrap_err();
+        assert!(
+            err.to_string().contains("LFW=1"),
+            "expected LFW!=0 unsupported error, got: {err}"
+        );
+    }
+
+    /// LRU=0 range with non-zero L1 in SPI/AP CONT is rejected.
+    ///
+    /// ENDF-6 §2.2: the SPI/AP CONT record for LRU=0 must be
+    /// [SPI, AP, 0, 0, NLS=0, 0].  Non-zero L1 or L2 indicates a
+    /// malformed or mis-identified record.
+    #[test]
+    fn test_lru0_nonzero_l1_rejected() {
+        const ENDF: &str = concat!(
+            // HEAD: ZA=92238, AWR=236, NIS=1
+            " 9.223800+4 2.360000+2          0          0          1          09237 2151    1\n",
+            // Isotope CONT: NER=1
+            " 9.223800+4 1.000000+0          0          0          1          09237 2151    2\n",
+            // Range CONT: LRU=0 (scattering-radius-only), LRF=0, NRO=0, NAPS=0
+            " 1.000000-5 1.000000+4          0          0          0          09237 2151    3\n",
+            // SPI/AP CONT: SPI=0, AP=9.4, L1=5 (invalid!), L2=0, NLS=0, N2=0
+            " 0.000000+0 9.400000-1          5          0          0          09237 2151    4\n",
+        );
+
+        let err = parse_endf_file2(ENDF).unwrap_err();
+        assert!(
+            err.to_string().contains("L1=5"),
+            "expected LRU=0 L1 validation error, got: {err}"
         );
     }
 
