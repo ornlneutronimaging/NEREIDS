@@ -2,11 +2,12 @@
 
 ## Pre-Commit Checklist (mandatory before every commit)
 
-Always run these two commands and fix all output before committing:
+Always run these three commands and fix all output before committing:
 
 ```
 cargo fmt --all
 cargo clippy --workspace --exclude nereids-python -- -D warnings
+cargo test --workspace --exclude nereids-python
 ```
 
 `cargo fmt --all` must be run (not just `--check`) so that formatting is
@@ -17,6 +18,10 @@ and line width that must be respected.
 `cargo clippy -- -D warnings` treats every warning as an error, matching CI.
 Fix all warnings; do not suppress them with `#[allow(...)]` unless there is a
 documented reason in a comment.
+
+`cargo test` catches regressions from API changes that ripple across crates
+(e.g., changing a return type in nereids-core breaks nereids-endf callers).
+The workspace run is fast (~2 s) and prevents cross-crate breakage.
 
 ## Physics Rules
 
@@ -50,80 +55,64 @@ documented reason in a comment.
 
 ## Multi-AI Review Pipeline (mandatory before merging PRs)
 
-Every feature branch must pass a 3-stage review before merge.  Run each
-stage, fix all findings, then proceed to the next.
+Every feature branch must pass a two-phase review before merge.
 
-### Stage 1 — Self-review (Claude sub-agent)
+### Phase A — Local iterative review (Claude + Codex)
 
-After implementation and tests pass, spawn a separate review agent:
+Run "review pipeline" to execute the local review loop. The pipeline runs
+these stages per iteration:
 
-```
-Task(subagent_type="general-purpose", prompt="""
-Audit <files> for: logic bugs, panics, missing validation, physics
-correctness, API consistency with existing patterns.  Report findings
-as P1 (must fix) / P2 (should fix) with file:line references.
-""")
-```
+1. **Self-audit** (Claude subagent) — architecture, physics, design
+2. **External review** (Codex CLI) — fresh eyes, panic/edge-case detection
+3. **Consolidation** — merge findings, present P1/P2 report for approval
+4. **Fix** — parallel fix agents per worktree
+5. **Verification** — re-audit to confirm fixes
+6. **Commit & push**
 
-Fix all P1s and re-run until clean.
+Individual stages: "self-review", "codex-review"
 
-### Stage 2 — Independent AI review
+**Iterate locally until zero P1s remain.** Then push to remote for Phase B.
 
-After committing, run a **different** AI provider's CLI for an independent
-second opinion.  Use Codex (primary) or Gemini CLI (fallback).
+Maximum **4 local iterations** per branch. If P1s persist after 4 rounds,
+stop and escalate to human developer review — this signals systematic
+issues that need manual assessment (scope too large, task decomposition
+needed, or fundamental design problems).
 
-**Codex** (primary — requires OpenAI subscription):
+### Phase B — Copilot review (manual trigger on GitHub)
+
+After pushing, the developer manually triggers Copilot review on the PR.
+Fetch comments:
 ```bash
-# Install: npm install -g @openai/codex
-codex review --base main
-# or for uncommitted work:
-codex review --uncommitted "Focus on panics, validation gaps, edge cases"
-```
-
-**Gemini CLI** (fallback — free with Google account):
-```bash
-# Install:  brew install gemini-cli
-# Auth:     export GEMINI_API_KEY=<key from https://aistudio.google.com/apikey>
-# Extension (one-time):
-#   gemini extensions install https://github.com/gemini-cli-extensions/code-review
-
-# Non-interactive review of branch diff:
-git diff main...HEAD | gemini -p "Review this diff for a Rust neutron physics \
-library. Focus on panics, validation gaps, edge cases, numerical stability. \
-Report findings as P1 (must fix) / P2 (should fix) with file:line references."
-```
-
-Fix all P1s, re-commit, and re-run until clean.
-
-### Stage 3 — GitHub Copilot PR review
-
-After pushing the branch and creating/updating a PR, Copilot auto-reviews:
-
-```bash
-# Fetch review comments:
 gh api repos/{owner}/{repo}/pulls/{pr}/comments \
   --jq '.[] | {path, line, body, created_at}'
 ```
 
-Address all actionable comments, push fixes, and re-fetch until clean.
-Dismiss comments that are: rehashing already-addressed issues, debating
-design choices with no clear improvement, or flagging edge cases that
-cannot occur in practice.
+**Copilot re-iteration gate** (combined threshold):
 
-### Review stage summary
+Re-iterate locally (back to Phase A) if **either** condition is met:
+- **3+ confirmed P1s** from Copilot review, OR
+- **P1 ratio > 40%** of total Copilot findings
 
-| Stage | Tool | When | Strength |
-|-------|------|------|----------|
-| 1 | Claude sub-agent | Before commit | Architecture, physics, design |
-| 2 | `codex review` or `gemini -p` | After commit | Fresh eyes, panic/edge-case detection |
-| 3 | Copilot (via `gh api`) | After push to PR | Diff-focused, code-centric |
+Otherwise (0-2 P1s and ratio ≤ 40%): fix the findings inline, push, and
+merge the PR.
+
+Dismiss Copilot comments that rehash addressed issues, debate design with
+no clear improvement, or flag impossible edge cases. These do not count
+toward the threshold.
+
+### Why these thresholds
+
+AI reviewers have higher false-positive rates than human reviewers, so a
+ratio-based gate (not "any P1 blocks") avoids infinite loops from
+hallucinated findings. The absolute count (3+) catches cases where few
+total findings exist but most are critical.
 
 ## Git Workflow
 
-- **Upstream**: `ornlneutronimaging/NEREIDS` — issues, releases, main branch
-- **Fork**: `KedoKudo/NEREIDS` — development branches, PRs
-- **Sync**: after merging a PR on the fork, push main to upstream:
-  `git push upstream main`
+- **origin**: `ornlneutronimaging/NEREIDS` — primary repo, issues, releases,
+  main branch.  All branches and PRs are pushed here directly.
+- **upstream** (secondary): `KedoKudo/NEREIDS` — personal fork, kept as
+  backup remote.
 
 ## Reference Codebases (siblings of this repo)
 
