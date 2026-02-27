@@ -825,7 +825,7 @@ mod tests {
         scattering_radius: f64,
     ) -> ResonanceData {
         ResonanceData {
-            isotope: nereids_core::types::Isotope::new(92, 238),
+            isotope: nereids_core::types::Isotope::new(92, 238).unwrap(),
             za: 92238,
             awr,
             ranges: vec![ResonanceRange {
@@ -1019,7 +1019,7 @@ mod tests {
     /// Build a single-resonance `ResonanceData` with a chosen formalism.
     fn make_slbw_data(formalism: ResonanceFormalism) -> ResonanceData {
         ResonanceData {
-            isotope: nereids_core::types::Isotope::new(92, 238),
+            isotope: nereids_core::types::Isotope::new(92, 238).unwrap(),
             za: 92238,
             awr: 236.006,
             ranges: vec![ResonanceRange {

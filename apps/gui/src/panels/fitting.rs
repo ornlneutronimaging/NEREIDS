@@ -77,6 +77,14 @@ pub fn fitting_panel(ui: &mut egui::Ui, state: &mut AppState) {
                     )
                     .changed();
 
+                // Enforce Z <= A (physical constraint: protons cannot exceed nucleons).
+                if z_changed && entry.z > entry.a {
+                    entry.a = entry.z;
+                }
+                if a_changed && entry.a < entry.z {
+                    entry.z = entry.a;
+                }
+
                 if z_changed || a_changed {
                     entry.symbol = format!(
                         "{}-{}",
@@ -250,7 +258,13 @@ fn fetch_endf_data(state: &mut AppState) {
     let mut work: Vec<(usize, Isotope, String, EndfLibrary)> = Vec::new();
     for (i, entry) in state.isotope_entries.iter().enumerate() {
         if entry.enabled && entry.resonance_data.is_none() {
-            let isotope = Isotope::new(entry.z, entry.a);
+            let isotope = match Isotope::new(entry.z, entry.a) {
+                Ok(iso) => iso,
+                Err(e) => {
+                    state.status_message = format!("Invalid isotope {}: {}", entry.symbol, e);
+                    continue;
+                }
+            };
             if retrieval::mat_number(&isotope).is_none() {
                 state.status_message = format!(
                     "No MAT number for {} — isotope not in database",

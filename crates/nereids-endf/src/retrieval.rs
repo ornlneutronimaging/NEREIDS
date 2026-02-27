@@ -53,9 +53,9 @@ impl EndfLibrary {
     /// - VIII.0, JEFF-3.3: MAT-first `n_{mat:04}_{z}-{Sym}-{a}.zip` (Z unpadded)
     /// - VIII.1, JENDL-5: Z-first   `n_{z:03}-{Sym}-{a}_{mat:04}.zip` (Z 3-digit)
     fn zip_filename(&self, isotope: &Isotope, mat: u32) -> String {
-        let sym = elements::element_symbol(isotope.z).unwrap_or("X");
-        let z = isotope.z;
-        let a = isotope.a;
+        let sym = elements::element_symbol(isotope.z()).unwrap_or("X");
+        let z = isotope.z();
+        let a = isotope.a();
         match self {
             Self::EndfB8_0 | Self::Jeff3_3 => {
                 format!("n_{mat:04}_{z}-{sym}-{a}.zip")
@@ -103,8 +103,8 @@ impl EndfRetriever {
 
     /// Get the cached ENDF file path for an isotope.
     fn cache_file_path(&self, isotope: &Isotope, library: EndfLibrary) -> PathBuf {
-        let sym = elements::element_symbol(isotope.z).unwrap_or("X");
-        let filename = format!("{}-{}.endf", sym, isotope.a);
+        let sym = elements::element_symbol(isotope.z()).unwrap_or("X");
+        let filename = format!("{}-{}.endf", sym, isotope.a());
         self.cache_dir(library).join(filename)
     }
 
@@ -161,8 +161,8 @@ impl EndfRetriever {
             return Err(EndfRetrievalError::NotInLibrary {
                 isotope: format!(
                     "{}-{}",
-                    nereids_core::elements::element_symbol(isotope.z).unwrap_or("?"),
-                    isotope.a
+                    nereids_core::elements::element_symbol(isotope.z()).unwrap_or("?"),
+                    isotope.a()
                 ),
                 library: library.cache_dir_name().to_string(),
             });
@@ -260,7 +260,7 @@ impl Default for EndfRetriever {
 /// 47-entry table and fixes several incorrect MAT values (Cd-113,
 /// Hf-177/178, W-182/183/184/186 were off by one isotope offset).
 pub fn mat_number(isotope: &Isotope) -> Option<u32> {
-    endf_mat::mat_number(isotope.z, isotope.a)
+    endf_mat::mat_number(isotope.z(), isotope.a())
 }
 
 /// Errors from ENDF retrieval operations.

@@ -302,7 +302,7 @@ mod tests {
 
     fn u238_single_resonance() -> ResonanceData {
         ResonanceData {
-            isotope: Isotope::new(92, 238),
+            isotope: Isotope::new(92, 238).unwrap(),
             za: 92238,
             awr: 236.006,
             ranges: vec![ResonanceRange {
@@ -376,7 +376,7 @@ mod tests {
 
         // Second isotope with resonance at 20 eV
         let other = ResonanceData {
-            isotope: Isotope::new(1, 10),
+            isotope: Isotope::new(1, 10).unwrap(),
             za: 1010,
             awr: 10.0,
             ranges: vec![ResonanceRange {

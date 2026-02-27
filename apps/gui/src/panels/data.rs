@@ -200,11 +200,27 @@ fn normalize_data(state: &mut AppState) {
 
             // Compute energy grid from TOF bins
             let n_tof = sample.shape()[0];
-            let tof_edges =
-                nereids_io::tof::linspace_tof_edges(state.tof_min_us, state.tof_max_us, n_tof);
+            let tof_edges = match nereids_io::tof::linspace_tof_edges(
+                state.tof_min_us,
+                state.tof_max_us,
+                n_tof,
+            ) {
+                Ok(edges) => edges,
+                Err(e) => {
+                    // Invalidate stale results so the GUI cannot fit against
+                    // outdated data from a previous successful normalization.
+                    state.normalized = None;
+                    state.energies = None;
+                    state.status_message = format!("TOF linspace error: {}", e);
+                    return;
+                }
+            };
             match nereids_io::tof::tof_edges_to_energy_centers(&tof_edges, &state.beamline) {
                 Ok(e) => state.energies = Some(e.to_vec()),
                 Err(e) => {
+                    // Invalidate stale results — same reasoning as TOF linspace error above.
+                    state.normalized = None;
+                    state.energies = None;
                     state.status_message = format!("TOF→energy error: {}", e);
                     return;
                 }

@@ -75,9 +75,13 @@ pub fn normalize(
         )));
     }
 
-    if params.proton_charge_sample <= 0.0 || params.proton_charge_ob <= 0.0 {
+    if !(params.proton_charge_sample > 0.0
+        && params.proton_charge_sample.is_finite()
+        && params.proton_charge_ob > 0.0
+        && params.proton_charge_ob.is_finite())
+    {
         return Err(IoError::InvalidParameter(
-            "Proton charges must be positive".into(),
+            "Proton charges must be finite and positive".into(),
         ));
     }
 
@@ -101,12 +105,31 @@ pub fn normalize(
                     transmission[[t, y, x]] = t_val;
 
                     // Poisson uncertainty: σ_T/T = √(1/C_s + 1/C_o)
-                    let rel_err = if c_s > 0.0 {
-                        (1.0 / c_s + 1.0 / c_o).sqrt()
+                    // NOTE: When dark_current is provided, this formula is approximate.
+                    // True variance after DC subtraction is Var(C_raw) + Var(DC),
+                    // but we use the subtracted count as the variance estimate.
+                    // This underestimates uncertainty when DC is a significant
+                    // fraction of raw counts.
+                    //
+                    // Apply a Bayesian floor of 0.5 counts (Jeffreys prior for
+                    // Poisson) only when the count is exactly zero. For 0 < c < 0.5,
+                    // the true Poisson variance equals c, so replacing it with 0.5
+                    // would be anti-conservative (smaller 1/c_eff, thus smaller
+                    // relative uncertainty). The floor only makes sense as a prior
+                    // when no counts have been observed at all.
+                    let c_s_eff = if c_s > 0.0 { c_s } else { 0.5 };
+                    let c_o_eff = if c_o > 0.0 { c_o } else { 0.5 };
+                    let rel_err = (1.0 / c_s_eff + 1.0 / c_o_eff).sqrt();
+                    // Use the absolute uncertainty formula: σ_T = T * rel_err.
+                    // When t_val=0 (c_s=0), use the floor-based absolute value
+                    // so downstream weighted fits never see σ=0.
+                    uncertainty[[t, y, x]] = if t_val > 0.0 {
+                        t_val * rel_err
                     } else {
-                        f64::INFINITY
+                        // c_s=0: T=0, but σ should reflect the Bayesian floor.
+                        // σ_T = (c_s_eff/c_o_eff) * pc_ratio * rel_err
+                        (c_s_eff / c_o_eff) * pc_ratio * rel_err
                     };
-                    uncertainty[[t, y, x]] = t_val * rel_err;
                 } else {
                     // No open-beam counts: mark as invalid
                     transmission[[t, y, x]] = 0.0;
@@ -295,6 +318,54 @@ mod tests {
         assert_eq!(avg.len(), 2);
         assert!((avg[0] - 100.0).abs() < 1e-10);
         assert!((avg[1] - 200.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_normalize_zero_sample_counts() {
+        // Zero sample counts should produce finite (not NaN) uncertainty
+        // thanks to the Bayesian floor of 0.5.
+        let sample = Array3::from_elem((1, 1, 1), 0.0);
+        let ob = Array3::from_elem((1, 1, 1), 100.0);
+        let params = NormalizationParams {
+            proton_charge_sample: 1.0,
+            proton_charge_ob: 1.0,
+        };
+
+        let result = normalize(&sample, &ob, &params, None).unwrap();
+        assert_eq!(result.transmission[[0, 0, 0]], 0.0);
+        assert!(
+            result.uncertainty[[0, 0, 0]].is_finite(),
+            "uncertainty should be finite for zero sample counts, got {}",
+            result.uncertainty[[0, 0, 0]]
+        );
+        assert!(
+            result.uncertainty[[0, 0, 0]] > 0.0,
+            "uncertainty should be strictly positive for zero sample counts (Bayesian floor), got {}",
+            result.uncertainty[[0, 0, 0]]
+        );
+    }
+
+    #[test]
+    fn test_normalize_zero_open_beam() {
+        // Zero OB counts should produce infinite uncertainty (marking
+        // the pixel as invalid), and the uncertainty must not be NaN.
+        let sample = Array3::from_elem((1, 1, 1), 50.0);
+        let ob = Array3::from_elem((1, 1, 1), 0.0);
+        let params = NormalizationParams {
+            proton_charge_sample: 1.0,
+            proton_charge_ob: 1.0,
+        };
+
+        let result = normalize(&sample, &ob, &params, None).unwrap();
+        assert_eq!(result.transmission[[0, 0, 0]], 0.0);
+        assert!(
+            !result.uncertainty[[0, 0, 0]].is_nan(),
+            "uncertainty must not be NaN for zero OB counts"
+        );
+        assert!(
+            result.uncertainty[[0, 0, 0]].is_infinite(),
+            "uncertainty should be infinite for zero OB counts"
+        );
     }
 
     #[test]

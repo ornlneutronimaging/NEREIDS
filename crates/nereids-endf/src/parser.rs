@@ -71,7 +71,7 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
     let awr = head.c2;
     let nis = head.n1 as usize; // number of isotopes (usually 1)
 
-    let isotope = isotope_from_za(za);
+    let isotope = isotope_from_za(za)?;
     let mut all_ranges = Vec::new();
 
     for _ in 0..nis {
@@ -1364,6 +1364,9 @@ pub enum EndfParseError {
 
     #[error("Unexpected end of file: {0}")]
     UnexpectedEof(String),
+
+    #[error("Invalid isotope: {0}")]
+    InvalidIsotope(#[from] nereids_core::error::NereidsError),
 }
 
 #[cfg(test)]
@@ -1714,7 +1717,7 @@ mod tests {
         use nereids_core::types::Isotope;
 
         let retriever = EndfRetriever::new();
-        let isotope = Isotope::new(74, 184);
+        let isotope = Isotope::new(74, 184).unwrap();
         let (_, text) = retriever
             .get_endf_file(&isotope, EndfLibrary::EndfB8_0, 7437)
             .expect("Failed to download W-184 ENDF/B-VIII.0");

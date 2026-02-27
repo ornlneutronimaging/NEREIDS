@@ -10,3 +10,6 @@ endf-mat = { workspace = true }
 thiserror = { workspace = true }
 ndarray = { workspace = true }
 serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
