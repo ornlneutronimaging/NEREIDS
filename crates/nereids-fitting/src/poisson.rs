@@ -92,6 +92,11 @@ fn poisson_nll(y_obs: &[f64], y_model: &[f64]) -> f64 {
 ///
 /// Since delta = ε − mdl ≥ 0, this becomes:
 ///   NLL(ε) − NLL'(ε)·delta + ½·NLL''(ε)·delta²
+///
+/// When obs == 0, the exact Hessian obs/ε² vanishes, leaving only a linear
+/// term that decreases without bound as mdl → −∞.  This can cause the
+/// optimizer to diverge.  We impose a minimum curvature of 1/ε so the
+/// quadratic penalty still curves upward for negative predictions.
 #[inline]
 fn poisson_nll_term(obs: f64, mdl: f64) -> f64 {
     if mdl > POISSON_EPSILON {
@@ -100,7 +105,13 @@ fn poisson_nll_term(obs: f64, mdl: f64) -> f64 {
         let eps = POISSON_EPSILON;
         let nll_eps = eps - obs * eps.ln();
         let grad_eps = 1.0 - obs / eps;
-        let hess_eps = obs / (eps * eps);
+        // Minimum curvature 1/eps ensures the penalty grows quadratically
+        // even when obs == 0 (where the exact Hessian obs/eps^2 vanishes).
+        let hess_eps = if obs > 0.0 {
+            obs / (eps * eps)
+        } else {
+            1.0 / eps
+        };
         let delta = eps - mdl;
         // Taylor expansion: f(eps) + f'(eps)*(mdl - eps) + 0.5*f''(eps)*(mdl - eps)^2
         // Since (mdl - eps) = -delta, the linear term flips sign.
@@ -116,6 +127,9 @@ fn poisson_nll_term(obs: f64, mdl: f64) -> f64 {
 ///
 /// Since delta = ε − mdl ≥ 0, the derivative of the NLL term w.r.t. mdl
 /// is the derivative of the quadratic extrapolation in poisson_nll_term.
+///
+/// The minimum curvature floor (1/ε when obs == 0) must match
+/// `poisson_nll_term` so the gradient is consistent with the objective.
 #[inline]
 fn poisson_nll_grad_term(obs: f64, mdl: f64) -> f64 {
     if mdl > POISSON_EPSILON {
@@ -123,10 +137,15 @@ fn poisson_nll_grad_term(obs: f64, mdl: f64) -> f64 {
     } else {
         let eps = POISSON_EPSILON;
         let grad_eps = 1.0 - obs / eps;
-        let hess_eps = obs / (eps * eps);
+        // Minimum curvature 1/eps, matching poisson_nll_term.
+        let hess_eps = if obs > 0.0 {
+            obs / (eps * eps)
+        } else {
+            1.0 / eps
+        };
         let delta = eps - mdl;
         // g(eps) + g'(eps)*(mdl - eps) = g(eps) - g'(eps)*delta
-        // where g'(x) = obs/x^2 = hess_eps
+        // where g'(x) = NLL''(x) = hess_eps at x=eps
         grad_eps - hess_eps * delta
     }
 }

@@ -516,30 +516,40 @@ pub fn levenberg_marquardt(
     // description and the weights are exact.  Multiplying by χ²/ν accounts for
     // misfit (model inadequacy or underestimated errors).  This is the standard
     // statistical prescription (see e.g. Numerical Recipes §15.6).
-    let reduced_chi2 = chi2 / dof as f64;
-    let (covariance, uncertainties) = if let Some(mut cov) = invert_matrix(&jtw_j) {
-        for row in cov.iter_mut() {
-            for elem in row.iter_mut() {
-                *elem *= reduced_chi2;
-            }
-        }
-        let unc: Vec<f64> = (0..n_free)
-            .map(|i| {
-                if cov[i][i].is_finite() && cov[i][i] > 0.0 {
-                    cov[i][i].sqrt()
-                } else {
-                    f64::NAN
+    //
+    // When dof == 0 (exactly determined system), reduced chi-squared is
+    // undefined (0/0).  We report NaN and skip covariance scaling entirely,
+    // returning None for covariance and uncertainties.
+    let reduced_chi2 = if dof > 0 { chi2 / dof as f64 } else { f64::NAN };
+
+    let (covariance, uncertainties) = if dof > 0 {
+        if let Some(mut cov) = invert_matrix(&jtw_j) {
+            for row in cov.iter_mut() {
+                for elem in row.iter_mut() {
+                    *elem *= reduced_chi2;
                 }
-            })
-            .collect();
-        (Some(cov), Some(unc))
+            }
+            let unc: Vec<f64> = (0..n_free)
+                .map(|i| {
+                    if cov[i][i].is_finite() && cov[i][i] > 0.0 {
+                        cov[i][i].sqrt()
+                    } else {
+                        f64::NAN
+                    }
+                })
+                .collect();
+            (Some(cov), Some(unc))
+        } else {
+            (None, None)
+        }
     } else {
+        // dof == 0: covariance scaling is undefined; report None.
         (None, None)
     };
 
     LmResult {
         chi_squared: chi2,
-        reduced_chi_squared: chi2 / dof as f64,
+        reduced_chi_squared: reduced_chi2,
         iterations: iter,
         converged,
         params: params.all_values(),
