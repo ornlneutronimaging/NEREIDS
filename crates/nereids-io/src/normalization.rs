@@ -336,6 +336,11 @@ mod tests {
             "uncertainty should be finite for zero sample counts, got {}",
             result.uncertainty[[0, 0, 0]]
         );
+        assert!(
+            result.uncertainty[[0, 0, 0]] > 0.0,
+            "uncertainty should be strictly positive for zero sample counts (Bayesian floor), got {}",
+            result.uncertainty[[0, 0, 0]]
+        );
     }
 
     #[test]

@@ -65,10 +65,16 @@ pub fn tof_edges_to_energy(
 
     let mut energies: Vec<f64> = Vec::with_capacity(tof_edges.len());
     for (i, &tof) in tof_edges.iter().enumerate() {
-        let corrected_tof = tof - params.delay_us;
-        if corrected_tof <= 0.0 {
+        if !tof.is_finite() {
             return Err(IoError::InvalidParameter(format!(
-                "TOF edge {:.6} us minus delay {:.6} us is non-positive at index {}",
+                "TOF edge is non-finite ({}) at index {}",
+                tof, i
+            )));
+        }
+        let corrected_tof = tof - params.delay_us;
+        if !corrected_tof.is_finite() || corrected_tof <= 0.0 {
+            return Err(IoError::InvalidParameter(format!(
+                "TOF edge {:.6} us minus delay {:.6} us is non-positive or non-finite at index {}",
                 tof, params.delay_us, i
             )));
         }
@@ -298,6 +304,35 @@ mod tests {
         assert!(
             tof_edges_to_energy(&tof_edges, &params_nan_delay).is_err(),
             "should reject NaN delay"
+        );
+    }
+
+    #[test]
+    fn test_tof_edges_to_energy_rejects_nan_inf_edges() {
+        let params = BeamlineParams {
+            flight_path_m: 25.0,
+            delay_us: 0.0,
+        };
+
+        // NaN in TOF edges should be rejected (not silently propagate)
+        let nan_edges = vec![100.0, f64::NAN, 300.0];
+        assert!(
+            tof_edges_to_energy(&nan_edges, &params).is_err(),
+            "should reject NaN in TOF edges"
+        );
+
+        // Inf in TOF edges should be rejected
+        let inf_edges = vec![100.0, f64::INFINITY, 300.0];
+        assert!(
+            tof_edges_to_energy(&inf_edges, &params).is_err(),
+            "should reject Inf in TOF edges"
+        );
+
+        // -Inf in TOF edges should be rejected
+        let neg_inf_edges = vec![f64::NEG_INFINITY, 200.0, 300.0];
+        assert!(
+            tof_edges_to_energy(&neg_inf_edges, &params).is_err(),
+            "should reject -Inf in TOF edges"
         );
     }
 }
