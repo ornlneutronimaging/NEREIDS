@@ -66,8 +66,5 @@ jobs:
       - name: Install dependencies
         run: pixi install
 
-      - name: Build Python bindings
-        run: pixi run build
-
-      - name: Run Python tests
+      - name: Build and test Python bindings
         run: pixi run test-python
