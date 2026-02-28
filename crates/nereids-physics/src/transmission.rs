@@ -25,6 +25,8 @@
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use rayon::prelude::*;
+
 use nereids_endf::resonance::ResonanceData;
 
 use crate::doppler::{self, DopplerParams};
@@ -166,44 +168,49 @@ pub fn forward_model(
         return Err(ResolutionError::UnsortedEnergies.into());
     }
 
-    // Accumulate total attenuation: Σᵢ thicknessᵢ × σᵢ(E)
+    // Compute broadened cross-sections for all isotopes in parallel.
+    // Each isotope's Doppler + resolution broadening is independent.
+    let broadened: Vec<(Vec<f64>, f64)> = sample
+        .isotopes
+        .par_iter()
+        .filter(|(_, thickness)| *thickness > 0.0)
+        .map(|(res_data, thickness)| {
+            // 1. Compute unbroadened total cross-sections
+            let unbroadened: Vec<f64> = energies
+                .iter()
+                .map(|&e| reich_moore::cross_sections_at_energy(res_data, e).total)
+                .collect();
+
+            // 2. Apply Doppler broadening
+            let after_doppler = if sample.temperature_k > 0.0 {
+                let doppler_params = DopplerParams::new(sample.temperature_k, res_data.awr)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "DopplerParams validation failed in forward_model: {} (temperature_k={}, awr={})",
+                            e, sample.temperature_k, res_data.awr
+                        )
+                    });
+                doppler::doppler_broaden(energies, &unbroadened, &doppler_params)
+            } else {
+                unbroadened
+            };
+
+            // 3. Apply resolution broadening (energy grid pre-validated above)
+            let after_resolution = if let Some(inst) = instrument {
+                resolution::apply_resolution_presorted(energies, &after_doppler, &inst.resolution)
+            } else {
+                after_doppler
+            };
+
+            (after_resolution, *thickness)
+        })
+        .collect();
+
+    // 4. Accumulate total attenuation: Σᵢ thicknessᵢ × σᵢ(E)
     let mut total_attenuation = vec![0.0f64; n];
-
-    for (res_data, thickness) in &sample.isotopes {
-        if *thickness <= 0.0 {
-            continue;
-        }
-
-        // 1. Compute unbroadened total cross-sections
-        let unbroadened: Vec<f64> = energies
-            .iter()
-            .map(|&e| reich_moore::cross_sections_at_energy(res_data, e).total)
-            .collect();
-
-        // 2. Apply Doppler broadening
-        let after_doppler = if sample.temperature_k > 0.0 {
-            let doppler_params = DopplerParams::new(sample.temperature_k, res_data.awr)
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "DopplerParams validation failed in forward_model: {} (temperature_k={}, awr={})",
-                        e, sample.temperature_k, res_data.awr
-                    )
-                });
-            doppler::doppler_broaden(energies, &unbroadened, &doppler_params)
-        } else {
-            unbroadened
-        };
-
-        // 3. Apply resolution broadening (energy grid pre-validated above)
-        let after_resolution = if let Some(inst) = instrument {
-            resolution::apply_resolution_presorted(energies, &after_doppler, &inst.resolution)
-        } else {
-            after_doppler
-        };
-
-        // 4. Accumulate attenuation
+    for (xs, thickness) in &broadened {
         for i in 0..n {
-            total_attenuation[i] += thickness * after_resolution[i];
+            total_attenuation[i] += thickness * xs[i];
         }
     }
 
@@ -246,47 +253,49 @@ pub fn broadened_cross_sections(
         return Err(ResolutionError::UnsortedEnergies.into());
     }
 
-    let mut result = Vec::with_capacity(resonance_data.len());
+    // Parallelize across isotopes — Doppler + resolution broadening for each
+    // isotope is independent and this is the dominant cost in the forward model
+    // pipeline.  Cancellation is checked per-isotope inside the parallel map.
+    let result: Result<Vec<Vec<f64>>, TransmissionError> = resonance_data
+        .par_iter()
+        .map(|rd| {
+            // Check cancellation before starting this isotope.
+            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                return Err(TransmissionError::Cancelled);
+            }
 
-    for rd in resonance_data {
-        // Check cancellation between isotopes — each per-isotope broadening
-        // step can be expensive (Doppler FGM × N_energy), so we bail here
-        // rather than inside the inner loop.
-        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
-            return Err(TransmissionError::Cancelled);
-        }
+            // 1. Unbroadened total cross-sections
+            let unbroadened: Vec<f64> = energies
+                .iter()
+                .map(|&e| reich_moore::cross_sections_at_energy(rd, e).total)
+                .collect();
 
-        // 1. Unbroadened total cross-sections
-        let unbroadened: Vec<f64> = energies
-            .iter()
-            .map(|&e| reich_moore::cross_sections_at_energy(rd, e).total)
-            .collect();
+            // 2. Doppler broadening
+            let after_doppler = if temperature_k > 0.0 {
+                let params = DopplerParams::new(temperature_k, rd.awr)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "DopplerParams validation failed in broadened_cross_sections: {} (temperature_k={}, awr={})",
+                            e, temperature_k, rd.awr
+                        )
+                    });
+                doppler::doppler_broaden(energies, &unbroadened, &params)
+            } else {
+                unbroadened
+            };
 
-        // 2. Doppler broadening
-        let after_doppler = if temperature_k > 0.0 {
-            let params = DopplerParams::new(temperature_k, rd.awr)
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "DopplerParams validation failed in broadened_cross_sections: {} (temperature_k={}, awr={})",
-                        e, temperature_k, rd.awr
-                    )
-                });
-            doppler::doppler_broaden(energies, &unbroadened, &params)
-        } else {
-            unbroadened
-        };
+            // 3. Resolution broadening (energy grid pre-validated above)
+            let xs = if let Some(inst) = instrument {
+                resolution::apply_resolution_presorted(energies, &after_doppler, &inst.resolution)
+            } else {
+                after_doppler
+            };
 
-        // 3. Resolution broadening (energy grid pre-validated above)
-        let xs = if let Some(inst) = instrument {
-            resolution::apply_resolution_presorted(energies, &after_doppler, &inst.resolution)
-        } else {
-            after_doppler
-        };
+            Ok(xs)
+        })
+        .collect();
 
-        result.push(xs);
-    }
-
-    Ok(result)
+    result
 }
 
 /// Compute broadened cross-sections and their temperature derivative.
