@@ -1010,14 +1010,6 @@ fn load_endf(
 ///     ResonanceData parsed from the file.
 #[pyfunction]
 fn load_endf_file(py: Python<'_>, path: &str) -> PyResult<PyResonanceData> {
-    // Validate path existence while we still hold the GIL (cheap check).
-    if !std::path::Path::new(path).exists() {
-        return Err(pyo3::exceptions::PyIOError::new_err(format!(
-            "Cannot read '{}': No such file or directory",
-            path
-        )));
-    }
-
     // Release the GIL for the file I/O and ENDF parsing.
     // Tag errors: false = I/O, true = parse.
     let owned_path = path.to_owned();
