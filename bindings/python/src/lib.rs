@@ -2238,6 +2238,95 @@ fn py_trace_detectability_survey(
         .collect())
 }
 
+/// Precompute Doppler- and resolution-broadened total cross-sections.
+///
+/// Returns one broadened total cross-section array per isotope.  This is the
+/// expensive physics step (Doppler FGM + resolution convolution); calling it
+/// once and caching the result avoids redundant computation when the same
+/// isotopes and energy grid are reused across many fits or forward-model
+/// evaluations.
+///
+/// Resolution broadening can be applied via either Gaussian parameters
+/// (``flight_path_m``, ``delta_t_us``, ``delta_l_m``) or a tabulated
+/// resolution function (``resolution``). Providing both is an error.
+///
+/// Args:
+///     energies: Energy grid in eV (1D numpy array, sorted ascending).
+///     isotopes: List of ResonanceData objects.
+///     temperature_k: Sample temperature in Kelvin (default 0.0).
+///     flight_path_m: Flight path in meters for Gaussian resolution (optional).
+///     delta_t_us: Timing uncertainty in microseconds (optional).
+///     delta_l_m: Path length uncertainty in meters (optional).
+///     resolution: TabulatedResolution from ``load_resolution()`` (optional).
+///
+/// Returns:
+///     List of 1D numpy arrays (one per isotope), each containing the broadened
+///     total cross-section in barns on the supplied energy grid.
+#[pyfunction]
+#[pyo3(signature = (energies, isotopes, temperature_k=0.0, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None))]
+fn precompute_cross_sections<'py>(
+    py: Python<'py>,
+    energies: PyReadonlyArray1<f64>,
+    isotopes: Vec<PyResonanceData>,
+    temperature_k: f64,
+    flight_path_m: Option<f64>,
+    delta_t_us: Option<f64>,
+    delta_l_m: Option<f64>,
+    resolution: Option<PyTabulatedResolution>,
+) -> PyResult<Vec<Bound<'py, PyArray1<f64>>>> {
+    let e = energies.as_slice()?;
+    require_non_empty_energy_grid(e)?;
+
+    if isotopes.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "isotopes list must not be empty",
+        ));
+    }
+    if !temperature_k.is_finite() || temperature_k < 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "temperature_k must be finite and non-negative",
+        ));
+    }
+
+    let res_data: Vec<ResonanceData> = isotopes.into_iter().map(|d| d.inner).collect();
+    let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution)?;
+    let instrument = res_fn.map(|r| InstrumentParams { resolution: r });
+
+    let xs = transmission::broadened_cross_sections(
+        e,
+        &res_data,
+        temperature_k,
+        instrument.as_ref(),
+        None,
+    )
+    .expect("broadened_cross_sections should not be cancelled (no cancel token)");
+
+    Ok(xs.into_iter().map(|v| PyArray1::from_vec(py, v)).collect())
+}
+
+/// Detect dead pixels in a 3D image stack.
+///
+/// A pixel is marked as "dead" when all its counts across the spectral/TOF
+/// axis are exactly zero.  The returned mask can be passed directly to
+/// ``spatial_map(dead_pixels=...)``.
+///
+/// Args:
+///     data: 3D numpy array with shape ``(n_frames, height, width)``.
+///         Typically an open-beam stack or raw sample stack.
+///
+/// Returns:
+///     2D boolean numpy array with shape ``(height, width)``.
+///     ``True`` marks a dead pixel.
+#[pyfunction]
+fn detect_dead_pixels<'py>(
+    py: Python<'py>,
+    data: PyReadonlyArray3<f64>,
+) -> PyResult<Bound<'py, PyArray2<bool>>> {
+    let arr = data.as_array().to_owned();
+    let mask = norm::detect_dead_pixels(&arr);
+    Ok(PyArray2::from_owned_array(py, mask))
+}
+
 /// NEREIDS Python module.
 #[pymodule]
 fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -2273,5 +2362,7 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_natural_isotopes, m)?)?;
     m.add_function(wrap_pyfunction!(py_trace_detectability, m)?)?;
     m.add_function(wrap_pyfunction!(py_trace_detectability_survey, m)?)?;
+    m.add_function(wrap_pyfunction!(precompute_cross_sections, m)?)?;
+    m.add_function(wrap_pyfunction!(detect_dead_pixels, m)?)?;
     Ok(())
 }
