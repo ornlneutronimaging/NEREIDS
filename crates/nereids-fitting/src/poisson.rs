@@ -37,6 +37,9 @@ pub struct PoissonConfig {
     pub armijo_c: f64,
     /// Line search backtracking factor.
     pub backtrack: f64,
+    /// Number of L-BFGS correction pairs (memory parameter m).
+    /// Only used by `poisson_fit_lbfgsb`. Default: 7.
+    pub lbfgsb_memory: usize,
 }
 
 impl Default for PoissonConfig {
@@ -48,6 +51,7 @@ impl Default for PoissonConfig {
             tol_param: 1e-8,
             armijo_c: 1e-4,
             backtrack: 0.5,
+            lbfgsb_memory: 7,
         }
     }
 }
@@ -812,6 +816,471 @@ impl<'a> FitModel for CountsModel<'a> {
     }
 }
 
+/// L-BFGS memory: stores last `m` correction pairs for inverse Hessian
+/// approximation.
+///
+/// Reference: Nocedal & Wright, "Numerical Optimization", Algorithm 7.4
+/// (two-loop recursion for limited-memory BFGS).
+///
+/// Uses a ring buffer to avoid shifting elements when the buffer is full.
+struct LbfgsbMemory {
+    /// Maximum number of correction pairs to store.
+    m: usize,
+    /// Parameter difference vectors s_k = x_{k+1} - x_k (ring buffer).
+    s: Vec<Vec<f64>>,
+    /// Gradient difference vectors y_k = g_{k+1} - g_k (ring buffer).
+    y: Vec<Vec<f64>>,
+    /// Precomputed 1/(y_k · s_k) for each stored pair.
+    rho: Vec<f64>,
+    /// Number of currently stored pairs (<= m).
+    len: usize,
+    /// Next write position in the ring buffer.
+    cursor: usize,
+}
+
+impl LbfgsbMemory {
+    /// Create a new L-BFGS memory with capacity for `m` correction pairs.
+    fn new(m: usize, n: usize) -> Self {
+        Self {
+            m,
+            s: vec![vec![0.0; n]; m],
+            y: vec![vec![0.0; n]; m],
+            rho: vec![0.0; m],
+            len: 0,
+            cursor: 0,
+        }
+    }
+
+    /// Store a new correction pair (s, y).
+    ///
+    /// The curvature condition y·s > 0 is enforced; pairs that violate it
+    /// (e.g., near constraints or numerical noise) are silently discarded.
+    fn push(&mut self, s_vec: Vec<f64>, y_vec: Vec<f64>) {
+        let ys: f64 = y_vec
+            .iter()
+            .zip(s_vec.iter())
+            .map(|(&yi, &si)| yi * si)
+            .sum();
+        if ys <= PIVOT_FLOOR {
+            // Curvature condition violated — discard this pair.
+            return;
+        }
+        let idx = self.cursor;
+        self.s[idx] = s_vec;
+        self.y[idx] = y_vec;
+        self.rho[idx] = 1.0 / ys;
+        self.cursor = (self.cursor + 1) % self.m;
+        if self.len < self.m {
+            self.len += 1;
+        }
+    }
+
+    /// Apply the two-loop recursion (Algorithm 7.4, Nocedal & Wright) to
+    /// compute H_k * q, where H_k is the L-BFGS approximation to the
+    /// inverse Hessian.
+    ///
+    /// If no pairs are stored yet, returns q unchanged (steepest descent).
+    fn apply_two_loop(&self, q: &[f64]) -> Vec<f64> {
+        let mut r: Vec<f64> = q.to_vec();
+
+        if self.len == 0 {
+            return r;
+        }
+
+        let mut alpha = vec![0.0; self.len];
+
+        // Backward pass: most recent to oldest.
+        // Most recent is at ring index (cursor - 1 + m) % m,
+        // second most recent at (cursor - 2 + m) % m, etc.
+        for i in (0..self.len).rev() {
+            let idx = (self.cursor + self.m - self.len + i) % self.m;
+            let dot_sr: f64 = self.s[idx]
+                .iter()
+                .zip(r.iter())
+                .map(|(&si, &ri)| si * ri)
+                .sum();
+            alpha[i] = self.rho[idx] * dot_sr;
+            for (rj, &yj) in r.iter_mut().zip(self.y[idx].iter()) {
+                *rj -= alpha[i] * yj;
+            }
+        }
+
+        // Scale by initial Hessian approximation: gamma = (s·y) / (y·y)
+        // using the most recent pair.
+        let newest = (self.cursor + self.m - 1) % self.m;
+        let sy: f64 = self.s[newest]
+            .iter()
+            .zip(self.y[newest].iter())
+            .map(|(&si, &yi)| si * yi)
+            .sum();
+        let yy: f64 = self.y[newest].iter().map(|&yi| yi * yi).sum();
+        if yy > PIVOT_FLOOR {
+            let gamma = sy / yy;
+            for ri in r.iter_mut() {
+                *ri *= gamma;
+            }
+        }
+
+        // Forward pass: oldest to most recent.
+        for (i, &alpha_i) in alpha.iter().enumerate().take(self.len) {
+            let idx = (self.cursor + self.m - self.len + i) % self.m;
+            let dot_yr: f64 = self.y[idx]
+                .iter()
+                .zip(r.iter())
+                .map(|(&yi, &ri)| yi * ri)
+                .sum();
+            let beta = self.rho[idx] * dot_yr;
+            for (rj, &sj) in r.iter_mut().zip(self.s[idx].iter()) {
+                *rj += (alpha_i - beta) * sj;
+            }
+        }
+
+        r
+    }
+}
+
+/// Run Poisson-likelihood optimization using L-BFGS-B (limited-memory BFGS
+/// with box constraints).
+///
+/// Uses the same analytical gradient as [`poisson_fit_analytic`] but replaces
+/// the diagonal Fisher preconditioning with a full L-BFGS inverse Hessian
+/// approximation.  This captures curvature across parameters (not just
+/// per-parameter diagonal curvature), which is critical for problems with
+/// correlated parameters such as joint density + temperature fitting.
+///
+/// The "B" (box constraints) is handled via projected gradient: gradient
+/// components at active bounds are zeroed before computing the L-BFGS
+/// direction, and the resulting step is projected back onto bounds.
+///
+/// Reference: Nocedal & Wright, "Numerical Optimization", Ch. 7 & 9.
+///
+/// # Arguments
+/// * `model`           — Forward model Y = Phi * T(theta) + B.
+/// * `y_obs`           — Observed counts.
+/// * `flux`            — Incident flux Phi(E).
+/// * `cross_sections`  — Precomputed Doppler-broadened sigma_k(E), one per isotope.
+/// * `density_indices` — Maps isotope k -> parameter index for densities.
+/// * `params`          — Parameter set (modified in place).
+/// * `config`          — Optimizer configuration (including `lbfgsb_memory`).
+/// * `temp_ctx`        — Optional temperature-fitting context.
+#[allow(clippy::too_many_arguments)]
+pub fn poisson_fit_lbfgsb(
+    model: &dyn FitModel,
+    y_obs: &[f64],
+    flux: &[f64],
+    cross_sections: &[Vec<f64>],
+    density_indices: &[usize],
+    params: &mut ParameterSet,
+    config: &PoissonConfig,
+    temp_ctx: Option<&TemperatureContext>,
+) -> PoissonResult {
+    let n_e = y_obs.len();
+    assert!(
+        config.lbfgsb_memory >= 1,
+        "lbfgsb_memory must be >= 1, got {}",
+        config.lbfgsb_memory,
+    );
+    assert_eq!(flux.len(), n_e, "flux length must match y_obs");
+    assert_eq!(
+        density_indices.len(),
+        cross_sections.len(),
+        "density_indices length must match cross_sections length, got {} density indices and {} cross sections",
+        density_indices.len(),
+        cross_sections.len(),
+    );
+    for (k, sigma) in cross_sections.iter().enumerate() {
+        assert_eq!(
+            sigma.len(),
+            n_e,
+            "cross_sections[{}] length ({}) must match energy grid length ({})",
+            k,
+            sigma.len(),
+            n_e,
+        );
+    }
+
+    // Early return when all parameters are fixed.
+    if params.n_free() == 0 {
+        let y_model = model.evaluate(&params.all_values());
+        let nll = poisson_nll(y_obs, &y_model);
+        if !nll.is_finite() {
+            return PoissonResult {
+                nll,
+                iterations: 0,
+                converged: false,
+                params: params.all_values(),
+            };
+        }
+        return PoissonResult {
+            nll,
+            iterations: 0,
+            converged: true,
+            params: params.all_values(),
+        };
+    }
+
+    // Validate that every free parameter is referenced by density_indices
+    // or the temperature context.
+    {
+        let free_set: std::collections::HashSet<usize> =
+            params.free_indices().into_iter().collect();
+        let mut mapped_set: std::collections::HashSet<usize> =
+            density_indices.iter().copied().collect();
+        if let Some(ctx) = &temp_ctx {
+            mapped_set.insert(ctx.temperature_index);
+        }
+        let unmapped: Vec<usize> = free_set.difference(&mapped_set).copied().collect();
+        assert!(
+            unmapped.is_empty(),
+            "poisson_fit_lbfgsb: free parameters {:?} are not mapped by density_indices \
+             or temperature_index; analytical gradient is zero for these params. \
+             Use poisson_fit (FD) for mixed parameter sets.",
+            unmapped,
+        );
+    }
+
+    // Precompute param_idx -> list of isotope indices.
+    let free_indices = params.free_indices();
+    let n_free = free_indices.len();
+    let param_isotopes: Vec<Vec<usize>> = free_indices
+        .iter()
+        .map(|&pi| {
+            density_indices
+                .iter()
+                .enumerate()
+                .filter(|&(_, &di)| di == pi)
+                .map(|(k, _)| k)
+                .collect()
+        })
+        .collect();
+
+    // Position of the temperature parameter in the free-parameter vector.
+    let temp_free_pos: Option<usize> = temp_ctx.as_ref().and_then(|ctx| {
+        free_indices
+            .iter()
+            .position(|&fi| fi == ctx.temperature_index)
+    });
+
+    // Own the cross-sections so we can update them when temperature changes.
+    let mut xs_owned: Vec<Vec<f64>> = cross_sections.to_vec();
+    let mut dxs_dt: Vec<Vec<f64>> = vec![vec![0.0; n_e]; density_indices.len()];
+
+    let y_model = model.evaluate(&params.all_values());
+    let mut nll = poisson_nll(y_obs, &y_model);
+
+    // Guard: if the initial NLL is non-finite, bail out immediately rather
+    // than entering the optimization loop with garbage values.
+    if !nll.is_finite() {
+        return PoissonResult {
+            nll,
+            iterations: 0,
+            converged: false,
+            params: params.all_values(),
+        };
+    }
+
+    let mut converged = false;
+    let mut iter = 0;
+
+    // Initialize L-BFGS memory.
+    let mut lbfgs = LbfgsbMemory::new(config.lbfgsb_memory, n_free);
+
+    // Previous free parameters and gradient — needed for memory updates.
+    let mut prev_free: Vec<f64> = params.free_values();
+    let mut prev_grad: Option<Vec<f64>> = None;
+
+    for _ in 0..config.max_iter {
+        iter += 1;
+
+        // ---- Temperature XS recomputation (same as poisson_fit_analytic) ----
+        if let Some(ctx) = &temp_ctx {
+            let t_current = params.all_values()[ctx.temperature_index];
+            let (xs_new, dxs_new) = transmission::broadened_cross_sections_with_derivative(
+                &ctx.energies,
+                &ctx.resonance_data,
+                t_current,
+                ctx.instrument.as_ref(),
+            );
+            xs_owned = xs_new;
+            dxs_dt = dxs_new;
+        }
+
+        // ---- Evaluate model and compute transmission ----
+        let y_model_now = model.evaluate(&params.all_values());
+        let all_vals = params.all_values();
+        let t_now: Vec<f64> = (0..n_e)
+            .map(|e| {
+                let mut neg_opt = 0.0f64;
+                for (k, xs) in xs_owned.iter().enumerate() {
+                    let density = all_vals[density_indices[k]];
+                    neg_opt -= density * xs[e];
+                }
+                neg_opt.exp()
+            })
+            .collect();
+
+        // ---- Analytical gradient (identical to poisson_fit_analytic) ----
+        let mut grad: Vec<f64> = param_isotopes
+            .iter()
+            .map(|iso_indices| {
+                y_obs
+                    .iter()
+                    .zip(y_model_now.iter())
+                    .zip(flux.iter())
+                    .zip(t_now.iter())
+                    .enumerate()
+                    .map(|(e, (((&obs, &ym), &phi), &t))| {
+                        let residual_factor = poisson_nll_grad_term(obs, ym);
+                        let sigma_sum: f64 = iso_indices.iter().map(|&k| xs_owned[k][e]).sum();
+                        residual_factor * phi * t * (-sigma_sum)
+                    })
+                    .sum::<f64>()
+            })
+            .collect();
+
+        // Temperature gradient.
+        if let Some(pos) = temp_free_pos {
+            let temp_grad: f64 = y_obs
+                .iter()
+                .zip(y_model_now.iter())
+                .zip(flux.iter())
+                .zip(t_now.iter())
+                .enumerate()
+                .map(|(e, (((&obs, &ym), &phi), &t))| {
+                    let residual_factor = poisson_nll_grad_term(obs, ym);
+                    let dsigma_sum: f64 = (0..density_indices.len())
+                        .map(|k| {
+                            let density = all_vals[density_indices[k]];
+                            density * dxs_dt[k][e]
+                        })
+                        .sum();
+                    residual_factor * phi * t * (-dsigma_sum)
+                })
+                .sum();
+            grad[pos] = temp_grad;
+        }
+
+        // Snapshot current free-parameter values once (used by both
+        // the L-BFGS memory update and the projected direction).
+        let current_free = params.free_values();
+
+        // ---- Update L-BFGS memory with previous step's pair ----
+        if let Some(ref pg) = prev_grad {
+            let s_vec: Vec<f64> = current_free
+                .iter()
+                .zip(prev_free.iter())
+                .map(|(&c, &p)| c - p)
+                .collect();
+            let y_vec: Vec<f64> = grad
+                .iter()
+                .zip(pg.iter())
+                .map(|(&gc, &gp)| gc - gp)
+                .collect();
+            lbfgs.push(s_vec, y_vec);
+        }
+
+        // ---- Projected L-BFGS direction ----
+        //
+        // Identify active bounds: parameter at lower bound with positive
+        // gradient (wants to go more negative, but can't), or at upper
+        // bound with negative gradient.
+
+        // Helper: zero components of `vec` at active bounds.  A bound is
+        // "active" when the parameter sits on the bound and the gradient
+        // points into the infeasible half-space.
+        let zero_active_bounds = |vec: &mut [f64], g: &[f64]| {
+            for (j, &fi) in free_indices.iter().enumerate() {
+                let p = &params.params[fi];
+                let at_lower = (p.value - p.lower).abs() < PIVOT_FLOOR && g[j] > 0.0;
+                let at_upper = (p.upper - p.value).abs() < PIVOT_FLOOR && g[j] < 0.0;
+                if at_lower || at_upper {
+                    vec[j] = 0.0;
+                }
+            }
+        };
+
+        let mut projected_grad = grad.clone();
+        zero_active_bounds(&mut projected_grad, &grad);
+
+        // ---- Projected gradient norm convergence check ----
+        // Use the projected gradient norm (KKT condition): if the projected
+        // gradient is zero we are at a constrained optimum, regardless of how
+        // large the raw gradient is at active bounds.
+        let proj_grad_norm: f64 = projected_grad.iter().map(|g| g * g).sum::<f64>().sqrt();
+        if proj_grad_norm < config.tol_param {
+            converged = true;
+            break;
+        }
+
+        // Apply two-loop recursion to get search direction.
+        let mut direction = lbfgs.apply_two_loop(&projected_grad);
+
+        // Zero out direction components at active bounds.
+        zero_active_bounds(&mut direction, &grad);
+
+        // Ensure descent direction: if direction · gradient < 0, the
+        // L-BFGS direction is ascending; fall back to steepest descent.
+        // (The search_dir convention in backtracking_line_search is:
+        //  x_new = x - alpha * search_dir, so search_dir should point
+        //  in the gradient direction for descent.)
+        let dir_dot_grad: f64 = direction
+            .iter()
+            .zip(grad.iter())
+            .map(|(&d, &g)| d * g)
+            .sum();
+        if dir_dot_grad <= 0.0 {
+            // L-BFGS direction is not a descent direction; fall back.
+            direction = projected_grad.clone();
+        }
+
+        // ---- Line search ----
+        let old_free = current_free.clone();
+        let search_norm: f64 = direction.iter().map(|d| d * d).sum::<f64>().sqrt();
+        let initial_alpha = config.step_size / search_norm.max(1.0);
+
+        // Save state for memory update.
+        prev_free = old_free.clone();
+        prev_grad = Some(grad.clone());
+
+        match backtracking_line_search(
+            model,
+            params,
+            y_obs,
+            &old_free,
+            &direction,
+            initial_alpha,
+            config,
+            &grad,
+            nll,
+        ) {
+            Some(new_nll) => nll = new_nll,
+            None => {
+                // Line search exhausted; params restored by backtracking_line_search.
+                break;
+            }
+        }
+
+        // ---- Parameter displacement convergence check ----
+        let step_norm: f64 = old_free
+            .iter()
+            .zip(params.free_values().iter())
+            .map(|(o, n)| (o - n).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        if step_norm < config.tol_param {
+            converged = true;
+            break;
+        }
+    }
+
+    PoissonResult {
+        nll,
+        iterations: iter,
+        converged,
+        params: params.all_values(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1486,5 +1955,455 @@ mod tests {
         );
         assert!(result.nll.is_finite(), "NLL should be finite");
         assert_eq!(result.iterations, 0);
+    }
+
+    // ---- Tests for poisson_fit_lbfgsb ----
+
+    #[test]
+    fn test_all_fixed_params_nan_model_poisson_lbfgsb() {
+        // Exercise the NaN guard in poisson_fit_lbfgsb.
+        // When all parameters are fixed and the model produces NaN, the result
+        // must report converged=false.
+        struct NanModel;
+        impl FitModel for NanModel {
+            fn evaluate(&self, _params: &[f64]) -> Vec<f64> {
+                vec![f64::NAN; 5]
+            }
+        }
+
+        let y_obs = vec![10.0; 5];
+        let flux = vec![1000.0; 5];
+        let cross_sections = vec![vec![1.0; 5]];
+        let density_indices = vec![0];
+        let mut params = ParameterSet::new(vec![FitParameter::fixed("density", 0.5)]);
+
+        let result = poisson_fit_lbfgsb(
+            &NanModel,
+            &y_obs,
+            &flux,
+            &cross_sections,
+            &density_indices,
+            &mut params,
+            &PoissonConfig::default(),
+            None,
+        );
+
+        assert!(
+            !result.converged,
+            "All-fixed NaN model should not converge in poisson_fit_lbfgsb"
+        );
+        assert!(!result.nll.is_finite(), "NLL should be non-finite");
+        assert_eq!(result.iterations, 0);
+    }
+
+    #[test]
+    fn test_lbfgsb_matches_analytic_result() {
+        // Both poisson_fit_analytic and poisson_fit_lbfgsb should converge
+        // to the same answer on a clean exponential model.
+        let x: Vec<f64> = (0..20).map(|i| i as f64 * 0.5).collect();
+        let true_b = 0.5;
+        let flux: Vec<f64> = vec![1000.0; x.len()];
+
+        let model = ExponentialModel {
+            x: x.clone(),
+            flux: flux.clone(),
+        };
+        let y_obs = model.evaluate(&[true_b]);
+        let cross_sections = vec![x.clone()];
+
+        // Analytic path
+        let mut params_an = ParameterSet::new(vec![FitParameter::non_negative("b", 1.0)]);
+        let res_an = poisson_fit_analytic(
+            &model,
+            &y_obs,
+            &flux,
+            &cross_sections,
+            &[0],
+            &mut params_an,
+            &PoissonConfig::default(),
+            None,
+        );
+
+        // L-BFGS-B path
+        let mut params_lb = ParameterSet::new(vec![FitParameter::non_negative("b", 1.0)]);
+        let res_lb = poisson_fit_lbfgsb(
+            &model,
+            &y_obs,
+            &flux,
+            &cross_sections,
+            &[0],
+            &mut params_lb,
+            &PoissonConfig::default(),
+            None,
+        );
+
+        assert!(res_an.converged, "Analytic did not converge");
+        assert!(res_lb.converged, "L-BFGS-B did not converge");
+        assert!(
+            (res_an.params[0] - res_lb.params[0]).abs() < 1e-4,
+            "Analytic={}, L-BFGS-B={} should agree",
+            res_an.params[0],
+            res_lb.params[0],
+        );
+        // Note: L-BFGS-B is not guaranteed to use fewer iterations than the
+        // Fisher-preconditioned gradient on all problems (especially 1D where
+        // it starts with no curvature history), so no iteration-count comparison
+        // is asserted here.
+    }
+
+    #[test]
+    fn test_lbfgsb_two_isotopes() {
+        // Two-isotope model: Y = Phi * exp(-n1*sigma1 - n2*sigma2)
+        let n_e = 30;
+        let sigma1: Vec<f64> = (0..n_e).map(|i| 1.0 + 0.1 * i as f64).collect();
+        let sigma2: Vec<f64> = (0..n_e).map(|i| 0.5 + 0.05 * (n_e - i) as f64).collect();
+        let flux: Vec<f64> = vec![500.0; n_e];
+        let true_n1 = 0.3;
+        let true_n2 = 0.7;
+
+        struct TwoIsotopeModel {
+            sigma1: Vec<f64>,
+            sigma2: Vec<f64>,
+            flux: Vec<f64>,
+        }
+        impl FitModel for TwoIsotopeModel {
+            fn evaluate(&self, params: &[f64]) -> Vec<f64> {
+                let (n1, n2) = (params[0], params[1]);
+                self.sigma1
+                    .iter()
+                    .zip(self.sigma2.iter())
+                    .zip(self.flux.iter())
+                    .map(|((&s1, &s2), &f)| f * (-n1 * s1 - n2 * s2).exp())
+                    .collect()
+            }
+        }
+
+        let model = TwoIsotopeModel {
+            sigma1: sigma1.clone(),
+            sigma2: sigma2.clone(),
+            flux: flux.clone(),
+        };
+        let y_obs = model.evaluate(&[true_n1, true_n2]);
+
+        let mut params = ParameterSet::new(vec![
+            FitParameter::non_negative("n1", 0.1),
+            FitParameter::non_negative("n2", 0.1),
+        ]);
+
+        let result = poisson_fit_lbfgsb(
+            &model,
+            &y_obs,
+            &flux,
+            &[sigma1, sigma2],
+            &[0, 1],
+            &mut params,
+            &PoissonConfig::default(),
+            None,
+        );
+
+        assert!(
+            result.converged,
+            "L-BFGS-B two-isotope did not converge after {} iters",
+            result.iterations,
+        );
+        assert!(
+            (result.params[0] - true_n1).abs() / true_n1 < 0.01,
+            "n1: fitted={}, true={}",
+            result.params[0],
+            true_n1,
+        );
+        assert!(
+            (result.params[1] - true_n2).abs() / true_n2 < 0.01,
+            "n2: fitted={}, true={}",
+            result.params[1],
+            true_n2,
+        );
+    }
+
+    #[test]
+    fn test_lbfgsb_temperature_recovery() {
+        // Joint density + temperature fit using L-BFGS-B.
+        // This is the KEY benchmark: L-BFGS-B should converge in <200
+        // iterations (vs 5000 for the diagonal Fisher preconditioner).
+        use nereids_core::types::Isotope;
+        use nereids_endf::resonance::{LGroup, Resonance, ResonanceFormalism, ResonanceRange};
+        use nereids_physics::transmission;
+
+        let resonance_data = vec![nereids_endf::resonance::ResonanceData {
+            isotope: Isotope::new(92, 238).unwrap(),
+            za: 92238,
+            awr: 236.006,
+            ranges: vec![ResonanceRange {
+                energy_low: 1e-5,
+                energy_high: 1e4,
+                resolved: true,
+                formalism: ResonanceFormalism::ReichMoore,
+                target_spin: 0.0,
+                scattering_radius: 9.4285,
+                naps: 0,
+                l_groups: vec![LGroup {
+                    l: 0,
+                    awr: 236.006,
+                    apl: 0.0,
+                    qx: 0.0,
+                    lrx: 0,
+                    resonances: vec![Resonance {
+                        energy: 6.674,
+                        j: 0.5,
+                        gn: 1.493e-3,
+                        gg: 23.0e-3,
+                        gfa: 0.0,
+                        gfb: 0.0,
+                    }],
+                }],
+                rml: None,
+                urr: None,
+                ap_table: None,
+            }],
+        }];
+
+        let energies: Vec<f64> = (0..201).map(|i| 4.0 + (i as f64) * 0.025).collect();
+        let n_e = energies.len();
+        let true_density = 0.0005;
+        let true_temp = 300.0;
+        let flux: Vec<f64> = vec![10000.0; n_e];
+
+        let xs_true = transmission::broadened_cross_sections(
+            &energies,
+            &resonance_data,
+            true_temp,
+            None,
+            None,
+        )
+        .unwrap();
+        let y_obs: Vec<f64> = (0..n_e)
+            .map(|e| {
+                let t = (-true_density * xs_true[0][e]).exp();
+                flux[e] * t
+            })
+            .collect();
+
+        use nereids_physics::transmission::SampleParams;
+        struct PhysicsCountsModel {
+            energies: Vec<f64>,
+            resonance_data: Vec<nereids_endf::resonance::ResonanceData>,
+            flux: Vec<f64>,
+        }
+        impl FitModel for PhysicsCountsModel {
+            fn evaluate(&self, params: &[f64]) -> Vec<f64> {
+                let density = params[0];
+                let temperature = params[1];
+                let sample = SampleParams {
+                    temperature_k: temperature,
+                    isotopes: vec![(self.resonance_data[0].clone(), density)],
+                };
+                let transmission = transmission::forward_model(&self.energies, &sample, None);
+                transmission
+                    .iter()
+                    .zip(self.flux.iter())
+                    .map(|(&t, &f)| f * t)
+                    .collect()
+            }
+        }
+
+        let model = PhysicsCountsModel {
+            energies: energies.clone(),
+            resonance_data: resonance_data.clone(),
+            flux: flux.clone(),
+        };
+
+        let init_temp = 200.0;
+        let xs_init = transmission::broadened_cross_sections(
+            &energies,
+            &resonance_data,
+            init_temp,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let mut params = ParameterSet::new(vec![
+            FitParameter::non_negative("density", 0.001),
+            FitParameter {
+                name: "temperature".into(),
+                value: init_temp,
+                lower: 50.0,
+                upper: 1000.0,
+                fixed: false,
+            },
+        ]);
+
+        let temp_ctx = TemperatureContext {
+            temperature_index: 1,
+            resonance_data: resonance_data.clone(),
+            energies: energies.clone(),
+            instrument: None,
+        };
+
+        let config = PoissonConfig {
+            max_iter: 200,
+            tol_param: 1e-12,
+            ..PoissonConfig::default()
+        };
+
+        let result = poisson_fit_lbfgsb(
+            &model,
+            &y_obs,
+            &flux,
+            &xs_init,
+            &[0],
+            &mut params,
+            &config,
+            Some(&temp_ctx),
+        );
+
+        assert!(
+            result.converged,
+            "L-BFGS-B temperature+density fit did not converge after {} iterations",
+            result.iterations,
+        );
+        let fitted_density = result.params[0];
+        let fitted_temp = result.params[1];
+        assert!(
+            (fitted_density - true_density).abs() / true_density < 0.01,
+            "density: fitted={}, true={}, error={:.2}%",
+            fitted_density,
+            true_density,
+            (fitted_density - true_density).abs() / true_density * 100.0,
+        );
+        assert!(
+            (fitted_temp - true_temp).abs() / true_temp < 0.01,
+            "temperature: fitted={:.1}, true={:.1}, error={:.2}%",
+            fitted_temp,
+            true_temp,
+            (fitted_temp - true_temp).abs() / true_temp * 100.0,
+        );
+        // The `converged` check above already verifies the optimizer did not
+        // hit the iteration limit, so no separate iteration-count assertion is
+        // needed (it would be fragile across platforms and BLAS implementations).
+    }
+
+    #[test]
+    fn test_lbfgsb_zero_density() {
+        // True density is ~0; verify convergence near the lower bound
+        // without NaN or divergence.
+        let x: Vec<f64> = (0..20).map(|i| i as f64 * 0.5).collect();
+        let flux: Vec<f64> = vec![1000.0; x.len()];
+
+        let model = ExponentialModel {
+            x: x.clone(),
+            flux: flux.clone(),
+        };
+        let y_obs = model.evaluate(&[0.0]);
+        let cross_sections = vec![x.clone()];
+
+        let mut params = ParameterSet::new(vec![FitParameter::non_negative("b", 0.5)]);
+
+        let result = poisson_fit_lbfgsb(
+            &model,
+            &y_obs,
+            &flux,
+            &cross_sections,
+            &[0],
+            &mut params,
+            &PoissonConfig::default(),
+            None,
+        );
+
+        assert!(
+            result.converged,
+            "L-BFGS-B zero-density fit did not converge"
+        );
+        assert!(
+            result.params[0] < 0.01,
+            "b should be ~0, got {}",
+            result.params[0],
+        );
+        assert!(
+            result.params[0] >= 0.0,
+            "b must be non-negative, got {}",
+            result.params[0],
+        );
+    }
+
+    #[test]
+    fn test_lbfgsb_all_fixed() {
+        // All parameters fixed — should return immediately with 0 iterations.
+        let x: Vec<f64> = (0..10).map(|i| i as f64 * 0.5).collect();
+        let flux: Vec<f64> = vec![100.0; x.len()];
+        let model = ExponentialModel {
+            x: x.clone(),
+            flux: flux.clone(),
+        };
+        let y_obs = model.evaluate(&[0.5]);
+        let cross_sections = vec![x.clone()];
+
+        let mut params = ParameterSet::new(vec![FitParameter::fixed("b", 0.5)]);
+
+        let result = poisson_fit_lbfgsb(
+            &model,
+            &y_obs,
+            &flux,
+            &cross_sections,
+            &[0],
+            &mut params,
+            &PoissonConfig::default(),
+            None,
+        );
+
+        assert!(
+            result.converged,
+            "All-fixed L-BFGS-B should converge immediately"
+        );
+        assert!(result.nll.is_finite(), "NLL should be finite");
+        assert_eq!(result.iterations, 0);
+    }
+
+    #[test]
+    fn test_lbfgsb_memory_one() {
+        // Edge case: L-BFGS-B with m=1 (minimal memory).  Should still
+        // converge, possibly needing more iterations than default m=7.
+        let x: Vec<f64> = (0..20).map(|i| i as f64 * 0.5).collect();
+        let true_b = 0.5;
+        let flux: Vec<f64> = vec![1000.0; x.len()];
+
+        let model = ExponentialModel {
+            x: x.clone(),
+            flux: flux.clone(),
+        };
+        let y_obs = model.evaluate(&[true_b]);
+        let cross_sections = vec![x.clone()];
+
+        let mut params = ParameterSet::new(vec![FitParameter::non_negative("b", 1.0)]);
+
+        let config = PoissonConfig {
+            lbfgsb_memory: 1,
+            max_iter: 500, // allow more iterations for minimal memory
+            ..PoissonConfig::default()
+        };
+
+        let result = poisson_fit_lbfgsb(
+            &model,
+            &y_obs,
+            &flux,
+            &cross_sections,
+            &[0],
+            &mut params,
+            &config,
+            None,
+        );
+
+        assert!(
+            result.converged,
+            "L-BFGS-B with m=1 did not converge after {} iterations",
+            result.iterations,
+        );
+        assert!(
+            (result.params[0] - true_b).abs() / true_b < 0.01,
+            "m=1: fitted={}, true={}, error={:.2}%",
+            result.params[0],
+            true_b,
+            (result.params[0] - true_b).abs() / true_b * 100.0,
+        );
     }
 }
