@@ -106,12 +106,8 @@ After all reviews complete:
 4. Report the iteration number: "Review Round N of 4"
 5. **Present the consolidated report to the user** and ask which findings to fix
 
-**Oscillating findings**: If a finding was "fixed" in a previous round but
-reappears (or its fix was reverted/reclassified), flag it prominently as
-**RECURRING**. This signals a design disagreement between reviewers — the
-user must decide the correct approach rather than letting the pipeline
-ping-pong. (Lesson: the ENDF LFW check oscillated for 3 rounds before the
-user decided to remove it entirely.)
+**Oscillating findings**: If a finding reappears after being "fixed", flag
+it as **RECURRING** — the user must decide the approach.
 
 IMPORTANT: Do NOT proceed to fixing without user approval. The consolidation
 step is an explicit gate.
@@ -179,13 +175,7 @@ git fetch origin && git checkout main && git pull origin main
 cargo test --workspace --exclude nereids-python
 ```
 
-This catches cross-PR regressions (e.g., a test in crate A that depended
-on behavior changed by a PR in crate B). If tests fail, fix on main
-immediately — these are integration bugs, not review failures.
-
-**Lesson**: The U-233 LFW=1 test broke after merging 4 PRs because the
-test expected old behavior that was changed in a different PR. Each branch
-passed in isolation, but the merged state failed.
+This catches cross-PR regressions. If tests fail, fix on main immediately.
 
 ## Step 10: Track Deferred P2 Findings
 
@@ -200,26 +190,14 @@ consolidation:
    - Reference the corresponding merged PR
 3. Report the created issue numbers to the user
 
-This ensures P2s aren't forgotten without blocking the merge. In the past
-two pipeline runs, ~20 P2s were identified but no tracking issues were
-created. This is a process gap.
+This ensures P2s aren't forgotten without blocking the merge.
 
-## Pre-commit Checklist (per CLAUDE.md)
+## Subagent Prompt Requirements
 
-Before every commit in every worktree:
-```bash
-cargo fmt --all
-cargo clippy --workspace --exclude nereids-python -- -D warnings
-cargo test --workspace --exclude nereids-python
-```
+When launching implementation or fix subagents, ALWAYS include:
 
-## Copilot Re-iteration Gate (Phase B — for reference)
-
-After the developer triggers Copilot review and fetches comments, the
-combined threshold from CLAUDE.md applies:
-
-- **Re-iterate** if: 3+ confirmed P1s OR P1 ratio > 40% of findings
-- **Merge** if: 0-2 P1s and ratio ≤ 40% (fix inline, push, merge)
-
-This gate is evaluated by the developer + Claude together, not
-automatically by this pipeline.
+- **Tooling**: "Use `pixi run build` / `pixi run test-python` — never
+  raw `maturin develop` or `pip install`."
+- **Pattern matching**: "Match patterns already used in the file you're
+  editing. Check existing code before introducing new API calls."
+- **Pre-commit**: "Run the pre-commit checklist from CLAUDE.md."
