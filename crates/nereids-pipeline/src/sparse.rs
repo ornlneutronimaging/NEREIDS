@@ -302,7 +302,21 @@ pub fn sparse_reconstruct(
         None => return Err(PipelineError::Cancelled),
     };
     let xs: Arc<Vec<Vec<f64>>> = Arc::new(xs_raw);
-    let density_idx: Vec<usize> = (0..n_isotopes).collect();
+    let density_idx: Arc<Vec<usize>> = Arc::new((0..n_isotopes).collect());
+
+    // Pre-build parameter template outside the pixel loop so that per-pixel
+    // iterations only need a cheap Clone (no String formatting via format!).
+    // isotope_names.len() == n_isotopes is validated above, so direct indexing
+    // is safe — the previous .get(i).unwrap_or_else(|| format!(...)) fallback
+    // was unreachable dead code.
+    let param_template = ParameterSet::new(
+        config
+            .initial_densities
+            .iter()
+            .enumerate()
+            .map(|(i, &d)| FitParameter::non_negative(config.isotope_names[i].clone(), d))
+            .collect(),
+    );
 
     // Collect pixel coordinates
     let mut pixel_coords: Vec<(usize, usize)> = Vec::new();
@@ -339,7 +353,7 @@ pub fn sparse_reconstruct(
             // avoiding expensive repeated Doppler/resolution broadening.
             let t_model = PrecomputedTransmissionModel {
                 cross_sections: Arc::clone(&xs),
-                density_indices: density_idx.clone(),
+                density_indices: Arc::clone(&density_idx),
             };
 
             // Wrap in counts model: Y = flux * T(theta) + background.
@@ -355,23 +369,7 @@ pub fn sparse_reconstruct(
             // poisson_fit_analytic to compute the full dNLL/dn_k gradient vector
             // in one model evaluation per iteration instead of N_isotopes+1
             // evaluations with finite differences (one base + one per parameter).
-            let mut params = ParameterSet::new(
-                config
-                    .initial_densities
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &d)| {
-                        FitParameter::non_negative(
-                            config
-                                .isotope_names
-                                .get(i)
-                                .cloned()
-                                .unwrap_or_else(|| format!("isotope_{}", i)),
-                            d,
-                        )
-                    })
-                    .collect(),
-            );
+            let mut params = param_template.clone();
 
             let result = poisson::poisson_fit_analytic(
                 &counts_model,

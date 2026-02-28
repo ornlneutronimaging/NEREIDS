@@ -5,6 +5,14 @@
 //! isotopes of the same element.
 
 /// A single fit parameter with value, bounds, and fixed/free flag.
+///
+/// The `name` field uses `String` rather than `Arc<str>` or `Cow<'static, str>`.
+/// For typical isotope names (e.g. "U-238", "isotope_0") the per-pixel clone
+/// cost is negligible compared to the Poisson/LM optimization work (~100s of
+/// model evaluations per pixel).  Switching to `Arc<str>` would save ~4-16
+/// small heap allocations per pixel but adds API complexity and lifetime
+/// constraints that are not justified at current workload sizes (1-4 isotopes
+/// × 16K pixels ≈ 64K short-string copies vs millions of FP ops).
 #[derive(Debug, Clone)]
 pub struct FitParameter {
     /// Parameter name (for reporting).
@@ -111,6 +119,26 @@ impl ParameterSet {
     /// Get the value of all parameters (fixed + free) as a vector.
     pub fn all_values(&self) -> Vec<f64> {
         self.params.iter().map(|p| p.value).collect()
+    }
+
+    /// Write all parameter values into the provided buffer, resizing if needed.
+    ///
+    /// This is the buffer-reuse counterpart of [`all_values`](Self::all_values).
+    /// Callers that fit many pixels in a loop can allocate one `Vec<f64>` and
+    /// reuse it across iterations to avoid per-pixel allocation churn.
+    pub fn all_values_into(&self, buf: &mut Vec<f64>) {
+        buf.clear();
+        buf.extend(self.params.iter().map(|p| p.value));
+    }
+
+    /// Write free parameter values into the provided buffer, resizing if needed.
+    ///
+    /// This is the buffer-reuse counterpart of [`free_values`](Self::free_values).
+    /// Callers that fit many pixels in a loop can allocate one `Vec<f64>` and
+    /// reuse it across iterations to avoid per-pixel allocation churn.
+    pub fn free_values_into(&self, buf: &mut Vec<f64>) {
+        buf.clear();
+        buf.extend(self.params.iter().filter(|p| !p.fixed).map(|p| p.value));
     }
 
     /// Indices (into `params`) of free parameters.
