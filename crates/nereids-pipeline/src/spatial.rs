@@ -178,16 +178,13 @@ pub fn spatial_map(
                     resolution: r.clone(),
                 });
                 // Pass the cancel token so precompute can bail between isotopes.
-                // Returns None if cancelled mid-precompute.
-                let Some(xs) = broadened_cross_sections(
+                let xs = broadened_cross_sections(
                     &config.energies,
                     &config.resonance_data,
                     config.temperature_k,
                     instrument_params.as_ref(),
                     cancel,
-                ) else {
-                    return Err(PipelineError::Cancelled);
-                };
+                )?;
                 Arc::new(xs)
             }
         };

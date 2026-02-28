@@ -22,13 +22,54 @@
 //! - `cro/` and `xxx/` modules — cross-section to transmission conversion
 //! - Manual Section 2 (transmission definition), Section 5 (experimental corrections)
 
+use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use nereids_endf::resonance::ResonanceData;
 
 use crate::doppler::{self, DopplerParams};
 use crate::reich_moore;
-use crate::resolution::{self, ResolutionFunction};
+use crate::resolution::{self, ResolutionError, ResolutionFunction};
+
+/// Errors from the transmission forward model.
+#[derive(Debug)]
+pub enum TransmissionError {
+    /// The energy grid is not sorted or has a length mismatch with data.
+    Resolution(ResolutionError),
+    /// Computation was cancelled via the cancel token.
+    Cancelled,
+}
+
+impl fmt::Display for TransmissionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Resolution(e) => write!(f, "resolution broadening error: {}", e),
+            Self::Cancelled => write!(f, "computation cancelled"),
+        }
+    }
+}
+
+impl std::error::Error for TransmissionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Resolution(e) => Some(e),
+            Self::Cancelled => None,
+        }
+    }
+}
+
+impl From<ResolutionError> for TransmissionError {
+    fn from(e: ResolutionError) -> Self {
+        Self::Resolution(e)
+    }
+}
+
+/// Broadened cross-sections and their temperature derivative.
+///
+/// `xs[k][e]` is the Doppler+resolution-broadened cross-section for isotope
+/// `k` at energy index `e`; `dxs_dt[k][e]` is the central finite-difference
+/// derivative with respect to temperature.
+pub type BroadenedXsWithDerivative = (Vec<Vec<f64>>, Vec<Vec<f64>>);
 
 /// Compute transmission from cross-sections via Beer-Lambert law.
 ///
@@ -104,14 +145,25 @@ pub struct InstrumentParams {
 ///
 /// # Returns
 /// Theoretical transmission spectrum on the energy grid.
+///
+/// # Errors
+/// Returns [`TransmissionError::Resolution`] if resolution broadening is
+/// enabled (`instrument` is `Some`) and `energies` is not sorted ascending.
 pub fn forward_model(
     energies: &[f64],
     sample: &SampleParams,
     instrument: Option<&InstrumentParams>,
-) -> Vec<f64> {
+) -> Result<Vec<f64>, TransmissionError> {
     let n = energies.len();
     if n == 0 {
-        return vec![];
+        return Ok(vec![]);
+    }
+
+    // Validate energy grid once before the per-isotope loop so that
+    // resolution broadening can use the presorted (unchecked) path,
+    // avoiding redundant O(N) sort checks per isotope.
+    if instrument.is_some() && !energies.windows(2).all(|w| w[0] <= w[1]) {
+        return Err(ResolutionError::UnsortedEnergies.into());
     }
 
     // Accumulate total attenuation: Σᵢ thicknessᵢ × σᵢ(E)
@@ -142,9 +194,9 @@ pub fn forward_model(
             unbroadened
         };
 
-        // 3. Apply resolution broadening
+        // 3. Apply resolution broadening (energy grid pre-validated above)
         let after_resolution = if let Some(inst) = instrument {
-            resolution::apply_resolution(energies, &after_doppler, &inst.resolution)
+            resolution::apply_resolution_presorted(energies, &after_doppler, &inst.resolution)
         } else {
             after_doppler
         };
@@ -156,7 +208,7 @@ pub fn forward_model(
     }
 
     // 5. Beer-Lambert: T = exp(-attenuation)
-    total_attenuation.iter().map(|&att| (-att).exp()).collect()
+    Ok(total_attenuation.iter().map(|&att| (-att).exp()).collect())
 }
 
 /// Compute Doppler- and resolution-broadened cross-sections for each isotope.
@@ -172,18 +224,28 @@ pub fn forward_model(
 /// * `temperature_k`   — Sample temperature for Doppler broadening.
 /// * `instrument`      — Optional instrument resolution parameters.
 /// * `cancel`          — Optional cancellation token.  When set, the function
-///   returns `None` after completing the current isotope.
+///   returns `Err(TransmissionError::Cancelled)` after completing the current isotope.
 ///
 /// # Returns
-/// `Some(xs)` — one cross-section vector per isotope — on success.
-/// `None` if the `cancel` flag was observed between isotopes.
+/// One cross-section vector per isotope on success.
+///
+/// # Errors
+/// * [`TransmissionError::Cancelled`] — if the `cancel` flag was observed
+///   between isotopes.
+/// * [`TransmissionError::Resolution`] — if resolution broadening is enabled
+///   (`instrument` is `Some`) and `energies` is not sorted ascending.
 pub fn broadened_cross_sections(
     energies: &[f64],
     resonance_data: &[ResonanceData],
     temperature_k: f64,
     instrument: Option<&InstrumentParams>,
     cancel: Option<&AtomicBool>,
-) -> Option<Vec<Vec<f64>>> {
+) -> Result<Vec<Vec<f64>>, TransmissionError> {
+    // Validate energy grid once before the per-isotope loop.
+    if instrument.is_some() && !energies.windows(2).all(|w| w[0] <= w[1]) {
+        return Err(ResolutionError::UnsortedEnergies.into());
+    }
+
     let mut result = Vec::with_capacity(resonance_data.len());
 
     for rd in resonance_data {
@@ -191,7 +253,7 @@ pub fn broadened_cross_sections(
         // step can be expensive (Doppler FGM × N_energy), so we bail here
         // rather than inside the inner loop.
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
-            return None;
+            return Err(TransmissionError::Cancelled);
         }
 
         // 1. Unbroadened total cross-sections
@@ -214,9 +276,9 @@ pub fn broadened_cross_sections(
             unbroadened
         };
 
-        // 3. Resolution broadening
+        // 3. Resolution broadening (energy grid pre-validated above)
         let xs = if let Some(inst) = instrument {
-            resolution::apply_resolution(energies, &after_doppler, &inst.resolution)
+            resolution::apply_resolution_presorted(energies, &after_doppler, &inst.resolution)
         } else {
             after_doppler
         };
@@ -224,7 +286,7 @@ pub fn broadened_cross_sections(
         result.push(xs);
     }
 
-    Some(result)
+    Ok(result)
 }
 
 /// Compute broadened cross-sections and their temperature derivative.
@@ -240,24 +302,26 @@ pub fn broadened_cross_sections(
 ///
 /// # Cost
 /// Three calls to `broadened_cross_sections` (at T, T+dT, T-dT).
+///
+/// # Errors
+/// Returns [`TransmissionError::Resolution`] if resolution broadening is
+/// enabled (`instrument` is `Some`) and `energies` is not sorted ascending.
 pub fn broadened_cross_sections_with_derivative(
     energies: &[f64],
     resonance_data: &[ResonanceData],
     temperature_k: f64,
     instrument: Option<&InstrumentParams>,
-) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
+) -> Result<BroadenedXsWithDerivative, TransmissionError> {
     let dt = 1e-4 * (1.0 + temperature_k);
     let t_up = temperature_k + dt;
     let t_down = (temperature_k - dt).max(0.1); // stay physical
     let actual_2dt = t_up - t_down;
 
+    // No cancel token passed, so only ResolutionError can occur.
     let xs_center =
-        broadened_cross_sections(energies, resonance_data, temperature_k, instrument, None)
-            .expect("broadened_cross_sections should not be cancelled (no cancel token)");
-    let xs_up = broadened_cross_sections(energies, resonance_data, t_up, instrument, None)
-        .expect("broadened_cross_sections should not be cancelled (no cancel token)");
-    let xs_down = broadened_cross_sections(energies, resonance_data, t_down, instrument, None)
-        .expect("broadened_cross_sections should not be cancelled (no cancel token)");
+        broadened_cross_sections(energies, resonance_data, temperature_k, instrument, None)?;
+    let xs_up = broadened_cross_sections(energies, resonance_data, t_up, instrument, None)?;
+    let xs_down = broadened_cross_sections(energies, resonance_data, t_down, instrument, None)?;
 
     let dxs_dt: Vec<Vec<f64>> = xs_up
         .iter()
@@ -270,7 +334,7 @@ pub fn broadened_cross_sections_with_derivative(
         })
         .collect();
 
-    (xs_center, dxs_dt)
+    Ok((xs_center, dxs_dt))
 }
 
 #[cfg(test)]
@@ -415,7 +479,7 @@ mod tests {
             temperature_k: 0.0,
             isotopes: vec![(data, thickness)],
         };
-        let t_forward = forward_model(&energies, &sample, None);
+        let t_forward = forward_model(&energies, &sample, None).unwrap();
 
         for i in 0..energies.len() {
             assert!(
@@ -442,14 +506,14 @@ mod tests {
             temperature_k: 0.0,
             isotopes: vec![(data.clone(), thickness)],
         };
-        let t_cold = forward_model(&energies, &sample_cold, None);
+        let t_cold = forward_model(&energies, &sample_cold, None).unwrap();
 
         // Hot (300 K Doppler)
         let sample_hot = SampleParams {
             temperature_k: 300.0,
             isotopes: vec![(data, thickness)],
         };
-        let t_hot = forward_model(&energies, &sample_hot, None);
+        let t_hot = forward_model(&energies, &sample_hot, None).unwrap();
 
         // Find minima
         let min_cold = t_cold.iter().cloned().fold(f64::MAX, f64::min);
@@ -509,7 +573,7 @@ mod tests {
             temperature_k: 0.0,
             isotopes: vec![(u238, 0.0001), (other, 0.0001)],
         };
-        let t = forward_model(&energies, &sample, None);
+        let t = forward_model(&energies, &sample, None).unwrap();
 
         // Find the transmission near 6.674 eV (U-238 resonance)
         let idx_u238 = energies
@@ -552,7 +616,8 @@ mod tests {
         let temperature = 300.0;
 
         let (xs, dxs_dt) =
-            broadened_cross_sections_with_derivative(&energies, &[data.clone()], temperature, None);
+            broadened_cross_sections_with_derivative(&energies, &[data.clone()], temperature, None)
+                .unwrap();
 
         // Basic shape checks
         assert_eq!(xs.len(), 1, "one isotope");

@@ -242,13 +242,13 @@ impl PyTabulatedResolution {
     /// Number of reference energies.
     #[getter]
     fn n_energies(&self) -> usize {
-        self.inner.ref_energies.len()
+        self.inner.ref_energies().len()
     }
 
     /// Energy range (min, max) of the reference kernels in eV.
     #[getter]
     fn energy_range(&self) -> (f64, f64) {
-        let e = &self.inner.ref_energies;
+        let e = self.inner.ref_energies();
         if e.is_empty() {
             (0.0, 0.0)
         } else {
@@ -259,14 +259,14 @@ impl PyTabulatedResolution {
     /// Flight path length in meters.
     #[getter]
     fn flight_path_m(&self) -> f64 {
-        self.inner.flight_path_m
+        self.inner.flight_path_m()
     }
 
     /// Number of points per kernel.
     #[getter]
     fn points_per_kernel(&self) -> usize {
         self.inner
-            .kernels
+            .kernels()
             .first()
             .map(|(o, _)| o.len())
             .unwrap_or(0)
@@ -279,7 +279,7 @@ impl PyTabulatedResolution {
             self.n_energies(),
             lo,
             hi,
-            self.inner.flight_path_m,
+            self.inner.flight_path_m(),
         )
     }
 }
@@ -515,7 +515,8 @@ fn forward_model<'py>(
     let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution)?;
     let instrument = res_fn.map(|r| InstrumentParams { resolution: r });
 
-    let t = transmission::forward_model(e, &sample, instrument.as_ref());
+    let t = transmission::forward_model(e, &sample, instrument.as_ref())
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
     Ok(PyArray1::from_vec(py, t))
 }
 
@@ -729,10 +730,11 @@ fn fit_spectrum(
                     instrument.as_ref(),
                     None,
                 )
-                .ok_or_else(|| {
-                    pyo3::exceptions::PyRuntimeError::new_err(
-                        "broadened_cross_sections returned None (cancellation) despite cancel=None; this should be unreachable",
-                    )
+                .map_err(|e| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "broadened_cross_sections failed: {}",
+                        e
+                    ))
                 })?;
 
                 // Build density parameters.
@@ -1296,7 +1298,8 @@ fn resolution_broaden<'py>(
         delta_t_us,
         delta_l_m,
     };
-    let result = resolution::resolution_broaden(e, xs, &params);
+    let result = resolution::resolution_broaden(e, xs, &params)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
     Ok(PyArray1::from_vec(py, result))
 }
 
@@ -1361,7 +1364,8 @@ fn py_apply_resolution<'py>(
     validate_energy_grid(e)?;
 
     let res_fn = ResolutionFunction::Tabulated(resolution.inner.clone());
-    let result = resolution::apply_resolution(e, s, &res_fn);
+    let result = resolution::apply_resolution(e, s, &res_fn)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
     Ok(PyArray1::from_vec(py, result))
 }
 
@@ -2303,11 +2307,8 @@ fn precompute_cross_sections<'py>(
     });
 
     // GIL is re-acquired after detach returns — use `py` directly.
-    let xs = xs.ok_or_else(|| {
-        pyo3::exceptions::PyRuntimeError::new_err(
-            "broadened_cross_sections returned None (cancellation) despite cancel=None; \
-             this should be unreachable and likely indicates an internal error",
-        )
+    let xs = xs.map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("broadened_cross_sections failed: {}", e))
     })?;
 
     Ok(xs.into_iter().map(|v| PyArray1::from_vec(py, v)).collect())
