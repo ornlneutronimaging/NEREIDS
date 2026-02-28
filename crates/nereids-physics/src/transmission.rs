@@ -140,8 +140,13 @@ pub fn forward_model(
         };
 
         // 3. Apply resolution broadening
+        //    The energy grid passed to forward_model must be sorted ascending;
+        //    resolution::apply_resolution validates this and returns Err on
+        //    unsorted input.  We unwrap here because forward_model's contract
+        //    already requires sorted energies (documented in its doc comment).
         let after_resolution = if let Some(inst) = instrument {
             resolution::apply_resolution(energies, &after_doppler, &inst.resolution)
+                .expect("resolution broadening failed: energy grid must be sorted ascending")
         } else {
             after_doppler
         };
@@ -209,8 +214,10 @@ pub fn broadened_cross_sections(
         };
 
         // 3. Resolution broadening
+        //    See forward_model comment — energy grid must be sorted ascending.
         let xs = if let Some(inst) = instrument {
             resolution::apply_resolution(energies, &after_doppler, &inst.resolution)
+                .expect("resolution broadening failed: energy grid must be sorted ascending")
         } else {
             after_doppler
         };

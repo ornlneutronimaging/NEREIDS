@@ -1304,7 +1304,8 @@ fn resolution_broaden<'py>(
         delta_t_us,
         delta_l_m,
     };
-    let result = resolution::resolution_broaden(e, xs, &params);
+    let result = resolution::resolution_broaden(e, xs, &params)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
     Ok(PyArray1::from_vec(py, result))
 }
 
@@ -1369,7 +1370,8 @@ fn py_apply_resolution<'py>(
     validate_energy_grid(e)?;
 
     let res_fn = ResolutionFunction::Tabulated(resolution.inner.clone());
-    let result = resolution::apply_resolution(e, s, &res_fn);
+    let result = resolution::apply_resolution(e, s, &res_fn)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
     Ok(PyArray1::from_vec(py, result))
 }
 

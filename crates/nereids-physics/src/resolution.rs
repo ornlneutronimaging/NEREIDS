@@ -36,6 +36,33 @@ use std::fmt;
 /// Derived from t = L / √(2E/m_n), converting to microseconds.
 const TOF_FACTOR: f64 = 72.298;
 
+/// Errors from resolution broadening operations.
+#[derive(Debug)]
+pub enum ResolutionError {
+    /// The energy grid is not sorted in ascending order.
+    UnsortedEnergies,
+    /// The energy grid and data arrays have mismatched lengths.
+    LengthMismatch { energies: usize, data: usize },
+}
+
+impl fmt::Display for ResolutionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsortedEnergies => write!(
+                f,
+                "energy grid must be sorted in non-descending order for binary search"
+            ),
+            Self::LengthMismatch { energies, data } => write!(
+                f,
+                "energy grid length ({}) must match data length ({})",
+                energies, data
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ResolutionError {}
+
 /// Resolution function parameters for time-of-flight instruments.
 #[derive(Debug, Clone, Copy)]
 pub struct ResolutionParams {
@@ -88,20 +115,29 @@ impl ResolutionParams {
 ///
 /// # Returns
 /// Resolution-broadened cross-sections on the same energy grid.
+///
+/// # Errors
+/// Returns [`ResolutionError::LengthMismatch`] if the arrays differ in length,
+/// or [`ResolutionError::UnsortedEnergies`] if the energy grid is not sorted
+/// in non-descending order.
 pub fn resolution_broaden(
     energies: &[f64],
     cross_sections: &[f64],
     params: &ResolutionParams,
-) -> Vec<f64> {
-    assert_eq!(energies.len(), cross_sections.len());
-    debug_assert!(
-        energies.windows(2).all(|w| w[0] <= w[1]),
-        "energies must be sorted ascending for partition_point"
-    );
+) -> Result<Vec<f64>, ResolutionError> {
+    if energies.len() != cross_sections.len() {
+        return Err(ResolutionError::LengthMismatch {
+            energies: energies.len(),
+            data: cross_sections.len(),
+        });
+    }
+    if !energies.windows(2).all(|w| w[0] <= w[1]) {
+        return Err(ResolutionError::UnsortedEnergies);
+    }
 
     let n = energies.len();
     if n == 0 {
-        return vec![];
+        return Ok(vec![]);
     }
 
     let n_sigma = 5.0; // Integrate out to 5σ
@@ -157,7 +193,7 @@ pub fn resolution_broaden(
         }
     }
 
-    broadened
+    Ok(broadened)
 }
 
 /// Apply resolution broadening to transmission data.
@@ -174,13 +210,17 @@ pub fn resolution_broaden(
 ///
 /// # Returns
 /// Resolution-broadened transmission on the same energy grid.
+///
+/// # Errors
+/// Returns [`ResolutionError`] if the energy grid is unsorted or array
+/// lengths do not match.
 pub fn resolution_broaden_transmission(
     energies: &[f64],
     transmission: &[f64],
     params: &ResolutionParams,
-) -> Vec<f64> {
+) -> Result<Vec<f64>, ResolutionError> {
     // The convolution kernel is the same; only the interpretation differs.
-    // Note: resolution_broaden already asserts that energies are sorted.
+    // Validation is handled by resolution_broaden.
     resolution_broaden(energies, transmission, params)
 }
 
@@ -333,11 +373,24 @@ impl TabulatedResolution {
     /// 1. Find bracketing reference energies and interpolate kernel (log-space)
     /// 2. Convert TOF offsets to energy offsets using exact TOF↔energy relation
     /// 3. Convolve spectrum with interpolated kernel (trapezoidal integration)
-    pub fn broaden(&self, energies: &[f64], spectrum: &[f64]) -> Vec<f64> {
-        assert_eq!(energies.len(), spectrum.len());
+    ///
+    /// # Errors
+    /// Returns [`ResolutionError::LengthMismatch`] if the arrays differ in
+    /// length, or [`ResolutionError::UnsortedEnergies`] if the energy grid is
+    /// not sorted in non-descending order.
+    pub fn broaden(&self, energies: &[f64], spectrum: &[f64]) -> Result<Vec<f64>, ResolutionError> {
+        if energies.len() != spectrum.len() {
+            return Err(ResolutionError::LengthMismatch {
+                energies: energies.len(),
+                data: spectrum.len(),
+            });
+        }
+        if !energies.windows(2).all(|w| w[0] <= w[1]) {
+            return Err(ResolutionError::UnsortedEnergies);
+        }
         let n = energies.len();
         if n == 0 {
-            return vec![];
+            return Ok(vec![]);
         }
 
         let mut result = vec![0.0f64; n];
@@ -404,16 +457,15 @@ impl TabulatedResolution {
             };
         }
 
-        result
+        Ok(result)
     }
 
     /// Interpolate kernel at an arbitrary energy using log-space linear interpolation
     /// between the two nearest reference energies.
+    ///
+    /// `ref_energies` is validated as strictly ascending by `from_text()` /
+    /// `from_file()` at construction time, so no per-call sort check is needed.
     fn interpolated_kernel(&self, energy: f64) -> (Vec<f64>, Vec<f64>) {
-        debug_assert!(
-            self.ref_energies.windows(2).all(|w| w[0] <= w[1]),
-            "ref_energies must be sorted ascending for partition_point"
-        );
         let n_ref = self.ref_energies.len();
 
         // Clamp to nearest reference if outside range
@@ -502,11 +554,15 @@ fn interp_spectrum(energies: &[f64], spectrum: &[f64], e: f64) -> Option<f64> {
 }
 
 /// Apply resolution broadening using either Gaussian or tabulated kernel.
+///
+/// # Errors
+/// Returns [`ResolutionError`] if the energy grid is unsorted or array
+/// lengths do not match.
 pub fn apply_resolution(
     energies: &[f64],
     spectrum: &[f64],
     resolution: &ResolutionFunction,
-) -> Vec<f64> {
+) -> Result<Vec<f64>, ResolutionError> {
     match resolution {
         ResolutionFunction::Gaussian(params) => resolution_broaden(energies, spectrum, params),
         ResolutionFunction::Tabulated(tab) => tab.broaden(energies, spectrum),
@@ -590,7 +646,7 @@ mod tests {
             delta_t_us: 0.0,
             delta_l_m: 0.0,
         };
-        let broadened = resolution_broaden(&energies, &xs, &params);
+        let broadened = resolution_broaden(&energies, &xs, &params).unwrap();
         assert_eq!(broadened, xs);
     }
 
@@ -614,7 +670,7 @@ mod tests {
             delta_t_us: 5.0, // Fairly large timing uncertainty
             delta_l_m: 0.01,
         };
-        let broadened = resolution_broaden(&energies, &xs, &params);
+        let broadened = resolution_broaden(&energies, &xs, &params).unwrap();
 
         let orig_peak = xs.iter().cloned().fold(0.0_f64, f64::max);
         let broad_peak = broadened.iter().cloned().fold(0.0_f64, f64::max);
@@ -653,7 +709,7 @@ mod tests {
             delta_t_us: 1.0,
             delta_l_m: 0.01,
         };
-        let broadened = resolution_broaden(&energies, &xs, &params);
+        let broadened = resolution_broaden(&energies, &xs, &params).unwrap();
 
         // Trapezoidal area
         let area_orig: f64 = (0..n - 1)
@@ -713,7 +769,7 @@ mod tests {
             w_kernel
         );
 
-        let broadened = resolution_broaden(&energies, &xs, &params);
+        let broadened = resolution_broaden(&energies, &xs, &params).unwrap();
 
         // Kernel std dev = W/√2
         let sigma_kernel = w_kernel / 2.0_f64.sqrt();
@@ -785,5 +841,42 @@ mod tests {
             de_over_e_100 > de_over_e_1,
             "Resolution should degrade at higher energies"
         );
+    }
+
+    #[test]
+    fn test_unsorted_energies_returns_error() {
+        let energies = vec![1.0, 3.0, 2.0, 4.0]; // not sorted
+        let xs = vec![10.0, 30.0, 20.0, 40.0];
+        let params = ResolutionParams {
+            flight_path_m: 25.0,
+            delta_t_us: 1.0,
+            delta_l_m: 0.01,
+        };
+        let result = resolution_broaden(&energies, &xs, &params);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ResolutionError::UnsortedEnergies
+        ));
+    }
+
+    #[test]
+    fn test_length_mismatch_returns_error() {
+        let energies = vec![1.0, 2.0, 3.0];
+        let xs = vec![10.0, 20.0]; // wrong length
+        let params = ResolutionParams {
+            flight_path_m: 25.0,
+            delta_t_us: 1.0,
+            delta_l_m: 0.01,
+        };
+        let result = resolution_broaden(&energies, &xs, &params);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ResolutionError::LengthMismatch {
+                energies: 3,
+                data: 2
+            }
+        ));
     }
 }
