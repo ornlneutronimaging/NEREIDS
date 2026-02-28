@@ -1143,6 +1143,12 @@ pub fn poisson_fit_lbfgsb(
     let mut prev_free: Vec<f64> = params.free_values();
     let mut prev_grad: Option<Vec<f64>> = None;
 
+    // Scratch buffers reused across the entire optimization loop to avoid
+    // per-iteration allocations inside backtracking_line_search.
+    let mut all_vals_buf = Vec::with_capacity(params.params.len());
+    let mut free_vals_buf = Vec::with_capacity(params.n_free());
+    let mut trial_free_buf: Vec<f64> = Vec::with_capacity(params.n_free());
+
     for _ in 0..config.max_iter {
         iter += 1;
 
@@ -1306,6 +1312,9 @@ pub fn poisson_fit_lbfgsb(
             config,
             &grad,
             nll,
+            &mut all_vals_buf,
+            &mut free_vals_buf,
+            &mut trial_free_buf,
         ) {
             Some(new_nll) => nll = new_nll,
             None => {
