@@ -63,8 +63,9 @@ pub const POISSON_EPSILON: f64 = 1e-10;
 /// to avoid division by zero.
 pub const DIVISION_FLOOR: f64 = 1e-50;
 
-/// Smallest meaningful cross-section contribution (barns).
-/// Terms below this are negligible and can be skipped.
+/// Generic tiny positive floor used as a near-zero tolerance across physics
+/// calculations (e.g., cross-sections in barns, energies in eV, widths,
+/// dimensionless parameters). Values below this are treated as negligible.
 pub const CROSS_SECTION_FLOOR: f64 = 1e-60;
 
 /// Floor for pivot detection and division safety in numerical linear algebra

@@ -872,7 +872,7 @@ mod tests {
         // J=0.5 group should have 2 resonances
         let j05 = groups
             .iter()
-            .find(|(j, _)| (*j - 0.5).abs() < 1e-10)
+            .find(|(j, _)| (*j - 0.5).abs() < nereids_core::constants::QUANTUM_NUMBER_EPS)
             .unwrap();
         assert_eq!(j05.1.len(), 2);
     }
