@@ -9,7 +9,7 @@ use std::sync::Arc;
 use nereids_endf::resonance::ResonanceData;
 use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
 
-use crate::lm::FitModel;
+use crate::lm::{FitModel, FlatMatrix};
 
 /// Transmission model backed by precomputed broadened cross-sections.
 ///
@@ -75,8 +75,9 @@ impl FitModel for PrecomputedTransmissionModel {
         _params: &[f64],
         free_param_indices: &[usize],
         y_current: &[f64],
-    ) -> Option<Vec<Vec<f64>>> {
+    ) -> Option<FlatMatrix> {
         let n_e = y_current.len();
+        let n_free = free_param_indices.len();
 
         // For each free parameter, sum the cross-sections of every isotope
         // tied to that parameter index.  The Beer-Lambert derivative is:
@@ -98,16 +99,14 @@ impl FitModel for PrecomputedTransmissionModel {
             })
             .collect();
 
-        // jacobian[i][j] = ∂T(E_i)/∂params[free_param_indices[j]]
-        //                = -(Σ σ_iso(E_i)) · T(E_i)   (Beer-Lambert derivative)
-        let jacobian: Vec<Vec<f64>> = (0..n_e)
-            .map(|i| {
-                fp_xs_sums
-                    .iter()
-                    .map(|xs_sum| -xs_sum[i] * y_current[i])
-                    .collect()
-            })
-            .collect();
+        // jacobian.get(i, j) = ∂T(E_i)/∂params[free_param_indices[j]]
+        //                    = -(Σ σ_iso(E_i)) · T(E_i)   (Beer-Lambert derivative)
+        let mut jacobian = FlatMatrix::zeros(n_e, n_free);
+        for i in 0..n_e {
+            for (j, xs_sum) in fp_xs_sums.iter().enumerate() {
+                *jacobian.get_mut(i, j) = -xs_sum[i] * y_current[i];
+            }
+        }
 
         Some(jacobian)
     }
@@ -256,10 +255,8 @@ mod tests {
             .analytical_jacobian(&params, &free, &y)
             .expect("analytical_jacobian should return Some(_)");
 
-        assert_eq!(jac.len(), 3); // n_energies
-        for row in &jac {
-            assert_eq!(row.len(), 2); // n_free_params
-        }
+        assert_eq!(jac.nrows, 3); // n_energies
+        assert_eq!(jac.ncols, 2); // n_free_params
 
         // Central-difference reference.
         let h = 1e-6f64;
@@ -274,7 +271,7 @@ mod tests {
 
             for i in 0..3 {
                 let fd = (y_plus[i] - y_minus[i]) / (2.0 * h);
-                let ana = jac[i][col];
+                let ana = jac.get(i, col);
                 assert!(
                     (fd - ana).abs() < 1e-6,
                     "Jacobian mismatch (row {i}, col {col}): FD={fd:.8}, analytical={ana:.8}"
@@ -310,9 +307,9 @@ mod tests {
             let sigma_sum = [1.0, 2.0, 3.0][i] + [0.5, 1.0, 1.5][i];
             let expected = -y[i] * sigma_sum;
             assert!(
-                (jac[i][0] - expected).abs() < 1e-12,
+                (jac.get(i, 0) - expected).abs() < 1e-12,
                 "Tied Jacobian mismatch at E[{i}]: got {}, expected {expected}",
-                jac[i][0]
+                jac.get(i, 0)
             );
         }
     }

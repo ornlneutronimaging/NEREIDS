@@ -14,6 +14,48 @@ use nereids_core::constants::{LM_DIAGONAL_FLOOR, PIVOT_FLOOR};
 
 use crate::parameters::ParameterSet;
 
+/// Row-major flat matrix for cache-friendly storage.
+///
+/// Replaces `Vec<Vec<f64>>` to collapse ~N separate heap allocations into 1
+/// and improve cache locality for JtWJ assembly.  Access: `data[i * ncols + j]`.
+#[derive(Debug, Clone)]
+pub struct FlatMatrix {
+    /// Flat row-major storage: `data[i * ncols + j]` = element at row i, col j.
+    pub data: Vec<f64>,
+    /// Number of rows.
+    pub nrows: usize,
+    /// Number of columns.
+    pub ncols: usize,
+}
+
+impl FlatMatrix {
+    /// Create a new zero-filled matrix with the given dimensions.
+    pub fn zeros(nrows: usize, ncols: usize) -> Self {
+        let len = nrows
+            .checked_mul(ncols)
+            .expect("FlatMatrix dimensions overflow usize");
+        Self {
+            data: vec![0.0; len],
+            nrows,
+            ncols,
+        }
+    }
+
+    /// Access element at (row, col) immutably.
+    #[inline(always)]
+    pub fn get(&self, row: usize, col: usize) -> f64 {
+        debug_assert!(row < self.nrows && col < self.ncols);
+        self.data[row * self.ncols + col]
+    }
+
+    /// Access element at (row, col) mutably.
+    #[inline(always)]
+    pub fn get_mut(&mut self, row: usize, col: usize) -> &mut f64 {
+        debug_assert!(row < self.nrows && col < self.ncols);
+        &mut self.data[row * self.ncols + col]
+    }
+}
+
 /// #125.4: Maximum damping parameter before the optimizer gives up.
 ///
 /// When λ exceeds this threshold, the optimizer is stuck in a region where no
@@ -67,7 +109,7 @@ pub struct LmResult {
     /// Final parameter values (all parameters, including fixed).
     pub params: Vec<f64>,
     /// Covariance matrix of free parameters (n_free × n_free), if available.
-    pub covariance: Option<Vec<Vec<f64>>>,
+    pub covariance: Option<FlatMatrix>,
     /// Standard errors of free parameters (diagonal of covariance).
     pub uncertainties: Option<Vec<f64>>,
 }
@@ -91,14 +133,15 @@ pub trait FitModel {
     /// Provided so implementations can compute J analytically from T without
     /// an extra `evaluate` call.
     ///
-    /// Returns `Some(J)` where `J[i][j] = ∂model[i]/∂params[free_param_indices[j]]`.
+    /// Returns `Some(J)` where `J.get(i, j) = ∂model[i]/∂params[free_param_indices[j]]`.
+    /// The matrix has `y_current.len()` rows and `free_param_indices.len()` columns.
     /// Return `None` to fall back to finite-difference Jacobian (the default).
     fn analytical_jacobian(
         &self,
         _params: &[f64],
         _free_param_indices: &[usize],
         _y_current: &[f64],
-    ) -> Option<Vec<Vec<f64>>> {
+    ) -> Option<FlatMatrix> {
         None
     }
 }
@@ -121,14 +164,14 @@ fn chi_squared(residuals: &[f64], weights: &[f64]) -> f64 {
 /// `all_vals_buf` is a scratch buffer reused across the per-parameter FD loop
 /// to avoid allocating a fresh `Vec<f64>` on every `model.evaluate()` call.
 ///
-/// J[i][j] = ∂model[i] / ∂free_param[j]
+/// J.get(i, j) = ∂model[i] / ∂free_param[j]
 fn compute_jacobian(
     model: &dyn FitModel,
     params: &mut ParameterSet,
     y_current: &[f64],
     fd_step: f64,
     all_vals_buf: &mut Vec<f64>,
-) -> Vec<Vec<f64>> {
+) -> FlatMatrix {
     let free_indices = params.free_indices();
     let n_free = free_indices.len();
     let n_data = y_current.len();
@@ -136,11 +179,21 @@ fn compute_jacobian(
     // Try analytical Jacobian first (no extra evaluate calls).
     params.all_values_into(all_vals_buf);
     if let Some(j) = model.analytical_jacobian(all_vals_buf, &free_indices, y_current) {
+        debug_assert!(
+            j.nrows == n_data && j.ncols == n_free && j.data.len() == n_data * n_free,
+            "analytical_jacobian shape mismatch: got ({}x{}, len={}), expected ({}x{}, len={})",
+            j.nrows,
+            j.ncols,
+            j.data.len(),
+            n_data,
+            n_free,
+            n_data * n_free,
+        );
         return j;
     }
 
     // Fallback: forward finite differences, reusing y_current as the base.
-    let mut jacobian = vec![vec![0.0; n_free]; n_data];
+    let mut jacobian = FlatMatrix::zeros(n_data, n_free);
 
     for (j, &idx) in free_indices.iter().enumerate() {
         let original = params.params[idx].value;
@@ -168,7 +221,7 @@ fn compute_jacobian(
         params.params[idx].value = original;
 
         for i in 0..n_data {
-            jacobian[i][j] = (perturbed[i] - y_current[i]) / actual_step;
+            *jacobian.get_mut(i, j) = (perturbed[i] - y_current[i]) / actual_step;
         }
     }
 
@@ -177,33 +230,33 @@ fn compute_jacobian(
 
 /// Solve (A + λ·diag(A)) · x = b using Gaussian elimination.
 ///
-/// A is n×n symmetric positive definite (approximately).
+/// A is a flat n×n symmetric positive definite matrix (approximately).
 /// Returns the solution vector x.
-#[allow(clippy::needless_range_loop)]
-fn solve_damped_system(a: &[Vec<f64>], b: &[f64], lambda: f64) -> Option<Vec<f64>> {
+fn solve_damped_system(a: &FlatMatrix, b: &[f64], lambda: f64) -> Option<Vec<f64>> {
     let n = b.len();
     if n == 0 {
         return Some(vec![]);
     }
 
-    // Build the augmented matrix [A + λ·diag(A) | b]
-    let mut aug = vec![vec![0.0; n + 1]; n];
-    for i in 0..n {
+    // Build the augmented matrix [A + λ·diag(A) | b] as flat (n × (n+1)).
+    let ncols = n + 1;
+    let mut aug = FlatMatrix::zeros(n, ncols);
+    for (i, &bi) in b.iter().enumerate() {
         for j in 0..n {
-            aug[i][j] = a[i][j];
+            *aug.get_mut(i, j) = a.get(i, j);
         }
-        aug[i][i] += lambda * a[i][i].max(LM_DIAGONAL_FLOOR); // Ensure non-zero diagonal
-        aug[i][n] = b[i];
+        *aug.get_mut(i, i) += lambda * a.get(i, i).max(LM_DIAGONAL_FLOOR); // Ensure non-zero diagonal
+        *aug.get_mut(i, n) = bi;
     }
 
     // Gaussian elimination with partial pivoting
     for col in 0..n {
         // Find pivot
-        let mut max_val = aug[col][col].abs();
+        let mut max_val = aug.get(col, col).abs();
         let mut max_row = col;
         for row in (col + 1)..n {
-            if aug[row][col].abs() > max_val {
-                max_val = aug[row][col].abs();
+            if aug.get(row, col).abs() > max_val {
+                max_val = aug.get(row, col).abs();
                 max_row = row;
             }
         }
@@ -212,13 +265,19 @@ fn solve_damped_system(a: &[Vec<f64>], b: &[f64], lambda: f64) -> Option<Vec<f64
             return None; // Singular
         }
 
-        aug.swap(col, max_row);
+        // Swap rows col and max_row in the flat buffer.
+        if col != max_row {
+            let (row_a, row_b) = (col * ncols, max_row * ncols);
+            let (first, second) = aug.data.split_at_mut(row_b);
+            first[row_a..row_a + ncols].swap_with_slice(&mut second[..ncols]);
+        }
 
-        let pivot = aug[col][col];
+        let pivot = aug.get(col, col);
         for row in (col + 1)..n {
-            let factor = aug[row][col] / pivot;
+            let factor = aug.get(row, col) / pivot;
             for j in col..=n {
-                aug[row][j] -= factor * aug[col][j];
+                let val = aug.get(col, j);
+                *aug.get_mut(row, j) -= factor * val;
             }
         }
     }
@@ -226,40 +285,42 @@ fn solve_damped_system(a: &[Vec<f64>], b: &[f64], lambda: f64) -> Option<Vec<f64
     // Back substitution
     let mut x = vec![0.0; n];
     for i in (0..n).rev() {
-        let mut sum = aug[i][n];
-        for j in (i + 1)..n {
-            sum -= aug[i][j] * x[j];
+        let mut sum = aug.get(i, n);
+        for (j, &xj) in x.iter().enumerate().skip(i + 1) {
+            sum -= aug.get(i, j) * xj;
         }
-        x[i] = sum / aug[i][i];
+        x[i] = sum / aug.get(i, i);
     }
 
     Some(x)
 }
 
 /// Invert a symmetric positive definite matrix (for covariance).
-#[allow(clippy::needless_range_loop)]
-fn invert_matrix(a: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
-    let n = a.len();
+///
+/// Input: flat n×n matrix. Output: flat n×n inverse, or None if singular.
+fn invert_matrix(a: &FlatMatrix) -> Option<FlatMatrix> {
+    let n = a.nrows;
     if n == 0 {
-        return Some(vec![]);
+        return Some(FlatMatrix::zeros(0, 0));
     }
 
-    // Build [A | I]
-    let mut aug = vec![vec![0.0; 2 * n]; n];
+    // Build [A | I] as flat (n × 2n).
+    let ncols = 2 * n;
+    let mut aug = FlatMatrix::zeros(n, ncols);
     for i in 0..n {
         for j in 0..n {
-            aug[i][j] = a[i][j];
+            *aug.get_mut(i, j) = a.get(i, j);
         }
-        aug[i][n + i] = 1.0;
+        *aug.get_mut(i, n + i) = 1.0;
     }
 
     // Forward elimination with partial pivoting
     for col in 0..n {
-        let mut max_val = aug[col][col].abs();
+        let mut max_val = aug.get(col, col).abs();
         let mut max_row = col;
         for row in (col + 1)..n {
-            if aug[row][col].abs() > max_val {
-                max_val = aug[row][col].abs();
+            if aug.get(row, col).abs() > max_val {
+                max_val = aug.get(row, col).abs();
                 max_row = row;
             }
         }
@@ -268,24 +329,36 @@ fn invert_matrix(a: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
             return None;
         }
 
-        aug.swap(col, max_row);
+        // Swap rows col and max_row.
+        if col != max_row {
+            let (row_a, row_b) = (col * ncols, max_row * ncols);
+            let (first, second) = aug.data.split_at_mut(row_b);
+            first[row_a..row_a + ncols].swap_with_slice(&mut second[..ncols]);
+        }
 
-        let pivot = aug[col][col];
-        for j in 0..(2 * n) {
-            aug[col][j] /= pivot;
+        let pivot = aug.get(col, col);
+        for j in 0..ncols {
+            *aug.get_mut(col, j) /= pivot;
         }
 
         for row in 0..n {
             if row != col {
-                let factor = aug[row][col];
-                for j in 0..(2 * n) {
-                    aug[row][j] -= factor * aug[col][j];
+                let factor = aug.get(row, col);
+                for j in 0..ncols {
+                    let val = aug.get(col, j);
+                    *aug.get_mut(row, j) -= factor * val;
                 }
             }
         }
     }
 
-    let inv: Vec<Vec<f64>> = aug.into_iter().map(|row| row[n..].to_vec()).collect();
+    // Extract the right half [I|A⁻¹] → A⁻¹
+    let mut inv = FlatMatrix::zeros(n, n);
+    for i in 0..n {
+        for j in 0..n {
+            *inv.get_mut(i, j) = aug.get(i, n + j);
+        }
+    }
 
     Some(inv)
 }
@@ -371,7 +444,7 @@ pub fn levenberg_marquardt(
             iterations: 0,
             converged: true,
             params: params.all_values(),
-            covariance: Some(vec![]),
+            covariance: Some(FlatMatrix::zeros(0, 0)),
             uncertainties: Some(vec![]),
         };
     }
@@ -444,14 +517,15 @@ pub fn levenberg_marquardt(
             compute_jacobian(model, params, &y_current, config.fd_step, &mut all_vals_buf);
 
         // Build normal equations: JᵀWJ and JᵀWr
-        let mut jtw_j = vec![vec![0.0; n_free]; n_free];
+        let mut jtw_j = FlatMatrix::zeros(n_free, n_free);
         let mut jtw_r = vec![0.0; n_free];
 
-        for i in 0..n_data {
-            for j in 0..n_free {
-                jtw_r[j] += jacobian[i][j] * weights[i] * residuals[i];
+        for (i, (&wi, &ri)) in weights.iter().zip(residuals.iter()).enumerate() {
+            for (j, jtw_r_j) in jtw_r.iter_mut().enumerate() {
+                let jij = jacobian.get(i, j);
+                *jtw_r_j += jij * wi * ri;
                 for k in 0..n_free {
-                    jtw_j[j][k] += jacobian[i][j] * weights[i] * jacobian[i][k];
+                    *jtw_j.get_mut(j, k) += jij * wi * jacobian.get(i, k);
                 }
             }
         }
@@ -536,11 +610,12 @@ pub fn levenberg_marquardt(
 
     // Compute covariance matrix: (JᵀWJ)⁻¹ at the final parameters.
     let jacobian = compute_jacobian(model, params, &y_current, config.fd_step, &mut all_vals_buf);
-    let mut jtw_j = vec![vec![0.0; n_free]; n_free];
-    for i in 0..n_data {
+    let mut jtw_j = FlatMatrix::zeros(n_free, n_free);
+    for (i, &wi) in weights.iter().enumerate() {
         for j in 0..n_free {
+            let jij = jacobian.get(i, j);
             for k in 0..n_free {
-                jtw_j[j][k] += jacobian[i][j] * weights[i] * jacobian[i][k];
+                *jtw_j.get_mut(j, k) += jij * wi * jacobian.get(i, k);
             }
         }
     }
@@ -559,15 +634,14 @@ pub fn levenberg_marquardt(
 
     let (covariance, uncertainties) = if dof > 0 {
         if let Some(mut cov) = invert_matrix(&jtw_j) {
-            for row in cov.iter_mut() {
-                for elem in row.iter_mut() {
-                    *elem *= reduced_chi2;
-                }
+            for elem in cov.data.iter_mut() {
+                *elem *= reduced_chi2;
             }
             let unc: Vec<f64> = (0..n_free)
                 .map(|i| {
-                    if cov[i][i].is_finite() && cov[i][i] > 0.0 {
-                        cov[i][i].sqrt()
+                    let diag = cov.get(i, i);
+                    if diag.is_finite() && diag > 0.0 {
+                        diag.sqrt()
                     } else {
                         f64::NAN
                     }
@@ -766,7 +840,11 @@ mod tests {
     #[test]
     fn test_solve_damped_system_identity() {
         // (I + λ·I)x = b → x = b/(1+λ)
-        let a = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        let a = FlatMatrix {
+            data: vec![1.0, 0.0, 0.0, 1.0],
+            nrows: 2,
+            ncols: 2,
+        };
         let b = vec![2.0, 4.0];
         let lambda = 1.0;
         let x = solve_damped_system(&a, &b, lambda).unwrap();
@@ -776,13 +854,17 @@ mod tests {
 
     #[test]
     fn test_invert_matrix_2x2() {
-        let a = vec![vec![4.0, 7.0], vec![2.0, 6.0]];
+        let a = FlatMatrix {
+            data: vec![4.0, 7.0, 2.0, 6.0],
+            nrows: 2,
+            ncols: 2,
+        };
         let inv = invert_matrix(&a).unwrap();
         // A⁻¹ = 1/10 × [6 -7; -2 4]
-        assert!((inv[0][0] - 0.6).abs() < 1e-10);
-        assert!((inv[0][1] - (-0.7)).abs() < 1e-10);
-        assert!((inv[1][0] - (-0.2)).abs() < 1e-10);
-        assert!((inv[1][1] - 0.4).abs() < 1e-10);
+        assert!((inv.get(0, 0) - 0.6).abs() < 1e-10);
+        assert!((inv.get(0, 1) - (-0.7)).abs() < 1e-10);
+        assert!((inv.get(1, 0) - (-0.2)).abs() < 1e-10);
+        assert!((inv.get(1, 1) - 0.4).abs() < 1e-10);
     }
 
     // ---- Edge-case tests for issue #125 ----
