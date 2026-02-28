@@ -26,7 +26,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use ndarray::{Array2, Array3};
+use ndarray::{Array2, Array3, s};
 use rayon::prelude::*;
 
 use nereids_endf::resonance::ResonanceData;
@@ -154,16 +154,33 @@ pub fn estimate_nuisance(
         None => (0..height, 0..width),
     };
 
+    // Slice the ROI first, THEN transpose, so the work is O(n_energies * roi_h * roi_w)
+    // instead of O(n_energies * height * width).  For small ROIs on large images this
+    // avoids transposing the entire open-beam array.
+    let ob_roi: Array3<f64> = open_beam_counts
+        .slice(s![
+            ..,
+            y_range.start..y_range.end,
+            x_range.start..x_range.end
+        ])
+        .permuted_axes([1, 2, 0])
+        .as_standard_layout()
+        .into_owned();
+
+    let roi_h = y_range.end - y_range.start;
+    let roi_w = x_range.end - x_range.start;
     let mut flux = vec![0.0f64; n_energies];
     let mut n_pixels: usize = 0;
 
-    for y in y_range {
-        for x in x_range.clone() {
-            if dead_pixels.is_some_and(|m| m[[y, x]]) {
+    for ly in 0..roi_h {
+        for lx in 0..roi_w {
+            // Map local ROI indices back to global coordinates for dead-pixel lookup
+            if dead_pixels.is_some_and(|m| m[[y_range.start + ly, x_range.start + lx]]) {
                 continue;
             }
+            let row = ob_roi.slice(s![ly, lx, ..]);
             for e in 0..n_energies {
-                flux[e] += open_beam_counts[[e, y, x]];
+                flux[e] += row[e];
             }
             n_pixels += 1;
         }
@@ -283,6 +300,15 @@ pub fn sparse_reconstruct(
         )));
     }
 
+    // Transpose sample_counts from (n_energies, height, width) to (height, width, n_energies)
+    // so that each pixel's spectrum is contiguous in memory.  See spatial.rs for the
+    // full cache-friendliness rationale.
+    let counts_t: Array3<f64> = sample_counts
+        .view()
+        .permuted_axes([1, 2, 0])
+        .as_standard_layout()
+        .into_owned();
+
     // Precompute Doppler-broadened cross-sections once, outside the pixel loop.
     // The same XS apply to every pixel (same isotopes, same temperature, same energy grid).
     // Mirrors the pattern used in spatial.rs to avoid repeating expensive broadening work.
@@ -348,9 +374,12 @@ pub fn sparse_reconstruct(
                 return None;
             }
 
-            // Extract counts for this pixel
-            let y_obs: Vec<f64> = (0..n_energies)
-                .map(|e| sample_counts[[e, y, x]].max(0.0))
+            // Extract counts for this pixel from the transposed (h, w, n_energies) layout.
+            // The energy axis is now contiguous in memory, fitting in L1 cache.
+            let y_obs: Vec<f64> = counts_t
+                .slice(s![y, x, ..])
+                .iter()
+                .map(|&v| v.max(0.0))
                 .collect();
 
             // Build per-pixel transmission model reusing precomputed XS.
@@ -447,6 +476,44 @@ mod tests {
         let nuisance = estimate_nuisance(&ob, None, None).unwrap();
         assert_eq!(nuisance.flux.len(), n_e);
         assert!((nuisance.flux[0] - 100.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_estimate_nuisance_nonzero_roi_with_dead_pixel() {
+        // 3 energies × 4 height × 4 width
+        let n_e = 3;
+        let h = 4;
+        let w = 4;
+        let mut ob = Array3::from_elem((n_e, h, w), 50.0);
+
+        // Give ROI pixels distinct values so the average is verifiable.
+        // ROI: y=1..3, x=1..3 → a 2×2 sub-grid of the 4×4 image.
+        //   (1,1)=100  (1,2)=200
+        //   (2,1)=300  (2,2)=400   ← this pixel will be dead
+        for e in 0..n_e {
+            ob[[e, 1, 1]] = 100.0;
+            ob[[e, 1, 2]] = 200.0;
+            ob[[e, 2, 1]] = 300.0;
+            ob[[e, 2, 2]] = 400.0;
+        }
+
+        // Dead-pixel mask: only (2,2) is dead (global coords, inside the ROI).
+        let mut dead = Array2::from_elem((h, w), false);
+        dead[[2, 2]] = true;
+
+        let roi = Some((1..3usize, 1..3usize));
+        let nuisance = estimate_nuisance(&ob, roi, Some(&dead)).unwrap();
+
+        // Live pixels in ROI: (1,1)=100, (1,2)=200, (2,1)=300.
+        // Expected average = (100 + 200 + 300) / 3 = 200.
+        assert_eq!(nuisance.flux.len(), n_e);
+        for &f in &nuisance.flux {
+            assert!((f - 200.0).abs() < 1e-10, "expected flux ~200.0, got {f}",);
+        }
+        // Background is zero (hardcoded).
+        for &b in &nuisance.background {
+            assert!((b).abs() < 1e-10);
+        }
     }
 
     #[test]

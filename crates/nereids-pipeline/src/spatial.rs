@@ -3,7 +3,7 @@
 //! Applies the single-spectrum fitting pipeline across all pixels in
 //! a hyperspectral neutron imaging dataset to produce 2D composition maps.
 
-use ndarray::{Array2, Array3};
+use ndarray::{Array2, Array3, s};
 use rayon::prelude::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -161,6 +161,23 @@ pub fn spatial_map(
         return Ok(empty_result());
     }
 
+    // Transpose data from (n_energies, height, width) to (height, width, n_energies)
+    // so that each pixel's spectrum is contiguous in memory.  The original layout
+    // requires striding across height*width elements per energy step — for a
+    // 1000x128x128 array that is 131,072 bytes between consecutive energy values,
+    // causing constant L1 cache misses.  After transposing, a pixel's 1000-point
+    // spectrum occupies 8 KB of contiguous memory, fitting comfortably in L1 cache.
+    let trans_t: Array3<f64> = transmission
+        .view()
+        .permuted_axes([1, 2, 0])
+        .as_standard_layout()
+        .into_owned();
+    let unc_t: Array3<f64> = uncertainty
+        .view()
+        .permuted_axes([1, 2, 0])
+        .as_standard_layout()
+        .into_owned();
+
     // When temperature is free, cross-sections are recomputed each iteration
     // inside the forward model, so precomputing here would be wasted work.
     // Only precompute when temperature is fixed.
@@ -206,10 +223,13 @@ pub fn spatial_map(
                 return None;
             }
 
-            // Extract spectrum for this pixel
-            let t_spectrum: Vec<f64> = (0..n_energies).map(|e| transmission[[e, y, x]]).collect();
-            let sigma: Vec<f64> = (0..n_energies)
-                .map(|e| uncertainty[[e, y, x]].max(1e-10)) // Avoid zero uncertainty
+            // Extract spectrum for this pixel from the transposed (h, w, n_energies) layout.
+            // The energy axis is now contiguous in memory, so this slice fits in L1 cache.
+            let t_spectrum: Vec<f64> = trans_t.slice(s![y, x, ..]).to_vec();
+            let sigma: Vec<f64> = unc_t
+                .slice(s![y, x, ..])
+                .iter()
+                .map(|&u| u.max(1e-10)) // Avoid zero uncertainty
                 .collect();
 
             // Config-level validation has passed up-front, so per-pixel
@@ -322,15 +342,41 @@ pub fn fit_roi(
 
     let n_pixels = (y_range.end - y_range.start) * (x_range.end - x_range.start);
 
-    // Average transmission over ROI
+    // Slice the ROI first, THEN transpose, so the work is O(n_energies * roi_h * roi_w)
+    // instead of O(n_energies * height * width).  For small ROIs on large images this
+    // avoids transposing the entire array.
+    let roi_trans: Array3<f64> = transmission
+        .slice(s![
+            ..,
+            y_range.start..y_range.end,
+            x_range.start..x_range.end
+        ])
+        .permuted_axes([1, 2, 0])
+        .as_standard_layout()
+        .into_owned();
+    let roi_unc: Array3<f64> = uncertainty
+        .slice(s![
+            ..,
+            y_range.start..y_range.end,
+            x_range.start..x_range.end
+        ])
+        .permuted_axes([1, 2, 0])
+        .as_standard_layout()
+        .into_owned();
+
+    // Average transmission over ROI using local (0-based) indices into the sliced array
+    let roi_h = y_range.end - y_range.start;
+    let roi_w = x_range.end - x_range.start;
     let mut avg_t = vec![0.0f64; n_energies];
     let mut avg_unc2 = vec![0.0f64; n_energies]; // Sum of squared uncertainties
 
-    for y in y_range.clone() {
-        for x in x_range.clone() {
+    for y in 0..roi_h {
+        for x in 0..roi_w {
+            let t_row = roi_trans.slice(s![y, x, ..]);
+            let u_row = roi_unc.slice(s![y, x, ..]);
             for e in 0..n_energies {
-                avg_t[e] += transmission[[e, y, x]];
-                avg_unc2[e] += uncertainty[[e, y, x]].powi(2);
+                avg_t[e] += t_row[e];
+                avg_unc2[e] += u_row[e].powi(2);
             }
         }
     }
