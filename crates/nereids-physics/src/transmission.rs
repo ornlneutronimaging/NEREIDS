@@ -230,15 +230,17 @@ pub fn forward_model(
 /// * `resonance_data`  — Resonance parameters for each isotope.
 /// * `temperature_k`   — Sample temperature for Doppler broadening.
 /// * `instrument`      — Optional instrument resolution parameters.
-/// * `cancel`          — Optional cancellation token.  When set, the function
-///   returns `Err(TransmissionError::Cancelled)` after completing the current isotope.
+/// * `cancel`          — Optional cancellation token.  Cancellation is checked
+///   at the start of each isotope's parallel task; in-flight tasks run to
+///   completion (consistent with the rayon pattern in `spatial.rs`).
 ///
 /// # Returns
 /// One cross-section vector per isotope on success.
 ///
 /// # Errors
 /// * [`TransmissionError::Cancelled`] — if the `cancel` flag was observed
-///   between isotopes.
+///   during parallel execution (either before an isotope started or after
+///   all tasks completed).
 /// * [`TransmissionError::Resolution`] — if resolution broadening is enabled
 ///   (`instrument` is `Some`) and `energies` is not sorted ascending.
 pub fn broadened_cross_sections(
@@ -294,6 +296,12 @@ pub fn broadened_cross_sections(
             Ok(xs)
         })
         .collect();
+
+    // Final cancellation check: if cancel was set during parallel execution,
+    // some tasks may have completed before observing it.
+    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+        return Err(TransmissionError::Cancelled);
+    }
 
     result
 }
