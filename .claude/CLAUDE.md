@@ -56,17 +56,13 @@ Run `/review-pipeline` to execute the full pipeline across active worktrees.
 **Phase A** iterates until zero P1s (max 4 rounds, then escalate to human).
 **Phase B** re-iterates if 3+ P1s or P1 ratio > 40%; otherwise fix inline
 and merge. Dismiss Copilot comments that rehash addressed issues or flag
-impossible edge cases.
+impossible edge cases. Fetch Copilot comments reliably with:
+`pixi run python scripts/fetch_copilot_reviews.py {pr_numbers...}`
 
-**Post-merge**: always run the full integration gate on the merged main.
-`pixi run build` compiles the entire workspace including PyO3 bindings,
-catching cross-PR signature mismatches that per-branch reviews miss:
-
-```
-pixi run build
-cargo test --workspace --exclude nereids-python
-pixi run test-python
-```
+**Post-merge**: run `/post-merge` to execute the full integration gate on
+merged main (cleanup, `cargo clean && pixi run build`, tests, issue closure,
+memory update). `pixi run build` must run first — it catches cross-PR
+signature mismatches that per-branch reviews miss.
 
 ## Validation Patterns
 

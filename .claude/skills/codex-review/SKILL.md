@@ -35,6 +35,8 @@ cd {worktree_path} && codex review 2>&1
 - `--approval` flag was removed — do not use
 - `--base` and positional `[PROMPT]` are mutually exclusive — use `--base main` alone
 - Piping a prompt via stdin (`echo "..." | codex review --base main -`) does not work
+- Notion MCP was removed from Codex config (caused `invalid_grant` noise).
+  Codex review only needs local file access — no MCP servers required.
 
 ### Failure handling
 

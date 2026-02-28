@@ -26,7 +26,7 @@ until zero P1s remain or the iteration limit is reached.
 Track the current iteration number and report it in each consolidation
 (e.g., "Round 2 of 4").
 
-## Step 1: Discover Targets
+## Step 1: Discover Targets & Merge Order
 
 Identify worktrees to review:
 
@@ -38,6 +38,24 @@ For each worktree under `.claude/worktrees/`, check if the branch has diverged
 from main (`git log main..HEAD --oneline`). Skip worktrees with no new commits.
 
 If `$ARGUMENTS` specifies a branch name, filter to just that one.
+
+### File Overlap Analysis (Merge Order)
+
+For each discovered branch, collect changed files:
+
+```bash
+cd {worktree_path} && git diff --name-only main...HEAD
+```
+
+Build a file overlap matrix and suggest merge order:
+
+1. **No overlap** branches can merge in any order (parallel-safe)
+2. **Overlapping** branches should merge in order of increasing diff size
+   (smallest first — the larger diff is more likely to need rebasing)
+3. Report the suggested merge order in the Step 4 consolidation
+
+This prevents the "last PR has merge conflicts" problem that occurred when
+PRs #151 and #152 both modified `poisson.rs`.
 
 ## Steps 2 + 3: Self-Audit & External Review (launch together)
 
@@ -96,10 +114,23 @@ After all reviews complete:
    - **Codex-only** issues
 3. For each finding, classify as:
    - **Fix now** — P1s and high-confidence P2s
-   - **Defer** — P2s that are out of scope, pre-existing, or belong to a different phase
+   - **Defer** — P2s that are genuinely out of scope (different crate/subsystem,
+     pre-existing issue not introduced by this PR)
    - **Dismiss** — false positives, style-only, or impossible edge cases
+
+### P2 Deferral Discipline
+
+**IMPORTANT**: If the PR's purpose is P2 burndown or tech debt reduction,
+the "Defer" category is restricted to findings in a *different crate or
+subsystem* than the one being fixed. Same-crate P2s MUST be classified as
+"Fix now" — otherwise P2 debt accumulates faster than it is paid down.
+
+For feature PRs, deferring same-crate P2s is acceptable, but each deferred
+P2 must result in a GitHub issue (Step 10).
+
 4. Report the iteration number: "Review Round N of 4"
-5. **Present the consolidated report to the user** and ask which findings to fix
+5. Include the **Suggested Merge Order** from Step 1's file overlap analysis
+6. **Present the consolidated report to the user** and ask which findings to fix
 
 **Oscillating findings**: If a finding reappears after being "fixed", flag
 it as **RECURRING** — the user must decide the approach.
@@ -161,26 +192,41 @@ After committing and pushing, check:
   review. Consider whether the PR scope is too large or needs task
   decomposition."
 
-## Step 9: Post-Merge Integration Test
+## Step 8.5: Phase B — Copilot Review (after push)
 
-After all PRs in the batch are merged, verify the merged main:
+After Phase A completes (zero P1s) and branches are pushed:
+
+1. The user triggers Copilot review on GitHub (manual — cannot be automated)
+2. When Copilot reviews are in, fetch comments using the extraction script:
 
 ```bash
-git fetch origin && git checkout main && git pull origin main
-pixi run build
-cargo test --workspace --exclude nereids-python
-pixi run test-python
+pixi run python scripts/fetch_copilot_reviews.py {pr_numbers...}
 ```
 
-**`pixi run build` must run first.** It compiles the full workspace including
-PyO3 bindings (`nereids-python`), which `cargo test --exclude nereids-python`
-does not. When multiple PRs modify the same function signature (e.g., one PR
-adds parameters, another PR calls the old signature), the per-branch reviews
-are blind to the conflict because each branch diffs against `main`
-independently. `pixi run build` catches these cross-PR integration
-regressions at compile time before tests even run.
+For machine-readable output (useful for automated processing):
+```bash
+pixi run python scripts/fetch_copilot_reviews.py {pr_numbers...} --json
+```
 
-If `pixi run build` or tests fail, fix on main immediately.
+3. Classify each Copilot comment as P1 or P2
+4. **Decision criteria** (from CLAUDE.md):
+   - 3+ P1s OR P1 ratio > 40% → re-iterate (back to Step 2)
+   - Otherwise → fix P2s inline and merge
+5. If fixing inline: launch fix agents per branch, commit, push
+6. Dismiss Copilot comments that rehash already-addressed issues or flag
+   impossible edge cases
+
+## Step 9: Post-Merge Integration Test
+
+After all PRs in the batch are merged, run `/post-merge` which handles:
+cleanup, `cargo clean && pixi run build`, workspace tests, Python tests,
+issue verification, and memory updates. See the post-merge skill for details.
+
+**IMPORTANT**: `pixi run build` must run first after `cargo clean`. It
+compiles the full workspace including PyO3 bindings. When multiple PRs modify
+the same function signature, per-branch reviews are blind to the conflict.
+`pixi run build` catches these cross-PR integration regressions at compile
+time.
 
 ## Step 10: Track Deferred P2 Findings
 
