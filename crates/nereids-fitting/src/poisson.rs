@@ -1102,6 +1102,27 @@ impl LbfgsbMemory {
 ///
 /// Uses the same analytical gradient as [`poisson_fit_analytic`] but replaces
 /// the diagonal Fisher preconditioning with a full L-BFGS inverse Hessian
+/// Returns `true` if `direction` is a descent direction with respect to
+/// `gradient`, i.e. the dot product `direction . gradient` is strictly
+/// positive.
+///
+/// In the L-BFGS-B line search convention `x_new = x - alpha * search_dir`,
+/// the search direction should point in the gradient direction for descent,
+/// so a positive dot product indicates the step will reduce the objective.
+///
+/// Used by [`poisson_fit_lbfgsb`] to decide whether to keep the L-BFGS
+/// direction or fall back to steepest descent (the projected gradient).
+fn is_descent_direction(direction: &[f64], gradient: &[f64]) -> bool {
+    let dot: f64 = direction
+        .iter()
+        .zip(gradient.iter())
+        .map(|(&d, &g)| d * g)
+        .sum();
+    // Strictly positive: orthogonal (dot == 0) is NOT descent because the
+    // step would not reduce the objective along the gradient.
+    dot > 0.0
+}
+
 /// approximation.  This captures curvature across parameters (not just
 /// per-parameter diagonal curvature), which is critical for problems with
 /// correlated parameters such as joint density + temperature fitting.
@@ -1310,17 +1331,10 @@ pub fn poisson_fit_lbfgsb(
         // Ensure descent direction: if direction · gradient <= 0, the
         // L-BFGS direction is not a descent direction (ascending or
         // orthogonal to the gradient); fall back to steepest descent.
-        // Zero dot product means no descent — the step would not reduce
-        // the objective.
         // (The search_dir convention in backtracking_line_search is:
         //  x_new = x - alpha * search_dir, so search_dir should point
         //  in the gradient direction for descent.)
-        let dir_dot_grad: f64 = direction
-            .iter()
-            .zip(grad.iter())
-            .map(|(&d, &g)| d * g)
-            .sum();
-        if dir_dot_grad <= 0.0 {
+        if !is_descent_direction(&direction, &grad) {
             // L-BFGS direction is not a descent direction; fall back.
             direction = projected_grad.clone();
         }
@@ -2517,82 +2531,24 @@ mod tests {
     }
 
     #[test]
-    fn test_lbfgsb_orthogonal_direction_falls_back_to_steepest_descent() {
-        // Verify that when the L-BFGS direction is orthogonal to the gradient
-        // (dir · grad == 0.0), the optimizer falls back to steepest descent
-        // and still converges.
-        //
-        // We test this indirectly: the LbfgsbMemory two-loop recursion with
-        // a carefully crafted pair can produce a direction orthogonal to the
-        // gradient.  But it is simpler to verify the guard directly on the
-        // LbfgsbMemory struct.
+    fn test_is_descent_direction_opposite_vectors() {
+        // Direction opposes gradient => positive dot product => descent.
+        assert!(is_descent_direction(&[1.0, 0.0], &[1.0, 0.0]));
+        assert!(is_descent_direction(&[0.5, 0.3], &[2.0, 1.0]));
+    }
 
-        // 2D problem: gradient = [1, 0], L-BFGS direction = [0, 1]
-        // => dir · grad = 0, which should trigger the fallback.
-        let grad = vec![1.0, 0.0];
-        let direction = vec![0.0, 1.0];
+    #[test]
+    fn test_is_descent_direction_orthogonal_not_descent() {
+        // Orthogonal direction => dot product is zero => NOT descent.
+        // The step would not reduce the objective along the gradient.
+        assert!(!is_descent_direction(&[0.0, 1.0], &[1.0, 0.0]));
+        assert!(!is_descent_direction(&[1.0, 0.0], &[0.0, 1.0]));
+    }
 
-        let dir_dot_grad: f64 = direction
-            .iter()
-            .zip(grad.iter())
-            .map(|(&d, &g)| d * g)
-            .sum();
-
-        // Confirm the dot product is exactly zero.
-        assert_eq!(
-            dir_dot_grad, 0.0,
-            "Test setup: dir · grad should be exactly 0.0"
-        );
-
-        // The guard in poisson_fit_lbfgsb uses `<= 0.0`, so zero triggers
-        // the steepest-descent fallback.  Simulate the fallback logic:
-        let fallback = if dir_dot_grad <= 0.0 {
-            grad.clone() // steepest descent
-        } else {
-            direction.clone()
-        };
-        assert_eq!(
-            fallback, grad,
-            "Orthogonal direction should fall back to steepest descent (gradient)"
-        );
-
-        // End-to-end: run L-BFGS-B on a simple problem where it converges
-        // even if the first L-BFGS direction happens to be poor.  The
-        // fallback ensures progress.
-        let x: Vec<f64> = (0..20).map(|i| i as f64 * 0.5).collect();
-        let true_b = 0.5;
-        let flux: Vec<f64> = vec![1000.0; x.len()];
-
-        let model = ExponentialModel {
-            x: x.clone(),
-            flux: flux.clone(),
-        };
-        let y_obs = model.evaluate(&[true_b]);
-        let cross_sections = vec![x.clone()];
-
-        let mut params = ParameterSet::new(vec![FitParameter::non_negative("b", 1.0)]);
-
-        let result = poisson_fit_lbfgsb(
-            &model,
-            &y_obs,
-            &flux,
-            &cross_sections,
-            &[0],
-            &mut params,
-            &PoissonConfig::default(),
-            None,
-        );
-
-        assert!(
-            result.converged,
-            "L-BFGS-B should converge even with orthogonal direction fallback"
-        );
-        assert!(
-            (result.params[0] - true_b).abs() / true_b < 0.01,
-            "fitted={}, true={}, error={:.2}%",
-            result.params[0],
-            true_b,
-            (result.params[0] - true_b).abs() / true_b * 100.0,
-        );
+    #[test]
+    fn test_is_descent_direction_ascending_not_descent() {
+        // Direction has negative dot product with gradient => ascending.
+        assert!(!is_descent_direction(&[-1.0, 0.0], &[1.0, 0.0]));
+        assert!(!is_descent_direction(&[-0.5, -0.3], &[2.0, 1.0]));
     }
 }
