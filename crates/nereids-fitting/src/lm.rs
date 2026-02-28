@@ -1049,6 +1049,49 @@ mod tests {
     }
 
     #[test]
+    fn test_fit_linear_no_covariance() {
+        // When compute_covariance is false, the fit should still converge and
+        // produce correct parameters, but covariance and uncertainties are None.
+        let x: Vec<f64> = (0..10).map(|i| i as f64).collect();
+        let y_obs: Vec<f64> = x.iter().map(|&xi| 2.0 * xi + 3.0).collect();
+        let sigma = vec![1.0; 10];
+
+        let model = LinearModel { x };
+        let mut params = ParameterSet::new(vec![
+            FitParameter::unbounded("a", 1.0),
+            FitParameter::unbounded("b", 1.0),
+        ]);
+
+        let config = LmConfig {
+            compute_covariance: false,
+            ..LmConfig::default()
+        };
+
+        let result = levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &config);
+
+        assert!(result.converged, "Fit did not converge");
+        assert!(
+            (result.params[0] - 2.0).abs() < 1e-4,
+            "a = {}, expected 2.0",
+            result.params[0]
+        );
+        assert!(
+            (result.params[1] - 3.0).abs() < 1e-4,
+            "b = {}, expected 3.0",
+            result.params[1]
+        );
+        assert!(result.chi_squared < 1e-6);
+        assert!(
+            result.covariance.is_none(),
+            "covariance should be None when compute_covariance=false"
+        );
+        assert!(
+            result.uncertainties.is_none(),
+            "uncertainties should be None when compute_covariance=false"
+        );
+    }
+
+    #[test]
     fn test_zero_negative_sigma_clamping() {
         // #125.6: Zero and negative sigma should be clamped to huge sigma (tiny weight),
         // not cause NaN/panic.

@@ -54,7 +54,7 @@ pub struct FitConfig {
     /// `SpectrumFitResult::uncertainties` will be `None`.
     ///
     /// Default: `true` (backwards-compatible for single-spectrum use).
-    /// Set to `false` in `spatial_map` and `sparse_reconstruct` for speed.
+    /// Set to `false` in `spatial_map` for speed when only densities are needed.
     pub compute_covariance: bool,
 }
 
@@ -174,7 +174,7 @@ pub fn fit_spectrum(
     let mut params = ParameterSet::new(param_vec);
 
     // Propagate the pipeline-level compute_covariance flag into the LM config.
-    // This lets spatial_map/sparse_reconstruct disable covariance without
+    // This lets spatial_map disable covariance without
     // modifying the caller's LmConfig.
     let mut lm_config = config.lm_config.clone();
     lm_config.compute_covariance = config.compute_covariance;
@@ -344,6 +344,53 @@ mod tests {
             .uncertainties
             .expect("uncertainties should be Some when compute_covariance=true");
         assert!(unc[0] > 0.0);
+    }
+
+    #[test]
+    fn test_fit_spectrum_no_covariance() {
+        // When compute_covariance is false, fit_spectrum should still produce
+        // correct densities but uncertainties should be None.
+        let data = u238_single_resonance();
+        let true_density = 0.0005;
+        let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
+
+        let model = TransmissionFitModel {
+            energies: energies.clone(),
+            resonance_data: vec![data.clone()],
+            temperature_k: 0.0,
+            instrument: None,
+            density_indices: vec![0],
+            temperature_index: None,
+        };
+        let y_obs = model.evaluate(&[true_density]);
+        let sigma = vec![0.01; y_obs.len()];
+
+        let config = FitConfig {
+            energies,
+            resonance_data: vec![data],
+            isotope_names: vec!["U-238".into()],
+            temperature_k: 0.0,
+            resolution: None,
+            initial_densities: vec![0.001],
+            lm_config: LmConfig::default(),
+            precomputed_cross_sections: None,
+            fit_temperature: false,
+            compute_covariance: false,
+        };
+
+        let result = fit_spectrum(&y_obs, &sigma, &config).unwrap();
+
+        assert!(result.converged);
+        assert!(
+            (result.densities[0] - true_density).abs() / true_density < 0.01,
+            "Fitted density = {}, true = {}",
+            result.densities[0],
+            true_density,
+        );
+        assert!(
+            result.uncertainties.is_none(),
+            "uncertainties should be None when compute_covariance=false"
+        );
     }
 
     #[test]
