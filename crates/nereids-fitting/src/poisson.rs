@@ -1278,8 +1278,11 @@ pub fn poisson_fit_lbfgsb(
         // Zero out direction components at active bounds.
         zero_active_bounds(&mut direction, &grad);
 
-        // Ensure descent direction: if direction · gradient < 0, the
-        // L-BFGS direction is ascending; fall back to steepest descent.
+        // Ensure descent direction: if direction · gradient <= 0, the
+        // L-BFGS direction is not a descent direction (ascending or
+        // orthogonal to the gradient); fall back to steepest descent.
+        // Zero dot product means no descent — the step would not reduce
+        // the objective.
         // (The search_dir convention in backtracking_line_search is:
         //  x_new = x - alpha * search_dir, so search_dir should point
         //  in the gradient direction for descent.)
@@ -1294,12 +1297,21 @@ pub fn poisson_fit_lbfgsb(
         }
 
         // ---- Line search ----
-        let old_free = current_free.clone();
+        //
+        // L-BFGS-B memory update protocol:
+        //   1. `prev_free` is saved BEFORE the line search so that
+        //      s_k = x_{k+1} - x_k uses the pre-step position.
+        //   2. `prev_grad` is saved from the CURRENT gradient (before the
+        //      line search moves parameters) so that y_k = g_{k+1} - g_k
+        //      uses the gradient at the pre-step point.
+        //   3. At the top of the NEXT iteration, the memory update computes
+        //      s_k and y_k using the new (post-step) position and gradient
+        //      minus these saved values.
         let search_norm: f64 = direction.iter().map(|d| d * d).sum::<f64>().sqrt();
         let initial_alpha = config.step_size / search_norm.max(1.0);
 
-        // Save state for memory update.
-        prev_free = old_free.clone();
+        prev_free = current_free.clone();
+        let old_free = current_free;
         prev_grad = Some(grad.clone());
 
         match backtracking_line_search(
