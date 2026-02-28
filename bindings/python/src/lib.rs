@@ -757,11 +757,11 @@ fn fit_spectrum(
 
                 // The transmission model for CountsModel: uses precomputed xs
                 // (or full physics model when fitting temperature).
-                let density_indices: Vec<usize> = (0..n_isotopes).collect();
+                let density_indices: Arc<Vec<usize>> = Arc::new((0..n_isotopes).collect());
                 let xs_arc = Arc::new(xs.clone());
                 let precomputed = PrecomputedTransmissionModel {
                     cross_sections: xs_arc,
-                    density_indices: density_indices.clone(),
+                    density_indices: Arc::clone(&density_indices),
                 };
 
                 // When fitting temperature, use TransmissionFitModel (full physics
@@ -784,7 +784,7 @@ fn fit_spectrum(
                         resonance_data: res_data,
                         temperature_k,
                         instrument: instrument.map(Arc::new),
-                        density_indices: density_indices.clone(),
+                        density_indices: (*density_indices).clone(),
                         temperature_index: Some(n_isotopes),
                     };
                     &full_model

@@ -29,7 +29,10 @@ pub struct PrecomputedTransmissionModel {
     /// Broadened cross-sections σ_D(E) per isotope, shape [n_isotopes][n_energies].
     pub cross_sections: Arc<Vec<Vec<f64>>>,
     /// Mapping: `params[density_indices[i]]` is the density of isotope `i`.
-    pub density_indices: Vec<usize>,
+    ///
+    /// Wrapped in `Arc` so that parallel pixel loops can share one copy
+    /// via cheap reference-count increments instead of deep-cloning per pixel.
+    pub density_indices: Arc<Vec<usize>>,
 }
 
 impl FitModel for PrecomputedTransmissionModel {
@@ -133,6 +136,11 @@ pub struct TransmissionFitModel {
     pub instrument: Option<Arc<InstrumentParams>>,
     /// Index mapping: which `params` indices correspond to areal densities.
     /// params[density_indices[i]] = areal density of isotope i.
+    ///
+    /// Uses `Vec<usize>` (not `Arc<Vec<usize>>`) because `TransmissionFitModel`
+    /// is constructed fresh per pixel (via `fit_spectrum`) and never shared
+    /// across threads.  `PrecomputedTransmissionModel` uses `Arc<Vec<usize>>`
+    /// for its density_indices because it _is_ shared across rayon workers.
     pub density_indices: Vec<usize>,
     /// If `Some(idx)`, `params[idx]` is treated as the sample temperature (K)
     /// and included as a free parameter in the fit. The Doppler broadening
@@ -198,7 +206,7 @@ mod tests {
         ]);
         let model = PrecomputedTransmissionModel {
             cross_sections: xs,
-            density_indices: vec![0, 1],
+            density_indices: Arc::new(vec![0, 1]),
         };
 
         let params = [0.2f64, 0.4f64];
@@ -230,7 +238,7 @@ mod tests {
         ]);
         let model = PrecomputedTransmissionModel {
             cross_sections: xs,
-            density_indices: vec![0, 1],
+            density_indices: Arc::new(vec![0, 1]),
         };
 
         let params = [0.2f64, 0.4f64];
@@ -279,7 +287,7 @@ mod tests {
         ]);
         let model = PrecomputedTransmissionModel {
             cross_sections: xs,
-            density_indices: vec![0, 0], // both isotopes share param[0]
+            density_indices: Arc::new(vec![0, 0]), // both isotopes share param[0]
         };
 
         let params = [0.1f64];

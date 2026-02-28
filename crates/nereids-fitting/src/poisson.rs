@@ -166,13 +166,19 @@ fn poisson_nll_grad_term(obs: f64, mdl: f64) -> f64 {
 }
 
 /// Compute gradient of Poisson NLL by finite differences.
+///
+/// `all_vals_buf` is a reusable scratch buffer for `params.all_values_into()`,
+/// avoiding a fresh allocation on every `model.evaluate()` call inside the
+/// per-parameter FD loop (N_free+1 allocations saved per gradient call).
 fn compute_gradient(
     model: &dyn FitModel,
     params: &mut ParameterSet,
     y_obs: &[f64],
     fd_step: f64,
+    all_vals_buf: &mut Vec<f64>,
 ) -> Vec<f64> {
-    let base_model = model.evaluate(&params.all_values());
+    params.all_values_into(all_vals_buf);
+    let base_model = model.evaluate(all_vals_buf);
     let base_nll = poisson_nll(y_obs, &base_model);
 
     let free_indices = params.free_indices();
@@ -199,7 +205,8 @@ fn compute_gradient(
             }
         }
 
-        let perturbed_model = model.evaluate(&params.all_values());
+        params.all_values_into(all_vals_buf);
+        let perturbed_model = model.evaluate(all_vals_buf);
         let perturbed_nll = poisson_nll(y_obs, &perturbed_model);
         params.params[idx].value = original;
 
@@ -233,6 +240,11 @@ fn project(params: &mut ParameterSet) {
 /// * `config`       — Optimizer configuration (backtrack factor, Armijo c).
 /// * `grad`         — Raw gradient (used for Armijo descent computation).
 /// * `nll`          — Current negative log-likelihood.
+/// * `all_vals_buf` — Scratch buffer for `params.all_values_into()`, reused
+///   across the up-to-50 backtracking iterations to avoid per-trial allocation.
+/// * `free_vals_buf`— Scratch buffer for `params.free_values_into()`.
+/// * `trial_free_buf` — Scratch buffer for the trial free-parameter vector,
+///   reused across backtracking iterations to avoid up to 50 allocations.
 ///
 /// # Returns
 /// `Some(new_nll)` if a step was accepted, `None` if the line search exhausted
@@ -242,8 +254,8 @@ fn project(params: &mut ParameterSet) {
 ///
 /// On `None` return (line search exhausted), `params` is restored to
 /// `old_free` before returning. Callers need not restore manually.
-// All 9 arguments are genuinely needed: this is an extraction of inline code
-// shared between two callers that differ only in search_dir vs. grad.
+// All 12 arguments are genuinely needed: 9 original + 3 scratch buffers that
+// avoid per-backtracking-iteration allocations inside the 50-trial loop.
 #[allow(clippy::too_many_arguments)]
 fn backtracking_line_search(
     model: &dyn FitModel,
@@ -255,19 +267,25 @@ fn backtracking_line_search(
     config: &PoissonConfig,
     grad: &[f64],
     nll: f64,
+    all_vals_buf: &mut Vec<f64>,
+    free_vals_buf: &mut Vec<f64>,
+    trial_free_buf: &mut Vec<f64>,
 ) -> Option<f64> {
     let mut alpha = initial_alpha;
     for _ in 0..50 {
         // Trial step: x_new = project(x - alpha * search_dir)
-        let trial_free: Vec<f64> = old_free
-            .iter()
-            .zip(search_dir.iter())
-            .map(|(&v, &d)| v - alpha * d)
-            .collect();
-        params.set_free_values(&trial_free);
+        trial_free_buf.clear();
+        trial_free_buf.extend(
+            old_free
+                .iter()
+                .zip(search_dir.iter())
+                .map(|(&v, &d)| v - alpha * d),
+        );
+        params.set_free_values(trial_free_buf);
         project(params);
 
-        let trial_model = model.evaluate(&params.all_values());
+        params.all_values_into(all_vals_buf);
+        let trial_model = model.evaluate(all_vals_buf);
 
         // #113: If the model produced NaN/Inf, reduce step size rather
         // than accepting a garbage NLL.
@@ -279,10 +297,11 @@ fn backtracking_line_search(
         let trial_nll = poisson_nll(y_obs, &trial_model);
 
         // Armijo condition: f(x_new) <= f(x) - c * descent
+        params.free_values_into(free_vals_buf);
         let descent = grad
             .iter()
             .zip(old_free.iter())
-            .zip(params.free_values().iter())
+            .zip(free_vals_buf.iter())
             .map(|((&g, &old), &new)| g * (old - new))
             .sum::<f64>();
 
@@ -340,7 +359,16 @@ pub fn poisson_fit(
         };
     }
 
-    let y_model = model.evaluate(&params.all_values());
+    // Scratch buffers reused across the entire optimization loop to avoid
+    // per-iteration allocations inside compute_gradient (N_free+1 calls)
+    // and backtracking_line_search (up to 50 calls).
+    let mut all_vals_buf = Vec::with_capacity(params.params.len());
+    let mut free_vals_buf = Vec::with_capacity(params.n_free());
+    let mut old_free_buf: Vec<f64> = Vec::with_capacity(params.n_free());
+    let mut trial_free_buf: Vec<f64> = Vec::with_capacity(params.n_free());
+
+    params.all_values_into(&mut all_vals_buf);
+    let y_model = model.evaluate(&all_vals_buf);
     let mut nll = poisson_nll(y_obs, &y_model);
     let mut converged = false;
     let mut iter = 0;
@@ -349,7 +377,7 @@ pub fn poisson_fit(
         iter += 1;
 
         // Compute gradient
-        let grad = compute_gradient(model, params, y_obs, config.fd_step);
+        let grad = compute_gradient(model, params, y_obs, config.fd_step, &mut all_vals_buf);
 
         // Check gradient norm for convergence
         let grad_norm: f64 = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
@@ -366,19 +394,24 @@ pub fn poisson_fit(
         // produces a large gradient (∝ √I₀), the fixed alpha=step_size initial
         // step wildly overshoots, and 30 backtracking halvings are not enough to
         // recover—causing the line search to fail even far from the optimum.
-        let old_free = params.free_values();
+        params.free_values_into(&mut free_vals_buf);
+        old_free_buf.clear();
+        old_free_buf.extend_from_slice(&free_vals_buf);
         let initial_alpha = config.step_size / grad_norm.max(1.0);
 
         match backtracking_line_search(
             model,
             params,
             y_obs,
-            &old_free,
+            &old_free_buf,
             &grad,
             initial_alpha,
             config,
             &grad,
             nll,
+            &mut all_vals_buf,
+            &mut free_vals_buf,
+            &mut trial_free_buf,
         ) {
             Some(new_nll) => nll = new_nll,
             None => {
@@ -393,9 +426,10 @@ pub fn poisson_fit(
         // photon counts the NLL is large (∝ I₀·n_bins) so even a productive
         // step has a tiny relative change.  Parameter displacement is a
         // scale-invariant and physically meaningful stopping criterion.
-        let step_norm: f64 = old_free
+        params.free_values_into(&mut free_vals_buf);
+        let step_norm: f64 = old_free_buf
             .iter()
-            .zip(params.free_values().iter())
+            .zip(free_vals_buf.iter())
             .map(|(o, n)| (o - n).powi(2))
             .sum::<f64>()
             .sqrt();
@@ -569,7 +603,19 @@ pub fn poisson_fit_analytic(
     // Temperature derivative ∂σ_k/∂T — only needed when fitting temperature.
     let mut dxs_dt: Vec<Vec<f64>> = vec![vec![0.0; n_e]; density_indices.len()];
 
-    let y_model = model.evaluate(&params.all_values());
+    // Scratch buffers reused across the entire optimization loop.  The analytic
+    // path calls params.all_values() 2–3× per iteration (model eval, T(E)
+    // computation, temperature lookup) and params.free_values() 2× (old_free
+    // snapshot + convergence check).  Reusing buffers avoids per-iteration
+    // allocation churn; the backtracking line search adds up to 50 more
+    // all_values + free_values calls per iteration.
+    let mut all_vals_buf = Vec::with_capacity(params.params.len());
+    let mut free_vals_buf = Vec::with_capacity(params.n_free());
+    let mut old_free_buf: Vec<f64> = Vec::with_capacity(params.n_free());
+    let mut trial_free_buf: Vec<f64> = Vec::with_capacity(params.n_free());
+
+    params.all_values_into(&mut all_vals_buf);
+    let y_model = model.evaluate(&all_vals_buf);
     let mut nll = poisson_nll(y_obs, &y_model);
     let mut converged = false;
     let mut iter = 0;
@@ -581,7 +627,8 @@ pub fn poisson_fit_analytic(
         // derivative at the current temperature.  This is expensive (3×
         // broadening) but necessary for an exact analytical gradient.
         if let Some(ctx) = &temp_ctx {
-            let t_current = params.all_values()[ctx.temperature_index];
+            params.all_values_into(&mut all_vals_buf);
+            let t_current = all_vals_buf[ctx.temperature_index];
             let (xs_new, dxs_new) = transmission::broadened_cross_sections_with_derivative(
                 &ctx.energies,
                 &ctx.resonance_data,
@@ -593,7 +640,8 @@ pub fn poisson_fit_analytic(
         }
 
         // Evaluate the full model Y(E) = Φ·T + B so we can form (1 - y_obs/Y).
-        let y_model_now = model.evaluate(&params.all_values());
+        params.all_values_into(&mut all_vals_buf);
+        let y_model_now = model.evaluate(&all_vals_buf);
 
         // Compute T(E) directly from cross-sections and current densities:
         //   T(E) = exp(−Σₖ nₖ · σₖ(E))
@@ -606,12 +654,12 @@ pub fn poisson_fit_analytic(
         // `density_indices[k]` maps isotope k → parameter index, so the
         // density lookup is correct even when the parameter vector contains
         // additional nuisance parameters before/after the densities.
-        let all_vals = params.all_values();
+        // Note: all_vals_buf was just populated above; reuse it directly.
         let t_now: Vec<f64> = (0..n_e)
             .map(|e| {
                 let mut neg_opt = 0.0f64;
                 for (k, xs) in xs_owned.iter().enumerate() {
-                    let density = all_vals[density_indices[k]];
+                    let density = all_vals_buf[density_indices[k]];
                     neg_opt -= density * xs[e];
                 }
                 neg_opt.exp()
@@ -659,7 +707,7 @@ pub fn poisson_fit_analytic(
                     let residual_factor = poisson_nll_grad_term(obs, ym);
                     let dsigma_sum: f64 = (0..density_indices.len())
                         .map(|k| {
-                            let density = all_vals[density_indices[k]];
+                            let density = all_vals_buf[density_indices[k]];
                             density * dxs_dt[k][e]
                         })
                         .sum();
@@ -694,7 +742,9 @@ pub fn poisson_fit_analytic(
         // extreme scale mismatch between density and temperature.
         // When temp_ctx is None, the preconditioner is still applied
         // (harmless: all density parameters have similar curvature).
-        let old_free = params.free_values();
+        params.free_values_into(&mut free_vals_buf);
+        old_free_buf.clear();
+        old_free_buf.extend_from_slice(&free_vals_buf);
 
         // Compute diagonal Fisher information for preconditioning.
         let hessian_diag: Vec<f64> = param_isotopes
@@ -717,7 +767,7 @@ pub fn poisson_fit_analytic(
                             // ∂Y/∂T = Φ · T · (−Σ_k n_k · ∂σ_k/∂T)
                             let dsigma_sum: f64 = (0..density_indices.len())
                                 .map(|k| {
-                                    let density = all_vals[density_indices[k]];
+                                    let density = all_vals_buf[density_indices[k]];
                                     density * dxs_dt[k][e]
                                 })
                                 .sum();
@@ -754,12 +804,15 @@ pub fn poisson_fit_analytic(
             model,
             params,
             y_obs,
-            &old_free,
+            &old_free_buf,
             &search_dir,
             initial_alpha,
             config,
             &grad,
             nll,
+            &mut all_vals_buf,
+            &mut free_vals_buf,
+            &mut trial_free_buf,
         ) {
             Some(new_nll) => nll = new_nll,
             None => {
@@ -769,9 +822,10 @@ pub fn poisson_fit_analytic(
         }
 
         // Convergence: parameter displacement (see poisson_fit for rationale).
-        let step_norm: f64 = old_free
+        params.free_values_into(&mut free_vals_buf);
+        let step_norm: f64 = old_free_buf
             .iter()
-            .zip(params.free_values().iter())
+            .zip(free_vals_buf.iter())
             .map(|(o, n)| (o - n).powi(2))
             .sum::<f64>()
             .sqrt();

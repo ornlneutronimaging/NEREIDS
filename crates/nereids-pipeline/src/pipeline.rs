@@ -193,7 +193,7 @@ pub fn fit_spectrum(
             }
             let model = PrecomputedTransmissionModel {
                 cross_sections: xs.clone(),
-                density_indices: (0..n_isotopes).collect(),
+                density_indices: Arc::new((0..n_isotopes).collect()),
             };
             lm::levenberg_marquardt(&model, measured_t, sigma, &mut params, &config.lm_config)
         } else {

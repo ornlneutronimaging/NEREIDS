@@ -118,19 +118,24 @@ fn chi_squared(residuals: &[f64], weights: &[f64]) -> f64 {
 /// current parameter values — it is passed in to avoid a redundant evaluate
 /// call (the LM loop already has this vector from the previous accepted step).
 ///
+/// `all_vals_buf` is a scratch buffer reused across the per-parameter FD loop
+/// to avoid allocating a fresh `Vec<f64>` on every `model.evaluate()` call.
+///
 /// J[i][j] = ∂model[i] / ∂free_param[j]
 fn compute_jacobian(
     model: &dyn FitModel,
     params: &mut ParameterSet,
     y_current: &[f64],
     fd_step: f64,
+    all_vals_buf: &mut Vec<f64>,
 ) -> Vec<Vec<f64>> {
     let free_indices = params.free_indices();
     let n_free = free_indices.len();
     let n_data = y_current.len();
 
     // Try analytical Jacobian first (no extra evaluate calls).
-    if let Some(j) = model.analytical_jacobian(&params.all_values(), &free_indices, y_current) {
+    params.all_values_into(all_vals_buf);
+    if let Some(j) = model.analytical_jacobian(all_vals_buf, &free_indices, y_current) {
         return j;
     }
 
@@ -158,7 +163,8 @@ fn compute_jacobian(
             }
         }
 
-        let perturbed = model.evaluate(&params.all_values());
+        params.all_values_into(all_vals_buf);
+        let perturbed = model.evaluate(all_vals_buf);
         params.params[idx].value = original;
 
         for i in 0..n_data {
@@ -404,10 +410,16 @@ pub fn levenberg_marquardt(
         })
         .collect();
 
+    // Scratch buffer reused across the optimization loop for
+    // params.all_values_into() calls in compute_jacobian (1 + N_free calls
+    // per Jacobian computation) and the trial-step evaluation.
+    let mut all_vals_buf = Vec::with_capacity(params.params.len());
+
     // Initial model output, residuals, and chi².
     // y_current is kept up-to-date after accepted steps so that the next
     // Jacobian call can reuse it without an extra evaluate() call.
-    let mut y_current = model.evaluate(&params.all_values());
+    params.all_values_into(&mut all_vals_buf);
+    let mut y_current = model.evaluate(&all_vals_buf);
     let mut residuals: Vec<f64> = y_obs
         .iter()
         .zip(y_current.iter())
@@ -425,7 +437,8 @@ pub fn levenberg_marquardt(
         // Compute Jacobian — uses y_current to avoid a redundant evaluate().
         // Analytical Jacobian (if provided by the model) costs 0 extra evaluates;
         // finite-difference fallback costs N_free extra evaluates.
-        let jacobian = compute_jacobian(model, params, &y_current, config.fd_step);
+        let jacobian =
+            compute_jacobian(model, params, &y_current, config.fd_step, &mut all_vals_buf);
 
         // Build normal equations: JᵀWJ and JᵀWr
         let mut jtw_j = vec![vec![0.0; n_free]; n_free];
@@ -455,7 +468,8 @@ pub fn levenberg_marquardt(
             .collect();
         params.set_free_values(&trial_free);
 
-        let y_trial = model.evaluate(&params.all_values());
+        params.all_values_into(&mut all_vals_buf);
+        let y_trial = model.evaluate(&all_vals_buf);
 
         // #113: If the model produced NaN/Inf, treat as a bad step (same as
         // chi2 increase) — increase lambda and try again.
@@ -517,7 +531,7 @@ pub fn levenberg_marquardt(
     }
 
     // Compute covariance matrix: (JᵀWJ)⁻¹ at the final parameters.
-    let jacobian = compute_jacobian(model, params, &y_current, config.fd_step);
+    let jacobian = compute_jacobian(model, params, &y_current, config.fd_step, &mut all_vals_buf);
     let mut jtw_j = vec![vec![0.0; n_free]; n_free];
     for i in 0..n_data {
         for j in 0..n_free {
