@@ -10,18 +10,8 @@ cargo clippy --workspace --exclude nereids-python -- -D warnings
 cargo test --workspace --exclude nereids-python
 ```
 
-`cargo fmt --all` must be run (not just `--check`) so that formatting is
-actually applied. Never rely on targeted `Edit` patches to keep formatting
-correct — rustfmt has its own opinions on argument layout, trailing commas,
-and line width that must be respected.
-
-`cargo clippy -- -D warnings` treats every warning as an error, matching CI.
-Fix all warnings; do not suppress them with `#[allow(...)]` unless there is a
-documented reason in a comment.
-
-`cargo test` catches regressions from API changes that ripple across crates
-(e.g., changing a return type in nereids-core breaks nereids-endf callers).
-The workspace run is fast (~2 s) and prevents cross-crate breakage.
+Run `cargo fmt` (not `--check`) so formatting is applied — never rely on
+targeted `Edit` patches. Do not suppress clippy warnings with `#[allow(...)]`.
 
 ## Physics Rules
 
@@ -78,42 +68,16 @@ pixi run test-python
 
 ## Validation Patterns
 
-Lessons from review pipeline findings — apply these consistently:
-
-- **Validate config up-front** in public entry points (`fit_spectrum`,
-  `spatial_map`, `fit_roi`, `sparse_reconstruct`). Check lengths,
-  emptiness, and finiteness *before* entering rayon parallel iterators.
-  Silent `Err(_) => None` in `filter_map` is acceptable only for
-  per-pixel numerical edge cases, never for config errors.
-- **NaN bypasses guards**: `NaN < 1.0` is `false`, so range checks like
-  `x < 1.0` don't catch NaN. Always pair with `.is_finite()`.
-- **Empty collections pass equality**: `0 == 0` passes length-match
-  checks. Guard `is_empty()` or `> 0` separately.
-- **`debug_assert!` for impossible states**: use `obs.is_finite() &&
-  obs >= 0.0` pattern — catches both NaN and negative in one assert.
-- **Magic number → named constant: preserve the value.** When replacing
-  numeric literals with named constants, verify that the constant's value
-  matches the original literal *exactly*. A `1e-30` guard replaced with a
-  `1e-60` constant silently loosens the threshold by 30 orders of magnitude.
-  Build a mapping table (literal → constant → value) before starting bulk
-  replacements, and grep-verify after.  (Lesson: PRs #135-#136 introduced
-  12+ threshold bugs this way; caught by Codex + Copilot across 3 rounds.)
-- **`debug_assert!` is not input validation.** Use `debug_assert!` only
-  for truly impossible internal states. For input validation (parser data,
-  config parameters), use hard errors (`return Err(...)`) that fire in
-  release builds too.
-- **Subagent prompts must specify tooling.** Always tell subagents to use
-  `pixi run build` / `pixi run test-python` — never raw `maturin develop`
-  or `pip install`.  Agents don't inherit this context automatically.
-- **Check existing patterns before introducing new API calls.** When a
-  subagent adds new code to an existing file (e.g., PyO3 bindings), the
-  prompt must say "match the patterns already used in this file" — not
-  invent new ones.  (Lesson: fix agent used `Python::with_gil()` which
-  doesn't exist; should have matched `py.detach()` at L643/L723.)
-- **Check sibling repos for solved problems.** Before designing CI
-  workflows or build configurations, check `../bm3dornl` and other
-  sibling projects for existing patterns.  (Lesson: pixi-based CI was
-  already working in bm3dornl; we wasted a round on a manual venv hack.)
+- **Validate config up-front** in public entry points, before rayon
+  iterators. `Err(_) => None` in `filter_map` only for per-pixel edge cases.
+- **NaN bypasses guards**: `NaN < 1.0` is `false`. Always pair with
+  `.is_finite()`.
+- **Empty collections pass equality**: `0 == 0` passes. Guard
+  `is_empty()` separately.
+- **`debug_assert!` is for impossible states only**, not input validation.
+  Use hard errors (`return Err(...)`) for parser/config validation.
+- **Magic number → named constant**: preserve the exact numeric value.
+  Verify with a mapping table and grep-verify after bulk replacements.
 
 ## Execution Model (mandatory)
 
@@ -126,13 +90,7 @@ When implementing fixes or features across multiple issues, crates, or files:
 - **Group related changes into PRs**, not individual commits.  Each PR
   should map to a coherent scope (e.g., one issue, one crate, one theme).
 - **Launch subagents in a single message** so they run concurrently.
-  Do not serialize what can be parallelized.
-- **Close/comment on GitHub issues in parallel** with implementation work,
-  not sequentially before or after.
-
-This rule exists because sequential editing is slow, error-prone, and
-ignores the tooling we built.  If you catch yourself editing files one by
-one across multiple issues, STOP and switch to the parallel model.
+- **Close/comment on GitHub issues in parallel** with implementation work.
 
 ## Git Workflow
 
