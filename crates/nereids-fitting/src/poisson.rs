@@ -316,6 +316,212 @@ fn backtracking_line_search(
     None
 }
 
+/// Early return for all-fixed parameters: evaluate once and report.
+///
+/// Returns `Some(PoissonResult)` if all parameters are fixed (either a valid
+/// result with converged=true, or a non-finite NLL with converged=false).
+/// Returns `None` if there are free parameters and optimization should proceed.
+fn try_early_return_fixed(
+    model: &dyn FitModel,
+    y_obs: &[f64],
+    params: &ParameterSet,
+) -> Option<PoissonResult> {
+    if params.n_free() != 0 {
+        return None;
+    }
+    let y_model = model.evaluate(&params.all_values());
+    let nll = poisson_nll(y_obs, &y_model);
+    if !nll.is_finite() {
+        return Some(PoissonResult {
+            nll,
+            iterations: 0,
+            converged: false,
+            params: params.all_values(),
+        });
+    }
+    Some(PoissonResult {
+        nll,
+        iterations: 0,
+        converged: true,
+        params: params.all_values(),
+    })
+}
+
+/// Validate inputs shared by `poisson_fit_analytic` and `poisson_fit_lbfgsb`.
+///
+/// Checks:
+/// - `flux` and all `cross_sections[k]` have the same length as `y_obs`.
+/// - Every free parameter is mapped by `density_indices` or `temperature_index`.
+///
+/// Panics on validation failure (same contract as the original inline asserts).
+fn validate_analytic_inputs(
+    n_e: usize,
+    flux: &[f64],
+    cross_sections: &[Vec<f64>],
+    density_indices: &[usize],
+    params: &ParameterSet,
+    temp_ctx: Option<&TemperatureContext>,
+    caller: &str,
+) {
+    assert_eq!(flux.len(), n_e, "flux length must match y_obs");
+    assert_eq!(
+        density_indices.len(),
+        cross_sections.len(),
+        "density_indices length must match cross_sections length, got {} density indices and {} cross sections",
+        density_indices.len(),
+        cross_sections.len(),
+    );
+    for (k, sigma) in cross_sections.iter().enumerate() {
+        assert_eq!(
+            sigma.len(),
+            n_e,
+            "cross_sections[{}] length ({}) must match energy grid length ({})",
+            k,
+            sigma.len(),
+            n_e,
+        );
+    }
+
+    // Validate that every free parameter is referenced by density_indices
+    // or the temperature context.  Free parameters with no analytical
+    // gradient mapping will never move, causing silent convergence to the
+    // initial guess.
+    let free_set: std::collections::HashSet<usize> = params.free_indices().into_iter().collect();
+    let mut mapped_set: std::collections::HashSet<usize> =
+        density_indices.iter().copied().collect();
+    if let Some(ctx) = temp_ctx {
+        mapped_set.insert(ctx.temperature_index);
+    }
+    let unmapped: Vec<usize> = free_set.difference(&mapped_set).copied().collect();
+    assert!(
+        unmapped.is_empty(),
+        "{caller}: free parameters {unmapped:?} are not mapped by density_indices \
+         or temperature_index; analytical gradient is zero for these params. \
+         Use poisson_fit (FD) for mixed parameter sets.",
+    );
+}
+
+/// Build a mapping from each free parameter index to the list of isotope
+/// indices it controls.
+///
+/// `param_isotopes[j]` contains the isotope indices `k` such that
+/// `density_indices[k] == free_indices[j]`.  This is precomputed once
+/// outside the iteration loop since `free_indices` and `density_indices`
+/// are invariant during optimization.
+fn build_param_isotope_map(free_indices: &[usize], density_indices: &[usize]) -> Vec<Vec<usize>> {
+    free_indices
+        .iter()
+        .map(|&pi| {
+            density_indices
+                .iter()
+                .enumerate()
+                .filter(|&(_, &di)| di == pi)
+                .map(|(k, _)| k)
+                .collect()
+        })
+        .collect()
+}
+
+/// Compute the Beer-Lambert transmission T(E) = exp(−Σₖ nₖ · σₖ(E))
+/// from cross-sections and current parameter values.
+///
+/// `density_indices[k]` maps isotope k to the parameter index, so the
+/// density lookup is correct even when the parameter vector contains
+/// additional nuisance parameters before/after the densities.
+fn compute_transmission(
+    n_e: usize,
+    xs: &[Vec<f64>],
+    density_indices: &[usize],
+    all_vals: &[f64],
+) -> Vec<f64> {
+    debug_assert!(
+        density_indices.iter().all(|&idx| idx < all_vals.len()),
+        "density_indices out of bounds for parameter vector"
+    );
+    (0..n_e)
+        .map(|e| {
+            let mut neg_opt = 0.0f64;
+            for (k, xs_k) in xs.iter().enumerate() {
+                let density = all_vals[density_indices[k]];
+                neg_opt -= density * xs_k[e];
+            }
+            neg_opt.exp()
+        })
+        .collect()
+}
+
+/// Inputs for `compute_analytic_gradient` bundled to satisfy clippy's
+/// too-many-arguments lint without suppression.
+struct AnalyticGradientCtx<'a> {
+    y_obs: &'a [f64],
+    y_model: &'a [f64],
+    flux: &'a [f64],
+    t_now: &'a [f64],
+    xs: &'a [Vec<f64>],
+    param_isotopes: &'a [Vec<usize>],
+    temp_free_pos: Option<usize>,
+    density_indices: &'a [usize],
+    all_vals: &'a [f64],
+    dxs_dt: &'a [Vec<f64>],
+}
+
+/// Compute the analytical gradient of the Poisson NLL w.r.t. free parameters.
+///
+/// Density gradient:  ∂NLL/∂nₖ = Σ_E [(1 − y_obs/Y) · (−Φ · σₖ · T)]
+/// Temperature gradient: ∂NLL/∂T = Σ_E [(1 − y_obs/Y) · Φ · T · (−Σₖ nₖ · ∂σₖ/∂T)]
+///
+/// Both use the smooth `poisson_nll_grad_term` for the residual factor,
+/// consistent with the C¹ extrapolation in `poisson_nll_term` (#109.2).
+fn compute_analytic_gradient(ctx: &AnalyticGradientCtx<'_>) -> Vec<f64> {
+    let mut grad: Vec<f64> = ctx
+        .param_isotopes
+        .iter()
+        .map(|iso_indices| {
+            ctx.y_obs
+                .iter()
+                .zip(ctx.y_model.iter())
+                .zip(ctx.flux.iter())
+                .zip(ctx.t_now.iter())
+                .enumerate()
+                .map(|(e, (((&obs, &ym), &phi), &t))| {
+                    let residual_factor = poisson_nll_grad_term(obs, ym);
+                    let sigma_sum: f64 = iso_indices.iter().map(|&k| ctx.xs[k][e]).sum();
+                    residual_factor * phi * t * (-sigma_sum)
+                })
+                .sum::<f64>()
+        })
+        .collect();
+
+    // Temperature gradient: ∂NLL/∂T = Σ_E [(1 − y_obs/Y) · Φ · T · (−Σₖ nₖ · ∂σₖ/∂T)]
+    if let Some(pos) = ctx.temp_free_pos {
+        debug_assert!(
+            !ctx.dxs_dt.is_empty(),
+            "dxs_dt must be non-empty when temperature fitting is enabled"
+        );
+        let temp_grad: f64 = ctx
+            .y_obs
+            .iter()
+            .zip(ctx.y_model.iter())
+            .zip(ctx.flux.iter())
+            .zip(ctx.t_now.iter())
+            .enumerate()
+            .map(|(e, (((&obs, &ym), &phi), &t))| {
+                let residual_factor = poisson_nll_grad_term(obs, ym);
+                let dsigma_sum: f64 = (0..ctx.density_indices.len())
+                    .map(|k| {
+                        let density = ctx.all_vals[ctx.density_indices[k]];
+                        density * ctx.dxs_dt[k][e]
+                    })
+                    .sum();
+                residual_factor * phi * t * (-dsigma_sum)
+            })
+            .sum();
+        grad[pos] = temp_grad;
+    }
+
+    grad
+}
+
 /// Run Poisson-likelihood optimization using projected gradient descent.
 ///
 /// Uses backtracking line search with Armijo condition and
@@ -335,28 +541,8 @@ pub fn poisson_fit(
     params: &mut ParameterSet,
     config: &PoissonConfig,
 ) -> PoissonResult {
-    // Early return when all parameters are fixed: evaluate once and report.
-    if params.n_free() == 0 {
-        let y_model = model.evaluate(&params.all_values());
-        let nll = poisson_nll(y_obs, &y_model);
-
-        // #P1: If the model produces non-finite NLL with all-fixed parameters,
-        // return converged=false rather than silently claiming success.
-        if !nll.is_finite() {
-            return PoissonResult {
-                nll,
-                iterations: 0,
-                converged: false,
-                params: params.all_values(),
-            };
-        }
-
-        return PoissonResult {
-            nll,
-            iterations: 0,
-            converged: true,
-            params: params.all_values(),
-        };
+    if let Some(result) = try_early_return_fixed(model, y_obs, params) {
+        return result;
     }
 
     // Scratch buffers reused across the entire optimization loop to avoid
@@ -370,6 +556,18 @@ pub fn poisson_fit(
     params.all_values_into(&mut all_vals_buf);
     let y_model = model.evaluate(&all_vals_buf);
     let mut nll = poisson_nll(y_obs, &y_model);
+
+    // Guard: if the initial NLL is non-finite, bail out immediately rather
+    // than entering the optimization loop with garbage values.
+    if !nll.is_finite() {
+        return PoissonResult {
+            nll,
+            iterations: 0,
+            converged: false,
+            params: params.all_values(),
+        };
+    }
+
     let mut converged = false;
     let mut iter = 0;
 
@@ -510,86 +708,22 @@ pub fn poisson_fit_analytic(
     temp_ctx: Option<&TemperatureContext>,
 ) -> PoissonResult {
     let n_e = y_obs.len();
-    assert_eq!(flux.len(), n_e, "flux length must match y_obs");
-    assert_eq!(
-        density_indices.len(),
-        cross_sections.len(),
-        "density_indices length must match cross_sections length, got {} density indices and {} cross sections",
-        density_indices.len(),
-        cross_sections.len(),
+    validate_analytic_inputs(
+        n_e,
+        flux,
+        cross_sections,
+        density_indices,
+        params,
+        temp_ctx,
+        "poisson_fit_analytic",
     );
-    for (k, sigma) in cross_sections.iter().enumerate() {
-        assert_eq!(
-            sigma.len(),
-            n_e,
-            "cross_sections[{}] length ({}) must match energy grid length ({})",
-            k,
-            sigma.len(),
-            n_e,
-        );
+
+    if let Some(result) = try_early_return_fixed(model, y_obs, params) {
+        return result;
     }
 
-    // Early return when all parameters are fixed: evaluate once and report.
-    if params.n_free() == 0 {
-        let y_model = model.evaluate(&params.all_values());
-        let nll = poisson_nll(y_obs, &y_model);
-
-        // #P1: If the model produces non-finite NLL with all-fixed parameters,
-        // return converged=false rather than silently claiming success.
-        if !nll.is_finite() {
-            return PoissonResult {
-                nll,
-                iterations: 0,
-                converged: false,
-                params: params.all_values(),
-            };
-        }
-
-        return PoissonResult {
-            nll,
-            iterations: 0,
-            converged: true,
-            params: params.all_values(),
-        };
-    }
-
-    // Validate that every free parameter is referenced by density_indices
-    // or the temperature context.  Free parameters with no analytical
-    // gradient mapping will never move, causing silent convergence to the
-    // initial guess.
-    {
-        let free_set: std::collections::HashSet<usize> =
-            params.free_indices().into_iter().collect();
-        let mut mapped_set: std::collections::HashSet<usize> =
-            density_indices.iter().copied().collect();
-        if let Some(ctx) = &temp_ctx {
-            mapped_set.insert(ctx.temperature_index);
-        }
-        let unmapped: Vec<usize> = free_set.difference(&mapped_set).copied().collect();
-        assert!(
-            unmapped.is_empty(),
-            "poisson_fit_analytic: free parameters {:?} are not mapped by density_indices \
-             or temperature_index; analytical gradient is zero for these params. Use \
-             poisson_fit (FD) for mixed parameter sets.",
-            unmapped,
-        );
-    }
-
-    // Precompute param_idx → list of isotope indices once, outside the
-    // iteration loop.  free_indices and density_indices are invariant
-    // during optimization, so this avoids repeated allocations per step.
     let free_indices = params.free_indices();
-    let param_isotopes: Vec<Vec<usize>> = free_indices
-        .iter()
-        .map(|&pi| {
-            density_indices
-                .iter()
-                .enumerate()
-                .filter(|&(_, &di)| di == pi)
-                .map(|(k, _)| k)
-                .collect()
-        })
-        .collect();
+    let param_isotopes = build_param_isotope_map(&free_indices, density_indices);
 
     // Position of the temperature parameter in the free-parameter vector.
     let temp_free_pos: Option<usize> = temp_ctx.as_ref().and_then(|ctx| {
@@ -598,17 +732,22 @@ pub fn poisson_fit_analytic(
             .position(|&fi| fi == ctx.temperature_index)
     });
 
-    // Own the cross-sections so we can update them when temperature changes.
-    let mut xs_owned: Vec<Vec<f64>> = cross_sections.to_vec();
-    // Temperature derivative ∂σ_k/∂T — only needed when fitting temperature.
-    let mut dxs_dt: Vec<Vec<f64>> = vec![vec![0.0; n_e]; density_indices.len()];
+    // Clone cross-sections only when temperature fitting is enabled (the
+    // optimizer overwrites xs_owned each iteration with recomputed values).
+    // When temperature is not being fitted, borrow the caller's data directly.
+    let mut xs_owned: Vec<Vec<f64>> = if temp_ctx.is_some() {
+        cross_sections.to_vec()
+    } else {
+        Vec::new()
+    };
+    // Temperature derivative dσ_k/dT — only allocated when fitting temperature.
+    let mut dxs_dt: Vec<Vec<f64>> = if temp_ctx.is_some() {
+        vec![vec![0.0; n_e]; density_indices.len()]
+    } else {
+        Vec::new()
+    };
 
-    // Scratch buffers reused across the entire optimization loop.  The analytic
-    // path calls params.all_values() 2–3× per iteration (model eval, T(E)
-    // computation, temperature lookup) and params.free_values() 2× (old_free
-    // snapshot + convergence check).  Reusing buffers avoids per-iteration
-    // allocation churn; the backtracking line search adds up to 50 more
-    // all_values + free_values calls per iteration.
+    // Scratch buffers reused across the entire optimization loop.
     let mut all_vals_buf = Vec::with_capacity(params.params.len());
     let mut free_vals_buf = Vec::with_capacity(params.n_free());
     let mut old_free_buf: Vec<f64> = Vec::with_capacity(params.n_free());
@@ -617,6 +756,18 @@ pub fn poisson_fit_analytic(
     params.all_values_into(&mut all_vals_buf);
     let y_model = model.evaluate(&all_vals_buf);
     let mut nll = poisson_nll(y_obs, &y_model);
+
+    // Guard: if the initial NLL is non-finite, bail out immediately rather
+    // than entering the optimization loop with garbage values.
+    if !nll.is_finite() {
+        return PoissonResult {
+            nll,
+            iterations: 0,
+            converged: false,
+            params: params.all_values(),
+        };
+    }
+
     let mut converged = false;
     let mut iter = 0;
 
@@ -624,7 +775,7 @@ pub fn poisson_fit_analytic(
         iter += 1;
 
         // When fitting temperature, recompute cross-sections and their T
-        // derivative at the current temperature.  This is expensive (3×
+        // derivative at the current temperature.  This is expensive (3x
         // broadening) but necessary for an exact analytical gradient.
         if let Some(ctx) = &temp_ctx {
             params.all_values_into(&mut all_vals_buf);
@@ -639,83 +790,32 @@ pub fn poisson_fit_analytic(
             dxs_dt = dxs_new;
         }
 
-        // Evaluate the full model Y(E) = Φ·T + B so we can form (1 - y_obs/Y).
+        // Use owned cross-sections when temperature fitting (mutated each
+        // iteration), otherwise borrow the caller's immutable data directly.
+        let xs_ref: &[Vec<f64>] = if temp_ctx.is_some() {
+            &xs_owned
+        } else {
+            cross_sections
+        };
+
+        // Evaluate the full model Y(E) and compute T(E) from Beer-Lambert.
         params.all_values_into(&mut all_vals_buf);
         let y_model_now = model.evaluate(&all_vals_buf);
+        let t_now = compute_transmission(n_e, xs_ref, density_indices, &all_vals_buf);
 
-        // Compute T(E) directly from cross-sections and current densities:
-        //   T(E) = exp(−Σₖ nₖ · σₖ(E))
-        //
-        // An earlier version derived T = Y/Φ, which is only correct when
-        // background B = 0.  Computing T from the Beer-Lambert definition
-        // is exact regardless of background and avoids a silent bias whenever
-        // a caller supplies a CountsModel with nonzero B(E).
-        //
-        // `density_indices[k]` maps isotope k → parameter index, so the
-        // density lookup is correct even when the parameter vector contains
-        // additional nuisance parameters before/after the densities.
-        // Note: all_vals_buf was just populated above; reuse it directly.
-        let t_now: Vec<f64> = (0..n_e)
-            .map(|e| {
-                let mut neg_opt = 0.0f64;
-                for (k, xs) in xs_owned.iter().enumerate() {
-                    let density = all_vals_buf[density_indices[k]];
-                    neg_opt -= density * xs[e];
-                }
-                neg_opt.exp()
-            })
-            .collect();
-
-        // Analytical gradient: ∂NLL/∂nₖ = Σ_E [(1 − y_obs/Y) · (−Φ · σₖ · T)]
-        //
-        // Derivation:  Y = Φ·T + B,  T = exp(−Σ nₖ σₖ)
-        //   ∂Y/∂nₖ = Φ · ∂T/∂nₖ = −Φ · σₖ · T
-        //   ∂NLL/∂nₖ = Σ_E (1 − y_obs/Y) · ∂Y/∂nₖ
-
-        let mut grad: Vec<f64> = param_isotopes
-            .iter()
-            .map(|iso_indices| {
-                y_obs
-                    .iter()
-                    .zip(y_model_now.iter())
-                    .zip(flux.iter())
-                    .zip(t_now.iter())
-                    .enumerate()
-                    .map(|(e, (((&obs, &ym), &phi), &t))| {
-                        // Use the smooth NLL gradient term consistent with
-                        // poisson_nll_grad_term (#109.2).
-                        let residual_factor = poisson_nll_grad_term(obs, ym);
-                        let sigma_sum: f64 = iso_indices.iter().map(|&k| xs_owned[k][e]).sum();
-                        residual_factor * phi * t * (-sigma_sum)
-                    })
-                    .sum::<f64>()
-            })
-            .collect();
-
-        // Temperature gradient: ∂NLL/∂T = Σ_E [(1 − y_obs/Y) · Φ · T · (−Σₖ nₖ · ∂σₖ/∂T)]
-        //
-        // Derivation:  ∂T/∂temp = T · (−Σₖ nₖ · ∂σₖ/∂temp)
-        //   ∂Y/∂temp = Φ · ∂T/∂temp
-        if let Some(pos) = temp_free_pos {
-            let temp_grad: f64 = y_obs
-                .iter()
-                .zip(y_model_now.iter())
-                .zip(flux.iter())
-                .zip(t_now.iter())
-                .enumerate()
-                .map(|(e, (((&obs, &ym), &phi), &t))| {
-                    let residual_factor = poisson_nll_grad_term(obs, ym);
-                    let dsigma_sum: f64 = (0..density_indices.len())
-                        .map(|k| {
-                            let density = all_vals_buf[density_indices[k]];
-                            density * dxs_dt[k][e]
-                        })
-                        .sum();
-                    residual_factor * phi * t * (-dsigma_sum)
-                })
-                .sum();
-            grad[pos] = temp_grad;
-        }
+        // Analytical gradient (density + optional temperature).
+        let grad = compute_analytic_gradient(&AnalyticGradientCtx {
+            y_obs,
+            y_model: &y_model_now,
+            flux,
+            t_now: &t_now,
+            xs: xs_ref,
+            param_isotopes: &param_isotopes,
+            temp_free_pos,
+            density_indices,
+            all_vals: &all_vals_buf,
+            dxs_dt: &dxs_dt,
+        });
 
         // Check gradient norm for convergence
         let grad_norm: f64 = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
@@ -774,7 +874,7 @@ pub fn poisson_fit_analytic(
                             phi * t * (-dsigma_sum)
                         } else {
                             // ∂Y/∂n_k = −Φ · σ_k · T
-                            let sigma_sum: f64 = iso_indices.iter().map(|&k| xs_owned[k][e]).sum();
+                            let sigma_sum: f64 = iso_indices.iter().map(|&k| xs_ref[k][e]).sum();
                             phi * t * (-sigma_sum)
                         };
                         dy * dy / ym_safe
@@ -877,6 +977,10 @@ impl<'a> FitModel for CountsModel<'a> {
 /// (two-loop recursion for limited-memory BFGS).
 ///
 /// Uses a ring buffer to avoid shifting elements when the buffer is full.
+// TODO(perf): consider flat buffer with stride-based indexing for cache locality.
+// The current Vec<Vec<f64>> layout scatters s/y vectors across the heap; a single
+// contiguous allocation with stride = n_free would improve L1/L2 cache utilization
+// during the two-loop recursion, especially for large parameter vectors.
 struct LbfgsbMemory {
     /// Maximum number of correction pairs to store.
     m: usize,
@@ -998,6 +1102,27 @@ impl LbfgsbMemory {
 ///
 /// Uses the same analytical gradient as [`poisson_fit_analytic`] but replaces
 /// the diagonal Fisher preconditioning with a full L-BFGS inverse Hessian
+/// Returns `true` if `direction` is a descent direction with respect to
+/// `gradient`, i.e. the dot product `direction . gradient` is strictly
+/// positive.
+///
+/// In the L-BFGS-B line search convention `x_new = x - alpha * search_dir`,
+/// the search direction should point in the gradient direction for descent,
+/// so a positive dot product indicates the step will reduce the objective.
+///
+/// Used by [`poisson_fit_lbfgsb`] to decide whether to keep the L-BFGS
+/// direction or fall back to steepest descent (the projected gradient).
+fn is_descent_direction(direction: &[f64], gradient: &[f64]) -> bool {
+    let dot: f64 = direction
+        .iter()
+        .zip(gradient.iter())
+        .map(|(&d, &g)| d * g)
+        .sum();
+    // Strictly positive: orthogonal (dot == 0) is NOT descent because the
+    // step would not reduce the objective along the gradient.
+    dot > 0.0
+}
+
 /// approximation.  This captures curvature across parameters (not just
 /// per-parameter diagonal curvature), which is critical for problems with
 /// correlated parameters such as joint density + temperature fitting.
@@ -1034,79 +1159,23 @@ pub fn poisson_fit_lbfgsb(
         "lbfgsb_memory must be >= 1, got {}",
         config.lbfgsb_memory,
     );
-    assert_eq!(flux.len(), n_e, "flux length must match y_obs");
-    assert_eq!(
-        density_indices.len(),
-        cross_sections.len(),
-        "density_indices length must match cross_sections length, got {} density indices and {} cross sections",
-        density_indices.len(),
-        cross_sections.len(),
+    validate_analytic_inputs(
+        n_e,
+        flux,
+        cross_sections,
+        density_indices,
+        params,
+        temp_ctx,
+        "poisson_fit_lbfgsb",
     );
-    for (k, sigma) in cross_sections.iter().enumerate() {
-        assert_eq!(
-            sigma.len(),
-            n_e,
-            "cross_sections[{}] length ({}) must match energy grid length ({})",
-            k,
-            sigma.len(),
-            n_e,
-        );
+
+    if let Some(result) = try_early_return_fixed(model, y_obs, params) {
+        return result;
     }
 
-    // Early return when all parameters are fixed.
-    if params.n_free() == 0 {
-        let y_model = model.evaluate(&params.all_values());
-        let nll = poisson_nll(y_obs, &y_model);
-        if !nll.is_finite() {
-            return PoissonResult {
-                nll,
-                iterations: 0,
-                converged: false,
-                params: params.all_values(),
-            };
-        }
-        return PoissonResult {
-            nll,
-            iterations: 0,
-            converged: true,
-            params: params.all_values(),
-        };
-    }
-
-    // Validate that every free parameter is referenced by density_indices
-    // or the temperature context.
-    {
-        let free_set: std::collections::HashSet<usize> =
-            params.free_indices().into_iter().collect();
-        let mut mapped_set: std::collections::HashSet<usize> =
-            density_indices.iter().copied().collect();
-        if let Some(ctx) = &temp_ctx {
-            mapped_set.insert(ctx.temperature_index);
-        }
-        let unmapped: Vec<usize> = free_set.difference(&mapped_set).copied().collect();
-        assert!(
-            unmapped.is_empty(),
-            "poisson_fit_lbfgsb: free parameters {:?} are not mapped by density_indices \
-             or temperature_index; analytical gradient is zero for these params. \
-             Use poisson_fit (FD) for mixed parameter sets.",
-            unmapped,
-        );
-    }
-
-    // Precompute param_idx -> list of isotope indices.
     let free_indices = params.free_indices();
     let n_free = free_indices.len();
-    let param_isotopes: Vec<Vec<usize>> = free_indices
-        .iter()
-        .map(|&pi| {
-            density_indices
-                .iter()
-                .enumerate()
-                .filter(|&(_, &di)| di == pi)
-                .map(|(k, _)| k)
-                .collect()
-        })
-        .collect();
+    let param_isotopes = build_param_isotope_map(&free_indices, density_indices);
 
     // Position of the temperature parameter in the free-parameter vector.
     let temp_free_pos: Option<usize> = temp_ctx.as_ref().and_then(|ctx| {
@@ -1115,9 +1184,17 @@ pub fn poisson_fit_lbfgsb(
             .position(|&fi| fi == ctx.temperature_index)
     });
 
-    // Own the cross-sections so we can update them when temperature changes.
-    let mut xs_owned: Vec<Vec<f64>> = cross_sections.to_vec();
-    let mut dxs_dt: Vec<Vec<f64>> = vec![vec![0.0; n_e]; density_indices.len()];
+    // Clone cross-sections only when temperature fitting is enabled.
+    let mut xs_owned: Vec<Vec<f64>> = if temp_ctx.is_some() {
+        cross_sections.to_vec()
+    } else {
+        Vec::new()
+    };
+    let mut dxs_dt: Vec<Vec<f64>> = if temp_ctx.is_some() {
+        vec![vec![0.0; n_e]; density_indices.len()]
+    } else {
+        Vec::new()
+    };
 
     let y_model = model.evaluate(&params.all_values());
     let mut nll = poisson_nll(y_obs, &y_model);
@@ -1152,9 +1229,13 @@ pub fn poisson_fit_lbfgsb(
     for _ in 0..config.max_iter {
         iter += 1;
 
-        // ---- Temperature XS recomputation (same as poisson_fit_analytic) ----
+        // ---- Temperature XS recomputation ----
+        // Fill all_vals_buf once up front; reused by both the temperature
+        // recomputation (if enabled) and the model evaluation below.
+        params.all_values_into(&mut all_vals_buf);
+
         if let Some(ctx) = &temp_ctx {
-            let t_current = params.all_values()[ctx.temperature_index];
+            let t_current = all_vals_buf[ctx.temperature_index];
             let (xs_new, dxs_new) = transmission::broadened_cross_sections_with_derivative(
                 &ctx.energies,
                 &ctx.resonance_data,
@@ -1165,60 +1246,29 @@ pub fn poisson_fit_lbfgsb(
             dxs_dt = dxs_new;
         }
 
-        // ---- Evaluate model and compute transmission ----
-        let y_model_now = model.evaluate(&params.all_values());
-        let all_vals = params.all_values();
-        let t_now: Vec<f64> = (0..n_e)
-            .map(|e| {
-                let mut neg_opt = 0.0f64;
-                for (k, xs) in xs_owned.iter().enumerate() {
-                    let density = all_vals[density_indices[k]];
-                    neg_opt -= density * xs[e];
-                }
-                neg_opt.exp()
-            })
-            .collect();
+        // Use owned cross-sections when temperature fitting, otherwise
+        // borrow the caller's immutable data directly.
+        let xs_ref: &[Vec<f64>] = if temp_ctx.is_some() {
+            &xs_owned
+        } else {
+            cross_sections
+        };
 
-        // ---- Analytical gradient (identical to poisson_fit_analytic) ----
-        let mut grad: Vec<f64> = param_isotopes
-            .iter()
-            .map(|iso_indices| {
-                y_obs
-                    .iter()
-                    .zip(y_model_now.iter())
-                    .zip(flux.iter())
-                    .zip(t_now.iter())
-                    .enumerate()
-                    .map(|(e, (((&obs, &ym), &phi), &t))| {
-                        let residual_factor = poisson_nll_grad_term(obs, ym);
-                        let sigma_sum: f64 = iso_indices.iter().map(|&k| xs_owned[k][e]).sum();
-                        residual_factor * phi * t * (-sigma_sum)
-                    })
-                    .sum::<f64>()
-            })
-            .collect();
-
-        // Temperature gradient.
-        if let Some(pos) = temp_free_pos {
-            let temp_grad: f64 = y_obs
-                .iter()
-                .zip(y_model_now.iter())
-                .zip(flux.iter())
-                .zip(t_now.iter())
-                .enumerate()
-                .map(|(e, (((&obs, &ym), &phi), &t))| {
-                    let residual_factor = poisson_nll_grad_term(obs, ym);
-                    let dsigma_sum: f64 = (0..density_indices.len())
-                        .map(|k| {
-                            let density = all_vals[density_indices[k]];
-                            density * dxs_dt[k][e]
-                        })
-                        .sum();
-                    residual_factor * phi * t * (-dsigma_sum)
-                })
-                .sum();
-            grad[pos] = temp_grad;
-        }
+        // ---- Evaluate model and compute transmission + gradient ----
+        let y_model_now = model.evaluate(&all_vals_buf);
+        let t_now = compute_transmission(n_e, xs_ref, density_indices, &all_vals_buf);
+        let grad = compute_analytic_gradient(&AnalyticGradientCtx {
+            y_obs,
+            y_model: &y_model_now,
+            flux,
+            t_now: &t_now,
+            xs: xs_ref,
+            param_isotopes: &param_isotopes,
+            temp_free_pos,
+            density_indices,
+            all_vals: &all_vals_buf,
+            dxs_dt: &dxs_dt,
+        });
 
         // Snapshot current free-parameter values once (used by both
         // the L-BFGS memory update and the projected direction).
@@ -1278,28 +1328,33 @@ pub fn poisson_fit_lbfgsb(
         // Zero out direction components at active bounds.
         zero_active_bounds(&mut direction, &grad);
 
-        // Ensure descent direction: if direction · gradient < 0, the
-        // L-BFGS direction is ascending; fall back to steepest descent.
+        // Ensure descent direction: if direction · gradient <= 0, the
+        // L-BFGS direction is not a descent direction (ascending or
+        // orthogonal to the gradient); fall back to steepest descent.
         // (The search_dir convention in backtracking_line_search is:
         //  x_new = x - alpha * search_dir, so search_dir should point
         //  in the gradient direction for descent.)
-        let dir_dot_grad: f64 = direction
-            .iter()
-            .zip(grad.iter())
-            .map(|(&d, &g)| d * g)
-            .sum();
-        if dir_dot_grad <= 0.0 {
+        if !is_descent_direction(&direction, &grad) {
             // L-BFGS direction is not a descent direction; fall back.
             direction = projected_grad.clone();
         }
 
         // ---- Line search ----
-        let old_free = current_free.clone();
+        //
+        // L-BFGS-B memory update protocol:
+        //   1. `prev_free` is saved BEFORE the line search so that
+        //      s_k = x_{k+1} - x_k uses the pre-step position.
+        //   2. `prev_grad` is saved from the CURRENT gradient (before the
+        //      line search moves parameters) so that y_k = g_{k+1} - g_k
+        //      uses the gradient at the pre-step point.
+        //   3. At the top of the NEXT iteration, the memory update computes
+        //      s_k and y_k using the new (post-step) position and gradient
+        //      minus these saved values.
         let search_norm: f64 = direction.iter().map(|d| d * d).sum::<f64>().sqrt();
         let initial_alpha = config.step_size / search_norm.max(1.0);
 
-        // Save state for memory update.
-        prev_free = old_free.clone();
+        prev_free = current_free.clone();
+        let old_free = current_free;
         prev_grad = Some(grad.clone());
 
         match backtracking_line_search(
@@ -1324,9 +1379,10 @@ pub fn poisson_fit_lbfgsb(
         }
 
         // ---- Parameter displacement convergence check ----
+        params.free_values_into(&mut free_vals_buf);
         let step_norm: f64 = old_free
             .iter()
-            .zip(params.free_values().iter())
+            .zip(free_vals_buf.iter())
             .map(|(o, n)| (o - n).powi(2))
             .sum::<f64>()
             .sqrt();
@@ -1344,6 +1400,10 @@ pub fn poisson_fit_lbfgsb(
     }
 }
 
+// TODO(validation): add test comparing L-BFGS-B vs analytic on a SAMMY-derived
+// spectrum (e.g., U-238 single resonance at 6.674 eV with realistic noise).
+// This would verify that both optimizers recover the same density/temperature
+// to the same tolerance, catching any divergence in the shared gradient path.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2468,5 +2528,27 @@ mod tests {
             true_b,
             (result.params[0] - true_b).abs() / true_b * 100.0,
         );
+    }
+
+    #[test]
+    fn test_is_descent_direction_opposite_vectors() {
+        // Direction opposes gradient => positive dot product => descent.
+        assert!(is_descent_direction(&[1.0, 0.0], &[1.0, 0.0]));
+        assert!(is_descent_direction(&[0.5, 0.3], &[2.0, 1.0]));
+    }
+
+    #[test]
+    fn test_is_descent_direction_orthogonal_not_descent() {
+        // Orthogonal direction => dot product is zero => NOT descent.
+        // The step would not reduce the objective along the gradient.
+        assert!(!is_descent_direction(&[0.0, 1.0], &[1.0, 0.0]));
+        assert!(!is_descent_direction(&[1.0, 0.0], &[0.0, 1.0]));
+    }
+
+    #[test]
+    fn test_is_descent_direction_ascending_not_descent() {
+        // Direction has negative dot product with gradient => ascending.
+        assert!(!is_descent_direction(&[-1.0, 0.0], &[1.0, 0.0]));
+        assert!(!is_descent_direction(&[-0.5, -0.3], &[2.0, 1.0]));
     }
 }
