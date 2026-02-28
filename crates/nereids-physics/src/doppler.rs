@@ -326,6 +326,12 @@ pub fn doppler_broaden(
 }
 
 /// Linear interpolation of cross-section at an arbitrary energy.
+///
+/// Unlike `resolution::interp_spectrum` (which returns `None` for off-grid
+/// queries), this function extrapolates using the 1/v law.  A future
+/// consolidation could unify both behind a shared trait or closure-based
+/// extrapolation strategy; for now they remain separate to avoid coupling
+/// the two broadening modules.
 fn interpolate_cross_section(energies: &[f64], cross_sections: &[f64], energy: f64) -> f64 {
     if energies.is_empty() {
         return 0.0;
