@@ -27,6 +27,8 @@ numpy = ">=2.4.2,<3"
 matplotlib = ">=3.10.8,<4"
 jupyter = ">=1.0"
 jupyterlab = ">=4.5.4,<5"
+pytest = ">=9.0.2,<10"
+tifffile = ">=2026.2.24,<2027"
 
 [tool.pixi.tasks]
 build = { cmd = "env -u VIRTUAL_ENV maturin develop --release --manifest-path bindings/python/Cargo.toml" }

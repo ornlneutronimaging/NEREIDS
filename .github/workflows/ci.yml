@@ -61,8 +61,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install maturin
-        run: pip install maturin
+      - name: Install dependencies
+        run: pip install maturin pytest numpy tifffile
 
-      - name: Build Python bindings
-        run: maturin build --manifest-path bindings/python/Cargo.toml
+      - name: Build and install Python bindings
+        run: maturin develop --manifest-path bindings/python/Cargo.toml --release
+
+      - name: Run Python tests
+        run: pytest tests/ -v
