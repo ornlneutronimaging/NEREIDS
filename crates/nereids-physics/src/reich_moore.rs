@@ -90,30 +90,25 @@ struct PrecomputedResonance3ch {
     beta_fb: f64,
 }
 
-/// Pre-computed J-group for the single-channel Reich-Moore path.
+/// Pre-computed J-group, generic over the per-resonance invariant type.
 ///
 /// Groups resonances by total angular momentum J, with per-resonance
 /// invariants already computed. The J-grouping depends only on the
 /// resonance data, not on the incident energy, so it is computed once
 /// and reused for every energy point.
-struct PrecomputedJGroupSingle {
+///
+/// Used by both Reich-Moore (single/2ch/3ch) and SLBW precompute paths.
+pub(crate) struct PrecomputedJGroup<R> {
     /// Statistical weight g_J = (2J+1) / ((2I+1)(2s+1)).
-    g_j: f64,
+    pub(crate) g_j: f64,
     /// Pre-computed per-resonance quantities for this J-group.
-    resonances: Vec<PrecomputedResonanceSingle>,
+    pub(crate) resonances: Vec<R>,
 }
 
-/// Pre-computed J-group for the 2-channel fission path.
-struct PrecomputedJGroup2ch {
-    g_j: f64,
-    resonances: Vec<PrecomputedResonance2ch>,
-}
-
-/// Pre-computed J-group for the 3-channel fission path.
-struct PrecomputedJGroup3ch {
-    g_j: f64,
-    resonances: Vec<PrecomputedResonance3ch>,
-}
+/// Type aliases for each channel count (preserves readability at call sites).
+type PrecomputedJGroupSingle = PrecomputedJGroup<PrecomputedResonanceSingle>;
+type PrecomputedJGroup2ch = PrecomputedJGroup<PrecomputedResonance2ch>;
+type PrecomputedJGroup3ch = PrecomputedJGroup<PrecomputedResonance3ch>;
 
 /// Compute penetrability at the resonance energy P_l(ρ_r).
 ///
@@ -146,6 +141,47 @@ fn penetrability_at_resonance(
     }
 }
 
+/// Group resonances by total angular momentum J, building per-resonance
+/// precomputed invariants via a caller-supplied closure.
+///
+/// This is the shared core of all `precompute_jgroups_*` functions (RM single,
+/// 2ch, 3ch) and SLBW's `precompute_slbw_jgroups`.  The closure `build_resonance`
+/// receives each ENDF resonance and returns the per-resonance struct `R` that
+/// differs between formalisms and channel counts.
+///
+/// The grouping logic is identical across all callers:
+/// 1. Extract J from each resonance.
+/// 2. Find or create a J-group (matching within `QUANTUM_NUMBER_EPS`).
+/// 3. Compute `g_J = (2J+1) / ((2I+1)(2s+1))` for new groups.
+/// 4. Push the precomputed resonance into the matching group.
+pub(crate) fn group_resonances_by_j<R>(
+    resonances: &[nereids_endf::resonance::Resonance],
+    target_spin: f64,
+    mut build_resonance: impl FnMut(&nereids_endf::resonance::Resonance) -> R,
+) -> Vec<PrecomputedJGroup<R>> {
+    let mut j_values: Vec<f64> = Vec::new();
+    let mut groups: Vec<PrecomputedJGroup<R>> = Vec::new();
+
+    for res in resonances {
+        let j = res.j;
+        let precomp = build_resonance(res);
+
+        if let Some(idx) = j_values
+            .iter()
+            .position(|&gj| (gj - j).abs() < QUANTUM_NUMBER_EPS)
+        {
+            groups[idx].resonances.push(precomp);
+        } else {
+            j_values.push(j);
+            groups.push(PrecomputedJGroup {
+                g_j: channel::statistical_weight(j, target_spin),
+                resonances: vec![precomp],
+            });
+        }
+    }
+    groups
+}
+
 /// Build pre-computed J-groups for the single-channel (non-fissile) path.
 ///
 /// Groups resonances by J, pre-computes γ²_n per resonance.
@@ -159,41 +195,19 @@ fn precompute_jgroups_single(
     ap_table: Option<&Tab1>,
     target_spin: f64,
 ) -> Vec<PrecomputedJGroupSingle> {
-    // Group by J (same logic as `group_by_j` but builds PrecomputedResonanceSingle directly).
-    let mut j_values: Vec<f64> = Vec::new();
-    let mut groups: Vec<PrecomputedJGroupSingle> = Vec::new();
-
-    for res in resonances {
-        let j = res.j;
-
-        // Precompute per-resonance invariants.
+    group_resonances_by_j(resonances, target_spin, |res| {
         let p_at_er = penetrability_at_resonance(res.energy, l, awr, channel_radius, ap_table);
         let gamma_n_reduced_sq = if p_at_er > PIVOT_FLOOR {
             res.gn.abs() / (2.0 * p_at_er)
         } else {
             0.0
         };
-        let precomp = PrecomputedResonanceSingle {
+        PrecomputedResonanceSingle {
             energy: res.energy,
             gamma_g: res.gg,
             gamma_n_reduced_sq,
-        };
-
-        // Find or create J-group.
-        if let Some(idx) = j_values
-            .iter()
-            .position(|&gj| (gj - j).abs() < QUANTUM_NUMBER_EPS)
-        {
-            groups[idx].resonances.push(precomp);
-        } else {
-            j_values.push(j);
-            groups.push(PrecomputedJGroupSingle {
-                g_j: channel::statistical_weight(j, target_spin),
-                resonances: vec![precomp],
-            });
         }
-    }
-    groups
+    })
 }
 
 /// Build pre-computed J-groups for the 2-channel fission path.
@@ -208,12 +222,7 @@ fn precompute_jgroups_2ch(
     ap_table: Option<&Tab1>,
     target_spin: f64,
 ) -> Vec<PrecomputedJGroup2ch> {
-    let mut j_values: Vec<f64> = Vec::new();
-    let mut groups: Vec<PrecomputedJGroup2ch> = Vec::new();
-
-    for res in resonances {
-        let j = res.j;
-
+    group_resonances_by_j(resonances, target_spin, |res| {
         let p_at_er = penetrability_at_resonance(res.energy, l, awr, channel_radius, ap_table);
 
         let beta_n = if p_at_er > PIVOT_FLOOR {
@@ -228,27 +237,13 @@ fn precompute_jgroups_2ch(
             sign * (res.gfa.abs() / 2.0).sqrt()
         };
 
-        let precomp = PrecomputedResonance2ch {
+        PrecomputedResonance2ch {
             energy: res.energy,
             gamma_g: res.gg,
             beta_n,
             beta_f,
-        };
-
-        if let Some(idx) = j_values
-            .iter()
-            .position(|&gj| (gj - j).abs() < QUANTUM_NUMBER_EPS)
-        {
-            groups[idx].resonances.push(precomp);
-        } else {
-            j_values.push(j);
-            groups.push(PrecomputedJGroup2ch {
-                g_j: channel::statistical_weight(j, target_spin),
-                resonances: vec![precomp],
-            });
         }
-    }
-    groups
+    })
 }
 
 /// Build pre-computed J-groups for the 3-channel fission path.
@@ -263,12 +258,7 @@ fn precompute_jgroups_3ch(
     ap_table: Option<&Tab1>,
     target_spin: f64,
 ) -> Vec<PrecomputedJGroup3ch> {
-    let mut j_values: Vec<f64> = Vec::new();
-    let mut groups: Vec<PrecomputedJGroup3ch> = Vec::new();
-
-    for res in resonances {
-        let j = res.j;
-
+    group_resonances_by_j(resonances, target_spin, |res| {
         let p_at_er = penetrability_at_resonance(res.energy, l, awr, channel_radius, ap_table);
 
         let beta_n = if p_at_er > PIVOT_FLOOR {
@@ -288,28 +278,14 @@ fn precompute_jgroups_3ch(
             sign * (res.gfb.abs() / 2.0).sqrt()
         };
 
-        let precomp = PrecomputedResonance3ch {
+        PrecomputedResonance3ch {
             energy: res.energy,
             gamma_g: res.gg,
             beta_n,
             beta_fa,
             beta_fb,
-        };
-
-        if let Some(idx) = j_values
-            .iter()
-            .position(|&gj| (gj - j).abs() < QUANTUM_NUMBER_EPS)
-        {
-            groups[idx].resonances.push(precomp);
-        } else {
-            j_values.push(j);
-            groups.push(PrecomputedJGroup3ch {
-                g_j: channel::statistical_weight(j, target_spin),
-                resonances: vec![precomp],
-            });
         }
-    }
-    groups
+    })
 }
 
 /// Cross-section results at a single energy point.
