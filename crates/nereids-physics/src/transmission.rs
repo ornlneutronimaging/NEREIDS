@@ -131,7 +131,12 @@ pub fn forward_model(
         // 2. Apply Doppler broadening
         let after_doppler = if sample.temperature_k > 0.0 {
             let doppler_params = DopplerParams::new(sample.temperature_k, res_data.awr)
-                .expect("DopplerParams validation failed in forward_model");
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "DopplerParams validation failed in forward_model: {} (temperature_k={}, awr={})",
+                        e, sample.temperature_k, res_data.awr
+                    )
+                });
             doppler::doppler_broaden(energies, &unbroadened, &doppler_params)
         } else {
             unbroadened
@@ -198,7 +203,12 @@ pub fn broadened_cross_sections(
         // 2. Doppler broadening
         let after_doppler = if temperature_k > 0.0 {
             let params = DopplerParams::new(temperature_k, rd.awr)
-                .expect("DopplerParams validation failed in broadened_cross_sections");
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "DopplerParams validation failed in broadened_cross_sections: {} (temperature_k={}, awr={})",
+                        e, temperature_k, rd.awr
+                    )
+                });
             doppler::doppler_broaden(energies, &unbroadened, &params)
         } else {
             unbroadened

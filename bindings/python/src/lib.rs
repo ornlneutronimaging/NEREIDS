@@ -1219,16 +1219,6 @@ fn doppler_broaden<'py>(
         )));
     }
     validate_energy_grid(e)?;
-    if !awr.is_finite() || awr <= 0.0 {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "awr must be finite and positive",
-        ));
-    }
-    if !temperature_k.is_finite() || temperature_k < 0.0 {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "temperature_k must be finite and non-negative",
-        ));
-    }
 
     if temperature_k == 0.0 {
         return Ok(PyArray1::from_vec(py, xs.to_vec()));
