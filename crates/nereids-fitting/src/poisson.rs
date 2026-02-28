@@ -1197,7 +1197,15 @@ pub fn poisson_fit_lbfgsb(
         Vec::new()
     };
 
-    let y_model = model.evaluate(&params.all_values());
+    // Scratch buffers reused across the entire optimization loop to avoid
+    // per-iteration allocations inside backtracking_line_search and the
+    // per-iteration model/gradient evaluations.
+    let mut all_vals_buf = Vec::with_capacity(params.params.len());
+    let mut free_vals_buf = Vec::with_capacity(params.n_free());
+    let mut trial_free_buf: Vec<f64> = Vec::with_capacity(params.n_free());
+
+    params.all_values_into(&mut all_vals_buf);
+    let y_model = model.evaluate(&all_vals_buf);
     let mut nll = poisson_nll(y_obs, &y_model);
 
     // Guard: if the initial NLL is non-finite, bail out immediately rather
@@ -1218,14 +1226,9 @@ pub fn poisson_fit_lbfgsb(
     let mut lbfgs = LbfgsbMemory::new(config.lbfgsb_memory, n_free);
 
     // Previous free parameters and gradient — needed for memory updates.
-    let mut prev_free: Vec<f64> = params.free_values();
+    params.free_values_into(&mut free_vals_buf);
+    let mut prev_free: Vec<f64> = free_vals_buf.clone();
     let mut prev_grad: Option<Vec<f64>> = None;
-
-    // Scratch buffers reused across the entire optimization loop to avoid
-    // per-iteration allocations inside backtracking_line_search.
-    let mut all_vals_buf = Vec::with_capacity(params.params.len());
-    let mut free_vals_buf = Vec::with_capacity(params.n_free());
-    let mut trial_free_buf: Vec<f64> = Vec::with_capacity(params.n_free());
 
     for _ in 0..config.max_iter {
         iter += 1;
@@ -1272,13 +1275,13 @@ pub fn poisson_fit_lbfgsb(
             dxs_dt: &dxs_dt,
         });
 
-        // Snapshot current free-parameter values once (used by both
-        // the L-BFGS memory update and the projected direction).
-        let current_free = params.free_values();
+        // Snapshot current free-parameter values into the reusable buffer
+        // (used by both the L-BFGS memory update and the line search).
+        params.free_values_into(&mut free_vals_buf);
 
         // ---- Update L-BFGS memory with previous step's pair ----
         if let Some(ref pg) = prev_grad {
-            let s_vec: Vec<f64> = current_free
+            let s_vec: Vec<f64> = free_vals_buf
                 .iter()
                 .zip(prev_free.iter())
                 .map(|(&c, &p)| c - p)
@@ -1355,15 +1358,19 @@ pub fn poisson_fit_lbfgsb(
         let search_norm: f64 = direction.iter().map(|d| d * d).sum::<f64>().sqrt();
         let initial_alpha = config.step_size / search_norm.max(1.0);
 
-        prev_free = current_free.clone();
-        let old_free = current_free;
+        // Save state for memory update — reuse prev_free buffer to avoid
+        // per-iteration allocation.
+        prev_free.clear();
+        prev_free.extend_from_slice(&free_vals_buf);
         prev_grad = Some(grad.clone());
 
+        // prev_free is not mutated by backtracking_line_search (it takes
+        // &[f64]), so pass it directly without cloning.
         match backtracking_line_search(
             model,
             params,
             y_obs,
-            &old_free,
+            &prev_free,
             &direction,
             initial_alpha,
             config,
@@ -1382,7 +1389,7 @@ pub fn poisson_fit_lbfgsb(
 
         // ---- Parameter displacement convergence check ----
         params.free_values_into(&mut free_vals_buf);
-        let step_norm: f64 = old_free
+        let step_norm: f64 = prev_free
             .iter()
             .zip(free_vals_buf.iter())
             .map(|(o, n)| (o - n).powi(2))

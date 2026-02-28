@@ -410,10 +410,13 @@ pub fn levenberg_marquardt(
         })
         .collect();
 
-    // Scratch buffer reused across the optimization loop for
+    // Scratch buffers reused across the optimization loop for
     // params.all_values_into() calls in compute_jacobian (1 + N_free calls
-    // per Jacobian computation) and the trial-step evaluation.
+    // per Jacobian computation) and the trial-step evaluation, and
+    // params.free_values_into() calls for snapshotting free parameters
+    // before trial steps.
     let mut all_vals_buf = Vec::with_capacity(params.params.len());
+    let mut free_vals_buf = Vec::with_capacity(n_free);
 
     // Initial model output, residuals, and chi².
     // y_current is kept up-to-date after accepted steps so that the next
@@ -459,9 +462,10 @@ pub fn levenberg_marquardt(
             None => break, // Singular system
         };
 
-        // Trial step
-        let old_free = params.free_values();
-        let trial_free: Vec<f64> = old_free
+        // Trial step — snapshot free values into a reusable buffer to avoid
+        // per-iteration allocation.
+        params.free_values_into(&mut free_vals_buf);
+        let trial_free: Vec<f64> = free_vals_buf
             .iter()
             .zip(delta.iter())
             .map(|(&v, &d)| v + d)
@@ -474,7 +478,7 @@ pub fn levenberg_marquardt(
         // #113: If the model produced NaN/Inf, treat as a bad step (same as
         // chi2 increase) — increase lambda and try again.
         if y_trial.iter().any(|v| !v.is_finite()) {
-            params.set_free_values(&old_free);
+            params.set_free_values(&free_vals_buf);
             lambda *= config.lambda_up;
             if lambda > LAMBDA_BREAKOUT {
                 converged = false;
@@ -505,7 +509,7 @@ pub fn levenberg_marquardt(
             // premature convergence on data with small residuals.  (#108.2)
             let param_change: f64 = delta
                 .iter()
-                .zip(old_free.iter())
+                .zip(free_vals_buf.iter())
                 .map(|(&d, &v)| (d / (v.abs() + PIVOT_FLOOR)).powi(2))
                 .sum::<f64>()
                 .sqrt();
@@ -516,8 +520,8 @@ pub fn levenberg_marquardt(
             }
         } else {
             // Reject step, restore parameters.
-            // y_current stays valid (parameters reverted to old_free).
-            params.set_free_values(&old_free);
+            // y_current stays valid (parameters reverted to free_vals_buf snapshot).
+            params.set_free_values(&free_vals_buf);
             lambda *= config.lambda_up;
 
             // #108.4: If lambda is astronomically large, the optimizer is stuck
