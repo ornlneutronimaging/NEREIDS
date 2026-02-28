@@ -44,10 +44,8 @@ Codex may fail due to:
 - Xcode license (macOS) — inform user to run `sudo xcodebuild -license accept`
 - Timeout — note and skip
 
-If Codex is entirely unavailable, offer to fall back to Gemini CLI:
-```bash
-cd {worktree_path} && git diff main...HEAD | gemini -p "Review this diff for a Rust neutron physics library. Focus on panics, validation gaps, edge cases, numerical stability. Report findings as P1 (must fix) / P2 (should fix) with file:line references."
-```
+If Codex is entirely unavailable, note the failure and continue. Codex is
+supplementary, not blocking — the Claude self-audit is the primary review.
 
 ## Output
 

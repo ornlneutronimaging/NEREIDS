@@ -85,11 +85,6 @@ prompt. If this syntax fails, try `codex review` without flags.
 If Codex fails (network, license, syntax change, or timeout), note the
 failure and continue. Codex is supplementary, not blocking.
 
-**Fallback**: If Codex is unavailable, use Gemini CLI instead:
-```bash
-cd {worktree_path} && git diff main...HEAD | gemini -p "Review this diff for a Rust neutron physics library. Focus on panics, validation gaps, edge cases, numerical stability. Report as P1/P2 with file:line references."
-```
-
 ## Step 4: Consolidate Findings
 
 After all reviews complete:
