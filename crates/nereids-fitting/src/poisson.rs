@@ -170,21 +170,25 @@ fn poisson_nll_grad_term(obs: f64, mdl: f64) -> f64 {
 /// `all_vals_buf` is a reusable scratch buffer for `params.all_values_into()`,
 /// avoiding a fresh allocation on every `model.evaluate()` call inside the
 /// per-parameter FD loop (N_free+1 allocations saved per gradient call).
+///
+/// `free_idx_buf` is a scratch buffer for `params.free_indices_into()`, reused
+/// across iterations to avoid per-gradient allocation.
 fn compute_gradient(
     model: &dyn FitModel,
     params: &mut ParameterSet,
     y_obs: &[f64],
     fd_step: f64,
     all_vals_buf: &mut Vec<f64>,
+    free_idx_buf: &mut Vec<usize>,
 ) -> Vec<f64> {
     params.all_values_into(all_vals_buf);
     let base_model = model.evaluate(all_vals_buf);
     let base_nll = poisson_nll(y_obs, &base_model);
 
-    let free_indices = params.free_indices();
-    let mut grad = vec![0.0; free_indices.len()];
+    params.free_indices_into(free_idx_buf);
+    let mut grad = vec![0.0; free_idx_buf.len()];
 
-    for (j, &idx) in free_indices.iter().enumerate() {
+    for (j, &idx) in free_idx_buf.iter().enumerate() {
         let original = params.params[idx].value;
         let step = fd_step * (1.0 + original.abs());
 
@@ -552,6 +556,7 @@ pub fn poisson_fit(
     let mut free_vals_buf = Vec::with_capacity(params.n_free());
     let mut old_free_buf: Vec<f64> = Vec::with_capacity(params.n_free());
     let mut trial_free_buf: Vec<f64> = Vec::with_capacity(params.n_free());
+    let mut free_idx_buf: Vec<usize> = Vec::with_capacity(params.n_free());
 
     params.all_values_into(&mut all_vals_buf);
     let y_model = model.evaluate(&all_vals_buf);
@@ -575,7 +580,14 @@ pub fn poisson_fit(
         iter += 1;
 
         // Compute gradient
-        let grad = compute_gradient(model, params, y_obs, config.fd_step, &mut all_vals_buf);
+        let grad = compute_gradient(
+            model,
+            params,
+            y_obs,
+            config.fd_step,
+            &mut all_vals_buf,
+            &mut free_idx_buf,
+        );
 
         // Check gradient norm for convergence
         let grad_norm: f64 = grad.iter().map(|g| g * g).sum::<f64>().sqrt();

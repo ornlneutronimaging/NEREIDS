@@ -4,20 +4,20 @@
 //! Supports non-negativity constraints and sum-to-one constraints for
 //! isotopes of the same element.
 
+use std::borrow::Cow;
+
 /// A single fit parameter with value, bounds, and fixed/free flag.
 ///
-/// The `name` field uses `String` rather than `Arc<str>` or `Cow<'static, str>`.
-/// For typical isotope names (e.g. "U-238", "isotope_0") the per-pixel clone
-/// cost is negligible compared to the Poisson/LM optimization work (~100s of
-/// model evaluations per pixel).  Switching to `Arc<str>` would save ~4-16
-/// small heap allocations per pixel but adds API complexity and lifetime
-/// constraints that are not justified at current workload sizes (1-4 isotopes
-/// × 16K pixels ≈ 64K short-string copies vs millions of FP ops).
+/// The `name` field uses `Cow<'static, str>` so that static strings
+/// (e.g. `"U-238"`, `"temperature_k"`) avoid heap allocation entirely,
+/// while dynamic strings from `format!()` still work via the `Owned` variant.
+/// When a `ParameterSet` template is cloned per-pixel, `Cow::Borrowed` names
+/// are copied as a pointer+length (16 bytes, no heap) instead of allocating
+/// a new `String` on the heap.
 #[derive(Debug, Clone)]
 pub struct FitParameter {
     /// Parameter name (for reporting).
-    // TODO(perf): consider Arc<str> if profiling shows parameter cloning is a bottleneck
-    pub name: String,
+    pub name: Cow<'static, str>,
     /// Current value.
     pub value: f64,
     /// Lower bound (f64::NEG_INFINITY if unbounded).
@@ -30,7 +30,7 @@ pub struct FitParameter {
 
 impl FitParameter {
     /// Create a new free parameter with non-negativity constraint.
-    pub fn non_negative(name: impl Into<String>, value: f64) -> Self {
+    pub fn non_negative(name: impl Into<Cow<'static, str>>, value: f64) -> Self {
         Self {
             name: name.into(),
             value,
@@ -41,7 +41,7 @@ impl FitParameter {
     }
 
     /// Create a new free parameter with no bounds.
-    pub fn unbounded(name: impl Into<String>, value: f64) -> Self {
+    pub fn unbounded(name: impl Into<Cow<'static, str>>, value: f64) -> Self {
         Self {
             name: name.into(),
             value,
@@ -52,7 +52,7 @@ impl FitParameter {
     }
 
     /// Create a fixed parameter.
-    pub fn fixed(name: impl Into<String>, value: f64) -> Self {
+    pub fn fixed(name: impl Into<Cow<'static, str>>, value: f64) -> Self {
         Self {
             name: name.into(),
             value,
@@ -150,6 +150,22 @@ impl ParameterSet {
             .filter(|(_, p)| !p.fixed)
             .map(|(i, _)| i)
             .collect()
+    }
+
+    /// Write free parameter indices into the provided buffer, resizing if needed.
+    ///
+    /// This is the buffer-reuse counterpart of [`free_indices`](Self::free_indices).
+    /// Callers that compute the Jacobian many times in a loop can allocate one
+    /// `Vec<usize>` and reuse it across iterations to avoid per-call allocation.
+    pub fn free_indices_into(&self, buf: &mut Vec<usize>) {
+        buf.clear();
+        buf.extend(
+            self.params
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| !p.fixed)
+                .map(|(i, _)| i),
+        );
     }
 }
 
