@@ -27,7 +27,44 @@
 //! The SAMMY Doppler width at energy E is:
 //!   Δ_D(E) = √(4·k_B·T·E / AWR)
 
+use std::fmt;
+
 use nereids_core::constants::{self, DIVISION_FLOOR, NEAR_ZERO_FLOOR};
+
+/// Number of standard deviations beyond the velocity range for the FGM
+/// integration window.  The Gaussian kernel exp(-arg²) contributes less
+/// than exp(-36) ≈ 2.3e-16 outside this window, which is below f64
+/// machine epsilon.
+const DOPPLER_N_SIGMA: f64 = 6.0;
+
+/// Floor for distinguishing negative-velocity grid points from zero.
+///
+/// When building the extended velocity grid for the FGM integral, we
+/// generate points from `v_neg_limit` up to (but not including) zero.
+/// This threshold prevents the last negative-velocity point from being
+/// so close to zero that it is numerically indistinguishable, which would
+/// create a near-duplicate of the explicit v = 0 anchor point.
+const NEGATIVE_VELOCITY_FLOOR: f64 = 1e-15;
+
+/// Errors from `DopplerParams` construction.
+#[derive(Debug)]
+pub enum DopplerParamsError {
+    /// AWR must be strictly positive.
+    InvalidAwr(f64),
+    /// Temperature must be finite (may be zero for "no broadening").
+    NonFiniteTemperature(f64),
+}
+
+impl fmt::Display for DopplerParamsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidAwr(v) => write!(f, "AWR must be positive, got {v}"),
+            Self::NonFiniteTemperature(v) => write!(f, "temperature must be finite, got {v}"),
+        }
+    }
+}
+
+impl std::error::Error for DopplerParamsError {}
 
 /// Doppler broadening parameters.
 #[derive(Debug, Clone, Copy)]
@@ -39,9 +76,26 @@ pub struct DopplerParams {
 }
 
 impl DopplerParams {
+    /// Create validated Doppler parameters.
+    ///
+    /// # Errors
+    /// Returns `DopplerParamsError::InvalidAwr` if `awr <= 0.0` or is NaN.
+    /// Returns `DopplerParamsError::NonFiniteTemperature` if `temperature_k`
+    /// is NaN or infinity (zero is allowed — it means "no broadening").
+    pub fn new(temperature_k: f64, awr: f64) -> Result<Self, DopplerParamsError> {
+        if !awr.is_finite() || awr <= 0.0 {
+            return Err(DopplerParamsError::InvalidAwr(awr));
+        }
+        if !temperature_k.is_finite() {
+            return Err(DopplerParamsError::NonFiniteTemperature(temperature_k));
+        }
+        Ok(Self { temperature_k, awr })
+    }
+
     /// Velocity-space Doppler width u = √(k_B·T / AWR).
     ///
     /// This is the standard deviation of the Gaussian kernel in √eV units.
+    #[must_use]
     pub fn u(&self) -> f64 {
         (constants::BOLTZMANN_EV_PER_K * self.temperature_k / self.awr).sqrt()
     }
@@ -49,6 +103,7 @@ impl DopplerParams {
     /// Energy-dependent Doppler width Δ_D(E) = √(4·k_B·T·E / AWR).
     ///
     /// This is the width that SAMMY reports in the .lpt file.
+    #[must_use]
     pub fn doppler_width(&self, energy_ev: f64) -> f64 {
         (4.0 * constants::BOLTZMANN_EV_PER_K * self.temperature_k * energy_ev / self.awr).sqrt()
     }
@@ -105,9 +160,8 @@ pub fn doppler_broaden(
 
     // Determine how many negative velocity points we need.
     // We need points down to v_min - N_sigma * u, which may go negative.
-    let n_sigma = 6.0; // Integration extends 6σ beyond the range
     let v_min = velocities[0];
-    let v_neg_limit = v_min - n_sigma * u;
+    let v_neg_limit = v_min - DOPPLER_N_SIGMA * u;
 
     // Build extended velocity grid: negative points (if needed) + positive points.
     let mut ext_v: Vec<f64> = Vec::new();
@@ -125,7 +179,7 @@ pub fn doppler_broaden(
 
         // Add negative velocity points from v_neg_limit to -dv
         let mut v = v_neg_limit;
-        while v < -1e-15 {
+        while v < -NEGATIVE_VELOCITY_FLOOR {
             ext_v.push(v);
             // Y(w) = |w| * σ(|w|²) for negative w
             // σ at E = w² — interpolate from the positive grid
@@ -148,7 +202,7 @@ pub fn doppler_broaden(
 
     // Add points beyond the highest velocity if needed
     let v_max = velocities[n - 1];
-    let v_max_limit = v_max + n_sigma * u;
+    let v_max_limit = v_max + DOPPLER_N_SIGMA * u;
     if v_max < v_max_limit {
         let dv = if n > 1 {
             (velocities[n - 1] - velocities[n - 2]).max(u * 0.1)
@@ -222,8 +276,8 @@ pub fn doppler_broaden(
         // to the Gaussian window [v − n_sigma·u, v + n_sigma·u].  The
         // velocity-space Doppler width u is energy-independent, so the window
         // width W is constant across all output energies.
-        let v_lo = v - n_sigma * u;
-        let v_hi = v + n_sigma * u;
+        let v_lo = v - DOPPLER_N_SIGMA * u;
+        let v_hi = v + DOPPLER_N_SIGMA * u;
         let j_lo = ext_v.partition_point(|&w| w < v_lo);
         let j_hi = ext_v.partition_point(|&w| w <= v_hi);
 
