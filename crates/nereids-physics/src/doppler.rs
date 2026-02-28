@@ -27,7 +27,7 @@
 //! The SAMMY Doppler width at energy E is:
 //!   Δ_D(E) = √(4·k_B·T·E / AWR)
 
-use nereids_core::constants;
+use nereids_core::constants::{self, CROSS_SECTION_FLOOR, DIVISION_FLOOR};
 
 /// Doppler broadening parameters.
 #[derive(Debug, Clone, Copy)]
@@ -85,7 +85,7 @@ pub fn doppler_broaden(
     }
 
     let u = params.u();
-    if u < 1e-30 {
+    if u < CROSS_SECTION_FLOOR {
         return cross_sections.to_vec();
     }
 
@@ -188,7 +188,7 @@ pub fn doppler_broaden(
     let ext_sigma: Vec<f64> = (0..n_ext)
         .map(|j| {
             let w = ext_v[j];
-            if w.abs() < 1e-30 {
+            if w.abs() < CROSS_SECTION_FLOOR {
                 // At v=0, cross-section is the extrapolated value
                 if !energies.is_empty() {
                     interpolate_cross_section(energies, cross_sections, 0.0)
@@ -206,7 +206,7 @@ pub fn doppler_broaden(
     for i in 0..n {
         let v = velocities[i];
         let e = energies[i];
-        if v < 1e-30 || e < 1e-30 {
+        if v < CROSS_SECTION_FLOOR || e < CROSS_SECTION_FLOOR {
             broadened[i] = cross_sections[i];
             continue;
         }
@@ -242,7 +242,7 @@ pub fn doppler_broaden(
             sum_weights += weights[j];
         }
 
-        if sum_weights < 1e-50 {
+        if sum_weights < DIVISION_FLOOR {
             broadened[i] = cross_sections[i];
             continue;
         }
@@ -290,7 +290,7 @@ fn interpolate_cross_section(energies: &[f64], cross_sections: &[f64], energy: f
         if energy <= 0.0 {
             return cross_sections[0];
         }
-        if energies[0] > 1e-30 {
+        if energies[0] > CROSS_SECTION_FLOOR {
             return cross_sections[0] * (energies[0] / energy).sqrt();
         }
         return cross_sections[0];
@@ -299,7 +299,7 @@ fn interpolate_cross_section(energies: &[f64], cross_sections: &[f64], energy: f
     if energy >= energies[energies.len() - 1] {
         // Extrapolate using 1/v law
         let last = energies.len() - 1;
-        if energy > 1e-30 {
+        if energy > CROSS_SECTION_FLOOR {
             return cross_sections[last] * (energies[last] / energy).sqrt();
         }
         return cross_sections[last];
@@ -325,16 +325,16 @@ fn interpolate_cross_section(energies: &[f64], cross_sections: &[f64], energy: f
     // Guard against duplicate energy grid points: if e0 == e1 (or nearly so),
     // no interpolation is needed — use the value at that point directly.
     // Use a combined relative+absolute threshold that works across the full
-    // energy range (meV to MeV): |de| < |e0|·ε_mach + 1e-30.
+    // energy range (meV to MeV): |de| < |e0|·ε_mach + CROSS_SECTION_FLOOR.
     // The relative part handles large energies where f64::EPSILON alone would
     // miss near-duplicates; the absolute part handles energies near zero.
-    // This is consistent with resolution.rs interp_spectrum (which uses 1e-30).
+    // This is consistent with resolution.rs interp_spectrum.
     let e0 = energies[idx];
     let e1 = energies[idx + 1];
     let s0 = cross_sections[idx];
     let s1 = cross_sections[idx + 1];
     let de = e1 - e0;
-    if de.abs() < e0.abs() * f64::EPSILON + 1e-30 {
+    if de.abs() < e0.abs() * f64::EPSILON + CROSS_SECTION_FLOOR {
         return s0;
     }
     let t = (energy - e0) / de;
@@ -682,14 +682,17 @@ mod tests {
             "Near-duplicate query should return finite result, got {result2}"
         );
 
-        // Exercise the `de.abs() < |e0|*EPS + 1e-30` threshold with
-        // near-zero adjacent energies where de is essentially zero
-        // (triggers the absolute 1e-30 floor, not the relative part).
-        let tiny_energies = vec![1e-35, 1e-35 + 1e-50, 1.0];
+        // Exercise the `de.abs() < |e0|*EPS + CROSS_SECTION_FLOOR` threshold
+        // with near-zero adjacent energies where de is essentially zero.
+        // With e0 = 1e-50, the relative term |e0|*EPS ≈ 2e-66 is smaller
+        // than CROSS_SECTION_FLOOR (1e-60), so the absolute floor dominates.
+        let tiny_energies = vec![1e-50, 1e-50 + 1e-105, 1.0];
         let tiny_xs = vec![100.0, 200.0, 300.0];
-        // Query between the two near-zero points: de ≈ 1e-50 which is
-        // far below the absolute threshold 1e-30, so the guard fires.
-        let result3 = interpolate_cross_section(&tiny_energies, &tiny_xs, 1e-35 + 5e-51);
+        // Query between the two near-zero points: de ≈ 1e-105 which is
+        // far below the absolute threshold CROSS_SECTION_FLOOR (1e-60),
+        // and the relative term (|1e-50| * EPS ≈ 2e-66) is even smaller,
+        // so the absolute floor is the binding constraint.
+        let result3 = interpolate_cross_section(&tiny_energies, &tiny_xs, 1e-50 + 5e-106);
         assert!(
             result3.is_finite(),
             "Near-zero de should be caught by the absolute threshold, got {result3}"

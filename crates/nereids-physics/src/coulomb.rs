@@ -13,7 +13,7 @@
 //! When η = 0, F_0 = sin ρ, G_0 = cos ρ, reproducing hard-sphere
 //! (Blatt-Weisskopf) penetrabilities from `penetrability.rs`.
 
-use nereids_core::constants;
+use nereids_core::constants::{self, CROSS_SECTION_FLOOR};
 
 /// Sommerfeld parameter η for a Coulomb channel.
 ///
@@ -356,7 +356,7 @@ pub fn coulomb_penetrability(l: u32, eta: f64, rho: f64) -> f64 {
         Some((fl, gl, _, _)) => rho / (fl * fl + gl * gl),
         None => {
             // Coulomb wave functions failed (ρ too small).
-            if eta.abs() < 1e-30 {
+            if eta.abs() < CROSS_SECTION_FLOOR {
                 // Neutral channel (η ≈ 0): fall back to the non-Coulomb
                 // (hard-sphere) penetrability, which is exact when η = 0.
                 crate::penetrability::penetrability(l, rho)

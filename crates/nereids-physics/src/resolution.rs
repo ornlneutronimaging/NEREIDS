@@ -28,7 +28,7 @@
 //! where R(E, E') = exp(-(E-E')²/W²) / (W·√π) is a Gaussian kernel
 //! with energy-dependent width W(E).
 
-use nereids_core::constants;
+use nereids_core::constants::{CROSS_SECTION_FLOOR, DIVISION_FLOOR};
 use std::fmt;
 
 /// TOF conversion factor: t[μs] = TOF_FACTOR × L[m] / √(E[eV]).
@@ -107,7 +107,7 @@ pub fn resolution_broaden(
         let e = energies[i];
         let w = params.gaussian_width(e);
 
-        if w < 1e-30 {
+        if w < CROSS_SECTION_FLOOR {
             broadened[i] = cross_sections[i];
             continue;
         }
@@ -149,7 +149,7 @@ pub fn resolution_broaden(
             norm += weight;
         }
 
-        if norm > 1e-50 {
+        if norm > DIVISION_FLOOR {
             broadened[i] = sum / norm;
         } else {
             broadened[i] = cross_sections[i];
@@ -395,7 +395,7 @@ impl TabulatedResolution {
                 norm += weight;
             }
 
-            result[i] = if norm > 1e-50 {
+            result[i] = if norm > DIVISION_FLOOR {
                 sum / norm
             } else {
                 spectrum[i]
@@ -489,7 +489,7 @@ fn interp_spectrum(energies: &[f64], spectrum: &[f64], e: f64) -> Option<f64> {
     // single-point grid where lo==hi), the denominator is zero.  Return the
     // value at the lower bracket to avoid NaN.
     let span = energies[hi] - energies[lo];
-    if span.abs() < 1e-30 {
+    if span.abs() < CROSS_SECTION_FLOOR {
         return Some(spectrum[lo]);
     }
     let frac = (e - energies[lo]) / span;
@@ -526,24 +526,10 @@ impl fmt::Display for ResolutionParseError {
 
 impl std::error::Error for ResolutionParseError {}
 
-/// Verify that the TOF conversion factor is consistent with the constants module.
-fn _verify_tof_factor() {
-    let e = 1.0; // 1 eV
-    let l = 1.0; // 1 meter
-    let tof_from_constants = constants::energy_to_tof(e, l);
-    let tof_from_factor = TOF_FACTOR / e.sqrt();
-    let rel_diff = (tof_from_constants - tof_from_factor).abs() / tof_from_constants;
-    debug_assert!(
-        rel_diff < 0.01,
-        "TOF factor mismatch: {} vs {}",
-        tof_from_constants,
-        tof_from_factor
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nereids_core::constants;
 
     #[test]
     fn test_tof_factor_consistency() {

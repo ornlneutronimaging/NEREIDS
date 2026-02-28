@@ -50,6 +50,37 @@ pub fn energy_to_tof(energy_ev: f64, flight_path_m: f64) -> f64 {
     (flight_path_m / v) * 1.0e6
 }
 
+// ── Numerical tolerances ─────────────────────────────────────────────
+// Named constants for magic-number epsilons scattered across physics code.
+
+/// Epsilon for floating-point comparison of quantum numbers (J, L, spin).
+pub const QUANTUM_NUMBER_EPS: f64 = 1e-10;
+
+/// Floor for Poisson model values to avoid log(0) in NLL computation.
+pub const POISSON_EPSILON: f64 = 1e-10;
+
+/// Floor for denominators in physics evaluations (penetrability, shift, etc.)
+/// to avoid division by zero.
+pub const DIVISION_FLOOR: f64 = 1e-50;
+
+/// Generic tiny positive floor used as a near-zero tolerance across physics
+/// calculations (e.g., cross-sections in barns, energies in eV, widths,
+/// dimensionless parameters). Values below this are treated as negligible.
+pub const CROSS_SECTION_FLOOR: f64 = 1e-60;
+
+/// Floor for pivot detection and division safety in numerical linear algebra
+/// (LM solver, Gaussian elimination). Values below this indicate a
+/// (near-)singular system.
+pub const PIVOT_FLOOR: f64 = 1e-30;
+
+/// Floor for Levenberg-Marquardt diagonal elements to ensure damping stability.
+/// Intentionally much larger than PIVOT_FLOOR — LM requires a meaningful
+/// minimum curvature for numerical stability of the trust-region step.
+pub const LM_DIAGONAL_FLOOR: f64 = 1e-10;
+
+/// Floor for avoiding log(0) or division by zero in general computations.
+pub const LOG_FLOOR: f64 = 1e-300;
+
 #[cfg(test)]
 mod tests {
     use super::*;

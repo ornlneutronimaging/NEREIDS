@@ -593,6 +593,29 @@ impl ResonanceRange {
     }
 }
 
+/// Group resonances by their total angular momentum J value.
+///
+/// Returns a vector of `(J, resonances)` pairs. Two J values are considered
+/// equal if they differ by less than [`nereids_core::constants::QUANTUM_NUMBER_EPS`].
+///
+/// Used by both the Reich-Moore and SLBW cross-section calculators to iterate
+/// over spin groups within an L-group.
+pub fn group_by_j(resonances: &[Resonance]) -> Vec<(f64, Vec<&Resonance>)> {
+    let mut groups: Vec<(f64, Vec<&Resonance>)> = Vec::new();
+    for res in resonances {
+        let j = res.j;
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|(gj, _)| (*gj - j).abs() < nereids_core::constants::QUANTUM_NUMBER_EPS)
+        {
+            group.1.push(res);
+        } else {
+            groups.push((j, vec![res]));
+        }
+    }
+    groups
+}
+
 impl std::fmt::Display for ResonanceData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -811,5 +834,46 @@ mod tests {
             (y - e).abs() < 1e-12,
             "INT=4 at midpoint x=1: expected y=e={e:.6}, got {y:.6}"
         );
+    }
+
+    #[test]
+    fn test_group_by_j() {
+        // Empty input
+        let groups = group_by_j(&[]);
+        assert!(groups.is_empty());
+
+        // Single resonance
+        let r1 = Resonance {
+            energy: 6.67,
+            j: 0.5,
+            gn: 0.001,
+            gg: 0.023,
+            gfa: 0.0,
+            gfb: 0.0,
+        };
+        let single = [r1.clone()];
+        let groups = group_by_j(&single);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].1.len(), 1);
+
+        // Multiple J values
+        let r2 = Resonance {
+            j: 1.5,
+            ..r1.clone()
+        };
+        let r3 = Resonance {
+            j: 0.5,
+            energy: 20.0,
+            ..r1.clone()
+        };
+        let multi = [r1, r2, r3];
+        let groups = group_by_j(&multi);
+        assert_eq!(groups.len(), 2); // J=0.5 and J=1.5
+        // J=0.5 group should have 2 resonances
+        let j05 = groups
+            .iter()
+            .find(|(j, _)| (*j - 0.5).abs() < nereids_core::constants::QUANTUM_NUMBER_EPS)
+            .unwrap();
+        assert_eq!(j05.1.len(), 2);
     }
 }

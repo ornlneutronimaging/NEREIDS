@@ -26,25 +26,18 @@
 //! where Γ_n(E) = Γ_n(E_r) × √(E/E_r) × P_l(E)/P_l(E_r)
 //! and Γ = Γ_n(E) + Γ_γ + Γ_f
 
-use nereids_endf::resonance::ResonanceData;
+use nereids_core::constants::{DIVISION_FLOOR, PIVOT_FLOOR};
+use nereids_endf::resonance::{ResonanceData, group_by_j};
 
 use crate::channel;
 use crate::penetrability;
-
-/// SLBW cross-section results at a single energy.
-#[derive(Debug, Clone, Copy)]
-pub struct SlbwCrossSections {
-    pub total: f64,
-    pub elastic: f64,
-    pub capture: f64,
-    pub fission: f64,
-}
+use crate::reich_moore::CrossSections;
 
 /// Compute SLBW cross-sections at a single energy.
 ///
 /// Works with both SLBW and Reich-Moore ENDF data (uses the same
 /// resonance parameters but applies the SLBW formulas).
-pub fn slbw_cross_sections(data: &ResonanceData, energy_ev: f64) -> SlbwCrossSections {
+pub fn slbw_cross_sections(data: &ResonanceData, energy_ev: f64) -> CrossSections {
     let awr = data.awr;
 
     let mut total = 0.0;
@@ -76,7 +69,7 @@ pub fn slbw_cross_sections(data: &ResonanceData, energy_ev: f64) -> SlbwCrossSec
         fission += f;
     }
 
-    SlbwCrossSections {
+    CrossSections {
         total,
         elastic,
         capture,
@@ -141,7 +134,7 @@ pub fn slbw_cross_sections_for_range(
                 // Γ_n(E) = Γ_n(E_r) × √(E/E_r) × P_l(E)/P_l(E_r)
                 // P_l(E_r) uses the channel radius evaluated at the resonance
                 // energy (ENDF §2.2.1 NRO=1: AP is tabulated, not constant).
-                let gamma_n = if e_r.abs() > 1e-30 {
+                let gamma_n = if e_r.abs() > PIVOT_FLOOR {
                     let radius_at_er = if l_group.apl > 0.0 {
                         l_group.apl
                     } else {
@@ -150,7 +143,7 @@ pub fn slbw_cross_sections_for_range(
                     let rho_r = channel::rho(e_r.abs(), awr_l, radius_at_er);
                     let p_at_e = penetrability::penetrability(l, rho);
                     let p_at_er = penetrability::penetrability(l, rho_r);
-                    if p_at_er > 1e-30 {
+                    if p_at_er > PIVOT_FLOOR {
                         res.gn.abs() * (energy_ev / e_r.abs()).sqrt() * p_at_e / p_at_er
                     } else {
                         0.0
@@ -163,7 +156,7 @@ pub fn slbw_cross_sections_for_range(
                 let de = energy_ev - e_r;
                 let denom = de * de + (gamma_total / 2.0).powi(2);
 
-                if denom < 1e-50 {
+                if denom < DIVISION_FLOOR {
                     continue;
                 }
 
@@ -199,20 +192,7 @@ pub fn slbw_cross_sections_for_range(
     (total, elastic, capture, fission)
 }
 
-fn group_by_j(
-    resonances: &[nereids_endf::resonance::Resonance],
-) -> Vec<(f64, Vec<&nereids_endf::resonance::Resonance>)> {
-    let mut groups: Vec<(f64, Vec<&nereids_endf::resonance::Resonance>)> = Vec::new();
-    for res in resonances {
-        let j = res.j;
-        if let Some(group) = groups.iter_mut().find(|(gj, _)| (*gj - j).abs() < 1e-10) {
-            group.1.push(res);
-        } else {
-            groups.push((j, vec![res]));
-        }
-    }
-    groups
-}
+// group_by_j is defined in nereids_endf::resonance and imported at the top of this file.
 
 #[cfg(test)]
 mod tests {

@@ -58,6 +58,7 @@
 
 use num_complex::Complex64;
 
+use nereids_core::constants::{CROSS_SECTION_FLOOR, LOG_FLOOR, PIVOT_FLOOR, QUANTUM_NUMBER_EPS};
 use nereids_endf::resonance::{ParticlePair, RmlData, SpinGroup};
 
 use crate::{channel, coulomb, penetrability};
@@ -381,8 +382,8 @@ fn spin_group_cross_sections(
         // the correction is negligible (ε << Γ_γ/2).
         // Reference: Cauchy PV regularisation; SAMMY avoids the exact pole by perturbing
         // the resonance energy during input processing.
-        let inv_denom = if denom.norm() < 1e-10 {
-            (denom + Complex64::new(0.0, 1e-10)).inv()
+        let inv_denom = if denom.norm() < QUANTUM_NUMBER_EPS {
+            (denom + Complex64::new(0.0, QUANTUM_NUMBER_EPS)).inv()
         } else {
             denom.inv()
         };
@@ -424,8 +425,8 @@ fn spin_group_cross_sections(
                     // whether |L_c| is actually near zero.
                     //
                     // Reference: SAMMY rml/mrml07.f — PH = 1/(S−B+iP).
-                    let inv_l = if l_c[c].norm_sqr() < 1e-60 {
-                        // |L_c| < 1e-30: use finite-but-large sentinel so the diagonal
+                    let inv_l = if l_c[c].norm_sqr() < CROSS_SECTION_FLOOR {
+                        // |L_c|² < CROSS_SECTION_FLOOR: use finite-but-large sentinel so the diagonal
                         // dominates and the channel decouples without overflow in inversion.
                         Complex64::new(1e30, 0.0)
                     } else {
@@ -449,8 +450,8 @@ fn spin_group_cross_sections(
             // The epsilon is real-only to preserve Hermitian symmetry of the
             // level matrix; an imaginary perturbation would break unitarity.
             //
-            // Use a *relative* epsilon: ε = |diag| × 1e-10, with a floor of
-            // 1e-30 for zero diagonals.  A fixed absolute epsilon (e.g. 1e-10)
+            // Use a *relative* epsilon: ε = |diag| × QUANTUM_NUMBER_EPS, with a floor of
+            // CROSS_SECTION_FLOOR for zero diagonals.  A fixed absolute epsilon
             // could be comparable to or larger than the diagonal value itself
             // for high-L channels with very small penetrabilities (where
             // 1/L_c ~ 1/P_c can be enormous, but R_cc' is also large, making
@@ -469,9 +470,9 @@ fn spin_group_cross_sections(
             let mut y_reg = y_tilde.clone();
             for (i, row) in y_reg.iter_mut().enumerate().take(nch) {
                 let diag_norm = row[i].norm();
-                // Relative regularization (1e-10 × diagonal) with an
-                // absolute floor of 1e-30 for near-zero diagonals.
-                let eps = (diag_norm * 1e-10).max(1e-30);
+                // Relative regularization (QUANTUM_NUMBER_EPS × diagonal) with an
+                // absolute floor of CROSS_SECTION_FLOOR for near-zero diagonals.
+                let eps = (diag_norm * QUANTUM_NUMBER_EPS).max(CROSS_SECTION_FLOOR);
                 row[i] += Complex64::new(eps, 0.0);
             }
             match invert_complex_matrix(&y_reg, nch) {
@@ -507,7 +508,7 @@ fn spin_group_cross_sections(
             // catches most cases, but a channel right at threshold might not
             // be flagged closed yet have |L_c| ≈ 0.  The extra norm check
             // prevents NaN propagation.
-            let sqrt_p_over_l = if is_closed[c] || l_c[c].norm() < 1e-30 {
+            let sqrt_p_over_l = if is_closed[c] || l_c[c].norm() < PIVOT_FLOOR {
                 Complex64::ZERO
             } else {
                 sqrt_p[c] / l_c[c]
@@ -606,7 +607,7 @@ fn spin_group_cross_sections(
 // ── Complex Gauss-Jordan Elimination ─────────────────────────────────────────
 //
 // Inverts an n×n complex matrix using Gauss-Jordan elimination with partial
-// pivoting. Returns None if the matrix is singular (pivot magnitude < 1e-300).
+// pivoting. Returns None if the matrix is singular (pivot magnitude < LOG_FLOOR).
 //
 // For LRF=7 isotopes relevant to VENUS imaging, NCH ≤ 6, so O(n³) is fast.
 // SAMMY uses a specialized complex symmetric factorization (Xspfa/Xspsl in
@@ -639,7 +640,7 @@ fn invert_complex_matrix(a: &[Vec<Complex64>], n: usize) -> Option<Vec<Vec<Compl
         aug.swap(col, pivot_row);
 
         let pivot = aug[col][col];
-        if pivot.norm() < 1e-300 {
+        if pivot.norm() < LOG_FLOOR {
             return None; // singular
         }
 
@@ -655,7 +656,7 @@ fn invert_complex_matrix(a: &[Vec<Complex64>], n: usize) -> Option<Vec<Vec<Compl
                 continue;
             }
             let factor = aug[row][col];
-            if factor.norm() < 1e-300 {
+            if factor.norm() < LOG_FLOOR {
                 continue;
             }
             let col_scaled: Vec<Complex64> = aug[col].iter().map(|&x| factor * x).collect();
