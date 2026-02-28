@@ -445,23 +445,30 @@ fn cross_sections<'py>(
     energies: PyReadonlyArray1<f64>,
     data: &PyResonanceData,
 ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    let e = energies.as_slice()?;
-    let mut total = Vec::with_capacity(e.len());
-    let mut elastic = Vec::with_capacity(e.len());
-    let mut capture = Vec::with_capacity(e.len());
-    let mut fission = Vec::with_capacity(e.len());
+    let e_owned = energies.as_slice()?.to_vec();
+    let res_data = data.inner.clone();
 
-    // The Rust dispatcher (`cross_sections_at_energy`) handles all supported
-    // resonance formalisms per range (Reich-Moore, SLBW, MLBW via an SLBW
-    // approximation, RML, URR), so no additional Python-side formalism
-    // dispatch is needed.
-    for &energy in e {
-        let xs = nereids_physics::reich_moore::cross_sections_at_energy(&data.inner, energy);
-        total.push(xs.total);
-        elastic.push(xs.elastic);
-        capture.push(xs.capture);
-        fission.push(xs.fission);
-    }
+    // Release the GIL for the cross-section computation.
+    let (total, elastic, capture, fission) = py.detach(move || {
+        let mut total = Vec::with_capacity(e_owned.len());
+        let mut elastic = Vec::with_capacity(e_owned.len());
+        let mut capture = Vec::with_capacity(e_owned.len());
+        let mut fission = Vec::with_capacity(e_owned.len());
+
+        // The Rust dispatcher (`cross_sections_at_energy`) handles all supported
+        // resonance formalisms per range (Reich-Moore, SLBW, MLBW via an SLBW
+        // approximation, RML, URR), so no additional Python-side formalism
+        // dispatch is needed.
+        for &energy in &e_owned {
+            let xs = nereids_physics::reich_moore::cross_sections_at_energy(&res_data, energy);
+            total.push(xs.total);
+            elastic.push(xs.elastic);
+            capture.push(xs.capture);
+            fission.push(xs.fission);
+        }
+
+        (total, elastic, capture, fission)
+    });
 
     let dict = pyo3::types::PyDict::new(py);
     dict.set_item("total", PyArray1::from_vec(py, total))?;
@@ -500,7 +507,7 @@ fn forward_model<'py>(
     delta_l_m: Option<f64>,
     resolution: Option<PyTabulatedResolution>,
 ) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let e = energies.as_slice()?;
+    let e_owned = energies.as_slice()?.to_vec();
 
     let sample_isotopes: Vec<(ResonanceData, f64)> = isotopes
         .into_iter()
@@ -515,8 +522,9 @@ fn forward_model<'py>(
     let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution)?;
     let instrument = res_fn.map(|r| InstrumentParams { resolution: r });
 
-    let t = transmission::forward_model(e, &sample, instrument.as_ref())
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    // Release the GIL for the forward model computation.
+    let t = py.detach(move || transmission::forward_model(&e_owned, &sample, instrument.as_ref()));
+    let t = t.map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
     Ok(PyArray1::from_vec(py, t))
 }
 
@@ -641,7 +649,8 @@ fn fit_spectrum(
             let s_owned = s.to_vec();
 
             // Release the GIL for the heavy computation.
-            py.detach(move || {
+            // The closure uses only Rust types; PyErr conversion happens outside.
+            let result: Result<PyFitResult, String> = py.detach(move || {
                 let model = TransmissionFitModel {
                     energies: e_owned,
                     resonance_data: res_data,
@@ -673,27 +682,28 @@ fn fit_spectrum(
                     ..LmConfig::default()
                 };
 
-                let result =
+                let lm_result =
                     lm::levenberg_marquardt(&model, &t_owned, &s_owned, &mut params, &config);
 
                 let n_total = n_isotopes + if fit_temperature { 1 } else { 0 };
-                let densities: Vec<f64> = (0..n_isotopes).map(|i| result.params[i]).collect();
-                let unc = result
+                let densities: Vec<f64> = (0..n_isotopes).map(|i| lm_result.params[i]).collect();
+                let unc = lm_result
                     .uncertainties
                     .unwrap_or_else(|| vec![f64::NAN; n_total]);
-                assert!(
-                    unc.len() >= n_total,
-                    "uncertainty vector length ({}) should be >= parameter count ({})",
-                    unc.len(),
-                    n_total
-                );
+                if unc.len() < n_total {
+                    return Err(format!(
+                        "uncertainty vector length ({}) should be >= parameter count ({})",
+                        unc.len(),
+                        n_total
+                    ));
+                }
                 let uncertainties: Vec<f64> = (0..n_isotopes)
                     .map(|i| unc.get(i).copied().unwrap_or(f64::NAN))
                     .collect();
 
                 let (fitted_temperature, fitted_temperature_unc) = if fit_temperature {
                     (
-                        Some(result.params[n_isotopes]),
+                        Some(lm_result.params[n_isotopes]),
                         Some(unc.get(n_isotopes).copied().unwrap_or(f64::NAN)),
                     )
                 } else {
@@ -703,13 +713,14 @@ fn fit_spectrum(
                 Ok(PyFitResult {
                     densities,
                     uncertainties,
-                    reduced_chi_squared: result.reduced_chi_squared,
-                    converged: result.converged,
-                    iterations: result.iterations,
+                    reduced_chi_squared: lm_result.reduced_chi_squared,
+                    converged: lm_result.converged,
+                    iterations: lm_result.iterations,
                     temperature_k: fitted_temperature,
                     temperature_k_unc: fitted_temperature_unc,
                 })
-            })
+            });
+            result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
         }
 
         "poisson" => {
@@ -721,7 +732,8 @@ fn fit_spectrum(
             let instrument = res_fn.map(|r| InstrumentParams { resolution: r });
 
             // Release the GIL for the heavy computation.
-            py.detach(move || {
+            // The closure uses only Rust types; PyErr conversion happens outside.
+            let result: Result<PyFitResult, String> = py.detach(move || {
                 // Precompute broadened cross-sections at the initial temperature.
                 let xs = transmission::broadened_cross_sections(
                     &e_owned,
@@ -730,12 +742,7 @@ fn fit_spectrum(
                     instrument.as_ref(),
                     None,
                 )
-                .map_err(|e| {
-                    pyo3::exceptions::PyValueError::new_err(format!(
-                        "broadened_cross_sections failed: {}",
-                        e
-                    ))
-                })?;
+                .map_err(|e| format!("broadened_cross_sections failed: {}", e))?;
 
                 // Build density parameters.
                 let mut param_vec: Vec<FitParameter> = init
@@ -806,7 +813,7 @@ fn fit_spectrum(
                     ..PoissonConfig::default()
                 };
 
-                let result = poisson::poisson_fit_analytic(
+                let poisson_result = poisson::poisson_fit_analytic(
                     &counts_model,
                     &y_obs,
                     &flux_owned,
@@ -817,13 +824,14 @@ fn fit_spectrum(
                     temp_ctx.as_ref(),
                 );
 
-                let densities: Vec<f64> = (0..n_isotopes).map(|i| result.params[i]).collect();
+                let densities: Vec<f64> =
+                    (0..n_isotopes).map(|i| poisson_result.params[i]).collect();
                 // Poisson optimizer does not compute uncertainties from covariance;
                 // report NaN for now.
                 let uncertainties = vec![f64::NAN; n_isotopes];
 
                 let (fitted_temperature, fitted_temperature_unc) = if fit_temperature {
-                    (Some(result.params[n_isotopes]), Some(f64::NAN))
+                    (Some(poisson_result.params[n_isotopes]), Some(f64::NAN))
                 } else {
                     (None, None)
                 };
@@ -831,13 +839,14 @@ fn fit_spectrum(
                 Ok(PyFitResult {
                     densities,
                     uncertainties,
-                    reduced_chi_squared: result.nll,
-                    converged: result.converged,
-                    iterations: result.iterations,
+                    reduced_chi_squared: poisson_result.nll,
+                    converged: poisson_result.converged,
+                    iterations: poisson_result.iterations,
                     temperature_k: fitted_temperature,
                     temperature_k_unc: fitted_temperature_unc,
                 })
-            })
+            });
+            result.map_err(|e| pyo3::exceptions::PyValueError::new_err(e))
         }
 
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -1229,7 +1238,13 @@ fn doppler_broaden<'py>(
     let params = DopplerParams::new(temperature_k, awr).map_err(|e| {
         pyo3::exceptions::PyValueError::new_err(format!("invalid DopplerParams: {e}"))
     })?;
-    let result = doppler::doppler_broaden(e, xs, &params);
+
+    // Copy numpy slices to owned vectors so we can release the GIL.
+    let e_owned = e.to_vec();
+    let xs_owned = xs.to_vec();
+
+    // Release the GIL for the Doppler broadening convolution.
+    let result = py.detach(move || doppler::doppler_broaden(&e_owned, &xs_owned, &params));
     Ok(PyArray1::from_vec(py, result))
 }
 
@@ -1298,8 +1313,14 @@ fn resolution_broaden<'py>(
         delta_t_us,
         delta_l_m,
     };
-    let result = resolution::resolution_broaden(e, xs, &params)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
+
+    // Copy numpy slices to owned vectors so we can release the GIL.
+    let e_owned = e.to_vec();
+    let xs_owned = xs.to_vec();
+
+    // Release the GIL for the resolution broadening convolution.
+    let result = py.detach(move || resolution::resolution_broaden(&e_owned, &xs_owned, &params));
+    let result = result.map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
     Ok(PyArray1::from_vec(py, result))
 }
 
@@ -1364,8 +1385,14 @@ fn py_apply_resolution<'py>(
     validate_energy_grid(e)?;
 
     let res_fn = ResolutionFunction::Tabulated(resolution.inner.clone());
-    let result = resolution::apply_resolution(e, s, &res_fn)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
+
+    // Copy numpy slices to owned vectors so we can release the GIL.
+    let e_owned = e.to_vec();
+    let s_owned = s.to_vec();
+
+    // Release the GIL for the tabulated resolution broadening.
+    let result = py.detach(move || resolution::apply_resolution(&e_owned, &s_owned, &res_fn));
+    let result = result.map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
     Ok(PyArray1::from_vec(py, result))
 }
 
@@ -1505,9 +1532,12 @@ fn py_spatial_map(
             let unc = uncertainty.as_array().to_owned();
             let dead = dead_pixels.map(|d| d.as_array().to_owned());
 
-            let result =
+            // Release the GIL for the heavy per-pixel fitting.
+            let result = py.detach(move || {
                 nereids_pipeline::spatial::spatial_map(&trans, &unc, &config, dead.as_ref(), None)
-                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+            });
+            let result =
+                result.map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
             let shape = (
                 result.converged_map.shape()[0],
@@ -1560,9 +1590,6 @@ fn py_spatial_map(
                 }
                 None => None,
             };
-            let nuisance = estimate_nuisance(&open_beam, roi_ranges, dead.as_ref())
-                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-
             let sparse_config = SparseConfig {
                 energies: e.to_vec(),
                 resonance_data: res_data,
@@ -1576,10 +1603,13 @@ fn py_spatial_map(
                 },
             };
 
-            // Stage 2: per-pixel Poisson NLL fitting.
-            let result =
+            // Release the GIL for nuisance estimation + per-pixel Poisson fitting.
+            let result = py.detach(move || {
+                let nuisance = estimate_nuisance(&open_beam, roi_ranges, dead.as_ref())?;
                 sparse_reconstruct(&sample, &nuisance, &sparse_config, dead.as_ref(), None)
-                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+            });
+            let result =
+                result.map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
             let shape = (result.nll_map.shape()[0], result.nll_map.shape()[1]);
             let py_result = PySparseResult {
@@ -1638,6 +1668,7 @@ fn py_spatial_map(
 #[pyfunction]
 #[pyo3(name = "fit_roi", signature = (transmission, uncertainty, y_range, x_range, energies, isotopes, temperature_k=300.0, initial_densities=None, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, max_iter=100))]
 fn py_fit_roi(
+    py: Python<'_>,
     transmission: PyReadonlyArray3<f64>,
     uncertainty: PyReadonlyArray3<f64>,
     y_range: (usize, usize),
@@ -1741,14 +1772,17 @@ fn py_fit_roi(
     let trans = transmission.as_array().to_owned();
     let unc = uncertainty.as_array().to_owned();
 
-    let result = nereids_pipeline::spatial::fit_roi(
-        &trans,
-        &unc,
-        y_range.0..y_range.1,
-        x_range.0..x_range.1,
-        &config,
-    )
-    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    // Release the GIL for the heavy ROI fitting.
+    let result = py.detach(move || {
+        nereids_pipeline::spatial::fit_roi(
+            &trans,
+            &unc,
+            y_range.0..y_range.1,
+            x_range.0..x_range.1,
+            &config,
+        )
+    });
+    let result = result.map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
     Ok(PyFitResult {
         densities: result.densities,
@@ -1881,8 +1915,9 @@ fn normalize<'py>(
         proton_charge_ob: pc_ob,
     };
 
-    let result = norm::normalize(&s, &ob, &params, dc.as_ref())
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
+    // Release the GIL for the normalization computation.
+    let result = py.detach(move || norm::normalize(&s, &ob, &params, dc.as_ref()));
+    let result = result.map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
 
     Ok((
         PyArray3::from_owned_array(py, result.transmission),
@@ -2081,6 +2116,7 @@ impl PyTraceDetectabilityReport {
 #[pyfunction]
 #[pyo3(name = "trace_detectability", signature = (matrix, matrix_density, trace, trace_ppm, energies, i0, temperature_k=293.6, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, snr_threshold=3.0))]
 fn py_trace_detectability(
+    py: Python<'_>,
     matrix: &PyResonanceData,
     matrix_density: f64,
     trace: &PyResonanceData,
@@ -2125,17 +2161,24 @@ fn py_trace_detectability(
 
     let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution)?;
 
-    let config = detectability::TraceDetectabilityConfig {
-        matrix: &matrix.inner,
-        matrix_density,
-        energies: e,
-        i0,
-        temperature_k,
-        resolution: res_fn.as_ref(),
-        snr_threshold,
-    };
+    // Clone data to owned types so we can release the GIL.
+    let e_owned = e.to_vec();
+    let matrix_data = matrix.inner.clone();
+    let trace_data = trace.inner.clone();
 
-    let report = detectability::trace_detectability(&config, &trace.inner, trace_ppm);
+    // Release the GIL for the detectability computation.
+    let report = py.detach(move || {
+        let config = detectability::TraceDetectabilityConfig {
+            matrix: &matrix_data,
+            matrix_density,
+            energies: &e_owned,
+            i0,
+            temperature_k,
+            resolution: res_fn.as_ref(),
+            snr_threshold,
+        };
+        detectability::trace_detectability(&config, &trace_data, trace_ppm)
+    });
 
     Ok(PyTraceDetectabilityReport { inner: report })
 }
@@ -2169,6 +2212,7 @@ fn py_trace_detectability(
 #[pyfunction]
 #[pyo3(name = "trace_detectability_survey", signature = (matrix, matrix_density, trace_candidates, trace_ppm, energies, i0, temperature_k=293.6, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, snr_threshold=3.0))]
 fn py_trace_detectability_survey(
+    py: Python<'_>,
     matrix: &PyResonanceData,
     matrix_density: f64,
     trace_candidates: Vec<PyResonanceData>,
@@ -2220,17 +2264,23 @@ fn py_trace_detectability_survey(
 
     let candidates: Vec<ResonanceData> = trace_candidates.into_iter().map(|d| d.inner).collect();
 
-    let config = detectability::TraceDetectabilityConfig {
-        matrix: &matrix.inner,
-        matrix_density,
-        energies: e,
-        i0,
-        temperature_k,
-        resolution: res_fn.as_ref(),
-        snr_threshold,
-    };
+    // Clone data to owned types so we can release the GIL.
+    let e_owned = e.to_vec();
+    let matrix_data = matrix.inner.clone();
 
-    let results = detectability::trace_detectability_survey(&config, &candidates, trace_ppm);
+    // Release the GIL for the parallelised detectability survey.
+    let results = py.detach(move || {
+        let config = detectability::TraceDetectabilityConfig {
+            matrix: &matrix_data,
+            matrix_density,
+            energies: &e_owned,
+            i0,
+            temperature_k,
+            resolution: res_fn.as_ref(),
+            snr_threshold,
+        };
+        detectability::trace_detectability_survey(&config, &candidates, trace_ppm)
+    });
 
     Ok(results
         .into_iter()
