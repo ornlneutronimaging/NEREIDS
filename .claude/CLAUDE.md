@@ -58,10 +58,12 @@ Run `/review-pipeline` to execute the full pipeline across active worktrees.
 and merge. Dismiss Copilot comments that rehash addressed issues or flag
 impossible edge cases.
 
-**Post-merge**: always run both test suites on the merged main to catch
-cross-PR integration regressions:
+**Post-merge**: always run the full integration gate on the merged main.
+`pixi run build` compiles the entire workspace including PyO3 bindings,
+catching cross-PR signature mismatches that per-branch reviews miss:
 
 ```
+pixi run build
 cargo test --workspace --exclude nereids-python
 pixi run test-python
 ```

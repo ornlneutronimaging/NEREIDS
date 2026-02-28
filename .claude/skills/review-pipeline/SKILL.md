@@ -167,10 +167,20 @@ After all PRs in the batch are merged, verify the merged main:
 
 ```bash
 git fetch origin && git checkout main && git pull origin main
+pixi run build
 cargo test --workspace --exclude nereids-python
+pixi run test-python
 ```
 
-This catches cross-PR regressions. If tests fail, fix on main immediately.
+**`pixi run build` must run first.** It compiles the full workspace including
+PyO3 bindings (`nereids-python`), which `cargo test --exclude nereids-python`
+does not. When multiple PRs modify the same function signature (e.g., one PR
+adds parameters, another PR calls the old signature), the per-branch reviews
+are blind to the conflict because each branch diffs against `main`
+independently. `pixi run build` catches these cross-PR integration
+regressions at compile time before tests even run.
+
+If `pixi run build` or tests fail, fix on main immediately.
 
 ## Step 10: Track Deferred P2 Findings
 
