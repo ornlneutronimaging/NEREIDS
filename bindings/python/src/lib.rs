@@ -2292,14 +2292,26 @@ fn precompute_cross_sections<'py>(
     let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution)?;
     let instrument = res_fn.map(|r| InstrumentParams { resolution: r });
 
-    let xs = transmission::broadened_cross_sections(
-        e,
-        &res_data,
-        temperature_k,
-        instrument.as_ref(),
-        None,
-    )
-    .expect("broadened_cross_sections should not be cancelled (no cancel token)");
+    // Copy numpy slice to owned Vec so we can release the GIL.
+    let e_owned = e.to_vec();
+
+    // Release the GIL for the heavy Doppler + resolution broadening.
+    let xs = py.detach(move || {
+        transmission::broadened_cross_sections(
+            &e_owned,
+            &res_data,
+            temperature_k,
+            instrument.as_ref(),
+            None,
+        )
+    });
+
+    // GIL is re-acquired after detach returns — use `py` directly.
+    let xs = xs.ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err(
+            "broadened_cross_sections returned None unexpectedly",
+        )
+    })?;
 
     Ok(xs.into_iter().map(|v| PyArray1::from_vec(py, v)).collect())
 }
