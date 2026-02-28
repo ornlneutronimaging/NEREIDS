@@ -31,8 +31,11 @@ pub struct FlatMatrix {
 impl FlatMatrix {
     /// Create a new zero-filled matrix with the given dimensions.
     pub fn zeros(nrows: usize, ncols: usize) -> Self {
+        let len = nrows
+            .checked_mul(ncols)
+            .expect("FlatMatrix dimensions overflow usize");
         Self {
-            data: vec![0.0; nrows * ncols],
+            data: vec![0.0; len],
             nrows,
             ncols,
         }
@@ -41,12 +44,14 @@ impl FlatMatrix {
     /// Access element at (row, col) immutably.
     #[inline(always)]
     pub fn get(&self, row: usize, col: usize) -> f64 {
+        debug_assert!(row < self.nrows && col < self.ncols);
         self.data[row * self.ncols + col]
     }
 
     /// Access element at (row, col) mutably.
     #[inline(always)]
     pub fn get_mut(&mut self, row: usize, col: usize) -> &mut f64 {
+        debug_assert!(row < self.nrows && col < self.ncols);
         &mut self.data[row * self.ncols + col]
     }
 }
@@ -104,7 +109,7 @@ pub struct LmResult {
     /// Final parameter values (all parameters, including fixed).
     pub params: Vec<f64>,
     /// Covariance matrix of free parameters (n_free × n_free), if available.
-    pub covariance: Option<Vec<Vec<f64>>>,
+    pub covariance: Option<FlatMatrix>,
     /// Standard errors of free parameters (diagonal of covariance).
     pub uncertainties: Option<Vec<f64>>,
 }
@@ -253,9 +258,8 @@ fn solve_damped_system(a: &FlatMatrix, b: &[f64], lambda: f64) -> Option<Vec<f64
         // Swap rows col and max_row in the flat buffer.
         if col != max_row {
             let (row_a, row_b) = (col * ncols, max_row * ncols);
-            for j in 0..ncols {
-                aug.data.swap(row_a + j, row_b + j);
-            }
+            let (first, second) = aug.data.split_at_mut(row_b);
+            first[row_a..row_a + ncols].swap_with_slice(&mut second[..ncols]);
         }
 
         let pivot = aug.get(col, col);
@@ -318,9 +322,8 @@ fn invert_matrix(a: &FlatMatrix) -> Option<FlatMatrix> {
         // Swap rows col and max_row.
         if col != max_row {
             let (row_a, row_b) = (col * ncols, max_row * ncols);
-            for j in 0..ncols {
-                aug.data.swap(row_a + j, row_b + j);
-            }
+            let (first, second) = aug.data.split_at_mut(row_b);
+            first[row_a..row_a + ncols].swap_with_slice(&mut second[..ncols]);
         }
 
         let pivot = aug.get(col, col);
@@ -431,7 +434,7 @@ pub fn levenberg_marquardt(
             iterations: 0,
             converged: true,
             params: params.all_values(),
-            covariance: Some(vec![]),
+            covariance: Some(FlatMatrix::zeros(0, 0)),
             uncertainties: Some(vec![]),
         };
     }
@@ -634,11 +637,7 @@ pub fn levenberg_marquardt(
                     }
                 })
                 .collect();
-            // Convert flat covariance to Vec<Vec<f64>> for the public API.
-            let cov_vv: Vec<Vec<f64>> = (0..n_free)
-                .map(|i| (0..n_free).map(|j| cov.get(i, j)).collect())
-                .collect();
-            (Some(cov_vv), Some(unc))
+            (Some(cov), Some(unc))
         } else {
             (None, None)
         }
