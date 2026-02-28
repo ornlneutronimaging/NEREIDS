@@ -4,7 +4,6 @@ All tests use synthetic data built with ``nereids.create_resonance_data()``
 so no network access or ENDF downloads are required.
 """
 
-import math
 import os
 import tempfile
 
@@ -169,10 +168,9 @@ class TestTofConversion:
         tof_edges = np.array([100.0, 200.0, 300.0, 400.0, 500.0])
         centers = nereids.tof_to_energy_centers(tof_edges, flight_path)
         assert len(centers) == len(tof_edges) - 1
-        # Energy centers should be ascending (TOF is ascending -> E is descending,
-        # but the function returns ascending energy)
+        # The function returns energy centers in ascending order
         for i in range(len(centers) - 1):
-            assert centers[i] < centers[i + 1] or centers[i] > centers[i + 1]
+            assert centers[i] < centers[i + 1], f"Expected ascending energy: centers[{i}]={centers[i]} >= centers[{i+1}]={centers[i+1]}"
 
 
 # ===========================================================================
@@ -280,7 +278,7 @@ class TestCrossSections:
 
     def test_non_negative(self, u238_data, energy_grid):
         xs = nereids.cross_sections(energy_grid, u238_data)
-        for key in ("total", "elastic", "capture"):
+        for key in ("total", "elastic", "capture", "fission"):
             arr = np.asarray(xs[key])
             assert np.all(arr >= 0.0), f"{key} has negative values"
 
@@ -635,7 +633,6 @@ class TestSpatialMapLM:
         """3x3 spatial map should return correct shapes."""
         energies = np.linspace(1.0, 30.0, 200)
         true_density = 0.002
-        n_e = len(energies)
         ny, nx = 3, 3
 
         # Build a (n_e, ny, nx) transmission cube
@@ -661,10 +658,14 @@ class TestSpatialMapLM:
         assert len(density_maps) == 1
         dmap = np.asarray(density_maps[0])
         assert dmap.shape == (ny, nx)
+        assert trans.shape[0] == len(energies)
 
         converged = np.asarray(result.converged_map)
         assert converged.shape == (ny, nx)
         assert result.n_total == ny * nx
+
+        # Density recovery: fitted values should be close to ground truth
+        np.testing.assert_allclose(dmap, true_density, rtol=0.15)
 
     def test_spatial_map_repr(self, u238_data):
         energies = np.linspace(1.0, 30.0, 100)
@@ -725,6 +726,9 @@ class TestSpatialMapPoisson:
         assert len(density_maps) == 1
         dmap = np.asarray(density_maps[0])
         assert dmap.shape == (ny, nx)
+
+        # Density recovery: Poisson is noisier, so use wider tolerance
+        np.testing.assert_allclose(dmap, true_density, rtol=0.5)
 
 
 # ===========================================================================
@@ -819,7 +823,7 @@ class TestTiffIO:
             )
 
     def test_load_tiff_stack_missing_file(self):
-        with pytest.raises(Exception):
+        with pytest.raises(OSError):
             nereids.load_tiff_stack("/nonexistent/path.tif")
 
 
