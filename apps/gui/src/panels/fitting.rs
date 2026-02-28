@@ -434,8 +434,8 @@ fn fit_roi(state: &mut AppState) {
     }
 
     let result = match nereids_pipeline::spatial::fit_roi(
-        &norm.transmission,
-        &norm.uncertainty,
+        norm.transmission.view(),
+        norm.uncertainty.view(),
         roi.y_start..roi.y_end,
         roi.x_start..roi.x_end,
         &config,
@@ -484,8 +484,8 @@ fn run_spatial_map(state: &mut AppState) {
 
     std::thread::spawn(move || {
         let result = nereids_pipeline::spatial::spatial_map(
-            &norm.transmission,
-            &norm.uncertainty,
+            norm.transmission.view(),
+            norm.uncertainty.view(),
             &config,
             dead_pixels.as_ref(),
             Some(&cancel),

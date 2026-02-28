@@ -3,7 +3,7 @@
 //! Applies the single-spectrum fitting pipeline across all pixels in
 //! a hyperspectral neutron imaging dataset to produce 2D composition maps.
 
-use ndarray::{Array2, Array3, s};
+use ndarray::{Array2, Array3, ArrayView3, s};
 use rayon::prelude::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,8 +57,8 @@ pub struct SpatialResult {
 /// # Returns
 /// Spatial result with density maps, uncertainty maps, and fit quality.
 pub fn spatial_map(
-    transmission: &Array3<f64>,
-    uncertainty: &Array3<f64>,
+    transmission: ArrayView3<'_, f64>,
+    uncertainty: ArrayView3<'_, f64>,
     config: &FitConfig,
     dead_pixels: Option<&Array2<bool>>,
     cancel: Option<&AtomicBool>,
@@ -168,12 +168,10 @@ pub fn spatial_map(
     // causing constant L1 cache misses.  After transposing, a pixel's 1000-point
     // spectrum occupies 8 KB of contiguous memory, fitting comfortably in L1 cache.
     let trans_t: Array3<f64> = transmission
-        .view()
         .permuted_axes([1, 2, 0])
         .as_standard_layout()
         .into_owned();
     let unc_t: Array3<f64> = uncertainty
-        .view()
         .permuted_axes([1, 2, 0])
         .as_standard_layout()
         .into_owned();
@@ -310,8 +308,8 @@ pub fn spatial_map(
 /// Returns `PipelineError::InvalidParameter` if the ROI is empty or out of bounds,
 /// or `PipelineError::ShapeMismatch` if config dimensions are inconsistent.
 pub fn fit_roi(
-    transmission: &Array3<f64>,
-    uncertainty: &Array3<f64>,
+    transmission: ArrayView3<'_, f64>,
+    uncertainty: ArrayView3<'_, f64>,
     y_range: std::ops::Range<usize>,
     x_range: std::ops::Range<usize>,
     config: &FitConfig,
@@ -458,7 +456,8 @@ mod tests {
             compute_covariance: true,
         };
 
-        let result = spatial_map(&transmission, &uncertainty, &config, None, None).unwrap();
+        let result =
+            spatial_map(transmission.view(), uncertainty.view(), &config, None, None).unwrap();
 
         assert_eq!(result.n_total, 9);
         assert_eq!(result.n_converged, 9);
@@ -526,7 +525,14 @@ mod tests {
             compute_covariance: true,
         };
 
-        let result = spatial_map(&transmission, &uncertainty, &config, Some(&dead), None).unwrap();
+        let result = spatial_map(
+            transmission.view(),
+            uncertainty.view(),
+            &config,
+            Some(&dead),
+            None,
+        )
+        .unwrap();
 
         assert_eq!(result.n_total, 3); // 4 pixels - 1 dead = 3
         assert_eq!(result.density_maps[0][[0, 0]], 0.0); // dead pixel stays at 0
@@ -551,7 +557,7 @@ mod tests {
         let transmission = Array3::from_elem((3, 2, 2), 0.5);
         let uncertainty = Array3::from_elem((3, 2, 3), 0.01); // different width
 
-        let result = spatial_map(&transmission, &uncertainty, &config, None, None);
+        let result = spatial_map(transmission.view(), uncertainty.view(), &config, None, None);
         assert!(result.is_err());
     }
 
@@ -575,7 +581,13 @@ mod tests {
         let uncertainty = Array3::from_elem((3, 2, 2), 0.01);
         let dead = Array2::from_elem((3, 2), false); // wrong shape
 
-        let result = spatial_map(&transmission, &uncertainty, &config, Some(&dead), None);
+        let result = spatial_map(
+            transmission.view(),
+            uncertainty.view(),
+            &config,
+            Some(&dead),
+            None,
+        );
         assert!(result.is_err());
     }
 
@@ -624,7 +636,7 @@ mod tests {
         };
 
         // Fit a 2×2 ROI
-        let result = fit_roi(&transmission, &uncertainty, 1..3, 1..3, &config).unwrap();
+        let result = fit_roi(transmission.view(), uncertainty.view(), 1..3, 1..3, &config).unwrap();
 
         assert!(result.converged);
         assert!(
@@ -654,7 +666,7 @@ mod tests {
         let transmission = Array3::from_elem((3, 4, 4), 0.5);
         let uncertainty = Array3::from_elem((3, 4, 4), 0.01);
 
-        let result = fit_roi(&transmission, &uncertainty, 2..2, 0..2, &config);
+        let result = fit_roi(transmission.view(), uncertainty.view(), 2..2, 0..2, &config);
         assert!(result.is_err());
     }
 }
