@@ -54,10 +54,13 @@ use nereids_pipeline::pipeline::FitConfig;
 use nereids_pipeline::sparse::{SparseConfig, estimate_nuisance, sparse_reconstruct};
 
 /// Python wrapper for ENDF resonance data.
+///
+/// Uses `Arc` internally so that `.clone()` in `py.detach()` closures is O(1)
+/// (refcount bump) instead of deep-copying the entire resonance dataset.
 #[pyclass(name = "ResonanceData", from_py_object)]
 #[derive(Clone)]
 struct PyResonanceData {
-    inner: ResonanceData,
+    inner: Arc<ResonanceData>,
 }
 
 #[pymethods]
@@ -238,10 +241,12 @@ impl PyFitResult {
 }
 
 /// Python wrapper for tabulated resolution function.
+///
+/// Uses `Arc` internally so that `.clone()` in `py.detach()` closures is O(1).
 #[pyclass(name = "TabulatedResolution", from_py_object)]
 #[derive(Clone)]
 struct PyTabulatedResolution {
-    inner: TabulatedResolution,
+    inner: Arc<TabulatedResolution>,
 }
 
 #[pymethods]
@@ -518,7 +523,7 @@ fn forward_model<'py>(
 
     let sample_isotopes: Vec<(ResonanceData, f64)> = isotopes
         .into_iter()
-        .map(|(d, thick)| (d.inner, thick))
+        .map(|(d, thick)| (Arc::unwrap_or_clone(d.inner), thick))
         .collect();
 
     let sample = SampleParams {
@@ -615,7 +620,10 @@ fn fit_spectrum(
     }
 
     let n_isotopes = isotopes.len();
-    let res_data: Vec<ResonanceData> = isotopes.into_iter().map(|d| d.inner).collect();
+    let res_data: Vec<ResonanceData> = isotopes
+        .into_iter()
+        .map(|d| Arc::unwrap_or_clone(d.inner))
+        .collect();
 
     let init = initial_densities.unwrap_or_else(|| vec![0.001; n_isotopes]);
 
@@ -919,7 +927,13 @@ fn energy_to_tof(energy_ev: f64, flight_path_m: f64) -> f64 {
 ///     ResonanceData parsed from the ENDF file.
 #[pyfunction]
 #[pyo3(signature = (z, a, library="endf8.1", mat=None))]
-fn load_endf(z: u32, a: u32, library: &str, mat: Option<u32>) -> PyResult<PyResonanceData> {
+fn load_endf(
+    py: Python<'_>,
+    z: u32,
+    a: u32,
+    library: &str,
+    mat: Option<u32>,
+) -> PyResult<PyResonanceData> {
     let lib = match library {
         "endf8.0" | "endf/b-viii.0" => EndfLibrary::EndfB8_0,
         "endf8.1" | "endf/b-viii.1" => EndfLibrary::EndfB8_1,
@@ -946,13 +960,20 @@ fn load_endf(z: u32, a: u32, library: &str, mat: Option<u32>) -> PyResult<PyReso
         })?,
     };
 
-    let retriever = EndfRetriever::new();
-    let (_path, contents) = retriever
-        .get_endf_file(&isotope, lib, mat_num)
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{}", e)))?;
+    // Release the GIL for the network I/O (download / cache lookup) and
+    // ENDF file parsing.  All types captured by the closure are Send.
+    let result: Result<ResonanceData, String> = py.detach(move || {
+        let retriever = EndfRetriever::new();
+        let (_path, contents) = retriever
+            .get_endf_file(&isotope, lib, mat_num)
+            .map_err(|e| format!("{}", e))?;
 
-    let data = parse_endf_file2(&contents)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("ENDF parse error: {}", e)))?;
+        let data = parse_endf_file2(&contents).map_err(|e| format!("ENDF parse error: {}", e))?;
+
+        Ok(data)
+    });
+
+    let data = result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
 
     // Validate that the parsed ENDF data matches the requested isotope.
     if data.isotope.z() != z || data.isotope.a() != a {
@@ -965,7 +986,9 @@ fn load_endf(z: u32, a: u32, library: &str, mat: Option<u32>) -> PyResult<PyReso
         )));
     }
 
-    Ok(PyResonanceData { inner: data })
+    Ok(PyResonanceData {
+        inner: Arc::new(data),
+    })
 }
 
 /// Load ENDF resonance data from a local file.
@@ -984,7 +1007,9 @@ fn load_endf_file(path: &str) -> PyResult<PyResonanceData> {
     let data = parse_endf_file2(&contents)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("ENDF parse error: {}", e)))?;
 
-    Ok(PyResonanceData { inner: data })
+    Ok(PyResonanceData {
+        inner: Arc::new(data),
+    })
 }
 
 /// Create ResonanceData from parameters (for testing/custom isotopes).
@@ -1075,7 +1100,7 @@ fn create_resonance_data(
     };
 
     Ok(PyResonanceData {
-        inner: ResonanceData {
+        inner: Arc::new(ResonanceData {
             isotope: Isotope::new(z, a).map_err(|e| {
                 pyo3::exceptions::PyValueError::new_err(format!("Invalid isotope: {}", e))
             })?,
@@ -1094,7 +1119,7 @@ fn create_resonance_data(
                 urr: None,
                 ap_table: None,
             }],
-        },
+        }),
     })
 }
 
@@ -1198,7 +1223,9 @@ fn build_resolution(
         ));
     }
     if let Some(tab) = resolution {
-        Ok(Some(ResolutionFunction::Tabulated(tab.inner)))
+        Ok(Some(ResolutionFunction::Tabulated(Arc::unwrap_or_clone(
+            tab.inner,
+        ))))
     } else if let (Some(fp), Some(dt), Some(dl)) = (flight_path_m, delta_t_us, delta_l_m) {
         validate_gaussian_params(fp, dt, dl)?;
         Ok(Some(ResolutionFunction::Gaussian(ResolutionParams {
@@ -1368,7 +1395,9 @@ fn load_resolution(path: &str, flight_path_m: f64) -> PyResult<PyTabulatedResolu
     let tab = TabulatedResolution::from_file(path, flight_path_m)
         .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))?;
 
-    Ok(PyTabulatedResolution { inner: tab })
+    Ok(PyTabulatedResolution {
+        inner: Arc::new(tab),
+    })
 }
 
 /// Apply tabulated resolution broadening to a spectrum.
@@ -1404,7 +1433,7 @@ fn py_apply_resolution<'py>(
     }
     validate_energy_grid(e)?;
 
-    let res_fn = ResolutionFunction::Tabulated(resolution.inner.clone());
+    let res_fn = ResolutionFunction::Tabulated((*resolution.inner).clone());
 
     // Copy numpy slices to owned vectors so we can release the GIL.
     let e_owned = e.to_vec();
@@ -1512,7 +1541,10 @@ fn py_spatial_map(
             format!("{}-{}", sym, d.inner.isotope.a())
         })
         .collect();
-    let res_data: Vec<ResonanceData> = isotopes.into_iter().map(|d| d.inner).collect();
+    let res_data: Vec<ResonanceData> = isotopes
+        .into_iter()
+        .map(|d| Arc::unwrap_or_clone(d.inner))
+        .collect();
 
     let init = initial_densities.unwrap_or_else(|| vec![0.001; n_isotopes]);
     if init.len() != n_isotopes {
@@ -1763,7 +1795,10 @@ fn py_fit_roi(
             format!("{}-{}", sym, d.inner.isotope.a())
         })
         .collect();
-    let res_data: Vec<ResonanceData> = isotopes.into_iter().map(|d| d.inner).collect();
+    let res_data: Vec<ResonanceData> = isotopes
+        .into_iter()
+        .map(|d| Arc::unwrap_or_clone(d.inner))
+        .collect();
 
     let init = initial_densities.unwrap_or_else(|| vec![0.001; n_isotopes]);
     if init.len() != n_isotopes {
@@ -2286,7 +2321,10 @@ fn py_trace_detectability_survey(
 
     let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution)?;
 
-    let candidates: Vec<ResonanceData> = trace_candidates.into_iter().map(|d| d.inner).collect();
+    let candidates: Vec<ResonanceData> = trace_candidates
+        .into_iter()
+        .map(|d| Arc::unwrap_or_clone(d.inner))
+        .collect();
 
     // Clone data to owned types so we can release the GIL.
     let e_owned = e.to_vec();
@@ -2362,7 +2400,10 @@ fn precompute_cross_sections<'py>(
         ));
     }
 
-    let res_data: Vec<ResonanceData> = isotopes.into_iter().map(|d| d.inner).collect();
+    let res_data: Vec<ResonanceData> = isotopes
+        .into_iter()
+        .map(|d| Arc::unwrap_or_clone(d.inner))
+        .collect();
     let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution)?;
     let instrument = res_fn.map(|r| InstrumentParams { resolution: r });
 
