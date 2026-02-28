@@ -28,7 +28,7 @@
 //! where R(E, E') = exp(-(E-E')²/W²) / (W·√π) is a Gaussian kernel
 //! with energy-dependent width W(E).
 
-use nereids_core::constants::{CROSS_SECTION_FLOOR, DIVISION_FLOOR};
+use nereids_core::constants::{DIVISION_FLOOR, NEAR_ZERO_FLOOR};
 use std::fmt;
 
 /// TOF conversion factor: t[μs] = TOF_FACTOR × L[m] / √(E[eV]).
@@ -107,7 +107,7 @@ pub fn resolution_broaden(
         let e = energies[i];
         let w = params.gaussian_width(e);
 
-        if w < CROSS_SECTION_FLOOR {
+        if w < NEAR_ZERO_FLOOR {
             broadened[i] = cross_sections[i];
             continue;
         }
@@ -489,7 +489,7 @@ fn interp_spectrum(energies: &[f64], spectrum: &[f64], e: f64) -> Option<f64> {
     // single-point grid where lo==hi), the denominator is zero.  Return the
     // value at the lower bracket to avoid NaN.
     let span = energies[hi] - energies[lo];
-    if span.abs() < CROSS_SECTION_FLOOR {
+    if span.abs() < NEAR_ZERO_FLOOR {
         return Some(spectrum[lo]);
     }
     let frac = (e - energies[lo]) / span;

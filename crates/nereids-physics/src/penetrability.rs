@@ -15,7 +15,7 @@
 //! The penetrability P_l(ρ), shift factor S_l(ρ), and hard-sphere phase
 //! shift φ_l(ρ) depend on orbital angular momentum l.
 
-use nereids_core::constants::CROSS_SECTION_FLOOR;
+use nereids_core::constants::NEAR_ZERO_FLOOR;
 
 /// Penetrability factor P_l(ρ) for orbital angular momentum l.
 ///
@@ -167,7 +167,7 @@ pub fn shift_factor_closed(l: u32, kappa: f64) -> f64 {
 /// upward recursion from the l=0 seed values:
 ///   f_0(iκ) = i·sinh(κ),  g_0(iκ) = cosh(κ)
 fn shift_factor_closed_general(l: u32, kappa: f64) -> f64 {
-    if kappa < CROSS_SECTION_FLOOR {
+    if kappa < NEAR_ZERO_FLOOR {
         return 0.0;
     }
 
@@ -191,7 +191,7 @@ fn shift_factor_closed_general(l: u32, kappa: f64) -> f64 {
 
     // f² + g² (complex square, not modulus squared); result is real
     let denom = f.0 * f.0 - f.1 * f.1 + g.0 * g.0 - g.1 * g.1;
-    if denom.abs() < CROSS_SECTION_FLOOR {
+    if denom.abs() < NEAR_ZERO_FLOOR {
         return 0.0;
     }
     numerator / denom
@@ -324,7 +324,7 @@ fn phase_shift_general(l: u32, rho: f64) -> f64 {
 ///
 /// j_l and n_l are spherical Bessel functions of the first and second kind.
 fn bessel_fg(l: u32, rho: f64) -> (f64, f64) {
-    if rho.abs() < CROSS_SECTION_FLOOR {
+    if rho.abs() < NEAR_ZERO_FLOOR {
         return if l == 0 {
             (0.0, -1.0)
         } else {

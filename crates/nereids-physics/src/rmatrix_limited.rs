@@ -58,7 +58,7 @@
 
 use num_complex::Complex64;
 
-use nereids_core::constants::{CROSS_SECTION_FLOOR, LOG_FLOOR, PIVOT_FLOOR, QUANTUM_NUMBER_EPS};
+use nereids_core::constants::{LOG_FLOOR, NEAR_ZERO_FLOOR, PIVOT_FLOOR, QUANTUM_NUMBER_EPS};
 use nereids_endf::resonance::{ParticlePair, RmlData, SpinGroup};
 
 use crate::{channel, coulomb, penetrability};
@@ -425,8 +425,8 @@ fn spin_group_cross_sections(
                     // whether |L_c| is actually near zero.
                     //
                     // Reference: SAMMY rml/mrml07.f — PH = 1/(S−B+iP).
-                    let inv_l = if l_c[c].norm_sqr() < CROSS_SECTION_FLOOR {
-                        // |L_c|² < CROSS_SECTION_FLOOR: use finite-but-large sentinel so the diagonal
+                    let inv_l = if l_c[c].norm_sqr() < NEAR_ZERO_FLOOR {
+                        // |L_c|² < NEAR_ZERO_FLOOR: use finite-but-large sentinel so the diagonal
                         // dominates and the channel decouples without overflow in inversion.
                         Complex64::new(1e30, 0.0)
                     } else {
@@ -451,7 +451,7 @@ fn spin_group_cross_sections(
             // level matrix; an imaginary perturbation would break unitarity.
             //
             // Use a *relative* epsilon: ε = |diag| × QUANTUM_NUMBER_EPS, with a floor of
-            // CROSS_SECTION_FLOOR for zero diagonals.  A fixed absolute epsilon
+            // NEAR_ZERO_FLOOR for zero diagonals.  A fixed absolute epsilon
             // could be comparable to or larger than the diagonal value itself
             // for high-L channels with very small penetrabilities (where
             // 1/L_c ~ 1/P_c can be enormous, but R_cc' is also large, making
@@ -471,8 +471,8 @@ fn spin_group_cross_sections(
             for (i, row) in y_reg.iter_mut().enumerate().take(nch) {
                 let diag_norm = row[i].norm();
                 // Relative regularization (QUANTUM_NUMBER_EPS × diagonal) with an
-                // absolute floor of CROSS_SECTION_FLOOR for near-zero diagonals.
-                let eps = (diag_norm * QUANTUM_NUMBER_EPS).max(CROSS_SECTION_FLOOR);
+                // absolute floor of NEAR_ZERO_FLOOR for near-zero diagonals.
+                let eps = (diag_norm * QUANTUM_NUMBER_EPS).max(NEAR_ZERO_FLOOR);
                 row[i] += Complex64::new(eps, 0.0);
             }
             match invert_complex_matrix(&y_reg, nch) {
