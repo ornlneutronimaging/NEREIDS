@@ -58,7 +58,7 @@
 
 use num_complex::Complex64;
 
-use nereids_core::constants::{CROSS_SECTION_FLOOR, LOG_FLOOR, QUANTUM_NUMBER_EPS};
+use nereids_core::constants::{CROSS_SECTION_FLOOR, LOG_FLOOR, PIVOT_FLOOR, QUANTUM_NUMBER_EPS};
 use nereids_endf::resonance::{ParticlePair, RmlData, SpinGroup};
 
 use crate::{channel, coulomb, penetrability};
@@ -508,7 +508,7 @@ fn spin_group_cross_sections(
             // catches most cases, but a channel right at threshold might not
             // be flagged closed yet have |L_c| ≈ 0.  The extra norm check
             // prevents NaN propagation.
-            let sqrt_p_over_l = if is_closed[c] || l_c[c].norm() < CROSS_SECTION_FLOOR {
+            let sqrt_p_over_l = if is_closed[c] || l_c[c].norm() < PIVOT_FLOOR {
                 Complex64::ZERO
             } else {
                 sqrt_p[c] / l_c[c]

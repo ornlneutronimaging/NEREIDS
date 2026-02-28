@@ -10,7 +10,7 @@
 //! ## SAMMY Reference
 //! - `fit/` module, manual Sec 4 (Bayes equations / generalized least-squares)
 
-use nereids_core::constants::PIVOT_FLOOR;
+use nereids_core::constants::{LM_DIAGONAL_FLOOR, PIVOT_FLOOR};
 
 use crate::parameters::ParameterSet;
 
@@ -186,7 +186,7 @@ fn solve_damped_system(a: &[Vec<f64>], b: &[f64], lambda: f64) -> Option<Vec<f64
         for j in 0..n {
             aug[i][j] = a[i][j];
         }
-        aug[i][i] += lambda * a[i][i].max(PIVOT_FLOOR); // Ensure non-zero diagonal
+        aug[i][i] += lambda * a[i][i].max(LM_DIAGONAL_FLOOR); // Ensure non-zero diagonal
         aug[i][n] = b[i];
     }
 

@@ -73,6 +73,11 @@ pub const CROSS_SECTION_FLOOR: f64 = 1e-60;
 /// (near-)singular system.
 pub const PIVOT_FLOOR: f64 = 1e-30;
 
+/// Floor for Levenberg-Marquardt diagonal elements to ensure damping stability.
+/// Intentionally much larger than PIVOT_FLOOR — LM requires a meaningful
+/// minimum curvature for numerical stability of the trust-region step.
+pub const LM_DIAGONAL_FLOOR: f64 = 1e-10;
+
 /// Floor for avoiding log(0) or division by zero in general computations.
 pub const LOG_FLOOR: f64 = 1e-300;
 
