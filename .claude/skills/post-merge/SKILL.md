@@ -48,7 +48,7 @@ multiple PRs. Stale incremental artifacts from worktrees cause spurious
 "can't find crate" errors with maturin.
 
 ```bash
-cargo clean
+pixi run clean
 pixi run build
 ```
 
