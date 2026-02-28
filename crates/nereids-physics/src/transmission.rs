@@ -161,8 +161,9 @@ pub struct InstrumentParams {
 /// # Errors
 /// * [`TransmissionError::Resolution`] — if resolution broadening is
 ///   enabled (`instrument` is `Some`) and `energies` is not sorted ascending.
-/// * [`TransmissionError::Doppler`] — if Doppler broadening parameters are
-///   invalid (non-positive AWR, non-finite or negative temperature).
+/// * [`TransmissionError::Doppler`] — if Doppler broadening is enabled
+///   (`temperature_k > 0.0`) and `DopplerParams` validation fails
+///   (e.g., non-positive or non-finite AWR).
 pub fn forward_model(
     energies: &[f64],
     sample: &SampleParams,
@@ -250,8 +251,9 @@ pub fn forward_model(
 ///   all tasks completed).
 /// * [`TransmissionError::Resolution`] — if resolution broadening is enabled
 ///   (`instrument` is `Some`) and `energies` is not sorted ascending.
-/// * [`TransmissionError::Doppler`] — if Doppler broadening parameters are
-///   invalid (non-positive AWR, non-finite or negative temperature).
+/// * [`TransmissionError::Doppler`] — if Doppler broadening is enabled
+///   (`temperature_k > 0.0`) and `DopplerParams` validation fails
+///   (e.g., non-positive or non-finite AWR).
 pub fn broadened_cross_sections(
     energies: &[f64],
     resonance_data: &[ResonanceData],
@@ -326,8 +328,9 @@ pub fn broadened_cross_sections(
 /// # Errors
 /// * [`TransmissionError::Resolution`] — if resolution broadening is
 ///   enabled (`instrument` is `Some`) and `energies` is not sorted ascending.
-/// * [`TransmissionError::Doppler`] — if Doppler broadening parameters are
-///   invalid (non-positive AWR, non-finite or negative temperature).
+/// * [`TransmissionError::Doppler`] — if Doppler broadening is enabled
+///   (`temperature_k > 0.0`) and `DopplerParams` validation fails
+///   (e.g., non-positive or non-finite AWR).
 pub fn broadened_cross_sections_with_derivative(
     energies: &[f64],
     resonance_data: &[ResonanceData],
@@ -339,7 +342,7 @@ pub fn broadened_cross_sections_with_derivative(
     let t_down = (temperature_k - dt).max(0.1); // stay physical
     let actual_2dt = t_up - t_down;
 
-    // No cancel token passed; ResolutionError or DopplerParamsError can occur.
+    // No cancel token passed; TransmissionError::{Resolution, Doppler} can occur.
     let xs_center =
         broadened_cross_sections(energies, resonance_data, temperature_k, instrument, None)?;
     let xs_up = broadened_cross_sections(energies, resonance_data, t_up, instrument, None)?;
