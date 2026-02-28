@@ -86,6 +86,17 @@ Lessons from review pipeline findings — apply these consistently:
   checks. Guard `is_empty()` or `> 0` separately.
 - **`debug_assert!` for impossible states**: use `obs.is_finite() &&
   obs >= 0.0` pattern — catches both NaN and negative in one assert.
+- **Magic number → named constant: preserve the value.** When replacing
+  numeric literals with named constants, verify that the constant's value
+  matches the original literal *exactly*. A `1e-30` guard replaced with a
+  `1e-60` constant silently loosens the threshold by 30 orders of magnitude.
+  Build a mapping table (literal → constant → value) before starting bulk
+  replacements, and grep-verify after.  (Lesson: PRs #135-#136 introduced
+  12+ threshold bugs this way; caught by Codex + Copilot across 3 rounds.)
+- **`debug_assert!` is not input validation.** Use `debug_assert!` only
+  for truly impossible internal states. For input validation (parser data,
+  config parameters), use hard errors (`return Err(...)`) that fire in
+  release builds too.
 
 ## Execution Model (mandatory)
 
