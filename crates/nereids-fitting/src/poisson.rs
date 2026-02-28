@@ -969,6 +969,10 @@ impl<'a> FitModel for CountsModel<'a> {
 /// (two-loop recursion for limited-memory BFGS).
 ///
 /// Uses a ring buffer to avoid shifting elements when the buffer is full.
+// TODO(perf): consider flat buffer with stride-based indexing for cache locality.
+// The current Vec<Vec<f64>> layout scatters s/y vectors across the heap; a single
+// contiguous allocation with stride = n_free would improve L1/L2 cache utilization
+// during the two-loop recursion, especially for large parameter vectors.
 struct LbfgsbMemory {
     /// Maximum number of correction pairs to store.
     m: usize,
@@ -1370,6 +1374,10 @@ pub fn poisson_fit_lbfgsb(
     }
 }
 
+// TODO(validation): add test comparing L-BFGS-B vs analytic on a SAMMY-derived
+// spectrum (e.g., U-238 single resonance at 6.674 eV with realistic noise).
+// This would verify that both optimizers recover the same density/temperature
+// to the same tolerance, catching any divergence in the shared gradient path.
 #[cfg(test)]
 mod tests {
     use super::*;
