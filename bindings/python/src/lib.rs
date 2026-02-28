@@ -731,7 +731,7 @@ fn fit_spectrum(
                     None,
                 )
                 .map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    pyo3::exceptions::PyValueError::new_err(format!(
                         "broadened_cross_sections failed: {}",
                         e
                     ))

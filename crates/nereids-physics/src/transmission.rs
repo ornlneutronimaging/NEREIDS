@@ -145,6 +145,10 @@ pub struct InstrumentParams {
 ///
 /// # Returns
 /// Theoretical transmission spectrum on the energy grid.
+///
+/// # Errors
+/// Returns [`TransmissionError::Resolution`] if resolution broadening is
+/// enabled (`instrument` is `Some`) and `energies` is not sorted ascending.
 pub fn forward_model(
     energies: &[f64],
     sample: &SampleParams,
@@ -217,11 +221,16 @@ pub fn forward_model(
 /// * `temperature_k`   — Sample temperature for Doppler broadening.
 /// * `instrument`      — Optional instrument resolution parameters.
 /// * `cancel`          — Optional cancellation token.  When set, the function
-///   returns `None` after completing the current isotope.
+///   returns `Err(TransmissionError::Cancelled)` after completing the current isotope.
 ///
 /// # Returns
-/// `Some(xs)` — one cross-section vector per isotope — on success.
-/// `None` if the `cancel` flag was observed between isotopes.
+/// One cross-section vector per isotope on success.
+///
+/// # Errors
+/// * [`TransmissionError::Cancelled`] — if the `cancel` flag was observed
+///   between isotopes.
+/// * [`TransmissionError::Resolution`] — if resolution broadening is enabled
+///   (`instrument` is `Some`) and `energies` is not sorted ascending.
 pub fn broadened_cross_sections(
     energies: &[f64],
     resonance_data: &[ResonanceData],
@@ -287,6 +296,10 @@ pub fn broadened_cross_sections(
 ///
 /// # Cost
 /// Three calls to `broadened_cross_sections` (at T, T+dT, T-dT).
+///
+/// # Errors
+/// Returns [`TransmissionError::Resolution`] if resolution broadening is
+/// enabled (`instrument` is `Some`) and `energies` is not sorted ascending.
 pub fn broadened_cross_sections_with_derivative(
     energies: &[f64],
     resonance_data: &[ResonanceData],
