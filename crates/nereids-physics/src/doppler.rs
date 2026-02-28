@@ -325,10 +325,10 @@ fn interpolate_cross_section(energies: &[f64], cross_sections: &[f64], energy: f
     // Guard against duplicate energy grid points: if e0 == e1 (or nearly so),
     // no interpolation is needed — use the value at that point directly.
     // Use a combined relative+absolute threshold that works across the full
-    // energy range (meV to MeV): |de| < |e0|·ε_mach + 1e-30.
+    // energy range (meV to MeV): |de| < |e0|·ε_mach + CROSS_SECTION_FLOOR.
     // The relative part handles large energies where f64::EPSILON alone would
     // miss near-duplicates; the absolute part handles energies near zero.
-    // This is consistent with resolution.rs interp_spectrum (which uses 1e-30).
+    // This is consistent with resolution.rs interp_spectrum.
     let e0 = energies[idx];
     let e1 = energies[idx + 1];
     let s0 = cross_sections[idx];

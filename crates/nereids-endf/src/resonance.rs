@@ -835,4 +835,45 @@ mod tests {
             "INT=4 at midpoint x=1: expected y=e={e:.6}, got {y:.6}"
         );
     }
+
+    #[test]
+    fn test_group_by_j() {
+        // Empty input
+        let groups = group_by_j(&[]);
+        assert!(groups.is_empty());
+
+        // Single resonance
+        let r1 = Resonance {
+            energy: 6.67,
+            j: 0.5,
+            gn: 0.001,
+            gg: 0.023,
+            gfa: 0.0,
+            gfb: 0.0,
+        };
+        let single = [r1.clone()];
+        let groups = group_by_j(&single);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].1.len(), 1);
+
+        // Multiple J values
+        let r2 = Resonance {
+            j: 1.5,
+            ..r1.clone()
+        };
+        let r3 = Resonance {
+            j: 0.5,
+            energy: 20.0,
+            ..r1.clone()
+        };
+        let multi = [r1, r2, r3];
+        let groups = group_by_j(&multi);
+        assert_eq!(groups.len(), 2); // J=0.5 and J=1.5
+        // J=0.5 group should have 2 resonances
+        let j05 = groups
+            .iter()
+            .find(|(j, _)| (*j - 0.5).abs() < 1e-10)
+            .unwrap();
+        assert_eq!(j05.1.len(), 2);
+    }
 }

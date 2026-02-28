@@ -67,6 +67,11 @@ pub const DIVISION_FLOOR: f64 = 1e-50;
 /// Terms below this are negligible and can be skipped.
 pub const CROSS_SECTION_FLOOR: f64 = 1e-60;
 
+/// Floor for pivot detection and division safety in numerical linear algebra
+/// (LM solver, Gaussian elimination). Values below this indicate a
+/// (near-)singular system.
+pub const PIVOT_FLOOR: f64 = 1e-30;
+
 /// Floor for avoiding log(0) or division by zero in general computations.
 pub const LOG_FLOOR: f64 = 1e-300;
 

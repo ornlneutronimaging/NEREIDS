@@ -16,7 +16,7 @@
 use nereids_endf::resonance::ResonanceData;
 use nereids_physics::transmission::{self, InstrumentParams};
 
-use nereids_core::constants::POISSON_EPSILON;
+use nereids_core::constants::{PIVOT_FLOOR, POISSON_EPSILON};
 
 use crate::lm::FitModel;
 use crate::parameters::ParameterSet;
@@ -184,11 +184,11 @@ fn compute_gradient(
 
         // #112: If the forward step is blocked by an upper bound, try the
         // backward step so the gradient component is not frozen at zero.
-        if actual_step.abs() < 1e-30 {
+        if actual_step.abs() < PIVOT_FLOOR {
             params.params[idx].value = original - step;
             params.params[idx].clamp();
             actual_step = params.params[idx].value - original;
-            if actual_step.abs() < 1e-30 {
+            if actual_step.abs() < PIVOT_FLOOR {
                 // Truly stuck at a point constraint — skip this parameter.
                 params.params[idx].value = original;
                 continue;
@@ -233,6 +233,12 @@ fn project(params: &mut ParameterSet) {
 /// # Returns
 /// `Some(new_nll)` if a step was accepted, `None` if the line search exhausted
 /// all backtracking attempts without finding an acceptable step.
+///
+/// # Failure contract
+///
+/// On `None` return (line search exhausted), `params` is left in the state
+/// of the last trial step, NOT restored to `old_free`. The caller MUST
+/// restore `params` via `params.set_free_values(old_free)` after receiving `None`.
 // All 9 arguments are genuinely needed: this is an extraction of inline code
 // shared between two callers that differ only in search_dir vs. grad.
 #[allow(clippy::too_many_arguments)]
@@ -728,7 +734,7 @@ pub fn poisson_fit_analytic(
             .iter()
             .zip(hessian_diag.iter())
             .map(|(&g, &h)| {
-                if h > 1e-30 {
+                if h > PIVOT_FLOOR {
                     g / h
                 } else {
                     // Pre-existing floor; when dy is extremely small, h can underflow.
