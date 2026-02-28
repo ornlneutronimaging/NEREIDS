@@ -179,6 +179,16 @@ fn compute_jacobian(
     // Try analytical Jacobian first (no extra evaluate calls).
     params.all_values_into(all_vals_buf);
     if let Some(j) = model.analytical_jacobian(all_vals_buf, &free_indices, y_current) {
+        debug_assert!(
+            j.nrows == n_data && j.ncols == n_free && j.data.len() == n_data * n_free,
+            "analytical_jacobian shape mismatch: got ({}x{}, len={}), expected ({}x{}, len={})",
+            j.nrows,
+            j.ncols,
+            j.data.len(),
+            n_data,
+            n_free,
+            n_data * n_free,
+        );
         return j;
     }
 
