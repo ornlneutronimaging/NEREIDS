@@ -26,7 +26,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use ndarray::{Array2, Array3};
+use ndarray::{Array2, Array3, s};
 use rayon::prelude::*;
 
 use nereids_endf::resonance::ResonanceData;
@@ -154,6 +154,14 @@ pub fn estimate_nuisance(
         None => (0..height, 0..width),
     };
 
+    // Transpose from (n_energies, height, width) to (height, width, n_energies)
+    // so that per-pixel spectrum accumulation accesses contiguous memory.
+    let ob_t: Array3<f64> = open_beam_counts
+        .view()
+        .permuted_axes([1, 2, 0])
+        .as_standard_layout()
+        .into_owned();
+
     let mut flux = vec![0.0f64; n_energies];
     let mut n_pixels: usize = 0;
 
@@ -162,8 +170,9 @@ pub fn estimate_nuisance(
             if dead_pixels.is_some_and(|m| m[[y, x]]) {
                 continue;
             }
+            let row = ob_t.slice(s![y, x, ..]);
             for e in 0..n_energies {
-                flux[e] += open_beam_counts[[e, y, x]];
+                flux[e] += row[e];
             }
             n_pixels += 1;
         }
@@ -283,6 +292,15 @@ pub fn sparse_reconstruct(
         )));
     }
 
+    // Transpose sample_counts from (n_energies, height, width) to (height, width, n_energies)
+    // so that each pixel's spectrum is contiguous in memory.  See spatial.rs for the
+    // full cache-friendliness rationale.
+    let counts_t: Array3<f64> = sample_counts
+        .view()
+        .permuted_axes([1, 2, 0])
+        .as_standard_layout()
+        .into_owned();
+
     // Precompute Doppler-broadened cross-sections once, outside the pixel loop.
     // The same XS apply to every pixel (same isotopes, same temperature, same energy grid).
     // Mirrors the pattern used in spatial.rs to avoid repeating expensive broadening work.
@@ -348,9 +366,12 @@ pub fn sparse_reconstruct(
                 return None;
             }
 
-            // Extract counts for this pixel
-            let y_obs: Vec<f64> = (0..n_energies)
-                .map(|e| sample_counts[[e, y, x]].max(0.0))
+            // Extract counts for this pixel from the transposed (h, w, n_energies) layout.
+            // The energy axis is now contiguous in memory, fitting in L1 cache.
+            let y_obs: Vec<f64> = counts_t
+                .slice(s![y, x, ..])
+                .iter()
+                .map(|&v| v.max(0.0))
                 .collect();
 
             // Build per-pixel transmission model reusing precomputed XS.
