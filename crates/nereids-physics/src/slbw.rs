@@ -26,12 +26,12 @@
 //! where Γ_n(E) = Γ_n(E_r) × √(E/E_r) × P_l(E)/P_l(E_r)
 //! and Γ = Γ_n(E) + Γ_γ + Γ_f
 
-use nereids_core::constants::{DIVISION_FLOOR, PIVOT_FLOOR, QUANTUM_NUMBER_EPS};
+use nereids_core::constants::{DIVISION_FLOOR, PIVOT_FLOOR};
 use nereids_endf::resonance::ResonanceData;
 
 use crate::channel;
 use crate::penetrability;
-use crate::reich_moore::CrossSections;
+use crate::reich_moore::{CrossSections, PrecomputedJGroup, group_resonances_by_j};
 
 // ─── Per-resonance precomputed invariants for SLBW ────────────────────────────
 //
@@ -61,18 +61,16 @@ pub(crate) struct PrecomputedSlbwResonance {
     pub(crate) p_at_er: f64,
 }
 
-/// Pre-computed J-group for SLBW.
-pub(crate) struct PrecomputedSlbwJGroup {
-    /// Statistical weight g_J.
-    pub(crate) g_j: f64,
-    /// Pre-computed per-resonance quantities for this J-group.
-    pub(crate) resonances: Vec<PrecomputedSlbwResonance>,
-}
+/// Pre-computed J-group for SLBW (type alias for the generic J-group).
+pub(crate) type PrecomputedSlbwJGroup = PrecomputedJGroup<PrecomputedSlbwResonance>;
 
 /// Build pre-computed J-groups for SLBW.
 ///
 /// All quantities depend only on resonance parameters (not incident energy),
 /// so the result can be computed once and reused across all energy points.
+///
+/// Uses the shared `group_resonances_by_j` helper (Issue #158) with an
+/// SLBW-specific closure for per-resonance invariant construction.
 pub(crate) fn precompute_slbw_jgroups(
     resonances: &[nereids_endf::resonance::Resonance],
     l: u32,
@@ -81,11 +79,7 @@ pub(crate) fn precompute_slbw_jgroups(
     l_group: &nereids_endf::resonance::LGroup,
     target_spin: f64,
 ) -> Vec<PrecomputedSlbwJGroup> {
-    let mut j_values: Vec<f64> = Vec::new();
-    let mut groups: Vec<PrecomputedSlbwJGroup> = Vec::new();
-
-    for res in resonances {
-        let j = res.j;
+    group_resonances_by_j(resonances, target_spin, |res| {
         let e_r = res.energy;
 
         // Pre-compute P_l(E_r) — this is the redundant computation Issue #87 eliminates.
@@ -101,28 +95,14 @@ pub(crate) fn precompute_slbw_jgroups(
             0.0 // Will produce gamma_n = 0 in the energy loop
         };
 
-        let precomp = PrecomputedSlbwResonance {
+        PrecomputedSlbwResonance {
             energy: e_r,
             gamma_g: res.gg,
             gamma_f: res.gfa.abs() + res.gfb.abs(),
             gn_abs: res.gn.abs(),
             p_at_er,
-        };
-
-        if let Some(idx) = j_values
-            .iter()
-            .position(|&gj| (gj - j).abs() < QUANTUM_NUMBER_EPS)
-        {
-            groups[idx].resonances.push(precomp);
-        } else {
-            j_values.push(j);
-            groups.push(PrecomputedSlbwJGroup {
-                g_j: channel::statistical_weight(j, target_spin),
-                resonances: vec![precomp],
-            });
         }
-    }
-    groups
+    })
 }
 
 /// Compute SLBW cross-sections at a single energy.

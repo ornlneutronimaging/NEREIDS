@@ -786,7 +786,7 @@ pub fn poisson_fit_analytic(
                 t_current,
                 ctx.instrument.as_ref(),
             )
-            .expect("poisson_fit_analytic: energy grid must be sorted ascending");
+            .expect("poisson_fit_analytic: broadening failed (energy grid must be sorted ascending and Doppler params must be valid)");
             xs_owned = xs_new;
             dxs_dt = dxs_new;
         }
@@ -1246,7 +1246,7 @@ pub fn poisson_fit_lbfgsb(
                 t_current,
                 ctx.instrument.as_ref(),
             )
-            .expect("poisson_fit_lbfgsb: energy grid must be sorted ascending");
+            .expect("poisson_fit_lbfgsb: broadening failed (energy grid must be sorted ascending and Doppler params must be valid)");
             xs_owned = xs_new;
             dxs_dt = dxs_new;
         }

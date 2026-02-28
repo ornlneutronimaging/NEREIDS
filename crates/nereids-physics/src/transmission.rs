@@ -29,7 +29,7 @@ use rayon::prelude::*;
 
 use nereids_endf::resonance::ResonanceData;
 
-use crate::doppler::{self, DopplerParams};
+use crate::doppler::{self, DopplerParams, DopplerParamsError};
 use crate::reich_moore;
 use crate::resolution::{self, ResolutionError, ResolutionFunction};
 
@@ -38,6 +38,8 @@ use crate::resolution::{self, ResolutionError, ResolutionFunction};
 pub enum TransmissionError {
     /// The energy grid is not sorted or has a length mismatch with data.
     Resolution(ResolutionError),
+    /// Doppler broadening parameter validation failed.
+    Doppler(DopplerParamsError),
     /// Computation was cancelled via the cancel token.
     Cancelled,
 }
@@ -46,6 +48,7 @@ impl fmt::Display for TransmissionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Resolution(e) => write!(f, "resolution broadening error: {}", e),
+            Self::Doppler(e) => write!(f, "Doppler parameter error: {}", e),
             Self::Cancelled => write!(f, "computation cancelled"),
         }
     }
@@ -55,6 +58,7 @@ impl std::error::Error for TransmissionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Resolution(e) => Some(e),
+            Self::Doppler(e) => Some(e),
             Self::Cancelled => None,
         }
     }
@@ -63,6 +67,12 @@ impl std::error::Error for TransmissionError {
 impl From<ResolutionError> for TransmissionError {
     fn from(e: ResolutionError) -> Self {
         Self::Resolution(e)
+    }
+}
+
+impl From<DopplerParamsError> for TransmissionError {
+    fn from(e: DopplerParamsError) -> Self {
+        Self::Doppler(e)
     }
 }
 
@@ -149,8 +159,11 @@ pub struct InstrumentParams {
 /// Theoretical transmission spectrum on the energy grid.
 ///
 /// # Errors
-/// Returns [`TransmissionError::Resolution`] if resolution broadening is
-/// enabled (`instrument` is `Some`) and `energies` is not sorted ascending.
+/// * [`TransmissionError::Resolution`] — if resolution broadening is
+///   enabled (`instrument` is `Some`) and `energies` is not sorted ascending.
+/// * [`TransmissionError::Doppler`] — if Doppler broadening is enabled
+///   (`temperature_k > 0.0`) and `DopplerParams` validation fails
+///   (e.g., non-positive or non-finite AWR).
 pub fn forward_model(
     energies: &[f64],
     sample: &SampleParams,
@@ -170,7 +183,7 @@ pub fn forward_model(
 
     // Compute broadened cross-sections for all isotopes in parallel.
     // Each isotope's Doppler + resolution broadening is independent.
-    let broadened: Vec<(Vec<f64>, f64)> = sample
+    let broadened: Result<Vec<(Vec<f64>, f64)>, TransmissionError> = sample
         .isotopes
         .par_iter()
         .filter(|(_, thickness)| *thickness > 0.0)
@@ -183,13 +196,7 @@ pub fn forward_model(
 
             // 2. Apply Doppler broadening
             let after_doppler = if sample.temperature_k > 0.0 {
-                let doppler_params = DopplerParams::new(sample.temperature_k, res_data.awr)
-                    .unwrap_or_else(|e| {
-                        panic!(
-                            "DopplerParams validation failed in forward_model: {} (temperature_k={}, awr={})",
-                            e, sample.temperature_k, res_data.awr
-                        )
-                    });
+                let doppler_params = DopplerParams::new(sample.temperature_k, res_data.awr)?;
                 doppler::doppler_broaden(energies, &unbroadened, &doppler_params)
             } else {
                 unbroadened
@@ -202,9 +209,10 @@ pub fn forward_model(
                 after_doppler
             };
 
-            (after_resolution, *thickness)
+            Ok((after_resolution, *thickness))
         })
         .collect();
+    let broadened = broadened?;
 
     // 4. Accumulate total attenuation: Σᵢ thicknessᵢ × σᵢ(E)
     let mut total_attenuation = vec![0.0f64; n];
@@ -243,6 +251,9 @@ pub fn forward_model(
 ///   all tasks completed).
 /// * [`TransmissionError::Resolution`] — if resolution broadening is enabled
 ///   (`instrument` is `Some`) and `energies` is not sorted ascending.
+/// * [`TransmissionError::Doppler`] — if Doppler broadening is enabled
+///   (`temperature_k > 0.0`) and `DopplerParams` validation fails
+///   (e.g., non-positive or non-finite AWR).
 pub fn broadened_cross_sections(
     energies: &[f64],
     resonance_data: &[ResonanceData],
@@ -274,13 +285,7 @@ pub fn broadened_cross_sections(
 
             // 2. Doppler broadening
             let after_doppler = if temperature_k > 0.0 {
-                let params = DopplerParams::new(temperature_k, rd.awr)
-                    .unwrap_or_else(|e| {
-                        panic!(
-                            "DopplerParams validation failed in broadened_cross_sections: {} (temperature_k={}, awr={})",
-                            e, temperature_k, rd.awr
-                        )
-                    });
+                let params = DopplerParams::new(temperature_k, rd.awr)?;
                 doppler::doppler_broaden(energies, &unbroadened, &params)
             } else {
                 unbroadened
@@ -321,8 +326,11 @@ pub fn broadened_cross_sections(
 /// Three calls to `broadened_cross_sections` (at T, T+dT, T-dT).
 ///
 /// # Errors
-/// Returns [`TransmissionError::Resolution`] if resolution broadening is
-/// enabled (`instrument` is `Some`) and `energies` is not sorted ascending.
+/// * [`TransmissionError::Resolution`] — if resolution broadening is
+///   enabled (`instrument` is `Some`) and `energies` is not sorted ascending.
+/// * [`TransmissionError::Doppler`] — if Doppler broadening is enabled
+///   (`temperature_k > 0.0`) and `DopplerParams` validation fails
+///   (e.g., non-positive or non-finite AWR).
 pub fn broadened_cross_sections_with_derivative(
     energies: &[f64],
     resonance_data: &[ResonanceData],
@@ -334,7 +342,7 @@ pub fn broadened_cross_sections_with_derivative(
     let t_down = (temperature_k - dt).max(0.1); // stay physical
     let actual_2dt = t_up - t_down;
 
-    // No cancel token passed, so only ResolutionError can occur.
+    // No cancel token passed; TransmissionError::{Resolution, Doppler} can occur.
     let xs_center =
         broadened_cross_sections(energies, resonance_data, temperature_k, instrument, None)?;
     let xs_up = broadened_cross_sections(energies, resonance_data, t_up, instrument, None)?;
