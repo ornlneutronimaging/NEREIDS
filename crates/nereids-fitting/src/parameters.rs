@@ -16,6 +16,7 @@
 #[derive(Debug, Clone)]
 pub struct FitParameter {
     /// Parameter name (for reporting).
+    // TODO(perf): consider Arc<str> if profiling shows parameter cloning is a bottleneck
     pub name: String,
     /// Current value.
     pub value: f64,

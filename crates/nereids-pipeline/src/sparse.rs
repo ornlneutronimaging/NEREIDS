@@ -301,6 +301,16 @@ pub fn sparse_reconstruct(
 
     // Pre-build parameter template outside the pixel loop so that per-pixel
     // iterations only need a cheap Clone (no String formatting via format!).
+    //
+    // Why clone instead of reconstruct?  ParameterSet::new + FitParameter
+    // constructors allocate one String per parameter per pixel (via
+    // `name.into()`).  Cloning an existing ParameterSet copies the Vec of
+    // FitParameter (which clones each String), but avoids re-running the
+    // format!/Into<String> conversion logic and re-evaluating the isotope
+    // name lookup.  At 1-4 isotopes the cost difference is tiny, but the
+    // pattern makes intent clear: the template is the single source of truth
+    // for parameter layout, bounds, and initial values.
+    //
     // isotope_names.len() == n_isotopes is validated above, so direct indexing
     // is safe — the previous .get(i).unwrap_or_else(|| format!(...)) fallback
     // was unreachable dead code.

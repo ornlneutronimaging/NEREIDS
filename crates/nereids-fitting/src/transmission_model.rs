@@ -32,6 +32,9 @@ pub struct PrecomputedTransmissionModel {
     ///
     /// Wrapped in `Arc` so that parallel pixel loops can share one copy
     /// via cheap reference-count increments instead of deep-cloning per pixel.
+    ///
+    /// Kept `pub` (not `pub(crate)`) because the Python bindings
+    /// (`nereids-python`) construct and access this field directly.
     pub density_indices: Arc<Vec<usize>>,
 }
 
