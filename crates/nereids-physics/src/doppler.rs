@@ -683,14 +683,16 @@ mod tests {
         );
 
         // Exercise the `de.abs() < |e0|*EPS + CROSS_SECTION_FLOOR` threshold
-        // with near-zero adjacent energies where de is essentially zero
-        // (triggers the absolute CROSS_SECTION_FLOOR floor, not the relative part).
-        let tiny_energies = vec![1e-40, 1e-40 + 1e-105, 1.0];
+        // with near-zero adjacent energies where de is essentially zero.
+        // With e0 = 1e-50, the relative term |e0|*EPS ≈ 2e-66 is smaller
+        // than CROSS_SECTION_FLOOR (1e-60), so the absolute floor dominates.
+        let tiny_energies = vec![1e-50, 1e-50 + 1e-105, 1.0];
         let tiny_xs = vec![100.0, 200.0, 300.0];
         // Query between the two near-zero points: de ≈ 1e-105 which is
-        // far below the absolute threshold CROSS_SECTION_FLOOR (1e-60)
-        // plus the relative term (|1e-40| * EPS ≈ 2e-56), so the guard fires.
-        let result3 = interpolate_cross_section(&tiny_energies, &tiny_xs, 1e-40 + 5e-106);
+        // far below the absolute threshold CROSS_SECTION_FLOOR (1e-60),
+        // and the relative term (|1e-50| * EPS ≈ 2e-66) is even smaller,
+        // so the absolute floor is the binding constraint.
+        let result3 = interpolate_cross_section(&tiny_energies, &tiny_xs, 1e-50 + 5e-106);
         assert!(
             result3.is_finite(),
             "Near-zero de should be caught by the absolute threshold, got {result3}"

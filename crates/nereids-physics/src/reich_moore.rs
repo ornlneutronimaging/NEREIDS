@@ -33,7 +33,7 @@
 
 use num_complex::Complex64;
 
-use nereids_core::constants::{CROSS_SECTION_FLOOR, DIVISION_FLOOR, LOG_FLOOR};
+use nereids_core::constants::{DIVISION_FLOOR, LOG_FLOOR, PIVOT_FLOOR};
 use nereids_endf::resonance::{
     ResonanceData, ResonanceFormalism, ResonanceRange, Tab1, group_by_j,
 };
@@ -355,7 +355,7 @@ fn reich_moore_spin_group(
     // Determine if any resonance has fission widths.
     let has_fission = resonances
         .iter()
-        .any(|r| r.gfa.abs() > CROSS_SECTION_FLOOR || r.gfb.abs() > CROSS_SECTION_FLOOR);
+        .any(|r| r.gfa.abs() > PIVOT_FLOOR || r.gfb.abs() > PIVOT_FLOOR);
 
     if has_fission {
         // Multi-channel case: neutron + fission channels.
@@ -403,7 +403,7 @@ fn reich_moore_spin_group(
         // so the penetrability must be evaluated at the resonance energy
         // using the channel radius AP(E_r) — not the incident-energy AP(E).
         // For NRO=0 (constant AP) this makes no difference.
-        let p_at_er = if e_r.abs() > CROSS_SECTION_FLOOR {
+        let p_at_er = if e_r.abs() > PIVOT_FLOOR {
             let radius_at_er = ap_table.map_or(channel_radius, |t| t.evaluate(e_r.abs()));
             let rho_r = channel::rho(e_r.abs(), awr, radius_at_er);
             penetrability::penetrability(l, rho_r)
@@ -411,7 +411,7 @@ fn reich_moore_spin_group(
             p_l // Fallback: use current-energy penetrability
         };
 
-        let gamma_n_reduced_sq = if p_at_er > CROSS_SECTION_FLOOR {
+        let gamma_n_reduced_sq = if p_at_er > PIVOT_FLOOR {
             gamma_n.abs() / (2.0 * p_at_er)
         } else {
             0.0
@@ -518,7 +518,7 @@ fn reich_moore_with_fission(
     ap_table: Option<&Tab1>,
 ) -> (f64, f64, f64, f64) {
     // Determine number of fission channels (1 or 2).
-    let has_two_fission = resonances.iter().any(|r| r.gfb.abs() > CROSS_SECTION_FLOOR);
+    let has_two_fission = resonances.iter().any(|r| r.gfb.abs() > PIVOT_FLOOR);
     let n_channels = if has_two_fission { 3 } else { 2 }; // neutron + fission(s)
 
     let boundary = 0.0;
@@ -536,7 +536,7 @@ fn reich_moore_with_fission(
 
             // Reduced width amplitudes.
             // Use AP(E_r) for the resonance-energy penetrability (ENDF width convention).
-            let p_at_er = if e_r.abs() > CROSS_SECTION_FLOOR {
+            let p_at_er = if e_r.abs() > PIVOT_FLOOR {
                 let radius_at_er = ap_table.map_or(channel_radius, |t| t.evaluate(e_r.abs()));
                 let rho_r = channel::rho(e_r.abs(), awr, radius_at_er);
                 penetrability::penetrability(l, rho_r)
@@ -545,7 +545,7 @@ fn reich_moore_with_fission(
             };
 
             // β_n = sqrt(|Γ_n| / (2·P_l(E_r))), sign from Γ_n sign
-            let beta_n = if p_at_er > CROSS_SECTION_FLOOR {
+            let beta_n = if p_at_er > PIVOT_FLOOR {
                 let sign = if gamma_n >= 0.0 { 1.0 } else { -1.0 };
                 sign * (gamma_n.abs() / (2.0 * p_at_er)).sqrt()
             } else {
@@ -687,7 +687,7 @@ fn reich_moore_3channel(
         let gamma_fb = res.gfb;
 
         // Use AP(E_r) for the resonance-energy penetrability (ENDF width convention).
-        let p_at_er = if e_r.abs() > CROSS_SECTION_FLOOR {
+        let p_at_er = if e_r.abs() > PIVOT_FLOOR {
             let radius_at_er = ap_table.map_or(channel_radius, |t| t.evaluate(e_r.abs()));
             let rho_r = channel::rho(e_r.abs(), awr, radius_at_er);
             penetrability::penetrability(l, rho_r)
@@ -695,7 +695,7 @@ fn reich_moore_3channel(
             p_l
         };
 
-        let beta_n = if p_at_er > CROSS_SECTION_FLOOR {
+        let beta_n = if p_at_er > PIVOT_FLOOR {
             let sign = if gamma_n >= 0.0 { 1.0 } else { -1.0 };
             sign * (gamma_n.abs() / (2.0 * p_at_er)).sqrt()
         } else {

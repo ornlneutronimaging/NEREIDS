@@ -26,7 +26,7 @@
 //! where Γ_n(E) = Γ_n(E_r) × √(E/E_r) × P_l(E)/P_l(E_r)
 //! and Γ = Γ_n(E) + Γ_γ + Γ_f
 
-use nereids_core::constants::{CROSS_SECTION_FLOOR, DIVISION_FLOOR};
+use nereids_core::constants::{DIVISION_FLOOR, PIVOT_FLOOR};
 use nereids_endf::resonance::{ResonanceData, group_by_j};
 
 use crate::channel;
@@ -134,7 +134,7 @@ pub fn slbw_cross_sections_for_range(
                 // Γ_n(E) = Γ_n(E_r) × √(E/E_r) × P_l(E)/P_l(E_r)
                 // P_l(E_r) uses the channel radius evaluated at the resonance
                 // energy (ENDF §2.2.1 NRO=1: AP is tabulated, not constant).
-                let gamma_n = if e_r.abs() > CROSS_SECTION_FLOOR {
+                let gamma_n = if e_r.abs() > PIVOT_FLOOR {
                     let radius_at_er = if l_group.apl > 0.0 {
                         l_group.apl
                     } else {
@@ -143,7 +143,7 @@ pub fn slbw_cross_sections_for_range(
                     let rho_r = channel::rho(e_r.abs(), awr_l, radius_at_er);
                     let p_at_e = penetrability::penetrability(l, rho);
                     let p_at_er = penetrability::penetrability(l, rho_r);
-                    if p_at_er > CROSS_SECTION_FLOOR {
+                    if p_at_er > PIVOT_FLOOR {
                         res.gn.abs() * (energy_ev / e_r.abs()).sqrt() * p_at_e / p_at_er
                     } else {
                         0.0
