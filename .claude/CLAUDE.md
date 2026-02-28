@@ -68,8 +68,13 @@ Run `/review-pipeline` to execute the full pipeline across active worktrees.
 and merge. Dismiss Copilot comments that rehash addressed issues or flag
 impossible edge cases.
 
-**Post-merge**: always run `cargo test --workspace --exclude nereids-python`
-on the merged main to catch cross-PR integration regressions.
+**Post-merge**: always run both test suites on the merged main to catch
+cross-PR integration regressions:
+
+```
+cargo test --workspace --exclude nereids-python
+pixi run test-python
+```
 
 ## Validation Patterns
 
@@ -97,6 +102,18 @@ Lessons from review pipeline findings — apply these consistently:
   for truly impossible internal states. For input validation (parser data,
   config parameters), use hard errors (`return Err(...)`) that fire in
   release builds too.
+- **Subagent prompts must specify tooling.** Always tell subagents to use
+  `pixi run build` / `pixi run test-python` — never raw `maturin develop`
+  or `pip install`.  Agents don't inherit this context automatically.
+- **Check existing patterns before introducing new API calls.** When a
+  subagent adds new code to an existing file (e.g., PyO3 bindings), the
+  prompt must say "match the patterns already used in this file" — not
+  invent new ones.  (Lesson: fix agent used `Python::with_gil()` which
+  doesn't exist; should have matched `py.detach()` at L643/L723.)
+- **Check sibling repos for solved problems.** Before designing CI
+  workflows or build configurations, check `../bm3dornl` and other
+  sibling projects for existing patterns.  (Lesson: pixi-based CI was
+  already working in bm3dornl; we wasted a round on a manual venv hack.)
 
 ## Execution Model (mandatory)
 
