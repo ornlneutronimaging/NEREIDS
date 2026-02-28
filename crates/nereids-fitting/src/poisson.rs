@@ -239,6 +239,8 @@ fn project(params: &mut ParameterSet) {
 /// * `all_vals_buf` — Scratch buffer for `params.all_values_into()`, reused
 ///   across the up-to-50 backtracking iterations to avoid per-trial allocation.
 /// * `free_vals_buf`— Scratch buffer for `params.free_values_into()`.
+/// * `trial_free_buf` — Scratch buffer for the trial free-parameter vector,
+///   reused across backtracking iterations to avoid up to 50 allocations.
 ///
 /// # Returns
 /// `Some(new_nll)` if a step was accepted, `None` if the line search exhausted
@@ -248,7 +250,7 @@ fn project(params: &mut ParameterSet) {
 ///
 /// On `None` return (line search exhausted), `params` is restored to
 /// `old_free` before returning. Callers need not restore manually.
-// All 11 arguments are genuinely needed: 9 original + 2 scratch buffers that
+// All 12 arguments are genuinely needed: 9 original + 3 scratch buffers that
 // avoid per-backtracking-iteration allocations inside the 50-trial loop.
 #[allow(clippy::too_many_arguments)]
 fn backtracking_line_search(
@@ -263,16 +265,19 @@ fn backtracking_line_search(
     nll: f64,
     all_vals_buf: &mut Vec<f64>,
     free_vals_buf: &mut Vec<f64>,
+    trial_free_buf: &mut Vec<f64>,
 ) -> Option<f64> {
     let mut alpha = initial_alpha;
     for _ in 0..50 {
         // Trial step: x_new = project(x - alpha * search_dir)
-        let trial_free: Vec<f64> = old_free
-            .iter()
-            .zip(search_dir.iter())
-            .map(|(&v, &d)| v - alpha * d)
-            .collect();
-        params.set_free_values(&trial_free);
+        trial_free_buf.clear();
+        trial_free_buf.extend(
+            old_free
+                .iter()
+                .zip(search_dir.iter())
+                .map(|(&v, &d)| v - alpha * d),
+        );
+        params.set_free_values(trial_free_buf);
         project(params);
 
         params.all_values_into(all_vals_buf);
@@ -355,6 +360,8 @@ pub fn poisson_fit(
     // and backtracking_line_search (up to 50 calls).
     let mut all_vals_buf = Vec::with_capacity(params.params.len());
     let mut free_vals_buf = Vec::with_capacity(params.n_free());
+    let mut old_free_buf: Vec<f64> = Vec::with_capacity(params.n_free());
+    let mut trial_free_buf: Vec<f64> = Vec::with_capacity(params.n_free());
 
     params.all_values_into(&mut all_vals_buf);
     let y_model = model.evaluate(&all_vals_buf);
@@ -384,14 +391,15 @@ pub fn poisson_fit(
         // step wildly overshoots, and 30 backtracking halvings are not enough to
         // recover—causing the line search to fail even far from the optimum.
         params.free_values_into(&mut free_vals_buf);
-        let old_free = free_vals_buf.clone();
+        old_free_buf.clear();
+        old_free_buf.extend_from_slice(&free_vals_buf);
         let initial_alpha = config.step_size / grad_norm.max(1.0);
 
         match backtracking_line_search(
             model,
             params,
             y_obs,
-            &old_free,
+            &old_free_buf,
             &grad,
             initial_alpha,
             config,
@@ -399,6 +407,7 @@ pub fn poisson_fit(
             nll,
             &mut all_vals_buf,
             &mut free_vals_buf,
+            &mut trial_free_buf,
         ) {
             Some(new_nll) => nll = new_nll,
             None => {
@@ -414,7 +423,7 @@ pub fn poisson_fit(
         // step has a tiny relative change.  Parameter displacement is a
         // scale-invariant and physically meaningful stopping criterion.
         params.free_values_into(&mut free_vals_buf);
-        let step_norm: f64 = old_free
+        let step_norm: f64 = old_free_buf
             .iter()
             .zip(free_vals_buf.iter())
             .map(|(o, n)| (o - n).powi(2))
@@ -598,6 +607,8 @@ pub fn poisson_fit_analytic(
     // all_values + free_values calls per iteration.
     let mut all_vals_buf = Vec::with_capacity(params.params.len());
     let mut free_vals_buf = Vec::with_capacity(params.n_free());
+    let mut old_free_buf: Vec<f64> = Vec::with_capacity(params.n_free());
+    let mut trial_free_buf: Vec<f64> = Vec::with_capacity(params.n_free());
 
     params.all_values_into(&mut all_vals_buf);
     let y_model = model.evaluate(&all_vals_buf);
@@ -728,7 +739,8 @@ pub fn poisson_fit_analytic(
         // When temp_ctx is None, the preconditioner is still applied
         // (harmless: all density parameters have similar curvature).
         params.free_values_into(&mut free_vals_buf);
-        let old_free = free_vals_buf.clone();
+        old_free_buf.clear();
+        old_free_buf.extend_from_slice(&free_vals_buf);
 
         // Compute diagonal Fisher information for preconditioning.
         let hessian_diag: Vec<f64> = param_isotopes
@@ -788,7 +800,7 @@ pub fn poisson_fit_analytic(
             model,
             params,
             y_obs,
-            &old_free,
+            &old_free_buf,
             &search_dir,
             initial_alpha,
             config,
@@ -796,6 +808,7 @@ pub fn poisson_fit_analytic(
             nll,
             &mut all_vals_buf,
             &mut free_vals_buf,
+            &mut trial_free_buf,
         ) {
             Some(new_nll) => nll = new_nll,
             None => {
@@ -806,7 +819,7 @@ pub fn poisson_fit_analytic(
 
         // Convergence: parameter displacement (see poisson_fit for rationale).
         params.free_values_into(&mut free_vals_buf);
-        let step_norm: f64 = old_free
+        let step_norm: f64 = old_free_buf
             .iter()
             .zip(free_vals_buf.iter())
             .map(|(o, n)| (o - n).powi(2))
