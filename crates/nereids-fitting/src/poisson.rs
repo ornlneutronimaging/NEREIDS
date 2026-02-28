@@ -236,9 +236,8 @@ fn project(params: &mut ParameterSet) {
 ///
 /// # Failure contract
 ///
-/// On `None` return (line search exhausted), `params` is left in the state
-/// of the last trial step, NOT restored to `old_free`. The caller MUST
-/// restore `params` via `params.set_free_values(old_free)` after receiving `None`.
+/// On `None` return (line search exhausted), `params` is restored to
+/// `old_free` before returning. Callers need not restore manually.
 // All 9 arguments are genuinely needed: this is an extraction of inline code
 // shared between two callers that differ only in search_dir vs. grad.
 #[allow(clippy::too_many_arguments)]
@@ -290,6 +289,7 @@ fn backtracking_line_search(
         // Backtrack
         alpha *= config.backtrack;
     }
+    params.set_free_values(old_free);
     None
 }
 
@@ -378,8 +378,8 @@ pub fn poisson_fit(
         ) {
             Some(new_nll) => nll = new_nll,
             None => {
-                params.set_free_values(&old_free);
                 // Can't improve from this point; stop without claiming convergence.
+                // (params already restored by backtracking_line_search)
                 break;
             }
         }
@@ -759,7 +759,7 @@ pub fn poisson_fit_analytic(
         ) {
             Some(new_nll) => nll = new_nll,
             None => {
-                params.set_free_values(&old_free);
+                // (params already restored by backtracking_line_search)
                 break;
             }
         }

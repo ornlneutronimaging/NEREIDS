@@ -66,7 +66,7 @@ pub const DIVISION_FLOOR: f64 = 1e-50;
 /// Generic tiny positive floor used as a near-zero tolerance across physics
 /// calculations (e.g., cross-sections in barns, energies in eV, widths,
 /// dimensionless parameters). Values below this are treated as negligible.
-pub const CROSS_SECTION_FLOOR: f64 = 1e-60;
+pub const NEAR_ZERO_FLOOR: f64 = 1e-60;
 
 /// Floor for pivot detection and division safety in numerical linear algebra
 /// (LM solver, Gaussian elimination). Values below this indicate a
