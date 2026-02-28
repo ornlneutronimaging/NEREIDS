@@ -479,6 +479,44 @@ mod tests {
     }
 
     #[test]
+    fn test_estimate_nuisance_nonzero_roi_with_dead_pixel() {
+        // 3 energies × 4 height × 4 width
+        let n_e = 3;
+        let h = 4;
+        let w = 4;
+        let mut ob = Array3::from_elem((n_e, h, w), 50.0);
+
+        // Give ROI pixels distinct values so the average is verifiable.
+        // ROI: y=1..3, x=1..3 → a 2×2 sub-grid of the 4×4 image.
+        //   (1,1)=100  (1,2)=200
+        //   (2,1)=300  (2,2)=400   ← this pixel will be dead
+        for e in 0..n_e {
+            ob[[e, 1, 1]] = 100.0;
+            ob[[e, 1, 2]] = 200.0;
+            ob[[e, 2, 1]] = 300.0;
+            ob[[e, 2, 2]] = 400.0;
+        }
+
+        // Dead-pixel mask: only (2,2) is dead (global coords, inside the ROI).
+        let mut dead = Array2::from_elem((h, w), false);
+        dead[[2, 2]] = true;
+
+        let roi = Some((1..3usize, 1..3usize));
+        let nuisance = estimate_nuisance(&ob, roi, Some(&dead)).unwrap();
+
+        // Live pixels in ROI: (1,1)=100, (1,2)=200, (2,1)=300.
+        // Expected average = (100 + 200 + 300) / 3 = 200.
+        assert_eq!(nuisance.flux.len(), n_e);
+        for &f in &nuisance.flux {
+            assert!((f - 200.0).abs() < 1e-10, "expected flux ~200.0, got {f}",);
+        }
+        // Background is zero (hardcoded).
+        for &b in &nuisance.background {
+            assert!((b).abs() < 1e-10);
+        }
+    }
+
+    #[test]
     fn test_estimate_nuisance_rejects_dead_pixel_shape_mismatch() {
         let n_e = 5;
         let ob = Array3::from_elem((n_e, 2, 2), 100.0);
