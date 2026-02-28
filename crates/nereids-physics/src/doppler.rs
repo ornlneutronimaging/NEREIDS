@@ -27,21 +27,97 @@
 //! The SAMMY Doppler width at energy E is:
 //!   Δ_D(E) = √(4·k_B·T·E / AWR)
 
+use std::fmt;
+
 use nereids_core::constants::{self, DIVISION_FLOOR, NEAR_ZERO_FLOOR};
+
+/// Number of standard deviations beyond the velocity range for the FGM
+/// integration window.  The Gaussian kernel exp(-arg²) contributes less
+/// than exp(-36) ≈ 2.3e-16 outside this window, which is below f64
+/// machine epsilon.
+const DOPPLER_N_SIGMA: f64 = 6.0;
+
+/// Floor for distinguishing negative-velocity grid points from zero.
+///
+/// When building the extended velocity grid for the FGM integral, we
+/// generate points from `v_neg_limit` up to (but not including) zero.
+/// This threshold prevents the last negative-velocity point from being
+/// so close to zero that it is numerically indistinguishable, which would
+/// create a near-duplicate of the explicit v = 0 anchor point.
+const NEGATIVE_VELOCITY_FLOOR: f64 = 1e-15;
+
+/// Errors from `DopplerParams` construction.
+#[derive(Debug, PartialEq)]
+pub enum DopplerParamsError {
+    /// AWR must be strictly positive.
+    InvalidAwr(f64),
+    /// Temperature must be finite (may be zero for "no broadening").
+    NonFiniteTemperature(f64),
+    /// Temperature must be non-negative (negative Kelvin is physically meaningless).
+    NegativeTemperature(f64),
+}
+
+impl fmt::Display for DopplerParamsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidAwr(v) => write!(f, "AWR must be positive, got {v}"),
+            Self::NonFiniteTemperature(v) => write!(f, "temperature must be finite, got {v}"),
+            Self::NegativeTemperature(v) => {
+                write!(f, "temperature must be non-negative, got {v}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DopplerParamsError {}
 
 /// Doppler broadening parameters.
 #[derive(Debug, Clone, Copy)]
 pub struct DopplerParams {
     /// Effective sample temperature in Kelvin.
-    pub temperature_k: f64,
+    temperature_k: f64,
     /// Atomic weight ratio (target mass / neutron mass) from ENDF.
-    pub awr: f64,
+    awr: f64,
 }
 
 impl DopplerParams {
+    /// Create validated Doppler parameters.
+    ///
+    /// # Errors
+    /// Returns `DopplerParamsError::InvalidAwr` if `awr <= 0.0` or is NaN.
+    /// Returns `DopplerParamsError::NonFiniteTemperature` if `temperature_k`
+    /// is NaN or infinity.
+    /// Returns `DopplerParamsError::NegativeTemperature` if `temperature_k < 0.0`.
+    /// Zero temperature is allowed — it means "no broadening".
+    pub fn new(temperature_k: f64, awr: f64) -> Result<Self, DopplerParamsError> {
+        if !awr.is_finite() || awr <= 0.0 {
+            return Err(DopplerParamsError::InvalidAwr(awr));
+        }
+        if !temperature_k.is_finite() {
+            return Err(DopplerParamsError::NonFiniteTemperature(temperature_k));
+        }
+        if temperature_k < 0.0 {
+            return Err(DopplerParamsError::NegativeTemperature(temperature_k));
+        }
+        Ok(Self { temperature_k, awr })
+    }
+
+    /// Returns the effective sample temperature in Kelvin.
+    #[must_use]
+    pub fn temperature_k(&self) -> f64 {
+        self.temperature_k
+    }
+
+    /// Returns the atomic weight ratio (target mass / neutron mass).
+    #[must_use]
+    pub fn awr(&self) -> f64 {
+        self.awr
+    }
+
     /// Velocity-space Doppler width u = √(k_B·T / AWR).
     ///
     /// This is the standard deviation of the Gaussian kernel in √eV units.
+    #[must_use]
     pub fn u(&self) -> f64 {
         (constants::BOLTZMANN_EV_PER_K * self.temperature_k / self.awr).sqrt()
     }
@@ -49,6 +125,7 @@ impl DopplerParams {
     /// Energy-dependent Doppler width Δ_D(E) = √(4·k_B·T·E / AWR).
     ///
     /// This is the width that SAMMY reports in the .lpt file.
+    #[must_use]
     pub fn doppler_width(&self, energy_ev: f64) -> f64 {
         (4.0 * constants::BOLTZMANN_EV_PER_K * self.temperature_k * energy_ev / self.awr).sqrt()
     }
@@ -80,7 +157,7 @@ pub fn doppler_broaden(
 ) -> Vec<f64> {
     assert_eq!(energies.len(), cross_sections.len());
 
-    if params.temperature_k <= 0.0 || energies.is_empty() {
+    if params.temperature_k() <= 0.0 || energies.is_empty() {
         return cross_sections.to_vec();
     }
 
@@ -105,34 +182,51 @@ pub fn doppler_broaden(
 
     // Determine how many negative velocity points we need.
     // We need points down to v_min - N_sigma * u, which may go negative.
-    let n_sigma = 6.0; // Integration extends 6σ beyond the range
     let v_min = velocities[0];
-    let v_neg_limit = v_min - n_sigma * u;
+    let v_neg_limit = v_min - DOPPLER_N_SIGMA * u;
 
     // Build extended velocity grid: negative points (if needed) + positive points.
-    let mut ext_v: Vec<f64> = Vec::new();
-    let mut ext_y: Vec<f64> = Vec::new();
+    // Pre-compute total capacity: negative points + zero + positive + upper extension.
+    let dv_lo = if n > 1 {
+        (velocities[1] - velocities[0]).max(u * 0.1)
+    } else {
+        u * 0.5
+    };
+    let dv_hi = if n > 1 {
+        (velocities[n - 1] - velocities[n - 2]).max(u * 0.1)
+    } else {
+        u * 0.5
+    };
+    let n_neg = if v_neg_limit < 0.0 {
+        // Points from v_neg_limit to just below zero, plus the v=0 anchor.
+        (((-v_neg_limit - NEGATIVE_VELOCITY_FLOOR) / dv_lo).ceil() as usize).saturating_add(1)
+    } else {
+        0
+    };
+    let v_max = velocities[n - 1];
+    let v_max_limit = v_max + DOPPLER_N_SIGMA * u;
+    let n_hi = if v_max < v_max_limit {
+        ((v_max_limit - v_max) / dv_hi).ceil() as usize
+    } else {
+        0
+    };
+    let capacity = n_neg + n + n_hi;
+    let mut ext_v: Vec<f64> = Vec::with_capacity(capacity);
+    let mut ext_y: Vec<f64> = Vec::with_capacity(capacity);
 
     if v_neg_limit < 0.0 {
         // We need negative velocity points.
         // Use the same spacing as the low-energy end of the positive grid,
         // but in velocity space (uniform dv).
-        let dv = if n > 1 {
-            (velocities[1] - velocities[0]).max(u * 0.1)
-        } else {
-            u * 0.5
-        };
-
-        // Add negative velocity points from v_neg_limit to -dv
         let mut v = v_neg_limit;
-        while v < -1e-15 {
+        while v < -NEGATIVE_VELOCITY_FLOOR {
             ext_v.push(v);
             // Y(w) = |w| * σ(|w|²) for negative w
             // σ at E = w² — interpolate from the positive grid
             let e = v * v;
             let sigma = interpolate_cross_section(energies, cross_sections, e);
             ext_y.push(v.abs() * sigma); // Y is even
-            v += dv;
+            v += dv_lo;
         }
 
         // Add v = 0 point
@@ -147,21 +241,14 @@ pub fn doppler_broaden(
     }
 
     // Add points beyond the highest velocity if needed
-    let v_max = velocities[n - 1];
-    let v_max_limit = v_max + n_sigma * u;
     if v_max < v_max_limit {
-        let dv = if n > 1 {
-            (velocities[n - 1] - velocities[n - 2]).max(u * 0.1)
-        } else {
-            u * 0.5
-        };
-        let mut v = v_max + dv;
+        let mut v = v_max + dv_hi;
         while v <= v_max_limit {
             ext_v.push(v);
             let e = v * v;
             let sigma = interpolate_cross_section(energies, cross_sections, e);
             ext_y.push(v * sigma);
-            v += dv;
+            v += dv_hi;
         }
     }
 
@@ -182,31 +269,13 @@ pub fn doppler_broaden(
     // where w_norm_i are Gaussian weights normalized to sum to 1,
     // v_i = ext_v[i], and σ(E_i) is the cross-section at E_i = v_i².
     //
-    // We also compute equivalent raw Gaussian weights for the extended
-    // velocity grid, then normalize, apply v² factor, multiply by σ,
-    // and divide by E.
-    //
     // For negative velocities: E_i = v_i², σ(E_i) is the cross-section
     // at energy v_i² (same as for positive v_i).
-
-    // Build the cross-section array on the extended grid.
-    // ext_y stores |w|×σ(w²), so σ(w²) = ext_y[j] / |ext_v[j]|
-    // for non-zero velocities.
-    let ext_sigma: Vec<f64> = (0..n_ext)
-        .map(|j| {
-            let w = ext_v[j];
-            if w.abs() < NEAR_ZERO_FLOOR {
-                // At v=0, cross-section is the extrapolated value
-                if !energies.is_empty() {
-                    interpolate_cross_section(energies, cross_sections, 0.0)
-                } else {
-                    0.0
-                }
-            } else {
-                ext_y[j] / w.abs()
-            }
-        })
-        .collect();
+    //
+    // Instead of pre-allocating an ext_sigma Vec, we compute σ on-the-fly.
+    // ext_y stores |w|×σ(w²), so:
+    //   v_j² × σ(E_j) = v_j² × ext_y[j] / |v_j| = |v_j| × ext_y[j]
+    // At v=0: v_j² × σ(E_j) = 0 regardless, and |v_j| × ext_y[j] = 0.
 
     let mut broadened = vec![0.0f64; n];
 
@@ -222,8 +291,8 @@ pub fn doppler_broaden(
         // to the Gaussian window [v − n_sigma·u, v + n_sigma·u].  The
         // velocity-space Doppler width u is energy-independent, so the window
         // width W is constant across all output energies.
-        let v_lo = v - n_sigma * u;
-        let v_hi = v + n_sigma * u;
+        let v_lo = v - DOPPLER_N_SIGMA * u;
+        let v_hi = v + DOPPLER_N_SIGMA * u;
         let j_lo = ext_v.partition_point(|&w| w < v_lo);
         let j_hi = ext_v.partition_point(|&w| w <= v_hi);
 
@@ -234,11 +303,10 @@ pub fn doppler_broaden(
         let mut sum_weights = 0.0f64;
         let mut result = 0.0f64;
 
+        // The binary-search window [v_lo, v_hi] guarantees |arg| ≤ DOPPLER_N_SIGMA = 6,
+        // so arg² ≤ 36.  No additional arg² > 100 guard is needed.
         for j in j_lo..j_hi {
             let arg = (v - ext_v[j]) / u;
-            if arg * arg > 100.0 {
-                continue;
-            }
             let g = (-arg * arg).exp();
 
             // Trapezoidal half-widths
@@ -256,11 +324,9 @@ pub fn doppler_broaden(
 
             let w = g * dw;
             sum_weights += w;
-            // v_j² × σ(E_j) — same as the original two-pass formula:
-            //   result += w_norm × v_j² × ext_sigma[j]
-            // but deferred normalisation (divide by sum_weights after the loop).
-            let vj2 = ext_v[j] * ext_v[j]; // v_j² = E_j
-            result += w * vj2 * ext_sigma[j];
+            // v_j² × σ(E_j) = |v_j| × ext_y[j], computed on-the-fly
+            // (see comment above the outer loop for the derivation).
+            result += w * ext_v[j].abs() * ext_y[j];
         }
 
         if sum_weights < DIVISION_FLOOR {
@@ -282,6 +348,12 @@ pub fn doppler_broaden(
 }
 
 /// Linear interpolation of cross-section at an arbitrary energy.
+///
+/// Unlike `resolution::interp_spectrum` (which returns `None` for off-grid
+/// queries), this function extrapolates using the 1/v law.  A future
+/// consolidation could unify both behind a shared trait or closure-based
+/// extrapolation strategy; for now they remain separate to avoid coupling
+/// the two broadening modules.
 fn interpolate_cross_section(energies: &[f64], cross_sections: &[f64], energy: f64) -> f64 {
     if energies.is_empty() {
         return 0.0;
@@ -356,14 +428,83 @@ fn interpolate_cross_section(energies: &[f64], cross_sections: &[f64], energy: f
 mod tests {
     use super::*;
 
+    // --- DopplerParams::new() validation tests ---
+
+    #[test]
+    fn test_new_negative_temperature_rejected() {
+        assert_eq!(
+            DopplerParams::new(-1.0, 238.0).unwrap_err(),
+            DopplerParamsError::NegativeTemperature(-1.0)
+        );
+    }
+
+    #[test]
+    fn test_new_nan_temperature_rejected() {
+        let err = DopplerParams::new(f64::NAN, 238.0).unwrap_err();
+        assert!(
+            matches!(err, DopplerParamsError::NonFiniteTemperature(v) if v.is_nan()),
+            "NaN temperature should return NonFiniteTemperature"
+        );
+    }
+
+    #[test]
+    fn test_new_infinity_temperature_rejected() {
+        assert_eq!(
+            DopplerParams::new(f64::INFINITY, 238.0).unwrap_err(),
+            DopplerParamsError::NonFiniteTemperature(f64::INFINITY)
+        );
+    }
+
+    #[test]
+    fn test_new_negative_awr_rejected() {
+        assert_eq!(
+            DopplerParams::new(300.0, -1.0).unwrap_err(),
+            DopplerParamsError::InvalidAwr(-1.0)
+        );
+    }
+
+    #[test]
+    fn test_new_zero_awr_rejected() {
+        assert_eq!(
+            DopplerParams::new(300.0, 0.0).unwrap_err(),
+            DopplerParamsError::InvalidAwr(0.0)
+        );
+    }
+
+    #[test]
+    fn test_new_nan_awr_rejected() {
+        let err = DopplerParams::new(300.0, f64::NAN).unwrap_err();
+        assert!(
+            matches!(err, DopplerParamsError::InvalidAwr(v) if v.is_nan()),
+            "NaN AWR should return InvalidAwr"
+        );
+    }
+
+    #[test]
+    fn test_new_zero_temperature_allowed() {
+        let params = DopplerParams::new(0.0, 238.0);
+        assert!(params.is_ok(), "zero temperature should be allowed");
+        let p = params.unwrap();
+        assert_eq!(p.temperature_k(), 0.0);
+        assert_eq!(p.awr(), 238.0);
+    }
+
+    #[test]
+    fn test_new_valid_params() {
+        let params = DopplerParams::new(300.0, 238.0);
+        assert!(params.is_ok(), "valid params should succeed");
+        let p = params.unwrap();
+        assert_eq!(p.temperature_k(), 300.0);
+        assert_eq!(p.awr(), 238.0);
+    }
+
+    // --- End validation tests ---
+
     #[test]
     fn test_doppler_width_u238() {
         // SAMMY reports: Doppler width at 6.075 eV = 0.05159437 eV for U-238 at 300K
         // AWR = 238.050972, T = 300 K
-        let params = DopplerParams {
-            temperature_k: 300.0,
-            awr: 238.050972,
-        };
+        let params = DopplerParams::new(300.0, 238.050972).unwrap();
         let dw = params.doppler_width(6.075);
         // SAMMY uses kB = 0.000086173420 eV/K (slightly different from CODATA 2018)
         // Our kB = 8.617333262e-5. The difference is ~0.003%.
@@ -380,10 +521,7 @@ mod tests {
         // ex001: A=10, T=300K. Δ_D at 10 eV = √(4kBTE/AWR).
         // SAMMY reports Δ_D = 0.3216 eV, FWHM = 2√(ln2) × Δ_D = 0.5355 eV.
         // (SAMMY lpt uses slightly different kB, giving FWHM = 0.5378 eV.)
-        let params = DopplerParams {
-            temperature_k: 300.0,
-            awr: 10.0,
-        };
+        let params = DopplerParams::new(300.0, 10.0).unwrap();
         let dw = params.doppler_width(10.0);
         // Δ_D = √(4 × 8.617e-5 × 300 × 10 / 10) = √(0.10341) ≈ 0.3216 eV
         assert!(
@@ -398,10 +536,7 @@ mod tests {
         // At T=0, broadening should return the original cross-sections.
         let energies = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let xs = vec![10.0, 20.0, 30.0, 20.0, 10.0];
-        let params = DopplerParams {
-            temperature_k: 0.0,
-            awr: 238.0,
-        };
+        let params = DopplerParams::new(0.0, 238.0).unwrap();
         let broadened = doppler_broaden(&energies, &xs, &params);
         assert_eq!(broadened, xs);
     }
@@ -422,10 +557,7 @@ mod tests {
             })
             .collect();
 
-        let params = DopplerParams {
-            temperature_k: 300.0,
-            awr: 238.0,
-        };
+        let params = DopplerParams::new(300.0, 238.0).unwrap();
         let broadened = doppler_broaden(&energies, &xs, &params);
 
         // Find peaks
@@ -523,10 +655,7 @@ mod tests {
             .collect();
 
         // Apply FGM Doppler broadening.
-        let params = DopplerParams {
-            temperature_k: 300.0,
-            awr: 10.0,
-        };
+        let params = DopplerParams::new(300.0, 10.0).unwrap();
         let broadened = doppler_broaden(&energies, &unbroadened, &params);
 
         // SAMMY ex001a.lst reference points: (energy, broadened capture σ in barns).
@@ -546,13 +675,6 @@ mod tests {
         for &(e_ref, sigma_ref) in &sammy_ref {
             let sigma_us = interpolate_cross_section(&energies, &broadened, e_ref);
             let rel_err = (sigma_us - sigma_ref).abs() / sigma_ref;
-            eprintln!(
-                "  E={:.4} eV: ours={:.4}, SAMMY={:.4}, ratio={:.4}",
-                e_ref,
-                sigma_us,
-                sigma_ref,
-                sigma_us / sigma_ref
-            );
             max_rel_err = max_rel_err.max(rel_err);
         }
         // Allow up to 5% relative error (trapezoidal integration + constant differences).
@@ -601,10 +723,7 @@ mod tests {
             })
             .collect();
 
-        let params = DopplerParams {
-            temperature_k: 300.0,
-            awr: 100.0,
-        };
+        let params = DopplerParams::new(300.0, 100.0).unwrap();
         let broadened = doppler_broaden(&energies, &xs, &params);
 
         // Compute area (trapezoidal) for both
