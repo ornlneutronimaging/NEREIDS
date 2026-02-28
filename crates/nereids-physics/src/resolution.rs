@@ -94,6 +94,10 @@ pub fn resolution_broaden(
     params: &ResolutionParams,
 ) -> Vec<f64> {
     assert_eq!(energies.len(), cross_sections.len());
+    debug_assert!(
+        energies.windows(2).all(|w| w[0] <= w[1]),
+        "energies must be sorted ascending for partition_point"
+    );
 
     let n = energies.len();
     if n == 0 {
@@ -120,11 +124,9 @@ pub fn resolution_broaden(
         let mut sum = 0.0;
         let mut norm = 0.0;
 
-        for j in 0..n {
-            if energies[j] < e_low || energies[j] > e_high {
-                continue;
-            }
-
+        let j_lo = energies.partition_point(|&ej| ej < e_low);
+        let j_hi = energies.partition_point(|&ej| ej <= e_high);
+        for j in j_lo..j_hi {
             let arg = (energies[j] - e) / w;
             if arg * arg > 100.0 {
                 continue;
@@ -178,6 +180,10 @@ pub fn resolution_broaden_transmission(
     transmission: &[f64],
     params: &ResolutionParams,
 ) -> Vec<f64> {
+    debug_assert!(
+        energies.windows(2).all(|w| w[0] <= w[1]),
+        "energies must be sorted ascending for partition_point"
+    );
     // The convolution kernel is the same; only the interpretation differs.
     resolution_broaden(energies, transmission, params)
 }
@@ -350,7 +356,7 @@ impl TabulatedResolution {
             // TOF at this energy: t = TOF_FACTOR * L / sqrt(E)
             let tof_center = TOF_FACTOR * self.flight_path_m / e.sqrt();
 
-            // Find bracketing reference energies (log-space interpolation)
+            // Compute interpolated kernel on the fly to avoid O(N * kernel_len) memory
             let (offsets, weights) = self.interpolated_kernel(e);
 
             // Convolve: for each kernel point, find the energy corresponding to
@@ -419,13 +425,12 @@ impl TabulatedResolution {
         }
 
         // Find bracketing indices
-        let mut idx = 0;
-        for j in 0..n_ref - 1 {
-            if self.ref_energies[j + 1] >= energy {
-                idx = j;
-                break;
-            }
-        }
+        let pos = self.ref_energies.partition_point(|&e| e < energy);
+        let idx = if pos == 0 {
+            0
+        } else {
+            (pos - 1).min(n_ref - 2)
+        };
 
         let e_lo = self.ref_energies[idx];
         let e_hi = self.ref_energies[idx + 1];
