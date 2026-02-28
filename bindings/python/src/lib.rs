@@ -962,18 +962,28 @@ fn load_endf(
 
     // Release the GIL for the network I/O (download / cache lookup) and
     // ENDF file parsing.  All types captured by the closure are Send.
-    let result: Result<ResonanceData, String> = py.detach(move || {
+    //
+    // We tag errors so we can map retrieval failures → PyRuntimeError and
+    // parse failures → PyValueError (preserving the pre-GIL-release contract).
+    let result: Result<ResonanceData, (bool, String)> = py.detach(move || {
         let retriever = EndfRetriever::new();
         let (_path, contents) = retriever
             .get_endf_file(&isotope, lib, mat_num)
-            .map_err(|e| format!("{}", e))?;
+            .map_err(|e| (false, format!("{}", e)))?;
 
-        let data = parse_endf_file2(&contents).map_err(|e| format!("ENDF parse error: {}", e))?;
+        let data =
+            parse_endf_file2(&contents).map_err(|e| (true, format!("ENDF parse error: {}", e)))?;
 
         Ok(data)
     });
 
-    let data = result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+    let data = result.map_err(|(is_parse, msg)| {
+        if is_parse {
+            pyo3::exceptions::PyValueError::new_err(msg)
+        } else {
+            pyo3::exceptions::PyRuntimeError::new_err(msg)
+        }
+    })?;
 
     // Validate that the parsed ENDF data matches the requested isotope.
     if data.isotope.z() != z || data.isotope.a() != a {
@@ -999,13 +1009,35 @@ fn load_endf(
 /// Returns:
 ///     ResonanceData parsed from the file.
 #[pyfunction]
-fn load_endf_file(path: &str) -> PyResult<PyResonanceData> {
-    let contents = std::fs::read_to_string(path).map_err(|e| {
-        pyo3::exceptions::PyIOError::new_err(format!("Cannot read '{}': {}", path, e))
-    })?;
+fn load_endf_file(py: Python<'_>, path: &str) -> PyResult<PyResonanceData> {
+    // Validate path existence while we still hold the GIL (cheap check).
+    if !std::path::Path::new(path).exists() {
+        return Err(pyo3::exceptions::PyIOError::new_err(format!(
+            "Cannot read '{}': No such file or directory",
+            path
+        )));
+    }
 
-    let data = parse_endf_file2(&contents)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("ENDF parse error: {}", e)))?;
+    // Release the GIL for the file I/O and ENDF parsing.
+    // Tag errors: false = I/O, true = parse.
+    let owned_path = path.to_owned();
+    let result: Result<ResonanceData, (bool, String)> = py.detach(move || {
+        let contents = std::fs::read_to_string(&owned_path)
+            .map_err(|e| (false, format!("Cannot read '{}': {}", owned_path, e)))?;
+
+        let data =
+            parse_endf_file2(&contents).map_err(|e| (true, format!("ENDF parse error: {}", e)))?;
+
+        Ok(data)
+    });
+
+    let data = result.map_err(|(is_parse, msg)| {
+        if is_parse {
+            pyo3::exceptions::PyValueError::new_err(msg)
+        } else {
+            pyo3::exceptions::PyIOError::new_err(msg)
+        }
+    })?;
 
     Ok(PyResonanceData {
         inner: Arc::new(data),
@@ -1419,7 +1451,7 @@ fn py_apply_resolution<'py>(
     py: Python<'py>,
     energies: PyReadonlyArray1<f64>,
     spectrum: PyReadonlyArray1<f64>,
-    resolution: &PyTabulatedResolution,
+    resolution: PyTabulatedResolution,
 ) -> PyResult<Bound<'py, PyArray1<f64>>> {
     let e = energies.as_slice()?;
     let s = spectrum.as_slice()?;
@@ -1433,7 +1465,10 @@ fn py_apply_resolution<'py>(
     }
     validate_energy_grid(e)?;
 
-    let res_fn = ResolutionFunction::Tabulated((*resolution.inner).clone());
+    // Take by value so we can use Arc::unwrap_or_clone instead of a
+    // deep clone.  When only one Python reference exists, this avoids
+    // the copy entirely.
+    let res_fn = ResolutionFunction::Tabulated(Arc::unwrap_or_clone(resolution.inner));
 
     // Copy numpy slices to owned vectors so we can release the GIL.
     let e_owned = e.to_vec();
