@@ -729,7 +729,11 @@ fn fit_spectrum(
                     instrument.as_ref(),
                     None,
                 )
-                .expect("broadened_cross_sections should not be cancelled");
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyRuntimeError::new_err(
+                        "broadened_cross_sections returned None (cancellation) despite cancel=None; this should be unreachable",
+                    )
+                })?;
 
                 // Build density parameters.
                 let mut param_vec: Vec<FitParameter> = init
@@ -2309,7 +2313,8 @@ fn precompute_cross_sections<'py>(
     // GIL is re-acquired after detach returns — use `py` directly.
     let xs = xs.ok_or_else(|| {
         pyo3::exceptions::PyRuntimeError::new_err(
-            "broadened_cross_sections returned None unexpectedly",
+            "broadened_cross_sections returned None (cancellation) despite cancel=None; \
+             this should be unreachable and likely indicates an internal error",
         )
     })?;
 
@@ -2335,7 +2340,7 @@ fn detect_dead_pixels<'py>(
     data: PyReadonlyArray3<f64>,
 ) -> PyResult<Bound<'py, PyArray2<bool>>> {
     let arr = data.as_array().to_owned();
-    let mask = norm::detect_dead_pixels(&arr);
+    let mask = py.detach(move || norm::detect_dead_pixels(&arr));
     Ok(PyArray2::from_owned_array(py, mask))
 }
 

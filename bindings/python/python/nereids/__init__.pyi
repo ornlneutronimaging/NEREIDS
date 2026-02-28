@@ -472,6 +472,16 @@ def detect_dead_pixels(
 ) -> NDArray[np.bool_]:
     """Detect dead pixels (all-zero across the spectral axis).
 
-    Returns a 2D boolean mask where True marks a dead pixel.
+    Parameters
+    ----------
+    data :
+        3D NumPy array with shape ``(n_frames, height, width)``. The spectral
+        axis corresponds to the first dimension (``n_frames``).
+
+    Returns
+    -------
+    NDArray[np.bool_]
+        2D boolean mask with shape ``(height, width)``, where ``True`` marks
+        a dead pixel (all-zero across the spectral axis).
     """
     ...
