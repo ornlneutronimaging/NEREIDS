@@ -649,7 +649,8 @@ fn fit_spectrum(
             let s_owned = s.to_vec();
 
             // Release the GIL for the heavy computation.
-            py.detach(move || {
+            // The closure uses only Rust types; PyErr conversion happens outside.
+            let result: Result<PyFitResult, String> = py.detach(move || {
                 let model = TransmissionFitModel {
                     energies: e_owned,
                     resonance_data: res_data,
@@ -681,27 +682,28 @@ fn fit_spectrum(
                     ..LmConfig::default()
                 };
 
-                let result =
+                let lm_result =
                     lm::levenberg_marquardt(&model, &t_owned, &s_owned, &mut params, &config);
 
                 let n_total = n_isotopes + if fit_temperature { 1 } else { 0 };
-                let densities: Vec<f64> = (0..n_isotopes).map(|i| result.params[i]).collect();
-                let unc = result
+                let densities: Vec<f64> = (0..n_isotopes).map(|i| lm_result.params[i]).collect();
+                let unc = lm_result
                     .uncertainties
                     .unwrap_or_else(|| vec![f64::NAN; n_total]);
-                assert!(
-                    unc.len() >= n_total,
-                    "uncertainty vector length ({}) should be >= parameter count ({})",
-                    unc.len(),
-                    n_total
-                );
+                if unc.len() < n_total {
+                    return Err(format!(
+                        "uncertainty vector length ({}) should be >= parameter count ({})",
+                        unc.len(),
+                        n_total
+                    ));
+                }
                 let uncertainties: Vec<f64> = (0..n_isotopes)
                     .map(|i| unc.get(i).copied().unwrap_or(f64::NAN))
                     .collect();
 
                 let (fitted_temperature, fitted_temperature_unc) = if fit_temperature {
                     (
-                        Some(result.params[n_isotopes]),
+                        Some(lm_result.params[n_isotopes]),
                         Some(unc.get(n_isotopes).copied().unwrap_or(f64::NAN)),
                     )
                 } else {
@@ -711,13 +713,14 @@ fn fit_spectrum(
                 Ok(PyFitResult {
                     densities,
                     uncertainties,
-                    reduced_chi_squared: result.reduced_chi_squared,
-                    converged: result.converged,
-                    iterations: result.iterations,
+                    reduced_chi_squared: lm_result.reduced_chi_squared,
+                    converged: lm_result.converged,
+                    iterations: lm_result.iterations,
                     temperature_k: fitted_temperature,
                     temperature_k_unc: fitted_temperature_unc,
                 })
-            })
+            });
+            result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
         }
 
         "poisson" => {
@@ -729,7 +732,8 @@ fn fit_spectrum(
             let instrument = res_fn.map(|r| InstrumentParams { resolution: r });
 
             // Release the GIL for the heavy computation.
-            py.detach(move || {
+            // The closure uses only Rust types; PyErr conversion happens outside.
+            let result: Result<PyFitResult, String> = py.detach(move || {
                 // Precompute broadened cross-sections at the initial temperature.
                 let xs = transmission::broadened_cross_sections(
                     &e_owned,
@@ -738,12 +742,7 @@ fn fit_spectrum(
                     instrument.as_ref(),
                     None,
                 )
-                .map_err(|e| {
-                    pyo3::exceptions::PyValueError::new_err(format!(
-                        "broadened_cross_sections failed: {}",
-                        e
-                    ))
-                })?;
+                .map_err(|e| format!("broadened_cross_sections failed: {}", e))?;
 
                 // Build density parameters.
                 let mut param_vec: Vec<FitParameter> = init
@@ -814,7 +813,7 @@ fn fit_spectrum(
                     ..PoissonConfig::default()
                 };
 
-                let result = poisson::poisson_fit_analytic(
+                let poisson_result = poisson::poisson_fit_analytic(
                     &counts_model,
                     &y_obs,
                     &flux_owned,
@@ -825,13 +824,14 @@ fn fit_spectrum(
                     temp_ctx.as_ref(),
                 );
 
-                let densities: Vec<f64> = (0..n_isotopes).map(|i| result.params[i]).collect();
+                let densities: Vec<f64> =
+                    (0..n_isotopes).map(|i| poisson_result.params[i]).collect();
                 // Poisson optimizer does not compute uncertainties from covariance;
                 // report NaN for now.
                 let uncertainties = vec![f64::NAN; n_isotopes];
 
                 let (fitted_temperature, fitted_temperature_unc) = if fit_temperature {
-                    (Some(result.params[n_isotopes]), Some(f64::NAN))
+                    (Some(poisson_result.params[n_isotopes]), Some(f64::NAN))
                 } else {
                     (None, None)
                 };
@@ -839,13 +839,14 @@ fn fit_spectrum(
                 Ok(PyFitResult {
                     densities,
                     uncertainties,
-                    reduced_chi_squared: result.nll,
-                    converged: result.converged,
-                    iterations: result.iterations,
+                    reduced_chi_squared: poisson_result.nll,
+                    converged: poisson_result.converged,
+                    iterations: poisson_result.iterations,
                     temperature_k: fitted_temperature,
                     temperature_k_unc: fitted_temperature_unc,
                 })
-            })
+            });
+            result.map_err(|e| pyo3::exceptions::PyValueError::new_err(e))
         }
 
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(
