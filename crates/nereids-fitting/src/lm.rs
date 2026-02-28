@@ -79,6 +79,13 @@ pub struct LmConfig {
     pub tol_param: f64,
     /// Step size for finite-difference Jacobian.
     pub fd_step: f64,
+    /// Whether to compute the covariance matrix (and uncertainties) after
+    /// convergence.  This requires an extra Jacobian evaluation + matrix
+    /// inversion at the final parameters.  Set to `false` for per-pixel
+    /// spatial mapping where only densities are needed.
+    ///
+    /// Default: `true`.
+    pub compute_covariance: bool,
 }
 
 impl Default for LmConfig {
@@ -91,6 +98,7 @@ impl Default for LmConfig {
             tol_chi2: 1e-8,
             tol_param: 1e-8,
             fd_step: 1e-6,
+            compute_covariance: true,
         }
     }
 }
@@ -608,51 +616,62 @@ pub fn levenberg_marquardt(
         }
     }
 
-    // Compute covariance matrix: (JᵀWJ)⁻¹ at the final parameters.
-    let jacobian = compute_jacobian(model, params, &y_current, config.fd_step, &mut all_vals_buf);
-    let mut jtw_j = FlatMatrix::zeros(n_free, n_free);
-    for (i, &wi) in weights.iter().enumerate() {
-        for j in 0..n_free {
-            let jij = jacobian.get(i, j);
-            for k in 0..n_free {
-                *jtw_j.get_mut(j, k) += jij * wi * jacobian.get(i, k);
-            }
-        }
-    }
-
-    // #108.1: Scale covariance by reduced chi-squared.
-    //
-    // The raw (JᵀWJ)⁻¹ gives the covariance only when the model is a perfect
-    // description and the weights are exact.  Multiplying by χ²/ν accounts for
-    // misfit (model inadequacy or underestimated errors).  This is the standard
-    // statistical prescription (see e.g. Numerical Recipes §15.6).
-    //
-    // When dof == 0 (exactly determined system), reduced chi-squared is
-    // undefined (0/0).  We report NaN and skip covariance scaling entirely,
-    // returning None for covariance and uncertainties.
     let reduced_chi2 = if dof > 0 { chi2 / dof as f64 } else { f64::NAN };
 
-    let (covariance, uncertainties) = if dof > 0 {
-        if let Some(mut cov) = invert_matrix(&jtw_j) {
-            for elem in cov.data.iter_mut() {
-                *elem *= reduced_chi2;
+    // Compute covariance matrix: (JᵀWJ)⁻¹ at the final parameters.
+    //
+    // This block requires an extra Jacobian evaluation + O(n_free³) matrix
+    // inversion.  When `compute_covariance` is false (e.g. per-pixel spatial
+    // mapping), we skip it entirely — the caller only needs densities and
+    // chi-squared, not uncertainties.
+    let (covariance, uncertainties) = if config.compute_covariance {
+        let jacobian =
+            compute_jacobian(model, params, &y_current, config.fd_step, &mut all_vals_buf);
+        let mut jtw_j = FlatMatrix::zeros(n_free, n_free);
+        for (i, &wi) in weights.iter().enumerate() {
+            for j in 0..n_free {
+                let jij = jacobian.get(i, j);
+                for k in 0..n_free {
+                    *jtw_j.get_mut(j, k) += jij * wi * jacobian.get(i, k);
+                }
             }
-            let unc: Vec<f64> = (0..n_free)
-                .map(|i| {
-                    let diag = cov.get(i, i);
-                    if diag.is_finite() && diag > 0.0 {
-                        diag.sqrt()
-                    } else {
-                        f64::NAN
-                    }
-                })
-                .collect();
-            (Some(cov), Some(unc))
+        }
+
+        // #108.1: Scale covariance by reduced chi-squared.
+        //
+        // The raw (JᵀWJ)⁻¹ gives the covariance only when the model is a perfect
+        // description and the weights are exact.  Multiplying by χ²/ν accounts for
+        // misfit (model inadequacy or underestimated errors).  This is the standard
+        // statistical prescription (see e.g. Numerical Recipes §15.6).
+        //
+        // When dof == 0 (exactly determined system), reduced chi-squared is
+        // undefined (0/0).  We report NaN and skip covariance scaling entirely,
+        // returning None for covariance and uncertainties.
+        if dof > 0 {
+            if let Some(mut cov) = invert_matrix(&jtw_j) {
+                for elem in cov.data.iter_mut() {
+                    *elem *= reduced_chi2;
+                }
+                let unc: Vec<f64> = (0..n_free)
+                    .map(|i| {
+                        let diag = cov.get(i, i);
+                        if diag.is_finite() && diag > 0.0 {
+                            diag.sqrt()
+                        } else {
+                            f64::NAN
+                        }
+                    })
+                    .collect();
+                (Some(cov), Some(unc))
+            } else {
+                (None, None)
+            }
         } else {
+            // dof == 0: covariance scaling is undefined; report None.
             (None, None)
         }
     } else {
-        // dof == 0: covariance scaling is undefined; report None.
+        // Covariance computation skipped (compute_covariance == false).
         (None, None)
     };
 

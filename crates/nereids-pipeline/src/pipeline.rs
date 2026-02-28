@@ -48,6 +48,14 @@ pub struct FitConfig {
     ///
     /// Default: `false` — temperature is held fixed.
     pub fit_temperature: bool,
+    /// Whether to compute the covariance matrix (and parameter uncertainties)
+    /// after convergence.  When `false`, the post-convergence Jacobian
+    /// recomputation and matrix inversion are skipped, and
+    /// `SpectrumFitResult::uncertainties` will be `None`.
+    ///
+    /// Default: `true` (backwards-compatible for single-spectrum use).
+    /// Set to `false` in `spatial_map` and `sparse_reconstruct` for speed.
+    pub compute_covariance: bool,
 }
 
 /// Result of fitting a single spectrum.
@@ -56,7 +64,10 @@ pub struct SpectrumFitResult {
     /// Fitted areal densities (atoms/barn), one per isotope.
     pub densities: Vec<f64>,
     /// Uncertainty on each density.
-    pub uncertainties: Vec<f64>,
+    ///
+    /// `None` when covariance computation was skipped
+    /// (`FitConfig::compute_covariance == false`).
+    pub uncertainties: Option<Vec<f64>>,
     /// Reduced chi-squared of the fit.
     pub reduced_chi_squared: f64,
     /// Whether the fit converged.
@@ -162,6 +173,12 @@ pub fn fit_spectrum(
 
     let mut params = ParameterSet::new(param_vec);
 
+    // Propagate the pipeline-level compute_covariance flag into the LM config.
+    // This lets spatial_map/sparse_reconstruct disable covariance without
+    // modifying the caller's LmConfig.
+    let mut lm_config = config.lm_config.clone();
+    lm_config.compute_covariance = config.compute_covariance;
+
     // Use precomputed cross-sections when available (fast path for spatial_map).
     // Fall back to the full forward-model path for single-spectrum calls.
     // When fitting temperature, always use the full forward model (can't
@@ -195,7 +212,7 @@ pub fn fit_spectrum(
                 cross_sections: xs.clone(),
                 density_indices: Arc::new((0..n_isotopes).collect()),
             };
-            lm::levenberg_marquardt(&model, measured_t, sigma, &mut params, &config.lm_config)
+            lm::levenberg_marquardt(&model, measured_t, sigma, &mut params, &lm_config)
         } else {
             let instrument = config
                 .resolution
@@ -209,7 +226,7 @@ pub fn fit_spectrum(
                 density_indices: (0..n_isotopes).collect(),
                 temperature_index: None,
             };
-            lm::levenberg_marquardt(&model, measured_t, sigma, &mut params, &config.lm_config)
+            lm::levenberg_marquardt(&model, measured_t, sigma, &mut params, &lm_config)
         }
     } else {
         // Temperature fitting: always use the full TransmissionFitModel
@@ -226,30 +243,44 @@ pub fn fit_spectrum(
             density_indices: (0..n_isotopes).collect(),
             temperature_index,
         };
-        lm::levenberg_marquardt(&model, measured_t, sigma, &mut params, &config.lm_config)
+        lm::levenberg_marquardt(&model, measured_t, sigma, &mut params, &lm_config)
     };
 
     let densities: Vec<f64> = (0..n_isotopes).map(|i| result.params[i]).collect();
-    let uncertainties_all = result
-        .uncertainties
-        .unwrap_or_else(|| vec![f64::NAN; n_isotopes + if config.fit_temperature { 1 } else { 0 }]);
 
-    let (temperature_k, temperature_k_unc) = if config.fit_temperature {
-        (
-            Some(result.params[n_isotopes]),
-            Some(*uncertainties_all.get(n_isotopes).unwrap_or(&f64::NAN)),
-        )
-    } else {
-        (None, None)
+    // When covariance was computed, extract per-isotope and temperature
+    // uncertainties from the LM result.  When skipped (None), propagate None.
+    let (uncertainties, temperature_k, temperature_k_unc) = match result.uncertainties {
+        Some(unc_all) => {
+            let (temp_k, temp_unc) = if config.fit_temperature {
+                (
+                    Some(result.params[n_isotopes]),
+                    Some(*unc_all.get(n_isotopes).unwrap_or(&f64::NAN)),
+                )
+            } else {
+                (None, None)
+            };
+
+            // Guard: the LM result should always produce at least n_isotopes
+            // uncertainties, but use a safe fallback to NaN if the invariant
+            // is ever violated rather than panicking on the slice.
+            let unc = unc_all
+                .get(..n_isotopes)
+                .map(|s| s.to_vec())
+                .unwrap_or_else(|| vec![f64::NAN; n_isotopes]);
+
+            (Some(unc), temp_k, temp_unc)
+        }
+        None => {
+            // Covariance was skipped — no uncertainties available.
+            let (temp_k, temp_unc) = if config.fit_temperature {
+                (Some(result.params[n_isotopes]), None)
+            } else {
+                (None, None)
+            };
+            (None, temp_k, temp_unc)
+        }
     };
-
-    // Guard: the LM result should always produce at least n_isotopes uncertainties,
-    // but use a safe fallback to NaN if the invariant is ever violated (e.g. by a
-    // future optimizer change) rather than panicking on the slice.
-    let uncertainties = uncertainties_all
-        .get(..n_isotopes)
-        .map(|s| s.to_vec())
-        .unwrap_or_else(|| vec![f64::NAN; n_isotopes]);
 
     Ok(SpectrumFitResult {
         densities,
@@ -297,6 +328,7 @@ mod tests {
             lm_config: LmConfig::default(),
             precomputed_cross_sections: None,
             fit_temperature: false,
+            compute_covariance: true,
         };
 
         let result = fit_spectrum(&y_obs, &sigma, &config).unwrap();
@@ -308,7 +340,10 @@ mod tests {
             result.densities[0],
             true_density,
         );
-        assert!(result.uncertainties[0] > 0.0);
+        let unc = result
+            .uncertainties
+            .expect("uncertainties should be Some when compute_covariance=true");
+        assert!(unc[0] > 0.0);
     }
 
     #[test]
@@ -324,6 +359,7 @@ mod tests {
             lm_config: LmConfig::default(),
             precomputed_cross_sections: None,
             fit_temperature: false,
+            compute_covariance: true,
         };
 
         // measured_t length (2) != energies length (3)
@@ -344,6 +380,7 @@ mod tests {
             lm_config: LmConfig::default(),
             precomputed_cross_sections: None,
             fit_temperature: false,
+            compute_covariance: true,
         };
 
         // sigma length (2) != measured_t length (3) — should return ShapeMismatch

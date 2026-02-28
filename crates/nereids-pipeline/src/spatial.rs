@@ -181,8 +181,16 @@ pub fn spatial_map(
     // When temperature is free, cross-sections are recomputed each iteration
     // inside the forward model, so precomputing here would be wasted work.
     // Only precompute when temperature is fixed.
+    //
+    // Always disable covariance computation for per-pixel fitting — the
+    // post-convergence Jacobian + matrix inversion is wasted work when we
+    // only need the fitted densities and chi-squared.  This saves one
+    // full Jacobian evaluation per pixel (N_free model evaluations for
+    // finite-difference, or free for analytical) plus the O(n_free³) inversion.
     let fast_config = if config.fit_temperature {
-        config.clone()
+        let mut cfg = config.clone();
+        cfg.compute_covariance = false;
+        cfg
     } else {
         // Use caller-supplied precomputed cross-sections when available; only call
         // broadened_cross_sections when none are provided.  This lets repeated
@@ -206,10 +214,12 @@ pub fn spatial_map(
             }
         };
 
-        // Build a config variant with the precomputed cross-sections injected.
+        // Build a config variant with the precomputed cross-sections injected
+        // and covariance computation disabled for per-pixel speed.
         // fit_spectrum will use PrecomputedTransmissionModel when this field is Some.
         FitConfig {
             precomputed_cross_sections: Some(xs),
+            compute_covariance: false,
             ..config.clone()
         }
     };
@@ -261,7 +271,11 @@ pub fn spatial_map(
     for ((y, x), result) in &results {
         for i in 0..n_isotopes {
             density_maps[i][[*y, *x]] = result.densities[i];
-            uncertainty_maps[i][[*y, *x]] = result.uncertainties[i];
+            // When covariance was skipped (per-pixel spatial_map), uncertainties
+            // are None and the maps stay at their NaN default.
+            if let Some(ref unc) = result.uncertainties {
+                uncertainty_maps[i][[*y, *x]] = unc[i];
+            }
         }
         chi_squared_map[[*y, *x]] = result.reduced_chi_squared;
         converged_map[[*y, *x]] = result.converged;
@@ -441,6 +455,7 @@ mod tests {
             lm_config: LmConfig::default(),
             precomputed_cross_sections: None,
             fit_temperature: false,
+            compute_covariance: true,
         };
 
         let result = spatial_map(&transmission, &uncertainty, &config, None, None).unwrap();
@@ -508,6 +523,7 @@ mod tests {
             lm_config: LmConfig::default(),
             precomputed_cross_sections: None,
             fit_temperature: false,
+            compute_covariance: true,
         };
 
         let result = spatial_map(&transmission, &uncertainty, &config, Some(&dead), None).unwrap();
@@ -529,6 +545,7 @@ mod tests {
             lm_config: LmConfig::default(),
             precomputed_cross_sections: None,
             fit_temperature: false,
+            compute_covariance: true,
         };
 
         let transmission = Array3::from_elem((3, 2, 2), 0.5);
@@ -551,6 +568,7 @@ mod tests {
             lm_config: LmConfig::default(),
             precomputed_cross_sections: None,
             fit_temperature: false,
+            compute_covariance: true,
         };
 
         let transmission = Array3::from_elem((3, 2, 2), 0.5);
@@ -602,6 +620,7 @@ mod tests {
             lm_config: LmConfig::default(),
             precomputed_cross_sections: None,
             fit_temperature: false,
+            compute_covariance: true,
         };
 
         // Fit a 2×2 ROI
@@ -629,6 +648,7 @@ mod tests {
             lm_config: LmConfig::default(),
             precomputed_cross_sections: None,
             fit_temperature: false,
+            compute_covariance: true,
         };
 
         let transmission = Array3::from_elem((3, 4, 4), 0.5);
