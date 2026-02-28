@@ -918,13 +918,13 @@ class TestErrorHandling:
     def test_doppler_broaden_invalid_awr(self):
         e = np.linspace(1.0, 10.0, 100)
         xs = np.ones(100)
-        with pytest.raises(ValueError, match="awr"):
+        with pytest.raises(ValueError, match="AWR must be positive"):
             nereids.doppler_broaden(e, xs, -1.0, 300.0)
 
     def test_doppler_broaden_invalid_temperature(self):
         e = np.linspace(1.0, 10.0, 100)
         xs = np.ones(100)
-        with pytest.raises(ValueError, match="temperature_k"):
+        with pytest.raises(ValueError, match="temperature must be non-negative"):
             nereids.doppler_broaden(e, xs, 236.0, -1.0)
 
     def test_resolution_broaden_invalid_delta_t(self):
