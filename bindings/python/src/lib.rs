@@ -1234,7 +1234,9 @@ fn doppler_broaden<'py>(
         return Ok(PyArray1::from_vec(py, xs.to_vec()));
     }
 
-    let params = DopplerParams { temperature_k, awr };
+    let params = DopplerParams::new(temperature_k, awr).map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(format!("invalid DopplerParams: {e}"))
+    })?;
     let result = doppler::doppler_broaden(e, xs, &params);
     Ok(PyArray1::from_vec(py, result))
 }

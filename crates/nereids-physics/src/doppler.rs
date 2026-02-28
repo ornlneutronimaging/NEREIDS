@@ -47,12 +47,14 @@ const DOPPLER_N_SIGMA: f64 = 6.0;
 const NEGATIVE_VELOCITY_FLOOR: f64 = 1e-15;
 
 /// Errors from `DopplerParams` construction.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum DopplerParamsError {
     /// AWR must be strictly positive.
     InvalidAwr(f64),
     /// Temperature must be finite (may be zero for "no broadening").
     NonFiniteTemperature(f64),
+    /// Temperature must be non-negative (negative Kelvin is physically meaningless).
+    NegativeTemperature(f64),
 }
 
 impl fmt::Display for DopplerParamsError {
@@ -60,6 +62,9 @@ impl fmt::Display for DopplerParamsError {
         match self {
             Self::InvalidAwr(v) => write!(f, "AWR must be positive, got {v}"),
             Self::NonFiniteTemperature(v) => write!(f, "temperature must be finite, got {v}"),
+            Self::NegativeTemperature(v) => {
+                write!(f, "temperature must be non-negative, got {v}")
+            }
         }
     }
 }
@@ -70,9 +75,9 @@ impl std::error::Error for DopplerParamsError {}
 #[derive(Debug, Clone, Copy)]
 pub struct DopplerParams {
     /// Effective sample temperature in Kelvin.
-    pub temperature_k: f64,
+    temperature_k: f64,
     /// Atomic weight ratio (target mass / neutron mass) from ENDF.
-    pub awr: f64,
+    awr: f64,
 }
 
 impl DopplerParams {
@@ -81,7 +86,9 @@ impl DopplerParams {
     /// # Errors
     /// Returns `DopplerParamsError::InvalidAwr` if `awr <= 0.0` or is NaN.
     /// Returns `DopplerParamsError::NonFiniteTemperature` if `temperature_k`
-    /// is NaN or infinity (zero is allowed — it means "no broadening").
+    /// is NaN or infinity.
+    /// Returns `DopplerParamsError::NegativeTemperature` if `temperature_k < 0.0`.
+    /// Zero temperature is allowed — it means "no broadening".
     pub fn new(temperature_k: f64, awr: f64) -> Result<Self, DopplerParamsError> {
         if !awr.is_finite() || awr <= 0.0 {
             return Err(DopplerParamsError::InvalidAwr(awr));
@@ -89,7 +96,22 @@ impl DopplerParams {
         if !temperature_k.is_finite() {
             return Err(DopplerParamsError::NonFiniteTemperature(temperature_k));
         }
+        if temperature_k < 0.0 {
+            return Err(DopplerParamsError::NegativeTemperature(temperature_k));
+        }
         Ok(Self { temperature_k, awr })
+    }
+
+    /// Returns the effective sample temperature in Kelvin.
+    #[must_use]
+    pub fn temperature_k(&self) -> f64 {
+        self.temperature_k
+    }
+
+    /// Returns the atomic weight ratio (target mass / neutron mass).
+    #[must_use]
+    pub fn awr(&self) -> f64 {
+        self.awr
     }
 
     /// Velocity-space Doppler width u = √(k_B·T / AWR).
@@ -135,7 +157,7 @@ pub fn doppler_broaden(
 ) -> Vec<f64> {
     assert_eq!(energies.len(), cross_sections.len());
 
-    if params.temperature_k <= 0.0 || energies.is_empty() {
+    if params.temperature_k() <= 0.0 || energies.is_empty() {
         return cross_sections.to_vec();
     }
 
@@ -406,14 +428,83 @@ fn interpolate_cross_section(energies: &[f64], cross_sections: &[f64], energy: f
 mod tests {
     use super::*;
 
+    // --- DopplerParams::new() validation tests ---
+
+    #[test]
+    fn test_new_negative_temperature_rejected() {
+        assert_eq!(
+            DopplerParams::new(-1.0, 238.0).unwrap_err(),
+            DopplerParamsError::NegativeTemperature(-1.0)
+        );
+    }
+
+    #[test]
+    fn test_new_nan_temperature_rejected() {
+        let err = DopplerParams::new(f64::NAN, 238.0).unwrap_err();
+        assert!(
+            matches!(err, DopplerParamsError::NonFiniteTemperature(v) if v.is_nan()),
+            "NaN temperature should return NonFiniteTemperature"
+        );
+    }
+
+    #[test]
+    fn test_new_infinity_temperature_rejected() {
+        assert_eq!(
+            DopplerParams::new(f64::INFINITY, 238.0).unwrap_err(),
+            DopplerParamsError::NonFiniteTemperature(f64::INFINITY)
+        );
+    }
+
+    #[test]
+    fn test_new_negative_awr_rejected() {
+        assert_eq!(
+            DopplerParams::new(300.0, -1.0).unwrap_err(),
+            DopplerParamsError::InvalidAwr(-1.0)
+        );
+    }
+
+    #[test]
+    fn test_new_zero_awr_rejected() {
+        assert_eq!(
+            DopplerParams::new(300.0, 0.0).unwrap_err(),
+            DopplerParamsError::InvalidAwr(0.0)
+        );
+    }
+
+    #[test]
+    fn test_new_nan_awr_rejected() {
+        let err = DopplerParams::new(300.0, f64::NAN).unwrap_err();
+        assert!(
+            matches!(err, DopplerParamsError::InvalidAwr(v) if v.is_nan()),
+            "NaN AWR should return InvalidAwr"
+        );
+    }
+
+    #[test]
+    fn test_new_zero_temperature_allowed() {
+        let params = DopplerParams::new(0.0, 238.0);
+        assert!(params.is_ok(), "zero temperature should be allowed");
+        let p = params.unwrap();
+        assert_eq!(p.temperature_k(), 0.0);
+        assert_eq!(p.awr(), 238.0);
+    }
+
+    #[test]
+    fn test_new_valid_params() {
+        let params = DopplerParams::new(300.0, 238.0);
+        assert!(params.is_ok(), "valid params should succeed");
+        let p = params.unwrap();
+        assert_eq!(p.temperature_k(), 300.0);
+        assert_eq!(p.awr(), 238.0);
+    }
+
+    // --- End validation tests ---
+
     #[test]
     fn test_doppler_width_u238() {
         // SAMMY reports: Doppler width at 6.075 eV = 0.05159437 eV for U-238 at 300K
         // AWR = 238.050972, T = 300 K
-        let params = DopplerParams {
-            temperature_k: 300.0,
-            awr: 238.050972,
-        };
+        let params = DopplerParams::new(300.0, 238.050972).unwrap();
         let dw = params.doppler_width(6.075);
         // SAMMY uses kB = 0.000086173420 eV/K (slightly different from CODATA 2018)
         // Our kB = 8.617333262e-5. The difference is ~0.003%.
@@ -430,10 +521,7 @@ mod tests {
         // ex001: A=10, T=300K. Δ_D at 10 eV = √(4kBTE/AWR).
         // SAMMY reports Δ_D = 0.3216 eV, FWHM = 2√(ln2) × Δ_D = 0.5355 eV.
         // (SAMMY lpt uses slightly different kB, giving FWHM = 0.5378 eV.)
-        let params = DopplerParams {
-            temperature_k: 300.0,
-            awr: 10.0,
-        };
+        let params = DopplerParams::new(300.0, 10.0).unwrap();
         let dw = params.doppler_width(10.0);
         // Δ_D = √(4 × 8.617e-5 × 300 × 10 / 10) = √(0.10341) ≈ 0.3216 eV
         assert!(
@@ -448,10 +536,7 @@ mod tests {
         // At T=0, broadening should return the original cross-sections.
         let energies = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let xs = vec![10.0, 20.0, 30.0, 20.0, 10.0];
-        let params = DopplerParams {
-            temperature_k: 0.0,
-            awr: 238.0,
-        };
+        let params = DopplerParams::new(0.0, 238.0).unwrap();
         let broadened = doppler_broaden(&energies, &xs, &params);
         assert_eq!(broadened, xs);
     }
@@ -472,10 +557,7 @@ mod tests {
             })
             .collect();
 
-        let params = DopplerParams {
-            temperature_k: 300.0,
-            awr: 238.0,
-        };
+        let params = DopplerParams::new(300.0, 238.0).unwrap();
         let broadened = doppler_broaden(&energies, &xs, &params);
 
         // Find peaks
@@ -573,10 +655,7 @@ mod tests {
             .collect();
 
         // Apply FGM Doppler broadening.
-        let params = DopplerParams {
-            temperature_k: 300.0,
-            awr: 10.0,
-        };
+        let params = DopplerParams::new(300.0, 10.0).unwrap();
         let broadened = doppler_broaden(&energies, &unbroadened, &params);
 
         // SAMMY ex001a.lst reference points: (energy, broadened capture σ in barns).
@@ -644,10 +723,7 @@ mod tests {
             })
             .collect();
 
-        let params = DopplerParams {
-            temperature_k: 300.0,
-            awr: 100.0,
-        };
+        let params = DopplerParams::new(300.0, 100.0).unwrap();
         let broadened = doppler_broaden(&energies, &xs, &params);
 
         // Compute area (trapezoidal) for both
