@@ -47,30 +47,33 @@ use crate::reich_moore::CrossSections;
 // Issue #87: Pre-compute P_l(E_r) and J-groups once before the energy loop.
 
 /// Per-resonance invariants for SLBW, pre-computed once per resonance.
-struct PrecomputedSlbwResonance {
+pub(crate) struct PrecomputedSlbwResonance {
     /// Resonance energy E_r (eV).
-    energy: f64,
+    pub(crate) energy: f64,
     /// Capture width Γ_γ (eV).
-    gamma_g: f64,
+    pub(crate) gamma_g: f64,
     /// Fission width |Γ_fa| + |Γ_fb| (eV).
-    gamma_f: f64,
+    pub(crate) gamma_f: f64,
     /// Absolute neutron width |Γ_n(E_r)| (eV).
-    gn_abs: f64,
+    pub(crate) gn_abs: f64,
     /// Penetrability at resonance energy P_l(ρ_r).
     /// Pre-computed to avoid redundant `penetrability(l, rho_r)` calls.
-    p_at_er: f64,
+    pub(crate) p_at_er: f64,
 }
 
 /// Pre-computed J-group for SLBW.
-struct PrecomputedSlbwJGroup {
+pub(crate) struct PrecomputedSlbwJGroup {
     /// Statistical weight g_J.
-    g_j: f64,
+    pub(crate) g_j: f64,
     /// Pre-computed per-resonance quantities for this J-group.
-    resonances: Vec<PrecomputedSlbwResonance>,
+    pub(crate) resonances: Vec<PrecomputedSlbwResonance>,
 }
 
 /// Build pre-computed J-groups for SLBW.
-fn precompute_slbw_jgroups(
+///
+/// All quantities depend only on resonance parameters (not incident energy),
+/// so the result can be computed once and reused across all energy points.
+pub(crate) fn precompute_slbw_jgroups(
     resonances: &[nereids_endf::resonance::Resonance],
     l: u32,
     awr_l: f64,
@@ -203,8 +206,10 @@ pub fn slbw_cross_sections_for_range(
         let sin2_phi = sin_phi * sin_phi;
         let p_at_e = penetrability::penetrability(l, rho);
 
-        // Pre-compute J-groups and per-resonance invariants once.
-        // Issue #87: eliminates redundant group_by_j + P_l(E_r) per energy.
+        // Build J-groups and per-resonance invariants.
+        // Note: in the per-point path (slbw_cross_sections_for_range), this
+        // is rebuilt each call. The batch grid path (cross_sections_on_grid)
+        // hoists this above the energy loop via precompute_range_data.
         let j_groups =
             precompute_slbw_jgroups(&l_group.resonances, l, awr_l, range, l_group, target_spin);
 
@@ -263,6 +268,96 @@ pub fn slbw_cross_sections_for_range(
                 elastic += interf;
                 total += interf;
             }
+        }
+    }
+
+    (total, elastic, capture, fission)
+}
+
+/// Evaluate SLBW cross-sections for a single L-group using pre-cached J-groups.
+///
+/// This is the per-energy inner loop extracted from `slbw_cross_sections_for_range`,
+/// used by the batch grid path (`cross_sections_on_grid`) to avoid redundant
+/// J-group precomputation at every energy point.
+///
+/// # Arguments
+/// * `jgroups` — Pre-computed J-groups (energy-independent invariants).
+/// * `energy_ev` — Incident neutron energy (eV).
+/// * `pi_over_k2` — π/k² in barns at this energy.
+/// * `p_at_e` — Penetrability P_l(ρ) at incident energy.
+/// * `sin_phi` — sin(φ_l) at incident energy.
+/// * `cos_phi` — cos(φ_l) at incident energy.
+/// * `sin2_phi` — sin²(φ_l) at incident energy.
+///
+/// # Returns
+/// `(total, elastic, capture, fission)` in barns for this L-group.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn slbw_evaluate_with_cached_jgroups(
+    jgroups: &[PrecomputedSlbwJGroup],
+    energy_ev: f64,
+    pi_over_k2: f64,
+    p_at_e: f64,
+    sin_phi: f64,
+    cos_phi: f64,
+    sin2_phi: f64,
+) -> (f64, f64, f64, f64) {
+    let mut total = 0.0;
+    let mut elastic = 0.0;
+    let mut capture = 0.0;
+    let mut fission = 0.0;
+
+    for jg in jgroups {
+        let g_j = jg.g_j;
+
+        // Potential scattering for this (l, J) group.
+        let pot_scatter = pi_over_k2 * g_j * 4.0 * sin2_phi;
+        elastic += pot_scatter;
+        total += pot_scatter;
+
+        for res in &jg.resonances {
+            let e_r = res.energy;
+
+            // Energy-dependent neutron width:
+            // Γ_n(E) = Γ_n(E_r) × √(E/E_r) × P_l(E)/P_l(E_r)
+            // P_l(E_r) is pre-computed in res.p_at_er (Issue #87).
+            let gamma_n = if e_r.abs() > PIVOT_FLOOR && res.p_at_er > PIVOT_FLOOR {
+                res.gn_abs * (energy_ev / e_r.abs()).sqrt() * p_at_e / res.p_at_er
+            } else {
+                0.0
+            };
+
+            let gamma_total = gamma_n + res.gamma_g + res.gamma_f;
+            let de = energy_ev - e_r;
+            let denom = de * de + (gamma_total / 2.0).powi(2);
+
+            if denom < DIVISION_FLOOR {
+                continue;
+            }
+
+            // Capture cross-section (symmetric Breit-Wigner).
+            let sigma_c = pi_over_k2 * g_j * gamma_n * res.gamma_g / denom;
+            capture += sigma_c;
+            total += sigma_c;
+
+            // Fission cross-section.
+            let sigma_f = pi_over_k2 * g_j * gamma_n * res.gamma_f / denom;
+            fission += sigma_f;
+            total += sigma_f;
+
+            // Elastic resonance scattering (interference term + resonance peak).
+            let sigma_e_res = pi_over_k2 * g_j * gamma_n * gamma_n / denom;
+            elastic += sigma_e_res;
+            total += sigma_e_res;
+
+            // Interference between resonance and potential scattering.
+            let interf = pi_over_k2
+                * g_j
+                * 2.0
+                * gamma_n
+                * (de * cos_phi * 2.0 * sin_phi + (gamma_total / 2.0) * 2.0 * sin2_phi)
+                / denom;
+            elastic += interf;
+            total += interf;
         }
     }
 

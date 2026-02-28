@@ -123,33 +123,40 @@ struct PrecomputedJGroup3ch {
 ///
 /// This function is the core quantity that Issue #87 caches: previously
 /// it was recomputed for every resonance at every energy point.
+///
+/// When E_r ≈ 0, the penetrability is zero (matching SLBW behavior in
+/// `slbw.rs`). This ensures the result depends only on resonance
+/// parameters and is independent of the incident energy, enabling the
+/// precompute to be hoisted above the energy loop.
 fn penetrability_at_resonance(
     e_r: f64,
     l: u32,
     awr: f64,
     channel_radius: f64,
     ap_table: Option<&Tab1>,
-    p_l_fallback: f64,
 ) -> f64 {
     if e_r.abs() > PIVOT_FLOOR {
         let radius_at_er = ap_table.map_or(channel_radius, |t| t.evaluate(e_r.abs()));
         let rho_r = channel::rho(e_r.abs(), awr, radius_at_er);
         penetrability::penetrability(l, rho_r)
     } else {
-        p_l_fallback
+        // E_r ≈ 0 → P_l(0) = 0, so γ²_n = 0 regardless.
+        // Using 0.0 keeps this function energy-independent.
+        0.0
     }
 }
 
 /// Build pre-computed J-groups for the single-channel (non-fissile) path.
 ///
 /// Groups resonances by J, pre-computes γ²_n per resonance.
+/// All quantities depend only on resonance parameters (not incident energy),
+/// so the result can be computed once and reused across all energy points.
 fn precompute_jgroups_single(
     resonances: &[nereids_endf::resonance::Resonance],
     l: u32,
     awr: f64,
     channel_radius: f64,
     ap_table: Option<&Tab1>,
-    p_l_fallback: f64,
     target_spin: f64,
 ) -> Vec<PrecomputedJGroupSingle> {
     // Group by J (same logic as `group_by_j` but builds PrecomputedResonanceSingle directly).
@@ -160,8 +167,7 @@ fn precompute_jgroups_single(
         let j = res.j;
 
         // Precompute per-resonance invariants.
-        let p_at_er =
-            penetrability_at_resonance(res.energy, l, awr, channel_radius, ap_table, p_l_fallback);
+        let p_at_er = penetrability_at_resonance(res.energy, l, awr, channel_radius, ap_table);
         let gamma_n_reduced_sq = if p_at_er > PIVOT_FLOOR {
             res.gn.abs() / (2.0 * p_at_er)
         } else {
@@ -191,13 +197,15 @@ fn precompute_jgroups_single(
 }
 
 /// Build pre-computed J-groups for the 2-channel fission path.
+///
+/// All quantities depend only on resonance parameters (not incident energy),
+/// so the result can be computed once and reused across all energy points.
 fn precompute_jgroups_2ch(
     resonances: &[nereids_endf::resonance::Resonance],
     l: u32,
     awr: f64,
     channel_radius: f64,
     ap_table: Option<&Tab1>,
-    p_l_fallback: f64,
     target_spin: f64,
 ) -> Vec<PrecomputedJGroup2ch> {
     let mut j_values: Vec<f64> = Vec::new();
@@ -206,8 +214,7 @@ fn precompute_jgroups_2ch(
     for res in resonances {
         let j = res.j;
 
-        let p_at_er =
-            penetrability_at_resonance(res.energy, l, awr, channel_radius, ap_table, p_l_fallback);
+        let p_at_er = penetrability_at_resonance(res.energy, l, awr, channel_radius, ap_table);
 
         let beta_n = if p_at_er > PIVOT_FLOOR {
             let sign = if res.gn >= 0.0 { 1.0 } else { -1.0 };
@@ -245,13 +252,15 @@ fn precompute_jgroups_2ch(
 }
 
 /// Build pre-computed J-groups for the 3-channel fission path.
+///
+/// All quantities depend only on resonance parameters (not incident energy),
+/// so the result can be computed once and reused across all energy points.
 fn precompute_jgroups_3ch(
     resonances: &[nereids_endf::resonance::Resonance],
     l: u32,
     awr: f64,
     channel_radius: f64,
     ap_table: Option<&Tab1>,
-    p_l_fallback: f64,
     target_spin: f64,
 ) -> Vec<PrecomputedJGroup3ch> {
     let mut j_values: Vec<f64> = Vec::new();
@@ -260,8 +269,7 @@ fn precompute_jgroups_3ch(
     for res in resonances {
         let j = res.j;
 
-        let p_at_er =
-            penetrability_at_resonance(res.energy, l, awr, channel_radius, ap_table, p_l_fallback);
+        let p_at_er = penetrability_at_resonance(res.energy, l, awr, channel_radius, ap_table);
 
         let beta_n = if p_at_er > PIVOT_FLOOR {
             let sign = if res.gn >= 0.0 { 1.0 } else { -1.0 };
@@ -411,7 +419,14 @@ pub fn cross_sections_at_energy(data: &ResonanceData, energy_ev: f64) -> CrossSe
 
 /// Compute cross-sections over a grid of energies.
 ///
-/// Convenience wrapper that calls [`cross_sections_at_energy`] for each energy.
+/// Optimized batch evaluation: precomputes J-groups and per-resonance
+/// invariants (reduced width amplitudes, penetrability at E_r) once per
+/// resonance range, then evaluates each energy point using the cached data.
+/// This avoids redundant `group_by_j` + `penetrability(l, rho_r)` calls
+/// that the per-point API (`cross_sections_at_energy`) would repeat.
+///
+/// Issue #87: the precompute is hoisted above the energy loop so that
+/// `precompute_jgroups_*` runs O(ranges) times total, not O(ranges × energies).
 ///
 /// # Arguments
 /// * `data` — Parsed resonance parameters from ENDF.
@@ -420,10 +435,456 @@ pub fn cross_sections_at_energy(data: &ResonanceData, energy_ev: f64) -> CrossSe
 /// # Returns
 /// Vector of cross-sections, one per energy point.
 pub fn cross_sections_on_grid(data: &ResonanceData, energies: &[f64]) -> Vec<CrossSections> {
+    let awr = data.awr;
+
+    // Phase 1: precompute per-range data (J-groups, reduced widths, etc.).
+    // This runs once for the entire grid, not per energy point.
+    let precomputed: Vec<PrecomputedRangeData> = data
+        .ranges
+        .iter()
+        .enumerate()
+        .map(|(range_idx, range)| precompute_range_data(range, range_idx, data, awr))
+        .collect();
+
+    // Phase 2: evaluate each energy point using precomputed data.
     energies
         .iter()
-        .map(|&e| cross_sections_at_energy(data, e))
+        .map(|&energy_ev| {
+            let mut total = 0.0;
+            let mut elastic = 0.0;
+            let mut capture = 0.0;
+            let mut fission = 0.0;
+
+            for pc in &precomputed {
+                let in_range = if pc.half_open_upper {
+                    energy_ev >= pc.energy_low && energy_ev < pc.energy_high
+                } else {
+                    energy_ev >= pc.energy_low && energy_ev <= pc.energy_high
+                };
+                if !in_range {
+                    continue;
+                }
+
+                let (t, e, c, f) = evaluate_precomputed_range(pc, energy_ev, awr);
+                total += t;
+                elastic += e;
+                capture += c;
+                fission += f;
+            }
+
+            CrossSections {
+                total,
+                elastic,
+                capture,
+                fission,
+            }
+        })
         .collect()
+}
+
+// ─── Precomputed range data for batch grid evaluation ────────────────────────
+//
+// These types hold energy-independent invariants for a single resonance range,
+// precomputed once by `precompute_range_data` and reused for every energy point
+// in `cross_sections_on_grid`.
+
+/// Precomputed data for a single L-group within a Reich-Moore range.
+///
+/// Holds the J-group cache and metadata needed to compute energy-dependent
+/// channel parameters (rho, P_l, S_l, phi_l) at each energy point.
+enum PrecomputedRmLGroupData {
+    /// Non-fissile: single neutron channel, capture eliminated.
+    Single {
+        l: u32,
+        awr_l: f64,
+        /// L-group override radius (fm). 0.0 means use range radius.
+        apl: f64,
+        jgroups: Vec<PrecomputedJGroupSingle>,
+    },
+    /// One fission channel (gfa != 0, gfb == 0).
+    TwoCh {
+        l: u32,
+        awr_l: f64,
+        apl: f64,
+        jgroups: Vec<PrecomputedJGroup2ch>,
+    },
+    /// Two fission channels (both gfa and gfb != 0).
+    ThreeCh {
+        l: u32,
+        awr_l: f64,
+        apl: f64,
+        jgroups: Vec<PrecomputedJGroup3ch>,
+    },
+}
+
+/// Precomputed data for a single SLBW L-group.
+struct PrecomputedSlbwLGroupData {
+    l: u32,
+    awr_l: f64,
+    /// L-group override radius (fm). 0.0 means use range radius.
+    apl: f64,
+    jgroups: Vec<slbw::PrecomputedSlbwJGroup>,
+}
+
+/// Precomputed data for a single resonance range.
+///
+/// Wraps the formalism-specific precomputed L-group data plus the
+/// energy interval metadata needed for range dispatch.
+struct PrecomputedRangeData<'a> {
+    energy_low: f64,
+    energy_high: f64,
+    half_open_upper: bool,
+    kind: PrecomputedRangeKind<'a>,
+}
+
+/// Formalism-specific precomputed data for a range.
+enum PrecomputedRangeKind<'a> {
+    /// Reich-Moore (LRF=3): precomputed J-groups per L-group.
+    /// The range reference is kept for `scattering_radius_at(energy_ev)`.
+    ReichMoore {
+        range: &'a ResonanceRange,
+        l_groups: Vec<PrecomputedRmLGroupData>,
+    },
+    /// SLBW/MLBW (LRF=1,2): precomputed J-groups per L-group.
+    /// The range reference is kept for `scattering_radius_at(energy_ev)`.
+    Slbw {
+        range: &'a ResonanceRange,
+        l_groups: Vec<PrecomputedSlbwLGroupData>,
+    },
+    /// R-Matrix Limited (LRF=7): no precompute, evaluate per-energy.
+    RMatrixLimited(&'a nereids_endf::resonance::RmlData),
+    /// URR: no precompute, evaluate per-energy.
+    Urr {
+        urr_data: &'a nereids_endf::resonance::UrrData,
+        range: &'a ResonanceRange,
+    },
+    /// Not evaluable (skip).
+    Skip,
+}
+
+/// Build precomputed range data for a single resonance range.
+///
+/// This extracts all energy-independent quantities (J-group structure,
+/// reduced width amplitudes, penetrability at resonance energies) so they
+/// can be reused across all energy points without redundant computation.
+fn precompute_range_data<'a>(
+    range: &'a ResonanceRange,
+    range_idx: usize,
+    data: &'a ResonanceData,
+    awr: f64,
+) -> PrecomputedRangeData<'a> {
+    // Half-open upper bound logic (same as cross_sections_at_energy).
+    let next_starts_here = data
+        .ranges
+        .get(range_idx + 1)
+        .is_some_and(|next| next.energy_low == range.energy_high && range_is_evaluable(next));
+
+    let make = |kind| PrecomputedRangeData {
+        energy_low: range.energy_low,
+        energy_high: range.energy_high,
+        half_open_upper: next_starts_here,
+        kind,
+    };
+
+    // URR ranges.
+    if let Some(urr_data) = &range.urr {
+        return make(PrecomputedRangeKind::Urr { urr_data, range });
+    }
+
+    if !range.resolved {
+        return make(PrecomputedRangeKind::Skip);
+    }
+
+    // RML ranges.
+    if let Some(rml) = &range.rml {
+        return make(PrecomputedRangeKind::RMatrixLimited(rml));
+    }
+
+    // SLBW/MLBW ranges: precompute J-groups per L-group.
+    if matches!(
+        range.formalism,
+        ResonanceFormalism::SLBW | ResonanceFormalism::MLBW
+    ) {
+        let l_groups: Vec<PrecomputedSlbwLGroupData> = range
+            .l_groups
+            .iter()
+            .map(|l_group| {
+                let l = l_group.l;
+                let awr_l = if l_group.awr > 0.0 { l_group.awr } else { awr };
+                let jgroups = slbw::precompute_slbw_jgroups(
+                    &l_group.resonances,
+                    l,
+                    awr_l,
+                    range,
+                    l_group,
+                    range.target_spin,
+                );
+                PrecomputedSlbwLGroupData {
+                    l,
+                    awr_l,
+                    apl: l_group.apl,
+                    jgroups,
+                }
+            })
+            .collect();
+        return make(PrecomputedRangeKind::Slbw { range, l_groups });
+    }
+
+    // Reich-Moore ranges: precompute J-groups per L-group.
+    if range.formalism == ResonanceFormalism::ReichMoore {
+        let rm_l_groups: Vec<PrecomputedRmLGroupData> = range
+            .l_groups
+            .iter()
+            .map(|l_group| {
+                let l = l_group.l;
+                let awr_l = if l_group.awr > 0.0 { l_group.awr } else { awr };
+
+                // Channel radius for precompute: when APL > 0, use it; otherwise
+                // use the constant scattering_radius. The ap_table (NRO=1) case
+                // is handled inside penetrability_at_resonance, which evaluates
+                // the table at E_r for each resonance.
+                let channel_radius = if l_group.apl > 0.0 {
+                    l_group.apl
+                } else {
+                    range.scattering_radius
+                };
+                let ap_table_ref: Option<&Tab1> = if l_group.apl > 0.0 {
+                    None
+                } else {
+                    range.ap_table.as_ref()
+                };
+
+                let has_fission = l_group
+                    .resonances
+                    .iter()
+                    .any(|r| r.gfa.abs() > PIVOT_FLOOR || r.gfb.abs() > PIVOT_FLOOR);
+                let has_two_fission = l_group.resonances.iter().any(|r| r.gfb.abs() > PIVOT_FLOOR);
+
+                if !has_fission {
+                    let jgroups = precompute_jgroups_single(
+                        &l_group.resonances,
+                        l,
+                        awr_l,
+                        channel_radius,
+                        ap_table_ref,
+                        range.target_spin,
+                    );
+                    PrecomputedRmLGroupData::Single {
+                        l,
+                        awr_l,
+                        apl: l_group.apl,
+                        jgroups,
+                    }
+                } else if !has_two_fission {
+                    let jgroups = precompute_jgroups_2ch(
+                        &l_group.resonances,
+                        l,
+                        awr_l,
+                        channel_radius,
+                        ap_table_ref,
+                        range.target_spin,
+                    );
+                    PrecomputedRmLGroupData::TwoCh {
+                        l,
+                        awr_l,
+                        apl: l_group.apl,
+                        jgroups,
+                    }
+                } else {
+                    let jgroups = precompute_jgroups_3ch(
+                        &l_group.resonances,
+                        l,
+                        awr_l,
+                        channel_radius,
+                        ap_table_ref,
+                        range.target_spin,
+                    );
+                    PrecomputedRmLGroupData::ThreeCh {
+                        l,
+                        awr_l,
+                        apl: l_group.apl,
+                        jgroups,
+                    }
+                }
+            })
+            .collect();
+        return make(PrecomputedRangeKind::ReichMoore {
+            range,
+            l_groups: rm_l_groups,
+        });
+    }
+
+    // Unrecognized formalism: skip.
+    make(PrecomputedRangeKind::Skip)
+}
+
+/// Evaluate cross-sections for a precomputed range at a single energy.
+///
+/// Uses the cached J-groups and per-resonance invariants to avoid
+/// redundant precomputation. Only energy-dependent quantities (rho,
+/// P_l, S_l, phi_l, pi/k^2) are computed per call.
+fn evaluate_precomputed_range(
+    pc: &PrecomputedRangeData,
+    energy_ev: f64,
+    awr: f64,
+) -> (f64, f64, f64, f64) {
+    match &pc.kind {
+        PrecomputedRangeKind::Skip => (0.0, 0.0, 0.0, 0.0),
+
+        PrecomputedRangeKind::RMatrixLimited(rml) => {
+            rmatrix_limited::cross_sections_for_rml_range(rml, energy_ev)
+        }
+
+        PrecomputedRangeKind::Urr { urr_data, range } => {
+            let ap_fm = range.scattering_radius_at(energy_ev);
+            urr::urr_cross_sections(urr_data, energy_ev, ap_fm)
+        }
+
+        PrecomputedRangeKind::Slbw { range, l_groups } => {
+            let pi_over_k2 = channel::pi_over_k_squared_barns(energy_ev, awr);
+            let mut total = 0.0;
+            let mut elastic = 0.0;
+            let mut capture = 0.0;
+            let mut fission = 0.0;
+
+            for lg in l_groups {
+                // Channel radius at incident energy: use APL if set,
+                // otherwise the range's (possibly energy-dependent) radius.
+                let channel_radius = if lg.apl > 0.0 {
+                    lg.apl
+                } else {
+                    range.scattering_radius_at(energy_ev)
+                };
+
+                let rho = channel::rho(energy_ev, lg.awr_l, channel_radius);
+                let phi = penetrability::phase_shift(lg.l, rho);
+                let sin_phi = phi.sin();
+                let cos_phi = phi.cos();
+                let sin2_phi = sin_phi * sin_phi;
+                let p_at_e = penetrability::penetrability(lg.l, rho);
+
+                let (t, e, c, f) = slbw::slbw_evaluate_with_cached_jgroups(
+                    &lg.jgroups,
+                    energy_ev,
+                    pi_over_k2,
+                    p_at_e,
+                    sin_phi,
+                    cos_phi,
+                    sin2_phi,
+                );
+                total += t;
+                elastic += e;
+                capture += c;
+                fission += f;
+            }
+
+            (total, elastic, capture, fission)
+        }
+
+        PrecomputedRangeKind::ReichMoore { range, l_groups } => {
+            let mut total = 0.0;
+            let mut elastic = 0.0;
+            let mut capture = 0.0;
+            let mut fission = 0.0;
+
+            for lg in l_groups {
+                let (l, awr_l, apl) = match lg {
+                    PrecomputedRmLGroupData::Single { l, awr_l, apl, .. } => (*l, *awr_l, *apl),
+                    PrecomputedRmLGroupData::TwoCh { l, awr_l, apl, .. } => (*l, *awr_l, *apl),
+                    PrecomputedRmLGroupData::ThreeCh { l, awr_l, apl, .. } => (*l, *awr_l, *apl),
+                };
+
+                // Channel radius at incident energy: use APL if set,
+                // otherwise the range's (possibly energy-dependent) radius.
+                let channel_radius = if apl > 0.0 {
+                    apl
+                } else {
+                    range.scattering_radius_at(energy_ev)
+                };
+
+                let rho = channel::rho(energy_ev, awr_l, channel_radius);
+                let p_l = penetrability::penetrability(l, rho);
+                let s_l = penetrability::shift_factor(l, rho);
+                let phi_l = penetrability::phase_shift(l, rho);
+
+                let (t, e, c, f) = match lg {
+                    PrecomputedRmLGroupData::Single { jgroups, .. } => {
+                        let mut t = 0.0;
+                        let mut e = 0.0;
+                        let mut c = 0.0;
+                        let mut f = 0.0;
+                        for jg in jgroups {
+                            let (jt, je, jc, jf) = reich_moore_spin_group_precomputed(
+                                &jg.resonances,
+                                energy_ev,
+                                awr_l,
+                                jg.g_j,
+                                p_l,
+                                s_l,
+                                phi_l,
+                            );
+                            t += jt;
+                            e += je;
+                            c += jc;
+                            f += jf;
+                        }
+                        (t, e, c, f)
+                    }
+                    PrecomputedRmLGroupData::TwoCh { jgroups, .. } => {
+                        let mut t = 0.0;
+                        let mut e = 0.0;
+                        let mut c = 0.0;
+                        let mut f = 0.0;
+                        for jg in jgroups {
+                            let (jt, je, jc, jf) = reich_moore_2ch_precomputed(
+                                &jg.resonances,
+                                energy_ev,
+                                awr_l,
+                                jg.g_j,
+                                p_l,
+                                s_l,
+                                phi_l,
+                            );
+                            t += jt;
+                            e += je;
+                            c += jc;
+                            f += jf;
+                        }
+                        (t, e, c, f)
+                    }
+                    PrecomputedRmLGroupData::ThreeCh { jgroups, .. } => {
+                        let mut t = 0.0;
+                        let mut e = 0.0;
+                        let mut c = 0.0;
+                        let mut f = 0.0;
+                        for jg in jgroups {
+                            let (jt, je, jc, jf) = reich_moore_3ch_precomputed(
+                                &jg.resonances,
+                                energy_ev,
+                                awr_l,
+                                jg.g_j,
+                                p_l,
+                                s_l,
+                                phi_l,
+                            );
+                            t += jt;
+                            e += je;
+                            c += jc;
+                            f += jf;
+                        }
+                        (t, e, c, f)
+                    }
+                };
+
+                total += t;
+                elastic += e;
+                capture += c;
+                fission += f;
+            }
+
+            (total, elastic, capture, fission)
+        }
+    }
 }
 
 /// Can this range actually produce non-zero cross-sections?
@@ -533,15 +994,16 @@ fn cross_sections_for_range(
         match range.formalism {
             ResonanceFormalism::ReichMoore => {
                 if !has_fission {
-                    // Single-channel (non-fissile): precompute J-groups once.
-                    // Issue #87 optimization: group_by_j + p_at_er cached.
+                    // Single-channel (non-fissile): build J-groups.
+                    // Note: in the per-point path (cross_sections_at_energy),
+                    // this is rebuilt each call. The batch grid path
+                    // (cross_sections_on_grid) hoists this above the energy loop.
                     let jgroups = precompute_jgroups_single(
                         &l_group.resonances,
                         l,
                         awr_l,
                         channel_radius,
                         ap_table_ref,
-                        p_l,
                         target_spin,
                     );
                     for jg in &jgroups {
@@ -560,14 +1022,13 @@ fn cross_sections_for_range(
                         fission += f;
                     }
                 } else if !has_two_fission {
-                    // 2-channel fission: precompute J-groups once.
+                    // 2-channel fission: build J-groups (see note above).
                     let jgroups = precompute_jgroups_2ch(
                         &l_group.resonances,
                         l,
                         awr_l,
                         channel_radius,
                         ap_table_ref,
-                        p_l,
                         target_spin,
                     );
                     for jg in &jgroups {
@@ -586,14 +1047,13 @@ fn cross_sections_for_range(
                         fission += f;
                     }
                 } else {
-                    // 3-channel fission: precompute J-groups once.
+                    // 3-channel fission: build J-groups (see note above).
                     let jgroups = precompute_jgroups_3ch(
                         &l_group.resonances,
                         l,
                         awr_l,
                         channel_radius,
                         ap_table_ref,
-                        p_l,
                         target_spin,
                     );
                     for jg in &jgroups {
@@ -1390,5 +1850,116 @@ mod tests {
             "Fission must be finite and non-negative, got {}",
             xs.fission
         );
+    }
+
+    /// `cross_sections_on_grid` (batch, precompute hoisted) must produce
+    /// identical results to `cross_sections_at_energy` (per-point) for
+    /// Reich-Moore data.
+    #[test]
+    fn test_grid_matches_per_point_reich_moore() {
+        let data =
+            make_single_resonance_data(6.674, 1.493e-3, 23.0e-3, 0.5, 0, 236.006, 0.0, 9.4285);
+
+        let energies = [0.01, 0.1, 1.0, 5.0, 6.0, 6.674, 7.0, 10.0, 100.0, 1000.0];
+        let grid_results = cross_sections_on_grid(&data, &energies);
+
+        for (i, &e) in energies.iter().enumerate() {
+            let point = cross_sections_at_energy(&data, e);
+            let grid = &grid_results[i];
+            let eps = 1e-12;
+            assert!(
+                (point.total - grid.total).abs() < eps,
+                "total mismatch at E={e}: per_point={} grid={}",
+                point.total,
+                grid.total
+            );
+            assert!(
+                (point.elastic - grid.elastic).abs() < eps,
+                "elastic mismatch at E={e}: per_point={} grid={}",
+                point.elastic,
+                grid.elastic
+            );
+            assert!(
+                (point.capture - grid.capture).abs() < eps,
+                "capture mismatch at E={e}: per_point={} grid={}",
+                point.capture,
+                grid.capture
+            );
+            assert!(
+                (point.fission - grid.fission).abs() < eps,
+                "fission mismatch at E={e}: per_point={} grid={}",
+                point.fission,
+                grid.fission
+            );
+        }
+    }
+
+    /// `cross_sections_on_grid` must match `cross_sections_at_energy` for
+    /// SLBW-formalism data too (the batch path precomputes SLBW J-groups).
+    #[test]
+    fn test_grid_matches_per_point_slbw() {
+        let data = make_slbw_data(ResonanceFormalism::SLBW);
+
+        let energies = [0.1, 1.0, 5.0, 6.0, 6.674, 7.0, 10.0, 100.0];
+        let grid_results = cross_sections_on_grid(&data, &energies);
+
+        for (i, &e) in energies.iter().enumerate() {
+            let point = cross_sections_at_energy(&data, e);
+            let grid = &grid_results[i];
+            let eps = 1e-12;
+            assert!(
+                (point.total - grid.total).abs() < eps,
+                "total mismatch at E={e}: per_point={} grid={}",
+                point.total,
+                grid.total
+            );
+            assert!(
+                (point.capture - grid.capture).abs() < eps,
+                "capture mismatch at E={e}: per_point={} grid={}",
+                point.capture,
+                grid.capture
+            );
+        }
+    }
+
+    /// `cross_sections_on_grid` must match per-point for the full U-238
+    /// ENDF file (many resonances, L-groups, J-groups).
+    #[test]
+    fn test_grid_matches_per_point_u238_full() {
+        let endf_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("../SAMMY/SAMMY/samexm_new/ex027_new/ex027.endf");
+
+        if !endf_path.exists() {
+            eprintln!("Skipping: SAMMY ENDF file not found at {:?}", endf_path);
+            return;
+        }
+
+        let endf_text = std::fs::read_to_string(&endf_path).unwrap();
+        let data = nereids_endf::parser::parse_endf_file2(&endf_text).unwrap();
+
+        let energies: Vec<f64> = (0..100).map(|i| 1.0 + i as f64 * 0.5).collect();
+        let grid_results = cross_sections_on_grid(&data, &energies);
+
+        for (i, &e) in energies.iter().enumerate() {
+            let point = cross_sections_at_energy(&data, e);
+            let grid = &grid_results[i];
+            let eps = 1e-10;
+            assert!(
+                (point.total - grid.total).abs() < eps * point.total.abs().max(1.0),
+                "total mismatch at E={e}: per_point={} grid={}",
+                point.total,
+                grid.total
+            );
+            assert!(
+                (point.capture - grid.capture).abs() < eps * point.capture.abs().max(1.0),
+                "capture mismatch at E={e}: per_point={} grid={}",
+                point.capture,
+                grid.capture
+            );
+        }
     }
 }
