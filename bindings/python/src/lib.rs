@@ -160,7 +160,8 @@ impl PyResonanceData {
 #[pyclass(name = "FitResult")]
 struct PyFitResult {
     densities: Vec<f64>,
-    uncertainties: Vec<f64>,
+    /// `None` when covariance computation was skipped.
+    uncertainties: Option<Vec<f64>>,
     reduced_chi_squared: f64,
     converged: bool,
     iterations: usize,
@@ -179,9 +180,15 @@ impl PyFitResult {
     }
 
     /// Uncertainties on fitted densities.
+    ///
+    /// Returns NaN-filled array when covariance computation was skipped.
     #[getter]
     fn uncertainties<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
-        PyArray1::from_vec(py, self.uncertainties.clone())
+        let unc = self
+            .uncertainties
+            .clone()
+            .unwrap_or_else(|| vec![f64::NAN; self.densities.len()]);
+        PyArray1::from_vec(py, unc)
     }
 
     /// Reduced chi-squared of the fit.
@@ -685,29 +692,42 @@ fn fit_spectrum(
                 let lm_result =
                     lm::levenberg_marquardt(&model, &t_owned, &s_owned, &mut params, &config);
 
-                let n_total = n_isotopes + if fit_temperature { 1 } else { 0 };
                 let densities: Vec<f64> = (0..n_isotopes).map(|i| lm_result.params[i]).collect();
-                let unc = lm_result
-                    .uncertainties
-                    .unwrap_or_else(|| vec![f64::NAN; n_total]);
-                if unc.len() < n_total {
-                    return Err(format!(
-                        "uncertainty vector length ({}) should be >= parameter count ({})",
-                        unc.len(),
-                        n_total
-                    ));
-                }
-                let uncertainties: Vec<f64> = (0..n_isotopes)
-                    .map(|i| unc.get(i).copied().unwrap_or(f64::NAN))
-                    .collect();
 
-                let (fitted_temperature, fitted_temperature_unc) = if fit_temperature {
-                    (
-                        Some(lm_result.params[n_isotopes]),
-                        Some(unc.get(n_isotopes).copied().unwrap_or(f64::NAN)),
-                    )
-                } else {
-                    (None, None)
+                let (uncertainties, fitted_temperature, fitted_temperature_unc) = match lm_result
+                    .uncertainties
+                {
+                    Some(unc) => {
+                        let n_total = n_isotopes + if fit_temperature { 1 } else { 0 };
+                        if unc.len() < n_total {
+                            return Err(format!(
+                                "uncertainty vector length ({}) should be >= parameter count ({})",
+                                unc.len(),
+                                n_total
+                            ));
+                        }
+                        let density_unc: Vec<f64> = (0..n_isotopes)
+                            .map(|i| unc.get(i).copied().unwrap_or(f64::NAN))
+                            .collect();
+                        let (t, t_unc) = if fit_temperature {
+                            (
+                                Some(lm_result.params[n_isotopes]),
+                                Some(unc.get(n_isotopes).copied().unwrap_or(f64::NAN)),
+                            )
+                        } else {
+                            (None, None)
+                        };
+                        (Some(density_unc), t, t_unc)
+                    }
+                    None => {
+                        // Covariance was skipped — no uncertainties.
+                        let t = if fit_temperature {
+                            Some(lm_result.params[n_isotopes])
+                        } else {
+                            None
+                        };
+                        (None, t, None)
+                    }
                 };
 
                 Ok(PyFitResult {
@@ -827,8 +847,8 @@ fn fit_spectrum(
                 let densities: Vec<f64> =
                     (0..n_isotopes).map(|i| poisson_result.params[i]).collect();
                 // Poisson optimizer does not compute uncertainties from covariance;
-                // report NaN for now.
-                let uncertainties = vec![f64::NAN; n_isotopes];
+                // report None (Python getter will return NaN-filled array).
+                let uncertainties: Option<Vec<f64>> = None;
 
                 let (fitted_temperature, fitted_temperature_unc) = if fit_temperature {
                     (Some(poisson_result.params[n_isotopes]), Some(f64::NAN))
@@ -1525,6 +1545,9 @@ fn py_spatial_map(
                 },
                 precomputed_cross_sections: None,
                 fit_temperature: false,
+                // spatial_map internally sets compute_covariance=false for
+                // per-pixel speed; the value here is the caller's default.
+                compute_covariance: true,
             };
 
             // Clone arrays only after all validation passes
@@ -1766,6 +1789,7 @@ fn py_fit_roi(
         },
         precomputed_cross_sections: None,
         fit_temperature: false,
+        compute_covariance: true,
     };
 
     // Clone arrays only after all validation passes

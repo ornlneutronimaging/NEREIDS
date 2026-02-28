@@ -345,6 +345,7 @@ fn build_fit_config(state: &AppState) -> Option<FitConfig> {
         lm_config: state.lm_config.clone(),
         precomputed_cross_sections: None,
         fit_temperature: false,
+        compute_covariance: true,
     })
 }
 

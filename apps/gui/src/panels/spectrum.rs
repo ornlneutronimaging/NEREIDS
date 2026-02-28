@@ -145,9 +145,14 @@ pub fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
             .enumerate()
         {
             if i < result.densities.len() {
+                let unc_str = result
+                    .uncertainties
+                    .as_ref()
+                    .and_then(|u| u.get(i))
+                    .map_or("N/A".to_string(), |u| format!("{:.2e}", u));
                 ui.label(format!(
-                    "  {}: rho = {:.6e} +/- {:.2e} atoms/barn",
-                    entry.symbol, result.densities[i], result.uncertainties[i]
+                    "  {}: rho = {:.6e} +/- {} atoms/barn",
+                    entry.symbol, result.densities[i], unc_str
                 ));
             }
         }
