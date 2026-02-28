@@ -625,7 +625,17 @@ fn parse_rmatrix_limited_range(
         };
         let npl = checked_count(sg_cont.n1, "NPL")?; // 6*(NCH+1)
         let nch_plus_one = checked_count(sg_cont.n2, "NCH+1")?; // NCH+1
-        let nch = nch_plus_one.saturating_sub(1);
+
+        // NCH+1 <= 1 would imply zero physical channels (NCH = 0), which is
+        // meaningless for a resonance range — every spin group must have at
+        // least one channel.
+        // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f.
+        if nch_plus_one <= 1 {
+            return Err(EndfParseError::UnsupportedFormat(format!(
+                "RML spin-group LIST: NCH+1 must be >= 2, got NCH+1={nch_plus_one}"
+            )));
+        }
+        let nch = nch_plus_one - 1;
 
         let sg_values = parse_list_values(ctx.lines, ctx.pos, npl)?;
 
@@ -1425,6 +1435,9 @@ fn parse_urr_range(
             l_groups.push(UrrLGroup { l, awri, j_groups });
         }
     }
+
+    // ENDF-6 §2.2.2: LRF for URR is 1 or 2. Guard before i32→u32 cast.
+    debug_assert!(lrf == 1 || lrf == 2, "URR LRF must be 1 or 2, got: {lrf}");
 
     let urr = UrrData {
         lrf: lrf as u32,

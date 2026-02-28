@@ -493,17 +493,15 @@ fn run_spatial_map(state: &mut AppState) {
             Ok(r) => {
                 // Only send result if not cancelled — receiver may already be dropped
                 if !cancel.load(Ordering::Relaxed) {
-                    let _ = tx.send(r);
+                    let _ = tx.send(Ok(r));
                 }
             }
             Err(nereids_pipeline::error::PipelineError::Cancelled) => {
                 // Cancelled — do nothing, receiver may already be dropped
             }
             Err(e) => {
-                // Validation error — receiver is still alive but we have no result.
-                // The channel will be closed when tx drops, signalling the error.
-                // Log to stderr so the error is not silently swallowed.
-                eprintln!("spatial_map error: {e}");
+                // Send error through channel so the GUI polling code can display it.
+                let _ = tx.send(Err(format!("{e}")));
             }
         }
     });
