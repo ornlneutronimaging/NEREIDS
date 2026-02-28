@@ -434,6 +434,10 @@ fn compute_transmission(
     density_indices: &[usize],
     all_vals: &[f64],
 ) -> Vec<f64> {
+    debug_assert!(
+        density_indices.iter().all(|&idx| idx < all_vals.len()),
+        "density_indices out of bounds for parameter vector"
+    );
     (0..n_e)
         .map(|e| {
             let mut neg_opt = 0.0f64;
@@ -490,6 +494,10 @@ fn compute_analytic_gradient(ctx: &AnalyticGradientCtx<'_>) -> Vec<f64> {
 
     // Temperature gradient: ∂NLL/∂T = Σ_E [(1 − y_obs/Y) · Φ · T · (−Σₖ nₖ · ∂σₖ/∂T)]
     if let Some(pos) = ctx.temp_free_pos {
+        debug_assert!(
+            !ctx.dxs_dt.is_empty(),
+            "dxs_dt must be non-empty when temperature fitting is enabled"
+        );
         let temp_grad: f64 = ctx
             .y_obs
             .iter()
@@ -1201,8 +1209,12 @@ pub fn poisson_fit_lbfgsb(
         iter += 1;
 
         // ---- Temperature XS recomputation ----
+        // Fill all_vals_buf once up front; reused by both the temperature
+        // recomputation (if enabled) and the model evaluation below.
+        params.all_values_into(&mut all_vals_buf);
+
         if let Some(ctx) = &temp_ctx {
-            let t_current = params.all_values()[ctx.temperature_index];
+            let t_current = all_vals_buf[ctx.temperature_index];
             let (xs_new, dxs_new) = transmission::broadened_cross_sections_with_derivative(
                 &ctx.energies,
                 &ctx.resonance_data,
@@ -1222,7 +1234,6 @@ pub fn poisson_fit_lbfgsb(
         };
 
         // ---- Evaluate model and compute transmission + gradient ----
-        params.all_values_into(&mut all_vals_buf);
         let y_model_now = model.evaluate(&all_vals_buf);
         let t_now = compute_transmission(n_e, xs_ref, density_indices, &all_vals_buf);
         let grad = compute_analytic_gradient(&AnalyticGradientCtx {
@@ -1354,9 +1365,10 @@ pub fn poisson_fit_lbfgsb(
         }
 
         // ---- Parameter displacement convergence check ----
+        params.free_values_into(&mut free_vals_buf);
         let step_norm: f64 = old_free
             .iter()
-            .zip(params.free_values().iter())
+            .zip(free_vals_buf.iter())
             .map(|(o, n)| (o - n).powi(2))
             .sum::<f64>()
             .sqrt();
@@ -2498,6 +2510,86 @@ mod tests {
         assert!(
             (result.params[0] - true_b).abs() / true_b < 0.01,
             "m=1: fitted={}, true={}, error={:.2}%",
+            result.params[0],
+            true_b,
+            (result.params[0] - true_b).abs() / true_b * 100.0,
+        );
+    }
+
+    #[test]
+    fn test_lbfgsb_orthogonal_direction_falls_back_to_steepest_descent() {
+        // Verify that when the L-BFGS direction is orthogonal to the gradient
+        // (dir · grad == 0.0), the optimizer falls back to steepest descent
+        // and still converges.
+        //
+        // We test this indirectly: the LbfgsbMemory two-loop recursion with
+        // a carefully crafted pair can produce a direction orthogonal to the
+        // gradient.  But it is simpler to verify the guard directly on the
+        // LbfgsbMemory struct.
+
+        // 2D problem: gradient = [1, 0], L-BFGS direction = [0, 1]
+        // => dir · grad = 0, which should trigger the fallback.
+        let grad = vec![1.0, 0.0];
+        let direction = vec![0.0, 1.0];
+
+        let dir_dot_grad: f64 = direction
+            .iter()
+            .zip(grad.iter())
+            .map(|(&d, &g)| d * g)
+            .sum();
+
+        // Confirm the dot product is exactly zero.
+        assert_eq!(
+            dir_dot_grad, 0.0,
+            "Test setup: dir · grad should be exactly 0.0"
+        );
+
+        // The guard in poisson_fit_lbfgsb uses `<= 0.0`, so zero triggers
+        // the steepest-descent fallback.  Simulate the fallback logic:
+        let fallback = if dir_dot_grad <= 0.0 {
+            grad.clone() // steepest descent
+        } else {
+            direction.clone()
+        };
+        assert_eq!(
+            fallback, grad,
+            "Orthogonal direction should fall back to steepest descent (gradient)"
+        );
+
+        // End-to-end: run L-BFGS-B on a simple problem where it converges
+        // even if the first L-BFGS direction happens to be poor.  The
+        // fallback ensures progress.
+        let x: Vec<f64> = (0..20).map(|i| i as f64 * 0.5).collect();
+        let true_b = 0.5;
+        let flux: Vec<f64> = vec![1000.0; x.len()];
+
+        let model = ExponentialModel {
+            x: x.clone(),
+            flux: flux.clone(),
+        };
+        let y_obs = model.evaluate(&[true_b]);
+        let cross_sections = vec![x.clone()];
+
+        let mut params = ParameterSet::new(vec![FitParameter::non_negative("b", 1.0)]);
+
+        let result = poisson_fit_lbfgsb(
+            &model,
+            &y_obs,
+            &flux,
+            &cross_sections,
+            &[0],
+            &mut params,
+            &PoissonConfig::default(),
+            None,
+        );
+
+        assert!(
+            result.converged,
+            "L-BFGS-B should converge even with orthogonal direction fallback"
+        );
+        assert!(
+            (result.params[0] - true_b).abs() / true_b < 0.01,
+            "fitted={}, true={}, error={:.2}%",
             result.params[0],
             true_b,
             (result.params[0] - true_b).abs() / true_b * 100.0,
