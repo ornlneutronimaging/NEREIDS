@@ -200,7 +200,7 @@ After Phase A completes (zero P1s) and branches are pushed:
 2. When Copilot reviews are in, fetch comments using the extraction script:
 
 ```bash
-pixi run python scripts/fetch_copilot_reviews.py {pr_numbers...} --dedup
+pixi run copilot-reviews {pr_numbers...} --dedup
 ```
 
 The `--dedup` flag groups similar comments (word-level Jaccard + shared
@@ -209,7 +209,7 @@ suggestion at multiple call sites.
 
 For machine-readable output (useful for automated processing):
 ```bash
-pixi run python scripts/fetch_copilot_reviews.py {pr_numbers...} --json --dedup
+pixi run copilot-reviews {pr_numbers...} --json --dedup
 ```
 
 3. Classify each Copilot comment as P1 or P2
@@ -290,6 +290,11 @@ When launching implementation or fix subagents, ALWAYS include:
 
 - **Tooling**: "Use `pixi run build` / `pixi run test-python` — never
   raw `maturin develop` or `pip install`."
+- **Commits**: "Use `scripts/worktree-commit.sh <worktree-name> '<message>' [files]`
+  for all commits. This validates the working directory and GPG-signs.
+  Do NOT use raw `git add && git commit` — it risks wrong-directory commits."
+- **GitHub issues**: "Use `pixi run gh-issues` for issue/PR queries
+  — never raw `gh` commands or `python scripts/...`."
 - **Pattern matching**: "Match patterns already used in the file you're
   editing. Check existing code before introducing new API calls."
 - **Pre-commit**: "Run the pre-commit checklist from CLAUDE.md."

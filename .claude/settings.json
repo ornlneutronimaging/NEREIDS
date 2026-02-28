@@ -31,7 +31,10 @@
       "Bash(gh issue *)",
       "Bash(gh pr *)",
       "Bash(gh api *)",
-      "Bash(codex review *)"
+      "Bash(codex review *)",
+      "Bash(scripts/worktree-commit.sh *)",
+      "Bash(./scripts/worktree-commit.sh *)",
+      "Bash(bash scripts/worktree-commit.sh *)"
     ]
   }
 }

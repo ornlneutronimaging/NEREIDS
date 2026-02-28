@@ -38,3 +38,5 @@ test = { depends-on = ["test-rust", "test-python"] }
 fmt = "cargo fmt --all"
 clippy = "cargo clippy --workspace -- -D warnings"
 check = { depends-on = ["fmt", "clippy", "test"] }
+gh-issues = { cmd = "python scripts/gh_issues.py", description = "Query GitHub issues/PRs consistently" }
+copilot-reviews = { cmd = "python scripts/fetch_copilot_reviews.py", description = "Fetch Copilot PR review comments" }
