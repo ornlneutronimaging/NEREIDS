@@ -57,12 +57,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - uses: actions/setup-python@v5
+      - name: Install pixi
+        uses: prefix-dev/setup-pixi@v0.9.4
         with:
-          python-version: "3.12"
+          pixi-version: v0.62.2
+          run-install: false
 
-      - name: Install maturin
-        run: pip install maturin
+      - name: Install dependencies
+        run: pixi install
 
-      - name: Build Python bindings
-        run: maturin build --manifest-path bindings/python/Cargo.toml
+      - name: Build and test Python bindings
+        run: pixi run test-python
