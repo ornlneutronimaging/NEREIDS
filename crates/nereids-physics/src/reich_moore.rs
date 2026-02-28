@@ -33,16 +33,276 @@
 
 use num_complex::Complex64;
 
-use nereids_core::constants::{DIVISION_FLOOR, LOG_FLOOR, PIVOT_FLOOR};
-use nereids_endf::resonance::{
-    ResonanceData, ResonanceFormalism, ResonanceRange, Tab1, group_by_j,
-};
+use nereids_core::constants::{DIVISION_FLOOR, LOG_FLOOR, PIVOT_FLOOR, QUANTUM_NUMBER_EPS};
+use nereids_endf::resonance::{ResonanceData, ResonanceFormalism, ResonanceRange, Tab1};
 
 use crate::channel;
 use crate::penetrability;
 use crate::rmatrix_limited;
 use crate::slbw;
 use crate::urr;
+
+// ─── Per-resonance precomputed invariants ─────────────────────────────────────
+//
+// These quantities depend only on the resonance parameters and the channel
+// radius at the resonance energy — both are energy-independent constants.
+// Pre-computing them once (outside the energy loop) eliminates redundant
+// `penetrability(l, rho_r)` and `group_by_j()` calls per energy point.
+//
+// Issue #87: "Perf: Pre-cache J-groups and per-resonance quantities"
+
+/// Per-resonance invariants for the single-channel (non-fissile) Reich-Moore path.
+///
+/// Pre-computed once per resonance before the energy sweep.
+/// Reference: SAMMY `rml/mrml03.f` Betset (lines 240-276)
+struct PrecomputedResonanceSingle {
+    /// Resonance energy E_r (eV).
+    energy: f64,
+    /// Capture width Γ_γ (eV).
+    gamma_g: f64,
+    /// Reduced width amplitude squared γ²_n = |Γ_n| / (2·P_l(E_r)).
+    gamma_n_reduced_sq: f64,
+}
+
+/// Per-resonance invariants for the 2-channel (one fission) Reich-Moore path.
+struct PrecomputedResonance2ch {
+    /// Resonance energy E_r (eV).
+    energy: f64,
+    /// Capture width Γ_γ (eV).
+    gamma_g: f64,
+    /// Reduced width amplitude β_n = sign(Γ_n) × √(|Γ_n| / (2·P_l(E_r))).
+    beta_n: f64,
+    /// Fission width amplitude β_f = sign(Γ_f) × √(|Γ_f| / 2).
+    beta_f: f64,
+}
+
+/// Per-resonance invariants for the 3-channel (two fission) Reich-Moore path.
+struct PrecomputedResonance3ch {
+    /// Resonance energy E_r (eV).
+    energy: f64,
+    /// Capture width Γ_γ (eV).
+    gamma_g: f64,
+    /// Reduced width amplitude β_n.
+    beta_n: f64,
+    /// Fission width amplitude β_fa.
+    beta_fa: f64,
+    /// Fission width amplitude β_fb.
+    beta_fb: f64,
+}
+
+/// Pre-computed J-group for the single-channel Reich-Moore path.
+///
+/// Groups resonances by total angular momentum J, with per-resonance
+/// invariants already computed. The J-grouping depends only on the
+/// resonance data, not on the incident energy, so it is computed once
+/// and reused for every energy point.
+struct PrecomputedJGroupSingle {
+    /// Statistical weight g_J = (2J+1) / ((2I+1)(2s+1)).
+    g_j: f64,
+    /// Pre-computed per-resonance quantities for this J-group.
+    resonances: Vec<PrecomputedResonanceSingle>,
+}
+
+/// Pre-computed J-group for the 2-channel fission path.
+struct PrecomputedJGroup2ch {
+    g_j: f64,
+    resonances: Vec<PrecomputedResonance2ch>,
+}
+
+/// Pre-computed J-group for the 3-channel fission path.
+struct PrecomputedJGroup3ch {
+    g_j: f64,
+    resonances: Vec<PrecomputedResonance3ch>,
+}
+
+/// Compute penetrability at the resonance energy P_l(ρ_r).
+///
+/// ENDF widths are defined as Γ_n = 2·P_l(AP(E_r), E_r)·γ²_n,
+/// so the penetrability must be evaluated at the resonance energy
+/// using the channel radius AP(E_r) — not the incident-energy AP(E).
+///
+/// This function is the core quantity that Issue #87 caches: previously
+/// it was recomputed for every resonance at every energy point.
+fn penetrability_at_resonance(
+    e_r: f64,
+    l: u32,
+    awr: f64,
+    channel_radius: f64,
+    ap_table: Option<&Tab1>,
+    p_l_fallback: f64,
+) -> f64 {
+    if e_r.abs() > PIVOT_FLOOR {
+        let radius_at_er = ap_table.map_or(channel_radius, |t| t.evaluate(e_r.abs()));
+        let rho_r = channel::rho(e_r.abs(), awr, radius_at_er);
+        penetrability::penetrability(l, rho_r)
+    } else {
+        p_l_fallback
+    }
+}
+
+/// Build pre-computed J-groups for the single-channel (non-fissile) path.
+///
+/// Groups resonances by J, pre-computes γ²_n per resonance.
+fn precompute_jgroups_single(
+    resonances: &[nereids_endf::resonance::Resonance],
+    l: u32,
+    awr: f64,
+    channel_radius: f64,
+    ap_table: Option<&Tab1>,
+    p_l_fallback: f64,
+    target_spin: f64,
+) -> Vec<PrecomputedJGroupSingle> {
+    // Group by J (same logic as `group_by_j` but builds PrecomputedResonanceSingle directly).
+    let mut j_values: Vec<f64> = Vec::new();
+    let mut groups: Vec<PrecomputedJGroupSingle> = Vec::new();
+
+    for res in resonances {
+        let j = res.j;
+
+        // Precompute per-resonance invariants.
+        let p_at_er =
+            penetrability_at_resonance(res.energy, l, awr, channel_radius, ap_table, p_l_fallback);
+        let gamma_n_reduced_sq = if p_at_er > PIVOT_FLOOR {
+            res.gn.abs() / (2.0 * p_at_er)
+        } else {
+            0.0
+        };
+        let precomp = PrecomputedResonanceSingle {
+            energy: res.energy,
+            gamma_g: res.gg,
+            gamma_n_reduced_sq,
+        };
+
+        // Find or create J-group.
+        if let Some(idx) = j_values
+            .iter()
+            .position(|&gj| (gj - j).abs() < QUANTUM_NUMBER_EPS)
+        {
+            groups[idx].resonances.push(precomp);
+        } else {
+            j_values.push(j);
+            groups.push(PrecomputedJGroupSingle {
+                g_j: channel::statistical_weight(j, target_spin),
+                resonances: vec![precomp],
+            });
+        }
+    }
+    groups
+}
+
+/// Build pre-computed J-groups for the 2-channel fission path.
+fn precompute_jgroups_2ch(
+    resonances: &[nereids_endf::resonance::Resonance],
+    l: u32,
+    awr: f64,
+    channel_radius: f64,
+    ap_table: Option<&Tab1>,
+    p_l_fallback: f64,
+    target_spin: f64,
+) -> Vec<PrecomputedJGroup2ch> {
+    let mut j_values: Vec<f64> = Vec::new();
+    let mut groups: Vec<PrecomputedJGroup2ch> = Vec::new();
+
+    for res in resonances {
+        let j = res.j;
+
+        let p_at_er =
+            penetrability_at_resonance(res.energy, l, awr, channel_radius, ap_table, p_l_fallback);
+
+        let beta_n = if p_at_er > PIVOT_FLOOR {
+            let sign = if res.gn >= 0.0 { 1.0 } else { -1.0 };
+            sign * (res.gn.abs() / (2.0 * p_at_er)).sqrt()
+        } else {
+            0.0
+        };
+
+        let beta_f = {
+            let sign = if res.gfa >= 0.0 { 1.0 } else { -1.0 };
+            sign * (res.gfa.abs() / 2.0).sqrt()
+        };
+
+        let precomp = PrecomputedResonance2ch {
+            energy: res.energy,
+            gamma_g: res.gg,
+            beta_n,
+            beta_f,
+        };
+
+        if let Some(idx) = j_values
+            .iter()
+            .position(|&gj| (gj - j).abs() < QUANTUM_NUMBER_EPS)
+        {
+            groups[idx].resonances.push(precomp);
+        } else {
+            j_values.push(j);
+            groups.push(PrecomputedJGroup2ch {
+                g_j: channel::statistical_weight(j, target_spin),
+                resonances: vec![precomp],
+            });
+        }
+    }
+    groups
+}
+
+/// Build pre-computed J-groups for the 3-channel fission path.
+fn precompute_jgroups_3ch(
+    resonances: &[nereids_endf::resonance::Resonance],
+    l: u32,
+    awr: f64,
+    channel_radius: f64,
+    ap_table: Option<&Tab1>,
+    p_l_fallback: f64,
+    target_spin: f64,
+) -> Vec<PrecomputedJGroup3ch> {
+    let mut j_values: Vec<f64> = Vec::new();
+    let mut groups: Vec<PrecomputedJGroup3ch> = Vec::new();
+
+    for res in resonances {
+        let j = res.j;
+
+        let p_at_er =
+            penetrability_at_resonance(res.energy, l, awr, channel_radius, ap_table, p_l_fallback);
+
+        let beta_n = if p_at_er > PIVOT_FLOOR {
+            let sign = if res.gn >= 0.0 { 1.0 } else { -1.0 };
+            sign * (res.gn.abs() / (2.0 * p_at_er)).sqrt()
+        } else {
+            0.0
+        };
+
+        let beta_fa = {
+            let sign = if res.gfa >= 0.0 { 1.0 } else { -1.0 };
+            sign * (res.gfa.abs() / 2.0).sqrt()
+        };
+
+        let beta_fb = {
+            let sign = if res.gfb >= 0.0 { 1.0 } else { -1.0 };
+            sign * (res.gfb.abs() / 2.0).sqrt()
+        };
+
+        let precomp = PrecomputedResonance3ch {
+            energy: res.energy,
+            gamma_g: res.gg,
+            beta_n,
+            beta_fa,
+            beta_fb,
+        };
+
+        if let Some(idx) = j_values
+            .iter()
+            .position(|&gj| (gj - j).abs() < QUANTUM_NUMBER_EPS)
+        {
+            groups[idx].resonances.push(precomp);
+        } else {
+            j_values.push(j);
+            groups.push(PrecomputedJGroup3ch {
+                g_j: channel::statistical_weight(j, target_spin),
+                resonances: vec![precomp],
+            });
+        }
+    }
+    groups
+}
 
 /// Cross-section results at a single energy point.
 #[derive(Debug, Clone, Copy)]
@@ -263,46 +523,108 @@ fn cross_sections_for_range(
         let s_l = penetrability::shift_factor(l, rho);
         let phi_l = penetrability::phase_shift(l, rho);
 
-        // Group resonances by J value for this L.
-        // In ENDF, the J value is stored per resonance; group them.
-        let j_groups = group_by_j(&l_group.resonances);
+        // Determine fission channel count for this L-group.
+        let has_fission = l_group
+            .resonances
+            .iter()
+            .any(|r| r.gfa.abs() > PIVOT_FLOOR || r.gfb.abs() > PIVOT_FLOOR);
+        let has_two_fission = l_group.resonances.iter().any(|r| r.gfb.abs() > PIVOT_FLOOR);
 
-        for (j_total, resonances) in &j_groups {
-            let j = *j_total;
-            let g_j = channel::statistical_weight(j, target_spin);
-
-            match range.formalism {
-                ResonanceFormalism::ReichMoore => {
-                    let (t, e, c, f) = reich_moore_spin_group(
-                        resonances,
-                        energy_ev,
+        match range.formalism {
+            ResonanceFormalism::ReichMoore => {
+                if !has_fission {
+                    // Single-channel (non-fissile): precompute J-groups once.
+                    // Issue #87 optimization: group_by_j + p_at_er cached.
+                    let jgroups = precompute_jgroups_single(
+                        &l_group.resonances,
+                        l,
                         awr_l,
                         channel_radius,
-                        l,
-                        g_j,
-                        p_l,
-                        s_l,
-                        phi_l,
                         ap_table_ref,
+                        p_l,
+                        target_spin,
                     );
-                    total += t;
-                    elastic += e;
-                    capture += c;
-                    fission += f;
+                    for jg in &jgroups {
+                        let (t, e, c, f) = reich_moore_spin_group_precomputed(
+                            &jg.resonances,
+                            energy_ev,
+                            awr_l,
+                            jg.g_j,
+                            p_l,
+                            s_l,
+                            phi_l,
+                        );
+                        total += t;
+                        elastic += e;
+                        capture += c;
+                        fission += f;
+                    }
+                } else if !has_two_fission {
+                    // 2-channel fission: precompute J-groups once.
+                    let jgroups = precompute_jgroups_2ch(
+                        &l_group.resonances,
+                        l,
+                        awr_l,
+                        channel_radius,
+                        ap_table_ref,
+                        p_l,
+                        target_spin,
+                    );
+                    for jg in &jgroups {
+                        let (t, e, c, f) = reich_moore_2ch_precomputed(
+                            &jg.resonances,
+                            energy_ev,
+                            awr_l,
+                            jg.g_j,
+                            p_l,
+                            s_l,
+                            phi_l,
+                        );
+                        total += t;
+                        elastic += e;
+                        capture += c;
+                        fission += f;
+                    }
+                } else {
+                    // 3-channel fission: precompute J-groups once.
+                    let jgroups = precompute_jgroups_3ch(
+                        &l_group.resonances,
+                        l,
+                        awr_l,
+                        channel_radius,
+                        ap_table_ref,
+                        p_l,
+                        target_spin,
+                    );
+                    for jg in &jgroups {
+                        let (t, e, c, f) = reich_moore_3ch_precomputed(
+                            &jg.resonances,
+                            energy_ev,
+                            awr_l,
+                            jg.g_j,
+                            p_l,
+                            s_l,
+                            phi_l,
+                        );
+                        total += t;
+                        elastic += e;
+                        capture += c;
+                        fission += f;
+                    }
                 }
-                ResonanceFormalism::SLBW | ResonanceFormalism::MLBW => {
-                    // Unreachable: SLBW/MLBW ranges are dispatched before
-                    // entering this loop (see early return above).
-                    unreachable!("SLBW/MLBW dispatched before l_group loop");
-                }
-                _ => {
-                    // Other formalisms (e.g. Adler-Adler LRF=4) are not
-                    // implemented.  `range_is_evaluable` returns `false` for
-                    // these, so they should never reach here through the
-                    // normal dispatcher.  This arm exists only for
-                    // exhaustiveness; contribution is zero.
-                    continue;
-                }
+            }
+            ResonanceFormalism::SLBW | ResonanceFormalism::MLBW => {
+                // Unreachable: SLBW/MLBW ranges are dispatched before
+                // entering this loop (see early return above).
+                unreachable!("SLBW/MLBW dispatched before l_group loop");
+            }
+            _ => {
+                // Other formalisms (e.g. Adler-Adler LRF=4) are not
+                // implemented.  `range_is_evaluable` returns `false` for
+                // these, so they should never reach here through the
+                // normal dispatcher.  This arm exists only for
+                // exhaustiveness; contribution is zero.
+                continue;
             }
         }
     }
@@ -310,7 +632,8 @@ fn cross_sections_for_range(
     (total, elastic, capture, fission)
 }
 
-/// Cross-sections for a single spin group (J, π) in the Reich-Moore formalism.
+/// Cross-sections for a single spin group (J, π) in the Reich-Moore formalism,
+/// using pre-computed per-resonance invariants (γ²_n cached).
 ///
 /// For non-fissile isotopes, the R-matrix has a single neutron channel
 /// and the capture channel is eliminated (absorbed into the imaginary
@@ -338,41 +661,16 @@ fn cross_sections_for_range(
 ///
 /// Reference: SAMMY `rml/mrml11.f` Sectio routine
 #[allow(clippy::too_many_arguments)]
-fn reich_moore_spin_group(
-    resonances: &[&nereids_endf::resonance::Resonance],
+fn reich_moore_spin_group_precomputed(
+    resonances: &[PrecomputedResonanceSingle],
     energy_ev: f64,
     awr: f64,
-    channel_radius: f64,
-    l: u32,
     g_j: f64,
     p_l: f64,
     s_l: f64,
     phi_l: f64,
-    ap_table: Option<&Tab1>,
 ) -> (f64, f64, f64, f64) {
     let pi_over_k2 = channel::pi_over_k_squared_barns(energy_ev, awr);
-
-    // Determine if any resonance has fission widths.
-    let has_fission = resonances
-        .iter()
-        .any(|r| r.gfa.abs() > PIVOT_FLOOR || r.gfb.abs() > PIVOT_FLOOR);
-
-    if has_fission {
-        // Multi-channel case: neutron + fission channels.
-        return reich_moore_with_fission(
-            resonances,
-            energy_ev,
-            awr,
-            channel_radius,
-            l,
-            g_j,
-            p_l,
-            s_l,
-            phi_l,
-            pi_over_k2,
-            ap_table,
-        );
-    }
 
     // Single-channel case (neutron only, capture eliminated).
     // This is the common case for non-fissile isotopes.
@@ -389,38 +687,16 @@ fn reich_moore_spin_group(
     //   γ²_n = Γ_n / (2 · P_l(ρ_n))
     // where ρ_n = k(E_n)·a, evaluated at the resonance energy.
     //
+    // Issue #87: γ²_n is now pre-computed in PrecomputedResonanceSingle.
+    //
     // Reference: SAMMY `rml/mrml03.f` Betset (lines 240-276)
     let mut r_real = 0.0;
     let mut r_imag = 0.0;
 
     for res in resonances {
         let e_r = res.energy;
-        let gamma_n = res.gn; // neutron width (eV)
-        let gamma_g = res.gg; // capture width (eV)
-
-        // Reduced width amplitude squared.
-        // ENDF widths are defined as Γ_n = 2·P_l(AP(E_r), E_r)·γ²_n,
-        // so the penetrability must be evaluated at the resonance energy
-        // using the channel radius AP(E_r) — not the incident-energy AP(E).
-        // For NRO=0 (constant AP) this makes no difference.
-        let p_at_er = if e_r.abs() > PIVOT_FLOOR {
-            let radius_at_er = ap_table.map_or(channel_radius, |t| t.evaluate(e_r.abs()));
-            let rho_r = channel::rho(e_r.abs(), awr, radius_at_er);
-            penetrability::penetrability(l, rho_r)
-        } else {
-            p_l // Fallback: use current-energy penetrability
-        };
-
-        let gamma_n_reduced_sq = if p_at_er > PIVOT_FLOOR {
-            gamma_n.abs() / (2.0 * p_at_er)
-        } else {
-            0.0
-        };
-
-        // Sign of neutron width: ENDF convention is that Γ_n may be negative
-        // to indicate the sign of the reduced width amplitude.
-        let gamma_n_sign = if gamma_n >= 0.0 { 1.0 } else { -1.0 };
-        let _ = gamma_n_sign; // For single-channel, sign doesn't matter (γ² always positive)
+        let gamma_g = res.gamma_g;
+        let gamma_n_reduced_sq = res.gamma_n_reduced_sq;
 
         // Denominator: (E_n - E)² + (Γ_γ/2)²
         let de = e_r - energy_ev;
@@ -496,227 +772,127 @@ fn reich_moore_spin_group(
     (sigma_total, sigma_elastic, sigma_capture, 0.0)
 }
 
-/// Reich-Moore calculation with explicit fission channels.
+/// Reich-Moore 2-channel (neutron + 1 fission) with pre-computed betas.
 ///
-/// When fission widths (GFA, GFB) are present, the R-matrix becomes
-/// 2×2 or 3×3 (neutron + 1 or 2 fission channels), with capture still
-/// eliminated into the imaginary denominator.
-///
-/// Reference: SAMMY `rml/mrml09.f` Twoch/Three routines
+/// Reference: SAMMY `rml/mrml09.f` Twoch routine
 #[allow(clippy::too_many_arguments)]
-fn reich_moore_with_fission(
-    resonances: &[&nereids_endf::resonance::Resonance],
+fn reich_moore_2ch_precomputed(
+    resonances: &[PrecomputedResonance2ch],
     energy_ev: f64,
     awr: f64,
-    channel_radius: f64,
-    l: u32,
     g_j: f64,
     p_l: f64,
     s_l: f64,
     phi_l: f64,
-    pi_over_k2: f64,
-    ap_table: Option<&Tab1>,
 ) -> (f64, f64, f64, f64) {
-    // Determine number of fission channels (1 or 2).
-    let has_two_fission = resonances.iter().any(|r| r.gfb.abs() > PIVOT_FLOOR);
-    let n_channels = if has_two_fission { 3 } else { 2 }; // neutron + fission(s)
-
+    let pi_over_k2 = channel::pi_over_k_squared_barns(energy_ev, awr);
     let boundary = 0.0;
 
-    if n_channels == 2 {
-        // 2-channel: neutron + one fission channel.
-        // R-matrix is 2×2 complex.
-        let mut r_mat = [[Complex64::new(0.0, 0.0); 2]; 2];
+    // 2-channel: neutron + one fission channel.
+    // R-matrix is 2x2 complex.
+    let mut r_mat = [[Complex64::new(0.0, 0.0); 2]; 2];
 
-        for res in resonances {
-            let e_r = res.energy;
-            let gamma_n = res.gn;
-            let gamma_g = res.gg;
-            let gamma_f = res.gfa;
+    for res in resonances {
+        // Denominator: (E_n - E) - i*Gamma_g/2
+        let de = res.energy - energy_ev;
+        let half_gg = res.gamma_g / 2.0;
+        let inv_denom = 1.0 / Complex64::new(de, -half_gg);
 
-            // Reduced width amplitudes.
-            // Use AP(E_r) for the resonance-energy penetrability (ENDF width convention).
-            let p_at_er = if e_r.abs() > PIVOT_FLOOR {
-                let radius_at_er = ap_table.map_or(channel_radius, |t| t.evaluate(e_r.abs()));
-                let rho_r = channel::rho(e_r.abs(), awr, radius_at_er);
-                penetrability::penetrability(l, rho_r)
-            } else {
-                p_l
-            };
-
-            // β_n = sqrt(|Γ_n| / (2·P_l(E_r))), sign from Γ_n sign
-            let beta_n = if p_at_er > PIVOT_FLOOR {
-                let sign = if gamma_n >= 0.0 { 1.0 } else { -1.0 };
-                sign * (gamma_n.abs() / (2.0 * p_at_er)).sqrt()
-            } else {
-                0.0
-            };
-
-            // β_f = sqrt(|Γ_f|/2), fission channel has no penetrability correction
-            // (Lpent=0 for fission in SAMMY)
-            let beta_f = {
-                let sign = if gamma_f >= 0.0 { 1.0 } else { -1.0 };
-                sign * (gamma_f.abs() / 2.0).sqrt()
-            };
-
-            // Denominator: (E_n - E) - i·Γ_γ/2
-            let de = e_r - energy_ev;
-            let half_gg = gamma_g / 2.0;
-            let denom = Complex64::new(de, -half_gg);
-            let inv_denom = 1.0 / denom;
-
-            // R_ij += β_i · β_j / denom
-            let betas = [beta_n, beta_f];
-            for i in 0..2 {
-                for j in 0..2 {
-                    r_mat[i][j] += betas[i] * betas[j] * inv_denom;
-                }
-            }
-        }
-
-        // Level matrix Y = diag(1/(S-B+iP)) - R
-        // Channel 0 (neutron): L = S_l - B + i·P_l
-        // Channel 1 (fission): L = 0 + i·1 (no penetrability, Pent=0)
-        //   → fission channel: P_f = 1, S_f = 0
-        let l_n = Complex64::new(s_l - boundary, p_l);
-        let l_f = Complex64::new(0.0, 1.0); // Fission: no barrier
-
-        let l_inv = [1.0 / l_n, 1.0 / l_f];
-
-        let mut y_mat = [[Complex64::new(0.0, 0.0); 2]; 2];
+        // R_ij += beta_i * beta_j / denom
+        let betas = [res.beta_n, res.beta_f];
         for i in 0..2 {
             for j in 0..2 {
-                y_mat[i][j] = -r_mat[i][j];
-            }
-            y_mat[i][i] += l_inv[i];
-        }
-
-        // Invert 2×2 Y-matrix.
-        // Guard against singular matrix: if |det| ≈ 0, the channel makes no
-        // contribution at this energy (physically: perfect destructive interference
-        // or degenerate channel configuration). Return zero cross-sections.
-        let det = y_mat[0][0] * y_mat[1][1] - y_mat[0][1] * y_mat[1][0];
-        if det.norm() < LOG_FLOOR {
-            return (0.0, 0.0, 0.0, 0.0);
-        }
-        let inv_det = 1.0 / det;
-        let y_inv = [
-            [y_mat[1][1] * inv_det, -y_mat[0][1] * inv_det],
-            [-y_mat[1][0] * inv_det, y_mat[0][0] * inv_det],
-        ];
-
-        // X-matrix: X_ij = √P_i · (Y⁻¹·R)_ij · √P_j / L_jj
-        // First compute q = Y⁻¹ · R
-        let mut q = [[Complex64::new(0.0, 0.0); 2]; 2];
-        for i in 0..2 {
-            for j in 0..2 {
-                for k in 0..2 {
-                    q[i][j] += y_inv[i][k] * r_mat[k][j];
-                }
+                r_mat[i][j] += betas[i] * betas[j] * inv_denom;
             }
         }
-
-        let sqrt_p = [p_l.sqrt(), 1.0]; // √P_n, √P_f
-        let mut x_mat = [[Complex64::new(0.0, 0.0); 2]; 2];
-        for i in 0..2 {
-            for j in 0..2 {
-                let l_jj = if j == 0 { l_n } else { l_f };
-                x_mat[i][j] = sqrt_p[i] * q[i][j] * sqrt_p[j] / l_jj;
-            }
-        }
-
-        // Collision matrix U from X-matrix.
-        // U_nn = e^{2iφ}(1 + 2i·X_nn)  (neutron→neutron)
-        // U_nf = e^{iφ}·2i·X_nf         (neutron→fission, φ_f=0)
-        let phase2 = Complex64::new((2.0 * phi_l).cos(), (2.0 * phi_l).sin());
-        let phase1 = Complex64::new(phi_l.cos(), phi_l.sin());
-
-        let u_nn = phase2 * (1.0 + 2.0 * Complex64::i() * x_mat[0][0]);
-        let u_nf = phase1 * 2.0 * Complex64::i() * x_mat[0][1];
-
-        // Cross-sections from U-matrix.
-        let sigma_total = g_j * 2.0 * pi_over_k2 * (1.0 - u_nn.re);
-        let sigma_elastic = g_j * pi_over_k2 * (1.0 - u_nn).norm_sqr();
-        let sigma_fission = g_j * pi_over_k2 * u_nf.norm_sqr();
-        let sigma_capture = sigma_total - sigma_elastic - sigma_fission;
-
-        (sigma_total, sigma_elastic, sigma_capture, sigma_fission)
-    } else {
-        // 3-channel: neutron + two fission channels.
-        // Use general complex matrix inversion.
-        reich_moore_3channel(
-            resonances,
-            energy_ev,
-            awr,
-            channel_radius,
-            l,
-            g_j,
-            p_l,
-            s_l,
-            phi_l,
-            pi_over_k2,
-            ap_table,
-        )
     }
+
+    // Level matrix Y = diag(1/(S-B+iP)) - R
+    // Channel 0 (neutron): L = S_l - B + i*P_l
+    // Channel 1 (fission): L = 0 + i*1 (no penetrability, Pent=0)
+    //   -> fission channel: P_f = 1, S_f = 0
+    let l_n = Complex64::new(s_l - boundary, p_l);
+    let l_f = Complex64::new(0.0, 1.0); // Fission: no barrier
+
+    let l_inv = [1.0 / l_n, 1.0 / l_f];
+
+    let mut y_mat = [[Complex64::new(0.0, 0.0); 2]; 2];
+    for i in 0..2 {
+        for j in 0..2 {
+            y_mat[i][j] = -r_mat[i][j];
+        }
+        y_mat[i][i] += l_inv[i];
+    }
+
+    // Invert 2x2 Y-matrix.
+    // Guard against singular matrix.
+    let det = y_mat[0][0] * y_mat[1][1] - y_mat[0][1] * y_mat[1][0];
+    if det.norm() < LOG_FLOOR {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+    let inv_det = 1.0 / det;
+    let y_inv = [
+        [y_mat[1][1] * inv_det, -y_mat[0][1] * inv_det],
+        [-y_mat[1][0] * inv_det, y_mat[0][0] * inv_det],
+    ];
+
+    // X-matrix: X_ij = sqrt(P_i) * (Y^-1 * R)_ij * sqrt(P_j) / L_jj
+    let mut q = [[Complex64::new(0.0, 0.0); 2]; 2];
+    for i in 0..2 {
+        for j in 0..2 {
+            for k in 0..2 {
+                q[i][j] += y_inv[i][k] * r_mat[k][j];
+            }
+        }
+    }
+
+    let sqrt_p = [p_l.sqrt(), 1.0]; // sqrt(P_n), sqrt(P_f)
+    let mut x_mat = [[Complex64::new(0.0, 0.0); 2]; 2];
+    for i in 0..2 {
+        for j in 0..2 {
+            let l_jj = if j == 0 { l_n } else { l_f };
+            x_mat[i][j] = sqrt_p[i] * q[i][j] * sqrt_p[j] / l_jj;
+        }
+    }
+
+    // Collision matrix U from X-matrix.
+    let phase2 = Complex64::new((2.0 * phi_l).cos(), (2.0 * phi_l).sin());
+    let phase1 = Complex64::new(phi_l.cos(), phi_l.sin());
+
+    let u_nn = phase2 * (1.0 + 2.0 * Complex64::i() * x_mat[0][0]);
+    let u_nf = phase1 * 2.0 * Complex64::i() * x_mat[0][1];
+
+    // Cross-sections from U-matrix.
+    let sigma_total = g_j * 2.0 * pi_over_k2 * (1.0 - u_nn.re);
+    let sigma_elastic = g_j * pi_over_k2 * (1.0 - u_nn).norm_sqr();
+    let sigma_fission = g_j * pi_over_k2 * u_nf.norm_sqr();
+    let sigma_capture = sigma_total - sigma_elastic - sigma_fission;
+
+    (sigma_total, sigma_elastic, sigma_capture, sigma_fission)
 }
 
-/// 3-channel Reich-Moore (neutron + 2 fission channels).
+/// 3-channel Reich-Moore (neutron + 2 fission channels) with pre-computed betas.
 #[allow(clippy::too_many_arguments)]
-fn reich_moore_3channel(
-    resonances: &[&nereids_endf::resonance::Resonance],
+fn reich_moore_3ch_precomputed(
+    resonances: &[PrecomputedResonance3ch],
     energy_ev: f64,
     awr: f64,
-    channel_radius: f64,
-    l: u32,
     g_j: f64,
     p_l: f64,
     s_l: f64,
     phi_l: f64,
-    pi_over_k2: f64,
-    ap_table: Option<&Tab1>,
 ) -> (f64, f64, f64, f64) {
+    let pi_over_k2 = channel::pi_over_k_squared_barns(energy_ev, awr);
     let boundary = 0.0;
 
     let mut r_mat = [[Complex64::new(0.0, 0.0); 3]; 3];
 
     for res in resonances {
-        let e_r = res.energy;
-        let gamma_n = res.gn;
-        let gamma_g = res.gg;
-        let gamma_fa = res.gfa;
-        let gamma_fb = res.gfb;
-
-        // Use AP(E_r) for the resonance-energy penetrability (ENDF width convention).
-        let p_at_er = if e_r.abs() > PIVOT_FLOOR {
-            let radius_at_er = ap_table.map_or(channel_radius, |t| t.evaluate(e_r.abs()));
-            let rho_r = channel::rho(e_r.abs(), awr, radius_at_er);
-            penetrability::penetrability(l, rho_r)
-        } else {
-            p_l
-        };
-
-        let beta_n = if p_at_er > PIVOT_FLOOR {
-            let sign = if gamma_n >= 0.0 { 1.0 } else { -1.0 };
-            sign * (gamma_n.abs() / (2.0 * p_at_er)).sqrt()
-        } else {
-            0.0
-        };
-
-        let beta_fa = {
-            let sign = if gamma_fa >= 0.0 { 1.0 } else { -1.0 };
-            sign * (gamma_fa.abs() / 2.0).sqrt()
-        };
-
-        let beta_fb = {
-            let sign = if gamma_fb >= 0.0 { 1.0 } else { -1.0 };
-            sign * (gamma_fb.abs() / 2.0).sqrt()
-        };
-
-        let de = e_r - energy_ev;
-        let half_gg = gamma_g / 2.0;
+        let de = res.energy - energy_ev;
+        let half_gg = res.gamma_g / 2.0;
         let inv_denom = 1.0 / Complex64::new(de, -half_gg);
 
-        let betas = [beta_n, beta_fa, beta_fb];
+        let betas = [res.beta_n, res.beta_fa, res.beta_fb];
         for i in 0..3 {
             for j in 0..3 {
                 r_mat[i][j] += betas[i] * betas[j] * inv_denom;
@@ -738,10 +914,7 @@ fn reich_moore_3channel(
         y_mat[i][i] += l_inv[i];
     }
 
-    // Invert 3×3 via cofactor expansion.
-    // Returns None if the Y-matrix is singular (degenerate spin group).
-    // In that case, return zero cross-sections — a singular Y-matrix means
-    // the channels are degenerate and contribute no resolvable physics.
+    // Invert 3x3 via cofactor expansion.
     let y_inv = match invert_3x3(y_mat) {
         Some(inv) => inv,
         None => return (0.0, 0.0, 0.0, 0.0),
@@ -810,7 +983,8 @@ fn invert_3x3(m: [[Complex64; 3]; 3]) -> Option<[[Complex64; 3]; 3]> {
     Some(result)
 }
 
-// group_by_j is defined in nereids_endf::resonance and imported at the top of this file.
+// J-group assembly is now done inline via the `precompute_jgroups_*` functions
+// (Issue #87).  The old `group_by_j` import is no longer needed.
 
 #[cfg(test)]
 mod tests {

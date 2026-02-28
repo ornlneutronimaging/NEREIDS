@@ -26,12 +26,101 @@
 //! where Γ_n(E) = Γ_n(E_r) × √(E/E_r) × P_l(E)/P_l(E_r)
 //! and Γ = Γ_n(E) + Γ_γ + Γ_f
 
-use nereids_core::constants::{DIVISION_FLOOR, PIVOT_FLOOR};
-use nereids_endf::resonance::{ResonanceData, group_by_j};
+use nereids_core::constants::{DIVISION_FLOOR, PIVOT_FLOOR, QUANTUM_NUMBER_EPS};
+use nereids_endf::resonance::ResonanceData;
 
 use crate::channel;
 use crate::penetrability;
 use crate::reich_moore::CrossSections;
+
+// ─── Per-resonance precomputed invariants for SLBW ────────────────────────────
+//
+// In SLBW, the energy-dependent neutron width is:
+//   Γ_n(E) = Γ_n(E_r) × √(E/E_r) × P_l(E)/P_l(E_r)
+//
+// The quantities that depend only on resonance parameters (not on E):
+//   - P_l(E_r): penetrability at resonance energy
+//   - |Γ_n(E_r)|: neutron width magnitude
+//   - Γ_γ, Γ_f: capture and fission widths
+//   - E_r: resonance energy
+//
+// Issue #87: Pre-compute P_l(E_r) and J-groups once before the energy loop.
+
+/// Per-resonance invariants for SLBW, pre-computed once per resonance.
+struct PrecomputedSlbwResonance {
+    /// Resonance energy E_r (eV).
+    energy: f64,
+    /// Capture width Γ_γ (eV).
+    gamma_g: f64,
+    /// Fission width |Γ_fa| + |Γ_fb| (eV).
+    gamma_f: f64,
+    /// Absolute neutron width |Γ_n(E_r)| (eV).
+    gn_abs: f64,
+    /// Penetrability at resonance energy P_l(ρ_r).
+    /// Pre-computed to avoid redundant `penetrability(l, rho_r)` calls.
+    p_at_er: f64,
+}
+
+/// Pre-computed J-group for SLBW.
+struct PrecomputedSlbwJGroup {
+    /// Statistical weight g_J.
+    g_j: f64,
+    /// Pre-computed per-resonance quantities for this J-group.
+    resonances: Vec<PrecomputedSlbwResonance>,
+}
+
+/// Build pre-computed J-groups for SLBW.
+fn precompute_slbw_jgroups(
+    resonances: &[nereids_endf::resonance::Resonance],
+    l: u32,
+    awr_l: f64,
+    range: &nereids_endf::resonance::ResonanceRange,
+    l_group: &nereids_endf::resonance::LGroup,
+    target_spin: f64,
+) -> Vec<PrecomputedSlbwJGroup> {
+    let mut j_values: Vec<f64> = Vec::new();
+    let mut groups: Vec<PrecomputedSlbwJGroup> = Vec::new();
+
+    for res in resonances {
+        let j = res.j;
+        let e_r = res.energy;
+
+        // Pre-compute P_l(E_r) — this is the redundant computation Issue #87 eliminates.
+        let p_at_er = if e_r.abs() > PIVOT_FLOOR {
+            let radius_at_er = if l_group.apl > 0.0 {
+                l_group.apl
+            } else {
+                range.scattering_radius_at(e_r.abs())
+            };
+            let rho_r = channel::rho(e_r.abs(), awr_l, radius_at_er);
+            penetrability::penetrability(l, rho_r)
+        } else {
+            0.0 // Will produce gamma_n = 0 in the energy loop
+        };
+
+        let precomp = PrecomputedSlbwResonance {
+            energy: e_r,
+            gamma_g: res.gg,
+            gamma_f: res.gfa.abs() + res.gfb.abs(),
+            gn_abs: res.gn.abs(),
+            p_at_er,
+        };
+
+        if let Some(idx) = j_values
+            .iter()
+            .position(|&gj| (gj - j).abs() < QUANTUM_NUMBER_EPS)
+        {
+            groups[idx].resonances.push(precomp);
+        } else {
+            j_values.push(j);
+            groups.push(PrecomputedSlbwJGroup {
+                g_j: channel::statistical_weight(j, target_spin),
+                resonances: vec![precomp],
+            });
+        }
+    }
+    groups
+}
 
 /// Compute SLBW cross-sections at a single energy.
 ///
@@ -112,12 +201,15 @@ pub fn slbw_cross_sections_for_range(
         let sin_phi = phi.sin();
         let cos_phi = phi.cos();
         let sin2_phi = sin_phi * sin_phi;
+        let p_at_e = penetrability::penetrability(l, rho);
 
-        // Group resonances by J.
-        let j_groups = group_by_j(&l_group.resonances);
+        // Pre-compute J-groups and per-resonance invariants once.
+        // Issue #87: eliminates redundant group_by_j + P_l(E_r) per energy.
+        let j_groups =
+            precompute_slbw_jgroups(&l_group.resonances, l, awr_l, range, l_group, target_spin);
 
-        for (j_total, resonances) in &j_groups {
-            let g_j = channel::statistical_weight(*j_total, target_spin);
+        for jg in &j_groups {
+            let g_j = jg.g_j;
 
             // Potential scattering for this (l, J) group.
             // Added once per spin group.
@@ -125,34 +217,19 @@ pub fn slbw_cross_sections_for_range(
             elastic += pot_scatter;
             total += pot_scatter;
 
-            for res in resonances {
+            for res in &jg.resonances {
                 let e_r = res.energy;
-                let gamma_g = res.gg;
-                let gamma_f = res.gfa.abs() + res.gfb.abs();
 
                 // Energy-dependent neutron width:
                 // Γ_n(E) = Γ_n(E_r) × √(E/E_r) × P_l(E)/P_l(E_r)
-                // P_l(E_r) uses the channel radius evaluated at the resonance
-                // energy (ENDF §2.2.1 NRO=1: AP is tabulated, not constant).
-                let gamma_n = if e_r.abs() > PIVOT_FLOOR {
-                    let radius_at_er = if l_group.apl > 0.0 {
-                        l_group.apl
-                    } else {
-                        range.scattering_radius_at(e_r.abs())
-                    };
-                    let rho_r = channel::rho(e_r.abs(), awr_l, radius_at_er);
-                    let p_at_e = penetrability::penetrability(l, rho);
-                    let p_at_er = penetrability::penetrability(l, rho_r);
-                    if p_at_er > PIVOT_FLOOR {
-                        res.gn.abs() * (energy_ev / e_r.abs()).sqrt() * p_at_e / p_at_er
-                    } else {
-                        0.0
-                    }
+                // P_l(E_r) is pre-computed in res.p_at_er (Issue #87).
+                let gamma_n = if e_r.abs() > PIVOT_FLOOR && res.p_at_er > PIVOT_FLOOR {
+                    res.gn_abs * (energy_ev / e_r.abs()).sqrt() * p_at_e / res.p_at_er
                 } else {
                     0.0
                 };
 
-                let gamma_total = gamma_n + gamma_g + gamma_f;
+                let gamma_total = gamma_n + res.gamma_g + res.gamma_f;
                 let de = energy_ev - e_r;
                 let denom = de * de + (gamma_total / 2.0).powi(2);
 
@@ -161,12 +238,12 @@ pub fn slbw_cross_sections_for_range(
                 }
 
                 // Capture cross-section (symmetric Breit-Wigner).
-                let sigma_c = pi_over_k2 * g_j * gamma_n * gamma_g / denom;
+                let sigma_c = pi_over_k2 * g_j * gamma_n * res.gamma_g / denom;
                 capture += sigma_c;
                 total += sigma_c;
 
                 // Fission cross-section.
-                let sigma_f = pi_over_k2 * g_j * gamma_n * gamma_f / denom;
+                let sigma_f = pi_over_k2 * g_j * gamma_n * res.gamma_f / denom;
                 fission += sigma_f;
                 total += sigma_f;
 
@@ -191,8 +268,6 @@ pub fn slbw_cross_sections_for_range(
 
     (total, elastic, capture, fission)
 }
-
-// group_by_j is defined in nereids_endf::resonance and imported at the top of this file.
 
 #[cfg(test)]
 mod tests {
