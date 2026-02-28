@@ -167,6 +167,13 @@ pub fn doppler_broaden(
 
     let n_ext = ext_v.len();
 
+    // The extended velocity grid must be sorted ascending (negative → 0 → positive)
+    // for the partition_point binary searches below to work correctly.
+    debug_assert!(
+        ext_v.windows(2).all(|w| w[0] <= w[1]),
+        "ext_v must be sorted ascending for partition_point"
+    );
+
     // For each output energy point, compute the broadened cross-section
     // using the SAMMY FGM formula (manual Sec III.B.1):
     //
@@ -211,14 +218,23 @@ pub fn doppler_broaden(
             continue;
         }
 
-        // Compute trapezoidal Gaussian weights on the extended grid.
+        // O(N×W) optimisation: use binary search to restrict the inner loop
+        // to the Gaussian window [v − n_sigma·u, v + n_sigma·u].  The
+        // velocity-space Doppler width u is energy-independent, so the window
+        // width W is constant across all output energies.
+        let v_lo = v - n_sigma * u;
+        let v_hi = v + n_sigma * u;
+        let j_lo = ext_v.partition_point(|&w| w < v_lo);
+        let j_hi = ext_v.partition_point(|&w| w <= v_hi);
+
+        // Single-pass accumulation: compute Gaussian-weighted sum and
+        // normalisation simultaneously, avoiding a per-point Vec allocation.
         // Weight_j = exp(-(v - w_j)²/u²) × (dw_j)
         // where dw_j is the trapezoidal width at point j.
-        let mut weights = vec![0.0f64; n_ext];
-        let mut sum_weights = 0.0;
+        let mut sum_weights = 0.0f64;
+        let mut result = 0.0f64;
 
-        // Compute raw Gaussian weights using trapezoidal integration.
-        for j in 0..n_ext {
+        for j in j_lo..j_hi {
             let arg = (v - ext_v[j]) / u;
             if arg * arg > 100.0 {
                 continue;
@@ -238,8 +254,13 @@ pub fn doppler_broaden(
             };
             let dw = dw_left + dw_right;
 
-            weights[j] = g * dw;
-            sum_weights += weights[j];
+            let w = g * dw;
+            sum_weights += w;
+            // v_j² × σ(E_j) — same as the original two-pass formula:
+            //   result += w_norm × v_j² × ext_sigma[j]
+            // but deferred normalisation (divide by sum_weights after the loop).
+            let vj2 = ext_v[j] * ext_v[j]; // v_j² = E_j
+            result += w * vj2 * ext_sigma[j];
         }
 
         if sum_weights < DIVISION_FLOOR {
@@ -247,19 +268,9 @@ pub fn doppler_broaden(
             continue;
         }
 
-        // Normalize weights, apply v² factor, sum with σ, divide by E.
         // σ_D(E) = (1/E) × Σ [w_norm × v_j² × σ(E_j)]
-        let inv_sum = 1.0 / sum_weights;
-        let mut result = 0.0;
-        for j in 0..n_ext {
-            if weights[j] == 0.0 {
-                continue;
-            }
-            let w_norm = weights[j] * inv_sum;
-            let vj2 = ext_v[j] * ext_v[j]; // v_j² = E_j
-            result += w_norm * vj2 * ext_sigma[j];
-        }
-        broadened[i] = result / e;
+        //        = (1/E) × (Σ w × v_j² × σ(E_j)) / (Σ w)
+        broadened[i] = (result / sum_weights) / e;
 
         // Ensure non-negative
         if broadened[i] < 0.0 {
