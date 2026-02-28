@@ -342,27 +342,38 @@ pub fn fit_roi(
 
     let n_pixels = (y_range.end - y_range.start) * (x_range.end - x_range.start);
 
-    // Transpose the ROI sub-arrays from (n_energies, h, w) to (h, w, n_energies)
-    // so that per-pixel spectrum accumulation accesses contiguous memory.
-    let trans_t: Array3<f64> = transmission
-        .view()
+    // Slice the ROI first, THEN transpose, so the work is O(n_energies * roi_h * roi_w)
+    // instead of O(n_energies * height * width).  For small ROIs on large images this
+    // avoids transposing the entire array.
+    let roi_trans: Array3<f64> = transmission
+        .slice(s![
+            ..,
+            y_range.start..y_range.end,
+            x_range.start..x_range.end
+        ])
         .permuted_axes([1, 2, 0])
         .as_standard_layout()
         .into_owned();
-    let unc_t: Array3<f64> = uncertainty
-        .view()
+    let roi_unc: Array3<f64> = uncertainty
+        .slice(s![
+            ..,
+            y_range.start..y_range.end,
+            x_range.start..x_range.end
+        ])
         .permuted_axes([1, 2, 0])
         .as_standard_layout()
         .into_owned();
 
-    // Average transmission over ROI
+    // Average transmission over ROI using local (0-based) indices into the sliced array
+    let roi_h = y_range.end - y_range.start;
+    let roi_w = x_range.end - x_range.start;
     let mut avg_t = vec![0.0f64; n_energies];
     let mut avg_unc2 = vec![0.0f64; n_energies]; // Sum of squared uncertainties
 
-    for y in y_range.clone() {
-        for x in x_range.clone() {
-            let t_row = trans_t.slice(s![y, x, ..]);
-            let u_row = unc_t.slice(s![y, x, ..]);
+    for y in 0..roi_h {
+        for x in 0..roi_w {
+            let t_row = roi_trans.slice(s![y, x, ..]);
+            let u_row = roi_unc.slice(s![y, x, ..]);
             for e in 0..n_energies {
                 avg_t[e] += t_row[e];
                 avg_unc2[e] += u_row[e].powi(2);

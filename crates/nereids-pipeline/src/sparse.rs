@@ -154,23 +154,31 @@ pub fn estimate_nuisance(
         None => (0..height, 0..width),
     };
 
-    // Transpose from (n_energies, height, width) to (height, width, n_energies)
-    // so that per-pixel spectrum accumulation accesses contiguous memory.
-    let ob_t: Array3<f64> = open_beam_counts
-        .view()
+    // Slice the ROI first, THEN transpose, so the work is O(n_energies * roi_h * roi_w)
+    // instead of O(n_energies * height * width).  For small ROIs on large images this
+    // avoids transposing the entire open-beam array.
+    let ob_roi: Array3<f64> = open_beam_counts
+        .slice(s![
+            ..,
+            y_range.start..y_range.end,
+            x_range.start..x_range.end
+        ])
         .permuted_axes([1, 2, 0])
         .as_standard_layout()
         .into_owned();
 
+    let roi_h = y_range.end - y_range.start;
+    let roi_w = x_range.end - x_range.start;
     let mut flux = vec![0.0f64; n_energies];
     let mut n_pixels: usize = 0;
 
-    for y in y_range {
-        for x in x_range.clone() {
-            if dead_pixels.is_some_and(|m| m[[y, x]]) {
+    for ly in 0..roi_h {
+        for lx in 0..roi_w {
+            // Map local ROI indices back to global coordinates for dead-pixel lookup
+            if dead_pixels.is_some_and(|m| m[[y_range.start + ly, x_range.start + lx]]) {
                 continue;
             }
-            let row = ob_t.slice(s![y, x, ..]);
+            let row = ob_roi.slice(s![ly, lx, ..]);
             for e in 0..n_energies {
                 flux[e] += row[e];
             }
