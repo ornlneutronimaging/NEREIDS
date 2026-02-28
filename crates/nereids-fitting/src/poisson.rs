@@ -634,7 +634,8 @@ pub fn poisson_fit_analytic(
                 &ctx.resonance_data,
                 t_current,
                 ctx.instrument.as_ref(),
-            );
+            )
+            .expect("poisson_fit_analytic: energy grid must be sorted ascending");
             xs_owned = xs_new;
             dxs_dt = dxs_new;
         }
@@ -1160,7 +1161,8 @@ pub fn poisson_fit_lbfgsb(
                 &ctx.resonance_data,
                 t_current,
                 ctx.instrument.as_ref(),
-            );
+            )
+            .expect("poisson_fit_lbfgsb: energy grid must be sorted ascending");
             xs_owned = xs_new;
             dxs_dt = dxs_new;
         }
@@ -1810,7 +1812,8 @@ mod tests {
                     temperature_k: temperature,
                     isotopes: vec![(self.resonance_data[0].clone(), density)],
                 };
-                let transmission = transmission::forward_model(&self.energies, &sample, None);
+                let transmission =
+                    transmission::forward_model(&self.energies, &sample, None).unwrap();
                 transmission
                     .iter()
                     .zip(self.flux.iter())
@@ -2260,7 +2263,8 @@ mod tests {
                     temperature_k: temperature,
                     isotopes: vec![(self.resonance_data[0].clone(), density)],
                 };
-                let transmission = transmission::forward_model(&self.energies, &sample, None);
+                let transmission =
+                    transmission::forward_model(&self.energies, &sample, None).unwrap();
                 transmission
                     .iter()
                     .zip(self.flux.iter())

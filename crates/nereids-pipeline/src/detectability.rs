@@ -94,7 +94,10 @@ fn matrix_baseline(
         temperature_k: config.temperature_k,
         isotopes: vec![(config.matrix.clone(), config.matrix_density)],
     };
+    // forward_model only fails for unsorted energies, which is a
+    // configuration bug caught before the analysis runs.
     transmission::forward_model(config.energies, &sample_matrix, instrument)
+        .expect("matrix_baseline: energy grid must be sorted ascending")
 }
 
 /// Build a report from a precomputed matrix-only baseline and a trace isotope.
@@ -114,7 +117,8 @@ fn report_from_baseline(
             (trace.clone(), trace_density),
         ],
     };
-    let t_combined = transmission::forward_model(config.energies, &sample_combined, instrument);
+    let t_combined = transmission::forward_model(config.energies, &sample_combined, instrument)
+        .expect("report_from_baseline: energy grid must be sorted ascending");
 
     // |ΔT| spectrum — absolute difference, sign discarded (see module docs).
     let delta_t_spectrum: Vec<f64> = t_matrix

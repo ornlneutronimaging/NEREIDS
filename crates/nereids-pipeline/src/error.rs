@@ -1,5 +1,7 @@
 //! Error types for the nereids-pipeline crate.
 
+use nereids_physics::transmission::TransmissionError;
+
 /// Errors that can occur during pipeline operations.
 #[derive(Debug, thiserror::Error)]
 pub enum PipelineError {
@@ -14,4 +16,17 @@ pub enum PipelineError {
     /// Operation was cancelled via the cancellation token.
     #[error("Operation cancelled")]
     Cancelled,
+
+    /// Error from the transmission forward model (e.g. unsorted energy grid).
+    #[error("Transmission error: {0}")]
+    Transmission(TransmissionError),
+}
+
+impl From<TransmissionError> for PipelineError {
+    fn from(e: TransmissionError) -> Self {
+        match e {
+            TransmissionError::Cancelled => PipelineError::Cancelled,
+            other => PipelineError::Transmission(other),
+        }
+    }
 }

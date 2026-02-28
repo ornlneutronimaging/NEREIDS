@@ -37,7 +37,7 @@ use std::fmt;
 const TOF_FACTOR: f64 = 72.298;
 
 /// Errors from resolution broadening operations.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum ResolutionError {
     /// The energy grid is not sorted in ascending order.
     UnsortedEnergies,
@@ -125,19 +125,41 @@ pub fn resolution_broaden(
     cross_sections: &[f64],
     params: &ResolutionParams,
 ) -> Result<Vec<f64>, ResolutionError> {
-    if energies.len() != cross_sections.len() {
+    validate_inputs(energies, cross_sections)?;
+    Ok(resolution_broaden_presorted(
+        energies,
+        cross_sections,
+        params,
+    ))
+}
+
+/// Check that the energy grid is sorted and that its length matches the data.
+fn validate_inputs(energies: &[f64], data: &[f64]) -> Result<(), ResolutionError> {
+    if energies.len() != data.len() {
         return Err(ResolutionError::LengthMismatch {
             energies: energies.len(),
-            data: cross_sections.len(),
+            data: data.len(),
         });
     }
     if !energies.windows(2).all(|w| w[0] <= w[1]) {
         return Err(ResolutionError::UnsortedEnergies);
     }
+    Ok(())
+}
 
+/// Gaussian resolution broadening assuming the energy grid is already validated
+/// (sorted ascending, same length as cross_sections).
+///
+/// Callers inside `nereids-physics` that validate once (e.g. `forward_model`)
+/// use this to avoid redundant O(N) sort checks per isotope.
+pub(crate) fn resolution_broaden_presorted(
+    energies: &[f64],
+    cross_sections: &[f64],
+    params: &ResolutionParams,
+) -> Vec<f64> {
     let n = energies.len();
     if n == 0 {
-        return Ok(vec![]);
+        return vec![];
     }
 
     let n_sigma = 5.0; // Integrate out to 5σ
@@ -193,7 +215,7 @@ pub fn resolution_broaden(
         }
     }
 
-    Ok(broadened)
+    broadened
 }
 
 /// Apply resolution broadening to transmission data.
@@ -245,12 +267,30 @@ pub fn resolution_broaden_transmission(
 #[derive(Debug, Clone)]
 pub struct TabulatedResolution {
     /// Reference energies (eV), sorted ascending.
-    pub ref_energies: Vec<f64>,
+    ref_energies: Vec<f64>,
     /// For each reference energy: (tof_offsets_μs, weights) pairs.
     /// Weights are peak-normalized (max=1.0).
-    pub kernels: Vec<(Vec<f64>, Vec<f64>)>,
+    kernels: Vec<(Vec<f64>, Vec<f64>)>,
     /// Flight path length in meters (needed for TOF↔energy conversion).
-    pub flight_path_m: f64,
+    flight_path_m: f64,
+}
+
+impl TabulatedResolution {
+    /// Reference energies (eV), sorted ascending.
+    pub fn ref_energies(&self) -> &[f64] {
+        &self.ref_energies
+    }
+
+    /// For each reference energy: (tof_offsets_μs, weights) pairs.
+    /// Weights are peak-normalized (max=1.0).
+    pub fn kernels(&self) -> &[(Vec<f64>, Vec<f64>)] {
+        &self.kernels
+    }
+
+    /// Flight path length in meters (needed for TOF↔energy conversion).
+    pub fn flight_path_m(&self) -> f64 {
+        self.flight_path_m
+    }
 }
 
 /// Resolution function: either analytical Gaussian or tabulated from Monte Carlo.
@@ -379,18 +419,16 @@ impl TabulatedResolution {
     /// length, or [`ResolutionError::UnsortedEnergies`] if the energy grid is
     /// not sorted in non-descending order.
     pub fn broaden(&self, energies: &[f64], spectrum: &[f64]) -> Result<Vec<f64>, ResolutionError> {
-        if energies.len() != spectrum.len() {
-            return Err(ResolutionError::LengthMismatch {
-                energies: energies.len(),
-                data: spectrum.len(),
-            });
-        }
-        if !energies.windows(2).all(|w| w[0] <= w[1]) {
-            return Err(ResolutionError::UnsortedEnergies);
-        }
+        validate_inputs(energies, spectrum)?;
+        Ok(self.broaden_presorted(energies, spectrum))
+    }
+
+    /// Tabulated resolution broadening assuming the energy grid is already
+    /// validated (sorted ascending, same length as spectrum).
+    pub(crate) fn broaden_presorted(&self, energies: &[f64], spectrum: &[f64]) -> Vec<f64> {
         let n = energies.len();
         if n == 0 {
-            return Ok(vec![]);
+            return vec![];
         }
 
         let mut result = vec![0.0f64; n];
@@ -457,7 +495,7 @@ impl TabulatedResolution {
             };
         }
 
-        Ok(result)
+        result
     }
 
     /// Interpolate kernel at an arbitrary energy using log-space linear interpolation
@@ -466,6 +504,10 @@ impl TabulatedResolution {
     /// `ref_energies` is validated as strictly ascending by `from_text()` /
     /// `from_file()` at construction time, so no per-call sort check is needed.
     fn interpolated_kernel(&self, energy: f64) -> (Vec<f64>, Vec<f64>) {
+        debug_assert!(
+            self.ref_energies.windows(2).all(|w| w[0] < w[1]),
+            "ref_energies must be strictly ascending (invariant broken)"
+        );
         let n_ref = self.ref_energies.len();
 
         // Clamp to nearest reference if outside range
@@ -566,6 +608,24 @@ pub fn apply_resolution(
     match resolution {
         ResolutionFunction::Gaussian(params) => resolution_broaden(energies, spectrum, params),
         ResolutionFunction::Tabulated(tab) => tab.broaden(energies, spectrum),
+    }
+}
+
+/// Apply resolution broadening assuming the energy grid is already validated
+/// (sorted ascending, same length as spectrum).
+///
+/// Used by `transmission.rs` to avoid redundant O(N) sort checks when
+/// broadening multiple isotopes on the same pre-validated energy grid.
+pub(crate) fn apply_resolution_presorted(
+    energies: &[f64],
+    spectrum: &[f64],
+    resolution: &ResolutionFunction,
+) -> Vec<f64> {
+    match resolution {
+        ResolutionFunction::Gaussian(params) => {
+            resolution_broaden_presorted(energies, spectrum, params)
+        }
+        ResolutionFunction::Tabulated(tab) => tab.broaden_presorted(energies, spectrum),
     }
 }
 

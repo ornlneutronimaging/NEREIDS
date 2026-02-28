@@ -295,12 +295,7 @@ pub fn sparse_reconstruct(
         config.temperature_k,
         instrument_params.as_ref(),
         cancel,
-    );
-    // If cancelled during XS precomputation, return Cancelled.
-    let xs_raw = match xs_raw {
-        Some(v) => v,
-        None => return Err(PipelineError::Cancelled),
-    };
+    )?;
     let xs: Arc<Vec<Vec<f64>>> = Arc::new(xs_raw);
     let density_idx: Arc<Vec<usize>> = Arc::new((0..n_isotopes).collect());
 
