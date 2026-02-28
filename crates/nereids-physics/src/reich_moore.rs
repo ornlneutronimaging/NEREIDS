@@ -435,6 +435,10 @@ pub fn cross_sections_at_energy(data: &ResonanceData, energy_ev: f64) -> CrossSe
 /// # Returns
 /// Vector of cross-sections, one per energy point.
 pub fn cross_sections_on_grid(data: &ResonanceData, energies: &[f64]) -> Vec<CrossSections> {
+    if energies.is_empty() {
+        return Vec::new();
+    }
+
     let awr = data.awr;
 
     // Phase 1: precompute per-range data (J-groups, reduced widths, etc.).
