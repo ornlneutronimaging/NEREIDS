@@ -185,11 +185,11 @@ impl FitModel for TransmissionFitModel {
             isotopes,
         };
 
-        // forward_model returns Err only for unsorted energies, which would
-        // be a configuration bug (energies are set once at model construction).
-        // Unwrap is safe here because the LM loop cannot fix a bad energy grid.
+        // forward_model can fail for unsorted energies or invalid Doppler
+        // params — both are configuration bugs (energies and isotope data are
+        // set once at model construction).  The LM loop cannot fix these.
         transmission::forward_model(&self.energies, &sample, self.instrument.as_deref())
-            .expect("TransmissionFitModel: energy grid must be sorted ascending")
+            .expect("TransmissionFitModel: forward_model failed (energy grid must be sorted ascending and Doppler params must be valid)")
     }
 }
 

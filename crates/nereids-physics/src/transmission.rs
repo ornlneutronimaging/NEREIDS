@@ -339,7 +339,7 @@ pub fn broadened_cross_sections_with_derivative(
     let t_down = (temperature_k - dt).max(0.1); // stay physical
     let actual_2dt = t_up - t_down;
 
-    // No cancel token passed, so only ResolutionError can occur.
+    // No cancel token passed; ResolutionError or DopplerParamsError can occur.
     let xs_center =
         broadened_cross_sections(energies, resonance_data, temperature_k, instrument, None)?;
     let xs_up = broadened_cross_sections(energies, resonance_data, t_up, instrument, None)?;
