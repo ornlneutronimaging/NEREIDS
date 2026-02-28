@@ -128,9 +128,8 @@ pub fn resolution_broaden(
         let j_hi = energies.partition_point(|&ej| ej <= e_high);
         for j in j_lo..j_hi {
             let arg = (energies[j] - e) / w;
-            if arg * arg > 100.0 {
-                continue;
-            }
+            // No need for arg*arg > 100 guard: partition_point already bounds
+            // j to [e - 5w, e + 5w], so |arg| <= 5 and arg*arg <= 25.
             let g = (-arg * arg).exp();
 
             // Trapezoidal width
@@ -180,11 +179,8 @@ pub fn resolution_broaden_transmission(
     transmission: &[f64],
     params: &ResolutionParams,
 ) -> Vec<f64> {
-    debug_assert!(
-        energies.windows(2).all(|w| w[0] <= w[1]),
-        "energies must be sorted ascending for partition_point"
-    );
     // The convolution kernel is the same; only the interpretation differs.
+    // Note: resolution_broaden already asserts that energies are sorted.
     resolution_broaden(energies, transmission, params)
 }
 
@@ -414,6 +410,10 @@ impl TabulatedResolution {
     /// Interpolate kernel at an arbitrary energy using log-space linear interpolation
     /// between the two nearest reference energies.
     fn interpolated_kernel(&self, energy: f64) -> (Vec<f64>, Vec<f64>) {
+        debug_assert!(
+            self.ref_energies.windows(2).all(|w| w[0] <= w[1]),
+            "ref_energies must be sorted ascending for partition_point"
+        );
         let n_ref = self.ref_energies.len();
 
         // Clamp to nearest reference if outside range
