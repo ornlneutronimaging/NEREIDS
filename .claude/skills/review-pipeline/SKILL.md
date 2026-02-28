@@ -200,12 +200,16 @@ After Phase A completes (zero P1s) and branches are pushed:
 2. When Copilot reviews are in, fetch comments using the extraction script:
 
 ```bash
-pixi run python scripts/fetch_copilot_reviews.py {pr_numbers...}
+pixi run python scripts/fetch_copilot_reviews.py {pr_numbers...} --dedup
 ```
+
+The `--dedup` flag groups similar comments (word-level Jaccard + shared
+backtick identifiers) to collapse Copilot's tendency to repeat the same
+suggestion at multiple call sites.
 
 For machine-readable output (useful for automated processing):
 ```bash
-pixi run python scripts/fetch_copilot_reviews.py {pr_numbers...} --json
+pixi run python scripts/fetch_copilot_reviews.py {pr_numbers...} --json --dedup
 ```
 
 3. Classify each Copilot comment as P1 or P2
@@ -216,7 +220,44 @@ pixi run python scripts/fetch_copilot_reviews.py {pr_numbers...} --json
 6. Dismiss Copilot comments that rehash already-addressed issues or flag
    impossible edge cases
 
-## Step 9: Post-Merge Integration Test
+## Step 9: Pre-Merge Checkpoint (user approval required)
+
+**IMPORTANT: Do NOT merge without explicit user approval.**
+
+Before merging, present the user with a concise summary table:
+
+```markdown
+### Pre-Merge Summary — Batch {name}
+
+| PR | Branch | Issue | Key Changes | Review Status |
+|----|--------|-------|-------------|---------------|
+| #{n} | {branch} | #{issue} | {1-line summary} | Phase A ✓ Phase B ✓ |
+| ... | ... | ... | ... | ... |
+
+**Merge order**: {any order / sequential recommendation with rationale}
+
+**Review rounds**: Phase A: {N} round(s), Phase B: {N} Copilot comment(s) ({M} after dedup)
+
+**Findings resolved**: {X} P1s fixed, {Y} P2s fixed inline, {Z} P2s deferred → issues #{a}, #{b}
+
+**Dismissed**: {N} false positives / duplicates / rehash
+
+**Tests on branches**: {N} Rust tests, {M} Python tests — all pass
+
+**Ready to merge?** (Merge will be in order: {order}. Post-merge gate runs afterward.)
+```
+
+Wait for the user to confirm before proceeding with any `gh pr merge` commands.
+The user may want to:
+- Inspect specific PRs on GitHub first
+- Request additional changes
+- Adjust merge order
+- Defer specific PRs to a later batch
+
+Once the user approves, merge in the recommended order using `gh pr merge --squash`.
+After all PRs are merged, proceed to Step 10.
+
+## Step 10: Post-Merge Integration Test
 
 After all PRs in the batch are merged, run `/post-merge` which handles:
 cleanup, `cargo clean && pixi run build`, workspace tests, Python tests,
@@ -228,7 +269,7 @@ the same function signature, per-branch reviews are blind to the conflict.
 `pixi run build` catches these cross-PR integration regressions at compile
 time.
 
-## Step 10: Track Deferred P2 Findings
+## Step 11: Track Deferred P2 Findings
 
 **Do NOT skip this step.** After the pipeline completes (zero P1s and PRs
 merged), create GitHub issues for every P2 finding deferred during

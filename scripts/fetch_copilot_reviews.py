@@ -13,9 +13,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 
 @dataclass
@@ -25,6 +26,7 @@ class ReviewComment:
     line: int | None
     body: str
     url: str
+    group_id: int | None = field(default=None, repr=False)
 
 
 def _gh_api(endpoint: str) -> list[dict]:
@@ -74,14 +76,115 @@ def fetch_copilot_comments(pr_number: int) -> list[ReviewComment]:
     return comments
 
 
-def print_markdown(comments: list[ReviewComment]) -> None:
+def _normalize_body(body: str) -> str:
+    """Strip code suggestions, identifiers, and paths for similarity comparison."""
+    # Remove markdown code blocks (```suggestion ... ```)
+    body = re.sub(r"```.*?```", "", body, flags=re.DOTALL)
+    # Remove all backtick-enclosed identifiers (e.g., `pi_over_k²`, `data.inner.clone()`)
+    body = re.sub(r"`[^`]*`", "", body)
+    # Remove file paths and line numbers
+    body = re.sub(r"[\w/]+\.(rs|py|toml)(:\d+)?", "", body)
+    # Remove markdown links
+    body = re.sub(r"\[.*?\]\(.*?\)", "", body)
+    # Strip punctuation so "energy)" and "energy" become the same token
+    body = re.sub(r"[^\w\s]", " ", body)
+    # Collapse whitespace
+    return re.sub(r"\s+", " ", body).strip().lower()
+
+
+def _deduplicate(comments: list[ReviewComment], threshold: float = 0.4) -> list[ReviewComment]:
+    """Group comments with similar bodies; keep one representative per group.
+
+    Uses word-level Jaccard similarity. Comments above *threshold* similarity
+    are grouped together. The representative is the longest body in the group.
+
+    Returns comments with ``group_id`` set. Duplicates are excluded from the
+    returned list, but a count of duplicates is noted in the body.
+    """
+    if not comments:
+        return comments
+
+    # Compute word sets for each comment
+    word_sets = [set(_normalize_body(c.body).split()) for c in comments]
+    n = len(comments)
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    # Also extract backtick-enclosed identifiers for concept-level grouping
+    ident_sets = []
+    for c in comments:
+        idents = set(re.findall(r"`([^`]+)`", c.body))
+        # Normalize: strip parens, trim whitespace
+        idents = {re.sub(r"[()]+$", "", x).strip().lower() for x in idents}
+        ident_sets.append(idents)
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if not word_sets[i] or not word_sets[j]:
+                continue
+            # Pass 1: word-level Jaccard on normalized body
+            intersection = len(word_sets[i] & word_sets[j])
+            union_size = len(word_sets[i] | word_sets[j])
+            word_sim = intersection / union_size if union_size > 0 else 0
+
+            # Pass 2: shared backtick identifiers (concept-level)
+            # If two comments share >50% of identifiers, they discuss the same thing
+            ident_inter = len(ident_sets[i] & ident_sets[j])
+            ident_union = len(ident_sets[i] | ident_sets[j])
+            ident_sim = ident_inter / ident_union if ident_union > 0 else 0
+
+            if word_sim >= threshold or ident_sim >= 0.5:
+                union(i, j)
+
+    # Group by root
+    groups: dict[int, list[int]] = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+
+    result: list[ReviewComment] = []
+    for gid, (_, members) in enumerate(sorted(groups.items())):
+        # Pick the longest comment as representative
+        rep_idx = max(members, key=lambda i: len(comments[i].body))
+        rep = comments[rep_idx]
+        rep.group_id = gid
+        if len(members) > 1:
+            others = [comments[i] for i in members if i != rep_idx]
+            locs = ", ".join(
+                f"PR#{c.pr} {c.path}:{c.line}" if c.line else f"PR#{c.pr} {c.path}"
+                for c in others
+            )
+            rep.body += f"\n\n*({len(members) - 1} duplicate(s) at: {locs})*"
+        result.append(rep)
+
+    return result
+
+
+def print_markdown(
+    comments: list[ReviewComment], *, dedup: bool = False
+) -> None:
     """Print comments grouped by PR in readable markdown."""
+    if dedup:
+        comments = _deduplicate(comments)
+        deduped_label = " (deduplicated)"
+    else:
+        deduped_label = ""
+
     by_pr: dict[int, list[ReviewComment]] = {}
     for c in comments:
         by_pr.setdefault(c.pr, []).append(c)
 
     for pr, items in sorted(by_pr.items()):
-        print(f"\n## PR #{pr} — {len(items)} Copilot comment(s)\n")
+        print(f"\n## PR #{pr} — {len(items)} Copilot comment(s){deduped_label}\n")
         if not items:
             print("No Copilot comments.\n")
             continue
@@ -114,6 +217,11 @@ def main() -> None:
         action="store_true",
         help="One-line summary per comment",
     )
+    parser.add_argument(
+        "--dedup",
+        action="store_true",
+        help="Deduplicate similar comments (Jaccard similarity >= 0.6)",
+    )
     args = parser.parse_args()
 
     all_comments: list[ReviewComment] = []
@@ -125,11 +233,13 @@ def main() -> None:
         sys.exit(0)
 
     if args.as_json:
-        print(json.dumps([asdict(c) for c in all_comments], indent=2))
+        out = _deduplicate(all_comments) if args.dedup else all_comments
+        print(json.dumps([asdict(c) for c in out], indent=2))
     elif args.summary_only:
-        print_summary(all_comments)
+        out = _deduplicate(all_comments) if args.dedup else all_comments
+        print_summary(out)
     else:
-        print_markdown(all_comments)
+        print_markdown(all_comments, dedup=args.dedup)
 
 
 if __name__ == "__main__":

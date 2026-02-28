@@ -100,6 +100,19 @@ gh issue view {number} --json state --jq '.state'
 
 Also check if any parent epics should be closed (all sub-issues done).
 
+## Step 7.5: Add Issues to Project Tracker
+
+Add all closed issues AND any newly created deferred-P2 issues to the
+NEREIDS Development project (number 8):
+
+```bash
+gh project item-add 8 --owner ornlneutronimaging \
+  --url https://github.com/ornlneutronimaging/NEREIDS/issues/{number}
+```
+
+Repeat for every issue number involved in this batch (closed + deferred).
+This keeps the project board in sync for velocity tracking.
+
 ## Step 8: Update Project Memory
 
 Unless `--skip-memory` is in `$ARGUMENTS`:
