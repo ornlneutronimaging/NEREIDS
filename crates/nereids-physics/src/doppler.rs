@@ -164,20 +164,38 @@ pub fn doppler_broaden(
     let v_neg_limit = v_min - DOPPLER_N_SIGMA * u;
 
     // Build extended velocity grid: negative points (if needed) + positive points.
-    let mut ext_v: Vec<f64> = Vec::new();
-    let mut ext_y: Vec<f64> = Vec::new();
+    // Pre-compute total capacity: negative points + zero + positive + upper extension.
+    let dv_lo = if n > 1 {
+        (velocities[1] - velocities[0]).max(u * 0.1)
+    } else {
+        u * 0.5
+    };
+    let dv_hi = if n > 1 {
+        (velocities[n - 1] - velocities[n - 2]).max(u * 0.1)
+    } else {
+        u * 0.5
+    };
+    let n_neg = if v_neg_limit < 0.0 {
+        // Points from v_neg_limit to just below zero, plus the v=0 anchor.
+        (((-v_neg_limit - NEGATIVE_VELOCITY_FLOOR) / dv_lo).ceil() as usize).saturating_add(1)
+    } else {
+        0
+    };
+    let v_max = velocities[n - 1];
+    let v_max_limit = v_max + DOPPLER_N_SIGMA * u;
+    let n_hi = if v_max < v_max_limit {
+        ((v_max_limit - v_max) / dv_hi).ceil() as usize
+    } else {
+        0
+    };
+    let capacity = n_neg + n + n_hi;
+    let mut ext_v: Vec<f64> = Vec::with_capacity(capacity);
+    let mut ext_y: Vec<f64> = Vec::with_capacity(capacity);
 
     if v_neg_limit < 0.0 {
         // We need negative velocity points.
         // Use the same spacing as the low-energy end of the positive grid,
         // but in velocity space (uniform dv).
-        let dv = if n > 1 {
-            (velocities[1] - velocities[0]).max(u * 0.1)
-        } else {
-            u * 0.5
-        };
-
-        // Add negative velocity points from v_neg_limit to -dv
         let mut v = v_neg_limit;
         while v < -NEGATIVE_VELOCITY_FLOOR {
             ext_v.push(v);
@@ -186,7 +204,7 @@ pub fn doppler_broaden(
             let e = v * v;
             let sigma = interpolate_cross_section(energies, cross_sections, e);
             ext_y.push(v.abs() * sigma); // Y is even
-            v += dv;
+            v += dv_lo;
         }
 
         // Add v = 0 point
@@ -201,21 +219,14 @@ pub fn doppler_broaden(
     }
 
     // Add points beyond the highest velocity if needed
-    let v_max = velocities[n - 1];
-    let v_max_limit = v_max + DOPPLER_N_SIGMA * u;
     if v_max < v_max_limit {
-        let dv = if n > 1 {
-            (velocities[n - 1] - velocities[n - 2]).max(u * 0.1)
-        } else {
-            u * 0.5
-        };
-        let mut v = v_max + dv;
+        let mut v = v_max + dv_hi;
         while v <= v_max_limit {
             ext_v.push(v);
             let e = v * v;
             let sigma = interpolate_cross_section(energies, cross_sections, e);
             ext_y.push(v * sigma);
-            v += dv;
+            v += dv_hi;
         }
     }
 
@@ -236,31 +247,13 @@ pub fn doppler_broaden(
     // where w_norm_i are Gaussian weights normalized to sum to 1,
     // v_i = ext_v[i], and σ(E_i) is the cross-section at E_i = v_i².
     //
-    // We also compute equivalent raw Gaussian weights for the extended
-    // velocity grid, then normalize, apply v² factor, multiply by σ,
-    // and divide by E.
-    //
     // For negative velocities: E_i = v_i², σ(E_i) is the cross-section
     // at energy v_i² (same as for positive v_i).
-
-    // Build the cross-section array on the extended grid.
-    // ext_y stores |w|×σ(w²), so σ(w²) = ext_y[j] / |ext_v[j]|
-    // for non-zero velocities.
-    let ext_sigma: Vec<f64> = (0..n_ext)
-        .map(|j| {
-            let w = ext_v[j];
-            if w.abs() < NEAR_ZERO_FLOOR {
-                // At v=0, cross-section is the extrapolated value
-                if !energies.is_empty() {
-                    interpolate_cross_section(energies, cross_sections, 0.0)
-                } else {
-                    0.0
-                }
-            } else {
-                ext_y[j] / w.abs()
-            }
-        })
-        .collect();
+    //
+    // Instead of pre-allocating an ext_sigma Vec, we compute σ on-the-fly.
+    // ext_y stores |w|×σ(w²), so:
+    //   v_j² × σ(E_j) = v_j² × ext_y[j] / |v_j| = |v_j| × ext_y[j]
+    // At v=0: v_j² × σ(E_j) = 0 regardless, and |v_j| × ext_y[j] = 0.
 
     let mut broadened = vec![0.0f64; n];
 
@@ -288,11 +281,10 @@ pub fn doppler_broaden(
         let mut sum_weights = 0.0f64;
         let mut result = 0.0f64;
 
+        // The binary-search window [v_lo, v_hi] guarantees |arg| ≤ DOPPLER_N_SIGMA = 6,
+        // so arg² ≤ 36.  No additional arg² > 100 guard is needed.
         for j in j_lo..j_hi {
             let arg = (v - ext_v[j]) / u;
-            if arg * arg > 100.0 {
-                continue;
-            }
             let g = (-arg * arg).exp();
 
             // Trapezoidal half-widths
@@ -310,11 +302,9 @@ pub fn doppler_broaden(
 
             let w = g * dw;
             sum_weights += w;
-            // v_j² × σ(E_j) — same as the original two-pass formula:
-            //   result += w_norm × v_j² × ext_sigma[j]
-            // but deferred normalisation (divide by sum_weights after the loop).
-            let vj2 = ext_v[j] * ext_v[j]; // v_j² = E_j
-            result += w * vj2 * ext_sigma[j];
+            // v_j² × σ(E_j) = |v_j| × ext_y[j], computed on-the-fly
+            // (see comment above the outer loop for the derivation).
+            result += w * ext_v[j].abs() * ext_y[j];
         }
 
         if sum_weights < DIVISION_FLOOR {
@@ -600,13 +590,6 @@ mod tests {
         for &(e_ref, sigma_ref) in &sammy_ref {
             let sigma_us = interpolate_cross_section(&energies, &broadened, e_ref);
             let rel_err = (sigma_us - sigma_ref).abs() / sigma_ref;
-            eprintln!(
-                "  E={:.4} eV: ours={:.4}, SAMMY={:.4}, ratio={:.4}",
-                e_ref,
-                sigma_us,
-                sigma_ref,
-                sigma_us / sigma_ref
-            );
             max_rel_err = max_rel_err.max(rel_err);
         }
         // Allow up to 5% relative error (trapezoidal integration + constant differences).
