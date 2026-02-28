@@ -1435,7 +1435,7 @@ fn parse_urr_range(
     }
 
     // ENDF-6 §2.2.2: LRF for URR is 1 or 2. Guard before i32→u32 cast.
-    debug_assert!((1..=7).contains(&lrf), "LRF out of ENDF-6 range: {lrf}");
+    debug_assert!(lrf == 1 || lrf == 2, "URR LRF must be 1 or 2, got: {lrf}");
 
     let urr = UrrData {
         lrf: lrf as u32,
