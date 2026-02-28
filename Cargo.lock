@@ -2398,6 +2398,7 @@ dependencies = [
  "nereids-core",
  "nereids-endf",
  "num-complex",
+ "rayon",
 ]
 
 [[package]]
