@@ -33,7 +33,7 @@ tifffile = ">=2024.1"
 [tool.pixi.tasks]
 build = { cmd = "env -u VIRTUAL_ENV maturin develop --release --manifest-path bindings/python/Cargo.toml" }
 test-rust = { cmd = "env -u VIRTUAL_ENV cargo test --workspace" }
-test-python = "python -m pytest tests/"
+test-python = { cmd = "python -m pytest tests/", depends-on = ["build"] }
 test = { depends-on = ["test-rust", "test-python"] }
 fmt = "cargo fmt --all"
 clippy = "cargo clippy --workspace -- -D warnings"
