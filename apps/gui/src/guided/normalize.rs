@@ -40,9 +40,9 @@ fn normalization_controls_card(ui: &mut egui::Ui, state: &mut AppState) {
                         ui.label("Transmission data ready (pre-normalized).");
                         show_energy_info(ui, state);
                     } else if state.sample_data.is_some() && state.spectrum_values.is_some() {
-                        if ui.button("Prepare Transmission").clicked() {
-                            prepare_transmission(state);
-                        }
+                        // Auto-prepare: pre-normalized data needs no user action.
+                        prepare_transmission(state);
+                        ui.label("Preparing transmission...");
                     } else {
                         ui.label("Load transmission TIFF and spectrum file first (Step 1).");
                     }
@@ -490,7 +490,10 @@ fn normalize_data(state: &mut AppState) {
 }
 
 /// Prepare pre-normalized transmission data (TransmissionTiff mode).
-fn prepare_transmission(state: &mut AppState) {
+///
+/// Called automatically when TransmissionTiff data is ready but not yet
+/// wrapped as `NormalizedData`.  Idempotent — does nothing if already prepared.
+pub(crate) fn prepare_transmission(state: &mut AppState) {
     state.cancel_pending_tasks();
     state.pixel_fit_result = None;
     state.spatial_result = None;

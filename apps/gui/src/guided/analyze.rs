@@ -5,7 +5,7 @@
 //! this redesign shows both side-by-side so the user can click a pixel on the
 //! map and immediately see its spectrum.
 
-use crate::state::{AppState, IsotopeEntry, RoiSelection};
+use crate::state::{AppState, InputMode, IsotopeEntry, RoiSelection};
 use crate::widgets::image_view::show_viridis_image;
 use egui_plot::{Line, Plot, PlotPoints};
 use nereids_pipeline::pipeline::FitConfig;
@@ -29,6 +29,15 @@ use std::sync::mpsc;
 /// +-----------------------+-----------------------+-----------------------+
 /// ```
 pub fn analyze_step(ui: &mut egui::Ui, state: &mut AppState) {
+    // Auto-prepare TransmissionTiff data if the user skipped the Normalize step.
+    if state.input_mode == InputMode::TransmissionTiff
+        && state.normalized.is_none()
+        && state.sample_data.is_some()
+        && state.spectrum_values.is_some()
+    {
+        crate::guided::normalize::prepare_transmission(state);
+    }
+
     ui.heading("Analyze");
     ui.separator();
 
