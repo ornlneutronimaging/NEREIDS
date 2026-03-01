@@ -6,7 +6,7 @@ Always run these three commands and fix all output before committing:
 
 ```
 cargo fmt --all
-cargo clippy --workspace --exclude nereids-python -- -D warnings
+cargo clippy --workspace --exclude nereids-python --all-targets -- -D warnings
 cargo test --workspace --exclude nereids-python
 ```
 
