@@ -339,7 +339,7 @@ pub fn broadened_cross_sections_with_derivative(
 ) -> Result<BroadenedXsWithDerivative, TransmissionError> {
     let dt = 1e-4 * (1.0 + temperature_k);
     let t_up = temperature_k + dt;
-    let t_down = (temperature_k - dt).max(0.1); // stay physical
+    let t_down = (temperature_k - dt).max(0.0); // stay physical
     let actual_2dt = t_up - t_down;
 
     // No cancel token passed; TransmissionError::{Resolution, Doppler} can occur.
@@ -700,5 +700,46 @@ mod tests {
             deriv_coarse,
             rel_err,
         );
+    }
+
+    #[test]
+    fn test_broadened_xs_derivative_low_temperature() {
+        // Regression test: derivative must have correct sign at low temperature.
+        // Before fix, t_down was clamped to 0.1 K, causing actual_2dt < 0
+        // and flipping the derivative sign for T < 0.1 K.
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 5.0 + (i as f64) * 0.1).collect();
+
+        // T = 0.05 K: was broken (t_down=0.1 > t_up=0.050105)
+        let (xs_low, dxs_low) = broadened_cross_sections_with_derivative(
+            &energies,
+            std::slice::from_ref(&data),
+            0.05,
+            None,
+        )
+        .unwrap();
+        assert!(!xs_low.is_empty());
+        // Derivative should be finite and mostly positive (Doppler broadening
+        // increases with temperature for narrow resonances).
+        for deriv_vec in &dxs_low {
+            for &d in deriv_vec {
+                assert!(d.is_finite(), "derivative must be finite at T=0.05 K");
+            }
+        }
+
+        // T = 0.0 K: edge case (forward difference only)
+        let (xs_zero, dxs_zero) = broadened_cross_sections_with_derivative(
+            &energies,
+            std::slice::from_ref(&data),
+            0.0,
+            None,
+        )
+        .unwrap();
+        assert!(!xs_zero.is_empty());
+        for deriv_vec in &dxs_zero {
+            for &d in deriv_vec {
+                assert!(d.is_finite(), "derivative must be finite at T=0.0 K");
+            }
+        }
     }
 }
