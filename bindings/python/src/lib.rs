@@ -522,10 +522,8 @@ fn forward_model<'py>(
         .map(|(d, thick)| (Arc::unwrap_or_clone(d.inner), thick))
         .collect();
 
-    let sample = SampleParams {
-        temperature_k,
-        isotopes: sample_isotopes,
-    };
+    let sample = SampleParams::new(temperature_k, sample_isotopes)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
     let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution)?;
     let instrument = res_fn.map(|r| InstrumentParams { resolution: r });
@@ -1183,27 +1181,6 @@ fn beer_lambert<'py>(
     Ok(PyArray1::from_vec(py, t))
 }
 
-/// Validate Gaussian resolution parameters: finite, positive flight path,
-/// non-negative timing and path length uncertainties.
-fn validate_gaussian_params(fp: f64, dt: f64, dl: f64) -> PyResult<()> {
-    if !fp.is_finite() || fp <= 0.0 {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "flight_path_m must be finite and positive",
-        ));
-    }
-    if !dt.is_finite() || dt < 0.0 {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "delta_t_us must be finite and non-negative",
-        ));
-    }
-    if !dl.is_finite() || dl < 0.0 {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "delta_l_m must be finite and non-negative",
-        ));
-    }
-    Ok(())
-}
-
 /// Validate that an energy grid is finite, positive, and sorted ascending.
 /// Empty grids are accepted (callers that need non-empty should use
 /// `require_non_empty_energy_grid` instead).
@@ -1268,12 +1245,9 @@ fn build_resolution(
             tab.inner,
         ))))
     } else if let (Some(fp), Some(dt), Some(dl)) = (flight_path_m, delta_t_us, delta_l_m) {
-        validate_gaussian_params(fp, dt, dl)?;
-        Ok(Some(ResolutionFunction::Gaussian(ResolutionParams {
-            flight_path_m: fp,
-            delta_t_us: dt,
-            delta_l_m: dl,
-        })))
+        let rp = ResolutionParams::new(fp, dt, dl)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(Some(ResolutionFunction::Gaussian(rp)))
     } else {
         Ok(None)
     }
@@ -1380,31 +1354,12 @@ fn resolution_broaden<'py>(
         )));
     }
     validate_energy_grid(e)?;
-    if !flight_path_m.is_finite() || flight_path_m <= 0.0 {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "flight_path_m must be finite and positive",
-        ));
-    }
-    if !delta_t_us.is_finite() || delta_t_us < 0.0 {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "delta_t_us must be finite and non-negative",
-        ));
-    }
-    if !delta_l_m.is_finite() || delta_l_m < 0.0 {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "delta_l_m must be finite and non-negative",
-        ));
-    }
+    let params = ResolutionParams::new(flight_path_m, delta_t_us, delta_l_m)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
     if delta_t_us == 0.0 && delta_l_m == 0.0 {
         return Ok(PyArray1::from_vec(py, xs.to_vec()));
     }
-
-    let params = ResolutionParams {
-        flight_path_m,
-        delta_t_us,
-        delta_l_m,
-    };
 
     // Copy numpy slices to owned vectors so we can release the GIL.
     let e_owned = e.to_vec();
@@ -1612,23 +1567,19 @@ fn py_spatial_map(
                     "roi is only supported with fitter='poisson', not fitter='lm'",
                 ));
             }
-            let config = FitConfig {
-                energies: e.to_vec(),
-                resonance_data: res_data,
-                isotope_names: isotope_names.clone(),
+            let config = FitConfig::new(
+                e.to_vec(),
+                res_data,
+                isotope_names.clone(),
                 temperature_k,
-                resolution: res_fn,
-                initial_densities: init,
-                lm_config: LmConfig {
+                res_fn,
+                init,
+                LmConfig {
                     max_iter,
                     ..LmConfig::default()
                 },
-                precomputed_cross_sections: None,
-                fit_temperature: false,
-                // spatial_map internally sets compute_covariance=false for
-                // per-pixel speed; the value here is the caller's default.
-                compute_covariance: true,
-            };
+            )
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
             // Clone arrays only after all validation passes.
             // The .to_owned() is necessary because py.detach() releases the GIL and
@@ -1703,18 +1654,19 @@ fn py_spatial_map(
                 }
                 None => None,
             };
-            let sparse_config = SparseConfig {
-                energies: e.to_vec(),
-                resonance_data: res_data,
-                isotope_names: isotope_names.clone(),
+            let sparse_config = SparseConfig::new(
+                e.to_vec(),
+                res_data,
+                isotope_names.clone(),
                 temperature_k,
-                resolution: res_fn,
-                initial_densities: init,
-                poisson_config: PoissonConfig {
+                res_fn,
+                init,
+                PoissonConfig {
                     max_iter,
                     ..PoissonConfig::default()
                 },
-            };
+            )
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
             // Release the GIL for nuisance estimation + per-pixel Poisson fitting.
             let result = py.detach(move || {
@@ -1869,21 +1821,19 @@ fn py_fit_roi(
 
     let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution)?;
 
-    let config = FitConfig {
-        energies: e.to_vec(),
-        resonance_data: res_data,
+    let config = FitConfig::new(
+        e.to_vec(),
+        res_data,
         isotope_names,
         temperature_k,
-        resolution: res_fn,
-        initial_densities: init,
-        lm_config: LmConfig {
+        res_fn,
+        init,
+        LmConfig {
             max_iter,
             ..LmConfig::default()
         },
-        precomputed_cross_sections: None,
-        fit_temperature: false,
-        compute_covariance: true,
-    };
+    )
+    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
     // Clone arrays only after all validation passes.
     // The .to_owned() is necessary because py.detach() releases the GIL and

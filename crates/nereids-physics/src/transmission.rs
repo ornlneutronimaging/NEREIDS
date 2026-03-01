@@ -166,13 +166,73 @@ pub fn beer_lambert_multi(
         .collect())
 }
 
+/// Errors from `SampleParams` construction.
+#[derive(Debug, PartialEq)]
+pub enum SampleParamsError {
+    /// Temperature must be finite.
+    NonFiniteTemperature(f64),
+    /// Temperature must be non-negative.
+    NegativeTemperature(f64),
+}
+
+impl fmt::Display for SampleParamsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NonFiniteTemperature(v) => {
+                write!(f, "temperature must be finite, got {v}")
+            }
+            Self::NegativeTemperature(v) => {
+                write!(f, "temperature must be non-negative, got {v}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SampleParamsError {}
+
 /// Sample description for the forward model.
 #[derive(Debug, Clone)]
 pub struct SampleParams {
     /// Temperature in Kelvin (for Doppler broadening).
-    pub temperature_k: f64,
+    temperature_k: f64,
     /// Isotope compositions: (resonance data, areal density in atoms/barn).
-    pub isotopes: Vec<(ResonanceData, f64)>,
+    isotopes: Vec<(ResonanceData, f64)>,
+}
+
+impl SampleParams {
+    /// Create validated sample parameters.
+    ///
+    /// # Errors
+    /// Returns `SampleParamsError::NonFiniteTemperature` if `temperature_k` is
+    /// NaN or infinity.
+    /// Returns `SampleParamsError::NegativeTemperature` if `temperature_k < 0.0`.
+    pub fn new(
+        temperature_k: f64,
+        isotopes: Vec<(ResonanceData, f64)>,
+    ) -> Result<Self, SampleParamsError> {
+        if !temperature_k.is_finite() {
+            return Err(SampleParamsError::NonFiniteTemperature(temperature_k));
+        }
+        if temperature_k < 0.0 {
+            return Err(SampleParamsError::NegativeTemperature(temperature_k));
+        }
+        Ok(Self {
+            temperature_k,
+            isotopes,
+        })
+    }
+
+    /// Returns the sample temperature in Kelvin.
+    #[must_use]
+    pub fn temperature_k(&self) -> f64 {
+        self.temperature_k
+    }
+
+    /// Returns the isotope compositions: (resonance data, areal density).
+    #[must_use]
+    pub fn isotopes(&self) -> &[(ResonanceData, f64)] {
+        &self.isotopes
+    }
 }
 
 /// Optional instrument resolution parameters.
@@ -221,7 +281,7 @@ pub fn forward_model(
     // Compute broadened cross-sections for all isotopes in parallel.
     // Each isotope's Doppler + resolution broadening is independent.
     let broadened: Result<Vec<(Vec<f64>, f64)>, TransmissionError> = sample
-        .isotopes
+        .isotopes()
         .par_iter()
         .filter(|(_, thickness)| *thickness > 0.0)
         .map(|(res_data, thickness)| {
@@ -232,8 +292,8 @@ pub fn forward_model(
                 .collect();
 
             // 2. Apply Doppler broadening
-            let after_doppler = if sample.temperature_k > 0.0 {
-                let doppler_params = DopplerParams::new(sample.temperature_k, res_data.awr)?;
+            let after_doppler = if sample.temperature_k() > 0.0 {
+                let doppler_params = DopplerParams::new(sample.temperature_k(), res_data.awr)?;
                 doppler::doppler_broaden(energies, &unbroadened, &doppler_params)?
             } else {
                 unbroadened
@@ -537,10 +597,7 @@ mod tests {
         let t_direct = beer_lambert(&xs, thickness);
 
         // Forward model
-        let sample = SampleParams {
-            temperature_k: 0.0,
-            isotopes: vec![(data, thickness)],
-        };
+        let sample = SampleParams::new(0.0, vec![(data, thickness)]).unwrap();
         let t_forward = forward_model(&energies, &sample, None).unwrap();
 
         for i in 0..energies.len() {
@@ -564,17 +621,11 @@ mod tests {
         let energies: Vec<f64> = (0..401).map(|i| 5.0 + (i as f64) * 0.01).collect();
 
         // Cold (no broadening)
-        let sample_cold = SampleParams {
-            temperature_k: 0.0,
-            isotopes: vec![(data.clone(), thickness)],
-        };
+        let sample_cold = SampleParams::new(0.0, vec![(data.clone(), thickness)]).unwrap();
         let t_cold = forward_model(&energies, &sample_cold, None).unwrap();
 
         // Hot (300 K Doppler)
-        let sample_hot = SampleParams {
-            temperature_k: 300.0,
-            isotopes: vec![(data, thickness)],
-        };
+        let sample_hot = SampleParams::new(300.0, vec![(data, thickness)]).unwrap();
         let t_hot = forward_model(&energies, &sample_hot, None).unwrap();
 
         // Find minima
@@ -631,10 +682,7 @@ mod tests {
 
         let energies: Vec<f64> = (0..301).map(|i| 1.0 + (i as f64) * 0.1).collect();
 
-        let sample = SampleParams {
-            temperature_k: 0.0,
-            isotopes: vec![(u238, 0.0001), (other, 0.0001)],
-        };
+        let sample = SampleParams::new(0.0, vec![(u238, 0.0001), (other, 0.0001)]).unwrap();
         let t = forward_model(&energies, &sample, None).unwrap();
 
         // Find the transmission near 6.674 eV (U-238 resonance)
@@ -778,5 +826,44 @@ mod tests {
                 assert!(d.is_finite(), "derivative must be finite at T=0.0 K");
             }
         }
+    }
+
+    // --- SampleParams validation tests ---
+
+    #[test]
+    fn test_sample_params_valid() {
+        let sample = SampleParams::new(300.0, vec![]).unwrap();
+        assert!((sample.temperature_k() - 300.0).abs() < 1e-15);
+        assert!(sample.isotopes().is_empty());
+    }
+
+    #[test]
+    fn test_sample_params_zero_temperature() {
+        let sample = SampleParams::new(0.0, vec![]).unwrap();
+        assert!((sample.temperature_k()).abs() < 1e-15);
+    }
+
+    #[test]
+    fn test_sample_params_rejects_negative_temperature() {
+        let err = SampleParams::new(-1.0, vec![]).unwrap_err();
+        assert_eq!(err, SampleParamsError::NegativeTemperature(-1.0));
+    }
+
+    #[test]
+    fn test_sample_params_rejects_nan_temperature() {
+        let err = SampleParams::new(f64::NAN, vec![]).unwrap_err();
+        assert!(matches!(err, SampleParamsError::NonFiniteTemperature(_)));
+    }
+
+    #[test]
+    fn test_sample_params_rejects_infinite_temperature() {
+        let err = SampleParams::new(f64::INFINITY, vec![]).unwrap_err();
+        assert!(matches!(err, SampleParamsError::NonFiniteTemperature(_)));
+    }
+
+    #[test]
+    fn test_sample_params_rejects_neg_infinite_temperature() {
+        let err = SampleParams::new(f64::NEG_INFINITY, vec![]).unwrap_err();
+        assert!(matches!(err, SampleParamsError::NonFiniteTemperature(_)));
     }
 }

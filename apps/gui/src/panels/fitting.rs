@@ -335,18 +335,16 @@ fn build_fit_config(state: &AppState) -> Option<FitConfig> {
     let isotope_names: Vec<_> = enabled.iter().map(|e| e.symbol.clone()).collect();
     let initial_densities: Vec<_> = enabled.iter().map(|e| e.initial_density).collect();
 
-    Some(FitConfig {
+    FitConfig::new(
         energies,
         resonance_data,
         isotope_names,
-        temperature_k: state.temperature_k,
-        resolution: None,
+        state.temperature_k,
+        None,
         initial_densities,
-        lm_config: state.lm_config.clone(),
-        precomputed_cross_sections: None,
-        fit_temperature: false,
-        compute_covariance: true,
-    })
+        state.lm_config.clone(),
+    )
+    .ok()
 }
 
 fn fit_pixel(state: &mut AppState) {

@@ -92,10 +92,11 @@ fn matrix_baseline(
     config: &TraceDetectabilityConfig,
     instrument: Option<&InstrumentParams>,
 ) -> Result<Vec<f64>, TransmissionError> {
-    let sample_matrix = SampleParams {
-        temperature_k: config.temperature_k,
-        isotopes: vec![(config.matrix.clone(), config.matrix_density)],
-    };
+    let sample_matrix = SampleParams::new(
+        config.temperature_k,
+        vec![(config.matrix.clone(), config.matrix_density)],
+    )
+    .map_err(|e| TransmissionError::InputMismatch(e.to_string()))?;
     transmission::forward_model(config.energies, &sample_matrix, instrument)
 }
 
@@ -109,13 +110,14 @@ fn report_from_baseline(
 ) -> Result<TraceDetectabilityReport, TransmissionError> {
     // T_combined: transmission through matrix + trace
     let trace_density = trace_ppm * 1e-6 * config.matrix_density;
-    let sample_combined = SampleParams {
-        temperature_k: config.temperature_k,
-        isotopes: vec![
+    let sample_combined = SampleParams::new(
+        config.temperature_k,
+        vec![
             (config.matrix.clone(), config.matrix_density),
             (trace.clone(), trace_density),
         ],
-    };
+    )
+    .map_err(|e| TransmissionError::InputMismatch(e.to_string()))?;
     let t_combined = transmission::forward_model(config.energies, &sample_combined, instrument)?;
 
     // |ΔT| spectrum — absolute difference, sign discarded (see module docs).

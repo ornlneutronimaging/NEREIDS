@@ -208,10 +208,8 @@ impl FitModel for TransmissionFitModel {
             None => self.temperature_k,
         };
 
-        let sample = SampleParams {
-            temperature_k,
-            isotopes,
-        };
+        let sample = SampleParams::new(temperature_k, isotopes)
+            .expect("SampleParams: temperature must be non-negative and finite");
 
         // forward_model can fail for unsorted energies or invalid Doppler
         // params — both are configuration bugs (energies and isotope data are
