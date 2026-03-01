@@ -46,39 +46,39 @@ targeted `Edit` patches. Do not suppress clippy warnings with `#[allow(...)]`.
 ## Mandatory User Checkpoints (NEVER skip these)
 
 The user MUST have the opportunity to review and intervene at these points.
-**Always pause and present a summary, then wait for user confirmation.**
+**Always pause and present a summary, then STOP and wait for user response.**
 
-1. **After creating PRs**: show PR URLs + summary of changes per PR. Ask
-   if the user wants to request Copilot review before proceeding.
-2. **Before merging**: present the pre-merge checklist (review results,
-   test status). Never `gh pr merge` without explicit user approval.
+1. **After creating PRs**: show PR URLs + summary of changes per PR.
+   STOP here. Do NOT proceed to reviews until the user responds.
+2. **After review pipeline completes**: present the review summary table.
+   STOP here. Do NOT merge until the user explicitly says "merge" or
+   "proceed".
 3. **After post-merge gate**: report results before closing issues/epics.
+   STOP here. Do NOT close issues until the user confirms.
 
-Do NOT chain these steps automatically. Each checkpoint is a full stop.
+**"STOP" means end your turn.** Do not add "Shall I proceed?" and then
+continue in the same message. Do not launch background tasks that advance
+to the next stage. The user's next message is the gate.
+
 The user approving step N does NOT imply approval for step N+1.
 
 ## Multi-AI Review Pipeline (mandatory before merging PRs)
 
-Every feature branch must pass a **full** multi-stage review before merge.
-**Always use `/review-pipeline`** — never substitute a single self-review.
-Self-review alone bypasses the independent Codex second opinion, which is
-the highest-value check (cross-model confirmed findings are always real).
+Every feature branch must pass a review before merge. There is exactly
+ONE review mechanism: **`/review-pipeline`**. The standalone `/self-review`
+and `/codex-review` skills have been merged into it.
 
-| Phase | Tool | Skill | When |
-|-------|------|-------|------|
-| A (local) | Claude self-review + Codex CLI | `/review-pipeline` | Before push |
-| B (remote) | GitHub Copilot (manual trigger) | — | After push to PR |
+**HARD RULE**: When asked to review, ALWAYS invoke `/review-pipeline` via
+the Skill tool. NEVER substitute with ad-hoc review agents or custom
+subagents. The skill contains the full workflow: Claude audit + Codex
+external review + user gates + iteration logic + Copilot phase.
 
-**Phase A** iterates until zero P1s (max 4 rounds, then escalate to human).
-**Phase B** re-iterates if 3+ P1s or P1 ratio > 40%; otherwise fix inline
-and merge. Dismiss Copilot comments that rehash addressed issues or flag
-impossible edge cases. Fetch Copilot comments reliably with:
-`pixi run copilot-reviews {pr_numbers...}`
+| Phase | What | When |
+|-------|------|------|
+| A | Claude self-audit + Codex CLI (inside `/review-pipeline`) | Before push |
+| B | GitHub Copilot (manual trigger, fetched inside `/review-pipeline`) | After push |
 
-**Post-merge**: run `/post-merge` to execute the full integration gate on
-merged main (cleanup, `cargo clean && pixi run build`, tests, issue closure,
-memory update). `pixi run build` must run first — it catches cross-PR
-signature mismatches that per-branch reviews miss.
+**Post-merge**: run `/post-merge` for the integration gate on merged main.
 
 ## Validation Patterns
 

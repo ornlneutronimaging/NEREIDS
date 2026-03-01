@@ -9,13 +9,19 @@ user-invokable: true
 Run an iterative review pipeline on active worktree branches. Repeats
 until zero P1s remain or the iteration limit is reached.
 
+**This is the ONLY review mechanism.** Do not substitute with ad-hoc
+self-review agents, custom subagents, or any improvised review approach.
+The standalone `/self-review` and `/codex-review` skills have been merged
+into this single pipeline. When the user says "review", "run reviews",
+or any variation, invoke THIS skill.
+
 ## Arguments
 
 - No arguments: auto-discover all `.claude/worktrees/*/` branches diverged from main
 - Branch name: scope to a single branch (e.g., `review-pipeline fix/my-branch`)
 - `--skip-codex`: skip the Codex external review stage
 
-## Iteration Policy (from CLAUDE.md)
+## Iteration Policy
 
 - **Goal**: Zero P1s before pushing to remote
 - **Max iterations**: 4 per branch
@@ -25,6 +31,8 @@ until zero P1s remain or the iteration limit is reached.
 
 Track the current iteration number and report it in each consolidation
 (e.g., "Round 2 of 4").
+
+---
 
 ## Step 1: Discover Targets & Merge Order
 
@@ -54,20 +62,18 @@ Build a file overlap matrix and suggest merge order:
    (smallest first — the larger diff is more likely to need rebasing)
 3. Report the suggested merge order in the Step 4 consolidation
 
-This prevents the "last PR has merge conflicts" problem that occurred when
-PRs #151 and #152 both modified `poisson.rs`.
+---
 
 ## Steps 2 + 3: Self-Audit & External Review (launch together)
 
-Launch **all** self-audit and external-review tasks in a **single message**
-(background mode) so they run concurrently. In practice this means N worktrees
-produce 2N parallel tasks (N Claude subagents + N Codex commands).
+Launch **all** review tasks in a **single message** (background mode) so
+they run concurrently. N worktrees produce up to 2N parallel tasks
+(N Claude subagents + N Codex commands).
 
 ### Self-Audit (Claude Subagents)
 
-Launch one `Task(subagent_type="general-purpose")` per worktree:
-
-Each agent receives this prompt template (fill in worktree path and branch):
+Launch one `Agent(subagent_type="general-purpose", run_in_background=true)`
+per worktree with this prompt:
 
 > You are auditing the branch `{branch}` at `{worktree_path}`.
 >
@@ -89,32 +95,40 @@ Each agent receives this prompt template (fill in worktree path and branch):
 
 ### External Review (Codex CLI)
 
-Unless `--skip-codex` is in `$ARGUMENTS`, also launch one `Bash` command per
-worktree in the same message:
+Unless `--skip-codex` is in `$ARGUMENTS`, also launch one `Bash` command
+per worktree in the **same message**:
 
 ```bash
 cd {worktree_path} && codex review --base main 2>&1
 ```
 
-**Known CLI pitfalls** (as of Feb 2026): `--approval` removed; `--base`
-and `[PROMPT]` are mutually exclusive — use `--base main` alone, no custom
-prompt. If this syntax fails, try `codex review` without flags.
+**Codex CLI fallback chain** (syntax changes between versions):
+1. `cd {path} && codex review --base main 2>&1` (primary)
+2. `cd {path} && codex review 2>&1` (fallback if --base fails)
 
-If Codex fails (network, license, syntax change, or timeout), note the
-failure and continue. Codex is supplementary, not blocking.
+**Known pitfalls** (as of Feb 2026):
+- `--approval` flag removed — do not use
+- `--base` and positional `[PROMPT]` are mutually exclusive
+- Piping via stdin does not work
+- Notion MCP was removed from Codex config
+
+If Codex fails (network, license, timeout), note the failure and continue.
+Codex is supplementary, not blocking.
+
+---
 
 ## Step 4: Consolidate Findings
 
 After all reviews complete:
 
-1. Collect self-audit findings (from Task results) and Codex findings (from Bash output)
+1. Collect self-audit findings (from Agent results) and Codex findings (from Bash output)
 2. Merge into a unified report grouped by worktree/branch:
    - **Cross-confirmed** issues (found by both Claude and Codex) — highest confidence
    - **Claude-only** issues
    - **Codex-only** issues
 3. For each finding, classify as:
    - **Fix now** — P1s and high-confidence P2s
-   - **Defer** — P2s that are genuinely out of scope (different crate/subsystem,
+   - **Defer** — P2s genuinely out of scope (different crate/subsystem,
      pre-existing issue not introduced by this PR)
    - **Dismiss** — false positives, style-only, or impossible edge cases
 
@@ -125,106 +139,80 @@ the "Defer" category is restricted to findings in a *different crate or
 subsystem* than the one being fixed. Same-crate P2s MUST be classified as
 "Fix now" — otherwise P2 debt accumulates faster than it is paid down.
 
-For feature PRs, deferring same-crate P2s is acceptable, but each deferred
-P2 must result in a GitHub issue (Step 10).
-
 4. Report the iteration number: "Review Round N of 4"
-5. Include the **Suggested Merge Order** from Step 1's file overlap analysis
-6. **Present the consolidated report to the user** and ask which findings to fix
+5. Include the **Suggested Merge Order** from Step 1
+6. **Present the consolidated report to the user and STOP.**
+
+**MANDATORY GATE**: Do NOT proceed to Step 5 without user approval.
+The user must review the consolidation and tell you which findings to fix.
+End your turn after presenting the report.
 
 **Oscillating findings**: If a finding reappears after being "fixed", flag
 it as **RECURRING** — the user must decide the approach.
 
-IMPORTANT: Do NOT proceed to fixing without user approval. The consolidation
-step is an explicit gate.
+---
 
 ## Step 5: Fix
 
-After user approves the fix list, launch one `Task(subagent_type="general-purpose")`
-per worktree **in parallel** with specific fix instructions for that branch.
+After user approves the fix list, launch one
+`Agent(subagent_type="general-purpose")` per worktree **in parallel**.
 
 Each fix agent must:
 1. Apply the approved fixes
-2. **Check downstream consumers** — if the fix changes a public API (return type,
-   field visibility, function signature), grep for all call sites across the
-   workspace and update them. Common ripple targets: `nereids-python` (PyO3
-   bindings), `apps/gui`, and cross-crate callers in `nereids-endf`/`nereids-fitting`.
+2. **Check downstream consumers** — if the fix changes a public API,
+   grep for all call sites across the workspace and update them
 3. Run `cargo fmt --all`
-4. Run `cargo clippy --workspace --exclude nereids-python -- -D warnings`
+4. Run `cargo clippy --workspace --exclude nereids-python --all-targets -- -D warnings`
 5. Run `cargo test --workspace --exclude nereids-python`
-6. Show `git diff` of changes made
+6. Commit with `scripts/worktree-commit.sh` (GPG-signed)
 
-Do NOT commit — leave that for the verification step.
+## Step 6: Verify & Push
 
-## Step 6: Verify
+After all fix agents complete:
+1. Verify each worktree has clean `git status`
+2. Push each branch: `git push origin {branch}`
+3. Report commit hashes and branch status
 
-Launch one `Task(subagent_type="general-purpose")` per worktree **in parallel**
-to verify each fix:
+---
 
-Each verification agent must:
-1. Read the `git diff` of uncommitted changes
-2. Verify each fix is correct (edge cases, mathematical consistency, no regressions)
-3. Run tests for the specific crate
-4. Report PASS/FAIL per fix with brief justification
+## Step 7: Iteration Decision
 
-## Step 7: Commit & Push
+After pushing, check:
 
-After all verifications pass:
-
-1. For each worktree, commit with `git commit -S` (GPG-signed) and a descriptive message
-2. Push each branch to origin
-3. Report the commit hashes and branch status
-
-If any verification FAILs, report the issue and ask the user how to proceed
-before committing.
-
-## Step 8: Iteration Decision
-
-After committing and pushing, check:
-
-- **Zero P1s found this round?** → Local review complete. Inform the user
-  to trigger Copilot review on GitHub (Phase B per CLAUDE.md).
-- **P1s found and fixed, iteration < 4?** → Loop back to Step 2 for the
-  next round. The new round reviews the cumulative diff (main...HEAD),
-  catching both leftover and newly-introduced issues.
+- **Zero P1s found this round?** → Phase A complete. Proceed to Phase B.
+- **P1s found and fixed, iteration < 4?** → Loop back to Step 2.
 - **Iteration == 4 and P1s still found?** → STOP. Report:
-  "Iteration limit reached (4 rounds). P1s persist — escalating to human
-  review. Consider whether the PR scope is too large or needs task
-  decomposition."
+  "Iteration limit reached (4 rounds). P1s persist — escalating to human."
 
-## Step 8.5: Phase B — Copilot Review (after push)
+---
+
+## Step 8: Phase B — Copilot Review (after push)
 
 After Phase A completes (zero P1s) and branches are pushed:
 
-1. The user triggers Copilot review on GitHub (manual — cannot be automated)
-2. When Copilot reviews are in, fetch comments using the extraction script:
+1. Inform the user that Phase A is complete and branches are pushed.
+   Ask them to trigger Copilot review on GitHub. **STOP and wait.**
+2. When the user says Copilot reviews are in, fetch comments:
 
 ```bash
 pixi run copilot-reviews {pr_numbers...} --dedup
 ```
 
-The `--dedup` flag groups similar comments (word-level Jaccard + shared
-backtick identifiers) to collapse Copilot's tendency to repeat the same
-suggestion at multiple call sites.
-
-For machine-readable output (useful for automated processing):
-```bash
-pixi run copilot-reviews {pr_numbers...} --json --dedup
-```
-
 3. Classify each Copilot comment as P1 or P2
-4. **Decision criteria** (from CLAUDE.md):
+4. **Decision criteria**:
    - 3+ P1s OR P1 ratio > 40% → re-iterate (back to Step 2)
-   - Otherwise → fix P2s inline and merge
-5. If fixing inline: launch fix agents per branch, commit, push
-6. Dismiss Copilot comments that rehash already-addressed issues or flag
+   - Otherwise → fix P2s inline, commit, push
+5. Dismiss Copilot comments that rehash already-addressed issues or flag
    impossible edge cases
+6. Present Copilot resolution summary to the user.
 
-## Step 9: Pre-Merge Checkpoint (user approval required)
+---
 
-**IMPORTANT: Do NOT merge without explicit user approval.**
+## Step 9: Pre-Merge Checkpoint
 
-Before merging, present the user with a concise summary table:
+**MANDATORY: End your turn here and wait for user approval.**
+
+Present the user with a concise summary table:
 
 ```markdown
 ### Pre-Merge Summary — Batch {name}
@@ -232,57 +220,45 @@ Before merging, present the user with a concise summary table:
 | PR | Branch | Issue | Key Changes | Review Status |
 |----|--------|-------|-------------|---------------|
 | #{n} | {branch} | #{issue} | {1-line summary} | Phase A ✓ Phase B ✓ |
-| ... | ... | ... | ... | ... |
 
-**Merge order**: {any order / sequential recommendation with rationale}
+**Merge order**: {recommendation}
+**Review rounds**: Phase A: {N} round(s), Phase B: {N} Copilot comment(s)
+**Findings resolved**: {X} P1s fixed, {Y} P2s fixed, {Z} P2s deferred
+**Tests on branches**: {N} Rust tests — all pass
 
-**Review rounds**: Phase A: {N} round(s), Phase B: {N} Copilot comment(s) ({M} after dedup)
-
-**Findings resolved**: {X} P1s fixed, {Y} P2s fixed inline, {Z} P2s deferred → issues #{a}, #{b}
-
-**Dismissed**: {N} false positives / duplicates / rehash
-
-**Tests on branches**: {N} Rust tests, {M} Python tests — all pass
-
-**Ready to merge?** (Merge will be in order: {order}. Post-merge gate runs afterward.)
+Ready to merge? (User must explicitly approve.)
 ```
 
-Wait for the user to confirm before proceeding with any `gh pr merge` commands.
-The user may want to:
-- Inspect specific PRs on GitHub first
-- Request additional changes
-- Adjust merge order
-- Defer specific PRs to a later batch
+**Do NOT run `gh pr merge` until the user responds with explicit approval.**
 
-Once the user approves, merge in the recommended order using `gh pr merge --squash`.
-After all PRs are merged, proceed to Step 10.
+---
 
-## Step 10: Post-Merge Integration Test
+## Step 10: Merge & Post-Merge
 
-After all PRs in the batch are merged, run `/post-merge` which handles:
-cleanup, `cargo clean && pixi run build`, workspace tests, Python tests,
-issue verification, and memory updates. See the post-merge skill for details.
+After user approves:
 
-**IMPORTANT**: `pixi run build` must run first after `cargo clean`. It
-compiles the full workspace including PyO3 bindings. When multiple PRs modify
-the same function signature, per-branch reviews are blind to the conflict.
-`pixi run build` catches these cross-PR integration regressions at compile
-time.
+1. Merge PRs in recommended order using `gh pr merge --squash --delete-branch`
+2. Clean up worktrees: `git worktree remove {path} --force` for each merged branch
+3. Delete local branches: `git branch -D {branch}` for each
+4. Run `/post-merge` which handles: pull main, `cargo clean && pixi run build`,
+   workspace tests, Python tests, issue verification, memory updates
+
+**IMPORTANT**: `pixi run build` must run first after `cargo clean`. It catches
+cross-PR signature mismatches that per-branch reviews miss.
+
+---
 
 ## Step 11: Track Deferred P2 Findings
 
-**Do NOT skip this step.** After the pipeline completes (zero P1s and PRs
-merged), create GitHub issues for every P2 finding deferred during
-consolidation:
+**Do NOT skip this step.** Create GitHub issues for every P2 finding deferred
+during consolidation:
 
 1. Group deferred P2s by branch/crate
-2. Create one issue per group with:
-   - Title: `{crate} follow-up: {brief scope}` (e.g., "nereids-endf follow-up: parser robustness")
-   - Body: bulleted list of P2 findings with `file:line` references
-   - Reference the corresponding merged PR
-3. Report the created issue numbers to the user
+2. Create one issue per group with `file:line` references
+3. Add to project tracker (project #8)
+4. Report created issue numbers to the user
 
-This ensures P2s aren't forgotten without blocking the merge.
+---
 
 ## Subagent Prompt Requirements
 
@@ -291,10 +267,7 @@ When launching implementation or fix subagents, ALWAYS include:
 - **Tooling**: "Use `pixi run build` / `pixi run test-python` — never
   raw `maturin develop` or `pip install`."
 - **Commits**: "Use `scripts/worktree-commit.sh <worktree-name> '<message>' [files]`
-  for all commits. This validates the working directory and GPG-signs.
-  Do NOT use raw `git add && git commit` — it risks wrong-directory commits."
-- **GitHub issues**: "Use `pixi run gh-issues` for issue/PR queries
-  — never raw `gh` commands or `python scripts/...`."
-- **Pattern matching**: "Match patterns already used in the file you're
-  editing. Check existing code before introducing new API calls."
+  for all commits."
+- **GitHub issues**: "Use `pixi run gh-issues` for issue/PR queries."
+- **Pattern matching**: "Match patterns already used in the file you're editing."
 - **Pre-commit**: "Run the pre-commit checklist from CLAUDE.md."
