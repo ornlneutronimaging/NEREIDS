@@ -193,6 +193,9 @@ fn compute_energies(state: &AppState, n_tof: usize) -> Result<Vec<f64>, String> 
             }
             (SpectrumUnit::EnergyEv, SpectrumValueKind::BinCenters) => {
                 // Direct: energy centers
+                if values.iter().any(|&v| v <= 0.0) {
+                    return Err("Energy bin centers must be positive".into());
+                }
                 values.clone()
             }
         };

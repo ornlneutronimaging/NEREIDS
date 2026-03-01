@@ -8,7 +8,8 @@ pub fn load_step(ui: &mut egui::Ui, state: &mut AppState) {
     ui.heading("Load Data");
     ui.separator();
 
-    // Input mode tabs
+    // Input mode tabs — invalidate results when switching modes
+    let prev_mode = state.input_mode;
     ui.horizontal(|ui| {
         ui.selectable_value(
             &mut state.input_mode,
@@ -25,6 +26,11 @@ pub fn load_step(ui: &mut egui::Ui, state: &mut AppState) {
             ui.label("HDF5 Histogram");
         });
     });
+    if state.input_mode != prev_mode {
+        state.invalidate_results();
+        state.sample_data = None;
+        state.open_beam_data = None;
+    }
 
     ui.add_space(8.0);
 
