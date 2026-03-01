@@ -166,6 +166,140 @@ pub fn load_nexus_histogram(path: &Path) -> Result<NexusHistogramData, IoError> 
     })
 }
 
+/// Parameters for histogramming neutron event data into a 3D grid.
+#[derive(Debug, Clone)]
+pub struct EventBinningParams {
+    /// Number of TOF bins.
+    pub n_bins: usize,
+    /// Minimum TOF in microseconds.
+    pub tof_min_us: f64,
+    /// Maximum TOF in microseconds.
+    pub tof_max_us: f64,
+    /// Detector height in pixels.
+    pub height: usize,
+    /// Detector width in pixels.
+    pub width: usize,
+}
+
+/// Load neutron event data from a NeXus file and histogram into a 3D grid.
+///
+/// Reads `/entry/neutrons/event_time_offset` (u64 ns), `x` (f64), `y` (f64),
+/// converts TOF from nanoseconds to microseconds, then bins events into a
+/// `(n_bins, height, width)` histogram grid.
+///
+/// Events outside the spatial bounds or TOF range are silently dropped.
+pub fn load_nexus_events(
+    path: &Path,
+    params: &EventBinningParams,
+) -> Result<NexusHistogramData, IoError> {
+    if params.n_bins == 0 {
+        return Err(IoError::InvalidParameter("n_bins must be positive".into()));
+    }
+    if params.height == 0 || params.width == 0 {
+        return Err(IoError::InvalidParameter(
+            "height and width must be positive".into(),
+        ));
+    }
+    if params.tof_max_us <= params.tof_min_us {
+        return Err(IoError::InvalidParameter(format!(
+            "tof_max_us ({}) must be greater than tof_min_us ({})",
+            params.tof_max_us, params.tof_min_us
+        )));
+    }
+
+    let file = hdf5::File::open(path).map_err(|e| {
+        IoError::FileNotFound(
+            path.display().to_string(),
+            std::io::Error::other(e.to_string()),
+        )
+    })?;
+
+    let entry = file
+        .group("entry")
+        .map_err(|e| IoError::InvalidParameter(format!("Missing /entry group: {e}")))?;
+
+    let neutrons = entry
+        .group("neutrons")
+        .map_err(|e| IoError::InvalidParameter(format!("Missing /entry/neutrons group: {e}")))?;
+
+    // Read event arrays
+    let tof_ns: Vec<u64> = neutrons
+        .dataset("event_time_offset")
+        .map_err(|e| IoError::InvalidParameter(format!("Missing event_time_offset dataset: {e}")))?
+        .read_1d()
+        .map_err(|e| IoError::InvalidParameter(format!("Failed to read event_time_offset: {e}")))?
+        .to_vec();
+
+    let x_coords: Vec<f64> = neutrons
+        .dataset("x")
+        .map_err(|e| IoError::InvalidParameter(format!("Missing x dataset: {e}")))?
+        .read_1d()
+        .map_err(|e| IoError::InvalidParameter(format!("Failed to read x: {e}")))?
+        .to_vec();
+
+    let y_coords: Vec<f64> = neutrons
+        .dataset("y")
+        .map_err(|e| IoError::InvalidParameter(format!("Missing y dataset: {e}")))?
+        .read_1d()
+        .map_err(|e| IoError::InvalidParameter(format!("Failed to read y: {e}")))?
+        .to_vec();
+
+    if tof_ns.len() != x_coords.len() || tof_ns.len() != y_coords.len() {
+        return Err(IoError::ShapeMismatch(format!(
+            "Event arrays have mismatched lengths: tof={}, x={}, y={}",
+            tof_ns.len(),
+            x_coords.len(),
+            y_coords.len()
+        )));
+    }
+
+    // Generate linear TOF bin edges
+    let tof_edges_us =
+        crate::tof::linspace_tof_edges(params.tof_min_us, params.tof_max_us, params.n_bins)?;
+
+    // Histogram events
+    let dt_us = (params.tof_max_us - params.tof_min_us) / params.n_bins as f64;
+    let mut counts = Array3::<f64>::zeros((params.n_bins, params.height, params.width));
+
+    for i in 0..tof_ns.len() {
+        let tof_us = tof_ns[i] as f64 / 1000.0; // ns → µs
+
+        // Skip events outside TOF range
+        if tof_us < params.tof_min_us || tof_us >= params.tof_max_us {
+            continue;
+        }
+
+        // Pixel coordinates (round to nearest integer)
+        let px = x_coords[i].round() as isize;
+        let py = y_coords[i].round() as isize;
+
+        // Skip events outside spatial bounds
+        if px < 0 || py < 0 || px >= params.width as isize || py >= params.height as isize {
+            continue;
+        }
+
+        let tof_bin = ((tof_us - params.tof_min_us) / dt_us) as usize;
+        // Clamp to last bin (edge case: tof_us exactly at max boundary)
+        let tof_bin = tof_bin.min(params.n_bins - 1);
+
+        counts[[tof_bin, py as usize, px as usize]] += 1.0;
+    }
+
+    // Read flight path
+    let flight_path_m = read_f64_attr(&neutrons, "flight_path_m")
+        .or_else(|| read_f64_attr(&entry, "flight_path_m"));
+
+    // Read dead pixel mask
+    let dead_pixels = read_dead_pixel_mask(&entry);
+
+    Ok(NexusHistogramData {
+        counts,
+        tof_edges_us,
+        flight_path_m,
+        dead_pixels,
+    })
+}
+
 // ---- Internal helpers ----
 
 /// Probe the histogram group for shape and TOF axis without loading counts.
@@ -371,5 +505,153 @@ mod tests {
         assert!(!meta.has_events);
         assert!(meta.histogram_shape.is_none());
         assert!(meta.n_events.is_none());
+    }
+
+    /// Create a minimal NeXus file with neutron event data.
+    fn create_test_events(
+        path: &Path,
+        tof_ns: &[u64],
+        x: &[f64],
+        y: &[f64],
+        flight_path_m: Option<f64>,
+    ) {
+        let file = hdf5::File::create(path).expect("create");
+        let entry = file.create_group("entry").expect("create entry");
+
+        if let Some(fp) = flight_path_m {
+            entry
+                .new_attr::<f64>()
+                .shape(())
+                .create("flight_path_m")
+                .expect("create attr")
+                .write_scalar(&fp)
+                .expect("write attr");
+        }
+
+        let neutrons = entry.create_group("neutrons").expect("create neutrons");
+        neutrons
+            .new_dataset::<u64>()
+            .shape([tof_ns.len()])
+            .create("event_time_offset")
+            .expect("create tof")
+            .write_raw(tof_ns)
+            .expect("write tof");
+        neutrons
+            .new_dataset::<f64>()
+            .shape([x.len()])
+            .create("x")
+            .expect("create x")
+            .write_raw(x)
+            .expect("write x");
+        neutrons
+            .new_dataset::<f64>()
+            .shape([y.len()])
+            .create("y")
+            .expect("create y")
+            .write_raw(y)
+            .expect("write y");
+    }
+
+    #[test]
+    fn test_histogram_known_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.h5");
+
+        // 3 events: all at pixel (1, 0), TOFs at 1500 µs, 2500 µs, 1800 µs (in ns)
+        let tof_ns = vec![1_500_000, 2_500_000, 1_800_000];
+        let x = vec![1.0, 1.0, 1.0];
+        let y = vec![0.0, 0.0, 0.0];
+        create_test_events(&path, &tof_ns, &x, &y, Some(25.0));
+
+        let params = EventBinningParams {
+            n_bins: 2,
+            tof_min_us: 1000.0,
+            tof_max_us: 3000.0,
+            height: 2,
+            width: 3,
+        };
+
+        let data = load_nexus_events(&path, &params).unwrap();
+        assert_eq!(data.counts.shape(), &[2, 2, 3]);
+
+        // Bin 0: TOF [1000, 2000) µs → events at 1500 and 1800 µs → 2 counts
+        assert_eq!(data.counts[[0, 0, 1]], 2.0);
+        // Bin 1: TOF [2000, 3000) µs → event at 2500 µs → 1 count
+        assert_eq!(data.counts[[1, 0, 1]], 1.0);
+
+        assert_eq!(data.flight_path_m, Some(25.0));
+        assert_eq!(data.tof_edges_us.len(), 3); // n_bins + 1 edges
+    }
+
+    #[test]
+    fn test_filter_out_of_range_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events_oob.h5");
+
+        // Events: one in range, one out of TOF range, one out of spatial range
+        let tof_ns = vec![
+            1_500_000, // in range
+            500_000,   // below tof_min
+            1_500_000, // in range but x out of bounds
+        ];
+        let x = vec![0.0, 0.0, 5.0]; // 5.0 is out of width=3
+        let y = vec![0.0, 0.0, 0.0];
+        create_test_events(&path, &tof_ns, &x, &y, None);
+
+        let params = EventBinningParams {
+            n_bins: 2,
+            tof_min_us: 1000.0,
+            tof_max_us: 3000.0,
+            height: 2,
+            width: 3,
+        };
+
+        let data = load_nexus_events(&path, &params).unwrap();
+
+        // Only 1 event should be counted (the first one)
+        let total: f64 = data.counts.iter().sum();
+        assert_eq!(total, 1.0);
+        assert_eq!(data.counts[[0, 0, 0]], 1.0);
+    }
+
+    #[test]
+    fn test_empty_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty_events.h5");
+
+        create_test_events(&path, &[], &[], &[], None);
+
+        let params = EventBinningParams {
+            n_bins: 10,
+            tof_min_us: 1000.0,
+            tof_max_us: 20000.0,
+            height: 4,
+            width: 4,
+        };
+
+        let data = load_nexus_events(&path, &params).unwrap();
+        assert_eq!(data.counts.shape(), &[10, 4, 4]);
+
+        let total: f64 = data.counts.iter().sum();
+        assert_eq!(total, 0.0);
+    }
+
+    #[test]
+    fn test_probe_with_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("with_events.h5");
+
+        create_test_events(
+            &path,
+            &[1000, 2000, 3000],
+            &[0.0, 1.0, 2.0],
+            &[0.0, 0.0, 1.0],
+            None,
+        );
+
+        let meta = probe_nexus(&path).unwrap();
+        assert!(!meta.has_histogram);
+        assert!(meta.has_events);
+        assert_eq!(meta.n_events, Some(3));
     }
 }
