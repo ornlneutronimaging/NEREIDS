@@ -5,6 +5,7 @@
 //!
 //! This is the building block for the spatial mapping pipeline.
 
+use std::fmt;
 use std::sync::Arc;
 
 use nereids_endf::resonance::ResonanceData;
@@ -16,46 +17,238 @@ use nereids_physics::transmission::InstrumentParams;
 
 use crate::error::PipelineError;
 
+/// Errors from `FitConfig` construction.
+#[derive(Debug, PartialEq)]
+pub enum FitConfigError {
+    /// Energy grid must be non-empty.
+    EmptyEnergies,
+    /// Resonance data must be non-empty.
+    EmptyResonanceData,
+    /// initial_densities length must match resonance_data length.
+    DensityCountMismatch { densities: usize, isotopes: usize },
+    /// isotope_names length must match resonance_data length.
+    NameCountMismatch { names: usize, isotopes: usize },
+    /// Temperature must be finite.
+    NonFiniteTemperature(f64),
+    /// Temperature must be non-negative.
+    NegativeTemperature(f64),
+    /// When fit_temperature is true, temperature must be >= 1.0 K.
+    FitTemperatureTooLow(f64),
+}
+
+impl fmt::Display for FitConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyEnergies => write!(f, "energy grid must be non-empty"),
+            Self::EmptyResonanceData => write!(f, "resonance_data must be non-empty"),
+            Self::DensityCountMismatch {
+                densities,
+                isotopes,
+            } => write!(
+                f,
+                "initial_densities length ({densities}) must match resonance_data length ({isotopes})"
+            ),
+            Self::NameCountMismatch { names, isotopes } => write!(
+                f,
+                "isotope_names length ({names}) must match resonance_data length ({isotopes})"
+            ),
+            Self::NonFiniteTemperature(v) => {
+                write!(f, "temperature must be finite, got {v}")
+            }
+            Self::NegativeTemperature(v) => {
+                write!(f, "temperature must be non-negative, got {v}")
+            }
+            Self::FitTemperatureTooLow(v) => {
+                write!(
+                    f,
+                    "temperature must be >= 1.0 K when fit_temperature is true, got {v}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for FitConfigError {}
+
 /// Configuration for a single-spectrum fit.
+///
+/// Fields are private to enforce validation invariants.
+/// Use [`FitConfig::new`] to construct, then builder methods for optional fields.
 #[derive(Debug, Clone)]
 pub struct FitConfig {
     /// Energy grid in eV (ascending).
-    pub energies: Vec<f64>,
+    energies: Vec<f64>,
     /// Resonance data for each isotope to fit.
-    pub resonance_data: Vec<ResonanceData>,
+    resonance_data: Vec<ResonanceData>,
     /// Isotope names (for reporting).
-    pub isotope_names: Vec<String>,
+    isotope_names: Vec<String>,
     /// Sample temperature in Kelvin.
-    pub temperature_k: f64,
+    temperature_k: f64,
     /// Optional instrument resolution function (Gaussian or tabulated).
-    pub resolution: Option<ResolutionFunction>,
+    resolution: Option<ResolutionFunction>,
     /// Initial guess for areal densities (atoms/barn), one per isotope.
-    pub initial_densities: Vec<f64>,
+    initial_densities: Vec<f64>,
     /// LM optimizer configuration.
-    pub lm_config: LmConfig,
+    lm_config: LmConfig,
     /// Precomputed Doppler+resolution-broadened cross-sections, one `Vec<f64>`
     /// per isotope.  When `Some`, `fit_spectrum` skips the expensive resonance
     /// and broadening computation and uses `PrecomputedTransmissionModel` instead.
-    ///
-    /// Compute with `nereids_physics::transmission::broadened_cross_sections`
-    /// and wrap in `Arc` before the `spatial_map` / `fit_roi` loop so the
-    /// result is shared read-only across all rayon threads.
-    pub precomputed_cross_sections: Option<Arc<Vec<Vec<f64>>>>,
+    precomputed_cross_sections: Option<Arc<Vec<Vec<f64>>>>,
     /// When `true`, `temperature_k` is treated as an initial guess and fitted
-    /// jointly with the areal densities.  The precomputed fast path is
-    /// disabled (cross-sections must be recomputed per evaluation at the
-    /// current trial temperature).
-    ///
-    /// Default: `false` — temperature is held fixed.
-    pub fit_temperature: bool,
+    /// jointly with the areal densities.
+    fit_temperature: bool,
     /// Whether to compute the covariance matrix (and parameter uncertainties)
-    /// after convergence.  When `false`, the post-convergence Jacobian
-    /// recomputation and matrix inversion are skipped, and
-    /// `SpectrumFitResult::uncertainties` will be `None`.
+    /// after convergence.
+    compute_covariance: bool,
+}
+
+impl FitConfig {
+    /// Create a validated fit configuration.
     ///
-    /// Default: `true` (backwards-compatible for single-spectrum use).
-    /// Set to `false` in `spatial_map` for speed when only densities are needed.
-    pub compute_covariance: bool,
+    /// # Arguments
+    /// * `energies` — Energy grid in eV (must be non-empty).
+    /// * `resonance_data` — Resonance data per isotope (must be non-empty).
+    /// * `isotope_names` — Display names for each isotope.
+    /// * `temperature_k` — Sample temperature in Kelvin (must be finite and non-negative).
+    /// * `resolution` — Optional instrument resolution function.
+    /// * `initial_densities` — Initial density guesses (length must match `resonance_data`).
+    /// * `lm_config` — LM optimizer configuration.
+    ///
+    /// # Errors
+    /// Returns `FitConfigError` if any invariant is violated.
+    pub fn new(
+        energies: Vec<f64>,
+        resonance_data: Vec<ResonanceData>,
+        isotope_names: Vec<String>,
+        temperature_k: f64,
+        resolution: Option<ResolutionFunction>,
+        initial_densities: Vec<f64>,
+        lm_config: LmConfig,
+    ) -> Result<Self, FitConfigError> {
+        if energies.is_empty() {
+            return Err(FitConfigError::EmptyEnergies);
+        }
+        if resonance_data.is_empty() {
+            return Err(FitConfigError::EmptyResonanceData);
+        }
+        if initial_densities.len() != resonance_data.len() {
+            return Err(FitConfigError::DensityCountMismatch {
+                densities: initial_densities.len(),
+                isotopes: resonance_data.len(),
+            });
+        }
+        if isotope_names.len() != resonance_data.len() {
+            return Err(FitConfigError::NameCountMismatch {
+                names: isotope_names.len(),
+                isotopes: resonance_data.len(),
+            });
+        }
+        if !temperature_k.is_finite() {
+            return Err(FitConfigError::NonFiniteTemperature(temperature_k));
+        }
+        if temperature_k < 0.0 {
+            return Err(FitConfigError::NegativeTemperature(temperature_k));
+        }
+        Ok(Self {
+            energies,
+            resonance_data,
+            isotope_names,
+            temperature_k,
+            resolution,
+            initial_densities,
+            lm_config,
+            precomputed_cross_sections: None,
+            fit_temperature: false,
+            compute_covariance: true,
+        })
+    }
+
+    /// Set precomputed cross-sections (builder pattern).
+    #[must_use]
+    pub fn with_precomputed_cross_sections(mut self, xs: Arc<Vec<Vec<f64>>>) -> Self {
+        self.precomputed_cross_sections = Some(xs);
+        self
+    }
+
+    /// Set whether to compute the covariance matrix (builder pattern).
+    #[must_use]
+    pub fn with_compute_covariance(mut self, compute: bool) -> Self {
+        self.compute_covariance = compute;
+        self
+    }
+
+    /// Set whether to fit temperature jointly (builder pattern).
+    ///
+    /// # Errors
+    /// Returns `FitConfigError::FitTemperatureTooLow` if `fit` is true and
+    /// `temperature_k < 1.0`.
+    pub fn with_fit_temperature(mut self, fit: bool) -> Result<Self, FitConfigError> {
+        if fit && self.temperature_k < 1.0 {
+            return Err(FitConfigError::FitTemperatureTooLow(self.temperature_k));
+        }
+        self.fit_temperature = fit;
+        Ok(self)
+    }
+
+    /// Returns the energy grid in eV.
+    #[must_use]
+    pub fn energies(&self) -> &[f64] {
+        &self.energies
+    }
+
+    /// Returns the resonance data for each isotope.
+    #[must_use]
+    pub fn resonance_data(&self) -> &[ResonanceData] {
+        &self.resonance_data
+    }
+
+    /// Returns the isotope names.
+    #[must_use]
+    pub fn isotope_names(&self) -> &[String] {
+        &self.isotope_names
+    }
+
+    /// Returns the sample temperature in Kelvin.
+    #[must_use]
+    pub fn temperature_k(&self) -> f64 {
+        self.temperature_k
+    }
+
+    /// Returns the optional resolution function.
+    #[must_use]
+    pub fn resolution(&self) -> Option<&ResolutionFunction> {
+        self.resolution.as_ref()
+    }
+
+    /// Returns the initial density guesses.
+    #[must_use]
+    pub fn initial_densities(&self) -> &[f64] {
+        &self.initial_densities
+    }
+
+    /// Returns the LM optimizer configuration.
+    #[must_use]
+    pub fn lm_config(&self) -> &LmConfig {
+        &self.lm_config
+    }
+
+    /// Returns the precomputed cross-sections, if any.
+    #[must_use]
+    pub fn precomputed_cross_sections(&self) -> Option<&Arc<Vec<Vec<f64>>>> {
+        self.precomputed_cross_sections.as_ref()
+    }
+
+    /// Returns whether temperature fitting is enabled.
+    #[must_use]
+    pub fn fit_temperature(&self) -> bool {
+        self.fit_temperature
+    }
+
+    /// Returns whether covariance computation is enabled.
+    #[must_use]
+    pub fn compute_covariance(&self) -> bool {
+        self.compute_covariance
+    }
 }
 
 /// Result of fitting a single spectrum.
@@ -98,25 +291,16 @@ pub fn fit_spectrum(
     sigma: &[f64],
     config: &FitConfig,
 ) -> Result<SpectrumFitResult, PipelineError> {
-    let n_isotopes = config.resonance_data.len();
+    let n_isotopes = config.resonance_data().len();
 
-    if config.energies.is_empty() {
-        return Err(PipelineError::InvalidParameter(
-            "config.energies must be non-empty".into(),
-        ));
-    }
-    if config.initial_densities.len() != n_isotopes {
-        return Err(PipelineError::ShapeMismatch(format!(
-            "initial_densities length ({}) must match resonance_data length ({})",
-            config.initial_densities.len(),
-            n_isotopes,
-        )));
-    }
-    if measured_t.len() != config.energies.len() {
+    // Config-level invariants (non-empty energies, resonance_data, density
+    // count, temperature) are enforced by FitConfig::new().  Only per-call
+    // shape checks remain here.
+    if measured_t.len() != config.energies().len() {
         return Err(PipelineError::ShapeMismatch(format!(
             "measured_t length ({}) must match energies length ({})",
             measured_t.len(),
-            config.energies.len(),
+            config.energies().len(),
         )));
     }
     if sigma.len() != measured_t.len() {
@@ -126,27 +310,15 @@ pub fn fit_spectrum(
             measured_t.len(),
         )));
     }
-    if !config.temperature_k.is_finite() {
-        return Err(PipelineError::InvalidParameter(format!(
-            "temperature_k must be finite, got {}",
-            config.temperature_k,
-        )));
-    }
-    if config.fit_temperature && config.temperature_k < 1.0 {
-        return Err(PipelineError::InvalidParameter(format!(
-            "temperature_k ({}) must be >= 1.0 K when fit_temperature is true",
-            config.temperature_k,
-        )));
-    }
 
     let mut param_vec: Vec<FitParameter> = config
-        .initial_densities
+        .initial_densities()
         .iter()
         .enumerate()
         .map(|(i, &d)| {
             FitParameter::non_negative(
                 config
-                    .isotope_names
+                    .isotope_names()
                     .get(i)
                     .cloned()
                     .unwrap_or_else(|| format!("isotope_{}", i)),
@@ -158,10 +330,10 @@ pub fn fit_spectrum(
     // When fitting temperature, append it as an additional free parameter
     // after the density parameters.  Temperature uses bounded constraints
     // (physical range 1–5000 K).
-    let temperature_index = if config.fit_temperature {
+    let temperature_index = if config.fit_temperature() {
         param_vec.push(FitParameter {
             name: "temperature_k".into(),
-            value: config.temperature_k,
+            value: config.temperature_k(),
             lower: 1.0,
             upper: 5000.0,
             fixed: false,
@@ -176,20 +348,15 @@ pub fn fit_spectrum(
     // Propagate the pipeline-level compute_covariance flag into the LM config.
     // This lets spatial_map disable covariance without
     // modifying the caller's LmConfig.
-    let mut lm_config = config.lm_config.clone();
-    lm_config.compute_covariance = config.compute_covariance;
+    let mut lm_config = config.lm_config().clone();
+    lm_config.compute_covariance = config.compute_covariance();
 
     // Use precomputed cross-sections when available (fast path for spatial_map).
     // Fall back to the full forward-model path for single-spectrum calls.
     // When fitting temperature, always use the full forward model (can't
     // precompute when T is free).
-    let result = if !config.fit_temperature {
-        if let Some(xs) = &config.precomputed_cross_sections {
-            if n_isotopes == 0 {
-                return Err(PipelineError::InvalidParameter(
-                    "resonance_data is empty — nothing to fit".into(),
-                ));
-            }
+    let result = if !config.fit_temperature() {
+        if let Some(xs) = config.precomputed_cross_sections() {
             if xs.len() != n_isotopes {
                 return Err(PipelineError::ShapeMismatch(format!(
                     "precomputed_cross_sections has {} isotope(s) but resonance_data has {}",
@@ -197,7 +364,7 @@ pub fn fit_spectrum(
                     n_isotopes,
                 )));
             }
-            let n_e = config.energies.len();
+            let n_e = config.energies().len();
             for (i, row) in xs.iter().enumerate() {
                 if row.len() != n_e {
                     return Err(PipelineError::ShapeMismatch(format!(
@@ -215,13 +382,13 @@ pub fn fit_spectrum(
             lm::levenberg_marquardt(&model, measured_t, sigma, &mut params, &lm_config)?
         } else {
             let instrument = config
-                .resolution
-                .clone()
+                .resolution()
+                .cloned()
                 .map(|r| Arc::new(InstrumentParams { resolution: r }));
             let model = TransmissionFitModel::new(
-                config.energies.clone(),
-                config.resonance_data.clone(),
-                config.temperature_k,
+                config.energies().to_vec(),
+                config.resonance_data().to_vec(),
+                config.temperature_k(),
                 instrument,
                 (0..n_isotopes).collect(),
                 None,
@@ -232,13 +399,13 @@ pub fn fit_spectrum(
         // Temperature fitting: always use the full TransmissionFitModel
         // with temperature_index pointing to the appended temperature param.
         let instrument = config
-            .resolution
-            .clone()
+            .resolution()
+            .cloned()
             .map(|r| Arc::new(InstrumentParams { resolution: r }));
         let model = TransmissionFitModel::new(
-            config.energies.clone(),
-            config.resonance_data.clone(),
-            config.temperature_k,
+            config.energies().to_vec(),
+            config.resonance_data().to_vec(),
+            config.temperature_k(),
             instrument,
             (0..n_isotopes).collect(),
             temperature_index,
@@ -252,7 +419,7 @@ pub fn fit_spectrum(
     // uncertainties from the LM result.  When skipped (None), propagate None.
     let (uncertainties, temperature_k, temperature_k_unc) = match result.uncertainties {
         Some(unc_all) => {
-            let (temp_k, temp_unc) = if config.fit_temperature {
+            let (temp_k, temp_unc) = if config.fit_temperature() {
                 (
                     Some(result.params[n_isotopes]),
                     Some(*unc_all.get(n_isotopes).unwrap_or(&f64::NAN)),
@@ -273,7 +440,7 @@ pub fn fit_spectrum(
         }
         None => {
             // Covariance was skipped — no uncertainties available.
-            let (temp_k, temp_unc) = if config.fit_temperature {
+            let (temp_k, temp_unc) = if config.fit_temperature() {
                 (Some(result.params[n_isotopes]), None)
             } else {
                 (None, None)
@@ -319,18 +486,16 @@ mod tests {
         let y_obs = model.evaluate(&[true_density]);
         let sigma = vec![0.01; y_obs.len()];
 
-        let config = FitConfig {
+        let config = FitConfig::new(
             energies,
-            resonance_data: vec![data],
-            isotope_names: vec!["U-238".into()],
-            temperature_k: 0.0,
-            resolution: None,
-            initial_densities: vec![0.001],
-            lm_config: LmConfig::default(),
-            precomputed_cross_sections: None,
-            fit_temperature: false,
-            compute_covariance: true,
-        };
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        )
+        .unwrap();
 
         let result = fit_spectrum(&y_obs, &sigma, &config).unwrap();
 
@@ -367,18 +532,17 @@ mod tests {
         let y_obs = model.evaluate(&[true_density]);
         let sigma = vec![0.01; y_obs.len()];
 
-        let config = FitConfig {
+        let config = FitConfig::new(
             energies,
-            resonance_data: vec![data],
-            isotope_names: vec!["U-238".into()],
-            temperature_k: 0.0,
-            resolution: None,
-            initial_densities: vec![0.001],
-            lm_config: LmConfig::default(),
-            precomputed_cross_sections: None,
-            fit_temperature: false,
-            compute_covariance: false,
-        };
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        )
+        .unwrap()
+        .with_compute_covariance(false);
 
         let result = fit_spectrum(&y_obs, &sigma, &config).unwrap();
 
@@ -398,18 +562,16 @@ mod tests {
     #[test]
     fn test_fit_spectrum_rejects_length_mismatch() {
         let data = u238_single_resonance();
-        let config = FitConfig {
-            energies: vec![1.0, 2.0, 3.0],
-            resonance_data: vec![data],
-            isotope_names: vec!["U-238".into()],
-            temperature_k: 0.0,
-            resolution: None,
-            initial_densities: vec![0.001],
-            lm_config: LmConfig::default(),
-            precomputed_cross_sections: None,
-            fit_temperature: false,
-            compute_covariance: true,
-        };
+        let config = FitConfig::new(
+            vec![1.0, 2.0, 3.0],
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        )
+        .unwrap();
 
         // measured_t length (2) != energies length (3)
         let result = fit_spectrum(&[0.9, 0.8], &[0.01, 0.01], &config);
@@ -419,18 +581,16 @@ mod tests {
     #[test]
     fn test_fit_spectrum_rejects_sigma_length_mismatch() {
         let data = u238_single_resonance();
-        let config = FitConfig {
-            energies: vec![1.0, 2.0, 3.0],
-            resonance_data: vec![data],
-            isotope_names: vec!["U-238".into()],
-            temperature_k: 0.0,
-            resolution: None,
-            initial_densities: vec![0.001],
-            lm_config: LmConfig::default(),
-            precomputed_cross_sections: None,
-            fit_temperature: false,
-            compute_covariance: true,
-        };
+        let config = FitConfig::new(
+            vec![1.0, 2.0, 3.0],
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        )
+        .unwrap();
 
         // sigma length (2) != measured_t length (3) — should return ShapeMismatch
         let result = fit_spectrum(&[0.9, 0.8, 0.7], &[0.01, 0.01], &config);
@@ -441,5 +601,154 @@ mod tests {
             "Expected sigma mismatch error, got: {}",
             err_msg,
         );
+    }
+
+    // --- FitConfig validation tests ---
+
+    #[test]
+    fn test_fit_config_valid() {
+        let data = u238_single_resonance();
+        let config = FitConfig::new(
+            vec![1.0, 2.0],
+            vec![data],
+            vec!["U-238".into()],
+            300.0,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        );
+        assert!(config.is_ok());
+    }
+
+    #[test]
+    fn test_fit_config_rejects_empty_energies() {
+        let data = u238_single_resonance();
+        let err = FitConfig::new(
+            vec![],
+            vec![data],
+            vec!["U-238".into()],
+            300.0,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err, FitConfigError::EmptyEnergies);
+    }
+
+    #[test]
+    fn test_fit_config_rejects_empty_resonance_data() {
+        let err = FitConfig::new(
+            vec![1.0, 2.0],
+            vec![],
+            vec![],
+            300.0,
+            None,
+            vec![],
+            LmConfig::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err, FitConfigError::EmptyResonanceData);
+    }
+
+    #[test]
+    fn test_fit_config_rejects_density_count_mismatch() {
+        let data = u238_single_resonance();
+        let err = FitConfig::new(
+            vec![1.0, 2.0],
+            vec![data],
+            vec!["U-238".into()],
+            300.0,
+            None,
+            vec![0.001, 0.002], // 2 densities but only 1 isotope
+            LmConfig::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, FitConfigError::DensityCountMismatch { .. }));
+    }
+
+    #[test]
+    fn test_fit_config_rejects_name_count_mismatch() {
+        let data = u238_single_resonance();
+        let err = FitConfig::new(
+            vec![1.0, 2.0],
+            vec![data],
+            vec!["U-238".into(), "extra".into()], // 2 names but only 1 isotope
+            300.0,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, FitConfigError::NameCountMismatch { .. }));
+    }
+
+    #[test]
+    fn test_fit_config_rejects_nan_temperature() {
+        let data = u238_single_resonance();
+        let err = FitConfig::new(
+            vec![1.0, 2.0],
+            vec![data],
+            vec!["U-238".into()],
+            f64::NAN,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, FitConfigError::NonFiniteTemperature(_)));
+    }
+
+    #[test]
+    fn test_fit_config_rejects_negative_temperature() {
+        let data = u238_single_resonance();
+        let err = FitConfig::new(
+            vec![1.0, 2.0],
+            vec![data],
+            vec!["U-238".into()],
+            -1.0,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err, FitConfigError::NegativeTemperature(-1.0));
+    }
+
+    #[test]
+    fn test_fit_config_fit_temperature_rejects_low_temp() {
+        let data = u238_single_resonance();
+        let config = FitConfig::new(
+            vec![1.0, 2.0],
+            vec![data],
+            vec!["U-238".into()],
+            0.5,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        )
+        .unwrap();
+        let err = config.with_fit_temperature(true).unwrap_err();
+        assert!(matches!(err, FitConfigError::FitTemperatureTooLow(_)));
+    }
+
+    #[test]
+    fn test_fit_config_builder_methods() {
+        let data = u238_single_resonance();
+        let config = FitConfig::new(
+            vec![1.0, 2.0],
+            vec![data],
+            vec!["U-238".into()],
+            300.0,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        )
+        .unwrap()
+        .with_compute_covariance(false);
+        assert!(!config.compute_covariance());
+
+        let config = config.with_fit_temperature(true).unwrap();
+        assert!(config.fit_temperature());
     }
 }

@@ -315,8 +315,12 @@ fn fetch_endf_data(state: &mut AppState) {
     });
 }
 
-fn build_fit_config(state: &AppState) -> Option<FitConfig> {
-    let energies = state.energies.as_ref()?.clone();
+fn build_fit_config(state: &AppState) -> Result<FitConfig, String> {
+    let energies = state
+        .energies
+        .as_ref()
+        .ok_or_else(|| "No energy grid loaded".to_string())?
+        .clone();
 
     let enabled: Vec<&IsotopeEntry> = state
         .isotope_entries
@@ -325,7 +329,7 @@ fn build_fit_config(state: &AppState) -> Option<FitConfig> {
         .collect();
 
     if enabled.is_empty() {
-        return None;
+        return Err("No enabled isotopes with resonance data".into());
     }
 
     let resonance_data: Vec<_> = enabled
@@ -335,25 +339,23 @@ fn build_fit_config(state: &AppState) -> Option<FitConfig> {
     let isotope_names: Vec<_> = enabled.iter().map(|e| e.symbol.clone()).collect();
     let initial_densities: Vec<_> = enabled.iter().map(|e| e.initial_density).collect();
 
-    Some(FitConfig {
+    FitConfig::new(
         energies,
         resonance_data,
         isotope_names,
-        temperature_k: state.temperature_k,
-        resolution: None,
+        state.temperature_k,
+        None,
         initial_densities,
-        lm_config: state.lm_config.clone(),
-        precomputed_cross_sections: None,
-        fit_temperature: false,
-        compute_covariance: true,
-    })
+        state.lm_config.clone(),
+    )
+    .map_err(|e| format!("FitConfig validation error: {e}"))
 }
 
 fn fit_pixel(state: &mut AppState) {
     let config = match build_fit_config(state) {
-        Some(c) => c,
-        None => {
-            state.status_message = "Missing fit configuration".into();
+        Ok(c) => c,
+        Err(e) => {
+            state.status_message = e;
             return;
         }
     };
@@ -402,9 +404,9 @@ fn fit_pixel(state: &mut AppState) {
 
 fn fit_roi(state: &mut AppState) {
     let config = match build_fit_config(state) {
-        Some(c) => c,
-        None => {
-            state.status_message = "Missing fit configuration".into();
+        Ok(c) => c,
+        Err(e) => {
+            state.status_message = e;
             return;
         }
     };
@@ -462,9 +464,9 @@ fn fit_roi(state: &mut AppState) {
 
 fn run_spatial_map(state: &mut AppState) {
     let config = match build_fit_config(state) {
-        Some(c) => c,
-        None => {
-            state.status_message = "Missing fit configuration".into();
+        Ok(c) => c,
+        Err(e) => {
+            state.status_message = e;
             return;
         }
     };

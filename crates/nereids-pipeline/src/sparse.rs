@@ -38,23 +38,163 @@ use nereids_physics::transmission::{InstrumentParams, broadened_cross_sections};
 
 use crate::error::PipelineError;
 
+/// Errors from `SparseConfig` construction.
+#[derive(Debug, PartialEq)]
+pub enum SparseConfigError {
+    /// Energy grid must be non-empty.
+    EmptyEnergies,
+    /// Resonance data must be non-empty.
+    EmptyResonanceData,
+    /// initial_densities length must match resonance_data length.
+    DensityCountMismatch { densities: usize, isotopes: usize },
+    /// isotope_names length must match resonance_data length.
+    NameCountMismatch { names: usize, isotopes: usize },
+    /// Temperature must be finite.
+    NonFiniteTemperature(f64),
+    /// Temperature must be non-negative.
+    NegativeTemperature(f64),
+}
+
+impl std::fmt::Display for SparseConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyEnergies => write!(f, "energy grid must be non-empty"),
+            Self::EmptyResonanceData => write!(f, "resonance_data must be non-empty"),
+            Self::DensityCountMismatch {
+                densities,
+                isotopes,
+            } => write!(
+                f,
+                "initial_densities length ({densities}) must match resonance_data length ({isotopes})"
+            ),
+            Self::NameCountMismatch { names, isotopes } => write!(
+                f,
+                "isotope_names length ({names}) must match resonance_data length ({isotopes})"
+            ),
+            Self::NonFiniteTemperature(v) => {
+                write!(f, "temperature must be finite, got {v}")
+            }
+            Self::NegativeTemperature(v) => {
+                write!(f, "temperature must be non-negative, got {v}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SparseConfigError {}
+
 /// Configuration for two-stage sparse reconstruction.
+///
+/// Fields are private to enforce validation invariants.
+/// Use [`SparseConfig::new`] to construct.
 #[derive(Debug, Clone)]
 pub struct SparseConfig {
     /// Energy grid in eV (ascending).
-    pub energies: Vec<f64>,
+    energies: Vec<f64>,
     /// Resonance data for each isotope.
-    pub resonance_data: Vec<ResonanceData>,
+    resonance_data: Vec<ResonanceData>,
     /// Isotope names (for reporting).
-    pub isotope_names: Vec<String>,
+    isotope_names: Vec<String>,
     /// Sample temperature in Kelvin.
-    pub temperature_k: f64,
+    temperature_k: f64,
     /// Optional resolution function (Gaussian or tabulated).
-    pub resolution: Option<ResolutionFunction>,
+    resolution: Option<ResolutionFunction>,
     /// Initial guess for areal densities.
-    pub initial_densities: Vec<f64>,
+    initial_densities: Vec<f64>,
     /// Poisson optimizer configuration.
-    pub poisson_config: PoissonConfig,
+    poisson_config: PoissonConfig,
+}
+
+impl SparseConfig {
+    /// Create a validated sparse reconstruction configuration.
+    ///
+    /// # Errors
+    /// Returns `SparseConfigError` if any invariant is violated.
+    pub fn new(
+        energies: Vec<f64>,
+        resonance_data: Vec<ResonanceData>,
+        isotope_names: Vec<String>,
+        temperature_k: f64,
+        resolution: Option<ResolutionFunction>,
+        initial_densities: Vec<f64>,
+        poisson_config: PoissonConfig,
+    ) -> Result<Self, SparseConfigError> {
+        if energies.is_empty() {
+            return Err(SparseConfigError::EmptyEnergies);
+        }
+        if resonance_data.is_empty() {
+            return Err(SparseConfigError::EmptyResonanceData);
+        }
+        if initial_densities.len() != resonance_data.len() {
+            return Err(SparseConfigError::DensityCountMismatch {
+                densities: initial_densities.len(),
+                isotopes: resonance_data.len(),
+            });
+        }
+        if isotope_names.len() != resonance_data.len() {
+            return Err(SparseConfigError::NameCountMismatch {
+                names: isotope_names.len(),
+                isotopes: resonance_data.len(),
+            });
+        }
+        if !temperature_k.is_finite() {
+            return Err(SparseConfigError::NonFiniteTemperature(temperature_k));
+        }
+        if temperature_k < 0.0 {
+            return Err(SparseConfigError::NegativeTemperature(temperature_k));
+        }
+        Ok(Self {
+            energies,
+            resonance_data,
+            isotope_names,
+            temperature_k,
+            resolution,
+            initial_densities,
+            poisson_config,
+        })
+    }
+
+    /// Returns the energy grid in eV.
+    #[must_use]
+    pub fn energies(&self) -> &[f64] {
+        &self.energies
+    }
+
+    /// Returns the resonance data for each isotope.
+    #[must_use]
+    pub fn resonance_data(&self) -> &[ResonanceData] {
+        &self.resonance_data
+    }
+
+    /// Returns the isotope names.
+    #[must_use]
+    pub fn isotope_names(&self) -> &[String] {
+        &self.isotope_names
+    }
+
+    /// Returns the sample temperature in Kelvin.
+    #[must_use]
+    pub fn temperature_k(&self) -> f64 {
+        self.temperature_k
+    }
+
+    /// Returns the optional resolution function.
+    #[must_use]
+    pub fn resolution(&self) -> Option<&ResolutionFunction> {
+        self.resolution.as_ref()
+    }
+
+    /// Returns the initial density guesses.
+    #[must_use]
+    pub fn initial_densities(&self) -> &[f64] {
+        &self.initial_densities
+    }
+
+    /// Returns the Poisson optimizer configuration.
+    #[must_use]
+    pub fn poisson_config(&self) -> &PoissonConfig {
+        &self.poisson_config
+    }
 }
 
 /// Nuisance parameters estimated in Stage 1.
@@ -237,42 +377,16 @@ pub fn sparse_reconstruct(
 ) -> Result<SparseResult, PipelineError> {
     let shape = sample_counts.shape();
     let (n_energies, height, width) = (shape[0], shape[1], shape[2]);
-    let n_isotopes = config.resonance_data.len();
+    let n_isotopes = config.resonance_data().len();
 
-    // Guard against zero-isotope calls: with no isotopes, PrecomputedTransmissionModel
-    // would receive an empty cross_sections Vec and the first evaluate() would panic.
-    // Return an empty result with no density maps, NaN-filled NLL, and zero
-    // converged/total counts rather than crashing.
-    if n_isotopes == 0 {
-        return Ok(SparseResult {
-            density_maps: vec![],
-            nll_map: Array2::from_elem((height, width), f64::NAN),
-            converged_map: Array2::from_elem((height, width), false),
-            n_converged: 0,
-            n_total: 0,
-            nuisance: nuisance.clone(),
-        });
-    }
-
-    if config.initial_densities.len() != n_isotopes {
-        return Err(PipelineError::ShapeMismatch(format!(
-            "initial_densities length ({}) != resonance_data length ({})",
-            config.initial_densities.len(),
-            n_isotopes,
-        )));
-    }
-    if config.isotope_names.len() != n_isotopes {
-        return Err(PipelineError::ShapeMismatch(format!(
-            "isotope_names length ({}) != resonance_data length ({})",
-            config.isotope_names.len(),
-            n_isotopes,
-        )));
-    }
-    if n_energies != config.energies.len() {
+    // Config-level invariants (non-empty energies, resonance_data, density
+    // count, temperature) are enforced by SparseConfig::new().  Only per-call
+    // shape checks remain here.
+    if n_energies != config.energies().len() {
         return Err(PipelineError::ShapeMismatch(format!(
             "sample_counts spectral axis ({}) != config.energies length ({})",
             n_energies,
-            config.energies.len(),
+            config.energies().len(),
         )));
     }
     if nuisance.flux.len() != n_energies {
@@ -312,13 +426,13 @@ pub fn sparse_reconstruct(
     // Precompute Doppler-broadened cross-sections once, outside the pixel loop.
     // The same XS apply to every pixel (same isotopes, same temperature, same energy grid).
     // Mirrors the pattern used in spatial.rs to avoid repeating expensive broadening work.
-    let instrument_params = config.resolution.as_ref().map(|r| InstrumentParams {
+    let instrument_params = config.resolution().map(|r| InstrumentParams {
         resolution: r.clone(),
     });
     let xs_raw = broadened_cross_sections(
-        &config.energies,
-        &config.resonance_data,
-        config.temperature_k,
+        config.energies(),
+        config.resonance_data(),
+        config.temperature_k(),
         instrument_params.as_ref(),
         cancel,
     )?;
@@ -341,10 +455,10 @@ pub fn sparse_reconstruct(
     // was unreachable dead code.
     let param_template = ParameterSet::new(
         config
-            .initial_densities
+            .initial_densities()
             .iter()
             .enumerate()
-            .map(|(i, &d)| FitParameter::non_negative(config.isotope_names[i].clone(), d))
+            .map(|(i, &d)| FitParameter::non_negative(config.isotope_names()[i].clone(), d))
             .collect(),
     );
 
@@ -411,7 +525,7 @@ pub fn sparse_reconstruct(
                 &xs,
                 t_model.density_indices.as_slice(),
                 &mut params,
-                &config.poisson_config,
+                config.poisson_config(),
                 None,
             )
             .ok()?;
@@ -564,15 +678,16 @@ mod tests {
         let nuisance = estimate_nuisance(&ob_counts, None, None).unwrap();
 
         // Stage 2: reconstruct
-        let config = SparseConfig {
+        let config = SparseConfig::new(
             energies,
-            resonance_data: vec![data],
-            isotope_names: vec!["U-238".into()],
-            temperature_k: 0.0,
-            resolution: None,
-            initial_densities: vec![0.001],
-            poisson_config: PoissonConfig::default(),
-        };
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+            PoissonConfig::default(),
+        )
+        .unwrap();
 
         let result = sparse_reconstruct(&sample_counts, &nuisance, &config, None, None).unwrap();
 
@@ -603,40 +718,37 @@ mod tests {
     }
 
     #[test]
-    fn test_sparse_reconstruct_rejects_density_len_mismatch() {
+    fn test_sparse_config_rejects_density_len_mismatch() {
         let data = u238_single_resonance();
-        let config = SparseConfig {
-            energies: vec![1.0, 2.0, 3.0],
-            resonance_data: vec![data],
-            isotope_names: vec!["U-238".into()],
-            temperature_k: 0.0,
-            resolution: None,
-            initial_densities: vec![], // wrong: should be 1 element
-            poisson_config: PoissonConfig::default(),
-        };
-        let sample = Array3::from_elem((3, 2, 2), 50.0);
-        let nuisance = NuisanceParams {
-            flux: vec![100.0; 3],
-            background: vec![0.0; 3],
-        };
-        let result = sparse_reconstruct(&sample, &nuisance, &config, None, None);
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("initial_densities"), "error: {msg}");
+        let err = SparseConfig::new(
+            vec![1.0, 2.0, 3.0],
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![], // wrong: should be 1 element
+            PoissonConfig::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            SparseConfigError::DensityCountMismatch { .. }
+        ));
     }
 
     #[test]
     fn test_sparse_reconstruct_rejects_dead_pixel_shape_mismatch() {
         let data = u238_single_resonance();
-        let config = SparseConfig {
-            energies: vec![1.0, 2.0, 3.0],
-            resonance_data: vec![data],
-            isotope_names: vec!["U-238".into()],
-            temperature_k: 0.0,
-            resolution: None,
-            initial_densities: vec![0.001],
-            poisson_config: PoissonConfig::default(),
-        };
+        let config = SparseConfig::new(
+            vec![1.0, 2.0, 3.0],
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+            PoissonConfig::default(),
+        )
+        .unwrap();
 
         let sample = Array3::from_elem((3, 2, 2), 50.0);
         let nuisance = NuisanceParams {
@@ -647,5 +759,101 @@ mod tests {
 
         let result = sparse_reconstruct(&sample, &nuisance, &config, Some(&dead), None);
         assert!(result.is_err());
+    }
+
+    // --- SparseConfig validation tests ---
+
+    #[test]
+    fn test_sparse_config_valid() {
+        let data = u238_single_resonance();
+        let config = SparseConfig::new(
+            vec![1.0, 2.0],
+            vec![data],
+            vec!["U-238".into()],
+            300.0,
+            None,
+            vec![0.001],
+            PoissonConfig::default(),
+        );
+        assert!(config.is_ok());
+    }
+
+    #[test]
+    fn test_sparse_config_rejects_empty_energies() {
+        let data = u238_single_resonance();
+        let err = SparseConfig::new(
+            vec![],
+            vec![data],
+            vec!["U-238".into()],
+            300.0,
+            None,
+            vec![0.001],
+            PoissonConfig::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err, SparseConfigError::EmptyEnergies);
+    }
+
+    #[test]
+    fn test_sparse_config_rejects_empty_resonance_data() {
+        let err = SparseConfig::new(
+            vec![1.0, 2.0],
+            vec![],
+            vec![],
+            300.0,
+            None,
+            vec![],
+            PoissonConfig::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err, SparseConfigError::EmptyResonanceData);
+    }
+
+    #[test]
+    fn test_sparse_config_rejects_name_count_mismatch() {
+        let data = u238_single_resonance();
+        let err = SparseConfig::new(
+            vec![1.0, 2.0],
+            vec![data],
+            vec!["U-238".into(), "extra".into()], // 2 names but only 1 isotope
+            300.0,
+            None,
+            vec![0.001],
+            PoissonConfig::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, SparseConfigError::NameCountMismatch { .. }));
+    }
+
+    #[test]
+    fn test_sparse_config_rejects_nan_temperature() {
+        let data = u238_single_resonance();
+        let err = SparseConfig::new(
+            vec![1.0, 2.0],
+            vec![data],
+            vec!["U-238".into()],
+            f64::NAN,
+            None,
+            vec![0.001],
+            PoissonConfig::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, SparseConfigError::NonFiniteTemperature(_)));
+    }
+
+    #[test]
+    fn test_sparse_config_rejects_negative_temperature() {
+        let data = u238_single_resonance();
+        let err = SparseConfig::new(
+            vec![1.0, 2.0],
+            vec![data],
+            vec!["U-238".into()],
+            -1.0,
+            None,
+            vec![0.001],
+            PoissonConfig::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err, SparseConfigError::NegativeTemperature(-1.0));
     }
 }

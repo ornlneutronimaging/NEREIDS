@@ -1925,10 +1925,9 @@ mod tests {
             fn evaluate(&self, params: &[f64]) -> Vec<f64> {
                 let density = params[0];
                 let temperature = params[1];
-                let sample = SampleParams {
-                    temperature_k: temperature,
-                    isotopes: vec![(self.resonance_data[0].clone(), density)],
-                };
+                let sample =
+                    SampleParams::new(temperature, vec![(self.resonance_data[0].clone(), density)])
+                        .unwrap();
                 let transmission =
                     transmission::forward_model(&self.energies, &sample, None).unwrap();
                 transmission
@@ -2382,10 +2381,9 @@ mod tests {
             fn evaluate(&self, params: &[f64]) -> Vec<f64> {
                 let density = params[0];
                 let temperature = params[1];
-                let sample = SampleParams {
-                    temperature_k: temperature,
-                    isotopes: vec![(self.resonance_data[0].clone(), density)],
-                };
+                let sample =
+                    SampleParams::new(temperature, vec![(self.resonance_data[0].clone(), density)])
+                        .unwrap();
                 let transmission =
                     transmission::forward_model(&self.energies, &sample, None).unwrap();
                 transmission

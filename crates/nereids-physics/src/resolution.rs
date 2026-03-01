@@ -66,25 +66,106 @@ impl fmt::Display for ResolutionError {
 
 impl std::error::Error for ResolutionError {}
 
+/// Errors from `ResolutionParams` construction.
+#[derive(Debug, PartialEq)]
+pub enum ResolutionParamsError {
+    /// Flight path must be positive and finite.
+    InvalidFlightPath(f64),
+    /// Timing uncertainty must be non-negative and finite.
+    InvalidDeltaT(f64),
+    /// Path length uncertainty must be non-negative and finite.
+    InvalidDeltaL(f64),
+}
+
+impl fmt::Display for ResolutionParamsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidFlightPath(v) => {
+                write!(f, "flight_path_m must be positive and finite, got {v}")
+            }
+            Self::InvalidDeltaT(v) => {
+                write!(f, "delta_t_us must be non-negative and finite, got {v}")
+            }
+            Self::InvalidDeltaL(v) => {
+                write!(f, "delta_l_m must be non-negative and finite, got {v}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ResolutionParamsError {}
+
 /// Resolution function parameters for time-of-flight instruments.
 #[derive(Debug, Clone, Copy)]
 pub struct ResolutionParams {
     /// Flight path length in meters (source to detector).
-    pub flight_path_m: f64,
+    flight_path_m: f64,
     /// Total timing uncertainty (1σ Gaussian) in microseconds.
     /// Combines moderator pulse width, detector timing, and electronics.
-    pub delta_t_us: f64,
+    delta_t_us: f64,
     /// Flight path uncertainty (1σ Gaussian) in meters.
-    pub delta_l_m: f64,
+    delta_l_m: f64,
 }
 
 impl ResolutionParams {
+    /// Create validated resolution parameters.
+    ///
+    /// # Errors
+    /// Returns `ResolutionParamsError::InvalidFlightPath` if `flight_path_m <= 0.0`
+    /// or is not finite.
+    /// Returns `ResolutionParamsError::InvalidDeltaT` if `delta_t_us < 0.0` or is
+    /// not finite.
+    /// Returns `ResolutionParamsError::InvalidDeltaL` if `delta_l_m < 0.0` or is
+    /// not finite.
+    pub fn new(
+        flight_path_m: f64,
+        delta_t_us: f64,
+        delta_l_m: f64,
+    ) -> Result<Self, ResolutionParamsError> {
+        if !flight_path_m.is_finite() || flight_path_m <= 0.0 {
+            return Err(ResolutionParamsError::InvalidFlightPath(flight_path_m));
+        }
+        if !delta_t_us.is_finite() || delta_t_us < 0.0 {
+            return Err(ResolutionParamsError::InvalidDeltaT(delta_t_us));
+        }
+        if !delta_l_m.is_finite() || delta_l_m < 0.0 {
+            return Err(ResolutionParamsError::InvalidDeltaL(delta_l_m));
+        }
+        Ok(Self {
+            flight_path_m,
+            delta_t_us,
+            delta_l_m,
+        })
+    }
+
+    /// Returns the flight path length in meters.
+    #[must_use]
+    pub fn flight_path_m(&self) -> f64 {
+        self.flight_path_m
+    }
+
+    /// Total timing uncertainty (1σ Gaussian) in microseconds.
+    ///
+    /// The factor of 2 in [`gaussian_width()`](Self::gaussian_width) comes from
+    /// the energy-TOF derivative dE/E = 2·dt/t, not from a σ-to-FWHM conversion.
+    #[must_use]
+    pub fn delta_t_us(&self) -> f64 {
+        self.delta_t_us
+    }
+
+    /// Returns the flight path uncertainty (1σ Gaussian) in meters.
+    #[must_use]
+    pub fn delta_l_m(&self) -> f64 {
+        self.delta_l_m
+    }
+
     /// Gaussian resolution width σ_E(E) in eV.
     ///
     /// Combines timing and flight-path contributions in quadrature:
     ///   σ_E² = (2·Δt/t × E)² + (2·ΔL/L × E)²
     ///
     /// where t = TOF_FACTOR × L / √E is the time-of-flight in μs.
+    #[must_use]
     pub fn gaussian_width(&self, energy_ev: f64) -> f64 {
         if energy_ev <= 0.0 || self.flight_path_m <= 0.0 {
             return 0.0;
@@ -101,6 +182,7 @@ impl ResolutionParams {
     }
 
     /// FWHM of the resolution function at energy E, in eV.
+    #[must_use]
     pub fn fwhm(&self, energy_ev: f64) -> f64 {
         2.0 * (2.0_f64.ln()).sqrt() * self.gaussian_width(energy_ev)
     }
@@ -674,11 +756,7 @@ mod tests {
 
     #[test]
     fn test_resolution_width_scaling() {
-        let params = ResolutionParams {
-            flight_path_m: 25.0,
-            delta_t_us: 1.0,
-            delta_l_m: 0.01,
-        };
+        let params = ResolutionParams::new(25.0, 1.0, 0.01).unwrap();
 
         // Resolution width should increase with energy.
         let w1 = params.gaussian_width(1.0);
@@ -704,11 +782,7 @@ mod tests {
         // If resolution parameters are zero, output should equal input.
         let energies = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let xs = vec![10.0, 20.0, 30.0, 20.0, 10.0];
-        let params = ResolutionParams {
-            flight_path_m: 25.0,
-            delta_t_us: 0.0,
-            delta_l_m: 0.0,
-        };
+        let params = ResolutionParams::new(25.0, 0.0, 0.0).unwrap();
         let broadened = resolution_broaden(&energies, &xs, &params).unwrap();
         assert_eq!(broadened, xs);
     }
@@ -728,11 +802,7 @@ mod tests {
             })
             .collect();
 
-        let params = ResolutionParams {
-            flight_path_m: 25.0,
-            delta_t_us: 5.0, // Fairly large timing uncertainty
-            delta_l_m: 0.01,
-        };
+        let params = ResolutionParams::new(25.0, 5.0, 0.01).unwrap();
         let broadened = resolution_broaden(&energies, &xs, &params).unwrap();
 
         let orig_peak = xs.iter().cloned().fold(0.0_f64, f64::max);
@@ -767,11 +837,7 @@ mod tests {
             })
             .collect();
 
-        let params = ResolutionParams {
-            flight_path_m: 25.0,
-            delta_t_us: 1.0,
-            delta_l_m: 0.01,
-        };
+        let params = ResolutionParams::new(25.0, 1.0, 0.01).unwrap();
         let broadened = resolution_broaden(&energies, &xs, &params).unwrap();
 
         // Trapezoidal area
@@ -817,11 +883,7 @@ mod tests {
         // Set delta_l such that W = gaussian_width(E=10) ≈ 0.3 eV.
         // W = 2·ΔL·E/L, so ΔL = W·L/(2E) = 0.3×25/(20) = 0.375 m
         let w_kernel = 0.3; // Kernel parameter W (exp(-x²/W²))
-        let params = ResolutionParams {
-            flight_path_m: 25.0,
-            delta_t_us: 0.0,
-            delta_l_m: w_kernel * 25.0 / (2.0 * center),
-        };
+        let params = ResolutionParams::new(25.0, 0.0, w_kernel * 25.0 / (2.0 * center)).unwrap();
 
         // Verify kernel W at center energy
         let w_at_center = params.gaussian_width(center);
@@ -882,11 +944,7 @@ mod tests {
     fn test_venus_typical_resolution() {
         // Verify resolution width for typical VENUS parameters.
         // VENUS: L ≈ 25 m, Δt ≈ 10 μs (pulsed source), ΔL ≈ 0.01 m
-        let params = ResolutionParams {
-            flight_path_m: 25.0,
-            delta_t_us: 10.0,
-            delta_l_m: 0.01,
-        };
+        let params = ResolutionParams::new(25.0, 10.0, 0.01).unwrap();
 
         // At 1 eV: ΔE/E should be small (good resolution)
         let de_1 = params.gaussian_width(1.0);
@@ -910,11 +968,7 @@ mod tests {
     fn test_unsorted_energies_returns_error() {
         let energies = vec![1.0, 3.0, 2.0, 4.0]; // not sorted
         let xs = vec![10.0, 30.0, 20.0, 40.0];
-        let params = ResolutionParams {
-            flight_path_m: 25.0,
-            delta_t_us: 1.0,
-            delta_l_m: 0.01,
-        };
+        let params = ResolutionParams::new(25.0, 1.0, 0.01).unwrap();
         let result = resolution_broaden(&energies, &xs, &params);
         assert!(result.is_err());
         assert!(matches!(
@@ -927,11 +981,7 @@ mod tests {
     fn test_length_mismatch_returns_error() {
         let energies = vec![1.0, 2.0, 3.0];
         let xs = vec![10.0, 20.0]; // wrong length
-        let params = ResolutionParams {
-            flight_path_m: 25.0,
-            delta_t_us: 1.0,
-            delta_l_m: 0.01,
-        };
+        let params = ResolutionParams::new(25.0, 1.0, 0.01).unwrap();
         let result = resolution_broaden(&energies, &xs, &params);
         assert!(result.is_err());
         assert!(matches!(
@@ -941,5 +991,57 @@ mod tests {
                 data: 2
             }
         ));
+    }
+
+    // --- ResolutionParams validation tests ---
+
+    #[test]
+    fn test_resolution_params_valid() {
+        let p = ResolutionParams::new(25.0, 1.0, 0.01).unwrap();
+        assert!((p.flight_path_m() - 25.0).abs() < 1e-15);
+        assert!((p.delta_t_us() - 1.0).abs() < 1e-15);
+        assert!((p.delta_l_m() - 0.01).abs() < 1e-15);
+    }
+
+    #[test]
+    fn test_resolution_params_rejects_zero_flight_path() {
+        let err = ResolutionParams::new(0.0, 1.0, 0.01).unwrap_err();
+        assert_eq!(err, ResolutionParamsError::InvalidFlightPath(0.0));
+    }
+
+    #[test]
+    fn test_resolution_params_rejects_negative_flight_path() {
+        let err = ResolutionParams::new(-1.0, 1.0, 0.01).unwrap_err();
+        assert_eq!(err, ResolutionParamsError::InvalidFlightPath(-1.0));
+    }
+
+    #[test]
+    fn test_resolution_params_rejects_nan_flight_path() {
+        let err = ResolutionParams::new(f64::NAN, 1.0, 0.01).unwrap_err();
+        assert!(matches!(err, ResolutionParamsError::InvalidFlightPath(_)));
+    }
+
+    #[test]
+    fn test_resolution_params_rejects_negative_delta_t() {
+        let err = ResolutionParams::new(25.0, -1.0, 0.01).unwrap_err();
+        assert_eq!(err, ResolutionParamsError::InvalidDeltaT(-1.0));
+    }
+
+    #[test]
+    fn test_resolution_params_rejects_nan_delta_t() {
+        let err = ResolutionParams::new(25.0, f64::NAN, 0.01).unwrap_err();
+        assert!(matches!(err, ResolutionParamsError::InvalidDeltaT(_)));
+    }
+
+    #[test]
+    fn test_resolution_params_rejects_negative_delta_l() {
+        let err = ResolutionParams::new(25.0, 1.0, -0.01).unwrap_err();
+        assert_eq!(err, ResolutionParamsError::InvalidDeltaL(-0.01));
+    }
+
+    #[test]
+    fn test_resolution_params_rejects_inf_delta_l() {
+        let err = ResolutionParams::new(25.0, 1.0, f64::INFINITY).unwrap_err();
+        assert!(matches!(err, ResolutionParamsError::InvalidDeltaL(_)));
     }
 }

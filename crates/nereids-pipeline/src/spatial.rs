@@ -65,9 +65,11 @@ pub fn spatial_map(
 ) -> Result<SpatialResult, PipelineError> {
     let shape = transmission.shape();
     let (n_energies, height, width) = (shape[0], shape[1], shape[2]);
-    let n_isotopes = config.resonance_data.len();
+    let n_isotopes = config.resonance_data().len();
 
-    // Validate shapes
+    // Validate shapes — config-level invariants (non-empty energies,
+    // resonance_data, density count, temperature) are enforced by
+    // FitConfig::new().  Only per-call shape checks remain here.
     if uncertainty.shape() != transmission.shape() {
         return Err(PipelineError::ShapeMismatch(format!(
             "uncertainty shape {:?} != transmission shape {:?}",
@@ -75,11 +77,11 @@ pub fn spatial_map(
             transmission.shape(),
         )));
     }
-    if n_energies != config.energies.len() {
+    if n_energies != config.energies().len() {
         return Err(PipelineError::ShapeMismatch(format!(
             "transmission spectral axis ({}) != config.energies length ({})",
             n_energies,
-            config.energies.len(),
+            config.energies().len(),
         )));
     }
     if let Some(dp) = dead_pixels
@@ -92,38 +94,11 @@ pub fn spatial_map(
             width,
         )));
     }
-
-    // Up-front config validation: catch configuration-level errors before
-    // entering the expensive precompute + pixel loop.  Per-pixel fit failures
-    // are extremely rare once these hold, but without this gate a config bug
-    // would be silently swallowed by the filter_map below.
-    if n_energies == 0 {
-        return Err(PipelineError::InvalidParameter(
-            "spectral axis length is zero; at least one energy bin is required".into(),
-        ));
-    }
-    if config.resonance_data.is_empty() {
-        return Err(PipelineError::InvalidParameter(
-            "resonance_data is empty — nothing to fit".into(),
-        ));
-    }
-    if config.initial_densities.len() != n_isotopes {
+    if config.initial_densities().len() != n_isotopes {
         return Err(PipelineError::ShapeMismatch(format!(
             "initial_densities length ({}) != resonance_data length ({})",
-            config.initial_densities.len(),
+            config.initial_densities().len(),
             n_isotopes,
-        )));
-    }
-    if config.fit_temperature && config.temperature_k < 1.0 {
-        return Err(PipelineError::InvalidParameter(format!(
-            "fit_temperature requires temperature_k >= 1.0, got {}",
-            config.temperature_k,
-        )));
-    }
-    if !config.temperature_k.is_finite() {
-        return Err(PipelineError::InvalidParameter(format!(
-            "temperature_k must be finite, got {}",
-            config.temperature_k,
         )));
     }
 
@@ -185,26 +160,24 @@ pub fn spatial_map(
     // only need the fitted densities and chi-squared.  This saves one
     // full Jacobian evaluation per pixel (N_free model evaluations for
     // finite-difference, or free for analytical) plus the O(n_free³) inversion.
-    let fast_config = if config.fit_temperature {
-        let mut cfg = config.clone();
-        cfg.compute_covariance = false;
-        cfg
+    let fast_config = if config.fit_temperature() {
+        config.clone().with_compute_covariance(false)
     } else {
         // Use caller-supplied precomputed cross-sections when available; only call
         // broadened_cross_sections when none are provided.  This lets repeated
         // spatial_map calls with the same isotopes/energy grid share one precompute
         // result and avoids redundant Doppler+resolution broadening work.
-        let xs: Arc<Vec<Vec<f64>>> = match config.precomputed_cross_sections.clone() {
+        let xs: Arc<Vec<Vec<f64>>> = match config.precomputed_cross_sections().cloned() {
             Some(cached) => cached,
             None => {
-                let instrument_params = config.resolution.as_ref().map(|r| InstrumentParams {
+                let instrument_params = config.resolution().map(|r| InstrumentParams {
                     resolution: r.clone(),
                 });
                 // Pass the cancel token so precompute can bail between isotopes.
                 let xs = broadened_cross_sections(
-                    &config.energies,
-                    &config.resonance_data,
-                    config.temperature_k,
+                    config.energies(),
+                    config.resonance_data(),
+                    config.temperature_k(),
                     instrument_params.as_ref(),
                     cancel,
                 )?;
@@ -215,11 +188,10 @@ pub fn spatial_map(
         // Build a config variant with the precomputed cross-sections injected
         // and covariance computation disabled for per-pixel speed.
         // fit_spectrum will use PrecomputedTransmissionModel when this field is Some.
-        FitConfig {
-            precomputed_cross_sections: Some(xs),
-            compute_covariance: false,
-            ..config.clone()
-        }
+        config
+            .clone()
+            .with_precomputed_cross_sections(xs)
+            .with_compute_covariance(false)
     };
 
     // Fit all pixels in parallel, skipping new work when cancelled
@@ -325,18 +297,12 @@ pub fn fit_roi(
         )));
     }
     // Validate spectral axis matches config.
-    if n_energies != config.energies.len() {
+    if n_energies != config.energies().len() {
         return Err(PipelineError::ShapeMismatch(format!(
             "transmission spectral axis ({}) != config.energies length ({})",
             n_energies,
-            config.energies.len(),
+            config.energies().len(),
         )));
-    }
-
-    if n_energies == 0 {
-        return Err(PipelineError::InvalidParameter(
-            "spectral axis length is zero; at least one energy bin is required".into(),
-        ));
     }
     if y_range.start >= y_range.end || x_range.start >= x_range.end {
         return Err(PipelineError::InvalidParameter(format!(
@@ -444,18 +410,16 @@ mod tests {
             }
         }
 
-        let config = FitConfig {
+        let config = FitConfig::new(
             energies,
-            resonance_data: vec![data],
-            isotope_names: vec!["U-238".into()],
-            temperature_k: 0.0,
-            resolution: None,
-            initial_densities: vec![0.001],
-            lm_config: LmConfig::default(),
-            precomputed_cross_sections: None,
-            fit_temperature: false,
-            compute_covariance: true,
-        };
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        )
+        .unwrap();
 
         let result =
             spatial_map(transmission.view(), uncertainty.view(), &config, None, None).unwrap();
@@ -514,18 +478,16 @@ mod tests {
         let mut dead = Array2::from_elem((height, width), false);
         dead[[0, 0]] = true;
 
-        let config = FitConfig {
+        let config = FitConfig::new(
             energies,
-            resonance_data: vec![data],
-            isotope_names: vec!["U-238".into()],
-            temperature_k: 0.0,
-            resolution: None,
-            initial_densities: vec![0.001],
-            lm_config: LmConfig::default(),
-            precomputed_cross_sections: None,
-            fit_temperature: false,
-            compute_covariance: true,
-        };
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        )
+        .unwrap();
 
         let result = spatial_map(
             transmission.view(),
@@ -543,18 +505,16 @@ mod tests {
     #[test]
     fn test_spatial_map_rejects_shape_mismatch() {
         let data = u238_single_resonance();
-        let config = FitConfig {
-            energies: vec![1.0, 2.0, 3.0],
-            resonance_data: vec![data],
-            isotope_names: vec!["U-238".into()],
-            temperature_k: 0.0,
-            resolution: None,
-            initial_densities: vec![0.001],
-            lm_config: LmConfig::default(),
-            precomputed_cross_sections: None,
-            fit_temperature: false,
-            compute_covariance: true,
-        };
+        let config = FitConfig::new(
+            vec![1.0, 2.0, 3.0],
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        )
+        .unwrap();
 
         let transmission = Array3::from_elem((3, 2, 2), 0.5);
         let uncertainty = Array3::from_elem((3, 2, 3), 0.01); // different width
@@ -566,18 +526,16 @@ mod tests {
     #[test]
     fn test_spatial_map_rejects_dead_pixel_shape_mismatch() {
         let data = u238_single_resonance();
-        let config = FitConfig {
-            energies: vec![1.0, 2.0, 3.0],
-            resonance_data: vec![data],
-            isotope_names: vec!["U-238".into()],
-            temperature_k: 0.0,
-            resolution: None,
-            initial_densities: vec![0.001],
-            lm_config: LmConfig::default(),
-            precomputed_cross_sections: None,
-            fit_temperature: false,
-            compute_covariance: true,
-        };
+        let config = FitConfig::new(
+            vec![1.0, 2.0, 3.0],
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        )
+        .unwrap();
 
         let transmission = Array3::from_elem((3, 2, 2), 0.5);
         let uncertainty = Array3::from_elem((3, 2, 2), 0.01);
@@ -625,18 +583,16 @@ mod tests {
             }
         }
 
-        let config = FitConfig {
+        let config = FitConfig::new(
             energies,
-            resonance_data: vec![data],
-            isotope_names: vec!["U-238".into()],
-            temperature_k: 0.0,
-            resolution: None,
-            initial_densities: vec![0.001],
-            lm_config: LmConfig::default(),
-            precomputed_cross_sections: None,
-            fit_temperature: false,
-            compute_covariance: true,
-        };
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        )
+        .unwrap();
 
         // Fit a 2×2 ROI
         let result = fit_roi(transmission.view(), uncertainty.view(), 1..3, 1..3, &config).unwrap();
@@ -653,18 +609,16 @@ mod tests {
     #[test]
     fn test_fit_roi_rejects_empty_range() {
         let data = u238_single_resonance();
-        let config = FitConfig {
-            energies: vec![1.0, 2.0, 3.0],
-            resonance_data: vec![data],
-            isotope_names: vec!["U-238".into()],
-            temperature_k: 0.0,
-            resolution: None,
-            initial_densities: vec![0.001],
-            lm_config: LmConfig::default(),
-            precomputed_cross_sections: None,
-            fit_temperature: false,
-            compute_covariance: true,
-        };
+        let config = FitConfig::new(
+            vec![1.0, 2.0, 3.0],
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        )
+        .unwrap();
 
         let transmission = Array3::from_elem((3, 4, 4), 0.5);
         let uncertainty = Array3::from_elem((3, 4, 4), 0.01);
