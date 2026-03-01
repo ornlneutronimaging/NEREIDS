@@ -98,14 +98,15 @@ pub fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
             .iter()
             .filter_map(|e| e.resonance_data.clone())
             .collect();
-        let model = nereids_fitting::transmission_model::TransmissionFitModel {
-            energies: energies.clone(),
+        let model = nereids_fitting::transmission_model::TransmissionFitModel::new(
+            energies.clone(),
             resonance_data,
-            temperature_k: state.temperature_k,
-            instrument: None,
-            density_indices: (0..result.densities.len()).collect(),
-            temperature_index: None,
-        };
+            state.temperature_k,
+            None,
+            (0..result.densities.len()).collect(),
+            None,
+        )
+        .ok()?;
 
         use nereids_fitting::lm::FitModel;
         let fitted_t = model.evaluate(&result.densities);

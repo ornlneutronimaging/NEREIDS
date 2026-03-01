@@ -413,7 +413,8 @@ pub fn sparse_reconstruct(
                 &mut params,
                 &config.poisson_config,
                 None,
-            );
+            )
+            .ok()?;
 
             let pixel_result = PixelResult {
                 densities: (0..n_isotopes).map(|i| result.params[i]).collect(),
@@ -533,14 +534,15 @@ mod tests {
         let n_energies = energies.len();
 
         // Build transmission model to generate synthetic data
-        let t_model = TransmissionFitModel {
-            energies: energies.clone(),
-            resonance_data: vec![data.clone()],
-            temperature_k: 0.0,
-            instrument: None,
-            density_indices: vec![0],
-            temperature_index: None,
-        };
+        let t_model = TransmissionFitModel::new(
+            energies.clone(),
+            vec![data.clone()],
+            0.0,
+            None,
+            vec![0],
+            None,
+        )
+        .unwrap();
         let transmission = t_model.evaluate(&[true_density]);
 
         // Create synthetic counts: flux = 1000, counts = flux * T

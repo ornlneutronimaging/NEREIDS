@@ -18,6 +18,7 @@ use nereids_physics::transmission::{self, InstrumentParams};
 
 use nereids_core::constants::{PIVOT_FLOOR, POISSON_EPSILON};
 
+use crate::error::FittingError;
 use crate::lm::FitModel;
 use crate::parameters::ParameterSet;
 
@@ -357,7 +358,9 @@ fn try_early_return_fixed(
 /// - `flux` and all `cross_sections[k]` have the same length as `y_obs`.
 /// - Every free parameter is mapped by `density_indices` or `temperature_index`.
 ///
-/// Panics on validation failure (same contract as the original inline asserts).
+/// # Errors
+/// Returns `FittingError::LengthMismatch` for array dimension mismatches,
+/// or `FittingError::InvalidConfig` for unmapped free parameters.
 fn validate_analytic_inputs(
     n_e: usize,
     flux: &[f64],
@@ -366,24 +369,33 @@ fn validate_analytic_inputs(
     params: &ParameterSet,
     temp_ctx: Option<&TemperatureContext>,
     caller: &str,
-) {
-    assert_eq!(flux.len(), n_e, "flux length must match y_obs");
-    assert_eq!(
-        density_indices.len(),
-        cross_sections.len(),
-        "density_indices length must match cross_sections length, got {} density indices and {} cross sections",
-        density_indices.len(),
-        cross_sections.len(),
-    );
+) -> Result<(), FittingError> {
+    if flux.len() != n_e {
+        return Err(FittingError::LengthMismatch {
+            expected: n_e,
+            actual: flux.len(),
+            field: "flux",
+        });
+    }
+    if density_indices.len() != cross_sections.len() {
+        return Err(FittingError::LengthMismatch {
+            expected: cross_sections.len(),
+            actual: density_indices.len(),
+            field: "density_indices",
+        });
+    }
     for (k, sigma) in cross_sections.iter().enumerate() {
-        assert_eq!(
-            sigma.len(),
-            n_e,
-            "cross_sections[{}] length ({}) must match energy grid length ({})",
-            k,
-            sigma.len(),
-            n_e,
-        );
+        if sigma.len() != n_e {
+            return Err(FittingError::LengthMismatch {
+                expected: n_e,
+                actual: sigma.len(),
+                field: if k == 0 {
+                    "cross_sections[0]"
+                } else {
+                    "cross_sections[k]"
+                },
+            });
+        }
     }
 
     // Validate that every free parameter is referenced by density_indices
@@ -397,12 +409,14 @@ fn validate_analytic_inputs(
         mapped_set.insert(ctx.temperature_index);
     }
     let unmapped: Vec<usize> = free_set.difference(&mapped_set).copied().collect();
-    assert!(
-        unmapped.is_empty(),
-        "{caller}: free parameters {unmapped:?} are not mapped by density_indices \
-         or temperature_index; analytical gradient is zero for these params. \
-         Use poisson_fit (FD) for mixed parameter sets.",
-    );
+    if !unmapped.is_empty() {
+        return Err(FittingError::InvalidConfig(format!(
+            "{caller}: free parameters {unmapped:?} are not mapped by density_indices \
+             or temperature_index; analytical gradient is zero for these params. \
+             Use poisson_fit (FD) for mixed parameter sets."
+        )));
+    }
+    Ok(())
 }
 
 /// Build a mapping from each free parameter index to the list of isotope
@@ -718,7 +732,7 @@ pub fn poisson_fit_analytic(
     params: &mut ParameterSet,
     config: &PoissonConfig,
     temp_ctx: Option<&TemperatureContext>,
-) -> PoissonResult {
+) -> Result<PoissonResult, FittingError> {
     let n_e = y_obs.len();
     validate_analytic_inputs(
         n_e,
@@ -728,10 +742,10 @@ pub fn poisson_fit_analytic(
         params,
         temp_ctx,
         "poisson_fit_analytic",
-    );
+    )?;
 
     if let Some(result) = try_early_return_fixed(model, y_obs, params) {
-        return result;
+        return Ok(result);
     }
 
     let free_indices = params.free_indices();
@@ -772,12 +786,12 @@ pub fn poisson_fit_analytic(
     // Guard: if the initial NLL is non-finite, bail out immediately rather
     // than entering the optimization loop with garbage values.
     if !nll.is_finite() {
-        return PoissonResult {
+        return Ok(PoissonResult {
             nll,
             iterations: 0,
             converged: false,
             params: params.all_values(),
-        };
+        });
     }
 
     let mut converged = false;
@@ -948,12 +962,12 @@ pub fn poisson_fit_analytic(
         }
     }
 
-    PoissonResult {
+    Ok(PoissonResult {
         nll,
         iterations: iter,
         converged,
         params: params.all_values(),
-    }
+    })
 }
 
 /// Convert transmission model + counts to a counts-based forward model.
@@ -1165,13 +1179,14 @@ pub fn poisson_fit_lbfgsb(
     params: &mut ParameterSet,
     config: &PoissonConfig,
     temp_ctx: Option<&TemperatureContext>,
-) -> PoissonResult {
+) -> Result<PoissonResult, FittingError> {
     let n_e = y_obs.len();
-    assert!(
-        config.lbfgsb_memory >= 1,
-        "lbfgsb_memory must be >= 1, got {}",
-        config.lbfgsb_memory,
-    );
+    if config.lbfgsb_memory < 1 {
+        return Err(FittingError::InvalidConfig(format!(
+            "lbfgsb_memory must be >= 1, got {}",
+            config.lbfgsb_memory,
+        )));
+    }
     validate_analytic_inputs(
         n_e,
         flux,
@@ -1180,10 +1195,10 @@ pub fn poisson_fit_lbfgsb(
         params,
         temp_ctx,
         "poisson_fit_lbfgsb",
-    );
+    )?;
 
     if let Some(result) = try_early_return_fixed(model, y_obs, params) {
-        return result;
+        return Ok(result);
     }
 
     let free_indices = params.free_indices();
@@ -1223,12 +1238,12 @@ pub fn poisson_fit_lbfgsb(
     // Guard: if the initial NLL is non-finite, bail out immediately rather
     // than entering the optimization loop with garbage values.
     if !nll.is_finite() {
-        return PoissonResult {
+        return Ok(PoissonResult {
             nll,
             iterations: 0,
             converged: false,
             params: params.all_values(),
-        };
+        });
     }
 
     let mut converged = false;
@@ -1413,12 +1428,12 @@ pub fn poisson_fit_lbfgsb(
         }
     }
 
-    PoissonResult {
+    Ok(PoissonResult {
         nll,
         iterations: iter,
         converged,
         params: params.all_values(),
-    }
+    })
 }
 
 // TODO(validation): add test comparing L-BFGS-B vs analytic on a SAMMY-derived
@@ -1612,7 +1627,8 @@ mod tests {
             &mut params_an,
             &PoissonConfig::default(),
             None,
-        );
+        )
+        .unwrap();
 
         assert!(res_fd.converged, "FD did not converge");
         assert!(res_an.converged, "Analytic did not converge");
@@ -1680,7 +1696,8 @@ mod tests {
             &mut params,
             &PoissonConfig::default(),
             None,
-        );
+        )
+        .unwrap();
 
         assert!(result.converged, "Two-isotope analytic did not converge");
         assert!(
@@ -1723,7 +1740,8 @@ mod tests {
             &mut params,
             &PoissonConfig::default(),
             None,
-        );
+        )
+        .unwrap();
 
         assert!(result.converged, "Zero-density fit did not converge");
         assert!(
@@ -1790,7 +1808,8 @@ mod tests {
             &mut params,
             &config,
             None,
-        );
+        )
+        .unwrap();
 
         assert!(
             result.converged,
@@ -1955,7 +1974,8 @@ mod tests {
             &mut params,
             &config,
             Some(&temp_ctx),
-        );
+        )
+        .unwrap();
 
         assert!(
             result.converged,
@@ -2069,7 +2089,8 @@ mod tests {
             &mut params,
             &PoissonConfig::default(),
             None,
-        );
+        )
+        .unwrap();
 
         assert!(
             !result.converged,
@@ -2131,7 +2152,8 @@ mod tests {
             &mut params,
             &PoissonConfig::default(),
             None,
-        );
+        )
+        .unwrap();
 
         assert!(
             !result.converged,
@@ -2167,7 +2189,8 @@ mod tests {
             &mut params_an,
             &PoissonConfig::default(),
             None,
-        );
+        )
+        .unwrap();
 
         // L-BFGS-B path
         let mut params_lb = ParameterSet::new(vec![FitParameter::non_negative("b", 1.0)]);
@@ -2180,7 +2203,8 @@ mod tests {
             &mut params_lb,
             &PoissonConfig::default(),
             None,
-        );
+        )
+        .unwrap();
 
         assert!(res_an.converged, "Analytic did not converge");
         assert!(res_lb.converged, "L-BFGS-B did not converge");
@@ -2244,7 +2268,8 @@ mod tests {
             &mut params,
             &PoissonConfig::default(),
             None,
-        );
+        )
+        .unwrap();
 
         assert!(
             result.converged,
@@ -2401,7 +2426,8 @@ mod tests {
             &mut params,
             &config,
             Some(&temp_ctx),
-        );
+        )
+        .unwrap();
 
         assert!(
             result.converged,
@@ -2454,7 +2480,8 @@ mod tests {
             &mut params,
             &PoissonConfig::default(),
             None,
-        );
+        )
+        .unwrap();
 
         assert!(
             result.converged,
@@ -2495,7 +2522,8 @@ mod tests {
             &mut params,
             &PoissonConfig::default(),
             None,
-        );
+        )
+        .unwrap();
 
         assert!(
             result.converged,
@@ -2537,7 +2565,8 @@ mod tests {
             &mut params,
             &config,
             None,
-        );
+        )
+        .unwrap();
 
         assert!(
             result.converged,

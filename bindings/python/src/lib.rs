@@ -686,14 +686,15 @@ fn fit_spectrum(
                 // When temperature is free, cross-sections change every iteration so
                 // we must use the full TransmissionFitModel.
                 let lm_result = if fit_temperature {
-                    let model = TransmissionFitModel {
-                        energies: e_owned,
-                        resonance_data: res_data,
+                    let model = TransmissionFitModel::new(
+                        e_owned,
+                        res_data,
                         temperature_k,
                         instrument,
-                        density_indices: (0..n_isotopes).collect(),
-                        temperature_index: Some(n_isotopes),
-                    };
+                        (0..n_isotopes).collect(),
+                        Some(n_isotopes),
+                    )
+                    .map_err(|e| format!("TransmissionFitModel::new failed: {e}"))?;
                     lm::levenberg_marquardt(&model, &t_owned, &s_owned, &mut params, &config)
                         .map_err(|e| format!("levenberg_marquardt failed: {e}"))?
                 } else {
@@ -830,14 +831,15 @@ fn fit_spectrum(
 
                 let full_model;
                 let t_model: &dyn FitModel = if fit_temperature {
-                    full_model = TransmissionFitModel {
-                        energies: e_owned,
-                        resonance_data: res_data,
+                    full_model = TransmissionFitModel::new(
+                        e_owned,
+                        res_data,
                         temperature_k,
-                        instrument: instrument.map(Arc::new),
-                        density_indices: (*density_indices).clone(),
-                        temperature_index: Some(n_isotopes),
-                    };
+                        instrument.map(Arc::new),
+                        (*density_indices).clone(),
+                        Some(n_isotopes),
+                    )
+                    .map_err(|e| format!("TransmissionFitModel::new failed: {e}"))?;
                     &full_model
                 } else {
                     &precomputed
@@ -864,7 +866,8 @@ fn fit_spectrum(
                     &mut params,
                     &poisson_config,
                     temp_ctx.as_ref(),
-                );
+                )
+                .map_err(|e| format!("poisson_fit_analytic failed: {e}"))?;
 
                 let densities: Vec<f64> =
                     (0..n_isotopes).map(|i| poisson_result.params[i]).collect();
