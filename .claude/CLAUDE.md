@@ -95,15 +95,25 @@ external review + user gates + iteration logic + Copilot phase.
 
 ## Execution Model (mandatory)
 
-When implementing fixes or features across multiple issues, crates, or files:
+### Branching: choose the right approach for the work pattern
 
-- **ALWAYS use parallel worktrees + concurrent subagents.** Create one
-  worktree per PR/branch, launch Task subagents in parallel (one per
-  worktree), and let them work concurrently.  Never fall back to
-  sequential single-thread editing across multiple issues.
+| Work pattern | Approach |
+|--------------|----------|
+| Multiple independent PRs (no file overlap) | Parallel worktrees + concurrent subagents |
+| Single PR, sequential work | Feature branch at repo root |
+
+**Decide at planning time** and state the choice explicitly in the plan.
+Worktrees add friction (path confusion, cleanup errors) with zero benefit
+when working single-threaded on one feature branch.
+
+### When using parallel worktrees:
+- Create one worktree per PR/branch, launch subagents in parallel (one
+  per worktree), and let them work concurrently.
+- **Launch subagents in a single message** so they run concurrently.
+
+### Always:
 - **Group related changes into PRs**, not individual commits.  Each PR
   should map to a coherent scope (e.g., one issue, one crate, one theme).
-- **Launch subagents in a single message** so they run concurrently.
 - **Close/comment on GitHub issues in parallel** with implementation work.
 
 ## Git Workflow
