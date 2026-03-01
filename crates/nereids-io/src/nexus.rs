@@ -81,7 +81,7 @@ pub fn probe_nexus(path: &Path) -> Result<NexusMetadata, IoError> {
     // Probe events
     let (has_events, n_events) = probe_event_group(&entry);
 
-    // Read metadata attributes (try group level first, then entry level)
+    // Read metadata attributes from the /entry group
     let flight_path_m = read_f64_attr(&entry, "flight_path_m");
     let tof_offset_ns = read_f64_attr(&entry, "tof_offset_ns");
 
@@ -298,7 +298,7 @@ pub fn load_nexus_events(
         }
 
         let tof_bin = ((tof_us - params.tof_min_us) / dt_us) as usize;
-        // Clamp to last bin (edge case: tof_us exactly at max boundary)
+        // Clamp to last bin (guard against floating-point rounding near the upper boundary)
         let tof_bin = tof_bin.min(params.n_bins - 1);
 
         counts[[tof_bin, py as usize, px as usize]] += 1.0;

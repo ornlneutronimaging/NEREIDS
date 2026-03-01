@@ -402,7 +402,15 @@ fn load_hdf5_histogram(state: &mut AppState) {
             // Populate spectrum values from TOF edges
             state.spectrum_values = Some(data.tof_edges_us.clone());
             state.spectrum_unit = nereids_io::spectrum::SpectrumUnit::TofMicroseconds;
-            state.spectrum_kind = nereids_io::spectrum::SpectrumValueKind::BinEdges;
+
+            // Determine whether TOF values are bin edges or bin centers
+            let n_frames = data.counts.shape()[0]; // (tof, y, x)
+            let n_tof_vals = data.tof_edges_us.len();
+            state.spectrum_kind = if n_tof_vals == n_frames + 1 {
+                nereids_io::spectrum::SpectrumValueKind::BinEdges
+            } else {
+                nereids_io::spectrum::SpectrumValueKind::BinCenters
+            };
 
             // Set flight path if available and valid
             if let Some(fp) = data.flight_path_m
@@ -410,6 +418,14 @@ fn load_hdf5_histogram(state: &mut AppState) {
                 && fp > 0.0
             {
                 state.beamline.flight_path_m = fp;
+            }
+
+            // Apply TOF offset as beamline delay
+            if let Some(offset_ns) = state.nexus_metadata.as_ref().and_then(|m| m.tof_offset_ns) {
+                let delay_us = offset_ns / 1000.0;
+                if delay_us.is_finite() {
+                    state.beamline.delay_us = delay_us;
+                }
             }
 
             if let Some(dead) = data.dead_pixels {
@@ -461,6 +477,14 @@ fn load_hdf5_events(state: &mut AppState) {
                 && fp > 0.0
             {
                 state.beamline.flight_path_m = fp;
+            }
+
+            // Apply TOF offset as beamline delay
+            if let Some(offset_ns) = state.nexus_metadata.as_ref().and_then(|m| m.tof_offset_ns) {
+                let delay_us = offset_ns / 1000.0;
+                if delay_us.is_finite() {
+                    state.beamline.delay_us = delay_us;
+                }
             }
 
             if let Some(dead) = data.dead_pixels {
