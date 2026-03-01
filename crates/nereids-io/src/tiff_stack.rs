@@ -90,6 +90,33 @@ pub fn load_tiff_stack(path: &Path) -> Result<Array3<f64>, IoError> {
         .map_err(|e| IoError::TiffDecode(format!("Shape error: {}", e)))
 }
 
+/// Load TIFF data from either a single multi-frame file or a directory.
+///
+/// Auto-detects based on whether `path` is a file or directory:
+/// - File → [`load_tiff_stack`] (multi-frame TIFF)
+/// - Directory → [`load_tiff_directory`] (one file per frame)
+///
+/// # Arguments
+/// * `path` — Path to either a multi-frame TIFF file or a directory of TIFFs.
+///
+/// # Returns
+/// 3D array with shape (n_frames, height, width) and f64 values.
+pub fn load_tiff_auto(path: &Path) -> Result<Array3<f64>, IoError> {
+    if path.is_file() {
+        load_tiff_stack(path)
+    } else if path.is_dir() {
+        load_tiff_directory(path)
+    } else {
+        Err(IoError::FileNotFound(
+            path.to_string_lossy().into_owned(),
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "path is neither a file nor a directory",
+            ),
+        ))
+    }
+}
+
 /// Load a directory of single-frame TIFFs as a 3D stack.
 ///
 /// Files are sorted by name (lexicographic), so they should be named with
@@ -600,5 +627,41 @@ mod tests {
         assert_eq!(info.n_frames, 10);
         assert_eq!(info.height, 512);
         assert_eq!(info.width, 512);
+    }
+
+    #[test]
+    fn test_load_tiff_auto_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi.tiff");
+
+        let frame1: Vec<u16> = vec![10, 20, 30, 40];
+        let frame2: Vec<u16> = vec![50, 60, 70, 80];
+        write_test_tiff(&path, &[frame1, frame2], 2, 2);
+
+        let arr = load_tiff_auto(&path).unwrap();
+        assert_eq!(arr.shape(), &[2, 2, 2]);
+        assert_eq!(arr[[0, 0, 0]], 10.0);
+        assert_eq!(arr[[1, 1, 1]], 80.0);
+    }
+
+    #[test]
+    fn test_load_tiff_auto_directory() {
+        let dir = tempfile::tempdir().unwrap();
+
+        for i in 0..2u16 {
+            let path = dir.path().join(format!("frame_{:04}.tif", i));
+            let data: Vec<u16> = (0..4).map(|j| (i + 1) * 10 + j).collect();
+            write_test_tiff(&path, &[data], 2, 2);
+        }
+
+        let arr = load_tiff_auto(dir.path()).unwrap();
+        assert_eq!(arr.shape(), &[2, 2, 2]);
+        assert_eq!(arr[[0, 0, 0]], 10.0);
+    }
+
+    #[test]
+    fn test_load_tiff_auto_nonexistent() {
+        let result = load_tiff_auto(Path::new("/nonexistent/path"));
+        assert!(result.is_err());
     }
 }
