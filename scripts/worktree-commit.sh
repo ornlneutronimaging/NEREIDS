@@ -16,7 +16,11 @@
 set -euo pipefail
 
 WORKTREE_BASE=".claude/worktrees"
-REPO_ROOT="$(git -C "$(dirname "$0")/.." rev-parse --show-toplevel)"
+# Resolve the main repo root from this script's own location (not cwd).
+# Use realpath so the script works even when invoked via relative path from
+# inside a worktree (where the cwd is NOT the main repo).
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(git -C "$SCRIPT_DIR/.." rev-parse --show-toplevel)"
 
 usage() {
     echo "Usage: $0 <worktree-name> \"<commit message>\" [files...]" >&2

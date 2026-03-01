@@ -43,21 +43,37 @@ targeted `Edit` patches. Do not suppress clippy warnings with `#[allow(...)]`.
 - `crates/nereids-python`  — PyO3 bindings (excluded from `--workspace` clippy/test runs)
 - `apps/gui`               — egui desktop application
 
+## Mandatory User Checkpoints (NEVER skip these)
+
+The user MUST have the opportunity to review and intervene at these points.
+**Always pause and present a summary, then wait for user confirmation.**
+
+1. **After creating PRs**: show PR URLs + summary of changes per PR. Ask
+   if the user wants to request Copilot review before proceeding.
+2. **Before merging**: present the pre-merge checklist (review results,
+   test status). Never `gh pr merge` without explicit user approval.
+3. **After post-merge gate**: report results before closing issues/epics.
+
+Do NOT chain these steps automatically. Each checkpoint is a full stop.
+The user approving step N does NOT imply approval for step N+1.
+
 ## Multi-AI Review Pipeline (mandatory before merging PRs)
 
-Every feature branch must pass a multi-stage review before merge.
-Run `/review-pipeline` to execute the full pipeline across active worktrees.
+Every feature branch must pass a **full** multi-stage review before merge.
+**Always use `/review-pipeline`** — never substitute a single self-review.
+Self-review alone bypasses the independent Codex second opinion, which is
+the highest-value check (cross-model confirmed findings are always real).
 
 | Phase | Tool | Skill | When |
 |-------|------|-------|------|
-| A (local) | Claude subagent + Codex CLI | `/review-pipeline`, `/self-review`, `/codex-review` | Before push |
+| A (local) | Claude self-review + Codex CLI | `/review-pipeline` | Before push |
 | B (remote) | GitHub Copilot (manual trigger) | — | After push to PR |
 
 **Phase A** iterates until zero P1s (max 4 rounds, then escalate to human).
 **Phase B** re-iterates if 3+ P1s or P1 ratio > 40%; otherwise fix inline
 and merge. Dismiss Copilot comments that rehash addressed issues or flag
 impossible edge cases. Fetch Copilot comments reliably with:
-`pixi run python scripts/fetch_copilot_reviews.py {pr_numbers...}`
+`pixi run copilot-reviews {pr_numbers...}`
 
 **Post-merge**: run `/post-merge` to execute the full integration gate on
 merged main (cleanup, `cargo clean && pixi run build`, tests, issue closure,
