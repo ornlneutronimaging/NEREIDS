@@ -9,6 +9,7 @@ use std::sync::Arc;
 use nereids_endf::resonance::ResonanceData;
 use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
 
+use crate::error::FittingError;
 use crate::lm::{FitModel, FlatMatrix};
 
 /// Transmission model backed by precomputed broadened cross-sections.
@@ -150,16 +151,40 @@ pub struct TransmissionFitModel {
     pub temperature_index: Option<usize>,
 }
 
+impl TransmissionFitModel {
+    /// Create a validated `TransmissionFitModel`.
+    ///
+    /// # Errors
+    /// Returns `FittingError::InvalidConfig` if `temperature_index` overlaps
+    /// with `density_indices`.
+    pub fn new(
+        energies: Vec<f64>,
+        resonance_data: Vec<ResonanceData>,
+        temperature_k: f64,
+        instrument: Option<Arc<InstrumentParams>>,
+        density_indices: Vec<usize>,
+        temperature_index: Option<usize>,
+    ) -> Result<Self, FittingError> {
+        if let Some(ti) = temperature_index
+            && density_indices.contains(&ti)
+        {
+            return Err(FittingError::InvalidConfig(
+                "temperature_index must not overlap with density_indices".into(),
+            ));
+        }
+        Ok(Self {
+            energies,
+            resonance_data,
+            temperature_k,
+            instrument,
+            density_indices,
+            temperature_index,
+        })
+    }
+}
+
 impl FitModel for TransmissionFitModel {
     fn evaluate(&self, params: &[f64]) -> Vec<f64> {
-        // Configuration check — not in a hot loop, so use assert! to catch
-        // parameter setup errors in release builds too.
-        assert!(
-            self.temperature_index
-                .is_none_or(|ti| !self.density_indices.contains(&ti)),
-            "temperature_index must not overlap with density_indices"
-        );
-
         let isotopes: Vec<(ResonanceData, f64)> = self
             .resonance_data
             .iter()
@@ -168,15 +193,7 @@ impl FitModel for TransmissionFitModel {
             .collect();
 
         let temperature_k = match self.temperature_index {
-            Some(idx) => {
-                assert!(
-                    idx < params.len(),
-                    "temperature_index ({}) out of bounds for params of length {}",
-                    idx,
-                    params.len(),
-                );
-                params[idx]
-            }
+            Some(idx) => params[idx],
             None => self.temperature_k,
         };
 
@@ -376,7 +393,8 @@ mod tests {
         ]);
 
         let result =
-            lm::levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &LmConfig::default());
+            lm::levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &LmConfig::default())
+                .unwrap();
 
         assert!(result.converged, "Fit did not converge");
         let fitted = result.params[0];
@@ -450,7 +468,8 @@ mod tests {
         ]);
 
         let result =
-            lm::levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &LmConfig::default());
+            lm::levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &LmConfig::default())
+                .unwrap();
 
         assert!(
             result.converged,
@@ -562,7 +581,7 @@ mod tests {
             ..LmConfig::default()
         };
 
-        let result = lm::levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &config);
+        let result = lm::levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &config).unwrap();
 
         assert!(
             result.converged,

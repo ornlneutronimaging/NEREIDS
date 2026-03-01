@@ -12,6 +12,7 @@
 
 use nereids_core::constants::{LM_DIAGONAL_FLOOR, PIVOT_FLOOR};
 
+use crate::error::FittingError;
 use crate::parameters::ParameterSet;
 
 /// Row-major flat matrix for cache-friendly storage.
@@ -392,16 +393,18 @@ pub fn levenberg_marquardt(
     sigma: &[f64],
     params: &mut ParameterSet,
     config: &LmConfig,
-) -> LmResult {
+) -> Result<LmResult, FittingError> {
     let n_data = y_obs.len();
-    assert!(n_data > 0, "y_obs must not be empty",);
-    assert_eq!(
-        sigma.len(),
-        n_data,
-        "sigma length ({}) must match y_obs length ({})",
-        sigma.len(),
-        n_data,
-    );
+    if n_data == 0 {
+        return Err(FittingError::EmptyData);
+    }
+    if sigma.len() != n_data {
+        return Err(FittingError::LengthMismatch {
+            expected: n_data,
+            actual: sigma.len(),
+            field: "sigma",
+        });
+    }
 
     let n_free = params.n_free();
 
@@ -426,7 +429,7 @@ pub fn levenberg_marquardt(
         // Covariance/uncertainties are None because the fit did not converge —
         // an unconverged result has no meaningful covariance to report.
         if !y_model.iter().all(|v| v.is_finite()) {
-            return LmResult {
+            return Ok(LmResult {
                 chi_squared: f64::NAN,
                 reduced_chi_squared: f64::NAN,
                 iterations: 0,
@@ -434,7 +437,7 @@ pub fn levenberg_marquardt(
                 params: params.all_values(),
                 covariance: None,
                 uncertainties: None,
-            };
+            });
         }
 
         let residuals: Vec<f64> = y_obs
@@ -450,7 +453,7 @@ pub fn levenberg_marquardt(
         // dof is always > 0 here; the guard below is a defensive check
         // kept for consistency with the main path.
         let reduced = if dof > 0 { chi2 / dof as f64 } else { f64::NAN };
-        return LmResult {
+        return Ok(LmResult {
             chi_squared: chi2,
             reduced_chi_squared: reduced,
             iterations: 0,
@@ -458,7 +461,7 @@ pub fn levenberg_marquardt(
             params: params.all_values(),
             covariance: Some(FlatMatrix::zeros(0, 0)),
             uncertainties: Some(vec![]),
-        };
+        });
     }
 
     // #108.3: Underdetermined systems — when n_data < n_free, the problem is
@@ -467,7 +470,7 @@ pub fn levenberg_marquardt(
     // n_data == n_free is exactly determined (dof=0) and still solvable;
     // we allow it and report reduced_chi_squared = NaN (0/0).
     if n_data < n_free {
-        return LmResult {
+        return Ok(LmResult {
             chi_squared: f64::NAN,
             reduced_chi_squared: f64::NAN,
             iterations: 0,
@@ -475,7 +478,7 @@ pub fn levenberg_marquardt(
             params: params.all_values(),
             covariance: None,
             uncertainties: None,
-        };
+        });
     }
     let dof = n_data - n_free;
 
@@ -693,7 +696,7 @@ pub fn levenberg_marquardt(
         (None, None)
     };
 
-    LmResult {
+    Ok(LmResult {
         chi_squared: chi2,
         reduced_chi_squared: reduced_chi2,
         iterations: iter,
@@ -701,7 +704,7 @@ pub fn levenberg_marquardt(
         params: params.all_values(),
         covariance,
         uncertainties,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -735,7 +738,8 @@ mod tests {
             FitParameter::unbounded("b", 1.0),
         ]);
 
-        let result = levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &LmConfig::default());
+        let result =
+            levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &LmConfig::default()).unwrap();
 
         assert!(result.converged, "Fit did not converge");
         assert!(
@@ -764,7 +768,8 @@ mod tests {
             FitParameter::fixed("b", 3.0),
         ]);
 
-        let result = levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &LmConfig::default());
+        let result =
+            levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &LmConfig::default()).unwrap();
 
         assert!(result.converged);
         assert!(
@@ -799,7 +804,8 @@ mod tests {
             FitParameter::unbounded("c", 0.0),
         ]);
 
-        let result = levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &LmConfig::default());
+        let result =
+            levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &LmConfig::default()).unwrap();
 
         assert!(result.converged);
         assert!(
@@ -841,7 +847,8 @@ mod tests {
         let model = SlopeModel { x };
         let mut params = ParameterSet::new(vec![FitParameter::non_negative("a", 1.0)]);
 
-        let result = levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &LmConfig::default());
+        let result =
+            levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &LmConfig::default()).unwrap();
 
         // Should be clamped at 0
         assert!(
@@ -864,7 +871,8 @@ mod tests {
             FitParameter::unbounded("b", 1.0),
         ]);
 
-        let result = levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &LmConfig::default());
+        let result =
+            levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &LmConfig::default()).unwrap();
 
         assert!(result.converged);
         assert!(result.uncertainties.is_some());
@@ -922,7 +930,8 @@ mod tests {
         let mut params = ParameterSet::new(vec![FitParameter::fixed("a", 1.0)]);
 
         let result =
-            levenberg_marquardt(&NanModel, &y_obs, &sigma, &mut params, &LmConfig::default());
+            levenberg_marquardt(&NanModel, &y_obs, &sigma, &mut params, &LmConfig::default())
+                .unwrap();
 
         assert!(!result.converged, "All-fixed NaN model should not converge");
         assert!(result.chi_squared.is_nan(), "chi2 should be NaN");
@@ -957,7 +966,8 @@ mod tests {
             &sigma,
             &mut params,
             &LmConfig::default(),
-        );
+        )
+        .unwrap();
 
         assert!(
             !result.converged,
@@ -980,7 +990,8 @@ mod tests {
             FitParameter::unbounded("b", 1.0),
         ]);
 
-        let result = levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &LmConfig::default());
+        let result =
+            levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &LmConfig::default()).unwrap();
 
         assert!(
             result.converged,
@@ -1023,7 +1034,8 @@ mod tests {
             ..LmConfig::default()
         };
 
-        let result = levenberg_marquardt(&ConstantModel, &y_obs, &sigma, &mut params, &config);
+        let result =
+            levenberg_marquardt(&ConstantModel, &y_obs, &sigma, &mut params, &config).unwrap();
 
         assert!(
             !result.converged,
@@ -1055,7 +1067,8 @@ mod tests {
         let model = NanAtLargeModel { x };
         let mut params = ParameterSet::new(vec![FitParameter::unbounded("a", 3.0)]);
 
-        let result = levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &LmConfig::default());
+        let result =
+            levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &LmConfig::default()).unwrap();
 
         // Should converge to a≈2 while avoiding the NaN region a>5.
         assert!(result.converged, "Should converge avoiding NaN region");
@@ -1085,7 +1098,7 @@ mod tests {
             ..LmConfig::default()
         };
 
-        let result = levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &config);
+        let result = levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &config).unwrap();
 
         assert!(result.converged, "Fit did not converge");
         assert!(
@@ -1125,7 +1138,8 @@ mod tests {
         ]);
 
         // Should not panic and should produce a finite result.
-        let result = levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &LmConfig::default());
+        let result =
+            levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &LmConfig::default()).unwrap();
 
         assert!(
             result.chi_squared.is_finite(),

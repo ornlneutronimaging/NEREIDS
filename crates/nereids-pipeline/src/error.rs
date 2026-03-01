@@ -1,5 +1,6 @@
 //! Error types for the nereids-pipeline crate.
 
+use nereids_fitting::error::FittingError;
 use nereids_physics::transmission::TransmissionError;
 
 /// Errors that can occur during pipeline operations.
@@ -20,6 +21,10 @@ pub enum PipelineError {
     /// Error from the transmission forward model (e.g. unsorted energy grid).
     #[error("Transmission error: {0}")]
     Transmission(TransmissionError),
+
+    /// Error from the fitting engine (e.g. empty data, length mismatch).
+    #[error("Fitting error: {0}")]
+    Fitting(FittingError),
 }
 
 impl From<TransmissionError> for PipelineError {
@@ -28,5 +33,11 @@ impl From<TransmissionError> for PipelineError {
             TransmissionError::Cancelled => PipelineError::Cancelled,
             other => PipelineError::Transmission(other),
         }
+    }
+}
+
+impl From<FittingError> for PipelineError {
+    fn from(e: FittingError) -> Self {
+        PipelineError::Fitting(e)
     }
 }

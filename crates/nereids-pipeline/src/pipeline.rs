@@ -212,7 +212,7 @@ pub fn fit_spectrum(
                 cross_sections: xs.clone(),
                 density_indices: Arc::new((0..n_isotopes).collect()),
             };
-            lm::levenberg_marquardt(&model, measured_t, sigma, &mut params, &lm_config)
+            lm::levenberg_marquardt(&model, measured_t, sigma, &mut params, &lm_config)?
         } else {
             let instrument = config
                 .resolution
@@ -226,7 +226,7 @@ pub fn fit_spectrum(
                 density_indices: (0..n_isotopes).collect(),
                 temperature_index: None,
             };
-            lm::levenberg_marquardt(&model, measured_t, sigma, &mut params, &lm_config)
+            lm::levenberg_marquardt(&model, measured_t, sigma, &mut params, &lm_config)?
         }
     } else {
         // Temperature fitting: always use the full TransmissionFitModel
@@ -243,7 +243,7 @@ pub fn fit_spectrum(
             density_indices: (0..n_isotopes).collect(),
             temperature_index,
         };
-        lm::levenberg_marquardt(&model, measured_t, sigma, &mut params, &lm_config)
+        lm::levenberg_marquardt(&model, measured_t, sigma, &mut params, &lm_config)?
     };
 
     let densities: Vec<f64> = (0..n_isotopes).map(|i| result.params[i]).collect();

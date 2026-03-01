@@ -695,6 +695,7 @@ fn fit_spectrum(
                         temperature_index: Some(n_isotopes),
                     };
                     lm::levenberg_marquardt(&model, &t_owned, &s_owned, &mut params, &config)
+                        .map_err(|e| format!("levenberg_marquardt failed: {e}"))?
                 } else {
                     let xs = transmission::broadened_cross_sections(
                         &e_owned,
@@ -710,6 +711,7 @@ fn fit_spectrum(
                         density_indices,
                     };
                     lm::levenberg_marquardt(&precomputed, &t_owned, &s_owned, &mut params, &config)
+                        .map_err(|e| format!("levenberg_marquardt failed: {e}"))?
                 };
 
                 let densities: Vec<f64> = (0..n_isotopes).map(|i| lm_result.params[i]).collect();
@@ -1327,7 +1329,11 @@ fn doppler_broaden<'py>(
     let xs_owned = xs.to_vec();
 
     // Release the GIL for the Doppler broadening convolution.
-    let result = py.detach(move || doppler::doppler_broaden(&e_owned, &xs_owned, &params));
+    let result = py.detach(move || {
+        doppler::doppler_broaden(&e_owned, &xs_owned, &params)
+            .map_err(|e| format!("doppler_broaden failed: {e}"))
+    });
+    let result = result.map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
     Ok(PyArray1::from_vec(py, result))
 }
 
@@ -2290,7 +2296,9 @@ fn py_trace_detectability(
             snr_threshold,
         };
         detectability::trace_detectability(&config, &trace_data, trace_ppm)
+            .map_err(|e| format!("trace_detectability failed: {e}"))
     });
+    let report = report.map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
 
     Ok(PyTraceDetectabilityReport { inner: report })
 }
@@ -2395,7 +2403,9 @@ fn py_trace_detectability_survey(
             snr_threshold,
         };
         detectability::trace_detectability_survey(&config, &candidates, trace_ppm)
+            .map_err(|e| format!("trace_detectability_survey failed: {e}"))
     });
+    let results = results.map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
 
     Ok(results
         .into_iter()
