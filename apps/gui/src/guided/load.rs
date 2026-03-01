@@ -163,6 +163,7 @@ fn spectrum_input_section(ui: &mut egui::Ui, state: &mut AppState) {
             state.spectrum_path = Some(file);
             state.spectrum_values = None;
             state.energies = None;
+            state.normalized = None;
         }
     });
 
@@ -197,9 +198,15 @@ fn spectrum_input_section(ui: &mut egui::Ui, state: &mut AppState) {
     });
 
     // Invalidate derived data when unit/kind settings change
-    if state.spectrum_unit != prev_unit || state.spectrum_kind != prev_kind {
+    let kind_changed = state.spectrum_kind != prev_kind;
+    if state.spectrum_unit != prev_unit || kind_changed {
         state.energies = None;
         state.normalized = None;
+    }
+    // Changing edges↔centers alters the expected value count vs frame count,
+    // so previously loaded spectrum values may no longer be valid.
+    if kind_changed {
+        state.spectrum_values = None;
     }
 
     if let Some(ref vals) = state.spectrum_values {

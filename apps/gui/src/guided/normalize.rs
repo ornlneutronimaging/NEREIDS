@@ -12,7 +12,7 @@ pub fn normalize_step(ui: &mut egui::Ui, state: &mut AppState) {
     match state.input_mode {
         InputMode::TransmissionTiff => {
             // Pre-normalized data: skip normalization, just derive energy axis
-            if state.normalized.is_some() {
+            if state.normalized.is_some() && state.energies.is_some() {
                 ui.label("Transmission data ready (pre-normalized).");
                 show_energy_info(ui, state);
             } else if state.sample_data.is_some() && state.spectrum_values.is_some() {

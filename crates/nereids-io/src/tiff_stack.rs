@@ -102,18 +102,26 @@ pub fn load_tiff_stack(path: &Path) -> Result<Array3<f64>, IoError> {
 /// # Returns
 /// 3D array with shape (n_frames, height, width) and f64 values.
 pub fn load_tiff_auto(path: &Path) -> Result<Array3<f64>, IoError> {
-    if path.is_file() {
-        load_tiff_stack(path)
-    } else if path.is_dir() {
-        load_tiff_directory(path)
-    } else {
-        Err(IoError::FileNotFound(
+    match std::fs::metadata(path) {
+        Ok(meta) => {
+            if meta.is_file() {
+                load_tiff_stack(path)
+            } else if meta.is_dir() {
+                load_tiff_directory(path)
+            } else {
+                Err(IoError::FileNotFound(
+                    path.to_string_lossy().into_owned(),
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "path is neither a regular file nor a directory",
+                    ),
+                ))
+            }
+        }
+        Err(e) => Err(IoError::FileNotFound(
             path.to_string_lossy().into_owned(),
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "path is neither a file nor a directory",
-            ),
-        ))
+            e,
+        )),
     }
 }
 

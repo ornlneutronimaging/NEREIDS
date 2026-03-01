@@ -197,7 +197,7 @@ impl AppState {
         self.is_fetching_endf = false;
     }
 
-    /// Clear pixel selection, ROI, results, and cancel pending tasks.
+    /// Clear pixel selection, ROI, results, normalization, and cancel pending tasks.
     /// Called when the underlying data changes.
     pub fn invalidate_results(&mut self) {
         self.cancel_pending_tasks();
@@ -207,6 +207,8 @@ impl AppState {
         self.spatial_result = None;
         self.preview_image = None;
         self.energies = None;
+        self.normalized = None;
+        self.dead_pixels = None;
         self.spectrum_values = None;
     }
 }
