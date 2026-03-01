@@ -976,6 +976,10 @@ pub fn poisson_fit_analytic(
 ///   Y_model = flux × T_model(θ) + background
 ///
 /// This wraps a transmission model to predict observed counts.
+///
+/// The `flux` and `background` slices must have the same length as the
+/// transmission vector returned by the inner model. In debug builds,
+/// `evaluate()` asserts this invariant.
 pub struct CountsModel<'a> {
     /// Underlying transmission model.
     pub transmission_model: &'a dyn FitModel,
@@ -988,6 +992,20 @@ pub struct CountsModel<'a> {
 impl<'a> FitModel for CountsModel<'a> {
     fn evaluate(&self, params: &[f64]) -> Vec<f64> {
         let transmission = self.transmission_model.evaluate(params);
+        debug_assert_eq!(
+            transmission.len(),
+            self.flux.len(),
+            "CountsModel: transmission length ({}) != flux length ({})",
+            transmission.len(),
+            self.flux.len(),
+        );
+        debug_assert_eq!(
+            self.flux.len(),
+            self.background.len(),
+            "CountsModel: flux length ({}) != background length ({})",
+            self.flux.len(),
+            self.background.len(),
+        );
         transmission
             .iter()
             .zip(self.flux.iter())
@@ -1124,13 +1142,9 @@ impl LbfgsbMemory {
     }
 }
 
-/// Run Poisson-likelihood optimization using L-BFGS-B (limited-memory BFGS
-/// with box constraints).
+/// Check whether `direction` is a descent direction for `gradient`.
 ///
-/// Uses the same analytical gradient as [`poisson_fit_analytic`] but replaces
-/// the diagonal Fisher preconditioning with a full L-BFGS inverse Hessian
-/// Returns `true` if `direction` is a descent direction with respect to
-/// `gradient`, i.e. the dot product `direction . gradient` is strictly
+/// Returns `true` if the dot product `direction . gradient` is strictly
 /// positive.
 ///
 /// In the L-BFGS-B line search convention `x_new = x - alpha * search_dir`,
@@ -1150,6 +1164,11 @@ fn is_descent_direction(direction: &[f64], gradient: &[f64]) -> bool {
     dot > 0.0
 }
 
+/// Run Poisson-likelihood optimization using L-BFGS-B (limited-memory BFGS
+/// with box constraints).
+///
+/// Uses the same analytical gradient as [`poisson_fit_analytic`] but replaces
+/// the diagonal Fisher preconditioning with a full L-BFGS inverse Hessian
 /// approximation.  This captures curvature across parameters (not just
 /// per-parameter diagonal curvature), which is critical for problems with
 /// correlated parameters such as joint density + temperature fitting.

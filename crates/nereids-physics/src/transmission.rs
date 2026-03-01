@@ -201,6 +201,10 @@ pub struct InstrumentParams {
 /// * [`TransmissionError::Doppler`] — if Doppler broadening is enabled
 ///   (`temperature_k > 0.0`) and `DopplerParams` validation fails
 ///   (e.g., non-positive or non-finite AWR).
+///
+/// **Note**: isotopes with thickness <= 0.0 are silently skipped
+/// (they contribute zero attenuation). This allows callers to include
+/// inactive isotopes in `SampleParams` without causing errors.
 pub fn forward_model(
     energies: &[f64],
     sample: &SampleParams,
@@ -220,6 +224,7 @@ pub fn forward_model(
 
     // Compute broadened cross-sections for all isotopes in parallel.
     // Each isotope's Doppler + resolution broadening is independent.
+    // Skip isotopes with non-positive thickness (zero attenuation).
     let broadened: Result<Vec<(Vec<f64>, f64)>, TransmissionError> = sample
         .isotopes
         .par_iter()
