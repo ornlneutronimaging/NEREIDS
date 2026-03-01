@@ -47,6 +47,8 @@ pub enum SparseConfigError {
     EmptyResonanceData,
     /// initial_densities length must match resonance_data length.
     DensityCountMismatch { densities: usize, isotopes: usize },
+    /// isotope_names length must match resonance_data length.
+    NameCountMismatch { names: usize, isotopes: usize },
     /// Temperature must be finite.
     NonFiniteTemperature(f64),
     /// Temperature must be non-negative.
@@ -64,6 +66,10 @@ impl std::fmt::Display for SparseConfigError {
             } => write!(
                 f,
                 "initial_densities length ({densities}) must match resonance_data length ({isotopes})"
+            ),
+            Self::NameCountMismatch { names, isotopes } => write!(
+                f,
+                "isotope_names length ({names}) must match resonance_data length ({isotopes})"
             ),
             Self::NonFiniteTemperature(v) => {
                 write!(f, "temperature must be finite, got {v}")
@@ -122,6 +128,12 @@ impl SparseConfig {
         if initial_densities.len() != resonance_data.len() {
             return Err(SparseConfigError::DensityCountMismatch {
                 densities: initial_densities.len(),
+                isotopes: resonance_data.len(),
+            });
+        }
+        if isotope_names.len() != resonance_data.len() {
+            return Err(SparseConfigError::NameCountMismatch {
+                names: isotope_names.len(),
                 isotopes: resonance_data.len(),
             });
         }
@@ -795,6 +807,22 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, SparseConfigError::EmptyResonanceData);
+    }
+
+    #[test]
+    fn test_sparse_config_rejects_name_count_mismatch() {
+        let data = u238_single_resonance();
+        let err = SparseConfig::new(
+            vec![1.0, 2.0],
+            vec![data],
+            vec!["U-238".into(), "extra".into()], // 2 names but only 1 isotope
+            300.0,
+            None,
+            vec![0.001],
+            PoissonConfig::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, SparseConfigError::NameCountMismatch { .. }));
     }
 
     #[test]

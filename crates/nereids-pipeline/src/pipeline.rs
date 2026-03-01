@@ -26,6 +26,8 @@ pub enum FitConfigError {
     EmptyResonanceData,
     /// initial_densities length must match resonance_data length.
     DensityCountMismatch { densities: usize, isotopes: usize },
+    /// isotope_names length must match resonance_data length.
+    NameCountMismatch { names: usize, isotopes: usize },
     /// Temperature must be finite.
     NonFiniteTemperature(f64),
     /// Temperature must be non-negative.
@@ -45,6 +47,10 @@ impl fmt::Display for FitConfigError {
             } => write!(
                 f,
                 "initial_densities length ({densities}) must match resonance_data length ({isotopes})"
+            ),
+            Self::NameCountMismatch { names, isotopes } => write!(
+                f,
+                "isotope_names length ({names}) must match resonance_data length ({isotopes})"
             ),
             Self::NonFiniteTemperature(v) => {
                 write!(f, "temperature must be finite, got {v}")
@@ -128,6 +134,12 @@ impl FitConfig {
         if initial_densities.len() != resonance_data.len() {
             return Err(FitConfigError::DensityCountMismatch {
                 densities: initial_densities.len(),
+                isotopes: resonance_data.len(),
+            });
+        }
+        if isotope_names.len() != resonance_data.len() {
+            return Err(FitConfigError::NameCountMismatch {
+                names: isotope_names.len(),
                 isotopes: resonance_data.len(),
             });
         }
@@ -653,6 +665,22 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, FitConfigError::DensityCountMismatch { .. }));
+    }
+
+    #[test]
+    fn test_fit_config_rejects_name_count_mismatch() {
+        let data = u238_single_resonance();
+        let err = FitConfig::new(
+            vec![1.0, 2.0],
+            vec![data],
+            vec!["U-238".into(), "extra".into()], // 2 names but only 1 isotope
+            300.0,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, FitConfigError::NameCountMismatch { .. }));
     }
 
     #[test]

@@ -315,8 +315,12 @@ fn fetch_endf_data(state: &mut AppState) {
     });
 }
 
-fn build_fit_config(state: &AppState) -> Option<FitConfig> {
-    let energies = state.energies.as_ref()?.clone();
+fn build_fit_config(state: &AppState) -> Result<FitConfig, String> {
+    let energies = state
+        .energies
+        .as_ref()
+        .ok_or_else(|| "No energy grid loaded".to_string())?
+        .clone();
 
     let enabled: Vec<&IsotopeEntry> = state
         .isotope_entries
@@ -325,7 +329,7 @@ fn build_fit_config(state: &AppState) -> Option<FitConfig> {
         .collect();
 
     if enabled.is_empty() {
-        return None;
+        return Err("No enabled isotopes with resonance data".into());
     }
 
     let resonance_data: Vec<_> = enabled
@@ -344,14 +348,14 @@ fn build_fit_config(state: &AppState) -> Option<FitConfig> {
         initial_densities,
         state.lm_config.clone(),
     )
-    .ok()
+    .map_err(|e| format!("FitConfig validation error: {e}"))
 }
 
 fn fit_pixel(state: &mut AppState) {
     let config = match build_fit_config(state) {
-        Some(c) => c,
-        None => {
-            state.status_message = "Missing fit configuration".into();
+        Ok(c) => c,
+        Err(e) => {
+            state.status_message = e;
             return;
         }
     };
@@ -400,9 +404,9 @@ fn fit_pixel(state: &mut AppState) {
 
 fn fit_roi(state: &mut AppState) {
     let config = match build_fit_config(state) {
-        Some(c) => c,
-        None => {
-            state.status_message = "Missing fit configuration".into();
+        Ok(c) => c,
+        Err(e) => {
+            state.status_message = e;
             return;
         }
     };
@@ -460,9 +464,9 @@ fn fit_roi(state: &mut AppState) {
 
 fn run_spatial_map(state: &mut AppState) {
     let config = match build_fit_config(state) {
-        Some(c) => c,
-        None => {
-            state.status_message = "Missing fit configuration".into();
+        Ok(c) => c,
+        Err(e) => {
+            state.status_message = e;
             return;
         }
     };
