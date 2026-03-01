@@ -9,6 +9,10 @@
 //! For isolated, well-separated resonances, SLBW and Reich-Moore should
 //! give nearly identical results.
 //!
+//! This module also handles MLBW (Multi-Level Breit-Wigner) ranges, which are
+//! evaluated using the SLBW formulas as an approximation (see `reich_moore`
+//! module for details).
+//!
 //! ## SAMMY Reference
 //! - `mlb/mmlb4.f90` Abpart_Mlb subroutine
 //! - SAMMY manual Section 2.1.1
