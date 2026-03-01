@@ -1156,6 +1156,9 @@ fn reich_moore_spin_group_precomputed(
     let l_real = s_l - boundary;
     let l_imag = p_l;
     let l_denom = l_real * l_real + l_imag * l_imag;
+    if l_denom < LOG_FLOOR {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
 
     // 1/(S - B + iP) = (S - B - iP) / |S - B + iP|²
     let l_inv_real = l_real / l_denom;
@@ -1166,6 +1169,9 @@ fn reich_moore_spin_group_precomputed(
 
     // Y⁻¹ = 1/Y
     let y_denom = y_real * y_real + y_imag * y_imag;
+    if y_denom < LOG_FLOOR {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
     let y_inv_real = y_real / y_denom;
     let y_inv_imag = -y_imag / y_denom;
 
@@ -1744,16 +1750,18 @@ mod tests {
     /// non-negative (no NaN or Inf propagation).
     ///
     /// We construct a scenario where evaluation occurs exactly at E_r,
-    /// maximizing the R-matrix contribution.  With a very narrow
-    /// resonance (small Γ_γ), the imaginary denominator is tiny and
-    /// the R-matrix peak is enormous, stressing the Y inversion.
+    /// maximizing the R-matrix contribution.  With an extremely narrow
+    /// resonance (Γ_γ = 1e-15 eV), the imaginary denominator is tiny
+    /// and the R-matrix peak is enormous, stressing the Y inversion.
     #[test]
     fn test_reich_moore_singular_y_matrix_guard() {
-        // Very narrow resonance: Γ_γ = 1e-6 eV makes R huge at E = E_r.
+        // Extremely narrow resonance: Γ_γ = 1e-15 eV forces R-matrix
+        // contribution to be enormous at E = E_r, pushing Y toward
+        // singularity and exercising the y_denom < LOG_FLOOR guard.
         let data = make_single_resonance_data(
             10.0,    // E_r
             1.0e-3,  // Γ_n (eV)
-            1.0e-6,  // Γ_γ (very small → large R at resonance)
+            1.0e-15, // Γ_γ (extremely small → near-singular Y)
             0.5,     // J
             0,       // L
             236.006, // AWR
@@ -1776,6 +1784,44 @@ mod tests {
         assert!(
             xs.capture.is_finite(),
             "Capture must be finite, got {}",
+            xs.capture
+        );
+    }
+
+    /// Zero capture width definitively triggers the y_denom guard:
+    /// with Γ_γ = 0, the R-matrix denominator at E = E_r is zero,
+    /// making R infinite.  The singularity guard must return zeros
+    /// rather than NaN/Inf.
+    #[test]
+    fn test_reich_moore_zero_capture_width_guard() {
+        let data = make_single_resonance_data(
+            10.0,    // E_r
+            1.0e-3,  // Γ_n (eV)
+            0.0,     // Γ_γ = 0 → guaranteed singularity
+            0.5,     // J
+            0,       // L
+            236.006, // AWR
+            0.0,     // target spin
+            9.4285,  // radius
+        );
+
+        // At E = E_r with Γ_γ = 0, the denominator (E_r - E)² + (Γ_γ/2)² = 0,
+        // so the DIVISION_FLOOR guard on the R-matrix denom fires, but even if
+        // it didn't, the y_denom guard would catch it downstream.
+        let xs = cross_sections_at_energy(&data, 10.0);
+        assert!(
+            xs.total.is_finite() && xs.total >= 0.0,
+            "Total must be finite and non-negative with zero capture width, got {}",
+            xs.total
+        );
+        assert!(
+            xs.elastic.is_finite() && xs.elastic >= 0.0,
+            "Elastic must be finite and non-negative, got {}",
+            xs.elastic
+        );
+        assert!(
+            xs.capture.is_finite() && xs.capture >= 0.0,
+            "Capture must be finite and non-negative, got {}",
             xs.capture
         );
     }
