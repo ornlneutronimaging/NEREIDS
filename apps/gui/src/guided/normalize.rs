@@ -35,16 +35,21 @@ fn normalization_controls_card(ui: &mut egui::Ui, state: &mut AppState) {
             ui.add_space(4.0);
 
             match state.input_mode {
-                InputMode::TransmissionTiff => {
+                InputMode::TransmissionTiff | InputMode::Hdf5Histogram | InputMode::Hdf5Event => {
                     if state.normalized.is_some() && state.energies.is_some() {
-                        ui.label("Transmission data ready (pre-normalized).");
+                        let label = match state.input_mode {
+                            InputMode::Hdf5Histogram => "HDF5 histogram data ready.",
+                            InputMode::Hdf5Event => "Histogrammed event data ready.",
+                            _ => "Transmission data ready (pre-normalized).",
+                        };
+                        ui.label(label);
                         show_energy_info(ui, state);
                     } else if state.sample_data.is_some() && state.spectrum_values.is_some() {
-                        // Auto-prepare: pre-normalized data needs no user action.
+                        // Auto-prepare: pre-normalized/HDF5 data needs no user action.
                         prepare_transmission(state);
-                        ui.label("Preparing transmission...");
+                        ui.label("Preparing data...");
                     } else {
-                        ui.label("Load transmission TIFF and spectrum file first (Step 1).");
+                        ui.label("Load data first (Step 1).");
                     }
                 }
                 InputMode::TiffPair => {
@@ -503,8 +508,10 @@ pub(crate) fn prepare_transmission(state: &mut AppState) {
         None => return,
     };
 
-    // No open beam in transmission mode — dead pixel detection not applicable
-    state.dead_pixels = None;
+    // Only clear dead pixels for TransmissionTiff — HDF5 modes load them from the file.
+    if state.input_mode == InputMode::TransmissionTiff {
+        state.dead_pixels = None;
+    }
 
     let n_tof = sample.shape()[0];
     // TODO(Phase 2b): estimate uncertainty from data or allow user to specify.

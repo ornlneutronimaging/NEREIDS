@@ -9,6 +9,7 @@ use std::sync::mpsc;
 use nereids_endf::resonance::ResonanceData;
 use nereids_endf::retrieval::EndfLibrary;
 use nereids_fitting::lm::LmConfig;
+use nereids_io::nexus::NexusMetadata;
 use nereids_io::normalization::NormalizedData;
 use nereids_io::spectrum::{SpectrumUnit, SpectrumValueKind};
 use nereids_io::tof::BeamlineParams;
@@ -29,6 +30,10 @@ pub enum InputMode {
     TiffPair,
     /// Pre-normalized transmission TIFF + Spectrum file.
     TransmissionTiff,
+    /// HDF5/NeXus file with pre-histogrammed counts.
+    Hdf5Histogram,
+    /// HDF5/NeXus file with raw neutron events (histogrammed on load).
+    Hdf5Event,
 }
 
 /// Analysis mode — determines how fitting operates in the Analyze step.
@@ -109,6 +114,15 @@ pub struct AppState {
     pub status_message: String,
     pub is_fitting: bool,
     pub is_fetching_endf: bool,
+
+    // -- HDF5/NeXus --
+    pub hdf5_path: Option<PathBuf>,
+    pub nexus_metadata: Option<NexusMetadata>,
+    pub event_n_bins: usize,
+    pub event_tof_min_us: f64,
+    pub event_tof_max_us: f64,
+    pub event_height: usize,
+    pub event_width: usize,
 
     // -- Normalize preview --
     pub analysis_mode: AnalysisMode,
@@ -290,6 +304,14 @@ impl Default for AppState {
             status_message: "Ready".into(),
             is_fitting: false,
             is_fetching_endf: false,
+
+            hdf5_path: None,
+            nexus_metadata: None,
+            event_n_bins: 500,
+            event_tof_min_us: 1000.0,
+            event_tof_max_us: 20000.0,
+            event_height: 512,
+            event_width: 512,
 
             analysis_mode: AnalysisMode::FullSpatialMap,
             normalize_spectrum_source: SpectrumDataSource::FullImage,

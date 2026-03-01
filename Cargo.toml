@@ -46,3 +46,4 @@ egui = "0.33"
 egui_extras = { version = "0.33", features = ["image", "svg"] }
 egui_plot = "0.34"
 rfd = "0.17"
+hdf5 = { package = "hdf5-metno", version = "0.12", features = ["static", "zlib"] }
