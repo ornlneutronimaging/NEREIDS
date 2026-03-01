@@ -404,8 +404,11 @@ fn load_hdf5_histogram(state: &mut AppState) {
             state.spectrum_unit = nereids_io::spectrum::SpectrumUnit::TofMicroseconds;
             state.spectrum_kind = nereids_io::spectrum::SpectrumValueKind::BinEdges;
 
-            // Set flight path if available
-            if let Some(fp) = data.flight_path_m {
+            // Set flight path if available and valid
+            if let Some(fp) = data.flight_path_m
+                && fp.is_finite()
+                && fp > 0.0
+            {
                 state.beamline.flight_path_m = fp;
             }
 
@@ -452,8 +455,11 @@ fn load_hdf5_events(state: &mut AppState) {
             state.spectrum_unit = nereids_io::spectrum::SpectrumUnit::TofMicroseconds;
             state.spectrum_kind = nereids_io::spectrum::SpectrumValueKind::BinEdges;
 
-            // Set flight path if available
-            if let Some(fp) = data.flight_path_m {
+            // Set flight path if available and valid
+            if let Some(fp) = data.flight_path_m
+                && fp.is_finite()
+                && fp > 0.0
+            {
                 state.beamline.flight_path_m = fp;
             }
 

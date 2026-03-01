@@ -258,7 +258,6 @@ impl AppState {
         self.normalized = None;
         self.dead_pixels = None;
         self.spectrum_values = None;
-        self.nexus_metadata = None;
     }
 }
 

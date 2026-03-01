@@ -132,7 +132,7 @@ pub fn load_nexus_histogram(path: &Path) -> Result<NexusHistogramData, IoError> 
 
     let counts_u64: ndarray::Array4<u64> = counts_ds
         .read()
-        .map_err(|e| IoError::TiffDecode(format!("Failed to read histogram counts: {e}")))?;
+        .map_err(|e| IoError::InvalidParameter(format!("Failed to read histogram counts: {e}")))?;
 
     // Sum over rotation angle axis (axis 0): [rot, y, x, tof] → [y, x, tof]
     let summed = counts_u64.sum_axis(ndarray::Axis(0));
@@ -150,6 +150,17 @@ pub fn load_nexus_histogram(path: &Path) -> Result<NexusHistogramData, IoError> 
 
     // Read TOF axis (nanoseconds → microseconds)
     let tof_edges_us = read_tof_axis(&hist_group)?;
+
+    // Validate TOF edges count against histogram TOF dimension
+    if tof_edges_us.len() != n_tof + 1 && tof_edges_us.len() != n_tof {
+        return Err(IoError::InvalidParameter(format!(
+            "TOF axis length {} is incompatible with {} histogram bins (expected {} or {})",
+            tof_edges_us.len(),
+            n_tof,
+            n_tof,
+            n_tof + 1
+        )));
+    }
 
     // Read flight path
     let flight_path_m = read_f64_attr(&hist_group, "flight_path_m")
@@ -198,6 +209,11 @@ pub fn load_nexus_events(
     if params.height == 0 || params.width == 0 {
         return Err(IoError::InvalidParameter(
             "height and width must be positive".into(),
+        ));
+    }
+    if !params.tof_min_us.is_finite() || !params.tof_max_us.is_finite() {
+        return Err(IoError::InvalidParameter(
+            "TOF bounds must be finite".into(),
         ));
     }
     if params.tof_max_us <= params.tof_min_us {
@@ -263,6 +279,9 @@ pub fn load_nexus_events(
 
     for i in 0..tof_ns.len() {
         let tof_us = tof_ns[i] as f64 / 1000.0; // ns → µs
+        if !tof_us.is_finite() {
+            continue;
+        }
 
         // Skip events outside TOF range
         if tof_us < params.tof_min_us || tof_us >= params.tof_max_us {

@@ -508,8 +508,10 @@ pub(crate) fn prepare_transmission(state: &mut AppState) {
         None => return,
     };
 
-    // No open beam in transmission mode — dead pixel detection not applicable
-    state.dead_pixels = None;
+    // Only clear dead pixels for TransmissionTiff — HDF5 modes load them from the file.
+    if state.input_mode == InputMode::TransmissionTiff {
+        state.dead_pixels = None;
+    }
 
     let n_tof = sample.shape()[0];
     // TODO(Phase 2b): estimate uncertainty from data or allow user to specify.
