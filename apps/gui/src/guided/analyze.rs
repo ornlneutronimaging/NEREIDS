@@ -1,7 +1,12 @@
-//! Step 4: Analyze — solver configuration, fit execution, spectrum/map display.
+//! Step 4: Analyze -- solver configuration, fit execution, spectrum/map display.
+//!
+//! Layout: 3-column simultaneous view (controls | image | spectrum+results).
+//! The previous tab-based layout hid the map and spectrum in separate tabs;
+//! this redesign shows both side-by-side so the user can click a pixel on the
+//! map and immediately see its spectrum.
 
-use crate::state::{AppState, IsotopeEntry, RoiSelection, Tab};
-use crate::widgets::image_view::show_grayscale_image;
+use crate::state::{AppState, IsotopeEntry, RoiSelection};
+use crate::widgets::image_view::show_viridis_image;
 use egui_plot::{Line, Plot, PlotPoints};
 use nereids_pipeline::pipeline::FitConfig;
 use std::sync::Arc;
@@ -9,18 +14,31 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 
 /// Draw the Analyze step content.
+///
+/// Three-column layout:
+/// ```text
+/// +-- Controls (scroll) --+-- Image (clickable) --+-- Spectrum + Results --+
+/// | Fit Parameters        | viridis density map   | Pixel: (y, x)         |
+/// | ROI controls          | OR preview image      | [y DragValue] [x DV]  |
+/// | Run buttons           |                       |                       |
+/// | Fitting spinner       | Click to select pixel | [Spectrum Plot]       |
+/// | [Isotope selector     | Pixel: (y, x) shown   | Measured + Fit lines  |
+/// |  for map display]     |                       |                       |
+/// |                       | [Convergence map      | Fit results:          |
+/// |                       |  below if available]  | chi2_r, densities     |
+/// +-----------------------+-----------------------+-----------------------+
+/// ```
 pub fn analyze_step(ui: &mut egui::Ui, state: &mut AppState) {
     ui.heading("Analyze");
     ui.separator();
 
-    // Horizontal layout: left controls | right spectrum/map
     let available_width = ui.available_width();
-    let controls_width = 260.0_f32.min(available_width * 0.35);
+    let controls_width = 220.0_f32.min(available_width * 0.2);
 
     ui.horizontal(|ui| {
-        // Left: fit controls
+        // Column 1: fit controls (scrollable, with min height to avoid clipping)
         ui.allocate_ui_with_layout(
-            egui::vec2(controls_width, ui.available_height()),
+            egui::vec2(controls_width, ui.available_height().max(400.0)),
             egui::Layout::top_down(egui::Align::LEFT),
             |ui| {
                 egui::ScrollArea::vertical()
@@ -33,19 +51,30 @@ pub fn analyze_step(ui: &mut egui::Ui, state: &mut AppState) {
 
         ui.separator();
 
-        // Right: spectrum/map tabs
-        ui.vertical(|ui| {
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut state.active_tab, Tab::Spectrum, "Spectrum");
-                ui.selectable_value(&mut state.active_tab, Tab::Map, "Map");
-            });
-            ui.separator();
+        // Remaining width split between image and spectrum panels
+        let remaining = (available_width - controls_width - 20.0).max(200.0);
+        let image_width = remaining * 0.45;
+        let spectrum_width = remaining * 0.55;
 
-            match state.active_tab {
-                Tab::Spectrum => spectrum_panel(ui, state),
-                Tab::Map => map_panel(ui, state),
-            }
-        });
+        // Column 2: image viewer (map or preview, clickable)
+        ui.allocate_ui_with_layout(
+            egui::vec2(image_width, ui.available_height().max(400.0)),
+            egui::Layout::top_down(egui::Align::LEFT),
+            |ui| {
+                image_panel(ui, state);
+            },
+        );
+
+        ui.separator();
+
+        // Column 3: spectrum + results
+        ui.allocate_ui_with_layout(
+            egui::vec2(spectrum_width, ui.available_height().max(400.0)),
+            egui::Layout::top_down(egui::Align::LEFT),
+            |ui| {
+                spectrum_panel(ui, state);
+            },
+        );
     });
 }
 
@@ -146,10 +175,74 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
     }
 }
 
-// ---- Spectrum Panel ----
+// ---- Image Panel (Column 2) ----
+
+/// Shows spatial result density maps if available, otherwise the preview image.
+/// Handles click-to-select-pixel via the return value of `show_viridis_image`.
+fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
+    if let Some(ref result) = state.spatial_result {
+        // Isotope selector (when multiple density maps)
+        let n_isotopes = result.density_maps.len();
+        if n_isotopes > 1 {
+            ui.horizontal(|ui| {
+                ui.label("Isotope:");
+                for i in 0..n_isotopes {
+                    let name = state
+                        .isotope_entries
+                        .iter()
+                        .filter(|e| e.enabled && e.resonance_data.is_some())
+                        .nth(i)
+                        .map(|e| e.symbol.as_str())
+                        .unwrap_or("?");
+                    ui.selectable_value(&mut state.map_display_isotope, i, name);
+                }
+            });
+        }
+
+        if n_isotopes == 0 {
+            ui.label("No density maps available.");
+            return;
+        }
+
+        let idx = state.map_display_isotope.min(n_isotopes - 1);
+
+        ui.label("Density (atoms/barn):");
+        if let Some((y, x)) = show_viridis_image(ui, &result.density_maps[idx], "density_tex") {
+            state.selected_pixel = Some((y, x));
+            state.pixel_fit_result = None;
+        }
+
+        ui.add_space(8.0);
+
+        ui.label("Convergence map:");
+        let conv_f64 = result.converged_map.mapv(|b| if b { 1.0 } else { 0.0 });
+        let _ = show_viridis_image(ui, &conv_f64, "conv_tex");
+
+        ui.label(format!(
+            "{}/{} pixels converged",
+            result.n_converged, result.n_total
+        ));
+    } else if let Some(ref preview) = state.preview_image {
+        ui.label("Preview (summed counts):");
+        if let Some((y, x)) = show_viridis_image(ui, preview, "preview_tex") {
+            state.selected_pixel = Some((y, x));
+            state.pixel_fit_result = None;
+        }
+    } else {
+        ui.label("Run spatial mapping to see density maps.");
+    }
+
+    // Show selected pixel coordinates as feedback
+    if let Some((y, x)) = state.selected_pixel {
+        ui.add_space(4.0);
+        ui.label(format!("Selected pixel: ({}, {})", y, x));
+    }
+}
+
+// ---- Spectrum Panel (Column 3) ----
 
 fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
-    // Pixel selector
+    // Pixel selector (manual override via DragValues)
     ui.horizontal(|ui| {
         ui.label("Pixel:");
         if let Some((y, x)) = state.selected_pixel {
@@ -300,62 +393,6 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
     }
 }
 
-// ---- Map Panel ----
-
-fn map_panel(ui: &mut egui::Ui, state: &mut AppState) {
-    let result = match state.spatial_result {
-        Some(ref r) => r,
-        None => {
-            if let Some(ref preview) = state.preview_image {
-                ui.label("Preview (summed counts):");
-                show_grayscale_image(ui, preview, "preview_tex");
-            } else {
-                ui.label("Run spatial mapping to see density maps.");
-            }
-            return;
-        }
-    };
-
-    // Isotope selector
-    let n_isotopes = result.density_maps.len();
-    if n_isotopes > 1 {
-        ui.horizontal(|ui| {
-            ui.label("Isotope:");
-            for i in 0..n_isotopes {
-                let name = state
-                    .isotope_entries
-                    .iter()
-                    .filter(|e| e.enabled && e.resonance_data.is_some())
-                    .nth(i)
-                    .map(|e| e.symbol.as_str())
-                    .unwrap_or("?");
-                ui.selectable_value(&mut state.map_display_isotope, i, name);
-            }
-        });
-    }
-
-    if n_isotopes == 0 {
-        ui.label("No density maps available.");
-        return;
-    }
-
-    let idx = state.map_display_isotope.min(n_isotopes - 1);
-
-    ui.label("Density (atoms/barn):");
-    show_grayscale_image(ui, &result.density_maps[idx], "density_tex");
-
-    ui.add_space(8.0);
-
-    ui.label("Convergence map:");
-    let conv_f64 = result.converged_map.mapv(|b| if b { 1.0 } else { 0.0 });
-    show_grayscale_image(ui, &conv_f64, "conv_tex");
-
-    ui.label(format!(
-        "{}/{} pixels converged",
-        result.n_converged, result.n_total
-    ));
-}
-
 // ---- Fit Helpers ----
 
 fn build_fit_config(state: &AppState) -> Result<FitConfig, String> {
@@ -442,7 +479,6 @@ fn fit_pixel(state: &mut AppState) {
     };
 
     state.pixel_fit_result = Some(result);
-    state.active_tab = Tab::Spectrum;
 }
 
 fn fit_roi(state: &mut AppState) {
@@ -502,7 +538,6 @@ fn fit_roi(state: &mut AppState) {
     };
 
     state.pixel_fit_result = Some(result);
-    state.active_tab = Tab::Spectrum;
 }
 
 pub fn run_spatial_map(state: &mut AppState) {

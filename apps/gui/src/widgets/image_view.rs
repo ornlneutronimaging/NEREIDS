@@ -1,15 +1,23 @@
-//! Shared image viewer widget: grayscale/viridis 2D array display with click-to-select.
+//! Shared image viewer widget: viridis-colormapped 2D array display with click-to-select.
 
 /// Display a 2D f64 array as a viridis-colormapped image with click-to-select-pixel.
 ///
 /// Normalizes the data range to [0, 1], maps through the viridis colormap,
-/// and renders as an egui texture. Click on the image to set `clicked_pixel`
-/// in the egui temp data store.
-pub fn show_grayscale_image(ui: &mut egui::Ui, data: &ndarray::Array2<f64>, tex_id: &str) {
+/// and renders as an egui texture.  Returns `Some((row, col))` if the user
+/// clicked on the image this frame, `None` otherwise.
+///
+/// Uses `ui.allocate_response` with `Sense::click()` so that clicks are
+/// properly registered (unlike `ui.image()` which does not enable click
+/// sensing by default).
+pub fn show_viridis_image(
+    ui: &mut egui::Ui,
+    data: &ndarray::Array2<f64>,
+    tex_id: &str,
+) -> Option<(usize, usize)> {
     let (height, width) = (data.shape()[0], data.shape()[1]);
     if width == 0 || height == 0 {
         ui.label("(empty image)");
-        return;
+        return None;
     }
 
     let mut vmin = f64::INFINITY;
@@ -53,7 +61,14 @@ pub fn show_grayscale_image(ui: &mut egui::Ui, data: &ndarray::Array2<f64>, tex_
     let scale = available_width / width as f32;
     let display_size = egui::Vec2::new(width as f32 * scale, height as f32 * scale);
 
-    let response = ui.image(egui::load::SizedTexture::new(texture.id(), display_size));
+    // Allocate interactive rect with click sensing (ui.image() does not register clicks).
+    let (response, painter) = ui.allocate_painter(display_size, egui::Sense::click());
+    painter.image(
+        texture.id(),
+        response.rect,
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        egui::Color32::WHITE,
+    );
 
     if response.clicked()
         && let Some(pos) = response.interact_pointer_pos()
@@ -63,13 +78,10 @@ pub fn show_grayscale_image(ui: &mut egui::Ui, data: &ndarray::Array2<f64>, tex_
         let rel_y = ((pos.y - rect.top()) / rect.height()).clamp(0.0, 1.0);
         let px_x = (rel_x * width as f32) as usize;
         let px_y = (rel_y * height as f32) as usize;
-        ui.ctx().data_mut(|d| {
-            d.insert_temp(
-                egui::Id::new("clicked_pixel"),
-                (px_y.min(height - 1), px_x.min(width - 1)),
-            );
-        });
+        return Some((px_y.min(height - 1), px_x.min(width - 1)));
     }
+
+    None
 }
 
 /// 4-segment linear approximation of the viridis colormap.

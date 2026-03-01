@@ -1,29 +1,28 @@
 //! Step 3: Normalize — transmission computation, preview, and analysis mode selection.
 
 use crate::state::{AnalysisMode, AppState, InputMode, SpectrumAxis, SpectrumDataSource};
-use crate::widgets::image_view::show_grayscale_image;
+use crate::widgets::image_view::show_viridis_image;
 use egui_plot::{Line, Plot, PlotPoints, VLine};
 use ndarray::{Array3, Axis};
 use nereids_io::spectrum::{SpectrumUnit, SpectrumValueKind};
 use std::sync::Arc;
 
 /// Draw the Normalize step content.
+///
+/// No inner ScrollArea -- the guided content area in app.rs already wraps
+/// everything in a vertical ScrollArea, so nesting would clip content.
 pub fn normalize_step(ui: &mut egui::Ui, state: &mut AppState) {
     ui.heading("Normalize");
     ui.separator();
 
-    egui::ScrollArea::vertical()
-        .id_salt("normalize_scroll")
-        .show(ui, |ui| {
-            normalization_controls_card(ui, state);
+    normalization_controls_card(ui, state);
 
-            if state.normalized.is_some() && state.energies.is_some() {
-                ui.add_space(12.0);
-                transmission_preview_card(ui, state);
-                ui.add_space(12.0);
-                analysis_mode_cards(ui, state);
-            }
-        });
+    if state.normalized.is_some() && state.energies.is_some() {
+        ui.add_space(12.0);
+        transmission_preview_card(ui, state);
+        ui.add_space(12.0);
+        analysis_mode_cards(ui, state);
+    }
 }
 
 // ---- Normalization Controls Card ----
@@ -141,7 +140,7 @@ fn preview_image_panel(ui: &mut egui::Ui, state: &mut AppState) {
         .transmission
         .index_axis(Axis(0), state.tof_slice_index)
         .to_owned();
-    show_grayscale_image(ui, &slice, "norm_preview_tex");
+    let _ = show_viridis_image(ui, &slice, "norm_preview_tex");
 
     // TOF slicer
     ui.add(
