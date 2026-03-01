@@ -1,6 +1,6 @@
 //! Guided mode sidebar: step navigator with completion indicators.
 
-use crate::state::{AppState, GuidedStep};
+use crate::state::{AppState, GuidedStep, InputMode};
 use crate::theme::{ThemeColors, semantic};
 
 /// Render the guided mode sidebar with step navigation.
@@ -122,7 +122,16 @@ pub fn guided_sidebar(ctx: &egui::Context, state: &mut AppState) {
 /// Check whether a guided step has been completed based on state.
 fn step_is_complete(step: GuidedStep, state: &AppState) -> bool {
     match step {
-        GuidedStep::Load => state.sample_data.is_some() && state.open_beam_data.is_some(),
+        GuidedStep::Load => match state.input_mode {
+            InputMode::TiffPair => {
+                state.sample_data.is_some()
+                    && state.open_beam_data.is_some()
+                    && state.spectrum_values.is_some()
+            }
+            InputMode::TransmissionTiff => {
+                state.sample_data.is_some() && state.spectrum_values.is_some()
+            }
+        },
         GuidedStep::Configure => state
             .isotope_entries
             .iter()
