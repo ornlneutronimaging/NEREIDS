@@ -652,11 +652,6 @@ fn fit_spectrum(
     match fitter {
         "lm" => {
             let instrument = res_fn.map(|r| Arc::new(InstrumentParams { resolution: r }));
-            let temperature_index = if fit_temperature {
-                Some(n_isotopes)
-            } else {
-                None
-            };
 
             // Copy numpy slices to owned vectors so we can release the GIL.
             let e_owned = e.to_vec();
@@ -666,15 +661,6 @@ fn fit_spectrum(
             // Release the GIL for the heavy computation.
             // The closure uses only Rust types; PyErr conversion happens outside.
             let result: Result<PyFitResult, String> = py.detach(move || {
-                let model = TransmissionFitModel {
-                    energies: e_owned,
-                    resonance_data: res_data,
-                    temperature_k,
-                    instrument,
-                    density_indices: (0..n_isotopes).collect(),
-                    temperature_index,
-                };
-
                 let mut param_vec: Vec<FitParameter> = init
                     .iter()
                     .enumerate()
@@ -697,8 +683,38 @@ fn fit_spectrum(
                     ..LmConfig::default()
                 };
 
-                let lm_result =
-                    lm::levenberg_marquardt(&model, &t_owned, &s_owned, &mut params, &config);
+                // When temperature is fixed, precompute Doppler+resolution-broadened
+                // cross-sections once and use PrecomputedTransmissionModel for the LM
+                // fit.  This avoids recomputing XS on every model evaluation and also
+                // provides the analytical Jacobian for free.
+                // When temperature is free, cross-sections change every iteration so
+                // we must use the full TransmissionFitModel.
+                let lm_result = if fit_temperature {
+                    let model = TransmissionFitModel {
+                        energies: e_owned,
+                        resonance_data: res_data,
+                        temperature_k,
+                        instrument,
+                        density_indices: (0..n_isotopes).collect(),
+                        temperature_index: Some(n_isotopes),
+                    };
+                    lm::levenberg_marquardt(&model, &t_owned, &s_owned, &mut params, &config)
+                } else {
+                    let xs = transmission::broadened_cross_sections(
+                        &e_owned,
+                        &res_data,
+                        temperature_k,
+                        instrument.as_ref().map(Arc::as_ref),
+                        None,
+                    )
+                    .map_err(|e| format!("broadened_cross_sections failed: {e}"))?;
+                    let density_indices: Arc<Vec<usize>> = Arc::new((0..n_isotopes).collect());
+                    let precomputed = PrecomputedTransmissionModel {
+                        cross_sections: Arc::new(xs),
+                        density_indices,
+                    };
+                    lm::levenberg_marquardt(&precomputed, &t_owned, &s_owned, &mut params, &config)
+                };
 
                 let densities: Vec<f64> = (0..n_isotopes).map(|i| lm_result.params[i]).collect();
 
@@ -1609,14 +1625,24 @@ fn py_spatial_map(
                 compute_covariance: true,
             };
 
-            // Clone arrays only after all validation passes
+            // Clone arrays only after all validation passes.
+            // The .to_owned() is necessary because py.detach() releases the GIL and
+            // the closure needs 'static data; numpy views borrow GIL-protected memory.
             let trans = transmission.as_array().to_owned();
             let unc = uncertainty.as_array().to_owned();
             let dead = dead_pixels.map(|d| d.as_array().to_owned());
 
             // Release the GIL for the heavy per-pixel fitting.
+            // Pass views into spatial_map to avoid a second deep copy — the function
+            // internally transposes into its own owned layout.
             let result = py.detach(move || {
-                nereids_pipeline::spatial::spatial_map(&trans, &unc, &config, dead.as_ref(), None)
+                nereids_pipeline::spatial::spatial_map(
+                    trans.view(),
+                    unc.view(),
+                    &config,
+                    dead.as_ref(),
+                    None,
+                )
             });
             let result =
                 result.map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
@@ -1854,15 +1880,19 @@ fn py_fit_roi(
         compute_covariance: true,
     };
 
-    // Clone arrays only after all validation passes
+    // Clone arrays only after all validation passes.
+    // The .to_owned() is necessary because py.detach() releases the GIL and
+    // the closure needs 'static data; numpy views borrow GIL-protected memory.
     let trans = transmission.as_array().to_owned();
     let unc = uncertainty.as_array().to_owned();
 
     // Release the GIL for the heavy ROI fitting.
+    // Pass views into fit_roi to avoid a second deep copy — the function
+    // internally slices and transposes into its own owned layout.
     let result = py.detach(move || {
         nereids_pipeline::spatial::fit_roi(
-            &trans,
-            &unc,
+            trans.view(),
+            unc.view(),
             y_range.0..y_range.1,
             x_range.0..x_range.1,
             &config,
