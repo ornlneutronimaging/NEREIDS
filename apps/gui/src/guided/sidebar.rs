@@ -50,7 +50,11 @@ pub fn guided_sidebar(ctx: &egui::Context, state: &mut AppState) {
                                 number.to_string()
                             },
                             egui::FontId::proportional(12.0),
-                            egui::Color32::WHITE,
+                            if is_current || is_complete {
+                                egui::Color32::WHITE
+                            } else {
+                                colors.fg
+                            },
                         );
 
                         // Step label

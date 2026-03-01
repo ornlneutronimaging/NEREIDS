@@ -91,7 +91,10 @@ pub fn apply_theme(ctx: &egui::Context, preference: ThemePreference) {
     let is_dark = match preference {
         ThemePreference::Dark => true,
         ThemePreference::Light => false,
-        ThemePreference::Auto => ctx.system_theme().is_none_or(|t| t == egui::Theme::Dark),
+        ThemePreference::Auto => match ctx.system_theme() {
+            Some(theme) => theme == egui::Theme::Dark,
+            None => ctx.style().visuals.dark_mode,
+        },
     };
 
     let colors = ThemeColors::from_dark_mode(is_dark);

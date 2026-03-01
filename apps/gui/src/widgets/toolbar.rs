@@ -34,51 +34,51 @@ pub fn toolbar(ctx: &egui::Context, state: &mut AppState) {
                 ui.selectable_value(&mut state.ui_mode, UiMode::Guided, "Guided");
                 ui.selectable_value(&mut state.ui_mode, UiMode::Studio, "Studio");
 
-                // Flexible spacer
-                ui.add_space((ui.available_width() - 250.0).max(0.0));
+                // Trailing controls right-aligned
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Theme selector (rightmost)
+                    egui::ComboBox::from_id_salt("theme_toggle")
+                        .width(60.0)
+                        .selected_text(match state.theme_preference {
+                            ThemePreference::Auto => "Auto",
+                            ThemePreference::Light => "Light",
+                            ThemePreference::Dark => "Dark",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut state.theme_preference,
+                                ThemePreference::Auto,
+                                "Auto",
+                            );
+                            ui.selectable_value(
+                                &mut state.theme_preference,
+                                ThemePreference::Light,
+                                "Light",
+                            );
+                            ui.selectable_value(
+                                &mut state.theme_preference,
+                                ThemePreference::Dark,
+                                "Dark",
+                            );
+                        });
 
-                // Progress indicator
-                if state.is_fitting {
-                    ui.spinner();
-                    ui.label(
-                        egui::RichText::new("Fitting...")
-                            .small()
-                            .color(semantic::ORANGE),
-                    );
-                } else if state.is_fetching_endf {
-                    ui.spinner();
-                    ui.label(
-                        egui::RichText::new("Fetching ENDF...")
-                            .small()
-                            .color(semantic::ORANGE),
-                    );
-                }
-
-                // Theme selector
-                egui::ComboBox::from_id_salt("theme_toggle")
-                    .width(60.0)
-                    .selected_text(match state.theme_preference {
-                        ThemePreference::Auto => "Auto",
-                        ThemePreference::Light => "Light",
-                        ThemePreference::Dark => "Dark",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut state.theme_preference,
-                            ThemePreference::Auto,
-                            "Auto",
+                    // Progress indicator
+                    if state.is_fitting {
+                        ui.label(
+                            egui::RichText::new("Fitting...")
+                                .small()
+                                .color(semantic::ORANGE),
                         );
-                        ui.selectable_value(
-                            &mut state.theme_preference,
-                            ThemePreference::Light,
-                            "Light",
+                        ui.spinner();
+                    } else if state.is_fetching_endf {
+                        ui.label(
+                            egui::RichText::new("Fetching ENDF...")
+                                .small()
+                                .color(semantic::ORANGE),
                         );
-                        ui.selectable_value(
-                            &mut state.theme_preference,
-                            ThemePreference::Dark,
-                            "Dark",
-                        );
-                    });
+                        ui.spinner();
+                    }
+                });
             });
         });
 }
