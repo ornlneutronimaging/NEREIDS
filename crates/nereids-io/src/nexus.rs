@@ -426,7 +426,7 @@ mod tests {
         let path = dir.path().join("test.h5");
 
         // 1 rot angle, 2x3 spatial, 4 TOF bins → shape [1, 2, 3, 4]
-        let counts = vec![0u64; 1 * 2 * 3 * 4];
+        let counts = vec![0u64; 24];
         let tof_ns = vec![1000.0, 2000.0, 3000.0, 4000.0, 5000.0]; // 5 edges for 4 bins
         create_test_histogram(&path, &counts, [1, 2, 3, 4], &tof_ns, Some(25.0));
 
@@ -478,7 +478,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.h5");
 
-        let counts = vec![0u64; 1 * 1 * 1 * 3];
+        let counts = vec![0u64; 3];
         let tof_ns = vec![500_000.0, 1_000_000.0, 1_500_000.0, 2_000_000.0];
         create_test_histogram(&path, &counts, [1, 1, 1, 3], &tof_ns, None);
 

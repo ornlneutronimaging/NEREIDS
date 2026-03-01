@@ -131,6 +131,9 @@ fn step_is_complete(step: GuidedStep, state: &AppState) -> bool {
             InputMode::TransmissionTiff => {
                 state.sample_data.is_some() && state.spectrum_values.is_some()
             }
+            InputMode::Hdf5Histogram | InputMode::Hdf5Event => {
+                state.sample_data.is_some() && state.spectrum_values.is_some()
+            }
         },
         GuidedStep::Configure => state
             .isotope_entries

@@ -21,10 +21,12 @@ pub fn load_step(ui: &mut egui::Ui, state: &mut AppState) {
             InputMode::TransmissionTiff,
             "Transmission TIFF",
         );
-        ui.add_enabled_ui(false, |ui| {
-            ui.label("HDF5 Event");
-            ui.label("HDF5 Histogram");
-        });
+        ui.selectable_value(
+            &mut state.input_mode,
+            InputMode::Hdf5Histogram,
+            "HDF5 Histogram",
+        );
+        ui.selectable_value(&mut state.input_mode, InputMode::Hdf5Event, "HDF5 Event");
     });
     if state.input_mode != prev_mode {
         state.invalidate_results();
@@ -37,6 +39,8 @@ pub fn load_step(ui: &mut egui::Ui, state: &mut AppState) {
     match state.input_mode {
         InputMode::TiffPair => tiff_pair_tab(ui, state),
         InputMode::TransmissionTiff => transmission_tiff_tab(ui, state),
+        InputMode::Hdf5Histogram => hdf5_histogram_tab(ui, state),
+        InputMode::Hdf5Event => hdf5_event_tab(ui, state),
     }
 }
 
@@ -241,6 +245,227 @@ fn show_loaded_info(ui: &mut egui::Ui, state: &AppState) {
             "Open Beam: {} frames, {}×{} px",
             shape[0], shape[1], shape[2]
         ));
+    }
+}
+
+/// HDF5 Histogram tab: load pre-histogrammed NeXus data.
+fn hdf5_histogram_tab(ui: &mut egui::Ui, state: &mut AppState) {
+    ui.label("Browse for a NeXus/HDF5 file containing histogram data.");
+    hdf5_browse_row(ui, state);
+    show_nexus_metadata(ui, state);
+
+    if state.hdf5_path.is_some()
+        && state
+            .nexus_metadata
+            .as_ref()
+            .is_some_and(|m| m.has_histogram)
+    {
+        ui.add_space(8.0);
+        if ui.button("Load Histogram").clicked() {
+            load_hdf5_histogram(state);
+        }
+    }
+
+    show_loaded_info(ui, state);
+}
+
+/// HDF5 Event tab: load raw neutron events and histogram them.
+fn hdf5_event_tab(ui: &mut egui::Ui, state: &mut AppState) {
+    ui.label("Browse for a NeXus/HDF5 file containing neutron event data.");
+    hdf5_browse_row(ui, state);
+    show_nexus_metadata(ui, state);
+
+    if state.hdf5_path.is_some() && state.nexus_metadata.as_ref().is_some_and(|m| m.has_events) {
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("Event Binning Parameters").strong());
+        ui.horizontal(|ui| {
+            ui.label("TOF bins:");
+            ui.add(egui::DragValue::new(&mut state.event_n_bins).range(1..=10000));
+        });
+        ui.horizontal(|ui| {
+            ui.label("TOF min (µs):");
+            ui.add(egui::DragValue::new(&mut state.event_tof_min_us).speed(10.0));
+        });
+        ui.horizontal(|ui| {
+            ui.label("TOF max (µs):");
+            ui.add(egui::DragValue::new(&mut state.event_tof_max_us).speed(10.0));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Height (px):");
+            ui.add(egui::DragValue::new(&mut state.event_height).range(1..=4096));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Width (px):");
+            ui.add(egui::DragValue::new(&mut state.event_width).range(1..=4096));
+        });
+
+        ui.add_space(4.0);
+        if ui.button("Histogram Events").clicked() {
+            load_hdf5_events(state);
+        }
+    }
+
+    show_loaded_info(ui, state);
+}
+
+/// HDF5 file browse row with probe.
+fn hdf5_browse_row(ui: &mut egui::Ui, state: &mut AppState) {
+    ui.horizontal(|ui| {
+        ui.label("File:");
+        if let Some(ref p) = state.hdf5_path {
+            ui.label(
+                p.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+            );
+        } else {
+            ui.label("(none)");
+        }
+        if ui.button("Browse...").clicked()
+            && let Some(file) = rfd::FileDialog::new()
+                .add_filter("NeXus/HDF5", &["h5", "hdf5", "nxs", "nx5"])
+                .pick_file()
+        {
+            state.hdf5_path = Some(file.clone());
+            state.invalidate_results();
+            state.sample_data = None;
+            state.open_beam_data = None;
+
+            // Probe the file immediately
+            match nereids_io::nexus::probe_nexus(&file) {
+                Ok(meta) => {
+                    // Auto-fill event binning from metadata if available
+                    if let Some(shape) = meta.histogram_shape {
+                        state.event_height = shape[1];
+                        state.event_width = shape[2];
+                    }
+                    state.nexus_metadata = Some(meta);
+                    state.status_message = "NeXus file probed".into();
+                }
+                Err(e) => {
+                    state.nexus_metadata = None;
+                    state.status_message = format!("Probe failed: {e}");
+                }
+            }
+        }
+    });
+}
+
+/// Display probed NeXus metadata.
+fn show_nexus_metadata(ui: &mut egui::Ui, state: &AppState) {
+    if let Some(ref meta) = state.nexus_metadata {
+        ui.add_space(4.0);
+        if meta.has_histogram {
+            if let Some(shape) = meta.histogram_shape {
+                ui.label(format!(
+                    "Histogram: {}×{}×{} (rot×y×x), {} TOF bins",
+                    shape[0], shape[1], shape[2], shape[3]
+                ));
+            }
+        } else {
+            ui.label("No histogram data.");
+        }
+
+        if meta.has_events {
+            if let Some(n) = meta.n_events {
+                ui.label(format!("Events: {} neutrons", n));
+            }
+        } else {
+            ui.label("No event data.");
+        }
+
+        if let Some(fp) = meta.flight_path_m {
+            ui.label(format!("Flight path: {:.2} m", fp));
+        }
+    }
+}
+
+/// Load histogram data from HDF5 file.
+fn load_hdf5_histogram(state: &mut AppState) {
+    let path = match state.hdf5_path {
+        Some(ref p) => p.clone(),
+        None => return,
+    };
+
+    state.invalidate_results();
+
+    match nereids_io::nexus::load_nexus_histogram(&path) {
+        Ok(data) => {
+            let shape = data.counts.shape();
+            state.preview_image = Some(data.counts.sum_axis(ndarray::Axis(0)));
+            state.status_message = format!(
+                "HDF5 histogram loaded: {} frames, {}×{} px",
+                shape[0], shape[1], shape[2]
+            );
+
+            // Populate spectrum values from TOF edges
+            state.spectrum_values = Some(data.tof_edges_us.clone());
+            state.spectrum_unit = nereids_io::spectrum::SpectrumUnit::TofMicroseconds;
+            state.spectrum_kind = nereids_io::spectrum::SpectrumValueKind::BinEdges;
+
+            // Set flight path if available
+            if let Some(fp) = data.flight_path_m {
+                state.beamline.flight_path_m = fp;
+            }
+
+            if let Some(dead) = data.dead_pixels {
+                state.dead_pixels = Some(dead);
+            }
+
+            state.sample_data = Some(data.counts);
+        }
+        Err(e) => {
+            state.status_message = format!("HDF5 load failed: {e}");
+        }
+    }
+}
+
+/// Load event data from HDF5 file with histogramming.
+fn load_hdf5_events(state: &mut AppState) {
+    let path = match state.hdf5_path {
+        Some(ref p) => p.clone(),
+        None => return,
+    };
+
+    state.invalidate_results();
+
+    let params = nereids_io::nexus::EventBinningParams {
+        n_bins: state.event_n_bins,
+        tof_min_us: state.event_tof_min_us,
+        tof_max_us: state.event_tof_max_us,
+        height: state.event_height,
+        width: state.event_width,
+    };
+
+    match nereids_io::nexus::load_nexus_events(&path, &params) {
+        Ok(data) => {
+            let shape = data.counts.shape();
+            state.preview_image = Some(data.counts.sum_axis(ndarray::Axis(0)));
+            state.status_message = format!(
+                "Events histogrammed: {} bins, {}×{} px",
+                shape[0], shape[1], shape[2]
+            );
+
+            // Populate spectrum values from TOF edges
+            state.spectrum_values = Some(data.tof_edges_us.clone());
+            state.spectrum_unit = nereids_io::spectrum::SpectrumUnit::TofMicroseconds;
+            state.spectrum_kind = nereids_io::spectrum::SpectrumValueKind::BinEdges;
+
+            // Set flight path if available
+            if let Some(fp) = data.flight_path_m {
+                state.beamline.flight_path_m = fp;
+            }
+
+            if let Some(dead) = data.dead_pixels {
+                state.dead_pixels = Some(dead);
+            }
+
+            state.sample_data = Some(data.counts);
+        }
+        Err(e) => {
+            state.status_message = format!("Event histogramming failed: {e}");
+        }
     }
 }
 

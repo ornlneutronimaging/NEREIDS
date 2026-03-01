@@ -29,9 +29,11 @@ use std::sync::mpsc;
 /// +-----------------------+-----------------------+-----------------------+
 /// ```
 pub fn analyze_step(ui: &mut egui::Ui, state: &mut AppState) {
-    // Auto-prepare TransmissionTiff data if the user skipped the Normalize step.
-    if state.input_mode == InputMode::TransmissionTiff
-        && state.normalized.is_none()
+    // Auto-prepare pre-normalized data if the user skipped the Normalize step.
+    if matches!(
+        state.input_mode,
+        InputMode::TransmissionTiff | InputMode::Hdf5Histogram | InputMode::Hdf5Event
+    ) && state.normalized.is_none()
         && state.sample_data.is_some()
         && state.spectrum_values.is_some()
     {
