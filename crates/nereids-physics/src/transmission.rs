@@ -143,6 +143,16 @@ pub fn beer_lambert_multi(
     }
 
     let n_energies = cross_sections_per_isotope[0].len();
+    for (k, sigma) in cross_sections_per_isotope.iter().enumerate() {
+        if sigma.len() != n_energies {
+            return Err(TransmissionError::InputMismatch(format!(
+                "cross_sections_per_isotope[{}] length ({}) must match [0] length ({})",
+                k,
+                sigma.len(),
+                n_energies
+            )));
+        }
+    }
 
     Ok((0..n_energies)
         .map(|i| {
