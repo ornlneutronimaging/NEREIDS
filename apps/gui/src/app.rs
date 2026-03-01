@@ -1,7 +1,10 @@
 //! Main application structure and egui App implementation.
 
-use crate::panels;
-use crate::state::{AppState, Tab};
+use crate::guided;
+use crate::state::{AppState, Tab, UiMode};
+use crate::studio;
+use crate::theme;
+use crate::widgets;
 
 /// NEREIDS desktop application.
 pub struct NereidsApp {
@@ -18,6 +21,9 @@ impl NereidsApp {
 
 impl eframe::App for NereidsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Apply theme
+        theme::apply_theme(ctx, self.state.theme_preference);
+
         // Poll background tasks
         poll_pending_tasks(&mut self.state);
 
@@ -37,45 +43,26 @@ impl eframe::App for NereidsApp {
             });
         }
 
-        // Left sidebar: data loading
-        egui::SidePanel::left("data_panel")
-            .default_width(280.0)
-            .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    panels::data::data_panel(ui, &mut self.state);
-                });
-            });
-
-        // Right sidebar: fitting controls
-        egui::SidePanel::right("fitting_panel")
-            .default_width(260.0)
-            .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    panels::fitting::fitting_panel(ui, &mut self.state);
-                });
-            });
+        // Top toolbar
+        widgets::toolbar::toolbar(ctx, &mut self.state);
 
         // Bottom status bar
-        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(&self.state.status_message);
-            });
-        });
+        widgets::statusbar::status_bar(ctx, &self.state);
 
-        // Central panel: spectrum or map
-        egui::CentralPanel::default().show(ctx, |ui| {
-            // Tab bar
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.state.active_tab, Tab::Spectrum, "Spectrum");
-                ui.selectable_value(&mut self.state.active_tab, Tab::Map, "Map");
-            });
-            ui.separator();
-
-            match self.state.active_tab {
-                Tab::Spectrum => panels::spectrum::spectrum_panel(ui, &mut self.state),
-                Tab::Map => panels::map::map_panel(ui, &mut self.state),
+        // Main content area
+        match self.state.ui_mode {
+            UiMode::Guided => {
+                guided::sidebar::guided_sidebar(ctx, &mut self.state);
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        guided::guided_content(ui, &mut self.state);
+                    });
+                });
             }
-        });
+            UiMode::Studio => {
+                studio::studio_content(ctx, &mut self.state);
+            }
+        }
     }
 }
 
