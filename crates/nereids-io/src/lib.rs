@@ -13,6 +13,8 @@
 //! - `pleiades/processing/helper_ornl.py` for data loading
 
 pub mod error;
+#[cfg(feature = "hdf5")]
+pub mod nexus;
 pub mod normalization;
 pub mod spectrum;
 pub mod tiff_stack;
