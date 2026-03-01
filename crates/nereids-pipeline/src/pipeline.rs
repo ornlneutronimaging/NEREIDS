@@ -212,21 +212,21 @@ pub fn fit_spectrum(
                 cross_sections: xs.clone(),
                 density_indices: Arc::new((0..n_isotopes).collect()),
             };
-            lm::levenberg_marquardt(&model, measured_t, sigma, &mut params, &lm_config)
+            lm::levenberg_marquardt(&model, measured_t, sigma, &mut params, &lm_config)?
         } else {
             let instrument = config
                 .resolution
                 .clone()
                 .map(|r| Arc::new(InstrumentParams { resolution: r }));
-            let model = TransmissionFitModel {
-                energies: config.energies.clone(),
-                resonance_data: config.resonance_data.clone(),
-                temperature_k: config.temperature_k,
+            let model = TransmissionFitModel::new(
+                config.energies.clone(),
+                config.resonance_data.clone(),
+                config.temperature_k,
                 instrument,
-                density_indices: (0..n_isotopes).collect(),
-                temperature_index: None,
-            };
-            lm::levenberg_marquardt(&model, measured_t, sigma, &mut params, &lm_config)
+                (0..n_isotopes).collect(),
+                None,
+            )?;
+            lm::levenberg_marquardt(&model, measured_t, sigma, &mut params, &lm_config)?
         }
     } else {
         // Temperature fitting: always use the full TransmissionFitModel
@@ -235,15 +235,15 @@ pub fn fit_spectrum(
             .resolution
             .clone()
             .map(|r| Arc::new(InstrumentParams { resolution: r }));
-        let model = TransmissionFitModel {
-            energies: config.energies.clone(),
-            resonance_data: config.resonance_data.clone(),
-            temperature_k: config.temperature_k,
+        let model = TransmissionFitModel::new(
+            config.energies.clone(),
+            config.resonance_data.clone(),
+            config.temperature_k,
             instrument,
-            density_indices: (0..n_isotopes).collect(),
+            (0..n_isotopes).collect(),
             temperature_index,
-        };
-        lm::levenberg_marquardt(&model, measured_t, sigma, &mut params, &lm_config)
+        )?;
+        lm::levenberg_marquardt(&model, measured_t, sigma, &mut params, &lm_config)?
     };
 
     let densities: Vec<f64> = (0..n_isotopes).map(|i| result.params[i]).collect();
@@ -307,14 +307,15 @@ mod tests {
         let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
 
         // Generate synthetic data using the forward model
-        let model = TransmissionFitModel {
-            energies: energies.clone(),
-            resonance_data: vec![data.clone()],
-            temperature_k: 0.0,
-            instrument: None,
-            density_indices: vec![0],
-            temperature_index: None,
-        };
+        let model = TransmissionFitModel::new(
+            energies.clone(),
+            vec![data.clone()],
+            0.0,
+            None,
+            vec![0],
+            None,
+        )
+        .unwrap();
         let y_obs = model.evaluate(&[true_density]);
         let sigma = vec![0.01; y_obs.len()];
 
@@ -354,14 +355,15 @@ mod tests {
         let true_density = 0.0005;
         let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
 
-        let model = TransmissionFitModel {
-            energies: energies.clone(),
-            resonance_data: vec![data.clone()],
-            temperature_k: 0.0,
-            instrument: None,
-            density_indices: vec![0],
-            temperature_index: None,
-        };
+        let model = TransmissionFitModel::new(
+            energies.clone(),
+            vec![data.clone()],
+            0.0,
+            None,
+            vec![0],
+            None,
+        )
+        .unwrap();
         let y_obs = model.evaluate(&[true_density]);
         let sigma = vec![0.01; y_obs.len()];
 

@@ -71,6 +71,34 @@ impl fmt::Display for DopplerParamsError {
 
 impl std::error::Error for DopplerParamsError {}
 
+/// Errors from Doppler broadening computation (not parameter construction).
+#[derive(Debug)]
+pub enum DopplerError {
+    /// Energy and cross-section arrays have different lengths.
+    LengthMismatch {
+        /// Number of energy points.
+        energies: usize,
+        /// Number of cross-section values.
+        cross_sections: usize,
+    },
+}
+
+impl fmt::Display for DopplerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LengthMismatch {
+                energies,
+                cross_sections,
+            } => write!(
+                f,
+                "energies length ({energies}) must match cross_sections length ({cross_sections})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DopplerError {}
+
 /// Doppler broadening parameters.
 #[derive(Debug, Clone, Copy)]
 pub struct DopplerParams {
@@ -154,16 +182,21 @@ pub fn doppler_broaden(
     energies: &[f64],
     cross_sections: &[f64],
     params: &DopplerParams,
-) -> Vec<f64> {
-    assert_eq!(energies.len(), cross_sections.len());
+) -> Result<Vec<f64>, DopplerError> {
+    if energies.len() != cross_sections.len() {
+        return Err(DopplerError::LengthMismatch {
+            energies: energies.len(),
+            cross_sections: cross_sections.len(),
+        });
+    }
 
     if params.temperature_k() <= 0.0 || energies.is_empty() {
-        return cross_sections.to_vec();
+        return Ok(cross_sections.to_vec());
     }
 
     let u = params.u();
     if u < NEAR_ZERO_FLOOR {
-        return cross_sections.to_vec();
+        return Ok(cross_sections.to_vec());
     }
 
     let n = energies.len();
@@ -344,7 +377,7 @@ pub fn doppler_broaden(
         }
     }
 
-    broadened
+    Ok(broadened)
 }
 
 /// Linear interpolation of cross-section at an arbitrary energy.
@@ -537,7 +570,7 @@ mod tests {
         let energies = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let xs = vec![10.0, 20.0, 30.0, 20.0, 10.0];
         let params = DopplerParams::new(0.0, 238.0).unwrap();
-        let broadened = doppler_broaden(&energies, &xs, &params);
+        let broadened = doppler_broaden(&energies, &xs, &params).unwrap();
         assert_eq!(broadened, xs);
     }
 
@@ -558,7 +591,7 @@ mod tests {
             .collect();
 
         let params = DopplerParams::new(300.0, 238.0).unwrap();
-        let broadened = doppler_broaden(&energies, &xs, &params);
+        let broadened = doppler_broaden(&energies, &xs, &params).unwrap();
 
         // Find peaks
         let orig_peak = xs.iter().cloned().fold(0.0_f64, f64::max);
@@ -656,7 +689,7 @@ mod tests {
 
         // Apply FGM Doppler broadening.
         let params = DopplerParams::new(300.0, 10.0).unwrap();
-        let broadened = doppler_broaden(&energies, &unbroadened, &params);
+        let broadened = doppler_broaden(&energies, &unbroadened, &params).unwrap();
 
         // SAMMY ex001a.lst reference points: (energy, broadened capture σ in barns).
         // Focus on the core region where our grid has good coverage.
@@ -724,7 +757,7 @@ mod tests {
             .collect();
 
         let params = DopplerParams::new(300.0, 100.0).unwrap();
-        let broadened = doppler_broaden(&energies, &xs, &params);
+        let broadened = doppler_broaden(&energies, &xs, &params).unwrap();
 
         // Compute area (trapezoidal) for both
         let area_orig: f64 = (0..n - 1)

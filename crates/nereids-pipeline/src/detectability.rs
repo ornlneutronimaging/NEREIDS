@@ -29,8 +29,10 @@
 use nereids_core::elements;
 use nereids_endf::resonance::ResonanceData;
 use nereids_physics::resolution::ResolutionFunction;
-use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
+use nereids_physics::transmission::{self, InstrumentParams, SampleParams, TransmissionError};
 use rayon::prelude::*;
+
+use crate::error::PipelineError;
 
 /// Result of a trace-detectability analysis for a single matrix+trace pair.
 #[derive(Debug, Clone)]
@@ -89,15 +91,12 @@ fn build_instrument(config: &TraceDetectabilityConfig) -> Option<InstrumentParam
 fn matrix_baseline(
     config: &TraceDetectabilityConfig,
     instrument: Option<&InstrumentParams>,
-) -> Vec<f64> {
+) -> Result<Vec<f64>, TransmissionError> {
     let sample_matrix = SampleParams {
         temperature_k: config.temperature_k,
         isotopes: vec![(config.matrix.clone(), config.matrix_density)],
     };
-    // forward_model fails for unsorted energies or invalid Doppler params,
-    // both configuration bugs caught before the analysis runs.
     transmission::forward_model(config.energies, &sample_matrix, instrument)
-        .expect("matrix_baseline: forward_model failed (energy grid must be sorted ascending and Doppler params must be valid)")
 }
 
 /// Build a report from a precomputed matrix-only baseline and a trace isotope.
@@ -107,7 +106,7 @@ fn report_from_baseline(
     t_matrix: &[f64],
     trace: &ResonanceData,
     trace_ppm: f64,
-) -> TraceDetectabilityReport {
+) -> Result<TraceDetectabilityReport, TransmissionError> {
     // T_combined: transmission through matrix + trace
     let trace_density = trace_ppm * 1e-6 * config.matrix_density;
     let sample_combined = SampleParams {
@@ -117,8 +116,7 @@ fn report_from_baseline(
             (trace.clone(), trace_density),
         ],
     };
-    let t_combined = transmission::forward_model(config.energies, &sample_combined, instrument)
-        .expect("report_from_baseline: forward_model failed (energy grid must be sorted ascending and Doppler params must be valid)");
+    let t_combined = transmission::forward_model(config.energies, &sample_combined, instrument)?;
 
     // |ΔT| spectrum — absolute difference, sign discarded (see module docs).
     let delta_t_spectrum: Vec<f64> = t_matrix
@@ -155,14 +153,14 @@ fn report_from_baseline(
         0.0
     };
 
-    TraceDetectabilityReport {
+    Ok(TraceDetectabilityReport {
         peak_delta_t_per_ppm,
         peak_energy_ev,
         peak_snr,
         detectable: peak_snr > config.snr_threshold,
         delta_t_spectrum,
         energies: config.energies.to_vec(),
-    }
+    })
 }
 
 /// Compute trace-detectability for a single matrix+trace isotope pair.
@@ -193,10 +191,16 @@ pub fn trace_detectability(
     config: &TraceDetectabilityConfig,
     trace: &ResonanceData,
     trace_ppm: f64,
-) -> TraceDetectabilityReport {
+) -> Result<TraceDetectabilityReport, PipelineError> {
     let instrument = build_instrument(config);
-    let t_matrix = matrix_baseline(config, instrument.as_ref());
-    report_from_baseline(config, instrument.as_ref(), &t_matrix, trace, trace_ppm)
+    let t_matrix = matrix_baseline(config, instrument.as_ref())?;
+    Ok(report_from_baseline(
+        config,
+        instrument.as_ref(),
+        &t_matrix,
+        trace,
+        trace_ppm,
+    )?)
 }
 
 /// Survey multiple trace candidates against a single matrix.
@@ -215,10 +219,10 @@ pub fn trace_detectability_survey(
     config: &TraceDetectabilityConfig,
     trace_candidates: &[ResonanceData],
     trace_ppm: f64,
-) -> Vec<(String, TraceDetectabilityReport)> {
+) -> Result<Vec<(String, TraceDetectabilityReport)>, PipelineError> {
     // Build instrument and matrix baseline once for all candidates.
     let instrument = build_instrument(config);
-    let t_matrix = matrix_baseline(config, instrument.as_ref());
+    let t_matrix = matrix_baseline(config, instrument.as_ref())?;
 
     let mut results: Vec<(String, TraceDetectabilityReport)> = trace_candidates
         .par_iter()
@@ -228,11 +232,11 @@ pub fn trace_detectability_survey(
                 .unwrap_or_else(|| format!("Z{}-{}", trace.isotope.z(), trace.isotope.a()));
 
             let report =
-                report_from_baseline(config, instrument.as_ref(), &t_matrix, trace, trace_ppm);
+                report_from_baseline(config, instrument.as_ref(), &t_matrix, trace, trace_ppm)?;
 
-            (name, report)
+            Ok((name, report))
         })
-        .collect();
+        .collect::<Result<Vec<_>, TransmissionError>>()?;
 
     // Sort by peak_snr descending
     results.sort_by(|(_, a), (_, b)| {
@@ -241,7 +245,7 @@ pub fn trace_detectability_survey(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    results
+    Ok(results)
 }
 
 #[cfg(test)]
@@ -288,7 +292,7 @@ mod tests {
             snr_threshold: 3.0,
         };
 
-        let report = trace_detectability(&config, &mn55, 2000.0);
+        let report = trace_detectability(&config, &mn55, 2000.0).unwrap();
 
         assert!(
             !report.detectable,
@@ -319,7 +323,7 @@ mod tests {
             snr_threshold: 3.0,
         };
 
-        let report = trace_detectability(&config, &hf178, 500.0);
+        let report = trace_detectability(&config, &hf178, 500.0).unwrap();
 
         assert!(
             !report.detectable,
@@ -352,7 +356,7 @@ mod tests {
             snr_threshold: 3.0,
         };
 
-        let report = trace_detectability(&config, &hf178, 500.0);
+        let report = trace_detectability(&config, &hf178, 500.0).unwrap();
 
         assert!(
             report.detectable,
@@ -389,7 +393,7 @@ mod tests {
         };
 
         // Hf-178 has strong resonances in 1-50 eV; Fe-56 does not
-        let results = trace_detectability_survey(&config, &[fe56, hf178], 500.0);
+        let results = trace_detectability_survey(&config, &[fe56, hf178], 500.0).unwrap();
 
         assert_eq!(results.len(), 2);
         // Results should be sorted by peak_snr descending
@@ -465,7 +469,7 @@ mod tests {
             snr_threshold: 3.0,
         };
 
-        let report = trace_detectability(&config, &trace, 1000.0);
+        let report = trace_detectability(&config, &trace, 1000.0).unwrap();
 
         // Basic sanity: spectrum has correct length
         assert_eq!(report.delta_t_spectrum.len(), energies.len());
@@ -512,7 +516,8 @@ mod tests {
         };
 
         // Pass weak first — survey should reorder by SNR descending
-        let results = trace_detectability_survey(&config, &[weak_trace, strong_trace], 500.0);
+        let results =
+            trace_detectability_survey(&config, &[weak_trace, strong_trace], 500.0).unwrap();
 
         assert_eq!(results.len(), 2);
         assert!(

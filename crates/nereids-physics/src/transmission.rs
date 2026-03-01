@@ -40,8 +40,12 @@ pub enum TransmissionError {
     Resolution(ResolutionError),
     /// Doppler broadening parameter validation failed.
     Doppler(DopplerParamsError),
+    /// Doppler broadening input validation failed (e.g. length mismatch).
+    DopplerBroadening(crate::doppler::DopplerError),
     /// Computation was cancelled via the cancel token.
     Cancelled,
+    /// Input array mismatch (e.g. cross-sections vs thicknesses length).
+    InputMismatch(String),
 }
 
 impl fmt::Display for TransmissionError {
@@ -49,7 +53,9 @@ impl fmt::Display for TransmissionError {
         match self {
             Self::Resolution(e) => write!(f, "resolution broadening error: {}", e),
             Self::Doppler(e) => write!(f, "Doppler parameter error: {}", e),
+            Self::DopplerBroadening(e) => write!(f, "Doppler broadening error: {}", e),
             Self::Cancelled => write!(f, "computation cancelled"),
+            Self::InputMismatch(msg) => write!(f, "input mismatch: {}", msg),
         }
     }
 }
@@ -59,7 +65,9 @@ impl std::error::Error for TransmissionError {
         match self {
             Self::Resolution(e) => Some(e),
             Self::Doppler(e) => Some(e),
+            Self::DopplerBroadening(e) => Some(e),
             Self::Cancelled => None,
+            Self::InputMismatch(_) => None,
         }
     }
 }
@@ -73,6 +81,12 @@ impl From<ResolutionError> for TransmissionError {
 impl From<DopplerParamsError> for TransmissionError {
     fn from(e: DopplerParamsError) -> Self {
         Self::Doppler(e)
+    }
+}
+
+impl From<crate::doppler::DopplerError> for TransmissionError {
+    fn from(e: crate::doppler::DopplerError) -> Self {
+        Self::DopplerBroadening(e)
     }
 }
 
@@ -111,13 +125,36 @@ pub fn beer_lambert(cross_sections: &[f64], thickness: f64) -> Vec<f64> {
 ///
 /// # Returns
 /// Combined transmission values at each energy point.
-pub fn beer_lambert_multi(cross_sections_per_isotope: &[&[f64]], thicknesses: &[f64]) -> Vec<f64> {
-    assert_eq!(cross_sections_per_isotope.len(), thicknesses.len());
-    assert!(!cross_sections_per_isotope.is_empty());
+pub fn beer_lambert_multi(
+    cross_sections_per_isotope: &[&[f64]],
+    thicknesses: &[f64],
+) -> Result<Vec<f64>, TransmissionError> {
+    if cross_sections_per_isotope.len() != thicknesses.len() {
+        return Err(TransmissionError::InputMismatch(format!(
+            "cross_sections_per_isotope length ({}) must match thicknesses length ({})",
+            cross_sections_per_isotope.len(),
+            thicknesses.len()
+        )));
+    }
+    if cross_sections_per_isotope.is_empty() {
+        return Err(TransmissionError::InputMismatch(
+            "cross_sections_per_isotope must not be empty".into(),
+        ));
+    }
 
     let n_energies = cross_sections_per_isotope[0].len();
+    for (k, sigma) in cross_sections_per_isotope.iter().enumerate() {
+        if sigma.len() != n_energies {
+            return Err(TransmissionError::InputMismatch(format!(
+                "cross_sections_per_isotope[{}] length ({}) must match [0] length ({})",
+                k,
+                sigma.len(),
+                n_energies
+            )));
+        }
+    }
 
-    (0..n_energies)
+    Ok((0..n_energies)
         .map(|i| {
             let total_attenuation: f64 = cross_sections_per_isotope
                 .iter()
@@ -126,7 +163,7 @@ pub fn beer_lambert_multi(cross_sections_per_isotope: &[&[f64]], thicknesses: &[
                 .sum();
             (-total_attenuation).exp()
         })
-        .collect()
+        .collect())
 }
 
 /// Sample description for the forward model.
@@ -197,7 +234,7 @@ pub fn forward_model(
             // 2. Apply Doppler broadening
             let after_doppler = if sample.temperature_k > 0.0 {
                 let doppler_params = DopplerParams::new(sample.temperature_k, res_data.awr)?;
-                doppler::doppler_broaden(energies, &unbroadened, &doppler_params)
+                doppler::doppler_broaden(energies, &unbroadened, &doppler_params)?
             } else {
                 unbroadened
             };
@@ -286,7 +323,7 @@ pub fn broadened_cross_sections(
             // 2. Doppler broadening
             let after_doppler = if temperature_k > 0.0 {
                 let params = DopplerParams::new(temperature_k, rd.awr)?;
-                doppler::doppler_broaden(energies, &unbroadened, &params)
+                doppler::doppler_broaden(energies, &unbroadened, &params)?
             } else {
                 unbroadened
             };
@@ -440,7 +477,7 @@ mod tests {
         // T = exp(-(1.0 + 1.0)) = exp(-2.0)
         let xs1 = vec![100.0];
         let xs2 = vec![200.0];
-        let t = beer_lambert_multi(&[&xs1, &xs2], &[0.01, 0.005]);
+        let t = beer_lambert_multi(&[&xs1, &xs2], &[0.01, 0.005]).unwrap();
         assert!(
             (t[0] - (-2.0_f64).exp()).abs() < 1e-10,
             "T = {}, expected {}",

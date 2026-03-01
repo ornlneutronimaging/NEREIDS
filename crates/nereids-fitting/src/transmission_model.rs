@@ -9,6 +9,7 @@ use std::sync::Arc;
 use nereids_endf::resonance::ResonanceData;
 use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
 
+use crate::error::FittingError;
 use crate::lm::{FitModel, FlatMatrix};
 
 /// Transmission model backed by precomputed broadened cross-sections.
@@ -129,13 +130,13 @@ impl FitModel for PrecomputedTransmissionModel {
 /// via cheap reference-count increments instead of deep-cloning per pixel.
 pub struct TransmissionFitModel {
     /// Energy grid (eV), ascending.
-    pub energies: Vec<f64>,
+    energies: Vec<f64>,
     /// Resonance data for each isotope.
-    pub resonance_data: Vec<ResonanceData>,
+    resonance_data: Vec<ResonanceData>,
     /// Sample temperature in Kelvin (used when `temperature_index` is `None`).
-    pub temperature_k: f64,
+    temperature_k: f64,
     /// Optional instrument resolution parameters (Arc-shared for parallel use).
-    pub instrument: Option<Arc<InstrumentParams>>,
+    instrument: Option<Arc<InstrumentParams>>,
     /// Index mapping: which `params` indices correspond to areal densities.
     /// params[density_indices[i]] = areal density of isotope i.
     ///
@@ -143,21 +144,56 @@ pub struct TransmissionFitModel {
     /// is constructed fresh per pixel (via `fit_spectrum`) and never shared
     /// across threads.  `PrecomputedTransmissionModel` uses `Arc<Vec<usize>>`
     /// for its density_indices because it _is_ shared across rayon workers.
-    pub density_indices: Vec<usize>,
+    density_indices: Vec<usize>,
     /// If `Some(idx)`, `params[idx]` is treated as the sample temperature (K)
     /// and included as a free parameter in the fit. The Doppler broadening
     /// kernel is recomputed at each `evaluate()` call.
-    pub temperature_index: Option<usize>,
+    temperature_index: Option<usize>,
+}
+
+impl TransmissionFitModel {
+    /// Create a validated `TransmissionFitModel`.
+    ///
+    /// # Errors
+    /// Returns `FittingError::InvalidConfig` if `temperature_index` overlaps
+    /// with `density_indices`.
+    pub fn new(
+        energies: Vec<f64>,
+        resonance_data: Vec<ResonanceData>,
+        temperature_k: f64,
+        instrument: Option<Arc<InstrumentParams>>,
+        density_indices: Vec<usize>,
+        temperature_index: Option<usize>,
+    ) -> Result<Self, FittingError> {
+        if let Some(ti) = temperature_index
+            && density_indices.contains(&ti)
+        {
+            return Err(FittingError::InvalidConfig(
+                "temperature_index must not overlap with density_indices".into(),
+            ));
+        }
+        Ok(Self {
+            energies,
+            resonance_data,
+            temperature_k,
+            instrument,
+            density_indices,
+            temperature_index,
+        })
+    }
 }
 
 impl FitModel for TransmissionFitModel {
     fn evaluate(&self, params: &[f64]) -> Vec<f64> {
-        // Configuration check — not in a hot loop, so use assert! to catch
-        // parameter setup errors in release builds too.
-        assert!(
-            self.temperature_index
-                .is_none_or(|ti| !self.density_indices.contains(&ti)),
-            "temperature_index must not overlap with density_indices"
+        debug_assert!(
+            self.density_indices.iter().all(|&i| i < params.len()),
+            "density_indices out of bounds for params (len={})",
+            params.len(),
+        );
+        debug_assert!(
+            self.temperature_index.is_none_or(|i| i < params.len()),
+            "temperature_index out of bounds for params (len={})",
+            params.len(),
         );
 
         let isotopes: Vec<(ResonanceData, f64)> = self
@@ -168,15 +204,7 @@ impl FitModel for TransmissionFitModel {
             .collect();
 
         let temperature_k = match self.temperature_index {
-            Some(idx) => {
-                assert!(
-                    idx < params.len(),
-                    "temperature_index ({}) out of bounds for params of length {}",
-                    idx,
-                    params.len(),
-                );
-                params[idx]
-            }
+            Some(idx) => params[idx],
             None => self.temperature_k,
         };
 
@@ -359,14 +387,9 @@ mod tests {
         // Generate synthetic data
         let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
 
-        let model = TransmissionFitModel {
-            energies: energies.clone(),
-            resonance_data: vec![data],
-            temperature_k: 0.0,
-            instrument: None,
-            density_indices: vec![0],
-            temperature_index: None,
-        };
+        let model =
+            TransmissionFitModel::new(energies.clone(), vec![data], 0.0, None, vec![0], None)
+                .unwrap();
 
         let y_obs = model.evaluate(&[true_thickness]);
         let sigma = vec![0.01; y_obs.len()]; // 1% uncertainty
@@ -376,7 +399,8 @@ mod tests {
         ]);
 
         let result =
-            lm::levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &LmConfig::default());
+            lm::levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &LmConfig::default())
+                .unwrap();
 
         assert!(result.converged, "Fit did not converge");
         let fitted = result.params[0];
@@ -432,14 +456,15 @@ mod tests {
 
         let energies: Vec<f64> = (0..301).map(|i| 1.0 + (i as f64) * 0.1).collect();
 
-        let model = TransmissionFitModel {
-            energies: energies.clone(),
-            resonance_data: vec![u238, other],
-            temperature_k: 0.0,
-            instrument: None,
-            density_indices: vec![0, 1],
-            temperature_index: None,
-        };
+        let model = TransmissionFitModel::new(
+            energies.clone(),
+            vec![u238, other],
+            0.0,
+            None,
+            vec![0, 1],
+            None,
+        )
+        .unwrap();
 
         let y_obs = model.evaluate(&[true_t1, true_t2]);
         let sigma = vec![0.01; y_obs.len()];
@@ -450,7 +475,8 @@ mod tests {
         ]);
 
         let result =
-            lm::levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &LmConfig::default());
+            lm::levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &LmConfig::default())
+                .unwrap();
 
         assert!(
             result.converged,
@@ -486,24 +512,20 @@ mod tests {
 
         // Model with fixed temperature = 0 K but temperature_index pointing
         // to params[1].
-        let model = TransmissionFitModel {
-            energies: energies.clone(),
-            resonance_data: vec![data.clone()],
-            temperature_k: 0.0,
-            instrument: None,
-            density_indices: vec![0],
-            temperature_index: Some(1),
-        };
+        let model = TransmissionFitModel::new(
+            energies.clone(),
+            vec![data.clone()],
+            0.0,
+            None,
+            vec![0],
+            Some(1),
+        )
+        .unwrap();
 
         // Model with fixed temperature = 300 K (no temperature_index).
-        let model_fixed = TransmissionFitModel {
-            energies: energies.clone(),
-            resonance_data: vec![data],
-            temperature_k: 300.0,
-            instrument: None,
-            density_indices: vec![0],
-            temperature_index: None,
-        };
+        let model_fixed =
+            TransmissionFitModel::new(energies.clone(), vec![data], 300.0, None, vec![0], None)
+                .unwrap();
 
         let density = 0.0005;
         let y_via_index = model.evaluate(&[density, 300.0]);
@@ -533,14 +555,15 @@ mod tests {
         let energies: Vec<f64> = (0..401).map(|i| 4.0 + (i as f64) * 0.025).collect();
 
         // Generate synthetic data at the true temperature.
-        let model = TransmissionFitModel {
-            energies: energies.clone(),
-            resonance_data: vec![data],
-            temperature_k: 0.0, // ignored — temperature_index is set
-            instrument: None,
-            density_indices: vec![0],
-            temperature_index: Some(1), // params[1] = temperature
-        };
+        let model = TransmissionFitModel::new(
+            energies.clone(),
+            vec![data],
+            0.0, // ignored — temperature_index is set
+            None,
+            vec![0],
+            Some(1), // params[1] = temperature
+        )
+        .unwrap();
 
         let y_obs = model.evaluate(&[true_density, true_temp]);
         let sigma = vec![0.005; y_obs.len()];
@@ -562,7 +585,7 @@ mod tests {
             ..LmConfig::default()
         };
 
-        let result = lm::levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &config);
+        let result = lm::levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &config).unwrap();
 
         assert!(
             result.converged,

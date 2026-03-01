@@ -419,14 +419,15 @@ mod tests {
         let n_energies = energies.len();
 
         // Generate synthetic spectrum
-        let model = TransmissionFitModel {
-            energies: energies.clone(),
-            resonance_data: vec![data.clone()],
-            temperature_k: 0.0,
-            instrument: None,
-            density_indices: vec![0],
-            temperature_index: None,
-        };
+        let model = TransmissionFitModel::new(
+            energies.clone(),
+            vec![data.clone()],
+            0.0,
+            None,
+            vec![0],
+            None,
+        )
+        .unwrap();
         let spectrum = model.evaluate(&[true_density]);
 
         // Create a 3×3 image with uniform transmission
@@ -485,14 +486,15 @@ mod tests {
         let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
         let n_energies = energies.len();
 
-        let model = TransmissionFitModel {
-            energies: energies.clone(),
-            resonance_data: vec![data.clone()],
-            temperature_k: 0.0,
-            instrument: None,
-            density_indices: vec![0],
-            temperature_index: None,
-        };
+        let model = TransmissionFitModel::new(
+            energies.clone(),
+            vec![data.clone()],
+            0.0,
+            None,
+            vec![0],
+            None,
+        )
+        .unwrap();
         let spectrum = model.evaluate(&[0.0005]);
 
         let height = 2;
@@ -598,14 +600,15 @@ mod tests {
         let energies: Vec<f64> = (0..101).map(|i| 1.0 + (i as f64) * 0.1).collect();
         let n_energies = energies.len();
 
-        let model = TransmissionFitModel {
-            energies: energies.clone(),
-            resonance_data: vec![data.clone()],
-            temperature_k: 0.0,
-            instrument: None,
-            density_indices: vec![0],
-            temperature_index: None,
-        };
+        let model = TransmissionFitModel::new(
+            energies.clone(),
+            vec![data.clone()],
+            0.0,
+            None,
+            vec![0],
+            None,
+        )
+        .unwrap();
         let spectrum = model.evaluate(&[true_density]);
 
         // 4×4 image
