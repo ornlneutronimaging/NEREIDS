@@ -235,7 +235,9 @@ fn fetch_endf_data(state: &mut AppState) {
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
-            let mat = retrieval::mat_number(&isotope).unwrap();
+            let Some(mat) = retrieval::mat_number(&isotope) else {
+                continue;
+            };
             let result = match retriever.get_endf_file(&isotope, library, mat) {
                 Ok((_path, endf_text)) => {
                     match nereids_endf::parser::parse_endf_file2(&endf_text) {

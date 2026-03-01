@@ -35,7 +35,7 @@ pub fn toolbar(ctx: &egui::Context, state: &mut AppState) {
                 ui.selectable_value(&mut state.ui_mode, UiMode::Studio, "Studio");
 
                 // Flexible spacer
-                ui.add_space(ui.available_width() - 250.0);
+                ui.add_space((ui.available_width() - 250.0).max(0.0));
 
                 // Progress indicator
                 if state.is_fitting {

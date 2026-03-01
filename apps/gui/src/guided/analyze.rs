@@ -333,7 +333,12 @@ fn map_panel(ui: &mut egui::Ui, state: &mut AppState) {
         });
     }
 
-    let idx = state.map_display_isotope.min(n_isotopes.saturating_sub(1));
+    if n_isotopes == 0 {
+        ui.label("No density maps available.");
+        return;
+    }
+
+    let idx = state.map_display_isotope.min(n_isotopes - 1);
 
     ui.label("Density (atoms/barn):");
     show_grayscale_image(ui, &result.density_maps[idx], "density_tex");

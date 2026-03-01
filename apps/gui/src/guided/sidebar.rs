@@ -23,7 +23,8 @@ pub fn guided_sidebar(ctx: &egui::Context, state: &mut AppState) {
             for step in GuidedStep::WORKFLOW {
                 let is_current = state.guided_step == step;
                 let is_complete = step_is_complete(step, state);
-                let number = step.number().unwrap();
+                // SAFETY: WORKFLOW only contains numbered steps
+                let number = step.number().unwrap_or(0);
 
                 let response = ui
                     .horizontal(|ui| {
