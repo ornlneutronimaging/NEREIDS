@@ -3,7 +3,7 @@
 use crate::state::{AnalysisMode, AppState, InputMode, SpectrumAxis, SpectrumDataSource};
 use crate::widgets::image_view::show_grayscale_image;
 use egui_plot::{Line, Plot, PlotPoints, VLine};
-use ndarray::Axis;
+use ndarray::{Array3, Axis};
 use nereids_io::spectrum::{SpectrumUnit, SpectrumValueKind};
 use std::sync::Arc;
 
@@ -149,6 +149,16 @@ fn preview_image_panel(ui: &mut egui::Ui, state: &mut AppState) {
     );
 }
 
+/// Compute the spatially-averaged transmission spectrum (mean over y, x axes).
+///
+/// Returns `None` when either spatial dimension has length 0, which would cause
+/// `ndarray::mean_axis()` to return `None`.
+fn full_image_average(transmission: &Array3<f64>) -> Option<Vec<f64>> {
+    let avg_x = transmission.mean_axis(Axis(2))?;
+    let avg_xy = avg_x.mean_axis(Axis(1))?;
+    Some(avg_xy.to_vec())
+}
+
 fn preview_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
     // Controls row
     ui.horizontal(|ui| {
@@ -190,15 +200,13 @@ fn preview_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
 
     // Compute averaged spectrum based on data source
     let spectrum: Vec<f64> = match state.normalize_spectrum_source {
-        SpectrumDataSource::FullImage => {
-            let avg = norm
-                .transmission
-                .mean_axis(Axis(2))
-                .unwrap()
-                .mean_axis(Axis(1))
-                .unwrap();
-            avg.to_vec()
-        }
+        SpectrumDataSource::FullImage => match full_image_average(&norm.transmission) {
+            Some(avg) => avg,
+            None => {
+                ui.label("(empty spatial dimensions)");
+                return;
+            }
+        },
         SpectrumDataSource::RoiAverage => {
             if let Some(roi) = state.roi {
                 match nereids_io::normalization::average_roi(
@@ -208,44 +216,75 @@ fn preview_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 ) {
                     Ok(avg) => avg.to_vec(),
                     Err(_) => {
-                        ui.label("Invalid ROI — using full image.");
-                        let avg = norm
-                            .transmission
-                            .mean_axis(Axis(2))
-                            .unwrap()
-                            .mean_axis(Axis(1))
-                            .unwrap();
-                        avg.to_vec()
+                        ui.label("Invalid ROI \u{2014} using full image.");
+                        match full_image_average(&norm.transmission) {
+                            Some(avg) => avg,
+                            None => {
+                                ui.label("(empty spatial dimensions)");
+                                return;
+                            }
+                        }
                     }
                 }
             } else {
-                ui.label("No ROI set — showing full image average.");
-                let avg = norm
-                    .transmission
-                    .mean_axis(Axis(2))
-                    .unwrap()
-                    .mean_axis(Axis(1))
-                    .unwrap();
-                avg.to_vec()
+                ui.label("No ROI set \u{2014} showing full image average.");
+                match full_image_average(&norm.transmission) {
+                    Some(avg) => avg,
+                    None => {
+                        ui.label("(empty spatial dimensions)");
+                        return;
+                    }
+                }
             }
         }
     };
 
-    // Build x-axis values
-    let x_values: Vec<f64> = match state.normalize_spectrum_axis {
+    // Build x-axis values and label, respecting spectrum_unit and spectrum_kind.
+    let (x_values, x_label): (Vec<f64>, &str) = match state.normalize_spectrum_axis {
         SpectrumAxis::EnergyEv => match state.energies {
-            Some(ref e) => e.clone(),
+            Some(ref e) => (e.clone(), "Energy (eV)"),
             None => return,
         },
         SpectrumAxis::TofMicroseconds => match state.spectrum_values {
-            Some(ref v) => {
-                // Spectrum values might be edges (n+1) while spectrum is length n.
-                // Take the first n values as approximate centers.
-                v.iter().take(n_tof).copied().collect()
-            }
+            Some(ref v) => match (state.spectrum_unit, state.spectrum_kind) {
+                (SpectrumUnit::TofMicroseconds, SpectrumValueKind::BinEdges) => {
+                    // Compute arithmetic mean bin centers from adjacent edges.
+                    let centers: Vec<f64> = v
+                        .windows(2)
+                        .take(n_tof)
+                        .map(|w| 0.5 * (w[0] + w[1]))
+                        .collect();
+                    (centers, "TOF (\u{03bc}s)")
+                }
+                (SpectrumUnit::TofMicroseconds, SpectrumValueKind::BinCenters) => {
+                    (v.iter().take(n_tof).copied().collect(), "TOF (\u{03bc}s)")
+                }
+                (SpectrumUnit::EnergyEv, _) => {
+                    // Spectrum file is in energy units — convert to TOF for the plot axis.
+                    if state.beamline.flight_path_m.is_finite()
+                        && state.beamline.flight_path_m > 0.0
+                    {
+                        let tof_vals: Vec<f64> = v
+                            .iter()
+                            .take(n_tof)
+                            .map(|&e| {
+                                nereids_core::constants::energy_to_tof(
+                                    e,
+                                    state.beamline.flight_path_m,
+                                ) + state.beamline.delay_us
+                            })
+                            .collect();
+                        (tof_vals, "TOF (\u{03bc}s)")
+                    } else {
+                        // Cannot convert without valid beamline params — show energy instead.
+                        (v.iter().take(n_tof).copied().collect(), "Energy (eV)")
+                    }
+                }
+            },
             None => {
-                // Fallback: indices
-                (0..n_tof).map(|i| i as f64).collect()
+                // No spectrum values — use frame indices with honest label.
+                let indices: Vec<f64> = (0..n_tof).map(|i| i as f64).collect();
+                (indices, "Frame index")
             }
         },
     };
@@ -254,11 +293,6 @@ fn preview_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
     if n_plot == 0 {
         return;
     }
-
-    let x_label = match state.normalize_spectrum_axis {
-        SpectrumAxis::EnergyEv => "Energy (eV)",
-        SpectrumAxis::TofMicroseconds => "TOF (\u{03bc}s)",
-    };
 
     let points: PlotPoints = (0..n_plot).map(|i| [x_values[i], spectrum[i]]).collect();
     let line = Line::new("Transmission", points);
