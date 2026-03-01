@@ -461,24 +461,20 @@ fn cross_sections<'py>(
     let res_data = data.inner.clone();
 
     // Release the GIL for the cross-section computation.
+    // Use cross_sections_on_grid() which precomputes J-group data once,
+    // rather than recomputing per energy point via cross_sections_at_energy().
     let (total, elastic, capture, fission) = py.detach(move || {
-        let mut total = Vec::with_capacity(e_owned.len());
-        let mut elastic = Vec::with_capacity(e_owned.len());
-        let mut capture = Vec::with_capacity(e_owned.len());
-        let mut fission = Vec::with_capacity(e_owned.len());
-
-        // The Rust dispatcher (`cross_sections_at_energy`) handles all supported
-        // resonance formalisms per range (Reich-Moore, SLBW, MLBW via an SLBW
-        // approximation, RML, URR), so no additional Python-side formalism
-        // dispatch is needed.
-        for &energy in &e_owned {
-            let xs = nereids_physics::reich_moore::cross_sections_at_energy(&res_data, energy);
+        let results = nereids_physics::reich_moore::cross_sections_on_grid(&res_data, &e_owned);
+        let mut total = Vec::with_capacity(results.len());
+        let mut elastic = Vec::with_capacity(results.len());
+        let mut capture = Vec::with_capacity(results.len());
+        let mut fission = Vec::with_capacity(results.len());
+        for xs in results {
             total.push(xs.total);
             elastic.push(xs.elastic);
             capture.push(xs.capture);
             fission.push(xs.fission);
         }
-
         (total, elastic, capture, fission)
     });
 
