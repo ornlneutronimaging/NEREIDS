@@ -33,8 +33,11 @@ use std::fmt;
 
 /// TOF conversion factor: t[μs] = TOF_FACTOR × L[m] / √(E[eV]).
 ///
-/// Derived from t = L / √(2E/m_n), converting to microseconds.
-const TOF_FACTOR: f64 = 72.298;
+/// Derived from t = L / √(2E/m_n), converting to microseconds:
+///   TOF_FACTOR = 1e6 / √(2 × EV_TO_JOULES / NEUTRON_MASS_KG)
+///
+/// Uses CODATA 2018 values (both exact in the 2019 SI).
+const TOF_FACTOR: f64 = 72.298_254_398_292_8;
 
 /// Errors from resolution broadening operations.
 #[derive(Debug, PartialEq)]
@@ -661,7 +664,7 @@ mod tests {
         let tof_ours = TOF_FACTOR * l / e.sqrt();
         let rel_diff = (tof_constants - tof_ours).abs() / tof_constants;
         assert!(
-            rel_diff < 0.001,
+            rel_diff < 1e-10,
             "TOF mismatch: constants={}, ours={}, diff={:.4}%",
             tof_constants,
             tof_ours,

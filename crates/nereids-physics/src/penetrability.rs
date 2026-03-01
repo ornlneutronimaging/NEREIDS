@@ -262,7 +262,7 @@ pub fn penetrability_derivative(l: u32, rho: f64) -> f64 {
             let rho4 = rho2 * rho2;
             let rho6 = rho4 * rho2;
             let denom = 225.0 + 45.0 * rho2 + 6.0 * rho4 + rho6;
-            // d(ρ·P₃)/dρ = ρ⁶(1575 + 225ρ² + 18ρ⁴ + ρ⁶) / D²
+            // dP₃/dρ = ρ⁶(1575 + 225ρ² + 18ρ⁴ + ρ⁶) / D²
             // SAMMY rml/mrml07.f Pgh subroutine, line 398.
             rho6 * (1575.0 + 225.0 * rho2 + 18.0 * rho4 + rho6) / (denom * denom)
         }
@@ -324,6 +324,10 @@ fn phase_shift_general(l: u32, rho: f64) -> f64 {
 ///
 /// j_l and n_l are spherical Bessel functions of the first and second kind.
 fn bessel_fg(l: u32, rho: f64) -> (f64, f64) {
+    // Near-zero guard.  The sign of g_0 is mathematically +1 (cos(0)),
+    // but we return -1.0 because this path is only reachable for l == 0
+    // (higher l returns NEG_INFINITY) and only P_l = rho / (f^2 + g^2)
+    // uses the result, where g^2 = 1 regardless of sign.
     if rho.abs() < NEAR_ZERO_FLOOR {
         return if l == 0 {
             (0.0, -1.0)
@@ -457,7 +461,7 @@ mod tests {
 
     #[test]
     fn test_penetrability_derivative_l2() {
-        // d(ρ·P₂)/dρ = ρ⁴(45 + 9ρ² + ρ⁴) / (9 + 3ρ² + ρ⁴)²
+        // dP₂/dρ = ρ⁴(45 + 9ρ² + ρ⁴) / (9 + 3ρ² + ρ⁴)²
         let rho = 2.0;
         let rho2 = rho * rho;
         let rho4 = rho2 * rho2;
@@ -473,7 +477,7 @@ mod tests {
 
     #[test]
     fn test_penetrability_derivative_l3() {
-        // d(ρ·P₃)/dρ = ρ⁶(1575 + 225ρ² + 18ρ⁴ + ρ⁶) / D²
+        // dP₃/dρ = ρ⁶(1575 + 225ρ² + 18ρ⁴ + ρ⁶) / D²
         // where D = 225 + 45ρ² + 6ρ⁴ + ρ⁶
         // SAMMY rml/mrml07.f Pgh subroutine, line 398.
         let rho = 1.5;

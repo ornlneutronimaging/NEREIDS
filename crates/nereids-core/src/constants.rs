@@ -16,7 +16,11 @@ pub const NEUTRON_MASS_MEV: f64 = 939.565_420_52;
 pub const BOLTZMANN_EV_PER_K: f64 = 8.617_333_262e-5;
 
 /// Planck constant (reduced, ħ) in eV·s.
-pub const HBAR_EV_S: f64 = 6.582_119_514e-16;
+///
+/// Derived from h = 6.626_070_15e-34 J·s (exact, 2019 SI) and
+/// e = 1.602_176_634e-19 C (exact): ħ = h / (2π·e).
+/// Rounded to 10 significant figures.
+pub const HBAR_EV_S: f64 = 6.582_119_569e-16;
 
 /// Speed of light in m/s.
 pub const SPEED_OF_LIGHT: f64 = 2.997_924_58e8;
