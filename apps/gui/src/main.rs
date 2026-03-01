@@ -4,8 +4,11 @@
 //! isotope identification, and spatial composition mapping.
 
 mod app;
-mod panels;
+mod guided;
 mod state;
+mod studio;
+mod theme;
+mod widgets;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -18,6 +21,10 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "NEREIDS",
         options,
-        Box::new(|cc| Ok(Box::new(app::NereidsApp::new(cc)))),
+        Box::new(|cc| {
+            egui_extras::install_image_loaders(&cc.egui_ctx);
+            theme::configure_fonts(&cc.egui_ctx);
+            Ok(Box::new(app::NereidsApp::new(cc)))
+        }),
     )
 }

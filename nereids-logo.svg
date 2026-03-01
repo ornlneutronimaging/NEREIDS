@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <defs>
+    <linearGradient id="bg16" x1="0.2" y1="0" x2="0.6" y2="1">
+      <stop offset="0%" stop-color="#172640"/>
+      <stop offset="50%" stop-color="#1a2c4a"/>
+      <stop offset="100%" stop-color="#231c3c"/>
+    </linearGradient>
+    <linearGradient id="dip16" x1="0.5" y1="0" x2="0.5" y2="1">
+      <stop offset="0%" stop-color="#1e9c89"/>
+      <stop offset="50%" stop-color="#35b779"/>
+      <stop offset="100%" stop-color="#90d743"/>
+    </linearGradient>
+  </defs>
+  
+  <rect x="0.5" y="0.5" width="15" height="15" rx="3.2" ry="3.2" fill="url(#bg16)"/>
+  
+  <!-- Flipped dip (original peak y-mirrored) -->
+  <path d="M8 13 C6.8 13, 5.5 10.5, 4.5 8 C3.8 6.5, 3 5.5, 2.5 5.2 L2.5 5 C3.5 5, 4.5 5.8, 5.5 7.5 C6.5 9.5, 7.3 11.5, 8 12.2 C8.7 11.5, 9.5 9.5, 10.5 7.5 C11.5 5.8, 12.5 5, 13.5 5 L13.5 5.2 C13 5.5, 12.2 6.5, 11.5 8 C10.5 10.5, 9.2 13, 8 13Z"
+        fill="url(#dip16)"/>
+  
+  <!-- Four-point star (neutron) centered in icon -->
+  <path d="M8 5.9 L8.65 7.1 L9.8 7.8 L8.65 8.5 L8 9.7 L7.35 8.5 L6.2 7.8 L7.35 7.1 Z" fill="#fde725"/>
+</svg>

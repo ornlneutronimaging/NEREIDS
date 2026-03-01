@@ -58,6 +58,9 @@ pub struct AppState {
     pub spatial_result: Option<SpatialResult>,
 
     // -- UI state --
+    pub ui_mode: UiMode,
+    pub guided_step: GuidedStep,
+    pub theme_preference: ThemePreference,
     pub active_tab: Tab,
     pub status_message: String,
     pub is_fitting: bool,
@@ -97,6 +100,69 @@ pub struct RoiSelection {
 pub enum Tab {
     Spectrum,
     Map,
+}
+
+/// Application UI mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiMode {
+    Guided,
+    Studio,
+}
+
+/// Step within the Guided workflow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuidedStep {
+    Load,
+    Configure,
+    Normalize,
+    Analyze,
+    Results,
+    ForwardModel,
+    Detectability,
+}
+
+impl GuidedStep {
+    /// Human-readable label for display.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Load => "Load",
+            Self::Configure => "Configure",
+            Self::Normalize => "Normalize",
+            Self::Analyze => "Analyze",
+            Self::Results => "Results",
+            Self::ForwardModel => "Forward Model",
+            Self::Detectability => "Detectability",
+        }
+    }
+
+    /// 1-based step number (None for tool steps).
+    pub fn number(self) -> Option<u8> {
+        match self {
+            Self::Load => Some(1),
+            Self::Configure => Some(2),
+            Self::Normalize => Some(3),
+            Self::Analyze => Some(4),
+            Self::Results => Some(5),
+            Self::ForwardModel | Self::Detectability => None,
+        }
+    }
+
+    /// Ordered list of the five main workflow steps.
+    pub const WORKFLOW: [GuidedStep; 5] = [
+        Self::Load,
+        Self::Configure,
+        Self::Normalize,
+        Self::Analyze,
+        Self::Results,
+    ];
+}
+
+/// Theme preference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThemePreference {
+    Auto,
+    Light,
+    Dark,
 }
 
 impl AppState {
@@ -157,6 +223,9 @@ impl Default for AppState {
             pixel_fit_result: None,
             spatial_result: None,
 
+            ui_mode: UiMode::Guided,
+            guided_step: GuidedStep::Load,
+            theme_preference: ThemePreference::Auto,
             active_tab: Tab::Spectrum,
             status_message: "Ready".into(),
             is_fitting: false,
