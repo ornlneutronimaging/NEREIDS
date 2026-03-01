@@ -10,6 +10,7 @@ use nereids_endf::resonance::ResonanceData;
 use nereids_endf::retrieval::EndfLibrary;
 use nereids_fitting::lm::LmConfig;
 use nereids_io::normalization::NormalizedData;
+use nereids_io::spectrum::{SpectrumUnit, SpectrumValueKind};
 use nereids_io::tof::BeamlineParams;
 use nereids_pipeline::pipeline::SpectrumFitResult;
 use nereids_pipeline::spatial::SpatialResult;
@@ -21,15 +22,31 @@ pub struct EndfFetchResult {
     pub result: Result<ResonanceData, String>,
 }
 
+/// Input mode: which type of data is being loaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputMode {
+    /// Sample TIFF stack + Open beam TIFF stack + Spectrum file.
+    TiffPair,
+    /// Pre-normalized transmission TIFF + Spectrum file.
+    TransmissionTiff,
+}
+
 /// Main application state.
 pub struct AppState {
     // -- Data loading --
+    pub input_mode: InputMode,
     pub sample_path: Option<PathBuf>,
     pub open_beam_path: Option<PathBuf>,
     pub sample_data: Option<Array3<f64>>,
     pub open_beam_data: Option<Array3<f64>>,
     pub normalized: Option<Arc<NormalizedData>>,
     pub dead_pixels: Option<Array2<bool>>,
+
+    // -- Spectrum file --
+    pub spectrum_path: Option<PathBuf>,
+    pub spectrum_values: Option<Vec<f64>>,
+    pub spectrum_unit: SpectrumUnit,
+    pub spectrum_kind: SpectrumValueKind,
 
     // -- Beamline parameters --
     pub beamline: BeamlineParams,
@@ -180,7 +197,7 @@ impl AppState {
         self.is_fetching_endf = false;
     }
 
-    /// Clear pixel selection, ROI, results, and cancel pending tasks.
+    /// Clear pixel selection, ROI, results, normalization, and cancel pending tasks.
     /// Called when the underlying data changes.
     pub fn invalidate_results(&mut self) {
         self.cancel_pending_tasks();
@@ -190,18 +207,27 @@ impl AppState {
         self.spatial_result = None;
         self.preview_image = None;
         self.energies = None;
+        self.normalized = None;
+        self.dead_pixels = None;
+        self.spectrum_values = None;
     }
 }
 
 impl Default for AppState {
     fn default() -> Self {
         Self {
+            input_mode: InputMode::TiffPair,
             sample_path: None,
             open_beam_path: None,
             sample_data: None,
             open_beam_data: None,
             normalized: None,
             dead_pixels: None,
+
+            spectrum_path: None,
+            spectrum_values: None,
+            spectrum_unit: SpectrumUnit::TofMicroseconds,
+            spectrum_kind: SpectrumValueKind::BinEdges,
 
             beamline: BeamlineParams::default(),
             proton_charge_sample: 1.0,

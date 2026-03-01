@@ -14,5 +14,6 @@
 
 pub mod error;
 pub mod normalization;
+pub mod spectrum;
 pub mod tiff_stack;
 pub mod tof;
