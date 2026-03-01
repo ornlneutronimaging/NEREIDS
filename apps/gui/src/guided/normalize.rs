@@ -116,6 +116,10 @@ fn normalize_data(state: &mut AppState) {
 
 /// Prepare pre-normalized transmission data (TransmissionTiff mode).
 fn prepare_transmission(state: &mut AppState) {
+    state.cancel_pending_tasks();
+    state.pixel_fit_result = None;
+    state.spatial_result = None;
+
     let sample = match state.sample_data {
         Some(ref d) => d.clone(),
         None => return,
