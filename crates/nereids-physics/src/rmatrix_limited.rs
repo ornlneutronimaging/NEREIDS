@@ -63,16 +63,131 @@ use nereids_endf::resonance::{ParticlePair, RmlData, SpinGroup};
 
 use crate::{channel, coulomb, penetrability};
 
+/// Pre-allocated workspace for RML cross-section evaluation.
+///
+/// Eliminates per-energy-point allocation of NCH×NCH complex matrices
+/// (`r_cplx`, `y_tilde`, `y_inv`, `xq`, `xxxx`, `u`) and per-channel
+/// vectors (`p_c`, `s_c`, `phi_c`, flags, etc.).
+///
+/// Flat `Vec<Complex64>` buffers store matrices in row-major order.
+/// For typical NCH=3-6, this avoids ~12 small heap allocations per
+/// energy point per spin group.
+struct RmlWorkspace {
+    // ── NCH×NCH complex matrix buffers (flat, row-major) ──────────────
+    r_cplx: Vec<Complex64>,
+    y_tilde: Vec<Complex64>,
+    y_inv: Vec<Complex64>,
+    xq: Vec<Complex64>,
+    xxxx: Vec<Complex64>,
+    u: Vec<Complex64>,
+    // ── Augmented matrix for Gauss-Jordan inversion (NCH × 2·NCH) ─────
+    aug: Vec<Complex64>,
+    // ── Temp row for elimination ───────────────────────────────────────
+    aug_tmp: Vec<Complex64>,
+    // ── Per-channel vectors ───────────────────────────────────────────
+    p_c: Vec<f64>,
+    s_c: Vec<f64>,
+    phi_c: Vec<f64>,
+    l_c: Vec<Complex64>,
+    sqrt_p: Vec<f64>,
+    omega: Vec<Complex64>,
+    is_entrance: Vec<bool>,
+    is_fission: Vec<bool>,
+    is_capture: Vec<bool>,
+    is_inelastic: Vec<bool>,
+    is_closed: Vec<bool>,
+    // ── Per-resonance scratch ─────────────────────────────────────────
+    gamma_vals: Vec<f64>,
+}
+
+impl RmlWorkspace {
+    fn new() -> Self {
+        Self {
+            r_cplx: Vec::new(),
+            y_tilde: Vec::new(),
+            y_inv: Vec::new(),
+            xq: Vec::new(),
+            xxxx: Vec::new(),
+            u: Vec::new(),
+            aug: Vec::new(),
+            aug_tmp: Vec::new(),
+            p_c: Vec::new(),
+            s_c: Vec::new(),
+            phi_c: Vec::new(),
+            l_c: Vec::new(),
+            sqrt_p: Vec::new(),
+            omega: Vec::new(),
+            is_entrance: Vec::new(),
+            is_fission: Vec::new(),
+            is_capture: Vec::new(),
+            is_inelastic: Vec::new(),
+            is_closed: Vec::new(),
+            gamma_vals: Vec::new(),
+        }
+    }
+
+    /// Resize all buffers for a spin group with `nch` channels and
+    /// `max_widths` resonance width entries, then zero them out.
+    fn resize_and_clear(&mut self, nch: usize, max_widths: usize) {
+        let nn = nch * nch;
+        let aug_len = nch * 2 * nch;
+
+        // Complex matrix buffers — resize then fill with zero.
+        resize_and_zero(&mut self.r_cplx, nn);
+        resize_and_zero(&mut self.y_tilde, nn);
+        resize_and_zero(&mut self.y_inv, nn);
+        resize_and_zero(&mut self.xq, nn);
+        resize_and_zero(&mut self.xxxx, nn);
+        resize_and_zero(&mut self.u, nn);
+        resize_and_zero(&mut self.aug, aug_len);
+        resize_and_zero(&mut self.aug_tmp, 2 * nch);
+
+        // Per-channel real/bool vectors.
+        resize_and_zero_f64(&mut self.p_c, nch);
+        resize_and_zero_f64(&mut self.s_c, nch);
+        resize_and_zero_f64(&mut self.phi_c, nch);
+        resize_and_zero(&mut self.l_c, nch);
+        resize_and_zero_f64(&mut self.sqrt_p, nch);
+        resize_and_zero(&mut self.omega, nch);
+        resize_and_zero_bool(&mut self.is_entrance, nch);
+        resize_and_zero_bool(&mut self.is_fission, nch);
+        resize_and_zero_bool(&mut self.is_capture, nch);
+        resize_and_zero_bool(&mut self.is_inelastic, nch);
+        resize_and_zero_bool(&mut self.is_closed, nch);
+
+        // Per-resonance scratch.
+        resize_and_zero_f64(&mut self.gamma_vals, max_widths);
+    }
+}
+
+fn resize_and_zero(buf: &mut Vec<Complex64>, len: usize) {
+    buf.clear();
+    buf.resize(len, Complex64::ZERO);
+}
+
+fn resize_and_zero_f64(buf: &mut Vec<f64>, len: usize) {
+    buf.clear();
+    buf.resize(len, 0.0);
+}
+
+fn resize_and_zero_bool(buf: &mut Vec<bool>, len: usize) {
+    buf.clear();
+    buf.resize(len, false);
+}
+
 /// Compute cross-section contributions from an LRF=7 energy range.
 ///
 /// Returns `(total, elastic, capture, fission)` in barns.
 ///
 /// Iterates over all spin groups (J,π), sums their contributions.
+/// A single [`RmlWorkspace`] is allocated once and reused across spin groups.
 pub fn cross_sections_for_rml_range(rml: &RmlData, energy_ev: f64) -> (f64, f64, f64, f64) {
     let mut total = 0.0;
     let mut elastic = 0.0;
     let mut capture = 0.0;
     let mut fission = 0.0;
+
+    let mut ws = RmlWorkspace::new();
 
     for sg in &rml.spin_groups {
         let (t, e, cap, fis) = spin_group_cross_sections(
@@ -82,6 +197,7 @@ pub fn cross_sections_for_rml_range(rml: &RmlData, energy_ev: f64) -> (f64, f64,
             rml.awr,
             rml.target_spin,
             rml.krm,
+            &mut ws,
         );
         total += t;
         elastic += e;
@@ -95,6 +211,9 @@ pub fn cross_sections_for_rml_range(rml: &RmlData, energy_ev: f64) -> (f64, f64,
 /// Cross-section contribution from a single spin group (J,π).
 ///
 /// Returns (total, elastic, capture, fission) in barns.
+///
+/// The caller-owned `ws` workspace is resized and reused across spin groups
+/// for a given energy evaluation to avoid per-call heap allocations.
 fn spin_group_cross_sections(
     sg: &SpinGroup,
     particle_pairs: &[ParticlePair],
@@ -102,6 +221,7 @@ fn spin_group_cross_sections(
     awr: f64,
     target_spin: f64,
     krm: u32,
+    ws: &mut RmlWorkspace,
 ) -> (f64, f64, f64, f64) {
     let nch = sg.channels.len();
     if nch == 0 {
@@ -123,18 +243,18 @@ fn spin_group_cross_sections(
     // per spin group).  Do NOT return early here; the resonance loop simply executes
     // zero iterations, leaving R = 0, which is exactly the hard-sphere limit.
 
+    // Resize workspace buffers for this spin group's channel count.
+    let max_widths = sg
+        .resonances
+        .iter()
+        .map(|r| r.widths.len())
+        .max()
+        .unwrap_or(nch)
+        .max(nch);
+    ws.resize_and_clear(nch, max_widths);
+
     let g_j = channel::statistical_weight(sg.j, target_spin);
     let pok2 = channel::pi_over_k_squared_barns(energy_ev, awr);
-
-    // ── Per-channel quantities ────────────────────────────────────────────────
-    let mut p_c = vec![0.0f64; nch]; // penetrability P_c
-    let mut s_c = vec![0.0f64; nch]; // shift factor S_c
-    let mut phi_c = vec![0.0f64; nch]; // hard-sphere phase φ_c
-    let mut is_entrance = vec![false; nch];
-    let mut is_fission = vec![false; nch];
-    let mut is_capture = vec![false; nch]; // photon/gamma channels (MT=102)
-    let mut is_inelastic = vec![false; nch]; // massive non-elastic/non-fission/non-capture (MT=51+)
-    let mut is_closed = vec![false; nch]; // channel below threshold (e_c ≤ 0)
 
     // Entrance-channel CM energy: E_cm = E_lab × AWR/(1+AWR).
     // Each exit channel adds its Q-value to get its own available energy.
@@ -146,21 +266,22 @@ fn spin_group_cross_sections(
         // silently, misclassifying any channel with an OOB index as the last pair.
         // An OOB value indicates corrupted ENDF data; let Rust's bounds check panic.
         let pp = &particle_pairs[ch.particle_pair_idx];
-        is_entrance[c] = pp.mt == 2;
-        is_fission[c] = pp.mt == 18;
-        is_capture[c] = pp.mt == 102;
+        ws.is_entrance[c] = pp.mt == 2;
+        ws.is_fission[c] = pp.mt == 18;
+        ws.is_capture[c] = pp.mt == 102;
         // Inelastic neutron channels (MT=51+): massive particle, not elastic/fission/capture.
         // Their flux appears in σ_total (optical theorem) but must not be assigned to capture.
         // Reference: ENDF MT number conventions, §3.4; SAMMY rml/mrml11.f Sectio.
-        is_inelastic[c] = pp.ma >= 0.5 && !is_entrance[c] && !is_fission[c] && !is_capture[c];
+        ws.is_inelastic[c] =
+            pp.ma >= 0.5 && !ws.is_entrance[c] && !ws.is_fission[c] && !ws.is_capture[c];
 
         if pp.ma < 0.5 {
             // Photon channel (MA = 0): P=1, S=0, φ=0.
             // Convention per ENDF-6 Formats Manual §2.2.1.6 Note 4.
             // SAMMY: rml/mrml07.f sets penetrability = 1 for massless particles.
-            p_c[c] = 1.0;
-            s_c[c] = 0.0;
-            phi_c[c] = 0.0;
+            ws.p_c[c] = 1.0;
+            ws.s_c[c] = 0.0;
+            ws.phi_c[c] = 0.0;
         } else {
             // Massive particle channel: channel-specific kinematics (P1).
             // E_c = E_cm + Q (CM kinetic energy in this exit channel).
@@ -174,9 +295,9 @@ fn spin_group_cross_sections(
                 //     ρ = iκ, which is real and finite.  L_c = (S_c − B_c) is generally
                 //     non-zero and its dispersive contribution must be preserved.
                 // Reference: SAMMY rml/mrml07.f Pgh — PH = 1/(S−B+iP).
-                p_c[c] = 0.0;
-                phi_c[c] = 0.0;
-                is_closed[c] = true;
+                ws.p_c[c] = 0.0;
+                ws.phi_c[c] = 0.0;
+                ws.is_closed[c] = true;
                 // SHF=0: S_c = B_c so (S_c − B_c) = 0 in the level matrix.
                 // SHF=1: S_c is the analytic shift at imaginary argument ρ = iκ.
                 //   For non-Coulomb channels we use the Blatt-Weisskopf formula.
@@ -186,7 +307,7 @@ fn spin_group_cross_sections(
                 //   Elinvr=1/Elinvi=0 (i.e. L_c = 1) for all closed channels,
                 //   Coulomb and non-Coulomb alike, without calling Pghcou.
                 let is_coulomb = pp.za.abs() > 0.5 && pp.zb.abs() > 0.5;
-                s_c[c] = if pp.shf == 1 && !is_coulomb {
+                ws.s_c[c] = if pp.shf == 1 && !is_coulomb {
                     let redmas = pp.ma * pp.mb / (pp.ma + pp.mb);
                     let kappa = channel::wave_number_from_cm(e_c.abs(), redmas);
                     penetrability::shift_factor_closed(ch.l, kappa * ch.effective_radius)
@@ -221,12 +342,12 @@ fn spin_group_cross_sections(
                         Some((f, g, fp, gp)) => {
                             // rho_eff succeeded: channel is genuinely open.
                             let fg_sq = f * f + g * g;
-                            p_c[c] = rho_eff / fg_sq;
+                            ws.p_c[c] = rho_eff / fg_sq;
                             // SHF=1: Coulomb shift ρ(F·F'+G·G')/(F²+G²).
                             // SHF=0: S_c = B_c so (S_c − B_c) = 0 in level matrix.
                             // Note: parser rejects Coulomb + SHF=1, so this arm is
                             // only reachable if that validation is later relaxed.
-                            s_c[c] = if pp.shf == 1 {
+                            ws.s_c[c] = if pp.shf == 1 {
                                 rho_eff * (f * fp + g * gp) / fg_sq
                             } else {
                                 ch.boundary
@@ -234,32 +355,32 @@ fn spin_group_cross_sections(
                             // φ_c from rho_true; if rho_true ≤ acch, default to 0
                             // (hard-sphere limit φ → 0 as ρ → 0) without closing
                             // the channel.
-                            phi_c[c] = coulomb::coulomb_wave_functions(ch.l, eta, rho_true)
+                            ws.phi_c[c] = coulomb::coulomb_wave_functions(ch.l, eta, rho_true)
                                 .map_or(0.0, |(fl_t, gl_t, _, _)| fl_t.atan2(gl_t));
                         }
                         None => {
                             // rho_eff ≤ acch (≈ 1e-8, SAMMY Coulfg threshold):
                             // penetrability → 0 at threshold; treat as closed.
                             // Reference: SAMMY coulomb/mrml08.f90 Coulfg — acch.
-                            p_c[c] = 0.0;
-                            s_c[c] = ch.boundary;
-                            phi_c[c] = 0.0;
-                            is_closed[c] = true;
+                            ws.p_c[c] = 0.0;
+                            ws.s_c[c] = ch.boundary;
+                            ws.phi_c[c] = 0.0;
+                            ws.is_closed[c] = true;
                         }
                     }
                 } else {
                     // Hard-sphere (Blatt-Weisskopf) channel.
-                    p_c[c] = penetrability::penetrability(ch.l, rho_eff);
+                    ws.p_c[c] = penetrability::penetrability(ch.l, rho_eff);
                     // SHF=0: shift factor not calculated; S_c = B_c so (S_c - B_c) = 0
                     // in the level matrix diagonal.
                     // SHF=1: calculate S_c analytically (Blatt-Weisskopf).
                     // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml07.f Pgh (Ishift check)
-                    s_c[c] = if pp.shf == 1 {
+                    ws.s_c[c] = if pp.shf == 1 {
                         penetrability::shift_factor(ch.l, rho_eff)
                     } else {
                         ch.boundary
                     };
-                    phi_c[c] = penetrability::phase_shift(ch.l, rho_true);
+                    ws.phi_c[c] = penetrability::phase_shift(ch.l, rho_true);
                 }
             }
         }
@@ -276,9 +397,9 @@ fn spin_group_cross_sections(
     //   going to capture.
     //
     // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml07.f Setr subroutine
-    let mut r_cplx = vec![vec![Complex64::ZERO; nch]; nch];
+    // ws.r_cplx is already zeroed by resize_and_clear.
     for res in &sg.resonances {
-        let (gamma_vals, e_tilde) = if krm == 3 {
+        let e_tilde = if krm == 3 {
             // KRM=3: convert formal partial widths to reduced amplitudes.
             // γ_nc = √(|Γ_nc| / (2·P_c(E_n))).  Sign preserved from Γ_nc.
             // For closed channels or P=0 (e.g. bound states at E_n<0): use
@@ -293,85 +414,82 @@ fn spin_group_cross_sections(
             // resonance shape away from the peak.
             // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f (reads Γ_nc then
             // converts via P at resonance energy in Pgh subroutine).
-            let gamma_vals: Vec<f64> = (0..nch)
-                .map(|c| {
-                    let gamma_formal = res.widths[c];
-                    let ch = &sg.channels[c];
-                    let pp_c = &particle_pairs[ch.particle_pair_idx];
-                    // P_c at the resonance energy E_n.  Returns None when the channel
-                    // is closed at E_n (bound-state resonance), Some(P) otherwise.
-                    //
-                    // The fallback must be gated on whether e_cm_n ≤ 0, NOT on
-                    // whether P is numerically small.  For genuinely open channels
-                    // near threshold (high-l, small ρ), P is positive but tiny;
-                    // a magnitude guard would replace √(|Γ|/(2P)) ≫ 1 with √|Γ| ≪ 1,
-                    // underestimating the reduced amplitude by orders of magnitude.
-                    // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f Pgh.
-                    let p_at_en: Option<f64> = if pp_c.ma < 0.5 {
-                        Some(1.0) // photon: P = 1 by convention
+            for c in 0..nch {
+                let gamma_formal = res.widths[c];
+                let ch = &sg.channels[c];
+                let pp_c = &particle_pairs[ch.particle_pair_idx];
+                // P_c at the resonance energy E_n.  Returns None when the channel
+                // is closed at E_n (bound-state resonance), Some(P) otherwise.
+                //
+                // The fallback must be gated on whether e_cm_n ≤ 0, NOT on
+                // whether P is numerically small.  For genuinely open channels
+                // near threshold (high-l, small ρ), P is positive but tiny;
+                // a magnitude guard would replace √(|Γ|/(2P)) ≫ 1 with √|Γ| ≪ 1,
+                // underestimating the reduced amplitude by orders of magnitude.
+                // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f Pgh.
+                let p_at_en: Option<f64> = if pp_c.ma < 0.5 {
+                    Some(1.0) // photon: P = 1 by convention
+                } else {
+                    // P1: res.energy is lab-frame; convert to CM before adding Q.
+                    // Reference: SAMMY rml/mrml03.f Fxradi; ENDF-6 §2.2.1.6.
+                    let e_cm_n = channel::lab_to_cm_energy(res.energy, awr) + pp_c.q;
+                    if e_cm_n <= 0.0 {
+                        None // channel closed at resonance energy (bound state)
                     } else {
-                        // P1: res.energy is lab-frame; convert to CM before adding Q.
-                        // Reference: SAMMY rml/mrml03.f Fxradi; ENDF-6 §2.2.1.6.
-                        let e_cm_n = channel::lab_to_cm_energy(res.energy, awr) + pp_c.q;
-                        if e_cm_n <= 0.0 {
-                            None // channel closed at resonance energy (bound state)
+                        let redmas = pp_c.ma * pp_c.mb / (pp_c.ma + pp_c.mb);
+                        let k_cn = channel::wave_number_from_cm(e_cm_n, redmas);
+                        let rho_eff_n = k_cn * ch.effective_radius;
+                        // Must use the same penetrability type as the open-channel
+                        // block: Coulomb P_c(E_n) for charged pairs, hard-sphere
+                        // otherwise.  Mixing them produces inconsistent γ_nc
+                        // normalisation: γ_nc = √(Γ_nc / (2·P_c(E_n))).
+                        // SAMMY rml/mrml07.f Pgh — same Zeta check applies here.
+                        let p = if pp_c.za.abs() > 0.5 && pp_c.zb.abs() > 0.5 {
+                            // If rho_eff_n ≤ acch (SAMMY Coulfg threshold,
+                            // ≈ 1e-8) wave functions return None and P = 0.0
+                            // is used.  The filter(p > 0.0) below then maps
+                            // P = 0 → None, applying the closed-channel
+                            // √(|Γ|) normalisation — correct physical limit
+                            // for a resonance barely above its Coulomb
+                            // channel threshold.
+                            // Reference: SAMMY coulomb/mrml08.f90 Coulfg.
+                            let eta =
+                                coulomb::sommerfeld_eta(pp_c.za, pp_c.zb, pp_c.ma, pp_c.mb, e_cm_n);
+                            coulomb::coulomb_wave_functions(ch.l, eta, rho_eff_n)
+                                .map_or(0.0, |(fl, gl, _, _)| rho_eff_n / (fl * fl + gl * gl))
                         } else {
-                            let redmas = pp_c.ma * pp_c.mb / (pp_c.ma + pp_c.mb);
-                            let k_cn = channel::wave_number_from_cm(e_cm_n, redmas);
-                            let rho_eff_n = k_cn * ch.effective_radius;
-                            // Must use the same penetrability type as the open-channel
-                            // block: Coulomb P_c(E_n) for charged pairs, hard-sphere
-                            // otherwise.  Mixing them produces inconsistent γ_nc
-                            // normalisation: γ_nc = √(Γ_nc / (2·P_c(E_n))).
-                            // SAMMY rml/mrml07.f Pgh — same Zeta check applies here.
-                            let p = if pp_c.za.abs() > 0.5 && pp_c.zb.abs() > 0.5 {
-                                // If rho_eff_n ≤ acch (SAMMY Coulfg threshold,
-                                // ≈ 1e-8) wave functions return None and P = 0.0
-                                // is used.  The filter(p > 0.0) below then maps
-                                // P = 0 → None, applying the closed-channel
-                                // √(|Γ|) normalisation — correct physical limit
-                                // for a resonance barely above its Coulomb
-                                // channel threshold.
-                                // Reference: SAMMY coulomb/mrml08.f90 Coulfg.
-                                let eta = coulomb::sommerfeld_eta(
-                                    pp_c.za, pp_c.zb, pp_c.ma, pp_c.mb, e_cm_n,
-                                );
-                                coulomb::coulomb_wave_functions(ch.l, eta, rho_eff_n)
-                                    .map_or(0.0, |(fl, gl, _, _)| rho_eff_n / (fl * fl + gl * gl))
-                            } else {
-                                penetrability::penetrability(ch.l, rho_eff_n)
-                            };
-                            Some(p)
-                        }
-                    };
-                    // Guard: prevent division by zero if P_c = 0.  Covers both
-                    // non-Coulomb channels at rho → 0 and Coulomb channels below
-                    // SAMMY's acch threshold (coulomb_wave_functions returns None
-                    // → P = 0.0).  Collapsing to None uses the closed-channel
-                    // √(|Γ|) normalisation, which is the correct limit when the
-                    // channel has effectively zero penetrability.
-                    let p_at_en = p_at_en.filter(|&p| p > 0.0);
-                    match p_at_en {
-                        None => {
-                            // Closed or non-computable channel at E_n: formal width used
-                            // directly as reduced amplitude (SAMMY bound-state convention).
-                            gamma_formal.abs().sqrt().copysign(gamma_formal)
-                        }
-                        Some(p) => {
-                            // Open channel: γ = √(|Γ| / (2·P_c(E_n))) with sign of Γ.
-                            let magnitude = (gamma_formal.abs() / (2.0 * p)).sqrt();
-                            magnitude.copysign(gamma_formal)
-                        }
+                            penetrability::penetrability(ch.l, rho_eff_n)
+                        };
+                        Some(p)
                     }
-                })
-                .collect();
-            (gamma_vals, e_tilde)
+                };
+                // Guard: prevent division by zero if P_c = 0.  Covers both
+                // non-Coulomb channels at rho → 0 and Coulomb channels below
+                // SAMMY's acch threshold (coulomb_wave_functions returns None
+                // → P = 0.0).  Collapsing to None uses the closed-channel
+                // √(|Γ|) normalisation, which is the correct limit when the
+                // channel has effectively zero penetrability.
+                let p_at_en = p_at_en.filter(|&p| p > 0.0);
+                ws.gamma_vals[c] = match p_at_en {
+                    None => {
+                        // Closed or non-computable channel at E_n: formal width used
+                        // directly as reduced amplitude (SAMMY bound-state convention).
+                        gamma_formal.abs().sqrt().copysign(gamma_formal)
+                    }
+                    Some(p) => {
+                        // Open channel: γ = √(|Γ| / (2·P_c(E_n))) with sign of Γ.
+                        let magnitude = (gamma_formal.abs() / (2.0 * p)).sqrt();
+                        magnitude.copysign(gamma_formal)
+                    }
+                };
+            }
+            e_tilde
         } else {
             // KRM=2: widths are already reduced amplitudes; real denominator.
             // P2: Guard only against exact IEEE 754 zero; complex infrastructure
             // handles the Lorentzian width naturally via i·P_c in level matrix.
-            let e_tilde = Complex64::new(res.energy, 0.0);
-            (res.widths.clone(), e_tilde)
+            ws.gamma_vals[..nch].copy_from_slice(&res.widths[..nch]);
+            Complex64::new(res.energy, 0.0)
         };
 
         let denom = e_tilde - energy_ev;
@@ -387,18 +505,19 @@ fn spin_group_cross_sections(
         } else {
             denom.inv()
         };
-        for (c, row) in r_cplx.iter_mut().enumerate() {
-            for (cp, elem) in row.iter_mut().enumerate() {
-                *elem += gamma_vals[c] * gamma_vals[cp] * inv_denom;
+        for c in 0..nch {
+            let gc = ws.gamma_vals[c];
+            for cp in 0..nch {
+                ws.r_cplx[c * nch + cp] += gc * ws.gamma_vals[cp] * inv_denom;
             }
         }
     }
 
     // ── L_c = (S_c - B_c) + i·P_c (per-channel level denominator) ───────────
     // Reference: SAMMY rml/mrml07.f Pgh subroutine, "PH = 1/(S-B+IP)"
-    let l_c: Vec<Complex64> = (0..nch)
-        .map(|c| Complex64::new(s_c[c] - sg.channels[c].boundary, p_c[c]))
-        .collect();
+    for c in 0..nch {
+        ws.l_c[c] = Complex64::new(ws.s_c[c] - sg.channels[c].boundary, ws.p_c[c]);
+    }
 
     // ── Reduced level matrix Ỹ = L⁻¹ - R (SAMMY "Ymat") ─────────────────────
     // Ỹ_cc'(E) = (1/L_c)·δ_cc' - R_cc'
@@ -409,139 +528,145 @@ fn spin_group_cross_sections(
     // A⁻¹·P = -i/P·P = -i, W = 1+2i²·(−1)=3) — catastrophically wrong.
     // Using L⁻¹ - R gives |U| = 1 for R=0 (Ỹ = 1/L, Ỹinv = L, XQ = L·0 = 0,
     // XXXX = 0, W = 1, U = exp(2iφ)) — correct hard-sphere limit.
-    let y_tilde: Vec<Vec<Complex64>> = (0..nch)
-        .map(|c| {
-            (0..nch)
-                .map(|cp| {
-                    // L_c = (S_c − B_c) + i·P_c.
-                    // For SHF=0 closed channels: S_c = B_c and P_c = 0 ⇒ L_c = 0.
-                    // Correct limit: 1/L_c → ∞ ⇒ Ỹ[c,c] >> R[c,c] ⇒ Ỹ⁻¹[c,c] ≈ 0
-                    // ⇒ channel decouples from U.  Setting 1/L_c = 0 (old bug) removes
-                    // the diagonal and lets R dominate — wrong coupling / Ỹ singular.
-                    //
-                    // For SHF=1 or non-matching B_c, L_c is generally finite even when
-                    // P_c = 0; the dispersive (real) shift must be preserved.  Do NOT
-                    // force the sentinel just because the channel is sub-threshold; check
-                    // whether |L_c| is actually near zero.
-                    //
-                    // Reference: SAMMY rml/mrml07.f — PH = 1/(S−B+iP).
-                    let inv_l = if l_c[c].norm_sqr() < NEAR_ZERO_FLOOR {
-                        // |L_c|² < NEAR_ZERO_FLOOR: use finite-but-large sentinel so the diagonal
-                        // dominates and the channel decouples without overflow in inversion.
-                        Complex64::new(1e30, 0.0)
-                    } else {
-                        Complex64::new(1.0, 0.0) / l_c[c]
-                    };
-                    let diag = if c == cp { inv_l } else { Complex64::ZERO };
-                    diag - r_cplx[c][cp]
-                })
-                .collect()
-        })
-        .collect();
+    for c in 0..nch {
+        // L_c = (S_c − B_c) + i·P_c.
+        // For SHF=0 closed channels: S_c = B_c and P_c = 0 ⇒ L_c = 0.
+        // Correct limit: 1/L_c → ∞ ⇒ Ỹ[c,c] >> R[c,c] ⇒ Ỹ⁻¹[c,c] ≈ 0
+        // ⇒ channel decouples from U.  Setting 1/L_c = 0 (old bug) removes
+        // the diagonal and lets R dominate — wrong coupling / Ỹ singular.
+        //
+        // For SHF=1 or non-matching B_c, L_c is generally finite even when
+        // P_c = 0; the dispersive (real) shift must be preserved.  Do NOT
+        // force the sentinel just because the channel is sub-threshold; check
+        // whether |L_c| is actually near zero.
+        //
+        // Reference: SAMMY rml/mrml07.f — PH = 1/(S−B+iP).
+        let inv_l = if ws.l_c[c].norm_sqr() < NEAR_ZERO_FLOOR {
+            // |L_c|² < NEAR_ZERO_FLOOR: use finite-but-large sentinel so the diagonal
+            // dominates and the channel decouples without overflow in inversion.
+            Complex64::new(1e30, 0.0)
+        } else {
+            Complex64::new(1.0, 0.0) / ws.l_c[c]
+        };
+        for cp in 0..nch {
+            let diag = if c == cp { inv_l } else { Complex64::ZERO };
+            ws.y_tilde[c * nch + cp] = diag - ws.r_cplx[c * nch + cp];
+        }
+    }
 
     // ── Invert Ỹ to get Ỹinv (SAMMY "Yinv") ─────────────────────────────────
     // Reference: SAMMY rml/mrml09.f Yinvrs subroutine
-    let y_inv = match invert_complex_matrix(&y_tilde, nch) {
-        Some(inv) => inv,
-        None => {
-            // Singular Ỹ matrix — regularize by adding a small real epsilon to
-            // the diagonal and retry.  This can happen when channels are
-            // near-degenerate (e.g. two channels at the same threshold).
-            // The epsilon is real-only to preserve Hermitian symmetry of the
-            // level matrix; an imaginary perturbation would break unitarity.
-            //
-            // Use a *relative* epsilon: ε = |diag| × QUANTUM_NUMBER_EPS, with a floor of
-            // NEAR_ZERO_FLOOR for zero diagonals.  A fixed absolute epsilon
-            // could be comparable to or larger than the diagonal value itself
-            // for high-L channels with very small penetrabilities (where
-            // 1/L_c ~ 1/P_c can be enormous, but R_cc' is also large, making
-            // the net diagonal small).  The relative approach perturbs the
-            // matrix by a fraction of its natural scale.
-            //
-            // Per-diagonal (not matrix-norm) regularization is intentional:
-            // each channel's diagonal element lives on its own physical scale
-            // (set by 1/L_c − R_cc), which can differ by orders of magnitude
-            // across channels (e.g. an s-wave elastic channel vs. a high-L
-            // fission channel).  A single matrix-norm epsilon would be
-            // dominated by the largest channel and could either over-perturb
-            // small channels or under-perturb large ones.  Per-diagonal
-            // epsilon ensures each channel is nudged proportionally to its
-            // own scale.
-            let mut y_reg = y_tilde.clone();
-            for (i, row) in y_reg.iter_mut().enumerate().take(nch) {
-                let diag_norm = row[i].norm();
-                // Relative regularization (QUANTUM_NUMBER_EPS × diagonal) with an
-                // absolute floor of NEAR_ZERO_FLOOR for near-zero diagonals.
-                let eps = (diag_norm * QUANTUM_NUMBER_EPS).max(NEAR_ZERO_FLOOR);
-                row[i] += Complex64::new(eps, 0.0);
-            }
-            match invert_complex_matrix(&y_reg, nch) {
-                Some(inv) => inv,
-                None => return (0.0, 0.0, 0.0, 0.0), // truly degenerate
-            }
+    if !invert_complex_matrix_flat(
+        &ws.y_tilde,
+        nch,
+        &mut ws.y_inv,
+        &mut ws.aug,
+        &mut ws.aug_tmp,
+    ) {
+        // Singular Ỹ matrix — regularize by adding a small real epsilon to
+        // the diagonal and retry.  This can happen when channels are
+        // near-degenerate (e.g. two channels at the same threshold).
+        // The epsilon is real-only to preserve Hermitian symmetry of the
+        // level matrix; an imaginary perturbation would break unitarity.
+        //
+        // Use a *relative* epsilon: ε = |diag| × QUANTUM_NUMBER_EPS, with a floor of
+        // NEAR_ZERO_FLOOR for zero diagonals.  A fixed absolute epsilon
+        // could be comparable to or larger than the diagonal value itself
+        // for high-L channels with very small penetrabilities (where
+        // 1/L_c ~ 1/P_c can be enormous, but R_cc' is also large, making
+        // the net diagonal small).  The relative approach perturbs the
+        // matrix by a fraction of its natural scale.
+        //
+        // Per-diagonal (not matrix-norm) regularization is intentional:
+        // each channel's diagonal element lives on its own physical scale
+        // (set by 1/L_c − R_cc), which can differ by orders of magnitude
+        // across channels (e.g. an s-wave elastic channel vs. a high-L
+        // fission channel).  A single matrix-norm epsilon would be
+        // dominated by the largest channel and could either over-perturb
+        // small channels or under-perturb large ones.  Per-diagonal
+        // epsilon ensures each channel is nudged proportionally to its
+        // own scale.
+
+        // Copy y_tilde into y_inv as a temp buffer for the regularized matrix.
+        ws.y_inv.copy_from_slice(&ws.y_tilde);
+        for i in 0..nch {
+            let diag_norm = ws.y_inv[i * nch + i].norm();
+            // Relative regularization (QUANTUM_NUMBER_EPS × diagonal) with an
+            // absolute floor of NEAR_ZERO_FLOOR for near-zero diagonals.
+            let eps = (diag_norm * QUANTUM_NUMBER_EPS).max(NEAR_ZERO_FLOOR);
+            ws.y_inv[i * nch + i] += Complex64::new(eps, 0.0);
         }
-    };
+        // y_inv now holds the regularized y_tilde; copy it to y_tilde so the
+        // inversion reads from the regularized version.
+        ws.y_tilde.copy_from_slice(&ws.y_inv);
+        if !invert_complex_matrix_flat(
+            &ws.y_tilde,
+            nch,
+            &mut ws.y_inv,
+            &mut ws.aug,
+            &mut ws.aug_tmp,
+        ) {
+            return (0.0, 0.0, 0.0, 0.0); // truly degenerate
+        }
+    }
 
     // ── XQ = Ỹinv · R (matrix product, SAMMY "Xqr/Xqi") ─────────────────────
     // Reference: SAMMY rml/mrml11.f Setxqx — "Xqr(k,i) = (L**-1-R)**-1 * R"
-    let xq: Vec<Vec<Complex64>> = (0..nch)
-        .map(|c| {
-            (0..nch)
-                .map(|cp| (0..nch).map(|k| y_inv[c][k] * r_cplx[k][cp]).sum())
-                .collect()
-        })
-        .collect();
+    for c in 0..nch {
+        for cp in 0..nch {
+            let mut sum = Complex64::ZERO;
+            for k in 0..nch {
+                sum += ws.y_inv[c * nch + k] * ws.r_cplx[k * nch + cp];
+            }
+            ws.xq[c * nch + cp] = sum;
+        }
+    }
 
     // ── XXXX = (√P_c / L_c) · XQ · √P_c' ────────────────────────────────────
     // Reference: SAMMY rml/mrml11.f Setxqx — "Xxxx = sqrt(P)/L * xq * sqrt(P)"
-    let sqrt_p: Vec<f64> = p_c.iter().map(|&x| x.sqrt()).collect();
-    let xxxx: Vec<Vec<Complex64>> = (0..nch)
-        .map(|c| {
-            // For a closed channel: sqrt_p[c] = 0 and L_c = 0 (0/0 indeterminate).
-            // The full XXXX[c,cp] = (√P_c / L_c) · XQ[c,cp] · √P_c'.
-            // Since √P_c = 0 for any closed channel c, the entire row is zero
-            // regardless of the value of L_c. Setting sqrt_p_over_l = 0 is correct.
-            // (The Ỹ sentinel handles Ỹ inversion correctly; this row zeroing is
-            //  consistent: a closed channel contributes nothing to XXXX/U.)
-            // Guard: at exact channel threshold, both √P_c and L_c can be
-            // zero simultaneously, producing 0/0 = NaN.  The is_closed flag
-            // catches most cases, but a channel right at threshold might not
-            // be flagged closed yet have |L_c| ≈ 0.  The extra norm check
-            // prevents NaN propagation.
-            let sqrt_p_over_l = if is_closed[c] || l_c[c].norm() < PIVOT_FLOOR {
-                Complex64::ZERO
-            } else {
-                sqrt_p[c] / l_c[c]
-            };
-            (0..nch)
-                .map(|cp| sqrt_p_over_l * xq[c][cp] * sqrt_p[cp])
-                .collect()
-        })
-        .collect();
+    for c in 0..nch {
+        ws.sqrt_p[c] = ws.p_c[c].sqrt();
+    }
+    for c in 0..nch {
+        // For a closed channel: sqrt_p[c] = 0 and L_c = 0 (0/0 indeterminate).
+        // The full XXXX[c,cp] = (√P_c / L_c) · XQ[c,cp] · √P_c'.
+        // Since √P_c = 0 for any closed channel c, the entire row is zero
+        // regardless of the value of L_c. Setting sqrt_p_over_l = 0 is correct.
+        // (The Ỹ sentinel handles Ỹ inversion correctly; this row zeroing is
+        //  consistent: a closed channel contributes nothing to XXXX/U.)
+        // Guard: at exact channel threshold, both √P_c and L_c can be
+        // zero simultaneously, producing 0/0 = NaN.  The is_closed flag
+        // catches most cases, but a channel right at threshold might not
+        // be flagged closed yet have |L_c| ≈ 0.  The extra norm check
+        // prevents NaN propagation.
+        let sqrt_p_over_l = if ws.is_closed[c] || ws.l_c[c].norm() < PIVOT_FLOOR {
+            Complex64::ZERO
+        } else {
+            ws.sqrt_p[c] / ws.l_c[c]
+        };
+        for cp in 0..nch {
+            ws.xxxx[c * nch + cp] = sqrt_p_over_l * ws.xq[c * nch + cp] * ws.sqrt_p[cp];
+        }
+    }
 
     // ── Collision matrix U = Ω · W · Ω, W = I + 2i·Ξ ────────────────────────
     // Reference: SAMMY manual eq. III.D.4; SAMMY rml/mrml11.f Setxqx/Sectio
     // Hard-sphere check: R=0 → XQ=0 → XXXX=0 → W=I → U = exp(2iφ)·I, |U|=1 ✓
-    let omega: Vec<Complex64> = phi_c
-        .iter()
-        .map(|&phi| Complex64::from_polar(1.0, phi))
-        .collect();
+    for c in 0..nch {
+        ws.omega[c] = Complex64::from_polar(1.0, ws.phi_c[c]);
+    }
 
-    let u: Vec<Vec<Complex64>> = (0..nch)
-        .map(|c| {
-            (0..nch)
-                .map(|cp| {
-                    let delta = if c == cp {
-                        Complex64::new(1.0, 0.0)
-                    } else {
-                        Complex64::ZERO
-                    };
-                    let w_cc = delta + Complex64::new(0.0, 2.0) * xxxx[c][cp];
-                    omega[c] * w_cc * omega[cp]
-                })
-                .collect()
-        })
-        .collect();
+    for c in 0..nch {
+        for cp in 0..nch {
+            let delta = if c == cp {
+                Complex64::new(1.0, 0.0)
+            } else {
+                Complex64::ZERO
+            };
+            let w_cc = delta + Complex64::new(0.0, 2.0) * ws.xxxx[c * nch + cp];
+            ws.u[c * nch + cp] = ws.omega[c] * w_cc * ws.omega[cp];
+        }
+    }
 
     // ── Cross-sections (sum over entrance channels) ───────────────────────────
     // Optical theorem gives σ_total = 2·(π/k²)·g_J·(1 - Re(U_cc)) per channel.
@@ -555,34 +680,34 @@ fn spin_group_cross_sections(
     // Whether this spin group has explicit capture (photon) channels in the
     // level matrix.  KRM=2 with photon channels: yes.  KRM=3: no (capture is
     // implicit via complex poles; no MT=102 channel appears in NCH).
-    let has_explicit_capture = is_capture.iter().any(|&x| x);
+    let has_explicit_capture = ws.is_capture[..nch].iter().any(|&x| x);
 
     for c0 in 0..nch {
-        if !is_entrance[c0] {
+        if !ws.is_entrance[c0] {
             continue;
         }
-        let u_diag = u[c0][c0];
+        let u_diag = ws.u[c0 * nch + c0];
         // σ_total (optical theorem, per entrance channel)
         tot += 2.0 * pok2 * g_j * (1.0 - u_diag.re);
         // σ_elastic: |1 - U_{c0,c0}|²
         elas += pok2 * g_j * (Complex64::new(1.0, 0.0) - u_diag).norm_sqr();
 
         for cp in 0..nch {
-            if is_fission[cp] {
+            if ws.is_fission[cp] {
                 // σ_fission: |U_{c0,c'}|² for fission channels c'
-                fis += pok2 * g_j * u[c0][cp].norm_sqr();
+                fis += pok2 * g_j * ws.u[c0 * nch + cp].norm_sqr();
             }
-            if has_explicit_capture && is_capture[cp] {
+            if has_explicit_capture && ws.is_capture[cp] {
                 // σ_capture (explicit): |U_{c0,c'}|² for photon channels c'.
                 // Avoids lumping inelastic neutron channels (MT=51+) into capture.
                 // Reference: SAMMY rml/mrml11.f Sectio — explicit sum over γ channels.
-                cap += pok2 * g_j * u[c0][cp].norm_sqr();
+                cap += pok2 * g_j * ws.u[c0 * nch + cp].norm_sqr();
             }
-            if is_inelastic[cp] {
+            if ws.is_inelastic[cp] {
                 // σ_inelastic: |U_{c0,c'}|² for inelastic neutron channels (MT=51+).
                 // Tracked separately so KRM=3 capture residual excludes this flux.
                 // Reference: ENDF MT conventions §3.4; SAMMY rml/mrml11.f Sectio.
-                inel += pok2 * g_j * u[c0][cp].norm_sqr();
+                inel += pok2 * g_j * ws.u[c0 * nch + cp].norm_sqr();
             }
         }
     }
@@ -604,70 +729,115 @@ fn spin_group_cross_sections(
     (tot, elas, cap, fis)
 }
 
-// ── Complex Gauss-Jordan Elimination ─────────────────────────────────────────
+// ── Complex Gauss-Jordan Elimination (flat-buffer version) ──────────────────
 //
 // Inverts an n×n complex matrix using Gauss-Jordan elimination with partial
-// pivoting. Returns None if the matrix is singular (pivot magnitude < LOG_FLOOR).
+// pivoting. Returns false if the matrix is singular (pivot magnitude < LOG_FLOOR).
 //
 // For LRF=7 isotopes relevant to VENUS imaging, NCH ≤ 6, so O(n³) is fast.
 // SAMMY uses a specialized complex symmetric factorization (Xspfa/Xspsl in
 // rml/mrml10.f), but Gauss-Jordan is correct and sufficient for our purposes.
+//
+// All buffers are caller-provided to avoid per-call allocation:
+// - `a`: input matrix (flat row-major, n×n)
+// - `out`: output inverse (flat row-major, n×n)
+// - `aug`: augmented matrix workspace (flat row-major, n×2n)
+// - `tmp`: temporary row buffer (length 2n)
 
-fn invert_complex_matrix(a: &[Vec<Complex64>], n: usize) -> Option<Vec<Vec<Complex64>>> {
+fn invert_complex_matrix_flat(
+    a: &[Complex64],
+    n: usize,
+    out: &mut [Complex64],
+    aug: &mut [Complex64],
+    tmp: &mut [Complex64],
+) -> bool {
+    let w = 2 * n; // augmented row width
+
     // Build augmented matrix [A | I] of size n × 2n
-    let mut aug: Vec<Vec<Complex64>> = (0..n)
-        .map(|r| {
-            let mut row = a[r].clone();
-            for c in 0..n {
-                row.push(if c == r {
-                    Complex64::new(1.0, 0.0)
-                } else {
-                    Complex64::ZERO
-                });
-            }
-            row
-        })
-        .collect();
+    for r in 0..n {
+        for c in 0..n {
+            aug[r * w + c] = a[r * n + c];
+        }
+        for c in 0..n {
+            aug[r * w + n + c] = if c == r {
+                Complex64::new(1.0, 0.0)
+            } else {
+                Complex64::ZERO
+            };
+        }
+    }
 
     for col in 0..n {
         // Partial pivoting: find row with largest magnitude in this column
-        let pivot_row = (col..n).max_by(|&r1, &r2| {
-            aug[r1][col]
-                .norm()
-                .partial_cmp(&aug[r2][col].norm())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })?;
-        aug.swap(col, pivot_row);
+        let mut best = col;
+        let mut best_norm = aug[col * w + col].norm();
+        for r in (col + 1)..n {
+            let norm = aug[r * w + col].norm();
+            if norm > best_norm {
+                best = r;
+                best_norm = norm;
+            }
+        }
+        // Swap rows col and best in aug
+        if best != col {
+            for j in 0..w {
+                aug.swap(col * w + j, best * w + j);
+            }
+        }
 
-        let pivot = aug[col][col];
+        let pivot = aug[col * w + col];
         if pivot.norm() < LOG_FLOOR {
-            return None; // singular
+            return false; // singular
         }
 
         // Scale pivot row so leading entry becomes 1
         let inv_pivot = pivot.inv();
-        for elem in aug[col].iter_mut() {
-            *elem *= inv_pivot;
+        for j in 0..w {
+            aug[col * w + j] *= inv_pivot;
         }
 
-        // Eliminate this column from all other rows
+        // Eliminate this column from all other rows.
+        // Copy pivot row to tmp to avoid aliasing issues.
+        tmp[..w].copy_from_slice(&aug[col * w..col * w + w]);
         for row in 0..n {
             if row == col {
                 continue;
             }
-            let factor = aug[row][col];
+            let factor = aug[row * w + col];
             if factor.norm() < LOG_FLOOR {
                 continue;
             }
-            let col_scaled: Vec<Complex64> = aug[col].iter().map(|&x| factor * x).collect();
-            for (r_elem, sub) in aug[row].iter_mut().zip(col_scaled) {
-                *r_elem -= sub;
+            for j in 0..w {
+                aug[row * w + j] -= factor * tmp[j];
             }
         }
     }
 
     // Extract the right half (the inverse)
-    Some(aug.into_iter().map(|row| row[n..].to_vec()).collect())
+    for r in 0..n {
+        for c in 0..n {
+            out[r * n + c] = aug[r * w + n + c];
+        }
+    }
+    true
+}
+
+// ── Legacy wrapper for tests (allocating version) ───────────────────────────
+#[cfg(test)]
+fn invert_complex_matrix(a: &[Vec<Complex64>], n: usize) -> Option<Vec<Vec<Complex64>>> {
+    let flat_a: Vec<Complex64> = a.iter().flat_map(|row| row.iter().copied()).collect();
+    let mut flat_out = vec![Complex64::ZERO; n * n];
+    let mut aug = vec![Complex64::ZERO; n * 2 * n];
+    let mut tmp = vec![Complex64::ZERO; 2 * n];
+    if invert_complex_matrix_flat(&flat_a, n, &mut flat_out, &mut aug, &mut tmp) {
+        Some(
+            (0..n)
+                .map(|r| flat_out[r * n..(r + 1) * n].to_vec())
+                .collect(),
+        )
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

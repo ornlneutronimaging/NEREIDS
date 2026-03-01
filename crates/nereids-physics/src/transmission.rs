@@ -640,9 +640,13 @@ mod tests {
         let energies: Vec<f64> = (0..201).map(|i| 4.0 + (i as f64) * 0.025).collect();
         let temperature = 300.0;
 
-        let (xs, dxs_dt) =
-            broadened_cross_sections_with_derivative(&energies, &[data.clone()], temperature, None)
-                .unwrap();
+        let (xs, dxs_dt) = broadened_cross_sections_with_derivative(
+            &energies,
+            std::slice::from_ref(&data),
+            temperature,
+            None,
+        )
+        .unwrap();
 
         // Basic shape checks
         assert_eq!(xs.len(), 1, "one isotope");
@@ -666,9 +670,14 @@ mod tests {
         // the two derivatives are consistent (within ~1% relative error on
         // the derivative near the resonance peak).
         let big_dt = 1.0; // 1 K step — much larger than internal 0.03 K
-        let xs_up =
-            broadened_cross_sections(&energies, &[data.clone()], temperature + big_dt, None, None)
-                .unwrap();
+        let xs_up = broadened_cross_sections(
+            &energies,
+            std::slice::from_ref(&data),
+            temperature + big_dt,
+            None,
+            None,
+        )
+        .unwrap();
         let xs_down =
             broadened_cross_sections(&energies, &[data], temperature - big_dt, None, None).unwrap();
 
