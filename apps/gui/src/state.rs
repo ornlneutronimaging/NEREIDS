@@ -31,6 +31,33 @@ pub enum InputMode {
     TransmissionTiff,
 }
 
+/// Analysis mode — determines how fitting operates in the Analyze step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnalysisMode {
+    /// Fit every pixel independently (full spatial map).
+    FullSpatialMap,
+    /// Average ROI into one spectrum, fit once.
+    RoiSingleSpectrum,
+    /// Bin NxN pixels, fit the binned map.
+    SpatialBinning(u8),
+}
+
+/// Data source for the normalize-preview spectrum plot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpectrumDataSource {
+    /// Average over all pixels in the full image.
+    FullImage,
+    /// Average over the selected ROI.
+    RoiAverage,
+}
+
+/// X-axis unit for the spectrum plot in the normalize preview.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpectrumAxis {
+    EnergyEv,
+    TofMicroseconds,
+}
+
 /// Main application state.
 pub struct AppState {
     // -- Data loading --
@@ -82,6 +109,13 @@ pub struct AppState {
     pub status_message: String,
     pub is_fitting: bool,
     pub is_fetching_endf: bool,
+
+    // -- Normalize preview --
+    pub analysis_mode: AnalysisMode,
+    pub normalize_spectrum_source: SpectrumDataSource,
+    pub normalize_spectrum_axis: SpectrumAxis,
+    pub tof_slice_index: usize,
+    pub show_resonance_dips: bool,
 
     // -- Background task receivers and cancellation --
     pub pending_spatial: Option<mpsc::Receiver<Result<SpatialResult, String>>>,
@@ -256,6 +290,12 @@ impl Default for AppState {
             status_message: "Ready".into(),
             is_fitting: false,
             is_fetching_endf: false,
+
+            analysis_mode: AnalysisMode::FullSpatialMap,
+            normalize_spectrum_source: SpectrumDataSource::FullImage,
+            normalize_spectrum_axis: SpectrumAxis::EnergyEv,
+            tof_slice_index: 0,
+            show_resonance_dips: false,
 
             pending_spatial: None,
             pending_endf: None,

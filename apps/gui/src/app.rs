@@ -32,17 +32,6 @@ impl eframe::App for NereidsApp {
             ctx.request_repaint();
         }
 
-        // Check for pixel clicks from map panel
-        if let Some((y, x)) =
-            ctx.data(|d| d.get_temp::<(usize, usize)>(egui::Id::new("clicked_pixel")))
-        {
-            self.state.selected_pixel = Some((y, x));
-            self.state.pixel_fit_result = None;
-            ctx.data_mut(|d| {
-                d.remove_temp::<(usize, usize)>(egui::Id::new("clicked_pixel"));
-            });
-        }
-
         // Top toolbar
         widgets::toolbar::toolbar(ctx, &mut self.state);
 
