@@ -223,6 +223,9 @@ def cross_sections(
     """Compute cross-sections at given energies for an isotope.
 
     Returns a dict with keys 'total', 'elastic', 'capture', 'fission'.
+
+    Note: MLBW (Multi-Level Breit-Wigner) ranges use SLBW approximation
+    (resonance-resonance interference is ignored).
     """
     ...
 
