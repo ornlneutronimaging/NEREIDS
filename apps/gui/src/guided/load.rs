@@ -36,8 +36,22 @@ pub fn load_step(ui: &mut egui::Ui, state: &mut AppState) {
 
 /// TIFF Pair tab: Sample + Open Beam + Spectrum file.
 fn tiff_pair_tab(ui: &mut egui::Ui, state: &mut AppState) {
-    tiff_browse_row(ui, "Sample", &mut state.sample_path);
-    tiff_browse_row(ui, "Open Beam", &mut state.open_beam_path);
+    if tiff_browse_row(ui, "Sample", &mut state.sample_path) {
+        state.sample_data = None;
+        state.normalized = None;
+        state.dead_pixels = None;
+        state.energies = None;
+        state.pixel_fit_result = None;
+        state.spatial_result = None;
+    }
+    if tiff_browse_row(ui, "Open Beam", &mut state.open_beam_path) {
+        state.open_beam_data = None;
+        state.normalized = None;
+        state.dead_pixels = None;
+        state.energies = None;
+        state.pixel_fit_result = None;
+        state.spatial_result = None;
+    }
 
     ui.add_space(8.0);
     spectrum_input_section(ui, state);
@@ -59,7 +73,14 @@ fn tiff_pair_tab(ui: &mut egui::Ui, state: &mut AppState) {
 
 /// Transmission TIFF tab: pre-normalized TIFF + Spectrum file.
 fn transmission_tiff_tab(ui: &mut egui::Ui, state: &mut AppState) {
-    tiff_browse_row(ui, "Transmission", &mut state.sample_path);
+    if tiff_browse_row(ui, "Transmission", &mut state.sample_path) {
+        state.sample_data = None;
+        state.normalized = None;
+        state.dead_pixels = None;
+        state.energies = None;
+        state.pixel_fit_result = None;
+        state.spatial_result = None;
+    }
 
     ui.add_space(8.0);
     spectrum_input_section(ui, state);
@@ -78,7 +99,11 @@ fn transmission_tiff_tab(ui: &mut egui::Ui, state: &mut AppState) {
 }
 
 /// A TIFF browse row with both "Browse Folder..." and "File..." buttons.
-fn tiff_browse_row(ui: &mut egui::Ui, label: &str, path: &mut Option<std::path::PathBuf>) {
+///
+/// Returns `true` if the user selected a new path (callers should invalidate
+/// dependent state).
+fn tiff_browse_row(ui: &mut egui::Ui, label: &str, path: &mut Option<std::path::PathBuf>) -> bool {
+    let mut changed = false;
     ui.horizontal(|ui| {
         ui.label(format!("{}:", label));
         match path.as_ref() {
@@ -100,6 +125,7 @@ fn tiff_browse_row(ui: &mut egui::Ui, label: &str, path: &mut Option<std::path::
             && let Some(dir) = rfd::FileDialog::new().pick_folder()
         {
             *path = Some(dir);
+            changed = true;
         }
         if ui.small_button("File...").clicked()
             && let Some(file) = rfd::FileDialog::new()
@@ -107,8 +133,10 @@ fn tiff_browse_row(ui: &mut egui::Ui, label: &str, path: &mut Option<std::path::
                 .pick_file()
         {
             *path = Some(file);
+            changed = true;
         }
     });
+    changed
 }
 
 /// Spectrum file input section: browse, unit selector, value kind selector.
@@ -138,6 +166,7 @@ fn spectrum_input_section(ui: &mut egui::Ui, state: &mut AppState) {
         }
     });
 
+    let prev_unit = state.spectrum_unit;
     ui.horizontal(|ui| {
         ui.label("Values are:");
         ui.selectable_value(
@@ -152,6 +181,7 @@ fn spectrum_input_section(ui: &mut egui::Ui, state: &mut AppState) {
         );
     });
 
+    let prev_kind = state.spectrum_kind;
     ui.horizontal(|ui| {
         ui.label("Value type:");
         ui.selectable_value(
@@ -165,6 +195,12 @@ fn spectrum_input_section(ui: &mut egui::Ui, state: &mut AppState) {
             "Bin centers",
         );
     });
+
+    // Invalidate derived data when unit/kind settings change
+    if state.spectrum_unit != prev_unit || state.spectrum_kind != prev_kind {
+        state.energies = None;
+        state.normalized = None;
+    }
 
     if let Some(ref vals) = state.spectrum_values {
         ui.label(format!(
@@ -228,6 +264,18 @@ fn load_all_data(state: &mut AppState) {
                 return;
             }
         }
+    }
+
+    // Validate frame count consistency between sample and open beam
+    if let (Some(sample), Some(ob)) = (&state.sample_data, &state.open_beam_data)
+        && sample.shape()[0] != ob.shape()[0]
+    {
+        state.status_message = format!(
+            "Frame count mismatch: sample has {} frames, open beam has {}",
+            sample.shape()[0],
+            ob.shape()[0]
+        );
+        return;
     }
 
     // Parse spectrum file

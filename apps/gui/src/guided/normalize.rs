@@ -121,7 +121,12 @@ fn prepare_transmission(state: &mut AppState) {
         None => return,
     };
 
+    // No open beam in transmission mode — dead pixel detection not applicable
+    state.dead_pixels = None;
+
     let n_tof = sample.shape()[0];
+    // TODO(Phase 2b): estimate uncertainty from data or allow user to specify.
+    // Using uniform synthetic uncertainty since no open beam is available.
     let uncertainty = ndarray::Array3::from_elem(sample.raw_dim(), 0.01);
 
     match compute_energies(state, n_tof) {
@@ -136,7 +141,7 @@ fn prepare_transmission(state: &mut AppState) {
         transmission: sample,
         uncertainty,
     }));
-    state.status_message = "Transmission data ready (pre-normalized)".into();
+    state.status_message = "Transmission ready (synthetic uncertainty — see docs)".into();
 }
 
 /// Compute energy bin centers from spectrum file or synthetic TOF edges.
@@ -146,39 +151,61 @@ fn prepare_transmission(state: &mut AppState) {
 /// (backward compatibility).
 fn compute_energies(state: &AppState, n_tof: usize) -> Result<Vec<f64>, String> {
     if let Some(ref values) = state.spectrum_values {
-        match (state.spectrum_unit, state.spectrum_kind) {
+        let energies = match (state.spectrum_unit, state.spectrum_kind) {
             (SpectrumUnit::TofMicroseconds, SpectrumValueKind::BinEdges) => {
                 // TOF edges → energy centers via geometric mean
                 nereids_io::tof::tof_edges_to_energy_centers(values, &state.beamline)
                     .map(|a| a.to_vec())
-                    .map_err(|e| format!("{}", e))
+                    .map_err(|e| format!("{}", e))?
             }
             (SpectrumUnit::TofMicroseconds, SpectrumValueKind::BinCenters) => {
                 // Convert each TOF center to energy directly
+                if !state.beamline.flight_path_m.is_finite() || state.beamline.flight_path_m <= 0.0
+                {
+                    return Err("Flight path must be positive and finite".into());
+                }
                 let mut energies: Vec<f64> = values
                     .iter()
                     .map(|&tof| {
                         let corrected = tof - state.beamline.delay_us;
-                        nereids_core::constants::tof_to_energy(
+                        if corrected <= 0.0 || !corrected.is_finite() {
+                            return Err(format!(
+                                "TOF {:.2} µs - delay {:.2} µs = {:.2} µs is not positive",
+                                tof, state.beamline.delay_us, corrected
+                            ));
+                        }
+                        Ok(nereids_core::constants::tof_to_energy(
                             corrected,
                             state.beamline.flight_path_m,
-                        )
+                        ))
                     })
-                    .collect();
+                    .collect::<Result<Vec<f64>, String>>()?;
                 // TOF ascending → energy descending, so reverse
                 energies.reverse();
-                Ok(energies)
+                energies
             }
             (SpectrumUnit::EnergyEv, SpectrumValueKind::BinEdges) => {
                 // Energy edges → geometric mean centers
-                let centers: Vec<f64> = values.windows(2).map(|w| (w[0] * w[1]).sqrt()).collect();
-                Ok(centers)
+                if values.iter().any(|&v| v <= 0.0) {
+                    return Err("Energy bin edges must be positive for geometric mean".into());
+                }
+                values.windows(2).map(|w| (w[0] * w[1]).sqrt()).collect()
             }
             (SpectrumUnit::EnergyEv, SpectrumValueKind::BinCenters) => {
                 // Direct: energy centers
-                Ok(values.clone())
+                values.clone()
             }
+        };
+
+        if energies.len() != n_tof {
+            return Err(format!(
+                "Energy grid has {} points but data has {} frames — check spectrum unit/kind settings",
+                energies.len(),
+                n_tof
+            ));
         }
+
+        Ok(energies)
     } else {
         // Fallback: synthetic linear TOF edges (backward compatibility)
         let tof_edges =

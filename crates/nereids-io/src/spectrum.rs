@@ -119,11 +119,15 @@ pub fn validate_spectrum_frame_count(
 /// Validate that values are strictly monotonically increasing.
 pub fn validate_monotonic(values: &[f64]) -> Result<(), IoError> {
     for window in values.windows(2) {
-        if window[1] <= window[0] {
-            return Err(IoError::InvalidParameter(format!(
-                "Spectrum values must be strictly increasing, but found {} >= {}",
-                window[0], window[1],
-            )));
+        match window[0].partial_cmp(&window[1]) {
+            Some(std::cmp::Ordering::Less) => {} // strictly increasing — OK
+            _ => {
+                // Equal, decreasing, or NaN (partial_cmp returns None)
+                return Err(IoError::InvalidParameter(format!(
+                    "Spectrum values must be strictly increasing, but found {} >= {}",
+                    window[0], window[1],
+                )));
+            }
         }
     }
     Ok(())
@@ -245,6 +249,12 @@ TOF_us, intensity
     fn test_validate_monotonic_decreasing() {
         let result = validate_monotonic(&[1.0, 3.0, 2.0, 4.0]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_monotonic_nan() {
+        let result = validate_monotonic(&[1.0, f64::NAN, 3.0]);
+        assert!(result.is_err(), "NaN should fail monotonicity check");
     }
 
     #[test]
