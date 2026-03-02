@@ -227,25 +227,24 @@ fn tile_toolbelt(
         }
 
         // Save PNG button
-        if ui.small_button("Save PNG").clicked() {
-            if let Some(path) = rfd::FileDialog::new()
+        if ui.small_button("Save PNG").clicked()
+            && let Some(path) = rfd::FileDialog::new()
                 .set_file_name(format!("{label}.png"))
                 .add_filter("PNG", &["png"])
                 .save_file()
-            {
-                let colormap = state
-                    .tile_display
-                    .get(tile_idx)
-                    .map_or(Colormap::Viridis, |t| t.colormap);
-                let rgba = render_to_rgba(data, colormap);
-                let (h, w) = (data.shape()[0] as u32, data.shape()[1] as u32);
-                match image::save_buffer(&path, &rgba, w, h, image::ColorType::Rgba8) {
-                    Ok(()) => {
-                        state.status_message = format!("Saved PNG: {}", path.display());
-                    }
-                    Err(e) => {
-                        state.status_message = format!("PNG save error: {e}");
-                    }
+        {
+            let colormap = state
+                .tile_display
+                .get(tile_idx)
+                .map_or(Colormap::Viridis, |t| t.colormap);
+            let rgba = render_to_rgba(data, colormap);
+            let (h, w) = (data.shape()[0] as u32, data.shape()[1] as u32);
+            match image::save_buffer(&path, &rgba, w, h, image::ColorType::Rgba8) {
+                Ok(()) => {
+                    state.status_message = format!("Saved PNG: {}", path.display());
+                }
+                Err(e) => {
+                    state.status_message = format!("PNG save error: {e}");
                 }
             }
         }
@@ -395,10 +394,10 @@ fn export_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 let dir_label = state.export_directory.as_deref().unwrap_or("(not set)");
                 ui.label(egui::RichText::new(dir_label).monospace());
 
-                if ui.button("Browse...").clicked() {
-                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                        state.export_directory = Some(path.display().to_string());
-                    }
+                if ui.button("Browse...").clicked()
+                    && let Some(path) = rfd::FileDialog::new().pick_folder()
+                {
+                    state.export_directory = Some(path.display().to_string());
                 }
             });
 
