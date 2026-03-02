@@ -454,7 +454,38 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 (SpectrumUnit::TofMicroseconds, SpectrumValueKind::BinCenters) => {
                     (v.iter().take(n_tof).copied().collect(), "TOF (\u{03bc}s)")
                 }
-                (SpectrumUnit::EnergyEv, _) => {
+                (SpectrumUnit::EnergyEv, SpectrumValueKind::BinEdges) => {
+                    if state.beamline.flight_path_m.is_finite()
+                        && state.beamline.flight_path_m > 0.0
+                    {
+                        // Compute bin centers from edges, then convert to TOF.
+                        let tof_vals: Vec<f64> = v
+                            .windows(2)
+                            .take(n_tof)
+                            .map(|w| {
+                                let center = 0.5 * (w[0] + w[1]);
+                                if center > 0.0 {
+                                    nereids_core::constants::energy_to_tof(
+                                        center,
+                                        state.beamline.flight_path_m,
+                                    ) + state.beamline.delay_us
+                                } else {
+                                    f64::NAN
+                                }
+                            })
+                            .collect();
+                        (tof_vals, "TOF (\u{03bc}s)")
+                    } else {
+                        // Fallback: show bin centers in energy units.
+                        let centers: Vec<f64> = v
+                            .windows(2)
+                            .take(n_tof)
+                            .map(|w| 0.5 * (w[0] + w[1]))
+                            .collect();
+                        (centers, "Energy (eV)")
+                    }
+                }
+                (SpectrumUnit::EnergyEv, SpectrumValueKind::BinCenters) => {
                     if state.beamline.flight_path_m.is_finite()
                         && state.beamline.flight_path_m > 0.0
                     {
@@ -578,8 +609,13 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
 
             // Resonance dip markers (energy axis only)
             if state.analyze_spectrum_axis == SpectrumAxis::EnergyEv {
-                let x_min = x_values[0].min(x_values[n_plot - 1]);
-                let x_max = x_values[0].max(x_values[n_plot - 1]);
+                let (x_min, x_max) = x_values
+                    .iter()
+                    .copied()
+                    .filter(|v| v.is_finite())
+                    .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
+                        (lo.min(v), hi.max(v))
+                    });
                 for entry in &state.isotope_entries {
                     if !entry.enabled {
                         continue;

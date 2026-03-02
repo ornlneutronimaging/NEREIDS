@@ -136,6 +136,7 @@ fn density_map_grid(ui: &mut egui::Ui, state: &mut AppState) {
                                 &format!("result_density_{}", i),
                             ) {
                                 state.selected_pixel = Some((y, x));
+                                state.pixel_fit_result = None;
                             }
                         });
                     }

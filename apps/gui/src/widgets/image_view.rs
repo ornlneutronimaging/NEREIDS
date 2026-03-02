@@ -118,6 +118,9 @@ fn draw_roi_overlay(
     if width == 0 || height == 0 {
         return;
     }
+    if roi.x_start >= roi.x_end || roi.y_start >= roi.y_end {
+        return;
+    }
 
     let x0 = image_rect.left() + (roi.x_start as f32 / width as f32) * image_rect.width();
     let x1 = image_rect.left() + (roi.x_end as f32 / width as f32) * image_rect.width();
