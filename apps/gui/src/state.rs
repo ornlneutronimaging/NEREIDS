@@ -9,10 +9,11 @@ use std::sync::mpsc;
 use nereids_endf::resonance::ResonanceData;
 use nereids_endf::retrieval::EndfLibrary;
 use nereids_fitting::lm::LmConfig;
-use nereids_io::nexus::NexusMetadata;
+use nereids_io::nexus::{Hdf5TreeEntry, NexusMetadata};
 use nereids_io::normalization::NormalizedData;
 use nereids_io::spectrum::{SpectrumUnit, SpectrumValueKind};
 use nereids_io::tof::BeamlineParams;
+use nereids_pipeline::detectability::TraceDetectabilityReport;
 use nereids_pipeline::pipeline::SpectrumFitResult;
 use nereids_pipeline::spatial::SpatialResult;
 
@@ -68,6 +69,24 @@ pub enum SpectrumDataSource {
 pub enum SpectrumAxis {
     EnergyEv,
     TofMicroseconds,
+}
+
+/// Target context for the periodic table modal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeriodicTableTarget {
+    Configure,
+    ForwardModel,
+    DetectMatrix,
+    DetectTrace,
+}
+
+/// A trace isotope entry for detectability analysis.
+pub struct DetectTraceEntry {
+    pub z: u32,
+    pub a: u32,
+    pub symbol: String,
+    pub concentration_ppm: f64,
+    pub resonance_data: Option<ResonanceData>,
 }
 
 /// Main application state.
@@ -153,6 +172,41 @@ pub struct AppState {
     // -- Preview image texture --
     pub preview_image: Option<Array2<f64>>,
     pub map_display_isotope: usize,
+
+    // -- Forward Model tool --
+    pub fm_isotope_entries: Vec<IsotopeEntry>,
+    pub fm_endf_library: EndfLibrary,
+    pub pending_fm_endf: Option<mpsc::Receiver<EndfFetchResult>>,
+    pub is_fetching_fm_endf: bool,
+    pub fm_temperature_k: f64,
+    pub fm_spectrum_axis: SpectrumAxis,
+    pub fm_spectrum: Option<Vec<f64>>,
+    pub fm_per_isotope_spectra: Vec<(String, Vec<f64>)>,
+    pub fm_energies: Option<Vec<f64>>,
+
+    // -- Detectability tool --
+    pub detect_matrix: Option<IsotopeEntry>,
+    pub detect_matrix_density: f64,
+    pub detect_trace_entries: Vec<DetectTraceEntry>,
+    pub detect_snr_threshold: f64,
+    pub detect_i0: f64,
+    pub detect_energy_min: f64,
+    pub detect_energy_max: f64,
+    pub detect_n_energy_points: usize,
+    pub detect_results: Vec<(String, TraceDetectabilityReport)>,
+    pub detect_show_advanced: bool,
+    pub pending_detect_endf: Option<mpsc::Receiver<EndfFetchResult>>,
+    pub is_fetching_detect_endf: bool,
+    pub detect_endf_library: EndfLibrary,
+    pub detect_temperature_k: f64,
+
+    // -- Periodic Table modal --
+    pub periodic_table_open: bool,
+    pub periodic_table_target: PeriodicTableTarget,
+    pub periodic_table_selected_z: Option<u32>,
+
+    // -- HDF5 tree browser --
+    pub hdf5_tree: Option<Vec<Hdf5TreeEntry>>,
 }
 
 /// An isotope the user wants to include in the fit.
@@ -255,8 +309,12 @@ impl AppState {
         self.cancel_token = Arc::new(AtomicBool::new(false));
         self.pending_spatial = None;
         self.pending_endf = None;
+        self.pending_fm_endf = None;
+        self.pending_detect_endf = None;
         self.is_fitting = false;
         self.is_fetching_endf = false;
+        self.is_fetching_fm_endf = false;
+        self.is_fetching_detect_endf = false;
     }
 
     /// Clear pixel selection, ROI, results, normalization, and cancel pending tasks.
@@ -345,6 +403,37 @@ impl Default for AppState {
 
             preview_image: None,
             map_display_isotope: 0,
+
+            fm_isotope_entries: Vec::new(),
+            fm_endf_library: EndfLibrary::EndfB8_0,
+            pending_fm_endf: None,
+            is_fetching_fm_endf: false,
+            fm_temperature_k: 296.0,
+            fm_spectrum_axis: SpectrumAxis::EnergyEv,
+            fm_spectrum: None,
+            fm_per_isotope_spectra: Vec::new(),
+            fm_energies: None,
+
+            detect_matrix: None,
+            detect_matrix_density: 0.001,
+            detect_trace_entries: Vec::new(),
+            detect_snr_threshold: 3.0,
+            detect_i0: 10_000.0,
+            detect_energy_min: 1.0,
+            detect_energy_max: 100.0,
+            detect_n_energy_points: 2000,
+            detect_results: Vec::new(),
+            detect_show_advanced: false,
+            pending_detect_endf: None,
+            is_fetching_detect_endf: false,
+            detect_endf_library: EndfLibrary::EndfB8_0,
+            detect_temperature_k: 296.0,
+
+            periodic_table_open: false,
+            periodic_table_target: PeriodicTableTarget::Configure,
+            periodic_table_selected_z: None,
+
+            hdf5_tree: None,
         }
     }
 }

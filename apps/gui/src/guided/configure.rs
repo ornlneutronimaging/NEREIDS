@@ -1,6 +1,6 @@
 //! Step 2: Configuration — beamline parameters, isotope selection, ENDF fetch.
 
-use crate::state::{AppState, EndfFetchResult, IsotopeEntry};
+use crate::state::{AppState, EndfFetchResult, GuidedStep, IsotopeEntry, PeriodicTableTarget};
 use nereids_endf::retrieval::EndfLibrary;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -8,7 +8,12 @@ use std::sync::mpsc;
 
 /// Draw the Configure step content.
 pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
-    ui.heading("Configure");
+    ui.horizontal(|ui| {
+        ui.heading("Configure");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            teleport_pill(ui, "Forward Model →", GuidedStep::ForwardModel, state);
+        });
+    });
     ui.separator();
 
     // --- Beamline parameters ---
@@ -103,6 +108,11 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
                 // Invalidate stale results — isotope order may have changed.
                 state.spatial_result = None;
                 state.pixel_fit_result = None;
+            }
+            if ui.button("Periodic Table...").clicked() {
+                state.periodic_table_open = true;
+                state.periodic_table_target = PeriodicTableTarget::Configure;
+                state.periodic_table_selected_z = None;
             }
         });
     });
@@ -275,4 +285,18 @@ fn fetch_endf_data(state: &mut AppState) {
             });
         }
     });
+}
+
+fn teleport_pill(ui: &mut egui::Ui, label: &str, target: GuidedStep, state: &mut AppState) {
+    let accent = crate::theme::ThemeColors::from_ctx(ui.ctx()).accent;
+    let btn = egui::Button::new(
+        egui::RichText::new(label)
+            .small()
+            .color(egui::Color32::WHITE),
+    )
+    .fill(accent)
+    .corner_radius(12.0);
+    if ui.add(btn).clicked() {
+        state.guided_step = target;
+    }
 }

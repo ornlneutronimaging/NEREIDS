@@ -35,4 +35,8 @@ pub enum IoError {
     /// Invalid parameter.
     #[error("Invalid parameter: {0}")]
     InvalidParameter(String),
+
+    /// HDF5 format or access error.
+    #[error("HDF5 error: {0}")]
+    Hdf5Error(String),
 }

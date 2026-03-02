@@ -5,7 +5,9 @@
 //! this redesign shows both side-by-side so the user can click a pixel on the
 //! map and immediately see its spectrum.
 
-use crate::state::{AppState, InputMode, IsotopeEntry, RoiSelection, SolverMethod, SpectrumAxis};
+use crate::state::{
+    AppState, GuidedStep, InputMode, IsotopeEntry, RoiSelection, SolverMethod, SpectrumAxis,
+};
 use crate::widgets::image_view::{show_viridis_image, show_viridis_image_with_roi};
 use egui_plot::{Line, Plot, PlotPoints, VLine};
 use ndarray::Axis;
@@ -42,7 +44,12 @@ pub fn analyze_step(ui: &mut egui::Ui, state: &mut AppState) {
         crate::guided::normalize::prepare_transmission(state);
     }
 
-    ui.heading("Analyze");
+    ui.horizontal(|ui| {
+        ui.heading("Analyze");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            teleport_pill(ui, "← Forward Model", GuidedStep::ForwardModel, state);
+        });
+    });
     ui.separator();
 
     let available_width = ui.available_width();
@@ -880,4 +887,18 @@ pub fn run_spatial_map(state: &mut AppState) {
             }
         }
     });
+}
+
+fn teleport_pill(ui: &mut egui::Ui, label: &str, target: GuidedStep, state: &mut AppState) {
+    let accent = crate::theme::ThemeColors::from_ctx(ui.ctx()).accent;
+    let btn = egui::Button::new(
+        egui::RichText::new(label)
+            .small()
+            .color(egui::Color32::WHITE),
+    )
+    .fill(accent)
+    .corner_radius(12.0);
+    if ui.add(btn).clicked() {
+        state.guided_step = target;
+    }
 }

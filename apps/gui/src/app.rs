@@ -28,7 +28,11 @@ impl eframe::App for NereidsApp {
         poll_pending_tasks(&mut self.state);
 
         // Keep repainting while background work is in progress
-        if self.state.is_fitting || self.state.is_fetching_endf {
+        if self.state.is_fitting
+            || self.state.is_fetching_endf
+            || self.state.is_fetching_fm_endf
+            || self.state.is_fetching_detect_endf
+        {
             ctx.request_repaint();
         }
 
@@ -52,6 +56,9 @@ impl eframe::App for NereidsApp {
                 studio::studio_content(ctx, &mut self.state);
             }
         }
+
+        // Periodic table modal overlay
+        crate::widgets::periodic_table::periodic_table_modal(ctx, &mut self.state);
     }
 }
 
@@ -124,6 +131,98 @@ fn poll_pending_tasks(state: &mut AppState) {
             }
             state.is_fetching_endf = false;
             state.pending_endf = None;
+        }
+    }
+
+    // Poll Forward Model ENDF fetch results
+    if let Some(ref rx) = state.pending_fm_endf {
+        let mut disconnected = false;
+        loop {
+            match rx.try_recv() {
+                Ok(fetch) => {
+                    if let Some(entry) = state.fm_isotope_entries.get_mut(fetch.index) {
+                        match fetch.result {
+                            Ok(data) => {
+                                entry.resonance_data = Some(data);
+                                state.status_message = format!("FM: loaded {}", fetch.symbol);
+                                state.fm_spectrum = None;
+                                state.fm_per_isotope_spectra.clear();
+                            }
+                            Err(msg) => {
+                                state.status_message = msg;
+                            }
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+        if disconnected {
+            if !state
+                .fm_isotope_entries
+                .iter()
+                .any(|e| e.enabled && e.resonance_data.is_none())
+            {
+                state.status_message = "FM: all ENDF data loaded".into();
+            }
+            state.is_fetching_fm_endf = false;
+            state.pending_fm_endf = None;
+        }
+    }
+
+    // Poll Detectability ENDF fetch results
+    // Index convention: 0 = matrix isotope, 1+ = trace entries at position (index - 1)
+    if let Some(ref rx) = state.pending_detect_endf {
+        let mut disconnected = false;
+        loop {
+            match rx.try_recv() {
+                Ok(fetch) => {
+                    if fetch.index == 0 {
+                        // Matrix isotope
+                        if let Some(ref mut matrix) = state.detect_matrix {
+                            match fetch.result {
+                                Ok(data) => {
+                                    matrix.resonance_data = Some(data);
+                                    state.status_message =
+                                        format!("Detect: loaded matrix {}", fetch.symbol);
+                                }
+                                Err(msg) => {
+                                    state.status_message = msg;
+                                }
+                            }
+                        }
+                    } else {
+                        // Trace isotope at position (index - 1)
+                        let trace_idx = fetch.index - 1;
+                        if let Some(entry) = state.detect_trace_entries.get_mut(trace_idx) {
+                            match fetch.result {
+                                Ok(data) => {
+                                    entry.resonance_data = Some(data);
+                                    state.status_message =
+                                        format!("Detect: loaded trace {}", fetch.symbol);
+                                }
+                                Err(msg) => {
+                                    state.status_message = msg;
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+        if disconnected {
+            state.status_message = "Detect: all ENDF data loaded".into();
+            state.is_fetching_detect_endf = false;
+            state.pending_detect_endf = None;
         }
     }
 }

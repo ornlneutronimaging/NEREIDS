@@ -14,7 +14,7 @@ pub fn results_step(ui: &mut egui::Ui, state: &mut AppState) {
             ui.label("Run spatial mapping (Analyze step) to see results here.");
             ui.add_space(8.0);
             ui.label(
-                egui::RichText::new("Export functionality coming in Phase 4.")
+                egui::RichText::new("Export functionality coming in Phase 5.")
                     .italics()
                     .color(crate::theme::semantic::ORANGE),
             );
@@ -35,7 +35,7 @@ pub fn results_step(ui: &mut egui::Ui, state: &mut AppState) {
     ui.add_space(12.0);
 
     ui.label(
-        egui::RichText::new("Export functionality coming in Phase 4.")
+        egui::RichText::new("Export functionality coming in Phase 5.")
             .italics()
             .color(crate::theme::semantic::ORANGE),
     );
