@@ -376,7 +376,7 @@ fn fm_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
             }
         }
 
-        state.fm_energies = Some(energies.clone());
+        state.fm_energies = state.energies.clone();
     }
 
     // Use the cached energy grid for plotting
