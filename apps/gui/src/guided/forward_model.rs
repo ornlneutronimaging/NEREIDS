@@ -92,6 +92,7 @@ pub fn forward_model_step(ui: &mut egui::Ui, state: &mut AppState) {
 /// Isotope table controls for the Forward Model (independent from Configure).
 fn fm_isotope_controls(ui: &mut egui::Ui, state: &mut AppState) {
     // ENDF library selector
+    let prev_lib = state.fm_endf_library;
     ui.horizontal(|ui| {
         ui.label("Library:");
         egui::ComboBox::from_id_salt("fm_endf_lib")
@@ -111,6 +112,14 @@ fn fm_isotope_controls(ui: &mut egui::Ui, state: &mut AppState) {
                 ui.selectable_value(&mut state.fm_endf_library, EndfLibrary::Jendl5, "JENDL-5");
             });
     });
+    // Library change invalidates all resonance data — must re-fetch
+    if state.fm_endf_library != prev_lib {
+        for e in &mut state.fm_isotope_entries {
+            e.resonance_data = None;
+        }
+        state.fm_spectrum = None;
+        state.fm_per_isotope_spectra.clear();
+    }
 
     // Temperature
     ui.horizontal(|ui| {

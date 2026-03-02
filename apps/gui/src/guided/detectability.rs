@@ -52,6 +52,7 @@ fn detect_controls(ui: &mut egui::Ui, state: &mut AppState) {
     ui.add_space(4.0);
 
     // ENDF library selector
+    let prev_lib = state.detect_endf_library;
     ui.horizontal(|ui| {
         ui.label("Library:");
         egui::ComboBox::from_id_salt("detect_endf_lib")
@@ -79,6 +80,16 @@ fn detect_controls(ui: &mut egui::Ui, state: &mut AppState) {
                 );
             });
     });
+    // Library change invalidates all resonance data — must re-fetch
+    if state.detect_endf_library != prev_lib {
+        if let Some(ref mut m) = state.detect_matrix {
+            m.resonance_data = None;
+        }
+        for t in &mut state.detect_trace_entries {
+            t.resonance_data = None;
+        }
+        state.detect_results.clear();
+    }
 
     if let Some(ref mut matrix) = state.detect_matrix {
         ui.horizontal(|ui| {
@@ -247,6 +258,14 @@ fn detect_controls(ui: &mut egui::Ui, state: &mut AppState) {
     ui.add_space(8.0);
 
     // --- Advanced config ---
+    // Snapshot values to detect changes
+    let prev_snr = state.detect_snr_threshold;
+    let prev_i0 = state.detect_i0;
+    let prev_emin = state.detect_energy_min;
+    let prev_emax = state.detect_energy_max;
+    let prev_npts = state.detect_n_energy_points;
+    let prev_temp = state.detect_temperature_k;
+
     egui::CollapsingHeader::new("Advanced")
         .default_open(false)
         .show(ui, |ui| {
@@ -297,6 +316,17 @@ fn detect_controls(ui: &mut egui::Ui, state: &mut AppState) {
                 );
             });
         });
+
+    // Invalidate stale results when any config param changes
+    if state.detect_snr_threshold != prev_snr
+        || state.detect_i0 != prev_i0
+        || state.detect_energy_min != prev_emin
+        || state.detect_energy_max != prev_emax
+        || state.detect_n_energy_points != prev_npts
+        || state.detect_temperature_k != prev_temp
+    {
+        state.detect_results.clear();
+    }
 
     ui.add_space(8.0);
 
