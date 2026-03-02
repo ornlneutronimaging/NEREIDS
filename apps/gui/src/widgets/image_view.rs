@@ -123,6 +123,8 @@ pub fn show_colormapped_image_with_roi(
 }
 
 /// Compute the (min, max) of finite values in a 2D array.
+///
+/// Returns `(0.0, 0.0)` when no finite values exist (empty or all-NaN).
 pub fn data_range(data: &ndarray::Array2<f64>) -> (f64, f64) {
     let mut vmin = f64::INFINITY;
     let mut vmax = f64::NEG_INFINITY;
@@ -132,7 +134,12 @@ pub fn data_range(data: &ndarray::Array2<f64>) -> (f64, f64) {
             vmax = vmax.max(v);
         }
     }
-    (vmin, vmax)
+    if vmin > vmax {
+        // No finite values found
+        (0.0, 0.0)
+    } else {
+        (vmin, vmax)
+    }
 }
 
 /// Render a 2D f64 array to RGBA bytes using the specified colormap.
@@ -140,6 +147,9 @@ pub fn data_range(data: &ndarray::Array2<f64>) -> (f64, f64) {
 /// Returns a Vec of length `width * height * 4` in RGBA order.
 pub fn render_to_rgba(data: &ndarray::Array2<f64>, colormap: Colormap) -> Vec<u8> {
     let (height, width) = (data.shape()[0], data.shape()[1]);
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
     let (vmin, vmax) = data_range(data);
     let range = if (vmax - vmin).abs() < 1e-30 {
         1.0
@@ -245,7 +255,11 @@ pub fn viridis(t: f64) -> (u8, u8, u8) {
         )
     };
 
-    (r as u8, g as u8, b as u8)
+    (
+        r.clamp(0.0, 255.0) as u8,
+        g.clamp(0.0, 255.0) as u8,
+        b.clamp(0.0, 255.0) as u8,
+    )
 }
 
 /// 4-segment linear approximation of the inferno colormap.
@@ -281,7 +295,11 @@ pub fn inferno(t: f64) -> (u8, u8, u8) {
         )
     };
 
-    (r as u8, g as u8, b as u8)
+    (
+        r.clamp(0.0, 255.0) as u8,
+        g.clamp(0.0, 255.0) as u8,
+        b.clamp(0.0, 255.0) as u8,
+    )
 }
 
 /// 4-segment linear approximation of the plasma colormap.
@@ -317,7 +335,11 @@ pub fn plasma(t: f64) -> (u8, u8, u8) {
         )
     };
 
-    (r as u8, g as u8, b as u8)
+    (
+        r.clamp(0.0, 255.0) as u8,
+        g.clamp(0.0, 255.0) as u8,
+        b.clamp(0.0, 255.0) as u8,
+    )
 }
 
 /// Linear grayscale colormap (black to white).

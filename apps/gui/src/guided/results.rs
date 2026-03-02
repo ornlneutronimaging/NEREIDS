@@ -535,20 +535,7 @@ fn export_markdown(
     let path = dir.join("nereids_report.md");
     let provenance: Vec<(String, String)> = provenance_log
         .iter()
-        .map(|ev| {
-            let ts = ev
-                .timestamp
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| {
-                    let secs = d.as_secs();
-                    let h = (secs / 3600) % 24;
-                    let m = (secs / 60) % 60;
-                    let s = secs % 60;
-                    format!("{h:02}:{m:02}:{s:02}")
-                })
-                .unwrap_or_else(|_| "??:??:??".to_string());
-            (ts, ev.message.clone())
-        })
+        .map(|ev| (ev.formatted_timestamp(), ev.message.clone()))
         .collect();
     nereids_io::export::export_markdown_report(
         &path,
@@ -573,17 +560,7 @@ fn provenance_section(ui: &mut egui::Ui, state: &AppState) {
         .default_open(false)
         .show(ui, |ui| {
             for event in state.provenance_log.iter().rev() {
-                let ts = event
-                    .timestamp
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| {
-                        let secs = d.as_secs();
-                        let h = (secs / 3600) % 24;
-                        let m = (secs / 60) % 60;
-                        let s = secs % 60;
-                        format!("{h:02}:{m:02}:{s:02}")
-                    })
-                    .unwrap_or_else(|_| "??:??:??".to_string());
+                let ts = event.formatted_timestamp();
 
                 let (kind_label, kind_color) = match event.kind {
                     ProvenanceEventKind::DataLoaded => ("LOAD", crate::theme::semantic::YELLOW),
