@@ -138,10 +138,13 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
 
     if state.show_advanced_solver {
         ui.indent("advanced_solver", |ui| {
-            ui.checkbox(&mut state.fit_temperature, "Fit temperature");
+            ui.checkbox(
+                &mut state.fit_temperature,
+                "Fit temperature (slow for Spatial Map)",
+            );
             ui.checkbox(
                 &mut state.lm_config.compute_covariance,
-                "Compute covariance",
+                "Compute covariance (single-pixel/ROI only)",
             );
             ui.horizontal(|ui| {
                 ui.label("Tol (param):");
@@ -506,7 +509,7 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
         .filter(|&i| x_values[i].is_finite())
         .map(|i| [x_values[i], norm.transmission[[i, y, x]]])
         .collect();
-    let measured_line = Line::new("Measured T(E)", measured_points);
+    let measured_line = Line::new("Measured", measured_points);
 
     // Fit result (if available)
     let energies = state.energies.as_ref();
