@@ -5,7 +5,7 @@
 //! this redesign shows both side-by-side so the user can click a pixel on the
 //! map and immediately see its spectrum.
 
-use crate::state::{AppState, InputMode, IsotopeEntry, RoiSelection, SpectrumAxis};
+use crate::state::{AppState, InputMode, IsotopeEntry, RoiSelection, SolverMethod, SpectrumAxis};
 use crate::widgets::image_view::show_viridis_image;
 use egui_plot::{Line, Plot, PlotPoints, VLine};
 use ndarray::Axis;
@@ -94,11 +94,75 @@ pub fn analyze_step(ui: &mut egui::Ui, state: &mut AppState) {
 // ---- Fit Controls ----
 
 fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
-    ui.label(egui::RichText::new("Fit Parameters").strong());
+    // -- Solver configuration --
+    ui.label(egui::RichText::new("Solver").strong());
+
+    ui.horizontal(|ui| {
+        ui.label("Method:");
+        egui::ComboBox::from_id_salt("solver_method")
+            .selected_text(match state.solver_method {
+                SolverMethod::LevenbergMarquardt => "Levenberg-Marquardt",
+                SolverMethod::PoissonKL => "Poisson KL",
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut state.solver_method,
+                    SolverMethod::LevenbergMarquardt,
+                    "Levenberg-Marquardt",
+                );
+                ui.selectable_value(
+                    &mut state.solver_method,
+                    SolverMethod::PoissonKL,
+                    "Poisson KL",
+                );
+            });
+    });
+
     ui.horizontal(|ui| {
         ui.label("Max iter:");
         ui.add(egui::DragValue::new(&mut state.lm_config.max_iter).range(1..=10000));
     });
+
+    // Advanced solver controls (collapsible)
+    let gear = if state.show_advanced_solver {
+        "\u{2699} Advanced \u{25b2}"
+    } else {
+        "\u{2699} Advanced \u{25bc}"
+    };
+    if ui
+        .add(egui::Button::new(egui::RichText::new(gear).small()).frame(false))
+        .clicked()
+    {
+        state.show_advanced_solver = !state.show_advanced_solver;
+    }
+
+    if state.show_advanced_solver {
+        ui.indent("advanced_solver", |ui| {
+            ui.checkbox(&mut state.fit_temperature, "Fit temperature");
+            ui.checkbox(
+                &mut state.lm_config.compute_covariance,
+                "Compute covariance",
+            );
+            ui.horizontal(|ui| {
+                ui.label("Tol (param):");
+                ui.add(
+                    egui::DragValue::new(&mut state.lm_config.tol_param)
+                        .speed(1e-9)
+                        .range(1e-12..=1.0),
+                );
+            });
+            if state.solver_method == SolverMethod::LevenbergMarquardt {
+                ui.horizontal(|ui| {
+                    ui.label("Lambda init:");
+                    ui.add(
+                        egui::DragValue::new(&mut state.lm_config.lambda_init)
+                            .speed(1e-4)
+                            .range(1e-10..=1e6),
+                    );
+                });
+            }
+        });
+    }
 
     ui.add_space(8.0);
     ui.separator();
@@ -163,6 +227,14 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
     // Run buttons
     ui.label(egui::RichText::new("Run").strong());
 
+    if state.solver_method == SolverMethod::PoissonKL {
+        ui.label(
+            egui::RichText::new("Poisson KL solver not yet wired to GUI pipeline.")
+                .small()
+                .color(crate::theme::semantic::ORANGE),
+        );
+    }
+
     let ready = state.normalized.is_some()
         && state.energies.is_some()
         && state
@@ -170,7 +242,10 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
             .iter()
             .any(|e| e.enabled && e.resonance_data.is_some());
 
-    ui.add_enabled_ui(ready && !state.is_fitting, |ui| {
+    let can_run =
+        ready && !state.is_fitting && state.solver_method == SolverMethod::LevenbergMarquardt;
+
+    ui.add_enabled_ui(can_run, |ui| {
         if ui.button("Fit Selected Pixel").clicked() {
             fit_pixel(state);
         }
@@ -568,7 +643,7 @@ fn build_fit_config(state: &AppState) -> Result<FitConfig, String> {
     let isotope_names: Vec<_> = enabled.iter().map(|e| e.symbol.clone()).collect();
     let initial_densities: Vec<_> = enabled.iter().map(|e| e.initial_density).collect();
 
-    FitConfig::new(
+    let mut config = FitConfig::new(
         energies,
         resonance_data,
         isotope_names,
@@ -577,7 +652,17 @@ fn build_fit_config(state: &AppState) -> Result<FitConfig, String> {
         initial_densities,
         state.lm_config.clone(),
     )
-    .map_err(|e| format!("FitConfig validation error: {e}"))
+    .map_err(|e| format!("FitConfig validation error: {e}"))?;
+
+    config = config.with_compute_covariance(state.lm_config.compute_covariance);
+
+    if state.fit_temperature {
+        config = config
+            .with_fit_temperature(true)
+            .map_err(|e| format!("FitConfig temperature error: {e}"))?;
+    }
+
+    Ok(config)
 }
 
 fn fit_pixel(state: &mut AppState) {

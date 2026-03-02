@@ -47,6 +47,13 @@ pub enum AnalysisMode {
     SpatialBinning(u8),
 }
 
+/// Solver method for fitting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SolverMethod {
+    LevenbergMarquardt,
+    PoissonKL,
+}
+
 /// Data source for the normalize-preview spectrum plot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpectrumDataSource {
@@ -97,6 +104,9 @@ pub struct AppState {
     // -- Fitting --
     pub temperature_k: f64,
     pub lm_config: LmConfig,
+    pub solver_method: SolverMethod,
+    pub fit_temperature: bool,
+    pub show_advanced_solver: bool,
 
     // -- Pixel / ROI selection --
     pub selected_pixel: Option<(usize, usize)>,
@@ -294,6 +304,9 @@ impl Default for AppState {
 
             temperature_k: 296.0,
             lm_config: LmConfig::default(),
+            solver_method: SolverMethod::LevenbergMarquardt,
+            fit_temperature: false,
+            show_advanced_solver: false,
 
             selected_pixel: None,
             roi: None,
