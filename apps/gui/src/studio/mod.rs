@@ -30,10 +30,10 @@ pub fn studio_content(ctx: &egui::Context, state: &mut AppState) {
     }
 
     // Ensure tile_display is populated
-    if let Some(ref r) = state.spatial_result {
-        if state.tile_display.len() < r.density_maps.len() + 1 {
-            state.init_tile_display(r.density_maps.len());
-        }
+    if let Some(ref r) = state.spatial_result
+        && state.tile_display.len() < r.density_maps.len() + 1
+    {
+        state.init_tile_display(r.density_maps.len());
     }
 
     // Left panel: tile gallery
@@ -86,48 +86,65 @@ fn tile_gallery(ui: &mut egui::Ui, state: &mut AppState) {
         None => return,
     };
 
+    // Build tile descriptors: (tile_index, label, data_ref, tex_id)
+    // so we can iterate without indexing into density_maps by range.
+    struct TileDesc<'a> {
+        idx: usize,
+        label: String,
+        data: &'a ndarray::Array2<f64>,
+        tex_id: String,
+    }
+
+    let mut tiles: Vec<TileDesc<'_>> = density_maps
+        .iter()
+        .enumerate()
+        .take(n_density)
+        .map(|(i, data)| TileDesc {
+            idx: i,
+            label: symbols
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| format!("Isotope {i}")),
+            data,
+            tex_id: format!("studio_gallery_{i}"),
+        })
+        .collect();
+    tiles.push(TileDesc {
+        idx: n_density,
+        label: "Convergence".to_string(),
+        data: &conv_f64,
+        tex_id: "studio_gallery_conv".to_string(),
+    });
+
     egui::ScrollArea::vertical().show(ui, |ui| {
-        for i in 0..=n_density {
-            let is_convergence = i == n_density;
-            let label = if is_convergence {
-                "Convergence".to_string()
-            } else {
-                symbols.get(i).cloned().unwrap_or_else(|| format!("Isotope {i}"))
-            };
-            let data = if is_convergence {
-                &conv_f64
-            } else {
-                &density_maps[i]
-            };
-            let tex_id = if is_convergence {
-                "studio_gallery_conv".to_string()
-            } else {
-                format!("studio_gallery_{i}")
-            };
+        for tile in &tiles {
             let colormap = state
                 .tile_display
-                .get(i)
+                .get(tile.idx)
                 .map_or(Colormap::Viridis, |t| t.colormap);
-            let selected = state.studio_selected_tile == i;
+            let selected = state.studio_selected_tile == tile.idx;
 
             // Highlight selected tile with a colored frame
             let frame = if selected {
                 egui::Frame::group(ui.style())
                     .inner_margin(egui::Margin::same(4))
-                    .stroke(egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 149, 237)))
+                    .stroke(egui::Stroke::new(
+                        2.0,
+                        egui::Color32::from_rgb(100, 149, 237),
+                    ))
             } else {
                 egui::Frame::group(ui.style()).inner_margin(egui::Margin::same(4))
             };
 
             let resp = frame
                 .show(ui, |ui| {
-                    ui.label(egui::RichText::new(&label).small().strong());
-                    let _ = show_colormapped_image(ui, data, &tex_id, colormap);
+                    ui.label(egui::RichText::new(&tile.label).small().strong());
+                    let _ = show_colormapped_image(ui, tile.data, &tile.tex_id, colormap);
                 })
                 .response;
 
             if resp.clicked() {
-                state.studio_selected_tile = i;
+                state.studio_selected_tile = tile.idx;
             }
 
             ui.add_space(4.0);
@@ -211,17 +228,13 @@ fn full_viewer(ui: &mut egui::Ui, state: &mut AppState) {
     egui::ScrollArea::both().show(ui, |ui| {
         if show_bar {
             ui.horizontal(|ui| {
-                if let Some((y, x)) =
-                    show_colormapped_image(ui, &data, "studio_viewer", colormap)
-                {
+                if let Some((y, x)) = show_colormapped_image(ui, &data, "studio_viewer", colormap) {
                     state.selected_pixel = Some((y, x));
                     state.pixel_fit_result = None;
                 }
                 result_widgets::draw_colorbar(ui, &data, colormap);
             });
-        } else if let Some((y, x)) =
-            show_colormapped_image(ui, &data, "studio_viewer", colormap)
-        {
+        } else if let Some((y, x)) = show_colormapped_image(ui, &data, "studio_viewer", colormap) {
             state.selected_pixel = Some((y, x));
             state.pixel_fit_result = None;
         }
