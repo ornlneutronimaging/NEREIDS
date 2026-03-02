@@ -136,17 +136,20 @@ fn tile_gallery(ui: &mut egui::Ui, state: &mut AppState) {
                 egui::Frame::group(ui.style()).inner_margin(egui::Margin::same(4))
             };
 
+            let mut image_clicked = false;
             let resp = frame
                 .show(ui, |ui| {
                     ui.label(egui::RichText::new(&tile.label).small().strong());
-                    let _ = show_colormapped_image(ui, tile.data, &tile.tex_id, colormap);
+                    if show_colormapped_image(ui, tile.data, &tile.tex_id, colormap).is_some() {
+                        image_clicked = true;
+                    }
                 })
                 .response;
 
             // Upgrade hover-only frame response to also sense clicks
             let resp = resp.interact(egui::Sense::click());
 
-            if resp.clicked() {
+            if resp.clicked() || image_clicked {
                 state.studio_selected_tile = tile.idx;
             }
 
