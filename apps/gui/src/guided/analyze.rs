@@ -5,9 +5,11 @@
 //! this redesign shows both side-by-side so the user can click a pixel on the
 //! map and immediately see its spectrum.
 
-use crate::state::{AppState, InputMode, IsotopeEntry, RoiSelection};
-use crate::widgets::image_view::show_viridis_image;
-use egui_plot::{Line, Plot, PlotPoints};
+use crate::state::{AppState, InputMode, IsotopeEntry, RoiSelection, SolverMethod, SpectrumAxis};
+use crate::widgets::image_view::{show_viridis_image, show_viridis_image_with_roi};
+use egui_plot::{Line, Plot, PlotPoints, VLine};
+use ndarray::Axis;
+use nereids_io::spectrum::{SpectrumUnit, SpectrumValueKind};
 use nereids_pipeline::pipeline::FitConfig;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -92,11 +94,78 @@ pub fn analyze_step(ui: &mut egui::Ui, state: &mut AppState) {
 // ---- Fit Controls ----
 
 fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
-    ui.label(egui::RichText::new("Fit Parameters").strong());
+    // -- Solver configuration --
+    ui.label(egui::RichText::new("Solver").strong());
+
+    ui.horizontal(|ui| {
+        ui.label("Method:");
+        egui::ComboBox::from_id_salt("solver_method")
+            .selected_text(match state.solver_method {
+                SolverMethod::LevenbergMarquardt => "Levenberg-Marquardt",
+                SolverMethod::PoissonKL => "Poisson KL",
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut state.solver_method,
+                    SolverMethod::LevenbergMarquardt,
+                    "Levenberg-Marquardt",
+                );
+                ui.selectable_value(
+                    &mut state.solver_method,
+                    SolverMethod::PoissonKL,
+                    "Poisson KL",
+                );
+            });
+    });
+
     ui.horizontal(|ui| {
         ui.label("Max iter:");
         ui.add(egui::DragValue::new(&mut state.lm_config.max_iter).range(1..=10000));
     });
+
+    // Advanced solver controls (collapsible)
+    let gear = if state.show_advanced_solver {
+        "\u{2699} Advanced \u{25b2}"
+    } else {
+        "\u{2699} Advanced \u{25bc}"
+    };
+    if ui
+        .add(egui::Button::new(egui::RichText::new(gear).small()).frame(false))
+        .clicked()
+    {
+        state.show_advanced_solver = !state.show_advanced_solver;
+    }
+
+    if state.show_advanced_solver {
+        ui.indent("advanced_solver", |ui| {
+            ui.checkbox(
+                &mut state.fit_temperature,
+                "Fit temperature (slow for Spatial Map)",
+            );
+            ui.checkbox(
+                &mut state.lm_config.compute_covariance,
+                "Compute covariance (single-pixel/ROI only)",
+            );
+            ui.horizontal(|ui| {
+                ui.label("Tol (param):");
+                ui.add(
+                    egui::DragValue::new(&mut state.lm_config.tol_param)
+                        .speed(1e-9)
+                        .range(1e-12..=1.0),
+                );
+            });
+            if state.solver_method == SolverMethod::LevenbergMarquardt {
+                ui.horizontal(|ui| {
+                    ui.label("Lambda init:");
+                    ui.add(
+                        egui::DragValue::new(&mut state.lm_config.lambda_init)
+                            .speed(1e-4)
+                            .range(1e-10..=1e6),
+                    );
+                });
+            }
+        });
+    }
 
     ui.add_space(8.0);
     ui.separator();
@@ -161,6 +230,14 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
     // Run buttons
     ui.label(egui::RichText::new("Run").strong());
 
+    if state.solver_method == SolverMethod::PoissonKL {
+        ui.label(
+            egui::RichText::new("Poisson KL solver not yet wired to GUI pipeline.")
+                .small()
+                .color(crate::theme::semantic::ORANGE),
+        );
+    }
+
     let ready = state.normalized.is_some()
         && state.energies.is_some()
         && state
@@ -168,7 +245,10 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
             .iter()
             .any(|e| e.enabled && e.resonance_data.is_some());
 
-    ui.add_enabled_ui(ready && !state.is_fitting, |ui| {
+    let can_run =
+        ready && !state.is_fitting && state.solver_method == SolverMethod::LevenbergMarquardt;
+
+    ui.add_enabled_ui(can_run, |ui| {
         if ui.button("Fit Selected Pixel").clicked() {
             fit_pixel(state);
         }
@@ -218,7 +298,13 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
         let idx = state.map_display_isotope.min(n_isotopes - 1);
 
         ui.label("Density (atoms/barn):");
-        if let Some((y, x)) = show_viridis_image(ui, &result.density_maps[idx], "density_tex") {
+        let (clicked, _rect) = show_viridis_image_with_roi(
+            ui,
+            &result.density_maps[idx],
+            "density_tex",
+            state.roi.as_ref(),
+        );
+        if let Some((y, x)) = clicked {
             state.selected_pixel = Some((y, x));
             state.pixel_fit_result = None;
         }
@@ -233,6 +319,36 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
             "{}/{} pixels converged",
             result.n_converged, result.n_total
         ));
+    } else if let Some(ref norm) = state.normalized {
+        // TOF-sliced transmission preview with slider
+        let n_tof = norm.transmission.shape()[0];
+        if n_tof == 0 {
+            ui.label("(no data)");
+        } else {
+            if state.analyze_tof_slice_index >= n_tof {
+                state.analyze_tof_slice_index = n_tof - 1;
+            }
+
+            ui.label("Transmission (TOF slice):");
+            let slice = norm
+                .transmission
+                .index_axis(Axis(0), state.analyze_tof_slice_index)
+                .to_owned();
+            let (clicked, _rect) =
+                show_viridis_image_with_roi(ui, &slice, "analyze_preview_tex", state.roi.as_ref());
+            if let Some((y, x)) = clicked {
+                state.selected_pixel = Some((y, x));
+                state.pixel_fit_result = None;
+            }
+
+            ui.add(
+                egui::Slider::new(
+                    &mut state.analyze_tof_slice_index,
+                    0..=n_tof.saturating_sub(1),
+                )
+                .text("TOF bin"),
+            );
+        }
     } else if let Some(ref preview) = state.preview_image {
         ui.label("Preview (summed counts):");
         if let Some((y, x)) = show_viridis_image(ui, preview, "preview_tex") {
@@ -291,13 +407,20 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
         }
     });
 
-    let energies = match state.energies {
-        Some(ref e) => e,
-        None => {
-            ui.label("Load and normalize data to see spectrum.");
-            return;
-        }
-    };
+    // Axis toggle + resonance dips
+    ui.horizontal(|ui| {
+        ui.label("Axis:");
+        ui.selectable_value(
+            &mut state.analyze_spectrum_axis,
+            SpectrumAxis::EnergyEv,
+            "Energy (eV)",
+        );
+        ui.selectable_value(
+            &mut state.analyze_spectrum_axis,
+            SpectrumAxis::TofMicroseconds,
+            "TOF (\u{03bc}s)",
+        );
+    });
 
     let norm = match state.normalized {
         Some(ref n) => n,
@@ -305,6 +428,92 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
             ui.label("No normalized data available.");
             return;
         }
+    };
+
+    let n_tof = norm.transmission.shape()[0];
+
+    // Build x-axis values
+    let (x_values, x_label): (Vec<f64>, &str) = match state.analyze_spectrum_axis {
+        SpectrumAxis::EnergyEv => match state.energies {
+            Some(ref e) => (e.clone(), "Energy (eV)"),
+            None => {
+                ui.label("Load and normalize data to see spectrum.");
+                return;
+            }
+        },
+        SpectrumAxis::TofMicroseconds => match state.spectrum_values {
+            Some(ref v) => match (state.spectrum_unit, state.spectrum_kind) {
+                (SpectrumUnit::TofMicroseconds, SpectrumValueKind::BinEdges) => {
+                    let centers: Vec<f64> = v
+                        .windows(2)
+                        .take(n_tof)
+                        .map(|w| 0.5 * (w[0] + w[1]))
+                        .collect();
+                    (centers, "TOF (\u{03bc}s)")
+                }
+                (SpectrumUnit::TofMicroseconds, SpectrumValueKind::BinCenters) => {
+                    (v.iter().take(n_tof).copied().collect(), "TOF (\u{03bc}s)")
+                }
+                (SpectrumUnit::EnergyEv, SpectrumValueKind::BinEdges) => {
+                    if state.beamline.flight_path_m.is_finite()
+                        && state.beamline.flight_path_m > 0.0
+                    {
+                        // Compute bin centers from edges, then convert to TOF.
+                        let tof_vals: Vec<f64> = v
+                            .windows(2)
+                            .take(n_tof)
+                            .map(|w| {
+                                let center = 0.5 * (w[0] + w[1]);
+                                if center > 0.0 {
+                                    nereids_core::constants::energy_to_tof(
+                                        center,
+                                        state.beamline.flight_path_m,
+                                    ) + state.beamline.delay_us
+                                } else {
+                                    f64::NAN
+                                }
+                            })
+                            .collect();
+                        (tof_vals, "TOF (\u{03bc}s)")
+                    } else {
+                        // Fallback: show bin centers in energy units.
+                        let centers: Vec<f64> = v
+                            .windows(2)
+                            .take(n_tof)
+                            .map(|w| 0.5 * (w[0] + w[1]))
+                            .collect();
+                        (centers, "Energy (eV)")
+                    }
+                }
+                (SpectrumUnit::EnergyEv, SpectrumValueKind::BinCenters) => {
+                    if state.beamline.flight_path_m.is_finite()
+                        && state.beamline.flight_path_m > 0.0
+                    {
+                        let tof_vals: Vec<f64> = v
+                            .iter()
+                            .take(n_tof)
+                            .map(|&e| {
+                                if e > 0.0 {
+                                    nereids_core::constants::energy_to_tof(
+                                        e,
+                                        state.beamline.flight_path_m,
+                                    ) + state.beamline.delay_us
+                                } else {
+                                    f64::NAN
+                                }
+                            })
+                            .collect();
+                        (tof_vals, "TOF (\u{03bc}s)")
+                    } else {
+                        (v.iter().take(n_tof).copied().collect(), "Energy (eV)")
+                    }
+                }
+            },
+            None => {
+                let indices: Vec<f64> = (0..n_tof).map(|i| i as f64).collect();
+                (indices, "Frame index")
+            }
+        },
     };
 
     let (y, x) = match state.selected_pixel {
@@ -315,20 +524,31 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
         }
     };
 
-    let n_energies = norm.transmission.shape()[0];
-    let n_plot = n_energies.min(energies.len());
+    let shape = norm.transmission.shape();
+    if y >= shape[1] || x >= shape[2] {
+        ui.label("Selected pixel is out of bounds. Click the image to select a new pixel.");
+        return;
+    }
 
-    // Measured spectrum
+    let n_plot = n_tof.min(x_values.len());
+    if n_plot == 0 {
+        return;
+    }
+
+    // Measured spectrum (skip points where x is non-finite, e.g. from non-positive energies)
     let measured_points: PlotPoints = (0..n_plot)
-        .map(|i| [energies[i], norm.transmission[[i, y, x]]])
+        .filter(|&i| x_values[i].is_finite())
+        .map(|i| [x_values[i], norm.transmission[[i, y, x]]])
         .collect();
-    let measured_line = Line::new("Measured T(E)", measured_points);
+    let measured_line = Line::new("Measured", measured_points);
 
     // Fit result (if available)
+    let energies = state.energies.as_ref();
     let fit_line = state.pixel_fit_result.as_ref().and_then(|result| {
         if !result.converged {
             return None;
         }
+        let energies = energies?;
         let enabled: Vec<_> = state
             .isotope_entries
             .iter()
@@ -354,13 +574,22 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
 
         use nereids_fitting::lm::FitModel;
         let fitted_t = model.evaluate(&result.densities);
-        let fit_points: PlotPoints = (0..n_plot).map(|i| [energies[i], fitted_t[i]]).collect();
+        let n_fit = n_plot.min(fitted_t.len());
+        let fit_points: PlotPoints = (0..n_fit)
+            .filter(|&i| x_values[i].is_finite())
+            .map(|i| [x_values[i], fitted_t[i]])
+            .collect();
         Some(Line::new("Fit", fit_points).width(2.0))
     });
 
+    // TOF position marker x-value
+    let tof_marker_x = x_values
+        .get(state.analyze_tof_slice_index.min(n_plot.saturating_sub(1)))
+        .copied();
+
     // Plot
     Plot::new("spectrum_plot")
-        .x_axis_label("Energy (eV)")
+        .x_axis_label(x_label)
         .y_axis_label("Transmission")
         .legend(egui_plot::Legend::default())
         .show(ui, |plot_ui| {
@@ -368,17 +597,59 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
             if let Some(fit) = fit_line {
                 plot_ui.line(fit);
             }
+
+            // Current TOF position marker
+            if let Some(xv) = tof_marker_x {
+                plot_ui.vline(
+                    VLine::new("TOF position", xv)
+                        .color(egui::Color32::from_rgb(255, 165, 0))
+                        .style(egui_plot::LineStyle::dashed_dense()),
+                );
+            }
+
+            // Resonance dip markers (energy axis only)
+            if state.analyze_spectrum_axis == SpectrumAxis::EnergyEv {
+                let (x_min, x_max) = x_values
+                    .iter()
+                    .copied()
+                    .filter(|v| v.is_finite())
+                    .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
+                        (lo.min(v), hi.max(v))
+                    });
+                for entry in &state.isotope_entries {
+                    if !entry.enabled {
+                        continue;
+                    }
+                    let Some(ref res_data) = entry.resonance_data else {
+                        continue;
+                    };
+                    for range in &res_data.ranges {
+                        for lg in &range.l_groups {
+                            for res in &lg.resonances {
+                                if res.energy >= x_min && res.energy <= x_max {
+                                    plot_ui.vline(
+                                        VLine::new("", res.energy)
+                                            .color(egui::Color32::from_rgb(180, 80, 80))
+                                            .style(egui_plot::LineStyle::dashed_loose()),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         });
 
     // Fit results below the plot
     if let Some(ref result) = state.pixel_fit_result {
         ui.separator();
         ui.horizontal(|ui| {
-            ui.label(if result.converged {
-                "Converged"
+            let (label, color) = if result.converged {
+                ("Converged", crate::theme::semantic::GREEN)
             } else {
-                "Did NOT converge"
-            });
+                ("NOT converged", crate::theme::semantic::RED)
+            };
+            ui.label(egui::RichText::new(label).color(color).strong());
             ui.label(format!("chi2_r = {:.4}", result.reduced_chi_squared));
             ui.label(format!("iter = {}", result.iterations));
         });
@@ -430,7 +701,7 @@ fn build_fit_config(state: &AppState) -> Result<FitConfig, String> {
     let isotope_names: Vec<_> = enabled.iter().map(|e| e.symbol.clone()).collect();
     let initial_densities: Vec<_> = enabled.iter().map(|e| e.initial_density).collect();
 
-    FitConfig::new(
+    let mut config = FitConfig::new(
         energies,
         resonance_data,
         isotope_names,
@@ -439,7 +710,17 @@ fn build_fit_config(state: &AppState) -> Result<FitConfig, String> {
         initial_densities,
         state.lm_config.clone(),
     )
-    .map_err(|e| format!("FitConfig validation error: {e}"))
+    .map_err(|e| format!("FitConfig validation error: {e}"))?;
+
+    config = config.with_compute_covariance(state.lm_config.compute_covariance);
+
+    if state.fit_temperature {
+        config = config
+            .with_fit_temperature(true)
+            .map_err(|e| format!("FitConfig temperature error: {e}"))?;
+    }
+
+    Ok(config)
 }
 
 fn fit_pixel(state: &mut AppState) {
@@ -464,7 +745,13 @@ fn fit_pixel(state: &mut AppState) {
         None => return,
     };
 
-    let n_energies = norm.transmission.shape()[0];
+    let shape = norm.transmission.shape();
+    if y >= shape[1] || x >= shape[2] {
+        state.status_message = "Selected pixel is out of bounds".into();
+        return;
+    }
+
+    let n_energies = shape[0];
     let t_spectrum: Vec<f64> = (0..n_energies)
         .map(|e| norm.transmission[[e, y, x]])
         .collect();

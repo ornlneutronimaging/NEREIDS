@@ -96,6 +96,9 @@ fn poll_pending_tasks(state: &mut AppState) {
                             Ok(data) => {
                                 entry.resonance_data = Some(data);
                                 state.status_message = format!("Loaded {}", fetch.symbol);
+                                // Invalidate stale results — isotope data changed.
+                                state.spatial_result = None;
+                                state.pixel_fit_result = None;
                             }
                             Err(msg) => {
                                 state.status_message = msg;

@@ -100,16 +100,24 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
                     resonance_data: None,
                     enabled: true,
                 });
+                // Invalidate stale results — isotope order may have changed.
+                state.spatial_result = None;
+                state.pixel_fit_result = None;
             }
         });
     });
 
     // Isotope list
     let mut to_remove = None;
+    let mut isotope_changed = false;
     for (idx, entry) in state.isotope_entries.iter_mut().enumerate() {
         ui.horizontal(|ui| {
             ui.add_enabled_ui(!isotope_locked, |ui| {
+                let enabled_before = entry.enabled;
                 ui.checkbox(&mut entry.enabled, "");
+                if entry.enabled != enabled_before {
+                    isotope_changed = true;
+                }
 
                 let z_changed = ui
                     .add(
@@ -141,6 +149,7 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
                         entry.a
                     );
                     entry.resonance_data = None;
+                    isotope_changed = true;
                 }
             });
 
@@ -168,6 +177,15 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
     }
     if let Some(idx) = to_remove {
         state.isotope_entries.remove(idx);
+        isotope_changed = true;
+    }
+
+    // Invalidate stale results when isotope entries change (enabled toggled,
+    // Z/A edited, or entry removed).  density_maps are indexed positionally
+    // by the isotope order at compute time, so any change invalidates them.
+    if isotope_changed {
+        state.spatial_result = None;
+        state.pixel_fit_result = None;
     }
 
     // Fetch ENDF data for isotopes missing resonance data

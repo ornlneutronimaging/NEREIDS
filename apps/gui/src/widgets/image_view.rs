@@ -1,5 +1,7 @@
 //! Shared image viewer widget: viridis-colormapped 2D array display with click-to-select.
 
+use crate::state::RoiSelection;
+
 /// Display a 2D f64 array as a viridis-colormapped image with click-to-select-pixel.
 ///
 /// Normalizes the data range to [0, 1], maps through the viridis colormap,
@@ -14,10 +16,23 @@ pub fn show_viridis_image(
     data: &ndarray::Array2<f64>,
     tex_id: &str,
 ) -> Option<(usize, usize)> {
+    show_viridis_image_with_roi(ui, data, tex_id, None).0
+}
+
+/// Display a viridis-colormapped image with an optional ROI overlay.
+///
+/// Returns `(clicked_pixel, image_rect)`.  When `roi` is `Some`, a
+/// semi-transparent rectangle is drawn over the corresponding region.
+pub fn show_viridis_image_with_roi(
+    ui: &mut egui::Ui,
+    data: &ndarray::Array2<f64>,
+    tex_id: &str,
+    roi: Option<&RoiSelection>,
+) -> (Option<(usize, usize)>, egui::Rect) {
     let (height, width) = (data.shape()[0], data.shape()[1]);
     if width == 0 || height == 0 {
         ui.label("(empty image)");
-        return None;
+        return (None, egui::Rect::NOTHING);
     }
 
     let mut vmin = f64::INFINITY;
@@ -63,25 +78,70 @@ pub fn show_viridis_image(
 
     // Allocate interactive rect with click sensing (ui.image() does not register clicks).
     let (response, painter) = ui.allocate_painter(display_size, egui::Sense::click());
+    let image_rect = response.rect;
     painter.image(
         texture.id(),
-        response.rect,
+        image_rect,
         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
         egui::Color32::WHITE,
     );
 
+    // Draw ROI overlay
+    if let Some(roi) = roi {
+        draw_roi_overlay(&painter, image_rect, (height, width), roi);
+    }
+
     if response.clicked()
         && let Some(pos) = response.interact_pointer_pos()
     {
-        let rect = response.rect;
-        let rel_x = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-        let rel_y = ((pos.y - rect.top()) / rect.height()).clamp(0.0, 1.0);
+        let rel_x = ((pos.x - image_rect.left()) / image_rect.width()).clamp(0.0, 1.0);
+        let rel_y = ((pos.y - image_rect.top()) / image_rect.height()).clamp(0.0, 1.0);
         let px_x = (rel_x * width as f32) as usize;
         let px_y = (rel_y * height as f32) as usize;
-        return Some((px_y.min(height - 1), px_x.min(width - 1)));
+        return (
+            Some((px_y.min(height - 1), px_x.min(width - 1))),
+            image_rect,
+        );
     }
 
-    None
+    (None, image_rect)
+}
+
+/// Draw a semi-transparent ROI rectangle overlay on a displayed image.
+fn draw_roi_overlay(
+    painter: &egui::Painter,
+    image_rect: egui::Rect,
+    image_dims: (usize, usize),
+    roi: &RoiSelection,
+) {
+    let (height, width) = image_dims;
+    if width == 0 || height == 0 {
+        return;
+    }
+    if roi.x_start >= roi.x_end || roi.y_start >= roi.y_end {
+        return;
+    }
+
+    let x0 = image_rect.left() + (roi.x_start as f32 / width as f32) * image_rect.width();
+    let x1 = image_rect.left() + (roi.x_end as f32 / width as f32) * image_rect.width();
+    let y0 = image_rect.top() + (roi.y_start as f32 / height as f32) * image_rect.height();
+    let y1 = image_rect.top() + (roi.y_end as f32 / height as f32) * image_rect.height();
+
+    let roi_rect = egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1));
+
+    // Semi-transparent fill
+    painter.rect_filled(
+        roi_rect,
+        0.0,
+        egui::Color32::from_rgba_unmultiplied(0, 120, 255, 40),
+    );
+    // Border
+    painter.rect_stroke(
+        roi_rect,
+        0.0,
+        egui::Stroke::new(1.5, egui::Color32::from_rgb(0, 120, 255)),
+        egui::StrokeKind::Outside,
+    );
 }
 
 /// 4-segment linear approximation of the viridis colormap.
