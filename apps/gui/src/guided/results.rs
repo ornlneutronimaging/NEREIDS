@@ -70,6 +70,7 @@ fn summary_card(
                 .zip(result.converged_map.iter())
                 .filter(|&(_, &conv)| conv)
                 .map(|(&c, _)| c)
+                .filter(|&c| c.is_finite())
                 .collect();
             if !chi2_vals.is_empty() {
                 let mean_chi2: f64 = chi2_vals.iter().sum::<f64>() / chi2_vals.len() as f64;
@@ -89,6 +90,7 @@ fn summary_card(
                         .zip(result.converged_map.iter())
                         .filter(|&(_, &conv)| conv)
                         .map(|(&d, _)| d)
+                        .filter(|&d| d.is_finite())
                         .collect();
                     if !conv_vals.is_empty() {
                         let mean: f64 = conv_vals.iter().sum::<f64>() / conv_vals.len() as f64;

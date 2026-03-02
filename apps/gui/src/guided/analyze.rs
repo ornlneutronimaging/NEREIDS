@@ -459,10 +459,14 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
                             .iter()
                             .take(n_tof)
                             .map(|&e| {
-                                nereids_core::constants::energy_to_tof(
-                                    e,
-                                    state.beamline.flight_path_m,
-                                ) + state.beamline.delay_us
+                                if e > 0.0 {
+                                    nereids_core::constants::energy_to_tof(
+                                        e,
+                                        state.beamline.flight_path_m,
+                                    ) + state.beamline.delay_us
+                                } else {
+                                    f64::NAN
+                                }
                             })
                             .collect();
                         (tof_vals, "TOF (\u{03bc}s)")
@@ -486,13 +490,20 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
         }
     };
 
+    let shape = norm.transmission.shape();
+    if y >= shape[1] || x >= shape[2] {
+        ui.label("Selected pixel is out of bounds. Click the image to select a new pixel.");
+        return;
+    }
+
     let n_plot = n_tof.min(x_values.len());
     if n_plot == 0 {
         return;
     }
 
-    // Measured spectrum
+    // Measured spectrum (skip points where x is non-finite, e.g. from non-positive energies)
     let measured_points: PlotPoints = (0..n_plot)
+        .filter(|&i| x_values[i].is_finite())
         .map(|i| [x_values[i], norm.transmission[[i, y, x]]])
         .collect();
     let measured_line = Line::new("Measured T(E)", measured_points);
@@ -530,7 +541,10 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
         use nereids_fitting::lm::FitModel;
         let fitted_t = model.evaluate(&result.densities);
         let n_fit = n_plot.min(fitted_t.len());
-        let fit_points: PlotPoints = (0..n_fit).map(|i| [x_values[i], fitted_t[i]]).collect();
+        let fit_points: PlotPoints = (0..n_fit)
+            .filter(|&i| x_values[i].is_finite())
+            .map(|i| [x_values[i], fitted_t[i]])
+            .collect();
         Some(Line::new("Fit", fit_points).width(2.0))
     });
 
@@ -575,12 +589,9 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
                             for res in &lg.resonances {
                                 if res.energy >= x_min && res.energy <= x_max {
                                     plot_ui.vline(
-                                        VLine::new(
-                                            format!("{} {:.1}eV", entry.symbol, res.energy),
-                                            res.energy,
-                                        )
-                                        .color(egui::Color32::from_rgb(180, 80, 80))
-                                        .style(egui_plot::LineStyle::dashed_loose()),
+                                        VLine::new("", res.energy)
+                                            .color(egui::Color32::from_rgb(180, 80, 80))
+                                            .style(egui_plot::LineStyle::dashed_loose()),
                                     );
                                 }
                             }
@@ -695,7 +706,13 @@ fn fit_pixel(state: &mut AppState) {
         None => return,
     };
 
-    let n_energies = norm.transmission.shape()[0];
+    let shape = norm.transmission.shape();
+    if y >= shape[1] || x >= shape[2] {
+        state.status_message = "Selected pixel is out of bounds".into();
+        return;
+    }
+
+    let n_energies = shape[0];
     let t_spectrum: Vec<f64> = (0..n_energies)
         .map(|e| norm.transmission[[e, y, x]])
         .collect();
