@@ -71,6 +71,91 @@ pub enum SpectrumAxis {
     TofMicroseconds,
 }
 
+/// A single provenance event in the session audit trail.
+#[derive(Debug, Clone)]
+pub struct ProvenanceEvent {
+    pub timestamp: std::time::SystemTime,
+    pub kind: ProvenanceEventKind,
+    pub message: String,
+}
+
+/// Classification of provenance events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProvenanceEventKind {
+    DataLoaded,
+    ConfigChanged,
+    Normalized,
+    AnalysisRun,
+    Exported,
+}
+
+/// Available colormaps for density map rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Colormap {
+    Viridis,
+    Inferno,
+    Plasma,
+    Grayscale,
+}
+
+impl Colormap {
+    pub const ALL: [Colormap; 4] = [
+        Colormap::Viridis,
+        Colormap::Inferno,
+        Colormap::Plasma,
+        Colormap::Grayscale,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Viridis => "Viridis",
+            Self::Inferno => "Inferno",
+            Self::Plasma => "Plasma",
+            Self::Grayscale => "Grayscale",
+        }
+    }
+}
+
+/// Export format for spatial mapping results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportFormat {
+    Tiff,
+    Hdf5,
+    Markdown,
+}
+
+impl ExportFormat {
+    pub const ALL: [ExportFormat; 3] = [
+        ExportFormat::Tiff,
+        ExportFormat::Hdf5,
+        ExportFormat::Markdown,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Tiff => "TIFF (f64)",
+            Self::Hdf5 => "HDF5",
+            Self::Markdown => "Markdown Report",
+        }
+    }
+}
+
+/// Per-tile display settings for density map rendering.
+#[derive(Debug, Clone)]
+pub struct TileDisplayState {
+    pub colormap: Colormap,
+    pub show_colorbar: bool,
+}
+
+impl Default for TileDisplayState {
+    fn default() -> Self {
+        Self {
+            colormap: Colormap::Viridis,
+            show_colorbar: false,
+        }
+    }
+}
+
 /// Target context for the periodic table modal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeriodicTableTarget {
@@ -206,6 +291,17 @@ pub struct AppState {
 
     // -- HDF5 tree browser --
     pub hdf5_tree: Option<Vec<Hdf5TreeEntry>>,
+
+    // -- Provenance --
+    pub provenance_log: Vec<ProvenanceEvent>,
+
+    // -- Per-tile display state (indexed same as density_maps + 1 for convergence) --
+    pub tile_display: Vec<TileDisplayState>,
+
+    // -- Export --
+    pub export_format: ExportFormat,
+    pub export_directory: Option<String>,
+    pub export_status: Option<String>,
 }
 
 /// An isotope the user wants to include in the fit.
@@ -334,6 +430,26 @@ impl AppState {
         self.normalized = None;
         self.dead_pixels = None;
         self.spectrum_values = None;
+        self.tile_display.clear();
+        self.export_status = None;
+    }
+
+    /// Append a provenance event to the session audit trail.
+    pub fn log_provenance(&mut self, kind: ProvenanceEventKind, message: impl Into<String>) {
+        self.provenance_log.push(ProvenanceEvent {
+            timestamp: std::time::SystemTime::now(),
+            kind,
+            message: message.into(),
+        });
+    }
+
+    /// Ensure `tile_display` has enough entries for the current result.
+    /// Call after spatial analysis completes.
+    pub fn init_tile_display(&mut self, n_density_maps: usize) {
+        // +1 for the convergence map tile
+        let needed = n_density_maps + 1;
+        self.tile_display
+            .resize_with(needed, TileDisplayState::default);
     }
 }
 
@@ -437,6 +553,12 @@ impl Default for AppState {
             periodic_table_selected_z: None,
 
             hdf5_tree: None,
+
+            provenance_log: Vec::new(),
+            tile_display: Vec::new(),
+            export_format: ExportFormat::Tiff,
+            export_directory: None,
+            export_status: None,
         }
     }
 }
