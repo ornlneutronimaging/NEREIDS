@@ -1,6 +1,6 @@
 //! Step 2: Configuration — beamline parameters, isotope selection, ENDF fetch.
 
-use crate::state::{AppState, EndfFetchResult, IsotopeEntry};
+use crate::state::{AppState, EndfFetchResult, GuidedStep, IsotopeEntry, PeriodicTableTarget};
 use nereids_endf::retrieval::EndfLibrary;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -8,7 +8,12 @@ use std::sync::mpsc;
 
 /// Draw the Configure step content.
 pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
-    ui.heading("Configure");
+    ui.horizontal(|ui| {
+        ui.heading("Configure");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            teleport_pill(ui, "Forward Model →", GuidedStep::ForwardModel, state);
+        });
+    });
     ui.separator();
 
     // --- Beamline parameters ---
@@ -62,26 +67,35 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
     ui.label(egui::RichText::new("Isotopes").strong());
     ui.add_space(4.0);
 
-    // ENDF library selector
-    ui.horizontal(|ui| {
-        ui.label("Library:");
-        egui::ComboBox::from_id_salt("endf_lib")
-            .selected_text(library_name(state.endf_library))
-            .show_ui(ui, |ui| {
-                ui.selectable_value(
-                    &mut state.endf_library,
-                    EndfLibrary::EndfB8_0,
-                    "ENDF/B-VIII.0",
-                );
-                ui.selectable_value(
-                    &mut state.endf_library,
-                    EndfLibrary::EndfB8_1,
-                    "ENDF/B-VIII.1",
-                );
-                ui.selectable_value(&mut state.endf_library, EndfLibrary::Jeff3_3, "JEFF-3.3");
-                ui.selectable_value(&mut state.endf_library, EndfLibrary::Jendl5, "JENDL-5");
-            });
+    // ENDF library selector (disabled during active fetch to prevent stale results)
+    let prev_lib = state.endf_library;
+    ui.add_enabled_ui(!state.is_fetching_endf, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Library:");
+            egui::ComboBox::from_id_salt("endf_lib")
+                .selected_text(library_name(state.endf_library))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut state.endf_library,
+                        EndfLibrary::EndfB8_0,
+                        "ENDF/B-VIII.0",
+                    );
+                    ui.selectable_value(
+                        &mut state.endf_library,
+                        EndfLibrary::EndfB8_1,
+                        "ENDF/B-VIII.1",
+                    );
+                    ui.selectable_value(&mut state.endf_library, EndfLibrary::Jeff3_3, "JEFF-3.3");
+                    ui.selectable_value(&mut state.endf_library, EndfLibrary::Jendl5, "JENDL-5");
+                });
+        });
     });
+    // Library change invalidates all resonance data — must re-fetch
+    if state.endf_library != prev_lib {
+        for e in &mut state.isotope_entries {
+            e.resonance_data = None;
+        }
+    }
 
     ui.add_space(4.0);
 
@@ -103,6 +117,11 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
                 // Invalidate stale results — isotope order may have changed.
                 state.spatial_result = None;
                 state.pixel_fit_result = None;
+            }
+            if ui.button("Periodic Table...").clicked() {
+                state.periodic_table_open = true;
+                state.periodic_table_target = PeriodicTableTarget::Configure;
+                state.periodic_table_selected_z = None;
             }
         });
     });
@@ -275,4 +294,18 @@ fn fetch_endf_data(state: &mut AppState) {
             });
         }
     });
+}
+
+fn teleport_pill(ui: &mut egui::Ui, label: &str, target: GuidedStep, state: &mut AppState) {
+    let accent = crate::theme::ThemeColors::from_ctx(ui.ctx()).accent;
+    let btn = egui::Button::new(
+        egui::RichText::new(label)
+            .small()
+            .color(egui::Color32::WHITE),
+    )
+    .fill(accent)
+    .corner_radius(12.0);
+    if ui.add(btn).clicked() {
+        state.guided_step = target;
+    }
 }

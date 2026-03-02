@@ -253,6 +253,7 @@ fn hdf5_histogram_tab(ui: &mut egui::Ui, state: &mut AppState) {
     ui.label("Browse for a NeXus/HDF5 file containing histogram data.");
     hdf5_browse_row(ui, state);
     show_nexus_metadata(ui, state);
+    show_hdf5_tree(ui, state);
 
     if state.hdf5_path.is_some()
         && state
@@ -274,6 +275,7 @@ fn hdf5_event_tab(ui: &mut egui::Ui, state: &mut AppState) {
     ui.label("Browse for a NeXus/HDF5 file containing neutron event data.");
     hdf5_browse_row(ui, state);
     show_nexus_metadata(ui, state);
+    show_hdf5_tree(ui, state);
 
     if state.hdf5_path.is_some() && state.nexus_metadata.as_ref().is_some_and(|m| m.has_events) {
         ui.add_space(8.0);
@@ -347,6 +349,12 @@ fn hdf5_browse_row(ui: &mut egui::Ui, state: &mut AppState) {
                     state.nexus_metadata = None;
                     state.status_message = format!("Probe failed: {e}");
                 }
+            }
+
+            // Build HDF5 tree structure for browser display
+            match nereids_io::nexus::list_hdf5_tree(&file, 3) {
+                Ok(tree) => state.hdf5_tree = Some(tree),
+                Err(_) => state.hdf5_tree = None,
             }
         }
     });
@@ -497,6 +505,42 @@ fn load_hdf5_events(state: &mut AppState) {
             state.status_message = format!("Event histogramming failed: {e}");
         }
     }
+}
+
+/// Display the HDF5 file tree structure in a collapsing header.
+fn show_hdf5_tree(ui: &mut egui::Ui, state: &AppState) {
+    let tree = match state.hdf5_tree {
+        Some(ref t) if !t.is_empty() => t,
+        _ => return,
+    };
+
+    ui.add_space(4.0);
+    egui::CollapsingHeader::new("HDF5 Structure")
+        .default_open(false)
+        .show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .max_height(200.0)
+                .show(ui, |ui| {
+                    for entry in tree {
+                        let depth = entry.path.matches('/').count().saturating_sub(1);
+                        let indent = "  ".repeat(depth);
+                        let name = entry.path.rsplit('/').next().unwrap_or(&entry.path);
+                        let label = match entry.kind {
+                            nereids_io::nexus::Hdf5EntryKind::Group => {
+                                format!("{indent}[G] {name}")
+                            }
+                            nereids_io::nexus::Hdf5EntryKind::Dataset => {
+                                if let Some(ref shape) = entry.shape {
+                                    format!("{indent}[D] {name} {:?}", shape)
+                                } else {
+                                    format!("{indent}[D] {name}")
+                                }
+                            }
+                        };
+                        ui.label(egui::RichText::new(label).monospace().small());
+                    }
+                });
+        });
 }
 
 /// Load all data: TIFF stacks + spectrum file with validation.

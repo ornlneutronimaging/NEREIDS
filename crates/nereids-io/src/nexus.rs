@@ -46,6 +46,24 @@ pub struct NexusMetadata {
     pub tof_edges_ns: Option<Vec<f64>>,
 }
 
+/// An entry in the HDF5 group/dataset tree hierarchy.
+#[derive(Debug, Clone)]
+pub struct Hdf5TreeEntry {
+    /// Full path within the HDF5 file (e.g., `/entry/histogram/counts`).
+    pub path: String,
+    /// Whether this entry is a group or dataset.
+    pub kind: Hdf5EntryKind,
+    /// Dataset shape, if this entry is a dataset.
+    pub shape: Option<Vec<usize>>,
+}
+
+/// Kind of HDF5 tree entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hdf5EntryKind {
+    Group,
+    Dataset,
+}
+
 /// Histogram data loaded from a NeXus file, ready for NEREIDS processing.
 #[derive(Debug, Clone)]
 pub struct NexusHistogramData {
@@ -396,6 +414,69 @@ fn read_dead_pixel_mask(entry: &hdf5::Group) -> Option<ndarray::Array2<bool>> {
     let dead_ds = masks.dataset("dead").ok()?;
     let dead_u8: ndarray::Array2<u8> = dead_ds.read().ok()?;
     Some(dead_u8.mapv(|v| v != 0))
+}
+
+/// List the group/dataset tree structure of an HDF5 file.
+///
+/// Walks the file hierarchy recursively up to `max_depth` levels deep,
+/// returning entries with their path, kind (group vs dataset), and shape
+/// (for datasets).  Useful for displaying file structure in a GUI browser.
+pub fn list_hdf5_tree(path: &Path, max_depth: usize) -> Result<Vec<Hdf5TreeEntry>, IoError> {
+    let file = hdf5::File::open(path)
+        .map_err(|e| IoError::Hdf5Error(format!("Cannot open HDF5 file: {e}")))?;
+    let mut entries = Vec::new();
+    walk_group(
+        &file
+            .as_group()
+            .map_err(|e| IoError::Hdf5Error(format!("Cannot read root group: {e}")))?,
+        "/",
+        0,
+        max_depth,
+        &mut entries,
+    );
+    Ok(entries)
+}
+
+/// Recursively walk an HDF5 group, collecting tree entries.
+fn walk_group(
+    group: &hdf5::Group,
+    prefix: &str,
+    depth: usize,
+    max_depth: usize,
+    entries: &mut Vec<Hdf5TreeEntry>,
+) {
+    let Ok(members) = group.member_names() else {
+        return;
+    };
+    let mut members = members;
+    members.sort();
+    for name in &members {
+        let child_path = if prefix == "/" {
+            format!("/{name}")
+        } else {
+            format!("{prefix}/{name}")
+        };
+
+        // Try dataset first (leaf nodes)
+        if let Ok(ds) = group.dataset(name) {
+            let shape = ds.shape();
+            entries.push(Hdf5TreeEntry {
+                path: child_path,
+                kind: Hdf5EntryKind::Dataset,
+                shape: Some(shape),
+            });
+        } else if let Ok(child_group) = group.group(name) {
+            // It's a group — record it and recurse if within depth
+            entries.push(Hdf5TreeEntry {
+                path: child_path.clone(),
+                kind: Hdf5EntryKind::Group,
+                shape: None,
+            });
+            if depth < max_depth {
+                walk_group(&child_group, &child_path, depth + 1, max_depth, entries);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
