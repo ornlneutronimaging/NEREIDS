@@ -6,6 +6,11 @@ use ndarray::Array2;
 
 use crate::error::IoError;
 
+/// Escape a string for use in a Markdown table cell.
+fn escape_md_cell(s: &str) -> String {
+    s.replace('|', "\\|").replace('\n', " ")
+}
+
 /// Export a single density map as a 64-bit float TIFF file.
 ///
 /// Each pixel stores the raw f64 density value (atoms/barn).
@@ -134,7 +139,7 @@ pub fn export_markdown_report(
     report.push_str("| Isotope | Mean Density (atoms/barn) | Std Dev |\n");
     report.push_str("|---------|--------------------------|----------|\n");
     for (i, map) in density_maps.iter().enumerate() {
-        let label = labels.get(i).map_or("unknown", |s| s.as_str());
+        let label = escape_md_cell(labels.get(i).map_or("unknown", |s| s.as_str()));
         let conv_vals: Vec<f64> = map
             .iter()
             .zip(converged_map.iter())
@@ -160,13 +165,15 @@ pub fn export_markdown_report(
         report.push_str("| Time | Event |\n");
         report.push_str("|------|-------|\n");
         for (timestamp, message) in provenance {
-            report.push_str(&format!("| {timestamp} | {message} |\n"));
+            let ts = escape_md_cell(timestamp);
+            let msg = escape_md_cell(message);
+            report.push_str(&format!("| {ts} | {msg} |\n"));
         }
         report.push('\n');
     }
 
     std::fs::write(path, report).map_err(|e| {
-        IoError::InvalidParameter(format!("cannot write report to {}: {e}", path.display()))
+        IoError::WriteError(format!("cannot write report to {}: {e}", path.display()))
     })?;
 
     Ok(())

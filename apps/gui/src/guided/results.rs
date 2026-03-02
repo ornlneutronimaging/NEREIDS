@@ -391,13 +391,16 @@ fn export_panel(ui: &mut egui::Ui, state: &mut AppState) {
 
             ui.horizontal(|ui| {
                 ui.label("Directory:");
-                let dir_label = state.export_directory.as_deref().unwrap_or("(not set)");
+                let dir_label = state
+                    .export_directory
+                    .as_ref()
+                    .map_or("(not set)".to_string(), |p| p.display().to_string());
                 ui.label(egui::RichText::new(dir_label).monospace());
 
                 if ui.button("Browse...").clicked()
                     && let Some(path) = rfd::FileDialog::new().pick_folder()
                 {
-                    state.export_directory = Some(path.display().to_string());
+                    state.export_directory = Some(path);
                 }
             });
 
@@ -426,7 +429,7 @@ fn export_panel(ui: &mut egui::Ui, state: &mut AppState) {
 /// Execute the export based on the selected format.
 fn run_export(state: &mut AppState) {
     let dir = match state.export_directory {
-        Some(ref d) => std::path::PathBuf::from(d),
+        Some(ref d) => d.clone(),
         None => return,
     };
 

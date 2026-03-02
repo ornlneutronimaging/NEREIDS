@@ -338,7 +338,7 @@ pub struct AppState {
 
     // -- Export --
     pub export_format: ExportFormat,
-    pub export_directory: Option<String>,
+    pub export_directory: Option<PathBuf>,
     pub export_status: Option<String>,
 }
 
