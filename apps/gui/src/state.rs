@@ -330,6 +330,9 @@ pub struct AppState {
     // -- HDF5 tree browser --
     pub hdf5_tree: Option<Vec<Hdf5TreeEntry>>,
 
+    // -- Studio mode --
+    pub studio_selected_tile: usize,
+
     // -- Provenance --
     pub provenance_log: Vec<ProvenanceEvent>,
 
@@ -469,6 +472,7 @@ impl AppState {
         self.dead_pixels = None;
         self.spectrum_values = None;
         self.tile_display.clear();
+        self.studio_selected_tile = 0;
         self.export_status = None;
     }
 
@@ -591,6 +595,8 @@ impl Default for AppState {
             periodic_table_selected_z: None,
 
             hdf5_tree: None,
+
+            studio_selected_tile: 0,
 
             provenance_log: Vec::new(),
             tile_display: Vec::new(),

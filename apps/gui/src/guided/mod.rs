@@ -6,6 +6,7 @@ pub mod detectability;
 pub mod forward_model;
 pub mod load;
 pub mod normalize;
+pub mod result_widgets;
 pub mod results;
 pub mod sidebar;
 
