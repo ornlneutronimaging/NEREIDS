@@ -8,6 +8,7 @@
 use crate::state::{AppState, InputMode, IsotopeEntry, RoiSelection, SpectrumAxis};
 use crate::widgets::image_view::show_viridis_image;
 use egui_plot::{Line, Plot, PlotPoints, VLine};
+use ndarray::Axis;
 use nereids_io::spectrum::{SpectrumUnit, SpectrumValueKind};
 use nereids_pipeline::pipeline::FitConfig;
 use std::sync::Arc;
@@ -234,6 +235,34 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
             "{}/{} pixels converged",
             result.n_converged, result.n_total
         ));
+    } else if let Some(ref norm) = state.normalized {
+        // TOF-sliced transmission preview with slider
+        let n_tof = norm.transmission.shape()[0];
+        if n_tof == 0 {
+            ui.label("(no data)");
+        } else {
+            if state.analyze_tof_slice_index >= n_tof {
+                state.analyze_tof_slice_index = n_tof - 1;
+            }
+
+            ui.label("Transmission (TOF slice):");
+            let slice = norm
+                .transmission
+                .index_axis(Axis(0), state.analyze_tof_slice_index)
+                .to_owned();
+            if let Some((y, x)) = show_viridis_image(ui, &slice, "analyze_preview_tex") {
+                state.selected_pixel = Some((y, x));
+                state.pixel_fit_result = None;
+            }
+
+            ui.add(
+                egui::Slider::new(
+                    &mut state.analyze_tof_slice_index,
+                    0..=n_tof.saturating_sub(1),
+                )
+                .text("TOF bin"),
+            );
+        }
     } else if let Some(ref preview) = state.preview_image {
         ui.label("Preview (summed counts):");
         if let Some((y, x)) = show_viridis_image(ui, preview, "preview_tex") {
