@@ -51,34 +51,36 @@ fn detect_controls(ui: &mut egui::Ui, state: &mut AppState) {
     ui.label(egui::RichText::new("Matrix Isotope").strong());
     ui.add_space(4.0);
 
-    // ENDF library selector
+    // ENDF library selector (disabled during active fetch to prevent stale results)
     let prev_lib = state.detect_endf_library;
-    ui.horizontal(|ui| {
-        ui.label("Library:");
-        egui::ComboBox::from_id_salt("detect_endf_lib")
-            .selected_text(library_name(state.detect_endf_library))
-            .show_ui(ui, |ui| {
-                ui.selectable_value(
-                    &mut state.detect_endf_library,
-                    EndfLibrary::EndfB8_0,
-                    "ENDF/B-VIII.0",
-                );
-                ui.selectable_value(
-                    &mut state.detect_endf_library,
-                    EndfLibrary::EndfB8_1,
-                    "ENDF/B-VIII.1",
-                );
-                ui.selectable_value(
-                    &mut state.detect_endf_library,
-                    EndfLibrary::Jeff3_3,
-                    "JEFF-3.3",
-                );
-                ui.selectable_value(
-                    &mut state.detect_endf_library,
-                    EndfLibrary::Jendl5,
-                    "JENDL-5",
-                );
-            });
+    ui.add_enabled_ui(!state.is_fetching_detect_endf, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Library:");
+            egui::ComboBox::from_id_salt("detect_endf_lib")
+                .selected_text(library_name(state.detect_endf_library))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut state.detect_endf_library,
+                        EndfLibrary::EndfB8_0,
+                        "ENDF/B-VIII.0",
+                    );
+                    ui.selectable_value(
+                        &mut state.detect_endf_library,
+                        EndfLibrary::EndfB8_1,
+                        "ENDF/B-VIII.1",
+                    );
+                    ui.selectable_value(
+                        &mut state.detect_endf_library,
+                        EndfLibrary::Jeff3_3,
+                        "JEFF-3.3",
+                    );
+                    ui.selectable_value(
+                        &mut state.detect_endf_library,
+                        EndfLibrary::Jendl5,
+                        "JENDL-5",
+                    );
+                });
+        });
     });
     // Library change invalidates all resonance data — must re-fetch
     if state.detect_endf_library != prev_lib {
@@ -135,7 +137,7 @@ fn detect_controls(ui: &mut egui::Ui, state: &mut AppState) {
                 .add(
                     egui::DragValue::new(&mut state.detect_matrix_density)
                         .speed(0.0001)
-                        .range(0.0..=1.0),
+                        .range(1e-6..=1.0),
                 )
                 .changed()
             {
@@ -476,6 +478,12 @@ fn run_detectability(state: &mut AppState) {
             .partial_cmp(&a.peak_snr)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+
+    // Guard: all traces skipped (no data) but no computation errors
+    if results.is_empty() && n_errors == 0 {
+        state.status_message = "No trace isotopes had data to analyze".into();
+        return;
+    }
 
     state.detect_results = results;
     if n_errors == 0 {

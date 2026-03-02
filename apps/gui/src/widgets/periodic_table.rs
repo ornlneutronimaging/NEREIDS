@@ -349,10 +349,16 @@ pub fn periodic_table_modal(ctx: &egui::Context, state: &mut AppState) {
 
 /// Add a selected isotope to the appropriate target list based on
 /// `state.periodic_table_target`.
+///
+/// Blocked when an ENDF fetch is in-flight for the corresponding target,
+/// preventing stale fetch results from landing on newly-added isotopes.
 fn add_isotope_to_target(state: &mut AppState, z: u32, a: u32, sym: &str) {
     let symbol = format!("{}-{}", sym, a);
     match state.periodic_table_target {
         PeriodicTableTarget::Configure => {
+            if state.is_fetching_endf {
+                return;
+            }
             state.isotope_entries.push(IsotopeEntry {
                 z,
                 a,
@@ -366,6 +372,9 @@ fn add_isotope_to_target(state: &mut AppState, z: u32, a: u32, sym: &str) {
             state.pixel_fit_result = None;
         }
         PeriodicTableTarget::ForwardModel => {
+            if state.is_fetching_fm_endf {
+                return;
+            }
             state.fm_isotope_entries.push(IsotopeEntry {
                 z,
                 a,
@@ -378,6 +387,9 @@ fn add_isotope_to_target(state: &mut AppState, z: u32, a: u32, sym: &str) {
             state.fm_per_isotope_spectra.clear();
         }
         PeriodicTableTarget::DetectMatrix => {
+            if state.is_fetching_detect_endf {
+                return;
+            }
             state.detect_matrix = Some(IsotopeEntry {
                 z,
                 a,
@@ -389,6 +401,9 @@ fn add_isotope_to_target(state: &mut AppState, z: u32, a: u32, sym: &str) {
             state.detect_results.clear();
         }
         PeriodicTableTarget::DetectTrace => {
+            if state.is_fetching_detect_endf {
+                return;
+            }
             state.detect_trace_entries.push(DetectTraceEntry {
                 z,
                 a,

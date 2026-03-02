@@ -317,6 +317,8 @@ impl AppState {
         // Clear stale FM spectrum caches
         self.fm_spectrum = None;
         self.fm_per_isotope_spectra.clear();
+        // Clear stale detectability results
+        self.detect_results.clear();
     }
 
     /// Clear pixel selection, ROI, results, normalization, and cancel pending tasks.

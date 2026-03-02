@@ -91,26 +91,32 @@ pub fn forward_model_step(ui: &mut egui::Ui, state: &mut AppState) {
 
 /// Isotope table controls for the Forward Model (independent from Configure).
 fn fm_isotope_controls(ui: &mut egui::Ui, state: &mut AppState) {
-    // ENDF library selector
+    // ENDF library selector (disabled during active fetch to prevent stale results)
     let prev_lib = state.fm_endf_library;
-    ui.horizontal(|ui| {
-        ui.label("Library:");
-        egui::ComboBox::from_id_salt("fm_endf_lib")
-            .selected_text(library_name(state.fm_endf_library))
-            .show_ui(ui, |ui| {
-                ui.selectable_value(
-                    &mut state.fm_endf_library,
-                    EndfLibrary::EndfB8_0,
-                    "ENDF/B-VIII.0",
-                );
-                ui.selectable_value(
-                    &mut state.fm_endf_library,
-                    EndfLibrary::EndfB8_1,
-                    "ENDF/B-VIII.1",
-                );
-                ui.selectable_value(&mut state.fm_endf_library, EndfLibrary::Jeff3_3, "JEFF-3.3");
-                ui.selectable_value(&mut state.fm_endf_library, EndfLibrary::Jendl5, "JENDL-5");
-            });
+    ui.add_enabled_ui(!state.is_fetching_fm_endf, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Library:");
+            egui::ComboBox::from_id_salt("fm_endf_lib")
+                .selected_text(library_name(state.fm_endf_library))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut state.fm_endf_library,
+                        EndfLibrary::EndfB8_0,
+                        "ENDF/B-VIII.0",
+                    );
+                    ui.selectable_value(
+                        &mut state.fm_endf_library,
+                        EndfLibrary::EndfB8_1,
+                        "ENDF/B-VIII.1",
+                    );
+                    ui.selectable_value(
+                        &mut state.fm_endf_library,
+                        EndfLibrary::Jeff3_3,
+                        "JEFF-3.3",
+                    );
+                    ui.selectable_value(&mut state.fm_endf_library, EndfLibrary::Jendl5, "JENDL-5");
+                });
+        });
     });
     // Library change invalidates all resonance data — must re-fetch
     if state.fm_endf_library != prev_lib {
@@ -314,10 +320,18 @@ fn fm_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
             .filter_map(|e| e.resonance_data.clone().map(|rd| (rd, e.initial_density)))
             .collect();
 
-        if let Ok(sample) = SampleParams::new(state.fm_temperature_k, isotopes)
-            && let Ok(combined) = transmission::forward_model(&energies, &sample, None)
-        {
-            state.fm_spectrum = Some(combined);
+        match SampleParams::new(state.fm_temperature_k, isotopes) {
+            Ok(sample) => match transmission::forward_model(&energies, &sample, None) {
+                Ok(combined) => {
+                    state.fm_spectrum = Some(combined);
+                }
+                Err(e) => {
+                    state.status_message = format!("Forward model error: {e}");
+                }
+            },
+            Err(e) => {
+                state.status_message = format!("Sample params error: {e}");
+            }
         }
 
         // Compute per-isotope contributions (each isotope alone)
@@ -327,10 +341,19 @@ fn fm_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 continue;
             };
             let single = vec![(rd, entry.initial_density)];
-            if let Ok(sample) = SampleParams::new(state.fm_temperature_k, single)
-                && let Ok(t) = transmission::forward_model(&energies, &sample, None)
-            {
-                state.fm_per_isotope_spectra.push((entry.symbol.clone(), t));
+            match SampleParams::new(state.fm_temperature_k, single) {
+                Ok(sample) => match transmission::forward_model(&energies, &sample, None) {
+                    Ok(t) => {
+                        state.fm_per_isotope_spectra.push((entry.symbol.clone(), t));
+                    }
+                    Err(e) => {
+                        state.status_message =
+                            format!("Forward model error for {}: {e}", entry.symbol);
+                    }
+                },
+                Err(e) => {
+                    state.status_message = format!("Sample params error for {}: {e}", entry.symbol);
+                }
             }
         }
 
