@@ -1,7 +1,7 @@
 //! Main application structure and egui App implementation.
 
 use crate::guided;
-use crate::state::{AppState, Tab, UiMode};
+use crate::state::{AppState, ProvenanceEventKind, Tab, UiMode};
 use crate::studio;
 use crate::theme;
 use crate::widgets;
@@ -72,6 +72,14 @@ fn poll_pending_tasks(state: &mut AppState) {
                     "Spatial map: {}/{} converged",
                     result.n_converged, result.n_total
                 );
+                state.log_provenance(
+                    ProvenanceEventKind::AnalysisRun,
+                    format!(
+                        "Spatial mapping: {}/{} converged",
+                        result.n_converged, result.n_total
+                    ),
+                );
+                state.init_tile_display(result.density_maps.len());
                 state.spatial_result = Some(result);
                 state.is_fitting = false;
                 state.active_tab = Tab::Map;
@@ -122,6 +130,11 @@ fn poll_pending_tasks(state: &mut AppState) {
         }
         // Only finalize when the sender is dropped (thread finished)
         if disconnected {
+            let loaded_count = state
+                .isotope_entries
+                .iter()
+                .filter(|e| e.enabled && e.resonance_data.is_some())
+                .count();
             if !state
                 .isotope_entries
                 .iter()
@@ -129,6 +142,10 @@ fn poll_pending_tasks(state: &mut AppState) {
             {
                 state.status_message = "All ENDF data loaded".into();
             }
+            state.log_provenance(
+                ProvenanceEventKind::ConfigChanged,
+                format!("Fetched ENDF data for {loaded_count} isotopes"),
+            );
             state.is_fetching_endf = false;
             state.pending_endf = None;
         }

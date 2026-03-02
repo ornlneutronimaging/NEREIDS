@@ -1,6 +1,8 @@
 //! Step 3: Normalize — transmission computation, preview, and analysis mode selection.
 
-use crate::state::{AnalysisMode, AppState, InputMode, SpectrumAxis, SpectrumDataSource};
+use crate::state::{
+    AnalysisMode, AppState, InputMode, ProvenanceEventKind, SpectrumAxis, SpectrumDataSource,
+};
 use crate::widgets::image_view::show_viridis_image;
 use egui_plot::{Line, Plot, PlotPoints, VLine};
 use ndarray::{Array3, Axis};
@@ -486,6 +488,10 @@ fn normalize_data(state: &mut AppState) {
             }
 
             state.normalized = Some(Arc::new(norm));
+            state.log_provenance(
+                ProvenanceEventKind::Normalized,
+                "Normalization complete (Method 2)",
+            );
             state.status_message = "Normalization complete".into();
         }
         Err(e) => {
@@ -530,6 +536,10 @@ pub(crate) fn prepare_transmission(state: &mut AppState) {
         transmission: sample,
         uncertainty,
     }));
+    state.log_provenance(
+        ProvenanceEventKind::Normalized,
+        "Transmission data prepared",
+    );
     state.status_message = "Transmission ready (synthetic uncertainty — see docs)".into();
 }
 
