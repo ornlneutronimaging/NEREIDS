@@ -6,7 +6,7 @@
 //! map and immediately see its spectrum.
 
 use crate::state::{AppState, InputMode, IsotopeEntry, RoiSelection, SolverMethod, SpectrumAxis};
-use crate::widgets::image_view::show_viridis_image;
+use crate::widgets::image_view::{show_viridis_image, show_viridis_image_with_roi};
 use egui_plot::{Line, Plot, PlotPoints, VLine};
 use ndarray::Axis;
 use nereids_io::spectrum::{SpectrumUnit, SpectrumValueKind};
@@ -295,7 +295,13 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
         let idx = state.map_display_isotope.min(n_isotopes - 1);
 
         ui.label("Density (atoms/barn):");
-        if let Some((y, x)) = show_viridis_image(ui, &result.density_maps[idx], "density_tex") {
+        let (clicked, _rect) = show_viridis_image_with_roi(
+            ui,
+            &result.density_maps[idx],
+            "density_tex",
+            state.roi.as_ref(),
+        );
+        if let Some((y, x)) = clicked {
             state.selected_pixel = Some((y, x));
             state.pixel_fit_result = None;
         }
@@ -325,7 +331,9 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 .transmission
                 .index_axis(Axis(0), state.analyze_tof_slice_index)
                 .to_owned();
-            if let Some((y, x)) = show_viridis_image(ui, &slice, "analyze_preview_tex") {
+            let (clicked, _rect) =
+                show_viridis_image_with_roi(ui, &slice, "analyze_preview_tex", state.roi.as_ref());
+            if let Some((y, x)) = clicked {
                 state.selected_pixel = Some((y, x));
                 state.pixel_fit_result = None;
             }
