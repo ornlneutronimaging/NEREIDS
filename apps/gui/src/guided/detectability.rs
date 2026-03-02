@@ -516,24 +516,50 @@ fn detect_fetch_endf_data(state: &mut AppState) {
     // Matrix at index 0
     if let Some(ref matrix) = state.detect_matrix
         && matrix.resonance_data.is_none()
-        && let Ok(isotope) = Isotope::new(matrix.z, matrix.a)
-        && retrieval::mat_number(&isotope).is_some()
     {
-        work.push((0, isotope, matrix.symbol.clone(), state.detect_endf_library));
+        match Isotope::new(matrix.z, matrix.a) {
+            Ok(isotope) => {
+                if retrieval::mat_number(&isotope).is_some() {
+                    work.push((0, isotope, matrix.symbol.clone(), state.detect_endf_library));
+                } else {
+                    state.status_message = format!(
+                        "No MAT number for matrix {} — isotope not in database",
+                        matrix.symbol
+                    );
+                }
+            }
+            Err(e) => {
+                state.status_message = format!(
+                    "Matrix isotope Z={} A={} is not supported: {}",
+                    matrix.z, matrix.a, e
+                );
+            }
+        }
     }
 
     // Traces at index 1+
     for (i, entry) in state.detect_trace_entries.iter().enumerate() {
-        if entry.resonance_data.is_none()
-            && let Ok(isotope) = Isotope::new(entry.z, entry.a)
-            && retrieval::mat_number(&isotope).is_some()
-        {
-            work.push((
-                i + 1,
-                isotope,
-                entry.symbol.clone(),
-                state.detect_endf_library,
-            ));
+        if entry.resonance_data.is_none() {
+            match Isotope::new(entry.z, entry.a) {
+                Ok(isotope) => {
+                    if retrieval::mat_number(&isotope).is_some() {
+                        work.push((
+                            i + 1,
+                            isotope,
+                            entry.symbol.clone(),
+                            state.detect_endf_library,
+                        ));
+                    } else {
+                        state.status_message = format!(
+                            "No MAT number for {} — isotope not in database",
+                            entry.symbol
+                        );
+                    }
+                }
+                Err(e) => {
+                    state.status_message = format!("Invalid isotope {}: {}", entry.symbol, e);
+                }
+            }
         }
     }
 

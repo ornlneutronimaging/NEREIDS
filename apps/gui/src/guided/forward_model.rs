@@ -23,45 +23,49 @@ pub fn forward_model_step(ui: &mut egui::Ui, state: &mut AppState) {
 
     ui.add_space(8.0);
 
-    // Sync buttons row
+    // Sync buttons row (disabled during active ENDF fetches to prevent index corruption)
     ui.horizontal(|ui| {
-        if ui.button("Copy from Config").clicked() {
-            state.fm_isotope_entries = state
-                .isotope_entries
-                .iter()
-                .map(|e| IsotopeEntry {
-                    z: e.z,
-                    a: e.a,
-                    symbol: e.symbol.clone(),
-                    initial_density: e.initial_density,
-                    resonance_data: e.resonance_data.clone(),
-                    enabled: e.enabled,
-                })
-                .collect();
-            state.fm_endf_library = state.endf_library;
-            state.fm_temperature_k = state.temperature_k;
-            state.fm_spectrum = None;
-            state.fm_per_isotope_spectra.clear();
-        }
-        if ui.button("Push to Config").clicked() {
-            state.isotope_entries = state
-                .fm_isotope_entries
-                .iter()
-                .map(|e| IsotopeEntry {
-                    z: e.z,
-                    a: e.a,
-                    symbol: e.symbol.clone(),
-                    initial_density: e.initial_density,
-                    resonance_data: e.resonance_data.clone(),
-                    enabled: e.enabled,
-                })
-                .collect();
-            state.endf_library = state.fm_endf_library;
-            state.temperature_k = state.fm_temperature_k;
-            // Invalidate stale fit results
-            state.spatial_result = None;
-            state.pixel_fit_result = None;
-        }
+        ui.add_enabled_ui(!state.is_fetching_fm_endf, |ui| {
+            if ui.button("Copy from Config").clicked() {
+                state.fm_isotope_entries = state
+                    .isotope_entries
+                    .iter()
+                    .map(|e| IsotopeEntry {
+                        z: e.z,
+                        a: e.a,
+                        symbol: e.symbol.clone(),
+                        initial_density: e.initial_density,
+                        resonance_data: e.resonance_data.clone(),
+                        enabled: e.enabled,
+                    })
+                    .collect();
+                state.fm_endf_library = state.endf_library;
+                state.fm_temperature_k = state.temperature_k;
+                state.fm_spectrum = None;
+                state.fm_per_isotope_spectra.clear();
+            }
+        });
+        ui.add_enabled_ui(!state.is_fetching_endf, |ui| {
+            if ui.button("Push to Config").clicked() {
+                state.isotope_entries = state
+                    .fm_isotope_entries
+                    .iter()
+                    .map(|e| IsotopeEntry {
+                        z: e.z,
+                        a: e.a,
+                        symbol: e.symbol.clone(),
+                        initial_density: e.initial_density,
+                        resonance_data: e.resonance_data.clone(),
+                        enabled: e.enabled,
+                    })
+                    .collect();
+                state.endf_library = state.fm_endf_library;
+                state.temperature_k = state.fm_temperature_k;
+                // Invalidate stale fit results
+                state.spatial_result = None;
+                state.pixel_fit_result = None;
+            }
+        });
     });
 
     ui.add_space(8.0);
@@ -313,6 +317,15 @@ fn fm_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
             .collect()
     };
 
+    // Invalidate cache when energy grid changes (e.g. new data loaded or energies cleared)
+    let current_grid = state.energies.as_deref();
+    let cached_grid = state.fm_energies.as_deref();
+    if current_grid != cached_grid {
+        state.fm_spectrum = None;
+        state.fm_per_isotope_spectra.clear();
+        state.fm_energies = None;
+    }
+
     // Compute combined forward model if cache is stale
     if state.fm_spectrum.is_none() {
         let isotopes: Vec<_> = enabled
@@ -327,10 +340,14 @@ fn fm_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 }
                 Err(e) => {
                     state.status_message = format!("Forward model error: {e}");
+                    // Sentinel: empty vec stops recomputation every frame
+                    state.fm_spectrum = Some(Vec::new());
                 }
             },
             Err(e) => {
                 state.status_message = format!("Sample params error: {e}");
+                // Sentinel: empty vec stops recomputation every frame
+                state.fm_spectrum = Some(Vec::new());
             }
         }
 
@@ -349,10 +366,12 @@ fn fm_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
                     Err(e) => {
                         state.status_message =
                             format!("Forward model error for {}: {e}", entry.symbol);
+                        // Skip this isotope but don't leave cache in recomputation state
                     }
                 },
                 Err(e) => {
                     state.status_message = format!("Sample params error for {}: {e}", entry.symbol);
+                    // Skip this isotope but don't leave cache in recomputation state
                 }
             }
         }

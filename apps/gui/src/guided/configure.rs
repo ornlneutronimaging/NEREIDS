@@ -67,26 +67,35 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
     ui.label(egui::RichText::new("Isotopes").strong());
     ui.add_space(4.0);
 
-    // ENDF library selector
-    ui.horizontal(|ui| {
-        ui.label("Library:");
-        egui::ComboBox::from_id_salt("endf_lib")
-            .selected_text(library_name(state.endf_library))
-            .show_ui(ui, |ui| {
-                ui.selectable_value(
-                    &mut state.endf_library,
-                    EndfLibrary::EndfB8_0,
-                    "ENDF/B-VIII.0",
-                );
-                ui.selectable_value(
-                    &mut state.endf_library,
-                    EndfLibrary::EndfB8_1,
-                    "ENDF/B-VIII.1",
-                );
-                ui.selectable_value(&mut state.endf_library, EndfLibrary::Jeff3_3, "JEFF-3.3");
-                ui.selectable_value(&mut state.endf_library, EndfLibrary::Jendl5, "JENDL-5");
-            });
+    // ENDF library selector (disabled during active fetch to prevent stale results)
+    let prev_lib = state.endf_library;
+    ui.add_enabled_ui(!state.is_fetching_endf, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Library:");
+            egui::ComboBox::from_id_salt("endf_lib")
+                .selected_text(library_name(state.endf_library))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut state.endf_library,
+                        EndfLibrary::EndfB8_0,
+                        "ENDF/B-VIII.0",
+                    );
+                    ui.selectable_value(
+                        &mut state.endf_library,
+                        EndfLibrary::EndfB8_1,
+                        "ENDF/B-VIII.1",
+                    );
+                    ui.selectable_value(&mut state.endf_library, EndfLibrary::Jeff3_3, "JEFF-3.3");
+                    ui.selectable_value(&mut state.endf_library, EndfLibrary::Jendl5, "JENDL-5");
+                });
+        });
     });
+    // Library change invalidates all resonance data — must re-fetch
+    if state.endf_library != prev_lib {
+        for e in &mut state.isotope_entries {
+            e.resonance_data = None;
+        }
+    }
 
     ui.add_space(4.0);
 

@@ -220,16 +220,38 @@ fn poll_pending_tasks(state: &mut AppState) {
             }
         }
         if disconnected {
-            let matrix_missing = state
-                .detect_matrix
-                .as_ref()
-                .is_some_and(|m| m.resonance_data.is_none());
-            let trace_missing = state
+            // Count how many trace isotopes have data vs total
+            let total_traces = state.detect_trace_entries.len();
+            let loaded_traces = state
                 .detect_trace_entries
                 .iter()
-                .any(|t| t.resonance_data.is_none());
-            if !matrix_missing && !trace_missing {
+                .filter(|t| t.resonance_data.is_some())
+                .count();
+            let matrix_loaded = state
+                .detect_matrix
+                .as_ref()
+                .is_some_and(|m| m.resonance_data.is_some());
+
+            if matrix_loaded && loaded_traces == total_traces {
                 state.status_message = "Detect: all ENDF data loaded".into();
+            } else {
+                let mut parts = Vec::new();
+                if !matrix_loaded && let Some(ref m) = state.detect_matrix {
+                    parts.push(format!("matrix {} not supported", m.symbol));
+                }
+                if loaded_traces < total_traces {
+                    let unsupported = total_traces - loaded_traces;
+                    parts.push(format!(
+                        "ENDF data loaded for {} of {} trace isotopes ({} not supported)",
+                        loaded_traces, total_traces, unsupported
+                    ));
+                } else {
+                    parts.push(format!(
+                        "ENDF data loaded for all {} trace isotopes",
+                        total_traces
+                    ));
+                }
+                state.status_message = format!("Detect: {}", parts.join("; "));
             }
             state.is_fetching_detect_endf = false;
             state.pending_detect_endf = None;
