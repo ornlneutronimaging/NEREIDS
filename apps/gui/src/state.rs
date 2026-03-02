@@ -472,6 +472,7 @@ impl AppState {
         self.dead_pixels = None;
         self.spectrum_values = None;
         self.tile_display.clear();
+        self.studio_selected_tile = 0;
         self.export_status = None;
     }
 

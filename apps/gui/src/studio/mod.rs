@@ -143,6 +143,9 @@ fn tile_gallery(ui: &mut egui::Ui, state: &mut AppState) {
                 })
                 .response;
 
+            // Upgrade hover-only frame response to also sense clicks
+            let resp = resp.interact(egui::Sense::click());
+
             if resp.clicked() {
                 state.studio_selected_tile = tile.idx;
             }
@@ -158,8 +161,8 @@ fn tile_gallery(ui: &mut egui::Ui, state: &mut AppState) {
 
 /// Full-size viewer for the selected tile with colorbar and toolbelt.
 fn full_viewer(ui: &mut egui::Ui, state: &mut AppState) {
-    // Extract tile data
-    let (n_density, data, label, conv_f64) = match state.spatial_result {
+    // Extract tile data — only compute convergence map when needed
+    let (n_density, data, label) = match state.spatial_result {
         Some(ref r) => {
             let symbols: Vec<String> = state
                 .isotope_entries
@@ -177,18 +180,18 @@ fn full_viewer(ui: &mut egui::Ui, state: &mut AppState) {
             }
 
             let is_convergence = tile_idx == n_density;
-            let conv = r.converged_map.mapv(|b| if b { 1.0 } else { 0.0 });
 
             if is_convergence {
+                let conv = r.converged_map.mapv(|b| if b { 1.0 } else { 0.0 });
                 let label = format!("Convergence ({}/{})", r.n_converged, r.n_total);
-                (n_density, conv.clone(), label, conv)
+                (n_density, conv, label)
             } else {
                 let label = symbols
                     .get(tile_idx)
                     .cloned()
                     .unwrap_or_else(|| format!("Isotope {tile_idx}"));
                 let data = r.density_maps[tile_idx].clone();
-                (n_density, data, format!("{label} density"), conv)
+                (n_density, data, format!("{label} density"))
             }
         }
         None => return,
@@ -253,9 +256,6 @@ fn full_viewer(ui: &mut egui::Ui, state: &mut AppState) {
         };
         result_widgets::tile_toolbelt(ui, &data, tile_idx, &short_label, state);
     });
-
-    // Drop the cloned data — make conv_f64 usable if needed
-    let _ = conv_f64;
 }
 
 // ---------------------------------------------------------------------------
