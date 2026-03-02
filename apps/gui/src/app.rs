@@ -220,7 +220,17 @@ fn poll_pending_tasks(state: &mut AppState) {
             }
         }
         if disconnected {
-            state.status_message = "Detect: all ENDF data loaded".into();
+            let matrix_missing = state
+                .detect_matrix
+                .as_ref()
+                .is_some_and(|m| m.resonance_data.is_none());
+            let trace_missing = state
+                .detect_trace_entries
+                .iter()
+                .any(|t| t.resonance_data.is_none());
+            if !matrix_missing && !trace_missing {
+                state.status_message = "Detect: all ENDF data loaded".into();
+            }
             state.is_fetching_detect_endf = false;
             state.pending_detect_endf = None;
         }

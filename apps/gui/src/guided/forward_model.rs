@@ -291,10 +291,10 @@ fn fm_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
         e.clone()
     } else {
         let n = 2000;
-        let ln_min = 1.0_f64.ln();
-        let ln_max = 100.0_f64.ln();
+        let e_min = 1.0_f64;
+        let e_max = 100.0_f64;
         (0..n)
-            .map(|i| (ln_min + (ln_max - ln_min) * i as f64 / (n - 1) as f64).exp())
+            .map(|i| e_min * (e_max / e_min).powf(i as f64 / (n - 1).max(1) as f64))
             .collect()
     };
 
@@ -302,7 +302,7 @@ fn fm_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
     if state.fm_spectrum.is_none() {
         let isotopes: Vec<_> = enabled
             .iter()
-            .map(|e| (e.resonance_data.clone().unwrap(), e.initial_density))
+            .filter_map(|e| e.resonance_data.clone().map(|rd| (rd, e.initial_density)))
             .collect();
 
         if let Ok(sample) = SampleParams::new(state.fm_temperature_k, isotopes)
@@ -314,7 +314,10 @@ fn fm_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
         // Compute per-isotope contributions (each isotope alone)
         state.fm_per_isotope_spectra.clear();
         for entry in &enabled {
-            let single = vec![(entry.resonance_data.clone().unwrap(), entry.initial_density)];
+            let Some(rd) = entry.resonance_data.clone() else {
+                continue;
+            };
+            let single = vec![(rd, entry.initial_density)];
             if let Ok(sample) = SampleParams::new(state.fm_temperature_k, single)
                 && let Ok(t) = transmission::forward_model(&energies, &sample, None)
             {
@@ -334,11 +337,12 @@ fn fm_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
         SpectrumAxis::TofMicroseconds => {
             let fp = state.beamline.flight_path_m;
             if fp.is_finite() && fp > 0.0 {
+                let delay = state.beamline.delay_us;
                 let tof: Vec<f64> = plot_energies
                     .iter()
                     .map(|&e| {
                         if e > 0.0 {
-                            nereids_core::constants::energy_to_tof(e, fp)
+                            nereids_core::constants::energy_to_tof(e, fp) + delay
                         } else {
                             f64::NAN
                         }

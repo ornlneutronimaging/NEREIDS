@@ -396,6 +396,7 @@ fn add_isotope_to_target(state: &mut AppState, z: u32, a: u32, sym: &str) {
                 concentration_ppm: 1000.0,
                 resonance_data: None,
             });
+            state.detect_results.clear();
         }
     }
 }

@@ -248,9 +248,8 @@ fn detect_controls(ui: &mut egui::Ui, state: &mut AppState) {
 
     // --- Advanced config ---
     egui::CollapsingHeader::new("Advanced")
-        .default_open(state.detect_show_advanced)
+        .default_open(false)
         .show(ui, |ui| {
-            state.detect_show_advanced = true;
             ui.horizontal(|ui| {
                 ui.label("SNR threshold:");
                 ui.add(
@@ -393,12 +392,23 @@ fn run_detectability(state: &mut AppState) {
         }
     };
 
-    let matrix_rd = matrix_entry.resonance_data.clone().unwrap();
+    let Some(matrix_rd) = matrix_entry.resonance_data.clone() else {
+        return;
+    };
+
+    // Validate energy range
+    let e_min = state.detect_energy_min;
+    let e_max = state.detect_energy_max;
+    if e_min >= e_max {
+        state.status_message = format!(
+            "E_min ({:.3} eV) must be less than E_max ({:.3} eV)",
+            e_min, e_max
+        );
+        return;
+    }
 
     // Build log-spaced energy grid
     let n = state.detect_n_energy_points;
-    let e_min = state.detect_energy_min;
-    let e_max = state.detect_energy_max;
     let energies: Vec<f64> = (0..n)
         .map(|i| e_min * (e_max / e_min).powf(i as f64 / (n - 1).max(1) as f64))
         .collect();
@@ -414,6 +424,7 @@ fn run_detectability(state: &mut AppState) {
     };
 
     let mut results = Vec::new();
+    let mut n_errors = 0usize;
     for trace_entry in &state.detect_trace_entries {
         let trace_rd = match &trace_entry.resonance_data {
             Some(rd) => rd,
@@ -424,6 +435,7 @@ fn run_detectability(state: &mut AppState) {
             Err(e) => {
                 state.status_message =
                     format!("Detectability error for {}: {}", trace_entry.symbol, e);
+                n_errors += 1;
             }
         }
     }
@@ -436,7 +448,14 @@ fn run_detectability(state: &mut AppState) {
     });
 
     state.detect_results = results;
-    state.status_message = "Detectability analysis complete".into();
+    if n_errors == 0 {
+        state.status_message = "Detectability analysis complete".into();
+    } else {
+        state.status_message = format!(
+            "Detectability analysis complete ({} trace(s) failed)",
+            n_errors
+        );
+    }
 }
 
 fn library_name(lib: EndfLibrary) -> &'static str {
@@ -481,6 +500,8 @@ fn detect_fetch_endf_data(state: &mut AppState) {
     }
 
     if work.is_empty() {
+        state.status_message =
+            "No supported isotopes found — none have MAT numbers in the ENDF database".into();
         return;
     }
 
