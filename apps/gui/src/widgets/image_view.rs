@@ -1,6 +1,6 @@
-//! Shared image viewer widget: viridis-colormapped 2D array display with click-to-select.
+//! Shared image viewer widget: colormapped 2D array display with click-to-select.
 
-use crate::state::RoiSelection;
+use crate::state::{Colormap, RoiSelection};
 
 /// Display a 2D f64 array as a viridis-colormapped image with click-to-select-pixel.
 ///
@@ -16,7 +16,17 @@ pub fn show_viridis_image(
     data: &ndarray::Array2<f64>,
     tex_id: &str,
 ) -> Option<(usize, usize)> {
-    show_viridis_image_with_roi(ui, data, tex_id, None).0
+    show_colormapped_image(ui, data, tex_id, Colormap::Viridis)
+}
+
+/// Display a 2D f64 array with a configurable colormap and click-to-select-pixel.
+pub fn show_colormapped_image(
+    ui: &mut egui::Ui,
+    data: &ndarray::Array2<f64>,
+    tex_id: &str,
+    colormap: Colormap,
+) -> Option<(usize, usize)> {
+    show_colormapped_image_with_roi(ui, data, tex_id, colormap, None).0
 }
 
 /// Display a viridis-colormapped image with an optional ROI overlay.
@@ -29,21 +39,26 @@ pub fn show_viridis_image_with_roi(
     tex_id: &str,
     roi: Option<&RoiSelection>,
 ) -> (Option<(usize, usize)>, egui::Rect) {
+    show_colormapped_image_with_roi(ui, data, tex_id, Colormap::Viridis, roi)
+}
+
+/// Display a colormapped image with an optional ROI overlay.
+///
+/// Returns `(clicked_pixel, image_rect)`.
+pub fn show_colormapped_image_with_roi(
+    ui: &mut egui::Ui,
+    data: &ndarray::Array2<f64>,
+    tex_id: &str,
+    colormap: Colormap,
+    roi: Option<&RoiSelection>,
+) -> (Option<(usize, usize)>, egui::Rect) {
     let (height, width) = (data.shape()[0], data.shape()[1]);
     if width == 0 || height == 0 {
         ui.label("(empty image)");
         return (None, egui::Rect::NOTHING);
     }
 
-    let mut vmin = f64::INFINITY;
-    let mut vmax = f64::NEG_INFINITY;
-    for &v in data.iter() {
-        if v.is_finite() {
-            vmin = vmin.min(v);
-            vmax = vmax.max(v);
-        }
-    }
-
+    let (vmin, vmax) = data_range(data);
     let range = if (vmax - vmin).abs() < 1e-30 {
         1.0
     } else {
@@ -59,7 +74,7 @@ pub fn show_viridis_image_with_roi(
             } else {
                 0.0
             };
-            let (r, g, b) = viridis(t);
+            let (r, g, b) = apply_colormap(colormap, t);
             pixels.push(r);
             pixels.push(g);
             pixels.push(b);
@@ -107,6 +122,60 @@ pub fn show_viridis_image_with_roi(
     (None, image_rect)
 }
 
+/// Compute the (min, max) of finite values in a 2D array.
+///
+/// Returns `(0.0, 0.0)` when no finite values exist (empty or all-NaN).
+pub fn data_range(data: &ndarray::Array2<f64>) -> (f64, f64) {
+    let mut vmin = f64::INFINITY;
+    let mut vmax = f64::NEG_INFINITY;
+    for &v in data.iter() {
+        if v.is_finite() {
+            vmin = vmin.min(v);
+            vmax = vmax.max(v);
+        }
+    }
+    if vmin > vmax {
+        // No finite values found
+        (0.0, 0.0)
+    } else {
+        (vmin, vmax)
+    }
+}
+
+/// Render a 2D f64 array to RGBA bytes using the specified colormap.
+///
+/// Returns a Vec of length `width * height * 4` in RGBA order.
+pub fn render_to_rgba(data: &ndarray::Array2<f64>, colormap: Colormap) -> Vec<u8> {
+    let (height, width) = (data.shape()[0], data.shape()[1]);
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+    let (vmin, vmax) = data_range(data);
+    let range = if (vmax - vmin).abs() < 1e-30 {
+        1.0
+    } else {
+        vmax - vmin
+    };
+
+    let mut pixels = Vec::with_capacity(width * height * 4);
+    for y in 0..height {
+        for x in 0..width {
+            let v = data[[y, x]];
+            let t = if v.is_finite() {
+                ((v - vmin) / range).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let (r, g, b) = apply_colormap(colormap, t);
+            pixels.push(r);
+            pixels.push(g);
+            pixels.push(b);
+            pixels.push(255);
+        }
+    }
+    pixels
+}
+
 /// Draw a semi-transparent ROI rectangle overlay on a displayed image.
 fn draw_roi_overlay(
     painter: &egui::Painter,
@@ -144,6 +213,16 @@ fn draw_roi_overlay(
     );
 }
 
+/// Dispatch to the appropriate colormap function.
+pub fn apply_colormap(colormap: Colormap, t: f64) -> (u8, u8, u8) {
+    match colormap {
+        Colormap::Viridis => viridis(t),
+        Colormap::Inferno => inferno(t),
+        Colormap::Plasma => plasma(t),
+        Colormap::Grayscale => grayscale(t),
+    }
+}
+
 /// 4-segment linear approximation of the viridis colormap.
 pub fn viridis(t: f64) -> (u8, u8, u8) {
     let (r, g, b) = if t < 0.25 {
@@ -176,5 +255,95 @@ pub fn viridis(t: f64) -> (u8, u8, u8) {
         )
     };
 
-    (r as u8, g as u8, b as u8)
+    (
+        r.clamp(0.0, 255.0) as u8,
+        g.clamp(0.0, 255.0) as u8,
+        b.clamp(0.0, 255.0) as u8,
+    )
+}
+
+/// 4-segment linear approximation of the inferno colormap.
+/// Control points sampled from matplotlib's inferno at t = 0, 0.25, 0.5, 0.75, 1.0.
+pub fn inferno(t: f64) -> (u8, u8, u8) {
+    let (r, g, b) = if t < 0.25 {
+        let s = t / 0.25;
+        (
+            0.0 + s * (87.0 - 0.0),
+            0.0 + s * (16.0 - 0.0),
+            4.0 + s * (110.0 - 4.0),
+        )
+    } else if t < 0.5 {
+        let s = (t - 0.25) / 0.25;
+        (
+            87.0 + s * (188.0 - 87.0),
+            16.0 + s * (55.0 - 16.0),
+            110.0 + s * (84.0 - 110.0),
+        )
+    } else if t < 0.75 {
+        let s = (t - 0.5) / 0.25;
+        (
+            188.0 + s * (249.0 - 188.0),
+            55.0 + s * (142.0 - 55.0),
+            84.0 + s * (9.0 - 84.0),
+        )
+    } else {
+        let s = (t - 0.75) / 0.25;
+        (
+            249.0 + s * (252.0 - 249.0),
+            142.0 + s * (255.0 - 142.0),
+            9.0 + s * (164.0 - 9.0),
+        )
+    };
+
+    (
+        r.clamp(0.0, 255.0) as u8,
+        g.clamp(0.0, 255.0) as u8,
+        b.clamp(0.0, 255.0) as u8,
+    )
+}
+
+/// 4-segment linear approximation of the plasma colormap.
+/// Control points sampled from matplotlib's plasma at t = 0, 0.25, 0.5, 0.75, 1.0.
+pub fn plasma(t: f64) -> (u8, u8, u8) {
+    let (r, g, b) = if t < 0.25 {
+        let s = t / 0.25;
+        (
+            13.0 + s * (126.0 - 13.0),
+            8.0 + s * (3.0 - 8.0),
+            135.0 + s * (168.0 - 135.0),
+        )
+    } else if t < 0.5 {
+        let s = (t - 0.25) / 0.25;
+        (
+            126.0 + s * (203.0 - 126.0),
+            3.0 + s * (71.0 - 3.0),
+            168.0 + s * (119.0 - 168.0),
+        )
+    } else if t < 0.75 {
+        let s = (t - 0.5) / 0.25;
+        (
+            203.0 + s * (248.0 - 203.0),
+            71.0 + s * (149.0 - 71.0),
+            119.0 + s * (40.0 - 119.0),
+        )
+    } else {
+        let s = (t - 0.75) / 0.25;
+        (
+            248.0 + s * (240.0 - 248.0),
+            149.0 + s * (249.0 - 149.0),
+            40.0 + s * (33.0 - 40.0),
+        )
+    };
+
+    (
+        r.clamp(0.0, 255.0) as u8,
+        g.clamp(0.0, 255.0) as u8,
+        b.clamp(0.0, 255.0) as u8,
+    )
+}
+
+/// Linear grayscale colormap (black to white).
+pub fn grayscale(t: f64) -> (u8, u8, u8) {
+    let v = (t.clamp(0.0, 1.0) * 255.0) as u8;
+    (v, v, v)
 }

@@ -22,3 +22,4 @@ egui_extras = { workspace = true }
 egui_plot = { workspace = true }
 rfd = { workspace = true }
 ndarray = { workspace = true }
+image = { workspace = true }

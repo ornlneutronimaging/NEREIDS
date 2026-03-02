@@ -71,6 +71,129 @@ pub enum SpectrumAxis {
     TofMicroseconds,
 }
 
+/// A single provenance event in the session audit trail.
+#[derive(Debug, Clone)]
+pub struct ProvenanceEvent {
+    pub timestamp: std::time::SystemTime,
+    pub kind: ProvenanceEventKind,
+    pub message: String,
+}
+
+/// Classification of provenance events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProvenanceEventKind {
+    DataLoaded,
+    ConfigChanged,
+    Normalized,
+    AnalysisRun,
+    Exported,
+}
+
+impl ProvenanceEvent {
+    /// Format the timestamp as "YYYY-MM-DD HH:MM:SS UTC".
+    pub fn formatted_timestamp(&self) -> String {
+        self.timestamp
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| {
+                let secs = d.as_secs();
+                // Days since epoch
+                let days = secs / 86400;
+                let time_secs = secs % 86400;
+                let h = time_secs / 3600;
+                let m = (time_secs / 60) % 60;
+                let s = time_secs % 60;
+                // Convert days to Y-M-D (civil calendar from epoch 1970-01-01)
+                let (y, mo, day) = days_to_civil(days);
+                format!("{y:04}-{mo:02}-{day:02} {h:02}:{m:02}:{s:02} UTC")
+            })
+            .unwrap_or_else(|_| "????-??-?? ??:??:?? UTC".to_string())
+    }
+}
+
+/// Convert days since Unix epoch to (year, month, day).
+///
+/// Algorithm from Howard Hinnant's `chrono`-compatible civil date conversion.
+fn days_to_civil(days: u64) -> (i32, u32, u32) {
+    let z = days as i64 + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64; // day of era [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as i32, m as u32, d as u32)
+}
+
+/// Available colormaps for density map rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Colormap {
+    Viridis,
+    Inferno,
+    Plasma,
+    Grayscale,
+}
+
+impl Colormap {
+    pub const ALL: [Colormap; 4] = [
+        Colormap::Viridis,
+        Colormap::Inferno,
+        Colormap::Plasma,
+        Colormap::Grayscale,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Viridis => "Viridis",
+            Self::Inferno => "Inferno",
+            Self::Plasma => "Plasma",
+            Self::Grayscale => "Grayscale",
+        }
+    }
+}
+
+/// Export format for spatial mapping results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportFormat {
+    Tiff,
+    Hdf5,
+    Markdown,
+}
+
+impl ExportFormat {
+    pub const ALL: [ExportFormat; 3] = [
+        ExportFormat::Tiff,
+        ExportFormat::Hdf5,
+        ExportFormat::Markdown,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Tiff => "TIFF (f64)",
+            Self::Hdf5 => "HDF5",
+            Self::Markdown => "Markdown Report",
+        }
+    }
+}
+
+/// Per-tile display settings for density map rendering.
+#[derive(Debug, Clone)]
+pub struct TileDisplayState {
+    pub colormap: Colormap,
+    pub show_colorbar: bool,
+}
+
+impl Default for TileDisplayState {
+    fn default() -> Self {
+        Self {
+            colormap: Colormap::Viridis,
+            show_colorbar: false,
+        }
+    }
+}
+
 /// Target context for the periodic table modal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeriodicTableTarget {
@@ -206,6 +329,17 @@ pub struct AppState {
 
     // -- HDF5 tree browser --
     pub hdf5_tree: Option<Vec<Hdf5TreeEntry>>,
+
+    // -- Provenance --
+    pub provenance_log: Vec<ProvenanceEvent>,
+
+    // -- Per-tile display state (indexed same as density_maps + 1 for convergence) --
+    pub tile_display: Vec<TileDisplayState>,
+
+    // -- Export --
+    pub export_format: ExportFormat,
+    pub export_directory: Option<PathBuf>,
+    pub export_status: Option<String>,
 }
 
 /// An isotope the user wants to include in the fit.
@@ -334,6 +468,26 @@ impl AppState {
         self.normalized = None;
         self.dead_pixels = None;
         self.spectrum_values = None;
+        self.tile_display.clear();
+        self.export_status = None;
+    }
+
+    /// Append a provenance event to the session audit trail.
+    pub fn log_provenance(&mut self, kind: ProvenanceEventKind, message: impl Into<String>) {
+        self.provenance_log.push(ProvenanceEvent {
+            timestamp: std::time::SystemTime::now(),
+            kind,
+            message: message.into(),
+        });
+    }
+
+    /// Ensure `tile_display` has enough entries for the current result.
+    /// Call after spatial analysis completes.
+    pub fn init_tile_display(&mut self, n_density_maps: usize) {
+        // +1 for the convergence map tile
+        let needed = n_density_maps + 1;
+        self.tile_display
+            .resize_with(needed, TileDisplayState::default);
     }
 }
 
@@ -437,6 +591,12 @@ impl Default for AppState {
             periodic_table_selected_z: None,
 
             hdf5_tree: None,
+
+            provenance_log: Vec::new(),
+            tile_display: Vec::new(),
+            export_format: ExportFormat::Tiff,
+            export_directory: None,
+            export_status: None,
         }
     }
 }

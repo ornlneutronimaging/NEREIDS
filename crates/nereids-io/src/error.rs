@@ -36,6 +36,14 @@ pub enum IoError {
     #[error("Invalid parameter: {0}")]
     InvalidParameter(String),
 
+    /// TIFF encoding/writing error.
+    #[error("TIFF encode error: {0}")]
+    TiffEncode(String),
+
+    /// Generic file write error (not TIFF-specific).
+    #[error("Write error: {0}")]
+    WriteError(String),
+
     /// HDF5 format or access error.
     #[error("HDF5 error: {0}")]
     Hdf5Error(String),

@@ -1,6 +1,6 @@
 //! Step 1: Data loading — multi-format TIFF + spectrum file input.
 
-use crate::state::{AppState, InputMode};
+use crate::state::{AppState, InputMode, ProvenanceEventKind};
 use ndarray::Axis;
 
 /// Draw the Load step content.
@@ -440,6 +440,14 @@ fn load_hdf5_histogram(state: &mut AppState) {
                 state.dead_pixels = Some(dead);
             }
 
+            let shape = data.counts.shape();
+            state.log_provenance(
+                ProvenanceEventKind::DataLoaded,
+                format!(
+                    "Loaded HDF5 histogram: {} frames ({}x{})",
+                    shape[0], shape[1], shape[2]
+                ),
+            );
             state.sample_data = Some(data.counts);
         }
         Err(e) => {
@@ -499,6 +507,14 @@ fn load_hdf5_events(state: &mut AppState) {
                 state.dead_pixels = Some(dead);
             }
 
+            let shape = data.counts.shape();
+            state.log_provenance(
+                ProvenanceEventKind::DataLoaded,
+                format!(
+                    "Loaded HDF5 events: {} frames ({}x{})",
+                    shape[0], shape[1], shape[2]
+                ),
+            );
             state.sample_data = Some(data.counts);
         }
         Err(e) => {
@@ -552,6 +568,14 @@ fn load_all_data(state: &mut AppState) {
         match nereids_io::tiff_stack::load_tiff_auto(path) {
             Ok(data) => {
                 state.preview_image = Some(data.sum_axis(Axis(0)));
+                let n_frames = data.shape()[0];
+                state.log_provenance(
+                    ProvenanceEventKind::DataLoaded,
+                    format!(
+                        "Loaded sample TIFF: {n_frames} frames from {}",
+                        path.display()
+                    ),
+                );
                 state.sample_data = Some(data);
                 state.status_message = "Sample loaded".into();
             }

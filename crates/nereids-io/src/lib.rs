@@ -13,6 +13,7 @@
 //! - `pleiades/processing/helper_ornl.py` for data loading
 
 pub mod error;
+pub mod export;
 #[cfg(feature = "hdf5")]
 pub mod nexus;
 pub mod normalization;
