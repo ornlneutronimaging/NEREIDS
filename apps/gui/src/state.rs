@@ -131,6 +131,10 @@ pub struct AppState {
     pub tof_slice_index: usize,
     pub show_resonance_dips: bool,
 
+    // -- Analyze viewer --
+    pub analyze_spectrum_axis: SpectrumAxis,
+    pub analyze_tof_slice_index: usize,
+
     // -- Background task receivers and cancellation --
     pub pending_spatial: Option<mpsc::Receiver<Result<SpatialResult, String>>>,
     pub pending_endf: Option<mpsc::Receiver<EndfFetchResult>>,
@@ -318,6 +322,9 @@ impl Default for AppState {
             normalize_spectrum_axis: SpectrumAxis::EnergyEv,
             tof_slice_index: 0,
             show_resonance_dips: false,
+
+            analyze_spectrum_axis: SpectrumAxis::EnergyEv,
+            analyze_tof_slice_index: 0,
 
             pending_spatial: None,
             pending_endf: None,

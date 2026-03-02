@@ -5,9 +5,10 @@
 //! this redesign shows both side-by-side so the user can click a pixel on the
 //! map and immediately see its spectrum.
 
-use crate::state::{AppState, InputMode, IsotopeEntry, RoiSelection};
+use crate::state::{AppState, InputMode, IsotopeEntry, RoiSelection, SpectrumAxis};
 use crate::widgets::image_view::show_viridis_image;
-use egui_plot::{Line, Plot, PlotPoints};
+use egui_plot::{Line, Plot, PlotPoints, VLine};
+use nereids_io::spectrum::{SpectrumUnit, SpectrumValueKind};
 use nereids_pipeline::pipeline::FitConfig;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -291,13 +292,20 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
         }
     });
 
-    let energies = match state.energies {
-        Some(ref e) => e,
-        None => {
-            ui.label("Load and normalize data to see spectrum.");
-            return;
-        }
-    };
+    // Axis toggle + resonance dips
+    ui.horizontal(|ui| {
+        ui.label("Axis:");
+        ui.selectable_value(
+            &mut state.analyze_spectrum_axis,
+            SpectrumAxis::EnergyEv,
+            "Energy (eV)",
+        );
+        ui.selectable_value(
+            &mut state.analyze_spectrum_axis,
+            SpectrumAxis::TofMicroseconds,
+            "TOF (\u{03bc}s)",
+        );
+    });
 
     let norm = match state.normalized {
         Some(ref n) => n,
@@ -305,6 +313,57 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
             ui.label("No normalized data available.");
             return;
         }
+    };
+
+    let n_tof = norm.transmission.shape()[0];
+
+    // Build x-axis values
+    let (x_values, x_label): (Vec<f64>, &str) = match state.analyze_spectrum_axis {
+        SpectrumAxis::EnergyEv => match state.energies {
+            Some(ref e) => (e.clone(), "Energy (eV)"),
+            None => {
+                ui.label("Load and normalize data to see spectrum.");
+                return;
+            }
+        },
+        SpectrumAxis::TofMicroseconds => match state.spectrum_values {
+            Some(ref v) => match (state.spectrum_unit, state.spectrum_kind) {
+                (SpectrumUnit::TofMicroseconds, SpectrumValueKind::BinEdges) => {
+                    let centers: Vec<f64> = v
+                        .windows(2)
+                        .take(n_tof)
+                        .map(|w| 0.5 * (w[0] + w[1]))
+                        .collect();
+                    (centers, "TOF (\u{03bc}s)")
+                }
+                (SpectrumUnit::TofMicroseconds, SpectrumValueKind::BinCenters) => {
+                    (v.iter().take(n_tof).copied().collect(), "TOF (\u{03bc}s)")
+                }
+                (SpectrumUnit::EnergyEv, _) => {
+                    if state.beamline.flight_path_m.is_finite()
+                        && state.beamline.flight_path_m > 0.0
+                    {
+                        let tof_vals: Vec<f64> = v
+                            .iter()
+                            .take(n_tof)
+                            .map(|&e| {
+                                nereids_core::constants::energy_to_tof(
+                                    e,
+                                    state.beamline.flight_path_m,
+                                ) + state.beamline.delay_us
+                            })
+                            .collect();
+                        (tof_vals, "TOF (\u{03bc}s)")
+                    } else {
+                        (v.iter().take(n_tof).copied().collect(), "Energy (eV)")
+                    }
+                }
+            },
+            None => {
+                let indices: Vec<f64> = (0..n_tof).map(|i| i as f64).collect();
+                (indices, "Frame index")
+            }
+        },
     };
 
     let (y, x) = match state.selected_pixel {
@@ -315,20 +374,24 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
         }
     };
 
-    let n_energies = norm.transmission.shape()[0];
-    let n_plot = n_energies.min(energies.len());
+    let n_plot = n_tof.min(x_values.len());
+    if n_plot == 0 {
+        return;
+    }
 
     // Measured spectrum
     let measured_points: PlotPoints = (0..n_plot)
-        .map(|i| [energies[i], norm.transmission[[i, y, x]]])
+        .map(|i| [x_values[i], norm.transmission[[i, y, x]]])
         .collect();
     let measured_line = Line::new("Measured T(E)", measured_points);
 
     // Fit result (if available)
+    let energies = state.energies.as_ref();
     let fit_line = state.pixel_fit_result.as_ref().and_then(|result| {
         if !result.converged {
             return None;
         }
+        let energies = energies?;
         let enabled: Vec<_> = state
             .isotope_entries
             .iter()
@@ -354,13 +417,19 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
 
         use nereids_fitting::lm::FitModel;
         let fitted_t = model.evaluate(&result.densities);
-        let fit_points: PlotPoints = (0..n_plot).map(|i| [energies[i], fitted_t[i]]).collect();
+        let n_fit = n_plot.min(fitted_t.len());
+        let fit_points: PlotPoints = (0..n_fit).map(|i| [x_values[i], fitted_t[i]]).collect();
         Some(Line::new("Fit", fit_points).width(2.0))
     });
 
+    // TOF position marker x-value
+    let tof_marker_x = x_values
+        .get(state.analyze_tof_slice_index.min(n_plot.saturating_sub(1)))
+        .copied();
+
     // Plot
     Plot::new("spectrum_plot")
-        .x_axis_label("Energy (eV)")
+        .x_axis_label(x_label)
         .y_axis_label("Transmission")
         .legend(egui_plot::Legend::default())
         .show(ui, |plot_ui| {
@@ -368,17 +437,57 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
             if let Some(fit) = fit_line {
                 plot_ui.line(fit);
             }
+
+            // Current TOF position marker
+            if let Some(xv) = tof_marker_x {
+                plot_ui.vline(
+                    VLine::new("TOF position", xv)
+                        .color(egui::Color32::from_rgb(255, 165, 0))
+                        .style(egui_plot::LineStyle::dashed_dense()),
+                );
+            }
+
+            // Resonance dip markers (energy axis only)
+            if state.analyze_spectrum_axis == SpectrumAxis::EnergyEv {
+                let x_min = x_values[0].min(x_values[n_plot - 1]);
+                let x_max = x_values[0].max(x_values[n_plot - 1]);
+                for entry in &state.isotope_entries {
+                    if !entry.enabled {
+                        continue;
+                    }
+                    let Some(ref res_data) = entry.resonance_data else {
+                        continue;
+                    };
+                    for range in &res_data.ranges {
+                        for lg in &range.l_groups {
+                            for res in &lg.resonances {
+                                if res.energy >= x_min && res.energy <= x_max {
+                                    plot_ui.vline(
+                                        VLine::new(
+                                            format!("{} {:.1}eV", entry.symbol, res.energy),
+                                            res.energy,
+                                        )
+                                        .color(egui::Color32::from_rgb(180, 80, 80))
+                                        .style(egui_plot::LineStyle::dashed_loose()),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         });
 
     // Fit results below the plot
     if let Some(ref result) = state.pixel_fit_result {
         ui.separator();
         ui.horizontal(|ui| {
-            ui.label(if result.converged {
-                "Converged"
+            let (label, color) = if result.converged {
+                ("Converged", crate::theme::semantic::GREEN)
             } else {
-                "Did NOT converge"
-            });
+                ("NOT converged", crate::theme::semantic::RED)
+            };
+            ui.label(egui::RichText::new(label).color(color).strong());
             ui.label(format!("chi2_r = {:.4}", result.reduced_chi_squared));
             ui.label(format!("iter = {}", result.iterations));
         });
