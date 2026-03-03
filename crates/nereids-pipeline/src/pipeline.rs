@@ -9,13 +9,25 @@ use std::fmt;
 use std::sync::Arc;
 
 use nereids_endf::resonance::ResonanceData;
-use nereids_fitting::lm::{self, LmConfig};
+use nereids_fitting::lm::{self, FitModel, LmConfig, LmResult};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
+use nereids_fitting::poisson::{self, PoissonConfig};
 use nereids_fitting::transmission_model::{PrecomputedTransmissionModel, TransmissionFitModel};
 use nereids_physics::resolution::ResolutionFunction;
 use nereids_physics::transmission::InstrumentParams;
 
 use crate::error::PipelineError;
+
+/// Which optimizer to use for spectrum fitting.
+#[derive(Debug, Clone, Default)]
+pub enum SolverChoice {
+    /// Levenberg-Marquardt chi-squared minimizer (default).
+    #[default]
+    LevenbergMarquardt,
+    /// Poisson negative log-likelihood via L-BFGS with projected gradients
+    /// and bound constraints. Appropriate for low-count data (< ~30 counts/bin).
+    PoissonKL(PoissonConfig),
+}
 
 /// Errors from `FitConfig` construction.
 #[derive(Debug, PartialEq)]
@@ -100,6 +112,8 @@ pub struct FitConfig {
     /// Whether to compute the covariance matrix (and parameter uncertainties)
     /// after convergence.
     compute_covariance: bool,
+    /// Which optimizer to use. Default: LevenbergMarquardt.
+    solver: SolverChoice,
 }
 
 impl FitConfig {
@@ -160,6 +174,7 @@ impl FitConfig {
             precomputed_cross_sections: None,
             fit_temperature: false,
             compute_covariance: true,
+            solver: SolverChoice::default(),
         })
     }
 
@@ -249,6 +264,19 @@ impl FitConfig {
     pub fn compute_covariance(&self) -> bool {
         self.compute_covariance
     }
+
+    /// Set which optimizer to use (builder pattern).
+    #[must_use]
+    pub fn with_solver(mut self, solver: SolverChoice) -> Self {
+        self.solver = solver;
+        self
+    }
+
+    /// Returns the solver choice.
+    #[must_use]
+    pub fn solver(&self) -> &SolverChoice {
+        &self.solver
+    }
 }
 
 /// Result of fitting a single spectrum.
@@ -271,6 +299,50 @@ pub struct SpectrumFitResult {
     pub temperature_k: Option<f64>,
     /// 1-sigma uncertainty on the fitted temperature (from covariance matrix).
     pub temperature_k_unc: Option<f64>,
+}
+
+/// Dispatch between LM and Poisson solvers.
+///
+/// Both solvers use the same `FitModel` interface. The Poisson result is
+/// mapped to `LmResult` so the caller can treat all solvers uniformly.
+fn dispatch_solver(
+    model: &dyn FitModel,
+    measured_t: &[f64],
+    sigma: &[f64],
+    params: &mut ParameterSet,
+    solver: &SolverChoice,
+    lm_config: &LmConfig,
+) -> Result<LmResult, PipelineError> {
+    match solver {
+        SolverChoice::LevenbergMarquardt => Ok(lm::levenberg_marquardt(
+            model, measured_t, sigma, params, lm_config,
+        )?),
+        SolverChoice::PoissonKL(poisson_config) => {
+            let pr = poisson::poisson_fit(model, measured_t, params, poisson_config);
+            let n_free = params.n_free();
+            let dof = measured_t.len().saturating_sub(n_free).max(1);
+            // Compute Pearson chi-squared for display consistency with LM solver.
+            let y_model = model.evaluate(&pr.params);
+            let chi_sq: f64 = measured_t
+                .iter()
+                .zip(y_model.iter())
+                .zip(sigma.iter())
+                .map(|((obs, mdl), s)| {
+                    let residual = obs - mdl;
+                    (residual * residual) / (s * s).max(1e-30)
+                })
+                .sum();
+            Ok(LmResult {
+                chi_squared: chi_sq,
+                reduced_chi_squared: chi_sq / dof as f64,
+                iterations: pr.iterations,
+                converged: pr.converged,
+                params: pr.params,
+                covariance: None,
+                uncertainties: None,
+            })
+        }
+    }
 }
 
 /// Fit a single measured transmission spectrum.
@@ -379,7 +451,14 @@ pub fn fit_spectrum(
                 cross_sections: xs.clone(),
                 density_indices: Arc::new((0..n_isotopes).collect()),
             };
-            lm::levenberg_marquardt(&model, measured_t, sigma, &mut params, &lm_config)?
+            dispatch_solver(
+                &model,
+                measured_t,
+                sigma,
+                &mut params,
+                config.solver(),
+                &lm_config,
+            )?
         } else {
             let instrument = config
                 .resolution()
@@ -393,7 +472,14 @@ pub fn fit_spectrum(
                 (0..n_isotopes).collect(),
                 None,
             )?;
-            lm::levenberg_marquardt(&model, measured_t, sigma, &mut params, &lm_config)?
+            dispatch_solver(
+                &model,
+                measured_t,
+                sigma,
+                &mut params,
+                config.solver(),
+                &lm_config,
+            )?
         }
     } else {
         // Temperature fitting: always use the full TransmissionFitModel
@@ -410,7 +496,14 @@ pub fn fit_spectrum(
             (0..n_isotopes).collect(),
             temperature_index,
         )?;
-        lm::levenberg_marquardt(&model, measured_t, sigma, &mut params, &lm_config)?
+        dispatch_solver(
+            &model,
+            measured_t,
+            sigma,
+            &mut params,
+            config.solver(),
+            &lm_config,
+        )?
     };
 
     let densities: Vec<f64> = (0..n_isotopes).map(|i| result.params[i]).collect();
@@ -750,5 +843,49 @@ mod tests {
 
         let config = config.with_fit_temperature(true).unwrap();
         assert!(config.fit_temperature());
+    }
+
+    #[test]
+    fn test_fit_spectrum_poisson_kl() {
+        let data = u238_single_resonance();
+        let true_density = 0.0005;
+        let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
+
+        // Generate synthetic data using the forward model
+        let model = TransmissionFitModel::new(
+            energies.clone(),
+            vec![data.clone()],
+            0.0,
+            None,
+            vec![0],
+            None,
+        )
+        .unwrap();
+        let y_obs = model.evaluate(&[true_density]);
+        let sigma = vec![0.01; y_obs.len()];
+
+        let config = FitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        )
+        .unwrap()
+        .with_solver(SolverChoice::PoissonKL(PoissonConfig::default()));
+
+        let result = fit_spectrum(&y_obs, &sigma, &config).unwrap();
+
+        assert!(result.converged);
+        assert!(
+            (result.densities[0] - true_density).abs() / true_density < 0.05,
+            "Poisson KL fitted density = {}, true = {}",
+            result.densities[0],
+            true_density,
+        );
+        // Poisson FD does not compute covariance
+        assert!(result.uncertainties.is_none());
     }
 }

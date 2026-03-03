@@ -26,23 +26,25 @@ pub fn show_colormapped_image(
     tex_id: &str,
     colormap: Colormap,
 ) -> Option<(usize, usize)> {
-    show_colormapped_image_with_roi(ui, data, tex_id, colormap, None).0
+    show_colormapped_image_with_roi(ui, data, tex_id, colormap, None, None).0
 }
 
-/// Display a viridis-colormapped image with an optional ROI overlay.
+/// Display a viridis-colormapped image with ROI overlay and optional pixel marker.
 ///
 /// Returns `(clicked_pixel, image_rect)`.  When `roi` is `Some`, a
 /// semi-transparent rectangle is drawn over the corresponding region.
+/// When `selected_pixel` is `Some`, an orange crosshair is drawn at that pixel.
 pub fn show_viridis_image_with_roi(
     ui: &mut egui::Ui,
     data: &ndarray::Array2<f64>,
     tex_id: &str,
     roi: Option<&RoiSelection>,
+    selected_pixel: Option<(usize, usize)>,
 ) -> (Option<(usize, usize)>, egui::Rect) {
-    show_colormapped_image_with_roi(ui, data, tex_id, Colormap::Viridis, roi)
+    show_colormapped_image_with_roi(ui, data, tex_id, Colormap::Viridis, roi, selected_pixel)
 }
 
-/// Display a colormapped image with an optional ROI overlay.
+/// Display a colormapped image with ROI overlay and optional pixel marker.
 ///
 /// Returns `(clicked_pixel, image_rect)`.
 pub fn show_colormapped_image_with_roi(
@@ -51,6 +53,7 @@ pub fn show_colormapped_image_with_roi(
     tex_id: &str,
     colormap: Colormap,
     roi: Option<&RoiSelection>,
+    selected_pixel: Option<(usize, usize)>,
 ) -> (Option<(usize, usize)>, egui::Rect) {
     let (height, width) = (data.shape()[0], data.shape()[1]);
     if width == 0 || height == 0 {
@@ -104,6 +107,11 @@ pub fn show_colormapped_image_with_roi(
     // Draw ROI overlay
     if let Some(roi) = roi {
         draw_roi_overlay(&painter, image_rect, (height, width), roi);
+    }
+
+    // Draw selected pixel marker
+    if let Some((py, px)) = selected_pixel {
+        draw_pixel_marker(&painter, image_rect, (height, width), py, px);
     }
 
     if response.clicked()
@@ -210,6 +218,42 @@ fn draw_roi_overlay(
         0.0,
         egui::Stroke::new(1.5, egui::Color32::from_rgb(0, 120, 255)),
         egui::StrokeKind::Outside,
+    );
+}
+
+/// Draw an orange crosshair marker at the specified pixel location.
+fn draw_pixel_marker(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    (height, width): (usize, usize),
+    py: usize,
+    px: usize,
+) {
+    if py >= height || px >= width || width == 0 || height == 0 {
+        return;
+    }
+    let frac_x = (px as f32 + 0.5) / width as f32;
+    let frac_y = (py as f32 + 0.5) / height as f32;
+    let center = egui::pos2(
+        rect.left() + frac_x * rect.width(),
+        rect.top() + frac_y * rect.height(),
+    );
+    let r = 4.0;
+    let stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 165, 0));
+    painter.circle_stroke(center, r, stroke);
+    painter.line_segment(
+        [
+            egui::pos2(center.x - r * 2.0, center.y),
+            egui::pos2(center.x + r * 2.0, center.y),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(center.x, center.y - r * 2.0),
+            egui::pos2(center.x, center.y + r * 2.0),
+        ],
+        stroke,
     );
 }
 

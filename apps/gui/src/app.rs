@@ -82,17 +82,23 @@ fn poll_pending_tasks(state: &mut AppState) {
                 state.init_tile_display(result.density_maps.len());
                 state.spatial_result = Some(result);
                 state.is_fitting = false;
+                state.fitting_progress = None;
+                state.fitting_progress_counter = None;
                 state.active_tab = Tab::Map;
                 state.pending_spatial = None;
             }
             Ok(Err(err_msg)) => {
                 state.status_message = format!("Spatial map error: {err_msg}");
                 state.is_fitting = false;
+                state.fitting_progress = None;
+                state.fitting_progress_counter = None;
                 state.pending_spatial = None;
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 state.status_message = "Spatial map task failed".into();
                 state.is_fitting = false;
+                state.fitting_progress = None;
+                state.fitting_progress_counter = None;
                 state.pending_spatial = None;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {} // Still running

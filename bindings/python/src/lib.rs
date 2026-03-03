@@ -1598,6 +1598,7 @@ fn py_spatial_map(
                     &config,
                     dead.as_ref(),
                     None,
+                    None,
                 )
             });
             let result =

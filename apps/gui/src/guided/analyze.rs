@@ -8,6 +8,7 @@
 use crate::state::{
     AppState, GuidedStep, InputMode, IsotopeEntry, RoiSelection, SolverMethod, SpectrumAxis,
 };
+use crate::widgets::design::{self, NavAction};
 use crate::widgets::image_view::{show_viridis_image, show_viridis_image_with_roi};
 use egui_plot::{Line, Plot, PlotPoints, VLine};
 use ndarray::Axis;
@@ -96,6 +97,20 @@ pub fn analyze_step(ui: &mut egui::Ui, state: &mut AppState) {
             },
         );
     });
+
+    // -- Navigation --
+    let can_continue = state.spatial_result.is_some();
+    match design::nav_buttons(
+        ui,
+        Some("\u{2190} Back"),
+        "Results \u{2192}",
+        can_continue,
+        "Run analysis to continue",
+    ) {
+        NavAction::Back => state.guided_step = GuidedStep::Normalize,
+        NavAction::Continue => state.guided_step = GuidedStep::Results,
+        NavAction::None => {}
+    }
 }
 
 // ---- Fit Controls ----
@@ -237,14 +252,6 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
     // Run buttons
     ui.label(egui::RichText::new("Run").strong());
 
-    if state.solver_method == SolverMethod::PoissonKL {
-        ui.label(
-            egui::RichText::new("Poisson KL solver not yet wired to GUI pipeline.")
-                .small()
-                .color(crate::theme::semantic::ORANGE),
-        );
-    }
-
     let ready = state.normalized.is_some()
         && state.energies.is_some()
         && state
@@ -252,8 +259,7 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
             .iter()
             .any(|e| e.enabled && e.resonance_data.is_some());
 
-    let can_run =
-        ready && !state.is_fitting && state.solver_method == SolverMethod::LevenbergMarquardt;
+    let can_run = ready && !state.is_fitting;
 
     ui.add_enabled_ui(can_run, |ui| {
         if ui.button("Fit Selected Pixel").clicked() {
@@ -268,8 +274,17 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
     });
 
     if state.is_fitting {
-        ui.spinner();
-        ui.label("Fitting...");
+        if let Some(ref counter) = state.fitting_progress_counter {
+            let done = counter.load(Ordering::Relaxed);
+            if let Some((_, total)) = state.fitting_progress {
+                state.fitting_progress = Some((done, total));
+                let frac = done as f32 / total.max(1) as f32;
+                crate::widgets::design::progress_mini(ui, frac, &format!("{done}/{total} px"));
+            }
+        } else {
+            ui.spinner();
+            ui.label("Fitting...");
+        }
     }
 }
 
@@ -310,6 +325,7 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
             &result.density_maps[idx],
             "density_tex",
             state.roi.as_ref(),
+            state.selected_pixel,
         );
         if let Some((y, x)) = clicked {
             state.selected_pixel = Some((y, x));
@@ -341,8 +357,13 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 .transmission
                 .index_axis(Axis(0), state.analyze_tof_slice_index)
                 .to_owned();
-            let (clicked, _rect) =
-                show_viridis_image_with_roi(ui, &slice, "analyze_preview_tex", state.roi.as_ref());
+            let (clicked, _rect) = show_viridis_image_with_roi(
+                ui,
+                &slice,
+                "analyze_preview_tex",
+                state.roi.as_ref(),
+                state.selected_pixel,
+            );
             if let Some((y, x)) = clicked {
                 state.selected_pixel = Some((y, x));
                 state.pixel_fit_result = None;
@@ -721,6 +742,15 @@ fn build_fit_config(state: &AppState) -> Result<FitConfig, String> {
 
     config = config.with_compute_covariance(state.lm_config.compute_covariance);
 
+    if state.solver_method == SolverMethod::PoissonKL {
+        config = config.with_solver(nereids_pipeline::pipeline::SolverChoice::PoissonKL(
+            nereids_fitting::poisson::PoissonConfig {
+                max_iter: state.lm_config.max_iter,
+                ..Default::default()
+            },
+        ));
+    }
+
     if state.fit_temperature {
         config = config
             .with_fit_temperature(true)
@@ -867,6 +897,17 @@ pub fn run_spatial_map(state: &mut AppState) {
     state.status_message = "Running spatial mapping...".into();
     let cancel = Arc::clone(&state.cancel_token);
 
+    // Progress counter: GUI polls this each frame via fitting_progress_counter.
+    let progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    state.fitting_progress_counter = Some(Arc::clone(&progress));
+    let shape = norm.transmission.shape();
+    let n_total_pixels = shape[1] * shape[2];
+    let n_live = match dead_pixels {
+        Some(ref dp) => dp.iter().filter(|&&d| !d).count(),
+        None => n_total_pixels,
+    };
+    state.fitting_progress = Some((0, n_live));
+
     std::thread::spawn(move || {
         let result = nereids_pipeline::spatial::spatial_map(
             norm.transmission.view(),
@@ -874,6 +915,7 @@ pub fn run_spatial_map(state: &mut AppState) {
             &config,
             dead_pixels.as_ref(),
             Some(&cancel),
+            Some(&progress),
         );
         match result {
             Ok(r) => {

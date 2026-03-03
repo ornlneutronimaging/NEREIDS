@@ -3,7 +3,7 @@
 use ndarray::{Array2, Array3};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 
 use nereids_endf::resonance::ResonanceData;
@@ -339,6 +339,7 @@ pub struct AppState {
 
     // -- Progress --
     pub fitting_progress: Option<(usize, usize)>,
+    pub fitting_progress_counter: Option<Arc<AtomicUsize>>,
 
     // -- Provenance --
     pub provenance_log: Vec<ProvenanceEvent>,
@@ -488,6 +489,7 @@ impl AppState {
         self.pending_detect_endf = None;
         self.is_fitting = false;
         self.fitting_progress = None;
+        self.fitting_progress_counter = None;
         self.is_fetching_endf = false;
         self.is_fetching_fm_endf = false;
         self.is_fetching_detect_endf = false;
@@ -657,6 +659,7 @@ impl Default for AppState {
             studio_selected_tile: 0,
             studio_tool: StudioTool::Select,
             fitting_progress: None,
+            fitting_progress_counter: None,
 
             provenance_log: Vec::new(),
             tile_display: Vec::new(),
