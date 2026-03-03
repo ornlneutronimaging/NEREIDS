@@ -3,6 +3,7 @@
 use crate::state::{
     AppState, EndfFetchResult, EndfStatus, GuidedStep, IsotopeEntry, PeriodicTableTarget,
 };
+use crate::widgets::design::{self, ChipAction, NavAction};
 use nereids_endf::retrieval::EndfLibrary;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -10,219 +11,272 @@ use std::sync::mpsc;
 
 /// Draw the Configure step content.
 pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
+    // Content header with teleport pill
     ui.horizontal(|ui| {
-        ui.heading("Configure");
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.vertical(|ui| {
+            design::content_header(
+                ui,
+                "Configure",
+                "Set beamline parameters and select isotopes",
+            );
+        });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
             teleport_pill(ui, "Forward Model →", GuidedStep::ForwardModel, state);
         });
     });
-    ui.separator();
 
-    // --- Beamline parameters ---
-    ui.label(egui::RichText::new("Beamline Parameters").strong());
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        ui.label("Flight path (m):");
-        ui.add(
-            egui::DragValue::new(&mut state.beamline.flight_path_m)
-                .range(1.0..=100.0)
-                .speed(0.1),
-        );
-    });
-    ui.horizontal(|ui| {
-        ui.label("Delay (us):");
-        ui.add(
-            egui::DragValue::new(&mut state.beamline.delay_us)
-                .range(0.0..=1000.0)
-                .speed(0.1),
-        );
-    });
-    ui.horizontal(|ui| {
-        ui.label("PC sample:");
-        ui.add(
-            egui::DragValue::new(&mut state.proton_charge_sample)
-                .range(0.001..=1e6)
-                .speed(0.01),
-        );
-    });
-    ui.horizontal(|ui| {
-        ui.label("PC open beam:");
-        ui.add(
-            egui::DragValue::new(&mut state.proton_charge_ob)
-                .range(0.001..=1e6)
-                .speed(0.01),
-        );
-    });
-    ui.horizontal(|ui| {
-        ui.label("Temperature (K):");
-        ui.add(
-            egui::DragValue::new(&mut state.temperature_k)
-                .range(1.0..=5000.0)
-                .speed(1.0),
-        );
-    });
-
-    ui.add_space(12.0);
-    ui.separator();
-
-    // --- Isotope selection ---
-    ui.label(egui::RichText::new("Isotopes").strong());
-    ui.add_space(4.0);
-
-    // ENDF library selector (disabled during active fetch to prevent stale results)
-    let prev_lib = state.endf_library;
-    ui.add_enabled_ui(!state.is_fetching_endf, |ui| {
-        ui.horizontal(|ui| {
-            ui.label("Library:");
-            egui::ComboBox::from_id_salt("endf_lib")
-                .selected_text(library_name(state.endf_library))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut state.endf_library,
-                        EndfLibrary::EndfB8_0,
-                        "ENDF/B-VIII.0",
-                    );
-                    ui.selectable_value(
-                        &mut state.endf_library,
-                        EndfLibrary::EndfB8_1,
-                        "ENDF/B-VIII.1",
-                    );
-                    ui.selectable_value(&mut state.endf_library, EndfLibrary::Jeff3_3, "JEFF-3.3");
-                    ui.selectable_value(&mut state.endf_library, EndfLibrary::Jendl5, "JENDL-5");
-                });
-        });
-    });
-    // Library change invalidates all resonance data — must re-fetch
-    if state.endf_library != prev_lib {
-        for e in &mut state.isotope_entries {
-            e.resonance_data = None;
-            e.endf_status = EndfStatus::Pending;
-        }
-    }
-
-    ui.add_space(4.0);
-
-    // Disable isotope add/remove/edit while ENDF fetch is in progress
-    let isotope_locked = state.is_fetching_endf;
-
-    // Add isotope row
-    ui.add_enabled_ui(!isotope_locked, |ui| {
-        ui.horizontal(|ui| {
-            if ui.button("Add Isotope").clicked() {
-                state.isotope_entries.push(IsotopeEntry {
-                    z: 92,
-                    a: 238,
-                    symbol: "U-238".into(),
-                    initial_density: 0.001,
-                    resonance_data: None,
-                    enabled: true,
-                    endf_status: EndfStatus::Pending,
-                });
-                // Invalidate stale results — isotope order may have changed.
-                state.spatial_result = None;
-                state.pixel_fit_result = None;
-            }
-            if ui.button("Periodic Table...").clicked() {
-                state.periodic_table_open = true;
-                state.periodic_table_target = PeriodicTableTarget::Configure;
-                state.periodic_table_selected_z = None;
-            }
-        });
-    });
-
-    // Isotope list
-    let mut to_remove = None;
-    let mut isotope_changed = false;
-    for (idx, entry) in state.isotope_entries.iter_mut().enumerate() {
-        ui.horizontal(|ui| {
-            ui.add_enabled_ui(!isotope_locked, |ui| {
-                let enabled_before = entry.enabled;
-                ui.checkbox(&mut entry.enabled, "");
-                if entry.enabled != enabled_before {
-                    isotope_changed = true;
-                }
-
-                let z_changed = ui
-                    .add(
-                        egui::DragValue::new(&mut entry.z)
-                            .prefix("Z=")
-                            .range(1..=118),
-                    )
-                    .changed();
-                let a_changed = ui
-                    .add(
-                        egui::DragValue::new(&mut entry.a)
-                            .prefix("A=")
-                            .range(1..=300),
-                    )
-                    .changed();
-
-                // Enforce Z <= A (physical constraint: protons cannot exceed nucleons).
-                if z_changed && entry.z > entry.a {
-                    entry.a = entry.z;
-                }
-                if a_changed && entry.a < entry.z {
-                    entry.z = entry.a;
-                }
-
-                if z_changed || a_changed {
-                    entry.symbol = format!(
-                        "{}-{}",
-                        nereids_core::elements::element_symbol(entry.z).unwrap_or("??"),
-                        entry.a
-                    );
-                    entry.resonance_data = None;
-                    isotope_changed = true;
-                }
-            });
-
-            ui.label(&entry.symbol);
-
-            ui.add_enabled_ui(!isotope_locked, |ui| {
+    // --- Beamline Parameters card ---
+    design::card_with_header(ui, "Beamline Parameters", None, |ui| {
+        egui::Grid::new("beamline_grid")
+            .num_columns(4)
+            .spacing([8.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("Flight Path (m):");
                 ui.add(
-                    egui::DragValue::new(&mut entry.initial_density)
-                        .prefix("rho0=")
-                        .speed(0.0001)
-                        .range(0.0..=1.0),
+                    egui::DragValue::new(&mut state.beamline.flight_path_m)
+                        .range(1.0..=100.0)
+                        .speed(0.1),
                 );
+                ui.label("Delay (μs):");
+                ui.add(
+                    egui::DragValue::new(&mut state.beamline.delay_us)
+                        .range(0.0..=1000.0)
+                        .speed(0.1),
+                );
+                ui.end_row();
+
+                ui.label("Temperature (K):");
+                ui.add(
+                    egui::DragValue::new(&mut state.temperature_k)
+                        .range(1.0..=5000.0)
+                        .speed(1.0),
+                );
+                ui.label("PC sample:");
+                ui.add(
+                    egui::DragValue::new(&mut state.proton_charge_sample)
+                        .range(0.001..=1e6)
+                        .speed(0.01),
+                );
+                ui.end_row();
+
+                ui.label("PC open beam:");
+                ui.add(
+                    egui::DragValue::new(&mut state.proton_charge_ob)
+                        .range(0.001..=1e6)
+                        .speed(0.01),
+                );
+                ui.end_row();
             });
+    });
 
-            if entry.resonance_data.is_some() {
-                ui.label("OK");
+    // --- Isotopes card ---
+    // Custom header: title left, library ComboBox right
+    let prev_lib = state.endf_library;
+    design::card(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Isotopes").size(14.0).strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_enabled_ui(!state.is_fetching_endf, |ui| {
+                    egui::ComboBox::from_id_salt("endf_lib")
+                        .selected_text(library_name(state.endf_library))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut state.endf_library,
+                                EndfLibrary::EndfB8_0,
+                                "ENDF/B-VIII.0",
+                            );
+                            ui.selectable_value(
+                                &mut state.endf_library,
+                                EndfLibrary::EndfB8_1,
+                                "ENDF/B-VIII.1",
+                            );
+                            ui.selectable_value(
+                                &mut state.endf_library,
+                                EndfLibrary::Jeff3_3,
+                                "JEFF-3.3",
+                            );
+                            ui.selectable_value(
+                                &mut state.endf_library,
+                                EndfLibrary::Jendl5,
+                                "JENDL-5",
+                            );
+                        });
+                });
+            });
+        });
+        // Library change invalidates all resonance data
+        if state.endf_library != prev_lib {
+            for e in &mut state.isotope_entries {
+                e.resonance_data = None;
+                e.endf_status = EndfStatus::Pending;
             }
+        }
 
-            ui.add_enabled_ui(!isotope_locked, |ui| {
-                if ui.small_button("X").clicked() {
-                    to_remove = Some(idx);
+        ui.add_space(8.0);
+
+        // Isotope chips
+        let chip_result = isotope_chips_flow(ui, state);
+        if chip_result.changed {
+            state.spatial_result = None;
+            state.pixel_fit_result = None;
+        }
+
+        ui.add_space(6.0);
+
+        // Add buttons (disabled during fetch)
+        ui.add_enabled_ui(!state.is_fetching_endf, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("Add Isotope").clicked() {
+                    state.isotope_entries.push(IsotopeEntry {
+                        z: 92,
+                        a: 238,
+                        symbol: "U-238".into(),
+                        initial_density: 0.001,
+                        resonance_data: None,
+                        enabled: true,
+                        endf_status: EndfStatus::Pending,
+                    });
+                    state.spatial_result = None;
+                    state.pixel_fit_result = None;
+                }
+                if ui.button("Periodic Table...").clicked() {
+                    state.periodic_table_open = true;
+                    state.periodic_table_target = PeriodicTableTarget::Configure;
+                    state.periodic_table_selected_z = None;
                 }
             });
         });
-    }
-    if let Some(idx) = to_remove {
-        state.isotope_entries.remove(idx);
-        isotope_changed = true;
-    }
 
-    // Invalidate stale results when isotope entries change (enabled toggled,
-    // Z/A edited, or entry removed).  density_maps are indexed positionally
-    // by the isotope order at compute time, so any change invalidates them.
-    if isotope_changed {
-        state.spatial_result = None;
-        state.pixel_fit_result = None;
-    }
+        // Fetch ENDF button
+        let has_missing = state
+            .isotope_entries
+            .iter()
+            .any(|e| e.enabled && e.endf_status != EndfStatus::Loaded);
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(has_missing && !state.is_fetching_endf, |ui| {
+                if ui.button("Fetch ENDF Data").clicked() {
+                    fetch_endf_data(state);
+                }
+            });
+            if state.is_fetching_endf {
+                ui.spinner();
+            }
+        });
+    });
 
-    // Fetch ENDF data for isotopes missing resonance data
-    let has_missing = state
+    // Density editing popup
+    density_edit_window(ui, state);
+
+    // --- Navigation buttons ---
+    let can_continue = state
         .isotope_entries
         .iter()
-        .any(|e| e.enabled && e.resonance_data.is_none());
-    ui.add_enabled_ui(has_missing && !state.is_fetching_endf, |ui| {
-        if ui.button("Fetch ENDF Data").clicked() {
-            fetch_endf_data(state);
+        .any(|e| e.enabled && e.endf_status == EndfStatus::Loaded);
+    match design::nav_buttons(
+        ui,
+        Some("\u{2190} Back"),
+        "Continue \u{2192}",
+        can_continue,
+        "Fetch ENDF data to continue",
+    ) {
+        NavAction::Back => state.guided_step = GuidedStep::Load,
+        NavAction::Continue => state.guided_step = GuidedStep::Normalize,
+        NavAction::None => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Isotope chips flow
+// ---------------------------------------------------------------------------
+
+struct ChipFlowResult {
+    changed: bool,
+}
+
+fn isotope_chips_flow(ui: &mut egui::Ui, state: &mut AppState) -> ChipFlowResult {
+    let mut to_remove = None;
+    let mut changed = false;
+    let locked = state.is_fetching_endf;
+
+    ui.horizontal_wrapped(|ui| {
+        for (idx, entry) in state.isotope_entries.iter_mut().enumerate() {
+            ui.add_enabled_ui(!locked, |ui| {
+                let action = design::isotope_chip(
+                    ui,
+                    &entry.symbol,
+                    entry.initial_density,
+                    entry.endf_status,
+                    entry.enabled,
+                    egui::Id::new(("iso_chip", idx)),
+                );
+                match action {
+                    ChipAction::Remove => {
+                        to_remove = Some(idx);
+                    }
+                    ChipAction::ToggleEnabled => {
+                        entry.enabled = !entry.enabled;
+                        changed = true;
+                    }
+                    ChipAction::None => {}
+                }
+            });
         }
     });
-    if state.is_fetching_endf {
-        ui.spinner();
+
+    if let Some(idx) = to_remove {
+        state.isotope_entries.remove(idx);
+        changed = true;
+    }
+
+    // Click density in a chip to open the editor
+    // (Handled via right-click or double-click on the chip in the future;
+    //  for now, provide a simple "Edit densities" button if entries exist.)
+    if !state.isotope_entries.is_empty() && !locked {
+        if ui.small_button("Edit densities...").clicked() {
+            state.editing_isotope_density = Some(0);
+        }
+    }
+
+    ChipFlowResult { changed }
+}
+
+// ---------------------------------------------------------------------------
+// Density editing window
+// ---------------------------------------------------------------------------
+
+fn density_edit_window(ui: &mut egui::Ui, state: &mut AppState) {
+    if state.editing_isotope_density.is_none() {
+        return;
+    }
+
+    let mut close = false;
+    let mut open = true;
+    egui::Window::new("Edit Densities")
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ui.ctx(), |ui| {
+            for entry in state.isotope_entries.iter_mut() {
+                ui.horizontal(|ui| {
+                    ui.label(&entry.symbol);
+                    ui.add(
+                        egui::DragValue::new(&mut entry.initial_density)
+                            .prefix("ρ₀=")
+                            .speed(0.0001)
+                            .range(0.0..=1.0),
+                    );
+                });
+            }
+            ui.add_space(4.0);
+            if ui.button("Done").clicked() {
+                close = true;
+            }
+        });
+
+    if !open || close {
+        state.editing_isotope_density = None;
     }
 }
 
