@@ -5,7 +5,7 @@
 //! chips that add the isotope to the appropriate target list (Configure,
 //! Forward Model, or Detectability).
 
-use crate::state::{AppState, DetectTraceEntry, IsotopeEntry, PeriodicTableTarget};
+use crate::state::{AppState, DetectTraceEntry, EndfStatus, IsotopeEntry, PeriodicTableTarget};
 use egui::Color32;
 
 // ---------------------------------------------------------------------------
@@ -366,6 +366,7 @@ fn add_isotope_to_target(state: &mut AppState, z: u32, a: u32, sym: &str) {
                 initial_density: 0.001,
                 resonance_data: None,
                 enabled: true,
+                endf_status: EndfStatus::Pending,
             });
             // Invalidate stale results -- isotope list changed.
             state.spatial_result = None;
@@ -382,6 +383,7 @@ fn add_isotope_to_target(state: &mut AppState, z: u32, a: u32, sym: &str) {
                 initial_density: 0.001,
                 resonance_data: None,
                 enabled: true,
+                endf_status: EndfStatus::Pending,
             });
             state.fm_spectrum = None;
             state.fm_per_isotope_spectra.clear();
@@ -397,6 +399,7 @@ fn add_isotope_to_target(state: &mut AppState, z: u32, a: u32, sym: &str) {
                 initial_density: state.detect_matrix_density,
                 resonance_data: None,
                 enabled: true,
+                endf_status: EndfStatus::Pending,
             });
             state.detect_results.clear();
         }

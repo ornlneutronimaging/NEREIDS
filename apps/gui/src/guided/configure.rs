@@ -1,6 +1,8 @@
 //! Step 2: Configuration — beamline parameters, isotope selection, ENDF fetch.
 
-use crate::state::{AppState, EndfFetchResult, GuidedStep, IsotopeEntry, PeriodicTableTarget};
+use crate::state::{
+    AppState, EndfFetchResult, EndfStatus, GuidedStep, IsotopeEntry, PeriodicTableTarget,
+};
 use nereids_endf::retrieval::EndfLibrary;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -94,6 +96,7 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
     if state.endf_library != prev_lib {
         for e in &mut state.isotope_entries {
             e.resonance_data = None;
+            e.endf_status = EndfStatus::Pending;
         }
     }
 
@@ -113,6 +116,7 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
                     initial_density: 0.001,
                     resonance_data: None,
                     enabled: true,
+                    endf_status: EndfStatus::Pending,
                 });
                 // Invalidate stale results — isotope order may have changed.
                 state.spatial_result = None;
@@ -258,6 +262,13 @@ fn fetch_endf_data(state: &mut AppState) {
 
     if work.is_empty() {
         return;
+    }
+
+    // Mark entries as Fetching before spawning the background thread
+    for (i, _, _, _) in &work {
+        if let Some(entry) = state.isotope_entries.get_mut(*i) {
+            entry.endf_status = EndfStatus::Fetching;
+        }
     }
 
     let (tx, rx) = mpsc::channel();

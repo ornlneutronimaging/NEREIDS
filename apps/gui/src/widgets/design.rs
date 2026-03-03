@@ -5,6 +5,7 @@
 //! Prototype reference: `.prototypes/D_hybrid_v4.html` CSS §Cards & Forms,
 //! §Tabs, §Badges, §Content Area, §Toolbar, §Drop Zones.
 
+use crate::state::EndfStatus;
 use crate::theme::{ThemeColors, semantic};
 use egui::{Color32, CornerRadius, Margin, Rect, Response, RichText, Sense, Shadow, Stroke, Ui};
 
@@ -290,4 +291,188 @@ pub fn progress_mini(ui: &mut Ui, fraction: f32, text: &str) {
 
         ui.label(RichText::new(text).size(10.0).color(tc.fg3));
     });
+}
+
+// ── Stat Row ────────────────────────────────────────────────────
+
+/// Horizontal row of summary stat boxes: bold value + small label.
+///
+/// Each box: bg3-filled, 6px radius, 12×8 padding.
+/// Prototype: stat summary boxes below normalization controls.
+pub fn stat_row(ui: &mut Ui, stats: &[(&str, &str)]) {
+    let tc = ThemeColors::from_ctx(ui.ctx());
+    ui.horizontal(|ui| {
+        for (value, label) in stats {
+            egui::Frame::NONE
+                .fill(tc.bg3)
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(Margin::symmetric(12, 8))
+                .show(ui, |ui| {
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(*value).size(16.0).strong());
+                        ui.label(RichText::new(*label).size(10.0).color(tc.fg3));
+                    });
+                });
+        }
+    });
+}
+
+// ── Isotope Chip ────────────────────────────────────────────────
+
+/// Action returned by an isotope chip interaction.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ChipAction {
+    None,
+    Remove,
+    ToggleEnabled,
+}
+
+/// Compact isotope chip: colored dot + symbol + density + ENDF badge + remove button.
+///
+/// Pill shape with bg3 fill (enabled) or bg2 fill (disabled).
+/// Prototype: inline isotope tags in the Configure step.
+pub fn isotope_chip(
+    ui: &mut Ui,
+    symbol: &str,
+    density: f64,
+    endf_status: EndfStatus,
+    enabled: bool,
+    id: egui::Id,
+) -> ChipAction {
+    let tc = ThemeColors::from_ctx(ui.ctx());
+    let mut action = ChipAction::None;
+
+    let fill = if enabled { tc.bg3 } else { tc.bg2 };
+    egui::Frame::NONE
+        .fill(fill)
+        .stroke(Stroke::new(1.0, tc.border))
+        .corner_radius(CornerRadius::same(12))
+        .inner_margin(Margin::symmetric(8, 4))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+
+                // Colored dot (hash-based color)
+                let dot_color = isotope_dot_color(symbol);
+                let (dot_rect, _) = ui.allocate_exact_size(egui::Vec2::splat(8.0), Sense::hover());
+                ui.painter()
+                    .circle_filled(dot_rect.center(), 4.0, dot_color);
+
+                // Enable/disable toggle via clicking the symbol
+                let sym_resp = ui.add(
+                    egui::Label::new(RichText::new(symbol).size(11.0).strong())
+                        .sense(Sense::click()),
+                );
+                if sym_resp.clicked() {
+                    action = ChipAction::ToggleEnabled;
+                }
+
+                // Density
+                ui.label(
+                    RichText::new(format!("{:.4}", density))
+                        .size(10.0)
+                        .color(tc.fg2),
+                );
+
+                // ENDF status badge
+                match endf_status {
+                    EndfStatus::Pending => badge(ui, "ENDF", BadgeVariant::Orange),
+                    EndfStatus::Fetching => {
+                        ui.spinner();
+                    }
+                    EndfStatus::Loaded => badge(ui, "ENDF", BadgeVariant::Green),
+                    EndfStatus::Failed => badge(ui, "FAIL", BadgeVariant::Red),
+                }
+
+                // Remove button
+                let x_resp = ui.add(
+                    egui::Button::new(RichText::new("✕").size(9.0).color(tc.fg3)).frame(false),
+                );
+                if x_resp.clicked() {
+                    action = ChipAction::Remove;
+                }
+            });
+        });
+
+    let _ = id; // reserved for density edit popup tracking
+    action
+}
+
+/// Deterministic dot color for an isotope symbol (hash-based hue).
+fn isotope_dot_color(symbol: &str) -> Color32 {
+    let mut hash: u32 = 5381;
+    for b in symbol.bytes() {
+        hash = hash.wrapping_mul(33).wrapping_add(u32::from(b));
+    }
+    let hue = (hash % 360) as f32;
+    hsl_to_rgb(hue, 0.70, 0.55)
+}
+
+/// Convert HSL to `Color32` (hue in degrees, s/l in 0..1).
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> Color32 {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let m = l - c / 2.0;
+    let (r1, g1, b1) = match h as u32 {
+        0..=59 => (c, x, 0.0),
+        60..=119 => (x, c, 0.0),
+        120..=179 => (0.0, c, x),
+        180..=239 => (0.0, x, c),
+        240..=299 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    Color32::from_rgb(
+        ((r1 + m) * 255.0).clamp(0.0, 255.0) as u8,
+        ((g1 + m) * 255.0).clamp(0.0, 255.0) as u8,
+        ((b1 + m) * 255.0).clamp(0.0, 255.0) as u8,
+    )
+}
+
+// ── Navigation Buttons ──────────────────────────────────────────
+
+/// Action returned by the navigation button bar.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum NavAction {
+    None,
+    Back,
+    Continue,
+}
+
+/// Back/Continue navigation bar with optional guard.
+///
+/// `back_label`: `Some("← Back")` or `None` to hide.
+/// `continue_label`: e.g. `"Continue →"`.
+/// `can_continue`: `false` disables the Continue button.
+/// `hint`: shown when Continue is disabled.
+pub fn nav_buttons(
+    ui: &mut Ui,
+    back_label: Option<&str>,
+    continue_label: &str,
+    can_continue: bool,
+    hint: &str,
+) -> NavAction {
+    let tc = ThemeColors::from_ctx(ui.ctx());
+    let mut action = NavAction::None;
+
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        if let Some(label) = back_label {
+            if ui.button(label).clicked() {
+                action = NavAction::Back;
+            }
+        }
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add_enabled_ui(can_continue, |ui| {
+                if btn_primary(ui, continue_label).clicked() {
+                    action = NavAction::Continue;
+                }
+            });
+            if !can_continue && !hint.is_empty() {
+                ui.label(RichText::new(hint).size(10.0).color(tc.fg3));
+            }
+        });
+    });
+
+    action
 }

@@ -1,7 +1,8 @@
 //! Detectability tool — matrix/trace isotope analysis with verdict table.
 
 use crate::state::{
-    AppState, DetectTraceEntry, EndfFetchResult, GuidedStep, IsotopeEntry, PeriodicTableTarget,
+    AppState, DetectTraceEntry, EndfFetchResult, EndfStatus, GuidedStep, IsotopeEntry,
+    PeriodicTableTarget,
 };
 use nereids_endf::retrieval::EndfLibrary;
 use std::sync::Arc;
@@ -155,6 +156,7 @@ fn detect_controls(ui: &mut egui::Ui, state: &mut AppState) {
                         initial_density: 0.001,
                         resonance_data: None,
                         enabled: true,
+                        endf_status: EndfStatus::Pending,
                     });
                 }
                 if ui.button("Periodic Table...").clicked() {

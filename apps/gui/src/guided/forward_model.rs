@@ -1,7 +1,8 @@
 //! Forward Model tool — independent isotope sandbox with live spectrum preview.
 
 use crate::state::{
-    AppState, EndfFetchResult, GuidedStep, IsotopeEntry, PeriodicTableTarget, SpectrumAxis,
+    AppState, EndfFetchResult, EndfStatus, GuidedStep, IsotopeEntry, PeriodicTableTarget,
+    SpectrumAxis,
 };
 use egui_plot::{Line, Plot, PlotPoints};
 use nereids_endf::retrieval::EndfLibrary;
@@ -37,6 +38,7 @@ pub fn forward_model_step(ui: &mut egui::Ui, state: &mut AppState) {
                         initial_density: e.initial_density,
                         resonance_data: e.resonance_data.clone(),
                         enabled: e.enabled,
+                        endf_status: e.endf_status,
                     })
                     .collect();
                 state.fm_endf_library = state.endf_library;
@@ -57,6 +59,7 @@ pub fn forward_model_step(ui: &mut egui::Ui, state: &mut AppState) {
                         initial_density: e.initial_density,
                         resonance_data: e.resonance_data.clone(),
                         enabled: e.enabled,
+                        endf_status: e.endf_status,
                     })
                     .collect();
                 state.endf_library = state.fm_endf_library;
@@ -162,6 +165,7 @@ fn fm_isotope_controls(ui: &mut egui::Ui, state: &mut AppState) {
                     initial_density: 0.001,
                     resonance_data: None,
                     enabled: true,
+                    endf_status: EndfStatus::Pending,
                 });
                 state.fm_spectrum = None;
                 state.fm_per_isotope_spectra.clear();

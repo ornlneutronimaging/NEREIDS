@@ -1,7 +1,7 @@
 //! Main application structure and egui App implementation.
 
 use crate::guided;
-use crate::state::{AppState, ProvenanceEventKind, Tab, UiMode};
+use crate::state::{AppState, EndfStatus, ProvenanceEventKind, Tab, UiMode};
 use crate::studio;
 use crate::theme;
 use crate::widgets;
@@ -110,12 +110,14 @@ fn poll_pending_tasks(state: &mut AppState) {
                         match fetch.result {
                             Ok(data) => {
                                 entry.resonance_data = Some(data);
+                                entry.endf_status = EndfStatus::Loaded;
                                 state.status_message = format!("Loaded {}", fetch.symbol);
                                 // Invalidate stale results — isotope data changed.
                                 state.spatial_result = None;
                                 state.pixel_fit_result = None;
                             }
                             Err(msg) => {
+                                entry.endf_status = EndfStatus::Failed;
                                 state.status_message = msg;
                             }
                         }
@@ -161,11 +163,13 @@ fn poll_pending_tasks(state: &mut AppState) {
                         match fetch.result {
                             Ok(data) => {
                                 entry.resonance_data = Some(data);
+                                entry.endf_status = EndfStatus::Loaded;
                                 state.status_message = format!("FM: loaded {}", fetch.symbol);
                                 state.fm_spectrum = None;
                                 state.fm_per_isotope_spectra.clear();
                             }
                             Err(msg) => {
+                                entry.endf_status = EndfStatus::Failed;
                                 state.status_message = msg;
                             }
                         }
@@ -204,10 +208,12 @@ fn poll_pending_tasks(state: &mut AppState) {
                             match fetch.result {
                                 Ok(data) => {
                                     matrix.resonance_data = Some(data);
+                                    matrix.endf_status = EndfStatus::Loaded;
                                     state.status_message =
                                         format!("Detect: loaded matrix {}", fetch.symbol);
                                 }
                                 Err(msg) => {
+                                    matrix.endf_status = EndfStatus::Failed;
                                     state.status_message = msg;
                                 }
                             }
