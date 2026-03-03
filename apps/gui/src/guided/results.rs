@@ -2,7 +2,7 @@
 
 use super::result_widgets;
 use crate::state::{AppState, Colormap, GuidedStep};
-use crate::widgets::design::{self, NavAction};
+use crate::widgets::design;
 use crate::widgets::image_view::show_colormapped_image;
 
 /// Draw the Results step content.
@@ -80,9 +80,9 @@ pub fn results_step(ui: &mut egui::Ui, state: &mut AppState) {
     ui.add_space(12.0);
 
     // -- Navigation --
-    match design::nav_buttons(ui, Some("\u{2190} Back"), "Export \u{2193}", true, "") {
-        NavAction::Back => state.guided_step = GuidedStep::Analyze,
-        NavAction::Continue | NavAction::None => {}
+    ui.add_space(8.0);
+    if ui.button("\u{2190} Back to Analyze").clicked() {
+        state.guided_step = GuidedStep::Analyze;
     }
 }
 
@@ -109,7 +109,7 @@ fn density_map_grid(ui: &mut egui::Ui, state: &mut AppState) {
     let available_width = ui.available_width();
     let tile_min = 180.0_f32;
     let n_cols = ((available_width / tile_min) as usize).max(1).min(n_tiles);
-    let tile_width = (available_width - (n_cols - 1) as f32 * 8.0) / n_cols as f32;
+    let tile_width = ((available_width - (n_cols - 1) as f32 * 8.0) / n_cols as f32).max(1.0);
 
     design::card_with_header(ui, "Density Maps", None, |ui| {
         egui::Grid::new("density_map_grid")

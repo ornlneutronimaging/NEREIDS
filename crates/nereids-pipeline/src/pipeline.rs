@@ -321,9 +321,20 @@ fn dispatch_solver(
             let pr = poisson::poisson_fit(model, measured_t, params, poisson_config);
             let n_free = params.n_free();
             let dof = measured_t.len().saturating_sub(n_free).max(1);
+            // Compute Pearson chi-squared for display consistency with LM solver.
+            let y_model = model.evaluate(&pr.params);
+            let chi_sq: f64 = measured_t
+                .iter()
+                .zip(y_model.iter())
+                .zip(sigma.iter())
+                .map(|((obs, mdl), s)| {
+                    let residual = obs - mdl;
+                    (residual * residual) / (s * s).max(1e-30)
+                })
+                .sum();
             Ok(LmResult {
-                chi_squared: pr.nll,
-                reduced_chi_squared: pr.nll / dof as f64,
+                chi_squared: chi_sq,
+                reduced_chi_squared: chi_sq / dof as f64,
                 iterations: pr.iterations,
                 converged: pr.converged,
                 params: pr.params,

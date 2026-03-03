@@ -99,7 +99,7 @@ pub fn analyze_step(ui: &mut egui::Ui, state: &mut AppState) {
     });
 
     // -- Navigation --
-    let can_continue = state.spatial_result.is_some() || state.pixel_fit_result.is_some();
+    let can_continue = state.spatial_result.is_some();
     match design::nav_buttons(
         ui,
         Some("\u{2190} Back"),
@@ -901,7 +901,12 @@ pub fn run_spatial_map(state: &mut AppState) {
     let progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     state.fitting_progress_counter = Some(Arc::clone(&progress));
     let shape = norm.transmission.shape();
-    state.fitting_progress = Some((0, shape[1] * shape[2]));
+    let n_total_pixels = shape[1] * shape[2];
+    let n_live = match dead_pixels {
+        Some(ref dp) => dp.iter().filter(|&&d| !d).count(),
+        None => n_total_pixels,
+    };
+    state.fitting_progress = Some((0, n_live));
 
     std::thread::spawn(move || {
         let result = nereids_pipeline::spatial::spatial_map(
