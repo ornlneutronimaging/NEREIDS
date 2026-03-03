@@ -59,19 +59,13 @@ pub fn guided_sidebar(ctx: &egui::Context, state: &mut AppState) {
                 // appears at the very bottom. So we render events first
                 // (newest at bottom), then label, then separator.
                 if !state.provenance_log.is_empty() {
-                    let events: Vec<_> = state
-                        .provenance_log
-                        .iter()
-                        .rev()
-                        .take(4)
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev()
-                        .collect();
-                    // Render bottom-up: newest event first (visually at bottom)
+                    let start = state.provenance_log.len().saturating_sub(4);
+                    let events = &state.provenance_log[start..];
+                    // bottom_up reverses visual order, so forward iteration
+                    // renders oldest first → newest appears at bottom
                     for event in events.iter().rev() {
                         let ts = event.formatted_timestamp();
-                        let short = &ts[11..16]; // "HH:MM"
+                        let short = ts.get(11..16).unwrap_or("??:??");
                         ui.label(
                             RichText::new(format!("{short} \u{2014} {}", event.message))
                                 .size(10.0)
@@ -276,9 +270,7 @@ fn step_subtitle(step: GuidedStep, state: &AppState) -> String {
         }
         GuidedStep::Analyze => {
             if let Some(ref sr) = state.spatial_result {
-                let total = sr.density_maps[0].len();
-                let converged = sr.converged_map.iter().filter(|&&v| v).count();
-                format!("{converged}/{total}")
+                format!("{}/{}", sr.n_converged, sr.n_total)
             } else if state.is_fitting {
                 "Running...".into()
             } else {

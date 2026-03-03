@@ -121,14 +121,15 @@ fn tiff_pair_tab(ui: &mut egui::Ui, state: &mut AppState) {
         spectrum_section(ui, state);
     });
 
-    // Auto-load when all paths present and no data yet
-    let can_auto = state.sample_path.is_some()
+    let can_load = state.sample_path.is_some()
         && state.open_beam_path.is_some()
-        && state.spectrum_path.is_some()
-        && state.sample_data.is_none();
-    if can_auto {
-        load_all_data(state);
-    }
+        && state.spectrum_path.is_some();
+    ui.add_space(8.0);
+    ui.add_enabled_ui(can_load, |ui| {
+        if design::btn_primary(ui, "Load All").clicked() {
+            load_all_data(state);
+        }
+    });
 
     show_loaded_info(ui, state);
 }
@@ -159,12 +160,13 @@ fn transmission_tiff_tab(ui: &mut egui::Ui, state: &mut AppState) {
         spectrum_section(ui, state);
     });
 
-    // Auto-load when paths present and no data yet
-    let can_auto =
-        state.sample_path.is_some() && state.spectrum_path.is_some() && state.sample_data.is_none();
-    if can_auto {
-        load_all_data(state);
-    }
+    let can_load = state.sample_path.is_some() && state.spectrum_path.is_some();
+    ui.add_space(8.0);
+    ui.add_enabled_ui(can_load, |ui| {
+        if design::btn_primary(ui, "Load All").clicked() {
+            load_all_data(state);
+        }
+    });
 
     show_loaded_info(ui, state);
 }
@@ -668,6 +670,7 @@ fn load_all_data(state: &mut AppState) {
             }
             Err(e) => {
                 state.status_message = format!("Failed to load open beam: {}", e);
+                state.sample_data = None; // Clear partial data
                 return;
             }
         }
@@ -682,6 +685,8 @@ fn load_all_data(state: &mut AppState) {
             sample.shape()[0],
             ob.shape()[0]
         );
+        state.sample_data = None;
+        state.open_beam_data = None;
         return;
     }
 

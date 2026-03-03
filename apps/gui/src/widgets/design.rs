@@ -204,6 +204,7 @@ pub fn btn_icon(ui: &mut Ui, label: &str, active: bool) -> Response {
 /// Returns a `Response` — callers check `.clicked()` to open a file dialog.
 ///
 /// Prototype: `.drop-zone { border: 2px dashed var(--border); border-radius: 10px; }`
+/// Note: egui renders a solid border as an approximation (no native dashed support).
 ///            `.drop-zone.loaded { border-style: solid; border-color: var(--green); }`
 pub fn drop_zone(ui: &mut Ui, loaded: bool, label: &str, hint: &str) -> Response {
     let tc = ThemeColors::from_ctx(ui.ctx());
