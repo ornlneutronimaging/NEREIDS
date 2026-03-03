@@ -2,12 +2,12 @@
 
 use super::result_widgets;
 use crate::state::{AppState, Colormap};
+use crate::widgets::design;
 use crate::widgets::image_view::show_colormapped_image;
 
 /// Draw the Results step content.
 pub fn results_step(ui: &mut egui::Ui, state: &mut AppState) {
-    ui.heading("Results");
-    ui.separator();
+    design::content_header(ui, "Results", "Density maps and export");
 
     // Ensure tile_display is populated
     match state.spatial_result {
@@ -64,75 +64,68 @@ fn density_map_grid(ui: &mut egui::Ui, state: &mut AppState) {
         .collect();
     let n_density = density_maps.len().min(symbols.len());
 
-    egui::Frame::group(ui.style())
-        .inner_margin(egui::Margin::same(12))
-        .show(ui, |ui| {
-            ui.label(egui::RichText::new("Density Maps").strong());
-            ui.add_space(4.0);
+    design::card_with_header(ui, "Density Maps", None, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            for i in 0..n_density {
+                let data = &density_maps[i];
+                let label = &symbols[i];
+                let tex_id = format!("result_density_{i}");
 
-            ui.horizontal_wrapped(|ui| {
-                for i in 0..n_density {
-                    let data = &density_maps[i];
-                    let label = &symbols[i];
-                    let tex_id = format!("result_density_{i}");
-
-                    ui.vertical(|ui| {
-                        ui.label(egui::RichText::new(format!("{label} density")).small());
-
-                        let colormap = state
-                            .tile_display
-                            .get(i)
-                            .map_or(Colormap::Viridis, |t| t.colormap);
-                        let show_bar = state.tile_display.get(i).is_some_and(|t| t.show_colorbar);
-
-                        if show_bar {
-                            ui.horizontal(|ui| {
-                                if let Some((y, x)) =
-                                    show_colormapped_image(ui, data, &tex_id, colormap)
-                                {
-                                    state.selected_pixel = Some((y, x));
-                                    state.pixel_fit_result = None;
-                                }
-                                result_widgets::draw_colorbar(ui, data, colormap);
-                            });
-                        } else if let Some((y, x)) =
-                            show_colormapped_image(ui, data, &tex_id, colormap)
-                        {
-                            state.selected_pixel = Some((y, x));
-                            state.pixel_fit_result = None;
-                        }
-
-                        result_widgets::tile_toolbelt(ui, data, i, label, state);
-                    });
-                }
-
-                // Convergence map
-                let conv_idx = n_density;
                 ui.vertical(|ui| {
-                    ui.label(egui::RichText::new("Convergence").small());
+                    ui.label(egui::RichText::new(format!("{label} density")).small());
 
                     let colormap = state
                         .tile_display
-                        .get(conv_idx)
+                        .get(i)
                         .map_or(Colormap::Viridis, |t| t.colormap);
-                    let show_bar = state
-                        .tile_display
-                        .get(conv_idx)
-                        .is_some_and(|t| t.show_colorbar);
+                    let show_bar = state.tile_display.get(i).is_some_and(|t| t.show_colorbar);
 
                     if show_bar {
                         ui.horizontal(|ui| {
-                            let _ =
-                                show_colormapped_image(ui, &conv_f64, "result_conv_map", colormap);
-                            result_widgets::draw_colorbar(ui, &conv_f64, colormap);
+                            if let Some((y, x)) =
+                                show_colormapped_image(ui, data, &tex_id, colormap)
+                            {
+                                state.selected_pixel = Some((y, x));
+                                state.pixel_fit_result = None;
+                            }
+                            result_widgets::draw_colorbar(ui, data, colormap);
                         });
-                    } else {
-                        let _ = show_colormapped_image(ui, &conv_f64, "result_conv_map", colormap);
+                    } else if let Some((y, x)) = show_colormapped_image(ui, data, &tex_id, colormap)
+                    {
+                        state.selected_pixel = Some((y, x));
+                        state.pixel_fit_result = None;
                     }
 
-                    ui.label(egui::RichText::new(format!("{n_converged}/{n_total}")).small());
-                    result_widgets::tile_toolbelt(ui, &conv_f64, conv_idx, "convergence", state);
+                    result_widgets::tile_toolbelt(ui, data, i, label, state);
                 });
+            }
+
+            // Convergence map
+            let conv_idx = n_density;
+            ui.vertical(|ui| {
+                ui.label(egui::RichText::new("Convergence").small());
+
+                let colormap = state
+                    .tile_display
+                    .get(conv_idx)
+                    .map_or(Colormap::Viridis, |t| t.colormap);
+                let show_bar = state
+                    .tile_display
+                    .get(conv_idx)
+                    .is_some_and(|t| t.show_colorbar);
+
+                if show_bar {
+                    ui.horizontal(|ui| {
+                        let _ = show_colormapped_image(ui, &conv_f64, "result_conv_map", colormap);
+                        result_widgets::draw_colorbar(ui, &conv_f64, colormap);
+                    });
+                } else {
+                    let _ = show_colormapped_image(ui, &conv_f64, "result_conv_map", colormap);
+                }
+
+                ui.label(egui::RichText::new(format!("{n_converged}/{n_total}")).small());
+                result_widgets::tile_toolbelt(ui, &conv_f64, conv_idx, "convergence", state);
             });
         });
+    });
 }
