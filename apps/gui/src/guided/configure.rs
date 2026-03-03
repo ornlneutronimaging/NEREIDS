@@ -145,6 +145,7 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
                     state.periodic_table_open = true;
                     state.periodic_table_target = PeriodicTableTarget::Configure;
                     state.periodic_table_selected_z = None;
+                    state.periodic_table_density = 0.001; // at/barn default
                 }
             });
         });

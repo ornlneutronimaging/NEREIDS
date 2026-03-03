@@ -188,6 +188,7 @@ fn detect_matrix_card(ui: &mut egui::Ui, state: &mut AppState, locked: bool) {
                     state.periodic_table_open = true;
                     state.periodic_table_target = PeriodicTableTarget::DetectMatrix;
                     state.periodic_table_selected_z = None;
+                    state.periodic_table_density = 0.001; // at/barn default
                 }
             });
         });
@@ -288,6 +289,7 @@ fn detect_trace_card(ui: &mut egui::Ui, state: &mut AppState, locked: bool) {
                     state.periodic_table_open = true;
                     state.periodic_table_target = PeriodicTableTarget::DetectTrace;
                     state.periodic_table_selected_z = None;
+                    state.periodic_table_density = 1000.0; // ppm default
                 }
             });
         });
@@ -548,39 +550,38 @@ fn detect_results_panel(ui: &mut egui::Ui, state: &AppState) {
                     .small()
                     .weak(),
             );
-                let plot_height = ui.available_height().clamp(200.0, 300.0);
-                Plot::new("detect_delta_t_plot")
-                    .height(plot_height)
-                    .x_axis_label("Energy (eV)")
-                    .y_axis_label("|\u{0394}T|")
-                    .legend(egui_plot::Legend::default())
-                    .show(ui, |plot_ui| {
-                        // Detection threshold line: snr_threshold / sqrt(i0)
-                        let threshold = state.detect_snr_threshold / state.detect_i0.sqrt();
-                        plot_ui.hline(
-                            HLine::new("threshold", threshold)
-                                .color(egui::Color32::from_rgb(200, 200, 200))
-                                .style(egui_plot::LineStyle::dashed_loose()),
-                        );
+            let plot_height = ui.available_height().clamp(200.0, 300.0);
+            Plot::new("detect_delta_t_plot")
+                .height(plot_height)
+                .x_axis_label("Energy (eV)")
+                .y_axis_label("|\u{0394}T|")
+                .legend(egui_plot::Legend::default())
+                .show(ui, |plot_ui| {
+                    // Detection threshold line: snr_threshold / sqrt(i0)
+                    let threshold = state.detect_snr_threshold / state.detect_i0.sqrt();
+                    plot_ui.hline(
+                        HLine::new("threshold", threshold)
+                            .color(egui::Color32::from_rgb(200, 200, 200))
+                            .style(egui_plot::LineStyle::dashed_loose()),
+                    );
 
-                        for (name, report) in &state.detect_results {
-                            if report.delta_t_spectrum.is_empty() {
-                                continue;
-                            }
-                            let n = report.energies.len().min(report.delta_t_spectrum.len());
-                            let points: PlotPoints = (0..n)
-                                .filter(|&i| {
-                                    report.energies[i].is_finite()
-                                        && report.delta_t_spectrum[i].is_finite()
-                                })
-                                .map(|i| [report.energies[i], report.delta_t_spectrum[i]])
-                                .collect();
-                            let color = design::isotope_dot_color(name);
-                            plot_ui.line(Line::new(name.as_str(), points).color(color).width(1.5));
+                    for (name, report) in &state.detect_results {
+                        if report.delta_t_spectrum.is_empty() {
+                            continue;
                         }
-                    });
-            },
-        );
+                        let n = report.energies.len().min(report.delta_t_spectrum.len());
+                        let points: PlotPoints = (0..n)
+                            .filter(|&i| {
+                                report.energies[i].is_finite()
+                                    && report.delta_t_spectrum[i].is_finite()
+                            })
+                            .map(|i| [report.energies[i], report.delta_t_spectrum[i]])
+                            .collect();
+                        let color = design::isotope_dot_color(name);
+                        plot_ui.line(Line::new(name.as_str(), points).color(color).width(1.5));
+                    }
+                });
+        });
     }
 }
 
@@ -617,9 +618,15 @@ fn run_detectability(state: &mut AppState) {
     // Build resolution function if enabled
     let res_fn = if state.detect_resolution_enabled {
         let fp = state.beamline.flight_path_m;
-        ResolutionParams::new(fp, state.detect_delta_t_us, state.detect_delta_l_m)
-            .ok()
-            .map(ResolutionFunction::Gaussian)
+        match ResolutionParams::new(fp, state.detect_delta_t_us, state.detect_delta_l_m) {
+            Ok(p) => Some(ResolutionFunction::Gaussian(p)),
+            Err(_) => {
+                state.status_message =
+                    "Resolution enabled but flight path not configured — broadening disabled"
+                        .into();
+                None
+            }
+        }
     } else {
         None
     };

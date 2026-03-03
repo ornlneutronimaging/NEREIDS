@@ -435,6 +435,49 @@ fn add_selected_isotopes(state: &mut AppState) {
     let density = state.periodic_table_density;
     let selected = state.periodic_table_selected_isotopes.clone();
 
+    // Propagate PT library choice to the target's library field.
+    // If the user selected a different library, existing resonance data
+    // must be re-fetched (same pattern as the main library ComboBox).
+    if let Some(lib) = state.periodic_table_library {
+        let target_lib = match state.periodic_table_target {
+            PeriodicTableTarget::Configure => &mut state.endf_library,
+            PeriodicTableTarget::ForwardModel => &mut state.fm_endf_library,
+            PeriodicTableTarget::DetectMatrix | PeriodicTableTarget::DetectTrace => {
+                &mut state.detect_endf_library
+            }
+        };
+        if *target_lib != lib {
+            *target_lib = lib;
+            // Clear existing resonance data so they get re-fetched with the new library
+            match state.periodic_table_target {
+                PeriodicTableTarget::Configure => {
+                    for e in &mut state.isotope_entries {
+                        e.resonance_data = None;
+                        e.endf_status = EndfStatus::Pending;
+                    }
+                }
+                PeriodicTableTarget::ForwardModel => {
+                    for e in &mut state.fm_isotope_entries {
+                        e.resonance_data = None;
+                        e.endf_status = EndfStatus::Pending;
+                    }
+                    state.fm_spectrum = None;
+                    state.fm_per_isotope_spectra.clear();
+                }
+                PeriodicTableTarget::DetectMatrix | PeriodicTableTarget::DetectTrace => {
+                    for e in &mut state.detect_matrix_entries {
+                        e.resonance_data = None;
+                        e.endf_status = EndfStatus::Pending;
+                    }
+                    for e in &mut state.detect_trace_entries {
+                        e.resonance_data = None;
+                    }
+                    state.detect_results.clear();
+                }
+            }
+        }
+    }
+
     for (z, a) in &selected {
         let sym = nereids_core::elements::element_symbol(*z).unwrap_or("??");
         let symbol = format!("{}-{}", sym, a);

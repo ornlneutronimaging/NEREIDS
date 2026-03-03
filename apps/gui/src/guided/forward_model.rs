@@ -100,16 +100,25 @@ pub fn forward_model_step(ui: &mut egui::Ui, state: &mut AppState) {
 }
 
 /// Build an optional InstrumentParams from the FM resolution state.
-fn fm_instrument(state: &AppState) -> Option<InstrumentParams> {
+/// Returns `(instrument, warning)` — warning is set if resolution is enabled
+/// but parameters are invalid (e.g., flight path not configured).
+fn fm_instrument(state: &AppState) -> (Option<InstrumentParams>, Option<&'static str>) {
     if !state.fm_resolution_enabled {
-        return None;
+        return (None, None);
     }
     let fp = state.beamline.flight_path_m;
-    ResolutionParams::new(fp, state.fm_delta_t_us, state.fm_delta_l_m)
-        .ok()
-        .map(|p| InstrumentParams {
-            resolution: ResolutionFunction::Gaussian(p),
-        })
+    match ResolutionParams::new(fp, state.fm_delta_t_us, state.fm_delta_l_m) {
+        Ok(p) => (
+            Some(InstrumentParams {
+                resolution: ResolutionFunction::Gaussian(p),
+            }),
+            None,
+        ),
+        Err(_) => (
+            None,
+            Some("Resolution enabled but flight path not configured — broadening disabled"),
+        ),
+    }
 }
 
 /// Resolution card: enable checkbox, flight path (read-only), delta_t, delta_l.
@@ -309,6 +318,7 @@ fn fm_isotopes_card(ui: &mut egui::Ui, state: &mut AppState) {
                     state.periodic_table_open = true;
                     state.periodic_table_target = PeriodicTableTarget::ForwardModel;
                     state.periodic_table_selected_z = None;
+                    state.periodic_table_density = 0.001; // at/barn default
                 }
             });
         });
@@ -371,7 +381,10 @@ fn fm_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
 
     // Compute combined forward model if cache is stale
     if state.fm_spectrum.is_none() {
-        let instrument = fm_instrument(state);
+        let (instrument, res_warning) = fm_instrument(state);
+        if let Some(msg) = res_warning {
+            state.status_message = msg.into();
+        }
         let isotopes: Vec<_> = enabled
             .iter()
             .filter_map(|e| e.resonance_data.clone().map(|rd| (rd, e.initial_density)))
