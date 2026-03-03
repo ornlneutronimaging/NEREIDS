@@ -306,6 +306,9 @@ pub struct AppState {
     pub fm_spectrum: Option<Vec<f64>>,
     pub fm_per_isotope_spectra: Vec<(String, Vec<f64>)>,
     pub fm_energies: Option<Vec<f64>>,
+    pub fm_resolution_enabled: bool,
+    pub fm_delta_t_us: f64,
+    pub fm_delta_l_m: f64,
 
     // -- Detectability tool --
     pub detect_matrix_entries: Vec<IsotopeEntry>,
@@ -635,6 +638,9 @@ impl Default for AppState {
             fm_spectrum: None,
             fm_per_isotope_spectra: Vec::new(),
             fm_energies: None,
+            fm_resolution_enabled: false,
+            fm_delta_t_us: 1.0,
+            fm_delta_l_m: 0.01,
 
             detect_matrix_entries: Vec::new(),
             detect_trace_entries: Vec::new(),
