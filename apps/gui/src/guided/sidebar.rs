@@ -53,16 +53,22 @@ pub fn guided_sidebar(ctx: &egui::Context, state: &mut AppState) {
                 ui.add_space(2.0);
             }
 
-            // ── History section (pushed to bottom) ─────────────
+            // ── Status + History (pushed to bottom) ────────────
             ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
-                // bottom_up reverses render order: first item rendered
-                // appears at the very bottom. So we render events first
-                // (newest at bottom), then label, then separator.
+                // Status message (bottom-most element)
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(&state.status_message)
+                        .small()
+                        .color(colors.fg3),
+                );
+
+                // History: last 4 provenance events
+                // bottom_up reverses visual order; .rev() renders newest
+                // first (bottom-most), giving chronological top-to-bottom.
                 if !state.provenance_log.is_empty() {
                     let start = state.provenance_log.len().saturating_sub(4);
                     let events = &state.provenance_log[start..];
-                    // bottom_up reverses visual order, so forward iteration
-                    // renders oldest first → newest appears at bottom
                     for event in events.iter().rev() {
                         let ts = event.formatted_timestamp();
                         let short = ts.get(11..16).unwrap_or("??:??");
