@@ -24,8 +24,8 @@ pub enum SolverChoice {
     /// Levenberg-Marquardt chi-squared minimizer (default).
     #[default]
     LevenbergMarquardt,
-    /// Poisson negative log-likelihood via projected gradient descent.
-    /// Appropriate for low-count data (< ~30 counts/bin).
+    /// Poisson negative log-likelihood via L-BFGS with projected gradients
+    /// and bound constraints. Appropriate for low-count data (< ~30 counts/bin).
     PoissonKL(PoissonConfig),
 }
 

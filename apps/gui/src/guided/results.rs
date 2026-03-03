@@ -3,7 +3,7 @@
 use super::result_widgets;
 use crate::state::{AppState, Colormap, GuidedStep};
 use crate::widgets::design;
-use crate::widgets::image_view::show_colormapped_image;
+use crate::widgets::image_view::show_colormapped_image_with_roi;
 
 /// Draw the Results step content.
 pub fn results_step(ui: &mut egui::Ui, state: &mut AppState) {
@@ -56,7 +56,7 @@ pub fn results_step(ui: &mut egui::Ui, state: &mut AppState) {
             ui,
             &[
                 (&pct, "Converged"),
-                (&chi2, "Mean \u{03C7}\u{00B2}"),
+                (&chi2, "Mean \u{03C7}\u{00B2}\u{1D63}"),
                 (&n_iso_str, "Isotopes"),
             ],
         );
@@ -106,12 +106,14 @@ fn density_map_grid(ui: &mut egui::Ui, state: &mut AppState) {
     let n_density = density_maps.len().min(symbols.len());
 
     let n_tiles = n_density + 1; // isotopes + convergence
-    let available_width = ui.available_width();
-    let tile_min = 180.0_f32;
-    let n_cols = ((available_width / tile_min) as usize).max(1).min(n_tiles);
-    let tile_width = ((available_width - (n_cols - 1) as f32 * 8.0) / n_cols as f32).max(1.0);
 
     design::card_with_header(ui, "Density Maps", None, |ui| {
+        // Compute layout inside the card so available_width accounts for card padding.
+        let available_width = ui.available_width();
+        let tile_min = 180.0_f32;
+        let n_cols = ((available_width / tile_min) as usize).max(1).min(n_tiles);
+        let tile_width = ((available_width - (n_cols - 1) as f32 * 8.0) / n_cols as f32).max(1.0);
+
         egui::Grid::new("density_map_grid")
             .num_columns(n_cols)
             .spacing([8.0, 8.0])
@@ -133,18 +135,23 @@ fn density_map_grid(ui: &mut egui::Ui, state: &mut AppState) {
                             let show_bar =
                                 state.tile_display.get(i).is_some_and(|t| t.show_colorbar);
 
+                            let selected = state.selected_pixel;
                             if show_bar {
                                 ui.horizontal(|ui| {
-                                    if let Some((y, x)) =
-                                        show_colormapped_image(ui, data, &tex_id, colormap)
+                                    if let Some((y, x)) = show_colormapped_image_with_roi(
+                                        ui, data, &tex_id, colormap, None, selected,
+                                    )
+                                    .0
                                     {
                                         state.selected_pixel = Some((y, x));
                                         state.pixel_fit_result = None;
                                     }
                                     result_widgets::draw_colorbar(ui, data, colormap);
                                 });
-                            } else if let Some((y, x)) =
-                                show_colormapped_image(ui, data, &tex_id, colormap)
+                            } else if let Some((y, x)) = show_colormapped_image_with_roi(
+                                ui, data, &tex_id, colormap, None, selected,
+                            )
+                            .0
                             {
                                 state.selected_pixel = Some((y, x));
                                 state.pixel_fit_result = None;
@@ -168,20 +175,24 @@ fn density_map_grid(ui: &mut egui::Ui, state: &mut AppState) {
 
                             if show_bar {
                                 ui.horizontal(|ui| {
-                                    let _ = show_colormapped_image(
+                                    let _ = show_colormapped_image_with_roi(
                                         ui,
                                         &conv_f64,
                                         "result_conv_map",
                                         colormap,
+                                        None,
+                                        None,
                                     );
                                     result_widgets::draw_colorbar(ui, &conv_f64, colormap);
                                 });
                             } else {
-                                let _ = show_colormapped_image(
+                                let _ = show_colormapped_image_with_roi(
                                     ui,
                                     &conv_f64,
                                     "result_conv_map",
                                     colormap,
+                                    None,
+                                    None,
                                 );
                             }
 
