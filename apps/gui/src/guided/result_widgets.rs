@@ -1,6 +1,7 @@
 //! Shared result display widgets used by both Guided Results step and Studio mode.
 
 use crate::state::{AppState, Colormap, ExportFormat, ProvenanceEventKind};
+use crate::widgets::design::{self, BadgeVariant};
 use crate::widgets::image_view::{apply_colormap, data_range, render_to_rgba};
 
 /// Summary statistics card showing convergence and density stats.
@@ -9,17 +10,24 @@ pub fn summary_card(
     result: &nereids_pipeline::spatial::SpatialResult,
     isotope_entries: &[crate::state::IsotopeEntry],
 ) {
-    egui::Frame::group(ui.style())
-        .inner_margin(egui::Margin::same(12))
-        .show(ui, |ui| {
-            ui.label(egui::RichText::new("Summary Statistics").strong());
-            ui.add_space(4.0);
+    let pct = if result.n_total > 0 {
+        100.0 * result.n_converged as f64 / result.n_total as f64
+    } else {
+        0.0
+    };
+    let conv_badge = if pct > 95.0 {
+        BadgeVariant::Green
+    } else if pct > 50.0 {
+        BadgeVariant::Orange
+    } else {
+        BadgeVariant::Red
+    };
 
-            let pct = if result.n_total > 0 {
-                100.0 * result.n_converged as f64 / result.n_total as f64
-            } else {
-                0.0
-            };
+    design::card_with_header(
+        ui,
+        "Summary Statistics",
+        Some((&format!("{:.0}%", pct), conv_badge)),
+        |ui| {
             ui.label(format!(
                 "Converged: {} / {} ({:.1}%)",
                 result.n_converged, result.n_total, pct
@@ -36,7 +44,17 @@ pub fn summary_card(
                 .collect();
             if !chi2_vals.is_empty() {
                 let mean_chi2: f64 = chi2_vals.iter().sum::<f64>() / chi2_vals.len() as f64;
-                ui.label(format!("Mean chi2_r (converged): {:.4}", mean_chi2));
+                ui.horizontal(|ui| {
+                    ui.label(format!("Mean chi2_r: {:.4}", mean_chi2));
+                    let chi2_variant = if mean_chi2 < 2.0 {
+                        BadgeVariant::Green
+                    } else if mean_chi2 < 5.0 {
+                        BadgeVariant::Orange
+                    } else {
+                        BadgeVariant::Red
+                    };
+                    design::badge(ui, &format!("{:.2}", mean_chi2), chi2_variant);
+                });
             }
 
             // Per-isotope mean density
@@ -63,7 +81,8 @@ pub fn summary_card(
                     }
                 }
             }
-        });
+        },
+    );
 }
 
 /// Per-tile toolbelt: colormap selector, colorbar toggle, save PNG.
@@ -189,20 +208,18 @@ pub fn pixel_inspector(ui: &mut egui::Ui, state: &AppState) {
         return;
     }
 
-    egui::Frame::group(ui.style())
-        .inner_margin(egui::Margin::same(12))
-        .show(ui, |ui| {
-            ui.label(egui::RichText::new(format!("Pixel Inspector ({}, {})", y, x)).strong());
-            ui.add_space(4.0);
+    let converged = result.converged_map[[y, x]];
+    let conv_badge = if converged {
+        Some(("Converged", BadgeVariant::Green))
+    } else {
+        Some(("NOT converged", BadgeVariant::Red))
+    };
 
-            let converged = result.converged_map[[y, x]];
-            let (label, color) = if converged {
-                ("Converged", crate::theme::semantic::GREEN)
-            } else {
-                ("NOT converged", crate::theme::semantic::RED)
-            };
-            ui.label(egui::RichText::new(label).color(color));
-
+    design::card_with_header(
+        ui,
+        &format!("Pixel Inspector ({}, {})", y, x),
+        conv_badge,
+        |ui| {
             ui.label(format!("chi2_r = {:.4}", result.chi_squared_map[[y, x]]));
 
             let enabled: Vec<_> = state
@@ -230,65 +247,61 @@ pub fn pixel_inspector(ui: &mut egui::Ui, state: &AppState) {
                     ));
                 }
             }
-        });
+        },
+    );
 }
 
 /// Export panel: format selector, directory picker, export button.
 pub fn export_panel(ui: &mut egui::Ui, state: &mut AppState) {
-    egui::Frame::group(ui.style())
-        .inner_margin(egui::Margin::same(12))
-        .show(ui, |ui| {
-            ui.label(egui::RichText::new("Export Results").strong());
-            ui.add_space(4.0);
+    design::card_with_header(ui, "Export Results", None, |ui| {
+        ui.horizontal(|ui| {
+            // Format selector
+            ui.label("Format:");
+            let current_label = state.export_format.label();
+            egui::ComboBox::from_id_salt("export_format")
+                .selected_text(current_label)
+                .show_ui(ui, |ui| {
+                    for fmt in ExportFormat::ALL {
+                        ui.selectable_value(&mut state.export_format, fmt, fmt.label());
+                    }
+                });
+        });
 
-            ui.horizontal(|ui| {
-                // Format selector
-                ui.label("Format:");
-                let current_label = state.export_format.label();
-                egui::ComboBox::from_id_salt("export_format")
-                    .selected_text(current_label)
-                    .show_ui(ui, |ui| {
-                        for fmt in ExportFormat::ALL {
-                            ui.selectable_value(&mut state.export_format, fmt, fmt.label());
-                        }
-                    });
-            });
+        ui.horizontal(|ui| {
+            ui.label("Directory:");
+            let dir_label = state
+                .export_directory
+                .as_ref()
+                .map_or("(not set)".to_string(), |p| p.display().to_string());
+            ui.label(egui::RichText::new(dir_label).monospace());
 
-            ui.horizontal(|ui| {
-                ui.label("Directory:");
-                let dir_label = state
-                    .export_directory
-                    .as_ref()
-                    .map_or("(not set)".to_string(), |p| p.display().to_string());
-                ui.label(egui::RichText::new(dir_label).monospace());
-
-                if ui.button("Browse...").clicked()
-                    && let Some(path) = rfd::FileDialog::new().pick_folder()
-                {
-                    state.export_directory = Some(path);
-                }
-            });
-
-            ui.add_space(4.0);
-
-            let can_export = state.spatial_result.is_some() && state.export_directory.is_some();
-            if ui
-                .add_enabled(can_export, egui::Button::new("Export Results"))
-                .clicked()
+            if ui.button("Browse...").clicked()
+                && let Some(path) = rfd::FileDialog::new().pick_folder()
             {
-                run_export(state);
-            }
-
-            if let Some(ref status) = state.export_status {
-                ui.add_space(4.0);
-                let color = if status.starts_with("Error") {
-                    crate::theme::semantic::RED
-                } else {
-                    crate::theme::semantic::GREEN
-                };
-                ui.label(egui::RichText::new(status.as_str()).color(color));
+                state.export_directory = Some(path);
             }
         });
+
+        ui.add_space(4.0);
+
+        let can_export = state.spatial_result.is_some() && state.export_directory.is_some();
+        if ui
+            .add_enabled(can_export, egui::Button::new("Export Results"))
+            .clicked()
+        {
+            run_export(state);
+        }
+
+        if let Some(ref status) = state.export_status {
+            ui.add_space(4.0);
+            let color = if status.starts_with("Error") {
+                crate::theme::semantic::RED
+            } else {
+                crate::theme::semantic::GREEN
+            };
+            ui.label(egui::RichText::new(status.as_str()).color(color));
+        }
+    });
 }
 
 /// Execute the export based on the selected format.

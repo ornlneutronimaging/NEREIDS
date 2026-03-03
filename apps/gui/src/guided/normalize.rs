@@ -3,6 +3,7 @@
 use crate::state::{
     AnalysisMode, AppState, InputMode, ProvenanceEventKind, SpectrumAxis, SpectrumDataSource,
 };
+use crate::widgets::design;
 use crate::widgets::image_view::show_viridis_image;
 use egui_plot::{Line, Plot, PlotPoints, VLine};
 use ndarray::{Array3, Axis};
@@ -14,8 +15,7 @@ use std::sync::Arc;
 /// No inner ScrollArea -- the guided content area in app.rs already wraps
 /// everything in a vertical ScrollArea, so nesting would clip content.
 pub fn normalize_step(ui: &mut egui::Ui, state: &mut AppState) {
-    ui.heading("Normalize");
-    ui.separator();
+    design::content_header(ui, "Normalize", "Compute and preview transmission");
 
     normalization_controls_card(ui, state);
 
@@ -30,55 +30,50 @@ pub fn normalize_step(ui: &mut egui::Ui, state: &mut AppState) {
 // ---- Normalization Controls Card ----
 
 fn normalization_controls_card(ui: &mut egui::Ui, state: &mut AppState) {
-    egui::Frame::group(ui.style())
-        .inner_margin(egui::Margin::same(12))
-        .show(ui, |ui| {
-            ui.label(egui::RichText::new("Normalization").strong());
-            ui.add_space(4.0);
-
-            match state.input_mode {
-                InputMode::TransmissionTiff | InputMode::Hdf5Histogram | InputMode::Hdf5Event => {
-                    if state.normalized.is_some() && state.energies.is_some() {
-                        let label = match state.input_mode {
-                            InputMode::Hdf5Histogram => "HDF5 histogram data ready.",
-                            InputMode::Hdf5Event => "Histogrammed event data ready.",
-                            _ => "Transmission data ready (pre-normalized).",
-                        };
-                        ui.label(label);
-                        show_energy_info(ui, state);
-                    } else if state.sample_data.is_some() && state.spectrum_values.is_some() {
-                        // Auto-prepare: pre-normalized/HDF5 data needs no user action.
-                        prepare_transmission(state);
-                        ui.label("Preparing data...");
-                    } else {
-                        ui.label("Load data first (Step 1).");
-                    }
-                }
-                InputMode::TiffPair => {
-                    let can_normalize = state.sample_data.is_some()
-                        && state.open_beam_data.is_some()
-                        && !state.is_fitting;
-                    ui.add_enabled_ui(can_normalize, |ui| {
-                        if ui.button("Normalize").clicked() {
-                            normalize_data(state);
-                        }
-                    });
-
-                    if state.normalized.is_some() {
-                        ui.label("Transmission computed.");
-                        if let Some(ref dead) = state.dead_pixels {
-                            let n_dead = dead.iter().filter(|&&d| d).count();
-                            ui.label(format!("Dead pixels: {}", n_dead));
-                        }
-                        show_energy_info(ui, state);
-                    } else if state.sample_data.is_some() && state.open_beam_data.is_some() {
-                        ui.label("Click Normalize to compute transmission.");
-                    } else {
-                        ui.label("Load sample and open beam data first (Step 1).");
-                    }
+    design::card_with_header(ui, "Normalization", None, |ui| {
+        match state.input_mode {
+            InputMode::TransmissionTiff | InputMode::Hdf5Histogram | InputMode::Hdf5Event => {
+                if state.normalized.is_some() && state.energies.is_some() {
+                    let label = match state.input_mode {
+                        InputMode::Hdf5Histogram => "HDF5 histogram data ready.",
+                        InputMode::Hdf5Event => "Histogrammed event data ready.",
+                        _ => "Transmission data ready (pre-normalized).",
+                    };
+                    ui.label(label);
+                    show_energy_info(ui, state);
+                } else if state.sample_data.is_some() && state.spectrum_values.is_some() {
+                    // Auto-prepare: pre-normalized/HDF5 data needs no user action.
+                    prepare_transmission(state);
+                    ui.label("Preparing data...");
+                } else {
+                    ui.label("Load data first (Step 1).");
                 }
             }
-        });
+            InputMode::TiffPair => {
+                let can_normalize = state.sample_data.is_some()
+                    && state.open_beam_data.is_some()
+                    && !state.is_fitting;
+                ui.add_enabled_ui(can_normalize, |ui| {
+                    if ui.button("Normalize").clicked() {
+                        normalize_data(state);
+                    }
+                });
+
+                if state.normalized.is_some() {
+                    ui.label("Transmission computed.");
+                    if let Some(ref dead) = state.dead_pixels {
+                        let n_dead = dead.iter().filter(|&&d| d).count();
+                        ui.label(format!("Dead pixels: {}", n_dead));
+                    }
+                    show_energy_info(ui, state);
+                } else if state.sample_data.is_some() && state.open_beam_data.is_some() {
+                    ui.label("Click Normalize to compute transmission.");
+                } else {
+                    ui.label("Load sample and open beam data first (Step 1).");
+                }
+            }
+        }
+    });
 }
 
 /// Show energy axis info after normalization.
@@ -96,33 +91,28 @@ fn show_energy_info(ui: &mut egui::Ui, state: &AppState) {
 // ---- Transmission Preview Card ----
 
 fn transmission_preview_card(ui: &mut egui::Ui, state: &mut AppState) {
-    egui::Frame::group(ui.style())
-        .inner_margin(egui::Margin::same(12))
-        .show(ui, |ui| {
-            ui.label(egui::RichText::new("Transmission Preview").strong());
-            ui.add_space(4.0);
+    design::card_with_header(ui, "Transmission Preview", None, |ui| {
+        let available_width = ui.available_width();
+        let image_width = 220.0_f32.min(available_width * 0.35);
 
-            let available_width = ui.available_width();
-            let image_width = 220.0_f32.min(available_width * 0.35);
+        ui.horizontal(|ui| {
+            // Left: image + TOF slicer
+            ui.allocate_ui_with_layout(
+                egui::vec2(image_width, ui.available_height()),
+                egui::Layout::top_down(egui::Align::LEFT),
+                |ui| {
+                    preview_image_panel(ui, state);
+                },
+            );
 
-            ui.horizontal(|ui| {
-                // Left: image + TOF slicer
-                ui.allocate_ui_with_layout(
-                    egui::vec2(image_width, ui.available_height()),
-                    egui::Layout::top_down(egui::Align::LEFT),
-                    |ui| {
-                        preview_image_panel(ui, state);
-                    },
-                );
+            ui.separator();
 
-                ui.separator();
-
-                // Right: spectrum plot + controls
-                ui.vertical(|ui| {
-                    preview_spectrum_panel(ui, state);
-                });
+            // Right: spectrum plot + controls
+            ui.vertical(|ui| {
+                preview_spectrum_panel(ui, state);
             });
         });
+    });
 }
 
 fn preview_image_panel(ui: &mut egui::Ui, state: &mut AppState) {
@@ -360,70 +350,59 @@ fn preview_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
 // ---- Analysis Mode Cards ----
 
 fn analysis_mode_cards(ui: &mut egui::Ui, state: &mut AppState) {
-    egui::Frame::group(ui.style())
-        .inner_margin(egui::Margin::same(12))
-        .show(ui, |ui| {
-            ui.label(egui::RichText::new("Analysis Mode").strong());
-            ui.add_space(4.0);
+    design::card_with_header(ui, "Analysis Mode", None, |ui| {
+        ui.horizontal(|ui| {
+            mode_card(
+                ui,
+                &mut state.analysis_mode,
+                AnalysisMode::FullSpatialMap,
+                "Full Spatial Map",
+                "Fit every pixel independently.",
+            );
+            mode_card(
+                ui,
+                &mut state.analysis_mode,
+                AnalysisMode::RoiSingleSpectrum,
+                "ROI \u{2192} Single Spectrum",
+                "Average ROI, fit once.",
+            );
 
-            ui.horizontal(|ui| {
-                mode_card(
-                    ui,
-                    &mut state.analysis_mode,
-                    AnalysisMode::FullSpatialMap,
-                    "Full Spatial Map",
-                    "Fit every pixel independently.",
-                );
-                mode_card(
-                    ui,
-                    &mut state.analysis_mode,
-                    AnalysisMode::RoiSingleSpectrum,
-                    "ROI \u{2192} Single Spectrum",
-                    "Average ROI, fit once.",
-                );
-
-                // Spatial binning card with dropdown
-                let is_binning = matches!(state.analysis_mode, AnalysisMode::SpatialBinning(_));
-                let stroke = if is_binning {
-                    egui::Stroke::new(2.0, ui.visuals().selection.bg_fill)
-                } else {
-                    ui.visuals().widgets.noninteractive.bg_stroke
-                };
-                egui::Frame::group(ui.style())
-                    .stroke(stroke)
-                    .inner_margin(egui::Margin::same(8))
-                    .show(ui, |ui| {
-                        if ui.selectable_label(is_binning, "Spatial Binning").clicked()
-                            && !is_binning
-                        {
-                            state.analysis_mode = AnalysisMode::SpatialBinning(2);
-                        }
-                        ui.label(
-                            egui::RichText::new("Bin NxN pixels, fit map.")
-                                .small()
-                                .weak(),
-                        );
-                        if is_binning {
-                            let mut bin_size = match state.analysis_mode {
-                                AnalysisMode::SpatialBinning(n) => n,
-                                _ => 2,
-                            };
-                            egui::ComboBox::from_id_salt("bin_size")
-                                .selected_text(format!("{}x{}", bin_size, bin_size))
-                                .show_ui(ui, |ui| {
-                                    for &n in &[2u8, 4, 8] {
-                                        ui.selectable_value(
-                                            &mut bin_size,
-                                            n,
-                                            format!("{}x{}", n, n),
-                                        );
-                                    }
-                                });
-                            state.analysis_mode = AnalysisMode::SpatialBinning(bin_size);
-                        }
-                    });
-            });
+            // Spatial binning card with dropdown
+            let is_binning = matches!(state.analysis_mode, AnalysisMode::SpatialBinning(_));
+            let stroke = if is_binning {
+                egui::Stroke::new(2.0, ui.visuals().selection.bg_fill)
+            } else {
+                ui.visuals().widgets.noninteractive.bg_stroke
+            };
+            egui::Frame::group(ui.style())
+                .stroke(stroke)
+                .inner_margin(egui::Margin::same(8))
+                .show(ui, |ui| {
+                    if ui.selectable_label(is_binning, "Spatial Binning").clicked() && !is_binning {
+                        state.analysis_mode = AnalysisMode::SpatialBinning(2);
+                    }
+                    ui.label(
+                        egui::RichText::new("Bin NxN pixels, fit map.")
+                            .small()
+                            .weak(),
+                    );
+                    if is_binning {
+                        let mut bin_size = match state.analysis_mode {
+                            AnalysisMode::SpatialBinning(n) => n,
+                            _ => 2,
+                        };
+                        egui::ComboBox::from_id_salt("bin_size")
+                            .selected_text(format!("{}x{}", bin_size, bin_size))
+                            .show_ui(ui, |ui| {
+                                for &n in &[2u8, 4, 8] {
+                                    ui.selectable_value(&mut bin_size, n, format!("{}x{}", n, n));
+                                }
+                            });
+                        state.analysis_mode = AnalysisMode::SpatialBinning(bin_size);
+                    }
+                });
         });
+    });
 }
 
 fn mode_card(

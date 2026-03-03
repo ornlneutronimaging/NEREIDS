@@ -1,34 +1,34 @@
 //! Step 1: Data loading — multi-format TIFF + spectrum file input.
 
 use crate::state::{AppState, InputMode, ProvenanceEventKind};
+use crate::widgets::design;
 use ndarray::Axis;
+
+const INPUT_MODE_LABELS: [&str; 4] = [
+    "TIFF Pair + Spectrum",
+    "Transmission TIFF",
+    "HDF5 Histogram",
+    "HDF5 Event",
+];
+
+const INPUT_MODES: [InputMode; 4] = [
+    InputMode::TiffPair,
+    InputMode::TransmissionTiff,
+    InputMode::Hdf5Histogram,
+    InputMode::Hdf5Event,
+];
 
 /// Draw the Load step content.
 pub fn load_step(ui: &mut egui::Ui, state: &mut AppState) {
-    ui.heading("Load Data");
-    ui.separator();
+    design::content_header(ui, "Load Data", "Select input format and load files");
 
     // Input mode tabs — invalidate results when switching modes
-    let prev_mode = state.input_mode;
-    ui.horizontal(|ui| {
-        ui.selectable_value(
-            &mut state.input_mode,
-            InputMode::TiffPair,
-            "TIFF Pair + Spectrum",
-        );
-        ui.selectable_value(
-            &mut state.input_mode,
-            InputMode::TransmissionTiff,
-            "Transmission TIFF",
-        );
-        ui.selectable_value(
-            &mut state.input_mode,
-            InputMode::Hdf5Histogram,
-            "HDF5 Histogram",
-        );
-        ui.selectable_value(&mut state.input_mode, InputMode::Hdf5Event, "HDF5 Event");
-    });
-    if state.input_mode != prev_mode {
+    let mut tab_idx = INPUT_MODES
+        .iter()
+        .position(|&m| m == state.input_mode)
+        .unwrap_or(0);
+    if design::underline_tabs(ui, &INPUT_MODE_LABELS, &mut tab_idx) {
+        state.input_mode = INPUT_MODES[tab_idx];
         state.invalidate_results();
         state.sample_data = None;
         state.open_beam_data = None;
