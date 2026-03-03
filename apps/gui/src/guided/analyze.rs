@@ -8,6 +8,7 @@
 use crate::state::{
     AppState, GuidedStep, InputMode, IsotopeEntry, RoiSelection, SolverMethod, SpectrumAxis,
 };
+use crate::widgets::design::{self, NavAction};
 use crate::widgets::image_view::{show_viridis_image, show_viridis_image_with_roi};
 use egui_plot::{Line, Plot, PlotPoints, VLine};
 use ndarray::Axis;
@@ -96,6 +97,20 @@ pub fn analyze_step(ui: &mut egui::Ui, state: &mut AppState) {
             },
         );
     });
+
+    // -- Navigation --
+    let can_continue = state.spatial_result.is_some() || state.pixel_fit_result.is_some();
+    match design::nav_buttons(
+        ui,
+        Some("\u{2190} Back"),
+        "Results \u{2192}",
+        can_continue,
+        "Run analysis to continue",
+    ) {
+        NavAction::Back => state.guided_step = GuidedStep::Normalize,
+        NavAction::Continue => state.guided_step = GuidedStep::Results,
+        NavAction::None => {}
+    }
 }
 
 // ---- Fit Controls ----
