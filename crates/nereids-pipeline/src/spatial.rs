@@ -6,7 +6,7 @@
 use ndarray::{Array2, Array3, ArrayView3, s};
 use rayon::prelude::*;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use nereids_physics::transmission::{InstrumentParams, broadened_cross_sections};
 
@@ -41,6 +41,9 @@ pub struct SpatialResult {
 /// * `cancel` — Optional cancellation token. When set to `true`, in-flight
 ///   rayon tasks finish but no new pixels are started. The function returns
 ///   `Err(PipelineError::Cancelled)`.
+/// * `progress` — Optional pixel completion counter. Incremented after each
+///   pixel finishes (whether successful or not). Callers can poll this from
+///   another thread to display a progress bar.
 ///
 /// # Cancellation semantics
 /// If cancellation occurs mid-flight, pixels that already completed are
@@ -62,6 +65,7 @@ pub fn spatial_map(
     config: &FitConfig,
     dead_pixels: Option<&Array2<bool>>,
     cancel: Option<&AtomicBool>,
+    progress: Option<&AtomicUsize>,
 ) -> Result<SpatialResult, PipelineError> {
     let shape = transmission.shape();
     let (n_energies, height, width) = (shape[0], shape[1], shape[2]);
@@ -215,10 +219,14 @@ pub fn spatial_map(
             // Config-level validation has passed up-front, so per-pixel
             // fit failures should be extremely rare (numerical edge cases
             // only).  Use an explicit match to make the skip intent clear.
-            match fit_spectrum(&t_spectrum, &sigma, &fast_config) {
+            let out = match fit_spectrum(&t_spectrum, &sigma, &fast_config) {
                 Ok(result) => Some(((y, x), result)),
                 Err(_) => None, // per-pixel fit failure; skip pixel
+            };
+            if let Some(p) = progress {
+                p.fetch_add(1, Ordering::Relaxed);
             }
+            out
         })
         .collect();
 
@@ -421,8 +429,15 @@ mod tests {
         )
         .unwrap();
 
-        let result =
-            spatial_map(transmission.view(), uncertainty.view(), &config, None, None).unwrap();
+        let result = spatial_map(
+            transmission.view(),
+            uncertainty.view(),
+            &config,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(result.n_total, 9);
         assert_eq!(result.n_converged, 9);
@@ -495,6 +510,7 @@ mod tests {
             &config,
             Some(&dead),
             None,
+            None,
         )
         .unwrap();
 
@@ -519,7 +535,14 @@ mod tests {
         let transmission = Array3::from_elem((3, 2, 2), 0.5);
         let uncertainty = Array3::from_elem((3, 2, 3), 0.01); // different width
 
-        let result = spatial_map(transmission.view(), uncertainty.view(), &config, None, None);
+        let result = spatial_map(
+            transmission.view(),
+            uncertainty.view(),
+            &config,
+            None,
+            None,
+            None,
+        );
         assert!(result.is_err());
     }
 
@@ -546,6 +569,7 @@ mod tests {
             uncertainty.view(),
             &config,
             Some(&dead),
+            None,
             None,
         );
         assert!(result.is_err());

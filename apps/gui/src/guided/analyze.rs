@@ -874,6 +874,7 @@ pub fn run_spatial_map(state: &mut AppState) {
             &config,
             dead_pixels.as_ref(),
             Some(&cancel),
+            None,
         );
         match result {
             Ok(r) => {
