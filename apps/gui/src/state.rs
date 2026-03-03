@@ -332,6 +332,10 @@ pub struct AppState {
 
     // -- Studio mode --
     pub studio_selected_tile: usize,
+    pub studio_tool: StudioTool,
+
+    // -- Progress --
+    pub fitting_progress: Option<(usize, usize)>,
 
     // -- Provenance --
     pub provenance_log: Vec<ProvenanceEvent>,
@@ -376,6 +380,27 @@ pub enum Tab {
 pub enum UiMode {
     Guided,
     Studio,
+}
+
+/// Studio interaction tool (toolbar selection).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StudioTool {
+    #[default]
+    Select,
+    Roi,
+    Probe,
+    Zoom,
+}
+
+impl StudioTool {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Select => "Sel",
+            Self::Roi => "ROI",
+            Self::Probe => "Prb",
+            Self::Zoom => "Zm",
+        }
+    }
 }
 
 /// Step within the Guided workflow.
@@ -448,6 +473,7 @@ impl AppState {
         self.pending_fm_endf = None;
         self.pending_detect_endf = None;
         self.is_fitting = false;
+        self.fitting_progress = None;
         self.is_fetching_endf = false;
         self.is_fetching_fm_endf = false;
         self.is_fetching_detect_endf = false;
@@ -597,6 +623,8 @@ impl Default for AppState {
             hdf5_tree: None,
 
             studio_selected_tile: 0,
+            studio_tool: StudioTool::Select,
+            fitting_progress: None,
 
             provenance_log: Vec::new(),
             tile_display: Vec::new(),

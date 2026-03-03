@@ -1,12 +1,12 @@
-//! Design system widgets: cards, underline tabs, badges, content headers.
+//! Design system widgets: cards, underline tabs, badges, buttons, drop zones.
 //!
 //! Theme-aware widgets resolve colors from the egui context (`ThemeColors`)
 //! or from `semantic` constants.
 //! Prototype reference: `.prototypes/D_hybrid_v4.html` CSS §Cards & Forms,
-//! §Tabs, §Badges, §Content Area.
+//! §Tabs, §Badges, §Content Area, §Toolbar, §Drop Zones.
 
 use crate::theme::{ThemeColors, semantic};
-use egui::{Color32, CornerRadius, Margin, RichText, Sense, Shadow, Stroke, Ui};
+use egui::{Color32, CornerRadius, Margin, Rect, Response, RichText, Sense, Shadow, Stroke, Ui};
 
 // ── Content Header ──────────────────────────────────────────────
 
@@ -156,4 +156,138 @@ pub fn badge(ui: &mut Ui, text: &str, variant: BadgeVariant) {
         .show(ui, |ui| {
             ui.label(RichText::new(text).size(10.0).color(fg).strong());
         });
+}
+
+// ── Buttons ─────────────────────────────────────────────────────
+
+/// Accent-filled action button: white bold text on accent background.
+///
+/// Prototype: `.btn-action { background: var(--accent); color: white;
+///   border-radius: 6px; font-size: 11px; font-weight: 600; }`
+pub fn btn_primary(ui: &mut Ui, text: &str) -> Response {
+    let tc = ThemeColors::from_ctx(ui.ctx());
+    ui.add(
+        egui::Button::new(
+            RichText::new(text)
+                .size(11.0)
+                .strong()
+                .color(Color32::WHITE),
+        )
+        .fill(tc.accent)
+        .corner_radius(CornerRadius::same(6)),
+    )
+}
+
+/// Small icon/label button for toolbars. Active state gets accent fill.
+///
+/// Prototype: `.tool-btn { background: var(--bg2); border: 1px solid var(--border); }`
+///            `.tool-btn.active { background: var(--accent); color: white; }`
+pub fn btn_icon(ui: &mut Ui, label: &str, active: bool) -> Response {
+    let tc = ThemeColors::from_ctx(ui.ctx());
+    let (fill, text_color, stroke) = if active {
+        (tc.accent, Color32::WHITE, Stroke::NONE)
+    } else {
+        (tc.bg2, tc.fg2, Stroke::new(1.0, tc.border))
+    };
+    ui.add(
+        egui::Button::new(RichText::new(label).size(11.0).strong().color(text_color))
+            .fill(fill)
+            .stroke(stroke)
+            .corner_radius(CornerRadius::same(5)),
+    )
+}
+
+// ── Drop Zone ───────────────────────────────────────────────────
+
+/// Clickable file drop zone with loaded/unloaded visual states.
+///
+/// Returns a `Response` — callers check `.clicked()` to open a file dialog.
+///
+/// Prototype: `.drop-zone { border: 2px dashed var(--border); border-radius: 10px; }`
+/// Note: egui renders a solid border as an approximation (no native dashed support).
+///            `.drop-zone.loaded { border-style: solid; border-color: var(--green); }`
+pub fn drop_zone(ui: &mut Ui, loaded: bool, label: &str, hint: &str) -> Response {
+    let tc = ThemeColors::from_ctx(ui.ctx());
+    let height = 72.0;
+    let width = ui.available_width();
+
+    let (response, painter) = ui.allocate_painter(egui::Vec2::new(width, height), Sense::click());
+    let rect = response.rect;
+
+    let (border_color, border_width, fill) = if loaded {
+        (
+            semantic::GREEN,
+            2.0,
+            Color32::from_rgba_unmultiplied(
+                semantic::GREEN.r(),
+                semantic::GREEN.g(),
+                semantic::GREEN.b(),
+                13,
+            ),
+        )
+    } else {
+        (tc.fg3, 1.5, Color32::TRANSPARENT)
+    };
+
+    // Background + border
+    painter.rect_filled(rect, CornerRadius::same(10), fill);
+    painter.rect_stroke(
+        rect,
+        CornerRadius::same(10),
+        Stroke::new(border_width, border_color),
+        egui::StrokeKind::Inside,
+    );
+
+    // Label text (centered)
+    let label_color = if loaded { semantic::GREEN } else { tc.fg2 };
+    let label_y = rect.center().y - 6.0;
+    painter.text(
+        egui::pos2(rect.center().x, label_y),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::proportional(13.0),
+        label_color,
+    );
+
+    // Hint text (below label)
+    if !hint.is_empty() {
+        painter.text(
+            egui::pos2(rect.center().x, label_y + 16.0),
+            egui::Align2::CENTER_CENTER,
+            hint,
+            egui::FontId::proportional(10.0),
+            tc.fg3,
+        );
+    }
+
+    response
+}
+
+// ── Progress Mini ───────────────────────────────────────────────
+
+/// Compact progress bar (80×3px) + text label for toolbar display.
+///
+/// Prototype: `.progress-bar-sm { width: 80px; height: 3px; }`
+pub fn progress_mini(ui: &mut Ui, fraction: f32, text: &str) {
+    let tc = ThemeColors::from_ctx(ui.ctx());
+    let bar_width = 80.0_f32;
+    let bar_height = 3.0_f32;
+
+    ui.horizontal(|ui| {
+        let (rect, _) =
+            ui.allocate_exact_size(egui::Vec2::new(bar_width, bar_height), Sense::hover());
+        let painter = ui.painter();
+
+        // Background track
+        painter.rect_filled(rect, CornerRadius::same(2), tc.bg3);
+
+        // Fill
+        let fill_width = bar_width * fraction.clamp(0.0, 1.0);
+        if fill_width > 0.0 {
+            let fill_rect = Rect::from_min_size(rect.min, egui::Vec2::new(fill_width, bar_height));
+            painter.rect_filled(fill_rect, CornerRadius::same(2), tc.accent);
+        }
+
+        ui.label(RichText::new(text).size(10.0).color(tc.fg3));
+    });
 }

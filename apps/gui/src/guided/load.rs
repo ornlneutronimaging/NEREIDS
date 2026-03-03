@@ -1,6 +1,10 @@
 //! Step 1: Data loading — multi-format TIFF + spectrum file input.
+//!
+//! Prototype: `.content-area` → cards with drop zones, auto-load,
+//! format hints, and a Continue button with data guard.
 
-use crate::state::{AppState, InputMode, ProvenanceEventKind};
+use crate::state::{AppState, GuidedStep, InputMode, ProvenanceEventKind};
+use crate::theme::ThemeColors;
 use crate::widgets::design;
 use ndarray::Axis;
 
@@ -20,6 +24,7 @@ const INPUT_MODES: [InputMode; 4] = [
 
 /// Draw the Load step content.
 pub fn load_step(ui: &mut egui::Ui, state: &mut AppState) {
+    let tc = ThemeColors::from_ctx(ui.ctx());
     design::content_header(ui, "Load Data", "Select input format and load files");
 
     // Input mode tabs — invalidate results when switching modes
@@ -42,38 +47,86 @@ pub fn load_step(ui: &mut egui::Ui, state: &mut AppState) {
         InputMode::Hdf5Histogram => hdf5_histogram_tab(ui, state),
         InputMode::Hdf5Event => hdf5_event_tab(ui, state),
     }
+
+    // ── Continue button ────────────────────────────────────────
+    ui.add_space(12.0);
+    let can_continue = has_required_data(state);
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+        ui.add_enabled_ui(can_continue, |ui| {
+            if design::btn_primary(ui, "Continue \u{2192}").clicked() {
+                state.guided_step = GuidedStep::Configure;
+            }
+        });
+        if !can_continue {
+            ui.label(
+                egui::RichText::new("Load data to continue")
+                    .size(10.0)
+                    .color(tc.fg3),
+            );
+        }
+    });
 }
 
-/// TIFF Pair tab: Sample + Open Beam + Spectrum file.
+/// Check whether the minimum data for this input mode is loaded.
+fn has_required_data(state: &AppState) -> bool {
+    match state.input_mode {
+        InputMode::TiffPair => {
+            state.sample_data.is_some()
+                && state.open_beam_data.is_some()
+                && state.spectrum_values.is_some()
+        }
+        InputMode::TransmissionTiff => {
+            state.sample_data.is_some() && state.spectrum_values.is_some()
+        }
+        InputMode::Hdf5Histogram | InputMode::Hdf5Event => {
+            state.sample_data.is_some() && state.spectrum_values.is_some()
+        }
+    }
+}
+
+// ── TIFF Pair tab ──────────────────────────────────────────────
+
+/// TIFF Pair tab: Sample + Open Beam drop zones + Spectrum.
 fn tiff_pair_tab(ui: &mut egui::Ui, state: &mut AppState) {
-    if tiff_browse_row(ui, "Sample", &mut state.sample_path) {
-        state.sample_data = None;
-        state.normalized = None;
-        state.dead_pixels = None;
-        state.energies = None;
-        state.pixel_fit_result = None;
-        state.spatial_result = None;
-    }
-    if tiff_browse_row(ui, "Open Beam", &mut state.open_beam_path) {
-        state.open_beam_data = None;
-        state.normalized = None;
-        state.dead_pixels = None;
-        state.energies = None;
-        state.pixel_fit_result = None;
-        state.spatial_result = None;
-    }
+    design::card(ui, |ui| {
+        ui.label(
+            egui::RichText::new("Load raw sample + open beam TIFF stacks with TOF spectrum.")
+                .size(10.0)
+                .color(ThemeColors::from_ctx(ui.ctx()).fg3),
+        );
+        ui.add_space(8.0);
 
-    ui.add_space(8.0);
-    spectrum_input_section(ui, state);
+        let sample_changed = tiff_drop_zone(ui, "Sample", &mut state.sample_path);
+        if sample_changed {
+            state.sample_data = None;
+            state.normalized = None;
+            state.dead_pixels = None;
+            state.energies = None;
+            state.pixel_fit_result = None;
+            state.spatial_result = None;
+        }
 
-    ui.add_space(8.0);
+        ui.add_space(6.0);
+        let ob_changed = tiff_drop_zone(ui, "Open Beam", &mut state.open_beam_path);
+        if ob_changed {
+            state.open_beam_data = None;
+            state.normalized = None;
+            state.dead_pixels = None;
+            state.energies = None;
+            state.pixel_fit_result = None;
+            state.spatial_result = None;
+        }
 
-    // Load button
+        ui.add_space(8.0);
+        spectrum_section(ui, state);
+    });
+
     let can_load = state.sample_path.is_some()
         && state.open_beam_path.is_some()
         && state.spectrum_path.is_some();
+    ui.add_space(8.0);
     ui.add_enabled_ui(can_load, |ui| {
-        if ui.button("Load All").clicked() {
+        if design::btn_primary(ui, "Load All").clicked() {
             load_all_data(state);
         }
     });
@@ -81,26 +134,36 @@ fn tiff_pair_tab(ui: &mut egui::Ui, state: &mut AppState) {
     show_loaded_info(ui, state);
 }
 
-/// Transmission TIFF tab: pre-normalized TIFF + Spectrum file.
+// ── Transmission TIFF tab ──────────────────────────────────────
+
+/// Transmission TIFF tab: pre-normalized TIFF + Spectrum.
 fn transmission_tiff_tab(ui: &mut egui::Ui, state: &mut AppState) {
-    if tiff_browse_row(ui, "Transmission", &mut state.sample_path) {
-        state.sample_data = None;
-        state.normalized = None;
-        state.dead_pixels = None;
-        state.energies = None;
-        state.pixel_fit_result = None;
-        state.spatial_result = None;
-    }
+    design::card(ui, |ui| {
+        ui.label(
+            egui::RichText::new("Load pre-normalized transmission TIFF stack with TOF spectrum.")
+                .size(10.0)
+                .color(ThemeColors::from_ctx(ui.ctx()).fg3),
+        );
+        ui.add_space(8.0);
 
-    ui.add_space(8.0);
-    spectrum_input_section(ui, state);
+        let changed = tiff_drop_zone(ui, "Transmission", &mut state.sample_path);
+        if changed {
+            state.sample_data = None;
+            state.normalized = None;
+            state.dead_pixels = None;
+            state.energies = None;
+            state.pixel_fit_result = None;
+            state.spatial_result = None;
+        }
 
-    ui.add_space(8.0);
+        ui.add_space(8.0);
+        spectrum_section(ui, state);
+    });
 
-    // Load button
     let can_load = state.sample_path.is_some() && state.spectrum_path.is_some();
+    ui.add_space(8.0);
     ui.add_enabled_ui(can_load, |ui| {
-        if ui.button("Load All").clicked() {
+        if design::btn_primary(ui, "Load All").clicked() {
             load_all_data(state);
         }
     });
@@ -108,151 +171,135 @@ fn transmission_tiff_tab(ui: &mut egui::Ui, state: &mut AppState) {
     show_loaded_info(ui, state);
 }
 
-/// A TIFF browse row with both "Browse Folder..." and "File..." buttons.
-///
-/// Returns `true` if the user selected a new path (callers should invalidate
-/// dependent state).
-fn tiff_browse_row(ui: &mut egui::Ui, label: &str, path: &mut Option<std::path::PathBuf>) -> bool {
-    let mut changed = false;
-    ui.horizontal(|ui| {
-        ui.label(format!("{}:", label));
-        match path.as_ref() {
-            Some(p) => {
-                let kind = if p.is_file() { "file" } else { "dir" };
-                let name = p
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
-                ui.label(format!("[{}] {}", kind, name));
-            }
-            None => {
-                ui.label("(none)");
-            }
-        }
+// ── Drop zone + folder fallback ────────────────────────────────
 
-        if ui.button("Browse Folder...").clicked()
-            && let Some(dir) = rfd::FileDialog::new().pick_folder()
-        {
-            *path = Some(dir);
-            changed = true;
-        }
-        if ui.small_button("File...").clicked()
-            && let Some(file) = rfd::FileDialog::new()
-                .add_filter("TIFF", &["tif", "tiff"])
-                .pick_file()
-        {
-            *path = Some(file);
-            changed = true;
-        }
-    });
+/// TIFF drop zone: click-to-browse file, with "or browse folder" link below.
+///
+/// Returns `true` if the user selected a new path.
+fn tiff_drop_zone(ui: &mut egui::Ui, label: &str, path: &mut Option<std::path::PathBuf>) -> bool {
+    let loaded = path.is_some();
+    let display = path
+        .as_ref()
+        .map_or(format!("Click to select {label}..."), |p| {
+            p.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string()
+        });
+    let hint = "TIFF file or folder of TIFFs";
+
+    let resp = design::drop_zone(ui, loaded, &display, hint);
+    let mut changed = false;
+    if resp.clicked()
+        && let Some(f) = rfd::FileDialog::new()
+            .add_filter("TIFF", &["tif", "tiff"])
+            .pick_file()
+    {
+        *path = Some(f);
+        changed = true;
+    }
+    // Secondary: folder browse
+    if ui.small_button("or browse folder\u{2026}").clicked()
+        && let Some(d) = rfd::FileDialog::new().pick_folder()
+    {
+        *path = Some(d);
+        changed = true;
+    }
     changed
 }
 
-/// Spectrum file input section: browse, unit selector, value kind selector.
-fn spectrum_input_section(ui: &mut egui::Ui, state: &mut AppState) {
+// ── Spectrum section ───────────────────────────────────────────
+
+/// Simplified spectrum file section: drop zone, no unit/kind toggles.
+fn spectrum_section(ui: &mut egui::Ui, state: &mut AppState) {
     ui.label(egui::RichText::new("Spectrum File").strong());
 
-    ui.horizontal(|ui| {
-        ui.label("File:");
-        if let Some(ref p) = state.spectrum_path {
-            ui.label(
+    let loaded = state.spectrum_path.is_some();
+    let display =
+        state
+            .spectrum_path
+            .as_ref()
+            .map_or("Click to select spectrum file...".to_string(), |p| {
                 p.file_name()
                     .unwrap_or_default()
                     .to_string_lossy()
-                    .to_string(),
-            );
-        } else {
-            ui.label("(none)");
-        }
-        if ui.button("Browse...").clicked()
-            && let Some(file) = rfd::FileDialog::new()
-                .add_filter("Spectrum", &["csv", "txt", "dat"])
-                .pick_file()
-        {
-            state.spectrum_path = Some(file);
-            state.spectrum_values = None;
-            state.energies = None;
-            state.normalized = None;
-        }
-    });
-
-    let prev_unit = state.spectrum_unit;
-    ui.horizontal(|ui| {
-        ui.label("Values are:");
-        ui.selectable_value(
-            &mut state.spectrum_unit,
-            nereids_io::spectrum::SpectrumUnit::TofMicroseconds,
-            "TOF (\u{03bc}s)",
-        );
-        ui.selectable_value(
-            &mut state.spectrum_unit,
-            nereids_io::spectrum::SpectrumUnit::EnergyEv,
-            "Energy (eV)",
-        );
-    });
-
-    let prev_kind = state.spectrum_kind;
-    ui.horizontal(|ui| {
-        ui.label("Value type:");
-        ui.selectable_value(
-            &mut state.spectrum_kind,
-            nereids_io::spectrum::SpectrumValueKind::BinEdges,
-            "Bin edges",
-        );
-        ui.selectable_value(
-            &mut state.spectrum_kind,
-            nereids_io::spectrum::SpectrumValueKind::BinCenters,
-            "Bin centers",
-        );
-    });
-
-    // Invalidate derived data when unit/kind settings change
-    let kind_changed = state.spectrum_kind != prev_kind;
-    if state.spectrum_unit != prev_unit || kind_changed {
+                    .to_string()
+            });
+    let resp = design::drop_zone(
+        ui,
+        loaded,
+        &display,
+        "CSV/TXT/DAT with TOF bin edges or centers",
+    );
+    if resp.clicked()
+        && let Some(f) = rfd::FileDialog::new()
+            .add_filter("Spectrum", &["csv", "txt", "dat"])
+            .pick_file()
+    {
+        state.spectrum_path = Some(f);
+        state.spectrum_values = None;
         state.energies = None;
         state.normalized = None;
     }
-    // Changing edges↔centers alters the expected value count vs frame count,
-    // so previously loaded spectrum values may no longer be valid.
-    if kind_changed {
-        state.spectrum_values = None;
-    }
 
+    // Show parsed info (no unit/kind toggles — auto-detected in load_all_data)
     if let Some(ref vals) = state.spectrum_values {
-        ui.label(format!(
-            "Parsed: {} values, range [{:.2}, {:.2}]",
-            vals.len(),
-            vals.first().copied().unwrap_or(0.0),
-            vals.last().copied().unwrap_or(0.0),
-        ));
+        ui.label(
+            egui::RichText::new(format!("Parsed: {} values", vals.len()))
+                .size(10.0)
+                .color(ThemeColors::from_ctx(ui.ctx()).fg3),
+        );
     }
 }
+
+// ── Loaded info ────────────────────────────────────────────────
 
 /// Display loaded data info.
 fn show_loaded_info(ui: &mut egui::Ui, state: &AppState) {
+    let tc = ThemeColors::from_ctx(ui.ctx());
+    if state.sample_data.is_none() && state.open_beam_data.is_none() {
+        return;
+    }
     ui.add_space(8.0);
     if let Some(ref data) = state.sample_data {
         let shape = data.shape();
-        ui.label(format!(
-            "Sample: {} frames, {}×{} px",
-            shape[0], shape[1], shape[2]
-        ));
+        ui.label(
+            egui::RichText::new(format!(
+                "\u{2713} Sample: {} frames, {}×{} px",
+                shape[0], shape[1], shape[2]
+            ))
+            .size(11.0)
+            .color(tc.fg2),
+        );
     }
     if let Some(ref data) = state.open_beam_data {
         let shape = data.shape();
-        ui.label(format!(
-            "Open Beam: {} frames, {}×{} px",
-            shape[0], shape[1], shape[2]
-        ));
+        ui.label(
+            egui::RichText::new(format!(
+                "\u{2713} Open Beam: {} frames, {}×{} px",
+                shape[0], shape[1], shape[2]
+            ))
+            .size(11.0)
+            .color(tc.fg2),
+        );
     }
 }
 
+// ── HDF5 Histogram tab ────────────────────────────────────────
+
 /// HDF5 Histogram tab: load pre-histogrammed NeXus data.
 fn hdf5_histogram_tab(ui: &mut egui::Ui, state: &mut AppState) {
-    ui.label("Browse for a NeXus/HDF5 file containing histogram data.");
-    hdf5_browse_row(ui, state);
-    show_nexus_metadata(ui, state);
+    design::card(ui, |ui| {
+        ui.label(
+            egui::RichText::new("Load pre-histogrammed NeXus/HDF5 data.")
+                .size(10.0)
+                .color(ThemeColors::from_ctx(ui.ctx()).fg3),
+        );
+        ui.add_space(8.0);
+        hdf5_drop_zone(ui, state);
+        show_nexus_metadata(ui, state);
+    });
+
     show_hdf5_tree(ui, state);
 
     if state.hdf5_path.is_some()
@@ -270,124 +317,193 @@ fn hdf5_histogram_tab(ui: &mut egui::Ui, state: &mut AppState) {
     show_loaded_info(ui, state);
 }
 
+// ── HDF5 Event tab ─────────────────────────────────────────────
+
 /// HDF5 Event tab: load raw neutron events and histogram them.
 fn hdf5_event_tab(ui: &mut egui::Ui, state: &mut AppState) {
-    ui.label("Browse for a NeXus/HDF5 file containing neutron event data.");
-    hdf5_browse_row(ui, state);
-    show_nexus_metadata(ui, state);
+    design::card(ui, |ui| {
+        ui.label(
+            egui::RichText::new("Load raw neutron events from NeXus/HDF5 and histogram them.")
+                .size(10.0)
+                .color(ThemeColors::from_ctx(ui.ctx()).fg3),
+        );
+        ui.add_space(8.0);
+        hdf5_drop_zone(ui, state);
+        show_nexus_metadata(ui, state);
+    });
+
     show_hdf5_tree(ui, state);
 
     if state.hdf5_path.is_some() && state.nexus_metadata.as_ref().is_some_and(|m| m.has_events) {
-        ui.add_space(8.0);
-        ui.label(egui::RichText::new("Event Binning Parameters").strong());
-        ui.horizontal(|ui| {
-            ui.label("TOF bins:");
-            ui.add(egui::DragValue::new(&mut state.event_n_bins).range(1..=10000));
-        });
-        ui.horizontal(|ui| {
-            ui.label("TOF min (µs):");
-            ui.add(egui::DragValue::new(&mut state.event_tof_min_us).speed(10.0));
-        });
-        ui.horizontal(|ui| {
-            ui.label("TOF max (µs):");
-            ui.add(egui::DragValue::new(&mut state.event_tof_max_us).speed(10.0));
-        });
-        ui.horizontal(|ui| {
-            ui.label("Height (px):");
-            ui.add(egui::DragValue::new(&mut state.event_height).range(1..=4096));
-        });
-        ui.horizontal(|ui| {
-            ui.label("Width (px):");
-            ui.add(egui::DragValue::new(&mut state.event_width).range(1..=4096));
-        });
+        design::card_with_header(ui, "Binning Parameters", None, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("TOF bins:");
+                ui.add(egui::DragValue::new(&mut state.event_n_bins).range(1..=10000));
+            });
+            ui.horizontal(|ui| {
+                ui.label("TOF min (\u{00B5}s):");
+                ui.add(egui::DragValue::new(&mut state.event_tof_min_us).speed(10.0));
+            });
+            ui.horizontal(|ui| {
+                ui.label("TOF max (\u{00B5}s):");
+                ui.add(egui::DragValue::new(&mut state.event_tof_max_us).speed(10.0));
+            });
+            ui.horizontal(|ui| {
+                ui.label("Height (px):");
+                ui.add(egui::DragValue::new(&mut state.event_height).range(1..=4096));
+            });
+            ui.horizontal(|ui| {
+                ui.label("Width (px):");
+                ui.add(egui::DragValue::new(&mut state.event_width).range(1..=4096));
+            });
 
-        ui.add_space(4.0);
-        if ui.button("Histogram Events").clicked() {
-            load_hdf5_events(state);
-        }
+            ui.add_space(4.0);
+            if ui.button("Histogram Events").clicked() {
+                load_hdf5_events(state);
+            }
+        });
     }
 
     show_loaded_info(ui, state);
 }
 
-/// HDF5 file browse row with probe.
-fn hdf5_browse_row(ui: &mut egui::Ui, state: &mut AppState) {
-    ui.horizontal(|ui| {
-        ui.label("File:");
-        if let Some(ref p) = state.hdf5_path {
-            ui.label(
+// ── HDF5 shared helpers ────────────────────────────────────────
+
+/// HDF5 file drop zone with auto-probe on selection.
+fn hdf5_drop_zone(ui: &mut egui::Ui, state: &mut AppState) {
+    let loaded = state.hdf5_path.is_some();
+    let display =
+        state
+            .hdf5_path
+            .as_ref()
+            .map_or("Click to select NeXus/HDF5 file...".to_string(), |p| {
                 p.file_name()
                     .unwrap_or_default()
                     .to_string_lossy()
-                    .to_string(),
-            );
-        } else {
-            ui.label("(none)");
-        }
-        if ui.button("Browse...").clicked()
-            && let Some(file) = rfd::FileDialog::new()
-                .add_filter("NeXus/HDF5", &["h5", "hdf5", "nxs", "nx5"])
-                .pick_file()
-        {
-            state.hdf5_path = Some(file.clone());
-            state.invalidate_results();
-            state.sample_data = None;
-            state.open_beam_data = None;
+                    .to_string()
+            });
+    let resp = design::drop_zone(ui, loaded, &display, "HDF5/NeXus (.h5, .hdf5, .nxs, .nx5)");
+    if resp.clicked()
+        && let Some(file) = rfd::FileDialog::new()
+            .add_filter("NeXus/HDF5", &["h5", "hdf5", "nxs", "nx5"])
+            .pick_file()
+    {
+        state.hdf5_path = Some(file.clone());
+        state.invalidate_results();
+        state.sample_data = None;
+        state.open_beam_data = None;
 
-            // Probe the file immediately
-            match nereids_io::nexus::probe_nexus(&file) {
-                Ok(meta) => {
-                    // Auto-fill event binning from metadata if available
-                    if let Some(shape) = meta.histogram_shape {
-                        state.event_height = shape[1];
-                        state.event_width = shape[2];
-                    }
-                    state.nexus_metadata = Some(meta);
-                    state.status_message = "NeXus file probed".into();
+        // Probe the file immediately
+        match nereids_io::nexus::probe_nexus(&file) {
+            Ok(meta) => {
+                if let Some(shape) = meta.histogram_shape {
+                    state.event_height = shape[1];
+                    state.event_width = shape[2];
                 }
-                Err(e) => {
-                    state.nexus_metadata = None;
-                    state.status_message = format!("Probe failed: {e}");
-                }
+                state.nexus_metadata = Some(meta);
+                state.status_message = "NeXus file probed".into();
             }
-
-            // Build HDF5 tree structure for browser display
-            match nereids_io::nexus::list_hdf5_tree(&file, 3) {
-                Ok(tree) => state.hdf5_tree = Some(tree),
-                Err(_) => state.hdf5_tree = None,
+            Err(e) => {
+                state.nexus_metadata = None;
+                state.status_message = format!("Probe failed: {e}");
             }
         }
-    });
+
+        // Build HDF5 tree structure for browser display
+        match nereids_io::nexus::list_hdf5_tree(&file, 3) {
+            Ok(tree) => state.hdf5_tree = Some(tree),
+            Err(_) => state.hdf5_tree = None,
+        }
+    }
 }
 
 /// Display probed NeXus metadata.
 fn show_nexus_metadata(ui: &mut egui::Ui, state: &AppState) {
     if let Some(ref meta) = state.nexus_metadata {
+        let tc = ThemeColors::from_ctx(ui.ctx());
         ui.add_space(4.0);
         if meta.has_histogram {
             if let Some(shape) = meta.histogram_shape {
-                ui.label(format!(
-                    "Histogram: {}×{}×{} (rot×y×x), {} TOF bins",
-                    shape[0], shape[1], shape[2], shape[3]
-                ));
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Histogram: {}×{}×{} (rot×y×x), {} TOF bins",
+                        shape[0], shape[1], shape[2], shape[3]
+                    ))
+                    .size(11.0)
+                    .color(tc.fg2),
+                );
             }
         } else {
-            ui.label("No histogram data.");
+            ui.label(
+                egui::RichText::new("No histogram data.")
+                    .size(11.0)
+                    .color(tc.fg3),
+            );
         }
 
         if meta.has_events {
             if let Some(n) = meta.n_events {
-                ui.label(format!("Events: {} neutrons", n));
+                ui.label(
+                    egui::RichText::new(format!("Events: {} neutrons", n))
+                        .size(11.0)
+                        .color(tc.fg2),
+                );
             }
         } else {
-            ui.label("No event data.");
+            ui.label(
+                egui::RichText::new("No event data.")
+                    .size(11.0)
+                    .color(tc.fg3),
+            );
         }
 
         if let Some(fp) = meta.flight_path_m {
-            ui.label(format!("Flight path: {:.2} m", fp));
+            ui.label(
+                egui::RichText::new(format!("Flight path: {:.2} m", fp))
+                    .size(11.0)
+                    .color(tc.fg2),
+            );
         }
     }
 }
+
+/// Display the HDF5 file tree structure in a collapsing header.
+fn show_hdf5_tree(ui: &mut egui::Ui, state: &AppState) {
+    let tree = match state.hdf5_tree {
+        Some(ref t) if !t.is_empty() => t,
+        _ => return,
+    };
+
+    ui.add_space(4.0);
+    egui::CollapsingHeader::new("HDF5 Structure")
+        .default_open(false)
+        .show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .max_height(200.0)
+                .show(ui, |ui| {
+                    for entry in tree {
+                        let depth = entry.path.matches('/').count().saturating_sub(1);
+                        let indent = "  ".repeat(depth);
+                        let name = entry.path.rsplit('/').next().unwrap_or(&entry.path);
+                        let label = match entry.kind {
+                            nereids_io::nexus::Hdf5EntryKind::Group => {
+                                format!("{indent}[G] {name}")
+                            }
+                            nereids_io::nexus::Hdf5EntryKind::Dataset => {
+                                if let Some(ref shape) = entry.shape {
+                                    format!("{indent}[D] {name} {:?}", shape)
+                                } else {
+                                    format!("{indent}[D] {name}")
+                                }
+                            }
+                        };
+                        ui.label(egui::RichText::new(label).monospace().small());
+                    }
+                });
+        });
+}
+
+// ── Data loading logic ─────────────────────────────────────────
 
 /// Load histogram data from HDF5 file.
 fn load_hdf5_histogram(state: &mut AppState) {
@@ -407,12 +523,10 @@ fn load_hdf5_histogram(state: &mut AppState) {
                 shape[0], shape[1], shape[2]
             );
 
-            // Populate spectrum values from TOF edges
             state.spectrum_values = Some(data.tof_edges_us.clone());
             state.spectrum_unit = nereids_io::spectrum::SpectrumUnit::TofMicroseconds;
 
-            // Determine whether TOF values are bin edges or bin centers
-            let n_frames = data.counts.shape()[0]; // (tof, y, x)
+            let n_frames = data.counts.shape()[0];
             let n_tof_vals = data.tof_edges_us.len();
             state.spectrum_kind = if n_tof_vals == n_frames + 1 {
                 nereids_io::spectrum::SpectrumValueKind::BinEdges
@@ -420,7 +534,6 @@ fn load_hdf5_histogram(state: &mut AppState) {
                 nereids_io::spectrum::SpectrumValueKind::BinCenters
             };
 
-            // Set flight path if available and valid
             if let Some(fp) = data.flight_path_m
                 && fp.is_finite()
                 && fp > 0.0
@@ -428,7 +541,6 @@ fn load_hdf5_histogram(state: &mut AppState) {
                 state.beamline.flight_path_m = fp;
             }
 
-            // Apply TOF offset as beamline delay
             if let Some(offset_ns) = state.nexus_metadata.as_ref().and_then(|m| m.tof_offset_ns) {
                 let delay_us = offset_ns / 1000.0;
                 if delay_us.is_finite() {
@@ -482,12 +594,10 @@ fn load_hdf5_events(state: &mut AppState) {
                 shape[0], shape[1], shape[2]
             );
 
-            // Populate spectrum values from TOF edges
             state.spectrum_values = Some(data.tof_edges_us.clone());
             state.spectrum_unit = nereids_io::spectrum::SpectrumUnit::TofMicroseconds;
             state.spectrum_kind = nereids_io::spectrum::SpectrumValueKind::BinEdges;
 
-            // Set flight path if available and valid
             if let Some(fp) = data.flight_path_m
                 && fp.is_finite()
                 && fp > 0.0
@@ -495,7 +605,6 @@ fn load_hdf5_events(state: &mut AppState) {
                 state.beamline.flight_path_m = fp;
             }
 
-            // Apply TOF offset as beamline delay
             if let Some(offset_ns) = state.nexus_metadata.as_ref().and_then(|m| m.tof_offset_ns) {
                 let delay_us = offset_ns / 1000.0;
                 if delay_us.is_finite() {
@@ -523,43 +632,7 @@ fn load_hdf5_events(state: &mut AppState) {
     }
 }
 
-/// Display the HDF5 file tree structure in a collapsing header.
-fn show_hdf5_tree(ui: &mut egui::Ui, state: &AppState) {
-    let tree = match state.hdf5_tree {
-        Some(ref t) if !t.is_empty() => t,
-        _ => return,
-    };
-
-    ui.add_space(4.0);
-    egui::CollapsingHeader::new("HDF5 Structure")
-        .default_open(false)
-        .show(ui, |ui| {
-            egui::ScrollArea::vertical()
-                .max_height(200.0)
-                .show(ui, |ui| {
-                    for entry in tree {
-                        let depth = entry.path.matches('/').count().saturating_sub(1);
-                        let indent = "  ".repeat(depth);
-                        let name = entry.path.rsplit('/').next().unwrap_or(&entry.path);
-                        let label = match entry.kind {
-                            nereids_io::nexus::Hdf5EntryKind::Group => {
-                                format!("{indent}[G] {name}")
-                            }
-                            nereids_io::nexus::Hdf5EntryKind::Dataset => {
-                                if let Some(ref shape) = entry.shape {
-                                    format!("{indent}[D] {name} {:?}", shape)
-                                } else {
-                                    format!("{indent}[D] {name}")
-                                }
-                            }
-                        };
-                        ui.label(egui::RichText::new(label).monospace().small());
-                    }
-                });
-        });
-}
-
-/// Load all data: TIFF stacks + spectrum file with validation.
+/// Load all data: TIFF stacks + spectrum file with validation and auto-detect.
 fn load_all_data(state: &mut AppState) {
     state.invalidate_results();
 
@@ -597,6 +670,7 @@ fn load_all_data(state: &mut AppState) {
             }
             Err(e) => {
                 state.status_message = format!("Failed to load open beam: {}", e);
+                state.sample_data = None; // Clear partial data
                 return;
             }
         }
@@ -611,10 +685,12 @@ fn load_all_data(state: &mut AppState) {
             sample.shape()[0],
             ob.shape()[0]
         );
+        state.sample_data = None;
+        state.open_beam_data = None;
         return;
     }
 
-    // Parse spectrum file
+    // Parse spectrum file with auto-detect bin type
     if let Some(ref path) = state.spectrum_path {
         match nereids_io::spectrum::parse_spectrum_file(path) {
             Ok(values) => {
@@ -624,8 +700,24 @@ fn load_all_data(state: &mut AppState) {
                     return;
                 }
 
-                // Validate frame count compatibility
+                // Auto-detect bin type from frame count
                 let n_frames = state.sample_data.as_ref().map_or(0, |d| d.shape()[0]);
+                let n_values = values.len();
+                state.spectrum_kind = if n_values == n_frames + 1 {
+                    nereids_io::spectrum::SpectrumValueKind::BinEdges
+                } else if n_values == n_frames {
+                    nereids_io::spectrum::SpectrumValueKind::BinCenters
+                } else {
+                    state.status_message = format!(
+                        "Warning: spectrum has {n_values} values, data has {n_frames} frames"
+                    );
+                    nereids_io::spectrum::SpectrumValueKind::BinEdges
+                };
+
+                // Default to TOF microseconds
+                state.spectrum_unit = nereids_io::spectrum::SpectrumUnit::TofMicroseconds;
+
+                // Validate with auto-detected kind
                 if let Err(e) = nereids_io::spectrum::validate_spectrum_frame_count(
                     values.len(),
                     n_frames,
