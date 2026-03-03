@@ -1,7 +1,10 @@
-//! Top toolbar: logo, mode toggle, progress, actions, theme selector.
+//! Top toolbar: logo, mode toggle, studio tools, progress, home, theme.
+//!
+//! Prototype: `.top-toolbar { height: 48px; backdrop-filter: blur(20px); }`
 
-use crate::state::{AppState, ThemePreference, UiMode};
-use crate::theme::{ThemeColors, semantic};
+use crate::state::{AppState, GuidedStep, StudioTool, ThemePreference, UiMode};
+use crate::theme::ThemeColors;
+use crate::widgets::design;
 
 /// Render the top toolbar.
 pub fn toolbar(ctx: &egui::Context, state: &mut AppState) {
@@ -34,49 +37,57 @@ pub fn toolbar(ctx: &egui::Context, state: &mut AppState) {
                 ui.selectable_value(&mut state.ui_mode, UiMode::Guided, "Guided");
                 ui.selectable_value(&mut state.ui_mode, UiMode::Studio, "Studio");
 
+                // Studio tool buttons — visible only in Studio mode
+                if state.ui_mode == UiMode::Studio {
+                    ui.add_space(8.0);
+                    for tool in [
+                        StudioTool::Select,
+                        StudioTool::Roi,
+                        StudioTool::Probe,
+                        StudioTool::Zoom,
+                    ] {
+                        if design::btn_icon(ui, tool.label(), state.studio_tool == tool).clicked() {
+                            state.studio_tool = tool;
+                        }
+                    }
+                }
+
                 // Trailing controls right-aligned
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // Theme selector (rightmost)
-                    egui::ComboBox::from_id_salt("theme_toggle")
-                        .width(60.0)
-                        .selected_text(match state.theme_preference {
-                            ThemePreference::Auto => "Auto",
-                            ThemePreference::Light => "Light",
-                            ThemePreference::Dark => "Dark",
-                        })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut state.theme_preference,
-                                ThemePreference::Auto,
-                                "Auto",
-                            );
-                            ui.selectable_value(
-                                &mut state.theme_preference,
-                                ThemePreference::Light,
-                                "Light",
-                            );
-                            ui.selectable_value(
-                                &mut state.theme_preference,
-                                ThemePreference::Dark,
-                                "Dark",
-                            );
-                        });
+                    // Theme toggle (rightmost) — cycles ☀ → ☽ → A
+                    let icon = match state.theme_preference {
+                        ThemePreference::Light => "\u{2600}", // ☀
+                        ThemePreference::Dark => "\u{263D}",  // ☽
+                        ThemePreference::Auto => "A",
+                    };
+                    if design::btn_icon(ui, icon, false).clicked() {
+                        state.theme_preference = match state.theme_preference {
+                            ThemePreference::Light => ThemePreference::Dark,
+                            ThemePreference::Dark => ThemePreference::Auto,
+                            ThemePreference::Auto => ThemePreference::Light,
+                        };
+                    }
+
+                    // Home button — returns to Guided/Load
+                    if design::btn_primary(ui, "\u{2302} Home").clicked() {
+                        state.guided_step = GuidedStep::Load;
+                        state.ui_mode = UiMode::Guided;
+                    }
 
                     // Progress indicator
                     if state.is_fitting {
-                        ui.label(
-                            egui::RichText::new("Fitting...")
-                                .small()
-                                .color(semantic::ORANGE),
-                        );
-                        ui.spinner();
+                        if let Some((done, total)) = state.fitting_progress {
+                            let frac = done as f32 / total.max(1) as f32;
+                            design::progress_mini(
+                                ui,
+                                frac,
+                                &format!("{:.0}% \u{2014} {done}/{total}", frac * 100.0),
+                            );
+                        } else {
+                            design::progress_mini(ui, 0.0, "Fitting...");
+                        }
                     } else if state.is_fetching_endf {
-                        ui.label(
-                            egui::RichText::new("Fetching ENDF...")
-                                .small()
-                                .color(semantic::ORANGE),
-                        );
-                        ui.spinner();
+                        design::progress_mini(ui, 0.0, "Fetching ENDF...");
                     }
                 });
             });
