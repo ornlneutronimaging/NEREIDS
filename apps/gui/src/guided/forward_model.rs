@@ -225,6 +225,7 @@ fn fm_isotope_controls(ui: &mut egui::Ui, state: &mut AppState) {
                         entry.a
                     );
                     entry.resonance_data = None;
+                    entry.endf_status = EndfStatus::Pending;
                     changed = true;
                 }
             });

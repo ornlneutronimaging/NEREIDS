@@ -125,6 +125,7 @@ fn detect_controls(ui: &mut egui::Ui, state: &mut AppState) {
                         matrix.a
                     );
                     matrix.resonance_data = None;
+                    matrix.endf_status = EndfStatus::Pending;
                     state.detect_results.clear();
                 }
             });
@@ -570,6 +571,14 @@ fn detect_fetch_endf_data(state: &mut AppState) {
         state.status_message =
             "No supported isotopes found — none have MAT numbers in the ENDF database".into();
         return;
+    }
+
+    // Mark matrix as Fetching before spawning the background thread
+    // (index 0 = matrix; traces use DetectTraceEntry which has no endf_status)
+    if work.iter().any(|(i, _, _, _)| *i == 0)
+        && let Some(ref mut m) = state.detect_matrix
+    {
+        m.endf_status = EndfStatus::Fetching;
     }
 
     let (tx, rx) = mpsc::channel();
