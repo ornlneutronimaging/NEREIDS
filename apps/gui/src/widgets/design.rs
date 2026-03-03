@@ -456,10 +456,10 @@ pub fn nav_buttons(
 
     ui.add_space(8.0);
     ui.horizontal(|ui| {
-        if let Some(label) = back_label {
-            if ui.button(label).clicked() {
-                action = NavAction::Back;
-            }
+        if let Some(label) = back_label
+            && ui.button(label).clicked()
+        {
+            action = NavAction::Back;
         }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

@@ -232,10 +232,11 @@ fn isotope_chips_flow(ui: &mut egui::Ui, state: &mut AppState) -> ChipFlowResult
     // Click density in a chip to open the editor
     // (Handled via right-click or double-click on the chip in the future;
     //  for now, provide a simple "Edit densities" button if entries exist.)
-    if !state.isotope_entries.is_empty() && !locked {
-        if ui.small_button("Edit densities...").clicked() {
-            state.editing_isotope_density = Some(0);
-        }
+    if !state.isotope_entries.is_empty()
+        && !locked
+        && ui.small_button("Edit densities...").clicked()
+    {
+        state.editing_isotope_density = Some(0);
     }
 
     ChipFlowResult { changed }
