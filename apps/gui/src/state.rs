@@ -337,6 +337,9 @@ pub struct AppState {
     pub periodic_table_open: bool,
     pub periodic_table_target: PeriodicTableTarget,
     pub periodic_table_selected_z: Option<u32>,
+    pub periodic_table_selected_isotopes: Vec<(u32, u32)>,
+    pub periodic_table_density: f64,
+    pub periodic_table_library: Option<EndfLibrary>,
 
     // -- HDF5 tree browser --
     pub hdf5_tree: Option<Vec<Hdf5TreeEntry>>,
@@ -667,6 +670,9 @@ impl Default for AppState {
             periodic_table_open: false,
             periodic_table_target: PeriodicTableTarget::Configure,
             periodic_table_selected_z: None,
+            periodic_table_selected_isotopes: Vec::new(),
+            periodic_table_density: 0.001,
+            periodic_table_library: None,
 
             hdf5_tree: None,
 
