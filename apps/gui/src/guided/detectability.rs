@@ -87,6 +87,7 @@ fn detect_controls(ui: &mut egui::Ui, state: &mut AppState) {
     if state.detect_endf_library != prev_lib {
         if let Some(ref mut m) = state.detect_matrix {
             m.resonance_data = None;
+            m.endf_status = EndfStatus::Pending;
         }
         for t in &mut state.detect_trace_entries {
             t.resonance_data = None;

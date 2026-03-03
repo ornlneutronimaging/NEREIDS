@@ -104,12 +104,14 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
                 });
             });
         });
-        // Library change invalidates all resonance data
+        // Library change invalidates all resonance data and stale results
         if state.endf_library != prev_lib {
             for e in &mut state.isotope_entries {
                 e.resonance_data = None;
                 e.endf_status = EndfStatus::Pending;
             }
+            state.spatial_result = None;
+            state.pixel_fit_result = None;
         }
 
         ui.add_space(8.0);
@@ -248,6 +250,11 @@ fn isotope_chips_flow(ui: &mut egui::Ui, state: &mut AppState) -> ChipFlowResult
 
 fn density_edit_window(ui: &mut egui::Ui, state: &mut AppState) {
     if state.editing_isotope_density.is_none() {
+        return;
+    }
+    // Auto-close if a fetch started while the window was open
+    if state.is_fetching_endf {
+        state.editing_isotope_density = None;
         return;
     }
 

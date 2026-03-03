@@ -59,7 +59,11 @@ pub fn forward_model_step(ui: &mut egui::Ui, state: &mut AppState) {
                         initial_density: e.initial_density,
                         resonance_data: e.resonance_data.clone(),
                         enabled: e.enabled,
-                        endf_status: e.endf_status,
+                        endf_status: if e.resonance_data.is_some() {
+                            EndfStatus::Loaded
+                        } else {
+                            EndfStatus::Pending
+                        },
                     })
                     .collect();
                 state.endf_library = state.fm_endf_library;
@@ -129,6 +133,7 @@ fn fm_isotope_controls(ui: &mut egui::Ui, state: &mut AppState) {
     if state.fm_endf_library != prev_lib {
         for e in &mut state.fm_isotope_entries {
             e.resonance_data = None;
+            e.endf_status = EndfStatus::Pending;
         }
         state.fm_spectrum = None;
         state.fm_per_isotope_spectra.clear();
@@ -491,6 +496,13 @@ fn fm_fetch_endf_data(state: &mut AppState) {
 
     if work.is_empty() {
         return;
+    }
+
+    // Mark entries as Fetching before spawning the background thread
+    for (i, _, _, _) in &work {
+        if let Some(entry) = state.fm_isotope_entries.get_mut(*i) {
+            entry.endf_status = EndfStatus::Fetching;
+        }
     }
 
     let (tx, rx) = mpsc::channel();

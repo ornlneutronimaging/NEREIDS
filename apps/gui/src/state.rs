@@ -491,6 +491,22 @@ impl AppState {
         self.is_fetching_endf = false;
         self.is_fetching_fm_endf = false;
         self.is_fetching_detect_endf = false;
+        // Reset any Fetching entries back to Pending (cancellation interrupted them)
+        for e in &mut self.isotope_entries {
+            if e.endf_status == EndfStatus::Fetching {
+                e.endf_status = EndfStatus::Pending;
+            }
+        }
+        for e in &mut self.fm_isotope_entries {
+            if e.endf_status == EndfStatus::Fetching {
+                e.endf_status = EndfStatus::Pending;
+            }
+        }
+        if let Some(ref mut m) = self.detect_matrix
+            && m.endf_status == EndfStatus::Fetching
+        {
+            m.endf_status = EndfStatus::Pending;
+        }
         // Clear stale FM spectrum caches
         self.fm_spectrum = None;
         self.fm_per_isotope_spectra.clear();
