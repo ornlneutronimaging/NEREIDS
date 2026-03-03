@@ -1,9 +1,10 @@
 //! Step 3: Normalize — transmission computation, preview, and analysis mode selection.
 
 use crate::state::{
-    AnalysisMode, AppState, InputMode, ProvenanceEventKind, SpectrumAxis, SpectrumDataSource,
+    AnalysisMode, AppState, GuidedStep, InputMode, ProvenanceEventKind, SpectrumAxis,
+    SpectrumDataSource,
 };
-use crate::widgets::design;
+use crate::widgets::design::{self, NavAction};
 use crate::widgets::image_view::show_viridis_image;
 use egui_plot::{Line, Plot, PlotPoints, VLine};
 use ndarray::{Array3, Axis};
@@ -15,15 +16,52 @@ use std::sync::Arc;
 /// No inner ScrollArea -- the guided content area in app.rs already wraps
 /// everything in a vertical ScrollArea, so nesting would clip content.
 pub fn normalize_step(ui: &mut egui::Ui, state: &mut AppState) {
-    design::content_header(ui, "Normalize", "Compute and preview transmission");
+    let subtitle = match state.input_mode {
+        InputMode::TiffPair => "Normalize raw data and preview transmission",
+        _ => "Preview transmission and select analysis mode",
+    };
+    design::content_header(ui, "Normalize", subtitle);
 
     normalization_controls_card(ui, state);
+
+    // Stat row (after normalization)
+    if let (Some(norm), Some(energies)) = (&state.normalized, &state.energies) {
+        let shape = norm.transmission.shape();
+        let bins = format!("{}", shape[0]);
+        let pixels = format!("{}", shape[1] * shape[2]);
+        let e_min = format!("{:.2}", energies.first().unwrap_or(&0.0));
+        let e_max = format!("{:.2}", energies.last().unwrap_or(&0.0));
+        ui.add_space(8.0);
+        design::stat_row(
+            ui,
+            &[
+                (&bins, "Energy Bins"),
+                (&pixels, "Pixels"),
+                (&e_min, "E_min (eV)"),
+                (&e_max, "E_max (eV)"),
+            ],
+        );
+    }
 
     if state.normalized.is_some() && state.energies.is_some() {
         ui.add_space(12.0);
         transmission_preview_card(ui, state);
         ui.add_space(12.0);
         analysis_mode_cards(ui, state);
+    }
+
+    // Navigation buttons
+    let can_continue = state.normalized.is_some() && state.energies.is_some();
+    match design::nav_buttons(
+        ui,
+        Some("\u{2190} Back"),
+        "Continue \u{2192}",
+        can_continue,
+        "Normalize data to continue",
+    ) {
+        NavAction::Back => state.guided_step = GuidedStep::Configure,
+        NavAction::Continue => state.guided_step = GuidedStep::Analyze,
+        NavAction::None => {}
     }
 }
 
@@ -40,7 +78,6 @@ fn normalization_controls_card(ui: &mut egui::Ui, state: &mut AppState) {
                         _ => "Transmission data ready (pre-normalized).",
                     };
                     ui.label(label);
-                    show_energy_info(ui, state);
                 } else if state.sample_data.is_some() && state.spectrum_values.is_some() {
                     // Auto-prepare: pre-normalized/HDF5 data needs no user action.
                     prepare_transmission(state);
@@ -50,6 +87,27 @@ fn normalization_controls_card(ui: &mut egui::Ui, state: &mut AppState) {
                 }
             }
             InputMode::TiffPair => {
+                // Editable proton charge parameters
+                egui::Grid::new("norm_params")
+                    .num_columns(4)
+                    .spacing([8.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("PC sample:");
+                        ui.add(
+                            egui::DragValue::new(&mut state.proton_charge_sample)
+                                .range(0.001..=1e6)
+                                .speed(0.01),
+                        );
+                        ui.label("PC open beam:");
+                        ui.add(
+                            egui::DragValue::new(&mut state.proton_charge_ob)
+                                .range(0.001..=1e6)
+                                .speed(0.01),
+                        );
+                        ui.end_row();
+                    });
+                ui.add_space(6.0);
+
                 let can_normalize = state.sample_data.is_some()
                     && state.open_beam_data.is_some()
                     && !state.is_fitting;
@@ -65,7 +123,6 @@ fn normalization_controls_card(ui: &mut egui::Ui, state: &mut AppState) {
                         let n_dead = dead.iter().filter(|&&d| d).count();
                         ui.label(format!("Dead pixels: {}", n_dead));
                     }
-                    show_energy_info(ui, state);
                 } else if state.sample_data.is_some() && state.open_beam_data.is_some() {
                     ui.label("Click Normalize to compute transmission.");
                 } else {
@@ -74,18 +131,6 @@ fn normalization_controls_card(ui: &mut egui::Ui, state: &mut AppState) {
             }
         }
     });
-}
-
-/// Show energy axis info after normalization.
-fn show_energy_info(ui: &mut egui::Ui, state: &AppState) {
-    if let Some(ref energies) = state.energies {
-        ui.label(format!(
-            "Energy axis: {} bins, [{:.2}, {:.2}] eV",
-            energies.len(),
-            energies.first().copied().unwrap_or(0.0),
-            energies.last().copied().unwrap_or(0.0),
-        ));
-    }
 }
 
 // ---- Transmission Preview Card ----

@@ -322,6 +322,9 @@ pub struct AppState {
     pub detect_endf_library: EndfLibrary,
     pub detect_temperature_k: f64,
 
+    // -- Isotope density editor --
+    pub editing_isotope_density: Option<usize>,
+
     // -- Periodic Table modal --
     pub periodic_table_open: bool,
     pub periodic_table_target: PeriodicTableTarget,
@@ -349,6 +352,16 @@ pub struct AppState {
     pub export_status: Option<String>,
 }
 
+/// ENDF fetch lifecycle for an isotope entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EndfStatus {
+    #[default]
+    Pending,
+    Fetching,
+    Loaded,
+    Failed,
+}
+
 /// An isotope the user wants to include in the fit.
 pub struct IsotopeEntry {
     pub z: u32,
@@ -357,6 +370,7 @@ pub struct IsotopeEntry {
     pub initial_density: f64,
     pub resonance_data: Option<ResonanceData>,
     pub enabled: bool,
+    pub endf_status: EndfStatus,
 }
 
 /// ROI rectangle in pixel coordinates.
@@ -477,6 +491,22 @@ impl AppState {
         self.is_fetching_endf = false;
         self.is_fetching_fm_endf = false;
         self.is_fetching_detect_endf = false;
+        // Reset any Fetching entries back to Pending (cancellation interrupted them)
+        for e in &mut self.isotope_entries {
+            if e.endf_status == EndfStatus::Fetching {
+                e.endf_status = EndfStatus::Pending;
+            }
+        }
+        for e in &mut self.fm_isotope_entries {
+            if e.endf_status == EndfStatus::Fetching {
+                e.endf_status = EndfStatus::Pending;
+            }
+        }
+        if let Some(ref mut m) = self.detect_matrix
+            && m.endf_status == EndfStatus::Fetching
+        {
+            m.endf_status = EndfStatus::Pending;
+        }
         // Clear stale FM spectrum caches
         self.fm_spectrum = None;
         self.fm_per_isotope_spectra.clear();
@@ -615,6 +645,8 @@ impl Default for AppState {
             is_fetching_detect_endf: false,
             detect_endf_library: EndfLibrary::EndfB8_0,
             detect_temperature_k: 296.0,
+
+            editing_isotope_density: None,
 
             periodic_table_open: false,
             periodic_table_target: PeriodicTableTarget::Configure,
