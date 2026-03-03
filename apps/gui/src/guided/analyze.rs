@@ -310,6 +310,7 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
             &result.density_maps[idx],
             "density_tex",
             state.roi.as_ref(),
+            state.selected_pixel,
         );
         if let Some((y, x)) = clicked {
             state.selected_pixel = Some((y, x));
@@ -341,8 +342,13 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 .transmission
                 .index_axis(Axis(0), state.analyze_tof_slice_index)
                 .to_owned();
-            let (clicked, _rect) =
-                show_viridis_image_with_roi(ui, &slice, "analyze_preview_tex", state.roi.as_ref());
+            let (clicked, _rect) = show_viridis_image_with_roi(
+                ui,
+                &slice,
+                "analyze_preview_tex",
+                state.roi.as_ref(),
+                state.selected_pixel,
+            );
             if let Some((y, x)) = clicked {
                 state.selected_pixel = Some((y, x));
                 state.pixel_fit_result = None;
