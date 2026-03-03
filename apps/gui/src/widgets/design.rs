@@ -1,6 +1,7 @@
 //! Design system widgets: cards, underline tabs, badges, content headers.
 //!
-//! All widgets resolve theme colors from the egui context automatically.
+//! Theme-aware widgets resolve colors from the egui context (`ThemeColors`)
+//! or from `semantic` constants.
 //! Prototype reference: `.prototypes/D_hybrid_v4.html` CSS §Cards & Forms,
 //! §Tabs, §Badges, §Content Area.
 
@@ -81,8 +82,8 @@ pub fn underline_tabs(ui: &mut Ui, labels: &[&str], selected: &mut usize) -> boo
     let tc = ThemeColors::from_ctx(ui.ctx());
     let prev = *selected;
 
-    // Collect tab rects so we can draw underlines after layout is complete.
-    let mut tab_rects = Vec::with_capacity(labels.len());
+    // Track only the active tab rect — no need to collect all rects.
+    let mut active_rect = None;
 
     let row = ui.horizontal(|ui| {
         for (i, label) in labels.iter().enumerate() {
@@ -90,7 +91,9 @@ pub fn underline_tabs(ui: &mut Ui, labels: &[&str], selected: &mut usize) -> boo
             let color = if active { tc.accent } else { tc.fg3 };
             let text = RichText::new(*label).size(12.0).color(color);
             let response = ui.add(egui::Label::new(text).sense(Sense::click()));
-            tab_rects.push((i, response.rect, active));
+            if active {
+                active_rect = Some(response.rect);
+            }
             if response.clicked() {
                 *selected = i;
             }
@@ -112,16 +115,14 @@ pub fn underline_tabs(ui: &mut Ui, labels: &[&str], selected: &mut usize) -> boo
     );
 
     // 2px accent underline on active tab
-    for &(_, rect, active) in &tab_rects {
-        if active {
-            painter.line_segment(
-                [
-                    egui::pos2(rect.left(), baseline),
-                    egui::pos2(rect.right(), baseline),
-                ],
-                Stroke::new(2.0, tc.accent),
-            );
-        }
+    if let Some(rect) = active_rect {
+        painter.line_segment(
+            [
+                egui::pos2(rect.left(), baseline),
+                egui::pos2(rect.right(), baseline),
+            ],
+            Stroke::new(2.0, tc.accent),
+        );
     }
 
     ui.add_space(10.0);
@@ -142,20 +143,12 @@ pub enum BadgeVariant {
 ///
 /// Prototype: `.badge { padding: 2px 7px; border-radius: 4px; font-size: 10px; }`
 pub fn badge(ui: &mut Ui, text: &str, variant: BadgeVariant) {
-    let (bg, fg) = match variant {
-        BadgeVariant::Green => (
-            Color32::from_rgba_unmultiplied(52, 199, 89, 38),
-            semantic::GREEN,
-        ),
-        BadgeVariant::Orange => (
-            Color32::from_rgba_unmultiplied(255, 149, 0, 38),
-            semantic::ORANGE,
-        ),
-        BadgeVariant::Red => (
-            Color32::from_rgba_unmultiplied(255, 59, 48, 38),
-            semantic::RED,
-        ),
+    let fg = match variant {
+        BadgeVariant::Green => semantic::GREEN,
+        BadgeVariant::Orange => semantic::ORANGE,
+        BadgeVariant::Red => semantic::RED,
     };
+    let bg = Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 38);
     egui::Frame::NONE
         .fill(bg)
         .corner_radius(CornerRadius::same(4))

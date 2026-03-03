@@ -53,7 +53,8 @@ pub fn summary_card(
                     } else {
                         BadgeVariant::Red
                     };
-                    design::badge(ui, &format!("{:.2}", mean_chi2), chi2_variant);
+                    let chi2_text = format!("{:.2}", mean_chi2);
+                    design::badge(ui, &chi2_text, chi2_variant);
                 });
             }
 
