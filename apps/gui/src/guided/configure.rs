@@ -171,10 +171,13 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
     density_edit_window(ui, state);
 
     // --- Navigation buttons ---
-    let can_continue = state
+    let has_enabled = state.isotope_entries.iter().any(|e| e.enabled);
+    let all_loaded = state
         .isotope_entries
         .iter()
-        .any(|e| e.enabled && e.endf_status == EndfStatus::Loaded);
+        .filter(|e| e.enabled)
+        .all(|e| e.endf_status == EndfStatus::Loaded);
+    let can_continue = has_enabled && all_loaded;
     match design::nav_buttons(
         ui,
         Some("\u{2190} Back"),
