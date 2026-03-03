@@ -326,6 +326,9 @@ pub struct AppState {
     /// Number of matrix entries at the time the ENDF fetch was spawned.
     /// Used by `poll_pending_tasks` to dispatch results correctly.
     pub detect_n_matrix_at_fetch: usize,
+    pub detect_resolution_enabled: bool,
+    pub detect_delta_t_us: f64,
+    pub detect_delta_l_m: f64,
 
     // -- Isotope density editor --
     pub editing_isotope_density: Option<usize>,
@@ -655,6 +658,9 @@ impl Default for AppState {
             detect_endf_library: EndfLibrary::EndfB8_0,
             detect_temperature_k: 296.0,
             detect_n_matrix_at_fetch: 0,
+            detect_resolution_enabled: false,
+            detect_delta_t_us: 1.0,
+            detect_delta_l_m: 0.01,
 
             editing_isotope_density: None,
 
