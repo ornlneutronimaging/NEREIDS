@@ -308,8 +308,7 @@ pub struct AppState {
     pub fm_energies: Option<Vec<f64>>,
 
     // -- Detectability tool --
-    pub detect_matrix: Option<IsotopeEntry>,
-    pub detect_matrix_density: f64,
+    pub detect_matrix_entries: Vec<IsotopeEntry>,
     pub detect_trace_entries: Vec<DetectTraceEntry>,
     pub detect_snr_threshold: f64,
     pub detect_i0: f64,
@@ -321,6 +320,9 @@ pub struct AppState {
     pub is_fetching_detect_endf: bool,
     pub detect_endf_library: EndfLibrary,
     pub detect_temperature_k: f64,
+    /// Number of matrix entries at the time the ENDF fetch was spawned.
+    /// Used by `poll_pending_tasks` to dispatch results correctly.
+    pub detect_n_matrix_at_fetch: usize,
 
     // -- Isotope density editor --
     pub editing_isotope_density: Option<usize>,
@@ -504,10 +506,10 @@ impl AppState {
                 e.endf_status = EndfStatus::Pending;
             }
         }
-        if let Some(ref mut m) = self.detect_matrix
-            && m.endf_status == EndfStatus::Fetching
-        {
-            m.endf_status = EndfStatus::Pending;
+        for e in &mut self.detect_matrix_entries {
+            if e.endf_status == EndfStatus::Fetching {
+                e.endf_status = EndfStatus::Pending;
+            }
         }
         // Clear stale FM spectrum caches
         self.fm_spectrum = None;
@@ -634,8 +636,7 @@ impl Default for AppState {
             fm_per_isotope_spectra: Vec::new(),
             fm_energies: None,
 
-            detect_matrix: None,
-            detect_matrix_density: 0.001,
+            detect_matrix_entries: Vec::new(),
             detect_trace_entries: Vec::new(),
             detect_snr_threshold: 3.0,
             detect_i0: 10_000.0,
@@ -647,6 +648,7 @@ impl Default for AppState {
             is_fetching_detect_endf: false,
             detect_endf_library: EndfLibrary::EndfB8_0,
             detect_temperature_k: 296.0,
+            detect_n_matrix_at_fetch: 0,
 
             editing_isotope_density: None,
 

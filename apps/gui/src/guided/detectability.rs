@@ -85,7 +85,7 @@ fn detect_controls(ui: &mut egui::Ui, state: &mut AppState) {
     });
     // Library change invalidates all resonance data — must re-fetch
     if state.detect_endf_library != prev_lib {
-        if let Some(ref mut m) = state.detect_matrix {
+        for m in &mut state.detect_matrix_entries {
             m.resonance_data = None;
             m.endf_status = EndfStatus::Pending;
         }
@@ -95,7 +95,9 @@ fn detect_controls(ui: &mut egui::Ui, state: &mut AppState) {
         state.detect_results.clear();
     }
 
-    if let Some(ref mut matrix) = state.detect_matrix {
+    // Matrix isotope list
+    let mut matrix_remove = None;
+    for (idx, matrix) in state.detect_matrix_entries.iter_mut().enumerate() {
         ui.horizontal(|ui| {
             ui.add_enabled_ui(!isotope_locked, |ui| {
                 let z_changed = ui
@@ -130,45 +132,54 @@ fn detect_controls(ui: &mut egui::Ui, state: &mut AppState) {
                 }
             });
             ui.label(&matrix.symbol);
+            ui.add_enabled_ui(!isotope_locked, |ui| {
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut matrix.initial_density)
+                            .speed(0.0001)
+                            .range(1e-6..=1.0),
+                    )
+                    .changed()
+                {
+                    state.detect_results.clear();
+                }
+            });
             if matrix.resonance_data.is_some() {
                 ui.label("OK");
             }
-        });
-        ui.horizontal(|ui| {
-            ui.label("Density (at/barn):");
-            if ui
-                .add(
-                    egui::DragValue::new(&mut state.detect_matrix_density)
-                        .speed(0.0001)
-                        .range(1e-6..=1.0),
-                )
-                .changed()
-            {
-                state.detect_results.clear();
-            }
-        });
-    } else {
-        ui.add_enabled_ui(!isotope_locked, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("Set Matrix Isotope").clicked() {
-                    state.detect_matrix = Some(IsotopeEntry {
-                        z: 26,
-                        a: 56,
-                        symbol: "Fe-56".into(),
-                        initial_density: 0.001,
-                        resonance_data: None,
-                        enabled: true,
-                        endf_status: EndfStatus::Pending,
-                    });
-                }
-                if ui.button("Periodic Table...").clicked() {
-                    state.periodic_table_open = true;
-                    state.periodic_table_target = PeriodicTableTarget::DetectMatrix;
-                    state.periodic_table_selected_z = None;
+            ui.add_enabled_ui(!isotope_locked, |ui| {
+                if ui.small_button("X").clicked() {
+                    matrix_remove = Some(idx);
                 }
             });
         });
     }
+    if let Some(idx) = matrix_remove {
+        state.detect_matrix_entries.remove(idx);
+        state.detect_results.clear();
+    }
+
+    ui.add_enabled_ui(!isotope_locked, |ui| {
+        ui.horizontal(|ui| {
+            if ui.button("Add Matrix Isotope").clicked() {
+                state.detect_matrix_entries.push(IsotopeEntry {
+                    z: 26,
+                    a: 56,
+                    symbol: "Fe-56".into(),
+                    initial_density: 0.001,
+                    resonance_data: None,
+                    enabled: true,
+                    endf_status: EndfStatus::Pending,
+                });
+                state.detect_results.clear();
+            }
+            if ui.button("Periodic Table...").clicked() {
+                state.periodic_table_open = true;
+                state.periodic_table_target = PeriodicTableTarget::DetectMatrix;
+                state.periodic_table_selected_z = None;
+            }
+        });
+    });
 
     ui.add_space(8.0);
     ui.separator();
@@ -338,9 +349,9 @@ fn detect_controls(ui: &mut egui::Ui, state: &mut AppState) {
 
     // Fetch ENDF + Run buttons
     let has_missing_endf = state
-        .detect_matrix
-        .as_ref()
-        .is_some_and(|m| m.resonance_data.is_none())
+        .detect_matrix_entries
+        .iter()
+        .any(|m| m.resonance_data.is_none())
         || state
             .detect_trace_entries
             .iter()
@@ -355,10 +366,11 @@ fn detect_controls(ui: &mut egui::Ui, state: &mut AppState) {
         ui.spinner();
     }
 
-    let can_run = state
-        .detect_matrix
-        .as_ref()
-        .is_some_and(|m| m.resonance_data.is_some())
+    let can_run = !state.detect_matrix_entries.is_empty()
+        && state
+            .detect_matrix_entries
+            .iter()
+            .all(|m| m.resonance_data.is_some())
         && state
             .detect_trace_entries
             .iter()
@@ -420,17 +432,17 @@ fn detect_results_panel(ui: &mut egui::Ui, state: &AppState) {
 fn run_detectability(state: &mut AppState) {
     use nereids_pipeline::detectability::{TraceDetectabilityConfig, trace_detectability};
 
-    let matrix_entry = match &state.detect_matrix {
-        Some(e) if e.resonance_data.is_some() => e,
-        _ => {
-            state.status_message = "Matrix isotope needs ENDF data".into();
-            return;
-        }
-    };
+    // Collect matrix isotopes with loaded ENDF data
+    let matrix_isotopes: Vec<_> = state
+        .detect_matrix_entries
+        .iter()
+        .filter_map(|e| e.resonance_data.clone().map(|rd| (rd, e.initial_density)))
+        .collect();
 
-    let Some(matrix_rd) = matrix_entry.resonance_data.clone() else {
+    if matrix_isotopes.is_empty() {
+        state.status_message = "Matrix isotope(s) need ENDF data".into();
         return;
-    };
+    }
 
     // Validate energy range
     let e_min = state.detect_energy_min;
@@ -450,8 +462,7 @@ fn run_detectability(state: &mut AppState) {
         .collect();
 
     let config = TraceDetectabilityConfig {
-        matrix: &matrix_rd,
-        matrix_density: state.detect_matrix_density,
+        matrix_isotopes: &matrix_isotopes,
         energies: &energies,
         i0: state.detect_i0,
         temperature_k: state.detect_temperature_k,
@@ -510,45 +521,46 @@ fn library_name(lib: EndfLibrary) -> &'static str {
 }
 
 /// Fetch ENDF data for matrix + trace isotopes.
-/// Index convention: 0 = matrix, 1+ = trace entries at position (index - 1).
+/// Index convention: 0..N = matrix entries, N.. = trace entries at (index - N).
 fn detect_fetch_endf_data(state: &mut AppState) {
     use nereids_core::types::Isotope;
     use nereids_endf::retrieval;
 
+    let n_matrix = state.detect_matrix_entries.len();
     let mut work: Vec<(usize, Isotope, String, EndfLibrary)> = Vec::new();
 
-    // Matrix at index 0
-    if let Some(ref matrix) = state.detect_matrix
-        && matrix.resonance_data.is_none()
-    {
-        match Isotope::new(matrix.z, matrix.a) {
-            Ok(isotope) => {
-                if retrieval::mat_number(&isotope).is_some() {
-                    work.push((0, isotope, matrix.symbol.clone(), state.detect_endf_library));
-                } else {
+    // Matrix entries at indices 0..N
+    for (i, entry) in state.detect_matrix_entries.iter().enumerate() {
+        if entry.resonance_data.is_none() {
+            match Isotope::new(entry.z, entry.a) {
+                Ok(isotope) => {
+                    if retrieval::mat_number(&isotope).is_some() {
+                        work.push((i, isotope, entry.symbol.clone(), state.detect_endf_library));
+                    } else {
+                        state.status_message = format!(
+                            "No MAT number for matrix {} — isotope not in database",
+                            entry.symbol
+                        );
+                    }
+                }
+                Err(e) => {
                     state.status_message = format!(
-                        "No MAT number for matrix {} — isotope not in database",
-                        matrix.symbol
+                        "Matrix isotope Z={} A={} is not supported: {}",
+                        entry.z, entry.a, e
                     );
                 }
-            }
-            Err(e) => {
-                state.status_message = format!(
-                    "Matrix isotope Z={} A={} is not supported: {}",
-                    matrix.z, matrix.a, e
-                );
             }
         }
     }
 
-    // Traces at index 1+
+    // Traces at indices N+
     for (i, entry) in state.detect_trace_entries.iter().enumerate() {
         if entry.resonance_data.is_none() {
             match Isotope::new(entry.z, entry.a) {
                 Ok(isotope) => {
                     if retrieval::mat_number(&isotope).is_some() {
                         work.push((
-                            i + 1,
+                            n_matrix + i,
                             isotope,
                             entry.symbol.clone(),
                             state.detect_endf_library,
@@ -573,13 +585,15 @@ fn detect_fetch_endf_data(state: &mut AppState) {
         return;
     }
 
-    // Mark matrix as Fetching before spawning the background thread
-    // (index 0 = matrix; traces use DetectTraceEntry which has no endf_status)
-    if work.iter().any(|(i, _, _, _)| *i == 0)
-        && let Some(ref mut m) = state.detect_matrix
-    {
-        m.endf_status = EndfStatus::Fetching;
+    // Mark matrix entries as Fetching before spawning the background thread
+    for (idx, _, _, _) in &work {
+        if *idx < n_matrix {
+            state.detect_matrix_entries[*idx].endf_status = EndfStatus::Fetching;
+        }
     }
+
+    // Store matrix count at fetch time for poll_pending_tasks dispatch
+    state.detect_n_matrix_at_fetch = n_matrix;
 
     let (tx, rx) = mpsc::channel();
     state.pending_detect_endf = Some(rx);

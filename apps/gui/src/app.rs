@@ -202,31 +202,33 @@ fn poll_pending_tasks(state: &mut AppState) {
     }
 
     // Poll Detectability ENDF fetch results
-    // Index convention: 0 = matrix isotope, 1+ = trace entries at position (index - 1)
+    // Index convention: 0..N = matrix entries, N.. = trace entries at (index - N)
+    // where N = state.detect_n_matrix_at_fetch (captured at fetch spawn time).
     if let Some(ref rx) = state.pending_detect_endf {
         let mut disconnected = false;
+        let n_matrix = state.detect_n_matrix_at_fetch;
         loop {
             match rx.try_recv() {
                 Ok(fetch) => {
-                    if fetch.index == 0 {
-                        // Matrix isotope
-                        if let Some(ref mut matrix) = state.detect_matrix {
+                    if fetch.index < n_matrix {
+                        // Matrix entry
+                        if let Some(entry) = state.detect_matrix_entries.get_mut(fetch.index) {
                             match fetch.result {
                                 Ok(data) => {
-                                    matrix.resonance_data = Some(data);
-                                    matrix.endf_status = EndfStatus::Loaded;
+                                    entry.resonance_data = Some(data);
+                                    entry.endf_status = EndfStatus::Loaded;
                                     state.status_message =
                                         format!("Detect: loaded matrix {}", fetch.symbol);
                                 }
                                 Err(msg) => {
-                                    matrix.endf_status = EndfStatus::Failed;
+                                    entry.endf_status = EndfStatus::Failed;
                                     state.status_message = msg;
                                 }
                             }
                         }
                     } else {
-                        // Trace isotope at position (index - 1)
-                        let trace_idx = fetch.index - 1;
+                        // Trace entry at (index - N)
+                        let trace_idx = fetch.index - n_matrix;
                         if let Some(entry) = state.detect_trace_entries.get_mut(trace_idx) {
                             match fetch.result {
                                 Ok(data) => {
@@ -249,38 +251,40 @@ fn poll_pending_tasks(state: &mut AppState) {
             }
         }
         if disconnected {
-            // Count how many trace isotopes have data vs total
             let total_traces = state.detect_trace_entries.len();
             let loaded_traces = state
                 .detect_trace_entries
                 .iter()
                 .filter(|t| t.resonance_data.is_some())
                 .count();
-            let matrix_loaded = state
-                .detect_matrix
-                .as_ref()
-                .is_some_and(|m| m.resonance_data.is_some());
+            let total_matrix = state.detect_matrix_entries.len();
+            let loaded_matrix = state
+                .detect_matrix_entries
+                .iter()
+                .filter(|m| m.resonance_data.is_some())
+                .count();
 
-            if matrix_loaded && loaded_traces == total_traces {
+            if loaded_matrix == total_matrix && loaded_traces == total_traces {
                 state.status_message = "Detect: all ENDF data loaded".into();
             } else {
                 let mut parts = Vec::new();
-                if !matrix_loaded && let Some(ref m) = state.detect_matrix {
-                    parts.push(format!("matrix {} not supported", m.symbol));
+                if loaded_matrix < total_matrix {
+                    let unsupported = total_matrix - loaded_matrix;
+                    parts.push(format!(
+                        "{} of {} matrix isotopes loaded ({} not supported)",
+                        loaded_matrix, total_matrix, unsupported
+                    ));
                 }
                 if loaded_traces < total_traces {
                     let unsupported = total_traces - loaded_traces;
                     parts.push(format!(
-                        "ENDF data loaded for {} of {} trace isotopes ({} not supported)",
+                        "{} of {} trace isotopes loaded ({} not supported)",
                         loaded_traces, total_traces, unsupported
                     ));
-                } else {
-                    parts.push(format!(
-                        "ENDF data loaded for all {} trace isotopes",
-                        total_traces
-                    ));
                 }
-                state.status_message = format!("Detect: {}", parts.join("; "));
+                if !parts.is_empty() {
+                    state.status_message = format!("Detect: {}", parts.join("; "));
+                }
             }
             state.is_fetching_detect_endf = false;
             state.pending_detect_endf = None;

@@ -1,7 +1,7 @@
 //! Trace-detectability analysis for neutron resonance imaging.
 //!
 //! Answers the pre-experiment question: *"Can I detect X ppm of isotope B
-//! in a matrix of isotope A across a given energy window?"*
+//! in a matrix of isotope(s) A across a given energy window?"*
 //!
 //! ## Core concept
 //!
@@ -58,10 +58,12 @@ pub struct TraceDetectabilityReport {
 
 /// Configuration for a trace-detectability analysis.
 pub struct TraceDetectabilityConfig<'a> {
-    /// Resonance data for the matrix isotope.
-    pub matrix: &'a ResonanceData,
-    /// Matrix areal density in atoms/barn.
-    pub matrix_density: f64,
+    /// Matrix isotopes with their areal densities in atoms/barn.
+    ///
+    /// Supports multi-isotope matrices (e.g., an alloy). The total matrix
+    /// density (sum of all densities) is used to convert trace ppm to
+    /// areal density: `trace_density = trace_ppm × 1e-6 × total_matrix_density`.
+    pub matrix_isotopes: &'a [(ResonanceData, f64)],
     /// Energy grid in eV (sorted ascending).
     pub energies: &'a [f64],
     /// Expected counts per bin (for Poisson noise estimate).
@@ -81,6 +83,11 @@ fn build_instrument(config: &TraceDetectabilityConfig) -> Option<InstrumentParam
     })
 }
 
+/// Total matrix areal density (sum of all matrix isotope densities).
+fn total_matrix_density(config: &TraceDetectabilityConfig) -> f64 {
+    config.matrix_isotopes.iter().map(|(_, d)| d).sum()
+}
+
 /// Compute the matrix-only baseline transmission.
 ///
 /// NOTE: `SampleParams` owns its `ResonanceData`, so we clone here.
@@ -92,11 +99,9 @@ fn matrix_baseline(
     config: &TraceDetectabilityConfig,
     instrument: Option<&InstrumentParams>,
 ) -> Result<Vec<f64>, TransmissionError> {
-    let sample_matrix = SampleParams::new(
-        config.temperature_k,
-        vec![(config.matrix.clone(), config.matrix_density)],
-    )
-    .map_err(|e| TransmissionError::InputMismatch(e.to_string()))?;
+    let isotopes: Vec<_> = config.matrix_isotopes.to_vec();
+    let sample_matrix = SampleParams::new(config.temperature_k, isotopes)
+        .map_err(|e| TransmissionError::InputMismatch(e.to_string()))?;
     transmission::forward_model(config.energies, &sample_matrix, instrument)
 }
 
@@ -109,15 +114,11 @@ fn report_from_baseline(
     trace_ppm: f64,
 ) -> Result<TraceDetectabilityReport, TransmissionError> {
     // T_combined: transmission through matrix + trace
-    let trace_density = trace_ppm * 1e-6 * config.matrix_density;
-    let sample_combined = SampleParams::new(
-        config.temperature_k,
-        vec![
-            (config.matrix.clone(), config.matrix_density),
-            (trace.clone(), trace_density),
-        ],
-    )
-    .map_err(|e| TransmissionError::InputMismatch(e.to_string()))?;
+    let trace_density = trace_ppm * 1e-6 * total_matrix_density(config);
+    let mut isotopes: Vec<_> = config.matrix_isotopes.to_vec();
+    isotopes.push((trace.clone(), trace_density));
+    let sample_combined = SampleParams::new(config.temperature_k, isotopes)
+        .map_err(|e| TransmissionError::InputMismatch(e.to_string()))?;
     let t_combined = transmission::forward_model(config.energies, &sample_combined, instrument)?;
 
     // |ΔT| spectrum — absolute difference, sign discarded (see module docs).
@@ -172,14 +173,14 @@ fn report_from_baseline(
 /// so the SNR reflects realistic peak spreading at VENUS.
 ///
 /// # Arguments
-/// * `config`    — Shared analysis parameters (matrix, energies, I₀, etc.).
+/// * `config`    — Shared analysis parameters (matrix isotopes, energies, I₀, etc.).
 /// * `trace`     — Resonance data for the trace isotope.
 /// * `trace_ppm` — Trace concentration in ppm by atom.
 ///
 /// # Preconditions
 /// * `config.energies` must be non-empty and sorted ascending.
 /// * `config.i0` must be positive (used as `1/√I₀` for noise estimate).
-/// * `config.matrix_density` must be positive.
+/// * `config.matrix_isotopes` must be non-empty with positive densities.
 /// * `config.snr_threshold` must be non-negative.
 /// * `trace_ppm` must be non-negative.
 ///
@@ -205,7 +206,7 @@ pub fn trace_detectability(
     )?)
 }
 
-/// Survey multiple trace candidates against a single matrix.
+/// Survey multiple trace candidates against a matrix (single or multi-isotope).
 ///
 /// The matrix-only baseline transmission and instrument resolution are
 /// computed once and reused for all candidates. Each candidate is then
@@ -285,8 +286,7 @@ mod tests {
             .collect();
 
         let config = TraceDetectabilityConfig {
-            matrix: &fe56,
-            matrix_density: 8.47e-3, // atoms/barn (1 mm Fe)
+            matrix_isotopes: &[(fe56, 8.47e-3)], // atoms/barn (1 mm Fe)
             energies: &energies,
             i0: 1000.0,
             temperature_k: 293.6,
@@ -316,8 +316,7 @@ mod tests {
         let energies: Vec<f64> = (0..5000).map(|i| 1.0 + (i as f64) * 4.0 / 4999.0).collect();
 
         let config = TraceDetectabilityConfig {
-            matrix: &w182,
-            matrix_density: 6.38e-3,
+            matrix_isotopes: &[(w182, 6.38e-3)],
             energies: &energies,
             i0: 1000.0,
             temperature_k: 293.6,
@@ -349,8 +348,7 @@ mod tests {
             .collect();
 
         let config = TraceDetectabilityConfig {
-            matrix: &w182,
-            matrix_density: 6.38e-3, // atoms/barn (1 mm W)
+            matrix_isotopes: &[(w182, 6.38e-3)], // atoms/barn (1 mm W)
             energies: &energies,
             i0: 1000.0,
             temperature_k: 293.6,
@@ -385,8 +383,7 @@ mod tests {
             .collect();
 
         let config = TraceDetectabilityConfig {
-            matrix: &w182,
-            matrix_density: 6.38e-3,
+            matrix_isotopes: &[(w182, 6.38e-3)],
             energies: &energies,
             i0: 1000.0,
             temperature_k: 293.6,
@@ -462,8 +459,7 @@ mod tests {
         let energies: Vec<f64> = (0..500).map(|i| 1.0 + (i as f64) * 49.0 / 499.0).collect();
 
         let config = TraceDetectabilityConfig {
-            matrix: &matrix,
-            matrix_density: 6e-3,
+            matrix_isotopes: &[(matrix.clone(), 6e-3)],
             energies: &energies,
             i0: 1000.0,
             temperature_k: 293.6,
@@ -508,8 +504,7 @@ mod tests {
         let energies: Vec<f64> = (0..500).map(|i| 1.0 + (i as f64) * 49.0 / 499.0).collect();
 
         let config = TraceDetectabilityConfig {
-            matrix: &matrix,
-            matrix_density: 6e-3,
+            matrix_isotopes: &[(matrix.clone(), 6e-3)],
             energies: &energies,
             i0: 1000.0,
             temperature_k: 293.6,
@@ -533,6 +528,57 @@ mod tests {
             results[0].0.starts_with("Hf"),
             "Strong trace (Hf) should rank first, got '{}'",
             results[0].0,
+        );
+    }
+
+    /// Multi-matrix baseline: two matrix isotopes produce a deeper baseline
+    /// than either alone, reducing trace detectability.
+    #[test]
+    fn test_multi_matrix_baseline() {
+        // Two matrix isotopes with resonances at different energies
+        let matrix_a = synthetic_isotope(74, 182, 20.0, 1e-3, 0.05);
+        let matrix_b = synthetic_isotope(26, 56, 35.0, 2e-3, 0.04);
+        let trace = synthetic_isotope(72, 178, 8.0, 0.5, 0.05);
+
+        let energies: Vec<f64> = (0..500).map(|i| 1.0 + (i as f64) * 49.0 / 499.0).collect();
+
+        // Single-matrix config
+        let config_single = TraceDetectabilityConfig {
+            matrix_isotopes: &[(matrix_a.clone(), 6e-3)],
+            energies: &energies,
+            i0: 1000.0,
+            temperature_k: 293.6,
+            resolution: None,
+            snr_threshold: 3.0,
+        };
+
+        // Multi-matrix config (same total density split across two isotopes)
+        let config_multi = TraceDetectabilityConfig {
+            matrix_isotopes: &[(matrix_a, 3e-3), (matrix_b, 3e-3)],
+            energies: &energies,
+            i0: 1000.0,
+            temperature_k: 293.6,
+            resolution: None,
+            snr_threshold: 3.0,
+        };
+
+        let report_single = trace_detectability(&config_single, &trace, 1000.0).unwrap();
+        let report_multi = trace_detectability(&config_multi, &trace, 1000.0).unwrap();
+
+        // Both should produce valid spectra of the correct length
+        assert_eq!(report_single.delta_t_spectrum.len(), energies.len());
+        assert_eq!(report_multi.delta_t_spectrum.len(), energies.len());
+
+        // Multi-matrix should still detect the trace (strong resonance at 8 eV)
+        assert!(
+            report_multi.peak_snr > 0.0,
+            "Multi-matrix SNR should be positive"
+        );
+
+        // The two configs produce different SNR values (different baselines)
+        assert!(
+            (report_single.peak_snr - report_multi.peak_snr).abs() > 1e-10,
+            "Single vs multi-matrix should produce different SNR values"
         );
     }
 }

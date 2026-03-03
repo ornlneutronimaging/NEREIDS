@@ -392,11 +392,11 @@ fn add_isotope_to_target(state: &mut AppState, z: u32, a: u32, sym: &str) {
             if state.is_fetching_detect_endf {
                 return;
             }
-            state.detect_matrix = Some(IsotopeEntry {
+            state.detect_matrix_entries.push(IsotopeEntry {
                 z,
                 a,
                 symbol,
-                initial_density: state.detect_matrix_density,
+                initial_density: 0.001,
                 resonance_data: None,
                 enabled: true,
                 endf_status: EndfStatus::Pending,
