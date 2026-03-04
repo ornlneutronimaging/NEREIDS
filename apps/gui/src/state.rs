@@ -831,6 +831,7 @@ impl GuidedStep {
                 req(Self::Configure),
                 req(Self::Load),
                 opt(Self::Rebin),
+                req(Self::Roi),
                 req(Self::Analyze),
                 req(Self::Results),
             ],

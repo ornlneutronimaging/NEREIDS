@@ -379,6 +379,8 @@ fn step_subtitle(step: GuidedStep, state: &AppState) -> String {
                     InputMode::Hdf5Event => "HDF5 event",
                 };
                 format!("{mode} \u{2014} {}×{}×{}", shape[0], shape[1], shape[2])
+            } else if state.input_mode == InputMode::Hdf5Event && state.hdf5_path.is_some() {
+                "HDF5 loaded".into()
             } else {
                 "No data".into()
             }
@@ -439,8 +441,13 @@ fn step_is_complete(step: GuidedStep, state: &AppState) -> bool {
             InputMode::TransmissionTiff => {
                 state.sample_data.is_some() && state.spectrum_values.is_some()
             }
-            InputMode::Hdf5Histogram | InputMode::Hdf5Event => {
+            InputMode::Hdf5Histogram => {
                 state.sample_data.is_some() && state.spectrum_values.is_some()
+            }
+            InputMode::Hdf5Event => {
+                // Events: only need file selected; histogramming is in Bin step
+                state.hdf5_path.is_some()
+                    && state.nexus_metadata.as_ref().is_some_and(|m| m.has_events)
             }
         },
         GuidedStep::Configure => {

@@ -364,6 +364,7 @@ fn limitations_for(fitting: FittingType, data: DataType) -> Vec<&'static str> {
             "Transmission data: to accumulate correctly, needs I\u{2080} estimate.",
             "Optional spatial rebin via counts approximation (T \u{00D7} I\u{2080} \u{2192} sum \u{2192} \u{00F7} I\u{2080}).",
             "Approximates counts as T \u{00D7} I\u{2080}_est, sums, then re-normalizes.",
+            "ROI determines which pixels are accumulated into the single spectrum.",
         ],
     }
 }

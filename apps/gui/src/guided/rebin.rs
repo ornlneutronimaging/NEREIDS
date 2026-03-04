@@ -1,25 +1,46 @@
-//! Rebin step: optional energy rebinning (stub).
+//! Rebin step: optional energy rebinning.
 //!
-//! This step appears in pre-normalized and transmission pipelines
-//! as an optional step that can be skipped.
+//! This step appears in pre-normalized and transmission pipelines as an
+//! optional step. Energy rebinning is not yet implemented — the step
+//! shows current bin info and allows the user to skip.
 
 use crate::state::AppState;
+use crate::theme::ThemeColors;
 use crate::widgets::design;
 
-/// Render the Rebin step (stub, optional).
+/// Render the Rebin step (optional, not yet implemented).
 pub fn rebin_step(ui: &mut egui::Ui, state: &mut AppState) {
     design::content_header(
         ui,
-        "Rebin",
-        "Optionally rebin the energy axis (this step can be skipped)",
+        "Rebin Energy Axis",
+        "Optionally coarsen the energy binning (this step can be skipped)",
     );
 
-    design::card(ui, |ui| {
+    design::card_with_header(ui, "Status", None, |ui| {
+        let tc = ThemeColors::from_ctx(ui.ctx());
         ui.label(
-            "Energy rebinning is not yet implemented. \
-             Click Continue to skip this step.",
+            egui::RichText::new("Energy rebinning is not yet implemented.")
+                .size(12.0)
+                .color(tc.fg2),
+        );
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new("This is an optional step \u{2014} click Continue to skip.")
+                .size(11.0)
+                .color(tc.fg3),
         );
     });
+
+    // Show current bin count if spectrum data is available
+    if let Some(ref vals) = state.spectrum_values {
+        let n_bins = if state.spectrum_kind == nereids_io::spectrum::SpectrumValueKind::BinEdges {
+            vals.len().saturating_sub(1)
+        } else {
+            vals.len()
+        };
+        let n = format!("{n_bins}");
+        design::stat_row(ui, &[(&n, "energy bins")]);
+    }
 
     // Optional steps are always passable
     match design::nav_buttons(ui, Some("\u{2190} Back"), "Continue \u{2192}", true, "") {

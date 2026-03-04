@@ -6,8 +6,7 @@
 //! map and immediately see its spectrum.
 
 use crate::state::{
-    AppState, GuidedStep, InputMode, IsotopeEntry, ResolutionMode, RoiSelection, SolverMethod,
-    SpectrumAxis,
+    AppState, GuidedStep, InputMode, IsotopeEntry, ResolutionMode, SolverMethod, SpectrumAxis,
 };
 use crate::widgets::design::{self, NavAction};
 use crate::widgets::image_view::{show_viridis_image, show_viridis_image_with_roi};
@@ -189,63 +188,6 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
                 });
             }
         });
-    }
-
-    ui.add_space(8.0);
-    ui.separator();
-
-    // ROI
-    ui.label(egui::RichText::new("Region of Interest").strong());
-    if let Some(ref norm) = state.normalized {
-        let shape = norm.transmission.shape();
-        let height = shape[1];
-        let width = shape[2];
-
-        let mut roi = state.roi.unwrap_or(RoiSelection {
-            y_start: 0,
-            y_end: height,
-            x_start: 0,
-            x_end: width,
-        });
-
-        let changed = ui
-            .horizontal(|ui| {
-                let mut changed = false;
-                changed |= ui
-                    .add(
-                        egui::DragValue::new(&mut roi.y_start)
-                            .prefix("y0=")
-                            .range(0..=height),
-                    )
-                    .changed();
-                changed |= ui
-                    .add(
-                        egui::DragValue::new(&mut roi.y_end)
-                            .prefix("y1=")
-                            .range(0..=height),
-                    )
-                    .changed();
-                changed |= ui
-                    .add(
-                        egui::DragValue::new(&mut roi.x_start)
-                            .prefix("x0=")
-                            .range(0..=width),
-                    )
-                    .changed();
-                changed |= ui
-                    .add(
-                        egui::DragValue::new(&mut roi.x_end)
-                            .prefix("x1=")
-                            .range(0..=width),
-                    )
-                    .changed();
-                changed
-            })
-            .inner;
-
-        if changed || state.roi.is_none() {
-            state.roi = Some(roi);
-        }
     }
 
     ui.add_space(8.0);
