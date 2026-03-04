@@ -1,8 +1,7 @@
 //! ROI step: region of interest selection with interactive image preview.
 //!
-//! This step appears in most pipelines. The user draws a rectangle ROI
-//! directly on the preview image (drag-to-draw), or adjusts coordinates
-//! via DragValues. Full image is the default (no ROI = entire detector).
+//! The user draws a rectangle ROI directly on the preview image via
+//! click-and-drag. Full image is the default (no ROI = entire detector).
 
 use crate::state::{AppState, Colormap, FittingType, RoiSelection};
 use crate::theme::ThemeColors;
@@ -18,7 +17,7 @@ pub fn roi_step(ui: &mut egui::Ui, state: &mut AppState) {
     );
 
     if let Some((height, width)) = image_dims(state) {
-        let mut roi = state.roi.unwrap_or(RoiSelection {
+        let roi = state.roi.unwrap_or(RoiSelection {
             y_start: 0,
             y_end: height,
             x_start: 0,
@@ -26,15 +25,13 @@ pub fn roi_step(ui: &mut egui::Ui, state: &mut AppState) {
         });
 
         // --- Image preview with drag-to-draw ROI ---
-        // Check preview availability and dimensions before entering closures
-        // to avoid simultaneous immutable borrow of preview + mutable borrow of state.
-        let preview_status = match &state.preview_image {
-            Some(p) if p.shape()[0] == height && p.shape()[1] == width => 0u8, // ok
-            Some(_) => 1,                                                      // dimension mismatch
-            None => 2,                                                         // no preview
-        };
+        // Check preview availability before entering closure to avoid borrow conflict.
+        let preview_ok = state
+            .preview_image
+            .as_ref()
+            .is_some_and(|p| p.shape()[0] == height && p.shape()[1] == width);
 
-        let drawn_roi = if preview_status == 0 {
+        let drawn_roi = if preview_ok {
             let preview = state.preview_image.as_ref().unwrap();
             let mut result = None;
             design::card(ui, |ui| {
@@ -55,18 +52,12 @@ pub fn roi_step(ui: &mut egui::Ui, state: &mut AppState) {
                 result = new_roi;
             });
             result
-        } else if preview_status == 1 {
-            design::card(ui, |ui| {
-                let tc = ThemeColors::from_ctx(ui.ctx());
-                ui.label(
-                    egui::RichText::new(
-                        "Preview dimensions mismatch. Reload data to update preview.",
-                    )
-                    .color(tc.fg2),
-                );
-            });
-            None
         } else {
+            // Generate preview on-the-fly from sample_data if missing
+            let can_generate = state.sample_data.is_some() && state.preview_image.is_none();
+            if can_generate && let Some(ref data) = state.sample_data {
+                state.preview_image = Some(data.sum_axis(ndarray::Axis(0)));
+            }
             design::card(ui, |ui| {
                 let tc = ThemeColors::from_ctx(ui.ctx());
                 ui.label(
@@ -79,81 +70,29 @@ pub fn roi_step(ui: &mut egui::Ui, state: &mut AppState) {
             None
         };
 
-        // Apply drawn ROI outside the borrow scope
+        // Apply drawn ROI — only clear downstream fit results, NOT preview_image
         if let Some(drawn) = drawn_roi {
-            roi = drawn;
-            state.roi = Some(roi);
+            state.roi = Some(drawn);
             state.pixel_fit_result = None;
             state.spatial_result = None;
             state.selected_pixel = None;
-            state.invalidate_results();
             state.log_provenance(
                 crate::state::ProvenanceEventKind::ConfigChanged,
                 format!(
                     "ROI drawn: y=[{}, {}] x=[{}, {}]",
-                    roi.y_start, roi.y_end, roi.x_start, roi.x_end
+                    drawn.y_start, drawn.y_end, drawn.x_start, drawn.x_end
                 ),
             );
         }
 
-        // --- DragValue coordinate fields ---
-        design::card_with_header(ui, "ROI Coordinates", None, |ui| {
-            let changed = ui
-                .horizontal(|ui| {
-                    let mut changed = false;
-                    changed |= ui
-                        .add(
-                            egui::DragValue::new(&mut roi.y_start)
-                                .prefix("y\u{2080}=")
-                                .range(0..=height),
-                        )
-                        .changed();
-                    changed |= ui
-                        .add(
-                            egui::DragValue::new(&mut roi.y_end)
-                                .prefix("y\u{2081}=")
-                                .range(0..=height),
-                        )
-                        .changed();
-                    changed |= ui
-                        .add(
-                            egui::DragValue::new(&mut roi.x_start)
-                                .prefix("x\u{2080}=")
-                                .range(0..=width),
-                        )
-                        .changed();
-                    changed |= ui
-                        .add(
-                            egui::DragValue::new(&mut roi.x_end)
-                                .prefix("x\u{2081}=")
-                                .range(0..=width),
-                        )
-                        .changed();
-                    changed
-                })
-                .inner;
-
-            // Clamp to valid ranges: ensure start <= end
-            if roi.y_start > roi.y_end {
-                std::mem::swap(&mut roi.y_start, &mut roi.y_end);
-            }
-            if roi.x_start > roi.x_end {
-                std::mem::swap(&mut roi.x_start, &mut roi.x_end);
-            }
-
-            if changed || state.roi.is_none() {
-                state.roi = Some(roi);
-            }
-
-            ui.add_space(4.0);
-            if ui.button("Reset to Full Image").clicked() {
-                state.roi = None;
-                // Only clear downstream fit results; preserve normalized/spectral data
-                state.pixel_fit_result = None;
-                state.spatial_result = None;
-                state.selected_pixel = None;
-            }
-        });
+        // Reset button
+        ui.add_space(4.0);
+        if ui.button("Reset to Full Image").clicked() {
+            state.roi = None;
+            state.pixel_fit_result = None;
+            state.spatial_result = None;
+            state.selected_pixel = None;
+        }
 
         // Info about ROI meaning
         let tc = ThemeColors::from_ctx(ui.ctx());
@@ -174,8 +113,8 @@ pub fn roi_step(ui: &mut egui::Ui, state: &mut AppState) {
         });
         let roi_h = active.y_end.saturating_sub(active.y_start);
         let roi_w = active.x_end.saturating_sub(active.x_start);
-        let img_str = format!("{}×{}", height, width);
-        let roi_str = format!("{}×{}", roi_h, roi_w);
+        let img_str = format!("{}x{}", height, width);
+        let roi_str = format!("{}x{}", roi_h, roi_w);
         let px_str = format!("{}", roi_h * roi_w);
         design::stat_row(
             ui,
