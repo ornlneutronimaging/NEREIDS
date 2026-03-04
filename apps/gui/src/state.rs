@@ -347,6 +347,10 @@ pub struct AppState {
     // -- Studio mode --
     pub studio_selected_tile: usize,
     pub studio_tool: StudioTool,
+    pub studio_doc_tab: StudioDocTab,
+    pub studio_dock_tab: usize,
+    pub studio_show_dock: bool,
+    pub studio_analysis_isotope: usize,
 
     // -- Progress --
     pub fitting_progress: Option<(usize, usize)>,
@@ -427,6 +431,15 @@ impl StudioTool {
             Self::Zoom => "Zm",
         }
     }
+}
+
+/// Document tab in Studio mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StudioDocTab {
+    #[default]
+    Analysis,
+    ForwardModel,
+    Detectability,
 }
 
 /// Step within the Guided workflow.
@@ -678,6 +691,10 @@ impl Default for AppState {
 
             studio_selected_tile: 0,
             studio_tool: StudioTool::Select,
+            studio_doc_tab: StudioDocTab::Analysis,
+            studio_dock_tab: 0,
+            studio_show_dock: true,
+            studio_analysis_isotope: 0,
             fitting_progress: None,
             fitting_progress_counter: None,
 
