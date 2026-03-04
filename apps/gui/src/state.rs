@@ -539,6 +539,12 @@ pub struct AppState {
     /// Prevents auto-load retry after a loading failure; cleared when file paths change.
     pub load_error: bool,
 
+    // -- Rebinning --
+    /// Integer rebin factor (1 = no rebinning).
+    pub rebin_factor: usize,
+    /// True after rebinning has been applied to sample_data/open_beam_data.
+    pub rebin_applied: bool,
+
     // -- HDF5/NeXus --
     pub hdf5_path: Option<PathBuf>,
     pub nexus_metadata: Option<NexusMetadata>,
@@ -914,6 +920,8 @@ impl AppState {
         self.tile_display.clear();
         self.studio_selected_tile = 0;
         self.export_status = None;
+        self.rebin_applied = false;
+        self.rebin_factor = 1;
     }
 
     /// Append a provenance event to the session audit trail.
@@ -997,6 +1005,8 @@ impl Default for AppState {
             normalized: None,
             dead_pixels: None,
             load_error: false,
+            rebin_factor: 1,
+            rebin_applied: false,
 
             spectrum_path: None,
             spectrum_values: None,

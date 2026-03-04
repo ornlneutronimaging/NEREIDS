@@ -17,6 +17,7 @@ pub mod export;
 #[cfg(feature = "hdf5")]
 pub mod nexus;
 pub mod normalization;
+pub mod rebin;
 pub mod spectrum;
 pub mod tiff_stack;
 pub mod tof;
