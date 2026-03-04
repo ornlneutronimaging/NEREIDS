@@ -382,8 +382,10 @@ fn preview_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
                                             format!("{} {:.1}eV", entry.symbol, res.energy),
                                             res.energy,
                                         )
-                                        .color(egui::Color32::from_rgb(180, 80, 80))
-                                        .style(egui_plot::LineStyle::dashed_loose()),
+                                        .color(egui::Color32::from_rgba_premultiplied(
+                                            180, 80, 80, 50,
+                                        ))
+                                        .width(0.5),
                                     );
                                 }
                             }

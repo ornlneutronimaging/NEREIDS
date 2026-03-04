@@ -392,6 +392,8 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
             SpectrumAxis::TofMicroseconds,
             "TOF (\u{03bc}s)",
         );
+        ui.separator();
+        ui.checkbox(&mut state.show_resonance_dips, "Resonances");
     });
 
     let norm = match state.normalized {
@@ -579,8 +581,8 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 );
             }
 
-            // Resonance dip markers (energy axis only)
-            if state.analyze_spectrum_axis == SpectrumAxis::EnergyEv {
+            // Resonance dip markers (energy axis only, toggled)
+            if state.show_resonance_dips && state.analyze_spectrum_axis == SpectrumAxis::EnergyEv {
                 let (x_min, x_max) = x_values
                     .iter()
                     .copied()
@@ -601,8 +603,10 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
                                 if res.energy >= x_min && res.energy <= x_max {
                                     plot_ui.vline(
                                         VLine::new("", res.energy)
-                                            .color(egui::Color32::from_rgb(180, 80, 80))
-                                            .style(egui_plot::LineStyle::dashed_loose()),
+                                            .color(egui::Color32::from_rgba_premultiplied(
+                                                180, 80, 80, 50,
+                                            ))
+                                            .width(0.5),
                                     );
                                 }
                             }
