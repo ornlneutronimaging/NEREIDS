@@ -160,6 +160,17 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
                 ui.label("Fetching ENDF data…");
             });
         }
+        let has_failed = state
+            .isotope_entries
+            .iter()
+            .any(|e| e.enabled && e.endf_status == EndfStatus::Failed);
+        if has_failed && !state.is_fetching_endf && ui.button("Retry failed").clicked() {
+            for e in &mut state.isotope_entries {
+                if e.endf_status == EndfStatus::Failed {
+                    e.endf_status = EndfStatus::Pending;
+                }
+            }
+        }
     });
 
     // Density editing popup
@@ -173,12 +184,21 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
         .filter(|e| e.enabled)
         .all(|e| e.endf_status == EndfStatus::Loaded);
     let can_continue = has_enabled && all_loaded;
+    let has_any_failed = state
+        .isotope_entries
+        .iter()
+        .any(|e| e.enabled && e.endf_status == EndfStatus::Failed);
+    let nav_hint = if has_any_failed {
+        "Some isotopes failed \u{2014} remove or retry"
+    } else {
+        "Waiting for ENDF data\u{2026}"
+    };
     match design::nav_buttons(
         ui,
         Some("\u{2190} Back"),
         "Continue \u{2192}",
         can_continue,
-        "Waiting for ENDF data…",
+        nav_hint,
     ) {
         NavAction::Back => state.nav_prev(),
         NavAction::Continue => state.nav_next(),
@@ -300,12 +320,14 @@ fn fetch_endf_data(state: &mut AppState) {
     use nereids_endf::retrieval;
 
     let mut work: Vec<(usize, Isotope, String, EndfLibrary)> = Vec::new();
+    let mut failed_indices: Vec<usize> = Vec::new();
     for (i, entry) in state.isotope_entries.iter().enumerate() {
-        if entry.enabled && entry.resonance_data.is_none() {
+        if entry.enabled && entry.endf_status == EndfStatus::Pending {
             let isotope = match Isotope::new(entry.z, entry.a) {
                 Ok(iso) => iso,
                 Err(e) => {
                     state.status_message = format!("Invalid isotope {}: {}", entry.symbol, e);
+                    failed_indices.push(i);
                     continue;
                 }
             };
@@ -314,10 +336,14 @@ fn fetch_endf_data(state: &mut AppState) {
                     "No MAT number for {} — isotope not in database",
                     entry.symbol
                 );
+                failed_indices.push(i);
                 continue;
             }
             work.push((i, isotope, entry.symbol.clone(), state.endf_library));
         }
+    }
+    for i in failed_indices {
+        state.isotope_entries[i].endf_status = EndfStatus::Failed;
     }
 
     if work.is_empty() {
