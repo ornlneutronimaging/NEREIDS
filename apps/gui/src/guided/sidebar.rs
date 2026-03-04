@@ -456,7 +456,6 @@ fn step_subtitle(step: GuidedStep, state: &AppState) -> String {
         GuidedStep::Results => "Maps & export".into(),
         GuidedStep::Bin => "Event histogramming".into(),
         GuidedStep::Rebin => "Energy rebin".into(),
-        GuidedStep::Roi => "Region selection".into(),
         GuidedStep::Landing | GuidedStep::Wizard => String::new(),
         GuidedStep::ForwardModel | GuidedStep::Detectability => String::new(),
     }
@@ -502,7 +501,6 @@ fn step_is_complete(step: GuidedStep, state: &AppState) -> bool {
         GuidedStep::Results => state.pixel_fit_result.is_some() || state.spatial_result.is_some(),
         GuidedStep::Bin => state.sample_data.is_some(),
         GuidedStep::Rebin => true, // optional, skip counts as done
-        GuidedStep::Roi => true,   // placeholder, always passable
         GuidedStep::Landing | GuidedStep::Wizard => false,
         GuidedStep::ForwardModel | GuidedStep::Detectability => false,
     }

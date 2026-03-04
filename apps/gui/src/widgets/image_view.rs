@@ -17,6 +17,8 @@ pub enum RoiEditorResult {
     Selected(usize),
     /// User clicked on empty space, deselecting the current ROI.
     Deselected,
+    /// User clicked on empty space with no ROI selected — pixel selection.
+    ClickedPixel(usize, usize),
 }
 
 /// Transient drag state, stored in egui per-widget temp memory.
@@ -131,6 +133,7 @@ pub fn show_image_with_roi_editor(
     colormap: Colormap,
     rois: &[RoiSelection],
     selected_roi: Option<usize>,
+    selected_pixel: Option<(usize, usize)>,
 ) -> (RoiEditorResult, egui::Rect) {
     let (height, width) = (data.shape()[0], data.shape()[1]);
     if width == 0 || height == 0 {
@@ -239,11 +242,13 @@ pub fn show_image_with_roi_editor(
                 RoiDragMode::DrawNew { origin_y, origin_x } => {
                     // Check if this was a click (no movement) vs a drag
                     if cy == origin_y && cx == origin_x {
-                        // Click — select/deselect
+                        // Click — select, deselect, or pixel-select
                         if let Some(hit_idx) = hit_test_rois(cy, cx, rois) {
                             result = RoiEditorResult::Selected(hit_idx);
-                        } else {
+                        } else if selected_roi.is_some() {
                             result = RoiEditorResult::Deselected;
+                        } else {
+                            result = RoiEditorResult::ClickedPixel(cy, cx);
                         }
                     } else {
                         let roi = make_roi(origin_y, origin_x, cy, cx, dims);
@@ -298,6 +303,11 @@ pub fn show_image_with_roi_editor(
                 draw_roi_overlay(&painter, image_rect, dims, roi);
             }
         }
+    }
+
+    // Draw selected pixel marker
+    if let Some((py, px)) = selected_pixel {
+        draw_pixel_marker(&painter, image_rect, dims, py, px);
     }
 
     // Cursor: move icon when hovering selected ROI, crosshair otherwise

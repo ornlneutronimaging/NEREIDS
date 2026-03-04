@@ -9,7 +9,9 @@ use crate::state::{
     AppState, GuidedStep, InputMode, IsotopeEntry, ResolutionMode, SolverMethod, SpectrumAxis,
 };
 use crate::widgets::design::{self, NavAction};
-use crate::widgets::image_view::{show_viridis_image, show_viridis_image_with_roi};
+use crate::widgets::image_view::{
+    RoiEditorResult, show_image_with_roi_editor, show_viridis_image, show_viridis_image_with_roi,
+};
 use egui_plot::{Line, Plot, PlotPoints, VLine};
 use ndarray::Axis;
 use nereids_io::spectrum::{SpectrumUnit, SpectrumValueKind};
@@ -230,15 +232,46 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
             ui.label("Fitting...");
         }
     }
+
+    // -- Fit feedback card --
+    if let Some(ref fb) = state.last_fit_feedback {
+        ui.add_space(8.0);
+        let (border_color, bg_color) = if fb.success {
+            (
+                egui::Color32::from_rgb(60, 160, 60),
+                egui::Color32::from_rgba_premultiplied(30, 80, 30, 40),
+            )
+        } else {
+            (
+                egui::Color32::from_rgb(200, 60, 60),
+                egui::Color32::from_rgba_premultiplied(80, 30, 30, 40),
+            )
+        };
+        egui::Frame::default()
+            .fill(bg_color)
+            .stroke(egui::Stroke::new(1.5, border_color))
+            .corner_radius(4.0)
+            .inner_margin(6.0)
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(&fb.summary)
+                        .color(border_color)
+                        .strong(),
+                );
+                for (symbol, density) in &fb.densities {
+                    ui.label(format!("  {symbol}: {density:.4e} at/barn"));
+                }
+            });
+    }
 }
 
 // ---- Image Panel (Column 2) ----
 
-/// Shows spatial result density maps if available, otherwise the preview image.
-/// Handles click-to-select-pixel via the return value of `show_viridis_image`.
+/// Shows spatial result density maps if available, otherwise the preview image
+/// with interactive ROI editor. Handles click-to-select-pixel and ROI drawing.
 fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
     if let Some(ref result) = state.spatial_result {
-        // Isotope selector (when multiple density maps)
+        // -- Density map display (read-only ROI overlay) --
         let n_isotopes = result.density_maps.len();
         if n_isotopes > 1 {
             ui.horizontal(|ui| {
@@ -274,6 +307,7 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
         if let Some((y, x)) = clicked {
             state.selected_pixel = Some((y, x));
             state.pixel_fit_result = None;
+            state.last_fit_feedback = None;
         }
 
         ui.add_space(8.0);
@@ -287,7 +321,7 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
             result.n_converged, result.n_total
         ));
     } else if let Some(ref norm) = state.normalized {
-        // TOF-sliced transmission preview with slider
+        // -- TOF-sliced preview with interactive ROI editor --
         let n_tof = norm.transmission.shape()[0];
         if n_tof == 0 {
             ui.label("(no data)");
@@ -301,17 +335,21 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 .transmission
                 .index_axis(Axis(0), state.analyze_tof_slice_index)
                 .to_owned();
-            let (clicked, _rect) = show_viridis_image_with_roi(
+
+            // Snapshot for borrow-free editor call
+            let rois_snap: Vec<_> = state.rois.clone();
+            let sel_roi = state.selected_roi;
+            let sel_px = state.selected_pixel;
+            let (editor_result, _rect) = show_image_with_roi_editor(
                 ui,
                 &slice,
                 "analyze_preview_tex",
-                &state.rois,
-                state.selected_pixel,
+                crate::state::Colormap::Viridis,
+                &rois_snap,
+                sel_roi,
+                sel_px,
             );
-            if let Some((y, x)) = clicked {
-                state.selected_pixel = Some((y, x));
-                state.pixel_fit_result = None;
-            }
+            apply_roi_editor_result(state, editor_result);
 
             ui.add(
                 egui::Slider::new(
@@ -321,14 +359,59 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 .text("TOF bin"),
             );
         }
-    } else if let Some(ref preview) = state.preview_image {
+    } else if state.preview_image.is_some() {
+        // -- Raw preview with interactive ROI editor --
         ui.label("Preview (summed counts):");
-        if let Some((y, x)) = show_viridis_image(ui, preview, "preview_tex") {
-            state.selected_pixel = Some((y, x));
-            state.pixel_fit_result = None;
-        }
+        let preview = state.preview_image.clone().unwrap();
+        let rois_snap: Vec<_> = state.rois.clone();
+        let sel_roi = state.selected_roi;
+        let sel_px = state.selected_pixel;
+        let (editor_result, _rect) = show_image_with_roi_editor(
+            ui,
+            &preview,
+            "preview_tex",
+            crate::state::Colormap::Viridis,
+            &rois_snap,
+            sel_roi,
+            sel_px,
+        );
+        apply_roi_editor_result(state, editor_result);
     } else {
-        ui.label("Run spatial mapping to see density maps.");
+        ui.label("Load and normalize data to see preview.");
+    }
+
+    // ROI toolbar (only in preview mode, not when viewing density maps)
+    if state.spatial_result.is_none()
+        && (state.normalized.is_some() || state.preview_image.is_some())
+    {
+        ui.horizontal(|ui| {
+            let has_sel = state.selected_roi.is_some_and(|i| i < state.rois.len());
+            if ui
+                .add_enabled(has_sel, egui::Button::new("Delete ROI"))
+                .clicked()
+                && let Some(idx) = state.selected_roi
+                && idx < state.rois.len()
+            {
+                state.rois.remove(idx);
+                state.selected_roi = None;
+                clear_analyze_downstream(state);
+            }
+            if ui
+                .add_enabled(!state.rois.is_empty(), egui::Button::new("Clear ROIs"))
+                .clicked()
+            {
+                state.rois.clear();
+                state.selected_roi = None;
+                clear_analyze_downstream(state);
+            }
+            if !state.rois.is_empty() {
+                ui.label(
+                    egui::RichText::new(format!("{} ROI(s)", state.rois.len()))
+                        .small()
+                        .weak(),
+                );
+            }
+        });
     }
 
     // Show selected pixel coordinates as feedback
@@ -336,6 +419,53 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
         ui.add_space(4.0);
         ui.label(format!("Selected pixel: ({}, {})", y, x));
     }
+}
+
+/// Apply the result of the ROI editor interaction to the state.
+fn apply_roi_editor_result(state: &mut AppState, result: RoiEditorResult) {
+    match result {
+        RoiEditorResult::DrawnNew(roi) => {
+            state.rois.push(roi);
+            state.selected_roi = Some(state.rois.len() - 1);
+            clear_analyze_downstream(state);
+            state.log_provenance(
+                crate::state::ProvenanceEventKind::ConfigChanged,
+                format!(
+                    "ROI #{} drawn: y=[{}, {}] x=[{}, {}]",
+                    state.rois.len(),
+                    roi.y_start,
+                    roi.y_end,
+                    roi.x_start,
+                    roi.x_end,
+                ),
+            );
+        }
+        RoiEditorResult::Moved { index, new_roi } => {
+            if index < state.rois.len() {
+                state.rois[index] = new_roi;
+                clear_analyze_downstream(state);
+            }
+        }
+        RoiEditorResult::Selected(idx) => {
+            state.selected_roi = Some(idx);
+        }
+        RoiEditorResult::Deselected => {
+            state.selected_roi = None;
+        }
+        RoiEditorResult::ClickedPixel(y, x) => {
+            state.selected_pixel = Some((y, x));
+            state.pixel_fit_result = None;
+            state.last_fit_feedback = None;
+        }
+        RoiEditorResult::None => {}
+    }
+}
+
+/// Clear downstream fit results when ROI changes.
+fn clear_analyze_downstream(state: &mut AppState) {
+    state.pixel_fit_result = None;
+    state.spatial_result = None;
+    state.last_fit_feedback = None;
 }
 
 // ---- Spectrum Panel (Column 3) ----
@@ -733,9 +863,16 @@ fn build_fit_config(state: &AppState) -> Result<FitConfig, String> {
 }
 
 fn fit_pixel(state: &mut AppState) {
+    state.last_fit_feedback = None;
+
     let config = match build_fit_config(state) {
         Ok(c) => c,
         Err(e) => {
+            state.last_fit_feedback = Some(crate::state::FitFeedback {
+                success: false,
+                summary: e.clone(),
+                densities: vec![],
+            });
             state.status_message = e;
             return;
         }
@@ -744,7 +881,13 @@ fn fit_pixel(state: &mut AppState) {
     let (y, x) = match state.selected_pixel {
         Some(px) => px,
         None => {
-            state.status_message = "No pixel selected".into();
+            let msg = "No pixel selected".to_string();
+            state.last_fit_feedback = Some(crate::state::FitFeedback {
+                success: false,
+                summary: msg.clone(),
+                densities: vec![],
+            });
+            state.status_message = msg;
             return;
         }
     };
@@ -756,7 +899,13 @@ fn fit_pixel(state: &mut AppState) {
 
     let shape = norm.transmission.shape();
     if y >= shape[1] || x >= shape[2] {
-        state.status_message = "Selected pixel is out of bounds".into();
+        let msg = "Selected pixel is out of bounds".to_string();
+        state.last_fit_feedback = Some(crate::state::FitFeedback {
+            success: false,
+            summary: msg.clone(),
+            densities: vec![],
+        });
+        state.status_message = msg;
         return;
     }
 
@@ -768,30 +917,62 @@ fn fit_pixel(state: &mut AppState) {
         .map(|e| norm.uncertainty[[e, y, x]].max(1e-10))
         .collect();
 
+    let enabled_symbols: Vec<String> = state
+        .isotope_entries
+        .iter()
+        .filter(|e| e.enabled && e.resonance_data.is_some())
+        .map(|e| e.symbol.clone())
+        .collect();
+
     let result = match nereids_pipeline::pipeline::fit_spectrum(&t_spectrum, &sigma, &config) {
         Ok(r) => r,
         Err(e) => {
-            state.status_message = format!("Fit error: {}", e);
+            let msg = format!("Fit error: {e}");
+            state.last_fit_feedback = Some(crate::state::FitFeedback {
+                success: false,
+                summary: msg.clone(),
+                densities: vec![],
+            });
+            state.status_message = msg;
             return;
         }
     };
 
-    state.status_message = if result.converged {
+    let summary = if result.converged {
         format!(
-            "Pixel ({},{}) fit converged, chi2_r = {:.4}",
+            "Pixel ({},{}) converged, \u{03C7}\u{00B2}\u{1D63} = {:.4}",
             y, x, result.reduced_chi_squared
         )
     } else {
-        format!("Pixel ({},{}) fit did NOT converge", y, x)
+        format!("Pixel ({},{}) did NOT converge", y, x)
     };
 
+    let densities: Vec<(String, f64)> = enabled_symbols
+        .iter()
+        .zip(result.densities.iter())
+        .map(|(s, &d)| (s.clone(), d))
+        .collect();
+
+    state.last_fit_feedback = Some(crate::state::FitFeedback {
+        success: result.converged,
+        summary: summary.clone(),
+        densities,
+    });
+    state.status_message = summary;
     state.pixel_fit_result = Some(result);
 }
 
 fn fit_roi(state: &mut AppState) {
+    state.last_fit_feedback = None;
+
     let config = match build_fit_config(state) {
         Ok(c) => c,
         Err(e) => {
+            state.last_fit_feedback = Some(crate::state::FitFeedback {
+                success: false,
+                summary: e.clone(),
+                densities: vec![],
+            });
             state.status_message = e;
             return;
         }
@@ -805,21 +986,46 @@ fn fit_roi(state: &mut AppState) {
     let roi = match state.bounding_roi() {
         Some(r) => r,
         None => {
-            state.status_message = "No ROI defined".into();
+            let msg = "No ROI defined".to_string();
+            state.last_fit_feedback = Some(crate::state::FitFeedback {
+                success: false,
+                summary: msg.clone(),
+                densities: vec![],
+            });
+            state.status_message = msg;
             return;
         }
     };
 
     if roi.y_start >= roi.y_end || roi.x_start >= roi.x_end {
-        state.status_message = "Invalid ROI: start must be less than end".into();
+        let msg = "Invalid ROI: start must be less than end".to_string();
+        state.last_fit_feedback = Some(crate::state::FitFeedback {
+            success: false,
+            summary: msg.clone(),
+            densities: vec![],
+        });
+        state.status_message = msg;
         return;
     }
 
     let shape = norm.transmission.shape();
     if roi.y_end > shape[1] || roi.x_end > shape[2] {
-        state.status_message = "ROI exceeds image dimensions".into();
+        let msg = "ROI exceeds image dimensions".to_string();
+        state.last_fit_feedback = Some(crate::state::FitFeedback {
+            success: false,
+            summary: msg.clone(),
+            densities: vec![],
+        });
+        state.status_message = msg;
         return;
     }
+
+    let enabled_symbols: Vec<String> = state
+        .isotope_entries
+        .iter()
+        .filter(|e| e.enabled && e.resonance_data.is_some())
+        .map(|e| e.symbol.clone())
+        .collect();
 
     let result = match nereids_pipeline::spatial::fit_roi(
         norm.transmission.view(),
@@ -830,24 +1036,44 @@ fn fit_roi(state: &mut AppState) {
     ) {
         Ok(r) => r,
         Err(e) => {
-            state.status_message = format!("ROI fit error: {}", e);
+            let msg = format!("ROI fit error: {e}");
+            state.last_fit_feedback = Some(crate::state::FitFeedback {
+                success: false,
+                summary: msg.clone(),
+                densities: vec![],
+            });
+            state.status_message = msg;
             return;
         }
     };
 
-    state.status_message = if result.converged {
+    let summary = if result.converged {
         format!(
-            "ROI fit converged, chi2_r = {:.4}",
+            "ROI fit converged, \u{03C7}\u{00B2}\u{1D63} = {:.4}",
             result.reduced_chi_squared
         )
     } else {
-        "ROI fit did NOT converge".into()
+        "ROI fit did NOT converge".to_string()
     };
 
+    let densities: Vec<(String, f64)> = enabled_symbols
+        .iter()
+        .zip(result.densities.iter())
+        .map(|(s, &d)| (s.clone(), d))
+        .collect();
+
+    state.last_fit_feedback = Some(crate::state::FitFeedback {
+        success: result.converged,
+        summary: summary.clone(),
+        densities,
+    });
+    state.status_message = summary;
     state.pixel_fit_result = Some(result);
 }
 
 pub fn run_spatial_map(state: &mut AppState) {
+    state.last_fit_feedback = None;
+
     let config = match build_fit_config(state) {
         Ok(c) => c,
         Err(e) => {

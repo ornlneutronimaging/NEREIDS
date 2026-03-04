@@ -273,6 +273,17 @@ pub enum SpectrumAxis {
     TofMicroseconds,
 }
 
+/// Prominent feedback from a fit operation, displayed in the Analyze controls.
+#[derive(Debug, Clone)]
+pub struct FitFeedback {
+    /// True if fit converged.
+    pub success: bool,
+    /// Summary line (e.g. "Pixel (3,5) converged, chi2_r = 1.23").
+    pub summary: String,
+    /// Per-isotope densities: (symbol, density_atoms_per_barn).
+    pub densities: Vec<(String, f64)>,
+}
+
 /// A single provenance event in the session audit trail.
 #[derive(Debug, Clone)]
 pub struct ProvenanceEvent {
@@ -529,6 +540,8 @@ pub struct AppState {
     // -- Results --
     pub pixel_fit_result: Option<SpectrumFitResult>,
     pub spatial_result: Option<SpatialResult>,
+    /// Prominent feedback from last fit attempt (pixel or ROI).
+    pub last_fit_feedback: Option<FitFeedback>,
 
     // -- Pipeline / wizard --
     pub fitting_type: Option<FittingType>,
@@ -765,7 +778,6 @@ pub enum GuidedStep {
     Bin,
     Rebin,
     Normalize,
-    Roi,
     Analyze,
     Results,
     ForwardModel,
@@ -783,7 +795,6 @@ impl GuidedStep {
             Self::Bin => "Bin",
             Self::Rebin => "Rebin",
             Self::Normalize => "Normalize",
-            Self::Roi => "ROI",
             Self::Analyze => "Analyze",
             Self::Results => "Results",
             Self::ForwardModel => "Forward Model",
@@ -807,7 +818,6 @@ impl GuidedStep {
                 req(Self::Load),
                 req(Self::Bin),
                 req(Self::Normalize),
-                req(Self::Roi),
                 req(Self::Analyze),
                 req(Self::Results),
             ],
@@ -815,7 +825,6 @@ impl GuidedStep {
                 req(Self::Configure),
                 req(Self::Load),
                 req(Self::Bin),
-                req(Self::Roi),
                 req(Self::Normalize),
                 req(Self::Analyze),
                 req(Self::Results),
@@ -825,14 +834,12 @@ impl GuidedStep {
                 req(Self::Load),
                 opt(Self::Rebin),
                 req(Self::Normalize),
-                req(Self::Roi),
                 req(Self::Analyze),
                 req(Self::Results),
             ],
             (FittingType::Single, DataType::PreNormalized) => vec![
                 req(Self::Configure),
                 req(Self::Load),
-                req(Self::Roi),
                 opt(Self::Rebin),
                 req(Self::Normalize),
                 req(Self::Analyze),
@@ -842,7 +849,6 @@ impl GuidedStep {
                 req(Self::Configure),
                 req(Self::Load),
                 opt(Self::Rebin),
-                req(Self::Roi),
                 req(Self::Analyze),
                 req(Self::Results),
             ],
@@ -850,7 +856,6 @@ impl GuidedStep {
                 req(Self::Configure),
                 req(Self::Load),
                 opt(Self::Rebin),
-                req(Self::Roi),
                 req(Self::Analyze),
                 req(Self::Results),
             ],
@@ -1076,6 +1081,7 @@ impl Default for AppState {
 
             pixel_fit_result: None,
             spatial_result: None,
+            last_fit_feedback: None,
 
             fitting_type: None,
             data_type: None,
