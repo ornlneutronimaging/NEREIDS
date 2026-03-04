@@ -439,8 +439,13 @@ fn step_is_complete(step: GuidedStep, state: &AppState) -> bool {
             InputMode::TransmissionTiff => {
                 state.sample_data.is_some() && state.spectrum_values.is_some()
             }
-            InputMode::Hdf5Histogram | InputMode::Hdf5Event => {
+            InputMode::Hdf5Histogram => {
                 state.sample_data.is_some() && state.spectrum_values.is_some()
+            }
+            InputMode::Hdf5Event => {
+                // Events: only need file selected; histogramming is in Bin step
+                state.hdf5_path.is_some()
+                    && state.nexus_metadata.as_ref().is_some_and(|m| m.has_events)
             }
         },
         GuidedStep::Configure => {

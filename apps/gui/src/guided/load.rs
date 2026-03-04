@@ -74,8 +74,11 @@ fn has_required_data(state: &AppState) -> bool {
         InputMode::TransmissionTiff => {
             state.sample_data.is_some() && state.spectrum_values.is_some()
         }
-        InputMode::Hdf5Histogram | InputMode::Hdf5Event => {
-            state.sample_data.is_some() && state.spectrum_values.is_some()
+        InputMode::Hdf5Histogram => state.sample_data.is_some() && state.spectrum_values.is_some(),
+        InputMode::Hdf5Event => {
+            // For events, we only need the file selected here;
+            // histogramming happens in the Bin step.
+            state.hdf5_path.is_some() && state.nexus_metadata.as_ref().is_some_and(|m| m.has_events)
         }
     }
 }
@@ -330,36 +333,6 @@ fn hdf5_event_tab(ui: &mut egui::Ui, state: &mut AppState) {
 
     show_hdf5_tree(ui, state);
 
-    if state.hdf5_path.is_some() && state.nexus_metadata.as_ref().is_some_and(|m| m.has_events) {
-        design::card_with_header(ui, "Binning Parameters", None, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("TOF bins:");
-                ui.add(egui::DragValue::new(&mut state.event_n_bins).range(1..=10000));
-            });
-            ui.horizontal(|ui| {
-                ui.label("TOF min (\u{00B5}s):");
-                ui.add(egui::DragValue::new(&mut state.event_tof_min_us).speed(10.0));
-            });
-            ui.horizontal(|ui| {
-                ui.label("TOF max (\u{00B5}s):");
-                ui.add(egui::DragValue::new(&mut state.event_tof_max_us).speed(10.0));
-            });
-            ui.horizontal(|ui| {
-                ui.label("Height (px):");
-                ui.add(egui::DragValue::new(&mut state.event_height).range(1..=4096));
-            });
-            ui.horizontal(|ui| {
-                ui.label("Width (px):");
-                ui.add(egui::DragValue::new(&mut state.event_width).range(1..=4096));
-            });
-
-            ui.add_space(4.0);
-            if ui.button("Histogram Events").clicked() {
-                load_hdf5_events(state);
-            }
-        });
-    }
-
     show_loaded_info(ui, state);
 }
 
@@ -560,70 +533,6 @@ fn load_hdf5_histogram(state: &mut AppState) {
         }
         Err(e) => {
             state.status_message = format!("HDF5 load failed: {e}");
-        }
-    }
-}
-
-/// Load event data from HDF5 file with histogramming.
-fn load_hdf5_events(state: &mut AppState) {
-    let path = match state.hdf5_path {
-        Some(ref p) => p.clone(),
-        None => return,
-    };
-
-    state.invalidate_results();
-
-    let params = nereids_io::nexus::EventBinningParams {
-        n_bins: state.event_n_bins,
-        tof_min_us: state.event_tof_min_us,
-        tof_max_us: state.event_tof_max_us,
-        height: state.event_height,
-        width: state.event_width,
-    };
-
-    match nereids_io::nexus::load_nexus_events(&path, &params) {
-        Ok(data) => {
-            let shape = data.counts.shape();
-            state.preview_image = Some(data.counts.sum_axis(ndarray::Axis(0)));
-            state.status_message = format!(
-                "Events histogrammed: {} bins, {}×{} px",
-                shape[0], shape[1], shape[2]
-            );
-
-            state.spectrum_values = Some(data.tof_edges_us.clone());
-            state.spectrum_unit = nereids_io::spectrum::SpectrumUnit::TofMicroseconds;
-            state.spectrum_kind = nereids_io::spectrum::SpectrumValueKind::BinEdges;
-
-            if let Some(fp) = data.flight_path_m
-                && fp.is_finite()
-                && fp > 0.0
-            {
-                state.beamline.flight_path_m = fp;
-            }
-
-            if let Some(offset_ns) = state.nexus_metadata.as_ref().and_then(|m| m.tof_offset_ns) {
-                let delay_us = offset_ns / 1000.0;
-                if delay_us.is_finite() {
-                    state.beamline.delay_us = delay_us;
-                }
-            }
-
-            if let Some(dead) = data.dead_pixels {
-                state.dead_pixels = Some(dead);
-            }
-
-            let shape = data.counts.shape();
-            state.log_provenance(
-                ProvenanceEventKind::DataLoaded,
-                format!(
-                    "Loaded HDF5 events: {} frames ({}x{})",
-                    shape[0], shape[1], shape[2]
-                ),
-            );
-            state.sample_data = Some(data.counts);
-        }
-        Err(e) => {
-            state.status_message = format!("Event histogramming failed: {e}");
         }
     }
 }
