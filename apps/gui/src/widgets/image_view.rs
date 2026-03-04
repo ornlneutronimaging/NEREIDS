@@ -181,31 +181,16 @@ pub fn show_image_with_roi_editor(
                 });
             }
         } else {
-            // No ROI selected — check if clicking on any existing ROI to select it,
-            // otherwise draw new
-            let hit = hit_test_rois(py, px, rois);
-            if hit.is_some() {
-                // Will be handled by click (drag_stopped with no movement) below
-                ui.data_mut(|d| {
-                    d.insert_temp(
-                        drag_id,
-                        RoiDragMode::DrawNew {
-                            origin_y: py,
-                            origin_x: px,
-                        },
-                    )
-                });
-            } else {
-                ui.data_mut(|d| {
-                    d.insert_temp(
-                        drag_id,
-                        RoiDragMode::DrawNew {
-                            origin_y: py,
-                            origin_x: px,
-                        },
-                    )
-                });
-            }
+            // No ROI selected — start DrawNew; click vs drag is resolved at drag_stopped.
+            ui.data_mut(|d| {
+                d.insert_temp(
+                    drag_id,
+                    RoiDragMode::DrawNew {
+                        origin_y: py,
+                        origin_x: px,
+                    },
+                )
+            });
         }
     }
 
@@ -518,6 +503,9 @@ fn screen_to_pixel(
     image_rect: egui::Rect,
     (height, width): (usize, usize),
 ) -> (usize, usize) {
+    if image_rect.width() <= 0.0 || image_rect.height() <= 0.0 {
+        return (0, 0);
+    }
     let rel_x = ((pos.x - image_rect.left()) / image_rect.width()).clamp(0.0, 1.0);
     let rel_y = ((pos.y - image_rect.top()) / image_rect.height()).clamp(0.0, 1.0);
     let px_x = (rel_x * width as f32) as usize;

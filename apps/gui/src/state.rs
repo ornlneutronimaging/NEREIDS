@@ -927,6 +927,7 @@ impl AppState {
         self.selected_roi = None;
         self.pixel_fit_result = None;
         self.spatial_result = None;
+        self.last_fit_feedback = None;
         self.fitting_rois.clear();
         self.preview_image = None;
         self.energies = None;

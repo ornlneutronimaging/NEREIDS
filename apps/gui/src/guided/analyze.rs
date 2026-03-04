@@ -359,10 +359,10 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 .text("TOF bin"),
             );
         }
-    } else if state.preview_image.is_some() {
+    } else if let Some(ref preview) = state.preview_image {
         // -- Raw preview with interactive ROI editor --
         ui.label("Preview (summed counts):");
-        let preview = state.preview_image.clone().unwrap();
+        let preview = preview.clone();
         let rois_snap: Vec<_> = state.rois.clone();
         let sel_roi = state.selected_roi;
         let sel_px = state.selected_pixel;
@@ -392,6 +392,10 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 && let Some(idx) = state.selected_roi
                 && idx < state.rois.len()
             {
+                state.log_provenance(
+                    crate::state::ProvenanceEventKind::ConfigChanged,
+                    format!("ROI #{} deleted", idx + 1),
+                );
                 state.rois.remove(idx);
                 state.selected_roi = None;
                 clear_analyze_downstream(state);
@@ -400,6 +404,11 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 .add_enabled(!state.rois.is_empty(), egui::Button::new("Clear ROIs"))
                 .clicked()
             {
+                let n = state.rois.len();
+                state.log_provenance(
+                    crate::state::ProvenanceEventKind::ConfigChanged,
+                    format!("Cleared all {n} ROIs"),
+                );
                 state.rois.clear();
                 state.selected_roi = None;
                 clear_analyze_downstream(state);
@@ -444,6 +453,17 @@ fn apply_roi_editor_result(state: &mut AppState, result: RoiEditorResult) {
             if index < state.rois.len() {
                 state.rois[index] = new_roi;
                 clear_analyze_downstream(state);
+                state.log_provenance(
+                    crate::state::ProvenanceEventKind::ConfigChanged,
+                    format!(
+                        "ROI #{} moved: y=[{}, {}] x=[{}, {}]",
+                        index + 1,
+                        new_roi.y_start,
+                        new_roi.y_end,
+                        new_roi.x_start,
+                        new_roi.x_end,
+                    ),
+                );
             }
         }
         RoiEditorResult::Selected(idx) => {
@@ -466,6 +486,7 @@ fn clear_analyze_downstream(state: &mut AppState) {
     state.pixel_fit_result = None;
     state.spatial_result = None;
     state.last_fit_feedback = None;
+    state.fitting_rois.clear();
 }
 
 // ---- Spectrum Panel (Column 3) ----
