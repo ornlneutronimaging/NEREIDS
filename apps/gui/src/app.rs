@@ -1,7 +1,7 @@
 //! Main application structure and egui App implementation.
 
 use crate::guided;
-use crate::state::{AppState, EndfStatus, ProvenanceEventKind, Tab, UiMode};
+use crate::state::{AppState, EndfStatus, ProvenanceEventKind, SessionCache, Tab, UiMode};
 use crate::studio;
 use crate::theme;
 use crate::widgets;
@@ -11,15 +11,33 @@ pub struct NereidsApp {
     pub state: AppState,
 }
 
+const SESSION_CACHE_KEY: &str = "nereids_session_cache";
+
 impl NereidsApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        Self {
-            state: AppState::default(),
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let mut state = AppState::default();
+
+        // Restore cached session from previous run (if any)
+        if let Some(storage) = cc.storage
+            && let Some(cache) = eframe::get_value::<SessionCache>(storage, SESSION_CACHE_KEY)
+        {
+            state.cached_session = Some(cache);
         }
+
+        Self { state }
     }
 }
 
 impl eframe::App for NereidsApp {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        if let Some(cache) = SessionCache::from_state(&self.state) {
+            eframe::set_value(storage, SESSION_CACHE_KEY, &cache);
+        } else {
+            // Clear stale cache when no pipeline is configured
+            storage.set_string(SESSION_CACHE_KEY, String::new());
+        }
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Apply theme
         theme::apply_theme(ctx, self.state.theme_preference);

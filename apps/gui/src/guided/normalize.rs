@@ -1,8 +1,7 @@
 //! Step 3: Normalize — transmission computation, preview, and analysis mode selection.
 
 use crate::state::{
-    AnalysisMode, AppState, GuidedStep, InputMode, ProvenanceEventKind, SpectrumAxis,
-    SpectrumDataSource,
+    AnalysisMode, AppState, InputMode, ProvenanceEventKind, SpectrumAxis, SpectrumDataSource,
 };
 use crate::widgets::design::{self, NavAction};
 use crate::widgets::image_view::show_viridis_image;
@@ -56,8 +55,8 @@ pub fn normalize_step(ui: &mut egui::Ui, state: &mut AppState) {
         can_continue,
         "Normalize data to continue",
     ) {
-        NavAction::Back => state.guided_step = GuidedStep::Configure,
-        NavAction::Continue => state.guided_step = GuidedStep::Analyze,
+        NavAction::Back => state.nav_prev(),
+        NavAction::Continue => state.nav_next(),
         NavAction::None => {}
     }
 

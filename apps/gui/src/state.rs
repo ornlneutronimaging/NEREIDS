@@ -17,6 +17,208 @@ use nereids_pipeline::detectability::TraceDetectabilityReport;
 use nereids_pipeline::pipeline::SpectrumFitResult;
 use nereids_pipeline::spatial::SpatialResult;
 
+/// Lightweight session cache for persistence across app restarts.
+/// Only stores the subset of state needed to resume a previous pipeline.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SessionCache {
+    pub fitting_type: Option<FittingType>,
+    pub data_type: Option<DataType>,
+    pub input_mode: InputMode,
+    pub analysis_mode: AnalysisMode,
+    /// Beamline flight path (m).
+    pub flight_path_m: f64,
+    /// Beamline delay (μs).
+    pub delay_us: f64,
+    /// Temperature (K).
+    pub temperature_k: f64,
+    /// Proton charge sample.
+    pub proton_charge_sample: f64,
+    /// Proton charge open beam.
+    pub proton_charge_ob: f64,
+    /// Isotope list: (z, a, symbol, density, enabled).
+    pub isotopes: Vec<CachedIsotope>,
+    /// ENDF library name (e.g. "ENDF/B-VIII.0").
+    pub endf_library_name: String,
+    /// Solver method.
+    pub solver_method: CachedSolverMethod,
+    /// Resolution broadening: "gaussian" or "tabulated".
+    pub resolution_kind: String,
+    /// Gaussian Δt (μs), only used when resolution_kind == "gaussian".
+    pub resolution_delta_t_us: f64,
+    /// Gaussian ΔL (m), only used when resolution_kind == "gaussian".
+    pub resolution_delta_l_m: f64,
+    /// Tabulated resolution file path (if applicable).
+    pub resolution_path: Option<String>,
+}
+
+/// Serializable solver method for session cache.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum CachedSolverMethod {
+    LevenbergMarquardt,
+    PoissonKL,
+}
+
+/// A cached isotope entry (serializable).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CachedIsotope {
+    pub z: u32,
+    pub a: u32,
+    pub symbol: String,
+    pub density: f64,
+    pub enabled: bool,
+}
+
+impl SessionCache {
+    /// Build a session cache from the current application state.
+    pub fn from_state(state: &AppState) -> Option<Self> {
+        // Only cache if a pipeline has been configured
+        if state.fitting_type.is_none() || state.data_type.is_none() || state.pipeline.is_empty() {
+            return None;
+        }
+        Some(Self {
+            fitting_type: state.fitting_type,
+            data_type: state.data_type,
+            input_mode: state.input_mode,
+            analysis_mode: state.analysis_mode,
+            flight_path_m: state.beamline.flight_path_m,
+            delay_us: state.beamline.delay_us,
+            temperature_k: state.temperature_k,
+            proton_charge_sample: state.proton_charge_sample,
+            proton_charge_ob: state.proton_charge_ob,
+            isotopes: state
+                .isotope_entries
+                .iter()
+                .map(|e| CachedIsotope {
+                    z: e.z,
+                    a: e.a,
+                    symbol: e.symbol.clone(),
+                    density: e.initial_density,
+                    enabled: e.enabled,
+                })
+                .collect(),
+            endf_library_name: endf_library_name(state.endf_library).to_string(),
+            solver_method: match state.solver_method {
+                SolverMethod::LevenbergMarquardt => CachedSolverMethod::LevenbergMarquardt,
+                SolverMethod::PoissonKL => CachedSolverMethod::PoissonKL,
+            },
+            resolution_kind: match &state.resolution_mode {
+                ResolutionMode::Gaussian { .. } => "gaussian".to_string(),
+                ResolutionMode::Tabulated { .. } => "tabulated".to_string(),
+            },
+            resolution_delta_t_us: match &state.resolution_mode {
+                ResolutionMode::Gaussian { delta_t_us, .. } => *delta_t_us,
+                _ => 0.0,
+            },
+            resolution_delta_l_m: match &state.resolution_mode {
+                ResolutionMode::Gaussian { delta_l_m, .. } => *delta_l_m,
+                _ => 0.0,
+            },
+            resolution_path: match &state.resolution_mode {
+                ResolutionMode::Tabulated { path, .. } => Some(path.to_string_lossy().to_string()),
+                _ => None,
+            },
+        })
+    }
+
+    /// Apply cached settings to app state (restores pipeline + config).
+    pub fn apply_to(&self, state: &mut AppState) {
+        state.fitting_type = self.fitting_type;
+        state.data_type = self.data_type;
+        state.input_mode = self.input_mode;
+        state.analysis_mode = self.analysis_mode;
+        state.beamline.flight_path_m = self.flight_path_m;
+        state.beamline.delay_us = self.delay_us;
+        state.temperature_k = self.temperature_k;
+        state.proton_charge_sample = self.proton_charge_sample;
+        state.proton_charge_ob = self.proton_charge_ob;
+
+        // Restore isotope entries (without resonance data — needs re-fetch)
+        state.isotope_entries = self
+            .isotopes
+            .iter()
+            .map(|c| IsotopeEntry {
+                z: c.z,
+                a: c.a,
+                symbol: c.symbol.clone(),
+                initial_density: c.density,
+                resonance_data: None,
+                enabled: c.enabled,
+                endf_status: EndfStatus::Pending,
+            })
+            .collect();
+
+        // Restore library by matching label
+        state.endf_library = match self.endf_library_name.as_str() {
+            "ENDF/B-VIII.1" => nereids_endf::retrieval::EndfLibrary::EndfB8_1,
+            "JEFF-3.3" => nereids_endf::retrieval::EndfLibrary::Jeff3_3,
+            "JENDL-5" => nereids_endf::retrieval::EndfLibrary::Jendl5,
+            _ => nereids_endf::retrieval::EndfLibrary::EndfB8_0,
+        };
+
+        // Restore solver method
+        state.solver_method = match self.solver_method {
+            CachedSolverMethod::LevenbergMarquardt => SolverMethod::LevenbergMarquardt,
+            CachedSolverMethod::PoissonKL => SolverMethod::PoissonKL,
+        };
+
+        // Restore resolution mode
+        state.resolution_mode = if self.resolution_kind == "tabulated" {
+            if let Some(ref p) = self.resolution_path {
+                ResolutionMode::Tabulated {
+                    path: PathBuf::from(p),
+                    data: None, // will need re-parse on first use
+                    error: None,
+                }
+            } else {
+                ResolutionMode::Gaussian {
+                    delta_t_us: self.resolution_delta_t_us,
+                    delta_l_m: self.resolution_delta_l_m,
+                }
+            }
+        } else {
+            ResolutionMode::Gaussian {
+                delta_t_us: self.resolution_delta_t_us,
+                delta_l_m: self.resolution_delta_l_m,
+            }
+        };
+
+        // Rebuild pipeline
+        state.rebuild_pipeline();
+    }
+
+    /// Summary label for display (e.g. "Spatial + Events, 3 isotopes").
+    pub fn summary(&self) -> String {
+        let fitting = match self.fitting_type {
+            Some(FittingType::Spatial) => "Spatial",
+            Some(FittingType::Single) => "Single",
+            None => "Unknown",
+        };
+        let data = match self.data_type {
+            Some(DataType::Events) => "Events",
+            Some(DataType::PreNormalized) => "Pre-norm",
+            Some(DataType::Transmission) => "Transmission",
+            None => "Unknown",
+        };
+        let n_iso = self.isotopes.iter().filter(|i| i.enabled).count();
+        if n_iso > 0 {
+            format!("{fitting} + {data}, {n_iso} isotope(s)")
+        } else {
+            format!("{fitting} + {data}")
+        }
+    }
+}
+
+/// Map an EndfLibrary variant to its display name for persistence.
+fn endf_library_name(lib: nereids_endf::retrieval::EndfLibrary) -> &'static str {
+    use nereids_endf::retrieval::EndfLibrary;
+    match lib {
+        EndfLibrary::EndfB8_0 => "ENDF/B-VIII.0",
+        EndfLibrary::EndfB8_1 => "ENDF/B-VIII.1",
+        EndfLibrary::Jeff3_3 => "JEFF-3.3",
+        EndfLibrary::Jendl5 => "JENDL-5",
+    }
+}
+
 /// Result of a background ENDF fetch for a single isotope.
 pub struct EndfFetchResult {
     pub index: usize,
@@ -25,7 +227,7 @@ pub struct EndfFetchResult {
 }
 
 /// Input mode: which type of data is being loaded.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum InputMode {
     /// Sample TIFF stack + Open beam TIFF stack + Spectrum file.
     TiffPair,
@@ -38,7 +240,7 @@ pub enum InputMode {
 }
 
 /// Analysis mode — determines how fitting operates in the Analyze step.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AnalysisMode {
     /// Fit every pixel independently (full spatial map).
     FullSpatialMap,
@@ -318,6 +520,12 @@ pub struct AppState {
     pub pixel_fit_result: Option<SpectrumFitResult>,
     pub spatial_result: Option<SpatialResult>,
 
+    // -- Pipeline / wizard --
+    pub fitting_type: Option<FittingType>,
+    pub data_type: Option<DataType>,
+    pub pipeline: Vec<PipelineEntry>,
+    pub wizard_step: u8,
+
     // -- UI state --
     pub ui_mode: UiMode,
     pub guided_step: GuidedStep,
@@ -426,6 +634,10 @@ pub struct AppState {
     pub export_format: ExportFormat,
     pub export_directory: Option<PathBuf>,
     pub export_status: Option<String>,
+
+    // -- Session persistence --
+    /// Cached session from a previous run (loaded at startup, cleared on use).
+    pub cached_session: Option<SessionCache>,
 }
 
 /// ENDF fetch lifecycle for an isotope entry.
@@ -502,12 +714,39 @@ pub enum StudioDocTab {
     Detectability,
 }
 
+/// Fitting type chosen in the wizard (Q1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum FittingType {
+    Spatial,
+    Single,
+}
+
+/// Data type chosen in the wizard (Q2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DataType {
+    Events,
+    PreNormalized,
+    Transmission,
+}
+
+/// A single entry in the dynamic pipeline.
+#[derive(Debug, Clone, Copy)]
+pub struct PipelineEntry {
+    pub step: GuidedStep,
+    pub optional: bool,
+}
+
 /// Step within the Guided workflow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuidedStep {
-    Load,
+    Landing,
+    Wizard,
     Configure,
+    Load,
+    Bin,
+    Rebin,
     Normalize,
+    Roi,
     Analyze,
     Results,
     ForwardModel,
@@ -518,9 +757,14 @@ impl GuidedStep {
     /// Human-readable label for display.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Load => "Load",
+            Self::Landing => "Home",
+            Self::Wizard => "Setup",
             Self::Configure => "Configure",
+            Self::Load => "Load",
+            Self::Bin => "Bin",
+            Self::Rebin => "Rebin",
             Self::Normalize => "Normalize",
+            Self::Roi => "ROI",
             Self::Analyze => "Analyze",
             Self::Results => "Results",
             Self::ForwardModel => "Forward Model",
@@ -528,26 +772,70 @@ impl GuidedStep {
         }
     }
 
-    /// 1-based step number (None for tool steps).
-    pub fn number(self) -> Option<u8> {
-        match self {
-            Self::Load => Some(1),
-            Self::Configure => Some(2),
-            Self::Normalize => Some(3),
-            Self::Analyze => Some(4),
-            Self::Results => Some(5),
-            Self::ForwardModel | Self::Detectability => None,
+    /// Compute the pipeline steps for the given fitting type and data type.
+    pub fn pipeline(fitting: FittingType, data: DataType) -> Vec<PipelineEntry> {
+        let req = |s| PipelineEntry {
+            step: s,
+            optional: false,
+        };
+        let opt = |s| PipelineEntry {
+            step: s,
+            optional: true,
+        };
+        match (fitting, data) {
+            (FittingType::Spatial, DataType::Events) => vec![
+                req(Self::Configure),
+                req(Self::Load),
+                req(Self::Bin),
+                req(Self::Normalize),
+                req(Self::Roi),
+                req(Self::Analyze),
+                req(Self::Results),
+            ],
+            (FittingType::Single, DataType::Events) => vec![
+                req(Self::Configure),
+                req(Self::Load),
+                req(Self::Bin),
+                req(Self::Roi),
+                req(Self::Normalize),
+                req(Self::Analyze),
+                req(Self::Results),
+            ],
+            (FittingType::Spatial, DataType::PreNormalized) => vec![
+                req(Self::Configure),
+                req(Self::Load),
+                opt(Self::Rebin),
+                req(Self::Normalize),
+                req(Self::Roi),
+                req(Self::Analyze),
+                req(Self::Results),
+            ],
+            (FittingType::Single, DataType::PreNormalized) => vec![
+                req(Self::Configure),
+                req(Self::Load),
+                req(Self::Roi),
+                opt(Self::Rebin),
+                req(Self::Normalize),
+                req(Self::Analyze),
+                req(Self::Results),
+            ],
+            (FittingType::Spatial, DataType::Transmission) => vec![
+                req(Self::Configure),
+                req(Self::Load),
+                opt(Self::Rebin),
+                req(Self::Roi),
+                req(Self::Analyze),
+                req(Self::Results),
+            ],
+            (FittingType::Single, DataType::Transmission) => vec![
+                req(Self::Configure),
+                req(Self::Load),
+                opt(Self::Rebin),
+                req(Self::Analyze),
+                req(Self::Results),
+            ],
         }
     }
-
-    /// Ordered list of the five main workflow steps.
-    pub const WORKFLOW: [GuidedStep; 5] = [
-        Self::Load,
-        Self::Configure,
-        Self::Normalize,
-        Self::Analyze,
-        Self::Results,
-    ];
 }
 
 /// Theme preference.
@@ -627,6 +915,57 @@ impl AppState {
         });
     }
 
+    /// Index of the current step in the pipeline, or `None` if not a pipeline step.
+    pub fn pipeline_index(&self) -> Option<usize> {
+        self.pipeline
+            .iter()
+            .position(|e| e.step == self.guided_step)
+    }
+
+    /// 1-based display number for a pipeline step (skipping optional steps).
+    /// Returns `None` for optional steps (displayed as "—").
+    pub fn step_display_number(&self, step: GuidedStep) -> Option<u8> {
+        let mut n = 0u8;
+        for entry in &self.pipeline {
+            if !entry.optional {
+                n += 1;
+            }
+            if entry.step == step {
+                return if entry.optional { None } else { Some(n) };
+            }
+        }
+        None
+    }
+
+    /// Navigate to the next step in the pipeline.
+    pub fn nav_next(&mut self) {
+        if let Some(idx) = self.pipeline_index()
+            && idx + 1 < self.pipeline.len()
+        {
+            self.guided_step = self.pipeline[idx + 1].step;
+        }
+    }
+
+    /// Navigate to the previous step in the pipeline.
+    /// From the first pipeline step, returns to the Wizard.
+    pub fn nav_prev(&mut self) {
+        if let Some(idx) = self.pipeline_index() {
+            if idx > 0 {
+                self.guided_step = self.pipeline[idx - 1].step;
+            } else {
+                self.guided_step = GuidedStep::Wizard;
+                self.wizard_step = 2; // return to Confirm page
+            }
+        }
+    }
+
+    /// Recompute the pipeline from the current fitting_type and data_type.
+    pub fn rebuild_pipeline(&mut self) {
+        if let (Some(ft), Some(dt)) = (self.fitting_type, self.data_type) {
+            self.pipeline = GuidedStep::pipeline(ft, dt);
+        }
+    }
+
     /// Ensure `tile_display` has enough entries for the current result.
     /// Call after spatial analysis completes.
     pub fn init_tile_display(&mut self, n_density_maps: usize) {
@@ -679,8 +1018,13 @@ impl Default for AppState {
             pixel_fit_result: None,
             spatial_result: None,
 
+            fitting_type: None,
+            data_type: None,
+            pipeline: Vec::new(),
+            wizard_step: 0,
+
             ui_mode: UiMode::Guided,
-            guided_step: GuidedStep::Load,
+            guided_step: GuidedStep::Landing,
             theme_preference: ThemePreference::Auto,
             active_tab: Tab::Spectrum,
             status_message: "Ready".into(),
@@ -766,6 +1110,8 @@ impl Default for AppState {
             export_format: ExportFormat::Tiff,
             export_directory: None,
             export_status: None,
+
+            cached_session: None,
         }
     }
 }

@@ -42,7 +42,7 @@ tiff = "0.11"
 image = "0.25"
 pyo3 = { version = "0.28", features = ["extension-module"] }
 numpy = "0.28"
-eframe = "0.33"
+eframe = { version = "0.33", features = ["persistence"] }
 egui = "0.33"
 egui_extras = { version = "0.33", features = ["image", "svg"] }
 egui_plot = "0.34"

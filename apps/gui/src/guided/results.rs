@@ -1,7 +1,7 @@
 //! Step 5: Results — spatial map results display, pixel inspector, and export.
 
 use super::result_widgets;
-use crate::state::{AppState, Colormap, GuidedStep};
+use crate::state::{AppState, Colormap};
 use crate::widgets::design;
 use crate::widgets::image_view::show_colormapped_image_with_roi;
 
@@ -81,8 +81,8 @@ pub fn results_step(ui: &mut egui::Ui, state: &mut AppState) {
 
     // -- Navigation --
     ui.add_space(8.0);
-    if ui.button("\u{2190} Back to Analyze").clicked() {
-        state.guided_step = GuidedStep::Analyze;
+    if ui.button("\u{2190} Back").clicked() {
+        state.nav_prev();
     }
 }
 

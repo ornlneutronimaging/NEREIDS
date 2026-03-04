@@ -27,7 +27,7 @@ pub fn status_bar(ctx: &egui::Context, state: &AppState) {
                 // Mode + step
                 let mode_text = match state.ui_mode {
                     UiMode::Guided => {
-                        if let Some(n) = state.guided_step.number() {
+                        if let Some(n) = state.step_display_number(state.guided_step) {
                             format!("Guided — Step {}: {}", n, state.guided_step.label())
                         } else {
                             format!("Guided — {}", state.guided_step.label())

@@ -3,7 +3,7 @@
 //! Prototype: `.content-area` → cards with drop zones, auto-load,
 //! format hints, and a Continue button with data guard.
 
-use crate::state::{AppState, GuidedStep, InputMode, ProvenanceEventKind};
+use crate::state::{AppState, InputMode, ProvenanceEventKind};
 use crate::theme::ThemeColors;
 use crate::widgets::design;
 use ndarray::Axis;
@@ -24,7 +24,6 @@ const INPUT_MODES: [InputMode; 4] = [
 
 /// Draw the Load step content.
 pub fn load_step(ui: &mut egui::Ui, state: &mut AppState) {
-    let tc = ThemeColors::from_ctx(ui.ctx());
     design::content_header(ui, "Load Data", "Select input format and load files");
 
     // Input mode tabs — invalidate results when switching modes
@@ -48,23 +47,20 @@ pub fn load_step(ui: &mut egui::Ui, state: &mut AppState) {
         InputMode::Hdf5Event => hdf5_event_tab(ui, state),
     }
 
-    // ── Continue button ────────────────────────────────────────
+    // ── Navigation ─────────────────────────────────────────────
     ui.add_space(12.0);
     let can_continue = has_required_data(state);
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-        ui.add_enabled_ui(can_continue, |ui| {
-            if design::btn_primary(ui, "Continue \u{2192}").clicked() {
-                state.guided_step = GuidedStep::Configure;
-            }
-        });
-        if !can_continue {
-            ui.label(
-                egui::RichText::new("Load data to continue")
-                    .size(10.0)
-                    .color(tc.fg3),
-            );
-        }
-    });
+    match design::nav_buttons(
+        ui,
+        Some("\u{2190} Back"),
+        "Continue \u{2192}",
+        can_continue,
+        "Load data to continue",
+    ) {
+        design::NavAction::Back => state.nav_prev(),
+        design::NavAction::Continue => state.nav_next(),
+        design::NavAction::None => {}
+    }
 }
 
 /// Check whether the minimum data for this input mode is loaded.
