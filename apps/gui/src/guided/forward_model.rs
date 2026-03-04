@@ -102,7 +102,7 @@ pub fn forward_model_step(ui: &mut egui::Ui, state: &mut AppState) {
 /// Build an optional InstrumentParams from the FM resolution state.
 /// Returns `(instrument, warning)` — warning is set if resolution is enabled
 /// but parameters are invalid (e.g., flight path not configured).
-fn fm_instrument(state: &AppState) -> (Option<InstrumentParams>, Option<&'static str>) {
+pub(crate) fn fm_instrument(state: &AppState) -> (Option<InstrumentParams>, Option<&'static str>) {
     if !state.fm_resolution_enabled {
         return (None, None);
     }
@@ -122,7 +122,7 @@ fn fm_instrument(state: &AppState) -> (Option<InstrumentParams>, Option<&'static
 }
 
 /// Resolution card: enable checkbox, flight path (read-only), delta_t, delta_l.
-fn fm_resolution_card(ui: &mut egui::Ui, state: &mut AppState) {
+pub(crate) fn fm_resolution_card(ui: &mut egui::Ui, state: &mut AppState) {
     design::card_with_header(ui, "Instrument Resolution", None, |ui| {
         let prev_enabled = state.fm_resolution_enabled;
         let prev_dt = state.fm_delta_t_us;
@@ -164,7 +164,7 @@ fn fm_resolution_card(ui: &mut egui::Ui, state: &mut AppState) {
 }
 
 /// Isotopes card: library, temperature, isotope list with density sliders.
-fn fm_isotopes_card(ui: &mut egui::Ui, state: &mut AppState) {
+pub(crate) fn fm_isotopes_card(ui: &mut egui::Ui, state: &mut AppState) {
     let isotope_locked = state.is_fetching_fm_endf;
 
     // Card header: Library + Temperature inline
@@ -339,7 +339,7 @@ fn fm_isotopes_card(ui: &mut egui::Ui, state: &mut AppState) {
 }
 
 /// Hero spectrum plot with energy/TOF axis and per-isotope contribution lines.
-fn fm_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
+pub(crate) fn fm_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
     // Collect enabled isotopes that have resonance data
     let enabled: Vec<_> = state
         .fm_isotope_entries
@@ -498,7 +498,7 @@ fn fm_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
         });
 }
 
-fn library_name(lib: EndfLibrary) -> &'static str {
+pub(crate) fn library_name(lib: EndfLibrary) -> &'static str {
     match lib {
         EndfLibrary::EndfB8_0 => "ENDF/B-VIII.0",
         EndfLibrary::EndfB8_1 => "ENDF/B-VIII.1",
@@ -507,7 +507,7 @@ fn library_name(lib: EndfLibrary) -> &'static str {
     }
 }
 
-fn fm_fetch_endf_data(state: &mut AppState) {
+pub(crate) fn fm_fetch_endf_data(state: &mut AppState) {
     use nereids_core::types::Isotope;
     use nereids_endf::retrieval;
 

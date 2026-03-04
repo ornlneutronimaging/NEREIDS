@@ -56,7 +56,7 @@ pub fn detectability_step(ui: &mut egui::Ui, state: &mut AppState) {
 }
 
 /// ENDF library selector, shared by matrix and trace isotopes.
-fn detect_library_selector(ui: &mut egui::Ui, state: &mut AppState, locked: bool) {
+pub(crate) fn detect_library_selector(ui: &mut egui::Ui, state: &mut AppState, locked: bool) {
     let prev_lib = state.detect_endf_library;
     ui.add_enabled_ui(!locked, |ui| {
         ui.horizontal(|ui| {
@@ -88,7 +88,7 @@ fn detect_library_selector(ui: &mut egui::Ui, state: &mut AppState, locked: bool
 }
 
 /// Card: matrix isotopes list with add/remove, density, ENDF badges.
-fn detect_matrix_card(ui: &mut egui::Ui, state: &mut AppState, locked: bool) {
+pub(crate) fn detect_matrix_card(ui: &mut egui::Ui, state: &mut AppState, locked: bool) {
     design::card_with_header(ui, "Matrix Isotopes", None, |ui| {
         let mut matrix_remove = None;
         for (idx, matrix) in state.detect_matrix_entries.iter_mut().enumerate() {
@@ -196,7 +196,7 @@ fn detect_matrix_card(ui: &mut egui::Ui, state: &mut AppState, locked: bool) {
 }
 
 /// Card: trace isotopes list with add/remove, concentration, ENDF status.
-fn detect_trace_card(ui: &mut egui::Ui, state: &mut AppState, locked: bool) {
+pub(crate) fn detect_trace_card(ui: &mut egui::Ui, state: &mut AppState, locked: bool) {
     design::card_with_header(ui, "Trace Isotopes", None, |ui| {
         let mut to_remove = None;
         for (idx, entry) in state.detect_trace_entries.iter_mut().enumerate() {
@@ -297,7 +297,7 @@ fn detect_trace_card(ui: &mut egui::Ui, state: &mut AppState, locked: bool) {
 }
 
 /// Resolution card: enable checkbox, flight path (read-only), delta_t, delta_l.
-fn detect_resolution_card(ui: &mut egui::Ui, state: &mut AppState) {
+pub(crate) fn detect_resolution_card(ui: &mut egui::Ui, state: &mut AppState) {
     design::card_with_header(ui, "Instrument Resolution", None, |ui| {
         let prev_enabled = state.detect_resolution_enabled;
         let prev_dt = state.detect_delta_t_us;
@@ -338,7 +338,7 @@ fn detect_resolution_card(ui: &mut egui::Ui, state: &mut AppState) {
 }
 
 /// Advanced config: SNR threshold, I0, energy range, points, temperature.
-fn detect_advanced_config(ui: &mut egui::Ui, state: &mut AppState) {
+pub(crate) fn detect_advanced_config(ui: &mut egui::Ui, state: &mut AppState) {
     let prev_snr = state.detect_snr_threshold;
     let prev_i0 = state.detect_i0;
     let prev_emin = state.detect_energy_min;
@@ -409,7 +409,7 @@ fn detect_advanced_config(ui: &mut egui::Ui, state: &mut AppState) {
 }
 
 /// Fetch ENDF + Run Analysis buttons.
-fn detect_action_buttons(ui: &mut egui::Ui, state: &mut AppState) {
+pub(crate) fn detect_action_buttons(ui: &mut egui::Ui, state: &mut AppState) {
     let has_missing_endf = state
         .detect_matrix_entries
         .iter()
@@ -449,7 +449,7 @@ fn detect_action_buttons(ui: &mut egui::Ui, state: &mut AppState) {
 }
 
 /// Results panel: hero stat row, verdict table with badges, delta-T spectrum.
-fn detect_results_panel(ui: &mut egui::Ui, state: &AppState) {
+pub(crate) fn detect_results_panel(ui: &mut egui::Ui, state: &AppState) {
     if state.detect_results.is_empty() {
         design::card(ui, |ui| {
             ui.label(
@@ -691,7 +691,7 @@ fn library_name(lib: EndfLibrary) -> &'static str {
 
 /// Fetch ENDF data for matrix + trace isotopes.
 /// Index convention: 0..N = matrix entries, N.. = trace entries at (index - N).
-fn detect_fetch_endf_data(state: &mut AppState) {
+pub(crate) fn detect_fetch_endf_data(state: &mut AppState) {
     use nereids_core::types::Isotope;
     use nereids_endf::retrieval;
 
