@@ -66,8 +66,10 @@ pub fn status_bar(ctx: &egui::Context, state: &AppState) {
 
                 // Beamline
                 let fp = state.beamline.flight_path_m;
-                let fp_text = if fp.fract() == 0.0 {
-                    format!("VENUS {} m", fp as i64)
+                let fp_text = if !fp.is_finite() {
+                    "VENUS \u{2014}".to_owned()
+                } else if (fp - fp.round()).abs() < 1e-6 {
+                    format!("VENUS {} m", fp.round() as i64)
                 } else {
                     format!("VENUS {} m", fp)
                 };

@@ -13,6 +13,18 @@ use crate::widgets::design;
 use crate::widgets::image_view::show_colormapped_image;
 use egui_plot::{Line, Plot, PlotPoints};
 
+/// Format a float without unnecessary trailing zeros; non-finite → "—".
+fn format_compact_f64(value: f64) -> String {
+    if !value.is_finite() {
+        return "\u{2014}".to_owned();
+    }
+    if value.fract().abs() < 1e-9 {
+        return format!("{:.0}", value);
+    }
+    let s = format!("{:.3}", value);
+    s.trim_end_matches('0').trim_end_matches('.').to_owned()
+}
+
 /// Render the Studio mode content.
 pub fn studio_content(ctx: &egui::Context, state: &mut AppState) {
     let has_results = state.spatial_result.is_some();
@@ -149,8 +161,9 @@ fn analysis_map_column(
     symbols: &[String],
     density_maps: &[ndarray::Array2<f64>],
 ) {
-    // Header: isotope selector + colormap/save controls
+    // Header: isotope selector (colormap/save controls are in tile_toolbelt below)
     ui.horizontal(|ui| {
+        ui.label("Isotope:");
         egui::ComboBox::from_id_salt("analysis_isotope_sel")
             .selected_text(
                 symbols
@@ -162,19 +175,6 @@ fn analysis_map_column(
                     ui.selectable_value(&mut state.studio_analysis_isotope, i, sym);
                 }
             });
-
-        let tile_idx = state.studio_analysis_isotope;
-        if let Some(td) = state.tile_display.get_mut(tile_idx) {
-            egui::ComboBox::from_id_salt("analysis_cmap")
-                .selected_text(td.colormap.label())
-                .width(80.0)
-                .show_ui(ui, |ui| {
-                    for cm in Colormap::ALL {
-                        ui.selectable_value(&mut td.colormap, cm, cm.label());
-                    }
-                });
-            ui.checkbox(&mut td.show_colorbar, "Colorbar");
-        }
     });
     ui.add_space(4.0);
 
@@ -659,16 +659,19 @@ fn beamline_summary(ui: &mut egui::Ui, state: &AppState) {
     design::card_with_header(ui, "Beamline", None, |ui| {
         ui.label(
             egui::RichText::new(format!(
-                "Flight path: {:.2} m",
-                state.beamline.flight_path_m
+                "Flight path: {} m",
+                format_compact_f64(state.beamline.flight_path_m)
             ))
             .small()
             .color(colors.fg2),
         );
         ui.label(
-            egui::RichText::new(format!("Delay: {:.2} \u{03bc}s", state.beamline.delay_us))
-                .small()
-                .color(colors.fg2),
+            egui::RichText::new(format!(
+                "Delay: {} \u{03bc}s",
+                format_compact_f64(state.beamline.delay_us)
+            ))
+            .small()
+            .color(colors.fg2),
         );
     });
 }
