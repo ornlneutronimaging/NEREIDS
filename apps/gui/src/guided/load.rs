@@ -36,6 +36,7 @@ pub fn load_step(ui: &mut egui::Ui, state: &mut AppState) {
         state.invalidate_results();
         state.sample_data = None;
         state.open_beam_data = None;
+        state.load_error = false;
     }
 
     ui.add_space(8.0);
@@ -50,12 +51,17 @@ pub fn load_step(ui: &mut egui::Ui, state: &mut AppState) {
     // ── Navigation ─────────────────────────────────────────────
     ui.add_space(12.0);
     let can_continue = has_required_data(state);
+    let nav_hint = if state.load_error {
+        "Loading failed \u{2014} fix files or retry"
+    } else {
+        "Select files to continue"
+    };
     match design::nav_buttons(
         ui,
         Some("\u{2190} Back"),
         "Continue \u{2192}",
         can_continue,
-        "Load data to continue",
+        nav_hint,
     ) {
         design::NavAction::Back => state.nav_prev(),
         design::NavAction::Continue => state.nav_next(),
@@ -103,6 +109,7 @@ fn tiff_pair_tab(ui: &mut egui::Ui, state: &mut AppState) {
             state.energies = None;
             state.pixel_fit_result = None;
             state.spatial_result = None;
+            state.load_error = false;
         }
 
         ui.add_space(6.0);
@@ -114,22 +121,24 @@ fn tiff_pair_tab(ui: &mut egui::Ui, state: &mut AppState) {
             state.energies = None;
             state.pixel_fit_result = None;
             state.spatial_result = None;
+            state.load_error = false;
         }
 
         ui.add_space(8.0);
         spectrum_section(ui, state);
     });
 
+    // Auto-load when all files are selected
     let can_load = state.sample_path.is_some()
         && state.open_beam_path.is_some()
-        && state.spectrum_path.is_some();
-    ui.add_space(8.0);
-    ui.add_enabled_ui(can_load, |ui| {
-        if design::btn_primary(ui, "Load All").clicked() {
-            load_all_data(state);
-        }
-    });
+        && state.spectrum_path.is_some()
+        && state.sample_data.is_none()
+        && !state.load_error;
+    if can_load {
+        load_all_data(state);
+    }
 
+    load_status_ui(ui, state);
     show_loaded_info(ui, state);
 }
 
@@ -153,20 +162,23 @@ fn transmission_tiff_tab(ui: &mut egui::Ui, state: &mut AppState) {
             state.energies = None;
             state.pixel_fit_result = None;
             state.spatial_result = None;
+            state.load_error = false;
         }
 
         ui.add_space(8.0);
         spectrum_section(ui, state);
     });
 
-    let can_load = state.sample_path.is_some() && state.spectrum_path.is_some();
-    ui.add_space(8.0);
-    ui.add_enabled_ui(can_load, |ui| {
-        if design::btn_primary(ui, "Load All").clicked() {
-            load_all_data(state);
-        }
-    });
+    // Auto-load when all files are selected
+    let can_load = state.sample_path.is_some()
+        && state.spectrum_path.is_some()
+        && state.sample_data.is_none()
+        && !state.load_error;
+    if can_load {
+        load_all_data(state);
+    }
 
+    load_status_ui(ui, state);
     show_loaded_info(ui, state);
 }
 
@@ -239,6 +251,7 @@ fn spectrum_section(ui: &mut egui::Ui, state: &mut AppState) {
         state.spectrum_values = None;
         state.energies = None;
         state.normalized = None;
+        state.load_error = false;
     }
 
     // Show parsed info (no unit/kind toggles — auto-detected in load_all_data)
@@ -301,18 +314,19 @@ fn hdf5_histogram_tab(ui: &mut egui::Ui, state: &mut AppState) {
 
     show_hdf5_tree(ui, state);
 
-    if state.hdf5_path.is_some()
+    // Auto-load histogram when file is selected and has histogram data
+    let can_load = state.hdf5_path.is_some()
         && state
             .nexus_metadata
             .as_ref()
             .is_some_and(|m| m.has_histogram)
-    {
-        ui.add_space(8.0);
-        if ui.button("Load Histogram").clicked() {
-            load_hdf5_histogram(state);
-        }
+        && state.sample_data.is_none()
+        && !state.load_error;
+    if can_load {
+        load_hdf5_histogram(state);
     }
 
+    load_status_ui(ui, state);
     show_loaded_info(ui, state);
 }
 
@@ -361,6 +375,7 @@ fn hdf5_drop_zone(ui: &mut egui::Ui, state: &mut AppState) {
         state.invalidate_results();
         state.sample_data = None;
         state.open_beam_data = None;
+        state.load_error = false;
 
         // Probe the file immediately
         match nereids_io::nexus::probe_nexus(&file) {
@@ -474,6 +489,19 @@ fn show_hdf5_tree(ui: &mut egui::Ui, state: &AppState) {
 
 // ── Data loading logic ─────────────────────────────────────────
 
+/// Show load error + retry button, or loading spinner.
+fn load_status_ui(ui: &mut egui::Ui, state: &mut AppState) {
+    if state.load_error {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(&state.status_message).color(crate::theme::semantic::RED));
+            if ui.button("Retry").clicked() {
+                state.load_error = false;
+            }
+        });
+    }
+}
+
 /// Load histogram data from HDF5 file.
 fn load_hdf5_histogram(state: &mut AppState) {
     let path = match state.hdf5_path {
@@ -533,6 +561,7 @@ fn load_hdf5_histogram(state: &mut AppState) {
         }
         Err(e) => {
             state.status_message = format!("HDF5 load failed: {e}");
+            state.load_error = true;
         }
     }
 }
@@ -559,6 +588,7 @@ fn load_all_data(state: &mut AppState) {
             }
             Err(e) => {
                 state.status_message = format!("Failed to load sample: {}", e);
+                state.load_error = true;
                 return;
             }
         }
@@ -576,6 +606,7 @@ fn load_all_data(state: &mut AppState) {
             Err(e) => {
                 state.status_message = format!("Failed to load open beam: {}", e);
                 state.sample_data = None; // Clear partial data
+                state.load_error = true;
                 return;
             }
         }
@@ -592,6 +623,7 @@ fn load_all_data(state: &mut AppState) {
         );
         state.sample_data = None;
         state.open_beam_data = None;
+        state.load_error = true;
         return;
     }
 
@@ -602,6 +634,7 @@ fn load_all_data(state: &mut AppState) {
                 // Validate monotonicity
                 if let Err(e) = nereids_io::spectrum::validate_monotonic(&values) {
                     state.status_message = format!("Spectrum: {}", e);
+                    state.load_error = true;
                     return;
                 }
 
@@ -629,6 +662,7 @@ fn load_all_data(state: &mut AppState) {
                     state.spectrum_kind,
                 ) {
                     state.status_message = format!("Spectrum: {}", e);
+                    state.load_error = true;
                     return;
                 }
 
@@ -637,6 +671,7 @@ fn load_all_data(state: &mut AppState) {
             }
             Err(e) => {
                 state.status_message = format!("Failed to parse spectrum: {}", e);
+                state.load_error = true;
             }
         }
     }

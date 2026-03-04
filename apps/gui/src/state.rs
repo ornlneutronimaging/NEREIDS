@@ -536,6 +536,9 @@ pub struct AppState {
     pub is_fitting: bool,
     pub is_fetching_endf: bool,
 
+    /// Prevents auto-load retry after a loading failure; cleared when file paths change.
+    pub load_error: bool,
+
     // -- HDF5/NeXus --
     pub hdf5_path: Option<PathBuf>,
     pub nexus_metadata: Option<NexusMetadata>,
@@ -993,6 +996,7 @@ impl Default for AppState {
             open_beam_data: None,
             normalized: None,
             dead_pixels: None,
+            load_error: false,
 
             spectrum_path: None,
             spectrum_values: None,
