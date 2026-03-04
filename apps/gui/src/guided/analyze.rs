@@ -741,7 +741,7 @@ fn build_fit_config(state: &AppState) -> Result<FitConfig, String> {
                 .map(ResolutionFunction::Gaussian),
             ResolutionMode::Tabulated {
                 data: Some(tab), ..
-            } => Some(ResolutionFunction::Tabulated((**tab).clone())),
+            } => Some(ResolutionFunction::Tabulated(Arc::clone(tab))),
             ResolutionMode::Tabulated { data: None, .. } => None,
         }
     } else {

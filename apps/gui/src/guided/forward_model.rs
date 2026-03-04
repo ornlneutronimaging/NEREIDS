@@ -41,6 +41,8 @@ pub fn forward_model_step(ui: &mut egui::Ui, state: &mut AppState) {
                     .collect();
                 state.fm_endf_library = state.endf_library;
                 state.fm_temperature_k = state.temperature_k;
+                state.fm_resolution_enabled = state.resolution_enabled;
+                state.fm_resolution_mode = state.resolution_mode.clone();
                 state.fm_spectrum = None;
                 state.fm_per_isotope_spectra.clear();
             }
@@ -66,6 +68,8 @@ pub fn forward_model_step(ui: &mut egui::Ui, state: &mut AppState) {
                     .collect();
                 state.endf_library = state.fm_endf_library;
                 state.temperature_k = state.fm_temperature_k;
+                state.resolution_enabled = state.fm_resolution_enabled;
+                state.resolution_mode = state.fm_resolution_mode.clone();
                 state.spatial_result = None;
                 state.pixel_fit_result = None;
             }
@@ -129,7 +133,7 @@ pub(crate) fn fm_instrument(state: &AppState) -> (Option<InstrumentParams>, Opti
             data: Some(tab), ..
         } => (
             Some(InstrumentParams {
-                resolution: ResolutionFunction::Tabulated((**tab).clone()),
+                resolution: ResolutionFunction::Tabulated(Arc::clone(tab)),
             }),
             None,
         ),

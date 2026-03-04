@@ -212,7 +212,33 @@ pub enum ResolutionMode {
     Tabulated {
         path: PathBuf,
         data: Option<Arc<nereids_physics::resolution::TabulatedResolution>>,
+        error: Option<String>,
     },
+}
+
+impl PartialEq for ResolutionMode {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Gaussian {
+                    delta_t_us: dt1,
+                    delta_l_m: dl1,
+                },
+                Self::Gaussian {
+                    delta_t_us: dt2,
+                    delta_l_m: dl2,
+                },
+            ) => dt1 == dt2 && dl1 == dl2,
+            (Self::Tabulated { data: d1, .. }, Self::Tabulated { data: d2, .. }) => {
+                match (d1, d2) {
+                    (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                    (None, None) => true,
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
 }
 
 impl Default for ResolutionMode {

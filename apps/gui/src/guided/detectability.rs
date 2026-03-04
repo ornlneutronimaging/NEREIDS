@@ -579,7 +579,7 @@ fn run_detectability(state: &mut AppState) {
             }
             ResolutionMode::Tabulated {
                 data: Some(tab), ..
-            } => Some(ResolutionFunction::Tabulated((**tab).clone())),
+            } => Some(ResolutionFunction::Tabulated(Arc::clone(tab))),
             ResolutionMode::Tabulated { data: None, .. } => {
                 state.status_message = "Resolution file not loaded — broadening disabled".into();
                 None

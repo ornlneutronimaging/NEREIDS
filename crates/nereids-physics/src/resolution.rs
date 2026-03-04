@@ -30,6 +30,7 @@
 
 use nereids_core::constants::{DIVISION_FLOOR, NEAR_ZERO_FLOOR};
 use std::fmt;
+use std::sync::Arc;
 
 /// TOF conversion factor: t[μs] = TOF_FACTOR × L[m] / √(E[eV]).
 ///
@@ -379,12 +380,15 @@ impl TabulatedResolution {
 }
 
 /// Resolution function: either analytical Gaussian or tabulated from Monte Carlo.
+///
+/// The `Tabulated` variant wraps an `Arc` so that cloning (e.g., per-pixel in
+/// spatial mapping) is a cheap reference-count bump rather than a deep copy.
 #[derive(Debug, Clone)]
 pub enum ResolutionFunction {
     /// Analytical Gaussian resolution from instrument parameters.
     Gaussian(ResolutionParams),
     /// Tabulated resolution from Monte Carlo instrument simulation.
-    Tabulated(TabulatedResolution),
+    Tabulated(Arc<TabulatedResolution>),
 }
 
 impl TabulatedResolution {

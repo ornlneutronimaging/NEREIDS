@@ -519,6 +519,7 @@ pub fn resolution_card(
                 *mode = ResolutionMode::Tabulated {
                     path: std::path::PathBuf::new(),
                     data: None,
+                    error: None,
                 };
                 changed = true;
             }
@@ -555,7 +556,7 @@ pub fn resolution_card(
                     changed = true;
                 }
             }
-            ResolutionMode::Tabulated { path, data } => {
+            ResolutionMode::Tabulated { path, data, error } => {
                 ui.horizontal(|ui| {
                     if ui.button("Load resolution file\u{2026}").clicked()
                         && let Some(file) = rfd::FileDialog::new()
@@ -567,15 +568,14 @@ pub fn resolution_card(
                             Ok(tab) => {
                                 *path = file;
                                 *data = Some(Arc::new(tab));
+                                *error = None;
                                 changed = true;
                             }
                             Err(e) => {
                                 *path = file;
                                 *data = None;
-                                ui.colored_label(
-                                    Color32::from_rgb(255, 100, 100),
-                                    format!("Parse error: {e}"),
-                                );
+                                *error = Some(format!("{e}"));
+                                changed = true;
                             }
                         }
                     }
@@ -587,7 +587,7 @@ pub fn resolution_card(
                         );
                     }
                 });
-                // Show summary if loaded
+                // Show summary if loaded, or error if parse failed
                 if let Some(tab) = data {
                     let n = tab.ref_energies().len();
                     let e_min = tab.ref_energies().first().copied().unwrap_or(0.0);
@@ -598,6 +598,11 @@ pub fn resolution_card(
                         ))
                         .size(11.0)
                         .color(Color32::from_rgb(100, 200, 100)),
+                    );
+                } else if let Some(err) = error {
+                    ui.colored_label(
+                        Color32::from_rgb(255, 100, 100),
+                        format!("Parse error: {err}"),
                     );
                 } else if !path.as_os_str().is_empty() {
                     ui.colored_label(
