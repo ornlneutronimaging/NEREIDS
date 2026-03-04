@@ -497,6 +497,9 @@ fn load_status_ui(ui: &mut egui::Ui, state: &mut AppState) {
             ui.label(egui::RichText::new(&state.status_message).color(crate::theme::semantic::RED));
             if ui.button("Retry").clicked() {
                 state.load_error = false;
+                state.sample_data = None;
+                state.open_beam_data = None;
+                state.spectrum_values = None;
             }
         });
     }
@@ -647,9 +650,12 @@ fn load_all_data(state: &mut AppState) {
                     nereids_io::spectrum::SpectrumValueKind::BinCenters
                 } else {
                     state.status_message = format!(
-                        "Warning: spectrum has {n_values} values, data has {n_frames} frames"
+                        "Spectrum mismatch: {n_values} values vs {n_frames} frames \
+                         (expected {f1} for BinEdges or {n_frames} for BinCenters)",
+                        f1 = n_frames + 1,
                     );
-                    nereids_io::spectrum::SpectrumValueKind::BinEdges
+                    state.load_error = true;
+                    return;
                 };
 
                 // Default to TOF microseconds
