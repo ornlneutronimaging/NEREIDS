@@ -1,6 +1,16 @@
 //! Shared image viewer widget: colormapped 2D array display with click-to-select.
+//!
+//! Also provides an interactive ROI editor variant (`show_image_with_roi_editor`)
+//! that supports drag-to-draw rectangle ROI on the image.
 
 use crate::state::{Colormap, RoiSelection};
+
+/// Transient drag origin, stored in egui per-widget temp memory during ROI drawing.
+#[derive(Clone, Copy)]
+struct RoiDragOrigin {
+    y: usize,
+    x: usize,
+}
 
 /// Display a 2D f64 array as a viridis-colormapped image with click-to-select-pixel.
 ///
@@ -61,6 +71,112 @@ pub fn show_colormapped_image_with_roi(
         return (None, egui::Rect::NOTHING);
     }
 
+    let (response, painter, image_rect) =
+        prepare_image_painter(ui, data, tex_id, colormap, egui::Sense::click());
+
+    // Draw ROI overlay
+    if let Some(roi) = roi {
+        draw_roi_overlay(&painter, image_rect, (height, width), roi);
+    }
+
+    // Draw selected pixel marker
+    if let Some((py, px)) = selected_pixel {
+        draw_pixel_marker(&painter, image_rect, (height, width), py, px);
+    }
+
+    if response.clicked()
+        && let Some(pos) = response.interact_pointer_pos()
+    {
+        let (py, px) = screen_to_pixel(pos, image_rect, (height, width));
+        return (Some((py, px)), image_rect);
+    }
+
+    (None, image_rect)
+}
+
+/// Display a colormapped image with interactive drag-to-draw ROI editor.
+///
+/// The user can drag on the image to draw a new ROI rectangle. A rubber-band
+/// rectangle (white) is shown during the drag; the committed ROI is drawn in
+/// blue. Returns `Some(new_roi)` when the user finishes a drag, `None` otherwise.
+pub fn show_image_with_roi_editor(
+    ui: &mut egui::Ui,
+    data: &ndarray::Array2<f64>,
+    tex_id: &str,
+    colormap: Colormap,
+    current_roi: Option<&RoiSelection>,
+) -> (Option<RoiSelection>, egui::Rect) {
+    let (height, width) = (data.shape()[0], data.shape()[1]);
+    if width == 0 || height == 0 {
+        ui.label("(empty image)");
+        return (None, egui::Rect::NOTHING);
+    }
+
+    let (response, painter, image_rect) =
+        prepare_image_painter(ui, data, tex_id, colormap, egui::Sense::click_and_drag());
+
+    let dims = (height, width);
+    let drag_id = response.id;
+    let mut committed_roi: Option<RoiSelection> = None;
+    let mut is_dragging = false;
+
+    // --- Drag state machine ---
+    if response.drag_started()
+        && let Some(pos) = response.interact_pointer_pos()
+    {
+        let (y, x) = screen_to_pixel(pos, image_rect, dims);
+        ui.data_mut(|d| d.insert_temp(drag_id, RoiDragOrigin { y, x }));
+    }
+
+    if response.dragged()
+        && let Some(origin) = ui.data(|d| d.get_temp::<RoiDragOrigin>(drag_id))
+    {
+        is_dragging = true;
+        if let Some(pos) = response.interact_pointer_pos() {
+            let (cy, cx) = screen_to_pixel(pos, image_rect, dims);
+            let draft = make_roi(origin.y, origin.x, cy, cx, dims);
+            draw_roi_draft_overlay(&painter, image_rect, dims, &draft);
+        }
+    }
+
+    if response.drag_stopped()
+        && let Some(origin) = ui.data(|d| d.get_temp::<RoiDragOrigin>(drag_id))
+    {
+        if let Some(pos) = response.interact_pointer_pos() {
+            let (cy, cx) = screen_to_pixel(pos, image_rect, dims);
+            let roi = make_roi(origin.y, origin.x, cy, cx, dims);
+            if roi.y_end > roi.y_start && roi.x_end > roi.x_start {
+                committed_roi = Some(roi);
+            }
+        }
+        ui.data_mut(|d| d.remove::<RoiDragOrigin>(drag_id));
+    }
+
+    // Draw the committed ROI overlay when not actively dragging
+    if !is_dragging && let Some(roi) = current_roi {
+        draw_roi_overlay(&painter, image_rect, dims, roi);
+    }
+
+    // Crosshair cursor when hovering over the image
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+    }
+
+    (committed_roi, image_rect)
+}
+
+/// Prepare the colormapped texture and allocate an interactive painter.
+///
+/// Shared between `show_colormapped_image_with_roi` (click) and
+/// `show_image_with_roi_editor` (click + drag).
+fn prepare_image_painter(
+    ui: &mut egui::Ui,
+    data: &ndarray::Array2<f64>,
+    tex_id: &str,
+    colormap: Colormap,
+    sense: egui::Sense,
+) -> (egui::Response, egui::Painter, egui::Rect) {
+    let (height, width) = (data.shape()[0], data.shape()[1]);
     let (vmin, vmax) = data_range(data);
     let range = if (vmax - vmin).abs() < 1e-30 {
         1.0
@@ -94,8 +210,7 @@ pub fn show_colormapped_image_with_roi(
     let scale = available_width / width as f32;
     let display_size = egui::Vec2::new(width as f32 * scale, height as f32 * scale);
 
-    // Allocate interactive rect with click sensing (ui.image() does not register clicks).
-    let (response, painter) = ui.allocate_painter(display_size, egui::Sense::click());
+    let (response, painter) = ui.allocate_painter(display_size, sense);
     let image_rect = response.rect;
     painter.image(
         texture.id(),
@@ -104,30 +219,79 @@ pub fn show_colormapped_image_with_roi(
         egui::Color32::WHITE,
     );
 
-    // Draw ROI overlay
-    if let Some(roi) = roi {
-        draw_roi_overlay(&painter, image_rect, (height, width), roi);
+    (response, painter, image_rect)
+}
+
+/// Convert a screen position to pixel coordinates, clamped to image bounds.
+fn screen_to_pixel(
+    pos: egui::Pos2,
+    image_rect: egui::Rect,
+    (height, width): (usize, usize),
+) -> (usize, usize) {
+    let rel_x = ((pos.x - image_rect.left()) / image_rect.width()).clamp(0.0, 1.0);
+    let rel_y = ((pos.y - image_rect.top()) / image_rect.height()).clamp(0.0, 1.0);
+    let px_x = (rel_x * width as f32) as usize;
+    let px_y = (rel_y * height as f32) as usize;
+    (
+        px_y.min(height.saturating_sub(1)),
+        px_x.min(width.saturating_sub(1)),
+    )
+}
+
+/// Build a `RoiSelection` from two corner points, auto-swapping so start <= end.
+fn make_roi(
+    y0: usize,
+    x0: usize,
+    y1: usize,
+    x1: usize,
+    (height, width): (usize, usize),
+) -> RoiSelection {
+    RoiSelection {
+        y_start: y0.min(y1),
+        y_end: (y0.max(y1) + 1).min(height),
+        x_start: x0.min(x1),
+        x_end: (x0.max(x1) + 1).min(width),
+    }
+}
+
+/// Draw a white semi-transparent rectangle for the in-progress ROI draft.
+fn draw_roi_draft_overlay(
+    painter: &egui::Painter,
+    image_rect: egui::Rect,
+    image_dims: (usize, usize),
+    roi: &RoiSelection,
+) {
+    let (height, width) = image_dims;
+    if width == 0 || height == 0 {
+        return;
+    }
+    if roi.x_start >= roi.x_end || roi.y_start >= roi.y_end {
+        return;
     }
 
-    // Draw selected pixel marker
-    if let Some((py, px)) = selected_pixel {
-        draw_pixel_marker(&painter, image_rect, (height, width), py, px);
-    }
+    let x0 = image_rect.left() + (roi.x_start as f32 / width as f32) * image_rect.width();
+    let x1 = image_rect.left() + (roi.x_end as f32 / width as f32) * image_rect.width();
+    let y0 = image_rect.top() + (roi.y_start as f32 / height as f32) * image_rect.height();
+    let y1 = image_rect.top() + (roi.y_end as f32 / height as f32) * image_rect.height();
 
-    if response.clicked()
-        && let Some(pos) = response.interact_pointer_pos()
-    {
-        let rel_x = ((pos.x - image_rect.left()) / image_rect.width()).clamp(0.0, 1.0);
-        let rel_y = ((pos.y - image_rect.top()) / image_rect.height()).clamp(0.0, 1.0);
-        let px_x = (rel_x * width as f32) as usize;
-        let px_y = (rel_y * height as f32) as usize;
-        return (
-            Some((px_y.min(height - 1), px_x.min(width - 1))),
-            image_rect,
-        );
-    }
+    let roi_rect = egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1));
 
-    (None, image_rect)
+    // White semi-transparent fill (distinct from blue committed overlay)
+    painter.rect_filled(
+        roi_rect,
+        0.0,
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30),
+    );
+    // White border
+    painter.rect_stroke(
+        roi_rect,
+        0.0,
+        egui::Stroke::new(
+            1.5,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 180),
+        ),
+        egui::StrokeKind::Outside,
+    );
 }
 
 /// Compute the (min, max) of finite values in a 2D array.

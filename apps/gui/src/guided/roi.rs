@@ -1,12 +1,13 @@
-//! ROI step: region of interest selection.
+//! ROI step: region of interest selection with interactive image preview.
 //!
-//! This step appears in most pipelines. The user sets the spatial
-//! region to analyze via coordinate DragValues. Full image is the
-//! default (no ROI = entire detector).
+//! This step appears in most pipelines. The user draws a rectangle ROI
+//! directly on the preview image (drag-to-draw), or adjusts coordinates
+//! via DragValues. Full image is the default (no ROI = entire detector).
 
-use crate::state::{AppState, FittingType, RoiSelection};
+use crate::state::{AppState, Colormap, FittingType, RoiSelection};
 use crate::theme::ThemeColors;
 use crate::widgets::design;
+use crate::widgets::image_view::show_image_with_roi_editor;
 
 /// Render the ROI step.
 pub fn roi_step(ui: &mut egui::Ui, state: &mut AppState) {
@@ -24,6 +25,78 @@ pub fn roi_step(ui: &mut egui::Ui, state: &mut AppState) {
             x_end: width,
         });
 
+        // --- Image preview with drag-to-draw ROI ---
+        // Check preview availability and dimensions before entering closures
+        // to avoid simultaneous immutable borrow of preview + mutable borrow of state.
+        let preview_status = match &state.preview_image {
+            Some(p) if p.shape()[0] == height && p.shape()[1] == width => 0u8, // ok
+            Some(_) => 1,                                                      // dimension mismatch
+            None => 2,                                                         // no preview
+        };
+
+        let drawn_roi = if preview_status == 0 {
+            let preview = state.preview_image.as_ref().unwrap();
+            let mut result = None;
+            design::card(ui, |ui| {
+                let tc = ThemeColors::from_ctx(ui.ctx());
+                ui.label(
+                    egui::RichText::new("Drag on the image to draw an ROI rectangle")
+                        .size(11.0)
+                        .color(tc.fg3),
+                );
+                ui.add_space(4.0);
+                let (new_roi, _rect) = show_image_with_roi_editor(
+                    ui,
+                    preview,
+                    "roi_preview_tex",
+                    Colormap::Viridis,
+                    Some(&roi),
+                );
+                result = new_roi;
+            });
+            result
+        } else if preview_status == 1 {
+            design::card(ui, |ui| {
+                let tc = ThemeColors::from_ctx(ui.ctx());
+                ui.label(
+                    egui::RichText::new(
+                        "Preview dimensions mismatch. Reload data to update preview.",
+                    )
+                    .color(tc.fg2),
+                );
+            });
+            None
+        } else {
+            design::card(ui, |ui| {
+                let tc = ThemeColors::from_ctx(ui.ctx());
+                ui.label(
+                    egui::RichText::new(
+                        "No preview image available. Complete earlier steps first.",
+                    )
+                    .color(tc.fg2),
+                );
+            });
+            None
+        };
+
+        // Apply drawn ROI outside the borrow scope
+        if let Some(drawn) = drawn_roi {
+            roi = drawn;
+            state.roi = Some(roi);
+            state.pixel_fit_result = None;
+            state.spatial_result = None;
+            state.selected_pixel = None;
+            state.invalidate_results();
+            state.log_provenance(
+                crate::state::ProvenanceEventKind::ConfigChanged,
+                format!(
+                    "ROI drawn: y=[{}, {}] x=[{}, {}]",
+                    roi.y_start, roi.y_end, roi.x_start, roi.x_end
+                ),
+            );
+        }
+
+        // --- DragValue coordinate fields ---
         design::card_with_header(ui, "ROI Coordinates", None, |ui| {
             let changed = ui
                 .horizontal(|ui| {
