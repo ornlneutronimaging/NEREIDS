@@ -298,29 +298,14 @@ pub(crate) fn fm_isotopes_card(ui: &mut egui::Ui, state: &mut AppState) {
 
         ui.add_space(4.0);
 
-        // Add + Periodic Table + Fetch buttons
+        // Add Isotope + Fetch buttons
         ui.add_enabled_ui(!isotope_locked, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("+ Add Isotope").clicked() {
-                    state.fm_isotope_entries.push(IsotopeEntry {
-                        z: 92,
-                        a: 238,
-                        symbol: "U-238".into(),
-                        initial_density: 0.001,
-                        resonance_data: None,
-                        enabled: true,
-                        endf_status: EndfStatus::Pending,
-                    });
-                    state.fm_spectrum = None;
-                    state.fm_per_isotope_spectra.clear();
-                }
-                if ui.button("Periodic Table...").clicked() {
-                    state.periodic_table_open = true;
-                    state.periodic_table_target = PeriodicTableTarget::ForwardModel;
-                    state.periodic_table_selected_z = None;
-                    state.periodic_table_density = 0.001; // at/barn default
-                }
-            });
+            if ui.button("Add Isotope...").clicked() {
+                state.periodic_table_open = true;
+                state.periodic_table_target = PeriodicTableTarget::ForwardModel;
+                state.periodic_table_selected_z = None;
+                state.periodic_table_density = 0.001; // at/barn default
+            }
         });
 
         let has_missing = state

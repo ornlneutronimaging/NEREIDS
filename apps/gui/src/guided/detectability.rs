@@ -1,10 +1,7 @@
 //! Detectability tool — multi-matrix + trace isotope analysis with resolution broadening,
 //! verdict badges, hero stats, and delta-T spectrum plot.
 
-use crate::state::{
-    AppState, DetectTraceEntry, EndfFetchResult, EndfStatus, GuidedStep, IsotopeEntry,
-    PeriodicTableTarget,
-};
+use crate::state::{AppState, EndfFetchResult, EndfStatus, GuidedStep, PeriodicTableTarget};
 use crate::widgets::design;
 use egui_plot::{HLine, Line, Plot, PlotPoints};
 use nereids_endf::retrieval::EndfLibrary;
@@ -171,26 +168,12 @@ pub(crate) fn detect_matrix_card(ui: &mut egui::Ui, state: &mut AppState, locked
 
         ui.add_space(4.0);
         ui.add_enabled_ui(!locked, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("Add Matrix Isotope").clicked() {
-                    state.detect_matrix_entries.push(IsotopeEntry {
-                        z: 26,
-                        a: 56,
-                        symbol: "Fe-56".into(),
-                        initial_density: 0.001,
-                        resonance_data: None,
-                        enabled: true,
-                        endf_status: EndfStatus::Pending,
-                    });
-                    state.detect_results.clear();
-                }
-                if ui.button("Periodic Table...").clicked() {
-                    state.periodic_table_open = true;
-                    state.periodic_table_target = PeriodicTableTarget::DetectMatrix;
-                    state.periodic_table_selected_z = None;
-                    state.periodic_table_density = 0.001; // at/barn default
-                }
-            });
+            if ui.button("Add Matrix Isotope...").clicked() {
+                state.periodic_table_open = true;
+                state.periodic_table_target = PeriodicTableTarget::DetectMatrix;
+                state.periodic_table_selected_z = None;
+                state.periodic_table_density = 0.001; // at/barn default
+            }
         });
     });
 }
@@ -274,24 +257,12 @@ pub(crate) fn detect_trace_card(ui: &mut egui::Ui, state: &mut AppState, locked:
 
         ui.add_space(4.0);
         ui.add_enabled_ui(!locked, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("Add Trace").clicked() {
-                    state.detect_trace_entries.push(DetectTraceEntry {
-                        z: 72,
-                        a: 178,
-                        symbol: "Hf-178".into(),
-                        concentration_ppm: 1000.0,
-                        resonance_data: None,
-                    });
-                    state.detect_results.clear();
-                }
-                if ui.button("Periodic Table...").clicked() {
-                    state.periodic_table_open = true;
-                    state.periodic_table_target = PeriodicTableTarget::DetectTrace;
-                    state.periodic_table_selected_z = None;
-                    state.periodic_table_density = 1000.0; // ppm default
-                }
-            });
+            if ui.button("Add Trace...").clicked() {
+                state.periodic_table_open = true;
+                state.periodic_table_target = PeriodicTableTarget::DetectTrace;
+                state.periodic_table_selected_z = None;
+                state.periodic_table_density = 1000.0; // ppm default
+            }
         });
     });
 }
