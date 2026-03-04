@@ -442,16 +442,6 @@ pub enum StudioDocTab {
     Detectability,
 }
 
-impl StudioDocTab {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Analysis => "Analysis",
-            Self::ForwardModel => "Forward Model",
-            Self::Detectability => "Detectability",
-        }
-    }
-}
-
 /// Step within the Guided workflow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuidedStep {
