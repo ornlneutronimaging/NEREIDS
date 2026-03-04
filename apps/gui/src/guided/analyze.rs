@@ -268,7 +268,7 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
             ui,
             &result.density_maps[idx],
             "density_tex",
-            state.roi.as_ref(),
+            &state.rois,
             state.selected_pixel,
         );
         if let Some((y, x)) = clicked {
@@ -305,7 +305,7 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 ui,
                 &slice,
                 "analyze_preview_tex",
-                state.roi.as_ref(),
+                &state.rois,
                 state.selected_pixel,
             );
             if let Some((y, x)) = clicked {
@@ -798,7 +798,7 @@ fn fit_roi(state: &mut AppState) {
         None => return,
     };
 
-    let roi = match state.roi {
+    let roi = match state.bounding_roi() {
         Some(r) => r,
         None => {
             state.status_message = "No ROI defined".into();

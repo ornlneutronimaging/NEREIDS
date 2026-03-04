@@ -251,7 +251,7 @@ fn preview_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
             }
         },
         SpectrumDataSource::RoiAverage => {
-            if let Some(roi) = state.roi {
+            if let Some(roi) = state.bounding_roi() {
                 match nereids_io::normalization::average_roi(
                     &norm.transmission,
                     roi.y_start..roi.y_end,

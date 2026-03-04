@@ -5,11 +5,32 @@
 
 use crate::state::{Colormap, RoiSelection};
 
-/// Transient drag origin, stored in egui per-widget temp memory during ROI drawing.
+/// Result of an ROI editor interaction this frame.
+pub enum RoiEditorResult {
+    /// No interaction this frame.
+    None,
+    /// User finished drawing a new ROI rectangle.
+    DrawnNew(RoiSelection),
+    /// User finished moving an existing ROI to a new position.
+    Moved { index: usize, new_roi: RoiSelection },
+    /// User clicked on an existing ROI to select it.
+    Selected(usize),
+    /// User clicked on empty space, deselecting the current ROI.
+    Deselected,
+}
+
+/// Transient drag state, stored in egui per-widget temp memory.
 #[derive(Clone, Copy)]
-struct RoiDragOrigin {
-    y: usize,
-    x: usize,
+enum RoiDragMode {
+    /// Drawing a new ROI from an origin pixel.
+    DrawNew { origin_y: usize, origin_x: usize },
+    /// Moving an existing ROI (index, grab pixel, original ROI).
+    MoveExisting {
+        index: usize,
+        grab_y: usize,
+        grab_x: usize,
+        orig: RoiSelection,
+    },
 }
 
 /// Display a 2D f64 array as a viridis-colormapped image with click-to-select-pixel.
@@ -36,25 +57,25 @@ pub fn show_colormapped_image(
     tex_id: &str,
     colormap: Colormap,
 ) -> Option<(usize, usize)> {
-    show_colormapped_image_with_roi(ui, data, tex_id, colormap, None, None).0
+    show_colormapped_image_with_roi(ui, data, tex_id, colormap, &[], None).0
 }
 
-/// Display a viridis-colormapped image with ROI overlay and optional pixel marker.
+/// Display a viridis-colormapped image with ROI overlays and optional pixel marker.
 ///
-/// Returns `(clicked_pixel, image_rect)`.  When `roi` is `Some`, a
-/// semi-transparent rectangle is drawn over the corresponding region.
+/// Returns `(clicked_pixel, image_rect)`.  Each ROI in the slice is drawn
+/// as a semi-transparent blue rectangle overlay.
 /// When `selected_pixel` is `Some`, an orange crosshair is drawn at that pixel.
 pub fn show_viridis_image_with_roi(
     ui: &mut egui::Ui,
     data: &ndarray::Array2<f64>,
     tex_id: &str,
-    roi: Option<&RoiSelection>,
+    rois: &[RoiSelection],
     selected_pixel: Option<(usize, usize)>,
 ) -> (Option<(usize, usize)>, egui::Rect) {
-    show_colormapped_image_with_roi(ui, data, tex_id, Colormap::Viridis, roi, selected_pixel)
+    show_colormapped_image_with_roi(ui, data, tex_id, Colormap::Viridis, rois, selected_pixel)
 }
 
-/// Display a colormapped image with ROI overlay and optional pixel marker.
+/// Display a colormapped image with ROI overlays and optional pixel marker.
 ///
 /// Returns `(clicked_pixel, image_rect)`.
 pub fn show_colormapped_image_with_roi(
@@ -62,7 +83,7 @@ pub fn show_colormapped_image_with_roi(
     data: &ndarray::Array2<f64>,
     tex_id: &str,
     colormap: Colormap,
-    roi: Option<&RoiSelection>,
+    rois: &[RoiSelection],
     selected_pixel: Option<(usize, usize)>,
 ) -> (Option<(usize, usize)>, egui::Rect) {
     let (height, width) = (data.shape()[0], data.shape()[1]);
@@ -74,8 +95,8 @@ pub fn show_colormapped_image_with_roi(
     let (response, painter, image_rect) =
         prepare_image_painter(ui, data, tex_id, colormap, egui::Sense::click());
 
-    // Draw ROI overlay
-    if let Some(roi) = roi {
+    // Draw ROI overlays
+    for roi in rois {
         draw_roi_overlay(&painter, image_rect, (height, width), roi);
     }
 
@@ -94,22 +115,27 @@ pub fn show_colormapped_image_with_roi(
     (None, image_rect)
 }
 
-/// Display a colormapped image with interactive drag-to-draw ROI editor.
+/// Display a colormapped image with interactive multi-ROI editor.
 ///
-/// The user can drag on the image to draw a new ROI rectangle. A rubber-band
-/// rectangle (white) is shown during the drag; the committed ROI is drawn in
-/// blue. Returns `Some(new_roi)` when the user finishes a drag, `None` otherwise.
+/// Supports:
+/// - **Draw new**: drag on empty space to create a new ROI rectangle
+/// - **Select**: click on an existing ROI to select it
+/// - **Move**: drag on a selected ROI to reposition it
+/// - **Deselect**: click on empty space
+///
+/// Returns `(RoiEditorResult, image_rect)`.
 pub fn show_image_with_roi_editor(
     ui: &mut egui::Ui,
     data: &ndarray::Array2<f64>,
     tex_id: &str,
     colormap: Colormap,
-    current_roi: Option<&RoiSelection>,
-) -> (Option<RoiSelection>, egui::Rect) {
+    rois: &[RoiSelection],
+    selected_roi: Option<usize>,
+) -> (RoiEditorResult, egui::Rect) {
     let (height, width) = (data.shape()[0], data.shape()[1]);
     if width == 0 || height == 0 {
         ui.label("(empty image)");
-        return (None, egui::Rect::NOTHING);
+        return (RoiEditorResult::None, egui::Rect::NOTHING);
     }
 
     let (response, painter, image_rect) =
@@ -117,52 +143,180 @@ pub fn show_image_with_roi_editor(
 
     let dims = (height, width);
     let drag_id = response.id;
-    let mut committed_roi: Option<RoiSelection> = None;
+    let mut result = RoiEditorResult::None;
     let mut is_dragging = false;
 
     // --- Drag state machine ---
     if response.drag_started()
         && let Some(pos) = response.interact_pointer_pos()
     {
-        let (y, x) = screen_to_pixel(pos, image_rect, dims);
-        ui.data_mut(|d| d.insert_temp(drag_id, RoiDragOrigin { y, x }));
+        let (py, px) = screen_to_pixel(pos, image_rect, dims);
+        // Hit test: if we're on a selected ROI, start moving it
+        if let Some(sel_idx) = selected_roi {
+            if sel_idx < rois.len() && point_in_roi(py, px, &rois[sel_idx]) {
+                ui.data_mut(|d| {
+                    d.insert_temp(
+                        drag_id,
+                        RoiDragMode::MoveExisting {
+                            index: sel_idx,
+                            grab_y: py,
+                            grab_x: px,
+                            orig: rois[sel_idx],
+                        },
+                    )
+                });
+            } else {
+                // Started drag outside selected ROI → draw new
+                ui.data_mut(|d| {
+                    d.insert_temp(
+                        drag_id,
+                        RoiDragMode::DrawNew {
+                            origin_y: py,
+                            origin_x: px,
+                        },
+                    )
+                });
+            }
+        } else {
+            // No ROI selected — check if clicking on any existing ROI to select it,
+            // otherwise draw new
+            let hit = hit_test_rois(py, px, rois);
+            if hit.is_some() {
+                // Will be handled by click (drag_stopped with no movement) below
+                ui.data_mut(|d| {
+                    d.insert_temp(
+                        drag_id,
+                        RoiDragMode::DrawNew {
+                            origin_y: py,
+                            origin_x: px,
+                        },
+                    )
+                });
+            } else {
+                ui.data_mut(|d| {
+                    d.insert_temp(
+                        drag_id,
+                        RoiDragMode::DrawNew {
+                            origin_y: py,
+                            origin_x: px,
+                        },
+                    )
+                });
+            }
+        }
     }
 
     if response.dragged()
-        && let Some(origin) = ui.data(|d| d.get_temp::<RoiDragOrigin>(drag_id))
+        && let Some(mode) = ui.data(|d| d.get_temp::<RoiDragMode>(drag_id))
     {
         is_dragging = true;
         if let Some(pos) = response.interact_pointer_pos() {
             let (cy, cx) = screen_to_pixel(pos, image_rect, dims);
-            let draft = make_roi(origin.y, origin.x, cy, cx, dims);
-            draw_roi_draft_overlay(&painter, image_rect, dims, &draft);
+            match mode {
+                RoiDragMode::DrawNew { origin_y, origin_x } => {
+                    let draft = make_roi(origin_y, origin_x, cy, cx, dims);
+                    draw_roi_draft_overlay(&painter, image_rect, dims, &draft);
+                }
+                RoiDragMode::MoveExisting {
+                    orig,
+                    grab_y,
+                    grab_x,
+                    ..
+                } => {
+                    let moved = move_roi(&orig, grab_y, grab_x, cy, cx, dims);
+                    draw_roi_draft_overlay(&painter, image_rect, dims, &moved);
+                }
+            }
         }
     }
 
     if response.drag_stopped()
-        && let Some(origin) = ui.data(|d| d.get_temp::<RoiDragOrigin>(drag_id))
+        && let Some(mode) = ui.data(|d| d.get_temp::<RoiDragMode>(drag_id))
     {
         if let Some(pos) = response.interact_pointer_pos() {
             let (cy, cx) = screen_to_pixel(pos, image_rect, dims);
-            let roi = make_roi(origin.y, origin.x, cy, cx, dims);
-            if roi.y_end > roi.y_start && roi.x_end > roi.x_start {
-                committed_roi = Some(roi);
+            match mode {
+                RoiDragMode::DrawNew { origin_y, origin_x } => {
+                    // Check if this was a click (no movement) vs a drag
+                    if cy == origin_y && cx == origin_x {
+                        // Click — select/deselect
+                        if let Some(hit_idx) = hit_test_rois(cy, cx, rois) {
+                            result = RoiEditorResult::Selected(hit_idx);
+                        } else {
+                            result = RoiEditorResult::Deselected;
+                        }
+                    } else {
+                        let roi = make_roi(origin_y, origin_x, cy, cx, dims);
+                        if roi.y_end > roi.y_start && roi.x_end > roi.x_start {
+                            result = RoiEditorResult::DrawnNew(roi);
+                        }
+                    }
+                }
+                RoiDragMode::MoveExisting {
+                    index,
+                    orig,
+                    grab_y,
+                    grab_x,
+                } => {
+                    let moved = move_roi(&orig, grab_y, grab_x, cy, cx, dims);
+                    if moved.y_end > moved.y_start && moved.x_end > moved.x_start {
+                        result = RoiEditorResult::Moved {
+                            index,
+                            new_roi: moved,
+                        };
+                    }
+                }
             }
         }
-        ui.data_mut(|d| d.remove::<RoiDragOrigin>(drag_id));
+        ui.data_mut(|d| d.remove::<RoiDragMode>(drag_id));
     }
 
-    // Draw the committed ROI overlay when not actively dragging
-    if !is_dragging && let Some(roi) = current_roi {
-        draw_roi_overlay(&painter, image_rect, dims, roi);
+    // Draw all committed ROI overlays when not actively dragging
+    if !is_dragging {
+        for (i, roi) in rois.iter().enumerate() {
+            if Some(i) == selected_roi {
+                draw_roi_selected_overlay(&painter, image_rect, dims, roi);
+            } else {
+                draw_roi_overlay(&painter, image_rect, dims, roi);
+            }
+        }
+    } else {
+        // While dragging, draw non-dragged ROIs normally
+        let dragged_idx = ui
+            .data(|d| d.get_temp::<RoiDragMode>(drag_id))
+            .and_then(|m| match m {
+                RoiDragMode::MoveExisting { index, .. } => Some(index),
+                _ => Option::None,
+            });
+        for (i, roi) in rois.iter().enumerate() {
+            if Some(i) == dragged_idx {
+                continue; // draft is drawn above
+            }
+            if Some(i) == selected_roi {
+                draw_roi_selected_overlay(&painter, image_rect, dims, roi);
+            } else {
+                draw_roi_overlay(&painter, image_rect, dims, roi);
+            }
+        }
     }
 
-    // Crosshair cursor when hovering over the image
-    if response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+    // Cursor: move icon when hovering selected ROI, crosshair otherwise
+    if response.hovered()
+        && let Some(pos) = ui.input(|i| i.pointer.hover_pos())
+    {
+        let (py, px) = screen_to_pixel(pos, image_rect, dims);
+        if let Some(sel_idx) = selected_roi {
+            if sel_idx < rois.len() && point_in_roi(py, px, &rois[sel_idx]) {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+            } else {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+            }
+        } else {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+        }
     }
 
-    (committed_roi, image_rect)
+    (result, image_rect)
 }
 
 /// Prepare the colormapped texture and allocate an interactive painter.
@@ -236,6 +390,50 @@ fn screen_to_pixel(
         px_y.min(height.saturating_sub(1)),
         px_x.min(width.saturating_sub(1)),
     )
+}
+
+/// Test whether a pixel coordinate falls inside an ROI rectangle.
+fn point_in_roi(py: usize, px: usize, roi: &RoiSelection) -> bool {
+    py >= roi.y_start && py < roi.y_end && px >= roi.x_start && px < roi.x_end
+}
+
+/// Hit-test a pixel coordinate against a list of ROIs.
+/// Returns the index of the first ROI containing the point, or `None`.
+fn hit_test_rois(py: usize, px: usize, rois: &[RoiSelection]) -> Option<usize> {
+    rois.iter().position(|roi| point_in_roi(py, px, roi))
+}
+
+/// Compute a moved version of an ROI, shifting it by the delta between
+/// the grab point and the current cursor position, clamped to image bounds.
+fn move_roi(
+    orig: &RoiSelection,
+    grab_y: usize,
+    grab_x: usize,
+    cur_y: usize,
+    cur_x: usize,
+    (height, width): (usize, usize),
+) -> RoiSelection {
+    let roi_h = orig.y_end.saturating_sub(orig.y_start);
+    let roi_w = orig.x_end.saturating_sub(orig.x_start);
+
+    // Compute signed delta
+    let dy = cur_y as isize - grab_y as isize;
+    let dx = cur_x as isize - grab_x as isize;
+
+    // Apply delta to origin, clamp so ROI stays in bounds
+    let new_y_start = (orig.y_start as isize + dy)
+        .max(0)
+        .min((height.saturating_sub(roi_h)) as isize) as usize;
+    let new_x_start = (orig.x_start as isize + dx)
+        .max(0)
+        .min((width.saturating_sub(roi_w)) as isize) as usize;
+
+    RoiSelection {
+        y_start: new_y_start,
+        y_end: new_y_start + roi_h,
+        x_start: new_x_start,
+        x_end: new_x_start + roi_w,
+    }
 }
 
 /// Build a `RoiSelection` from two corner points, auto-swapping so start <= end.
@@ -381,6 +579,44 @@ fn draw_roi_overlay(
         roi_rect,
         0.0,
         egui::Stroke::new(1.5, egui::Color32::from_rgb(0, 120, 255)),
+        egui::StrokeKind::Outside,
+    );
+}
+
+/// Draw a selected ROI overlay (green border, brighter fill) to distinguish from
+/// unselected ROIs.
+fn draw_roi_selected_overlay(
+    painter: &egui::Painter,
+    image_rect: egui::Rect,
+    image_dims: (usize, usize),
+    roi: &RoiSelection,
+) {
+    let (height, width) = image_dims;
+    if width == 0 || height == 0 {
+        return;
+    }
+    if roi.x_start >= roi.x_end || roi.y_start >= roi.y_end {
+        return;
+    }
+
+    let x0 = image_rect.left() + (roi.x_start as f32 / width as f32) * image_rect.width();
+    let x1 = image_rect.left() + (roi.x_end as f32 / width as f32) * image_rect.width();
+    let y0 = image_rect.top() + (roi.y_start as f32 / height as f32) * image_rect.height();
+    let y1 = image_rect.top() + (roi.y_end as f32 / height as f32) * image_rect.height();
+
+    let roi_rect = egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1));
+
+    // Green semi-transparent fill
+    painter.rect_filled(
+        roi_rect,
+        0.0,
+        egui::Color32::from_rgba_unmultiplied(0, 200, 80, 50),
+    );
+    // Green border (thicker)
+    painter.rect_stroke(
+        roi_rect,
+        0.0,
+        egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 200, 80)),
         egui::StrokeKind::Outside,
     );
 }

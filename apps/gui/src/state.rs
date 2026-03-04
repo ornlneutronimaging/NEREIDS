@@ -515,7 +515,8 @@ pub struct AppState {
 
     // -- Pixel / ROI selection --
     pub selected_pixel: Option<(usize, usize)>,
-    pub roi: Option<RoiSelection>,
+    pub rois: Vec<RoiSelection>,
+    pub selected_roi: Option<usize>,
 
     // -- Results --
     pub pixel_fit_result: Option<SpectrumFitResult>,
@@ -909,7 +910,8 @@ impl AppState {
     pub fn invalidate_results(&mut self) {
         self.cancel_pending_tasks();
         self.selected_pixel = None;
-        self.roi = None;
+        self.rois.clear();
+        self.selected_roi = None;
         self.pixel_fit_result = None;
         self.spatial_result = None;
         self.preview_image = None;
@@ -922,6 +924,29 @@ impl AppState {
         self.export_status = None;
         self.rebin_applied = false;
         self.rebin_factor = 1;
+    }
+
+    /// Compute the bounding box of all ROIs, or `None` if no ROIs exist.
+    pub fn bounding_roi(&self) -> Option<RoiSelection> {
+        if self.rois.is_empty() {
+            return None;
+        }
+        let mut y_start = usize::MAX;
+        let mut y_end = 0;
+        let mut x_start = usize::MAX;
+        let mut x_end = 0;
+        for r in &self.rois {
+            y_start = y_start.min(r.y_start);
+            y_end = y_end.max(r.y_end);
+            x_start = x_start.min(r.x_start);
+            x_end = x_end.max(r.x_end);
+        }
+        Some(RoiSelection {
+            y_start,
+            y_end,
+            x_start,
+            x_end,
+        })
     }
 
     /// Append a provenance event to the session audit trail.
@@ -1034,7 +1059,8 @@ impl Default for AppState {
             show_advanced_solver: false,
 
             selected_pixel: None,
-            roi: None,
+            rois: Vec::new(),
+            selected_roi: None,
 
             pixel_fit_result: None,
             spatial_result: None,

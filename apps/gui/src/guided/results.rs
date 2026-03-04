@@ -139,7 +139,12 @@ fn density_map_grid(ui: &mut egui::Ui, state: &mut AppState) {
                             if show_bar {
                                 ui.horizontal(|ui| {
                                     if let Some((y, x)) = show_colormapped_image_with_roi(
-                                        ui, data, &tex_id, colormap, None, selected,
+                                        ui,
+                                        data,
+                                        &tex_id,
+                                        colormap,
+                                        &[],
+                                        selected,
                                     )
                                     .0
                                     {
@@ -149,7 +154,12 @@ fn density_map_grid(ui: &mut egui::Ui, state: &mut AppState) {
                                     result_widgets::draw_colorbar(ui, data, colormap);
                                 });
                             } else if let Some((y, x)) = show_colormapped_image_with_roi(
-                                ui, data, &tex_id, colormap, None, selected,
+                                ui,
+                                data,
+                                &tex_id,
+                                colormap,
+                                &[],
+                                selected,
                             )
                             .0
                             {
@@ -180,7 +190,7 @@ fn density_map_grid(ui: &mut egui::Ui, state: &mut AppState) {
                                         &conv_f64,
                                         "result_conv_map",
                                         colormap,
-                                        None,
+                                        &[],
                                         None,
                                     );
                                     result_widgets::draw_colorbar(ui, &conv_f64, colormap);
@@ -191,7 +201,7 @@ fn density_map_grid(ui: &mut egui::Ui, state: &mut AppState) {
                                     &conv_f64,
                                     "result_conv_map",
                                     colormap,
-                                    None,
+                                    &[],
                                     None,
                                 );
                             }
