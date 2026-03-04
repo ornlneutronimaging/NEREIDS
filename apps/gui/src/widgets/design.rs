@@ -563,20 +563,29 @@ pub fn resolution_card(
                             .add_filter("Resolution", &["txt", "dat"])
                             .pick_file()
                     {
-                        match TabulatedResolution::from_file(&file.to_string_lossy(), flight_path_m)
-                        {
-                            Ok(tab) => {
-                                *path = file;
-                                *data = Some(Arc::new(tab));
-                                *error = None;
-                                changed = true;
+                        if let Some(path_str) = file.to_str() {
+                            match TabulatedResolution::from_file(path_str, flight_path_m) {
+                                Ok(tab) => {
+                                    *path = file;
+                                    *data = Some(Arc::new(tab));
+                                    *error = None;
+                                    changed = true;
+                                }
+                                Err(e) => {
+                                    *path = file;
+                                    *data = None;
+                                    *error = Some(format!("{e}"));
+                                    changed = true;
+                                }
                             }
-                            Err(e) => {
-                                *path = file;
-                                *data = None;
-                                *error = Some(format!("{e}"));
-                                changed = true;
-                            }
+                        } else {
+                            *path = file;
+                            *data = None;
+                            *error = Some(
+                                "File path is not valid UTF-8; please choose a different file"
+                                    .into(),
+                            );
+                            changed = true;
                         }
                     }
                     if let Some(name) = path.file_name() {
@@ -597,16 +606,13 @@ pub fn resolution_card(
                             "{n} reference energies, {e_min:.4}\u{2013}{e_max:.1} eV"
                         ))
                         .size(11.0)
-                        .color(Color32::from_rgb(100, 200, 100)),
+                        .color(crate::theme::semantic::GREEN),
                     );
                 } else if let Some(err) = error {
-                    ui.colored_label(
-                        Color32::from_rgb(255, 100, 100),
-                        format!("Parse error: {err}"),
-                    );
+                    ui.colored_label(crate::theme::semantic::RED, format!("Parse error: {err}"));
                 } else if !path.as_os_str().is_empty() {
                     ui.colored_label(
-                        Color32::from_rgb(255, 100, 100),
+                        crate::theme::semantic::RED,
                         "File not loaded \u{2014} select a valid resolution file",
                     );
                 }

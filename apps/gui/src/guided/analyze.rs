@@ -736,13 +736,20 @@ fn build_fit_config(state: &AppState) -> Result<FitConfig, String> {
             ResolutionMode::Gaussian {
                 delta_t_us,
                 delta_l_m,
-            } => ResolutionParams::new(state.beamline.flight_path_m, *delta_t_us, *delta_l_m)
-                .ok()
-                .map(ResolutionFunction::Gaussian),
+            } => {
+                let params =
+                    ResolutionParams::new(state.beamline.flight_path_m, *delta_t_us, *delta_l_m)
+                        .map_err(|e| format!("Invalid Gaussian resolution parameters: {e}"))?;
+                Some(ResolutionFunction::Gaussian(params))
+            }
             ResolutionMode::Tabulated {
                 data: Some(tab), ..
             } => Some(ResolutionFunction::Tabulated(Arc::clone(tab))),
-            ResolutionMode::Tabulated { data: None, .. } => None,
+            ResolutionMode::Tabulated { data: None, .. } => {
+                return Err(
+                    "Tabulated resolution enabled but no file loaded — load a resolution file or disable broadening".into(),
+                );
+            }
         }
     } else {
         None

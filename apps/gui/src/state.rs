@@ -229,13 +229,22 @@ impl PartialEq for ResolutionMode {
                     delta_l_m: dl2,
                 },
             ) => dt1 == dt2 && dl1 == dl2,
-            (Self::Tabulated { data: d1, .. }, Self::Tabulated { data: d2, .. }) => {
-                match (d1, d2) {
-                    (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-                    (None, None) => true,
-                    _ => false,
-                }
-            }
+            (
+                Self::Tabulated {
+                    path: p1,
+                    data: d1,
+                    error: e1,
+                },
+                Self::Tabulated {
+                    path: p2,
+                    data: d2,
+                    error: e2,
+                },
+            ) => match (d1, d2) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => p1 == p2 && e1 == e2,
+                _ => false,
+            },
             _ => false,
         }
     }
