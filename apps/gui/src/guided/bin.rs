@@ -129,7 +129,6 @@ fn histogram_events(state: &mut AppState) {
                 state.dead_pixels = Some(dead);
             }
 
-            let shape = data.counts.shape();
             state.log_provenance(
                 ProvenanceEventKind::DataLoaded,
                 format!(

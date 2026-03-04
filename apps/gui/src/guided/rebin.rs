@@ -33,7 +33,12 @@ pub fn rebin_step(ui: &mut egui::Ui, state: &mut AppState) {
 
     // Show current bin count if spectrum data is available
     if let Some(ref vals) = state.spectrum_values {
-        let n = format!("{}", vals.len());
+        let n_bins = if state.spectrum_kind == nereids_io::spectrum::SpectrumValueKind::BinEdges {
+            vals.len().saturating_sub(1)
+        } else {
+            vals.len()
+        };
+        let n = format!("{n_bins}");
         design::stat_row(ui, &[(&n, "energy bins")]);
     }
 

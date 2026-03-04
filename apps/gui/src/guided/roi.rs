@@ -60,6 +60,14 @@ pub fn roi_step(ui: &mut egui::Ui, state: &mut AppState) {
                 })
                 .inner;
 
+            // Clamp to valid ranges: ensure start <= end
+            if roi.y_start > roi.y_end {
+                std::mem::swap(&mut roi.y_start, &mut roi.y_end);
+            }
+            if roi.x_start > roi.x_end {
+                std::mem::swap(&mut roi.x_start, &mut roi.x_end);
+            }
+
             if changed || state.roi.is_none() {
                 state.roi = Some(roi);
             }
@@ -67,6 +75,7 @@ pub fn roi_step(ui: &mut egui::Ui, state: &mut AppState) {
             ui.add_space(4.0);
             if ui.button("Reset to Full Image").clicked() {
                 state.roi = None;
+                state.invalidate_results();
             }
         });
 

@@ -379,6 +379,8 @@ fn step_subtitle(step: GuidedStep, state: &AppState) -> String {
                     InputMode::Hdf5Event => "HDF5 event",
                 };
                 format!("{mode} \u{2014} {}×{}×{}", shape[0], shape[1], shape[2])
+            } else if state.input_mode == InputMode::Hdf5Event && state.hdf5_path.is_some() {
+                "HDF5 loaded".into()
             } else {
                 "No data".into()
             }

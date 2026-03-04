@@ -6,8 +6,7 @@
 //! map and immediately see its spectrum.
 
 use crate::state::{
-    AppState, GuidedStep, InputMode, IsotopeEntry, ResolutionMode, SolverMethod,
-    SpectrumAxis,
+    AppState, GuidedStep, InputMode, IsotopeEntry, ResolutionMode, SolverMethod, SpectrumAxis,
 };
 use crate::widgets::design::{self, NavAction};
 use crate::widgets::image_view::{show_viridis_image, show_viridis_image_with_roi};
