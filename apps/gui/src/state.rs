@@ -523,6 +523,8 @@ pub struct AppState {
     pub fitting_rois: Vec<RoiSelection>,
     /// Toggle: show density overlay on preview image in Results.
     pub show_density_overlay: bool,
+    /// Toggle: show provenance history popup window.
+    pub show_history_window: bool,
 
     // -- Results --
     pub pixel_fit_result: Option<SpectrumFitResult>,
@@ -1070,6 +1072,7 @@ impl Default for AppState {
             selected_roi: None,
             fitting_rois: Vec::new(),
             show_density_overlay: true,
+            show_history_window: false,
 
             pixel_fit_result: None,
             spatial_result: None,

@@ -64,6 +64,7 @@ impl eframe::App for NereidsApp {
         match self.state.ui_mode {
             UiMode::Guided => {
                 guided::sidebar::guided_sidebar(ctx, &mut self.state);
+                guided::sidebar::history_window(ctx, &mut self.state);
                 egui::CentralPanel::default().show(ctx, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         guided::guided_content(ui, &mut self.state);
