@@ -115,17 +115,24 @@ pub fn guided_sidebar(ctx: &egui::Context, state: &mut AppState) {
                         .color(colors.fg3),
                 );
 
-                // History: last 4 provenance events
+                // History: last 3 provenance events, truncated to fit sidebar
                 // bottom_up reverses visual order; .rev() renders newest
                 // first (bottom-most), giving chronological top-to-bottom.
                 if !state.provenance_log.is_empty() {
-                    let start = state.provenance_log.len().saturating_sub(4);
+                    let start = state.provenance_log.len().saturating_sub(3);
                     let events = &state.provenance_log[start..];
                     for event in events.iter().rev() {
                         let ts = event.formatted_timestamp();
                         let short = ts.get(11..16).unwrap_or("??:??");
+                        let msg = &event.message;
+                        // Truncate long messages to prevent overflow into Tools
+                        let display_msg = if msg.len() > 24 {
+                            format!("{}...", &msg[..24])
+                        } else {
+                            msg.clone()
+                        };
                         ui.label(
-                            RichText::new(format!("{short} \u{2014} {}", event.message))
+                            RichText::new(format!("{short} \u{2014} {display_msg}"))
                                 .size(10.0)
                                 .color(colors.fg3),
                         );
