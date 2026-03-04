@@ -365,7 +365,7 @@ pub fn periodic_table_modal(ctx: &egui::Context, state: &mut AppState) {
                         ui.label("A:");
                         ui.add(
                             egui::DragValue::new(&mut state.periodic_table_custom_a)
-                                .range(1..=300_u32),
+                                .range(1..=999_u32),
                         );
                     });
                     if state.periodic_table_custom_z > state.periodic_table_custom_a {
@@ -379,12 +379,12 @@ pub fn periodic_table_modal(ctx: &egui::Context, state: &mut AppState) {
                         ui.label(egui::RichText::new(format!("{csym}-{ca}")).strong());
                         if has_eval {
                             ui.label(
-                                egui::RichText::new("ENDF eval available")
+                                egui::RichText::new("ENDF/B-VIII.0 eval available")
                                     .color(Color32::from_rgb(34, 139, 34)),
                             );
                         } else {
                             ui.label(
-                                egui::RichText::new("No ENDF eval")
+                                egui::RichText::new("No ENDF/B-VIII.0 eval")
                                     .color(Color32::from_rgb(200, 130, 0)),
                             );
                         }
