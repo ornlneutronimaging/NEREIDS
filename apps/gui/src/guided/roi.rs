@@ -75,7 +75,10 @@ pub fn roi_step(ui: &mut egui::Ui, state: &mut AppState) {
             ui.add_space(4.0);
             if ui.button("Reset to Full Image").clicked() {
                 state.roi = None;
-                state.invalidate_results();
+                // Only clear downstream fit results; preserve normalized/spectral data
+                state.pixel_fit_result = None;
+                state.spatial_result = None;
+                state.selected_pixel = None;
             }
         });
 
