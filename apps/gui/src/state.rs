@@ -318,6 +318,12 @@ pub struct AppState {
     pub pixel_fit_result: Option<SpectrumFitResult>,
     pub spatial_result: Option<SpatialResult>,
 
+    // -- Pipeline / wizard --
+    pub fitting_type: Option<FittingType>,
+    pub data_type: Option<DataType>,
+    pub pipeline: Vec<PipelineEntry>,
+    pub wizard_step: u8,
+
     // -- UI state --
     pub ui_mode: UiMode,
     pub guided_step: GuidedStep,
@@ -502,12 +508,39 @@ pub enum StudioDocTab {
     Detectability,
 }
 
+/// Fitting type chosen in the wizard (Q1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FittingType {
+    Spatial,
+    Single,
+}
+
+/// Data type chosen in the wizard (Q2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataType {
+    Events,
+    PreNormalized,
+    Transmission,
+}
+
+/// A single entry in the dynamic pipeline.
+#[derive(Debug, Clone, Copy)]
+pub struct PipelineEntry {
+    pub step: GuidedStep,
+    pub optional: bool,
+}
+
 /// Step within the Guided workflow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuidedStep {
-    Load,
+    Landing,
+    Wizard,
     Configure,
+    Load,
+    Bin,
+    Rebin,
     Normalize,
+    Roi,
     Analyze,
     Results,
     ForwardModel,
@@ -518,9 +551,14 @@ impl GuidedStep {
     /// Human-readable label for display.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Load => "Load",
+            Self::Landing => "Home",
+            Self::Wizard => "Setup",
             Self::Configure => "Configure",
+            Self::Load => "Load",
+            Self::Bin => "Bin",
+            Self::Rebin => "Rebin",
             Self::Normalize => "Normalize",
+            Self::Roi => "ROI",
             Self::Analyze => "Analyze",
             Self::Results => "Results",
             Self::ForwardModel => "Forward Model",
@@ -528,26 +566,70 @@ impl GuidedStep {
         }
     }
 
-    /// 1-based step number (None for tool steps).
-    pub fn number(self) -> Option<u8> {
-        match self {
-            Self::Load => Some(1),
-            Self::Configure => Some(2),
-            Self::Normalize => Some(3),
-            Self::Analyze => Some(4),
-            Self::Results => Some(5),
-            Self::ForwardModel | Self::Detectability => None,
+    /// Compute the pipeline steps for the given fitting type and data type.
+    pub fn pipeline(fitting: FittingType, data: DataType) -> Vec<PipelineEntry> {
+        let req = |s| PipelineEntry {
+            step: s,
+            optional: false,
+        };
+        let opt = |s| PipelineEntry {
+            step: s,
+            optional: true,
+        };
+        match (fitting, data) {
+            (FittingType::Spatial, DataType::Events) => vec![
+                req(Self::Configure),
+                req(Self::Load),
+                req(Self::Bin),
+                req(Self::Normalize),
+                req(Self::Roi),
+                req(Self::Analyze),
+                req(Self::Results),
+            ],
+            (FittingType::Single, DataType::Events) => vec![
+                req(Self::Configure),
+                req(Self::Load),
+                req(Self::Bin),
+                req(Self::Roi),
+                req(Self::Normalize),
+                req(Self::Analyze),
+                req(Self::Results),
+            ],
+            (FittingType::Spatial, DataType::PreNormalized) => vec![
+                req(Self::Configure),
+                req(Self::Load),
+                opt(Self::Rebin),
+                req(Self::Normalize),
+                req(Self::Roi),
+                req(Self::Analyze),
+                req(Self::Results),
+            ],
+            (FittingType::Single, DataType::PreNormalized) => vec![
+                req(Self::Configure),
+                req(Self::Load),
+                req(Self::Roi),
+                opt(Self::Rebin),
+                req(Self::Normalize),
+                req(Self::Analyze),
+                req(Self::Results),
+            ],
+            (FittingType::Spatial, DataType::Transmission) => vec![
+                req(Self::Configure),
+                req(Self::Load),
+                opt(Self::Rebin),
+                req(Self::Roi),
+                req(Self::Analyze),
+                req(Self::Results),
+            ],
+            (FittingType::Single, DataType::Transmission) => vec![
+                req(Self::Configure),
+                req(Self::Load),
+                opt(Self::Rebin),
+                req(Self::Analyze),
+                req(Self::Results),
+            ],
         }
     }
-
-    /// Ordered list of the five main workflow steps.
-    pub const WORKFLOW: [GuidedStep; 5] = [
-        Self::Load,
-        Self::Configure,
-        Self::Normalize,
-        Self::Analyze,
-        Self::Results,
-    ];
 }
 
 /// Theme preference.
@@ -627,6 +709,57 @@ impl AppState {
         });
     }
 
+    /// Index of the current step in the pipeline, or `None` if not a pipeline step.
+    pub fn pipeline_index(&self) -> Option<usize> {
+        self.pipeline
+            .iter()
+            .position(|e| e.step == self.guided_step)
+    }
+
+    /// 1-based display number for a pipeline step (skipping optional steps).
+    /// Returns `None` for optional steps (displayed as "—").
+    pub fn step_display_number(&self, step: GuidedStep) -> Option<u8> {
+        let mut n = 0u8;
+        for entry in &self.pipeline {
+            if !entry.optional {
+                n += 1;
+            }
+            if entry.step == step {
+                return if entry.optional { None } else { Some(n) };
+            }
+        }
+        None
+    }
+
+    /// Navigate to the next step in the pipeline.
+    pub fn nav_next(&mut self) {
+        if let Some(idx) = self.pipeline_index()
+            && idx + 1 < self.pipeline.len()
+        {
+            self.guided_step = self.pipeline[idx + 1].step;
+        }
+    }
+
+    /// Navigate to the previous step in the pipeline.
+    /// From the first pipeline step, returns to the Wizard.
+    pub fn nav_prev(&mut self) {
+        if let Some(idx) = self.pipeline_index() {
+            if idx > 0 {
+                self.guided_step = self.pipeline[idx - 1].step;
+            } else {
+                self.guided_step = GuidedStep::Wizard;
+                self.wizard_step = 2; // return to Confirm page
+            }
+        }
+    }
+
+    /// Recompute the pipeline from the current fitting_type and data_type.
+    pub fn rebuild_pipeline(&mut self) {
+        if let (Some(ft), Some(dt)) = (self.fitting_type, self.data_type) {
+            self.pipeline = GuidedStep::pipeline(ft, dt);
+        }
+    }
+
     /// Ensure `tile_display` has enough entries for the current result.
     /// Call after spatial analysis completes.
     pub fn init_tile_display(&mut self, n_density_maps: usize) {
@@ -679,8 +812,13 @@ impl Default for AppState {
             pixel_fit_result: None,
             spatial_result: None,
 
+            fitting_type: None,
+            data_type: None,
+            pipeline: Vec::new(),
+            wizard_step: 0,
+
             ui_mode: UiMode::Guided,
-            guided_step: GuidedStep::Load,
+            guided_step: GuidedStep::Landing,
             theme_preference: ThemePreference::Auto,
             active_tab: Tab::Spectrum,
             status_message: "Ready".into(),

@@ -109,8 +109,8 @@ pub fn analyze_step(ui: &mut egui::Ui, state: &mut AppState) {
         can_continue,
         "Run analysis to continue",
     ) {
-        NavAction::Back => state.guided_step = GuidedStep::Normalize,
-        NavAction::Continue => state.guided_step = GuidedStep::Results,
+        NavAction::Back => state.nav_prev(),
+        NavAction::Continue => state.nav_next(),
         NavAction::None => {}
     }
 }

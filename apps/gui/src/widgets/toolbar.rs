@@ -68,9 +68,9 @@ pub fn toolbar(ctx: &egui::Context, state: &mut AppState) {
                         };
                     }
 
-                    // Home button — returns to Guided/Load
+                    // Home button — returns to Landing page
                     if design::btn_primary(ui, "\u{2302} Home").clicked() {
-                        state.guided_step = GuidedStep::Load;
+                        state.guided_step = GuidedStep::Landing;
                         state.ui_mode = UiMode::Guided;
                     }
 
