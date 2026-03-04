@@ -409,13 +409,15 @@ fn analysis_spectrum_column(ui: &mut egui::Ui, state: &mut AppState) {
                     .and_then(|u| u.get(i))
                     .map_or("N/A".to_string(), |u| format!("{:.2e}", u));
                 let dot_color = design::isotope_dot_color(&entry.symbol);
-                let (rect, _) =
-                    ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                ui.painter().circle_filled(rect.center(), 4.0, dot_color);
-                ui.label(format!(
-                    "{}: {:.4e} \u{00b1} {}",
-                    entry.symbol, result.densities[i], unc_str
-                ));
+                ui.horizontal(|ui| {
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                    ui.painter().circle_filled(rect.center(), 4.0, dot_color);
+                    ui.label(format!(
+                        "{}: {:.4e} \u{00b1} {}",
+                        entry.symbol, result.densities[i], unc_str
+                    ));
+                });
             }
         }
     }
