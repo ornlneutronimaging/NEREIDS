@@ -270,17 +270,17 @@ fn analysis_spectrum_column(ui: &mut egui::Ui, state: &mut AppState) {
                         (v.iter().take(n_tof).copied().collect(), "TOF (\u{03bc}s)")
                     }
                     (SpectrumUnit::EnergyEv, _) => {
+                        // Spectrum file is in energy units — convert to TOF for the plot axis.
                         if state.beamline.flight_path_m.is_finite()
                             && state.beamline.flight_path_m > 0.0
                         {
                             let tof_vals: Vec<f64> = v
-                                .windows(2)
+                                .iter()
                                 .take(n_tof)
-                                .map(|w| {
-                                    let center = 0.5 * (w[0] + w[1]);
-                                    if center > 0.0 {
+                                .map(|&e| {
+                                    if e > 0.0 {
                                         nereids_core::constants::energy_to_tof(
-                                            center,
+                                            e,
                                             state.beamline.flight_path_m,
                                         ) + state.beamline.delay_us
                                     } else {
@@ -290,12 +290,8 @@ fn analysis_spectrum_column(ui: &mut egui::Ui, state: &mut AppState) {
                                 .collect();
                             (tof_vals, "TOF (\u{03bc}s)")
                         } else {
-                            let centers: Vec<f64> = v
-                                .windows(2)
-                                .take(n_tof)
-                                .map(|w| 0.5 * (w[0] + w[1]))
-                                .collect();
-                            (centers, "Energy (eV)")
+                            // Cannot convert without valid beamline params — show energy instead.
+                            (v.iter().take(n_tof).copied().collect(), "Energy (eV)")
                         }
                     }
                 }
@@ -529,7 +525,7 @@ fn dock_isotopes(ui: &mut egui::Ui, state: &AppState) {
         .striped(true)
         .show(ui, |ui| {
             // Header
-            ui.label(egui::RichText::new("").small().strong());
+            ui.label(egui::RichText::new("On").small().strong());
             ui.label(egui::RichText::new("Symbol").small().strong());
             ui.label(egui::RichText::new("Z").small().strong());
             ui.label(egui::RichText::new("A").small().strong());
