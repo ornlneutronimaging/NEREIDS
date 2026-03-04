@@ -518,6 +518,12 @@ pub struct AppState {
     pub rois: Vec<RoiSelection>,
     pub selected_roi: Option<usize>,
 
+    /// Snapshot of ROIs at the time spatial_map was launched.
+    /// Used to render density overlays only on fitted pixels.
+    pub fitting_rois: Vec<RoiSelection>,
+    /// Toggle: show density overlay on preview image in Results.
+    pub show_density_overlay: bool,
+
     // -- Results --
     pub pixel_fit_result: Option<SpectrumFitResult>,
     pub spatial_result: Option<SpatialResult>,
@@ -914,6 +920,7 @@ impl AppState {
         self.selected_roi = None;
         self.pixel_fit_result = None;
         self.spatial_result = None;
+        self.fitting_rois.clear();
         self.preview_image = None;
         self.energies = None;
         self.normalized = None;
@@ -1061,6 +1068,8 @@ impl Default for AppState {
             selected_pixel: None,
             rois: Vec::new(),
             selected_roi: None,
+            fitting_rois: Vec::new(),
+            show_density_overlay: true,
 
             pixel_fit_result: None,
             spatial_result: None,

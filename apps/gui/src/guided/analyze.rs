@@ -857,7 +857,31 @@ pub fn run_spatial_map(state: &mut AppState) {
         None => return,
     };
 
-    let dead_pixels = state.dead_pixels.clone();
+    // Combine dead_pixels with ROI mask: pixels outside all ROIs are treated as dead.
+    let shape = norm.transmission.shape();
+    let (height, width) = (shape[1], shape[2]);
+    let dead_pixels = if !state.rois.is_empty() {
+        let mut mask = ndarray::Array2::from_elem((height, width), true);
+        for roi in &state.rois {
+            for y in roi.y_start..roi.y_end.min(height) {
+                for x in roi.x_start..roi.x_end.min(width) {
+                    mask[[y, x]] = false;
+                }
+            }
+        }
+        // Merge with existing dead_pixels
+        if let Some(ref dp) = state.dead_pixels {
+            ndarray::Zip::from(&mut mask)
+                .and(dp)
+                .for_each(|m, &d| *m = *m || d);
+        }
+        Some(mask)
+    } else {
+        state.dead_pixels.clone()
+    };
+
+    // Snapshot ROIs at fit time for overlay rendering in Results
+    state.fitting_rois = state.rois.clone();
 
     let (tx, rx) = mpsc::channel();
     state.pending_spatial = Some(rx);
@@ -868,8 +892,7 @@ pub fn run_spatial_map(state: &mut AppState) {
     // Progress counter: GUI polls this each frame via fitting_progress_counter.
     let progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     state.fitting_progress_counter = Some(Arc::clone(&progress));
-    let shape = norm.transmission.shape();
-    let n_total_pixels = shape[1] * shape[2];
+    let n_total_pixels = height * width;
     let n_live = match dead_pixels {
         Some(ref dp) => dp.iter().filter(|&&d| !d).count(),
         None => n_total_pixels,

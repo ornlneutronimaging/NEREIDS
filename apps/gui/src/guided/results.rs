@@ -3,7 +3,7 @@
 use super::result_widgets;
 use crate::state::{AppState, Colormap};
 use crate::widgets::design;
-use crate::widgets::image_view::show_colormapped_image_with_roi;
+use crate::widgets::image_view::{show_colormapped_image_with_roi, show_density_overlay};
 
 /// Draw the Results step content.
 pub fn results_step(ui: &mut egui::Ui, state: &mut AppState) {
@@ -107,6 +107,31 @@ fn density_map_grid(ui: &mut egui::Ui, state: &mut AppState) {
 
     let n_tiles = n_density + 1; // isotopes + convergence
 
+    // Overlay toggle (only when fitting_rois is non-empty)
+    let has_rois = !state.fitting_rois.is_empty();
+    if has_rois {
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut state.show_density_overlay, "Overlay on preview");
+            if state.show_density_overlay {
+                ui.label(
+                    egui::RichText::new("Density shown only in fitted ROI regions")
+                        .size(11.0)
+                        .weak(),
+                );
+            }
+        });
+        ui.add_space(4.0);
+    }
+
+    // Snapshot overlay state for rendering
+    let use_overlay = has_rois && state.show_density_overlay && state.preview_image.is_some();
+    let fitting_rois = state.fitting_rois.clone();
+    let preview_for_overlay = if use_overlay {
+        state.preview_image.clone()
+    } else {
+        None
+    };
+
     design::card_with_header(ui, "Density Maps", None, |ui| {
         // Compute layout inside the card so available_width accounts for card padding.
         let available_width = ui.available_width();
@@ -136,7 +161,23 @@ fn density_map_grid(ui: &mut egui::Ui, state: &mut AppState) {
                                 state.tile_display.get(i).is_some_and(|t| t.show_colorbar);
 
                             let selected = state.selected_pixel;
-                            if show_bar {
+
+                            // Use overlay rendering if available
+                            if let Some(ref preview) = preview_for_overlay {
+                                let (clicked, _rect) = show_density_overlay(
+                                    ui,
+                                    preview,
+                                    data,
+                                    &fitting_rois,
+                                    &tex_id,
+                                    colormap,
+                                    selected,
+                                );
+                                if let Some((y, x)) = clicked {
+                                    state.selected_pixel = Some((y, x));
+                                    state.pixel_fit_result = None;
+                                }
+                            } else if show_bar {
                                 ui.horizontal(|ui| {
                                     if let Some((y, x)) = show_colormapped_image_with_roi(
                                         ui,

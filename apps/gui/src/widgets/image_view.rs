@@ -319,6 +319,132 @@ pub fn show_image_with_roi_editor(
     (result, image_rect)
 }
 
+/// Display a density map overlaid on a dimmed preview image.
+///
+/// Pixels inside any of the `fitting_rois` show the density colormap.
+/// Pixels outside show a dimmed grayscale version of the preview.
+/// Returns `(clicked_pixel, image_rect)`.
+pub fn show_density_overlay(
+    ui: &mut egui::Ui,
+    preview: &ndarray::Array2<f64>,
+    density: &ndarray::Array2<f64>,
+    fitting_rois: &[RoiSelection],
+    tex_id: &str,
+    colormap: Colormap,
+    selected_pixel: Option<(usize, usize)>,
+) -> (Option<(usize, usize)>, egui::Rect) {
+    let (height, width) = (preview.shape()[0], preview.shape()[1]);
+    if width == 0 || height == 0 {
+        ui.label("(empty image)");
+        return (None, egui::Rect::NOTHING);
+    }
+
+    // Compute ranges for preview (grayscale) and density (colormap)
+    let (p_min, p_max) = data_range(preview);
+    let p_range = if (p_max - p_min).abs() < 1e-30 {
+        1.0
+    } else {
+        p_max - p_min
+    };
+    let (d_min, d_max) = density_range_in_rois(density, fitting_rois);
+    let d_range = if (d_max - d_min).abs() < 1e-30 {
+        1.0
+    } else {
+        d_max - d_min
+    };
+
+    let mut pixels = Vec::with_capacity(width * height * 4);
+    for y in 0..height {
+        for x in 0..width {
+            let in_roi = fitting_rois
+                .iter()
+                .any(|r| y >= r.y_start && y < r.y_end && x >= r.x_start && x < r.x_end);
+            if in_roi {
+                // Density colormap
+                let v = density[[y, x]];
+                let t = if v.is_finite() {
+                    ((v - d_min) / d_range).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let (r, g, b) = apply_colormap(colormap, t);
+                pixels.push(r);
+                pixels.push(g);
+                pixels.push(b);
+                pixels.push(255);
+            } else {
+                // Dimmed grayscale preview
+                let v = preview[[y, x]];
+                let t = if v.is_finite() {
+                    ((v - p_min) / p_range).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let gray = (t * 80.0 + 30.0).clamp(0.0, 255.0) as u8;
+                pixels.push(gray);
+                pixels.push(gray);
+                pixels.push(gray);
+                pixels.push(255);
+            }
+        }
+    }
+
+    let image = egui::ColorImage::from_rgba_unmultiplied([width, height], &pixels);
+    let texture = ui
+        .ctx()
+        .load_texture(tex_id, image, egui::TextureOptions::NEAREST);
+
+    let available_width = ui.available_width().min(512.0);
+    let scale = available_width / width as f32;
+    let display_size = egui::Vec2::new(width as f32 * scale, height as f32 * scale);
+
+    let (response, painter) = ui.allocate_painter(display_size, egui::Sense::click());
+    let image_rect = response.rect;
+    painter.image(
+        texture.id(),
+        image_rect,
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        egui::Color32::WHITE,
+    );
+
+    // Draw selected pixel marker
+    if let Some((py, px)) = selected_pixel {
+        draw_pixel_marker(&painter, image_rect, (height, width), py, px);
+    }
+
+    if response.clicked()
+        && let Some(pos) = response.interact_pointer_pos()
+    {
+        let (py, px) = screen_to_pixel(pos, image_rect, (height, width));
+        return (Some((py, px)), image_rect);
+    }
+
+    (None, image_rect)
+}
+
+/// Compute (min, max) of finite density values within ROI regions only.
+fn density_range_in_rois(density: &ndarray::Array2<f64>, rois: &[RoiSelection]) -> (f64, f64) {
+    let mut vmin = f64::INFINITY;
+    let mut vmax = f64::NEG_INFINITY;
+    let (height, width) = (density.shape()[0], density.shape()[1]);
+    for roi in rois {
+        for y in roi.y_start..roi.y_end.min(height) {
+            for x in roi.x_start..roi.x_end.min(width) {
+                let v = density[[y, x]];
+                if v.is_finite() {
+                    vmin = vmin.min(v);
+                    vmax = vmax.max(v);
+                }
+            }
+        }
+    }
+    if vmin > vmax {
+        (0.0, 0.0)
+    } else {
+        (vmin, vmax)
+    }
+}
+
 /// Prepare the colormapped texture and allocate an interactive painter.
 ///
 /// Shared between `show_colormapped_image_with_roi` (click) and
