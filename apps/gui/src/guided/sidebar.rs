@@ -17,6 +17,9 @@ pub fn guided_sidebar(ctx: &egui::Context, state: &mut AppState) {
                 .stroke(Stroke::new(1.0, colors.border)),
         )
         .show(ctx, |ui| {
+            let on_landing_or_wizard =
+                matches!(state.guided_step, GuidedStep::Landing | GuidedStep::Wizard);
+
             // ── Dynamic pipeline steps or placeholder ────────────
             if state.pipeline.is_empty() {
                 ui.label(
@@ -31,13 +34,42 @@ pub fn guided_sidebar(ctx: &egui::Context, state: &mut AppState) {
                         .size(11.0)
                         .color(colors.fg3),
                 );
+            } else if on_landing_or_wizard {
+                // Dimmed previous pipeline — user navigated Home
+                ui.label(
+                    RichText::new("PREVIOUS")
+                        .size(10.0)
+                        .strong()
+                        .color(colors.fg3),
+                );
+                ui.add_space(4.0);
+                let pathway = pathway_label(state);
+                ui.label(RichText::new(pathway).size(12.0).color(colors.fg3));
+                ui.add_space(8.0);
+
+                // Dimmed step list
+                let pipeline: Vec<PipelineEntry> = state.pipeline.clone();
+                for entry in &pipeline {
+                    dimmed_pipeline_step_row(ui, entry, state, &colors);
+                    ui.add_space(2.0);
+                }
+                ui.add_space(8.0);
+
+                // Resume button
+                if ui.button("\u{21B5} Resume").clicked() {
+                    // Jump back to the first incomplete step, or the first step
+                    let target = pipeline
+                        .iter()
+                        .find(|e| !step_is_complete(e.step, state))
+                        .unwrap_or(&pipeline[0]);
+                    state.guided_step = target.step;
+                }
             } else {
-                // Pathway label
+                // Active pipeline — full rendering
                 let pathway_label = pathway_label(state);
                 ui.label(RichText::new(pathway_label).strong().size(14.0));
                 ui.add_space(12.0);
 
-                // Clone pipeline to avoid borrow issues with state
                 let pipeline: Vec<PipelineEntry> = state.pipeline.clone();
                 for entry in &pipeline {
                     pipeline_step_row(ui, entry, state, &colors);
@@ -46,7 +78,7 @@ pub fn guided_sidebar(ctx: &egui::Context, state: &mut AppState) {
             }
 
             // ── Tools section (hidden on Landing/Wizard) ─────
-            if !state.pipeline.is_empty() {
+            if !state.pipeline.is_empty() && !on_landing_or_wizard {
                 ui.add_space(12.0);
                 ui.separator();
                 ui.add_space(8.0);
@@ -214,6 +246,60 @@ fn pipeline_step_row(
     }
 }
 
+/// Render a dimmed pipeline step row (for inactive/previous pipeline on Landing).
+fn dimmed_pipeline_step_row(
+    ui: &mut egui::Ui,
+    entry: &PipelineEntry,
+    state: &AppState,
+    colors: &ThemeColors,
+) {
+    let step = entry.step;
+    let is_complete = step_is_complete(step, state);
+    let display_num = state.step_display_number(step);
+
+    egui::Frame::NONE
+        .corner_radius(CornerRadius::same(7))
+        .inner_margin(Margin::symmetric(10, 4))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+
+                // Dimmed number badge (16×16, smaller)
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), Sense::hover());
+                let center = rect.center();
+
+                let badge_text = match display_num {
+                    Some(n) => n.to_string(),
+                    None => "\u{2014}".to_string(),
+                };
+
+                if is_complete {
+                    ui.painter()
+                        .circle_filled(center, 8.0, semantic::GREEN.gamma_multiply(0.4));
+                    ui.painter().text(
+                        center,
+                        egui::Align2::CENTER_CENTER,
+                        "\u{2713}",
+                        egui::FontId::proportional(9.0),
+                        colors.fg3,
+                    );
+                } else {
+                    ui.painter()
+                        .circle_filled(center, 8.0, colors.bg3.gamma_multiply(0.5));
+                    ui.painter().text(
+                        center,
+                        egui::Align2::CENTER_CENTER,
+                        &badge_text,
+                        egui::FontId::proportional(9.0),
+                        colors.fg3,
+                    );
+                }
+
+                ui.label(RichText::new(step.label()).size(11.0).color(colors.fg3));
+            });
+        });
+}
+
 /// Render a tool row (Forward Model, Detectability) with icon and subtitle.
 fn tool_row(
     ui: &mut egui::Ui,
@@ -334,6 +420,11 @@ fn step_subtitle(step: GuidedStep, state: &AppState) -> String {
         GuidedStep::Landing | GuidedStep::Wizard => String::new(),
         GuidedStep::ForwardModel | GuidedStep::Detectability => String::new(),
     }
+}
+
+/// Check whether a guided step has been completed based on state (public accessor).
+pub fn step_is_complete_pub(step: GuidedStep, state: &AppState) -> bool {
+    step_is_complete(step, state)
 }
 
 /// Check whether a guided step has been completed based on state.

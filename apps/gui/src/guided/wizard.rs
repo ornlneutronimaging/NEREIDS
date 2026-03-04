@@ -238,6 +238,7 @@ fn wizard_confirm(ui: &mut egui::Ui, state: &mut AppState) {
                 state.fitting_type = Some(ft);
                 state.data_type = Some(dt);
                 state.rebuild_pipeline();
+                state.cached_session = None; // new pipeline supersedes cache
                 if let Some(first) = state.pipeline.first() {
                     state.guided_step = first.step;
                 }

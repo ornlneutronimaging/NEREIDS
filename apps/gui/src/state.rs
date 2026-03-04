@@ -17,6 +17,144 @@ use nereids_pipeline::detectability::TraceDetectabilityReport;
 use nereids_pipeline::pipeline::SpectrumFitResult;
 use nereids_pipeline::spatial::SpatialResult;
 
+/// Lightweight session cache for persistence across app restarts.
+/// Only stores the subset of state needed to resume a previous pipeline.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SessionCache {
+    pub fitting_type: Option<FittingType>,
+    pub data_type: Option<DataType>,
+    pub input_mode: InputMode,
+    pub analysis_mode: AnalysisMode,
+    /// Beamline flight path (m).
+    pub flight_path_m: f64,
+    /// Beamline delay (μs).
+    pub delay_us: f64,
+    /// Temperature (K).
+    pub temperature_k: f64,
+    /// Proton charge sample.
+    pub proton_charge_sample: f64,
+    /// Proton charge open beam.
+    pub proton_charge_ob: f64,
+    /// Isotope list: (z, a, symbol, density, endf_library_name).
+    pub isotopes: Vec<CachedIsotope>,
+    /// ENDF library name (e.g. "ENDF/B-VIII.0").
+    pub endf_library_name: String,
+}
+
+/// A cached isotope entry (serializable).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CachedIsotope {
+    pub z: u32,
+    pub a: u32,
+    pub symbol: String,
+    pub density: f64,
+    pub enabled: bool,
+}
+
+impl SessionCache {
+    /// Build a session cache from the current application state.
+    pub fn from_state(state: &AppState) -> Option<Self> {
+        // Only cache if a pipeline has been configured
+        if state.fitting_type.is_none() || state.data_type.is_none() {
+            return None;
+        }
+        Some(Self {
+            fitting_type: state.fitting_type,
+            data_type: state.data_type,
+            input_mode: state.input_mode,
+            analysis_mode: state.analysis_mode,
+            flight_path_m: state.beamline.flight_path_m,
+            delay_us: state.beamline.delay_us,
+            temperature_k: state.temperature_k,
+            proton_charge_sample: state.proton_charge_sample,
+            proton_charge_ob: state.proton_charge_ob,
+            isotopes: state
+                .isotope_entries
+                .iter()
+                .map(|e| CachedIsotope {
+                    z: e.z,
+                    a: e.a,
+                    symbol: e.symbol.clone(),
+                    density: e.initial_density,
+                    enabled: e.enabled,
+                })
+                .collect(),
+            endf_library_name: endf_library_name(state.endf_library).to_string(),
+        })
+    }
+
+    /// Apply cached settings to app state (restores pipeline + config).
+    pub fn apply_to(&self, state: &mut AppState) {
+        state.fitting_type = self.fitting_type;
+        state.data_type = self.data_type;
+        state.input_mode = self.input_mode;
+        state.analysis_mode = self.analysis_mode;
+        state.beamline.flight_path_m = self.flight_path_m;
+        state.beamline.delay_us = self.delay_us;
+        state.temperature_k = self.temperature_k;
+        state.proton_charge_sample = self.proton_charge_sample;
+        state.proton_charge_ob = self.proton_charge_ob;
+
+        // Restore isotope entries (without resonance data — needs re-fetch)
+        state.isotope_entries = self
+            .isotopes
+            .iter()
+            .map(|c| IsotopeEntry {
+                z: c.z,
+                a: c.a,
+                symbol: c.symbol.clone(),
+                initial_density: c.density,
+                resonance_data: None,
+                enabled: c.enabled,
+                endf_status: EndfStatus::Pending,
+            })
+            .collect();
+
+        // Restore library by matching label
+        state.endf_library = match self.endf_library_name.as_str() {
+            "ENDF/B-VIII.1" => nereids_endf::retrieval::EndfLibrary::EndfB8_1,
+            "JEFF-3.3" => nereids_endf::retrieval::EndfLibrary::Jeff3_3,
+            "JENDL-5" => nereids_endf::retrieval::EndfLibrary::Jendl5,
+            _ => nereids_endf::retrieval::EndfLibrary::EndfB8_0,
+        };
+
+        // Rebuild pipeline
+        state.rebuild_pipeline();
+    }
+
+    /// Summary label for display (e.g. "Spatial + Events, 3 isotopes").
+    pub fn summary(&self) -> String {
+        let fitting = match self.fitting_type {
+            Some(FittingType::Spatial) => "Spatial",
+            Some(FittingType::Single) => "Single",
+            None => "Unknown",
+        };
+        let data = match self.data_type {
+            Some(DataType::Events) => "Events",
+            Some(DataType::PreNormalized) => "Pre-norm",
+            Some(DataType::Transmission) => "Transmission",
+            None => "Unknown",
+        };
+        let n_iso = self.isotopes.iter().filter(|i| i.enabled).count();
+        if n_iso > 0 {
+            format!("{fitting} + {data}, {n_iso} isotope(s)")
+        } else {
+            format!("{fitting} + {data}")
+        }
+    }
+}
+
+/// Map an EndfLibrary variant to its display name for persistence.
+fn endf_library_name(lib: nereids_endf::retrieval::EndfLibrary) -> &'static str {
+    use nereids_endf::retrieval::EndfLibrary;
+    match lib {
+        EndfLibrary::EndfB8_0 => "ENDF/B-VIII.0",
+        EndfLibrary::EndfB8_1 => "ENDF/B-VIII.1",
+        EndfLibrary::Jeff3_3 => "JEFF-3.3",
+        EndfLibrary::Jendl5 => "JENDL-5",
+    }
+}
+
 /// Result of a background ENDF fetch for a single isotope.
 pub struct EndfFetchResult {
     pub index: usize,
@@ -25,7 +163,7 @@ pub struct EndfFetchResult {
 }
 
 /// Input mode: which type of data is being loaded.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum InputMode {
     /// Sample TIFF stack + Open beam TIFF stack + Spectrum file.
     TiffPair,
@@ -38,7 +176,7 @@ pub enum InputMode {
 }
 
 /// Analysis mode — determines how fitting operates in the Analyze step.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AnalysisMode {
     /// Fit every pixel independently (full spatial map).
     FullSpatialMap,
@@ -432,6 +570,10 @@ pub struct AppState {
     pub export_format: ExportFormat,
     pub export_directory: Option<PathBuf>,
     pub export_status: Option<String>,
+
+    // -- Session persistence --
+    /// Cached session from a previous run (loaded at startup, cleared on use).
+    pub cached_session: Option<SessionCache>,
 }
 
 /// ENDF fetch lifecycle for an isotope entry.
@@ -509,14 +651,14 @@ pub enum StudioDocTab {
 }
 
 /// Fitting type chosen in the wizard (Q1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FittingType {
     Spatial,
     Single,
 }
 
 /// Data type chosen in the wizard (Q2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DataType {
     Events,
     PreNormalized,
@@ -904,6 +1046,8 @@ impl Default for AppState {
             export_format: ExportFormat::Tiff,
             export_directory: None,
             export_status: None,
+
+            cached_session: None,
         }
     }
 }
