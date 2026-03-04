@@ -22,65 +22,50 @@ pub fn normalize_step(ui: &mut egui::Ui, state: &mut AppState) {
     };
     design::content_header(ui, "Normalize", subtitle);
 
-    // --- Upper section: two-column layout ---
-    let available_width = ui.available_width();
-    let left_width = (available_width * 0.45).min(420.0);
+    let has_data = state.normalized.is_some() && state.energies.is_some();
 
-    ui.horizontal(|ui| {
-        // Left column: normalization card + stat row
-        ui.allocate_ui_with_layout(
-            egui::vec2(left_width, ui.available_height()),
-            egui::Layout::top_down(egui::Align::LEFT),
-            |ui| {
-                normalization_controls_card(ui, state);
-
-                if let (Some(norm), Some(energies)) = (&state.normalized, &state.energies) {
-                    let shape = norm.transmission.shape();
-                    let bins = format!("{}", shape[0]);
-                    let pixels = format!("{}", shape[1] * shape[2]);
-                    let e_min = format!("{:.2}", energies.first().unwrap_or(&0.0));
-                    let e_max = format!("{:.2}", energies.last().unwrap_or(&0.0));
-                    ui.add_space(8.0);
-                    design::stat_row(
-                        ui,
-                        &[
-                            (&bins, "Energy Bins"),
-                            (&pixels, "Pixels"),
-                            (&e_min, "E_min (eV)"),
-                            (&e_max, "E_max (eV)"),
-                        ],
-                    );
-                }
-            },
-        );
-
-        ui.add_space(12.0);
-
-        // Right column: analysis mode + nav buttons
-        ui.vertical(|ui| {
-            let has_data = state.normalized.is_some() && state.energies.is_some();
-            if has_data {
-                analysis_mode_cards(ui, state);
-            }
-
-            let can_continue = state.normalized.is_some() && state.energies.is_some();
-            match design::nav_buttons(
-                ui,
-                Some("\u{2190} Back"),
-                "Continue \u{2192}",
-                can_continue,
-                "Normalize data to continue",
-            ) {
-                NavAction::Back => state.guided_step = GuidedStep::Configure,
-                NavAction::Continue => state.guided_step = GuidedStep::Analyze,
-                NavAction::None => {}
-            }
-        });
+    // --- Row 1: Normalization card + Analysis Mode card side by side ---
+    ui.columns(2, |cols| {
+        normalization_controls_card(&mut cols[0], state);
+        if has_data {
+            analysis_mode_cards(&mut cols[1], state);
+        }
     });
 
-    // --- Lower section: transmission preview (full width) ---
-    if state.normalized.is_some() && state.energies.is_some() {
-        ui.add_space(12.0);
+    // --- Row 2: stat row + nav buttons ---
+    if let (Some(norm), Some(energies)) = (&state.normalized, &state.energies) {
+        let shape = norm.transmission.shape();
+        let bins = format!("{}", shape[0]);
+        let pixels = format!("{}", shape[1] * shape[2]);
+        let e_min = format!("{:.2}", energies.first().unwrap_or(&0.0));
+        let e_max = format!("{:.2}", energies.last().unwrap_or(&0.0));
+        design::stat_row(
+            ui,
+            &[
+                (&bins, "Energy Bins"),
+                (&pixels, "Pixels"),
+                (&e_min, "E_min (eV)"),
+                (&e_max, "E_max (eV)"),
+            ],
+        );
+    }
+
+    let can_continue = state.normalized.is_some() && state.energies.is_some();
+    match design::nav_buttons(
+        ui,
+        Some("\u{2190} Back"),
+        "Continue \u{2192}",
+        can_continue,
+        "Normalize data to continue",
+    ) {
+        NavAction::Back => state.guided_step = GuidedStep::Configure,
+        NavAction::Continue => state.guided_step = GuidedStep::Analyze,
+        NavAction::None => {}
+    }
+
+    // --- Row 3: transmission preview (full width) ---
+    if has_data {
+        ui.add_space(8.0);
         transmission_preview_card(ui, state);
     }
 }
@@ -416,7 +401,7 @@ fn preview_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
 
 fn analysis_mode_cards(ui: &mut egui::Ui, state: &mut AppState) {
     design::card_with_header(ui, "Analysis Mode", None, |ui| {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             mode_card(
                 ui,
                 &mut state.analysis_mode,
