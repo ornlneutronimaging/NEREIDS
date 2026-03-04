@@ -585,6 +585,7 @@ fn add_selected_isotopes(state: &mut AppState) {
                     symbol,
                     concentration_ppm: density,
                     resonance_data: None,
+                    endf_status: EndfStatus::Pending,
                 });
                 state.detect_results.clear();
             }

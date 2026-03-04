@@ -145,22 +145,21 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
             }
         });
 
-        // Fetch ENDF button
-        let has_missing = state
+        // Auto-fetch ENDF data when isotopes are pending
+        let has_pending = state
             .isotope_entries
             .iter()
-            .any(|e| e.enabled && e.endf_status != EndfStatus::Loaded);
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.add_enabled_ui(has_missing && !state.is_fetching_endf, |ui| {
-                if ui.button("Fetch ENDF Data").clicked() {
-                    fetch_endf_data(state);
-                }
-            });
-            if state.is_fetching_endf {
+            .any(|e| e.enabled && e.endf_status == EndfStatus::Pending);
+        if has_pending && !state.is_fetching_endf {
+            fetch_endf_data(state);
+        }
+        if state.is_fetching_endf {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
                 ui.spinner();
-            }
-        });
+                ui.label("Fetching ENDF data…");
+            });
+        }
     });
 
     // Density editing popup
@@ -179,7 +178,7 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
         Some("\u{2190} Back"),
         "Continue \u{2192}",
         can_continue,
-        "Fetch ENDF data to continue",
+        "Waiting for ENDF data…",
     ) {
         NavAction::Back => state.nav_prev(),
         NavAction::Continue => state.nav_next(),

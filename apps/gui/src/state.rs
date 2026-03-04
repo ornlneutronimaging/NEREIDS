@@ -468,6 +468,7 @@ pub struct DetectTraceEntry {
     pub symbol: String,
     pub concentration_ppm: f64,
     pub resonance_data: Option<ResonanceData>,
+    pub endf_status: EndfStatus,
 }
 
 /// Main application state.
@@ -878,6 +879,11 @@ impl AppState {
             }
         }
         for e in &mut self.detect_matrix_entries {
+            if e.endf_status == EndfStatus::Fetching {
+                e.endf_status = EndfStatus::Pending;
+            }
+        }
+        for e in &mut self.detect_trace_entries {
             if e.endf_status == EndfStatus::Fetching {
                 e.endf_status = EndfStatus::Pending;
             }

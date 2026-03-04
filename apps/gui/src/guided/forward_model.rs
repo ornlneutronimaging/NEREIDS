@@ -303,17 +303,19 @@ pub(crate) fn fm_isotopes_card(ui: &mut egui::Ui, state: &mut AppState) {
             }
         });
 
-        let has_missing = state
+        // Auto-fetch ENDF data when isotopes are pending
+        let has_pending = state
             .fm_isotope_entries
             .iter()
-            .any(|e| e.enabled && e.resonance_data.is_none());
-        ui.add_enabled_ui(has_missing && !state.is_fetching_fm_endf, |ui| {
-            if design::btn_primary(ui, "Fetch ENDF").clicked() {
-                fm_fetch_endf_data(state);
-            }
-        });
+            .any(|e| e.enabled && e.endf_status == EndfStatus::Pending);
+        if has_pending && !state.is_fetching_fm_endf {
+            fm_fetch_endf_data(state);
+        }
         if state.is_fetching_fm_endf {
-            ui.spinner();
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Fetching ENDF data…");
+            });
         }
     });
 }
