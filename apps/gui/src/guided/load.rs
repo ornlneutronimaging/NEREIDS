@@ -249,6 +249,8 @@ fn spectrum_section(ui: &mut egui::Ui, state: &mut AppState) {
     {
         state.spectrum_path = Some(f);
         state.spectrum_values = None;
+        state.sample_data = None;
+        state.open_beam_data = None;
         state.energies = None;
         state.normalized = None;
         state.load_error = false;
@@ -489,7 +491,7 @@ fn show_hdf5_tree(ui: &mut egui::Ui, state: &AppState) {
 
 // ── Data loading logic ─────────────────────────────────────────
 
-/// Show load error + retry button, or loading spinner.
+/// Show load error with retry button.
 fn load_status_ui(ui: &mut egui::Ui, state: &mut AppState) {
     if state.load_error {
         ui.add_space(4.0);
