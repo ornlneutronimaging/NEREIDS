@@ -81,6 +81,7 @@ pub(crate) fn detect_library_selector(ui: &mut egui::Ui, state: &mut AppState, l
         }
         for t in &mut state.detect_trace_entries {
             t.resonance_data = None;
+            t.endf_status = EndfStatus::Pending;
         }
         state.detect_results.clear();
     }
@@ -221,6 +222,7 @@ pub(crate) fn detect_trace_card(ui: &mut egui::Ui, state: &mut AppState, locked:
                             entry.a
                         );
                         entry.resonance_data = None;
+                        entry.endf_status = EndfStatus::Pending;
                         state.detect_results.clear();
                     }
                 });
@@ -239,10 +241,11 @@ pub(crate) fn detect_trace_card(ui: &mut egui::Ui, state: &mut AppState, locked:
                     }
                 });
 
-                if entry.resonance_data.is_some() {
-                    design::badge(ui, "OK", design::BadgeVariant::Green);
-                } else {
-                    design::badge(ui, "...", design::BadgeVariant::Orange);
+                match entry.endf_status {
+                    EndfStatus::Loaded => design::badge(ui, "OK", design::BadgeVariant::Green),
+                    EndfStatus::Fetching => design::badge(ui, "…", design::BadgeVariant::Orange),
+                    EndfStatus::Failed => design::badge(ui, "ERR", design::BadgeVariant::Red),
+                    EndfStatus::Pending => design::badge(ui, "...", design::BadgeVariant::Orange),
                 }
 
                 ui.add_enabled_ui(!locked, |ui| {
@@ -355,31 +358,29 @@ pub(crate) fn detect_advanced_config(ui: &mut egui::Ui, state: &mut AppState) {
 
 /// Fetch ENDF + Run Analysis buttons.
 pub(crate) fn detect_action_buttons(ui: &mut egui::Ui, state: &mut AppState) {
-    let has_missing_endf = state
+    // Auto-fetch ENDF data when entries are pending
+    let has_pending = state
         .detect_matrix_entries
         .iter()
-        .any(|m| m.resonance_data.is_none())
+        .any(|m| m.endf_status == EndfStatus::Pending)
         || state
             .detect_trace_entries
             .iter()
-            .any(|t| t.resonance_data.is_none());
+            .any(|t| t.endf_status == EndfStatus::Pending);
+    if has_pending && !state.is_fetching_detect_endf {
+        detect_fetch_endf_data(state);
+    }
 
     ui.horizontal(|ui| {
-        ui.add_enabled_ui(has_missing_endf && !state.is_fetching_detect_endf, |ui| {
-            if design::btn_primary(ui, "Fetch ENDF").clicked() {
-                detect_fetch_endf_data(state);
-            }
-        });
-
         let can_run = !state.detect_matrix_entries.is_empty()
             && state
                 .detect_matrix_entries
                 .iter()
-                .all(|m| m.resonance_data.is_some())
+                .all(|m| m.endf_status == EndfStatus::Loaded)
             && state
                 .detect_trace_entries
                 .iter()
-                .any(|t| t.resonance_data.is_some());
+                .any(|t| t.endf_status == EndfStatus::Loaded);
 
         ui.add_enabled_ui(can_run, |ui| {
             if design::btn_primary(ui, "Run Analysis").clicked() {
@@ -389,8 +390,30 @@ pub(crate) fn detect_action_buttons(ui: &mut egui::Ui, state: &mut AppState) {
 
         if state.is_fetching_detect_endf {
             ui.spinner();
+            ui.label("Fetching ENDF data…");
         }
     });
+
+    let has_failed = state
+        .detect_matrix_entries
+        .iter()
+        .any(|m| m.endf_status == EndfStatus::Failed)
+        || state
+            .detect_trace_entries
+            .iter()
+            .any(|t| t.endf_status == EndfStatus::Failed);
+    if has_failed && !state.is_fetching_detect_endf && ui.button("Retry failed").clicked() {
+        for e in &mut state.detect_matrix_entries {
+            if e.endf_status == EndfStatus::Failed {
+                e.endf_status = EndfStatus::Pending;
+            }
+        }
+        for e in &mut state.detect_trace_entries {
+            if e.endf_status == EndfStatus::Failed {
+                e.endf_status = EndfStatus::Pending;
+            }
+        }
+    }
 }
 
 /// Results panel: hero stat row, verdict table with badges, delta-T spectrum.
@@ -655,9 +678,11 @@ pub(crate) fn detect_fetch_endf_data(state: &mut AppState) {
 
     let n_matrix = state.detect_matrix_entries.len();
     let mut work: Vec<(usize, Isotope, String, EndfLibrary)> = Vec::new();
+    let mut failed_matrix: Vec<usize> = Vec::new();
+    let mut failed_trace: Vec<usize> = Vec::new();
 
     for (i, entry) in state.detect_matrix_entries.iter().enumerate() {
-        if entry.resonance_data.is_none() {
+        if entry.endf_status == EndfStatus::Pending {
             match Isotope::new(entry.z, entry.a) {
                 Ok(isotope) => {
                     if retrieval::mat_number(&isotope).is_some() {
@@ -667,6 +692,7 @@ pub(crate) fn detect_fetch_endf_data(state: &mut AppState) {
                             "No MAT number for matrix {} \u{2014} isotope not in database",
                             entry.symbol
                         );
+                        failed_matrix.push(i);
                     }
                 }
                 Err(e) => {
@@ -674,13 +700,14 @@ pub(crate) fn detect_fetch_endf_data(state: &mut AppState) {
                         "Matrix isotope Z={} A={} is not supported: {}",
                         entry.z, entry.a, e
                     );
+                    failed_matrix.push(i);
                 }
             }
         }
     }
 
     for (i, entry) in state.detect_trace_entries.iter().enumerate() {
-        if entry.resonance_data.is_none() {
+        if entry.endf_status == EndfStatus::Pending {
             match Isotope::new(entry.z, entry.a) {
                 Ok(isotope) => {
                     if retrieval::mat_number(&isotope).is_some() {
@@ -695,13 +722,21 @@ pub(crate) fn detect_fetch_endf_data(state: &mut AppState) {
                             "No MAT number for {} \u{2014} isotope not in database",
                             entry.symbol
                         );
+                        failed_trace.push(i);
                     }
                 }
                 Err(e) => {
                     state.status_message = format!("Invalid isotope {}: {}", entry.symbol, e);
+                    failed_trace.push(i);
                 }
             }
         }
+    }
+    for i in failed_matrix {
+        state.detect_matrix_entries[i].endf_status = EndfStatus::Failed;
+    }
+    for i in failed_trace {
+        state.detect_trace_entries[i].endf_status = EndfStatus::Failed;
     }
 
     if work.is_empty() {
@@ -714,6 +749,8 @@ pub(crate) fn detect_fetch_endf_data(state: &mut AppState) {
     for (idx, _, _, _) in &work {
         if *idx < n_matrix {
             state.detect_matrix_entries[*idx].endf_status = EndfStatus::Fetching;
+        } else if let Some(entry) = state.detect_trace_entries.get_mut(*idx - n_matrix) {
+            entry.endf_status = EndfStatus::Fetching;
         }
     }
 

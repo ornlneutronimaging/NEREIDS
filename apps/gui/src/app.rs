@@ -251,10 +251,12 @@ fn poll_pending_tasks(state: &mut AppState) {
                             match fetch.result {
                                 Ok(data) => {
                                     entry.resonance_data = Some(data);
+                                    entry.endf_status = EndfStatus::Loaded;
                                     state.status_message =
                                         format!("Detect: loaded trace {}", fetch.symbol);
                                 }
                                 Err(msg) => {
+                                    entry.endf_status = EndfStatus::Failed;
                                     state.status_message = msg;
                                 }
                             }
