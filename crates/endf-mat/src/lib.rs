@@ -38,7 +38,7 @@ mod za;
 pub use elements::{element_name, element_symbol, symbol_to_z};
 
 // MAT numbers
-pub use mat::{isotope_from_mat, mat_number};
+pub use mat::{has_endf_evaluation, isotope_from_mat, known_isotopes, mat_number};
 
 // Natural abundances
 pub use abundances::{natural_abundance, natural_isotopes};
