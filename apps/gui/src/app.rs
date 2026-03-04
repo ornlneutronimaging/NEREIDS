@@ -32,6 +32,9 @@ impl eframe::App for NereidsApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         if let Some(cache) = SessionCache::from_state(&self.state) {
             eframe::set_value(storage, SESSION_CACHE_KEY, &cache);
+        } else {
+            // Clear stale cache when no pipeline is configured
+            storage.set_string(SESSION_CACHE_KEY, String::new());
         }
     }
 

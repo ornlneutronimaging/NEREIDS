@@ -39,6 +39,23 @@ pub struct SessionCache {
     pub isotopes: Vec<CachedIsotope>,
     /// ENDF library name (e.g. "ENDF/B-VIII.0").
     pub endf_library_name: String,
+    /// Solver method.
+    pub solver_method: CachedSolverMethod,
+    /// Resolution broadening: "gaussian" or "tabulated".
+    pub resolution_kind: String,
+    /// Gaussian Δt (μs), only used when resolution_kind == "gaussian".
+    pub resolution_delta_t_us: f64,
+    /// Gaussian ΔL (m), only used when resolution_kind == "gaussian".
+    pub resolution_delta_l_m: f64,
+    /// Tabulated resolution file path (if applicable).
+    pub resolution_path: Option<String>,
+}
+
+/// Serializable solver method for session cache.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum CachedSolverMethod {
+    LevenbergMarquardt,
+    PoissonKL,
 }
 
 /// A cached isotope entry (serializable).
@@ -80,6 +97,26 @@ impl SessionCache {
                 })
                 .collect(),
             endf_library_name: endf_library_name(state.endf_library).to_string(),
+            solver_method: match state.solver_method {
+                SolverMethod::LevenbergMarquardt => CachedSolverMethod::LevenbergMarquardt,
+                SolverMethod::PoissonKL => CachedSolverMethod::PoissonKL,
+            },
+            resolution_kind: match &state.resolution_mode {
+                ResolutionMode::Gaussian { .. } => "gaussian".to_string(),
+                ResolutionMode::Tabulated { .. } => "tabulated".to_string(),
+            },
+            resolution_delta_t_us: match &state.resolution_mode {
+                ResolutionMode::Gaussian { delta_t_us, .. } => *delta_t_us,
+                _ => 0.0,
+            },
+            resolution_delta_l_m: match &state.resolution_mode {
+                ResolutionMode::Gaussian { delta_l_m, .. } => *delta_l_m,
+                _ => 0.0,
+            },
+            resolution_path: match &state.resolution_mode {
+                ResolutionMode::Tabulated { path, .. } => Some(path.to_string_lossy().to_string()),
+                _ => None,
+            },
         })
     }
 
@@ -116,6 +153,33 @@ impl SessionCache {
             "JEFF-3.3" => nereids_endf::retrieval::EndfLibrary::Jeff3_3,
             "JENDL-5" => nereids_endf::retrieval::EndfLibrary::Jendl5,
             _ => nereids_endf::retrieval::EndfLibrary::EndfB8_0,
+        };
+
+        // Restore solver method
+        state.solver_method = match self.solver_method {
+            CachedSolverMethod::LevenbergMarquardt => SolverMethod::LevenbergMarquardt,
+            CachedSolverMethod::PoissonKL => SolverMethod::PoissonKL,
+        };
+
+        // Restore resolution mode
+        state.resolution_mode = if self.resolution_kind == "tabulated" {
+            if let Some(ref p) = self.resolution_path {
+                ResolutionMode::Tabulated {
+                    path: PathBuf::from(p),
+                    data: None, // will need re-parse on first use
+                    error: None,
+                }
+            } else {
+                ResolutionMode::Gaussian {
+                    delta_t_us: self.resolution_delta_t_us,
+                    delta_l_m: self.resolution_delta_l_m,
+                }
+            }
+        } else {
+            ResolutionMode::Gaussian {
+                delta_t_us: self.resolution_delta_t_us,
+                delta_l_m: self.resolution_delta_l_m,
+            }
         };
 
         // Rebuild pipeline

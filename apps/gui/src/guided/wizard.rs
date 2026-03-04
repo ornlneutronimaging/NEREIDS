@@ -148,7 +148,8 @@ fn wizard_q2(ui: &mut egui::Ui, state: &mut AppState) {
         selected_prenorm,
     ) {
         state.data_type = Some(DataType::PreNormalized);
-        // Input mode chosen in Load step (TiffPair or Hdf5Histogram)
+        // Default to TiffPair; user can switch to Hdf5Histogram in Load step
+        state.input_mode = InputMode::TiffPair;
         state.wizard_step = 2;
     }
 
@@ -176,8 +177,11 @@ fn wizard_q2(ui: &mut egui::Ui, state: &mut AppState) {
 // ── Q3: Confirm ─────────────────────────────────────────────────
 
 fn wizard_confirm(ui: &mut egui::Ui, state: &mut AppState) {
-    let ft = state.fitting_type.unwrap_or(FittingType::Spatial);
-    let dt = state.data_type.unwrap_or(DataType::PreNormalized);
+    let (Some(ft), Some(dt)) = (state.fitting_type, state.data_type) else {
+        // Should not reach Confirm without both selections — redirect to Q1
+        state.wizard_step = 0;
+        return;
+    };
 
     let fitting_label = match ft {
         FittingType::Spatial => "Spatially Resolved",
@@ -235,8 +239,7 @@ fn wizard_confirm(ui: &mut egui::Ui, state: &mut AppState) {
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if design::btn_primary(ui, "Start \u{2192}").clicked() {
-                state.fitting_type = Some(ft);
-                state.data_type = Some(dt);
+                // fitting_type and data_type are already set by Q1/Q2
                 state.rebuild_pipeline();
                 state.cached_session = None; // new pipeline supersedes cache
                 if let Some(first) = state.pipeline.first() {

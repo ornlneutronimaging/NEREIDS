@@ -443,10 +443,15 @@ fn step_is_complete(step: GuidedStep, state: &AppState) -> bool {
                 state.sample_data.is_some() && state.spectrum_values.is_some()
             }
         },
-        GuidedStep::Configure => state
-            .isotope_entries
-            .iter()
-            .any(|e| e.enabled && e.resonance_data.is_some()),
+        GuidedStep::Configure => {
+            let has_enabled = state.isotope_entries.iter().any(|e| e.enabled);
+            has_enabled
+                && state
+                    .isotope_entries
+                    .iter()
+                    .filter(|e| e.enabled)
+                    .all(|e| e.resonance_data.is_some())
+        }
         GuidedStep::Normalize => state.normalized.is_some(),
         GuidedStep::Analyze => state.pixel_fit_result.is_some() || state.spatial_result.is_some(),
         GuidedStep::Results => state.spatial_result.is_some(),

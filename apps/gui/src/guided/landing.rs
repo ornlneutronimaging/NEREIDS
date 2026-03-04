@@ -117,7 +117,7 @@ pub fn landing_step(ui: &mut egui::Ui, state: &mut AppState) {
             };
 
             ui.allocate_ui(egui::vec2(max_grid, 0.0), |ui| {
-                let resp = egui::Frame::NONE
+                let frame_out = egui::Frame::NONE
                     .fill(tc.bg2)
                     .corner_radius(CornerRadius::same(8))
                     .inner_margin(Margin::symmetric(16, 10))
@@ -129,13 +129,17 @@ pub fn landing_step(ui: &mut egui::Ui, state: &mut AppState) {
                                 ui.label(RichText::new(&summary).size(11.0).color(tc.fg3));
                             });
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                design::btn_primary(ui, "\u{21B5} Resume");
-                            });
-                        });
-                    })
-                    .response;
+                                design::btn_primary(ui, "\u{21B5} Resume").clicked()
+                            })
+                            .inner
+                        })
+                        .inner
+                    });
 
-                if resp.interact(Sense::click()).clicked() {
+                // Check btn_primary click (inner) OR frame background click
+                let btn_clicked = frame_out.inner;
+                let frame_clicked = frame_out.response.interact(Sense::click()).clicked();
+                if btn_clicked || frame_clicked {
                     if has_active_pipeline {
                         // Resume within session: jump to first incomplete step
                         let target = state
