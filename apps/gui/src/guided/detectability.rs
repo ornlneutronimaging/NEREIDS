@@ -1,91 +1,82 @@
-//! Detectability tool — matrix/trace isotope analysis with verdict table.
+//! Detectability tool — multi-matrix + trace isotope analysis with resolution broadening,
+//! verdict badges, hero stats, and delta-T spectrum plot.
 
 use crate::state::{
     AppState, DetectTraceEntry, EndfFetchResult, EndfStatus, GuidedStep, IsotopeEntry,
     PeriodicTableTarget,
 };
+use crate::widgets::design;
+use egui_plot::{HLine, Line, Plot, PlotPoints};
 use nereids_endf::retrieval::EndfLibrary;
+use nereids_physics::resolution::{ResolutionFunction, ResolutionParams};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 
 /// Draw the Detectability tool content.
 pub fn detectability_step(ui: &mut egui::Ui, state: &mut AppState) {
+    // -- Header row --
     ui.horizontal(|ui| {
-        ui.heading("Detectability");
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            teleport_pill(ui, "← Configure", GuidedStep::Configure, state);
-        });
+        design::content_header(ui, "Detectability", "Trace element sensitivity analysis");
     });
-    ui.separator();
+    ui.horizontal(|ui| {
+        teleport_pill(ui, "← Configure", GuidedStep::Configure, state);
+    });
 
     ui.add_space(8.0);
 
-    // Two-column layout: controls (left) | results (right)
-    let available_width = ui.available_width();
-    let controls_width = 300.0_f32.min(available_width * 0.4);
+    // -- ENDF library selector (shared by matrix + trace) --
+    let isotope_locked = state.is_fetching_detect_endf;
+    detect_library_selector(ui, state, isotope_locked);
 
-    ui.horizontal(|ui| {
-        ui.allocate_ui_with_layout(
-            egui::vec2(controls_width, ui.available_height().max(400.0)),
-            egui::Layout::top_down(egui::Align::LEFT),
-            |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("detect_controls")
-                    .show(ui, |ui| {
-                        detect_controls(ui, state);
-                    });
-            },
-        );
-        ui.separator();
-        ui.vertical(|ui| {
-            detect_results_panel(ui, state);
-        });
-    });
+    ui.add_space(8.0);
+
+    // -- Matrix isotopes card --
+    detect_matrix_card(ui, state, isotope_locked);
+    ui.add_space(8.0);
+
+    // -- Trace isotopes card --
+    detect_trace_card(ui, state, isotope_locked);
+    ui.add_space(8.0);
+
+    // -- Resolution card --
+    detect_resolution_card(ui, state);
+    ui.add_space(8.0);
+
+    // -- Advanced config --
+    detect_advanced_config(ui, state);
+    ui.add_space(8.0);
+
+    // -- Fetch ENDF + Run buttons --
+    detect_action_buttons(ui, state);
+    ui.add_space(12.0);
+
+    // -- Results: hero stats + verdict table + spectrum --
+    detect_results_panel(ui, state);
 }
 
-/// Controls column: matrix isotope, trace isotopes, advanced config, run button.
-fn detect_controls(ui: &mut egui::Ui, state: &mut AppState) {
-    let isotope_locked = state.is_fetching_detect_endf;
-
-    // --- Matrix isotope ---
-    ui.label(egui::RichText::new("Matrix Isotope").strong());
-    ui.add_space(4.0);
-
-    // ENDF library selector (disabled during active fetch to prevent stale results)
+/// ENDF library selector, shared by matrix and trace isotopes.
+fn detect_library_selector(ui: &mut egui::Ui, state: &mut AppState, locked: bool) {
     let prev_lib = state.detect_endf_library;
-    ui.add_enabled_ui(!state.is_fetching_detect_endf, |ui| {
+    ui.add_enabled_ui(!locked, |ui| {
         ui.horizontal(|ui| {
             ui.label("Library:");
             egui::ComboBox::from_id_salt("detect_endf_lib")
                 .selected_text(library_name(state.detect_endf_library))
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut state.detect_endf_library,
-                        EndfLibrary::EndfB8_0,
-                        "ENDF/B-VIII.0",
-                    );
-                    ui.selectable_value(
-                        &mut state.detect_endf_library,
-                        EndfLibrary::EndfB8_1,
-                        "ENDF/B-VIII.1",
-                    );
-                    ui.selectable_value(
-                        &mut state.detect_endf_library,
-                        EndfLibrary::Jeff3_3,
-                        "JEFF-3.3",
-                    );
-                    ui.selectable_value(
-                        &mut state.detect_endf_library,
-                        EndfLibrary::Jendl5,
-                        "JENDL-5",
-                    );
+                    for (val, label) in [
+                        (EndfLibrary::EndfB8_0, "ENDF/B-VIII.0"),
+                        (EndfLibrary::EndfB8_1, "ENDF/B-VIII.1"),
+                        (EndfLibrary::Jeff3_3, "JEFF-3.3"),
+                        (EndfLibrary::Jendl5, "JENDL-5"),
+                    ] {
+                        ui.selectable_value(&mut state.detect_endf_library, val, label);
+                    }
                 });
         });
     });
-    // Library change invalidates all resonance data — must re-fetch
     if state.detect_endf_library != prev_lib {
-        if let Some(ref mut m) = state.detect_matrix {
+        for m in &mut state.detect_matrix_entries {
             m.resonance_data = None;
             m.endf_status = EndfStatus::Pending;
         }
@@ -94,64 +85,95 @@ fn detect_controls(ui: &mut egui::Ui, state: &mut AppState) {
         }
         state.detect_results.clear();
     }
+}
 
-    if let Some(ref mut matrix) = state.detect_matrix {
-        ui.horizontal(|ui| {
-            ui.add_enabled_ui(!isotope_locked, |ui| {
-                let z_changed = ui
-                    .add(
-                        egui::DragValue::new(&mut matrix.z)
-                            .prefix("Z=")
-                            .range(1..=118),
-                    )
-                    .changed();
-                let a_changed = ui
-                    .add(
-                        egui::DragValue::new(&mut matrix.a)
-                            .prefix("A=")
-                            .range(1..=300),
-                    )
-                    .changed();
-                if z_changed && matrix.z > matrix.a {
-                    matrix.a = matrix.z;
-                }
-                if a_changed && matrix.a < matrix.z {
-                    matrix.z = matrix.a;
-                }
-                if z_changed || a_changed {
-                    matrix.symbol = format!(
-                        "{}-{}",
-                        nereids_core::elements::element_symbol(matrix.z).unwrap_or("??"),
-                        matrix.a
-                    );
-                    matrix.resonance_data = None;
-                    matrix.endf_status = EndfStatus::Pending;
-                    state.detect_results.clear();
-                }
-            });
-            ui.label(&matrix.symbol);
-            if matrix.resonance_data.is_some() {
-                ui.label("OK");
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.label("Density (at/barn):");
-            if ui
-                .add(
-                    egui::DragValue::new(&mut state.detect_matrix_density)
-                        .speed(0.0001)
-                        .range(1e-6..=1.0),
-                )
-                .changed()
-            {
-                state.detect_results.clear();
-            }
-        });
-    } else {
-        ui.add_enabled_ui(!isotope_locked, |ui| {
+/// Card: matrix isotopes list with add/remove, density, ENDF badges.
+fn detect_matrix_card(ui: &mut egui::Ui, state: &mut AppState, locked: bool) {
+    design::card_with_header(ui, "Matrix Isotopes", None, |ui| {
+        let mut matrix_remove = None;
+        for (idx, matrix) in state.detect_matrix_entries.iter_mut().enumerate() {
             ui.horizontal(|ui| {
-                if ui.button("Set Matrix Isotope").clicked() {
-                    state.detect_matrix = Some(IsotopeEntry {
+                // Colored dot
+                let dot_color = design::isotope_dot_color(&matrix.symbol);
+                let (dot_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                ui.painter()
+                    .circle_filled(dot_rect.center(), 4.0, dot_color);
+
+                ui.add_enabled_ui(!locked, |ui| {
+                    let z_changed = ui
+                        .add(
+                            egui::DragValue::new(&mut matrix.z)
+                                .prefix("Z=")
+                                .range(1..=118),
+                        )
+                        .changed();
+                    let a_changed = ui
+                        .add(
+                            egui::DragValue::new(&mut matrix.a)
+                                .prefix("A=")
+                                .range(1..=300),
+                        )
+                        .changed();
+                    if z_changed && matrix.z > matrix.a {
+                        matrix.a = matrix.z;
+                    }
+                    if a_changed && matrix.a < matrix.z {
+                        matrix.z = matrix.a;
+                    }
+                    if z_changed || a_changed {
+                        matrix.symbol = format!(
+                            "{}-{}",
+                            nereids_core::elements::element_symbol(matrix.z).unwrap_or("??"),
+                            matrix.a
+                        );
+                        matrix.resonance_data = None;
+                        matrix.endf_status = EndfStatus::Pending;
+                        state.detect_results.clear();
+                    }
+                });
+                ui.label(&matrix.symbol);
+                ui.add_enabled_ui(!locked, |ui| {
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut matrix.initial_density)
+                                .speed(0.0001)
+                                .range(1e-6..=1.0)
+                                .max_decimals(6),
+                        )
+                        .changed()
+                    {
+                        state.detect_results.clear();
+                    }
+                });
+
+                // ENDF status badge
+                match matrix.endf_status {
+                    EndfStatus::Loaded => design::badge(ui, "OK", design::BadgeVariant::Green),
+                    EndfStatus::Fetching => {
+                        ui.spinner();
+                    }
+                    EndfStatus::Failed => design::badge(ui, "ERR", design::BadgeVariant::Red),
+                    EndfStatus::Pending => design::badge(ui, "...", design::BadgeVariant::Orange),
+                }
+
+                ui.add_enabled_ui(!locked, |ui| {
+                    if ui.small_button("\u{00d7}").clicked() {
+                        matrix_remove = Some(idx);
+                    }
+                });
+            });
+        }
+        if let Some(idx) = matrix_remove {
+            state.detect_matrix_entries.remove(idx);
+            state.detect_results.clear();
+        }
+
+        ui.add_space(4.0);
+        ui.add_enabled_ui(!locked, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("Add Matrix Isotope").clicked() {
+                    state.detect_matrix_entries.push(IsotopeEntry {
                         z: 26,
                         a: 56,
                         symbol: "Fe-56".into(),
@@ -160,111 +182,163 @@ fn detect_controls(ui: &mut egui::Ui, state: &mut AppState) {
                         enabled: true,
                         endf_status: EndfStatus::Pending,
                     });
+                    state.detect_results.clear();
                 }
                 if ui.button("Periodic Table...").clicked() {
                     state.periodic_table_open = true;
                     state.periodic_table_target = PeriodicTableTarget::DetectMatrix;
                     state.periodic_table_selected_z = None;
+                    state.periodic_table_density = 0.001; // at/barn default
                 }
             });
-        });
-    }
-
-    ui.add_space(8.0);
-    ui.separator();
-    ui.add_space(4.0);
-
-    // --- Trace isotopes ---
-    ui.label(egui::RichText::new("Trace Isotopes").strong());
-    ui.add_space(4.0);
-
-    ui.add_enabled_ui(!isotope_locked, |ui| {
-        ui.horizontal(|ui| {
-            if ui.button("Add Trace").clicked() {
-                state.detect_trace_entries.push(DetectTraceEntry {
-                    z: 72,
-                    a: 178,
-                    symbol: "Hf-178".into(),
-                    concentration_ppm: 1000.0,
-                    resonance_data: None,
-                });
-                state.detect_results.clear();
-            }
-            if ui.button("Periodic Table...").clicked() {
-                state.periodic_table_open = true;
-                state.periodic_table_target = PeriodicTableTarget::DetectTrace;
-                state.periodic_table_selected_z = None;
-            }
         });
     });
+}
 
-    let mut to_remove = None;
-    for (idx, entry) in state.detect_trace_entries.iter_mut().enumerate() {
-        ui.horizontal(|ui| {
-            ui.add_enabled_ui(!isotope_locked, |ui| {
-                let z_changed = ui
-                    .add(
-                        egui::DragValue::new(&mut entry.z)
-                            .prefix("Z=")
-                            .range(1..=118),
-                    )
-                    .changed();
-                let a_changed = ui
-                    .add(
-                        egui::DragValue::new(&mut entry.a)
-                            .prefix("A=")
-                            .range(1..=300),
-                    )
-                    .changed();
-                if z_changed && entry.z > entry.a {
-                    entry.a = entry.z;
+/// Card: trace isotopes list with add/remove, concentration, ENDF status.
+fn detect_trace_card(ui: &mut egui::Ui, state: &mut AppState, locked: bool) {
+    design::card_with_header(ui, "Trace Isotopes", None, |ui| {
+        let mut to_remove = None;
+        for (idx, entry) in state.detect_trace_entries.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                // Colored dot
+                let dot_color = design::isotope_dot_color(&entry.symbol);
+                let (dot_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                ui.painter()
+                    .circle_filled(dot_rect.center(), 4.0, dot_color);
+
+                ui.add_enabled_ui(!locked, |ui| {
+                    let z_changed = ui
+                        .add(
+                            egui::DragValue::new(&mut entry.z)
+                                .prefix("Z=")
+                                .range(1..=118),
+                        )
+                        .changed();
+                    let a_changed = ui
+                        .add(
+                            egui::DragValue::new(&mut entry.a)
+                                .prefix("A=")
+                                .range(1..=300),
+                        )
+                        .changed();
+                    if z_changed && entry.z > entry.a {
+                        entry.a = entry.z;
+                    }
+                    if a_changed && entry.a < entry.z {
+                        entry.z = entry.a;
+                    }
+                    if z_changed || a_changed {
+                        entry.symbol = format!(
+                            "{}-{}",
+                            nereids_core::elements::element_symbol(entry.z).unwrap_or("??"),
+                            entry.a
+                        );
+                        entry.resonance_data = None;
+                        state.detect_results.clear();
+                    }
+                });
+                ui.label(&entry.symbol);
+                ui.add_enabled_ui(!locked, |ui| {
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut entry.concentration_ppm)
+                                .prefix("ppm=")
+                                .speed(10.0)
+                                .range(0.1..=1e6),
+                        )
+                        .changed()
+                    {
+                        state.detect_results.clear();
+                    }
+                });
+
+                if entry.resonance_data.is_some() {
+                    design::badge(ui, "OK", design::BadgeVariant::Green);
+                } else {
+                    design::badge(ui, "...", design::BadgeVariant::Orange);
                 }
-                if a_changed && entry.a < entry.z {
-                    entry.z = entry.a;
-                }
-                if z_changed || a_changed {
-                    entry.symbol = format!(
-                        "{}-{}",
-                        nereids_core::elements::element_symbol(entry.z).unwrap_or("??"),
-                        entry.a
-                    );
-                    entry.resonance_data = None;
+
+                ui.add_enabled_ui(!locked, |ui| {
+                    if ui.small_button("\u{00d7}").clicked() {
+                        to_remove = Some(idx);
+                    }
+                });
+            });
+        }
+        if let Some(idx) = to_remove {
+            state.detect_trace_entries.remove(idx);
+            state.detect_results.clear();
+        }
+
+        ui.add_space(4.0);
+        ui.add_enabled_ui(!locked, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("Add Trace").clicked() {
+                    state.detect_trace_entries.push(DetectTraceEntry {
+                        z: 72,
+                        a: 178,
+                        symbol: "Hf-178".into(),
+                        concentration_ppm: 1000.0,
+                        resonance_data: None,
+                    });
                     state.detect_results.clear();
                 }
-            });
-            ui.label(&entry.symbol);
-            ui.add_enabled_ui(!isotope_locked, |ui| {
-                if ui
-                    .add(
-                        egui::DragValue::new(&mut entry.concentration_ppm)
-                            .prefix("ppm=")
-                            .speed(10.0)
-                            .range(0.1..=1e6),
-                    )
-                    .changed()
-                {
-                    state.detect_results.clear();
-                }
-            });
-            if entry.resonance_data.is_some() {
-                ui.label("OK");
-            }
-            ui.add_enabled_ui(!isotope_locked, |ui| {
-                if ui.small_button("X").clicked() {
-                    to_remove = Some(idx);
+                if ui.button("Periodic Table...").clicked() {
+                    state.periodic_table_open = true;
+                    state.periodic_table_target = PeriodicTableTarget::DetectTrace;
+                    state.periodic_table_selected_z = None;
+                    state.periodic_table_density = 1000.0; // ppm default
                 }
             });
         });
-    }
-    if let Some(idx) = to_remove {
-        state.detect_trace_entries.remove(idx);
-        state.detect_results.clear();
-    }
+    });
+}
 
-    ui.add_space(8.0);
+/// Resolution card: enable checkbox, flight path (read-only), delta_t, delta_l.
+fn detect_resolution_card(ui: &mut egui::Ui, state: &mut AppState) {
+    design::card_with_header(ui, "Instrument Resolution", None, |ui| {
+        let prev_enabled = state.detect_resolution_enabled;
+        let prev_dt = state.detect_delta_t_us;
+        let prev_dl = state.detect_delta_l_m;
 
-    // --- Advanced config ---
-    // Snapshot values to detect changes
+        ui.checkbox(&mut state.detect_resolution_enabled, "Enable broadening");
+
+        if state.detect_resolution_enabled {
+            ui.horizontal(|ui| {
+                let fp = state.beamline.flight_path_m;
+                ui.label(format!("Flight path: {fp:.2} m"));
+                ui.label("(from Beamline)");
+            });
+            ui.horizontal(|ui| {
+                ui.label("\u{0394}t (\u{03bc}s):");
+                ui.add(
+                    egui::DragValue::new(&mut state.detect_delta_t_us)
+                        .speed(0.1)
+                        .range(0.0..=100.0),
+                );
+                ui.label("\u{0394}L (m):");
+                ui.add(
+                    egui::DragValue::new(&mut state.detect_delta_l_m)
+                        .speed(0.001)
+                        .range(0.0..=1.0),
+                );
+            });
+        }
+
+        // Invalidate results on any resolution change
+        if state.detect_resolution_enabled != prev_enabled
+            || state.detect_delta_t_us != prev_dt
+            || state.detect_delta_l_m != prev_dl
+        {
+            state.detect_results.clear();
+        }
+    });
+}
+
+/// Advanced config: SNR threshold, I0, energy range, points, temperature.
+fn detect_advanced_config(ui: &mut egui::Ui, state: &mut AppState) {
     let prev_snr = state.detect_snr_threshold;
     let prev_i0 = state.detect_i0;
     let prev_emin = state.detect_energy_min;
@@ -284,7 +358,7 @@ fn detect_controls(ui: &mut egui::Ui, state: &mut AppState) {
                 );
             });
             ui.horizontal(|ui| {
-                ui.label("I_0 (counts/bin):");
+                ui.label("I\u{2080} (counts/bin):");
                 ui.add(
                     egui::DragValue::new(&mut state.detect_i0)
                         .speed(100.0)
@@ -323,7 +397,6 @@ fn detect_controls(ui: &mut egui::Ui, state: &mut AppState) {
             });
         });
 
-    // Invalidate stale results when any config param changes
     if state.detect_snr_threshold != prev_snr
         || state.detect_i0 != prev_i0
         || state.detect_energy_min != prev_emin
@@ -333,106 +406,200 @@ fn detect_controls(ui: &mut egui::Ui, state: &mut AppState) {
     {
         state.detect_results.clear();
     }
+}
 
-    ui.add_space(8.0);
-
-    // Fetch ENDF + Run buttons
+/// Fetch ENDF + Run Analysis buttons.
+fn detect_action_buttons(ui: &mut egui::Ui, state: &mut AppState) {
     let has_missing_endf = state
-        .detect_matrix
-        .as_ref()
-        .is_some_and(|m| m.resonance_data.is_none())
+        .detect_matrix_entries
+        .iter()
+        .any(|m| m.resonance_data.is_none())
         || state
             .detect_trace_entries
             .iter()
             .any(|t| t.resonance_data.is_none());
 
-    ui.add_enabled_ui(has_missing_endf && !state.is_fetching_detect_endf, |ui| {
-        if ui.button("Fetch ENDF Data").clicked() {
-            detect_fetch_endf_data(state);
-        }
-    });
-    if state.is_fetching_detect_endf {
-        ui.spinner();
-    }
+    ui.horizontal(|ui| {
+        ui.add_enabled_ui(has_missing_endf && !state.is_fetching_detect_endf, |ui| {
+            if design::btn_primary(ui, "Fetch ENDF").clicked() {
+                detect_fetch_endf_data(state);
+            }
+        });
 
-    let can_run = state
-        .detect_matrix
-        .as_ref()
-        .is_some_and(|m| m.resonance_data.is_some())
-        && state
-            .detect_trace_entries
-            .iter()
-            .any(|t| t.resonance_data.is_some());
+        let can_run = !state.detect_matrix_entries.is_empty()
+            && state
+                .detect_matrix_entries
+                .iter()
+                .all(|m| m.resonance_data.is_some())
+            && state
+                .detect_trace_entries
+                .iter()
+                .any(|t| t.resonance_data.is_some());
 
-    ui.add_enabled_ui(can_run, |ui| {
-        if ui.button("Run Analysis").clicked() {
-            run_detectability(state);
+        ui.add_enabled_ui(can_run, |ui| {
+            if design::btn_primary(ui, "Run Analysis").clicked() {
+                run_detectability(state);
+            }
+        });
+
+        if state.is_fetching_detect_endf {
+            ui.spinner();
         }
     });
 }
 
-/// Results column: verdict table and optional spectrum plot.
+/// Results panel: hero stat row, verdict table with badges, delta-T spectrum.
 fn detect_results_panel(ui: &mut egui::Ui, state: &AppState) {
     if state.detect_results.is_empty() {
-        ui.label("Configure matrix and trace isotopes, then click Run Analysis.");
+        design::card(ui, |ui| {
+            ui.label(
+                egui::RichText::new(
+                    "Configure matrix and trace isotopes, then click Run Analysis.",
+                )
+                .italics()
+                .color(crate::theme::semantic::ORANGE),
+            );
+        });
         return;
     }
 
-    ui.label(egui::RichText::new("Verdict Table").strong());
-    ui.add_space(4.0);
+    // Summary banner
+    let n_total = state.detect_results.len();
+    let n_detect = state
+        .detect_results
+        .iter()
+        .filter(|(_, r)| r.detectable)
+        .count();
+    let summary = if n_detect == n_total {
+        format!(
+            "ALL DETECTABLE (>{:.0}\u{03c3})",
+            state.detect_snr_threshold
+        )
+    } else {
+        format!("{}/{} DETECTABLE", n_detect, n_total)
+    };
+    let summary_variant = if n_detect == n_total {
+        design::BadgeVariant::Green
+    } else if n_detect > 0 {
+        design::BadgeVariant::Orange
+    } else {
+        design::BadgeVariant::Red
+    };
+    design::badge(ui, &summary, summary_variant);
+    ui.add_space(8.0);
 
-    egui::Grid::new("detect_verdict_grid")
-        .striped(true)
-        .spacing([12.0, 4.0])
-        .show(ui, |ui| {
-            // Header
-            ui.label(egui::RichText::new("Isotope").strong());
-            ui.label(egui::RichText::new("Peak E (eV)").strong());
-            ui.label(egui::RichText::new("Peak SNR").strong());
-            ui.label(egui::RichText::new("dT/ppm").strong());
-            ui.label(egui::RichText::new("Verdict").strong());
-            ui.end_row();
+    // Hero stat row — best result
+    if let Some((best_name, best)) = state.detect_results.iter().max_by(|(_, a), (_, b)| {
+        a.peak_snr
+            .partial_cmp(&b.peak_snr)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }) {
+        let snr_str = format!("{:.1}\u{03c3}", best.peak_snr);
+        let energy_str = format!("{:.2} eV", best.peak_energy_ev);
+        design::stat_row(
+            ui,
+            &[
+                (&snr_str, "Best SNR"),
+                (best_name, "Best Isotope"),
+                (&energy_str, "Peak Energy"),
+            ],
+        );
+    }
 
-            for (name, report) in &state.detect_results {
-                ui.label(name);
-                ui.label(format!("{:.2}", report.peak_energy_ev));
-                ui.label(format!("{:.2}", report.peak_snr));
-                ui.label(format!("{:.2e}", report.peak_delta_t_per_ppm));
-                if report.detectable {
-                    ui.label(
-                        egui::RichText::new("PASS")
-                            .color(crate::theme::semantic::GREEN)
-                            .strong(),
-                    );
-                } else {
-                    ui.label(
-                        egui::RichText::new("FAIL")
-                            .color(crate::theme::semantic::RED)
-                            .strong(),
-                    );
-                }
+    ui.add_space(8.0);
+
+    // Verdict table with badges
+    design::card_with_header(ui, "Verdict Table", None, |ui| {
+        egui::Grid::new("detect_verdict_grid")
+            .striped(true)
+            .spacing([12.0, 4.0])
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new("Isotope").strong());
+                ui.label(egui::RichText::new("Peak E (eV)").strong());
+                ui.label(egui::RichText::new("Peak SNR").strong());
+                ui.label(egui::RichText::new("\u{0394}T/ppm").strong());
+                ui.label(egui::RichText::new("Verdict").strong());
                 ui.end_row();
-            }
+
+                for (name, report) in &state.detect_results {
+                    ui.label(name);
+                    ui.label(format!("{:.2}", report.peak_energy_ev));
+                    ui.label(format!("{:.2}\u{03c3}", report.peak_snr));
+                    ui.label(format!("{:.2e}", report.peak_delta_t_per_ppm));
+                    if report.detectable {
+                        design::badge(ui, "DETECTABLE", design::BadgeVariant::Green);
+                    } else {
+                        design::badge(ui, "NOT DETECTED", design::BadgeVariant::Red);
+                    }
+                    ui.end_row();
+                }
+            });
+    });
+
+    ui.add_space(12.0);
+
+    // Delta-T spectrum plot
+    if state
+        .detect_results
+        .iter()
+        .any(|(_, r)| !r.delta_t_spectrum.is_empty())
+    {
+        design::card_with_header(ui, "\u{0394}T Spectrum", None, |ui| {
+            ui.label(
+                egui::RichText::new("Transmission difference per trace")
+                    .small()
+                    .weak(),
+            );
+            let plot_height = ui.available_height().clamp(200.0, 300.0);
+            Plot::new("detect_delta_t_plot")
+                .height(plot_height)
+                .x_axis_label("Energy (eV)")
+                .y_axis_label("|\u{0394}T|")
+                .legend(egui_plot::Legend::default())
+                .show(ui, |plot_ui| {
+                    // Detection threshold line: snr_threshold / sqrt(i0)
+                    let threshold = state.detect_snr_threshold / state.detect_i0.sqrt();
+                    plot_ui.hline(
+                        HLine::new("threshold", threshold)
+                            .color(egui::Color32::from_rgb(200, 200, 200))
+                            .style(egui_plot::LineStyle::dashed_loose()),
+                    );
+
+                    for (name, report) in &state.detect_results {
+                        if report.delta_t_spectrum.is_empty() {
+                            continue;
+                        }
+                        let n = report.energies.len().min(report.delta_t_spectrum.len());
+                        let points: PlotPoints = (0..n)
+                            .filter(|&i| {
+                                report.energies[i].is_finite()
+                                    && report.delta_t_spectrum[i].is_finite()
+                            })
+                            .map(|i| [report.energies[i], report.delta_t_spectrum[i]])
+                            .collect();
+                        let color = design::isotope_dot_color(name);
+                        plot_ui.line(Line::new(name.as_str(), points).color(color).width(1.5));
+                    }
+                });
         });
+    }
 }
 
 /// Run detectability analysis for all trace candidates against the matrix.
 fn run_detectability(state: &mut AppState) {
     use nereids_pipeline::detectability::{TraceDetectabilityConfig, trace_detectability};
 
-    let matrix_entry = match &state.detect_matrix {
-        Some(e) if e.resonance_data.is_some() => e,
-        _ => {
-            state.status_message = "Matrix isotope needs ENDF data".into();
-            return;
-        }
-    };
+    let matrix_isotopes: Vec<_> = state
+        .detect_matrix_entries
+        .iter()
+        .filter_map(|e| e.resonance_data.clone().map(|rd| (rd, e.initial_density)))
+        .collect();
 
-    let Some(matrix_rd) = matrix_entry.resonance_data.clone() else {
+    if matrix_isotopes.is_empty() {
+        state.status_message = "Matrix isotope(s) need ENDF data".into();
         return;
-    };
+    }
 
-    // Validate energy range
     let e_min = state.detect_energy_min;
     let e_max = state.detect_energy_max;
     if e_min >= e_max {
@@ -443,19 +610,33 @@ fn run_detectability(state: &mut AppState) {
         return;
     }
 
-    // Build log-spaced energy grid
     let n = state.detect_n_energy_points;
     let energies: Vec<f64> = (0..n)
         .map(|i| e_min * (e_max / e_min).powf(i as f64 / (n - 1).max(1) as f64))
         .collect();
 
+    // Build resolution function if enabled
+    let res_fn = if state.detect_resolution_enabled {
+        let fp = state.beamline.flight_path_m;
+        match ResolutionParams::new(fp, state.detect_delta_t_us, state.detect_delta_l_m) {
+            Ok(p) => Some(ResolutionFunction::Gaussian(p)),
+            Err(_) => {
+                state.status_message =
+                    "Resolution enabled but flight path not configured — broadening disabled"
+                        .into();
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let config = TraceDetectabilityConfig {
-        matrix: &matrix_rd,
-        matrix_density: state.detect_matrix_density,
+        matrix_isotopes: &matrix_isotopes,
         energies: &energies,
         i0: state.detect_i0,
         temperature_k: state.detect_temperature_k,
-        resolution: None,
+        resolution: res_fn.as_ref(),
         snr_threshold: state.detect_snr_threshold,
     };
 
@@ -483,7 +664,6 @@ fn run_detectability(state: &mut AppState) {
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    // Guard: all traces skipped (no data) but no computation errors
     if results.is_empty() && n_errors == 0 {
         state.status_message = "No trace isotopes had data to analyze".into();
         return;
@@ -510,52 +690,51 @@ fn library_name(lib: EndfLibrary) -> &'static str {
 }
 
 /// Fetch ENDF data for matrix + trace isotopes.
-/// Index convention: 0 = matrix, 1+ = trace entries at position (index - 1).
+/// Index convention: 0..N = matrix entries, N.. = trace entries at (index - N).
 fn detect_fetch_endf_data(state: &mut AppState) {
     use nereids_core::types::Isotope;
     use nereids_endf::retrieval;
 
+    let n_matrix = state.detect_matrix_entries.len();
     let mut work: Vec<(usize, Isotope, String, EndfLibrary)> = Vec::new();
 
-    // Matrix at index 0
-    if let Some(ref matrix) = state.detect_matrix
-        && matrix.resonance_data.is_none()
-    {
-        match Isotope::new(matrix.z, matrix.a) {
-            Ok(isotope) => {
-                if retrieval::mat_number(&isotope).is_some() {
-                    work.push((0, isotope, matrix.symbol.clone(), state.detect_endf_library));
-                } else {
+    for (i, entry) in state.detect_matrix_entries.iter().enumerate() {
+        if entry.resonance_data.is_none() {
+            match Isotope::new(entry.z, entry.a) {
+                Ok(isotope) => {
+                    if retrieval::mat_number(&isotope).is_some() {
+                        work.push((i, isotope, entry.symbol.clone(), state.detect_endf_library));
+                    } else {
+                        state.status_message = format!(
+                            "No MAT number for matrix {} \u{2014} isotope not in database",
+                            entry.symbol
+                        );
+                    }
+                }
+                Err(e) => {
                     state.status_message = format!(
-                        "No MAT number for matrix {} — isotope not in database",
-                        matrix.symbol
+                        "Matrix isotope Z={} A={} is not supported: {}",
+                        entry.z, entry.a, e
                     );
                 }
-            }
-            Err(e) => {
-                state.status_message = format!(
-                    "Matrix isotope Z={} A={} is not supported: {}",
-                    matrix.z, matrix.a, e
-                );
             }
         }
     }
 
-    // Traces at index 1+
     for (i, entry) in state.detect_trace_entries.iter().enumerate() {
         if entry.resonance_data.is_none() {
             match Isotope::new(entry.z, entry.a) {
                 Ok(isotope) => {
                     if retrieval::mat_number(&isotope).is_some() {
                         work.push((
-                            i + 1,
+                            n_matrix + i,
                             isotope,
                             entry.symbol.clone(),
                             state.detect_endf_library,
                         ));
                     } else {
                         state.status_message = format!(
-                            "No MAT number for {} — isotope not in database",
+                            "No MAT number for {} \u{2014} isotope not in database",
                             entry.symbol
                         );
                     }
@@ -569,17 +748,18 @@ fn detect_fetch_endf_data(state: &mut AppState) {
 
     if work.is_empty() {
         state.status_message =
-            "No supported isotopes found — none have MAT numbers in the ENDF database".into();
+            "No supported isotopes found \u{2014} none have MAT numbers in the ENDF database"
+                .into();
         return;
     }
 
-    // Mark matrix as Fetching before spawning the background thread
-    // (index 0 = matrix; traces use DetectTraceEntry which has no endf_status)
-    if work.iter().any(|(i, _, _, _)| *i == 0)
-        && let Some(ref mut m) = state.detect_matrix
-    {
-        m.endf_status = EndfStatus::Fetching;
+    for (idx, _, _, _) in &work {
+        if *idx < n_matrix {
+            state.detect_matrix_entries[*idx].endf_status = EndfStatus::Fetching;
+        }
     }
+
+    state.detect_n_matrix_at_fetch = n_matrix;
 
     let (tx, rx) = mpsc::channel();
     state.pending_detect_endf = Some(rx);

@@ -7,6 +7,7 @@
 
 use crate::state::{AppState, DetectTraceEntry, EndfStatus, IsotopeEntry, PeriodicTableTarget};
 use egui::Color32;
+use nereids_endf::retrieval::EndfLibrary;
 
 // ---------------------------------------------------------------------------
 // Element categories for color coding
@@ -233,6 +234,7 @@ pub fn periodic_table_modal(ctx: &egui::Context, state: &mut AppState) {
         return;
     }
 
+    let accent = crate::theme::ThemeColors::from_ctx(ctx).accent;
     let mut open = true;
     egui::Window::new("Periodic Table")
         .open(&mut open)
@@ -241,11 +243,11 @@ pub fn periodic_table_modal(ctx: &egui::Context, state: &mut AppState) {
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
             // --- Element grid ---
+            let prev_z = state.periodic_table_selected_z;
             egui::Grid::new("pt_grid")
                 .spacing([2.0, 2.0])
                 .show(ui, |ui| {
                     for row in 0..=9 {
-                        // Row 7 is a visual gap between the main table and f-block
                         if row == 7 {
                             ui.add_space(6.0);
                             ui.end_row();
@@ -264,7 +266,6 @@ pub fn periodic_table_modal(ctx: &egui::Context, state: &mut AppState) {
                                 )
                                 .min_size(egui::vec2(28.0, 28.0))
                                 .fill(if is_selected {
-                                    // Highlight selected element
                                     Color32::from_rgb(100, 149, 237)
                                 } else {
                                     bg
@@ -273,30 +274,31 @@ pub fn periodic_table_modal(ctx: &egui::Context, state: &mut AppState) {
                                 if ui.add(btn).clicked() {
                                     state.periodic_table_selected_z = Some(z);
                                 }
+                            } else if row == 5 && col == 2 {
+                                ui.label(egui::RichText::new("*").size(10.0).strong());
+                            } else if row == 6 && col == 2 {
+                                ui.label(egui::RichText::new("**").size(10.0).strong());
+                            } else if row == 8 && col == 2 {
+                                ui.label(egui::RichText::new("*").size(10.0).strong());
+                            } else if row == 9 && col == 2 {
+                                ui.label(egui::RichText::new("**").size(10.0).strong());
                             } else {
-                                // Placeholder labels for lanthanide/actinide markers
-                                if row == 5 && col == 2 {
-                                    ui.label(egui::RichText::new("*").size(10.0).strong());
-                                } else if row == 6 && col == 2 {
-                                    ui.label(egui::RichText::new("**").size(10.0).strong());
-                                } else if row == 8 && col == 2 {
-                                    ui.label(egui::RichText::new("*").size(10.0).strong());
-                                } else if row == 9 && col == 2 {
-                                    ui.label(egui::RichText::new("**").size(10.0).strong());
-                                } else {
-                                    // Empty cell
-                                    ui.allocate_space(egui::vec2(28.0, 28.0));
-                                }
+                                ui.allocate_space(egui::vec2(28.0, 28.0));
                             }
                         }
                         ui.end_row();
                     }
                 });
 
+            // Element change clears isotope selection
+            if state.periodic_table_selected_z != prev_z {
+                state.periodic_table_selected_isotopes.clear();
+            }
+
             ui.add_space(8.0);
             ui.separator();
 
-            // --- Selected element info + natural isotopes ---
+            // --- Selected element info + multi-select isotope chips ---
             if let Some(z) = state.periodic_table_selected_z {
                 let name = nereids_core::elements::element_name(z).unwrap_or("Unknown");
                 let sym = nereids_core::elements::element_symbol(z).unwrap_or("??");
@@ -310,16 +312,91 @@ pub fn periodic_table_modal(ctx: &egui::Context, state: &mut AppState) {
                 if isotopes.is_empty() {
                     ui.label("No natural isotopes in database.");
                 } else {
-                    ui.label("Natural isotopes (click to add):");
+                    ui.label("Click isotopes to select (toggle):");
                     ui.horizontal_wrapped(|ui| {
                         for (iso, frac) in &isotopes {
                             let a = iso.a();
                             let chip_label = format!("{}-{}  ({:.2}%)", sym, a, frac * 100.0);
-                            if ui.button(&chip_label).clicked() {
-                                add_isotope_to_target(state, z, a, sym);
+                            let is_selected =
+                                state.periodic_table_selected_isotopes.contains(&(z, a));
+
+                            let btn = egui::Button::new(egui::RichText::new(&chip_label).color(
+                                if is_selected {
+                                    Color32::WHITE
+                                } else {
+                                    Color32::BLACK
+                                },
+                            ))
+                            .fill(if is_selected {
+                                accent
+                            } else {
+                                Color32::from_gray(240)
+                            })
+                            .corner_radius(12.0);
+
+                            if ui.add(btn).clicked() {
+                                if is_selected {
+                                    state
+                                        .periodic_table_selected_isotopes
+                                        .retain(|&p| p != (z, a));
+                                } else {
+                                    state.periodic_table_selected_isotopes.push((z, a));
+                                }
                             }
                         }
                     });
+
+                    // Form row: density + library + Add Selected (shown when selection non-empty)
+                    if !state.periodic_table_selected_isotopes.is_empty() {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            let is_ppm =
+                                state.periodic_table_target == PeriodicTableTarget::DetectTrace;
+                            let label = if is_ppm {
+                                "Conc. (ppm):"
+                            } else {
+                                "Density (at/barn):"
+                            };
+                            ui.label(label);
+                            ui.add(
+                                egui::DragValue::new(&mut state.periodic_table_density)
+                                    .speed(if is_ppm { 10.0 } else { 0.0001 })
+                                    .range(if is_ppm { 0.1..=1e6 } else { 1e-6..=1.0 })
+                                    .max_decimals(if is_ppm { 1 } else { 6 }),
+                            );
+
+                            // Library selector
+                            let lib = state
+                                .periodic_table_library
+                                .get_or_insert(target_library(state));
+                            egui::ComboBox::from_id_salt("pt_lib")
+                                .selected_text(library_name(*lib))
+                                .show_ui(ui, |ui| {
+                                    for (val, label) in [
+                                        (EndfLibrary::EndfB8_0, "ENDF/B-VIII.0"),
+                                        (EndfLibrary::EndfB8_1, "ENDF/B-VIII.1"),
+                                        (EndfLibrary::Jeff3_3, "JEFF-3.3"),
+                                        (EndfLibrary::Jendl5, "JENDL-5"),
+                                    ] {
+                                        ui.selectable_value(lib, val, label);
+                                    }
+                                });
+
+                            let n_sel = state.periodic_table_selected_isotopes.len();
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new(format!("Add Selected ({n_sel})"))
+                                            .color(Color32::WHITE),
+                                    )
+                                    .fill(accent),
+                                )
+                                .clicked()
+                            {
+                                add_selected_isotopes(state);
+                            }
+                        });
+                    }
                 }
             } else {
                 ui.label("Click an element to see its natural isotopes.");
@@ -330,91 +407,163 @@ pub fn periodic_table_modal(ctx: &egui::Context, state: &mut AppState) {
             // --- Close button ---
             ui.horizontal(|ui| {
                 if ui.button("Close").clicked() {
-                    state.periodic_table_open = false;
-                    state.periodic_table_selected_z = None;
+                    close_modal(state);
                 }
             });
         });
 
-    // Handle the window X button
     if !open {
-        state.periodic_table_open = false;
-        state.periodic_table_selected_z = None;
+        close_modal(state);
     }
+}
+
+/// Clean up modal state on close.
+fn close_modal(state: &mut AppState) {
+    state.periodic_table_open = false;
+    state.periodic_table_selected_z = None;
+    state.periodic_table_selected_isotopes.clear();
+    state.periodic_table_library = None;
 }
 
 // ---------------------------------------------------------------------------
 // Isotope insertion logic
 // ---------------------------------------------------------------------------
 
-/// Add a selected isotope to the appropriate target list based on
-/// `state.periodic_table_target`.
-///
-/// Blocked when an ENDF fetch is in-flight for the corresponding target,
-/// preventing stale fetch results from landing on newly-added isotopes.
-fn add_isotope_to_target(state: &mut AppState, z: u32, a: u32, sym: &str) {
-    let symbol = format!("{}-{}", sym, a);
+/// Batch-add all selected isotopes to the appropriate target list.
+/// Closes the modal afterwards.
+fn add_selected_isotopes(state: &mut AppState) {
+    let density = state.periodic_table_density;
+    let selected = state.periodic_table_selected_isotopes.clone();
+
+    // Propagate PT library choice to the target's library field.
+    // If the user selected a different library, existing resonance data
+    // must be re-fetched (same pattern as the main library ComboBox).
+    if let Some(lib) = state.periodic_table_library {
+        let target_lib = match state.periodic_table_target {
+            PeriodicTableTarget::Configure => &mut state.endf_library,
+            PeriodicTableTarget::ForwardModel => &mut state.fm_endf_library,
+            PeriodicTableTarget::DetectMatrix | PeriodicTableTarget::DetectTrace => {
+                &mut state.detect_endf_library
+            }
+        };
+        if *target_lib != lib {
+            *target_lib = lib;
+            // Clear existing resonance data so they get re-fetched with the new library
+            match state.periodic_table_target {
+                PeriodicTableTarget::Configure => {
+                    for e in &mut state.isotope_entries {
+                        e.resonance_data = None;
+                        e.endf_status = EndfStatus::Pending;
+                    }
+                }
+                PeriodicTableTarget::ForwardModel => {
+                    for e in &mut state.fm_isotope_entries {
+                        e.resonance_data = None;
+                        e.endf_status = EndfStatus::Pending;
+                    }
+                    state.fm_spectrum = None;
+                    state.fm_per_isotope_spectra.clear();
+                }
+                PeriodicTableTarget::DetectMatrix | PeriodicTableTarget::DetectTrace => {
+                    for e in &mut state.detect_matrix_entries {
+                        e.resonance_data = None;
+                        e.endf_status = EndfStatus::Pending;
+                    }
+                    for e in &mut state.detect_trace_entries {
+                        e.resonance_data = None;
+                    }
+                    state.detect_results.clear();
+                }
+            }
+        }
+    }
+
+    for (z, a) in &selected {
+        let sym = nereids_core::elements::element_symbol(*z).unwrap_or("??");
+        let symbol = format!("{}-{}", sym, a);
+        match state.periodic_table_target {
+            PeriodicTableTarget::Configure => {
+                if state.is_fetching_endf {
+                    continue;
+                }
+                state.isotope_entries.push(IsotopeEntry {
+                    z: *z,
+                    a: *a,
+                    symbol,
+                    initial_density: density,
+                    resonance_data: None,
+                    enabled: true,
+                    endf_status: EndfStatus::Pending,
+                });
+                state.spatial_result = None;
+                state.pixel_fit_result = None;
+            }
+            PeriodicTableTarget::ForwardModel => {
+                if state.is_fetching_fm_endf {
+                    continue;
+                }
+                state.fm_isotope_entries.push(IsotopeEntry {
+                    z: *z,
+                    a: *a,
+                    symbol,
+                    initial_density: density,
+                    resonance_data: None,
+                    enabled: true,
+                    endf_status: EndfStatus::Pending,
+                });
+                state.fm_spectrum = None;
+                state.fm_per_isotope_spectra.clear();
+            }
+            PeriodicTableTarget::DetectMatrix => {
+                if state.is_fetching_detect_endf {
+                    continue;
+                }
+                state.detect_matrix_entries.push(IsotopeEntry {
+                    z: *z,
+                    a: *a,
+                    symbol,
+                    initial_density: density,
+                    resonance_data: None,
+                    enabled: true,
+                    endf_status: EndfStatus::Pending,
+                });
+                state.detect_results.clear();
+            }
+            PeriodicTableTarget::DetectTrace => {
+                if state.is_fetching_detect_endf {
+                    continue;
+                }
+                state.detect_trace_entries.push(DetectTraceEntry {
+                    z: *z,
+                    a: *a,
+                    symbol,
+                    concentration_ppm: density,
+                    resonance_data: None,
+                });
+                state.detect_results.clear();
+            }
+        }
+    }
+
+    close_modal(state);
+}
+
+/// Get the current ENDF library for the target context (default for library selector).
+fn target_library(state: &AppState) -> EndfLibrary {
     match state.periodic_table_target {
-        PeriodicTableTarget::Configure => {
-            if state.is_fetching_endf {
-                return;
-            }
-            state.isotope_entries.push(IsotopeEntry {
-                z,
-                a,
-                symbol,
-                initial_density: 0.001,
-                resonance_data: None,
-                enabled: true,
-                endf_status: EndfStatus::Pending,
-            });
-            // Invalidate stale results -- isotope list changed.
-            state.spatial_result = None;
-            state.pixel_fit_result = None;
+        PeriodicTableTarget::Configure => state.endf_library,
+        PeriodicTableTarget::ForwardModel => state.fm_endf_library,
+        PeriodicTableTarget::DetectMatrix | PeriodicTableTarget::DetectTrace => {
+            state.detect_endf_library
         }
-        PeriodicTableTarget::ForwardModel => {
-            if state.is_fetching_fm_endf {
-                return;
-            }
-            state.fm_isotope_entries.push(IsotopeEntry {
-                z,
-                a,
-                symbol,
-                initial_density: 0.001,
-                resonance_data: None,
-                enabled: true,
-                endf_status: EndfStatus::Pending,
-            });
-            state.fm_spectrum = None;
-            state.fm_per_isotope_spectra.clear();
-        }
-        PeriodicTableTarget::DetectMatrix => {
-            if state.is_fetching_detect_endf {
-                return;
-            }
-            state.detect_matrix = Some(IsotopeEntry {
-                z,
-                a,
-                symbol,
-                initial_density: state.detect_matrix_density,
-                resonance_data: None,
-                enabled: true,
-                endf_status: EndfStatus::Pending,
-            });
-            state.detect_results.clear();
-        }
-        PeriodicTableTarget::DetectTrace => {
-            if state.is_fetching_detect_endf {
-                return;
-            }
-            state.detect_trace_entries.push(DetectTraceEntry {
-                z,
-                a,
-                symbol,
-                concentration_ppm: 1000.0,
-                resonance_data: None,
-            });
-            state.detect_results.clear();
-        }
+    }
+}
+
+fn library_name(lib: EndfLibrary) -> &'static str {
+    match lib {
+        EndfLibrary::EndfB8_0 => "ENDF/B-VIII.0",
+        EndfLibrary::EndfB8_1 => "ENDF/B-VIII.1",
+        EndfLibrary::Jeff3_3 => "JEFF-3.3",
+        EndfLibrary::Jendl5 => "JENDL-5",
     }
 }

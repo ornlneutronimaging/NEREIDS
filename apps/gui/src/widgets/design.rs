@@ -399,7 +399,7 @@ pub fn isotope_chip(
 }
 
 /// Deterministic dot color for an isotope symbol (hash-based hue).
-fn isotope_dot_color(symbol: &str) -> Color32 {
+pub fn isotope_dot_color(symbol: &str) -> Color32 {
     let mut hash: u32 = 5381;
     for b in symbol.bytes() {
         hash = hash.wrapping_mul(33).wrapping_add(u32::from(b));

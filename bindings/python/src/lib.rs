@@ -2239,10 +2239,12 @@ fn py_trace_detectability(
     let trace_data = trace.inner.clone();
 
     // Release the GIL for the detectability computation.
+    // Wrap single matrix in a vec — Rust API supports multi-matrix but Python
+    // API preserves backward compatibility with a single matrix argument.
     let report = py.detach(move || {
+        let matrix_isotopes = vec![(Arc::unwrap_or_clone(matrix_data), matrix_density)];
         let config = detectability::TraceDetectabilityConfig {
-            matrix: &matrix_data,
-            matrix_density,
+            matrix_isotopes: &matrix_isotopes,
             energies: &e_owned,
             i0,
             temperature_k,
@@ -2346,10 +2348,12 @@ fn py_trace_detectability_survey(
     let matrix_data = matrix.inner.clone();
 
     // Release the GIL for the parallelised detectability survey.
+    // Wrap single matrix in a vec — Rust API supports multi-matrix but Python
+    // API preserves backward compatibility with a single matrix argument.
     let results = py.detach(move || {
+        let matrix_isotopes = vec![(Arc::unwrap_or_clone(matrix_data), matrix_density)];
         let config = detectability::TraceDetectabilityConfig {
-            matrix: &matrix_data,
-            matrix_density,
+            matrix_isotopes: &matrix_isotopes,
             energies: &e_owned,
             i0,
             temperature_k,

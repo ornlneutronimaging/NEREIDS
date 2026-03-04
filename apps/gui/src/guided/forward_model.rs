@@ -4,28 +4,26 @@ use crate::state::{
     AppState, EndfFetchResult, EndfStatus, GuidedStep, IsotopeEntry, PeriodicTableTarget,
     SpectrumAxis,
 };
+use crate::widgets::design;
 use egui_plot::{Line, Plot, PlotPoints};
 use nereids_endf::retrieval::EndfLibrary;
-use nereids_physics::transmission::{self, SampleParams};
+use nereids_physics::resolution::{ResolutionFunction, ResolutionParams};
+use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 
 /// Draw the Forward Model tool content.
 pub fn forward_model_step(ui: &mut egui::Ui, state: &mut AppState) {
+    // -- Header row: title + teleport pills + sync + axis toggle --
     ui.horizontal(|ui| {
-        ui.heading("Forward Model");
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            teleport_pill(ui, "Analyze →", GuidedStep::Analyze, state);
-            teleport_pill(ui, "← Configure", GuidedStep::Configure, state);
-        });
+        design::content_header(ui, "Forward Model", "Simulated transmission");
     });
-    ui.separator();
-
-    ui.add_space(8.0);
-
-    // Sync buttons row (disabled during active ENDF fetches to prevent index corruption)
     ui.horizontal(|ui| {
+        teleport_pill(ui, "← Configure", GuidedStep::Configure, state);
+        teleport_pill(ui, "Analyze →", GuidedStep::Analyze, state);
+        ui.separator();
+        // Sync buttons (disabled during active ENDF fetches to prevent index corruption)
         ui.add_enabled_ui(!state.is_fetching_fm_endf, |ui| {
             if ui.button("Copy from Config").clicked() {
                 state.fm_isotope_entries = state
@@ -68,224 +66,12 @@ pub fn forward_model_step(ui: &mut egui::Ui, state: &mut AppState) {
                     .collect();
                 state.endf_library = state.fm_endf_library;
                 state.temperature_k = state.fm_temperature_k;
-                // Invalidate stale fit results
                 state.spatial_result = None;
                 state.pixel_fit_result = None;
             }
         });
-    });
-
-    ui.add_space(8.0);
-
-    // Two-column layout: controls (left) | spectrum plot (right)
-    let available_width = ui.available_width();
-    let controls_width = 300.0_f32.min(available_width * 0.4);
-
-    ui.horizontal(|ui| {
-        ui.allocate_ui_with_layout(
-            egui::vec2(controls_width, ui.available_height().max(400.0)),
-            egui::Layout::top_down(egui::Align::LEFT),
-            |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("fm_controls")
-                    .show(ui, |ui| {
-                        fm_isotope_controls(ui, state);
-                    });
-            },
-        );
         ui.separator();
-        ui.vertical(|ui| {
-            fm_spectrum_panel(ui, state);
-        });
-    });
-}
-
-/// Isotope table controls for the Forward Model (independent from Configure).
-fn fm_isotope_controls(ui: &mut egui::Ui, state: &mut AppState) {
-    // ENDF library selector (disabled during active fetch to prevent stale results)
-    let prev_lib = state.fm_endf_library;
-    ui.add_enabled_ui(!state.is_fetching_fm_endf, |ui| {
-        ui.horizontal(|ui| {
-            ui.label("Library:");
-            egui::ComboBox::from_id_salt("fm_endf_lib")
-                .selected_text(library_name(state.fm_endf_library))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut state.fm_endf_library,
-                        EndfLibrary::EndfB8_0,
-                        "ENDF/B-VIII.0",
-                    );
-                    ui.selectable_value(
-                        &mut state.fm_endf_library,
-                        EndfLibrary::EndfB8_1,
-                        "ENDF/B-VIII.1",
-                    );
-                    ui.selectable_value(
-                        &mut state.fm_endf_library,
-                        EndfLibrary::Jeff3_3,
-                        "JEFF-3.3",
-                    );
-                    ui.selectable_value(&mut state.fm_endf_library, EndfLibrary::Jendl5, "JENDL-5");
-                });
-        });
-    });
-    // Library change invalidates all resonance data — must re-fetch
-    if state.fm_endf_library != prev_lib {
-        for e in &mut state.fm_isotope_entries {
-            e.resonance_data = None;
-            e.endf_status = EndfStatus::Pending;
-        }
-        state.fm_spectrum = None;
-        state.fm_per_isotope_spectra.clear();
-    }
-
-    // Temperature
-    ui.horizontal(|ui| {
-        ui.label("Temperature (K):");
-        if ui
-            .add(
-                egui::DragValue::new(&mut state.fm_temperature_k)
-                    .range(1.0..=5000.0)
-                    .speed(1.0),
-            )
-            .changed()
-        {
-            state.fm_spectrum = None;
-            state.fm_per_isotope_spectra.clear();
-        }
-    });
-
-    ui.add_space(8.0);
-
-    let isotope_locked = state.is_fetching_fm_endf;
-
-    // Add isotope button
-    ui.add_enabled_ui(!isotope_locked, |ui| {
-        ui.horizontal(|ui| {
-            if ui.button("Add Isotope").clicked() {
-                state.fm_isotope_entries.push(IsotopeEntry {
-                    z: 92,
-                    a: 238,
-                    symbol: "U-238".into(),
-                    initial_density: 0.001,
-                    resonance_data: None,
-                    enabled: true,
-                    endf_status: EndfStatus::Pending,
-                });
-                state.fm_spectrum = None;
-                state.fm_per_isotope_spectra.clear();
-            }
-            if ui.button("Periodic Table...").clicked() {
-                state.periodic_table_open = true;
-                state.periodic_table_target = PeriodicTableTarget::ForwardModel;
-                state.periodic_table_selected_z = None;
-            }
-        });
-    });
-
-    ui.add_space(4.0);
-
-    // Isotope list
-    let mut to_remove = None;
-    let mut changed = false;
-    for (idx, entry) in state.fm_isotope_entries.iter_mut().enumerate() {
-        ui.horizontal(|ui| {
-            ui.add_enabled_ui(!isotope_locked, |ui| {
-                if ui.checkbox(&mut entry.enabled, "").changed() {
-                    changed = true;
-                }
-
-                let z_changed = ui
-                    .add(
-                        egui::DragValue::new(&mut entry.z)
-                            .prefix("Z=")
-                            .range(1..=118),
-                    )
-                    .changed();
-                let a_changed = ui
-                    .add(
-                        egui::DragValue::new(&mut entry.a)
-                            .prefix("A=")
-                            .range(1..=300),
-                    )
-                    .changed();
-
-                // Enforce Z <= A
-                if z_changed && entry.z > entry.a {
-                    entry.a = entry.z;
-                }
-                if a_changed && entry.a < entry.z {
-                    entry.z = entry.a;
-                }
-
-                if z_changed || a_changed {
-                    entry.symbol = format!(
-                        "{}-{}",
-                        nereids_core::elements::element_symbol(entry.z).unwrap_or("??"),
-                        entry.a
-                    );
-                    entry.resonance_data = None;
-                    entry.endf_status = EndfStatus::Pending;
-                    changed = true;
-                }
-            });
-
-            ui.label(&entry.symbol);
-
-            ui.add_enabled_ui(!isotope_locked, |ui| {
-                if ui
-                    .add(
-                        egui::DragValue::new(&mut entry.initial_density)
-                            .prefix("rho=")
-                            .speed(0.0001)
-                            .range(0.0..=1.0),
-                    )
-                    .changed()
-                {
-                    changed = true;
-                }
-            });
-
-            if entry.resonance_data.is_some() {
-                ui.label("OK");
-            }
-
-            ui.add_enabled_ui(!isotope_locked, |ui| {
-                if ui.small_button("X").clicked() {
-                    to_remove = Some(idx);
-                }
-            });
-        });
-    }
-    if let Some(idx) = to_remove {
-        state.fm_isotope_entries.remove(idx);
-        changed = true;
-    }
-
-    if changed {
-        state.fm_spectrum = None;
-        state.fm_per_isotope_spectra.clear();
-    }
-
-    // Fetch ENDF data
-    let has_missing = state
-        .fm_isotope_entries
-        .iter()
-        .any(|e| e.enabled && e.resonance_data.is_none());
-    ui.add_enabled_ui(has_missing && !state.is_fetching_fm_endf, |ui| {
-        if ui.button("Fetch ENDF Data").clicked() {
-            fm_fetch_endf_data(state);
-        }
-    });
-    if state.is_fetching_fm_endf {
-        ui.spinner();
-    }
-}
-
-/// Spectrum plot with energy/TOF axis toggle and per-isotope contribution lines.
-fn fm_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
-    // Axis toggle (Energy vs TOF)
-    ui.horizontal(|ui| {
+        // Axis toggle
         ui.label("Axis:");
         ui.selectable_value(
             &mut state.fm_spectrum_axis,
@@ -299,6 +85,261 @@ fn fm_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
         );
     });
 
+    ui.add_space(8.0);
+
+    // -- Hero Spectrum (full width) --
+    fm_spectrum_panel(ui, state);
+    ui.add_space(12.0);
+
+    // -- Instrument Resolution Card --
+    fm_resolution_card(ui, state);
+    ui.add_space(12.0);
+
+    // -- Isotopes Card --
+    fm_isotopes_card(ui, state);
+}
+
+/// Build an optional InstrumentParams from the FM resolution state.
+/// Returns `(instrument, warning)` — warning is set if resolution is enabled
+/// but parameters are invalid (e.g., flight path not configured).
+fn fm_instrument(state: &AppState) -> (Option<InstrumentParams>, Option<&'static str>) {
+    if !state.fm_resolution_enabled {
+        return (None, None);
+    }
+    let fp = state.beamline.flight_path_m;
+    match ResolutionParams::new(fp, state.fm_delta_t_us, state.fm_delta_l_m) {
+        Ok(p) => (
+            Some(InstrumentParams {
+                resolution: ResolutionFunction::Gaussian(p),
+            }),
+            None,
+        ),
+        Err(_) => (
+            None,
+            Some("Resolution enabled but flight path not configured — broadening disabled"),
+        ),
+    }
+}
+
+/// Resolution card: enable checkbox, flight path (read-only), delta_t, delta_l.
+fn fm_resolution_card(ui: &mut egui::Ui, state: &mut AppState) {
+    design::card_with_header(ui, "Instrument Resolution", None, |ui| {
+        let prev_enabled = state.fm_resolution_enabled;
+        let prev_dt = state.fm_delta_t_us;
+        let prev_dl = state.fm_delta_l_m;
+
+        ui.checkbox(&mut state.fm_resolution_enabled, "Enable broadening");
+
+        if state.fm_resolution_enabled {
+            ui.horizontal(|ui| {
+                let fp = state.beamline.flight_path_m;
+                ui.label(format!("Flight path: {fp:.2} m"));
+                ui.label("(from Beamline)");
+            });
+            ui.horizontal(|ui| {
+                ui.label("\u{0394}t (\u{03bc}s):");
+                ui.add(
+                    egui::DragValue::new(&mut state.fm_delta_t_us)
+                        .speed(0.1)
+                        .range(0.0..=100.0),
+                );
+                ui.label("\u{0394}L (m):");
+                ui.add(
+                    egui::DragValue::new(&mut state.fm_delta_l_m)
+                        .speed(0.001)
+                        .range(0.0..=1.0),
+                );
+            });
+        }
+
+        // Invalidate spectrum cache on any resolution change
+        if state.fm_resolution_enabled != prev_enabled
+            || state.fm_delta_t_us != prev_dt
+            || state.fm_delta_l_m != prev_dl
+        {
+            state.fm_spectrum = None;
+            state.fm_per_isotope_spectra.clear();
+        }
+    });
+}
+
+/// Isotopes card: library, temperature, isotope list with density sliders.
+fn fm_isotopes_card(ui: &mut egui::Ui, state: &mut AppState) {
+    let isotope_locked = state.is_fetching_fm_endf;
+
+    // Card header: Library + Temperature inline
+    let lib_label = library_name(state.fm_endf_library);
+    let header = format!(
+        "Isotopes  \u{2014}  {lib_label}  T={:.0}K",
+        state.fm_temperature_k
+    );
+    design::card_with_header(ui, &header, None, |ui| {
+        // Library selector
+        let prev_lib = state.fm_endf_library;
+        ui.add_enabled_ui(!isotope_locked, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Library:");
+                egui::ComboBox::from_id_salt("fm_endf_lib")
+                    .selected_text(library_name(state.fm_endf_library))
+                    .show_ui(ui, |ui| {
+                        for (val, label) in [
+                            (EndfLibrary::EndfB8_0, "ENDF/B-VIII.0"),
+                            (EndfLibrary::EndfB8_1, "ENDF/B-VIII.1"),
+                            (EndfLibrary::Jeff3_3, "JEFF-3.3"),
+                            (EndfLibrary::Jendl5, "JENDL-5"),
+                        ] {
+                            ui.selectable_value(&mut state.fm_endf_library, val, label);
+                        }
+                    });
+                ui.label("Temp (K):");
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut state.fm_temperature_k)
+                            .range(1.0..=5000.0)
+                            .speed(1.0),
+                    )
+                    .changed()
+                {
+                    state.fm_spectrum = None;
+                    state.fm_per_isotope_spectra.clear();
+                }
+            });
+        });
+        if state.fm_endf_library != prev_lib {
+            for e in &mut state.fm_isotope_entries {
+                e.resonance_data = None;
+                e.endf_status = EndfStatus::Pending;
+            }
+            state.fm_spectrum = None;
+            state.fm_per_isotope_spectra.clear();
+        }
+
+        ui.add_space(4.0);
+
+        // Isotope list with density sliders
+        let mut to_remove = None;
+        let mut changed = false;
+        for (idx, entry) in state.fm_isotope_entries.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.add_enabled_ui(!isotope_locked, |ui| {
+                    if ui.checkbox(&mut entry.enabled, "").changed() {
+                        changed = true;
+                    }
+                });
+
+                // Colored dot matching isotope_dot_color
+                let dot_color = design::isotope_dot_color(&entry.symbol);
+                let (dot_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                ui.painter()
+                    .circle_filled(dot_rect.center(), 4.0, dot_color);
+
+                ui.label(&entry.symbol);
+
+                ui.add_enabled_ui(!isotope_locked, |ui| {
+                    // DragValue for precise density entry
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut entry.initial_density)
+                                .speed(0.0001)
+                                .range(1e-6..=0.05)
+                                .max_decimals(6),
+                        )
+                        .changed()
+                    {
+                        changed = true;
+                    }
+
+                    // Logarithmic slider for visual density adjustment
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut entry.initial_density, 1e-6..=0.05)
+                                .logarithmic(true)
+                                .show_value(false)
+                                .clamping(egui::SliderClamping::Always),
+                        )
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                });
+
+                // ENDF status badge
+                match entry.endf_status {
+                    EndfStatus::Loaded => {
+                        design::badge(ui, "OK", design::BadgeVariant::Green);
+                    }
+                    EndfStatus::Fetching => {
+                        ui.spinner();
+                    }
+                    EndfStatus::Failed => {
+                        design::badge(ui, "ERR", design::BadgeVariant::Red);
+                    }
+                    EndfStatus::Pending => {
+                        design::badge(ui, "...", design::BadgeVariant::Orange);
+                    }
+                }
+
+                ui.add_enabled_ui(!isotope_locked, |ui| {
+                    if ui.small_button("\u{00d7}").clicked() {
+                        to_remove = Some(idx);
+                    }
+                });
+            });
+        }
+        if let Some(idx) = to_remove {
+            state.fm_isotope_entries.remove(idx);
+            changed = true;
+        }
+        if changed {
+            state.fm_spectrum = None;
+            state.fm_per_isotope_spectra.clear();
+        }
+
+        ui.add_space(4.0);
+
+        // Add + Periodic Table + Fetch buttons
+        ui.add_enabled_ui(!isotope_locked, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("+ Add Isotope").clicked() {
+                    state.fm_isotope_entries.push(IsotopeEntry {
+                        z: 92,
+                        a: 238,
+                        symbol: "U-238".into(),
+                        initial_density: 0.001,
+                        resonance_data: None,
+                        enabled: true,
+                        endf_status: EndfStatus::Pending,
+                    });
+                    state.fm_spectrum = None;
+                    state.fm_per_isotope_spectra.clear();
+                }
+                if ui.button("Periodic Table...").clicked() {
+                    state.periodic_table_open = true;
+                    state.periodic_table_target = PeriodicTableTarget::ForwardModel;
+                    state.periodic_table_selected_z = None;
+                    state.periodic_table_density = 0.001; // at/barn default
+                }
+            });
+        });
+
+        let has_missing = state
+            .fm_isotope_entries
+            .iter()
+            .any(|e| e.enabled && e.resonance_data.is_none());
+        ui.add_enabled_ui(has_missing && !state.is_fetching_fm_endf, |ui| {
+            if design::btn_primary(ui, "Fetch ENDF").clicked() {
+                fm_fetch_endf_data(state);
+            }
+        });
+        if state.is_fetching_fm_endf {
+            ui.spinner();
+        }
+    });
+}
+
+/// Hero spectrum plot with energy/TOF axis and per-isotope contribution lines.
+fn fm_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
     // Collect enabled isotopes that have resonance data
     let enabled: Vec<_> = state
         .fm_isotope_entries
@@ -307,11 +348,13 @@ fn fm_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
         .collect();
 
     if enabled.is_empty() {
-        ui.label(
-            egui::RichText::new("Add isotopes and fetch ENDF data to see the forward model.")
-                .italics()
-                .color(crate::theme::semantic::ORANGE),
-        );
+        design::card(ui, |ui| {
+            ui.label(
+                egui::RichText::new("Add isotopes and fetch ENDF data to see the forward model.")
+                    .italics()
+                    .color(crate::theme::semantic::ORANGE),
+            );
+        });
         return;
     }
 
@@ -327,7 +370,7 @@ fn fm_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
             .collect()
     };
 
-    // Invalidate cache when energy grid changes (e.g. new data loaded or energies cleared)
+    // Invalidate cache when energy grid changes
     let current_grid = state.energies.as_deref();
     let cached_grid = state.fm_energies.as_deref();
     if current_grid != cached_grid {
@@ -338,25 +381,29 @@ fn fm_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
 
     // Compute combined forward model if cache is stale
     if state.fm_spectrum.is_none() {
+        let (instrument, res_warning) = fm_instrument(state);
+        if let Some(msg) = res_warning {
+            state.status_message = msg.into();
+        }
         let isotopes: Vec<_> = enabled
             .iter()
             .filter_map(|e| e.resonance_data.clone().map(|rd| (rd, e.initial_density)))
             .collect();
 
         match SampleParams::new(state.fm_temperature_k, isotopes) {
-            Ok(sample) => match transmission::forward_model(&energies, &sample, None) {
-                Ok(combined) => {
-                    state.fm_spectrum = Some(combined);
+            Ok(sample) => {
+                match transmission::forward_model(&energies, &sample, instrument.as_ref()) {
+                    Ok(combined) => {
+                        state.fm_spectrum = Some(combined);
+                    }
+                    Err(e) => {
+                        state.status_message = format!("Forward model error: {e}");
+                        state.fm_spectrum = Some(Vec::new());
+                    }
                 }
-                Err(e) => {
-                    state.status_message = format!("Forward model error: {e}");
-                    // Sentinel: empty vec stops recomputation every frame
-                    state.fm_spectrum = Some(Vec::new());
-                }
-            },
+            }
             Err(e) => {
                 state.status_message = format!("Sample params error: {e}");
-                // Sentinel: empty vec stops recomputation every frame
                 state.fm_spectrum = Some(Vec::new());
             }
         }
@@ -369,19 +416,19 @@ fn fm_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
             };
             let single = vec![(rd, entry.initial_density)];
             match SampleParams::new(state.fm_temperature_k, single) {
-                Ok(sample) => match transmission::forward_model(&energies, &sample, None) {
-                    Ok(t) => {
-                        state.fm_per_isotope_spectra.push((entry.symbol.clone(), t));
+                Ok(sample) => {
+                    match transmission::forward_model(&energies, &sample, instrument.as_ref()) {
+                        Ok(t) => {
+                            state.fm_per_isotope_spectra.push((entry.symbol.clone(), t));
+                        }
+                        Err(e) => {
+                            state.status_message =
+                                format!("Forward model error for {}: {e}", entry.symbol);
+                        }
                     }
-                    Err(e) => {
-                        state.status_message =
-                            format!("Forward model error for {}: {e}", entry.symbol);
-                        // Skip this isotope but don't leave cache in recomputation state
-                    }
-                },
+                }
                 Err(e) => {
                     state.status_message = format!("Sample params error for {}: {e}", entry.symbol);
-                    // Skip this isotope but don't leave cache in recomputation state
                 }
             }
         }
@@ -411,25 +458,15 @@ fn fm_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
                     .collect();
                 (tof, "TOF (\u{03bc}s)")
             } else {
-                // Fallback to energy if flight path is not configured
                 (plot_energies.clone(), "Energy (eV)")
             }
         }
     };
 
-    // Distinct colors for per-isotope lines
-    let isotope_colors = [
-        egui::Color32::from_rgb(230, 100, 50), // orange
-        egui::Color32::from_rgb(50, 180, 50),  // green
-        egui::Color32::from_rgb(180, 50, 180), // purple
-        egui::Color32::from_rgb(50, 150, 220), // blue
-        egui::Color32::from_rgb(220, 50, 50),  // red
-        egui::Color32::from_rgb(50, 200, 200), // cyan
-        egui::Color32::from_rgb(200, 200, 50), // yellow
-        egui::Color32::from_rgb(150, 100, 50), // brown
-    ];
-
+    // Hero plot — full width, min 300px tall
+    let plot_height = ui.available_height().clamp(300.0, 350.0);
     Plot::new("fm_spectrum_plot")
+        .height(plot_height)
         .x_axis_label(x_label)
         .y_axis_label("Transmission")
         .legend(egui_plot::Legend::default())
@@ -444,14 +481,14 @@ fn fm_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 plot_ui.line(Line::new("Combined T(E)", points).width(2.0));
             }
 
-            // Per-isotope contribution lines (dashed)
-            for (idx, (symbol, spectrum)) in state.fm_per_isotope_spectra.iter().enumerate() {
+            // Per-isotope contribution lines (dashed, colored by isotope hash)
+            for (symbol, spectrum) in state.fm_per_isotope_spectra.iter() {
                 let n_plot = x_values.len().min(spectrum.len());
                 let points: PlotPoints = (0..n_plot)
                     .filter(|&i| x_values[i].is_finite())
                     .map(|i| [x_values[i], spectrum[i]])
                     .collect();
-                let color = isotope_colors[idx % isotope_colors.len()];
+                let color = design::isotope_dot_color(symbol);
                 plot_ui.line(
                     Line::new(symbol.as_str(), points)
                         .color(color)
