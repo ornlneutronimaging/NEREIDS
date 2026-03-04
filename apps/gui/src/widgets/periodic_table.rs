@@ -517,6 +517,7 @@ fn add_selected_isotopes(state: &mut AppState) {
                     }
                     for e in &mut state.detect_trace_entries {
                         e.resonance_data = None;
+                        e.endf_status = EndfStatus::Pending;
                     }
                     state.detect_results.clear();
                 }

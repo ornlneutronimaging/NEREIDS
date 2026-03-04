@@ -188,7 +188,9 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
         .isotope_entries
         .iter()
         .any(|e| e.enabled && e.endf_status == EndfStatus::Failed);
-    let nav_hint = if has_any_failed {
+    let nav_hint = if !has_enabled {
+        "Add an isotope to continue"
+    } else if has_any_failed {
         "Some isotopes failed \u{2014} remove or retry"
     } else {
         "Waiting for ENDF data\u{2026}"
