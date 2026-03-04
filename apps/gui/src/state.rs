@@ -35,7 +35,7 @@ pub struct SessionCache {
     pub proton_charge_sample: f64,
     /// Proton charge open beam.
     pub proton_charge_ob: f64,
-    /// Isotope list: (z, a, symbol, density, endf_library_name).
+    /// Isotope list: (z, a, symbol, density, enabled).
     pub isotopes: Vec<CachedIsotope>,
     /// ENDF library name (e.g. "ENDF/B-VIII.0").
     pub endf_library_name: String,
@@ -72,7 +72,7 @@ impl SessionCache {
     /// Build a session cache from the current application state.
     pub fn from_state(state: &AppState) -> Option<Self> {
         // Only cache if a pipeline has been configured
-        if state.fitting_type.is_none() || state.data_type.is_none() {
+        if state.fitting_type.is_none() || state.data_type.is_none() || state.pipeline.is_empty() {
             return None;
         }
         Some(Self {

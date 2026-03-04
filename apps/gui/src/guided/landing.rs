@@ -27,12 +27,6 @@ pub fn landing_step(ui: &mut egui::Ui, state: &mut AppState) {
         let avail = ui.available_width();
         let max_grid = 900.0_f32.min(avail);
 
-        // Center the grid by wrapping in a fixed-width layout
-        let left_pad = ((avail - max_grid) / 2.0).max(0.0);
-        if left_pad > 0.0 {
-            ui.add_space(0.0); // no-op, centering handled by columns below
-        }
-
         let cards: [(GuidedStep, &str, &str, &str); 3] = [
             (
                 GuidedStep::Wizard,
@@ -60,7 +54,7 @@ pub fn landing_step(ui: &mut egui::Ui, state: &mut AppState) {
         ];
 
         // Use a fixed-width sub-UI so columns divide evenly
-        ui.allocate_ui(egui::vec2(max_grid, ui.available_height()), |ui| {
+        ui.allocate_ui(egui::vec2(max_grid, 0.0), |ui| {
             ui.columns(3, |cols| {
                 for (i, (target, icon, title, desc)) in cards.iter().enumerate() {
                     let clicked = landing_card(&mut cols[i], &tc, icon, title, desc);

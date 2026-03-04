@@ -454,7 +454,7 @@ fn step_is_complete(step: GuidedStep, state: &AppState) -> bool {
         }
         GuidedStep::Normalize => state.normalized.is_some(),
         GuidedStep::Analyze => state.pixel_fit_result.is_some() || state.spatial_result.is_some(),
-        GuidedStep::Results => state.spatial_result.is_some(),
+        GuidedStep::Results => state.pixel_fit_result.is_some() || state.spatial_result.is_some(),
         GuidedStep::Bin => state.sample_data.is_some(),
         GuidedStep::Rebin => true, // optional, skip counts as done
         GuidedStep::Roi => true,   // placeholder, always passable
