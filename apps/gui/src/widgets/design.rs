@@ -5,9 +5,11 @@
 //! Prototype reference: `.prototypes/D_hybrid_v4.html` CSS §Cards & Forms,
 //! §Tabs, §Badges, §Content Area, §Toolbar, §Drop Zones.
 
-use crate::state::EndfStatus;
+use crate::state::{EndfStatus, ResolutionMode};
 use crate::theme::{ThemeColors, semantic};
 use egui::{Color32, CornerRadius, Margin, Rect, Response, RichText, Sense, Shadow, Stroke, Ui};
+use nereids_physics::resolution::TabulatedResolution;
+use std::sync::Arc;
 
 // ── Content Header ──────────────────────────────────────────────
 
@@ -475,4 +477,148 @@ pub fn nav_buttons(
     });
 
     action
+}
+
+// ── Resolution Card ────────────────────────────────────────────
+
+/// Result from the resolution card widget.
+pub struct ResolutionCardResult {
+    pub changed: bool,
+}
+
+/// Shared resolution broadening card: Gaussian parametric or tabulated file.
+///
+/// Used identically in Configure, Forward Model, and Detectability.
+pub fn resolution_card(
+    ui: &mut Ui,
+    enabled: &mut bool,
+    mode: &mut ResolutionMode,
+    flight_path_m: f64,
+) -> ResolutionCardResult {
+    let mut changed = false;
+
+    card_with_header(ui, "Instrument Resolution", None, |ui| {
+        let prev_enabled = *enabled;
+        ui.checkbox(enabled, "Enable broadening");
+        if *enabled != prev_enabled {
+            changed = true;
+        }
+
+        if !*enabled {
+            return;
+        }
+
+        // Mode selector: Gaussian vs Tabulated
+        let is_gaussian = matches!(mode, ResolutionMode::Gaussian { .. });
+        ui.horizontal(|ui| {
+            if ui.radio(is_gaussian, "Gaussian (parametric)").clicked() && !is_gaussian {
+                *mode = ResolutionMode::default();
+                changed = true;
+            }
+            if ui.radio(!is_gaussian, "From file").clicked() && is_gaussian {
+                *mode = ResolutionMode::Tabulated {
+                    path: std::path::PathBuf::new(),
+                    data: None,
+                    error: None,
+                };
+                changed = true;
+            }
+        });
+
+        ui.add_space(4.0);
+
+        match mode {
+            ResolutionMode::Gaussian {
+                delta_t_us,
+                delta_l_m,
+            } => {
+                ui.horizontal(|ui| {
+                    ui.label(format!("Flight path: {flight_path_m:.2} m"));
+                    ui.label("(from Beamline)");
+                });
+                let prev_dt = *delta_t_us;
+                let prev_dl = *delta_l_m;
+                ui.horizontal(|ui| {
+                    ui.label("\u{0394}t (\u{03bc}s):");
+                    ui.add(
+                        egui::DragValue::new(delta_t_us)
+                            .speed(0.1)
+                            .range(0.0..=100.0),
+                    );
+                    ui.label("\u{0394}L (m):");
+                    ui.add(
+                        egui::DragValue::new(delta_l_m)
+                            .speed(0.001)
+                            .range(0.0..=1.0),
+                    );
+                });
+                if *delta_t_us != prev_dt || *delta_l_m != prev_dl {
+                    changed = true;
+                }
+            }
+            ResolutionMode::Tabulated { path, data, error } => {
+                ui.horizontal(|ui| {
+                    if ui.button("Load resolution file\u{2026}").clicked()
+                        && let Some(file) = rfd::FileDialog::new()
+                            .add_filter("Resolution", &["txt", "dat"])
+                            .pick_file()
+                    {
+                        if let Some(path_str) = file.to_str() {
+                            match TabulatedResolution::from_file(path_str, flight_path_m) {
+                                Ok(tab) => {
+                                    *path = file;
+                                    *data = Some(Arc::new(tab));
+                                    *error = None;
+                                    changed = true;
+                                }
+                                Err(e) => {
+                                    *path = file;
+                                    *data = None;
+                                    *error = Some(format!("{e}"));
+                                    changed = true;
+                                }
+                            }
+                        } else {
+                            *path = file;
+                            *data = None;
+                            *error = Some(
+                                "File path is not valid UTF-8; please choose a different file"
+                                    .into(),
+                            );
+                            changed = true;
+                        }
+                    }
+                    if let Some(name) = path.file_name() {
+                        ui.label(
+                            RichText::new(name.to_string_lossy().to_string())
+                                .monospace()
+                                .size(11.0),
+                        );
+                    }
+                });
+                // Show summary if loaded, or error if parse failed
+                if let Some(tab) = data {
+                    let n = tab.ref_energies().len();
+                    let e_min = tab.ref_energies().first().copied().unwrap_or(0.0);
+                    let e_max = tab.ref_energies().last().copied().unwrap_or(0.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "{n} reference energies, {e_min:.4}\u{2013}{e_max:.1} eV"
+                        ))
+                        .size(11.0)
+                        .color(crate::theme::semantic::GREEN),
+                    );
+                } else if let Some(err) = error {
+                    ui.colored_label(crate::theme::semantic::RED, format!("Parse error: {err}"));
+                } else if !path.as_os_str().is_empty() {
+                    ui.colored_label(
+                        crate::theme::semantic::RED,
+                        "File not loaded \u{2014} select a valid resolution file",
+                    );
+                }
+            }
+        }
+    });
+
+    ResolutionCardResult { changed }
 }

@@ -2,7 +2,7 @@
 
 use crate::state::{
     AppState, EndfFetchResult, EndfStatus, GuidedStep, IsotopeEntry, PeriodicTableTarget,
-    SpectrumAxis,
+    ResolutionMode, SpectrumAxis,
 };
 use crate::widgets::design;
 use egui_plot::{Line, Plot, PlotPoints};
@@ -41,6 +41,8 @@ pub fn forward_model_step(ui: &mut egui::Ui, state: &mut AppState) {
                     .collect();
                 state.fm_endf_library = state.endf_library;
                 state.fm_temperature_k = state.temperature_k;
+                state.fm_resolution_enabled = state.resolution_enabled;
+                state.fm_resolution_mode = state.resolution_mode.clone();
                 state.fm_spectrum = None;
                 state.fm_per_isotope_spectra.clear();
             }
@@ -66,6 +68,8 @@ pub fn forward_model_step(ui: &mut egui::Ui, state: &mut AppState) {
                     .collect();
                 state.endf_library = state.fm_endf_library;
                 state.temperature_k = state.fm_temperature_k;
+                state.resolution_enabled = state.fm_resolution_enabled;
+                state.resolution_mode = state.fm_resolution_mode.clone();
                 state.spatial_result = None;
                 state.pixel_fit_result = None;
             }
@@ -107,60 +111,51 @@ pub(crate) fn fm_instrument(state: &AppState) -> (Option<InstrumentParams>, Opti
         return (None, None);
     }
     let fp = state.beamline.flight_path_m;
-    match ResolutionParams::new(fp, state.fm_delta_t_us, state.fm_delta_l_m) {
-        Ok(p) => (
+    match &state.fm_resolution_mode {
+        ResolutionMode::Gaussian {
+            delta_t_us,
+            delta_l_m,
+        } => match ResolutionParams::new(fp, *delta_t_us, *delta_l_m) {
+            Ok(p) => (
+                Some(InstrumentParams {
+                    resolution: ResolutionFunction::Gaussian(p),
+                }),
+                None,
+            ),
+            Err(_) => (
+                None,
+                Some(
+                    "Resolution enabled but flight path not configured \u{2014} broadening disabled",
+                ),
+            ),
+        },
+        ResolutionMode::Tabulated {
+            data: Some(tab), ..
+        } => (
             Some(InstrumentParams {
-                resolution: ResolutionFunction::Gaussian(p),
+                resolution: ResolutionFunction::Tabulated(Arc::clone(tab)),
             }),
             None,
         ),
-        Err(_) => (
+        ResolutionMode::Tabulated { data: None, .. } => (
             None,
-            Some("Resolution enabled but flight path not configured — broadening disabled"),
+            Some("Resolution file not loaded \u{2014} broadening disabled"),
         ),
     }
 }
 
-/// Resolution card: enable checkbox, flight path (read-only), delta_t, delta_l.
+/// Resolution card using the shared design widget.
 pub(crate) fn fm_resolution_card(ui: &mut egui::Ui, state: &mut AppState) {
-    design::card_with_header(ui, "Instrument Resolution", None, |ui| {
-        let prev_enabled = state.fm_resolution_enabled;
-        let prev_dt = state.fm_delta_t_us;
-        let prev_dl = state.fm_delta_l_m;
-
-        ui.checkbox(&mut state.fm_resolution_enabled, "Enable broadening");
-
-        if state.fm_resolution_enabled {
-            ui.horizontal(|ui| {
-                let fp = state.beamline.flight_path_m;
-                ui.label(format!("Flight path: {fp:.2} m"));
-                ui.label("(from Beamline)");
-            });
-            ui.horizontal(|ui| {
-                ui.label("\u{0394}t (\u{03bc}s):");
-                ui.add(
-                    egui::DragValue::new(&mut state.fm_delta_t_us)
-                        .speed(0.1)
-                        .range(0.0..=100.0),
-                );
-                ui.label("\u{0394}L (m):");
-                ui.add(
-                    egui::DragValue::new(&mut state.fm_delta_l_m)
-                        .speed(0.001)
-                        .range(0.0..=1.0),
-                );
-            });
-        }
-
-        // Invalidate spectrum cache on any resolution change
-        if state.fm_resolution_enabled != prev_enabled
-            || state.fm_delta_t_us != prev_dt
-            || state.fm_delta_l_m != prev_dl
-        {
-            state.fm_spectrum = None;
-            state.fm_per_isotope_spectra.clear();
-        }
-    });
+    let res = design::resolution_card(
+        ui,
+        &mut state.fm_resolution_enabled,
+        &mut state.fm_resolution_mode,
+        state.beamline.flight_path_m,
+    );
+    if res.changed {
+        state.fm_spectrum = None;
+        state.fm_per_isotope_spectra.clear();
+    }
 }
 
 /// Isotopes card: library, temperature, isotope list with density sliders.

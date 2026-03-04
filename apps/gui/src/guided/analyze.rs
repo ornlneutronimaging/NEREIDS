@@ -6,13 +6,15 @@
 //! map and immediately see its spectrum.
 
 use crate::state::{
-    AppState, GuidedStep, InputMode, IsotopeEntry, RoiSelection, SolverMethod, SpectrumAxis,
+    AppState, GuidedStep, InputMode, IsotopeEntry, ResolutionMode, RoiSelection, SolverMethod,
+    SpectrumAxis,
 };
 use crate::widgets::design::{self, NavAction};
 use crate::widgets::image_view::{show_viridis_image, show_viridis_image_with_roi};
 use egui_plot::{Line, Plot, PlotPoints, VLine};
 use ndarray::Axis;
 use nereids_io::spectrum::{SpectrumUnit, SpectrumValueKind};
+use nereids_physics::resolution::{ResolutionFunction, ResolutionParams};
 use nereids_pipeline::pipeline::FitConfig;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -729,12 +731,36 @@ fn build_fit_config(state: &AppState) -> Result<FitConfig, String> {
     let isotope_names: Vec<_> = enabled.iter().map(|e| e.symbol.clone()).collect();
     let initial_densities: Vec<_> = enabled.iter().map(|e| e.initial_density).collect();
 
+    let resolution = if state.resolution_enabled {
+        match &state.resolution_mode {
+            ResolutionMode::Gaussian {
+                delta_t_us,
+                delta_l_m,
+            } => {
+                let params =
+                    ResolutionParams::new(state.beamline.flight_path_m, *delta_t_us, *delta_l_m)
+                        .map_err(|e| format!("Invalid Gaussian resolution parameters: {e}"))?;
+                Some(ResolutionFunction::Gaussian(params))
+            }
+            ResolutionMode::Tabulated {
+                data: Some(tab), ..
+            } => Some(ResolutionFunction::Tabulated(Arc::clone(tab))),
+            ResolutionMode::Tabulated { data: None, .. } => {
+                return Err(
+                    "Tabulated resolution enabled but no file loaded — load a resolution file or disable broadening".into(),
+                );
+            }
+        }
+    } else {
+        None
+    };
+
     let mut config = FitConfig::new(
         energies,
         resonance_data,
         isotope_names,
         state.temperature_k,
-        None,
+        resolution,
         initial_densities,
         state.lm_config.clone(),
     )

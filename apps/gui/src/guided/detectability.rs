@@ -1,7 +1,9 @@
 //! Detectability tool — multi-matrix + trace isotope analysis with resolution broadening,
 //! verdict badges, hero stats, and delta-T spectrum plot.
 
-use crate::state::{AppState, EndfFetchResult, EndfStatus, GuidedStep, PeriodicTableTarget};
+use crate::state::{
+    AppState, EndfFetchResult, EndfStatus, GuidedStep, PeriodicTableTarget, ResolutionMode,
+};
 use crate::widgets::design;
 use egui_plot::{HLine, Line, Plot, PlotPoints};
 use nereids_endf::retrieval::EndfLibrary;
@@ -267,45 +269,17 @@ pub(crate) fn detect_trace_card(ui: &mut egui::Ui, state: &mut AppState, locked:
     });
 }
 
-/// Resolution card: enable checkbox, flight path (read-only), delta_t, delta_l.
+/// Resolution card: Gaussian (parametric) or tabulated file, with shared widget.
 pub(crate) fn detect_resolution_card(ui: &mut egui::Ui, state: &mut AppState) {
-    design::card_with_header(ui, "Instrument Resolution", None, |ui| {
-        let prev_enabled = state.detect_resolution_enabled;
-        let prev_dt = state.detect_delta_t_us;
-        let prev_dl = state.detect_delta_l_m;
-
-        ui.checkbox(&mut state.detect_resolution_enabled, "Enable broadening");
-
-        if state.detect_resolution_enabled {
-            ui.horizontal(|ui| {
-                let fp = state.beamline.flight_path_m;
-                ui.label(format!("Flight path: {fp:.2} m"));
-                ui.label("(from Beamline)");
-            });
-            ui.horizontal(|ui| {
-                ui.label("\u{0394}t (\u{03bc}s):");
-                ui.add(
-                    egui::DragValue::new(&mut state.detect_delta_t_us)
-                        .speed(0.1)
-                        .range(0.0..=100.0),
-                );
-                ui.label("\u{0394}L (m):");
-                ui.add(
-                    egui::DragValue::new(&mut state.detect_delta_l_m)
-                        .speed(0.001)
-                        .range(0.0..=1.0),
-                );
-            });
-        }
-
-        // Invalidate results on any resolution change
-        if state.detect_resolution_enabled != prev_enabled
-            || state.detect_delta_t_us != prev_dt
-            || state.detect_delta_l_m != prev_dl
-        {
-            state.detect_results.clear();
-        }
-    });
+    let res = design::resolution_card(
+        ui,
+        &mut state.detect_resolution_enabled,
+        &mut state.detect_resolution_mode,
+        state.beamline.flight_path_m,
+    );
+    if res.changed {
+        state.detect_results.clear();
+    }
 }
 
 /// Advanced config: SNR threshold, I0, energy range, points, temperature.
@@ -588,13 +562,26 @@ fn run_detectability(state: &mut AppState) {
 
     // Build resolution function if enabled
     let res_fn = if state.detect_resolution_enabled {
-        let fp = state.beamline.flight_path_m;
-        match ResolutionParams::new(fp, state.detect_delta_t_us, state.detect_delta_l_m) {
-            Ok(p) => Some(ResolutionFunction::Gaussian(p)),
-            Err(_) => {
-                state.status_message =
-                    "Resolution enabled but flight path not configured — broadening disabled"
-                        .into();
+        match &state.detect_resolution_mode {
+            ResolutionMode::Gaussian {
+                delta_t_us,
+                delta_l_m,
+            } => {
+                let fp = state.beamline.flight_path_m;
+                match ResolutionParams::new(fp, *delta_t_us, *delta_l_m) {
+                    Ok(p) => Some(ResolutionFunction::Gaussian(p)),
+                    Err(_) => {
+                        state.status_message =
+                            "Resolution params invalid — broadening disabled".into();
+                        None
+                    }
+                }
+            }
+            ResolutionMode::Tabulated {
+                data: Some(tab), ..
+            } => Some(ResolutionFunction::Tabulated(Arc::clone(tab))),
+            ResolutionMode::Tabulated { data: None, .. } => {
+                state.status_message = "Resolution file not loaded — broadening disabled".into();
                 None
             }
         }

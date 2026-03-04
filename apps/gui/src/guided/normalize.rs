@@ -22,36 +22,33 @@ pub fn normalize_step(ui: &mut egui::Ui, state: &mut AppState) {
     };
     design::content_header(ui, "Normalize", subtitle);
 
+    let has_data = state.normalized.is_some() && state.energies.is_some();
+
+    // --- Normalization status + Analysis Mode (compact, full width) ---
     normalization_controls_card(ui, state);
 
-    // Stat row (after normalization)
-    if let (Some(norm), Some(energies)) = (&state.normalized, &state.energies) {
-        let shape = norm.transmission.shape();
-        let bins = format!("{}", shape[0]);
-        let pixels = format!("{}", shape[1] * shape[2]);
-        let e_min = format!("{:.2}", energies.first().unwrap_or(&0.0));
-        let e_max = format!("{:.2}", energies.last().unwrap_or(&0.0));
-        ui.add_space(8.0);
-        design::stat_row(
-            ui,
-            &[
-                (&bins, "Energy Bins"),
-                (&pixels, "Pixels"),
-                (&e_min, "E_min (eV)"),
-                (&e_max, "E_max (eV)"),
-            ],
-        );
+    if has_data {
+        analysis_mode_card(ui, state);
+
+        if let (Some(norm), Some(energies)) = (&state.normalized, &state.energies) {
+            let shape = norm.transmission.shape();
+            let bins = format!("{}", shape[0]);
+            let pixels = format!("{}", shape[1] * shape[2]);
+            let e_min = format!("{:.2}", energies.first().unwrap_or(&0.0));
+            let e_max = format!("{:.2}", energies.last().unwrap_or(&0.0));
+            design::stat_row(
+                ui,
+                &[
+                    (&bins, "Energy Bins"),
+                    (&pixels, "Pixels"),
+                    (&e_min, "E_min (eV)"),
+                    (&e_max, "E_max (eV)"),
+                ],
+            );
+        }
     }
 
-    if state.normalized.is_some() && state.energies.is_some() {
-        ui.add_space(12.0);
-        transmission_preview_card(ui, state);
-        ui.add_space(12.0);
-        analysis_mode_cards(ui, state);
-    }
-
-    // Navigation buttons
-    let can_continue = state.normalized.is_some() && state.energies.is_some();
+    let can_continue = has_data;
     match design::nav_buttons(
         ui,
         Some("\u{2190} Back"),
@@ -62,6 +59,12 @@ pub fn normalize_step(ui: &mut egui::Ui, state: &mut AppState) {
         NavAction::Back => state.guided_step = GuidedStep::Configure,
         NavAction::Continue => state.guided_step = GuidedStep::Analyze,
         NavAction::None => {}
+    }
+
+    // --- Transmission preview (full width, tall) ---
+    if has_data {
+        ui.add_space(8.0);
+        transmission_preview_card(ui, state);
     }
 }
 
@@ -392,86 +395,57 @@ fn preview_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
         });
 }
 
-// ---- Analysis Mode Cards ----
+// ---- Analysis Mode Card ----
 
-fn analysis_mode_cards(ui: &mut egui::Ui, state: &mut AppState) {
+fn analysis_mode_card(ui: &mut egui::Ui, state: &mut AppState) {
     design::card_with_header(ui, "Analysis Mode", None, |ui| {
         ui.horizontal(|ui| {
-            mode_card(
-                ui,
-                &mut state.analysis_mode,
-                AnalysisMode::FullSpatialMap,
-                "Full Spatial Map",
-                "Fit every pixel independently.",
-            );
-            mode_card(
-                ui,
-                &mut state.analysis_mode,
-                AnalysisMode::RoiSingleSpectrum,
-                "ROI \u{2192} Single Spectrum",
-                "Average ROI, fit once.",
+            // Full Spatial Map
+            let is_spatial = state.analysis_mode == AnalysisMode::FullSpatialMap;
+            if ui.radio(is_spatial, "Full Spatial Map").clicked() {
+                state.analysis_mode = AnalysisMode::FullSpatialMap;
+            }
+            ui.label(
+                egui::RichText::new("Fit every pixel independently.")
+                    .small()
+                    .weak(),
             );
 
-            // Spatial binning card with dropdown
+            ui.add_space(16.0);
+
+            // ROI Single Spectrum
+            let is_roi = state.analysis_mode == AnalysisMode::RoiSingleSpectrum;
+            if ui.radio(is_roi, "ROI \u{2192} Single Spectrum").clicked() {
+                state.analysis_mode = AnalysisMode::RoiSingleSpectrum;
+            }
+            ui.label(egui::RichText::new("Average ROI, fit once.").small().weak());
+
+            ui.add_space(16.0);
+
+            // Spatial Binning
             let is_binning = matches!(state.analysis_mode, AnalysisMode::SpatialBinning(_));
-            let stroke = if is_binning {
-                egui::Stroke::new(2.0, ui.visuals().selection.bg_fill)
+            if ui.radio(is_binning, "Spatial Binning").clicked() && !is_binning {
+                state.analysis_mode = AnalysisMode::SpatialBinning(2);
+            }
+            if is_binning {
+                let mut bin_size = match state.analysis_mode {
+                    AnalysisMode::SpatialBinning(n) => n,
+                    _ => 2,
+                };
+                egui::ComboBox::from_id_salt("bin_size")
+                    .selected_text(format!("{}x{}", bin_size, bin_size))
+                    .width(50.0)
+                    .show_ui(ui, |ui| {
+                        for &n in &[2u8, 4, 8] {
+                            ui.selectable_value(&mut bin_size, n, format!("{}x{}", n, n));
+                        }
+                    });
+                state.analysis_mode = AnalysisMode::SpatialBinning(bin_size);
             } else {
-                ui.visuals().widgets.noninteractive.bg_stroke
-            };
-            egui::Frame::group(ui.style())
-                .stroke(stroke)
-                .inner_margin(egui::Margin::same(8))
-                .show(ui, |ui| {
-                    if ui.selectable_label(is_binning, "Spatial Binning").clicked() && !is_binning {
-                        state.analysis_mode = AnalysisMode::SpatialBinning(2);
-                    }
-                    ui.label(
-                        egui::RichText::new("Bin NxN pixels, fit map.")
-                            .small()
-                            .weak(),
-                    );
-                    if is_binning {
-                        let mut bin_size = match state.analysis_mode {
-                            AnalysisMode::SpatialBinning(n) => n,
-                            _ => 2,
-                        };
-                        egui::ComboBox::from_id_salt("bin_size")
-                            .selected_text(format!("{}x{}", bin_size, bin_size))
-                            .show_ui(ui, |ui| {
-                                for &n in &[2u8, 4, 8] {
-                                    ui.selectable_value(&mut bin_size, n, format!("{}x{}", n, n));
-                                }
-                            });
-                        state.analysis_mode = AnalysisMode::SpatialBinning(bin_size);
-                    }
-                });
+                ui.label(egui::RichText::new("Bin NxN, fit map.").small().weak());
+            }
         });
     });
-}
-
-fn mode_card(
-    ui: &mut egui::Ui,
-    current: &mut AnalysisMode,
-    value: AnalysisMode,
-    title: &str,
-    description: &str,
-) {
-    let is_selected = *current == value;
-    let stroke = if is_selected {
-        egui::Stroke::new(2.0, ui.visuals().selection.bg_fill)
-    } else {
-        ui.visuals().widgets.noninteractive.bg_stroke
-    };
-    egui::Frame::group(ui.style())
-        .stroke(stroke)
-        .inner_margin(egui::Margin::same(8))
-        .show(ui, |ui| {
-            if ui.selectable_label(is_selected, title).clicked() {
-                *current = value;
-            }
-            ui.label(egui::RichText::new(description).small().weak());
-        });
 }
 
 // ---- Normalization Logic (unchanged from Phase 2a) ----

@@ -203,6 +203,62 @@ pub enum PeriodicTableTarget {
     DetectTrace,
 }
 
+/// Resolution broadening mode: parametric Gaussian or tabulated from file.
+#[derive(Clone, Debug)]
+pub enum ResolutionMode {
+    /// Analytical Gaussian: Δt (μs) and ΔL (m).
+    Gaussian { delta_t_us: f64, delta_l_m: f64 },
+    /// Tabulated from a VENUS/FTS resolution file.
+    Tabulated {
+        path: PathBuf,
+        data: Option<Arc<nereids_physics::resolution::TabulatedResolution>>,
+        error: Option<String>,
+    },
+}
+
+impl PartialEq for ResolutionMode {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Gaussian {
+                    delta_t_us: dt1,
+                    delta_l_m: dl1,
+                },
+                Self::Gaussian {
+                    delta_t_us: dt2,
+                    delta_l_m: dl2,
+                },
+            ) => dt1 == dt2 && dl1 == dl2,
+            (
+                Self::Tabulated {
+                    path: p1,
+                    data: d1,
+                    error: e1,
+                },
+                Self::Tabulated {
+                    path: p2,
+                    data: d2,
+                    error: e2,
+                },
+            ) => match (d1, d2) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => p1 == p2 && e1 == e2,
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+}
+
+impl Default for ResolutionMode {
+    fn default() -> Self {
+        Self::Gaussian {
+            delta_t_us: 1.0,
+            delta_l_m: 0.01,
+        }
+    }
+}
+
 /// A trace isotope entry for detectability analysis.
 pub struct DetectTraceEntry {
     pub z: u32,
@@ -242,6 +298,10 @@ pub struct AppState {
     // -- Isotope selection --
     pub isotope_entries: Vec<IsotopeEntry>,
     pub endf_library: EndfLibrary,
+
+    // -- Instrument Resolution --
+    pub resolution_enabled: bool,
+    pub resolution_mode: ResolutionMode,
 
     // -- Fitting --
     pub temperature_k: f64,
@@ -307,8 +367,7 @@ pub struct AppState {
     pub fm_per_isotope_spectra: Vec<(String, Vec<f64>)>,
     pub fm_energies: Option<Vec<f64>>,
     pub fm_resolution_enabled: bool,
-    pub fm_delta_t_us: f64,
-    pub fm_delta_l_m: f64,
+    pub fm_resolution_mode: ResolutionMode,
 
     // -- Detectability tool --
     pub detect_matrix_entries: Vec<IsotopeEntry>,
@@ -327,8 +386,7 @@ pub struct AppState {
     /// Used by `poll_pending_tasks` to dispatch results correctly.
     pub detect_n_matrix_at_fetch: usize,
     pub detect_resolution_enabled: bool,
-    pub detect_delta_t_us: f64,
-    pub detect_delta_l_m: f64,
+    pub detect_resolution_mode: ResolutionMode,
 
     // -- Isotope density editor --
     pub editing_isotope_density: Option<usize>,
@@ -606,6 +664,9 @@ impl Default for AppState {
             isotope_entries: Vec::new(),
             endf_library: EndfLibrary::EndfB8_0,
 
+            resolution_enabled: false,
+            resolution_mode: ResolutionMode::default(),
+
             temperature_k: 296.0,
             lm_config: LmConfig::default(),
             solver_method: SolverMethod::LevenbergMarquardt,
@@ -660,8 +721,7 @@ impl Default for AppState {
             fm_per_isotope_spectra: Vec::new(),
             fm_energies: None,
             fm_resolution_enabled: false,
-            fm_delta_t_us: 1.0,
-            fm_delta_l_m: 0.01,
+            fm_resolution_mode: ResolutionMode::default(),
 
             detect_matrix_entries: Vec::new(),
             detect_trace_entries: Vec::new(),
@@ -677,8 +737,7 @@ impl Default for AppState {
             detect_temperature_k: 296.0,
             detect_n_matrix_at_fetch: 0,
             detect_resolution_enabled: false,
-            detect_delta_t_us: 1.0,
-            detect_delta_l_m: 0.01,
+            detect_resolution_mode: ResolutionMode::default(),
 
             editing_isotope_density: None,
 

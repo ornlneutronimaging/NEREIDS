@@ -1241,9 +1241,7 @@ fn build_resolution(
         ));
     }
     if let Some(tab) = resolution {
-        Ok(Some(ResolutionFunction::Tabulated(Arc::unwrap_or_clone(
-            tab.inner,
-        ))))
+        Ok(Some(ResolutionFunction::Tabulated(tab.inner)))
     } else if let (Some(fp), Some(dt), Some(dl)) = (flight_path_m, delta_t_us, delta_l_m) {
         let rp = ResolutionParams::new(fp, dt, dl)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
@@ -1433,10 +1431,7 @@ fn py_apply_resolution<'py>(
     }
     validate_energy_grid(e)?;
 
-    // Take by value so we can use Arc::unwrap_or_clone instead of a
-    // deep clone.  When only one Python reference exists, this avoids
-    // the copy entirely.
-    let res_fn = ResolutionFunction::Tabulated(Arc::unwrap_or_clone(resolution.inner));
+    let res_fn = ResolutionFunction::Tabulated(resolution.inner);
 
     // Copy numpy slices to owned vectors so we can release the GIL.
     let e_owned = e.to_vec();

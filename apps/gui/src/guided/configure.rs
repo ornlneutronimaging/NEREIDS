@@ -67,6 +67,18 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
             });
     });
 
+    // --- Instrument Resolution card ---
+    let res = design::resolution_card(
+        ui,
+        &mut state.resolution_enabled,
+        &mut state.resolution_mode,
+        state.beamline.flight_path_m,
+    );
+    if res.changed {
+        state.spatial_result = None;
+        state.pixel_fit_result = None;
+    }
+
     // --- Isotopes card ---
     // Custom header: title left, library ComboBox right
     let prev_lib = state.endf_library;
