@@ -41,6 +41,40 @@ pub fn isotope_from_mat(mat: u32) -> Option<(u32, u32)> {
         .map(|&(z, a, _)| (z, a))
 }
 
+/// All mass numbers with ENDF/B-VIII.0 evaluations for element Z.
+///
+/// Returns every A value in the MAT table for the given atomic number Z,
+/// including synthetic and transuranic isotopes. Returns an empty `Vec`
+/// for elements with no evaluations.
+///
+/// # Examples
+/// ```
+/// let pu = endf_mat::known_isotopes(94);
+/// assert!(pu.contains(&239));
+///
+/// let tc = endf_mat::known_isotopes(43);
+/// assert_eq!(tc, vec![98, 99]);
+/// ```
+pub fn known_isotopes(z: u32) -> Vec<u32> {
+    let start = ENDF_MAT_TABLE.partition_point(|&(tz, _, _)| tz < z);
+    ENDF_MAT_TABLE[start..]
+        .iter()
+        .take_while(|&&(tz, _, _)| tz == z)
+        .map(|&(_, a, _)| a)
+        .collect()
+}
+
+/// Whether the ENDF/B-VIII.0 neutrons sublibrary has an evaluation for (Z, A).
+///
+/// # Examples
+/// ```
+/// assert!(endf_mat::has_endf_evaluation(94, 239));  // Pu-239
+/// assert!(!endf_mat::has_endf_evaluation(94, 999)); // no such isotope
+/// ```
+pub fn has_endf_evaluation(z: u32, a: u32) -> bool {
+    mat_number(z, a).is_some()
+}
+
 // Auto-generated from ENDF/B-VIII.0 neutrons.list
 // 535 ground-state isotopes (metastable states excluded)
 // Format: (Z, A, MAT) — sorted by (Z, A)
@@ -680,6 +714,57 @@ mod tests {
     #[test]
     fn test_table_size() {
         assert_eq!(ENDF_MAT_TABLE.len(), 535);
+    }
+
+    #[test]
+    fn test_known_isotopes_plutonium() {
+        let pu = known_isotopes(94);
+        assert_eq!(
+            pu,
+            vec![236, 237, 238, 239, 240, 241, 242, 243, 244, 245, 246]
+        );
+    }
+
+    #[test]
+    fn test_known_isotopes_technetium() {
+        // Tc (Z=43) is synthetic — no natural isotopes but has ENDF evaluations
+        let tc = known_isotopes(43);
+        assert_eq!(tc, vec![98, 99]);
+    }
+
+    #[test]
+    fn test_known_isotopes_iron() {
+        let fe = known_isotopes(26);
+        assert_eq!(fe, vec![54, 55, 56, 57, 58]);
+    }
+
+    #[test]
+    fn test_known_isotopes_unknown() {
+        assert!(known_isotopes(200).is_empty());
+        assert!(known_isotopes(119).is_empty());
+    }
+
+    #[test]
+    fn test_known_isotopes_superset_of_natural() {
+        use crate::abundances::natural_isotopes;
+        for z in 1..=92 {
+            let natural_a: Vec<u32> = natural_isotopes(z).into_iter().map(|(a, _)| a).collect();
+            let known_a = known_isotopes(z);
+            for a in &natural_a {
+                assert!(
+                    known_a.contains(a),
+                    "Z={z}, A={a} is natural but not in known_isotopes"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_has_endf_evaluation() {
+        assert!(has_endf_evaluation(94, 239)); // Pu-239
+        assert!(has_endf_evaluation(92, 235)); // U-235
+        assert!(!has_endf_evaluation(94, 999)); // no such isotope
+        assert!(!has_endf_evaluation(200, 400));
     }
 
     #[test]

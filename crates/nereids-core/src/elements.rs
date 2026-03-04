@@ -58,6 +58,23 @@ pub fn natural_isotopes(z: u32) -> Vec<(Isotope, f64)> {
         .collect()
 }
 
+/// Get all isotopes with ENDF evaluations for element Z.
+///
+/// Unlike [`natural_isotopes`], this includes synthetic and transuranic
+/// isotopes (Tc, Pm, Np, Pu, Am, etc.) that have no natural abundance
+/// but do have evaluated nuclear data files.
+pub fn known_isotopes(z: u32) -> Vec<Isotope> {
+    endf_mat::known_isotopes(z)
+        .into_iter()
+        .filter_map(|a| Isotope::new(z, a).ok())
+        .collect()
+}
+
+/// Whether the ENDF/B-VIII.0 sublibrary has an evaluation for (Z, A).
+pub fn has_endf_evaluation(z: u32, a: u32) -> bool {
+    endf_mat::has_endf_evaluation(z, a)
+}
+
 /// Compute ENDF ZA identifier: Z * 1000 + A.
 pub fn za_from_isotope(isotope: &Isotope) -> u32 {
     endf_mat::za(isotope.z(), isotope.a())
@@ -152,5 +169,40 @@ mod tests {
     fn test_isotope_to_string() {
         let iso = Isotope::new(92, 238).unwrap();
         assert_eq!(isotope_to_string(&iso), "U-238");
+    }
+
+    #[test]
+    fn test_known_isotopes_plutonium() {
+        let pu = known_isotopes(94);
+        assert!(!pu.is_empty());
+        assert!(pu.iter().any(|iso| iso.a() == 239));
+    }
+
+    #[test]
+    fn test_known_isotopes_synthetic_element() {
+        // Tc has no natural isotopes but has ENDF evaluations
+        assert!(natural_isotopes(43).is_empty());
+        let tc = known_isotopes(43);
+        assert!(!tc.is_empty());
+    }
+
+    #[test]
+    fn test_known_isotopes_superset_of_natural() {
+        let natural: Vec<Isotope> = natural_isotopes(26)
+            .into_iter()
+            .map(|(iso, _)| iso)
+            .collect();
+        let known = known_isotopes(26);
+        for iso in &natural {
+            assert!(known.contains(iso));
+        }
+        // Fe-55 is in ENDF but not natural
+        assert!(known.iter().any(|iso| iso.a() == 55));
+    }
+
+    #[test]
+    fn test_has_endf_evaluation() {
+        assert!(has_endf_evaluation(94, 239));
+        assert!(!has_endf_evaluation(94, 999));
     }
 }
