@@ -298,7 +298,7 @@ pub(crate) fn fm_isotopes_card(ui: &mut egui::Ui, state: &mut AppState) {
 
         ui.add_space(4.0);
 
-        // Add + Periodic Table + Fetch buttons
+        // Add Isotope + Fetch buttons
         ui.add_enabled_ui(!isotope_locked, |ui| {
             if ui.button("Add Isotope...").clicked() {
                 state.periodic_table_open = true;
