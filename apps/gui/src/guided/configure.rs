@@ -1,8 +1,6 @@
 //! Step 2: Configuration — beamline parameters, isotope selection, ENDF fetch.
 
-use crate::state::{
-    AppState, EndfFetchResult, EndfStatus, GuidedStep, IsotopeEntry, PeriodicTableTarget,
-};
+use crate::state::{AppState, EndfFetchResult, EndfStatus, GuidedStep, PeriodicTableTarget};
 use crate::widgets::design::{self, ChipAction, NavAction};
 use nereids_endf::retrieval::EndfLibrary;
 use std::sync::Arc;
@@ -127,27 +125,12 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
 
         // Add buttons (disabled during fetch)
         ui.add_enabled_ui(!state.is_fetching_endf, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("Add Isotope").clicked() {
-                    state.isotope_entries.push(IsotopeEntry {
-                        z: 92,
-                        a: 238,
-                        symbol: "U-238".into(),
-                        initial_density: 0.001,
-                        resonance_data: None,
-                        enabled: true,
-                        endf_status: EndfStatus::Pending,
-                    });
-                    state.spatial_result = None;
-                    state.pixel_fit_result = None;
-                }
-                if ui.button("Periodic Table...").clicked() {
-                    state.periodic_table_open = true;
-                    state.periodic_table_target = PeriodicTableTarget::Configure;
-                    state.periodic_table_selected_z = None;
-                    state.periodic_table_density = 0.001; // at/barn default
-                }
-            });
+            if ui.button("Add Isotope...").clicked() {
+                state.periodic_table_open = true;
+                state.periodic_table_target = PeriodicTableTarget::Configure;
+                state.periodic_table_selected_z = None;
+                state.periodic_table_density = 0.001; // at/barn default
+            }
         });
 
         // Fetch ENDF button
