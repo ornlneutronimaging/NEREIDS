@@ -630,7 +630,7 @@ fn isotope_chip(
     let selected = state.periodic_table_selected_isotopes.contains(&pair);
 
     let label = match frac {
-        Some(f) => format!("{sym}-{a} ({:.1}%)", f * 100.0),
+        Some(f) => format!("{sym}-{a} ({:.2}%)", f * 100.0),
         None => format!("{sym}-{a}"),
     };
 
