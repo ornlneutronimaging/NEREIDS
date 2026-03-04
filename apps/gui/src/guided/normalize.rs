@@ -22,46 +22,66 @@ pub fn normalize_step(ui: &mut egui::Ui, state: &mut AppState) {
     };
     design::content_header(ui, "Normalize", subtitle);
 
-    normalization_controls_card(ui, state);
+    // --- Upper section: two-column layout ---
+    let available_width = ui.available_width();
+    let left_width = (available_width * 0.45).min(420.0);
 
-    // Stat row (after normalization)
-    if let (Some(norm), Some(energies)) = (&state.normalized, &state.energies) {
-        let shape = norm.transmission.shape();
-        let bins = format!("{}", shape[0]);
-        let pixels = format!("{}", shape[1] * shape[2]);
-        let e_min = format!("{:.2}", energies.first().unwrap_or(&0.0));
-        let e_max = format!("{:.2}", energies.last().unwrap_or(&0.0));
-        ui.add_space(8.0);
-        design::stat_row(
-            ui,
-            &[
-                (&bins, "Energy Bins"),
-                (&pixels, "Pixels"),
-                (&e_min, "E_min (eV)"),
-                (&e_max, "E_max (eV)"),
-            ],
+    ui.horizontal(|ui| {
+        // Left column: normalization card + stat row
+        ui.allocate_ui_with_layout(
+            egui::vec2(left_width, ui.available_height()),
+            egui::Layout::top_down(egui::Align::LEFT),
+            |ui| {
+                normalization_controls_card(ui, state);
+
+                if let (Some(norm), Some(energies)) = (&state.normalized, &state.energies) {
+                    let shape = norm.transmission.shape();
+                    let bins = format!("{}", shape[0]);
+                    let pixels = format!("{}", shape[1] * shape[2]);
+                    let e_min = format!("{:.2}", energies.first().unwrap_or(&0.0));
+                    let e_max = format!("{:.2}", energies.last().unwrap_or(&0.0));
+                    ui.add_space(8.0);
+                    design::stat_row(
+                        ui,
+                        &[
+                            (&bins, "Energy Bins"),
+                            (&pixels, "Pixels"),
+                            (&e_min, "E_min (eV)"),
+                            (&e_max, "E_max (eV)"),
+                        ],
+                    );
+                }
+            },
         );
-    }
 
+        ui.add_space(12.0);
+
+        // Right column: analysis mode + nav buttons
+        ui.vertical(|ui| {
+            let has_data = state.normalized.is_some() && state.energies.is_some();
+            if has_data {
+                analysis_mode_cards(ui, state);
+            }
+
+            let can_continue = state.normalized.is_some() && state.energies.is_some();
+            match design::nav_buttons(
+                ui,
+                Some("\u{2190} Back"),
+                "Continue \u{2192}",
+                can_continue,
+                "Normalize data to continue",
+            ) {
+                NavAction::Back => state.guided_step = GuidedStep::Configure,
+                NavAction::Continue => state.guided_step = GuidedStep::Analyze,
+                NavAction::None => {}
+            }
+        });
+    });
+
+    // --- Lower section: transmission preview (full width) ---
     if state.normalized.is_some() && state.energies.is_some() {
         ui.add_space(12.0);
         transmission_preview_card(ui, state);
-        ui.add_space(12.0);
-        analysis_mode_cards(ui, state);
-    }
-
-    // Navigation buttons
-    let can_continue = state.normalized.is_some() && state.energies.is_some();
-    match design::nav_buttons(
-        ui,
-        Some("\u{2190} Back"),
-        "Continue \u{2192}",
-        can_continue,
-        "Normalize data to continue",
-    ) {
-        NavAction::Back => state.guided_step = GuidedStep::Configure,
-        NavAction::Continue => state.guided_step = GuidedStep::Analyze,
-        NavAction::None => {}
     }
 }
 
