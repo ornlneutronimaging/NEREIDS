@@ -185,4 +185,11 @@ mod tests {
         let rebinned = rebin_centers(&centers, 2);
         assert_eq!(rebinned, vec![2.0, 5.0]); // mean(1,3)=2, mean(5)=5
     }
+
+    #[test]
+    fn counts_empty_array() {
+        let data = Array3::<f64>::zeros((0, 2, 2));
+        let rebinned = rebin_counts(&data, 3);
+        assert_eq!(rebinned.shape(), &[0, 2, 2]);
+    }
 }

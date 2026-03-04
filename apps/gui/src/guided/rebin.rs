@@ -64,6 +64,12 @@ pub fn rebin_step(ui: &mut egui::Ui, state: &mut AppState) {
                     state.rebin_factor = 1;
                     state.load_error = false;
                     state.invalidate_results();
+                    state.log_provenance(
+                        crate::state::ProvenanceEventKind::ConfigChanged,
+                        "Rebin undone — reloading original data",
+                    );
+                    // Navigate back to Load so auto-load re-triggers
+                    state.guided_step = crate::state::GuidedStep::Load;
                 }
             });
         } else {
@@ -134,6 +140,23 @@ fn current_bin_count(state: &AppState) -> Option<usize> {
 fn apply_rebin(state: &mut AppState, is_transmission: bool) {
     let factor = state.rebin_factor;
 
+    // Validate spectrum axis matches data axis-0
+    if let (Some(data), Some(vals)) = (&state.sample_data, &state.spectrum_values) {
+        let expected = if state.spectrum_kind == SpectrumValueKind::BinEdges {
+            vals.len().saturating_sub(1)
+        } else {
+            vals.len()
+        };
+        if expected != data.shape()[0] {
+            state.status_message = format!(
+                "Spectrum length ({}) doesn't match data bins ({})",
+                expected,
+                data.shape()[0]
+            );
+            return;
+        }
+    }
+
     // Rebin sample_data
     if let Some(ref data) = state.sample_data {
         let rebinned = if is_transmission {
@@ -171,4 +194,8 @@ fn apply_rebin(state: &mut AppState, is_transmission: bool) {
     state.spatial_result = None;
     state.pixel_fit_result = None;
     state.status_message = format!("Rebinned by factor {factor}");
+    state.log_provenance(
+        crate::state::ProvenanceEventKind::ConfigChanged,
+        format!("Rebinned by factor {factor}"),
+    );
 }

@@ -920,6 +920,8 @@ impl AppState {
         self.tile_display.clear();
         self.studio_selected_tile = 0;
         self.export_status = None;
+        self.rebin_applied = false;
+        self.rebin_factor = 1;
     }
 
     /// Append a provenance event to the session audit trail.
