@@ -140,6 +140,9 @@ fn current_bin_count(state: &AppState) -> Option<usize> {
 fn apply_rebin(state: &mut AppState, is_transmission: bool) {
     let factor = state.rebin_factor;
 
+    // Cancel any in-flight fitting tasks before mutating data arrays
+    state.cancel_pending_tasks();
+
     // Validate spectrum axis matches data axis-0
     if let (Some(data), Some(vals)) = (&state.sample_data, &state.spectrum_values) {
         let expected = if state.spectrum_kind == SpectrumValueKind::BinEdges {
