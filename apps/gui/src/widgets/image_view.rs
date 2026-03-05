@@ -446,7 +446,8 @@ pub fn show_density_overlay(
     let display_size = egui::Vec2::new(width as f32 * scale, height as f32 * scale);
 
     let (response, painter) = ui.allocate_painter(display_size, egui::Sense::click());
-    let image_rect = response.rect;
+    // Center within allocation to preserve aspect ratio (see prepare_image_painter).
+    let image_rect = egui::Rect::from_center_size(response.rect.center(), display_size);
     painter.image(
         texture.id(),
         image_rect,
@@ -548,7 +549,10 @@ fn prepare_image_painter(
     let display_size = egui::Vec2::new(width as f32 * scale, height as f32 * scale);
 
     let (response, painter) = ui.allocate_painter(display_size, sense);
-    let image_rect = response.rect;
+    // egui column layouts may stretch the allocated rect wider than
+    // display_size.  Center the image within the allocation to
+    // preserve the data's aspect ratio.
+    let image_rect = egui::Rect::from_center_size(response.rect.center(), display_size);
     painter.image(
         texture.id(),
         image_rect,
