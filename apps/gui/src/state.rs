@@ -991,6 +991,7 @@ impl AppState {
             && idx + 1 < self.pipeline.len()
         {
             self.guided_step = self.pipeline[idx + 1].step;
+            self.status_message = String::new();
         }
     }
 
@@ -1004,6 +1005,7 @@ impl AppState {
                 self.guided_step = GuidedStep::Wizard;
                 self.wizard_step = 2; // return to Confirm page
             }
+            self.status_message = String::new();
         }
     }
 
