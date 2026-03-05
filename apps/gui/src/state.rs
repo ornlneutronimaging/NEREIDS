@@ -55,6 +55,9 @@ pub struct SessionCache {
     /// Whether rebinning has been applied.
     #[serde(default)]
     pub rebin_applied: bool,
+    /// Whether the sidebar is collapsed (icon-only mode).
+    #[serde(default)]
+    pub sidebar_collapsed: bool,
 }
 
 fn default_rebin_factor() -> usize {
@@ -129,6 +132,7 @@ impl SessionCache {
             },
             rebin_factor: state.rebin_factor,
             rebin_applied: state.rebin_applied,
+            sidebar_collapsed: state.sidebar_collapsed,
         })
     }
 
@@ -197,6 +201,9 @@ impl SessionCache {
         // Restore rebin state
         state.rebin_factor = self.rebin_factor;
         state.rebin_applied = self.rebin_applied;
+
+        // Restore sidebar state
+        state.sidebar_collapsed = self.sidebar_collapsed;
 
         // Rebuild pipeline
         state.rebuild_pipeline();
@@ -560,6 +567,8 @@ pub struct AppState {
     pub theme_preference: ThemePreference,
     /// Cached resolved dark-mode boolean; used to skip redundant `apply_theme`.
     pub last_applied_dark_mode: Option<bool>,
+    /// Whether the guided-mode sidebar is collapsed (icon-only mode).
+    pub sidebar_collapsed: bool,
     pub active_tab: Tab,
     pub status_message: String,
     pub is_fitting: bool,
@@ -1112,6 +1121,7 @@ impl Default for AppState {
             guided_step: GuidedStep::Landing,
             theme_preference: ThemePreference::Auto,
             last_applied_dark_mode: None,
+            sidebar_collapsed: false,
             active_tab: Tab::Spectrum,
             status_message: "Ready".into(),
             is_fitting: false,

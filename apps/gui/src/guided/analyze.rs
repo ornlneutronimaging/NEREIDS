@@ -296,18 +296,29 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
         // -- Density map display (read-only ROI overlay) --
         let n_isotopes = result.density_maps.len();
         if n_isotopes > 1 {
+            let current_name = state
+                .isotope_entries
+                .iter()
+                .filter(|e| e.enabled && e.resonance_data.is_some())
+                .nth(state.map_display_isotope.min(n_isotopes - 1))
+                .map(|e| e.symbol.as_str())
+                .unwrap_or("?");
             ui.horizontal(|ui| {
                 ui.label("Isotope:");
-                for i in 0..n_isotopes {
-                    let name = state
-                        .isotope_entries
-                        .iter()
-                        .filter(|e| e.enabled && e.resonance_data.is_some())
-                        .nth(i)
-                        .map(|e| e.symbol.as_str())
-                        .unwrap_or("?");
-                    ui.selectable_value(&mut state.map_display_isotope, i, name);
-                }
+                egui::ComboBox::from_id_salt("isotope_map_select")
+                    .selected_text(current_name)
+                    .show_ui(ui, |ui| {
+                        for i in 0..n_isotopes {
+                            let name = state
+                                .isotope_entries
+                                .iter()
+                                .filter(|e| e.enabled && e.resonance_data.is_some())
+                                .nth(i)
+                                .map(|e| e.symbol.as_str())
+                                .unwrap_or("?");
+                            ui.selectable_value(&mut state.map_display_isotope, i, name);
+                        }
+                    });
             });
         }
 

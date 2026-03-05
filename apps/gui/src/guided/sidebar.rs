@@ -7,123 +7,334 @@ use egui::{Align, Color32, CornerRadius, Layout, Margin, RichText, Sense, Stroke
 /// Render the guided mode sidebar with step navigation.
 pub fn guided_sidebar(ctx: &egui::Context, state: &mut AppState) {
     let colors = ThemeColors::from_ctx(ctx);
+    let panel_width = if state.sidebar_collapsed { 56.0 } else { 240.0 };
+    let margin = if state.sidebar_collapsed {
+        Margin::symmetric(4, 12)
+    } else {
+        Margin::symmetric(12, 16)
+    };
     egui::SidePanel::left("guided_sidebar")
-        .default_width(220.0)
+        .default_width(panel_width)
+        .exact_width(panel_width)
         .resizable(false)
         .frame(
             egui::Frame::NONE
                 .fill(colors.bg)
-                .inner_margin(Margin::symmetric(12, 16))
+                .inner_margin(margin)
                 .stroke(Stroke::new(1.0, colors.border)),
         )
         .show(ctx, |ui| {
-            let on_landing_or_wizard =
-                matches!(state.guided_step, GuidedStep::Landing | GuidedStep::Wizard);
-
-            // ── Dynamic pipeline steps or placeholder ────────────
-            if state.pipeline.is_empty() {
-                ui.label(
-                    RichText::new("WELCOME")
-                        .size(10.0)
-                        .strong()
-                        .color(colors.fg3),
-                );
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new("Choose a workflow from the main panel to begin.")
-                        .size(11.0)
-                        .color(colors.fg3),
-                );
-            } else if on_landing_or_wizard {
-                // Dimmed previous pipeline — user navigated Home
-                ui.label(
-                    RichText::new("PREVIOUS")
-                        .size(10.0)
-                        .strong()
-                        .color(colors.fg3),
-                );
-                ui.add_space(4.0);
-                let pathway = pathway_label(state);
-                ui.label(RichText::new(pathway).size(12.0).color(colors.fg3));
-                ui.add_space(8.0);
-
-                // Dimmed step list
-                let pipeline: Vec<PipelineEntry> = state.pipeline.clone();
-                for entry in &pipeline {
-                    dimmed_pipeline_step_row(ui, entry, state, &colors);
-                    ui.add_space(2.0);
-                }
-                ui.add_space(8.0);
-
-                // Resume button
-                if ui.button("\u{21B5} Resume").clicked() {
-                    // Jump back to the first incomplete step, or the first step
-                    let target = pipeline
-                        .iter()
-                        .find(|e| !step_is_complete(e.step, state))
-                        .unwrap_or(&pipeline[0]);
-                    state.guided_step = target.step;
-                }
+            if state.sidebar_collapsed {
+                collapsed_sidebar(ui, state, &colors);
             } else {
-                // Active pipeline — full rendering
-                let pathway_label = pathway_label(state);
-                ui.label(RichText::new(pathway_label).strong().size(14.0));
-                ui.add_space(12.0);
-
-                let pipeline: Vec<PipelineEntry> = state.pipeline.clone();
-                for entry in &pipeline {
-                    pipeline_step_row(ui, entry, state, &colors);
-                    ui.add_space(2.0);
-                }
+                expanded_sidebar(ui, state, &colors);
             }
+        });
+}
 
-            // ── Tools section (hidden on Landing/Wizard) ─────
-            if !state.pipeline.is_empty() && !on_landing_or_wizard {
-                ui.add_space(12.0);
-                ui.separator();
-                ui.add_space(8.0);
+/// Collapsed sidebar: toggle button + badge-only step rows with tooltips.
+fn collapsed_sidebar(ui: &mut egui::Ui, state: &mut AppState, colors: &ThemeColors) {
+    // Expand toggle
+    if ui
+        .add(egui::Button::new(RichText::new(">>").size(11.0).color(colors.fg2)).frame(false))
+        .on_hover_text("Expand sidebar")
+        .clicked()
+    {
+        state.sidebar_collapsed = false;
+    }
+    ui.add_space(8.0);
 
-                ui.label(RichText::new("Tools").strong().size(13.0).color(colors.fg2));
-                ui.add_space(4.0);
+    let pipeline: Vec<PipelineEntry> = state.pipeline.clone();
+    for entry in &pipeline {
+        collapsed_step_badge(ui, entry, state, colors);
+        ui.add_space(2.0);
+    }
 
-                for &(tool_step, title, subtitle, icon) in &[
-                    (
-                        GuidedStep::ForwardModel,
-                        "Forward Model",
-                        "Preview spectra",
-                        "\u{21D2}",
-                    ),
-                    (
-                        GuidedStep::Detectability,
-                        "Detectability",
-                        "Pre-experiment",
-                        "\u{2605}",
-                    ),
-                ] {
-                    tool_row(ui, tool_step, title, subtitle, icon, state, &colors);
-                    ui.add_space(2.0);
-                }
+    // Tools
+    if !state.pipeline.is_empty()
+        && !matches!(state.guided_step, GuidedStep::Landing | GuidedStep::Wizard)
+    {
+        ui.add_space(4.0);
+        ui.separator();
+        ui.add_space(4.0);
+
+        for &(tool_step, title, icon) in &[
+            (GuidedStep::ForwardModel, "Forward Model", "\u{21D2}"),
+            (GuidedStep::Detectability, "Detectability", "\u{2605}"),
+        ] {
+            collapsed_tool_badge(ui, tool_step, icon, title, state, colors);
+            ui.add_space(2.0);
+        }
+    }
+
+    // History icon at bottom
+    ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
+        if !state.provenance_log.is_empty() {
+            let n = state.provenance_log.len();
+            if ui
+                .small_button("H")
+                .on_hover_text(format!("History ({n})"))
+                .clicked()
+            {
+                state.show_history_window = !state.show_history_window;
             }
+        }
+    });
+}
 
-            // ── Status + History button (pushed to bottom) ────────────
-            ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
-                // Status message (bottom-most element)
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new(&state.status_message)
-                        .small()
-                        .color(colors.fg3),
-                );
+/// Expanded sidebar: collapse button + full step labels (240px wide).
+fn expanded_sidebar(ui: &mut egui::Ui, state: &mut AppState, colors: &ThemeColors) {
+    // Collapse toggle (right-aligned)
+    ui.horizontal(|ui| {
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui
+                .add(
+                    egui::Button::new(RichText::new("<<").size(11.0).color(colors.fg2))
+                        .frame(false),
+                )
+                .on_hover_text("Collapse sidebar")
+                .clicked()
+            {
+                state.sidebar_collapsed = true;
+            }
+        });
+    });
+    ui.add_space(4.0);
 
-                // History button — opens separate window
-                if !state.provenance_log.is_empty() {
-                    let n = state.provenance_log.len();
-                    if ui.small_button(format!("History ({n})")).clicked() {
-                        state.show_history_window = !state.show_history_window;
-                    }
+    let on_landing_or_wizard =
+        matches!(state.guided_step, GuidedStep::Landing | GuidedStep::Wizard);
+
+    // ── Dynamic pipeline steps or placeholder ────────────
+    if state.pipeline.is_empty() {
+        ui.label(
+            RichText::new("WELCOME")
+                .size(10.0)
+                .strong()
+                .color(colors.fg3),
+        );
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new("Choose a workflow from the main panel to begin.")
+                .size(11.0)
+                .color(colors.fg3),
+        );
+    } else if on_landing_or_wizard {
+        // Dimmed previous pipeline — user navigated Home
+        ui.label(
+            RichText::new("PREVIOUS")
+                .size(10.0)
+                .strong()
+                .color(colors.fg3),
+        );
+        ui.add_space(4.0);
+        let pathway = pathway_label(state);
+        ui.label(RichText::new(pathway).size(12.0).color(colors.fg3));
+        ui.add_space(8.0);
+
+        let pipeline: Vec<PipelineEntry> = state.pipeline.clone();
+        for entry in &pipeline {
+            dimmed_pipeline_step_row(ui, entry, state, colors);
+            ui.add_space(2.0);
+        }
+        ui.add_space(8.0);
+
+        if ui.button("\u{21B5} Resume").clicked() {
+            let target = pipeline
+                .iter()
+                .find(|e| !step_is_complete(e.step, state))
+                .unwrap_or(&pipeline[0]);
+            state.guided_step = target.step;
+        }
+    } else {
+        let pathway_label = pathway_label(state);
+        ui.label(RichText::new(pathway_label).strong().size(14.0));
+        ui.add_space(12.0);
+
+        let pipeline: Vec<PipelineEntry> = state.pipeline.clone();
+        for entry in &pipeline {
+            pipeline_step_row(ui, entry, state, colors);
+            ui.add_space(2.0);
+        }
+    }
+
+    // ── Tools section ─────
+    if !state.pipeline.is_empty() && !on_landing_or_wizard {
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        ui.label(RichText::new("Tools").strong().size(13.0).color(colors.fg2));
+        ui.add_space(4.0);
+
+        for &(tool_step, title, subtitle, icon) in &[
+            (
+                GuidedStep::ForwardModel,
+                "Forward Model",
+                "Preview spectra",
+                "\u{21D2}",
+            ),
+            (
+                GuidedStep::Detectability,
+                "Detectability",
+                "Pre-experiment",
+                "\u{2605}",
+            ),
+        ] {
+            tool_row(ui, tool_step, title, subtitle, icon, state, colors);
+            ui.add_space(2.0);
+        }
+    }
+
+    // ── Status + History ────────────
+    ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(&state.status_message)
+                .small()
+                .color(colors.fg3),
+        );
+        if !state.provenance_log.is_empty() {
+            let n = state.provenance_log.len();
+            if ui.small_button(format!("History ({n})")).clicked() {
+                state.show_history_window = !state.show_history_window;
+            }
+        }
+    });
+}
+
+/// Collapsed badge for a pipeline step: 20x20 circle with tooltip.
+fn collapsed_step_badge(
+    ui: &mut egui::Ui,
+    entry: &PipelineEntry,
+    state: &mut AppState,
+    colors: &ThemeColors,
+) {
+    let step = entry.step;
+    let is_active = state.guided_step == step;
+    let is_complete = step_is_complete(step, state);
+    let display_num = state.step_display_number(step);
+    let sub = step_subtitle(step, state);
+    let tooltip = if sub.is_empty() {
+        step.label().to_string()
+    } else {
+        format!("{}\n{}", step.label(), sub)
+    };
+
+    let badge_text = match display_num {
+        Some(n) => n.to_string(),
+        None => "\u{2014}".to_string(),
+    };
+
+    let row_fill = if is_active {
+        colors.accent
+    } else {
+        Color32::TRANSPARENT
+    };
+
+    let resp = egui::Frame::NONE
+        .fill(row_fill)
+        .corner_radius(CornerRadius::same(7))
+        .inner_margin(Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            // Center the badge
+            ui.with_layout(Layout::top_down(Align::Center), |ui| {
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), Sense::hover());
+                let center = rect.center();
+
+                if is_active {
+                    ui.painter()
+                        .circle_filled(center, 10.0, Color32::from_white_alpha(60));
+                    ui.painter().text(
+                        center,
+                        egui::Align2::CENTER_CENTER,
+                        &badge_text,
+                        egui::FontId::proportional(11.0),
+                        Color32::WHITE,
+                    );
+                } else if is_complete {
+                    ui.painter().circle_filled(center, 10.0, semantic::GREEN);
+                    ui.painter().text(
+                        center,
+                        egui::Align2::CENTER_CENTER,
+                        "\u{2713}",
+                        egui::FontId::proportional(11.0),
+                        Color32::WHITE,
+                    );
+                } else {
+                    ui.painter().circle_filled(center, 10.0, colors.bg3);
+                    ui.painter()
+                        .circle_stroke(center, 10.0, Stroke::new(1.0, colors.border));
+                    ui.painter().text(
+                        center,
+                        egui::Align2::CENTER_CENTER,
+                        &badge_text,
+                        egui::FontId::proportional(11.0),
+                        colors.fg3,
+                    );
                 }
             });
-        });
+        })
+        .response;
+
+    let resp = resp.interact(Sense::click());
+    resp.clone().on_hover_text(&tooltip);
+    if resp.clicked() {
+        state.guided_step = step;
+        state.status_message = String::new();
+    }
+}
+
+/// Collapsed tool badge: icon-only circle with tooltip.
+fn collapsed_tool_badge(
+    ui: &mut egui::Ui,
+    step: GuidedStep,
+    icon: &str,
+    title: &str,
+    state: &mut AppState,
+    colors: &ThemeColors,
+) {
+    let is_active = state.guided_step == step;
+    let row_fill = if is_active {
+        colors.accent
+    } else {
+        Color32::TRANSPARENT
+    };
+
+    let resp = egui::Frame::NONE
+        .fill(row_fill)
+        .corner_radius(CornerRadius::same(7))
+        .inner_margin(Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            ui.with_layout(Layout::top_down(Align::Center), |ui| {
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), Sense::hover());
+                let badge_color = if is_active {
+                    Color32::from_white_alpha(60)
+                } else {
+                    colors.bg3
+                };
+                ui.painter().circle_filled(rect.center(), 10.0, badge_color);
+                let icon_color = if is_active {
+                    Color32::WHITE
+                } else {
+                    colors.fg2
+                };
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    icon,
+                    egui::FontId::proportional(11.0),
+                    icon_color,
+                );
+            });
+        })
+        .response;
+
+    let resp = resp.interact(Sense::click());
+    resp.clone().on_hover_text(title);
+    if resp.clicked() {
+        state.guided_step = step;
+        state.status_message = String::new();
+    }
 }
 
 /// Render the provenance history popup window (call from top-level update).

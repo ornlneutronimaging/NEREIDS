@@ -1,7 +1,9 @@
 //! Main application structure and egui App implementation.
 
 use crate::guided;
-use crate::state::{AppState, EndfStatus, ProvenanceEventKind, SessionCache, Tab, UiMode};
+use crate::state::{
+    AppState, EndfStatus, GuidedStep, ProvenanceEventKind, SessionCache, Tab, UiMode,
+};
 use crate::studio;
 use crate::theme;
 use crate::widgets;
@@ -70,9 +72,19 @@ impl eframe::App for NereidsApp {
                 guided::sidebar::guided_sidebar(ctx, &mut self.state);
                 guided::sidebar::history_window(ctx, &mut self.state);
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
+                    // Analyze and Results need the real viewport height
+                    // (ScrollArea makes available_height() return infinity).
+                    let needs_scroll = !matches!(
+                        self.state.guided_step,
+                        GuidedStep::Analyze | GuidedStep::Results
+                    );
+                    if needs_scroll {
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            guided::guided_content(ui, &mut self.state);
+                        });
+                    } else {
                         guided::guided_content(ui, &mut self.state);
-                    });
+                    }
                 });
             }
             UiMode::Studio => {
