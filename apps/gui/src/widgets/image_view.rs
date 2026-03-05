@@ -5,6 +5,26 @@
 
 use crate::state::{Colormap, RoiSelection};
 
+/// Cached GPU texture to avoid per-frame pixel generation and re-upload.
+///
+/// Stored in egui per-Id temp data, keyed by texture name.
+/// Cache hit when the source data pointer, dimensions, and colormap match.
+#[derive(Clone)]
+struct CachedTexture {
+    key: u64,
+    handle: egui::TextureHandle,
+}
+
+/// Combine cache-key parts into a single u64 via FNV-1a-like mixing.
+fn cache_key(parts: &[usize]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &p in parts {
+        h ^= p as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
 /// Result of an ROI editor interaction this frame.
 pub enum RoiEditorResult {
     /// No interaction this frame.
@@ -392,46 +412,81 @@ pub fn show_density_overlay(
         d_max - d_min
     };
 
-    let mut pixels = Vec::with_capacity(width * height * 4);
-    for y in 0..height {
-        for x in 0..width {
-            let in_roi = fitting_rois
-                .iter()
-                .any(|r| y >= r.y_start && y < r.y_end && x >= r.x_start && x < r.x_end);
-            if in_roi {
-                // Density colormap
-                let v = density[[y, x]];
-                let t = if v.is_finite() {
-                    ((v - d_min) / d_range).clamp(0.0, 1.0)
+    // Overlay texture cache: key includes both data pointers, ROI hash, and colormap.
+    let roi_hash = fitting_rois.iter().fold(0usize, |acc, r| {
+        acc.wrapping_mul(31)
+            .wrapping_add(r.y_start)
+            .wrapping_add(r.y_end << 16)
+            .wrapping_add(r.x_start << 32)
+            .wrapping_add(r.x_end << 48)
+    });
+    let cid = egui::Id::new(tex_id).with("tex_cache");
+    let key = cache_key(&[
+        preview.as_ptr() as usize,
+        density.as_ptr() as usize,
+        height,
+        width,
+        colormap as usize,
+        roi_hash,
+    ]);
+    let cached: Option<CachedTexture> = ui.data(|d| d.get_temp(cid));
+    let cache_hit = cached.as_ref().is_some_and(|c| c.key == key);
+
+    let texture = if cache_hit {
+        let c = cached.unwrap();
+        let handle = c.handle.clone();
+        ui.data_mut(|d| d.insert_temp(cid, c));
+        handle
+    } else {
+        let mut pixels = Vec::with_capacity(width * height * 4);
+        for y in 0..height {
+            for x in 0..width {
+                let in_roi = fitting_rois
+                    .iter()
+                    .any(|r| y >= r.y_start && y < r.y_end && x >= r.x_start && x < r.x_end);
+                if in_roi {
+                    let v = density[[y, x]];
+                    let t = if v.is_finite() {
+                        ((v - d_min) / d_range).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    let (r, g, b) = apply_colormap(colormap, t);
+                    pixels.push(r);
+                    pixels.push(g);
+                    pixels.push(b);
+                    pixels.push(255);
                 } else {
-                    0.0
-                };
-                let (r, g, b) = apply_colormap(colormap, t);
-                pixels.push(r);
-                pixels.push(g);
-                pixels.push(b);
-                pixels.push(255);
-            } else {
-                // Dimmed grayscale preview
-                let v = preview[[y, x]];
-                let t = if v.is_finite() {
-                    ((v - p_min) / p_range).clamp(0.0, 1.0)
-                } else {
-                    0.0
-                };
-                let gray = (t * 80.0 + 30.0).clamp(0.0, 255.0) as u8;
-                pixels.push(gray);
-                pixels.push(gray);
-                pixels.push(gray);
-                pixels.push(255);
+                    let v = preview[[y, x]];
+                    let t = if v.is_finite() {
+                        ((v - p_min) / p_range).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    let gray = (t * 80.0 + 30.0).clamp(0.0, 255.0) as u8;
+                    pixels.push(gray);
+                    pixels.push(gray);
+                    pixels.push(gray);
+                    pixels.push(255);
+                }
             }
         }
-    }
 
-    let image = egui::ColorImage::from_rgba_unmultiplied([width, height], &pixels);
-    let texture = ui
-        .ctx()
-        .load_texture(tex_id, image, egui::TextureOptions::NEAREST);
+        let image = egui::ColorImage::from_rgba_unmultiplied([width, height], &pixels);
+        let handle = ui
+            .ctx()
+            .load_texture(tex_id, image, egui::TextureOptions::NEAREST);
+        ui.data_mut(|d| {
+            d.insert_temp(
+                cid,
+                CachedTexture {
+                    key,
+                    handle: handle.clone(),
+                },
+            )
+        });
+        handle
+    };
 
     let available_width = ui.available_width();
     let available_height = ui.available_height();
@@ -505,34 +560,58 @@ fn prepare_image_painter(
     sense: egui::Sense,
 ) -> (egui::Response, egui::Painter, egui::Rect) {
     let (height, width) = (data.shape()[0], data.shape()[1]);
-    let (vmin, vmax) = data_range(data);
-    let range = if (vmax - vmin).abs() < 1e-30 {
-        1.0
+
+    // Texture cache: skip pixel generation + GPU upload when data unchanged.
+    let cid = egui::Id::new(tex_id).with("tex_cache");
+    let key = cache_key(&[data.as_ptr() as usize, height, width, colormap as usize]);
+    let cached: Option<CachedTexture> = ui.data(|d| d.get_temp(cid));
+    let cache_hit = cached.as_ref().is_some_and(|c| c.key == key);
+
+    let texture = if cache_hit {
+        let c = cached.unwrap();
+        let handle = c.handle.clone();
+        ui.data_mut(|d| d.insert_temp(cid, c)); // refresh TTL
+        handle
     } else {
-        vmax - vmin
-    };
+        let (vmin, vmax) = data_range(data);
+        let range = if (vmax - vmin).abs() < 1e-30 {
+            1.0
+        } else {
+            vmax - vmin
+        };
 
-    let mut pixels = Vec::with_capacity(width * height * 4);
-    for y in 0..height {
-        for x in 0..width {
-            let v = data[[y, x]];
-            let t = if v.is_finite() {
-                ((v - vmin) / range).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            let (r, g, b) = apply_colormap(colormap, t);
-            pixels.push(r);
-            pixels.push(g);
-            pixels.push(b);
-            pixels.push(255);
+        let mut pixels = Vec::with_capacity(width * height * 4);
+        for y in 0..height {
+            for x in 0..width {
+                let v = data[[y, x]];
+                let t = if v.is_finite() {
+                    ((v - vmin) / range).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let (r, g, b) = apply_colormap(colormap, t);
+                pixels.push(r);
+                pixels.push(g);
+                pixels.push(b);
+                pixels.push(255);
+            }
         }
-    }
 
-    let image = egui::ColorImage::from_rgba_unmultiplied([width, height], &pixels);
-    let texture = ui
-        .ctx()
-        .load_texture(tex_id, image, egui::TextureOptions::NEAREST);
+        let image = egui::ColorImage::from_rgba_unmultiplied([width, height], &pixels);
+        let handle = ui
+            .ctx()
+            .load_texture(tex_id, image, egui::TextureOptions::NEAREST);
+        ui.data_mut(|d| {
+            d.insert_temp(
+                cid,
+                CachedTexture {
+                    key,
+                    handle: handle.clone(),
+                },
+            )
+        });
+        handle
+    };
 
     let available_width = ui.available_width();
     let available_height = ui.available_height();
