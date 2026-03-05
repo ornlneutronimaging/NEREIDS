@@ -268,8 +268,8 @@ fn spectrum_section(ui: &mut egui::Ui, state: &mut AppState) {
 
 // ── Loaded info ────────────────────────────────────────────────
 
-/// Display loaded data info.
-fn show_loaded_info(ui: &mut egui::Ui, state: &AppState) {
+/// Display loaded data info with a Reload button.
+fn show_loaded_info(ui: &mut egui::Ui, state: &mut AppState) {
     let tc = ThemeColors::from_ctx(ui.ctx());
     if state.sample_data.is_none() && state.open_beam_data.is_none() {
         return;
@@ -296,6 +296,14 @@ fn show_loaded_info(ui: &mut egui::Ui, state: &AppState) {
             .size(11.0)
             .color(tc.fg2),
         );
+    }
+    // Reload button: force re-read from disk
+    if ui.small_button("\u{21bb} Reload").clicked() {
+        state.sample_data = None;
+        state.open_beam_data = None;
+        state.load_error = false;
+        state.nexus_probe_error = None;
+        state.invalidate_results();
     }
 }
 
