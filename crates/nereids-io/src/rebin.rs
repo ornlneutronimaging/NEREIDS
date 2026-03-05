@@ -10,9 +10,12 @@ use ndarray::{Array3, Axis, s};
 /// Rebin a 3D counts array along axis 0 by summing groups of `factor` slices.
 ///
 /// Remainder slices at the end are summed into the last output bin.
-/// Returns the original array unchanged if `factor <= 1`.
+/// Returns the original array unchanged if `factor < 2`.
+///
+/// **NaN handling**: NaN values propagate through the sum — any NaN in a
+/// group produces NaN in that output bin. This matches ndarray semantics.
 pub fn rebin_counts(data: &Array3<f64>, factor: usize) -> Array3<f64> {
-    if factor <= 1 {
+    if factor < 2 {
         return data.clone();
     }
     let n_old = data.shape()[0];
@@ -37,9 +40,12 @@ pub fn rebin_counts(data: &Array3<f64>, factor: usize) -> Array3<f64> {
 /// group. **This is an approximation** — real I₀ varies per pixel
 /// and energy bin.
 ///
-/// Returns the original array unchanged if `factor <= 1`.
+/// Returns the original array unchanged if `factor < 2`.
+///
+/// **NaN handling**: NaN values propagate through the average — any NaN
+/// in a group produces NaN in that output bin. This matches ndarray semantics.
 pub fn rebin_transmission(data: &Array3<f64>, factor: usize) -> Array3<f64> {
-    if factor <= 1 {
+    if factor < 2 {
         return data.clone();
     }
     let n_old = data.shape()[0];
@@ -191,5 +197,41 @@ mod tests {
         let data = Array3::<f64>::zeros((0, 2, 2));
         let rebinned = rebin_counts(&data, 3);
         assert_eq!(rebinned.shape(), &[0, 2, 2]);
+    }
+
+    #[test]
+    fn counts_factor_zero_returns_clone() {
+        let data = Array3::from_shape_fn((4, 1, 1), |(t, _, _)| t as f64);
+        let rebinned = rebin_counts(&data, 0);
+        assert_eq!(rebinned, data);
+    }
+
+    #[test]
+    fn transmission_factor_zero_returns_clone() {
+        let data = Array3::from_elem((4, 1, 1), 0.5);
+        let rebinned = rebin_transmission(&data, 0);
+        assert_eq!(rebinned, data);
+    }
+
+    #[test]
+    fn counts_nan_propagation() {
+        let mut data = Array3::from_shape_fn((4, 1, 1), |(t, _, _)| t as f64);
+        data[[1, 0, 0]] = f64::NAN; // bin 1 is NaN
+        let rebinned = rebin_counts(&data, 2);
+        // Group [0, NaN] should produce NaN
+        assert!(rebinned[[0, 0, 0]].is_nan());
+        // Group [2, 3] should produce 5.0
+        assert!((rebinned[[1, 0, 0]] - 5.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn transmission_nan_propagation() {
+        let mut data = Array3::from_shape_fn((4, 1, 1), |(t, _, _)| t as f64);
+        data[[1, 0, 0]] = f64::NAN; // bin 1 is NaN
+        let rebinned = rebin_transmission(&data, 2);
+        // Group [0, NaN] → mean is NaN
+        assert!(rebinned[[0, 0, 0]].is_nan());
+        // Group [2, 3] → mean = 2.5
+        assert!((rebinned[[1, 0, 0]] - 2.5).abs() < 1e-10);
     }
 }
