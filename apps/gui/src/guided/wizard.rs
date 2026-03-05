@@ -10,7 +10,6 @@ use egui::{Color32, CornerRadius, Margin, RichText, Stroke};
 /// Render the decision wizard (dispatches to the current sub-step).
 pub fn wizard_step(ui: &mut egui::Ui, state: &mut AppState) {
     ui.vertical(|ui| {
-
         // Breadcrumb bar
         breadcrumb_bar(ui, state);
         ui.add_space(12.0);
@@ -191,6 +190,9 @@ fn wizard_confirm(ui: &mut egui::Ui, state: &mut AppState) {
         DataType::Transmission => "Transmission",
     };
 
+    let tc = ThemeColors::from_ctx(ui.ctx());
+    let full_w = ui.available_width();
+
     design::content_header(
         ui,
         "Your Analysis Pipeline",
@@ -199,32 +201,70 @@ fn wizard_confirm(ui: &mut egui::Ui, state: &mut AppState) {
 
     let steps = GuidedStep::pipeline(ft, dt);
 
-    // Pipeline chips
+    // Pipeline steps — full-width card with numbered vertical list
     design::card_with_header(ui, "Pipeline Steps", None, |ui| {
-        pipeline_chips(ui, &steps);
+        ui.set_min_width(full_w - 36.0); // card has 16px padding + border
+        for (i, entry) in steps.iter().enumerate() {
+            let label = entry.step.label();
+            let opt_tag = if entry.optional { "  (optional)" } else { "" };
+            ui.horizontal(|ui| {
+                // Step number chip
+                let fill = if entry.optional { tc.bg3 } else { tc.accent };
+                let text_color = if entry.optional {
+                    tc.fg
+                } else {
+                    Color32::WHITE
+                };
+                egui::Frame::NONE
+                    .fill(fill)
+                    .corner_radius(CornerRadius::same(4))
+                    .inner_margin(Margin::symmetric(8, 3))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(format!("{}", i + 1))
+                                .size(12.0)
+                                .strong()
+                                .color(text_color),
+                        );
+                    });
+                ui.label(
+                    RichText::new(format!("{label}{opt_tag}"))
+                        .size(13.0)
+                        .strong(),
+                );
+            });
+            if i + 1 < steps.len() {
+                ui.add_space(4.0);
+            }
+        }
     });
 
-    // Limitations
+    // Inline chip summary (compact visual)
+    pipeline_chips(ui, &steps);
+    ui.add_space(14.0);
+
+    // Limitations — full-width card
     let limitations = limitations_for(ft, dt);
     if !limitations.is_empty() {
-        let tc = ThemeColors::from_ctx(ui.ctx());
         egui::Frame::NONE
             .fill(tc.bg2)
             .corner_radius(CornerRadius::same(8))
-            .inner_margin(Margin::same(14))
+            .inner_margin(Margin::same(16))
             .stroke(Stroke::new(1.0, tc.accent))
             .show(ui, |ui| {
+                ui.set_min_width(full_w - 38.0);
                 ui.label(
                     RichText::new("\u{26A0} Limitations & Notes")
                         .strong()
-                        .size(13.0),
+                        .size(14.0),
                 );
-                ui.add_space(4.0);
-                for note in limitations {
+                ui.add_space(6.0);
+                for note in &limitations {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("\u{2022}").color(tc.fg2));
-                        ui.label(RichText::new(note).size(12.0).color(tc.fg2));
+                        ui.label(RichText::new("\u{2022}").size(13.0).color(tc.fg2));
+                        ui.label(RichText::new(*note).size(13.0).color(tc.fg2));
                     });
+                    ui.add_space(2.0);
                 }
             });
         ui.add_space(14.0);
@@ -296,6 +336,7 @@ fn wizard_option_card(
         Stroke::new(1.0, tc.border)
     };
 
+    let full_w = ui.available_width();
     let resp = egui::Frame::NONE
         .fill(fill)
         .corner_radius(CornerRadius::same(10))
@@ -312,6 +353,7 @@ fn wizard_option_card(
             }
         })
         .show(ui, |ui| {
+            ui.set_min_width(full_w - 36.0);
             ui.horizontal(|ui| {
                 ui.label(RichText::new(title).strong().size(14.0));
                 if let Some(b) = badge {
