@@ -122,8 +122,9 @@ pub fn show_colormapped_image_with_roi(
 /// Supports:
 /// - **Draw new**: drag on empty space to create a new ROI rectangle
 /// - **Select**: click on an existing ROI to select it
-/// - **Move**: drag on a selected ROI to reposition it
-/// - **Deselect**: click on empty space
+/// - **Move**: Shift+drag on a selected ROI to reposition it
+/// - **Select/Deselect ROI**: Shift+click on/off an ROI
+/// - **Select pixel**: plain click (no Shift)
 ///
 /// Returns `(RoiEditorResult, image_rect)`.
 pub fn show_image_with_roi_editor(
@@ -149,8 +150,12 @@ pub fn show_image_with_roi_editor(
     let mut result = RoiEditorResult::None;
     let mut is_dragging = false;
 
-    // --- Drag state machine ---
-    if response.drag_started()
+    // Shift key gates ROI operations; plain click selects a pixel.
+    let shift_held = ui.input(|i| i.modifiers.shift);
+
+    // --- Drag state machine (only when Shift is held) ---
+    if shift_held
+        && response.drag_started()
         && let Some(pos) = response.interact_pointer_pos()
     {
         let (py, px) = screen_to_pixel(pos, image_rect, dims);
@@ -169,7 +174,6 @@ pub fn show_image_with_roi_editor(
                     )
                 });
             } else {
-                // Started drag outside selected ROI → draw new
                 ui.data_mut(|d| {
                     d.insert_temp(
                         drag_id,
@@ -181,7 +185,6 @@ pub fn show_image_with_roi_editor(
                 });
             }
         } else {
-            // No ROI selected — start DrawNew; click vs drag is resolved at drag_stopped.
             ui.data_mut(|d| {
                 d.insert_temp(
                     drag_id,
@@ -225,15 +228,12 @@ pub fn show_image_with_roi_editor(
             let (cy, cx) = screen_to_pixel(pos, image_rect, dims);
             match mode {
                 RoiDragMode::DrawNew { origin_y, origin_x } => {
-                    // Check if this was a click (no movement) vs a drag
                     if cy == origin_y && cx == origin_x {
-                        // Click — select, deselect, or pixel-select
+                        // Shift+click — select or deselect ROI
                         if let Some(hit_idx) = hit_test_rois(cy, cx, rois) {
                             result = RoiEditorResult::Selected(hit_idx);
-                        } else if selected_roi.is_some() {
-                            result = RoiEditorResult::Deselected;
                         } else {
-                            result = RoiEditorResult::ClickedPixel(cy, cx);
+                            result = RoiEditorResult::Deselected;
                         }
                     } else {
                         let roi = make_roi(origin_y, origin_x, cy, cx, dims);
@@ -259,6 +259,15 @@ pub fn show_image_with_roi_editor(
             }
         }
         ui.data_mut(|d| d.remove::<RoiDragMode>(drag_id));
+    }
+
+    // Plain click (no Shift) → select pixel
+    if !shift_held
+        && response.clicked()
+        && let Some(pos) = response.interact_pointer_pos()
+    {
+        let (py, px) = screen_to_pixel(pos, image_rect, dims);
+        result = RoiEditorResult::ClickedPixel(py, px);
     }
 
     // Draw all committed ROI overlays when not actively dragging
@@ -295,19 +304,23 @@ pub fn show_image_with_roi_editor(
         draw_pixel_marker(&painter, image_rect, dims, py, px);
     }
 
-    // Cursor: move icon when hovering selected ROI, crosshair otherwise
+    // Cursor: crosshair for ROI mode (Shift held), default for pixel mode
     if response.hovered()
         && let Some(pos) = ui.input(|i| i.pointer.hover_pos())
     {
-        let (py, px) = screen_to_pixel(pos, image_rect, dims);
-        if let Some(sel_idx) = selected_roi {
-            if sel_idx < rois.len() && point_in_roi(py, px, &rois[sel_idx]) {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        if shift_held {
+            let (py, px) = screen_to_pixel(pos, image_rect, dims);
+            if let Some(sel_idx) = selected_roi {
+                if sel_idx < rois.len() && point_in_roi(py, px, &rois[sel_idx]) {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                } else {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                }
             } else {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
             }
         } else {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
     }
 

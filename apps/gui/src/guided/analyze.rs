@@ -268,7 +268,7 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
 // ---- Image Panel (Column 2) ----
 
 /// Shows spatial result density maps if available, otherwise the preview image
-/// with interactive ROI editor. Handles click-to-select-pixel and ROI drawing.
+/// with interactive ROI editor. Click to select pixel, Shift+drag to draw ROIs.
 fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
     if let Some(ref result) = state.spatial_result {
         // -- Density map display (read-only ROI overlay) --
