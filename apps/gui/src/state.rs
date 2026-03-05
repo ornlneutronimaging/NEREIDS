@@ -49,6 +49,16 @@ pub struct SessionCache {
     pub resolution_delta_l_m: f64,
     /// Tabulated resolution file path (if applicable).
     pub resolution_path: Option<String>,
+    /// Energy rebin factor (1 = no rebinning).
+    #[serde(default = "default_rebin_factor")]
+    pub rebin_factor: usize,
+    /// Whether rebinning has been applied.
+    #[serde(default)]
+    pub rebin_applied: bool,
+}
+
+fn default_rebin_factor() -> usize {
+    1
 }
 
 /// Serializable solver method for session cache.
@@ -117,6 +127,8 @@ impl SessionCache {
                 ResolutionMode::Tabulated { path, .. } => Some(path.to_string_lossy().to_string()),
                 _ => None,
             },
+            rebin_factor: state.rebin_factor,
+            rebin_applied: state.rebin_applied,
         })
     }
 
@@ -181,6 +193,10 @@ impl SessionCache {
                 delta_l_m: self.resolution_delta_l_m,
             }
         };
+
+        // Restore rebin state
+        state.rebin_factor = self.rebin_factor;
+        state.rebin_applied = self.rebin_applied;
 
         // Rebuild pipeline
         state.rebuild_pipeline();
