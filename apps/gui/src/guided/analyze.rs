@@ -1094,11 +1094,12 @@ fn fit_roi(state: &mut AppState) {
     let avg_t: Vec<f64> = sum_t
         .iter()
         .zip(sum_w.iter())
-        .map(|(&s, &w)| if w > 0.0 { s / w } else { f64::NAN })
+        .map(|(&s, &w)| if w > 0.0 { s / w } else { 0.0 })
         .collect();
+    // Bins with no valid pixels get negligible weight so the fitter ignores them.
     let sigma: Vec<f64> = sum_w
         .iter()
-        .map(|&w| if w > 0.0 { 1.0 / w.sqrt() } else { f64::NAN })
+        .map(|&w| if w > 0.0 { 1.0 / w.sqrt() } else { 1.0e30 })
         .collect();
 
     let enabled_symbols: Vec<String> = state
