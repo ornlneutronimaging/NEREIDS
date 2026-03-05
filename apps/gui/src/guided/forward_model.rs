@@ -20,8 +20,8 @@ pub fn forward_model_step(ui: &mut egui::Ui, state: &mut AppState) {
         design::content_header(ui, "Forward Model", "Simulated transmission");
     });
     ui.horizontal(|ui| {
-        teleport_pill(ui, "← Configure", GuidedStep::Configure, state);
-        teleport_pill(ui, "Analyze →", GuidedStep::Analyze, state);
+        design::teleport_pill(ui, "← Configure", GuidedStep::Configure, state);
+        design::teleport_pill(ui, "Analyze →", GuidedStep::Analyze, state);
         ui.separator();
         // Sync buttons (disabled during active ENDF fetches to prevent index corruption)
         ui.add_enabled_ui(!state.is_fetching_fm_endf, |ui| {
@@ -163,7 +163,7 @@ pub(crate) fn fm_isotopes_card(ui: &mut egui::Ui, state: &mut AppState) {
     let isotope_locked = state.is_fetching_fm_endf;
 
     // Card header: Library + Temperature inline
-    let lib_label = library_name(state.fm_endf_library);
+    let lib_label = design::library_name(state.fm_endf_library);
     let header = format!(
         "Isotopes  \u{2014}  {lib_label}  T={:.0}K",
         state.fm_temperature_k
@@ -175,7 +175,7 @@ pub(crate) fn fm_isotopes_card(ui: &mut egui::Ui, state: &mut AppState) {
             ui.horizontal(|ui| {
                 ui.label("Library:");
                 egui::ComboBox::from_id_salt("fm_endf_lib")
-                    .selected_text(library_name(state.fm_endf_library))
+                    .selected_text(design::library_name(state.fm_endf_library))
                     .show_ui(ui, |ui| {
                         for (val, label) in [
                             (EndfLibrary::EndfB8_0, "ENDF/B-VIII.0"),
@@ -491,15 +491,6 @@ pub(crate) fn fm_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
         });
 }
 
-pub(crate) fn library_name(lib: EndfLibrary) -> &'static str {
-    match lib {
-        EndfLibrary::EndfB8_0 => "ENDF/B-VIII.0",
-        EndfLibrary::EndfB8_1 => "ENDF/B-VIII.1",
-        EndfLibrary::Jeff3_3 => "JEFF-3.3",
-        EndfLibrary::Jendl5 => "JENDL-5",
-    }
-}
-
 pub(crate) fn fm_fetch_endf_data(state: &mut AppState) {
     use nereids_core::types::Isotope;
     use nereids_endf::retrieval;
@@ -576,18 +567,4 @@ pub(crate) fn fm_fetch_endf_data(state: &mut AppState) {
             });
         }
     });
-}
-
-fn teleport_pill(ui: &mut egui::Ui, label: &str, target: GuidedStep, state: &mut AppState) {
-    let accent = crate::theme::ThemeColors::from_ctx(ui.ctx()).accent;
-    let btn = egui::Button::new(
-        egui::RichText::new(label)
-            .small()
-            .color(egui::Color32::WHITE),
-    )
-    .fill(accent)
-    .corner_radius(12.0);
-    if ui.add(btn).clicked() {
-        state.guided_step = target;
-    }
 }

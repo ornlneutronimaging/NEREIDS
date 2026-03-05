@@ -51,7 +51,7 @@ pub fn analyze_step(ui: &mut egui::Ui, state: &mut AppState) {
     ui.horizontal(|ui| {
         ui.heading("Analyze");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            teleport_pill(ui, "← Forward Model", GuidedStep::ForwardModel, state);
+            design::teleport_pill(ui, "← Forward Model", GuidedStep::ForwardModel, state);
         });
     });
     ui.separator();
@@ -1182,18 +1182,4 @@ pub fn run_spatial_map(state: &mut AppState) {
             }
         }
     });
-}
-
-fn teleport_pill(ui: &mut egui::Ui, label: &str, target: GuidedStep, state: &mut AppState) {
-    let accent = crate::theme::ThemeColors::from_ctx(ui.ctx()).accent;
-    let btn = egui::Button::new(
-        egui::RichText::new(label)
-            .small()
-            .color(egui::Color32::WHITE),
-    )
-    .fill(accent)
-    .corner_radius(12.0);
-    if ui.add(btn).clicked() {
-        state.guided_step = target;
-    }
 }

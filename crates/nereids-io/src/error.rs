@@ -2,6 +2,7 @@
 
 /// Errors that can occur during I/O operations.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum IoError {
     /// File not found or could not be opened.
     #[error("File not found: {0}: {1}")]

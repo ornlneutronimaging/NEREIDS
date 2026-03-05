@@ -96,7 +96,7 @@ impl SessionCache {
                     enabled: e.enabled,
                 })
                 .collect(),
-            endf_library_name: endf_library_name(state.endf_library).to_string(),
+            endf_library_name: crate::widgets::design::library_name(state.endf_library).to_string(),
             solver_method: match state.solver_method {
                 SolverMethod::LevenbergMarquardt => CachedSolverMethod::LevenbergMarquardt,
                 SolverMethod::PoissonKL => CachedSolverMethod::PoissonKL,
@@ -205,17 +205,6 @@ impl SessionCache {
         } else {
             format!("{fitting} + {data}")
         }
-    }
-}
-
-/// Map an EndfLibrary variant to its display name for persistence.
-fn endf_library_name(lib: nereids_endf::retrieval::EndfLibrary) -> &'static str {
-    use nereids_endf::retrieval::EndfLibrary;
-    match lib {
-        EndfLibrary::EndfB8_0 => "ENDF/B-VIII.0",
-        EndfLibrary::EndfB8_1 => "ENDF/B-VIII.1",
-        EndfLibrary::Jeff3_3 => "JEFF-3.3",
-        EndfLibrary::Jendl5 => "JENDL-5",
     }
 }
 
