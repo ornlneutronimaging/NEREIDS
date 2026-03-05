@@ -333,6 +333,10 @@ pub fn show_density_overlay(
         ui.label("(empty image)");
         return (None, egui::Rect::NOTHING);
     }
+    if density.shape() != preview.shape() {
+        ui.label("(density/preview shape mismatch)");
+        return (None, egui::Rect::NOTHING);
+    }
 
     // Compute ranges for preview (grayscale) and density (colormap)
     let (p_min, p_max) = data_range(preview);
