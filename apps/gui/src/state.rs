@@ -561,6 +561,8 @@ pub struct AppState {
     // -- HDF5/NeXus --
     pub hdf5_path: Option<PathBuf>,
     pub nexus_metadata: Option<NexusMetadata>,
+    /// Inline error message from NeXus probe (shown in red below metadata).
+    pub nexus_probe_error: Option<String>,
     pub event_n_bins: usize,
     pub event_tof_min_us: f64,
     pub event_tof_max_us: f64,
@@ -1094,6 +1096,7 @@ impl Default for AppState {
 
             hdf5_path: None,
             nexus_metadata: None,
+            nexus_probe_error: None,
             event_n_bins: 500,
             event_tof_min_us: 1000.0,
             event_tof_max_us: 20000.0,

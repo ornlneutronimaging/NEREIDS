@@ -378,6 +378,7 @@ fn hdf5_drop_zone(ui: &mut egui::Ui, state: &mut AppState) {
         state.sample_data = None;
         state.open_beam_data = None;
         state.load_error = false;
+        state.nexus_probe_error = None;
 
         // Probe the file immediately
         match nereids_io::nexus::probe_nexus(&file) {
@@ -387,10 +388,12 @@ fn hdf5_drop_zone(ui: &mut egui::Ui, state: &mut AppState) {
                     state.event_width = shape[2];
                 }
                 state.nexus_metadata = Some(meta);
+                state.nexus_probe_error = None;
                 state.status_message = "NeXus file probed".into();
             }
             Err(e) => {
                 state.nexus_metadata = None;
+                state.nexus_probe_error = Some(format!("Probe failed: {e}"));
                 state.status_message = format!("Probe failed: {e}");
             }
         }
@@ -403,8 +406,15 @@ fn hdf5_drop_zone(ui: &mut egui::Ui, state: &mut AppState) {
     }
 }
 
-/// Display probed NeXus metadata.
+/// Display probed NeXus metadata (or inline probe error).
 fn show_nexus_metadata(ui: &mut egui::Ui, state: &AppState) {
+    // Show probe error inline in red
+    if let Some(ref err) = state.nexus_probe_error {
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new(err).size(11.0).color(crate::theme::semantic::RED));
+        return;
+    }
+
     if let Some(ref meta) = state.nexus_metadata {
         let tc = ThemeColors::from_ctx(ui.ctx());
         ui.add_space(4.0);
