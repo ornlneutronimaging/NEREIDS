@@ -86,7 +86,11 @@ pub fn analyze_step(ui: &mut egui::Ui, state: &mut AppState) {
             egui::vec2(image_width, ui.available_height().max(400.0)),
             egui::Layout::top_down(egui::Align::LEFT),
             |ui| {
-                image_panel(ui, state);
+                egui::ScrollArea::vertical()
+                    .id_salt("analyze_images")
+                    .show(ui, |ui| {
+                        image_panel(ui, state);
+                    });
             },
         );
 

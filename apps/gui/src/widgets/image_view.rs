@@ -434,7 +434,9 @@ pub fn show_density_overlay(
         .load_texture(tex_id, image, egui::TextureOptions::NEAREST);
 
     let available_width = ui.available_width().min(512.0);
-    let scale = available_width / width as f32;
+    let scale_w = available_width / width as f32;
+    let scale_h = ui.available_height().min(512.0) / height as f32;
+    let scale = scale_w.min(scale_h).max(0.5); // never shrink below 0.5px/texel
     let display_size = egui::Vec2::new(width as f32 * scale, height as f32 * scale);
 
     let (response, painter) = ui.allocate_painter(display_size, egui::Sense::click());
@@ -526,7 +528,9 @@ fn prepare_image_painter(
         .load_texture(tex_id, image, egui::TextureOptions::NEAREST);
 
     let available_width = ui.available_width().min(512.0);
-    let scale = available_width / width as f32;
+    let scale_w = available_width / width as f32;
+    let scale_h = ui.available_height().min(512.0) / height as f32;
+    let scale = scale_w.min(scale_h).max(0.5); // never shrink below 0.5px/texel
     let display_size = egui::Vec2::new(width as f32 * scale, height as f32 * scale);
 
     let (response, painter) = ui.allocate_painter(display_size, sense);
