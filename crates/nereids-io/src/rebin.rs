@@ -69,9 +69,9 @@ pub fn rebin_transmission(data: &Array3<f64>, factor: usize) -> Array3<f64> {
 /// Input: N+1 edges for N bins.
 /// Output: ceil(N/factor)+1 edges for ceil(N/factor) bins.
 ///
-/// Returns the original edges unchanged if `factor <= 1`.
+/// Returns the original edges unchanged if `factor < 2`.
 pub fn rebin_edges(edges: &[f64], factor: usize) -> Vec<f64> {
-    if factor <= 1 || edges.len() <= 1 {
+    if factor < 2 || edges.len() <= 1 {
         return edges.to_vec();
     }
     let mut out: Vec<f64> = edges.iter().step_by(factor).copied().collect();
@@ -84,9 +84,9 @@ pub fn rebin_edges(edges: &[f64], factor: usize) -> Vec<f64> {
 
 /// Rebin bin centers by averaging each group of `factor` centers.
 ///
-/// Returns the original centers unchanged if `factor <= 1`.
+/// Returns the original centers unchanged if `factor < 2`.
 pub fn rebin_centers(centers: &[f64], factor: usize) -> Vec<f64> {
-    if factor <= 1 || centers.is_empty() {
+    if factor < 2 || centers.is_empty() {
         return centers.to_vec();
     }
     centers
@@ -233,5 +233,17 @@ mod tests {
         assert!(rebinned[[0, 0, 0]].is_nan());
         // Group [2, 3] → mean = 2.5
         assert!((rebinned[[1, 0, 0]] - 2.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn edges_factor_zero_returns_clone() {
+        let edges = vec![0.0, 1.0, 2.0, 3.0];
+        assert_eq!(rebin_edges(&edges, 0), edges);
+    }
+
+    #[test]
+    fn centers_factor_zero_returns_clone() {
+        let centers = vec![0.5, 1.5, 2.5];
+        assert_eq!(rebin_centers(&centers, 0), centers);
     }
 }

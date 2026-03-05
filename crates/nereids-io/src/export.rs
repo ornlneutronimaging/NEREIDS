@@ -11,9 +11,13 @@ fn escape_md_cell(s: &str) -> String {
     s.replace('|', "\\|").replace('\n', " ")
 }
 
-/// Export a single density map as a 64-bit float TIFF file.
+/// Export a single density map as a 32-bit float TIFF file.
 ///
-/// Each pixel stores the raw f64 density value (atoms/barn).
+/// Each pixel stores the density value (atoms/barn) as f32.  We use
+/// 32-bit rather than 64-bit floats because most image viewers
+/// (Preview, GIMP, ImageJ, Fiji) cannot open 64-bit float TIFFs.
+/// The f64→f32 conversion is lossless for the ~7 significant digits
+/// that density values typically carry.
 pub fn export_density_tiff(path: &Path, data: &Array2<f64>, label: &str) -> Result<(), IoError> {
     let filename = path.join(format!("{label}_density.tiff"));
     let file = std::fs::File::create(&filename)
@@ -23,10 +27,11 @@ pub fn export_density_tiff(path: &Path, data: &Array2<f64>, label: &str) -> Resu
 
     let (height, width) = (data.shape()[0] as u32, data.shape()[1] as u32);
 
-    // tiff encoder expects a contiguous row-major slice
-    let pixels: Vec<f64> = data.iter().copied().collect();
+    // tiff encoder expects a contiguous row-major slice; cast to f32
+    // for broad viewer compatibility.
+    let pixels: Vec<f32> = data.iter().map(|&v| v as f32).collect();
     encoder
-        .write_image::<tiff::encoder::colortype::Gray64Float>(width, height, &pixels)
+        .write_image::<tiff::encoder::colortype::Gray32Float>(width, height, &pixels)
         .map_err(|e| IoError::TiffEncode(e.to_string()))?;
 
     Ok(())
