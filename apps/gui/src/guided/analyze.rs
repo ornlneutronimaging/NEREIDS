@@ -745,8 +745,13 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
         .get(state.analyze_tof_slice_index.min(n_plot.saturating_sub(1)))
         .copied();
 
+    // Reserve space below the plot for the fit-result summary so it
+    // doesn't get clipped at the column bottom.
+    let plot_height = (ui.available_height() - 100.0).max(200.0);
+
     // Plot
     Plot::new("spectrum_plot")
+        .height(plot_height)
         .x_axis_label(x_label)
         .y_axis_label("Transmission")
         .legend(egui_plot::Legend::default())
