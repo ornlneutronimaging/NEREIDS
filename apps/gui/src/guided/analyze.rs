@@ -1011,22 +1011,8 @@ fn fit_roi(state: &mut AppState) {
         None => return,
     };
 
-    let roi = match state.bounding_roi() {
-        Some(r) => r,
-        None => {
-            let msg = "No ROI defined".to_string();
-            state.last_fit_feedback = Some(crate::state::FitFeedback {
-                success: false,
-                summary: msg.clone(),
-                densities: vec![],
-            });
-            state.status_message = msg;
-            return;
-        }
-    };
-
-    if roi.y_start >= roi.y_end || roi.x_start >= roi.x_end {
-        let msg = "Invalid ROI: start must be less than end".to_string();
+    if state.rois.is_empty() {
+        let msg = "No ROI defined".to_string();
         state.last_fit_feedback = Some(crate::state::FitFeedback {
             success: false,
             summary: msg.clone(),
@@ -1037,8 +1023,33 @@ fn fit_roi(state: &mut AppState) {
     }
 
     let shape = norm.transmission.shape();
-    if roi.y_end > shape[1] || roi.x_end > shape[2] {
-        let msg = "ROI exceeds image dimensions".to_string();
+    let (n_tof, height, width) = (shape[0], shape[1], shape[2]);
+
+    // Build union mask: average transmission across all pixels inside any ROI
+    let mut sum_t = vec![0.0f64; n_tof];
+    let mut sum_w = vec![0.0f64; n_tof]; // inverse-variance weights
+    let mut n_pixels = 0usize;
+
+    for y in 0..height {
+        for x in 0..width {
+            if !state.rois.iter().any(|r| r.contains(y, x)) {
+                continue;
+            }
+            n_pixels += 1;
+            for t in 0..n_tof {
+                let val = norm.transmission[[t, y, x]];
+                let sig = norm.uncertainty[[t, y, x]];
+                if val.is_finite() && sig.is_finite() && sig > 0.0 {
+                    let w = 1.0 / (sig * sig);
+                    sum_t[t] += val * w;
+                    sum_w[t] += w;
+                }
+            }
+        }
+    }
+
+    if n_pixels == 0 {
+        let msg = "No valid pixels in ROI".to_string();
         state.last_fit_feedback = Some(crate::state::FitFeedback {
             success: false,
             summary: msg.clone(),
@@ -1048,6 +1059,17 @@ fn fit_roi(state: &mut AppState) {
         return;
     }
 
+    // Weighted average transmission and propagated uncertainty
+    let avg_t: Vec<f64> = sum_t
+        .iter()
+        .zip(sum_w.iter())
+        .map(|(&s, &w)| if w > 0.0 { s / w } else { 1.0 })
+        .collect();
+    let sigma: Vec<f64> = sum_w
+        .iter()
+        .map(|&w| if w > 0.0 { 1.0 / w.sqrt() } else { 1.0 })
+        .collect();
+
     let enabled_symbols: Vec<String> = state
         .isotope_entries
         .iter()
@@ -1055,13 +1077,7 @@ fn fit_roi(state: &mut AppState) {
         .map(|e| e.symbol.clone())
         .collect();
 
-    let result = match nereids_pipeline::spatial::fit_roi(
-        norm.transmission.view(),
-        norm.uncertainty.view(),
-        roi.y_start..roi.y_end,
-        roi.x_start..roi.x_end,
-        &config,
-    ) {
+    let result = match nereids_pipeline::pipeline::fit_spectrum(&avg_t, &sigma, &config) {
         Ok(r) => r,
         Err(e) => {
             let msg = format!("ROI fit error: {e}");
@@ -1077,17 +1093,17 @@ fn fit_roi(state: &mut AppState) {
 
     let summary = if result.converged {
         format!(
-            "ROI fit converged, \u{03C7}\u{00B2}\u{1D63} = {:.4}",
+            "ROI fit ({n_pixels} px) converged, \u{03C7}\u{00B2}\u{1D63} = {:.4}",
             result.reduced_chi_squared
         )
     } else {
-        "ROI fit did NOT converge".to_string()
+        format!("ROI fit ({n_pixels} px) did NOT converge")
     };
 
     let densities: Vec<(String, f64)> = enabled_symbols
         .iter()
         .zip(result.densities.iter())
-        .map(|(s, &d)| (s.clone(), d))
+        .map(|(s, d)| (s.clone(), *d))
         .collect();
 
     state.last_fit_feedback = Some(crate::state::FitFeedback {

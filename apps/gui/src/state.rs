@@ -711,6 +711,13 @@ pub struct RoiSelection {
     pub x_end: usize,
 }
 
+impl RoiSelection {
+    /// Check whether pixel (y, x) falls inside this ROI rectangle.
+    pub fn contains(&self, y: usize, x: usize) -> bool {
+        y >= self.y_start && y < self.y_end && x >= self.x_start && x < self.x_end
+    }
+}
+
 /// Active tab in the main view area.
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum Tab {
