@@ -16,8 +16,8 @@ fn escape_md_cell(s: &str) -> String {
 /// Each pixel stores the density value (atoms/barn) as f32.  We use
 /// 32-bit rather than 64-bit floats because most image viewers
 /// (Preview, GIMP, ImageJ, Fiji) cannot open 64-bit float TIFFs.
-/// The f64→f32 conversion is lossless for the ~7 significant digits
-/// that density values typically carry.
+/// The f64→f32 conversion preserves roughly 7 significant digits of
+/// precision, which is sufficient for typical density values.
 pub fn export_density_tiff(path: &Path, data: &Array2<f64>, label: &str) -> Result<(), IoError> {
     let filename = path.join(format!("{label}_density.tiff"));
     let file = std::fs::File::create(&filename)
