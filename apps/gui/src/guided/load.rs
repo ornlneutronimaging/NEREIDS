@@ -396,7 +396,6 @@ fn hdf5_drop_zone(ui: &mut egui::Ui, state: &mut AppState) {
                     state.event_width = shape[2];
                 }
                 state.nexus_metadata = Some(meta);
-                state.nexus_probe_error = None;
                 state.status_message = "NeXus file probed".into();
             }
             Err(e) => {

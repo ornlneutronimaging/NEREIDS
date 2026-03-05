@@ -1094,11 +1094,11 @@ fn fit_roi(state: &mut AppState) {
     let avg_t: Vec<f64> = sum_t
         .iter()
         .zip(sum_w.iter())
-        .map(|(&s, &w)| if w > 0.0 { s / w } else { 1.0 })
+        .map(|(&s, &w)| if w > 0.0 { s / w } else { f64::NAN })
         .collect();
     let sigma: Vec<f64> = sum_w
         .iter()
-        .map(|&w| if w > 0.0 { 1.0 / w.sqrt() } else { 1.0 })
+        .map(|&w| if w > 0.0 { 1.0 / w.sqrt() } else { f64::NAN })
         .collect();
 
     let enabled_symbols: Vec<String> = state

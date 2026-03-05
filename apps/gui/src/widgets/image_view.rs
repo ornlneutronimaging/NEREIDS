@@ -442,12 +442,13 @@ pub fn show_density_overlay(
         let scale_h = available_height / height as f32;
         scale_w.min(scale_h)
     }
-    .max(0.5);
+    .max(available_width / width.max(1) as f32); // never exceed available width
     let display_size = egui::Vec2::new(width as f32 * scale, height as f32 * scale);
 
     let (response, painter) = ui.allocate_painter(display_size, egui::Sense::click());
     // Center within allocation to preserve aspect ratio (see prepare_image_painter).
-    let image_rect = egui::Rect::from_center_size(response.rect.center(), display_size);
+    let image_rect =
+        egui::Rect::from_center_size(response.rect.center(), display_size).intersect(response.rect);
     painter.image(
         texture.id(),
         image_rect,
@@ -545,14 +546,15 @@ fn prepare_image_painter(
         let scale_h = available_height / height as f32;
         scale_w.min(scale_h)
     }
-    .max(0.5); // never shrink below 0.5px/texel
+    .max(available_width / width.max(1) as f32); // never exceed available width
     let display_size = egui::Vec2::new(width as f32 * scale, height as f32 * scale);
 
     let (response, painter) = ui.allocate_painter(display_size, sense);
     // egui column layouts may stretch the allocated rect wider than
     // display_size.  Center the image within the allocation to
     // preserve the data's aspect ratio.
-    let image_rect = egui::Rect::from_center_size(response.rect.center(), display_size);
+    let image_rect =
+        egui::Rect::from_center_size(response.rect.center(), display_size).intersect(response.rect);
     painter.image(
         texture.id(),
         image_rect,

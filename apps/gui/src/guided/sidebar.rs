@@ -277,11 +277,11 @@ fn collapsed_step_badge(
         .response;
 
     let resp = resp.interact(Sense::click());
-    resp.clone().on_hover_text(&tooltip);
     if resp.clicked() {
         state.guided_step = step;
         state.status_message = String::new();
     }
+    resp.on_hover_text(&tooltip);
 }
 
 /// Collapsed tool badge: icon-only circle with tooltip.
@@ -330,11 +330,11 @@ fn collapsed_tool_badge(
         .response;
 
     let resp = resp.interact(Sense::click());
-    resp.clone().on_hover_text(title);
     if resp.clicked() {
         state.guided_step = step;
         state.status_message = String::new();
     }
+    resp.on_hover_text(title);
 }
 
 /// Render the provenance history popup window (call from top-level update).
