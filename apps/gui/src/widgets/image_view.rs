@@ -261,6 +261,19 @@ pub fn show_image_with_roi_editor(
         ui.data_mut(|d| d.remove::<RoiDragMode>(drag_id));
     }
 
+    // Shift+click (no drag) → select/deselect ROI
+    if shift_held
+        && response.clicked()
+        && let Some(pos) = response.interact_pointer_pos()
+    {
+        let (py, px) = screen_to_pixel(pos, image_rect, dims);
+        if let Some(hit_idx) = hit_test_rois(py, px, rois) {
+            result = RoiEditorResult::Selected(hit_idx);
+        } else {
+            result = RoiEditorResult::Deselected;
+        }
+    }
+
     // Plain click (no Shift) → select pixel
     if !shift_held
         && response.clicked()
@@ -347,7 +360,11 @@ pub fn show_density_overlay(
         return (None, egui::Rect::NOTHING);
     }
     if density.shape() != preview.shape() {
-        ui.label("(density/preview shape mismatch)");
+        ui.label(format!(
+            "(density/preview shape mismatch: {:?} vs {:?})",
+            density.shape(),
+            preview.shape()
+        ));
         return (None, egui::Rect::NOTHING);
     }
 

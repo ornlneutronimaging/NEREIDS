@@ -694,7 +694,7 @@ pub struct IsotopeEntry {
 }
 
 /// ROI rectangle in pixel coordinates.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct RoiSelection {
     pub y_start: usize,
     pub y_end: usize,

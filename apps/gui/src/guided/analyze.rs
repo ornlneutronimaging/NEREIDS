@@ -397,7 +397,13 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
                     format!("ROI #{} deleted", idx + 1),
                 );
                 state.rois.remove(idx);
-                state.selected_roi = None;
+                // Adjust selection: if deleted ROI was selected, clear.
+                // If a higher-indexed ROI was selected, shift down.
+                state.selected_roi = match state.selected_roi {
+                    Some(s) if s == idx => None,
+                    Some(s) if s > idx => Some(s - 1),
+                    other => other,
+                };
                 clear_analyze_downstream(state);
             }
             if ui
@@ -421,6 +427,11 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 );
             }
         });
+        ui.label(
+            egui::RichText::new("Click to select pixel · Shift+drag to draw ROI")
+                .small()
+                .weak(),
+        );
     }
 
     // Show selected pixel coordinates as feedback
