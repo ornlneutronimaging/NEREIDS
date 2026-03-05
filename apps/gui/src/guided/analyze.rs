@@ -59,10 +59,13 @@ pub fn analyze_step(ui: &mut egui::Ui, state: &mut AppState) {
     let available_width = ui.available_width();
     let controls_width = 220.0_f32.min(available_width * 0.2);
 
+    // Reserve height for nav buttons (~40px) below the 3-column region.
+    let col_height = (ui.available_height() - 40.0).max(300.0);
+
     ui.horizontal(|ui| {
-        // Column 1: fit controls (scrollable, with min height to avoid clipping)
+        // Column 1: fit controls (scrollable — content can exceed viewport)
         ui.allocate_ui_with_layout(
-            egui::vec2(controls_width, ui.available_height().max(400.0)),
+            egui::vec2(controls_width, col_height),
             egui::Layout::top_down(egui::Align::LEFT),
             |ui| {
                 egui::ScrollArea::vertical()
@@ -82,16 +85,13 @@ pub fn analyze_step(ui: &mut egui::Ui, state: &mut AppState) {
         let image_width = remaining * 0.45;
         let spectrum_width = remaining * 0.55;
 
-        // Column 2: image viewer (map or preview, clickable)
+        // Column 2: image viewer (NO ScrollArea — image uses available_height
+        // to fill the column vertically instead of floating in the top half).
         ui.allocate_ui_with_layout(
-            egui::vec2(image_width, ui.available_height().max(400.0)),
+            egui::vec2(image_width, col_height),
             egui::Layout::top_down(egui::Align::LEFT),
             |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("analyze_images")
-                    .show(ui, |ui| {
-                        image_panel(ui, state);
-                    });
+                image_panel(ui, state);
             },
         );
 
@@ -99,7 +99,7 @@ pub fn analyze_step(ui: &mut egui::Ui, state: &mut AppState) {
 
         // Column 3: spectrum + results
         ui.allocate_ui_with_layout(
-            egui::vec2(spectrum_width, ui.available_height().max(400.0)),
+            egui::vec2(spectrum_width, col_height),
             egui::Layout::top_down(egui::Align::LEFT),
             |ui| {
                 spectrum_panel(ui, state);

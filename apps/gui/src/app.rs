@@ -90,18 +90,16 @@ impl eframe::App for NereidsApp {
                 guided::sidebar::guided_sidebar(ctx, &mut self.state);
                 guided::sidebar::history_window(ctx, &mut self.state);
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    // Analyze and Results need the real viewport height
-                    // (ScrollArea makes available_height() return infinity).
-                    let needs_scroll = !matches!(
-                        self.state.guided_step,
-                        GuidedStep::Analyze | GuidedStep::Results
-                    );
-                    if needs_scroll {
+                    // Analyze needs the real viewport height so its image
+                    // column can fill vertically (ScrollArea makes
+                    // available_height() return infinity). All other steps
+                    // use ScrollArea for overflowing content.
+                    if self.state.guided_step == GuidedStep::Analyze {
+                        guided::guided_content(ui, &mut self.state);
+                    } else {
                         egui::ScrollArea::vertical().show(ui, |ui| {
                             guided::guided_content(ui, &mut self.state);
                         });
-                    } else {
-                        guided::guided_content(ui, &mut self.state);
                     }
                 });
             }
