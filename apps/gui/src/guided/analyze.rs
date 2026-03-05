@@ -69,6 +69,7 @@ pub fn analyze_step(ui: &mut egui::Ui, state: &mut AppState) {
                     .id_salt("analyze_controls")
                     .show(ui, |ui| {
                         fit_controls(ui, state);
+                        convergence_summary(ui, state);
                     });
             },
         );
@@ -266,6 +267,26 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
     }
 }
 
+/// Small convergence map + summary, shown in the controls column after spatial map.
+fn convergence_summary(ui: &mut egui::Ui, state: &AppState) {
+    let result = match state.spatial_result {
+        Some(ref r) => r,
+        None => return,
+    };
+
+    ui.add_space(12.0);
+    ui.label(egui::RichText::new("Convergence").strong());
+    let conv_f64 = result.converged_map.mapv(|b| if b { 1.0 } else { 0.0 });
+    let _ = show_viridis_image(ui, &conv_f64, "conv_tex");
+    ui.label(
+        egui::RichText::new(format!(
+            "{}/{} converged",
+            result.n_converged, result.n_total
+        ))
+        .size(11.0),
+    );
+}
+
 // ---- Image Panel (Column 2) ----
 
 /// Shows spatial result density maps if available, otherwise the preview image
@@ -310,17 +331,6 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
             state.pixel_fit_result = None;
             state.last_fit_feedback = None;
         }
-
-        ui.add_space(8.0);
-
-        ui.label("Convergence map:");
-        let conv_f64 = result.converged_map.mapv(|b| if b { 1.0 } else { 0.0 });
-        let _ = show_viridis_image(ui, &conv_f64, "conv_tex");
-
-        ui.label(format!(
-            "{}/{} pixels converged",
-            result.n_converged, result.n_total
-        ));
     } else if let Some(ref norm) = state.normalized {
         // -- TOF-sliced preview with interactive ROI editor --
         let n_tof = norm.transmission.shape()[0];
