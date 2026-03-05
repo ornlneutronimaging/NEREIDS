@@ -75,8 +75,9 @@ pub fn analyze_step(ui: &mut egui::Ui, state: &mut AppState) {
 
         ui.separator();
 
-        // Remaining width split between image and spectrum panels
-        let remaining = (available_width - controls_width - 20.0).max(200.0);
+        // Remaining width split between image and spectrum panels.
+        // Account for separators + item spacing + right-edge padding.
+        let remaining = (available_width - controls_width - 48.0).max(200.0);
         let image_width = remaining * 0.45;
         let spectrum_width = remaining * 0.55;
 
