@@ -86,16 +86,24 @@ impl ThemeColors {
 
 use crate::state::ThemePreference;
 
-/// Apply the theme to the egui context based on user preference.
-pub fn apply_theme(ctx: &egui::Context, preference: ThemePreference) {
-    let is_dark = match preference {
+/// Resolve the theme preference to a concrete dark/light boolean.
+///
+/// For `Auto`, uses the system theme if available, otherwise falls back
+/// to the current egui visuals.
+pub fn resolve_dark_mode(ctx: &egui::Context, preference: ThemePreference) -> bool {
+    match preference {
         ThemePreference::Dark => true,
         ThemePreference::Light => false,
         ThemePreference::Auto => match ctx.system_theme() {
             Some(theme) => theme == egui::Theme::Dark,
             None => ctx.style().visuals.dark_mode,
         },
-    };
+    }
+}
+
+/// Apply the theme to the egui context based on user preference.
+pub fn apply_theme(ctx: &egui::Context, preference: ThemePreference) {
+    let is_dark = resolve_dark_mode(ctx, preference);
 
     let colors = ThemeColors::from_dark_mode(is_dark);
     let mut visuals = if is_dark {

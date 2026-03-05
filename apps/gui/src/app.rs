@@ -39,8 +39,12 @@ impl eframe::App for NereidsApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Apply theme
-        theme::apply_theme(ctx, self.state.theme_preference);
+        // Apply theme (skip if unchanged to avoid 80+ color assignments per frame)
+        let resolved = theme::resolve_dark_mode(ctx, self.state.theme_preference);
+        if self.state.last_applied_dark_mode != Some(resolved) {
+            theme::apply_theme(ctx, self.state.theme_preference);
+            self.state.last_applied_dark_mode = Some(resolved);
+        }
 
         // Poll background tasks
         poll_pending_tasks(&mut self.state);

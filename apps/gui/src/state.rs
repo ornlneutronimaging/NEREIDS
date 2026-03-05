@@ -542,6 +542,8 @@ pub struct AppState {
     pub ui_mode: UiMode,
     pub guided_step: GuidedStep,
     pub theme_preference: ThemePreference,
+    /// Cached resolved dark-mode boolean; used to skip redundant `apply_theme`.
+    pub last_applied_dark_mode: Option<bool>,
     pub active_tab: Tab,
     pub status_message: String,
     pub is_fitting: bool,
@@ -1084,6 +1086,7 @@ impl Default for AppState {
             ui_mode: UiMode::Guided,
             guided_step: GuidedStep::Landing,
             theme_preference: ThemePreference::Auto,
+            last_applied_dark_mode: None,
             active_tab: Tab::Spectrum,
             status_message: "Ready".into(),
             is_fitting: false,
