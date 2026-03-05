@@ -124,6 +124,15 @@ fn poll_pending_tasks(state: &mut AppState) {
         }
     }
 
+    // Update fitting progress from the atomic counter (runs every frame,
+    // not just when Analyze is visible, so toolbar always shows fresh data).
+    if let Some(ref counter) = state.fitting_progress_counter {
+        let done = counter.load(std::sync::atomic::Ordering::Relaxed);
+        if let Some((_, total)) = state.fitting_progress {
+            state.fitting_progress = Some((done, total));
+        }
+    }
+
     // Poll ENDF fetch results (streamed one per isotope)
     if let Some(ref rx) = state.pending_endf {
         let mut disconnected = false;

@@ -5,9 +5,10 @@
 //! Prototype reference: `.prototypes/D_hybrid_v4.html` CSS §Cards & Forms,
 //! §Tabs, §Badges, §Content Area, §Toolbar, §Drop Zones.
 
-use crate::state::{EndfStatus, ResolutionMode};
+use crate::state::{AppState, EndfStatus, GuidedStep, ResolutionMode};
 use crate::theme::{ThemeColors, semantic};
 use egui::{Color32, CornerRadius, Margin, Rect, Response, RichText, Sense, Shadow, Stroke, Ui};
+use nereids_endf::retrieval::EndfLibrary;
 use nereids_physics::resolution::TabulatedResolution;
 use std::sync::Arc;
 
@@ -621,4 +622,30 @@ pub fn resolution_card(
     });
 
     ResolutionCardResult { changed }
+}
+
+// ── ENDF Library Name ──────────────────────────────────────────
+
+/// Map an `EndfLibrary` variant to its display name.
+pub fn library_name(lib: EndfLibrary) -> &'static str {
+    match lib {
+        EndfLibrary::EndfB8_0 => "ENDF/B-VIII.0",
+        EndfLibrary::EndfB8_1 => "ENDF/B-VIII.1",
+        EndfLibrary::Jeff3_3 => "JEFF-3.3",
+        EndfLibrary::Jendl5 => "JENDL-5",
+    }
+}
+
+// ── Teleport Pill ──────────────────────────────────────────────
+
+/// Accent-filled pill button that navigates to another guided step.
+pub fn teleport_pill(ui: &mut Ui, label: &str, target: GuidedStep, state: &mut AppState) {
+    let accent = ThemeColors::from_ctx(ui.ctx()).accent;
+    let btn = egui::Button::new(RichText::new(label).small().color(Color32::WHITE))
+        .fill(accent)
+        .corner_radius(12.0);
+    if ui.add(btn).clicked() {
+        state.status_message = String::new();
+        state.guided_step = target;
+    }
 }

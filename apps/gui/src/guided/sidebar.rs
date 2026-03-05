@@ -281,6 +281,7 @@ fn pipeline_step_row(
 
     if resp.interact(Sense::click()).clicked() {
         state.guided_step = step;
+        state.status_message = String::new();
     }
 }
 
@@ -401,6 +402,7 @@ fn tool_row(
 
     if resp.interact(Sense::click()).clicked() {
         state.guided_step = step;
+        state.status_message = String::new();
     }
 }
 

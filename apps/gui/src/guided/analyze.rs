@@ -51,7 +51,7 @@ pub fn analyze_step(ui: &mut egui::Ui, state: &mut AppState) {
     ui.horizontal(|ui| {
         ui.heading("Analyze");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            teleport_pill(ui, "← Forward Model", GuidedStep::ForwardModel, state);
+            design::teleport_pill(ui, "← Forward Model", GuidedStep::ForwardModel, state);
         });
     });
     ui.separator();
@@ -220,13 +220,9 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
     });
 
     if state.is_fitting {
-        if let Some(ref counter) = state.fitting_progress_counter {
-            let done = counter.load(Ordering::Relaxed);
-            if let Some((_, total)) = state.fitting_progress {
-                state.fitting_progress = Some((done, total));
-                let frac = done as f32 / total.max(1) as f32;
-                crate::widgets::design::progress_mini(ui, frac, &format!("{done}/{total} px"));
-            }
+        if let Some((done, total)) = state.fitting_progress {
+            let frac = done as f32 / total.max(1) as f32;
+            crate::widgets::design::progress_mini(ui, frac, &format!("{done}/{total} px"));
         } else {
             ui.spinner();
             ui.label("Fitting...");
@@ -1182,18 +1178,4 @@ pub fn run_spatial_map(state: &mut AppState) {
             }
         }
     });
-}
-
-fn teleport_pill(ui: &mut egui::Ui, label: &str, target: GuidedStep, state: &mut AppState) {
-    let accent = crate::theme::ThemeColors::from_ctx(ui.ctx()).accent;
-    let btn = egui::Button::new(
-        egui::RichText::new(label)
-            .small()
-            .color(egui::Color32::WHITE),
-    )
-    .fill(accent)
-    .corner_radius(12.0);
-    if ui.add(btn).clicked() {
-        state.guided_step = target;
-    }
 }

@@ -79,7 +79,7 @@ pub fn rebin_step(ui: &mut egui::Ui, state: &mut AppState) {
                 ui.add(
                     egui::DragValue::new(&mut state.rebin_factor)
                         .range(1..=n)
-                        .speed(1),
+                        .speed(0.2),
                 );
                 for &f in &[2, 4, 8] {
                     if f <= n

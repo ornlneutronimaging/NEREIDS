@@ -420,7 +420,7 @@ pub fn periodic_table_modal(ctx: &egui::Context, state: &mut AppState) {
                         .periodic_table_library
                         .get_or_insert(target_library(state));
                     egui::ComboBox::from_id_salt("pt_lib")
-                        .selected_text(library_name(*lib))
+                        .selected_text(super::design::library_name(*lib))
                         .show_ui(ui, |ui| {
                             for (val, label) in [
                                 (EndfLibrary::EndfB8_0, "ENDF/B-VIII.0"),
@@ -604,15 +604,6 @@ fn target_library(state: &AppState) -> EndfLibrary {
         PeriodicTableTarget::DetectMatrix | PeriodicTableTarget::DetectTrace => {
             state.detect_endf_library
         }
-    }
-}
-
-fn library_name(lib: EndfLibrary) -> &'static str {
-    match lib {
-        EndfLibrary::EndfB8_0 => "ENDF/B-VIII.0",
-        EndfLibrary::EndfB8_1 => "ENDF/B-VIII.1",
-        EndfLibrary::Jeff3_3 => "JEFF-3.3",
-        EndfLibrary::Jendl5 => "JENDL-5",
     }
 }
 

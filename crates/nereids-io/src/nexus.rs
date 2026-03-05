@@ -754,4 +754,39 @@ mod tests {
         assert!(meta.has_events);
         assert_eq!(meta.n_events, Some(3));
     }
+
+    #[test]
+    fn test_list_hdf5_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tree.h5");
+
+        // Create a file with nested groups and a dataset
+        {
+            let file = hdf5::File::create(&path).expect("create file");
+            let g1 = file.create_group("entry").expect("create entry");
+            let g2 = g1.create_group("histogram").expect("create histogram");
+            g2.new_dataset::<f64>()
+                .shape([3])
+                .create("data")
+                .expect("create data")
+                .write_raw(&[1.0, 2.0, 3.0])
+                .expect("write data");
+        }
+
+        let tree = list_hdf5_tree(&path, 10).unwrap();
+        assert!(!tree.is_empty());
+
+        // Check that we find the expected paths
+        let paths: Vec<&str> = tree.iter().map(|e| e.path.as_str()).collect();
+        assert!(paths.contains(&"/entry"));
+        assert!(paths.contains(&"/entry/histogram"));
+        assert!(paths.contains(&"/entry/histogram/data"));
+
+        // The dataset should have a shape
+        let data_entry = tree
+            .iter()
+            .find(|e| e.path == "/entry/histogram/data")
+            .unwrap();
+        assert!(data_entry.shape.is_some());
+    }
 }

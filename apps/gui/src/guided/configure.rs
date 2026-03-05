@@ -19,7 +19,7 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
             );
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-            teleport_pill(ui, "Forward Model →", GuidedStep::ForwardModel, state);
+            design::teleport_pill(ui, "Forward Model →", GuidedStep::ForwardModel, state);
         });
     });
 
@@ -88,7 +88,7 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_enabled_ui(!state.is_fetching_endf, |ui| {
                     egui::ComboBox::from_id_salt("endf_lib")
-                        .selected_text(library_name(state.endf_library))
+                        .selected_text(design::library_name(state.endf_library))
                         .show_ui(ui, |ui| {
                             ui.selectable_value(
                                 &mut state.endf_library,
@@ -308,15 +308,6 @@ fn density_edit_window(ui: &mut egui::Ui, state: &mut AppState) {
     }
 }
 
-fn library_name(lib: EndfLibrary) -> &'static str {
-    match lib {
-        EndfLibrary::EndfB8_0 => "ENDF/B-VIII.0",
-        EndfLibrary::EndfB8_1 => "ENDF/B-VIII.1",
-        EndfLibrary::Jeff3_3 => "JEFF-3.3",
-        EndfLibrary::Jendl5 => "JENDL-5",
-    }
-}
-
 fn fetch_endf_data(state: &mut AppState) {
     use nereids_core::types::Isotope;
     use nereids_endf::retrieval;
@@ -393,18 +384,4 @@ fn fetch_endf_data(state: &mut AppState) {
             });
         }
     });
-}
-
-fn teleport_pill(ui: &mut egui::Ui, label: &str, target: GuidedStep, state: &mut AppState) {
-    let accent = crate::theme::ThemeColors::from_ctx(ui.ctx()).accent;
-    let btn = egui::Button::new(
-        egui::RichText::new(label)
-            .small()
-            .color(egui::Color32::WHITE),
-    )
-    .fill(accent)
-    .corner_radius(12.0);
-    if ui.add(btn).clicked() {
-        state.guided_step = target;
-    }
 }
