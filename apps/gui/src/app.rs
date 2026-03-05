@@ -1,7 +1,9 @@
 //! Main application structure and egui App implementation.
 
 use crate::guided;
-use crate::state::{AppState, EndfStatus, ProvenanceEventKind, SessionCache, Tab, UiMode};
+use crate::state::{
+    AppState, EndfStatus, GuidedStep, ProvenanceEventKind, SessionCache, Tab, UiMode,
+};
 use crate::studio;
 use crate::theme;
 use crate::widgets;
@@ -15,6 +17,24 @@ const SESSION_CACHE_KEY: &str = "nereids_session_cache";
 
 impl NereidsApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // Load DejaVuSans as a fallback font for Unicode symbols (arrows, math, etc.)
+        // that egui's built-in font doesn't cover.
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert(
+            "dejavu".to_owned(),
+            std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+                "../assets/DejaVuSans.ttf"
+            ))),
+        );
+        // Append as fallback to Proportional — egui tries fonts in order,
+        // so the default font renders most glyphs and DejaVu fills the gaps.
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .push("dejavu".to_owned());
+        cc.egui_ctx.set_fonts(fonts);
+
         let mut state = AppState::default();
 
         // Restore cached session from previous run (if any)
@@ -39,8 +59,12 @@ impl eframe::App for NereidsApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Apply theme
-        theme::apply_theme(ctx, self.state.theme_preference);
+        // Apply theme (skip if unchanged to avoid 80+ color assignments per frame)
+        let resolved = theme::resolve_dark_mode(ctx, self.state.theme_preference);
+        if self.state.last_applied_dark_mode != Some(resolved) {
+            theme::apply_theme(ctx, self.state.theme_preference);
+            self.state.last_applied_dark_mode = Some(resolved);
+        }
 
         // Poll background tasks
         poll_pending_tasks(&mut self.state);
@@ -66,9 +90,17 @@ impl eframe::App for NereidsApp {
                 guided::sidebar::guided_sidebar(ctx, &mut self.state);
                 guided::sidebar::history_window(ctx, &mut self.state);
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
+                    // Analyze needs the real viewport height so its image
+                    // column can fill vertically (ScrollArea makes
+                    // available_height() return infinity). All other steps
+                    // use ScrollArea for overflowing content.
+                    if self.state.guided_step == GuidedStep::Analyze {
                         guided::guided_content(ui, &mut self.state);
-                    });
+                    } else {
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            guided::guided_content(ui, &mut self.state);
+                        });
+                    }
                 });
             }
             UiMode::Studio => {

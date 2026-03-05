@@ -49,6 +49,19 @@ pub struct SessionCache {
     pub resolution_delta_l_m: f64,
     /// Tabulated resolution file path (if applicable).
     pub resolution_path: Option<String>,
+    /// Energy rebin factor (1 = no rebinning).
+    #[serde(default = "default_rebin_factor")]
+    pub rebin_factor: usize,
+    /// Whether rebinning has been applied.
+    #[serde(default)]
+    pub rebin_applied: bool,
+    /// Whether the sidebar is collapsed (icon-only mode).
+    #[serde(default)]
+    pub sidebar_collapsed: bool,
+}
+
+fn default_rebin_factor() -> usize {
+    1
 }
 
 /// Serializable solver method for session cache.
@@ -117,6 +130,9 @@ impl SessionCache {
                 ResolutionMode::Tabulated { path, .. } => Some(path.to_string_lossy().to_string()),
                 _ => None,
             },
+            rebin_factor: state.rebin_factor,
+            rebin_applied: state.rebin_applied,
+            sidebar_collapsed: state.sidebar_collapsed,
         })
     }
 
@@ -181,6 +197,13 @@ impl SessionCache {
                 delta_l_m: self.resolution_delta_l_m,
             }
         };
+
+        // Restore rebin state
+        state.rebin_factor = self.rebin_factor;
+        state.rebin_applied = self.rebin_applied;
+
+        // Restore sidebar state
+        state.sidebar_collapsed = self.sidebar_collapsed;
 
         // Rebuild pipeline
         state.rebuild_pipeline();
@@ -373,7 +396,7 @@ impl ExportFormat {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Tiff => "TIFF (f64)",
+            Self::Tiff => "TIFF (f32)",
             Self::Hdf5 => "HDF5",
             Self::Markdown => "Markdown Report",
         }
@@ -542,6 +565,10 @@ pub struct AppState {
     pub ui_mode: UiMode,
     pub guided_step: GuidedStep,
     pub theme_preference: ThemePreference,
+    /// Cached resolved dark-mode boolean; used to skip redundant `apply_theme`.
+    pub last_applied_dark_mode: Option<bool>,
+    /// Whether the guided-mode sidebar is collapsed (icon-only mode).
+    pub sidebar_collapsed: bool,
     pub active_tab: Tab,
     pub status_message: String,
     pub is_fitting: bool,
@@ -559,6 +586,8 @@ pub struct AppState {
     // -- HDF5/NeXus --
     pub hdf5_path: Option<PathBuf>,
     pub nexus_metadata: Option<NexusMetadata>,
+    /// Inline error message from NeXus probe (shown in red below metadata).
+    pub nexus_probe_error: Option<String>,
     pub event_n_bins: usize,
     pub event_tof_min_us: f64,
     pub event_tof_max_us: f64,
@@ -689,6 +718,13 @@ pub struct RoiSelection {
     pub y_end: usize,
     pub x_start: usize,
     pub x_end: usize,
+}
+
+impl RoiSelection {
+    /// Check whether pixel (y, x) falls inside this ROI rectangle.
+    pub fn contains(&self, y: usize, x: usize) -> bool {
+        y >= self.y_start && y < self.y_end && x >= self.x_start && x < self.x_end
+    }
 }
 
 /// Active tab in the main view area.
@@ -1061,7 +1097,7 @@ impl Default for AppState {
 
             temperature_k: 296.0,
             lm_config: LmConfig::default(),
-            solver_method: SolverMethod::LevenbergMarquardt,
+            solver_method: SolverMethod::PoissonKL,
             fit_temperature: false,
             show_advanced_solver: false,
 
@@ -1084,6 +1120,8 @@ impl Default for AppState {
             ui_mode: UiMode::Guided,
             guided_step: GuidedStep::Landing,
             theme_preference: ThemePreference::Auto,
+            last_applied_dark_mode: None,
+            sidebar_collapsed: false,
             active_tab: Tab::Spectrum,
             status_message: "Ready".into(),
             is_fitting: false,
@@ -1091,6 +1129,7 @@ impl Default for AppState {
 
             hdf5_path: None,
             nexus_metadata: None,
+            nexus_probe_error: None,
             event_n_bins: 500,
             event_tof_min_us: 1000.0,
             event_tof_max_us: 20000.0,

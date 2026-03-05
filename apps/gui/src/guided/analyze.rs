@@ -59,30 +59,36 @@ pub fn analyze_step(ui: &mut egui::Ui, state: &mut AppState) {
     let available_width = ui.available_width();
     let controls_width = 220.0_f32.min(available_width * 0.2);
 
+    // Reserve height for nav buttons (~40px) below the 3-column region.
+    let col_height = (ui.available_height() - 40.0).max(300.0);
+
     ui.horizontal(|ui| {
-        // Column 1: fit controls (scrollable, with min height to avoid clipping)
+        // Column 1: fit controls (scrollable — content can exceed viewport)
         ui.allocate_ui_with_layout(
-            egui::vec2(controls_width, ui.available_height().max(400.0)),
+            egui::vec2(controls_width, col_height),
             egui::Layout::top_down(egui::Align::LEFT),
             |ui| {
                 egui::ScrollArea::vertical()
                     .id_salt("analyze_controls")
                     .show(ui, |ui| {
                         fit_controls(ui, state);
+                        convergence_summary(ui, state);
                     });
             },
         );
 
         ui.separator();
 
-        // Remaining width split between image and spectrum panels
-        let remaining = (available_width - controls_width - 20.0).max(200.0);
+        // Remaining width split between image and spectrum panels.
+        // Account for separators + item spacing + right-edge padding.
+        let remaining = (available_width - controls_width - 48.0).max(200.0);
         let image_width = remaining * 0.45;
         let spectrum_width = remaining * 0.55;
 
-        // Column 2: image viewer (map or preview, clickable)
+        // Column 2: image viewer (NO ScrollArea — image uses available_height
+        // to fill the column vertically instead of floating in the top half).
         ui.allocate_ui_with_layout(
-            egui::vec2(image_width, ui.available_height().max(400.0)),
+            egui::vec2(image_width, col_height),
             egui::Layout::top_down(egui::Align::LEFT),
             |ui| {
                 image_panel(ui, state);
@@ -93,7 +99,7 @@ pub fn analyze_step(ui: &mut egui::Ui, state: &mut AppState) {
 
         // Column 3: spectrum + results
         ui.allocate_ui_with_layout(
-            egui::vec2(spectrum_width, ui.available_height().max(400.0)),
+            egui::vec2(spectrum_width, col_height),
             egui::Layout::top_down(egui::Align::LEFT),
             |ui| {
                 spectrum_panel(ui, state);
@@ -261,6 +267,26 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
     }
 }
 
+/// Small convergence map + summary, shown in the controls column after spatial map.
+fn convergence_summary(ui: &mut egui::Ui, state: &AppState) {
+    let result = match state.spatial_result {
+        Some(ref r) => r,
+        None => return,
+    };
+
+    ui.add_space(12.0);
+    ui.label(egui::RichText::new("Convergence").strong());
+    let conv_f64 = result.converged_map.mapv(|b| if b { 1.0 } else { 0.0 });
+    let _ = show_viridis_image(ui, &conv_f64, "conv_tex");
+    ui.label(
+        egui::RichText::new(format!(
+            "{}/{} converged",
+            result.n_converged, result.n_total
+        ))
+        .size(11.0),
+    );
+}
+
 // ---- Image Panel (Column 2) ----
 
 /// Shows spatial result density maps if available, otherwise the preview image
@@ -270,18 +296,29 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
         // -- Density map display (read-only ROI overlay) --
         let n_isotopes = result.density_maps.len();
         if n_isotopes > 1 {
+            let current_name = state
+                .isotope_entries
+                .iter()
+                .filter(|e| e.enabled && e.resonance_data.is_some())
+                .nth(state.map_display_isotope.min(n_isotopes - 1))
+                .map(|e| e.symbol.as_str())
+                .unwrap_or("?");
             ui.horizontal(|ui| {
                 ui.label("Isotope:");
-                for i in 0..n_isotopes {
-                    let name = state
-                        .isotope_entries
-                        .iter()
-                        .filter(|e| e.enabled && e.resonance_data.is_some())
-                        .nth(i)
-                        .map(|e| e.symbol.as_str())
-                        .unwrap_or("?");
-                    ui.selectable_value(&mut state.map_display_isotope, i, name);
-                }
+                egui::ComboBox::from_id_salt("isotope_map_select")
+                    .selected_text(current_name)
+                    .show_ui(ui, |ui| {
+                        for i in 0..n_isotopes {
+                            let name = state
+                                .isotope_entries
+                                .iter()
+                                .filter(|e| e.enabled && e.resonance_data.is_some())
+                                .nth(i)
+                                .map(|e| e.symbol.as_str())
+                                .unwrap_or("?");
+                            ui.selectable_value(&mut state.map_display_isotope, i, name);
+                        }
+                    });
             });
         }
 
@@ -305,17 +342,6 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
             state.pixel_fit_result = None;
             state.last_fit_feedback = None;
         }
-
-        ui.add_space(8.0);
-
-        ui.label("Convergence map:");
-        let conv_f64 = result.converged_map.mapv(|b| if b { 1.0 } else { 0.0 });
-        let _ = show_viridis_image(ui, &conv_f64, "conv_tex");
-
-        ui.label(format!(
-            "{}/{} pixels converged",
-            result.n_converged, result.n_total
-        ));
     } else if let Some(ref norm) = state.normalized {
         // -- TOF-sliced preview with interactive ROI editor --
         let n_tof = norm.transmission.shape()[0];
@@ -719,8 +745,13 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
         .get(state.analyze_tof_slice_index.min(n_plot.saturating_sub(1)))
         .copied();
 
+    // Reserve space below the plot for the fit-result summary so it
+    // doesn't get clipped at the column bottom.
+    let plot_height = (ui.available_height() - 100.0).max(200.0);
+
     // Plot
     Plot::new("spectrum_plot")
+        .height(plot_height)
         .x_axis_label(x_label)
         .y_axis_label("Transmission")
         .legend(egui_plot::Legend::default())
@@ -1011,22 +1042,8 @@ fn fit_roi(state: &mut AppState) {
         None => return,
     };
 
-    let roi = match state.bounding_roi() {
-        Some(r) => r,
-        None => {
-            let msg = "No ROI defined".to_string();
-            state.last_fit_feedback = Some(crate::state::FitFeedback {
-                success: false,
-                summary: msg.clone(),
-                densities: vec![],
-            });
-            state.status_message = msg;
-            return;
-        }
-    };
-
-    if roi.y_start >= roi.y_end || roi.x_start >= roi.x_end {
-        let msg = "Invalid ROI: start must be less than end".to_string();
+    if state.rois.is_empty() {
+        let msg = "No ROI defined".to_string();
         state.last_fit_feedback = Some(crate::state::FitFeedback {
             success: false,
             summary: msg.clone(),
@@ -1037,8 +1054,33 @@ fn fit_roi(state: &mut AppState) {
     }
 
     let shape = norm.transmission.shape();
-    if roi.y_end > shape[1] || roi.x_end > shape[2] {
-        let msg = "ROI exceeds image dimensions".to_string();
+    let (n_tof, height, width) = (shape[0], shape[1], shape[2]);
+
+    // Build union mask: average transmission across all pixels inside any ROI
+    let mut sum_t = vec![0.0f64; n_tof];
+    let mut sum_w = vec![0.0f64; n_tof]; // inverse-variance weights
+    let mut n_pixels = 0usize;
+
+    for y in 0..height {
+        for x in 0..width {
+            if !state.rois.iter().any(|r| r.contains(y, x)) {
+                continue;
+            }
+            n_pixels += 1;
+            for t in 0..n_tof {
+                let val = norm.transmission[[t, y, x]];
+                let sig = norm.uncertainty[[t, y, x]];
+                if val.is_finite() && sig.is_finite() && sig > 0.0 {
+                    let w = 1.0 / (sig * sig);
+                    sum_t[t] += val * w;
+                    sum_w[t] += w;
+                }
+            }
+        }
+    }
+
+    if n_pixels == 0 {
+        let msg = "No valid pixels in ROI".to_string();
         state.last_fit_feedback = Some(crate::state::FitFeedback {
             success: false,
             summary: msg.clone(),
@@ -1048,6 +1090,18 @@ fn fit_roi(state: &mut AppState) {
         return;
     }
 
+    // Weighted average transmission and propagated uncertainty
+    let avg_t: Vec<f64> = sum_t
+        .iter()
+        .zip(sum_w.iter())
+        .map(|(&s, &w)| if w > 0.0 { s / w } else { 0.0 })
+        .collect();
+    // Bins with no valid pixels get negligible weight so the fitter ignores them.
+    let sigma: Vec<f64> = sum_w
+        .iter()
+        .map(|&w| if w > 0.0 { 1.0 / w.sqrt() } else { 1.0e30 })
+        .collect();
+
     let enabled_symbols: Vec<String> = state
         .isotope_entries
         .iter()
@@ -1055,13 +1109,7 @@ fn fit_roi(state: &mut AppState) {
         .map(|e| e.symbol.clone())
         .collect();
 
-    let result = match nereids_pipeline::spatial::fit_roi(
-        norm.transmission.view(),
-        norm.uncertainty.view(),
-        roi.y_start..roi.y_end,
-        roi.x_start..roi.x_end,
-        &config,
-    ) {
+    let result = match nereids_pipeline::pipeline::fit_spectrum(&avg_t, &sigma, &config) {
         Ok(r) => r,
         Err(e) => {
             let msg = format!("ROI fit error: {e}");
@@ -1077,17 +1125,17 @@ fn fit_roi(state: &mut AppState) {
 
     let summary = if result.converged {
         format!(
-            "ROI fit converged, \u{03C7}\u{00B2}\u{1D63} = {:.4}",
+            "ROI fit ({n_pixels} px) converged, \u{03C7}\u{00B2}\u{1D63} = {:.4}",
             result.reduced_chi_squared
         )
     } else {
-        "ROI fit did NOT converge".to_string()
+        format!("ROI fit ({n_pixels} px) did NOT converge")
     };
 
     let densities: Vec<(String, f64)> = enabled_symbols
         .iter()
         .zip(result.densities.iter())
-        .map(|(s, &d)| (s.clone(), d))
+        .map(|(s, d)| (s.clone(), *d))
         .collect();
 
     state.last_fit_feedback = Some(crate::state::FitFeedback {
