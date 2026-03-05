@@ -662,4 +662,104 @@ mod tests {
         let result = fit_roi(transmission.view(), uncertainty.view(), 2..2, 0..2, &config);
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_spatial_map_temperature_map() {
+        let data = u238_single_resonance();
+        let true_density = 0.0005;
+        let true_temp = 300.0;
+        let energies: Vec<f64> = (0..101).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let n_energies = energies.len();
+
+        // Generate synthetic spectrum at true temperature
+        let model = TransmissionFitModel::new(
+            energies.clone(),
+            vec![data.clone()],
+            true_temp,
+            None,
+            vec![0],
+            None,
+        )
+        .unwrap();
+        let spectrum = model.evaluate(&[true_density]);
+
+        // 2×2 image
+        let height = 2;
+        let width = 2;
+        let mut transmission = Array3::<f64>::zeros((n_energies, height, width));
+        let uncertainty = Array3::from_elem((n_energies, height, width), 0.01);
+        for y in 0..height {
+            for x in 0..width {
+                for e in 0..n_energies {
+                    transmission[[e, y, x]] = spectrum[e];
+                }
+            }
+        }
+
+        // Without fit_temperature → temperature_map is None
+        let config_no_temp = FitConfig::new(
+            energies.clone(),
+            vec![data.clone()],
+            vec!["U-238".into()],
+            true_temp,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        )
+        .unwrap();
+
+        let result = spatial_map(
+            transmission.view(),
+            uncertainty.view(),
+            &config_no_temp,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            result.temperature_map.is_none(),
+            "temperature_map should be None when fit_temperature is false"
+        );
+
+        // With fit_temperature → temperature_map is Some
+        let config_with_temp = FitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            true_temp,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        )
+        .unwrap()
+        .with_fit_temperature(true)
+        .unwrap();
+
+        let result = spatial_map(
+            transmission.view(),
+            uncertainty.view(),
+            &config_with_temp,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            result.temperature_map.is_some(),
+            "temperature_map should be Some when fit_temperature is true"
+        );
+        let t_map = result.temperature_map.unwrap();
+        assert_eq!(t_map.shape(), &[height, width]);
+        // All pixels should recover a temperature near 300 K
+        for y in 0..height {
+            for x in 0..width {
+                let t = t_map[[y, x]];
+                assert!(
+                    t.is_finite(),
+                    "Pixel ({y},{x}) temperature is not finite: {t}"
+                );
+            }
+        }
+    }
 }

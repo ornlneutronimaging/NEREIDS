@@ -413,7 +413,7 @@ fn export_tiff(
         nereids_io::export::export_density_tiff(dir, map, label).map_err(|e| e.to_string())?;
     }
     if let Some(t_map) = temperature_map {
-        nereids_io::export::export_density_tiff(dir, t_map, "temperature")
+        nereids_io::export::export_map_tiff(dir, t_map, "temperature")
             .map_err(|e| e.to_string())?;
     }
     let n = density_maps.len() + temperature_map.is_some() as usize;

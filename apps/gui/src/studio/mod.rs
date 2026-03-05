@@ -30,10 +30,12 @@ pub fn studio_content(ctx: &egui::Context, state: &mut AppState) {
     let has_results = state.spatial_result.is_some();
 
     // Ensure tile_display is populated when results exist
-    if let Some(ref r) = state.spatial_result
-        && state.tile_display.len() < r.density_maps.len() + 1
-    {
-        state.init_tile_display(r.density_maps.len());
+    if let Some(ref r) = state.spatial_result {
+        let has_temp = r.temperature_map.is_some();
+        let needed = r.density_maps.len() + 1 + has_temp as usize;
+        if state.tile_display.len() < needed {
+            state.init_tile_display(r.density_maps.len());
+        }
     }
 
     // 1. Bottom dock (before side panel and central panel — egui ordering)

@@ -817,11 +817,14 @@ fn fit_spectrum(
                 // When fitting temperature, use TransmissionFitModel (full physics
                 // per evaluation) so the model sees the changing T.
                 let temp_ctx = if fit_temperature {
+                    let base = transmission::unbroadened_cross_sections(&e_owned, &res_data, None)
+                        .map_err(|e| format!("unbroadened_cross_sections failed: {e}"))?;
                     Some(TemperatureContext {
                         temperature_index: n_isotopes,
                         resonance_data: res_data.clone(),
                         energies: e_owned.clone(),
                         instrument: instrument.clone(),
+                        base_xs: Some(base),
                     })
                 } else {
                     None

@@ -19,7 +19,14 @@ fn escape_md_cell(s: &str) -> String {
 /// The f64→f32 conversion preserves roughly 7 significant digits of
 /// precision, which is sufficient for typical density values.
 pub fn export_density_tiff(path: &Path, data: &Array2<f64>, label: &str) -> Result<(), IoError> {
-    let filename = path.join(format!("{label}_density.tiff"));
+    export_map_tiff(path, data, &format!("{label}_density"))
+}
+
+/// Export a single 2D map as a 32-bit float TIFF file.
+///
+/// The file is named `{name}.tiff` inside `path`.
+pub fn export_map_tiff(path: &Path, data: &Array2<f64>, name: &str) -> Result<(), IoError> {
+    let filename = path.join(format!("{name}.tiff"));
     let file = std::fs::File::create(&filename)
         .map_err(|e| IoError::TiffEncode(format!("cannot create {}: {e}", filename.display())))?;
     let mut encoder =

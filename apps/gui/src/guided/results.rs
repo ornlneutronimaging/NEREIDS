@@ -12,7 +12,9 @@ pub fn results_step(ui: &mut egui::Ui, state: &mut AppState) {
     // Ensure tile_display is populated
     match state.spatial_result {
         Some(ref r) => {
-            if state.tile_display.len() < r.density_maps.len() + 1 {
+            let has_temp = r.temperature_map.is_some();
+            let needed = r.density_maps.len() + 1 + has_temp as usize;
+            if state.tile_display.len() < needed {
                 let n = r.density_maps.len();
                 state.init_tile_display(n);
             }
