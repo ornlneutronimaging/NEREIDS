@@ -11,10 +11,11 @@ use std::sync::Arc;
 use nereids_endf::resonance::ResonanceData;
 use nereids_fitting::lm::{self, FitModel, LmConfig, LmResult};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
-use nereids_fitting::poisson::{self, PoissonConfig};
+use nereids_fitting::poisson::{self, PoissonConfig, TemperatureContext};
 use nereids_fitting::transmission_model::{PrecomputedTransmissionModel, TransmissionFitModel};
 use nereids_physics::resolution::ResolutionFunction;
 use nereids_physics::transmission::InstrumentParams;
+use nereids_physics::transmission::{self as phys_transmission};
 
 use crate::error::PipelineError;
 
@@ -492,18 +493,95 @@ pub fn fit_spectrum(
             config.energies().to_vec(),
             config.resonance_data().to_vec(),
             config.temperature_k(),
-            instrument,
+            instrument.clone(),
             (0..n_isotopes).collect(),
             temperature_index,
         )?;
-        dispatch_solver(
-            &model,
-            measured_t,
-            sigma,
-            &mut params,
-            config.solver(),
-            &lm_config,
-        )?
+
+        match config.solver() {
+            SolverChoice::LevenbergMarquardt => dispatch_solver(
+                &model,
+                measured_t,
+                sigma,
+                &mut params,
+                config.solver(),
+                &lm_config,
+            )?,
+            SolverChoice::PoissonKL(poisson_config) => {
+                // The basic poisson_fit uses finite-difference gradient descent,
+                // which cannot effectively optimize temperature: the gradient is
+                // dominated by density parameters (scale ~1e-4) so the temperature
+                // (scale ~200) never moves.
+                //
+                // Use poisson_fit_analytic with Fisher preconditioning, which
+                // handles the scale mismatch via diagonal Hessian normalization.
+                //
+                // In transmission space, flux = 1.0 everywhere (since Y = T,
+                // not Y = Φ·T + B).  The analytical gradient formulas reduce
+                // correctly with Φ=1.
+                let density_indices: Vec<usize> = (0..n_isotopes).collect();
+                let instrument_plain = instrument.as_deref().cloned();
+
+                // Compute initial broadened cross-sections at the starting temperature.
+                let xs = phys_transmission::broadened_cross_sections(
+                    config.energies(),
+                    config.resonance_data(),
+                    config.temperature_k(),
+                    instrument.as_deref(),
+                    None,
+                )?;
+
+                // Precompute unbroadened XS for the TemperatureContext cache.
+                let base_xs = phys_transmission::unbroadened_cross_sections(
+                    config.energies(),
+                    config.resonance_data(),
+                    None,
+                )?;
+
+                let temp_ctx = TemperatureContext {
+                    temperature_index: n_isotopes,
+                    resonance_data: config.resonance_data().to_vec(),
+                    energies: config.energies().to_vec(),
+                    instrument: instrument_plain,
+                    base_xs: Some(base_xs),
+                };
+
+                let flux = vec![1.0f64; config.energies().len()];
+
+                let pr = poisson::poisson_fit_analytic(
+                    &model,
+                    measured_t,
+                    &flux,
+                    &xs,
+                    &density_indices,
+                    &mut params,
+                    poisson_config,
+                    Some(&temp_ctx),
+                )?;
+
+                let n_free = params.n_free();
+                let dof = measured_t.len().saturating_sub(n_free).max(1);
+                let y_model = model.evaluate(&pr.params);
+                let chi_sq: f64 = measured_t
+                    .iter()
+                    .zip(y_model.iter())
+                    .zip(sigma.iter())
+                    .map(|((obs, mdl), s)| {
+                        let residual = obs - mdl;
+                        (residual * residual) / (s * s).max(1e-30)
+                    })
+                    .sum();
+                LmResult {
+                    chi_squared: chi_sq,
+                    reduced_chi_squared: chi_sq / dof as f64,
+                    iterations: pr.iterations,
+                    converged: pr.converged,
+                    params: pr.params,
+                    covariance: None,
+                    uncertainties: None,
+                }
+            }
+        }
     };
 
     let densities: Vec<f64> = (0..n_isotopes).map(|i| result.params[i]).collect();
