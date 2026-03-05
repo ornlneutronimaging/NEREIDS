@@ -256,7 +256,7 @@ fn pipeline_chips(ui: &mut egui::Ui, steps: &[PipelineEntry]) {
     ui.horizontal_wrapped(|ui| {
         for (i, entry) in steps.iter().enumerate() {
             if i > 0 {
-                ui.label(RichText::new("\u{2192}").color(tc.fg3));
+                ui.label(RichText::new(">").color(tc.fg3));
             }
             let label = entry.step.label();
             let text = if entry.optional {
