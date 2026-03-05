@@ -251,7 +251,7 @@ fn preview_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
             }
         },
         SpectrumDataSource::RoiAverage => {
-            if let Some(roi) = state.roi {
+            if let Some(roi) = state.bounding_roi() {
                 match nereids_io::normalization::average_roi(
                     &norm.transmission,
                     roi.y_start..roi.y_end,
@@ -382,8 +382,10 @@ fn preview_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
                                             format!("{} {:.1}eV", entry.symbol, res.energy),
                                             res.energy,
                                         )
-                                        .color(egui::Color32::from_rgb(180, 80, 80))
-                                        .style(egui_plot::LineStyle::dashed_loose()),
+                                        .color(egui::Color32::from_rgba_premultiplied(
+                                            180, 80, 80, 50,
+                                        ))
+                                        .width(0.5),
                                     );
                                 }
                             }

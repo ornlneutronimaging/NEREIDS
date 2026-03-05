@@ -273,6 +273,17 @@ pub enum SpectrumAxis {
     TofMicroseconds,
 }
 
+/// Prominent feedback from a fit operation, displayed in the Analyze controls.
+#[derive(Debug, Clone)]
+pub struct FitFeedback {
+    /// True if fit converged.
+    pub success: bool,
+    /// Summary line (e.g. "Pixel (3,5) converged, chi2_r = 1.23").
+    pub summary: String,
+    /// Per-isotope densities: (symbol, density_atoms_per_barn).
+    pub densities: Vec<(String, f64)>,
+}
+
 /// A single provenance event in the session audit trail.
 #[derive(Debug, Clone)]
 pub struct ProvenanceEvent {
@@ -515,11 +526,22 @@ pub struct AppState {
 
     // -- Pixel / ROI selection --
     pub selected_pixel: Option<(usize, usize)>,
-    pub roi: Option<RoiSelection>,
+    pub rois: Vec<RoiSelection>,
+    pub selected_roi: Option<usize>,
+
+    /// Snapshot of ROIs at the time spatial_map was launched.
+    /// Used to render density overlays only on fitted pixels.
+    pub fitting_rois: Vec<RoiSelection>,
+    /// Toggle: show density overlay on preview image in Results.
+    pub show_density_overlay: bool,
+    /// Toggle: show provenance history popup window.
+    pub show_history_window: bool,
 
     // -- Results --
     pub pixel_fit_result: Option<SpectrumFitResult>,
     pub spatial_result: Option<SpatialResult>,
+    /// Prominent feedback from last fit attempt (pixel or ROI).
+    pub last_fit_feedback: Option<FitFeedback>,
 
     // -- Pipeline / wizard --
     pub fitting_type: Option<FittingType>,
@@ -672,7 +694,7 @@ pub struct IsotopeEntry {
 }
 
 /// ROI rectangle in pixel coordinates.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct RoiSelection {
     pub y_start: usize,
     pub y_end: usize,
@@ -756,7 +778,6 @@ pub enum GuidedStep {
     Bin,
     Rebin,
     Normalize,
-    Roi,
     Analyze,
     Results,
     ForwardModel,
@@ -774,7 +795,6 @@ impl GuidedStep {
             Self::Bin => "Bin",
             Self::Rebin => "Rebin",
             Self::Normalize => "Normalize",
-            Self::Roi => "ROI",
             Self::Analyze => "Analyze",
             Self::Results => "Results",
             Self::ForwardModel => "Forward Model",
@@ -798,7 +818,6 @@ impl GuidedStep {
                 req(Self::Load),
                 req(Self::Bin),
                 req(Self::Normalize),
-                req(Self::Roi),
                 req(Self::Analyze),
                 req(Self::Results),
             ],
@@ -806,7 +825,6 @@ impl GuidedStep {
                 req(Self::Configure),
                 req(Self::Load),
                 req(Self::Bin),
-                req(Self::Roi),
                 req(Self::Normalize),
                 req(Self::Analyze),
                 req(Self::Results),
@@ -816,14 +834,12 @@ impl GuidedStep {
                 req(Self::Load),
                 opt(Self::Rebin),
                 req(Self::Normalize),
-                req(Self::Roi),
                 req(Self::Analyze),
                 req(Self::Results),
             ],
             (FittingType::Single, DataType::PreNormalized) => vec![
                 req(Self::Configure),
                 req(Self::Load),
-                req(Self::Roi),
                 opt(Self::Rebin),
                 req(Self::Normalize),
                 req(Self::Analyze),
@@ -833,7 +849,6 @@ impl GuidedStep {
                 req(Self::Configure),
                 req(Self::Load),
                 opt(Self::Rebin),
-                req(Self::Roi),
                 req(Self::Analyze),
                 req(Self::Results),
             ],
@@ -841,7 +856,6 @@ impl GuidedStep {
                 req(Self::Configure),
                 req(Self::Load),
                 opt(Self::Rebin),
-                req(Self::Roi),
                 req(Self::Analyze),
                 req(Self::Results),
             ],
@@ -909,9 +923,12 @@ impl AppState {
     pub fn invalidate_results(&mut self) {
         self.cancel_pending_tasks();
         self.selected_pixel = None;
-        self.roi = None;
+        self.rois.clear();
+        self.selected_roi = None;
         self.pixel_fit_result = None;
         self.spatial_result = None;
+        self.last_fit_feedback = None;
+        self.fitting_rois.clear();
         self.preview_image = None;
         self.energies = None;
         self.normalized = None;
@@ -922,6 +939,29 @@ impl AppState {
         self.export_status = None;
         self.rebin_applied = false;
         self.rebin_factor = 1;
+    }
+
+    /// Compute the bounding box of all ROIs, or `None` if no ROIs exist.
+    pub fn bounding_roi(&self) -> Option<RoiSelection> {
+        if self.rois.is_empty() {
+            return None;
+        }
+        let mut y_start = usize::MAX;
+        let mut y_end = 0;
+        let mut x_start = usize::MAX;
+        let mut x_end = 0;
+        for r in &self.rois {
+            y_start = y_start.min(r.y_start);
+            y_end = y_end.max(r.y_end);
+            x_start = x_start.min(r.x_start);
+            x_end = x_end.max(r.x_end);
+        }
+        Some(RoiSelection {
+            y_start,
+            y_end,
+            x_start,
+            x_end,
+        })
     }
 
     /// Append a provenance event to the session audit trail.
@@ -1034,10 +1074,15 @@ impl Default for AppState {
             show_advanced_solver: false,
 
             selected_pixel: None,
-            roi: None,
+            rois: Vec::new(),
+            selected_roi: None,
+            fitting_rois: Vec::new(),
+            show_density_overlay: true,
+            show_history_window: false,
 
             pixel_fit_result: None,
             spatial_result: None,
+            last_fit_feedback: None,
 
             fitting_type: None,
             data_type: None,

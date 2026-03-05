@@ -11,7 +11,6 @@ pub mod normalize;
 pub mod rebin;
 pub mod result_widgets;
 pub mod results;
-pub mod roi;
 pub mod sidebar;
 pub mod wizard;
 
@@ -27,7 +26,6 @@ pub fn guided_content(ui: &mut egui::Ui, state: &mut AppState) {
         GuidedStep::Bin => bin::bin_step(ui, state),
         GuidedStep::Rebin => rebin::rebin_step(ui, state),
         GuidedStep::Normalize => normalize::normalize_step(ui, state),
-        GuidedStep::Roi => roi::roi_step(ui, state),
         GuidedStep::Analyze => analyze::analyze_step(ui, state),
         GuidedStep::Results => results::results_step(ui, state),
         GuidedStep::ForwardModel => forward_model::forward_model_step(ui, state),

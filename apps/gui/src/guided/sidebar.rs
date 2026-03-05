@@ -105,7 +105,7 @@ pub fn guided_sidebar(ctx: &egui::Context, state: &mut AppState) {
                 }
             }
 
-            // ── Status + History (pushed to bottom) ────────────
+            // ── Status + History button (pushed to bottom) ────────────
             ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
                 // Status message (bottom-most element)
                 ui.add_space(4.0);
@@ -115,32 +115,70 @@ pub fn guided_sidebar(ctx: &egui::Context, state: &mut AppState) {
                         .color(colors.fg3),
                 );
 
-                // History: last 4 provenance events
-                // bottom_up reverses visual order; .rev() renders newest
-                // first (bottom-most), giving chronological top-to-bottom.
+                // History button — opens separate window
                 if !state.provenance_log.is_empty() {
-                    let start = state.provenance_log.len().saturating_sub(4);
-                    let events = &state.provenance_log[start..];
-                    for event in events.iter().rev() {
-                        let ts = event.formatted_timestamp();
-                        let short = ts.get(11..16).unwrap_or("??:??");
-                        ui.label(
-                            RichText::new(format!("{short} \u{2014} {}", event.message))
-                                .size(10.0)
-                                .color(colors.fg3),
-                        );
+                    let n = state.provenance_log.len();
+                    if ui.small_button(format!("History ({n})")).clicked() {
+                        state.show_history_window = !state.show_history_window;
                     }
-                    ui.add_space(4.0);
-                    ui.label(
-                        RichText::new("HISTORY")
-                            .size(10.0)
-                            .strong()
-                            .color(colors.fg3),
-                    );
-                    ui.separator();
                 }
             });
         });
+}
+
+/// Render the provenance history popup window (call from top-level update).
+pub fn history_window(ctx: &egui::Context, state: &mut AppState) {
+    if !state.show_history_window || state.provenance_log.is_empty() {
+        return;
+    }
+
+    let mut open = state.show_history_window;
+    egui::Window::new("Processing History")
+        .open(&mut open)
+        .default_width(420.0)
+        .default_height(320.0)
+        .resizable(true)
+        .collapsible(false)
+        .show(ctx, |ui| {
+            ui.label(
+                RichText::new(format!("{} events", state.provenance_log.len()))
+                    .small()
+                    .weak(),
+            );
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .auto_shrink([false; 2])
+                .show(ui, |ui| {
+                    for event in state.provenance_log.iter().rev() {
+                        let ts = event.formatted_timestamp();
+                        let kind = format!("{:?}", event.kind);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new(&ts).size(11.0).weak());
+                            ui.label(
+                                RichText::new(kind)
+                                    .size(11.0)
+                                    .strong()
+                                    .color(kind_color(event.kind)),
+                            );
+                        });
+                        ui.label(RichText::new(&event.message).size(12.0));
+                        ui.add_space(4.0);
+                    }
+                });
+        });
+    state.show_history_window = open;
+}
+
+/// Map provenance event kind to a display color.
+fn kind_color(kind: crate::state::ProvenanceEventKind) -> Color32 {
+    use crate::state::ProvenanceEventKind::*;
+    match kind {
+        DataLoaded => Color32::from_rgb(0x00, 0x7a, 0xff), // blue
+        ConfigChanged => semantic::YELLOW,
+        Normalized => semantic::GREEN,
+        AnalysisRun => Color32::from_rgb(0xaf, 0x52, 0xde), // purple
+        Exported => semantic::GREEN,
+    }
 }
 
 /// Render a pipeline step row with dynamic numbering.
@@ -418,7 +456,6 @@ fn step_subtitle(step: GuidedStep, state: &AppState) -> String {
         GuidedStep::Results => "Maps & export".into(),
         GuidedStep::Bin => "Event histogramming".into(),
         GuidedStep::Rebin => "Energy rebin".into(),
-        GuidedStep::Roi => "Region selection".into(),
         GuidedStep::Landing | GuidedStep::Wizard => String::new(),
         GuidedStep::ForwardModel | GuidedStep::Detectability => String::new(),
     }
@@ -464,7 +501,6 @@ fn step_is_complete(step: GuidedStep, state: &AppState) -> bool {
         GuidedStep::Results => state.pixel_fit_result.is_some() || state.spatial_result.is_some(),
         GuidedStep::Bin => state.sample_data.is_some(),
         GuidedStep::Rebin => true, // optional, skip counts as done
-        GuidedStep::Roi => true,   // placeholder, always passable
         GuidedStep::Landing | GuidedStep::Wizard => false,
         GuidedStep::ForwardModel | GuidedStep::Detectability => false,
     }
