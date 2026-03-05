@@ -419,7 +419,11 @@ fn show_nexus_metadata(ui: &mut egui::Ui, state: &AppState) {
     // Show probe error inline in red
     if let Some(ref err) = state.nexus_probe_error {
         ui.add_space(4.0);
-        ui.label(egui::RichText::new(err).size(11.0).color(crate::theme::semantic::RED));
+        ui.label(
+            egui::RichText::new(err)
+                .size(11.0)
+                .color(crate::theme::semantic::RED),
+        );
         return;
     }
 
