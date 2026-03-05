@@ -9,9 +9,7 @@ use egui::{Color32, CornerRadius, Margin, RichText, Stroke};
 
 /// Render the decision wizard (dispatches to the current sub-step).
 pub fn wizard_step(ui: &mut egui::Ui, state: &mut AppState) {
-    let max_width = 700.0_f32.min(ui.available_width());
     ui.vertical(|ui| {
-        ui.set_max_width(max_width);
 
         // Breadcrumb bar
         breadcrumb_bar(ui, state);
