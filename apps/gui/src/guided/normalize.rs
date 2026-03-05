@@ -249,7 +249,6 @@ fn preview_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
     let full_avg = if let Some((ptr, avg)) = cached_full_avg
         && ptr == trans_ptr
     {
-        ui.data_mut(|d| d.insert_temp(full_avg_cache_id, (trans_ptr, avg.clone())));
         Some(avg)
     } else {
         let avg = full_image_average(&norm.transmission);

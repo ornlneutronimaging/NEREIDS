@@ -413,13 +413,13 @@ pub fn show_density_overlay(
     };
 
     // Overlay texture cache: key includes both data pointers, ROI hash, and colormap.
-    let roi_hash = fitting_rois.iter().fold(0usize, |acc, r| {
+    let roi_hash = fitting_rois.iter().fold(0u64, |acc, r| {
         acc.wrapping_mul(31)
-            .wrapping_add(r.y_start)
-            .wrapping_add(r.y_end << 16)
-            .wrapping_add(r.x_start << 32)
-            .wrapping_add(r.x_end << 48)
-    });
+            .wrapping_add(r.y_start as u64)
+            .wrapping_add((r.y_end as u64) << 16)
+            .wrapping_add((r.x_start as u64) << 32)
+            .wrapping_add((r.x_end as u64) << 48)
+    }) as usize;
     let cid = egui::Id::new(tex_id).with("tex_cache");
     let key = cache_key(&[
         preview.as_ptr() as usize,

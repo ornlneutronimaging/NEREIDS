@@ -104,7 +104,6 @@ fn density_map_grid(ui: &mut egui::Ui, state: &mut AppState) {
         if let Some((ptr, arr)) = cached
             && ptr == conv_ptr
         {
-            ui.data_mut(|d| d.insert_temp(conv_cache_id, (conv_ptr, arr.clone())));
             arr
         } else {
             let arr = result.converged_map.mapv(|b| if b { 1.0 } else { 0.0 });
