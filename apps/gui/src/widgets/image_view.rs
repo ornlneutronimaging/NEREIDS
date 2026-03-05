@@ -434,9 +434,15 @@ pub fn show_density_overlay(
         .load_texture(tex_id, image, egui::TextureOptions::NEAREST);
 
     let available_width = ui.available_width();
+    let available_height = ui.available_height();
     let scale_w = available_width / width as f32;
-    let scale_h = ui.available_height() / height as f32;
-    let scale = scale_w.min(scale_h).max(0.5); // never shrink below 0.5px/texel
+    let scale = if available_height > 2000.0 {
+        scale_w
+    } else {
+        let scale_h = available_height / height as f32;
+        scale_w.min(scale_h)
+    }
+    .max(0.5);
     let display_size = egui::Vec2::new(width as f32 * scale, height as f32 * scale);
 
     let (response, painter) = ui.allocate_painter(display_size, egui::Sense::click());
@@ -528,9 +534,17 @@ fn prepare_image_painter(
         .load_texture(tex_id, image, egui::TextureOptions::NEAREST);
 
     let available_width = ui.available_width();
+    let available_height = ui.available_height();
     let scale_w = available_width / width as f32;
-    let scale_h = ui.available_height() / height as f32;
-    let scale = scale_w.min(scale_h).max(0.5); // never shrink below 0.5px/texel
+    // In ScrollArea contexts, available_height is infinite — use width-only
+    // scaling so tiles don't grow unbounded.
+    let scale = if available_height > 2000.0 {
+        scale_w
+    } else {
+        let scale_h = available_height / height as f32;
+        scale_w.min(scale_h)
+    }
+    .max(0.5); // never shrink below 0.5px/texel
     let display_size = egui::Vec2::new(width as f32 * scale, height as f32 * scale);
 
     let (response, painter) = ui.allocate_painter(display_size, sense);

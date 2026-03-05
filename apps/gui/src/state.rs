@@ -396,7 +396,7 @@ impl ExportFormat {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Tiff => "TIFF (f64)",
+            Self::Tiff => "TIFF (f32)",
             Self::Hdf5 => "HDF5",
             Self::Markdown => "Markdown Report",
         }
