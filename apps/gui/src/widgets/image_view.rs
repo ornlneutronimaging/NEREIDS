@@ -147,6 +147,7 @@ pub fn show_image_with_roi_editor(
 
     let dims = (height, width);
     let drag_id = response.id;
+    let last_pixel_id = drag_id.with("last_drag_pixel");
     let mut result = RoiEditorResult::None;
     let mut is_dragging = false;
 
@@ -203,6 +204,8 @@ pub fn show_image_with_roi_editor(
         is_dragging = true;
         if let Some(pos) = response.interact_pointer_pos() {
             let (cy, cx) = screen_to_pixel(pos, image_rect, dims);
+            // Store last known pixel for fallback if pointer leaves image on release
+            ui.data_mut(|d| d.insert_temp(last_pixel_id, (cy, cx)));
             match mode {
                 RoiDragMode::DrawNew { origin_y, origin_x } => {
                     let draft = make_roi(origin_y, origin_x, cy, cx, dims);
@@ -224,8 +227,12 @@ pub fn show_image_with_roi_editor(
     if response.drag_stopped()
         && let Some(mode) = ui.data(|d| d.get_temp::<RoiDragMode>(drag_id))
     {
-        if let Some(pos) = response.interact_pointer_pos() {
-            let (cy, cx) = screen_to_pixel(pos, image_rect, dims);
+        // Use interact_pointer_pos, falling back to last stored pixel if pointer left image
+        let end_pixel = response
+            .interact_pointer_pos()
+            .map(|pos| screen_to_pixel(pos, image_rect, dims))
+            .or_else(|| ui.data(|d| d.get_temp::<(usize, usize)>(last_pixel_id)));
+        if let Some((cy, cx)) = end_pixel {
             match mode {
                 RoiDragMode::DrawNew { origin_y, origin_x } => {
                     if cy == origin_y && cx == origin_x {
@@ -258,7 +265,10 @@ pub fn show_image_with_roi_editor(
                 }
             }
         }
-        ui.data_mut(|d| d.remove::<RoiDragMode>(drag_id));
+        ui.data_mut(|d| {
+            d.remove::<RoiDragMode>(drag_id);
+            d.remove::<(usize, usize)>(last_pixel_id);
+        });
     }
 
     // Shift+click (no drag) → select/deselect ROI
