@@ -212,7 +212,14 @@ fn analysis_map_column(
             .get(tile_idx)
             .map_or("unknown", |s| s.as_str())
             .to_string();
-        result_widgets::tile_toolbelt(ui, data, tile_idx, &label, state);
+        result_widgets::tile_toolbelt(
+            ui,
+            data,
+            tile_idx,
+            &label,
+            &mut state.tile_display,
+            &mut state.status_message,
+        );
     }
 }
 

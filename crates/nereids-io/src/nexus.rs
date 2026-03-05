@@ -155,16 +155,13 @@ pub fn load_nexus_histogram(path: &Path) -> Result<NexusHistogramData, IoError> 
     // Sum over rotation angle axis (axis 0): [rot, y, x, tof] → [y, x, tof]
     let summed = counts_u64.sum_axis(ndarray::Axis(0));
 
-    // Convert to f64 and transpose to NEREIDS convention [tof, y, x]
-    let (n_y, n_x, n_tof) = (summed.shape()[0], summed.shape()[1], summed.shape()[2]);
-    let mut counts_f64 = Array3::<f64>::zeros((n_tof, n_y, n_x));
-    for t in 0..n_tof {
-        for y in 0..n_y {
-            for x in 0..n_x {
-                counts_f64[[t, y, x]] = summed[[y, x, t]] as f64;
-            }
-        }
-    }
+    // Convert to f64 and transpose [y, x, tof] → NEREIDS convention [tof, y, x]
+    let counts_f64: Array3<f64> = summed
+        .mapv(|v| v as f64)
+        .permuted_axes([2, 0, 1])
+        .as_standard_layout()
+        .into_owned();
+    let n_tof = counts_f64.shape()[0];
 
     // Read TOF axis (nanoseconds → microseconds)
     let tof_edges_us = read_tof_axis(&hist_group)?;

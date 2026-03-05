@@ -36,17 +36,17 @@ pub fn results_step(ui: &mut egui::Ui, state: &mut AppState) {
         } else {
             0.0
         };
-        let chi2_vals: Vec<f64> = result
+        // Single-pass fold: compute sum + count without allocating a Vec.
+        let (chi2_sum, chi2_count) = result
             .chi_squared_map
             .iter()
             .zip(result.converged_map.iter())
             .filter(|(v, c)| **c && v.is_finite())
-            .map(|(v, _)| *v)
-            .collect();
-        let mean_chi2 = if chi2_vals.is_empty() {
+            .fold((0.0_f64, 0usize), |(s, n), (v, _)| (s + *v, n + 1));
+        let mean_chi2 = if chi2_count == 0 {
             0.0
         } else {
-            chi2_vals.iter().sum::<f64>() / chi2_vals.len() as f64
+            chi2_sum / chi2_count as f64
         };
         let n_iso = result.density_maps.len();
         let pct = format!("{conv_pct:.1}%");
@@ -88,13 +88,29 @@ pub fn results_step(ui: &mut egui::Ui, state: &mut AppState) {
 
 /// Grid of density map tiles (one per isotope + convergence map).
 fn density_map_grid(ui: &mut egui::Ui, state: &mut AppState) {
-    // Extract data we need before taking mutable borrows
-    let (density_maps, conv_f64, n_converged, n_total) = match state.spatial_result {
-        Some(ref r) => {
-            let conv = r.converged_map.mapv(|b| if b { 1.0 } else { 0.0 });
-            (r.density_maps.clone(), conv, r.n_converged, r.n_total)
-        }
+    let result = match state.spatial_result {
+        Some(ref r) => r,
         None => return,
+    };
+    let n_density_maps = result.density_maps.len();
+    let n_converged = result.n_converged;
+    let n_total = result.n_total;
+
+    // Cache converged_map → f64 conversion in egui temp data to avoid per-frame mapv.
+    let conv_cache_id = egui::Id::new("result_conv_f64_cache");
+    let conv_ptr = result.converged_map.as_ptr() as usize;
+    let conv_f64: ndarray::Array2<f64> = {
+        let cached: Option<(usize, ndarray::Array2<f64>)> = ui.data(|d| d.get_temp(conv_cache_id));
+        if let Some((ptr, arr)) = cached
+            && ptr == conv_ptr
+        {
+            ui.data_mut(|d| d.insert_temp(conv_cache_id, (conv_ptr, arr.clone())));
+            arr
+        } else {
+            let arr = result.converged_map.mapv(|b| if b { 1.0 } else { 0.0 });
+            ui.data_mut(|d| d.insert_temp(conv_cache_id, (conv_ptr, arr.clone())));
+            arr
+        }
     };
 
     let symbols: Vec<String> = state
@@ -103,8 +119,7 @@ fn density_map_grid(ui: &mut egui::Ui, state: &mut AppState) {
         .filter(|e| e.enabled && e.resonance_data.is_some())
         .map(|e| e.symbol.clone())
         .collect();
-    let n_density = density_maps.len().min(symbols.len());
-
+    let n_density = n_density_maps.min(symbols.len());
     let n_tiles = n_density + 1; // isotopes + convergence
 
     // Overlay toggle (only when fitting_rois is non-empty)
@@ -123,22 +138,16 @@ fn density_map_grid(ui: &mut egui::Ui, state: &mut AppState) {
         ui.add_space(4.0);
     }
 
-    // Snapshot overlay state for rendering
     let use_overlay = has_rois && state.show_density_overlay && state.preview_image.is_some();
-    let fitting_rois = state.fitting_rois.clone();
-    let preview_for_overlay = if use_overlay {
-        state.preview_image.clone()
-    } else {
-        None
-    };
+
+    // Collect click events from tiles, apply to state after rendering.
+    let mut new_pixel: Option<(usize, usize)> = None;
 
     design::card_with_header(ui, "Density Maps", None, |ui| {
-        // Compute layout inside the card so available_width accounts for card padding.
         let available_width = ui.available_width();
         let tile_min = 180.0_f32;
         let n_cols = ((available_width / tile_min) as usize).max(1).min(n_tiles);
 
-        // Lay out tiles in rows using ui.columns() which properly constrains widths.
         let n_rows = n_tiles.div_ceil(n_cols);
         for row in 0..n_rows {
             ui.columns(n_cols, |columns| {
@@ -149,8 +158,8 @@ fn density_map_grid(ui: &mut egui::Ui, state: &mut AppState) {
                     }
 
                     if i < n_density {
-                        // Isotope density tile
-                        let data = &density_maps[i];
+                        // Isotope density tile — render image in a short borrow scope,
+                        // then call tile_toolbelt with a fresh borrow.
                         let label = &symbols[i];
                         let tex_id = format!("result_density_{i}");
 
@@ -161,56 +170,66 @@ fn density_map_grid(ui: &mut egui::Ui, state: &mut AppState) {
                             .get(i)
                             .map_or(Colormap::Viridis, |t| t.colormap);
                         let show_bar = state.tile_display.get(i).is_some_and(|t| t.show_colorbar);
-
                         let selected = state.selected_pixel;
 
-                        // Use overlay rendering if available
-                        if let Some(ref preview) = preview_for_overlay {
-                            let (clicked, _rect) = show_density_overlay(
-                                ui,
-                                preview,
-                                data,
-                                &fitting_rois,
-                                &tex_id,
-                                colormap,
-                                selected,
-                            );
-                            if let Some((y, x)) = clicked {
-                                state.selected_pixel = Some((y, x));
-                                state.pixel_fit_result = None;
-                            }
-                        } else if show_bar {
-                            ui.horizontal(|ui| {
-                                if let Some((y, x)) = show_colormapped_image_with_roi(
+                        // Render image (borrows state.spatial_result immutably).
+                        {
+                            let data = &state.spatial_result.as_ref().unwrap().density_maps[i];
+                            if use_overlay {
+                                let preview = state.preview_image.as_ref().unwrap();
+                                let (clicked, _rect) = show_density_overlay(
                                     ui,
+                                    preview,
                                     data,
+                                    &state.fitting_rois,
                                     &tex_id,
                                     colormap,
-                                    &[],
                                     selected,
-                                )
-                                .0
-                                {
-                                    state.selected_pixel = Some((y, x));
-                                    state.pixel_fit_result = None;
+                                );
+                                if clicked.is_some() {
+                                    new_pixel = clicked;
                                 }
-                                result_widgets::draw_colorbar(ui, data, colormap);
-                            });
-                        } else if let Some((y, x)) = show_colormapped_image_with_roi(
-                            ui,
-                            data,
-                            &tex_id,
-                            colormap,
-                            &[],
-                            selected,
-                        )
-                        .0
-                        {
-                            state.selected_pixel = Some((y, x));
-                            state.pixel_fit_result = None;
+                            } else if show_bar {
+                                ui.horizontal(|ui| {
+                                    if let Some(px) = show_colormapped_image_with_roi(
+                                        ui,
+                                        data,
+                                        &tex_id,
+                                        colormap,
+                                        &[],
+                                        selected,
+                                    )
+                                    .0
+                                    {
+                                        new_pixel = Some(px);
+                                    }
+                                    result_widgets::draw_colorbar(ui, data, colormap);
+                                });
+                            } else if let Some(px) = show_colormapped_image_with_roi(
+                                ui,
+                                data,
+                                &tex_id,
+                                colormap,
+                                &[],
+                                selected,
+                            )
+                            .0
+                            {
+                                new_pixel = Some(px);
+                            }
                         }
 
-                        result_widgets::tile_toolbelt(ui, data, i, label, state);
+                        // Toolbelt — uses split borrows to avoid conflicting with
+                        // the spatial_result reference used for image rendering.
+                        let data = &state.spatial_result.as_ref().unwrap().density_maps[i];
+                        result_widgets::tile_toolbelt(
+                            ui,
+                            data,
+                            i,
+                            label,
+                            &mut state.tile_display,
+                            &mut state.status_message,
+                        );
                     } else {
                         // Convergence map tile
                         let conv_idx = n_density;
@@ -255,7 +274,8 @@ fn density_map_grid(ui: &mut egui::Ui, state: &mut AppState) {
                             &conv_f64,
                             conv_idx,
                             "convergence",
-                            state,
+                            &mut state.tile_display,
+                            &mut state.status_message,
                         );
                     }
                 }
@@ -265,4 +285,10 @@ fn density_map_grid(ui: &mut egui::Ui, state: &mut AppState) {
             }
         }
     });
+
+    // Apply deferred click outside the rendering loop.
+    if let Some((y, x)) = new_pixel {
+        state.selected_pixel = Some((y, x));
+        state.pixel_fit_result = None;
+    }
 }
