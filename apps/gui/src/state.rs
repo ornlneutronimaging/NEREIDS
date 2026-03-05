@@ -928,6 +928,7 @@ impl AppState {
         self.export_status = None;
         self.rebin_applied = false;
         self.rebin_factor = 1;
+        self.analyze_tof_slice_index = 0;
     }
 
     /// Compute the bounding box of all ROIs, or `None` if no ROIs exist.
