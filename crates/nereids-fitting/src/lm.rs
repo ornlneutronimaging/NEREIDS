@@ -92,7 +92,7 @@ pub struct LmConfig {
 impl Default for LmConfig {
     fn default() -> Self {
         Self {
-            max_iter: 100,
+            max_iter: 200,
             lambda_init: 1e-3,
             lambda_up: 10.0,
             lambda_down: 0.1,

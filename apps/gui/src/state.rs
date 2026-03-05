@@ -1088,7 +1088,7 @@ impl Default for AppState {
 
             temperature_k: 296.0,
             lm_config: LmConfig::default(),
-            solver_method: SolverMethod::LevenbergMarquardt,
+            solver_method: SolverMethod::PoissonKL,
             fit_temperature: false,
             show_advanced_solver: false,
 
