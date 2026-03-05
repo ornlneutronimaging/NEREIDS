@@ -44,6 +44,7 @@ pub fn export_density_tiff(path: &Path, data: &Array2<f64>, label: &str) -> Resu
 /// - `/uncertainty/{label}` — uncertainty map for each isotope
 /// - `/chi_squared` — reduced chi-squared map
 /// - `/converged` — boolean convergence map (stored as u8: 0/1)
+/// - `/temperature` — fitted temperature map in Kelvin (when temperature fitting was enabled)
 #[cfg(feature = "hdf5")]
 pub fn export_results_hdf5(
     path: &Path,
@@ -52,6 +53,7 @@ pub fn export_results_hdf5(
     chi_squared_map: &Array2<f64>,
     converged_map: &Array2<bool>,
     labels: &[String],
+    temperature_map: Option<&Array2<f64>>,
 ) -> Result<(), IoError> {
     let file = hdf5::File::create(path).map_err(|e| IoError::Hdf5Error(format!("create: {e}")))?;
 
@@ -111,6 +113,17 @@ pub fn export_results_hdf5(
             .create("converged")
             .and_then(|ds| ds.write_raw(&data))
             .map_err(|e| IoError::Hdf5Error(format!("write /converged: {e}")))?;
+    }
+
+    // Temperature map (when temperature fitting was enabled)
+    if let Some(t_map) = temperature_map {
+        let shape = [t_map.shape()[0], t_map.shape()[1]];
+        let data: Vec<f64> = t_map.iter().copied().collect();
+        file.new_dataset::<f64>()
+            .shape(shape)
+            .create("temperature")
+            .and_then(|ds| ds.write_raw(&data))
+            .map_err(|e| IoError::Hdf5Error(format!("write /temperature: {e}")))?;
     }
 
     Ok(())

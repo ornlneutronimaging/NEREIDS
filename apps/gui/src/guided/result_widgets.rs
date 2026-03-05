@@ -58,6 +58,21 @@ pub fn summary_card(
                 });
             }
 
+            // Mean temperature (if available)
+            if let Some(ref t_map) = result.temperature_map {
+                let temp_vals: Vec<f64> = t_map
+                    .iter()
+                    .zip(result.converged_map.iter())
+                    .filter(|&(_, &conv)| conv)
+                    .map(|(&t, _)| t)
+                    .filter(|t| t.is_finite())
+                    .collect();
+                if !temp_vals.is_empty() {
+                    let mean_t: f64 = temp_vals.iter().sum::<f64>() / temp_vals.len() as f64;
+                    ui.label(format!("Mean temperature: {mean_t:.1} K"));
+                }
+            }
+
             // Per-isotope mean density
             let enabled: Vec<_> = isotope_entries
                 .iter()
@@ -226,6 +241,13 @@ pub fn pixel_inspector(ui: &mut egui::Ui, state: &AppState) {
         |ui| {
             ui.label(format!("chi2_r = {:.4}", result.chi_squared_map[[y, x]]));
 
+            if let Some(ref t_map) = result.temperature_map {
+                let t = t_map[[y, x]];
+                if t.is_finite() {
+                    ui.label(format!("  T = {t:.1} K"));
+                }
+            }
+
             let enabled: Vec<_> = state
                 .isotope_entries
                 .iter()
@@ -316,18 +338,26 @@ fn run_export(state: &mut AppState) {
     };
 
     // Extract data needed from spatial_result
-    let (density_maps, uncertainty_maps, chi_squared_map, converged_map, n_converged, n_total) =
-        match state.spatial_result {
-            Some(ref r) => (
-                r.density_maps.clone(),
-                r.uncertainty_maps.clone(),
-                r.chi_squared_map.clone(),
-                r.converged_map.clone(),
-                r.n_converged,
-                r.n_total,
-            ),
-            None => return,
-        };
+    let (
+        density_maps,
+        uncertainty_maps,
+        chi_squared_map,
+        converged_map,
+        temperature_map,
+        n_converged,
+        n_total,
+    ) = match state.spatial_result {
+        Some(ref r) => (
+            r.density_maps.clone(),
+            r.uncertainty_maps.clone(),
+            r.chi_squared_map.clone(),
+            r.converged_map.clone(),
+            r.temperature_map.clone(),
+            r.n_converged,
+            r.n_total,
+        ),
+        None => return,
+    };
 
     let labels: Vec<String> = state
         .isotope_entries
@@ -337,7 +367,7 @@ fn run_export(state: &mut AppState) {
         .collect();
 
     let result = match state.export_format {
-        ExportFormat::Tiff => export_tiff(&dir, &density_maps, &labels),
+        ExportFormat::Tiff => export_tiff(&dir, &density_maps, &labels, temperature_map.as_ref()),
         ExportFormat::Hdf5 => export_hdf5(
             &dir,
             &density_maps,
@@ -345,6 +375,7 @@ fn run_export(state: &mut AppState) {
             &chi_squared_map,
             &converged_map,
             &labels,
+            temperature_map.as_ref(),
         ),
         ExportFormat::Markdown => export_markdown(
             &dir,
@@ -375,16 +406,18 @@ fn export_tiff(
     dir: &std::path::Path,
     density_maps: &[ndarray::Array2<f64>],
     labels: &[String],
+    temperature_map: Option<&ndarray::Array2<f64>>,
 ) -> Result<String, String> {
     for (i, map) in density_maps.iter().enumerate() {
         let label = labels.get(i).map_or("unknown", |s| s.as_str());
         nereids_io::export::export_density_tiff(dir, map, label).map_err(|e| e.to_string())?;
     }
-    Ok(format!(
-        "Exported {} TIFF files to {}",
-        density_maps.len(),
-        dir.display()
-    ))
+    if let Some(t_map) = temperature_map {
+        nereids_io::export::export_density_tiff(dir, t_map, "temperature")
+            .map_err(|e| e.to_string())?;
+    }
+    let n = density_maps.len() + temperature_map.is_some() as usize;
+    Ok(format!("Exported {n} TIFF files to {}", dir.display()))
 }
 
 fn export_hdf5(
@@ -394,6 +427,7 @@ fn export_hdf5(
     chi_squared_map: &ndarray::Array2<f64>,
     converged_map: &ndarray::Array2<bool>,
     labels: &[String],
+    temperature_map: Option<&ndarray::Array2<f64>>,
 ) -> Result<String, String> {
     let path = dir.join("nereids_results.hdf5");
     nereids_io::export::export_results_hdf5(
@@ -403,6 +437,7 @@ fn export_hdf5(
         chi_squared_map,
         converged_map,
         labels,
+        temperature_map,
     )
     .map_err(|e| e.to_string())?;
     Ok(format!("Exported HDF5 to {}", path.display()))

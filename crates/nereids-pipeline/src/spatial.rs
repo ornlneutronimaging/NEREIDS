@@ -25,6 +25,8 @@ pub struct SpatialResult {
     pub chi_squared_map: Array2<f64>,
     /// Convergence map (true = converged).
     pub converged_map: Array2<bool>,
+    /// Fitted temperature map (K). `Some` when `config.fit_temperature()` is true.
+    pub temperature_map: Option<Array2<f64>>,
     /// Number of pixels that converged.
     pub n_converged: usize,
     /// Total number of pixels fitted.
@@ -130,6 +132,7 @@ pub fn spatial_map(
             .collect(),
         chi_squared_map: Array2::from_elem((height, width), f64::NAN),
         converged_map: Array2::from_elem((height, width), false),
+        temperature_map: None,
         n_converged: 0,
         n_total: 0,
     };
@@ -244,6 +247,11 @@ pub fn spatial_map(
         .collect();
     let mut chi_squared_map = Array2::from_elem((height, width), f64::NAN);
     let mut converged_map = Array2::from_elem((height, width), false);
+    let mut temperature_map: Option<Array2<f64>> = if config.fit_temperature() {
+        Some(Array2::from_elem((height, width), f64::NAN))
+    } else {
+        None
+    };
     let mut n_converged = 0;
 
     for ((y, x), result) in &results {
@@ -257,6 +265,9 @@ pub fn spatial_map(
         }
         chi_squared_map[[*y, *x]] = result.reduced_chi_squared;
         converged_map[[*y, *x]] = result.converged;
+        if let (Some(t_map), Some(t)) = (&mut temperature_map, result.temperature_k) {
+            t_map[[*y, *x]] = t;
+        }
         if result.converged {
             n_converged += 1;
         }
@@ -267,6 +278,7 @@ pub fn spatial_map(
         uncertainty_maps,
         chi_squared_map,
         converged_map,
+        temperature_map,
         n_converged,
         n_total: results.len(),
     })

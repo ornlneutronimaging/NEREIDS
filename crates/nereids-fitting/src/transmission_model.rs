@@ -149,6 +149,10 @@ pub struct TransmissionFitModel {
     /// and included as a free parameter in the fit. The Doppler broadening
     /// kernel is recomputed at each `evaluate()` call.
     temperature_index: Option<usize>,
+    /// Cached unbroadened (Reich-Moore) cross-sections, computed once in
+    /// `new()` when `temperature_index` is `Some`. Eliminates redundant
+    /// O(N_energy × N_resonances) computation on every `evaluate()` call.
+    base_xs: Option<Vec<Vec<f64>>>,
 }
 
 impl TransmissionFitModel {
@@ -172,6 +176,18 @@ impl TransmissionFitModel {
                 "temperature_index must not overlap with density_indices".into(),
             ));
         }
+        let base_xs = if temperature_index.is_some() {
+            Some(
+                transmission::unbroadened_cross_sections(&energies, &resonance_data, None)
+                    .map_err(|e| {
+                        FittingError::InvalidConfig(format!(
+                            "failed to compute unbroadened cross-sections: {e}"
+                        ))
+                    })?,
+            )
+        } else {
+            None
+        };
         Ok(Self {
             energies,
             resonance_data,
@@ -179,6 +195,7 @@ impl TransmissionFitModel {
             instrument,
             density_indices,
             temperature_index,
+            base_xs,
         })
     }
 }
@@ -196,26 +213,42 @@ impl FitModel for TransmissionFitModel {
             params.len(),
         );
 
-        let isotopes: Vec<(ResonanceData, f64)> = self
-            .resonance_data
-            .iter()
-            .zip(self.density_indices.iter())
-            .map(|(rd, &idx): (&ResonanceData, &usize)| (rd.clone(), params[idx]))
-            .collect();
-
         let temperature_k = match self.temperature_index {
             Some(idx) => params[idx],
             None => self.temperature_k,
         };
 
-        let sample = SampleParams::new(temperature_k, isotopes)
-            .expect("SampleParams: temperature must be non-negative and finite");
+        if let Some(ref base_xs) = self.base_xs {
+            // Fast path: reuse cached unbroadened XS, only redo Doppler + Beer-Lambert.
+            let thicknesses: Vec<f64> = self
+                .density_indices
+                .iter()
+                .map(|&idx| params[idx])
+                .collect();
+            transmission::forward_model_from_base_xs(
+                &self.energies,
+                base_xs,
+                &self.resonance_data,
+                &thicknesses,
+                temperature_k,
+                self.instrument.as_deref(),
+            )
+            .expect("forward_model_from_base_xs failed")
+        } else {
+            // Original path: full forward model (no temperature fitting).
+            let isotopes: Vec<(ResonanceData, f64)> = self
+                .resonance_data
+                .iter()
+                .zip(self.density_indices.iter())
+                .map(|(rd, &idx): (&ResonanceData, &usize)| (rd.clone(), params[idx]))
+                .collect();
 
-        // forward_model can fail for unsorted energies or invalid Doppler
-        // params — both are configuration bugs (energies and isotope data are
-        // set once at model construction).  The LM loop cannot fix these.
-        transmission::forward_model(&self.energies, &sample, self.instrument.as_deref())
-            .expect("TransmissionFitModel: forward_model failed (energy grid must be sorted ascending and Doppler params must be valid)")
+            let sample = SampleParams::new(temperature_k, isotopes)
+                .expect("SampleParams: temperature must be non-negative and finite");
+
+            transmission::forward_model(&self.energies, &sample, self.instrument.as_deref())
+                .expect("TransmissionFitModel: forward_model failed")
+        }
     }
 }
 

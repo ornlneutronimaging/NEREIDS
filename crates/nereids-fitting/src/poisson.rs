@@ -688,6 +688,10 @@ pub struct TemperatureContext {
     /// Optional instrument parameters (for resolution broadening during
     /// cross-section recomputation).
     pub instrument: Option<InstrumentParams>,
+    /// Cached unbroadened (Reich-Moore) cross-sections, computed once.
+    /// When `Some`, the optimizer uses `_from_base` variants to skip the
+    /// expensive per-iteration Reich-Moore evaluation.
+    pub base_xs: Option<Vec<Vec<f64>>>,
 }
 
 /// Run Poisson-likelihood optimization with an analytical gradient.
@@ -806,13 +810,23 @@ pub fn poisson_fit_analytic(
         if let Some(ctx) = &temp_ctx {
             params.all_values_into(&mut all_vals_buf);
             let t_current = all_vals_buf[ctx.temperature_index];
-            let (xs_new, dxs_new) = transmission::broadened_cross_sections_with_derivative(
-                &ctx.energies,
-                &ctx.resonance_data,
-                t_current,
-                ctx.instrument.as_ref(),
-            )
-            .expect("poisson_fit_analytic: broadening failed (energy grid must be sorted ascending and Doppler params must be valid)");
+            let (xs_new, dxs_new) = if let Some(ref base) = ctx.base_xs {
+                transmission::broadened_cross_sections_with_derivative_from_base(
+                    &ctx.energies,
+                    base,
+                    &ctx.resonance_data,
+                    t_current,
+                    ctx.instrument.as_ref(),
+                )
+            } else {
+                transmission::broadened_cross_sections_with_derivative(
+                    &ctx.energies,
+                    &ctx.resonance_data,
+                    t_current,
+                    ctx.instrument.as_ref(),
+                )
+            }
+            .expect("poisson_fit_analytic: broadening failed");
             xs_owned = xs_new;
             dxs_dt = dxs_new;
         }
@@ -1286,13 +1300,23 @@ pub fn poisson_fit_lbfgsb(
 
         if let Some(ctx) = &temp_ctx {
             let t_current = all_vals_buf[ctx.temperature_index];
-            let (xs_new, dxs_new) = transmission::broadened_cross_sections_with_derivative(
-                &ctx.energies,
-                &ctx.resonance_data,
-                t_current,
-                ctx.instrument.as_ref(),
-            )
-            .expect("poisson_fit_lbfgsb: broadening failed (energy grid must be sorted ascending and Doppler params must be valid)");
+            let (xs_new, dxs_new) = if let Some(ref base) = ctx.base_xs {
+                transmission::broadened_cross_sections_with_derivative_from_base(
+                    &ctx.energies,
+                    base,
+                    &ctx.resonance_data,
+                    t_current,
+                    ctx.instrument.as_ref(),
+                )
+            } else {
+                transmission::broadened_cross_sections_with_derivative(
+                    &ctx.energies,
+                    &ctx.resonance_data,
+                    t_current,
+                    ctx.instrument.as_ref(),
+                )
+            }
+            .expect("poisson_fit_lbfgsb: broadening failed");
             xs_owned = xs_new;
             dxs_dt = dxs_new;
         }
@@ -1972,6 +1996,7 @@ mod tests {
             resonance_data: resonance_data.clone(),
             energies: energies.clone(),
             instrument: None,
+            base_xs: None,
         };
 
         // Tight tolerance and many iterations: density and temperature are
@@ -2426,6 +2451,7 @@ mod tests {
             resonance_data: resonance_data.clone(),
             energies: energies.clone(),
             instrument: None,
+            base_xs: None,
         };
 
         let config = PoissonConfig {
