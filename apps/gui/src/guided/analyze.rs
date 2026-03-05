@@ -358,8 +358,6 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 .index_axis(Axis(0), state.analyze_tof_slice_index)
                 .to_owned();
 
-            // Snapshot for borrow-free editor call
-            let rois_snap: Vec<_> = state.rois.clone();
             let sel_roi = state.selected_roi;
             let sel_px = state.selected_pixel;
             let (editor_result, _rect) = show_image_with_roi_editor(
@@ -367,7 +365,7 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 &slice,
                 "analyze_preview_tex",
                 crate::state::Colormap::Viridis,
-                &rois_snap,
+                &state.rois,
                 sel_roi,
                 sel_px,
             );
@@ -384,16 +382,14 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
     } else if let Some(ref preview) = state.preview_image {
         // -- Raw preview with interactive ROI editor --
         ui.label("Preview (summed counts):");
-        let preview = preview.clone();
-        let rois_snap: Vec<_> = state.rois.clone();
         let sel_roi = state.selected_roi;
         let sel_px = state.selected_pixel;
         let (editor_result, _rect) = show_image_with_roi_editor(
             ui,
-            &preview,
+            preview,
             "preview_tex",
             crate::state::Colormap::Viridis,
-            &rois_snap,
+            &state.rois,
             sel_roi,
             sel_px,
         );

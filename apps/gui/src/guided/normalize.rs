@@ -241,10 +241,27 @@ fn preview_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
 
     let n_tof = norm.transmission.shape()[0];
 
+    // Cache `full_image_average` in egui temp data, keyed by the transmission
+    // data pointer.  The transmission is in an Arc so the pointer is stable.
+    let full_avg_cache_id = egui::Id::new("norm_full_avg_cache");
+    let trans_ptr = norm.transmission.as_ptr() as usize;
+    let cached_full_avg: Option<(usize, Vec<f64>)> = ui.data(|d| d.get_temp(full_avg_cache_id));
+    let full_avg = if let Some((ptr, avg)) = cached_full_avg
+        && ptr == trans_ptr
+    {
+        Some(avg)
+    } else {
+        let avg = full_image_average(&norm.transmission);
+        if let Some(ref a) = avg {
+            ui.data_mut(|d| d.insert_temp(full_avg_cache_id, (trans_ptr, a.clone())));
+        }
+        avg
+    };
+
     // Compute averaged spectrum based on data source
     let spectrum: Vec<f64> = match state.normalize_spectrum_source {
-        SpectrumDataSource::FullImage => match full_image_average(&norm.transmission) {
-            Some(avg) => avg,
+        SpectrumDataSource::FullImage => match full_avg {
+            Some(ref avg) => avg.clone(),
             None => {
                 ui.label("(empty spatial dimensions)");
                 return;
@@ -260,8 +277,8 @@ fn preview_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
                     Ok(avg) => avg.to_vec(),
                     Err(_) => {
                         ui.label("Invalid ROI \u{2014} using full image.");
-                        match full_image_average(&norm.transmission) {
-                            Some(avg) => avg,
+                        match full_avg {
+                            Some(ref avg) => avg.clone(),
                             None => {
                                 ui.label("(empty spatial dimensions)");
                                 return;
@@ -271,8 +288,8 @@ fn preview_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 }
             } else {
                 ui.label("No ROI set \u{2014} showing full image average.");
-                match full_image_average(&norm.transmission) {
-                    Some(avg) => avg,
+                match full_avg {
+                    Some(ref avg) => avg.clone(),
                     None => {
                         ui.label("(empty spatial dimensions)");
                         return;

@@ -53,9 +53,19 @@ pub fn bin_step(ui: &mut egui::Ui, state: &mut AppState) {
             });
 
             ui.add_space(4.0);
-            if design::btn_primary(ui, "Histogram Events").clicked() {
-                histogram_events(state);
-            }
+            let valid_range = state.event_tof_min_us < state.event_tof_max_us;
+            ui.add_enabled_ui(valid_range, |ui| {
+                if design::btn_primary(ui, "Histogram Events").clicked() {
+                    histogram_events(state);
+                }
+                if !valid_range {
+                    ui.label(
+                        egui::RichText::new("TOF min must be less than TOF max")
+                            .small()
+                            .color(crate::theme::semantic::RED),
+                    );
+                }
+            });
         });
 
         // Show result summary if histogrammed

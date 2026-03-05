@@ -1,6 +1,6 @@
 //! Shared result display widgets used by both Guided Results step and Studio mode.
 
-use crate::state::{AppState, Colormap, ExportFormat, ProvenanceEventKind};
+use crate::state::{AppState, Colormap, ExportFormat, ProvenanceEventKind, TileDisplayState};
 use crate::widgets::design::{self, BadgeVariant};
 use crate::widgets::image_view::{apply_colormap, data_range, render_to_rgba};
 
@@ -87,16 +87,20 @@ pub fn summary_card(
 }
 
 /// Per-tile toolbelt: colormap selector, colorbar toggle, save PNG.
+///
+/// Takes split borrows to avoid conflicting with `&state.spatial_result`
+/// references held by the caller (density map data lives in spatial_result).
 pub fn tile_toolbelt(
     ui: &mut egui::Ui,
     data: &ndarray::Array2<f64>,
     tile_idx: usize,
     label: &str,
-    state: &mut AppState,
+    tile_display: &mut [TileDisplayState],
+    status_message: &mut String,
 ) {
     ui.horizontal(|ui| {
         // Colormap selector
-        if let Some(tile) = state.tile_display.get_mut(tile_idx) {
+        if let Some(tile) = tile_display.get_mut(tile_idx) {
             let current_label = tile.colormap.label();
             egui::ComboBox::from_id_salt(format!("cmap_{tile_idx}"))
                 .selected_text(current_label)
@@ -118,18 +122,17 @@ pub fn tile_toolbelt(
                 .add_filter("PNG", &["png"])
                 .save_file()
         {
-            let colormap = state
-                .tile_display
+            let colormap = tile_display
                 .get(tile_idx)
                 .map_or(Colormap::Viridis, |t| t.colormap);
             let rgba = render_to_rgba(data, colormap);
             let (h, w) = (data.shape()[0] as u32, data.shape()[1] as u32);
             match image::save_buffer(&path, &rgba, w, h, image::ColorType::Rgba8) {
                 Ok(()) => {
-                    state.status_message = format!("Saved PNG: {}", path.display());
+                    *status_message = format!("Saved PNG: {}", path.display());
                 }
                 Err(e) => {
-                    state.status_message = format!("PNG save error: {e}");
+                    *status_message = format!("PNG save error: {e}");
                 }
             }
         }
