@@ -17,6 +17,24 @@ const SESSION_CACHE_KEY: &str = "nereids_session_cache";
 
 impl NereidsApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // Load DejaVuSans as a fallback font for Unicode symbols (arrows, math, etc.)
+        // that egui's built-in font doesn't cover.
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert(
+            "dejavu".to_owned(),
+            std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+                "../assets/DejaVuSans.ttf"
+            ))),
+        );
+        // Append as fallback to Proportional — egui tries fonts in order,
+        // so the default font renders most glyphs and DejaVu fills the gaps.
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .push("dejavu".to_owned());
+        cc.egui_ctx.set_fonts(fonts);
+
         let mut state = AppState::default();
 
         // Restore cached session from previous run (if any)
