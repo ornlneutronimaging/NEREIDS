@@ -1001,4 +1001,156 @@ mod tests {
         // Poisson FD does not compute covariance
         assert!(result.uncertainties.is_none());
     }
+
+    // ── Temperature fitting round-trip tests ────────────────────────────────
+
+    /// Generate synthetic transmission for the given isotopes at a known
+    /// temperature and density, then fit through `fit_spectrum` and verify
+    /// recovery.
+    fn temperature_round_trip(
+        resonance_data: Vec<ResonanceData>,
+        names: Vec<String>,
+        true_densities: &[f64],
+        true_temp: f64,
+        solver: SolverChoice,
+        tolerance: f64,
+        label: &str,
+    ) {
+        use nereids_physics::transmission::{SampleParams, forward_model};
+
+        // Energy grid spanning both the W-182 (4.15 eV) and U-238 (6.67 eV)
+        // resonances with enough points for the optimizer.
+        let energies: Vec<f64> = (0..501).map(|i| 2.0 + (i as f64) * 0.02).collect();
+
+        // Build isotope list for the forward model at truth.
+        let isotopes: Vec<(ResonanceData, f64)> = resonance_data
+            .iter()
+            .zip(true_densities.iter())
+            .map(|(rd, &d)| (rd.clone(), d))
+            .collect();
+        let sample = SampleParams::new(true_temp, isotopes).unwrap();
+        let y_obs = forward_model(&energies, &sample, None).unwrap();
+
+        // Use uniform small sigma for the LM path.
+        let sigma = vec![0.005; y_obs.len()];
+
+        // Initial guesses: densities at 2× truth, temperature 100 K off.
+        let initial_densities: Vec<f64> = true_densities.iter().map(|d| d * 2.0).collect();
+        let config = FitConfig::new(
+            energies,
+            resonance_data,
+            names,
+            true_temp - 100.0, // initial T guess offset from truth
+            None,
+            initial_densities,
+            LmConfig {
+                max_iter: 300,
+                ..LmConfig::default()
+            },
+        )
+        .unwrap()
+        .with_fit_temperature(true)
+        .unwrap()
+        .with_solver(solver);
+
+        let result = fit_spectrum(&y_obs, &sigma, &config).unwrap();
+
+        assert!(
+            result.converged,
+            "[{label}] did not converge after {} iterations",
+            result.iterations,
+        );
+
+        // Check each density.
+        for (i, (&fitted, &truth)) in result
+            .densities
+            .iter()
+            .zip(true_densities.iter())
+            .enumerate()
+        {
+            let rel_err = (fitted - truth).abs() / truth;
+            assert!(
+                rel_err < tolerance,
+                "[{label}] density[{i}]: fitted={fitted:.6e}, true={truth:.6e}, error={:.2}%",
+                rel_err * 100.0,
+            );
+        }
+
+        // Check temperature.
+        let fitted_temp = result
+            .temperature_k
+            .expect("temperature_k should be Some when fit_temperature=true");
+        let temp_rel_err = (fitted_temp - true_temp).abs() / true_temp;
+        assert!(
+            temp_rel_err < tolerance,
+            "[{label}] temperature: fitted={fitted_temp:.1} K, true={true_temp:.1} K, error={:.2}%",
+            temp_rel_err * 100.0,
+        );
+    }
+
+    #[test]
+    fn test_fit_spectrum_single_isotope_temperature_lm() {
+        let u238 = u238_single_resonance();
+        temperature_round_trip(
+            vec![u238],
+            vec!["U-238".into()],
+            &[0.0005],
+            300.0,
+            SolverChoice::LevenbergMarquardt,
+            0.01, // 1% tolerance (noise-free data)
+            "1-isotope LM",
+        );
+    }
+
+    #[test]
+    fn test_fit_spectrum_multi_isotope_temperature_lm() {
+        use crate::test_helpers::w182_single_resonance;
+        let u238 = u238_single_resonance();
+        let w182 = w182_single_resonance();
+        temperature_round_trip(
+            vec![u238, w182],
+            vec!["U-238".into(), "W-182".into()],
+            &[0.0005, 0.0003],
+            300.0,
+            SolverChoice::LevenbergMarquardt,
+            0.01, // 1%
+            "2-isotope LM",
+        );
+    }
+
+    #[test]
+    fn test_fit_spectrum_single_isotope_temperature_poisson() {
+        let u238 = u238_single_resonance();
+        temperature_round_trip(
+            vec![u238],
+            vec!["U-238".into()],
+            &[0.0005],
+            300.0,
+            SolverChoice::PoissonKL(PoissonConfig {
+                max_iter: 500,
+                ..PoissonConfig::default()
+            }),
+            0.02, // 2% tolerance (Poisson solver slightly less precise)
+            "1-isotope Poisson",
+        );
+    }
+
+    #[test]
+    fn test_fit_spectrum_multi_isotope_temperature_poisson() {
+        use crate::test_helpers::w182_single_resonance;
+        let u238 = u238_single_resonance();
+        let w182 = w182_single_resonance();
+        temperature_round_trip(
+            vec![u238, w182],
+            vec!["U-238".into(), "W-182".into()],
+            &[0.0005, 0.0003],
+            300.0,
+            SolverChoice::PoissonKL(PoissonConfig {
+                max_iter: 500,
+                ..PoissonConfig::default()
+            }),
+            0.02, // 2%
+            "2-isotope Poisson",
+        );
+    }
 }
