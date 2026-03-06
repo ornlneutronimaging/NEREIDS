@@ -696,9 +696,55 @@ fn dock_provenance(ui: &mut egui::Ui, state: &AppState) {
     }
 }
 
-/// Export panel (reuse result_widgets).
+/// Export panel — flat layout without card wrapper to fit in the dock.
 fn dock_export(ui: &mut egui::Ui, state: &mut AppState) {
-    result_widgets::export_panel(ui, state);
+    use crate::state::ExportFormat;
+
+    ui.horizontal(|ui| {
+        ui.label("Format:");
+        let current_label = state.export_format.label();
+        egui::ComboBox::from_id_salt("dock_export_format")
+            .selected_text(current_label)
+            .show_ui(ui, |ui| {
+                for fmt in ExportFormat::ALL {
+                    ui.selectable_value(&mut state.export_format, fmt, fmt.label());
+                }
+            });
+    });
+
+    ui.horizontal(|ui| {
+        ui.label("Directory:");
+        let dir_label = state
+            .export_directory
+            .as_ref()
+            .map_or("(not set)".to_string(), |p| p.display().to_string());
+        ui.label(egui::RichText::new(dir_label).monospace().small());
+
+        if ui.button("Browse\u{2026}").clicked()
+            && let Some(path) = rfd::FileDialog::new().pick_folder()
+        {
+            state.export_directory = Some(path);
+        }
+    });
+
+    ui.add_space(4.0);
+
+    let can_export = state.spatial_result.is_some() && state.export_directory.is_some();
+    if ui
+        .add_enabled(can_export, egui::Button::new("Export Results"))
+        .clicked()
+    {
+        result_widgets::run_export(state);
+    }
+
+    if let Some(ref status) = state.export_status {
+        let color = if status.starts_with("Error") {
+            crate::theme::semantic::RED
+        } else {
+            crate::theme::semantic::GREEN
+        };
+        ui.label(egui::RichText::new(status.as_str()).small().color(color));
+    }
 }
 
 // ---------------------------------------------------------------------------
