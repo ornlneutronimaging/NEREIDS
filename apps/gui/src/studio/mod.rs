@@ -513,12 +513,17 @@ fn studio_forward_model(ui: &mut egui::Ui, state: &mut AppState) {
     design::content_header(ui, "Forward Model", "Simulated transmission spectrum");
 
     ui.horizontal(|ui| {
-        // Sync buttons (disabled during ENDF fetches to prevent index corruption)
-        ui.add_enabled_ui(!state.is_fetching_fm_endf, |ui| {
-            if ui.button("Copy from Config").clicked() {
-                forward_model::copy_config_to_fm(state);
-            }
-        });
+        // Sync buttons (disabled during ENDF fetches to prevent index corruption).
+        // Guard "Copy" by both FM and main fetch flags — copying mid-fetch
+        // from main would create orphaned Fetching entries in FM.
+        ui.add_enabled_ui(
+            !state.is_fetching_fm_endf && !state.is_fetching_endf,
+            |ui| {
+                if ui.button("Copy from Config").clicked() {
+                    forward_model::copy_config_to_fm(state);
+                }
+            },
+        );
         ui.add_enabled_ui(!state.is_fetching_endf, |ui| {
             if ui.button("Push to Config").clicked() {
                 forward_model::push_fm_to_config(state);
@@ -550,13 +555,18 @@ fn studio_forward_model(ui: &mut egui::Ui, state: &mut AppState) {
 fn studio_detectability(ui: &mut egui::Ui, state: &mut AppState) {
     design::content_header(ui, "Detectability", "Trace element sensitivity analysis");
 
-    // Sync button: copy main isotope config as matrix composition
+    // Sync button: copy main isotope config as matrix composition.
+    // Guard by both detect and main fetch flags — copying mid-fetch
+    // from main would create orphaned Fetching entries in matrix.
     ui.horizontal(|ui| {
-        ui.add_enabled_ui(!state.is_fetching_detect_endf, |ui| {
-            if ui.button("Copy matrix from Config").clicked() {
-                detectability::copy_config_to_detect_matrix(state);
-            }
-        });
+        ui.add_enabled_ui(
+            !state.is_fetching_detect_endf && !state.is_fetching_endf,
+            |ui| {
+                if ui.button("Copy matrix from Config").clicked() {
+                    detectability::copy_config_to_detect_matrix(state);
+                }
+            },
+        );
     });
     ui.add_space(4.0);
 
@@ -753,11 +763,39 @@ fn dock_residuals(ui: &mut egui::Ui, state: &AppState) {
     }
 
     let overlay_temp = result.temperature_k.unwrap_or(state.temperature_k);
+
+    // Build instrument params matching what the fit used, so residuals
+    // correctly reflect resolution broadening.
+    let instrument = if state.resolution_enabled {
+        use nereids_physics::resolution::{ResolutionFunction, ResolutionParams};
+        use nereids_physics::transmission::InstrumentParams;
+        match &state.resolution_mode {
+            crate::state::ResolutionMode::Gaussian {
+                delta_t_us,
+                delta_l_m,
+            } => ResolutionParams::new(state.beamline.flight_path_m, *delta_t_us, *delta_l_m)
+                .ok()
+                .map(|p| {
+                    std::sync::Arc::new(InstrumentParams {
+                        resolution: ResolutionFunction::Gaussian(p),
+                    })
+                }),
+            crate::state::ResolutionMode::Tabulated {
+                data: Some(tab), ..
+            } => Some(std::sync::Arc::new(InstrumentParams {
+                resolution: ResolutionFunction::Tabulated(std::sync::Arc::clone(tab)),
+            })),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
     let model = match nereids_fitting::transmission_model::TransmissionFitModel::new(
         energies.clone(),
         resonance_data,
         overlay_temp,
-        None,
+        instrument,
         (0..result.densities.len()).collect(),
         None,
         None,

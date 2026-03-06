@@ -499,6 +499,8 @@ pub(crate) fn push_fm_to_config(state: &mut AppState) {
     state.resolution_mode = state.fm_resolution_mode.clone();
     state.spatial_result = None;
     state.pixel_fit_result = None;
+    // Mark pipeline dirty so the Studio re-run button becomes active.
+    state.mark_dirty(GuidedStep::Analyze);
 }
 
 pub(crate) fn fm_fetch_endf_data(state: &mut AppState) {
