@@ -680,7 +680,11 @@ pub(crate) fn copy_config_to_detect_matrix(state: &mut AppState) {
             initial_density: e.initial_density,
             resonance_data: e.resonance_data.clone(),
             enabled: e.enabled,
-            endf_status: e.endf_status,
+            endf_status: if e.resonance_data.is_some() {
+                EndfStatus::Loaded
+            } else {
+                EndfStatus::Pending
+            },
         })
         .collect();
     state.detect_endf_library = state.endf_library;

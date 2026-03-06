@@ -764,8 +764,9 @@ fn dock_residuals(ui: &mut egui::Ui, state: &AppState) {
 
     let overlay_temp = result.temperature_k.unwrap_or(state.temperature_k);
 
-    // Build instrument params matching what the fit used, so residuals
-    // correctly reflect resolution broadening.
+    // Build instrument params from the current resolution settings so residuals
+    // reflect the currently configured resolution broadening (which may differ
+    // from what was used during the fit if settings were changed without re-running).
     let instrument = if state.resolution_enabled {
         use nereids_physics::resolution::{ResolutionFunction, ResolutionParams};
         use nereids_physics::transmission::InstrumentParams;
@@ -773,19 +774,38 @@ fn dock_residuals(ui: &mut egui::Ui, state: &AppState) {
             crate::state::ResolutionMode::Gaussian {
                 delta_t_us,
                 delta_l_m,
-            } => ResolutionParams::new(state.beamline.flight_path_m, *delta_t_us, *delta_l_m)
-                .ok()
-                .map(|p| {
-                    std::sync::Arc::new(InstrumentParams {
+            } => {
+                match ResolutionParams::new(state.beamline.flight_path_m, *delta_t_us, *delta_l_m) {
+                    Ok(p) => Some(std::sync::Arc::new(InstrumentParams {
                         resolution: ResolutionFunction::Gaussian(p),
-                    })
-                }),
+                    })),
+                    Err(_) => {
+                        ui.label(
+                            egui::RichText::new(
+                                "Invalid resolution settings — check configuration.",
+                            )
+                            .small()
+                            .color(colors.fg3),
+                        );
+                        return;
+                    }
+                }
+            }
             crate::state::ResolutionMode::Tabulated {
                 data: Some(tab), ..
             } => Some(std::sync::Arc::new(InstrumentParams {
                 resolution: ResolutionFunction::Tabulated(std::sync::Arc::clone(tab)),
             })),
-            _ => None,
+            crate::state::ResolutionMode::Tabulated { data: None, .. } => {
+                ui.label(
+                    egui::RichText::new(
+                        "Resolution file not loaded — load it in configuration first.",
+                    )
+                    .small()
+                    .color(colors.fg3),
+                );
+                return;
+            }
         }
     } else {
         None

@@ -24,11 +24,14 @@ pub fn forward_model_step(ui: &mut egui::Ui, state: &mut AppState) {
         design::teleport_pill(ui, "Analyze →", GuidedStep::Analyze, state);
         ui.separator();
         // Sync buttons (disabled during active ENDF fetches to prevent index corruption)
-        ui.add_enabled_ui(!state.is_fetching_fm_endf, |ui| {
-            if ui.button("Copy from Config").clicked() {
-                copy_config_to_fm(state);
-            }
-        });
+        ui.add_enabled_ui(
+            !state.is_fetching_fm_endf && !state.is_fetching_endf,
+            |ui| {
+                if ui.button("Copy from Config").clicked() {
+                    copy_config_to_fm(state);
+                }
+            },
+        );
         ui.add_enabled_ui(!state.is_fetching_endf, |ui| {
             if ui.button("Push to Config").clicked() {
                 push_fm_to_config(state);
@@ -463,7 +466,11 @@ pub(crate) fn copy_config_to_fm(state: &mut AppState) {
             initial_density: e.initial_density,
             resonance_data: e.resonance_data.clone(),
             enabled: e.enabled,
-            endf_status: e.endf_status,
+            endf_status: if e.resonance_data.is_some() {
+                EndfStatus::Loaded
+            } else {
+                EndfStatus::Pending
+            },
         })
         .collect();
     state.fm_endf_library = state.endf_library;
