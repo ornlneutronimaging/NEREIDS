@@ -26,52 +26,12 @@ pub fn forward_model_step(ui: &mut egui::Ui, state: &mut AppState) {
         // Sync buttons (disabled during active ENDF fetches to prevent index corruption)
         ui.add_enabled_ui(!state.is_fetching_fm_endf, |ui| {
             if ui.button("Copy from Config").clicked() {
-                state.fm_isotope_entries = state
-                    .isotope_entries
-                    .iter()
-                    .map(|e| IsotopeEntry {
-                        z: e.z,
-                        a: e.a,
-                        symbol: e.symbol.clone(),
-                        initial_density: e.initial_density,
-                        resonance_data: e.resonance_data.clone(),
-                        enabled: e.enabled,
-                        endf_status: e.endf_status,
-                    })
-                    .collect();
-                state.fm_endf_library = state.endf_library;
-                state.fm_temperature_k = state.temperature_k;
-                state.fm_resolution_enabled = state.resolution_enabled;
-                state.fm_resolution_mode = state.resolution_mode.clone();
-                state.fm_spectrum = None;
-                state.fm_per_isotope_spectra.clear();
+                copy_config_to_fm(state);
             }
         });
         ui.add_enabled_ui(!state.is_fetching_endf, |ui| {
             if ui.button("Push to Config").clicked() {
-                state.isotope_entries = state
-                    .fm_isotope_entries
-                    .iter()
-                    .map(|e| IsotopeEntry {
-                        z: e.z,
-                        a: e.a,
-                        symbol: e.symbol.clone(),
-                        initial_density: e.initial_density,
-                        resonance_data: e.resonance_data.clone(),
-                        enabled: e.enabled,
-                        endf_status: if e.resonance_data.is_some() {
-                            EndfStatus::Loaded
-                        } else {
-                            EndfStatus::Pending
-                        },
-                    })
-                    .collect();
-                state.endf_library = state.fm_endf_library;
-                state.temperature_k = state.fm_temperature_k;
-                state.resolution_enabled = state.fm_resolution_enabled;
-                state.resolution_mode = state.fm_resolution_mode.clone();
-                state.spatial_result = None;
-                state.pixel_fit_result = None;
+                push_fm_to_config(state);
             }
         });
         ui.separator();
@@ -489,6 +449,56 @@ pub(crate) fn fm_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 );
             }
         });
+}
+
+/// Copy main Configure isotopes + settings into the FM sandbox.
+pub(crate) fn copy_config_to_fm(state: &mut AppState) {
+    state.fm_isotope_entries = state
+        .isotope_entries
+        .iter()
+        .map(|e| IsotopeEntry {
+            z: e.z,
+            a: e.a,
+            symbol: e.symbol.clone(),
+            initial_density: e.initial_density,
+            resonance_data: e.resonance_data.clone(),
+            enabled: e.enabled,
+            endf_status: e.endf_status,
+        })
+        .collect();
+    state.fm_endf_library = state.endf_library;
+    state.fm_temperature_k = state.temperature_k;
+    state.fm_resolution_enabled = state.resolution_enabled;
+    state.fm_resolution_mode = state.resolution_mode.clone();
+    state.fm_spectrum = None;
+    state.fm_per_isotope_spectra.clear();
+}
+
+/// Push FM sandbox isotopes + settings back to main Configure.
+pub(crate) fn push_fm_to_config(state: &mut AppState) {
+    state.isotope_entries = state
+        .fm_isotope_entries
+        .iter()
+        .map(|e| IsotopeEntry {
+            z: e.z,
+            a: e.a,
+            symbol: e.symbol.clone(),
+            initial_density: e.initial_density,
+            resonance_data: e.resonance_data.clone(),
+            enabled: e.enabled,
+            endf_status: if e.resonance_data.is_some() {
+                EndfStatus::Loaded
+            } else {
+                EndfStatus::Pending
+            },
+        })
+        .collect();
+    state.endf_library = state.fm_endf_library;
+    state.temperature_k = state.fm_temperature_k;
+    state.resolution_enabled = state.fm_resolution_enabled;
+    state.resolution_mode = state.fm_resolution_mode.clone();
+    state.spatial_result = None;
+    state.pixel_fit_result = None;
 }
 
 pub(crate) fn fm_fetch_endf_data(state: &mut AppState) {

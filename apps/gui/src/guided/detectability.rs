@@ -661,6 +661,26 @@ fn run_detectability(state: &mut AppState) {
     }
 }
 
+/// Copy main Configure isotopes into the Detectability matrix list.
+pub(crate) fn copy_config_to_detect_matrix(state: &mut AppState) {
+    use crate::state::IsotopeEntry;
+    state.detect_matrix_entries = state
+        .isotope_entries
+        .iter()
+        .map(|e| IsotopeEntry {
+            z: e.z,
+            a: e.a,
+            symbol: e.symbol.clone(),
+            initial_density: e.initial_density,
+            resonance_data: e.resonance_data.clone(),
+            enabled: e.enabled,
+            endf_status: e.endf_status,
+        })
+        .collect();
+    state.detect_endf_library = state.endf_library;
+    state.detect_results.clear();
+}
+
 /// Fetch ENDF data for matrix + trace isotopes.
 /// Index convention: 0..N = matrix entries, N.. = trace entries at (index - N).
 pub(crate) fn detect_fetch_endf_data(state: &mut AppState) {
