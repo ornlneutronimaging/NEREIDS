@@ -12,6 +12,9 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 
+/// Fraction of opaque energy bins above which we show a warning.
+const OPAQUE_WARN_FRACTION: f64 = 0.5;
+
 /// Draw the Detectability tool content.
 pub fn detectability_step(ui: &mut egui::Ui, state: &mut AppState) {
     // -- Header row --
@@ -482,7 +485,7 @@ pub(crate) fn detect_results_panel(ui: &mut egui::Ui, state: &AppState) {
         .iter()
         .map(|(_, r)| r.opaque_fraction)
         .fold(0.0f64, f64::max);
-    if max_opaque > 0.5 {
+    if max_opaque > OPAQUE_WARN_FRACTION {
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new(format!(
@@ -515,7 +518,7 @@ pub(crate) fn detect_results_panel(ui: &mut egui::Ui, state: &AppState) {
                     ui.label(format!("{:.2e}", report.peak_delta_t_per_ppm));
                     if report.detectable {
                         design::badge(ui, "DETECTABLE", design::BadgeVariant::Green);
-                    } else if report.opaque_fraction > 0.5 {
+                    } else if report.opaque_fraction > OPAQUE_WARN_FRACTION {
                         design::badge(ui, "OPAQUE MATRIX", design::BadgeVariant::Red);
                     } else {
                         design::badge(ui, "NOT DETECTED", design::BadgeVariant::Red);
