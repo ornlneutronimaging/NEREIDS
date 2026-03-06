@@ -519,6 +519,15 @@ pub fn broadened_cross_sections_from_base(
             resonance_data.len(),
         )));
     }
+    for (i, row) in base_xs.iter().enumerate() {
+        if row.len() != energies.len() {
+            return Err(TransmissionError::InputMismatch(format!(
+                "base_xs[{i}] has {} energies but expected {}",
+                row.len(),
+                energies.len(),
+            )));
+        }
+    }
     if instrument.is_some() && !energies.windows(2).all(|w| w[0] <= w[1]) {
         return Err(ResolutionError::UnsortedEnergies.into());
     }

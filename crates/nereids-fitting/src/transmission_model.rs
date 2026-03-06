@@ -152,20 +152,21 @@ pub struct TransmissionFitModel {
     /// Cached unbroadened (Reich-Moore) cross-sections, computed once in
     /// `new()` when `temperature_index` is `Some`. Eliminates redundant
     /// O(N_energy × N_resonances) computation on every `evaluate()` call.
-    base_xs: Option<Vec<Vec<f64>>>,
+    /// Wrapped in `Arc` so `spatial_map` can share a single allocation across
+    /// all per-pixel `TransmissionFitModel` instances without deep cloning.
+    base_xs: Option<Arc<Vec<Vec<f64>>>>,
 }
 
 impl TransmissionFitModel {
     /// Create a validated `TransmissionFitModel`.
     ///
-    /// # Errors
-    /// Returns `FittingError::InvalidConfig` if `temperature_index` overlaps
-    /// with `density_indices`.
-    /// Create a new transmission fit model.
-    ///
     /// When `external_base_xs` is `Some`, uses those precomputed unbroadened
     /// cross-sections instead of computing them (expensive Reich-Moore).
     /// `spatial_map` precomputes once for all pixels and passes them here.
+    ///
+    /// # Errors
+    /// Returns `FittingError::InvalidConfig` if `temperature_index` overlaps
+    /// with `density_indices`, or if `external_base_xs` has a mismatched shape.
     pub fn new(
         energies: Vec<f64>,
         resonance_data: Vec<ResonanceData>,
@@ -173,7 +174,7 @@ impl TransmissionFitModel {
         instrument: Option<Arc<InstrumentParams>>,
         density_indices: Vec<usize>,
         temperature_index: Option<usize>,
-        external_base_xs: Option<Vec<Vec<f64>>>,
+        external_base_xs: Option<Arc<Vec<Vec<f64>>>>,
     ) -> Result<Self, FittingError> {
         if let Some(ti) = temperature_index
             && density_indices.contains(&ti)
@@ -182,16 +183,35 @@ impl TransmissionFitModel {
                 "temperature_index must not overlap with density_indices".into(),
             ));
         }
+        // Validate external base XS shape before accepting.
+        if let Some(ref xs) = external_base_xs {
+            if xs.len() != resonance_data.len() {
+                return Err(FittingError::InvalidConfig(format!(
+                    "external_base_xs has {} isotopes but resonance_data has {}",
+                    xs.len(),
+                    resonance_data.len(),
+                )));
+            }
+            for (i, row) in xs.iter().enumerate() {
+                if row.len() != energies.len() {
+                    return Err(FittingError::InvalidConfig(format!(
+                        "external_base_xs[{i}] has {} energies but expected {}",
+                        row.len(),
+                        energies.len(),
+                    )));
+                }
+            }
+        }
         let base_xs = match external_base_xs {
             Some(xs) => Some(xs),
-            None if temperature_index.is_some() => Some(
+            None if temperature_index.is_some() => Some(Arc::new(
                 transmission::unbroadened_cross_sections(&energies, &resonance_data, None)
                     .map_err(|e| {
                         FittingError::InvalidConfig(format!(
                             "failed to compute unbroadened cross-sections: {e}"
                         ))
                     })?,
-            ),
+            )),
             None => None,
         };
         Ok(Self {

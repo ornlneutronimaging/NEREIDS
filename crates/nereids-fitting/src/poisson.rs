@@ -13,6 +13,8 @@
 //! ## TRINIDI Reference
 //! - `trinidi/reconstruct.py` — Poisson NLL and APGM optimizer
 
+use std::sync::Arc;
+
 use nereids_endf::resonance::ResonanceData;
 use nereids_physics::transmission::{self, InstrumentParams};
 
@@ -691,7 +693,8 @@ pub struct TemperatureContext {
     /// Cached unbroadened (Reich-Moore) cross-sections, computed once.
     /// When `Some`, the optimizer uses `_from_base` variants to skip the
     /// expensive per-iteration Reich-Moore evaluation.
-    pub base_xs: Option<Vec<Vec<f64>>>,
+    /// Wrapped in `Arc` to share across pixels without deep cloning.
+    pub base_xs: Option<Arc<Vec<Vec<f64>>>>,
 }
 
 /// Run Poisson-likelihood optimization with an analytical gradient.

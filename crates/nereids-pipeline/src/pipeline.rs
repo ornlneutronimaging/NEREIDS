@@ -514,7 +514,7 @@ pub fn fit_spectrum(
 
         // When spatial_map precomputes base_xs once for all pixels, inject
         // them into the model to skip per-pixel Reich-Moore evaluation.
-        let base_xs_for_model = config.precomputed_base_xs().map(|arc| (**arc).clone());
+        let base_xs_for_model = config.precomputed_base_xs().cloned();
         let model = TransmissionFitModel::new(
             config.energies().to_vec(),
             config.resonance_data().to_vec(),
@@ -551,13 +551,13 @@ pub fn fit_spectrum(
 
                 // Use precomputed base_xs when available (spatial_map path);
                 // fall back to computing them here (single-pixel path).
-                let base_xs = match config.precomputed_base_xs() {
-                    Some(cached) => (**cached).clone(),
-                    None => phys_transmission::unbroadened_cross_sections(
+                let base_xs: Arc<Vec<Vec<f64>>> = match config.precomputed_base_xs() {
+                    Some(cached) => Arc::clone(cached),
+                    None => Arc::new(phys_transmission::unbroadened_cross_sections(
                         config.energies(),
                         config.resonance_data(),
                         None,
-                    )?,
+                    )?),
                 };
 
                 // Compute initial broadened XS from base (Doppler + resolution

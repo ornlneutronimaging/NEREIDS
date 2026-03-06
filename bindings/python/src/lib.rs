@@ -817,15 +817,23 @@ fn fit_spectrum(
 
                 // When fitting temperature, build a TemperatureContext with cached
                 // base XS so the Poisson optimizer can update T each iteration.
+                // Share the same Arc between TemperatureContext and TransmissionFitModel
+                // to avoid computing unbroadened XS twice.
+                let base_xs_arc = if fit_temperature {
+                    Some(Arc::new(
+                        transmission::unbroadened_cross_sections(&e_owned, &res_data, None)
+                            .map_err(|e| format!("unbroadened_cross_sections failed: {e}"))?,
+                    ))
+                } else {
+                    None
+                };
                 let temp_ctx = if fit_temperature {
-                    let base = transmission::unbroadened_cross_sections(&e_owned, &res_data, None)
-                        .map_err(|e| format!("unbroadened_cross_sections failed: {e}"))?;
                     Some(TemperatureContext {
                         temperature_index: n_isotopes,
                         resonance_data: res_data.clone(),
                         energies: e_owned.clone(),
                         instrument: instrument.clone(),
-                        base_xs: Some(base),
+                        base_xs: base_xs_arc.clone(),
                     })
                 } else {
                     None
@@ -840,7 +848,7 @@ fn fit_spectrum(
                         instrument.map(Arc::new),
                         (*density_indices).clone(),
                         Some(n_isotopes),
-                        None,
+                        base_xs_arc,
                     )
                     .map_err(|e| format!("TransmissionFitModel::new failed: {e}"))?;
                     &full_model
