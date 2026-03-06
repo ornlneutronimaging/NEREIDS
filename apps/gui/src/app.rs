@@ -144,6 +144,8 @@ fn poll_pending_tasks(state: &mut AppState) {
                 state.fitting_progress_counter = None;
                 state.active_tab = Tab::Map;
                 state.pending_spatial = None;
+                // Pipeline re-run completed successfully — clear dirty state.
+                state.clear_dirty();
             }
             Ok(Err(err_msg)) => {
                 state.status_message = format!("Spatial map error: {err_msg}");

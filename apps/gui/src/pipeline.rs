@@ -65,9 +65,10 @@ pub fn run_pipeline(state: &mut AppState, from_step: GuidedStep) -> Result<(), S
                 }
 
                 // Analyze is async — launch and return.  The GUI polls the
-                // channel for completion.
+                // channel for completion.  Dirty state is cleared in
+                // poll_pending_tasks on success; on error/cancel it stays
+                // dirty so the user can re-run.
                 crate::guided::analyze::run_spatial_map(state);
-                state.clear_dirty();
                 return Ok(());
             }
             // Other stages (Configure, Load, Bin, Results, etc.) are either
