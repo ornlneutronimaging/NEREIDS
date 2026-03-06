@@ -8,7 +8,9 @@ use rayon::prelude::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use nereids_physics::transmission::{InstrumentParams, broadened_cross_sections};
+use nereids_physics::transmission::{
+    InstrumentParams, broadened_cross_sections, unbroadened_cross_sections,
+};
 
 use crate::error::PipelineError;
 use crate::pipeline::{FitConfig, SpectrumFitResult, fit_spectrum};
@@ -168,7 +170,22 @@ pub fn spatial_map(
     // full Jacobian evaluation per pixel (N_free model evaluations for
     // finite-difference, or free for analytical) plus the O(n_free³) inversion.
     let fast_config = if config.fit_temperature() {
-        config.clone().with_compute_covariance(false)
+        // Precompute unbroadened (Reich-Moore) cross-sections ONCE for all
+        // pixels.  Without this, each pixel recomputes them inside
+        // TransmissionFitModel::new() and TemperatureContext construction,
+        // dominating total runtime for heavy nuclei (U-238: ~5000 resonances).
+        let base_xs = match config.precomputed_base_xs().cloned() {
+            Some(cached) => cached,
+            None => {
+                let xs =
+                    unbroadened_cross_sections(config.energies(), config.resonance_data(), cancel)?;
+                Arc::new(xs)
+            }
+        };
+        config
+            .clone()
+            .with_precomputed_base_xs(base_xs)
+            .with_compute_covariance(false)
     } else {
         // Use caller-supplied precomputed cross-sections when available; only call
         // broadened_cross_sections when none are provided.  This lets repeated
@@ -412,6 +429,7 @@ mod tests {
             None,
             vec![0],
             None,
+            None,
         )
         .unwrap();
         let spectrum = model.evaluate(&[true_density]);
@@ -483,6 +501,7 @@ mod tests {
             0.0,
             None,
             vec![0],
+            None,
             None,
         )
         .unwrap();
@@ -601,6 +620,7 @@ mod tests {
             None,
             vec![0],
             None,
+            None,
         )
         .unwrap();
         let spectrum = model.evaluate(&[true_density]);
@@ -678,6 +698,7 @@ mod tests {
             true_temp,
             None,
             vec![0],
+            None,
             None,
         )
         .unwrap();

@@ -728,6 +728,7 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
             None,
             (0..result.densities.len()).collect(),
             None,
+            None,
         )
         .ok()?;
 

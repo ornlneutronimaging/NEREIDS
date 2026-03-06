@@ -404,6 +404,7 @@ fn analysis_spectrum_column(ui: &mut egui::Ui, state: &mut AppState) {
             None,
             (0..result.densities.len()).collect(),
             None,
+            None,
         )
         .ok()?;
 

@@ -691,6 +691,7 @@ fn fit_spectrum(
                         instrument,
                         (0..n_isotopes).collect(),
                         Some(n_isotopes),
+                        None,
                     )
                     .map_err(|e| format!("TransmissionFitModel::new failed: {e}"))?;
                     lm::levenberg_marquardt(&model, &t_owned, &s_owned, &mut params, &config)
@@ -839,6 +840,7 @@ fn fit_spectrum(
                         instrument.map(Arc::new),
                         (*density_indices).clone(),
                         Some(n_isotopes),
+                        None,
                     )
                     .map_err(|e| format!("TransmissionFitModel::new failed: {e}"))?;
                     &full_model

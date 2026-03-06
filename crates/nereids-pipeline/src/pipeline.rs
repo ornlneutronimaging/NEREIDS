@@ -107,6 +107,11 @@ pub struct FitConfig {
     /// per isotope.  When `Some`, `fit_spectrum` skips the expensive resonance
     /// and broadening computation and uses `PrecomputedTransmissionModel` instead.
     precomputed_cross_sections: Option<Arc<Vec<Vec<f64>>>>,
+    /// Precomputed unbroadened (Reich-Moore) cross-sections, one `Vec<f64>` per
+    /// isotope.  When `Some` and temperature fitting is enabled, `fit_spectrum`
+    /// skips the per-pixel Reich-Moore evaluation and uses `_from_base` variants
+    /// for both the `TransmissionFitModel` and `TemperatureContext`.
+    precomputed_base_xs: Option<Arc<Vec<Vec<f64>>>>,
     /// When `true`, `temperature_k` is treated as an initial guess and fitted
     /// jointly with the areal densities.
     fit_temperature: bool,
@@ -173,6 +178,7 @@ impl FitConfig {
             initial_densities,
             lm_config,
             precomputed_cross_sections: None,
+            precomputed_base_xs: None,
             fit_temperature: false,
             compute_covariance: true,
             solver: SolverChoice::default(),
@@ -183,6 +189,15 @@ impl FitConfig {
     #[must_use]
     pub fn with_precomputed_cross_sections(mut self, xs: Arc<Vec<Vec<f64>>>) -> Self {
         self.precomputed_cross_sections = Some(xs);
+        self
+    }
+
+    /// Set precomputed unbroadened (base) cross-sections (builder pattern).
+    ///
+    /// When set, temperature fitting skips the per-pixel Reich-Moore evaluation.
+    #[must_use]
+    pub fn with_precomputed_base_xs(mut self, xs: Arc<Vec<Vec<f64>>>) -> Self {
+        self.precomputed_base_xs = Some(xs);
         self
     }
 
@@ -252,6 +267,12 @@ impl FitConfig {
     #[must_use]
     pub fn precomputed_cross_sections(&self) -> Option<&Arc<Vec<Vec<f64>>>> {
         self.precomputed_cross_sections.as_ref()
+    }
+
+    /// Returns the precomputed unbroadened (base) cross-sections, if any.
+    #[must_use]
+    pub fn precomputed_base_xs(&self) -> Option<&Arc<Vec<Vec<f64>>>> {
+        self.precomputed_base_xs.as_ref()
     }
 
     /// Returns whether temperature fitting is enabled.
@@ -472,6 +493,7 @@ pub fn fit_spectrum(
                 instrument,
                 (0..n_isotopes).collect(),
                 None,
+                None,
             )?;
             dispatch_solver(
                 &model,
@@ -489,6 +511,10 @@ pub fn fit_spectrum(
             .resolution()
             .cloned()
             .map(|r| Arc::new(InstrumentParams { resolution: r }));
+
+        // When spatial_map precomputes base_xs once for all pixels, inject
+        // them into the model to skip per-pixel Reich-Moore evaluation.
+        let base_xs_for_model = config.precomputed_base_xs().map(|arc| (**arc).clone());
         let model = TransmissionFitModel::new(
             config.energies().to_vec(),
             config.resonance_data().to_vec(),
@@ -496,6 +522,7 @@ pub fn fit_spectrum(
             instrument.clone(),
             (0..n_isotopes).collect(),
             temperature_index,
+            base_xs_for_model,
         )?;
 
         match config.solver() {
@@ -522,20 +549,25 @@ pub fn fit_spectrum(
                 let density_indices: Vec<usize> = (0..n_isotopes).collect();
                 let instrument_plain = instrument.as_deref().cloned();
 
-                // Compute initial broadened cross-sections at the starting temperature.
-                let xs = phys_transmission::broadened_cross_sections(
+                // Use precomputed base_xs when available (spatial_map path);
+                // fall back to computing them here (single-pixel path).
+                let base_xs = match config.precomputed_base_xs() {
+                    Some(cached) => (**cached).clone(),
+                    None => phys_transmission::unbroadened_cross_sections(
+                        config.energies(),
+                        config.resonance_data(),
+                        None,
+                    )?,
+                };
+
+                // Compute initial broadened XS from base (Doppler + resolution
+                // only, no redundant Reich-Moore).
+                let xs = phys_transmission::broadened_cross_sections_from_base(
                     config.energies(),
+                    &base_xs,
                     config.resonance_data(),
                     config.temperature_k(),
                     instrument.as_deref(),
-                    None,
-                )?;
-
-                // Precompute unbroadened XS for the TemperatureContext cache.
-                let base_xs = phys_transmission::unbroadened_cross_sections(
-                    config.energies(),
-                    config.resonance_data(),
-                    None,
                 )?;
 
                 let temp_ctx = TemperatureContext {
@@ -652,6 +684,7 @@ mod tests {
             None,
             vec![0],
             None,
+            None,
         )
         .unwrap();
         let y_obs = model.evaluate(&[true_density]);
@@ -697,6 +730,7 @@ mod tests {
             0.0,
             None,
             vec![0],
+            None,
             None,
         )
         .unwrap();
@@ -936,6 +970,7 @@ mod tests {
             0.0,
             None,
             vec![0],
+            None,
             None,
         )
         .unwrap();

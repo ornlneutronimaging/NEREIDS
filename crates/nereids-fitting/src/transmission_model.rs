@@ -161,6 +161,11 @@ impl TransmissionFitModel {
     /// # Errors
     /// Returns `FittingError::InvalidConfig` if `temperature_index` overlaps
     /// with `density_indices`.
+    /// Create a new transmission fit model.
+    ///
+    /// When `external_base_xs` is `Some`, uses those precomputed unbroadened
+    /// cross-sections instead of computing them (expensive Reich-Moore).
+    /// `spatial_map` precomputes once for all pixels and passes them here.
     pub fn new(
         energies: Vec<f64>,
         resonance_data: Vec<ResonanceData>,
@@ -168,6 +173,7 @@ impl TransmissionFitModel {
         instrument: Option<Arc<InstrumentParams>>,
         density_indices: Vec<usize>,
         temperature_index: Option<usize>,
+        external_base_xs: Option<Vec<Vec<f64>>>,
     ) -> Result<Self, FittingError> {
         if let Some(ti) = temperature_index
             && density_indices.contains(&ti)
@@ -176,17 +182,17 @@ impl TransmissionFitModel {
                 "temperature_index must not overlap with density_indices".into(),
             ));
         }
-        let base_xs = if temperature_index.is_some() {
-            Some(
+        let base_xs = match external_base_xs {
+            Some(xs) => Some(xs),
+            None if temperature_index.is_some() => Some(
                 transmission::unbroadened_cross_sections(&energies, &resonance_data, None)
                     .map_err(|e| {
                         FittingError::InvalidConfig(format!(
                             "failed to compute unbroadened cross-sections: {e}"
                         ))
                     })?,
-            )
-        } else {
-            None
+            ),
+            None => None,
         };
         Ok(Self {
             energies,
@@ -419,7 +425,7 @@ mod tests {
         let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
 
         let model =
-            TransmissionFitModel::new(energies.clone(), vec![data], 0.0, None, vec![0], None)
+            TransmissionFitModel::new(energies.clone(), vec![data], 0.0, None, vec![0], None, None)
                 .unwrap();
 
         let y_obs = model.evaluate(&[true_thickness]);
@@ -494,6 +500,7 @@ mod tests {
             None,
             vec![0, 1],
             None,
+            None,
         )
         .unwrap();
 
@@ -550,13 +557,21 @@ mod tests {
             None,
             vec![0],
             Some(1),
+            None,
         )
         .unwrap();
 
         // Model with fixed temperature = 300 K (no temperature_index).
-        let model_fixed =
-            TransmissionFitModel::new(energies.clone(), vec![data], 300.0, None, vec![0], None)
-                .unwrap();
+        let model_fixed = TransmissionFitModel::new(
+            energies.clone(),
+            vec![data],
+            300.0,
+            None,
+            vec![0],
+            None,
+            None,
+        )
+        .unwrap();
 
         let density = 0.0005;
         let y_via_index = model.evaluate(&[density, 300.0]);
@@ -593,6 +608,7 @@ mod tests {
             None,
             vec![0],
             Some(1), // params[1] = temperature
+            None,
         )
         .unwrap();
 
