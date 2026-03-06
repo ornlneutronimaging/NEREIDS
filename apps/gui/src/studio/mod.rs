@@ -231,22 +231,42 @@ fn analysis_map_column(
     };
 
     if let Some(data) = map_data {
-        if show_bar {
-            ui.horizontal(|ui| {
+        // Colorbar width: 16px bar + 50px labels = 66px + 4px spacing.
+        let colorbar_reserved = if show_bar { 70.0 } else { 0.0 };
+
+        // Compute image display size using the parent's available dimensions
+        // (BEFORE entering a horizontal, where available_height collapses to
+        // one line height and produces a tiny image).
+        let (dh, dw) = (data.shape()[0], data.shape()[1]);
+        let img_avail_w = (ui.available_width() - colorbar_reserved).max(32.0);
+        let img_avail_h = ui.available_height();
+        let scale_w = img_avail_w / dw.max(1) as f32;
+        let scale = if img_avail_h > 2000.0 {
+            scale_w
+        } else {
+            let scale_h = img_avail_h / dh.max(1) as f32;
+            scale_w.min(scale_h)
+        };
+        let img_height = dh as f32 * scale;
+
+        // Use allocate_ui_with_layout with the pre-computed height so the
+        // horizontal strip has enough room for the image.
+        let strip_height = img_height.max(128.0); // at least colorbar height
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), strip_height),
+            egui::Layout::left_to_right(egui::Align::TOP),
+            |ui| {
                 if let Some((y, x)) =
                     show_colormapped_image(ui, data, "studio_analysis_map", colormap)
                 {
                     state.selected_pixel = Some((y, x));
                     state.pixel_fit_result = None;
                 }
-                result_widgets::draw_colorbar(ui, data, colormap);
-            });
-        } else if let Some((y, x)) =
-            show_colormapped_image(ui, data, "studio_analysis_map", colormap)
-        {
-            state.selected_pixel = Some((y, x));
-            state.pixel_fit_result = None;
-        }
+                if show_bar {
+                    result_widgets::draw_colorbar(ui, data, colormap);
+                }
+            },
+        );
 
         // Toolbelt
         let label = if tile_idx < n_density {
