@@ -661,6 +661,45 @@ fn run_detectability(state: &mut AppState) {
     }
 }
 
+/// Copy main Configure isotopes into the Detectability matrix list.
+///
+/// When the main config uses a different ENDF library, trace entries are
+/// invalidated (resonance data cleared, status reset to Pending) to prevent
+/// mixed-library detectability runs.
+pub(crate) fn copy_config_to_detect_matrix(state: &mut AppState) {
+    use crate::state::IsotopeEntry;
+    let library_changed = state.endf_library != state.detect_endf_library;
+
+    state.detect_matrix_entries = state
+        .isotope_entries
+        .iter()
+        .map(|e| IsotopeEntry {
+            z: e.z,
+            a: e.a,
+            symbol: e.symbol.clone(),
+            initial_density: e.initial_density,
+            resonance_data: e.resonance_data.clone(),
+            enabled: e.enabled,
+            endf_status: if e.resonance_data.is_some() {
+                EndfStatus::Loaded
+            } else {
+                EndfStatus::Pending
+            },
+        })
+        .collect();
+    state.detect_endf_library = state.endf_library;
+    state.detect_results.clear();
+
+    // If the library changed, invalidate trace entries so they get re-fetched
+    // from the new library (same pattern as detect_library_selector).
+    if library_changed {
+        for t in &mut state.detect_trace_entries {
+            t.resonance_data = None;
+            t.endf_status = EndfStatus::Pending;
+        }
+    }
+}
+
 /// Fetch ENDF data for matrix + trace isotopes.
 /// Index convention: 0..N = matrix entries, N.. = trace entries at (index - N).
 pub(crate) fn detect_fetch_endf_data(state: &mut AppState) {

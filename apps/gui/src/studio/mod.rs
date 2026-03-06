@@ -513,6 +513,23 @@ fn studio_forward_model(ui: &mut egui::Ui, state: &mut AppState) {
     design::content_header(ui, "Forward Model", "Simulated transmission spectrum");
 
     ui.horizontal(|ui| {
+        // Sync buttons (disabled during ENDF fetches to prevent index corruption).
+        // Guard "Copy" by both FM and main fetch flags — copying mid-fetch
+        // from main would create orphaned Fetching entries in FM.
+        ui.add_enabled_ui(
+            !state.is_fetching_fm_endf && !state.is_fetching_endf,
+            |ui| {
+                if ui.button("Copy from Config").clicked() {
+                    forward_model::copy_config_to_fm(state);
+                }
+            },
+        );
+        ui.add_enabled_ui(!state.is_fetching_endf, |ui| {
+            if ui.button("Push to Config").clicked() {
+                forward_model::push_fm_to_config(state);
+            }
+        });
+        ui.separator();
         ui.selectable_value(
             &mut state.fm_spectrum_axis,
             SpectrumAxis::EnergyEv,
@@ -537,6 +554,21 @@ fn studio_forward_model(ui: &mut egui::Ui, state: &mut AppState) {
 
 fn studio_detectability(ui: &mut egui::Ui, state: &mut AppState) {
     design::content_header(ui, "Detectability", "Trace element sensitivity analysis");
+
+    // Sync button: copy main isotope config as matrix composition.
+    // Guard by both detect and main fetch flags — copying mid-fetch
+    // from main would create orphaned Fetching entries in matrix.
+    ui.horizontal(|ui| {
+        ui.add_enabled_ui(
+            !state.is_fetching_detect_endf && !state.is_fetching_endf,
+            |ui| {
+                if ui.button("Copy matrix from Config").clicked() {
+                    detectability::copy_config_to_detect_matrix(state);
+                }
+            },
+        );
+    });
+    ui.add_space(4.0);
 
     let locked = state.is_fetching_detect_endf;
     detectability::detect_library_selector(ui, state, locked);
@@ -584,7 +616,7 @@ fn bottom_dock(ctx: &egui::Context, state: &mut AppState) {
 
             egui::ScrollArea::vertical().show(ui, |ui| match state.studio_dock_tab {
                 0 => dock_isotopes(ui, state),
-                1 => dock_residuals(ui),
+                1 => dock_residuals(ui, state),
                 2 => dock_provenance(ui, state),
                 3 => dock_export(ui, state),
                 _ => {}
@@ -592,16 +624,27 @@ fn bottom_dock(ctx: &egui::Context, state: &mut AppState) {
         });
 }
 
-/// Isotopes table (read-only view of configure isotope list).
+/// Isotopes table (read-only reference view; editing is in the left sidebar).
 fn dock_isotopes(ui: &mut egui::Ui, state: &AppState) {
     if state.isotope_entries.is_empty() {
         ui.label(
-            egui::RichText::new("No isotopes configured. Add isotopes in Guided → Configure.")
-                .small()
-                .color(ThemeColors::from_ctx(ui.ctx()).fg3),
+            egui::RichText::new(
+                "No isotopes configured. Add isotopes in Guided \u{2192} Configure.",
+            )
+            .small()
+            .color(ThemeColors::from_ctx(ui.ctx()).fg3),
         );
         return;
     }
+
+    ui.label(
+        egui::RichText::new(
+            "Read-only reference \u{2014} edit densities in the sidebar Isotopes card.",
+        )
+        .small()
+        .color(ThemeColors::from_ctx(ui.ctx()).fg3),
+    );
+    ui.add_space(4.0);
 
     egui::Grid::new("dock_isotope_grid")
         .num_columns(6)
@@ -653,13 +696,197 @@ fn dock_isotopes(ui: &mut egui::Ui, state: &AppState) {
         });
 }
 
-/// Residuals placeholder.
-fn dock_residuals(ui: &mut egui::Ui) {
-    ui.label(
-        egui::RichText::new("Residual analysis \u{2014} coming in a future update.")
-            .small()
-            .color(ThemeColors::from_ctx(ui.ctx()).fg3),
+/// Residuals dock tab — shows residual plot + statistics for the selected pixel.
+fn dock_residuals(ui: &mut egui::Ui, state: &AppState) {
+    let colors = ThemeColors::from_ctx(ui.ctx());
+
+    // Need a pixel fit result to show residuals.
+    let result = match &state.pixel_fit_result {
+        Some(r) if r.converged => r,
+        Some(_) => {
+            ui.label(
+                egui::RichText::new("Fit did not converge \u{2014} no residuals to display.")
+                    .small()
+                    .color(colors.fg3),
+            );
+            return;
+        }
+        None => {
+            ui.label(
+                egui::RichText::new(
+                    "Click a pixel in the density map to view residuals for that fit.",
+                )
+                .small()
+                .color(colors.fg3),
+            );
+            return;
+        }
+    };
+
+    let (energies, norm, (py, px)) =
+        match (&state.energies, &state.normalized, state.selected_pixel) {
+            (Some(e), Some(n), Some(p)) => (e, n, p),
+            _ => {
+                ui.label(
+                    egui::RichText::new("Missing energy grid or normalized data.")
+                        .small()
+                        .color(colors.fg3),
+                );
+                return;
+            }
+        };
+
+    let shape = norm.transmission.shape();
+    let n_tof = shape[0];
+    if py >= shape[1] || px >= shape[2] {
+        ui.label("Selected pixel is out of bounds.");
+        return;
+    }
+
+    // Build fitted model curve from result densities.
+    let enabled: Vec<_> = state
+        .isotope_entries
+        .iter()
+        .filter(|e| e.enabled && e.resonance_data.is_some())
+        .collect();
+    let resonance_data: Vec<_> = enabled
+        .iter()
+        .filter_map(|e| e.resonance_data.clone())
+        .collect();
+    if resonance_data.len() != result.densities.len() {
+        ui.label(
+            egui::RichText::new("Isotope count mismatch \u{2014} re-run the fit.")
+                .small()
+                .color(colors.fg3),
+        );
+        return;
+    }
+
+    let overlay_temp = result.temperature_k.unwrap_or(state.temperature_k);
+
+    // Build instrument params from the current resolution settings so residuals
+    // reflect the currently configured resolution broadening (which may differ
+    // from what was used during the fit if settings were changed without re-running).
+    let instrument = if state.resolution_enabled {
+        use nereids_physics::resolution::{ResolutionFunction, ResolutionParams};
+        use nereids_physics::transmission::InstrumentParams;
+        match &state.resolution_mode {
+            crate::state::ResolutionMode::Gaussian {
+                delta_t_us,
+                delta_l_m,
+            } => {
+                match ResolutionParams::new(state.beamline.flight_path_m, *delta_t_us, *delta_l_m) {
+                    Ok(p) => Some(std::sync::Arc::new(InstrumentParams {
+                        resolution: ResolutionFunction::Gaussian(p),
+                    })),
+                    Err(_) => {
+                        ui.label(
+                            egui::RichText::new(
+                                "Invalid resolution settings — check configuration.",
+                            )
+                            .small()
+                            .color(colors.fg3),
+                        );
+                        return;
+                    }
+                }
+            }
+            crate::state::ResolutionMode::Tabulated {
+                data: Some(tab), ..
+            } => Some(std::sync::Arc::new(InstrumentParams {
+                resolution: ResolutionFunction::Tabulated(std::sync::Arc::clone(tab)),
+            })),
+            crate::state::ResolutionMode::Tabulated { data: None, .. } => {
+                ui.label(
+                    egui::RichText::new(
+                        "Resolution file not loaded — load it in configuration first.",
+                    )
+                    .small()
+                    .color(colors.fg3),
+                );
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
+    let model = match nereids_fitting::transmission_model::TransmissionFitModel::new(
+        energies.clone(),
+        resonance_data,
+        overlay_temp,
+        instrument,
+        (0..result.densities.len()).collect(),
+        None,
+        None,
+    ) {
+        Ok(m) => m,
+        Err(_) => {
+            ui.label("Could not build transmission model for residuals.");
+            return;
+        }
+    };
+
+    use nereids_fitting::lm::FitModel;
+    let fitted = model.evaluate(&result.densities);
+    let n_plot = n_tof.min(energies.len()).min(fitted.len());
+    if n_plot == 0 {
+        return;
+    }
+
+    // Compute residuals and statistics.
+    let mut residuals = Vec::with_capacity(n_plot);
+    let mut sum_sq = 0.0;
+    let mut max_abs = 0.0f64;
+    for i in 0..n_plot {
+        let meas = norm.transmission[[i, py, px]];
+        let res = meas - fitted[i];
+        if res.is_finite() {
+            residuals.push((energies[i], res));
+            sum_sq += res * res;
+            max_abs = max_abs.max(res.abs());
+        }
+    }
+    let n_res = residuals.len();
+    let rms = if n_res > 0 {
+        (sum_sq / n_res as f64).sqrt()
+    } else {
+        0.0
+    };
+
+    // Stats row
+    design::stat_row(
+        ui,
+        &[
+            (&format!("{:.2e}", rms), "RMS"),
+            (&format!("{:.2e}", max_abs), "Max |r|"),
+            (&n_res.to_string(), "Points"),
+            (
+                &format!("{:.4}", result.reduced_chi_squared),
+                "\u{03c7}\u{00b2}_r",
+            ),
+        ],
     );
+    ui.add_space(4.0);
+
+    // Residual plot
+    let plot_height = ui.available_height().clamp(100.0, 250.0);
+    let res_points: egui_plot::PlotPoints = residuals.iter().map(|&(e, r)| [e, r]).collect();
+    egui_plot::Plot::new("dock_residuals_plot")
+        .height(plot_height)
+        .x_axis_label("Energy (eV)")
+        .y_axis_label("Residual")
+        .show(ui, |plot_ui| {
+            plot_ui.line(
+                egui_plot::Line::new("Residual", res_points)
+                    .color(egui::Color32::from_rgb(100, 160, 255)),
+            );
+            plot_ui.hline(
+                egui_plot::HLine::new("zero", 0.0)
+                    .color(egui::Color32::from_rgba_premultiplied(150, 150, 150, 80))
+                    .style(egui_plot::LineStyle::dashed_loose()),
+            );
+        });
 }
 
 /// Provenance log (flat list, no collapsing header).
