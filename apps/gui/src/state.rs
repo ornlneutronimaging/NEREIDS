@@ -546,8 +546,6 @@ pub struct AppState {
     /// Snapshot of ROIs at the time spatial_map was launched.
     /// Used to render density overlays only on fitted pixels.
     pub fitting_rois: Vec<RoiSelection>,
-    /// Toggle: show density overlay on preview image in Results.
-    pub show_density_overlay: bool,
     /// Toggle: show provenance history popup window.
     pub show_history_window: bool,
 
@@ -1146,7 +1144,6 @@ impl Default for AppState {
             rois: Vec::new(),
             selected_roi: None,
             fitting_rois: Vec::new(),
-            show_density_overlay: true,
             show_history_window: false,
 
             pixel_fit_result: None,

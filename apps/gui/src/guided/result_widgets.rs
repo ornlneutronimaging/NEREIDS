@@ -472,34 +472,3 @@ fn export_markdown(
     .map_err(|e| e.to_string())?;
     Ok(format!("Exported report to {}", path.display()))
 }
-
-/// Provenance log section (collapsible).
-pub fn provenance_section(ui: &mut egui::Ui, state: &AppState) {
-    if state.provenance_log.is_empty() {
-        return;
-    }
-
-    egui::CollapsingHeader::new(egui::RichText::new("Provenance Log").strong())
-        .default_open(false)
-        .show(ui, |ui| {
-            for event in state.provenance_log.iter().rev() {
-                let ts = event.formatted_timestamp();
-
-                let (kind_label, kind_color) = match event.kind {
-                    ProvenanceEventKind::DataLoaded => ("LOAD", crate::theme::semantic::YELLOW),
-                    ProvenanceEventKind::ConfigChanged => {
-                        ("CONFIG", crate::theme::semantic::ORANGE)
-                    }
-                    ProvenanceEventKind::Normalized => ("NORM", crate::theme::semantic::GREEN),
-                    ProvenanceEventKind::AnalysisRun => ("ANALYZE", crate::theme::semantic::ORANGE),
-                    ProvenanceEventKind::Exported => ("EXPORT", crate::theme::semantic::GREEN),
-                };
-
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(&ts).monospace().small());
-                    ui.label(egui::RichText::new(kind_label).small().color(kind_color));
-                    ui.label(egui::RichText::new(&event.message).small());
-                });
-            }
-        });
-}
