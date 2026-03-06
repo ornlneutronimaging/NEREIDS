@@ -60,15 +60,18 @@ pub fn summary_card(
 
             // Mean temperature (if available)
             if let Some(ref t_map) = result.temperature_map {
-                let temp_vals: Vec<f64> = t_map
-                    .iter()
-                    .zip(result.converged_map.iter())
-                    .filter(|&(_, &conv)| conv)
-                    .map(|(&t, _)| t)
-                    .filter(|t| t.is_finite())
-                    .collect();
-                if !temp_vals.is_empty() {
-                    let mean_t: f64 = temp_vals.iter().sum::<f64>() / temp_vals.len() as f64;
+                let (sum_t, count_t) = t_map.iter().zip(result.converged_map.iter()).fold(
+                    (0.0_f64, 0_usize),
+                    |(sum, count), (&t, &conv)| {
+                        if conv && t.is_finite() {
+                            (sum + t, count + 1)
+                        } else {
+                            (sum, count)
+                        }
+                    },
+                );
+                if count_t > 0 {
+                    let mean_t = sum_t / count_t as f64;
                     ui.label(format!("Mean temperature: {mean_t:.1} K"));
                 }
             }

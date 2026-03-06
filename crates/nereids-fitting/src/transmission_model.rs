@@ -226,6 +226,13 @@ impl FitModel for TransmissionFitModel {
 
         if let Some(ref base_xs) = self.base_xs {
             // Fast path: reuse cached unbroadened XS, only redo Doppler + Beer-Lambert.
+            // Validate temperature (same rules as SampleParams::new) so the optimizer
+            // can't silently evaluate an unphysical model with NaN/negative T.
+            let temperature_k = if !temperature_k.is_finite() || temperature_k < 0.0 {
+                0.0
+            } else {
+                temperature_k
+            };
             let thicknesses: Vec<f64> = self
                 .density_indices
                 .iter()

@@ -815,8 +815,8 @@ fn fit_spectrum(
                     density_indices: Arc::clone(&density_indices),
                 };
 
-                // When fitting temperature, use TransmissionFitModel (full physics
-                // per evaluation) so the model sees the changing T.
+                // When fitting temperature, build a TemperatureContext with cached
+                // base XS so the Poisson optimizer can update T each iteration.
                 let temp_ctx = if fit_temperature {
                     let base = transmission::unbroadened_cross_sections(&e_owned, &res_data, None)
                         .map_err(|e| format!("unbroadened_cross_sections failed: {e}"))?;

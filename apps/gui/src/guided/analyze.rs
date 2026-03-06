@@ -820,10 +820,11 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
             ui.label(format!("chi2_r = {:.4}", result.reduced_chi_squared));
             ui.label(format!("iter = {}", result.iterations));
             if let Some(t) = result.temperature_k {
-                let unc_str = result
-                    .temperature_k_unc
-                    .map_or("N/A".to_string(), |u| format!("{:.1}", u));
-                ui.label(format!("T = {t:.1} \u{00b1} {unc_str} K"));
+                if let Some(u) = result.temperature_k_unc {
+                    ui.label(format!("T = {t:.1} \u{00b1} {u:.1} K"));
+                } else {
+                    ui.label(format!("T = {t:.1} K"));
+                }
             }
         });
 

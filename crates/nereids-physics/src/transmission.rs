@@ -512,6 +512,13 @@ pub fn broadened_cross_sections_from_base(
     temperature_k: f64,
     instrument: Option<&InstrumentParams>,
 ) -> Result<Vec<Vec<f64>>, TransmissionError> {
+    if base_xs.len() != resonance_data.len() {
+        return Err(TransmissionError::InputMismatch(format!(
+            "base_xs has {} isotopes but resonance_data has {}",
+            base_xs.len(),
+            resonance_data.len(),
+        )));
+    }
     if instrument.is_some() && !energies.windows(2).all(|w| w[0] <= w[1]) {
         return Err(ResolutionError::UnsortedEnergies.into());
     }
@@ -596,6 +603,14 @@ pub fn forward_model_from_base_xs(
     temperature_k: f64,
     instrument: Option<&InstrumentParams>,
 ) -> Result<Vec<f64>, TransmissionError> {
+    if base_xs.len() != resonance_data.len() || thicknesses.len() != resonance_data.len() {
+        return Err(TransmissionError::InputMismatch(format!(
+            "forward_model_from_base_xs: base_xs({})/thicknesses({})/resonance_data({}) length mismatch",
+            base_xs.len(),
+            thicknesses.len(),
+            resonance_data.len(),
+        )));
+    }
     let n = energies.len();
     if n == 0 {
         return Ok(vec![]);

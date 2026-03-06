@@ -123,8 +123,13 @@ fn analysis_tab(ui: &mut egui::Ui, state: &mut AppState) {
         return;
     }
 
-    // Clamp isotope index
-    if state.studio_analysis_isotope >= n_density {
+    // Clamp isotope index (account for optional temperature map entry)
+    let has_temp_map_early = state
+        .spatial_result
+        .as_ref()
+        .is_some_and(|r| r.temperature_map.is_some());
+    let n_options_early = n_density + has_temp_map_early as usize;
+    if state.studio_analysis_isotope >= n_options_early {
         state.studio_analysis_isotope = 0;
     }
 
@@ -445,10 +450,11 @@ fn analysis_spectrum_column(ui: &mut egui::Ui, state: &mut AppState) {
             ui.label(format!("chi2_r = {:.4}", result.reduced_chi_squared));
             ui.label(format!("iter = {}", result.iterations));
             if let Some(t) = result.temperature_k {
-                let unc_str = result
-                    .temperature_k_unc
-                    .map_or("N/A".to_string(), |u| format!("{:.1}", u));
-                ui.label(format!("T = {t:.1} \u{00b1} {unc_str} K"));
+                if let Some(u) = result.temperature_k_unc {
+                    ui.label(format!("T = {t:.1} \u{00b1} {u:.1} K"));
+                } else {
+                    ui.label(format!("T = {t:.1} K"));
+                }
             }
         });
 

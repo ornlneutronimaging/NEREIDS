@@ -259,25 +259,31 @@ fn density_map_grid(ui: &mut egui::Ui, state: &mut AppState) {
                                 .unwrap();
                             if show_bar {
                                 ui.horizontal(|ui| {
-                                    let _ = show_colormapped_image_with_roi(
+                                    if let Some(px) = show_colormapped_image_with_roi(
                                         ui,
                                         data,
                                         "result_temp_map",
                                         colormap,
                                         &[],
                                         state.selected_pixel,
-                                    );
+                                    )
+                                    .0
+                                    {
+                                        new_pixel = Some(px);
+                                    }
                                     result_widgets::draw_colorbar(ui, data, colormap);
                                 });
-                            } else {
-                                let _ = show_colormapped_image_with_roi(
-                                    ui,
-                                    data,
-                                    "result_temp_map",
-                                    colormap,
-                                    &[],
-                                    state.selected_pixel,
-                                );
+                            } else if let Some(px) = show_colormapped_image_with_roi(
+                                ui,
+                                data,
+                                "result_temp_map",
+                                colormap,
+                                &[],
+                                state.selected_pixel,
+                            )
+                            .0
+                            {
+                                new_pixel = Some(px);
                             }
                         }
 
