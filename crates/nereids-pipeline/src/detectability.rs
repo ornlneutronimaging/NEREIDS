@@ -34,14 +34,6 @@ use rayon::prelude::*;
 
 use crate::error::PipelineError;
 
-/// Transmission threshold below which a bin is considered opaque.
-///
-/// At `T < 1e-15`, `exp(-n·σ)` is effectively zero in f64 arithmetic.
-/// Any ΔT computation between two opaque transmissions yields 0.0 due to
-/// floating-point underflow, making trace detection impossible regardless
-/// of the actual physics.
-const OPAQUE_THRESHOLD: f64 = 1e-15;
-
 /// Result of a trace-detectability analysis for a single matrix+trace pair.
 #[derive(Debug, Clone)]
 pub struct TraceDetectabilityReport {
@@ -62,13 +54,6 @@ pub struct TraceDetectabilityReport {
     pub delta_t_spectrum: Vec<f64>,
     /// Energies used (eV).
     pub energies: Vec<f64>,
-    /// Fraction of energy bins where the matrix baseline transmission is
-    /// below [`OPAQUE_THRESHOLD`] (effectively zero due to underflow).
-    ///
-    /// When this is close to 1.0, the matrix is essentially opaque across
-    /// the entire energy range, and trace detection is physically impossible
-    /// regardless of concentration or I₀.
-    pub opaque_fraction: f64,
 }
 
 /// Configuration for a trace-detectability analysis.
@@ -136,14 +121,6 @@ fn report_from_baseline(
         .map_err(|e| TransmissionError::InputMismatch(e.to_string()))?;
     let t_combined = transmission::forward_model(config.energies, &sample_combined, instrument)?;
 
-    // Opaque fraction: bins where matrix baseline underflows to ~0.
-    let n_opaque = t_matrix.iter().filter(|&&t| t < OPAQUE_THRESHOLD).count();
-    let opaque_fraction = if t_matrix.is_empty() {
-        0.0
-    } else {
-        n_opaque as f64 / t_matrix.len() as f64
-    };
-
     // |ΔT| spectrum — absolute difference, sign discarded (see module docs).
     let delta_t_spectrum: Vec<f64> = t_matrix
         .iter()
@@ -186,7 +163,6 @@ fn report_from_baseline(
         detectable: peak_snr > config.snr_threshold,
         delta_t_spectrum,
         energies: config.energies.to_vec(),
-        opaque_fraction,
     })
 }
 
@@ -603,71 +579,6 @@ mod tests {
         assert!(
             (report_single.peak_snr - report_multi.peak_snr).abs() > 1e-10,
             "Single vs multi-matrix should produce different SNR values"
-        );
-    }
-
-    /// Opaque matrix: extremely high density causes exp(-n·σ) underflow.
-    ///
-    /// Reproduces #278: 1.0 at/barn matrix with a strong resonance gives
-    /// T ≈ 0 (underflow), so ΔT = 0 and SNR = 0. The report should flag
-    /// the matrix as opaque via `opaque_fraction > 0.5`.
-    #[test]
-    fn test_opaque_matrix_flags_high_opaque_fraction() {
-        // Matrix with a strong resonance at 20 eV and very high density (1.0 at/barn)
-        let matrix = synthetic_isotope(74, 182, 20.0, 0.5, 0.05);
-        let trace = synthetic_isotope(72, 178, 8.0, 0.5, 0.05);
-
-        let energies: Vec<f64> = (0..500).map(|i| 1.0 + (i as f64) * 49.0 / 499.0).collect();
-
-        let config = TraceDetectabilityConfig {
-            matrix_isotopes: &[(matrix, 1.0)], // 1.0 at/barn — extremely thick
-            energies: &energies,
-            i0: 10000.0,
-            temperature_k: 293.6,
-            resolution: None,
-            snr_threshold: 3.0,
-        };
-
-        let report = trace_detectability(&config, &trace, 2350.0).unwrap();
-
-        // With such a thick matrix, most bins should be opaque
-        assert!(
-            report.opaque_fraction > 0.5,
-            "Expected opaque_fraction > 0.5 for 1.0 at/barn matrix, got {:.3}",
-            report.opaque_fraction,
-        );
-
-        // SNR should be 0 or very close to 0 due to underflow
-        assert!(
-            report.peak_snr < 1.0,
-            "Expected near-zero SNR for opaque matrix, got {:.2}",
-            report.peak_snr,
-        );
-    }
-
-    /// Normal density: opaque_fraction should be 0 or very small.
-    #[test]
-    fn test_normal_density_not_opaque() {
-        let matrix = synthetic_isotope(74, 182, 20.0, 1e-3, 0.05);
-        let trace = synthetic_isotope(72, 178, 8.0, 0.5, 0.05);
-
-        let energies: Vec<f64> = (0..500).map(|i| 1.0 + (i as f64) * 49.0 / 499.0).collect();
-
-        let config = TraceDetectabilityConfig {
-            matrix_isotopes: &[(matrix, 6e-3)], // typical thin sample
-            energies: &energies,
-            i0: 1000.0,
-            temperature_k: 293.6,
-            resolution: None,
-            snr_threshold: 3.0,
-        };
-
-        let report = trace_detectability(&config, &trace, 1000.0).unwrap();
-
-        assert!(
-            report.opaque_fraction < 0.01,
-            "Expected opaque_fraction < 0.01 for normal density, got {:.3}",
-            report.opaque_fraction,
         );
     }
 }
