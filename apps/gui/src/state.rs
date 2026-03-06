@@ -669,7 +669,6 @@ pub struct AppState {
 
     // -- Studio mode --
     pub studio_selected_tile: usize,
-    pub studio_tool: StudioTool,
     pub studio_doc_tab: StudioDocTab,
     pub studio_dock_tab: usize,
     pub studio_show_dock: bool,
@@ -747,27 +746,6 @@ pub enum Tab {
 pub enum UiMode {
     Guided,
     Studio,
-}
-
-/// Studio interaction tool (toolbar selection).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum StudioTool {
-    #[default]
-    Select,
-    Roi,
-    Probe,
-    Zoom,
-}
-
-impl StudioTool {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Select => "Sel",
-            Self::Roi => "ROI",
-            Self::Probe => "Prb",
-            Self::Zoom => "Zm",
-        }
-    }
 }
 
 /// Document tab in Studio mode.
@@ -1236,7 +1214,6 @@ impl Default for AppState {
 
             dirty_from: None,
             studio_selected_tile: 0,
-            studio_tool: StudioTool::Select,
             studio_doc_tab: StudioDocTab::Analysis,
             studio_dock_tab: 0,
             studio_show_dock: true,

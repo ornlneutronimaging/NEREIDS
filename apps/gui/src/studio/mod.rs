@@ -568,8 +568,8 @@ fn bottom_dock(ctx: &egui::Context, state: &mut AppState) {
     let colors = ThemeColors::from_ctx(ctx);
     egui::TopBottomPanel::bottom("studio_dock")
         .resizable(true)
-        .default_height(170.0)
-        .min_height(80.0)
+        .default_height(200.0)
+        .min_height(140.0)
         .max_height(400.0)
         .frame(
             egui::Frame::NONE
