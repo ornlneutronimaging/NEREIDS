@@ -697,7 +697,11 @@ fn dock_isotopes(ui: &mut egui::Ui, state: &AppState) {
 }
 
 /// Residuals dock tab — shows residual plot + statistics for the selected pixel.
-fn dock_residuals(ui: &mut egui::Ui, state: &AppState) {
+///
+/// Uses `state.residuals_cache` to avoid rebuilding the `TransmissionFitModel`
+/// and recomputing the forward model on every frame. The cache is keyed by
+/// `(fit_result_gen, resolution_enabled, resolution_mode, flight_path_m)`.
+fn dock_residuals(ui: &mut egui::Ui, state: &mut AppState) {
     let colors = ThemeColors::from_ctx(ui.ctx());
 
     // Need a pixel fit result to show residuals.
@@ -722,156 +726,42 @@ fn dock_residuals(ui: &mut egui::Ui, state: &AppState) {
             return;
         }
     };
+    let chi2_r = result.reduced_chi_squared;
 
-    let (energies, norm, (py, px)) =
-        match (&state.energies, &state.normalized, state.selected_pixel) {
-            (Some(e), Some(n), Some(p)) => (e, n, p),
-            _ => {
-                ui.label(
-                    egui::RichText::new("Missing energy grid or normalized data.")
-                        .small()
-                        .color(colors.fg3),
-                );
-                return;
-            }
-        };
+    // Check if the cache is still valid.
+    let cache_valid = state.residuals_cache.as_ref().is_some_and(|c| {
+        c.fit_gen == state.fit_result_gen
+            && c.resolution_enabled == state.resolution_enabled
+            && c.resolution_mode == state.resolution_mode
+            && c.flight_path_m == state.beamline.flight_path_m
+    });
 
-    let shape = norm.transmission.shape();
-    let n_tof = shape[0];
-    if py >= shape[1] || px >= shape[2] {
-        ui.label("Selected pixel is out of bounds.");
-        return;
+    if !cache_valid {
+        // Rebuild the cache.
+        let new_cache = build_residuals_cache(state);
+        state.residuals_cache = new_cache;
     }
 
-    // Build fitted model curve from result densities.
-    let enabled: Vec<_> = state
-        .isotope_entries
-        .iter()
-        .filter(|e| e.enabled && e.resonance_data.is_some())
-        .collect();
-    let resonance_data: Vec<_> = enabled
-        .iter()
-        .filter_map(|e| e.resonance_data.clone())
-        .collect();
-    if resonance_data.len() != result.densities.len() {
-        ui.label(
-            egui::RichText::new("Isotope count mismatch \u{2014} re-run the fit.")
-                .small()
-                .color(colors.fg3),
-        );
-        return;
-    }
-
-    let overlay_temp = result.temperature_k.unwrap_or(state.temperature_k);
-
-    // Build instrument params from the current resolution settings so residuals
-    // reflect the currently configured resolution broadening (which may differ
-    // from what was used during the fit if settings were changed without re-running).
-    let instrument = if state.resolution_enabled {
-        use nereids_physics::resolution::{ResolutionFunction, ResolutionParams};
-        use nereids_physics::transmission::InstrumentParams;
-        match &state.resolution_mode {
-            crate::state::ResolutionMode::Gaussian {
-                delta_t_us,
-                delta_l_m,
-            } => {
-                match ResolutionParams::new(state.beamline.flight_path_m, *delta_t_us, *delta_l_m) {
-                    Ok(p) => Some(std::sync::Arc::new(InstrumentParams {
-                        resolution: ResolutionFunction::Gaussian(p),
-                    })),
-                    Err(_) => {
-                        ui.label(
-                            egui::RichText::new(
-                                "Invalid resolution settings — check configuration.",
-                            )
-                            .small()
-                            .color(colors.fg3),
-                        );
-                        return;
-                    }
-                }
-            }
-            crate::state::ResolutionMode::Tabulated {
-                data: Some(tab), ..
-            } => Some(std::sync::Arc::new(InstrumentParams {
-                resolution: ResolutionFunction::Tabulated(std::sync::Arc::clone(tab)),
-            })),
-            crate::state::ResolutionMode::Tabulated { data: None, .. } => {
-                ui.label(
-                    egui::RichText::new(
-                        "Resolution file not loaded — load it in configuration first.",
-                    )
-                    .small()
-                    .color(colors.fg3),
-                );
-                return;
-            }
-        }
-    } else {
-        None
-    };
-
-    let model = match nereids_fitting::transmission_model::TransmissionFitModel::new(
-        energies.clone(),
-        resonance_data,
-        overlay_temp,
-        instrument,
-        (0..result.densities.len()).collect(),
-        None,
-        None,
-    ) {
-        Ok(m) => m,
-        Err(_) => {
-            ui.label("Could not build transmission model for residuals.");
-            return;
-        }
-    };
-
-    use nereids_fitting::lm::FitModel;
-    let fitted = model.evaluate(&result.densities);
-    let n_plot = n_tof.min(energies.len()).min(fitted.len());
-    if n_plot == 0 {
-        return;
-    }
-
-    // Compute residuals and statistics.
-    let mut residuals = Vec::with_capacity(n_plot);
-    let mut sum_sq = 0.0;
-    let mut max_abs = 0.0f64;
-    for i in 0..n_plot {
-        let meas = norm.transmission[[i, py, px]];
-        let res = meas - fitted[i];
-        if res.is_finite() {
-            residuals.push((energies[i], res));
-            sum_sq += res * res;
-            max_abs = max_abs.max(res.abs());
-        }
-    }
-    let n_res = residuals.len();
-    let rms = if n_res > 0 {
-        (sum_sq / n_res as f64).sqrt()
-    } else {
-        0.0
+    let cache = match &state.residuals_cache {
+        Some(c) => c,
+        None => return, // build failed — error already shown via state.status_message
     };
 
     // Stats row
     design::stat_row(
         ui,
         &[
-            (&format!("{:.2e}", rms), "RMS"),
-            (&format!("{:.2e}", max_abs), "Max |r|"),
-            (&n_res.to_string(), "Points"),
-            (
-                &format!("{:.4}", result.reduced_chi_squared),
-                "\u{03c7}\u{00b2}_r",
-            ),
+            (&format!("{:.2e}", cache.rms), "RMS"),
+            (&format!("{:.2e}", cache.max_abs), "Max |r|"),
+            (&cache.n_points.to_string(), "Points"),
+            (&format!("{:.4}", chi2_r), "\u{03c7}\u{00b2}_r"),
         ],
     );
     ui.add_space(4.0);
 
     // Residual plot
     let plot_height = ui.available_height().clamp(100.0, 250.0);
-    let res_points: egui_plot::PlotPoints = residuals.iter().map(|&(e, r)| [e, r]).collect();
+    let res_points: egui_plot::PlotPoints = cache.residuals.iter().map(|&(e, r)| [e, r]).collect();
     egui_plot::Plot::new("dock_residuals_plot")
         .height(plot_height)
         .x_axis_label("Energy (eV)")
@@ -887,6 +777,112 @@ fn dock_residuals(ui: &mut egui::Ui, state: &AppState) {
                     .style(egui_plot::LineStyle::dashed_loose()),
             );
         });
+}
+
+/// Build the residuals cache by constructing a `TransmissionFitModel`, evaluating
+/// the forward model, and computing residuals against measured data.
+///
+/// Returns `None` if any prerequisite is missing (no pixel, no energies, etc.).
+fn build_residuals_cache(state: &AppState) -> Option<crate::state::CachedResiduals> {
+    let result = state.pixel_fit_result.as_ref()?;
+    let energies = state.energies.as_ref()?;
+    let norm = state.normalized.as_ref()?;
+    let (py, px) = state.selected_pixel?;
+
+    let shape = norm.transmission.shape();
+    let n_tof = shape[0];
+    if py >= shape[1] || px >= shape[2] {
+        return None;
+    }
+
+    // Collect resonance data for enabled isotopes.
+    let resonance_data: Vec<_> = state
+        .isotope_entries
+        .iter()
+        .filter(|e| e.enabled && e.resonance_data.is_some())
+        .filter_map(|e| e.resonance_data.clone())
+        .collect();
+    if resonance_data.len() != result.densities.len() {
+        return None;
+    }
+
+    let overlay_temp = result.temperature_k.unwrap_or(state.temperature_k);
+
+    // Build instrument params from current resolution settings.
+    let instrument = if state.resolution_enabled {
+        use nereids_physics::resolution::{ResolutionFunction, ResolutionParams};
+        use nereids_physics::transmission::InstrumentParams;
+        match &state.resolution_mode {
+            crate::state::ResolutionMode::Gaussian {
+                delta_t_us,
+                delta_l_m,
+            } => {
+                let p =
+                    ResolutionParams::new(state.beamline.flight_path_m, *delta_t_us, *delta_l_m)
+                        .ok()?;
+                Some(std::sync::Arc::new(InstrumentParams {
+                    resolution: ResolutionFunction::Gaussian(p),
+                }))
+            }
+            crate::state::ResolutionMode::Tabulated {
+                data: Some(tab), ..
+            } => Some(std::sync::Arc::new(InstrumentParams {
+                resolution: ResolutionFunction::Tabulated(std::sync::Arc::clone(tab)),
+            })),
+            crate::state::ResolutionMode::Tabulated { data: None, .. } => return None,
+        }
+    } else {
+        None
+    };
+
+    let model = nereids_fitting::transmission_model::TransmissionFitModel::new(
+        energies.clone(),
+        resonance_data,
+        overlay_temp,
+        instrument,
+        (0..result.densities.len()).collect(),
+        None,
+        None,
+    )
+    .ok()?;
+
+    use nereids_fitting::lm::FitModel;
+    let fitted = model.evaluate(&result.densities);
+    let n_plot = n_tof.min(energies.len()).min(fitted.len());
+    if n_plot == 0 {
+        return None;
+    }
+
+    // Compute residuals and statistics.
+    let mut residuals = Vec::with_capacity(n_plot);
+    let mut sum_sq = 0.0;
+    let mut max_abs = 0.0f64;
+    for i in 0..n_plot {
+        let meas = norm.transmission[[i, py, px]];
+        let res = meas - fitted[i];
+        if res.is_finite() {
+            residuals.push((energies[i], res));
+            sum_sq += res * res;
+            max_abs = max_abs.max(res.abs());
+        }
+    }
+    let n_points = residuals.len();
+    let rms = if n_points > 0 {
+        (sum_sq / n_points as f64).sqrt()
+    } else {
+        0.0
+    };
+
+    Some(crate::state::CachedResiduals {
+        fit_gen: state.fit_result_gen,
+        resolution_enabled: state.resolution_enabled,
+        resolution_mode: state.resolution_mode.clone(),
+        flight_path_m: state.beamline.flight_path_m,
+        residuals,
+        rms,
+        max_abs,
+        n_points,
+    })
 }
 
 /// Provenance log (flat list, no collapsing header).

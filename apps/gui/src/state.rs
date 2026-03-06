@@ -496,6 +496,26 @@ pub struct DetectTraceEntry {
     pub endf_status: EndfStatus,
 }
 
+/// Cached residuals data for the Studio dock, avoiding per-frame model rebuild.
+pub struct CachedResiduals {
+    /// Generation counter of the `pixel_fit_result` that produced this cache.
+    pub fit_gen: u64,
+    /// Resolution enabled flag at cache time.
+    pub resolution_enabled: bool,
+    /// Resolution mode at cache time (compared via PartialEq).
+    pub resolution_mode: ResolutionMode,
+    /// Flight path at cache time (affects Gaussian resolution).
+    pub flight_path_m: f64,
+    /// Residual points: (energy_ev, residual_value).
+    pub residuals: Vec<(f64, f64)>,
+    /// RMS of residuals.
+    pub rms: f64,
+    /// Maximum absolute residual.
+    pub max_abs: f64,
+    /// Number of finite residual points.
+    pub n_points: usize,
+}
+
 /// Main application state.
 pub struct AppState {
     // -- Data loading --
@@ -551,6 +571,10 @@ pub struct AppState {
 
     // -- Results --
     pub pixel_fit_result: Option<SpectrumFitResult>,
+    /// Generation counter; incremented each time `pixel_fit_result` is replaced.
+    pub fit_result_gen: u64,
+    /// Cached residuals for the Studio dock (keyed by `fit_result_gen` + resolution config).
+    pub residuals_cache: Option<CachedResiduals>,
     pub spatial_result: Option<SpatialResult>,
     /// Prominent feedback from last fit attempt (pixel or ROI).
     pub last_fit_feedback: Option<FitFeedback>,
@@ -949,6 +973,7 @@ impl AppState {
         self.rois.clear();
         self.selected_roi = None;
         self.pixel_fit_result = None;
+        self.residuals_cache = None;
         self.spatial_result = None;
         self.last_fit_feedback = None;
         self.fitting_rois.clear();
@@ -1128,6 +1153,8 @@ impl Default for AppState {
             show_history_window: false,
 
             pixel_fit_result: None,
+            fit_result_gen: 0,
+            residuals_cache: None,
             spatial_result: None,
             last_fit_feedback: None,
 

@@ -1034,6 +1034,7 @@ fn fit_pixel(state: &mut AppState) {
     });
     state.status_message = summary;
     state.pixel_fit_result = Some(result);
+    state.fit_result_gen = state.fit_result_gen.wrapping_add(1);
 }
 
 fn fit_roi(state: &mut AppState) {
@@ -1166,6 +1167,7 @@ fn fit_roi(state: &mut AppState) {
     });
     state.status_message = summary;
     state.pixel_fit_result = Some(result);
+    state.fit_result_gen = state.fit_result_gen.wrapping_add(1);
 }
 
 pub fn run_spatial_map(state: &mut AppState) {
