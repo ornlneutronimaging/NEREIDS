@@ -2172,10 +2172,19 @@ impl PyTraceDetectabilityReport {
         PyArray1::from_vec(py, self.inner.energies.clone())
     }
 
+    /// Fraction of energy bins where the matrix baseline is opaque (T < 1e-15).
+    #[getter]
+    fn opaque_fraction(&self) -> f64 {
+        self.inner.opaque_fraction
+    }
+
     fn __repr__(&self) -> String {
         format!(
-            "TraceDetectabilityReport(detectable={}, peak_snr={:.2}, peak_energy_ev={:.2})",
-            self.inner.detectable, self.inner.peak_snr, self.inner.peak_energy_ev,
+            "TraceDetectabilityReport(detectable={}, peak_snr={:.2}, peak_energy_ev={:.2}, opaque_fraction={:.2})",
+            self.inner.detectable,
+            self.inner.peak_snr,
+            self.inner.peak_energy_ev,
+            self.inner.opaque_fraction,
         )
     }
 }

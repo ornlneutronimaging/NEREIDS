@@ -212,6 +212,11 @@ class TraceDetectabilityReport:
         """Energies used (eV)."""
         ...
 
+    @property
+    def opaque_fraction(self) -> float:
+        """Fraction of energy bins where matrix baseline is opaque (T < 1e-15)."""
+        ...
+
 # ---------------------------------------------------------------------------
 # Functions
 # ---------------------------------------------------------------------------

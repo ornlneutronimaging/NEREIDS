@@ -12,6 +12,9 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 
+/// Fraction of opaque energy bins above which we show a warning.
+const OPAQUE_WARN_FRACTION: f64 = 0.5;
+
 /// Draw the Detectability tool content.
 pub fn detectability_step(ui: &mut egui::Ui, state: &mut AppState) {
     // -- Header row --
@@ -476,6 +479,25 @@ pub(crate) fn detect_results_panel(ui: &mut egui::Ui, state: &AppState) {
 
     ui.add_space(8.0);
 
+    // Opaque matrix warning
+    let max_opaque = state
+        .detect_results
+        .iter()
+        .map(|(_, r)| r.opaque_fraction)
+        .fold(0.0f64, f64::max);
+    if max_opaque > OPAQUE_WARN_FRACTION {
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "\u{26a0} Matrix is opaque at {:.0}% of energies — reduce matrix density",
+                    max_opaque * 100.0,
+                ))
+                .color(crate::theme::semantic::ORANGE),
+            );
+        });
+        ui.add_space(4.0);
+    }
+
     // Verdict table with badges
     design::card_with_header(ui, "Verdict Table", None, |ui| {
         egui::Grid::new("detect_verdict_grid")
@@ -496,6 +518,8 @@ pub(crate) fn detect_results_panel(ui: &mut egui::Ui, state: &AppState) {
                     ui.label(format!("{:.2e}", report.peak_delta_t_per_ppm));
                     if report.detectable {
                         design::badge(ui, "DETECTABLE", design::BadgeVariant::Green);
+                    } else if report.opaque_fraction > OPAQUE_WARN_FRACTION {
+                        design::badge(ui, "OPAQUE MATRIX", design::BadgeVariant::Red);
                     } else {
                         design::badge(ui, "NOT DETECTED", design::BadgeVariant::Red);
                     }
