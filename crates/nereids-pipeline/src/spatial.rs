@@ -8,7 +8,9 @@ use rayon::prelude::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use nereids_physics::transmission::{InstrumentParams, broadened_cross_sections};
+use nereids_physics::transmission::{
+    InstrumentParams, broadened_cross_sections, unbroadened_cross_sections,
+};
 
 use crate::error::PipelineError;
 use crate::pipeline::{FitConfig, SpectrumFitResult, fit_spectrum};
@@ -25,6 +27,8 @@ pub struct SpatialResult {
     pub chi_squared_map: Array2<f64>,
     /// Convergence map (true = converged).
     pub converged_map: Array2<bool>,
+    /// Fitted temperature map (K). `Some` when `config.fit_temperature()` is true.
+    pub temperature_map: Option<Array2<f64>>,
     /// Number of pixels that converged.
     pub n_converged: usize,
     /// Total number of pixels fitted.
@@ -130,6 +134,7 @@ pub fn spatial_map(
             .collect(),
         chi_squared_map: Array2::from_elem((height, width), f64::NAN),
         converged_map: Array2::from_elem((height, width), false),
+        temperature_map: None,
         n_converged: 0,
         n_total: 0,
     };
@@ -165,7 +170,22 @@ pub fn spatial_map(
     // full Jacobian evaluation per pixel (N_free model evaluations for
     // finite-difference, or free for analytical) plus the O(n_free³) inversion.
     let fast_config = if config.fit_temperature() {
-        config.clone().with_compute_covariance(false)
+        // Precompute unbroadened (Reich-Moore) cross-sections ONCE for all
+        // pixels.  Without this, each pixel recomputes them inside
+        // TransmissionFitModel::new() and TemperatureContext construction,
+        // dominating total runtime for heavy nuclei (U-238: ~5000 resonances).
+        let base_xs = match config.precomputed_base_xs().cloned() {
+            Some(cached) => cached,
+            None => {
+                let xs =
+                    unbroadened_cross_sections(config.energies(), config.resonance_data(), cancel)?;
+                Arc::new(xs)
+            }
+        };
+        config
+            .clone()
+            .with_precomputed_base_xs(base_xs)
+            .with_compute_covariance(false)
     } else {
         // Use caller-supplied precomputed cross-sections when available; only call
         // broadened_cross_sections when none are provided.  This lets repeated
@@ -244,6 +264,11 @@ pub fn spatial_map(
         .collect();
     let mut chi_squared_map = Array2::from_elem((height, width), f64::NAN);
     let mut converged_map = Array2::from_elem((height, width), false);
+    let mut temperature_map: Option<Array2<f64>> = if config.fit_temperature() {
+        Some(Array2::from_elem((height, width), f64::NAN))
+    } else {
+        None
+    };
     let mut n_converged = 0;
 
     for ((y, x), result) in &results {
@@ -257,6 +282,9 @@ pub fn spatial_map(
         }
         chi_squared_map[[*y, *x]] = result.reduced_chi_squared;
         converged_map[[*y, *x]] = result.converged;
+        if let (Some(t_map), Some(t)) = (&mut temperature_map, result.temperature_k) {
+            t_map[[*y, *x]] = t;
+        }
         if result.converged {
             n_converged += 1;
         }
@@ -267,6 +295,7 @@ pub fn spatial_map(
         uncertainty_maps,
         chi_squared_map,
         converged_map,
+        temperature_map,
         n_converged,
         n_total: results.len(),
     })
@@ -400,6 +429,7 @@ mod tests {
             None,
             vec![0],
             None,
+            None,
         )
         .unwrap();
         let spectrum = model.evaluate(&[true_density]);
@@ -471,6 +501,7 @@ mod tests {
             0.0,
             None,
             vec![0],
+            None,
             None,
         )
         .unwrap();
@@ -589,6 +620,7 @@ mod tests {
             None,
             vec![0],
             None,
+            None,
         )
         .unwrap();
         let spectrum = model.evaluate(&[true_density]);
@@ -649,5 +681,106 @@ mod tests {
 
         let result = fit_roi(transmission.view(), uncertainty.view(), 2..2, 0..2, &config);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_spatial_map_temperature_map() {
+        let data = u238_single_resonance();
+        let true_density = 0.0005;
+        let true_temp = 300.0;
+        let energies: Vec<f64> = (0..101).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let n_energies = energies.len();
+
+        // Generate synthetic spectrum at true temperature
+        let model = TransmissionFitModel::new(
+            energies.clone(),
+            vec![data.clone()],
+            true_temp,
+            None,
+            vec![0],
+            None,
+            None,
+        )
+        .unwrap();
+        let spectrum = model.evaluate(&[true_density]);
+
+        // 2×2 image
+        let height = 2;
+        let width = 2;
+        let mut transmission = Array3::<f64>::zeros((n_energies, height, width));
+        let uncertainty = Array3::from_elem((n_energies, height, width), 0.01);
+        for y in 0..height {
+            for x in 0..width {
+                for e in 0..n_energies {
+                    transmission[[e, y, x]] = spectrum[e];
+                }
+            }
+        }
+
+        // Without fit_temperature → temperature_map is None
+        let config_no_temp = FitConfig::new(
+            energies.clone(),
+            vec![data.clone()],
+            vec!["U-238".into()],
+            true_temp,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        )
+        .unwrap();
+
+        let result = spatial_map(
+            transmission.view(),
+            uncertainty.view(),
+            &config_no_temp,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            result.temperature_map.is_none(),
+            "temperature_map should be None when fit_temperature is false"
+        );
+
+        // With fit_temperature → temperature_map is Some
+        let config_with_temp = FitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            true_temp,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        )
+        .unwrap()
+        .with_fit_temperature(true)
+        .unwrap();
+
+        let result = spatial_map(
+            transmission.view(),
+            uncertainty.view(),
+            &config_with_temp,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            result.temperature_map.is_some(),
+            "temperature_map should be Some when fit_temperature is true"
+        );
+        let t_map = result.temperature_map.unwrap();
+        assert_eq!(t_map.shape(), &[height, width]);
+        // All pixels should recover a temperature near 300 K
+        for y in 0..height {
+            for x in 0..width {
+                let t = t_map[[y, x]];
+                assert!(
+                    t.is_finite(),
+                    "Pixel ({y},{x}) temperature is not finite: {t}"
+                );
+            }
+        }
     }
 }

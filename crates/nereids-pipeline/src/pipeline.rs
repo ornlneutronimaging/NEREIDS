@@ -11,10 +11,11 @@ use std::sync::Arc;
 use nereids_endf::resonance::ResonanceData;
 use nereids_fitting::lm::{self, FitModel, LmConfig, LmResult};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
-use nereids_fitting::poisson::{self, PoissonConfig};
+use nereids_fitting::poisson::{self, PoissonConfig, TemperatureContext};
 use nereids_fitting::transmission_model::{PrecomputedTransmissionModel, TransmissionFitModel};
 use nereids_physics::resolution::ResolutionFunction;
 use nereids_physics::transmission::InstrumentParams;
+use nereids_physics::transmission::{self as phys_transmission};
 
 use crate::error::PipelineError;
 
@@ -106,6 +107,11 @@ pub struct FitConfig {
     /// per isotope.  When `Some`, `fit_spectrum` skips the expensive resonance
     /// and broadening computation and uses `PrecomputedTransmissionModel` instead.
     precomputed_cross_sections: Option<Arc<Vec<Vec<f64>>>>,
+    /// Precomputed unbroadened (Reich-Moore) cross-sections, one `Vec<f64>` per
+    /// isotope.  When `Some` and temperature fitting is enabled, `fit_spectrum`
+    /// skips the per-pixel Reich-Moore evaluation and uses `_from_base` variants
+    /// for both the `TransmissionFitModel` and `TemperatureContext`.
+    precomputed_base_xs: Option<Arc<Vec<Vec<f64>>>>,
     /// When `true`, `temperature_k` is treated as an initial guess and fitted
     /// jointly with the areal densities.
     fit_temperature: bool,
@@ -172,6 +178,7 @@ impl FitConfig {
             initial_densities,
             lm_config,
             precomputed_cross_sections: None,
+            precomputed_base_xs: None,
             fit_temperature: false,
             compute_covariance: true,
             solver: SolverChoice::default(),
@@ -182,6 +189,15 @@ impl FitConfig {
     #[must_use]
     pub fn with_precomputed_cross_sections(mut self, xs: Arc<Vec<Vec<f64>>>) -> Self {
         self.precomputed_cross_sections = Some(xs);
+        self
+    }
+
+    /// Set precomputed unbroadened (base) cross-sections (builder pattern).
+    ///
+    /// When set, temperature fitting skips the per-pixel Reich-Moore evaluation.
+    #[must_use]
+    pub fn with_precomputed_base_xs(mut self, xs: Arc<Vec<Vec<f64>>>) -> Self {
+        self.precomputed_base_xs = Some(xs);
         self
     }
 
@@ -251,6 +267,12 @@ impl FitConfig {
     #[must_use]
     pub fn precomputed_cross_sections(&self) -> Option<&Arc<Vec<Vec<f64>>>> {
         self.precomputed_cross_sections.as_ref()
+    }
+
+    /// Returns the precomputed unbroadened (base) cross-sections, if any.
+    #[must_use]
+    pub fn precomputed_base_xs(&self) -> Option<&Arc<Vec<Vec<f64>>>> {
+        self.precomputed_base_xs.as_ref()
     }
 
     /// Returns whether temperature fitting is enabled.
@@ -471,6 +493,7 @@ pub fn fit_spectrum(
                 instrument,
                 (0..n_isotopes).collect(),
                 None,
+                None,
             )?;
             dispatch_solver(
                 &model,
@@ -488,22 +511,109 @@ pub fn fit_spectrum(
             .resolution()
             .cloned()
             .map(|r| Arc::new(InstrumentParams { resolution: r }));
+
+        // When spatial_map precomputes base_xs once for all pixels, inject
+        // them into the model to skip per-pixel Reich-Moore evaluation.
+        let base_xs_for_model = config.precomputed_base_xs().cloned();
         let model = TransmissionFitModel::new(
             config.energies().to_vec(),
             config.resonance_data().to_vec(),
             config.temperature_k(),
-            instrument,
+            instrument.clone(),
             (0..n_isotopes).collect(),
             temperature_index,
+            base_xs_for_model,
         )?;
-        dispatch_solver(
-            &model,
-            measured_t,
-            sigma,
-            &mut params,
-            config.solver(),
-            &lm_config,
-        )?
+
+        match config.solver() {
+            SolverChoice::LevenbergMarquardt => dispatch_solver(
+                &model,
+                measured_t,
+                sigma,
+                &mut params,
+                config.solver(),
+                &lm_config,
+            )?,
+            SolverChoice::PoissonKL(poisson_config) => {
+                // The basic poisson_fit uses finite-difference gradient descent,
+                // which cannot effectively optimize temperature: the gradient is
+                // dominated by density parameters (scale ~1e-4) so the temperature
+                // (scale ~200) never moves.
+                //
+                // Use poisson_fit_analytic with Fisher preconditioning, which
+                // handles the scale mismatch via diagonal Hessian normalization.
+                //
+                // In transmission space, flux = 1.0 everywhere (since Y = T,
+                // not Y = Φ·T + B).  The analytical gradient formulas reduce
+                // correctly with Φ=1.
+                let density_indices: Vec<usize> = (0..n_isotopes).collect();
+                let instrument_plain = instrument.as_deref().cloned();
+
+                // Use precomputed base_xs when available (spatial_map path);
+                // fall back to computing them here (single-pixel path).
+                let base_xs: Arc<Vec<Vec<f64>>> = match config.precomputed_base_xs() {
+                    Some(cached) => Arc::clone(cached),
+                    None => Arc::new(phys_transmission::unbroadened_cross_sections(
+                        config.energies(),
+                        config.resonance_data(),
+                        None,
+                    )?),
+                };
+
+                // Compute initial broadened XS from base (Doppler + resolution
+                // only, no redundant Reich-Moore).
+                let xs = phys_transmission::broadened_cross_sections_from_base(
+                    config.energies(),
+                    &base_xs,
+                    config.resonance_data(),
+                    config.temperature_k(),
+                    instrument.as_deref(),
+                )?;
+
+                let temp_ctx = TemperatureContext {
+                    temperature_index: n_isotopes,
+                    resonance_data: config.resonance_data().to_vec(),
+                    energies: config.energies().to_vec(),
+                    instrument: instrument_plain,
+                    base_xs: Some(base_xs),
+                };
+
+                let flux = vec![1.0f64; config.energies().len()];
+
+                let pr = poisson::poisson_fit_analytic(
+                    &model,
+                    measured_t,
+                    &flux,
+                    &xs,
+                    &density_indices,
+                    &mut params,
+                    poisson_config,
+                    Some(&temp_ctx),
+                )?;
+
+                let n_free = params.n_free();
+                let dof = measured_t.len().saturating_sub(n_free).max(1);
+                let y_model = model.evaluate(&pr.params);
+                let chi_sq: f64 = measured_t
+                    .iter()
+                    .zip(y_model.iter())
+                    .zip(sigma.iter())
+                    .map(|((obs, mdl), s)| {
+                        let residual = obs - mdl;
+                        (residual * residual) / (s * s).max(1e-30)
+                    })
+                    .sum();
+                LmResult {
+                    chi_squared: chi_sq,
+                    reduced_chi_squared: chi_sq / dof as f64,
+                    iterations: pr.iterations,
+                    converged: pr.converged,
+                    params: pr.params,
+                    covariance: None,
+                    uncertainties: None,
+                }
+            }
+        }
     };
 
     let densities: Vec<f64> = (0..n_isotopes).map(|i| result.params[i]).collect();
@@ -574,6 +684,7 @@ mod tests {
             None,
             vec![0],
             None,
+            None,
         )
         .unwrap();
         let y_obs = model.evaluate(&[true_density]);
@@ -619,6 +730,7 @@ mod tests {
             0.0,
             None,
             vec![0],
+            None,
             None,
         )
         .unwrap();
@@ -859,6 +971,7 @@ mod tests {
             None,
             vec![0],
             None,
+            None,
         )
         .unwrap();
         let y_obs = model.evaluate(&[true_density]);
@@ -887,5 +1000,157 @@ mod tests {
         );
         // Poisson FD does not compute covariance
         assert!(result.uncertainties.is_none());
+    }
+
+    // ── Temperature fitting round-trip tests ────────────────────────────────
+
+    /// Generate synthetic transmission for the given isotopes at a known
+    /// temperature and density, then fit through `fit_spectrum` and verify
+    /// recovery.
+    fn temperature_round_trip(
+        resonance_data: Vec<ResonanceData>,
+        names: Vec<String>,
+        true_densities: &[f64],
+        true_temp: f64,
+        solver: SolverChoice,
+        tolerance: f64,
+        label: &str,
+    ) {
+        use nereids_physics::transmission::{SampleParams, forward_model};
+
+        // Energy grid spanning both the W-182 (4.15 eV) and U-238 (6.67 eV)
+        // resonances with enough points for the optimizer.
+        let energies: Vec<f64> = (0..501).map(|i| 2.0 + (i as f64) * 0.02).collect();
+
+        // Build isotope list for the forward model at truth.
+        let isotopes: Vec<(ResonanceData, f64)> = resonance_data
+            .iter()
+            .zip(true_densities.iter())
+            .map(|(rd, &d)| (rd.clone(), d))
+            .collect();
+        let sample = SampleParams::new(true_temp, isotopes).unwrap();
+        let y_obs = forward_model(&energies, &sample, None).unwrap();
+
+        // Use uniform small sigma for the LM path.
+        let sigma = vec![0.005; y_obs.len()];
+
+        // Initial guesses: densities at 2× truth, temperature 100 K off.
+        let initial_densities: Vec<f64> = true_densities.iter().map(|d| d * 2.0).collect();
+        let config = FitConfig::new(
+            energies,
+            resonance_data,
+            names,
+            true_temp - 100.0, // initial T guess offset from truth
+            None,
+            initial_densities,
+            LmConfig {
+                max_iter: 300,
+                ..LmConfig::default()
+            },
+        )
+        .unwrap()
+        .with_fit_temperature(true)
+        .unwrap()
+        .with_solver(solver);
+
+        let result = fit_spectrum(&y_obs, &sigma, &config).unwrap();
+
+        assert!(
+            result.converged,
+            "[{label}] did not converge after {} iterations",
+            result.iterations,
+        );
+
+        // Check each density.
+        for (i, (&fitted, &truth)) in result
+            .densities
+            .iter()
+            .zip(true_densities.iter())
+            .enumerate()
+        {
+            let rel_err = (fitted - truth).abs() / truth;
+            assert!(
+                rel_err < tolerance,
+                "[{label}] density[{i}]: fitted={fitted:.6e}, true={truth:.6e}, error={:.2}%",
+                rel_err * 100.0,
+            );
+        }
+
+        // Check temperature.
+        let fitted_temp = result
+            .temperature_k
+            .expect("temperature_k should be Some when fit_temperature=true");
+        let temp_rel_err = (fitted_temp - true_temp).abs() / true_temp;
+        assert!(
+            temp_rel_err < tolerance,
+            "[{label}] temperature: fitted={fitted_temp:.1} K, true={true_temp:.1} K, error={:.2}%",
+            temp_rel_err * 100.0,
+        );
+    }
+
+    #[test]
+    fn test_fit_spectrum_single_isotope_temperature_lm() {
+        let u238 = u238_single_resonance();
+        temperature_round_trip(
+            vec![u238],
+            vec!["U-238".into()],
+            &[0.0005],
+            300.0,
+            SolverChoice::LevenbergMarquardt,
+            0.01, // 1% tolerance (noise-free data)
+            "1-isotope LM",
+        );
+    }
+
+    #[test]
+    fn test_fit_spectrum_multi_isotope_temperature_lm() {
+        use crate::test_helpers::w182_single_resonance;
+        let u238 = u238_single_resonance();
+        let w182 = w182_single_resonance();
+        temperature_round_trip(
+            vec![u238, w182],
+            vec!["U-238".into(), "W-182".into()],
+            &[0.0005, 0.0003],
+            300.0,
+            SolverChoice::LevenbergMarquardt,
+            0.01, // 1%
+            "2-isotope LM",
+        );
+    }
+
+    #[test]
+    fn test_fit_spectrum_single_isotope_temperature_poisson() {
+        let u238 = u238_single_resonance();
+        temperature_round_trip(
+            vec![u238],
+            vec!["U-238".into()],
+            &[0.0005],
+            300.0,
+            SolverChoice::PoissonKL(PoissonConfig {
+                max_iter: 500,
+                ..PoissonConfig::default()
+            }),
+            0.02, // 2% tolerance (Poisson solver slightly less precise)
+            "1-isotope Poisson",
+        );
+    }
+
+    #[test]
+    fn test_fit_spectrum_multi_isotope_temperature_poisson() {
+        use crate::test_helpers::w182_single_resonance;
+        let u238 = u238_single_resonance();
+        let w182 = w182_single_resonance();
+        temperature_round_trip(
+            vec![u238, w182],
+            vec!["U-238".into(), "W-182".into()],
+            &[0.0005, 0.0003],
+            300.0,
+            SolverChoice::PoissonKL(PoissonConfig {
+                max_iter: 500,
+                ..PoissonConfig::default()
+            }),
+            0.02, // 2%
+            "2-isotope Poisson",
+        );
     }
 }

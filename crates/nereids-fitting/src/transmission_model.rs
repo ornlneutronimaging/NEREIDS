@@ -149,14 +149,24 @@ pub struct TransmissionFitModel {
     /// and included as a free parameter in the fit. The Doppler broadening
     /// kernel is recomputed at each `evaluate()` call.
     temperature_index: Option<usize>,
+    /// Cached unbroadened (Reich-Moore) cross-sections, computed once in
+    /// `new()` when `temperature_index` is `Some`. Eliminates redundant
+    /// O(N_energy × N_resonances) computation on every `evaluate()` call.
+    /// Wrapped in `Arc` so `spatial_map` can share a single allocation across
+    /// all per-pixel `TransmissionFitModel` instances without deep cloning.
+    base_xs: Option<Arc<Vec<Vec<f64>>>>,
 }
 
 impl TransmissionFitModel {
     /// Create a validated `TransmissionFitModel`.
     ///
+    /// When `external_base_xs` is `Some`, uses those precomputed unbroadened
+    /// cross-sections instead of computing them (expensive Reich-Moore).
+    /// `spatial_map` precomputes once for all pixels and passes them here.
+    ///
     /// # Errors
     /// Returns `FittingError::InvalidConfig` if `temperature_index` overlaps
-    /// with `density_indices`.
+    /// with `density_indices`, or if `external_base_xs` has a mismatched shape.
     pub fn new(
         energies: Vec<f64>,
         resonance_data: Vec<ResonanceData>,
@@ -164,6 +174,7 @@ impl TransmissionFitModel {
         instrument: Option<Arc<InstrumentParams>>,
         density_indices: Vec<usize>,
         temperature_index: Option<usize>,
+        external_base_xs: Option<Arc<Vec<Vec<f64>>>>,
     ) -> Result<Self, FittingError> {
         if let Some(ti) = temperature_index
             && density_indices.contains(&ti)
@@ -172,6 +183,37 @@ impl TransmissionFitModel {
                 "temperature_index must not overlap with density_indices".into(),
             ));
         }
+        // Validate external base XS shape before accepting.
+        if let Some(ref xs) = external_base_xs {
+            if xs.len() != resonance_data.len() {
+                return Err(FittingError::InvalidConfig(format!(
+                    "external_base_xs has {} isotopes but resonance_data has {}",
+                    xs.len(),
+                    resonance_data.len(),
+                )));
+            }
+            for (i, row) in xs.iter().enumerate() {
+                if row.len() != energies.len() {
+                    return Err(FittingError::InvalidConfig(format!(
+                        "external_base_xs[{i}] has {} energies but expected {}",
+                        row.len(),
+                        energies.len(),
+                    )));
+                }
+            }
+        }
+        let base_xs = match external_base_xs {
+            Some(xs) => Some(xs),
+            None if temperature_index.is_some() => Some(Arc::new(
+                transmission::unbroadened_cross_sections(&energies, &resonance_data, None)
+                    .map_err(|e| {
+                        FittingError::InvalidConfig(format!(
+                            "failed to compute unbroadened cross-sections: {e}"
+                        ))
+                    })?,
+            )),
+            None => None,
+        };
         Ok(Self {
             energies,
             resonance_data,
@@ -179,6 +221,7 @@ impl TransmissionFitModel {
             instrument,
             density_indices,
             temperature_index,
+            base_xs,
         })
     }
 }
@@ -196,26 +239,49 @@ impl FitModel for TransmissionFitModel {
             params.len(),
         );
 
-        let isotopes: Vec<(ResonanceData, f64)> = self
-            .resonance_data
-            .iter()
-            .zip(self.density_indices.iter())
-            .map(|(rd, &idx): (&ResonanceData, &usize)| (rd.clone(), params[idx]))
-            .collect();
-
         let temperature_k = match self.temperature_index {
             Some(idx) => params[idx],
             None => self.temperature_k,
         };
 
-        let sample = SampleParams::new(temperature_k, isotopes)
-            .expect("SampleParams: temperature must be non-negative and finite");
+        if let Some(ref base_xs) = self.base_xs {
+            // Fast path: reuse cached unbroadened XS, only redo Doppler + Beer-Lambert.
+            // Validate temperature (same rules as SampleParams::new) so the optimizer
+            // can't silently evaluate an unphysical model with NaN/negative T.
+            let temperature_k = if !temperature_k.is_finite() || temperature_k < 0.0 {
+                0.0
+            } else {
+                temperature_k
+            };
+            let thicknesses: Vec<f64> = self
+                .density_indices
+                .iter()
+                .map(|&idx| params[idx])
+                .collect();
+            transmission::forward_model_from_base_xs(
+                &self.energies,
+                base_xs,
+                &self.resonance_data,
+                &thicknesses,
+                temperature_k,
+                self.instrument.as_deref(),
+            )
+            .expect("forward_model_from_base_xs failed")
+        } else {
+            // Original path: full forward model (no temperature fitting).
+            let isotopes: Vec<(ResonanceData, f64)> = self
+                .resonance_data
+                .iter()
+                .zip(self.density_indices.iter())
+                .map(|(rd, &idx): (&ResonanceData, &usize)| (rd.clone(), params[idx]))
+                .collect();
 
-        // forward_model can fail for unsorted energies or invalid Doppler
-        // params — both are configuration bugs (energies and isotope data are
-        // set once at model construction).  The LM loop cannot fix these.
-        transmission::forward_model(&self.energies, &sample, self.instrument.as_deref())
-            .expect("TransmissionFitModel: forward_model failed (energy grid must be sorted ascending and Doppler params must be valid)")
+            let sample = SampleParams::new(temperature_k, isotopes)
+                .expect("SampleParams: temperature must be non-negative and finite");
+
+            transmission::forward_model(&self.energies, &sample, self.instrument.as_deref())
+                .expect("TransmissionFitModel: forward_model failed")
+        }
     }
 }
 
@@ -386,7 +452,7 @@ mod tests {
         let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
 
         let model =
-            TransmissionFitModel::new(energies.clone(), vec![data], 0.0, None, vec![0], None)
+            TransmissionFitModel::new(energies.clone(), vec![data], 0.0, None, vec![0], None, None)
                 .unwrap();
 
         let y_obs = model.evaluate(&[true_thickness]);
@@ -461,6 +527,7 @@ mod tests {
             None,
             vec![0, 1],
             None,
+            None,
         )
         .unwrap();
 
@@ -517,13 +584,21 @@ mod tests {
             None,
             vec![0],
             Some(1),
+            None,
         )
         .unwrap();
 
         // Model with fixed temperature = 300 K (no temperature_index).
-        let model_fixed =
-            TransmissionFitModel::new(energies.clone(), vec![data], 300.0, None, vec![0], None)
-                .unwrap();
+        let model_fixed = TransmissionFitModel::new(
+            energies.clone(),
+            vec![data],
+            300.0,
+            None,
+            vec![0],
+            None,
+            None,
+        )
+        .unwrap();
 
         let density = 0.0005;
         let y_via_index = model.evaluate(&[density, 300.0]);
@@ -560,6 +635,7 @@ mod tests {
             None,
             vec![0],
             Some(1), // params[1] = temperature
+            None,
         )
         .unwrap();
 

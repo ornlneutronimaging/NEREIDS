@@ -655,6 +655,7 @@ mod tests {
             None,
             vec![0],
             None,
+            None,
         )
         .unwrap();
         let transmission = t_model.evaluate(&[true_density]);

@@ -691,6 +691,7 @@ fn fit_spectrum(
                         instrument,
                         (0..n_isotopes).collect(),
                         Some(n_isotopes),
+                        None,
                     )
                     .map_err(|e| format!("TransmissionFitModel::new failed: {e}"))?;
                     lm::levenberg_marquardt(&model, &t_owned, &s_owned, &mut params, &config)
@@ -775,15 +776,38 @@ fn fit_spectrum(
             // Release the GIL for the heavy computation.
             // The closure uses only Rust types; PyErr conversion happens outside.
             let result: Result<PyFitResult, String> = py.detach(move || {
+                // When fitting temperature, compute unbroadened XS first (Reich-Moore,
+                // temperature-independent), then derive broadened XS from them.
+                // This avoids computing Reich-Moore twice.
+                let base_xs_arc = if fit_temperature {
+                    Some(Arc::new(
+                        transmission::unbroadened_cross_sections(&e_owned, &res_data, None)
+                            .map_err(|e| format!("unbroadened_cross_sections failed: {e}"))?,
+                    ))
+                } else {
+                    None
+                };
+
                 // Precompute broadened cross-sections at the initial temperature.
-                let xs = transmission::broadened_cross_sections(
-                    &e_owned,
-                    &res_data,
-                    temperature_k,
-                    instrument.as_ref(),
-                    None,
-                )
-                .map_err(|e| format!("broadened_cross_sections failed: {}", e))?;
+                let xs = if let Some(ref base) = base_xs_arc {
+                    transmission::broadened_cross_sections_from_base(
+                        &e_owned,
+                        base,
+                        &res_data,
+                        temperature_k,
+                        instrument.as_ref(),
+                    )
+                    .map_err(|e| format!("broadened_cross_sections_from_base failed: {e}"))?
+                } else {
+                    transmission::broadened_cross_sections(
+                        &e_owned,
+                        &res_data,
+                        temperature_k,
+                        instrument.as_ref(),
+                        None,
+                    )
+                    .map_err(|e| format!("broadened_cross_sections failed: {e}"))?
+                };
 
                 // Build density parameters.
                 let mut param_vec: Vec<FitParameter> = init
@@ -814,14 +838,15 @@ fn fit_spectrum(
                     density_indices: Arc::clone(&density_indices),
                 };
 
-                // When fitting temperature, use TransmissionFitModel (full physics
-                // per evaluation) so the model sees the changing T.
+                // When fitting temperature, share base_xs between
+                // TemperatureContext and TransmissionFitModel.
                 let temp_ctx = if fit_temperature {
                     Some(TemperatureContext {
                         temperature_index: n_isotopes,
                         resonance_data: res_data.clone(),
                         energies: e_owned.clone(),
                         instrument: instrument.clone(),
+                        base_xs: base_xs_arc.clone(),
                     })
                 } else {
                     None
@@ -836,6 +861,7 @@ fn fit_spectrum(
                         instrument.map(Arc::new),
                         (*density_indices).clone(),
                         Some(n_isotopes),
+                        base_xs_arc,
                     )
                     .map_err(|e| format!("TransmissionFitModel::new failed: {e}"))?;
                     &full_model

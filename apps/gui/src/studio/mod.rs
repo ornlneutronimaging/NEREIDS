@@ -30,10 +30,12 @@ pub fn studio_content(ctx: &egui::Context, state: &mut AppState) {
     let has_results = state.spatial_result.is_some();
 
     // Ensure tile_display is populated when results exist
-    if let Some(ref r) = state.spatial_result
-        && state.tile_display.len() < r.density_maps.len() + 1
-    {
-        state.init_tile_display(r.density_maps.len());
+    if let Some(ref r) = state.spatial_result {
+        let has_temp = r.temperature_map.is_some();
+        let needed = r.density_maps.len() + 1 + has_temp as usize;
+        if state.tile_display.len() < needed {
+            state.init_tile_display(r.density_maps.len());
+        }
     }
 
     // 1. Bottom dock (before side panel and central panel — egui ordering)
@@ -121,8 +123,13 @@ fn analysis_tab(ui: &mut egui::Ui, state: &mut AppState) {
         return;
     }
 
-    // Clamp isotope index
-    if state.studio_analysis_isotope >= n_density {
+    // Clamp isotope index (account for optional temperature map entry)
+    let has_temp_map_early = state
+        .spatial_result
+        .as_ref()
+        .is_some_and(|r| r.temperature_map.is_some());
+    let n_options_early = n_density + has_temp_map_early as usize;
+    if state.studio_analysis_isotope >= n_options_early {
         state.studio_analysis_isotope = 0;
     }
 
@@ -161,24 +168,46 @@ fn analysis_map_column(
     symbols: &[String],
     density_maps: &[ndarray::Array2<f64>],
 ) {
-    // Header: isotope selector (colormap/save controls are in tile_toolbelt below)
+    let has_temp_map = state
+        .spatial_result
+        .as_ref()
+        .is_some_and(|r| r.temperature_map.is_some());
+    // Index mapping: 0..n_density = isotopes, n_density = temperature (if present)
+    let n_options = n_density + has_temp_map as usize;
+
+    // Header: map selector (colormap/save controls are in tile_toolbelt below)
     ui.horizontal(|ui| {
-        ui.label("Isotope:");
+        ui.label("Map:");
+        let sel = state.studio_analysis_isotope;
+        let sel_text = if sel < n_density {
+            symbols.get(sel).map_or("—", |s| s.as_str())
+        } else if has_temp_map && sel == n_density {
+            "Temperature"
+        } else {
+            "—"
+        };
         egui::ComboBox::from_id_salt("analysis_isotope_sel")
-            .selected_text(
-                symbols
-                    .get(state.studio_analysis_isotope)
-                    .map_or("—", |s| s.as_str()),
-            )
+            .selected_text(sel_text)
             .show_ui(ui, |ui| {
                 for (i, sym) in symbols.iter().enumerate().take(n_density) {
                     ui.selectable_value(&mut state.studio_analysis_isotope, i, sym);
+                }
+                if has_temp_map {
+                    ui.selectable_value(
+                        &mut state.studio_analysis_isotope,
+                        n_density,
+                        "Temperature",
+                    );
                 }
             });
     });
     ui.add_space(4.0);
 
-    // Density map image
+    // Clamp
+    if state.studio_analysis_isotope >= n_options {
+        state.studio_analysis_isotope = 0;
+    }
+
     let tile_idx = state.studio_analysis_isotope;
     let colormap = state
         .tile_display
@@ -189,7 +218,19 @@ fn analysis_map_column(
         .get(tile_idx)
         .is_some_and(|t| t.show_colorbar);
 
-    if let Some(data) = density_maps.get(tile_idx) {
+    // Select the appropriate map data
+    let map_data: Option<&ndarray::Array2<f64>> = if tile_idx < n_density {
+        density_maps.get(tile_idx)
+    } else if has_temp_map && tile_idx == n_density {
+        state
+            .spatial_result
+            .as_ref()
+            .and_then(|r| r.temperature_map.as_ref())
+    } else {
+        None
+    };
+
+    if let Some(data) = map_data {
         if show_bar {
             ui.horizontal(|ui| {
                 if let Some((y, x)) =
@@ -208,10 +249,14 @@ fn analysis_map_column(
         }
 
         // Toolbelt
-        let label = symbols
-            .get(tile_idx)
-            .map_or("unknown", |s| s.as_str())
-            .to_string();
+        let label = if tile_idx < n_density {
+            symbols
+                .get(tile_idx)
+                .map_or("unknown", |s| s.as_str())
+                .to_string()
+        } else {
+            "temperature".to_string()
+        };
         result_widgets::tile_toolbelt(
             ui,
             data,
@@ -355,12 +400,15 @@ fn analysis_spectrum_column(ui: &mut egui::Ui, state: &mut AppState) {
             .iter()
             .filter_map(|e| e.resonance_data.clone())
             .collect();
+        // Use fitted temperature for overlay (falls back to initial guess).
+        let overlay_temp = result.temperature_k.unwrap_or(state.temperature_k);
         let model = nereids_fitting::transmission_model::TransmissionFitModel::new(
             energies.clone(),
             resonance_data,
-            state.temperature_k,
+            overlay_temp,
             None,
             (0..result.densities.len()).collect(),
+            None,
             None,
         )
         .ok()?;
@@ -401,6 +449,13 @@ fn analysis_spectrum_column(ui: &mut egui::Ui, state: &mut AppState) {
             ui.label(egui::RichText::new(label).color(color).strong());
             ui.label(format!("chi2_r = {:.4}", result.reduced_chi_squared));
             ui.label(format!("iter = {}", result.iterations));
+            if let Some(t) = result.temperature_k {
+                if let Some(u) = result.temperature_k_unc {
+                    ui.label(format!("T = {t:.1} \u{00b1} {u:.1} K"));
+                } else {
+                    ui.label(format!("T = {t:.1} K"));
+                }
+            }
         });
 
         for (i, entry) in state

@@ -294,6 +294,8 @@ pub struct FitFeedback {
     pub summary: String,
     /// Per-isotope densities: (symbol, density_atoms_per_barn).
     pub densities: Vec<(String, f64)>,
+    /// Fitted temperature (K), when temperature fitting was enabled.
+    pub temperature_k: Option<f64>,
 }
 
 /// A single provenance event in the session audit trail.
@@ -1055,8 +1057,12 @@ impl AppState {
     /// Ensure `tile_display` has enough entries for the current result.
     /// Call after spatial analysis completes.
     pub fn init_tile_display(&mut self, n_density_maps: usize) {
-        // +1 for the convergence map tile
-        let needed = n_density_maps + 1;
+        // +1 for convergence, +1 for temperature map (if present)
+        let has_temp = self
+            .spatial_result
+            .as_ref()
+            .is_some_and(|r| r.temperature_map.is_some());
+        let needed = n_density_maps + 1 + has_temp as usize;
         self.tile_display
             .resize_with(needed, TileDisplayState::default);
     }

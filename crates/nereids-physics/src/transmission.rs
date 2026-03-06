@@ -464,6 +464,188 @@ pub fn broadened_cross_sections_with_derivative(
     Ok((xs_center, dxs_dt))
 }
 
+/// Compute unbroadened (raw Reich-Moore) cross-sections for each isotope.
+///
+/// This is the temperature-independent first step of the forward model.
+/// The result can be cached and reused across multiple temperature evaluations
+/// (e.g., during LM iterations where temperature is a free parameter).
+///
+/// # Returns
+/// One total cross-section vector per isotope: `result[k][e]` is the
+/// unbroadened total cross-section (barns) for isotope `k` at energy `e`.
+pub fn unbroadened_cross_sections(
+    energies: &[f64],
+    resonance_data: &[ResonanceData],
+    cancel: Option<&AtomicBool>,
+) -> Result<Vec<Vec<f64>>, TransmissionError> {
+    let result: Result<Vec<Vec<f64>>, TransmissionError> = resonance_data
+        .par_iter()
+        .map(|rd| {
+            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                return Err(TransmissionError::Cancelled);
+            }
+            let xs: Vec<f64> = energies
+                .iter()
+                .map(|&e| reich_moore::cross_sections_at_energy(rd, e).total)
+                .collect();
+            Ok(xs)
+        })
+        .collect();
+
+    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+        return Err(TransmissionError::Cancelled);
+    }
+    result
+}
+
+/// Compute Doppler- and resolution-broadened cross-sections from precomputed
+/// unbroadened cross-sections.
+///
+/// Like [`broadened_cross_sections`] but skips the expensive Reich-Moore
+/// calculation (step 1). Use [`unbroadened_cross_sections`] to compute
+/// `base_xs` once, then call this function repeatedly with different
+/// temperatures.
+pub fn broadened_cross_sections_from_base(
+    energies: &[f64],
+    base_xs: &[Vec<f64>],
+    resonance_data: &[ResonanceData],
+    temperature_k: f64,
+    instrument: Option<&InstrumentParams>,
+) -> Result<Vec<Vec<f64>>, TransmissionError> {
+    if base_xs.len() != resonance_data.len() {
+        return Err(TransmissionError::InputMismatch(format!(
+            "base_xs has {} isotopes but resonance_data has {}",
+            base_xs.len(),
+            resonance_data.len(),
+        )));
+    }
+    for (i, row) in base_xs.iter().enumerate() {
+        if row.len() != energies.len() {
+            return Err(TransmissionError::InputMismatch(format!(
+                "base_xs[{i}] has {} energies but expected {}",
+                row.len(),
+                energies.len(),
+            )));
+        }
+    }
+    if instrument.is_some() && !energies.windows(2).all(|w| w[0] <= w[1]) {
+        return Err(ResolutionError::UnsortedEnergies.into());
+    }
+
+    base_xs
+        .iter()
+        .zip(resonance_data.iter())
+        .map(|(xs_raw, rd)| {
+            let after_doppler = if temperature_k > 0.0 {
+                let params = DopplerParams::new(temperature_k, rd.awr)?;
+                doppler::doppler_broaden(energies, xs_raw, &params)?
+            } else {
+                xs_raw.clone()
+            };
+
+            let xs = if let Some(inst) = instrument {
+                resolution::apply_resolution_presorted(energies, &after_doppler, &inst.resolution)
+            } else {
+                after_doppler
+            };
+
+            Ok(xs)
+        })
+        .collect()
+}
+
+/// Compute broadened cross-sections and their temperature derivative from
+/// precomputed unbroadened cross-sections.
+///
+/// Like [`broadened_cross_sections_with_derivative`] but skips the expensive
+/// Reich-Moore calculation. Three calls to [`broadened_cross_sections_from_base`]
+/// at T, T+dT, T−dT.
+pub fn broadened_cross_sections_with_derivative_from_base(
+    energies: &[f64],
+    base_xs: &[Vec<f64>],
+    resonance_data: &[ResonanceData],
+    temperature_k: f64,
+    instrument: Option<&InstrumentParams>,
+) -> Result<BroadenedXsWithDerivative, TransmissionError> {
+    let dt = 1e-4 * (1.0 + temperature_k);
+    let t_up = temperature_k + dt;
+    let t_down = (temperature_k - dt).max(0.0);
+    let actual_2dt = t_up - t_down;
+
+    let xs_center = broadened_cross_sections_from_base(
+        energies,
+        base_xs,
+        resonance_data,
+        temperature_k,
+        instrument,
+    )?;
+    let xs_up =
+        broadened_cross_sections_from_base(energies, base_xs, resonance_data, t_up, instrument)?;
+    let xs_down =
+        broadened_cross_sections_from_base(energies, base_xs, resonance_data, t_down, instrument)?;
+
+    let dxs_dt: Vec<Vec<f64>> = xs_up
+        .iter()
+        .zip(xs_down.iter())
+        .map(|(up, down)| {
+            up.iter()
+                .zip(down.iter())
+                .map(|(&u, &d)| (u - d) / actual_2dt)
+                .collect()
+        })
+        .collect();
+
+    Ok((xs_center, dxs_dt))
+}
+
+/// Compute a transmission spectrum from precomputed unbroadened cross-sections.
+///
+/// Applies Doppler broadening, resolution broadening, and Beer-Lambert
+/// using cached base XS. This skips the expensive Reich-Moore calculation,
+/// making it suitable for use inside `TransmissionFitModel::evaluate()` when
+/// temperature is a free parameter.
+pub fn forward_model_from_base_xs(
+    energies: &[f64],
+    base_xs: &[Vec<f64>],
+    resonance_data: &[ResonanceData],
+    thicknesses: &[f64],
+    temperature_k: f64,
+    instrument: Option<&InstrumentParams>,
+) -> Result<Vec<f64>, TransmissionError> {
+    if base_xs.len() != resonance_data.len() || thicknesses.len() != resonance_data.len() {
+        return Err(TransmissionError::InputMismatch(format!(
+            "forward_model_from_base_xs: base_xs({})/thicknesses({})/resonance_data({}) length mismatch",
+            base_xs.len(),
+            thicknesses.len(),
+            resonance_data.len(),
+        )));
+    }
+    let n = energies.len();
+    if n == 0 {
+        return Ok(vec![]);
+    }
+
+    let broadened = broadened_cross_sections_from_base(
+        energies,
+        base_xs,
+        resonance_data,
+        temperature_k,
+        instrument,
+    )?;
+
+    let mut total_attenuation = vec![0.0f64; n];
+    for (xs, &thickness) in broadened.iter().zip(thicknesses.iter()) {
+        if thickness <= 0.0 {
+            continue;
+        }
+        for i in 0..n {
+            total_attenuation[i] += thickness * xs[i];
+        }
+    }
+
+    Ok(total_attenuation.iter().map(|&att| (-att).exp()).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -870,5 +1052,122 @@ mod tests {
     fn test_sample_params_rejects_neg_infinite_temperature() {
         let err = SampleParams::new(f64::NEG_INFINITY, vec![]).unwrap_err();
         assert!(matches!(err, SampleParamsError::NonFiniteTemperature(_)));
+    }
+
+    // --- Base XS caching tests ---
+
+    #[test]
+    fn test_forward_model_from_base_xs_matches_forward_model() {
+        let data = u238_single_resonance();
+        let thickness = 0.0005;
+        let temperature = 300.0;
+        let energies: Vec<f64> = (0..201).map(|i| 4.0 + (i as f64) * 0.025).collect();
+
+        // Reference: full forward model
+        let sample = SampleParams::new(temperature, vec![(data.clone(), thickness)]).unwrap();
+        let t_ref = forward_model(&energies, &sample, None).unwrap();
+
+        // Cached path: unbroadened XS → forward_model_from_base_xs
+        let base_xs =
+            unbroadened_cross_sections(&energies, std::slice::from_ref(&data), None).unwrap();
+        let t_cached = forward_model_from_base_xs(
+            &energies,
+            &base_xs,
+            std::slice::from_ref(&data),
+            &[thickness],
+            temperature,
+            None,
+        )
+        .unwrap();
+
+        for (i, (&r, &c)) in t_ref.iter().zip(t_cached.iter()).enumerate() {
+            assert!(
+                (r - c).abs() < 1e-12,
+                "Mismatch at E[{}]={}: ref={}, cached={}",
+                i,
+                energies[i],
+                r,
+                c
+            );
+        }
+    }
+
+    #[test]
+    fn test_broadened_from_base_matches_broadened() {
+        let data = u238_single_resonance();
+        let temperature = 300.0;
+        let energies: Vec<f64> = (0..201).map(|i| 4.0 + (i as f64) * 0.025).collect();
+
+        let xs_ref = broadened_cross_sections(
+            &energies,
+            std::slice::from_ref(&data),
+            temperature,
+            None,
+            None,
+        )
+        .unwrap();
+        let base_xs =
+            unbroadened_cross_sections(&energies, std::slice::from_ref(&data), None).unwrap();
+        let xs_cached = broadened_cross_sections_from_base(
+            &energies,
+            &base_xs,
+            std::slice::from_ref(&data),
+            temperature,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(xs_ref.len(), xs_cached.len());
+        for (r, c) in xs_ref[0].iter().zip(xs_cached[0].iter()) {
+            assert!(
+                (r - c).abs() < 1e-12,
+                "broadened_from_base mismatch: ref={}, cached={}",
+                r,
+                c
+            );
+        }
+    }
+
+    #[test]
+    fn test_derivative_from_base_matches_derivative() {
+        let data = u238_single_resonance();
+        let temperature = 300.0;
+        let energies: Vec<f64> = (0..201).map(|i| 4.0 + (i as f64) * 0.025).collect();
+
+        let (xs_ref, dxs_ref) = broadened_cross_sections_with_derivative(
+            &energies,
+            std::slice::from_ref(&data),
+            temperature,
+            None,
+        )
+        .unwrap();
+
+        let base_xs =
+            unbroadened_cross_sections(&energies, std::slice::from_ref(&data), None).unwrap();
+        let (xs_cached, dxs_cached) = broadened_cross_sections_with_derivative_from_base(
+            &energies,
+            &base_xs,
+            std::slice::from_ref(&data),
+            temperature,
+            None,
+        )
+        .unwrap();
+
+        for (r, c) in xs_ref[0].iter().zip(xs_cached[0].iter()) {
+            assert!(
+                (r - c).abs() < 1e-12,
+                "XS mismatch: ref={}, cached={}",
+                r,
+                c
+            );
+        }
+        for (r, c) in dxs_ref[0].iter().zip(dxs_cached[0].iter()) {
+            assert!(
+                (r - c).abs() < 1e-12,
+                "dXS/dT mismatch: ref={}, cached={}",
+                r,
+                c
+            );
+        }
     }
 }

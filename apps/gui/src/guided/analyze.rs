@@ -263,6 +263,9 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
                 for (symbol, density) in &fb.densities {
                     ui.label(format!("  {symbol}: {density:.4e} at/barn"));
                 }
+                if let Some(t) = fb.temperature_k {
+                    ui.label(format!("  T = {t:.1} K"));
+                }
             });
     }
 }
@@ -716,12 +719,15 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
             .iter()
             .filter_map(|e| e.resonance_data.clone())
             .collect();
+        // Use fitted temperature for the overlay (falls back to initial guess).
+        let overlay_temp = result.temperature_k.unwrap_or(state.temperature_k);
         let model = nereids_fitting::transmission_model::TransmissionFitModel::new(
             energies.clone(),
             resonance_data,
-            state.temperature_k,
+            overlay_temp,
             None,
             (0..result.densities.len()).collect(),
+            None,
             None,
         )
         .ok()?;
@@ -813,6 +819,13 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
             ui.label(egui::RichText::new(label).color(color).strong());
             ui.label(format!("chi2_r = {:.4}", result.reduced_chi_squared));
             ui.label(format!("iter = {}", result.iterations));
+            if let Some(t) = result.temperature_k {
+                if let Some(u) = result.temperature_k_unc {
+                    ui.label(format!("T = {t:.1} \u{00b1} {u:.1} K"));
+                } else {
+                    ui.label(format!("T = {t:.1} K"));
+                }
+            }
         });
 
         for (i, entry) in state
@@ -927,6 +940,7 @@ fn fit_pixel(state: &mut AppState) {
                 success: false,
                 summary: e.clone(),
                 densities: vec![],
+                temperature_k: None,
             });
             state.status_message = e;
             return;
@@ -941,6 +955,7 @@ fn fit_pixel(state: &mut AppState) {
                 success: false,
                 summary: msg.clone(),
                 densities: vec![],
+                temperature_k: None,
             });
             state.status_message = msg;
             return;
@@ -959,6 +974,7 @@ fn fit_pixel(state: &mut AppState) {
             success: false,
             summary: msg.clone(),
             densities: vec![],
+            temperature_k: None,
         });
         state.status_message = msg;
         return;
@@ -987,6 +1003,7 @@ fn fit_pixel(state: &mut AppState) {
                 success: false,
                 summary: msg.clone(),
                 densities: vec![],
+                temperature_k: None,
             });
             state.status_message = msg;
             return;
@@ -1008,10 +1025,12 @@ fn fit_pixel(state: &mut AppState) {
         .map(|(s, &d)| (s.clone(), d))
         .collect();
 
+    let fitted_temp = result.temperature_k;
     state.last_fit_feedback = Some(crate::state::FitFeedback {
         success: result.converged,
         summary: summary.clone(),
         densities,
+        temperature_k: fitted_temp,
     });
     state.status_message = summary;
     state.pixel_fit_result = Some(result);
@@ -1027,6 +1046,7 @@ fn fit_roi(state: &mut AppState) {
                 success: false,
                 summary: e.clone(),
                 densities: vec![],
+                temperature_k: None,
             });
             state.status_message = e;
             return;
@@ -1044,6 +1064,7 @@ fn fit_roi(state: &mut AppState) {
             success: false,
             summary: msg.clone(),
             densities: vec![],
+            temperature_k: None,
         });
         state.status_message = msg;
         return;
@@ -1081,6 +1102,7 @@ fn fit_roi(state: &mut AppState) {
             success: false,
             summary: msg.clone(),
             densities: vec![],
+            temperature_k: None,
         });
         state.status_message = msg;
         return;
@@ -1113,6 +1135,7 @@ fn fit_roi(state: &mut AppState) {
                 success: false,
                 summary: msg.clone(),
                 densities: vec![],
+                temperature_k: None,
             });
             state.status_message = msg;
             return;
@@ -1134,10 +1157,12 @@ fn fit_roi(state: &mut AppState) {
         .map(|(s, d)| (s.clone(), *d))
         .collect();
 
+    let fitted_temp = result.temperature_k;
     state.last_fit_feedback = Some(crate::state::FitFeedback {
         success: result.converged,
         summary: summary.clone(),
         densities,
+        temperature_k: fitted_temp,
     });
     state.status_message = summary;
     state.pixel_fit_result = Some(result);

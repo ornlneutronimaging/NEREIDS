@@ -12,7 +12,9 @@ pub fn results_step(ui: &mut egui::Ui, state: &mut AppState) {
     // Ensure tile_display is populated
     match state.spatial_result {
         Some(ref r) => {
-            if state.tile_display.len() < r.density_maps.len() + 1 {
+            let has_temp = r.temperature_map.is_some();
+            let needed = r.density_maps.len() + 1 + has_temp as usize;
+            if state.tile_display.len() < needed {
                 let n = r.density_maps.len();
                 state.init_tile_display(n);
             }
@@ -119,7 +121,8 @@ fn density_map_grid(ui: &mut egui::Ui, state: &mut AppState) {
         .map(|e| e.symbol.clone())
         .collect();
     let n_density = n_density_maps.min(symbols.len());
-    let n_tiles = n_density + 1; // isotopes + convergence
+    let has_temp_map = result.temperature_map.is_some();
+    let n_tiles = n_density + has_temp_map as usize + 1; // isotopes + temperature + convergence
 
     // Overlay toggle (only when fitting_rois is non-empty)
     let has_rois = !state.fitting_rois.is_empty();
@@ -155,6 +158,9 @@ fn density_map_grid(ui: &mut egui::Ui, state: &mut AppState) {
                     if i >= n_tiles {
                         continue;
                     }
+
+                    let temp_tile_idx = if has_temp_map { Some(n_density) } else { None };
+                    let conv_tile_idx = n_density + has_temp_map as usize;
 
                     if i < n_density {
                         // Isotope density tile — render image in a short borrow scope,
@@ -229,19 +235,84 @@ fn density_map_grid(ui: &mut egui::Ui, state: &mut AppState) {
                             &mut state.tile_display,
                             &mut state.status_message,
                         );
-                    } else {
-                        // Convergence map tile
-                        let conv_idx = n_density;
+                    } else if temp_tile_idx == Some(i) {
+                        // Temperature map tile
+                        let t_idx = i;
+                        ui.label(egui::RichText::new("Temperature (K)").small());
 
+                        let colormap = state
+                            .tile_display
+                            .get(t_idx)
+                            .map_or(Colormap::Inferno, |t| t.colormap);
+                        let show_bar = state
+                            .tile_display
+                            .get(t_idx)
+                            .is_some_and(|t| t.show_colorbar);
+
+                        {
+                            let data = state
+                                .spatial_result
+                                .as_ref()
+                                .unwrap()
+                                .temperature_map
+                                .as_ref()
+                                .unwrap();
+                            if show_bar {
+                                ui.horizontal(|ui| {
+                                    if let Some(px) = show_colormapped_image_with_roi(
+                                        ui,
+                                        data,
+                                        "result_temp_map",
+                                        colormap,
+                                        &[],
+                                        state.selected_pixel,
+                                    )
+                                    .0
+                                    {
+                                        new_pixel = Some(px);
+                                    }
+                                    result_widgets::draw_colorbar(ui, data, colormap);
+                                });
+                            } else if let Some(px) = show_colormapped_image_with_roi(
+                                ui,
+                                data,
+                                "result_temp_map",
+                                colormap,
+                                &[],
+                                state.selected_pixel,
+                            )
+                            .0
+                            {
+                                new_pixel = Some(px);
+                            }
+                        }
+
+                        let data = state
+                            .spatial_result
+                            .as_ref()
+                            .unwrap()
+                            .temperature_map
+                            .as_ref()
+                            .unwrap();
+                        result_widgets::tile_toolbelt(
+                            ui,
+                            data,
+                            t_idx,
+                            "temperature",
+                            &mut state.tile_display,
+                            &mut state.status_message,
+                        );
+                    } else if i == conv_tile_idx {
+                        // Convergence map tile
                         ui.label(egui::RichText::new("Convergence").small());
 
                         let colormap = state
                             .tile_display
-                            .get(conv_idx)
+                            .get(conv_tile_idx)
                             .map_or(Colormap::Viridis, |t| t.colormap);
                         let show_bar = state
                             .tile_display
-                            .get(conv_idx)
+                            .get(conv_tile_idx)
                             .is_some_and(|t| t.show_colorbar);
 
                         if show_bar {
@@ -271,7 +342,7 @@ fn density_map_grid(ui: &mut egui::Ui, state: &mut AppState) {
                         result_widgets::tile_toolbelt(
                             ui,
                             &conv_f64,
-                            conv_idx,
+                            conv_tile_idx,
                             "convergence",
                             &mut state.tile_display,
                             &mut state.status_message,
