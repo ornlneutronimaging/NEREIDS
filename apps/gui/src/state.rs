@@ -674,6 +674,9 @@ pub struct AppState {
     pub studio_dock_tab: usize,
     pub studio_show_dock: bool,
     pub studio_analysis_isotope: usize,
+    /// Symbol of the last-displayed isotope in Studio Analysis tab.
+    /// Used to detect when the isotope list changes under the selected index.
+    pub studio_analysis_prev_symbol: Option<String>,
 
     // -- Progress --
     pub fitting_progress: Option<(usize, usize)>,
@@ -1238,6 +1241,7 @@ impl Default for AppState {
             studio_dock_tab: 0,
             studio_show_dock: true,
             studio_analysis_isotope: 0,
+            studio_analysis_prev_symbol: None,
             fitting_progress: None,
             fitting_progress_counter: None,
 

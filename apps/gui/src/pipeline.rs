@@ -43,15 +43,27 @@ pub fn run_pipeline(state: &mut AppState, from_step: GuidedStep) -> Result<(), S
         .filter(|&s| (s as u8) >= from_order)
         .collect();
 
-    for step in stages {
+    // Track whether Normalize was explicitly dispatched.
+    let mut normalized_ran = false;
+
+    for step in &stages {
         match step {
             GuidedStep::Rebin => {
                 run_rebin(state);
             }
             GuidedStep::Normalize => {
                 run_normalize(state)?;
+                normalized_ran = true;
             }
             GuidedStep::Analyze => {
+                // Transmission pipelines omit the Normalize step, but
+                // beamline edits still mark dirty from Normalize because
+                // the energy grid depends on flight_path / delay.  Ensure
+                // normalization + energy grid is fresh before Analyze.
+                if !normalized_ran && from_order <= (GuidedStep::Normalize as u8) {
+                    run_normalize(state)?;
+                }
+
                 // Analyze is async — launch and return.  The GUI polls the
                 // channel for completion.
                 crate::guided::analyze::run_spatial_map(state);
@@ -73,24 +85,31 @@ pub fn run_pipeline(state: &mut AppState, from_step: GuidedStep) -> Result<(), S
 /// Only applies if `rebin_factor > 1` and rebin hasn't already been applied.
 /// In a re-run scenario the data has already been loaded from disk, so we
 /// just need to apply the rebinning again.
-fn run_rebin(state: &mut AppState) {
-    if state.rebin_factor <= 1 || state.rebin_applied {
-        // Nothing to do: rebin either not requested or already applied.
-        // Re-running from Rebin would require reloading original data first,
-        // which is not yet implemented — tracked for a future iteration.
-    }
+fn run_rebin(_state: &mut AppState) {
+    // TODO(#235): Re-running rebin requires reloading original data first,
+    // then re-applying the factor.  Currently a no-op — the pipeline falls
+    // through to Normalize/Analyze which use whatever data is loaded.
 }
 
 /// Execute the normalize stage synchronously.
 ///
 /// Delegates to `prepare_transmission` for pre-normalized data or
 /// computes normalization for TiffPair.
+///
+/// Always clears cached normalization + energy grid first so that
+/// parameter changes (beamline, etc.) take effect.
 fn run_normalize(state: &mut AppState) -> Result<(), String> {
     use crate::state::InputMode;
 
+    // Force recomputation — the whole point of re-running is that upstream
+    // parameters changed.  Without this, the `is_none()` guards short-circuit
+    // and we silently keep stale data.
+    state.normalized = None;
+    state.energies = None;
+
     match state.input_mode {
         InputMode::TransmissionTiff | InputMode::Hdf5Histogram | InputMode::Hdf5Event => {
-            if state.normalized.is_none() && state.sample_data.is_some() {
+            if state.sample_data.is_some() {
                 crate::guided::normalize::prepare_transmission(state);
             }
             if state.normalized.is_none() {
@@ -98,12 +117,10 @@ fn run_normalize(state: &mut AppState) -> Result<(), String> {
             }
         }
         InputMode::TiffPair => {
-            if state.normalized.is_none() {
-                if state.sample_data.is_none() || state.open_beam_data.is_none() {
-                    return Err("Missing sample or open beam data for normalization".into());
-                }
-                crate::guided::normalize::normalize_data(state);
+            if state.sample_data.is_none() || state.open_beam_data.is_none() {
+                return Err("Missing sample or open beam data for normalization".into());
             }
+            crate::guided::normalize::normalize_data(state);
             if state.normalized.is_none() {
                 return Err("Normalization failed — check status message".into());
             }

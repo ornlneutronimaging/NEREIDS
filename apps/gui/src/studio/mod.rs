@@ -111,13 +111,22 @@ fn analysis_tab(ui: &mut egui::Ui, state: &mut AppState) {
         return;
     }
 
-    // Clamp isotope index (account for optional temperature map entry)
+    // Clamp isotope index (account for optional temperature map entry).
+    // Also reset to 0 when the selected index no longer maps to the same
+    // isotope (e.g. after enable/disable toggling in the isotopes card).
     let has_temp_map_early = state
         .spatial_result
         .as_ref()
         .is_some_and(|r| r.temperature_map.is_some());
     let n_options_early = n_density + has_temp_map_early as usize;
     if state.studio_analysis_isotope >= n_options_early {
+        state.studio_analysis_isotope = 0;
+    }
+    // If the symbol at the selected index doesn't match what the user last
+    // saw, reset to 0 to avoid silently showing a different isotope's data.
+    if let Some(prev_sym) = &state.studio_analysis_prev_symbol
+        && symbols.get(state.studio_analysis_isotope) != Some(prev_sym)
+    {
         state.studio_analysis_isotope = 0;
     }
 
@@ -195,6 +204,9 @@ fn analysis_map_column(
     if state.studio_analysis_isotope >= n_options {
         state.studio_analysis_isotope = 0;
     }
+
+    // Track which symbol is displayed so we detect isotope list mutations.
+    state.studio_analysis_prev_symbol = symbols.get(state.studio_analysis_isotope).cloned();
 
     let tile_idx = state.studio_analysis_isotope;
     let colormap = state
@@ -644,7 +656,8 @@ fn dock_provenance(ui: &mut egui::Ui, state: &AppState) {
     for event in state.provenance_log.iter().rev() {
         ui.horizontal(|ui| {
             let ts = event.formatted_timestamp();
-            ui.label(egui::RichText::new(&ts[11..19]).small().monospace());
+            let time_str = ts.get(11..19).unwrap_or("??:??:??");
+            ui.label(egui::RichText::new(time_str).small().monospace());
 
             let kind_color = match event.kind {
                 crate::state::ProvenanceEventKind::DataLoaded => crate::theme::semantic::YELLOW,
