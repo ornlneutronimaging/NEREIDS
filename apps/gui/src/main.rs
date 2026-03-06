@@ -5,6 +5,7 @@
 
 mod app;
 mod guided;
+mod pipeline;
 mod state;
 mod studio;
 mod theme;

@@ -699,6 +699,9 @@ fn mini_inspector(ctx: &egui::Context, state: &mut AppState) {
         )
         .show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
+                rerun_controls(ui, state);
+                ui.add_space(8.0);
+
                 beamline_summary(ui, state);
                 ui.add_space(8.0);
 
@@ -713,6 +716,37 @@ fn mini_inspector(ctx: &egui::Context, state: &mut AppState) {
                 }
             });
         });
+}
+
+/// Dirty state indicator and re-run button.
+///
+/// Shows the earliest dirty stage (if any) and a button to re-run the
+/// pipeline from that point.
+fn rerun_controls(ui: &mut egui::Ui, state: &mut AppState) {
+    if let Some(step) = state.dirty_from {
+        let colors = ThemeColors::from_ctx(ui.ctx());
+        design::card_with_header(ui, "Pipeline", None, |ui| {
+            ui.label(
+                egui::RichText::new(format!("Dirty from: {}", step.label()))
+                    .small()
+                    .color(colors.fg3),
+            );
+            let can_run = !state.is_fitting;
+            ui.add_enabled_ui(can_run, |ui| {
+                if ui
+                    .button(format!("\u{25b6} Re-run from {}", step.label()))
+                    .clicked()
+                {
+                    match crate::pipeline::run_from_dirty(state) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            state.status_message = e;
+                        }
+                    }
+                }
+            });
+        });
+    }
 }
 
 /// Compact beamline config summary (read-only).
@@ -738,8 +772,8 @@ fn beamline_summary(ui: &mut egui::Ui, state: &AppState) {
     });
 }
 
-/// Compact solver config summary (read-only).
-fn solver_summary(ui: &mut egui::Ui, state: &AppState) {
+/// Compact solver config summary with editable temperature.
+fn solver_summary(ui: &mut egui::Ui, state: &mut AppState) {
     let colors = ThemeColors::from_ctx(ui.ctx());
     let method = match state.solver_method {
         crate::state::SolverMethod::LevenbergMarquardt => "Levenberg-Marquardt",
@@ -752,11 +786,19 @@ fn solver_summary(ui: &mut egui::Ui, state: &AppState) {
                 .small()
                 .color(colors.fg2),
         );
-        ui.label(
-            egui::RichText::new(format!("Temp: {:.0} K", state.temperature_k))
-                .small()
-                .color(colors.fg2),
-        );
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Temp:").small().color(colors.fg2));
+            let prev = state.temperature_k;
+            ui.add(
+                egui::DragValue::new(&mut state.temperature_k)
+                    .speed(1.0)
+                    .range(1.0..=2000.0)
+                    .suffix(" K"),
+            );
+            if state.temperature_k != prev {
+                state.mark_dirty(crate::state::GuidedStep::Analyze);
+            }
+        });
     });
 }
 

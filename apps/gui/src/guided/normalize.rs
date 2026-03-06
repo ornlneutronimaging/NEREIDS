@@ -469,7 +469,10 @@ fn analysis_mode_card(ui: &mut egui::Ui, state: &mut AppState) {
 // ---- Normalization Logic (unchanged from Phase 2a) ----
 
 /// Standard normalization: sample + open beam → transmission.
-fn normalize_data(state: &mut AppState) {
+///
+/// Public within the crate so the pipeline executor can call it for TiffPair
+/// re-runs without going through the UI.
+pub(crate) fn normalize_data(state: &mut AppState) {
     state.cancel_pending_tasks();
     state.pixel_fit_result = None;
     state.spatial_result = None;

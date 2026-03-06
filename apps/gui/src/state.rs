@@ -664,6 +664,11 @@ pub struct AppState {
     // -- HDF5 tree browser --
     pub hdf5_tree: Option<Vec<Hdf5TreeEntry>>,
 
+    // -- Dirty tracking for Studio re-run --
+    /// When `Some`, indicates the earliest pipeline stage that needs re-running.
+    /// Set by parameter edits in Studio; cleared after a successful re-run.
+    pub dirty_from: Option<GuidedStep>,
+
     // -- Studio mode --
     pub studio_selected_tile: usize,
     pub studio_tool: StudioTool,
@@ -796,19 +801,31 @@ pub struct PipelineEntry {
 }
 
 /// Step within the Guided workflow.
+///
+/// The discriminant values define pipeline ordering for dirty tracking:
+/// earlier stages have lower values, so `min()` on the discriminant
+/// gives "earliest dirty stage" semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum GuidedStep {
-    Landing,
-    Wizard,
-    Configure,
-    Load,
-    Bin,
-    Rebin,
-    Normalize,
-    Analyze,
-    Results,
-    ForwardModel,
-    Detectability,
+    Landing = 0,
+    Wizard = 1,
+    Configure = 2,
+    Load = 3,
+    Bin = 4,
+    Rebin = 5,
+    Normalize = 6,
+    Analyze = 7,
+    Results = 8,
+    ForwardModel = 9,
+    Detectability = 10,
+}
+
+impl GuidedStep {
+    /// Numeric stage index for ordering comparisons.
+    fn stage_order(self) -> u8 {
+        self as u8
+    }
 }
 
 impl GuidedStep {
@@ -967,6 +984,7 @@ impl AppState {
         self.rebin_applied = false;
         self.rebin_factor = 1;
         self.analyze_tof_slice_index = 0;
+        self.dirty_from = None;
     }
 
     /// Compute the bounding box of all ROIs, or `None` if no ROIs exist.
@@ -990,6 +1008,23 @@ impl AppState {
             x_start,
             x_end,
         })
+    }
+
+    /// Mark the pipeline as dirty from the given step.
+    ///
+    /// Uses min-semantics: if already dirty from an earlier step, keeps the
+    /// earlier one. Called by Studio parameter edits to track what needs
+    /// re-running.
+    pub fn mark_dirty(&mut self, step: GuidedStep) {
+        self.dirty_from = Some(match self.dirty_from {
+            Some(existing) if existing.stage_order() <= step.stage_order() => existing,
+            _ => step,
+        });
+    }
+
+    /// Clear dirty state after a successful pipeline re-run.
+    pub fn clear_dirty(&mut self) {
+        self.dirty_from = None;
     }
 
     /// Append a provenance event to the session audit trail.
@@ -1199,6 +1234,7 @@ impl Default for AppState {
 
             hdf5_tree: None,
 
+            dirty_from: None,
             studio_selected_tile: 0,
             studio_tool: StudioTool::Select,
             studio_doc_tab: StudioDocTab::Analysis,
