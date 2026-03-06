@@ -11,6 +11,7 @@ use crate::widgets;
 /// NEREIDS desktop application.
 pub struct NereidsApp {
     pub state: AppState,
+    pub memory: crate::telemetry::MemoryTelemetry,
 }
 
 const SESSION_CACHE_KEY: &str = "nereids_session_cache";
@@ -44,7 +45,10 @@ impl NereidsApp {
             state.cached_session = Some(cache);
         }
 
-        Self { state }
+        Self {
+            state,
+            memory: crate::telemetry::MemoryTelemetry::new(),
+        }
     }
 }
 
@@ -69,6 +73,9 @@ impl eframe::App for NereidsApp {
         // Poll background tasks
         poll_pending_tasks(&mut self.state);
 
+        // Refresh memory telemetry (750ms interval)
+        self.memory.refresh(ctx.input(|i| i.time));
+
         // Keep repainting while background work is in progress
         if self.state.is_fitting
             || self.state.is_fetching_endf
@@ -82,7 +89,7 @@ impl eframe::App for NereidsApp {
         widgets::toolbar::toolbar(ctx, &mut self.state);
 
         // Bottom status bar
-        widgets::statusbar::status_bar(ctx, &self.state);
+        widgets::statusbar::status_bar(ctx, &self.state, self.memory.rss_bytes);
 
         // Main content area
         match self.state.ui_mode {
@@ -137,6 +144,8 @@ fn poll_pending_tasks(state: &mut AppState) {
                 state.fitting_progress_counter = None;
                 state.active_tab = Tab::Map;
                 state.pending_spatial = None;
+                // Pipeline re-run completed successfully — clear dirty state.
+                state.clear_dirty();
             }
             Ok(Err(err_msg)) => {
                 state.status_message = format!("Spatial map error: {err_msg}");

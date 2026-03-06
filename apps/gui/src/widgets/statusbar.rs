@@ -4,7 +4,7 @@ use crate::state::{AppState, UiMode};
 use crate::theme::{ThemeColors, semantic};
 
 /// Render the bottom status bar.
-pub fn status_bar(ctx: &egui::Context, state: &AppState) {
+pub fn status_bar(ctx: &egui::Context, state: &AppState, rss_bytes: u64) {
     let colors = ThemeColors::from_ctx(ctx);
     egui::TopBottomPanel::bottom("status_bar")
         .frame(
@@ -75,13 +75,60 @@ pub fn status_bar(ctx: &egui::Context, state: &AppState) {
                 };
                 ui.label(egui::RichText::new(fp_text).small().color(colors.fg2));
 
-                // Right-aligned version
+                // Right-aligned: RAM + version
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
                         egui::RichText::new(format!("NEREIDS v{}", env!("CARGO_PKG_VERSION")))
                             .small()
                             .color(colors.fg3),
                     );
+
+                    if rss_bytes > 0 {
+                        let ram_text =
+                            format!("RAM: {}", crate::telemetry::format_bytes(rss_bytes));
+                        let resp =
+                            ui.label(egui::RichText::new(&ram_text).small().color(colors.fg3));
+                        resp.on_hover_ui(|ui| {
+                            ui.label(egui::RichText::new("Process Memory").strong());
+                            ui.label(format!(
+                                "RSS: {}",
+                                crate::telemetry::format_bytes(rss_bytes)
+                            ));
+                            ui.separator();
+                            ui.label(egui::RichText::new("Estimated Buffers").strong());
+                            let breakdown = crate::telemetry::memory_breakdown(state);
+                            if breakdown.is_empty() {
+                                ui.label("(no data loaded)");
+                            } else {
+                                let total: u64 = breakdown.iter().map(|(_, b)| b).sum();
+                                egui::Grid::new("mem_breakdown").show(ui, |ui| {
+                                    for (name, bytes) in &breakdown {
+                                        ui.label(*name);
+                                        ui.label(crate::telemetry::format_bytes(*bytes));
+                                        ui.end_row();
+                                    }
+                                    ui.separator();
+                                    ui.separator();
+                                    ui.end_row();
+                                    ui.label(egui::RichText::new("Total estimated").strong());
+                                    ui.label(
+                                        egui::RichText::new(crate::telemetry::format_bytes(total))
+                                            .strong(),
+                                    );
+                                    ui.end_row();
+                                });
+                            }
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new(
+                                    "Excludes allocator overhead, textures, and OS caches",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                        });
+                        ui.separator();
+                    }
                 });
             });
         });

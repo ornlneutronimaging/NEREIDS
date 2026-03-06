@@ -5,8 +5,10 @@
 
 mod app;
 mod guided;
+mod pipeline;
 mod state;
 mod studio;
+mod telemetry;
 mod theme;
 mod widgets;
 

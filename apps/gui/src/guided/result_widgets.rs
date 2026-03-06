@@ -280,61 +280,8 @@ pub fn pixel_inspector(ui: &mut egui::Ui, state: &AppState) {
     );
 }
 
-/// Export panel: format selector, directory picker, export button.
-pub fn export_panel(ui: &mut egui::Ui, state: &mut AppState) {
-    design::card_with_header(ui, "Export Results", None, |ui| {
-        ui.horizontal(|ui| {
-            // Format selector
-            ui.label("Format:");
-            let current_label = state.export_format.label();
-            egui::ComboBox::from_id_salt("export_format")
-                .selected_text(current_label)
-                .show_ui(ui, |ui| {
-                    for fmt in ExportFormat::ALL {
-                        ui.selectable_value(&mut state.export_format, fmt, fmt.label());
-                    }
-                });
-        });
-
-        ui.horizontal(|ui| {
-            ui.label("Directory:");
-            let dir_label = state
-                .export_directory
-                .as_ref()
-                .map_or("(not set)".to_string(), |p| p.display().to_string());
-            ui.label(egui::RichText::new(dir_label).monospace());
-
-            if ui.button("Browse...").clicked()
-                && let Some(path) = rfd::FileDialog::new().pick_folder()
-            {
-                state.export_directory = Some(path);
-            }
-        });
-
-        ui.add_space(4.0);
-
-        let can_export = state.spatial_result.is_some() && state.export_directory.is_some();
-        if ui
-            .add_enabled(can_export, egui::Button::new("Export Results"))
-            .clicked()
-        {
-            run_export(state);
-        }
-
-        if let Some(ref status) = state.export_status {
-            ui.add_space(4.0);
-            let color = if status.starts_with("Error") {
-                crate::theme::semantic::RED
-            } else {
-                crate::theme::semantic::GREEN
-            };
-            ui.label(egui::RichText::new(status.as_str()).color(color));
-        }
-    });
-}
-
 /// Execute the export based on the selected format.
-fn run_export(state: &mut AppState) {
+pub fn run_export(state: &mut AppState) {
     let dir = match state.export_directory {
         Some(ref d) => d.clone(),
         None => return,
@@ -471,35 +418,4 @@ fn export_markdown(
     )
     .map_err(|e| e.to_string())?;
     Ok(format!("Exported report to {}", path.display()))
-}
-
-/// Provenance log section (collapsible).
-pub fn provenance_section(ui: &mut egui::Ui, state: &AppState) {
-    if state.provenance_log.is_empty() {
-        return;
-    }
-
-    egui::CollapsingHeader::new(egui::RichText::new("Provenance Log").strong())
-        .default_open(false)
-        .show(ui, |ui| {
-            for event in state.provenance_log.iter().rev() {
-                let ts = event.formatted_timestamp();
-
-                let (kind_label, kind_color) = match event.kind {
-                    ProvenanceEventKind::DataLoaded => ("LOAD", crate::theme::semantic::YELLOW),
-                    ProvenanceEventKind::ConfigChanged => {
-                        ("CONFIG", crate::theme::semantic::ORANGE)
-                    }
-                    ProvenanceEventKind::Normalized => ("NORM", crate::theme::semantic::GREEN),
-                    ProvenanceEventKind::AnalysisRun => ("ANALYZE", crate::theme::semantic::ORANGE),
-                    ProvenanceEventKind::Exported => ("EXPORT", crate::theme::semantic::GREEN),
-                };
-
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(&ts).monospace().small());
-                    ui.label(egui::RichText::new(kind_label).small().color(kind_color));
-                    ui.label(egui::RichText::new(&event.message).small());
-                });
-            }
-        });
 }

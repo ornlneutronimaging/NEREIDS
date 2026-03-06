@@ -2,7 +2,7 @@
 //!
 //! Prototype: `.top-toolbar { height: 48px; backdrop-filter: blur(20px); }`
 
-use crate::state::{AppState, GuidedStep, StudioTool, ThemePreference, UiMode};
+use crate::state::{AppState, GuidedStep, ThemePreference, UiMode};
 use crate::theme::ThemeColors;
 use crate::widgets::design;
 
@@ -36,21 +36,6 @@ pub fn toolbar(ctx: &egui::Context, state: &mut AppState) {
                 // Mode toggle
                 ui.selectable_value(&mut state.ui_mode, UiMode::Guided, "Guided");
                 ui.selectable_value(&mut state.ui_mode, UiMode::Studio, "Studio");
-
-                // Studio tool buttons — visible only in Studio mode
-                if state.ui_mode == UiMode::Studio {
-                    ui.add_space(8.0);
-                    for tool in [
-                        StudioTool::Select,
-                        StudioTool::Roi,
-                        StudioTool::Probe,
-                        StudioTool::Zoom,
-                    ] {
-                        if design::btn_icon(ui, tool.label(), state.studio_tool == tool).clicked() {
-                            state.studio_tool = tool;
-                        }
-                    }
-                }
 
                 // Trailing controls right-aligned
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

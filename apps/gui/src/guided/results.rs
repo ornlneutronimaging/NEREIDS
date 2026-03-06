@@ -1,15 +1,18 @@
-//! Step 5: Results — spatial map results display, pixel inspector, and export.
+//! Step 5: Results — compact summary + "Open in Studio" entry point.
+//!
+//! The Results step shows a quick-look summary (convergence stats, density
+//! table, thumbnail map).  Detailed analysis (pixel inspector, export,
+//! colormaps, per-tile toolbelt) lives exclusively in Studio mode.
 
 use super::result_widgets;
-use crate::state::{AppState, Colormap};
+use crate::state::{AppState, Colormap, StudioDocTab, UiMode};
 use crate::widgets::design;
-use crate::widgets::image_view::{show_colormapped_image_with_roi, show_density_overlay};
+use crate::widgets::image_view::show_colormapped_image;
 
 /// Draw the Results step content.
 pub fn results_step(ui: &mut egui::Ui, state: &mut AppState) {
-    design::content_header(ui, "Results", "Density maps and export");
+    design::content_header(ui, "Results", "Analysis summary");
 
-    // Ensure tile_display is populated
     match state.spatial_result {
         Some(ref r) => {
             let has_temp = r.temperature_map.is_some();
@@ -21,6 +24,16 @@ pub fn results_step(ui: &mut egui::Ui, state: &mut AppState) {
         }
         None => {
             ui.label("Run spatial mapping (Analyze step) to see results here.");
+            if design::nav_buttons(
+                ui,
+                Some("\u{2190} Back"),
+                "Open in Studio",
+                false,
+                "Run analysis first",
+            ) == design::NavAction::Back
+            {
+                state.nav_prev();
+            }
             return;
         }
     }
@@ -38,7 +51,6 @@ pub fn results_step(ui: &mut egui::Ui, state: &mut AppState) {
         } else {
             0.0
         };
-        // Single-pass fold: compute sum + count without allocating a Vec.
         let (chi2_sum, chi2_count) = result
             .chi_squared_map
             .iter()
@@ -65,300 +77,36 @@ pub fn results_step(ui: &mut egui::Ui, state: &mut AppState) {
     }
     ui.add_space(12.0);
 
-    // -- Density Map Grid --
-    density_map_grid(ui, state);
-    ui.add_space(12.0);
-
-    // -- Pixel Inspector --
-    result_widgets::pixel_inspector(ui, state);
-    ui.add_space(12.0);
-
-    // -- Export Panel --
-    result_widgets::export_panel(ui, state);
-    ui.add_space(12.0);
-
-    // -- Provenance Log --
-    result_widgets::provenance_section(ui, state);
-    ui.add_space(12.0);
-
-    // -- Navigation --
-    ui.add_space(8.0);
-    if ui.button("\u{2190} Back").clicked() {
-        state.nav_prev();
-    }
-}
-
-/// Grid of density map tiles (one per isotope + convergence map).
-fn density_map_grid(ui: &mut egui::Ui, state: &mut AppState) {
-    let result = match state.spatial_result {
-        Some(ref r) => r,
-        None => return,
-    };
-    let n_density_maps = result.density_maps.len();
-    let n_converged = result.n_converged;
-    let n_total = result.n_total;
-
-    // Cache converged_map → f64 conversion in egui temp data to avoid per-frame mapv.
-    let conv_cache_id = egui::Id::new("result_conv_f64_cache");
-    let conv_ptr = result.converged_map.as_ptr() as usize;
-    let conv_f64: ndarray::Array2<f64> = {
-        let cached: Option<(usize, ndarray::Array2<f64>)> = ui.data(|d| d.get_temp(conv_cache_id));
-        if let Some((ptr, arr)) = cached
-            && ptr == conv_ptr
-        {
-            arr
-        } else {
-            let arr = result.converged_map.mapv(|b| if b { 1.0 } else { 0.0 });
-            ui.data_mut(|d| d.insert_temp(conv_cache_id, (conv_ptr, arr.clone())));
-            arr
-        }
-    };
-
-    let symbols: Vec<String> = state
-        .isotope_entries
-        .iter()
-        .filter(|e| e.enabled && e.resonance_data.is_some())
-        .map(|e| e.symbol.clone())
-        .collect();
-    let n_density = n_density_maps.min(symbols.len());
-    let has_temp_map = result.temperature_map.is_some();
-    let n_tiles = n_density + has_temp_map as usize + 1; // isotopes + temperature + convergence
-
-    // Overlay toggle (only when fitting_rois is non-empty)
-    let has_rois = !state.fitting_rois.is_empty();
-    if has_rois {
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut state.show_density_overlay, "Overlay on preview");
-            if state.show_density_overlay {
-                ui.label(
-                    egui::RichText::new("Density shown only in fitted ROI regions")
-                        .size(11.0)
-                        .weak(),
-                );
+    // -- Thumbnail: first density map (compact, no toolbelt) --
+    if let Some(data) = result.density_maps.first() {
+        design::card_with_header(ui, "Density Map Preview", None, |ui| {
+            let symbols: Vec<String> = state
+                .isotope_entries
+                .iter()
+                .filter(|e| e.enabled && e.resonance_data.is_some())
+                .map(|e| e.symbol.clone())
+                .collect();
+            if let Some(sym) = symbols.first() {
+                ui.label(egui::RichText::new(sym).small());
             }
+            let _ = show_colormapped_image(ui, data, "results_thumb", Colormap::Viridis);
         });
-        ui.add_space(4.0);
     }
+    ui.add_space(12.0);
 
-    let use_overlay = has_rois && state.show_density_overlay && state.preview_image.is_some();
-
-    // Collect click events from tiles, apply to state after rendering.
-    let mut new_pixel: Option<(usize, usize)> = None;
-
-    design::card_with_header(ui, "Density Maps", None, |ui| {
-        let available_width = ui.available_width();
-        let tile_min = 180.0_f32;
-        let n_cols = ((available_width / tile_min) as usize).max(1).min(n_tiles);
-
-        let n_rows = n_tiles.div_ceil(n_cols);
-        for row in 0..n_rows {
-            ui.columns(n_cols, |columns| {
-                for (col, ui) in columns.iter_mut().enumerate().take(n_cols) {
-                    let i = row * n_cols + col;
-                    if i >= n_tiles {
-                        continue;
-                    }
-
-                    let temp_tile_idx = if has_temp_map { Some(n_density) } else { None };
-                    let conv_tile_idx = n_density + has_temp_map as usize;
-
-                    if i < n_density {
-                        // Isotope density tile — render image in a short borrow scope,
-                        // then call tile_toolbelt with a fresh borrow.
-                        let label = &symbols[i];
-                        let tex_id = format!("result_density_{i}");
-
-                        ui.label(egui::RichText::new(format!("{label} density")).small());
-
-                        let colormap = state
-                            .tile_display
-                            .get(i)
-                            .map_or(Colormap::Viridis, |t| t.colormap);
-                        let show_bar = state.tile_display.get(i).is_some_and(|t| t.show_colorbar);
-                        let selected = state.selected_pixel;
-
-                        // Render image (borrows state.spatial_result immutably).
-                        {
-                            let data = &state.spatial_result.as_ref().unwrap().density_maps[i];
-                            if use_overlay {
-                                let preview = state.preview_image.as_ref().unwrap();
-                                let (clicked, _rect) = show_density_overlay(
-                                    ui,
-                                    preview,
-                                    data,
-                                    &state.fitting_rois,
-                                    &tex_id,
-                                    colormap,
-                                    selected,
-                                );
-                                if clicked.is_some() {
-                                    new_pixel = clicked;
-                                }
-                            } else if show_bar {
-                                ui.horizontal(|ui| {
-                                    if let Some(px) = show_colormapped_image_with_roi(
-                                        ui,
-                                        data,
-                                        &tex_id,
-                                        colormap,
-                                        &[],
-                                        selected,
-                                    )
-                                    .0
-                                    {
-                                        new_pixel = Some(px);
-                                    }
-                                    result_widgets::draw_colorbar(ui, data, colormap);
-                                });
-                            } else if let Some(px) = show_colormapped_image_with_roi(
-                                ui,
-                                data,
-                                &tex_id,
-                                colormap,
-                                &[],
-                                selected,
-                            )
-                            .0
-                            {
-                                new_pixel = Some(px);
-                            }
-                        }
-
-                        // Toolbelt — uses split borrows to avoid conflicting with
-                        // the spatial_result reference used for image rendering.
-                        let data = &state.spatial_result.as_ref().unwrap().density_maps[i];
-                        result_widgets::tile_toolbelt(
-                            ui,
-                            data,
-                            i,
-                            label,
-                            &mut state.tile_display,
-                            &mut state.status_message,
-                        );
-                    } else if temp_tile_idx == Some(i) {
-                        // Temperature map tile
-                        let t_idx = i;
-                        ui.label(egui::RichText::new("Temperature (K)").small());
-
-                        let colormap = state
-                            .tile_display
-                            .get(t_idx)
-                            .map_or(Colormap::Inferno, |t| t.colormap);
-                        let show_bar = state
-                            .tile_display
-                            .get(t_idx)
-                            .is_some_and(|t| t.show_colorbar);
-
-                        {
-                            let data = state
-                                .spatial_result
-                                .as_ref()
-                                .unwrap()
-                                .temperature_map
-                                .as_ref()
-                                .unwrap();
-                            if show_bar {
-                                ui.horizontal(|ui| {
-                                    if let Some(px) = show_colormapped_image_with_roi(
-                                        ui,
-                                        data,
-                                        "result_temp_map",
-                                        colormap,
-                                        &[],
-                                        state.selected_pixel,
-                                    )
-                                    .0
-                                    {
-                                        new_pixel = Some(px);
-                                    }
-                                    result_widgets::draw_colorbar(ui, data, colormap);
-                                });
-                            } else if let Some(px) = show_colormapped_image_with_roi(
-                                ui,
-                                data,
-                                "result_temp_map",
-                                colormap,
-                                &[],
-                                state.selected_pixel,
-                            )
-                            .0
-                            {
-                                new_pixel = Some(px);
-                            }
-                        }
-
-                        let data = state
-                            .spatial_result
-                            .as_ref()
-                            .unwrap()
-                            .temperature_map
-                            .as_ref()
-                            .unwrap();
-                        result_widgets::tile_toolbelt(
-                            ui,
-                            data,
-                            t_idx,
-                            "temperature",
-                            &mut state.tile_display,
-                            &mut state.status_message,
-                        );
-                    } else if i == conv_tile_idx {
-                        // Convergence map tile
-                        ui.label(egui::RichText::new("Convergence").small());
-
-                        let colormap = state
-                            .tile_display
-                            .get(conv_tile_idx)
-                            .map_or(Colormap::Viridis, |t| t.colormap);
-                        let show_bar = state
-                            .tile_display
-                            .get(conv_tile_idx)
-                            .is_some_and(|t| t.show_colorbar);
-
-                        if show_bar {
-                            ui.horizontal(|ui| {
-                                let _ = show_colormapped_image_with_roi(
-                                    ui,
-                                    &conv_f64,
-                                    "result_conv_map",
-                                    colormap,
-                                    &[],
-                                    None,
-                                );
-                                result_widgets::draw_colorbar(ui, &conv_f64, colormap);
-                            });
-                        } else {
-                            let _ = show_colormapped_image_with_roi(
-                                ui,
-                                &conv_f64,
-                                "result_conv_map",
-                                colormap,
-                                &[],
-                                None,
-                            );
-                        }
-
-                        ui.label(egui::RichText::new(format!("{n_converged}/{n_total}")).small());
-                        result_widgets::tile_toolbelt(
-                            ui,
-                            &conv_f64,
-                            conv_tile_idx,
-                            "convergence",
-                            &mut state.tile_display,
-                            &mut state.status_message,
-                        );
-                    }
-                }
-            });
-            if row + 1 < n_rows {
-                ui.add_space(8.0);
-            }
+    // -- Navigation: Back + Open in Studio --
+    match design::nav_buttons(
+        ui,
+        Some("\u{2190} Back"),
+        "Open in Studio \u{2192}",
+        true,
+        "",
+    ) {
+        design::NavAction::Back => state.nav_prev(),
+        design::NavAction::Continue => {
+            state.studio_doc_tab = StudioDocTab::Analysis;
+            state.ui_mode = UiMode::Studio;
         }
-    });
-
-    // Apply deferred click outside the rendering loop.
-    if let Some((y, x)) = new_pixel {
-        state.selected_pixel = Some((y, x));
-        state.pixel_fit_result = None;
+        design::NavAction::None => {}
     }
 }

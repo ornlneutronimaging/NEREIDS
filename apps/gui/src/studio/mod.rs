@@ -13,18 +13,6 @@ use crate::widgets::design;
 use crate::widgets::image_view::show_colormapped_image;
 use egui_plot::{Line, Plot, PlotPoints};
 
-/// Format a float without unnecessary trailing zeros; non-finite → "—".
-fn format_compact_f64(value: f64) -> String {
-    if !value.is_finite() {
-        return "\u{2014}".to_owned();
-    }
-    if value.fract().abs() < 1e-9 {
-        return format!("{:.0}", value);
-    }
-    let s = format!("{:.3}", value);
-    s.trim_end_matches('0').trim_end_matches('.').to_owned()
-}
-
 /// Render the Studio mode content.
 pub fn studio_content(ctx: &egui::Context, state: &mut AppState) {
     let has_results = state.spatial_result.is_some();
@@ -43,9 +31,9 @@ pub fn studio_content(ctx: &egui::Context, state: &mut AppState) {
         bottom_dock(ctx, state);
     }
 
-    // 2. Mini-inspector sidebar (right, only for Analysis tab with results)
-    if state.studio_doc_tab == StudioDocTab::Analysis && has_results {
-        mini_inspector(ctx, state);
+    // 2. Parameter sidebar (left, Analysis tab only)
+    if state.studio_doc_tab == StudioDocTab::Analysis {
+        parameter_sidebar(ctx, state);
     }
 
     // 3. Central panel: doc tab bar + routed content
@@ -123,13 +111,22 @@ fn analysis_tab(ui: &mut egui::Ui, state: &mut AppState) {
         return;
     }
 
-    // Clamp isotope index (account for optional temperature map entry)
+    // Clamp isotope index (account for optional temperature map entry).
+    // Also reset to 0 when the selected index no longer maps to the same
+    // isotope (e.g. after enable/disable toggling in the isotopes card).
     let has_temp_map_early = state
         .spatial_result
         .as_ref()
         .is_some_and(|r| r.temperature_map.is_some());
     let n_options_early = n_density + has_temp_map_early as usize;
     if state.studio_analysis_isotope >= n_options_early {
+        state.studio_analysis_isotope = 0;
+    }
+    // If the symbol at the selected index doesn't match what the user last
+    // saw, reset to 0 to avoid silently showing a different isotope's data.
+    if let Some(prev_sym) = &state.studio_analysis_prev_symbol
+        && symbols.get(state.studio_analysis_isotope) != Some(prev_sym)
+    {
         state.studio_analysis_isotope = 0;
     }
 
@@ -208,6 +205,9 @@ fn analysis_map_column(
         state.studio_analysis_isotope = 0;
     }
 
+    // Track which symbol is displayed so we detect isotope list mutations.
+    state.studio_analysis_prev_symbol = symbols.get(state.studio_analysis_isotope).cloned();
+
     let tile_idx = state.studio_analysis_isotope;
     let colormap = state
         .tile_display
@@ -231,22 +231,42 @@ fn analysis_map_column(
     };
 
     if let Some(data) = map_data {
-        if show_bar {
-            ui.horizontal(|ui| {
+        // Colorbar width: 16px bar + 50px labels = 66px + 4px spacing.
+        let colorbar_reserved = if show_bar { 70.0 } else { 0.0 };
+
+        // Compute image display size using the parent's available dimensions
+        // (BEFORE entering a horizontal, where available_height collapses to
+        // one line height and produces a tiny image).
+        let (dh, dw) = (data.shape()[0], data.shape()[1]);
+        let img_avail_w = (ui.available_width() - colorbar_reserved).max(32.0);
+        let img_avail_h = ui.available_height();
+        let scale_w = img_avail_w / dw.max(1) as f32;
+        let scale = if img_avail_h > 2000.0 {
+            scale_w
+        } else {
+            let scale_h = img_avail_h / dh.max(1) as f32;
+            scale_w.min(scale_h)
+        };
+        let img_height = dh as f32 * scale;
+
+        // Use allocate_ui_with_layout with the pre-computed height so the
+        // horizontal strip has enough room for the image.
+        let strip_height = img_height.max(128.0); // at least colorbar height
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), strip_height),
+            egui::Layout::left_to_right(egui::Align::TOP),
+            |ui| {
                 if let Some((y, x)) =
                     show_colormapped_image(ui, data, "studio_analysis_map", colormap)
                 {
                     state.selected_pixel = Some((y, x));
                     state.pixel_fit_result = None;
                 }
-                result_widgets::draw_colorbar(ui, data, colormap);
-            });
-        } else if let Some((y, x)) =
-            show_colormapped_image(ui, data, "studio_analysis_map", colormap)
-        {
-            state.selected_pixel = Some((y, x));
-            state.pixel_fit_result = None;
-        }
+                if show_bar {
+                    result_widgets::draw_colorbar(ui, data, colormap);
+                }
+            },
+        );
 
         // Toolbelt
         let label = if tile_idx < n_density {
@@ -548,8 +568,8 @@ fn bottom_dock(ctx: &egui::Context, state: &mut AppState) {
     let colors = ThemeColors::from_ctx(ctx);
     egui::TopBottomPanel::bottom("studio_dock")
         .resizable(true)
-        .default_height(170.0)
-        .min_height(80.0)
+        .default_height(200.0)
+        .min_height(140.0)
         .max_height(400.0)
         .frame(
             egui::Frame::NONE
@@ -656,7 +676,8 @@ fn dock_provenance(ui: &mut egui::Ui, state: &AppState) {
     for event in state.provenance_log.iter().rev() {
         ui.horizontal(|ui| {
             let ts = event.formatted_timestamp();
-            ui.label(egui::RichText::new(&ts[11..19]).small().monospace());
+            let time_str = ts.get(11..19).unwrap_or("??:??:??");
+            ui.label(egui::RichText::new(time_str).small().monospace());
 
             let kind_color = match event.kind {
                 crate::state::ProvenanceEventKind::DataLoaded => crate::theme::semantic::YELLOW,
@@ -675,22 +696,70 @@ fn dock_provenance(ui: &mut egui::Ui, state: &AppState) {
     }
 }
 
-/// Export panel (reuse result_widgets).
+/// Export panel — flat layout without card wrapper to fit in the dock.
 fn dock_export(ui: &mut egui::Ui, state: &mut AppState) {
-    result_widgets::export_panel(ui, state);
+    use crate::state::ExportFormat;
+
+    ui.horizontal(|ui| {
+        ui.label("Format:");
+        let current_label = state.export_format.label();
+        egui::ComboBox::from_id_salt("dock_export_format")
+            .selected_text(current_label)
+            .show_ui(ui, |ui| {
+                for fmt in ExportFormat::ALL {
+                    ui.selectable_value(&mut state.export_format, fmt, fmt.label());
+                }
+            });
+    });
+
+    ui.horizontal(|ui| {
+        ui.label("Directory:");
+        let dir_label = state
+            .export_directory
+            .as_ref()
+            .map_or("(not set)".to_string(), |p| p.display().to_string());
+        ui.label(egui::RichText::new(dir_label).monospace().small());
+
+        if ui.button("Browse\u{2026}").clicked()
+            && let Some(path) = rfd::FileDialog::new().pick_folder()
+        {
+            state.export_directory = Some(path);
+        }
+    });
+
+    ui.add_space(4.0);
+
+    let can_export = state.spatial_result.is_some() && state.export_directory.is_some();
+    if ui
+        .add_enabled(can_export, egui::Button::new("Export Results"))
+        .clicked()
+    {
+        result_widgets::run_export(state);
+    }
+
+    if let Some(ref status) = state.export_status {
+        let color = if status.starts_with("Error") {
+            crate::theme::semantic::RED
+        } else {
+            crate::theme::semantic::GREEN
+        };
+        ui.label(egui::RichText::new(status.as_str()).small().color(color));
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Mini-inspector sidebar (right, Analysis tab only)
 // ---------------------------------------------------------------------------
 
-fn mini_inspector(ctx: &egui::Context, state: &mut AppState) {
+/// Left parameter sidebar — editable beamline, solver, isotope, and ROI
+/// controls with dirty tracking + re-run button.
+fn parameter_sidebar(ctx: &egui::Context, state: &mut AppState) {
     let colors = ThemeColors::from_ctx(ctx);
-    egui::SidePanel::right("studio_mini_inspector")
+    egui::SidePanel::left("studio_params")
         .resizable(true)
-        .default_width(220.0)
-        .min_width(180.0)
-        .max_width(320.0)
+        .default_width(240.0)
+        .min_width(200.0)
+        .max_width(360.0)
         .frame(
             egui::Frame::NONE
                 .fill(colors.bg)
@@ -699,14 +768,20 @@ fn mini_inspector(ctx: &egui::Context, state: &mut AppState) {
         )
         .show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
-                beamline_summary(ui, state);
-                ui.add_space(8.0);
+                rerun_card(ui, state);
+                ui.add_space(6.0);
 
-                solver_summary(ui, state);
-                ui.add_space(8.0);
+                beamline_card(ui, state);
+                ui.add_space(6.0);
+
+                solver_card(ui, state);
+                ui.add_space(6.0);
+
+                isotopes_card(ui, state);
+                ui.add_space(6.0);
 
                 result_widgets::pixel_inspector(ui, state);
-                ui.add_space(8.0);
+                ui.add_space(6.0);
 
                 if let Some(ref result) = state.spatial_result {
                     result_widgets::summary_card(ui, result, &state.isotope_entries);
@@ -715,48 +790,220 @@ fn mini_inspector(ctx: &egui::Context, state: &mut AppState) {
         });
 }
 
-/// Compact beamline config summary (read-only).
-fn beamline_summary(ui: &mut egui::Ui, state: &AppState) {
-    let colors = ThemeColors::from_ctx(ui.ctx());
+/// Re-run pipeline card with dirty indicator.
+fn rerun_card(ui: &mut egui::Ui, state: &mut AppState) {
+    use crate::state::GuidedStep;
+
+    design::card_with_header(ui, "Pipeline", None, |ui| {
+        if state.is_fitting {
+            if let Some((done, total)) = state.fitting_progress {
+                let frac = done as f32 / total.max(1) as f32;
+                design::progress_mini(ui, frac, &format!("{done}/{total} px"));
+            } else {
+                ui.spinner();
+                ui.label("Running...");
+            }
+        } else if let Some(step) = state.dirty_from {
+            ui.horizontal(|ui| {
+                design::badge(
+                    ui,
+                    &format!("Dirty: {}", step.label()),
+                    design::BadgeVariant::Orange,
+                );
+            });
+            if ui
+                .button(format!("\u{25b6} Re-run from {}", step.label()))
+                .clicked()
+            {
+                match crate::pipeline::run_from_dirty(state) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        state.status_message = e;
+                    }
+                }
+            }
+        } else {
+            ui.label(
+                egui::RichText::new("Up to date")
+                    .small()
+                    .color(ThemeColors::from_ctx(ui.ctx()).fg3),
+            );
+        }
+    });
+
+    // Quick-access: re-run from Analyze (always available when not fitting)
+    if !state.is_fitting
+        && state.spatial_result.is_some()
+        && ui
+            .add_enabled(
+                state.dirty_from.is_none(),
+                egui::Button::new("\u{1f504} Re-run Spatial Map"),
+            )
+            .on_hover_text("Force re-run the spatial map with current parameters")
+            .clicked()
+    {
+        state.mark_dirty(GuidedStep::Analyze);
+        match crate::pipeline::run_from_dirty(state) {
+            Ok(_) => {}
+            Err(e) => {
+                state.status_message = e;
+            }
+        }
+    }
+}
+
+/// Editable beamline parameters card.
+fn beamline_card(ui: &mut egui::Ui, state: &mut AppState) {
+    use crate::state::GuidedStep;
+
     design::card_with_header(ui, "Beamline", None, |ui| {
-        ui.label(
-            egui::RichText::new(format!(
-                "Flight path: {} m",
-                format_compact_f64(state.beamline.flight_path_m)
-            ))
-            .small()
-            .color(colors.fg2),
-        );
-        ui.label(
-            egui::RichText::new(format!(
-                "Delay: {} \u{03bc}s",
-                format_compact_f64(state.beamline.delay_us)
-            ))
-            .small()
-            .color(colors.fg2),
-        );
+        ui.horizontal(|ui| {
+            ui.label("Flight path:");
+            let prev = state.beamline.flight_path_m;
+            ui.add(
+                egui::DragValue::new(&mut state.beamline.flight_path_m)
+                    .speed(0.01)
+                    .range(0.1..=100.0)
+                    .suffix(" m"),
+            );
+            if state.beamline.flight_path_m != prev {
+                state.mark_dirty(GuidedStep::Normalize);
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Delay:");
+            let prev = state.beamline.delay_us;
+            ui.add(
+                egui::DragValue::new(&mut state.beamline.delay_us)
+                    .speed(0.1)
+                    .range(-1000.0..=1000.0)
+                    .suffix(" \u{03bc}s"),
+            );
+            if state.beamline.delay_us != prev {
+                state.mark_dirty(GuidedStep::Normalize);
+            }
+        });
     });
 }
 
-/// Compact solver config summary (read-only).
-fn solver_summary(ui: &mut egui::Ui, state: &AppState) {
-    let colors = ThemeColors::from_ctx(ui.ctx());
-    let method = match state.solver_method {
-        crate::state::SolverMethod::LevenbergMarquardt => "Levenberg-Marquardt",
-        crate::state::SolverMethod::PoissonKL => "Poisson KL",
-    };
+/// Editable solver parameters card.
+fn solver_card(ui: &mut egui::Ui, state: &mut AppState) {
+    use crate::state::{GuidedStep, SolverMethod};
+
     design::card_with_header(ui, "Solver", None, |ui| {
-        ui.label(egui::RichText::new(method).small().color(colors.fg2));
-        ui.label(
-            egui::RichText::new(format!("Max iter: {}", state.lm_config.max_iter))
-                .small()
-                .color(colors.fg2),
-        );
-        ui.label(
-            egui::RichText::new(format!("Temp: {:.0} K", state.temperature_k))
-                .small()
-                .color(colors.fg2),
-        );
+        ui.horizontal(|ui| {
+            ui.label("Method:");
+            let prev = state.solver_method;
+            egui::ComboBox::from_id_salt("studio_solver_method")
+                .selected_text(match state.solver_method {
+                    SolverMethod::LevenbergMarquardt => "LM",
+                    SolverMethod::PoissonKL => "Poisson KL",
+                })
+                .width(90.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut state.solver_method,
+                        SolverMethod::LevenbergMarquardt,
+                        "Levenberg-Marquardt",
+                    );
+                    ui.selectable_value(
+                        &mut state.solver_method,
+                        SolverMethod::PoissonKL,
+                        "Poisson KL",
+                    );
+                });
+            if state.solver_method != prev {
+                state.mark_dirty(GuidedStep::Analyze);
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Max iter:");
+            let prev = state.lm_config.max_iter;
+            ui.add(egui::DragValue::new(&mut state.lm_config.max_iter).range(1..=10000));
+            if state.lm_config.max_iter != prev {
+                state.mark_dirty(GuidedStep::Analyze);
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Temp:");
+            let prev = state.temperature_k;
+            ui.add(
+                egui::DragValue::new(&mut state.temperature_k)
+                    .speed(1.0)
+                    .range(1.0..=2000.0)
+                    .suffix(" K"),
+            );
+            if state.temperature_k != prev {
+                state.mark_dirty(GuidedStep::Analyze);
+            }
+        });
+
+        let prev_fit_temp = state.fit_temperature;
+        ui.checkbox(&mut state.fit_temperature, "Fit temperature");
+        if state.fit_temperature != prev_fit_temp {
+            state.mark_dirty(GuidedStep::Analyze);
+        }
+    });
+}
+
+/// Isotope list card (enable/disable + densities).
+fn isotopes_card(ui: &mut egui::Ui, state: &mut AppState) {
+    use crate::state::GuidedStep;
+
+    design::card_with_header(ui, "Isotopes", None, |ui| {
+        if state.isotope_entries.is_empty() {
+            ui.label(
+                egui::RichText::new("No isotopes — configure in Guided mode.")
+                    .small()
+                    .color(ThemeColors::from_ctx(ui.ctx()).fg3),
+            );
+            return;
+        }
+
+        let locked = state.is_fetching_endf || state.is_fitting;
+
+        for i in 0..state.isotope_entries.len() {
+            ui.horizontal(|ui| {
+                // Enable checkbox
+                let prev_enabled = state.isotope_entries[i].enabled;
+                ui.add_enabled(
+                    !locked,
+                    egui::Checkbox::without_text(&mut state.isotope_entries[i].enabled),
+                );
+                if state.isotope_entries[i].enabled != prev_enabled {
+                    state.mark_dirty(GuidedStep::Analyze);
+                }
+
+                // Colored dot + symbol
+                let dot_color = design::isotope_dot_color(&state.isotope_entries[i].symbol);
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                ui.painter().circle_filled(rect.center(), 3.0, dot_color);
+                ui.label(egui::RichText::new(&state.isotope_entries[i].symbol).small());
+
+                // Editable density
+                let prev_density = state.isotope_entries[i].initial_density;
+                ui.add_enabled(
+                    !locked,
+                    egui::DragValue::new(&mut state.isotope_entries[i].initial_density)
+                        .speed(1e-5)
+                        .range(0.0..=1.0),
+                );
+                if state.isotope_entries[i].initial_density != prev_density {
+                    state.mark_dirty(GuidedStep::Analyze);
+                }
+
+                // ENDF status
+                let (badge_text, badge_variant) = match state.isotope_entries[i].endf_status {
+                    crate::state::EndfStatus::Pending => ("?", design::BadgeVariant::Orange),
+                    crate::state::EndfStatus::Fetching => ("..", design::BadgeVariant::Orange),
+                    crate::state::EndfStatus::Loaded => ("\u{2713}", design::BadgeVariant::Green),
+                    crate::state::EndfStatus::Failed => ("!", design::BadgeVariant::Red),
+                };
+                design::badge(ui, badge_text, badge_variant);
+            });
+        }
     });
 }
 
