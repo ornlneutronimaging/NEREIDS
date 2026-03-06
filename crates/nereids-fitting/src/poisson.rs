@@ -829,7 +829,7 @@ pub fn poisson_fit_analytic(
                     ctx.instrument.as_ref(),
                 )
             }
-            .expect("poisson_fit_analytic: broadening failed");
+            .unwrap_or_else(|e| panic!("poisson_fit_analytic: broadening failed: {e}"));
             xs_owned = xs_new;
             dxs_dt = dxs_new;
         }
@@ -1319,7 +1319,7 @@ pub fn poisson_fit_lbfgsb(
                     ctx.instrument.as_ref(),
                 )
             }
-            .expect("poisson_fit_lbfgsb: broadening failed");
+            .unwrap_or_else(|e| panic!("poisson_fit_lbfgsb: broadening failed: {e}"));
             xs_owned = xs_new;
             dxs_dt = dxs_new;
         }

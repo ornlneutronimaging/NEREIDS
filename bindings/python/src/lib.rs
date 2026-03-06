@@ -776,15 +776,38 @@ fn fit_spectrum(
             // Release the GIL for the heavy computation.
             // The closure uses only Rust types; PyErr conversion happens outside.
             let result: Result<PyFitResult, String> = py.detach(move || {
+                // When fitting temperature, compute unbroadened XS first (Reich-Moore,
+                // temperature-independent), then derive broadened XS from them.
+                // This avoids computing Reich-Moore twice.
+                let base_xs_arc = if fit_temperature {
+                    Some(Arc::new(
+                        transmission::unbroadened_cross_sections(&e_owned, &res_data, None)
+                            .map_err(|e| format!("unbroadened_cross_sections failed: {e}"))?,
+                    ))
+                } else {
+                    None
+                };
+
                 // Precompute broadened cross-sections at the initial temperature.
-                let xs = transmission::broadened_cross_sections(
-                    &e_owned,
-                    &res_data,
-                    temperature_k,
-                    instrument.as_ref(),
-                    None,
-                )
-                .map_err(|e| format!("broadened_cross_sections failed: {}", e))?;
+                let xs = if let Some(ref base) = base_xs_arc {
+                    transmission::broadened_cross_sections_from_base(
+                        &e_owned,
+                        base,
+                        &res_data,
+                        temperature_k,
+                        instrument.as_ref(),
+                    )
+                    .map_err(|e| format!("broadened_cross_sections_from_base failed: {e}"))?
+                } else {
+                    transmission::broadened_cross_sections(
+                        &e_owned,
+                        &res_data,
+                        temperature_k,
+                        instrument.as_ref(),
+                        None,
+                    )
+                    .map_err(|e| format!("broadened_cross_sections failed: {e}"))?
+                };
 
                 // Build density parameters.
                 let mut param_vec: Vec<FitParameter> = init
@@ -815,18 +838,8 @@ fn fit_spectrum(
                     density_indices: Arc::clone(&density_indices),
                 };
 
-                // When fitting temperature, build a TemperatureContext with cached
-                // base XS so the Poisson optimizer can update T each iteration.
-                // Share the same Arc between TemperatureContext and TransmissionFitModel
-                // to avoid computing unbroadened XS twice.
-                let base_xs_arc = if fit_temperature {
-                    Some(Arc::new(
-                        transmission::unbroadened_cross_sections(&e_owned, &res_data, None)
-                            .map_err(|e| format!("unbroadened_cross_sections failed: {e}"))?,
-                    ))
-                } else {
-                    None
-                };
+                // When fitting temperature, share base_xs between
+                // TemperatureContext and TransmissionFitModel.
                 let temp_ctx = if fit_temperature {
                     Some(TemperatureContext {
                         temperature_index: n_isotopes,
