@@ -177,7 +177,7 @@ pub struct EmbeddedData<'a> {
 }
 
 /// Estimated compression ratio for gzip-4 on float64 neutron data.
-const EMBED_COMPRESSION_RATIO: f64 = 3.0;
+pub const EMBED_COMPRESSION_RATIO: f64 = 3.0;
 
 /// Estimate (uncompressed, compressed) byte sizes for embedding raw data.
 pub fn estimate_embedded_size(

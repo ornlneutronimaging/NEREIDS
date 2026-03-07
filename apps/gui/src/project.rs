@@ -318,6 +318,7 @@ pub fn save_modal(ctx: &egui::Context, state: &mut AppState) {
             }
 
             if state.save_data_mode == SaveDataMode::Embedded && can_embed {
+                let ratio = nereids_io::project::EMBED_COMPRESSION_RATIO;
                 ui.add_space(8.0);
                 crate::widgets::design::card(ui, |ui| {
                     if let Some(ref sample) = state.sample_data {
@@ -325,7 +326,7 @@ pub fn save_modal(ctx: &egui::Context, state: &mut AppState) {
                         ui.label(format!(
                             "Sample: {} \u{2192} ~{}",
                             crate::telemetry::format_bytes(s),
-                            crate::telemetry::format_bytes((s as f64 / 3.0) as u64),
+                            crate::telemetry::format_bytes((s as f64 / ratio) as u64),
                         ));
                     }
                     if let Some(ref ob) = state.open_beam_data {
@@ -333,7 +334,15 @@ pub fn save_modal(ctx: &egui::Context, state: &mut AppState) {
                         ui.label(format!(
                             "Open beam: {} \u{2192} ~{}",
                             crate::telemetry::format_bytes(s),
-                            crate::telemetry::format_bytes((s as f64 / 3.0) as u64),
+                            crate::telemetry::format_bytes((s as f64 / ratio) as u64),
+                        ));
+                    }
+                    if let Some(ref sp) = state.spectrum_values {
+                        let s = (sp.len() as u64) * 8;
+                        ui.label(format!(
+                            "Spectrum: {} \u{2192} ~{}",
+                            crate::telemetry::format_bytes(s),
+                            crate::telemetry::format_bytes((s as f64 / ratio) as u64),
                         ));
                     }
                     ui.separator();
@@ -408,13 +417,9 @@ fn execute_save_with_dialog(state: &mut AppState) {
 
 /// Execute the actual save to `path` with the given mode.
 fn execute_save(state: &mut AppState, path: &Path, mode: SaveDataMode) {
-    // Fall back to linked if embedded requested but no data available
-    let mode = if mode == SaveDataMode::Embedded
-        && state.sample_data.is_none()
-        && state.open_beam_data.is_none()
-        && state.spectrum_values.is_none()
-    {
-        state.status_message = "No raw data to embed — saving in linked mode.".into();
+    // Fall back to linked if embedded requested but sample data not available
+    let mode = if mode == SaveDataMode::Embedded && state.sample_data.is_none() {
+        state.status_message = "Sample data required for embed — saving in linked mode.".into();
         SaveDataMode::Linked
     } else {
         mode
