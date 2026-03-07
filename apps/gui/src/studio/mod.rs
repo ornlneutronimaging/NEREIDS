@@ -700,7 +700,7 @@ fn dock_isotopes(ui: &mut egui::Ui, state: &AppState) {
 ///
 /// Uses `state.residuals_cache` to avoid rebuilding the `TransmissionFitModel`
 /// and recomputing the forward model on every frame. The cache is keyed by
-/// `(fit_result_gen, resolution_enabled, resolution_mode, flight_path_m)`.
+/// `(fit_result_gen, resolution_enabled, resolution_mode, flight_path_m, temperature_k)`.
 fn dock_residuals(ui: &mut egui::Ui, state: &mut AppState) {
     let colors = ThemeColors::from_ctx(ui.ctx());
 
@@ -727,6 +727,7 @@ fn dock_residuals(ui: &mut egui::Ui, state: &mut AppState) {
         }
     };
     let chi2_r = result.reduced_chi_squared;
+    let effective_temp = result.temperature_k.unwrap_or(state.temperature_k);
 
     // Check if the cache is still valid.
     let cache_valid = state.residuals_cache.as_ref().is_some_and(|c| {
@@ -734,6 +735,7 @@ fn dock_residuals(ui: &mut egui::Ui, state: &mut AppState) {
             && c.resolution_enabled == state.resolution_enabled
             && c.resolution_mode == state.resolution_mode
             && c.flight_path_m == state.beamline.flight_path_m
+            && c.temperature_k == effective_temp
     });
 
     if !cache_valid {
@@ -744,7 +746,16 @@ fn dock_residuals(ui: &mut egui::Ui, state: &mut AppState) {
 
     let cache = match &state.residuals_cache {
         Some(c) => c,
-        None => return, // build failed — error already shown via state.status_message
+        None => {
+            ui.label(
+                egui::RichText::new(
+                    "Could not compute residuals (missing data or isotope mismatch).",
+                )
+                .small()
+                .color(colors.fg3),
+            );
+            return;
+        }
     };
 
     // Stats row
@@ -878,6 +889,7 @@ fn build_residuals_cache(state: &AppState) -> Option<crate::state::CachedResidua
         resolution_enabled: state.resolution_enabled,
         resolution_mode: state.resolution_mode.clone(),
         flight_path_m: state.beamline.flight_path_m,
+        temperature_k: overlay_temp,
         residuals,
         rms,
         max_abs,

@@ -497,6 +497,7 @@ pub struct DetectTraceEntry {
 }
 
 /// Cached residuals data for the Studio dock, avoiding per-frame model rebuild.
+#[derive(Clone, Debug)]
 pub struct CachedResiduals {
     /// Generation counter of the `pixel_fit_result` that produced this cache.
     pub fit_gen: u64,
@@ -506,6 +507,8 @@ pub struct CachedResiduals {
     pub resolution_mode: ResolutionMode,
     /// Flight path at cache time (affects Gaussian resolution).
     pub flight_path_m: f64,
+    /// Effective temperature used for the forward model overlay.
+    pub temperature_k: f64,
     /// Residual points: (energy_ev, residual_value).
     pub residuals: Vec<(f64, f64)>,
     /// RMS of residuals.
