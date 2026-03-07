@@ -65,6 +65,11 @@ pub fn toolbar(ctx: &egui::Context, state: &mut AppState) {
                         crate::project::save_project_dialog(state);
                     }
 
+                    // Open button — always visible
+                    if design::btn_primary(ui, "\u{1F4C2} Open").clicked() {
+                        crate::project::load_project_dialog(state);
+                    }
+
                     // Progress indicator
                     if state.is_fitting {
                         if let Some(ref fp) = state.fitting_progress {

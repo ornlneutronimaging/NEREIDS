@@ -1,9 +1,9 @@
-//! Project file save for `.nrd.h5` (NEREIDS HDF5 archive).
+//! Project file save and load for `.nrd.h5` (NEREIDS HDF5 archive).
 //!
 //! The project file captures the full session state so users can persist
 //! and share analysis sessions. This module defines [`ProjectSnapshot`]
 //! (a serialization-friendly subset of the GUI's `AppState`) and the
-//! [`save_project`] function that writes it to HDF5.
+//! [`save_project`] and [`load_project`] functions for HDF5 I/O.
 
 use std::path::Path;
 
@@ -22,6 +22,7 @@ pub const PROJECT_SCHEMA_VERSION: &str = "1.0";
 /// All GUI-specific enums are stored as plain strings so this struct
 /// has no dependency on the GUI crate. The GUI handles
 /// `AppState <-> ProjectSnapshot` conversion.
+#[derive(Debug)]
 pub struct ProjectSnapshot {
     // -- meta --
     pub schema_version: String,
@@ -102,6 +103,59 @@ pub struct ProjectSnapshot {
     // -- provenance --
     /// (timestamp, kind, message) triples.
     pub provenance: Vec<(String, String, String)>,
+}
+
+impl Default for ProjectSnapshot {
+    fn default() -> Self {
+        Self {
+            schema_version: String::new(),
+            created_utc: String::new(),
+            software_version: String::new(),
+            fitting_type: String::new(),
+            data_type: String::new(),
+            flight_path_m: 0.0,
+            delay_us: 0.0,
+            proton_charge_sample: 0.0,
+            proton_charge_ob: 0.0,
+            isotope_z: vec![],
+            isotope_a: vec![],
+            isotope_symbol: vec![],
+            isotope_density: vec![],
+            isotope_enabled: vec![],
+            solver_method: String::new(),
+            max_iter: 0,
+            temperature_k: 0.0,
+            fit_temperature: false,
+            resolution_enabled: false,
+            resolution_kind: String::new(),
+            delta_t_us: None,
+            delta_l_m: None,
+            tabulated_path: None,
+            rois: vec![],
+            endf_library: String::new(),
+            data_mode: String::new(),
+            sample_path: None,
+            open_beam_path: None,
+            spectrum_path: None,
+            hdf5_path: None,
+            spectrum_unit: String::new(),
+            spectrum_kind: String::new(),
+            rebin_factor: 0,
+            rebin_applied: false,
+            normalized: None,
+            energies: None,
+            density_maps: None,
+            uncertainty_maps: None,
+            chi_squared_map: None,
+            converged_map: None,
+            temperature_map: None,
+            n_converged: None,
+            n_total: None,
+            result_isotope_labels: None,
+            endf_cache: vec![],
+            provenance: vec![],
+        }
+    }
 }
 
 /// Write a project snapshot to an HDF5 file at `path`.
@@ -560,6 +614,449 @@ fn chunk_shape_3d(shape: [usize; 3]) -> [usize; 3] {
 }
 
 // ---------------------------------------------------------------------------
+// Read helpers
+// ---------------------------------------------------------------------------
+
+fn read_str_attr(loc: &hdf5::Group, name: &str) -> Result<String, IoError> {
+    let val: VarLenUnicode = loc
+        .attr(name)
+        .and_then(|a| a.read_scalar())
+        .map_err(|e| hdf5_err(name, e))?;
+    Ok(val.as_str().to_string())
+}
+
+fn read_f64_attr(loc: &hdf5::Group, name: &str) -> Result<f64, IoError> {
+    loc.attr(name)
+        .and_then(|a| a.read_scalar())
+        .map_err(|e| hdf5_err(name, e))
+}
+
+fn read_u32_attr(loc: &hdf5::Group, name: &str) -> Result<u32, IoError> {
+    loc.attr(name)
+        .and_then(|a| a.read_scalar())
+        .map_err(|e| hdf5_err(name, e))
+}
+
+fn read_bool_attr(loc: &hdf5::Group, name: &str) -> Result<bool, IoError> {
+    let v: u8 = loc
+        .attr(name)
+        .and_then(|a| a.read_scalar())
+        .map_err(|e| hdf5_err(name, e))?;
+    Ok(v != 0)
+}
+
+fn read_u64_attr(loc: &hdf5::Group, name: &str) -> Result<u64, IoError> {
+    loc.attr(name)
+        .and_then(|a| a.read_scalar())
+        .map_err(|e| hdf5_err(name, e))
+}
+
+/// Return `None` if the attribute does not exist.
+fn read_str_attr_opt(loc: &hdf5::Group, name: &str) -> Option<String> {
+    loc.attr(name)
+        .and_then(|a| a.read_scalar::<VarLenUnicode>())
+        .ok()
+        .map(|v| v.as_str().to_string())
+}
+
+/// Return `None` if the attribute does not exist.
+fn read_f64_attr_opt(loc: &hdf5::Group, name: &str) -> Option<f64> {
+    loc.attr(name).and_then(|a| a.read_scalar::<f64>()).ok()
+}
+
+// ---------------------------------------------------------------------------
+// Load
+// ---------------------------------------------------------------------------
+
+/// Load a project snapshot from an HDF5 file at `path`.
+pub fn load_project(path: &Path) -> Result<ProjectSnapshot, IoError> {
+    let file = hdf5::File::open(path).map_err(|e| IoError::Hdf5Error(format!("open: {e}")))?;
+
+    let mut snap = read_meta(&file)?;
+    read_config(&file, &mut snap)?;
+    read_data_links(&file, &mut snap)?;
+    read_intermediate(&file, &mut snap)?;
+    read_results(&file, &mut snap)?;
+    read_endf_cache_into(&file, &mut snap)?;
+    read_provenance_into(&file, &mut snap)?;
+
+    Ok(snap)
+}
+
+fn read_meta(file: &hdf5::File) -> Result<ProjectSnapshot, IoError> {
+    let g = file.group("meta").map_err(|_| {
+        IoError::Hdf5Error("Not a valid NEREIDS project file: missing schema version".to_string())
+    })?;
+
+    let schema_version = read_str_attr(&g, "version").map_err(|_| {
+        IoError::Hdf5Error("Not a valid NEREIDS project file: missing schema version".to_string())
+    })?;
+    let created_utc = read_str_attr(&g, "created_utc")?;
+    let software_version = read_str_attr(&g, "software_version")?;
+    let fitting_type = read_str_attr(&g, "fitting_type")?;
+    let data_type = read_str_attr(&g, "data_type")?;
+
+    Ok(ProjectSnapshot {
+        schema_version,
+        created_utc,
+        software_version,
+        fitting_type,
+        data_type,
+        ..Default::default()
+    })
+}
+
+fn read_config(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoError> {
+    let config = file
+        .group("config")
+        .map_err(|e| hdf5_err("open /config", e))?;
+
+    // Beamline
+    let bl = config
+        .group("beamline")
+        .map_err(|e| hdf5_err("open /config/beamline", e))?;
+    snap.flight_path_m = read_f64_attr(&bl, "flight_path_m")?;
+    snap.delay_us = read_f64_attr(&bl, "delay_us")?;
+    snap.proton_charge_sample = read_f64_attr(&bl, "proton_charge_sample")?;
+    snap.proton_charge_ob = read_f64_attr(&bl, "proton_charge_ob")?;
+
+    // Isotopes
+    let iso = config
+        .group("isotopes")
+        .map_err(|e| hdf5_err("open /config/isotopes", e))?;
+    if iso.dataset("z").is_ok() {
+        let z_ds = iso
+            .dataset("z")
+            .map_err(|e| hdf5_err("/config/isotopes/z", e))?;
+        snap.isotope_z = z_ds
+            .read_raw()
+            .map_err(|e| hdf5_err("/config/isotopes/z", e))?;
+
+        let a_ds = iso
+            .dataset("a")
+            .map_err(|e| hdf5_err("/config/isotopes/a", e))?;
+        snap.isotope_a = a_ds
+            .read_raw()
+            .map_err(|e| hdf5_err("/config/isotopes/a", e))?;
+
+        let sym_ds = iso
+            .dataset("symbol")
+            .map_err(|e| hdf5_err("/config/isotopes/symbol", e))?;
+        let symbols: Vec<VarLenUnicode> = sym_ds
+            .read_raw()
+            .map_err(|e| hdf5_err("/config/isotopes/symbol", e))?;
+        snap.isotope_symbol = symbols.iter().map(|v| v.as_str().to_string()).collect();
+
+        let d_ds = iso
+            .dataset("density")
+            .map_err(|e| hdf5_err("/config/isotopes/density", e))?;
+        snap.isotope_density = d_ds
+            .read_raw()
+            .map_err(|e| hdf5_err("/config/isotopes/density", e))?;
+
+        let en_ds = iso
+            .dataset("enabled")
+            .map_err(|e| hdf5_err("/config/isotopes/enabled", e))?;
+        let en_raw: Vec<u8> = en_ds
+            .read_raw()
+            .map_err(|e| hdf5_err("/config/isotopes/enabled", e))?;
+        snap.isotope_enabled = en_raw.iter().map(|&v| v != 0).collect();
+    }
+
+    // Solver
+    let solver = config
+        .group("solver")
+        .map_err(|e| hdf5_err("open /config/solver", e))?;
+    snap.solver_method = read_str_attr(&solver, "method")?;
+    snap.max_iter = read_u32_attr(&solver, "max_iter")?;
+    snap.temperature_k = read_f64_attr(&solver, "temperature_k")?;
+    snap.fit_temperature = read_bool_attr(&solver, "fit_temperature")?;
+
+    // Resolution
+    let res = config
+        .group("resolution")
+        .map_err(|e| hdf5_err("open /config/resolution", e))?;
+    snap.resolution_enabled = read_bool_attr(&res, "enabled")?;
+    snap.resolution_kind = read_str_attr(&res, "kind")?;
+    snap.delta_t_us = read_f64_attr_opt(&res, "delta_t_us");
+    snap.delta_l_m = read_f64_attr_opt(&res, "delta_l_m");
+    snap.tabulated_path = read_str_attr_opt(&res, "tabulated_path");
+
+    // ROIs
+    if let Ok(roi_ds) = config.dataset("rois") {
+        let shape = roi_ds.shape();
+        let flat: Vec<u64> = roi_ds.read_raw().map_err(|e| hdf5_err("/config/rois", e))?;
+        if shape.len() == 2 && shape[1] == 4 {
+            snap.rois = flat.chunks(4).map(|c| [c[0], c[1], c[2], c[3]]).collect();
+        }
+    }
+
+    // ENDF library
+    snap.endf_library = read_str_attr(&config, "endf_library")?;
+
+    Ok(())
+}
+
+fn read_data_links(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoError> {
+    let data = file.group("data").map_err(|e| hdf5_err("open /data", e))?;
+    snap.data_mode = read_str_attr(&data, "mode")?;
+    snap.spectrum_unit = read_str_attr(&data, "spectrum_unit")?;
+    snap.spectrum_kind = read_str_attr(&data, "spectrum_kind")?;
+    snap.rebin_factor = read_u32_attr(&data, "rebin_factor")?;
+    snap.rebin_applied = read_bool_attr(&data, "rebin_applied")?;
+
+    let links = data
+        .group("links")
+        .map_err(|e| hdf5_err("open /data/links", e))?;
+    snap.sample_path = read_str_attr_opt(&links, "sample_path");
+    snap.open_beam_path = read_str_attr_opt(&links, "open_beam_path");
+    snap.spectrum_path = read_str_attr_opt(&links, "spectrum_path");
+    snap.hdf5_path = read_str_attr_opt(&links, "hdf5_path");
+
+    Ok(())
+}
+
+fn read_intermediate(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoError> {
+    let inter = file
+        .group("intermediate")
+        .map_err(|e| hdf5_err("open /intermediate", e))?;
+
+    if let Ok(norm_ds) = inter.dataset("normalized") {
+        let shape = norm_ds.shape();
+        if shape.len() == 3 {
+            let data: Vec<f64> = norm_ds
+                .read_raw()
+                .map_err(|e| hdf5_err("/intermediate/normalized", e))?;
+            snap.normalized = Some(
+                Array3::from_shape_vec((shape[0], shape[1], shape[2]), data)
+                    .map_err(|e| hdf5_err("/intermediate/normalized reshape", e))?,
+            );
+        }
+    }
+
+    if let Ok(e_ds) = inter.dataset("energies") {
+        let data: Vec<f64> = e_ds
+            .read_raw()
+            .map_err(|e| hdf5_err("/intermediate/energies", e))?;
+        snap.energies = Some(data);
+    }
+
+    Ok(())
+}
+
+fn read_results(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoError> {
+    let results = file
+        .group("results")
+        .map_err(|e| hdf5_err("open /results", e))?;
+
+    // Read isotope labels first so we can use them to order density/uncertainty maps
+    if let Ok(labels_ds) = results.dataset("result_isotopes") {
+        let labels_vlu: Vec<VarLenUnicode> = labels_ds
+            .read_raw()
+            .map_err(|e| hdf5_err("/results/result_isotopes", e))?;
+        let labels: Vec<String> = labels_vlu.iter().map(|v| v.as_str().to_string()).collect();
+        snap.result_isotope_labels = Some(labels);
+    }
+
+    // Density maps
+    if let Ok(density_grp) = results.group("density") {
+        let names = density_grp
+            .member_names()
+            .map_err(|e| hdf5_err("/results/density member_names", e))?;
+
+        // Order by result_isotope_labels if available, otherwise alphabetical
+        let ordered: Vec<String> = if let Some(ref labels) = snap.result_isotope_labels {
+            labels
+                .iter()
+                .filter(|l| names.contains(l))
+                .cloned()
+                .collect()
+        } else {
+            let mut sorted = names;
+            sorted.sort();
+            sorted
+        };
+
+        let mut maps = Vec::with_capacity(ordered.len());
+        for name in &ordered {
+            let ds = density_grp
+                .dataset(name)
+                .map_err(|e| hdf5_err(&format!("/results/density/{name}"), e))?;
+            let shape = ds.shape();
+            if shape.len() == 2 {
+                let data: Vec<f64> = ds
+                    .read_raw()
+                    .map_err(|e| hdf5_err(&format!("/results/density/{name}"), e))?;
+                maps.push(
+                    Array2::from_shape_vec((shape[0], shape[1]), data)
+                        .map_err(|e| hdf5_err(&format!("/results/density/{name} reshape"), e))?,
+                );
+            }
+        }
+        if !maps.is_empty() {
+            snap.density_maps = Some(maps);
+        }
+    }
+
+    // Uncertainty maps
+    if let Ok(unc_grp) = results.group("uncertainty") {
+        let names = unc_grp
+            .member_names()
+            .map_err(|e| hdf5_err("/results/uncertainty member_names", e))?;
+
+        let ordered: Vec<String> = if let Some(ref labels) = snap.result_isotope_labels {
+            labels
+                .iter()
+                .filter(|l| names.contains(l))
+                .cloned()
+                .collect()
+        } else {
+            let mut sorted = names;
+            sorted.sort();
+            sorted
+        };
+
+        let mut maps = Vec::with_capacity(ordered.len());
+        for name in &ordered {
+            let ds = unc_grp
+                .dataset(name)
+                .map_err(|e| hdf5_err(&format!("/results/uncertainty/{name}"), e))?;
+            let shape = ds.shape();
+            if shape.len() == 2 {
+                let data: Vec<f64> = ds
+                    .read_raw()
+                    .map_err(|e| hdf5_err(&format!("/results/uncertainty/{name}"), e))?;
+                maps.push(
+                    Array2::from_shape_vec((shape[0], shape[1]), data).map_err(|e| {
+                        hdf5_err(&format!("/results/uncertainty/{name} reshape"), e)
+                    })?,
+                );
+            }
+        }
+        if !maps.is_empty() {
+            snap.uncertainty_maps = Some(maps);
+        }
+    }
+
+    // Chi-squared map
+    if let Ok(chi2_ds) = results.dataset("chi_squared") {
+        let shape = chi2_ds.shape();
+        if shape.len() == 2 {
+            let data: Vec<f64> = chi2_ds
+                .read_raw()
+                .map_err(|e| hdf5_err("/results/chi_squared", e))?;
+            snap.chi_squared_map = Some(
+                Array2::from_shape_vec((shape[0], shape[1]), data)
+                    .map_err(|e| hdf5_err("/results/chi_squared reshape", e))?,
+            );
+        }
+    }
+
+    // Converged map
+    if let Ok(conv_ds) = results.dataset("converged") {
+        let shape = conv_ds.shape();
+        if shape.len() == 2 {
+            let data: Vec<u8> = conv_ds
+                .read_raw()
+                .map_err(|e| hdf5_err("/results/converged", e))?;
+            snap.converged_map = Some(
+                Array2::from_shape_vec(
+                    (shape[0], shape[1]),
+                    data.iter().map(|&v| v != 0).collect(),
+                )
+                .map_err(|e| hdf5_err("/results/converged reshape", e))?,
+            );
+        }
+    }
+
+    // Temperature map
+    if let Ok(t_ds) = results.dataset("temperature") {
+        let shape = t_ds.shape();
+        if shape.len() == 2 {
+            let data: Vec<f64> = t_ds
+                .read_raw()
+                .map_err(|e| hdf5_err("/results/temperature", e))?;
+            snap.temperature_map = Some(
+                Array2::from_shape_vec((shape[0], shape[1]), data)
+                    .map_err(|e| hdf5_err("/results/temperature reshape", e))?,
+            );
+        }
+    }
+
+    // Scalar attrs
+    if let Ok(nc) = read_u64_attr(&results, "n_converged") {
+        snap.n_converged = Some(nc as usize);
+    }
+    if let Ok(nt) = read_u64_attr(&results, "n_total") {
+        snap.n_total = Some(nt as usize);
+    }
+
+    Ok(())
+}
+
+fn read_endf_cache_into(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoError> {
+    let cache = file
+        .group("endf_cache")
+        .map_err(|e| hdf5_err("open /endf_cache", e))?;
+
+    let names = cache
+        .member_names()
+        .map_err(|e| hdf5_err("/endf_cache member_names", e))?;
+
+    for name in &names {
+        let iso_grp = cache
+            .group(name)
+            .map_err(|e| hdf5_err(&format!("/endf_cache/{name}"), e))?;
+        let ds = iso_grp
+            .dataset("resonance_data")
+            .map_err(|e| hdf5_err(&format!("/endf_cache/{name}/resonance_data"), e))?;
+        let json: VarLenUnicode = ds
+            .read_scalar()
+            .map_err(|e| hdf5_err(&format!("/endf_cache/{name}/resonance_data"), e))?;
+        let rd: ResonanceData = serde_json::from_str(json.as_str())
+            .map_err(|e| hdf5_err(&format!("deserialize /endf_cache/{name}"), e))?;
+        snap.endf_cache.push((name.clone(), rd));
+    }
+
+    Ok(())
+}
+
+fn read_provenance_into(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoError> {
+    let prov = file
+        .group("provenance")
+        .map_err(|e| hdf5_err("open /provenance", e))?;
+
+    let ts_ds = match prov.dataset("timestamps") {
+        Ok(ds) => ds,
+        Err(_) => return Ok(()), // empty provenance
+    };
+    let timestamps: Vec<VarLenUnicode> = ts_ds
+        .read_raw()
+        .map_err(|e| hdf5_err("/provenance/timestamps", e))?;
+    let kinds: Vec<VarLenUnicode> = prov
+        .dataset("kinds")
+        .and_then(|ds| ds.read_raw())
+        .map_err(|e| hdf5_err("/provenance/kinds", e))?;
+    let messages: Vec<VarLenUnicode> = prov
+        .dataset("messages")
+        .and_then(|ds| ds.read_raw())
+        .map_err(|e| hdf5_err("/provenance/messages", e))?;
+
+    for (i, ts_vlu) in timestamps.iter().enumerate() {
+        let ts = ts_vlu.as_str().to_string();
+        let kind = kinds
+            .get(i)
+            .map_or(String::new(), |v| v.as_str().to_string());
+        let msg = messages
+            .get(i)
+            .map_or(String::new(), |v| v.as_str().to_string());
+        snap.provenance.push((ts, kind, msg));
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -843,5 +1340,232 @@ mod tests {
         let delay: f64 = bl.attr("delay_us").unwrap().read_scalar().unwrap();
         assert!((fp - 15.3).abs() < 1e-10);
         assert!((delay - 42.5).abs() < 1e-10);
+    }
+
+    // -----------------------------------------------------------------------
+    // Round-trip tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_roundtrip_minimal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt.nrd.h5");
+        let snap = minimal_snapshot();
+        save_project(&path, &snap).unwrap();
+        let loaded = load_project(&path).unwrap();
+
+        assert_eq!(loaded.schema_version, snap.schema_version);
+        assert_eq!(loaded.created_utc, snap.created_utc);
+        assert_eq!(loaded.software_version, snap.software_version);
+        assert_eq!(loaded.fitting_type, snap.fitting_type);
+        assert_eq!(loaded.data_type, snap.data_type);
+        assert!((loaded.flight_path_m - snap.flight_path_m).abs() < 1e-10);
+        assert!((loaded.delay_us - snap.delay_us).abs() < 1e-10);
+        assert!((loaded.proton_charge_sample - snap.proton_charge_sample).abs() < 1e-10);
+        assert!((loaded.proton_charge_ob - snap.proton_charge_ob).abs() < 1e-10);
+        assert_eq!(loaded.solver_method, snap.solver_method);
+        assert_eq!(loaded.max_iter, snap.max_iter);
+        assert!((loaded.temperature_k - snap.temperature_k).abs() < 1e-10);
+        assert_eq!(loaded.fit_temperature, snap.fit_temperature);
+        assert_eq!(loaded.resolution_enabled, snap.resolution_enabled);
+        assert_eq!(loaded.resolution_kind, snap.resolution_kind);
+        assert_eq!(loaded.endf_library, snap.endf_library);
+        assert_eq!(loaded.data_mode, snap.data_mode);
+        assert_eq!(loaded.sample_path, snap.sample_path);
+        assert_eq!(loaded.open_beam_path, snap.open_beam_path);
+        assert_eq!(loaded.spectrum_path, snap.spectrum_path);
+        assert_eq!(loaded.hdf5_path, snap.hdf5_path);
+        assert_eq!(loaded.spectrum_unit, snap.spectrum_unit);
+        assert_eq!(loaded.spectrum_kind, snap.spectrum_kind);
+        assert_eq!(loaded.rebin_factor, snap.rebin_factor);
+        assert_eq!(loaded.rebin_applied, snap.rebin_applied);
+    }
+
+    #[test]
+    fn test_roundtrip_with_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt_results.nrd.h5");
+        let mut snap = minimal_snapshot();
+        snap.density_maps = Some(vec![
+            Array2::from_elem((3, 4), 0.001),
+            Array2::from_elem((3, 4), 0.002),
+        ]);
+        snap.uncertainty_maps = Some(vec![
+            Array2::from_elem((3, 4), 0.0001),
+            Array2::from_elem((3, 4), 0.0002),
+        ]);
+        snap.chi_squared_map = Some(Array2::from_elem((3, 4), 1.5));
+        snap.converged_map = Some(Array2::from_elem((3, 4), true));
+        snap.temperature_map = Some(Array2::from_elem((3, 4), 295.0));
+        snap.n_converged = Some(12);
+        snap.n_total = Some(12);
+        snap.result_isotope_labels = Some(vec!["W-182".into(), "Fe-56".into()]);
+        save_project(&path, &snap).unwrap();
+        let loaded = load_project(&path).unwrap();
+
+        let dm = loaded.density_maps.unwrap();
+        assert_eq!(dm.len(), 2);
+        assert!((dm[0][[0, 0]] - 0.001).abs() < 1e-10);
+        assert!((dm[1][[0, 0]] - 0.002).abs() < 1e-10);
+
+        let um = loaded.uncertainty_maps.unwrap();
+        assert_eq!(um.len(), 2);
+
+        let chi2 = loaded.chi_squared_map.unwrap();
+        assert!((chi2[[0, 0]] - 1.5).abs() < 1e-10);
+
+        let conv = loaded.converged_map.unwrap();
+        assert!(conv[[0, 0]]);
+
+        let temp = loaded.temperature_map.unwrap();
+        assert!((temp[[0, 0]] - 295.0).abs() < 1e-10);
+
+        assert_eq!(loaded.n_converged, Some(12));
+        assert_eq!(loaded.n_total, Some(12));
+        assert_eq!(
+            loaded.result_isotope_labels,
+            Some(vec!["W-182".into(), "Fe-56".into()])
+        );
+    }
+
+    #[test]
+    fn test_roundtrip_with_intermediate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt_inter.nrd.h5");
+        let mut snap = minimal_snapshot();
+        snap.normalized = Some(Array3::from_elem((10, 3, 4), 0.5));
+        snap.energies = Some(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+        save_project(&path, &snap).unwrap();
+        let loaded = load_project(&path).unwrap();
+
+        let norm = loaded.normalized.unwrap();
+        assert_eq!(norm.shape(), &[10, 3, 4]);
+        assert!((norm[[0, 0, 0]] - 0.5).abs() < 1e-10);
+
+        let en = loaded.energies.unwrap();
+        assert_eq!(en.len(), 5);
+        assert!((en[2] - 3.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_roundtrip_endf_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt_endf.nrd.h5");
+        let mut snap = minimal_snapshot();
+        let rd = ResonanceData {
+            isotope: nereids_core::types::Isotope::new(74, 182).unwrap(),
+            za: 74182,
+            awr: 180.948,
+            ranges: vec![],
+        };
+        snap.endf_cache = vec![("W-182".into(), rd)];
+        save_project(&path, &snap).unwrap();
+        let loaded = load_project(&path).unwrap();
+
+        assert_eq!(loaded.endf_cache.len(), 1);
+        assert_eq!(loaded.endf_cache[0].0, "W-182");
+        assert_eq!(loaded.endf_cache[0].1.za, 74182);
+        assert!((loaded.endf_cache[0].1.awr - 180.948).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_roundtrip_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt_prov.nrd.h5");
+        let mut snap = minimal_snapshot();
+        snap.provenance = vec![
+            (
+                "2026-03-07 12:00:00 UTC".into(),
+                "DataLoaded".into(),
+                "Loaded sample".into(),
+            ),
+            (
+                "2026-03-07 12:01:00 UTC".into(),
+                "AnalysisRun".into(),
+                "Spatial map done".into(),
+            ),
+        ];
+        save_project(&path, &snap).unwrap();
+        let loaded = load_project(&path).unwrap();
+
+        assert_eq!(loaded.provenance.len(), 2);
+        assert_eq!(loaded.provenance[0].0, "2026-03-07 12:00:00 UTC");
+        assert_eq!(loaded.provenance[0].1, "DataLoaded");
+        assert_eq!(loaded.provenance[0].2, "Loaded sample");
+        assert_eq!(loaded.provenance[1].1, "AnalysisRun");
+    }
+
+    #[test]
+    fn test_roundtrip_isotope_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt_iso.nrd.h5");
+        let mut snap = minimal_snapshot();
+        snap.isotope_z = vec![74, 26];
+        snap.isotope_a = vec![182, 56];
+        snap.isotope_symbol = vec!["W-182".into(), "Fe-56".into()];
+        snap.isotope_density = vec![0.001, 0.002];
+        snap.isotope_enabled = vec![true, false];
+        save_project(&path, &snap).unwrap();
+        let loaded = load_project(&path).unwrap();
+
+        assert_eq!(loaded.isotope_z, vec![74, 26]);
+        assert_eq!(loaded.isotope_a, vec![182, 56]);
+        assert_eq!(loaded.isotope_symbol, vec!["W-182", "Fe-56"]);
+        assert!((loaded.isotope_density[0] - 0.001).abs() < 1e-10);
+        assert_eq!(loaded.isotope_enabled, vec![true, false]);
+    }
+
+    #[test]
+    fn test_roundtrip_rois() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt_rois.nrd.h5");
+        let mut snap = minimal_snapshot();
+        snap.rois = vec![[10, 20, 30, 40], [50, 60, 70, 80]];
+        save_project(&path, &snap).unwrap();
+        let loaded = load_project(&path).unwrap();
+
+        assert_eq!(loaded.rois.len(), 2);
+        assert_eq!(loaded.rois[0], [10, 20, 30, 40]);
+        assert_eq!(loaded.rois[1], [50, 60, 70, 80]);
+    }
+
+    #[test]
+    fn test_load_missing_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.h5");
+        // Create an HDF5 file with no /meta group
+        hdf5::File::create(&path).unwrap();
+        let result = load_project(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("schema") || err.contains("meta") || err.contains("version"),
+            "Error should mention missing schema: {err}"
+        );
+    }
+
+    #[test]
+    fn test_load_future_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("future.nrd.h5");
+        let mut snap = minimal_snapshot();
+        snap.schema_version = "99.0".into();
+        save_project(&path, &snap).unwrap();
+        let loaded = load_project(&path).unwrap();
+        assert_eq!(loaded.schema_version, "99.0");
+    }
+
+    #[test]
+    fn test_roundtrip_empty_isotopes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt_empty_iso.nrd.h5");
+        let snap = minimal_snapshot(); // has empty isotope arrays
+        save_project(&path, &snap).unwrap();
+        let loaded = load_project(&path).unwrap();
+        assert!(loaded.isotope_z.is_empty());
+        assert!(loaded.isotope_a.is_empty());
+        assert!(loaded.isotope_symbol.is_empty());
+        assert!(loaded.isotope_density.is_empty());
+        assert!(loaded.isotope_enabled.is_empty());
     }
 }

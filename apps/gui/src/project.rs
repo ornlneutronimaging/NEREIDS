@@ -1,13 +1,18 @@
-//! Project file save — AppState → ProjectSnapshot conversion and save dialog.
+//! Project file save and load — AppState ↔ ProjectSnapshot conversion and dialogs.
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use nereids_endf::resonance::ResonanceData;
+use nereids_io::normalization::NormalizedData;
 use nereids_io::project::{PROJECT_SCHEMA_VERSION, ProjectSnapshot};
-
 use nereids_io::spectrum::{SpectrumUnit, SpectrumValueKind};
+use nereids_pipeline::spatial::SpatialResult;
 
 use crate::state::{
-    AppState, DataType, FittingType, ProvenanceEventKind, ResolutionMode, SolverMethod,
+    AppState, DataType, EndfStatus, FittingType, GuidedStep, InputMode, IsotopeEntry,
+    ProvenanceEvent, ProvenanceEventKind, ResolutionMode, RoiSelection, SolverMethod, UiMode,
 };
 use crate::widgets::design::library_name;
 
@@ -319,4 +324,330 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
+}
+
+// ---------------------------------------------------------------------------
+// Load
+// ---------------------------------------------------------------------------
+
+/// Show a native open dialog and load a project file.
+pub fn load_project_dialog(state: &mut AppState) {
+    let dialog = rfd::FileDialog::new()
+        .set_title("Open NEREIDS Project")
+        .add_filter("NEREIDS Project", &["nrd.h5", "h5"]);
+
+    if let Some(path) = dialog.pick_file() {
+        load_project_from_path(state, &path);
+    }
+}
+
+/// Load a project file from `path` and apply the snapshot to `state`.
+pub fn load_project_from_path(state: &mut AppState, path: &Path) {
+    match nereids_io::project::load_project(path) {
+        Ok(snap) => {
+            state_from_snapshot(snap, state, path);
+        }
+        Err(e) => {
+            state.status_message = format!("Load failed: {e}");
+        }
+    }
+}
+
+/// Apply a [`ProjectSnapshot`] to [`AppState`], restoring the full session.
+fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path) {
+    // 1. Clear derived state
+    state.spatial_result = None;
+    state.pixel_fit_result = None;
+    state.last_fit_feedback = None;
+    state.normalized = None;
+    state.energies = None;
+    state.preview_image = None;
+    state.tile_display.clear();
+    state.residuals_cache = None;
+    state.sample_data = None;
+    state.open_beam_data = None;
+    state.dead_pixels = None;
+    state.fm_spectrum = None;
+    state.fm_per_isotope_spectra.clear();
+    state.detect_results.clear();
+    state.load_error = false;
+
+    // 2. Parse fitting_type and data_type
+    state.fitting_type = match snap.fitting_type.as_str() {
+        "spatial" => Some(FittingType::Spatial),
+        "single" => Some(FittingType::Single),
+        _ => None,
+    };
+    state.data_type = match snap.data_type.as_str() {
+        "events" => Some(DataType::Events),
+        "pre_normalized" => Some(DataType::PreNormalized),
+        "transmission" => Some(DataType::Transmission),
+        _ => None,
+    };
+
+    // 3. Rebuild pipeline
+    state.rebuild_pipeline();
+
+    // 4. Derive input_mode heuristically
+    state.input_mode = match (snap.data_type.as_str(), snap.hdf5_path.is_some()) {
+        ("events", true) => InputMode::Hdf5Event,
+        ("events", false) => InputMode::TiffPair,
+        ("pre_normalized", _) => InputMode::TransmissionTiff,
+        ("transmission", _) => InputMode::TiffPair,
+        _ => InputMode::TiffPair,
+    };
+
+    // 5. Restore beamline
+    state.beamline.flight_path_m = snap.flight_path_m;
+    state.beamline.delay_us = snap.delay_us;
+    state.proton_charge_sample = snap.proton_charge_sample;
+    state.proton_charge_ob = snap.proton_charge_ob;
+
+    // 6. Restore ENDF library
+    state.endf_library = match snap.endf_library.as_str() {
+        "ENDF/B-VIII.1" => nereids_endf::retrieval::EndfLibrary::EndfB8_1,
+        "JEFF-3.3" => nereids_endf::retrieval::EndfLibrary::Jeff3_3,
+        "JENDL-5" => nereids_endf::retrieval::EndfLibrary::Jendl5,
+        _ => nereids_endf::retrieval::EndfLibrary::EndfB8_0,
+    };
+
+    // 7. ENDF cache priority — build lookup from snapshot
+    let endf_cache: HashMap<String, ResonanceData> = snap.endf_cache.into_iter().collect();
+
+    // 8. Restore isotope entries with ENDF cache
+    let n_iso = snap.isotope_z.len();
+    state.isotope_entries = (0..n_iso)
+        .map(|i| {
+            let symbol = snap.isotope_symbol.get(i).cloned().unwrap_or_default();
+            let rd = endf_cache.get(&symbol).cloned();
+            let status = if rd.is_some() {
+                EndfStatus::Loaded
+            } else {
+                EndfStatus::Pending
+            };
+            IsotopeEntry {
+                z: snap.isotope_z[i],
+                a: snap.isotope_a[i],
+                symbol,
+                initial_density: snap.isotope_density.get(i).copied().unwrap_or(0.0),
+                resonance_data: rd,
+                enabled: snap.isotope_enabled.get(i).copied().unwrap_or(true),
+                endf_status: status,
+            }
+        })
+        .collect();
+
+    // 9. Restore solver
+    state.solver_method = match snap.solver_method.as_str() {
+        "poisson_kl" => SolverMethod::PoissonKL,
+        _ => SolverMethod::LevenbergMarquardt,
+    };
+    state.lm_config.max_iter = snap.max_iter as usize;
+    state.temperature_k = snap.temperature_k;
+    state.fit_temperature = snap.fit_temperature;
+
+    // 10. Restore resolution
+    state.resolution_enabled = snap.resolution_enabled;
+    state.resolution_mode = match snap.resolution_kind.as_str() {
+        "tabulated" => {
+            if let Some(p) = snap.tabulated_path {
+                ResolutionMode::Tabulated {
+                    path: PathBuf::from(p),
+                    data: None,
+                    error: None,
+                }
+            } else {
+                ResolutionMode::Gaussian {
+                    delta_t_us: snap.delta_t_us.unwrap_or(0.0),
+                    delta_l_m: snap.delta_l_m.unwrap_or(0.0),
+                }
+            }
+        }
+        _ => ResolutionMode::Gaussian {
+            delta_t_us: snap.delta_t_us.unwrap_or(0.0),
+            delta_l_m: snap.delta_l_m.unwrap_or(0.0),
+        },
+    };
+
+    // 11. Restore ROIs
+    state.rois = snap
+        .rois
+        .iter()
+        .map(|r| RoiSelection {
+            y_start: r[0] as usize,
+            y_end: r[1] as usize,
+            x_start: r[2] as usize,
+            x_end: r[3] as usize,
+        })
+        .collect();
+    state.selected_roi = None;
+
+    // 12. Restore spectrum unit/kind
+    state.spectrum_unit = match snap.spectrum_unit.as_str() {
+        "energy_ev" => SpectrumUnit::EnergyEv,
+        _ => SpectrumUnit::TofMicroseconds,
+    };
+    state.spectrum_kind = match snap.spectrum_kind.as_str() {
+        "bin_centers" => SpectrumValueKind::BinCenters,
+        _ => SpectrumValueKind::BinEdges,
+    };
+
+    // 13. Restore rebin state
+    state.rebin_factor = snap.rebin_factor as usize;
+    state.rebin_applied = snap.rebin_applied;
+
+    // 14. Restore file paths (verify existence, collect warnings)
+    let mut missing = Vec::new();
+    state.sample_path = snap.sample_path.map(|s| {
+        let p = PathBuf::from(&s);
+        if !p.exists() {
+            missing.push(s);
+        }
+        p
+    });
+    state.open_beam_path = snap.open_beam_path.map(|s| {
+        let p = PathBuf::from(&s);
+        if !p.exists() {
+            missing.push(s);
+        }
+        p
+    });
+    state.spectrum_path = snap.spectrum_path.map(|s| {
+        let p = PathBuf::from(&s);
+        if !p.exists() {
+            missing.push(s);
+        }
+        p
+    });
+    state.hdf5_path = snap.hdf5_path.map(|s| {
+        let p = PathBuf::from(&s);
+        if !p.exists() {
+            missing.push(s);
+        }
+        p
+    });
+
+    // 15. Restore intermediate data
+    if let Some(transmission) = snap.normalized {
+        let shape = transmission.raw_dim();
+        let uncertainty = ndarray::Array3::zeros(shape);
+        state.normalized = Some(Arc::new(NormalizedData {
+            transmission,
+            uncertainty,
+        }));
+    }
+    state.energies = snap.energies;
+
+    // 16. Restore results
+    if let Some(density_maps) = snap.density_maps {
+        let n_maps = density_maps.len();
+        let uncertainty_maps = snap.uncertainty_maps.unwrap_or_else(|| {
+            density_maps
+                .iter()
+                .map(|m| ndarray::Array2::zeros(m.raw_dim()))
+                .collect()
+        });
+        let chi_squared_map = snap
+            .chi_squared_map
+            .unwrap_or_else(|| ndarray::Array2::zeros((1, 1)));
+        let converged_map = snap
+            .converged_map
+            .unwrap_or_else(|| ndarray::Array2::from_elem((1, 1), false));
+        let result = SpatialResult {
+            density_maps,
+            uncertainty_maps,
+            chi_squared_map,
+            converged_map,
+            temperature_map: snap.temperature_map,
+            n_converged: snap.n_converged.unwrap_or(0),
+            n_total: snap.n_total.unwrap_or(0),
+        };
+        state.init_tile_display(n_maps);
+        state.spatial_result = Some(result);
+    }
+
+    // 17. Restore provenance
+    state.provenance_log = snap
+        .provenance
+        .iter()
+        .map(|(ts, kind_str, msg)| {
+            let kind = match kind_str.as_str() {
+                "DataLoaded" => ProvenanceEventKind::DataLoaded,
+                "Normalized" => ProvenanceEventKind::Normalized,
+                "AnalysisRun" => ProvenanceEventKind::AnalysisRun,
+                "Exported" => ProvenanceEventKind::Exported,
+                "ProjectSaved" => ProvenanceEventKind::ProjectSaved,
+                "ProjectLoaded" => ProvenanceEventKind::ProjectLoaded,
+                _ => ProvenanceEventKind::ConfigChanged,
+            };
+            let timestamp = parse_timestamp(ts);
+            ProvenanceEvent {
+                timestamp,
+                kind,
+                message: msg.clone(),
+            }
+        })
+        .collect();
+
+    // 18. Set project file path
+    state.project_file_path = Some(path.to_path_buf());
+
+    // 19. Auto-navigate
+    if state.spatial_result.is_some() {
+        state.ui_mode = UiMode::Studio;
+    } else if state.normalized.is_some() {
+        state.guided_step = GuidedStep::Analyze;
+    } else if !state.pipeline.is_empty() {
+        state.guided_step = state.pipeline[0].step;
+    }
+
+    // 20. Status message
+    let mut status = format!("Project loaded from {}", path.display());
+    if !missing.is_empty() {
+        status.push_str(&format!(" (missing files: {})", missing.join(", ")));
+    }
+    state.status_message = status;
+
+    // 21. Log provenance
+    state.log_provenance(
+        ProvenanceEventKind::ProjectLoaded,
+        format!("Loaded from {}", path.display()),
+    );
+}
+
+/// Parse a timestamp string ("YYYY-MM-DD HH:MM:SS UTC" or ISO 8601) into SystemTime.
+fn parse_timestamp(s: &str) -> std::time::SystemTime {
+    // Try "YYYY-MM-DD HH:MM:SS UTC" or "YYYY-MM-DDTHH:MM:SSZ"
+    let s = s
+        .trim()
+        .trim_end_matches("UTC")
+        .trim_end_matches('Z')
+        .trim();
+    let parts: Vec<&str> = s.splitn(2, ['T', ' ']).collect();
+    if parts.len() != 2 {
+        return std::time::SystemTime::now();
+    }
+    let date_parts: Vec<u64> = parts[0].split('-').filter_map(|p| p.parse().ok()).collect();
+    let time_parts: Vec<u64> = parts[1].split(':').filter_map(|p| p.parse().ok()).collect();
+    if date_parts.len() != 3 || time_parts.len() != 3 {
+        return std::time::SystemTime::now();
+    }
+    let (y, m, d) = (date_parts[0], date_parts[1], date_parts[2]);
+    let (h, mi, sec) = (time_parts[0], time_parts[1], time_parts[2]);
+    // Convert to days since epoch using the inverse of days_to_ymd
+    let days = ymd_to_days(y, m, d);
+    let total_secs = days * 86400 + h * 3600 + mi * 60 + sec;
+    std::time::UNIX_EPOCH + std::time::Duration::from_secs(total_secs)
+}
+
+/// Convert (year, month, day) to days since Unix epoch.
+fn ymd_to_days(y: u64, m: u64, d: u64) -> u64 {
+    // Inverse of days_to_ymd — Howard Hinnant's civil_from_days
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y / 400;
+    let yoe = y - era * 400;
+    let m_adj = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * m_adj + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
 }

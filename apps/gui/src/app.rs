@@ -98,6 +98,11 @@ impl eframe::App for NereidsApp {
             }
         }
 
+        // Cmd+O / Ctrl+O — open project
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::O)) {
+            crate::project::load_project_dialog(&mut self.state);
+        }
+
         // Top toolbar
         widgets::toolbar::toolbar(ctx, &mut self.state);
 

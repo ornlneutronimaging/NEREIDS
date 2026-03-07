@@ -21,13 +21,22 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
 
+    // Check for a project file argument (e.g. `nereids-gui project.nrd.h5`)
+    let project_arg = std::env::args().nth(1).map(std::path::PathBuf::from);
+
     eframe::run_native(
         "NEREIDS",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
             theme::configure_fonts(&cc.egui_ctx);
-            Ok(Box::new(app::NereidsApp::new(cc)))
+            let mut app = app::NereidsApp::new(cc);
+            if let Some(ref path) = project_arg
+                && path.exists()
+            {
+                project::load_project_from_path(&mut app.state, path);
+            }
+            Ok(Box::new(app))
         }),
     )
 }
