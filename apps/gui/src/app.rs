@@ -79,10 +79,11 @@ impl eframe::App for NereidsApp {
         // Refresh memory telemetry (750ms interval)
         self.memory.refresh(ctx.input(|i| i.time));
 
-        // Keep repainting while background work is in progress (ENDF fetches).
-        // Fitting progress uses a dedicated watcher thread that calls
-        // ctx.request_repaint() directly — more reliable than timers.
-        if self.state.is_fetching_endf
+        // Keep repainting while background work is in progress.
+        // Fitting also has a dedicated watcher thread that pokes via
+        // ctx.request_repaint(), but we keep the timer as a fallback.
+        if self.state.is_fitting
+            || self.state.is_fetching_endf
             || self.state.is_fetching_fm_endf
             || self.state.is_fetching_detect_endf
         {

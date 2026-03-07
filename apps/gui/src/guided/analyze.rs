@@ -1238,6 +1238,27 @@ pub fn run_spatial_map(state: &mut AppState) {
     // when rayon saturates the CPU.
     let ctx = state.egui_ctx.clone();
 
+    // Build a DEDICATED rayon pool for per-pixel fitting.
+    //
+    // spatial_map uses par_iter over pixels, and each pixel's forward-model
+    // evaluation calls broadened_cross_sections / unbroadened_cross_sections
+    // which ALSO use par_iter on the global rayon pool.  If both the outer
+    // pixel loop and the inner physics functions share the global pool, all
+    // pool threads block on inner par_iter tasks that can only run when outer
+    // tasks yield — creating massive contention and effectively deadlocking
+    // the pool (especially with heavy temperature fitting).
+    //
+    // By running the outer pixel loop on a dedicated pool, the inner physics
+    // par_iter calls dispatch to the *global* pool instead.  The two pools
+    // are independent, so there is no nested contention.
+    let n_threads = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(1).max(1))
+        .unwrap_or(1);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(n_threads)
+        .build()
+        .expect("failed to build fitting thread pool");
+
     std::thread::spawn(move || {
         // Watcher thread: poke the GUI every 100ms so the progress bar
         // repaints.  Uses near-zero CPU (sleep + one syscall per wake).
@@ -1259,14 +1280,18 @@ pub fn run_spatial_map(state: &mut AppState) {
             })
         };
 
-        let result = nereids_pipeline::spatial::spatial_map(
-            norm.transmission.view(),
-            norm.uncertainty.view(),
-            &config,
-            dead_pixels.as_ref(),
-            Some(&cancel),
-            Some(&progress),
-        );
+        // Run spatial_map on the dedicated pool so its par_iter doesn't
+        // share the global pool with inner physics par_iter calls.
+        let result = pool.install(|| {
+            nereids_pipeline::spatial::spatial_map(
+                norm.transmission.view(),
+                norm.uncertainty.view(),
+                &config,
+                dead_pixels.as_ref(),
+                Some(&cancel),
+                Some(&progress),
+            )
+        });
 
         // Signal watcher to stop, then send result.
         done_flag.store(true, Ordering::Relaxed);
