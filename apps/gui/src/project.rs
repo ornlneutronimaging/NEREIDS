@@ -355,6 +355,9 @@ pub fn load_project_from_path(state: &mut AppState, path: &Path) {
 
 /// Apply a [`ProjectSnapshot`] to [`AppState`], restoring the full session.
 fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path) {
+    // 0. Cancel any in-flight background tasks (ENDF fetches, fitting, etc.)
+    state.cancel_pending_tasks();
+
     // 1. Clear derived state
     state.spatial_result = None;
     state.pixel_fit_result = None;
@@ -392,8 +395,8 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
     state.input_mode = match (snap.data_type.as_str(), snap.hdf5_path.is_some()) {
         ("events", true) => InputMode::Hdf5Event,
         ("events", false) => InputMode::TiffPair,
-        ("pre_normalized", _) => InputMode::TransmissionTiff,
-        ("transmission", _) => InputMode::TiffPair,
+        ("pre_normalized", _) => InputMode::TiffPair,
+        ("transmission", _) => InputMode::TransmissionTiff,
         _ => InputMode::TiffPair,
     };
 
@@ -415,10 +418,15 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
     let endf_cache: HashMap<String, ResonanceData> = snap.endf_cache.into_iter().collect();
 
     // 8. Restore isotope entries with ENDF cache
-    let n_iso = snap.isotope_z.len();
+    // Use the minimum length across all parallel arrays to avoid panics on corrupted files.
+    let n_iso = snap
+        .isotope_z
+        .len()
+        .min(snap.isotope_a.len())
+        .min(snap.isotope_symbol.len());
     state.isotope_entries = (0..n_iso)
         .map(|i| {
-            let symbol = snap.isotope_symbol.get(i).cloned().unwrap_or_default();
+            let symbol = snap.isotope_symbol[i].clone();
             let rd = endf_cache.get(&symbol).cloned();
             let status = if rd.is_some() {
                 EndfStatus::Loaded
@@ -481,6 +489,7 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
         })
         .collect();
     state.selected_roi = None;
+    state.fitting_rois = state.rois.clone();
 
     // 12. Restore spectrum unit/kind
     state.spectrum_unit = match snap.spectrum_unit.as_str() {
@@ -608,7 +617,10 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
     }
     state.status_message = status;
 
-    // 21. Log provenance
+    // 21. Clear stale wizard session cache
+    state.cached_session = None;
+
+    // 22. Log provenance
     state.log_provenance(
         ProvenanceEventKind::ProjectLoaded,
         format!("Loaded from {}", path.display()),
