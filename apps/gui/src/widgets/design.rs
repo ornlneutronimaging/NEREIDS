@@ -5,12 +5,14 @@
 //! Prototype reference: `.prototypes/D_hybrid_v4.html` CSS §Cards & Forms,
 //! §Tabs, §Badges, §Content Area, §Toolbar, §Drop Zones.
 
-use crate::state::{AppState, EndfStatus, GuidedStep, ResolutionMode};
+use crate::state::{AppState, EndfFetchResult, EndfStatus, GuidedStep, ResolutionMode};
 use crate::theme::{ThemeColors, semantic};
 use egui::{Color32, CornerRadius, Margin, Rect, Response, RichText, Sense, Shadow, Stroke, Ui};
+use nereids_core::types::Isotope;
 use nereids_endf::retrieval::EndfLibrary;
-use nereids_physics::resolution::TabulatedResolution;
-use std::sync::Arc;
+use nereids_physics::resolution::{ResolutionFunction, ResolutionParams, TabulatedResolution};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 
 /// Semi-transparent red used for resonance energy dip markers on spectrum plots.
 /// Values are manually premultiplied: RGBA(180, 80, 80, 50) → (35, 15, 15, 50).
@@ -651,5 +653,70 @@ pub fn teleport_pill(ui: &mut Ui, label: &str, target: GuidedStep, state: &mut A
     if ui.add(btn).clicked() {
         state.status_message = String::new();
         state.guided_step = target;
+    }
+}
+
+// ── Shared Helpers ─────────────────────────────────────────────────
+
+/// Background worker for ENDF data fetching.
+///
+/// Runs inside a `std::thread::spawn` closure — iterates `work` items,
+/// fetches + parses each, and sends results on `tx`. Supports cancellation.
+pub(crate) fn endf_fetch_worker(
+    work: Vec<(usize, Isotope, String, EndfLibrary)>,
+    cancel: Arc<AtomicBool>,
+    tx: mpsc::Sender<EndfFetchResult>,
+) {
+    let retriever = nereids_endf::retrieval::EndfRetriever::new();
+    for (index, isotope, symbol, library) in work {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let Some(mat) = nereids_endf::retrieval::mat_number(&isotope) else {
+            continue;
+        };
+        let result = match retriever.get_endf_file(&isotope, library, mat) {
+            Ok((_path, endf_text)) => match nereids_endf::parser::parse_endf_file2(&endf_text) {
+                Ok(data) => Ok(data),
+                Err(e) => Err(format!("Parse error for {symbol}: {e}")),
+            },
+            Err(e) => Err(format!("Fetch error for {symbol}: {e}")),
+        };
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let _ = tx.send(EndfFetchResult {
+            index,
+            symbol,
+            result,
+        });
+    }
+}
+
+/// Build an `Option<ResolutionFunction>` from the current resolution settings.
+///
+/// Returns `Ok(None)` if resolution is disabled, `Ok(Some(..))` on success,
+/// or `Err(msg)` if parameters are invalid or a file isn't loaded.
+pub(crate) fn build_resolution_function(
+    enabled: bool,
+    mode: &ResolutionMode,
+    flight_path_m: f64,
+) -> Result<Option<ResolutionFunction>, String> {
+    if !enabled {
+        return Ok(None);
+    }
+    match mode {
+        ResolutionMode::Gaussian {
+            delta_t_us,
+            delta_l_m,
+        } => {
+            let params = ResolutionParams::new(flight_path_m, *delta_t_us, *delta_l_m)
+                .map_err(|e| format!("Invalid resolution parameters: {e}"))?;
+            Ok(Some(ResolutionFunction::Gaussian(params)))
+        }
+        ResolutionMode::Tabulated {
+            data: Some(tab), ..
+        } => Ok(Some(ResolutionFunction::Tabulated(Arc::clone(tab)))),
+        ResolutionMode::Tabulated { data: None, .. } => Err("Resolution file not loaded".into()),
     }
 }

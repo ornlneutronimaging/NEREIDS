@@ -1,10 +1,9 @@
 //! Step 2: Configuration — beamline parameters, isotope selection, ENDF fetch.
 
-use crate::state::{AppState, EndfFetchResult, EndfStatus, GuidedStep, PeriodicTableTarget};
+use crate::state::{AppState, EndfStatus, GuidedStep, PeriodicTableTarget};
 use crate::widgets::design::{self, ChipAction, NavAction};
 use nereids_endf::retrieval::EndfLibrary;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 
 /// Draw the Configure step content.
@@ -356,32 +355,5 @@ fn fetch_endf_data(state: &mut AppState) {
     state.status_message = "Fetching ENDF data...".into();
     let cancel = Arc::clone(&state.cancel_token);
 
-    std::thread::spawn(move || {
-        let retriever = nereids_endf::retrieval::EndfRetriever::new();
-        for (index, isotope, symbol, library) in work {
-            if cancel.load(Ordering::Relaxed) {
-                break;
-            }
-            let Some(mat) = retrieval::mat_number(&isotope) else {
-                continue;
-            };
-            let result = match retriever.get_endf_file(&isotope, library, mat) {
-                Ok((_path, endf_text)) => {
-                    match nereids_endf::parser::parse_endf_file2(&endf_text) {
-                        Ok(data) => Ok(data),
-                        Err(e) => Err(format!("Parse error for {}: {}", symbol, e)),
-                    }
-                }
-                Err(e) => Err(format!("Fetch error for {}: {}", symbol, e)),
-            };
-            if cancel.load(Ordering::Relaxed) {
-                break;
-            }
-            let _ = tx.send(EndfFetchResult {
-                index,
-                symbol,
-                result,
-            });
-        }
-    });
+    std::thread::spawn(move || design::endf_fetch_worker(work, cancel, tx));
 }

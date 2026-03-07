@@ -1,15 +1,11 @@
 //! Detectability tool — multi-matrix + trace isotope analysis with resolution broadening,
 //! verdict badges, hero stats, and delta-T spectrum plot.
 
-use crate::state::{
-    AppState, EndfFetchResult, EndfStatus, GuidedStep, PeriodicTableTarget, ResolutionMode,
-};
+use crate::state::{AppState, EndfStatus, GuidedStep, PeriodicTableTarget};
 use crate::widgets::design;
 use egui_plot::{HLine, Line, Plot, PlotPoints};
 use nereids_endf::retrieval::EndfLibrary;
-use nereids_physics::resolution::{ResolutionFunction, ResolutionParams};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 
 /// Fraction of opaque energy bins above which we show a warning.
@@ -608,32 +604,16 @@ fn run_detectability(state: &mut AppState) {
         .collect();
 
     // Build resolution function if enabled
-    let res_fn = if state.detect_resolution_enabled {
-        match &state.detect_resolution_mode {
-            ResolutionMode::Gaussian {
-                delta_t_us,
-                delta_l_m,
-            } => {
-                let fp = state.beamline.flight_path_m;
-                match ResolutionParams::new(fp, *delta_t_us, *delta_l_m) {
-                    Ok(p) => Some(ResolutionFunction::Gaussian(p)),
-                    Err(_) => {
-                        state.status_message =
-                            "Resolution params invalid — broadening disabled".into();
-                        None
-                    }
-                }
-            }
-            ResolutionMode::Tabulated {
-                data: Some(tab), ..
-            } => Some(ResolutionFunction::Tabulated(Arc::clone(tab))),
-            ResolutionMode::Tabulated { data: None, .. } => {
-                state.status_message = "Resolution file not loaded — broadening disabled".into();
-                None
-            }
+    let res_fn = match design::build_resolution_function(
+        state.detect_resolution_enabled,
+        &state.detect_resolution_mode,
+        state.beamline.flight_path_m,
+    ) {
+        Ok(rf) => rf,
+        Err(msg) => {
+            state.status_message = msg;
+            None
         }
-    } else {
-        None
     };
 
     let config = TraceDetectabilityConfig {
@@ -816,32 +796,5 @@ pub(crate) fn detect_fetch_endf_data(state: &mut AppState) {
     state.status_message = "Fetching ENDF data (Detect)...".into();
     let cancel = Arc::clone(&state.cancel_token);
 
-    std::thread::spawn(move || {
-        let retriever = nereids_endf::retrieval::EndfRetriever::new();
-        for (index, isotope, symbol, library) in work {
-            if cancel.load(Ordering::Relaxed) {
-                break;
-            }
-            let Some(mat) = retrieval::mat_number(&isotope) else {
-                continue;
-            };
-            let result = match retriever.get_endf_file(&isotope, library, mat) {
-                Ok((_path, endf_text)) => {
-                    match nereids_endf::parser::parse_endf_file2(&endf_text) {
-                        Ok(data) => Ok(data),
-                        Err(e) => Err(format!("Parse error for {}: {}", symbol, e)),
-                    }
-                }
-                Err(e) => Err(format!("Fetch error for {}: {}", symbol, e)),
-            };
-            if cancel.load(Ordering::Relaxed) {
-                break;
-            }
-            let _ = tx.send(EndfFetchResult {
-                index,
-                symbol,
-                result,
-            });
-        }
-    });
+    std::thread::spawn(move || design::endf_fetch_worker(work, cancel, tx));
 }

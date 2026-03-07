@@ -5,9 +5,7 @@
 //! this redesign shows both side-by-side so the user can click a pixel on the
 //! map and immediately see its spectrum.
 
-use crate::state::{
-    AppState, GuidedStep, InputMode, IsotopeEntry, ResolutionMode, SolverMethod, SpectrumAxis,
-};
+use crate::state::{AppState, GuidedStep, InputMode, IsotopeEntry, SolverMethod, SpectrumAxis};
 use crate::widgets::design::{self, NavAction};
 use crate::widgets::image_view::{
     RoiEditorResult, show_image_with_roi_editor, show_viridis_image, show_viridis_image_with_roi,
@@ -15,7 +13,6 @@ use crate::widgets::image_view::{
 use egui_plot::{Line, Plot, PlotPoints, VLine};
 use ndarray::Axis;
 use nereids_io::spectrum::{SpectrumUnit, SpectrumValueKind};
-use nereids_physics::resolution::{ResolutionFunction, ResolutionParams};
 use nereids_pipeline::pipeline::FitConfig;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -878,29 +875,12 @@ fn build_fit_config(state: &AppState) -> Result<FitConfig, String> {
     let isotope_names: Vec<_> = enabled.iter().map(|e| e.symbol.clone()).collect();
     let initial_densities: Vec<_> = enabled.iter().map(|e| e.initial_density).collect();
 
-    let resolution = if state.resolution_enabled {
-        match &state.resolution_mode {
-            ResolutionMode::Gaussian {
-                delta_t_us,
-                delta_l_m,
-            } => {
-                let params =
-                    ResolutionParams::new(state.beamline.flight_path_m, *delta_t_us, *delta_l_m)
-                        .map_err(|e| format!("Invalid Gaussian resolution parameters: {e}"))?;
-                Some(ResolutionFunction::Gaussian(params))
-            }
-            ResolutionMode::Tabulated {
-                data: Some(tab), ..
-            } => Some(ResolutionFunction::Tabulated(Arc::clone(tab))),
-            ResolutionMode::Tabulated { data: None, .. } => {
-                return Err(
-                    "Tabulated resolution enabled but no file loaded — load a resolution file or disable broadening".into(),
-                );
-            }
-        }
-    } else {
-        None
-    };
+    let resolution = design::build_resolution_function(
+        state.resolution_enabled,
+        &state.resolution_mode,
+        state.beamline.flight_path_m,
+    )
+    .map_err(|e| format!("{e} \u{2014} load a resolution file or disable broadening"))?;
 
     let mut config = FitConfig::new(
         energies,
