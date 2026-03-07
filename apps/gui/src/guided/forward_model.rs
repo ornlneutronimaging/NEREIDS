@@ -66,7 +66,7 @@ pub fn forward_model_step(ui: &mut egui::Ui, state: &mut AppState) {
 /// Build an optional InstrumentParams from the FM resolution state.
 /// Returns `(instrument, warning)` — warning is set if resolution is enabled
 /// but parameters are invalid (e.g., flight path not configured).
-pub(crate) fn fm_instrument(state: &AppState) -> (Option<InstrumentParams>, Option<&'static str>) {
+pub(crate) fn fm_instrument(state: &AppState) -> (Option<InstrumentParams>, Option<String>) {
     match design::build_resolution_function(
         state.fm_resolution_enabled,
         &state.fm_resolution_mode,
@@ -74,10 +74,7 @@ pub(crate) fn fm_instrument(state: &AppState) -> (Option<InstrumentParams>, Opti
     ) {
         Ok(Some(resolution)) => (Some(InstrumentParams { resolution }), None),
         Ok(None) => (None, None),
-        Err(_) => (
-            None,
-            Some("Resolution enabled but parameters invalid \u{2014} broadening disabled"),
-        ),
+        Err(e) => (None, Some(format!("{e} \u{2014} broadening disabled"))),
     }
 }
 
@@ -313,7 +310,7 @@ pub(crate) fn fm_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
     if state.fm_spectrum.is_none() {
         let (instrument, res_warning) = fm_instrument(state);
         if let Some(msg) = res_warning {
-            state.status_message = msg.into();
+            state.status_message = msg;
         }
         let isotopes: Vec<_> = enabled
             .iter()

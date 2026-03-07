@@ -717,8 +717,6 @@ pub(crate) fn build_resolution_function(
         ResolutionMode::Tabulated {
             data: Some(tab), ..
         } => Ok(Some(ResolutionFunction::Tabulated(Arc::clone(tab)))),
-        ResolutionMode::Tabulated { data: None, .. } => {
-            Err("Resolution file not loaded \u{2014} broadening disabled".into())
-        }
+        ResolutionMode::Tabulated { data: None, .. } => Err("Resolution file not loaded".into()),
     }
 }

@@ -879,7 +879,8 @@ fn build_fit_config(state: &AppState) -> Result<FitConfig, String> {
         state.resolution_enabled,
         &state.resolution_mode,
         state.beamline.flight_path_m,
-    )?;
+    )
+    .map_err(|e| format!("{e} \u{2014} load a resolution file or disable broadening"))?;
 
     let mut config = FitConfig::new(
         energies,
