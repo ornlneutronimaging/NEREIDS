@@ -481,9 +481,12 @@ fn write_chunked_3d(
         return Ok(());
     }
     let contiguous = arr.as_standard_layout();
-    let slice = contiguous
-        .as_slice()
-        .expect("as_standard_layout guarantees contiguous memory");
+    let slice = contiguous.as_slice().ok_or_else(|| {
+        hdf5_err(
+            &format!("{path_prefix}/{name}"),
+            "array is not contiguous after as_standard_layout",
+        )
+    })?;
     group
         .new_dataset::<f64>()
         .shape(shape)
@@ -1861,6 +1864,77 @@ mod tests {
         assert!(
             data.group("embedded").is_err(),
             "Linked-mode file should not have /data/embedded group"
+        );
+    }
+
+    #[test]
+    fn test_embedded_missing_group_errors() {
+        // Save a linked-mode file, then patch data_mode to "embedded" and
+        // verify that loading returns an error (missing /data/embedded group).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing_embedded.nrd.h5");
+        let snap = minimal_snapshot();
+        save_project(&path, &snap).unwrap();
+
+        // Overwrite /data/mode attribute to "embedded" without adding an embedded group
+        {
+            let file = hdf5::File::open_rw(&path).unwrap();
+            let data = file.group("data").unwrap();
+            // Delete existing mode attribute, then recreate as "embedded"
+            data.delete_attr("mode").unwrap();
+            let val: hdf5::types::VarLenUnicode = "embedded".parse().unwrap();
+            data.new_attr::<hdf5::types::VarLenUnicode>()
+                .shape(())
+                .create("mode")
+                .and_then(|a| a.write_scalar(&val))
+                .unwrap();
+        }
+
+        let err = load_project(&path);
+        assert!(err.is_err(), "Should error when embedded group is missing");
+        let msg = format!("{}", err.unwrap_err());
+        assert!(
+            msg.contains("embedded"),
+            "Error should mention 'embedded': {msg}"
+        );
+    }
+
+    #[test]
+    fn test_embedded_wrong_dimensionality_errors() {
+        // Save a valid embedded file, then replace sample with a 1D dataset.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wrong_dim.nrd.h5");
+        let sample = Array3::from_elem((2, 3, 4), 1.0);
+        let spectrum = vec![1.0, 2.0];
+        let mut snap = minimal_snapshot();
+        snap.data_mode = "embedded".into();
+        let emb = EmbeddedData {
+            sample: Some(&sample),
+            open_beam: None,
+            spectrum: Some(&spectrum),
+        };
+        save_project_with_data(&path, &snap, Some(&emb)).unwrap();
+
+        // Replace /data/embedded/sample with a 1D dataset
+        {
+            let file = hdf5::File::open_rw(&path).unwrap();
+            let embedded = file.group("data/embedded").unwrap();
+            let _ = embedded.unlink("sample");
+            embedded
+                .new_dataset::<f64>()
+                .shape([24])
+                .create("sample")
+                .unwrap()
+                .write_raw(&[0.0_f64; 24])
+                .unwrap();
+        }
+
+        let err = load_project(&path);
+        assert!(err.is_err(), "Should error on non-3D sample dataset");
+        let msg = format!("{}", err.unwrap_err());
+        assert!(
+            msg.contains("expected 3D"),
+            "Error should mention dimensionality: {msg}"
         );
     }
 }
