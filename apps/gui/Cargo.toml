@@ -24,4 +24,5 @@ rfd = { workspace = true }
 ndarray = { workspace = true }
 image = { workspace = true }
 serde = { workspace = true }
+rayon = { workspace = true }
 sysinfo = "0.33"

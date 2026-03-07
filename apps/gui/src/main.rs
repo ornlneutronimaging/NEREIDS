@@ -13,6 +13,17 @@ mod theme;
 mod widgets;
 
 fn main() -> eframe::Result {
+    // Reserve one CPU core for the GUI thread.  Without this, rayon's global
+    // pool uses all cores during spatial mapping, starving the main thread
+    // and freezing the progress bar.
+    let n_threads = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(1).max(1))
+        .unwrap_or(1);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(n_threads)
+        .build_global()
+        .ok(); // harmless if already initialised
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
