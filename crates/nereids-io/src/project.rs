@@ -443,49 +443,11 @@ fn write_embedded_data(data_group: &hdf5::Group, emb: &EmbeddedData<'_>) -> Resu
         .map_err(|e| hdf5_err("create /data/embedded", e))?;
 
     if let Some(sample) = emb.sample {
-        let shape = [sample.shape()[0], sample.shape()[1], sample.shape()[2]];
-        let write_result = if let Some(slice) = sample.as_slice() {
-            embedded
-                .new_dataset::<f64>()
-                .shape(shape)
-                .chunk(chunk_shape_3d(shape))
-                .deflate(4)
-                .create("sample")
-                .and_then(|ds| ds.write_raw(slice))
-        } else {
-            let flat: Vec<f64> = sample.iter().copied().collect();
-            embedded
-                .new_dataset::<f64>()
-                .shape(shape)
-                .chunk(chunk_shape_3d(shape))
-                .deflate(4)
-                .create("sample")
-                .and_then(|ds| ds.write_raw(&flat))
-        };
-        write_result.map_err(|e| hdf5_err("/data/embedded/sample", e))?;
+        write_embedded_3d(&embedded, "sample", sample)?;
     }
 
     if let Some(ob) = emb.open_beam {
-        let shape = [ob.shape()[0], ob.shape()[1], ob.shape()[2]];
-        let write_result = if let Some(slice) = ob.as_slice() {
-            embedded
-                .new_dataset::<f64>()
-                .shape(shape)
-                .chunk(chunk_shape_3d(shape))
-                .deflate(4)
-                .create("open_beam")
-                .and_then(|ds| ds.write_raw(slice))
-        } else {
-            let flat: Vec<f64> = ob.iter().copied().collect();
-            embedded
-                .new_dataset::<f64>()
-                .shape(shape)
-                .chunk(chunk_shape_3d(shape))
-                .deflate(4)
-                .create("open_beam")
-                .and_then(|ds| ds.write_raw(&flat))
-        };
-        write_result.map_err(|e| hdf5_err("/data/embedded/open_beam", e))?;
+        write_embedded_3d(&embedded, "open_beam", ob)?;
     }
 
     if let Some(spectrum) = emb.spectrum {
@@ -498,6 +460,28 @@ fn write_embedded_data(data_group: &hdf5::Group, emb: &EmbeddedData<'_>) -> Resu
             .map_err(|e| hdf5_err("/data/embedded/spectrum", e))?;
     }
 
+    Ok(())
+}
+
+/// Write a 3D f64 array as a chunked, gzip-compressed dataset.
+///
+/// Uses `as_standard_layout()` to get a contiguous view without allocating
+/// when the array is already in standard (row-major) layout. Only copies
+/// if the array has non-standard strides.
+fn write_embedded_3d(group: &hdf5::Group, name: &str, arr: &Array3<f64>) -> Result<(), IoError> {
+    let shape = [arr.shape()[0], arr.shape()[1], arr.shape()[2]];
+    let contiguous = arr.as_standard_layout();
+    let slice = contiguous
+        .as_slice()
+        .expect("as_standard_layout guarantees contiguous memory");
+    group
+        .new_dataset::<f64>()
+        .shape(shape)
+        .chunk(chunk_shape_3d(shape))
+        .deflate(4)
+        .create(name)
+        .and_then(|ds| ds.write_raw(slice))
+        .map_err(|e| hdf5_err(&format!("/data/embedded/{name}"), e))?;
     Ok(())
 }
 
@@ -743,8 +727,9 @@ fn write_provenance(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoE
 /// Pick a reasonable chunk shape for a 3D dataset.
 fn chunk_shape_3d(shape: [usize; 3]) -> [usize; 3] {
     // One full frame per chunk, capped at 256 frames.
-    let frames = shape[0].min(256);
-    [frames, shape[1], shape[2]]
+    // Guard zero dimensions — HDF5 rejects zero-sized chunks.
+    let frames = shape[0].clamp(1, 256);
+    [frames, shape[1].max(1), shape[2].max(1)]
 }
 
 // ---------------------------------------------------------------------------
@@ -956,35 +941,42 @@ fn read_data_links(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), 
 }
 
 fn read_embedded_data(data_group: &hdf5::Group, snap: &mut ProjectSnapshot) -> Result<(), IoError> {
-    let embedded = match data_group.group("embedded") {
-        Ok(g) => g,
-        Err(_) => return Ok(()), // no embedded group
-    };
+    let embedded = data_group
+        .group("embedded")
+        .map_err(|e| hdf5_err("open /data/embedded (file claims embedded mode)", e))?;
 
     if let Ok(ds) = embedded.dataset("sample") {
         let shape = ds.shape();
-        if shape.len() == 3 {
-            let data: Vec<f64> = ds
-                .read_raw()
-                .map_err(|e| hdf5_err("/data/embedded/sample", e))?;
-            snap.sample_data = Some(
-                Array3::from_shape_vec((shape[0], shape[1], shape[2]), data)
-                    .map_err(|e| hdf5_err("/data/embedded/sample reshape", e))?,
-            );
+        if shape.len() != 3 {
+            return Err(hdf5_err(
+                "/data/embedded/sample",
+                format!("expected 3D, got {}D", shape.len()),
+            ));
         }
+        let data: Vec<f64> = ds
+            .read_raw()
+            .map_err(|e| hdf5_err("/data/embedded/sample", e))?;
+        snap.sample_data = Some(
+            Array3::from_shape_vec((shape[0], shape[1], shape[2]), data)
+                .map_err(|e| hdf5_err("/data/embedded/sample reshape", e))?,
+        );
     }
 
     if let Ok(ds) = embedded.dataset("open_beam") {
         let shape = ds.shape();
-        if shape.len() == 3 {
-            let data: Vec<f64> = ds
-                .read_raw()
-                .map_err(|e| hdf5_err("/data/embedded/open_beam", e))?;
-            snap.open_beam_data = Some(
-                Array3::from_shape_vec((shape[0], shape[1], shape[2]), data)
-                    .map_err(|e| hdf5_err("/data/embedded/open_beam reshape", e))?,
-            );
+        if shape.len() != 3 {
+            return Err(hdf5_err(
+                "/data/embedded/open_beam",
+                format!("expected 3D, got {}D", shape.len()),
+            ));
         }
+        let data: Vec<f64> = ds
+            .read_raw()
+            .map_err(|e| hdf5_err("/data/embedded/open_beam", e))?;
+        snap.open_beam_data = Some(
+            Array3::from_shape_vec((shape[0], shape[1], shape[2]), data)
+                .map_err(|e| hdf5_err("/data/embedded/open_beam reshape", e))?,
+        );
     }
 
     if let Ok(ds) = embedded.dataset("spectrum") {
