@@ -895,6 +895,7 @@ fn dock_provenance(ui: &mut egui::Ui, state: &AppState) {
                 crate::state::ProvenanceEventKind::Normalized => crate::theme::semantic::GREEN,
                 crate::state::ProvenanceEventKind::AnalysisRun => crate::theme::semantic::ORANGE,
                 crate::state::ProvenanceEventKind::Exported => crate::theme::semantic::GREEN,
+                crate::state::ProvenanceEventKind::ProjectSaved => crate::theme::semantic::GREEN,
             };
             ui.label(
                 egui::RichText::new(format!("{:?}", event.kind))

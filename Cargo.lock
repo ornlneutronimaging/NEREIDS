@@ -2803,7 +2803,6 @@ name = "nereids-core"
 version = "0.1.0"
 dependencies = [
  "endf-mat",
- "ndarray",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -2818,7 +2817,6 @@ dependencies = [
  "nereids-core",
  "reqwest",
  "serde",
- "serde_json",
  "thiserror 2.0.18",
  "zip",
 ]
@@ -2827,7 +2825,6 @@ dependencies = [
 name = "nereids-fitting"
 version = "0.1.0"
 dependencies = [
- "ndarray",
  "nereids-core",
  "nereids-endf",
  "nereids-physics",
@@ -2849,6 +2846,7 @@ dependencies = [
  "nereids-io",
  "nereids-physics",
  "nereids-pipeline",
+ "rayon",
  "rfd",
  "serde",
  "sysinfo",
@@ -2861,6 +2859,8 @@ dependencies = [
  "hdf5-metno",
  "ndarray",
  "nereids-core",
+ "nereids-endf",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tiff 0.11.3",
@@ -2870,7 +2870,6 @@ dependencies = [
 name = "nereids-physics"
 version = "0.1.0"
 dependencies = [
- "ndarray",
  "nereids-core",
  "nereids-endf",
  "num-complex",
@@ -2885,7 +2884,6 @@ dependencies = [
  "nereids-core",
  "nereids-endf",
  "nereids-fitting",
- "nereids-io",
  "nereids-physics",
  "rayon",
  "thiserror 2.0.18",

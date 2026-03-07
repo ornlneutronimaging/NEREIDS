@@ -6,6 +6,7 @@
 mod app;
 mod guided;
 mod pipeline;
+mod project;
 mod state;
 mod studio;
 mod telemetry;

@@ -90,6 +90,15 @@ impl eframe::App for NereidsApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
+        // Cmd+S / Ctrl+S — save project
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S)) {
+            let has_results =
+                self.state.spatial_result.is_some() || self.state.last_fit_feedback.is_some();
+            if has_results {
+                crate::project::save_project_quick(&mut self.state);
+            }
+        }
+
         // Top toolbar
         widgets::toolbar::toolbar(ctx, &mut self.state);
 
