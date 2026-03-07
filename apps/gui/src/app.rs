@@ -122,6 +122,17 @@ impl eframe::App for NereidsApp {
 
 /// Poll background task channels and apply results to state.
 fn poll_pending_tasks(state: &mut AppState) {
+    // Update fitting progress from the atomic counter BEFORE checking task
+    // completion.  The old order (check → clear → poll) meant the counter's
+    // final value was never read — the progress bar jumped from its last
+    // polled value straight to "complete".
+    if let Some(ref counter) = state.fitting_progress_counter {
+        let done = counter.load(std::sync::atomic::Ordering::Relaxed);
+        if let Some((_, total)) = state.fitting_progress {
+            state.fitting_progress = Some((done, total));
+        }
+    }
+
     // Poll spatial map result
     if let Some(ref rx) = state.pending_spatial {
         match rx.try_recv() {
@@ -162,15 +173,6 @@ fn poll_pending_tasks(state: &mut AppState) {
                 state.pending_spatial = None;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {} // Still running
-        }
-    }
-
-    // Update fitting progress from the atomic counter (runs every frame,
-    // not just when Analyze is visible, so toolbar always shows fresh data).
-    if let Some(ref counter) = state.fitting_progress_counter {
-        let done = counter.load(std::sync::atomic::Ordering::Relaxed);
-        if let Some((_, total)) = state.fitting_progress {
-            state.fitting_progress = Some((done, total));
         }
     }
 
