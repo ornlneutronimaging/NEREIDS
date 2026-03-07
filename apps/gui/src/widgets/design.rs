@@ -819,7 +819,7 @@ pub(crate) fn build_spectrum_x_axis(
 /// Draw resonance energy dip markers on a spectrum plot (energy axis only).
 ///
 /// Iterates all enabled isotope entries with resonance data and draws a `VLine`
-/// for each resonance within the visible x-axis range.
+/// for each resonance within the data x-range.
 pub(crate) fn draw_resonance_dips(
     plot_ui: &mut egui_plot::PlotUi,
     entries: &[IsotopeEntry],
@@ -844,7 +844,7 @@ pub(crate) fn draw_resonance_dips(
                 for res in &lg.resonances {
                     if res.energy >= x_min && res.energy <= x_max {
                         plot_ui.vline(
-                            VLine::new(format!("{} {:.1}eV", entry.symbol, res.energy), res.energy)
+                            VLine::new("", res.energy)
                                 .color(RESONANCE_DIP_COLOR)
                                 .width(0.5),
                         );
@@ -892,7 +892,7 @@ pub(crate) fn build_fit_line(
 
     use nereids_fitting::lm::FitModel;
     let fitted_t = model.evaluate(&result.densities);
-    let n_fit = n_plot.min(fitted_t.len());
+    let n_fit = n_plot.min(fitted_t.len()).min(x_values.len());
     let fit_points: PlotPoints = (0..n_fit)
         .filter(|&i| x_values[i].is_finite())
         .map(|i| [x_values[i], fitted_t[i]])
