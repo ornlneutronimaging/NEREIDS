@@ -9,4 +9,3 @@ license.workspace = true
 nereids-core = { workspace = true }
 nereids-endf = { workspace = true }
 nereids-physics = { workspace = true }
-ndarray = { workspace = true }

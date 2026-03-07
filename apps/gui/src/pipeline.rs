@@ -87,8 +87,8 @@ pub fn run_pipeline(state: &mut AppState, from_step: GuidedStep) -> Result<(), S
 /// In a re-run scenario the data has already been loaded from disk, so we
 /// just need to apply the rebinning again.
 fn run_rebin(_state: &mut AppState) {
-    // TODO(#235): Re-running rebin requires reloading original data first,
-    // then re-applying the factor.  Currently a no-op — the pipeline falls
+    // Re-running rebin requires reloading original data first, then
+    // re-applying the factor.  Currently a no-op — the pipeline falls
     // through to Normalize/Analyze which use whatever data is loaded.
 }
 
