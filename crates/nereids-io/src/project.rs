@@ -443,11 +443,11 @@ fn write_embedded_data(data_group: &hdf5::Group, emb: &EmbeddedData<'_>) -> Resu
         .map_err(|e| hdf5_err("create /data/embedded", e))?;
 
     if let Some(sample) = emb.sample {
-        write_embedded_3d(&embedded, "sample", sample)?;
+        write_chunked_3d(&embedded, "sample", sample, "/data/embedded")?;
     }
 
     if let Some(ob) = emb.open_beam {
-        write_embedded_3d(&embedded, "open_beam", ob)?;
+        write_chunked_3d(&embedded, "open_beam", ob, "/data/embedded")?;
     }
 
     if let Some(spectrum) = emb.spectrum {
@@ -468,8 +468,18 @@ fn write_embedded_data(data_group: &hdf5::Group, emb: &EmbeddedData<'_>) -> Resu
 /// Uses `as_standard_layout()` to get a contiguous view without allocating
 /// when the array is already in standard (row-major) layout. Only copies
 /// if the array has non-standard strides.
-fn write_embedded_3d(group: &hdf5::Group, name: &str, arr: &Array3<f64>) -> Result<(), IoError> {
+///
+/// Zero-dimension arrays are silently skipped (nothing to write).
+fn write_chunked_3d(
+    group: &hdf5::Group,
+    name: &str,
+    arr: &Array3<f64>,
+    path_prefix: &str,
+) -> Result<(), IoError> {
     let shape = [arr.shape()[0], arr.shape()[1], arr.shape()[2]];
+    if shape.contains(&0) {
+        return Ok(());
+    }
     let contiguous = arr.as_standard_layout();
     let slice = contiguous
         .as_slice()
@@ -481,7 +491,7 @@ fn write_embedded_3d(group: &hdf5::Group, name: &str, arr: &Array3<f64>) -> Resu
         .deflate(4)
         .create(name)
         .and_then(|ds| ds.write_raw(slice))
-        .map_err(|e| hdf5_err(&format!("/data/embedded/{name}"), e))?;
+        .map_err(|e| hdf5_err(&format!("{path_prefix}/{name}"), e))?;
     Ok(())
 }
 
@@ -491,26 +501,7 @@ fn write_intermediate(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), I
         .map_err(|e| hdf5_err("create /intermediate", e))?;
 
     if let Some(ref norm) = snap.normalized {
-        let shape = [norm.shape()[0], norm.shape()[1], norm.shape()[2]];
-        let write_result = if let Some(slice) = norm.as_slice() {
-            inter
-                .new_dataset::<f64>()
-                .shape(shape)
-                .chunk(chunk_shape_3d(shape))
-                .deflate(4)
-                .create("normalized")
-                .and_then(|ds| ds.write_raw(slice))
-        } else {
-            let data: Vec<f64> = norm.iter().copied().collect();
-            inter
-                .new_dataset::<f64>()
-                .shape(shape)
-                .chunk(chunk_shape_3d(shape))
-                .deflate(4)
-                .create("normalized")
-                .and_then(|ds| ds.write_raw(&data))
-        };
-        write_result.map_err(|e| hdf5_err("/intermediate/normalized", e))?;
+        write_chunked_3d(&inter, "normalized", norm, "/intermediate")?;
     }
 
     if let Some(ref energies) = snap.energies {
