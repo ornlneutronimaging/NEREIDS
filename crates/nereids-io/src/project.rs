@@ -68,8 +68,8 @@ pub struct ProjectSnapshot {
     // -- config/endf --
     pub endf_library: String,
 
-    // -- data (linked mode) --
-    /// "linked" (embed mode is a separate issue)
+    // -- data --
+    /// "linked" | "embedded"
     pub data_mode: String,
     pub sample_path: Option<String>,
     pub open_beam_path: Option<String>,
@@ -81,6 +81,11 @@ pub struct ProjectSnapshot {
     pub spectrum_kind: String,
     pub rebin_factor: u32,
     pub rebin_applied: bool,
+
+    // -- data (embedded mode, populated on load) --
+    pub sample_data: Option<Array3<f64>>,
+    pub open_beam_data: Option<Array3<f64>>,
+    pub spectrum_values: Option<Vec<f64>>,
 
     // -- intermediate (always embedded) --
     pub normalized: Option<Array3<f64>>,
@@ -142,6 +147,9 @@ impl Default for ProjectSnapshot {
             spectrum_kind: String::new(),
             rebin_factor: 0,
             rebin_applied: false,
+            sample_data: None,
+            open_beam_data: None,
+            spectrum_values: None,
             normalized: None,
             energies: None,
             density_maps: None,
@@ -158,13 +166,59 @@ impl Default for ProjectSnapshot {
     }
 }
 
-/// Write a project snapshot to an HDF5 file at `path`.
+/// Borrowed references to raw data for embedded saves.
+///
+/// Avoids cloning multi-GB arrays into [`ProjectSnapshot`].
+/// Pass `None` for linked-mode saves.
+pub struct EmbeddedData<'a> {
+    pub sample: Option<&'a Array3<f64>>,
+    pub open_beam: Option<&'a Array3<f64>>,
+    pub spectrum: Option<&'a [f64]>,
+}
+
+/// Estimated compression ratio for gzip-4 on float64 neutron data.
+const EMBED_COMPRESSION_RATIO: f64 = 3.0;
+
+/// Estimate (uncompressed, compressed) byte sizes for embedding raw data.
+pub fn estimate_embedded_size(
+    sample: Option<&Array3<f64>>,
+    open_beam: Option<&Array3<f64>>,
+    spectrum: Option<&[f64]>,
+) -> (u64, u64) {
+    let mut raw: u64 = 0;
+    if let Some(s) = sample {
+        raw += (s.len() as u64) * 8;
+    }
+    if let Some(ob) = open_beam {
+        raw += (ob.len() as u64) * 8;
+    }
+    if let Some(sp) = spectrum {
+        raw += (sp.len() as u64) * 8;
+    }
+    let compressed = (raw as f64 / EMBED_COMPRESSION_RATIO) as u64;
+    (raw, compressed)
+}
+
+/// Write a project snapshot to an HDF5 file at `path` (linked mode).
 pub fn save_project(path: &Path, snap: &ProjectSnapshot) -> Result<(), IoError> {
+    save_project_with_data(path, snap, None)
+}
+
+/// Write a project snapshot with optional embedded raw data.
+///
+/// When `embedded` is `Some`, raw data arrays are written to `/data/embedded/`
+/// and the mode attribute is set to `"embedded"`. File paths in `/data/links/`
+/// are always written for provenance.
+pub fn save_project_with_data(
+    path: &Path,
+    snap: &ProjectSnapshot,
+    embedded: Option<&EmbeddedData<'_>>,
+) -> Result<(), IoError> {
     let file = hdf5::File::create(path).map_err(|e| IoError::Hdf5Error(format!("create: {e}")))?;
 
     write_meta(&file, snap)?;
     write_config(&file, snap)?;
-    write_data_links(&file, snap)?;
+    write_data_links(&file, snap, embedded)?;
     write_intermediate(&file, snap)?;
     write_results(&file, snap)?;
     write_endf_cache(&file, snap)?;
@@ -338,16 +392,27 @@ fn write_config(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoError
     Ok(())
 }
 
-fn write_data_links(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoError> {
+fn write_data_links(
+    file: &hdf5::File,
+    snap: &ProjectSnapshot,
+    embedded: Option<&EmbeddedData<'_>>,
+) -> Result<(), IoError> {
     let data = file
         .create_group("data")
         .map_err(|e| hdf5_err("create /data", e))?;
-    write_str_attr(&data, "mode", &snap.data_mode)?;
+
+    let mode = if embedded.is_some() {
+        "embedded"
+    } else {
+        &snap.data_mode
+    };
+    write_str_attr(&data, "mode", mode)?;
     write_str_attr(&data, "spectrum_unit", &snap.spectrum_unit)?;
     write_str_attr(&data, "spectrum_kind", &snap.spectrum_kind)?;
     write_u32_attr(&data, "rebin_factor", snap.rebin_factor)?;
     write_bool_attr(&data, "rebin_applied", snap.rebin_applied)?;
 
+    // Always write links for provenance (original file paths)
     let links = data
         .create_group("links")
         .map_err(|e| hdf5_err("create /data/links", e))?;
@@ -362,6 +427,75 @@ fn write_data_links(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoE
     }
     if let Some(ref p) = snap.hdf5_path {
         write_str_attr(&links, "hdf5_path", p)?;
+    }
+
+    // Write embedded data if present
+    if let Some(emb) = embedded {
+        write_embedded_data(&data, emb)?;
+    }
+
+    Ok(())
+}
+
+fn write_embedded_data(data_group: &hdf5::Group, emb: &EmbeddedData<'_>) -> Result<(), IoError> {
+    let embedded = data_group
+        .create_group("embedded")
+        .map_err(|e| hdf5_err("create /data/embedded", e))?;
+
+    if let Some(sample) = emb.sample {
+        let shape = [sample.shape()[0], sample.shape()[1], sample.shape()[2]];
+        let write_result = if let Some(slice) = sample.as_slice() {
+            embedded
+                .new_dataset::<f64>()
+                .shape(shape)
+                .chunk(chunk_shape_3d(shape))
+                .deflate(4)
+                .create("sample")
+                .and_then(|ds| ds.write_raw(slice))
+        } else {
+            let flat: Vec<f64> = sample.iter().copied().collect();
+            embedded
+                .new_dataset::<f64>()
+                .shape(shape)
+                .chunk(chunk_shape_3d(shape))
+                .deflate(4)
+                .create("sample")
+                .and_then(|ds| ds.write_raw(&flat))
+        };
+        write_result.map_err(|e| hdf5_err("/data/embedded/sample", e))?;
+    }
+
+    if let Some(ob) = emb.open_beam {
+        let shape = [ob.shape()[0], ob.shape()[1], ob.shape()[2]];
+        let write_result = if let Some(slice) = ob.as_slice() {
+            embedded
+                .new_dataset::<f64>()
+                .shape(shape)
+                .chunk(chunk_shape_3d(shape))
+                .deflate(4)
+                .create("open_beam")
+                .and_then(|ds| ds.write_raw(slice))
+        } else {
+            let flat: Vec<f64> = ob.iter().copied().collect();
+            embedded
+                .new_dataset::<f64>()
+                .shape(shape)
+                .chunk(chunk_shape_3d(shape))
+                .deflate(4)
+                .create("open_beam")
+                .and_then(|ds| ds.write_raw(&flat))
+        };
+        write_result.map_err(|e| hdf5_err("/data/embedded/open_beam", e))?;
+    }
+
+    if let Some(spectrum) = emb.spectrum {
+        embedded
+            .new_dataset::<f64>()
+            .shape([spectrum.len()])
+            .deflate(4)
+            .create("spectrum")
+            .and_then(|ds| ds.write_raw(spectrum))
+            .map_err(|e| hdf5_err("/data/embedded/spectrum", e))?;
     }
 
     Ok(())
@@ -813,6 +947,53 @@ fn read_data_links(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), 
     snap.spectrum_path = read_str_attr_opt(&links, "spectrum_path");
     snap.hdf5_path = read_str_attr_opt(&links, "hdf5_path");
 
+    // Read embedded data if mode is "embedded"
+    if snap.data_mode == "embedded" {
+        read_embedded_data(&data, snap)?;
+    }
+
+    Ok(())
+}
+
+fn read_embedded_data(data_group: &hdf5::Group, snap: &mut ProjectSnapshot) -> Result<(), IoError> {
+    let embedded = match data_group.group("embedded") {
+        Ok(g) => g,
+        Err(_) => return Ok(()), // no embedded group
+    };
+
+    if let Ok(ds) = embedded.dataset("sample") {
+        let shape = ds.shape();
+        if shape.len() == 3 {
+            let data: Vec<f64> = ds
+                .read_raw()
+                .map_err(|e| hdf5_err("/data/embedded/sample", e))?;
+            snap.sample_data = Some(
+                Array3::from_shape_vec((shape[0], shape[1], shape[2]), data)
+                    .map_err(|e| hdf5_err("/data/embedded/sample reshape", e))?,
+            );
+        }
+    }
+
+    if let Ok(ds) = embedded.dataset("open_beam") {
+        let shape = ds.shape();
+        if shape.len() == 3 {
+            let data: Vec<f64> = ds
+                .read_raw()
+                .map_err(|e| hdf5_err("/data/embedded/open_beam", e))?;
+            snap.open_beam_data = Some(
+                Array3::from_shape_vec((shape[0], shape[1], shape[2]), data)
+                    .map_err(|e| hdf5_err("/data/embedded/open_beam reshape", e))?,
+            );
+        }
+    }
+
+    if let Ok(ds) = embedded.dataset("spectrum") {
+        let data: Vec<f64> = ds
+            .read_raw()
+            .map_err(|e| hdf5_err("/data/embedded/spectrum", e))?;
+        snap.spectrum_values = Some(data);
+    }
+
     Ok(())
 }
 
@@ -1113,6 +1294,9 @@ mod tests {
             spectrum_kind: "bin_edges".into(),
             rebin_factor: 1,
             rebin_applied: false,
+            sample_data: None,
+            open_beam_data: None,
+            spectrum_values: None,
             normalized: None,
             energies: None,
             density_maps: None,
@@ -1578,5 +1762,122 @@ mod tests {
         assert!(loaded.isotope_symbol.is_empty());
         assert!(loaded.isotope_density.is_empty());
         assert!(loaded.isotope_enabled.is_empty());
+    }
+
+    // -- embedded mode tests --
+
+    #[test]
+    fn test_roundtrip_embedded_sample_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("embed_sample.nrd.h5");
+        let snap = minimal_snapshot();
+        let sample = Array3::from_shape_fn((5, 3, 4), |(t, y, x)| (t * 12 + y * 4 + x) as f64);
+        let spectrum = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let emb = EmbeddedData {
+            sample: Some(&sample),
+            open_beam: None,
+            spectrum: Some(&spectrum),
+        };
+        save_project_with_data(&path, &snap, Some(&emb)).unwrap();
+        let loaded = load_project(&path).unwrap();
+
+        assert_eq!(loaded.data_mode, "embedded");
+        let loaded_sample = loaded.sample_data.unwrap();
+        assert_eq!(loaded_sample.shape(), [5, 3, 4]);
+        assert_eq!(loaded_sample, sample);
+        assert!(loaded.open_beam_data.is_none());
+        assert_eq!(loaded.spectrum_values.unwrap(), spectrum);
+    }
+
+    #[test]
+    fn test_roundtrip_embedded_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("embed_full.nrd.h5");
+        let snap = minimal_snapshot();
+        let sample = Array3::from_shape_fn((4, 2, 3), |(t, y, x)| (t * 6 + y * 3 + x) as f64 + 0.5);
+        let ob = Array3::from_shape_fn((4, 2, 3), |(t, y, x)| (t * 6 + y * 3 + x) as f64 * 2.0);
+        let spectrum = vec![10.0, 20.0, 30.0, 40.0, 50.0];
+        let emb = EmbeddedData {
+            sample: Some(&sample),
+            open_beam: Some(&ob),
+            spectrum: Some(&spectrum),
+        };
+        save_project_with_data(&path, &snap, Some(&emb)).unwrap();
+        let loaded = load_project(&path).unwrap();
+
+        assert_eq!(loaded.data_mode, "embedded");
+        assert_eq!(loaded.sample_data.unwrap(), sample);
+        assert_eq!(loaded.open_beam_data.unwrap(), ob);
+        assert_eq!(loaded.spectrum_values.unwrap(), spectrum);
+    }
+
+    #[test]
+    fn test_roundtrip_embedded_preserves_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("embed_links.nrd.h5");
+        let snap = minimal_snapshot();
+        let sample = Array3::from_elem((2, 2, 2), 1.0);
+        let emb = EmbeddedData {
+            sample: Some(&sample),
+            open_beam: None,
+            spectrum: None,
+        };
+        save_project_with_data(&path, &snap, Some(&emb)).unwrap();
+        let loaded = load_project(&path).unwrap();
+
+        // Links should still be present from the snapshot
+        assert_eq!(loaded.sample_path, Some("/data/sample".into()));
+        assert_eq!(loaded.open_beam_path, Some("/data/ob".into()));
+        assert_eq!(loaded.spectrum_path, Some("/data/spectrum.txt".into()));
+    }
+
+    #[test]
+    fn test_embedded_file_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("embed_size.nrd.h5");
+        let snap = minimal_snapshot();
+        // 100 frames × 10 × 10 = 10,000 f64 values = 80 KB raw
+        let sample = Array3::from_elem((100, 10, 10), 42.0);
+        let emb = EmbeddedData {
+            sample: Some(&sample),
+            open_beam: None,
+            spectrum: None,
+        };
+        save_project_with_data(&path, &snap, Some(&emb)).unwrap();
+        let file_size = std::fs::metadata(&path).unwrap().len();
+        let raw_size = 100 * 10 * 10 * 8; // 80,000 bytes
+        // Compressed file should be smaller than raw data (gzip on uniform data)
+        assert!(
+            file_size < raw_size,
+            "File size {file_size} should be < raw {raw_size}"
+        );
+    }
+
+    #[test]
+    fn test_estimate_embedded_size() {
+        let sample = Array3::from_elem((10, 5, 4), 1.0); // 200 elements
+        let ob = Array3::from_elem((10, 5, 4), 2.0); // 200 elements
+        let spectrum = vec![1.0; 11]; // 11 elements
+        let (raw, compressed) = estimate_embedded_size(Some(&sample), Some(&ob), Some(&spectrum));
+        // 200 + 200 + 11 = 411 f64 values × 8 bytes = 3288 bytes
+        assert_eq!(raw, 411 * 8);
+        assert!(compressed < raw);
+        assert!(compressed > 0);
+    }
+
+    #[test]
+    fn test_linked_mode_no_embedded_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("linked_no_embed.nrd.h5");
+        let snap = minimal_snapshot();
+        save_project(&path, &snap).unwrap(); // linked mode, no embedded data
+
+        // Verify /data/embedded group does NOT exist
+        let file = hdf5::File::open(&path).unwrap();
+        let data = file.group("data").unwrap();
+        assert!(
+            data.group("embedded").is_err(),
+            "Linked-mode file should not have /data/embedded group"
+        );
     }
 }

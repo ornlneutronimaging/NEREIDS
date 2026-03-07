@@ -407,6 +407,14 @@ impl ExportFormat {
     }
 }
 
+/// Data mode for project file save.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SaveDataMode {
+    #[default]
+    Linked,
+    Embedded,
+}
+
 /// Per-tile display settings for density map rendering.
 #[derive(Debug, Clone)]
 pub struct TileDisplayState {
@@ -760,6 +768,12 @@ pub struct AppState {
     // -- Project file --
     /// Path of the last saved/loaded project file (.nrd.h5).
     pub project_file_path: Option<PathBuf>,
+    /// Whether the save-mode chooser modal is open.
+    pub show_save_modal: bool,
+    /// Selected data mode for the next save operation.
+    pub save_data_mode: SaveDataMode,
+    /// Data mode used in the last explicit save (for Cmd+S re-save).
+    pub last_save_mode: SaveDataMode,
 
     // -- Session persistence --
     /// Cached session from a previous run (loaded at startup, cleared on use).
@@ -1322,6 +1336,9 @@ impl Default for AppState {
             export_status: None,
 
             project_file_path: None,
+            show_save_modal: false,
+            save_data_mode: SaveDataMode::Linked,
+            last_save_mode: SaveDataMode::Linked,
 
             cached_session: None,
         }
