@@ -101,6 +101,17 @@ pub struct ProjectSnapshot {
     pub n_total: Option<usize>,
     pub result_isotope_labels: Option<Vec<String>>,
 
+    // -- results/single_fit (single-pixel fit, optional) --
+    pub single_fit_densities: Option<Vec<f64>>,
+    pub single_fit_uncertainties: Option<Vec<f64>>,
+    pub single_fit_chi_squared: Option<f64>,
+    pub single_fit_temperature: Option<f64>,
+    pub single_fit_temperature_unc: Option<f64>,
+    pub single_fit_converged: Option<bool>,
+    pub single_fit_iterations: Option<usize>,
+    pub single_fit_pixel: Option<(usize, usize)>,
+    pub single_fit_labels: Option<Vec<String>>,
+
     // -- endf_cache --
     /// (symbol, resonance_data) pairs for offline loading.
     pub endf_cache: Vec<(String, ResonanceData)>,
@@ -160,6 +171,15 @@ impl Default for ProjectSnapshot {
             n_converged: None,
             n_total: None,
             result_isotope_labels: None,
+            single_fit_densities: None,
+            single_fit_uncertainties: None,
+            single_fit_chi_squared: None,
+            single_fit_temperature: None,
+            single_fit_temperature_unc: None,
+            single_fit_converged: None,
+            single_fit_iterations: None,
+            single_fit_pixel: None,
+            single_fit_labels: None,
             endf_cache: vec![],
             provenance: vec![],
         }
@@ -629,6 +649,55 @@ fn write_results(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoErro
             .create("result_isotopes")
             .and_then(|ds| ds.write_raw(&vlu))
             .map_err(|e| hdf5_err("/results/result_isotopes", e))?;
+    }
+
+    // Single-pixel fit results (optional)
+    if let Some(ref densities) = snap.single_fit_densities {
+        let sf = results
+            .create_group("single_fit")
+            .map_err(|e| hdf5_err("create /results/single_fit", e))?;
+        sf.new_dataset::<f64>()
+            .shape([densities.len()])
+            .create("densities")
+            .and_then(|ds| ds.write_raw(densities))
+            .map_err(|e| hdf5_err("/results/single_fit/densities", e))?;
+        if let Some(ref unc) = snap.single_fit_uncertainties {
+            sf.new_dataset::<f64>()
+                .shape([unc.len()])
+                .create("uncertainties")
+                .and_then(|ds| ds.write_raw(unc))
+                .map_err(|e| hdf5_err("/results/single_fit/uncertainties", e))?;
+        }
+        if let Some(chi2) = snap.single_fit_chi_squared {
+            write_f64_attr(&sf, "chi_squared", chi2)?;
+        }
+        if let Some(temp) = snap.single_fit_temperature {
+            write_f64_attr(&sf, "temperature_k", temp)?;
+        }
+        if let Some(temp_unc) = snap.single_fit_temperature_unc {
+            write_f64_attr(&sf, "temperature_k_unc", temp_unc)?;
+        }
+        if let Some(iterations) = snap.single_fit_iterations {
+            write_u32_attr(&sf, "iterations", iterations as u32)?;
+        }
+        if let Some(conv) = snap.single_fit_converged {
+            write_bool_attr(&sf, "converged", conv)?;
+        }
+        if let Some((py, px)) = snap.single_fit_pixel {
+            write_u32_attr(&sf, "pixel_y", py as u32)?;
+            write_u32_attr(&sf, "pixel_x", px as u32)?;
+        }
+        if let Some(ref labels) = snap.single_fit_labels {
+            let vlu: Vec<VarLenUnicode> = labels
+                .iter()
+                .map(|s| s.parse().map_err(|e| hdf5_err("parse single_fit label", e)))
+                .collect::<Result<Vec<_>, _>>()?;
+            sf.new_dataset::<VarLenUnicode>()
+                .shape([labels.len()])
+                .create("isotope_labels")
+                .and_then(|ds| ds.write_raw(&vlu))
+                .map_err(|e| hdf5_err("/results/single_fit/isotope_labels", e))?;
+        }
     }
 
     Ok(())
@@ -1169,6 +1238,36 @@ fn read_results(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoE
         snap.n_total = Some(nt as usize);
     }
 
+    // Single-pixel fit results
+    if let Ok(sf) = results.group("single_fit") {
+        if let Ok(ds) = sf.dataset("densities") {
+            let data: Vec<f64> = ds
+                .read_raw()
+                .map_err(|e| hdf5_err("/results/single_fit/densities", e))?;
+            snap.single_fit_densities = Some(data);
+        }
+        if let Ok(ds) = sf.dataset("uncertainties") {
+            let data: Vec<f64> = ds
+                .read_raw()
+                .map_err(|e| hdf5_err("/results/single_fit/uncertainties", e))?;
+            snap.single_fit_uncertainties = Some(data);
+        }
+        snap.single_fit_chi_squared = read_f64_attr(&sf, "chi_squared").ok();
+        snap.single_fit_temperature = read_f64_attr(&sf, "temperature_k").ok();
+        snap.single_fit_temperature_unc = read_f64_attr(&sf, "temperature_k_unc").ok();
+        snap.single_fit_converged = read_bool_attr(&sf, "converged").ok();
+        snap.single_fit_iterations = read_u32_attr(&sf, "iterations").ok().map(|v| v as usize);
+        if let (Ok(py), Ok(px)) = (read_u32_attr(&sf, "pixel_y"), read_u32_attr(&sf, "pixel_x")) {
+            snap.single_fit_pixel = Some((py as usize, px as usize));
+        }
+        if let Ok(ds) = sf.dataset("isotope_labels") {
+            let vlu: Vec<VarLenUnicode> = ds
+                .read_raw()
+                .map_err(|e| hdf5_err("/results/single_fit/isotope_labels", e))?;
+            snap.single_fit_labels = Some(vlu.iter().map(|v| v.as_str().to_string()).collect());
+        }
+    }
+
     Ok(())
 }
 
@@ -1293,6 +1392,15 @@ mod tests {
             n_converged: None,
             n_total: None,
             result_isotope_labels: None,
+            single_fit_densities: None,
+            single_fit_uncertainties: None,
+            single_fit_chi_squared: None,
+            single_fit_temperature: None,
+            single_fit_temperature_unc: None,
+            single_fit_converged: None,
+            single_fit_iterations: None,
+            single_fit_pixel: None,
+            single_fit_labels: None,
             endf_cache: vec![],
             provenance: vec![],
         }
@@ -1936,5 +2044,53 @@ mod tests {
             msg.contains("expected 3D"),
             "Error should mention dimensionality: {msg}"
         );
+    }
+
+    #[test]
+    fn test_roundtrip_single_fit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("single_fit.nrd.h5");
+        let mut snap = minimal_snapshot();
+        snap.single_fit_densities = Some(vec![0.001, 0.002]);
+        snap.single_fit_uncertainties = Some(vec![1e-5, 2e-5]);
+        snap.single_fit_chi_squared = Some(1.23);
+        snap.single_fit_temperature = Some(296.0);
+        snap.single_fit_temperature_unc = Some(5.0);
+        snap.single_fit_converged = Some(true);
+        snap.single_fit_iterations = Some(42);
+        snap.single_fit_pixel = Some((10, 20));
+        snap.single_fit_labels = Some(vec!["U-238".into(), "Fe-56".into()]);
+        save_project(&path, &snap).unwrap();
+
+        let loaded = load_project(&path).unwrap();
+        assert_eq!(
+            loaded.single_fit_densities.as_deref(),
+            Some([0.001, 0.002].as_slice())
+        );
+        assert_eq!(
+            loaded.single_fit_uncertainties.as_deref(),
+            Some([1e-5, 2e-5].as_slice())
+        );
+        assert!((loaded.single_fit_chi_squared.unwrap() - 1.23).abs() < 1e-10);
+        assert!((loaded.single_fit_temperature.unwrap() - 296.0).abs() < 1e-10);
+        assert!((loaded.single_fit_temperature_unc.unwrap() - 5.0).abs() < 1e-10);
+        assert_eq!(loaded.single_fit_converged, Some(true));
+        assert_eq!(loaded.single_fit_iterations, Some(42));
+        assert_eq!(loaded.single_fit_pixel, Some((10, 20)));
+        let expected_labels: Vec<String> = vec!["U-238".into(), "Fe-56".into()];
+        assert_eq!(loaded.single_fit_labels, Some(expected_labels));
+    }
+
+    #[test]
+    fn test_roundtrip_no_single_fit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no_single_fit.nrd.h5");
+        let snap = minimal_snapshot();
+        save_project(&path, &snap).unwrap();
+
+        let loaded = load_project(&path).unwrap();
+        assert!(loaded.single_fit_densities.is_none());
+        assert!(loaded.single_fit_pixel.is_none());
+        assert!(loaded.single_fit_labels.is_none());
     }
 }

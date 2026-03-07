@@ -1644,7 +1644,7 @@ fn py_spatial_map(
                 converged_map: PyArray2::from_owned_array(py, result.converged_map).unbind(),
                 n_converged: result.n_converged,
                 n_total: result.n_total,
-                isotope_names,
+                isotope_names: result.isotope_labels,
                 shape,
             };
             Py::new(py, py_result).map(|p| p.into_any())

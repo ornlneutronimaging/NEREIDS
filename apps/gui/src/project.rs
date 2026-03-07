@@ -11,7 +11,7 @@ use nereids_io::spectrum::{SpectrumUnit, SpectrumValueKind};
 use nereids_pipeline::spatial::SpatialResult;
 
 use crate::state::{
-    AppState, DataType, EndfStatus, FittingType, GuidedStep, InputMode, IsotopeEntry,
+    AppState, DataType, EndfStatus, FitFeedback, FittingType, GuidedStep, InputMode, IsotopeEntry,
     ProvenanceEvent, ProvenanceEventKind, ResolutionMode, RoiSelection, SaveDataMode, SolverMethod,
     UiMode,
 };
@@ -120,12 +120,6 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         n_total,
         result_isotope_labels,
     ) = if let Some(ref sr) = state.spatial_result {
-        let labels: Vec<String> = state
-            .isotope_entries
-            .iter()
-            .filter(|e| e.enabled)
-            .map(|e| e.symbol.clone())
-            .collect();
         (
             Some(sr.density_maps.clone()),
             Some(sr.uncertainty_maps.clone()),
@@ -134,10 +128,52 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
             sr.temperature_map.clone(),
             Some(sr.n_converged),
             Some(sr.n_total),
-            Some(labels),
+            Some(sr.isotope_labels.clone()),
         )
     } else {
         (None, None, None, None, None, None, None, None)
+    };
+
+    // Single-pixel fit results
+    let (
+        single_fit_densities,
+        single_fit_uncertainties,
+        single_fit_chi_squared,
+        single_fit_temperature,
+        single_fit_temperature_unc,
+        single_fit_converged,
+        single_fit_iterations,
+        single_fit_pixel,
+        single_fit_labels,
+    ) = if let Some(ref pfr) = state.pixel_fit_result {
+        // Prefer labels from FitFeedback (captured at fit time) to avoid
+        // desync if isotope_entries are modified after the fit.
+        // Only trust feedback when its length matches the result (a failed
+        // fit may leave stale feedback with a different isotope count).
+        let labels: Vec<String> = match state.last_fit_feedback.as_ref() {
+            Some(fb) if fb.densities.len() == pfr.densities.len() && !fb.densities.is_empty() => {
+                fb.densities.iter().map(|(s, _)| s.clone()).collect()
+            }
+            _ => state
+                .isotope_entries
+                .iter()
+                .filter(|e| e.enabled && e.resonance_data.is_some())
+                .map(|e| e.symbol.clone())
+                .collect(),
+        };
+        (
+            Some(pfr.densities.clone()),
+            pfr.uncertainties.clone(),
+            Some(pfr.reduced_chi_squared),
+            pfr.temperature_k,
+            pfr.temperature_k_unc,
+            Some(pfr.converged),
+            Some(pfr.iterations),
+            state.selected_pixel,
+            Some(labels),
+        )
+    } else {
+        (None, None, None, None, None, None, None, None, None)
     };
 
     // Provenance log
@@ -224,6 +260,15 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         n_converged,
         n_total,
         result_isotope_labels,
+        single_fit_densities,
+        single_fit_uncertainties,
+        single_fit_chi_squared,
+        single_fit_temperature,
+        single_fit_temperature_unc,
+        single_fit_converged,
+        single_fit_iterations,
+        single_fit_pixel,
+        single_fit_labels,
         endf_cache,
         provenance,
     }
@@ -752,11 +797,57 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
             chi_squared_map,
             converged_map,
             temperature_map: snap.temperature_map,
+            isotope_labels: snap.result_isotope_labels.unwrap_or_else(|| {
+                // Fallback for project files created before labels were stored
+                // in SpatialResult — derive from the restored isotope entries.
+                state
+                    .isotope_entries
+                    .iter()
+                    .filter(|e| e.enabled && e.resonance_data.is_some())
+                    .map(|e| e.symbol.clone())
+                    .collect()
+            }),
             n_converged: snap.n_converged.unwrap_or(0),
             n_total: snap.n_total.unwrap_or(0),
         };
         state.init_tile_display(n_maps);
         state.spatial_result = Some(result);
+    }
+
+    // 16b. Restore single-pixel fit results
+    if let Some(densities) = snap.single_fit_densities {
+        let uncertainties = snap.single_fit_uncertainties;
+        let result = nereids_pipeline::pipeline::SpectrumFitResult {
+            densities,
+            uncertainties,
+            reduced_chi_squared: snap.single_fit_chi_squared.unwrap_or(f64::NAN),
+            converged: snap.single_fit_converged.unwrap_or(false),
+            iterations: snap.single_fit_iterations.unwrap_or(0),
+            temperature_k: snap.single_fit_temperature,
+            temperature_k_unc: snap.single_fit_temperature_unc,
+        };
+        // Rebuild FitFeedback from the restored result
+        if let Some(ref labels) = snap.single_fit_labels {
+            let fb_densities: Vec<(String, f64)> = labels
+                .iter()
+                .zip(result.densities.iter())
+                .map(|(s, &d)| (s.clone(), d))
+                .collect();
+            let summary = if result.converged {
+                format!("Converged, chi2_r = {:.4}", result.reduced_chi_squared)
+            } else {
+                "Did not converge".to_string()
+            };
+            state.last_fit_feedback = Some(FitFeedback {
+                success: result.converged,
+                summary,
+                densities: fb_densities,
+                temperature_k: result.temperature_k,
+            });
+        }
+        state.selected_pixel = snap.single_fit_pixel;
+        state.pixel_fit_result = Some(result);
+        state.fit_result_gen += 1;
     }
 
     // 17. Restore provenance
