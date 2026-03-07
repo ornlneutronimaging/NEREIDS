@@ -864,13 +864,19 @@ fn read_results(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoE
             .member_names()
             .map_err(|e| hdf5_err("/results/density member_names", e))?;
 
-        // Order by result_isotope_labels if available, otherwise alphabetical
+        // Order by result_isotope_labels if available, otherwise alphabetical.
+        // Append any datasets not in labels so data isn't lost on corrupted files.
         let ordered: Vec<String> = if let Some(ref labels) = snap.result_isotope_labels {
-            labels
+            let mut ordered: Vec<String> = labels
                 .iter()
                 .filter(|l| names.contains(l))
                 .cloned()
-                .collect()
+                .collect();
+            let mut remaining: Vec<String> =
+                names.into_iter().filter(|n| !labels.contains(n)).collect();
+            remaining.sort();
+            ordered.extend(remaining);
+            ordered
         } else {
             let mut sorted = names;
             sorted.sort();
@@ -905,11 +911,16 @@ fn read_results(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoE
             .map_err(|e| hdf5_err("/results/uncertainty member_names", e))?;
 
         let ordered: Vec<String> = if let Some(ref labels) = snap.result_isotope_labels {
-            labels
+            let mut ordered: Vec<String> = labels
                 .iter()
                 .filter(|l| names.contains(l))
                 .cloned()
-                .collect()
+                .collect();
+            let mut remaining: Vec<String> =
+                names.into_iter().filter(|n| !labels.contains(n)).collect();
+            remaining.sort();
+            ordered.extend(remaining);
+            ordered
         } else {
             let mut sorted = names;
             sorted.sort();

@@ -605,8 +605,10 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
     if state.spatial_result.is_some() {
         state.ui_mode = UiMode::Studio;
     } else if state.normalized.is_some() {
+        state.ui_mode = UiMode::Guided;
         state.guided_step = GuidedStep::Analyze;
     } else if !state.pipeline.is_empty() {
+        state.ui_mode = UiMode::Guided;
         state.guided_step = state.pipeline[0].step;
     }
 
@@ -617,8 +619,9 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
     }
     state.status_message = status;
 
-    // 21. Clear stale wizard session cache
+    // 21. Clear stale wizard session cache and dirty tracking
     state.cached_session = None;
+    state.clear_dirty();
 
     // 22. Log provenance
     state.log_provenance(
@@ -637,29 +640,37 @@ fn parse_timestamp(s: &str) -> std::time::SystemTime {
         .trim();
     let parts: Vec<&str> = s.splitn(2, ['T', ' ']).collect();
     if parts.len() != 2 {
-        return std::time::SystemTime::now();
+        return std::time::UNIX_EPOCH;
     }
     let date_parts: Vec<u64> = parts[0].split('-').filter_map(|p| p.parse().ok()).collect();
     let time_parts: Vec<u64> = parts[1].split(':').filter_map(|p| p.parse().ok()).collect();
     if date_parts.len() != 3 || time_parts.len() != 3 {
-        return std::time::SystemTime::now();
+        return std::time::UNIX_EPOCH;
     }
     let (y, m, d) = (date_parts[0], date_parts[1], date_parts[2]);
     let (h, mi, sec) = (time_parts[0], time_parts[1], time_parts[2]);
-    // Convert to days since epoch using the inverse of days_to_ymd
     let days = ymd_to_days(y, m, d);
-    let total_secs = days * 86400 + h * 3600 + mi * 60 + sec;
-    std::time::UNIX_EPOCH + std::time::Duration::from_secs(total_secs)
+    let total_secs = days
+        .checked_mul(86400)
+        .and_then(|v| v.checked_add(h * 3600 + mi * 60 + sec));
+    match total_secs {
+        Some(secs) => std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+        None => std::time::UNIX_EPOCH,
+    }
 }
 
 /// Convert (year, month, day) to days since Unix epoch.
 fn ymd_to_days(y: u64, m: u64, d: u64) -> u64 {
     // Inverse of days_to_ymd — Howard Hinnant's civil_from_days
+    if m <= 2 && y == 0 {
+        return 0;
+    }
     let y = if m <= 2 { y - 1 } else { y };
     let era = y / 400;
     let yoe = y - era * 400;
     let m_adj = if m > 2 { m - 3 } else { m + 9 };
     let doy = (153 * m_adj + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
+    let base = era * 146097 + doe;
+    base.saturating_sub(719468)
 }
