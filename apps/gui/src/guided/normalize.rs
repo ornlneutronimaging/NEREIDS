@@ -399,9 +399,7 @@ fn preview_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
                                             format!("{} {:.1}eV", entry.symbol, res.energy),
                                             res.energy,
                                         )
-                                        .color(egui::Color32::from_rgba_premultiplied(
-                                            180, 80, 80, 50,
-                                        ))
+                                        .color(crate::widgets::design::RESONANCE_DIP_COLOR)
                                         .width(0.5),
                                     );
                                 }
@@ -539,7 +537,6 @@ pub(crate) fn prepare_transmission(state: &mut AppState) {
     }
 
     let n_tof = sample.shape()[0];
-    // TODO(Phase 2b): estimate uncertainty from data or allow user to specify.
     // Using uniform synthetic uncertainty since no open beam is available.
     let uncertainty = ndarray::Array3::from_elem(sample.raw_dim(), 0.01);
 

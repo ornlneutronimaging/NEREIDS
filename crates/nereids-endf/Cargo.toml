@@ -10,7 +10,6 @@ endf-mat = { workspace = true }
 nereids-core = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
 reqwest = { workspace = true }
 zip = { workspace = true }
 dirs = { workspace = true }

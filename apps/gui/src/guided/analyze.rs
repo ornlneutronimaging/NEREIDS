@@ -799,9 +799,7 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
                                 if res.energy >= x_min && res.energy <= x_max {
                                     plot_ui.vline(
                                         VLine::new("", res.energy)
-                                            .color(egui::Color32::from_rgba_premultiplied(
-                                                180, 80, 80, 50,
-                                            ))
+                                            .color(crate::widgets::design::RESONANCE_DIP_COLOR)
                                             .width(0.5),
                                     );
                                 }

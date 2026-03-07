@@ -12,6 +12,10 @@ use nereids_endf::retrieval::EndfLibrary;
 use nereids_physics::resolution::TabulatedResolution;
 use std::sync::Arc;
 
+/// Semi-transparent red used for resonance energy dip markers on spectrum plots.
+/// Values are manually premultiplied: RGBA(180, 80, 80, 50) → (35, 15, 15, 50).
+pub const RESONANCE_DIP_COLOR: Color32 = Color32::from_rgba_premultiplied(35, 15, 15, 50);
+
 // ── Content Header ──────────────────────────────────────────────
 
 /// Page-level title (22px bold) + subtitle (13px fg2).

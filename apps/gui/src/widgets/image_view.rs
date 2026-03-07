@@ -5,6 +5,10 @@
 
 use crate::state::{Colormap, RoiSelection};
 
+/// Minimum range for colormap normalisation.  When `vmax - vmin` is smaller
+/// than this, we treat the image as uniform to avoid division by near-zero.
+const COLORMAP_RANGE_EPSILON: f64 = 1e-30;
+
 /// Cached GPU texture to avoid per-frame pixel generation and re-upload.
 ///
 /// Stored in egui per-Id temp data, keyed by texture name.
@@ -396,7 +400,7 @@ fn prepare_image_painter(
         handle
     } else {
         let (vmin, vmax) = data_range(data);
-        let range = if (vmax - vmin).abs() < 1e-30 {
+        let range = if (vmax - vmin).abs() < COLORMAP_RANGE_EPSILON {
             1.0
         } else {
             vmax - vmin
@@ -612,7 +616,7 @@ pub fn render_to_rgba(data: &ndarray::Array2<f64>, colormap: Colormap) -> Vec<u8
         return Vec::new();
     }
     let (vmin, vmax) = data_range(data);
-    let range = if (vmax - vmin).abs() < 1e-30 {
+    let range = if (vmax - vmin).abs() < COLORMAP_RANGE_EPSILON {
         1.0
     } else {
         vmax - vmin

@@ -8,6 +8,5 @@ license.workspace = true
 [dependencies]
 nereids-core = { workspace = true }
 nereids-endf = { workspace = true }
-ndarray = { workspace = true }
 num-complex = { workspace = true }
 rayon = { workspace = true }
