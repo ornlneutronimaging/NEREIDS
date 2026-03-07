@@ -7,7 +7,7 @@ license.workspace = true
 
 [features]
 default = []
-hdf5 = ["dep:hdf5"]
+hdf5 = ["dep:hdf5", "dep:serde_json", "dep:nereids-endf"]
 
 [dependencies]
 nereids-core = { workspace = true }
@@ -15,6 +15,8 @@ ndarray = { workspace = true }
 thiserror = { workspace = true }
 tiff = { workspace = true }
 hdf5 = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+nereids-endf = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"

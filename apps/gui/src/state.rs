@@ -314,6 +314,7 @@ pub enum ProvenanceEventKind {
     Normalized,
     AnalysisRun,
     Exported,
+    ProjectSaved,
 }
 
 impl ProvenanceEvent {
@@ -754,6 +755,10 @@ pub struct AppState {
     pub export_format: ExportFormat,
     pub export_directory: Option<PathBuf>,
     pub export_status: Option<String>,
+
+    // -- Project file --
+    /// Path of the last saved/loaded project file (.nrd.h5).
+    pub project_file_path: Option<PathBuf>,
 
     // -- Session persistence --
     /// Cached session from a previous run (loaded at startup, cleared on use).
@@ -1314,6 +1319,8 @@ impl Default for AppState {
             export_format: ExportFormat::Tiff,
             export_directory: None,
             export_status: None,
+
+            project_file_path: None,
 
             cached_session: None,
         }

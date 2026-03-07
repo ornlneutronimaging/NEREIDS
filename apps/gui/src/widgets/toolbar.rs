@@ -59,6 +59,12 @@ pub fn toolbar(ctx: &egui::Context, state: &mut AppState) {
                         state.ui_mode = UiMode::Guided;
                     }
 
+                    // Save button — visible when spatial results exist
+                    let has_results = state.spatial_result.is_some();
+                    if has_results && design::btn_primary(ui, "\u{1F4BE} Save").clicked() {
+                        crate::project::save_project_dialog(state);
+                    }
+
                     // Progress indicator
                     if state.is_fitting {
                         if let Some(ref fp) = state.fitting_progress {
