@@ -1,11 +1,10 @@
 //! Forward Model tool — independent isotope sandbox with live spectrum preview.
 
-use crate::state::{
-    AppState, EndfStatus, GuidedStep, IsotopeEntry, PeriodicTableTarget, SpectrumAxis,
-};
+use crate::state::{AppState, EndfStatus, GuidedStep, PeriodicTableTarget, SpectrumAxis};
 use crate::widgets::design;
 use egui_plot::{Line, Plot, PlotPoints};
 use nereids_endf::retrieval::EndfLibrary;
+use nereids_io::spectrum::{SpectrumUnit, SpectrumValueKind};
 use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -366,29 +365,19 @@ pub(crate) fn fm_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
     // Use the cached energy grid for plotting
     let plot_energies = state.fm_energies.as_ref().unwrap_or(&energies);
 
-    // Build x-axis values based on axis selection
-    let (x_values, x_label): (Vec<f64>, &str) = match state.fm_spectrum_axis {
-        SpectrumAxis::EnergyEv => (plot_energies.clone(), "Energy (eV)"),
-        SpectrumAxis::TofMicroseconds => {
-            let fp = state.beamline.flight_path_m;
-            if fp.is_finite() && fp > 0.0 {
-                let delay = state.beamline.delay_us;
-                let tof: Vec<f64> = plot_energies
-                    .iter()
-                    .map(|&e| {
-                        if e > 0.0 {
-                            nereids_core::constants::energy_to_tof(e, fp) + delay
-                        } else {
-                            f64::NAN
-                        }
-                    })
-                    .collect();
-                (tof, "TOF (\u{03bc}s)")
-            } else {
-                (plot_energies.clone(), "Energy (eV)")
-            }
-        }
-    };
+    // Build x-axis values based on axis selection.
+    // FM uses energies directly as "spectrum values" with EnergyEv + BinCenters.
+    let (x_values, x_label) = design::build_spectrum_x_axis(&design::SpectrumXAxisParams {
+        axis: state.fm_spectrum_axis,
+        energies: Some(plot_energies),
+        spectrum_values: Some(plot_energies),
+        spectrum_unit: SpectrumUnit::EnergyEv,
+        spectrum_kind: SpectrumValueKind::BinCenters,
+        flight_path_m: state.beamline.flight_path_m,
+        delay_us: state.beamline.delay_us,
+        n_tof: plot_energies.len(),
+    })
+    .unwrap_or_else(|| (plot_energies.clone(), "Energy (eV)"));
 
     // Hero plot — full width, min 300px tall
     let plot_height = ui.available_height().clamp(300.0, 350.0);
@@ -430,19 +419,7 @@ pub(crate) fn copy_config_to_fm(state: &mut AppState) {
     state.fm_isotope_entries = state
         .isotope_entries
         .iter()
-        .map(|e| IsotopeEntry {
-            z: e.z,
-            a: e.a,
-            symbol: e.symbol.clone(),
-            initial_density: e.initial_density,
-            resonance_data: e.resonance_data.clone(),
-            enabled: e.enabled,
-            endf_status: if e.resonance_data.is_some() {
-                EndfStatus::Loaded
-            } else {
-                EndfStatus::Pending
-            },
-        })
+        .map(|e| e.clone_with_normalized_status())
         .collect();
     state.fm_endf_library = state.endf_library;
     state.fm_temperature_k = state.temperature_k;
@@ -457,19 +434,7 @@ pub(crate) fn push_fm_to_config(state: &mut AppState) {
     state.isotope_entries = state
         .fm_isotope_entries
         .iter()
-        .map(|e| IsotopeEntry {
-            z: e.z,
-            a: e.a,
-            symbol: e.symbol.clone(),
-            initial_density: e.initial_density,
-            resonance_data: e.resonance_data.clone(),
-            enabled: e.enabled,
-            endf_status: if e.resonance_data.is_some() {
-                EndfStatus::Loaded
-            } else {
-                EndfStatus::Pending
-            },
-        })
+        .map(|e| e.clone_with_normalized_status())
         .collect();
     state.endf_library = state.fm_endf_library;
     state.temperature_k = state.fm_temperature_k;

@@ -781,6 +781,28 @@ pub struct IsotopeEntry {
     pub endf_status: EndfStatus,
 }
 
+impl IsotopeEntry {
+    /// Clone with `endf_status` normalized to match `resonance_data` presence.
+    ///
+    /// Used when copying entries between contexts (Configure → FM, Configure → Detect)
+    /// to avoid propagating stale `Fetching` or `Failed` statuses.
+    pub fn clone_with_normalized_status(&self) -> Self {
+        Self {
+            z: self.z,
+            a: self.a,
+            symbol: self.symbol.clone(),
+            initial_density: self.initial_density,
+            resonance_data: self.resonance_data.clone(),
+            enabled: self.enabled,
+            endf_status: if self.resonance_data.is_some() {
+                EndfStatus::Loaded
+            } else {
+                EndfStatus::Pending
+            },
+        }
+    }
+}
+
 /// ROI rectangle in pixel coordinates.
 #[derive(Debug, Clone, Copy)]
 pub struct RoiSelection {

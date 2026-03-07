@@ -300,53 +300,17 @@ fn preview_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
     };
 
     // Build x-axis values and label, respecting spectrum_unit and spectrum_kind.
-    let (x_values, x_label): (Vec<f64>, &str) = match state.normalize_spectrum_axis {
-        SpectrumAxis::EnergyEv => match state.energies {
-            Some(ref e) => (e.clone(), "Energy (eV)"),
-            None => return,
-        },
-        SpectrumAxis::TofMicroseconds => match state.spectrum_values {
-            Some(ref v) => match (state.spectrum_unit, state.spectrum_kind) {
-                (SpectrumUnit::TofMicroseconds, SpectrumValueKind::BinEdges) => {
-                    // Compute arithmetic mean bin centers from adjacent edges.
-                    let centers: Vec<f64> = v
-                        .windows(2)
-                        .take(n_tof)
-                        .map(|w| 0.5 * (w[0] + w[1]))
-                        .collect();
-                    (centers, "TOF (\u{03bc}s)")
-                }
-                (SpectrumUnit::TofMicroseconds, SpectrumValueKind::BinCenters) => {
-                    (v.iter().take(n_tof).copied().collect(), "TOF (\u{03bc}s)")
-                }
-                (SpectrumUnit::EnergyEv, _) => {
-                    // Spectrum file is in energy units — convert to TOF for the plot axis.
-                    if state.beamline.flight_path_m.is_finite()
-                        && state.beamline.flight_path_m > 0.0
-                    {
-                        let tof_vals: Vec<f64> = v
-                            .iter()
-                            .take(n_tof)
-                            .map(|&e| {
-                                nereids_core::constants::energy_to_tof(
-                                    e,
-                                    state.beamline.flight_path_m,
-                                ) + state.beamline.delay_us
-                            })
-                            .collect();
-                        (tof_vals, "TOF (\u{03bc}s)")
-                    } else {
-                        // Cannot convert without valid beamline params — show energy instead.
-                        (v.iter().take(n_tof).copied().collect(), "Energy (eV)")
-                    }
-                }
-            },
-            None => {
-                // No spectrum values — use frame indices with honest label.
-                let indices: Vec<f64> = (0..n_tof).map(|i| i as f64).collect();
-                (indices, "Frame index")
-            }
-        },
+    let Some((x_values, x_label)) = design::build_spectrum_x_axis(&design::SpectrumXAxisParams {
+        axis: state.normalize_spectrum_axis,
+        energies: state.energies.as_deref(),
+        spectrum_values: state.spectrum_values.as_deref(),
+        spectrum_unit: state.spectrum_unit,
+        spectrum_kind: state.spectrum_kind,
+        flight_path_m: state.beamline.flight_path_m,
+        delay_us: state.beamline.delay_us,
+        n_tof,
+    }) else {
+        return;
     };
 
     let n_plot = spectrum.len().min(x_values.len());
@@ -381,32 +345,7 @@ fn preview_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
             // Resonance dip markers (energy axis only)
             if state.show_resonance_dips && state.normalize_spectrum_axis == SpectrumAxis::EnergyEv
             {
-                let x_min = x_values[0].min(x_values[n_plot - 1]);
-                let x_max = x_values[0].max(x_values[n_plot - 1]);
-                for entry in &state.isotope_entries {
-                    if !entry.enabled {
-                        continue;
-                    }
-                    let Some(ref res_data) = entry.resonance_data else {
-                        continue;
-                    };
-                    for range in &res_data.ranges {
-                        for lg in &range.l_groups {
-                            for res in &lg.resonances {
-                                if res.energy >= x_min && res.energy <= x_max {
-                                    plot_ui.vline(
-                                        VLine::new(
-                                            format!("{} {:.1}eV", entry.symbol, res.energy),
-                                            res.energy,
-                                        )
-                                        .color(crate::widgets::design::RESONANCE_DIP_COLOR)
-                                        .width(0.5),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
+                design::draw_resonance_dips(plot_ui, &state.isotope_entries, &x_values);
             }
         });
 }

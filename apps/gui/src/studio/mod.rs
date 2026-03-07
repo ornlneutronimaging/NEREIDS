@@ -318,62 +318,19 @@ fn analysis_spectrum_column(ui: &mut egui::Ui, state: &mut AppState) {
 
     let n_tof = norm.transmission.shape()[0];
 
-    // Build x-axis values (same pattern as analyze.rs)
-    let (x_values, x_label): (Vec<f64>, &str) = match state.analyze_spectrum_axis {
-        SpectrumAxis::EnergyEv => match state.energies {
-            Some(ref e) => (e.clone(), "Energy (eV)"),
-            None => {
-                ui.label("No energy grid loaded.");
-                return;
-            }
-        },
-        SpectrumAxis::TofMicroseconds => match state.spectrum_values {
-            Some(ref v) => {
-                use nereids_io::spectrum::{SpectrumUnit, SpectrumValueKind};
-                match (state.spectrum_unit, state.spectrum_kind) {
-                    (SpectrumUnit::TofMicroseconds, SpectrumValueKind::BinEdges) => {
-                        let centers: Vec<f64> = v
-                            .windows(2)
-                            .take(n_tof)
-                            .map(|w| 0.5 * (w[0] + w[1]))
-                            .collect();
-                        (centers, "TOF (\u{03bc}s)")
-                    }
-                    (SpectrumUnit::TofMicroseconds, SpectrumValueKind::BinCenters) => {
-                        (v.iter().take(n_tof).copied().collect(), "TOF (\u{03bc}s)")
-                    }
-                    (SpectrumUnit::EnergyEv, _) => {
-                        // Spectrum file is in energy units — convert to TOF for the plot axis.
-                        if state.beamline.flight_path_m.is_finite()
-                            && state.beamline.flight_path_m > 0.0
-                        {
-                            let tof_vals: Vec<f64> = v
-                                .iter()
-                                .take(n_tof)
-                                .map(|&e| {
-                                    if e > 0.0 {
-                                        nereids_core::constants::energy_to_tof(
-                                            e,
-                                            state.beamline.flight_path_m,
-                                        ) + state.beamline.delay_us
-                                    } else {
-                                        f64::NAN
-                                    }
-                                })
-                                .collect();
-                            (tof_vals, "TOF (\u{03bc}s)")
-                        } else {
-                            // Cannot convert without valid beamline params — show energy instead.
-                            (v.iter().take(n_tof).copied().collect(), "Energy (eV)")
-                        }
-                    }
-                }
-            }
-            None => {
-                let indices: Vec<f64> = (0..n_tof).map(|i| i as f64).collect();
-                (indices, "Frame index")
-            }
-        },
+    // Build x-axis values
+    let Some((x_values, x_label)) = design::build_spectrum_x_axis(&design::SpectrumXAxisParams {
+        axis: state.analyze_spectrum_axis,
+        energies: state.energies.as_deref(),
+        spectrum_values: state.spectrum_values.as_deref(),
+        spectrum_unit: state.spectrum_unit,
+        spectrum_kind: state.spectrum_kind,
+        flight_path_m: state.beamline.flight_path_m,
+        delay_us: state.beamline.delay_us,
+        n_tof,
+    }) else {
+        ui.label("No energy grid loaded.");
+        return;
     };
 
     let (y, x) = match state.selected_pixel {
@@ -403,45 +360,16 @@ fn analysis_spectrum_column(ui: &mut egui::Ui, state: &mut AppState) {
     let measured_line = Line::new("Measured", measured_points);
 
     // Fit curve (if available)
-    let energies = state.energies.as_ref();
     let fit_line = state.pixel_fit_result.as_ref().and_then(|result| {
-        if !result.converged {
-            return None;
-        }
-        let energies = energies?;
-        let enabled: Vec<_> = state
-            .isotope_entries
-            .iter()
-            .filter(|e| e.enabled && e.resonance_data.is_some())
-            .collect();
-        if enabled.is_empty() {
-            return None;
-        }
-        let resonance_data: Vec<_> = enabled
-            .iter()
-            .filter_map(|e| e.resonance_data.clone())
-            .collect();
-        // Use fitted temperature for overlay (falls back to initial guess).
-        let overlay_temp = result.temperature_k.unwrap_or(state.temperature_k);
-        let model = nereids_fitting::transmission_model::TransmissionFitModel::new(
-            energies.clone(),
-            resonance_data,
-            overlay_temp,
-            None,
-            (0..result.densities.len()).collect(),
-            None,
-            None,
+        let energies = state.energies.as_ref()?;
+        design::build_fit_line(
+            result,
+            &state.isotope_entries,
+            energies,
+            state.temperature_k,
+            &x_values,
+            n_plot,
         )
-        .ok()?;
-
-        use nereids_fitting::lm::FitModel;
-        let fitted_t = model.evaluate(&result.densities);
-        let n_fit = n_plot.min(fitted_t.len());
-        let fit_points: PlotPoints = (0..n_fit)
-            .filter(|&i| x_values[i].is_finite())
-            .map(|i| [x_values[i], fitted_t[i]])
-            .collect();
-        Some(Line::new("Fit", fit_points).width(2.0))
     });
 
     // Spectrum plot
