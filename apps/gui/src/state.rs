@@ -496,6 +496,37 @@ pub struct DetectTraceEntry {
     pub endf_status: EndfStatus,
 }
 
+/// Progress state for spatial mapping.
+///
+/// Holds an `Arc<AtomicUsize>` shared with the background thread and the
+/// pixel total.  Display code reads the atomic directly each frame — no
+/// intermediate polling step, no sync issues.
+pub struct FittingProgress {
+    counter: Arc<AtomicUsize>,
+    total: usize,
+}
+
+impl FittingProgress {
+    pub fn new(total: usize) -> (Self, Arc<AtomicUsize>) {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let handle = Arc::clone(&counter);
+        (Self { counter, total }, handle)
+    }
+
+    /// Current number of completed pixels (reads atomic).
+    pub fn done(&self) -> usize {
+        self.counter.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn total(&self) -> usize {
+        self.total
+    }
+
+    pub fn fraction(&self) -> f32 {
+        self.done() as f32 / self.total.max(1) as f32
+    }
+}
+
 /// Cached residuals data for the Studio dock, avoiding per-frame model rebuild.
 #[derive(Clone, Debug)]
 pub struct CachedResiduals {
@@ -709,8 +740,7 @@ pub struct AppState {
     pub studio_analysis_prev_symbol: Option<String>,
 
     // -- Progress --
-    pub fitting_progress: Option<(usize, usize)>,
-    pub fitting_progress_counter: Option<Arc<AtomicUsize>>,
+    pub fitting_progress: Option<FittingProgress>,
 
     // -- Provenance --
     pub provenance_log: Vec<ProvenanceEvent>,
@@ -940,7 +970,6 @@ impl AppState {
         self.pending_detect_endf = None;
         self.is_fitting = false;
         self.fitting_progress = None;
-        self.fitting_progress_counter = None;
         self.is_fetching_endf = false;
         self.is_fetching_fm_endf = false;
         self.is_fetching_detect_endf = false;
@@ -1254,7 +1283,6 @@ impl Default for AppState {
             studio_analysis_isotope: 0,
             studio_analysis_prev_symbol: None,
             fitting_progress: None,
-            fitting_progress_counter: None,
 
             provenance_log: Vec::new(),
             tile_display: Vec::new(),

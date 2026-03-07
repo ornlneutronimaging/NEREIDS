@@ -226,8 +226,10 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
     });
 
     if state.is_fitting {
-        if let Some((done, total)) = state.fitting_progress {
-            let frac = done as f32 / total.max(1) as f32;
+        if let Some(ref fp) = state.fitting_progress {
+            let done = fp.done();
+            let total = fp.total();
+            let frac = fp.fraction();
             crate::widgets::design::progress_mini(ui, frac, &format!("{done}/{total} px"));
         } else {
             ui.spinner();
@@ -1221,15 +1223,14 @@ pub fn run_spatial_map(state: &mut AppState) {
     state.status_message = "Running spatial mapping...".into();
     let cancel = Arc::clone(&state.cancel_token);
 
-    // Progress counter: GUI polls this each frame via fitting_progress_counter.
-    let progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    state.fitting_progress_counter = Some(Arc::clone(&progress));
-    let n_total_pixels = height * width;
+    // Progress: single FittingProgress struct holds the Arc<AtomicUsize> counter
+    // and the pixel total.  Display code reads the atomic directly each frame.
     let n_live = match dead_pixels {
         Some(ref dp) => dp.iter().filter(|&&d| !d).count(),
-        None => n_total_pixels,
+        None => height * width,
     };
-    state.fitting_progress = Some((0, n_live));
+    let (fp, progress) = crate::state::FittingProgress::new(n_live);
+    state.fitting_progress = Some(fp);
 
     std::thread::spawn(move || {
         let result = nereids_pipeline::spatial::spatial_map(

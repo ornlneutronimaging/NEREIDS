@@ -127,17 +127,6 @@ impl eframe::App for NereidsApp {
 
 /// Poll background task channels and apply results to state.
 fn poll_pending_tasks(state: &mut AppState) {
-    // Update fitting progress from the atomic counter BEFORE checking task
-    // completion.  The old order (check → clear → poll) meant the counter's
-    // final value was never read — the progress bar jumped from its last
-    // polled value straight to "complete".
-    if let Some(ref counter) = state.fitting_progress_counter {
-        let done = counter.load(std::sync::atomic::Ordering::Relaxed);
-        if let Some((_, total)) = state.fitting_progress {
-            state.fitting_progress = Some((done, total));
-        }
-    }
-
     // Poll spatial map result
     if let Some(ref rx) = state.pending_spatial {
         match rx.try_recv() {
@@ -157,7 +146,6 @@ fn poll_pending_tasks(state: &mut AppState) {
                 state.spatial_result = Some(result);
                 state.is_fitting = false;
                 state.fitting_progress = None;
-                state.fitting_progress_counter = None;
                 state.active_tab = Tab::Map;
                 state.pending_spatial = None;
                 // Pipeline re-run completed successfully — clear dirty state.
@@ -167,14 +155,12 @@ fn poll_pending_tasks(state: &mut AppState) {
                 state.status_message = format!("Spatial map error: {err_msg}");
                 state.is_fitting = false;
                 state.fitting_progress = None;
-                state.fitting_progress_counter = None;
                 state.pending_spatial = None;
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 state.status_message = "Spatial map task failed".into();
                 state.is_fitting = false;
                 state.fitting_progress = None;
-                state.fitting_progress_counter = None;
                 state.pending_spatial = None;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {} // Still running

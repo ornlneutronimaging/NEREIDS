@@ -1093,8 +1093,10 @@ fn rerun_card(ui: &mut egui::Ui, state: &mut AppState) {
 
     design::card_with_header(ui, "Pipeline", None, |ui| {
         if state.is_fitting {
-            if let Some((done, total)) = state.fitting_progress {
-                let frac = done as f32 / total.max(1) as f32;
+            if let Some(ref fp) = state.fitting_progress {
+                let done = fp.done();
+                let total = fp.total();
+                let frac = fp.fraction();
                 design::progress_mini(ui, frac, &format!("{done}/{total} px"));
             } else {
                 ui.spinner();
