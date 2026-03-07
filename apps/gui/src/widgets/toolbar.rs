@@ -62,17 +62,12 @@ pub fn toolbar(ctx: &egui::Context, state: &mut AppState) {
                     // Progress indicator
                     if state.is_fitting {
                         if let Some((done, total)) = state.fitting_progress {
-                            if done == 0 {
-                                // Precompute phase: cross-sections being calculated
-                                design::progress_mini(ui, 0.0, "Preparing XS...");
-                            } else {
-                                let frac = done as f32 / total.max(1) as f32;
-                                design::progress_mini(
-                                    ui,
-                                    frac,
-                                    &format!("{:.0}% \u{2014} {done}/{total}", frac * 100.0),
-                                );
-                            }
+                            let frac = done as f32 / total.max(1) as f32;
+                            design::progress_mini(
+                                ui,
+                                frac,
+                                &format!("{:.0}% \u{2014} {done}/{total}", frac * 100.0),
+                            );
                         } else {
                             design::progress_mini(ui, 0.0, "Fitting...");
                         }
