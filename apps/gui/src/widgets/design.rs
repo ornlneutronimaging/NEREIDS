@@ -5,11 +5,15 @@
 //! Prototype reference: `.prototypes/D_hybrid_v4.html` CSS §Cards & Forms,
 //! §Tabs, §Badges, §Content Area, §Toolbar, §Drop Zones.
 
-use crate::state::{AppState, EndfFetchResult, EndfStatus, GuidedStep, ResolutionMode};
+use crate::state::{
+    AppState, EndfFetchResult, EndfStatus, GuidedStep, IsotopeEntry, ResolutionMode, SpectrumAxis,
+};
 use crate::theme::{ThemeColors, semantic};
 use egui::{Color32, CornerRadius, Margin, Rect, Response, RichText, Sense, Shadow, Stroke, Ui};
+use egui_plot::{Line, PlotPoints, VLine};
 use nereids_core::types::Isotope;
 use nereids_endf::retrieval::EndfLibrary;
+use nereids_io::spectrum::{SpectrumUnit, SpectrumValueKind};
 use nereids_physics::resolution::{ResolutionFunction, ResolutionParams, TabulatedResolution};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
@@ -719,4 +723,179 @@ pub(crate) fn build_resolution_function(
         } => Ok(Some(ResolutionFunction::Tabulated(Arc::clone(tab)))),
         ResolutionMode::Tabulated { data: None, .. } => Err("Resolution file not loaded".into()),
     }
+}
+
+/// Parameters for [`build_spectrum_x_axis`].
+pub(crate) struct SpectrumXAxisParams<'a> {
+    pub axis: SpectrumAxis,
+    pub energies: Option<&'a [f64]>,
+    pub spectrum_values: Option<&'a [f64]>,
+    pub spectrum_unit: SpectrumUnit,
+    pub spectrum_kind: SpectrumValueKind,
+    pub flight_path_m: f64,
+    pub delay_us: f64,
+    pub n_tof: usize,
+}
+
+/// Build x-axis values and label for a spectrum plot.
+///
+/// Handles all combinations of `SpectrumAxis × SpectrumUnit × SpectrumValueKind`,
+/// including energy-to-TOF conversion with NaN guards for non-positive energies.
+/// Returns `None` if the required data is missing (e.g., no energy grid for EnergyEv axis).
+pub(crate) fn build_spectrum_x_axis(
+    p: &SpectrumXAxisParams<'_>,
+) -> Option<(Vec<f64>, &'static str)> {
+    match p.axis {
+        SpectrumAxis::EnergyEv => Some((p.energies?.to_vec(), "Energy (eV)")),
+        SpectrumAxis::TofMicroseconds => {
+            let v = match p.spectrum_values {
+                Some(v) => v,
+                None => {
+                    return Some(((0..p.n_tof).map(|i| i as f64).collect(), "Frame index"));
+                }
+            };
+            let can_convert = p.flight_path_m.is_finite() && p.flight_path_m > 0.0;
+            match (p.spectrum_unit, p.spectrum_kind) {
+                (SpectrumUnit::TofMicroseconds, SpectrumValueKind::BinEdges) => {
+                    let centers: Vec<f64> = v
+                        .windows(2)
+                        .take(p.n_tof)
+                        .map(|w| 0.5 * (w[0] + w[1]))
+                        .collect();
+                    Some((centers, "TOF (\u{03bc}s)"))
+                }
+                (SpectrumUnit::TofMicroseconds, SpectrumValueKind::BinCenters) => {
+                    Some((v.iter().take(p.n_tof).copied().collect(), "TOF (\u{03bc}s)"))
+                }
+                (SpectrumUnit::EnergyEv, SpectrumValueKind::BinEdges) => {
+                    if can_convert {
+                        let tof_vals: Vec<f64> = v
+                            .windows(2)
+                            .take(p.n_tof)
+                            .map(|w| {
+                                let center = 0.5 * (w[0] + w[1]);
+                                if center > 0.0 {
+                                    nereids_core::constants::energy_to_tof(center, p.flight_path_m)
+                                        + p.delay_us
+                                } else {
+                                    f64::NAN
+                                }
+                            })
+                            .collect();
+                        Some((tof_vals, "TOF (\u{03bc}s)"))
+                    } else {
+                        let centers: Vec<f64> = v
+                            .windows(2)
+                            .take(p.n_tof)
+                            .map(|w| 0.5 * (w[0] + w[1]))
+                            .collect();
+                        Some((centers, "Energy (eV)"))
+                    }
+                }
+                (SpectrumUnit::EnergyEv, SpectrumValueKind::BinCenters) => {
+                    if can_convert {
+                        let tof_vals: Vec<f64> = v
+                            .iter()
+                            .take(p.n_tof)
+                            .map(|&e| {
+                                if e > 0.0 {
+                                    nereids_core::constants::energy_to_tof(e, p.flight_path_m)
+                                        + p.delay_us
+                                } else {
+                                    f64::NAN
+                                }
+                            })
+                            .collect();
+                        Some((tof_vals, "TOF (\u{03bc}s)"))
+                    } else {
+                        Some((v.iter().take(p.n_tof).copied().collect(), "Energy (eV)"))
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Draw resonance energy dip markers on a spectrum plot (energy axis only).
+///
+/// Iterates all enabled isotope entries with resonance data and draws a `VLine`
+/// for each resonance within the visible x-axis range.
+pub(crate) fn draw_resonance_dips(
+    plot_ui: &mut egui_plot::PlotUi,
+    entries: &[IsotopeEntry],
+    x_values: &[f64],
+) {
+    let (x_min, x_max) = x_values
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
+            (lo.min(v), hi.max(v))
+        });
+    for entry in entries {
+        if !entry.enabled {
+            continue;
+        }
+        let Some(ref res_data) = entry.resonance_data else {
+            continue;
+        };
+        for range in &res_data.ranges {
+            for lg in &range.l_groups {
+                for res in &lg.resonances {
+                    if res.energy >= x_min && res.energy <= x_max {
+                        plot_ui.vline(
+                            VLine::new(format!("{} {:.1}eV", entry.symbol, res.energy), res.energy)
+                                .color(RESONANCE_DIP_COLOR)
+                                .width(0.5),
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Build a fit overlay line from a `SpectrumFitResult`.
+///
+/// Returns `None` if the fit didn't converge, no enabled isotopes have resonance data,
+/// or model construction fails.
+pub(crate) fn build_fit_line(
+    result: &nereids_pipeline::pipeline::SpectrumFitResult,
+    entries: &[IsotopeEntry],
+    energies: &[f64],
+    temperature_k: f64,
+    x_values: &[f64],
+    n_plot: usize,
+) -> Option<Line<'static>> {
+    if !result.converged {
+        return None;
+    }
+    let resonance_data: Vec<_> = entries
+        .iter()
+        .filter(|e| e.enabled && e.resonance_data.is_some())
+        .filter_map(|e| e.resonance_data.clone())
+        .collect();
+    if resonance_data.is_empty() {
+        return None;
+    }
+    let overlay_temp = result.temperature_k.unwrap_or(temperature_k);
+    let model = nereids_fitting::transmission_model::TransmissionFitModel::new(
+        energies.to_vec(),
+        resonance_data,
+        overlay_temp,
+        None,
+        (0..result.densities.len()).collect(),
+        None,
+        None,
+    )
+    .ok()?;
+
+    use nereids_fitting::lm::FitModel;
+    let fitted_t = model.evaluate(&result.densities);
+    let n_fit = n_plot.min(fitted_t.len());
+    let fit_points: PlotPoints = (0..n_fit)
+        .filter(|&i| x_values[i].is_finite())
+        .map(|i| [x_values[i], fitted_t[i]])
+        .collect();
+    Some(Line::new("Fit", fit_points).width(2.0))
 }
