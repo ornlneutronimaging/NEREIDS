@@ -148,18 +148,19 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
     ) = if let Some(ref pfr) = state.pixel_fit_result {
         // Prefer labels from FitFeedback (captured at fit time) to avoid
         // desync if isotope_entries are modified after the fit.
-        let labels: Vec<String> = state
-            .last_fit_feedback
-            .as_ref()
-            .map(|fb| fb.densities.iter().map(|(s, _)| s.clone()).collect())
-            .unwrap_or_else(|| {
-                state
-                    .isotope_entries
-                    .iter()
-                    .filter(|e| e.enabled && e.resonance_data.is_some())
-                    .map(|e| e.symbol.clone())
-                    .collect()
-            });
+        // Only trust feedback when its length matches the result (a failed
+        // fit may leave stale feedback with a different isotope count).
+        let labels: Vec<String> = match state.last_fit_feedback.as_ref() {
+            Some(fb) if fb.densities.len() == pfr.densities.len() && !fb.densities.is_empty() => {
+                fb.densities.iter().map(|(s, _)| s.clone()).collect()
+            }
+            _ => state
+                .isotope_entries
+                .iter()
+                .filter(|e| e.enabled && e.resonance_data.is_some())
+                .map(|e| e.symbol.clone())
+                .collect(),
+        };
         (
             Some(pfr.densities.clone()),
             pfr.uncertainties.clone(),
@@ -819,7 +820,7 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
         let result = nereids_pipeline::pipeline::SpectrumFitResult {
             densities,
             uncertainties,
-            reduced_chi_squared: snap.single_fit_chi_squared.unwrap_or(0.0),
+            reduced_chi_squared: snap.single_fit_chi_squared.unwrap_or(f64::NAN),
             converged: snap.single_fit_converged.unwrap_or(false),
             iterations: snap.single_fit_iterations.unwrap_or(0),
             temperature_k: snap.single_fit_temperature,

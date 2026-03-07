@@ -126,6 +126,8 @@ pub fn spatial_map(
         }
     }
 
+    let isotope_labels = config.isotope_names().to_vec();
+
     // Bail out before the expensive precompute if:
     //   (a) the cancel flag is already set, or
     //   (b) every pixel is masked dead — nothing to fit.
@@ -139,7 +141,7 @@ pub fn spatial_map(
         chi_squared_map: Array2::from_elem((height, width), f64::NAN),
         converged_map: Array2::from_elem((height, width), false),
         temperature_map: None,
-        isotope_labels: config.isotope_names().to_vec(),
+        isotope_labels: isotope_labels.clone(),
         n_converged: 0,
         n_total: 0,
     };
@@ -301,7 +303,7 @@ pub fn spatial_map(
         chi_squared_map,
         converged_map,
         temperature_map,
-        isotope_labels: config.isotope_names().to_vec(),
+        isotope_labels,
         n_converged,
         n_total: results.len(),
     })

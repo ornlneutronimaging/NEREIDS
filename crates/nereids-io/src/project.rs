@@ -2055,7 +2055,9 @@ mod tests {
         snap.single_fit_uncertainties = Some(vec![1e-5, 2e-5]);
         snap.single_fit_chi_squared = Some(1.23);
         snap.single_fit_temperature = Some(296.0);
+        snap.single_fit_temperature_unc = Some(5.0);
         snap.single_fit_converged = Some(true);
+        snap.single_fit_iterations = Some(42);
         snap.single_fit_pixel = Some((10, 20));
         snap.single_fit_labels = Some(vec!["U-238".into(), "Fe-56".into()]);
         save_project(&path, &snap).unwrap();
@@ -2071,7 +2073,9 @@ mod tests {
         );
         assert!((loaded.single_fit_chi_squared.unwrap() - 1.23).abs() < 1e-10);
         assert!((loaded.single_fit_temperature.unwrap() - 296.0).abs() < 1e-10);
+        assert!((loaded.single_fit_temperature_unc.unwrap() - 5.0).abs() < 1e-10);
         assert_eq!(loaded.single_fit_converged, Some(true));
+        assert_eq!(loaded.single_fit_iterations, Some(42));
         assert_eq!(loaded.single_fit_pixel, Some((10, 20)));
         let expected_labels: Vec<String> = vec!["U-238".into(), "Fe-56".into()];
         assert_eq!(loaded.single_fit_labels, Some(expected_labels));
