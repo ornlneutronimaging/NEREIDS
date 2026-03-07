@@ -1,4 +1,4 @@
-//! Project file save/load for `.nrd.h5` (NEREIDS HDF5 archive).
+//! Project file save for `.nrd.h5` (NEREIDS HDF5 archive).
 //!
 //! The project file captures the full session state so users can persist
 //! and share analysis sessions. This module defines [`ProjectSnapshot`]
@@ -53,6 +53,7 @@ pub struct ProjectSnapshot {
     pub fit_temperature: bool,
 
     // -- config/resolution --
+    pub resolution_enabled: bool,
     /// "gaussian" | "tabulated"
     pub resolution_kind: String,
     pub delta_t_us: Option<f64>,
@@ -253,6 +254,7 @@ fn write_config(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoError
     let res = config
         .create_group("resolution")
         .map_err(|e| hdf5_err("create /config/resolution", e))?;
+    write_bool_attr(&res, "enabled", snap.resolution_enabled)?;
     write_str_attr(&res, "kind", &snap.resolution_kind)?;
     if let Some(dt) = snap.delta_t_us {
         write_f64_attr(&res, "delta_t_us", dt)?;
@@ -318,15 +320,25 @@ fn write_intermediate(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), I
 
     if let Some(ref norm) = snap.normalized {
         let shape = [norm.shape()[0], norm.shape()[1], norm.shape()[2]];
-        let data: Vec<f64> = norm.iter().copied().collect();
-        inter
-            .new_dataset::<f64>()
-            .shape(shape)
-            .chunk(chunk_shape_3d(shape))
-            .deflate(4)
-            .create("normalized")
-            .and_then(|ds| ds.write_raw(&data))
-            .map_err(|e| hdf5_err("/intermediate/normalized", e))?;
+        let write_result = if let Some(slice) = norm.as_slice() {
+            inter
+                .new_dataset::<f64>()
+                .shape(shape)
+                .chunk(chunk_shape_3d(shape))
+                .deflate(4)
+                .create("normalized")
+                .and_then(|ds| ds.write_raw(slice))
+        } else {
+            let data: Vec<f64> = norm.iter().copied().collect();
+            inter
+                .new_dataset::<f64>()
+                .shape(shape)
+                .chunk(chunk_shape_3d(shape))
+                .deflate(4)
+                .create("normalized")
+                .and_then(|ds| ds.write_raw(&data))
+        };
+        write_result.map_err(|e| hdf5_err("/intermediate/normalized", e))?;
     }
 
     if let Some(ref energies) = snap.energies {
@@ -360,6 +372,8 @@ fn write_results(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoErro
             density
                 .new_dataset::<f64>()
                 .shape(shape)
+                .chunk(shape)
+                .deflate(4)
                 .create(name.as_str())
                 .and_then(|ds| ds.write_raw(&data))
                 .map_err(|e| hdf5_err(&format!("/results/density/{name}"), e))?;
@@ -379,6 +393,8 @@ fn write_results(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoErro
             let data: Vec<f64> = map.iter().copied().collect();
             unc.new_dataset::<f64>()
                 .shape(shape)
+                .chunk(shape)
+                .deflate(4)
                 .create(name.as_str())
                 .and_then(|ds| ds.write_raw(&data))
                 .map_err(|e| hdf5_err(&format!("/results/uncertainty/{name}"), e))?;
@@ -391,6 +407,8 @@ fn write_results(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoErro
         results
             .new_dataset::<f64>()
             .shape(shape)
+            .chunk(shape)
+            .deflate(4)
             .create("chi_squared")
             .and_then(|ds| ds.write_raw(&data))
             .map_err(|e| hdf5_err("/results/chi_squared", e))?;
@@ -402,6 +420,8 @@ fn write_results(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoErro
         results
             .new_dataset::<u8>()
             .shape(shape)
+            .chunk(shape)
+            .deflate(4)
             .create("converged")
             .and_then(|ds| ds.write_raw(&data))
             .map_err(|e| hdf5_err("/results/converged", e))?;
@@ -413,6 +433,8 @@ fn write_results(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoErro
         results
             .new_dataset::<f64>()
             .shape(shape)
+            .chunk(shape)
+            .deflate(4)
             .create("temperature")
             .and_then(|ds| ds.write_raw(&data))
             .map_err(|e| hdf5_err("/results/temperature", e))?;
@@ -567,6 +589,7 @@ mod tests {
             max_iter: 20,
             temperature_k: 300.0,
             fit_temperature: false,
+            resolution_enabled: false,
             resolution_kind: "gaussian".into(),
             delta_t_us: Some(1.5),
             delta_l_m: Some(0.003),
