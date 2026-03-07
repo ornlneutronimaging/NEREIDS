@@ -635,6 +635,8 @@ pub struct AppState {
     pub status_message: String,
     pub is_fitting: bool,
     pub is_fetching_endf: bool,
+    /// Cloned egui context for background threads to request repaints.
+    pub egui_ctx: Option<egui::Context>,
 
     /// Prevents auto-load retry after a loading failure; cleared when file paths change.
     pub load_error: bool,
@@ -1208,6 +1210,7 @@ impl Default for AppState {
             status_message: "Ready".into(),
             is_fitting: false,
             is_fetching_endf: false,
+            egui_ctx: None,
 
             hdf5_path: None,
             nexus_metadata: None,

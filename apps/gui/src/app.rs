@@ -70,20 +70,19 @@ impl eframe::App for NereidsApp {
             self.state.last_applied_dark_mode = Some(resolved);
         }
 
+        // Store context so background threads can request repaints.
+        self.state.egui_ctx = Some(ctx.clone());
+
         // Poll background tasks
         poll_pending_tasks(&mut self.state);
 
         // Refresh memory telemetry (750ms interval)
         self.memory.refresh(ctx.input(|i| i.time));
 
-        // Keep repainting while background work is in progress.
-        // Use request_repaint_after with a short interval rather than bare
-        // request_repaint() — on macOS the OS compositor can deprioritize
-        // the GUI thread when rayon saturates all CPU cores, causing the
-        // progress bar to freeze even though the atomic counter updates.
-        // A timed repaint guarantees the event loop wakes at 10 Hz minimum.
-        if self.state.is_fitting
-            || self.state.is_fetching_endf
+        // Keep repainting while background work is in progress (ENDF fetches).
+        // Fitting progress uses a dedicated watcher thread that calls
+        // ctx.request_repaint() directly — more reliable than timers.
+        if self.state.is_fetching_endf
             || self.state.is_fetching_fm_endf
             || self.state.is_fetching_detect_endf
         {

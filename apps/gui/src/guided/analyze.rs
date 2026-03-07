@@ -18,7 +18,7 @@ use nereids_io::spectrum::{SpectrumUnit, SpectrumValueKind};
 use nereids_physics::resolution::{ResolutionFunction, ResolutionParams};
 use nereids_pipeline::pipeline::FitConfig;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
 /// Draw the Analyze step content.
@@ -1232,7 +1232,33 @@ pub fn run_spatial_map(state: &mut AppState) {
     let (fp, progress) = crate::state::FittingProgress::new(n_live);
     state.fitting_progress = Some(fp);
 
+    // Clone the egui context so the background thread can poke the GUI
+    // event loop directly via ctx.request_repaint().  This sends an
+    // OS-level wake signal — far more reliable than timer-based repaints
+    // when rayon saturates the CPU.
+    let ctx = state.egui_ctx.clone();
+
     std::thread::spawn(move || {
+        // Watcher thread: poke the GUI every 100ms so the progress bar
+        // repaints.  Uses near-zero CPU (sleep + one syscall per wake).
+        let done_flag = Arc::new(AtomicBool::new(false));
+        let watcher = {
+            let done = Arc::clone(&done_flag);
+            let repaint_ctx = ctx.clone();
+            std::thread::spawn(move || {
+                while !done.load(Ordering::Relaxed) {
+                    if let Some(ref c) = repaint_ctx {
+                        c.request_repaint();
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                // One final poke so the completion frame renders immediately.
+                if let Some(ref c) = repaint_ctx {
+                    c.request_repaint();
+                }
+            })
+        };
+
         let result = nereids_pipeline::spatial::spatial_map(
             norm.transmission.view(),
             norm.uncertainty.view(),
@@ -1241,6 +1267,11 @@ pub fn run_spatial_map(state: &mut AppState) {
             Some(&cancel),
             Some(&progress),
         );
+
+        // Signal watcher to stop, then send result.
+        done_flag.store(true, Ordering::Relaxed);
+        watcher.join().ok();
+
         match result {
             Ok(r) => {
                 if !cancel.load(Ordering::Relaxed) {
