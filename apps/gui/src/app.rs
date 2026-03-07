@@ -76,13 +76,18 @@ impl eframe::App for NereidsApp {
         // Refresh memory telemetry (750ms interval)
         self.memory.refresh(ctx.input(|i| i.time));
 
-        // Keep repainting while background work is in progress
+        // Keep repainting while background work is in progress.
+        // Use request_repaint_after with a short interval rather than bare
+        // request_repaint() — on macOS the OS compositor can deprioritize
+        // the GUI thread when rayon saturates all CPU cores, causing the
+        // progress bar to freeze even though the atomic counter updates.
+        // A timed repaint guarantees the event loop wakes at 10 Hz minimum.
         if self.state.is_fitting
             || self.state.is_fetching_endf
             || self.state.is_fetching_fm_endf
             || self.state.is_fetching_detect_endf
         {
-            ctx.request_repaint();
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
         // Top toolbar

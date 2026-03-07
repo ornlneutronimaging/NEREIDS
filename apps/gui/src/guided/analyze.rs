@@ -343,6 +343,7 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
         if let Some((y, x)) = clicked {
             state.selected_pixel = Some((y, x));
             state.pixel_fit_result = None;
+            state.residuals_cache = None;
             state.last_fit_feedback = None;
         }
     } else if let Some(ref norm) = state.normalized {
@@ -507,6 +508,7 @@ fn apply_roi_editor_result(state: &mut AppState, result: RoiEditorResult) {
         RoiEditorResult::ClickedPixel(y, x) => {
             state.selected_pixel = Some((y, x));
             state.pixel_fit_result = None;
+            state.residuals_cache = None;
             state.last_fit_feedback = None;
         }
         RoiEditorResult::None => {}
@@ -558,6 +560,7 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
             if y_changed || x_changed {
                 state.selected_pixel = Some((y_val, x_val));
                 state.pixel_fit_result = None;
+                state.residuals_cache = None;
             }
         }
     });

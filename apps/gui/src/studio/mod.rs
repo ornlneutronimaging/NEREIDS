@@ -261,6 +261,7 @@ fn analysis_map_column(
                 {
                     state.selected_pixel = Some((y, x));
                     state.pixel_fit_result = None;
+                    state.residuals_cache = None;
                 }
                 if show_bar {
                     result_widgets::draw_colorbar(ui, data, colormap);
