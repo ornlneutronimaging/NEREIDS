@@ -1,16 +1,13 @@
 //! Forward Model tool — independent isotope sandbox with live spectrum preview.
 
 use crate::state::{
-    AppState, EndfFetchResult, EndfStatus, GuidedStep, IsotopeEntry, PeriodicTableTarget,
-    ResolutionMode, SpectrumAxis,
+    AppState, EndfStatus, GuidedStep, IsotopeEntry, PeriodicTableTarget, SpectrumAxis,
 };
 use crate::widgets::design;
 use egui_plot::{Line, Plot, PlotPoints};
 use nereids_endf::retrieval::EndfLibrary;
-use nereids_physics::resolution::{ResolutionFunction, ResolutionParams};
 use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 
 /// Draw the Forward Model tool content.
@@ -70,39 +67,16 @@ pub fn forward_model_step(ui: &mut egui::Ui, state: &mut AppState) {
 /// Returns `(instrument, warning)` — warning is set if resolution is enabled
 /// but parameters are invalid (e.g., flight path not configured).
 pub(crate) fn fm_instrument(state: &AppState) -> (Option<InstrumentParams>, Option<&'static str>) {
-    if !state.fm_resolution_enabled {
-        return (None, None);
-    }
-    let fp = state.beamline.flight_path_m;
-    match &state.fm_resolution_mode {
-        ResolutionMode::Gaussian {
-            delta_t_us,
-            delta_l_m,
-        } => match ResolutionParams::new(fp, *delta_t_us, *delta_l_m) {
-            Ok(p) => (
-                Some(InstrumentParams {
-                    resolution: ResolutionFunction::Gaussian(p),
-                }),
-                None,
-            ),
-            Err(_) => (
-                None,
-                Some(
-                    "Resolution enabled but flight path not configured \u{2014} broadening disabled",
-                ),
-            ),
-        },
-        ResolutionMode::Tabulated {
-            data: Some(tab), ..
-        } => (
-            Some(InstrumentParams {
-                resolution: ResolutionFunction::Tabulated(Arc::clone(tab)),
-            }),
+    match design::build_resolution_function(
+        state.fm_resolution_enabled,
+        &state.fm_resolution_mode,
+        state.beamline.flight_path_m,
+    ) {
+        Ok(Some(resolution)) => (Some(InstrumentParams { resolution }), None),
+        Ok(None) => (None, None),
+        Err(_) => (
             None,
-        ),
-        ResolutionMode::Tabulated { data: None, .. } => (
-            None,
-            Some("Resolution file not loaded \u{2014} broadening disabled"),
+            Some("Resolution enabled but parameters invalid \u{2014} broadening disabled"),
         ),
     }
 }
@@ -558,32 +532,5 @@ pub(crate) fn fm_fetch_endf_data(state: &mut AppState) {
     state.status_message = "Fetching ENDF data (FM)...".into();
     let cancel = Arc::clone(&state.cancel_token);
 
-    std::thread::spawn(move || {
-        let retriever = nereids_endf::retrieval::EndfRetriever::new();
-        for (index, isotope, symbol, library) in work {
-            if cancel.load(Ordering::Relaxed) {
-                break;
-            }
-            let Some(mat) = retrieval::mat_number(&isotope) else {
-                continue;
-            };
-            let result = match retriever.get_endf_file(&isotope, library, mat) {
-                Ok((_path, endf_text)) => {
-                    match nereids_endf::parser::parse_endf_file2(&endf_text) {
-                        Ok(data) => Ok(data),
-                        Err(e) => Err(format!("Parse error for {}: {}", symbol, e)),
-                    }
-                }
-                Err(e) => Err(format!("Fetch error for {}: {}", symbol, e)),
-            };
-            if cancel.load(Ordering::Relaxed) {
-                break;
-            }
-            let _ = tx.send(EndfFetchResult {
-                index,
-                symbol,
-                result,
-            });
-        }
-    });
+    std::thread::spawn(move || design::endf_fetch_worker(work, cancel, tx));
 }

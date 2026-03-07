@@ -880,30 +880,15 @@ fn build_residuals_cache(
     }
 
     // Build instrument params from current resolution settings.
-    let instrument = if state.resolution_enabled {
-        use nereids_physics::resolution::{ResolutionFunction, ResolutionParams};
+    let instrument = {
         use nereids_physics::transmission::InstrumentParams;
-        match &state.resolution_mode {
-            crate::state::ResolutionMode::Gaussian {
-                delta_t_us,
-                delta_l_m,
-            } => {
-                let p =
-                    ResolutionParams::new(state.beamline.flight_path_m, *delta_t_us, *delta_l_m)
-                        .ok()?;
-                Some(std::sync::Arc::new(InstrumentParams {
-                    resolution: ResolutionFunction::Gaussian(p),
-                }))
-            }
-            crate::state::ResolutionMode::Tabulated {
-                data: Some(tab), ..
-            } => Some(std::sync::Arc::new(InstrumentParams {
-                resolution: ResolutionFunction::Tabulated(std::sync::Arc::clone(tab)),
-            })),
-            crate::state::ResolutionMode::Tabulated { data: None, .. } => return None,
-        }
-    } else {
-        None
+        design::build_resolution_function(
+            state.resolution_enabled,
+            &state.resolution_mode,
+            state.beamline.flight_path_m,
+        )
+        .ok()?
+        .map(|resolution| std::sync::Arc::new(InstrumentParams { resolution }))
     };
 
     let model = nereids_fitting::transmission_model::TransmissionFitModel::new(
