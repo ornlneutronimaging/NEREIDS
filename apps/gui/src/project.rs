@@ -408,6 +408,17 @@ fn execute_save_with_dialog(state: &mut AppState) {
 
 /// Execute the actual save to `path` with the given mode.
 fn execute_save(state: &mut AppState, path: &Path, mode: SaveDataMode) {
+    // Fall back to linked if embedded requested but no data available
+    let mode = if mode == SaveDataMode::Embedded
+        && state.sample_data.is_none()
+        && state.open_beam_data.is_none()
+        && state.spectrum_values.is_none()
+    {
+        state.status_message = "No raw data to embed — saving in linked mode.".into();
+        SaveDataMode::Linked
+    } else {
+        mode
+    };
     let snap = snapshot_from_state(state);
     let result = match mode {
         SaveDataMode::Linked => nereids_io::project::save_project(path, &snap),
@@ -518,11 +529,14 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
     state.residuals_cache = None;
     state.sample_data = None;
     state.open_beam_data = None;
+    state.spectrum_values = None;
     state.dead_pixels = None;
     state.fm_spectrum = None;
     state.fm_per_isotope_spectra.clear();
     state.detect_results.clear();
     state.load_error = false;
+    state.show_save_modal = false;
+    state.save_data_mode = SaveDataMode::default();
 
     // 2. Parse fitting_type and data_type
     state.fitting_type = match snap.fitting_type.as_str() {
@@ -697,6 +711,8 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
             state.spectrum_values = Some(data);
         }
         state.last_save_mode = SaveDataMode::Embedded;
+    } else {
+        state.last_save_mode = SaveDataMode::Linked;
     }
 
     // 15. Restore intermediate data
