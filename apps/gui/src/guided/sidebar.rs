@@ -390,6 +390,7 @@ fn kind_color(kind: crate::state::ProvenanceEventKind) -> Color32 {
         AnalysisRun => Color32::from_rgb(0xaf, 0x52, 0xde), // purple
         Exported => semantic::GREEN,
         ProjectSaved => Color32::from_rgb(0x00, 0x7a, 0xff), // blue
+        ProjectLoaded => Color32::from_rgb(0x00, 0x7a, 0xff), // blue
     }
 }
 

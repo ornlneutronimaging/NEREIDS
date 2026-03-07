@@ -315,6 +315,7 @@ pub enum ProvenanceEventKind {
     AnalysisRun,
     Exported,
     ProjectSaved,
+    ProjectLoaded,
 }
 
 impl ProvenanceEvent {
