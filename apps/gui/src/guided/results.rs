@@ -41,7 +41,7 @@ pub fn results_step(ui: &mut egui::Ui, state: &mut AppState) {
     let result = state.spatial_result.as_ref().unwrap();
 
     // -- Summary Statistics Card --
-    result_widgets::summary_card(ui, result, &state.isotope_entries);
+    result_widgets::summary_card(ui, result);
     ui.add_space(4.0);
 
     // -- Stat Row --
@@ -80,13 +80,7 @@ pub fn results_step(ui: &mut egui::Ui, state: &mut AppState) {
     // -- Thumbnail: first density map (compact, no toolbelt) --
     if let Some(data) = result.density_maps.first() {
         design::card_with_header(ui, "Density Map Preview", None, |ui| {
-            let symbols: Vec<String> = state
-                .isotope_entries
-                .iter()
-                .filter(|e| e.enabled && e.resonance_data.is_some())
-                .map(|e| e.symbol.clone())
-                .collect();
-            if let Some(sym) = symbols.first() {
+            if let Some(sym) = result.isotope_labels.first() {
                 ui.label(egui::RichText::new(sym).small());
             }
             let _ = show_colormapped_image(ui, data, "results_thumb", Colormap::Viridis);

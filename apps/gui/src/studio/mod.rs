@@ -93,12 +93,7 @@ fn analysis_tab(ui: &mut egui::Ui, state: &mut AppState) {
     // Extract data before mutable borrows
     let (n_density, symbols, density_maps) = match state.spatial_result {
         Some(ref r) => {
-            let symbols: Vec<String> = state
-                .isotope_entries
-                .iter()
-                .filter(|e| e.enabled && e.resonance_data.is_some())
-                .map(|e| e.symbol.clone())
-                .collect();
+            let symbols = r.isotope_labels.clone();
             let n_density = r.density_maps.len().min(symbols.len());
             let density_maps = r.density_maps.clone();
             (n_density, symbols, density_maps)
@@ -996,7 +991,7 @@ fn parameter_sidebar(ctx: &egui::Context, state: &mut AppState) {
                 ui.add_space(6.0);
 
                 if let Some(ref result) = state.spatial_result {
-                    result_widgets::summary_card(ui, result, &state.isotope_entries);
+                    result_widgets::summary_card(ui, result);
                 }
             });
         });

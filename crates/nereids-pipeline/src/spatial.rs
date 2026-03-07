@@ -29,6 +29,10 @@ pub struct SpatialResult {
     pub converged_map: Array2<bool>,
     /// Fitted temperature map (K). `Some` when `config.fit_temperature()` is true.
     pub temperature_map: Option<Array2<f64>>,
+    /// Isotope labels captured at compute time, one per density map.
+    /// Ensures display labels stay in sync with density data even if the
+    /// user modifies the isotope list after fitting.
+    pub isotope_labels: Vec<String>,
     /// Number of pixels that converged.
     pub n_converged: usize,
     /// Total number of pixels fitted.
@@ -135,6 +139,7 @@ pub fn spatial_map(
         chi_squared_map: Array2::from_elem((height, width), f64::NAN),
         converged_map: Array2::from_elem((height, width), false),
         temperature_map: None,
+        isotope_labels: config.isotope_names().to_vec(),
         n_converged: 0,
         n_total: 0,
     };
@@ -296,6 +301,7 @@ pub fn spatial_map(
         chi_squared_map,
         converged_map,
         temperature_map,
+        isotope_labels: config.isotope_names().to_vec(),
         n_converged,
         n_total: results.len(),
     })

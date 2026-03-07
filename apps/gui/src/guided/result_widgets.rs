@@ -5,11 +5,7 @@ use crate::widgets::design::{self, BadgeVariant};
 use crate::widgets::image_view::{apply_colormap, data_range, render_to_rgba};
 
 /// Summary statistics card showing convergence and density stats.
-pub fn summary_card(
-    ui: &mut egui::Ui,
-    result: &nereids_pipeline::spatial::SpatialResult,
-    isotope_entries: &[crate::state::IsotopeEntry],
-) {
+pub fn summary_card(ui: &mut egui::Ui, result: &nereids_pipeline::spatial::SpatialResult) {
     let pct = if result.n_total > 0 {
         100.0 * result.n_converged as f64 / result.n_total as f64
     } else {
@@ -77,11 +73,7 @@ pub fn summary_card(
             }
 
             // Per-isotope mean density
-            let enabled: Vec<_> = isotope_entries
-                .iter()
-                .filter(|e| e.enabled && e.resonance_data.is_some())
-                .collect();
-            for (i, entry) in enabled.iter().enumerate() {
+            for (i, label) in result.isotope_labels.iter().enumerate() {
                 if i < result.density_maps.len() {
                     let map = &result.density_maps[i];
                     let conv_vals: Vec<f64> = map
@@ -93,10 +85,7 @@ pub fn summary_card(
                         .collect();
                     if !conv_vals.is_empty() {
                         let mean: f64 = conv_vals.iter().sum::<f64>() / conv_vals.len() as f64;
-                        ui.label(format!(
-                            "{}: mean density = {:.4e} atoms/barn",
-                            entry.symbol, mean
-                        ));
+                        ui.label(format!("{label}: mean density = {:.4e} atoms/barn", mean));
                     }
                 }
             }
