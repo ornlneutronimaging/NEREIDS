@@ -6,15 +6,23 @@ use std::sync::Arc;
 
 use nereids_endf::resonance::ResonanceData;
 use nereids_io::normalization::NormalizedData;
-use nereids_io::project::{PROJECT_SCHEMA_VERSION, ProjectSnapshot};
+use nereids_io::project::{EmbeddedData, PROJECT_SCHEMA_VERSION, ProjectSnapshot};
 use nereids_io::spectrum::{SpectrumUnit, SpectrumValueKind};
 use nereids_pipeline::spatial::SpatialResult;
 
 use crate::state::{
     AppState, DataType, EndfStatus, FittingType, GuidedStep, InputMode, IsotopeEntry,
-    ProvenanceEvent, ProvenanceEventKind, ResolutionMode, RoiSelection, SolverMethod, UiMode,
+    ProvenanceEvent, ProvenanceEventKind, ResolutionMode, RoiSelection, SaveDataMode, SolverMethod,
+    UiMode,
 };
 use crate::widgets::design::library_name;
+
+/// Internal action for the save modal.
+enum SaveModalAction {
+    None,
+    Save,
+    Cancel,
+}
 
 /// Build a [`ProjectSnapshot`] from the current [`AppState`].
 pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
@@ -203,6 +211,9 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         spectrum_kind: spectrum_kind.into(),
         rebin_factor: state.rebin_factor.min(u32::MAX as usize) as u32,
         rebin_applied: state.rebin_applied,
+        sample_data: None,
+        open_beam_data: None,
+        spectrum_values: None,
         normalized,
         energies: state.energies.clone(),
         density_maps,
@@ -218,58 +229,23 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
     }
 }
 
-/// Show a native save dialog and write the project file.
+/// Open the save-mode chooser modal.
 pub fn save_project_dialog(state: &mut AppState) {
-    let mut dialog = rfd::FileDialog::new()
-        .set_title("Save NEREIDS Project")
-        .add_filter("NEREIDS Project", &["nrd.h5"]);
-
-    if let Some(ref existing) = state.project_file_path {
-        if let Some(parent) = existing.parent() {
-            dialog = dialog.set_directory(parent);
-        }
-        if let Some(name) = existing.file_name() {
-            dialog = dialog.set_file_name(name.to_string_lossy());
-        }
-    }
-
-    if let Some(path) = dialog.save_file() {
-        // Ensure .nrd.h5 extension
-        let path = ensure_extension(path);
-
-        let snap = snapshot_from_state(state);
-        match nereids_io::project::save_project(&path, &snap) {
-            Ok(()) => {
-                state.project_file_path = Some(path.clone());
-                state.status_message = format!("Project saved to {}", path.display());
-                state.log_provenance(
-                    ProvenanceEventKind::ProjectSaved,
-                    format!("Saved to {}", path.display()),
-                );
-            }
-            Err(e) => {
-                state.status_message = format!("Save failed: {e}");
-            }
-        }
-    }
+    state.show_save_modal = true;
 }
 
 /// Quick-save: re-save to the existing project file path without dialog.
 pub fn save_project_quick(state: &mut AppState) {
     if let Some(ref path) = state.project_file_path.clone() {
-        let snap = snapshot_from_state(state);
-        match nereids_io::project::save_project(path, &snap) {
-            Ok(()) => {
-                state.status_message = format!("Project saved to {}", path.display());
-                state.log_provenance(
-                    ProvenanceEventKind::ProjectSaved,
-                    format!("Saved to {}", path.display()),
-                );
-            }
-            Err(e) => {
-                state.status_message = format!("Save failed: {e}");
-            }
-        }
+        // If last save was embedded but data is gone, fall back to linked
+        let mode = if state.last_save_mode == SaveDataMode::Embedded && state.sample_data.is_none()
+        {
+            state.status_message = "Raw data no longer in memory — saving in linked mode.".into();
+            SaveDataMode::Linked
+        } else {
+            state.last_save_mode
+        };
+        execute_save(state, path, mode);
     } else {
         save_project_dialog(state);
     }
@@ -288,6 +264,195 @@ fn ensure_extension(path: PathBuf) -> PathBuf {
         PathBuf::from(format!("{stripped}.nrd.h5"))
     } else {
         PathBuf::from(format!("{s}.nrd.h5"))
+    }
+}
+
+/// Render the save-mode chooser modal window.
+pub fn save_modal(ctx: &egui::Context, state: &mut AppState) {
+    if !state.show_save_modal {
+        return;
+    }
+
+    let can_embed = state.sample_data.is_some();
+    let (raw_bytes, compressed_bytes) = if can_embed {
+        nereids_io::project::estimate_embedded_size(
+            state.sample_data.as_ref(),
+            state.open_beam_data.as_ref(),
+            state.spectrum_values.as_deref(),
+        )
+    } else {
+        (0, 0)
+    };
+
+    let mut action = SaveModalAction::None;
+
+    egui::Window::new("Save Project")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.label("Choose how to store raw data:");
+            ui.add_space(8.0);
+
+            ui.radio_value(
+                &mut state.save_data_mode,
+                SaveDataMode::Linked,
+                "Link to source files (recommended)",
+            );
+            ui.add_space(4.0);
+
+            if can_embed {
+                ui.radio_value(
+                    &mut state.save_data_mode,
+                    SaveDataMode::Embedded,
+                    "Embed all data (for sharing)",
+                );
+            } else {
+                ui.add_enabled(
+                    false,
+                    egui::RadioButton::new(false, "Embed all data (for sharing)"),
+                )
+                .on_disabled_hover_text(
+                    "Raw data not in memory. Reload data in the Load step to enable embedding.",
+                );
+            }
+
+            if state.save_data_mode == SaveDataMode::Embedded && can_embed {
+                let ratio = nereids_io::project::EMBED_COMPRESSION_RATIO;
+                ui.add_space(8.0);
+                crate::widgets::design::card(ui, |ui| {
+                    if let Some(ref sample) = state.sample_data {
+                        let s = (sample.len() as u64) * 8;
+                        ui.label(format!(
+                            "Sample: {} \u{2192} ~{}",
+                            crate::telemetry::format_bytes(s),
+                            crate::telemetry::format_bytes((s as f64 / ratio) as u64),
+                        ));
+                    }
+                    if let Some(ref ob) = state.open_beam_data {
+                        let s = (ob.len() as u64) * 8;
+                        ui.label(format!(
+                            "Open beam: {} \u{2192} ~{}",
+                            crate::telemetry::format_bytes(s),
+                            crate::telemetry::format_bytes((s as f64 / ratio) as u64),
+                        ));
+                    }
+                    if let Some(ref sp) = state.spectrum_values {
+                        let s = (sp.len() as u64) * 8;
+                        ui.label(format!(
+                            "Spectrum: {} \u{2192} ~{}",
+                            crate::telemetry::format_bytes(s),
+                            crate::telemetry::format_bytes((s as f64 / ratio) as u64),
+                        ));
+                    }
+                    ui.separator();
+                    ui.label(format!(
+                        "Total: {} \u{2192} ~{}",
+                        crate::telemetry::format_bytes(raw_bytes),
+                        crate::telemetry::format_bytes(compressed_bytes),
+                    ));
+                });
+
+                if state.data_type == Some(DataType::Events) {
+                    ui.add_space(4.0);
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        "\u{26A0} Raw event data is very large. Consider linked mode.",
+                    );
+                }
+            }
+
+            ui.add_space(12.0);
+
+            ui.horizontal(|ui| {
+                let label = if state.save_data_mode == SaveDataMode::Embedded && can_embed {
+                    format!(
+                        "Save (~{})",
+                        crate::telemetry::format_bytes(compressed_bytes)
+                    )
+                } else {
+                    "Save".to_string()
+                };
+                if ui.button(label).clicked() {
+                    action = SaveModalAction::Save;
+                }
+                if ui.button("Cancel").clicked() {
+                    action = SaveModalAction::Cancel;
+                }
+            });
+        });
+
+    match action {
+        SaveModalAction::Save => {
+            state.show_save_modal = false;
+            execute_save_with_dialog(state);
+        }
+        SaveModalAction::Cancel => {
+            state.show_save_modal = false;
+        }
+        SaveModalAction::None => {}
+    }
+}
+
+/// Show the native file dialog and save with the currently selected mode.
+fn execute_save_with_dialog(state: &mut AppState) {
+    let mut dialog = rfd::FileDialog::new()
+        .set_title("Save NEREIDS Project")
+        .add_filter("NEREIDS Project", &["nrd.h5"]);
+
+    if let Some(ref existing) = state.project_file_path {
+        if let Some(parent) = existing.parent() {
+            dialog = dialog.set_directory(parent);
+        }
+        if let Some(name) = existing.file_name() {
+            dialog = dialog.set_file_name(name.to_string_lossy());
+        }
+    }
+
+    if let Some(path) = dialog.save_file() {
+        let path = ensure_extension(path);
+        execute_save(state, &path, state.save_data_mode);
+    }
+}
+
+/// Execute the actual save to `path` with the given mode.
+fn execute_save(state: &mut AppState, path: &Path, mode: SaveDataMode) {
+    // Fall back to linked if embedded requested but sample data not available
+    let mode = if mode == SaveDataMode::Embedded && state.sample_data.is_none() {
+        state.status_message = "Sample data required for embed — saving in linked mode.".into();
+        SaveDataMode::Linked
+    } else {
+        mode
+    };
+    let snap = snapshot_from_state(state);
+    let result = match mode {
+        SaveDataMode::Linked => nereids_io::project::save_project(path, &snap),
+        SaveDataMode::Embedded => {
+            let emb = EmbeddedData {
+                sample: state.sample_data.as_ref(),
+                open_beam: state.open_beam_data.as_ref(),
+                spectrum: state.spectrum_values.as_deref(),
+            };
+            nereids_io::project::save_project_with_data(path, &snap, Some(&emb))
+        }
+    };
+    let mode_label = match mode {
+        SaveDataMode::Linked => "linked",
+        SaveDataMode::Embedded => "embedded",
+    };
+    match result {
+        Ok(()) => {
+            state.project_file_path = Some(path.to_path_buf());
+            state.last_save_mode = mode;
+            state.status_message = format!("Project saved ({mode_label}) to {}", path.display());
+            state.log_provenance(
+                ProvenanceEventKind::ProjectSaved,
+                format!("Saved ({mode_label}) to {}", path.display()),
+            );
+        }
+        Err(e) => {
+            state.status_message = format!("Save failed: {e}");
+        }
     }
 }
 
@@ -369,11 +534,14 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
     state.residuals_cache = None;
     state.sample_data = None;
     state.open_beam_data = None;
+    state.spectrum_values = None;
     state.dead_pixels = None;
     state.fm_spectrum = None;
     state.fm_per_isotope_spectra.clear();
     state.detect_results.clear();
     state.load_error = false;
+    state.show_save_modal = false;
+    state.save_data_mode = SaveDataMode::default();
 
     // 2. Parse fitting_type and data_type
     state.fitting_type = match snap.fitting_type.as_str() {
@@ -535,6 +703,22 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
         }
         p
     });
+
+    // 14b. Restore embedded data if present
+    if snap.data_mode == "embedded" {
+        if let Some(data) = snap.sample_data {
+            state.sample_data = Some(data);
+        }
+        if let Some(data) = snap.open_beam_data {
+            state.open_beam_data = Some(data);
+        }
+        if let Some(data) = snap.spectrum_values {
+            state.spectrum_values = Some(data);
+        }
+        state.last_save_mode = SaveDataMode::Embedded;
+    } else {
+        state.last_save_mode = SaveDataMode::Linked;
+    }
 
     // 15. Restore intermediate data
     if let Some(transmission) = snap.normalized {

@@ -133,6 +133,9 @@ impl eframe::App for NereidsApp {
             }
         }
 
+        // Save-mode chooser modal
+        crate::project::save_modal(ctx, &mut self.state);
+
         // Periodic table modal overlay
         crate::widgets::periodic_table::periodic_table_modal(ctx, &mut self.state);
     }
