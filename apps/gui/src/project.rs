@@ -140,27 +140,39 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         single_fit_uncertainties,
         single_fit_chi_squared,
         single_fit_temperature,
+        single_fit_temperature_unc,
         single_fit_converged,
+        single_fit_iterations,
         single_fit_pixel,
         single_fit_labels,
     ) = if let Some(ref pfr) = state.pixel_fit_result {
+        // Prefer labels from FitFeedback (captured at fit time) to avoid
+        // desync if isotope_entries are modified after the fit.
         let labels: Vec<String> = state
-            .isotope_entries
-            .iter()
-            .filter(|e| e.enabled && e.resonance_data.is_some())
-            .map(|e| e.symbol.clone())
-            .collect();
+            .last_fit_feedback
+            .as_ref()
+            .map(|fb| fb.densities.iter().map(|(s, _)| s.clone()).collect())
+            .unwrap_or_else(|| {
+                state
+                    .isotope_entries
+                    .iter()
+                    .filter(|e| e.enabled && e.resonance_data.is_some())
+                    .map(|e| e.symbol.clone())
+                    .collect()
+            });
         (
             Some(pfr.densities.clone()),
             pfr.uncertainties.clone(),
             Some(pfr.reduced_chi_squared),
             pfr.temperature_k,
+            pfr.temperature_k_unc,
             Some(pfr.converged),
+            Some(pfr.iterations),
             state.selected_pixel,
             Some(labels),
         )
     } else {
-        (None, None, None, None, None, None, None)
+        (None, None, None, None, None, None, None, None, None)
     };
 
     // Provenance log
@@ -251,7 +263,9 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         single_fit_uncertainties,
         single_fit_chi_squared,
         single_fit_temperature,
+        single_fit_temperature_unc,
         single_fit_converged,
+        single_fit_iterations,
         single_fit_pixel,
         single_fit_labels,
         endf_cache,
@@ -782,7 +796,16 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
             chi_squared_map,
             converged_map,
             temperature_map: snap.temperature_map,
-            isotope_labels: snap.result_isotope_labels.unwrap_or_default(),
+            isotope_labels: snap.result_isotope_labels.unwrap_or_else(|| {
+                // Fallback for project files created before labels were stored
+                // in SpatialResult — derive from the restored isotope entries.
+                state
+                    .isotope_entries
+                    .iter()
+                    .filter(|e| e.enabled && e.resonance_data.is_some())
+                    .map(|e| e.symbol.clone())
+                    .collect()
+            }),
             n_converged: snap.n_converged.unwrap_or(0),
             n_total: snap.n_total.unwrap_or(0),
         };
@@ -798,9 +821,9 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
             uncertainties,
             reduced_chi_squared: snap.single_fit_chi_squared.unwrap_or(0.0),
             converged: snap.single_fit_converged.unwrap_or(false),
-            iterations: 0,
+            iterations: snap.single_fit_iterations.unwrap_or(0),
             temperature_k: snap.single_fit_temperature,
-            temperature_k_unc: None,
+            temperature_k_unc: snap.single_fit_temperature_unc,
         };
         // Rebuild FitFeedback from the restored result
         if let Some(ref labels) = snap.single_fit_labels {
@@ -823,6 +846,7 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
         }
         state.selected_pixel = snap.single_fit_pixel;
         state.pixel_fit_result = Some(result);
+        state.fit_result_gen += 1;
     }
 
     // 17. Restore provenance

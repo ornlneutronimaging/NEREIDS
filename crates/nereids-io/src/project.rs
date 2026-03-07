@@ -106,7 +106,9 @@ pub struct ProjectSnapshot {
     pub single_fit_uncertainties: Option<Vec<f64>>,
     pub single_fit_chi_squared: Option<f64>,
     pub single_fit_temperature: Option<f64>,
+    pub single_fit_temperature_unc: Option<f64>,
     pub single_fit_converged: Option<bool>,
+    pub single_fit_iterations: Option<usize>,
     pub single_fit_pixel: Option<(usize, usize)>,
     pub single_fit_labels: Option<Vec<String>>,
 
@@ -173,7 +175,9 @@ impl Default for ProjectSnapshot {
             single_fit_uncertainties: None,
             single_fit_chi_squared: None,
             single_fit_temperature: None,
+            single_fit_temperature_unc: None,
             single_fit_converged: None,
+            single_fit_iterations: None,
             single_fit_pixel: None,
             single_fit_labels: None,
             endf_cache: vec![],
@@ -669,6 +673,12 @@ fn write_results(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoErro
         }
         if let Some(temp) = snap.single_fit_temperature {
             write_f64_attr(&sf, "temperature_k", temp)?;
+        }
+        if let Some(temp_unc) = snap.single_fit_temperature_unc {
+            write_f64_attr(&sf, "temperature_k_unc", temp_unc)?;
+        }
+        if let Some(iterations) = snap.single_fit_iterations {
+            write_u32_attr(&sf, "iterations", iterations as u32)?;
         }
         if let Some(conv) = snap.single_fit_converged {
             write_bool_attr(&sf, "converged", conv)?;
@@ -1244,7 +1254,9 @@ fn read_results(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoE
         }
         snap.single_fit_chi_squared = read_f64_attr(&sf, "chi_squared").ok();
         snap.single_fit_temperature = read_f64_attr(&sf, "temperature_k").ok();
+        snap.single_fit_temperature_unc = read_f64_attr(&sf, "temperature_k_unc").ok();
         snap.single_fit_converged = read_bool_attr(&sf, "converged").ok();
+        snap.single_fit_iterations = read_u32_attr(&sf, "iterations").ok().map(|v| v as usize);
         if let (Ok(py), Ok(px)) = (read_u32_attr(&sf, "pixel_y"), read_u32_attr(&sf, "pixel_x")) {
             snap.single_fit_pixel = Some((py as usize, px as usize));
         }
@@ -1384,7 +1396,9 @@ mod tests {
             single_fit_uncertainties: None,
             single_fit_chi_squared: None,
             single_fit_temperature: None,
+            single_fit_temperature_unc: None,
             single_fit_converged: None,
+            single_fit_iterations: None,
             single_fit_pixel: None,
             single_fit_labels: None,
             endf_cache: vec![],
