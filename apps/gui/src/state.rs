@@ -496,6 +496,64 @@ pub struct DetectTraceEntry {
     pub endf_status: EndfStatus,
 }
 
+/// Progress state for spatial mapping.
+///
+/// Holds an `Arc<AtomicUsize>` shared with the background thread and the
+/// pixel total.  Display code reads the atomic directly each frame — no
+/// intermediate polling step, no sync issues.
+pub struct FittingProgress {
+    counter: Arc<AtomicUsize>,
+    total: usize,
+}
+
+impl FittingProgress {
+    pub fn new(total: usize) -> (Self, Arc<AtomicUsize>) {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let handle = Arc::clone(&counter);
+        (Self { counter, total }, handle)
+    }
+
+    /// Current number of completed pixels (reads atomic).
+    pub fn done(&self) -> usize {
+        self.counter.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn total(&self) -> usize {
+        self.total
+    }
+
+    pub fn fraction(&self) -> f32 {
+        self.done() as f32 / self.total.max(1) as f32
+    }
+}
+
+/// Cached residuals data for the Studio dock, avoiding per-frame model rebuild.
+#[derive(Clone, Debug)]
+pub struct CachedResiduals {
+    /// Generation counter of the `pixel_fit_result` that produced this cache.
+    pub fit_gen: u64,
+    /// Selected pixel at cache time.
+    pub pixel: (usize, usize),
+    /// Resolution enabled flag at cache time.
+    pub resolution_enabled: bool,
+    /// Resolution mode at cache time (compared via PartialEq).
+    pub resolution_mode: ResolutionMode,
+    /// Flight path at cache time (affects Gaussian resolution).
+    pub flight_path_m: f64,
+    /// Effective temperature used for the forward model overlay.
+    pub temperature_k: f64,
+    /// Reduced chi-squared (stored so display doesn't need to re-extract).
+    pub chi2_r: f64,
+    /// Residual points: (energy_ev, residual_value).
+    pub residuals: Vec<(f64, f64)>,
+    /// RMS of residuals.
+    pub rms: f64,
+    /// Maximum absolute residual.
+    pub max_abs: f64,
+    /// Number of finite residual points.
+    pub n_points: usize,
+}
+
 /// Main application state.
 pub struct AppState {
     // -- Data loading --
@@ -551,6 +609,10 @@ pub struct AppState {
 
     // -- Results --
     pub pixel_fit_result: Option<SpectrumFitResult>,
+    /// Generation counter; incremented each time `pixel_fit_result` is replaced.
+    pub fit_result_gen: u64,
+    /// Cached residuals for the Studio dock (keyed by `fit_result_gen` + resolution config).
+    pub residuals_cache: Option<CachedResiduals>,
     pub spatial_result: Option<SpatialResult>,
     /// Prominent feedback from last fit attempt (pixel or ROI).
     pub last_fit_feedback: Option<FitFeedback>,
@@ -573,6 +635,8 @@ pub struct AppState {
     pub status_message: String,
     pub is_fitting: bool,
     pub is_fetching_endf: bool,
+    /// Cloned egui context for background threads to request repaints.
+    pub egui_ctx: Option<egui::Context>,
 
     /// Prevents auto-load retry after a loading failure; cleared when file paths change.
     pub load_error: bool,
@@ -678,8 +742,7 @@ pub struct AppState {
     pub studio_analysis_prev_symbol: Option<String>,
 
     // -- Progress --
-    pub fitting_progress: Option<(usize, usize)>,
-    pub fitting_progress_counter: Option<Arc<AtomicUsize>>,
+    pub fitting_progress: Option<FittingProgress>,
 
     // -- Provenance --
     pub provenance_log: Vec<ProvenanceEvent>,
@@ -909,7 +972,6 @@ impl AppState {
         self.pending_detect_endf = None;
         self.is_fitting = false;
         self.fitting_progress = None;
-        self.fitting_progress_counter = None;
         self.is_fetching_endf = false;
         self.is_fetching_fm_endf = false;
         self.is_fetching_detect_endf = false;
@@ -949,6 +1011,7 @@ impl AppState {
         self.rois.clear();
         self.selected_roi = None;
         self.pixel_fit_result = None;
+        self.residuals_cache = None;
         self.spatial_result = None;
         self.last_fit_feedback = None;
         self.fitting_rois.clear();
@@ -1128,6 +1191,8 @@ impl Default for AppState {
             show_history_window: false,
 
             pixel_fit_result: None,
+            fit_result_gen: 0,
+            residuals_cache: None,
             spatial_result: None,
             last_fit_feedback: None,
 
@@ -1145,6 +1210,7 @@ impl Default for AppState {
             status_message: "Ready".into(),
             is_fitting: false,
             is_fetching_endf: false,
+            egui_ctx: None,
 
             hdf5_path: None,
             nexus_metadata: None,
@@ -1220,7 +1286,6 @@ impl Default for AppState {
             studio_analysis_isotope: 0,
             studio_analysis_prev_symbol: None,
             fitting_progress: None,
-            fitting_progress_counter: None,
 
             provenance_log: Vec::new(),
             tile_display: Vec::new(),

@@ -18,7 +18,7 @@ use nereids_io::spectrum::{SpectrumUnit, SpectrumValueKind};
 use nereids_physics::resolution::{ResolutionFunction, ResolutionParams};
 use nereids_pipeline::pipeline::FitConfig;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
 /// Draw the Analyze step content.
@@ -226,8 +226,10 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
     });
 
     if state.is_fitting {
-        if let Some((done, total)) = state.fitting_progress {
-            let frac = done as f32 / total.max(1) as f32;
+        if let Some(ref fp) = state.fitting_progress {
+            let done = fp.done();
+            let total = fp.total();
+            let frac = fp.fraction();
             crate::widgets::design::progress_mini(ui, frac, &format!("{done}/{total} px"));
         } else {
             ui.spinner();
@@ -343,6 +345,7 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
         if let Some((y, x)) = clicked {
             state.selected_pixel = Some((y, x));
             state.pixel_fit_result = None;
+            state.residuals_cache = None;
             state.last_fit_feedback = None;
         }
     } else if let Some(ref norm) = state.normalized {
@@ -507,6 +510,7 @@ fn apply_roi_editor_result(state: &mut AppState, result: RoiEditorResult) {
         RoiEditorResult::ClickedPixel(y, x) => {
             state.selected_pixel = Some((y, x));
             state.pixel_fit_result = None;
+            state.residuals_cache = None;
             state.last_fit_feedback = None;
         }
         RoiEditorResult::None => {}
@@ -558,6 +562,7 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
             if y_changed || x_changed {
                 state.selected_pixel = Some((y_val, x_val));
                 state.pixel_fit_result = None;
+                state.residuals_cache = None;
             }
         }
     });
@@ -1034,6 +1039,7 @@ fn fit_pixel(state: &mut AppState) {
     });
     state.status_message = summary;
     state.pixel_fit_result = Some(result);
+    state.fit_result_gen = state.fit_result_gen.wrapping_add(1);
 }
 
 fn fit_roi(state: &mut AppState) {
@@ -1166,6 +1172,7 @@ fn fit_roi(state: &mut AppState) {
     });
     state.status_message = summary;
     state.pixel_fit_result = Some(result);
+    state.fit_result_gen = state.fit_result_gen.wrapping_add(1);
 }
 
 pub fn run_spatial_map(state: &mut AppState) {
@@ -1216,25 +1223,88 @@ pub fn run_spatial_map(state: &mut AppState) {
     state.status_message = "Running spatial mapping...".into();
     let cancel = Arc::clone(&state.cancel_token);
 
-    // Progress counter: GUI polls this each frame via fitting_progress_counter.
-    let progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    state.fitting_progress_counter = Some(Arc::clone(&progress));
-    let n_total_pixels = height * width;
+    // Progress: single FittingProgress struct holds the Arc<AtomicUsize> counter
+    // and the pixel total.  Display code reads the atomic directly each frame.
     let n_live = match dead_pixels {
         Some(ref dp) => dp.iter().filter(|&&d| !d).count(),
-        None => n_total_pixels,
+        None => height * width,
     };
-    state.fitting_progress = Some((0, n_live));
+    let (fp, progress) = crate::state::FittingProgress::new(n_live);
+    state.fitting_progress = Some(fp);
+
+    // Clone the egui context so the background thread can poke the GUI
+    // event loop directly via ctx.request_repaint().  This sends an
+    // OS-level wake signal — far more reliable than timer-based repaints
+    // when rayon saturates the CPU.
+    let ctx = state.egui_ctx.clone();
+
+    // Build a DEDICATED rayon pool for per-pixel fitting.
+    //
+    // spatial_map uses par_iter over pixels, and each pixel's forward-model
+    // evaluation calls broadened_cross_sections / unbroadened_cross_sections
+    // which ALSO use par_iter on the global rayon pool.  If both the outer
+    // pixel loop and the inner physics functions share the global pool, all
+    // pool threads block on inner par_iter tasks that can only run when outer
+    // tasks yield — creating massive contention and effectively deadlocking
+    // the pool (especially with heavy temperature fitting).
+    //
+    // By running the outer pixel loop on a dedicated pool, the inner physics
+    // par_iter calls dispatch to the *global* pool instead.  The two pools
+    // are independent, so there is no nested contention.
+    let n_threads = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(1).max(1))
+        .unwrap_or(1);
+    let pool = match rayon::ThreadPoolBuilder::new()
+        .num_threads(n_threads)
+        .build()
+    {
+        Ok(p) => p,
+        Err(e) => {
+            state.status_message = format!("Failed to create thread pool: {e}");
+            state.is_fitting = false;
+            state.fitting_progress = None;
+            return;
+        }
+    };
 
     std::thread::spawn(move || {
-        let result = nereids_pipeline::spatial::spatial_map(
-            norm.transmission.view(),
-            norm.uncertainty.view(),
-            &config,
-            dead_pixels.as_ref(),
-            Some(&cancel),
-            Some(&progress),
-        );
+        // Watcher thread: poke the GUI every 100ms so the progress bar
+        // repaints.  Uses near-zero CPU (sleep + one syscall per wake).
+        let done_flag = Arc::new(AtomicBool::new(false));
+        let watcher = {
+            let done = Arc::clone(&done_flag);
+            let repaint_ctx = ctx.clone();
+            std::thread::spawn(move || {
+                while !done.load(Ordering::Relaxed) {
+                    if let Some(ref c) = repaint_ctx {
+                        c.request_repaint();
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                // One final poke so the completion frame renders immediately.
+                if let Some(ref c) = repaint_ctx {
+                    c.request_repaint();
+                }
+            })
+        };
+
+        // Run spatial_map on the dedicated pool so its par_iter doesn't
+        // share the global pool with inner physics par_iter calls.
+        let result = pool.install(|| {
+            nereids_pipeline::spatial::spatial_map(
+                norm.transmission.view(),
+                norm.uncertainty.view(),
+                &config,
+                dead_pixels.as_ref(),
+                Some(&cancel),
+                Some(&progress),
+            )
+        });
+
+        // Signal watcher to stop, then send result.
+        done_flag.store(true, Ordering::Relaxed);
+        watcher.join().ok();
+
         match result {
             Ok(r) => {
                 if !cancel.load(Ordering::Relaxed) {

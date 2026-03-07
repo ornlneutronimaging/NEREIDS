@@ -70,19 +70,24 @@ impl eframe::App for NereidsApp {
             self.state.last_applied_dark_mode = Some(resolved);
         }
 
+        // Store context so background threads can request repaints.
+        self.state.egui_ctx = Some(ctx.clone());
+
         // Poll background tasks
         poll_pending_tasks(&mut self.state);
 
         // Refresh memory telemetry (750ms interval)
         self.memory.refresh(ctx.input(|i| i.time));
 
-        // Keep repainting while background work is in progress
+        // Keep repainting while background work is in progress.
+        // Fitting also has a dedicated watcher thread that pokes via
+        // ctx.request_repaint(), but we keep the timer as a fallback.
         if self.state.is_fitting
             || self.state.is_fetching_endf
             || self.state.is_fetching_fm_endf
             || self.state.is_fetching_detect_endf
         {
-            ctx.request_repaint();
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
         // Top toolbar
@@ -141,7 +146,7 @@ fn poll_pending_tasks(state: &mut AppState) {
                 state.spatial_result = Some(result);
                 state.is_fitting = false;
                 state.fitting_progress = None;
-                state.fitting_progress_counter = None;
+                state.residuals_cache = None;
                 state.active_tab = Tab::Map;
                 state.pending_spatial = None;
                 // Pipeline re-run completed successfully — clear dirty state.
@@ -151,26 +156,17 @@ fn poll_pending_tasks(state: &mut AppState) {
                 state.status_message = format!("Spatial map error: {err_msg}");
                 state.is_fitting = false;
                 state.fitting_progress = None;
-                state.fitting_progress_counter = None;
+                state.residuals_cache = None;
                 state.pending_spatial = None;
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 state.status_message = "Spatial map task failed".into();
                 state.is_fitting = false;
                 state.fitting_progress = None;
-                state.fitting_progress_counter = None;
+                state.residuals_cache = None;
                 state.pending_spatial = None;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {} // Still running
-        }
-    }
-
-    // Update fitting progress from the atomic counter (runs every frame,
-    // not just when Analyze is visible, so toolbar always shows fresh data).
-    if let Some(ref counter) = state.fitting_progress_counter {
-        let done = counter.load(std::sync::atomic::Ordering::Relaxed);
-        if let Some((_, total)) = state.fitting_progress {
-            state.fitting_progress = Some((done, total));
         }
     }
 

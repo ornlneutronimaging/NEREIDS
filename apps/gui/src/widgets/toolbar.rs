@@ -61,8 +61,10 @@ pub fn toolbar(ctx: &egui::Context, state: &mut AppState) {
 
                     // Progress indicator
                     if state.is_fitting {
-                        if let Some((done, total)) = state.fitting_progress {
-                            let frac = done as f32 / total.max(1) as f32;
+                        if let Some(ref fp) = state.fitting_progress {
+                            let frac = fp.fraction();
+                            let done = fp.done();
+                            let total = fp.total();
                             design::progress_mini(
                                 ui,
                                 frac,
