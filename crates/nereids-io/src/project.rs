@@ -215,8 +215,11 @@ fn write_config(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoError
         let symbols: Vec<VarLenUnicode> = snap
             .isotope_symbol
             .iter()
-            .map(|s| s.parse().unwrap())
-            .collect();
+            .map(|s| {
+                s.parse()
+                    .map_err(|e| hdf5_err("parse VarLenUnicode symbol", e))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         iso.new_dataset::<VarLenUnicode>()
             .shape([n])
             .create("symbol")
@@ -425,7 +428,13 @@ fn write_results(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoErro
     if let Some(ref labels) = snap.result_isotope_labels
         && !labels.is_empty()
     {
-        let vlu: Vec<VarLenUnicode> = labels.iter().map(|s| s.parse().unwrap()).collect();
+        let vlu: Vec<VarLenUnicode> = labels
+            .iter()
+            .map(|s| {
+                s.parse()
+                    .map_err(|e| hdf5_err("parse VarLenUnicode label", e))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         results
             .new_dataset::<VarLenUnicode>()
             .shape([labels.len()])
@@ -442,7 +451,11 @@ fn write_endf_cache(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoE
         .create_group("endf_cache")
         .map_err(|e| hdf5_err("create /endf_cache", e))?;
 
+    let mut written = std::collections::HashSet::new();
     for (symbol, rd) in &snap.endf_cache {
+        if !written.insert(symbol.clone()) {
+            continue; // skip duplicate symbol — first entry wins
+        }
         let iso_group = cache
             .create_group(symbol)
             .map_err(|e| hdf5_err(&format!("create /endf_cache/{symbol}"), e))?;
@@ -474,18 +487,27 @@ fn write_provenance(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoE
     let timestamps: Vec<VarLenUnicode> = snap
         .provenance
         .iter()
-        .map(|(ts, _, _)| ts.parse().unwrap())
-        .collect();
+        .map(|(ts, _, _)| {
+            ts.parse()
+                .map_err(|e| hdf5_err("parse VarLenUnicode timestamp", e))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let kinds: Vec<VarLenUnicode> = snap
         .provenance
         .iter()
-        .map(|(_, k, _)| k.parse().unwrap())
-        .collect();
+        .map(|(_, k, _)| {
+            k.parse()
+                .map_err(|e| hdf5_err("parse VarLenUnicode kind", e))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let messages: Vec<VarLenUnicode> = snap
         .provenance
         .iter()
-        .map(|(_, _, m)| m.parse().unwrap())
-        .collect();
+        .map(|(_, _, m)| {
+            m.parse()
+                .map_err(|e| hdf5_err("parse VarLenUnicode message", e))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     prov.new_dataset::<VarLenUnicode>()
         .shape([n])

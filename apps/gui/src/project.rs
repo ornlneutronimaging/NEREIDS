@@ -274,13 +274,14 @@ fn ensure_extension(path: PathBuf) -> PathBuf {
     let s = path.to_string_lossy();
     if s.ends_with(".nrd.h5") {
         path
-    } else if s.ends_with(".h5") || s.ends_with(".hdf5") {
-        // Replace existing HDF5 extension
-        let stem = path.with_extension("");
-        let stem = stem.with_extension(""); // strip double ext
-        PathBuf::from(format!("{}.nrd.h5", stem.display()))
+    } else if s.ends_with(".hdf5") {
+        let stripped = s.strip_suffix(".hdf5").unwrap();
+        PathBuf::from(format!("{stripped}.nrd.h5"))
+    } else if s.ends_with(".h5") {
+        let stripped = s.strip_suffix(".h5").unwrap();
+        PathBuf::from(format!("{stripped}.nrd.h5"))
     } else {
-        PathBuf::from(format!("{}.nrd.h5", s))
+        PathBuf::from(format!("{s}.nrd.h5"))
     }
 }
 
