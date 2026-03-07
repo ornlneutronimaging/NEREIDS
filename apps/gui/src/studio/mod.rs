@@ -700,21 +700,15 @@ fn dock_isotopes(ui: &mut egui::Ui, state: &AppState) {
 ///
 /// Uses `state.residuals_cache` to avoid rebuilding the `TransmissionFitModel`
 /// and recomputing the forward model on every frame. The cache is keyed by
-/// `(fit_result_gen, resolution_enabled, resolution_mode, flight_path_m, temperature_k)`.
+/// `(fit_result_gen, pixel, resolution_enabled, resolution_mode, flight_path_m, temperature_k)`.
+///
+/// Densities come from `pixel_fit_result` (single-pixel fit) when available,
+/// otherwise from `spatial_result` density maps at the selected pixel.
 fn dock_residuals(ui: &mut egui::Ui, state: &mut AppState) {
     let colors = ThemeColors::from_ctx(ui.ctx());
 
-    // Need a pixel fit result to show residuals.
-    let result = match &state.pixel_fit_result {
-        Some(r) if r.converged => r,
-        Some(_) => {
-            ui.label(
-                egui::RichText::new("Fit did not converge \u{2014} no residuals to display.")
-                    .small()
-                    .color(colors.fg3),
-            );
-            return;
-        }
+    let (py, px) = match state.selected_pixel {
+        Some(p) => p,
         None => {
             ui.label(
                 egui::RichText::new(
@@ -726,12 +720,35 @@ fn dock_residuals(ui: &mut egui::Ui, state: &mut AppState) {
             return;
         }
     };
-    let chi2_r = result.reduced_chi_squared;
-    let effective_temp = result.temperature_k.unwrap_or(state.temperature_k);
+
+    // Extract densities, temperature, chi2, and convergence from either
+    // pixel_fit_result (priority) or spatial_result.
+    let pixel_info = extract_pixel_fit_info(state, py, px);
+    let (densities, effective_temp, chi2_r, converged) = match pixel_info {
+        Some(info) => info,
+        None => {
+            ui.label(
+                egui::RichText::new("No fit data for this pixel.")
+                    .small()
+                    .color(colors.fg3),
+            );
+            return;
+        }
+    };
+
+    if !converged {
+        ui.label(
+            egui::RichText::new("Fit did not converge \u{2014} no residuals to display.")
+                .small()
+                .color(colors.fg3),
+        );
+        return;
+    }
 
     // Check if the cache is still valid.
     let cache_valid = state.residuals_cache.as_ref().is_some_and(|c| {
         c.fit_gen == state.fit_result_gen
+            && c.pixel == (py, px)
             && c.resolution_enabled == state.resolution_enabled
             && c.resolution_mode == state.resolution_mode
             && c.flight_path_m == state.beamline.flight_path_m
@@ -739,8 +756,7 @@ fn dock_residuals(ui: &mut egui::Ui, state: &mut AppState) {
     });
 
     if !cache_valid {
-        // Rebuild the cache.
-        let new_cache = build_residuals_cache(state);
+        let new_cache = build_residuals_cache(state, (py, px), &densities, effective_temp, chi2_r);
         state.residuals_cache = new_cache;
     }
 
@@ -765,7 +781,7 @@ fn dock_residuals(ui: &mut egui::Ui, state: &mut AppState) {
             (&format!("{:.2e}", cache.rms), "RMS"),
             (&format!("{:.2e}", cache.max_abs), "Max |r|"),
             (&cache.n_points.to_string(), "Points"),
-            (&format!("{:.4}", chi2_r), "\u{03c7}\u{00b2}_r"),
+            (&format!("{:.4}", cache.chi2_r), "\u{03c7}\u{00b2}_r"),
         ],
     );
     ui.add_space(4.0);
@@ -790,15 +806,60 @@ fn dock_residuals(ui: &mut egui::Ui, state: &mut AppState) {
         });
 }
 
+/// Extract per-pixel fit info from `pixel_fit_result` or `spatial_result`.
+///
+/// Returns `(densities, effective_temperature, chi2_r, converged)`.
+fn extract_pixel_fit_info(
+    state: &AppState,
+    py: usize,
+    px: usize,
+) -> Option<(Vec<f64>, f64, f64, bool)> {
+    // Prefer pixel_fit_result (from explicit Fit Pixel / Fit ROI).
+    if let Some(ref result) = state.pixel_fit_result {
+        let temp = result.temperature_k.unwrap_or(state.temperature_k);
+        return Some((
+            result.densities.clone(),
+            temp,
+            result.reduced_chi_squared,
+            result.converged,
+        ));
+    }
+
+    // Fall back to spatial_result maps.
+    let sr = state.spatial_result.as_ref()?;
+    if py >= sr.converged_map.nrows() || px >= sr.converged_map.ncols() {
+        return None;
+    }
+    let n_isotopes = sr.density_maps.len();
+    if n_isotopes == 0 {
+        return None;
+    }
+    let densities: Vec<f64> = (0..n_isotopes)
+        .map(|i| sr.density_maps[i][[py, px]])
+        .collect();
+    let temp = sr
+        .temperature_map
+        .as_ref()
+        .map_or(state.temperature_k, |m| m[[py, px]]);
+    let chi2_r = sr.chi_squared_map[[py, px]];
+    let converged = sr.converged_map[[py, px]];
+    Some((densities, temp, chi2_r, converged))
+}
+
 /// Build the residuals cache by constructing a `TransmissionFitModel`, evaluating
 /// the forward model, and computing residuals against measured data.
 ///
-/// Returns `None` if any prerequisite is missing (no pixel, no energies, etc.).
-fn build_residuals_cache(state: &AppState) -> Option<crate::state::CachedResiduals> {
-    let result = state.pixel_fit_result.as_ref()?;
+/// Returns `None` if any prerequisite is missing (no energies, etc.).
+fn build_residuals_cache(
+    state: &AppState,
+    pixel: (usize, usize),
+    densities: &[f64],
+    temperature_k: f64,
+    chi2_r: f64,
+) -> Option<crate::state::CachedResiduals> {
     let energies = state.energies.as_ref()?;
     let norm = state.normalized.as_ref()?;
-    let (py, px) = state.selected_pixel?;
+    let (py, px) = pixel;
 
     let shape = norm.transmission.shape();
     let n_tof = shape[0];
@@ -813,11 +874,9 @@ fn build_residuals_cache(state: &AppState) -> Option<crate::state::CachedResidua
         .filter(|e| e.enabled && e.resonance_data.is_some())
         .filter_map(|e| e.resonance_data.clone())
         .collect();
-    if resonance_data.len() != result.densities.len() {
+    if resonance_data.len() != densities.len() {
         return None;
     }
-
-    let overlay_temp = result.temperature_k.unwrap_or(state.temperature_k);
 
     // Build instrument params from current resolution settings.
     let instrument = if state.resolution_enabled {
@@ -849,16 +908,16 @@ fn build_residuals_cache(state: &AppState) -> Option<crate::state::CachedResidua
     let model = nereids_fitting::transmission_model::TransmissionFitModel::new(
         energies.clone(),
         resonance_data,
-        overlay_temp,
+        temperature_k,
         instrument,
-        (0..result.densities.len()).collect(),
+        (0..densities.len()).collect(),
         None,
         None,
     )
     .ok()?;
 
     use nereids_fitting::lm::FitModel;
-    let fitted = model.evaluate(&result.densities);
+    let fitted = model.evaluate(densities);
     let n_plot = n_tof.min(energies.len()).min(fitted.len());
     if n_plot == 0 {
         return None;
@@ -886,10 +945,12 @@ fn build_residuals_cache(state: &AppState) -> Option<crate::state::CachedResidua
 
     Some(crate::state::CachedResiduals {
         fit_gen: state.fit_result_gen,
+        pixel,
         resolution_enabled: state.resolution_enabled,
         resolution_mode: state.resolution_mode.clone(),
         flight_path_m: state.beamline.flight_path_m,
-        temperature_k: overlay_temp,
+        temperature_k,
+        chi2_r,
         residuals,
         rms,
         max_abs,
@@ -1032,8 +1093,12 @@ fn rerun_card(ui: &mut egui::Ui, state: &mut AppState) {
     design::card_with_header(ui, "Pipeline", None, |ui| {
         if state.is_fitting {
             if let Some((done, total)) = state.fitting_progress {
-                let frac = done as f32 / total.max(1) as f32;
-                design::progress_mini(ui, frac, &format!("{done}/{total} px"));
+                if done == 0 {
+                    design::progress_mini(ui, 0.0, "Preparing XS...");
+                } else {
+                    let frac = done as f32 / total.max(1) as f32;
+                    design::progress_mini(ui, frac, &format!("{done}/{total} px"));
+                }
             } else {
                 ui.spinner();
                 ui.label("Running...");

@@ -501,6 +501,8 @@ pub struct DetectTraceEntry {
 pub struct CachedResiduals {
     /// Generation counter of the `pixel_fit_result` that produced this cache.
     pub fit_gen: u64,
+    /// Selected pixel at cache time.
+    pub pixel: (usize, usize),
     /// Resolution enabled flag at cache time.
     pub resolution_enabled: bool,
     /// Resolution mode at cache time (compared via PartialEq).
@@ -509,6 +511,8 @@ pub struct CachedResiduals {
     pub flight_path_m: f64,
     /// Effective temperature used for the forward model overlay.
     pub temperature_k: f64,
+    /// Reduced chi-squared (stored so display doesn't need to re-extract).
+    pub chi2_r: f64,
     /// Residual points: (energy_ev, residual_value).
     pub residuals: Vec<(f64, f64)>,
     /// RMS of residuals.

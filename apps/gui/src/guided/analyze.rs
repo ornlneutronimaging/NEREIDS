@@ -227,8 +227,12 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
 
     if state.is_fitting {
         if let Some((done, total)) = state.fitting_progress {
-            let frac = done as f32 / total.max(1) as f32;
-            crate::widgets::design::progress_mini(ui, frac, &format!("{done}/{total} px"));
+            if done == 0 {
+                crate::widgets::design::progress_mini(ui, 0.0, "Preparing XS...");
+            } else {
+                let frac = done as f32 / total.max(1) as f32;
+                crate::widgets::design::progress_mini(ui, frac, &format!("{done}/{total} px"));
+            }
         } else {
             ui.spinner();
             ui.label("Fitting...");
