@@ -1254,10 +1254,18 @@ pub fn run_spatial_map(state: &mut AppState) {
     let n_threads = std::thread::available_parallelism()
         .map(|n| n.get().saturating_sub(1).max(1))
         .unwrap_or(1);
-    let pool = rayon::ThreadPoolBuilder::new()
+    let pool = match rayon::ThreadPoolBuilder::new()
         .num_threads(n_threads)
         .build()
-        .expect("failed to build fitting thread pool");
+    {
+        Ok(p) => p,
+        Err(e) => {
+            state.status_message = format!("Failed to create thread pool: {e}");
+            state.is_fitting = false;
+            state.fitting_progress = None;
+            return;
+        }
+    };
 
     std::thread::spawn(move || {
         // Watcher thread: poke the GUI every 100ms so the progress bar
