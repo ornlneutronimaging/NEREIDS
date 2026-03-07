@@ -8,12 +8,12 @@
 use crate::state::{AppState, EndfStatus, GuidedStep, ResolutionMode};
 use crate::theme::{ThemeColors, semantic};
 use egui::{Color32, CornerRadius, Margin, Rect, Response, RichText, Sense, Shadow, Stroke, Ui};
-
-/// Semi-transparent red used for resonance energy dip markers on spectrum plots.
-pub const RESONANCE_DIP_COLOR: Color32 = Color32::from_rgba_premultiplied(180, 80, 80, 50);
 use nereids_endf::retrieval::EndfLibrary;
 use nereids_physics::resolution::TabulatedResolution;
 use std::sync::Arc;
+
+/// Semi-transparent red used for resonance energy dip markers on spectrum plots.
+pub const RESONANCE_DIP_COLOR: Color32 = Color32::from_rgba_premultiplied(180, 80, 80, 50);
 
 // ── Content Header ──────────────────────────────────────────────
 
