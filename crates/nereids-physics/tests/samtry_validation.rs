@@ -1,27 +1,38 @@
-//! SAMMY `samtry` test suite validation.
+//! SAMMY `samtry` test suite validation (issue #321).
 //!
 //! Validates NEREIDS physics against SAMMY's canonical reference output from
 //! the `samtry/` test suite.  Each test case loads a SAMMY `.par` + `.inp` +
 //! `.plt` file set, computes cross-sections (and optionally transmission) using
 //! NEREIDS, and compares against SAMMY's `Th_initial` reference values.
 //!
-//! ## Phase 1: Transmission cases (issue #292)
-//! - tr007: Fe-56, 3 resonances, 2 spin groups
-//! - tr008: Ni-58, ~100 resonances, 5 spin groups
-//! - tr006: Ni-60, ~270 resonances, pure forward model
-//! - tr004: Ni-60, ~270 resonances, with transmission reference
+//! ## Error Budget by Broadening Type
 //!
-//! ## Broadening
+//! Tolerances are set per case based on the dominant error source.  The SAMMY
+//! → NEREIDS Gaussian kernel formula and parameter conversion are exact
+//! (verified against `mrsl4.f90` `Rolowg` and `RslResolutionFunction_M.f90`
+//! `getAo2`/`getBo2`).  All errors come from:
 //!
-//! SAMMY applies Doppler (FGM) + Gaussian resolution + optional exponential
-//! resolution broadening.  These tests apply Doppler + Gaussian resolution
-//! using the SAMMY → NEREIDS parameter conversion from
-//! `RslResolutionFunction_M.f90` (getAo2/getBo2).
+//! 1. **Doppler method mismatch** — SAMMY's `use multi-style doppler` keyword
+//!    activates HEGA (Gaussian approximation in E-space).  NEREIDS always uses
+//!    exact FGM (velocity-space convolution).  Affects tr006, tr008.
 //!
-//! tr006 and tr004 use pure Gaussian resolution (Deltae=0, Iesopr=1).
-//! tr007 and tr008 also have an exponential tail (Deltae>0, Iesopr=3),
-//! which is not yet implemented in NEREIDS — these cases may show slightly
-//! higher residual error.
+//! 2. **Quadrature difference** — SAMMY uses 4-point Xcoef weights (Eq. IV B
+//!    3.8) designed for sparse grids.  NEREIDS uses trapezoidal rule.  Matters
+//!    when few grid points fall in the 10σ convolution window (high energy).
+//!    Affects tr004 most (only ~21 pts/window at 500 keV).
+//!
+//! 3. **Missing exponential tail** — Cases with Deltae > 0 have an exponential
+//!    resolution component (Iesopr=3) not yet implemented in NEREIDS.  The
+//!    effect varies by energy range and resonance density.
+//!
+//! | Category | Cases | Tolerance | Dominant Error Source |
+//! |----------|-------|-----------|---------------------|
+//! | FGM Doppler + Gaussian, dense grid | tr015, tr016 | <10% | Trapezoidal quadrature |
+//! | FGM Doppler + Gaussian, sparse grid | tr004 | <6% | Sparse-grid quadrature |
+//! | HEGA Doppler + Gaussian | tr006, tr008 | <8% | Doppler method mismatch |
+//! | FGM + Gaussian + Exp tail | tr007, tr047 | <12% | Missing exponential tail |
+//! | FGM + Gauss + Exp, few resonances | tr029, tr030 | <25% | Exp tail + narrow range |
+//! | Multi-channel fission | tr028 | IGNORED | Not implemented (Batch C) |
 //!
 //! ## Reference
 //! SAMMY source: `../SAMMY/SAMMY/sammy/samtry/`
@@ -372,9 +383,12 @@ fn test_tr007_fe56_broadened() {
         result.n_above_threshold,
         result.worst_energy_kev
     );
-    // Doppler + Gaussian resolution applied.  tr007 also has an exponential
-    // tail (Deltae=0.022, Iesopr=3) which is not yet implemented.  The
-    // remaining ~9% mean error is from the missing exponential broadening.
+    // tr007: Deltae=0.022, has exponential tail (Iesopr=3) not yet implemented.
+    // FGM Doppler + Gaussian resolution match SAMMY exactly (kernel + conversion
+    // verified against mrsl4.f90).  The 8.8% mean error is from the missing
+    // exponential tail broadening.  Dense grid at low energy (1.13-1.17 keV)
+    // means quadrature error is negligible here.
+    // Measured: 8.8% mean.
     assert!(
         result.mean_rel_error < 0.12,
         "broadened mean error {:.4} > 12%",
@@ -416,10 +430,10 @@ fn test_tr008_ni58_broadened() {
         result.n_above_threshold,
         result.worst_energy_kev
     );
-    // Doppler + Gaussian resolution applied.  tr008 also has an exponential
-    // tail (Deltae=0.004, Iesopr=3) which is not yet implemented.  The
-    // remaining ~7% mean error is from the missing exponential broadening
-    // and HEGA Doppler mode differences.
+    // tr008: SAMMY uses HEGA Doppler (multi-style doppler broadening keyword),
+    // NEREIDS uses exact FGM.  Additionally has exponential tail (Deltae=0.004).
+    // Error sources: Doppler method mismatch + missing exponential tail.
+    // Measured: 7.0% mean.
     assert!(
         result.mean_rel_error < 0.10,
         "broadened mean error {:.4} > 10%",
@@ -461,8 +475,12 @@ fn test_tr006_ni60_broadened() {
         result.n_above_threshold,
         result.worst_energy_kev
     );
-    // tr006 uses pure Gaussian resolution (Deltae=0, Iesopr=1).
-    // Observed ~3.4% mean error with Doppler + Gaussian resolution.
+    // tr006: Deltae=0 (pure Gaussian resolution), but SAMMY uses HEGA Doppler
+    // (`use multi-style doppler broadening` keyword → Kkkdop=0) while NEREIDS
+    // uses exact FGM.  The 3.4% mean error is the HEGA-vs-FGM Doppler
+    // method difference, not a resolution bug.  Kernel formula and parameter
+    // conversion are exact (verified against mrsl4.f90 Rolowg).
+    // Measured: 3.4% mean.
     assert!(
         result.mean_rel_error < 0.05,
         "broadened mean error {:.4} > 5%",
@@ -504,8 +522,13 @@ fn test_tr004_ni60_broadened() {
         result.n_above_threshold,
         result.worst_energy_kev
     );
-    // tr004 uses pure Gaussian resolution (Deltae=0, Iesopr=1).
-    // Observed ~4.7% mean error with Doppler + Gaussian resolution.
+    // tr004: Deltae=0 (pure Gaussian resolution), both SAMMY and NEREIDS use
+    // FGM Doppler.  The 4.7% mean error is dominated by sparse-grid trapezoidal
+    // quadrature in the resolution convolution: at 500 keV the Gaussian width
+    // is ~772 eV but only ~21 grid points fall in the 10σ window.  SAMMY's
+    // 4-point Xcoef weights (Eq. IV B 3.8) handle sparse grids better.
+    // Fix: implement Xcoef quadrature or densify the convolution grid.
+    // Measured: 4.7% mean.
     assert!(
         result.mean_rel_error < 0.06,
         "broadened mean error {:.4} > 6%",
@@ -539,9 +562,9 @@ fn test_tr004_ni60_transmission() {
         result.n_above_threshold,
         result.worst_energy_kev
     );
-    // tr004 transmission: pure Gaussian resolution (Deltae=0, Iesopr=1).
-    // Observed ~0.95% mean error — transmission exponentiates the XS error,
-    // so small XS errors become small transmission errors.
+    // tr004 transmission: same sparse-grid quadrature issue as XS (4.7%), but
+    // T = exp(-n·σ) compresses cross-section errors exponentially.
+    // Measured: 0.95% mean — confirms the XS error is the root cause.
     assert!(
         result.mean_rel_error < 0.02,
         "transmission mean error {:.4} > 2%",
@@ -586,7 +609,10 @@ fn test_tr015_ni58_broadened() {
         result.n_above_threshold,
         result.worst_energy_kev
     );
-    // tr015: Deltae=0, pure Gaussian resolution.
+    // tr015: Deltae=0, FGM Doppler + pure Gaussian resolution.  Narrow range
+    // (180-181 keV) with ~28 points.  Trapezoidal quadrature at moderate
+    // energy produces ~8.4% mean error.  Similar to tr004/tr006 mechanism.
+    // Measured: 8.4% mean.
     assert!(
         result.mean_rel_error < 0.10,
         "broadened mean error {:.4} > 10%",
@@ -628,10 +654,13 @@ fn test_tr016_ni58_broadened() {
         result.n_above_threshold,
         result.worst_energy_kev
     );
-    // tr016: Deltae=0, pure Gaussian resolution.
+    // tr016: Deltae=0, FGM Doppler + pure Gaussian resolution.  Wider range
+    // (180-183 keV) with ~56 points — same mechanism as tr015 but with more
+    // grid points, hence slightly lower error.
+    // Measured: 6.5% mean.
     assert!(
-        result.mean_rel_error < 0.10,
-        "broadened mean error {:.4} > 10%",
+        result.mean_rel_error < 0.08,
+        "broadened mean error {:.4} > 8%",
         result.mean_rel_error
     );
 }
@@ -670,10 +699,14 @@ fn test_tr029_ni58_broadened() {
         result.n_above_threshold,
         result.worst_energy_kev
     );
-    // tr029: Deltae=0.008, has exponential tail (not yet implemented).
+    // tr029: Deltae=0.008, has exponential tail (Iesopr=3) not yet implemented.
+    // Wide range (40-53k eV) with 1032 points — good grid density at lower
+    // energies where most resonances live.  The 4.9% mean error is dominated
+    // by the missing exponential tail, diluted by many well-matched low-E points.
+    // Measured: 4.9% mean.
     assert!(
-        result.mean_rel_error < 0.15,
-        "broadened mean error {:.4} > 15%",
+        result.mean_rel_error < 0.08,
+        "broadened mean error {:.4} > 8%",
         result.mean_rel_error
     );
 }
@@ -712,9 +745,12 @@ fn test_tr030_ni58_broadened() {
         result.n_above_threshold,
         result.worst_energy_kev
     );
-    // tr030: Deltae=0.008, has exponential tail (not yet implemented).
-    // Narrow range (13-15.5 keV) with few active resonances amplifies
-    // the exponential tail contribution → higher relative error than tr029.
+    // tr030: Deltae=0.008, has exponential tail (Iesopr=3) not yet implemented.
+    // Narrow range (13-15.5 keV) with only 5 active resonances (68 excluded
+    // via negative spin group).  The exponential tail's relative effect is
+    // amplified when few resonances contribute.  Compare tr029 (same Deltae,
+    // wide range, 4.9% mean) — the wider energy range dilutes the exp tail error.
+    // Measured: 19.6% mean.
     assert!(
         result.mean_rel_error < 0.25,
         "broadened mean error {:.4} > 25%",
@@ -757,10 +793,16 @@ fn test_tr047_fe56_broadened() {
         result.n_above_threshold,
         result.worst_energy_kev
     );
-    // tr047: Deltae=0.022, has exponential tail (not yet implemented).
+    // tr047: Deltae=0.022, has exponential tail (Iesopr=3) not yet implemented.
+    // Similar to tr007 (same isotope/energy range) but cooled to 181K (reduced
+    // Doppler width).  Deltae=0.022 is larger than tr007's 0.022 — same value
+    // but at lower temperature the relative contribution of exp tail vs Doppler
+    // shifts.  The 2.6% mean error is low because the Fe-56 resonance at
+    // 1151 eV dominates and its broadened shape is mainly Doppler+Gaussian.
+    // Measured: 2.6% mean.
     assert!(
-        result.mean_rel_error < 0.15,
-        "broadened mean error {:.4} > 15%",
+        result.mean_rel_error < 0.05,
+        "broadened mean error {:.4} > 5%",
         result.mean_rel_error
     );
 }
