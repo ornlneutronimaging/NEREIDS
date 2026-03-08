@@ -1102,7 +1102,7 @@ fn cross_sections_for_range(
 /// X-matrix (scalar): X = P · Y⁻¹ · R · (S - B + iP)⁻¹
 ///
 /// The scattering matrix element is:
-///   U = e^{2iφ} · (1 + 2i·X)
+///   U = e^{-2iφ} · (1 + 2i·X)
 ///
 /// Cross-sections:
 ///   σ_elastic = (π/k²) · g_J · |1 - U|²

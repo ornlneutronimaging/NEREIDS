@@ -152,10 +152,7 @@ fn validate_broadened_cross_sections(
     // SAMMY .plt may not be sorted; ensure ascending for broadening.
     let is_ascending = energies.windows(2).all(|w| w[0] <= w[1]);
     if !is_ascending {
-        // Sort and track original order.
-        let mut indexed: Vec<(usize, f64)> = energies.iter().copied().enumerate().collect();
-        indexed.sort_by(|a, b| a.1.total_cmp(&b.1));
-        energies = indexed.iter().map(|(_, e)| *e).collect();
+        energies.sort_by(|a, b| a.total_cmp(b));
     }
 
     // Compute broadened cross-sections (Doppler + no resolution for now).
@@ -184,7 +181,12 @@ fn validate_broadened_cross_sections(
 
     for rec in reference {
         let energy_ev = rec.energy_kev * 1000.0;
-        let nereids_total = *xs_map.get(&energy_ev.to_bits()).unwrap_or(&0.0);
+        let nereids_total = *xs_map.get(&energy_ev.to_bits()).unwrap_or_else(|| {
+            panic!(
+                "Missing broadened cross section for energy {} eV (energy grid mismatch)",
+                energy_ev
+            )
+        });
         let sammy_total = rec.theory_initial;
 
         let rel_error = if sammy_total.abs() > 1e-6 {
@@ -254,7 +256,12 @@ fn validate_transmission(
 
     for rec in reference {
         let energy_ev = rec.energy_kev * 1000.0;
-        let nereids_trans = *trans_map.get(&energy_ev.to_bits()).unwrap_or(&0.0);
+        let nereids_trans = *trans_map.get(&energy_ev.to_bits()).unwrap_or_else(|| {
+            panic!(
+                "Missing transmission value for energy {} eV (energy grid mismatch)",
+                energy_ev
+            )
+        });
         let sammy_trans = rec.theory_initial;
 
         let rel_error = if sammy_trans.abs() > 1e-6 {
