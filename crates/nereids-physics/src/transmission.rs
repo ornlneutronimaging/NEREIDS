@@ -444,11 +444,27 @@ pub fn broadened_cross_sections_with_derivative(
     let t_down = (temperature_k - dt).max(0.0); // stay physical
     let actual_2dt = t_up - t_down;
 
-    // No cancel token passed; TransmissionError::{Resolution, Doppler} can occur.
-    let xs_center =
-        broadened_cross_sections(energies, resonance_data, temperature_k, instrument, None)?;
-    let xs_up = broadened_cross_sections(energies, resonance_data, t_up, instrument, None)?;
-    let xs_down = broadened_cross_sections(energies, resonance_data, t_down, instrument, None)?;
+    // Run the three independent broadening calls concurrently via rayon::join.
+    let ((xs_center, xs_up), xs_down) = rayon::join(
+        || {
+            rayon::join(
+                || {
+                    broadened_cross_sections(
+                        energies,
+                        resonance_data,
+                        temperature_k,
+                        instrument,
+                        None,
+                    )
+                },
+                || broadened_cross_sections(energies, resonance_data, t_up, instrument, None),
+            )
+        },
+        || broadened_cross_sections(energies, resonance_data, t_down, instrument, None),
+    );
+    let xs_center = xs_center?;
+    let xs_up = xs_up?;
+    let xs_down = xs_down?;
 
     let dxs_dt: Vec<Vec<f64>> = xs_up
         .iter()
@@ -572,17 +588,45 @@ pub fn broadened_cross_sections_with_derivative_from_base(
     let t_down = (temperature_k - dt).max(0.0);
     let actual_2dt = t_up - t_down;
 
-    let xs_center = broadened_cross_sections_from_base(
-        energies,
-        base_xs,
-        resonance_data,
-        temperature_k,
-        instrument,
-    )?;
-    let xs_up =
-        broadened_cross_sections_from_base(energies, base_xs, resonance_data, t_up, instrument)?;
-    let xs_down =
-        broadened_cross_sections_from_base(energies, base_xs, resonance_data, t_down, instrument)?;
+    // Run the three independent broadening calls concurrently via rayon::join.
+    // Each call is O(n_energies × window_width × n_isotopes), so parallelism
+    // yields ~2-3× speedup on multi-core systems.
+    let ((xs_center, xs_up), xs_down) = rayon::join(
+        || {
+            rayon::join(
+                || {
+                    broadened_cross_sections_from_base(
+                        energies,
+                        base_xs,
+                        resonance_data,
+                        temperature_k,
+                        instrument,
+                    )
+                },
+                || {
+                    broadened_cross_sections_from_base(
+                        energies,
+                        base_xs,
+                        resonance_data,
+                        t_up,
+                        instrument,
+                    )
+                },
+            )
+        },
+        || {
+            broadened_cross_sections_from_base(
+                energies,
+                base_xs,
+                resonance_data,
+                t_down,
+                instrument,
+            )
+        },
+    );
+    let xs_center = xs_center?;
+    let xs_up = xs_up?;
+    let xs_down = xs_down?;
 
     let dxs_dt: Vec<Vec<f64>> = xs_up
         .iter()

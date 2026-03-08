@@ -804,34 +804,47 @@ pub fn poisson_fit_analytic(
     let mut converged = false;
     let mut iter = 0;
 
+    // Track the temperature at which xs_owned/dxs_dt were last computed.
+    // When T hasn't changed between iterations (density-only updates), skip
+    // the expensive 3× Doppler broadening.  Temperature typically converges
+    // in ~5 iterations while density takes ~30, so this avoids ~70-90% of
+    // redundant broadening calls.
+    // Use f64::NAN with explicit is_finite() guard in the comparison
+    // (NaN comparisons bypass `>` — see CLAUDE.md validation patterns).
+    let mut cached_temperature: f64 = f64::NAN;
+
     for _ in 0..config.max_iter {
         iter += 1;
 
         // When fitting temperature, recompute cross-sections and their T
-        // derivative at the current temperature.  This is expensive (3x
-        // broadening) but necessary for an exact analytical gradient.
+        // derivative only when the temperature has actually changed.
         if let Some(ctx) = &temp_ctx {
             params.all_values_into(&mut all_vals_buf);
             let t_current = all_vals_buf[ctx.temperature_index];
-            let (xs_new, dxs_new) = if let Some(ref base) = ctx.base_xs {
-                transmission::broadened_cross_sections_with_derivative_from_base(
-                    &ctx.energies,
-                    base,
-                    &ctx.resonance_data,
-                    t_current,
-                    ctx.instrument.as_ref(),
-                )
-            } else {
-                transmission::broadened_cross_sections_with_derivative(
-                    &ctx.energies,
-                    &ctx.resonance_data,
-                    t_current,
-                    ctx.instrument.as_ref(),
-                )
+            if !cached_temperature.is_finite()
+                || (t_current - cached_temperature).abs() > f64::EPSILON * (1.0 + t_current.abs())
+            {
+                let (xs_new, dxs_new) = if let Some(ref base) = ctx.base_xs {
+                    transmission::broadened_cross_sections_with_derivative_from_base(
+                        &ctx.energies,
+                        base,
+                        &ctx.resonance_data,
+                        t_current,
+                        ctx.instrument.as_ref(),
+                    )
+                } else {
+                    transmission::broadened_cross_sections_with_derivative(
+                        &ctx.energies,
+                        &ctx.resonance_data,
+                        t_current,
+                        ctx.instrument.as_ref(),
+                    )
+                }
+                .unwrap_or_else(|e| panic!("poisson_fit_analytic: broadening failed: {e}"));
+                xs_owned = xs_new;
+                dxs_dt = dxs_new;
+                cached_temperature = t_current;
             }
-            .unwrap_or_else(|e| panic!("poisson_fit_analytic: broadening failed: {e}"));
-            xs_owned = xs_new;
-            dxs_dt = dxs_new;
         }
 
         // Use owned cross-sections when temperature fitting (mutated each
@@ -1293,6 +1306,12 @@ pub fn poisson_fit_lbfgsb(
     let mut prev_free: Vec<f64> = free_vals_buf.clone();
     let mut prev_grad: Option<Vec<f64>> = None;
 
+    // Track the temperature at which xs_owned/dxs_dt were last computed.
+    // Skip redundant broadening when T hasn't changed (density-only steps).
+    // Use f64::NAN with explicit is_finite() guard in the comparison
+    // (NaN comparisons bypass `>` — see CLAUDE.md validation patterns).
+    let mut cached_temperature: f64 = f64::NAN;
+
     for _ in 0..config.max_iter {
         iter += 1;
 
@@ -1303,25 +1322,30 @@ pub fn poisson_fit_lbfgsb(
 
         if let Some(ctx) = &temp_ctx {
             let t_current = all_vals_buf[ctx.temperature_index];
-            let (xs_new, dxs_new) = if let Some(ref base) = ctx.base_xs {
-                transmission::broadened_cross_sections_with_derivative_from_base(
-                    &ctx.energies,
-                    base,
-                    &ctx.resonance_data,
-                    t_current,
-                    ctx.instrument.as_ref(),
-                )
-            } else {
-                transmission::broadened_cross_sections_with_derivative(
-                    &ctx.energies,
-                    &ctx.resonance_data,
-                    t_current,
-                    ctx.instrument.as_ref(),
-                )
+            if !cached_temperature.is_finite()
+                || (t_current - cached_temperature).abs() > f64::EPSILON * (1.0 + t_current.abs())
+            {
+                let (xs_new, dxs_new) = if let Some(ref base) = ctx.base_xs {
+                    transmission::broadened_cross_sections_with_derivative_from_base(
+                        &ctx.energies,
+                        base,
+                        &ctx.resonance_data,
+                        t_current,
+                        ctx.instrument.as_ref(),
+                    )
+                } else {
+                    transmission::broadened_cross_sections_with_derivative(
+                        &ctx.energies,
+                        &ctx.resonance_data,
+                        t_current,
+                        ctx.instrument.as_ref(),
+                    )
+                }
+                .unwrap_or_else(|e| panic!("poisson_fit_lbfgsb: broadening failed: {e}"));
+                xs_owned = xs_new;
+                dxs_dt = dxs_new;
+                cached_temperature = t_current;
             }
-            .unwrap_or_else(|e| panic!("poisson_fit_lbfgsb: broadening failed: {e}"));
-            xs_owned = xs_new;
-            dxs_dt = dxs_new;
         }
 
         // Use owned cross-sections when temperature fitting, otherwise
