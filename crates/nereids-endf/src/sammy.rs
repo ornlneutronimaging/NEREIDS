@@ -174,31 +174,36 @@ impl SammyInpConfig {
 ///
 /// SAMMY Ref: `RslResolutionFunction_M.f90` (getAo2 lines 143-161, getBo2 lines 165-179)
 ///
-/// **Note**: This function only converts the Gaussian resolution parameters
-/// (Deltal → Bo2, Deltag → Ao2).  The exponential tail parameter Deltae
-/// (`effective_delta_e()`) is not used — exponential resolution broadening
-/// is not yet implemented in NEREIDS.
+/// Returns `None` if all effective Deltal, Deltag, and Deltae are zero
+/// (no resolution broadening).
+/// Otherwise returns `Some((flight_path_m, delta_t_us, delta_l_m, delta_e))`.
 ///
-/// Returns `None` if both effective Deltal and Deltag are zero (no resolution broadening).
-/// Otherwise returns `Some((flight_path_m, delta_t_us, delta_l_m))`.
+/// The fourth element `delta_e` is the exponential tail parameter (raw SAMMY
+/// Deltae units, passed through without conversion). When non-zero, the
+/// resolution kernel is the convolution of a Gaussian with an exponential
+/// tail (SAMMY Iesopr=3).
 #[must_use]
-pub fn sammy_to_nereids_resolution(inp: &SammyInpConfig) -> Option<(f64, f64, f64)> {
+pub fn sammy_to_nereids_resolution(inp: &SammyInpConfig) -> Option<(f64, f64, f64, f64)> {
     if inp.no_broadening {
         return None;
     }
 
     let delta_l = inp.effective_delta_l();
     let delta_g = inp.effective_delta_g();
+    let delta_e = inp.effective_delta_e();
 
-    if delta_l == 0.0 && delta_g == 0.0 {
+    if delta_l == 0.0 && delta_g == 0.0 && delta_e == 0.0 {
         return None;
     }
 
     // Convert from SAMMY convention to NEREIDS convention.
     let delta_t_us = delta_g / (2.0 * 2.0_f64.ln().sqrt());
     let delta_l_m = delta_l / 6.0_f64.sqrt();
+    // delta_e: no conversion needed — raw SAMMY Deltae maps directly to
+    // NEREIDS's exp_width formula: Widexp = 2·Deltae·E^(3/2)/(TOF_FACTOR·L).
+    // SAMMY Ref: RslResolutionFunction_M.f90 getCo2, mrsl4.f90 Wdsint.
 
-    Some((inp.flight_path_m, delta_t_us, delta_l_m))
+    Some((inp.flight_path_m, delta_t_us, delta_l_m, delta_e))
 }
 
 // ─── .plt file types ───────────────────────────────────────────────────────────
@@ -1121,7 +1126,7 @@ BROADENING
             spin_groups: vec![],
         };
 
-        let (flight_path, delta_t, delta_l) =
+        let (flight_path, delta_t, delta_l, delta_e) =
             sammy_to_nereids_resolution(&inp).expect("should return Some for non-zero params");
 
         assert!((flight_path - 80.263).abs() < 1e-10);
@@ -1136,6 +1141,11 @@ BROADENING
         assert!(
             (delta_l - expected_dl).abs() < 1e-12,
             "delta_l={delta_l}, expected={expected_dl}"
+        );
+        // delta_e = raw Deltae from BROADENING card (no conversion)
+        assert!(
+            (delta_e - 0.022).abs() < 1e-12,
+            "delta_e={delta_e}, expected=0.022"
         );
     }
 

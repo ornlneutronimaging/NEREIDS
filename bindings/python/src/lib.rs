@@ -1269,7 +1269,7 @@ fn build_resolution(
     if let Some(tab) = resolution {
         Ok(Some(ResolutionFunction::Tabulated(tab.inner)))
     } else if let (Some(fp), Some(dt), Some(dl)) = (flight_path_m, delta_t_us, delta_l_m) {
-        let rp = ResolutionParams::new(fp, dt, dl)
+        let rp = ResolutionParams::new(fp, dt, dl, 0.0)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         Ok(Some(ResolutionFunction::Gaussian(rp)))
     } else {
@@ -1378,7 +1378,7 @@ fn resolution_broaden<'py>(
         )));
     }
     validate_energy_grid(e)?;
-    let params = ResolutionParams::new(flight_path_m, delta_t_us, delta_l_m)
+    let params = ResolutionParams::new(flight_path_m, delta_t_us, delta_l_m, 0.0)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
     if delta_t_us == 0.0 && delta_l_m == 0.0 {

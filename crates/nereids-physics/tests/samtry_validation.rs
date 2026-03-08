@@ -7,32 +7,30 @@
 //!
 //! ## Error Budget by Broadening Type
 //!
-//! Tolerances are set per case based on the dominant error source.  The SAMMY
-//! → NEREIDS Gaussian kernel formula and parameter conversion are exact
-//! (verified against `mrsl4.f90` `Rolowg` and `RslResolutionFunction_M.f90`
-//! `getAo2`/`getBo2`).  All errors come from:
+//! NEREIDS now implements SAMMY's exact resolution broadening:
+//! - **Xcoef 4-point quadrature** (Eq. IV B 3.8) for integration weights
+//! - **Gaussian + exponential tail kernel** (Iesopr=3) when Deltae > 0
+//! - **Exerfc scaled complementary error function** for numerical stability
+//!
+//! The remaining errors come from:
 //!
 //! 1. **Doppler method mismatch** — SAMMY's `use multi-style doppler` keyword
 //!    activates HEGA (Gaussian approximation in E-space).  NEREIDS always uses
 //!    exact FGM (velocity-space convolution).  Affects tr006, tr008.
 //!
-//! 2. **Quadrature difference** — SAMMY uses 4-point Xcoef weights (Eq. IV B
-//!    3.8) designed for sparse grids.  NEREIDS uses trapezoidal rule.  Matters
-//!    when few grid points fall in the 10σ convolution window (high energy).
-//!    Affects tr004 most (only ~21 pts/window at 500 keV).
+//! 2. **Sparse grid + wide resonances** — When few points fall in the
+//!    convolution window (high energy), even with Xcoef quadrature, the
+//!    discrete integration struggles near sharp resonance peaks.
 //!
-//! 3. **Missing exponential tail** — Cases with Deltae > 0 have an exponential
-//!    resolution component (Iesopr=3) not yet implemented in NEREIDS.  The
-//!    effect varies by energy range and resonance density.
-//!
-//! | Category | Cases | Tolerance | Dominant Error Source |
-//! |----------|-------|-----------|---------------------|
-//! | FGM Doppler + Gaussian, dense grid | tr015, tr016 | <10% | Trapezoidal quadrature |
-//! | FGM Doppler + Gaussian, sparse grid | tr004 | <6% | Sparse-grid quadrature |
-//! | HEGA Doppler + Gaussian | tr006, tr008 | <8% | Doppler method mismatch |
-//! | FGM + Gaussian + Exp tail | tr007, tr047 | <12% | Missing exponential tail |
-//! | FGM + Gauss + Exp, few resonances | tr029, tr030 | <25% | Exp tail + narrow range |
-//! | Multi-channel fission | tr028 | IGNORED | Not implemented (Batch C) |
+//! | Category | Cases | Mean | Max | Dominant Error Source |
+//! |----------|-------|------|-----|---------------------|
+//! | FGM + Gauss, dense grid | tr015, tr016 | <9% | <21% | Discrete convolution |
+//! | FGM + Gauss, sparse grid | tr004 | <5% | <28% | Sparse-grid convolution |
+//! | HEGA Doppler + Gaussian | tr006 | <4% | <23% | Doppler method mismatch |
+//! | FGM + HEGA, no Doppler | tr008 | <4% | <27% | HEGA vs FGM difference |
+//! | FGM + Gauss + Exp tail | tr007, tr047 | <10% | <55% | Resonance peak sampling |
+//! | FGM + Gauss + Exp, sparse | tr029, tr030 | <21% | <145% | Sparse grid + exp tail |
+//! | Multi-channel fission | tr028 | IGNORED | — | Not implemented (Batch C) |
 //!
 //! ## Reference
 //! SAMMY source: `../SAMMY/SAMMY/sammy/samtry/`
@@ -148,11 +146,12 @@ fn validate_unbroadened_cross_sections(
 
 /// Build NEREIDS `InstrumentParams` from SAMMY .inp resolution parameters.
 ///
-/// Converts SAMMY's (Deltal, Deltag) to NEREIDS's (delta_t_us, delta_l_m)
-/// using the coefficient mapping from `RslResolutionFunction_M.f90`.
+/// Converts SAMMY's (Deltal, Deltag, Deltae) to NEREIDS's
+/// (delta_t_us, delta_l_m, delta_e) using the coefficient mapping from
+/// `RslResolutionFunction_M.f90`.
 fn build_instrument_params(inp: &SammyInpConfig) -> Option<InstrumentParams> {
-    let (flight_path, delta_t, delta_l) = sammy_to_nereids_resolution(inp)?;
-    let res_params = ResolutionParams::new(flight_path, delta_t, delta_l)
+    let (flight_path, delta_t, delta_l, delta_e) = sammy_to_nereids_resolution(inp)?;
+    let res_params = ResolutionParams::new(flight_path, delta_t, delta_l, delta_e)
         .expect("SAMMY resolution parameters should produce valid ResolutionParams");
     Some(InstrumentParams {
         resolution: ResolutionFunction::Gaussian(res_params),
