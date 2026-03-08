@@ -1,0 +1,20 @@
+60-NI TRANSMISSION ... TEST WHETHER AA = BB + CC ...
+      60NI    59.927  505000.0  508000.0        -1
+cro
+PRINT THEORETICAL VALUES
+GENERATE PLOT FILE AUTOMATICALLY
+  
+      300.   78.2030    0.0200    0.0       0.0100
+    6.0000  0.074400                       -10000.   552000.
+TRANSMISSION
+  1      1    0   .5       1.0   .0
+    1    1    0    0      .500
+  2      1    0  -.5       1.0   .0
+    1    1    0    1      .500
+  3      1    0 -1.5       1.0   .0
+    1    1    0    1      .500
+  4      1    0  1.5       1.0   .0
+    1    1    0    2      .500
+  5      1    0  2.5       1.0   .0
+    1    1    0    2      .500
+  

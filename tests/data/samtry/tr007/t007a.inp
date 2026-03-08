@@ -1,0 +1,30 @@
+ FE TRANSMISSION FROM 1.13 TO 1.18 KEV
+      FE56 55.9      1133.01   1170.517    99
+PRINT WEIGHTED RESIDUALS
+DATA COVARIANCE FILE IS NAMED t007a.dcv 
+PRINT THEORETICAL VALUES
+PRINT ALL INPUT PARAMETERS
+PRINT INPUT DATA
+WRITE NEW INPUT FILE = temp1_thick1.inp
+#DO NOT SUPPRESS ANY INTERMEDIATE RESULTS
+GENERATE PLOT FILE AUTOMATICALLY
+  
+329.      80.263     0.0301   0.0       .021994
+6.0       0.2179
+TRANSMISSION
+  1      1    0  0.5    0.9999   .0
+    1    1    0    0      .500      .000      .000
+  2      1    0 -0.5    0.9172   .0
+    1    1    0    1      .500      .000      .000
+
+BROADENING
+6.00      329.00    0.2179    0.025     0.022     0.022      1 1 1 1 1 1
+
+AdjustableObject to be saved = temp1_thick1.cov
+BROADENING
+
+AdjustableObject to be restored = temp1_thick1.cov
+BROADENING
+
+AdjustableObject to be dropped
+BROADENING
