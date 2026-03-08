@@ -1,0 +1,20 @@
+junk test case based on 58-NI transmission
+      58NI    57.935   13000.0   15500.0  100    0      9   
+PRINT ALL INPUT PARAMETERS
+GENERATE PLOT FILE AUTOMATICALLY
+DO NOT SUPPRESS ANY INTERMEDIATE RESULTS
+ENERGY UNCERTAINTIES ARE AT THE END OF THE LINE
+ 
+      300.   78.2030    0.0200    0.008     0.040 
+    6.400   0.076400                          
+TRANSMISSION
+  1      1    0  0.5       1.0  0.0
+    1    1    0    0     0.500
+  2      1    0 -0.5       1.0  0.0
+    1    1    0    1     0.500
+  3      1    0 -1.5       1.0  0.0
+    1    1    0    1     0.500
+  4      1    0  1.5       1.0  0.0
+    1    1    0    2     0.500
+  5      1    0  2.5       1.0  0.0
+    1    1    0    2     0.500

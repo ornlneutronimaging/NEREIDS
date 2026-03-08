@@ -2,13 +2,17 @@
 //!
 //! Convolves theoretical cross-sections (or transmission) with the instrument
 //! resolution function to account for finite energy resolution. The resolution
-//! function is modeled as a Gaussian with energy-dependent width, derived from
-//! time-of-flight instrument parameters.
+//! function is modeled as a Gaussian with energy-dependent width, optionally
+//! combined with an exponential tail, derived from time-of-flight instrument
+//! parameters.
 //!
 //! ## SAMMY Reference
-//! - `rsl/mrsl1.f90` — Main RSL resolution broadening routines
+//! - `rsl/mrsl1.f90` — Main RSL resolution broadening routines (Resbrd)
 //! - `rsl/mrsl4.f90` — Resolution width calculation (Wdsint, Rolowg)
-//! - Manual Section 3.2 (Resolution Broadening)
+//! - `rsl/mrsl5.f90` — Exponential tail peak shift (Shftge)
+//! - `fnc/exerfc.f90` — Scaled complementary error function
+//! - `convolution/DopplerAndResolutionBroadener.cpp` — Xcoef quadrature weights
+//! - Manual Section 3.2 (Resolution Broadening), Eq. IV B 3.8
 //!
 //! ## Physics
 //!
@@ -25,8 +29,16 @@
 //!
 //!   σ_res(E) = ∫ R(E, E') · σ(E') dE'
 //!
-//! where R(E, E') = exp(-(E-E')²/W²) / (W·√π) is a Gaussian kernel
-//! with energy-dependent width W(E).
+//! When Deltae = 0, R is a pure Gaussian (Iesopr=1):
+//!   R(E, E') = exp(-(E-E')²/Wg²) / (Wg·√π)
+//!
+//! When Deltae > 0, R is the convolution of a Gaussian with an exponential
+//! tail (Iesopr=3):
+//!   R(E, E') ∝ exp(2·C·A + C²) · erfc(C + A)
+//!
+//! where C = Wg/(2·We), A = (E - E')/Wg, Wg = Gaussian width, We = exponential
+//! width. This is the analytical result for convolving exp(-x²/Wg²) with
+//! exp(-x/We)·H(x).
 
 use nereids_core::constants::{DIVISION_FLOOR, NEAR_ZERO_FLOOR};
 use std::fmt;
@@ -76,6 +88,8 @@ pub enum ResolutionParamsError {
     InvalidDeltaT(f64),
     /// Path length uncertainty must be non-negative and finite.
     InvalidDeltaL(f64),
+    /// Exponential tail parameter must be non-negative and finite.
+    InvalidDeltaE(f64),
 }
 
 impl fmt::Display for ResolutionParamsError {
@@ -89,6 +103,9 @@ impl fmt::Display for ResolutionParamsError {
             }
             Self::InvalidDeltaL(v) => {
                 write!(f, "delta_l_m must be non-negative and finite, got {v}")
+            }
+            Self::InvalidDeltaE(v) => {
+                write!(f, "delta_e_us must be non-negative and finite, got {v}")
             }
         }
     }
@@ -106,10 +123,25 @@ pub struct ResolutionParams {
     delta_t_us: f64,
     /// Flight path uncertainty (1σ Gaussian) in meters.
     delta_l_m: f64,
+    /// Exponential tail parameter (SAMMY Deltae, raw SAMMY units).
+    ///
+    /// When zero, pure Gaussian broadening is used (SAMMY Iesopr=1).
+    /// When positive, the kernel is the convolution of a Gaussian with an
+    /// exponential tail (SAMMY Iesopr=3).
+    ///
+    /// SAMMY Ref: `RslResolutionFunction_M.f90` getCo2, `rsl/mrsl4.f90` Wdsint.
+    delta_e_us: f64,
 }
 
 impl ResolutionParams {
     /// Create validated resolution parameters.
+    ///
+    /// # Arguments
+    /// * `flight_path_m` — Flight path length in meters (must be > 0).
+    /// * `delta_t_us` — Timing uncertainty in microseconds (must be >= 0).
+    /// * `delta_l_m` — Flight path uncertainty in meters (must be >= 0).
+    /// * `delta_e_us` — Exponential tail parameter in SAMMY Deltae units
+    ///   (must be >= 0). When 0, pure Gaussian broadening is used.
     ///
     /// # Errors
     /// Returns `ResolutionParamsError::InvalidFlightPath` if `flight_path_m <= 0.0`
@@ -118,10 +150,13 @@ impl ResolutionParams {
     /// not finite.
     /// Returns `ResolutionParamsError::InvalidDeltaL` if `delta_l_m < 0.0` or is
     /// not finite.
+    /// Returns `ResolutionParamsError::InvalidDeltaE` if `delta_e_us < 0.0` or is
+    /// not finite.
     pub fn new(
         flight_path_m: f64,
         delta_t_us: f64,
         delta_l_m: f64,
+        delta_e_us: f64,
     ) -> Result<Self, ResolutionParamsError> {
         if !flight_path_m.is_finite() || flight_path_m <= 0.0 {
             return Err(ResolutionParamsError::InvalidFlightPath(flight_path_m));
@@ -132,10 +167,14 @@ impl ResolutionParams {
         if !delta_l_m.is_finite() || delta_l_m < 0.0 {
             return Err(ResolutionParamsError::InvalidDeltaL(delta_l_m));
         }
+        if !delta_e_us.is_finite() || delta_e_us < 0.0 {
+            return Err(ResolutionParamsError::InvalidDeltaE(delta_e_us));
+        }
         Ok(Self {
             flight_path_m,
             delta_t_us,
             delta_l_m,
+            delta_e_us,
         })
     }
 
@@ -158,6 +197,32 @@ impl ResolutionParams {
     #[must_use]
     pub fn delta_l_m(&self) -> f64 {
         self.delta_l_m
+    }
+
+    /// Returns the exponential tail parameter (SAMMY Deltae units).
+    #[must_use]
+    pub fn delta_e_us(&self) -> f64 {
+        self.delta_e_us
+    }
+
+    /// Whether the exponential tail is active (Deltae > 0, SAMMY Iesopr=3).
+    #[must_use]
+    pub fn has_exponential_tail(&self) -> bool {
+        self.delta_e_us > NEAR_ZERO_FLOOR
+    }
+
+    /// Exponential tail width Widexp(E) in eV.
+    ///
+    /// SAMMY Ref: `rsl/mrsl4.f90` Wdsint lines 55-56 (Kedxfw=false path):
+    ///   `Widexp = E * Co2 * sqrt(E)` where `Co2 = 2·Deltae / (Sm2·Dist)`.
+    ///
+    /// Combined: `Widexp = 2·Deltae·E^(3/2) / (TOF_FACTOR·L)`.
+    #[must_use]
+    pub fn exp_width(&self, energy_ev: f64) -> f64 {
+        if energy_ev <= 0.0 || self.delta_e_us <= 0.0 {
+            return 0.0;
+        }
+        2.0 * self.delta_e_us * energy_ev.powf(1.5) / (TOF_FACTOR * self.flight_path_m)
     }
 
     /// Gaussian resolution width σ_E(E) in eV.
@@ -233,8 +298,296 @@ fn validate_inputs(energies: &[f64], data: &[f64]) -> Result<(), ResolutionError
     Ok(())
 }
 
-/// Gaussian resolution broadening assuming the energy grid is already validated
+// ─── Xcoef quadrature weights ──────────────────────────────────────────────────
+
+/// Compute SAMMY's 4-point quadrature weights for a non-uniform energy grid.
+///
+/// Replaces the simple trapezoidal rule `de = (E[j+1] - E[j-1]) / 2` with
+/// SAMMY's higher-order scheme from Eq. IV B 3.8 (page 80 of SAMMY manual R3).
+///
+/// SAMMY Ref: `convolution/DopplerAndResolutionBroadener.cpp`, `setXcoefWeights()`.
+///
+/// The weights include a correction term x2(k) that accounts for non-uniform
+/// grid spacing, providing 4th-order accuracy on smooth grids.
+///
+/// Note: the returned weights are 12x the quantity in Eq. IV B 3.8. This
+/// constant factor cancels during normalization (sum/norm), so the broadened
+/// result is independent of the scaling.
+fn compute_xcoef_weights(energies: &[f64]) -> Vec<f64> {
+    let n = energies.len();
+    if n == 0 {
+        return vec![];
+    }
+    if n == 1 {
+        return vec![1.0];
+    }
+
+    let mut weights = vec![0.0f64; n];
+
+    // Sliding window of 5 energies: e[0]..e[4] centered around point k.
+    // Padded with 0.0 at boundaries (matching SAMMY's convention).
+    let mut e = [0.0f64; 5];
+    e[3] = energies[0];
+    e[4] = if n > 1 { energies[1] } else { 0.0 };
+
+    for k in 0..n {
+        // Shift window left
+        e[0] = e[1];
+        e[1] = e[2];
+        e[2] = e[3];
+        e[3] = e[4];
+        e[4] = if k + 2 < n { energies[k + 2] } else { 0.0 };
+
+        // Spacings
+        let v1 = e[1] - e[0];
+        let v2 = e[2] - e[1];
+        let v3 = e[3] - e[2];
+        let v4 = e[4] - e[3];
+
+        let mut a = [0.0f64; 6];
+
+        // A[0] = dx(k-2), only for k >= 2
+        if k >= 2 {
+            a[0] = v1;
+
+            // A[4] = x2(k-2) = (v3² - v1²) / v2
+            if v2.abs() > NEAR_ZERO_FLOOR {
+                a[4] = (v3 * v3 - v1 * v1) / v2;
+            }
+        }
+
+        // A[1] = 5·dx(k-1), only for k >= 1
+        if k >= 1 {
+            a[1] = 5.0 * v2;
+
+            // A[5] = -x2(k-1) = -(v4² - v2²) / v3
+            if v3.abs() > NEAR_ZERO_FLOOR {
+                a[5] = -(v4 * v4 - v2 * v2) / v3;
+            }
+        }
+
+        // A[2] = 5·dx(k), only for k < n-1
+        if k < n - 1 {
+            a[2] = 5.0 * v3;
+        }
+
+        // A[3] = dx(k+1), only for k < n-2
+        if k < n - 2 {
+            a[3] = v4;
+        }
+
+        // Boundary adjustments (matching SAMMY's DopplerAndResolutionBroadener.cpp)
+        if k == n - 2 {
+            a[5] = 0.0;
+        }
+        if k == n - 1 {
+            a[4] = 0.0;
+            a[5] = 0.0;
+        }
+
+        weights[k] = a.iter().sum();
+    }
+
+    weights
+}
+
+// ─── Scaled complementary error function ───────────────────────────────────────
+
+/// Compute exp(x²)·erfc(x)·√π, numerically stable for all x.
+///
+/// SAMMY Ref: `fnc/exerfc.f90`.
+///
+/// Uses rational approximation for |x| < 5.01 and asymptotic expansion
+/// (Abramowitz & Stegun 7.1.23) for |x| >= 5.01.
+fn exerfc(x: f64) -> f64 {
+    const SQRT_PI: f64 = 1.772_453_850_905_516;
+    const TWO_SQRT_PI: f64 = 3.544_907_701_811_032;
+    const XMAX: f64 = 5.01;
+    // Rational approximation coefficients (from SAMMY's exerfc.f90)
+    const A1: f64 = 8.584_076_57e-1;
+    const A2: f64 = 3.078_181_93e-1;
+    const A3: f64 = 6.383_238_91e-2;
+    const A4: f64 = 1.824_050_75e-4;
+    const A5: f64 = 6.509_742_65e-1;
+    const A6: f64 = 2.294_848_19e-1;
+    const A7: f64 = 3.403_018_23e-2;
+
+    if x < 0.0 {
+        let xp = -x;
+        if xp > XMAX {
+            TWO_SQRT_PI - asympt(xp)
+        } else {
+            let a =
+                (A1 + xp * (A2 + xp * (A3 - xp * A4))) / (1.0 + xp * (A5 + xp * (A6 + xp * A7)));
+            let b = SQRT_PI + xp * (2.0 - a);
+            let a_rat = b / (xp * b + 1.0);
+            TWO_SQRT_PI * (x * x).exp() - a_rat
+        }
+    } else if x > XMAX {
+        asympt(x)
+    } else if x > 0.0 {
+        let a = (A1 + x * (A2 + x * (A3 - x * A4))) / (1.0 + x * (A5 + x * (A6 + x * A7)));
+        let b = SQRT_PI + x * (2.0 - a);
+        b / (x * b + 1.0)
+    } else {
+        SQRT_PI
+    }
+}
+
+/// Asymptotic expansion of exp(x²)·erfc(x)·√π for large positive x.
+///
+/// SAMMY Ref: `fnc/exerfc.f90`, Asympt function.
+/// Uses Abramowitz & Stegun 7.1.23.
+fn asympt(x: f64) -> f64 {
+    if x == 0.0 {
+        return 0.0;
+    }
+    let e = 1.0 / x;
+    if e == 0.0 {
+        return 0.0;
+    }
+    let b = 1.0 / (x * x);
+    let mut a = 1.0;
+    let mut c = b * 0.5;
+    for n in 1..=40 {
+        a -= c;
+        c *= -(n as f64 + 0.5) * b;
+        if (a - c) == a || (c / a).abs() < 1e-8 {
+            break;
+        }
+    }
+    a * e
+}
+
+/// Compute the Gaussian+exponential combined kernel weight Z(A, B).
+///
+/// Returns √π · exp(-A² + B²) · erfc(B), computed via exerfc for stability.
+///
+/// SAMMY Ref: `rsl/mrsl1.f90` lines 467-484 (Resbrd, Iesopr=3 path).
+///
+/// When B >= 0: `Z = exp(-A²) · Exerfc(B)`
+/// When B < 0:  `Z = Xxerfc(B, A)` which is the same mathematical function
+///   computed with different numerical strategy for stability.
+fn gauss_exp_kernel(a: f64, b: f64) -> f64 {
+    if b >= 0.0 {
+        let exp_neg_a2 = (-a * a).exp();
+        if exp_neg_a2 == 0.0 {
+            return 0.0;
+        }
+        exp_neg_a2 * exerfc(b)
+    } else {
+        // Xxerfc(B, A): compute exp(-A² + B²) · erfc(-B) · √π
+        // Using the same rational approximation as exerfc but for negative B.
+        //
+        // SAMMY Ref: `fnc/xxerfc.f90`.
+        xxerfc(b, a)
+    }
+}
+
+/// Compute exp(-xxx² + xx²) · erfc(-xx) · √π for xx assumed negative (B < 0).
+///
+/// SAMMY Ref: `fnc/xxerfc.f90`. Note: SAMMY says "Xx is assumed positive"
+/// but the caller passes B < 0 as Xx. The code handles this by immediately
+/// computing X = -Xx (which is positive).
+///
+/// When x = -xx exceeds XMAX, the rational approximation loses accuracy.
+/// We switch to `exp(-xxx²) · asympt(x)`, mirroring exerfc's large-argument
+/// path.
+fn xxerfc(xx: f64, xxx: f64) -> f64 {
+    const SQRT_PI: f64 = 1.772_453_850_905_516;
+    const XMAX: f64 = 5.01;
+    const A1: f64 = 8.584_076_57e-1;
+    const A2: f64 = 3.078_181_93e-1;
+    const A3: f64 = 6.383_238_91e-2;
+    const A4: f64 = 1.824_050_75e-4;
+    const A5: f64 = 6.509_742_65e-1;
+    const A6: f64 = 2.294_848_19e-1;
+    const A7: f64 = 3.403_018_23e-2;
+
+    let x = -xx; // x is positive (xx is B < 0)
+
+    // For large x, the rational approximation loses accuracy.
+    // exp(-xxx² + x²)·erfc(x)·√π = exp(-xxx²)·[exp(x²)·erfc(x)·√π]
+    //                              = exp(-xxx²)·asympt(x)
+    if x > XMAX {
+        return (-xxx * xxx).exp() * asympt(x);
+    }
+
+    let a_rat = (A1 + x * (A2 + x * (A3 - x * A4))) / (1.0 + x * (A5 + x * (A6 + x * A7)));
+    let b_int = SQRT_PI + x * (2.0 - a_rat);
+    let a_final = b_int / (x * b_int + 1.0);
+    // exp(-xxx² + x²) = exp(-A² + B²) since x = -B, xx = B
+    let exp_term = (-xxx * xxx + x * x).exp();
+    SQRT_PI * 2.0 * exp_term - a_final * (-xxx * xxx).exp()
+}
+
+/// Compute the energy shift for the Gaussian+exponential kernel peak.
+///
+/// Finds the peak of the combined kernel relative to E=0 via Newton-Raphson
+/// iteration. This centers the convolution window on the kernel maximum.
+///
+/// SAMMY Ref: `rsl/mrsl5.f90`, Shftge function.
+///
+/// # Arguments
+/// * `c` — Mixing parameter: Widgau / (2·Widexp)
+/// * `widgau` — Gaussian resolution width (eV)
+///
+/// # Returns
+/// The energy shift Est (eV) to apply to the measurement energy.
+fn shftge(c: f64, widgau: f64) -> f64 {
+    const ONE_OVER_SQRT_PI: f64 = 0.564_189_583_547_756_3;
+    const SMALL: f64 = 0.01;
+
+    let ax = c;
+    let bx = widgau;
+
+    // Initial guess
+    let mut x0 = if ax > ONE_OVER_SQRT_PI { ax } else { 0.0 };
+
+    let f0_initial = ax * exerfc(x0) - 1.0;
+    let mut f0 = f0_initial;
+    let fff = f0;
+
+    for _iter in 0..100 {
+        let f = ax * exerfc(x0) - 1.0;
+        let xma = x0 - ax;
+        let q = 1.0 - 2.0 * x0 * xma;
+        let delx = if q.abs() < NEAR_ZERO_FLOOR {
+            // q ≈ 0: division would overflow; accept current estimate.
+            break;
+        } else if xma * xma - q * f > 0.0 {
+            let disc = (xma * xma - q * f).sqrt();
+            if xma > 0.0 {
+                (-xma + disc) / q
+            } else {
+                (-xma - disc) / q
+            }
+        } else {
+            if xma.abs() < NEAR_ZERO_FLOOR {
+                break;
+            }
+            -f * 0.5 / xma
+        };
+        let x1 = x0 + delx;
+        let shftg = (ax - x1) * bx;
+        if (x1 - x0).abs() / x1.abs().max(1.0) < SMALL
+            && fff.abs() > NEAR_ZERO_FLOOR
+            && (f - f0).abs() / fff.abs() < SMALL
+        {
+            return shftg;
+        }
+        f0 = f;
+        x0 = x1;
+    }
+
+    (ax - x0) * bx
+}
+
+/// Resolution broadening assuming the energy grid is already validated
 /// (sorted ascending, same length as cross_sections).
+///
+/// Uses SAMMY's Xcoef quadrature weights (Eq. IV B 3.8) for the integration
+/// rule, and the combined Gaussian+exponential kernel when `delta_e > 0`.
 ///
 /// Callers inside `nereids-physics` that validate once (e.g. `forward_model`)
 /// use this to avoid redundant O(N) sort checks per isotope.
@@ -248,50 +601,95 @@ pub(crate) fn resolution_broaden_presorted(
         return vec![];
     }
 
-    let n_sigma = 5.0; // Integrate out to 5σ
+    let xcoef = compute_xcoef_weights(energies);
+    let use_exp_tail = params.has_exponential_tail();
+    let n_sigma = 5.0; // Integrate out to 5σ for Gaussian
     let mut broadened = vec![0.0f64; n];
 
     for i in 0..n {
         let e = energies[i];
-        let w = params.gaussian_width(e);
+        let widgau = params.gaussian_width(e);
 
-        if w < NEAR_ZERO_FLOOR {
+        if widgau < NEAR_ZERO_FLOOR {
             broadened[i] = cross_sections[i];
             continue;
         }
 
-        // Integration limits
-        let e_low = e - n_sigma * w;
-        let e_high = e + n_sigma * w;
-
-        // Trapezoidal integration with normalized Gaussian weights.
-        let mut sum = 0.0;
-        let mut norm = 0.0;
+        // Compute integration limits
+        let (e_low, e_high) = if use_exp_tail {
+            let widexp = params.exp_width(e);
+            if widexp < NEAR_ZERO_FLOOR {
+                // Fall back to pure Gaussian
+                (e - n_sigma * widgau, e + n_sigma * widgau)
+            } else {
+                // SAMMY Ref: mrsl4.f90 lines 57-65
+                let wlow = n_sigma * widgau;
+                let rwid = widgau / widexp;
+                let wup = if rwid <= 1.0 {
+                    6.25 * widexp
+                } else if rwid <= 2.0 {
+                    n_sigma * (3.0 - rwid) * widgau
+                } else {
+                    n_sigma * widgau
+                };
+                (e - wlow, e + wup)
+            }
+        } else {
+            (e - n_sigma * widgau, e + n_sigma * widgau)
+        };
 
         let j_lo = energies.partition_point(|&ej| ej < e_low);
         let j_hi = energies.partition_point(|&ej| ej <= e_high);
-        for j in j_lo..j_hi {
-            let arg = (energies[j] - e) / w;
-            // No need for arg*arg > 100 guard: partition_point already bounds
-            // j to [e - 5w, e + 5w], so |arg| <= 5 and arg*arg <= 25.
-            let g = (-arg * arg).exp();
 
-            // Trapezoidal width
-            let de_left = if j > 0 {
-                (energies[j] - energies[j - 1]) * 0.5
-            } else {
-                0.0
-            };
-            let de_right = if j < n - 1 {
-                (energies[j + 1] - energies[j]) * 0.5
-            } else {
-                0.0
-            };
-            let de = de_left + de_right;
+        if j_hi <= j_lo + 1 {
+            // Need at least 2 points for any meaningful integration.
+            // With only 1 point (delta convolution), the original value is correct.
+            // With 2+ points, Xcoef weights are precomputed and valid.
+            broadened[i] = cross_sections[i];
+            continue;
+        }
 
-            let weight = g * de;
-            sum += weight * cross_sections[j];
-            norm += weight;
+        let mut sum = 0.0;
+        let mut norm = 0.0;
+
+        if use_exp_tail {
+            let widexp = params.exp_width(e);
+            if widexp > NEAR_ZERO_FLOOR {
+                // Combined Gaussian + exponential kernel (SAMMY Iesopr=3)
+                // SAMMY Ref: mrsl1.f90 lines 455-484
+                let c = widgau * 0.5 / widexp;
+                let est = shftge(c, widgau);
+                let y = c * widgau + e - est;
+
+                for j in j_lo..j_hi {
+                    let ee = energies[j];
+                    let a = (e - est - ee) / widgau;
+                    let b = (y - ee) / widgau;
+                    let z = gauss_exp_kernel(a, b);
+                    let wt = xcoef[j] * z;
+                    sum += wt * cross_sections[j];
+                    norm += wt;
+                }
+            } else {
+                // Widexp ≈ 0, fall back to pure Gaussian with Xcoef weights
+                for j in j_lo..j_hi {
+                    let arg = (energies[j] - e) / widgau;
+                    let g = (-arg * arg).exp();
+                    let wt = xcoef[j] * g;
+                    sum += wt * cross_sections[j];
+                    norm += wt;
+                }
+            }
+        } else {
+            // Pure Gaussian kernel with Xcoef weights (SAMMY Iesopr=1)
+            // SAMMY Ref: mrsl1.f90 lines 422-435
+            for j in j_lo..j_hi {
+                let arg = (energies[j] - e) / widgau;
+                let g = (-arg * arg).exp();
+                let wt = xcoef[j] * g;
+                sum += wt * cross_sections[j];
+                norm += wt;
+            }
         }
 
         if norm > DIVISION_FLOOR {
@@ -760,7 +1158,7 @@ mod tests {
 
     #[test]
     fn test_resolution_width_scaling() {
-        let params = ResolutionParams::new(25.0, 1.0, 0.01).unwrap();
+        let params = ResolutionParams::new(25.0, 1.0, 0.01, 0.0).unwrap();
 
         // Resolution width should increase with energy.
         let w1 = params.gaussian_width(1.0);
@@ -786,7 +1184,7 @@ mod tests {
         // If resolution parameters are zero, output should equal input.
         let energies = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let xs = vec![10.0, 20.0, 30.0, 20.0, 10.0];
-        let params = ResolutionParams::new(25.0, 0.0, 0.0).unwrap();
+        let params = ResolutionParams::new(25.0, 0.0, 0.0, 0.0).unwrap();
         let broadened = resolution_broaden(&energies, &xs, &params).unwrap();
         assert_eq!(broadened, xs);
     }
@@ -806,7 +1204,7 @@ mod tests {
             })
             .collect();
 
-        let params = ResolutionParams::new(25.0, 5.0, 0.01).unwrap();
+        let params = ResolutionParams::new(25.0, 5.0, 0.01, 0.0).unwrap();
         let broadened = resolution_broaden(&energies, &xs, &params).unwrap();
 
         let orig_peak = xs.iter().cloned().fold(0.0_f64, f64::max);
@@ -841,7 +1239,7 @@ mod tests {
             })
             .collect();
 
-        let params = ResolutionParams::new(25.0, 1.0, 0.01).unwrap();
+        let params = ResolutionParams::new(25.0, 1.0, 0.01, 0.0).unwrap();
         let broadened = resolution_broaden(&energies, &xs, &params).unwrap();
 
         // Trapezoidal area
@@ -887,7 +1285,8 @@ mod tests {
         // Set delta_l such that W = gaussian_width(E=10) ≈ 0.3 eV.
         // W = 2·ΔL·E/L, so ΔL = W·L/(2E) = 0.3×25/(20) = 0.375 m
         let w_kernel = 0.3; // Kernel parameter W (exp(-x²/W²))
-        let params = ResolutionParams::new(25.0, 0.0, w_kernel * 25.0 / (2.0 * center)).unwrap();
+        let params =
+            ResolutionParams::new(25.0, 0.0, w_kernel * 25.0 / (2.0 * center), 0.0).unwrap();
 
         // Verify kernel W at center energy
         let w_at_center = params.gaussian_width(center);
@@ -948,7 +1347,7 @@ mod tests {
     fn test_venus_typical_resolution() {
         // Verify resolution width for typical VENUS parameters.
         // VENUS: L ≈ 25 m, Δt ≈ 10 μs (pulsed source), ΔL ≈ 0.01 m
-        let params = ResolutionParams::new(25.0, 10.0, 0.01).unwrap();
+        let params = ResolutionParams::new(25.0, 10.0, 0.01, 0.0).unwrap();
 
         // At 1 eV: ΔE/E should be small (good resolution)
         let de_1 = params.gaussian_width(1.0);
@@ -972,7 +1371,7 @@ mod tests {
     fn test_unsorted_energies_returns_error() {
         let energies = vec![1.0, 3.0, 2.0, 4.0]; // not sorted
         let xs = vec![10.0, 30.0, 20.0, 40.0];
-        let params = ResolutionParams::new(25.0, 1.0, 0.01).unwrap();
+        let params = ResolutionParams::new(25.0, 1.0, 0.01, 0.0).unwrap();
         let result = resolution_broaden(&energies, &xs, &params);
         assert!(result.is_err());
         assert!(matches!(
@@ -985,7 +1384,7 @@ mod tests {
     fn test_length_mismatch_returns_error() {
         let energies = vec![1.0, 2.0, 3.0];
         let xs = vec![10.0, 20.0]; // wrong length
-        let params = ResolutionParams::new(25.0, 1.0, 0.01).unwrap();
+        let params = ResolutionParams::new(25.0, 1.0, 0.01, 0.0).unwrap();
         let result = resolution_broaden(&energies, &xs, &params);
         assert!(result.is_err());
         assert!(matches!(
@@ -1001,7 +1400,7 @@ mod tests {
 
     #[test]
     fn test_resolution_params_valid() {
-        let p = ResolutionParams::new(25.0, 1.0, 0.01).unwrap();
+        let p = ResolutionParams::new(25.0, 1.0, 0.01, 0.0).unwrap();
         assert!((p.flight_path_m() - 25.0).abs() < 1e-15);
         assert!((p.delta_t_us() - 1.0).abs() < 1e-15);
         assert!((p.delta_l_m() - 0.01).abs() < 1e-15);
@@ -1009,43 +1408,62 @@ mod tests {
 
     #[test]
     fn test_resolution_params_rejects_zero_flight_path() {
-        let err = ResolutionParams::new(0.0, 1.0, 0.01).unwrap_err();
+        let err = ResolutionParams::new(0.0, 1.0, 0.01, 0.0).unwrap_err();
         assert_eq!(err, ResolutionParamsError::InvalidFlightPath(0.0));
     }
 
     #[test]
     fn test_resolution_params_rejects_negative_flight_path() {
-        let err = ResolutionParams::new(-1.0, 1.0, 0.01).unwrap_err();
+        let err = ResolutionParams::new(-1.0, 1.0, 0.01, 0.0).unwrap_err();
         assert_eq!(err, ResolutionParamsError::InvalidFlightPath(-1.0));
     }
 
     #[test]
     fn test_resolution_params_rejects_nan_flight_path() {
-        let err = ResolutionParams::new(f64::NAN, 1.0, 0.01).unwrap_err();
+        let err = ResolutionParams::new(f64::NAN, 1.0, 0.01, 0.0).unwrap_err();
         assert!(matches!(err, ResolutionParamsError::InvalidFlightPath(_)));
     }
 
     #[test]
     fn test_resolution_params_rejects_negative_delta_t() {
-        let err = ResolutionParams::new(25.0, -1.0, 0.01).unwrap_err();
+        let err = ResolutionParams::new(25.0, -1.0, 0.01, 0.0).unwrap_err();
         assert_eq!(err, ResolutionParamsError::InvalidDeltaT(-1.0));
     }
 
     #[test]
     fn test_resolution_params_rejects_nan_delta_t() {
-        let err = ResolutionParams::new(25.0, f64::NAN, 0.01).unwrap_err();
+        let err = ResolutionParams::new(25.0, f64::NAN, 0.01, 0.0).unwrap_err();
         assert!(matches!(err, ResolutionParamsError::InvalidDeltaT(_)));
     }
 
     #[test]
     fn test_resolution_params_rejects_negative_delta_l() {
-        let err = ResolutionParams::new(25.0, 1.0, -0.01).unwrap_err();
+        let err = ResolutionParams::new(25.0, 1.0, -0.01, 0.0).unwrap_err();
         assert_eq!(err, ResolutionParamsError::InvalidDeltaL(-0.01));
     }
 
     #[test]
     fn test_resolution_params_rejects_inf_delta_l() {
-        let err = ResolutionParams::new(25.0, 1.0, f64::INFINITY).unwrap_err();
+        let err = ResolutionParams::new(25.0, 1.0, f64::INFINITY, 0.0).unwrap_err();
         assert!(matches!(err, ResolutionParamsError::InvalidDeltaL(_)));
+    }
+
+    #[test]
+    fn test_resolution_params_rejects_negative_delta_e() {
+        let err = ResolutionParams::new(25.0, 1.0, 0.01, -0.05).unwrap_err();
+        assert_eq!(err, ResolutionParamsError::InvalidDeltaE(-0.05));
+    }
+
+    #[test]
+    fn test_resolution_params_rejects_nan_delta_e() {
+        let err = ResolutionParams::new(25.0, 1.0, 0.01, f64::NAN).unwrap_err();
+        assert!(matches!(err, ResolutionParamsError::InvalidDeltaE(_)));
+    }
+
+    #[test]
+    fn test_resolution_params_accepts_zero_delta_e() {
+        let p = ResolutionParams::new(25.0, 1.0, 0.01, 0.0).unwrap();
+        assert!((p.delta_e_us() - 0.0).abs() < 1e-15);
+        assert!(!p.has_exponential_tail());
     }
 }

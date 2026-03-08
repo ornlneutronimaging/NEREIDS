@@ -111,6 +111,9 @@ pub struct SammyInpConfig {
     ///
     /// Maps to rslRes parameter 2 → Ao2 in SAMMY's resolution broadening.
     pub delta_g_sammy: f64,
+    /// When true, broadening is explicitly disabled for this case
+    /// (e.g., `BROADENING IS NOT WANTED` or `NO LOW-ENERGY BROADENING`).
+    pub no_broadening: bool,
     /// BROADENING card override for Deltal (rslRes param 1).
     /// Non-zero values override Card 5 `delta_l_sammy`.
     /// SAMMY Ref: `minp18.f90` lines 89-94.
@@ -171,27 +174,36 @@ impl SammyInpConfig {
 ///
 /// SAMMY Ref: `RslResolutionFunction_M.f90` (getAo2 lines 143-161, getBo2 lines 165-179)
 ///
-/// **Note**: This function only converts the Gaussian resolution parameters
-/// (Deltal → Bo2, Deltag → Ao2).  The exponential tail parameter Deltae
-/// (`effective_delta_e()`) is not used — exponential resolution broadening
-/// is not yet implemented in NEREIDS.
+/// Returns `None` if all effective Deltal, Deltag, and Deltae are zero
+/// (no resolution broadening).
+/// Otherwise returns `Some((flight_path_m, delta_t_us, delta_l_m, delta_e))`.
 ///
-/// Returns `None` if both effective Deltal and Deltag are zero (no resolution broadening).
-/// Otherwise returns `Some((flight_path_m, delta_t_us, delta_l_m))`.
+/// The fourth element `delta_e` is the exponential tail parameter (raw SAMMY
+/// Deltae units, passed through without conversion). When non-zero, the
+/// resolution kernel is the convolution of a Gaussian with an exponential
+/// tail (SAMMY Iesopr=3).
 #[must_use]
-pub fn sammy_to_nereids_resolution(inp: &SammyInpConfig) -> Option<(f64, f64, f64)> {
+pub fn sammy_to_nereids_resolution(inp: &SammyInpConfig) -> Option<(f64, f64, f64, f64)> {
+    if inp.no_broadening {
+        return None;
+    }
+
     let delta_l = inp.effective_delta_l();
     let delta_g = inp.effective_delta_g();
+    let delta_e = inp.effective_delta_e();
 
-    if delta_l == 0.0 && delta_g == 0.0 {
+    if delta_l == 0.0 && delta_g == 0.0 && delta_e == 0.0 {
         return None;
     }
 
     // Convert from SAMMY convention to NEREIDS convention.
     let delta_t_us = delta_g / (2.0 * 2.0_f64.ln().sqrt());
     let delta_l_m = delta_l / 6.0_f64.sqrt();
+    // delta_e: no conversion needed — raw SAMMY Deltae maps directly to
+    // NEREIDS's exp_width formula: Widexp = 2·Deltae·E^(3/2)/(TOF_FACTOR·L).
+    // SAMMY Ref: RslResolutionFunction_M.f90 getCo2, mrsl4.f90 Wdsint.
 
-    Some((inp.flight_path_m, delta_t_us, delta_l_m))
+    Some((inp.flight_path_m, delta_t_us, delta_l_m, delta_e))
 }
 
 // ─── .plt file types ───────────────────────────────────────────────────────────
@@ -262,16 +274,18 @@ pub fn parse_sammy_plt(content: &str) -> Result<Vec<SammyPltRecord>, SammyParseE
 
 /// Parse a SAMMY `.par` file (resonance parameters).
 ///
-/// Reads fixed-width columnar data until a blank line or the `EXPLICIT` keyword.
-/// Column layout (all widths approximate, falls back to whitespace split):
-///   cols  1-11: E_res (eV)
-///   cols 12-22: Γ_γ (meV)
-///   cols 23-33: Γ_n (meV)
-///   cols 34-44: Γ_f1 (meV)
-///   cols 45-55: Γ_f2 (meV)
-///   remaining:  [vary-flags]  spin_group_id
+/// Uses Fortran fixed-width column parsing (FORMAT 5F11.4, 5I2, I2):
+///   cols  0-10: E_res (eV)         — 11 chars
+///   cols 11-21: Γ_γ (meV)          — 11 chars
+///   cols 22-32: Γ_n (meV)          — 11 chars
+///   cols 33-43: Γ_f1 (meV)         — 11 chars
+///   cols 44-54: Γ_f2 (meV)         — 11 chars
+///   cols 55-64: vary flags (5×I2)  — 10 chars
+///   cols 65-66: spin_group_id (I2) — 2 chars
 ///
 /// Widths are in meV in the file; this function converts to eV.
+///
+/// SAMMY Ref: `ResonanceParameterIO.cpp`, `mrpti.f90`.
 pub fn parse_sammy_par(content: &str) -> Result<SammyParFile, SammyParseError> {
     let mut resonances = Vec::new();
 
@@ -282,45 +296,65 @@ pub fn parse_sammy_par(content: &str) -> Result<SammyParFile, SammyParseError> {
             break;
         }
 
-        // Parse the resonance line. Use whitespace splitting — the Fortran
-        // fixed-width format in samtry files always has spaces between fields.
-        let fields: Vec<&str> = trimmed.split_whitespace().collect();
-        if fields.len() < 3 {
+        // Need at least enough characters for E + Γ_γ + Γ_n (33 chars).
+        if line.len() < 33 {
             return Err(SammyParseError::new(format!(
-                "line {}: expected at least 3 fields (E, Γ_γ, Γ_n), got {}",
+                "line {}: too short for .par format (need ≥33 chars, got {})",
                 i + 1,
-                fields.len()
+                line.len()
             )));
         }
 
-        let parse_f64 = |s: &str, name: &str| {
+        let parse_col = |start: usize, end: usize, name: &str| -> Result<f64, SammyParseError> {
+            let s = if start >= line.len() {
+                // Column starts past line end — treat missing as zero.
+                ""
+            } else {
+                line[start..end.min(line.len())].trim()
+            };
+            if s.is_empty() {
+                return Ok(0.0);
+            }
             s.parse::<f64>().map_err(|e| {
-                SammyParseError::new(format!("line {}: cannot parse {name}: {e}", i + 1))
+                SammyParseError::new(format!("line {}: cannot parse {name} ({s:?}): {e}", i + 1))
             })
         };
 
-        let energy_ev = parse_f64(fields[0], "E_res")?;
-        let gamma_gamma_mev = parse_f64(fields[1], "Γ_γ")?;
-        let gamma_n_mev = parse_f64(fields[2], "Γ_n")?;
+        let energy_ev = parse_col(0, 11, "E_res")?;
+        let gamma_gamma_mev = parse_col(11, 22, "Γ_γ")?;
+        let gamma_n_mev = parse_col(22, 33, "Γ_n")?;
+        let gamma_f1_mev = parse_col(33, 44, "Γ_f1")?;
+        let gamma_f2_mev = parse_col(44, 55, "Γ_f2")?;
 
-        // Fission widths: fields 3 and 4 if present and non-zero.
-        // These come after Γ_n but before the vary-flag integers.
-        // We detect fission widths by checking if the field parses as f64
-        // and contains a decimal point (vary flags are integers like "0").
-        let (gamma_f1_mev, gamma_f2_mev, flag_start) = parse_fission_widths(&fields[3..]);
+        // Spin group index at cols 65-66 (I2).
+        // The standard .par resonance line is FORMAT(5E11.4, 5I2, I2) = 67 columns.
+        // Optional trailing data (e.g., energy uncertainties) starts at position 67.
+        //
+        // SAMMY convention (ResonanceParameterIO.cpp:217-220): negative spin group
+        // means "exclude this resonance from the calculation" (setIncludeInCalc(false)).
+        // We skip excluded resonances entirely.
+        let spin_group_signed: i32 = if line.len() > 65 {
+            let end = line.len().min(67);
+            let sg_str = line[65..end].trim();
+            if sg_str.is_empty() {
+                1
+            } else {
+                sg_str.parse::<i32>().map_err(|e| {
+                    SammyParseError::new(format!(
+                        "line {}: cannot parse spin group ({sg_str:?}): {e}",
+                        i + 1
+                    ))
+                })?
+            }
+        } else {
+            1 // Default spin group if line is too short.
+        };
 
-        // Spin group index is the last integer on the line.
-        let spin_group = fields
-            .last()
-            .and_then(|s| s.parse::<u32>().ok())
-            .ok_or_else(|| {
-                SammyParseError::new(format!("line {}: no spin group index found", i + 1))
-            })?;
-
-        // Ensure the spin_group came from after the flag region.
-        // In samtry files, the layout is: E Γ_γ Γ_n [Γ_f1 Γ_f2] flags... spin_group
-        // The spin group is always the very last field.
-        let _ = flag_start; // Flags are not needed for forward model.
+        if spin_group_signed < 0 {
+            // Negative spin group → excluded from calculation.
+            continue;
+        }
+        let spin_group = spin_group_signed as u32;
 
         resonances.push(SammyResonance {
             energy_ev,
@@ -336,49 +370,6 @@ pub fn parse_sammy_par(content: &str) -> Result<SammyParFile, SammyParseError> {
         return Err(SammyParseError::new("no resonances found in .par file"));
     }
     Ok(SammyParFile { resonances })
-}
-
-/// Parse optional fission widths from the remaining fields.
-///
-/// Returns (Γ_f1_meV, Γ_f2_meV, index_of_first_vary_flag).
-///
-/// Distinguishing fission widths from vary flags: vary flags are single-digit
-/// integers (0-9) while fission widths are general floating-point values.
-/// A field is classified as a fission width if it parses as f64 AND is not
-/// a single-digit integer (which would be a vary flag).
-fn parse_fission_widths(fields: &[&str]) -> (f64, f64, usize) {
-    let mut f1 = 0.0;
-    let mut f2 = 0.0;
-    let mut idx = 0;
-
-    /// Returns true if the field looks like a fission width rather than a
-    /// vary flag.  Vary flags are single-digit integers 0-9; anything else
-    /// that parses as f64 (including "0.0", "0.", "1.5E-3") is a width.
-    fn is_fission_width(s: &str) -> bool {
-        // Single-digit integers are vary flags, not widths.
-        if s.len() == 1 && s.as_bytes()[0].is_ascii_digit() {
-            return false;
-        }
-        s.parse::<f64>().is_ok()
-    }
-
-    // Field 0 = potential Γ_f1
-    if let Some(&s) = fields.first()
-        && is_fission_width(s)
-        && let Ok(v) = s.parse::<f64>()
-    {
-        f1 = v;
-        idx = 1;
-        // Field 1 = potential Γ_f2
-        if let Some(&s2) = fields.get(1)
-            && is_fission_width(s2)
-            && let Ok(v2) = s2.parse::<f64>()
-        {
-            f2 = v2;
-            idx = 2;
-        }
-    }
-    (f1, f2, idx)
 }
 
 // ─── .inp parser ───────────────────────────────────────────────────────────────
@@ -430,15 +421,22 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
     let mut thickness_atoms_barn = 0.0;
     let mut target_spin = 0.0;
     let mut spin_groups = Vec::new();
+    let mut no_broadening = false;
 
     // State machine: find blank line after commands, then parse numeric cards.
     let mut idx = 2;
-    // Skip command lines until first blank line.
+    // Scan command lines until first blank line, detecting special keywords.
     while idx < lines.len() {
         let trimmed = lines[idx].trim();
         if trimmed.is_empty() {
             idx += 1;
             break;
+        }
+        // Detect no-broadening keywords.
+        let upper = trimmed.to_uppercase();
+        if upper.contains("BROADENING IS NOT WANTED") || upper.contains("NO LOW-ENERGY BROADENING")
+        {
+            no_broadening = true;
         }
         idx += 1;
     }
@@ -496,7 +494,7 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
 
     while idx < lines.len() {
         let trimmed = lines[idx].trim().to_uppercase();
-        if trimmed == "TRANSMISSION" {
+        if trimmed.starts_with("TRANSMISSION") || trimmed.starts_with("TOTAL") {
             idx += 1;
             // Parse spin group definitions until blank line.
             let (groups, parsed_target_spin) = parse_spin_groups(&lines[idx..])?;
@@ -553,6 +551,7 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
         delta_l_sammy,
         delta_e_sammy,
         delta_g_sammy,
+        no_broadening,
         broadening_delta_l,
         broadening_delta_g,
         broadening_delta_e,
@@ -573,16 +572,30 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
 ///     1    1    0    1      .500
 /// ```
 ///
-/// Header: group_index  n_channels  ?  J  abundance  target_spin
-/// Channel: channel_id  pair_id  L  ?  channel_spin
+/// Header line uses fixed-width Fortran FORMAT(I5, I5, I5, F5.1, F11.4, F5.1):
+///   [0:5]   KKK    — spin group index
+///   [5:10]  NENT   — number of entrance channels
+///   [10:15] NEXT   — number of exit-only channels
+///   [15:20] SPINJ  — J value for this group (F5.1)
+///   [20:31] ABNDNC — abundance/weight (F11.4)
+///   [31:36] SPINI  — target spin (F5.1)
 ///
-/// Returns (spin_groups, target_spin).  Target spin is read from field 6 of
-/// the first header line; all headers should carry the same value.  Defaults
-/// to 0.0 if field 6 is missing or not parseable.
+/// Channel lines use split_whitespace (indented ≥4 spaces).
+///
+/// Returns (spin_groups, target_spin).
 fn parse_spin_groups(lines: &[&str]) -> Result<(Vec<SammySpinGroup>, f64), SammyParseError> {
     let mut groups = Vec::new();
     let mut target_spin = 0.0;
     let mut i = 0;
+
+    /// Extract a trimmed substring from a fixed-width field, returning "" if out of bounds.
+    fn col(line: &str, start: usize, end: usize) -> &str {
+        if start >= line.len() {
+            return "";
+        }
+        let actual_end = end.min(line.len());
+        line[start..actual_end].trim()
+    }
 
     while i < lines.len() {
         let trimmed = lines[i].trim();
@@ -590,41 +603,42 @@ fn parse_spin_groups(lines: &[&str]) -> Result<(Vec<SammySpinGroup>, f64), Sammy
             break; // End of spin group block.
         }
 
-        let fields: Vec<&str> = trimmed.split_whitespace().collect();
-
-        // Distinguish header vs channel line.  Channel lines are more
-        // indented (typically 4+ spaces) than header lines (typically 2
-        // spaces).  We use leading whitespace length as the primary
-        // discriminator, with a fallback: headers also have >= 5 fields
-        // and field[3] parses as f64 (the J value — may be integer for
-        // integral spin).
+        // Distinguish header vs channel line by leading whitespace.
+        // Header lines have ≤3 leading spaces; channel lines have ≥4.
         let leading_spaces = lines[i].len() - lines[i].trim_start().len();
-        let is_header =
-            leading_spaces <= 3 && fields.len() >= 5 && fields[3].parse::<f64>().is_ok();
+        let is_header = leading_spaces <= 3 && lines[i].len() >= 20;
 
         if is_header {
-            let index = fields[0]
-                .parse::<u32>()
+            let line = lines[i];
+            // Fixed-width column extraction.
+            let index: u32 = col(line, 0, 5)
+                .parse()
                 .map_err(|e| SammyParseError::new(format!("spin group index: {e}")))?;
-            let j: f64 = fields[3]
+            let j: f64 = col(line, 15, 20)
                 .parse()
                 .map_err(|e| SammyParseError::new(format!("spin group J: {e}")))?;
             // Preserve the sign: SAMMY uses negative J to distinguish spin
             // groups with the same |J|.  The sign keeps them in separate
             // J-groups during cross-section evaluation.
+            let abundance: f64 = {
+                let s = col(line, 20, 31);
+                if s.is_empty() {
+                    1.0
+                } else {
+                    s.parse().map_err(|e| {
+                        SammyParseError::new(format!("spin group abundance ({s:?}): {e}"))
+                    })?
+                }
+            };
 
-            // Field 4: abundance (isotopic weight for this spin group).
-            // Not mapped to ResonanceRange fields because NEREIDS handles
-            // isotopic mixing at a higher level (FitConfig densities).
-            // Stored in SammySpinGroup for completeness / future use.
-            let abundance: f64 = fields[4].parse().unwrap_or(1.0);
-
-            // Field 5: target spin I (same for all spin groups).
-            // Read from the first header; subsequent headers should agree.
-            if groups.is_empty()
-                && let Some(&ts_str) = fields.get(5)
-            {
-                target_spin = ts_str.parse::<f64>().unwrap_or(0.0);
+            // Target spin: read from the first header only.
+            if groups.is_empty() {
+                let s = col(line, 31, 36);
+                if !s.is_empty() {
+                    target_spin = s.parse::<f64>().map_err(|e| {
+                        SammyParseError::new(format!("spin group target spin ({s:?}): {e}"))
+                    })?;
+                }
             }
 
             // The next line is the channel definition — extract L.
@@ -640,14 +654,14 @@ fn parse_spin_groups(lines: &[&str]) -> Result<(Vec<SammySpinGroup>, f64), Sammy
             //   cols 18-19: L (orbital angular momentum)  ← this is what we need
             //   cols 20-29: channel spin
             //
-            // Blank integer fields (kz1, kz2, ifexcl) collapse in whitespace
-            // splitting, so the token layout is:
-            //   [0]=chan_id  [1]=lpent  [2]=ishift  [3]=L  [4]=channel_spin
+            // Use fixed-width column extraction (cols 18-20) instead of
+            // whitespace split, which breaks when blank fields (kz1, kz2,
+            // ifexcl) are present or absent.
             let mut l = 0u32;
             if i + 1 < lines.len() {
-                let ch_fields: Vec<&str> = lines[i + 1].split_whitespace().collect();
-                if ch_fields.len() >= 4 {
-                    l = ch_fields[3].parse().unwrap_or(0);
+                let l_str = col(lines[i + 1], 18, 20);
+                if !l_str.is_empty() {
+                    l = l_str.parse().unwrap_or(0);
                 }
             }
 
@@ -1027,6 +1041,7 @@ BROADENING
             delta_l_sammy: 0.0301,
             delta_e_sammy: 0.0,
             delta_g_sammy: 0.021994,
+            no_broadening: false,
             broadening_delta_l: None,
             broadening_delta_g: None,
             broadening_delta_e: None,
@@ -1101,6 +1116,7 @@ BROADENING
             delta_l_sammy: 0.0301,
             delta_e_sammy: 0.0,
             delta_g_sammy: 0.021994,
+            no_broadening: false,
             broadening_delta_l: Some(0.025),
             broadening_delta_g: Some(0.022),
             broadening_delta_e: Some(0.022),
@@ -1110,7 +1126,7 @@ BROADENING
             spin_groups: vec![],
         };
 
-        let (flight_path, delta_t, delta_l) =
+        let (flight_path, delta_t, delta_l, delta_e) =
             sammy_to_nereids_resolution(&inp).expect("should return Some for non-zero params");
 
         assert!((flight_path - 80.263).abs() < 1e-10);
@@ -1125,6 +1141,11 @@ BROADENING
         assert!(
             (delta_l - expected_dl).abs() < 1e-12,
             "delta_l={delta_l}, expected={expected_dl}"
+        );
+        // delta_e = raw Deltae from BROADENING card (no conversion)
+        assert!(
+            (delta_e - 0.022).abs() < 1e-12,
+            "delta_e={delta_e}, expected=0.022"
         );
     }
 
@@ -1141,6 +1162,7 @@ BROADENING
             delta_l_sammy: 0.0,
             delta_e_sammy: 0.0,
             delta_g_sammy: 0.0,
+            no_broadening: false,
             broadening_delta_l: None,
             broadening_delta_g: None,
             broadening_delta_e: None,

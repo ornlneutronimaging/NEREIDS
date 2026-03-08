@@ -1,0 +1,26 @@
+58-NI TRANSMISSION assuming abundance of water as variable parameter
+      58NI    57.935      40.0   53000.0  100    0      9   
+PRINT ALL INPUT PARAMETERS
+#do not print partial derivatives
+#do not print debug information
+#do not print theoretical cross sections
+GENERATE PLOT FILE AUTOMATICALLY
+#DO NOT SUPPRESS ANY INTERMEDIATE RESULTS
+ENERGY UNCERTAINTIES ARE AT THE END OF THE LINE
+ 
+      300.   78.2030    0.0200    0.008     0.040 
+    6.400   0.076400                          
+TRANSMISSION
+  1      1    0   .5       1.0   .0
+    1    1    0    0      .500      .000      .000
+  2      1    0  -.5       1.0   .0
+    1    1    0    1      .500      .000      .000
+  3      1    0 -1.5       1.0   .0
+    1    1    0    1      .500      .000      .000
+  4      1    0  1.5       1.0   .0
+    1    1    0    2      .500      .000      .000
+  5      1    0  2.5       1.0   .0
+    1    1    0    2      .500      .000      .000
+  6      1    0  0.50.05056968   .0
+    1    1    0    0      .500      .000      .000
+

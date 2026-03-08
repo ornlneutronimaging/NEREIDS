@@ -714,7 +714,7 @@ pub(crate) fn build_resolution_function(
             delta_t_us,
             delta_l_m,
         } => {
-            let params = ResolutionParams::new(flight_path_m, *delta_t_us, *delta_l_m)
+            let params = ResolutionParams::new(flight_path_m, *delta_t_us, *delta_l_m, 0.0)
                 .map_err(|e| format!("Invalid resolution parameters: {e}"))?;
             Ok(Some(ResolutionFunction::Gaussian(params)))
         }

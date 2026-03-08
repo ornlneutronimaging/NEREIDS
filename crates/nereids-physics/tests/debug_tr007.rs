@@ -20,7 +20,7 @@ fn samtry_data_dir() -> PathBuf {
 #[test]
 #[ignore] // Diagnostic test with verbose output — run manually with `cargo test -- --ignored`.
 fn debug_tr007_cross_sections() {
-    let dir = samtry_data_dir().join("tr007");
+    let dir = samtry_data_dir().join("tr007_fe56_transmission_doppler_resolution");
     let inp = parse_sammy_inp(&std::fs::read_to_string(dir.join("t007a.inp")).unwrap()).unwrap();
     let par = parse_sammy_par(&std::fs::read_to_string(dir.join("t007a.par")).unwrap()).unwrap();
     let plt =
@@ -60,14 +60,14 @@ fn debug_tr007_cross_sections() {
     )
     .unwrap();
 
-    // Compute broadened cross-sections (Doppler + Gaussian resolution).
-    // Uses sammy_to_nereids_resolution() which converts SAMMY's (Deltal, Deltag)
-    // to NEREIDS's (delta_t_us, delta_l_m), respecting BROADENING card overrides.
+    // Compute broadened cross-sections (Doppler + Gaussian + exponential resolution).
+    // Uses sammy_to_nereids_resolution() which converts SAMMY's (Deltal, Deltag, Deltae)
+    // to NEREIDS's (delta_t_us, delta_l_m, delta_e), respecting BROADENING card overrides.
     use nereids_physics::resolution::{ResolutionFunction, ResolutionParams};
     use nereids_physics::transmission::InstrumentParams;
-    let (flight_path, delta_t, delta_l) = sammy_to_nereids_resolution(&inp)
+    let (flight_path, delta_t, delta_l, delta_e) = sammy_to_nereids_resolution(&inp)
         .expect("tr007 should have non-zero resolution parameters");
-    let res_params = ResolutionParams::new(flight_path, delta_t, delta_l).unwrap();
+    let res_params = ResolutionParams::new(flight_path, delta_t, delta_l, delta_e).unwrap();
     let instrument = InstrumentParams {
         resolution: ResolutionFunction::Gaussian(res_params),
     };
