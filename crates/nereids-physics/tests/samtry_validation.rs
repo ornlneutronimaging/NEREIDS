@@ -141,7 +141,8 @@ fn validate_unbroadened_cross_sections(
 /// using the coefficient mapping from `RslResolutionFunction_M.f90`.
 fn build_instrument_params(inp: &SammyInpConfig) -> Option<InstrumentParams> {
     let (flight_path, delta_t, delta_l) = sammy_to_nereids_resolution(inp)?;
-    let res_params = ResolutionParams::new(flight_path, delta_t, delta_l).ok()?;
+    let res_params = ResolutionParams::new(flight_path, delta_t, delta_l)
+        .expect("SAMMY resolution parameters should produce valid ResolutionParams");
     Some(InstrumentParams {
         resolution: ResolutionFunction::Gaussian(res_params),
     })
