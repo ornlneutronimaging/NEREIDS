@@ -17,6 +17,7 @@ fn samtry_data_dir() -> PathBuf {
 }
 
 #[test]
+#[ignore] // Diagnostic test with verbose output — run manually with `cargo test -- --ignored`.
 fn debug_tr007_cross_sections() {
     let dir = samtry_data_dir().join("tr007");
     let inp = parse_sammy_inp(&std::fs::read_to_string(dir.join("t007a.inp")).unwrap()).unwrap();

@@ -103,6 +103,11 @@ pub struct SammyInpConfig {
     pub scattering_radius_fm: f64,
     /// Sample thickness (atoms/barn).
     pub thickness_atoms_barn: f64,
+    /// Target nuclear spin I.  Determines the statistical weight
+    /// g_J = (2J+1) / ((2I+1)(2s+1)).  Parsed from field 6 of the
+    /// spin group header in Card Set 10 (all headers should agree).
+    /// Defaults to 0.0 (even-even nuclei like Fe-56, Ni-58, Ni-60).
+    pub target_spin: f64,
     /// Spin group definitions.
     pub spin_groups: Vec<SammySpinGroup>,
 }
@@ -254,22 +259,37 @@ pub fn parse_sammy_par(content: &str) -> Result<SammyParFile, SammyParseError> {
 /// Parse optional fission widths from the remaining fields.
 ///
 /// Returns (Γ_f1_meV, Γ_f2_meV, index_of_first_vary_flag).
-/// Fission width fields contain "." (floating point), vary flags are bare integers.
+///
+/// Distinguishing fission widths from vary flags: vary flags are single-digit
+/// integers (0-9) while fission widths are general floating-point values.
+/// A field is classified as a fission width if it parses as f64 AND is not
+/// a single-digit integer (which would be a vary flag).
 fn parse_fission_widths(fields: &[&str]) -> (f64, f64, usize) {
     let mut f1 = 0.0;
     let mut f2 = 0.0;
     let mut idx = 0;
 
+    /// Returns true if the field looks like a fission width rather than a
+    /// vary flag.  Vary flags are single-digit integers 0-9; anything else
+    /// that parses as f64 (including "0.0", "0.", "1.5E-3") is a width.
+    fn is_fission_width(s: &str) -> bool {
+        // Single-digit integers are vary flags, not widths.
+        if s.len() == 1 && s.as_bytes()[0].is_ascii_digit() {
+            return false;
+        }
+        s.parse::<f64>().is_ok()
+    }
+
     // Field 0 = potential Γ_f1
     if let Some(&s) = fields.first()
-        && (s.contains('.') || s.contains('E') || s.contains('e'))
+        && is_fission_width(s)
         && let Ok(v) = s.parse::<f64>()
     {
         f1 = v;
         idx = 1;
         // Field 1 = potential Γ_f2
         if let Some(&s2) = fields.get(1)
-            && (s2.contains('.') || s2.contains('E') || s2.contains('e'))
+            && is_fission_width(s2)
             && let Ok(v2) = s2.parse::<f64>()
         {
             f2 = v2;
@@ -324,6 +344,7 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
     let mut channel_width = 0.0;
     let mut scattering_radius_fm = 0.0;
     let mut thickness_atoms_barn = 0.0;
+    let mut target_spin = 0.0;
     let mut spin_groups = Vec::new();
 
     // State machine: find blank line after commands, then parse numeric cards.
@@ -339,11 +360,16 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
     }
 
     // Card 5: broadening parameters (first numeric line after blank).
+    // Temperature and flight_path are required; channel_width is optional.
     if idx < lines.len() {
         let card5_fields: Vec<&str> = lines[idx].split_whitespace().collect();
         if card5_fields.len() >= 2 {
-            temperature_k = card5_fields[0].parse().unwrap_or(300.0);
-            flight_path_m = card5_fields[1].parse().unwrap_or(0.0);
+            temperature_k = card5_fields[0]
+                .parse::<f64>()
+                .map_err(|e| SammyParseError::new(format!("Card 5: temperature: {e}")))?;
+            flight_path_m = card5_fields[1]
+                .parse::<f64>()
+                .map_err(|e| SammyParseError::new(format!("Card 5: flight_path: {e}")))?;
             if card5_fields.len() >= 5 {
                 channel_width = card5_fields[4].parse().unwrap_or(0.0);
             }
@@ -351,12 +377,16 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
         idx += 1;
     }
 
-    // Card 6: scattering radius and thickness.
+    // Card 6: scattering radius (required) and thickness (required).
     if idx < lines.len() {
         let card6_fields: Vec<&str> = lines[idx].split_whitespace().collect();
         if card6_fields.len() >= 2 {
-            scattering_radius_fm = card6_fields[0].parse().unwrap_or(0.0);
-            thickness_atoms_barn = card6_fields[1].parse().unwrap_or(0.0);
+            scattering_radius_fm = card6_fields[0]
+                .parse::<f64>()
+                .map_err(|e| SammyParseError::new(format!("Card 6: scattering_radius: {e}")))?;
+            thickness_atoms_barn = card6_fields[1]
+                .parse::<f64>()
+                .map_err(|e| SammyParseError::new(format!("Card 6: thickness: {e}")))?;
         }
         idx += 1;
     }
@@ -367,7 +397,9 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
         if trimmed == "TRANSMISSION" {
             idx += 1;
             // Parse spin group definitions until blank line.
-            spin_groups = parse_spin_groups(&lines[idx..])?;
+            let (groups, parsed_target_spin) = parse_spin_groups(&lines[idx..])?;
+            spin_groups = groups;
+            target_spin = parsed_target_spin;
             break;
         }
         idx += 1;
@@ -384,6 +416,7 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
         channel_width,
         scattering_radius_fm,
         thickness_atoms_barn,
+        target_spin,
         spin_groups,
     })
 }
@@ -400,8 +433,13 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
 ///
 /// Header: group_index  n_channels  ?  J  abundance  target_spin
 /// Channel: channel_id  pair_id  L  ?  channel_spin
-fn parse_spin_groups(lines: &[&str]) -> Result<Vec<SammySpinGroup>, SammyParseError> {
+///
+/// Returns (spin_groups, target_spin).  Target spin is read from field 6 of
+/// the first header line; all headers should carry the same value.  Defaults
+/// to 0.0 if field 6 is missing or not parseable.
+fn parse_spin_groups(lines: &[&str]) -> Result<(Vec<SammySpinGroup>, f64), SammyParseError> {
     let mut groups = Vec::new();
+    let mut target_spin = 0.0;
     let mut i = 0;
 
     while i < lines.len() {
@@ -412,15 +450,15 @@ fn parse_spin_groups(lines: &[&str]) -> Result<Vec<SammySpinGroup>, SammyParseEr
 
         let fields: Vec<&str> = trimmed.split_whitespace().collect();
 
-        // Distinguish header vs channel line: channel lines are indented (start
-        // with spaces) and the first field is the channel index within the group.
-        // Header lines have the group index as first field, typically ≥ 1, and
-        // are less indented. We detect headers by checking if the first character
-        // of the raw line (after minimal trim) is a digit at a low indent level.
-        //
-        // Simpler heuristic: header lines have >= 5 fields with a floating-point
-        // J value at position 3 (contains '.').
-        let is_header = fields.len() >= 5 && fields[3].contains('.');
+        // Distinguish header vs channel line.  Channel lines are more
+        // indented (typically 4+ spaces) than header lines (typically 2
+        // spaces).  We use leading whitespace length as the primary
+        // discriminator, with a fallback: headers also have >= 5 fields
+        // and field[3] parses as f64 (the J value — may be integer for
+        // integral spin).
+        let leading_spaces = lines[i].len() - lines[i].trim_start().len();
+        let is_header =
+            leading_spaces <= 3 && fields.len() >= 5 && fields[3].parse::<f64>().is_ok();
 
         if is_header {
             let index = fields[0]
@@ -432,7 +470,20 @@ fn parse_spin_groups(lines: &[&str]) -> Result<Vec<SammySpinGroup>, SammyParseEr
             // Preserve the sign: SAMMY uses negative J to distinguish spin
             // groups with the same |J|.  The sign keeps them in separate
             // J-groups during cross-section evaluation.
+
+            // Field 4: abundance (isotopic weight for this spin group).
+            // Not mapped to ResonanceRange fields because NEREIDS handles
+            // isotopic mixing at a higher level (FitConfig densities).
+            // Stored in SammySpinGroup for completeness / future use.
             let abundance: f64 = fields[4].parse().unwrap_or(1.0);
+
+            // Field 5: target spin I (same for all spin groups).
+            // Read from the first header; subsequent headers should agree.
+            if groups.is_empty()
+                && let Some(&ts_str) = fields.get(5)
+            {
+                target_spin = ts_str.parse::<f64>().unwrap_or(0.0);
+            }
 
             // The next line is the channel definition — extract L.
             //
@@ -469,7 +520,7 @@ fn parse_spin_groups(lines: &[&str]) -> Result<Vec<SammySpinGroup>, SammyParseEr
         i += 1;
     }
 
-    Ok(groups)
+    Ok((groups, target_spin))
 }
 
 // ─── Converter: SAMMY → NEREIDS ResonanceData ──────────────────────────────────
@@ -526,10 +577,9 @@ pub fn sammy_to_resonance_data(
         })
         .collect();
 
-    // Determine target spin from the .inp.  For Ni/Fe isotopes with even A,
-    // target spin I = 0.  We extract it from the spin group definition if
-    // available (field 6 in the header), otherwise default to 0.
-    let target_spin = 0.0;
+    // Use the target spin parsed from the spin group header (field 6).
+    // For even-even nuclei (Fe-56, Ni-58, Ni-60) this is 0.0.
+    let target_spin = inp.target_spin;
 
     // Infer Z and A from the isotope symbol (e.g. "60NI" → Z=28, A=60;
     // "FE56" → Z=26, A=56; "58NI" → Z=28, A=58).
@@ -595,7 +645,9 @@ fn parse_isotope_symbol(symbol: &str) -> Result<(u32, u32), SammyParseError> {
     )))
 }
 
-/// Map element symbol to atomic number Z.
+/// Map element symbol (uppercase) to atomic number Z.
+///
+/// Covers all elements Z=1 (H) through Z=100 (Fm).
 fn element_symbol_to_z(symbol: &str) -> Option<u32> {
     match symbol {
         "H" => Some(1),
@@ -634,20 +686,70 @@ fn element_symbol_to_z(symbol: &str) -> Option<u32> {
         "SE" => Some(34),
         "BR" => Some(35),
         "KR" => Some(36),
+        "RB" => Some(37),
+        "SR" => Some(38),
+        "Y" => Some(39),
         "ZR" => Some(40),
         "NB" => Some(41),
         "MO" => Some(42),
         "TC" => Some(43),
+        "RU" => Some(44),
+        "RH" => Some(45),
+        "PD" => Some(46),
         "AG" => Some(47),
+        "CD" => Some(48),
         "IN" => Some(49),
         "SN" => Some(50),
+        "SB" => Some(51),
+        "TE" => Some(52),
+        "I" => Some(53),
+        "XE" => Some(54),
+        "CS" => Some(55),
+        "BA" => Some(56),
+        "LA" => Some(57),
+        "CE" => Some(58),
+        "PR" => Some(59),
+        "ND" => Some(60),
+        "PM" => Some(61),
+        "SM" => Some(62),
+        "EU" => Some(63),
+        "GD" => Some(64),
+        "TB" => Some(65),
+        "DY" => Some(66),
+        "HO" => Some(67),
+        "ER" => Some(68),
+        "TM" => Some(69),
+        "YB" => Some(70),
+        "LU" => Some(71),
+        "HF" => Some(72),
         "TA" => Some(73),
         "W" => Some(74),
+        "RE" => Some(75),
+        "OS" => Some(76),
+        "IR" => Some(77),
+        "PT" => Some(78),
+        "AU" => Some(79),
+        "HG" => Some(80),
+        "TL" => Some(81),
         "PB" => Some(82),
+        "BI" => Some(83),
+        "PO" => Some(84),
+        "AT" => Some(85),
+        "RN" => Some(86),
+        "FR" => Some(87),
+        "RA" => Some(88),
+        "AC" => Some(89),
         "TH" => Some(90),
+        "PA" => Some(91),
         "U" => Some(92),
+        "NP" => Some(93),
         "PU" => Some(94),
         "AM" => Some(95),
+        "CM" => Some(96),
+        "BK" => Some(97),
+        "CF" => Some(98),
+        "ES" => Some(99),
+        "FM" => Some(100),
         _ => None,
     }
 }
@@ -734,6 +836,8 @@ BROADENING
         assert!((inp.flight_path_m - 80.263).abs() < 1e-6);
         assert!((inp.scattering_radius_fm - 6.0).abs() < 1e-6);
         assert!((inp.thickness_atoms_barn - 0.2179).abs() < 1e-6);
+        // Target spin parsed from spin group header field 6 (".0" → 0.0).
+        assert!((inp.target_spin - 0.0).abs() < 1e-6);
 
         // Spin groups.
         assert_eq!(inp.spin_groups.len(), 2);
@@ -769,6 +873,7 @@ BROADENING
             channel_width: 0.021994,
             scattering_radius_fm: 6.0,
             thickness_atoms_barn: 0.2179,
+            target_spin: 0.0,
             spin_groups: vec![
                 SammySpinGroup {
                     index: 1,

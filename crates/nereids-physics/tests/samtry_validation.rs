@@ -154,7 +154,7 @@ fn validate_broadened_cross_sections(
     if !is_ascending {
         // Sort and track original order.
         let mut indexed: Vec<(usize, f64)> = energies.iter().copied().enumerate().collect();
-        indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        indexed.sort_by(|a, b| a.1.total_cmp(&b.1));
         energies = indexed.iter().map(|(_, e)| *e).collect();
     }
 
@@ -225,7 +225,7 @@ fn validate_transmission(
     let mut energies: Vec<f64> = reference.iter().map(|r| r.energy_kev * 1000.0).collect();
     let is_ascending = energies.windows(2).all(|w| w[0] <= w[1]);
     if !is_ascending {
-        energies.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        energies.sort_by(|a, b| a.total_cmp(b));
     }
 
     // Broadened cross-sections.

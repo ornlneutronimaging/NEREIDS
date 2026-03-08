@@ -892,6 +892,12 @@ mod tests {
                 // Use a meaningful floor: when both FD and analytical values
                 // are below 1e-10, relative error comparisons are dominated
                 // by floating-point noise and are not physically meaningful.
+                //
+                // The floor was raised from 1e-15 to 1e-10 alongside the
+                // B=S_l boundary condition fix in the Reich-Moore U-matrix.
+                // That fix shifted near-zero cross-section values from
+                // O(1e-15) to O(1e-10), making the old floor too tight for
+                // floating-point comparison at those magnitudes.
                 let scale = fd.abs().max(ana.abs()).max(1e-10);
                 assert!(
                     err / scale < 0.01,
