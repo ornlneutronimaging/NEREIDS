@@ -18,12 +18,14 @@ use crate::lm::{FitModel, FlatMatrix};
 /// Used by `TransmissionFitModel` to avoid redundant Doppler broadening
 /// when the temperature hasn't changed between `evaluate()` calls (e.g.,
 /// during finite-difference Jacobian computation for density parameters).
-#[derive(Clone)]
+/// Uses `Rc` so cache hits return a cheap reference-count bump instead of
+/// deep-cloning the entire cross-section data (which can be ~72 KB+ for
+/// 3 isotopes × 3000 energy bins).
 struct BroadenedXsCache {
     /// Temperature (K) at which the cross-sections were computed.
     temperature_k: f64,
     /// Broadened cross-sections σ_D(E) per isotope.
-    cross_sections: Vec<Vec<f64>>,
+    cross_sections: std::rc::Rc<Vec<Vec<f64>>>,
 }
 
 /// Transmission model backed by precomputed broadened cross-sections.
@@ -177,6 +179,9 @@ pub struct TransmissionFitModel {
     ///
     /// Uses `RefCell` for interior mutability since `FitModel::evaluate()`
     /// takes `&self`. `TransmissionFitModel` is per-pixel and single-threaded.
+    /// The `RefCell` intentionally makes this type `!Sync`, so any accidental
+    /// attempt to share it across threads (e.g., wrapping in `Arc`) will fail
+    /// at compile time rather than at runtime.
     broadened_cache: RefCell<Option<BroadenedXsCache>>,
 }
 
@@ -268,18 +273,24 @@ impl TransmissionFitModel {
     ///
     /// Returns the broadened XS. Updates the internal cache if the temperature
     /// differs from the cached value.
-    fn broadened_xs_cached(&self, temperature_k: f64) -> Vec<Vec<f64>> {
-        let base_xs = self
-            .base_xs
-            .as_ref()
-            .expect("broadened_xs_cached requires base_xs");
+    ///
+    /// # Errors
+    /// Returns `FittingError::InvalidConfig` if `base_xs` is `None` (caller
+    /// should check beforehand) or if the broadening computation fails.
+    fn broadened_xs_cached(
+        &self,
+        temperature_k: f64,
+    ) -> Result<std::rc::Rc<Vec<Vec<f64>>>, FittingError> {
+        let base_xs = self.base_xs.as_ref().ok_or_else(|| {
+            FittingError::InvalidConfig("broadened_xs_cached requires base_xs".into())
+        })?;
         {
             let cache = self.broadened_cache.borrow();
             if let Some(ref c) = *cache
                 && (c.temperature_k - temperature_k).abs()
                     <= f64::EPSILON * (1.0 + temperature_k.abs())
             {
-                return c.cross_sections.clone();
+                return Ok(std::rc::Rc::clone(&c.cross_sections));
             }
         }
         // Cache miss — recompute.
@@ -290,12 +301,13 @@ impl TransmissionFitModel {
             temperature_k,
             self.instrument.as_deref(),
         )
-        .expect("broadened_cross_sections_from_base failed");
+        .map_err(|e| FittingError::InvalidConfig(format!("broadening failed: {e}")))?;
+        let rc = std::rc::Rc::new(xs);
         *self.broadened_cache.borrow_mut() = Some(BroadenedXsCache {
             temperature_k,
-            cross_sections: xs.clone(),
+            cross_sections: std::rc::Rc::clone(&rc),
         });
-        xs
+        Ok(rc)
     }
 }
 
@@ -316,7 +328,8 @@ impl FitModel for TransmissionFitModel {
 
         if self.base_xs.is_some() {
             // Fast path: use cached broadened XS + Beer-Lambert.
-            let broadened = self.broadened_xs_cached(temperature_k);
+            // unwrap safe: base_xs.is_some() guard above; broadening validated in new().
+            let broadened = self.broadened_xs_cached(temperature_k).unwrap();
             let n = self.energies.len();
             let mut neg_opt = vec![0.0f64; n];
             for (i, xs) in broadened.iter().enumerate() {
@@ -369,7 +382,8 @@ impl FitModel for TransmissionFitModel {
         let n_e = y_current.len();
         let n_free = free_param_indices.len();
         let temperature_k = self.effective_temperature(params);
-        let broadened = self.broadened_xs_cached(temperature_k);
+        // unwrap safe: base_xs checked by `?` above; broadening validated in new().
+        let broadened = self.broadened_xs_cached(temperature_k).unwrap();
 
         let mut jacobian = FlatMatrix::zeros(n_e, n_free);
 
@@ -816,12 +830,17 @@ mod tests {
         );
         // With the analytical Jacobian, the fit converges to machine precision
         // on noise-free data, giving chi2 ≈ 0 and reduced_chi2 ≈ 0. The
-        // covariance scaling (cov * reduced_chi2) then yields zero uncertainties.
-        // Accept zero or positive finite values — both are correct.
-        assert!(
-            (unc[1] >= 0.0 && unc[1].is_finite()) || result.reduced_chi_squared == 0.0,
-            "temperature uncertainty should be non-negative and finite, got {}",
-            unc[1]
-        );
+        // covariance matrix may have NaN from ill-conditioned inversion;
+        // sqrt(NaN) * 0.0 = NaN (IEEE 754). When reduced_chi2 == 0, the
+        // uncertainty is mathematically undefined (0 × ∞), so NaN is acceptable.
+        // For nonzero reduced_chi2, uncertainty must be non-negative and finite.
+        if result.reduced_chi_squared > 0.0 {
+            assert!(
+                unc[1] >= 0.0 && unc[1].is_finite(),
+                "temperature uncertainty should be non-negative and finite, got {} (reduced_chi2={})",
+                unc[1],
+                result.reduced_chi_squared,
+            );
+        }
     }
 }
