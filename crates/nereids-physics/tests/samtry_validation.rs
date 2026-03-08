@@ -311,7 +311,12 @@ fn validate_transmission(
 /// cross-section reference values (Th_initial).
 #[test]
 fn test_tr007_fe56_parse() {
-    let (inp, par, plt) = load_samtry_case("tr007", "t007a.inp", "t007a.par", "raa.plt");
+    let (inp, par, plt) = load_samtry_case(
+        "tr007_fe56_transmission_doppler_resolution",
+        "t007a.inp",
+        "t007a.par",
+        "raa.plt",
+    );
 
     // Verify parsing.
     assert_eq!(par.resonances.len(), 3);
@@ -326,7 +331,12 @@ fn test_tr007_fe56_parse() {
 
 #[test]
 fn test_tr007_fe56_unbroadened() {
-    let (inp, par, plt) = load_samtry_case("tr007", "t007a.inp", "t007a.par", "raa.plt");
+    let (inp, par, plt) = load_samtry_case(
+        "tr007_fe56_transmission_doppler_resolution",
+        "t007a.inp",
+        "t007a.par",
+        "raa.plt",
+    );
 
     // Unbroadened cross-sections won't match the broadened reference exactly,
     // but they should be in the same ballpark — validate the physics is sane.
@@ -346,7 +356,12 @@ fn test_tr007_fe56_unbroadened() {
 
 #[test]
 fn test_tr007_fe56_broadened() {
-    let (inp, par, plt) = load_samtry_case("tr007", "t007a.inp", "t007a.par", "raa.plt");
+    let (inp, par, plt) = load_samtry_case(
+        "tr007_fe56_transmission_doppler_resolution",
+        "t007a.inp",
+        "t007a.par",
+        "raa.plt",
+    );
 
     let result = validate_broadened_cross_sections(&inp, &par, &plt, 0.01);
     eprintln!(
@@ -370,7 +385,12 @@ fn test_tr007_fe56_broadened() {
 /// tr008: Ni-58 transmission, 293-308 keV, ~100 resonances, 5 spin groups.
 #[test]
 fn test_tr008_ni58_parse() {
-    let (inp, par, plt) = load_samtry_case("tr008", "t008a.inp", "t008a.par", "raa.plt");
+    let (inp, par, plt) = load_samtry_case(
+        "tr008_ni58_transmission_hega",
+        "t008a.inp",
+        "t008a.par",
+        "raa.plt",
+    );
 
     assert!(par.resonances.len() > 50, "expected many resonances");
     assert!(inp.spin_groups.len() >= 4, "expected >= 4 spin groups");
@@ -380,7 +400,12 @@ fn test_tr008_ni58_parse() {
 
 #[test]
 fn test_tr008_ni58_broadened() {
-    let (inp, par, plt) = load_samtry_case("tr008", "t008a.inp", "t008a.par", "raa.plt");
+    let (inp, par, plt) = load_samtry_case(
+        "tr008_ni58_transmission_hega",
+        "t008a.inp",
+        "t008a.par",
+        "raa.plt",
+    );
 
     let result = validate_broadened_cross_sections(&inp, &par, &plt, 0.01);
     eprintln!(
@@ -405,7 +430,12 @@ fn test_tr008_ni58_broadened() {
 /// tr006: Ni-60, 134-137 keV, ~270 resonances, DO NOT SOLVE BAYES (pure forward).
 #[test]
 fn test_tr006_ni60_parse() {
-    let (inp, par, plt) = load_samtry_case("tr006", "t006a.inp", "t006a.par", "raa.plt");
+    let (inp, par, plt) = load_samtry_case(
+        "tr006_ni60_transmission_gaussian_print",
+        "t006a.inp",
+        "t006a.par",
+        "raa.plt",
+    );
 
     assert!(par.resonances.len() > 100, "expected many resonances");
     assert_eq!(inp.spin_groups.len(), 5);
@@ -415,7 +445,12 @@ fn test_tr006_ni60_parse() {
 
 #[test]
 fn test_tr006_ni60_broadened() {
-    let (inp, par, plt) = load_samtry_case("tr006", "t006a.inp", "t006a.par", "raa.plt");
+    let (inp, par, plt) = load_samtry_case(
+        "tr006_ni60_transmission_gaussian_print",
+        "t006a.inp",
+        "t006a.par",
+        "raa.plt",
+    );
 
     let result = validate_broadened_cross_sections(&inp, &par, &plt, 0.01);
     eprintln!(
@@ -438,7 +473,12 @@ fn test_tr006_ni60_broadened() {
 /// tr004: Ni-60, 505-508 keV, ~270 resonances, with transmission reference.
 #[test]
 fn test_tr004_ni60_parse() {
-    let (inp, par, plt) = load_samtry_case("tr004", "t004a.inp", "t004a.par", "raa.plt");
+    let (inp, par, plt) = load_samtry_case(
+        "tr004_ni60_transmission_gaussian",
+        "t004a.inp",
+        "t004a.par",
+        "raa.plt",
+    );
 
     assert!(par.resonances.len() > 100, "expected many resonances");
     assert_eq!(inp.spin_groups.len(), 5);
@@ -448,7 +488,12 @@ fn test_tr004_ni60_parse() {
 
 #[test]
 fn test_tr004_ni60_broadened() {
-    let (inp, par, plt) = load_samtry_case("tr004", "t004a.inp", "t004a.par", "raa.plt");
+    let (inp, par, plt) = load_samtry_case(
+        "tr004_ni60_transmission_gaussian",
+        "t004a.inp",
+        "t004a.par",
+        "raa.plt",
+    );
 
     let result = validate_broadened_cross_sections(&inp, &par, &plt, 0.01);
     eprintln!(
@@ -470,11 +515,16 @@ fn test_tr004_ni60_broadened() {
 
 #[test]
 fn test_tr004_ni60_transmission() {
-    let (inp, par, _) = load_samtry_case("tr004", "t004a.inp", "t004a.par", "raa.plt");
+    let (inp, par, _) = load_samtry_case(
+        "tr004_ni60_transmission_gaussian",
+        "t004a.inp",
+        "t004a.par",
+        "raa.plt",
+    );
 
     // Load transmission reference (.plt2 file).
     let plt2_path = samtry_data_dir()
-        .join("tr004")
+        .join("tr004_ni60_transmission_gaussian")
         .join("answers")
         .join("raa2.plt");
     let plt2_content = std::fs::read_to_string(&plt2_path).unwrap();
@@ -495,6 +545,268 @@ fn test_tr004_ni60_transmission() {
     assert!(
         result.mean_rel_error < 0.02,
         "transmission mean error {:.4} > 2%",
+        result.mean_rel_error
+    );
+}
+
+// ─── Batch A: New cases (issue #321-A) ──────────────────────────────────────
+
+/// tr015: Ni-58 transmission, 180-181 keV, Doppler+Gaussian (Deltae=0).
+///
+/// Tests ENERGY UNCERTAINTIES keyword (parser should ignore it).
+#[test]
+fn test_tr015_ni58_parse() {
+    let (inp, par, plt) = load_samtry_case(
+        "tr015_ni58_transmission_energy_unc",
+        "t015a.inp",
+        "t015a.par",
+        "raa.plt",
+    );
+    assert!(par.resonances.len() >= 15, "expected >=15 resonances");
+    assert!(!plt.is_empty());
+    assert_eq!(inp.isotope_symbol, "58NI");
+    assert!((inp.temperature_k - 300.0).abs() < 1.0);
+    assert!(!inp.no_broadening);
+}
+
+#[test]
+fn test_tr015_ni58_broadened() {
+    let (inp, par, plt) = load_samtry_case(
+        "tr015_ni58_transmission_energy_unc",
+        "t015a.inp",
+        "t015a.par",
+        "raa.plt",
+    );
+    let result = validate_broadened_cross_sections(&inp, &par, &plt, 0.01);
+    eprintln!(
+        "tr015 broadened: max_rel={:.6}, mean_rel={:.6}, n={}, above_1%={}, worst@{:.4} keV",
+        result.max_rel_error,
+        result.mean_rel_error,
+        result.n_points,
+        result.n_above_threshold,
+        result.worst_energy_kev
+    );
+    // tr015: Deltae=0, pure Gaussian resolution.
+    assert!(
+        result.mean_rel_error < 0.10,
+        "broadened mean error {:.4} > 10%",
+        result.mean_rel_error
+    );
+}
+
+/// tr016: Ni-58 transmission, 180-183 keV, Doppler+Gaussian (Deltae=0).
+///
+/// Tests ENERGY UNCERTAINTIES + PRINT PARTIAL DERIVATIVES keywords.
+#[test]
+fn test_tr016_ni58_parse() {
+    let (inp, par, plt) = load_samtry_case(
+        "tr016_ni58_transmission_partial_deriv",
+        "t016a.inp",
+        "t016a.par",
+        "raa.plt",
+    );
+    assert!(par.resonances.len() >= 10, "expected >=10 resonances");
+    assert!(!plt.is_empty());
+    assert_eq!(inp.isotope_symbol, "58NI");
+    assert!(!inp.no_broadening);
+}
+
+#[test]
+fn test_tr016_ni58_broadened() {
+    let (inp, par, plt) = load_samtry_case(
+        "tr016_ni58_transmission_partial_deriv",
+        "t016a.inp",
+        "t016a.par",
+        "raa.plt",
+    );
+    let result = validate_broadened_cross_sections(&inp, &par, &plt, 0.01);
+    eprintln!(
+        "tr016 broadened: max_rel={:.6}, mean_rel={:.6}, n={}, above_1%={}, worst@{:.4} keV",
+        result.max_rel_error,
+        result.mean_rel_error,
+        result.n_points,
+        result.n_above_threshold,
+        result.worst_energy_kev
+    );
+    // tr016: Deltae=0, pure Gaussian resolution.
+    assert!(
+        result.mean_rel_error < 0.10,
+        "broadened mean error {:.4} > 10%",
+        result.mean_rel_error
+    );
+}
+
+/// tr029: Ni-58 transmission, 40-53000 eV, Doppler+Gaussian+Exponential.
+///
+/// Tests ENERGY UNCERTAINTIES and PRINT ALL INPUT keywords.
+#[test]
+fn test_tr029_ni58_parse() {
+    let (inp, par, plt) = load_samtry_case(
+        "tr029_ni58_transmission_abundance_var",
+        "t029a.inp",
+        "t029a.par",
+        "raa.plt",
+    );
+    assert!(par.resonances.len() >= 100, "expected many resonances");
+    assert!(!plt.is_empty());
+    assert_eq!(inp.isotope_symbol, "58NI");
+    assert!(!inp.no_broadening);
+}
+
+#[test]
+fn test_tr029_ni58_broadened() {
+    let (inp, par, plt) = load_samtry_case(
+        "tr029_ni58_transmission_abundance_var",
+        "t029a.inp",
+        "t029a.par",
+        "raa.plt",
+    );
+    let result = validate_broadened_cross_sections(&inp, &par, &plt, 0.01);
+    eprintln!(
+        "tr029 broadened: max_rel={:.6}, mean_rel={:.6}, n={}, above_1%={}, worst@{:.4} keV",
+        result.max_rel_error,
+        result.mean_rel_error,
+        result.n_points,
+        result.n_above_threshold,
+        result.worst_energy_kev
+    );
+    // tr029: Deltae=0.008, has exponential tail (not yet implemented).
+    assert!(
+        result.mean_rel_error < 0.15,
+        "broadened mean error {:.4} > 15%",
+        result.mean_rel_error
+    );
+}
+
+/// tr030: Ni-58 transmission, 13-15.5 keV, Doppler+Gaussian+Exponential.
+///
+/// Tests spin group removal via negative sign in PAR file.
+#[test]
+fn test_tr030_ni58_parse() {
+    let (inp, par, plt) = load_samtry_case(
+        "tr030_ni58_transmission_spin_removal",
+        "t030a.inp",
+        "t030a.par",
+        "raa.plt",
+    );
+    assert!(!par.resonances.is_empty(), "expected resonances");
+    assert!(!plt.is_empty());
+    assert_eq!(inp.isotope_symbol, "58NI");
+    assert!(!inp.no_broadening);
+}
+
+#[test]
+fn test_tr030_ni58_broadened() {
+    let (inp, par, plt) = load_samtry_case(
+        "tr030_ni58_transmission_spin_removal",
+        "t030a.inp",
+        "t030a.par",
+        "raa.plt",
+    );
+    let result = validate_broadened_cross_sections(&inp, &par, &plt, 0.01);
+    eprintln!(
+        "tr030 broadened: max_rel={:.6}, mean_rel={:.6}, n={}, above_1%={}, worst@{:.4} keV",
+        result.max_rel_error,
+        result.mean_rel_error,
+        result.n_points,
+        result.n_above_threshold,
+        result.worst_energy_kev
+    );
+    // tr030: Deltae=0.008, has exponential tail (not yet implemented).
+    // Narrow range (13-15.5 keV) with few active resonances amplifies
+    // the exponential tail contribution → higher relative error than tr029.
+    assert!(
+        result.mean_rel_error < 0.25,
+        "broadened mean error {:.4} > 25%",
+        result.mean_rel_error
+    );
+}
+
+/// tr047: Fe-56 transmission, 1130-1168 eV, cooled to 181K, Doppler+Gaussian+Exponential.
+///
+/// Similar to tr007 but at a different temperature. Tests `csisrs` keyword.
+#[test]
+fn test_tr047_fe56_parse() {
+    let (inp, par, plt) = load_samtry_case(
+        "tr047_fe56_transmission_cooled",
+        "t047a.inp",
+        "t047a.par",
+        "raa.plt",
+    );
+    assert!(!par.resonances.is_empty(), "expected resonances");
+    assert!(!plt.is_empty());
+    assert_eq!(inp.isotope_symbol, "FE56");
+    assert!((inp.temperature_k - 181.0).abs() < 1.0);
+    assert!(!inp.no_broadening);
+}
+
+#[test]
+fn test_tr047_fe56_broadened() {
+    let (inp, par, plt) = load_samtry_case(
+        "tr047_fe56_transmission_cooled",
+        "t047a.inp",
+        "t047a.par",
+        "raa.plt",
+    );
+    let result = validate_broadened_cross_sections(&inp, &par, &plt, 0.01);
+    eprintln!(
+        "tr047 broadened: max_rel={:.6}, mean_rel={:.6}, n={}, above_1%={}, worst@{:.4} keV",
+        result.max_rel_error,
+        result.mean_rel_error,
+        result.n_points,
+        result.n_above_threshold,
+        result.worst_energy_kev
+    );
+    // tr047: Deltae=0.022, has exponential tail (not yet implemented).
+    assert!(
+        result.mean_rel_error < 0.15,
+        "broadened mean error {:.4} > 15%",
+        result.mean_rel_error
+    );
+}
+
+/// tr028: Pu-241 total cross-section, 0.001-0.1 eV, NO BROADENING.
+///
+/// Tests TOTAL CROSS SECTION keyword and no-broadening mode.
+/// Very low energy range — unbroadened cross-sections should match exactly.
+#[test]
+fn test_tr028_pu241_parse() {
+    let (inp, par, plt) = load_samtry_case(
+        "tr028_pu241_total_xs_no_broadening",
+        "t028a.inp",
+        "t028a.par",
+        "raa.plt",
+    );
+    assert!(!par.resonances.is_empty(), "expected resonances");
+    assert!(!plt.is_empty());
+    assert_eq!(inp.isotope_symbol, "PU241");
+    assert!(inp.no_broadening, "should detect no-broadening keyword");
+}
+
+#[test]
+#[ignore] // Pu-241 has 3 channels per spin group (fission) — Batch C scope.
+fn test_tr028_pu241_unbroadened() {
+    let (inp, par, plt) = load_samtry_case(
+        "tr028_pu241_total_xs_no_broadening",
+        "t028a.inp",
+        "t028a.par",
+        "raa.plt",
+    );
+    // No broadening — compare unbroadened cross-sections directly.
+    let result = validate_unbroadened_cross_sections(&inp, &par, &plt, 0.01);
+    eprintln!(
+        "tr028 unbroadened: max_rel={:.6}, mean_rel={:.6}, n={}, above_1%={}, worst@{:.4} keV",
+        result.max_rel_error,
+        result.mean_rel_error,
+        result.n_points,
+        result.n_above_threshold,
+        result.worst_energy_kev
+    );
+    // No broadening: unbroadened XS should match SAMMY reference closely.
+    // Currently 91% mean error — multi-channel fission not yet supported.
+    assert!(
+        result.mean_rel_error < 0.50,
+        "unbroadened mean error {:.4} > 50%",
         result.mean_rel_error
     );
 }

@@ -1,0 +1,20 @@
+PU 241     totale young
+     PU241      241.     0.001       0.1         0       
+no low-energy broadening is to be used
+print debug information
+print theoretical values
+DO NOT SOLVE BAYES EQUATIONS
+CHI SQUARED IS WANTED
+GENERATE PLOT FILE A
+
+     300.        20.      .038        0.     64.00   5.0      0.05
+     9.540 0.003587
+TOTAL                    CROSS
+  1      1    2  3.0       1.0  2.5
+    1    1    0    0     3.000
+    2    0    0    0     3.000
+    3    0    0    0     3.000
+  2      1    2  2.0       1.0  2.5
+    1    1    0    0     2.000
+    2    0    0    0     2.000
+    3    0    0    0     2.000
