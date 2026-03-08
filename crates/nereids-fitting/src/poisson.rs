@@ -1308,6 +1308,10 @@ pub fn poisson_fit_lbfgsb(
 
     let mut converged = false;
     let mut iter = 0;
+    // Track the temperature from the previous iteration so we can skip the
+    // expensive 3× broadening when T has not changed (e.g. only densities
+    // moved during the last line search).
+    let mut last_temperature: f64 = f64::NAN;
 
     // Initialize L-BFGS memory.
     let mut lbfgs = LbfgsbMemory::new(config.lbfgsb_memory, n_free);
@@ -1327,29 +1331,32 @@ pub fn poisson_fit_lbfgsb(
 
         if let Some(ctx) = &temp_ctx {
             let t_current = all_vals_buf[ctx.temperature_index];
-            let (xs_new, dxs_new) = if let Some(ref base) = ctx.base_xs {
-                transmission::broadened_cross_sections_with_derivative_from_base(
-                    &ctx.energies,
-                    base,
-                    &ctx.resonance_data,
-                    t_current,
-                    ctx.instrument.as_ref(),
-                )
-            } else {
-                transmission::broadened_cross_sections_with_derivative(
-                    &ctx.energies,
-                    &ctx.resonance_data,
-                    t_current,
-                    ctx.instrument.as_ref(),
-                )
+            if !last_temperature.is_finite() || (t_current - last_temperature).abs() > 1e-15 {
+                let (xs_new, dxs_new) = if let Some(ref base) = ctx.base_xs {
+                    transmission::broadened_cross_sections_with_derivative_from_base(
+                        &ctx.energies,
+                        base,
+                        &ctx.resonance_data,
+                        t_current,
+                        ctx.instrument.as_ref(),
+                    )
+                } else {
+                    transmission::broadened_cross_sections_with_derivative(
+                        &ctx.energies,
+                        &ctx.resonance_data,
+                        t_current,
+                        ctx.instrument.as_ref(),
+                    )
+                }
+                .map_err(|e| {
+                    FittingError::EvaluationFailed(format!(
+                        "poisson_fit_lbfgsb: broadening failed: {e}"
+                    ))
+                })?;
+                xs_owned = xs_new;
+                dxs_dt = dxs_new;
+                last_temperature = t_current;
             }
-            .map_err(|e| {
-                FittingError::EvaluationFailed(format!(
-                    "poisson_fit_lbfgsb: broadening failed: {e}"
-                ))
-            })?;
-            xs_owned = xs_new;
-            dxs_dt = dxs_new;
         }
 
         // Use owned cross-sections when temperature fitting, otherwise

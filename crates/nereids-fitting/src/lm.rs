@@ -230,7 +230,16 @@ fn compute_jacobian(
         }
 
         params.all_values_into(all_vals_buf);
-        let perturbed = model.evaluate(all_vals_buf)?;
+        let perturbed = match model.evaluate(all_vals_buf) {
+            Ok(v) => v,
+            Err(_) => {
+                // Restore original before skipping — leaving the column as
+                // zero makes this parameter unresponsive for one LM step,
+                // which is safe (matches Poisson compute_gradient pattern).
+                params.params[idx].value = original;
+                continue;
+            }
+        };
         params.params[idx].value = original;
 
         for i in 0..n_data {
