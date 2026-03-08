@@ -241,8 +241,8 @@ def forward_model(
     flight_path_m: float | None = None,
     delta_t_us: float | None = None,
     delta_l_m: float | None = None,
-    delta_e_us: float | None = None,
     resolution: TabulatedResolution | None = None,
+    delta_e_us: float | None = None,
 ) -> NDArray[np.float64]:
     """Compute theoretical transmission spectrum."""
     ...
@@ -258,8 +258,8 @@ def fit_spectrum(
     flight_path_m: float | None = None,
     delta_t_us: float | None = None,
     delta_l_m: float | None = None,
-    delta_e_us: float | None = None,
     resolution: TabulatedResolution | None = None,
+    delta_e_us: float | None = None,
     fit_temperature: bool = False,
     fitter: str = "lm",
 ) -> FitResult:
@@ -353,8 +353,8 @@ def spatial_map(
     flight_path_m: float | None = None,
     delta_t_us: float | None = None,
     delta_l_m: float | None = None,
-    delta_e_us: float | None = None,
     resolution: TabulatedResolution | None = None,
+    delta_e_us: float | None = None,
     max_iter: int = 100,
     fitter: str = "lm",
     roi: list[int] | None = None,
@@ -374,8 +374,8 @@ def fit_roi(
     flight_path_m: float | None = None,
     delta_t_us: float | None = None,
     delta_l_m: float | None = None,
-    delta_e_us: float | None = None,
     resolution: TabulatedResolution | None = None,
+    delta_e_us: float | None = None,
     max_iter: int = 100,
 ) -> FitResult:
     """Fit a single spectrum averaged over a region of interest."""
@@ -441,8 +441,8 @@ def trace_detectability(
     flight_path_m: float | None = None,
     delta_t_us: float | None = None,
     delta_l_m: float | None = None,
-    delta_e_us: float | None = None,
     resolution: TabulatedResolution | None = None,
+    delta_e_us: float | None = None,
     snr_threshold: float = 3.0,
 ) -> TraceDetectabilityReport:
     """Compute trace-detectability for a matrix + trace isotope pair."""
@@ -459,8 +459,8 @@ def trace_detectability_survey(
     flight_path_m: float | None = None,
     delta_t_us: float | None = None,
     delta_l_m: float | None = None,
-    delta_e_us: float | None = None,
     resolution: TabulatedResolution | None = None,
+    delta_e_us: float | None = None,
     snr_threshold: float = 3.0,
 ) -> list[tuple[str, TraceDetectabilityReport]]:
     """Survey multiple trace candidates against a single matrix."""
@@ -473,8 +473,8 @@ def precompute_cross_sections(
     flight_path_m: float | None = None,
     delta_t_us: float | None = None,
     delta_l_m: float | None = None,
-    delta_e_us: float | None = None,
     resolution: TabulatedResolution | None = None,
+    delta_e_us: float | None = None,
 ) -> list[NDArray[np.float64]]:
     """Precompute Doppler- and resolution-broadened total cross-sections.
 

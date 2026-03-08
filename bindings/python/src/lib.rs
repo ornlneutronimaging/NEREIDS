@@ -507,7 +507,7 @@ fn cross_sections<'py>(
 /// Returns:
 ///     1D numpy array of transmission values.
 #[pyfunction]
-#[pyo3(signature = (energies, isotopes, temperature_k=0.0, flight_path_m=None, delta_t_us=None, delta_l_m=None, delta_e_us=None, resolution=None))]
+#[pyo3(signature = (energies, isotopes, temperature_k=0.0, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, delta_e_us=None))]
 fn forward_model<'py>(
     py: Python<'py>,
     energies: PyReadonlyArray1<f64>,
@@ -516,8 +516,8 @@ fn forward_model<'py>(
     flight_path_m: Option<f64>,
     delta_t_us: Option<f64>,
     delta_l_m: Option<f64>,
-    delta_e_us: Option<f64>,
     resolution: Option<PyTabulatedResolution>,
+    delta_e_us: Option<f64>,
 ) -> PyResult<Bound<'py, PyArray1<f64>>> {
     let e_owned = energies.as_slice()?.to_vec();
 
@@ -529,7 +529,7 @@ fn forward_model<'py>(
     let sample = SampleParams::new(temperature_k, sample_isotopes)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
-    let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, delta_e_us, resolution)?;
+    let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution, delta_e_us)?;
     let instrument = res_fn.map(|r| InstrumentParams { resolution: r });
 
     // Release the GIL for the forward model computation.
@@ -571,7 +571,7 @@ fn forward_model<'py>(
 /// Returns:
 ///     FitResult with densities, uncertainties, and fit quality.
 #[pyfunction]
-#[pyo3(signature = (measured_t, sigma, energies, isotopes, temperature_k=0.0, initial_densities=None, max_iter=100, flight_path_m=None, delta_t_us=None, delta_l_m=None, delta_e_us=None, resolution=None, fit_temperature=false, fitter="lm"))]
+#[pyo3(signature = (measured_t, sigma, energies, isotopes, temperature_k=0.0, initial_densities=None, max_iter=100, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, delta_e_us=None, fit_temperature=false, fitter="lm"))]
 fn fit_spectrum(
     py: Python<'_>,
     measured_t: PyReadonlyArray1<f64>,
@@ -584,8 +584,8 @@ fn fit_spectrum(
     flight_path_m: Option<f64>,
     delta_t_us: Option<f64>,
     delta_l_m: Option<f64>,
-    delta_e_us: Option<f64>,
     resolution: Option<PyTabulatedResolution>,
+    delta_e_us: Option<f64>,
     fit_temperature: bool,
     fitter: &str,
 ) -> PyResult<PyFitResult> {
@@ -646,7 +646,7 @@ fn fit_spectrum(
         ));
     }
 
-    let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, delta_e_us, resolution)?;
+    let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution, delta_e_us)?;
 
     match fitter {
         "lm" => {
@@ -1257,8 +1257,8 @@ fn build_resolution(
     flight_path_m: Option<f64>,
     delta_t_us: Option<f64>,
     delta_l_m: Option<f64>,
-    delta_e_us: Option<f64>,
     resolution: Option<PyTabulatedResolution>,
+    delta_e_us: Option<f64>,
 ) -> PyResult<Option<ResolutionFunction>> {
     let has_gaussian = flight_path_m.is_some() || delta_t_us.is_some() || delta_l_m.is_some();
     if has_gaussian && resolution.is_some() {
@@ -1507,7 +1507,7 @@ fn py_apply_resolution<'py>(
 /// Returns:
 ///     SpatialResult (fitter='lm') or SparseResult (fitter='poisson').
 #[pyfunction]
-#[pyo3(name = "spatial_map", signature = (transmission, uncertainty, energies, isotopes, temperature_k=300.0, initial_densities=None, dead_pixels=None, flight_path_m=None, delta_t_us=None, delta_l_m=None, delta_e_us=None, resolution=None, max_iter=100, fitter="lm", roi=None))]
+#[pyo3(name = "spatial_map", signature = (transmission, uncertainty, energies, isotopes, temperature_k=300.0, initial_densities=None, dead_pixels=None, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, delta_e_us=None, max_iter=100, fitter="lm", roi=None))]
 fn py_spatial_map(
     py: Python<'_>,
     transmission: PyReadonlyArray3<f64>,
@@ -1520,8 +1520,8 @@ fn py_spatial_map(
     flight_path_m: Option<f64>,
     delta_t_us: Option<f64>,
     delta_l_m: Option<f64>,
-    delta_e_us: Option<f64>,
     resolution: Option<PyTabulatedResolution>,
+    delta_e_us: Option<f64>,
     max_iter: usize,
     fitter: &str,
     roi: Option<[usize; 4]>,
@@ -1588,7 +1588,7 @@ fn py_spatial_map(
         )));
     }
 
-    let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, delta_e_us, resolution)?;
+    let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution, delta_e_us)?;
 
     match fitter {
         "lm" => {
@@ -1762,7 +1762,7 @@ fn py_spatial_map(
 /// Returns:
 ///     FitResult with densities, uncertainties, and fit quality.
 #[pyfunction]
-#[pyo3(name = "fit_roi", signature = (transmission, uncertainty, y_range, x_range, energies, isotopes, temperature_k=300.0, initial_densities=None, flight_path_m=None, delta_t_us=None, delta_l_m=None, delta_e_us=None, resolution=None, max_iter=100))]
+#[pyo3(name = "fit_roi", signature = (transmission, uncertainty, y_range, x_range, energies, isotopes, temperature_k=300.0, initial_densities=None, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, delta_e_us=None, max_iter=100))]
 fn py_fit_roi(
     py: Python<'_>,
     transmission: PyReadonlyArray3<f64>,
@@ -1776,8 +1776,8 @@ fn py_fit_roi(
     flight_path_m: Option<f64>,
     delta_t_us: Option<f64>,
     delta_l_m: Option<f64>,
-    delta_e_us: Option<f64>,
     resolution: Option<PyTabulatedResolution>,
+    delta_e_us: Option<f64>,
     max_iter: usize,
 ) -> PyResult<PyFitResult> {
     let e = energies.as_slice()?;
@@ -1851,7 +1851,7 @@ fn py_fit_roi(
         )));
     }
 
-    let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, delta_e_us, resolution)?;
+    let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution, delta_e_us)?;
 
     let config = FitConfig::new(
         e.to_vec(),
@@ -2226,7 +2226,7 @@ impl PyTraceDetectabilityReport {
 /// Returns:
 ///     TraceDetectabilityReport with peak SNR, peak energy, and |ΔT| spectrum.
 #[pyfunction]
-#[pyo3(name = "trace_detectability", signature = (matrix, matrix_density, trace, trace_ppm, energies, i0, temperature_k=293.6, flight_path_m=None, delta_t_us=None, delta_l_m=None, delta_e_us=None, resolution=None, snr_threshold=3.0))]
+#[pyo3(name = "trace_detectability", signature = (matrix, matrix_density, trace, trace_ppm, energies, i0, temperature_k=293.6, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, delta_e_us=None, snr_threshold=3.0))]
 fn py_trace_detectability(
     py: Python<'_>,
     matrix: &PyResonanceData,
@@ -2239,8 +2239,8 @@ fn py_trace_detectability(
     flight_path_m: Option<f64>,
     delta_t_us: Option<f64>,
     delta_l_m: Option<f64>,
-    delta_e_us: Option<f64>,
     resolution: Option<PyTabulatedResolution>,
+    delta_e_us: Option<f64>,
     snr_threshold: f64,
 ) -> PyResult<PyTraceDetectabilityReport> {
     let e = energies.as_slice()?;
@@ -2272,7 +2272,7 @@ fn py_trace_detectability(
         ));
     }
 
-    let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, delta_e_us, resolution)?;
+    let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution, delta_e_us)?;
 
     // Clone data to owned types so we can release the GIL.
     let e_owned = e.to_vec();
@@ -2327,7 +2327,7 @@ fn py_trace_detectability(
 /// Returns:
 ///     List of (isotope_name, TraceDetectabilityReport) sorted by peak_snr descending.
 #[pyfunction]
-#[pyo3(name = "trace_detectability_survey", signature = (matrix, matrix_density, trace_candidates, trace_ppm, energies, i0, temperature_k=293.6, flight_path_m=None, delta_t_us=None, delta_l_m=None, delta_e_us=None, resolution=None, snr_threshold=3.0))]
+#[pyo3(name = "trace_detectability_survey", signature = (matrix, matrix_density, trace_candidates, trace_ppm, energies, i0, temperature_k=293.6, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, delta_e_us=None, snr_threshold=3.0))]
 fn py_trace_detectability_survey(
     py: Python<'_>,
     matrix: &PyResonanceData,
@@ -2340,8 +2340,8 @@ fn py_trace_detectability_survey(
     flight_path_m: Option<f64>,
     delta_t_us: Option<f64>,
     delta_l_m: Option<f64>,
-    delta_e_us: Option<f64>,
     resolution: Option<PyTabulatedResolution>,
+    delta_e_us: Option<f64>,
     snr_threshold: f64,
 ) -> PyResult<Vec<(String, PyTraceDetectabilityReport)>> {
     let e = energies.as_slice()?;
@@ -2378,7 +2378,7 @@ fn py_trace_detectability_survey(
         ));
     }
 
-    let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, delta_e_us, resolution)?;
+    let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution, delta_e_us)?;
 
     let candidates: Vec<ResonanceData> = trace_candidates
         .into_iter()
@@ -2438,7 +2438,7 @@ fn py_trace_detectability_survey(
 ///     List of 1D numpy arrays (one per isotope), each containing the broadened
 ///     total cross-section in barns on the supplied energy grid.
 #[pyfunction]
-#[pyo3(signature = (energies, isotopes, temperature_k=0.0, flight_path_m=None, delta_t_us=None, delta_l_m=None, delta_e_us=None, resolution=None))]
+#[pyo3(signature = (energies, isotopes, temperature_k=0.0, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, delta_e_us=None))]
 fn precompute_cross_sections<'py>(
     py: Python<'py>,
     energies: PyReadonlyArray1<f64>,
@@ -2447,8 +2447,8 @@ fn precompute_cross_sections<'py>(
     flight_path_m: Option<f64>,
     delta_t_us: Option<f64>,
     delta_l_m: Option<f64>,
-    delta_e_us: Option<f64>,
     resolution: Option<PyTabulatedResolution>,
+    delta_e_us: Option<f64>,
 ) -> PyResult<Vec<Bound<'py, PyArray1<f64>>>> {
     let e = energies.as_slice()?;
     require_non_empty_energy_grid(e)?;
@@ -2468,7 +2468,7 @@ fn precompute_cross_sections<'py>(
         .into_iter()
         .map(|d| Arc::unwrap_or_clone(d.inner))
         .collect();
-    let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, delta_e_us, resolution)?;
+    let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution, delta_e_us)?;
     let instrument = res_fn.map(|r| InstrumentParams { resolution: r });
 
     // Copy numpy slice to owned Vec so we can release the GIL.
