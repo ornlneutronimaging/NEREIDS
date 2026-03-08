@@ -130,8 +130,15 @@ pub struct LmResult {
 pub trait FitModel {
     /// Evaluate the model for the given parameters.
     ///
-    /// Returns a vector of model predictions, same length as the data.
-    fn evaluate(&self, params: &[f64]) -> Vec<f64>;
+    /// On success, returns a vector of model predictions with the same
+    /// length as the data being fitted. On failure, returns a
+    /// [`FittingError`] indicating that the model could not be evaluated
+    /// (e.g. a broadening or physics error).
+    ///
+    /// **Optimizer semantics:** during Levenberg-Marquardt trial steps,
+    /// an `Err` is treated as a failed step (increase λ / backtrack).
+    /// At the initial point or post-convergence, `Err` is propagated.
+    fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError>;
 
     /// Optionally provide an analytical Jacobian.
     ///
@@ -184,7 +191,7 @@ fn compute_jacobian(
     fd_step: f64,
     all_vals_buf: &mut Vec<f64>,
     free_idx_buf: &mut Vec<usize>,
-) -> FlatMatrix {
+) -> Result<FlatMatrix, FittingError> {
     params.free_indices_into(free_idx_buf);
     let n_free = free_idx_buf.len();
     let n_data = y_current.len();
@@ -202,7 +209,7 @@ fn compute_jacobian(
             n_free,
             n_data * n_free,
         );
-        return j;
+        return Ok(j);
     }
 
     // Fallback: forward finite differences, reusing y_current as the base.
@@ -230,7 +237,16 @@ fn compute_jacobian(
         }
 
         params.all_values_into(all_vals_buf);
-        let perturbed = model.evaluate(all_vals_buf);
+        let perturbed = match model.evaluate(all_vals_buf) {
+            Ok(v) => v,
+            Err(_) => {
+                // Restore original before skipping — leaving the column as
+                // zero makes this parameter unresponsive for one LM step,
+                // which is safe (matches Poisson compute_gradient pattern).
+                params.params[idx].value = original;
+                continue;
+            }
+        };
         params.params[idx].value = original;
 
         for i in 0..n_data {
@@ -238,7 +254,7 @@ fn compute_jacobian(
         }
     }
 
-    jacobian
+    Ok(jacobian)
 }
 
 /// Solve (A + λ·diag(A)) · x = b using Gaussian elimination.
@@ -422,7 +438,7 @@ pub fn levenberg_marquardt(
                 }
             })
             .collect();
-        let y_model = model.evaluate(&params.all_values());
+        let y_model = model.evaluate(&params.all_values())?;
 
         // #P1: If the model produces NaN/Inf with all-fixed parameters,
         // return converged=false rather than silently propagating NaN chi².
@@ -512,7 +528,7 @@ pub fn levenberg_marquardt(
     // y_current is kept up-to-date after accepted steps so that the next
     // Jacobian call can reuse it without an extra evaluate() call.
     params.all_values_into(&mut all_vals_buf);
-    let mut y_current = model.evaluate(&all_vals_buf);
+    let mut y_current = model.evaluate(&all_vals_buf)?;
     let mut residuals: Vec<f64> = y_obs
         .iter()
         .zip(y_current.iter())
@@ -537,7 +553,7 @@ pub fn levenberg_marquardt(
             config.fd_step,
             &mut all_vals_buf,
             &mut free_idx_buf,
-        );
+        )?;
 
         // Build normal equations: JᵀWJ and JᵀWr
         let mut jtw_j = FlatMatrix::zeros(n_free, n_free);
@@ -570,7 +586,19 @@ pub fn levenberg_marquardt(
         params.set_free_values(&trial_free);
 
         params.all_values_into(&mut all_vals_buf);
-        let y_trial = model.evaluate(&all_vals_buf);
+        let y_trial = match model.evaluate(&all_vals_buf) {
+            Ok(y) => y,
+            Err(_) => {
+                // Treat evaluation error as a bad step (same as NaN).
+                params.set_free_values(&free_vals_buf);
+                lambda *= config.lambda_up;
+                if lambda > LAMBDA_BREAKOUT {
+                    converged = false;
+                    break;
+                }
+                continue;
+            }
+        };
 
         // #113: If the model produced NaN/Inf, treat as a bad step (same as
         // chi2 increase) — increase lambda and try again.
@@ -647,7 +675,7 @@ pub fn levenberg_marquardt(
             config.fd_step,
             &mut all_vals_buf,
             &mut free_idx_buf,
-        );
+        )?;
         let mut jtw_j = FlatMatrix::zeros(n_free, n_free);
         for (i, &wi) in weights.iter().enumerate() {
             for j in 0..n_free {
@@ -718,10 +746,10 @@ mod tests {
     }
 
     impl FitModel for LinearModel {
-        fn evaluate(&self, params: &[f64]) -> Vec<f64> {
+        fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
             let a = params[0];
             let b = params[1];
-            self.x.iter().map(|&x| a * x + b).collect()
+            Ok(self.x.iter().map(|&x| a * x + b).collect())
         }
     }
 
@@ -787,9 +815,9 @@ mod tests {
             x: Vec<f64>,
         }
         impl FitModel for QuadModel {
-            fn evaluate(&self, params: &[f64]) -> Vec<f64> {
+            fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
                 let (a, b, c) = (params[0], params[1], params[2]);
-                self.x.iter().map(|&x| a * x * x + b * x + c).collect()
+                Ok(self.x.iter().map(|&x| a * x * x + b * x + c).collect())
             }
         }
 
@@ -834,9 +862,9 @@ mod tests {
             x: Vec<f64>,
         }
         impl FitModel for SlopeModel {
-            fn evaluate(&self, params: &[f64]) -> Vec<f64> {
+            fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
                 let a = params[0];
-                self.x.iter().map(|&x| a * x).collect()
+                Ok(self.x.iter().map(|&x| a * x).collect())
             }
         }
 
@@ -920,8 +948,8 @@ mod tests {
         // the result must report converged=false (not converged=true with NaN chi2).
         struct NanModel;
         impl FitModel for NanModel {
-            fn evaluate(&self, _params: &[f64]) -> Vec<f64> {
-                vec![f64::NAN; 5]
+            fn evaluate(&self, _params: &[f64]) -> Result<Vec<f64>, FittingError> {
+                Ok(vec![f64::NAN; 5])
             }
         }
 
@@ -949,8 +977,8 @@ mod tests {
         // but 3 free params for 2 data points is underdetermined.
         struct ThreeParamModel;
         impl FitModel for ThreeParamModel {
-            fn evaluate(&self, params: &[f64]) -> Vec<f64> {
-                vec![params[0] + params[1] + params[2]; 2]
+            fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+                Ok(vec![params[0] + params[1] + params[2]; 2])
             }
         }
 
@@ -1018,10 +1046,10 @@ mod tests {
         // #125.6: A model that never improves should trigger lambda breakout.
         struct ConstantModel;
         impl FitModel for ConstantModel {
-            fn evaluate(&self, _params: &[f64]) -> Vec<f64> {
+            fn evaluate(&self, _params: &[f64]) -> Result<Vec<f64>, FittingError> {
                 // Returns constant output regardless of parameters,
                 // so the Jacobian is zero and no step can improve chi2.
-                vec![42.0; 5]
+                Ok(vec![42.0; 5])
             }
         }
 
@@ -1051,12 +1079,13 @@ mod tests {
             x: Vec<f64>,
         }
         impl FitModel for NanAtLargeModel {
-            fn evaluate(&self, params: &[f64]) -> Vec<f64> {
+            fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
                 let a = params[0];
-                self.x
+                Ok(self
+                    .x
                     .iter()
                     .map(|&x| if a > 5.0 { f64::NAN } else { a * x + 1.0 })
-                    .collect()
+                    .collect())
             }
         }
 
@@ -1072,6 +1101,45 @@ mod tests {
 
         // Should converge to a≈2 while avoiding the NaN region a>5.
         assert!(result.converged, "Should converge avoiding NaN region");
+        assert!(
+            (result.params[0] - 2.0).abs() < 0.1,
+            "a = {}, expected ~2.0",
+            result.params[0]
+        );
+    }
+
+    #[test]
+    fn test_err_model_during_trial_step() {
+        // Model that returns Err for large parameter values.
+        // The optimizer should treat Err trial steps as bad steps (increase λ)
+        // and converge without panicking.
+        struct ErrAtLargeModel {
+            x: Vec<f64>,
+        }
+        impl FitModel for ErrAtLargeModel {
+            fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+                let a = params[0];
+                if a > 5.0 {
+                    return Err(FittingError::EvaluationFailed(
+                        "parameter out of valid range".into(),
+                    ));
+                }
+                Ok(self.x.iter().map(|&x| a * x + 1.0).collect())
+            }
+        }
+
+        let x: Vec<f64> = (0..10).map(|i| i as f64).collect();
+        let y_obs: Vec<f64> = x.iter().map(|&xi| 2.0 * xi + 1.0).collect();
+        let sigma = vec![1.0; 10];
+
+        let model = ErrAtLargeModel { x };
+        let mut params = ParameterSet::new(vec![FitParameter::unbounded("a", 3.0)]);
+
+        let result =
+            levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &LmConfig::default()).unwrap();
+
+        // Should converge to a≈2 while avoiding the Err region a>5.
+        assert!(result.converged, "Should converge avoiding Err region");
         assert!(
             (result.params[0] - 2.0).abs() < 0.1,
             "a = {}, expected ~2.0",

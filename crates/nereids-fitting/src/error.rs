@@ -18,6 +18,8 @@ pub enum FittingError {
     },
     /// Invalid model configuration.
     InvalidConfig(String),
+    /// Model evaluation failed (e.g. broadening error, invalid physics state).
+    EvaluationFailed(String),
 }
 
 impl fmt::Display for FittingError {
@@ -33,6 +35,7 @@ impl fmt::Display for FittingError {
                 "{field} length ({actual}) must match expected length ({expected})"
             ),
             Self::InvalidConfig(msg) => write!(f, "invalid model configuration: {msg}"),
+            Self::EvaluationFailed(msg) => write!(f, "model evaluation failed: {msg}"),
         }
     }
 }

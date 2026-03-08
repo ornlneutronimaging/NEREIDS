@@ -42,11 +42,12 @@ pub struct PrecomputedTransmissionModel {
 }
 
 impl FitModel for PrecomputedTransmissionModel {
-    fn evaluate(&self, params: &[f64]) -> Vec<f64> {
-        assert!(
-            !self.cross_sections.is_empty(),
-            "PrecomputedTransmissionModel.cross_sections must not be empty"
-        );
+    fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+        if self.cross_sections.is_empty() {
+            return Err(FittingError::InvalidConfig(
+                "PrecomputedTransmissionModel.cross_sections must not be empty".into(),
+            ));
+        }
         let n_e = self.cross_sections[0].len();
         let mut neg_opt = vec![0.0f64; n_e];
         // #109.1: No density > 0 guard — let Beer-Lambert handle all densities
@@ -61,7 +62,7 @@ impl FitModel for PrecomputedTransmissionModel {
                 neg_opt[j] -= density * sigma;
             }
         }
-        neg_opt.iter().map(|&d| d.exp()).collect()
+        Ok(neg_opt.iter().map(|&d| d.exp()).collect())
     }
 
     /// Analytical Jacobian for the Beer-Lambert transmission model.
@@ -241,7 +242,7 @@ impl TransmissionFitModel {
 }
 
 impl FitModel for TransmissionFitModel {
-    fn evaluate(&self, params: &[f64]) -> Vec<f64> {
+    fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
         debug_assert!(
             self.density_indices.iter().all(|&i| i < params.len()),
             "density_indices out of bounds for params (len={})",
@@ -283,7 +284,7 @@ impl FitModel for TransmissionFitModel {
                         temperature_k,
                         self.instrument.as_deref(),
                     )
-                    .expect("broadened_cross_sections_from_base failed"),
+                    .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?,
                 );
                 *self.cached_broadened_xs.borrow_mut() = Some(Rc::clone(&xs));
                 self.cached_temperature.set(temperature_k);
@@ -299,7 +300,7 @@ impl FitModel for TransmissionFitModel {
                     neg_opt[j] -= density * sigma;
                 }
             }
-            neg_opt.iter().map(|&d| d.exp()).collect()
+            Ok(neg_opt.iter().map(|&d| d.exp()).collect())
         } else {
             // Original path: full forward model (no temperature fitting).
             let isotopes: Vec<(ResonanceData, f64)> = self
@@ -310,10 +311,10 @@ impl FitModel for TransmissionFitModel {
                 .collect();
 
             let sample = SampleParams::new(temperature_k, isotopes)
-                .expect("SampleParams: temperature must be non-negative and finite");
+                .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?;
 
             transmission::forward_model(&self.energies, &sample, self.instrument.as_deref())
-                .expect("TransmissionFitModel: forward_model failed")
+                .map_err(|e| FittingError::EvaluationFailed(e.to_string()))
         }
     }
 
@@ -396,7 +397,7 @@ impl FitModel for TransmissionFitModel {
                 t_perturbed,
                 self.instrument.as_deref(),
             )
-            .expect("broadened_cross_sections_from_base (T+dT) failed");
+            .ok()?;
 
             // Beer-Lambert at perturbed temperature with current densities.
             let mut neg_opt = vec![0.0f64; n_e];
@@ -440,7 +441,7 @@ mod tests {
         };
 
         let params = [0.2f64, 0.4f64];
-        let y = model.evaluate(&params);
+        let y = model.evaluate(&params).unwrap();
 
         let expected: Vec<f64> = (0..3)
             .map(|i| {
@@ -472,7 +473,7 @@ mod tests {
         };
 
         let params = [0.2f64, 0.4f64];
-        let y = model.evaluate(&params);
+        let y = model.evaluate(&params).unwrap();
         let free = vec![0usize, 1usize];
 
         let jac = model
@@ -490,8 +491,8 @@ mod tests {
             p_plus[p_idx] += h;
             p_minus[p_idx] -= h;
 
-            let y_plus = model.evaluate(&p_plus);
-            let y_minus = model.evaluate(&p_minus);
+            let y_plus = model.evaluate(&p_plus).unwrap();
+            let y_minus = model.evaluate(&p_minus).unwrap();
 
             for i in 0..3 {
                 let fd = (y_plus[i] - y_minus[i]) / (2.0 * h);
@@ -519,7 +520,7 @@ mod tests {
         };
 
         let params = [0.1f64];
-        let y = model.evaluate(&params);
+        let y = model.evaluate(&params).unwrap();
         let free = vec![0usize];
 
         let jac = model
@@ -587,7 +588,7 @@ mod tests {
             TransmissionFitModel::new(energies.clone(), vec![data], 0.0, None, vec![0], None, None)
                 .unwrap();
 
-        let y_obs = model.evaluate(&[true_thickness]);
+        let y_obs = model.evaluate(&[true_thickness]).unwrap();
         let sigma = vec![0.01; y_obs.len()]; // 1% uncertainty
 
         let mut params = ParameterSet::new(vec![
@@ -663,7 +664,7 @@ mod tests {
         )
         .unwrap();
 
-        let y_obs = model.evaluate(&[true_t1, true_t2]);
+        let y_obs = model.evaluate(&[true_t1, true_t2]).unwrap();
         let sigma = vec![0.01; y_obs.len()];
 
         let mut params = ParameterSet::new(vec![
@@ -733,8 +734,8 @@ mod tests {
         .unwrap();
 
         let density = 0.0005;
-        let y_via_index = model.evaluate(&[density, 300.0]);
-        let y_via_fixed = model_fixed.evaluate(&[density]);
+        let y_via_index = model.evaluate(&[density, 300.0]).unwrap();
+        let y_via_fixed = model_fixed.evaluate(&[density]).unwrap();
 
         for (a, b) in y_via_index.iter().zip(y_via_fixed.iter()) {
             assert!(
@@ -771,7 +772,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut y_obs = model.evaluate(&[true_density, true_temp]);
+        let mut y_obs = model.evaluate(&[true_density, true_temp]).unwrap();
         // Add tiny deterministic noise so reduced_chi2 stays positive.
         // Without noise, the analytical Jacobian converges to exact parameters,
         // yielding chi2 ≈ 0, which makes covariance ≈ 0 and uncertainty NaN.
@@ -862,7 +863,7 @@ mod tests {
         .unwrap();
 
         let params = [0.0005f64, 300.0f64]; // density, temperature
-        let y = model.evaluate(&params);
+        let y = model.evaluate(&params).unwrap();
         let free = vec![0usize, 1usize];
 
         let jac = model
@@ -880,8 +881,8 @@ mod tests {
             p_plus[p_idx] += h * (1.0 + params[p_idx].abs());
             p_minus[p_idx] -= h * (1.0 + params[p_idx].abs());
 
-            let y_plus = model.evaluate(&p_plus);
-            let y_minus = model.evaluate(&p_minus);
+            let y_plus = model.evaluate(&p_plus).unwrap();
+            let y_minus = model.evaluate(&p_minus).unwrap();
 
             let actual_2h = p_plus[p_idx] - p_minus[p_idx];
             for i in 0..y.len() {
@@ -912,13 +913,13 @@ mod tests {
                 .unwrap();
 
         // First call populates the cache.
-        let y1 = model.evaluate(&[0.0005, 300.0]);
+        let y1 = model.evaluate(&[0.0005, 300.0]).unwrap();
         assert!(model.cached_broadened_xs.borrow().is_some());
         assert!((model.cached_temperature.get() - 300.0).abs() < 1e-15);
 
         // Second call with same temperature but different density should
         // reuse cached broadened XS (no rebroadening).
-        let y2 = model.evaluate(&[0.001, 300.0]);
+        let y2 = model.evaluate(&[0.001, 300.0]).unwrap();
         assert!((model.cached_temperature.get() - 300.0).abs() < 1e-15);
 
         // Results must differ (different density) but cache temperature unchanged.
@@ -928,7 +929,7 @@ mod tests {
         );
 
         // Change temperature — cache should update.
-        let _y3 = model.evaluate(&[0.0005, 600.0]);
+        let _y3 = model.evaluate(&[0.0005, 600.0]).unwrap();
         assert!((model.cached_temperature.get() - 600.0).abs() < 1e-15);
     }
 }

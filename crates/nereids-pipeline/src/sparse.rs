@@ -658,7 +658,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let transmission = t_model.evaluate(&[true_density]);
+        let transmission = t_model.evaluate(&[true_density]).unwrap();
 
         // Create synthetic counts: flux = 1000, counts = flux * T
         let flux = 1000.0;

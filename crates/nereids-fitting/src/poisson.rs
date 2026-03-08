@@ -183,9 +183,9 @@ fn compute_gradient(
     fd_step: f64,
     all_vals_buf: &mut Vec<f64>,
     free_idx_buf: &mut Vec<usize>,
-) -> Vec<f64> {
+) -> Result<Vec<f64>, FittingError> {
     params.all_values_into(all_vals_buf);
-    let base_model = model.evaluate(all_vals_buf);
+    let base_model = model.evaluate(all_vals_buf)?;
     let base_nll = poisson_nll(y_obs, &base_model);
 
     params.free_indices_into(free_idx_buf);
@@ -213,14 +213,20 @@ fn compute_gradient(
         }
 
         params.all_values_into(all_vals_buf);
-        let perturbed_model = model.evaluate(all_vals_buf);
+        let perturbed_model = match model.evaluate(all_vals_buf) {
+            Ok(v) => v,
+            Err(_) => {
+                params.params[idx].value = original;
+                continue;
+            }
+        };
         let perturbed_nll = poisson_nll(y_obs, &perturbed_model);
         params.params[idx].value = original;
 
         grad[j] = (perturbed_nll - base_nll) / actual_step;
     }
 
-    grad
+    Ok(grad)
 }
 
 /// Project a point onto the feasible region (parameter bounds).
@@ -292,7 +298,13 @@ fn backtracking_line_search(
         project(params);
 
         params.all_values_into(all_vals_buf);
-        let trial_model = model.evaluate(all_vals_buf);
+        let trial_model = match model.evaluate(all_vals_buf) {
+            Ok(v) => v,
+            Err(_) => {
+                alpha *= config.backtrack;
+                continue;
+            }
+        };
 
         // #113: If the model produced NaN/Inf, reduce step size rather
         // than accepting a garbage NLL.
@@ -325,33 +337,34 @@ fn backtracking_line_search(
 
 /// Early return for all-fixed parameters: evaluate once and report.
 ///
-/// Returns `Some(PoissonResult)` if all parameters are fixed (either a valid
-/// result with converged=true, or a non-finite NLL with converged=false).
-/// Returns `None` if there are free parameters and optimization should proceed.
+/// Returns `Ok(Some(PoissonResult))` if all parameters are fixed (either a
+/// valid result with converged=true, or a non-finite NLL with converged=false).
+/// Returns `Ok(None)` if there are free parameters and optimization should
+/// proceed. Returns `Err(FittingError)` if model evaluation fails.
 fn try_early_return_fixed(
     model: &dyn FitModel,
     y_obs: &[f64],
     params: &ParameterSet,
-) -> Option<PoissonResult> {
+) -> Result<Option<PoissonResult>, FittingError> {
     if params.n_free() != 0 {
-        return None;
+        return Ok(None);
     }
-    let y_model = model.evaluate(&params.all_values());
+    let y_model = model.evaluate(&params.all_values())?;
     let nll = poisson_nll(y_obs, &y_model);
     if !nll.is_finite() {
-        return Some(PoissonResult {
+        return Ok(Some(PoissonResult {
             nll,
             iterations: 0,
             converged: false,
             params: params.all_values(),
-        });
+        }));
     }
-    Some(PoissonResult {
+    Ok(Some(PoissonResult {
         nll,
         iterations: 0,
         converged: true,
         params: params.all_values(),
-    })
+    }))
 }
 
 /// Validate inputs shared by `poisson_fit_analytic` and `poisson_fit_lbfgsb`.
@@ -554,15 +567,18 @@ fn compute_analytic_gradient(ctx: &AnalyticGradientCtx<'_>) -> Vec<f64> {
 /// * `config` — Optimizer configuration.
 ///
 /// # Returns
-/// Optimization result with final NLL, parameters, and convergence status.
+/// `Ok(PoissonResult)` with final NLL, parameters, and convergence status.
+/// `Err(FittingError)` if model evaluation fails at the initial point.
+/// Evaluation errors during line-search trials are treated as bad steps
+/// (backtrack), not fatal errors.
 pub fn poisson_fit(
     model: &dyn FitModel,
     y_obs: &[f64],
     params: &mut ParameterSet,
     config: &PoissonConfig,
-) -> PoissonResult {
-    if let Some(result) = try_early_return_fixed(model, y_obs, params) {
-        return result;
+) -> Result<PoissonResult, FittingError> {
+    if let Some(result) = try_early_return_fixed(model, y_obs, params)? {
+        return Ok(result);
     }
 
     // Scratch buffers reused across the entire optimization loop to avoid
@@ -575,18 +591,18 @@ pub fn poisson_fit(
     let mut free_idx_buf: Vec<usize> = Vec::with_capacity(params.n_free());
 
     params.all_values_into(&mut all_vals_buf);
-    let y_model = model.evaluate(&all_vals_buf);
+    let y_model = model.evaluate(&all_vals_buf)?;
     let mut nll = poisson_nll(y_obs, &y_model);
 
     // Guard: if the initial NLL is non-finite, bail out immediately rather
     // than entering the optimization loop with garbage values.
     if !nll.is_finite() {
-        return PoissonResult {
+        return Ok(PoissonResult {
             nll,
             iterations: 0,
             converged: false,
             params: params.all_values(),
-        };
+        });
     }
 
     let mut converged = false;
@@ -603,7 +619,7 @@ pub fn poisson_fit(
             config.fd_step,
             &mut all_vals_buf,
             &mut free_idx_buf,
-        );
+        )?;
 
         // Check gradient norm for convergence
         let grad_norm: f64 = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
@@ -665,12 +681,12 @@ pub fn poisson_fit(
         }
     }
 
-    PoissonResult {
+    Ok(PoissonResult {
         nll,
         iterations: iter,
         converged,
         params: params.all_values(),
-    }
+    })
 }
 
 /// Context for fitting temperature alongside densities in the analytical
@@ -751,7 +767,7 @@ pub fn poisson_fit_analytic(
         "poisson_fit_analytic",
     )?;
 
-    if let Some(result) = try_early_return_fixed(model, y_obs, params) {
+    if let Some(result) = try_early_return_fixed(model, y_obs, params)? {
         return Ok(result);
     }
 
@@ -787,7 +803,7 @@ pub fn poisson_fit_analytic(
     let mut trial_free_buf: Vec<f64> = Vec::with_capacity(params.n_free());
 
     params.all_values_into(&mut all_vals_buf);
-    let y_model = model.evaluate(&all_vals_buf);
+    let y_model = model.evaluate(&all_vals_buf)?;
     let mut nll = poisson_nll(y_obs, &y_model);
 
     // Guard: if the initial NLL is non-finite, bail out immediately rather
@@ -835,7 +851,11 @@ pub fn poisson_fit_analytic(
                         ctx.instrument.as_ref(),
                     )
                 }
-                .unwrap_or_else(|e| panic!("poisson_fit_analytic: broadening failed: {e}"));
+                .map_err(|e| {
+                    FittingError::EvaluationFailed(format!(
+                        "poisson_fit_analytic: broadening failed: {e}"
+                    ))
+                })?;
                 xs_owned = xs_new;
                 dxs_dt = dxs_new;
                 last_temperature = t_current;
@@ -852,7 +872,7 @@ pub fn poisson_fit_analytic(
 
         // Evaluate the full model Y(E) and compute T(E) from Beer-Lambert.
         params.all_values_into(&mut all_vals_buf);
-        let y_model_now = model.evaluate(&all_vals_buf);
+        let y_model_now = model.evaluate(&all_vals_buf)?;
         let t_now = compute_transmission(n_e, xs_ref, density_indices, &all_vals_buf);
 
         // Analytical gradient (density + optional temperature).
@@ -1015,8 +1035,8 @@ pub struct CountsModel<'a> {
 }
 
 impl<'a> FitModel for CountsModel<'a> {
-    fn evaluate(&self, params: &[f64]) -> Vec<f64> {
-        let transmission = self.transmission_model.evaluate(params);
+    fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+        let transmission = self.transmission_model.evaluate(params)?;
         debug_assert_eq!(
             transmission.len(),
             self.flux.len(),
@@ -1031,12 +1051,12 @@ impl<'a> FitModel for CountsModel<'a> {
             self.flux.len(),
             self.background.len(),
         );
-        transmission
+        Ok(transmission
             .iter()
             .zip(self.flux.iter())
             .zip(self.background.iter())
             .map(|((&t, &f), &b)| f * t + b)
-            .collect()
+            .collect())
     }
 }
 
@@ -1241,7 +1261,7 @@ pub fn poisson_fit_lbfgsb(
         "poisson_fit_lbfgsb",
     )?;
 
-    if let Some(result) = try_early_return_fixed(model, y_obs, params) {
+    if let Some(result) = try_early_return_fixed(model, y_obs, params)? {
         return Ok(result);
     }
 
@@ -1276,7 +1296,7 @@ pub fn poisson_fit_lbfgsb(
     let mut trial_free_buf: Vec<f64> = Vec::with_capacity(params.n_free());
 
     params.all_values_into(&mut all_vals_buf);
-    let y_model = model.evaluate(&all_vals_buf);
+    let y_model = model.evaluate(&all_vals_buf)?;
     let mut nll = poisson_nll(y_obs, &y_model);
 
     // Guard: if the initial NLL is non-finite, bail out immediately rather
@@ -1292,6 +1312,10 @@ pub fn poisson_fit_lbfgsb(
 
     let mut converged = false;
     let mut iter = 0;
+    // Track the temperature from the previous iteration so we can skip the
+    // expensive 3× broadening when T has not changed (e.g. only densities
+    // moved during the last line search).
+    let mut last_temperature: f64 = f64::NAN;
 
     // Initialize L-BFGS memory.
     let mut lbfgs = LbfgsbMemory::new(config.lbfgsb_memory, n_free);
@@ -1311,25 +1335,32 @@ pub fn poisson_fit_lbfgsb(
 
         if let Some(ctx) = &temp_ctx {
             let t_current = all_vals_buf[ctx.temperature_index];
-            let (xs_new, dxs_new) = if let Some(ref base) = ctx.base_xs {
-                transmission::broadened_cross_sections_with_derivative_from_base(
-                    &ctx.energies,
-                    base,
-                    &ctx.resonance_data,
-                    t_current,
-                    ctx.instrument.as_ref(),
-                )
-            } else {
-                transmission::broadened_cross_sections_with_derivative(
-                    &ctx.energies,
-                    &ctx.resonance_data,
-                    t_current,
-                    ctx.instrument.as_ref(),
-                )
+            if !last_temperature.is_finite() || (t_current - last_temperature).abs() > 1e-15 {
+                let (xs_new, dxs_new) = if let Some(ref base) = ctx.base_xs {
+                    transmission::broadened_cross_sections_with_derivative_from_base(
+                        &ctx.energies,
+                        base,
+                        &ctx.resonance_data,
+                        t_current,
+                        ctx.instrument.as_ref(),
+                    )
+                } else {
+                    transmission::broadened_cross_sections_with_derivative(
+                        &ctx.energies,
+                        &ctx.resonance_data,
+                        t_current,
+                        ctx.instrument.as_ref(),
+                    )
+                }
+                .map_err(|e| {
+                    FittingError::EvaluationFailed(format!(
+                        "poisson_fit_lbfgsb: broadening failed: {e}"
+                    ))
+                })?;
+                xs_owned = xs_new;
+                dxs_dt = dxs_new;
+                last_temperature = t_current;
             }
-            .unwrap_or_else(|e| panic!("poisson_fit_lbfgsb: broadening failed: {e}"));
-            xs_owned = xs_new;
-            dxs_dt = dxs_new;
         }
 
         // Use owned cross-sections when temperature fitting, otherwise
@@ -1341,7 +1372,7 @@ pub fn poisson_fit_lbfgsb(
         };
 
         // ---- Evaluate model and compute transmission + gradient ----
-        let y_model_now = model.evaluate(&all_vals_buf);
+        let y_model_now = model.evaluate(&all_vals_buf)?;
         let t_now = compute_transmission(n_e, xs_ref, density_indices, &all_vals_buf);
         let grad = compute_analytic_gradient(&AnalyticGradientCtx {
             y_obs,
@@ -1508,13 +1539,14 @@ mod tests {
     }
 
     impl FitModel for ExponentialModel {
-        fn evaluate(&self, params: &[f64]) -> Vec<f64> {
+        fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
             let b = params[0]; // "density"
-            self.x
+            Ok(self
+                .x
                 .iter()
                 .zip(self.flux.iter())
                 .map(|(&xi, &fi)| fi * (-b * xi).exp())
-                .collect()
+                .collect())
         }
     }
 
@@ -1545,13 +1577,13 @@ mod tests {
         };
 
         // Use exact expected counts (no noise) for reproducibility
-        let y_obs = model.evaluate(&[true_b]);
+        let y_obs = model.evaluate(&[true_b]).unwrap();
 
         let mut params = ParameterSet::new(vec![
             FitParameter::non_negative("b", 1.0), // Initial guess 2× off
         ]);
 
-        let result = poisson_fit(&model, &y_obs, &mut params, &PoissonConfig::default());
+        let result = poisson_fit(&model, &y_obs, &mut params, &PoissonConfig::default()).unwrap();
 
         assert!(
             result.converged,
@@ -1579,11 +1611,11 @@ mod tests {
             flux: flux.clone(),
         };
 
-        let y_obs = model.evaluate(&[true_b]);
+        let y_obs = model.evaluate(&[true_b]).unwrap();
 
         let mut params = ParameterSet::new(vec![FitParameter::non_negative("b", 0.1)]);
 
-        let result = poisson_fit(&model, &y_obs, &mut params, &PoissonConfig::default());
+        let result = poisson_fit(&model, &y_obs, &mut params, &PoissonConfig::default()).unwrap();
 
         assert!(result.converged);
         assert!(
@@ -1610,7 +1642,7 @@ mod tests {
 
         let mut params = ParameterSet::new(vec![FitParameter::non_negative("b", 1.0)]);
 
-        let result = poisson_fit(&model, &y_obs, &mut params, &PoissonConfig::default());
+        let result = poisson_fit(&model, &y_obs, &mut params, &PoissonConfig::default()).unwrap();
 
         assert!(
             result.params[0] >= 0.0,
@@ -1628,8 +1660,8 @@ mod tests {
     fn test_counts_model() {
         struct ConstTransmission;
         impl FitModel for ConstTransmission {
-            fn evaluate(&self, params: &[f64]) -> Vec<f64> {
-                vec![params[0]; 3]
+            fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+                Ok(vec![params[0]; 3])
             }
         }
 
@@ -1643,7 +1675,7 @@ mod tests {
         };
 
         // T = 0.5 → counts = flux*0.5 + background
-        let result = counts_model.evaluate(&[0.5]);
+        let result = counts_model.evaluate(&[0.5]).unwrap();
         assert!((result[0] - 55.0).abs() < 1e-10);
         assert!((result[1] - 110.0).abs() < 1e-10);
         assert!((result[2] - 165.0).abs() < 1e-10);
@@ -1663,12 +1695,13 @@ mod tests {
             x: x.clone(),
             flux: flux.clone(),
         };
-        let y_obs = model.evaluate(&[true_b]);
+        let y_obs = model.evaluate(&[true_b]).unwrap();
         let cross_sections = vec![x.clone()]; // σ(E) = x
 
         // FD path
         let mut params_fd = ParameterSet::new(vec![FitParameter::non_negative("b", 1.0)]);
-        let res_fd = poisson_fit(&model, &y_obs, &mut params_fd, &PoissonConfig::default());
+        let res_fd =
+            poisson_fit(&model, &y_obs, &mut params_fd, &PoissonConfig::default()).unwrap();
 
         // Analytic path
         let mut params_an = ParameterSet::new(vec![FitParameter::non_negative("b", 1.0)]);
@@ -1718,14 +1751,15 @@ mod tests {
             flux: Vec<f64>,
         }
         impl FitModel for TwoIsotopeModel {
-            fn evaluate(&self, params: &[f64]) -> Vec<f64> {
+            fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
                 let (n1, n2) = (params[0], params[1]);
-                self.sigma1
+                Ok(self
+                    .sigma1
                     .iter()
                     .zip(self.sigma2.iter())
                     .zip(self.flux.iter())
                     .map(|((&s1, &s2), &f)| f * (-n1 * s1 - n2 * s2).exp())
-                    .collect()
+                    .collect())
             }
         }
 
@@ -1734,7 +1768,7 @@ mod tests {
             sigma2: sigma2.clone(),
             flux: flux.clone(),
         };
-        let y_obs = model.evaluate(&[true_n1, true_n2]);
+        let y_obs = model.evaluate(&[true_n1, true_n2]).unwrap();
 
         let mut params = ParameterSet::new(vec![
             FitParameter::non_negative("n1", 0.1),
@@ -1780,7 +1814,7 @@ mod tests {
             flux: flux.clone(),
         };
         // True b = 0 → y_obs = flux (constant)
-        let y_obs = model.evaluate(&[0.0]);
+        let y_obs = model.evaluate(&[0.0]).unwrap();
         let cross_sections = vec![x.clone()];
 
         let mut params = ParameterSet::new(vec![FitParameter::non_negative("b", 0.5)]);
@@ -1825,9 +1859,9 @@ mod tests {
             sigma: Vec<f64>,
         }
         impl FitModel for PureTransmission {
-            fn evaluate(&self, params: &[f64]) -> Vec<f64> {
+            fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
                 let b = params[0];
-                self.sigma.iter().map(|&s| (-b * s).exp()).collect()
+                Ok(self.sigma.iter().map(|&s| (-b * s).exp()).collect())
             }
         }
 
@@ -1841,7 +1875,7 @@ mod tests {
         };
 
         // Generate observed counts Y = Φ·T + B at true density.
-        let y_obs = counts_model.evaluate(&[true_b]);
+        let y_obs = counts_model.evaluate(&[true_b]).unwrap();
 
         let mut params = ParameterSet::new(vec![FitParameter::non_negative("b", 0.2)]);
 
@@ -1957,19 +1991,19 @@ mod tests {
             flux: Vec<f64>,
         }
         impl FitModel for PhysicsCountsModel {
-            fn evaluate(&self, params: &[f64]) -> Vec<f64> {
+            fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
                 let density = params[0];
                 let temperature = params[1];
                 let sample =
                     SampleParams::new(temperature, vec![(self.resonance_data[0].clone(), density)])
-                        .unwrap();
-                let transmission =
-                    transmission::forward_model(&self.energies, &sample, None).unwrap();
-                transmission
+                        .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?;
+                let transmission = transmission::forward_model(&self.energies, &sample, None)
+                    .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?;
+                Ok(transmission
                     .iter()
                     .zip(self.flux.iter())
                     .map(|(&t, &f)| f * t)
-                    .collect()
+                    .collect())
             }
         }
 
@@ -2097,15 +2131,16 @@ mod tests {
         // #125.1: All-fixed parameters with NaN model → converged=false.
         struct NanModel;
         impl FitModel for NanModel {
-            fn evaluate(&self, _params: &[f64]) -> Vec<f64> {
-                vec![f64::NAN; 5]
+            fn evaluate(&self, _params: &[f64]) -> Result<Vec<f64>, FittingError> {
+                Ok(vec![f64::NAN; 5])
             }
         }
 
         let y_obs = vec![10.0; 5];
         let mut params = ParameterSet::new(vec![FitParameter::fixed("a", 1.0)]);
 
-        let result = poisson_fit(&NanModel, &y_obs, &mut params, &PoissonConfig::default());
+        let result =
+            poisson_fit(&NanModel, &y_obs, &mut params, &PoissonConfig::default()).unwrap();
 
         assert!(
             !result.converged,
@@ -2122,8 +2157,8 @@ mod tests {
         // must report converged=false.
         struct NanModel;
         impl FitModel for NanModel {
-            fn evaluate(&self, _params: &[f64]) -> Vec<f64> {
-                vec![f64::NAN; 5]
+            fn evaluate(&self, _params: &[f64]) -> Result<Vec<f64>, FittingError> {
+                Ok(vec![f64::NAN; 5])
             }
         }
 
@@ -2163,11 +2198,11 @@ mod tests {
             x: x.clone(),
             flux: flux.clone(),
         };
-        let y_obs = model.evaluate(&[0.5]);
+        let y_obs = model.evaluate(&[0.5]).unwrap();
 
         let mut params = ParameterSet::new(vec![FitParameter::fixed("b", 0.5)]);
 
-        let result = poisson_fit(&model, &y_obs, &mut params, &PoissonConfig::default());
+        let result = poisson_fit(&model, &y_obs, &mut params, &PoissonConfig::default()).unwrap();
 
         assert!(
             result.converged,
@@ -2186,8 +2221,8 @@ mod tests {
         // must report converged=false.
         struct NanModel;
         impl FitModel for NanModel {
-            fn evaluate(&self, _params: &[f64]) -> Vec<f64> {
-                vec![f64::NAN; 5]
+            fn evaluate(&self, _params: &[f64]) -> Result<Vec<f64>, FittingError> {
+                Ok(vec![f64::NAN; 5])
             }
         }
 
@@ -2229,7 +2264,7 @@ mod tests {
             x: x.clone(),
             flux: flux.clone(),
         };
-        let y_obs = model.evaluate(&[true_b]);
+        let y_obs = model.evaluate(&[true_b]).unwrap();
         let cross_sections = vec![x.clone()];
 
         // Analytic path
@@ -2290,14 +2325,15 @@ mod tests {
             flux: Vec<f64>,
         }
         impl FitModel for TwoIsotopeModel {
-            fn evaluate(&self, params: &[f64]) -> Vec<f64> {
+            fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
                 let (n1, n2) = (params[0], params[1]);
-                self.sigma1
+                Ok(self
+                    .sigma1
                     .iter()
                     .zip(self.sigma2.iter())
                     .zip(self.flux.iter())
                     .map(|((&s1, &s2), &f)| f * (-n1 * s1 - n2 * s2).exp())
-                    .collect()
+                    .collect())
             }
         }
 
@@ -2306,7 +2342,7 @@ mod tests {
             sigma2: sigma2.clone(),
             flux: flux.clone(),
         };
-        let y_obs = model.evaluate(&[true_n1, true_n2]);
+        let y_obs = model.evaluate(&[true_n1, true_n2]).unwrap();
 
         let mut params = ParameterSet::new(vec![
             FitParameter::non_negative("n1", 0.1),
@@ -2414,19 +2450,19 @@ mod tests {
             flux: Vec<f64>,
         }
         impl FitModel for PhysicsCountsModel {
-            fn evaluate(&self, params: &[f64]) -> Vec<f64> {
+            fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
                 let density = params[0];
                 let temperature = params[1];
                 let sample =
                     SampleParams::new(temperature, vec![(self.resonance_data[0].clone(), density)])
-                        .unwrap();
-                let transmission =
-                    transmission::forward_model(&self.energies, &sample, None).unwrap();
-                transmission
+                        .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?;
+                let transmission = transmission::forward_model(&self.energies, &sample, None)
+                    .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?;
+                Ok(transmission
                     .iter()
                     .zip(self.flux.iter())
                     .map(|(&t, &f)| f * t)
-                    .collect()
+                    .collect())
             }
         }
 
@@ -2520,7 +2556,7 @@ mod tests {
             x: x.clone(),
             flux: flux.clone(),
         };
-        let y_obs = model.evaluate(&[0.0]);
+        let y_obs = model.evaluate(&[0.0]).unwrap();
         let cross_sections = vec![x.clone()];
 
         let mut params = ParameterSet::new(vec![FitParameter::non_negative("b", 0.5)]);
@@ -2562,7 +2598,7 @@ mod tests {
             x: x.clone(),
             flux: flux.clone(),
         };
-        let y_obs = model.evaluate(&[0.5]);
+        let y_obs = model.evaluate(&[0.5]).unwrap();
         let cross_sections = vec![x.clone()];
 
         let mut params = ParameterSet::new(vec![FitParameter::fixed("b", 0.5)]);
@@ -2599,7 +2635,7 @@ mod tests {
             x: x.clone(),
             flux: flux.clone(),
         };
-        let y_obs = model.evaluate(&[true_b]);
+        let y_obs = model.evaluate(&[true_b]).unwrap();
         let cross_sections = vec![x.clone()];
 
         let mut params = ParameterSet::new(vec![FitParameter::non_negative("b", 1.0)]);

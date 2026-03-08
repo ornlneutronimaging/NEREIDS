@@ -826,7 +826,7 @@ fn build_residuals_cache(
     .ok()?;
 
     use nereids_fitting::lm::FitModel;
-    let fitted = model.evaluate(densities);
+    let fitted = model.evaluate(densities).ok()?;
     let n_plot = n_tof.min(energies.len()).min(fitted.len());
     if n_plot == 0 {
         return None;
