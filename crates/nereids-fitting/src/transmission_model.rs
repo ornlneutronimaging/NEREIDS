@@ -5,6 +5,7 @@
 //! (thicknesses) of each isotope in the sample.
 
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use nereids_endf::resonance::ResonanceData;
@@ -161,7 +162,7 @@ pub struct TransmissionFitModel {
     /// rebroadening.  Interior mutability via `RefCell` is needed because
     /// `FitModel::evaluate` takes `&self`.  Safe because `TransmissionFitModel`
     /// is constructed per-pixel and never shared across threads.
-    cached_broadened_xs: RefCell<Option<Vec<Vec<f64>>>>,
+    cached_broadened_xs: RefCell<Option<Rc<Vec<Vec<f64>>>>>,
     /// Temperature at which `cached_broadened_xs` was computed.
     /// `Cell` is sufficient because `f64` is `Copy`.
     cached_temperature: Cell<f64>,
@@ -271,17 +272,19 @@ impl FitModel for TransmissionFitModel {
             // (same T, different lambda) and enables analytical_jacobian() to
             // read the broadened σ for density columns.
             let broadened_xs = if (temperature_k - self.cached_temperature.get()).abs() < 1e-15 {
-                self.cached_broadened_xs.borrow().clone().unwrap()
+                Rc::clone(self.cached_broadened_xs.borrow().as_ref().unwrap())
             } else {
-                let xs = transmission::broadened_cross_sections_from_base(
-                    &self.energies,
-                    base_xs,
-                    &self.resonance_data,
-                    temperature_k,
-                    self.instrument.as_deref(),
-                )
-                .expect("broadened_cross_sections_from_base failed");
-                *self.cached_broadened_xs.borrow_mut() = Some(xs.clone());
+                let xs = Rc::new(
+                    transmission::broadened_cross_sections_from_base(
+                        &self.energies,
+                        base_xs,
+                        &self.resonance_data,
+                        temperature_k,
+                        self.instrument.as_deref(),
+                    )
+                    .expect("broadened_cross_sections_from_base failed"),
+                );
+                *self.cached_broadened_xs.borrow_mut() = Some(Rc::clone(&xs));
                 self.cached_temperature.set(temperature_k);
                 xs
             };
@@ -337,6 +340,18 @@ impl FitModel for TransmissionFitModel {
         let base_xs = self.base_xs.as_ref()?;
         let cached_xs = self.cached_broadened_xs.borrow();
         let broadened_xs = cached_xs.as_ref()?;
+
+        // Guard: verify the cache matches the current parameter temperature.
+        // After a rejected LM trial step, evaluate() may have updated the cache
+        // to the trial temperature while the solver reverted params to the
+        // accepted point.  Using stale XS would give an incorrect Jacobian.
+        if let Some(ti) = self.temperature_index {
+            let param_temp = params[ti];
+            if (param_temp - self.cached_temperature.get()).abs() > 1e-15 {
+                // Cache is stale — fall back to finite-difference Jacobian.
+                return None;
+            }
+        }
 
         let n_e = y_current.len();
         let n_free = free_param_indices.len();
