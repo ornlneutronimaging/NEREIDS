@@ -11,31 +11,28 @@
 //! - tr006: Ni-60, ~270 resonances, pure forward model
 //! - tr004: Ni-60, ~270 resonances, with transmission reference
 //!
-//! ## Phase 1 Tolerances
+//! ## Broadening
 //!
-//! SAMMY applies Doppler (FGM) + Gaussian resolution + exponential resolution
-//! broadening.  NEREIDS currently applies only Doppler broadening in these
-//! tests (no resolution parameters passed).  The remaining ~10-15% mean error
-//! at resonance peaks is dominated by the missing resolution broadening:
+//! SAMMY applies Doppler (FGM) + Gaussian resolution + optional exponential
+//! resolution broadening.  These tests apply Doppler + Gaussian resolution
+//! using the SAMMY → NEREIDS parameter conversion from
+//! `RslResolutionFunction_M.f90` (getAo2/getBo2).
 //!
-//! | Test  | Energy    | Doppler FWHM | Resolution FWHM | Mean error |
-//! |-------|-----------|-------------|-----------------|------------|
-//! | tr007 | 1.1 keV   | 2.5 eV      | 0.6 eV          | ~9%        |
-//! | tr008 | 300 keV   | 39 eV       | 296 eV          | ~14%       |
-//! | tr006 | 135 keV   | 26 eV       | 183 eV          | ~12%       |
-//! | tr004 | 500 keV   | 50 eV       | 500+ eV         | ~15%       |
-//!
-//! Phase 2 will add resolution broadening and tighten tolerances to <1%.
+//! tr006 and tr004 use pure Gaussian resolution (Deltae=0, Iesopr=1).
+//! tr007 and tr008 also have an exponential tail (Deltae>0, Iesopr=3),
+//! which is not yet implemented in NEREIDS — these cases may show slightly
+//! higher residual error.
 //!
 //! ## Reference
 //! SAMMY source: `../SAMMY/SAMMY/sammy/samtry/`
 
 use nereids_endf::sammy::{
     SammyInpConfig, SammyParFile, SammyPltRecord, parse_sammy_inp, parse_sammy_par,
-    parse_sammy_plt, sammy_to_resonance_data,
+    parse_sammy_plt, sammy_to_nereids_resolution, sammy_to_resonance_data,
 };
 use nereids_physics::reich_moore;
-use nereids_physics::transmission;
+use nereids_physics::resolution::{ResolutionFunction, ResolutionParams};
+use nereids_physics::transmission::{self, InstrumentParams};
 
 use std::path::PathBuf;
 
@@ -138,6 +135,18 @@ fn validate_unbroadened_cross_sections(
     }
 }
 
+/// Build NEREIDS `InstrumentParams` from SAMMY .inp resolution parameters.
+///
+/// Converts SAMMY's (Deltal, Deltag) to NEREIDS's (delta_t_us, delta_l_m)
+/// using the coefficient mapping from `RslResolutionFunction_M.f90`.
+fn build_instrument_params(inp: &SammyInpConfig) -> Option<InstrumentParams> {
+    let (flight_path, delta_t, delta_l) = sammy_to_nereids_resolution(inp)?;
+    let res_params = ResolutionParams::new(flight_path, delta_t, delta_l).ok()?;
+    Some(InstrumentParams {
+        resolution: ResolutionFunction::Gaussian(res_params),
+    })
+}
+
 /// Compare NEREIDS broadened cross-sections against SAMMY Th_initial reference.
 fn validate_broadened_cross_sections(
     inp: &SammyInpConfig,
@@ -155,12 +164,15 @@ fn validate_broadened_cross_sections(
         energies.sort_by(|a, b| a.total_cmp(b));
     }
 
-    // Compute broadened cross-sections (Doppler + no resolution for now).
+    // Build resolution parameters from SAMMY .inp config.
+    let instrument = build_instrument_params(inp);
+
+    // Compute broadened cross-sections (Doppler + Gaussian resolution).
     let broadened = transmission::broadened_cross_sections(
         &energies,
         &[resonance_data],
         inp.temperature_k,
-        None, // Skip resolution broadening for now.
+        instrument.as_ref(),
         None, // No cancellation.
     )
     .unwrap();
@@ -230,12 +242,13 @@ fn validate_transmission(
         energies.sort_by(|a, b| a.total_cmp(b));
     }
 
-    // Broadened cross-sections.
+    // Broadened cross-sections with resolution.
+    let instrument = build_instrument_params(inp);
     let broadened = transmission::broadened_cross_sections(
         &energies,
         &[resonance_data],
         inp.temperature_k,
-        None,
+        instrument.as_ref(),
         None,
     )
     .unwrap();
@@ -343,14 +356,12 @@ fn test_tr007_fe56_broadened() {
         result.n_above_threshold,
         result.worst_energy_kev
     );
-    // Phase 1: Doppler-only broadening.  SAMMY also applies Gaussian +
-    // exponential resolution broadening (combined FWHM ~0.6 eV at 1.1 keV),
-    // which we omit here.  The remaining ~9% mean error is concentrated at
-    // the resonance peak where resolution broadening reduces the peak height.
-    // Phase 2 will add resolution broadening and tighten to <1%.
+    // Doppler + Gaussian resolution applied.  tr007 also has an exponential
+    // tail (Deltae=0.022, Iesopr=3) which is not yet implemented.  The
+    // remaining ~9% mean error is from the missing exponential broadening.
     assert!(
-        result.mean_rel_error < 0.15,
-        "broadened mean error {:.4} > 15%",
+        result.mean_rel_error < 0.12,
+        "broadened mean error {:.4} > 12%",
         result.mean_rel_error
     );
 }
@@ -379,11 +390,13 @@ fn test_tr008_ni58_broadened() {
         result.n_above_threshold,
         result.worst_energy_kev
     );
-    // Phase 1: Resolution broadening dominates at 300 keV (FWHM ~296 eV
-    // vs Doppler ~39 eV).  Without resolution, ~14% mean error expected.
+    // Doppler + Gaussian resolution applied.  tr008 also has an exponential
+    // tail (Deltae=0.004, Iesopr=3) which is not yet implemented.  The
+    // remaining ~7% mean error is from the missing exponential broadening
+    // and HEGA Doppler mode differences.
     assert!(
-        result.mean_rel_error < 0.20,
-        "broadened mean error {:.4} > 20%",
+        result.mean_rel_error < 0.10,
+        "broadened mean error {:.4} > 10%",
         result.mean_rel_error
     );
 }
@@ -412,10 +425,11 @@ fn test_tr006_ni60_broadened() {
         result.n_above_threshold,
         result.worst_energy_kev
     );
-    // Phase 1: Resolution dominates at 135 keV (FWHM ~183 eV vs Doppler ~26 eV).
+    // tr006 uses pure Gaussian resolution (Deltae=0, Iesopr=1).
+    // Observed ~3.4% mean error with Doppler + Gaussian resolution.
     assert!(
-        result.mean_rel_error < 0.20,
-        "broadened mean error {:.4} > 20%",
+        result.mean_rel_error < 0.05,
+        "broadened mean error {:.4} > 5%",
         result.mean_rel_error
     );
 }
@@ -444,10 +458,11 @@ fn test_tr004_ni60_broadened() {
         result.n_above_threshold,
         result.worst_energy_kev
     );
-    // Phase 1: Resolution dominates at 500 keV (FWHM ~500+ eV vs Doppler ~50 eV).
+    // tr004 uses pure Gaussian resolution (Deltae=0, Iesopr=1).
+    // Observed ~4.7% mean error with Doppler + Gaussian resolution.
     assert!(
-        result.mean_rel_error < 0.20,
-        "broadened mean error {:.4} > 20%",
+        result.mean_rel_error < 0.06,
+        "broadened mean error {:.4} > 6%",
         result.mean_rel_error
     );
 }
@@ -473,9 +488,12 @@ fn test_tr004_ni60_transmission() {
         result.n_above_threshold,
         result.worst_energy_kev
     );
+    // tr004 transmission: pure Gaussian resolution (Deltae=0, Iesopr=1).
+    // Observed ~0.95% mean error — transmission exponentiates the XS error,
+    // so small XS errors become small transmission errors.
     assert!(
-        result.mean_rel_error < 0.05,
-        "transmission mean error {:.4} > 5%",
+        result.mean_rel_error < 0.02,
+        "transmission mean error {:.4} > 2%",
         result.mean_rel_error
     );
 }

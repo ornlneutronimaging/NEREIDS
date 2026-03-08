@@ -97,8 +97,28 @@ pub struct SammyInpConfig {
     pub temperature_k: f64,
     /// Flight path length (m).
     pub flight_path_m: f64,
-    /// Channel width / delta-L (m or μs depending on context).
-    pub channel_width: f64,
+    /// Card 5, field 3: Deltal — flight path uncertainty (SAMMY units).
+    ///
+    /// Maps to rslRes parameter 1 → Bo2 in SAMMY's resolution broadening.
+    /// SAMMY Ref: `minp06.f90` line 226.
+    pub delta_l_sammy: f64,
+    /// Card 5, field 4: Deltae — exponential tail parameter (SAMMY units).
+    ///
+    /// Maps to rslRes parameter 3 → Co2 in SAMMY's resolution broadening.
+    /// When zero, no exponential broadening is applied (Iesopr=1, pure Gaussian).
+    pub delta_e_sammy: f64,
+    /// Card 5, field 5: Deltag — timing uncertainty (SAMMY units).
+    ///
+    /// Maps to rslRes parameter 2 → Ao2 in SAMMY's resolution broadening.
+    pub delta_g_sammy: f64,
+    /// BROADENING card override for Deltal (rslRes param 1).
+    /// Non-zero values override Card 5 `delta_l_sammy`.
+    /// SAMMY Ref: `minp18.f90` lines 89-94.
+    pub broadening_delta_l: Option<f64>,
+    /// BROADENING card override for Deltag (rslRes param 2).
+    pub broadening_delta_g: Option<f64>,
+    /// BROADENING card override for Deltae (rslRes param 3).
+    pub broadening_delta_e: Option<f64>,
     /// Scattering radius (fm).
     pub scattering_radius_fm: f64,
     /// Sample thickness (atoms/barn).
@@ -110,6 +130,63 @@ pub struct SammyInpConfig {
     pub target_spin: f64,
     /// Spin group definitions.
     pub spin_groups: Vec<SammySpinGroup>,
+}
+
+impl SammyInpConfig {
+    /// Effective Deltal: BROADENING card override if non-zero, else Card 5.
+    #[must_use]
+    pub fn effective_delta_l(&self) -> f64 {
+        self.broadening_delta_l
+            .filter(|&v| v != 0.0)
+            .unwrap_or(self.delta_l_sammy)
+    }
+
+    /// Effective Deltag: BROADENING card override if non-zero, else Card 5.
+    #[must_use]
+    pub fn effective_delta_g(&self) -> f64 {
+        self.broadening_delta_g
+            .filter(|&v| v != 0.0)
+            .unwrap_or(self.delta_g_sammy)
+    }
+
+    /// Effective Deltae: BROADENING card override if non-zero, else Card 5.
+    #[must_use]
+    pub fn effective_delta_e(&self) -> f64 {
+        self.broadening_delta_e
+            .filter(|&v| v != 0.0)
+            .unwrap_or(self.delta_e_sammy)
+    }
+}
+
+/// Convert SAMMY resolution parameters to NEREIDS-convention values.
+///
+/// SAMMY stores resolution parameters in a different convention from NEREIDS:
+///
+/// | SAMMY coefficient | Formula | NEREIDS equivalent |
+/// |---|---|---|
+/// | Ao2 = (1.20112·Deltag / (Sm2·Dist))² | timing | `delta_t = Deltag / (2·√ln2)` |
+/// | Bo2 = (0.81650·Deltal / Dist)² | path | `delta_l = Deltal / √6` |
+///
+/// where 1.20112 = 1/√ln2, 0.81650 = √(2/3), Sm2 = TOF_FACTOR = 72.298.
+///
+/// SAMMY Ref: `RslResolutionFunction_M.f90` (getAo2 lines 143-161, getBo2 lines 165-179)
+///
+/// Returns `None` if both effective Deltal and Deltag are zero (no resolution broadening).
+/// Otherwise returns `Some((flight_path_m, delta_t_us, delta_l_m))`.
+#[must_use]
+pub fn sammy_to_nereids_resolution(inp: &SammyInpConfig) -> Option<(f64, f64, f64)> {
+    let delta_l = inp.effective_delta_l();
+    let delta_g = inp.effective_delta_g();
+
+    if delta_l == 0.0 && delta_g == 0.0 {
+        return None;
+    }
+
+    // Convert from SAMMY convention to NEREIDS convention.
+    let delta_t_us = delta_g / (2.0 * 2.0_f64.ln().sqrt());
+    let delta_l_m = delta_l / 6.0_f64.sqrt();
+
+    Some((inp.flight_path_m, delta_t_us, delta_l_m))
 }
 
 // ─── .plt file types ───────────────────────────────────────────────────────────
@@ -341,7 +418,9 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
     // Also look for TRANSMISSION keyword and spin group block.
     let mut temperature_k = 300.0;
     let mut flight_path_m = 0.0;
-    let mut channel_width = 0.0;
+    let mut delta_l_sammy = 0.0;
+    let mut delta_e_sammy = 0.0;
+    let mut delta_g_sammy = 0.0;
     let mut scattering_radius_fm = 0.0;
     let mut thickness_atoms_barn = 0.0;
     let mut target_spin = 0.0;
@@ -360,7 +439,15 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
     }
 
     // Card 5: broadening parameters (first numeric line after blank).
-    // Temperature and flight_path are required; channel_width is optional.
+    //
+    // SAMMY format (minp06.f90 line 226):
+    //   READ (Iu22,10100) Temp, Dist, Deltal, Deltae, Deltag, ...
+    //
+    // - Temp: sample temperature (K)
+    // - Dist: flight path length (m)
+    // - Deltal: flight path uncertainty → rslRes param 1 → Bo2
+    // - Deltae: exponential tail → rslRes param 3 → Co2
+    // - Deltag: timing uncertainty → rslRes param 2 → Ao2
     if idx < lines.len() {
         let card5_fields: Vec<&str> = lines[idx].split_whitespace().collect();
         if card5_fields.len() >= 2 {
@@ -370,8 +457,14 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
             flight_path_m = card5_fields[1]
                 .parse::<f64>()
                 .map_err(|e| SammyParseError::new(format!("Card 5: flight_path: {e}")))?;
+            if card5_fields.len() >= 3 {
+                delta_l_sammy = card5_fields[2].parse().unwrap_or(0.0);
+            }
+            if card5_fields.len() >= 4 {
+                delta_e_sammy = card5_fields[3].parse().unwrap_or(0.0);
+            }
             if card5_fields.len() >= 5 {
-                channel_width = card5_fields[4].parse().unwrap_or(0.0);
+                delta_g_sammy = card5_fields[4].parse().unwrap_or(0.0);
             }
         }
         idx += 1;
@@ -391,7 +484,11 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
         idx += 1;
     }
 
-    // Scan for TRANSMISSION keyword and spin group block.
+    // Scan for TRANSMISSION keyword and spin group block, then BROADENING card.
+    let mut broadening_delta_l: Option<f64> = None;
+    let mut broadening_delta_g: Option<f64> = None;
+    let mut broadening_delta_e: Option<f64> = None;
+
     while idx < lines.len() {
         let trimmed = lines[idx].trim().to_uppercase();
         if trimmed == "TRANSMISSION" {
@@ -400,6 +497,41 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
             let (groups, parsed_target_spin) = parse_spin_groups(&lines[idx..])?;
             spin_groups = groups;
             target_spin = parsed_target_spin;
+            // Advance past spin group block.
+            while idx < lines.len() && !lines[idx].trim().is_empty() {
+                idx += 1;
+            }
+        } else if trimmed.starts_with("BROADENING") {
+            // BROADENING card: next line has 6 floats + flags.
+            //
+            // SAMMY format (minp18.f90):
+            //   Uuu(1-3) = channel_radius, Temp, thickness (broadenPars)
+            //   Uuu(4-6) = Deltal, Deltag, Deltae (rslRes params 1-3)
+            //
+            // Non-zero Uuu(4-6) override Card 5 values.
+            idx += 1;
+            if idx < lines.len() {
+                let brd_fields: Vec<&str> = lines[idx].split_whitespace().collect();
+                if brd_fields.len() >= 6 {
+                    if let Ok(v) = brd_fields[3].parse::<f64>()
+                        && v != 0.0
+                    {
+                        broadening_delta_l = Some(v);
+                    }
+                    if let Ok(v) = brd_fields[4].parse::<f64>()
+                        && v != 0.0
+                    {
+                        broadening_delta_g = Some(v);
+                    }
+                    if let Ok(v) = brd_fields[5].parse::<f64>()
+                        && v != 0.0
+                    {
+                        broadening_delta_e = Some(v);
+                    }
+                }
+            }
+            // Only use the first BROADENING card (subsequent ones are for
+            // AdjustableObject save/restore operations and may be empty).
             break;
         }
         idx += 1;
@@ -413,7 +545,12 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
         energy_max_ev,
         temperature_k,
         flight_path_m,
-        channel_width,
+        delta_l_sammy,
+        delta_e_sammy,
+        delta_g_sammy,
+        broadening_delta_l,
+        broadening_delta_g,
+        broadening_delta_e,
         scattering_radius_fm,
         thickness_atoms_barn,
         target_spin,
@@ -834,6 +971,18 @@ BROADENING
         assert!((inp.energy_max_ev - 1170.517).abs() < 1e-6);
         assert!((inp.temperature_k - 329.0).abs() < 1e-6);
         assert!((inp.flight_path_m - 80.263).abs() < 1e-6);
+        // Card 5 resolution params.
+        assert!((inp.delta_l_sammy - 0.0301).abs() < 1e-6);
+        assert!((inp.delta_e_sammy - 0.0).abs() < 1e-6);
+        assert!((inp.delta_g_sammy - 0.021994).abs() < 1e-6);
+        // BROADENING card overrides.
+        assert_eq!(inp.broadening_delta_l, Some(0.025));
+        assert_eq!(inp.broadening_delta_g, Some(0.022));
+        assert_eq!(inp.broadening_delta_e, Some(0.022));
+        // Effective values use BROADENING card when present.
+        assert!((inp.effective_delta_l() - 0.025).abs() < 1e-6);
+        assert!((inp.effective_delta_g() - 0.022).abs() < 1e-6);
+        assert!((inp.effective_delta_e() - 0.022).abs() < 1e-6);
         assert!((inp.scattering_radius_fm - 6.0).abs() < 1e-6);
         assert!((inp.thickness_atoms_barn - 0.2179).abs() < 1e-6);
         // Target spin parsed from spin group header field 6 (".0" → 0.0).
@@ -870,7 +1019,12 @@ BROADENING
             energy_max_ev: 1170.517,
             temperature_k: 329.0,
             flight_path_m: 80.263,
-            channel_width: 0.021994,
+            delta_l_sammy: 0.0301,
+            delta_e_sammy: 0.0,
+            delta_g_sammy: 0.021994,
+            broadening_delta_l: None,
+            broadening_delta_g: None,
+            broadening_delta_e: None,
             scattering_radius_fm: 6.0,
             thickness_atoms_barn: 0.2179,
             target_spin: 0.0,

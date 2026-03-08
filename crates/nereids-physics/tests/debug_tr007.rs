@@ -1,7 +1,8 @@
 //! Debug test for tr007 cross-section comparison.
 
 use nereids_endf::sammy::{
-    parse_sammy_inp, parse_sammy_par, parse_sammy_plt, sammy_to_resonance_data,
+    parse_sammy_inp, parse_sammy_par, parse_sammy_plt, sammy_to_nereids_resolution,
+    sammy_to_resonance_data,
 };
 use nereids_physics::reich_moore;
 use nereids_physics::transmission;
@@ -59,16 +60,14 @@ fn debug_tr007_cross_sections() {
     )
     .unwrap();
 
-    // Compute broadened cross-sections (Doppler + resolution)
-    // Card 5: DELTAT=0.0301μs, DELTTT=0.021994μs; BROADENING card: ΔL=0.025m
+    // Compute broadened cross-sections (Doppler + Gaussian resolution).
+    // Uses sammy_to_nereids_resolution() which converts SAMMY's (Deltal, Deltag)
+    // to NEREIDS's (delta_t_us, delta_l_m), respecting BROADENING card overrides.
     use nereids_physics::resolution::{ResolutionFunction, ResolutionParams};
     use nereids_physics::transmission::InstrumentParams;
-    let res_params = ResolutionParams::new(
-        inp.flight_path_m, // 80.263 m
-        0.0301,            // delta_t_us (Card 5 DELTAT)
-        0.025,             // delta_l_m (BROADENING card)
-    )
-    .unwrap();
+    let (flight_path, delta_t, delta_l) = sammy_to_nereids_resolution(&inp)
+        .expect("tr007 should have non-zero resolution parameters");
+    let res_params = ResolutionParams::new(flight_path, delta_t, delta_l).unwrap();
     let instrument = InstrumentParams {
         resolution: ResolutionFunction::Gaussian(res_params),
     };
