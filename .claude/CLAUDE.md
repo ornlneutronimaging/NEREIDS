@@ -48,6 +48,11 @@ targeted `Edit` patches. Do not suppress clippy warnings with `#[allow(...)]`.
 The user MUST have the opportunity to review and intervene at these points.
 **Always pause and present a summary, then STOP and wait for user response.**
 
+0. **Before starting any work on a new issue/task**: Enter Plan mode.
+   Conduct thorough research appropriate to the task — study reference
+   implementations, trace affected code paths, form an independent
+   analysis. Present the full findings and implementation plan.
+   STOP here. Do NOT write any code until the user approves the plan.
 1. **After creating PRs**: show PR URLs + summary of changes per PR.
    STOP here. Do NOT proceed to reviews until the user responds.
 2. **After review pipeline completes**: present the review summary table.
