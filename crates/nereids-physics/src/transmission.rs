@@ -444,11 +444,21 @@ pub fn broadened_cross_sections_with_derivative(
     let t_down = (temperature_k - dt).max(0.0); // stay physical
     let actual_2dt = t_up - t_down;
 
-    // No cancel token passed; TransmissionError::{Resolution, Doppler} can occur.
-    let xs_center =
-        broadened_cross_sections(energies, resonance_data, temperature_k, instrument, None)?;
-    let xs_up = broadened_cross_sections(energies, resonance_data, t_up, instrument, None)?;
-    let xs_down = broadened_cross_sections(energies, resonance_data, t_down, instrument, None)?;
+    // The three broadening calls at T, T+dT, T-dT are independent —
+    // run them concurrently with rayon::join.  No cancel token passed;
+    // TransmissionError::{Resolution, Doppler} can occur.
+    let (center_result, (up_result, down_result)) = rayon::join(
+        || broadened_cross_sections(energies, resonance_data, temperature_k, instrument, None),
+        || {
+            rayon::join(
+                || broadened_cross_sections(energies, resonance_data, t_up, instrument, None),
+                || broadened_cross_sections(energies, resonance_data, t_down, instrument, None),
+            )
+        },
+    );
+    let xs_center = center_result?;
+    let xs_up = up_result?;
+    let xs_down = down_result?;
 
     let dxs_dt: Vec<Vec<f64>> = xs_up
         .iter()
@@ -533,8 +543,8 @@ pub fn broadened_cross_sections_from_base(
     }
 
     base_xs
-        .iter()
-        .zip(resonance_data.iter())
+        .par_iter()
+        .zip(resonance_data.par_iter())
         .map(|(xs_raw, rd)| {
             let after_doppler = if temperature_k > 0.0 {
                 let params = DopplerParams::new(temperature_k, rd.awr)?;
@@ -572,17 +582,44 @@ pub fn broadened_cross_sections_with_derivative_from_base(
     let t_down = (temperature_k - dt).max(0.0);
     let actual_2dt = t_up - t_down;
 
-    let xs_center = broadened_cross_sections_from_base(
-        energies,
-        base_xs,
-        resonance_data,
-        temperature_k,
-        instrument,
-    )?;
-    let xs_up =
-        broadened_cross_sections_from_base(energies, base_xs, resonance_data, t_up, instrument)?;
-    let xs_down =
-        broadened_cross_sections_from_base(energies, base_xs, resonance_data, t_down, instrument)?;
+    // The three broadening calls at T, T+dT, T-dT are independent —
+    // run them concurrently with rayon::join.
+    let (center_result, (up_result, down_result)) = rayon::join(
+        || {
+            broadened_cross_sections_from_base(
+                energies,
+                base_xs,
+                resonance_data,
+                temperature_k,
+                instrument,
+            )
+        },
+        || {
+            rayon::join(
+                || {
+                    broadened_cross_sections_from_base(
+                        energies,
+                        base_xs,
+                        resonance_data,
+                        t_up,
+                        instrument,
+                    )
+                },
+                || {
+                    broadened_cross_sections_from_base(
+                        energies,
+                        base_xs,
+                        resonance_data,
+                        t_down,
+                        instrument,
+                    )
+                },
+            )
+        },
+    );
+    let xs_center = center_result?;
+    let xs_up = up_result?;
+    let xs_down = down_result?;
 
     let dxs_dt: Vec<Vec<f64>> = xs_up
         .iter()

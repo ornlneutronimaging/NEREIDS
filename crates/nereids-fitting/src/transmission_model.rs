@@ -4,6 +4,8 @@
 //! that the LM optimizer can call. The fit parameters are the areal densities
 //! (thicknesses) of each isotope in the sample.
 
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use nereids_endf::resonance::ResonanceData;
@@ -122,8 +124,9 @@ impl FitModel for PrecomputedTransmissionModel {
 /// Optionally, the sample temperature can also be fitted by setting
 /// `temperature_index` to the parameter slot holding the temperature value.
 /// When `temperature_index` is `Some(idx)`, the Doppler broadening kernel
-/// is recomputed at `params[idx]` on every `evaluate()` call, and the LM
-/// engine will compute a finite-difference Jacobian column for it.
+/// is recomputed at `params[idx]` when the temperature changes (cached
+/// across calls at the same temperature), and the analytical Jacobian
+/// provides density columns directly plus a single FD column for temperature.
 ///
 /// `instrument` uses `Arc` so that parallel pixel loops (e.g. in `sparse.rs`)
 /// can share one copy of a potentially large tabulated resolution kernel
@@ -155,6 +158,15 @@ pub struct TransmissionFitModel {
     /// Wrapped in `Arc` so `spatial_map` can share a single allocation across
     /// all per-pixel `TransmissionFitModel` instances without deep cloning.
     base_xs: Option<Arc<Vec<Vec<f64>>>>,
+    /// Cached broadened cross-sections from the last `evaluate()` call.
+    /// Used by `analytical_jacobian()` to provide density columns without
+    /// rebroadening.  Interior mutability via `RefCell` is needed because
+    /// `FitModel::evaluate` takes `&self`.  Safe because `TransmissionFitModel`
+    /// is constructed per-pixel and never shared across threads.
+    cached_broadened_xs: RefCell<Option<Rc<Vec<Vec<f64>>>>>,
+    /// Temperature at which `cached_broadened_xs` was computed.
+    /// `Cell` is sufficient because `f64` is `Copy`.
+    cached_temperature: Cell<f64>,
 }
 
 impl TransmissionFitModel {
@@ -222,6 +234,8 @@ impl TransmissionFitModel {
             density_indices,
             temperature_index,
             base_xs,
+            cached_broadened_xs: RefCell::new(None),
+            cached_temperature: Cell::new(f64::NAN),
         })
     }
 }
@@ -253,20 +267,39 @@ impl FitModel for TransmissionFitModel {
             } else {
                 temperature_k
             };
-            let thicknesses: Vec<f64> = self
-                .density_indices
-                .iter()
-                .map(|&idx| params[idx])
-                .collect();
-            transmission::forward_model_from_base_xs(
-                &self.energies,
-                base_xs,
-                &self.resonance_data,
-                &thicknesses,
-                temperature_k,
-                self.instrument.as_deref(),
-            )
-            .expect("forward_model_from_base_xs failed")
+
+            // Compute broadened XS (or reuse cache if temperature unchanged).
+            // Caching avoids redundant Doppler broadening on rejected LM steps
+            // (same T, different lambda) and enables analytical_jacobian() to
+            // read the broadened σ for density columns.
+            let broadened_xs = if (temperature_k - self.cached_temperature.get()).abs() < 1e-15 {
+                Rc::clone(self.cached_broadened_xs.borrow().as_ref().unwrap())
+            } else {
+                let xs = Rc::new(
+                    transmission::broadened_cross_sections_from_base(
+                        &self.energies,
+                        base_xs,
+                        &self.resonance_data,
+                        temperature_k,
+                        self.instrument.as_deref(),
+                    )
+                    .expect("broadened_cross_sections_from_base failed"),
+                );
+                *self.cached_broadened_xs.borrow_mut() = Some(Rc::clone(&xs));
+                self.cached_temperature.set(temperature_k);
+                xs
+            };
+
+            // Beer-Lambert: T(E) = exp(-Σᵢ nᵢ · σᵢ(E))
+            let n_e = self.energies.len();
+            let mut neg_opt = vec![0.0f64; n_e];
+            for (i, xs) in broadened_xs.iter().enumerate() {
+                let density = params[self.density_indices[i]];
+                for (j, &sigma) in xs.iter().enumerate() {
+                    neg_opt[j] -= density * sigma;
+                }
+            }
+            neg_opt.iter().map(|&d| d.exp()).collect()
         } else {
             // Original path: full forward model (no temperature fitting).
             let isotopes: Vec<(ResonanceData, f64)> = self
@@ -282,6 +315,105 @@ impl FitModel for TransmissionFitModel {
             transmission::forward_model(&self.energies, &sample, self.instrument.as_deref())
                 .expect("TransmissionFitModel: forward_model failed")
         }
+    }
+
+    /// Analytical Jacobian for the transmission model with temperature fitting.
+    ///
+    /// When `base_xs` is available (temperature fitting path):
+    /// - **Density columns**: `∂T/∂nᵢ = -σᵢ(E)·T(E)` using cached broadened XS
+    ///   from the most recent `evaluate()` call.  Same formula as
+    ///   `PrecomputedTransmissionModel`, zero extra broadening calls.
+    /// - **Temperature column**: single forward finite-difference perturbation
+    ///   at T+dT.  Requires one extra `broadened_cross_sections_from_base()`
+    ///   call, which is dramatically cheaper than the N_free calls the LM
+    ///   solver would make with a full FD Jacobian.
+    ///
+    /// Returns `None` for the no-base_xs path (full forward model), which
+    /// falls back to finite-difference in the LM solver.
+    fn analytical_jacobian(
+        &self,
+        params: &[f64],
+        free_param_indices: &[usize],
+        y_current: &[f64],
+    ) -> Option<FlatMatrix> {
+        // Only provide analytical Jacobian when base_xs is available
+        // (temperature-fitting fast path with cached broadened XS).
+        let base_xs = self.base_xs.as_ref()?;
+        let cached_xs = self.cached_broadened_xs.borrow();
+        let broadened_xs = cached_xs.as_ref()?;
+
+        // Guard: verify the cache matches the current parameter temperature.
+        // After a rejected LM trial step, evaluate() may have updated the cache
+        // to the trial temperature while the solver reverted params to the
+        // accepted point.  Using stale XS would give an incorrect Jacobian.
+        if let Some(ti) = self.temperature_index {
+            let param_temp = params[ti];
+            if (param_temp - self.cached_temperature.get()).abs() > 1e-15 {
+                // Cache is stale — fall back to finite-difference Jacobian.
+                return None;
+            }
+        }
+
+        let n_e = y_current.len();
+        let n_free = free_param_indices.len();
+        let mut jacobian = FlatMatrix::zeros(n_e, n_free);
+
+        // Identify which free parameter column is the temperature (if any).
+        let temp_col = self
+            .temperature_index
+            .and_then(|ti| free_param_indices.iter().position(|&fp| fp == ti));
+
+        // ── Density columns: ∂T/∂nᵢ = -σᵢ(E)·T(E) ──
+        // Same formula as PrecomputedTransmissionModel::analytical_jacobian.
+        for (col, &fp_idx) in free_param_indices.iter().enumerate() {
+            if temp_col == Some(col) {
+                continue; // temperature column handled below
+            }
+            // Sum cross-sections of all isotopes tied to this free parameter.
+            let mut sigma_sum = vec![0.0f64; n_e];
+            for (iso, &di) in self.density_indices.iter().enumerate() {
+                if di == fp_idx {
+                    for (j, &sigma) in broadened_xs[iso].iter().enumerate() {
+                        sigma_sum[j] += sigma;
+                    }
+                }
+            }
+            for i in 0..n_e {
+                *jacobian.get_mut(i, col) = -sigma_sum[i] * y_current[i];
+            }
+        }
+
+        // ── Temperature column: forward FD at T+dT ──
+        if let Some(col) = temp_col {
+            let temperature_k = self.cached_temperature.get();
+            let dt = 1e-6 * (1.0 + temperature_k.abs());
+            let t_perturbed = temperature_k + dt;
+
+            let xs_perturbed = transmission::broadened_cross_sections_from_base(
+                &self.energies,
+                base_xs,
+                &self.resonance_data,
+                t_perturbed,
+                self.instrument.as_deref(),
+            )
+            .expect("broadened_cross_sections_from_base (T+dT) failed");
+
+            // Beer-Lambert at perturbed temperature with current densities.
+            let mut neg_opt = vec![0.0f64; n_e];
+            for (iso, xs) in xs_perturbed.iter().enumerate() {
+                let density = params[self.density_indices[iso]];
+                for (j, &sigma) in xs.iter().enumerate() {
+                    neg_opt[j] -= density * sigma;
+                }
+            }
+            let y_perturbed: Vec<f64> = neg_opt.iter().map(|&d| d.exp()).collect();
+
+            for i in 0..n_e {
+                *jacobian.get_mut(i, col) = (y_perturbed[i] - y_current[i]) / dt;
+            }
+        }
+
+        Some(jacobian)
     }
 }
 
@@ -639,7 +771,13 @@ mod tests {
         )
         .unwrap();
 
-        let y_obs = model.evaluate(&[true_density, true_temp]);
+        let mut y_obs = model.evaluate(&[true_density, true_temp]);
+        // Add tiny deterministic noise so reduced_chi2 stays positive.
+        // Without noise, the analytical Jacobian converges to exact parameters,
+        // yielding chi2 ≈ 0, which makes covariance ≈ 0 and uncertainty NaN.
+        for (i, y) in y_obs.iter_mut().enumerate() {
+            *y *= 1.0 + 1e-5 * ((i % 7) as f64 - 3.0);
+        }
         let sigma = vec![0.005; y_obs.len()];
 
         // Fit with initial guesses offset from truth.
@@ -670,7 +808,7 @@ mod tests {
         let fit_density = result.params[0];
         let fit_temp = result.params[1];
 
-        // Noise-free synthetic data: optimizer should converge to within 0.1%.
+        // Tiny deterministic noise (max ±3e-5): optimizer should converge to within 0.1%.
         assert!(
             (fit_density - true_density).abs() / true_density < 0.001,
             "Density: fitted={}, true={}, error={:.1}%",
@@ -700,5 +838,97 @@ mod tests {
             "temperature uncertainty should be positive and finite, got {}",
             unc[1]
         );
+    }
+
+    /// Analytical Jacobian for TransmissionFitModel (with temperature) must
+    /// agree with central-difference finite-difference Jacobian.
+    ///
+    /// This validates both the density columns (∂T/∂nᵢ = -σᵢ·T) and the
+    /// temperature column (forward FD at T+dT).
+    #[test]
+    fn transmission_fit_model_analytical_jacobian_matches_fd() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
+
+        let model = TransmissionFitModel::new(
+            energies,
+            vec![data],
+            0.0,
+            None,
+            vec![0],
+            Some(1), // params[1] = temperature
+            None,
+        )
+        .unwrap();
+
+        let params = [0.0005f64, 300.0f64]; // density, temperature
+        let y = model.evaluate(&params);
+        let free = vec![0usize, 1usize];
+
+        let jac = model
+            .analytical_jacobian(&params, &free, &y)
+            .expect("analytical_jacobian should return Some(_)");
+
+        assert_eq!(jac.nrows, y.len());
+        assert_eq!(jac.ncols, 2);
+
+        // Central-difference reference.
+        let h = 1e-6f64;
+        for (col, &p_idx) in free.iter().enumerate() {
+            let mut p_plus = params;
+            let mut p_minus = params;
+            p_plus[p_idx] += h * (1.0 + params[p_idx].abs());
+            p_minus[p_idx] -= h * (1.0 + params[p_idx].abs());
+
+            let y_plus = model.evaluate(&p_plus);
+            let y_minus = model.evaluate(&p_minus);
+
+            let actual_2h = p_plus[p_idx] - p_minus[p_idx];
+            for i in 0..y.len() {
+                let fd = (y_plus[i] - y_minus[i]) / actual_2h;
+                let ana = jac.get(i, col);
+                let err = (fd - ana).abs();
+                let scale = fd.abs().max(ana.abs()).max(1e-15);
+                assert!(
+                    err / scale < 0.01,
+                    "Jacobian mismatch (row {i}, col {col}): FD={fd:.8}, analytical={ana:.8}, \
+                     rel_err={:.4}",
+                    err / scale,
+                );
+            }
+        }
+    }
+
+    /// Verify that the broadened-XS cache avoids redundant recomputation.
+    /// Calling evaluate() twice with the same temperature should produce
+    /// identical results and reuse the cache.
+    #[test]
+    fn transmission_fit_model_cache_reuse() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
+
+        let model =
+            TransmissionFitModel::new(energies, vec![data], 0.0, None, vec![0], Some(1), None)
+                .unwrap();
+
+        // First call populates the cache.
+        let y1 = model.evaluate(&[0.0005, 300.0]);
+        assert!(model.cached_broadened_xs.borrow().is_some());
+        assert!((model.cached_temperature.get() - 300.0).abs() < 1e-15);
+
+        // Second call with same temperature but different density should
+        // reuse cached broadened XS (no rebroadening).
+        let y2 = model.evaluate(&[0.001, 300.0]);
+        assert!((model.cached_temperature.get() - 300.0).abs() < 1e-15);
+
+        // Results must differ (different density) but cache temperature unchanged.
+        assert!(
+            (y1[100] - y2[100]).abs() > 1e-10,
+            "different densities should produce different transmission"
+        );
+
+        // Change temperature — cache should update.
+        let _y3 = model.evaluate(&[0.0005, 600.0]);
+        assert!((model.cached_temperature.get() - 600.0).abs() < 1e-15);
     }
 }
