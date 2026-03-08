@@ -1,0 +1,23 @@
+58-NI TRANSMISSION
+      58NI    57.935  293000.0  308500.0  131    0
+PRINT INPUT DATA
+hega
+PRINT VARIED INPUT PARAMETERS
+#DO NOT SUPPRESS ANY INTERMEDIATE RESULTS
+PRINT THEORETICAL VALUES
+GENERATE PLOT FILE AUTOMATICALLY
+  
+      300.   78.2030    0.0350    0.004     0.004
+    6.5     0.076400
+TRANSMISSION
+  1      1    0   .5       1.0   .0
+    1    1    0    0      .500
+  2      1    0  -.5       1.0   .0
+    1    1    0    1      .500
+  3      1    0 -1.5       1.0   .0
+    1    1    0    1      .500
+  4      1    0  1.5       1.0   .0
+    1    1    0    2      .500
+  5      1    0  2.5       1.0   .0
+    1    1    0    2      .500
+  

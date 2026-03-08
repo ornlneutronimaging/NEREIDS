@@ -104,16 +104,20 @@ pub fn rho(energy_ev: f64, awr: f64, channel_radius_fm: f64) -> f64 {
 
 /// Spin statistical weight factor g_J.
 ///
-///   g_J = (2J + 1) / ((2I + 1) · (2s + 1))
+///   g_J = (2|J| + 1) / ((2I + 1) · (2s + 1))
 ///
 /// where I = target spin, s = neutron spin (1/2), J = total angular momentum.
 ///
+/// Uses `|J|` so that the SAMMY sign convention (negative J to distinguish
+/// spin groups with the same |J|) produces the correct weight.  ENDF data
+/// always has J ≥ 0, so the `abs()` is a no-op for standard ENDF inputs.
+///
 /// # Arguments
-/// * `j_total` — Total angular momentum J.
+/// * `j_total` — Total angular momentum J (may be negative per SAMMY convention).
 /// * `target_spin` — Target nucleus spin I.
 pub fn statistical_weight(j_total: f64, target_spin: f64) -> f64 {
     let neutron_spin = 0.5;
-    (2.0 * j_total + 1.0) / ((2.0 * target_spin + 1.0) * (2.0 * neutron_spin + 1.0))
+    (2.0 * j_total.abs() + 1.0) / ((2.0 * target_spin + 1.0) * (2.0 * neutron_spin + 1.0))
 }
 
 /// Convert between lab and center-of-mass energy.

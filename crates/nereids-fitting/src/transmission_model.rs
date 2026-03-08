@@ -889,7 +889,10 @@ mod tests {
                 let fd = (y_plus[i] - y_minus[i]) / actual_2h;
                 let ana = jac.get(i, col);
                 let err = (fd - ana).abs();
-                let scale = fd.abs().max(ana.abs()).max(1e-15);
+                // Use a meaningful floor: when both FD and analytical values
+                // are below 1e-10, relative error comparisons are dominated
+                // by floating-point noise and are not physically meaningful.
+                let scale = fd.abs().max(ana.abs()).max(1e-10);
                 assert!(
                     err / scale < 0.01,
                     "Jacobian mismatch (row {i}, col {col}): FD={fd:.8}, analytical={ana:.8}, \

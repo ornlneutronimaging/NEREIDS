@@ -1125,11 +1125,20 @@ fn reich_moore_spin_group_precomputed(
     // Single-channel case (neutron only, capture eliminated).
     // This is the common case for non-fissile isotopes.
 
-    // Boundary condition: B = S(E_n) at each resonance energy.
-    // SAMMY typically uses B = 0 (Shift=0 flag in .par file).
-    // ENDF convention: B = S(E_n) unless NRO/NAPS flags say otherwise.
-    // For simplicity and following SAMMY ex027 (Shift=0), we use B = 0.
-    let boundary = 0.0;
+    // Boundary condition B = S_l(E): the shift factor and boundary cancel.
+    //
+    // SAMMY convention (CalcShift=false / Ishift=0): the shift factor
+    // is NOT computed in the level matrix — Pgh (src/xxx/mxxx8.f90)
+    // leaves S-B = 0 for all L values when Ishift=0. The resonance
+    // energies in the .par file are observed peak positions.
+    //
+    // ENDF-102 convention (LRF=3 Reich-Moore): B_l = S_l, giving
+    // S_l - B_l = 0 identically. Resonance energies are "formal"
+    // eigenvalues, but with B=S the observed peaks coincide.
+    //
+    // Net effect: l_real = S - B = 0 for all L, so the level-matrix
+    // denominator is 0 + iP, regardless of orbital angular momentum.
+    let boundary = s_l;
 
     // Build the R-matrix (scalar, complex) = Σ_n γ²_n / (E_n - E - iΓ_γ,n/2)
     //
@@ -1205,11 +1214,18 @@ fn reich_moore_spin_group_precomputed(
 
     // Compute the collision matrix element U from X.
     //
-    //   U = e^{2iφ} · (1 + 2iX)
+    //   U = e^{-2iφ} · (1 + 2iX)
+    //
+    // The phase factor uses e^{-2iφ}, NOT e^{+2iφ}.  SAMMY's Cossin
+    // subroutine (src/xxx/mxxx6.f90 line 8) generates cos(2φ) and sin(2φ),
+    // and the Total subroutine (src/cro/mcro4.f90 line 232) combines them
+    // as:  Re(U) = cos(2φ)·Wr + sin(2φ)·Wi = Re(e^{-2iφ} · W)
+    //
+    // This is the Ω² factor in Lane & Thomas: Ω = e^{-iφ}.
     //
     // Reference: ENDF-102 Section 2, Lane & Thomas R-matrix theory
     let x = Complex64::new(x_real, x_imag);
-    let phase = Complex64::new((2.0 * phi_l).cos(), (2.0 * phi_l).sin());
+    let phase = Complex64::new((2.0 * phi_l).cos(), -(2.0 * phi_l).sin());
     let u = phase * (1.0 + 2.0 * Complex64::i() * x);
 
     // Cross-sections from the collision matrix U:
@@ -1242,7 +1258,8 @@ fn reich_moore_2ch_precomputed(
     phi_l: f64,
 ) -> (f64, f64, f64, f64) {
     let pi_over_k2 = channel::pi_over_k_squared_barns(energy_ev, awr);
-    let boundary = 0.0;
+    // B = S_l(E) — see comment in reich_moore_spin_group_precomputed.
+    let boundary = s_l;
 
     // 2-channel: neutron + one fission channel.
     // R-matrix is 2x2 complex.
@@ -1312,8 +1329,10 @@ fn reich_moore_2ch_precomputed(
     }
 
     // Collision matrix U from X-matrix.
-    let phase2 = Complex64::new((2.0 * phi_l).cos(), (2.0 * phi_l).sin());
-    let phase1 = Complex64::new(phi_l.cos(), phi_l.sin());
+    // Phase: e^{-2iφ} for diagonal, e^{-iφ} for off-diagonal (one neutron leg).
+    // See comment in reich_moore_spin_group_precomputed for SAMMY reference.
+    let phase2 = Complex64::new((2.0 * phi_l).cos(), -(2.0 * phi_l).sin());
+    let phase1 = Complex64::new(phi_l.cos(), -phi_l.sin());
 
     let u_nn = phase2 * (1.0 + 2.0 * Complex64::i() * x_mat[0][0]);
     let u_nf = phase1 * 2.0 * Complex64::i() * x_mat[0][1];
@@ -1339,7 +1358,8 @@ fn reich_moore_3ch_precomputed(
     phi_l: f64,
 ) -> (f64, f64, f64, f64) {
     let pi_over_k2 = channel::pi_over_k_squared_barns(energy_ev, awr);
-    let boundary = 0.0;
+    // B = S_l(E) — see comment in reich_moore_spin_group_precomputed.
+    let boundary = s_l;
 
     let mut r_mat = [[Complex64::new(0.0, 0.0); 3]; 3];
 
@@ -1394,8 +1414,9 @@ fn reich_moore_3ch_precomputed(
     }
 
     // Collision matrix U from X-matrix.
-    let phase2 = Complex64::new((2.0 * phi_l).cos(), (2.0 * phi_l).sin());
-    let phase1 = Complex64::new(phi_l.cos(), phi_l.sin());
+    // Phase: e^{-2iφ} for diagonal, e^{-iφ} for off-diagonal.
+    let phase2 = Complex64::new((2.0 * phi_l).cos(), -(2.0 * phi_l).sin());
+    let phase1 = Complex64::new(phi_l.cos(), -phi_l.sin());
 
     let u_nn = phase2 * (1.0 + 2.0 * Complex64::i() * x_mat[0][0]);
     let u_nf1 = phase1 * 2.0 * Complex64::i() * x_mat[0][1];
