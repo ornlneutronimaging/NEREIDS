@@ -654,14 +654,14 @@ fn parse_spin_groups(lines: &[&str]) -> Result<(Vec<SammySpinGroup>, f64), Sammy
             //   cols 18-19: L (orbital angular momentum)  ← this is what we need
             //   cols 20-29: channel spin
             //
-            // Blank integer fields (kz1, kz2, ifexcl) collapse in whitespace
-            // splitting, so the token layout is:
-            //   [0]=chan_id  [1]=lpent  [2]=ishift  [3]=L  [4]=channel_spin
+            // Use fixed-width column extraction (cols 18-20) instead of
+            // whitespace split, which breaks when blank fields (kz1, kz2,
+            // ifexcl) are present or absent.
             let mut l = 0u32;
             if i + 1 < lines.len() {
-                let ch_fields: Vec<&str> = lines[i + 1].split_whitespace().collect();
-                if ch_fields.len() >= 4 {
-                    l = ch_fields[3].parse().unwrap_or(0);
+                let l_str = col(lines[i + 1], 18, 20);
+                if !l_str.is_empty() {
+                    l = l_str.parse().unwrap_or(0);
                 }
             }
 

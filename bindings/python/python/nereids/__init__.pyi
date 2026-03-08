@@ -241,6 +241,7 @@ def forward_model(
     flight_path_m: float | None = None,
     delta_t_us: float | None = None,
     delta_l_m: float | None = None,
+    delta_e_us: float | None = None,
     resolution: TabulatedResolution | None = None,
 ) -> NDArray[np.float64]:
     """Compute theoretical transmission spectrum."""
@@ -257,6 +258,7 @@ def fit_spectrum(
     flight_path_m: float | None = None,
     delta_t_us: float | None = None,
     delta_l_m: float | None = None,
+    delta_e_us: float | None = None,
     resolution: TabulatedResolution | None = None,
     fit_temperature: bool = False,
     fitter: str = "lm",
@@ -320,8 +322,9 @@ def resolution_broaden(
     flight_path_m: float,
     delta_t_us: float,
     delta_l_m: float,
+    delta_e_us: float = 0.0,
 ) -> NDArray[np.float64]:
-    """Apply Gaussian resolution broadening to a cross-section or spectrum array."""
+    """Apply resolution broadening (Gaussian, or Gaussian+exponential tail) to a cross-section or spectrum array."""
     ...
 
 def load_resolution(
@@ -350,6 +353,7 @@ def spatial_map(
     flight_path_m: float | None = None,
     delta_t_us: float | None = None,
     delta_l_m: float | None = None,
+    delta_e_us: float | None = None,
     resolution: TabulatedResolution | None = None,
     max_iter: int = 100,
     fitter: str = "lm",
@@ -370,6 +374,7 @@ def fit_roi(
     flight_path_m: float | None = None,
     delta_t_us: float | None = None,
     delta_l_m: float | None = None,
+    delta_e_us: float | None = None,
     resolution: TabulatedResolution | None = None,
     max_iter: int = 100,
 ) -> FitResult:
@@ -436,6 +441,7 @@ def trace_detectability(
     flight_path_m: float | None = None,
     delta_t_us: float | None = None,
     delta_l_m: float | None = None,
+    delta_e_us: float | None = None,
     resolution: TabulatedResolution | None = None,
     snr_threshold: float = 3.0,
 ) -> TraceDetectabilityReport:
@@ -453,6 +459,7 @@ def trace_detectability_survey(
     flight_path_m: float | None = None,
     delta_t_us: float | None = None,
     delta_l_m: float | None = None,
+    delta_e_us: float | None = None,
     resolution: TabulatedResolution | None = None,
     snr_threshold: float = 3.0,
 ) -> list[tuple[str, TraceDetectabilityReport]]:
@@ -466,6 +473,7 @@ def precompute_cross_sections(
     flight_path_m: float | None = None,
     delta_t_us: float | None = None,
     delta_l_m: float | None = None,
+    delta_e_us: float | None = None,
     resolution: TabulatedResolution | None = None,
 ) -> list[NDArray[np.float64]]:
     """Precompute Doppler- and resolution-broadened total cross-sections.

@@ -88,6 +88,8 @@ pub enum ResolutionParamsError {
     InvalidDeltaT(f64),
     /// Path length uncertainty must be non-negative and finite.
     InvalidDeltaL(f64),
+    /// Exponential tail parameter must be non-negative and finite.
+    InvalidDeltaE(f64),
 }
 
 impl fmt::Display for ResolutionParamsError {
@@ -101,6 +103,9 @@ impl fmt::Display for ResolutionParamsError {
             }
             Self::InvalidDeltaL(v) => {
                 write!(f, "delta_l_m must be non-negative and finite, got {v}")
+            }
+            Self::InvalidDeltaE(v) => {
+                write!(f, "delta_e_us must be non-negative and finite, got {v}")
             }
         }
     }
@@ -145,6 +150,8 @@ impl ResolutionParams {
     /// not finite.
     /// Returns `ResolutionParamsError::InvalidDeltaL` if `delta_l_m < 0.0` or is
     /// not finite.
+    /// Returns `ResolutionParamsError::InvalidDeltaE` if `delta_e_us < 0.0` or is
+    /// not finite.
     pub fn new(
         flight_path_m: f64,
         delta_t_us: f64,
@@ -160,12 +167,9 @@ impl ResolutionParams {
         if !delta_l_m.is_finite() || delta_l_m < 0.0 {
             return Err(ResolutionParamsError::InvalidDeltaL(delta_l_m));
         }
-        // delta_e_us: NaN or negative is invalid; 0.0 means no exponential tail
-        let delta_e_us = if !delta_e_us.is_finite() || delta_e_us < 0.0 {
-            0.0
-        } else {
-            delta_e_us
-        };
+        if !delta_e_us.is_finite() || delta_e_us < 0.0 {
+            return Err(ResolutionParamsError::InvalidDeltaE(delta_e_us));
+        }
         Ok(Self {
             flight_path_m,
             delta_t_us,
@@ -305,6 +309,10 @@ fn validate_inputs(energies: &[f64], data: &[f64]) -> Result<(), ResolutionError
 ///
 /// The weights include a correction term x2(k) that accounts for non-uniform
 /// grid spacing, providing 4th-order accuracy on smooth grids.
+///
+/// Note: the returned weights are 12x the quantity in Eq. IV B 3.8. This
+/// constant factor cancels during normalization (sum/norm), so the broadened
+/// result is independent of the scaling.
 fn compute_xcoef_weights(energies: &[f64]) -> Vec<f64> {
     let n = energies.len();
     if n == 0 {
@@ -481,8 +489,13 @@ fn gauss_exp_kernel(a: f64, b: f64) -> f64 {
 /// SAMMY Ref: `fnc/xxerfc.f90`. Note: SAMMY says "Xx is assumed positive"
 /// but the caller passes B < 0 as Xx. The code handles this by immediately
 /// computing X = -Xx (which is positive).
+///
+/// When x = -xx exceeds XMAX, the rational approximation loses accuracy.
+/// We switch to `exp(-xxx²) · asympt(x)`, mirroring exerfc's large-argument
+/// path.
 fn xxerfc(xx: f64, xxx: f64) -> f64 {
     const SQRT_PI: f64 = 1.772_453_850_905_516;
+    const XMAX: f64 = 5.01;
     const A1: f64 = 8.584_076_57e-1;
     const A2: f64 = 3.078_181_93e-1;
     const A3: f64 = 6.383_238_91e-2;
@@ -492,6 +505,14 @@ fn xxerfc(xx: f64, xxx: f64) -> f64 {
     const A7: f64 = 3.403_018_23e-2;
 
     let x = -xx; // x is positive (xx is B < 0)
+
+    // For large x, the rational approximation loses accuracy.
+    // exp(-xxx² + x²)·erfc(x)·√π = exp(-xxx²)·[exp(x²)·erfc(x)·√π]
+    //                              = exp(-xxx²)·asympt(x)
+    if x > XMAX {
+        return (-xxx * xxx).exp() * asympt(x);
+    }
+
     let a_rat = (A1 + x * (A2 + x * (A3 - x * A4))) / (1.0 + x * (A5 + x * (A6 + x * A7)));
     let b_int = SQRT_PI + x * (2.0 - a_rat);
     let a_final = b_int / (x * b_int + 1.0);
@@ -531,7 +552,10 @@ fn shftge(c: f64, widgau: f64) -> f64 {
         let f = ax * exerfc(x0) - 1.0;
         let xma = x0 - ax;
         let q = 1.0 - 2.0 * x0 * xma;
-        let delx = if xma * xma - q * f > 0.0 {
+        let delx = if q.abs() < NEAR_ZERO_FLOOR {
+            // q ≈ 0: division would overflow; accept current estimate.
+            break;
+        } else if xma * xma - q * f > 0.0 {
             let disc = (xma * xma - q * f).sqrt();
             if xma > 0.0 {
                 (-xma + disc) / q
@@ -617,8 +641,10 @@ pub(crate) fn resolution_broaden_presorted(
         let j_lo = energies.partition_point(|&ej| ej < e_low);
         let j_hi = energies.partition_point(|&ej| ej <= e_high);
 
-        if j_hi <= j_lo + 5 {
-            // Too few points for meaningful integration
+        if j_hi <= j_lo + 1 {
+            // Need at least 2 points for any meaningful integration.
+            // With only 1 point (delta convolution), the original value is correct.
+            // With 2+ points, Xcoef weights are precomputed and valid.
             broadened[i] = cross_sections[i];
             continue;
         }
@@ -1420,5 +1446,24 @@ mod tests {
     fn test_resolution_params_rejects_inf_delta_l() {
         let err = ResolutionParams::new(25.0, 1.0, f64::INFINITY, 0.0).unwrap_err();
         assert!(matches!(err, ResolutionParamsError::InvalidDeltaL(_)));
+    }
+
+    #[test]
+    fn test_resolution_params_rejects_negative_delta_e() {
+        let err = ResolutionParams::new(25.0, 1.0, 0.01, -0.05).unwrap_err();
+        assert_eq!(err, ResolutionParamsError::InvalidDeltaE(-0.05));
+    }
+
+    #[test]
+    fn test_resolution_params_rejects_nan_delta_e() {
+        let err = ResolutionParams::new(25.0, 1.0, 0.01, f64::NAN).unwrap_err();
+        assert!(matches!(err, ResolutionParamsError::InvalidDeltaE(_)));
+    }
+
+    #[test]
+    fn test_resolution_params_accepts_zero_delta_e() {
+        let p = ResolutionParams::new(25.0, 1.0, 0.01, 0.0).unwrap();
+        assert!((p.delta_e_us() - 0.0).abs() < 1e-15);
+        assert!(!p.has_exponential_tail());
     }
 }

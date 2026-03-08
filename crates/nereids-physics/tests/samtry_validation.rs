@@ -382,11 +382,10 @@ fn test_tr007_fe56_broadened() {
         result.n_above_threshold,
         result.worst_energy_kev
     );
-    // tr007: Deltae=0.022, has exponential tail (Iesopr=3) not yet implemented.
-    // FGM Doppler + Gaussian resolution match SAMMY exactly (kernel + conversion
-    // verified against mrsl4.f90).  The 8.8% mean error is from the missing
-    // exponential tail broadening.  Dense grid at low energy (1.13-1.17 keV)
-    // means quadrature error is negligible here.
+    // tr007: Deltae=0.022, has exponential tail (Iesopr=3).
+    // FGM Doppler + Gaussian+exponential resolution broadening implemented.
+    // Dense grid at low energy (1.13-1.17 keV) means quadrature error is
+    // negligible here.  Remaining error is from FGM vs HEGA Doppler difference.
     // Measured: 8.8% mean.
     assert!(
         result.mean_rel_error < 0.12,
@@ -698,10 +697,10 @@ fn test_tr029_ni58_broadened() {
         result.n_above_threshold,
         result.worst_energy_kev
     );
-    // tr029: Deltae=0.008, has exponential tail (Iesopr=3) not yet implemented.
+    // tr029: Deltae=0.008, has exponential tail (Iesopr=3).
     // Wide range (40-53k eV) with 1032 points — good grid density at lower
-    // energies where most resonances live.  The 4.9% mean error is dominated
-    // by the missing exponential tail, diluted by many well-matched low-E points.
+    // energies where most resonances live.  The remaining error is from
+    // sparse-grid convolution at high energies plus Doppler method differences.
     // Measured: 4.9% mean.
     assert!(
         result.mean_rel_error < 0.08,
@@ -744,11 +743,11 @@ fn test_tr030_ni58_broadened() {
         result.n_above_threshold,
         result.worst_energy_kev
     );
-    // tr030: Deltae=0.008, has exponential tail (Iesopr=3) not yet implemented.
+    // tr030: Deltae=0.008, has exponential tail (Iesopr=3).
     // Narrow range (13-15.5 keV) with only 5 active resonances (68 excluded
     // via negative spin group).  The exponential tail's relative effect is
     // amplified when few resonances contribute.  Compare tr029 (same Deltae,
-    // wide range, 4.9% mean) — the wider energy range dilutes the exp tail error.
+    // wide range, 4.9% mean) — the wider energy range dilutes sparse-grid error.
     // Measured: 19.6% mean.
     assert!(
         result.mean_rel_error < 0.25,
@@ -792,7 +791,7 @@ fn test_tr047_fe56_broadened() {
         result.n_above_threshold,
         result.worst_energy_kev
     );
-    // tr047: Deltae=0.022, has exponential tail (Iesopr=3) not yet implemented.
+    // tr047: Deltae=0.022, has exponential tail (Iesopr=3).
     // Similar to tr007 (same isotope/energy range) but cooled to 181K (reduced
     // Doppler width).  Both tr047 and tr007 share the same Deltae=0.022, but
     // at lower temperature the relative contribution of exp tail vs Doppler
