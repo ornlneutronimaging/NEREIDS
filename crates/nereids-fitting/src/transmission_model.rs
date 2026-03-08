@@ -124,8 +124,9 @@ impl FitModel for PrecomputedTransmissionModel {
 /// Optionally, the sample temperature can also be fitted by setting
 /// `temperature_index` to the parameter slot holding the temperature value.
 /// When `temperature_index` is `Some(idx)`, the Doppler broadening kernel
-/// is recomputed at `params[idx]` on every `evaluate()` call, and the LM
-/// engine will compute a finite-difference Jacobian column for it.
+/// is recomputed at `params[idx]` when the temperature changes (cached
+/// across calls at the same temperature), and the analytical Jacobian
+/// provides density columns directly plus a single FD column for temperature.
 ///
 /// `instrument` uses `Arc` so that parallel pixel loops (e.g. in `sparse.rs`)
 /// can share one copy of a potentially large tabulated resolution kernel
@@ -807,7 +808,7 @@ mod tests {
         let fit_density = result.params[0];
         let fit_temp = result.params[1];
 
-        // Noise-free synthetic data: optimizer should converge to within 0.1%.
+        // Tiny deterministic noise (max ±3e-5): optimizer should converge to within 0.1%.
         assert!(
             (fit_density - true_density).abs() / true_density < 0.001,
             "Density: fitted={}, true={}, error={:.1}%",
