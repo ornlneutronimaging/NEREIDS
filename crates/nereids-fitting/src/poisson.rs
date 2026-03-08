@@ -337,9 +337,10 @@ fn backtracking_line_search(
 
 /// Early return for all-fixed parameters: evaluate once and report.
 ///
-/// Returns `Some(PoissonResult)` if all parameters are fixed (either a valid
-/// result with converged=true, or a non-finite NLL with converged=false).
-/// Returns `None` if there are free parameters and optimization should proceed.
+/// Returns `Ok(Some(PoissonResult))` if all parameters are fixed (either a
+/// valid result with converged=true, or a non-finite NLL with converged=false).
+/// Returns `Ok(None)` if there are free parameters and optimization should
+/// proceed. Returns `Err(FittingError)` if model evaluation fails.
 fn try_early_return_fixed(
     model: &dyn FitModel,
     y_obs: &[f64],
@@ -566,7 +567,10 @@ fn compute_analytic_gradient(ctx: &AnalyticGradientCtx<'_>) -> Vec<f64> {
 /// * `config` — Optimizer configuration.
 ///
 /// # Returns
-/// Optimization result with final NLL, parameters, and convergence status.
+/// `Ok(PoissonResult)` with final NLL, parameters, and convergence status.
+/// `Err(FittingError)` if model evaluation fails at the initial point.
+/// Evaluation errors during line-search trials are treated as bad steps
+/// (backtrack), not fatal errors.
 pub fn poisson_fit(
     model: &dyn FitModel,
     y_obs: &[f64],

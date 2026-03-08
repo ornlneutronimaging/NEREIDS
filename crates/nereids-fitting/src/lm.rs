@@ -130,7 +130,14 @@ pub struct LmResult {
 pub trait FitModel {
     /// Evaluate the model for the given parameters.
     ///
-    /// Returns a vector of model predictions, same length as the data.
+    /// On success, returns a vector of model predictions with the same
+    /// length as the data being fitted. On failure, returns a
+    /// [`FittingError`] indicating that the model could not be evaluated
+    /// (e.g. a broadening or physics error).
+    ///
+    /// **Optimizer semantics:** during Levenberg-Marquardt trial steps,
+    /// an `Err` is treated as a failed step (increase λ / backtrack).
+    /// At the initial point or post-convergence, `Err` is propagated.
     fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError>;
 
     /// Optionally provide an analytical Jacobian.
@@ -1094,6 +1101,45 @@ mod tests {
 
         // Should converge to a≈2 while avoiding the NaN region a>5.
         assert!(result.converged, "Should converge avoiding NaN region");
+        assert!(
+            (result.params[0] - 2.0).abs() < 0.1,
+            "a = {}, expected ~2.0",
+            result.params[0]
+        );
+    }
+
+    #[test]
+    fn test_err_model_during_trial_step() {
+        // Model that returns Err for large parameter values.
+        // The optimizer should treat Err trial steps as bad steps (increase λ)
+        // and converge without panicking.
+        struct ErrAtLargeModel {
+            x: Vec<f64>,
+        }
+        impl FitModel for ErrAtLargeModel {
+            fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+                let a = params[0];
+                if a > 5.0 {
+                    return Err(FittingError::EvaluationFailed(
+                        "parameter out of valid range".into(),
+                    ));
+                }
+                Ok(self.x.iter().map(|&x| a * x + 1.0).collect())
+            }
+        }
+
+        let x: Vec<f64> = (0..10).map(|i| i as f64).collect();
+        let y_obs: Vec<f64> = x.iter().map(|&xi| 2.0 * xi + 1.0).collect();
+        let sigma = vec![1.0; 10];
+
+        let model = ErrAtLargeModel { x };
+        let mut params = ParameterSet::new(vec![FitParameter::unbounded("a", 3.0)]);
+
+        let result =
+            levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &LmConfig::default()).unwrap();
+
+        // Should converge to a≈2 while avoiding the Err region a>5.
+        assert!(result.converged, "Should converge avoiding Err region");
         assert!(
             (result.params[0] - 2.0).abs() < 0.1,
             "a = {}, expected ~2.0",
