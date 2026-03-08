@@ -340,11 +340,11 @@ fn dispatch_solver(
             model, measured_t, sigma, params, lm_config,
         )?),
         SolverChoice::PoissonKL(poisson_config) => {
-            let pr = poisson::poisson_fit(model, measured_t, params, poisson_config);
+            let pr = poisson::poisson_fit(model, measured_t, params, poisson_config)?;
             let n_free = params.n_free();
             let dof = measured_t.len().saturating_sub(n_free).max(1);
             // Compute Pearson chi-squared for display consistency with LM solver.
-            let y_model = model.evaluate(&pr.params);
+            let y_model = model.evaluate(&pr.params)?;
             let chi_sq: f64 = measured_t
                 .iter()
                 .zip(y_model.iter())
@@ -593,7 +593,7 @@ pub fn fit_spectrum(
 
                 let n_free = params.n_free();
                 let dof = measured_t.len().saturating_sub(n_free).max(1);
-                let y_model = model.evaluate(&pr.params);
+                let y_model = model.evaluate(&pr.params)?;
                 let chi_sq: f64 = measured_t
                     .iter()
                     .zip(y_model.iter())
@@ -687,7 +687,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let y_obs = model.evaluate(&[true_density]);
+        let y_obs = model.evaluate(&[true_density]).unwrap();
         let sigma = vec![0.01; y_obs.len()];
 
         let config = FitConfig::new(
@@ -734,7 +734,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let y_obs = model.evaluate(&[true_density]);
+        let y_obs = model.evaluate(&[true_density]).unwrap();
         let sigma = vec![0.01; y_obs.len()];
 
         let config = FitConfig::new(
@@ -974,7 +974,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let y_obs = model.evaluate(&[true_density]);
+        let y_obs = model.evaluate(&[true_density]).unwrap();
         let sigma = vec![0.01; y_obs.len()];
 
         let config = FitConfig::new(

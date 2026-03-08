@@ -891,7 +891,7 @@ pub(crate) fn build_fit_line(
     .ok()?;
 
     use nereids_fitting::lm::FitModel;
-    let fitted_t = model.evaluate(&result.densities);
+    let fitted_t = model.evaluate(&result.densities).ok()?;
     let n_fit = n_plot.min(fitted_t.len()).min(x_values.len());
     let fit_points: PlotPoints = (0..n_fit)
         .filter(|&i| x_values[i].is_finite())

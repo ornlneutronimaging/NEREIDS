@@ -440,7 +440,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let spectrum = model.evaluate(&[true_density]);
+        let spectrum = model.evaluate(&[true_density]).unwrap();
 
         // Create a 3×3 image with uniform transmission
         let height = 3;
@@ -513,7 +513,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let spectrum = model.evaluate(&[0.0005]);
+        let spectrum = model.evaluate(&[0.0005]).unwrap();
 
         let height = 2;
         let width = 2;
@@ -631,7 +631,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let spectrum = model.evaluate(&[true_density]);
+        let spectrum = model.evaluate(&[true_density]).unwrap();
 
         // 4×4 image
         let height = 4;
@@ -710,7 +710,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let spectrum = model.evaluate(&[true_density]);
+        let spectrum = model.evaluate(&[true_density]).unwrap();
 
         // 2×2 image
         let height = 2;
