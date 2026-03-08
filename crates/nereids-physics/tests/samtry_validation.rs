@@ -795,8 +795,8 @@ fn test_tr047_fe56_broadened() {
     );
     // tr047: Deltae=0.022, has exponential tail (Iesopr=3) not yet implemented.
     // Similar to tr007 (same isotope/energy range) but cooled to 181K (reduced
-    // Doppler width).  Deltae=0.022 is larger than tr007's 0.022 — same value
-    // but at lower temperature the relative contribution of exp tail vs Doppler
+    // Doppler width).  Both tr047 and tr007 share the same Deltae=0.022, but
+    // at lower temperature the relative contribution of exp tail vs Doppler
     // shifts.  The 2.6% mean error is low because the Fe-56 resonance at
     // 1151 eV dominates and its broadened shape is mainly Doppler+Gaussian.
     // Measured: 2.6% mean.

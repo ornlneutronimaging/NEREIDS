@@ -183,6 +183,10 @@ impl SammyInpConfig {
 /// Otherwise returns `Some((flight_path_m, delta_t_us, delta_l_m))`.
 #[must_use]
 pub fn sammy_to_nereids_resolution(inp: &SammyInpConfig) -> Option<(f64, f64, f64)> {
+    if inp.no_broadening {
+        return None;
+    }
+
     let delta_l = inp.effective_delta_l();
     let delta_g = inp.effective_delta_g();
 
@@ -265,14 +269,14 @@ pub fn parse_sammy_plt(content: &str) -> Result<Vec<SammyPltRecord>, SammyParseE
 
 /// Parse a SAMMY `.par` file (resonance parameters).
 ///
-/// Uses Fortran fixed-width column parsing (FORMAT 5F11.4, 5I2, I5):
+/// Uses Fortran fixed-width column parsing (FORMAT 5F11.4, 5I2, I2):
 ///   cols  0-10: E_res (eV)         — 11 chars
 ///   cols 11-21: Γ_γ (meV)          — 11 chars
 ///   cols 22-32: Γ_n (meV)          — 11 chars
 ///   cols 33-43: Γ_f1 (meV)         — 11 chars
 ///   cols 44-54: Γ_f2 (meV)         — 11 chars
 ///   cols 55-64: vary flags (5×I2)  — 10 chars
-///   cols 65-69: spin_group_id (I5) — 5 chars
+///   cols 65-66: spin_group_id (I2) — 2 chars
 ///
 /// Widths are in meV in the file; this function converts to eV.
 ///
@@ -297,11 +301,11 @@ pub fn parse_sammy_par(content: &str) -> Result<SammyParFile, SammyParseError> {
         }
 
         let parse_col = |start: usize, end: usize, name: &str| -> Result<f64, SammyParseError> {
-            let s = if end <= line.len() {
-                line[start..end].trim()
-            } else {
-                // Column extends past line end — treat missing as zero.
+            let s = if start >= line.len() {
+                // Column starts past line end — treat missing as zero.
                 ""
+            } else {
+                line[start..end.min(line.len())].trim()
             };
             if s.is_empty() {
                 return Ok(0.0);
@@ -327,7 +331,16 @@ pub fn parse_sammy_par(content: &str) -> Result<SammyParFile, SammyParseError> {
         let spin_group_signed: i32 = if line.len() > 65 {
             let end = line.len().min(67);
             let sg_str = line[65..end].trim();
-            sg_str.parse::<i32>().unwrap_or(1)
+            if sg_str.is_empty() {
+                1
+            } else {
+                sg_str.parse::<i32>().map_err(|e| {
+                    SammyParseError::new(format!(
+                        "line {}: cannot parse spin group ({sg_str:?}): {e}",
+                        i + 1
+                    ))
+                })?
+            }
         } else {
             1 // Default spin group if line is too short.
         };
@@ -476,8 +489,7 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
 
     while idx < lines.len() {
         let trimmed = lines[idx].trim().to_uppercase();
-        if trimmed == "TRANSMISSION" || trimmed.starts_with("TRANS") || trimmed.starts_with("TOTAL")
-        {
+        if trimmed.starts_with("TRANSMISSION") || trimmed.starts_with("TOTAL") {
             idx += 1;
             // Parse spin group definitions until blank line.
             let (groups, parsed_target_spin) = parse_spin_groups(&lines[idx..])?;
@@ -608,7 +620,9 @@ fn parse_spin_groups(lines: &[&str]) -> Result<(Vec<SammySpinGroup>, f64), Sammy
                 if s.is_empty() {
                     1.0
                 } else {
-                    s.parse().unwrap_or(1.0)
+                    s.parse().map_err(|e| {
+                        SammyParseError::new(format!("spin group abundance ({s:?}): {e}"))
+                    })?
                 }
             };
 
@@ -616,7 +630,9 @@ fn parse_spin_groups(lines: &[&str]) -> Result<(Vec<SammySpinGroup>, f64), Sammy
             if groups.is_empty() {
                 let s = col(line, 31, 36);
                 if !s.is_empty() {
-                    target_spin = s.parse::<f64>().unwrap_or(0.0);
+                    target_spin = s.parse::<f64>().map_err(|e| {
+                        SammyParseError::new(format!("spin group target spin ({s:?}): {e}"))
+                    })?;
                 }
             }
 
