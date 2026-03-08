@@ -171,6 +171,11 @@ impl SammyInpConfig {
 ///
 /// SAMMY Ref: `RslResolutionFunction_M.f90` (getAo2 lines 143-161, getBo2 lines 165-179)
 ///
+/// **Note**: This function only converts the Gaussian resolution parameters
+/// (Deltal → Bo2, Deltag → Ao2).  The exponential tail parameter Deltae
+/// (`effective_delta_e()`) is not used — exponential resolution broadening
+/// is not yet implemented in NEREIDS.
+///
 /// Returns `None` if both effective Deltal and Deltag are zero (no resolution broadening).
 /// Otherwise returns `Some((flight_path_m, delta_t_us, delta_l_m))`.
 #[must_use]
@@ -1080,5 +1085,74 @@ BROADENING
         let res_l1 = &rd.ranges[0].l_groups[1].resonances[0];
         assert!((res_l0.j - 0.5).abs() < 1e-6, "spin group 1 → J=+0.5");
         assert!((res_l1.j - (-0.5)).abs() < 1e-6, "spin group 2 → J=-0.5");
+    }
+
+    #[test]
+    fn test_sammy_to_nereids_resolution_conversion() {
+        // Use tr007's effective BROADENING card values: Deltag=0.022, Deltal=0.025.
+        let inp = SammyInpConfig {
+            title: String::new(),
+            isotope_symbol: "FE56".to_string(),
+            awr: 55.9,
+            energy_min_ev: 1133.0,
+            energy_max_ev: 1170.0,
+            temperature_k: 329.0,
+            flight_path_m: 80.263,
+            delta_l_sammy: 0.0301,
+            delta_e_sammy: 0.0,
+            delta_g_sammy: 0.021994,
+            broadening_delta_l: Some(0.025),
+            broadening_delta_g: Some(0.022),
+            broadening_delta_e: Some(0.022),
+            scattering_radius_fm: 6.0,
+            thickness_atoms_barn: 0.2179,
+            target_spin: 0.0,
+            spin_groups: vec![],
+        };
+
+        let (flight_path, delta_t, delta_l) =
+            sammy_to_nereids_resolution(&inp).expect("should return Some for non-zero params");
+
+        assert!((flight_path - 80.263).abs() < 1e-10);
+        // delta_t = Deltag / (2·√ln2) = 0.022 / (2·0.83255...) = 0.01321...
+        let expected_dt = 0.022 / (2.0 * 2.0_f64.ln().sqrt());
+        assert!(
+            (delta_t - expected_dt).abs() < 1e-12,
+            "delta_t={delta_t}, expected={expected_dt}"
+        );
+        // delta_l = Deltal / √6 = 0.025 / 2.44949... = 0.01021...
+        let expected_dl = 0.025 / 6.0_f64.sqrt();
+        assert!(
+            (delta_l - expected_dl).abs() < 1e-12,
+            "delta_l={delta_l}, expected={expected_dl}"
+        );
+    }
+
+    #[test]
+    fn test_sammy_to_nereids_resolution_zero_params() {
+        let inp = SammyInpConfig {
+            title: String::new(),
+            isotope_symbol: "FE56".to_string(),
+            awr: 55.9,
+            energy_min_ev: 1133.0,
+            energy_max_ev: 1170.0,
+            temperature_k: 329.0,
+            flight_path_m: 80.263,
+            delta_l_sammy: 0.0,
+            delta_e_sammy: 0.0,
+            delta_g_sammy: 0.0,
+            broadening_delta_l: None,
+            broadening_delta_g: None,
+            broadening_delta_e: None,
+            scattering_radius_fm: 6.0,
+            thickness_atoms_barn: 0.2179,
+            target_spin: 0.0,
+            spin_groups: vec![],
+        };
+
+        assert!(
+            sammy_to_nereids_resolution(&inp).is_none(),
+            "should return None when both Deltal and Deltag are zero"
+        );
     }
 }
