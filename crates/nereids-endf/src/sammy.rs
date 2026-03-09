@@ -827,6 +827,26 @@ pub fn sammy_to_resonance_data(
         });
     }
 
+    // Inject zero-width sentinel resonances for spin groups that have no
+    // resonances in the .par file.  These spin groups still contribute
+    // potential scattering: R=0 → U = e^{-2iφ_L} → σ_pot ≠ 0.
+    // Without sentinels, the L-group (or J-group within it) is never
+    // created, and the potential scattering is silently lost.
+    let sg_indices_with_resonances: std::collections::HashSet<u32> =
+        par.resonances.iter().map(|r| r.spin_group).collect();
+    for sg in &inp.spin_groups {
+        if !sg_indices_with_resonances.contains(&sg.index) {
+            l_group_map.entry(sg.l).or_default().push(Resonance {
+                energy: 0.0,
+                j: sg.j,
+                gn: 0.0,
+                gg: 0.0,
+                gfa: 0.0,
+                gfb: 0.0,
+            });
+        }
+    }
+
     // Build LGroups.
     let l_groups: Vec<LGroup> = l_group_map
         .into_iter()
@@ -991,6 +1011,25 @@ pub fn sammy_to_resonance_data_multi(
                 gfa: res.gamma_f1_ev,
                 gfb: res.gamma_f2_ev,
             });
+        }
+
+        // Inject zero-width sentinels for spin groups in this isotope
+        // group that have no resonances (same fix as sammy_to_resonance_data).
+        let res_sg_indices: std::collections::HashSet<u32> =
+            group_resonances.iter().map(|r| r.spin_group).collect();
+        for &idx in &sg_indices {
+            if !res_sg_indices.contains(&idx)
+                && let Some(sg) = sg_map.get(&idx)
+            {
+                l_group_map.entry(sg.l).or_default().push(Resonance {
+                    energy: 0.0,
+                    j: sg.j,
+                    gn: 0.0,
+                    gg: 0.0,
+                    gfa: 0.0,
+                    gfb: 0.0,
+                });
+            }
         }
 
         let l_groups: Vec<LGroup> = l_group_map

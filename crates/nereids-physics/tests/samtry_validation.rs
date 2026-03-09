@@ -35,9 +35,9 @@
 //! | HEGA, Ni-58 180 keV | tr012, tr041 | <10% | <25% | Doppler method mismatch |
 //! | HEGA + Exp tail, Fe-56 1 keV | tr022 | <12% | <55% | Resonance peak sampling |
 //! | HEGA, Fe-56 1 keV (MLBW cmp) | tr025 | <10% | <30% | Doppler method mismatch |
-//! | Multi-isotope (3 sp), HEGA | tr010 | <25% | <35% | ~50% unmodeled isotope pot. scatt.|
-//! | Unbroadened reconstruction | tr037 | <5% | <100% | Missing higher-L pot. scatt. |
-//! | Multi-isotope (2 sp), Gauss | tr040 | <50% | <350% | High-energy broadening (P2) |
+//! | Multi-isotope (3 sp), HEGA | tr010 | <1% | <8% | Doppler method mismatch |
+//! | Unbroadened reconstruction | tr037 | <0.1% | <1% | Direct R-matrix (exact) |
+//! | Multi-isotope (2 sp), Gauss | tr040 | <50% | <400% | Sparse-grid broadening (P2) |
 //!
 //! ## Reference
 //! SAMMY source: `../SAMMY/SAMMY/sammy/samtry/`
@@ -1559,13 +1559,11 @@ fn test_tr010_zr_broadened() {
         result.worst_energy_kev
     );
     // Zr multi-isotope: 3 species (93Zr/91Zr/94Zr), HEGA broadened.
-    // Modeled abundances sum to only ~0.50 (the remaining ~50% is unmodeled
-    // Zr isotopes like 90Zr).  SAMMY's Th_initial includes potential
-    // scattering from ALL isotopes; we only model the 3 labeled species.
-    // Expected ~18% systematic underestimate from missing contributions.
+    // Sentinel fix for zero-resonance spin groups restores potential scattering
+    // from 94Zr (SG13, "FAKES" — no resonances, L=0 potential scattering only).
     assert!(
-        result.mean_rel_error < 0.25,
-        "broadened multi mean error {:.4} >= 25%",
+        result.mean_rel_error < 0.01,
+        "broadened multi mean error {:.4} >= 1%",
         result.mean_rel_error
     );
 }
@@ -1636,13 +1634,11 @@ fn test_tr037_ni60_unbroadened() {
         worst_energy_kev
     );
     // Ni-60 unbroadened reconstruction: direct R-matrix evaluation.
-    // Spin groups 3-5 (L=1,2) have 0 resonances in the .par file but still
-    // contribute potential scattering in SAMMY.  Our code doesn't add empty
-    // L-groups, causing a systematic ~3% offset from missing higher-L
-    // potential scattering.
+    // Sentinel zero-width resonances for empty spin groups (L=1,2) ensure
+    // potential scattering is computed even when no resonances exist.
     assert!(
-        mean_rel_error < 0.05,
-        "unbroadened mean error {:.6} >= 5%",
+        mean_rel_error < 0.001,
+        "unbroadened mean error {:.6} >= 0.1%",
         mean_rel_error
     );
 }
