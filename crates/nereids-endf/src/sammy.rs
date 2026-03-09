@@ -531,12 +531,19 @@ pub fn parse_sammy_par(content: &str) -> Result<SammyParFile, SammyParseError> {
                     .split_whitespace()
                     .filter_map(|t| t.parse().ok())
                     .collect();
+                // Require exactly 7 parameters; skip malformed entries.
+                if tokens.len() != 7 {
+                    continue;
+                }
                 for (i, &v) in tokens.iter().enumerate().take(7) {
                     params[i] = v;
                 }
             }
 
-            r_external.insert(sg, params);
+            // Keep the FIRST entry per spin group (channel 1 = elastic).
+            // Subsequent channels (fission, etc.) are intentionally ignored
+            // since only the elastic R-external contribution is currently used.
+            r_external.entry(sg).or_insert(params);
         }
     }
 

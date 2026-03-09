@@ -611,45 +611,79 @@ pub fn broadened_cross_sections_for_transmission(
                 return Err(TransmissionError::Cancelled);
             }
 
-            let (ext_energies, data_indices) = ext_grid
-                .as_ref()
-                .expect("instrument provided but no ext grid built");
+            let sigma_eff = if let Some((ref ext_energies, ref data_indices)) = ext_grid {
+                // Extended grid available: evaluate the full pipeline on the
+                // extended grid and extract at data positions.
 
-            // 1. Unbroadened cross sections on extended grid.
-            let unbroadened: Vec<f64> = ext_energies
-                .iter()
-                .map(|&e| reich_moore::cross_sections_at_energy(rd, e).total)
-                .collect();
+                // 1. Unbroadened cross sections on extended grid.
+                let unbroadened: Vec<f64> = ext_energies
+                    .iter()
+                    .map(|&e| reich_moore::cross_sections_at_energy(rd, e).total)
+                    .collect();
 
-            // 2. Doppler broadening.
-            let after_doppler = if temperature_k > 0.0 {
-                let params = DopplerParams::new(temperature_k, rd.awr)?;
-                doppler::doppler_broaden(ext_energies, &unbroadened, &params)?
+                // 2. Doppler broadening.
+                let after_doppler = if temperature_k > 0.0 {
+                    let params = DopplerParams::new(temperature_k, rd.awr)?;
+                    doppler::doppler_broaden(ext_energies, &unbroadened, &params)?
+                } else {
+                    unbroadened
+                };
+
+                // 3. Convert to transmission: T = exp(-nd × σ_D).
+                let transmission: Vec<f64> = after_doppler
+                    .iter()
+                    .map(|&sigma| (-nd * sigma).exp())
+                    .collect();
+
+                // 4. Resolution-broaden T.
+                let t_broadened = resolution::apply_resolution_presorted(
+                    ext_energies,
+                    &transmission,
+                    &instrument.resolution,
+                );
+
+                // 5. Convert back to effective σ: σ_eff = -ln(T_broad) / nd.
+                data_indices
+                    .iter()
+                    .map(|&i| {
+                        let t = t_broadened[i].max(1e-30); // Prevent ln(0)
+                        -t.ln() / nd
+                    })
+                    .collect()
             } else {
-                unbroadened
+                // No extended grid (e.g. tabulated resolution with no aux grid):
+                // Doppler on data grid, Beer-Lambert, resolution on data grid.
+                let unbroadened: Vec<f64> = energies
+                    .iter()
+                    .map(|&e| reich_moore::cross_sections_at_energy(rd, e).total)
+                    .collect();
+
+                let after_doppler = if temperature_k > 0.0 {
+                    let params = DopplerParams::new(temperature_k, rd.awr)?;
+                    doppler::doppler_broaden(energies, &unbroadened, &params)?
+                } else {
+                    unbroadened
+                };
+
+                let transmission: Vec<f64> = after_doppler
+                    .iter()
+                    .map(|&sigma| (-nd * sigma).exp())
+                    .collect();
+
+                let t_broadened = resolution::apply_resolution_presorted(
+                    energies,
+                    &transmission,
+                    &instrument.resolution,
+                );
+
+                t_broadened
+                    .iter()
+                    .map(|&t| {
+                        let t_clamped = t.max(1e-30); // Prevent ln(0)
+                        -t_clamped.ln() / nd
+                    })
+                    .collect()
             };
-
-            // 3. Convert to transmission: T = exp(-nd × σ_D).
-            let transmission: Vec<f64> = after_doppler
-                .iter()
-                .map(|&sigma| (-nd * sigma).exp())
-                .collect();
-
-            // 4. Resolution-broaden T.
-            let t_broadened = resolution::apply_resolution_presorted(
-                ext_energies,
-                &transmission,
-                &instrument.resolution,
-            );
-
-            // 5. Convert back to effective σ: σ_eff = -ln(T_broad) / nd.
-            let sigma_eff: Vec<f64> = data_indices
-                .iter()
-                .map(|&i| {
-                    let t = t_broadened[i].max(1e-30); // Prevent ln(0)
-                    -t.ln() / nd
-                })
-                .collect();
 
             Ok(sigma_eff)
         })

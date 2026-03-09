@@ -407,7 +407,7 @@ pub struct Resonance {
 /// ## Formula
 /// ```text
 /// R_ext(E) = R_con + R_lin·E + R_quad·E²
-///          − s_lin·(E_up − E_low)
+///          + s_lin·(E_up − E_low)
 ///          − (s_con + s_lin·E)·ln[(E_up − E) / (E − E_low)]
 /// ```
 ///

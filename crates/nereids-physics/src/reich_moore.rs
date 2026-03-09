@@ -669,6 +669,12 @@ fn precompute_range_data<'a>(
                         jgroups,
                     }
                 } else if !has_two_fission {
+                    // R-external for fission channels is a future extension;
+                    // warn if any entries match this L-group.
+                    debug_assert!(
+                        !range.r_external.iter().any(|re| re.l == l),
+                        "R-external entries exist for L={l} (2ch fission path) but are not applied"
+                    );
                     let jgroups = precompute_jgroups_2ch(
                         &l_group.resonances,
                         l,
@@ -684,6 +690,12 @@ fn precompute_range_data<'a>(
                         jgroups,
                     }
                 } else {
+                    // R-external for fission channels is a future extension;
+                    // warn if any entries match this L-group.
+                    debug_assert!(
+                        !range.r_external.iter().any(|re| re.l == l),
+                        "R-external entries exist for L={l} (3ch fission path) but are not applied"
+                    );
                     let jgroups = precompute_jgroups_3ch(
                         &l_group.resonances,
                         l,
@@ -1030,6 +1042,12 @@ fn cross_sections_for_range(
                         fission += f;
                     }
                 } else if !has_two_fission {
+                    // R-external for fission channels is a future extension;
+                    // warn if any entries match this L-group.
+                    debug_assert!(
+                        !range.r_external.iter().any(|re| re.l == l),
+                        "R-external entries exist for L={l} (2ch fission path) but are not applied"
+                    );
                     // 2-channel fission: build J-groups (see note above).
                     let jgroups = precompute_jgroups_2ch(
                         &l_group.resonances,
@@ -1055,6 +1073,12 @@ fn cross_sections_for_range(
                         fission += f;
                     }
                 } else {
+                    // R-external for fission channels is a future extension;
+                    // warn if any entries match this L-group.
+                    debug_assert!(
+                        !range.r_external.iter().any(|re| re.l == l),
+                        "R-external entries exist for L={l} (3ch fission path) but are not applied"
+                    );
                     // 3-channel fission: build J-groups (see note above).
                     let jgroups = precompute_jgroups_3ch(
                         &l_group.resonances,
