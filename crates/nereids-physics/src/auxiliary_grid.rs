@@ -75,10 +75,11 @@ pub fn build_extended_grid(
     build_extended_grid_inner(data_energies, resolution, resonances, true)
 }
 
-/// Build extended grid without intermediate point densification.
+/// Build extended grid with boundary extension only (no intermediate points).
 ///
-/// Used for exponential tail broadening where the trapezoidal × kernel
-/// quadrature is sensitive to grid density changes.
+/// Used when the combined Gaussian+exponential kernel is active, where
+/// non-uniform spacing from adaptive intermediates degrades the Xcoef
+/// quadrature accuracy.
 pub fn build_extended_grid_boundary_only(
     data_energies: &[f64],
     resolution: Option<&ResolutionParams>,
@@ -188,11 +189,14 @@ fn build_extended_grid_inner(
     // integral has enough quadrature points even on coarse grids.
     //
     // Target: spacing ≤ W/4 (at least ~20 points per 5σ window).
+    //
+    // W/4 is sufficient: the PW-linear Gaussian integration is exact for
+    // linear cross-section segments, so the error depends on the cross-section
+    // curvature × h², not on quadrature point count.  Fine-structure points
+    // (Step 3) densify around narrow resonances where curvature is high.
+    //
     // SAMMY analogue: dat/mdata.f90 Eqxtra (with nxtra=0 default, but
     // SAMMY's fine-structure + Xcoef quadrature compensates).
-    //
-    // Skipped for exponential tail broadening where the trapezoidal × kernel
-    // approach is sensitive to grid density changes (build_extended_grid_boundary_only).
     if add_intermediate {
         let mut extra: Vec<f64> = Vec::new();
         for k in 0..grid.len() - 1 {

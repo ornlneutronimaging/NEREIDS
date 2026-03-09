@@ -1952,6 +1952,7 @@ mod tests {
                 rml: None,
                 urr: None,
                 ap_table: None,
+                r_external: vec![],
             }],
         }];
 
@@ -2419,6 +2420,7 @@ mod tests {
                 rml: None,
                 urr: None,
                 ap_table: None,
+                r_external: vec![],
             }],
         }];
 

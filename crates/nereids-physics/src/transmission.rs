@@ -33,30 +33,49 @@ use crate::doppler::{self, DopplerParams, DopplerParamsError};
 use crate::reich_moore;
 use crate::resolution::{self, ResolutionError, ResolutionFunction};
 
-/// Collect (energy, gd) pairs from all resonance data for auxiliary grid
-/// fine-structure densification.
-///
-/// `gd = 0.001 * Σ|Γ_i|` is the resonance half-width parameter from SAMMY's
 /// Build the auxiliary extended grid for resolution broadening.
 ///
 /// Shared helper that extracts Gaussian resolution params and resonance info
-/// to build the extended grid with boundary extension + fine-structure.
-/// Returns `None` if no extension is needed (no resolution, or grid unchanged).
+/// to build the extended grid with boundary extension + adaptive intermediate
+/// points.  Returns `None` if no extension is needed (no resolution, or grid
+/// unchanged).
+///
+/// Intermediate points are inserted only when the resolution broadening at
+/// the grid midpoint uses the PW-linear Gaussian path (exp tail negligible
+/// or absent).  For genuine combined-kernel cases, intermediates create
+/// non-uniform spacing transitions that degrade the Xcoef quadrature.
 fn build_aux_grid(
     energies: &[f64],
     instrument: Option<&InstrumentParams>,
-    _resonance_data: &[ResonanceData],
+    resonance_data: &[ResonanceData],
 ) -> Option<(Vec<f64>, Vec<usize>)> {
     instrument.and_then(|inst| {
         if let ResolutionFunction::Gaussian(ref params) = inst.resolution {
-            let (ext_e, di) = if params.has_exponential_tail() {
-                // Exp tail: boundary extension only (trapezoidal × kernel is
-                // sensitive to grid density changes).
-                crate::auxiliary_grid::build_extended_grid_boundary_only(energies, Some(params))
+            // Check the Gaussian-to-exp-tail ratio at the grid midpoint to
+            // decide whether intermediates help or hurt.  The ratio C =
+            // W_g/(2·W_e) determines which broadening path is used per-energy
+            // in resolution_broaden_presorted.  When C > 2.5 the PW-linear
+            // Gaussian path is used, which benefits from intermediates.
+            let use_intermediates = if energies.len() >= 2 {
+                let e_mid = energies[energies.len() / 2];
+                let wg = params.gaussian_width(e_mid);
+                let we = params.exp_width(e_mid);
+                // Matches EXP_TAIL_NEGLIGIBLE_C = 2.5 in resolution.rs
+                we < 1e-60 || wg / (2.0 * we) > 2.5
             } else {
-                // Pure Gaussian: full densification with intermediate points
-                // for piecewise-linear integration accuracy.
-                crate::auxiliary_grid::build_extended_grid(energies, Some(params), &[])
+                true
+            };
+
+            // Extract (energy_eV, gd_eV) pairs for fine-structure densification.
+            // gd = total resonance width, used by Fspken to identify regions
+            // needing denser grid points around narrow resonances.
+            // SAMMY Ref: dat/mdat4.f90 Fspken lines 243-284
+            let resonances = extract_resonance_widths(resonance_data);
+
+            let (ext_e, di) = if use_intermediates {
+                crate::auxiliary_grid::build_extended_grid(energies, Some(params), &resonances)
+            } else {
+                crate::auxiliary_grid::build_extended_grid_boundary_only(energies, Some(params))
             };
             if ext_e.len() > energies.len() {
                 Some((ext_e, di))
@@ -67,6 +86,49 @@ fn build_aux_grid(
             None
         }
     })
+}
+
+/// Extract (energy_eV, gd_eV) pairs from resonance data for fine-structure
+/// grid densification.
+///
+/// For LRF=1/2/3 (BW and Reich-Moore): `gd = |Γn| + |Γγ| + |Γf1| + |Γf2|`
+/// For LRF=7 (R-Matrix Limited): `gd = |Γγ| + Σ|γ_i|²` (approximate)
+///
+/// SAMMY Ref: dat/mdat4.f90 Fspken — uses total width to define the region
+/// [E_res − gd, E_res + gd] for fine-structure point insertion.
+fn extract_resonance_widths(resonance_data: &[ResonanceData]) -> Vec<(f64, f64)> {
+    let mut pairs = Vec::new();
+    for rd in resonance_data {
+        for range in &rd.ranges {
+            if !range.resolved {
+                continue;
+            }
+            // LRF=1/2/3: resonances grouped by L
+            for lg in &range.l_groups {
+                for res in &lg.resonances {
+                    let gd = res.gn.abs() + res.gg.abs() + res.gfa.abs() + res.gfb.abs();
+                    if gd > 0.0 {
+                        pairs.push((res.energy, gd));
+                    }
+                }
+            }
+            // LRF=7: resonances in spin groups
+            if let Some(ref rml) = range.rml {
+                for sg in &rml.spin_groups {
+                    for res in &sg.resonances {
+                        let mut gd = res.gamma_gamma.abs();
+                        for &w in &res.widths {
+                            gd += w * w; // γ² approximates Γ
+                        }
+                        if gd > 0.0 {
+                            pairs.push((res.energy, gd));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    pairs
 }
 
 /// Errors from the transmission forward model.
@@ -499,6 +561,107 @@ pub fn broadened_cross_sections(
     result
 }
 
+/// Compute Doppler+resolution-broadened cross-sections using SAMMY's
+/// Beer-Lambert-aware pipeline for transmission data.
+///
+/// For transmission data, SAMMY applies resolution broadening to the
+/// transmission T = exp(-nd×σ_D) rather than to σ_D directly.  Due to
+/// Jensen's inequality (the exponential is convex), direct σ broadening
+/// overestimates the effective cross section at resonance peaks.  This
+/// function implements SAMMY's correct pipeline:
+///
+/// 1. Evaluate unbroadened σ on extended grid
+/// 2. Doppler-broaden σ → σ_D
+/// 3. Convert to transmission: T = exp(-nd × σ_D)
+/// 4. Resolution-broaden T → T_broadened
+/// 5. Convert back: σ_eff = -ln(T_broadened) / nd
+///
+/// SAMMY Ref: DopplerAndResolutionBroadener.cpp — resolution broadening is
+/// applied after Beer-Lambert conversion in the SAMMY pipeline.
+///
+/// # Arguments
+/// * `energies`             — Energy grid in eV (sorted ascending).
+/// * `resonance_data`       — Resonance parameters for each isotope.
+/// * `temperature_k`        — Sample temperature for Doppler broadening.
+/// * `instrument`           — Instrument resolution parameters.
+/// * `thickness_atoms_barn`  — Sample thickness n×d (atoms/barn).  Must be > 0.
+/// * `cancel`               — Optional cancellation token.
+///
+/// # Returns
+/// One effective cross-section vector per isotope on success.
+pub fn broadened_cross_sections_for_transmission(
+    energies: &[f64],
+    resonance_data: &[ResonanceData],
+    temperature_k: f64,
+    instrument: &InstrumentParams,
+    thickness_atoms_barn: f64,
+    cancel: Option<&AtomicBool>,
+) -> Result<Vec<Vec<f64>>, TransmissionError> {
+    if !energies.windows(2).all(|w| w[0] <= w[1]) {
+        return Err(ResolutionError::UnsortedEnergies.into());
+    }
+
+    let ext_grid = build_aux_grid(energies, Some(instrument), resonance_data);
+    let nd = thickness_atoms_barn;
+
+    let result: Result<Vec<Vec<f64>>, TransmissionError> = resonance_data
+        .par_iter()
+        .map(|rd| {
+            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                return Err(TransmissionError::Cancelled);
+            }
+
+            let (ext_energies, data_indices) = ext_grid
+                .as_ref()
+                .expect("instrument provided but no ext grid built");
+
+            // 1. Unbroadened cross sections on extended grid.
+            let unbroadened: Vec<f64> = ext_energies
+                .iter()
+                .map(|&e| reich_moore::cross_sections_at_energy(rd, e).total)
+                .collect();
+
+            // 2. Doppler broadening.
+            let after_doppler = if temperature_k > 0.0 {
+                let params = DopplerParams::new(temperature_k, rd.awr)?;
+                doppler::doppler_broaden(ext_energies, &unbroadened, &params)?
+            } else {
+                unbroadened
+            };
+
+            // 3. Convert to transmission: T = exp(-nd × σ_D).
+            let transmission: Vec<f64> = after_doppler
+                .iter()
+                .map(|&sigma| (-nd * sigma).exp())
+                .collect();
+
+            // 4. Resolution-broaden T.
+            let t_broadened = resolution::apply_resolution_presorted(
+                ext_energies,
+                &transmission,
+                &instrument.resolution,
+            );
+
+            // 5. Convert back to effective σ: σ_eff = -ln(T_broad) / nd.
+            let sigma_eff: Vec<f64> = data_indices
+                .iter()
+                .map(|&i| {
+                    let t = t_broadened[i].max(1e-30); // Prevent ln(0)
+                    -t.ln() / nd
+                })
+                .collect();
+
+            Ok(sigma_eff)
+        })
+        .collect();
+
+    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+        return Err(TransmissionError::Cancelled);
+    }
+
+    result
+}
+
 /// Compute broadened cross-sections and their temperature derivative.
 ///
 /// Returns `(sigma_k, dsigma_k_dT)` where `sigma_k[k][e]` is the
@@ -854,6 +1017,7 @@ mod tests {
                 rml: None,
                 urr: None,
                 ap_table: None,
+                r_external: vec![],
             }],
         }
     }
@@ -1035,6 +1199,7 @@ mod tests {
                 rml: None,
                 urr: None,
                 ap_table: None,
+                r_external: vec![],
             }],
         };
 

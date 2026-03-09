@@ -390,6 +390,7 @@ fn parse_bw_range(
         l_groups,
         rml: None,
         urr: None,
+        r_external: vec![],
     })
 }
 
@@ -481,6 +482,7 @@ fn parse_reich_moore_range(
         l_groups,
         rml: None,
         urr: None,
+        r_external: vec![],
     })
 }
 
@@ -843,6 +845,7 @@ fn parse_rmatrix_limited_range(
         l_groups: Vec::new(),
         rml: Some(Box::new(rml)),
         urr: None,
+        r_external: vec![],
     })
 }
 
@@ -1370,6 +1373,7 @@ fn parse_urr_range(
                         l_groups: Vec::new(),
                         rml: None,
                         urr: None,
+                        r_external: vec![],
                     });
                 }
 
@@ -1460,6 +1464,7 @@ fn parse_urr_range(
         l_groups: Vec::new(),
         rml: None,
         urr: Some(Box::new(urr)),
+        r_external: vec![],
     })
 }
 

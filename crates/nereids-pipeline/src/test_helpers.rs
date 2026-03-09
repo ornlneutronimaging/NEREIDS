@@ -40,6 +40,7 @@ pub fn w182_single_resonance() -> ResonanceData {
             rml: None,
             urr: None,
             ap_table: None,
+            r_external: vec![],
         }],
     }
 }
@@ -79,6 +80,7 @@ pub fn u238_single_resonance() -> ResonanceData {
             rml: None,
             urr: None,
             ap_table: None,
+            r_external: vec![],
         }],
     }
 }

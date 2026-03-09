@@ -11,6 +11,8 @@
 //! - **Xcoef 4-point quadrature** (Eq. IV B 3.8) for integration weights
 //! - **Gaussian + exponential tail kernel** (Iesopr=3) when Deltae > 0
 //! - **Exerfc scaled complementary error function** for numerical stability
+//! - **Beer-Lambert-aware broadening** for transmission cases (broadens T, not σ)
+//! - **R-external background R-matrix** for distant resonance contributions
 //!
 //! The remaining errors come from:
 //!
@@ -18,26 +20,25 @@
 //!    activates HEGA (Gaussian approximation in E-space).  NEREIDS always uses
 //!    exact FGM (velocity-space convolution).  Affects tr006, tr008.
 //!
-//! 2. **Sparse grid + wide resonances** — When few points fall in the
-//!    convolution window (high energy), even with Xcoef quadrature, the
-//!    discrete integration struggles near sharp resonance peaks.
+//! 2. **Discrete quadrature** — Sparse grids at high energy have few points
+//!    per convolution window, limiting integration accuracy near resonance peaks.
 //!
-//! | Category | Cases | Mean | Max | Dominant Error Source |
-//! |----------|-------|------|-----|---------------------|
-//! | FGM + Gauss, dense grid | tr015, tr016 | <9% | <21% | Discrete convolution |
-//! | FGM + Gauss, sparse grid | tr004 | <5% | <28% | Sparse-grid convolution |
-//! | HEGA Doppler + Gaussian | tr006 | <4% | <23% | Doppler method mismatch |
-//! | FGM + HEGA, no Doppler | tr008 | <4% | <27% | HEGA vs FGM difference |
-//! | FGM + Gauss + Exp tail | tr007, tr047 | <10% | <55% | Resonance peak sampling |
-//! | FGM + Gauss + Exp, sparse | tr029, tr030 | <21% | <145% | Sparse grid + exp tail |
-//! | 3-ch fission, unbroadened | tr028, tr018 | <0.1% | <0.5% | Direct R-matrix (exact) |
-//! | 3-ch fission, broadened | tr019 | <2% | <21% | Resonance peak sampling |
-//! | HEGA, Ni-58 180 keV | tr012, tr041 | <10% | <25% | Doppler method mismatch |
-//! | HEGA + Exp tail, Fe-56 1 keV | tr022 | <12% | <55% | Resonance peak sampling |
-//! | HEGA, Fe-56 1 keV (MLBW cmp) | tr025 | <10% | <30% | Doppler method mismatch |
-//! | Multi-isotope (3 sp), HEGA | tr010 | <1% | <8% | Doppler method mismatch |
-//! | Unbroadened reconstruction | tr037 | <0.1% | <1% | Direct R-matrix (exact) |
-//! | Multi-isotope (2 sp), Gauss | tr040 | <50% | <400% | Sparse-grid broadening (P2) |
+//! | Category | Cases | Mean | Dominant Error Source |
+//! |----------|-------|------|---------------------|
+//! | FGM + Gauss, dense (BL) | tr015, tr016 | <0.1% | Beer-Lambert path (exact) |
+//! | FGM + Gauss, sparse | tr004 | <3.4% | Sparse-grid convolution |
+//! | HEGA Doppler + Gaussian | tr006 | <3.3% | Doppler method mismatch |
+//! | FGM + HEGA, no Doppler | tr008 | <3.0% | HEGA vs FGM difference |
+//! | FGM + Gauss + Exp tail | tr007, tr047 | <2.9% | Resonance peak sampling |
+//! | FGM + Gauss + Exp, sparse | tr029, tr030 | <2.5% | Sparse grid + exp tail |
+//! | 3-ch fission, unbroadened | tr028, tr018 | <0.1% | Direct R-matrix (exact) |
+//! | 3-ch fission, broadened | tr019 | <1.7% | Resonance peak sampling |
+//! | FGM + Gauss (BL), Ni-58 | tr012, tr041 | <0.1% | Beer-Lambert path (exact) |
+//! | HEGA + Exp tail, Fe-56 | tr022 | <1.6% | Resonance peak sampling |
+//! | HEGA, Fe-56 (MLBW cmp) | tr025 | <1.6% | Doppler method mismatch |
+//! | Multi-isotope (3 sp), HEGA | tr010 | <0.62% | Doppler method mismatch |
+//! | Unbroadened reconstruction | tr037 | <0.1% | Direct R-matrix (exact) |
+//! | Multi-isotope + R-ext, Gauss | tr040 | <1.1% | R-external + multi-isotope |
 //!
 //! ## Reference
 //! SAMMY source: `../SAMMY/SAMMY/sammy/samtry/`
@@ -193,6 +194,11 @@ fn build_instrument_params(inp: &SammyInpConfig) -> Option<InstrumentParams> {
 }
 
 /// Compare NEREIDS broadened cross-sections against SAMMY Th_initial reference.
+///
+/// For transmission data with resolution broadening, uses SAMMY's Beer-Lambert-
+/// aware pipeline: resolution-broaden T = exp(-nd×σ_D), then convert back to
+/// σ_eff = -ln(T_broad)/nd.  This correctly accounts for Jensen's inequality
+/// (convex exponential makes direct σ broadening overestimate peaks).
 fn validate_broadened_cross_sections(
     inp: &SammyInpConfig,
     par: &SammyParFile,
@@ -212,15 +218,33 @@ fn validate_broadened_cross_sections(
     // Build resolution parameters from SAMMY .inp config.
     let instrument = build_instrument_params(inp);
 
-    // Compute broadened cross-sections (Doppler + Gaussian resolution).
-    let broadened = transmission::broadened_cross_sections(
-        &energies,
-        &[resonance_data],
-        inp.temperature_k,
-        instrument.as_ref(),
-        None, // No cancellation.
-    )
-    .unwrap();
+    // For transmission data with resolution broadening: use Beer-Lambert-aware
+    // pipeline (resolution-broaden T, not σ).  This matches SAMMY's pipeline
+    // where resolution broadening is applied after the exponential transmission
+    // conversion.
+    let nd = inp.thickness_atoms_barn;
+    let use_transmission_path = instrument.is_some() && nd > 0.0;
+
+    let broadened = if use_transmission_path {
+        transmission::broadened_cross_sections_for_transmission(
+            &energies,
+            &[resonance_data],
+            inp.temperature_k,
+            instrument.as_ref().unwrap(),
+            nd,
+            None,
+        )
+        .unwrap()
+    } else {
+        transmission::broadened_cross_sections(
+            &energies,
+            &[resonance_data],
+            inp.temperature_k,
+            instrument.as_ref(),
+            None,
+        )
+        .unwrap()
+    };
 
     let xs_total = &broadened[0]; // Single isotope.
 
@@ -289,17 +313,32 @@ fn validate_transmission(
 
     // Broadened cross-sections with resolution.
     let instrument = build_instrument_params(inp);
-    let broadened = transmission::broadened_cross_sections(
-        &energies,
-        &[resonance_data],
-        inp.temperature_k,
-        instrument.as_ref(),
-        None,
-    )
-    .unwrap();
+    let nd = inp.thickness_atoms_barn;
+    let use_transmission_path = instrument.is_some() && nd > 0.0;
 
-    // Beer-Lambert transmission: T = exp(-n * σ)
-    let trans = transmission::beer_lambert(&broadened[0], inp.thickness_atoms_barn);
+    let broadened = if use_transmission_path {
+        transmission::broadened_cross_sections_for_transmission(
+            &energies,
+            &[resonance_data],
+            inp.temperature_k,
+            instrument.as_ref().unwrap(),
+            nd,
+            None,
+        )
+        .unwrap()
+    } else {
+        transmission::broadened_cross_sections(
+            &energies,
+            &[resonance_data],
+            inp.temperature_k,
+            instrument.as_ref(),
+            None,
+        )
+        .unwrap()
+    };
+
+    // Beer-Lambert transmission: T = exp(-n * σ_eff)
+    let trans = transmission::beer_lambert(&broadened[0], nd);
 
     let trans_map: std::collections::HashMap<u64, f64> = energies
         .iter()
@@ -420,10 +459,10 @@ fn test_tr007_fe56_broadened() {
     // FGM Doppler + Gaussian+exponential resolution broadening.
     // Dense grid at low energy (1.13-1.17 keV) means quadrature error is
     // negligible.  Remaining error is from FGM vs HEGA Doppler difference.
-    // Measured: 9.1% mean.
+    // Measured: 2.9% mean.
     assert!(
-        result.mean_rel_error < 0.10,
-        "broadened mean error {:.4} > 10%",
+        result.mean_rel_error < 0.04,
+        "broadened mean error {:.4} > 4%",
         result.mean_rel_error
     );
 }
@@ -641,14 +680,10 @@ fn test_tr015_ni58_broadened() {
         result.n_above_threshold,
         result.worst_energy_kev
     );
-    // tr015: Deltae=0, FGM Doppler + pure Gaussian resolution.  Narrow range
-    // (180-181 keV) with ~28 points.  PW-linear broadening + adaptive
-    // intermediates reduced error from 8.4% to 8.5%.  Remaining error is
-    // from FGM vs HEGA Doppler difference (SAMMY uses HEGA for tr015).
-    // Measured: 8.5% mean.
+    // Measured: 0.06% mean (Beer-Lambert path: resolution-broadens T, not σ).
     assert!(
-        result.mean_rel_error < 0.09,
-        "broadened mean error {:.4} > 9%",
+        result.mean_rel_error < 0.002,
+        "broadened mean error {:.4} > 0.2%",
         result.mean_rel_error
     );
 }
@@ -690,10 +725,10 @@ fn test_tr016_ni58_broadened() {
     // tr016: Deltae=0, FGM Doppler + pure Gaussian resolution.  Wider range
     // (180-183 keV) with ~56 points — same mechanism as tr015 but with more
     // grid points, hence slightly lower error.
-    // Measured: 6.5% mean.
+    // Measured: 0.06% mean.
     assert!(
-        result.mean_rel_error < 0.08,
-        "broadened mean error {:.4} > 8%",
+        result.mean_rel_error < 0.002,
+        "broadened mean error {:.4} > 0.2%",
         result.mean_rel_error
     );
 }
@@ -736,10 +771,10 @@ fn test_tr029_ni58_broadened() {
     // Wide range (40-53k eV) with 1032 points — good grid density at lower
     // energies where most resonances live.  Boundary extension improves
     // edge effects.  Error from sparse grid at high energies + Doppler.
-    // Measured: 5.0% mean.
+    // Measured: 0.63% mean.
     assert!(
-        result.mean_rel_error < 0.06,
-        "broadened mean error {:.4} > 6%",
+        result.mean_rel_error < 0.01,
+        "broadened mean error {:.4} > 1%",
         result.mean_rel_error
     );
 }
@@ -783,10 +818,10 @@ fn test_tr030_ni58_broadened() {
     // via negative spin group).  The exponential tail's relative effect is
     // amplified when few resonances contribute.  Boundary extension helps but
     // exp tail quadrature on coarse grids remains a limitation.
-    // Measured: 20.5% mean.
+    // Measured: 2.5% mean.
     assert!(
-        result.mean_rel_error < 0.22,
-        "broadened mean error {:.4} > 22%",
+        result.mean_rel_error < 0.04,
+        "broadened mean error {:.4} > 4%",
         result.mean_rel_error
     );
 }
@@ -928,6 +963,13 @@ fn validate_cross_sections_multi(
     let abundances: Vec<f64> = multi.iter().map(|(_, ab)| *ab).collect();
 
     // Compute broadened cross-sections per isotope.
+    //
+    // Note: Beer-Lambert resolution broadening is NOT used here because
+    // for multi-isotope cases, per-isotope Beer-Lambert is physically wrong.
+    // The correct approach (resolution-broaden total T) requires knowing
+    // the densities, which are not available at precomputation time.
+    // The R-external contribution (implemented in the R-matrix) handles
+    // the dominant error source for multi-isotope high-energy cases (tr040).
     let broadened = transmission::broadened_cross_sections(
         &energies,
         &resonance_data_vec,
@@ -1376,10 +1418,10 @@ fn test_tr012_ni58_broadened() {
     // Ni-58, HEGA Doppler broadened at 180–181 keV.
     // Similar to tr015/tr016 (same isotope, nearby energy).
     // PW-linear + intermediates improved resolution accuracy.
-    // Measured: 8.3% mean.
+    // Measured: 0.07% mean.
     assert!(
-        result.mean_rel_error < 0.09,
-        "broadened mean error {:.4} >= 9%",
+        result.mean_rel_error < 0.002,
+        "broadened mean error {:.4} >= 0.2%",
         result.mean_rel_error
     );
 }
@@ -1697,15 +1739,10 @@ fn test_tr040_fe54_broadened() {
         result.n_above_threshold,
         result.worst_energy_kev
     );
-    // Fe-54 multi-isotope at 890–1000 keV: very high energy regime where
-    // Doppler + Gaussian resolution broadening shows ~40% mean discrepancy
-    // against SAMMY.  Peak shapes are correct but differ at resonance peaks.
-    // Known limitation: minor isotope (0.0268) has 0 resonances in the .par,
-    // contributing only potential scattering.  High-energy broadening accuracy
-    // is deferred (P2).
+    // Measured: 1.1% mean.
     assert!(
-        result.mean_rel_error < 0.50,
-        "broadened multi mean error {:.4} >= 50%",
+        result.mean_rel_error < 0.02,
+        "broadened multi mean error {:.4} >= 2%",
         result.mean_rel_error
     );
 }
@@ -1748,10 +1785,10 @@ fn test_tr041_ni58_broadened() {
     // Ni-58 IPQ broadened at 180–181 keV.
     // Generated .plt reference from SAMMY run.
     // IPQ method is specific to SAMMY fitting; reference is Th_initial.
-    // PW-linear + intermediates: 8.3% mean (same as tr012).
+    // Measured: 0.06% mean.
     assert!(
-        result.mean_rel_error < 0.09,
-        "broadened mean error {:.4} >= 9%",
+        result.mean_rel_error < 0.002,
+        "broadened mean error {:.4} >= 0.2%",
         result.mean_rel_error
     );
 }
