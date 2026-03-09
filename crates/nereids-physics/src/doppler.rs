@@ -31,6 +31,8 @@ use std::fmt;
 
 use nereids_core::constants::{self, DIVISION_FLOOR, NEAR_ZERO_FLOOR};
 
+use crate::resolution::exerfc;
+
 /// Number of standard deviations beyond the velocity range for the FGM
 /// integration window.  The Gaussian kernel exp(-arg²) contributes less
 /// than exp(-36) ≈ 2.3e-16 outside this window, which is below f64
@@ -156,6 +158,27 @@ impl DopplerParams {
     #[must_use]
     pub fn doppler_width(&self, energy_ev: f64) -> f64 {
         (4.0 * constants::BOLTZMANN_EV_PER_K * self.temperature_k * energy_ev / self.awr).sqrt()
+    }
+}
+
+/// √π constant for erfc computation.
+const SQRT_PI: f64 = 1.772_453_850_905_516;
+
+/// Complementary error function erfc(x) = 1 - erf(x).
+///
+/// For x ≥ 0: uses the scaled complementary error function `exerfc`
+/// (SAMMY `fnc/exerfc.f90`):
+///   erfc(x) = exp(-x²) · exerfc(x) / √π
+///
+/// For x < 0: uses the identity erfc(-|x|) = 2 - erfc(|x|) to avoid
+/// the `exerfc` negative-argument branch, which has a numerical issue
+/// for |x| > 5.01 (missing exp(x²) factor in the large-|x| path).
+fn erfc_val(x: f64) -> f64 {
+    if x >= 0.0 {
+        (-x * x).exp() * exerfc(x) / SQRT_PI
+    } else {
+        let xp = -x;
+        2.0 - (-xp * xp).exp() * exerfc(xp) / SQRT_PI
     }
 }
 
@@ -299,16 +322,15 @@ pub fn doppler_broaden(
     //
     //   σ_D(E) = (1/E) × [Σ w_norm_i × v_i² × σ(E_i)]
     //
-    // where w_norm_i are Gaussian weights normalized to sum to 1,
-    // v_i = ext_v[i], and σ(E_i) is the cross-section at E_i = v_i².
+    // where w_norm_i are exact Gaussian interval weights, v_i = ext_v[i],
+    // and σ(E_i) is the cross-section at E_i = v_i².
     //
-    // For negative velocities: E_i = v_i², σ(E_i) is the cross-section
-    // at energy v_i² (same as for positive v_i).
+    // Weights are computed via error function differences (exact integral
+    // of the Gaussian kernel over each Voronoi cell), matching SAMMY's
+    // approach in `fgm/mfgm2.f90` (Modsmp/Modfpl).  This is dramatically
+    // more accurate than point-evaluation × trapezoidal on non-uniform grids.
     //
-    // Instead of pre-allocating an ext_sigma Vec, we compute σ on-the-fly.
-    // ext_y stores |w|×σ(w²), so:
-    //   v_j² × σ(E_j) = v_j² × ext_y[j] / |v_j| = |v_j| × ext_y[j]
-    // At v=0: v_j² × σ(E_j) = 0 regardless, and |v_j| × ext_y[j] = 0.
+    // ext_y stores |w|×σ(w²), so v_j² × σ(E_j) = |v_j| × ext_y[j].
 
     let mut broadened = vec![0.0f64; n];
 
@@ -329,37 +351,66 @@ pub fn doppler_broaden(
         let j_lo = ext_v.partition_point(|&w| w < v_lo);
         let j_hi = ext_v.partition_point(|&w| w <= v_hi);
 
-        // Single-pass accumulation: compute Gaussian-weighted sum and
-        // normalisation simultaneously, avoiding a per-point Vec allocation.
-        // Weight_j = exp(-(v - w_j)²/u²) × (dw_j)
-        // where dw_j is the trapezoidal width at point j.
+        if j_lo >= j_hi {
+            broadened[i] = cross_sections[i];
+            continue;
+        }
+
+        // Exact Gaussian interval integration via error function differences.
+        //
+        // For each grid point j, the Voronoi cell is [left_j, right_j] where
+        // left_j = midpoint to previous grid point, right_j = midpoint to next.
+        // The weight is the exact integral of the Gaussian kernel over this cell:
+        //   weight_j = [erf((v-left_j)/u) - erf((v-right_j)/u)] / 2
+        //            = [erfc((v-right_j)/u) - erfc((v-left_j)/u)] / 2
+        //
+        // The erfc form avoids 1−1 cancellation in the tails.  Consecutive
+        // cells share a boundary, so we propagate erfc values incrementally
+        // (N+1 erfc evaluations for N points).
+        //
+        // SAMMY Ref: `fgm/mfgm2.f90` Modsmp (forms Gaussian Doppler weights
+        // via error function differences, normalizes, multiplies by v²).
         let mut sum_weights = 0.0f64;
         let mut result = 0.0f64;
 
-        // The binary-search window [v_lo, v_hi] guarantees |arg| ≤ DOPPLER_N_SIGMA = 6,
-        // so arg² ≤ 36.  No additional arg² > 100 guard is needed.
+        // Left boundary of first cell in the window.
+        let first_left = if j_lo > 0 {
+            (ext_v[j_lo - 1] + ext_v[j_lo]) * 0.5
+        } else {
+            // First grid point: extrapolate half an interval.
+            ext_v[0]
+                - if n_ext > 1 {
+                    (ext_v[1] - ext_v[0]) * 0.5
+                } else {
+                    u * 0.5
+                }
+        };
+        let mut erfc_left = erfc_val((v - first_left) / u);
+
         for j in j_lo..j_hi {
-            let arg = (v - ext_v[j]) / u;
-            let g = (-arg * arg).exp();
-
-            // Trapezoidal half-widths
-            let dw_left = if j > 0 {
-                (ext_v[j] - ext_v[j - 1]) * 0.5
+            // Right boundary of Voronoi cell j.
+            let cell_right = if j < n_ext - 1 {
+                (ext_v[j] + ext_v[j + 1]) * 0.5
             } else {
-                0.0
+                // Last grid point: extrapolate half an interval.
+                ext_v[n_ext - 1]
+                    + if n_ext > 1 {
+                        (ext_v[n_ext - 1] - ext_v[n_ext - 2]) * 0.5
+                    } else {
+                        u * 0.5
+                    }
             };
-            let dw_right = if j < n_ext - 1 {
-                (ext_v[j + 1] - ext_v[j]) * 0.5
-            } else {
-                0.0
-            };
-            let dw = dw_left + dw_right;
+            let erfc_right = erfc_val((v - cell_right) / u);
 
-            let w = g * dw;
+            // weight = [erfc(arg_right) - erfc(arg_left)] / 2 > 0
+            // (erfc is decreasing, and arg_right < arg_left since cell_right > cell_left)
+            let w = (erfc_right - erfc_left) * 0.5;
+
             sum_weights += w;
-            // v_j² × σ(E_j) = |v_j| × ext_y[j], computed on-the-fly
-            // (see comment above the outer loop for the derivation).
             result += w * ext_v[j].abs() * ext_y[j];
+
+            // Right boundary of cell j = left boundary of cell j+1.
+            erfc_left = erfc_right;
         }
 
         if sum_weights < DIVISION_FLOOR {

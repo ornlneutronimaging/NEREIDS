@@ -696,8 +696,24 @@ fn parse_spin_groups(lines: &[&str]) -> Result<(Vec<SammySpinGroup>, f64), Sammy
         let index: u32 = col(line, 0, 5)
             .parse()
             .map_err(|e| SammyParseError::new(format!("spin group index: {e}")))?;
-        let n_ent: u32 = col(line, 5, 10).parse().unwrap_or(1);
-        let n_exit: u32 = col(line, 10, 15).parse().unwrap_or(0);
+        let n_ent: u32 = {
+            let s = col(line, 5, 10);
+            if s.is_empty() {
+                1
+            } else {
+                s.parse()
+                    .map_err(|e| SammyParseError::new(format!("spin group n_ent ({s:?}): {e}")))?
+            }
+        };
+        let n_exit: u32 = {
+            let s = col(line, 10, 15);
+            if s.is_empty() {
+                0
+            } else {
+                s.parse()
+                    .map_err(|e| SammyParseError::new(format!("spin group n_exit ({s:?}): {e}")))?
+            }
+        };
         let j: f64 = col(line, 15, 20)
             .parse()
             .map_err(|e| SammyParseError::new(format!("spin group J: {e}")))?;

@@ -322,73 +322,37 @@ fn compute_xcoef_weights(energies: &[f64]) -> Vec<f64> {
         return vec![1.0];
     }
 
+    // Trapezoidal (midpoint Voronoi cell) weights.
+    //
+    // w[j] = (E[j+1] - E[j-1]) / 2 for interior points,
+    // with half-intervals at boundaries.
+    //
+    // These are always positive and robust on non-uniform grids.
+    // Used only for the exponential tail path where erf-based exact
+    // integration is not available.
     let mut weights = vec![0.0f64; n];
-
-    // Sliding window of 5 energies: e[0]..e[4] centered around point k.
-    // Padded with 0.0 at boundaries (matching SAMMY's convention).
-    let mut e = [0.0f64; 5];
-    e[3] = energies[0];
-    e[4] = if n > 1 { energies[1] } else { 0.0 };
-
-    for k in 0..n {
-        // Shift window left
-        e[0] = e[1];
-        e[1] = e[2];
-        e[2] = e[3];
-        e[3] = e[4];
-        e[4] = if k + 2 < n { energies[k + 2] } else { 0.0 };
-
-        // Spacings
-        let v1 = e[1] - e[0];
-        let v2 = e[2] - e[1];
-        let v3 = e[3] - e[2];
-        let v4 = e[4] - e[3];
-
-        let mut a = [0.0f64; 6];
-
-        // A[0] = dx(k-2), only for k >= 2
-        if k >= 2 {
-            a[0] = v1;
-
-            // A[4] = x2(k-2) = (v3² - v1²) / v2
-            if v2.abs() > NEAR_ZERO_FLOOR {
-                a[4] = (v3 * v3 - v1 * v1) / v2;
-            }
-        }
-
-        // A[1] = 5·dx(k-1), only for k >= 1
-        if k >= 1 {
-            a[1] = 5.0 * v2;
-
-            // A[5] = -x2(k-1) = -(v4² - v2²) / v3
-            if v3.abs() > NEAR_ZERO_FLOOR {
-                a[5] = -(v4 * v4 - v2 * v2) / v3;
-            }
-        }
-
-        // A[2] = 5·dx(k), only for k < n-1
-        if k < n - 1 {
-            a[2] = 5.0 * v3;
-        }
-
-        // A[3] = dx(k+1), only for k < n-2
-        if k < n - 2 {
-            a[3] = v4;
-        }
-
-        // Boundary adjustments (matching SAMMY's DopplerAndResolutionBroadener.cpp)
-        if k == n - 2 {
-            a[5] = 0.0;
-        }
-        if k == n - 1 {
-            a[4] = 0.0;
-            a[5] = 0.0;
-        }
-
-        weights[k] = a.iter().sum();
+    weights[0] = energies[1] - energies[0];
+    for k in 1..n - 1 {
+        weights[k] = (energies[k + 1] - energies[k - 1]) * 0.5;
     }
+    weights[n - 1] = energies[n - 1] - energies[n - 2];
 
     weights
+}
+
+/// Compute erfc(x) using the existing `exerfc` function.
+///
+/// erfc(x) = exp(-x²) · exerfc(x) / √π
+///
+/// For x < 0: erfc(-|x|) = 2 - erfc(|x|)
+fn erfc_from_exerfc(x: f64) -> f64 {
+    const SQRT_PI: f64 = 1.772_453_850_905_516;
+    if x >= 0.0 {
+        (-x * x).exp() * exerfc(x) / SQRT_PI
+    } else {
+        let xp = -x;
+        2.0 - (-xp * xp).exp() * exerfc(xp) / SQRT_PI
+    }
 }
 
 // ─── Scaled complementary error function ───────────────────────────────────────
@@ -399,7 +363,7 @@ fn compute_xcoef_weights(energies: &[f64]) -> Vec<f64> {
 ///
 /// Uses rational approximation for |x| < 5.01 and asymptotic expansion
 /// (Abramowitz & Stegun 7.1.23) for |x| >= 5.01.
-fn exerfc(x: f64) -> f64 {
+pub(crate) fn exerfc(x: f64) -> f64 {
     const SQRT_PI: f64 = 1.772_453_850_905_516;
     const TWO_SQRT_PI: f64 = 3.544_907_701_811_032;
     const XMAX: f64 = 5.01;
@@ -601,8 +565,12 @@ pub(crate) fn resolution_broaden_presorted(
         return vec![];
     }
 
-    let xcoef = compute_xcoef_weights(energies);
     let use_exp_tail = params.has_exponential_tail();
+    let xcoef = if use_exp_tail {
+        compute_xcoef_weights(energies)
+    } else {
+        vec![]
+    };
     let n_sigma = 5.0; // Integrate out to 5σ for Gaussian
     let mut broadened = vec![0.0f64; n];
 
@@ -619,7 +587,6 @@ pub(crate) fn resolution_broaden_presorted(
         let (e_low, e_high) = if use_exp_tail {
             let widexp = params.exp_width(e);
             if widexp < NEAR_ZERO_FLOOR {
-                // Fall back to pure Gaussian
                 (e - n_sigma * widgau, e + n_sigma * widgau)
             } else {
                 // SAMMY Ref: mrsl4.f90 lines 57-65
@@ -641,10 +608,7 @@ pub(crate) fn resolution_broaden_presorted(
         let j_lo = energies.partition_point(|&ej| ej < e_low);
         let j_hi = energies.partition_point(|&ej| ej <= e_high);
 
-        if j_hi <= j_lo + 1 {
-            // Need at least 2 points for any meaningful integration.
-            // With only 1 point (delta convolution), the original value is correct.
-            // With 2+ points, Xcoef weights are precomputed and valid.
+        if j_hi.saturating_sub(j_lo) <= 1 {
             broadened[i] = cross_sections[i];
             continue;
         }
@@ -656,6 +620,7 @@ pub(crate) fn resolution_broaden_presorted(
             let widexp = params.exp_width(e);
             if widexp > NEAR_ZERO_FLOOR {
                 // Combined Gaussian + exponential kernel (SAMMY Iesopr=3)
+                // Trapezoidal quadrature: w_j × K(E_j) × σ(E_j)
                 // SAMMY Ref: mrsl1.f90 lines 455-484
                 let c = widgau * 0.5 / widexp;
                 let est = shftge(c, widgau);
@@ -671,24 +636,71 @@ pub(crate) fn resolution_broaden_presorted(
                     norm += wt;
                 }
             } else {
-                // Widexp ≈ 0, fall back to pure Gaussian with Xcoef weights
-                for j in j_lo..j_hi {
-                    let arg = (energies[j] - e) / widgau;
-                    let g = (-arg * arg).exp();
-                    let wt = xcoef[j] * g;
-                    sum += wt * cross_sections[j];
-                    norm += wt;
+                // Widexp ≈ 0, fall back to pure Gaussian with piecewise-linear
+                let inv_w = 1.0 / widgau;
+                for j in j_lo..j_hi.saturating_sub(1) {
+                    let e_j = energies[j];
+                    let e_j1 = energies[j + 1];
+                    let h = e_j1 - e_j;
+                    if h < NEAR_ZERO_FLOOR {
+                        continue;
+                    }
+                    let a_j = (e_j - e) * inv_w;
+                    let a_j1 = (e_j1 - e) * inv_w;
+                    let erfc_aj = erfc_from_exerfc(a_j);
+                    let erfc_aj1 = erfc_from_exerfc(a_j1);
+                    let i0 = erfc_aj - erfc_aj1;
+                    if i0 < NEAR_ZERO_FLOOR {
+                        continue;
+                    }
+                    let i1 = ((-a_j * a_j).exp() - (-a_j1 * a_j1).exp()) * 0.5;
+                    let slope = (cross_sections[j + 1] - cross_sections[j]) / h;
+                    sum += cross_sections[j] * i0 + slope * widgau * (i1 - a_j * i0);
+                    norm += i0;
                 }
             }
         } else {
-            // Pure Gaussian kernel with Xcoef weights (SAMMY Iesopr=1)
-            // SAMMY Ref: mrsl1.f90 lines 422-435
-            for j in j_lo..j_hi {
-                let arg = (energies[j] - e) / widgau;
-                let g = (-arg * arg).exp();
-                let wt = xcoef[j] * g;
-                sum += wt * cross_sections[j];
-                norm += wt;
+            // Pure Gaussian kernel with piecewise-linear exact integration.
+            //
+            // For each interval [E_j, E_{j+1}], integrate G(E_i - E') × σ_linear(E')
+            // exactly using:
+            //   I₀ = erf(a_{j+1}) - erf(a_j)      [Gaussian integral over interval]
+            //   I₁ = (exp(-a_j²) - exp(-a_{j+1}²))/2  [first moment, closed form]
+            //
+            // Contribution = σ_j × I₀ + slope × W × (I₁ - a_j × I₀)
+            // where slope = (σ_{j+1} - σ_j) / (E_{j+1} - E_j), a_j = (E_j - E_i)/W.
+            //
+            // This captures linear cross-section variation within each interval,
+            // giving second-order accuracy vs zeroth-order (midpoint) erf weights.
+            let inv_w = 1.0 / widgau;
+            for j in j_lo..j_hi.saturating_sub(1) {
+                let e_j = energies[j];
+                let e_j1 = energies[j + 1];
+                let h = e_j1 - e_j;
+                if h < NEAR_ZERO_FLOOR {
+                    continue;
+                }
+
+                let a_j = (e_j - e) * inv_w;
+                let a_j1 = (e_j1 - e) * inv_w;
+
+                // I₀ = erf(a_{j+1}) - erf(a_j) = erfc(a_j) - erfc(a_{j+1})
+                let erfc_aj = erfc_from_exerfc(a_j);
+                let erfc_aj1 = erfc_from_exerfc(a_j1);
+                let i0 = erfc_aj - erfc_aj1;
+
+                if i0 < NEAR_ZERO_FLOOR {
+                    continue;
+                }
+
+                // I₁ = (exp(-a_j²) - exp(-a_{j+1}²)) / 2
+                let i1 = ((-a_j * a_j).exp() - (-a_j1 * a_j1).exp()) * 0.5;
+
+                let slope = (cross_sections[j + 1] - cross_sections[j]) / h;
+
+                // σ_j × I₀ + slope × W × (I₁ - a_j × I₀)
+                sum += cross_sections[j] * i0 + slope * widgau * (i1 - a_j * i0);
+                norm += i0;
             }
         }
 

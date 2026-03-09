@@ -21,6 +21,7 @@
 //! - Resolution: `convolution/` module, manual Sec 3.2
 //! - Transmission: `cro/`, `xxx/` modules, manual Sec 2, Sec 5
 
+pub mod auxiliary_grid;
 pub mod channel;
 pub mod coulomb;
 pub mod doppler;
