@@ -869,7 +869,25 @@ pub fn sammy_to_resonance_data_multi(
             group_order.push(key.clone());
         }
         group_members.entry(key.clone()).or_default().push(i);
+        if let Some(&existing) = group_abundance.get(&key) {
+            debug_assert!(
+                (existing - sg.abundance).abs() < 1e-12,
+                "spin groups in isotope group '{}' disagree on abundance: {} vs {}",
+                key,
+                existing,
+                sg.abundance
+            );
+        }
         group_abundance.insert(key.clone(), sg.abundance);
+        if let Some(&existing) = group_target_spin.get(&key) {
+            debug_assert!(
+                (existing - sg.target_spin).abs() < 1e-12,
+                "spin groups in isotope group '{}' disagree on target_spin: {} vs {}",
+                key,
+                existing,
+                sg.target_spin
+            );
+        }
         group_target_spin.insert(key.clone(), sg.target_spin);
     }
 
@@ -981,7 +999,7 @@ pub fn sammy_to_resonance_data_multi(
 /// For natural-element symbols like "NatFE", A=0 is returned (no specific
 /// mass number).  Space-separated labels like "CU 65" are handled by
 /// stripping internal spaces.
-pub fn parse_isotope_symbol(symbol: &str) -> Result<(u32, u32), SammyParseError> {
+pub(crate) fn parse_isotope_symbol(symbol: &str) -> Result<(u32, u32), SammyParseError> {
     // Strip internal spaces (handles "CU 65" → "CU65").
     let joined: String = symbol.chars().filter(|c| !c.is_whitespace()).collect();
     let s = joined.to_uppercase();

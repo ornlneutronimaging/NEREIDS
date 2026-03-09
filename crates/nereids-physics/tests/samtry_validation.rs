@@ -885,6 +885,16 @@ fn validate_cross_sections_multi(
     reference: &[SammyPltRecord],
     tolerance_rel: f64,
 ) -> ValidationResult {
+    if reference.is_empty() {
+        return ValidationResult {
+            max_rel_error: 0.0,
+            mean_rel_error: 0.0,
+            n_points: 0,
+            n_above_threshold: 0,
+            worst_energy_kev: 0.0,
+        };
+    }
+
     let multi = sammy_to_resonance_data_multi(inp, par).unwrap();
 
     // Build sorted energy grid from reference points.
@@ -978,6 +988,16 @@ fn validate_unbroadened_cross_sections_multi(
     reference: &[SammyPltRecord],
     tolerance_rel: f64,
 ) -> ValidationResult {
+    if reference.is_empty() {
+        return ValidationResult {
+            max_rel_error: 0.0,
+            mean_rel_error: 0.0,
+            n_points: 0,
+            n_above_threshold: 0,
+            worst_energy_kev: 0.0,
+        };
+    }
+
     let multi = sammy_to_resonance_data_multi(inp, par).unwrap();
 
     let mut max_rel_error = 0.0_f64;
