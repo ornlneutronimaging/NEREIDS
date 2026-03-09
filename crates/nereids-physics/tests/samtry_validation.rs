@@ -38,6 +38,7 @@
 use nereids_endf::sammy::{
     SammyInpConfig, SammyParFile, SammyPltRecord, parse_sammy_inp, parse_sammy_par,
     parse_sammy_plt, sammy_to_nereids_resolution, sammy_to_resonance_data,
+    sammy_to_resonance_data_multi,
 };
 use nereids_physics::reich_moore;
 use nereids_physics::resolution::{ResolutionFunction, ResolutionParams};
@@ -59,6 +60,11 @@ fn samtry_data_dir() -> PathBuf {
 }
 
 /// Load all files for a samtry test case.
+///
+/// The `.plt` energy column may be in eV or keV depending on the SAMMY run
+/// configuration.  This function detects the unit by comparing the plt energy
+/// range with the inp energy range (which is always in eV).  The returned
+/// `SammyPltRecord` values always have `energy_kev` in keV.
 fn load_samtry_case(
     test_id: &str,
     inp_name: &str,
@@ -76,7 +82,24 @@ fn load_samtry_case(
 
     let inp = parse_sammy_inp(&inp_content).unwrap();
     let par = parse_sammy_par(&par_content).unwrap();
-    let plt = parse_sammy_plt(&plt_content).unwrap();
+    let mut plt = parse_sammy_plt(&plt_content).unwrap();
+
+    // Detect plt energy unit: compare mid-point of plt range with inp Emin (eV).
+    // If plt values are ~1000× smaller than inp eV range → plt is in keV.
+    // If plt values are in the same range as inp eV range → plt is in eV.
+    if !plt.is_empty() {
+        let plt_mid = plt[plt.len() / 2].energy_kev; // raw value from parser
+        let inp_mid_ev = (inp.energy_min_ev + inp.energy_max_ev) / 2.0;
+        let ratio = plt_mid / inp_mid_ev; // close to 1.0 → eV, close to 0.001 → keV
+
+        if ratio > 0.5 {
+            // plt is in eV — convert to keV for consistency with the field name.
+            for rec in &mut plt {
+                rec.energy_kev /= 1000.0;
+            }
+        }
+        // else: plt is already in keV (the standard assumption).
+    }
 
     (inp, par, plt)
 }
@@ -845,6 +868,354 @@ fn test_tr028_pu241_unbroadened() {
     assert!(
         result.mean_rel_error > 0.50,
         "unbroadened mean error {:.4} <= 50% — multi-channel fission may now be supported, update test",
+        result.mean_rel_error
+    );
+}
+
+// ─── Batch B: Multi-isotope support (issue #325-B) ──────────────────────────
+
+/// Compare NEREIDS multi-isotope cross-sections against SAMMY reference.
+///
+/// Uses `sammy_to_resonance_data_multi` to split spin groups into per-isotope
+/// `ResonanceData`, computes broadened XS per isotope, then forms the
+/// abundance-weighted sum: σ_total(E) = Σ_i abundance_i · σ_i(E).
+fn validate_cross_sections_multi(
+    inp: &SammyInpConfig,
+    par: &SammyParFile,
+    reference: &[SammyPltRecord],
+    tolerance_rel: f64,
+) -> ValidationResult {
+    let multi = sammy_to_resonance_data_multi(inp, par).unwrap();
+
+    // Build sorted energy grid from reference points.
+    let mut energies: Vec<f64> = reference.iter().map(|r| r.energy_kev * 1000.0).collect();
+    let is_ascending = energies.windows(2).all(|w| w[0] <= w[1]);
+    if !is_ascending {
+        energies.sort_by(|a, b| a.total_cmp(b));
+    }
+
+    // Build resolution parameters from SAMMY .inp config.
+    let instrument = build_instrument_params(inp);
+
+    // Collect ResonanceData for broadened_cross_sections call.
+    let resonance_data_vec: Vec<_> = multi.iter().map(|(rd, _)| rd.clone()).collect();
+    let abundances: Vec<f64> = multi.iter().map(|(_, ab)| *ab).collect();
+
+    // Compute broadened cross-sections per isotope.
+    let broadened = transmission::broadened_cross_sections(
+        &energies,
+        &resonance_data_vec,
+        inp.temperature_k,
+        instrument.as_ref(),
+        None,
+    )
+    .unwrap();
+
+    // Abundance-weighted sum: σ_total[j] = Σ_i abundance_i · σ_i[j].
+    let n_points = energies.len();
+    let mut sigma_total = vec![0.0_f64; n_points];
+    for (i, xs_isotope) in broadened.iter().enumerate() {
+        for (j, &xs) in xs_isotope.iter().enumerate() {
+            sigma_total[j] += abundances[i] * xs;
+        }
+    }
+
+    // Build energy→σ map for lookup.
+    let xs_map: std::collections::HashMap<u64, f64> = energies
+        .iter()
+        .zip(sigma_total.iter())
+        .map(|(&e, &xs)| (e.to_bits(), xs))
+        .collect();
+
+    let mut max_rel_error = 0.0_f64;
+    let mut sum_rel_error = 0.0;
+    let mut n_above = 0;
+    let mut worst_energy_kev = 0.0;
+
+    for rec in reference {
+        let energy_ev = rec.energy_kev * 1000.0;
+        let nereids_total = *xs_map.get(&energy_ev.to_bits()).unwrap_or_else(|| {
+            panic!(
+                "Missing cross section for energy {} eV (energy grid mismatch)",
+                energy_ev
+            )
+        });
+        let sammy_total = rec.theory_initial;
+
+        let rel_error = if sammy_total.abs() > 1e-6 {
+            (nereids_total - sammy_total).abs() / sammy_total.abs()
+        } else {
+            (nereids_total - sammy_total).abs()
+        };
+
+        sum_rel_error += rel_error;
+        if rel_error > max_rel_error {
+            max_rel_error = rel_error;
+            worst_energy_kev = rec.energy_kev;
+        }
+        if rel_error > tolerance_rel {
+            n_above += 1;
+        }
+    }
+
+    ValidationResult {
+        max_rel_error,
+        mean_rel_error: sum_rel_error / reference.len() as f64,
+        n_points: reference.len(),
+        n_above_threshold: n_above,
+        worst_energy_kev,
+    }
+}
+
+/// Compare NEREIDS multi-isotope *unbroadened* cross-sections against reference.
+///
+/// Same abundance-weighted sum as `validate_cross_sections_multi` but without
+/// Doppler or resolution broadening — evaluates `cross_sections_at_energy`
+/// per isotope per reference energy.
+fn validate_unbroadened_cross_sections_multi(
+    inp: &SammyInpConfig,
+    par: &SammyParFile,
+    reference: &[SammyPltRecord],
+    tolerance_rel: f64,
+) -> ValidationResult {
+    let multi = sammy_to_resonance_data_multi(inp, par).unwrap();
+
+    let mut max_rel_error = 0.0_f64;
+    let mut sum_rel_error = 0.0;
+    let mut n_above = 0;
+    let mut worst_energy_kev = 0.0;
+
+    for rec in reference {
+        let energy_ev = rec.energy_kev * 1000.0;
+
+        // σ_total(E) = Σ_i abundance_i · σ_i(E)
+        let mut nereids_total = 0.0;
+        for (rd, abundance) in &multi {
+            let xs = reich_moore::cross_sections_at_energy(rd, energy_ev);
+            nereids_total += abundance * xs.total;
+        }
+
+        let sammy_total = rec.theory_initial;
+
+        let rel_error = if sammy_total.abs() > 1e-6 {
+            (nereids_total - sammy_total).abs() / sammy_total.abs()
+        } else {
+            (nereids_total - sammy_total).abs()
+        };
+
+        sum_rel_error += rel_error;
+        if rel_error > max_rel_error {
+            max_rel_error = rel_error;
+            worst_energy_kev = rec.energy_kev;
+        }
+        if rel_error > tolerance_rel {
+            n_above += 1;
+        }
+    }
+
+    ValidationResult {
+        max_rel_error,
+        mean_rel_error: sum_rel_error / reference.len() as f64,
+        n_points: reference.len(),
+        n_above_threshold: n_above,
+        worst_energy_kev,
+    }
+}
+
+// ─── tr034: Cu dual-isotope (Cu-65 + Cu-63), unbroadened ─────────────────────
+
+/// tr034: Cu-65 + Cu-63 total cross-section, 225-235 eV, no broadening.
+///
+/// Tests multi-isotope parsing with explicit isotope labels in spin group
+/// headers and `broadening is not wanted` keyword (no Card 5).
+#[test]
+fn test_tr034_cu_parse() {
+    let (inp, par, plt) = load_samtry_case(
+        "tr034_cu_transmission_dual_isotope",
+        "t034c.inp",
+        "t034c.par",
+        "rcc.plt",
+    );
+
+    // Verify parsing basics.
+    assert_eq!(inp.spin_groups.len(), 4);
+    assert_eq!(par.resonances.len(), 6);
+    assert!(!plt.is_empty());
+    assert!(inp.no_broadening, "should detect broadening-is-not-wanted");
+
+    // Verify Card 6 parsing (no Card 5 for this case).
+    assert!(
+        (inp.scattering_radius_fm - 6.7).abs() < 1e-6,
+        "scattering_radius={}, expected 6.7",
+        inp.scattering_radius_fm
+    );
+    assert!(
+        (inp.thickness_atoms_barn - 0.028).abs() < 1e-6,
+        "thickness={}, expected 0.028",
+        inp.thickness_atoms_barn
+    );
+
+    // Verify per-group target spin (all Cu isotopes have I=3/2).
+    for sg in &inp.spin_groups {
+        assert!(
+            (sg.target_spin - 1.5).abs() < 1e-6,
+            "SG{} target_spin={}, expected 1.5",
+            sg.index,
+            sg.target_spin
+        );
+    }
+
+    // Verify isotope labels.
+    assert_eq!(
+        inp.spin_groups[0].isotope_label.as_deref(),
+        Some("Cu65"),
+        "SG1 label"
+    );
+    assert_eq!(
+        inp.spin_groups[1].isotope_label.as_deref(),
+        Some("Cu65"),
+        "SG2 label"
+    );
+    assert_eq!(
+        inp.spin_groups[2].isotope_label.as_deref(),
+        Some("Cu63"),
+        "SG3 label"
+    );
+    assert_eq!(
+        inp.spin_groups[3].isotope_label.as_deref(),
+        Some("Cu63"),
+        "SG4 label"
+    );
+
+    // Verify abundances.
+    assert!(
+        (inp.spin_groups[0].abundance - 0.3083).abs() < 1e-4,
+        "SG1 abundance"
+    );
+    assert!(
+        (inp.spin_groups[2].abundance - 0.6917).abs() < 1e-4,
+        "SG3 abundance"
+    );
+
+    // Verify multi-isotope grouping.
+    let multi = sammy_to_resonance_data_multi(&inp, &par).unwrap();
+    assert_eq!(multi.len(), 2, "expected 2 isotope groups (Cu65 + Cu63)");
+
+    // First group: Cu-65 (Z=29, A=65).
+    assert_eq!(multi[0].0.za, 29065);
+    assert!((multi[0].1 - 0.3083).abs() < 1e-4, "Cu65 abundance");
+
+    // Second group: Cu-63 (Z=29, A=63).
+    assert_eq!(multi[1].0.za, 29063);
+    assert!((multi[1].1 - 0.6917).abs() < 1e-4, "Cu63 abundance");
+}
+
+#[test]
+fn test_tr034_cu_unbroadened() {
+    let (inp, par, plt) = load_samtry_case(
+        "tr034_cu_transmission_dual_isotope",
+        "t034c.inp",
+        "t034c.par",
+        "rcc.plt",
+    );
+
+    // No broadening — compare unbroadened multi-isotope XS directly.
+    let result = validate_unbroadened_cross_sections_multi(&inp, &par, &plt, 0.01);
+    eprintln!(
+        "tr034 unbroadened multi: max_rel={:.6}, mean_rel={:.6}, n={}, above_1%={}, worst@{:.4} keV",
+        result.max_rel_error,
+        result.mean_rel_error,
+        result.n_points,
+        result.n_above_threshold,
+        result.worst_energy_kev
+    );
+    // tr034: no broadening, multi-isotope abundance-weighted sum.
+    // Unbroadened should match SAMMY reference very closely (<1%).
+    assert!(
+        result.mean_rel_error < 0.01,
+        "unbroadened multi mean error {:.6} > 1%",
+        result.mean_rel_error
+    );
+}
+
+// ─── tr024: NatFe multi-isotope (Fe-56 + Fe-54 + Fe-57), broadened ───────────
+
+/// tr024: Natural iron transmission, 20-21 keV, 11 spin groups, 3 isotopes.
+///
+/// Tests multi-isotope parsing without explicit labels (grouped by abundance
+/// + target_spin).  Broadened with Doppler + Gaussian resolution.
+#[test]
+fn test_tr024_natfe_parse() {
+    let (inp, par, _) = load_samtry_case(
+        "tr024_natfe_transmission_multi_isotope",
+        "t024a.inp",
+        "t024a.par",
+        "raa.plt",
+    );
+
+    // Verify parsing basics.
+    assert_eq!(inp.spin_groups.len(), 11);
+    assert!(!inp.no_broadening);
+    assert_eq!(inp.isotope_symbol, "NatFE");
+
+    // Verify broadening parameters.
+    assert!(
+        (inp.temperature_k - 300.0).abs() < 1.0,
+        "temperature={}, expected 300",
+        inp.temperature_k
+    );
+    assert!(
+        (inp.flight_path_m - 201.563).abs() < 0.01,
+        "flight_path={}, expected 201.563",
+        inp.flight_path_m
+    );
+
+    // Verify resonance count (45 resonances in par file).
+    assert_eq!(par.resonances.len(), 45);
+
+    // Verify multi-isotope grouping (by abundance + target_spin).
+    let multi = sammy_to_resonance_data_multi(&inp, &par).unwrap();
+    assert_eq!(
+        multi.len(),
+        3,
+        "expected 3 isotope groups (Fe-56, Fe-57, Fe-54)"
+    );
+
+    // Group 1: Fe-56 (abundance=0.918, target_spin=0.0, 6 spin groups).
+    assert!((multi[0].1 - 0.918).abs() < 1e-3, "Fe-56 abundance");
+
+    // Group 2: Fe-57 (abundance=0.058, target_spin=0.0, 3 spin groups).
+    assert!((multi[1].1 - 0.058).abs() < 1e-3, "Fe-57 abundance");
+
+    // Group 3: Fe-54 (abundance=0.021, target_spin=0.5, 2 spin groups).
+    assert!((multi[2].1 - 0.021).abs() < 1e-3, "Fe-54 abundance");
+}
+
+#[test]
+fn test_tr024_natfe_broadened() {
+    let (inp, par, plt) = load_samtry_case(
+        "tr024_natfe_transmission_multi_isotope",
+        "t024a.inp",
+        "t024a.par",
+        "raa.plt",
+    );
+
+    let result = validate_cross_sections_multi(&inp, &par, &plt, 0.10);
+    eprintln!(
+        "tr024 broadened multi: max_rel={:.6}, mean_rel={:.6}, n={}, above_10%={}, worst@{:.4} keV",
+        result.max_rel_error,
+        result.mean_rel_error,
+        result.n_points,
+        result.n_above_threshold,
+        result.worst_energy_kev
+    );
+    // tr024: Deltae=0 (pure Gaussian), Doppler at 300K, sparse grid (13 points
+    // at 20-21 keV).  Multi-isotope abundance-weighted sum.  At 20 keV the
+    // Gaussian resolution width is moderate, but with only 13 reference points
+    // the discrete convolution has significant quadrature error.
+    assert!(
+        result.mean_rel_error < 0.10,
+        "broadened multi mean error {:.4} > 10%",
         result.mean_rel_error
     );
 }

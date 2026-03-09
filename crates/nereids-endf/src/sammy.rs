@@ -79,6 +79,12 @@ pub struct SammySpinGroup {
     pub l: u32,
     /// Statistical weight / abundance.
     pub abundance: f64,
+    /// Per-spin-group target spin I, parsed from column [31:36] of each
+    /// header line.  Defaults to 0.0 (even-even nuclei).
+    pub target_spin: f64,
+    /// Optional isotope label from the header line (columns ~52+),
+    /// e.g. "Cu65", "Cu63".  Present in multi-isotope SAMMY cases.
+    pub isotope_label: Option<String>,
 }
 
 /// Beamline and sample configuration from a SAMMY `.inp` file.
@@ -389,26 +395,40 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
     // Line 1: title.
     let title = lines[0].trim().to_string();
 
-    // Line 2: isotope definition.
-    // Format: "      60NI    59.927  505000.0  508000.0        -1"
+    // Line 2: isotope definition (Fortran FORMAT A10, F10.5, 2F10.1, I5, I5).
+    //
+    // Fixed-width columns:
+    //   [0:10]  isotope symbol (may contain spaces, e.g. "CU 65")
+    //   [10:20] AWR (atomic weight ratio)
+    //   [20:30] Emin (lower energy bound, eV)
+    //   [30:40] Emax (upper energy bound, eV)
+    //
+    // SAMMY Ref: `minp01.f90` Card Set 2 format.
     let iso_line = lines[1];
-    let iso_fields: Vec<&str> = iso_line.split_whitespace().collect();
-    if iso_fields.len() < 4 {
+    if iso_line.len() < 30 {
         return Err(SammyParseError::new(format!(
-            "line 2: expected at least 4 fields (symbol, AWR, Emin, Emax), got {}",
-            iso_fields.len()
+            "line 2: too short for Card 2 fixed-width format (need ≥30 chars, got {})",
+            iso_line.len()
         )));
     }
-    let isotope_symbol = iso_fields[0].to_string();
-    let awr = iso_fields[1]
+    let isotope_symbol = iso_line[..10.min(iso_line.len())].trim().to_string();
+    let awr = iso_line[10..20.min(iso_line.len())]
+        .trim()
         .parse::<f64>()
         .map_err(|e| SammyParseError::new(format!("line 2: AWR: {e}")))?;
-    let energy_min_ev = iso_fields[2]
+    let energy_min_ev = iso_line[20..30.min(iso_line.len())]
+        .trim()
         .parse::<f64>()
         .map_err(|e| SammyParseError::new(format!("line 2: Emin: {e}")))?;
-    let energy_max_ev = iso_fields[3]
-        .parse::<f64>()
-        .map_err(|e| SammyParseError::new(format!("line 2: Emax: {e}")))?;
+    let energy_max_ev = if iso_line.len() > 30 {
+        iso_line[30..40.min(iso_line.len())]
+            .trim()
+            .parse::<f64>()
+            .map_err(|e| SammyParseError::new(format!("line 2: Emax: {e}")))?
+    } else {
+        // Some files may have a short line — fall back to Emin.
+        energy_min_ev
+    };
 
     // Scan for keyword commands (skip until blank line), then parse Card 5, 6.
     // Also look for TRANSMISSION keyword and spin group block.
@@ -451,7 +471,18 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
     // - Deltal: flight path uncertainty → rslRes param 1 → Bo2
     // - Deltae: exponential tail → rslRes param 3 → Co2
     // - Deltag: timing uncertainty → rslRes param 2 → Ao2
-    if idx < lines.len() {
+    //
+    // When `no_broadening` is set AND the first numeric line has exactly 2
+    // fields, Card 5 is absent — the line is Card 6 (scattering_radius,
+    // thickness).  Example: tr034c.inp.
+    let card5_present = if idx < lines.len() {
+        let fields: Vec<&str> = lines[idx].split_whitespace().collect();
+        !(no_broadening && fields.len() == 2)
+    } else {
+        false
+    };
+
+    if card5_present && idx < lines.len() {
         let card5_fields: Vec<&str> = lines[idx].split_whitespace().collect();
         if card5_fields.len() >= 2 {
             temperature_k = card5_fields[0]
@@ -631,15 +662,34 @@ fn parse_spin_groups(lines: &[&str]) -> Result<(Vec<SammySpinGroup>, f64), Sammy
                 }
             };
 
-            // Target spin: read from the first header only.
-            if groups.is_empty() {
+            // Target spin: parse from each header line (col 31-36).
+            let group_target_spin = {
                 let s = col(line, 31, 36);
-                if !s.is_empty() {
-                    target_spin = s.parse::<f64>().map_err(|e| {
+                if s.is_empty() {
+                    0.0
+                } else {
+                    s.parse::<f64>().map_err(|e| {
                         SammyParseError::new(format!("spin group target spin ({s:?}): {e}"))
-                    })?;
+                    })?
                 }
+            };
+            // Use first group's target spin as the global default.
+            if groups.is_empty() {
+                target_spin = group_target_spin;
             }
+
+            // Optional isotope label: text after column 36, trimmed.
+            // Multi-isotope cases (e.g. tr034) store labels like "Cu65", "Cu63".
+            let isotope_label = if line.len() > 36 {
+                let s = line[36..].trim();
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s.to_string())
+                }
+            } else {
+                None
+            };
 
             // The next line is the channel definition — extract L.
             //
@@ -670,6 +720,8 @@ fn parse_spin_groups(lines: &[&str]) -> Result<(Vec<SammySpinGroup>, f64), Sammy
                 j,
                 l,
                 abundance,
+                target_spin: group_target_spin,
+                isotope_label,
             });
         }
         // Skip channel lines (they follow their header).
@@ -738,8 +790,12 @@ pub fn sammy_to_resonance_data(
     let target_spin = inp.target_spin;
 
     // Infer Z and A from the isotope symbol (e.g. "60NI" → Z=28, A=60;
-    // "FE56" → Z=26, A=56; "58NI" → Z=28, A=58).
-    let (z, a) = parse_isotope_symbol(&inp.isotope_symbol)?;
+    // "FE56" → Z=26, A=56; "58NI" → Z=28, A=58; "NatFE" → Z=26, A=0).
+    let (z, mut a) = parse_isotope_symbol(&inp.isotope_symbol)?;
+    // For natural-element symbols (A=0), approximate A from AWR.
+    if a == 0 {
+        a = inp.awr.round() as u32;
+    }
     let za = z * 1000 + a;
 
     // Use a wide energy range so that cross-sections can be evaluated at any
@@ -769,9 +825,173 @@ pub fn sammy_to_resonance_data(
     })
 }
 
-/// Parse a SAMMY isotope symbol like "60NI", "FE56", "58NI" into (Z, A).
-fn parse_isotope_symbol(symbol: &str) -> Result<(u32, u32), SammyParseError> {
-    let s = symbol.trim().to_uppercase();
+/// Convert parsed SAMMY `.par` + `.inp` into multiple `(ResonanceData, abundance)` pairs.
+///
+/// Groups spin groups into "pseudo-isotopes" by isotope label (if present) or
+/// by (abundance, target_spin).  Each group gets its own `ResonanceData` with
+/// only the resonances belonging to that group's spin groups.
+///
+/// This is needed for multi-isotope SAMMY cases like tr024 (NatFe: Fe-56 +
+/// Fe-54 + Fe-57) and tr034 (Cu-65 + Cu-63).
+pub fn sammy_to_resonance_data_multi(
+    inp: &SammyInpConfig,
+    par: &SammyParFile,
+) -> Result<Vec<(ResonanceData, f64)>, SammyParseError> {
+    if inp.spin_groups.is_empty() {
+        return Err(SammyParseError::new("no spin groups defined in .inp file"));
+    }
+
+    // Determine grouping key for each spin group.
+    // If ANY spin group has an isotope_label, group by label.
+    // Otherwise, group by (abundance, target_spin) using a string key.
+    let has_labels = inp.spin_groups.iter().any(|sg| sg.isotope_label.is_some());
+
+    // Build grouping: key → (spin_group_indices, abundance, target_spin).
+    let mut group_order: Vec<String> = Vec::new();
+    let mut group_members: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    let mut group_abundance: std::collections::HashMap<String, f64> =
+        std::collections::HashMap::new();
+    let mut group_target_spin: std::collections::HashMap<String, f64> =
+        std::collections::HashMap::new();
+
+    for (i, sg) in inp.spin_groups.iter().enumerate() {
+        let key = if has_labels {
+            sg.isotope_label
+                .as_deref()
+                .unwrap_or("unknown")
+                .to_uppercase()
+        } else {
+            format!("{:.6}_{:.1}", sg.abundance, sg.target_spin)
+        };
+
+        if !group_members.contains_key(&key) {
+            group_order.push(key.clone());
+        }
+        group_members.entry(key.clone()).or_default().push(i);
+        group_abundance.insert(key.clone(), sg.abundance);
+        group_target_spin.insert(key.clone(), sg.target_spin);
+    }
+
+    // Build spin_group_index → SammySpinGroup map.
+    let sg_map: std::collections::HashMap<u32, &SammySpinGroup> =
+        inp.spin_groups.iter().map(|sg| (sg.index, sg)).collect();
+
+    // Z from Card 2 (shared across all groups).
+    let (card2_z, card2_a) = parse_isotope_symbol(&inp.isotope_symbol)?;
+
+    let mut result = Vec::new();
+
+    for key in &group_order {
+        let member_indices = &group_members[key];
+        let abundance = group_abundance[key];
+        let target_spin = group_target_spin[key];
+
+        // Collect the spin group indices (1-based) for this group.
+        let sg_indices: std::collections::HashSet<u32> = member_indices
+            .iter()
+            .map(|&i| inp.spin_groups[i].index)
+            .collect();
+
+        // Filter resonances belonging to this group.
+        let group_resonances: Vec<&SammyResonance> = par
+            .resonances
+            .iter()
+            .filter(|r| sg_indices.contains(&r.spin_group))
+            .collect();
+
+        // Build L-groups from these resonances.
+        let mut l_group_map: std::collections::BTreeMap<u32, Vec<Resonance>> =
+            std::collections::BTreeMap::new();
+
+        for res in &group_resonances {
+            let sg = sg_map.get(&res.spin_group).ok_or_else(|| {
+                SammyParseError::new(format!(
+                    "resonance at E={} eV references undefined spin group {}",
+                    res.energy_ev, res.spin_group
+                ))
+            })?;
+
+            l_group_map.entry(sg.l).or_default().push(Resonance {
+                energy: res.energy_ev,
+                j: sg.j,
+                gn: res.gamma_n_ev,
+                gg: res.gamma_gamma_ev,
+                gfa: res.gamma_f1_ev,
+                gfb: res.gamma_f2_ev,
+            });
+        }
+
+        let l_groups: Vec<LGroup> = l_group_map
+            .into_iter()
+            .map(|(l, resonances)| LGroup {
+                l,
+                awr: inp.awr,
+                apl: 0.0,
+                qx: 0.0,
+                lrx: 0,
+                resonances,
+            })
+            .collect();
+
+        // Determine Z/A for this group.
+        let (z, mut a) = if has_labels {
+            // Try to parse the isotope label (e.g. "Cu65" → Z=29, A=65).
+            parse_isotope_symbol(key).unwrap_or((card2_z, card2_a))
+        } else {
+            (card2_z, card2_a)
+        };
+        // For natural-element symbols (A=0), approximate A from AWR.
+        if a == 0 {
+            a = inp.awr.round() as u32;
+        }
+        let za = z * 1000 + a;
+
+        let range = ResonanceRange {
+            energy_low: 1e-5,
+            energy_high: 2e7,
+            resolved: true,
+            formalism: ResonanceFormalism::ReichMoore,
+            target_spin,
+            scattering_radius: inp.scattering_radius_fm,
+            naps: 0,
+            ap_table: None,
+            l_groups,
+            rml: None,
+            urr: None,
+        };
+
+        let resonance_data = ResonanceData {
+            isotope: Isotope::new(z, a)
+                .map_err(|e| SammyParseError::new(format!("invalid isotope: {e}")))?,
+            za,
+            awr: inp.awr,
+            ranges: vec![range],
+        };
+
+        result.push((resonance_data, abundance));
+    }
+
+    Ok(result)
+}
+
+/// Parse a SAMMY isotope symbol like "60NI", "FE56", "58NI", "NatFE",
+/// "CU 65", "Cu65" into (Z, A).
+///
+/// For natural-element symbols like "NatFE", A=0 is returned (no specific
+/// mass number).  Space-separated labels like "CU 65" are handled by
+/// stripping internal spaces.
+pub fn parse_isotope_symbol(symbol: &str) -> Result<(u32, u32), SammyParseError> {
+    // Strip internal spaces (handles "CU 65" → "CU65").
+    let joined: String = symbol.chars().filter(|c| !c.is_whitespace()).collect();
+    let s = joined.to_uppercase();
+
+    // Handle "NAT" prefix: "NATFE" → Z from element, A=0.
+    if let Some(rest) = s.strip_prefix("NAT")
+        && let Some(z) = element_symbol_to_z(rest)
+    {
+        return Ok((z, 0));
+    }
 
     // Try format: "60NI" (mass number first, then element symbol).
     if let Some(split_pos) = s.find(|c: char| c.is_ascii_alphabetic()) {
@@ -1026,6 +1246,13 @@ BROADENING
         assert_eq!(parse_isotope_symbol("FE56").unwrap(), (26, 56));
         assert_eq!(parse_isotope_symbol("58NI").unwrap(), (28, 58));
         assert!(parse_isotope_symbol("UNKNOWN99").is_err());
+        // Multi-isotope labels.
+        assert_eq!(parse_isotope_symbol("Cu65").unwrap(), (29, 65));
+        assert_eq!(parse_isotope_symbol("Cu63").unwrap(), (29, 63));
+        assert_eq!(parse_isotope_symbol("CU 65").unwrap(), (29, 65));
+        // Natural-element prefix.
+        assert_eq!(parse_isotope_symbol("NatFE").unwrap(), (26, 0));
+        assert_eq!(parse_isotope_symbol("NatFe").unwrap(), (26, 0));
     }
 
     #[test]
@@ -1054,12 +1281,16 @@ BROADENING
                     j: 0.5,
                     l: 0,
                     abundance: 0.9999,
+                    target_spin: 0.0,
+                    isotope_label: None,
                 },
                 SammySpinGroup {
                     index: 2,
                     j: -0.5, // Negative J per SAMMY convention
                     l: 1,    // p-wave: J=|L-S|=|1-0.5|=0.5
                     abundance: 0.9172,
+                    target_spin: 0.0,
+                    isotope_label: None,
                 },
             ],
         };
