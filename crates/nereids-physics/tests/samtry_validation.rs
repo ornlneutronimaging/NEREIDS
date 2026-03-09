@@ -30,7 +30,8 @@
 //! | FGM + HEGA, no Doppler | tr008 | <4% | <27% | HEGA vs FGM difference |
 //! | FGM + Gauss + Exp tail | tr007, tr047 | <10% | <55% | Resonance peak sampling |
 //! | FGM + Gauss + Exp, sparse | tr029, tr030 | <21% | <145% | Sparse grid + exp tail |
-//! | Multi-channel fission | tr028 | IGNORED | — | Not implemented (Batch C) |
+//! | 3-ch fission, unbroadened | tr028 | <0.1% | <0.2% | Direct R-matrix (exact) |
+//! | 3-ch fission, broadened | tr019 | <2% | <21% | Resonance peak sampling |
 //!
 //! ## Reference
 //! SAMMY source: `../SAMMY/SAMMY/sammy/samtry/`
@@ -84,13 +85,17 @@ fn load_samtry_case(
     let par = parse_sammy_par(&par_content).unwrap();
     let mut plt = parse_sammy_plt(&plt_content).unwrap();
 
-    // Detect plt energy unit: compare mid-point of plt range with inp Emin (eV).
-    // If plt values are ~1000× smaller than inp eV range → plt is in keV.
-    // If plt values are in the same range as inp eV range → plt is in eV.
+    // Detect plt energy unit: compare max plt value with inp energy_max (eV).
+    // If plt values are ~1000× smaller → plt is in keV (the parser default).
+    // If plt values are in the same range → plt is in eV, needs conversion.
+    // Uses max rather than mid-index to handle log-spaced grids correctly
+    // (mid-index can be far from the arithmetic midpoint for non-uniform spacing).
     if !plt.is_empty() {
-        let plt_mid = plt[plt.len() / 2].energy_kev; // raw value from parser
-        let inp_mid_ev = (inp.energy_min_ev + inp.energy_max_ev) / 2.0;
-        let ratio = plt_mid / inp_mid_ev; // close to 1.0 → eV, close to 0.001 → keV
+        let plt_max = plt
+            .iter()
+            .map(|r| r.energy_kev)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let ratio = plt_max / inp.energy_max_ev; // close to 1.0 → eV, close to 0.001 → keV
 
         if ratio > 0.5 {
             // plt is in eV — convert to keV for consistency with the field name.
@@ -845,7 +850,6 @@ fn test_tr028_pu241_parse() {
 }
 
 #[test]
-#[ignore] // Pu-241 has 3 channels per spin group (fission) — Batch C scope.
 fn test_tr028_pu241_unbroadened() {
     let (inp, par, plt) = load_samtry_case(
         "tr028_pu241_total_xs_no_broadening",
@@ -854,20 +858,24 @@ fn test_tr028_pu241_unbroadened() {
         "raa.plt",
     );
     // No broadening — compare unbroadened cross-sections directly.
-    let result = validate_unbroadened_cross_sections(&inp, &par, &plt, 0.01);
+    // Pu-241 has 3 channels per spin group (neutron + 2 fission).
+    // The 3-channel Reich-Moore path handles this correctly.
+    let result = validate_unbroadened_cross_sections(&inp, &par, &plt, 0.002);
     eprintln!(
-        "tr028 unbroadened: max_rel={:.6}, mean_rel={:.6}, n={}, above_1%={}, worst@{:.4} keV",
+        "tr028 unbroadened: max_rel={:.6}, mean_rel={:.6}, n={}, above_0.2%={}, worst@{:.4} keV",
         result.max_rel_error,
         result.mean_rel_error,
         result.n_points,
         result.n_above_threshold,
         result.worst_energy_kev
     );
-    // Currently ~91% mean error — multi-channel fission not yet supported.
-    // Assert current behavior so this ignored test is still usable for diagnostics.
+    assert_eq!(
+        result.n_above_threshold, 0,
+        "no points above 0.2% threshold"
+    );
     assert!(
-        result.mean_rel_error > 0.50,
-        "unbroadened mean error {:.4} <= 50% — multi-channel fission may now be supported, update test",
+        result.mean_rel_error < 0.001,
+        "unbroadened mean error {:.4} >= 0.1%",
         result.mean_rel_error
     );
 }
@@ -1236,6 +1244,83 @@ fn test_tr024_natfe_broadened() {
     assert!(
         result.mean_rel_error < 0.10,
         "broadened multi mean error {:.4} > 10%",
+        result.mean_rel_error
+    );
+}
+
+// ─── Batch C: Multi-channel fission (issue #326) ────────────────────────────
+//
+// tr019 (U-235) and tr028 (Pu-241) both have 3 channels per spin group:
+// neutron entrance + 2 fission exit channels.  The 3-channel Reich-Moore
+// path (`reich_moore_3ch_precomputed`) handles this correctly — Batch C
+// required only a test infrastructure fix (energy unit detection heuristic)
+// and a parser fix (abbreviated TRANS keyword).
+
+/// tr019: U-235 transmission, 300-338 eV, Doppler + exponential tail resolution.
+///
+/// 276 resonances, 2 spin groups (J=3.0, J=4.0), I=3.5.
+/// Each spin group has 3 channels (neutron + 2 fission).
+/// Temperature 97K, flight path 80.394m, delta_l=0.025, delta_e=0.030.
+#[test]
+fn test_tr019_u235_parse() {
+    let (inp, par, plt) = load_samtry_case(
+        "tr019_u235_transmission_fission",
+        "t019a.inp",
+        "t019a.par",
+        "raa.plt",
+    );
+    assert_eq!(inp.isotope_symbol, "U235");
+    assert_eq!(inp.spin_groups.len(), 2);
+    assert!((inp.spin_groups[0].j - 3.0).abs() < 1e-6, "SG1 J=3.0");
+    assert!((inp.spin_groups[1].j - 4.0).abs() < 1e-6, "SG2 J=4.0");
+    assert!(
+        (inp.spin_groups[0].target_spin - 3.5).abs() < 1e-6,
+        "target_spin=3.5 for U-235"
+    );
+    // 276 resonances in the .par file.
+    assert!(
+        par.resonances.len() >= 270,
+        "expected ~276 resonances, got {}",
+        par.resonances.len()
+    );
+    // Many resonances have non-zero fission widths (both Γ_f1 and Γ_f2).
+    let n_fission = par
+        .resonances
+        .iter()
+        .filter(|r| r.gamma_f1_ev.abs() > 1e-10 && r.gamma_f2_ev.abs() > 1e-10)
+        .count();
+    assert!(
+        n_fission > 100,
+        "expected >100 resonances with both fission widths, got {}",
+        n_fission
+    );
+    assert!(!plt.is_empty());
+}
+
+#[test]
+fn test_tr019_u235_broadened() {
+    let (inp, par, plt) = load_samtry_case(
+        "tr019_u235_transmission_fission",
+        "t019a.inp",
+        "t019a.par",
+        "raa.plt",
+    );
+
+    let result = validate_broadened_cross_sections(&inp, &par, &plt, 0.05);
+    eprintln!(
+        "tr019 broadened: max_rel={:.6}, mean_rel={:.6}, n={}, above_5%={}, worst@{:.4} keV",
+        result.max_rel_error,
+        result.mean_rel_error,
+        result.n_points,
+        result.n_above_threshold,
+        result.worst_energy_kev
+    );
+    // U-235 transmission: Doppler (97K) + exponential tail resolution.
+    // 607 reference points over 300-338 eV, dense grid.
+    // 3-channel Reich-Moore (fission).
+    assert!(
+        result.mean_rel_error < 0.05,
+        "broadened mean error {:.4} >= 5%",
         result.mean_rel_error
     );
 }

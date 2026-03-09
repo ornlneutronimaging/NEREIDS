@@ -525,7 +525,8 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
 
     while idx < lines.len() {
         let trimmed = lines[idx].trim().to_uppercase();
-        if trimmed.starts_with("TRANSMISSION") || trimmed.starts_with("TOTAL") {
+        // SAMMY allows keyword abbreviations: "TRANS" matches "TRANSMISSION".
+        if trimmed.starts_with("TRANS") || trimmed.starts_with("TOTAL") {
             idx += 1;
             // Parse spin group definitions until blank line.
             let (groups, parsed_target_spin) = parse_spin_groups(&lines[idx..])?;
