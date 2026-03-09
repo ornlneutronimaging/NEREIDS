@@ -869,24 +869,22 @@ pub fn sammy_to_resonance_data_multi(
             group_order.push(key.clone());
         }
         group_members.entry(key.clone()).or_default().push(i);
-        if let Some(&existing) = group_abundance.get(&key) {
-            debug_assert!(
-                (existing - sg.abundance).abs() < 1e-12,
+        if let Some(&existing) = group_abundance.get(&key)
+            && (existing - sg.abundance).abs() >= 1e-12
+        {
+            return Err(SammyParseError::new(format!(
                 "spin groups in isotope group '{}' disagree on abundance: {} vs {}",
-                key,
-                existing,
-                sg.abundance
-            );
+                key, existing, sg.abundance
+            )));
         }
         group_abundance.insert(key.clone(), sg.abundance);
-        if let Some(&existing) = group_target_spin.get(&key) {
-            debug_assert!(
-                (existing - sg.target_spin).abs() < 1e-12,
+        if let Some(&existing) = group_target_spin.get(&key)
+            && (existing - sg.target_spin).abs() >= 1e-12
+        {
+            return Err(SammyParseError::new(format!(
                 "spin groups in isotope group '{}' disagree on target_spin: {} vs {}",
-                key,
-                existing,
-                sg.target_spin
-            );
+                key, existing, sg.target_spin
+            )));
         }
         group_target_spin.insert(key.clone(), sg.target_spin);
     }
