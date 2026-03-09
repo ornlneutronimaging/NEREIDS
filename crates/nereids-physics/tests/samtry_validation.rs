@@ -860,19 +860,22 @@ fn test_tr028_pu241_unbroadened() {
     // No broadening — compare unbroadened cross-sections directly.
     // Pu-241 has 3 channels per spin group (neutron + 2 fission).
     // The 3-channel Reich-Moore path handles this correctly.
-    let result = validate_unbroadened_cross_sections(&inp, &par, &plt, 0.01);
+    let result = validate_unbroadened_cross_sections(&inp, &par, &plt, 0.002);
     eprintln!(
-        "tr028 unbroadened: max_rel={:.6}, mean_rel={:.6}, n={}, above_1%={}, worst@{:.4} keV",
+        "tr028 unbroadened: max_rel={:.6}, mean_rel={:.6}, n={}, above_0.2%={}, worst@{:.4} keV",
         result.max_rel_error,
         result.mean_rel_error,
         result.n_points,
         result.n_above_threshold,
         result.worst_energy_kev
     );
-    assert_eq!(result.n_above_threshold, 0, "no points above 1% threshold");
+    assert_eq!(
+        result.n_above_threshold, 0,
+        "no points above 0.2% threshold"
+    );
     assert!(
-        result.mean_rel_error < 0.01,
-        "unbroadened mean error {:.4} >= 1%",
+        result.mean_rel_error < 0.001,
+        "unbroadened mean error {:.4} >= 0.1%",
         result.mean_rel_error
     );
 }
@@ -1303,9 +1306,9 @@ fn test_tr019_u235_broadened() {
         "raa.plt",
     );
 
-    let result = validate_broadened_cross_sections(&inp, &par, &plt, 0.10);
+    let result = validate_broadened_cross_sections(&inp, &par, &plt, 0.05);
     eprintln!(
-        "tr019 broadened: max_rel={:.6}, mean_rel={:.6}, n={}, above_10%={}, worst@{:.4} keV",
+        "tr019 broadened: max_rel={:.6}, mean_rel={:.6}, n={}, above_5%={}, worst@{:.4} keV",
         result.max_rel_error,
         result.mean_rel_error,
         result.n_points,
@@ -1316,8 +1319,8 @@ fn test_tr019_u235_broadened() {
     // 607 reference points over 300-338 eV, dense grid.
     // 3-channel Reich-Moore (fission).
     assert!(
-        result.mean_rel_error < 0.10,
-        "broadened mean error {:.4} >= 10%",
+        result.mean_rel_error < 0.05,
+        "broadened mean error {:.4} >= 5%",
         result.mean_rel_error
     );
 }
