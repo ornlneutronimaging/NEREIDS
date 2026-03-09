@@ -1,0 +1,17 @@
+ CU-65 TOTAL CROSS SECTION FROM 225.  EV TO 235.   EV
+CU 65     65.0      225.00    235.00             0
+PRINT VARIED INPUT PARAMETERS
+broadening is not wanted
+DO NOT SUPPRESS ANY INTERM
+GENERATE PLOT FILE AUTOMATICALLY
+
+6.700     0.0280
+transmission
+  1      1    0  1.0  0.308300  1.5                  Cu65
+    1    1    0    0     1.000      .000      .000
+  2      1    0  2.0  0.308300  1.5                  Cu65
+    1    1    0    0     2.000      .000      .000
+  3      1    0  1.0  0.691700  1.5                  Cu63
+    1    1    0    0     1.000      .000      .000
+  4      1    0  2.0  0.691700  1.5                  Cu63
+    1    1    0    0     2.000      .000      .000
