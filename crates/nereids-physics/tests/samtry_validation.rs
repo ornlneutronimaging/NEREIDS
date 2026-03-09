@@ -30,8 +30,14 @@
 //! | FGM + HEGA, no Doppler | tr008 | <4% | <27% | HEGA vs FGM difference |
 //! | FGM + Gauss + Exp tail | tr007, tr047 | <10% | <55% | Resonance peak sampling |
 //! | FGM + Gauss + Exp, sparse | tr029, tr030 | <21% | <145% | Sparse grid + exp tail |
-//! | 3-ch fission, unbroadened | tr028 | <0.1% | <0.2% | Direct R-matrix (exact) |
+//! | 3-ch fission, unbroadened | tr028, tr018 | <0.1% | <0.5% | Direct R-matrix (exact) |
 //! | 3-ch fission, broadened | tr019 | <2% | <21% | Resonance peak sampling |
+//! | HEGA, Ni-58 180 keV | tr012, tr041 | <10% | <25% | Doppler method mismatch |
+//! | HEGA + Exp tail, Fe-56 1 keV | tr022 | <12% | <55% | Resonance peak sampling |
+//! | HEGA, Fe-56 1 keV (MLBW cmp) | tr025 | <10% | <30% | Doppler method mismatch |
+//! | Multi-isotope (3 sp), HEGA | tr010 | <25% | <35% | ~50% unmodeled isotope pot. scatt.|
+//! | Unbroadened reconstruction | tr037 | <5% | <100% | Missing higher-L pot. scatt. |
+//! | Multi-isotope (2 sp), Gauss | tr040 | <50% | <350% | High-energy broadening (P2) |
 //!
 //! ## Reference
 //! SAMMY source: `../SAMMY/SAMMY/sammy/samtry/`
@@ -1321,6 +1327,423 @@ fn test_tr019_u235_broadened() {
     assert!(
         result.mean_rel_error < 0.05,
         "broadened mean error {:.4} >= 5%",
+        result.mean_rel_error
+    );
+}
+
+// ─── Batch D: Coverage expansion (issue #327) ───────────────────────────────
+
+// ─── tr012: Ni-58, HEGA broadened, 180–181 keV ──────────────────────────────
+
+#[test]
+fn test_tr012_ni58_parse() {
+    let (inp, par, plt) = load_samtry_case(
+        "tr012_ni58_transmission_hega",
+        "t012a.inp",
+        "t012a.par",
+        "raa.plt",
+    );
+    assert!(par.resonances.len() >= 10, "expected >=10 resonances");
+    assert!(!plt.is_empty());
+    assert_eq!(inp.isotope_symbol, "58NI");
+    assert!((inp.temperature_k - 300.0).abs() < 1.0);
+    assert!(!inp.no_broadening);
+    // 6 spin groups, Ni-58 (even-even → target_spin=0.0).
+    assert_eq!(inp.spin_groups.len(), 6);
+}
+
+#[test]
+fn test_tr012_ni58_broadened() {
+    let (inp, par, plt) = load_samtry_case(
+        "tr012_ni58_transmission_hega",
+        "t012a.inp",
+        "t012a.par",
+        "raa.plt",
+    );
+    let result = validate_broadened_cross_sections(&inp, &par, &plt, 0.10);
+    eprintln!(
+        "tr012 broadened: max_rel={:.6}, mean_rel={:.6}, n={}, above_10%={}, worst@{:.4} keV",
+        result.max_rel_error,
+        result.mean_rel_error,
+        result.n_points,
+        result.n_above_threshold,
+        result.worst_energy_kev
+    );
+    // Ni-58, HEGA Doppler broadened at 180–181 keV.
+    // Similar to tr015/tr016 (same isotope, nearby energy).
+    assert!(
+        result.mean_rel_error < 0.10,
+        "broadened mean error {:.4} >= 10%",
+        result.mean_rel_error
+    );
+}
+
+// ─── tr022: Fe-56, HEGA + exponential tail, 1137–1165 eV ────────────────────
+
+#[test]
+fn test_tr022_fe56_parse() {
+    let (inp, par, plt) = load_samtry_case(
+        "tr022_fe56_transmission_exp_tail",
+        "t022a.inp",
+        "t022a.par",
+        "raa.plt",
+    );
+    assert!(par.resonances.len() >= 3, "expected >=3 resonances");
+    assert!(!plt.is_empty());
+    assert_eq!(inp.isotope_symbol, "FE56");
+    assert!(!inp.no_broadening);
+    // 2 spin groups, Fe-56 (even-even → target_spin=0.0).
+    assert_eq!(inp.spin_groups.len(), 2);
+}
+
+#[test]
+fn test_tr022_fe56_broadened() {
+    let (inp, par, plt) = load_samtry_case(
+        "tr022_fe56_transmission_exp_tail",
+        "t022a.inp",
+        "t022a.par",
+        "raa.plt",
+    );
+    let result = validate_broadened_cross_sections(&inp, &par, &plt, 0.12);
+    eprintln!(
+        "tr022 broadened: max_rel={:.6}, mean_rel={:.6}, n={}, above_12%={}, worst@{:.4} keV",
+        result.max_rel_error,
+        result.mean_rel_error,
+        result.n_points,
+        result.n_above_threshold,
+        result.worst_energy_kev
+    );
+    // Fe-56, HEGA + exponential tail at 1137–1165 eV.
+    // Similar to tr007/tr047 (same isotope, nearby energy, exp tail).
+    assert!(
+        result.mean_rel_error < 0.12,
+        "broadened mean error {:.4} >= 12%",
+        result.mean_rel_error
+    );
+}
+
+// ─── tr025: Fe-56, HEGA broadened, 1137–1165 eV (MLBW comparison) ───────────
+
+#[test]
+fn test_tr025_fe56_parse() {
+    let (inp, par, plt) = load_samtry_case(
+        "tr025_fe56_transmission_mlbw_compare",
+        "t025ctd.inp",
+        "t025a.par",
+        "rctd.plt",
+    );
+    assert!(par.resonances.len() >= 3, "expected >=3 resonances");
+    assert!(!plt.is_empty());
+    assert_eq!(inp.isotope_symbol, "FE56");
+    assert!(!inp.no_broadening);
+    assert_eq!(inp.spin_groups.len(), 2);
+}
+
+#[test]
+fn test_tr025_fe56_broadened() {
+    let (inp, par, plt) = load_samtry_case(
+        "tr025_fe56_transmission_mlbw_compare",
+        "t025ctd.inp",
+        "t025a.par",
+        "rctd.plt",
+    );
+    let result = validate_broadened_cross_sections(&inp, &par, &plt, 0.10);
+    eprintln!(
+        "tr025 broadened: max_rel={:.6}, mean_rel={:.6}, n={}, above_10%={}, worst@{:.4} keV",
+        result.max_rel_error,
+        result.mean_rel_error,
+        result.n_points,
+        result.n_above_threshold,
+        result.worst_energy_kev
+    );
+    // Fe-56, HEGA broadened at 1137–1165 eV.
+    // MLBW comparison keywords are output-only; physics is standard RM.
+    assert!(
+        result.mean_rel_error < 0.10,
+        "broadened mean error {:.4} >= 10%",
+        result.mean_rel_error
+    );
+}
+
+// ─── tr018: U-235, unbroadened, 3-channel fission, 1500–1505 eV ─────────────
+
+#[test]
+fn test_tr018_u235_parse() {
+    let (inp, par, plt) = load_samtry_case(
+        "tr018_u235_transmission_no_broadening",
+        "t018tra.inp",
+        "t018a.par",
+        "rtra.plt",
+    );
+    assert!(!par.resonances.is_empty(), "expected resonances");
+    assert!(!plt.is_empty());
+    assert_eq!(inp.isotope_symbol, "U235");
+    assert!(
+        inp.no_broadening,
+        "should detect abbreviated BROADENING IS NOT"
+    );
+    // 2 spin groups (J=3.0, J=4.0), U-235 target_spin=3.5.
+    assert_eq!(inp.spin_groups.len(), 2);
+    assert!(
+        (inp.spin_groups[0].target_spin - 3.5).abs() < 1e-6,
+        "target_spin={}, expected 3.5",
+        inp.spin_groups[0].target_spin
+    );
+    // 3 channels per spin group (neutron + 2 fission) — verified via
+    // non-zero fission widths in par file resonances.
+}
+
+#[test]
+fn test_tr018_u235_unbroadened() {
+    let (inp, par, plt) = load_samtry_case(
+        "tr018_u235_transmission_no_broadening",
+        "t018tra.inp",
+        "t018a.par",
+        "rtra.plt",
+    );
+    let result = validate_unbroadened_cross_sections(&inp, &par, &plt, 0.005);
+    eprintln!(
+        "tr018 unbroadened: max_rel={:.6}, mean_rel={:.6}, n={}, above_0.5%={}, worst@{:.4} keV",
+        result.max_rel_error,
+        result.mean_rel_error,
+        result.n_points,
+        result.n_above_threshold,
+        result.worst_energy_kev
+    );
+    // U-235 unbroadened: direct R-matrix, 3-channel fission.
+    // Should match SAMMY almost exactly (no broadening approximation).
+    assert!(
+        result.mean_rel_error < 0.001,
+        "unbroadened mean error {:.6} >= 0.1%",
+        result.mean_rel_error
+    );
+}
+
+// ─── tr010: Zr multi-isotope (93Zr/91Zr/94Zr), HEGA broadened ──────────────
+
+#[test]
+fn test_tr010_zr_parse() {
+    let (inp, par, plt) = load_samtry_case(
+        "tr010_zr_multi_isotope_transmission",
+        "t010a.inp",
+        "t010a.par",
+        "raa.plt",
+    );
+    assert!(par.resonances.len() >= 200, "expected >=200 resonances");
+    assert!(!plt.is_empty());
+    assert_eq!(inp.isotope_symbol, "ZIRCONIUM");
+    assert!(!inp.no_broadening);
+    // 13 spin groups across 3 isotopes.
+    assert_eq!(inp.spin_groups.len(), 13);
+    // Verify multi-isotope labels: 93Zr (groups 1-6), 91Zr (groups 7-12), 94Zr (group 13).
+    assert!(inp.spin_groups[0].isotope_label.is_some());
+    // Multi-isotope conversion is tested in the broadened test via
+    // validate_cross_sections_multi.
+}
+
+#[test]
+fn test_tr010_zr_broadened() {
+    let (inp, par, plt) = load_samtry_case(
+        "tr010_zr_multi_isotope_transmission",
+        "t010a.inp",
+        "t010a.par",
+        "raa.plt",
+    );
+    let result = validate_cross_sections_multi(&inp, &par, &plt, 0.10);
+    eprintln!(
+        "tr010 broadened multi: max_rel={:.6}, mean_rel={:.6}, n={}, above_10%={}, worst@{:.4} keV",
+        result.max_rel_error,
+        result.mean_rel_error,
+        result.n_points,
+        result.n_above_threshold,
+        result.worst_energy_kev
+    );
+    // Zr multi-isotope: 3 species (93Zr/91Zr/94Zr), HEGA broadened.
+    // Modeled abundances sum to only ~0.50 (the remaining ~50% is unmodeled
+    // Zr isotopes like 90Zr).  SAMMY's Th_initial includes potential
+    // scattering from ALL isotopes; we only model the 3 labeled species.
+    // Expected ~18% systematic underestimate from missing contributions.
+    assert!(
+        result.mean_rel_error < 0.25,
+        "broadened multi mean error {:.4} >= 25%",
+        result.mean_rel_error
+    );
+}
+
+// ─── tr037: Ni-60, unbroadened reconstruction, 120–200 keV ──────────────────
+
+#[test]
+fn test_tr037_ni60_parse() {
+    let (inp, par, plt) = load_samtry_case(
+        "tr037_ni60_transmission_reconstruct",
+        "t037x06.inp",
+        "t006a.par",
+        "r06.plt",
+    );
+    assert!(par.resonances.len() >= 200, "expected >=200 resonances");
+    assert!(!plt.is_empty());
+    assert_eq!(inp.isotope_symbol, "60NI");
+    assert!(inp.no_broadening, "should detect broadening-is-not-wanted");
+}
+
+#[test]
+fn test_tr037_ni60_unbroadened() {
+    let (inp, par, plt) = load_samtry_case(
+        "tr037_ni60_transmission_reconstruct",
+        "t037x06.inp",
+        "t006a.par",
+        "r06.plt",
+    );
+    // Reconstruct-mode .plt: total cross section is in the Data column
+    // (not Th_initial).  SAMMY "reconstruct cross sections" puts σ_total
+    // in col 2 (Data) and σ_elastic in col 3 (Uncertainty).
+    let resonance_data = sammy_to_resonance_data(&inp, &par).unwrap();
+
+    let mut max_rel_error = 0.0_f64;
+    let mut sum_rel_error = 0.0;
+    let mut n_above = 0;
+    let mut worst_energy_kev = 0.0;
+
+    for rec in &plt {
+        let energy_ev = rec.energy_kev * 1000.0;
+        let xs = reich_moore::cross_sections_at_energy(&resonance_data, energy_ev);
+        let nereids_total = xs.total;
+        let sammy_total = rec.data; // Data column has σ_total in reconstruction .plt.
+
+        let rel_error = if sammy_total.abs() > 1e-6 {
+            (nereids_total - sammy_total).abs() / sammy_total.abs()
+        } else {
+            (nereids_total - sammy_total).abs()
+        };
+
+        sum_rel_error += rel_error;
+        if rel_error > max_rel_error {
+            max_rel_error = rel_error;
+            worst_energy_kev = rec.energy_kev;
+        }
+        if rel_error > 0.005 {
+            n_above += 1;
+        }
+    }
+    let mean_rel_error = sum_rel_error / plt.len() as f64;
+
+    eprintln!(
+        "tr037 unbroadened: max_rel={:.6}, mean_rel={:.6}, n={}, above_0.5%={}, worst@{:.4} keV",
+        max_rel_error,
+        mean_rel_error,
+        plt.len(),
+        n_above,
+        worst_energy_kev
+    );
+    // Ni-60 unbroadened reconstruction: direct R-matrix evaluation.
+    // Spin groups 3-5 (L=1,2) have 0 resonances in the .par file but still
+    // contribute potential scattering in SAMMY.  Our code doesn't add empty
+    // L-groups, causing a systematic ~3% offset from missing higher-L
+    // potential scattering.
+    assert!(
+        mean_rel_error < 0.05,
+        "unbroadened mean error {:.6} >= 5%",
+        mean_rel_error
+    );
+}
+
+// ─── tr040: Fe-54, Gaussian broadened, 890–1000 keV (generated .plt) ────────
+
+#[test]
+fn test_tr040_fe54_parse() {
+    let (inp, par, plt) = load_samtry_case(
+        "tr040_fe54_transmission_gaussian",
+        "t040a.inp",
+        "t040a.par",
+        "raa.plt",
+    );
+    assert!(par.resonances.len() >= 200, "expected >=200 resonances");
+    assert!(!plt.is_empty());
+    assert_eq!(inp.isotope_symbol, "54FE");
+    assert!(!inp.no_broadening);
+    // 10 spin groups: 9 for 54Fe (abundance 0.9723) + 1 minor isotope (0.0268).
+    assert_eq!(inp.spin_groups.len(), 10);
+    // Multi-isotope: two abundance groups.
+    let multi = sammy_to_resonance_data_multi(&inp, &par).unwrap();
+    assert_eq!(
+        multi.len(),
+        2,
+        "expected 2 isotope groups (major + minor), got {}",
+        multi.len()
+    );
+}
+
+#[test]
+fn test_tr040_fe54_broadened() {
+    let (inp, par, plt) = load_samtry_case(
+        "tr040_fe54_transmission_gaussian",
+        "t040a.inp",
+        "t040a.par",
+        "raa.plt",
+    );
+    let result = validate_cross_sections_multi(&inp, &par, &plt, 0.10);
+    eprintln!(
+        "tr040 broadened multi: max_rel={:.6}, mean_rel={:.6}, n={}, above_10%={}, worst@{:.4} keV",
+        result.max_rel_error,
+        result.mean_rel_error,
+        result.n_points,
+        result.n_above_threshold,
+        result.worst_energy_kev
+    );
+    // Fe-54 multi-isotope at 890–1000 keV: very high energy regime where
+    // Doppler + Gaussian resolution broadening shows ~40% mean discrepancy
+    // against SAMMY.  Peak shapes are correct but differ at resonance peaks.
+    // Known limitation: minor isotope (0.0268) has 0 resonances in the .par,
+    // contributing only potential scattering.  High-energy broadening accuracy
+    // is deferred (P2).
+    assert!(
+        result.mean_rel_error < 0.50,
+        "broadened multi mean error {:.4} >= 50%",
+        result.mean_rel_error
+    );
+}
+
+// ─── tr041: Ni-58, IPQ/Gaussian broadened, 180–181 keV (generated .plt) ─────
+
+#[test]
+fn test_tr041_ni58_parse() {
+    let (inp, par, plt) = load_samtry_case(
+        "tr041_ni58_transmission_ipq",
+        "t041a.inp",
+        "t041a.par",
+        "raa.plt",
+    );
+    assert!(par.resonances.len() >= 10, "expected >=10 resonances");
+    assert!(!plt.is_empty());
+    assert_eq!(inp.isotope_symbol, "58NI");
+    assert!(!inp.no_broadening);
+    // 6 spin groups, same structure as tr012.
+    assert_eq!(inp.spin_groups.len(), 6);
+}
+
+#[test]
+fn test_tr041_ni58_broadened() {
+    let (inp, par, plt) = load_samtry_case(
+        "tr041_ni58_transmission_ipq",
+        "t041a.inp",
+        "t041a.par",
+        "raa.plt",
+    );
+    let result = validate_broadened_cross_sections(&inp, &par, &plt, 0.10);
+    eprintln!(
+        "tr041 broadened: max_rel={:.6}, mean_rel={:.6}, n={}, above_10%={}, worst@{:.4} keV",
+        result.max_rel_error,
+        result.mean_rel_error,
+        result.n_points,
+        result.n_above_threshold,
+        result.worst_energy_kev
+    );
+    // Ni-58 IPQ broadened at 180–181 keV.
+    // Generated .plt reference from SAMMY run.
+    // IPQ method is specific to SAMMY fitting; reference is Th_initial.
+    assert!(
+        result.mean_rel_error < 0.10,
+        "broadened mean error {:.4} >= 10%",
         result.mean_rel_error
     );
 }
