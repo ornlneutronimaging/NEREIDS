@@ -1,0 +1,12 @@
+Pu240
+Pu240     240.      1.0000E-05  5700.
+twenty
+use ten percent data uncertainty
+generate plot file automatically
+DO NOT SOLVE BAYES EQUATIONS
+INPUT IS ENDF/B FILE
+put unbroadened cross sections into odf file
+  
+300.
+   1.00000      0.3
+total

@@ -1,0 +1,20 @@
+ FE TRANSMISSION FROM 1.13 TO 1.18 KEV
+      FE56 55.9      1133.01   1170.517    99
+PRINT WEIGHTED RESIDUALS
+PRINT THEORETICAL VALUES
+PRINT ALL INPUT PARAMETERS
+PRINT INPUT DATA
+GENERATE PLOT FILE AUTOMATICALLY
+  
+329.      80.263     0.0301   0.0       .021994
+6.0       0.2179                        .001
+TRANSMISSION
+  1      1    0  0.5    0.9999   .0
+    1    1    0    0      .500      .000      .000
+  2      1    0 -0.5    0.9172   .0
+    1    1    0    1      .500      .000      .000
+
+
+BROADENING
+6.00      173.20354 .017766765 .025     0.022     0.022      0 3 3 0 0 0
+0.5         5.0     0.002179  0.005     0.005     0.005
