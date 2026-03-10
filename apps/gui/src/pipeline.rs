@@ -84,12 +84,24 @@ pub fn run_pipeline(state: &mut AppState, from_step: GuidedStep) -> Result<(), S
 /// Re-run the rebin stage.
 ///
 /// Only applies if `rebin_factor > 1` and rebin hasn't already been applied.
-/// In a re-run scenario the data has already been loaded from disk, so we
-/// just need to apply the rebinning again.
-fn run_rebin(_state: &mut AppState) {
-    // Re-running rebin requires reloading original data first, then
-    // re-applying the factor.  Currently a no-op — the pipeline falls
-    // through to Normalize/Analyze which use whatever data is loaded.
+/// In a re-run scenario the data has already been loaded from disk (the
+/// pipeline escalates to Load when dirty_from <= Load), so we just need to
+/// re-apply the rebinning to the freshly loaded data.
+fn run_rebin(state: &mut AppState) {
+    use crate::state::InputMode;
+
+    // Nothing to do if factor is trivial or already applied.
+    if state.rebin_factor <= 1 || state.rebin_applied {
+        return;
+    }
+
+    // Need data to rebin.
+    if state.sample_data.is_none() {
+        return;
+    }
+
+    let is_transmission = state.input_mode == InputMode::TransmissionTiff;
+    crate::guided::rebin::apply_rebin(state, is_transmission);
 }
 
 /// Execute the normalize stage synchronously.
