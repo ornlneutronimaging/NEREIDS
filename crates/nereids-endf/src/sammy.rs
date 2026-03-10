@@ -1160,7 +1160,7 @@ fn parse_spin_groups(lines: &[&str]) -> Result<(Vec<SammySpinGroup>, f64), Sammy
 
 // ─── Converter: SAMMY → NEREIDS ResonanceData ──────────────────────────────────
 
-/// Perturbation offset (eV) added to J values to distinguish spin groups
+/// Small dimensionless perturbation added to J values to distinguish spin groups
 /// with the same |J| but different channel structure.
 const CHANNEL_OFFSET: f64 = 1e-6;
 
