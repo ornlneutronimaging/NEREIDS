@@ -591,8 +591,18 @@ pub fn parse_sammy_par(content: &str) -> Result<SammyParFile, SammyParseError> {
                 continue;
             }
 
-            let awr: f64 = iso_line[..10].trim().parse().unwrap_or(0.0);
-            let abundance: f64 = iso_line[10..20].trim().parse().unwrap_or(0.0);
+            let awr: f64 = iso_line[..10].trim().parse().map_err(|_| {
+                SammyParseError::new(format!(
+                    "ISOTOPIC MASSES: bad AWR field '{}'",
+                    iso_line[..10].trim()
+                ))
+            })?;
+            let abundance: f64 = iso_line[10..20].trim().parse().map_err(|_| {
+                SammyParseError::new(format!(
+                    "ISOTOPIC MASSES: bad abundance field '{}'",
+                    iso_line[10..20].trim()
+                ))
+            })?;
             if awr <= 0.0 {
                 continue;
             }
