@@ -234,3 +234,39 @@ class TestDetectIsotopes:
                 matrix_density=0.01,
                 trace_isotopes=["W-182"],
             )
+
+
+# ---------------------------------------------------------------------------
+# Input validation
+# ---------------------------------------------------------------------------
+
+
+class TestInputValidation:
+    def test_compute_cross_sections_invalid_energy(self):
+        """Energy validation catches bad inputs."""
+        load_endf("Fe-56")
+        with pytest.raises(ValueError, match="energy_min"):
+            compute_cross_sections("Fe-56", energy_min=-1.0)
+        with pytest.raises(ValueError, match="n_points"):
+            compute_cross_sections("Fe-56", n_points=0)
+        with pytest.raises(ValueError, match="energy_min.*less than"):
+            compute_cross_sections("Fe-56", energy_min=100.0, energy_max=1.0)
+
+    def test_compute_transmission_invalid_thickness(self):
+        load_endf("Fe-56")
+        with pytest.raises(ValueError, match="thickness"):
+            compute_transmission("Fe-56", thickness=-1.0)
+
+    def test_forward_model_missing_key(self):
+        load_endf("Fe-56")
+        with pytest.raises(ValueError, match="thickness"):
+            forward_model([{"isotope": "Fe-56"}])  # missing thickness
+
+    def test_detect_isotopes_empty_traces(self):
+        load_endf("Fe-56")
+        with pytest.raises(ValueError, match="empty"):
+            detect_isotopes("Fe-56", 0.01, [])
+
+    def test_list_isotopes_invalid_z(self):
+        with pytest.raises(ValueError, match="z must be"):
+            list_isotopes(0)
