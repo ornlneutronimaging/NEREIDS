@@ -643,7 +643,7 @@ class TestSpatialMapLM:
         unc = np.full_like(trans, 0.005)
 
         result = nereids.spatial_map(
-            trans, unc, energies, [u238_data], max_iter=50
+            trans, unc, energies, [u238_data], temperature_k=0.0, max_iter=50
         )
         # Should return SpatialResult
         assert hasattr(result, "density_maps")
@@ -714,6 +714,7 @@ class TestSpatialMapPoisson:
             open_beam,
             energies,
             [u238_data],
+            temperature_k=0.0,
             fitter="poisson",
             max_iter=50,
         )
