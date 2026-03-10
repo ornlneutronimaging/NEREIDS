@@ -1,0 +1,14 @@
+Pu240
+Pu240     240.054181  0.00001  200.0000     0    0 0  0 0  0         0
+twenty              
+print all input parameters
+do not suppress any intermediate printout
+use ten percent data uncertainty
+generate plot file automatically
+broadening is not wanted
+ 
+  8.880000  0.300000
+total
+  1      1    1  0.5       1.0  0.0
+    1    1    0    0       0.5
+    2    0    0    0       0.5

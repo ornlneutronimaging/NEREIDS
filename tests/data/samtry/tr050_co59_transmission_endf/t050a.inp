@@ -1,0 +1,12 @@
+Cobalt
+Co59        59.     2000.      3000.
+BROADENING IS NOT WANTED
+csisrs                      
+generate plot file automatically
+print theoretical values
+print debug information
+DO NOT SOLVE BAYES EQUATIONS
+INPUT IS ENDF/B FILE
+  
+   1.00000      0.3
+transmission

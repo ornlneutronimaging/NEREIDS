@@ -1,0 +1,15 @@
+Rhodium-like but dummy parameters
+    Rh-103 102.9055    0.00001 10000000.         4
+ev
+twenty
+generate plot file automatically
+print theoretical values
+print partial derivatives
+ 
+  300.0
+  6.560000  0.02435
+TOTAL                                                                         
+  1      1    0  0.0       1.0  0.5
+    1    1    0    0       0.0
+  2      1    0  1.0       1.0  0.5
+    1    1    0    0       1.0

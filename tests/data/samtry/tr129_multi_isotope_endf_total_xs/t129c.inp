@@ -1,0 +1,12 @@
+Na23
+Na23      23.       600.0     500000.
+twenty
+use ten percent data uncertainty
+generate plot file automatically
+DO NOT SOLVE BAYES EQUATIONS
+INPUT IS ENDF/B FILE
+put unbroadened cross sections into odf file
+  
+300.
+   1.00000      0.3
+total

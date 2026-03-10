@@ -345,6 +345,33 @@ pub fn parse_sammy_plt(content: &str) -> Result<Vec<SammyPltRecord>, SammyParseE
 /// Widths are in meV in the file; this function converts to eV.
 ///
 /// SAMMY Ref: `ResonanceParameterIO.cpp`, `mrpti.f90`.
+///
+/// Parse a Fortran-style floating-point literal.
+///
+/// Handles compact exponent notation without 'E': `5.400000-5` → `5.4e-5`,
+/// `1.23+3` → `1.23e3`. Standard notation (`1.23E-5`, `1.23`) is also handled.
+fn parse_fortran_float(s: &str) -> Result<f64, std::num::ParseFloatError> {
+    // Try standard parse first (fast path).
+    if let Ok(v) = s.parse::<f64>() {
+        return Ok(v);
+    }
+    // Look for a bare +/- exponent after a digit: "1.23-5" or "1.23+3".
+    // Skip the first character to avoid matching a leading sign.
+    if s.len() > 1 {
+        for (i, c) in s[1..].char_indices() {
+            let pos = i + 1; // position in original string
+            if (c == '+' || c == '-') && s.as_bytes()[pos - 1].is_ascii_digit() {
+                let mut fixed = String::with_capacity(s.len() + 1);
+                fixed.push_str(&s[..pos]);
+                fixed.push('E');
+                fixed.push_str(&s[pos..]);
+                return fixed.parse::<f64>();
+            }
+        }
+    }
+    s.parse::<f64>()
+}
+
 pub fn parse_sammy_par(content: &str) -> Result<SammyParFile, SammyParseError> {
     let mut resonances = Vec::new();
 
@@ -374,7 +401,7 @@ pub fn parse_sammy_par(content: &str) -> Result<SammyParFile, SammyParseError> {
             if s.is_empty() {
                 return Ok(0.0);
             }
-            s.parse::<f64>().map_err(|e| {
+            parse_fortran_float(s).map_err(|e| {
                 SammyParseError::new(format!("line {}: cannot parse {name} ({s:?}): {e}", i + 1))
             })
         };
@@ -757,6 +784,9 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
         if upper.starts_with("USE NEW SPIN GROUP") {
             use_new_spin_group_format = true;
         }
+        // Recognize "INPUT IS ENDF/B FILE" keyword — informational only.
+        // NEREIDS uses its own ENDF parser; this keyword is skipped.
+        // Optional Mat= parameter on the same line is also ignored.
         idx += 1;
     }
 
@@ -987,7 +1017,7 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
 /// Returns (spin_groups, target_spin).
 fn parse_spin_groups(
     lines: &[&str],
-    new_format: bool,
+    _new_format: bool,
 ) -> Result<(Vec<SammySpinGroup>, f64), SammyParseError> {
     let mut groups = Vec::new();
     let mut target_spin = 0.0;
@@ -1048,8 +1078,10 @@ fn parse_spin_groups(
         // Preserve the sign: SAMMY uses negative J to distinguish spin
         // groups with the same |J|.  The sign keeps them in separate
         // J-groups during cross-section evaluation.
-        // Abundance: OLD cols 20-30 (F11.4), NEW cols 20-29 (F10.0).
-        let abund_end = if new_format { 30 } else { 31 };
+        // Abundance: 10 chars at cols 20-29 (F10.0) in both formats.
+        // SAMMY Ref: ResonanceParameterIO.cpp:931 "10 spaces for abundance (21-30)"
+        // (SAMMY uses 1-based column numbering; 0-based = 20-29).
+        let abund_end = 30;
         let abundance: f64 = {
             let s = col(line, 20, abund_end);
             if s.is_empty() {
@@ -1061,8 +1093,9 @@ fn parse_spin_groups(
             }
         };
 
-        // Target spin: OLD cols 31-35, NEW cols 30-34.
-        let tspin_start = if new_format { 30 } else { 31 };
+        // Target spin: 5 chars at cols 30-34 in both formats.
+        // SAMMY Ref: ResonanceParameterIO.cpp:938 "5 spaces for target spin (31-35)"
+        let tspin_start = 30;
         let group_target_spin = {
             let s = col(line, tspin_start, tspin_start + 5);
             if s.is_empty() {
@@ -1586,8 +1619,11 @@ pub fn sammy_to_resonance_data_multi(
 /// mass number).  Space-separated labels like "CU 65" are handled by
 /// stripping internal spaces.
 pub(crate) fn parse_isotope_symbol(symbol: &str) -> Result<(u32, u32), SammyParseError> {
-    // Strip internal spaces (handles "CU 65" → "CU65").
-    let joined: String = symbol.chars().filter(|c| !c.is_whitespace()).collect();
+    // Strip internal spaces and hyphens (handles "CU 65" → "CU65", "Rh-103" → "RH103").
+    let joined: String = symbol
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .collect();
     let s = joined.to_uppercase();
 
     // Handle "NAT" prefix: "NATFE" → Z from element, A=0.
