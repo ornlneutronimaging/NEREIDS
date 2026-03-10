@@ -47,7 +47,7 @@ use crate::resolution::{self, ResolutionError, ResolutionFunction};
 fn build_aux_grid(
     energies: &[f64],
     instrument: Option<&InstrumentParams>,
-    resonance_data: &[ResonanceData],
+    resonance_data: &[&ResonanceData],
 ) -> Option<(Vec<f64>, Vec<usize>)> {
     instrument.and_then(|inst| {
         if let ResolutionFunction::Gaussian(ref params) = inst.resolution {
@@ -96,7 +96,7 @@ fn build_aux_grid(
 ///
 /// SAMMY Ref: dat/mdat4.f90 Fspken — uses total width to define the region
 /// [E_res − gd, E_res + gd] for fine-structure point insertion.
-fn extract_resonance_widths(resonance_data: &[ResonanceData]) -> Vec<(f64, f64)> {
+fn extract_resonance_widths(resonance_data: &[&ResonanceData]) -> Vec<(f64, f64)> {
     let mut pairs = Vec::new();
     for rd in resonance_data {
         for range in &rd.ranges {
@@ -381,12 +381,13 @@ pub fn forward_model(
     }
 
     // Build auxiliary grid with boundary extension + resonance fine-structure.
+    // Collect references to avoid cloning full ResonanceData structs.
     // SAMMY Ref: dat/mdat4.f90 Escale, Fspken, Add_Pnts
-    let active_rd: Vec<ResonanceData> = sample
+    let active_rd: Vec<&ResonanceData> = sample
         .isotopes()
         .iter()
         .filter(|(_, t)| *t > 0.0)
-        .map(|(rd, _)| rd.clone())
+        .map(|(rd, _)| rd)
         .collect();
     let ext_grid = build_aux_grid(energies, instrument, &active_rd);
 
@@ -499,7 +500,8 @@ pub fn broadened_cross_sections(
     // around narrow resonances so the broadening convolution integrals have
     // adequate quadrature points.
     // SAMMY Ref: dat/mdat4.f90 Escale+Fspken+Add_Pnts, dat/mdata.f90 Vqcon
-    let ext_grid = build_aux_grid(energies, instrument, resonance_data);
+    let rd_refs: Vec<&ResonanceData> = resonance_data.iter().collect();
+    let ext_grid = build_aux_grid(energies, instrument, &rd_refs);
 
     // Parallelize across isotopes — Doppler + resolution broadening for each
     // isotope is independent and this is the dominant cost in the forward model
@@ -535,16 +537,26 @@ pub fn broadened_cross_sections(
                 );
                 data_indices.iter().map(|&i| broadened[i]).collect()
             } else {
-                // No resolution broadening: original pipeline on data grid.
+                // No extended grid: Doppler on data grid, then resolution
+                // on data grid if instrument is present.
                 let unbroadened: Vec<f64> = energies
                     .iter()
                     .map(|&e| reich_moore::cross_sections_at_energy(rd, e).total)
                     .collect();
-                if temperature_k > 0.0 {
+                let after_doppler = if temperature_k > 0.0 {
                     let params = DopplerParams::new(temperature_k, rd.awr)?;
                     doppler::doppler_broaden(energies, &unbroadened, &params)?
                 } else {
                     unbroadened
+                };
+                if let Some(inst) = instrument {
+                    resolution::apply_resolution_presorted(
+                        energies,
+                        &after_doppler,
+                        &inst.resolution,
+                    )
+                } else {
+                    after_doppler
                 }
             };
 
@@ -601,7 +613,8 @@ pub fn broadened_cross_sections_for_transmission(
         return Err(ResolutionError::UnsortedEnergies.into());
     }
 
-    let ext_grid = build_aux_grid(energies, Some(instrument), resonance_data);
+    let rd_refs: Vec<&ResonanceData> = resonance_data.iter().collect();
+    let ext_grid = build_aux_grid(energies, Some(instrument), &rd_refs);
     let nd = thickness_atoms_barn;
 
     let result: Result<Vec<Vec<f64>>, TransmissionError> = resonance_data
@@ -646,7 +659,7 @@ pub fn broadened_cross_sections_for_transmission(
                 data_indices
                     .iter()
                     .map(|&i| {
-                        let t = t_broadened[i].max(1e-30); // Prevent ln(0)
+                        let t = t_broadened[i].clamp(1e-30, 1.0);
                         -t.ln() / nd
                     })
                     .collect()
@@ -679,7 +692,7 @@ pub fn broadened_cross_sections_for_transmission(
                 t_broadened
                     .iter()
                     .map(|&t| {
-                        let t_clamped = t.max(1e-30); // Prevent ln(0)
+                        let t_clamped = t.clamp(1e-30, 1.0);
                         -t_clamped.ln() / nd
                     })
                     .collect()
@@ -830,7 +843,8 @@ pub fn broadened_cross_sections_from_base(
     // cross-sections at the auxiliary-only points (cheap: only the few hundred
     // extra points, not the full grid).
     // SAMMY Ref: dat/mdat4.f90 Escale+Fspken+Add_Pnts
-    let ext_grid = build_aux_grid(energies, instrument, resonance_data);
+    let rd_refs: Vec<&ResonanceData> = resonance_data.iter().collect();
+    let ext_grid = build_aux_grid(energies, instrument, &rd_refs);
 
     // Build a bool mask to identify data-grid positions in the extended grid.
     let is_data_point: Option<Vec<bool>> = ext_grid.as_ref().map(|(ext_e, di)| {

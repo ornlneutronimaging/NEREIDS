@@ -370,7 +370,9 @@ fn compute_xcoef_weights(energies: &[f64]) -> Vec<f64> {
         if k >= 2 {
             a[0] = v1;
             // Curvature correction: x2(k-2) = (v3² - v1²) / v2
-            a[4] = (v3 * v3 - v1 * v1) / v2;
+            if v2.abs() > NEAR_ZERO_FLOOR {
+                a[4] = (v3 * v3 - v1 * v1) / v2;
+            }
         }
         if k >= 1 {
             a[1] = 5.0 * v2;

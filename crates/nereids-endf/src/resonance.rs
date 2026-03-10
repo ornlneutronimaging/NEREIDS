@@ -437,8 +437,9 @@ pub struct RExternalEntry {
 impl RExternalEntry {
     /// Evaluate R_ext(E) at the given energy.
     ///
-    /// Returns 0.0 if the energy is outside `[e_low, e_up]` (log argument
-    /// would be non-positive).
+    /// The polynomial part (`r_con + r_lin·E + r_quad·E²`) applies at all
+    /// energies.  The logarithmic terms are only added when `E` is strictly
+    /// inside `(e_low, e_up)`.
     ///
     /// SAMMY Ref: mcro2.f90 Setr_Cro, lines 180-193
     pub fn evaluate(&self, energy_ev: f64) -> f64 {
