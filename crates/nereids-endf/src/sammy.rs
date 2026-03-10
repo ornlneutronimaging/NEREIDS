@@ -61,6 +61,20 @@ pub struct SammyResonance {
     pub spin_group: u32,
 }
 
+/// Per-isotope mass and abundance entry from "ISOTOPIC MASSES AND ABUNDANCES
+/// FOLLOW" section in a SAMMY `.par` file.
+///
+/// SAMMY Ref: `IsotopicMassesAndAbundances.cpp`, Manual Section II.B.1.e
+#[derive(Debug, Clone)]
+pub struct IsotopicMass {
+    /// Atomic weight ratio (target mass / neutron mass) for this isotope.
+    pub awr: f64,
+    /// Fractional abundance (number fraction) of this isotope in the sample.
+    pub abundance: f64,
+    /// 1-based spin group indices assigned to this isotope.
+    pub spin_groups: Vec<u32>,
+}
+
 /// Parsed SAMMY `.par` file.
 #[derive(Debug, Clone)]
 pub struct SammyParFile {
@@ -75,6 +89,12 @@ pub struct SammyParFile {
     ///
     /// SAMMY Ref: mpar03.f90 Readrx, Manual Section II.B.1.d
     pub r_external: std::collections::HashMap<u32, [f64; 7]>,
+    /// Per-isotope AWR and abundance from "ISOTOPIC MASSES AND ABUNDANCES FOLLOW".
+    /// When present, overrides .inp spin group abundances and provides per-isotope
+    /// AWR values (the .inp only has a global AWR from Card 2).
+    ///
+    /// SAMMY Ref: `IsotopicMassesAndAbundances.cpp`
+    pub isotopic_masses: Vec<IsotopicMass>,
 }
 
 // ─── .inp file types ───────────────────────────────────────────────────────────
@@ -408,7 +428,7 @@ pub fn parse_sammy_par(content: &str) -> Result<SammyParFile, SammyParseError> {
     let lines_vec: Vec<&str> = content.lines().collect();
     if let Some(rad_idx) = lines_vec
         .iter()
-        .position(|l| l.trim().starts_with("RADIUS PARAMETERS"))
+        .position(|l| l.trim().to_uppercase().starts_with("RADIUS"))
     {
         for rad_line in &lines_vec[rad_idx + 1..] {
             let trimmed = rad_line.trim();
@@ -547,10 +567,94 @@ pub fn parse_sammy_par(content: &str) -> Result<SammyParFile, SammyParseError> {
         }
     }
 
+    // Scan for "ISOTOPIC MASSES AND ABUNDANCES FOLLOW" section.
+    //
+    // Format per line (fixed-width, same I2 spin group convention as RADIUS):
+    //   cols  0- 9: AWR (F10)
+    //   cols 10-19: abundance (F10)
+    //   cols 20-29: uncertainty on abundance (F10, ignored)
+    //   cols 30-31: flag (I2, ignored)
+    //   cols 32+ : spin group indices (I2 each, 0 = terminator)
+    //
+    // SAMMY Ref: IsotopicMassesAndAbundances.cpp
+    let mut isotopic_masses = Vec::new();
+    if let Some(iso_idx) = lines_vec
+        .iter()
+        .position(|l| l.trim().to_uppercase().starts_with("ISOTOPIC"))
+    {
+        for iso_line in &lines_vec[iso_idx + 1..] {
+            let trimmed = iso_line.trim();
+            if trimmed.is_empty() || trimmed.starts_with(|c: char| c.is_alphabetic()) {
+                break;
+            }
+            if iso_line.len() < 20 {
+                continue;
+            }
+
+            let awr: f64 = iso_line[..10].trim().parse().map_err(|_| {
+                SammyParseError::new(format!(
+                    "ISOTOPIC MASSES: bad AWR field '{}'",
+                    iso_line[..10].trim()
+                ))
+            })?;
+            let abundance: f64 = iso_line[10..20].trim().parse().map_err(|_| {
+                SammyParseError::new(format!(
+                    "ISOTOPIC MASSES: bad abundance field '{}'",
+                    iso_line[10..20].trim()
+                ))
+            })?;
+            if awr <= 0.0 {
+                continue;
+            }
+
+            // Parse spin group indices — I2 fields starting at position 32,
+            // same convention as RADIUS PARAMETERS section.
+            let group_start = 32.min(iso_line.len());
+            let group_str = &iso_line[group_start..];
+            let mut spin_groups = Vec::new();
+            let mut pos = 0;
+            let mut found_group = false;
+            while pos + 2 <= group_str.len() {
+                let field = group_str[pos..pos + 2].trim();
+                pos += 2;
+                let val: i32 = match field.parse() {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if val > 0 {
+                    spin_groups.push(val as u32);
+                    found_group = true;
+                } else if val == 0 && found_group {
+                    break;
+                }
+            }
+
+            // Fallback: whitespace-split parsing for non-standard formatting.
+            if !found_group {
+                for tok in iso_line[group_start..].split_whitespace() {
+                    if let Ok(v) = tok.parse::<i32>()
+                        && v > 0
+                    {
+                        spin_groups.push(v as u32);
+                    }
+                }
+            }
+
+            if !spin_groups.is_empty() {
+                isotopic_masses.push(IsotopicMass {
+                    awr,
+                    abundance,
+                    spin_groups,
+                });
+            }
+        }
+    }
+
     Ok(SammyParFile {
         resonances,
         radius_overrides,
         r_external,
+        isotopic_masses,
     })
 }
 
@@ -618,6 +722,7 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
     let mut target_spin = 0.0;
     let mut spin_groups = Vec::new();
     let mut no_broadening = false;
+    let mut use_new_spin_group_format = false;
 
     // State machine: find blank line after commands, then parse numeric cards.
     let mut idx = 2;
@@ -633,6 +738,9 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
         // SAMMY allows abbreviated keywords: "BROADENING IS NOT WA" matches.
         if upper.starts_with("BROADENING IS NOT") || upper.contains("NO LOW-ENERGY BROADENING") {
             no_broadening = true;
+        }
+        if upper.starts_with("USE NEW SPIN GROUP") {
+            use_new_spin_group_format = true;
         }
         idx += 1;
     }
@@ -745,7 +853,8 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
                 idx += 1;
             }
             // Parse spin group definitions until blank line.
-            let (groups, parsed_target_spin) = parse_spin_groups(&lines[idx..])?;
+            let (groups, parsed_target_spin) =
+                parse_spin_groups(&lines[idx..], use_new_spin_group_format)?;
             spin_groups = groups;
             target_spin = parsed_target_spin;
             // Advance past spin group block.
@@ -820,18 +929,31 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
 ///     1    1    0    1      .500
 /// ```
 ///
-/// Header line uses fixed-width Fortran FORMAT(I5, I5, I5, F5.1, F11.4, F5.1):
+/// **Old format** header: FORMAT(I5, I5, I5, F5.1, F11.4, F5.1, A7)
 ///   [0:5]   KKK    — spin group index
 ///   [5:10]  NENT   — number of entrance channels
 ///   [10:15] NEXT   — number of exit-only channels
 ///   [15:20] SPINJ  — J value for this group (F5.1)
 ///   [20:31] ABNDNC — abundance/weight (F11.4)
 ///   [31:36] SPINI  — target spin (F5.1)
+///   [36:]   label
 ///
-/// Channel lines use split_whitespace (indented ≥4 spaces).
+/// **New format** header (ResonanceParameterIO.cpp:822-943):
+///   [0:3]   KKK    — spin group index (I3)
+///   [7:10]  NENT   — number of entrance channels (I3)
+///   [12:15] NEXT   — number of exit-only channels (I3)
+///   [15:20] SPINJ  — J value (F5.1) — same as old
+///   [20:30] ABNDNC — abundance (F10.0) — 1 char narrower
+///   [30:35] SPINI  — target spin (data present, SAMMY skips in new format)
+///   [36:]   label
+///
+/// Channel lines: L at cols 18-19 in both formats.
 ///
 /// Returns (spin_groups, target_spin).
-fn parse_spin_groups(lines: &[&str]) -> Result<(Vec<SammySpinGroup>, f64), SammyParseError> {
+fn parse_spin_groups(
+    lines: &[&str],
+    new_format: bool,
+) -> Result<(Vec<SammySpinGroup>, f64), SammyParseError> {
     let mut groups = Vec::new();
     let mut target_spin = 0.0;
     let mut i = 0;
@@ -853,14 +975,15 @@ fn parse_spin_groups(lines: &[&str]) -> Result<(Vec<SammySpinGroup>, f64), Sammy
 
         let line = lines[i];
 
-        // Spin group header line: FORMAT(I5,I5,I5,F5.1,F11.4,F4.1,A7)
-        //   col  0-4:  spin group index (I5)
-        //   col  5-9:  n_ent (number of entrance channels, I5)
-        //   col 10-14: n_exit (number of exit channels, I5)
-        //   col 15-19: J (F5.1)
-        //   col 20-30: abundance (F11.4)
-        //   col 31-35: target spin (F4.1)
-        //   col 36+:   isotope label (A7)
+        // Spin group header line (see doc comment above for old/new layouts).
+        //
+        // Fields common to both formats: index, n_ent, n_exit occupy cols 0-14
+        // (I5 in old, I3+gaps in new — but cols 0-14 parse identically by
+        // trimming).  J is always at cols 15-19 (F5.1).
+        //
+        // Abundance and target spin differ:
+        //   OLD: abundance F11.4 at cols 20-30, target spin F5.1 at cols 31-35
+        //   NEW: abundance F10.0 at cols 20-29, target spin at cols 30-34
         //
         // Total channel lines following = n_ent + n_exit.
         let index: u32 = col(line, 0, 5)
@@ -890,8 +1013,10 @@ fn parse_spin_groups(lines: &[&str]) -> Result<(Vec<SammySpinGroup>, f64), Sammy
         // Preserve the sign: SAMMY uses negative J to distinguish spin
         // groups with the same |J|.  The sign keeps them in separate
         // J-groups during cross-section evaluation.
+        // Abundance: OLD cols 20-30 (F11.4), NEW cols 20-29 (F10.0).
+        let abund_end = if new_format { 30 } else { 31 };
         let abundance: f64 = {
-            let s = col(line, 20, 31);
+            let s = col(line, 20, abund_end);
             if s.is_empty() {
                 1.0
             } else {
@@ -901,9 +1026,10 @@ fn parse_spin_groups(lines: &[&str]) -> Result<(Vec<SammySpinGroup>, f64), Sammy
             }
         };
 
-        // Target spin: parse from each header line (col 31-36).
+        // Target spin: OLD cols 31-35, NEW cols 30-34.
+        let tspin_start = if new_format { 30 } else { 31 };
         let group_target_spin = {
-            let s = col(line, 31, 36);
+            let s = col(line, tspin_start, tspin_start + 5);
             if s.is_empty() {
                 0.0
             } else {
@@ -995,6 +1121,43 @@ pub fn sammy_to_resonance_data(
     let mut l_group_map: std::collections::BTreeMap<u32, Vec<Resonance>> =
         std::collections::BTreeMap::new();
 
+    // Multi-channel J offset: for targets with I > 0 (e.g., Al-27 I=5/2),
+    // multiple SAMMY spin groups can share the same (L, |J|) but represent
+    // different entrance channels (different channel spins).  NEREIDS's
+    // single-channel R-matrix groups resonances by J, computing one U-matrix
+    // per J-group.  If channels are merged, potential scattering from extra
+    // channels is lost.
+    //
+    // Fix: assign slightly perturbed J values to the 2nd, 3rd, ... spin
+    // groups with the same (L, |J|).  The perturbation (1e-6) is:
+    // - Larger than QUANTUM_NUMBER_EPS (1e-10), keeping groups separate
+    // - Negligible for g_J = (2|J|+1) / (2(2I+1)) (error < 1e-6)
+    //
+    // This creates independent J-groups for each entrance channel, correctly
+    // computing separate U-matrix elements and potential scattering.
+    //
+    // Guard: only apply for I > 0 (non-zero target spin).  For I = 0
+    // (even-even nuclei like Ni-58, Fe-56), there is exactly one channel
+    // per (L, J).  Duplicate (L, J) spin groups in I = 0 cases represent
+    // pseudo-isotope contaminants (e.g., water proxy in tr029), not extra
+    // channels.  Separating them incorrectly doubles their potential
+    // scattering contribution.
+    //
+    // Ref: SAMMY Manual Eq. III A.1, sum over entrance channels c.
+    const CHANNEL_OFFSET: f64 = 1e-6;
+    let mut lj_seen: std::collections::HashMap<(u32, i64), u32> = std::collections::HashMap::new();
+    let mut sg_j_offset: std::collections::HashMap<u32, f64> = std::collections::HashMap::new();
+    if inp.target_spin.abs() > 1e-10 {
+        for sg in &inp.spin_groups {
+            let j_key = (sg.j.abs() * 1_000_000.0).round() as i64;
+            let count = lj_seen.entry((sg.l, j_key)).or_insert(0);
+            if *count > 0 {
+                sg_j_offset.insert(sg.index, *count as f64 * CHANNEL_OFFSET);
+            }
+            *count += 1;
+        }
+    }
+
     for res in &par.resonances {
         let sg = group_map.get(&res.spin_group).ok_or_else(|| {
             SammyParseError::new(format!(
@@ -1003,9 +1166,10 @@ pub fn sammy_to_resonance_data(
             ))
         })?;
 
+        let j = sg.j + sg_j_offset.get(&sg.index).copied().unwrap_or(0.0);
         l_group_map.entry(sg.l).or_default().push(Resonance {
             energy: res.energy_ev,
-            j: sg.j,
+            j,
             gn: res.gamma_n_ev,
             gg: res.gamma_gamma_ev,
             gfa: res.gamma_f1_ev,
@@ -1022,9 +1186,10 @@ pub fn sammy_to_resonance_data(
         par.resonances.iter().map(|r| r.spin_group).collect();
     for sg in &inp.spin_groups {
         if !sg_indices_with_resonances.contains(&sg.index) {
+            let j = sg.j + sg_j_offset.get(&sg.index).copied().unwrap_or(0.0);
             l_group_map.entry(sg.l).or_default().push(Resonance {
                 energy: 0.0,
-                j: sg.j,
+                j,
                 gn: 0.0,
                 gg: 0.0,
                 gfa: 0.0,
@@ -1180,6 +1345,17 @@ pub fn sammy_to_resonance_data_multi(
     let sg_map: std::collections::HashMap<u32, &SammySpinGroup> =
         inp.spin_groups.iter().map(|sg| (sg.index, sg)).collect();
 
+    // Build spin_group → (awr, abundance) from ISOTOPIC MASSES section if present.
+    // These override the .inp spin group abundances and provide per-isotope AWR.
+    let mut sg_iso_awr: std::collections::HashMap<u32, f64> = std::collections::HashMap::new();
+    let mut sg_iso_abund: std::collections::HashMap<u32, f64> = std::collections::HashMap::new();
+    for im in &par.isotopic_masses {
+        for &sg_idx in &im.spin_groups {
+            sg_iso_awr.insert(sg_idx, im.awr);
+            sg_iso_abund.insert(sg_idx, im.abundance);
+        }
+    }
+
     // Z from Card 2 (shared across all groups).
     let (card2_z, card2_a) = parse_isotope_symbol(&inp.isotope_symbol)?;
 
@@ -1187,8 +1363,15 @@ pub fn sammy_to_resonance_data_multi(
 
     for key in &group_order {
         let member_indices = &group_members[key];
-        let abundance = group_abundance[key];
         let target_spin = group_target_spin[key];
+
+        // Use ISOTOPIC MASSES abundance when available (overrides .inp spin
+        // group headers).  Fall back to .inp abundance.
+        let first_sg_idx = inp.spin_groups[member_indices[0]].index;
+        let abundance = sg_iso_abund
+            .get(&first_sg_idx)
+            .copied()
+            .unwrap_or(group_abundance[key]);
 
         // Collect the spin group indices (1-based) for this group.
         let sg_indices: std::collections::HashSet<u32> = member_indices
@@ -1203,6 +1386,28 @@ pub fn sammy_to_resonance_data_multi(
             .filter(|r| sg_indices.contains(&r.spin_group))
             .collect();
 
+        // Multi-channel J offset for this isotope group (same logic as
+        // sammy_to_resonance_data — see detailed comment there).
+        //
+        // Guard: only apply for I > 0 (non-zero target spin).  For I = 0
+        // (even-even nuclei), duplicate (L, J) spin groups represent
+        // pseudo-isotope contaminants, not extra channels.
+        const CHANNEL_OFFSET: f64 = 1e-6;
+        let mut lj_seen: std::collections::HashMap<(u32, i64), u32> =
+            std::collections::HashMap::new();
+        let mut sg_j_offset: std::collections::HashMap<u32, f64> = std::collections::HashMap::new();
+        if target_spin.abs() > 1e-10 {
+            for &mi in member_indices {
+                let sg = &inp.spin_groups[mi];
+                let j_key = (sg.j.abs() * 1_000_000.0).round() as i64;
+                let count = lj_seen.entry((sg.l, j_key)).or_insert(0);
+                if *count > 0 {
+                    sg_j_offset.insert(sg.index, *count as f64 * CHANNEL_OFFSET);
+                }
+                *count += 1;
+            }
+        }
+
         // Build L-groups from these resonances.
         let mut l_group_map: std::collections::BTreeMap<u32, Vec<Resonance>> =
             std::collections::BTreeMap::new();
@@ -1215,9 +1420,10 @@ pub fn sammy_to_resonance_data_multi(
                 ))
             })?;
 
+            let j = sg.j + sg_j_offset.get(&sg.index).copied().unwrap_or(0.0);
             l_group_map.entry(sg.l).or_default().push(Resonance {
                 energy: res.energy_ev,
-                j: sg.j,
+                j,
                 gn: res.gamma_n_ev,
                 gg: res.gamma_gamma_ev,
                 gfa: res.gamma_f1_ev,
@@ -1233,9 +1439,10 @@ pub fn sammy_to_resonance_data_multi(
             if !res_sg_indices.contains(&idx)
                 && let Some(sg) = sg_map.get(&idx)
             {
+                let j = sg.j + sg_j_offset.get(&sg.index).copied().unwrap_or(0.0);
                 l_group_map.entry(sg.l).or_default().push(Resonance {
                     energy: 0.0,
-                    j: sg.j,
+                    j,
                     gn: 0.0,
                     gg: 0.0,
                     gfa: 0.0,
@@ -1255,13 +1462,17 @@ pub fn sammy_to_resonance_data_multi(
             }
         }
 
+        // Per-isotope AWR: use ISOTOPIC MASSES value when available,
+        // fall back to .inp global AWR from Card 2.
+        let isotope_awr = sg_iso_awr.get(&first_sg_idx).copied().unwrap_or(inp.awr);
+
         let l_groups: Vec<LGroup> = l_group_map
             .into_iter()
             .map(|(l, resonances)| {
                 let apl = l_radius_map.get(&l).copied().unwrap_or(0.0);
                 LGroup {
                     l,
-                    awr: inp.awr,
+                    awr: isotope_awr,
                     apl,
                     qx: 0.0,
                     lrx: 0,
@@ -1279,7 +1490,7 @@ pub fn sammy_to_resonance_data_multi(
         };
         // For natural-element symbols (A=0), approximate A from AWR.
         if a == 0 {
-            a = inp.awr.round() as u32;
+            a = isotope_awr.round() as u32;
         }
         let za = z * 1000 + a;
 
@@ -1289,9 +1500,10 @@ pub fn sammy_to_resonance_data_multi(
             if let Some(sg) = sg_map.get(&idx)
                 && let Some(params) = par.r_external.get(&sg.index)
             {
+                let j = sg.j + sg_j_offset.get(&sg.index).copied().unwrap_or(0.0);
                 r_external_entries.push(RExternalEntry {
                     l: sg.l,
-                    j: sg.j,
+                    j,
                     e_low: params[0],
                     e_up: params[1],
                     r_con: params[2],
@@ -1322,7 +1534,7 @@ pub fn sammy_to_resonance_data_multi(
             isotope: Isotope::new(z, a)
                 .map_err(|e| SammyParseError::new(format!("invalid isotope: {e}")))?,
             za,
-            awr: inp.awr,
+            awr: isotope_awr,
             ranges: vec![range],
         };
 
@@ -1382,6 +1594,11 @@ pub(crate) fn parse_isotope_symbol(symbol: &str) -> Result<(u32, u32), SammyPars
         {
             return Ok((z, a));
         }
+    }
+
+    // Try bare element symbol without mass number (e.g. "Al" → Z=13, A=0).
+    if let Some(z) = element_symbol_to_z(&s) {
+        return Ok((z, 0));
     }
 
     // Try full element name (e.g. "ZIRCONIUM" → Z=40, A=0 natural).
@@ -1790,6 +2007,7 @@ BROADENING
             ],
             radius_overrides: std::collections::HashMap::new(),
             r_external: std::collections::HashMap::new(),
+            isotopic_masses: Vec::new(),
         };
         let rd = sammy_to_resonance_data(&inp, &par).unwrap();
         assert_eq!(rd.za, 26056); // Fe-56
