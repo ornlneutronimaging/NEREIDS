@@ -863,6 +863,11 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
             } else if trimmed.starts_with("FISSI") {
                 observation_type = SammyObservationType::Fission;
             }
+            // NOTE: CAPTU (capture) and DIRAC observables are recognized so
+            // the parser advances through their spin group definitions, but
+            // observation_type intentionally remains Transmission (default).
+            // Extend SammyObservationType when capture/Dirac physics are
+            // implemented in NEREIDS.
             idx += 1;
             // Skip data-reduction parameter lines (SAMMY Card 8) that can
             // appear between the TRANSMISSION keyword and spin group
