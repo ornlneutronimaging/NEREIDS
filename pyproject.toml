@@ -5,6 +5,12 @@ description = "Neutron Resonance Imaging Data Analysis Library"
 requires-python = ">= 3.10"
 license = "BSD-3-Clause"
 
+[project.optional-dependencies]
+mcp = ["fastmcp>=3.0"]
+
+[project.scripts]
+nereids-mcp = "nereids.mcp:mcp.run"
+
 [build-system]
 requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
