@@ -774,6 +774,10 @@ pub struct AppState {
     pub save_data_mode: SaveDataMode,
     /// Data mode used in the last explicit save (for Cmd+S re-save).
     pub last_save_mode: SaveDataMode,
+    /// Whether a background save is in progress.
+    pub is_saving: bool,
+    /// Channel to receive the save result from the background thread.
+    pub pending_save: Option<mpsc::Receiver<Result<(PathBuf, SaveDataMode), String>>>,
 
     // -- Session persistence --
     /// Cached session from a previous run (loaded at startup, cleared on use).
@@ -1017,6 +1021,8 @@ impl AppState {
         self.is_fetching_endf = false;
         self.is_fetching_fm_endf = false;
         self.is_fetching_detect_endf = false;
+        self.is_saving = false;
+        self.pending_save = None;
         // Reset any Fetching entries back to Pending (cancellation interrupted them)
         for e in &mut self.isotope_entries {
             if e.endf_status == EndfStatus::Fetching {
@@ -1339,6 +1345,8 @@ impl Default for AppState {
             show_save_modal: false,
             save_data_mode: SaveDataMode::Linked,
             last_save_mode: SaveDataMode::Linked,
+            is_saving: false,
+            pending_save: None,
 
             cached_session: None,
         }
