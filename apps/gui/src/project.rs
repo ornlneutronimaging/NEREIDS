@@ -500,7 +500,7 @@ fn execute_save(state: &mut AppState, path: &Path, mode: SaveDataMode) {
     state.pending_save = Some(rx);
     state.status_message = "Saving project...".into();
 
-    std::thread::spawn(move || {
+    let handle = std::thread::spawn(move || {
         let result = if let Some((ref sample, ref open_beam, ref spectrum)) = embedded_data {
             let emb = EmbeddedData {
                 sample: sample.as_ref(),
@@ -513,6 +513,7 @@ fn execute_save(state: &mut AppState, path: &Path, mode: SaveDataMode) {
         };
         let _ = tx.send(result.map(|()| (path, mode)).map_err(|e| e.to_string()));
     });
+    state.save_join_handle = Some(handle);
 
     // Watcher thread to poke the GUI event loop until save completes.
     if let Some(ctx) = ctx {
@@ -591,6 +592,14 @@ pub fn load_project_from_path(state: &mut AppState, path: &Path) {
 fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path) {
     // 0. Cancel any in-flight background tasks (ENDF fetches, fitting, etc.)
     state.cancel_pending_tasks();
+
+    // cancel_pending_tasks deliberately leaves save state alone (save cannot be
+    // cancelled safely). Since we are replacing the entire session, clear save
+    // tracking explicitly — the background thread will still finish its HDF5
+    // write, but we no longer care about the result.
+    state.is_saving = false;
+    state.pending_save = None;
+    state.save_join_handle = None;
 
     // 1. Clear derived state
     state.spatial_result = None;

@@ -53,6 +53,14 @@ impl NereidsApp {
 }
 
 impl eframe::App for NereidsApp {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // If a background save is in progress, block until it completes
+        // to avoid corrupting the HDF5 file.
+        if let Some(handle) = self.state.save_join_handle.take() {
+            handle.join().ok();
+        }
+    }
+
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         if let Some(cache) = SessionCache::from_state(&self.state) {
             eframe::set_value(storage, SESSION_CACHE_KEY, &cache);
@@ -393,16 +401,19 @@ fn poll_pending_tasks(state: &mut AppState) {
                 );
                 state.is_saving = false;
                 state.pending_save = None;
+                state.save_join_handle = None;
             }
             Ok(Err(msg)) => {
                 state.status_message = format!("Save failed: {msg}");
                 state.is_saving = false;
                 state.pending_save = None;
+                state.save_join_handle = None;
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 state.status_message = "Save task failed unexpectedly".into();
                 state.is_saving = false;
                 state.pending_save = None;
+                state.save_join_handle = None;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {} // Still saving
         }
