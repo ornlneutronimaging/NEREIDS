@@ -1,0 +1,21 @@
+PU 239 FISSION  FROM  0. EV TO 304. EV     2-8-84
+     PU239      239.      0.        304.         0
+CHI SQUARED IS WANTED
+high energy Gaussian approximation
+PRINT WEIGHTED RESIDUALS
+PRINT THEORETICAL VALUES
+PRINT VARIED INPUT PARAMETERS
+PRINT INPUT DATA
+DO NOT SUPPRESS INTERMEDIATE RESULTS
+GENERATE PLOT FILE AUTOMATICALLY
+  
+     300.      21.65      .024        0.        0.
+     9.011        0.
+FISSION
+  1      1    2   .0       1.0   .5
+    1    1    0    0      .000
+    2    0    0    0      .000
+    3    0    0    0      .000
+  2      1    1  1.0       1.0   .5
+    1    1    0    0     1.000
+    2    0    0    0     1.000

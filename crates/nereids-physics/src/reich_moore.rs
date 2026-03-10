@@ -1357,7 +1357,12 @@ fn reich_moore_2ch_precomputed(
         [-y_mat[1][0] * inv_det, y_mat[0][0] * inv_det],
     ];
 
-    // X-matrix: X_ij = sqrt(P_i) * (Y^-1 * R)_ij * sqrt(P_j) / L_jj
+    // X-matrix (ENDF-102 Eq. 2.76):
+    // W_ij = sqrt(P_i) * (L^{-1}_i) * (Y^{-1} * R)_ij * sqrt(P_j)
+    //
+    // The L^{-1} factor is applied to channel i (row), NOT channel j (column).
+    // This matters for off-diagonal elements where L_n = iP ≠ L_f = i.
+    // Ref: (I - RL)^{-1} = L^{-1} · Y^{-1}, so L^{-1} multiplies from the left.
     let mut q = [[Complex64::new(0.0, 0.0); 2]; 2];
     for i in 0..2 {
         for j in 0..2 {
@@ -1368,11 +1373,11 @@ fn reich_moore_2ch_precomputed(
     }
 
     let sqrt_p = [p_l.sqrt(), 1.0]; // sqrt(P_n), sqrt(P_f)
+    let l_vals = [l_n, l_f];
     let mut x_mat = [[Complex64::new(0.0, 0.0); 2]; 2];
     for i in 0..2 {
         for j in 0..2 {
-            let l_jj = if j == 0 { l_n } else { l_f };
-            x_mat[i][j] = sqrt_p[i] * q[i][j] * sqrt_p[j] / l_jj;
+            x_mat[i][j] = sqrt_p[i] * q[i][j] * sqrt_p[j] / l_vals[i];
         }
     }
 
@@ -1457,7 +1462,7 @@ fn reich_moore_3ch_precomputed(
     }
     for i in 0..3 {
         for j in 0..3 {
-            x_mat[i][j] = sqrt_p[i] * q[i][j] * sqrt_p[j] / l_vals[j];
+            x_mat[i][j] = sqrt_p[i] * q[i][j] * sqrt_p[j] / l_vals[i];
         }
     }
 
