@@ -1378,18 +1378,24 @@ pub fn sammy_to_resonance_data_multi(
 
         // Multi-channel J offset for this isotope group (same logic as
         // sammy_to_resonance_data — see detailed comment there).
+        //
+        // Guard: only apply for I > 0 (non-zero target spin).  For I = 0
+        // (even-even nuclei), duplicate (L, J) spin groups represent
+        // pseudo-isotope contaminants, not extra channels.
         const CHANNEL_OFFSET: f64 = 1e-6;
         let mut lj_seen: std::collections::HashMap<(u32, i64), u32> =
             std::collections::HashMap::new();
         let mut sg_j_offset: std::collections::HashMap<u32, f64> = std::collections::HashMap::new();
-        for &mi in member_indices {
-            let sg = &inp.spin_groups[mi];
-            let j_key = (sg.j.abs() * 1_000_000.0).round() as i64;
-            let count = lj_seen.entry((sg.l, j_key)).or_insert(0);
-            if *count > 0 {
-                sg_j_offset.insert(sg.index, *count as f64 * CHANNEL_OFFSET);
+        if target_spin.abs() > 1e-10 {
+            for &mi in member_indices {
+                let sg = &inp.spin_groups[mi];
+                let j_key = (sg.j.abs() * 1_000_000.0).round() as i64;
+                let count = lj_seen.entry((sg.l, j_key)).or_insert(0);
+                if *count > 0 {
+                    sg_j_offset.insert(sg.index, *count as f64 * CHANNEL_OFFSET);
+                }
+                *count += 1;
             }
-            *count += 1;
         }
 
         // Build L-groups from these resonances.
@@ -1484,9 +1490,10 @@ pub fn sammy_to_resonance_data_multi(
             if let Some(sg) = sg_map.get(&idx)
                 && let Some(params) = par.r_external.get(&sg.index)
             {
+                let j = sg.j + sg_j_offset.get(&sg.index).copied().unwrap_or(0.0);
                 r_external_entries.push(RExternalEntry {
                     l: sg.l,
-                    j: sg.j,
+                    j,
                     e_low: params[0],
                     e_up: params[1],
                     r_con: params[2],
