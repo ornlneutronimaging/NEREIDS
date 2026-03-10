@@ -111,7 +111,7 @@ pub struct SammySpinGroup {
     pub l: u32,
     /// Statistical weight / abundance.
     pub abundance: f64,
-    /// Per-spin-group target spin I, parsed from column [31:36] of each
+    /// Per-spin-group target spin I, parsed from columns [30:35] of each
     /// header line.  Defaults to 0.0 (even-even nuclei).
     pub target_spin: f64,
     /// Optional isotope label from the header line (columns ~52+),
@@ -779,9 +779,9 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
         if upper.starts_with("BROADENING IS NOT") || upper.contains("NO LOW-ENERGY BROADENING") {
             no_broadening = true;
         }
-        // Recognize "INPUT IS ENDF/B FILE" keyword — informational only.
-        // NEREIDS uses its own ENDF parser; this keyword is skipped.
-        // Optional Mat= parameter on the same line is also ignored.
+        // "INPUT IS ENDF/B FILE" and similar keywords are informational only.
+        // NEREIDS uses its own ENDF parser; such keywords (and any optional
+        // Mat= parameter on the same line) are ignored here.
         idx += 1;
     }
 
@@ -1029,9 +1029,9 @@ fn parse_spin_groups(lines: &[&str]) -> Result<(Vec<SammySpinGroup>, f64), Sammy
         // (I5 in old, I3+gaps in new — but cols 0-14 parse identically by
         // trimming).  J is always at cols 15-19 (F5.1).
         //
-        // Abundance and target spin differ:
-        //   OLD: abundance F11.4 at cols 20-30, target spin F5.1 at cols 31-35
-        //   NEW: abundance F10.0 at cols 20-29, target spin at cols 30-34
+        // Abundance: F10.0 at cols 20-29 (unified, both formats).
+        // Target spin: F5.1 at cols 30-34 (unified, both formats).
+        // SAMMY Ref: ResonanceParameterIO.cpp:931-938.
         //
         // Total channel lines following = n_ent + n_exit.
         let index: u32 = col(line, 0, 5)
