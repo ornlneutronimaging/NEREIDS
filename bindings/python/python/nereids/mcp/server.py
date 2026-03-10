@@ -5,7 +5,13 @@ from __future__ import annotations
 import math
 
 import numpy as np
-from fastmcp import FastMCP
+try:
+    from fastmcp import FastMCP
+except ModuleNotFoundError as exc:
+    raise ModuleNotFoundError(
+        "fastmcp is required for the MCP server. "
+        "Install it with: pip install 'nereids[mcp]'"
+    ) from exc
 
 import nereids
 
