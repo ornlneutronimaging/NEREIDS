@@ -1,0 +1,26 @@
+58-NI TRANSMISSION
+      58NI    57.935  180000.0  181000.0  140    0
+ipq
+PRINT VARIED INPUT PARAMETERS
+GENERATE PLOT FILE A
+PRINT DEBUG INFORMATION
+PRINT THEORETICAL VALUES
+CHI SQUARED IS WANTED
+ENERGY UNCERTAINTIES ARE AT THE END OF LINE IN PAR FILE
+  
+      300.  201.5780    0.0290    0.0000    0.0050
+    6.40    0.172400
+TRANSMISSION
+  1      1    0   .5       1.0   .0
+    1    1    0    0      .500
+  2      1    0  -.5       1.0   .0
+    1    1    0    1      .500
+  3      1    0 -1.5       1.0   .0
+    1    1    0    1      .500
+  4      1    0  1.5       1.0   .0
+    1    1    0    2      .500
+  5      1    0  2.5       1.0   .0
+    1    1    0    2      .500
+  6      1    0 -2.5       1.0   .0
+    1    1    0    3      .500
+  

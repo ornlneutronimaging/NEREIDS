@@ -14,7 +14,9 @@ use std::fmt;
 
 use nereids_core::types::Isotope;
 
-use crate::resonance::{LGroup, Resonance, ResonanceData, ResonanceFormalism, ResonanceRange};
+use crate::resonance::{
+    LGroup, RExternalEntry, Resonance, ResonanceData, ResonanceFormalism, ResonanceRange,
+};
 
 // ─── Error type ────────────────────────────────────────────────────────────────
 
@@ -63,6 +65,16 @@ pub struct SammyResonance {
 #[derive(Debug, Clone)]
 pub struct SammyParFile {
     pub resonances: Vec<SammyResonance>,
+    /// Per-spin-group channel radius overrides from "RADIUS PARAMETERS FOLLOW".
+    /// Maps 1-based spin group index → effective channel radius in fm.
+    /// When present, overrides the global scattering radius from the .inp file.
+    pub radius_overrides: std::collections::HashMap<u32, f64>,
+    /// Per-spin-group R-external parameters from "R-EXTERNAL PARAMETERS FOLLOW".
+    /// Maps 1-based spin group index → 7 R-external parameters
+    /// [E_low, E_up, R_con, R_lin, s_con, s_lin, R_quad].
+    ///
+    /// SAMMY Ref: mpar03.f90 Readrx, Manual Section II.B.1.d
+    pub r_external: std::collections::HashMap<u32, [f64; 7]>,
 }
 
 // ─── .inp file types ───────────────────────────────────────────────────────────
@@ -250,9 +262,9 @@ pub fn parse_sammy_plt(content: &str) -> Result<Vec<SammyPltRecord>, SammyParseE
             continue;
         }
         let fields: Vec<&str> = trimmed.split_whitespace().collect();
-        if fields.len() < 5 {
+        if fields.len() < 4 {
             return Err(SammyParseError::new(format!(
-                "line {}: expected 5 columns, got {}",
+                "line {}: expected >=4 columns, got {}",
                 i + 1,
                 fields.len()
             )));
@@ -262,12 +274,18 @@ pub fn parse_sammy_plt(content: &str) -> Result<Vec<SammyPltRecord>, SammyParseE
                 SammyParseError::new(format!("line {}: cannot parse {col}: {e}", i + 1))
             })
         };
+        // Some .plt files have only 4 columns (no Th_final) when SAMMY
+        // did not fit (e.g., "reconstruct cross sections" mode).
         records.push(SammyPltRecord {
             energy_kev: parse(fields[0], "energy")?,
             data: parse(fields[1], "data")?,
             uncertainty: parse(fields[2], "uncertainty")?,
             theory_initial: parse(fields[3], "theory_initial")?,
-            theory_final: parse(fields[4], "theory_final")?,
+            theory_final: if fields.len() >= 5 {
+                parse(fields[4], "theory_final")?
+            } else {
+                0.0
+            },
         });
     }
     if records.is_empty() {
@@ -375,7 +393,165 @@ pub fn parse_sammy_par(content: &str) -> Result<SammyParFile, SammyParseError> {
     if resonances.is_empty() {
         return Err(SammyParseError::new("no resonances found in .par file"));
     }
-    Ok(SammyParFile { resonances })
+
+    // Continue scanning for "RADIUS PARAMETERS FOLLOW" section after the
+    // resonance block.  SAMMY par file layout:
+    //   <resonances>
+    //   <blank>
+    //   <uncertainties/other sections>
+    //   RADIUS PARAMETERS FOLLOW
+    //   <radius lines>
+    //   <blank>
+    //
+    // Ref: SAMMY AdjustedRadiusData.cpp readOldStyle
+    let mut radius_overrides = std::collections::HashMap::new();
+    let lines_vec: Vec<&str> = content.lines().collect();
+    if let Some(rad_idx) = lines_vec
+        .iter()
+        .position(|l| l.trim().starts_with("RADIUS PARAMETERS"))
+    {
+        for rad_line in &lines_vec[rad_idx + 1..] {
+            let trimmed = rad_line.trim();
+            if trimmed.is_empty() || trimmed.starts_with(|c: char| c.is_alphabetic()) {
+                break; // End of radius section.
+            }
+
+            // Old-style format (AdjustedRadiusData.cpp readOldStyle):
+            //   Positions 0-9:   effective radius (F10)
+            //   Positions 10-19: true radius (F10)
+            //   Position  20:    chanOpt (I1) — ignored
+            //   Position  21:    ifleff  (I1) — ignored
+            //   Positions 22-23: ifltrue (I2) — ignored
+            //   Positions 24+:   spin group indices (I2 each, 0 = terminator)
+            if rad_line.len() < 20 {
+                continue;
+            }
+            let r_eff: f64 = rad_line[..10].trim().parse().unwrap_or(0.0);
+            if r_eff <= 0.0 {
+                continue;
+            }
+
+            // Extract spin group indices from I2 fields starting at position 24.
+            let group_str = if rad_line.len() > 24 {
+                &rad_line[24..]
+            } else {
+                ""
+            };
+            let mut pos = 0;
+            let mut found_group = false;
+            while pos + 2 <= group_str.len() {
+                let field = group_str[pos..pos + 2].trim();
+                pos += 2;
+                let val: i32 = match field.parse() {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if val > 0 {
+                    radius_overrides.insert(val as u32, r_eff);
+                    found_group = true;
+                } else if val == 0 && found_group {
+                    break; // 0 after groups = terminator.
+                }
+            }
+
+            // Fallback: if no I2 groups found but line has tokens after radii,
+            // try whitespace-split parsing (handles short lines like "3.57 3.57 0 0 6").
+            if !found_group {
+                for tok in rad_line[20..].split_whitespace() {
+                    if let Ok(v) = tok.parse::<i32>()
+                        && v > 0
+                    {
+                        radius_overrides.insert(v as u32, r_eff);
+                    }
+                }
+            }
+        }
+    }
+
+    // Scan for "R-EXTERNAL PARAMETERS FOLLOW" section.
+    //
+    // SAMMY 7-parameter format (mpar03.f90 Readrx):
+    //   I2 = spin group number (cols 1-2)
+    //   I1 = channel number    (col  3)
+    //   7×I1 = fit flags       (cols 4-10)
+    //   7×F10.1 = parameters   (cols 11-80)
+    //     P[0]=E_low, P[1]=E_up, P[2]=R_con, P[3]=R_lin,
+    //     P[4]=s_con, P[5]=s_lin, P[6]=R_quad
+    //
+    // Ref: SAMMY Manual Section II.B.1.d, mpar03.f90 Readrx
+    let mut r_external = std::collections::HashMap::new();
+    if let Some(rext_idx) = lines_vec
+        .iter()
+        .position(|l| l.trim().starts_with("R-EXTERNAL PARAMETERS"))
+    {
+        for rext_line in &lines_vec[rext_idx + 1..] {
+            let trimmed = rext_line.trim();
+            if trimmed.is_empty() || trimmed.starts_with(|c: char| c.is_alphabetic()) {
+                break; // End of R-external section.
+            }
+
+            // Need at least 10 chars (I2+I1+7×I1) + 70 chars (7×F10.1) = 80.
+            if rext_line.len() < 40 {
+                continue;
+            }
+
+            // Parse spin group index (I2, cols 0-1) and channel (I1, col 2).
+            let sg: u32 = match rext_line[..2].trim().parse() {
+                Ok(v) if v > 0 => v,
+                _ => continue,
+            };
+            // Channel number (col 2) — we only use channel 1 (neutron elastic).
+            // Fit flags (cols 3-9) — not needed for cross-section calculation.
+
+            // Parse 7 parameters from cols 10+, each F10.1 (10 chars wide).
+            // Allow flexible parsing: try fixed-width first, fall back to
+            // whitespace-split for non-standard formatting.
+            let param_str = &rext_line[10..];
+            let mut params = [0.0f64; 7];
+            let mut parsed_ok = true;
+
+            // Try fixed-width F10.1 parsing (standard SAMMY format).
+            if param_str.len() >= 70 {
+                for (i, chunk) in (0..7).map(|i| (i, &param_str[i * 10..(i + 1) * 10])) {
+                    match chunk.trim().parse::<f64>() {
+                        Ok(v) => params[i] = v,
+                        Err(_) => {
+                            parsed_ok = false;
+                            break;
+                        }
+                    }
+                }
+            } else {
+                parsed_ok = false;
+            }
+
+            // Fallback: whitespace-delimited parsing.
+            if !parsed_ok {
+                let tokens: Vec<f64> = param_str
+                    .split_whitespace()
+                    .filter_map(|t| t.parse().ok())
+                    .collect();
+                // Require exactly 7 parameters; skip malformed entries.
+                if tokens.len() != 7 {
+                    continue;
+                }
+                for (i, &v) in tokens.iter().enumerate().take(7) {
+                    params[i] = v;
+                }
+            }
+
+            // Keep the FIRST entry per spin group (channel 1 = elastic).
+            // Subsequent channels (fission, etc.) are intentionally ignored
+            // since only the elastic R-external contribution is currently used.
+            r_external.entry(sg).or_insert(params);
+        }
+    }
+
+    Ok(SammyParFile {
+        resonances,
+        radius_overrides,
+        r_external,
+    })
 }
 
 // ─── .inp parser ───────────────────────────────────────────────────────────────
@@ -454,8 +630,8 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
         }
         // Detect no-broadening keywords.
         let upper = trimmed.to_uppercase();
-        if upper.contains("BROADENING IS NOT WANTED") || upper.contains("NO LOW-ENERGY BROADENING")
-        {
+        // SAMMY allows abbreviated keywords: "BROADENING IS NOT WA" matches.
+        if upper.starts_with("BROADENING IS NOT") || upper.contains("NO LOW-ENERGY BROADENING") {
             no_broadening = true;
         }
         idx += 1;
@@ -475,9 +651,32 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
     // When `no_broadening` is set AND the first numeric line has exactly 2
     // fields, Card 5 is absent — the line is Card 6 (scattering_radius,
     // thickness).  Example: tr034c.inp.
+    // Card 5 (broadening params) is always present when broadening is active.
+    // When "BROADENING IS NOT WANTED", Card 5 may or may not be present:
+    // - tr028: no_broadening + Card 5 present (7 fields, next line is Card 6)
+    // - tr018/tr034: no_broadening + Card 5 absent (2 fields, next is TRANSMISSION)
+    // - tr037: no_broadening + Card 5 absent (4 fields, next is TRANSMISSION)
+    //
+    // Heuristic: when no_broadening, peek at the line AFTER the current one.
+    // If that next line is also numeric (starts with digit/sign/dot), then
+    // the current line is Card 5 (and the next is Card 6).  If the next
+    // line is a keyword (starts with alpha), the current line is Card 6
+    // (Card 5 was skipped).
     let card5_present = if idx < lines.len() {
-        let fields: Vec<&str> = lines[idx].split_whitespace().collect();
-        !(no_broadening && fields.len() == 2)
+        if no_broadening {
+            // Look ahead to determine if Card 5 is present.
+            if idx + 1 < lines.len() {
+                let next_trimmed = lines[idx + 1].trim();
+                next_trimmed
+                    .bytes()
+                    .next()
+                    .is_some_and(|b| b.is_ascii_digit() || b == b'.' || b == b'-' || b == b'+')
+            } else {
+                false
+            }
+        } else {
+            true // Broadening active → Card 5 always present.
+        }
     } else {
         false
     };
@@ -528,6 +727,23 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
         // SAMMY allows keyword abbreviations: "TRANS" matches "TRANSMISSION".
         if trimmed.starts_with("TRANS") || trimmed.starts_with("TOTAL") {
             idx += 1;
+            // Skip data-reduction parameter lines (SAMMY Card 8) that can
+            // appear between the TRANSMISSION keyword and spin group
+            // definitions.  Spin group headers have a positive integer in
+            // columns 0-4; Card 8 lines have floats (e.g. "0.0 0.0 0 1"
+            // in tr025).
+            while idx < lines.len() {
+                let l = lines[idx];
+                let field = if l.len() >= 5 {
+                    l[..5].trim()
+                } else {
+                    l.trim()
+                };
+                if field.is_empty() || field.parse::<u32>().is_ok() {
+                    break;
+                }
+                idx += 1;
+            }
             // Parse spin group definitions until blank line.
             let (groups, parsed_target_spin) = parse_spin_groups(&lines[idx..])?;
             spin_groups = groups;
@@ -635,98 +851,122 @@ fn parse_spin_groups(lines: &[&str]) -> Result<(Vec<SammySpinGroup>, f64), Sammy
             break; // End of spin group block.
         }
 
-        // Distinguish header vs channel line by leading whitespace.
-        // Header lines have ≤3 leading spaces; channel lines have ≥4.
-        let leading_spaces = lines[i].len() - lines[i].trim_start().len();
-        let is_header = leading_spaces <= 3 && lines[i].len() >= 20;
+        let line = lines[i];
 
-        if is_header {
-            let line = lines[i];
-            // Fixed-width column extraction.
-            let index: u32 = col(line, 0, 5)
-                .parse()
-                .map_err(|e| SammyParseError::new(format!("spin group index: {e}")))?;
-            let j: f64 = col(line, 15, 20)
-                .parse()
-                .map_err(|e| SammyParseError::new(format!("spin group J: {e}")))?;
-            // Preserve the sign: SAMMY uses negative J to distinguish spin
-            // groups with the same |J|.  The sign keeps them in separate
-            // J-groups during cross-section evaluation.
-            let abundance: f64 = {
-                let s = col(line, 20, 31);
-                if s.is_empty() {
-                    1.0
-                } else {
-                    s.parse().map_err(|e| {
-                        SammyParseError::new(format!("spin group abundance ({s:?}): {e}"))
-                    })?
-                }
-            };
-
-            // Target spin: parse from each header line (col 31-36).
-            let group_target_spin = {
-                let s = col(line, 31, 36);
-                if s.is_empty() {
-                    0.0
-                } else {
-                    s.parse::<f64>().map_err(|e| {
-                        SammyParseError::new(format!("spin group target spin ({s:?}): {e}"))
-                    })?
-                }
-            };
-            // Use first group's target spin as the global default.
-            if groups.is_empty() {
-                target_spin = group_target_spin;
-            }
-
-            // Optional isotope label: text after column 36, trimmed.
-            // Multi-isotope cases (e.g. tr034) store labels like "Cu65", "Cu63".
-            let isotope_label = if line.len() > 36 {
-                let s = line[36..].trim();
-                if s.is_empty() {
-                    None
-                } else {
-                    Some(s.to_string())
-                }
+        // Spin group header line: FORMAT(I5,I5,I5,F5.1,F11.4,F4.1,A7)
+        //   col  0-4:  spin group index (I5)
+        //   col  5-9:  n_ent (number of entrance channels, I5)
+        //   col 10-14: n_exit (number of exit channels, I5)
+        //   col 15-19: J (F5.1)
+        //   col 20-30: abundance (F11.4)
+        //   col 31-35: target spin (F4.1)
+        //   col 36+:   isotope label (A7)
+        //
+        // Total channel lines following = n_ent + n_exit.
+        let index: u32 = col(line, 0, 5)
+            .parse()
+            .map_err(|e| SammyParseError::new(format!("spin group index: {e}")))?;
+        let n_ent: u32 = {
+            let s = col(line, 5, 10);
+            if s.is_empty() {
+                1
             } else {
-                None
-            };
-
-            // The next line is the channel definition — extract L.
-            //
-            // SAMMY Card Set 10.1 (old format) channel card columns
-            // (from ResonanceParameterIO.cpp:readOldChannelData):
-            //   cols  3-4: channel ID
-            //   cols  5-7: kz1 (charge, usually blank)
-            //   cols  8-9: lpent
-            //   cols 10-12: kz2 (charge, usually blank)
-            //   cols 13-14: ishift
-            //   cols 15-17: ifexcl (usually blank)
-            //   cols 18-19: L (orbital angular momentum)  ← this is what we need
-            //   cols 20-29: channel spin
-            //
-            // Use fixed-width column extraction (cols 18-20) instead of
-            // whitespace split, which breaks when blank fields (kz1, kz2,
-            // ifexcl) are present or absent.
-            let mut l = 0u32;
-            if i + 1 < lines.len() {
-                let l_str = col(lines[i + 1], 18, 20);
-                if !l_str.is_empty() {
-                    l = l_str.parse().unwrap_or(0);
-                }
+                s.parse()
+                    .map_err(|e| SammyParseError::new(format!("spin group n_ent ({s:?}): {e}")))?
             }
+        };
+        let n_exit: u32 = {
+            let s = col(line, 10, 15);
+            if s.is_empty() {
+                0
+            } else {
+                s.parse()
+                    .map_err(|e| SammyParseError::new(format!("spin group n_exit ({s:?}): {e}")))?
+            }
+        };
+        let j: f64 = col(line, 15, 20)
+            .parse()
+            .map_err(|e| SammyParseError::new(format!("spin group J: {e}")))?;
+        // Preserve the sign: SAMMY uses negative J to distinguish spin
+        // groups with the same |J|.  The sign keeps them in separate
+        // J-groups during cross-section evaluation.
+        let abundance: f64 = {
+            let s = col(line, 20, 31);
+            if s.is_empty() {
+                1.0
+            } else {
+                s.parse().map_err(|e| {
+                    SammyParseError::new(format!("spin group abundance ({s:?}): {e}"))
+                })?
+            }
+        };
 
-            groups.push(SammySpinGroup {
-                index,
-                j,
-                l,
-                abundance,
-                target_spin: group_target_spin,
-                isotope_label,
-            });
+        // Target spin: parse from each header line (col 31-36).
+        let group_target_spin = {
+            let s = col(line, 31, 36);
+            if s.is_empty() {
+                0.0
+            } else {
+                s.parse::<f64>().map_err(|e| {
+                    SammyParseError::new(format!("spin group target spin ({s:?}): {e}"))
+                })?
+            }
+        };
+        // Use first group's target spin as the global default.
+        if groups.is_empty() {
+            target_spin = group_target_spin;
         }
-        // Skip channel lines (they follow their header).
-        i += 1;
+
+        // Optional isotope label: text after column 36, trimmed.
+        // Multi-isotope cases (e.g. tr034) store labels like "Cu65", "Cu63".
+        let isotope_label = if line.len() > 36 {
+            let s = line[36..].trim();
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.to_string())
+            }
+        } else {
+            None
+        };
+
+        // Extract L from the first channel line following this header.
+        //
+        // SAMMY Card Set 10.1 (old format) channel card columns
+        // (from ResonanceParameterIO.cpp:readOldChannelData):
+        //   cols  0-2: spin group index (I3)
+        //   cols  3-4: channel ID (I2)
+        //   cols  5-7: kz1 (charge, usually blank)
+        //   cols  8-9: lpent
+        //   cols 10-12: kz2 (charge, usually blank)
+        //   cols 13-14: ishift
+        //   cols 15-17: ifexcl (usually blank)
+        //   cols 18-19: L (orbital angular momentum)  ← this is what we need
+        //   cols 20-29: channel spin
+        //
+        // Use fixed-width column extraction (cols 18-20) instead of
+        // whitespace split, which breaks when blank fields (kz1, kz2,
+        // ifexcl) are present or absent.
+        let n_channels = n_ent + n_exit;
+        let mut l = 0u32;
+        if i + 1 < lines.len() {
+            let l_str = col(lines[i + 1], 18, 20);
+            if !l_str.is_empty() {
+                l = l_str.parse().unwrap_or(0);
+            }
+        }
+
+        groups.push(SammySpinGroup {
+            index,
+            j,
+            l,
+            abundance,
+            target_spin: group_target_spin,
+            isotope_label,
+        });
+
+        // Skip channel lines: n_ent + n_exit lines follow the header.
+        i += 1 + n_channels as usize;
     }
 
     Ok((groups, target_spin))
@@ -773,16 +1013,55 @@ pub fn sammy_to_resonance_data(
         });
     }
 
+    // Inject zero-width sentinel resonances for spin groups that have no
+    // resonances in the .par file.  These spin groups still contribute
+    // potential scattering: R=0 → U = e^{-2iφ_L} → σ_pot ≠ 0.
+    // Without sentinels, the L-group (or J-group within it) is never
+    // created, and the potential scattering is silently lost.
+    let sg_indices_with_resonances: std::collections::HashSet<u32> =
+        par.resonances.iter().map(|r| r.spin_group).collect();
+    for sg in &inp.spin_groups {
+        if !sg_indices_with_resonances.contains(&sg.index) {
+            l_group_map.entry(sg.l).or_default().push(Resonance {
+                energy: 0.0,
+                j: sg.j,
+                gn: 0.0,
+                gg: 0.0,
+                gfa: 0.0,
+                gfb: 0.0,
+            });
+        }
+    }
+
+    // Build per-L-group radius from par file "RADIUS PARAMETERS FOLLOW".
+    // SAMMY assigns radii per spin group; NEREIDS uses per-L-group (apl).
+    // Map: L → radius by looking up each spin group's L value and its
+    // assigned radius.  All spin groups with the same L should have the
+    // same radius (verified in SAMMY test cases).
+    //
+    // Ref: SAMMY AdjustedRadiusData.cpp readOldStyle
+    let mut l_radius_map: std::collections::HashMap<u32, f64> = std::collections::HashMap::new();
+    for sg in &inp.spin_groups {
+        if let Some(&r) = par.radius_overrides.get(&sg.index) {
+            l_radius_map.entry(sg.l).or_insert(r);
+        }
+    }
+
     // Build LGroups.
     let l_groups: Vec<LGroup> = l_group_map
         .into_iter()
-        .map(|(l, resonances)| LGroup {
-            l,
-            awr: inp.awr,
-            apl: 0.0, // Use global scattering radius.
-            qx: 0.0,
-            lrx: 0,
-            resonances,
+        .map(|(l, resonances)| {
+            // Use per-L-group radius if available, else fall back to global
+            // (apl=0.0 means "use range.scattering_radius").
+            let apl = l_radius_map.get(&l).copied().unwrap_or(0.0);
+            LGroup {
+                l,
+                awr: inp.awr,
+                apl,
+                qx: 0.0,
+                lrx: 0,
+                resonances,
+            }
         })
         .collect();
 
@@ -803,6 +1082,12 @@ pub fn sammy_to_resonance_data(
     // energy in the .plt reference file, which may extend beyond the .inp
     // analysis window.  SAMMY's .inp energy limits define the fitting region,
     // not the physics validity bounds of the resonance parameters.
+    // R-external is NOT included in the single-isotope path.
+    //
+    // The single-isotope path merges ALL spin groups (including minor isotopes)
+    // into one ResonanceRange.  R-external entries from one isotope's spin groups
+    // could erroneously match another isotope's (L, J) group, corrupting the
+    // cross section.  Use sammy_to_resonance_data_multi() for cases with R-ext.
     let range = ResonanceRange {
         energy_low: 1e-5,
         energy_high: 2e7,
@@ -815,6 +1100,7 @@ pub fn sammy_to_resonance_data(
         l_groups,
         rml: None,
         urr: None,
+        r_external: vec![],
     };
 
     Ok(ResonanceData {
@@ -939,15 +1225,48 @@ pub fn sammy_to_resonance_data_multi(
             });
         }
 
+        // Inject zero-width sentinels for spin groups in this isotope
+        // group that have no resonances (same fix as sammy_to_resonance_data).
+        let res_sg_indices: std::collections::HashSet<u32> =
+            group_resonances.iter().map(|r| r.spin_group).collect();
+        for &idx in &sg_indices {
+            if !res_sg_indices.contains(&idx)
+                && let Some(sg) = sg_map.get(&idx)
+            {
+                l_group_map.entry(sg.l).or_default().push(Resonance {
+                    energy: 0.0,
+                    j: sg.j,
+                    gn: 0.0,
+                    gg: 0.0,
+                    gfa: 0.0,
+                    gfb: 0.0,
+                });
+            }
+        }
+
+        // Build per-L radius map for this isotope group's spin groups.
+        let mut l_radius_map: std::collections::HashMap<u32, f64> =
+            std::collections::HashMap::new();
+        for &idx in &sg_indices {
+            if let Some(sg) = sg_map.get(&idx)
+                && let Some(&r) = par.radius_overrides.get(&sg.index)
+            {
+                l_radius_map.entry(sg.l).or_insert(r);
+            }
+        }
+
         let l_groups: Vec<LGroup> = l_group_map
             .into_iter()
-            .map(|(l, resonances)| LGroup {
-                l,
-                awr: inp.awr,
-                apl: 0.0,
-                qx: 0.0,
-                lrx: 0,
-                resonances,
+            .map(|(l, resonances)| {
+                let apl = l_radius_map.get(&l).copied().unwrap_or(0.0);
+                LGroup {
+                    l,
+                    awr: inp.awr,
+                    apl,
+                    qx: 0.0,
+                    lrx: 0,
+                    resonances,
+                }
             })
             .collect();
 
@@ -964,6 +1283,26 @@ pub fn sammy_to_resonance_data_multi(
         }
         let za = z * 1000 + a;
 
+        // Build R-external entries for this isotope group's spin groups.
+        let mut r_external_entries = Vec::new();
+        for &idx in &sg_indices {
+            if let Some(sg) = sg_map.get(&idx)
+                && let Some(params) = par.r_external.get(&sg.index)
+            {
+                r_external_entries.push(RExternalEntry {
+                    l: sg.l,
+                    j: sg.j,
+                    e_low: params[0],
+                    e_up: params[1],
+                    r_con: params[2],
+                    r_lin: params[3],
+                    s_con: params[4],
+                    s_lin: params[5],
+                    r_quad: params[6],
+                });
+            }
+        }
+
         let range = ResonanceRange {
             energy_low: 1e-5,
             energy_high: 2e7,
@@ -976,6 +1315,7 @@ pub fn sammy_to_resonance_data_multi(
             l_groups,
             rml: None,
             urr: None,
+            r_external: r_external_entries,
         };
 
         let resonance_data = ResonanceData {
@@ -1011,9 +1351,15 @@ pub(crate) fn parse_isotope_symbol(symbol: &str) -> Result<(u32, u32), SammyPars
     }
 
     // Try format: "60NI" (mass number first, then element symbol).
+    // Extract just the leading alphabetic chars as element symbol to handle
+    // labels with trailing comments (e.g. "94Zr ... FAKES" → "ZR").
     if let Some(split_pos) = s.find(|c: char| c.is_ascii_alphabetic()) {
         let mass_str = &s[..split_pos];
-        let elem_str = &s[split_pos..];
+        let remaining = &s[split_pos..];
+        let alpha_len = remaining
+            .find(|c: char| !c.is_ascii_alphabetic())
+            .unwrap_or(remaining.len());
+        let elem_str = &remaining[..alpha_len];
         if !mass_str.is_empty()
             && let Ok(a) = mass_str.parse::<u32>()
             && let Some(z) = element_symbol_to_z(elem_str)
@@ -1023,14 +1369,24 @@ pub(crate) fn parse_isotope_symbol(symbol: &str) -> Result<(u32, u32), SammyPars
     }
 
     // Try format: "FE56" (element symbol first, then mass number).
+    // Extract just the leading digit chars to handle trailing garbage.
     if let Some(split_pos) = s.find(|c: char| c.is_ascii_digit()) {
         let elem_str = &s[..split_pos];
-        let mass_str = &s[split_pos..];
+        let remaining = &s[split_pos..];
+        let digit_len = remaining
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(remaining.len());
+        let mass_str = &remaining[..digit_len];
         if let Ok(a) = mass_str.parse::<u32>()
             && let Some(z) = element_symbol_to_z(elem_str)
         {
             return Ok((z, a));
         }
+    }
+
+    // Try full element name (e.g. "ZIRCONIUM" → Z=40, A=0 natural).
+    if let Some(z) = element_name_to_z(&s) {
+        return Ok((z, 0));
     }
 
     Err(SammyParseError::new(format!(
@@ -1143,6 +1499,108 @@ fn element_symbol_to_z(symbol: &str) -> Option<u32> {
         "CF" => Some(98),
         "ES" => Some(99),
         "FM" => Some(100),
+        _ => None,
+    }
+}
+
+/// Map full element name (uppercase) to atomic number Z.
+///
+/// Handles SAMMY inp files that use full element names on Card 2
+/// (e.g. "ZIRCONIUM" instead of "ZR").
+fn element_name_to_z(name: &str) -> Option<u32> {
+    match name {
+        "HYDROGEN" => Some(1),
+        "HELIUM" => Some(2),
+        "LITHIUM" => Some(3),
+        "BERYLLIUM" => Some(4),
+        "BORON" => Some(5),
+        "CARBON" => Some(6),
+        "NITROGEN" => Some(7),
+        "OXYGEN" => Some(8),
+        "FLUORINE" => Some(9),
+        "NEON" => Some(10),
+        "SODIUM" => Some(11),
+        "MAGNESIUM" => Some(12),
+        "ALUMINUM" | "ALUMINIUM" => Some(13),
+        "SILICON" => Some(14),
+        "PHOSPHORUS" => Some(15),
+        "SULFUR" | "SULPHUR" => Some(16),
+        "CHLORINE" => Some(17),
+        "ARGON" => Some(18),
+        "POTASSIUM" => Some(19),
+        "CALCIUM" => Some(20),
+        "SCANDIUM" => Some(21),
+        "TITANIUM" => Some(22),
+        "VANADIUM" => Some(23),
+        "CHROMIUM" => Some(24),
+        "MANGANESE" => Some(25),
+        "IRON" => Some(26),
+        "COBALT" => Some(27),
+        "NICKEL" => Some(28),
+        "COPPER" => Some(29),
+        "ZINC" => Some(30),
+        "GALLIUM" => Some(31),
+        "GERMANIUM" => Some(32),
+        "ARSENIC" => Some(33),
+        "SELENIUM" => Some(34),
+        "BROMINE" => Some(35),
+        "KRYPTON" => Some(36),
+        "RUBIDIUM" => Some(37),
+        "STRONTIUM" => Some(38),
+        "YTTRIUM" => Some(39),
+        "ZIRCONIUM" => Some(40),
+        "NIOBIUM" => Some(41),
+        "MOLYBDENUM" => Some(42),
+        "TECHNETIUM" => Some(43),
+        "RUTHENIUM" => Some(44),
+        "RHODIUM" => Some(45),
+        "PALLADIUM" => Some(46),
+        "SILVER" => Some(47),
+        "CADMIUM" => Some(48),
+        "INDIUM" => Some(49),
+        "TIN" => Some(50),
+        "ANTIMONY" => Some(51),
+        "TELLURIUM" => Some(52),
+        "IODINE" => Some(53),
+        "XENON" => Some(54),
+        "CESIUM" | "CAESIUM" => Some(55),
+        "BARIUM" => Some(56),
+        "LANTHANUM" => Some(57),
+        "CERIUM" => Some(58),
+        "PRASEODYMIUM" => Some(59),
+        "NEODYMIUM" => Some(60),
+        "PROMETHIUM" => Some(61),
+        "SAMARIUM" => Some(62),
+        "EUROPIUM" => Some(63),
+        "GADOLINIUM" => Some(64),
+        "TERBIUM" => Some(65),
+        "DYSPROSIUM" => Some(66),
+        "HOLMIUM" => Some(67),
+        "ERBIUM" => Some(68),
+        "THULIUM" => Some(69),
+        "YTTERBIUM" => Some(70),
+        "LUTETIUM" => Some(71),
+        "HAFNIUM" => Some(72),
+        "TANTALUM" => Some(73),
+        "TUNGSTEN" => Some(74),
+        "RHENIUM" => Some(75),
+        "OSMIUM" => Some(76),
+        "IRIDIUM" => Some(77),
+        "PLATINUM" => Some(78),
+        "GOLD" => Some(79),
+        "MERCURY" => Some(80),
+        "THALLIUM" => Some(81),
+        "LEAD" => Some(82),
+        "BISMUTH" => Some(83),
+        "THORIUM" => Some(90),
+        "PROTACTINIUM" => Some(91),
+        "URANIUM" => Some(92),
+        "NEPTUNIUM" => Some(93),
+        "PLUTONIUM" => Some(94),
+        "AMERICIUM" => Some(95),
+        "CURIUM" => Some(96),
+        "BERKELIUM" => Some(97),
+        "CALIFORNIUM" => Some(98),
         _ => None,
     }
 }
@@ -1330,6 +1788,8 @@ BROADENING
                     spin_group: 2,
                 },
             ],
+            radius_overrides: std::collections::HashMap::new(),
+            r_external: std::collections::HashMap::new(),
         };
         let rd = sammy_to_resonance_data(&inp, &par).unwrap();
         assert_eq!(rd.za, 26056); // Fe-56

@@ -323,6 +323,17 @@ pub struct ResonanceRange {
     /// formula in `nereids_physics::urr::urr_cross_sections`.
     #[serde(default)]
     pub urr: Option<Box<UrrData>>,
+    /// R-external (background R-matrix) entries per spin group.
+    ///
+    /// Diagonal, real-valued corrections to the R-matrix that approximate
+    /// the effect of distant (unresolved) resonances.  Keyed by (L, J).
+    ///
+    /// Populated from SAMMY's "R-EXTERNAL PARAMETERS FOLLOW" section.
+    /// Empty for ENDF-only data or SAMMY cases without R-external.
+    ///
+    /// SAMMY Ref: Manual Section II.B.1.d, mpar03.f90 Readrx
+    #[serde(default)]
+    pub r_external: Vec<RExternalEntry>,
 }
 
 /// Parameters grouped by orbital angular momentum L.
@@ -383,6 +394,68 @@ pub struct Resonance {
     pub gfa: f64,
     /// Second fission width (eV). Zero for non-fissile isotopes.
     pub gfb: f64,
+}
+
+// ─── R-External (Background R-Matrix) ─────────────────────────────────────────
+
+/// R-external (background R-matrix) parameters for a single spin group channel.
+///
+/// Parameterizes smooth R-matrix contribution from distant (unresolved)
+/// resonances.  The background R-matrix is diagonal and real-valued,
+/// parameterized as a logarithmic polynomial in energy.
+///
+/// ## Formula
+/// ```text
+/// R_ext(E) = R_con + R_lin·E + R_quad·E²
+///          + s_lin·(E_up − E_low)
+///          − (s_con + s_lin·E)·ln[(E_up − E) / (E − E_low)]
+/// ```
+///
+/// SAMMY Ref: Manual Section II.B.1.d, mcro2.f90 lines 180-193
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RExternalEntry {
+    /// Orbital angular momentum L of the spin group.
+    pub l: u32,
+    /// Total angular momentum J (signed, per SAMMY convention).
+    pub j: f64,
+    /// Lower energy bound (eV).
+    pub e_low: f64,
+    /// Upper energy bound (eV).
+    pub e_up: f64,
+    /// Constant term in R-matrix polynomial.
+    pub r_con: f64,
+    /// Linear coefficient (eV⁻¹).
+    pub r_lin: f64,
+    /// Constant logarithmic coefficient.
+    pub s_con: f64,
+    /// Linear logarithmic coefficient (eV⁻¹).
+    pub s_lin: f64,
+    /// Quadratic coefficient (eV⁻²).
+    pub r_quad: f64,
+}
+
+impl RExternalEntry {
+    /// Evaluate R_ext(E) at the given energy.
+    ///
+    /// The polynomial part (`r_con + r_lin·E + r_quad·E²`) applies at all
+    /// energies.  The logarithmic terms are only added when `E` is strictly
+    /// inside `(e_low, e_up)`.
+    ///
+    /// SAMMY Ref: mcro2.f90 Setr_Cro, lines 180-193
+    pub fn evaluate(&self, energy_ev: f64) -> f64 {
+        let e = energy_ev;
+        let mut r = self.r_con + self.r_lin * e + self.r_quad * e * e;
+
+        let e_up_diff = self.e_up - e;
+        let e_low_diff = e - self.e_low;
+        if e_up_diff > 0.0 && e_low_diff > 0.0 {
+            let log_val = (e_up_diff / e_low_diff).ln();
+            r -= (self.s_con + self.s_lin * e) * log_val;
+            r += self.s_lin * (self.e_up - self.e_low);
+        }
+
+        r
+    }
 }
 
 // ─── LRF=7 (R-Matrix Limited) Data Structures ────────────────────────────────
@@ -735,6 +808,7 @@ mod tests {
             l_groups: vec![],
             rml: None,
             urr: None,
+            r_external: vec![],
         };
         assert_eq!(range.scattering_radius_at(1.0), 9.4285);
         assert_eq!(range.scattering_radius_at(1000.0), 9.4285);
@@ -757,6 +831,7 @@ mod tests {
             l_groups: vec![],
             rml: None,
             urr: None,
+            r_external: vec![],
         };
         // At 1 eV: 8.0 fm
         assert!((range.scattering_radius_at(1.0) - 8.0).abs() < 1e-10);

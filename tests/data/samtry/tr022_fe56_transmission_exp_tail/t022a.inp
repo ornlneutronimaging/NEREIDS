@@ -1,0 +1,18 @@
+FE TRANSMISSION COOLED FROM 1.1372 TO 1.1649 KEV
+      FE56 55.9      1137.1    1164.9     129    1
+#DO NOT PRINT WEIGHTED RESIDUALS
+PRINT THEORETICAL VALUES
+PRINT ALL INPUT PARAMETERS
+high energy Gaussian approximation
+shift energy for exponential tail on resolution broadening
+DO NOT PRINT INPUT DATA
+DO NOT SUPPRESS ANY INTERMEDIATE RESULTS
+GENERATE PLOT FILE AUTOMATICALLY
+
+146.      80.263    0.025     0.022     0.022
+6.0       0.01754   
+TRANSMISSION
+  1      1    0  0.5    0.9999   .0
+    1    1    0    0      .500
+  2      1    0 -0.5    0.9172   .0
+    1    1    0    1      .500

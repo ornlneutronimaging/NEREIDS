@@ -1,0 +1,19 @@
+SAMPLE TEST CASE #18... CHECK NO BROADENING WITH TRANSMISSION
+      U235      235.   1500.       1505.              0
+cro
+DO NOT SOLVE BAYES EQUATIONS
+PRINT DEBUG INFORMATION
+PRINT THEORETICAL VALUES
+BROADENING IS NOT WA
+GENERATE PLOT FILE A
+
+    9.5663     0.05
+TRANSMISSION
+  1      1    2  3.0       1.0  3.5
+    1    1    0    0     3.000
+    2    0    0    0     3.000
+    3    0    0    0     3.000
+  2      1    2  4.0       1.0  3.5
+    1    1    0    0     4.000
+    2    0    0    0     4.000
+    3    0    0    0     4.000

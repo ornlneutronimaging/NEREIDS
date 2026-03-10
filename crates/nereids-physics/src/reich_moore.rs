@@ -99,6 +99,8 @@ struct PrecomputedResonance3ch {
 ///
 /// Used by both Reich-Moore (single/2ch/3ch) and SLBW precompute paths.
 pub(crate) struct PrecomputedJGroup<R> {
+    /// Total angular momentum J (signed, per SAMMY convention).
+    pub(crate) j: f64,
     /// Statistical weight g_J = (2J+1) / ((2I+1)(2s+1)).
     pub(crate) g_j: f64,
     /// Pre-computed per-resonance quantities for this J-group.
@@ -174,6 +176,7 @@ pub(crate) fn group_resonances_by_j<R>(
         } else {
             j_values.push(j);
             groups.push(PrecomputedJGroup {
+                j,
                 g_j: channel::statistical_weight(j, target_spin),
                 resonances: vec![precomp],
             });
@@ -666,6 +669,12 @@ fn precompute_range_data<'a>(
                         jgroups,
                     }
                 } else if !has_two_fission {
+                    // R-external for fission channels is a future extension;
+                    // warn if any entries match this L-group.
+                    debug_assert!(
+                        !range.r_external.iter().any(|re| re.l == l),
+                        "R-external entries exist for L={l} (2ch fission path) but are not applied"
+                    );
                     let jgroups = precompute_jgroups_2ch(
                         &l_group.resonances,
                         l,
@@ -681,6 +690,12 @@ fn precompute_range_data<'a>(
                         jgroups,
                     }
                 } else {
+                    // R-external for fission channels is a future extension;
+                    // warn if any entries match this L-group.
+                    debug_assert!(
+                        !range.r_external.iter().any(|re| re.l == l),
+                        "R-external entries exist for L={l} (3ch fission path) but are not applied"
+                    );
                     let jgroups = precompute_jgroups_3ch(
                         &l_group.resonances,
                         l,
@@ -798,12 +813,18 @@ fn evaluate_precomputed_range(
                 let phi_l = penetrability::phase_shift(l, rho);
 
                 let (t, e, c, f) = match lg {
-                    PrecomputedRmLGroupData::Single { jgroups, .. } => {
+                    PrecomputedRmLGroupData::Single { l, jgroups, .. } => {
                         let mut t = 0.0;
                         let mut e = 0.0;
                         let mut c = 0.0;
                         let mut f = 0.0;
                         for jg in jgroups {
+                            let r_ext = range
+                                .r_external
+                                .iter()
+                                .find(|re| re.l == *l && (re.j - jg.j).abs() < QUANTUM_NUMBER_EPS)
+                                .map(|re| re.evaluate(energy_ev))
+                                .unwrap_or(0.0);
                             let (jt, je, jc, jf) = reich_moore_spin_group_precomputed(
                                 &jg.resonances,
                                 energy_ev,
@@ -812,6 +833,7 @@ fn evaluate_precomputed_range(
                                 p_l,
                                 s_l,
                                 phi_l,
+                                r_ext,
                             );
                             t += jt;
                             e += je;
@@ -997,6 +1019,13 @@ fn cross_sections_for_range(
                         target_spin,
                     );
                     for jg in &jgroups {
+                        // R-external: look up background R-matrix for this (L, J).
+                        let r_ext = range
+                            .r_external
+                            .iter()
+                            .find(|re| re.l == l && (re.j - jg.j).abs() < QUANTUM_NUMBER_EPS)
+                            .map(|re| re.evaluate(energy_ev))
+                            .unwrap_or(0.0);
                         let (t, e, c, f) = reich_moore_spin_group_precomputed(
                             &jg.resonances,
                             energy_ev,
@@ -1005,6 +1034,7 @@ fn cross_sections_for_range(
                             p_l,
                             s_l,
                             phi_l,
+                            r_ext,
                         );
                         total += t;
                         elastic += e;
@@ -1012,6 +1042,12 @@ fn cross_sections_for_range(
                         fission += f;
                     }
                 } else if !has_two_fission {
+                    // R-external for fission channels is a future extension;
+                    // warn if any entries match this L-group.
+                    debug_assert!(
+                        !range.r_external.iter().any(|re| re.l == l),
+                        "R-external entries exist for L={l} (2ch fission path) but are not applied"
+                    );
                     // 2-channel fission: build J-groups (see note above).
                     let jgroups = precompute_jgroups_2ch(
                         &l_group.resonances,
@@ -1037,6 +1073,12 @@ fn cross_sections_for_range(
                         fission += f;
                     }
                 } else {
+                    // R-external for fission channels is a future extension;
+                    // warn if any entries match this L-group.
+                    debug_assert!(
+                        !range.r_external.iter().any(|re| re.l == l),
+                        "R-external entries exist for L={l} (3ch fission path) but are not applied"
+                    );
                     // 3-channel fission: build J-groups (see note above).
                     let jgroups = precompute_jgroups_3ch(
                         &l_group.resonances,
@@ -1119,6 +1161,7 @@ fn reich_moore_spin_group_precomputed(
     p_l: f64,
     s_l: f64,
     phi_l: f64,
+    r_ext: f64,
 ) -> (f64, f64, f64, f64) {
     let pi_over_k2 = channel::pi_over_k_squared_barns(energy_ev, awr);
 
@@ -1170,6 +1213,11 @@ fn reich_moore_spin_group_precomputed(
             r_imag += gamma_n_reduced_sq * half_gg / denom;
         }
     }
+
+    // R-external: diagonal, real-valued background R-matrix correction.
+    // Adds smooth energy-dependent contribution from distant resonances.
+    // SAMMY Ref: mcro2.f90 Setr_Cro lines 180-193
+    r_real += r_ext;
 
     // Level matrix Y = 1/(S - B + iP) - R  (scalar, complex)
     let l_real = s_l - boundary;
@@ -1510,6 +1558,7 @@ mod tests {
                 rml: None,
                 ap_table: None,
                 urr: None,
+                r_external: vec![],
             }],
         }
     }
@@ -1707,6 +1756,7 @@ mod tests {
                 rml: None,
                 ap_table: None,
                 urr: None,
+                r_external: vec![],
             }],
         }
     }
@@ -1895,6 +1945,7 @@ mod tests {
                 rml: None,
                 ap_table: None,
                 urr: None,
+                r_external: vec![],
             }],
         };
 
