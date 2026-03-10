@@ -819,6 +819,11 @@ fn evaluate_precomputed_range(
                         let mut c = 0.0;
                         let mut f = 0.0;
                         for jg in jgroups {
+                            // SAFETY: Float J comparison is safe here because both R-matrix
+                            // resonance J values and R-external J values originate from the
+                            // same `compute_j_offsets()` map in sammy.rs. The offset is either
+                            // 0.0 or N * 1e-6 (exact floating-point), so the values are
+                            // bit-identical and 1e-10 epsilon is ample.
                             let r_ext = range
                                 .r_external
                                 .iter()
@@ -1020,6 +1025,11 @@ fn cross_sections_for_range(
                     );
                     for jg in &jgroups {
                         // R-external: look up background R-matrix for this (L, J).
+                        // SAFETY: Float J comparison is safe here because both R-matrix
+                        // resonance J values and R-external J values originate from the
+                        // same `compute_j_offsets()` map in sammy.rs. The offset is either
+                        // 0.0 or N * 1e-6 (exact floating-point), so the values are
+                        // bit-identical and 1e-10 epsilon is ample.
                         let r_ext = range
                             .r_external
                             .iter()
