@@ -1,0 +1,18 @@
+AM-241 zero-th order run to generate odf file for input data file
+AMERICIUM  241.      .017897     100.0   130
+use multi-style doppler broadening
+twenty
+GENERATE PLOT FILE AUTO
+do not solve bayes equations
+  
+     300.0       9.1      0.04     0.000     0.025
+0.0       0.0       0.0       0.0
+FISSI
+  1      1    2  2.0       1.0  2.5
+    1    1    0    0     2.000      .000      .000
+    2    0    0    0     2.000      .000      .000
+    3    0    0    0     2.000      .000      .000
+  2      1    2  3.0       1.0  2.5
+    1    1    0    0     3.000      .000      .000
+    2    0    0    0     3.000      .000      .000
+    3    0    0    0     3.000      .000      .000

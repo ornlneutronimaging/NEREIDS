@@ -119,6 +119,19 @@ pub struct SammySpinGroup {
     pub isotope_label: Option<String>,
 }
 
+/// Observation type parsed from the SAMMY `.inp` keyword block.
+///
+/// Determines what physical quantity SAMMY's Th_initial column represents:
+/// - Transmission/TotalCrossSection → σ_total
+/// - Fission → σ_fission
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum SammyObservationType {
+    #[default]
+    Transmission,
+    TotalCrossSection,
+    Fission,
+}
+
 /// Beamline and sample configuration from a SAMMY `.inp` file.
 #[derive(Debug, Clone)]
 pub struct SammyInpConfig {
@@ -171,6 +184,8 @@ pub struct SammyInpConfig {
     pub target_spin: f64,
     /// Spin group definitions.
     pub spin_groups: Vec<SammySpinGroup>,
+    /// Observation type (Transmission, TotalCrossSection, or Fission).
+    pub observation_type: SammyObservationType,
 }
 
 impl SammyInpConfig {
@@ -798,6 +813,8 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
             flight_path_m = card5_fields[1]
                 .parse::<f64>()
                 .map_err(|e| SammyParseError::new(format!("Card 5: flight_path: {e}")))?;
+            // SAMMY Card 5 field order: Temp, Dist, Deltal, Deltae, Deltag
+            // Ref: SAMMY Users' Guide Table IVA.1.
             if card5_fields.len() >= 3 {
                 delta_l_sammy = card5_fields[2].parse().unwrap_or(0.0);
             }
@@ -825,15 +842,27 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
         idx += 1;
     }
 
-    // Scan for TRANSMISSION keyword and spin group block, then BROADENING card.
+    // Scan for observation keyword and spin group block, then BROADENING card.
     let mut broadening_delta_l: Option<f64> = None;
     let mut broadening_delta_g: Option<f64> = None;
     let mut broadening_delta_e: Option<f64> = None;
+    let mut observation_type = SammyObservationType::default();
 
     while idx < lines.len() {
         let trimmed = lines[idx].trim().to_uppercase();
-        // SAMMY allows keyword abbreviations: "TRANS" matches "TRANSMISSION".
-        if trimmed.starts_with("TRANS") || trimmed.starts_with("TOTAL") {
+        // SAMMY allows keyword abbreviations: "TRANS" matches "TRANSMISSION",
+        // "TOTAL" matches "TOTAL CROSS SECTION", "FISSI" matches "FISSION".
+        if trimmed.starts_with("TRANS")
+            || trimmed.starts_with("TOTAL")
+            || trimmed.starts_with("FISSI")
+            || trimmed.starts_with("CAPTU")
+            || trimmed.starts_with("DIRAC")
+        {
+            if trimmed.starts_with("TOTAL") {
+                observation_type = SammyObservationType::TotalCrossSection;
+            } else if trimmed.starts_with("FISSI") {
+                observation_type = SammyObservationType::Fission;
+            }
             idx += 1;
             // Skip data-reduction parameter lines (SAMMY Card 8) that can
             // appear between the TRANSMISSION keyword and spin group
@@ -916,6 +945,7 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
         thickness_atoms_barn,
         target_spin,
         spin_groups,
+        observation_type,
     })
 }
 
@@ -1967,6 +1997,7 @@ BROADENING
             scattering_radius_fm: 6.0,
             thickness_atoms_barn: 0.2179,
             target_spin: 0.0,
+            observation_type: SammyObservationType::default(),
             spin_groups: vec![
                 SammySpinGroup {
                     index: 1,
@@ -2049,6 +2080,7 @@ BROADENING
             scattering_radius_fm: 6.0,
             thickness_atoms_barn: 0.2179,
             target_spin: 0.0,
+            observation_type: SammyObservationType::default(),
             spin_groups: vec![],
         };
 
@@ -2095,6 +2127,7 @@ BROADENING
             scattering_radius_fm: 6.0,
             thickness_atoms_barn: 0.2179,
             target_spin: 0.0,
+            observation_type: SammyObservationType::default(),
             spin_groups: vec![],
         };
 

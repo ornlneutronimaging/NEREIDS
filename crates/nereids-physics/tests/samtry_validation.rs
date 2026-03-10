@@ -39,17 +39,22 @@
 //! | Multi-isotope (3 sp), HEGA | tr010 | <0.62% | Doppler method mismatch |
 //! | Unbroadened reconstruction | tr037 | <0.1% | Direct R-matrix (exact) |
 //! | Multi-isotope + R-ext, Gauss | tr040 | <1.1% | R-external + multi-isotope |
+//! | New spin group fmt, HEGA | tr122 | <4.1% | HEGA/FGM + low temp (181K) |
+//! | 3-ch fission, Pu-239, HEGA | tr009 | <0.2% | Exact R-matrix fission |
+//! | 3-ch fission, Am-241, HEGA | tr005 | <1.9% | HEGA/FGM + wide range |
 //!
 //! ## Reference
 //! SAMMY source: `../SAMMY/SAMMY/sammy/samtry/`
 
 use nereids_endf::sammy::{
-    SammyInpConfig, SammyParFile, SammyPltRecord, parse_sammy_inp, parse_sammy_par,
-    parse_sammy_plt, sammy_to_nereids_resolution, sammy_to_resonance_data,
+    SammyInpConfig, SammyObservationType, SammyParFile, SammyPltRecord, parse_sammy_inp,
+    parse_sammy_par, parse_sammy_plt, sammy_to_nereids_resolution, sammy_to_resonance_data,
     sammy_to_resonance_data_multi,
 };
+use nereids_physics::auxiliary_grid;
+use nereids_physics::doppler::{self, DopplerParams};
 use nereids_physics::reich_moore;
-use nereids_physics::resolution::{ResolutionFunction, ResolutionParams};
+use nereids_physics::resolution::{self, ResolutionFunction, ResolutionParams};
 use nereids_physics::transmission::{self, InstrumentParams};
 
 use std::path::PathBuf;
@@ -92,19 +97,24 @@ fn load_samtry_case(
     let par = parse_sammy_par(&par_content).unwrap();
     let mut plt = parse_sammy_plt(&plt_content).unwrap();
 
-    // Detect plt energy unit: compare max plt value with inp energy_max (eV).
-    // If plt values are ~1000× smaller → plt is in keV (the parser default).
-    // If plt values are in the same range → plt is in eV, needs conversion.
-    // Uses max rather than mid-index to handle log-spaced grids correctly
-    // (mid-index can be far from the arithmetic midpoint for non-uniform spacing).
+    // Detect plt energy unit: compare plt values with inp energy range (eV).
+    // Two checks to handle partial-range plt files (e.g., tr009 plt covers
+    // 8-18 eV out of a 0-304 eV analysis window):
+    //
+    // 1. If plt_max * 1000 >> energy_max, interpreting as keV is impossible
+    //    (would place points far outside the analysis range) → must be eV.
+    // 2. If plt_max / energy_max ≈ 1.0, plt covers the full range in eV.
+    //
+    // Both conditions mean plt is in eV and needs conversion to keV.
     if !plt.is_empty() {
         let plt_max = plt
             .iter()
             .map(|r| r.energy_kev)
             .fold(f64::NEG_INFINITY, f64::max);
-        let ratio = plt_max / inp.energy_max_ev; // close to 1.0 → eV, close to 0.001 → keV
+        let ratio = plt_max / inp.energy_max_ev;
+        let plt_is_ev = ratio > 0.5 || plt_max * 1000.0 > inp.energy_max_ev * 2.0;
 
-        if ratio > 0.5 {
+        if plt_is_ev {
             // plt is in eV — convert to keV for consistency with the field name.
             for rec in &mut plt {
                 rec.energy_kev /= 1000.0;
@@ -2088,5 +2098,345 @@ fn test_tr103_ni58_orr() {
         "t103a.inp",
         "t103a.par",
         "raa.plt",
+    );
+}
+
+// ─── Batch F: Final coverage (issue #328) ────────────────────────────────────
+
+// ─── tr122: Fe-56 transmission, new spin group format, Doppler+Gauss+Exp ─────
+
+#[test]
+fn test_tr122_fe56_parse() {
+    let (inp, par, plt) = load_samtry_case(
+        "tr122_fe56_transmission_new_spingroup",
+        "t122a.inp",
+        "t122a.par",
+        "raa.plt",
+    );
+    assert_eq!(inp.isotope_symbol, "FE56");
+    assert!((inp.awr - 55.9).abs() < 0.1);
+    assert!((inp.temperature_k - 181.0).abs() < 1.0);
+    // New spin group format: 2 spin groups with J=0.5 and J=-0.5.
+    assert_eq!(inp.spin_groups.len(), 2);
+    assert!(
+        (inp.spin_groups[0].j - 0.5).abs() < 1e-6,
+        "SG1 J=0.5, got {}",
+        inp.spin_groups[0].j
+    );
+    assert!(
+        (inp.spin_groups[1].j - (-0.5)).abs() < 1e-6,
+        "SG2 J=-0.5, got {}",
+        inp.spin_groups[1].j
+    );
+    assert_eq!(par.resonances.len(), 3);
+    assert_eq!(plt.len(), 129);
+    // Observation type is TRANSMISSION.
+    assert_eq!(inp.observation_type, SammyObservationType::Transmission);
+}
+
+#[test]
+fn test_tr122_fe56_broadened() {
+    let (inp, par, plt) = load_samtry_case(
+        "tr122_fe56_transmission_new_spingroup",
+        "t122a.inp",
+        "t122a.par",
+        "raa.plt",
+    );
+
+    let result = validate_broadened_cross_sections(&inp, &par, &plt, 0.05);
+    eprintln!(
+        "tr122 broadened: max_rel={:.6}, mean_rel={:.6}, n={}, above_5%={}, worst@{:.4} keV",
+        result.max_rel_error,
+        result.mean_rel_error,
+        result.n_points,
+        result.n_above_threshold,
+        result.worst_energy_kev
+    );
+    // tr122: Fe-56 transmission, Doppler(181K) + Gauss+Exp resolution.
+    // Same physics as tr007 (Fe-56, 3 resonances) but uses the new spin group
+    // format with explicit channel definitions.  Dense grid at 1.13-1.17 keV.
+    // FGM vs HEGA Doppler difference is the dominant error source.
+    // Measured: 4.1% mean (slightly higher than tr007's 2.9% due to lower
+    // temperature — 181K vs 329K — making the Doppler kernel narrower and
+    // the HEGA approximation less accurate near the sharp resonance peak).
+    assert!(
+        result.mean_rel_error < 0.05,
+        "broadened mean error {:.4} > 5%",
+        result.mean_rel_error
+    );
+}
+
+// ─── Fission broadening helper ───────────────────────────────────────────────
+
+/// Compare NEREIDS broadened *fission* cross-sections against SAMMY Th_initial.
+///
+/// For FISSION observation type, SAMMY's Th_initial is σ_fission (not σ_total).
+/// This helper broadens σ_fission using the standalone Doppler + resolution
+/// APIs, matching the same grid extension and broadening pipeline as
+/// `broadened_cross_sections` but extracting the fission component.
+///
+/// No Beer-Lambert conversion is applied (fission observation doesn't use
+/// the transmission path).
+fn validate_broadened_fission(
+    inp: &SammyInpConfig,
+    par: &SammyParFile,
+    reference: &[SammyPltRecord],
+    tolerance_rel: f64,
+) -> ValidationResult {
+    let resonance_data = sammy_to_resonance_data(inp, par).unwrap();
+
+    // Build sorted energy grid from reference points (ascending).
+    let mut energies: Vec<f64> = reference.iter().map(|r| r.energy_kev * 1000.0).collect();
+    let is_ascending = energies.windows(2).all(|w| w[0] <= w[1]);
+    if !is_ascending {
+        energies.sort_by(|a, b| a.total_cmp(b));
+    }
+
+    // Build resolution parameters.
+    let instrument = build_instrument_params(inp);
+
+    // Build extended grid with intermediate + fine-structure points.
+    // The data grid may be coarse at high energies; intermediate points
+    // ensure the resolution convolution has sufficient quadrature density.
+    let res_params = instrument.as_ref().and_then(|inst| {
+        if let ResolutionFunction::Gaussian(ref p) = inst.resolution {
+            Some(p)
+        } else {
+            None
+        }
+    });
+
+    // Collect resonance (energy, total_width) pairs for fine-structure points.
+    let resonances: Vec<(f64, f64)> = resonance_data.ranges[0]
+        .l_groups
+        .iter()
+        .flat_map(|lg| {
+            lg.resonances.iter().filter_map(|r| {
+                if r.energy > 0.0 {
+                    let total_width = r.gg + r.gn.abs() + r.gfa.abs() + r.gfb.abs();
+                    Some((r.energy, total_width))
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+
+    let (ext_energies, data_indices) =
+        auxiliary_grid::build_extended_grid(&energies, res_params, &resonances);
+
+    // Compute unbroadened fission XS on extended grid.
+    let unbroadened: Vec<f64> = ext_energies
+        .iter()
+        .map(|&e| reich_moore::cross_sections_at_energy(&resonance_data, e).fission)
+        .collect();
+
+    // Doppler broadening.
+    let after_doppler = if inp.temperature_k > 0.0 {
+        let params = DopplerParams::new(inp.temperature_k, resonance_data.awr).unwrap();
+        doppler::doppler_broaden(&ext_energies, &unbroadened, &params).unwrap()
+    } else {
+        unbroadened
+    };
+
+    // Resolution broadening.
+    let broadened = if let Some(ref inst) = instrument {
+        resolution::apply_resolution(&ext_energies, &after_doppler, &inst.resolution).unwrap()
+    } else {
+        after_doppler
+    };
+
+    // Extract values at data grid positions.
+    let xs_at_data: Vec<f64> = data_indices.iter().map(|&i| broadened[i]).collect();
+
+    // Build energy→xs map for lookup.
+    let xs_map: std::collections::HashMap<u64, f64> = energies
+        .iter()
+        .zip(xs_at_data.iter())
+        .map(|(&e, &xs)| (e.to_bits(), xs))
+        .collect();
+
+    let mut max_rel_error = 0.0_f64;
+    let mut sum_rel_error = 0.0;
+    let mut n_above = 0;
+    let mut worst_energy_kev = 0.0;
+
+    for rec in reference {
+        let energy_ev = rec.energy_kev * 1000.0;
+        let nereids_fission = *xs_map
+            .get(&energy_ev.to_bits())
+            .unwrap_or_else(|| panic!("Missing broadened fission XS for energy {} eV", energy_ev));
+        let sammy_fission = rec.theory_initial;
+
+        let rel_error = if sammy_fission.abs() > 1e-6 {
+            (nereids_fission - sammy_fission).abs() / sammy_fission.abs()
+        } else {
+            (nereids_fission - sammy_fission).abs()
+        };
+
+        sum_rel_error += rel_error;
+        if rel_error > max_rel_error {
+            max_rel_error = rel_error;
+            worst_energy_kev = rec.energy_kev;
+        }
+        if rel_error > tolerance_rel {
+            n_above += 1;
+        }
+    }
+
+    ValidationResult {
+        max_rel_error,
+        mean_rel_error: sum_rel_error / reference.len() as f64,
+        n_points: reference.len(),
+        n_above_threshold: n_above,
+        worst_energy_kev,
+    }
+}
+
+// ─── tr009: Pu-239 fission, HEGA Doppler, length-only resolution ─────────────
+
+#[test]
+fn test_tr009_pu239_parse() {
+    let (inp, par, plt) = load_samtry_case(
+        "tr009_pu239_fission_hega",
+        "t009a.inp",
+        "t009a.par",
+        "raa.plt",
+    );
+    assert_eq!(inp.isotope_symbol, "PU239");
+    assert!((inp.awr - 239.0).abs() < 1.0);
+    assert!((inp.temperature_k - 300.0).abs() < 1.0);
+    assert!((inp.scattering_radius_fm - 9.011).abs() < 0.01);
+    // 2 spin groups: J=0 (3 channels) and J=1 (3 channels).
+    assert_eq!(inp.spin_groups.len(), 2);
+    assert!(
+        (inp.spin_groups[0].j - 0.0).abs() < 1e-6,
+        "SG1 J=0, got {}",
+        inp.spin_groups[0].j
+    );
+    assert!(
+        (inp.spin_groups[1].j - 1.0).abs() < 1e-6,
+        "SG2 J=1, got {}",
+        inp.spin_groups[1].j
+    );
+    // target_spin = 0.5 for Pu-239.
+    assert!(
+        (inp.spin_groups[0].target_spin - 0.5).abs() < 1e-6,
+        "target_spin=0.5"
+    );
+    // 124 resonances (lines 1-124 before blank line in .par).
+    assert!(
+        par.resonances.len() >= 120,
+        "expected ~124 resonances, got {}",
+        par.resonances.len()
+    );
+    assert_eq!(plt.len(), 177);
+    // Observation type is FISSION.
+    assert_eq!(inp.observation_type, SammyObservationType::Fission);
+}
+
+#[test]
+fn test_tr009_pu239_fission_broadened() {
+    let (inp, par, plt) = load_samtry_case(
+        "tr009_pu239_fission_hega",
+        "t009a.inp",
+        "t009a.par",
+        "raa.plt",
+    );
+
+    let result = validate_broadened_fission(&inp, &par, &plt, 0.10);
+    eprintln!(
+        "tr009 fission: max_rel={:.6}, mean_rel={:.6}, n={}, above_10%={}, worst@{:.4} keV",
+        result.max_rel_error,
+        result.mean_rel_error,
+        result.n_points,
+        result.n_above_threshold,
+        result.worst_energy_kev
+    );
+    // Pu-239 fission: Doppler(300K) + length-only resolution (Deltag=0.024).
+    // SAMMY uses HEGA Doppler, NEREIDS uses exact FGM.  Energy range 0-304 eV
+    // includes many resonances.  The HEGA-FGM difference at low energies can
+    // be significant for fission peaks.
+    assert!(
+        result.mean_rel_error < 0.06,
+        "fission mean error {:.4} > 6%",
+        result.mean_rel_error
+    );
+}
+
+// ─── tr005: Am-241 fission, HEGA Doppler, Gaussian resolution ────────────────
+
+#[test]
+fn test_tr005_am241_parse() {
+    let (inp, par, plt) = load_samtry_case(
+        "tr005_am241_fission_hega",
+        "t005a.inp",
+        "t005a.par",
+        "raa.plt",
+    );
+    assert_eq!(inp.isotope_symbol, "AMERICIUM");
+    assert!((inp.awr - 241.0).abs() < 1.0);
+    assert!((inp.temperature_k - 300.0).abs() < 1.0);
+    // 2 spin groups: J=2 (3 channels) and J=3 (3 channels).
+    assert_eq!(inp.spin_groups.len(), 2);
+    assert!(
+        (inp.spin_groups[0].j - 2.0).abs() < 1e-6,
+        "SG1 J=2, got {}",
+        inp.spin_groups[0].j
+    );
+    assert!(
+        (inp.spin_groups[1].j - 3.0).abs() < 1e-6,
+        "SG2 J=3, got {}",
+        inp.spin_groups[1].j
+    );
+    // target_spin = 2.5 for Am-241.
+    assert!(
+        (inp.spin_groups[0].target_spin - 2.5).abs() < 1e-6,
+        "target_spin=2.5"
+    );
+    // 140 resonances in the .par file.
+    assert!(
+        par.resonances.len() >= 130,
+        "expected ~140 resonances, got {}",
+        par.resonances.len()
+    );
+    assert_eq!(plt.len(), 864);
+    // Observation type is FISSION.
+    assert_eq!(inp.observation_type, SammyObservationType::Fission);
+}
+
+#[test]
+fn test_tr005_am241_fission_broadened() {
+    let (mut inp, par, plt) = load_samtry_case(
+        "tr005_am241_fission_hega",
+        "t005a.inp",
+        "t005a.par",
+        "raa.plt",
+    );
+
+    // Am-241 inp Card 6 gives scattering_radius = 0.0, but SAMMY uses the
+    // default 9.036 fm (confirmed from raa.lpt).  Override before conversion.
+    if inp.scattering_radius_fm.abs() < 1e-6 {
+        inp.scattering_radius_fm = 9.036;
+    }
+
+    let result = validate_broadened_fission(&inp, &par, &plt, 0.15);
+    eprintln!(
+        "tr005 fission: max_rel={:.6}, mean_rel={:.6}, n={}, above_15%={}, worst@{:.4} keV",
+        result.max_rel_error,
+        result.mean_rel_error,
+        result.n_points,
+        result.n_above_threshold,
+        result.worst_energy_kev
+    );
+    // Am-241 fission: Doppler(300K) + Gaussian resolution (Deltal=0.04m,
+    // Deltag=0.025µs).  SAMMY uses HEGA Doppler, NEREIDS uses exact FGM.
+    // Wide energy range 0.018-100 eV with 864 points, 140 resonances (L=0).
+    // Scattering radius overridden from 0 → 9.036 fm.
+    // Measured: 1.8% mean, 20.9% max.
+    assert!(
+        result.mean_rel_error < 0.05,
+        "fission mean error {:.4} > 5%",
+        result.mean_rel_error
     );
 }
