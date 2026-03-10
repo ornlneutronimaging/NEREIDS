@@ -2,7 +2,7 @@
 
 use crate::guided;
 use crate::state::{
-    AppState, EndfStatus, GuidedStep, ProvenanceEventKind, SessionCache, Tab, UiMode,
+    AppState, EndfStatus, GuidedStep, ProvenanceEventKind, SaveDataMode, SessionCache, Tab, UiMode,
 };
 use crate::studio;
 use crate::theme;
@@ -53,6 +53,14 @@ impl NereidsApp {
 }
 
 impl eframe::App for NereidsApp {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // If a background save is in progress, block until it completes
+        // to avoid corrupting the HDF5 file.
+        if let Some(handle) = self.state.save_join_handle.take() {
+            handle.join().ok();
+        }
+    }
+
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         if let Some(cache) = SessionCache::from_state(&self.state) {
             eframe::set_value(storage, SESSION_CACHE_KEY, &cache);
@@ -86,6 +94,7 @@ impl eframe::App for NereidsApp {
             || self.state.is_fetching_endf
             || self.state.is_fetching_fm_endf
             || self.state.is_fetching_detect_endf
+            || self.state.is_saving
         {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
@@ -93,7 +102,7 @@ impl eframe::App for NereidsApp {
         // Cmd+S / Ctrl+S — save project
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S)) {
             let has_results = self.state.spatial_result.is_some();
-            if has_results {
+            if has_results && !self.state.is_saving {
                 crate::project::save_project_quick(&mut self.state);
             }
         }
@@ -371,6 +380,42 @@ fn poll_pending_tasks(state: &mut AppState) {
             }
             state.is_fetching_detect_endf = false;
             state.pending_detect_endf = None;
+        }
+    }
+
+    // Poll project save result
+    if let Some(ref rx) = state.pending_save {
+        match rx.try_recv() {
+            Ok(Ok((path, mode))) => {
+                let mode_label = match mode {
+                    SaveDataMode::Linked => "linked",
+                    SaveDataMode::Embedded => "embedded",
+                };
+                state.project_file_path = Some(path.clone());
+                state.last_save_mode = mode;
+                state.status_message =
+                    format!("Project saved ({mode_label}) to {}", path.display());
+                state.log_provenance(
+                    ProvenanceEventKind::ProjectSaved,
+                    format!("Saved ({mode_label}) to {}", path.display()),
+                );
+                state.is_saving = false;
+                state.pending_save = None;
+                state.save_join_handle = None;
+            }
+            Ok(Err(msg)) => {
+                state.status_message = format!("Save failed: {msg}");
+                state.is_saving = false;
+                state.pending_save = None;
+                state.save_join_handle = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                state.status_message = "Save task failed unexpectedly".into();
+                state.is_saving = false;
+                state.pending_save = None;
+                state.save_join_handle = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {} // Still saving
         }
     }
 }

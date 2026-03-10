@@ -461,7 +461,16 @@ fn execute_save_with_dialog(state: &mut AppState) {
 }
 
 /// Execute the actual save to `path` with the given mode.
+///
+/// Spawns a background thread so large embedded saves do not block the UI.
+/// The result is polled in [`crate::app::poll_pending_tasks`].
 fn execute_save(state: &mut AppState, path: &Path, mode: SaveDataMode) {
+    // Guard: don't start another save while one is in progress
+    if state.is_saving {
+        state.status_message = "Save already in progress.".into();
+        return;
+    }
+
     // Fall back to linked if embedded requested but sample data not available
     let mode = if mode == SaveDataMode::Embedded && state.sample_data.is_none() {
         state.status_message = "Sample data required for embed — saving in linked mode.".into();
@@ -469,35 +478,51 @@ fn execute_save(state: &mut AppState, path: &Path, mode: SaveDataMode) {
     } else {
         mode
     };
+
     let snap = snapshot_from_state(state);
-    let result = match mode {
-        SaveDataMode::Linked => nereids_io::project::save_project(path, &snap),
-        SaveDataMode::Embedded => {
+    let path = path.to_path_buf();
+
+    // For embedded mode, clone the data arrays for the background thread.
+    let embedded_data = if mode == SaveDataMode::Embedded {
+        Some((
+            state.sample_data.clone(),
+            state.open_beam_data.clone(),
+            state.spectrum_values.clone(),
+        ))
+    } else {
+        None
+    };
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let ctx = state.egui_ctx.clone();
+
+    state.is_saving = true;
+    state.pending_save = Some(rx);
+    state.status_message = "Saving project...".into();
+
+    let handle = std::thread::spawn(move || {
+        let result = if let Some((ref sample, ref open_beam, ref spectrum)) = embedded_data {
             let emb = EmbeddedData {
-                sample: state.sample_data.as_ref(),
-                open_beam: state.open_beam_data.as_ref(),
-                spectrum: state.spectrum_values.as_deref(),
+                sample: sample.as_ref(),
+                open_beam: open_beam.as_ref(),
+                spectrum: spectrum.as_deref(),
             };
-            nereids_io::project::save_project_with_data(path, &snap, Some(&emb))
-        }
-    };
-    let mode_label = match mode {
-        SaveDataMode::Linked => "linked",
-        SaveDataMode::Embedded => "embedded",
-    };
-    match result {
-        Ok(()) => {
-            state.project_file_path = Some(path.to_path_buf());
-            state.last_save_mode = mode;
-            state.status_message = format!("Project saved ({mode_label}) to {}", path.display());
-            state.log_provenance(
-                ProvenanceEventKind::ProjectSaved,
-                format!("Saved ({mode_label}) to {}", path.display()),
-            );
-        }
-        Err(e) => {
-            state.status_message = format!("Save failed: {e}");
-        }
+            nereids_io::project::save_project_with_data(&path, &snap, Some(&emb))
+        } else {
+            nereids_io::project::save_project(&path, &snap)
+        };
+        let _ = tx.send(result.map(|()| (path, mode)).map_err(|e| e.to_string()));
+    });
+    state.save_join_handle = Some(handle);
+
+    // Watcher thread to poke the GUI event loop until save completes.
+    if let Some(ctx) = ctx {
+        std::thread::spawn(move || {
+            for _ in 0..600 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                ctx.request_repaint();
+            }
+        });
     }
 }
 
@@ -567,6 +592,17 @@ pub fn load_project_from_path(state: &mut AppState, path: &Path) {
 fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path) {
     // 0. Cancel any in-flight background tasks (ENDF fetches, fitting, etc.)
     state.cancel_pending_tasks();
+
+    // cancel_pending_tasks deliberately leaves save state alone (save cannot be
+    // cancelled safely). Since we are replacing the entire session, clear save
+    // tracking explicitly — the background thread will still finish its HDF5
+    // write, and we no longer care about the result for this session, but we
+    // still keep the JoinHandle so shutdown code can join the thread safely.
+    state.is_saving = false;
+    state.pending_save = None;
+    // Note: save_join_handle is intentionally NOT cleared here.
+    // Dropping it would detach the thread, making on_exit unable to join it.
+    // The handle will be joined in on_exit() before the process terminates.
 
     // 1. Clear derived state
     state.spatial_result = None;
