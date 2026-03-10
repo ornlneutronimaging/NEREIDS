@@ -964,16 +964,25 @@ fn validate_cross_sections_multi(
 
     // Compute broadened cross-sections per isotope.
     //
+    // When the SAMMY inp says "broadening is not wanted", use T=0 to
+    // disable Doppler broadening (the parser defaults temperature_k=300
+    // when Card 5 is absent, which would incorrectly broaden).
+    //
     // Note: Beer-Lambert resolution broadening is NOT used here because
     // for multi-isotope cases, per-isotope Beer-Lambert is physically wrong.
     // The correct approach (resolution-broaden total T) requires knowing
     // the densities, which are not available at precomputation time.
     // The R-external contribution (implemented in the R-matrix) handles
     // the dominant error source for multi-isotope high-energy cases (tr040).
+    let temperature = if inp.no_broadening {
+        0.0
+    } else {
+        inp.temperature_k
+    };
     let broadened = transmission::broadened_cross_sections(
         &energies,
         &resonance_data_vec,
-        inp.temperature_k,
+        temperature,
         instrument.as_ref(),
         None,
     )
@@ -1790,5 +1799,294 @@ fn test_tr041_ni58_broadened() {
         result.mean_rel_error < 0.002,
         "broadened mean error {:.4} >= 0.2%",
         result.mean_rel_error
+    );
+}
+
+// ─── Batch E: NEW SPIN GROUP FORMAT (issue #328) ─────────────────────────────
+//
+// These cases use the `USE NEW SPIN GROUP FORMAT` keyword in their .inp files.
+// The column layout is identical to the old format for the spin group header
+// and channel lines, so no parser changes are needed — the existing fixed-width
+// column extraction handles both formats.
+
+// ─── tr055: NatFe multi-isotope total XS, no broadening ─────────────────────
+
+/// tr055: Natural iron total cross section, 0.0001-30 eV, 15 spin groups,
+/// 4 isotopes (Fe-56/54/57/58), no broadening.
+///
+/// Tests multi-isotope parsing with explicit isotope labels in the new spin
+/// group format.  17 resonances across 4 isotopes with per-spin-group radii
+/// and ISOTOPIC MASSES section in .par file.
+#[test]
+fn test_tr055_natfe_parse() {
+    let (inp, par, _) = load_samtry_case(
+        "tr055_natfe_total_xs_multi_isotope",
+        "t055a.inp",
+        "t055a.par",
+        "raa.plt",
+    );
+
+    // Verify parsing basics.
+    assert_eq!(inp.spin_groups.len(), 15);
+    assert!(inp.no_broadening);
+    assert_eq!(inp.isotope_symbol, "nat Fe");
+
+    // Verify isotope labels from new spin group format.
+    assert_eq!(
+        inp.spin_groups[0].isotope_label.as_deref(),
+        Some("Fe56"),
+        "SG1 label"
+    );
+    assert_eq!(
+        inp.spin_groups[3].isotope_label.as_deref(),
+        Some("Fe54"),
+        "SG4 label"
+    );
+    assert_eq!(
+        inp.spin_groups[6].isotope_label.as_deref(),
+        Some("Fe57"),
+        "SG7 label"
+    );
+    assert_eq!(
+        inp.spin_groups[12].isotope_label.as_deref(),
+        Some("Fe58"),
+        "SG13 label"
+    );
+
+    // Verify abundances from spin group headers.
+    assert!(
+        (inp.spin_groups[0].abundance - 0.9172).abs() < 1e-4,
+        "Fe-56 abundance"
+    );
+    assert!(
+        (inp.spin_groups[3].abundance - 0.0717).abs() < 1e-4,
+        "Fe-54 abundance"
+    );
+
+    // Verify resonance count.
+    assert_eq!(par.resonances.len(), 17);
+
+    // Verify ISOTOPIC MASSES section parsing.
+    assert_eq!(
+        par.isotopic_masses.len(),
+        4,
+        "expected 4 isotopic mass entries"
+    );
+    assert!(
+        (par.isotopic_masses[0].awr - 55.454).abs() < 1e-3,
+        "Fe-56 AWR"
+    );
+    assert!(
+        (par.isotopic_masses[1].awr - 54.0).abs() < 1e-3,
+        "Fe-54 AWR"
+    );
+    assert!(
+        (par.isotopic_masses[1].abundance - 0.0485).abs() < 1e-4,
+        "Fe-54 par abundance"
+    );
+    assert_eq!(
+        par.isotopic_masses[2].spin_groups,
+        vec![7, 8, 9, 10, 11, 12]
+    );
+
+    // Verify multi-isotope grouping with ISOTOPIC MASSES overrides.
+    let multi = sammy_to_resonance_data_multi(&inp, &par).unwrap();
+    assert_eq!(
+        multi.len(),
+        4,
+        "expected 4 isotope groups (Fe56, Fe54, Fe57, Fe58)"
+    );
+    // ISOTOPIC MASSES abundance overrides inp spin group abundance.
+    assert!(
+        (multi[1].1 - 0.0485).abs() < 1e-4,
+        "Fe-54 multi abundance should use par file value (0.0485), got {}",
+        multi[1].1
+    );
+    // Per-isotope AWR from ISOTOPIC MASSES.
+    assert!(
+        (multi[1].0.awr - 54.0).abs() < 1e-3,
+        "Fe-54 AWR should be 54.0 from ISOTOPIC MASSES, got {}",
+        multi[1].0.awr
+    );
+}
+
+#[test]
+fn test_tr055_natfe_unbroadened() {
+    let (inp, par, plt) = load_samtry_case(
+        "tr055_natfe_total_xs_multi_isotope",
+        "t055a.inp",
+        "t055a.par",
+        "raa.plt",
+    );
+
+    // Reconstruct-mode .plt: σ_total is in the Data column (col 2), NOT
+    // Th_initial (col 4).  SAMMY "reconstruct cross sections" puts:
+    //   col 2 = σ_total, col 3 = σ_elastic, col 4 = σ_capture.
+    // Custom comparison loop (same pattern as tr037).
+    let multi = sammy_to_resonance_data_multi(&inp, &par).unwrap();
+
+    let mut max_rel_error = 0.0_f64;
+    let mut sum_rel_error = 0.0;
+    let mut n_above = 0;
+    let mut worst_energy_kev = 0.0;
+
+    for rec in &plt {
+        let energy_ev = rec.energy_kev * 1000.0;
+
+        // Abundance-weighted total XS: σ_total(E) = Σ_i f_i · σ_i(E).
+        let mut nereids_total = 0.0;
+        for (rd, ab) in &multi {
+            let xs = reich_moore::cross_sections_at_energy(rd, energy_ev);
+            nereids_total += ab * xs.total;
+        }
+
+        let sammy_total = rec.data; // Data column = σ_total in reconstruction mode.
+
+        let rel_error = if sammy_total.abs() > 1e-6 {
+            (nereids_total - sammy_total).abs() / sammy_total.abs()
+        } else {
+            (nereids_total - sammy_total).abs()
+        };
+
+        sum_rel_error += rel_error;
+        if rel_error > max_rel_error {
+            max_rel_error = rel_error;
+            worst_energy_kev = rec.energy_kev;
+        }
+        if rel_error > 0.005 {
+            n_above += 1;
+        }
+    }
+    let mean_rel_error = sum_rel_error / plt.len() as f64;
+
+    eprintln!(
+        "tr055 unbroadened multi: max_rel={:.6}, mean_rel={:.6}, n={}, above_0.5%={}, worst@{:.4} keV",
+        max_rel_error,
+        mean_rel_error,
+        plt.len(),
+        n_above,
+        worst_energy_kev
+    );
+    // tr055: NatFe total XS, reconstruction mode, 4 isotopes, no broadening.
+    // Unbroadened R-matrix calculation with ISOTOPIC MASSES for per-isotope
+    // AWR/abundance should closely match SAMMY's reconstruction output.
+    assert!(
+        mean_rel_error < 0.001,
+        "unbroadened multi mean error {:.6} > 0.1%",
+        mean_rel_error
+    );
+}
+
+// ─── tr063: Constant cross-section mock-up ───────────────────────────────────
+
+/// tr063: Constant cross-section mock-up, "UnKnown" isotope, no resonances.
+///
+/// Deferred: the "UnKnown" isotope symbol cannot be parsed by
+/// `parse_isotope_symbol()`.  This is a SAMMY test harness mock, not real
+/// physics — it tests SAMMY's internal normalization, not resonance evaluation.
+#[test]
+#[ignore = "tr063: UnKnown isotope symbol not supported by parse_isotope_symbol"]
+fn test_tr063_constant_xs() {
+    let (_inp, _par, _plt) = load_samtry_case(
+        "tr063_co59_total_xs_constant",
+        "t063a.inp",
+        "t063a.par",
+        "raa.plt",
+    );
+}
+
+// ─── tr101: Al-27 total XS, 18 spin groups, no broadening ──────────────────
+
+/// tr101: Aluminum-27 total cross section, 760-800 keV, 18 spin groups,
+/// 2 resonances, no broadening.
+///
+/// Tests the new spin group format with many spin groups (s/p/d waves),
+/// per-spin-group radii, and high-energy regime where potential scattering
+/// dominates over a sparse resonance landscape.
+#[test]
+fn test_tr101_al27_parse() {
+    let (inp, par, _) = load_samtry_case(
+        "tr101_al27_total_xs_new_format",
+        "t101a.inp",
+        "t101a.par",
+        "raa.plt",
+    );
+
+    // Verify parsing basics.
+    assert_eq!(inp.spin_groups.len(), 18);
+    assert!(inp.no_broadening);
+    assert_eq!(inp.isotope_symbol, "Al");
+
+    // Verify target spin (Al-27: I=5/2).
+    assert!(
+        (inp.spin_groups[0].target_spin - 2.5).abs() < 1e-6,
+        "target_spin={}, expected 2.5",
+        inp.spin_groups[0].target_spin
+    );
+
+    // Verify L values: s-wave (L=0), p-wave (L=1), d-wave (L=2).
+    assert_eq!(inp.spin_groups[0].l, 0, "SG1 L=0 (s-wave)");
+    assert_eq!(inp.spin_groups[2].l, 1, "SG3 L=1 (p-wave)");
+    assert_eq!(inp.spin_groups[8].l, 2, "SG9 L=2 (d-wave)");
+
+    // Verify resonance count.
+    assert_eq!(par.resonances.len(), 2);
+
+    // Verify per-spin-group radii from RADIUS PARAMETERS FOLLOW.
+    assert!(
+        !par.radius_overrides.is_empty(),
+        "should parse RADIUS PARAMETERS"
+    );
+
+    // Verify isotope labels.
+    assert_eq!(
+        inp.spin_groups[0].isotope_label.as_deref(),
+        Some("Al   s2+"),
+        "SG1 label"
+    );
+}
+
+#[test]
+fn test_tr101_al27_unbroadened() {
+    let (inp, par, plt) = load_samtry_case(
+        "tr101_al27_total_xs_new_format",
+        "t101a.inp",
+        "t101a.par",
+        "raa.plt",
+    );
+
+    let result = validate_unbroadened_cross_sections(&inp, &par, &plt, 0.05);
+    eprintln!(
+        "tr101 unbroadened: max_rel={:.6}, mean_rel={:.6}, n={}, above_5%={}, worst@{:.4} keV",
+        result.max_rel_error,
+        result.mean_rel_error,
+        result.n_points,
+        result.n_above_threshold,
+        result.worst_energy_kev
+    );
+    // tr101: Al-27 total XS, no broadening, 18 spin groups, s/p/d waves.
+    // Unbroadened R-matrix calculation should be exact.
+    assert!(
+        result.mean_rel_error < 0.001,
+        "unbroadened mean error {:.6} > 0.1%",
+        result.mean_rel_error
+    );
+}
+
+// ─── tr103: Ni-58 transmission, ORR resolution ──────────────────────────────
+
+/// tr103: Ni-58 transmission, 180-183 keV, ORR resolution function.
+///
+/// Deferred: requires ORR (Oak Ridge Research Reactor) resolution broadening
+/// which is not yet implemented.  The .plt reference uses ORR-broadened
+/// theoretical values that cannot be reproduced with Gaussian broadening.
+#[test]
+#[ignore = "tr103: ORR resolution function not yet implemented"]
+fn test_tr103_ni58_orr() {
+    let (_inp, _par, _plt) = load_samtry_case(
+        "tr103_ni58_transmission_orr",
+        "t103a.inp",
+        "t103a.par",
+        "raa.plt",
     );
 }

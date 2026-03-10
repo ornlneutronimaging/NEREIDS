@@ -1,0 +1,13 @@
+Constant cross section mock-up
+UnKnown      027.000      .001  1000000.
+csisrs
+USE NEW SPIN GROUP FORMAT
+PRINT ALL INPUT PARAMETERS
+broadening is not wanted
+do not suppress any intermediate results
+generate odf file automatically
+  
+    0.000   0.00000
+total
+  1      1    0  2.0       1.0  2.5
+    1    1    0    0       2.0     0.000     0.000
