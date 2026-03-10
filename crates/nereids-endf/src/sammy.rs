@@ -334,11 +334,20 @@ pub fn parse_sammy_plt(content: &str) -> Result<Vec<SammyPltRecord>, SammyParseE
 /// Parse a Fortran-style floating-point literal.
 ///
 /// Handles compact exponent notation without 'E': `5.400000-5` → `5.4e-5`,
-/// `1.23+3` → `1.23e3`. Standard notation (`1.23E-5`, `1.23`) is also handled.
+/// `1.23+3` → `1.23e3`. Also handles Fortran D-exponent: `1.23D-5` → `1.23e-5`.
+/// Standard notation (`1.23E-5`, `1.23`) is also handled.
 fn parse_fortran_float(s: &str) -> Result<f64, std::num::ParseFloatError> {
     // Try standard parse first (fast path).
     if let Ok(v) = s.parse::<f64>() {
         return Ok(v);
+    }
+    // Handle Fortran D-exponent: "1.23D-5" or "1.23d+3" → replace D/d with E.
+    if let Some(pos) = s.find(['D', 'd']) {
+        let mut fixed = String::with_capacity(s.len());
+        fixed.push_str(&s[..pos]);
+        fixed.push('E');
+        fixed.push_str(&s[pos + 1..]);
+        return fixed.parse::<f64>();
     }
     // Look for a bare +/- exponent after a digit: "1.23-5" or "1.23+3".
     // Skip the first character to avoid matching a leading sign.
@@ -1151,6 +1160,42 @@ fn parse_spin_groups(lines: &[&str]) -> Result<(Vec<SammySpinGroup>, f64), Sammy
 
 // ─── Converter: SAMMY → NEREIDS ResonanceData ──────────────────────────────────
 
+/// Perturbation offset (eV) added to J values to distinguish spin groups
+/// with the same |J| but different channel structure.
+const CHANNEL_OFFSET: f64 = 1e-6;
+
+/// Compute J-value offsets for spin groups that share the same (L, |J|) pair.
+///
+/// For targets with non-zero spin (I > 0), multiple spin groups can have
+/// the same (L, |J|) but represent different entrance channels (different
+/// channel spin s = I +/- 1/2). These must be kept separate in the R-matrix
+/// calculation. We assign a small perturbation (1e-6 per duplicate) to
+/// distinguish them.
+///
+/// For I = 0 (even-even nuclei), duplicate (L, J) spin groups represent
+/// pseudo-isotope contaminants, not extra channels, so no offset is applied.
+///
+/// Ref: SAMMY Manual Eq. III A.1, sum over entrance channels c.
+fn compute_j_offsets(
+    spin_groups: &[SammySpinGroup],
+    target_spin: f64,
+) -> std::collections::HashMap<u32, f64> {
+    let mut sg_j_offset = std::collections::HashMap::new();
+    if target_spin.abs() <= 1e-10 {
+        return sg_j_offset;
+    }
+    let mut lj_seen: std::collections::HashMap<(u32, i64), u32> = std::collections::HashMap::new();
+    for sg in spin_groups {
+        let j_key = (sg.j.abs() * 1_000_000.0).round() as i64;
+        let count = lj_seen.entry((sg.l, j_key)).or_insert(0);
+        if *count > 0 {
+            sg_j_offset.insert(sg.index, *count as f64 * CHANNEL_OFFSET);
+        }
+        *count += 1;
+    }
+    sg_j_offset
+}
+
 /// Convert parsed SAMMY `.par` + `.inp` into a NEREIDS `ResonanceData`.
 ///
 /// Groups resonances by spin group, maps each group to an `LGroup` using the
@@ -1172,42 +1217,10 @@ pub fn sammy_to_resonance_data(
     let mut l_group_map: std::collections::BTreeMap<u32, Vec<Resonance>> =
         std::collections::BTreeMap::new();
 
-    // Multi-channel J offset: for targets with I > 0 (e.g., Al-27 I=5/2),
-    // multiple SAMMY spin groups can share the same (L, |J|) but represent
-    // different entrance channels (different channel spins).  NEREIDS's
-    // single-channel R-matrix groups resonances by J, computing one U-matrix
-    // per J-group.  If channels are merged, potential scattering from extra
-    // channels is lost.
-    //
-    // Fix: assign slightly perturbed J values to the 2nd, 3rd, ... spin
-    // groups with the same (L, |J|).  The perturbation (1e-6) is:
-    // - Larger than QUANTUM_NUMBER_EPS (1e-10), keeping groups separate
-    // - Negligible for g_J = (2|J|+1) / (2(2I+1)) (error < 1e-6)
-    //
-    // This creates independent J-groups for each entrance channel, correctly
-    // computing separate U-matrix elements and potential scattering.
-    //
-    // Guard: only apply for I > 0 (non-zero target spin).  For I = 0
-    // (even-even nuclei like Ni-58, Fe-56), there is exactly one channel
-    // per (L, J).  Duplicate (L, J) spin groups in I = 0 cases represent
-    // pseudo-isotope contaminants (e.g., water proxy in tr029), not extra
-    // channels.  Separating them incorrectly doubles their potential
-    // scattering contribution.
-    //
-    // Ref: SAMMY Manual Eq. III A.1, sum over entrance channels c.
-    const CHANNEL_OFFSET: f64 = 1e-6;
-    let mut lj_seen: std::collections::HashMap<(u32, i64), u32> = std::collections::HashMap::new();
-    let mut sg_j_offset: std::collections::HashMap<u32, f64> = std::collections::HashMap::new();
-    if inp.target_spin.abs() > 1e-10 {
-        for sg in &inp.spin_groups {
-            let j_key = (sg.j.abs() * 1_000_000.0).round() as i64;
-            let count = lj_seen.entry((sg.l, j_key)).or_insert(0);
-            if *count > 0 {
-                sg_j_offset.insert(sg.index, *count as f64 * CHANNEL_OFFSET);
-            }
-            *count += 1;
-        }
-    }
+    // Multi-channel J offset: for targets with I > 0, perturb duplicate
+    // (L, |J|) spin groups so each entrance channel gets its own J-group.
+    // See `compute_j_offsets` doc comment for full explanation.
+    let sg_j_offset = compute_j_offsets(&inp.spin_groups, inp.target_spin);
 
     for res in &par.resonances {
         let sg = group_map.get(&res.spin_group).ok_or_else(|| {
@@ -1437,27 +1450,13 @@ pub fn sammy_to_resonance_data_multi(
             .filter(|r| sg_indices.contains(&r.spin_group))
             .collect();
 
-        // Multi-channel J offset for this isotope group (same logic as
-        // sammy_to_resonance_data — see detailed comment there).
-        //
-        // Guard: only apply for I > 0 (non-zero target spin).  For I = 0
-        // (even-even nuclei), duplicate (L, J) spin groups represent
-        // pseudo-isotope contaminants, not extra channels.
-        const CHANNEL_OFFSET: f64 = 1e-6;
-        let mut lj_seen: std::collections::HashMap<(u32, i64), u32> =
-            std::collections::HashMap::new();
-        let mut sg_j_offset: std::collections::HashMap<u32, f64> = std::collections::HashMap::new();
-        if target_spin.abs() > 1e-10 {
-            for &mi in member_indices {
-                let sg = &inp.spin_groups[mi];
-                let j_key = (sg.j.abs() * 1_000_000.0).round() as i64;
-                let count = lj_seen.entry((sg.l, j_key)).or_insert(0);
-                if *count > 0 {
-                    sg_j_offset.insert(sg.index, *count as f64 * CHANNEL_OFFSET);
-                }
-                *count += 1;
-            }
-        }
+        // Multi-channel J offset for this isotope group's spin groups.
+        // See `compute_j_offsets` doc comment for full explanation.
+        let member_sgs: Vec<SammySpinGroup> = member_indices
+            .iter()
+            .map(|&i| inp.spin_groups[i].clone())
+            .collect();
+        let sg_j_offset = compute_j_offsets(&member_sgs, target_spin);
 
         // Build L-groups from these resonances.
         let mut l_group_map: std::collections::BTreeMap<u32, Vec<Resonance>> =
@@ -2159,5 +2158,13 @@ BROADENING
             sammy_to_nereids_resolution(&inp).is_none(),
             "should return None when both Deltal and Deltag are zero"
         );
+    }
+
+    #[test]
+    fn test_parse_fortran_d_exponent() {
+        assert!((parse_fortran_float("1.23D-5").unwrap() - 1.23e-5).abs() < 1e-20);
+        assert!((parse_fortran_float("1.23d-5").unwrap() - 1.23e-5).abs() < 1e-20);
+        assert!((parse_fortran_float("5.4D+3").unwrap() - 5.4e3).abs() < 1e-6);
+        assert!((parse_fortran_float("1.0D0").unwrap() - 1.0).abs() < 1e-15);
     }
 }
