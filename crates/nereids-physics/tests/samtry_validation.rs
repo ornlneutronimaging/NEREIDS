@@ -238,6 +238,13 @@ fn validate_broadened_cross_sections(
     // Build resolution parameters from SAMMY .inp config.
     let instrument = build_instrument_params(inp);
 
+    // "broadening is not wanted" disables ALL broadening (Doppler + resolution).
+    let temperature = if inp.no_broadening {
+        0.0
+    } else {
+        inp.temperature_k
+    };
+
     // For transmission data with resolution broadening: use Beer-Lambert-aware
     // pipeline (resolution-broaden T, not σ).  This matches SAMMY's pipeline
     // where resolution broadening is applied after the exponential transmission
@@ -251,7 +258,7 @@ fn validate_broadened_cross_sections(
         transmission::broadened_cross_sections_for_transmission(
             &energies,
             &[resonance_data],
-            inp.temperature_k,
+            temperature,
             instrument.as_ref().unwrap(),
             nd,
             None,
@@ -261,7 +268,7 @@ fn validate_broadened_cross_sections(
         transmission::broadened_cross_sections(
             &energies,
             &[resonance_data],
-            inp.temperature_k,
+            temperature,
             instrument.as_ref(),
             None,
         )
@@ -678,7 +685,7 @@ fn test_tr015_ni58_parse() {
         "t015a.par",
         "raa.plt",
     );
-    assert!(!par.resonances.len() >= 15, "expected >=15 resonances");
+    assert!(par.resonances.len() >= 15, "expected >=15 resonances");
     assert!(!plt.is_empty());
     assert_eq!(inp.isotope_symbol, "58NI");
     assert!((inp.temperature_k - 300.0).abs() < 1.0);
@@ -721,7 +728,7 @@ fn test_tr016_ni58_parse() {
         "t016a.par",
         "raa.plt",
     );
-    assert!(!par.resonances.len() >= 10, "expected >=10 resonances");
+    assert!(par.resonances.len() >= 10, "expected >=10 resonances");
     assert!(!plt.is_empty());
     assert_eq!(inp.isotope_symbol, "58NI");
     assert!(!inp.no_broadening);
@@ -766,7 +773,7 @@ fn test_tr029_ni58_parse() {
         "t029a.par",
         "raa.plt",
     );
-    assert!(!par.resonances.len() >= 100, "expected many resonances");
+    assert!(par.resonances.len() >= 100, "expected many resonances");
     assert!(!plt.is_empty());
     assert_eq!(inp.isotope_symbol, "58NI");
     assert!(!inp.no_broadening);
@@ -1420,7 +1427,7 @@ fn test_tr012_ni58_parse() {
         "t012a.par",
         "raa.plt",
     );
-    assert!(!par.resonances.len() >= 10, "expected >=10 resonances");
+    assert!(par.resonances.len() >= 10, "expected >=10 resonances");
     assert!(!plt.is_empty());
     assert_eq!(inp.isotope_symbol, "58NI");
     assert!((inp.temperature_k - 300.0).abs() < 1.0);
@@ -1788,7 +1795,7 @@ fn test_tr041_ni58_parse() {
         "t041a.par",
         "raa.plt",
     );
-    assert!(!par.resonances.len() >= 10, "expected >=10 resonances");
+    assert!(par.resonances.len() >= 10, "expected >=10 resonances");
     assert!(!plt.is_empty());
     assert_eq!(inp.isotope_symbol, "58NI");
     assert!(!inp.no_broadening);
@@ -2341,7 +2348,7 @@ fn test_tr009_pu239_parse() {
     );
     // 124 resonances (lines 1-124 before blank line in .par).
     assert!(
-        !par.resonances.len() >= 120,
+        par.resonances.len() >= 120,
         "expected ~124 resonances, got {}",
         par.resonances.len()
     );
@@ -2411,7 +2418,7 @@ fn test_tr005_am241_parse() {
     );
     // 140 resonances in the .par file.
     assert!(
-        !par.resonances.len() >= 130,
+        par.resonances.len() >= 130,
         "expected ~140 resonances, got {}",
         par.resonances.len()
     );
@@ -2529,6 +2536,16 @@ fn validate_unbroadened_with_resonance_data(
         if rel_error > tolerance_rel {
             n_above += 1;
         }
+    }
+
+    if reference.is_empty() {
+        return ValidationResult {
+            max_rel_error: 0.0,
+            mean_rel_error: 0.0,
+            n_points: 0,
+            n_above_threshold: 0,
+            worst_energy_kev: 0.0,
+        };
     }
 
     ValidationResult {
@@ -2929,7 +2946,7 @@ fn test_tr135_si28_parse() {
         "t135a.par",
         "raa.plt",
     );
-    assert!(!par.resonances.len() >= 10);
+    assert!(par.resonances.len() >= 10);
     assert!(plt.len() > 1000);
     assert_eq!(
         inp.observation_type,
@@ -3159,14 +3176,17 @@ fn test_tr166_al27_broadened() {
         "t166a.par",
         "raa.plt",
     );
-    let result = validate_broadened_cross_sections(&inp, &par, &plt, 0.15);
+    // No broadening requested — validate_broadened_cross_sections respects
+    // no_broadening flag (temp=0). Unbroadened Al-27, 100-840 keV.
+    // Measured: mean=0.03%, max=0.16%.
+    let result = validate_broadened_cross_sections(&inp, &par, &plt, 0.01);
     eprintln!(
         "tr166: max_rel={:.6}, mean_rel={:.6}, n={}, worst@{:.4} keV",
         result.max_rel_error, result.mean_rel_error, result.n_points, result.worst_energy_kev
     );
     assert!(
-        result.mean_rel_error < 0.10,
-        "mean {:.4} > 10%",
+        result.mean_rel_error < 0.01,
+        "mean {:.4} > 1%",
         result.mean_rel_error
     );
 }
@@ -3195,17 +3215,17 @@ fn test_tr179_pu240_broadened() {
         "t179a.par",
         "raa.plt",
     );
-    // Known limitation: Pu-240 total XS with fission channel.
-    // No broadening requested, but the 2-channel (elastic+fission) setup
-    // and potential scattering for actinides contributes to ~77% mean error.
-    let result = validate_broadened_cross_sections(&inp, &par, &plt, 0.15);
+    // No broadening requested — validate_broadened_cross_sections respects
+    // no_broadening flag (temp=0). Pu-240 total XS with 2-channel fission.
+    // Measured: mean=0.009%, max=0.07%.
+    let result = validate_broadened_cross_sections(&inp, &par, &plt, 0.01);
     eprintln!(
         "tr179: max_rel={:.6}, mean_rel={:.6}, n={}, worst@{:.4} keV",
         result.max_rel_error, result.mean_rel_error, result.n_points, result.worst_energy_kev
     );
     assert!(
-        result.mean_rel_error < 1.0,
-        "mean {:.4} > 100%",
+        result.mean_rel_error < 0.01,
+        "mean {:.4} > 1%",
         result.mean_rel_error
     );
 }

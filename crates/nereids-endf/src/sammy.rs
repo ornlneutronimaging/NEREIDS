@@ -331,21 +331,6 @@ pub fn parse_sammy_plt(content: &str) -> Result<Vec<SammyPltRecord>, SammyParseE
 
 // ─── .par parser ───────────────────────────────────────────────────────────────
 
-/// Parse a SAMMY `.par` file (resonance parameters).
-///
-/// Uses Fortran fixed-width column parsing (FORMAT 5F11.4, 5I2, I2):
-///   cols  0-10: E_res (eV)         — 11 chars
-///   cols 11-21: Γ_γ (meV)          — 11 chars
-///   cols 22-32: Γ_n (meV)          — 11 chars
-///   cols 33-43: Γ_f1 (meV)         — 11 chars
-///   cols 44-54: Γ_f2 (meV)         — 11 chars
-///   cols 55-64: vary flags (5×I2)  — 10 chars
-///   cols 65-66: spin_group_id (I2) — 2 chars
-///
-/// Widths are in meV in the file; this function converts to eV.
-///
-/// SAMMY Ref: `ResonanceParameterIO.cpp`, `mrpti.f90`.
-///
 /// Parse a Fortran-style floating-point literal.
 ///
 /// Handles compact exponent notation without 'E': `5.400000-5` → `5.4e-5`,
@@ -372,6 +357,20 @@ fn parse_fortran_float(s: &str) -> Result<f64, std::num::ParseFloatError> {
     s.parse::<f64>()
 }
 
+/// Parse a SAMMY `.par` file (resonance parameters).
+///
+/// Uses Fortran fixed-width column parsing (FORMAT 5F11.4, 5I2, I2):
+///   cols  0-10: E_res (eV)         — 11 chars
+///   cols 11-21: Γ_γ (meV)          — 11 chars
+///   cols 22-32: Γ_n (meV)          — 11 chars
+///   cols 33-43: Γ_f1 (meV)         — 11 chars
+///   cols 44-54: Γ_f2 (meV)         — 11 chars
+///   cols 55-64: vary flags (5×I2)  — 10 chars
+///   cols 65-66: spin_group_id (I2) — 2 chars
+///
+/// Widths are in meV in the file; this function converts to eV.
+///
+/// SAMMY Ref: `ResonanceParameterIO.cpp`, `mrpti.f90`.
 pub fn parse_sammy_par(content: &str) -> Result<SammyParFile, SammyParseError> {
     let mut resonances = Vec::new();
 
@@ -764,7 +763,6 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
     let mut target_spin = 0.0;
     let mut spin_groups = Vec::new();
     let mut no_broadening = false;
-    let mut use_new_spin_group_format = false;
 
     // State machine: find blank line after commands, then parse numeric cards.
     let mut idx = 2;
@@ -780,9 +778,6 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
         // SAMMY allows abbreviated keywords: "BROADENING IS NOT WA" matches.
         if upper.starts_with("BROADENING IS NOT") || upper.contains("NO LOW-ENERGY BROADENING") {
             no_broadening = true;
-        }
-        if upper.starts_with("USE NEW SPIN GROUP") {
-            use_new_spin_group_format = true;
         }
         // Recognize "INPUT IS ENDF/B FILE" keyword — informational only.
         // NEREIDS uses its own ENDF parser; this keyword is skipped.
@@ -917,8 +912,7 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
                 idx += 1;
             }
             // Parse spin group definitions until blank line.
-            let (groups, parsed_target_spin) =
-                parse_spin_groups(&lines[idx..], use_new_spin_group_format)?;
+            let (groups, parsed_target_spin) = parse_spin_groups(&lines[idx..])?;
             spin_groups = groups;
             target_spin = parsed_target_spin;
             // Advance past spin group block.
@@ -994,31 +988,20 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
 ///     1    1    0    1      .500
 /// ```
 ///
-/// **Old format** header: FORMAT(I5, I5, I5, F5.1, F11.4, F5.1, A7)
-///   [0:5]   KKK    — spin group index
-///   [5:10]  NENT   — number of entrance channels
-///   [10:15] NEXT   — number of exit-only channels
-///   [15:20] SPINJ  — J value for this group (F5.1)
-///   [20:31] ABNDNC — abundance/weight (F11.4)
-///   [31:36] SPINI  — target spin (F5.1)
-///   [36:]   label
-///
-/// **New format** header (ResonanceParameterIO.cpp:822-943):
-///   [0:3]   KKK    — spin group index (I3)
-///   [7:10]  NENT   — number of entrance channels (I3)
-///   [12:15] NEXT   — number of exit-only channels (I3)
-///   [15:20] SPINJ  — J value (F5.1) — same as old
-///   [20:30] ABNDNC — abundance (F10.0) — 1 char narrower
-///   [30:35] SPINI  — target spin (data present, SAMMY skips in new format)
+/// Header columns (unified for old and new format, verified against
+/// SAMMY ResonanceParameterIO.cpp:931-938):
+///   [0:5/0:3]   KKK   — spin group index
+///   [5:10/7:10] NENT  — number of entrance channels
+///   [10:15/12:15] NEXT — number of exit-only channels
+///   [15:20] SPINJ     — J value (F5.1)
+///   [20:30] ABNDNC    — abundance (F10.0)
+///   [30:35] SPINI     — target spin (F5.1)
 ///   [36:]   label
 ///
 /// Channel lines: L at cols 18-19 in both formats.
 ///
 /// Returns (spin_groups, target_spin).
-fn parse_spin_groups(
-    lines: &[&str],
-    _new_format: bool,
-) -> Result<(Vec<SammySpinGroup>, f64), SammyParseError> {
+fn parse_spin_groups(lines: &[&str]) -> Result<(Vec<SammySpinGroup>, f64), SammyParseError> {
     let mut groups = Vec::new();
     let mut target_spin = 0.0;
     let mut i = 0;
