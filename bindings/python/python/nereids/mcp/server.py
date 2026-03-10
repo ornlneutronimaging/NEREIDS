@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 from fastmcp import FastMCP
 
@@ -21,6 +23,20 @@ def _isotope_key(z: int, a: int) -> str:
     return f"{symbol}-{a}"
 
 
+def _validate_energy_grid(energy_min: float, energy_max: float, n_points: int) -> None:
+    """Validate energy grid parameters."""
+    if n_points < 1:
+        raise ValueError(f"n_points must be >= 1, got {n_points}")
+    if not math.isfinite(energy_min) or not math.isfinite(energy_max):
+        raise ValueError("energy_min and energy_max must be finite")
+    if energy_min <= 0 or energy_max <= 0:
+        raise ValueError("energy_min and energy_max must be positive (neutron energies)")
+    if energy_min >= energy_max:
+        raise ValueError(
+            f"energy_min ({energy_min}) must be less than energy_max ({energy_max})"
+        )
+
+
 @mcp.tool()
 def list_isotopes(z: int) -> list[dict]:
     """List naturally occurring isotopes for element Z with their abundances.
@@ -31,6 +47,8 @@ def list_isotopes(z: int) -> list[dict]:
     Returns:
         List of dicts with keys: z, a, symbol, abundance.
     """
+    if not isinstance(z, int) or z < 1 or z > 118:
+        raise ValueError(f"z must be an integer between 1 and 118, got {z}")
     symbol = nereids.element_symbol(z) or f"Z{z}"
     isotopes = nereids.natural_isotopes(z)
     return [
@@ -116,6 +134,7 @@ def compute_cross_sections(
     Returns:
         Dict with keys: energies, total, elastic, capture, fission (all as lists).
     """
+    _validate_energy_grid(energy_min, energy_max, n_points)
     data = _registry.get(isotope)
     if data is None:
         raise ValueError(f"Isotope {isotope!r} not loaded. Call load_endf first.")
@@ -152,6 +171,13 @@ def compute_transmission(
     Returns:
         Dict with keys: energies, transmission (as lists).
     """
+    _validate_energy_grid(energy_min, energy_max, n_points)
+    if not math.isfinite(thickness) or thickness < 0:
+        raise ValueError(f"thickness must be non-negative and finite, got {thickness}")
+    if not math.isfinite(temperature_k) or temperature_k < 0:
+        raise ValueError(
+            f"temperature_k must be non-negative and finite, got {temperature_k}"
+        )
     data = _registry.get(isotope)
     if data is None:
         raise ValueError(f"Isotope {isotope!r} not loaded. Call load_endf first.")
@@ -187,13 +213,27 @@ def forward_model(
     Returns:
         Dict with keys: energies, transmission (as lists).
     """
+    _validate_energy_grid(energy_min, energy_max, n_points)
+    if not math.isfinite(temperature_k) or temperature_k < 0:
+        raise ValueError(
+            f"temperature_k must be non-negative and finite, got {temperature_k}"
+        )
     iso_list = []
     for entry in isotopes:
-        key = entry["isotope"]
+        key = entry.get("isotope")
+        if key is None:
+            raise ValueError(f"Missing 'isotope' key in isotope entry: {entry}")
+        thickness = entry.get("thickness")
+        if thickness is None:
+            raise ValueError(f"Missing 'thickness' key in isotope entry: {entry}")
+        if not math.isfinite(thickness) or thickness < 0:
+            raise ValueError(
+                f"thickness must be non-negative and finite, got {thickness}"
+            )
         data = _registry.get(key)
         if data is None:
             raise ValueError(f"Isotope {key!r} not loaded. Call load_endf first.")
-        iso_list.append((data, entry["thickness"]))
+        iso_list.append((data, thickness))
     energies = np.linspace(energy_min, energy_max, n_points)
     t = nereids.forward_model(energies, iso_list, temperature_k=temperature_k)
     return {
@@ -233,6 +273,26 @@ def detect_isotopes(
         List of dicts with keys: isotope, detectable, peak_snr, peak_energy_ev,
         peak_delta_t_per_ppm, opaque_fraction.
     """
+    _validate_energy_grid(energy_min, energy_max, n_points)
+    if not math.isfinite(matrix_density) or matrix_density <= 0:
+        raise ValueError(
+            f"matrix_density must be positive and finite, got {matrix_density}"
+        )
+    if not trace_isotopes:
+        raise ValueError("trace_isotopes must not be empty")
+    if not math.isfinite(trace_ppm) or trace_ppm < 0:
+        raise ValueError(f"trace_ppm must be non-negative and finite, got {trace_ppm}")
+    if not math.isfinite(i0) or i0 <= 0:
+        raise ValueError(f"i0 must be positive and finite, got {i0}")
+    if not math.isfinite(snr_threshold) or snr_threshold < 0:
+        raise ValueError(
+            f"snr_threshold must be non-negative and finite, got {snr_threshold}"
+        )
+    if not math.isfinite(temperature_k) or temperature_k < 0:
+        raise ValueError(
+            f"temperature_k must be non-negative and finite, got {temperature_k}"
+        )
+
     matrix = _registry.get(matrix_isotope)
     if matrix is None:
         raise ValueError(f"Matrix isotope {matrix_isotope!r} not loaded.")
