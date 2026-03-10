@@ -596,10 +596,13 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
     // cancel_pending_tasks deliberately leaves save state alone (save cannot be
     // cancelled safely). Since we are replacing the entire session, clear save
     // tracking explicitly — the background thread will still finish its HDF5
-    // write, but we no longer care about the result.
+    // write, and we no longer care about the result for this session, but we
+    // still keep the JoinHandle so shutdown code can join the thread safely.
     state.is_saving = false;
     state.pending_save = None;
-    state.save_join_handle = None;
+    // Note: save_join_handle is intentionally NOT cleared here.
+    // Dropping it would detach the thread, making on_exit unable to join it.
+    // The handle will be joined in on_exit() before the process terminates.
 
     // 1. Clear derived state
     state.spatial_result = None;
