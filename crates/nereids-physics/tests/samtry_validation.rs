@@ -533,10 +533,10 @@ fn test_tr008_ni58_broadened() {
     // tr008: SAMMY uses HEGA Doppler (multi-style doppler broadening keyword),
     // NEREIDS uses exact FGM and Gaussian+exponential resolution (Deltae=0.004).
     // Error sources: Doppler method mismatch (HEGA vs FGM).
-    // Measured: 3.3% mean.
+    // Measured: 1.7% mean.
     assert!(
-        result.mean_rel_error < 0.04,
-        "broadened mean error {:.4} > 4%",
+        result.mean_rel_error < 0.03,
+        "broadened mean error {:.4} > 3%",
         result.mean_rel_error
     );
 }
@@ -580,10 +580,10 @@ fn test_tr006_ni60_broadened() {
     // uses exact FGM.  PW-linear Gaussian broadening + adaptive intermediate
     // grid points reduced the error from 3.4% to 3.0%.  The residual is the
     // HEGA-vs-FGM Doppler method difference.
-    // Measured: 3.0% mean.
+    // Measured: 0.36% mean.
     assert!(
-        result.mean_rel_error < 0.04,
-        "broadened mean error {:.4} > 4%",
+        result.mean_rel_error < 0.006,
+        "broadened mean error {:.4} > 0.6%",
         result.mean_rel_error
     );
 }
@@ -664,10 +664,10 @@ fn test_tr004_ni60_transmission() {
     // tr004 transmission: PW-linear broadening + intermediates reduced XS error
     // from 4.7% to 3.4%, and transmission error from 0.95% to 0.84%.
     // T = exp(-n·σ) compresses cross-section errors exponentially.
-    // Measured: 0.84% mean.
+    // Measured: 0.07% mean.
     assert!(
-        result.mean_rel_error < 0.01,
-        "transmission mean error {:.4} > 1%",
+        result.mean_rel_error < 0.002,
+        "transmission mean error {:.4} > 0.2%",
         result.mean_rel_error
     );
 }
@@ -711,8 +711,8 @@ fn test_tr015_ni58_broadened() {
     );
     // Measured: 0.06% mean (Beer-Lambert path: resolution-broadens T, not σ).
     assert!(
-        result.mean_rel_error < 0.002,
-        "broadened mean error {:.4} > 0.2%",
+        result.mean_rel_error < 0.001,
+        "broadened mean error {:.4} > 0.1%",
         result.mean_rel_error
     );
 }
@@ -756,8 +756,8 @@ fn test_tr016_ni58_broadened() {
     // grid points, hence slightly lower error.
     // Measured: 0.06% mean.
     assert!(
-        result.mean_rel_error < 0.002,
-        "broadened mean error {:.4} > 0.2%",
+        result.mean_rel_error < 0.001,
+        "broadened mean error {:.4} > 0.1%",
         result.mean_rel_error
     );
 }
@@ -945,9 +945,10 @@ fn test_tr028_pu241_unbroadened() {
         result.n_above_threshold, 0,
         "no points above 0.2% threshold"
     );
+    // Measured: 0.024% mean.
     assert!(
-        result.mean_rel_error < 0.001,
-        "unbroadened mean error {:.4} >= 0.1%",
+        result.mean_rel_error < 0.0005,
+        "unbroadened mean error {:.6} >= 0.05%",
         result.mean_rel_error
     );
 }
@@ -1246,10 +1247,10 @@ fn test_tr034_cu_unbroadened() {
         result.worst_energy_kev
     );
     // tr034: no broadening, multi-isotope abundance-weighted sum.
-    // Unbroadened should match SAMMY reference very closely (<1%).
+    // Measured: 0.007% mean.
     assert!(
-        result.mean_rel_error < 0.01,
-        "unbroadened multi mean error {:.6} > 1%",
+        result.mean_rel_error < 0.0002,
+        "unbroadened multi mean error {:.6} > 0.02%",
         result.mean_rel_error
     );
 }
@@ -1330,8 +1331,8 @@ fn test_tr024_natfe_broadened() {
     // broadening + adaptive intermediates dramatically improved accuracy.
     // Measured: 0.001% mean.
     assert!(
-        result.mean_rel_error < 0.001,
-        "broadened multi mean error {:.4} > 0.1%",
+        result.mean_rel_error < 0.0001,
+        "broadened multi mean error {:.6} > 0.01%",
         result.mean_rel_error
     );
 }
@@ -1458,8 +1459,8 @@ fn test_tr012_ni58_broadened() {
     // PW-linear + intermediates improved resolution accuracy.
     // Measured: 0.07% mean.
     assert!(
-        result.mean_rel_error < 0.002,
-        "broadened mean error {:.4} >= 0.2%",
+        result.mean_rel_error < 0.0012,
+        "broadened mean error {:.4} >= 0.12%",
         result.mean_rel_error
     );
 }
@@ -1601,9 +1602,10 @@ fn test_tr018_u235_unbroadened() {
     );
     // U-235 unbroadened: direct R-matrix, 3-channel fission.
     // Should match SAMMY almost exactly (no broadening approximation).
+    // Measured: 0.0025% mean.
     assert!(
-        result.mean_rel_error < 0.001,
-        "unbroadened mean error {:.6} >= 0.1%",
+        result.mean_rel_error < 0.0001,
+        "unbroadened mean error {:.6} >= 0.01%",
         result.mean_rel_error
     );
 }
@@ -1727,9 +1729,10 @@ fn test_tr037_ni60_unbroadened() {
     // Ni-60 unbroadened reconstruction: direct R-matrix evaluation.
     // Sentinel zero-width resonances for empty spin groups (L=1,2) ensure
     // potential scattering is computed even when no resonances exist.
+    // Measured: 0.026% mean.
     assert!(
-        mean_rel_error < 0.001,
-        "unbroadened mean error {:.6} >= 0.1%",
+        mean_rel_error < 0.0005,
+        "unbroadened mean error {:.6} >= 0.05%",
         mean_rel_error
     );
 }
@@ -1825,8 +1828,8 @@ fn test_tr041_ni58_broadened() {
     // IPQ method is specific to SAMMY fitting; reference is Th_initial.
     // Measured: 0.06% mean.
     assert!(
-        result.mean_rel_error < 0.002,
-        "broadened mean error {:.4} >= 0.2%",
+        result.mean_rel_error < 0.001,
+        "broadened mean error {:.4} >= 0.1%",
         result.mean_rel_error
     );
 }
@@ -1999,9 +2002,10 @@ fn test_tr055_natfe_unbroadened() {
     // tr055: NatFe total XS, reconstruction mode, 4 isotopes, no broadening.
     // Unbroadened R-matrix calculation with ISOTOPIC MASSES for per-isotope
     // AWR/abundance should closely match SAMMY's reconstruction output.
+    // Measured: 0.019% mean.
     assert!(
-        mean_rel_error < 0.001,
-        "unbroadened multi mean error {:.6} > 0.1%",
+        mean_rel_error < 0.0004,
+        "unbroadened multi mean error {:.6} > 0.04%",
         mean_rel_error
     );
 }
@@ -2095,9 +2099,10 @@ fn test_tr101_al27_unbroadened() {
     );
     // tr101: Al-27 total XS, no broadening, 18 spin groups, s/p/d waves.
     // Unbroadened R-matrix calculation should be exact.
+    // Measured: 0.011% mean.
     assert!(
-        result.mean_rel_error < 0.001,
-        "unbroadened mean error {:.6} > 0.1%",
+        result.mean_rel_error < 0.0003,
+        "unbroadened mean error {:.6} > 0.03%",
         result.mean_rel_error
     );
 }
@@ -2379,9 +2384,10 @@ fn test_tr009_pu239_fission_broadened() {
     // SAMMY uses HEGA Doppler, NEREIDS uses exact FGM.  Energy range 0-304 eV
     // includes many resonances.  The HEGA-FGM difference at low energies can
     // be significant for fission peaks.
+    // Measured: 0.17% mean.
     assert!(
-        result.mean_rel_error < 0.06,
-        "fission mean error {:.4} > 6%",
+        result.mean_rel_error < 0.003,
+        "fission mean error {:.4} > 0.3%",
         result.mean_rel_error
     );
 }
@@ -2457,8 +2463,8 @@ fn test_tr005_am241_fission_broadened() {
     // Scattering radius overridden from 0 → 9.036 fm.
     // Measured: 1.8% mean, 20.9% max.
     assert!(
-        result.mean_rel_error < 0.05,
-        "fission mean error {:.4} > 5%",
+        result.mean_rel_error < 0.03,
+        "fission mean error {:.4} > 3%",
         result.mean_rel_error
     );
 }
@@ -2607,8 +2613,8 @@ fn test_tr050_co59_endf_transmission() {
         result.worst_energy_kev
     );
     assert!(
-        result.mean_rel_error < 0.01,
-        "ENDF mean error {:.4} > 1%",
+        result.mean_rel_error < 0.0001,
+        "ENDF mean error {:.6} > 0.01%",
         result.mean_rel_error
     );
 }
@@ -2827,9 +2833,10 @@ fn test_tr067_ni60_broadened() {
         "tr067: max_rel={:.6}, mean_rel={:.6}, n={}, worst@{:.4} keV",
         result.max_rel_error, result.mean_rel_error, result.n_points, result.worst_energy_kev
     );
+    // Measured: 0.31% mean.
     assert!(
-        result.mean_rel_error < 0.05,
-        "mean {:.4} > 5%",
+        result.mean_rel_error < 0.005,
+        "mean {:.4} > 0.5%",
         result.mean_rel_error
     );
 }
@@ -2931,9 +2938,10 @@ fn test_tr132_al_broadened() {
         "tr132: max_rel={:.6}, mean_rel={:.6}, n={}, worst@{:.4} keV",
         result.max_rel_error, result.mean_rel_error, result.n_points, result.worst_energy_kev
     );
+    // Measured: 0.022% mean.
     assert!(
-        result.mean_rel_error < 0.05,
-        "mean {:.4} > 5%",
+        result.mean_rel_error < 0.001,
+        "mean {:.4} > 0.1%",
         result.mean_rel_error
     );
 }
@@ -3036,9 +3044,10 @@ fn test_tr151_ni58_broadened() {
         "tr151: max_rel={:.6}, mean_rel={:.6}, n={}, worst@{:.4} keV",
         result.max_rel_error, result.mean_rel_error, result.n_points, result.worst_energy_kev
     );
+    // Measured: 0.062% mean.
     assert!(
-        result.mean_rel_error < 0.05,
-        "mean {:.4} > 5%",
+        result.mean_rel_error < 0.001,
+        "mean {:.4} > 0.1%",
         result.mean_rel_error
     );
 }
@@ -3184,9 +3193,10 @@ fn test_tr166_al27_broadened() {
         "tr166: max_rel={:.6}, mean_rel={:.6}, n={}, worst@{:.4} keV",
         result.max_rel_error, result.mean_rel_error, result.n_points, result.worst_energy_kev
     );
+    // Measured: 0.030% mean.
     assert!(
-        result.mean_rel_error < 0.01,
-        "mean {:.4} > 1%",
+        result.mean_rel_error < 0.001,
+        "mean {:.4} > 0.1%",
         result.mean_rel_error
     );
 }
@@ -3223,9 +3233,10 @@ fn test_tr179_pu240_broadened() {
         "tr179: max_rel={:.6}, mean_rel={:.6}, n={}, worst@{:.4} keV",
         result.max_rel_error, result.mean_rel_error, result.n_points, result.worst_energy_kev
     );
+    // Measured: 0.009% mean.
     assert!(
-        result.mean_rel_error < 0.01,
-        "mean {:.4} > 1%",
+        result.mean_rel_error < 0.0003,
+        "mean {:.6} > 0.03%",
         result.mean_rel_error
     );
 }
