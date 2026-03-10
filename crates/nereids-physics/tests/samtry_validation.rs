@@ -2207,7 +2207,10 @@ fn validate_broadened_fission(
     });
 
     // Collect resonance (energy, total_width) pairs for fine-structure points.
-    let resonances: Vec<(f64, f64)> = resonance_data.ranges[0]
+    let resonances: Vec<(f64, f64)> = resonance_data
+        .ranges
+        .first()
+        .expect("at least one resonance range")
         .l_groups
         .iter()
         .flat_map(|lg| {
