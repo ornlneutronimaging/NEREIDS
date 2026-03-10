@@ -16,7 +16,7 @@ pub fn status_bar(ctx: &egui::Context, state: &AppState, rss_bytes: u64) {
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 // Status dot
-                let dot_color = if state.is_fitting || state.is_fetching_endf {
+                let dot_color = if state.is_fitting || state.is_fetching_endf || state.is_saving {
                     semantic::ORANGE
                 } else {
                     semantic::GREEN

@@ -61,8 +61,12 @@ pub fn toolbar(ctx: &egui::Context, state: &mut AppState) {
 
                     // Save button — visible when spatial results exist
                     let has_results = state.spatial_result.is_some();
-                    if has_results && design::btn_primary(ui, "\u{1F4BE} Save").clicked() {
-                        crate::project::save_project_dialog(state);
+                    if has_results {
+                        if state.is_saving {
+                            ui.add_enabled(false, egui::Button::new("\u{1F4BE} Saving..."));
+                        } else if design::btn_primary(ui, "\u{1F4BE} Save").clicked() {
+                            crate::project::save_project_dialog(state);
+                        }
                     }
 
                     // Open button — always visible
@@ -86,6 +90,8 @@ pub fn toolbar(ctx: &egui::Context, state: &mut AppState) {
                         }
                     } else if state.is_fetching_endf {
                         design::progress_mini(ui, 0.0, "Fetching ENDF...");
+                    } else if state.is_saving {
+                        design::progress_mini(ui, 0.0, "Saving...");
                     }
                 });
             });
