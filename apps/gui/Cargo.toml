@@ -26,3 +26,17 @@ image = { workspace = true }
 serde = { workspace = true }
 rayon = { workspace = true }
 sysinfo = "0.33"
+
+# macOS app bundle configuration for cargo-bundle
+[package.metadata.bundle]
+name = "NEREIDS"
+identifier = "gov.ornl.nereids"
+icon = ["icons/nereids.icns"]
+short_description = "Neutron Resonance Imaging Data Analysis"
+long_description = """
+NEREIDS is a high-performance library and GUI for neutron resonance imaging
+data analysis. It provides cross-section computation, Levenberg-Marquardt
+fitting, and spatial composition mapping for the VENUS beamline at SNS, ORNL.
+"""
+category = "public.app-category.developer-tools"
+copyright = "Copyright © 2025 Oak Ridge National Laboratory"

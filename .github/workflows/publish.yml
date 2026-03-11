@@ -112,6 +112,40 @@ jobs:
           name: gui-wheel-${{ matrix.target }}
           path: apps/gui/dist/*.whl
 
+  # ── macOS app bundle + DMG ────────────────────────────────────────────
+  build-macos-app:
+    name: macOS App Bundle
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-bundle
+        run: cargo install cargo-bundle
+
+      - name: Build macOS app bundle
+        working-directory: apps/gui
+        run: cargo bundle --release
+
+      - name: Create DMG
+        run: |
+          VERSION=${GITHUB_REF_NAME:-dev}
+          VERSION=${VERSION#v}
+          hdiutil create -volname "NEREIDS ${VERSION}" \
+            -srcfolder apps/gui/target/release/bundle/osx/NEREIDS.app \
+            -ov -format UDZO \
+            nereids-${VERSION}-macos-arm64.dmg
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: gui-macos-app
+          path: "*.dmg"
+
   # ── Publish library to PyPI ───────────────────────────────────────────
   publish-pypi:
     name: Publish to PyPI
@@ -173,7 +207,7 @@ jobs:
   # ── GitHub Release ────────────────────────────────────────────────────
   github-release:
     name: GitHub Release
-    needs: [build-wheels, build-sdist, build-gui]
+    needs: [build-wheels, build-sdist, build-gui, build-macos-app]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
@@ -199,11 +233,19 @@ jobs:
           pattern: gui-wheel-*
           merge-multiple: true
 
+      - name: Download macOS app DMG
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/dmg
+          pattern: gui-macos-app
+          merge-multiple: true
+
       - name: Prepare release assets
         run: |
           mkdir -p release
           cp dist/wheels/* release/ 2>/dev/null || true
           cp dist/gui/* release/ 2>/dev/null || true
+          cp dist/dmg/* release/ 2>/dev/null || true
           ls -la release/
 
       - name: Create GitHub Release
