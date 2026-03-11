@@ -2140,8 +2140,9 @@ mod tests {
     /// Note: for L=0, P_0(rho) = 1 regardless of radius, so NAPS only
     /// affects L>=1.  Even for L>=1, the neutron width uses the RATIO
     /// P_l(E)/P_l(E_r), so the radius effect largely cancels.  The main
-    /// observable effect of NAPS is on the phase shift, which always uses
-    /// the scattering radius AP regardless of NAPS.
+    /// observable impact of NAPS is through the penetrability and
+    /// shift-factor terms (P_l, S_l) for L>=1; the phase shift itself
+    /// always uses the scattering radius AP regardless of NAPS.
     ///
     /// This test verifies the code path is wired correctly by checking:
     /// 1. NAPS=0 with AP = formula_radius matches NAPS=1 with AP = formula_radius

@@ -264,7 +264,7 @@ fn load_frames_from_paths(paths: &[std::path::PathBuf]) -> Result<Array3<f64>, I
         // in a directory is expected to contain exactly one frame.
         // Use load_tiff_stack() for multi-frame TIFFs.
         if decoder.more_images() {
-            return Err(IoError::TiffDecode(format!(
+            return Err(IoError::InvalidParameter(format!(
                 "File '{}' contains multiple frames; use load_tiff_stack() for multi-frame TIFFs",
                 path.display()
             )));
