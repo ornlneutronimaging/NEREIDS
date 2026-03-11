@@ -127,7 +127,7 @@ jobs:
       - name: Install cmake and cargo-bundle
         run: |
           brew install cmake
-          cargo install cargo-bundle
+          cargo install cargo-bundle --locked
 
       - name: Build macOS app bundle
         working-directory: apps/gui
