@@ -122,7 +122,7 @@ pub fn statistical_weight(j_total: f64, target_spin: f64) -> f64 {
 
 /// ENDF-6 §2.2.1 default channel radius (fm).
 ///
-/// a_c = (0.123 · A^(1/3) + 0.08) × 10  [fm]
+/// a_c = (0.123 · A^(1/3) + 0.08) × 10  \[fm\]
 ///
 /// The ENDF formula gives values in 10⁻¹² cm; the × 10 converts to fm
 /// (matching the ENDF_RADIUS_TO_FM factor applied to AP during parsing).

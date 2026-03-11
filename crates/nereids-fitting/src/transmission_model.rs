@@ -29,7 +29,7 @@ use crate::lm::{FitModel, FlatMatrix};
 /// then wrap in `Arc` so the same precomputed data is shared read-only
 /// across all rayon worker threads.
 pub struct PrecomputedTransmissionModel {
-    /// Broadened cross-sections σ_D(E) per isotope, shape [n_isotopes][n_energies].
+    /// Broadened cross-sections σ_D(E) per isotope, shape \[n_isotopes\]\[n_energies\].
     pub cross_sections: Arc<Vec<Vec<f64>>>,
     /// Mapping: `params[density_indices[i]]` is the density of isotope `i`.
     ///

@@ -180,7 +180,7 @@ fn resize_and_zero_bool(buf: &mut Vec<bool>, len: usize) {
 /// Returns `(total, elastic, capture, fission)` in barns.
 ///
 /// Iterates over all spin groups (J,π), sums their contributions.
-/// A single [`RmlWorkspace`] is allocated once and reused across spin groups.
+/// A single `RmlWorkspace` is allocated once and reused across spin groups.
 pub fn cross_sections_for_rml_range(rml: &RmlData, energy_ev: f64) -> (f64, f64, f64, f64) {
     let mut total = 0.0;
     let mut elastic = 0.0;
