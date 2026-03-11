@@ -229,10 +229,18 @@ jobs:
           for crate in endf-mat nereids-core nereids-endf nereids-physics \
                         nereids-io nereids-fitting nereids-pipeline; do
             echo "Publishing $crate..."
-            cargo publish -p $crate --no-verify \
-              || echo "$crate already published, skipping"
-            echo "Waiting for crates.io indexing..."
-            sleep 30
+            if output=$(cargo publish -p "$crate" --no-verify 2>&1); then
+              echo "Waiting for crates.io indexing..."
+              sleep 30
+            else
+              echo "$output"
+              if echo "$output" | grep -qi 'crate version .* is already uploaded'; then
+                echo "$crate already published, skipping"
+              else
+                echo "Error publishing $crate; failing workflow."
+                exit 1
+              fi
+            fi
           done
 
   # ── GitHub Release ────────────────────────────────────────────────────
