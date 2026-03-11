@@ -1,6 +1,8 @@
+# Template only — the canonical cask lives at ornlneutronimaging/homebrew-nereids.
+# CI (publish.yml update-homebrew job) substitutes version + sha256 in the tap repo.
 cask "nereids" do
   version "0.1.0"
-  sha256 "PLACEHOLDER_SHA256"
+  sha256 :no_check
 
   url "https://github.com/ornlneutronimaging/NEREIDS/releases/download/v#{version}/nereids-#{version}-macos-arm64.dmg"
   name "NEREIDS"
