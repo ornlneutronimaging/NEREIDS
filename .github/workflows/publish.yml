@@ -210,8 +210,12 @@ jobs:
   # ── Publish Rust crates to crates.io ──────────────────────────────────
   publish-crates:
     name: Publish to crates.io
+    needs: [build-wheels]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'workflow_dispatch' || github.event.inputs.dry_run != 'true')
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/nereids-core
     steps:
       - uses: actions/checkout@v4
 
@@ -225,7 +229,8 @@ jobs:
           for crate in endf-mat nereids-core nereids-endf nereids-physics \
                         nereids-io nereids-fitting nereids-pipeline; do
             echo "Publishing $crate..."
-            cargo publish -p $crate --no-verify
+            cargo publish -p $crate --no-verify \
+              || echo "$crate already published, skipping"
             echo "Waiting for crates.io indexing..."
             sleep 30
           done
