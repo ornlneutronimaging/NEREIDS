@@ -124,8 +124,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install cargo-bundle
-        run: cargo install cargo-bundle
+      - name: Install cmake and cargo-bundle
+        run: |
+          brew install cmake
+          cargo install cargo-bundle
 
       - name: Build macOS app bundle
         working-directory: apps/gui
@@ -136,7 +138,7 @@ jobs:
           VERSION=${GITHUB_REF_NAME:-dev}
           VERSION=${VERSION#v}
           hdiutil create -volname "NEREIDS ${VERSION}" \
-            -srcfolder apps/gui/target/release/bundle/osx/NEREIDS.app \
+            -srcfolder target/release/bundle/osx/NEREIDS.app \
             -ov -format UDZO \
             nereids-${VERSION}-macos-arm64.dmg
 
@@ -145,6 +147,7 @@ jobs:
         with:
           name: gui-macos-app
           path: "*.dmg"
+          if-no-files-found: error
 
   # ── Publish library to PyPI ───────────────────────────────────────────
   publish-pypi:

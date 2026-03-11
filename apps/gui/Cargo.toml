@@ -39,4 +39,4 @@ data analysis. It provides cross-section computation, Levenberg-Marquardt
 fitting, and spatial composition mapping for the VENUS beamline at SNS, ORNL.
 """
 category = "public.app-category.developer-tools"
-copyright = "Copyright © 2025 Oak Ridge National Laboratory"
+copyright = "Copyright © 2025-2026 Oak Ridge National Laboratory"
