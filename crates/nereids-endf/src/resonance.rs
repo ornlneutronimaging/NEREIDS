@@ -803,7 +803,7 @@ mod tests {
             formalism: crate::resonance::ResonanceFormalism::ReichMoore,
             target_spin: 0.0,
             scattering_radius: 9.4285,
-            naps: 0,
+            naps: 1,
             ap_table: None,
             l_groups: vec![],
             rml: None,
@@ -826,7 +826,7 @@ mod tests {
             formalism: crate::resonance::ResonanceFormalism::ReichMoore,
             target_spin: 0.0,
             scattering_radius: 9.0, // constant fallback (ignored when table is Some)
-            naps: 0,
+            naps: 1,
             ap_table: Some(table),
             l_groups: vec![],
             rml: None,

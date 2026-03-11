@@ -1183,7 +1183,7 @@ fn create_resonance_data(
                 formalism: res_formalism,
                 target_spin,
                 scattering_radius,
-                naps: 0,
+                naps: 1,
                 l_groups: groups,
                 rml: None,
                 urr: None,
