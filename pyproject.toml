@@ -85,5 +85,9 @@ lint = { depends-on = ["lint-fmt", "lint-clippy"], description = "Run all linter
 gui = { cmd = "cargo run --release -p nereids-gui", description = "Run the GUI application (release)" }
 gui-debug = { cmd = "cargo run -p nereids-gui", description = "Run the GUI application (debug)" }
 gui-bundle = { cmd = "cargo bundle --release", cwd = "apps/gui", description = "Bundle the GUI as a macOS .app" }
+doc-guide = { cmd = "mdbook build", cwd = "docs/guide", description = "Build the mdBook user guide (requires: cargo install mdbook)" }
+doc-api = { cmd = "cargo doc --workspace --no-deps --exclude nereids-python", description = "Build rustdoc API reference" }
+doc-build = { cmd = "cp -r target/doc target/book/api", depends-on = ["doc-guide", "doc-api"], description = "Build full docs site (mdBook + rustdoc)" }
+doc = { cmd = "python -m http.server 8000", cwd = "target/book", depends-on = ["doc-build"], description = "Build and serve docs locally at http://localhost:8000" }
 gh-issues = { cmd = "python scripts/gh_issues.py", description = "Query GitHub issues/PRs consistently" }
 copilot-reviews = { cmd = "python scripts/fetch_copilot_reviews.py", description = "Fetch Copilot PR review comments" }
