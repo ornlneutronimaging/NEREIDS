@@ -207,6 +207,34 @@ mod tests {
     }
 
     #[test]
+    fn test_run_rebin_applies_factor_and_sets_flag() {
+        use crate::state::InputMode;
+
+        let mut state = AppState {
+            input_mode: InputMode::TransmissionTiff,
+            rebin_factor: 2,
+            ..Default::default()
+        };
+
+        // With no data, rebin should set a status message and return.
+        run_rebin(&mut state);
+        assert!(!state.rebin_applied);
+        assert!(state.status_message.contains("no data loaded"));
+
+        // With trivial factor, rebin should be skipped entirely.
+        state.rebin_factor = 1;
+        state.status_message.clear();
+        run_rebin(&mut state);
+        assert!(!state.rebin_applied);
+
+        // With already-applied flag, rebin should be skipped.
+        state.rebin_factor = 2;
+        state.rebin_applied = true;
+        run_rebin(&mut state);
+        assert!(state.rebin_applied); // unchanged
+    }
+
+    #[test]
     fn test_stage_order_all_distinct() {
         let steps = [
             GuidedStep::Landing,
