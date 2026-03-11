@@ -33,8 +33,8 @@ NEREIDS ships in three forms:
 
 ## Relationship to SAMMY
 
-NEREIDS implements the same physics as [SAMMY](https://code.ornl.gov/SAMMY/SAMMY)
-(a Fortran code for multilevel R-matrix analysis of neutron data), rewritten in
+NEREIDS implements the same physics as SAMMY
+(a Fortran code for multilevel R-matrix analysis of neutron data, ORNL/TM-9179/R8), rewritten in
 Rust with modern tooling. All physics modules reference specific SAMMY source files
 and equation numbers in their documentation.
 

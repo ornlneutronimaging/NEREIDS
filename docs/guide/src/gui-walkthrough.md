@@ -47,6 +47,12 @@ file format and loads data when all fields are filled.
 
 ![Load step](images/load-step.png)
 
+### Normalize
+
+For raw data pipelines (TIFF pair or NeXus events), the Normalize step computes
+transmission from sample and open-beam measurements. Pre-normalized and
+transmission TIFF pipelines skip this step automatically.
+
 ### Configure
 
 Select isotopes of interest from the periodic table. ENDF nuclear data is

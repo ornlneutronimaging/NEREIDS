@@ -12,13 +12,13 @@ equations and citations.
 
 | Formalism | ENDF LRF | Module | SAMMY Reference |
 |-----------|----------|--------|-----------------|
-| Reich-Moore | LRF=3 | [`reich_moore`](/api/nereids_physics/reich_moore/) | Manual Sec 2, `rml/` |
-| Single-Level Breit-Wigner | LRF=1,2 | [`slbw`](/api/nereids_physics/slbw/) | Manual Sec 2, `mlb/` |
-| R-Matrix Limited | LRF=7 | [`rmatrix_limited`](/api/nereids_physics/rmatrix_limited/) | Manual Sec 2 |
-| Unresolved Resonance Region | LRU=2 | [`urr`](/api/nereids_physics/urr/) | Hauser-Feshbach |
+| Reich-Moore | LRF=3 | [`reich_moore`](api/nereids_physics/reich_moore/) | Manual Sec 2, `rml/` |
+| Single-Level Breit-Wigner | LRF=1,2 | [`slbw`](api/nereids_physics/slbw/) | Manual Sec 2, `mlb/` |
+| R-Matrix Limited | LRF=7 | [`rmatrix_limited`](api/nereids_physics/rmatrix_limited/) | Manual Sec 2 |
+| Unresolved Resonance Region | LRU=2 | [`urr`](api/nereids_physics/urr/) | Hauser-Feshbach |
 
-The [`penetrability`](/api/nereids_physics/penetrability/) and
-[`channel`](/api/nereids_physics/channel/) modules provide the underlying
+The [`penetrability`](api/nereids_physics/penetrability/) and
+[`channel`](api/nereids_physics/channel/) modules provide the underlying
 nuclear physics: hard-sphere phase shifts, penetrability factors, wave numbers,
 and statistical spin weights.
 
@@ -28,7 +28,7 @@ and statistical spin weights.
 
 Free Gas Model (FGM) convolution accounting for thermal motion of target nuclei.
 
-- Module: [`doppler`](/api/nereids_physics/doppler/)
+- Module: [`doppler`](api/nereids_physics/doppler/)
 - SAMMY reference: `dop/` module, manual Sec 3.1
 - Key function: `doppler_broaden()` using psi/chi auxiliary functions on an adaptive grid
 
@@ -37,7 +37,7 @@ Free Gas Model (FGM) convolution accounting for thermal motion of target nuclei.
 Instrument resolution broadening from flight-path uncertainty, timing jitter,
 and moderator pulse width.
 
-- Module: [`resolution`](/api/nereids_physics/resolution/)
+- Module: [`resolution`](api/nereids_physics/resolution/)
 - SAMMY reference: `convolution/` module, manual Sec 3.2
 - Supports: Gaussian convolution, Gaussian + exponential tail, tabulated resolution functions
 
@@ -48,7 +48,7 @@ Beer-Lambert transmission: T(E) = exp(-sum_i n_i sigma_i(E))
 Where n_i is the areal density (atoms/barn) and sigma_i(E) is the broadened
 total cross-section for isotope i.
 
-- Module: [`transmission`](/api/nereids_physics/transmission/)
+- Module: [`transmission`](api/nereids_physics/transmission/)
 - SAMMY reference: `cro/`, `xxx/` modules, manual Sec 2, Sec 5
 - Handles multi-isotope samples with individual Doppler temperatures
 
@@ -58,7 +58,7 @@ total cross-section for isotope i.
 
 Standard nonlinear least-squares minimization for Gaussian-distributed data.
 
-- Module: [`lm`](/api/nereids_fitting/lm/)
+- Module: [`lm`](api/nereids_fitting/lm/)
 - SAMMY reference: `fit/` module, manual Sec 4
 - Parameters: areal densities with optional bounds, optional temperature fitting
 
@@ -66,7 +66,7 @@ Standard nonlinear least-squares minimization for Gaussian-distributed data.
 
 Maximum-likelihood fitting for low-count data where Gaussian statistics break down.
 
-- Module: [`poisson`](/api/nereids_fitting/poisson/)
+- Module: [`poisson`](api/nereids_fitting/poisson/)
 - Reference: TRINIDI approach (`trinidi/reconstruct.py`)
 - Uses analytic gradients with Fisher preconditioning for joint density + temperature fits
 
@@ -74,14 +74,14 @@ Maximum-likelihood fitting for low-count data where Gaussian statistics break do
 
 Resonance parameters are sourced from the ENDF/B library via the IAEA API:
 
-- Module: [`retrieval`](/api/nereids_endf/retrieval/) -- download and cache
-- Module: [`parser`](/api/nereids_endf/parser/) -- parse ENDF-6 File 2
-- Module: [`resonance`](/api/nereids_endf/resonance/) -- data structures
+- Module: [`retrieval`](api/nereids_endf/retrieval/) -- download and cache
+- Module: [`parser`](api/nereids_endf/parser/) -- parse ENDF-6 File 2
+- Module: [`resonance`](api/nereids_endf/resonance/) -- data structures
 
 Supported libraries: ENDF/B-VIII.0, ENDF/B-VIII.1, JEFF-3.3, JENDL-5.
 
 ## Further Reading
 
-- [SAMMY User's Guide](https://code.ornl.gov/SAMMY/SAMMY) (ORNL/TM-9179/R8)
+- SAMMY User's Guide (ORNL/TM-9179/R8)
 - [ENDF-6 Formats Manual](https://www.nndc.bnl.gov/csewg/docs/endf-manual.pdf) (BNL-203218-2018-INRE)
 - [ENDF/B-VIII.0](https://doi.org/10.1016/j.nds.2018.02.001) (Nuclear Data Sheets, 2018)

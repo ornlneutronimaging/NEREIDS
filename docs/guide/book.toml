@@ -11,5 +11,6 @@ build-dir = "../../target/book"
 [output.html]
 default-theme = "navy"
 preferred-dark-theme = "navy"
+site-url = "/NEREIDS/"
 git-repository-url = "https://github.com/ornlneutronimaging/NEREIDS"
 edit-url-template = "https://github.com/ornlneutronimaging/NEREIDS/edit/main/docs/guide/{path}"

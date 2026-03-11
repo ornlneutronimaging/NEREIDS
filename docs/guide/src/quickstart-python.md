@@ -120,4 +120,4 @@ print(f"Peak SNR: {report.peak_snr:.1f} at {report.peak_energy_ev:.2f} eV")
 
 - See the [GUI walkthrough](./gui-walkthrough.md) for interactive analysis
 - Explore the [Architecture](./architecture.md) chapter for the crate structure
-- Browse the [API Reference](/api/nereids_pipeline/) for the full Rust docs
+- Browse the [API Reference](api/nereids_pipeline/) for the full Rust docs
