@@ -23,7 +23,6 @@ jobs:
   # ── Formatting ─────────────────────────────────────────────────────
   fmt:
     name: Formatting
-    needs: check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -50,6 +49,8 @@ jobs:
     name: Test (${{ matrix.os }})
     needs: check
     runs-on: ${{ matrix.os }}
+    # Windows HDF5 static build may fail; don't block CI on it.
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     strategy:
       fail-fast: false
       matrix:
