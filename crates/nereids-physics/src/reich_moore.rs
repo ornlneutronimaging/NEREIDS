@@ -2134,7 +2134,7 @@ mod tests {
     ///
     /// The NAPS flag controls which radius is used for penetrability
     /// and shift factor calculations (ENDF-6 §2.2.1):
-    /// - NAPS=0: channel radius = 0.123·A^(1/3) + 0.08  (fm)
+    /// - NAPS=0: channel radius = (0.123·A^(1/3) + 0.08) × 10  (fm)
     /// - NAPS=1: scattering radius AP (or AP(E))
     ///
     /// Note: for L=0, P_0(rho) = 1 regardless of radius, so NAPS only
