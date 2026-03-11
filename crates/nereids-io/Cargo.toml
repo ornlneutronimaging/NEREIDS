@@ -4,6 +4,9 @@ description = "Data I/O for TIFF stacks, NeXus files, and VENUS normalization"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+keywords = ["tiff", "hdf5", "neutron", "imaging", "io"]
+categories = ["science"]
 
 [features]
 default = []

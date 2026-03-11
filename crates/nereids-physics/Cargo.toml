@@ -4,6 +4,9 @@ description = "Cross-section calculation, broadening, and transmission forward m
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+keywords = ["cross-section", "neutron", "resonance", "physics", "sammy"]
+categories = ["science"]
 
 [dependencies]
 nereids-core = { workspace = true }
