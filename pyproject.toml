@@ -28,7 +28,7 @@ keywords = [
   "cross-section",
   "spectroscopy",
 ]
-dependencies = ["numpy>=1.24"]
+dependencies = ["numpy>=1.26"]
 
 [project.urls]
 Homepage = "https://github.com/ornlneutronimaging/NEREIDS"

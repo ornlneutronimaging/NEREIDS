@@ -117,7 +117,7 @@ jobs:
     name: Publish to PyPI
     needs: [build-wheels, build-sdist]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'workflow_dispatch' || !inputs.dry_run)
+    if: startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'workflow_dispatch' || github.event.inputs.dry_run != 'true')
     environment:
       name: pypi
       url: https://pypi.org/p/nereids
@@ -150,7 +150,7 @@ jobs:
     name: Publish GUI to PyPI
     needs: [build-gui]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'workflow_dispatch' || !inputs.dry_run)
+    if: startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'workflow_dispatch' || github.event.inputs.dry_run != 'true')
     environment:
       name: pypi-gui
       url: https://pypi.org/p/nereids-gui
@@ -211,5 +211,5 @@ jobs:
         with:
           files: release/*
           generate_release_notes: true
-          draft: ${{ inputs.dry_run || false }}
+          draft: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'true' }}
           prerelease: ${{ contains(github.ref, 'rc') || contains(github.ref, 'alpha') || contains(github.ref, 'beta') }}
