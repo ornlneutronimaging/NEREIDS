@@ -658,10 +658,12 @@ fn precompute_range_data<'a>(
                 } else {
                     0.0
                 };
-                // Channel radius for precompute: when APL > 0, use it; otherwise
-                // use the constant scattering_radius. The ap_table (NRO=1) case
-                // is handled inside penetrability_at_resonance, which evaluates
-                // the table at E_r for each resonance.
+                // Channel radius for precompute: when a penetrability radius
+                // override is available (APL > 0 or NAPS=0), use that
+                // precomputed radius; otherwise fall back to the constant
+                // scattering_radius. The ap_table (NRO=1) case is handled
+                // inside penetrability_at_resonance, which evaluates the
+                // table at E_r for each resonance.
                 let channel_radius = if pen_radius_override > 0.0 {
                     pen_radius_override
                 } else {
