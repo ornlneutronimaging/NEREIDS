@@ -886,22 +886,27 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
         let trimmed = lines[idx].trim().to_uppercase();
         // SAMMY allows keyword abbreviations: "TRANS" matches "TRANSMISSION",
         // "TOTAL" matches "TOTAL CROSS SECTION", "FISSI" matches "FISSION".
+        // Reject unsupported observation types early instead of silently
+        // defaulting to Transmission.
+        if trimmed.starts_with("CAPTU") {
+            return Err(SammyParseError::new(
+                "unsupported observation type: CAPTURE (not yet implemented in NEREIDS)",
+            ));
+        }
+        if trimmed.starts_with("DIRAC") {
+            return Err(SammyParseError::new(
+                "unsupported observation type: DIRAC (not yet implemented in NEREIDS)",
+            ));
+        }
         if trimmed.starts_with("TRANS")
             || trimmed.starts_with("TOTAL")
             || trimmed.starts_with("FISSI")
-            || trimmed.starts_with("CAPTU")
-            || trimmed.starts_with("DIRAC")
         {
             if trimmed.starts_with("TOTAL") {
                 observation_type = SammyObservationType::TotalCrossSection;
             } else if trimmed.starts_with("FISSI") {
                 observation_type = SammyObservationType::Fission;
             }
-            // NOTE: CAPTU (capture) and DIRAC observables are recognized so
-            // the parser advances through their spin group definitions, but
-            // observation_type intentionally remains Transmission (default).
-            // Extend SammyObservationType when capture/Dirac physics are
-            // implemented in NEREIDS.
             idx += 1;
             // Skip data-reduction parameter lines (SAMMY Card 8) that can
             // appear between the TRANSMISSION keyword and spin group
@@ -1324,7 +1329,7 @@ pub fn sammy_to_resonance_data(
         formalism: ResonanceFormalism::ReichMoore,
         target_spin,
         scattering_radius: inp.scattering_radius_fm,
-        naps: 0,
+        naps: 1,
         ap_table: None,
         l_groups,
         rml: None,
@@ -1572,7 +1577,7 @@ pub fn sammy_to_resonance_data_multi(
             formalism: ResonanceFormalism::ReichMoore,
             target_spin,
             scattering_radius: inp.scattering_radius_fm,
-            naps: 0,
+            naps: 1,
             ap_table: None,
             l_groups,
             rml: None,
@@ -2166,5 +2171,49 @@ BROADENING
         assert!((parse_fortran_float("1.23d-5").unwrap() - 1.23e-5).abs() < 1e-20);
         assert!((parse_fortran_float("5.4D+3").unwrap() - 5.4e3).abs() < 1e-6);
         assert!((parse_fortran_float("1.0D0").unwrap() - 1.0).abs() < 1e-15);
+    }
+
+    /// Verify that CAPTURE observation type is rejected with an error.
+    #[test]
+    fn test_capture_observation_type_rejected() {
+        let content = "\
+ FE TRANSMISSION FROM 1.13 TO 1.18 KEV
+      FE56 55.9      1133.01   1170.517    99
+
+329.      80.263     0.0301   0.0       .021994
+6.0       0.2179
+CAPTURE CROSS SECTION
+  1      1    0  0.5    0.9999   .0
+    1    1    0    0      .500      .000      .000
+";
+        let result = parse_sammy_inp(content);
+        assert!(result.is_err(), "CAPTURE should be rejected");
+        let msg = result.unwrap_err().message;
+        assert!(
+            msg.contains("CAPTURE"),
+            "Error message should mention CAPTURE, got: {msg}"
+        );
+    }
+
+    /// Verify that DIRAC observation type is rejected with an error.
+    #[test]
+    fn test_dirac_observation_type_rejected() {
+        let content = "\
+ FE TRANSMISSION FROM 1.13 TO 1.18 KEV
+      FE56 55.9      1133.01   1170.517    99
+
+329.      80.263     0.0301   0.0       .021994
+6.0       0.2179
+DIRAC CROSS SECTION
+  1      1    0  0.5    0.9999   .0
+    1    1    0    0      .500      .000      .000
+";
+        let result = parse_sammy_inp(content);
+        assert!(result.is_err(), "DIRAC should be rejected");
+        let msg = result.unwrap_err().message;
+        assert!(
+            msg.contains("DIRAC"),
+            "Error message should mention DIRAC, got: {msg}"
+        );
     }
 }

@@ -260,6 +260,16 @@ fn load_frames_from_paths(paths: &[std::path::PathBuf]) -> Result<Array3<f64>, I
             .read_image()
             .map_err(|e| IoError::TiffDecode(format!("{}", e)))?;
 
+        // Reject multi-frame TIFFs in folder loading mode — each file
+        // in a directory is expected to contain exactly one frame.
+        // Use load_tiff_stack() for multi-frame TIFFs.
+        if decoder.more_images() {
+            return Err(IoError::TiffDecode(format!(
+                "File '{}' contains multiple frames; use load_tiff_stack() for multi-frame TIFFs",
+                path.display()
+            )));
+        }
+
         let pixels = decode_to_f64(data)?;
         let expected_len = (width as usize) * (height as usize);
         if pixels.len() != expected_len {
@@ -671,5 +681,28 @@ mod tests {
     fn test_load_tiff_auto_nonexistent() {
         let result = load_tiff_auto(Path::new("/nonexistent/path"));
         assert!(result.is_err());
+    }
+
+    /// Folder loading should reject files containing multiple frames.
+    #[test]
+    fn test_load_tiff_folder_rejects_multi_frame() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Write a multi-frame TIFF into the directory.
+        let path = dir.path().join("multi.tiff");
+        let frame1: Vec<u16> = vec![1, 2, 3, 4];
+        let frame2: Vec<u16> = vec![5, 6, 7, 8];
+        write_test_tiff(&path, &[frame1, frame2], 2, 2);
+
+        let result = load_tiff_folder(dir.path(), None);
+        assert!(
+            result.is_err(),
+            "Multi-frame TIFF in folder should be rejected"
+        );
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("multiple frames"),
+            "Error should mention multiple frames, got: {err}"
+        );
     }
 }

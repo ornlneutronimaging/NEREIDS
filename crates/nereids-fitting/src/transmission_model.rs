@@ -261,13 +261,13 @@ impl FitModel for TransmissionFitModel {
 
         if let Some(ref base_xs) = self.base_xs {
             // Fast path: reuse cached unbroadened XS, only redo Doppler + Beer-Lambert.
-            // Validate temperature (same rules as SampleParams::new) so the optimizer
-            // can't silently evaluate an unphysical model with NaN/negative T.
-            let temperature_k = if !temperature_k.is_finite() || temperature_k < 0.0 {
-                0.0
-            } else {
-                temperature_k
-            };
+            // Validate temperature (same rules as SampleParams::new in the slow path)
+            // so the optimizer can't silently evaluate an unphysical model.
+            if !temperature_k.is_finite() || temperature_k < 0.0 {
+                return Err(FittingError::EvaluationFailed(format!(
+                    "Invalid temperature: {temperature_k} K (must be finite and non-negative)"
+                )));
+            }
 
             // Compute broadened XS (or reuse cache if temperature unchanged).
             // Caching avoids redundant Doppler broadening on rejected LM steps
@@ -553,7 +553,7 @@ mod tests {
                 formalism: ResonanceFormalism::ReichMoore,
                 target_spin: 0.0,
                 scattering_radius: 9.4285,
-                naps: 0,
+                naps: 1,
                 l_groups: vec![LGroup {
                     l: 0,
                     awr: 236.006,
@@ -627,7 +627,7 @@ mod tests {
                 formalism: ResonanceFormalism::ReichMoore,
                 target_spin: 0.0,
                 scattering_radius: 5.0,
-                naps: 0,
+                naps: 1,
                 l_groups: vec![LGroup {
                     l: 0,
                     awr: 10.0,

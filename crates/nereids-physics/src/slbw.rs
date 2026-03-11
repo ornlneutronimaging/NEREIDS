@@ -90,7 +90,11 @@ pub(crate) fn precompute_slbw_jgroups(
         let p_at_er = if e_r.abs() > PIVOT_FLOOR {
             let radius_at_er = if l_group.apl > 0.0 {
                 l_group.apl
+            } else if range.naps == 0 {
+                // NAPS=0: use channel radius per ENDF-6 §2.2.1
+                0.123 * awr_l.cbrt() + 0.08
             } else {
+                // NAPS=1 (default): use scattering radius AP or AP(E)
                 range.scattering_radius_at(e_r.abs())
             };
             let rho_r = channel::rho(e_r.abs(), awr_l, radius_at_er);
@@ -177,18 +181,29 @@ pub fn slbw_cross_sections_for_range(
         let l = l_group.l;
         let awr_l = if l_group.awr > 0.0 { l_group.awr } else { awr };
 
-        let channel_radius = if l_group.apl > 0.0 {
+        // Scattering radius for phase shift (always AP/APL).
+        let scatt_radius = if l_group.apl > 0.0 {
             l_group.apl
         } else {
             range.scattering_radius_at(energy_ev)
         };
+        // Penetrability radius: NAPS=0 uses channel radius formula,
+        // NAPS=1 uses scattering radius (ENDF-6 §2.2.1).
+        let pen_radius = if l_group.apl > 0.0 {
+            l_group.apl
+        } else if range.naps == 0 {
+            0.123 * awr_l.cbrt() + 0.08
+        } else {
+            scatt_radius
+        };
 
-        let rho = channel::rho(energy_ev, awr_l, channel_radius);
-        let phi = penetrability::phase_shift(l, rho);
+        let rho_phase = channel::rho(energy_ev, awr_l, scatt_radius);
+        let rho_pen = channel::rho(energy_ev, awr_l, pen_radius);
+        let phi = penetrability::phase_shift(l, rho_phase);
         let sin_phi = phi.sin();
         let cos_phi = phi.cos();
         let sin2_phi = sin_phi * sin_phi;
-        let p_at_e = penetrability::penetrability(l, rho);
+        let p_at_e = penetrability::penetrability(l, rho_pen);
 
         // Build J-groups and per-resonance invariants.
         // Note: in the per-point path (slbw_cross_sections_for_range), this
@@ -368,7 +383,7 @@ mod tests {
                 formalism: ResonanceFormalism::SLBW,
                 target_spin: 0.0,
                 scattering_radius: 9.4285,
-                naps: 0,
+                naps: 1,
                 l_groups: vec![LGroup {
                     l: 0,
                     awr: 236.006,
@@ -434,7 +449,7 @@ mod tests {
                 formalism: ResonanceFormalism::ReichMoore,
                 target_spin: 0.0,
                 scattering_radius: 9.4285,
-                naps: 0,
+                naps: 1,
                 l_groups: resonances.clone(),
                 rml: None,
                 urr: None,
@@ -454,7 +469,7 @@ mod tests {
                 formalism: ResonanceFormalism::SLBW,
                 target_spin: 0.0,
                 scattering_radius: 9.4285,
-                naps: 0,
+                naps: 1,
                 l_groups: resonances,
                 rml: None,
                 urr: None,
