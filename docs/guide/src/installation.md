@@ -2,24 +2,15 @@
 
 ## Rust Library
 
-Add individual crates to your `Cargo.toml`:
-
-```toml
-[dependencies]
-nereids-core = "0.1"
-nereids-endf = "0.1"
-nereids-physics = "0.1"
-nereids-fitting = "0.1"
-nereids-io = "0.1"
-nereids-pipeline = "0.1"
-```
-
-Or use just the top-level orchestration crate:
+Add the top-level orchestration crate (re-exports all lower-level crates):
 
 ```toml
 [dependencies]
 nereids-pipeline = "0.1"
 ```
+
+Or add individual crates (`nereids-core`, `nereids-endf`, `nereids-physics`,
+`nereids-fitting`, `nereids-io`) for finer-grained dependency control.
 
 **Requirements**: Rust edition 2024 (rustc 1.85+).
 
@@ -37,30 +28,17 @@ This requires the HDF5 C library to be installed on your system.
 ## Python Bindings
 
 ```bash
-pip install nereids
+pip install nereids          # available after first public release
 ```
 
-Or with [pixi](https://pixi.sh):
-
-```bash
-pixi add nereids
-```
-
-**Requirements**: Python 3.9+ and NumPy.
+**Requirements**: Python 3.10+ and NumPy.
 
 ## Desktop GUI
 
 ### macOS (Homebrew)
 
 ```bash
-brew install --cask ornlneutronimaging/nereids/nereids
-```
-
-### macOS / Linux (pip)
-
-```bash
-pip install nereids-gui
-nereids-gui
+brew install --cask ornlneutronimaging/nereids/nereids   # available after first public release
 ```
 
 ### From Source
