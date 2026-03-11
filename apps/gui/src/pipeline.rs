@@ -84,9 +84,9 @@ pub fn run_pipeline(state: &mut AppState, from_step: GuidedStep) -> Result<(), S
 /// Re-run the rebin stage.
 ///
 /// Only applies if `rebin_factor > 1` and rebin hasn't already been applied.
-/// In a re-run scenario the data has already been loaded from disk (the
-/// pipeline escalates to Load when dirty_from <= Load), so we just need to
-/// re-apply the rebinning to the freshly loaded data.
+/// In a re-run scenario, data loading is handled by the GUI before
+/// `run_pipeline` is called, so the data is already fresh when we
+/// reach Rebin.
 fn run_rebin(state: &mut AppState) {
     use crate::state::InputMode;
 
@@ -97,6 +97,7 @@ fn run_rebin(state: &mut AppState) {
 
     // Need data to rebin.
     if state.sample_data.is_none() {
+        state.status_message = "Rebin skipped: no data loaded".into();
         return;
     }
 
