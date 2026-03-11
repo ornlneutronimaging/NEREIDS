@@ -2,7 +2,15 @@
 
 **N**eutron r**E**sonance **RE**solved **I**maging **D**ata analysis **S**ystem
 
+[![Docs](https://img.shields.io/badge/docs-guide-blue)](https://ornlneutronimaging.github.io/NEREIDS/)
+[![API](https://img.shields.io/badge/docs-rustdoc-orange)](https://ornlneutronimaging.github.io/NEREIDS/api/nereids_pipeline/)
+
 A Rust-based library for neutron resonance imaging at the VENUS beamline, SNS, ORNL.
+
+## Documentation
+
+- **[User Guide](https://ornlneutronimaging.github.io/NEREIDS/)** -- Installation, quickstart, architecture
+- **[API Reference](https://ornlneutronimaging.github.io/NEREIDS/api/nereids_pipeline/)** -- Rustdoc for all crates
 
 ## Overview
 
