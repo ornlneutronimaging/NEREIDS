@@ -137,7 +137,7 @@ fn current_bin_count(state: &AppState) -> Option<usize> {
     })
 }
 
-fn apply_rebin(state: &mut AppState, is_transmission: bool) {
+pub(crate) fn apply_rebin(state: &mut AppState, is_transmission: bool) {
     let factor = state.rebin_factor;
 
     // Cancel any in-flight fitting tasks before mutating data arrays

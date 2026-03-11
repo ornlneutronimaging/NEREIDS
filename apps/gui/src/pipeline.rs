@@ -84,12 +84,25 @@ pub fn run_pipeline(state: &mut AppState, from_step: GuidedStep) -> Result<(), S
 /// Re-run the rebin stage.
 ///
 /// Only applies if `rebin_factor > 1` and rebin hasn't already been applied.
-/// In a re-run scenario the data has already been loaded from disk, so we
-/// just need to apply the rebinning again.
-fn run_rebin(_state: &mut AppState) {
-    // Re-running rebin requires reloading original data first, then
-    // re-applying the factor.  Currently a no-op — the pipeline falls
-    // through to Normalize/Analyze which use whatever data is loaded.
+/// In a re-run scenario, data loading is handled by the GUI before
+/// `run_pipeline` is called, so the data is already fresh when we
+/// reach Rebin.
+fn run_rebin(state: &mut AppState) {
+    use crate::state::InputMode;
+
+    // Nothing to do if factor is trivial or already applied.
+    if state.rebin_factor <= 1 || state.rebin_applied {
+        return;
+    }
+
+    // Need data to rebin.
+    if state.sample_data.is_none() {
+        state.status_message = "Rebin skipped: no data loaded".into();
+        return;
+    }
+
+    let is_transmission = state.input_mode == InputMode::TransmissionTiff;
+    crate::guided::rebin::apply_rebin(state, is_transmission);
 }
 
 /// Execute the normalize stage synchronously.
@@ -191,6 +204,34 @@ mod tests {
         state.mark_dirty(GuidedStep::Analyze);
         state.mark_dirty(GuidedStep::Analyze);
         assert_eq!(state.dirty_from, Some(GuidedStep::Analyze));
+    }
+
+    #[test]
+    fn test_run_rebin_applies_factor_and_sets_flag() {
+        use crate::state::InputMode;
+
+        let mut state = AppState {
+            input_mode: InputMode::TransmissionTiff,
+            rebin_factor: 2,
+            ..Default::default()
+        };
+
+        // With no data, rebin should set a status message and return.
+        run_rebin(&mut state);
+        assert!(!state.rebin_applied);
+        assert!(state.status_message.contains("no data loaded"));
+
+        // With trivial factor, rebin should be skipped entirely.
+        state.rebin_factor = 1;
+        state.status_message.clear();
+        run_rebin(&mut state);
+        assert!(!state.rebin_applied);
+
+        // With already-applied flag, rebin should be skipped.
+        state.rebin_factor = 2;
+        state.rebin_applied = true;
+        run_rebin(&mut state);
+        assert!(state.rebin_applied); // unchanged
     }
 
     #[test]
