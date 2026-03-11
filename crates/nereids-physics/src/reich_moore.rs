@@ -490,8 +490,12 @@ enum PrecomputedRmLGroupData {
     Single {
         l: u32,
         awr_l: f64,
-        /// L-group override radius (fm). 0.0 means use range radius.
+        /// L-group override radius (fm). Used only for scattering radius
+        /// (phase shifts). 0.0 means use range radius.
         apl: f64,
+        /// Precomputed penetrability radius (fm): APL when set, else
+        /// NAPS=0 formula. 0.0 means fall back to `scatt_radius`.
+        pen_radius_override: f64,
         jgroups: Vec<PrecomputedJGroupSingle>,
     },
     /// One fission channel (gfa != 0, gfb == 0).
@@ -499,6 +503,7 @@ enum PrecomputedRmLGroupData {
         l: u32,
         awr_l: f64,
         apl: f64,
+        pen_radius_override: f64,
         jgroups: Vec<PrecomputedJGroup2ch>,
     },
     /// Two fission channels (both gfa and gfb != 0).
@@ -506,6 +511,7 @@ enum PrecomputedRmLGroupData {
         l: u32,
         awr_l: f64,
         apl: f64,
+        pen_radius_override: f64,
         jgroups: Vec<PrecomputedJGroup3ch>,
     },
 }
@@ -516,6 +522,9 @@ struct PrecomputedSlbwLGroupData {
     awr_l: f64,
     /// L-group override radius (fm). 0.0 means use range radius.
     apl: f64,
+    /// Precomputed penetrability radius (fm): APL when set, else
+    /// NAPS=0 formula. 0.0 means fall back to `scatt_radius`.
+    pen_radius_override: f64,
     jgroups: Vec<slbw::PrecomputedSlbwJGroup>,
 }
 
@@ -612,10 +621,18 @@ fn precompute_range_data<'a>(
                     l_group,
                     range.target_spin,
                 );
+                let pen_radius_override = if l_group.apl > 0.0 {
+                    l_group.apl
+                } else if range.naps == 0 {
+                    channel::endf_channel_radius_fm(awr_l)
+                } else {
+                    0.0
+                };
                 PrecomputedSlbwLGroupData {
                     l,
                     awr_l,
                     apl: l_group.apl,
+                    pen_radius_override,
                     jgroups,
                 }
             })
@@ -632,17 +649,24 @@ fn precompute_range_data<'a>(
                 let l = l_group.l;
                 let awr_l = if l_group.awr > 0.0 { l_group.awr } else { awr };
 
-                // Channel radius for precompute: when APL > 0, use it; otherwise
-                // use the constant scattering_radius. The ap_table (NRO=1) case
-                // is handled inside penetrability_at_resonance, which evaluates
-                // the table at E_r for each resonance.
-                let channel_radius = if l_group.apl > 0.0 {
+                // Pen-radius override: energy-independent when APL > 0 or NAPS=0.
+                // Stored in the precomputed struct to avoid recomputation per energy.
+                let pen_radius_override = if l_group.apl > 0.0 {
                     l_group.apl
                 } else if range.naps == 0 {
-                    // NAPS=0: use channel radius per ENDF-6 §2.2.1
                     channel::endf_channel_radius_fm(awr_l)
                 } else {
-                    // NAPS=1 (default): use scattering radius AP or AP(E)
+                    0.0
+                };
+                // Channel radius for precompute: when a penetrability radius
+                // override is available (APL > 0 or NAPS=0), use that
+                // precomputed radius; otherwise fall back to the constant
+                // scattering_radius. The ap_table (NRO=1) case is handled
+                // inside penetrability_at_resonance, which evaluates the
+                // table at E_r for each resonance.
+                let channel_radius = if pen_radius_override > 0.0 {
+                    pen_radius_override
+                } else {
                     range.scattering_radius
                 };
                 // NAPS=0: penetrability uses the formula radius, not the AP(E) table.
@@ -671,6 +695,7 @@ fn precompute_range_data<'a>(
                         l,
                         awr_l,
                         apl: l_group.apl,
+                        pen_radius_override,
                         jgroups,
                     }
                 } else if !has_two_fission {
@@ -692,6 +717,7 @@ fn precompute_range_data<'a>(
                         l,
                         awr_l,
                         apl: l_group.apl,
+                        pen_radius_override,
                         jgroups,
                     }
                 } else {
@@ -713,6 +739,7 @@ fn precompute_range_data<'a>(
                         l,
                         awr_l,
                         apl: l_group.apl,
+                        pen_radius_override,
                         jgroups,
                     }
                 }
@@ -764,12 +791,10 @@ fn evaluate_precomputed_range(
                 } else {
                     range.scattering_radius_at(energy_ev)
                 };
-                // Penetrability radius: NAPS=0 uses channel radius formula,
-                // NAPS=1 uses scattering radius (ENDF-6 §2.2.1).
-                let pen_radius = if lg.apl > 0.0 {
-                    lg.apl
-                } else if range.naps == 0 {
-                    channel::endf_channel_radius_fm(lg.awr_l)
+                // Penetrability radius: precomputed override (APL or NAPS=0
+                // formula), falling back to scattering radius.
+                let pen_radius = if lg.pen_radius_override > 0.0 {
+                    lg.pen_radius_override
                 } else {
                     scatt_radius
                 };
@@ -807,10 +832,28 @@ fn evaluate_precomputed_range(
             let mut fission = 0.0;
 
             for lg in l_groups {
-                let (l, awr_l, apl) = match lg {
-                    PrecomputedRmLGroupData::Single { l, awr_l, apl, .. } => (*l, *awr_l, *apl),
-                    PrecomputedRmLGroupData::TwoCh { l, awr_l, apl, .. } => (*l, *awr_l, *apl),
-                    PrecomputedRmLGroupData::ThreeCh { l, awr_l, apl, .. } => (*l, *awr_l, *apl),
+                let (l, awr_l, apl, pen_ovr) = match lg {
+                    PrecomputedRmLGroupData::Single {
+                        l,
+                        awr_l,
+                        apl,
+                        pen_radius_override,
+                        ..
+                    } => (*l, *awr_l, *apl, *pen_radius_override),
+                    PrecomputedRmLGroupData::TwoCh {
+                        l,
+                        awr_l,
+                        apl,
+                        pen_radius_override,
+                        ..
+                    } => (*l, *awr_l, *apl, *pen_radius_override),
+                    PrecomputedRmLGroupData::ThreeCh {
+                        l,
+                        awr_l,
+                        apl,
+                        pen_radius_override,
+                        ..
+                    } => (*l, *awr_l, *apl, *pen_radius_override),
                 };
 
                 // Scattering radius for phase shift (always AP/APL).
@@ -819,15 +862,9 @@ fn evaluate_precomputed_range(
                 } else {
                     range.scattering_radius_at(energy_ev)
                 };
-                // Penetrability/shift radius: NAPS=0 uses channel radius formula,
-                // NAPS=1 uses scattering radius (ENDF-6 §2.2.1).
-                let pen_radius = if apl > 0.0 {
-                    apl
-                } else if range.naps == 0 {
-                    channel::endf_channel_radius_fm(awr_l)
-                } else {
-                    scatt_radius
-                };
+                // Penetrability/shift radius: precomputed override (APL or
+                // NAPS=0 formula), falling back to scattering radius.
+                let pen_radius = if pen_ovr > 0.0 { pen_ovr } else { scatt_radius };
 
                 let rho_phase = channel::rho(energy_ev, awr_l, scatt_radius);
                 let rho_pen = channel::rho(energy_ev, awr_l, pen_radius);
