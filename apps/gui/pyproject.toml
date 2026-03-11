@@ -1,0 +1,34 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "nereids-gui"
+version = "0.1.0"
+description = "GUI application for NEREIDS neutron resonance imaging"
+readme = "../../README.md"
+requires-python = ">= 3.10"
+license = "BSD-3-Clause"
+authors = [{ name = "ORNL Neutron Imaging", email = "neutronimaging@ornl.gov" }]
+keywords = ["neutron", "resonance", "imaging", "GUI"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: X11 Applications",
+  "Environment :: MacOS X :: Cocoa",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: BSD License",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering :: Physics",
+]
+
+[project.urls]
+Homepage = "https://github.com/ornlneutronimaging/NEREIDS"
+Repository = "https://github.com/ornlneutronimaging/NEREIDS"
+
+[tool.maturin]
+bindings = "bin"
+manifest-path = "Cargo.toml"
+strip = true

@@ -4,9 +4,40 @@ version = "0.1.0"
 description = "Neutron Resonance Imaging Data Analysis Library"
 requires-python = ">= 3.10"
 license = "BSD-3-Clause"
+authors = [{ name = "ORNL Neutron Imaging", email = "neutronimaging@ornl.gov" }]
+readme = "README.md"
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: BSD License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Topic :: Scientific/Engineering",
+  "Topic :: Scientific/Engineering :: Physics",
+]
+keywords = [
+  "neutron",
+  "resonance",
+  "imaging",
+  "endf",
+  "cross-section",
+  "spectroscopy",
+]
+dependencies = ["numpy"]
+
+[project.urls]
+Homepage = "https://github.com/ornlneutronimaging/NEREIDS"
+Repository = "https://github.com/ornlneutronimaging/NEREIDS"
+Issues = "https://github.com/ornlneutronimaging/NEREIDS/issues"
 
 [project.optional-dependencies]
 mcp = ["fastmcp>=3.0"]
+gui = ["nereids-gui==0.1.0"]
 
 [project.scripts]
 nereids-mcp = "nereids.mcp:mcp.run"
