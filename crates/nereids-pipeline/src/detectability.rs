@@ -63,7 +63,7 @@ pub struct TraceDetectabilityReport {
     /// Energies used (eV).
     pub energies: Vec<f64>,
     /// Fraction of energy bins where the matrix baseline transmission is
-    /// below [`OPAQUE_THRESHOLD`] (effectively zero due to underflow).
+    /// below `OPAQUE_THRESHOLD` (effectively zero due to underflow).
     ///
     /// When this is close to 1.0, the matrix is essentially opaque across
     /// the entire energy range, and trace detection is physically impossible

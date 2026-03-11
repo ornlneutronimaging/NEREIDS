@@ -463,7 +463,7 @@ fn execute_save_with_dialog(state: &mut AppState) {
 /// Execute the actual save to `path` with the given mode.
 ///
 /// Spawns a background thread so large embedded saves do not block the UI.
-/// The result is polled in [`crate::app::poll_pending_tasks`].
+/// The result is polled in `crate::app::poll_pending_tasks`.
 fn execute_save(state: &mut AppState, path: &Path, mode: SaveDataMode) {
     // Guard: don't start another save while one is in progress
     if state.is_saving {

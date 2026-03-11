@@ -10,61 +10,111 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  lint:
-    name: Lint
+  # ── Fast compilation gate ──────────────────────────────────────────
+  check:
+    name: Check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-
       - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --exclude nereids-python
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Clippy (Rust crates + GUI)
-        run: cargo clippy --workspace --exclude nereids-python --all-targets -- -D warnings
-
-  test:
-    name: Test
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+  # ── Formatting ─────────────────────────────────────────────────────
+  fmt:
+    name: Formatting
+    needs: check
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
 
+  # ── Clippy ─────────────────────────────────────────────────────────
+  clippy:
+    name: Clippy
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --exclude nereids-python --all-targets -- -D warnings
 
+  # ── Tests (cross-platform) ─────────────────────────────────────────
+  test:
+    name: Test (${{ matrix.os }})
+    needs: check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --workspace --exclude nereids-python
-
       - name: Run tests
         run: cargo test --workspace --exclude nereids-python
 
-  python:
-    name: Python bindings
+  # ── Documentation (warnings = errors) ──────────────────────────────
+  doc:
+    name: Documentation
+    needs: check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
-
       - uses: Swatinem/rust-cache@v2
+      - name: Build docs
+        run: cargo doc --workspace --no-deps --exclude nereids-python
+        env:
+          RUSTDOCFLAGS: -D warnings
 
+  # ── Python bindings ────────────────────────────────────────────────
+  python:
+    name: Python bindings
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Install pixi
         uses: prefix-dev/setup-pixi@v0.9.4
         with:
           pixi-version: v0.62.2
+          cache: true
           run-install: false
-
       - name: Install dependencies
         run: pixi install
-
       - name: Build and test Python bindings
         run: pixi run test-python
+
+  # ── Code coverage ──────────────────────────────────────────────────
+  coverage:
+    name: Coverage
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Generate coverage
+        run: cargo llvm-cov --workspace --exclude nereids-python --lcov --output-path lcov.info
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

@@ -111,7 +111,7 @@ pub struct SammySpinGroup {
     pub l: u32,
     /// Statistical weight / abundance.
     pub abundance: f64,
-    /// Per-spin-group target spin I, parsed from columns [30:35] of each
+    /// Per-spin-group target spin I, parsed from columns \[30:35\] of each
     /// header line.  Defaults to 0.0 (even-even nuclei).
     pub target_spin: f64,
     /// Optional isotope label from the header line (columns ~52+),
