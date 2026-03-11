@@ -120,6 +120,16 @@ pub fn statistical_weight(j_total: f64, target_spin: f64) -> f64 {
     (2.0 * j_total.abs() + 1.0) / ((2.0 * target_spin + 1.0) * (2.0 * neutron_spin + 1.0))
 }
 
+/// ENDF-6 §2.2.1 default channel radius (fm).
+///
+/// a_c = (0.123 · A^(1/3) + 0.08) × 10  [fm]
+///
+/// The ENDF formula gives values in 10⁻¹² cm; the × 10 converts to fm
+/// (matching the ENDF_RADIUS_TO_FM factor applied to AP during parsing).
+pub fn endf_channel_radius_fm(awr: f64) -> f64 {
+    (0.123 * awr.cbrt() + 0.08) * 10.0
+}
+
 /// Convert between lab and center-of-mass energy.
 ///
 /// E_cm = E_lab · AWR / (1 + AWR)

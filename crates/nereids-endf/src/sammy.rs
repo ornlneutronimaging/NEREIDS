@@ -1329,6 +1329,7 @@ pub fn sammy_to_resonance_data(
         formalism: ResonanceFormalism::ReichMoore,
         target_spin,
         scattering_radius: inp.scattering_radius_fm,
+        // SAMMY always uses AP for penetrability (equivalent to ENDF NAPS=1).
         naps: 1,
         ap_table: None,
         l_groups,
@@ -1577,6 +1578,7 @@ pub fn sammy_to_resonance_data_multi(
             formalism: ResonanceFormalism::ReichMoore,
             target_spin,
             scattering_radius: inp.scattering_radius_fm,
+            // SAMMY always uses AP for penetrability (equivalent to ENDF NAPS=1).
             naps: 1,
             ap_table: None,
             l_groups,

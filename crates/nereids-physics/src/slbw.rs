@@ -92,7 +92,7 @@ pub(crate) fn precompute_slbw_jgroups(
                 l_group.apl
             } else if range.naps == 0 {
                 // NAPS=0: use channel radius per ENDF-6 §2.2.1
-                0.123 * awr_l.cbrt() + 0.08
+                channel::endf_channel_radius_fm(awr_l)
             } else {
                 // NAPS=1 (default): use scattering radius AP or AP(E)
                 range.scattering_radius_at(e_r.abs())
@@ -192,7 +192,7 @@ pub fn slbw_cross_sections_for_range(
         let pen_radius = if l_group.apl > 0.0 {
             l_group.apl
         } else if range.naps == 0 {
-            0.123 * awr_l.cbrt() + 0.08
+            channel::endf_channel_radius_fm(awr_l)
         } else {
             scatt_radius
         };
@@ -503,5 +503,150 @@ mod tests {
                 e
             );
         }
+    }
+
+    /// Verify the SLBW NAPS=0 code path uses the channel radius formula.
+    ///
+    /// Same structure as the RM `test_naps_zero_uses_channel_radius_formula`:
+    /// 1. NAPS=0 with AP = formula_radius matches NAPS=1 with AP = formula_radius
+    ///    (confirming the formula gives the expected value)
+    /// 2. NAPS=0 with a different AP still produces valid XS (no NaN/panic)
+    #[test]
+    fn test_slbw_naps_zero_uses_channel_radius_formula() {
+        let awr: f64 = 55.345; // Fe-56-like
+        let formula_radius = channel::endf_channel_radius_fm(awr);
+
+        // NAPS=0: penetrability uses formula, phase shift uses AP (= formula here)
+        let data_naps0 = ResonanceData {
+            isotope: nereids_core::types::Isotope::new(26, 56).unwrap(),
+            za: 26056,
+            awr,
+            ranges: vec![ResonanceRange {
+                energy_low: 1e-5,
+                energy_high: 1e5,
+                resolved: true,
+                formalism: ResonanceFormalism::SLBW,
+                target_spin: 0.0,
+                scattering_radius: formula_radius, // AP = formula → same as pen_radius
+                naps: 0,
+                l_groups: vec![LGroup {
+                    l: 1,
+                    awr,
+                    apl: 0.0,
+                    qx: 0.0,
+                    lrx: 0,
+                    resonances: vec![Resonance {
+                        energy: 30000.0,
+                        j: 1.5,
+                        gn: 5.0,
+                        gg: 1.0,
+                        gfa: 0.0,
+                        gfb: 0.0,
+                    }],
+                }],
+                rml: None,
+                urr: None,
+                ap_table: None,
+                r_external: vec![],
+            }],
+        };
+
+        // NAPS=1 with AP = formula_radius: both penetrability and phase use AP
+        let data_naps1 = ResonanceData {
+            isotope: nereids_core::types::Isotope::new(26, 56).unwrap(),
+            za: 26056,
+            awr,
+            ranges: vec![ResonanceRange {
+                energy_low: 1e-5,
+                energy_high: 1e5,
+                resolved: true,
+                formalism: ResonanceFormalism::SLBW,
+                target_spin: 0.0,
+                scattering_radius: formula_radius,
+                naps: 1,
+                l_groups: vec![LGroup {
+                    l: 1,
+                    awr,
+                    apl: 0.0,
+                    qx: 0.0,
+                    lrx: 0,
+                    resonances: vec![Resonance {
+                        energy: 30000.0,
+                        j: 1.5,
+                        gn: 5.0,
+                        gg: 1.0,
+                        gfa: 0.0,
+                        gfb: 0.0,
+                    }],
+                }],
+                rml: None,
+                urr: None,
+                ap_table: None,
+                r_external: vec![],
+            }],
+        };
+
+        let e = 30000.0;
+        let xs_naps0 = slbw_cross_sections(&data_naps0, e);
+        let xs_naps1 = slbw_cross_sections(&data_naps1, e);
+
+        // When AP equals the formula radius, NAPS=0 and NAPS=1 should
+        // give identical results (both use the same radius everywhere).
+        assert!(
+            (xs_naps0.total - xs_naps1.total).abs() < 1e-10 * xs_naps1.total.abs().max(1.0),
+            "NAPS=0 total={} vs NAPS=1 total={}: should match when AP=formula",
+            xs_naps0.total,
+            xs_naps1.total,
+        );
+        assert!(
+            (xs_naps0.capture - xs_naps1.capture).abs() < 1e-10 * xs_naps1.capture.abs().max(1.0),
+            "NAPS=0 capture={} vs NAPS=1 capture={}: should match when AP=formula",
+            xs_naps0.capture,
+            xs_naps1.capture,
+        );
+
+        // Verify finite and positive cross-sections (no NaN from formula)
+        assert!(xs_naps0.total.is_finite() && xs_naps0.total > 0.0);
+        assert!(xs_naps0.capture.is_finite() && xs_naps0.capture > 0.0);
+
+        // Also verify NAPS=0 with a different AP still produces valid XS
+        let data_naps0_diff_ap = ResonanceData {
+            isotope: nereids_core::types::Isotope::new(26, 56).unwrap(),
+            za: 26056,
+            awr,
+            ranges: vec![ResonanceRange {
+                energy_low: 1e-5,
+                energy_high: 1e5,
+                resolved: true,
+                formalism: ResonanceFormalism::SLBW,
+                target_spin: 0.0,
+                scattering_radius: 9.0, // Different from formula
+                naps: 0,
+                l_groups: vec![LGroup {
+                    l: 1,
+                    awr,
+                    apl: 0.0,
+                    qx: 0.0,
+                    lrx: 0,
+                    resonances: vec![Resonance {
+                        energy: 30000.0,
+                        j: 1.5,
+                        gn: 5.0,
+                        gg: 1.0,
+                        gfa: 0.0,
+                        gfb: 0.0,
+                    }],
+                }],
+                rml: None,
+                urr: None,
+                ap_table: None,
+                r_external: vec![],
+            }],
+        };
+        let xs_diff = slbw_cross_sections(&data_naps0_diff_ap, e);
+        assert!(
+            xs_diff.total.is_finite() && xs_diff.total > 0.0,
+            "NAPS=0 with different AP should still produce valid XS"
+        );
     }
 }

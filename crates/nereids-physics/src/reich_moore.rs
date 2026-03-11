@@ -640,12 +640,13 @@ fn precompute_range_data<'a>(
                     l_group.apl
                 } else if range.naps == 0 {
                     // NAPS=0: use channel radius per ENDF-6 §2.2.1
-                    0.123 * awr_l.cbrt() + 0.08
+                    channel::endf_channel_radius_fm(awr_l)
                 } else {
                     // NAPS=1 (default): use scattering radius AP or AP(E)
                     range.scattering_radius
                 };
-                let ap_table_ref: Option<&Tab1> = if l_group.apl > 0.0 {
+                // NAPS=0: penetrability uses the formula radius, not the AP(E) table.
+                let ap_table_ref: Option<&Tab1> = if l_group.apl > 0.0 || range.naps == 0 {
                     None
                 } else {
                     range.ap_table.as_ref()
@@ -768,7 +769,7 @@ fn evaluate_precomputed_range(
                 let pen_radius = if lg.apl > 0.0 {
                     lg.apl
                 } else if range.naps == 0 {
-                    0.123 * lg.awr_l.cbrt() + 0.08
+                    channel::endf_channel_radius_fm(lg.awr_l)
                 } else {
                     scatt_radius
                 };
@@ -823,7 +824,7 @@ fn evaluate_precomputed_range(
                 let pen_radius = if apl > 0.0 {
                     apl
                 } else if range.naps == 0 {
-                    0.123 * awr_l.cbrt() + 0.08
+                    channel::endf_channel_radius_fm(awr_l)
                 } else {
                     scatt_radius
                 };
@@ -1015,7 +1016,7 @@ fn cross_sections_for_range(
             l_group.apl
         } else if range.naps == 0 {
             // NAPS=0: channel radius per ENDF-6 §2.2.1
-            0.123 * awr_l.cbrt() + 0.08
+            channel::endf_channel_radius_fm(awr_l)
         } else {
             scatt_radius
         };
@@ -1024,7 +1025,8 @@ fn cross_sections_for_range(
         // NRO=1 table is in use (i.e., no L-group override via APL).
         // When NRO=1, ENDF widths are defined at AP(E_r), not AP(energy_ev),
         // so p_at_er must use the radius evaluated at the resonance energy.
-        let ap_table_ref: Option<&Tab1> = if l_group.apl > 0.0 {
+        // NAPS=0: penetrability uses the formula radius, not the AP(E) table.
+        let ap_table_ref: Option<&Tab1> = if l_group.apl > 0.0 || range.naps == 0 {
             None
         } else {
             range.ap_table.as_ref()
@@ -2148,7 +2150,7 @@ mod tests {
     #[test]
     fn test_naps_zero_uses_channel_radius_formula() {
         let awr: f64 = 55.345; // Fe-56-like
-        let formula_radius = 0.123 * awr.cbrt() + 0.08;
+        let formula_radius = channel::endf_channel_radius_fm(awr);
 
         // NAPS=0: penetrability uses formula, phase shift uses AP (= formula here)
         let data_naps0 = ResonanceData {
@@ -2245,8 +2247,8 @@ mod tests {
 
         // Also verify the formula value is sane
         assert!(
-            (formula_radius - 0.549).abs() < 0.01,
-            "Expected ~0.549 fm for Fe-56-like, got {formula_radius}"
+            (formula_radius - 5.49).abs() < 0.1,
+            "Expected ~5.49 fm for Fe-56-like, got {formula_radius}"
         );
     }
 }
