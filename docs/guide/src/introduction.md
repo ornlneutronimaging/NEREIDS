@@ -29,9 +29,7 @@ NEREIDS ships in three forms:
 | **Python bindings** (`pip install nereids`) | Jupyter notebooks, scripting, integration with NumPy/SciPy |
 | **Desktop GUI** (`nereids-gui`) | Interactive analysis with visual feedback |
 
-<!-- TODO: uncomment when screenshots are available
 ![NEREIDS landing page](images/landing.png)
--->
 
 ## Relationship to SAMMY
 

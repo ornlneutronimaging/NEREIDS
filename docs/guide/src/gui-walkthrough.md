@@ -25,7 +25,7 @@ The landing page presents three entry points:
 - **Spatial Map** -- fit every pixel in a transmission image stack
 - **Tools** -- forward model, detectability analysis, periodic table
 
-<!-- TODO: ![Landing page](images/landing.png) -->
+![Landing page](images/landing.png)
 
 ## Decision Wizard
 
@@ -45,7 +45,7 @@ Select sample data, open beam, and spectrum files. Supports multi-frame TIFF
 stacks, TIFF folders, and NeXus/HDF5 event data. The GUI auto-detects the
 file format and loads data when all fields are filled.
 
-<!-- TODO: ![Load step](images/load-step.png) -->
+![Load step](images/load-step.png)
 
 ### Configure
 
@@ -56,7 +56,7 @@ a status badge (Pending, Fetching, Loaded, Failed).
 Configure beamline parameters (flight path, timing resolution) and solver
 settings (Levenberg-Marquardt or Poisson KL divergence).
 
-<!-- TODO: ![Configure step](images/configure-step.png) -->
+![Configure step](images/configure-step.png)
 
 ### Analyze
 
@@ -67,7 +67,7 @@ shows green (good fit) or red (failed) status.
 Draw regions of interest (ROI) with Shift+drag. Multiple ROIs are supported
 with move, select, and delete operations.
 
-<!-- TODO: ![Analyze step](images/analyze-step.png) -->
+![Analyze step](images/analyze-step.png)
 
 ### Results
 
@@ -75,7 +75,7 @@ View density maps for each fitted isotope. Summary statistics show convergence
 rate, median chi-squared, and isotope count. Open results in Studio for
 detailed exploration.
 
-<!-- TODO: ![Results step](images/results-step.png) -->
+![Results step](images/results-step.png)
 
 ## Studio Mode
 
@@ -87,7 +87,7 @@ Studio provides a "Final Cut"-style workspace for exploring results:
 - **Bottom dock**: Isotopes, Residuals, Provenance, and Export panels
 - **Inspector sidebar**: per-pixel parameter values
 
-<!-- TODO: ![Studio mode](images/studio.png) -->
+![Studio mode](images/studio.png)
 
 ## Tools
 
@@ -97,7 +97,7 @@ Compute theoretical transmission spectra for arbitrary isotope mixtures.
 Adjust densities with sliders and see the spectrum update in real-time.
 Hero spectrum layout with per-isotope contribution lines.
 
-<!-- TODO: ![Forward Model](images/forward-model.png) -->
+![Forward Model](images/forward-model.png)
 
 ### Detectability
 
@@ -105,7 +105,7 @@ Analyze whether a trace isotope is detectable in a given matrix material.
 Multi-matrix support with resolution broadening. Shows a delta-T spectrum
 and verdict badges (DETECTABLE / NOT DETECTABLE / OPAQUE MATRIX).
 
-<!-- TODO: ![Detectability](images/detectability.png) -->
+![Detectability](images/detectability.png)
 
 ### Periodic Table
 
@@ -113,7 +113,7 @@ Interactive 18-column periodic table for selecting isotopes. Click an element
 to see its natural isotopes with abundance percentages. Supports multi-select
 with density input. ENDF/B-VIII.0 availability hints shown for each isotope.
 
-<!-- TODO: ![Periodic Table](images/periodic-table.png) -->
+![Periodic Table](images/periodic-table.png)
 
 ## Project Files
 
