@@ -4,6 +4,9 @@ description = "ENDF file retrieval, caching, and resonance parameter parsing"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+keywords = ["endf", "nuclear", "resonance", "neutron", "parsing"]
+categories = ["science"]
 
 [dependencies]
 endf-mat = { workspace = true }

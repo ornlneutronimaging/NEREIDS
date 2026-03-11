@@ -4,6 +4,7 @@ description = "egui desktop application for NEREIDS"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 [[bin]]
 name = "nereids-gui"

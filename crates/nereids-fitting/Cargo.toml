@@ -4,6 +4,9 @@ description = "Optimization engine for resonance fitting (LM, Poisson/BFGS)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+keywords = ["fitting", "levenberg-marquardt", "optimization", "poisson", "neutron"]
+categories = ["science"]
 
 [dependencies]
 nereids-core = { workspace = true }

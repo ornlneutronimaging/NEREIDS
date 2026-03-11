@@ -4,6 +4,7 @@ description = "PyO3 Python bindings for NEREIDS"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 [lib]
 name = "nereids"

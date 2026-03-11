@@ -4,6 +4,9 @@ description = "Core types, constants, and traits for NEREIDS neutron resonance i
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+keywords = ["neutron", "resonance", "imaging", "nereids", "physics"]
+categories = ["science"]
 
 [dependencies]
 endf-mat = { workspace = true }
