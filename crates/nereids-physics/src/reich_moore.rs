@@ -490,7 +490,8 @@ enum PrecomputedRmLGroupData {
     Single {
         l: u32,
         awr_l: f64,
-        /// L-group override radius (fm). 0.0 means use range radius.
+        /// L-group override radius (fm). Used only for scattering radius
+        /// (phase shifts). 0.0 means use range radius.
         apl: f64,
         /// Precomputed penetrability radius (fm): APL when set, else
         /// NAPS=0 formula. 0.0 means fall back to `scatt_radius`.
@@ -829,7 +830,7 @@ fn evaluate_precomputed_range(
             let mut fission = 0.0;
 
             for lg in l_groups {
-                let (l, awr_l, apl, pro) = match lg {
+                let (l, awr_l, apl, pen_ovr) = match lg {
                     PrecomputedRmLGroupData::Single {
                         l,
                         awr_l,
@@ -861,7 +862,7 @@ fn evaluate_precomputed_range(
                 };
                 // Penetrability/shift radius: precomputed override (APL or
                 // NAPS=0 formula), falling back to scattering radius.
-                let pen_radius = if pro > 0.0 { pro } else { scatt_radius };
+                let pen_radius = if pen_ovr > 0.0 { pen_ovr } else { scatt_radius };
 
                 let rho_phase = channel::rho(energy_ev, awr_l, scatt_radius);
                 let rho_pen = channel::rho(energy_ev, awr_l, pen_radius);
