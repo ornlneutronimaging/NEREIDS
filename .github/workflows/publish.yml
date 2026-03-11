@@ -23,6 +23,8 @@ jobs:
   build-wheels:
     name: Wheel (${{ matrix.os }}, ${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    # Windows HDF5 static build may fail; don't block release on it.
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     strategy:
       fail-fast: false
       matrix:
@@ -32,7 +34,7 @@ jobs:
             manylinux: "2_28"
           - os: macos-latest
             target: aarch64-apple-darwin
-          - os: macos-13
+          - os: macos-15
             target: x86_64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
@@ -103,7 +105,7 @@ jobs:
             yum install -y cmake3 || yum install -y cmake
             ln -sf /usr/bin/cmake3 /usr/bin/cmake || true
 
-    # Note: maturin working-directory puts output in apps/gui/dist
+      # maturin working-directory puts output in apps/gui/dist
       - name: Upload GUI wheel
         uses: actions/upload-artifact@v4
         with:
