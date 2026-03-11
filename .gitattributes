@@ -1,3 +1,9 @@
 # Exclude Jupyter notebooks from GitHub language statistics and diff
 # views so that the repository is correctly detected as Rust.
 *.ipynb linguist-generated
+
+# SAMMY nuclear data test files — not code, exclude from language stats
+# (GitHub linguist misclassifies these as Gnuplot)
+tests/data/samtry/**/*.dat linguist-generated
+tests/data/samtry/**/*.par linguist-generated
+tests/data/samtry/**/*.inp linguist-generated
