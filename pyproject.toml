@@ -1,6 +1,6 @@
 [project]
 name = "nereids"
-version = "0.1.3"
+version = "0.1.4"
 description = "Neutron Resonance Imaging Data Analysis Library"
 requires-python = ">= 3.10"
 license = "BSD-3-Clause"
@@ -37,7 +37,7 @@ Issues = "https://github.com/ornlneutronimaging/NEREIDS/issues"
 
 [project.optional-dependencies]
 mcp = ["fastmcp>=3.0"]
-gui = ["nereids-gui==0.1.3"]
+gui = ["nereids-gui==0.1.4"]
 
 [project.scripts]
 nereids-mcp = "nereids.mcp:mcp.run"
@@ -51,6 +51,7 @@ manifest-path = "bindings/python/Cargo.toml"
 python-source = "bindings/python/python"
 module-name = "nereids"
 features = ["pyo3/extension-module"]
+include = [{ path = "LICENSE", format = "sdist" }]
 
 [tool.pixi.workspace]
 channels = ["conda-forge"]
