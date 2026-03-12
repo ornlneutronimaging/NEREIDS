@@ -19,7 +19,7 @@
 //! term: `(ρ · deg(p) / 2) · ||n_k - target_k(p)||²`.
 //!
 //! This maps directly to the existing per-pixel fitting API via
-//! [`ProximalPenalty`](nereids_fitting::proximal::ProximalPenalty).
+//! [`ProximalPenalty`].
 //!
 //! ## Reference
 //! - Boyd et al., "Distributed Optimization and Statistical Learning via
