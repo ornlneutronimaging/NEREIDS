@@ -402,34 +402,58 @@ pub fn spatial_map_tv(
         }
     }
 
-    // ---- Final pass: re-evaluate ancillary maps at ADMM densities ----
-    // Run spatial_map with ADMM densities as warm-start to get correct
-    // chi², uncertainty, convergence, and temperature maps.  Since the
-    // warm-start is near the per-pixel optimum, each pixel converges in
-    // ~1 LM iteration.
-    let mean_densities: Vec<f64> = (0..n_isotopes)
-        .map(|k| {
-            let sum: f64 = live_pixels.iter().map(|&p| densities[p][k]).sum();
-            sum / live_pixels.len().max(1) as f64
+    // ---- Final pass: evaluate ancillary maps at ADMM densities ----
+    // For each pixel, run fit_spectrum with ADMM density as warm-start
+    // to get chi², uncertainty, and convergence at the regularized solution.
+    // No proximal penalty — we want pure data-fidelity evaluation.
+    let trans_t_ref = &trans_t;
+    let unc_t_ref = &unc_t;
+    let densities_ref = &densities;
+
+    let final_results: Vec<(usize, crate::pipeline::SpectrumFitResult)> = live_pixels
+        .par_iter()
+        .filter_map(|&p| {
+            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                return None;
+            }
+            let y = p / width;
+            let x = p % width;
+
+            let mut pixel_config = fast_config.clone();
+            pixel_config.set_initial_densities(densities_ref[p].clone());
+
+            let t_spectrum: Vec<f64> = trans_t_ref.slice(s![y, x, ..]).to_vec();
+            let sigma: Vec<f64> = unc_t_ref
+                .slice(s![y, x, ..])
+                .iter()
+                .map(|&u| u.max(1e-10))
+                .collect();
+
+            match fit_spectrum(&t_spectrum, &sigma, &pixel_config) {
+                Ok(result) => Some((p, result)),
+                Err(_) => None,
+            }
         })
         .collect();
-    let mut final_config = fast_config.clone();
-    final_config.set_initial_densities(mean_densities);
 
-    let mut final_result = spatial_map(
-        transmission,
-        uncertainty,
-        &final_config,
-        dead_pixels,
-        cancel,
-        None,
-    )?;
-
-    // Replace density_maps with the exact ADMM-regularized values.
+    // Assemble final SpatialResult with ADMM densities + fresh ancillary maps.
     let mut density_maps: Vec<Array2<f64>> = (0..n_isotopes)
         .map(|_| Array2::zeros((height, width)))
         .collect();
+    let mut uncertainty_maps: Vec<Array2<f64>> = (0..n_isotopes)
+        .map(|_| Array2::from_elem((height, width), f64::NAN))
+        .collect();
+    let mut chi_squared_map = Array2::from_elem((height, width), f64::NAN);
+    let mut converged_map = Array2::from_elem((height, width), false);
+    let mut temperature_map: Option<Array2<f64>> = if config.fit_temperature() {
+        Some(Array2::from_elem((height, width), f64::NAN))
+    } else {
+        None
+    };
     let isotope_labels = config.isotope_names().to_vec();
+    let mut n_converged = 0usize;
+
+    // Fill ADMM densities for all live pixels.
     for &p in &live_pixels {
         let y = p / width;
         let x = p % width;
@@ -437,10 +461,36 @@ pub fn spatial_map_tv(
             density_maps[k][[y, x]] = densities[p][k];
         }
     }
-    final_result.density_maps = density_maps;
-    final_result.isotope_labels = isotope_labels;
 
-    Ok(final_result)
+    // Fill ancillary maps from final evaluation results.
+    for (p, result) in &final_results {
+        let y = p / width;
+        let x = p % width;
+        if let Some(ref unc) = result.uncertainties {
+            for k in 0..n_isotopes {
+                uncertainty_maps[k][[y, x]] = unc[k];
+            }
+        }
+        chi_squared_map[[y, x]] = result.reduced_chi_squared;
+        converged_map[[y, x]] = result.converged;
+        if result.converged {
+            n_converged += 1;
+        }
+        if let (Some(t_map), Some(temp)) = (&mut temperature_map, result.temperature_k) {
+            t_map[[y, x]] = temp;
+        }
+    }
+
+    Ok(SpatialResult {
+        density_maps,
+        uncertainty_maps,
+        chi_squared_map,
+        converged_map,
+        temperature_map,
+        isotope_labels,
+        n_converged,
+        n_total: live_pixels.len(),
+    })
 }
 
 #[cfg(test)]
