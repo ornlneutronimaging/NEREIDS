@@ -19,6 +19,66 @@ use nereids_physics::transmission::{self as phys_transmission};
 
 use crate::error::PipelineError;
 
+/// How a fit parameter participates in the optimization.
+///
+/// Used in [`ParameterConstraints`] to control which isotope densities and
+/// temperature are free (optimized) vs fixed (held constant).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum ParameterRole {
+    /// Optimized during fitting (default).
+    /// Uses `initial_densities[i]` as the starting point.
+    #[default]
+    Free,
+    /// Held at the specified value, excluded from optimization.
+    /// The value is used directly in the forward model.
+    Fixed(f64),
+}
+
+/// Per-parameter fitting constraints for a spectrum fit.
+///
+/// Controls which isotope densities and the sample temperature are
+/// free (optimized) vs fixed (held constant) during fitting.
+///
+/// # Example workflows
+///
+/// - **Fix known matrix, fit traces**: set bulk isotope densities to
+///   `Fixed(known_value)`, leave trace isotopes as `Free`.
+/// - **Fix temperature, fit densities**: set `temperature` to
+///   `Fixed(293.6)`, all densities `Free`.
+/// - **Two-stage**: first pass with `temperature: Fixed(T)` and all
+///   densities `Free`, then second pass with densities `Fixed` at
+///   fitted values and `temperature: Free`.
+#[derive(Debug, Clone)]
+pub struct ParameterConstraints {
+    /// Per-isotope constraint. Length must match `FitConfig::resonance_data`.
+    /// `Free` isotopes use `initial_densities[i]` as the starting guess.
+    /// `Fixed(val)` isotopes are held at `val` regardless of `initial_densities`.
+    pub densities: Vec<ParameterRole>,
+    /// Temperature constraint. Only meaningful when `fit_temperature` is true.
+    /// When `Fixed(T)`, the temperature is held constant at `T` even if
+    /// `fit_temperature` was enabled (the parameter is present but fixed).
+    /// When `Free`, temperature is optimized (current default behavior).
+    pub temperature: ParameterRole,
+}
+
+impl ParameterConstraints {
+    /// Create constraints where all densities are free and temperature is free.
+    pub fn all_free(n_isotopes: usize) -> Self {
+        Self {
+            densities: vec![ParameterRole::Free; n_isotopes],
+            temperature: ParameterRole::Free,
+        }
+    }
+
+    /// Returns true if all density constraints are `Free` and temperature is `Free`.
+    pub fn is_all_free(&self) -> bool {
+        self.densities
+            .iter()
+            .all(|r| matches!(r, ParameterRole::Free))
+            && matches!(self.temperature, ParameterRole::Free)
+    }
+}
+
 /// Which optimizer to use for spectrum fitting.
 #[derive(Debug, Clone, Default)]
 pub enum SolverChoice {
@@ -41,6 +101,12 @@ pub enum FitConfigError {
     DensityCountMismatch { densities: usize, isotopes: usize },
     /// isotope_names length must match resonance_data length.
     NameCountMismatch { names: usize, isotopes: usize },
+    /// constraints.densities length must match resonance_data length.
+    ConstraintCountMismatch { constraints: usize, isotopes: usize },
+    /// Fixed density value must be finite.
+    NonFiniteFixedDensity { index: usize, value: f64 },
+    /// Fixed temperature must be finite and non-negative.
+    InvalidFixedTemperature(f64),
     /// Temperature must be finite.
     NonFiniteTemperature(f64),
     /// Temperature must be non-negative.
@@ -64,6 +130,21 @@ impl fmt::Display for FitConfigError {
             Self::NameCountMismatch { names, isotopes } => write!(
                 f,
                 "isotope_names length ({names}) must match resonance_data length ({isotopes})"
+            ),
+            Self::ConstraintCountMismatch {
+                constraints,
+                isotopes,
+            } => write!(
+                f,
+                "constraints.densities length ({constraints}) must match resonance_data length ({isotopes})"
+            ),
+            Self::NonFiniteFixedDensity { index, value } => write!(
+                f,
+                "fixed density at index {index} must be finite, got {value}"
+            ),
+            Self::InvalidFixedTemperature(v) => write!(
+                f,
+                "fixed temperature must be finite and non-negative, got {v}"
             ),
             Self::NonFiniteTemperature(v) => {
                 write!(f, "temperature must be finite, got {v}")
@@ -120,6 +201,9 @@ pub struct FitConfig {
     compute_covariance: bool,
     /// Which optimizer to use. Default: LevenbergMarquardt.
     solver: SolverChoice,
+    /// Per-parameter constraints (fixed/free). When `None`, all parameters
+    /// are free (current default behavior).
+    constraints: Option<ParameterConstraints>,
 }
 
 impl FitConfig {
@@ -182,6 +266,7 @@ impl FitConfig {
             fit_temperature: false,
             compute_covariance: true,
             solver: SolverChoice::default(),
+            constraints: None,
         })
     }
 
@@ -299,6 +384,47 @@ impl FitConfig {
     pub fn solver(&self) -> &SolverChoice {
         &self.solver
     }
+
+    /// Set per-parameter constraints (builder pattern).
+    ///
+    /// # Errors
+    /// Returns `FitConfigError::ConstraintCountMismatch` if `constraints.densities`
+    /// length does not match `resonance_data` length, or validation errors for
+    /// non-finite fixed values.
+    pub fn with_constraints(
+        mut self,
+        constraints: ParameterConstraints,
+    ) -> Result<Self, FitConfigError> {
+        if constraints.densities.len() != self.resonance_data.len() {
+            return Err(FitConfigError::ConstraintCountMismatch {
+                constraints: constraints.densities.len(),
+                isotopes: self.resonance_data.len(),
+            });
+        }
+        for (i, role) in constraints.densities.iter().enumerate() {
+            if let ParameterRole::Fixed(v) = role
+                && !v.is_finite()
+            {
+                return Err(FitConfigError::NonFiniteFixedDensity {
+                    index: i,
+                    value: *v,
+                });
+            }
+        }
+        if let ParameterRole::Fixed(v) = constraints.temperature
+            && (!v.is_finite() || v < 0.0)
+        {
+            return Err(FitConfigError::InvalidFixedTemperature(v));
+        }
+        self.constraints = Some(constraints);
+        Ok(self)
+    }
+
+    /// Returns the parameter constraints, if any.
+    #[must_use]
+    pub fn constraints(&self) -> Option<&ParameterConstraints> {
+        self.constraints.as_ref()
+    }
 }
 
 /// Result of fitting a single spectrum.
@@ -405,33 +531,55 @@ pub fn fit_spectrum(
         )));
     }
 
+    let constraints = config.constraints();
     let mut param_vec: Vec<FitParameter> = config
         .initial_densities()
         .iter()
         .enumerate()
         .map(|(i, &d)| {
-            FitParameter::non_negative(
-                config
-                    .isotope_names()
-                    .get(i)
-                    .cloned()
-                    .unwrap_or_else(|| format!("isotope_{}", i)),
-                d,
-            )
+            let name = config
+                .isotope_names()
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| format!("isotope_{}", i));
+            match constraints.and_then(|c| c.densities.get(i)) {
+                Some(ParameterRole::Fixed(val)) => FitParameter::fixed(name, *val),
+                _ => FitParameter::non_negative(name, d),
+            }
         })
         .collect();
 
-    // When fitting temperature, append it as an additional free parameter
+    // When fitting temperature, append it as an additional parameter
     // after the density parameters.  Temperature uses bounded constraints
-    // (physical range 1–5000 K).
+    // (physical range 1–5000 K).  When constraints specify Fixed(T),
+    // the temperature parameter is present but marked fixed.
     let temperature_index = if config.fit_temperature() {
-        param_vec.push(FitParameter {
-            name: "temperature_k".into(),
-            value: config.temperature_k(),
-            lower: 1.0,
-            upper: 5000.0,
-            fixed: false,
-        });
+        let is_temp_fixed =
+            constraints.is_some_and(|c| matches!(c.temperature, ParameterRole::Fixed(_)));
+        let temp_value = match constraints {
+            Some(ParameterConstraints {
+                temperature: ParameterRole::Fixed(v),
+                ..
+            }) => *v,
+            _ => config.temperature_k(),
+        };
+        if is_temp_fixed {
+            param_vec.push(FitParameter {
+                name: "temperature_k".into(),
+                value: temp_value,
+                lower: 1.0,
+                upper: 5000.0,
+                fixed: true,
+            });
+        } else {
+            param_vec.push(FitParameter {
+                name: "temperature_k".into(),
+                value: temp_value,
+                lower: 1.0,
+                upper: 5000.0,
+                fixed: false,
+            });
+        }
         Some(n_isotopes)
     } else {
         None
@@ -620,8 +768,23 @@ pub fn fit_spectrum(
 
     // When covariance was computed, extract per-isotope and temperature
     // uncertainties from the LM result.  When skipped (None), propagate None.
+    //
+    // The LM result stores uncertainties only for free parameters (n_free
+    // elements).  When parameter constraints fix some densities, we expand
+    // the compact free-param uncertainties back to all-param positions,
+    // inserting 0.0 for fixed parameters.
+    let n_all_params = params.params.len();
     let (uncertainties, temperature_k, temperature_k_unc) = match result.uncertainties {
-        Some(unc_all) => {
+        Some(unc_free) => {
+            // Expand free-param uncertainties to all-param positions.
+            let free_indices = params.free_indices();
+            let mut unc_all = vec![0.0f64; n_all_params];
+            for (j, &all_idx) in free_indices.iter().enumerate() {
+                if let Some(&u) = unc_free.get(j) {
+                    unc_all[all_idx] = u;
+                }
+            }
+
             let (temp_k, temp_unc) = if config.fit_temperature() {
                 (
                     Some(result.params[n_isotopes]),
@@ -631,9 +794,6 @@ pub fn fit_spectrum(
                 (None, None)
             };
 
-            // Guard: the LM result should always produce at least n_isotopes
-            // uncertainties, but use a safe fallback to NaN if the invariant
-            // is ever violated rather than panicking on the slice.
             let unc = unc_all
                 .get(..n_isotopes)
                 .map(|s| s.to_vec())
@@ -1152,5 +1312,474 @@ mod tests {
             0.02, // 2%
             "2-isotope Poisson",
         );
+    }
+
+    // ── Parameter constraint tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_constraints_all_free_unchanged() {
+        // All-free constraints should produce identical results to no constraints.
+        let data = u238_single_resonance();
+        let true_density = 0.0005;
+        let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
+
+        let model = TransmissionFitModel::new(
+            energies.clone(),
+            vec![data.clone()],
+            0.0,
+            None,
+            vec![0],
+            None,
+            None,
+        )
+        .unwrap();
+        let y_obs = model.evaluate(&[true_density]).unwrap();
+        let sigma = vec![0.01; y_obs.len()];
+
+        // Without constraints
+        let config_no_constraints = FitConfig::new(
+            energies.clone(),
+            vec![data.clone()],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        )
+        .unwrap();
+        let result_no = fit_spectrum(&y_obs, &sigma, &config_no_constraints).unwrap();
+
+        // With all-free constraints
+        let config_all_free = FitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        )
+        .unwrap()
+        .with_constraints(ParameterConstraints::all_free(1))
+        .unwrap();
+        let result_free = fit_spectrum(&y_obs, &sigma, &config_all_free).unwrap();
+
+        assert!(
+            (result_no.densities[0] - result_free.densities[0]).abs() < 1e-12,
+            "All-free constraints should give identical results: {} vs {}",
+            result_no.densities[0],
+            result_free.densities[0],
+        );
+    }
+
+    #[test]
+    fn test_constraints_fix_one_density() {
+        // Fix U-238 at known value, fit the "other" isotope.
+        use crate::test_helpers::w182_single_resonance;
+
+        let u238 = u238_single_resonance();
+        let w182 = w182_single_resonance();
+        let true_u = 0.0005;
+        let true_w = 0.0003;
+
+        let energies: Vec<f64> = (0..401).map(|i| 2.0 + (i as f64) * 0.025).collect();
+
+        let model = TransmissionFitModel::new(
+            energies.clone(),
+            vec![u238.clone(), w182.clone()],
+            0.0,
+            None,
+            vec![0, 1],
+            None,
+            None,
+        )
+        .unwrap();
+        let y_obs = model.evaluate(&[true_u, true_w]).unwrap();
+        let sigma = vec![0.01; y_obs.len()];
+
+        // Fix U-238, fit W-182
+        let constraints = ParameterConstraints {
+            densities: vec![ParameterRole::Fixed(true_u), ParameterRole::Free],
+            temperature: ParameterRole::Free,
+        };
+        let config = FitConfig::new(
+            energies,
+            vec![u238, w182],
+            vec!["U-238".into(), "W-182".into()],
+            0.0,
+            None,
+            vec![0.001, 0.001], // initial guesses (U-238 guess ignored)
+            LmConfig::default(),
+        )
+        .unwrap()
+        .with_constraints(constraints)
+        .unwrap();
+
+        let result = fit_spectrum(&y_obs, &sigma, &config).unwrap();
+
+        assert!(result.converged, "Fit should converge");
+
+        // U-238 density must be exactly the fixed value
+        assert!(
+            (result.densities[0] - true_u).abs() < 1e-15,
+            "Fixed density should be exact: got {}, expected {}",
+            result.densities[0],
+            true_u,
+        );
+
+        // W-182 density should be recovered within tolerance
+        assert!(
+            (result.densities[1] - true_w).abs() / true_w < 0.02,
+            "Free density recovery: got {}, expected {}, error = {:.1}%",
+            result.densities[1],
+            true_w,
+            (result.densities[1] - true_w).abs() / true_w * 100.0,
+        );
+
+        // U-238 uncertainty should be 0 (fixed param)
+        if let Some(ref unc) = result.uncertainties {
+            assert!(
+                unc[0].abs() < 1e-15,
+                "Fixed param uncertainty should be 0, got {}",
+                unc[0],
+            );
+            // W-182 uncertainty should be positive
+            assert!(
+                unc[1] > 0.0,
+                "Free param uncertainty should be positive, got {}",
+                unc[1],
+            );
+        }
+    }
+
+    #[test]
+    fn test_constraints_fix_temperature() {
+        // Fix temperature, fit densities only.
+        let u238 = u238_single_resonance();
+        let true_density = 0.0005;
+        let true_temp = 300.0;
+
+        let energies: Vec<f64> = (0..401).map(|i| 4.0 + (i as f64) * 0.025).collect();
+
+        let model = TransmissionFitModel::new(
+            energies.clone(),
+            vec![u238.clone()],
+            0.0,
+            None,
+            vec![0],
+            Some(1),
+            None,
+        )
+        .unwrap();
+        let y_obs = model.evaluate(&[true_density, true_temp]).unwrap();
+        let sigma = vec![0.005; y_obs.len()];
+
+        let constraints = ParameterConstraints {
+            densities: vec![ParameterRole::Free],
+            temperature: ParameterRole::Fixed(true_temp),
+        };
+        let config = FitConfig::new(
+            energies,
+            vec![u238],
+            vec!["U-238".into()],
+            true_temp,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        )
+        .unwrap()
+        .with_fit_temperature(true)
+        .unwrap()
+        .with_constraints(constraints)
+        .unwrap();
+
+        let result = fit_spectrum(&y_obs, &sigma, &config).unwrap();
+
+        assert!(result.converged, "Fit should converge");
+
+        // Density should be recovered
+        assert!(
+            (result.densities[0] - true_density).abs() / true_density < 0.01,
+            "Density recovery: got {}, expected {}",
+            result.densities[0],
+            true_density,
+        );
+
+        // Temperature should be exactly the fixed value
+        let fitted_temp = result.temperature_k.unwrap();
+        assert!(
+            (fitted_temp - true_temp).abs() < 1e-10,
+            "Fixed temperature should be exact: got {}, expected {}",
+            fitted_temp,
+            true_temp,
+        );
+    }
+
+    #[test]
+    fn test_constraints_fix_all_but_one() {
+        // Fix all isotopes except one — the single free param should converge.
+        use crate::test_helpers::w182_single_resonance;
+
+        let u238 = u238_single_resonance();
+        let w182 = w182_single_resonance();
+        let true_u = 0.0005;
+        let true_w = 0.0003;
+
+        let energies: Vec<f64> = (0..401).map(|i| 2.0 + (i as f64) * 0.025).collect();
+
+        let model = TransmissionFitModel::new(
+            energies.clone(),
+            vec![u238.clone(), w182.clone()],
+            0.0,
+            None,
+            vec![0, 1],
+            None,
+            None,
+        )
+        .unwrap();
+        let y_obs = model.evaluate(&[true_u, true_w]).unwrap();
+        let sigma = vec![0.01; y_obs.len()];
+
+        // Fix W-182, fit only U-238
+        let constraints = ParameterConstraints {
+            densities: vec![ParameterRole::Free, ParameterRole::Fixed(true_w)],
+            temperature: ParameterRole::Free,
+        };
+        let config = FitConfig::new(
+            energies,
+            vec![u238, w182],
+            vec!["U-238".into(), "W-182".into()],
+            0.0,
+            None,
+            vec![0.001, 0.001],
+            LmConfig::default(),
+        )
+        .unwrap()
+        .with_constraints(constraints)
+        .unwrap();
+
+        let result = fit_spectrum(&y_obs, &sigma, &config).unwrap();
+
+        assert!(result.converged, "Fit should converge");
+
+        // U-238 recovered
+        assert!(
+            (result.densities[0] - true_u).abs() / true_u < 0.02,
+            "U-238: got {}, expected {}, error = {:.1}%",
+            result.densities[0],
+            true_u,
+            (result.densities[0] - true_u).abs() / true_u * 100.0,
+        );
+
+        // W-182 exact
+        assert!(
+            (result.densities[1] - true_w).abs() < 1e-15,
+            "Fixed W-182: got {}, expected {}",
+            result.densities[1],
+            true_w,
+        );
+    }
+
+    #[test]
+    fn test_constraints_fixed_values_in_output() {
+        // Verify that fixed density values appear at the correct indices in the
+        // result, even when both fixed and free params are present.
+        use crate::test_helpers::w182_single_resonance;
+
+        let u238 = u238_single_resonance();
+        let w182 = w182_single_resonance();
+        let fixed_u = 0.00042;
+        let fixed_w = 0.00031;
+
+        let energies: Vec<f64> = (0..201).map(|i| 2.0 + (i as f64) * 0.05).collect();
+
+        let model = TransmissionFitModel::new(
+            energies.clone(),
+            vec![u238.clone(), w182.clone()],
+            0.0,
+            None,
+            vec![0, 1],
+            None,
+            None,
+        )
+        .unwrap();
+        let y_obs = model.evaluate(&[fixed_u, fixed_w]).unwrap();
+        let sigma = vec![0.01; y_obs.len()];
+
+        // Fix BOTH densities
+        let constraints = ParameterConstraints {
+            densities: vec![ParameterRole::Fixed(fixed_u), ParameterRole::Fixed(fixed_w)],
+            temperature: ParameterRole::Free,
+        };
+        let config = FitConfig::new(
+            energies,
+            vec![u238, w182],
+            vec!["U-238".into(), "W-182".into()],
+            0.0,
+            None,
+            vec![0.001, 0.001], // ignored for fixed
+            LmConfig::default(),
+        )
+        .unwrap()
+        .with_constraints(constraints)
+        .unwrap();
+
+        let result = fit_spectrum(&y_obs, &sigma, &config).unwrap();
+
+        assert!(result.converged, "All-fixed should 'converge'");
+        assert_eq!(result.densities.len(), 2);
+        assert!(
+            (result.densities[0] - fixed_u).abs() < 1e-15,
+            "index 0: got {}, expected {}",
+            result.densities[0],
+            fixed_u,
+        );
+        assert!(
+            (result.densities[1] - fixed_w).abs() < 1e-15,
+            "index 1: got {}, expected {}",
+            result.densities[1],
+            fixed_w,
+        );
+    }
+
+    #[test]
+    fn test_constraints_poisson_fix_one_density() {
+        // Same as test_constraints_fix_one_density but with Poisson solver.
+        use crate::test_helpers::w182_single_resonance;
+
+        let u238 = u238_single_resonance();
+        let w182 = w182_single_resonance();
+        let true_u = 0.0005;
+        let true_w = 0.0003;
+
+        let energies: Vec<f64> = (0..401).map(|i| 2.0 + (i as f64) * 0.025).collect();
+
+        let model = TransmissionFitModel::new(
+            energies.clone(),
+            vec![u238.clone(), w182.clone()],
+            0.0,
+            None,
+            vec![0, 1],
+            None,
+            None,
+        )
+        .unwrap();
+        let y_obs = model.evaluate(&[true_u, true_w]).unwrap();
+        let sigma = vec![0.01; y_obs.len()];
+
+        // Fix U-238, fit W-182 with Poisson solver
+        let constraints = ParameterConstraints {
+            densities: vec![ParameterRole::Fixed(true_u), ParameterRole::Free],
+            temperature: ParameterRole::Free,
+        };
+        let config = FitConfig::new(
+            energies,
+            vec![u238, w182],
+            vec!["U-238".into(), "W-182".into()],
+            0.0,
+            None,
+            vec![0.001, 0.001],
+            LmConfig::default(),
+        )
+        .unwrap()
+        .with_constraints(constraints)
+        .unwrap()
+        .with_solver(SolverChoice::PoissonKL(PoissonConfig::default()));
+
+        let result = fit_spectrum(&y_obs, &sigma, &config).unwrap();
+
+        assert!(result.converged, "Poisson fit should converge");
+
+        // U-238 fixed
+        assert!(
+            (result.densities[0] - true_u).abs() < 1e-15,
+            "Fixed U-238: got {}, expected {}",
+            result.densities[0],
+            true_u,
+        );
+
+        // W-182 recovered
+        assert!(
+            (result.densities[1] - true_w).abs() / true_w < 0.05,
+            "Poisson W-182: got {}, expected {}, error = {:.1}%",
+            result.densities[1],
+            true_w,
+            (result.densities[1] - true_w).abs() / true_w * 100.0,
+        );
+    }
+
+    // ── Constraint validation tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_constraints_count_mismatch() {
+        let data = u238_single_resonance();
+        let config = FitConfig::new(
+            vec![1.0, 2.0],
+            vec![data],
+            vec!["U-238".into()],
+            300.0,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        )
+        .unwrap();
+
+        // 2 constraints but only 1 isotope
+        let err = config
+            .with_constraints(ParameterConstraints {
+                densities: vec![ParameterRole::Free, ParameterRole::Free],
+                temperature: ParameterRole::Free,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            FitConfigError::ConstraintCountMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn test_constraints_non_finite_fixed_density() {
+        let data = u238_single_resonance();
+        let config = FitConfig::new(
+            vec![1.0, 2.0],
+            vec![data],
+            vec!["U-238".into()],
+            300.0,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        )
+        .unwrap();
+
+        let err = config
+            .with_constraints(ParameterConstraints {
+                densities: vec![ParameterRole::Fixed(f64::NAN)],
+                temperature: ParameterRole::Free,
+            })
+            .unwrap_err();
+        assert!(matches!(err, FitConfigError::NonFiniteFixedDensity { .. }));
+    }
+
+    #[test]
+    fn test_constraints_invalid_fixed_temperature() {
+        let data = u238_single_resonance();
+        let config = FitConfig::new(
+            vec![1.0, 2.0],
+            vec![data],
+            vec!["U-238".into()],
+            300.0,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        )
+        .unwrap();
+
+        let err = config
+            .with_constraints(ParameterConstraints {
+                densities: vec![ParameterRole::Free],
+                temperature: ParameterRole::Fixed(-10.0),
+            })
+            .unwrap_err();
+        assert!(matches!(err, FitConfigError::InvalidFixedTemperature(_)));
     }
 }
