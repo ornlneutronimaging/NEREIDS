@@ -40,6 +40,8 @@ zip = "2"
 dirs = "6"
 tiff = "0.11"
 image = "0.25"
+rand = "0.9"
+rand_distr = "0.5"
 pyo3 = { version = "0.28", features = ["extension-module"] }
 numpy = "0.28"
 eframe = { version = "0.33", features = ["persistence"] }
