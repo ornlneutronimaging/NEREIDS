@@ -254,7 +254,7 @@ jobs:
               sleep 60
             else
               echo "$output"
-              if echo "$output" | grep -qi 'crate version .* is already uploaded'; then
+              if echo "$output" | grep -qiE 'already (uploaded|exists)'; then
                 echo "$crate already published, skipping"
               else
                 echo "Error publishing $crate; failing workflow."
