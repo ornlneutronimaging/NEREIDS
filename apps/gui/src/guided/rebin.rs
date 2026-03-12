@@ -4,6 +4,8 @@
 //! - **Transmission data** (TransmissionTiff): average adjacent bins
 //!   (assumes uniform I₀ — this is an approximation).
 
+use std::sync::Arc;
+
 use crate::state::{AppState, InputMode};
 use crate::theme::ThemeColors;
 use crate::widgets::design;
@@ -167,13 +169,13 @@ pub(crate) fn apply_rebin(state: &mut AppState, is_transmission: bool) {
         } else {
             nereids_io::rebin::rebin_counts(data, factor)
         };
-        state.sample_data = Some(rebinned);
+        state.sample_data = Some(Arc::new(rebinned));
     }
 
     // Rebin open_beam_data (always counts)
     if let Some(ref data) = state.open_beam_data {
         let rebinned = nereids_io::rebin::rebin_counts(data, factor);
-        state.open_beam_data = Some(rebinned);
+        state.open_beam_data = Some(Arc::new(rebinned));
     }
 
     // Rebin spectrum axis
@@ -183,7 +185,7 @@ pub(crate) fn apply_rebin(state: &mut AppState, is_transmission: bool) {
         } else {
             nereids_io::rebin::rebin_centers(vals, factor)
         };
-        state.spectrum_values = Some(new_vals);
+        state.spectrum_values = Some(Arc::new(new_vals));
     }
 
     // Update preview image (sum along TOF axis of new data)
