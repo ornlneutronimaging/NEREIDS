@@ -104,8 +104,8 @@ pub enum FitConfigError {
     /// constraints.densities length must match resonance_data length.
     ConstraintCountMismatch { constraints: usize, isotopes: usize },
     /// Fixed density value must be finite and non-negative.
-    NonFiniteFixedDensity { index: usize, value: f64 },
-    /// Fixed temperature must be finite and non-negative.
+    InvalidFixedDensity { index: usize, value: f64 },
+    /// Fixed temperature must be finite and within physical bounds [1, 5000] K.
     InvalidFixedTemperature(f64),
     /// Temperature must be finite.
     NonFiniteTemperature(f64),
@@ -138,13 +138,13 @@ impl fmt::Display for FitConfigError {
                 f,
                 "constraints.densities length ({constraints}) must match resonance_data length ({isotopes})"
             ),
-            Self::NonFiniteFixedDensity { index, value } => write!(
+            Self::InvalidFixedDensity { index, value } => write!(
                 f,
                 "fixed density at index {index} must be finite and non-negative, got {value}"
             ),
             Self::InvalidFixedTemperature(v) => write!(
                 f,
-                "fixed temperature must be finite and non-negative, got {v}"
+                "fixed temperature must be finite and within [1, 5000] K, got {v}"
             ),
             Self::NonFiniteTemperature(v) => {
                 write!(f, "temperature must be finite, got {v}")
@@ -405,14 +405,14 @@ impl FitConfig {
             if let ParameterRole::Fixed(v) = role
                 && (!v.is_finite() || *v < 0.0)
             {
-                return Err(FitConfigError::NonFiniteFixedDensity {
+                return Err(FitConfigError::InvalidFixedDensity {
                     index: i,
                     value: *v,
                 });
             }
         }
         if let ParameterRole::Fixed(v) = constraints.temperature
-            && (!v.is_finite() || v < 0.0)
+            && (!v.is_finite() || !(1.0..=5000.0).contains(&v))
         {
             return Err(FitConfigError::InvalidFixedTemperature(v));
         }
@@ -1745,7 +1745,7 @@ mod tests {
                 temperature: ParameterRole::Free,
             })
             .unwrap_err();
-        assert!(matches!(err, FitConfigError::NonFiniteFixedDensity { .. }));
+        assert!(matches!(err, FitConfigError::InvalidFixedDensity { .. }));
     }
 
     #[test]
@@ -1768,7 +1768,7 @@ mod tests {
                 temperature: ParameterRole::Free,
             })
             .unwrap_err();
-        assert!(matches!(err, FitConfigError::NonFiniteFixedDensity { .. }));
+        assert!(matches!(err, FitConfigError::InvalidFixedDensity { .. }));
     }
 
     #[test]
