@@ -103,7 +103,7 @@ pub enum FitConfigError {
     NameCountMismatch { names: usize, isotopes: usize },
     /// constraints.densities length must match resonance_data length.
     ConstraintCountMismatch { constraints: usize, isotopes: usize },
-    /// Fixed density value must be finite.
+    /// Fixed density value must be finite and non-negative.
     NonFiniteFixedDensity { index: usize, value: f64 },
     /// Fixed temperature must be finite and non-negative.
     InvalidFixedTemperature(f64),
@@ -140,7 +140,7 @@ impl fmt::Display for FitConfigError {
             ),
             Self::NonFiniteFixedDensity { index, value } => write!(
                 f,
-                "fixed density at index {index} must be finite, got {value}"
+                "fixed density at index {index} must be finite and non-negative, got {value}"
             ),
             Self::InvalidFixedTemperature(v) => write!(
                 f,
@@ -403,7 +403,7 @@ impl FitConfig {
         }
         for (i, role) in constraints.densities.iter().enumerate() {
             if let ParameterRole::Fixed(v) = role
-                && !v.is_finite()
+                && (!v.is_finite() || *v < 0.0)
             {
                 return Err(FitConfigError::NonFiniteFixedDensity {
                     index: i,
@@ -554,32 +554,20 @@ pub fn fit_spectrum(
     // (physical range 1–5000 K).  When constraints specify Fixed(T),
     // the temperature parameter is present but marked fixed.
     let temperature_index = if config.fit_temperature() {
-        let is_temp_fixed =
-            constraints.is_some_and(|c| matches!(c.temperature, ParameterRole::Fixed(_)));
-        let temp_value = match constraints {
+        let (temp_value, is_temp_fixed) = match constraints {
             Some(ParameterConstraints {
                 temperature: ParameterRole::Fixed(v),
                 ..
-            }) => *v,
-            _ => config.temperature_k(),
+            }) => (*v, true),
+            _ => (config.temperature_k(), false),
         };
-        if is_temp_fixed {
-            param_vec.push(FitParameter {
-                name: "temperature_k".into(),
-                value: temp_value,
-                lower: 1.0,
-                upper: 5000.0,
-                fixed: true,
-            });
-        } else {
-            param_vec.push(FitParameter {
-                name: "temperature_k".into(),
-                value: temp_value,
-                lower: 1.0,
-                upper: 5000.0,
-                fixed: false,
-            });
-        }
+        param_vec.push(FitParameter {
+            name: "temperature_k".into(),
+            value: temp_value,
+            lower: 1.0,
+            upper: 5000.0,
+            fixed: is_temp_fixed,
+        });
         Some(n_isotopes)
     } else {
         None
@@ -1761,6 +1749,29 @@ mod tests {
     }
 
     #[test]
+    fn test_constraints_negative_fixed_density() {
+        let data = u238_single_resonance();
+        let config = FitConfig::new(
+            vec![1.0, 2.0],
+            vec![data],
+            vec!["U-238".into()],
+            300.0,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        )
+        .unwrap();
+
+        let err = config
+            .with_constraints(ParameterConstraints {
+                densities: vec![ParameterRole::Fixed(-0.001)],
+                temperature: ParameterRole::Free,
+            })
+            .unwrap_err();
+        assert!(matches!(err, FitConfigError::NonFiniteFixedDensity { .. }));
+    }
+
+    #[test]
     fn test_constraints_invalid_fixed_temperature() {
         let data = u238_single_resonance();
         let config = FitConfig::new(
@@ -1781,5 +1792,81 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(err, FitConfigError::InvalidFixedTemperature(_)));
+    }
+
+    #[test]
+    fn test_constraints_poisson_fix_temperature() {
+        // Poisson solver with fit_temperature + Fixed(T) constraint.
+        // This exercises the combined Poisson+temperature+constraints path.
+        use crate::test_helpers::w182_single_resonance;
+
+        let u238 = u238_single_resonance();
+        let w182 = w182_single_resonance();
+        let true_u = 0.0005;
+        let true_w = 0.0003;
+        let true_temp = 300.0;
+
+        let energies: Vec<f64> = (0..401).map(|i| 2.0 + (i as f64) * 0.025).collect();
+
+        let model = TransmissionFitModel::new(
+            energies.clone(),
+            vec![u238.clone(), w182.clone()],
+            true_temp,
+            None,
+            vec![0, 1],
+            None,
+            None,
+        )
+        .unwrap();
+        let y_obs = model.evaluate(&[true_u, true_w]).unwrap();
+        let sigma = vec![0.01; y_obs.len()];
+
+        // Fix temperature, fit both densities with Poisson solver
+        let constraints = ParameterConstraints {
+            densities: vec![ParameterRole::Free, ParameterRole::Free],
+            temperature: ParameterRole::Fixed(true_temp),
+        };
+        let config = FitConfig::new(
+            energies,
+            vec![u238, w182],
+            vec!["U-238".into(), "W-182".into()],
+            true_temp,
+            None,
+            vec![0.001, 0.001],
+            LmConfig::default(),
+        )
+        .unwrap()
+        .with_constraints(constraints)
+        .unwrap()
+        .with_fit_temperature(true)
+        .unwrap()
+        .with_solver(SolverChoice::PoissonKL(PoissonConfig::default()));
+
+        let result = fit_spectrum(&y_obs, &sigma, &config).unwrap();
+
+        assert!(result.converged, "Poisson+fixed-temp fit should converge");
+
+        // Temperature held at fixed value
+        let temp = result.temperature_k.expect("temperature should be present");
+        assert!(
+            (temp - true_temp).abs() < 1e-10,
+            "Fixed temperature: got {temp}, expected {true_temp}",
+        );
+
+        // Both densities recovered
+        assert!(
+            (result.densities[0] - true_u).abs() / true_u < 0.05,
+            "U-238: got {}, expected {}, error = {:.1}%",
+            result.densities[0],
+            true_u,
+            (result.densities[0] - true_u).abs() / true_u * 100.0,
+        );
+        assert!(
+            (result.densities[1] - true_w).abs() / true_w < 0.05,
+            "W-182: got {}, expected {}, error = {:.1}%",
+            result.densities[1],
+            true_w,
+            (result.densities[1] - true_w).abs() / true_w * 100.0,
+        );
     }
 }
