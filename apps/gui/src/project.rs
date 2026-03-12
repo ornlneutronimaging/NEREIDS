@@ -321,9 +321,9 @@ pub fn save_modal(ctx: &egui::Context, state: &mut AppState) {
     let can_embed = state.sample_data.is_some();
     let (raw_bytes, compressed_bytes) = if can_embed {
         nereids_io::project::estimate_embedded_size(
-            state.sample_data.as_ref(),
-            state.open_beam_data.as_ref(),
-            state.spectrum_values.as_deref(),
+            state.sample_data.as_deref(),
+            state.open_beam_data.as_deref(),
+            state.spectrum_values.as_ref().map(|v| v.as_slice()),
         )
     } else {
         (0, 0)
@@ -503,9 +503,9 @@ fn execute_save(state: &mut AppState, path: &Path, mode: SaveDataMode) {
     let handle = std::thread::spawn(move || {
         let result = if let Some((ref sample, ref open_beam, ref spectrum)) = embedded_data {
             let emb = EmbeddedData {
-                sample: sample.as_ref(),
-                open_beam: open_beam.as_ref(),
-                spectrum: spectrum.as_deref(),
+                sample: sample.as_deref(),
+                open_beam: open_beam.as_deref(),
+                spectrum: spectrum.as_ref().map(|v| v.as_slice()),
             };
             nereids_io::project::save_project_with_data(&path, &snap, Some(&emb))
         } else {
@@ -788,13 +788,13 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
     // 14b. Restore embedded data if present
     if snap.data_mode == "embedded" {
         if let Some(data) = snap.sample_data {
-            state.sample_data = Some(data);
+            state.sample_data = Some(Arc::new(data));
         }
         if let Some(data) = snap.open_beam_data {
-            state.open_beam_data = Some(data);
+            state.open_beam_data = Some(Arc::new(data));
         }
         if let Some(data) = snap.spectrum_values {
-            state.spectrum_values = Some(data);
+            state.spectrum_values = Some(Arc::new(data));
         }
         state.last_save_mode = SaveDataMode::Embedded;
     } else {

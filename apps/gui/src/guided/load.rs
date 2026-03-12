@@ -3,6 +3,8 @@
 //! Prototype: `.content-area` → cards with drop zones, auto-load,
 //! format hints, and a Continue button with data guard.
 
+use std::sync::Arc;
+
 use crate::state::{AppState, InputMode, ProvenanceEventKind};
 use crate::theme::ThemeColors;
 use crate::widgets::design;
@@ -546,7 +548,7 @@ fn load_hdf5_histogram(state: &mut AppState) {
                 shape[0], shape[1], shape[2]
             );
 
-            state.spectrum_values = Some(data.tof_edges_us.clone());
+            state.spectrum_values = Some(Arc::new(data.tof_edges_us.clone()));
             state.spectrum_unit = nereids_io::spectrum::SpectrumUnit::TofMicroseconds;
 
             let n_frames = data.counts.shape()[0];
@@ -583,7 +585,7 @@ fn load_hdf5_histogram(state: &mut AppState) {
                     shape[0], shape[1], shape[2]
                 ),
             );
-            state.sample_data = Some(data.counts);
+            state.sample_data = Some(Arc::new(data.counts));
         }
         Err(e) => {
             state.status_message = format!("HDF5 load failed: {e}");
@@ -609,7 +611,7 @@ fn load_all_data(state: &mut AppState) {
                         path.display()
                     ),
                 );
-                state.sample_data = Some(data);
+                state.sample_data = Some(Arc::new(data));
                 state.status_message = "Sample loaded".into();
             }
             Err(e) => {
@@ -626,7 +628,7 @@ fn load_all_data(state: &mut AppState) {
     {
         match nereids_io::tiff_stack::load_tiff_auto(path) {
             Ok(data) => {
-                state.open_beam_data = Some(data);
+                state.open_beam_data = Some(Arc::new(data));
                 state.status_message = "Sample and open beam loaded".into();
             }
             Err(e) => {
@@ -695,7 +697,7 @@ fn load_all_data(state: &mut AppState) {
                     return;
                 }
 
-                state.spectrum_values = Some(values);
+                state.spectrum_values = Some(Arc::new(values));
                 state.status_message = "All data loaded".into();
             }
             Err(e) => {
