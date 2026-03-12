@@ -49,6 +49,7 @@ jobs:
           manylinux: ${{ matrix.manylinux || 'auto' }}
           args: --release --out dist -m bindings/python/Cargo.toml
           before-script-linux: |
+            yum install -y openssl-devel perl-IPC-Cmd
             yum install -y cmake3 || yum install -y cmake
             ln -sf /usr/bin/cmake3 /usr/bin/cmake || true
 
@@ -102,6 +103,7 @@ jobs:
           manylinux: ${{ matrix.manylinux || 'auto' }}
           args: --release --out dist
           before-script-linux: |
+            yum install -y openssl-devel perl-IPC-Cmd
             yum install -y cmake3 || yum install -y cmake
             ln -sf /usr/bin/cmake3 /usr/bin/cmake || true
 
