@@ -174,6 +174,18 @@ pub fn spatial_map_tv(
             )));
         }
     }
+    if !tv_config.tol_primal.is_finite() || tv_config.tol_primal < 0.0 {
+        return Err(PipelineError::InvalidParameter(format!(
+            "tv_config.tol_primal must be >= 0 and finite, got {}",
+            tv_config.tol_primal,
+        )));
+    }
+    if !tv_config.tol_dual.is_finite() || tv_config.tol_dual < 0.0 {
+        return Err(PipelineError::InvalidParameter(format!(
+            "tv_config.tol_dual must be >= 0 and finite, got {}",
+            tv_config.tol_dual,
+        )));
+    }
     if uncertainty.shape() != transmission.shape() {
         return Err(PipelineError::ShapeMismatch(format!(
             "uncertainty shape {:?} != transmission shape {:?}",
@@ -213,12 +225,37 @@ pub fn spatial_map_tv(
         })
         .collect();
 
+    // Short-circuit: if no isotope has both free status and non-zero lambda,
+    // the ADMM loop would do nothing. Return vanilla spatial_map directly.
+    let has_active_tv = free_isotopes
+        .iter()
+        .zip(tv_config.lambda.iter())
+        .any(|(&free, &lam)| free && lam > 0.0);
+    if !has_active_tv {
+        return spatial_map(
+            transmission,
+            uncertainty,
+            config,
+            dead_pixels,
+            cancel,
+            progress,
+        );
+    }
+
+    // Precompute cross-sections once — shared by initial spatial_map and
+    // all ADMM iterations, avoiding redundant broadening computation.
+    let fast_config = precompute_config(config, cancel)?;
+
     // ---- Iteration 0: vanilla spatial_map ----
     // Pass None for progress: only ADMM iterations count toward progress.
-    let initial_result = spatial_map(transmission, uncertainty, config, dead_pixels, cancel, None)?;
-
-    // Precompute cross-sections once for all ADMM iterations.
-    let fast_config = precompute_config(config, cancel)?;
+    let initial_result = spatial_map(
+        transmission,
+        uncertainty,
+        &fast_config,
+        dead_pixels,
+        cancel,
+        None,
+    )?;
 
     // Transpose data once for per-pixel access.
     let trans_t = transmission
