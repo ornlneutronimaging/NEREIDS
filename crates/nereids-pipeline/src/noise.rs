@@ -15,24 +15,35 @@ use rand_distr::{Distribution, Normal, Poisson};
 /// - counts_i ~ Poisson(T_i × n_photons)
 /// - T_noisy_i = counts_i / n_photons
 ///
-/// For bins where T ≤ 0 (opaque or unphysical), the count is 0.
+/// For bins where T ≤ 0 or T is non-finite (opaque/unphysical), the count is 0.
 ///
 /// Returns `(noisy_transmission, uncertainty)` where
 /// uncertainty_i = √(max(counts_i, 1)) / n_photons.
 /// The `max(counts_i, 1)` floor avoids zero uncertainty for zero-count bins.
+///
+/// # Panics
+///
+/// Panics if `n_photons` is not finite and positive.
 pub fn add_poisson_noise(transmission: &[f64], n_photons: f64, seed: u64) -> (Vec<f64>, Vec<f64>) {
+    assert!(
+        n_photons.is_finite() && n_photons > 0.0,
+        "n_photons must be finite and positive, got {n_photons}",
+    );
+
     let mut rng = StdRng::seed_from_u64(seed);
     let mut noisy = Vec::with_capacity(transmission.len());
     let mut uncertainty = Vec::with_capacity(transmission.len());
 
     for &t in transmission {
         let mean = t * n_photons;
-        let counts = if mean <= 0.0 {
-            0.0
-        } else {
+        // Guard: non-finite or non-positive mean → zero counts.
+        // This handles NaN, Inf, negative transmission gracefully.
+        let counts = if mean.is_finite() && mean > 0.0 {
             Poisson::new(mean)
-                .expect("Poisson mean must be finite and positive")
+                .expect("Poisson mean validated as finite and positive")
                 .sample(&mut rng)
+        } else {
+            0.0
         };
         noisy.push(counts / n_photons);
         uncertainty.push((counts.max(1.0)).sqrt() / n_photons);
@@ -47,9 +58,18 @@ pub fn add_poisson_noise(transmission: &[f64], n_photons: f64, seed: u64) -> (Ve
 ///
 /// Returns `(noisy_transmission, uncertainty)` where all uncertainty
 /// values equal `sigma`.
+///
+/// # Panics
+///
+/// Panics if `sigma` is not finite and positive.
 pub fn add_gaussian_noise(transmission: &[f64], sigma: f64, seed: u64) -> (Vec<f64>, Vec<f64>) {
+    assert!(
+        sigma.is_finite() && sigma > 0.0,
+        "sigma must be finite and positive, got {sigma}",
+    );
+
     let mut rng = StdRng::seed_from_u64(seed);
-    let normal = Normal::new(0.0, sigma).expect("sigma must be finite and positive");
+    let normal = Normal::new(0.0, sigma).expect("sigma validated as finite and positive");
 
     let noisy: Vec<f64> = transmission
         .iter()
@@ -67,6 +87,10 @@ pub fn add_gaussian_noise(transmission: &[f64], sigma: f64, seed: u64) -> (Vec<f
 ///
 /// Returns `(noisy_cube, uncertainty_cube)` with shape
 /// `(n_energies, height, width)`.
+///
+/// # Panics
+///
+/// Panics if `n_photons` is not finite and positive.
 pub fn generate_noisy_cube(
     transmission: &[f64],
     shape: (usize, usize),
@@ -81,8 +105,9 @@ pub fn generate_noisy_cube(
 
     for y in 0..height {
         for x in 0..width {
-            // Deterministic per-pixel seed.
-            let pixel_seed = seed.wrapping_add((y * width + x) as u64);
+            // Deterministic per-pixel seed with u64 arithmetic to avoid
+            // usize overflow on 32-bit targets.
+            let pixel_seed = seed.wrapping_add((y as u64) * (width as u64) + (x as u64));
             let (noisy_spec, unc_spec) = add_poisson_noise(transmission, n_photons, pixel_seed);
 
             for (e, (&n, &u)) in noisy_spec.iter().zip(unc_spec.iter()).enumerate() {
@@ -186,7 +211,8 @@ mod tests {
 
     #[test]
     fn test_seed_reproducibility() {
-        let transmission = vec![0.9, 0.5, 0.1];
+        // Use enough bins that collision probability is negligible.
+        let transmission = vec![0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0.05];
         let n_photons = 500.0;
         let seed = 42;
 
@@ -222,6 +248,85 @@ mod tests {
         for &u in &unc {
             assert!((u - 1.0 / 1000.0).abs() < 1e-15);
         }
+    }
+
+    #[test]
+    fn test_poisson_negative_transmission() {
+        // Negative T → treated as zero (mean ≤ 0 guard).
+        let transmission = vec![-0.5, -0.001, -1.0];
+        let (noisy, _) = add_poisson_noise(&transmission, 1000.0, 77);
+
+        for &v in &noisy {
+            assert_eq!(v, 0.0, "negative transmission must produce zero counts");
+        }
+    }
+
+    #[test]
+    fn test_poisson_nan_inf_transmission() {
+        // Non-finite values in transmission are treated as zero counts.
+        let transmission = vec![f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.5];
+        let (noisy, unc) = add_poisson_noise(&transmission, 1000.0, 55);
+
+        // NaN, Inf, -Inf → zero counts
+        assert_eq!(noisy[0], 0.0, "NaN transmission → zero");
+        assert_eq!(noisy[1], 0.0, "Inf transmission → zero");
+        assert_eq!(noisy[2], 0.0, "-Inf transmission → zero");
+        // Normal bin still gets noise
+        assert!(noisy[3] > 0.0, "normal bin should have positive counts");
+
+        // All uncertainties must be positive and finite
+        for &u in &unc {
+            assert!(u.is_finite() && u > 0.0);
+        }
+    }
+
+    #[test]
+    fn test_empty_inputs() {
+        let (noisy, unc) = add_poisson_noise(&[], 1000.0, 0);
+        assert!(noisy.is_empty());
+        assert!(unc.is_empty());
+
+        let (noisy, unc) = add_gaussian_noise(&[], 0.01, 0);
+        assert!(noisy.is_empty());
+        assert!(unc.is_empty());
+
+        let (cube, unc) = generate_noisy_cube(&[0.5, 0.3], (0, 0), 1000.0, 0);
+        assert_eq!(cube.shape(), &[2, 0, 0]);
+        assert_eq!(unc.shape(), &[2, 0, 0]);
+
+        let (cube, unc) = generate_noisy_cube(&[], (3, 3), 1000.0, 0);
+        assert_eq!(cube.shape(), &[0, 3, 3]);
+        assert_eq!(unc.shape(), &[0, 3, 3]);
+    }
+
+    #[test]
+    #[should_panic(expected = "n_photons must be finite and positive")]
+    fn test_poisson_zero_n_photons() {
+        add_poisson_noise(&[0.5], 0.0, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "n_photons must be finite and positive")]
+    fn test_poisson_negative_n_photons() {
+        add_poisson_noise(&[0.5], -100.0, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "n_photons must be finite and positive")]
+    fn test_poisson_nan_n_photons() {
+        add_poisson_noise(&[0.5], f64::NAN, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "sigma must be finite and positive")]
+    fn test_gaussian_zero_sigma() {
+        add_gaussian_noise(&[0.5], 0.0, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "sigma must be finite and positive")]
+    fn test_gaussian_negative_sigma() {
+        add_gaussian_noise(&[0.5], -0.01, 0);
     }
 
     #[test]
