@@ -15,6 +15,54 @@ use nereids_physics::transmission::{
 use crate::error::PipelineError;
 use crate::pipeline::{FitConfig, SpectrumFitResult, fit_spectrum};
 
+/// Precompute cross-sections once and return a fast `FitConfig` for per-pixel fitting.
+///
+/// When `fit_temperature` is true, precomputes unbroadened (Reich-Moore) base XS.
+/// Otherwise, precomputes fully broadened (Doppler+resolution) XS.
+/// Always disables covariance computation for speed.
+///
+/// This helper is shared by `spatial_map` and `spatial_map_tv`.
+pub(crate) fn precompute_config(
+    config: &FitConfig,
+    cancel: Option<&AtomicBool>,
+) -> Result<FitConfig, PipelineError> {
+    if config.fit_temperature() {
+        let base_xs = match config.precomputed_base_xs().cloned() {
+            Some(cached) => cached,
+            None => {
+                let xs =
+                    unbroadened_cross_sections(config.energies(), config.resonance_data(), cancel)?;
+                Arc::new(xs)
+            }
+        };
+        Ok(config
+            .clone()
+            .with_precomputed_base_xs(base_xs)
+            .with_compute_covariance(false))
+    } else {
+        let xs: Arc<Vec<Vec<f64>>> = match config.precomputed_cross_sections().cloned() {
+            Some(cached) => cached,
+            None => {
+                let instrument_params = config.resolution().map(|r| InstrumentParams {
+                    resolution: r.clone(),
+                });
+                let xs = broadened_cross_sections(
+                    config.energies(),
+                    config.resonance_data(),
+                    config.temperature_k(),
+                    instrument_params.as_ref(),
+                    cancel,
+                )?;
+                Arc::new(xs)
+            }
+        };
+        Ok(config
+            .clone()
+            .with_precomputed_cross_sections(xs)
+            .with_compute_covariance(false))
+    }
+}
+
 /// Result of spatial mapping over a 2D image.
 #[derive(Debug)]
 pub struct SpatialResult {
@@ -167,63 +215,8 @@ pub fn spatial_map(
         .as_standard_layout()
         .into_owned();
 
-    // When temperature is free, cross-sections are recomputed each iteration
-    // inside the forward model, so precomputing here would be wasted work.
-    // Only precompute when temperature is fixed.
-    //
-    // Always disable covariance computation for per-pixel fitting — the
-    // post-convergence Jacobian + matrix inversion is wasted work when we
-    // only need the fitted densities and chi-squared.  This saves one
-    // full Jacobian evaluation per pixel (N_free model evaluations for
-    // finite-difference, or free for analytical) plus the O(n_free³) inversion.
-    let fast_config = if config.fit_temperature() {
-        // Precompute unbroadened (Reich-Moore) cross-sections ONCE for all
-        // pixels.  Without this, each pixel recomputes them inside
-        // TransmissionFitModel::new() and TemperatureContext construction,
-        // dominating total runtime for heavy nuclei (U-238: ~5000 resonances).
-        let base_xs = match config.precomputed_base_xs().cloned() {
-            Some(cached) => cached,
-            None => {
-                let xs =
-                    unbroadened_cross_sections(config.energies(), config.resonance_data(), cancel)?;
-                Arc::new(xs)
-            }
-        };
-        config
-            .clone()
-            .with_precomputed_base_xs(base_xs)
-            .with_compute_covariance(false)
-    } else {
-        // Use caller-supplied precomputed cross-sections when available; only call
-        // broadened_cross_sections when none are provided.  This lets repeated
-        // spatial_map calls with the same isotopes/energy grid share one precompute
-        // result and avoids redundant Doppler+resolution broadening work.
-        let xs: Arc<Vec<Vec<f64>>> = match config.precomputed_cross_sections().cloned() {
-            Some(cached) => cached,
-            None => {
-                let instrument_params = config.resolution().map(|r| InstrumentParams {
-                    resolution: r.clone(),
-                });
-                // Pass the cancel token so precompute can bail between isotopes.
-                let xs = broadened_cross_sections(
-                    config.energies(),
-                    config.resonance_data(),
-                    config.temperature_k(),
-                    instrument_params.as_ref(),
-                    cancel,
-                )?;
-                Arc::new(xs)
-            }
-        };
-
-        // Build a config variant with the precomputed cross-sections injected
-        // and covariance computation disabled for per-pixel speed.
-        // fit_spectrum will use PrecomputedTransmissionModel when this field is Some.
-        config
-            .clone()
-            .with_precomputed_cross_sections(xs)
-            .with_compute_covariance(false)
-    };
+    // Precompute cross-sections once for all pixels and disable covariance.
+    let fast_config = precompute_config(config, cancel)?;
 
     // Fit all pixels in parallel, skipping new work when cancelled
     let results: Vec<((usize, usize), SpectrumFitResult)> = pixel_coords

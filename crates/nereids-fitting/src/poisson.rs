@@ -23,6 +23,7 @@ use nereids_core::constants::{PIVOT_FLOOR, POISSON_EPSILON};
 use crate::error::FittingError;
 use crate::lm::FitModel;
 use crate::parameters::ParameterSet;
+use crate::proximal::ProximalPenalty;
 
 /// Configuration for the Poisson optimizer.
 #[derive(Debug, Clone)]
@@ -183,10 +184,14 @@ fn compute_gradient(
     fd_step: f64,
     all_vals_buf: &mut Vec<f64>,
     free_idx_buf: &mut Vec<usize>,
+    proximal: Option<&ProximalPenalty>,
 ) -> Result<Vec<f64>, FittingError> {
     params.all_values_into(all_vals_buf);
     let base_model = model.evaluate(all_vals_buf)?;
-    let base_nll = poisson_nll(y_obs, &base_model);
+    let mut base_nll = poisson_nll(y_obs, &base_model);
+    if let Some(p) = proximal {
+        base_nll += p.value(all_vals_buf);
+    }
 
     params.free_indices_into(free_idx_buf);
     let mut grad = vec![0.0; free_idx_buf.len()];
@@ -220,7 +225,10 @@ fn compute_gradient(
                 continue;
             }
         };
-        let perturbed_nll = poisson_nll(y_obs, &perturbed_model);
+        let mut perturbed_nll = poisson_nll(y_obs, &perturbed_model);
+        if let Some(p) = proximal {
+            perturbed_nll += p.value(all_vals_buf);
+        }
         params.params[idx].value = original;
 
         grad[j] = (perturbed_nll - base_nll) / actual_step;
@@ -267,8 +275,9 @@ fn project(params: &mut ParameterSet) {
 ///
 /// On `None` return (line search exhausted), `params` is restored to
 /// `old_free` before returning. Callers need not restore manually.
-// All 12 arguments are genuinely needed: 9 original + 3 scratch buffers that
-// avoid per-backtracking-iteration allocations inside the 50-trial loop.
+// All arguments are genuinely needed: 9 original + 3 scratch buffers that
+// avoid per-backtracking-iteration allocations inside the 50-trial loop,
+// plus an optional proximal penalty for ADMM integration.
 #[allow(clippy::too_many_arguments)]
 fn backtracking_line_search(
     model: &dyn FitModel,
@@ -283,6 +292,7 @@ fn backtracking_line_search(
     all_vals_buf: &mut Vec<f64>,
     free_vals_buf: &mut Vec<f64>,
     trial_free_buf: &mut Vec<f64>,
+    proximal: Option<&ProximalPenalty>,
 ) -> Option<f64> {
     let mut alpha = initial_alpha;
     for _ in 0..50 {
@@ -313,7 +323,10 @@ fn backtracking_line_search(
             continue;
         }
 
-        let trial_nll = poisson_nll(y_obs, &trial_model);
+        let mut trial_nll = poisson_nll(y_obs, &trial_model);
+        if let Some(p) = proximal {
+            trial_nll += p.value(all_vals_buf);
+        }
 
         // Armijo condition: f(x_new) <= f(x) - c * descent
         params.free_values_into(free_vals_buf);
@@ -576,6 +589,7 @@ pub fn poisson_fit(
     y_obs: &[f64],
     params: &mut ParameterSet,
     config: &PoissonConfig,
+    proximal: Option<&ProximalPenalty>,
 ) -> Result<PoissonResult, FittingError> {
     if let Some(result) = try_early_return_fixed(model, y_obs, params)? {
         return Ok(result);
@@ -593,6 +607,9 @@ pub fn poisson_fit(
     params.all_values_into(&mut all_vals_buf);
     let y_model = model.evaluate(&all_vals_buf)?;
     let mut nll = poisson_nll(y_obs, &y_model);
+    if let Some(p) = proximal {
+        nll += p.value(&all_vals_buf);
+    }
 
     // Guard: if the initial NLL is non-finite, bail out immediately rather
     // than entering the optimization loop with garbage values.
@@ -619,6 +636,7 @@ pub fn poisson_fit(
             config.fd_step,
             &mut all_vals_buf,
             &mut free_idx_buf,
+            proximal,
         )?;
 
         // Check gradient norm for convergence
@@ -654,6 +672,7 @@ pub fn poisson_fit(
             &mut all_vals_buf,
             &mut free_vals_buf,
             &mut trial_free_buf,
+            proximal,
         ) {
             Some(new_nll) => nll = new_nll,
             None => {
@@ -741,10 +760,10 @@ pub struct TemperatureContext {
 /// * `temp_ctx`        — Optional temperature-fitting context.  When `Some`,
 ///   the optimizer recomputes cross-sections at the current temperature each
 ///   iteration and adds a ∂NLL/∂T gradient column.
-// The 8th parameter (`temp_ctx`) extends an existing 7-param function with
-// optional temperature-fitting context.  Bundling into a config struct would
-// break all call sites for marginal gain; a single `Option` is the minimal
-// extension that keeps the existing API intact.
+// The extra parameters (`temp_ctx`, `proximal`) extend the core 7-param
+// function with optional temperature-fitting and ADMM proximal contexts.
+// Bundling into a config struct would break all call sites for marginal gain;
+// `Option` parameters are the minimal extension that keeps the existing API intact.
 #[allow(clippy::too_many_arguments)]
 pub fn poisson_fit_analytic(
     model: &dyn FitModel,
@@ -755,6 +774,7 @@ pub fn poisson_fit_analytic(
     params: &mut ParameterSet,
     config: &PoissonConfig,
     temp_ctx: Option<&TemperatureContext>,
+    proximal: Option<&ProximalPenalty>,
 ) -> Result<PoissonResult, FittingError> {
     let n_e = y_obs.len();
     validate_analytic_inputs(
@@ -805,6 +825,9 @@ pub fn poisson_fit_analytic(
     params.all_values_into(&mut all_vals_buf);
     let y_model = model.evaluate(&all_vals_buf)?;
     let mut nll = poisson_nll(y_obs, &y_model);
+    if let Some(p) = proximal {
+        nll += p.value(&all_vals_buf);
+    }
 
     // Guard: if the initial NLL is non-finite, bail out immediately rather
     // than entering the optimization loop with garbage values.
@@ -876,7 +899,7 @@ pub fn poisson_fit_analytic(
         let t_now = compute_transmission(n_e, xs_ref, density_indices, &all_vals_buf);
 
         // Analytical gradient (density + optional temperature).
-        let grad = compute_analytic_gradient(&AnalyticGradientCtx {
+        let mut grad = compute_analytic_gradient(&AnalyticGradientCtx {
             y_obs,
             y_model: &y_model_now,
             flux,
@@ -888,6 +911,13 @@ pub fn poisson_fit_analytic(
             all_vals: &all_vals_buf,
             dxs_dt: &dxs_dt,
         });
+
+        // Add proximal penalty gradient contributions.
+        if let Some(p) = proximal {
+            for (j, &fi) in free_indices.iter().enumerate() {
+                grad[j] += p.gradient(fi, all_vals_buf[fi]);
+            }
+        }
 
         // Check gradient norm for convergence
         let grad_norm: f64 = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
@@ -919,7 +949,7 @@ pub fn poisson_fit_analytic(
         old_free_buf.extend_from_slice(&free_vals_buf);
 
         // Compute diagonal Fisher information for preconditioning.
-        let hessian_diag: Vec<f64> = param_isotopes
+        let mut hessian_diag: Vec<f64> = param_isotopes
             .iter()
             .enumerate()
             .map(|(j, iso_indices)| {
@@ -955,6 +985,13 @@ pub fn poisson_fit_analytic(
             })
             .collect();
 
+        // Add proximal Hessian diagonal contribution (rho per term).
+        if let Some(p) = proximal {
+            for (j, &fi) in free_indices.iter().enumerate() {
+                hessian_diag[j] += p.hessian_diag(fi);
+            }
+        }
+
         // search_dir = D * grad where D_ii = 1/H_ii (Newton scaling).
         let search_dir: Vec<f64> = grad
             .iter()
@@ -985,6 +1022,7 @@ pub fn poisson_fit_analytic(
             &mut all_vals_buf,
             &mut free_vals_buf,
             &mut trial_free_buf,
+            proximal,
         ) {
             Some(new_nll) => nll = new_nll,
             None => {
@@ -1243,6 +1281,7 @@ pub fn poisson_fit_lbfgsb(
     params: &mut ParameterSet,
     config: &PoissonConfig,
     temp_ctx: Option<&TemperatureContext>,
+    proximal: Option<&ProximalPenalty>,
 ) -> Result<PoissonResult, FittingError> {
     let n_e = y_obs.len();
     if config.lbfgsb_memory < 1 {
@@ -1298,6 +1337,9 @@ pub fn poisson_fit_lbfgsb(
     params.all_values_into(&mut all_vals_buf);
     let y_model = model.evaluate(&all_vals_buf)?;
     let mut nll = poisson_nll(y_obs, &y_model);
+    if let Some(p) = proximal {
+        nll += p.value(&all_vals_buf);
+    }
 
     // Guard: if the initial NLL is non-finite, bail out immediately rather
     // than entering the optimization loop with garbage values.
@@ -1374,7 +1416,7 @@ pub fn poisson_fit_lbfgsb(
         // ---- Evaluate model and compute transmission + gradient ----
         let y_model_now = model.evaluate(&all_vals_buf)?;
         let t_now = compute_transmission(n_e, xs_ref, density_indices, &all_vals_buf);
-        let grad = compute_analytic_gradient(&AnalyticGradientCtx {
+        let mut grad = compute_analytic_gradient(&AnalyticGradientCtx {
             y_obs,
             y_model: &y_model_now,
             flux,
@@ -1386,6 +1428,13 @@ pub fn poisson_fit_lbfgsb(
             all_vals: &all_vals_buf,
             dxs_dt: &dxs_dt,
         });
+
+        // Add proximal gradient contribution.
+        if let Some(p) = proximal {
+            for (j, &fi) in free_indices.iter().enumerate() {
+                grad[j] += p.gradient(fi, all_vals_buf[fi]);
+            }
+        }
 
         // Snapshot current free-parameter values into the reusable buffer
         // (used by both the L-BFGS memory update and the line search).
@@ -1491,6 +1540,7 @@ pub fn poisson_fit_lbfgsb(
             &mut all_vals_buf,
             &mut free_vals_buf,
             &mut trial_free_buf,
+            proximal,
         ) {
             Some(new_nll) => nll = new_nll,
             None => {
@@ -1583,7 +1633,8 @@ mod tests {
             FitParameter::non_negative("b", 1.0), // Initial guess 2× off
         ]);
 
-        let result = poisson_fit(&model, &y_obs, &mut params, &PoissonConfig::default()).unwrap();
+        let result =
+            poisson_fit(&model, &y_obs, &mut params, &PoissonConfig::default(), None).unwrap();
 
         assert!(
             result.converged,
@@ -1615,7 +1666,8 @@ mod tests {
 
         let mut params = ParameterSet::new(vec![FitParameter::non_negative("b", 0.1)]);
 
-        let result = poisson_fit(&model, &y_obs, &mut params, &PoissonConfig::default()).unwrap();
+        let result =
+            poisson_fit(&model, &y_obs, &mut params, &PoissonConfig::default(), None).unwrap();
 
         assert!(result.converged);
         assert!(
@@ -1642,7 +1694,8 @@ mod tests {
 
         let mut params = ParameterSet::new(vec![FitParameter::non_negative("b", 1.0)]);
 
-        let result = poisson_fit(&model, &y_obs, &mut params, &PoissonConfig::default()).unwrap();
+        let result =
+            poisson_fit(&model, &y_obs, &mut params, &PoissonConfig::default(), None).unwrap();
 
         assert!(
             result.params[0] >= 0.0,
@@ -1700,8 +1753,14 @@ mod tests {
 
         // FD path
         let mut params_fd = ParameterSet::new(vec![FitParameter::non_negative("b", 1.0)]);
-        let res_fd =
-            poisson_fit(&model, &y_obs, &mut params_fd, &PoissonConfig::default()).unwrap();
+        let res_fd = poisson_fit(
+            &model,
+            &y_obs,
+            &mut params_fd,
+            &PoissonConfig::default(),
+            None,
+        )
+        .unwrap();
 
         // Analytic path
         let mut params_an = ParameterSet::new(vec![FitParameter::non_negative("b", 1.0)]);
@@ -1713,6 +1772,7 @@ mod tests {
             &[0],
             &mut params_an,
             &PoissonConfig::default(),
+            None,
             None,
         )
         .unwrap();
@@ -1784,6 +1844,7 @@ mod tests {
             &mut params,
             &PoissonConfig::default(),
             None,
+            None,
         )
         .unwrap();
 
@@ -1827,6 +1888,7 @@ mod tests {
             &[0],
             &mut params,
             &PoissonConfig::default(),
+            None,
             None,
         )
         .unwrap();
@@ -1895,6 +1957,7 @@ mod tests {
             &[0],
             &mut params,
             &config,
+            None,
             None,
         )
         .unwrap();
@@ -2063,6 +2126,7 @@ mod tests {
             &mut params,
             &config,
             Some(&temp_ctx),
+            None,
         )
         .unwrap();
 
@@ -2140,8 +2204,14 @@ mod tests {
         let y_obs = vec![10.0; 5];
         let mut params = ParameterSet::new(vec![FitParameter::fixed("a", 1.0)]);
 
-        let result =
-            poisson_fit(&NanModel, &y_obs, &mut params, &PoissonConfig::default()).unwrap();
+        let result = poisson_fit(
+            &NanModel,
+            &y_obs,
+            &mut params,
+            &PoissonConfig::default(),
+            None,
+        )
+        .unwrap();
 
         assert!(
             !result.converged,
@@ -2179,6 +2249,7 @@ mod tests {
             &mut params,
             &PoissonConfig::default(),
             None,
+            None,
         )
         .unwrap();
 
@@ -2203,7 +2274,8 @@ mod tests {
 
         let mut params = ParameterSet::new(vec![FitParameter::fixed("b", 0.5)]);
 
-        let result = poisson_fit(&model, &y_obs, &mut params, &PoissonConfig::default()).unwrap();
+        let result =
+            poisson_fit(&model, &y_obs, &mut params, &PoissonConfig::default(), None).unwrap();
 
         assert!(
             result.converged,
@@ -2242,6 +2314,7 @@ mod tests {
             &mut params,
             &PoissonConfig::default(),
             None,
+            None,
         )
         .unwrap();
 
@@ -2279,6 +2352,7 @@ mod tests {
             &mut params_an,
             &PoissonConfig::default(),
             None,
+            None,
         )
         .unwrap();
 
@@ -2292,6 +2366,7 @@ mod tests {
             &[0],
             &mut params_lb,
             &PoissonConfig::default(),
+            None,
             None,
         )
         .unwrap();
@@ -2358,6 +2433,7 @@ mod tests {
             &[0, 1],
             &mut params,
             &PoissonConfig::default(),
+            None,
             None,
         )
         .unwrap();
@@ -2518,6 +2594,7 @@ mod tests {
             &mut params,
             &config,
             Some(&temp_ctx),
+            None,
         )
         .unwrap();
 
@@ -2572,6 +2649,7 @@ mod tests {
             &mut params,
             &PoissonConfig::default(),
             None,
+            None,
         )
         .unwrap();
 
@@ -2613,6 +2691,7 @@ mod tests {
             &[0],
             &mut params,
             &PoissonConfig::default(),
+            None,
             None,
         )
         .unwrap();
@@ -2656,6 +2735,7 @@ mod tests {
             &[0],
             &mut params,
             &config,
+            None,
             None,
         )
         .unwrap();

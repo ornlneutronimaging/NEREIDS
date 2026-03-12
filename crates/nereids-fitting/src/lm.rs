@@ -162,6 +162,24 @@ pub trait FitModel {
     }
 }
 
+/// Blanket impl so `&dyn FitModel` (and any `&ConcreteModel`) also
+/// implements `FitModel`.  Enables `ProximalModel::new(model_ref, penalty)`
+/// when `model_ref: &dyn FitModel`.
+impl<T: FitModel + ?Sized> FitModel for &T {
+    fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+        (**self).evaluate(params)
+    }
+
+    fn analytical_jacobian(
+        &self,
+        params: &[f64],
+        free_param_indices: &[usize],
+        y_current: &[f64],
+    ) -> Option<FlatMatrix> {
+        (**self).analytical_jacobian(params, free_param_indices, y_current)
+    }
+}
+
 /// Compute weighted chi-squared: Σ [(y_obs - y_model)² / σ²].
 fn chi_squared(residuals: &[f64], weights: &[f64]) -> f64 {
     residuals

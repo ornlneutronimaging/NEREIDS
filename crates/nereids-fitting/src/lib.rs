@@ -18,4 +18,5 @@ pub mod error;
 pub mod lm;
 pub mod parameters;
 pub mod poisson;
+pub mod proximal;
 pub mod transmission_model;

@@ -12,6 +12,7 @@ use nereids_endf::resonance::ResonanceData;
 use nereids_fitting::lm::{self, FitModel, LmConfig, LmResult};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
 use nereids_fitting::poisson::{self, PoissonConfig, TemperatureContext};
+use nereids_fitting::proximal::ProximalPenalty;
 use nereids_fitting::transmission_model::{PrecomputedTransmissionModel, TransmissionFitModel};
 use nereids_physics::resolution::ResolutionFunction;
 use nereids_physics::transmission::InstrumentParams;
@@ -204,6 +205,9 @@ pub struct FitConfig {
     /// Per-parameter constraints (fixed/free). When `None`, all parameters
     /// are free (current default behavior).
     constraints: Option<ParameterConstraints>,
+    /// Optional proximal penalty for ADMM integration.
+    /// Added by the TV-ADMM outer loop to couple per-pixel fits.
+    proximal_penalty: Option<ProximalPenalty>,
 }
 
 impl FitConfig {
@@ -267,6 +271,7 @@ impl FitConfig {
             compute_covariance: true,
             solver: SolverChoice::default(),
             constraints: None,
+            proximal_penalty: None,
         })
     }
 
@@ -425,6 +430,24 @@ impl FitConfig {
     pub fn constraints(&self) -> Option<&ParameterConstraints> {
         self.constraints.as_ref()
     }
+
+    /// Set proximal penalty for ADMM integration (builder pattern).
+    #[must_use]
+    pub fn with_proximal_penalty(mut self, penalty: ProximalPenalty) -> Self {
+        self.proximal_penalty = Some(penalty);
+        self
+    }
+
+    /// Returns the proximal penalty, if any.
+    #[must_use]
+    pub fn proximal_penalty(&self) -> Option<&ProximalPenalty> {
+        self.proximal_penalty.as_ref()
+    }
+
+    /// Override initial densities (warm-start for ADMM iterations).
+    pub fn set_initial_densities(&mut self, densities: Vec<f64>) {
+        self.initial_densities = densities;
+    }
 }
 
 /// Result of fitting a single spectrum.
@@ -460,13 +483,29 @@ fn dispatch_solver(
     params: &mut ParameterSet,
     solver: &SolverChoice,
     lm_config: &LmConfig,
+    proximal: Option<&ProximalPenalty>,
 ) -> Result<LmResult, PipelineError> {
     match solver {
-        SolverChoice::LevenbergMarquardt => Ok(lm::levenberg_marquardt(
-            model, measured_t, sigma, params, lm_config,
-        )?),
+        SolverChoice::LevenbergMarquardt => {
+            if let Some(penalty) = proximal {
+                use nereids_fitting::proximal::{ProximalModel, extend_data_for_proximal};
+                let prox_model = ProximalModel::new(model, penalty);
+                let (y_ext, s_ext) = extend_data_for_proximal(measured_t, sigma, penalty);
+                Ok(lm::levenberg_marquardt(
+                    &prox_model,
+                    &y_ext,
+                    &s_ext,
+                    params,
+                    lm_config,
+                )?)
+            } else {
+                Ok(lm::levenberg_marquardt(
+                    model, measured_t, sigma, params, lm_config,
+                )?)
+            }
+        }
         SolverChoice::PoissonKL(poisson_config) => {
-            let pr = poisson::poisson_fit(model, measured_t, params, poisson_config)?;
+            let pr = poisson::poisson_fit(model, measured_t, params, poisson_config, proximal)?;
             let n_free = params.n_free();
             let dof = measured_t.len().saturating_sub(n_free).max(1);
             // Compute Pearson chi-squared for display consistency with LM solver.
@@ -616,6 +655,7 @@ pub fn fit_spectrum(
                 &mut params,
                 config.solver(),
                 &lm_config,
+                config.proximal_penalty(),
             )?
         } else {
             let instrument = config
@@ -638,6 +678,7 @@ pub fn fit_spectrum(
                 &mut params,
                 config.solver(),
                 &lm_config,
+                config.proximal_penalty(),
             )?
         }
     } else {
@@ -669,6 +710,7 @@ pub fn fit_spectrum(
                 &mut params,
                 config.solver(),
                 &lm_config,
+                config.proximal_penalty(),
             )?,
             SolverChoice::PoissonKL(poisson_config) => {
                 // The basic poisson_fit uses finite-difference gradient descent,
@@ -725,6 +767,7 @@ pub fn fit_spectrum(
                     &mut params,
                     poisson_config,
                     Some(&temp_ctx),
+                    config.proximal_penalty(),
                 )?;
 
                 let n_free = params.n_free();
