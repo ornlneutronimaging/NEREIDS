@@ -404,11 +404,21 @@ pub fn spatial_map_tv(
 
     // ---- Final pass: evaluate ancillary maps at ADMM densities ----
     // For each pixel, run fit_spectrum with ADMM density as warm-start
-    // to get chi², uncertainty, and convergence at the regularized solution.
-    // No proximal penalty — we want pure data-fidelity evaluation.
+    // and max_iter=0 so the solver evaluates (but doesn't re-optimize).
+    // This gives chi²/uncertainty/convergence AT the regularized solution,
+    // not at the unconstrained per-pixel optimum.
     let trans_t_ref = &trans_t;
     let unc_t_ref = &unc_t;
     let densities_ref = &densities;
+
+    // Build eval-only config: max_iter=0 prevents LM from moving away
+    // from ADMM densities, compute_covariance=true for uncertainty maps.
+    let mut eval_lm_config = fast_config.lm_config().clone();
+    eval_lm_config.max_iter = 0;
+    let eval_config = fast_config
+        .clone()
+        .with_compute_covariance(true)
+        .with_lm_config(eval_lm_config);
 
     let final_results: Vec<(usize, crate::pipeline::SpectrumFitResult)> = live_pixels
         .par_iter()
@@ -419,7 +429,7 @@ pub fn spatial_map_tv(
             let y = p / width;
             let x = p % width;
 
-            let mut pixel_config = fast_config.clone();
+            let mut pixel_config = eval_config.clone();
             pixel_config.set_initial_densities(densities_ref[p].clone());
 
             let t_spectrum: Vec<f64> = trans_t_ref.slice(s![y, x, ..]).to_vec();

@@ -353,6 +353,13 @@ impl FitConfig {
         &self.lm_config
     }
 
+    /// Set the LM optimizer configuration (builder pattern).
+    #[must_use]
+    pub fn with_lm_config(mut self, lm_config: LmConfig) -> Self {
+        self.lm_config = lm_config;
+        self
+    }
+
     /// Returns the precomputed cross-sections, if any.
     #[must_use]
     pub fn precomputed_cross_sections(&self) -> Option<&Arc<Vec<Vec<f64>>>> {
