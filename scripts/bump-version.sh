@@ -85,9 +85,10 @@ apply_sed() {
     echo "  updated: $file"
 }
 
-# 1. Cargo.toml — workspace.package version (first occurrence)
+# 1. Cargo.toml — workspace.package version
+#    This is the only bare `version = "X.Y.Z"` line (deps have `, path =` after)
 apply_sed "$REPO_ROOT/Cargo.toml" \
-    "0,/^version = \"$CURRENT_VERSION\"/{s/^version = \"$CURRENT_VERSION\"/version = \"$NEW_VERSION\"/}"
+    "s/^version = \"$CURRENT_VERSION\"$/version = \"$NEW_VERSION\"/"
 
 # 2. Cargo.toml — workspace.dependencies internal crate versions
 #    These lines look like: endf-mat = { version = "0.1.0", path = "..." }
