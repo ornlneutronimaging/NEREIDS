@@ -594,7 +594,7 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
     let Some((x_values, x_label)) = design::build_spectrum_x_axis(&design::SpectrumXAxisParams {
         axis: state.analyze_spectrum_axis,
         energies: state.energies.as_deref(),
-        spectrum_values: state.spectrum_values.as_deref(),
+        spectrum_values: state.spectrum_values.as_ref().map(|v| v.as_slice()),
         spectrum_unit: state.spectrum_unit,
         spectrum_kind: state.spectrum_kind,
         flight_path_m: state.beamline.flight_path_m,

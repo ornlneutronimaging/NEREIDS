@@ -570,14 +570,14 @@ pub struct AppState {
     pub input_mode: InputMode,
     pub sample_path: Option<PathBuf>,
     pub open_beam_path: Option<PathBuf>,
-    pub sample_data: Option<Array3<f64>>,
-    pub open_beam_data: Option<Array3<f64>>,
+    pub sample_data: Option<Arc<Array3<f64>>>,
+    pub open_beam_data: Option<Arc<Array3<f64>>>,
     pub normalized: Option<Arc<NormalizedData>>,
     pub dead_pixels: Option<Array2<bool>>,
 
     // -- Spectrum file --
     pub spectrum_path: Option<PathBuf>,
-    pub spectrum_values: Option<Vec<f64>>,
+    pub spectrum_values: Option<Arc<Vec<f64>>>,
     pub spectrum_unit: SpectrumUnit,
     pub spectrum_kind: SpectrumValueKind,
 

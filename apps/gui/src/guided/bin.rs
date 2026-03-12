@@ -4,6 +4,8 @@
 //! Normalize). The user sets bin parameters and triggers histogramming
 //! of the raw HDF5 event data loaded in the previous step.
 
+use std::sync::Arc;
+
 use crate::state::{AppState, ProvenanceEventKind};
 use crate::theme::ThemeColors;
 use crate::widgets::design;
@@ -117,7 +119,7 @@ fn histogram_events(state: &mut AppState) {
                 shape[0], shape[1], shape[2]
             );
 
-            state.spectrum_values = Some(data.tof_edges_us.clone());
+            state.spectrum_values = Some(Arc::new(data.tof_edges_us.clone()));
             state.spectrum_unit = nereids_io::spectrum::SpectrumUnit::TofMicroseconds;
             state.spectrum_kind = nereids_io::spectrum::SpectrumValueKind::BinEdges;
 
@@ -146,7 +148,7 @@ fn histogram_events(state: &mut AppState) {
                     shape[0], shape[1], shape[2]
                 ),
             );
-            state.sample_data = Some(data.counts);
+            state.sample_data = Some(Arc::new(data.counts));
         }
         Err(e) => {
             state.status_message = format!("Event histogramming failed: {e}");

@@ -303,7 +303,7 @@ fn preview_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
     let Some((x_values, x_label)) = design::build_spectrum_x_axis(&design::SpectrumXAxisParams {
         axis: state.normalize_spectrum_axis,
         energies: state.energies.as_deref(),
-        spectrum_values: state.spectrum_values.as_deref(),
+        spectrum_values: state.spectrum_values.as_ref().map(|v| v.as_slice()),
         spectrum_unit: state.spectrum_unit,
         spectrum_kind: state.spectrum_kind,
         flight_path_m: state.beamline.flight_path_m,
@@ -466,7 +466,7 @@ pub(crate) fn prepare_transmission(state: &mut AppState) {
     state.spatial_result = None;
 
     let sample = match state.sample_data {
-        Some(ref d) => d.clone(),
+        Some(ref d) => (**d).clone(),
         None => return,
     };
 
@@ -550,7 +550,7 @@ fn compute_energies(state: &AppState, n_tof: usize) -> Result<Vec<f64>, String> 
                 if values.iter().any(|&v| v <= 0.0) {
                     return Err("Energy bin centers must be positive".into());
                 }
-                values.clone()
+                values.to_vec()
             }
         };
 
