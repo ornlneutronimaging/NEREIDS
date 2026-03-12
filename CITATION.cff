@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+title: "NEREIDS: Neutron Resonance Resolved Imaging Data Analysis System"
+message: "If you use this software, please cite it as below."
+type: software
+license: BSD-3-Clause
+version: 0.1.5
+doi: 10.5281/zenodo.18973054
+url: https://ornlneutronimaging.github.io/NEREIDS/
+repository-code: https://github.com/ornlneutronimaging/NEREIDS
+authors:
+  - given-names: Chen
+    family-names: Zhang
+    orcid: https://orcid.org/0000-0001-8374-4467
+    affiliation: Oak Ridge National Laboratory
+  - given-names: Jean-Christophe
+    family-names: Bilheux
+    orcid: https://orcid.org/0000-0003-2172-6487
+    affiliation: Oak Ridge National Laboratory
+  - given-names: Shiming
+    family-names: Tang
+    orcid: https://orcid.org/0000-0002-9220-3707
+    affiliation: Oak Ridge National Laboratory
+  - given-names: Hassina
+    family-names: Bilheux
+    orcid: https://orcid.org/0000-0001-8574-2449
+    affiliation: Oak Ridge National Laboratory
