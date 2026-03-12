@@ -1312,7 +1312,7 @@ dependencies = [
 
 [[package]]
 name = "endf-mat"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "endi"
@@ -2800,7 +2800,7 @@ dependencies = [
 
 [[package]]
 name = "nereids-core"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "endf-mat",
  "serde",
@@ -2810,7 +2810,7 @@ dependencies = [
 
 [[package]]
 name = "nereids-endf"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "dirs",
  "endf-mat",
@@ -2823,7 +2823,7 @@ dependencies = [
 
 [[package]]
 name = "nereids-fitting"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "nereids-core",
  "nereids-endf",
@@ -2832,7 +2832,7 @@ dependencies = [
 
 [[package]]
 name = "nereids-gui"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "eframe",
  "egui",
@@ -2854,7 +2854,7 @@ dependencies = [
 
 [[package]]
 name = "nereids-io"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "hdf5-metno",
  "ndarray",
@@ -2868,7 +2868,7 @@ dependencies = [
 
 [[package]]
 name = "nereids-physics"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "nereids-core",
  "nereids-endf",
@@ -2878,7 +2878,7 @@ dependencies = [
 
 [[package]]
 name = "nereids-pipeline"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ndarray",
  "nereids-core",
@@ -2891,7 +2891,7 @@ dependencies = [
 
 [[package]]
 name = "nereids-python"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ndarray",
  "nereids-core",
