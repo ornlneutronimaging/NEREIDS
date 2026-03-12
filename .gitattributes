@@ -7,3 +7,4 @@
 tests/data/samtry/**/*.dat linguist-generated
 tests/data/samtry/**/*.par linguist-generated
 tests/data/samtry/**/*.inp linguist-generated
+tests/data/samtry/**/*.plt linguist-generated
