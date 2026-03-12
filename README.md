@@ -2,6 +2,7 @@
 
 **N**eutron r**E**sonance **RE**solved **I**maging **D**ata analysis **S**ystem
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.18973054.svg)](https://doi.org/10.5281/zenodo.18973054)
 [![Docs](https://img.shields.io/badge/docs-guide-blue)](https://ornlneutronimaging.github.io/NEREIDS/)
 [![API](https://img.shields.io/badge/docs-rustdoc-orange)](https://ornlneutronimaging.github.io/NEREIDS/api/nereids_pipeline/)
 
