@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use nereids_fitting::proximal::ProximalPenalty;
 
 use crate::error::PipelineError;
-use crate::pipeline::{FitConfig, ParameterRole, fit_spectrum};
+use crate::pipeline::{FitConfig, ParameterRole, SolverChoice, fit_spectrum};
 use crate::spatial::{SpatialResult, precompute_config, spatial_map};
 
 /// Configuration for TV-ADMM spatial regularization.
@@ -262,6 +262,7 @@ pub fn spatial_map_tv(
     }
 
     // ---- ADMM outer loop ----
+    let mut admm_converged = false;
     for _outer in 0..tv_config.max_outer_iter {
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
             return Err(PipelineError::Cancelled);
@@ -398,6 +399,7 @@ pub fn spatial_map_tv(
         let dual_norm = dual_sq.sqrt();
 
         if primal_norm < tv_config.tol_primal && dual_norm < tv_config.tol_dual {
+            admm_converged = true;
             break;
         }
     }
@@ -411,14 +413,23 @@ pub fn spatial_map_tv(
     let unc_t_ref = &unc_t;
     let densities_ref = &densities;
 
-    // Build eval-only config: max_iter=0 prevents LM from moving away
-    // from ADMM densities, compute_covariance=true for uncertainty maps.
+    // Build eval-only config: max_iter=0 prevents both LM and Poisson
+    // from moving away from ADMM densities. compute_covariance=true for
+    // uncertainty maps (LM path only; Poisson always returns None).
     let mut eval_lm_config = fast_config.lm_config().clone();
     eval_lm_config.max_iter = 0;
     let eval_config = fast_config
         .clone()
         .with_compute_covariance(true)
         .with_lm_config(eval_lm_config);
+    // Also zero out Poisson max_iter when the solver is PoissonKL.
+    let eval_config = if let SolverChoice::PoissonKL(ref pc) = *eval_config.solver() {
+        let mut eval_pc = pc.clone();
+        eval_pc.max_iter = 0;
+        eval_config.with_solver(SolverChoice::PoissonKL(eval_pc))
+    } else {
+        eval_config
+    };
 
     let final_results: Vec<(usize, crate::pipeline::SpectrumFitResult)> = live_pixels
         .par_iter()
@@ -454,14 +465,23 @@ pub fn spatial_map_tv(
         .map(|_| Array2::from_elem((height, width), f64::NAN))
         .collect();
     let mut chi_squared_map = Array2::from_elem((height, width), f64::NAN);
+    // Convergence reflects ADMM status: all live pixels marked converged
+    // if the ADMM primal+dual residuals dropped below tolerance.
     let mut converged_map = Array2::from_elem((height, width), false);
+    if admm_converged {
+        for &p in &live_pixels {
+            let y = p / width;
+            let x = p % width;
+            converged_map[[y, x]] = true;
+        }
+    }
     let mut temperature_map: Option<Array2<f64>> = if config.fit_temperature() {
         Some(Array2::from_elem((height, width), f64::NAN))
     } else {
         None
     };
     let isotope_labels = config.isotope_names().to_vec();
-    let mut n_converged = 0usize;
+    let n_converged = if admm_converged { live_pixels.len() } else { 0 };
 
     // Fill ADMM densities for all live pixels.
     for &p in &live_pixels {
@@ -482,10 +502,6 @@ pub fn spatial_map_tv(
             }
         }
         chi_squared_map[[y, x]] = result.reduced_chi_squared;
-        converged_map[[y, x]] = result.converged;
-        if result.converged {
-            n_converged += 1;
-        }
         if let (Some(t_map), Some(temp)) = (&mut temperature_map, result.temperature_k) {
             t_map[[y, x]] = temp;
         }
