@@ -161,14 +161,14 @@ pub fn spatial_map_tv(
             n_isotopes,
         )));
     }
-    if tv_config.rho <= 0.0 {
+    if !tv_config.rho.is_finite() || tv_config.rho <= 0.0 {
         return Err(PipelineError::InvalidParameter(format!(
             "tv_config.rho must be > 0, got {}",
             tv_config.rho,
         )));
     }
     for (k, &lam) in tv_config.lambda.iter().enumerate() {
-        if lam < 0.0 {
+        if !lam.is_finite() || lam < 0.0 {
             return Err(PipelineError::InvalidParameter(format!(
                 "tv_config.lambda[{k}] must be >= 0, got {lam}",
             )));
@@ -188,6 +188,16 @@ pub fn spatial_map_tv(
             config.energies().len(),
         )));
     }
+    if let Some(dp) = dead_pixels
+        && dp.shape() != [height, width]
+    {
+        return Err(PipelineError::ShapeMismatch(format!(
+            "dead_pixels shape {:?} != spatial dimensions ({}, {})",
+            dp.shape(),
+            height,
+            width,
+        )));
+    }
 
     // ---- Build edge graph ----
     let edges = build_edge_list(height, width, dead_pixels);
@@ -204,14 +214,8 @@ pub fn spatial_map_tv(
         .collect();
 
     // ---- Iteration 0: vanilla spatial_map ----
-    let initial_result = spatial_map(
-        transmission,
-        uncertainty,
-        config,
-        dead_pixels,
-        cancel,
-        progress,
-    )?;
+    // Pass None for progress: only ADMM iterations count toward progress.
+    let initial_result = spatial_map(transmission, uncertainty, config, dead_pixels, cancel, None)?;
 
     // Precompute cross-sections once for all ADMM iterations.
     let fast_config = precompute_config(config, cancel)?;
@@ -251,8 +255,11 @@ pub fn spatial_map_tv(
         })
         .collect();
 
-    // Track the full SpatialResult; updated each iteration.
-    let best_result = initial_result;
+    // Short-circuit when all pixels are dead — the initial spatial_map already
+    // returned an empty result, so just pass it through.
+    if live_pixels.is_empty() {
+        return Ok(initial_result);
+    }
 
     // ---- ADMM outer loop ----
     for _outer in 0..tv_config.max_outer_iter {
@@ -395,7 +402,30 @@ pub fn spatial_map_tv(
         }
     }
 
-    // ---- Assemble final result ----
+    // ---- Final pass: re-evaluate ancillary maps at ADMM densities ----
+    // Run spatial_map with ADMM densities as warm-start to get correct
+    // chi², uncertainty, convergence, and temperature maps.  Since the
+    // warm-start is near the per-pixel optimum, each pixel converges in
+    // ~1 LM iteration.
+    let mean_densities: Vec<f64> = (0..n_isotopes)
+        .map(|k| {
+            let sum: f64 = live_pixels.iter().map(|&p| densities[p][k]).sum();
+            sum / live_pixels.len().max(1) as f64
+        })
+        .collect();
+    let mut final_config = fast_config.clone();
+    final_config.set_initial_densities(mean_densities);
+
+    let mut final_result = spatial_map(
+        transmission,
+        uncertainty,
+        &final_config,
+        dead_pixels,
+        cancel,
+        None,
+    )?;
+
+    // Replace density_maps with the exact ADMM-regularized values.
     let mut density_maps: Vec<Array2<f64>> = (0..n_isotopes)
         .map(|_| Array2::zeros((height, width)))
         .collect();
@@ -407,22 +437,10 @@ pub fn spatial_map_tv(
             density_maps[k][[y, x]] = densities[p][k];
         }
     }
+    final_result.density_maps = density_maps;
+    final_result.isotope_labels = isotope_labels;
 
-    // Reuse chi-squared and convergence from the initial spatial_map.
-    // The TV-regularized densities are better, but we don't re-evaluate
-    // chi² here — that would require another full model evaluation pass.
-    let n_converged = best_result.n_converged;
-
-    Ok(SpatialResult {
-        density_maps,
-        uncertainty_maps: best_result.uncertainty_maps,
-        chi_squared_map: best_result.chi_squared_map,
-        converged_map: best_result.converged_map,
-        temperature_map: best_result.temperature_map,
-        isotope_labels,
-        n_converged,
-        n_total: best_result.n_total,
-    })
+    Ok(final_result)
 }
 
 #[cfg(test)]

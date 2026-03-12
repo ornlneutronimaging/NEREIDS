@@ -445,7 +445,17 @@ impl FitConfig {
     }
 
     /// Override initial densities (warm-start for ADMM iterations).
+    ///
+    /// # Panics
+    /// Panics if `densities.len()` does not match `resonance_data.len()`.
     pub fn set_initial_densities(&mut self, densities: Vec<f64>) {
+        assert_eq!(
+            densities.len(),
+            self.resonance_data.len(),
+            "set_initial_densities: length {} != n_isotopes {}",
+            densities.len(),
+            self.resonance_data.len(),
+        );
         self.initial_densities = densities;
     }
 }
