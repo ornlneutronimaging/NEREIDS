@@ -298,6 +298,13 @@ pub fn spatial_map_tv(
         return Ok(initial_result);
     }
 
+    // Track per-pixel convergence from the ADMM inner loop.
+    // Updated each outer iteration; the last iteration's values are used for
+    // the convergence map.  The final evaluation pass uses max_iter=0 (no
+    // solver iteration), which always reports converged=false — so we must
+    // track convergence from the inner loop where actual fitting happens.
+    let mut pixel_converged = vec![false; n_pixels];
+
     // ---- ADMM outer loop ----
     for _outer in 0..tv_config.max_outer_iter {
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
@@ -313,7 +320,7 @@ pub fn spatial_map_tv(
         // The proximal penalty is:
         //   (rho * deg(p) / 2) * (n_k - target_k(p))²
 
-        let pixel_results: Vec<(usize, Vec<f64>)> = live_pixels
+        let pixel_results: Vec<(usize, Vec<f64>, bool)> = live_pixels
             .par_iter()
             .filter_map(|&p| {
                 if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
@@ -326,7 +333,7 @@ pub fn spatial_map_tv(
                 let degree = neighbors.len();
                 if degree == 0 {
                     // Isolated pixel (all neighbors dead): no regularization.
-                    return Some((p, densities[p].clone()));
+                    return Some((p, densities[p].clone(), true));
                 }
 
                 // Build proximal penalty for this pixel.
@@ -374,22 +381,23 @@ pub fn spatial_map_tv(
                         if let Some(prog) = progress {
                             prog.fetch_add(1, Ordering::Relaxed);
                         }
-                        Some((p, result.densities))
+                        Some((p, result.densities, result.converged))
                     }
                     Err(_) => {
                         if let Some(prog) = progress {
                             prog.fetch_add(1, Ordering::Relaxed);
                         }
                         // Keep previous densities on failure.
-                        Some((p, densities[p].clone()))
+                        Some((p, densities[p].clone(), false))
                     }
                 }
             })
             .collect();
 
-        // Update densities from pixel results.
-        for (p, new_densities) in &pixel_results {
+        // Update densities and convergence from pixel results.
+        for (p, new_densities, converged) in &pixel_results {
             densities[*p] = new_densities.clone();
+            pixel_converged[*p] = *converged;
         }
 
         // ---- z-update: soft-thresholding per edge per isotope ----
@@ -520,8 +528,20 @@ pub fn spatial_map_tv(
         }
     }
 
-    // Fill ancillary maps from final evaluation results.
+    // Fill convergence from the last ADMM inner iteration (not the final
+    // evaluation pass, which uses max_iter=0 and always reports false).
     let mut n_converged = 0usize;
+    for &p in &live_pixels {
+        let y = p / width;
+        let x = p % width;
+        converged_map[[y, x]] = pixel_converged[p];
+        if pixel_converged[p] {
+            n_converged += 1;
+        }
+    }
+
+    // Fill ancillary maps (chi², uncertainties, temperature) from final
+    // evaluation results.
     for (p, result) in &final_results {
         let y = p / width;
         let x = p % width;
@@ -531,10 +551,6 @@ pub fn spatial_map_tv(
             }
         }
         chi_squared_map[[y, x]] = result.reduced_chi_squared;
-        converged_map[[y, x]] = result.converged;
-        if result.converged {
-            n_converged += 1;
-        }
         if let (Some(t_map), Some(temp)) = (&mut temperature_map, result.temperature_k) {
             t_map[[y, x]] = temp;
         }
