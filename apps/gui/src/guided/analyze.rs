@@ -5,7 +5,10 @@
 //! this redesign shows both side-by-side so the user can click a pixel on the
 //! map and immediately see its spectrum.
 
-use crate::state::{AppState, GuidedStep, InputMode, IsotopeEntry, SolverMethod, SpectrumAxis};
+use crate::state::{
+    AppState, FittingType, GuidedStep, InputMode, IsotopeEntry, RegularizationMethod, SolverMethod,
+    SpectrumAxis,
+};
 use crate::widgets::design::{self, NavAction};
 use crate::widgets::image_view::{
     RoiEditorResult, show_image_with_roi_editor, show_viridis_image, show_viridis_image_with_roi,
@@ -192,6 +195,56 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
                 });
             }
         });
+    }
+
+    // Regularization (Spatial only)
+    if state.fitting_type == Some(FittingType::Spatial) {
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("Regularization").strong());
+
+        ui.horizontal(|ui| {
+            ui.label("Method:");
+            egui::ComboBox::from_id_salt("reg_method")
+                .selected_text(match state.regularization_method {
+                    RegularizationMethod::None => "None",
+                    RegularizationMethod::TotalVariation => "Total Variation",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut state.regularization_method,
+                        RegularizationMethod::None,
+                        "None",
+                    );
+                    ui.selectable_value(
+                        &mut state.regularization_method,
+                        RegularizationMethod::TotalVariation,
+                        "Total Variation",
+                    );
+                });
+        });
+
+        if state.regularization_method == RegularizationMethod::TotalVariation {
+            ui.horizontal(|ui| {
+                ui.label("Lambda:");
+                ui.add(
+                    egui::DragValue::new(&mut state.tv_lambda)
+                        .speed(0.01)
+                        .range(0.0..=1e4),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("Rho:");
+                ui.add(
+                    egui::DragValue::new(&mut state.tv_rho)
+                        .speed(0.01)
+                        .range(0.001..=1e4),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("ADMM iter:");
+                ui.add(egui::DragValue::new(&mut state.tv_max_outer_iter).range(1..=500));
+            });
+        }
     }
 
     ui.add_space(8.0);
@@ -783,6 +836,29 @@ fn build_fit_config(state: &AppState) -> Result<FitConfig, String> {
             .map_err(|e| format!("FitConfig temperature error: {e}"))?;
     }
 
+    // Apply per-isotope constraints if any are fixed
+    let has_fixed = enabled.iter().any(|e| e.fixed);
+    if has_fixed {
+        use nereids_pipeline::pipeline::{ParameterConstraints, ParameterRole};
+        let density_roles: Vec<ParameterRole> = enabled
+            .iter()
+            .map(|e| {
+                if e.fixed {
+                    ParameterRole::Fixed(e.initial_density)
+                } else {
+                    ParameterRole::Free
+                }
+            })
+            .collect();
+        let constraints = ParameterConstraints {
+            densities: density_roles,
+            temperature: ParameterRole::Free,
+        };
+        config = config
+            .with_constraints(constraints)
+            .map_err(|e| format!("Constraint error: {e}"))?;
+    }
+
     Ok(config)
 }
 
@@ -1071,8 +1147,36 @@ pub fn run_spatial_map(state: &mut AppState) {
     let (tx, rx) = mpsc::channel();
     state.pending_spatial = Some(rx);
     state.is_fitting = true;
-    state.status_message = "Running spatial mapping...".into();
     let cancel = Arc::clone(&state.cancel_token);
+
+    // Build TV-ADMM config if regularization is enabled
+    let tv_config_opt = if state.regularization_method == RegularizationMethod::TotalVariation
+        && state.fitting_type == Some(FittingType::Spatial)
+    {
+        let n_isotopes = state
+            .isotope_entries
+            .iter()
+            .filter(|e| e.enabled && e.resonance_data.is_some())
+            .count();
+        Some(nereids_pipeline::tv_admm::TvAdmmConfig {
+            lambda: vec![state.tv_lambda; n_isotopes],
+            rho: state.tv_rho,
+            max_outer_iter: state.tv_max_outer_iter,
+            tol_primal: state.tv_tol_primal,
+            tol_dual: state.tv_tol_dual,
+        })
+    } else {
+        None
+    };
+
+    state.status_message = if tv_config_opt.is_some() {
+        format!(
+            "Running TV-ADMM spatial mapping ({} outer iter)...",
+            state.tv_max_outer_iter,
+        )
+    } else {
+        "Running spatial mapping...".into()
+    };
 
     // Progress: single FittingProgress struct holds the Arc<AtomicUsize> counter
     // and the pixel total.  Display code reads the atomic directly each frame.
@@ -1142,14 +1246,26 @@ pub fn run_spatial_map(state: &mut AppState) {
         // Run spatial_map on the dedicated pool so its par_iter doesn't
         // share the global pool with inner physics par_iter calls.
         let result = pool.install(|| {
-            nereids_pipeline::spatial::spatial_map(
-                norm.transmission.view(),
-                norm.uncertainty.view(),
-                &config,
-                dead_pixels.as_ref(),
-                Some(&cancel),
-                Some(&progress),
-            )
+            if let Some(ref tv_cfg) = tv_config_opt {
+                nereids_pipeline::tv_admm::spatial_map_tv(
+                    norm.transmission.view(),
+                    norm.uncertainty.view(),
+                    &config,
+                    tv_cfg,
+                    dead_pixels.as_ref(),
+                    Some(&cancel),
+                    Some(&progress),
+                )
+            } else {
+                nereids_pipeline::spatial::spatial_map(
+                    norm.transmission.view(),
+                    norm.uncertainty.view(),
+                    &config,
+                    dead_pixels.as_ref(),
+                    Some(&cancel),
+                    Some(&progress),
+                )
+            }
         });
 
         // Signal watcher to stop, then send result.

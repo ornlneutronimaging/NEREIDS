@@ -287,10 +287,11 @@ fn density_edit_window(ui: &mut egui::Ui, state: &mut AppState) {
         .show(ui.ctx(), |ui| {
             for entry in state.isotope_entries.iter_mut() {
                 ui.horizontal(|ui| {
+                    design::constraint_toggle(ui, &mut entry.fixed);
                     ui.label(&entry.symbol);
                     ui.add(
                         egui::DragValue::new(&mut entry.initial_density)
-                            .prefix("ρ₀=")
+                            .prefix(if entry.fixed { "fixed=" } else { "init=" })
                             .speed(0.0001)
                             .range(0.0..=1.0),
                     );

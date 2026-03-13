@@ -899,3 +899,31 @@ pub(crate) fn build_fit_line(
         .collect();
     Some(Line::new("Fit", fit_points).width(2.0))
 }
+
+// ---------------------------------------------------------------------------
+// Constraint toggle (lock/free)
+// ---------------------------------------------------------------------------
+
+/// Lock/free toggle for a parameter. Returns `true` if clicked (state changed).
+///
+/// Uses text labels ("Fix"/"Free") rather than emoji to avoid font fallback
+/// issues with DejaVuSans.
+pub fn constraint_toggle(ui: &mut egui::Ui, fixed: &mut bool) -> bool {
+    let (label, hint) = if *fixed {
+        ("Fix", "Fixed: held constant during fitting")
+    } else {
+        ("Free", "Free: optimized during fitting")
+    };
+    let color = if *fixed {
+        egui::Color32::from_rgb(200, 120, 50)
+    } else {
+        ui.visuals().text_color()
+    };
+    let resp = ui
+        .add(egui::Button::new(egui::RichText::new(label).color(color).small()).frame(false))
+        .on_hover_text(hint);
+    if resp.clicked() {
+        *fixed = !*fixed;
+    }
+    resp.clicked()
+}

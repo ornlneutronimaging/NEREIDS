@@ -45,6 +45,14 @@ pub struct ProjectSnapshot {
     pub isotope_symbol: Vec<String>,
     pub isotope_density: Vec<f64>,
     pub isotope_enabled: Vec<bool>,
+    pub isotope_fixed: Vec<bool>,
+
+    // -- config/regularization --
+    /// "none" | "tv"
+    pub regularization_method: String,
+    pub tv_lambda: f64,
+    pub tv_rho: f64,
+    pub tv_max_outer_iter: u32,
 
     // -- config/solver --
     /// "lm" | "poisson_kl"
@@ -138,6 +146,11 @@ impl Default for ProjectSnapshot {
             isotope_symbol: vec![],
             isotope_density: vec![],
             isotope_enabled: vec![],
+            isotope_fixed: vec![],
+            regularization_method: "none".to_string(),
+            tv_lambda: 1.0,
+            tv_rho: 1.0,
+            tv_max_outer_iter: 20,
             solver_method: String::new(),
             max_iter: 0,
             temperature_k: 0.0,
@@ -367,6 +380,26 @@ fn write_config(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoError
             .create("enabled")
             .and_then(|ds| ds.write_raw(&enabled))
             .map_err(|e| hdf5_err("/config/isotopes/enabled", e))?;
+
+        if !snap.isotope_fixed.is_empty() {
+            let fixed: Vec<u8> = snap.isotope_fixed.iter().map(|&b| u8::from(b)).collect();
+            iso.new_dataset::<u8>()
+                .shape([n])
+                .create("fixed")
+                .and_then(|ds| ds.write_raw(&fixed))
+                .map_err(|e| hdf5_err("/config/isotopes/fixed", e))?;
+        }
+    }
+
+    // Regularization
+    {
+        let reg = config
+            .create_group("regularization")
+            .map_err(|e| hdf5_err("create /config/regularization", e))?;
+        write_str_attr(&reg, "method", &snap.regularization_method)?;
+        write_f64_attr(&reg, "tv_lambda", snap.tv_lambda)?;
+        write_f64_attr(&reg, "tv_rho", snap.tv_rho)?;
+        write_u32_attr(&reg, "tv_max_outer_iter", snap.tv_max_outer_iter)?;
     }
 
     // Solver
@@ -943,6 +976,23 @@ fn read_config(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoEr
             .read_raw()
             .map_err(|e| hdf5_err("/config/isotopes/enabled", e))?;
         snap.isotope_enabled = en_raw.iter().map(|&v| v != 0).collect();
+
+        // fixed (backward-compat: defaults to all-false if dataset missing)
+        if let Ok(fixed_ds) = iso.dataset("fixed") {
+            let fixed_raw: Vec<u8> = fixed_ds
+                .read_raw()
+                .map_err(|e| hdf5_err("/config/isotopes/fixed", e))?;
+            snap.isotope_fixed = fixed_raw.iter().map(|&v| v != 0).collect();
+        }
+    }
+
+    // Regularization (backward-compat: defaults if group missing)
+    if let Ok(reg) = config.group("regularization") {
+        snap.regularization_method =
+            read_str_attr(&reg, "method").unwrap_or_else(|_| "none".to_string());
+        snap.tv_lambda = read_f64_attr(&reg, "tv_lambda").unwrap_or(1.0);
+        snap.tv_rho = read_f64_attr(&reg, "tv_rho").unwrap_or(1.0);
+        snap.tv_max_outer_iter = read_u32_attr(&reg, "tv_max_outer_iter").unwrap_or(20);
     }
 
     // Solver
@@ -1359,6 +1409,11 @@ mod tests {
             isotope_symbol: vec![],
             isotope_density: vec![],
             isotope_enabled: vec![],
+            isotope_fixed: vec![],
+            regularization_method: "none".into(),
+            tv_lambda: 1.0,
+            tv_rho: 1.0,
+            tv_max_outer_iter: 20,
             solver_method: "lm".into(),
             max_iter: 20,
             temperature_k: 300.0,

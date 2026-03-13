@@ -541,6 +541,7 @@ fn add_selected_isotopes(state: &mut AppState) {
                     resonance_data: None,
                     enabled: true,
                     endf_status: EndfStatus::Pending,
+                    fixed: false,
                 });
                 state.spatial_result = None;
                 state.pixel_fit_result = None;
@@ -557,6 +558,7 @@ fn add_selected_isotopes(state: &mut AppState) {
                     resonance_data: None,
                     enabled: true,
                     endf_status: EndfStatus::Pending,
+                    fixed: false,
                 });
                 state.fm_spectrum = None;
                 state.fm_per_isotope_spectra.clear();
@@ -573,6 +575,7 @@ fn add_selected_isotopes(state: &mut AppState) {
                     resonance_data: None,
                     enabled: true,
                     endf_status: EndfStatus::Pending,
+                    fixed: false,
                 });
                 state.detect_results.clear();
             }

@@ -1154,6 +1154,75 @@ fn solver_card(ui: &mut egui::Ui, state: &mut AppState) {
         if state.fit_temperature != prev_fit_temp {
             state.mark_dirty(GuidedStep::Analyze);
         }
+
+        // Regularization (Spatial only)
+        if state.fitting_type == Some(crate::state::FittingType::Spatial) {
+            ui.separator();
+            ui.label(egui::RichText::new("Regularization").small().strong());
+
+            let prev_reg = state.regularization_method;
+            ui.horizontal(|ui| {
+                ui.label("Method:");
+                egui::ComboBox::from_id_salt("studio_reg_method")
+                    .selected_text(match state.regularization_method {
+                        crate::state::RegularizationMethod::None => "None",
+                        crate::state::RegularizationMethod::TotalVariation => "TV",
+                    })
+                    .width(60.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut state.regularization_method,
+                            crate::state::RegularizationMethod::None,
+                            "None",
+                        );
+                        ui.selectable_value(
+                            &mut state.regularization_method,
+                            crate::state::RegularizationMethod::TotalVariation,
+                            "Total Variation",
+                        );
+                    });
+            });
+            if state.regularization_method != prev_reg {
+                state.mark_dirty(GuidedStep::Analyze);
+            }
+
+            if state.regularization_method == crate::state::RegularizationMethod::TotalVariation {
+                let prev_lambda = state.tv_lambda;
+                ui.horizontal(|ui| {
+                    ui.label("Lambda:");
+                    ui.add(
+                        egui::DragValue::new(&mut state.tv_lambda)
+                            .speed(0.01)
+                            .range(0.0..=1e4),
+                    );
+                });
+                if state.tv_lambda != prev_lambda {
+                    state.mark_dirty(GuidedStep::Analyze);
+                }
+
+                let prev_rho = state.tv_rho;
+                ui.horizontal(|ui| {
+                    ui.label("Rho:");
+                    ui.add(
+                        egui::DragValue::new(&mut state.tv_rho)
+                            .speed(0.01)
+                            .range(0.001..=1e4),
+                    );
+                });
+                if state.tv_rho != prev_rho {
+                    state.mark_dirty(GuidedStep::Analyze);
+                }
+
+                let prev_iter = state.tv_max_outer_iter;
+                ui.horizontal(|ui| {
+                    ui.label("ADMM iter:");
+                    ui.add(egui::DragValue::new(&mut state.tv_max_outer_iter).range(1..=500));
+                });
+                if state.tv_max_outer_iter != prev_iter {
+                    state.mark_dirty(GuidedStep::Analyze);
+                }
+            }
+        }
     });
 }
 
@@ -1185,6 +1254,15 @@ fn isotopes_card(ui: &mut egui::Ui, state: &mut AppState) {
                     state.mark_dirty(GuidedStep::Analyze);
                 }
 
+                // Lock/free toggle
+                let prev_fixed = state.isotope_entries[i].fixed;
+                ui.add_enabled_ui(!locked, |ui| {
+                    design::constraint_toggle(ui, &mut state.isotope_entries[i].fixed);
+                });
+                if state.isotope_entries[i].fixed != prev_fixed {
+                    state.mark_dirty(GuidedStep::Analyze);
+                }
+
                 // Colored dot + symbol
                 let dot_color = design::isotope_dot_color(&state.isotope_entries[i].symbol);
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
@@ -1193,9 +1271,15 @@ fn isotopes_card(ui: &mut egui::Ui, state: &mut AppState) {
 
                 // Editable density
                 let prev_density = state.isotope_entries[i].initial_density;
+                let density_prefix = if state.isotope_entries[i].fixed {
+                    "fixed="
+                } else {
+                    "init="
+                };
                 ui.add_enabled(
                     !locked,
                     egui::DragValue::new(&mut state.isotope_entries[i].initial_density)
+                        .prefix(density_prefix)
                         .speed(1e-5)
                         .range(0.0..=1.0),
                 );

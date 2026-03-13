@@ -58,10 +58,34 @@ pub struct SessionCache {
     /// Whether the sidebar is collapsed (icon-only mode).
     #[serde(default)]
     pub sidebar_collapsed: bool,
+    /// Regularization method: "none" or "tv".
+    #[serde(default)]
+    pub regularization_method: String,
+    /// TV-ADMM lambda (scalar, broadcast to all isotopes).
+    #[serde(default = "default_tv_lambda")]
+    pub tv_lambda: f64,
+    /// TV-ADMM penalty parameter rho.
+    #[serde(default = "default_tv_rho")]
+    pub tv_rho: f64,
+    /// TV-ADMM maximum outer iterations.
+    #[serde(default = "default_tv_max_outer_iter")]
+    pub tv_max_outer_iter: usize,
 }
 
 fn default_rebin_factor() -> usize {
     1
+}
+
+fn default_tv_lambda() -> f64 {
+    1.0
+}
+
+fn default_tv_rho() -> f64 {
+    1.0
+}
+
+fn default_tv_max_outer_iter() -> usize {
+    20
 }
 
 /// Serializable solver method for session cache.
@@ -79,6 +103,8 @@ pub struct CachedIsotope {
     pub symbol: String,
     pub density: f64,
     pub enabled: bool,
+    #[serde(default)]
+    pub fixed: bool,
 }
 
 impl SessionCache {
@@ -107,6 +133,7 @@ impl SessionCache {
                     symbol: e.symbol.clone(),
                     density: e.initial_density,
                     enabled: e.enabled,
+                    fixed: e.fixed,
                 })
                 .collect(),
             endf_library_name: crate::widgets::design::library_name(state.endf_library).to_string(),
@@ -133,6 +160,13 @@ impl SessionCache {
             rebin_factor: state.rebin_factor,
             rebin_applied: state.rebin_applied,
             sidebar_collapsed: state.sidebar_collapsed,
+            regularization_method: match state.regularization_method {
+                RegularizationMethod::None => "none".to_string(),
+                RegularizationMethod::TotalVariation => "tv".to_string(),
+            },
+            tv_lambda: state.tv_lambda,
+            tv_rho: state.tv_rho,
+            tv_max_outer_iter: state.tv_max_outer_iter,
         })
     }
 
@@ -160,6 +194,7 @@ impl SessionCache {
                 resonance_data: None,
                 enabled: c.enabled,
                 endf_status: EndfStatus::Pending,
+                fixed: c.fixed,
             })
             .collect();
 
@@ -204,6 +239,15 @@ impl SessionCache {
 
         // Restore sidebar state
         state.sidebar_collapsed = self.sidebar_collapsed;
+
+        // Restore regularization settings
+        state.regularization_method = match self.regularization_method.as_str() {
+            "tv" => RegularizationMethod::TotalVariation,
+            _ => RegularizationMethod::None,
+        };
+        state.tv_lambda = self.tv_lambda;
+        state.tv_rho = self.tv_rho;
+        state.tv_max_outer_iter = self.tv_max_outer_iter;
 
         // Rebuild pipeline
         state.rebuild_pipeline();
@@ -267,6 +311,14 @@ pub enum AnalysisMode {
 pub enum SolverMethod {
     LevenbergMarquardt,
     PoissonKL,
+}
+
+/// Regularization method for spatial fitting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RegularizationMethod {
+    #[default]
+    None,
+    TotalVariation,
 }
 
 /// Data source for the normalize-preview spectrum plot.
@@ -606,6 +658,14 @@ pub struct AppState {
     pub fit_temperature: bool,
     pub show_advanced_solver: bool,
 
+    // -- Regularization (TV-ADMM) --
+    pub regularization_method: RegularizationMethod,
+    pub tv_lambda: f64,
+    pub tv_rho: f64,
+    pub tv_max_outer_iter: usize,
+    pub tv_tol_primal: f64,
+    pub tv_tol_dual: f64,
+
     // -- Pixel / ROI selection --
     pub selected_pixel: Option<(usize, usize)>,
     pub rois: Vec<RoiSelection>,
@@ -805,6 +865,8 @@ pub struct IsotopeEntry {
     pub resonance_data: Option<ResonanceData>,
     pub enabled: bool,
     pub endf_status: EndfStatus,
+    /// When true, density is held at `initial_density` during fitting.
+    pub fixed: bool,
 }
 
 impl IsotopeEntry {
@@ -825,6 +887,7 @@ impl IsotopeEntry {
             } else {
                 EndfStatus::Pending
             },
+            fixed: self.fixed,
         }
     }
 }
@@ -1234,6 +1297,13 @@ impl Default for AppState {
             solver_method: SolverMethod::PoissonKL,
             fit_temperature: false,
             show_advanced_solver: false,
+
+            regularization_method: RegularizationMethod::None,
+            tv_lambda: 1.0,
+            tv_rho: 1.0,
+            tv_max_outer_iter: 20,
+            tv_tol_primal: 1e-4,
+            tv_tol_dual: 1e-4,
 
             selected_pixel: None,
             rois: Vec::new(),
