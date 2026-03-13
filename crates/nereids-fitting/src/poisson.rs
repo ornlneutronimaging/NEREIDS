@@ -639,9 +639,26 @@ pub fn poisson_fit(
             proximal,
         )?;
 
-        // Check gradient norm for convergence
+        // Check gradient norm for convergence (absolute threshold).
         let grad_norm: f64 = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
         if grad_norm < config.tol_param {
+            converged = true;
+            break;
+        }
+
+        // Scale-invariant gradient convergence check: |∂NLL/∂p · |p|| / NLL.
+        // The absolute check above uses a fixed threshold that doesn't account
+        // for the NLL magnitude (which scales with bin count and photon flux).
+        // Near the optimum of a warm-started problem (e.g., ADMM inner loop),
+        // the absolute gradient can be small but above tol_param, while the
+        // relative gradient correctly identifies the stationary point.
+        params.free_values_into(&mut free_vals_buf);
+        let rel_grad_max: f64 = grad
+            .iter()
+            .zip(free_vals_buf.iter())
+            .map(|(&g, &v)| (g * (v.abs() + 1e-30) / (nll.abs() + 1e-30)).abs())
+            .fold(0.0f64, f64::max);
+        if rel_grad_max < config.tol_param {
             converged = true;
             break;
         }
@@ -654,7 +671,6 @@ pub fn poisson_fit(
         // produces a large gradient (∝ √I₀), the fixed alpha=step_size initial
         // step wildly overshoots, and 30 backtracking halvings are not enough to
         // recover—causing the line search to fail even far from the optimum.
-        params.free_values_into(&mut free_vals_buf);
         old_free_buf.clear();
         old_free_buf.extend_from_slice(&free_vals_buf);
         let initial_alpha = config.step_size / grad_norm.max(1.0);
@@ -919,9 +935,21 @@ pub fn poisson_fit_analytic(
             }
         }
 
-        // Check gradient norm for convergence
+        // Check gradient norm for convergence (absolute threshold).
         let grad_norm: f64 = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
         if grad_norm < config.tol_param {
+            converged = true;
+            break;
+        }
+
+        // Scale-invariant gradient convergence check (same as poisson_fit).
+        params.free_values_into(&mut free_vals_buf);
+        let rel_grad_max: f64 = grad
+            .iter()
+            .zip(free_vals_buf.iter())
+            .map(|(&g, &v)| (g * (v.abs() + 1e-30) / (nll.abs() + 1e-30)).abs())
+            .fold(0.0f64, f64::max);
+        if rel_grad_max < config.tol_param {
             converged = true;
             break;
         }
