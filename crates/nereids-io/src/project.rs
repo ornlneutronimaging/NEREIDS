@@ -385,14 +385,15 @@ fn write_config(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoError
             .and_then(|ds| ds.write_raw(&enabled))
             .map_err(|e| hdf5_err("/config/isotopes/enabled", e))?;
 
-        if !snap.isotope_fixed.is_empty() {
-            let fixed: Vec<u8> = snap.isotope_fixed.iter().map(|&b| u8::from(b)).collect();
-            iso.new_dataset::<u8>()
-                .shape([n])
-                .create("fixed")
-                .and_then(|ds| ds.write_raw(&fixed))
-                .map_err(|e| hdf5_err("/config/isotopes/fixed", e))?;
-        }
+        // Always write `fixed` array, padding with false if shorter than n.
+        let mut fixed_vals = snap.isotope_fixed.clone();
+        fixed_vals.resize(n, false);
+        let fixed: Vec<u8> = fixed_vals.iter().map(|&b| u8::from(b)).collect();
+        iso.new_dataset::<u8>()
+            .shape([n])
+            .create("fixed")
+            .and_then(|ds| ds.write_raw(&fixed))
+            .map_err(|e| hdf5_err("/config/isotopes/fixed", e))?;
     }
 
     // Regularization
@@ -989,6 +990,8 @@ fn read_config(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoEr
                 .read_raw()
                 .map_err(|e| hdf5_err("/config/isotopes/fixed", e))?;
             snap.isotope_fixed = fixed_raw.iter().map(|&v| v != 0).collect();
+        } else {
+            snap.isotope_fixed = vec![false; snap.isotope_z.len()];
         }
     }
 
@@ -1867,6 +1870,45 @@ mod tests {
         assert_eq!(loaded.isotope_symbol, vec!["W-182", "Fe-56"]);
         assert!((loaded.isotope_density[0] - 0.001).abs() < 1e-10);
         assert_eq!(loaded.isotope_enabled, vec![true, false]);
+        // isotope_fixed defaults to all-false when not explicitly set
+        assert_eq!(loaded.isotope_fixed, vec![false, false]);
+    }
+
+    #[test]
+    fn test_roundtrip_isotope_fixed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt_fixed.nrd.h5");
+        let mut snap = minimal_snapshot();
+        snap.isotope_z = vec![74, 26];
+        snap.isotope_a = vec![182, 56];
+        snap.isotope_symbol = vec!["W-182".into(), "Fe-56".into()];
+        snap.isotope_density = vec![0.001, 0.002];
+        snap.isotope_enabled = vec![true, true];
+        snap.isotope_fixed = vec![true, false];
+        save_project(&path, &snap).unwrap();
+        let loaded = load_project(&path).unwrap();
+        assert_eq!(loaded.isotope_fixed, vec![true, false]);
+    }
+
+    #[test]
+    fn test_roundtrip_regularization() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt_reg.nrd.h5");
+        let mut snap = minimal_snapshot();
+        snap.regularization_method = "tv".into();
+        snap.tv_lambda = 2.5;
+        snap.tv_rho = 0.5;
+        snap.tv_max_outer_iter = 30;
+        snap.tv_tol_primal = 1e-5;
+        snap.tv_tol_dual = 1e-3;
+        save_project(&path, &snap).unwrap();
+        let loaded = load_project(&path).unwrap();
+        assert_eq!(loaded.regularization_method, "tv");
+        assert!((loaded.tv_lambda - 2.5).abs() < 1e-10);
+        assert!((loaded.tv_rho - 0.5).abs() < 1e-10);
+        assert_eq!(loaded.tv_max_outer_iter, 30);
+        assert!((loaded.tv_tol_primal - 1e-5).abs() < 1e-12);
+        assert!((loaded.tv_tol_dual - 1e-3).abs() < 1e-12);
     }
 
     #[test]
