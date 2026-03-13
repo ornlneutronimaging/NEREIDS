@@ -587,15 +587,34 @@ pub fn levenberg_marquardt(
             }
         }
 
+        // Gradient-based convergence check: if the gradient ∂χ²/∂p is
+        // negligible relative to χ² and parameter scales, the current point
+        // is a stationary point.  This catches warm-started optimizations
+        // (e.g., ADMM inner iterations) where the initial parameters are
+        // already at the minimum and no LM step can improve χ².
+        //
+        // Only check when the Jacobian is non-trivial (JᵀWJ norm > 0).
+        // A zero Jacobian means the model is insensitive to parameters
+        // (gradient is zero trivially, not because we're at a minimum).
+        params.free_values_into(&mut free_vals_buf);
+        let jac_norm_sq: f64 = jtw_j.data.iter().map(|v| v * v).sum();
+        if jac_norm_sq > PIVOT_FLOOR {
+            let rel_grad_max: f64 = jtw_r
+                .iter()
+                .zip(free_vals_buf.iter())
+                .map(|(&g, &v)| (2.0 * g * (v.abs() + PIVOT_FLOOR) / (chi2 + PIVOT_FLOOR)).abs())
+                .fold(0.0f64, f64::max);
+            if rel_grad_max < config.tol_chi2 {
+                converged = true;
+                break;
+            }
+        }
+
         // Solve (JᵀWJ + λ·diag(JᵀWJ)) · δ = JᵀWr
         let delta = match solve_damped_system(&jtw_j, &jtw_r, lambda) {
             Some(d) => d,
             None => break, // Singular system
         };
-
-        // Trial step — snapshot free values into a reusable buffer to avoid
-        // per-iteration allocation.
-        params.free_values_into(&mut free_vals_buf);
         let trial_free: Vec<f64> = free_vals_buf
             .iter()
             .zip(delta.iter())
