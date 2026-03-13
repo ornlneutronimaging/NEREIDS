@@ -1291,9 +1291,9 @@ fn build_resolution(
 
 /// Parse a Python `dict[str, str]` into [`ParameterConstraints`].
 ///
-/// Keys are isotope names (e.g. "U-238") or "temperature".
-/// Values are "free" or "fixed:VALUE".
-/// Unmentioned isotopes default to `Free`.
+/// Keys are isotope names (e.g. "U-238"). Values are "free" or "fixed:VALUE".
+/// Unmentioned isotopes default to `Free`. Temperature is always `Free`
+/// (temperature fitting is only available via `fit_spectrum()`).
 fn parse_constraints(
     dict: Option<&Bound<'_, PyDict>>,
     isotope_names: &[String],
@@ -1305,7 +1305,6 @@ fn parse_constraints(
 
     let n = isotope_names.len();
     let mut densities = vec![ParameterRole::Free; n];
-    let mut temperature = ParameterRole::Free;
 
     for (key, value) in dict.iter() {
         let key_str: String = key.extract()?;
@@ -1319,12 +1318,15 @@ fn parse_constraints(
         })?;
 
         if key_str == "temperature" {
-            temperature = role;
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "temperature constraints are not supported in spatial_map/spatial_map_tv; \
+                 use fit_spectrum(fit_temperature=True) for temperature fitting",
+            ));
         } else if let Some(idx) = isotope_names.iter().position(|n| *n == key_str) {
             densities[idx] = role;
         } else {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "unknown constraint key '{}'; valid keys are {:?} or 'temperature'",
+                "unknown constraint key '{}'; valid keys are {:?}",
                 key_str, isotope_names,
             )));
         }
@@ -1332,17 +1334,22 @@ fn parse_constraints(
 
     Ok(Some(ParameterConstraints {
         densities,
-        temperature,
+        temperature: ParameterRole::Free,
     }))
 }
 
 /// Parse a single constraint value string like "free" or "fixed:0.001".
+///
+/// Both keywords are case-insensitive: "Fixed:0.001", "FIXED:0.001", etc.
 fn parse_role(s: &str) -> Result<ParameterRole, String> {
     let s = s.trim();
     if s.eq_ignore_ascii_case("free") {
         return Ok(ParameterRole::Free);
     }
-    if let Some(rest) = s.strip_prefix("fixed:") {
+    // Case-insensitive check for "fixed:" prefix, then parse the numeric tail
+    // from the original string to preserve the value.
+    if s.len() > 6 && s[..6].eq_ignore_ascii_case("fixed:") {
+        let rest = &s[6..];
         let val: f64 = rest
             .trim()
             .parse()
@@ -1572,7 +1579,7 @@ fn py_apply_resolution<'py>(
 ///     roi: [y0, y1, x0, x1] region for Stage-1 nuisance estimation
 ///         (Poisson path only, default uses full image).
 ///     constraints: Dict mapping isotope names to constraints (optional).
-///         Keys are isotope names (e.g. "U-238") or "temperature".
+///         Keys are isotope names (e.g. "U-238").
 ///         Values are "free" or "fixed:VALUE" (e.g. "fixed:0.001").
 ///         Only supported with fitter='lm'.
 ///
@@ -1835,7 +1842,7 @@ fn py_spatial_map(
 ///     initial_densities: Initial guesses for areal densities (optional).
 ///     dead_pixels: 2D bool numpy array marking dead pixels (optional).
 ///     constraints: Dict mapping isotope names to constraints (optional).
-///         Keys are isotope names (e.g. "U-238") or "temperature".
+///         Keys are isotope names (e.g. "U-238").
 ///         Values are "free" or "fixed:VALUE" (e.g. "fixed:0.001").
 ///     flight_path_m: Flight path for Gaussian resolution (optional).
 ///     delta_t_us: Timing uncertainty for Gaussian resolution (optional).
@@ -2930,8 +2937,9 @@ fn py_generate_noisy_cube<'py>(
             "n_photons must be finite and positive",
         ));
     }
-    let data = transmission.as_slice()?;
-    let (cube, unc) = noise::generate_noisy_cube(data, shape, n_photons, seed);
+    // Clone data before releasing the GIL — numpy views borrow GIL-protected memory.
+    let data = transmission.as_slice()?.to_vec();
+    let (cube, unc) = py.detach(move || noise::generate_noisy_cube(&data, shape, n_photons, seed));
     Ok((
         PyArray3::from_owned_array(py, cube),
         PyArray3::from_owned_array(py, unc),

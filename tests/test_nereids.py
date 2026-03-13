@@ -1248,6 +1248,41 @@ class TestConstraints:
                 constraints={"U-238": "free"},
             )
 
+    def test_temperature_constraint_raises(self, u238_data):
+        """Temperature constraint in spatial mapping should raise ValueError."""
+        energies = np.linspace(1.0, 30.0, 50)
+        trans = np.ones((50, 2, 2))
+        unc = np.full_like(trans, 0.005)
+
+        with pytest.raises(ValueError, match="temperature constraints are not supported"):
+            nereids.spatial_map(
+                trans, unc, energies, [u238_data],
+                temperature_k=0.0,
+                constraints={"temperature": "fixed:300"},
+            )
+
+    def test_fixed_case_insensitive(self, u238_data):
+        """Fixed keyword should be case-insensitive."""
+        energies = np.linspace(1.0, 30.0, 200)
+        true_density = 0.002
+        ny, nx = 2, 2
+
+        t_1d = np.asarray(
+            nereids.forward_model(energies, [(u238_data, true_density)])
+        )
+        trans = np.tile(t_1d[:, None, None], (1, ny, nx))
+        unc = np.full_like(trans, 0.005)
+
+        fixed_val = 0.003
+        # "Fixed:" with capital F should work
+        result = nereids.spatial_map(
+            trans, unc, energies, [u238_data],
+            temperature_k=0.0, max_iter=50,
+            constraints={"U-238": f"Fixed:{fixed_val}"},
+        )
+        dmap = np.asarray(result.density_maps[0])
+        np.testing.assert_allclose(dmap, fixed_val, atol=1e-10)
+
 
 # ===========================================================================
 # Noise utilities
