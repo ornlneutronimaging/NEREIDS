@@ -11,6 +11,7 @@
 //! - [`sparse`] — TRINIDI-inspired two-stage reconstruction for low-count data
 //! - [`detectability`] — Trace-detectability analysis (pre-experiment SNR check)
 //! - [`noise`] — Synthetic noise generation (Poisson, Gaussian) for testing
+//! - [`tv_admm`] — Total Variation regularization via ADMM for spatial maps
 
 pub mod detectability;
 pub mod error;
@@ -18,6 +19,7 @@ pub mod noise;
 pub mod pipeline;
 pub mod sparse;
 pub mod spatial;
+pub mod tv_admm;
 
 #[cfg(test)]
 mod test_helpers;

@@ -527,6 +527,7 @@ pub fn sparse_reconstruct(
                 &mut params,
                 config.poisson_config(),
                 None,
+                None,
             )
             .ok()?;
 

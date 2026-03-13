@@ -895,6 +895,7 @@ fn fit_spectrum(
                     &mut params,
                     &poisson_config,
                     temp_ctx.as_ref(),
+                    None,
                 )
                 .map_err(|e| format!("poisson_fit_analytic failed: {e}"))?;
 
