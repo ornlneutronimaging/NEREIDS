@@ -76,6 +76,12 @@ pub struct SessionCache {
     /// TV-ADMM dual residual tolerance.
     #[serde(default = "default_tv_tol")]
     pub tv_tol_dual: f64,
+    /// Whether to fit temperature.
+    #[serde(default)]
+    pub fit_temperature: bool,
+    /// Whether temperature is fixed during fitting (when fit_temperature is true).
+    #[serde(default)]
+    pub fixed_temperature: bool,
 }
 
 fn default_rebin_factor() -> usize {
@@ -179,6 +185,8 @@ impl SessionCache {
             tv_max_outer_iter: state.tv_max_outer_iter,
             tv_tol_primal: state.tv_tol_primal,
             tv_tol_dual: state.tv_tol_dual,
+            fit_temperature: state.fit_temperature,
+            fixed_temperature: state.fixed_temperature,
         })
     }
 
@@ -262,6 +270,8 @@ impl SessionCache {
         state.tv_max_outer_iter = self.tv_max_outer_iter;
         state.tv_tol_primal = self.tv_tol_primal;
         state.tv_tol_dual = self.tv_tol_dual;
+        state.fit_temperature = self.fit_temperature;
+        state.fixed_temperature = self.fixed_temperature;
 
         // Rebuild pipeline
         state.rebuild_pipeline();
@@ -670,6 +680,9 @@ pub struct AppState {
     pub lm_config: LmConfig,
     pub solver_method: SolverMethod,
     pub fit_temperature: bool,
+    /// When true and `fit_temperature` is true, temperature is included in the
+    /// parameter set but held at `temperature_k` (not optimized).
+    pub fixed_temperature: bool,
     pub show_advanced_solver: bool,
 
     // -- Regularization (TV-ADMM) --
@@ -1310,6 +1323,7 @@ impl Default for AppState {
             lm_config: LmConfig::default(),
             solver_method: SolverMethod::PoissonKL,
             fit_temperature: false,
+            fixed_temperature: false,
             show_advanced_solver: false,
 
             regularization_method: RegularizationMethod::None,

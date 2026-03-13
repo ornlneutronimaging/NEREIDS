@@ -62,6 +62,7 @@ pub struct ProjectSnapshot {
     pub max_iter: u32,
     pub temperature_k: f64,
     pub fit_temperature: bool,
+    pub fixed_temperature: bool,
 
     // -- config/resolution --
     pub resolution_enabled: bool,
@@ -159,6 +160,7 @@ impl Default for ProjectSnapshot {
             max_iter: 0,
             temperature_k: 0.0,
             fit_temperature: false,
+            fixed_temperature: false,
             resolution_enabled: false,
             resolution_kind: String::new(),
             delta_t_us: None,
@@ -417,6 +419,7 @@ fn write_config(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoError
     write_u32_attr(&solver, "max_iter", snap.max_iter)?;
     write_f64_attr(&solver, "temperature_k", snap.temperature_k)?;
     write_bool_attr(&solver, "fit_temperature", snap.fit_temperature)?;
+    write_bool_attr(&solver, "fixed_temperature", snap.fixed_temperature)?;
 
     // Resolution
     let res = config
@@ -1014,6 +1017,8 @@ fn read_config(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoEr
     snap.max_iter = read_u32_attr(&solver, "max_iter")?;
     snap.temperature_k = read_f64_attr(&solver, "temperature_k")?;
     snap.fit_temperature = read_bool_attr(&solver, "fit_temperature")?;
+    // Backward-compatible: older projects may not have fixed_temperature.
+    snap.fixed_temperature = read_bool_attr(&solver, "fixed_temperature").unwrap_or(false);
 
     // Resolution
     let res = config
@@ -1431,6 +1436,7 @@ mod tests {
             max_iter: 20,
             temperature_k: 300.0,
             fit_temperature: false,
+            fixed_temperature: false,
             resolution_enabled: false,
             resolution_kind: "gaussian".into(),
             delta_t_us: Some(1.5),

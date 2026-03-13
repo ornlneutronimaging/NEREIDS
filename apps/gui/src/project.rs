@@ -231,6 +231,7 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         max_iter: state.lm_config.max_iter.min(u32::MAX as usize) as u32,
         temperature_k: state.temperature_k,
         fit_temperature: state.fit_temperature,
+        fixed_temperature: state.fixed_temperature,
         resolution_enabled: state.resolution_enabled,
         resolution_kind: resolution_kind.into(),
         delta_t_us,
@@ -715,6 +716,7 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
     state.lm_config.max_iter = snap.max_iter as usize;
     state.temperature_k = snap.temperature_k;
     state.fit_temperature = snap.fit_temperature;
+    state.fixed_temperature = snap.fixed_temperature;
 
     // 9b. Restore regularization
     state.regularization_method = match snap.regularization_method.as_str() {

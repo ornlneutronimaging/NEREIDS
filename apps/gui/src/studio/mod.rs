@@ -1150,8 +1150,14 @@ fn solver_card(ui: &mut egui::Ui, state: &mut AppState) {
         });
 
         let prev_fit_temp = state.fit_temperature;
-        ui.checkbox(&mut state.fit_temperature, "Fit temperature");
-        if state.fit_temperature != prev_fit_temp {
+        let prev_fixed_temp = state.fixed_temperature;
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut state.fit_temperature, "Fit temperature");
+            if state.fit_temperature {
+                design::constraint_toggle(ui, &mut state.fixed_temperature);
+            }
+        });
+        if state.fit_temperature != prev_fit_temp || state.fixed_temperature != prev_fixed_temp {
             state.mark_dirty(GuidedStep::Analyze);
         }
 

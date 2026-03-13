@@ -906,22 +906,28 @@ pub(crate) fn build_fit_line(
 
 /// Lock/free toggle for a parameter. Returns `true` if clicked (state changed).
 ///
-/// Uses text labels ("Fix"/"Free") rather than emoji to avoid font fallback
-/// issues with DejaVuSans.
+/// Renders as a colored pill button: orange "Fixed" or green "Free".
+/// The filled background makes it visually obvious that it's interactive.
 pub fn constraint_toggle(ui: &mut egui::Ui, fixed: &mut bool) -> bool {
-    let (label, hint) = if *fixed {
-        ("Fix", "Fixed: held constant during fitting")
+    let (label, hint, fg, bg) = if *fixed {
+        (
+            "Fixed",
+            "Click to make this parameter free (optimized during fitting)",
+            Color32::WHITE,
+            semantic::ORANGE,
+        )
     } else {
-        ("Free", "Free: optimized during fitting")
+        (
+            "Free",
+            "Click to fix this parameter (held constant during fitting)",
+            Color32::WHITE,
+            semantic::GREEN,
+        )
     };
-    let color = if *fixed {
-        egui::Color32::from_rgb(200, 120, 50)
-    } else {
-        ui.visuals().text_color()
-    };
-    let resp = ui
-        .add(egui::Button::new(egui::RichText::new(label).color(color).small()).frame(false))
-        .on_hover_text(hint);
+    let button = egui::Button::new(RichText::new(label).size(10.0).color(fg).strong())
+        .fill(bg)
+        .corner_radius(CornerRadius::same(8));
+    let resp = ui.add(button).on_hover_text(hint);
     if resp.clicked() {
         *fixed = !*fixed;
     }

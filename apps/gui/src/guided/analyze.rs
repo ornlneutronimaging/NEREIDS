@@ -168,10 +168,12 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
 
     if state.show_advanced_solver {
         ui.indent("advanced_solver", |ui| {
-            ui.checkbox(
-                &mut state.fit_temperature,
-                "Fit temperature (slow for Spatial Map)",
-            );
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut state.fit_temperature, "Fit temperature");
+                if state.fit_temperature {
+                    design::constraint_toggle(ui, &mut state.fixed_temperature);
+                }
+            });
             ui.checkbox(
                 &mut state.lm_config.compute_covariance,
                 "Compute covariance (single-pixel/ROI only)",
@@ -836,9 +838,10 @@ fn build_fit_config(state: &AppState) -> Result<FitConfig, String> {
             .map_err(|e| format!("FitConfig temperature error: {e}"))?;
     }
 
-    // Apply per-isotope constraints if any are fixed
-    let has_fixed = enabled.iter().any(|e| e.fixed);
-    if has_fixed {
+    // Apply per-isotope and/or temperature constraints
+    let has_fixed_density = enabled.iter().any(|e| e.fixed);
+    let has_fixed_temp = state.fit_temperature && state.fixed_temperature;
+    if has_fixed_density || has_fixed_temp {
         use nereids_pipeline::pipeline::{ParameterConstraints, ParameterRole};
         let density_roles: Vec<ParameterRole> = enabled
             .iter()
@@ -850,9 +853,14 @@ fn build_fit_config(state: &AppState) -> Result<FitConfig, String> {
                 }
             })
             .collect();
+        let temperature_role = if has_fixed_temp {
+            ParameterRole::Fixed(state.temperature_k)
+        } else {
+            ParameterRole::Free
+        };
         let constraints = ParameterConstraints {
             densities: density_roles,
-            temperature: ParameterRole::Free,
+            temperature: temperature_role,
         };
         config = config
             .with_constraints(constraints)
