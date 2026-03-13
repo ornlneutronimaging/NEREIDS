@@ -247,14 +247,14 @@ pub fn spatial_map_tv(
     let fast_config = precompute_config(config, cancel)?;
 
     // ---- Iteration 0: vanilla spatial_map ----
-    // Pass None for progress: only ADMM iterations count toward progress.
+    // Pass the progress counter so the initial pass updates the GUI progress bar.
     let initial_result = spatial_map(
         transmission,
         uncertainty,
         &fast_config,
         dead_pixels,
         cancel,
-        None,
+        progress,
     )?;
 
     // Transpose data once for per-pixel access.

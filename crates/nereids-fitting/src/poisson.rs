@@ -646,6 +646,16 @@ pub fn poisson_fit(
             break;
         }
 
+        // FD noise floor: the finite-difference gradient has an error of
+        // approximately `NLL · ε_mach / h` per component, where h = fd_step.
+        // Below this threshold, the gradient direction is dominated by
+        // round-off and the line search cannot make reliable progress.
+        let fd_noise_floor = nll.abs() * config.fd_step;
+        if grad_norm < fd_noise_floor {
+            converged = true;
+            break;
+        }
+
         // Scale-invariant gradient convergence check: |∂NLL/∂p · |p|| / NLL.
         // The absolute check above uses a fixed threshold that doesn't account
         // for the NLL magnitude (which scales with bin count and photon flux).

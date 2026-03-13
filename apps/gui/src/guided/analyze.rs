@@ -1186,7 +1186,9 @@ pub fn run_spatial_map(state: &mut AppState) {
         None => height * width,
     };
     let progress_total = match tv_config_opt {
-        Some(ref cfg) => n_live * cfg.max_outer_iter,
+        // +1 accounts for the initial (vanilla) spatial_map pass that provides
+        // the warm-start for ADMM iterations.
+        Some(ref cfg) => n_live * (cfg.max_outer_iter + 1),
         None => n_live,
     };
     let (fp, progress) = crate::state::FittingProgress::new(progress_total);

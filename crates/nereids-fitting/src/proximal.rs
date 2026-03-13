@@ -63,10 +63,10 @@ impl ProximalPenalty {
 ///   `model_output[extra_row] = sqrt(rho) * params[idx]`
 ///
 /// When paired with extended observations `y_obs[extra_row] = sqrt(rho) * target`
-/// and `sigma[extra_row] = 1.0`, the LM objective gains:
-///   `residual² / sigma² = rho * (params[idx] - target)²`
+/// and `sigma[extra_row] = sqrt(2)`, the LM objective gains:
+///   `residual² / sigma² = (rho/2) * (params[idx] - target)²`
 ///
-/// which is exactly the desired proximal penalty.
+/// matching [`ProximalPenalty::value`] and the ADMM augmented Lagrangian.
 pub struct ProximalModel<M: FitModel> {
     inner: M,
     /// `(param_index, target, sqrt_rho)` — note sqrt_rho, not rho.
@@ -136,10 +136,11 @@ impl<M: FitModel> FitModel for ProximalModel<M> {
 ///
 /// For each proximal term, appends:
 ///   `y_obs_ext = sqrt(rho) * target`
-///   `sigma_ext = 1.0`
+///   `sigma_ext = sqrt(2)`
 ///
 /// so the LM residual `(y_obs - y_model)² / sigma²` equals
-/// `rho * (target - param)²` for the proximal rows.
+/// `(rho/2) * (target - param)²` for the proximal rows, matching
+/// [`ProximalPenalty::value`] and the ADMM augmented Lagrangian.
 pub fn extend_data_for_proximal(
     y_obs: &[f64],
     sigma: &[f64],
@@ -149,7 +150,7 @@ pub fn extend_data_for_proximal(
     let mut s_ext = sigma.to_vec();
     for &(_idx, target, rho) in &penalty.terms {
         y_ext.push(rho.sqrt() * target);
-        s_ext.push(1.0);
+        s_ext.push(std::f64::consts::SQRT_2);
     }
     (y_ext, s_ext)
 }
@@ -236,7 +237,7 @@ mod tests {
         assert_eq!(s_ext.len(), 4);
         // sqrt(4.0) * 1.5 = 3.0
         assert!((y_ext[3] - 3.0).abs() < 1e-12);
-        assert!((s_ext[3] - 1.0).abs() < 1e-12);
+        assert!((s_ext[3] - std::f64::consts::SQRT_2).abs() < 1e-12);
     }
 
     #[test]
