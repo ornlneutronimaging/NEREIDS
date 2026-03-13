@@ -712,10 +712,12 @@ pub fn poisson_fit(
                 // This happens when Fisher information >> rho, making the
                 // improvement ~rho²/Fisher ≈ 1e-12 on NLL ≈ 1e4.
                 //
-                // For a convex objective (Poisson NLL + quadratic proximal),
-                // inability to find *any* descent step implies the current
-                // point is a practical minimum.
-                converged = true;
+                // Only declare convergence in the proximal context — for
+                // cold-start fits (no proximal), line search failure is a
+                // genuine optimization failure.
+                if proximal.is_some() {
+                    converged = true;
+                }
                 break;
             }
         }
