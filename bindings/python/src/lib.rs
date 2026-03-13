@@ -1893,12 +1893,7 @@ fn py_spatial_map_tv(
     tv_tol_dual: f64,
 ) -> PyResult<Py<PyAny>> {
     let e = energies.as_slice()?;
-
-    if e.is_empty() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "energies must not be empty",
-        ));
-    }
+    require_non_empty_energy_grid(e)?;
 
     // Validate shapes using cheap PyReadonly views before cloning
     let t_shape = transmission.shape();
