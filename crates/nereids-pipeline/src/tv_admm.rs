@@ -299,7 +299,6 @@ pub fn spatial_map_tv(
     }
 
     // ---- ADMM outer loop ----
-    let mut admm_converged = false;
     for _outer in 0..tv_config.max_outer_iter {
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
             return Err(PipelineError::Cancelled);
@@ -436,7 +435,6 @@ pub fn spatial_map_tv(
         let dual_norm = dual_sq.sqrt();
 
         if primal_norm < tv_config.tol_primal && dual_norm < tv_config.tol_dual {
-            admm_converged = true;
             break;
         }
     }
@@ -502,23 +500,16 @@ pub fn spatial_map_tv(
         .map(|_| Array2::from_elem((height, width), f64::NAN))
         .collect();
     let mut chi_squared_map = Array2::from_elem((height, width), f64::NAN);
-    // Convergence reflects ADMM status: all live pixels marked converged
-    // if the ADMM primal+dual residuals dropped below tolerance.
+    // Use per-pixel LM convergence from the final evaluation, not the global
+    // ADMM convergence flag.  This gives users the same granularity as the
+    // vanilla spatial_map path and avoids the all-or-nothing convergence report.
     let mut converged_map = Array2::from_elem((height, width), false);
-    if admm_converged {
-        for &p in &live_pixels {
-            let y = p / width;
-            let x = p % width;
-            converged_map[[y, x]] = true;
-        }
-    }
     let mut temperature_map: Option<Array2<f64>> = if config.fit_temperature() {
         Some(Array2::from_elem((height, width), f64::NAN))
     } else {
         None
     };
     let isotope_labels = config.isotope_names().to_vec();
-    let n_converged = if admm_converged { live_pixels.len() } else { 0 };
 
     // Fill ADMM densities for all live pixels.
     for &p in &live_pixels {
@@ -530,6 +521,7 @@ pub fn spatial_map_tv(
     }
 
     // Fill ancillary maps from final evaluation results.
+    let mut n_converged = 0usize;
     for (p, result) in &final_results {
         let y = p / width;
         let x = p % width;
@@ -539,6 +531,10 @@ pub fn spatial_map_tv(
             }
         }
         chi_squared_map[[y, x]] = result.reduced_chi_squared;
+        converged_map[[y, x]] = result.converged;
+        if result.converged {
+            n_converged += 1;
+        }
         if let (Some(t_map), Some(temp)) = (&mut temperature_map, result.temperature_k) {
             t_map[[y, x]] = temp;
         }
