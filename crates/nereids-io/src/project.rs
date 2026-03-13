@@ -53,6 +53,8 @@ pub struct ProjectSnapshot {
     pub tv_lambda: f64,
     pub tv_rho: f64,
     pub tv_max_outer_iter: u32,
+    pub tv_tol_primal: f64,
+    pub tv_tol_dual: f64,
 
     // -- config/solver --
     /// "lm" | "poisson_kl"
@@ -151,6 +153,8 @@ impl Default for ProjectSnapshot {
             tv_lambda: 1.0,
             tv_rho: 1.0,
             tv_max_outer_iter: 20,
+            tv_tol_primal: 1e-4,
+            tv_tol_dual: 1e-4,
             solver_method: String::new(),
             max_iter: 0,
             temperature_k: 0.0,
@@ -400,6 +404,8 @@ fn write_config(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoError
         write_f64_attr(&reg, "tv_lambda", snap.tv_lambda)?;
         write_f64_attr(&reg, "tv_rho", snap.tv_rho)?;
         write_u32_attr(&reg, "tv_max_outer_iter", snap.tv_max_outer_iter)?;
+        write_f64_attr(&reg, "tv_tol_primal", snap.tv_tol_primal)?;
+        write_f64_attr(&reg, "tv_tol_dual", snap.tv_tol_dual)?;
     }
 
     // Solver
@@ -993,6 +999,8 @@ fn read_config(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoEr
         snap.tv_lambda = read_f64_attr(&reg, "tv_lambda").unwrap_or(1.0);
         snap.tv_rho = read_f64_attr(&reg, "tv_rho").unwrap_or(1.0);
         snap.tv_max_outer_iter = read_u32_attr(&reg, "tv_max_outer_iter").unwrap_or(20);
+        snap.tv_tol_primal = read_f64_attr(&reg, "tv_tol_primal").unwrap_or(1e-4);
+        snap.tv_tol_dual = read_f64_attr(&reg, "tv_tol_dual").unwrap_or(1e-4);
     }
 
     // Solver
@@ -1414,6 +1422,8 @@ mod tests {
             tv_lambda: 1.0,
             tv_rho: 1.0,
             tv_max_outer_iter: 20,
+            tv_tol_primal: 1e-4,
+            tv_tol_dual: 1e-4,
             solver_method: "lm".into(),
             max_iter: 20,
             temperature_k: 300.0,

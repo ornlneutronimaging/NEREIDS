@@ -70,6 +70,12 @@ pub struct SessionCache {
     /// TV-ADMM maximum outer iterations.
     #[serde(default = "default_tv_max_outer_iter")]
     pub tv_max_outer_iter: usize,
+    /// TV-ADMM primal residual tolerance.
+    #[serde(default = "default_tv_tol")]
+    pub tv_tol_primal: f64,
+    /// TV-ADMM dual residual tolerance.
+    #[serde(default = "default_tv_tol")]
+    pub tv_tol_dual: f64,
 }
 
 fn default_rebin_factor() -> usize {
@@ -86,6 +92,10 @@ fn default_tv_rho() -> f64 {
 
 fn default_tv_max_outer_iter() -> usize {
     20
+}
+
+fn default_tv_tol() -> f64 {
+    1e-4
 }
 
 /// Serializable solver method for session cache.
@@ -167,6 +177,8 @@ impl SessionCache {
             tv_lambda: state.tv_lambda,
             tv_rho: state.tv_rho,
             tv_max_outer_iter: state.tv_max_outer_iter,
+            tv_tol_primal: state.tv_tol_primal,
+            tv_tol_dual: state.tv_tol_dual,
         })
     }
 
@@ -248,6 +260,8 @@ impl SessionCache {
         state.tv_lambda = self.tv_lambda;
         state.tv_rho = self.tv_rho;
         state.tv_max_outer_iter = self.tv_max_outer_iter;
+        state.tv_tol_primal = self.tv_tol_primal;
+        state.tv_tol_dual = self.tv_tol_dual;
 
         // Rebuild pipeline
         state.rebuild_pipeline();

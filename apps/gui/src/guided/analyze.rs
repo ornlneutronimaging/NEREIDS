@@ -237,7 +237,7 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
                 ui.add(
                     egui::DragValue::new(&mut state.tv_rho)
                         .speed(0.01)
-                        .range(0.001..=1e4),
+                        .range(0.01..=1e4),
                 );
             });
             ui.horizontal(|ui| {
@@ -1180,11 +1180,16 @@ pub fn run_spatial_map(state: &mut AppState) {
 
     // Progress: single FittingProgress struct holds the Arc<AtomicUsize> counter
     // and the pixel total.  Display code reads the atomic directly each frame.
+    // TV-ADMM increments per pixel per outer iteration, so scale total accordingly.
     let n_live = match dead_pixels {
         Some(ref dp) => dp.iter().filter(|&&d| !d).count(),
         None => height * width,
     };
-    let (fp, progress) = crate::state::FittingProgress::new(n_live);
+    let progress_total = match tv_config_opt {
+        Some(ref cfg) => n_live * cfg.max_outer_iter,
+        None => n_live,
+    };
+    let (fp, progress) = crate::state::FittingProgress::new(progress_total);
     state.fitting_progress = Some(fp);
 
     // Clone the egui context so the background thread can poke the GUI

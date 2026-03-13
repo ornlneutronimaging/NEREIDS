@@ -1206,7 +1206,7 @@ fn solver_card(ui: &mut egui::Ui, state: &mut AppState) {
                     ui.add(
                         egui::DragValue::new(&mut state.tv_rho)
                             .speed(0.01)
-                            .range(0.001..=1e4),
+                            .range(0.01..=1e4),
                     );
                 });
                 if state.tv_rho != prev_rho {

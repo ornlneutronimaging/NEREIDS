@@ -225,6 +225,8 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         tv_lambda: state.tv_lambda,
         tv_rho: state.tv_rho,
         tv_max_outer_iter: state.tv_max_outer_iter.min(u32::MAX as usize) as u32,
+        tv_tol_primal: state.tv_tol_primal,
+        tv_tol_dual: state.tv_tol_dual,
         solver_method: solver_method.into(),
         max_iter: state.lm_config.max_iter.min(u32::MAX as usize) as u32,
         temperature_k: state.temperature_k,
@@ -722,6 +724,8 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
     state.tv_lambda = snap.tv_lambda;
     state.tv_rho = snap.tv_rho;
     state.tv_max_outer_iter = snap.tv_max_outer_iter as usize;
+    state.tv_tol_primal = snap.tv_tol_primal;
+    state.tv_tol_dual = snap.tv_tol_dual;
 
     // 10. Restore resolution
     state.resolution_enabled = snap.resolution_enabled;
