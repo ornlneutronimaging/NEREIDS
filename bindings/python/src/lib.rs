@@ -1299,8 +1299,8 @@ fn parse_constraints(
     isotope_names: &[String],
 ) -> PyResult<Option<ParameterConstraints>> {
     let dict = match dict {
-        Some(d) => d,
-        None => return Ok(None),
+        Some(d) if !d.is_empty() => d,
+        _ => return Ok(None),
     };
 
     let n = isotope_names.len();
@@ -1346,9 +1346,9 @@ fn parse_role(s: &str) -> Result<ParameterRole, String> {
     if s.eq_ignore_ascii_case("free") {
         return Ok(ParameterRole::Free);
     }
-    // Case-insensitive check for "fixed:" prefix, then parse the numeric tail
-    // from the original string to preserve the value.
-    if s.len() > 6 && s[..6].eq_ignore_ascii_case("fixed:") {
+    // Case-insensitive check for "fixed:" prefix using byte comparison
+    // (safe: "fixed:" is pure ASCII, so byte position 6 is always a char boundary).
+    if s.len() > 6 && s.as_bytes()[..6].eq_ignore_ascii_case(b"fixed:") {
         let rest = &s[6..];
         let val: f64 = rest
             .trim()

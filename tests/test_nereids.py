@@ -1283,6 +1283,33 @@ class TestConstraints:
         dmap = np.asarray(result.density_maps[0])
         np.testing.assert_allclose(dmap, fixed_val, atol=1e-10)
 
+    def test_unicode_constraint_value_raises(self, u238_data):
+        """Non-ASCII constraint value should raise ValueError, not panic."""
+        energies = np.linspace(1.0, 30.0, 50)
+        trans = np.ones((50, 2, 2))
+        unc = np.full_like(trans, 0.005)
+
+        with pytest.raises(ValueError, match="expected 'free' or 'fixed:VALUE'"):
+            nereids.spatial_map(
+                trans, unc, energies, [u238_data],
+                temperature_k=0.0,
+                constraints={"U-238": "\U0001f600\U0001f600"},  # emoji string
+            )
+
+    def test_empty_constraints_poisson_ok(self, u238_data):
+        """Empty constraints dict should be treated as None (no constraints)."""
+        energies = np.linspace(1.0, 30.0, 50)
+        trans = np.ones((50, 2, 2))
+        unc = np.full_like(trans, 0.005)
+
+        # Should NOT raise — empty dict is semantically identical to None.
+        result = nereids.spatial_map(
+            trans, unc, energies, [u238_data],
+            temperature_k=0.0, fitter="poisson",
+            constraints={},
+        )
+        assert result.n_total > 0
+
 
 # ===========================================================================
 # Noise utilities
