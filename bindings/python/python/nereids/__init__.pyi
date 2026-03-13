@@ -358,8 +358,34 @@ def spatial_map(
     max_iter: int = 100,
     fitter: str = "lm",
     roi: list[int] | None = None,
+    constraints: dict[str, str] | None = None,
 ) -> SpatialResult | SparseResult:
     """Run per-pixel fitting across a transmission image stack."""
+    ...
+
+def spatial_map_tv(
+    transmission: NDArray[np.float64],
+    uncertainty: NDArray[np.float64],
+    energies: NDArray[np.float64],
+    isotopes: list[ResonanceData],
+    tv_lambda: list[float] | float,
+    temperature_k: float = 300.0,
+    initial_densities: list[float] | None = None,
+    dead_pixels: NDArray[np.bool_] | None = None,
+    constraints: dict[str, str] | None = None,
+    flight_path_m: float | None = None,
+    delta_t_us: float | None = None,
+    delta_l_m: float | None = None,
+    resolution: TabulatedResolution | None = None,
+    delta_e_us: float | None = None,
+    max_iter: int = 100,
+    fitter: str = "lm",
+    tv_rho: float = 1.0,
+    tv_max_iter: int = 20,
+    tv_tol_primal: float = 1e-4,
+    tv_tol_dual: float = 1e-4,
+) -> SpatialResult:
+    """Run TV-ADMM regularized per-pixel fitting across a transmission image stack."""
     ...
 
 def fit_roi(
@@ -499,5 +525,39 @@ def detect_dead_pixels(
     NDArray[np.bool_]
         2D boolean mask with shape ``(height, width)``, where ``True`` marks
         a dead pixel (all-zero across the spectral axis).
+    """
+    ...
+
+def add_poisson_noise(
+    transmission: NDArray[np.float64],
+    n_photons: float,
+    seed: int,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Add Poisson shot noise to a 1D transmission spectrum.
+
+    Returns (noisy_transmission, uncertainty).
+    """
+    ...
+
+def add_gaussian_noise(
+    transmission: NDArray[np.float64],
+    sigma: float,
+    seed: int,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Add Gaussian noise to a 1D transmission spectrum.
+
+    Returns (noisy_transmission, uncertainty). All uncertainty values equal sigma.
+    """
+    ...
+
+def generate_noisy_cube(
+    transmission: NDArray[np.float64],
+    shape: tuple[int, int],
+    n_photons: float,
+    seed: int,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Generate a noisy 3D transmission cube from a 1D model spectrum.
+
+    Returns (noisy_cube, uncertainty_cube) with shape (n_energies, height, width).
     """
     ...

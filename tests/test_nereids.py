@@ -1007,3 +1007,315 @@ class TestTraceDetectability:
                 energies=energies,
                 i0=10000.0,
             )
+
+
+# ===========================================================================
+# TV-ADMM spatial regularization
+# ===========================================================================
+
+
+class TestSpatialMapTV:
+    """Tests for spatial_map_tv() with TV-ADMM regularization."""
+
+    def test_basic_tv(self, u238_data):
+        """TV-ADMM should return SpatialResult with correct shapes."""
+        energies = np.linspace(1.0, 30.0, 200)
+        true_density = 0.002
+        ny, nx = 3, 3
+
+        t_1d = np.asarray(
+            nereids.forward_model(energies, [(u238_data, true_density)])
+        )
+        trans = np.tile(t_1d[:, None, None], (1, ny, nx))
+        unc = np.full_like(trans, 0.005)
+
+        result = nereids.spatial_map_tv(
+            trans,
+            unc,
+            energies,
+            [u238_data],
+            tv_lambda=0.001,
+            temperature_k=0.0,
+            max_iter=50,
+            tv_max_iter=3,
+        )
+        assert hasattr(result, "density_maps")
+        assert hasattr(result, "uncertainty_maps")
+        assert hasattr(result, "chi_squared_map")
+        assert hasattr(result, "converged_map")
+        assert hasattr(result, "n_converged")
+        assert hasattr(result, "n_total")
+        assert hasattr(result, "isotope_names")
+
+        density_maps = result.density_maps
+        assert len(density_maps) == 1
+        dmap = np.asarray(density_maps[0])
+        assert dmap.shape == (ny, nx)
+        assert result.n_total == ny * nx
+
+    def test_tv_scalar_lambda(self, u238_data):
+        """Scalar tv_lambda should broadcast to all isotopes."""
+        energies = np.linspace(1.0, 30.0, 100)
+        t_1d = np.asarray(
+            nereids.forward_model(energies, [(u238_data, 0.001)])
+        )
+        trans = np.tile(t_1d[:, None, None], (1, 2, 2))
+        unc = np.full_like(trans, 0.005)
+
+        # scalar float — should work
+        result = nereids.spatial_map_tv(
+            trans, unc, energies, [u238_data],
+            tv_lambda=0.001, temperature_k=0.0, max_iter=20, tv_max_iter=2,
+        )
+        assert len(result.density_maps) == 1
+
+    def test_tv_list_lambda(self, u238_data):
+        """List tv_lambda should work when length matches isotopes."""
+        energies = np.linspace(1.0, 30.0, 100)
+        t_1d = np.asarray(
+            nereids.forward_model(energies, [(u238_data, 0.001)])
+        )
+        trans = np.tile(t_1d[:, None, None], (1, 2, 2))
+        unc = np.full_like(trans, 0.005)
+
+        result = nereids.spatial_map_tv(
+            trans, unc, energies, [u238_data],
+            tv_lambda=[0.001], temperature_k=0.0, max_iter=20, tv_max_iter=2,
+        )
+        assert len(result.density_maps) == 1
+
+    def test_tv_lambda_mismatch_raises(self, u238_data):
+        """Wrong-length tv_lambda list should raise ValueError."""
+        energies = np.linspace(1.0, 30.0, 50)
+        trans = np.ones((50, 2, 2))
+        unc = np.full_like(trans, 0.005)
+
+        with pytest.raises(ValueError, match="tv_lambda length"):
+            nereids.spatial_map_tv(
+                trans, unc, energies, [u238_data],
+                tv_lambda=[0.001, 0.002],  # 2 lambdas for 1 isotope
+                temperature_k=0.0,
+            )
+
+    def test_tv_negative_rho_raises(self, u238_data):
+        """Negative tv_rho should raise ValueError."""
+        energies = np.linspace(1.0, 30.0, 50)
+        trans = np.ones((50, 2, 2))
+        unc = np.full_like(trans, 0.005)
+
+        with pytest.raises(ValueError, match="rho"):
+            nereids.spatial_map_tv(
+                trans, unc, energies, [u238_data],
+                tv_lambda=0.001, tv_rho=-1.0, temperature_k=0.0,
+            )
+
+    def test_tv_denoises(self, u238_data):
+        """TV should reduce density variance on a noisy uniform image."""
+        energies = np.linspace(1.0, 30.0, 200)
+        true_density = 0.002
+        ny, nx = 4, 4
+
+        t_1d = np.asarray(
+            nereids.forward_model(energies, [(u238_data, true_density)])
+        )
+        # Generate noisy cube with moderate noise
+        noisy_cube, unc_cube = nereids.generate_noisy_cube(
+            t_1d, (ny, nx), n_photons=200.0, seed=42
+        )
+
+        # Vanilla spatial_map
+        vanilla = nereids.spatial_map(
+            noisy_cube, unc_cube, energies, [u238_data],
+            temperature_k=0.0, max_iter=50,
+        )
+        # TV-ADMM spatial_map with strong regularization
+        tv = nereids.spatial_map_tv(
+            noisy_cube, unc_cube, energies, [u238_data],
+            tv_lambda=0.1, temperature_k=0.0,
+            max_iter=50, tv_max_iter=10, tv_rho=1.0,
+        )
+
+        vanilla_map = np.asarray(vanilla.density_maps[0])
+        tv_map = np.asarray(tv.density_maps[0])
+
+        # TV should produce lower spatial variance on a uniform image
+        assert np.std(tv_map) < np.std(vanilla_map)
+
+    def test_tv_returns_spatial_result(self, u238_data):
+        """spatial_map_tv always returns SpatialResult, never SparseResult."""
+        energies = np.linspace(1.0, 30.0, 100)
+        t_1d = np.asarray(
+            nereids.forward_model(energies, [(u238_data, 0.001)])
+        )
+        trans = np.tile(t_1d[:, None, None], (1, 2, 2))
+        unc = np.full_like(trans, 0.005)
+
+        result = nereids.spatial_map_tv(
+            trans, unc, energies, [u238_data],
+            tv_lambda=0.001, temperature_k=0.0, max_iter=20, tv_max_iter=2,
+        )
+        r = repr(result)
+        assert "SpatialResult" in r
+
+
+# ===========================================================================
+# Constraints
+# ===========================================================================
+
+
+class TestConstraints:
+    """Tests for the constraints dict API."""
+
+    def test_fixed_density(self, u238_data):
+        """Fixed density should be returned exactly."""
+        energies = np.linspace(1.0, 30.0, 200)
+        true_density = 0.002
+        ny, nx = 2, 2
+
+        t_1d = np.asarray(
+            nereids.forward_model(energies, [(u238_data, true_density)])
+        )
+        trans = np.tile(t_1d[:, None, None], (1, ny, nx))
+        unc = np.full_like(trans, 0.005)
+
+        fixed_val = 0.003
+        result = nereids.spatial_map(
+            trans, unc, energies, [u238_data],
+            temperature_k=0.0, max_iter=50,
+            constraints={"U-238": f"fixed:{fixed_val}"},
+        )
+        dmap = np.asarray(result.density_maps[0])
+        np.testing.assert_allclose(dmap, fixed_val, atol=1e-10)
+
+    def test_unknown_isotope_raises(self, u238_data):
+        """Unknown isotope name in constraints should raise ValueError."""
+        energies = np.linspace(1.0, 30.0, 50)
+        trans = np.ones((50, 2, 2))
+        unc = np.full_like(trans, 0.005)
+
+        with pytest.raises(ValueError, match="unknown constraint key"):
+            nereids.spatial_map(
+                trans, unc, energies, [u238_data],
+                temperature_k=0.0,
+                constraints={"Pu-239": "free"},
+            )
+
+    def test_invalid_format_raises(self, u238_data):
+        """Malformed constraint string should raise ValueError."""
+        energies = np.linspace(1.0, 30.0, 50)
+        trans = np.ones((50, 2, 2))
+        unc = np.full_like(trans, 0.005)
+
+        with pytest.raises(ValueError, match="invalid constraint value"):
+            nereids.spatial_map(
+                trans, unc, energies, [u238_data],
+                temperature_k=0.0,
+                constraints={"U-238": "bounded:0:1"},
+            )
+
+    def test_constraints_with_tv(self, u238_data):
+        """Constraints should work in spatial_map_tv too."""
+        energies = np.linspace(1.0, 30.0, 200)
+        true_density = 0.002
+        ny, nx = 2, 2
+
+        t_1d = np.asarray(
+            nereids.forward_model(energies, [(u238_data, true_density)])
+        )
+        trans = np.tile(t_1d[:, None, None], (1, ny, nx))
+        unc = np.full_like(trans, 0.005)
+
+        fixed_val = 0.003
+        result = nereids.spatial_map_tv(
+            trans, unc, energies, [u238_data],
+            tv_lambda=0.001, temperature_k=0.0,
+            max_iter=50, tv_max_iter=2,
+            constraints={"U-238": f"fixed:{fixed_val}"},
+        )
+        dmap = np.asarray(result.density_maps[0])
+        np.testing.assert_allclose(dmap, fixed_val, atol=1e-10)
+
+    def test_constraints_poisson_raises(self, u238_data):
+        """Constraints with fitter='poisson' should raise ValueError."""
+        energies = np.linspace(1.0, 30.0, 50)
+        trans = np.ones((50, 2, 2))
+        unc = np.full_like(trans, 0.005)
+
+        with pytest.raises(ValueError, match="constraints are not supported"):
+            nereids.spatial_map(
+                trans, unc, energies, [u238_data],
+                temperature_k=0.0, fitter="poisson",
+                constraints={"U-238": "free"},
+            )
+
+
+# ===========================================================================
+# Noise utilities
+# ===========================================================================
+
+
+class TestNoiseUtilities:
+    """Tests for add_poisson_noise, add_gaussian_noise, generate_noisy_cube."""
+
+    def test_poisson_shape(self):
+        """Output shape should match input."""
+        t = np.array([0.8, 0.5, 0.2])
+        noisy, unc = nereids.add_poisson_noise(t, n_photons=1000.0, seed=42)
+        assert noisy.shape == t.shape
+        assert unc.shape == t.shape
+
+    def test_poisson_reproducibility(self):
+        """Same seed should produce identical output."""
+        t = np.array([0.9, 0.6, 0.3])
+        a1, u1 = nereids.add_poisson_noise(t, n_photons=500.0, seed=7)
+        a2, u2 = nereids.add_poisson_noise(t, n_photons=500.0, seed=7)
+        np.testing.assert_array_equal(a1, a2)
+        np.testing.assert_array_equal(u1, u2)
+
+    def test_poisson_different_seed(self):
+        """Different seeds should produce different output."""
+        t = np.array([0.9, 0.6, 0.3, 0.1, 0.05])
+        a1, _ = nereids.add_poisson_noise(t, n_photons=500.0, seed=1)
+        a2, _ = nereids.add_poisson_noise(t, n_photons=500.0, seed=2)
+        assert not np.array_equal(a1, a2)
+
+    def test_gaussian_shape(self):
+        """Output shape should match input."""
+        t = np.array([0.7, 0.5, 0.3])
+        noisy, unc = nereids.add_gaussian_noise(t, sigma=0.01, seed=42)
+        assert noisy.shape == t.shape
+        assert unc.shape == t.shape
+
+    def test_gaussian_uncertainty_is_sigma(self):
+        """All uncertainty values should equal sigma."""
+        t = np.array([0.9, 0.5, 0.1])
+        sigma = 0.02
+        _, unc = nereids.add_gaussian_noise(t, sigma=sigma, seed=123)
+        np.testing.assert_allclose(unc, sigma)
+
+    def test_noisy_cube_shape(self):
+        """Cube shape should be (n_energies, height, width)."""
+        t = np.array([0.8, 0.6, 0.4, 0.2])
+        cube, unc = nereids.generate_noisy_cube(t, shape=(3, 5), n_photons=1000.0, seed=0)
+        assert cube.shape == (4, 3, 5)
+        assert unc.shape == (4, 3, 5)
+
+    def test_noisy_cube_reproducibility(self):
+        """Same seed should produce identical cube."""
+        t = np.array([0.8, 0.6])
+        c1, u1 = nereids.generate_noisy_cube(t, shape=(2, 2), n_photons=500.0, seed=42)
+        c2, u2 = nereids.generate_noisy_cube(t, shape=(2, 2), n_photons=500.0, seed=42)
+        np.testing.assert_array_equal(c1, c2)
+        np.testing.assert_array_equal(u1, u2)
+
+    def test_poisson_zero_photons_raises(self):
+        """n_photons=0 should raise ValueError."""
+        t = np.array([0.5])
+        with pytest.raises(ValueError, match="n_photons"):
+            nereids.add_poisson_noise(t, n_photons=0.0, seed=0)
+
+    def test_gaussian_negative_sigma_raises(self):
+        """sigma < 0 should raise ValueError."""
+        t = np.array([0.5])
+        with pytest.raises(ValueError, match="sigma"):
+            nereids.add_gaussian_noise(t, sigma=-0.01, seed=0)

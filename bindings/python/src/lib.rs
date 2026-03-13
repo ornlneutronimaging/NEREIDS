@@ -30,6 +30,7 @@ use numpy::{
     PyUntypedArrayMethods,
 };
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 
 use nereids_core::elements;
 use nereids_core::types::Isotope;
@@ -50,8 +51,10 @@ use nereids_physics::resolution::{
 };
 use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
 use nereids_pipeline::detectability;
-use nereids_pipeline::pipeline::FitConfig;
+use nereids_pipeline::noise;
+use nereids_pipeline::pipeline::{FitConfig, ParameterConstraints, ParameterRole, SolverChoice};
 use nereids_pipeline::sparse::{SparseConfig, estimate_nuisance, sparse_reconstruct};
+use nereids_pipeline::tv_admm::TvAdmmConfig;
 
 /// Python wrapper for ENDF resonance data.
 ///
@@ -1286,6 +1289,69 @@ fn build_resolution(
     }
 }
 
+/// Parse a Python `dict[str, str]` into [`ParameterConstraints`].
+///
+/// Keys are isotope names (e.g. "U-238") or "temperature".
+/// Values are "free" or "fixed:VALUE".
+/// Unmentioned isotopes default to `Free`.
+fn parse_constraints(
+    dict: Option<&Bound<'_, PyDict>>,
+    isotope_names: &[String],
+) -> PyResult<Option<ParameterConstraints>> {
+    let dict = match dict {
+        Some(d) => d,
+        None => return Ok(None),
+    };
+
+    let n = isotope_names.len();
+    let mut densities = vec![ParameterRole::Free; n];
+    let mut temperature = ParameterRole::Free;
+
+    for (key, value) in dict.iter() {
+        let key_str: String = key.extract()?;
+        let val_str: String = value.extract()?;
+
+        let role = parse_role(&val_str).map_err(|msg| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "invalid constraint value '{}' for key '{}': {}",
+                val_str, key_str, msg,
+            ))
+        })?;
+
+        if key_str == "temperature" {
+            temperature = role;
+        } else if let Some(idx) = isotope_names.iter().position(|n| *n == key_str) {
+            densities[idx] = role;
+        } else {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown constraint key '{}'; valid keys are {:?} or 'temperature'",
+                key_str, isotope_names,
+            )));
+        }
+    }
+
+    Ok(Some(ParameterConstraints {
+        densities,
+        temperature,
+    }))
+}
+
+/// Parse a single constraint value string like "free" or "fixed:0.001".
+fn parse_role(s: &str) -> Result<ParameterRole, String> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("free") {
+        return Ok(ParameterRole::Free);
+    }
+    if let Some(rest) = s.strip_prefix("fixed:") {
+        let val: f64 = rest
+            .trim()
+            .parse()
+            .map_err(|_| format!("cannot parse '{}' as a float", rest.trim()))?;
+        return Ok(ParameterRole::Fixed(val));
+    }
+    Err("expected 'free' or 'fixed:VALUE'".to_string())
+}
+
 /// Apply Free Gas Model (FGM) Doppler broadening to a cross-section array.
 ///
 /// Convolves the input cross-sections with a Gaussian kernel whose width
@@ -1505,11 +1571,15 @@ fn py_apply_resolution<'py>(
 ///     fitter: 'lm' (default) for Gaussian χ² or 'poisson' for Poisson NLL.
 ///     roi: [y0, y1, x0, x1] region for Stage-1 nuisance estimation
 ///         (Poisson path only, default uses full image).
+///     constraints: Dict mapping isotope names to constraints (optional).
+///         Keys are isotope names (e.g. "U-238") or "temperature".
+///         Values are "free" or "fixed:VALUE" (e.g. "fixed:0.001").
+///         Only supported with fitter='lm'.
 ///
 /// Returns:
 ///     SpatialResult (fitter='lm') or SparseResult (fitter='poisson').
 #[pyfunction]
-#[pyo3(name = "spatial_map", signature = (transmission, uncertainty, energies, isotopes, temperature_k=300.0, initial_densities=None, dead_pixels=None, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, delta_e_us=None, max_iter=100, fitter="lm", roi=None))]
+#[pyo3(name = "spatial_map", signature = (transmission, uncertainty, energies, isotopes, temperature_k=300.0, initial_densities=None, dead_pixels=None, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, delta_e_us=None, max_iter=100, fitter="lm", roi=None, constraints=None))]
 fn py_spatial_map(
     py: Python<'_>,
     transmission: PyReadonlyArray3<f64>,
@@ -1527,6 +1597,7 @@ fn py_spatial_map(
     max_iter: usize,
     fitter: &str,
     roi: Option<[usize; 4]>,
+    constraints: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyAny>> {
     let e = energies.as_slice()?;
 
@@ -1592,6 +1663,8 @@ fn py_spatial_map(
 
     let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution, delta_e_us)?;
 
+    let parsed_constraints = parse_constraints(constraints, &isotope_names)?;
+
     match fitter {
         "lm" => {
             if roi.is_some() {
@@ -1599,7 +1672,7 @@ fn py_spatial_map(
                     "roi is only supported with fitter='poisson', not fitter='lm'",
                 ));
             }
-            let config = FitConfig::new(
+            let mut config = FitConfig::new(
                 e.to_vec(),
                 res_data,
                 isotope_names.clone(),
@@ -1612,6 +1685,12 @@ fn py_spatial_map(
                 },
             )
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+
+            if let Some(c) = parsed_constraints {
+                config = config
+                    .with_constraints(c)
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+            }
 
             // Clone arrays only after all validation passes.
             // The .to_owned() is necessary because py.detach() releases the GIL and
@@ -1662,6 +1741,12 @@ fn py_spatial_map(
         }
 
         "poisson" => {
+            if parsed_constraints.is_some() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "constraints are not supported with fitter='poisson' in spatial_map; \
+                     use spatial_map_tv for regularized fitting with constraints",
+                ));
+            }
             // Stage 1: estimate flux + background from open-beam (second arg).
             let sample = transmission.as_array().to_owned();
             let open_beam = uncertainty.as_array().to_owned();
@@ -1731,6 +1816,245 @@ fn py_spatial_map(
             other,
         ))),
     }
+}
+
+/// Per-pixel spatial mapping with TV-ADMM spatial regularization.
+///
+/// Produces spatially smooth density maps that preserve material boundaries.
+/// For each isotope independently, minimizes data-fidelity + TV penalty
+/// via the Alternating Direction Method of Multipliers (ADMM).
+///
+/// Args:
+///     transmission: 3D array (n_energies, height, width), normalised T ∈ [0,1].
+///     uncertainty: 3D array (n_energies, height, width), per-bin σ.
+///     energies: 1D numpy array of energy values in eV.
+///     isotopes: List of ResonanceData objects.
+///     tv_lambda: TV regularization strength. A single float (broadcast to all
+///         isotopes) or a list of floats (one per isotope).
+///     temperature_k: Sample temperature in Kelvin (default 300.0).
+///     initial_densities: Initial guesses for areal densities (optional).
+///     dead_pixels: 2D bool numpy array marking dead pixels (optional).
+///     constraints: Dict mapping isotope names to constraints (optional).
+///         Keys are isotope names (e.g. "U-238") or "temperature".
+///         Values are "free" or "fixed:VALUE" (e.g. "fixed:0.001").
+///     flight_path_m: Flight path for Gaussian resolution (optional).
+///     delta_t_us: Timing uncertainty for Gaussian resolution (optional).
+///     delta_l_m: Path length uncertainty for Gaussian resolution (optional).
+///     resolution: TabulatedResolution for tabulated broadening (optional).
+///     delta_e_us: Exponential tail parameter for Gaussian resolution (optional).
+///     max_iter: Maximum iterations per pixel for inner LM/Poisson fits (default 100).
+///     fitter: 'lm' (default) for Gaussian χ² or 'poisson' for Poisson NLL.
+///     tv_rho: ADMM penalty parameter (default 1.0).
+///     tv_max_iter: Maximum ADMM outer iterations (default 20).
+///     tv_tol_primal: Primal residual convergence tolerance (default 1e-4).
+///     tv_tol_dual: Dual residual convergence tolerance (default 1e-4).
+///
+/// Returns:
+///     SpatialResult with spatially regularized density maps.
+#[pyfunction]
+#[pyo3(name = "spatial_map_tv", signature = (
+    transmission, uncertainty, energies, isotopes, tv_lambda,
+    temperature_k=300.0, initial_densities=None, dead_pixels=None,
+    constraints=None,
+    flight_path_m=None, delta_t_us=None, delta_l_m=None,
+    resolution=None, delta_e_us=None,
+    max_iter=100, fitter="lm",
+    tv_rho=1.0, tv_max_iter=20, tv_tol_primal=1e-4, tv_tol_dual=1e-4,
+))]
+#[allow(clippy::too_many_arguments)]
+fn py_spatial_map_tv(
+    py: Python<'_>,
+    transmission: PyReadonlyArray3<f64>,
+    uncertainty: PyReadonlyArray3<f64>,
+    energies: PyReadonlyArray1<f64>,
+    isotopes: Vec<PyResonanceData>,
+    tv_lambda: Py<PyAny>,
+    temperature_k: f64,
+    initial_densities: Option<Vec<f64>>,
+    dead_pixels: Option<PyReadonlyArray2<bool>>,
+    constraints: Option<&Bound<'_, PyDict>>,
+    flight_path_m: Option<f64>,
+    delta_t_us: Option<f64>,
+    delta_l_m: Option<f64>,
+    resolution: Option<PyTabulatedResolution>,
+    delta_e_us: Option<f64>,
+    max_iter: usize,
+    fitter: &str,
+    tv_rho: f64,
+    tv_max_iter: usize,
+    tv_tol_primal: f64,
+    tv_tol_dual: f64,
+) -> PyResult<Py<PyAny>> {
+    let e = energies.as_slice()?;
+
+    if e.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "energies must not be empty",
+        ));
+    }
+
+    // Validate shapes using cheap PyReadonly views before cloning
+    let t_shape = transmission.shape();
+    let u_shape = uncertainty.shape();
+    if t_shape != u_shape {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "transmission shape {:?} must match uncertainty shape {:?}",
+            t_shape, u_shape,
+        )));
+    }
+    if e.len() != t_shape[0] {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "energies length ({}) must match spectral axis ({}) of transmission",
+            e.len(),
+            t_shape[0],
+        )));
+    }
+    if let Some(ref dead) = dead_pixels {
+        let d_shape = dead.shape();
+        if d_shape[0] != t_shape[1] || d_shape[1] != t_shape[2] {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "dead_pixels shape ({}, {}) must match spatial dimensions ({}, {}) of transmission",
+                d_shape[0], d_shape[1], t_shape[1], t_shape[2],
+            )));
+        }
+    }
+
+    if isotopes.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "isotopes list must not be empty",
+        ));
+    }
+
+    let n_isotopes = isotopes.len();
+    let isotope_names: Vec<String> = isotopes
+        .iter()
+        .map(|d| {
+            let sym = elements::element_symbol(d.inner.isotope.z()).unwrap_or("?");
+            format!("{}-{}", sym, d.inner.isotope.a())
+        })
+        .collect();
+    let res_data: Vec<ResonanceData> = isotopes
+        .into_iter()
+        .map(|d| Arc::unwrap_or_clone(d.inner))
+        .collect();
+
+    let init = initial_densities.unwrap_or_else(|| vec![0.001; n_isotopes]);
+    if init.len() != n_isotopes {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "initial_densities length ({}) must match isotopes length ({})",
+            init.len(),
+            n_isotopes,
+        )));
+    }
+
+    // Parse tv_lambda: accept scalar float (broadcast) or list of floats
+    let tv_lambda_bound = tv_lambda.bind(py);
+    let lambda_vec: Vec<f64> = if let Ok(scalar) = tv_lambda_bound.extract::<f64>() {
+        vec![scalar; n_isotopes]
+    } else if let Ok(list) = tv_lambda_bound.extract::<Vec<f64>>() {
+        if list.len() != n_isotopes {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "tv_lambda length ({}) must match isotopes length ({})",
+                list.len(),
+                n_isotopes,
+            )));
+        }
+        list
+    } else {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "tv_lambda must be a float or a list of floats",
+        ));
+    };
+
+    let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution, delta_e_us)?;
+
+    let parsed_constraints = parse_constraints(constraints, &isotope_names)?;
+
+    let mut config = FitConfig::new(
+        e.to_vec(),
+        res_data,
+        isotope_names.clone(),
+        temperature_k,
+        res_fn,
+        init,
+        LmConfig {
+            max_iter,
+            ..LmConfig::default()
+        },
+    )
+    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+
+    // Set solver choice
+    config = match fitter {
+        "lm" => config,
+        "poisson" => config.with_solver(SolverChoice::PoissonKL(PoissonConfig {
+            max_iter,
+            ..PoissonConfig::default()
+        })),
+        other => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "fitter must be 'lm' or 'poisson', got '{}'",
+                other,
+            )));
+        }
+    };
+
+    if let Some(c) = parsed_constraints {
+        config = config
+            .with_constraints(c)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    }
+
+    let tv_config = TvAdmmConfig {
+        lambda: lambda_vec,
+        rho: tv_rho,
+        max_outer_iter: tv_max_iter,
+        tol_primal: tv_tol_primal,
+        tol_dual: tv_tol_dual,
+    };
+
+    // Clone arrays only after all validation passes.
+    let trans = transmission.as_array().to_owned();
+    let unc = uncertainty.as_array().to_owned();
+    let dead = dead_pixels.map(|d| d.as_array().to_owned());
+
+    // Release the GIL for the heavy ADMM + per-pixel fitting.
+    let result = py.detach(move || {
+        nereids_pipeline::tv_admm::spatial_map_tv(
+            trans.view(),
+            unc.view(),
+            &config,
+            &tv_config,
+            dead.as_ref(),
+            None,
+            None,
+        )
+    });
+    let result = result.map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+
+    let shape = (
+        result.converged_map.shape()[0],
+        result.converged_map.shape()[1],
+    );
+    let py_result = PySpatialResult {
+        density_maps: result
+            .density_maps
+            .into_iter()
+            .map(|m| PyArray2::from_owned_array(py, m).unbind())
+            .collect(),
+        uncertainty_maps: result
+            .uncertainty_maps
+            .into_iter()
+            .map(|m| PyArray2::from_owned_array(py, m).unbind())
+            .collect(),
+        chi_squared_map: PyArray2::from_owned_array(py, result.chi_squared_map).unbind(),
+        converged_map: PyArray2::from_owned_array(py, result.converged_map).unbind(),
+        n_converged: result.n_converged,
+        n_total: result.n_total,
+        isotope_names: result.isotope_labels,
+        shape,
+    };
+    Py::new(py, py_result).map(|p| p.into_any())
 }
 
 /// Fit a single spectrum averaged over a region of interest.
@@ -2518,6 +2842,102 @@ fn detect_dead_pixels<'py>(
     Ok(PyArray2::from_owned_array(py, mask))
 }
 
+/// Add Poisson (shot) noise to a 1D transmission spectrum.
+///
+/// Models photon counting statistics: counts_i ~ Poisson(T_i × n_photons),
+/// T_noisy_i = counts_i / n_photons.
+///
+/// Args:
+///     transmission: 1D numpy array of transmission values.
+///     n_photons: Number of incident photons per bin (must be positive and finite).
+///     seed: Random seed for reproducibility.
+///
+/// Returns:
+///     Tuple of (noisy_transmission, uncertainty) as 1D numpy arrays.
+#[pyfunction]
+#[pyo3(name = "add_poisson_noise")]
+fn py_add_poisson_noise<'py>(
+    py: Python<'py>,
+    transmission: PyReadonlyArray1<f64>,
+    n_photons: f64,
+    seed: u64,
+) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
+    if !n_photons.is_finite() || n_photons <= 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "n_photons must be finite and positive",
+        ));
+    }
+    let data = transmission.as_slice()?;
+    let (noisy, unc) = noise::add_poisson_noise(data, n_photons, seed);
+    Ok((PyArray1::from_vec(py, noisy), PyArray1::from_vec(py, unc)))
+}
+
+/// Add Gaussian noise to a 1D transmission spectrum.
+///
+/// T_noisy_i = T_i + N(0, sigma).
+///
+/// Args:
+///     transmission: 1D numpy array of transmission values.
+///     sigma: Standard deviation of the Gaussian noise (must be positive and finite).
+///     seed: Random seed for reproducibility.
+///
+/// Returns:
+///     Tuple of (noisy_transmission, uncertainty) as 1D numpy arrays.
+///     All uncertainty values equal sigma.
+#[pyfunction]
+#[pyo3(name = "add_gaussian_noise")]
+fn py_add_gaussian_noise<'py>(
+    py: Python<'py>,
+    transmission: PyReadonlyArray1<f64>,
+    sigma: f64,
+    seed: u64,
+) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
+    if !sigma.is_finite() || sigma <= 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "sigma must be finite and positive",
+        ));
+    }
+    let data = transmission.as_slice()?;
+    let (noisy, unc) = noise::add_gaussian_noise(data, sigma, seed);
+    Ok((PyArray1::from_vec(py, noisy), PyArray1::from_vec(py, unc)))
+}
+
+/// Generate a noisy 3D transmission cube from a 1D model spectrum.
+///
+/// Each pixel (y, x) gets an independent Poisson noise realization with
+/// a deterministic per-pixel seed derived from the global seed.
+///
+/// Args:
+///     transmission: 1D numpy array of clean transmission values.
+///     shape: (height, width) tuple for the spatial dimensions.
+///     n_photons: Number of incident photons per bin (must be positive and finite).
+///     seed: Random seed for reproducibility.
+///
+/// Returns:
+///     Tuple of (noisy_cube, uncertainty_cube) as 3D numpy arrays
+///     with shape (n_energies, height, width).
+#[pyfunction]
+#[pyo3(name = "generate_noisy_cube")]
+fn py_generate_noisy_cube<'py>(
+    py: Python<'py>,
+    transmission: PyReadonlyArray1<f64>,
+    shape: (usize, usize),
+    n_photons: f64,
+    seed: u64,
+) -> PyResult<(Bound<'py, PyArray3<f64>>, Bound<'py, PyArray3<f64>>)> {
+    if !n_photons.is_finite() || n_photons <= 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "n_photons must be finite and positive",
+        ));
+    }
+    let data = transmission.as_slice()?;
+    let (cube, unc) = noise::generate_noisy_cube(data, shape, n_photons, seed);
+    Ok((
+        PyArray3::from_owned_array(py, cube),
+        PyArray3::from_owned_array(py, unc),
+    ))
+}
+
 /// NEREIDS Python module.
 #[pymodule]
 fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -2541,6 +2961,7 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(load_resolution, m)?)?;
     m.add_function(wrap_pyfunction!(py_apply_resolution, m)?)?;
     m.add_function(wrap_pyfunction!(py_spatial_map, m)?)?;
+    m.add_function(wrap_pyfunction!(py_spatial_map_tv, m)?)?;
     m.add_function(wrap_pyfunction!(py_fit_roi, m)?)?;
     m.add_function(wrap_pyfunction!(load_tiff_stack, m)?)?;
     m.add_function(wrap_pyfunction!(load_tiff_folder, m)?)?;
@@ -2555,5 +2976,8 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_trace_detectability_survey, m)?)?;
     m.add_function(wrap_pyfunction!(precompute_cross_sections, m)?)?;
     m.add_function(wrap_pyfunction!(detect_dead_pixels, m)?)?;
+    m.add_function(wrap_pyfunction!(py_add_poisson_noise, m)?)?;
+    m.add_function(wrap_pyfunction!(py_add_gaussian_noise, m)?)?;
+    m.add_function(wrap_pyfunction!(py_generate_noisy_cube, m)?)?;
     Ok(())
 }
