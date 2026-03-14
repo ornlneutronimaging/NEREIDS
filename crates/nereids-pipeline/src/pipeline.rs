@@ -465,6 +465,18 @@ impl FitConfig {
         );
         self.initial_densities = densities;
     }
+
+    /// Override the initial temperature (Kelvin) for warm-starting.
+    ///
+    /// # Panics
+    /// Panics if `temp` is not finite or is negative.
+    pub fn set_temperature_k(&mut self, temp: f64) {
+        assert!(
+            temp.is_finite() && temp >= 0.0,
+            "set_temperature_k: invalid temperature {temp}"
+        );
+        self.temperature_k = temp;
+    }
 }
 
 /// Result of fitting a single spectrum.
