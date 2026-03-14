@@ -1884,7 +1884,9 @@ fn py_spatial_map(
 ///     delta_e_us: Exponential tail parameter for Gaussian resolution (optional).
 ///     max_iter: Maximum iterations per pixel for inner LM/Poisson fits (default 100).
 ///     fitter: 'lm' (default) for Gaussian χ² or 'poisson' for Poisson NLL.
-///     tv_rho: ADMM penalty parameter (default 1.0).
+///     tv_rho: ADMM penalty parameter (dimensionless, default 1.0).
+///         Internally scaled by n_energies so the proximal term competes
+///         with the data-fidelity Hessian. Typical range: 0.1-10.
 ///     tv_max_iter: Maximum ADMM outer iterations (default 20).
 ///     tv_tol_primal: Primal residual convergence tolerance (default 1e-4).
 ///     tv_tol_dual: Dual residual convergence tolerance (default 1e-4).

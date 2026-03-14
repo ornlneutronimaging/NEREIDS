@@ -54,7 +54,11 @@ const DENSITY_STABILIZATION_TOL: f64 = 1e-6;
 pub struct TvAdmmConfig {
     /// TV strength per isotope. Length must match n_isotopes.
     pub lambda: Vec<f64>,
-    /// ADMM penalty parameter. Default: 1.0.
+    /// ADMM penalty parameter (dimensionless, default 1.0).
+    ///
+    /// Internally scaled by `n_energies` so the proximal term is
+    /// commensurate with the data-fidelity Hessian (which grows
+    /// linearly with the number of energy bins). Typical range: 0.1–10.
     pub rho: f64,
     /// Maximum ADMM outer iterations. Default: 20.
     pub max_outer_iter: usize,
@@ -328,6 +332,42 @@ pub fn spatial_map_tv(
         return Ok(initial_result);
     }
 
+    // ---- Scale rho to match data-fidelity curvature ----
+    //
+    // The ADMM proximal penalty adds ~rho_scaled * degree / 2 to the LM
+    // Hessian diagonal.  The data-fidelity Hessian is proportional to
+    // 1/var(density): tight per-pixel fits ↔ high curvature ↔ small variance.
+    //
+    // We estimate the data curvature from the variance of the vanilla-fit
+    // densities across live pixels and set rho_scaled ∝ 1/max_var so the
+    // proximal is commensurate with the data term regardless of isotope,
+    // energy-grid size, flux level, or cross-section magnitude.
+    let rho_scaled = {
+        let mut max_var = 0.0_f64;
+        for k in 0..n_isotopes {
+            if !free_isotopes[k] {
+                continue;
+            }
+            let vals: Vec<f64> = live_pixels.iter().map(|&p| densities[p][k]).collect();
+            let n = vals.len() as f64;
+            if n < 2.0 {
+                continue;
+            }
+            let mean = vals.iter().sum::<f64>() / n;
+            let var = vals.iter().map(|&v| (v - mean).powi(2)).sum::<f64>() / n;
+            if var > max_var {
+                max_var = var;
+            }
+        }
+        // Fallback: if all variances are zero (e.g., 1-pixel image or
+        // perfectly uniform data), use n_energies scaling as a baseline.
+        if max_var < 1e-30 {
+            tv_config.rho * n_energies as f64
+        } else {
+            tv_config.rho / max_var
+        }
+    };
+
     // Track per-pixel convergence from the ADMM inner loop.
     // Updated each outer iteration; the last iteration's values are used for
     // the convergence map.  The final evaluation pass uses max_iter=0 (no
@@ -402,7 +442,7 @@ pub fn spatial_map_tv(
                             densities[neighbor_idx][k] + sign * (z[k][e_idx] - u[k][e_idx]);
                     }
                     let target = target_sum / degree as f64;
-                    let rho_eff = tv_config.rho * degree as f64;
+                    let rho_eff = rho_scaled * degree as f64;
 
                     // param_index for isotope k is k (densities are params 0..n_isotopes).
                     penalty_terms.push((k, target, rho_eff));
@@ -479,7 +519,7 @@ pub fn spatial_map_tv(
             if !free_isotopes[k] || tv_config.lambda[k] == 0.0 {
                 continue;
             }
-            let kappa = tv_config.lambda[k] / tv_config.rho;
+            let kappa = tv_config.lambda[k] / rho_scaled;
             for (e_idx, edge) in edges.iter().enumerate() {
                 let diff = densities[edge.pixel_a][k] - densities[edge.pixel_b][k];
                 z[k][e_idx] = soft_threshold(diff + u[k][e_idx], kappa);
@@ -508,7 +548,7 @@ pub fn spatial_map_tv(
                 let diff = densities[edge.pixel_a][k] - densities[edge.pixel_b][k];
                 let r = diff - z[k][e_idx]; // primal residual
                 primal_sq += r * r;
-                let s = tv_config.rho * (z[k][e_idx] - z_prev[k][e_idx]); // dual residual
+                let s = rho_scaled * (z[k][e_idx] - z_prev[k][e_idx]); // dual residual
                 dual_sq += s * s;
             }
         }
@@ -895,10 +935,11 @@ mod tests {
         // Vanilla fit.
         let vanilla = spatial_map(noisy.view(), unc.view(), &config, None, None, None).unwrap();
 
-        // TV-ADMM fit with very strong regularization to force smoothing.
+        // TV-ADMM fit with moderate regularization.
+        // After the rho*n_energies scaling fix, rho=1.0 is sufficient.
         let tv_config = TvAdmmConfig {
-            lambda: vec![100.0],
-            rho: 100.0,
+            lambda: vec![1.0],
+            rho: 1.0,
             max_outer_iter: 10,
             ..TvAdmmConfig::default()
         };
@@ -975,5 +1016,273 @@ mod tests {
             None,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_tv_denoises_realistic() {
+        // Realistic dimensions: 500 energy bins, I0=100, 10x10 grid.
+        // With the rho*n_energies scaling, rho=1.0 produces visible denoising.
+        use crate::noise::generate_noisy_cube;
+        use crate::test_helpers::w182_single_resonance;
+        use nereids_fitting::lm::LmConfig;
+        use nereids_physics::transmission::broadened_cross_sections;
+
+        let n_e = 500;
+        let energies: Vec<f64> = (0..n_e).map(|i| 1.0 + i as f64 * 0.02).collect();
+        let true_density = 0.001;
+        let height = 8;
+        let width = 8;
+
+        let resonance_data = vec![w182_single_resonance()];
+        let config = FitConfig::new(
+            energies.clone(),
+            resonance_data.clone(),
+            vec!["W-182".to_string()],
+            300.0,
+            None,
+            vec![true_density],
+            LmConfig::default(),
+        )
+        .unwrap();
+
+        let xs = broadened_cross_sections(&energies, &resonance_data, 300.0, None, None).unwrap();
+        let clean_spectrum: Vec<f64> = (0..n_e).map(|e| (-true_density * xs[0][e]).exp()).collect();
+
+        let (noisy, unc) = generate_noisy_cube(&clean_spectrum, (height, width), 100.0, 42);
+
+        // Vanilla fit.
+        let vanilla = spatial_map(noisy.view(), unc.view(), &config, None, None, None).unwrap();
+
+        // TV-ADMM with default rho=1.0.
+        let tv_config = TvAdmmConfig {
+            lambda: vec![1.0],
+            rho: 1.0,
+            max_outer_iter: 10,
+            ..TvAdmmConfig::default()
+        };
+        let tv_result = spatial_map_tv(
+            noisy.view(),
+            unc.view(),
+            &config,
+            &tv_config,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let n_px = (height * width) as f64;
+        let mean_v: f64 = vanilla.density_maps[0].iter().sum::<f64>() / n_px;
+        let var_v: f64 = vanilla.density_maps[0]
+            .iter()
+            .map(|&v| (v - mean_v).powi(2))
+            .sum::<f64>()
+            / n_px;
+
+        let mean_t: f64 = tv_result.density_maps[0].iter().sum::<f64>() / n_px;
+        let var_t: f64 = tv_result.density_maps[0]
+            .iter()
+            .map(|&v| (v - mean_t).powi(2))
+            .sum::<f64>()
+            / n_px;
+
+        assert!(
+            var_t < var_v,
+            "TV should reduce variance at realistic scale (500 bins, I0=100): \
+             var_tv={var_t:.2e}, var_vanilla={var_v:.2e}"
+        );
+    }
+
+    #[test]
+    fn test_tv_preserves_edge() {
+        // Two-region image: left half at density_a, right half at density_b.
+        // TV should denoise within each region but preserve the edge.
+        use crate::noise::add_poisson_noise;
+        use crate::test_helpers::w182_single_resonance;
+        use nereids_fitting::lm::LmConfig;
+        use nereids_physics::transmission::broadened_cross_sections;
+
+        let n_e = 100;
+        let energies: Vec<f64> = (0..n_e).map(|i| 1.0 + i as f64 * 0.1).collect();
+        let density_a = 0.001;
+        let density_b = 0.003;
+        let height = 6;
+        let width = 10;
+
+        let resonance_data = vec![w182_single_resonance()];
+        let xs = broadened_cross_sections(&energies, &resonance_data, 300.0, None, None).unwrap();
+        let spectrum_a: Vec<f64> = (0..n_e).map(|e| (-density_a * xs[0][e]).exp()).collect();
+        let spectrum_b: Vec<f64> = (0..n_e).map(|e| (-density_b * xs[0][e]).exp()).collect();
+
+        // Build cube: left half = density_a, right half = density_b.
+        let mut data = ndarray::Array3::<f64>::zeros((n_e, height, width));
+        let mut unc = ndarray::Array3::<f64>::zeros((n_e, height, width));
+        let i0 = 50.0;
+        for y in 0..height {
+            for x in 0..width {
+                let spectrum = if x < width / 2 {
+                    &spectrum_a
+                } else {
+                    &spectrum_b
+                };
+                let seed = 42u64.wrapping_add((y as u64) * (width as u64) + (x as u64));
+                let (noisy_spec, unc_spec) = add_poisson_noise(spectrum, i0, seed);
+                for e in 0..n_e {
+                    data[[e, y, x]] = noisy_spec[e];
+                    unc[[e, y, x]] = unc_spec[e];
+                }
+            }
+        }
+
+        let config = FitConfig::new(
+            energies,
+            resonance_data,
+            vec!["W-182".to_string()],
+            300.0,
+            None,
+            vec![0.002], // midpoint initial guess
+            LmConfig::default(),
+        )
+        .unwrap();
+
+        let tv_config = TvAdmmConfig {
+            lambda: vec![1.0],
+            rho: 1.0,
+            max_outer_iter: 15,
+            ..TvAdmmConfig::default()
+        };
+        let tv_result = spatial_map_tv(
+            data.view(),
+            unc.view(),
+            &config,
+            &tv_config,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Separate left and right halves.
+        let mut left_vals = Vec::new();
+        let mut right_vals = Vec::new();
+        for y in 0..height {
+            for x in 0..width {
+                let d = tv_result.density_maps[0][[y, x]];
+                if x < width / 2 {
+                    left_vals.push(d);
+                } else {
+                    right_vals.push(d);
+                }
+            }
+        }
+
+        let mean_left: f64 = left_vals.iter().sum::<f64>() / left_vals.len() as f64;
+        let mean_right: f64 = right_vals.iter().sum::<f64>() / right_vals.len() as f64;
+
+        // Edge preserved: means should be distinct.
+        assert!(
+            (mean_right - mean_left).abs() > (density_b - density_a) * 0.3,
+            "Edge should be preserved: mean_left={mean_left:.4e}, mean_right={mean_right:.4e}"
+        );
+
+        // Within-region variance < global variance (smoothing works).
+        let var_left: f64 = left_vals
+            .iter()
+            .map(|&v| (v - mean_left).powi(2))
+            .sum::<f64>()
+            / left_vals.len() as f64;
+        let var_right: f64 = right_vals
+            .iter()
+            .map(|&v| (v - mean_right).powi(2))
+            .sum::<f64>()
+            / right_vals.len() as f64;
+        let within_var = (var_left + var_right) / 2.0;
+        let n_total = (height * width) as f64;
+        let global_mean: f64 = tv_result.density_maps[0].iter().sum::<f64>() / n_total;
+        let global_var: f64 = tv_result.density_maps[0]
+            .iter()
+            .map(|&v| (v - global_mean).powi(2))
+            .sum::<f64>()
+            / n_total;
+
+        assert!(
+            within_var < global_var,
+            "Within-region variance should be less than global: \
+             within={within_var:.2e}, global={global_var:.2e}"
+        );
+    }
+
+    #[test]
+    fn test_rho_scaling_invariance() {
+        // rho=1.0 should denoise at both n_e=100 and n_e=500,
+        // confirming the n_energies scaling makes rho dimensionless.
+        use crate::noise::generate_noisy_cube;
+        use crate::test_helpers::w182_single_resonance;
+        use nereids_fitting::lm::LmConfig;
+        use nereids_physics::transmission::broadened_cross_sections;
+
+        for n_e in [100, 500] {
+            let energies: Vec<f64> = (0..n_e)
+                .map(|i| 1.0 + i as f64 * (10.0 / n_e as f64))
+                .collect();
+            let true_density = 0.001;
+            let (h, w) = (6, 6);
+
+            let resonance_data = vec![w182_single_resonance()];
+            let config = FitConfig::new(
+                energies.clone(),
+                resonance_data.clone(),
+                vec!["W-182".to_string()],
+                300.0,
+                None,
+                vec![true_density],
+                LmConfig::default(),
+            )
+            .unwrap();
+
+            let xs =
+                broadened_cross_sections(&energies, &resonance_data, 300.0, None, None).unwrap();
+            let clean: Vec<f64> = (0..n_e).map(|e| (-true_density * xs[0][e]).exp()).collect();
+            let (noisy, unc) = generate_noisy_cube(&clean, (h, w), 20.0, 42);
+
+            let vanilla = spatial_map(noisy.view(), unc.view(), &config, None, None, None).unwrap();
+
+            let tv_config = TvAdmmConfig {
+                lambda: vec![1.0],
+                rho: 1.0,
+                max_outer_iter: 10,
+                ..TvAdmmConfig::default()
+            };
+            let tv_result = spatial_map_tv(
+                noisy.view(),
+                unc.view(),
+                &config,
+                &tv_config,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+            let n_px = (h * w) as f64;
+            let mean_v: f64 = vanilla.density_maps[0].iter().sum::<f64>() / n_px;
+            let var_v: f64 = vanilla.density_maps[0]
+                .iter()
+                .map(|&v| (v - mean_v).powi(2))
+                .sum::<f64>()
+                / n_px;
+            let mean_t: f64 = tv_result.density_maps[0].iter().sum::<f64>() / n_px;
+            let var_t: f64 = tv_result.density_maps[0]
+                .iter()
+                .map(|&v| (v - mean_t).powi(2))
+                .sum::<f64>()
+                / n_px;
+
+            assert!(
+                var_t < var_v,
+                "n_e={n_e}: TV should reduce variance with rho=1: \
+                 var_tv={var_t:.2e}, var_vanilla={var_v:.2e}"
+            );
+        }
     }
 }

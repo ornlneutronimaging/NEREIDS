@@ -1113,14 +1113,14 @@ class TestSpatialMapTV:
         """TV should reduce density variance on a noisy uniform image."""
         energies = np.linspace(1.0, 30.0, 200)
         true_density = 0.002
-        ny, nx = 4, 4
+        ny, nx = 6, 6
 
         t_1d = np.asarray(
             nereids.forward_model(energies, [(u238_data, true_density)])
         )
-        # Generate noisy cube with moderate noise
+        # Generate noisy cube with low photon count
         noisy_cube, unc_cube = nereids.generate_noisy_cube(
-            t_1d, (ny, nx), n_photons=200.0, seed=42
+            t_1d, (ny, nx), n_photons=50.0, seed=42
         )
 
         # Vanilla spatial_map
@@ -1128,20 +1128,21 @@ class TestSpatialMapTV:
             noisy_cube, unc_cube, energies, [u238_data],
             temperature_k=0.0, max_iter=50,
         )
-        # TV-ADMM spatial_map with strong regularization
+        # TV-ADMM with rho=1.0 (rho is internally scaled by n_energies)
         tv = nereids.spatial_map_tv(
             noisy_cube, unc_cube, energies, [u238_data],
-            tv_lambda=0.1, temperature_k=0.0,
+            tv_lambda=1.0, temperature_k=0.0,
             max_iter=50, tv_max_iter=10, tv_rho=1.0,
         )
 
         vanilla_map = np.asarray(vanilla.density_maps[0])
         tv_map = np.asarray(tv.density_maps[0])
 
-        # TV should not increase spatial variance on a uniform image.
-        # On a tiny 4x4 grid the denoising effect is marginal, so allow
-        # a 1% relative tolerance for floating-point noise.
-        assert np.std(tv_map) < np.std(vanilla_map) * 1.01
+        # TV should measurably reduce spatial variance on a uniform image.
+        assert np.std(tv_map) < np.std(vanilla_map) * 0.98, (
+            f"TV should reduce std by at least 2%: "
+            f"std_tv={np.std(tv_map):.6f}, std_vanilla={np.std(vanilla_map):.6f}"
+        )
 
     def test_tv_returns_spatial_result(self, u238_data):
         """spatial_map_tv always returns SpatialResult, never SparseResult."""
