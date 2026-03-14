@@ -899,3 +899,37 @@ pub(crate) fn build_fit_line(
         .collect();
     Some(Line::new("Fit", fit_points).width(2.0))
 }
+
+// ---------------------------------------------------------------------------
+// Constraint toggle (lock/free)
+// ---------------------------------------------------------------------------
+
+/// Lock/free toggle for a parameter. Returns `true` if clicked (state changed).
+///
+/// Renders as a colored pill button: orange "Fixed" or green "Free".
+/// The filled background makes it visually obvious that it's interactive.
+pub fn constraint_toggle(ui: &mut egui::Ui, fixed: &mut bool) -> bool {
+    let (label, hint, fg, bg) = if *fixed {
+        (
+            "Fixed",
+            "Click to make this parameter free (optimized during fitting)",
+            Color32::WHITE,
+            semantic::ORANGE,
+        )
+    } else {
+        (
+            "Free",
+            "Click to fix this parameter (held constant during fitting)",
+            Color32::WHITE,
+            semantic::GREEN,
+        )
+    };
+    let button = egui::Button::new(RichText::new(label).size(10.0).color(fg).strong())
+        .fill(bg)
+        .corner_radius(CornerRadius::same(8));
+    let resp = ui.add(button).on_hover_text(hint);
+    if resp.clicked() {
+        *fixed = !*fixed;
+    }
+    resp.clicked()
+}

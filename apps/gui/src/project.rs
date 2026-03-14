@@ -87,12 +87,14 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
     let mut isotope_symbol = Vec::with_capacity(n_iso);
     let mut isotope_density = Vec::with_capacity(n_iso);
     let mut isotope_enabled = Vec::with_capacity(n_iso);
+    let mut isotope_fixed = Vec::with_capacity(n_iso);
     for entry in &state.isotope_entries {
         isotope_z.push(entry.z);
         isotope_a.push(entry.a);
         isotope_symbol.push(entry.symbol.clone());
         isotope_density.push(entry.initial_density);
         isotope_enabled.push(entry.enabled);
+        isotope_fixed.push(entry.fixed);
     }
 
     // ENDF cache: collect all resonance_data from isotope entries
@@ -215,10 +217,21 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         isotope_symbol,
         isotope_density,
         isotope_enabled,
+        isotope_fixed,
+        regularization_method: match state.regularization_method {
+            crate::state::RegularizationMethod::None => "none".into(),
+            crate::state::RegularizationMethod::TotalVariation => "tv".into(),
+        },
+        tv_lambda: state.tv_lambda,
+        tv_rho: state.tv_rho,
+        tv_max_outer_iter: state.tv_max_outer_iter.min(u32::MAX as usize) as u32,
+        tv_tol_primal: state.tv_tol_primal,
+        tv_tol_dual: state.tv_tol_dual,
         solver_method: solver_method.into(),
         max_iter: state.lm_config.max_iter.min(u32::MAX as usize) as u32,
         temperature_k: state.temperature_k,
         fit_temperature: state.fit_temperature,
+        fixed_temperature: state.fixed_temperature,
         resolution_enabled: state.resolution_enabled,
         resolution_kind: resolution_kind.into(),
         delta_t_us,
@@ -690,6 +703,7 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
                 resonance_data: rd,
                 enabled: snap.isotope_enabled.get(i).copied().unwrap_or(true),
                 endf_status: status,
+                fixed: snap.isotope_fixed.get(i).copied().unwrap_or(false),
             }
         })
         .collect();
@@ -702,6 +716,18 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
     state.lm_config.max_iter = snap.max_iter as usize;
     state.temperature_k = snap.temperature_k;
     state.fit_temperature = snap.fit_temperature;
+    state.fixed_temperature = snap.fixed_temperature;
+
+    // 9b. Restore regularization
+    state.regularization_method = match snap.regularization_method.as_str() {
+        "tv" => crate::state::RegularizationMethod::TotalVariation,
+        _ => crate::state::RegularizationMethod::None,
+    };
+    state.tv_lambda = snap.tv_lambda;
+    state.tv_rho = snap.tv_rho;
+    state.tv_max_outer_iter = snap.tv_max_outer_iter as usize;
+    state.tv_tol_primal = snap.tv_tol_primal;
+    state.tv_tol_dual = snap.tv_tol_dual;
 
     // 10. Restore resolution
     state.resolution_enabled = snap.resolution_enabled;
@@ -845,6 +871,7 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
             }),
             n_converged: snap.n_converged.unwrap_or(0),
             n_total: snap.n_total.unwrap_or(0),
+            admm_info: None,
         };
         state.init_tile_display(n_maps);
         state.spatial_result = Some(result);

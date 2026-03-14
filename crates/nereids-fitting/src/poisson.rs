@@ -641,6 +641,7 @@ pub fn poisson_fit(
 
         // Check gradient norm for convergence
         let grad_norm: f64 = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
+
         if grad_norm < config.tol_param {
             converged = true;
             break;
@@ -674,7 +675,9 @@ pub fn poisson_fit(
             &mut trial_free_buf,
             proximal,
         ) {
-            Some(new_nll) => nll = new_nll,
+            Some(new_nll) => {
+                nll = new_nll;
+            }
             None => {
                 // Can't improve from this point; stop without claiming convergence.
                 // (params already restored by backtracking_line_search)
@@ -921,6 +924,7 @@ pub fn poisson_fit_analytic(
 
         // Check gradient norm for convergence
         let grad_norm: f64 = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
+
         if grad_norm < config.tol_param {
             converged = true;
             break;
@@ -1024,7 +1028,9 @@ pub fn poisson_fit_analytic(
             &mut trial_free_buf,
             proximal,
         ) {
-            Some(new_nll) => nll = new_nll,
+            Some(new_nll) => {
+                nll = new_nll;
+            }
             None => {
                 // (params already restored by backtracking_line_search)
                 break;

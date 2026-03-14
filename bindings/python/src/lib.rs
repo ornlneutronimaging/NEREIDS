@@ -313,6 +313,11 @@ struct PySpatialResult {
     n_total: usize,
     isotope_names: Vec<String>,
     shape: (usize, usize),
+    // ADMM convergence info (None for vanilla spatial_map).
+    admm_outer_iterations: Option<usize>,
+    admm_primal_residual: Option<f64>,
+    admm_dual_residual: Option<f64>,
+    admm_converged: Option<bool>,
 }
 
 #[pymethods]
@@ -363,6 +368,30 @@ impl PySpatialResult {
     #[getter]
     fn isotope_names(&self) -> Vec<String> {
         self.isotope_names.clone()
+    }
+
+    /// Number of ADMM outer iterations performed (None for vanilla spatial_map).
+    #[getter]
+    fn admm_outer_iterations(&self) -> Option<usize> {
+        self.admm_outer_iterations
+    }
+
+    /// Final ADMM primal residual norm (None for vanilla spatial_map).
+    #[getter]
+    fn admm_primal_residual(&self) -> Option<f64> {
+        self.admm_primal_residual
+    }
+
+    /// Final ADMM dual residual norm (None for vanilla spatial_map).
+    #[getter]
+    fn admm_dual_residual(&self) -> Option<f64> {
+        self.admm_dual_residual
+    }
+
+    /// Whether ADMM converged before reaching max_outer_iter (None for vanilla).
+    #[getter]
+    fn admm_converged(&self) -> Option<bool> {
+        self.admm_converged
     }
 
     fn __repr__(&self) -> String {
@@ -1743,6 +1772,10 @@ fn py_spatial_map(
                 n_total: result.n_total,
                 isotope_names: result.isotope_labels,
                 shape,
+                admm_outer_iterations: result.admm_info.as_ref().map(|a| a.outer_iterations),
+                admm_primal_residual: result.admm_info.as_ref().map(|a| a.primal_residual),
+                admm_dual_residual: result.admm_info.as_ref().map(|a| a.dual_residual),
+                admm_converged: result.admm_info.as_ref().map(|a| a.admm_converged),
             };
             Py::new(py, py_result).map(|p| p.into_any())
         }
@@ -2055,6 +2088,10 @@ fn py_spatial_map_tv(
         n_total: result.n_total,
         isotope_names: result.isotope_labels,
         shape,
+        admm_outer_iterations: result.admm_info.as_ref().map(|a| a.outer_iterations),
+        admm_primal_residual: result.admm_info.as_ref().map(|a| a.primal_residual),
+        admm_dual_residual: result.admm_info.as_ref().map(|a| a.dual_residual),
+        admm_converged: result.admm_info.as_ref().map(|a| a.admm_converged),
     };
     Py::new(py, py_result).map(|p| p.into_any())
 }
