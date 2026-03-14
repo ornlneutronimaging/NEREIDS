@@ -34,7 +34,7 @@ use nereids_fitting::proximal::ProximalPenalty;
 
 use crate::error::PipelineError;
 use crate::pipeline::{FitConfig, ParameterRole, SolverChoice, fit_spectrum};
-use crate::spatial::{SpatialResult, precompute_config, spatial_map};
+use crate::spatial::{AdmmConvergenceInfo, SpatialResult, precompute_config, spatial_map};
 
 /// Configuration for TV-ADMM spatial regularization.
 #[derive(Debug, Clone)]
@@ -305,11 +305,30 @@ pub fn spatial_map_tv(
     // track convergence from the inner loop where actual fitting happens.
     let mut pixel_converged = vec![false; n_pixels];
 
+    /// Relative density change threshold for ADMM-level convergence.
+    ///
+    /// When per-pixel densities change by less than this between ADMM
+    /// iterations, the pixel is considered converged at the ADMM level.
+    /// This is a fallback for inner solvers (particularly Poisson FD) that
+    /// may fail to declare convergence near the warm-started optimum due
+    /// to FD gradient noise.
+    const DENSITY_STABILIZATION_TOL: f64 = 1e-6;
+
+    // Track ADMM convergence metrics for reporting.
+    let mut admm_outer_iterations = 0usize;
+    let mut last_primal_norm = f64::INFINITY;
+    let mut last_dual_norm = f64::INFINITY;
+    let mut admm_converged = false;
+
     // ---- ADMM outer loop ----
     for _outer in 0..tv_config.max_outer_iter {
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
             return Err(PipelineError::Cancelled);
         }
+        admm_outer_iterations += 1;
+
+        // Snapshot densities before n-update for stabilization check.
+        let prev_densities: Vec<Vec<f64>> = densities.clone();
 
         // ---- n-update: per-pixel fit with proximal penalty ----
         //
@@ -395,9 +414,19 @@ pub fn spatial_map_tv(
             .collect();
 
         // Update densities and convergence from pixel results.
-        for (p, new_densities, converged) in &pixel_results {
+        // ADMM-level density stabilization: if densities stopped changing
+        // between iterations, the pixel is converged even if the inner
+        // solver didn't declare it (common with warm-started Poisson FD).
+        for (p, new_densities, inner_converged) in &pixel_results {
+            let density_stable = _outer > 0
+                && new_densities
+                    .iter()
+                    .zip(prev_densities[*p].iter())
+                    .all(|(new, old)| {
+                        (new - old).abs() <= DENSITY_STABILIZATION_TOL * (old.abs() + 1e-30)
+                    });
             densities[*p] = new_densities.clone();
-            pixel_converged[*p] = *converged;
+            pixel_converged[*p] = *inner_converged || density_stable;
         }
 
         // ---- z-update: soft-thresholding per edge per isotope ----
@@ -439,10 +468,11 @@ pub fn spatial_map_tv(
                 dual_sq += s * s;
             }
         }
-        let primal_norm = primal_sq.sqrt();
-        let dual_norm = dual_sq.sqrt();
+        last_primal_norm = primal_sq.sqrt();
+        last_dual_norm = dual_sq.sqrt();
 
-        if primal_norm < tv_config.tol_primal && dual_norm < tv_config.tol_dual {
+        if last_primal_norm < tv_config.tol_primal && last_dual_norm < tv_config.tol_dual {
+            admm_converged = true;
             break;
         }
     }
@@ -565,6 +595,12 @@ pub fn spatial_map_tv(
         isotope_labels,
         n_converged,
         n_total: live_pixels.len(),
+        admm_info: Some(AdmmConvergenceInfo {
+            outer_iterations: admm_outer_iterations,
+            primal_residual: last_primal_norm,
+            dual_residual: last_dual_norm,
+            admm_converged,
+        }),
     })
 }
 

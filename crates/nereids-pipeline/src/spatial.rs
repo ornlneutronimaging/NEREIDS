@@ -63,6 +63,19 @@ pub(crate) fn precompute_config(
     }
 }
 
+/// ADMM convergence diagnostics for TV-regularized spatial maps.
+#[derive(Debug)]
+pub struct AdmmConvergenceInfo {
+    /// Number of ADMM outer iterations actually performed.
+    pub outer_iterations: usize,
+    /// Final primal residual norm (constraint violation).
+    pub primal_residual: f64,
+    /// Final dual residual norm (dual variable change).
+    pub dual_residual: f64,
+    /// Whether ADMM converged before reaching `max_outer_iter`.
+    pub admm_converged: bool,
+}
+
 /// Result of spatial mapping over a 2D image.
 #[derive(Debug)]
 pub struct SpatialResult {
@@ -85,6 +98,8 @@ pub struct SpatialResult {
     pub n_converged: usize,
     /// Total number of pixels fitted.
     pub n_total: usize,
+    /// ADMM convergence info (only present for TV-regularized runs).
+    pub admm_info: Option<AdmmConvergenceInfo>,
 }
 
 /// Run per-pixel fitting across a transmission image stack.
@@ -192,6 +207,7 @@ pub fn spatial_map(
         isotope_labels: isotope_labels.clone(),
         n_converged: 0,
         n_total: 0,
+        admm_info: None,
     };
     if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
         return Err(PipelineError::Cancelled);
@@ -299,6 +315,7 @@ pub fn spatial_map(
         isotope_labels,
         n_converged,
         n_total: results.len(),
+        admm_info: None,
     })
 }
 

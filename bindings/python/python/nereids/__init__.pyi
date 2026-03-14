@@ -146,6 +146,26 @@ class SpatialResult:
         """Isotope names."""
         ...
 
+    @property
+    def admm_outer_iterations(self) -> int | None:
+        """Number of ADMM outer iterations performed (None for vanilla spatial_map)."""
+        ...
+
+    @property
+    def admm_primal_residual(self) -> float | None:
+        """Final ADMM primal residual norm (None for vanilla spatial_map)."""
+        ...
+
+    @property
+    def admm_dual_residual(self) -> float | None:
+        """Final ADMM dual residual norm (None for vanilla spatial_map)."""
+        ...
+
+    @property
+    def admm_converged(self) -> bool | None:
+        """Whether ADMM converged before reaching max_outer_iter (None for vanilla)."""
+        ...
+
 class SparseResult:
     """Result of per-pixel sparse/Poisson fitting."""
 

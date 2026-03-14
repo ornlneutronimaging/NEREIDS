@@ -493,6 +493,23 @@ pub struct SpectrumFitResult {
 ///
 /// Both solvers use the same `FitModel` interface. The Poisson result is
 /// mapped to `LmResult` so the caller can treat all solvers uniformly.
+/// Context for routing Poisson fits through the analytic gradient solver.
+///
+/// When provided alongside `SolverChoice::PoissonKL`, `dispatch_solver` uses
+/// `poisson_fit_analytic` (exact gradients + Fisher preconditioning) instead of
+/// `poisson_fit` (finite-difference gradients).  This eliminates FD noise near
+/// the optimum, which is critical for ADMM warm-started inner fits where the
+/// true gradient is smaller than the FD noise floor.
+struct AnalyticPoissonCtx<'a> {
+    /// Incident flux Phi(E).  For transmission-space fitting, all 1.0.
+    flux: &'a [f64],
+    /// Precomputed broadened cross-sections, one `Vec<f64>` per isotope.
+    cross_sections: &'a [Vec<f64>],
+    /// Maps isotope index k → parameter index in the parameter vector.
+    density_indices: &'a [usize],
+}
+
+#[allow(clippy::too_many_arguments)]
 fn dispatch_solver(
     model: &dyn FitModel,
     measured_t: &[f64],
@@ -501,6 +518,7 @@ fn dispatch_solver(
     solver: &SolverChoice,
     lm_config: &LmConfig,
     proximal: Option<&ProximalPenalty>,
+    analytic_ctx: Option<&AnalyticPoissonCtx<'_>>,
 ) -> Result<LmResult, PipelineError> {
     match solver {
         SolverChoice::LevenbergMarquardt => {
@@ -522,7 +540,25 @@ fn dispatch_solver(
             }
         }
         SolverChoice::PoissonKL(poisson_config) => {
-            let pr = poisson::poisson_fit(model, measured_t, params, poisson_config, proximal)?;
+            let pr = if let Some(ctx) = analytic_ctx {
+                // Analytic path: exact gradients + Fisher preconditioning.
+                // Eliminates FD noise that causes line search failure near the
+                // warm-started optimum (ADMM inner fits).
+                poisson::poisson_fit_analytic(
+                    model,
+                    measured_t,
+                    ctx.flux,
+                    ctx.cross_sections,
+                    ctx.density_indices,
+                    params,
+                    poisson_config,
+                    None, // no temperature context (density-only)
+                    proximal,
+                )?
+            } else {
+                // FD path (original, for single-spectrum without precomputed XS).
+                poisson::poisson_fit(model, measured_t, params, poisson_config, proximal)?
+            };
             let n_free = params.n_free();
             let dof = measured_t.len().saturating_sub(n_free).max(1);
             // Compute Pearson chi-squared for display consistency with LM solver.
@@ -661,9 +697,25 @@ pub fn fit_spectrum(
                     )));
                 }
             }
+            let idx_buf: Vec<usize> = (0..n_isotopes).collect();
             let model = PrecomputedTransmissionModel {
                 cross_sections: xs.clone(),
-                density_indices: Arc::new((0..n_isotopes).collect()),
+                density_indices: Arc::new(idx_buf.clone()),
+            };
+            // When the solver is PoissonKL and precomputed cross-sections are
+            // available, use the analytic gradient solver.  This eliminates
+            // FD gradient noise that causes convergence failure in warm-started
+            // ADMM inner fits.
+            let flux_buf;
+            let analytic_ctx = if matches!(config.solver(), SolverChoice::PoissonKL(_)) {
+                flux_buf = vec![1.0f64; config.energies().len()];
+                Some(AnalyticPoissonCtx {
+                    flux: &flux_buf,
+                    cross_sections: xs,
+                    density_indices: &idx_buf,
+                })
+            } else {
+                None
             };
             dispatch_solver(
                 &model,
@@ -673,6 +725,7 @@ pub fn fit_spectrum(
                 config.solver(),
                 &lm_config,
                 config.proximal_penalty(),
+                analytic_ctx.as_ref(),
             )?
         } else {
             let instrument = config
@@ -696,6 +749,7 @@ pub fn fit_spectrum(
                 config.solver(),
                 &lm_config,
                 config.proximal_penalty(),
+                None,
             )?
         }
     } else {
@@ -728,6 +782,7 @@ pub fn fit_spectrum(
                 config.solver(),
                 &lm_config,
                 config.proximal_penalty(),
+                None,
             )?,
             SolverChoice::PoissonKL(poisson_config) => {
                 // The basic poisson_fit uses finite-difference gradient descent,
