@@ -832,7 +832,7 @@ fn build_fit_config(state: &AppState) -> Result<FitConfig, String> {
         ));
     }
 
-    if state.fit_temperature && !state.fixed_temperature {
+    if state.fit_temperature {
         config = config
             .with_fit_temperature(true)
             .map_err(|e| format!("FitConfig temperature error: {e}"))?;
