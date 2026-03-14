@@ -586,9 +586,9 @@ pub fn spatial_map_tv(
         .map(|_| Array2::from_elem((height, width), f64::NAN))
         .collect();
     let mut chi_squared_map = Array2::from_elem((height, width), f64::NAN);
-    // Use per-pixel LM convergence from the final evaluation, not the global
-    // ADMM convergence flag.  This gives users the same granularity as the
-    // vanilla spatial_map path and avoids the all-or-nothing convergence report.
+    // Filled from `pixel_converged` tracked during the last ADMM inner
+    // iteration (not the final evaluation pass, which uses max_iter=0
+    // and always reports converged=false).
     let mut converged_map = Array2::from_elem((height, width), false);
     let mut temperature_map: Option<Array2<f64>> = if config.fit_temperature() {
         Some(Array2::from_elem((height, width), f64::NAN))

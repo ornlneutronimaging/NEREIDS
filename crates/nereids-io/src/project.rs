@@ -1730,6 +1730,7 @@ mod tests {
         assert_eq!(loaded.max_iter, snap.max_iter);
         assert!((loaded.temperature_k - snap.temperature_k).abs() < 1e-10);
         assert_eq!(loaded.fit_temperature, snap.fit_temperature);
+        assert_eq!(loaded.fixed_temperature, snap.fixed_temperature);
         assert_eq!(loaded.resolution_enabled, snap.resolution_enabled);
         assert_eq!(loaded.resolution_kind, snap.resolution_kind);
         assert_eq!(loaded.endf_library, snap.endf_library);
@@ -1915,6 +1916,52 @@ mod tests {
         assert_eq!(loaded.tv_max_outer_iter, 30);
         assert!((loaded.tv_tol_primal - 1e-5).abs() < 1e-12);
         assert!((loaded.tv_tol_dual - 1e-3).abs() < 1e-12);
+    }
+
+    /// Combined round-trip for all TV-ADMM / fixed-density fields together.
+    #[test]
+    fn test_roundtrip_new_fields_combined() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt_new_fields.nrd.h5");
+        let mut snap = minimal_snapshot();
+
+        // Isotope arrays with fixed flags
+        snap.isotope_z = vec![74, 26, 92];
+        snap.isotope_a = vec![182, 56, 238];
+        snap.isotope_symbol = vec!["W-182".into(), "Fe-56".into(), "U-238".into()];
+        snap.isotope_density = vec![0.001, 0.002, 0.003];
+        snap.isotope_enabled = vec![true, true, false];
+        snap.isotope_fixed = vec![true, false, true];
+
+        // Regularization
+        snap.regularization_method = "tv".into();
+        snap.tv_lambda = 3.0;
+        snap.tv_rho = 0.7;
+        snap.tv_max_outer_iter = 50;
+        snap.tv_tol_primal = 2e-5;
+        snap.tv_tol_dual = 3e-4;
+
+        // Solver with fixed_temperature
+        snap.fixed_temperature = true;
+        snap.temperature_k = 400.0;
+
+        save_project(&path, &snap).unwrap();
+        let loaded = load_project(&path).unwrap();
+
+        // Isotope fixed preserved
+        assert_eq!(loaded.isotope_fixed, vec![true, false, true]);
+
+        // Regularization preserved
+        assert_eq!(loaded.regularization_method, "tv");
+        assert!((loaded.tv_lambda - 3.0).abs() < 1e-10);
+        assert!((loaded.tv_rho - 0.7).abs() < 1e-10);
+        assert_eq!(loaded.tv_max_outer_iter, 50);
+        assert!((loaded.tv_tol_primal - 2e-5).abs() < 1e-12);
+        assert!((loaded.tv_tol_dual - 3e-4).abs() < 1e-12);
+
+        // fixed_temperature preserved
+        assert!(loaded.fixed_temperature);
+        assert!((loaded.temperature_k - 400.0).abs() < 1e-10);
     }
 
     #[test]
