@@ -64,7 +64,7 @@ pub(crate) fn precompute_config(
 }
 
 /// ADMM convergence diagnostics for TV-regularized spatial maps.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AdmmConvergenceInfo {
     /// Number of ADMM outer iterations actually performed.
     pub outer_iterations: usize,

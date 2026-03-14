@@ -36,6 +36,15 @@ use crate::error::PipelineError;
 use crate::pipeline::{FitConfig, ParameterRole, SolverChoice, fit_spectrum};
 use crate::spatial::{AdmmConvergenceInfo, SpatialResult, precompute_config, spatial_map};
 
+/// Relative density change threshold for ADMM-level convergence.
+///
+/// When per-pixel densities change by less than this between ADMM
+/// iterations, the pixel is considered converged at the ADMM level.
+/// This is a fallback for inner solvers (particularly Poisson FD) that
+/// may fail to declare convergence near the warm-started optimum due
+/// to FD gradient noise.
+const DENSITY_STABILIZATION_TOL: f64 = 1e-6;
+
 /// Configuration for TV-ADMM spatial regularization.
 #[derive(Debug, Clone)]
 pub struct TvAdmmConfig {
@@ -305,15 +314,6 @@ pub fn spatial_map_tv(
     // track convergence from the inner loop where actual fitting happens.
     let mut pixel_converged = vec![false; n_pixels];
 
-    /// Relative density change threshold for ADMM-level convergence.
-    ///
-    /// When per-pixel densities change by less than this between ADMM
-    /// iterations, the pixel is considered converged at the ADMM level.
-    /// This is a fallback for inner solvers (particularly Poisson FD) that
-    /// may fail to declare convergence near the warm-started optimum due
-    /// to FD gradient noise.
-    const DENSITY_STABILIZATION_TOL: f64 = 1e-6;
-
     // Track ADMM convergence metrics for reporting.
     let mut admm_outer_iterations = 0usize;
     let mut last_primal_norm = f64::INFINITY;
@@ -339,7 +339,8 @@ pub fn spatial_map_tv(
         // The proximal penalty is:
         //   (rho * deg(p) / 2) * (n_k - target_k(p))²
 
-        let pixel_results: Vec<(usize, Vec<f64>, bool)> = live_pixels
+        // Tuple: (pixel_index, densities, inner_converged, had_error).
+        let pixel_results: Vec<(usize, Vec<f64>, bool, bool)> = live_pixels
             .par_iter()
             .filter_map(|&p| {
                 if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
@@ -352,7 +353,8 @@ pub fn spatial_map_tv(
                 let degree = neighbors.len();
                 if degree == 0 {
                     // Isolated pixel (all neighbors dead): no regularization.
-                    return Some((p, densities[p].clone(), true));
+                    // Preserve convergence status from the initial spatial_map.
+                    return Some((p, densities[p].clone(), pixel_converged[p], false));
                 }
 
                 // Build proximal penalty for this pixel.
@@ -400,14 +402,14 @@ pub fn spatial_map_tv(
                         if let Some(prog) = progress {
                             prog.fetch_add(1, Ordering::Relaxed);
                         }
-                        Some((p, result.densities, result.converged))
+                        Some((p, result.densities, result.converged, false))
                     }
                     Err(_) => {
                         if let Some(prog) = progress {
                             prog.fetch_add(1, Ordering::Relaxed);
                         }
                         // Keep previous densities on failure.
-                        Some((p, densities[p].clone(), false))
+                        Some((p, densities[p].clone(), false, true))
                     }
                 }
             })
@@ -417,8 +419,11 @@ pub fn spatial_map_tv(
         // ADMM-level density stabilization: if densities stopped changing
         // between iterations, the pixel is converged even if the inner
         // solver didn't declare it (common with warm-started Poisson FD).
-        for (p, new_densities, inner_converged) in &pixel_results {
+        // Pixels with inner solver errors are excluded from stabilization
+        // to prevent falsely marking them converged via unchanged densities.
+        for (p, new_densities, inner_converged, had_error) in &pixel_results {
             let density_stable = _outer > 0
+                && !had_error
                 && new_densities
                     .iter()
                     .zip(prev_densities[*p].iter())

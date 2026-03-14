@@ -489,10 +489,6 @@ pub struct SpectrumFitResult {
     pub temperature_k_unc: Option<f64>,
 }
 
-/// Dispatch between LM and Poisson solvers.
-///
-/// Both solvers use the same `FitModel` interface. The Poisson result is
-/// mapped to `LmResult` so the caller can treat all solvers uniformly.
 /// Context for routing Poisson fits through the analytic gradient solver.
 ///
 /// When provided alongside `SolverChoice::PoissonKL`, `dispatch_solver` uses
@@ -509,6 +505,10 @@ struct AnalyticPoissonCtx<'a> {
     density_indices: &'a [usize],
 }
 
+/// Dispatch between LM and Poisson solvers.
+///
+/// Both solvers use the same `FitModel` interface. The Poisson result is
+/// mapped to `LmResult` so the caller can treat all solvers uniformly.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_solver(
     model: &dyn FitModel,
