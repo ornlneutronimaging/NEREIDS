@@ -40,7 +40,7 @@ use nereids_endf::resonance::{
 use nereids_endf::retrieval::{EndfLibrary, EndfRetriever, mat_number};
 use nereids_fitting::lm::{self, FitModel, LmConfig};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
-use nereids_fitting::poisson::{self, CountsModel, PoissonConfig, TemperatureContext};
+use nereids_fitting::poisson::{self, PoissonConfig, TemperatureContext};
 use nereids_fitting::transmission_model::{PrecomputedTransmissionModel, TransmissionFitModel};
 use nereids_io::normalization::{self as norm, NormalizationParams};
 use nereids_io::tof::BeamlineParams;
@@ -565,7 +565,9 @@ fn forward_model<'py>(
 ///         - ``"lm"`` (default): Levenberg-Marquardt (chi-squared).
 ///           ``measured_t`` is transmission, ``sigma`` is uncertainties.
 ///         - ``"poisson"``: Poisson NLL with analytical gradient.
-///           ``measured_t`` is sample counts, ``sigma`` is open-beam/flux counts.
+///           ``measured_t`` and ``sigma`` have the same meaning as for ``"lm"``
+///           (transmission and uncertainties). ``sigma`` is unused by the Poisson
+///           optimizer but required for API consistency.
 ///           ``result.reduced_chi_squared`` contains the final NLL (not chi-squared).
 ///
 /// Returns:
@@ -774,7 +776,6 @@ fn fit_spectrum(
             // Copy numpy slices to owned vectors so we can release the GIL.
             let e_owned = e.to_vec();
             let y_obs = t.to_vec();
-            let flux_owned = s.to_vec();
 
             let instrument = res_fn.map(|r| InstrumentParams { resolution: r });
 
@@ -834,8 +835,9 @@ fn fit_spectrum(
 
                 let mut params = ParameterSet::new(param_vec);
 
-                // The transmission model for CountsModel: uses precomputed xs
-                // (or full physics model when fitting temperature).
+                // Transmission-space formulation: flux = 1.0 everywhere since
+                // Y = T, not Y = Φ·T + B.  The analytical gradient formulas
+                // reduce correctly with Φ=1 (matches pipeline.rs).
                 let density_indices: Arc<Vec<usize>> = Arc::new((0..n_isotopes).collect());
                 let xs_arc = Arc::new(xs.clone());
                 let precomputed = PrecomputedTransmissionModel {
@@ -860,7 +862,7 @@ fn fit_spectrum(
                 let full_model;
                 let t_model: &dyn FitModel = if fit_temperature {
                     full_model = TransmissionFitModel::new(
-                        e_owned,
+                        e_owned.clone(),
                         res_data,
                         temperature_k,
                         instrument.map(Arc::new),
@@ -874,12 +876,7 @@ fn fit_spectrum(
                     &precomputed
                 };
 
-                let background = vec![0.0f64; flux_owned.len()];
-                let counts_model = CountsModel {
-                    transmission_model: t_model,
-                    flux: &flux_owned,
-                    background: &background,
-                };
+                let flux = vec![1.0f64; e_owned.len()];
 
                 let poisson_config = PoissonConfig {
                     max_iter,
@@ -887,9 +884,9 @@ fn fit_spectrum(
                 };
 
                 let poisson_result = poisson::poisson_fit_analytic(
-                    &counts_model,
+                    t_model,
                     &y_obs,
-                    &flux_owned,
+                    &flux,
                     &xs,
                     &density_indices,
                     &mut params,
