@@ -568,24 +568,25 @@ class TestFitSpectrumPoisson:
     """Tests for fit_spectrum() with the Poisson fitter."""
 
     def test_poisson_basic(self, u238_data):
-        """Poisson fitter with synthetic count data."""
+        """Poisson fitter with synthetic transmission data."""
         energies = np.linspace(1.0, 30.0, 300)
         true_density = 0.002
-        flux = 10000.0  # high counts for easy fitting
+        open_beam_counts = 10000.0  # high counts for easy fitting
 
         # Build clean transmission
         t_clean = np.asarray(
             nereids.forward_model(energies, [(u238_data, true_density)])
         )
 
-        # Simulate counts: sample_counts ~ Poisson(flux * T), open_beam ~ flux
+        # Simulate Poisson counts, then convert to transmission + uncertainty
         rng = np.random.default_rng(123)
-        open_beam = np.full(len(energies), flux)
-        sample_counts = rng.poisson(flux * t_clean).astype(float)
+        sample_counts = rng.poisson(open_beam_counts * t_clean).astype(float)
+        measured_t = sample_counts / open_beam_counts
+        sigma = np.sqrt(np.maximum(sample_counts, 1.0)) / open_beam_counts
 
         result = nereids.fit_spectrum(
-            sample_counts,
-            open_beam,
+            measured_t,
+            sigma,
             energies,
             [u238_data],
             fitter="poisson",
@@ -601,12 +602,11 @@ class TestFitSpectrumPoisson:
         t = np.asarray(
             nereids.forward_model(energies, [(u238_data, 0.001)])
         )
-        open_beam = np.full(len(energies), 5000.0)
-        sample_counts = (t * 5000.0).astype(float)
+        sigma = np.full_like(t, 0.01)  # unused by Poisson, required for API
 
         result = nereids.fit_spectrum(
-            sample_counts,
-            open_beam,
+            t,
+            sigma,
             energies,
             [u238_data],
             fitter="poisson",
