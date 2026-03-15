@@ -1885,8 +1885,8 @@ fn py_spatial_map(
 ///     max_iter: Maximum iterations per pixel for inner LM/Poisson fits (default 100).
 ///     fitter: 'lm' (default) for Gaussian χ² or 'poisson' for Poisson NLL.
 ///     tv_rho: ADMM penalty parameter (dimensionless, default 1.0).
-///         Internally scaled by n_energies so the proximal term competes
-///         with the data-fidelity Hessian. Typical range: 0.1-10.
+///         Auto-scaled to match the data-fidelity Hessian curvature.
+///         Typical range: 0.1-10.
 ///     tv_max_iter: Maximum ADMM outer iterations (default 20).
 ///     tv_tol_primal: Primal residual convergence tolerance (default 1e-4).
 ///     tv_tol_dual: Dual residual convergence tolerance (default 1e-4).

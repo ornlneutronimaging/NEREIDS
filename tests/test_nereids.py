@@ -1128,7 +1128,7 @@ class TestSpatialMapTV:
             noisy_cube, unc_cube, energies, [u238_data],
             temperature_k=0.0, max_iter=50,
         )
-        # TV-ADMM with rho=1.0 (rho is internally scaled by n_energies)
+        # TV-ADMM with rho=1.0 (rho is auto-scaled to data curvature)
         tv = nereids.spatial_map_tv(
             noisy_cube, unc_cube, energies, [u238_data],
             tv_lambda=1.0, temperature_k=0.0,

@@ -56,9 +56,10 @@ pub struct TvAdmmConfig {
     pub lambda: Vec<f64>,
     /// ADMM penalty parameter (dimensionless, default 1.0).
     ///
-    /// Internally scaled by `n_energies` so the proximal term is
-    /// commensurate with the data-fidelity Hessian (which grows
-    /// linearly with the number of energy bins). Typical range: 0.1–10.
+    /// Internally auto-scaled to match the data-fidelity Hessian
+    /// curvature (estimated from the vanilla-fit density variance,
+    /// with `n_energies` fallback for degenerate cases).
+    /// Typical range: 0.1–10.
     pub rho: f64,
     /// Maximum ADMM outer iterations. Default: 20.
     pub max_outer_iter: usize,
@@ -345,7 +346,7 @@ pub fn spatial_map_tv(
     let rho_scaled = {
         let mut max_var = 0.0_f64;
         for k in 0..n_isotopes {
-            if !free_isotopes[k] {
+            if !free_isotopes[k] || tv_config.lambda[k] == 0.0 {
                 continue;
             }
             let vals: Vec<f64> = live_pixels.iter().map(|&p| densities[p][k]).collect();
@@ -936,7 +937,7 @@ mod tests {
         let vanilla = spatial_map(noisy.view(), unc.view(), &config, None, None, None).unwrap();
 
         // TV-ADMM fit with moderate regularization.
-        // After the rho*n_energies scaling fix, rho=1.0 is sufficient.
+        // Auto-scaled rho makes rho=1.0 sufficient.
         let tv_config = TvAdmmConfig {
             lambda: vec![1.0],
             rho: 1.0,
@@ -1021,7 +1022,7 @@ mod tests {
     #[test]
     fn test_tv_denoises_realistic() {
         // Realistic dimensions: 500 energy bins, I0=100, 10x10 grid.
-        // With the rho*n_energies scaling, rho=1.0 produces visible denoising.
+        // With auto-scaled rho, rho=1.0 produces visible denoising.
         use crate::noise::generate_noisy_cube;
         use crate::test_helpers::w182_single_resonance;
         use nereids_fitting::lm::LmConfig;
@@ -1215,7 +1216,7 @@ mod tests {
     #[test]
     fn test_rho_scaling_invariance() {
         // rho=1.0 should denoise at both n_e=100 and n_e=500,
-        // confirming the n_energies scaling makes rho dimensionless.
+        // confirming the auto-scaling makes rho dimensionless.
         use crate::noise::generate_noisy_cube;
         use crate::test_helpers::w182_single_resonance;
         use nereids_fitting::lm::LmConfig;
