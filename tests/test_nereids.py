@@ -571,7 +571,7 @@ class TestFitSpectrumPoisson:
         """Poisson fitter with synthetic transmission data."""
         energies = np.linspace(1.0, 30.0, 300)
         true_density = 0.002
-        flux = 10000.0  # high counts for easy fitting
+        open_beam_counts = 10000.0  # high counts for easy fitting
 
         # Build clean transmission
         t_clean = np.asarray(
@@ -580,9 +580,9 @@ class TestFitSpectrumPoisson:
 
         # Simulate Poisson counts, then convert to transmission + uncertainty
         rng = np.random.default_rng(123)
-        sample_counts = rng.poisson(flux * t_clean).astype(float)
-        measured_t = sample_counts / flux
-        sigma = np.sqrt(np.maximum(sample_counts, 1.0)) / flux
+        sample_counts = rng.poisson(open_beam_counts * t_clean).astype(float)
+        measured_t = sample_counts / open_beam_counts
+        sigma = np.sqrt(np.maximum(sample_counts, 1.0)) / open_beam_counts
 
         result = nereids.fit_spectrum(
             measured_t,

@@ -838,10 +838,11 @@ fn fit_spectrum(
                 // Transmission-space formulation: flux = 1.0 everywhere since
                 // Y = T, not Y = Φ·T + B.  The analytical gradient formulas
                 // reduce correctly with Φ=1 (matches pipeline.rs).
+                let n_e = e_owned.len();
                 let density_indices: Arc<Vec<usize>> = Arc::new((0..n_isotopes).collect());
-                let xs_arc = Arc::new(xs.clone());
+                let xs_arc = Arc::new(xs);
                 let precomputed = PrecomputedTransmissionModel {
-                    cross_sections: xs_arc,
+                    cross_sections: Arc::clone(&xs_arc),
                     density_indices: Arc::clone(&density_indices),
                 };
 
@@ -862,7 +863,7 @@ fn fit_spectrum(
                 let full_model;
                 let t_model: &dyn FitModel = if fit_temperature {
                     full_model = TransmissionFitModel::new(
-                        e_owned.clone(),
+                        e_owned,
                         res_data,
                         temperature_k,
                         instrument.map(Arc::new),
@@ -876,7 +877,7 @@ fn fit_spectrum(
                     &precomputed
                 };
 
-                let flux = vec![1.0f64; e_owned.len()];
+                let flux = vec![1.0f64; n_e];
 
                 let poisson_config = PoissonConfig {
                     max_iter,
@@ -887,7 +888,7 @@ fn fit_spectrum(
                     t_model,
                     &y_obs,
                     &flux,
-                    &xs,
+                    &*xs_arc,
                     &density_indices,
                     &mut params,
                     &poisson_config,
