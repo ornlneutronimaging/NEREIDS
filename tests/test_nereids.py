@@ -1139,9 +1139,11 @@ class TestSpatialMapTV:
         tv_map = np.asarray(tv.density_maps[0])
 
         # TV should measurably reduce spatial variance on a uniform image.
-        assert np.std(tv_map) < np.std(vanilla_map) * 0.98, (
+        std_tv = float(np.std(tv_map))
+        std_vanilla = float(np.std(vanilla_map))
+        assert std_tv < std_vanilla * 0.98, (
             f"TV should reduce std by at least 2%: "
-            f"std_tv={np.std(tv_map):.6f}, std_vanilla={np.std(vanilla_map):.6f}"
+            f"std_tv={std_tv:.6f}, std_vanilla={std_vanilla:.6f}"
         )
 
     def test_tv_returns_spatial_result(self, u238_data):

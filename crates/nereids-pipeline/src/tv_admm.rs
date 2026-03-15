@@ -1021,7 +1021,7 @@ mod tests {
 
     #[test]
     fn test_tv_denoises_realistic() {
-        // Realistic dimensions: 500 energy bins, I0=100, 10x10 grid.
+        // Realistic dimensions: 500 energy bins, I0=100, 8x8 grid.
         // With auto-scaled rho, rho=1.0 produces visible denoising.
         use crate::noise::generate_noisy_cube;
         use crate::test_helpers::w182_single_resonance;
@@ -1146,6 +1146,9 @@ mod tests {
         )
         .unwrap();
 
+        // Vanilla fit for comparison.
+        let vanilla = spatial_map(data.view(), unc.view(), &config, None, None, None).unwrap();
+
         let tv_config = TvAdmmConfig {
             lambda: vec![1.0],
             rho: 1.0,
@@ -1163,7 +1166,30 @@ mod tests {
         )
         .unwrap();
 
-        // Separate left and right halves.
+        // Helper: compute within-region variance for left/right halves.
+        let within_var = |maps: &ndarray::Array2<f64>| -> f64 {
+            let (mut left, mut right) = (Vec::new(), Vec::new());
+            for y in 0..height {
+                for x in 0..width {
+                    if x < width / 2 {
+                        left.push(maps[[y, x]]);
+                    } else {
+                        right.push(maps[[y, x]]);
+                    }
+                }
+            }
+            let var = |vals: &[f64]| -> f64 {
+                let n = vals.len() as f64;
+                let mean = vals.iter().sum::<f64>() / n;
+                vals.iter().map(|&v| (v - mean).powi(2)).sum::<f64>() / n
+            };
+            (var(&left) + var(&right)) / 2.0
+        };
+
+        let tv_within = within_var(&tv_result.density_maps[0]);
+        let van_within = within_var(&vanilla.density_maps[0]);
+
+        // Separate left and right TV means for edge check.
         let mut left_vals = Vec::new();
         let mut right_vals = Vec::new();
         for y in 0..height {
@@ -1176,7 +1202,6 @@ mod tests {
                 }
             }
         }
-
         let mean_left: f64 = left_vals.iter().sum::<f64>() / left_vals.len() as f64;
         let mean_right: f64 = right_vals.iter().sum::<f64>() / right_vals.len() as f64;
 
@@ -1186,30 +1211,13 @@ mod tests {
             "Edge should be preserved: mean_left={mean_left:.4e}, mean_right={mean_right:.4e}"
         );
 
-        // Within-region variance < global variance (smoothing works).
-        let var_left: f64 = left_vals
-            .iter()
-            .map(|&v| (v - mean_left).powi(2))
-            .sum::<f64>()
-            / left_vals.len() as f64;
-        let var_right: f64 = right_vals
-            .iter()
-            .map(|&v| (v - mean_right).powi(2))
-            .sum::<f64>()
-            / right_vals.len() as f64;
-        let within_var = (var_left + var_right) / 2.0;
-        let n_total = (height * width) as f64;
-        let global_mean: f64 = tv_result.density_maps[0].iter().sum::<f64>() / n_total;
-        let global_var: f64 = tv_result.density_maps[0]
-            .iter()
-            .map(|&v| (v - global_mean).powi(2))
-            .sum::<f64>()
-            / n_total;
-
+        // TV within-region variance should be less than vanilla within-region
+        // variance — verifies actual denoising, not just the tautological
+        // within < global decomposition.
         assert!(
-            within_var < global_var,
-            "Within-region variance should be less than global: \
-             within={within_var:.2e}, global={global_var:.2e}"
+            tv_within < van_within,
+            "TV should reduce within-region variance vs vanilla: \
+             tv={tv_within:.2e}, vanilla={van_within:.2e}"
         );
     }
 
