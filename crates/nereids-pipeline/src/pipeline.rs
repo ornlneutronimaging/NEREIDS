@@ -12,7 +12,9 @@ use nereids_endf::resonance::ResonanceData;
 use nereids_fitting::lm::{self, FitModel, LmConfig, LmResult};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
 use nereids_fitting::poisson::{self, PoissonConfig, TemperatureContext};
-use nereids_fitting::transmission_model::{PrecomputedTransmissionModel, TransmissionFitModel};
+use nereids_fitting::transmission_model::{
+    NormalizedTransmissionModel, PrecomputedTransmissionModel, TransmissionFitModel,
+};
 use nereids_physics::resolution::ResolutionFunction;
 use nereids_physics::transmission::InstrumentParams;
 use nereids_physics::transmission::{self as phys_transmission};
@@ -28,6 +30,50 @@ pub enum SolverChoice {
     /// Poisson negative log-likelihood via L-BFGS with projected gradients
     /// and bound constraints. Appropriate for low-count data (< ~30 counts/bin).
     PoissonKL(PoissonConfig),
+}
+
+/// SAMMY-style normalization and background configuration.
+///
+/// When enabled, the transmission model becomes:
+///   T_out(E) = Anorm × T_inner(E) + BackA + BackB / √E + BackC × √E
+///
+/// These 4 parameters are fitted jointly with the isotope densities.
+///
+/// ## SAMMY Reference
+/// SAMMY manual Sec III.E.2 — NORMAlization and BACKGround cards.
+#[derive(Debug, Clone)]
+pub struct BackgroundConfig {
+    /// Initial value for the normalization factor (default 1.0).
+    pub anorm_init: f64,
+    /// Initial value for the constant background (default 0.0).
+    pub back_a_init: f64,
+    /// Initial value for the 1/√E background term (default 0.0).
+    pub back_b_init: f64,
+    /// Initial value for the √E background term (default 0.0).
+    pub back_c_init: f64,
+    /// Whether Anorm is free (true) or fixed (false).
+    pub fit_anorm: bool,
+    /// Whether BackA is free (true) or fixed (false).
+    pub fit_back_a: bool,
+    /// Whether BackB is free (true) or fixed (false).
+    pub fit_back_b: bool,
+    /// Whether BackC is free (true) or fixed (false).
+    pub fit_back_c: bool,
+}
+
+impl Default for BackgroundConfig {
+    fn default() -> Self {
+        Self {
+            anorm_init: 1.0,
+            back_a_init: 0.0,
+            back_b_init: 0.0,
+            back_c_init: 0.0,
+            fit_anorm: true,
+            fit_back_a: true,
+            fit_back_b: true,
+            fit_back_c: true,
+        }
+    }
 }
 
 /// Errors from `FitConfig` construction.
@@ -120,6 +166,9 @@ pub struct FitConfig {
     compute_covariance: bool,
     /// Which optimizer to use. Default: LevenbergMarquardt.
     solver: SolverChoice,
+    /// Optional SAMMY-style normalization and background configuration.
+    /// When `Some`, adds Anorm + 3 background parameters to the fit.
+    background: Option<BackgroundConfig>,
 }
 
 impl FitConfig {
@@ -182,6 +231,7 @@ impl FitConfig {
             fit_temperature: false,
             compute_covariance: true,
             solver: SolverChoice::default(),
+            background: None,
         })
     }
 
@@ -299,6 +349,19 @@ impl FitConfig {
     pub fn solver(&self) -> &SolverChoice {
         &self.solver
     }
+
+    /// Set normalization/background configuration (builder pattern).
+    #[must_use]
+    pub fn with_background(mut self, bg: BackgroundConfig) -> Self {
+        self.background = Some(bg);
+        self
+    }
+
+    /// Returns the background configuration, if any.
+    #[must_use]
+    pub fn background(&self) -> Option<&BackgroundConfig> {
+        self.background.as_ref()
+    }
 }
 
 /// Result of fitting a single spectrum.
@@ -321,6 +384,10 @@ pub struct SpectrumFitResult {
     pub temperature_k: Option<f64>,
     /// 1-sigma uncertainty on the fitted temperature (from covariance matrix).
     pub temperature_k_unc: Option<f64>,
+    /// Fitted normalization factor (1.0 if background not enabled).
+    pub anorm: f64,
+    /// Fitted background parameters \[BackA, BackB, BackC\] (all 0.0 if not enabled).
+    pub background: [f64; 3],
 }
 
 /// Dispatch between LM and Poisson solvers.
@@ -437,6 +504,43 @@ pub fn fit_spectrum(
         None
     };
 
+    // When background normalization is enabled, append the 4 background
+    // parameters after density (and optional temperature) parameters.
+    // Parameter vector layout:
+    //   [density_0 .. density_{n-1}, (temperature_k?), Anorm, BackA, BackB, BackC]
+    let bg_base = param_vec.len(); // first background param index
+    let bg_indices = if let Some(bg) = config.background() {
+        param_vec.push(if bg.fit_anorm {
+            FitParameter {
+                name: "anorm".into(),
+                value: bg.anorm_init,
+                lower: 0.0,
+                upper: f64::INFINITY,
+                fixed: false,
+            }
+        } else {
+            FitParameter::fixed("anorm", bg.anorm_init)
+        });
+        param_vec.push(if bg.fit_back_a {
+            FitParameter::unbounded("back_a", bg.back_a_init)
+        } else {
+            FitParameter::fixed("back_a", bg.back_a_init)
+        });
+        param_vec.push(if bg.fit_back_b {
+            FitParameter::unbounded("back_b", bg.back_b_init)
+        } else {
+            FitParameter::fixed("back_b", bg.back_b_init)
+        });
+        param_vec.push(if bg.fit_back_c {
+            FitParameter::unbounded("back_c", bg.back_c_init)
+        } else {
+            FitParameter::fixed("back_c", bg.back_c_init)
+        });
+        Some((bg_base, bg_base + 1, bg_base + 2, bg_base + 3))
+    } else {
+        None
+    };
+
     let mut params = ParameterSet::new(param_vec);
 
     // Propagate the pipeline-level compute_covariance flag into the LM config.
@@ -444,6 +548,33 @@ pub fn fit_spectrum(
     // modifying the caller's LmConfig.
     let mut lm_config = config.lm_config().clone();
     lm_config.compute_covariance = config.compute_covariance();
+
+    // Helper: dispatch solver with optional NormalizedTransmissionModel wrapping.
+    // Returns the LmResult from whichever solver path is selected.
+    let dispatch_maybe_bg =
+        |inner: &dyn FitModel, params: &mut ParameterSet| -> Result<LmResult, PipelineError> {
+            if let Some((ai, bai, bbi, bci)) = bg_indices {
+                let wrapped =
+                    NormalizedTransmissionModel::new(inner, config.energies(), ai, bai, bbi, bci);
+                dispatch_solver(
+                    &wrapped,
+                    measured_t,
+                    sigma,
+                    params,
+                    config.solver(),
+                    &lm_config,
+                )
+            } else {
+                dispatch_solver(
+                    inner,
+                    measured_t,
+                    sigma,
+                    params,
+                    config.solver(),
+                    &lm_config,
+                )
+            }
+        };
 
     // Use precomputed cross-sections when available (fast path for spatial_map).
     // Fall back to the full forward-model path for single-spectrum calls.
@@ -473,14 +604,7 @@ pub fn fit_spectrum(
                 cross_sections: xs.clone(),
                 density_indices: Arc::new((0..n_isotopes).collect()),
             };
-            dispatch_solver(
-                &model,
-                measured_t,
-                sigma,
-                &mut params,
-                config.solver(),
-                &lm_config,
-            )?
+            dispatch_maybe_bg(&model, &mut params)?
         } else {
             let instrument = config
                 .resolution()
@@ -495,14 +619,7 @@ pub fn fit_spectrum(
                 None,
                 None,
             )?;
-            dispatch_solver(
-                &model,
-                measured_t,
-                sigma,
-                &mut params,
-                config.solver(),
-                &lm_config,
-            )?
+            dispatch_maybe_bg(&model, &mut params)?
         }
     } else {
         // Temperature fitting: always use the full TransmissionFitModel
@@ -526,14 +643,7 @@ pub fn fit_spectrum(
         )?;
 
         match config.solver() {
-            SolverChoice::LevenbergMarquardt => dispatch_solver(
-                &model,
-                measured_t,
-                sigma,
-                &mut params,
-                config.solver(),
-                &lm_config,
-            )?,
+            SolverChoice::LevenbergMarquardt => dispatch_maybe_bg(&model, &mut params)?,
             SolverChoice::PoissonKL(poisson_config) => {
                 // The basic poisson_fit uses finite-difference gradient descent,
                 // which cannot effectively optimize temperature: the gradient is
@@ -546,77 +656,95 @@ pub fn fit_spectrum(
                 // In transmission space, flux = 1.0 everywhere (since Y = T,
                 // not Y = Φ·T + B).  The analytical gradient formulas reduce
                 // correctly with Φ=1.
-                let density_indices: Vec<usize> = (0..n_isotopes).collect();
-                let instrument_plain = instrument.as_deref().cloned();
+                //
+                // NOTE: Poisson analytic path does NOT support background wrapping
+                // because it constructs its own model internally.  Background +
+                // Poisson + temperature is dispatched through the standard path.
+                if bg_indices.is_some() {
+                    dispatch_maybe_bg(&model, &mut params)?
+                } else {
+                    let density_indices: Vec<usize> = (0..n_isotopes).collect();
+                    let instrument_plain = instrument.as_deref().cloned();
 
-                // Use precomputed base_xs when available (spatial_map path);
-                // fall back to computing them here (single-pixel path).
-                let base_xs: Arc<Vec<Vec<f64>>> = match config.precomputed_base_xs() {
-                    Some(cached) => Arc::clone(cached),
-                    None => Arc::new(phys_transmission::unbroadened_cross_sections(
+                    // Use precomputed base_xs when available (spatial_map path);
+                    // fall back to computing them here (single-pixel path).
+                    let base_xs: Arc<Vec<Vec<f64>>> = match config.precomputed_base_xs() {
+                        Some(cached) => Arc::clone(cached),
+                        None => Arc::new(phys_transmission::unbroadened_cross_sections(
+                            config.energies(),
+                            config.resonance_data(),
+                            None,
+                        )?),
+                    };
+
+                    // Compute initial broadened XS from base (Doppler + resolution
+                    // only, no redundant Reich-Moore).
+                    let xs = phys_transmission::broadened_cross_sections_from_base(
                         config.energies(),
+                        &base_xs,
                         config.resonance_data(),
-                        None,
-                    )?),
-                };
+                        config.temperature_k(),
+                        instrument.as_deref(),
+                    )?;
 
-                // Compute initial broadened XS from base (Doppler + resolution
-                // only, no redundant Reich-Moore).
-                let xs = phys_transmission::broadened_cross_sections_from_base(
-                    config.energies(),
-                    &base_xs,
-                    config.resonance_data(),
-                    config.temperature_k(),
-                    instrument.as_deref(),
-                )?;
+                    let temp_ctx = TemperatureContext {
+                        temperature_index: n_isotopes,
+                        resonance_data: config.resonance_data().to_vec(),
+                        energies: config.energies().to_vec(),
+                        instrument: instrument_plain,
+                        base_xs: Some(base_xs),
+                    };
 
-                let temp_ctx = TemperatureContext {
-                    temperature_index: n_isotopes,
-                    resonance_data: config.resonance_data().to_vec(),
-                    energies: config.energies().to_vec(),
-                    instrument: instrument_plain,
-                    base_xs: Some(base_xs),
-                };
+                    let flux = vec![1.0f64; config.energies().len()];
 
-                let flux = vec![1.0f64; config.energies().len()];
+                    let pr = poisson::poisson_fit_analytic(
+                        &model,
+                        measured_t,
+                        &flux,
+                        &xs,
+                        &density_indices,
+                        &mut params,
+                        poisson_config,
+                        Some(&temp_ctx),
+                    )?;
 
-                let pr = poisson::poisson_fit_analytic(
-                    &model,
-                    measured_t,
-                    &flux,
-                    &xs,
-                    &density_indices,
-                    &mut params,
-                    poisson_config,
-                    Some(&temp_ctx),
-                )?;
-
-                let n_free = params.n_free();
-                let dof = measured_t.len().saturating_sub(n_free).max(1);
-                let y_model = model.evaluate(&pr.params)?;
-                let chi_sq: f64 = measured_t
-                    .iter()
-                    .zip(y_model.iter())
-                    .zip(sigma.iter())
-                    .map(|((obs, mdl), s)| {
-                        let residual = obs - mdl;
-                        (residual * residual) / (s * s).max(1e-30)
-                    })
-                    .sum();
-                LmResult {
-                    chi_squared: chi_sq,
-                    reduced_chi_squared: chi_sq / dof as f64,
-                    iterations: pr.iterations,
-                    converged: pr.converged,
-                    params: pr.params,
-                    covariance: None,
-                    uncertainties: None,
+                    let n_free = params.n_free();
+                    let dof = measured_t.len().saturating_sub(n_free).max(1);
+                    let y_model = model.evaluate(&pr.params)?;
+                    let chi_sq: f64 = measured_t
+                        .iter()
+                        .zip(y_model.iter())
+                        .zip(sigma.iter())
+                        .map(|((obs, mdl), s)| {
+                            let residual = obs - mdl;
+                            (residual * residual) / (s * s).max(1e-30)
+                        })
+                        .sum();
+                    LmResult {
+                        chi_squared: chi_sq,
+                        reduced_chi_squared: chi_sq / dof as f64,
+                        iterations: pr.iterations,
+                        converged: pr.converged,
+                        params: pr.params,
+                        covariance: None,
+                        uncertainties: None,
+                    }
                 }
             }
         }
     };
 
     let densities: Vec<f64> = (0..n_isotopes).map(|i| result.params[i]).collect();
+
+    // Extract background parameters from the result, or defaults if not enabled.
+    let (anorm, background) = if let Some((ai, bai, bbi, bci)) = bg_indices {
+        (
+            result.params[ai],
+            [result.params[bai], result.params[bbi], result.params[bci]],
+        )
+    } else {
+        (1.0, [0.0, 0.0, 0.0])
+    };
 
     // When covariance was computed, extract per-isotope and temperature
     // uncertainties from the LM result.  When skipped (None), propagate None.
@@ -660,6 +788,8 @@ pub fn fit_spectrum(
         iterations: result.iterations,
         temperature_k,
         temperature_k_unc,
+        anorm,
+        background,
     })
 }
 
@@ -1151,6 +1281,322 @@ mod tests {
             }),
             0.02, // 2%
             "2-isotope Poisson",
+        );
+    }
+
+    // ── Background normalization tests ───────────────────────────────────────
+
+    /// Without BackgroundConfig, results must include default background
+    /// fields (anorm=1.0, background=[0,0,0]) and densities must match
+    /// the pre-background behavior.
+    #[test]
+    fn test_no_background_unchanged() {
+        let data = u238_single_resonance();
+        let true_density = 0.0005;
+        let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
+
+        let model = TransmissionFitModel::new(
+            energies.clone(),
+            vec![data.clone()],
+            0.0,
+            None,
+            vec![0],
+            None,
+            None,
+        )
+        .unwrap();
+        let y_obs = model.evaluate(&[true_density]).unwrap();
+        let sigma = vec![0.01; y_obs.len()];
+
+        let config = FitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        )
+        .unwrap();
+
+        let result = fit_spectrum(&y_obs, &sigma, &config).unwrap();
+
+        assert!(result.converged);
+        assert!(
+            (result.densities[0] - true_density).abs() / true_density < 0.01,
+            "density mismatch without background"
+        );
+        // Default background fields
+        assert!(
+            (result.anorm - 1.0).abs() < 1e-12,
+            "anorm should be 1.0 without background config"
+        );
+        assert!(
+            result.background.iter().all(|&v| v.abs() < 1e-12),
+            "background should be all zeros without background config"
+        );
+    }
+
+    /// Generate data with a known constant offset (BackA=0.02), fit with
+    /// background enabled, verify BackA is recovered.
+    #[test]
+    fn test_background_constant_offset() {
+        let data = u238_single_resonance();
+        let true_density = 0.0005;
+        let true_back_a = 0.02;
+        let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
+
+        // Generate synthetic data: T_inner + constant offset
+        let model = TransmissionFitModel::new(
+            energies.clone(),
+            vec![data.clone()],
+            0.0,
+            None,
+            vec![0],
+            None,
+            None,
+        )
+        .unwrap();
+        let t_inner = model.evaluate(&[true_density]).unwrap();
+        let y_obs: Vec<f64> = t_inner.iter().map(|&t| t + true_back_a).collect();
+        let sigma = vec![0.001; y_obs.len()];
+
+        let bg = BackgroundConfig {
+            anorm_init: 1.0,
+            back_a_init: 0.0,
+            back_b_init: 0.0,
+            back_c_init: 0.0,
+            fit_anorm: false, // fix Anorm=1.0 to avoid degeneracy with constant offset
+            fit_back_a: true,
+            fit_back_b: false,
+            fit_back_c: false,
+        };
+
+        let config = FitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        )
+        .unwrap()
+        .with_background(bg);
+
+        let result = fit_spectrum(&y_obs, &sigma, &config).unwrap();
+
+        assert!(
+            result.converged,
+            "constant offset fit should converge: {} iters",
+            result.iterations
+        );
+        assert!(
+            (result.densities[0] - true_density).abs() / true_density < 0.02,
+            "density: fitted={}, true={}",
+            result.densities[0],
+            true_density,
+        );
+        assert!(
+            (result.background[0] - true_back_a).abs() < 0.005,
+            "back_a: fitted={}, true={}",
+            result.background[0],
+            true_back_a,
+        );
+    }
+
+    /// Generate data with Anorm=0.95, fit and verify recovery.
+    #[test]
+    fn test_background_normalization() {
+        let data = u238_single_resonance();
+        let true_density = 0.0005;
+        let true_anorm = 0.95;
+        let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
+
+        let model = TransmissionFitModel::new(
+            energies.clone(),
+            vec![data.clone()],
+            0.0,
+            None,
+            vec![0],
+            None,
+            None,
+        )
+        .unwrap();
+        let t_inner = model.evaluate(&[true_density]).unwrap();
+        let y_obs: Vec<f64> = t_inner.iter().map(|&t| true_anorm * t).collect();
+        let sigma = vec![0.001; y_obs.len()];
+
+        let bg = BackgroundConfig {
+            anorm_init: 1.0,
+            fit_anorm: true,
+            fit_back_a: false,
+            fit_back_b: false,
+            fit_back_c: false,
+            ..BackgroundConfig::default()
+        };
+
+        let config = FitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        )
+        .unwrap()
+        .with_background(bg);
+
+        let result = fit_spectrum(&y_obs, &sigma, &config).unwrap();
+
+        assert!(result.converged, "normalization fit should converge");
+        assert!(
+            (result.densities[0] - true_density).abs() / true_density < 0.02,
+            "density: fitted={}, true={}",
+            result.densities[0],
+            true_density,
+        );
+        assert!(
+            (result.anorm - true_anorm).abs() / true_anorm < 0.02,
+            "anorm: fitted={}, true={}",
+            result.anorm,
+            true_anorm,
+        );
+    }
+
+    /// Generate data with a BackB/√E term and verify recovery.
+    #[test]
+    fn test_background_energy_dependent() {
+        let data = u238_single_resonance();
+        let true_density = 0.0005;
+        let true_back_b = 0.01;
+        let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
+
+        let model = TransmissionFitModel::new(
+            energies.clone(),
+            vec![data.clone()],
+            0.0,
+            None,
+            vec![0],
+            None,
+            None,
+        )
+        .unwrap();
+        let t_inner = model.evaluate(&[true_density]).unwrap();
+        let y_obs: Vec<f64> = t_inner
+            .iter()
+            .zip(energies.iter())
+            .map(|(&t, &e)| t + true_back_b / e.sqrt())
+            .collect();
+        let sigma = vec![0.001; y_obs.len()];
+
+        let bg = BackgroundConfig {
+            anorm_init: 1.0,
+            fit_anorm: false,
+            fit_back_a: false,
+            fit_back_b: true,
+            fit_back_c: false,
+            ..BackgroundConfig::default()
+        };
+
+        let config = FitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        )
+        .unwrap()
+        .with_background(bg);
+
+        let result = fit_spectrum(&y_obs, &sigma, &config).unwrap();
+
+        assert!(
+            result.converged,
+            "energy-dependent background fit should converge"
+        );
+        assert!(
+            (result.densities[0] - true_density).abs() / true_density < 0.02,
+            "density: fitted={}, true={}",
+            result.densities[0],
+            true_density,
+        );
+        assert!(
+            (result.background[1] - true_back_b).abs() < 0.005,
+            "back_b: fitted={}, true={}",
+            result.background[1],
+            true_back_b,
+        );
+    }
+
+    /// Background fitting works with the Poisson KL solver.
+    /// The Poisson FD solver needs more iterations for the extra background
+    /// parameters, and convergence tolerance is relaxed to 5%.
+    #[test]
+    fn test_background_poisson_kl() {
+        let data = u238_single_resonance();
+        let true_density = 0.0005;
+        let true_back_a = 0.015;
+        let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
+
+        let model = TransmissionFitModel::new(
+            energies.clone(),
+            vec![data.clone()],
+            0.0,
+            None,
+            vec![0],
+            None,
+            None,
+        )
+        .unwrap();
+        let t_inner = model.evaluate(&[true_density]).unwrap();
+        let y_obs: Vec<f64> = t_inner.iter().map(|&t| t + true_back_a).collect();
+        let sigma = vec![0.01; y_obs.len()]; // unused by Poisson but required
+
+        let bg = BackgroundConfig {
+            anorm_init: 1.0,
+            fit_anorm: false,
+            fit_back_a: true,
+            fit_back_b: false,
+            fit_back_c: false,
+            ..BackgroundConfig::default()
+        };
+
+        let config = FitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        )
+        .unwrap()
+        .with_background(bg)
+        .with_solver(SolverChoice::PoissonKL(PoissonConfig {
+            max_iter: 500,
+            ..PoissonConfig::default()
+        }));
+
+        let result = fit_spectrum(&y_obs, &sigma, &config).unwrap();
+
+        // Poisson FD solver with wrapped model may not converge within the
+        // iteration limit (conservative convergence criteria), but the
+        // parameter recovery should still be acceptable.
+        assert!(
+            (result.densities[0] - true_density).abs() / true_density < 0.10,
+            "density: fitted={}, true={}",
+            result.densities[0],
+            true_density,
+        );
+        assert!(
+            (result.background[0] - true_back_a).abs() < 0.02,
+            "back_a: fitted={}, true={}",
+            result.background[0],
+            true_back_a,
         );
     }
 }

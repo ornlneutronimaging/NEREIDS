@@ -418,6 +418,190 @@ impl FitModel for TransmissionFitModel {
     }
 }
 
+/// Wraps a transmission model with SAMMY-style normalization and background.
+///
+/// T_out(E) = Anorm × T_inner(E) + BackA + BackB / √E + BackC × √E
+///
+/// The normalization and background parameters are additional entries in the
+/// parameter vector, appended after the density (and optional temperature)
+/// parameters of the inner model.
+///
+/// ## SAMMY Reference
+/// SAMMY manual Sec III.E.2 — NORMAlization and BACKGround cards.
+/// SAMMY fits up to 4 background terms; we implement the same 4:
+///   Anorm, constant BackA, 1/√E term BackB, √E term BackC.
+pub struct NormalizedTransmissionModel<M: FitModel> {
+    /// The inner (pure Beer-Lambert) transmission model.
+    inner: M,
+    /// Precomputed √E for each energy bin.  Computed once in `new()`.
+    sqrt_energies: Vec<f64>,
+    /// Precomputed 1/√E for each energy bin.  Computed once in `new()`.
+    inv_sqrt_energies: Vec<f64>,
+    /// Index of the Anorm parameter in the full parameter vector.
+    anorm_index: usize,
+    /// Index of the BackA (constant background) parameter.
+    back_a_index: usize,
+    /// Index of the BackB (1/√E background) parameter.
+    back_b_index: usize,
+    /// Index of the BackC (√E background) parameter.
+    back_c_index: usize,
+}
+
+impl<M: FitModel> NormalizedTransmissionModel<M> {
+    /// Create a new normalized transmission model.
+    ///
+    /// # Arguments
+    /// * `inner` — The inner transmission model (Beer-Lambert).
+    /// * `energies` — Energy grid in eV (must be positive).
+    /// * `anorm_index` — Index of Anorm in the parameter vector.
+    /// * `back_a_index` — Index of BackA in the parameter vector.
+    /// * `back_b_index` — Index of BackB in the parameter vector.
+    /// * `back_c_index` — Index of BackC in the parameter vector.
+    pub fn new(
+        inner: M,
+        energies: &[f64],
+        anorm_index: usize,
+        back_a_index: usize,
+        back_b_index: usize,
+        back_c_index: usize,
+    ) -> Self {
+        let sqrt_energies: Vec<f64> = energies.iter().map(|&e| e.sqrt()).collect();
+        let inv_sqrt_energies: Vec<f64> = sqrt_energies
+            .iter()
+            .map(|&se| if se > 0.0 { 1.0 / se } else { 0.0 })
+            .collect();
+        Self {
+            inner,
+            sqrt_energies,
+            inv_sqrt_energies,
+            anorm_index,
+            back_a_index,
+            back_b_index,
+            back_c_index,
+        }
+    }
+}
+
+impl<M: FitModel> FitModel for NormalizedTransmissionModel<M> {
+    fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+        let t_inner = self.inner.evaluate(params)?;
+        let anorm = params[self.anorm_index];
+        let back_a = params[self.back_a_index];
+        let back_b = params[self.back_b_index];
+        let back_c = params[self.back_c_index];
+
+        let result: Vec<f64> = t_inner
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| {
+                anorm * t
+                    + back_a
+                    + back_b * self.inv_sqrt_energies[i]
+                    + back_c * self.sqrt_energies[i]
+            })
+            .collect();
+        Ok(result)
+    }
+
+    /// Analytical Jacobian for the normalized transmission model.
+    ///
+    /// For each free parameter:
+    /// - If it belongs to the inner model (density or temperature):
+    ///   ∂T_out/∂p = Anorm × ∂T_inner/∂p  (inner Jacobian scaled by Anorm)
+    /// - ∂T_out/∂Anorm  = T_inner(E)
+    /// - ∂T_out/∂BackA  = 1
+    /// - ∂T_out/∂BackB  = 1/√E
+    /// - ∂T_out/∂BackC  = √E
+    fn analytical_jacobian(
+        &self,
+        params: &[f64],
+        free_param_indices: &[usize],
+        y_current: &[f64],
+    ) -> Option<FlatMatrix> {
+        let n_e = y_current.len();
+        let n_free = free_param_indices.len();
+
+        // Compute T_inner for Anorm column and for scaling inner Jacobian.
+        // T_inner = (T_out - BackA - BackB/√E - BackC×√E) / Anorm
+        // But to avoid numerical issues, recompute from the inner model.
+        let t_inner = self.inner.evaluate(params).ok()?;
+
+        let anorm = params[self.anorm_index];
+
+        // Identify which free params are background params vs inner params.
+        let bg_indices = [
+            self.anorm_index,
+            self.back_a_index,
+            self.back_b_index,
+            self.back_c_index,
+        ];
+
+        // Collect inner model's free param indices (those not in bg_indices).
+        let inner_free_indices: Vec<usize> = free_param_indices
+            .iter()
+            .copied()
+            .filter(|idx| !bg_indices.contains(idx))
+            .collect();
+
+        // Get inner Jacobian if there are inner free params.
+        // y_current for the inner model is t_inner, not the outer y_current.
+        let inner_jac = if !inner_free_indices.is_empty() {
+            self.inner
+                .analytical_jacobian(params, &inner_free_indices, &t_inner)
+        } else {
+            None
+        };
+
+        let mut jacobian = FlatMatrix::zeros(n_e, n_free);
+
+        // Map inner free param index → column in inner Jacobian.
+        let mut inner_col_map = std::collections::HashMap::new();
+        for (col, &idx) in inner_free_indices.iter().enumerate() {
+            inner_col_map.insert(idx, col);
+        }
+
+        for (col, &fp_idx) in free_param_indices.iter().enumerate() {
+            if fp_idx == self.anorm_index {
+                // ∂T_out/∂Anorm = T_inner(E)
+                for (i, &ti) in t_inner.iter().enumerate() {
+                    *jacobian.get_mut(i, col) = ti;
+                }
+            } else if fp_idx == self.back_a_index {
+                // ∂T_out/∂BackA = 1
+                for i in 0..n_e {
+                    *jacobian.get_mut(i, col) = 1.0;
+                }
+            } else if fp_idx == self.back_b_index {
+                // ∂T_out/∂BackB = 1/√E
+                for (i, &inv_se) in self.inv_sqrt_energies.iter().enumerate() {
+                    *jacobian.get_mut(i, col) = inv_se;
+                }
+            } else if fp_idx == self.back_c_index {
+                // ∂T_out/∂BackC = √E
+                for (i, &se) in self.sqrt_energies.iter().enumerate() {
+                    *jacobian.get_mut(i, col) = se;
+                }
+            } else if let Some(&inner_col) = inner_col_map.get(&fp_idx) {
+                // Inner model parameter: ∂T_out/∂p = Anorm × ∂T_inner/∂p
+                if let Some(ref jac) = inner_jac {
+                    for i in 0..n_e {
+                        *jacobian.get_mut(i, col) = anorm * jac.get(i, inner_col);
+                    }
+                } else {
+                    // Inner model did not provide analytical Jacobian —
+                    // fall back to finite-difference for the whole thing.
+                    return None;
+                }
+            } else {
+                // Unknown parameter — should not happen, but fall back to FD.
+                return None;
+            }
+        }
+
+        Some(jacobian)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -942,5 +1126,237 @@ mod tests {
         // Change temperature — cache should update.
         let _y3 = model.evaluate(&[0.0005, 600.0]).unwrap();
         assert!((model.cached_temperature.get() - 600.0).abs() < 1e-15);
+    }
+
+    // ── NormalizedTransmissionModel ─────────────────────────────────────────
+
+    /// Helper: make a PrecomputedTransmissionModel with given cross-sections.
+    fn make_precomputed(
+        xs: Vec<Vec<f64>>,
+        density_indices: Vec<usize>,
+    ) -> PrecomputedTransmissionModel {
+        PrecomputedTransmissionModel {
+            cross_sections: Arc::new(xs),
+            density_indices: Arc::new(density_indices),
+        }
+    }
+
+    /// Verify that NormalizedTransmissionModel with identity normalization
+    /// (Anorm=1, all background=0) gives the same result as the inner model.
+    #[test]
+    fn normalized_identity_matches_inner() {
+        let xs = vec![
+            vec![1.0, 2.0, 3.0], // isotope 0
+            vec![0.5, 0.5, 0.5], // isotope 1
+        ];
+        let inner_ref = make_precomputed(xs.clone(), vec![0, 1]);
+        let inner_wrap = make_precomputed(xs, vec![0, 1]);
+
+        let energies = [4.0, 9.0, 16.0];
+        // params: [density0, density1, Anorm, BackA, BackB, BackC]
+        let model = NormalizedTransmissionModel::new(inner_wrap, &energies, 2, 3, 4, 5);
+
+        let params = [0.2, 0.4, 1.0, 0.0, 0.0, 0.0];
+        let y_norm = model.evaluate(&params).unwrap();
+        let y_inner = inner_ref.evaluate(&params).unwrap();
+
+        for (a, b) in y_norm.iter().zip(y_inner.iter()) {
+            assert!(
+                (a - b).abs() < 1e-12,
+                "identity normalization should match inner: {} vs {}",
+                a,
+                b
+            );
+        }
+    }
+
+    /// Verify the normalization formula:
+    /// T_out = Anorm * T_inner + BackA + BackB/sqrt(E) + BackC*sqrt(E)
+    #[test]
+    fn normalized_formula_correct() {
+        let xs = vec![vec![1.0, 2.0, 3.0]];
+        let inner_ref = make_precomputed(xs.clone(), vec![0]);
+        let inner_wrap = make_precomputed(xs, vec![0]);
+
+        let energies = [4.0, 9.0, 16.0]; // sqrt = [2, 3, 4]
+        let model = NormalizedTransmissionModel::new(inner_wrap, &energies, 1, 2, 3, 4);
+
+        // params: [density, Anorm, BackA, BackB, BackC]
+        let anorm = 0.95;
+        let back_a = 0.01;
+        let back_b = 0.02;
+        let back_c = 0.005;
+        let density = 0.3;
+        let params = [density, anorm, back_a, back_b, back_c];
+
+        let y = model.evaluate(&params).unwrap();
+        let t_inner = inner_ref.evaluate(&params).unwrap();
+
+        for (i, (&yi, &ti)) in y.iter().zip(t_inner.iter()).enumerate() {
+            let sqrt_e = energies[i].sqrt();
+            let expected = anorm * ti + back_a + back_b / sqrt_e + back_c * sqrt_e;
+            assert!(
+                (yi - expected).abs() < 1e-12,
+                "E[{i}]: got {yi}, expected {expected}"
+            );
+        }
+    }
+
+    /// Analytical Jacobian of NormalizedTransmissionModel must match
+    /// central-difference finite-difference.
+    #[test]
+    fn normalized_analytical_jacobian_matches_fd() {
+        let xs = vec![
+            vec![1.0, 2.0, 3.0], // isotope 0
+            vec![0.5, 0.5, 0.5], // isotope 1
+        ];
+        let inner = make_precomputed(xs, vec![0, 1]);
+
+        let energies = [4.0, 9.0, 16.0];
+        // params: [density0, density1, Anorm, BackA, BackB, BackC]
+        let model = NormalizedTransmissionModel::new(inner, &energies, 2, 3, 4, 5);
+
+        let params = [0.2, 0.4, 0.95, 0.01, 0.02, 0.005];
+        let y = model.evaluate(&params).unwrap();
+        let free: Vec<usize> = (0..6).collect();
+
+        let jac = model
+            .analytical_jacobian(&params, &free, &y)
+            .expect("analytical_jacobian should return Some");
+
+        assert_eq!(jac.nrows, 3);
+        assert_eq!(jac.ncols, 6);
+
+        // Central-difference reference
+        let h = 1e-7;
+        for (col, &p_idx) in free.iter().enumerate() {
+            let mut p_plus = params;
+            let mut p_minus = params;
+            p_plus[p_idx] += h;
+            p_minus[p_idx] -= h;
+
+            let y_plus = model.evaluate(&p_plus).unwrap();
+            let y_minus = model.evaluate(&p_minus).unwrap();
+
+            for i in 0..3 {
+                let fd = (y_plus[i] - y_minus[i]) / (2.0 * h);
+                let ana = jac.get(i, col);
+                let err = (fd - ana).abs();
+                let scale = fd.abs().max(ana.abs()).max(1e-10);
+                assert!(
+                    err / scale < 1e-4,
+                    "Jacobian mismatch (row {i}, col {col}): FD={fd:.8}, analytical={ana:.8}, \
+                     rel_err={:.6}",
+                    err / scale,
+                );
+            }
+        }
+    }
+
+    /// Verify that when some background params are fixed (not in
+    /// free_param_indices), the Jacobian columns are correct.
+    #[test]
+    fn normalized_jacobian_partial_free() {
+        let xs = vec![vec![1.0, 2.0, 3.0]];
+        let inner = make_precomputed(xs, vec![0]);
+
+        let energies = [4.0, 9.0, 16.0];
+        let model = NormalizedTransmissionModel::new(inner, &energies, 1, 2, 3, 4);
+
+        // params: [density, Anorm, BackA, BackB, BackC]
+        let params = [0.3, 0.95, 0.01, 0.0, 0.0];
+        let y = model.evaluate(&params).unwrap();
+        // Only density and Anorm are free
+        let free = vec![0usize, 1usize];
+
+        let jac = model
+            .analytical_jacobian(&params, &free, &y)
+            .expect("should return Some for partial free");
+
+        assert_eq!(jac.nrows, 3);
+        assert_eq!(jac.ncols, 2);
+
+        // Central-difference reference
+        let h = 1e-7;
+        for (col, &p_idx) in free.iter().enumerate() {
+            let mut p_plus = params;
+            let mut p_minus = params;
+            p_plus[p_idx] += h;
+            p_minus[p_idx] -= h;
+
+            let y_plus = model.evaluate(&p_plus).unwrap();
+            let y_minus = model.evaluate(&p_minus).unwrap();
+
+            for i in 0..3 {
+                let fd = (y_plus[i] - y_minus[i]) / (2.0 * h);
+                let ana = jac.get(i, col);
+                let err = (fd - ana).abs();
+                let scale = fd.abs().max(ana.abs()).max(1e-10);
+                assert!(
+                    err / scale < 1e-4,
+                    "Jacobian mismatch (row {i}, col {col}): FD={fd:.8}, analytical={ana:.8}"
+                );
+            }
+        }
+    }
+
+    /// End-to-end: fit recovers known Anorm + BackA from synthetic data.
+    #[test]
+    fn normalized_fit_recovers_anorm_and_backa() {
+        let xs = vec![vec![1.0, 2.0, 3.0, 2.0, 1.5]];
+        let inner = make_precomputed(xs, vec![0]);
+
+        let energies = [4.0, 9.0, 16.0, 25.0, 36.0];
+        let model = NormalizedTransmissionModel::new(inner, &energies, 1, 2, 3, 4);
+
+        // True parameters
+        let true_density = 0.2;
+        let true_anorm = 0.95;
+        let true_back_a = 0.02;
+        let true_params = [true_density, true_anorm, true_back_a, 0.0, 0.0];
+
+        let y_obs = model.evaluate(&true_params).unwrap();
+        let sigma = vec![0.001; y_obs.len()];
+
+        // Initial guesses offset from truth
+        let mut params = ParameterSet::new(vec![
+            FitParameter::non_negative("density", 0.1),
+            FitParameter {
+                name: "anorm".into(),
+                value: 1.0,
+                lower: 0.5,
+                upper: 1.5,
+                fixed: false,
+            },
+            FitParameter::unbounded("back_a", 0.0),
+            FitParameter::fixed("back_b", 0.0),
+            FitParameter::fixed("back_c", 0.0),
+        ]);
+
+        let config = LmConfig {
+            max_iter: 200,
+            ..LmConfig::default()
+        };
+
+        let result = lm::levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &config).unwrap();
+
+        assert!(result.converged, "Fit should converge");
+
+        let fit_density = result.params[0];
+        let fit_anorm = result.params[1];
+        let fit_back_a = result.params[2];
+
+        assert!(
+            (fit_density - true_density).abs() / true_density < 0.01,
+            "density: fitted={fit_density}, true={true_density}"
+        );
+        assert!(
+            (fit_anorm - true_anorm).abs() / true_anorm < 0.01,
+            "anorm: fitted={fit_anorm}, true={true_anorm}"
+        );
+        assert!(
+            (fit_back_a - true_back_a).abs() < 0.001,
+            "back_a: fitted={fit_back_a}, true={true_back_a}"
+        );
     }
 }

@@ -50,7 +50,7 @@ use nereids_physics::resolution::{
 };
 use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
 use nereids_pipeline::detectability;
-use nereids_pipeline::pipeline::FitConfig;
+use nereids_pipeline::pipeline::{BackgroundConfig, FitConfig, SolverChoice};
 use nereids_pipeline::regularization::{RegularizationConfig, spatial_map_regularized};
 use nereids_pipeline::sparse::{SparseConfig, estimate_nuisance, sparse_reconstruct};
 
@@ -688,7 +688,7 @@ fn forward_model<'py>(
 /// Returns:
 ///     FitResult with densities, uncertainties, and fit quality.
 #[pyfunction]
-#[pyo3(signature = (measured_t, sigma, energies, isotopes, temperature_k=0.0, initial_densities=None, max_iter=100, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, delta_e_us=None, fit_temperature=false, fitter="lm"))]
+#[pyo3(signature = (measured_t, sigma, energies, isotopes, temperature_k=0.0, initial_densities=None, max_iter=100, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, delta_e_us=None, fit_temperature=false, fitter="lm", background=false))]
 fn fit_spectrum(
     py: Python<'_>,
     measured_t: PyReadonlyArray1<f64>,
@@ -705,6 +705,7 @@ fn fit_spectrum(
     delta_e_us: Option<f64>,
     fit_temperature: bool,
     fitter: &str,
+    background: bool,
 ) -> PyResult<PyFitResult> {
     let e = energies.as_slice()?;
     let t = measured_t.as_slice()?;
@@ -764,6 +765,73 @@ fn fit_spectrum(
     }
 
     let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution, delta_e_us)?;
+
+    // When background normalization is enabled, delegate to the pipeline's
+    // fit_spectrum which already handles NormalizedTransmissionModel wrapping.
+    if background {
+        let e_owned = e.to_vec();
+        let t_owned = t.to_vec();
+        let s_owned = s.to_vec();
+
+        let solver_choice = match fitter {
+            "lm" => SolverChoice::LevenbergMarquardt,
+            "poisson" => SolverChoice::PoissonKL(PoissonConfig {
+                max_iter,
+                ..PoissonConfig::default()
+            }),
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "fitter must be 'lm' or 'poisson', got '{other}'"
+                )));
+            }
+        };
+
+        let result: Result<PyFitResult, String> = py.detach(move || {
+            let names: Vec<String> = (0..n_isotopes).map(|i| format!("isotope_{i}")).collect();
+
+            let mut fit_config = FitConfig::new(
+                e_owned,
+                res_data.clone(),
+                names,
+                temperature_k,
+                res_fn,
+                init,
+                LmConfig {
+                    max_iter,
+                    ..LmConfig::default()
+                },
+            )
+            .map_err(|e| format!("FitConfig::new failed: {e}"))?
+            .with_background(BackgroundConfig::default())
+            .with_solver(solver_choice);
+
+            if fit_temperature {
+                fit_config = fit_config
+                    .with_fit_temperature(true)
+                    .map_err(|e| format!("with_fit_temperature failed: {e}"))?;
+            }
+
+            let result = nereids_pipeline::pipeline::fit_spectrum(&t_owned, &s_owned, &fit_config)
+                .map_err(|e| format!("fit_spectrum failed: {e}"))?;
+
+            let (fitted_temperature, fitted_temperature_unc) =
+                match (result.temperature_k, result.temperature_k_unc) {
+                    (Some(t), unc) => (Some(t), unc),
+                    _ => (None, None),
+                };
+
+            Ok(PyFitResult {
+                densities: result.densities,
+                uncertainties: result.uncertainties,
+                reduced_chi_squared: result.reduced_chi_squared,
+                converged: result.converged,
+                iterations: result.iterations,
+                temperature_k: fitted_temperature,
+                temperature_k_unc: fitted_temperature_unc,
+            })
+        });
+        return result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e));
+    }
 
     match fitter {
         "lm" => {
