@@ -33,6 +33,10 @@ pub struct SpatialResult {
     /// Ensures display labels stay in sync with density data even if the
     /// user modifies the isotope list after fitting.
     pub isotope_labels: Vec<String>,
+    /// Per-pixel normalization factor map (when background fitting is enabled).
+    pub anorm_map: Option<Array2<f64>>,
+    /// Per-pixel background parameter maps [BackA, BackB, BackC] (when background enabled).
+    pub background_maps: Option<[Array2<f64>; 3]>,
     /// Number of pixels that converged.
     pub n_converged: usize,
     /// Total number of pixels fitted.
@@ -142,6 +146,8 @@ pub fn spatial_map(
         converged_map: Array2::from_elem((height, width), false),
         temperature_map: None,
         isotope_labels: isotope_labels.clone(),
+        anorm_map: None,
+        background_maps: None,
         n_converged: 0,
         n_total: 0,
     };
@@ -276,6 +282,21 @@ pub fn spatial_map(
     } else {
         None
     };
+    let has_background = config.background().is_some();
+    let mut anorm_map: Option<Array2<f64>> = if has_background {
+        Some(Array2::from_elem((height, width), 1.0))
+    } else {
+        None
+    };
+    let mut background_maps: Option<[Array2<f64>; 3]> = if has_background {
+        Some([
+            Array2::zeros((height, width)),
+            Array2::zeros((height, width)),
+            Array2::zeros((height, width)),
+        ])
+    } else {
+        None
+    };
     let mut n_converged = 0;
 
     for ((y, x), result) in &results {
@@ -292,6 +313,14 @@ pub fn spatial_map(
         if let (Some(t_map), Some(t)) = (&mut temperature_map, result.temperature_k) {
             t_map[[*y, *x]] = t;
         }
+        if let Some(ref mut a_map) = anorm_map {
+            a_map[[*y, *x]] = result.anorm;
+        }
+        if let Some(ref mut bg_maps) = background_maps {
+            bg_maps[0][[*y, *x]] = result.background[0];
+            bg_maps[1][[*y, *x]] = result.background[1];
+            bg_maps[2][[*y, *x]] = result.background[2];
+        }
         if result.converged {
             n_converged += 1;
         }
@@ -304,6 +333,8 @@ pub fn spatial_map(
         converged_map,
         temperature_map,
         isotope_labels,
+        anorm_map,
+        background_maps,
         n_converged,
         n_total: results.len(),
     })

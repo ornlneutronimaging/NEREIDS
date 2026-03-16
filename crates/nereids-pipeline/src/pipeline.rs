@@ -659,7 +659,11 @@ pub fn fit_spectrum(
                 //
                 // NOTE: Poisson analytic path does NOT support background wrapping
                 // because it constructs its own model internally.  Background +
-                // Poisson + temperature is dispatched through the standard path.
+                // Poisson + temperature is dispatched through the standard path,
+                // which uses finite-difference gradients.  FD gradients suffer
+                // from the density (~1e-4) vs temperature (~200) scale mismatch,
+                // so temperature fitting may be inaccurate in this combination.
+                // Users should prefer LM for background + temperature fitting.
                 if bg_indices.is_some() {
                     dispatch_maybe_bg(&model, &mut params)?
                 } else {

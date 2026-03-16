@@ -111,6 +111,10 @@ pub struct ProjectSnapshot {
     pub single_fit_iterations: Option<usize>,
     pub single_fit_pixel: Option<(usize, usize)>,
     pub single_fit_labels: Option<Vec<String>>,
+    /// Fitted normalization factor from single-pixel fit (1.0 default).
+    pub single_fit_anorm: Option<f64>,
+    /// Fitted background [BackA, BackB, BackC] from single-pixel fit.
+    pub single_fit_background: Option<[f64; 3]>,
 
     // -- endf_cache --
     /// (symbol, resonance_data) pairs for offline loading.
@@ -180,6 +184,8 @@ impl Default for ProjectSnapshot {
             single_fit_iterations: None,
             single_fit_pixel: None,
             single_fit_labels: None,
+            single_fit_anorm: None,
+            single_fit_background: None,
             endf_cache: vec![],
             provenance: vec![],
         }
@@ -697,6 +703,16 @@ fn write_results(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoErro
                 .create("isotope_labels")
                 .and_then(|ds| ds.write_raw(&vlu))
                 .map_err(|e| hdf5_err("/results/single_fit/isotope_labels", e))?;
+        }
+        if let Some(anorm) = snap.single_fit_anorm {
+            write_f64_attr(&sf, "anorm", anorm)?;
+        }
+        if let Some(bg) = snap.single_fit_background {
+            sf.new_dataset::<f64>()
+                .shape([3])
+                .create("background")
+                .and_then(|ds| ds.write_raw(&bg))
+                .map_err(|e| hdf5_err("/results/single_fit/background", e))?;
         }
     }
 
@@ -1266,6 +1282,15 @@ fn read_results(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoE
                 .map_err(|e| hdf5_err("/results/single_fit/isotope_labels", e))?;
             snap.single_fit_labels = Some(vlu.iter().map(|v| v.as_str().to_string()).collect());
         }
+        snap.single_fit_anorm = read_f64_attr(&sf, "anorm").ok();
+        if let Ok(ds) = sf.dataset("background") {
+            let data: Vec<f64> = ds
+                .read_raw()
+                .map_err(|e| hdf5_err("/results/single_fit/background", e))?;
+            if data.len() == 3 {
+                snap.single_fit_background = Some([data[0], data[1], data[2]]);
+            }
+        }
     }
 
     Ok(())
@@ -1401,6 +1426,8 @@ mod tests {
             single_fit_iterations: None,
             single_fit_pixel: None,
             single_fit_labels: None,
+            single_fit_anorm: None,
+            single_fit_background: None,
             endf_cache: vec![],
             provenance: vec![],
         }

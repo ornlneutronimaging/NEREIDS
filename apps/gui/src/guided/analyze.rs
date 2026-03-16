@@ -1194,6 +1194,8 @@ pub fn run_spatial_map(state: &mut AppState) {
                         converged_map: r.converged_map,
                         temperature_map: r.temperature_map,
                         isotope_labels: r.isotope_labels,
+                        anorm_map: None,
+                        background_maps: None,
                         n_converged: r.n_converged,
                         n_total: r.n_total,
                     }
