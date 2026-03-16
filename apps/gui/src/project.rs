@@ -145,6 +145,8 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         single_fit_iterations,
         single_fit_pixel,
         single_fit_labels,
+        single_fit_anorm,
+        single_fit_background,
     ) = if let Some(ref pfr) = state.pixel_fit_result {
         // Prefer labels from FitFeedback (captured at fit time) to avoid
         // desync if isotope_entries are modified after the fit.
@@ -171,9 +173,13 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
             Some(pfr.iterations),
             state.selected_pixel,
             Some(labels),
+            Some(pfr.anorm),
+            Some(pfr.background),
         )
     } else {
-        (None, None, None, None, None, None, None, None, None)
+        (
+            None, None, None, None, None, None, None, None, None, None, None,
+        )
     };
 
     // Provenance log
@@ -269,6 +275,8 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         single_fit_iterations,
         single_fit_pixel,
         single_fit_labels,
+        single_fit_anorm,
+        single_fit_background,
         endf_cache,
         provenance,
     }
@@ -843,6 +851,10 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
                     .map(|e| e.symbol.clone())
                     .collect()
             }),
+            // Background maps are not persisted yet — default to None for
+            // backward compatibility with old project files.
+            anorm_map: None,
+            background_maps: None,
             n_converged: snap.n_converged.unwrap_or(0),
             n_total: snap.n_total.unwrap_or(0),
         };
@@ -861,8 +873,8 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
             iterations: snap.single_fit_iterations.unwrap_or(0),
             temperature_k: snap.single_fit_temperature,
             temperature_k_unc: snap.single_fit_temperature_unc,
-            anorm: 1.0,
-            background: [0.0, 0.0, 0.0],
+            anorm: snap.single_fit_anorm.unwrap_or(1.0),
+            background: snap.single_fit_background.unwrap_or([0.0, 0.0, 0.0]),
         };
         // Rebuild FitFeedback from the restored result
         if let Some(ref labels) = snap.single_fit_labels {

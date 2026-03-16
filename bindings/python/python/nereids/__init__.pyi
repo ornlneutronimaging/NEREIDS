@@ -85,6 +85,16 @@ class FitResult:
         """1-sigma uncertainty on fitted temperature (None when fit_temperature=False)."""
         ...
 
+    @property
+    def anorm(self) -> float:
+        """Fitted normalization factor (1.0 if background not enabled)."""
+        ...
+
+    @property
+    def background(self) -> tuple[float, float, float]:
+        """Fitted background parameters (BackA, BackB, BackC)."""
+        ...
+
 class TabulatedResolution:
     """Tabulated instrument resolution function."""
 

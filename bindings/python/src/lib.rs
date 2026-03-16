@@ -173,6 +173,10 @@ struct PyFitResult {
     temperature_k: Option<f64>,
     /// 1-sigma uncertainty on fitted temperature (K).
     temperature_k_unc: Option<f64>,
+    /// Fitted normalization factor (1.0 when background not enabled).
+    anorm: f64,
+    /// Fitted background parameters [BackA, BackB, BackC] (all 0.0 when not enabled).
+    background: [f64; 3],
 }
 
 #[pymethods]
@@ -224,6 +228,18 @@ impl PyFitResult {
     #[getter]
     fn temperature_k_unc(&self) -> Option<f64> {
         self.temperature_k_unc
+    }
+
+    /// Fitted normalization factor (1.0 if background not enabled).
+    #[getter]
+    fn anorm(&self) -> f64 {
+        self.anorm
+    }
+
+    /// Fitted background parameters (BackA, BackB, BackC).
+    #[getter]
+    fn background(&self) -> [f64; 3] {
+        self.background
     }
 
     fn __repr__(&self) -> String {
@@ -685,6 +701,14 @@ fn forward_model<'py>(
 ///           optimizer but required for API consistency.
 ///           ``result.reduced_chi_squared`` contains the final NLL (not chi-squared).
 ///
+/// Note:
+///     When ``fitter='poisson'`` and ``background=True``, the Poisson analytic
+///     gradient path is unavailable (it does not support background wrapping).
+///     The solver falls back to finite-difference gradients, which suffer from
+///     the density (~1e-4) vs temperature (~200) scale mismatch.  Temperature
+///     fitting may be inaccurate in this combination.  Prefer ``fitter='lm'``
+///     for background + temperature fitting.
+///
 /// Returns:
 ///     FitResult with densities, uncertainties, and fit quality.
 #[pyfunction]
@@ -791,7 +815,7 @@ fn fit_spectrum(
 
             let mut fit_config = FitConfig::new(
                 e_owned,
-                res_data.clone(),
+                res_data,
                 names,
                 temperature_k,
                 res_fn,
@@ -828,6 +852,8 @@ fn fit_spectrum(
                 iterations: result.iterations,
                 temperature_k: fitted_temperature,
                 temperature_k_unc: fitted_temperature_unc,
+                anorm: result.anorm,
+                background: result.background,
             })
         });
         return result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e));
@@ -950,6 +976,8 @@ fn fit_spectrum(
                     iterations: lm_result.iterations,
                     temperature_k: fitted_temperature,
                     temperature_k_unc: fitted_temperature_unc,
+                    anorm: 1.0,
+                    background: [0.0, 0.0, 0.0],
                 })
             });
             result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
@@ -1099,6 +1127,8 @@ fn fit_spectrum(
                     iterations: poisson_result.iterations,
                     temperature_k: fitted_temperature,
                     temperature_k_unc: fitted_temperature_unc,
+                    anorm: 1.0,
+                    background: [0.0, 0.0, 0.0],
                 })
             });
             result.map_err(|e| pyo3::exceptions::PyValueError::new_err(e))
@@ -2291,6 +2321,8 @@ fn py_fit_roi(
         iterations: result.iterations,
         temperature_k: None,
         temperature_k_unc: None,
+        anorm: result.anorm,
+        background: result.background,
     })
 }
 
