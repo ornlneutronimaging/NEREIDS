@@ -1007,3 +1007,104 @@ class TestTraceDetectability:
                 energies=energies,
                 i0=10000.0,
             )
+
+
+# ===========================================================================
+# Spatial map regularized
+# ===========================================================================
+
+
+@pytest.fixture(scope="module")
+def w182_endf():
+    """Load W-182 ENDF data (requires network on first run, cached after)."""
+    return nereids.load_endf(74, 182)
+
+
+class TestSpatialMapRegularized:
+    """Tests for spatial_map_regularized()."""
+
+    def test_basic_regularized(self, w182_endf):
+        """Smoke test: W-182, 4x4 grid, verify result shape and finiteness."""
+        energies = np.linspace(1.0, 100.0, 50)
+        true_density = 0.001
+        ny, nx = 4, 4
+        i0 = 50.0
+
+        # Build clean transmission via forward_model
+        t_clean = np.asarray(
+            nereids.forward_model(energies, [(w182_endf, true_density)])
+        )
+
+        # Simulate Poisson-noisy counts, convert back to transmission
+        rng = np.random.default_rng(42)
+        trans = np.zeros((len(energies), ny, nx))
+        unc = np.zeros_like(trans)
+        for y in range(ny):
+            for x in range(nx):
+                counts = rng.poisson(i0 * t_clean).astype(float)
+                counts = np.maximum(counts, 1.0)
+                trans[:, y, x] = counts / i0
+                unc[:, y, x] = np.sqrt(counts) / i0
+
+        result = nereids.spatial_map_regularized(
+            trans, unc, energies, [w182_endf],
+            temperature_k=0.0, max_iter=50,
+        )
+
+        # Verify type
+        assert isinstance(result, nereids.RegularizedResult)
+
+        # Density maps: one per isotope, correct spatial shape
+        density_maps = result.density_maps
+        assert len(density_maps) == 1
+        dmap = np.asarray(density_maps[0])
+        assert dmap.shape == (ny, nx)
+        assert np.all(np.isfinite(dmap))
+
+        # Uncertainty maps: one per isotope, correct shape, finite
+        uncertainty_maps = result.uncertainty_maps
+        assert len(uncertainty_maps) == 1
+        umap = np.asarray(uncertainty_maps[0])
+        assert umap.shape == (ny, nx)
+        assert np.all(np.isfinite(umap))
+
+        # Diagnostics
+        assert result.n_weak_directions >= 0
+        fisher_eigs = np.asarray(result.fisher_eigenvalues)
+        assert len(fisher_eigs) == 1  # 1 isotope -> 1 eigenvalue
+        assert np.all(np.isfinite(fisher_eigs))
+
+        # Chi-squared and convergence maps
+        assert np.asarray(result.chi_squared_map).shape == (ny, nx)
+        assert np.asarray(result.converged_map).shape == (ny, nx)
+        assert result.n_total == ny * nx
+
+    def test_single_isotope_no_weak_directions(self, w182_endf):
+        """Single isotope: the one eigenvalue is always 'strong' (threshold < 1.0)."""
+        energies = np.linspace(1.0, 100.0, 50)
+        true_density = 0.001
+        ny, nx = 2, 2
+        i0 = 50.0
+
+        t_clean = np.asarray(
+            nereids.forward_model(energies, [(w182_endf, true_density)])
+        )
+
+        rng = np.random.default_rng(99)
+        trans = np.zeros((len(energies), ny, nx))
+        unc = np.zeros_like(trans)
+        for y in range(ny):
+            for x in range(nx):
+                counts = rng.poisson(i0 * t_clean).astype(float)
+                counts = np.maximum(counts, 1.0)
+                trans[:, y, x] = counts / i0
+                unc[:, y, x] = np.sqrt(counts) / i0
+
+        result = nereids.spatial_map_regularized(
+            trans, unc, energies, [w182_endf],
+            temperature_k=0.0, max_iter=50,
+        )
+
+        # With a single isotope, the single eigenvalue is the max eigenvalue,
+        # so threshold * max == threshold * val < val => always strong.
+        assert result.n_weak_directions == 0
