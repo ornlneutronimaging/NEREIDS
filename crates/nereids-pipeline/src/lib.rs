@@ -14,6 +14,7 @@
 pub mod detectability;
 pub mod error;
 pub mod pipeline;
+pub mod regularization;
 pub mod sparse;
 pub mod spatial;
 
