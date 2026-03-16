@@ -194,6 +194,24 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
         });
     }
 
+    // -- Spatial regularization --
+    ui.add_space(4.0);
+    ui.checkbox(&mut state.regularize, "Spatial regularization");
+    if state.regularize {
+        ui.horizontal(|ui| {
+            ui.label("Threshold:");
+            ui.add(
+                egui::DragValue::new(&mut state.regularization_threshold)
+                    .range(0.01..=0.5)
+                    .speed(0.01),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label("Smooth iter:");
+            ui.add(egui::DragValue::new(&mut state.regularization_smooth_iter).range(1..=50));
+        });
+    }
+
     ui.add_space(8.0);
     ui.separator();
 
@@ -1068,6 +1086,11 @@ pub fn run_spatial_map(state: &mut AppState) {
     // Snapshot ROIs at fit time for overlay rendering in Results
     state.fitting_rois = state.rois.clone();
 
+    // Capture regularization parameters before the thread closure borrows them.
+    let state_regularize = state.regularize;
+    let state_threshold = state.regularization_threshold;
+    let state_smooth_iter = state.regularization_smooth_iter;
+
     let (tx, rx) = mpsc::channel();
     state.pending_spatial = Some(rx);
     state.is_fitting = true;
@@ -1142,14 +1165,49 @@ pub fn run_spatial_map(state: &mut AppState) {
         // Run spatial_map on the dedicated pool so its par_iter doesn't
         // share the global pool with inner physics par_iter calls.
         let result = pool.install(|| {
-            nereids_pipeline::spatial::spatial_map(
-                norm.transmission.view(),
-                norm.uncertainty.view(),
-                &config,
-                dead_pixels.as_ref(),
-                Some(&cancel),
-                Some(&progress),
-            )
+            if state_regularize {
+                use nereids_pipeline::regularization::{
+                    RegularizationConfig, spatial_map_regularized,
+                };
+                let reg_config = RegularizationConfig {
+                    threshold: state_threshold,
+                    smooth_iter: state_smooth_iter,
+                    regularize_temperature: true,
+                    compute_uncertainty: true,
+                };
+                spatial_map_regularized(
+                    norm.transmission.view(),
+                    norm.uncertainty.view(),
+                    &config,
+                    &reg_config,
+                    dead_pixels.as_ref(),
+                    Some(&cancel),
+                    Some(&progress),
+                )
+                .map(|r| {
+                    // Convert RegularizedResult to SpatialResult for the
+                    // existing result display infrastructure.
+                    nereids_pipeline::spatial::SpatialResult {
+                        density_maps: r.density_maps,
+                        uncertainty_maps: r.uncertainty_maps,
+                        chi_squared_map: r.chi_squared_map,
+                        converged_map: r.converged_map,
+                        temperature_map: r.temperature_map,
+                        isotope_labels: r.isotope_labels,
+                        n_converged: r.n_converged,
+                        n_total: r.n_total,
+                    }
+                })
+            } else {
+                nereids_pipeline::spatial::spatial_map(
+                    norm.transmission.view(),
+                    norm.uncertainty.view(),
+                    &config,
+                    dead_pixels.as_ref(),
+                    Some(&cancel),
+                    Some(&progress),
+                )
+            }
         });
 
         // Signal watcher to stop, then send result.
