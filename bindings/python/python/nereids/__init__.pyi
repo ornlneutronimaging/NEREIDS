@@ -434,6 +434,7 @@ def spatial_map_regularized(
     resolution: TabulatedResolution | None = None,
     delta_e_us: float | None = None,
     max_iter: int = 100,
+    fitter: str = "lm",
     threshold: float = 0.05,
     smooth_iter: int = 10,
     compute_uncertainty: bool = True,
