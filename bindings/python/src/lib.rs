@@ -1876,7 +1876,7 @@ fn py_spatial_map(
 /// Returns:
 ///     RegularizedResult with density maps, uncertainty maps, and diagnostics.
 #[pyfunction]
-#[pyo3(name = "spatial_map_regularized", signature = (transmission, uncertainty, energies, isotopes, temperature_k=300.0, initial_densities=None, dead_pixels=None, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, delta_e_us=None, max_iter=100, threshold=0.05, smooth_iter=10, compute_uncertainty=true, regularize_temperature=true))]
+#[pyo3(name = "spatial_map_regularized", signature = (transmission, uncertainty, energies, isotopes, temperature_k=300.0, initial_densities=None, dead_pixels=None, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, delta_e_us=None, max_iter=100, fitter="lm", threshold=0.05, smooth_iter=10, compute_uncertainty=true, regularize_temperature=true))]
 fn py_spatial_map_regularized(
     py: Python<'_>,
     transmission: PyReadonlyArray3<f64>,
@@ -1892,6 +1892,7 @@ fn py_spatial_map_regularized(
     resolution: Option<PyTabulatedResolution>,
     delta_e_us: Option<f64>,
     max_iter: usize,
+    fitter: &str,
     threshold: f64,
     smooth_iter: usize,
     compute_uncertainty: bool,
@@ -1967,7 +1968,7 @@ fn py_spatial_map_regularized(
 
     let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution, delta_e_us)?;
 
-    let config = FitConfig::new(
+    let mut config = FitConfig::new(
         e.to_vec(),
         res_data,
         isotope_names,
@@ -1980,6 +1981,22 @@ fn py_spatial_map_regularized(
         },
     )
     .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+
+    // Set solver choice
+    config = match fitter {
+        "lm" => config,
+        "poisson" => config.with_solver(nereids_pipeline::pipeline::SolverChoice::PoissonKL(
+            PoissonConfig {
+                max_iter,
+                ..PoissonConfig::default()
+            },
+        )),
+        other => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "fitter must be 'lm' or 'poisson', got '{other}'",
+            )));
+        }
+    };
 
     let reg_config = RegularizationConfig {
         threshold,
