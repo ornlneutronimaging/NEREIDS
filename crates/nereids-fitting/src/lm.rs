@@ -162,6 +162,27 @@ pub trait FitModel {
     }
 }
 
+/// Blanket implementation: shared references to any `FitModel` also implement
+/// `FitModel`, forwarding all calls to the underlying implementation.
+///
+/// This enables `NormalizedTransmissionModel<&dyn FitModel>` to work when the
+/// inner model is borrowed (e.g. in `fit_spectrum` where the inner model is a
+/// local variable wrapped conditionally).
+impl<M: FitModel + ?Sized> FitModel for &M {
+    fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+        (**self).evaluate(params)
+    }
+
+    fn analytical_jacobian(
+        &self,
+        params: &[f64],
+        free_param_indices: &[usize],
+        y_current: &[f64],
+    ) -> Option<FlatMatrix> {
+        (**self).analytical_jacobian(params, free_param_indices, y_current)
+    }
+}
+
 /// Compute weighted chi-squared: Σ [(y_obs - y_model)² / σ²].
 fn chi_squared(residuals: &[f64], weights: &[f64]) -> f64 {
     residuals

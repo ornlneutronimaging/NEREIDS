@@ -861,6 +861,8 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
             iterations: snap.single_fit_iterations.unwrap_or(0),
             temperature_k: snap.single_fit_temperature,
             temperature_k_unc: snap.single_fit_temperature_unc,
+            anorm: 1.0,
+            background: [0.0, 0.0, 0.0],
         };
         // Rebuild FitFeedback from the restored result
         if let Some(ref labels) = snap.single_fit_labels {

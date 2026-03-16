@@ -320,8 +320,17 @@ def fit_spectrum(
     delta_e_us: float | None = None,
     fit_temperature: bool = False,
     fitter: str = "lm",
+    background: bool = False,
 ) -> FitResult:
-    """Fit a measured transmission spectrum to recover isotopic areal densities."""
+    """Fit a measured transmission spectrum to recover isotopic areal densities.
+
+    When ``background=True``, the model becomes:
+
+        T(E) = Anorm * T_inner(E) + BackA + BackB/sqrt(E) + BackC*sqrt(E)
+
+    where Anorm and BackA/B/C are fitted jointly with the isotope densities.
+    This matches SAMMY's NORMAlization and BACKGround cards.
+    """
     ...
 
 def tof_to_energy(tof_us: float, flight_path_m: float) -> float:
