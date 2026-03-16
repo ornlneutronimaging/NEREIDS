@@ -14,5 +14,7 @@ nereids-endf = { workspace = true }
 nereids-physics = { workspace = true }
 nereids-fitting = { workspace = true }
 ndarray = { workspace = true }
+rand = "0.9"
+rand_distr = "0.5"
 rayon = { workspace = true }
 thiserror = { workspace = true }

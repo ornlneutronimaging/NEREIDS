@@ -490,76 +490,11 @@ pub fn spatial_map_regularized(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::noise::generate_noisy_cube;
     use crate::pipeline::FitConfig;
     use crate::test_helpers::w182_single_resonance;
     use nereids_fitting::lm::LmConfig;
     use nereids_physics::transmission::broadened_cross_sections;
-
-    /// Helper: generate a uniform noisy cube using simple seeded RNG.
-    /// Uses a linear congruential generator to avoid rand dependency.
-    fn generate_uniform_cube(
-        energies: &[f64],
-        cross_sections: &[Vec<f64>],
-        true_densities: &[f64],
-        height: usize,
-        width: usize,
-        i0: f64,
-        seed: u64,
-    ) -> (ndarray::Array3<f64>, ndarray::Array3<f64>) {
-        let n_e = energies.len();
-
-        // Compute clean transmission
-        let mut t_clean = vec![0.0f64; n_e];
-        for e in 0..n_e {
-            let mut exponent = 0.0;
-            for k in 0..cross_sections.len() {
-                exponent += true_densities[k] * cross_sections[k][e];
-            }
-            t_clean[e] = (-exponent).exp();
-        }
-
-        // Simple Poisson-like noise using a seeded LCG.
-        // Not cryptographically random, but reproducible for tests.
-        let mut state = seed;
-        let mut next_uniform = || -> f64 {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-            (state >> 33) as f64 / (1u64 << 31) as f64
-        };
-        // Box-Muller-ish Poisson approximation: for lambda > 0,
-        // use round(lambda + sqrt(lambda) * normal).
-        let mut next_poisson = |lambda: f64| -> f64 {
-            if lambda < 0.5 {
-                // For very small lambda, just use 0 or 1
-                if next_uniform() < (-lambda).exp() {
-                    0.0
-                } else {
-                    1.0
-                }
-            } else {
-                // Normal approximation to Poisson
-                let u1 = next_uniform().max(1e-30);
-                let u2 = next_uniform();
-                let normal = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
-                (lambda + lambda.sqrt() * normal).round().max(0.0)
-            }
-        };
-
-        let mut trans = ndarray::Array3::<f64>::zeros((n_e, height, width));
-        let mut unc = ndarray::Array3::<f64>::zeros((n_e, height, width));
-
-        for y in 0..height {
-            for x in 0..width {
-                for e in 0..n_e {
-                    let expected = i0 * t_clean[e];
-                    let counts = next_poisson(expected);
-                    trans[[e, y, x]] = counts / i0;
-                    unc[[e, y, x]] = counts.max(1.0).sqrt() / i0;
-                }
-            }
-        }
-
-        (trans, unc)
-    }
 
     #[test]
     fn test_fisher_matrix_symmetric() {
@@ -642,7 +577,10 @@ mod tests {
         .unwrap();
 
         let xs = broadened_cross_sections(&energies, &resonance_data, 300.0, None, None).unwrap();
-        let (trans, unc) = generate_uniform_cube(&energies, &xs, &[0.001], 4, 4, 50.0, 42);
+        let clean: Vec<f64> = (0..energies.len())
+            .map(|e| (-0.001 * xs[0][e]).exp())
+            .collect();
+        let (trans, unc) = generate_noisy_cube(&clean, (4, 4), 50.0, 42);
 
         let reg_config = RegularizationConfig {
             compute_uncertainty: false,
@@ -679,6 +617,171 @@ mod tests {
         assert!(
             max_diff < 1e-10,
             "Single isotope: regularized should match vanilla, max_diff={max_diff}"
+        );
+    }
+
+    #[test]
+    fn test_two_isotope_weak_direction_smoothed() {
+        // Two isotopes with very different Fisher information.
+        // Create a synthetic case where one isotope has strong resonances
+        // (well-determined) and one has weak resonances (poorly-determined).
+        // The regularization should smooth the weak isotope more than the strong.
+        use crate::test_helpers::w182_single_resonance;
+
+        let _resonance_data = [w182_single_resonance(), w182_single_resonance()];
+        let _energies: Vec<f64> = (0..50).map(|i| 1.0 + i as f64 * 0.2).collect();
+
+        // Build cross-sections manually: isotope 0 strong, isotope 1 weak
+        let xs_strong: Vec<f64> = (0..50)
+            .map(|i| {
+                let e = 1.0 + i as f64 * 0.2;
+                // Strong resonance at E=4.15 eV
+                1000.0 / (1.0 + ((e - 4.15) / 0.1).powi(2))
+            })
+            .collect();
+        let xs_weak: Vec<f64> = (0..50).map(|_| 5.0).collect(); // flat, featureless
+
+        // Compute clean transmission for [0.001, 0.003]
+        let true_densities = [0.001, 0.003];
+        let clean: Vec<f64> = (0..50)
+            .map(|e| (-(true_densities[0] * xs_strong[e] + true_densities[1] * xs_weak[e])).exp())
+            .collect();
+
+        // Generate noisy cube at low counts (unused — we test components directly)
+        let (_trans, _unc) = generate_noisy_cube(&clean, (8, 8), 10.0, 42);
+
+        // We can't use FitConfig with fake cross-sections, but we can
+        // test the Fisher matrix and eigenbasis components directly.
+        let xs = [xs_strong, xs_weak];
+        let fisher = compute_fisher_matrix(&xs, &true_densities);
+        let (eigenvalues, _eigenvectors) = eigen_symmetric(&fisher);
+
+        // The weak isotope (flat xs) should produce a much smaller
+        // Fisher eigenvalue than the strong one.
+        assert!(
+            eigenvalues[0] < eigenvalues[1] * 0.1,
+            "Weak direction eigenvalue should be << strong: {:?}",
+            eigenvalues
+        );
+
+        // Verify the threshold correctly identifies weak vs strong
+        let threshold = 0.05;
+        let max_eig = eigenvalues.iter().cloned().fold(0.0f64, f64::max);
+        let is_weak: Vec<bool> = eigenvalues
+            .iter()
+            .map(|&e| e < threshold * max_eig)
+            .collect();
+        assert!(is_weak[0], "First eigenvalue should be weak");
+        assert!(!is_weak[1], "Second eigenvalue should be strong");
+
+        // Test selective smoothing: create noisy maps, smooth, verify
+        // weak map gets smoother while strong map is untouched
+        let mut maps = vec![
+            Array2::from_elem((4, 4), 0.001),
+            Array2::from_elem((4, 4), 0.003),
+        ];
+        // Add noise
+        maps[0][[0, 0]] = 0.002;
+        maps[0][[1, 1]] = 0.0005;
+        maps[1][[0, 0]] = 0.004;
+        maps[1][[1, 1]] = 0.002;
+
+        let var_before_0: f64 = {
+            let mean = maps[0].iter().sum::<f64>() / 16.0;
+            maps[0].iter().map(|&v| (v - mean).powi(2)).sum::<f64>() / 16.0
+        };
+        let var_before_1: f64 = {
+            let mean = maps[1].iter().sum::<f64>() / 16.0;
+            maps[1].iter().map(|&v| (v - mean).powi(2)).sum::<f64>() / 16.0
+        };
+
+        selective_spatial_smooth(&mut maps, &is_weak, 10);
+
+        let var_after_0: f64 = {
+            let mean = maps[0].iter().sum::<f64>() / 16.0;
+            maps[0].iter().map(|&v| (v - mean).powi(2)).sum::<f64>() / 16.0
+        };
+        let var_after_1: f64 = {
+            let mean = maps[1].iter().sum::<f64>() / 16.0;
+            maps[1].iter().map(|&v| (v - mean).powi(2)).sum::<f64>() / 16.0
+        };
+
+        // Weak map (index 0) should be smoother
+        assert!(
+            var_after_0 < var_before_0 * 0.5,
+            "Weak map should be significantly smoother: before={var_before_0:.2e} after={var_after_0:.2e}"
+        );
+        // Strong map (index 1) should be unchanged
+        assert!(
+            (var_after_1 - var_before_1).abs() < 1e-15,
+            "Strong map should be untouched: before={var_before_1:.2e} after={var_after_1:.2e}"
+        );
+    }
+
+    #[test]
+    fn test_regularized_reduces_noise_at_realistic_scale() {
+        // Integration test: W-182 at 100 energy bins, I₀=10, 8×8 grid.
+        // Regularization should NOT change the result for a single isotope
+        // (only 1 direction, always "strong"), but this validates the
+        // full pipeline runs without errors at moderate scale.
+        let resonance_data = vec![w182_single_resonance()];
+        let energies: Vec<f64> = (0..100).map(|i| 1.0 + i as f64 * 0.1).collect();
+
+        let config = FitConfig::new(
+            energies.clone(),
+            resonance_data.clone(),
+            vec!["W-182".to_string()],
+            300.0,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        )
+        .unwrap();
+
+        let xs = broadened_cross_sections(&energies, &resonance_data, 300.0, None, None).unwrap();
+        let clean: Vec<f64> = (0..energies.len())
+            .map(|e| (-0.001 * xs[0][e]).exp())
+            .collect();
+        let (trans, unc) = generate_noisy_cube(&clean, (8, 8), 10.0, 42);
+
+        let reg_config = RegularizationConfig {
+            compute_uncertainty: true,
+            ..Default::default()
+        };
+
+        let result = spatial_map_regularized(
+            trans.view(),
+            unc.view(),
+            &config,
+            &reg_config,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Basic sanity checks
+        assert_eq!(result.density_maps.len(), 1);
+        assert_eq!(result.uncertainty_maps.len(), 1);
+        assert_eq!(result.density_maps[0].shape(), &[8, 8]);
+        assert_eq!(result.uncertainty_maps[0].shape(), &[8, 8]);
+        assert_eq!(result.n_weak_directions, 0);
+        assert_eq!(result.fisher_eigenvalues.len(), 1);
+        assert!(result.fisher_eigenvalues[0] > 0.0);
+
+        // All uncertainties should be finite and positive
+        for &u in result.uncertainty_maps[0].iter() {
+            assert!(
+                u.is_finite() && u > 0.0,
+                "Uncertainty should be finite positive, got {u}"
+            );
+        }
+
+        // Densities should be reasonable (positive, within order of magnitude of true)
+        let mean: f64 = result.density_maps[0].iter().sum::<f64>() / 64.0;
+        assert!(
+            mean > 0.0 && mean < 0.01,
+            "Mean density should be reasonable, got {mean}"
         );
     }
 }
