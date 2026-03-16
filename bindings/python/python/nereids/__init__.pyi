@@ -179,6 +179,64 @@ class SparseResult:
         """Isotope names."""
         ...
 
+class RegularizedResult:
+    """Result of spatially regularized (Fisher eigenbasis) fitting."""
+
+    @property
+    def density_maps(self) -> list[NDArray[np.float64]]:
+        """Density maps as a list of 2D arrays, one per isotope."""
+        ...
+
+    @property
+    def uncertainty_maps(self) -> list[NDArray[np.float64]]:
+        """Uncertainty maps as a list of 2D arrays."""
+        ...
+
+    @property
+    def chi_squared_map(self) -> NDArray[np.float64]:
+        """Reduced chi-squared map."""
+        ...
+
+    @property
+    def converged_map(self) -> NDArray[np.bool_]:
+        """Convergence map (True = converged)."""
+        ...
+
+    @property
+    def temperature_map(self) -> NDArray[np.float64] | None:
+        """Temperature map (None when temperature fitting is disabled)."""
+        ...
+
+    @property
+    def temperature_uncertainty_map(self) -> NDArray[np.float64] | None:
+        """Temperature uncertainty map (None when temperature fitting is disabled)."""
+        ...
+
+    @property
+    def n_converged(self) -> int:
+        """Number of converged pixels."""
+        ...
+
+    @property
+    def n_total(self) -> int:
+        """Total number of fitted pixels."""
+        ...
+
+    @property
+    def isotope_names(self) -> list[str]:
+        """Isotope names."""
+        ...
+
+    @property
+    def n_weak_directions(self) -> int:
+        """Number of eigenvalue directions classified as weak."""
+        ...
+
+    @property
+    def fisher_eigenvalues(self) -> NDArray[np.float64]:
+        """Fisher eigenvalues (ascending order)."""
+        ...
+
 class TraceDetectabilityReport:
     """Result of a trace-detectability analysis."""
 
@@ -360,6 +418,27 @@ def spatial_map(
     roi: list[int] | None = None,
 ) -> SpatialResult | SparseResult:
     """Run per-pixel fitting across a transmission image stack."""
+    ...
+
+def spatial_map_regularized(
+    transmission: NDArray[np.float64],
+    uncertainty: NDArray[np.float64],
+    energies: NDArray[np.float64],
+    isotopes: list[ResonanceData],
+    temperature_k: float = 300.0,
+    initial_densities: list[float] | None = None,
+    dead_pixels: NDArray[np.bool_] | None = None,
+    flight_path_m: float | None = None,
+    delta_t_us: float | None = None,
+    delta_l_m: float | None = None,
+    resolution: TabulatedResolution | None = None,
+    delta_e_us: float | None = None,
+    max_iter: int = 100,
+    threshold: float = 0.05,
+    smooth_iter: int = 10,
+    compute_uncertainty: bool = True,
+) -> RegularizedResult:
+    """Run spatially regularized per-pixel fitting."""
     ...
 
 def fit_roi(
