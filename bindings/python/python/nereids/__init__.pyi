@@ -437,8 +437,17 @@ def spatial_map_regularized(
     threshold: float = 0.05,
     smooth_iter: int = 10,
     compute_uncertainty: bool = True,
+    regularize_temperature: bool = True,
 ) -> RegularizedResult:
-    """Run spatially regularized per-pixel fitting."""
+    """Run spatially regularized per-pixel fitting.
+
+    Uses Fisher eigenbasis selective regularization: identifies
+    poorly-determined parameter directions from the cross-section
+    structure and spatially smooths only those directions.
+
+    Temperature directions are included in the eigenbasis analysis
+    when temperature fitting is active in the FitConfig.
+    """
     ...
 
 def fit_roi(

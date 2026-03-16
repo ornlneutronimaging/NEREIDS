@@ -1869,11 +1869,14 @@ fn py_spatial_map(
 ///     threshold: Eigenvalue threshold for weak direction detection (default 0.05).
 ///     smooth_iter: Number of spatial smoothing iterations (default 10).
 ///     compute_uncertainty: Whether to compute Laplace uncertainty (default True).
+///     regularize_temperature: Whether to include temperature in the Fisher
+///         eigenbasis analysis (default True).  Only has effect when temperature
+///         fitting is active in the FitConfig.
 ///
 /// Returns:
 ///     RegularizedResult with density maps, uncertainty maps, and diagnostics.
 #[pyfunction]
-#[pyo3(name = "spatial_map_regularized", signature = (transmission, uncertainty, energies, isotopes, temperature_k=300.0, initial_densities=None, dead_pixels=None, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, delta_e_us=None, max_iter=100, threshold=0.05, smooth_iter=10, compute_uncertainty=true))]
+#[pyo3(name = "spatial_map_regularized", signature = (transmission, uncertainty, energies, isotopes, temperature_k=300.0, initial_densities=None, dead_pixels=None, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, delta_e_us=None, max_iter=100, threshold=0.05, smooth_iter=10, compute_uncertainty=true, regularize_temperature=true))]
 fn py_spatial_map_regularized(
     py: Python<'_>,
     transmission: PyReadonlyArray3<f64>,
@@ -1892,6 +1895,7 @@ fn py_spatial_map_regularized(
     threshold: f64,
     smooth_iter: usize,
     compute_uncertainty: bool,
+    regularize_temperature: bool,
 ) -> PyResult<PyRegularizedResult> {
     let e = energies.as_slice()?;
 
@@ -1955,6 +1959,12 @@ fn py_spatial_map_regularized(
         )));
     }
 
+    if !temperature_k.is_finite() || temperature_k < 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "temperature_k must be finite and non-negative",
+        ));
+    }
+
     let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution, delta_e_us)?;
 
     let config = FitConfig::new(
@@ -1975,7 +1985,7 @@ fn py_spatial_map_regularized(
         threshold,
         smooth_iter,
         compute_uncertainty,
-        ..RegularizationConfig::default()
+        regularize_temperature,
     };
 
     // Clone arrays only after all validation passes.
