@@ -19,6 +19,11 @@ use rand_distr::Poisson;
 /// * `n_photons` — Open beam intensity I₀ (expected counts per bin before attenuation).
 /// * `seed` — Random seed for reproducibility.
 pub fn add_poisson_noise(transmission: &[f64], n_photons: f64, seed: u64) -> (Vec<f64>, Vec<f64>) {
+    assert!(
+        n_photons > 0.0,
+        "n_photons must be positive, got {n_photons}"
+    );
+    assert!(!transmission.is_empty(), "transmission must not be empty");
     let mut rng = StdRng::seed_from_u64(seed);
     let n_e = transmission.len();
     let mut noisy = vec![0.0; n_e];
@@ -60,6 +65,17 @@ pub fn generate_noisy_cube(
     n_photons: f64,
     seed: u64,
 ) -> (Array3<f64>, Array3<f64>) {
+    assert!(
+        n_photons > 0.0,
+        "n_photons must be positive, got {n_photons}"
+    );
+    assert!(!transmission.is_empty(), "transmission must not be empty");
+    assert!(
+        shape.0 > 0 && shape.1 > 0,
+        "shape dimensions must be positive, got ({}, {})",
+        shape.0,
+        shape.1
+    );
     let (height, width) = shape;
     let n_e = transmission.len();
     let mut trans = Array3::<f64>::zeros((n_e, height, width));

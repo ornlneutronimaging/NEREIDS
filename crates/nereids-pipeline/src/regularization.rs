@@ -92,6 +92,7 @@ pub struct RegularizedResult {
 /// At low I₀, the actual information is I₀ × F, but the eigenstructure
 /// (which determines weak vs strong directions) is independent of I₀.
 fn compute_fisher_matrix(cross_sections: &[Vec<f64>], densities: &[f64]) -> Vec<Vec<f64>> {
+    debug_assert!(!cross_sections.is_empty());
     let n_iso = cross_sections.len();
     let n_e = cross_sections[0].len();
 
@@ -126,7 +127,6 @@ fn compute_fisher_matrix(cross_sections: &[Vec<f64>], densities: &[f64]) -> Vec<
 /// Each column of the eigenvector matrix is an eigenvector.
 ///
 /// Uses the Jacobi eigenvalue algorithm for small matrices (n ≤ 10).
-#[allow(clippy::needless_range_loop)]
 fn eigen_symmetric(matrix: &[Vec<f64>]) -> (Vec<f64>, Vec<Vec<f64>>) {
     let n = matrix.len();
 
@@ -145,18 +145,7 @@ fn eigen_symmetric(matrix: &[Vec<f64>]) -> (Vec<f64>, Vec<Vec<f64>>) {
     let max_iter = 100 * n * n;
     for _ in 0..max_iter {
         // Find largest off-diagonal element
-        let mut max_val = 0.0f64;
-        let mut p = 0;
-        let mut q = 1;
-        for i in 0..n {
-            for j in (i + 1)..n {
-                if a[i][j].abs() > max_val {
-                    max_val = a[i][j].abs();
-                    p = i;
-                    q = j;
-                }
-            }
-        }
+        let (max_val, p, q) = find_max_offdiag(&a);
         if max_val < 1e-15 {
             break;
         }
@@ -171,43 +160,118 @@ fn eigen_symmetric(matrix: &[Vec<f64>]) -> (Vec<f64>, Vec<Vec<f64>>) {
         let s = theta.sin();
 
         // Apply rotation to matrix: A' = G^T A G
-        let mut a_new = a.clone();
-        for i in 0..n {
-            if i != p && i != q {
-                a_new[i][p] = c * a[i][p] + s * a[i][q];
-                a_new[p][i] = a_new[i][p];
-                a_new[i][q] = -s * a[i][p] + c * a[i][q];
-                a_new[q][i] = a_new[i][q];
-            }
-        }
-        a_new[p][p] = c * c * a[p][p] + 2.0 * s * c * a[p][q] + s * s * a[q][q];
-        a_new[q][q] = s * s * a[p][p] - 2.0 * s * c * a[p][q] + c * c * a[q][q];
-        a_new[p][q] = 0.0;
-        a_new[q][p] = 0.0;
-        a = a_new;
+        apply_jacobi_rotation_matrix(&mut a, p, q, c, s);
 
         // Apply rotation to eigenvectors
-        let mut v_new = v.clone();
-        for i in 0..n {
-            v_new[i][p] = c * v[i][p] + s * v[i][q];
-            v_new[i][q] = -s * v[i][p] + c * v[i][q];
-        }
-        v = v_new;
+        apply_jacobi_rotation_vectors(&mut v, p, q, c, s);
     }
 
-    // Extract eigenvalues and sort ascending
+    // Check convergence: warn-level residual off-diagonal (P2-9)
+    #[cfg(debug_assertions)]
+    {
+        let (max_offdiag, _, _) = find_max_offdiag(&a);
+        debug_assert!(
+            max_offdiag <= 1e-10,
+            "Jacobi did not fully converge: max off-diagonal = {max_offdiag:.2e}"
+        );
+    }
+
+    // Extract eigenvalues and sort ascending (P1-1: handle NaN safely)
     let mut eigen_pairs: Vec<(f64, Vec<f64>)> = (0..n)
         .map(|i| {
             let eigvec: Vec<f64> = (0..n).map(|j| v[j][i]).collect();
             (a[i][i], eigvec)
         })
         .collect();
-    eigen_pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    eigen_pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
     let eigenvalues: Vec<f64> = eigen_pairs.iter().map(|(e, _)| *e).collect();
     let eigenvectors: Vec<Vec<f64>> = eigen_pairs.iter().map(|(_, v)| v.clone()).collect();
     // Return as column-major: eigenvectors[k] is the k-th eigenvector
     (eigenvalues, eigenvectors)
+}
+
+/// Find the largest off-diagonal element in a symmetric matrix.
+/// Returns (max_abs_value, row_index, col_index).
+fn find_max_offdiag(a: &[Vec<f64>]) -> (f64, usize, usize) {
+    let n = a.len();
+    let mut max_val = 0.0f64;
+    let mut p = 0;
+    let mut q = 1.min(n.saturating_sub(1));
+    for (i, row) in a.iter().enumerate() {
+        for (j_offset, val) in row.iter().enumerate().skip(i + 1) {
+            if val.abs() > max_val {
+                max_val = val.abs();
+                p = i;
+                q = j_offset;
+            }
+        }
+    }
+    (max_val, p, q)
+}
+
+/// Apply a Jacobi rotation to the matrix A in-place.
+/// Rotates in the (p, q) plane with angle defined by (cos, sin) = (c, s).
+fn apply_jacobi_rotation_matrix(a: &mut [Vec<f64>], p: usize, q: usize, c: f64, s: f64) {
+    let a_old = a.to_vec();
+    for (i, row_old) in a_old.iter().enumerate() {
+        if i != p && i != q {
+            let new_ip = c * row_old[p] + s * row_old[q];
+            let new_iq = -s * row_old[p] + c * row_old[q];
+            a[i][p] = new_ip;
+            a[p][i] = new_ip;
+            a[i][q] = new_iq;
+            a[q][i] = new_iq;
+        }
+    }
+    a[p][p] = c * c * a_old[p][p] + 2.0 * s * c * a_old[p][q] + s * s * a_old[q][q];
+    a[q][q] = s * s * a_old[p][p] - 2.0 * s * c * a_old[p][q] + c * c * a_old[q][q];
+    a[p][q] = 0.0;
+    a[q][p] = 0.0;
+}
+
+/// Apply a Jacobi rotation to the eigenvector matrix V in-place.
+fn apply_jacobi_rotation_vectors(v: &mut [Vec<f64>], p: usize, q: usize, c: f64, s: f64) {
+    for row in v.iter_mut() {
+        let old_p = row[p];
+        let old_q = row[q];
+        row[p] = c * old_p + s * old_q;
+        row[q] = -s * old_p + c * old_q;
+    }
+}
+
+/// Smooth a single 2D array in-place using 4-connected averaging.
+///
+/// Each pixel is replaced with the mean of itself and its direct
+/// neighbors (up to 4). Repeated `n_iter` times.
+fn smooth_array2(map: &mut Array2<f64>, n_iter: usize) {
+    let (height, width) = (map.nrows(), map.ncols());
+    for _ in 0..n_iter {
+        let old = map.clone();
+        for y in 0..height {
+            for x in 0..width {
+                let mut sum = old[[y, x]];
+                let mut count = 1usize;
+                if y > 0 {
+                    sum += old[[y - 1, x]];
+                    count += 1;
+                }
+                if y + 1 < height {
+                    sum += old[[y + 1, x]];
+                    count += 1;
+                }
+                if x > 0 {
+                    sum += old[[y, x - 1]];
+                    count += 1;
+                }
+                if x + 1 < width {
+                    sum += old[[y, x + 1]];
+                    count += 1;
+                }
+                map[[y, x]] = sum / count as f64;
+            }
+        }
+    }
 }
 
 /// Spatially smooth selected components of a set of maps.
@@ -217,38 +281,11 @@ fn eigen_symmetric(matrix: &[Vec<f64>]) -> (Vec<f64>, Vec<Vec<f64>>) {
 /// 4-connected neighbors.  Strong components are left untouched.
 fn selective_spatial_smooth(maps: &mut [Array2<f64>], is_weak: &[bool], n_iter: usize) {
     let n_comp = maps.len();
-    let (height, width) = (maps[0].nrows(), maps[0].ncols());
-
-    for _ in 0..n_iter {
-        for k in 0..n_comp {
-            if !is_weak[k] {
-                continue;
-            }
-            let old = maps[k].clone();
-            for y in 0..height {
-                for x in 0..width {
-                    let mut sum = old[[y, x]];
-                    let mut count = 1usize;
-                    if y > 0 {
-                        sum += old[[y - 1, x]];
-                        count += 1;
-                    }
-                    if y + 1 < height {
-                        sum += old[[y + 1, x]];
-                        count += 1;
-                    }
-                    if x > 0 {
-                        sum += old[[y, x - 1]];
-                        count += 1;
-                    }
-                    if x + 1 < width {
-                        sum += old[[y, x + 1]];
-                        count += 1;
-                    }
-                    maps[k][[y, x]] = sum / count as f64;
-                }
-            }
+    for k in 0..n_comp {
+        if !is_weak[k] {
+            continue;
         }
+        smooth_array2(&mut maps[k], n_iter);
     }
 }
 
@@ -279,6 +316,17 @@ pub fn spatial_map_regularized(
     cancel: Option<&AtomicBool>,
     progress: Option<&AtomicUsize>,
 ) -> Result<RegularizedResult, PipelineError> {
+    // ---- Validate regularization config (P2-5) ----
+    if !reg_config.threshold.is_finite()
+        || reg_config.threshold <= 0.0
+        || reg_config.threshold >= 1.0
+    {
+        return Err(PipelineError::InvalidParameter(format!(
+            "threshold must be in (0, 1), got {}",
+            reg_config.threshold
+        )));
+    }
+
     let shape = transmission.shape();
     let (_n_energies, height, width) = (shape[0], shape[1], shape[2]);
     let n_isotopes = config.resonance_data().len();
@@ -312,13 +360,27 @@ pub fn spatial_map_regularized(
         )?
     };
 
-    // Use the mean fitted densities as the linearization point for Fisher
+    // Use the mean fitted densities (converged pixels only) as the
+    // linearization point for Fisher (P2-11)
     let mean_densities: Vec<f64> = (0..n_isotopes)
         .map(|k| {
             let map = &initial.density_maps[k];
-            let sum: f64 = map.iter().sum();
-            let n = (height * width) as f64;
-            (sum / n).max(1e-10)
+            let conv = &initial.converged_map;
+            let mut sum = 0.0;
+            let mut count = 0usize;
+            for y in 0..height {
+                for x in 0..width {
+                    if conv[[y, x]] {
+                        sum += map[[y, x]];
+                        count += 1;
+                    }
+                }
+            }
+            if count > 0 {
+                (sum / count as f64).max(1e-10)
+            } else {
+                1e-10
+            }
         })
         .collect();
 
@@ -328,7 +390,12 @@ pub fn spatial_map_regularized(
     let (eigenvalues, eigenvectors) = eigen_symmetric(&fisher);
     let max_eig = eigenvalues.iter().cloned().fold(0.0f64, f64::max);
     let threshold_val = reg_config.threshold * max_eig;
-    let is_weak: Vec<bool> = eigenvalues.iter().map(|&e| e < threshold_val).collect();
+    // P1-3: Degenerate Fisher (all zeros) — all directions are weak
+    let is_weak: Vec<bool> = if max_eig < 1e-30 {
+        vec![true; n_isotopes]
+    } else {
+        eigenvalues.iter().map(|&e| e < threshold_val).collect()
+    };
     let n_weak = is_weak.iter().filter(|&&w| w).count();
 
     // ---- Step 4: Transform to eigenbasis ----
@@ -377,94 +444,91 @@ pub fn spatial_map_regularized(
     }
 
     // ---- Step 7: Laplace uncertainty ----
-    // Diagonal approximation: for each pixel, the uncertainty in each
-    // isotope density accounts for the data Hessian (Fisher info) and
-    // the spatial smoothing penalty.
+    // Use the Fisher eigen decomposition for proper correlated uncertainty.
     //
-    // In the eigenbasis: Var(θ_k) ≈ 1 / (I₀ * λ_k + penalty_hessian_k)
-    // Transform back: Cov(n) = V Var(θ) Vᵀ
-    //
-    // For now, use the initial fit uncertainty (from LM covariance) as
-    // a baseline. The regularization reduces variance for weak directions.
+    // For each pixel: compute per-pixel Fisher F, add spatial penalty
+    // contribution for weak directions, then invert via the eigen
+    // decomposition:
+    //   H = F + penalty
+    //   (H^{-1})_kk = Σ_j V_jk^2 / λ_j    (P1-4)
+    //   σ_k = sqrt((H^{-1})_kk)
     let uncertainty_maps = if reg_config.compute_uncertainty {
-        // Approximate: for strong directions, use initial uncertainty.
-        // For weak directions, the smoothing reduces variance by ~degree+1
-        // (averaging over neighbors).
-        // More rigorous: compute Hessian of penalized objective.
-        // For this implementation, we use the per-pixel Fisher info diagonal
-        // in the original basis.
-        (0..n_isotopes)
-            .map(|k| {
-                let mut unc = Array2::zeros((height, width));
-                for y in 0..height {
-                    for x in 0..width {
-                        let n_px: Vec<f64> =
-                            (0..n_isotopes).map(|i| density_maps[i][[y, x]]).collect();
-                        let f = compute_fisher_matrix(&cross_sections, &n_px);
-                        let h_kk = f[k][k];
-                        // Spatial penalty Hessian contribution for weak directions
-                        let mut h_penalty = 0.0;
-                        // Check if isotope k has any weak eigenvector contribution
-                        for j in 0..n_isotopes {
-                            if is_weak[j] {
-                                // Isotope k's contribution in weak direction j
-                                let v_jk = eigenvectors[j][k];
-                                // Neighbor count (approximate: interior pixels have 4)
-                                let degree = 4.0f64;
-                                h_penalty += v_jk * v_jk * degree;
+        let mut unc_maps: Vec<Array2<f64>> = (0..n_isotopes)
+            .map(|_| Array2::zeros((height, width)))
+            .collect();
+
+        for y in 0..height {
+            for x in 0..width {
+                let n_px: Vec<f64> = (0..n_isotopes).map(|i| density_maps[i][[y, x]]).collect();
+                let f = compute_fisher_matrix(&cross_sections, &n_px);
+
+                // Compute actual neighbor count for this pixel (P2-2)
+                let mut degree = 0.0f64;
+                if y > 0 {
+                    degree += 1.0;
+                }
+                if y + 1 < height {
+                    degree += 1.0;
+                }
+                if x > 0 {
+                    degree += 1.0;
+                }
+                if x + 1 < width {
+                    degree += 1.0;
+                }
+
+                // Build penalized Hessian: H_ij = F_ij + penalty_ij
+                // Penalty in eigenbasis: diag(degree) for weak directions
+                // Back in density space: H = F + V·diag(penalty)·Vᵀ
+                let mut h = f;
+                for j in 0..n_isotopes {
+                    if is_weak[j] {
+                        for r in 0..n_isotopes {
+                            for c in 0..n_isotopes {
+                                h[r][c] += eigenvectors[j][r] * eigenvectors[j][c] * degree;
                             }
                         }
-                        let total_h = h_kk + h_penalty;
-                        unc[[y, x]] = if total_h > 0.0 {
-                            1.0 / total_h.sqrt()
-                        } else {
-                            f64::INFINITY
-                        };
                     }
                 }
-                unc
-            })
-            .collect()
+
+                // Eigendecompose H to invert: H^{-1} = V diag(1/λ) Vᵀ
+                let (h_evals, h_evecs) = eigen_symmetric(&h);
+
+                // Extract diagonal of H^{-1}: (H^{-1})_kk = Σ_j V_jk^2 / λ_j
+                for k in 0..n_isotopes {
+                    let mut inv_diag = 0.0;
+                    for (j, &lam) in h_evals.iter().enumerate() {
+                        if lam > 1e-30 {
+                            inv_diag += h_evecs[j][k] * h_evecs[j][k] / lam;
+                        }
+                    }
+                    unc_maps[k][[y, x]] = if inv_diag > 0.0 {
+                        inv_diag.sqrt()
+                    } else {
+                        f64::INFINITY
+                    };
+                }
+            }
+        }
+        unc_maps
     } else {
-        initial.uncertainty_maps.clone()
+        // P2-3: When uncertainty is not computed, use INFINITY (not NaN)
+        (0..n_isotopes)
+            .map(|_| Array2::from_elem((height, width), f64::INFINITY))
+            .collect()
     };
 
     // Temperature: if enabled, smooth the temperature map using the
-    // same selective logic (temperature is typically a weak direction).
+    // same smooth_array2 helper (P2-4).  Temperature is typically a
+    // weak direction.
     let (temperature_map, temperature_uncertainty_map) =
         if let Some(ref t_map) = initial.temperature_map {
             if reg_config.regularize_temperature {
                 let mut t_smoothed = t_map.clone();
-                // Simple spatial averaging for temperature
-                for _ in 0..reg_config.smooth_iter {
-                    let old = t_smoothed.clone();
-                    for y in 0..height {
-                        for x in 0..width {
-                            let mut sum = old[[y, x]];
-                            let mut count = 1usize;
-                            if y > 0 {
-                                sum += old[[y - 1, x]];
-                                count += 1;
-                            }
-                            if y + 1 < height {
-                                sum += old[[y + 1, x]];
-                                count += 1;
-                            }
-                            if x > 0 {
-                                sum += old[[y, x - 1]];
-                                count += 1;
-                            }
-                            if x + 1 < width {
-                                sum += old[[y, x + 1]];
-                                count += 1;
-                            }
-                            t_smoothed[[y, x]] = sum / count as f64;
-                        }
-                    }
-                }
-                // Temperature uncertainty: simplified estimate
-                let t_unc = Array2::from_elem((height, width), f64::NAN); // TODO: proper Laplace
-                (Some(t_smoothed), Some(t_unc))
+                smooth_array2(&mut t_smoothed, reg_config.smooth_iter);
+                // P1-5: Temperature uncertainty not yet computed — return None
+                // rather than emitting NaN.
+                (Some(t_smoothed), None)
             } else {
                 (Some(t_map.clone()), None)
             }
