@@ -51,17 +51,30 @@ fn build_aux_grid(
 ) -> Option<(Vec<f64>, Vec<usize>)> {
     instrument.and_then(|inst| {
         if let ResolutionFunction::Gaussian(ref params) = inst.resolution {
-            // Check the Gaussian-to-exp-tail ratio at the grid midpoint to
-            // decide whether intermediates help or hurt.  The ratio C =
+            // P-9: Check the Gaussian-to-exp-tail ratio at MULTIPLE energies
+            // to decide whether intermediates help or hurt.  The ratio C =
             // W_g/(2·W_e) determines which broadening path is used per-energy
             // in resolution_broaden_presorted.  When C > 2.5 the PW-linear
             // Gaussian path is used, which benefits from intermediates.
+            //
+            // Previously checked at a single midpoint, which could make the
+            // wrong decision if the ratio crosses 2.5 within the energy range.
+            // Now checks at 5 points (lo, 25%, mid, 75%, hi) and uses
+            // intermediates if a MAJORITY of points have C > 2.5.
             let use_intermediates = if energies.len() >= 2 {
-                let e_mid = energies[energies.len() / 2];
-                let wg = params.gaussian_width(e_mid);
-                let we = params.exp_width(e_mid);
-                // Matches EXP_TAIL_NEGLIGIBLE_C = 2.5 in resolution.rs
-                we < 1e-60 || wg / (2.0 * we) > 2.5
+                let n = energies.len();
+                let check_indices = [0, n / 4, n / 2, 3 * n / 4, n - 1];
+                let n_pw_linear = check_indices
+                    .iter()
+                    .filter(|&&i| {
+                        let e = energies[i];
+                        let wg = params.gaussian_width(e);
+                        let we = params.exp_width(e);
+                        we < 1e-60 || wg / (2.0 * we) > 2.5
+                    })
+                    .count();
+                // Majority rule: use intermediates if ≥3 of 5 points qualify.
+                n_pw_linear >= 3
             } else {
                 true
             };

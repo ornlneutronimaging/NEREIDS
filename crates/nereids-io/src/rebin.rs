@@ -38,7 +38,14 @@ pub fn rebin_counts(data: &Array3<f64>, factor: usize) -> Array3<f64> {
 /// Transmission T = I/I₀ is a ratio. With uniform I₀ across bins,
 /// the correct rebinned transmission is the arithmetic mean of the
 /// group. **This is an approximation** — real I₀ varies per pixel
-/// and energy bin.
+/// and energy bin. When I₀ varies significantly across the group
+/// (e.g., near absorption edges or chopper gaps), the arithmetic
+/// mean biases toward bins with higher I₀.
+///
+/// The correct approach is Σ(C_s) / Σ(C_ob) (sum counts then divide),
+/// but this requires raw counts which are not available at the
+/// transmission stage. Users working with raw event data should
+/// rebin counts before normalization via `rebin_counts`.
 ///
 /// Returns the original array unchanged if `factor < 2`.
 ///

@@ -164,13 +164,26 @@ fn report_from_baseline(
         config.energies[peak_idx]
     };
 
-    // SNR calculation: σ_noise ≈ 1/√I₀
-    let sigma_noise = if config.i0 > 0.0 {
-        1.0 / config.i0.sqrt()
+    // P-8: SNR uses energy-dependent noise σ(E) = √(T_matrix(E) / I₀).
+    //
+    // Previously used the off-resonance approximation σ ≈ 1/√I₀ (T≈1),
+    // which underestimates SNR at resonance dips where T<<1 and noise
+    // is correspondingly smaller.  The energy-dependent formula gives
+    // the correct Poisson counting noise at each bin.
+    //
+    // Peak SNR = max_E |ΔT(E)| / σ(E)  where σ(E) = √(T_matrix(E) / I₀)
+    let peak_snr = if config.i0 > 0.0 {
+        delta_t_spectrum
+            .iter()
+            .zip(t_matrix.iter())
+            .map(|(&dt, &tm)| {
+                let sigma_e = (tm.max(OPAQUE_THRESHOLD) / config.i0).sqrt();
+                dt / sigma_e
+            })
+            .fold(0.0f64, f64::max)
     } else {
-        f64::INFINITY
+        0.0
     };
-    let peak_snr = peak_delta_t / sigma_noise;
 
     // Per-ppm normalisation
     let peak_delta_t_per_ppm = if trace_ppm > 0.0 {
