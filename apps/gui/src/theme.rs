@@ -32,10 +32,8 @@ pub mod light {
 pub mod semantic {
     use egui::Color32;
     pub const GREEN: Color32 = Color32::from_rgb(0x34, 0xc7, 0x59);
-    #[allow(dead_code)]
     pub const RED: Color32 = Color32::from_rgb(0xff, 0x3b, 0x30);
     pub const ORANGE: Color32 = Color32::from_rgb(0xff, 0x95, 0x00);
-    #[allow(dead_code)]
     pub const YELLOW: Color32 = Color32::from_rgb(0xff, 0xcc, 0x00);
 }
 

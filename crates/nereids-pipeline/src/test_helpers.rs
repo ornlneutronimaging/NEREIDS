@@ -1,4 +1,9 @@
 //! Shared test helpers for the nereids-pipeline crate.
+//!
+//! TD-5: These builders use single-resonance data by design — they test
+//! pipeline/fitting logic (convergence, regularization, spatial map)
+//! independently of full ENDF evaluations.  Multi-resonance physics
+//! accuracy is covered by the SAMMY test harness in nereids-physics.
 
 use nereids_core::types::Isotope;
 use nereids_endf::resonance::{

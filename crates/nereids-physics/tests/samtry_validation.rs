@@ -129,6 +129,11 @@ fn load_samtry_case(
 }
 
 /// Validation result for a single test case.
+///
+/// T-2: Tests assert on BOTH `mean_rel_error` (overall accuracy) and
+/// `max_rel_error` (worst-case outlier).  Mean alone can hide individual
+/// points with large errors.  Max alone is too sensitive to single-peak
+/// Doppler method differences.  Using both gives a balanced picture.
 #[derive(Debug)]
 struct ValidationResult {
     /// Maximum relative error across all reference points.
@@ -198,9 +203,12 @@ fn validate_unbroadened_cross_sections(
 /// `RslResolutionFunction_M.f90`.
 fn build_instrument_params(inp: &SammyInpConfig) -> Option<InstrumentParams> {
     let (flight_path, delta_t, delta_l, delta_e) = sammy_to_nereids_resolution(inp)?;
-    // Negative SAMMY resolution parameters indicate special broadening modes
-    // (e.g., CLM) that our simple Gaussian conversion doesn't handle.
-    // Clamp negatives to zero so they don't contribute broadening.
+    // T-1: Negative SAMMY resolution parameters indicate special broadening
+    // modes (e.g., CLM = Crystal Lattice Model, channel-specific widths) that
+    // NEREIDS does not yet implement.  Clamping to zero disables that
+    // broadening term, producing narrower peaks than SAMMY.  This is a known
+    // limitation — affected cases (tr008 has negative Deltae) show higher
+    // mean error because the exponential tail is effectively absent.
     let res_params = ResolutionParams::new(
         flight_path,
         delta_t.max(0.0),
