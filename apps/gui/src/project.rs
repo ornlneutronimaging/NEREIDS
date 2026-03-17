@@ -110,7 +110,7 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
     let normalized = state.normalized.as_ref().map(|nd| nd.transmission.clone());
     let normalized_uncertainty = state.normalized.as_ref().map(|nd| nd.uncertainty.clone());
 
-    // Results from spatial mapping
+    // Results from spatial mapping (D-11/D-21: include anorm + background)
     let (
         density_maps,
         uncertainty_maps,
@@ -120,6 +120,8 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         n_converged,
         n_total,
         result_isotope_labels,
+        anorm_map,
+        background_maps,
     ) = if let Some(ref sr) = state.spatial_result {
         (
             Some(sr.density_maps.clone()),
@@ -130,9 +132,11 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
             Some(sr.n_converged),
             Some(sr.n_total),
             Some(sr.isotope_labels.clone()),
+            sr.anorm_map.clone(),
+            sr.background_maps.clone(),
         )
     } else {
-        (None, None, None, None, None, None, None, None)
+        (None, None, None, None, None, None, None, None, None, None)
     };
 
     // Single-pixel fit results
@@ -269,6 +273,8 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         n_converged,
         n_total,
         result_isotope_labels,
+        anorm_map,
+        background_maps,
         single_fit_densities,
         single_fit_uncertainties,
         single_fit_chi_squared,
@@ -861,10 +867,9 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
                     .map(|e| e.symbol.clone())
                     .collect()
             }),
-            // Background maps are not persisted yet — default to None for
-            // backward compatibility with old project files.
-            anorm_map: None,
-            background_maps: None,
+            // D-11/D-21: Now persisted; None for old project files.
+            anorm_map: snap.anorm_map,
+            background_maps: snap.background_maps,
             n_converged: snap.n_converged.unwrap_or(0),
             n_total: snap.n_total.unwrap_or(0),
         };

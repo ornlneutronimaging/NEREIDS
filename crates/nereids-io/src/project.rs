@@ -107,6 +107,11 @@ pub struct ProjectSnapshot {
     pub n_converged: Option<usize>,
     pub n_total: Option<usize>,
     pub result_isotope_labels: Option<Vec<String>>,
+    /// D-11/D-21: Per-pixel normalization factor from regularized fitting.
+    pub anorm_map: Option<Array2<f64>>,
+    /// D-11/D-21: Per-pixel background [A, B, C] maps from regularized fitting.
+    /// Stored as 3 separate Array2 maps (one per coefficient).
+    pub background_maps: Option<[Array2<f64>; 3]>,
 
     // -- results/single_fit (single-pixel fit, optional) --
     pub single_fit_densities: Option<Vec<f64>>,
@@ -184,6 +189,8 @@ impl Default for ProjectSnapshot {
             n_converged: None,
             n_total: None,
             result_isotope_labels: None,
+            anorm_map: None,
+            background_maps: None,
             single_fit_densities: None,
             single_fit_uncertainties: None,
             single_fit_chi_squared: None,
@@ -658,6 +665,39 @@ fn write_results(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoErro
             .create("temperature")
             .and_then(|ds| ds.write_raw(&data))
             .map_err(|e| hdf5_err("/results/temperature", e))?;
+    }
+
+    // D-11/D-21: Save anorm and background maps from regularized fitting.
+    if let Some(ref a_map) = snap.anorm_map {
+        let shape = [a_map.shape()[0], a_map.shape()[1]];
+        let data: Vec<f64> = a_map.iter().copied().collect();
+        results
+            .new_dataset::<f64>()
+            .shape(shape)
+            .chunk(shape)
+            .deflate(4)
+            .create("anorm")
+            .and_then(|ds| ds.write_raw(&data))
+            .map_err(|e| hdf5_err("/results/anorm", e))?;
+    }
+
+    if let Some(ref bg_maps) = snap.background_maps {
+        let bg_grp = results
+            .create_group("background")
+            .map_err(|e| hdf5_err("create /results/background", e))?;
+        for (i, &label) in ["back_a", "back_b", "back_c"].iter().enumerate() {
+            let m = &bg_maps[i];
+            let shape = [m.shape()[0], m.shape()[1]];
+            let data: Vec<f64> = m.iter().copied().collect();
+            bg_grp
+                .new_dataset::<f64>()
+                .shape(shape)
+                .chunk(shape)
+                .deflate(4)
+                .create(label)
+                .and_then(|ds| ds.write_raw(&data))
+                .map_err(|e| hdf5_err(&format!("/results/background/{label}"), e))?;
+        }
     }
 
     if let Some(nc) = snap.n_converged {
@@ -1303,6 +1343,44 @@ fn read_results(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoE
         }
     }
 
+    // D-11/D-21: Anorm map
+    if let Ok(a_ds) = results.dataset("anorm") {
+        let shape = a_ds.shape();
+        if shape.len() == 2 {
+            let data: Vec<f64> = a_ds.read_raw().map_err(|e| hdf5_err("/results/anorm", e))?;
+            snap.anorm_map = Some(
+                Array2::from_shape_vec((shape[0], shape[1]), data)
+                    .map_err(|e| hdf5_err("/results/anorm reshape", e))?,
+            );
+        }
+    }
+
+    // D-11/D-21: Background maps
+    if let Ok(bg_grp) = results.group("background") {
+        let mut maps: [Option<Array2<f64>>; 3] = [None, None, None];
+        for (i, &label) in ["back_a", "back_b", "back_c"].iter().enumerate() {
+            if let Ok(ds) = bg_grp.dataset(label) {
+                let shape = ds.shape();
+                if shape.len() == 2 {
+                    let data: Vec<f64> = ds
+                        .read_raw()
+                        .map_err(|e| hdf5_err(&format!("/results/background/{label}"), e))?;
+                    maps[i] = Some(Array2::from_shape_vec((shape[0], shape[1]), data).map_err(
+                        |e| hdf5_err(&format!("/results/background/{label} reshape"), e),
+                    )?);
+                }
+            }
+        }
+        // Only set if all three are present.
+        if maps.iter().all(|m| m.is_some()) {
+            snap.background_maps = Some([
+                maps[0].take().unwrap(),
+                maps[1].take().unwrap(),
+                maps[2].take().unwrap(),
+            ]);
+        }
+    }
+
     // Scalar attrs
     if let Ok(nc) = read_u64_attr(&results, "n_converged") {
         snap.n_converged = Some(nc as usize);
@@ -1476,6 +1554,8 @@ mod tests {
             n_converged: None,
             n_total: None,
             result_isotope_labels: None,
+            anorm_map: None,
+            background_maps: None,
             single_fit_densities: None,
             single_fit_uncertainties: None,
             single_fit_chi_squared: None,

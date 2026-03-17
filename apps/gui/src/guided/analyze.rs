@@ -1195,6 +1195,8 @@ pub fn run_spatial_map(state: &mut AppState) {
                 .map(|r| {
                     // Convert RegularizedResult to SpatialResult for the
                     // existing result display infrastructure.
+                    // D-12: Carry anorm_map and background_maps through
+                    // instead of dropping them.
                     nereids_pipeline::spatial::SpatialResult {
                         density_maps: r.density_maps,
                         uncertainty_maps: r.uncertainty_maps,
@@ -1202,8 +1204,8 @@ pub fn run_spatial_map(state: &mut AppState) {
                         converged_map: r.converged_map,
                         temperature_map: r.temperature_map,
                         isotope_labels: r.isotope_labels,
-                        anorm_map: None,
-                        background_maps: None,
+                        anorm_map: r.anorm_map,
+                        background_maps: r.background_maps,
                         n_converged: r.n_converged,
                         n_total: r.n_total,
                     }
