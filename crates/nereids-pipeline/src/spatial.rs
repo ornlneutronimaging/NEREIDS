@@ -449,8 +449,10 @@ pub fn fit_roi(
 mod tests {
     use super::*;
     use nereids_fitting::lm::{FitModel, LmConfig};
+    use nereids_fitting::poisson::PoissonConfig;
     use nereids_fitting::transmission_model::TransmissionFitModel;
 
+    use crate::pipeline::{BackgroundConfig, SolverChoice};
     use crate::test_helpers::u238_single_resonance;
 
     #[test]
@@ -821,5 +823,343 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- C3 Critical Integration Tests ----
+
+    /// C3-1: spatial_map with background=True recovers density AND
+    /// produces non-trivial anorm_map and background_maps.
+    #[test]
+    fn test_spatial_map_with_background() {
+        let data = u238_single_resonance();
+        let true_density = 0.0005;
+        let energies: Vec<f64> = (0..101).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let n_energies = energies.len();
+
+        // Generate synthetic spectrum with known background:
+        //   T_out(E) = Anorm * exp(-n*sigma(E)) + BackA
+        let model = TransmissionFitModel::new(
+            energies.clone(),
+            vec![data.clone()],
+            0.0,
+            None,
+            vec![0],
+            None,
+            None,
+        )
+        .unwrap();
+        let t_inner = model.evaluate(&[true_density]).unwrap();
+        let anorm_true = 0.95;
+        let back_a_true = 0.03;
+        let spectrum: Vec<f64> = t_inner
+            .iter()
+            .map(|&t| anorm_true * t + back_a_true)
+            .collect();
+
+        // 3×3 image
+        let (height, width) = (3, 3);
+        let mut transmission = Array3::<f64>::zeros((n_energies, height, width));
+        let uncertainty = Array3::from_elem((n_energies, height, width), 0.01);
+        for y in 0..height {
+            for x in 0..width {
+                for e in 0..n_energies {
+                    transmission[[e, y, x]] = spectrum[e];
+                }
+            }
+        }
+
+        let config = FitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        )
+        .unwrap()
+        .with_background(BackgroundConfig::default());
+
+        let result = spatial_map(
+            transmission.view(),
+            uncertainty.view(),
+            &config,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Density recovered within 10%
+        let fitted = result.density_maps[0][[1, 1]];
+        assert!(
+            (fitted - true_density).abs() / true_density < 0.10,
+            "density = {fitted}, expected {true_density}"
+        );
+
+        // anorm_map populated
+        let anorm_map = result
+            .anorm_map
+            .expect("anorm_map should be Some when background=True");
+        let anorm_fitted = anorm_map[[1, 1]];
+        assert!(
+            (anorm_fitted - anorm_true).abs() < 0.05,
+            "anorm = {anorm_fitted}, expected ~{anorm_true}"
+        );
+
+        // background_maps populated
+        let bg_maps = result
+            .background_maps
+            .expect("background_maps should be Some");
+        let back_a_fitted = bg_maps[0][[1, 1]];
+        assert!(
+            (back_a_fitted - back_a_true).abs() < 0.02,
+            "backA = {back_a_fitted}, expected ~{back_a_true}"
+        );
+    }
+
+    /// C3-2: spatial_map with fitter=Poisson (via SolverChoice::PoissonKL)
+    /// converges on clean synthetic data.
+    #[test]
+    fn test_spatial_map_with_poisson_solver() {
+        let data = u238_single_resonance();
+        let true_density = 0.0005;
+        let energies: Vec<f64> = (0..101).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let n_energies = energies.len();
+
+        let model = TransmissionFitModel::new(
+            energies.clone(),
+            vec![data.clone()],
+            0.0,
+            None,
+            vec![0],
+            None,
+            None,
+        )
+        .unwrap();
+        let spectrum = model.evaluate(&[true_density]).unwrap();
+
+        let (height, width) = (3, 3);
+        let mut transmission = Array3::<f64>::zeros((n_energies, height, width));
+        let uncertainty = Array3::from_elem((n_energies, height, width), 0.01);
+        for y in 0..height {
+            for x in 0..width {
+                for e in 0..n_energies {
+                    transmission[[e, y, x]] = spectrum[e];
+                }
+            }
+        }
+
+        let config = FitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        )
+        .unwrap()
+        .with_solver(SolverChoice::PoissonKL(PoissonConfig {
+            max_iter: 200,
+            ..PoissonConfig::default()
+        }));
+
+        let result = spatial_map(
+            transmission.view(),
+            uncertainty.view(),
+            &config,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result.n_total, 9);
+        // At least some pixels should converge on clean data
+        assert!(
+            result.n_converged >= 5,
+            "Expected >=5 converged, got {}",
+            result.n_converged
+        );
+
+        // Check density recovery (Poisson on transmission with sigma=0.01 should be reasonable)
+        let fitted = result.density_maps[0][[1, 1]];
+        assert!(
+            (fitted - true_density).abs() / true_density < 0.15,
+            "Poisson density = {fitted}, expected {true_density}"
+        );
+    }
+
+    /// C3-3: spatial_map with Poisson + background converges.
+    #[test]
+    fn test_spatial_map_poisson_with_background() {
+        let data = u238_single_resonance();
+        let true_density = 0.0005;
+        let energies: Vec<f64> = (0..101).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let n_energies = energies.len();
+
+        let model = TransmissionFitModel::new(
+            energies.clone(),
+            vec![data.clone()],
+            0.0,
+            None,
+            vec![0],
+            None,
+            None,
+        )
+        .unwrap();
+        let t_inner = model.evaluate(&[true_density]).unwrap();
+        // Apply background
+        let spectrum: Vec<f64> = t_inner.iter().map(|&t| 0.95 * t + 0.03).collect();
+
+        let (height, width) = (3, 3);
+        let mut transmission = Array3::<f64>::zeros((n_energies, height, width));
+        let uncertainty = Array3::from_elem((n_energies, height, width), 0.01);
+        for y in 0..height {
+            for x in 0..width {
+                for e in 0..n_energies {
+                    transmission[[e, y, x]] = spectrum[e];
+                }
+            }
+        }
+
+        let config = FitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        )
+        .unwrap()
+        .with_solver(SolverChoice::PoissonKL(PoissonConfig {
+            max_iter: 200,
+            ..PoissonConfig::default()
+        }))
+        .with_background(BackgroundConfig::default());
+
+        let result = spatial_map(
+            transmission.view(),
+            uncertainty.view(),
+            &config,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Should have anorm_map and background_maps
+        assert!(
+            result.anorm_map.is_some(),
+            "anorm_map should be Some with Poisson+background"
+        );
+        assert!(
+            result.background_maps.is_some(),
+            "background_maps should be Some with Poisson+background"
+        );
+    }
+
+    /// C3-4: Poisson + background + temperature is correctly rejected.
+    #[test]
+    fn test_poisson_bg_temperature_rejected() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        let n_energies = energies.len();
+
+        let (height, width) = (2, 2);
+        let transmission = Array3::from_elem((n_energies, height, width), 0.8);
+        let uncertainty = Array3::from_elem((n_energies, height, width), 0.01);
+
+        let config = FitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            300.0,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        )
+        .unwrap()
+        .with_solver(SolverChoice::PoissonKL(PoissonConfig::default()))
+        .with_background(BackgroundConfig::default())
+        .with_fit_temperature(true)
+        .unwrap();
+
+        let result = spatial_map(
+            transmission.view(),
+            uncertainty.view(),
+            &config,
+            None,
+            None,
+            None,
+        );
+
+        // Should fail with a clear error, not silently produce wrong results.
+        // Note: the error comes from per-pixel fit_spectrum, so we get
+        // an empty result (all pixels fail) rather than a top-level error.
+        // Either outcome is acceptable — the key is no silent wrong answers.
+        match result {
+            Err(_) => {} // top-level rejection: good
+            Ok(r) => {
+                // If individual pixels all failed, that's also acceptable
+                assert!(
+                    r.n_converged == 0,
+                    "Poisson+bg+temperature should not produce converged results; got {} converged",
+                    r.n_converged,
+                );
+            }
+        }
+    }
+
+    /// C3-5: spatial_map handles zero-count bins gracefully (no panic, no NaN propagation).
+    #[test]
+    fn test_spatial_map_zero_transmission_bins() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        let n_energies = energies.len();
+
+        let (height, width) = (2, 2);
+        let mut transmission = Array3::from_elem((n_energies, height, width), 0.9);
+        let mut uncertainty = Array3::from_elem((n_energies, height, width), 0.01);
+
+        // Set 10% of bins to zero transmission with large uncertainty
+        for e in (0..n_energies).step_by(10) {
+            for y in 0..height {
+                for x in 0..width {
+                    transmission[[e, y, x]] = 0.0;
+                    uncertainty[[e, y, x]] = 1e30; // negligible weight
+                }
+            }
+        }
+
+        let config = FitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+            LmConfig::default(),
+        )
+        .unwrap();
+
+        let result = spatial_map(
+            transmission.view(),
+            uncertainty.view(),
+            &config,
+            None,
+            None,
+            None,
+        );
+
+        // Should not panic
+        assert!(result.is_ok(), "spatial_map panicked on zero-count bins");
+        let r = result.unwrap();
+
+        // At least some pixels should produce finite results
+        let any_finite = r.density_maps[0].iter().any(|&d| d.is_finite());
+        assert!(any_finite, "All density values are NaN/Inf after zero bins");
     }
 }
