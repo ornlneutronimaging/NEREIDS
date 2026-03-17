@@ -699,12 +699,7 @@ fn precompute_range_data<'a>(
                         jgroups,
                     }
                 } else if !has_two_fission {
-                    // R-external for fission channels is a future extension;
-                    // warn if any entries match this L-group.
-                    debug_assert!(
-                        !range.r_external.iter().any(|re| re.l == l),
-                        "R-external entries exist for L={l} (2ch fission path) but are not applied"
-                    );
+                    // P-7: R-external now applied in the 2ch evaluation path.
                     let jgroups = precompute_jgroups_2ch(
                         &l_group.resonances,
                         l,
@@ -721,12 +716,7 @@ fn precompute_range_data<'a>(
                         jgroups,
                     }
                 } else {
-                    // R-external for fission channels is a future extension;
-                    // warn if any entries match this L-group.
-                    debug_assert!(
-                        !range.r_external.iter().any(|re| re.l == l),
-                        "R-external entries exist for L={l} (3ch fission path) but are not applied"
-                    );
+                    // P-7: R-external now applied in the 3ch evaluation path.
                     let jgroups = precompute_jgroups_3ch(
                         &l_group.resonances,
                         l,
@@ -907,12 +897,19 @@ fn evaluate_precomputed_range(
                         }
                         (t, e, c, f)
                     }
-                    PrecomputedRmLGroupData::TwoCh { jgroups, .. } => {
+                    PrecomputedRmLGroupData::TwoCh { jgroups, l, .. } => {
                         let mut t = 0.0;
                         let mut e = 0.0;
                         let mut c = 0.0;
                         let mut f = 0.0;
                         for jg in jgroups {
+                            // P-7: R-external for 2ch fission path.
+                            let r_ext = range
+                                .r_external
+                                .iter()
+                                .find(|re| re.l == *l && (re.j - jg.j).abs() < QUANTUM_NUMBER_EPS)
+                                .map(|re| re.evaluate(energy_ev))
+                                .unwrap_or(0.0);
                             let (jt, je, jc, jf) = reich_moore_2ch_precomputed(
                                 &jg.resonances,
                                 energy_ev,
@@ -921,6 +918,7 @@ fn evaluate_precomputed_range(
                                 p_l,
                                 s_l,
                                 phi_l,
+                                r_ext,
                             );
                             t += jt;
                             e += je;
@@ -929,12 +927,19 @@ fn evaluate_precomputed_range(
                         }
                         (t, e, c, f)
                     }
-                    PrecomputedRmLGroupData::ThreeCh { jgroups, .. } => {
+                    PrecomputedRmLGroupData::ThreeCh { jgroups, l, .. } => {
                         let mut t = 0.0;
                         let mut e = 0.0;
                         let mut c = 0.0;
                         let mut f = 0.0;
                         for jg in jgroups {
+                            // P-7: R-external for 3ch fission path.
+                            let r_ext = range
+                                .r_external
+                                .iter()
+                                .find(|re| re.l == *l && (re.j - jg.j).abs() < QUANTUM_NUMBER_EPS)
+                                .map(|re| re.evaluate(energy_ev))
+                                .unwrap_or(0.0);
                             let (jt, je, jc, jf) = reich_moore_3ch_precomputed(
                                 &jg.resonances,
                                 energy_ev,
@@ -943,6 +948,7 @@ fn evaluate_precomputed_range(
                                 p_l,
                                 s_l,
                                 phi_l,
+                                r_ext,
                             );
                             t += jt;
                             e += je;
@@ -1123,12 +1129,6 @@ fn cross_sections_for_range(
                         fission += f;
                     }
                 } else if !has_two_fission {
-                    // R-external for fission channels is a future extension;
-                    // warn if any entries match this L-group.
-                    debug_assert!(
-                        !range.r_external.iter().any(|re| re.l == l),
-                        "R-external entries exist for L={l} (2ch fission path) but are not applied"
-                    );
                     // 2-channel fission: build J-groups (see note above).
                     let jgroups = precompute_jgroups_2ch(
                         &l_group.resonances,
@@ -1139,6 +1139,13 @@ fn cross_sections_for_range(
                         target_spin,
                     );
                     for jg in &jgroups {
+                        // P-7: R-external for 2ch fission path.
+                        let r_ext = range
+                            .r_external
+                            .iter()
+                            .find(|re| re.l == l && (re.j - jg.j).abs() < QUANTUM_NUMBER_EPS)
+                            .map(|re| re.evaluate(energy_ev))
+                            .unwrap_or(0.0);
                         let (t, e, c, f) = reich_moore_2ch_precomputed(
                             &jg.resonances,
                             energy_ev,
@@ -1147,6 +1154,7 @@ fn cross_sections_for_range(
                             p_l,
                             s_l,
                             phi_l,
+                            r_ext,
                         );
                         total += t;
                         elastic += e;
@@ -1154,12 +1162,6 @@ fn cross_sections_for_range(
                         fission += f;
                     }
                 } else {
-                    // R-external for fission channels is a future extension;
-                    // warn if any entries match this L-group.
-                    debug_assert!(
-                        !range.r_external.iter().any(|re| re.l == l),
-                        "R-external entries exist for L={l} (3ch fission path) but are not applied"
-                    );
                     // 3-channel fission: build J-groups (see note above).
                     let jgroups = precompute_jgroups_3ch(
                         &l_group.resonances,
@@ -1170,6 +1172,13 @@ fn cross_sections_for_range(
                         target_spin,
                     );
                     for jg in &jgroups {
+                        // P-7: R-external for 3ch fission path.
+                        let r_ext = range
+                            .r_external
+                            .iter()
+                            .find(|re| re.l == l && (re.j - jg.j).abs() < QUANTUM_NUMBER_EPS)
+                            .map(|re| re.evaluate(energy_ev))
+                            .unwrap_or(0.0);
                         let (t, e, c, f) = reich_moore_3ch_precomputed(
                             &jg.resonances,
                             energy_ev,
@@ -1178,6 +1187,7 @@ fn cross_sections_for_range(
                             p_l,
                             s_l,
                             phi_l,
+                            r_ext,
                         );
                         total += t;
                         elastic += e;
@@ -1385,6 +1395,7 @@ fn reich_moore_2ch_precomputed(
     p_l: f64,
     s_l: f64,
     phi_l: f64,
+    r_ext: f64,
 ) -> (f64, f64, f64, f64) {
     let pi_over_k2 = channel::pi_over_k_squared_barns(energy_ev, awr);
     // B = S_l(E) — see comment in reich_moore_spin_group_precomputed.
@@ -1407,6 +1418,13 @@ fn reich_moore_2ch_precomputed(
                 r_mat[i][j] += betas[i] * betas[j] * inv_denom;
             }
         }
+    }
+
+    // P-7: R-external adds to the neutron channel diagonal only.
+    // This is a smooth energy-dependent background from distant resonances.
+    // SAMMY ref: mcro2.f90 Setr_Cro lines 180-193.
+    if r_ext != 0.0 {
+        r_mat[0][0] += Complex64::new(r_ext, 0.0);
     }
 
     // Level matrix Y = diag(1/(S-B+iP)) - R
@@ -1490,6 +1508,7 @@ fn reich_moore_3ch_precomputed(
     p_l: f64,
     s_l: f64,
     phi_l: f64,
+    r_ext: f64,
 ) -> (f64, f64, f64, f64) {
     let pi_over_k2 = channel::pi_over_k_squared_barns(energy_ev, awr);
     // B = S_l(E) — see comment in reich_moore_spin_group_precomputed.
@@ -1508,6 +1527,11 @@ fn reich_moore_3ch_precomputed(
                 r_mat[i][j] += betas[i] * betas[j] * inv_denom;
             }
         }
+    }
+
+    // P-7: R-external adds to the neutron channel diagonal only.
+    if r_ext != 0.0 {
+        r_mat[0][0] += Complex64::new(r_ext, 0.0);
     }
 
     // Level matrix Y.
