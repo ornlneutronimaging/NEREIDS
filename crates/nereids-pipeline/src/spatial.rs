@@ -394,7 +394,7 @@ pub fn fit_roi(
         )));
     }
 
-    let n_pixels = (y_range.end - y_range.start) * (x_range.end - x_range.start);
+    let _n_pixels = (y_range.end - y_range.start) * (x_range.end - x_range.start);
 
     // Slice the ROI first, THEN transpose, so the work is O(n_energies * roi_h * roi_w)
     // instead of O(n_energies * height * width).  For small ROIs on large images this
@@ -418,31 +418,53 @@ pub fn fit_roi(
         .as_standard_layout()
         .into_owned();
 
-    // Average transmission over ROI using local (0-based) indices into the sliced array
+    // D-2: Inverse-variance weighted average of transmission over ROI.
+    //
+    // Simple arithmetic averaging of transmission is biased because
+    // T = C_s / C_ob is a ratio — the average of ratios ≠ ratio of averages.
+    // Inverse-variance weighting (w_i = 1/σ_i²) gives more weight to
+    // pixels with better statistics, approximating the counts-first approach.
+    //
+    // For each energy bin:
+    //   T_avg = Σ(w_i · T_i) / Σ(w_i)
+    //   σ_avg = 1 / √(Σ(w_i))
+    //
+    // Reference: Bevington & Robinson §4.1 (weighted average of measurements).
     let roi_h = y_range.end - y_range.start;
     let roi_w = x_range.end - x_range.start;
     let mut avg_t = vec![0.0f64; n_energies];
-    let mut avg_unc2 = vec![0.0f64; n_energies]; // Sum of squared uncertainties
+    let mut sum_w = vec![0.0f64; n_energies]; // Σ(1/σ²)
 
     for y in 0..roi_h {
         for x in 0..roi_w {
             let t_row = roi_trans.slice(s![y, x, ..]);
             let u_row = roi_unc.slice(s![y, x, ..]);
             for e in 0..n_energies {
-                avg_t[e] += t_row[e];
-                avg_unc2[e] += u_row[e].powi(2);
+                let sigma = u_row[e];
+                if sigma > 0.0 && sigma.is_finite() {
+                    let w = 1.0 / (sigma * sigma);
+                    avg_t[e] += w * t_row[e];
+                    sum_w[e] += w;
+                }
             }
         }
     }
 
-    let n_pix_f = n_pixels as f64;
     for e in 0..n_energies {
-        avg_t[e] /= n_pix_f;
-        // Uncertainty of mean: σ_mean = √(Σσ²)/N
-        avg_unc2[e] = (avg_unc2[e]).sqrt() / n_pix_f;
+        if sum_w[e] > 0.0 {
+            avg_t[e] /= sum_w[e];
+            // σ_avg = 1 / √(Σ w)
+            sum_w[e] = 1.0 / sum_w[e].sqrt();
+        } else {
+            // No valid pixels — use zero weight (will be skipped by fitter)
+            avg_t[e] = 0.0;
+            sum_w[e] = 1e30;
+        }
     }
+    // Rename for clarity in the fit call
+    let avg_unc = sum_w;
 
-    fit_spectrum(&avg_t, &avg_unc2, config)
+    fit_spectrum(&avg_t, &avg_unc, config)
 }
 
 #[cfg(test)]
