@@ -260,6 +260,7 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         normalized,
         normalized_uncertainty,
         energies: state.energies.clone(),
+        dead_pixels: state.dead_pixels.clone(),
         density_maps,
         uncertainty_maps,
         chi_squared_map,
@@ -825,6 +826,9 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
         }));
     }
     state.energies = snap.energies;
+
+    // 15b. Restore dead-pixel mask (D-20).
+    state.dead_pixels = snap.dead_pixels;
 
     // 16. Restore results
     if let Some(density_maps) = snap.density_maps {

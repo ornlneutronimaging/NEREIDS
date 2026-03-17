@@ -94,6 +94,9 @@ pub struct ProjectSnapshot {
     /// lose uncertainty information (reconstructed as zeros).
     pub normalized_uncertainty: Option<Array3<f64>>,
     pub energies: Option<Vec<f64>>,
+    /// D-20: Dead-pixel mask (true = dead). Same spatial dimensions as the
+    /// transmission data (height × width). `None` when no mask is available.
+    pub dead_pixels: Option<Array2<bool>>,
 
     // -- results (always embedded) --
     pub density_maps: Option<Vec<Array2<f64>>>,
@@ -172,6 +175,7 @@ impl Default for ProjectSnapshot {
             normalized: None,
             normalized_uncertainty: None,
             energies: None,
+            dead_pixels: None,
             density_maps: None,
             uncertainty_maps: None,
             chi_squared_map: None,
@@ -550,6 +554,20 @@ fn write_intermediate(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), I
             .create("energies")
             .and_then(|ds| ds.write_raw(energies))
             .map_err(|e| hdf5_err("/intermediate/energies", e))?;
+    }
+
+    // D-20: Persist dead-pixel mask as u8 (0 = live, 1 = dead).
+    if let Some(ref dp) = snap.dead_pixels {
+        let shape = [dp.shape()[0], dp.shape()[1]];
+        if !shape.contains(&0) {
+            let data: Vec<u8> = dp.iter().map(|&b| u8::from(b)).collect();
+            inter
+                .new_dataset::<u8>()
+                .shape(shape)
+                .create("dead_pixels")
+                .and_then(|ds| ds.write_raw(&data))
+                .map_err(|e| hdf5_err("/intermediate/dead_pixels", e))?;
+        }
     }
 
     Ok(())
@@ -1117,6 +1135,21 @@ fn read_intermediate(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<()
         snap.energies = Some(data);
     }
 
+    // D-20: Load dead-pixel mask (u8 → bool).
+    if let Ok(dp_ds) = inter.dataset("dead_pixels") {
+        let shape = dp_ds.shape();
+        if shape.len() == 2 {
+            let data: Vec<u8> = dp_ds
+                .read_raw()
+                .map_err(|e| hdf5_err("/intermediate/dead_pixels", e))?;
+            let bools: Vec<bool> = data.iter().map(|&v| v != 0).collect();
+            snap.dead_pixels = Some(
+                Array2::from_shape_vec((shape[0], shape[1]), bools)
+                    .map_err(|e| hdf5_err("/intermediate/dead_pixels reshape", e))?,
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -1434,6 +1467,7 @@ mod tests {
             normalized: None,
             normalized_uncertainty: None,
             energies: None,
+            dead_pixels: None,
             density_maps: None,
             uncertainty_maps: None,
             chi_squared_map: None,
