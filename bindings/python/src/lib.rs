@@ -740,12 +740,12 @@ fn forward_model<'py>(
 ///           ``result.reduced_chi_squared`` contains the final NLL (not chi-squared).
 ///
 /// Note:
-///     When ``fitter='poisson'`` and ``background=True``, the Poisson analytic
-///     gradient path is unavailable (it does not support background wrapping).
-///     The solver falls back to finite-difference gradients, which suffer from
-///     the density (~1e-4) vs temperature (~200) scale mismatch.  Temperature
-///     fitting may be inaccurate in this combination.  Prefer ``fitter='lm'``
-///     for background + temperature fitting.
+///     When ``fitter='poisson'`` and ``background=True`` and
+///     ``fit_temperature=True``, the combination is **rejected with an error**.
+///     The Poisson analytic gradient path does not support background wrapping,
+///     and the density (~1e-4) vs temperature (~200) scale mismatch makes
+///     finite-difference gradients unreliable.  Use ``fitter='lm'`` for
+///     background + temperature fitting.
 ///
 /// Returns:
 ///     FitResult with densities, uncertainties, and fit quality.
