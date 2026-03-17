@@ -799,12 +799,16 @@ fn parse_rmatrix_limited_range(
 
         // KBK: background R-matrix correction (pole-free or smooth background terms).
         // Per ENDF-6 §2.2.1.6: when KBK > 0 there are NCH background sub-records
-        // per spin group (one per channel), each consisting of a CONT+LIST pair;
-        // if LBK==1 in that CONT, two TAB1 records (real and imaginary parts) follow.
-        // Records are consumed to advance the file position; the background correction
-        // is NOT applied — matching SAMMY behaviour (mrml10.f is a matrix factorisation
-        // utility, not a background R-matrix reader).
-        // Reference: OpenScale File2Lrf7.f90 lines 269–298; ENDF-6 §2.2.1.6 Table 2.4.
+        // per spin group (one per channel), each a CONT+LIST pair; if LBK==1,
+        // two TAB1 records (real and imaginary parts) follow.
+        //
+        // Records are consumed to advance the parser; the background correction
+        // is NOT applied.  This matches SAMMY: all rml/mrml*.f physics files
+        // contain zero references to KBK, LBK, or background R-matrix terms.
+        // SAMMY reads the flags, skips the data, and computes cross-sections
+        // without these corrections.
+        //
+        // Ref: ENDF-6 §2.2.1.6 Table 2.4; OpenScale File2Lrf7.f90 l.269–298.
         if kbk != 0 {
             for _ in 0..nch {
                 skip_background_subrecord(ctx.lines, ctx.pos)?;
@@ -812,11 +816,12 @@ fn parse_rmatrix_limited_range(
         }
 
         // KPS: tabulated penetrability/phase-shift override.
-        // Same record structure as KBK: NCH CONT+LIST pairs (one per channel), with
-        // optional TAB1s when LPS==1.  SAMMY always computes penetrabilities and phase
-        // shifts analytically (mrml07.f, Sinsix subroutine) and ignores KPS entirely.
-        // We match that behaviour: consume the records, do not apply them.
-        // Reference: OpenScale File2Lrf7.f90 lines 301–331; ENDF-6 §2.2.1.6 Table 2.5.
+        // Same record structure as KBK.  SAMMY always computes penetrabilities
+        // and phase shifts analytically (mrml07.f Sinsix) and ignores KPS
+        // entirely — zero references to KPS or LPS in any rml/ physics file.
+        // We match that behaviour.
+        //
+        // Ref: ENDF-6 §2.2.1.6 Table 2.5; OpenScale File2Lrf7.f90 l.301–331.
         if kps != 0 {
             for _ in 0..nch {
                 skip_background_subrecord(ctx.lines, ctx.pos)?;
