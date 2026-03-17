@@ -327,6 +327,10 @@ struct PySpatialResult {
     n_total: usize,
     isotope_names: Vec<String>,
     shape: (usize, usize),
+    /// Per-pixel normalization factor (None when background=False).
+    anorm_map: Option<Py<PyArray2<f64>>>,
+    /// Per-pixel background parameters [BackA, BackB, BackC] (None when background=False).
+    background_maps: Option<[Py<PyArray2<f64>>; 3]>,
 }
 
 #[pymethods]
@@ -377,6 +381,21 @@ impl PySpatialResult {
     #[getter]
     fn isotope_names(&self) -> Vec<String> {
         self.isotope_names.clone()
+    }
+
+    /// Per-pixel normalization factor Anorm (None when background fitting was disabled).
+    #[getter]
+    fn anorm_map<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray2<f64>>> {
+        self.anorm_map.as_ref().map(|m| m.bind(py).clone())
+    }
+
+    /// Per-pixel background parameter maps [BackA, BackB, BackC]
+    /// (None when background fitting was disabled).
+    #[getter]
+    fn background_maps<'py>(&self, py: Python<'py>) -> Option<Vec<Bound<'py, PyArray2<f64>>>> {
+        self.background_maps
+            .as_ref()
+            .map(|maps| maps.iter().map(|m| m.bind(py).clone()).collect())
     }
 
     fn __repr__(&self) -> String {
@@ -480,6 +499,10 @@ struct PyRegularizedResult {
     n_weak_directions: usize,
     fisher_eigenvalues: Py<PyArray1<f64>>,
     shape: (usize, usize),
+    /// Per-pixel normalization factor (None when background=False).
+    anorm_map: Option<Py<PyArray2<f64>>>,
+    /// Per-pixel background parameters [BackA, BackB, BackC] (None when background=False).
+    background_maps: Option<[Py<PyArray2<f64>>; 3]>,
 }
 
 #[pymethods]
@@ -559,6 +582,21 @@ impl PyRegularizedResult {
     #[getter]
     fn fisher_eigenvalues<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
         self.fisher_eigenvalues.bind(py).clone()
+    }
+
+    /// Per-pixel normalization factor Anorm (None when background fitting was disabled).
+    #[getter]
+    fn anorm_map<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray2<f64>>> {
+        self.anorm_map.as_ref().map(|m| m.bind(py).clone())
+    }
+
+    /// Per-pixel background parameter maps [BackA, BackB, BackC]
+    /// (None when background fitting was disabled).
+    #[getter]
+    fn background_maps<'py>(&self, py: Python<'py>) -> Option<Vec<Bound<'py, PyArray2<f64>>>> {
+        self.background_maps
+            .as_ref()
+            .map(|maps| maps.iter().map(|m| m.bind(py).clone()).collect())
     }
 
     fn __repr__(&self) -> String {
@@ -1694,14 +1732,23 @@ fn py_apply_resolution<'py>(
 /// Routes to either the Levenberg-Marquardt (LM/χ²) fitter or the
 /// Poisson/KL sparse fitter depending on the `fitter` argument.
 ///
+/// **Input format depends on fitter + background combination:**
+///
+/// | fitter    | background | transmission arg        | uncertainty arg              | Returns       |
+/// |-----------|------------|-------------------------|------------------------------|---------------|
+/// | 'lm'      | False/True | normalised T ∈ [0,~2]   | per-bin σ (std dev)          | SpatialResult |
+/// | 'poisson' | False      | raw sample counts       | raw open-beam counts         | SparseResult  |
+/// | 'poisson' | True       | normalised T ∈ [0,~2]   | per-bin σ (std dev)          | SpatialResult |
+///
+/// **WARNING**: When ``fitter='poisson'`` and ``background=True``, the input
+/// format is **transmission + uncertainty** (same as LM), NOT raw counts.
+/// This is because the Poisson+background path uses the FitConfig/spatial_map
+/// engine which operates on transmission data.  Passing raw counts with
+/// ``background=True`` will produce silently wrong results.
+///
 /// Args:
-///     transmission: 3D array (n_energies, height, width).
-///         - fitter='lm':      normalised transmission T ∈ [0,1].
-///         - fitter='poisson': raw sample counts (integer-valued floats).
-///     uncertainty: 3D array (n_energies, height, width).
-///         - fitter='lm':      per-bin transmission uncertainty σ (standard deviation).
-///         - fitter='poisson': raw open-beam counts (NOT uncertainty — this parameter is
-///                            reused to pass open-beam data; same shape as sample).
+///     transmission: 3D array (n_energies, height, width).  See table above.
+///     uncertainty: 3D array (n_energies, height, width).  See table above.
 ///     energies: 1D numpy array of energy values in eV.
 ///     isotopes: List of ResonanceData objects.
 ///     temperature_k: Sample temperature in Kelvin (default 300.0).
@@ -1713,13 +1760,15 @@ fn py_apply_resolution<'py>(
 ///     resolution: TabulatedResolution for tabulated broadening (optional).
 ///     max_iter: Maximum iterations per pixel for LM or Poisson fitting (default 100).
 ///     fitter: 'lm' (default) for Gaussian χ² or 'poisson' for Poisson NLL.
+///     background: Enable SAMMY-style normalization + background fitting (default False).
 ///     roi: [y0, y1, x0, x1] region for Stage-1 nuisance estimation
-///         (Poisson path only, default uses full image).
+///         (Poisson path only, without background; default uses full image).
 ///
 /// Returns:
-///     SpatialResult (fitter='lm') or SparseResult (fitter='poisson').
+///     SpatialResult (fitter='lm', or fitter='poisson' with background=True)
+///     or SparseResult (fitter='poisson' without background).
 #[pyfunction]
-#[pyo3(name = "spatial_map", signature = (transmission, uncertainty, energies, isotopes, temperature_k=300.0, initial_densities=None, dead_pixels=None, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, delta_e_us=None, max_iter=100, fitter="lm", roi=None))]
+#[pyo3(name = "spatial_map", signature = (transmission, uncertainty, energies, isotopes, temperature_k=300.0, initial_densities=None, dead_pixels=None, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, delta_e_us=None, max_iter=100, fitter="lm", roi=None, background=false))]
 fn py_spatial_map(
     py: Python<'_>,
     transmission: PyReadonlyArray3<f64>,
@@ -1737,6 +1786,7 @@ fn py_spatial_map(
     max_iter: usize,
     fitter: &str,
     roi: Option<[usize; 4]>,
+    background: bool,
 ) -> PyResult<Py<PyAny>> {
     let e = energies.as_slice()?;
 
@@ -1802,144 +1852,202 @@ fn py_spatial_map(
 
     let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution, delta_e_us)?;
 
-    match fitter {
-        "lm" => {
-            if roi.is_some() {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "roi is only supported with fitter='poisson', not fitter='lm'",
-                ));
+    // When fitter='poisson' + background=True, route through the FitConfig/spatial_map
+    // path (same as LM) but with PoissonKL solver.  The SparseConfig path does not
+    // support background wrapping.
+    //
+    // IMPORTANT: The FitConfig path expects TRANSMISSION + UNCERTAINTY as input,
+    // NOT raw counts + open-beam.  This is a different input format from the
+    // SparseConfig path (fitter='poisson' without background).
+    let use_fitconfig_path = fitter == "lm" || (fitter == "poisson" && background);
+
+    if use_fitconfig_path {
+        if fitter == "lm" && roi.is_some() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "roi is only supported with fitter='poisson' (without background), not fitter='lm'",
+            ));
+        }
+        if fitter == "poisson" && roi.is_some() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "roi is only supported with fitter='poisson' without background; \
+                 poisson + background routes through the FitConfig path which does not use ROI",
+            ));
+        }
+
+        // C1 SAFETY CHECK: When fitter='poisson' + background=True, input must be
+        // transmission+uncertainty, NOT counts+open_beam.  Detect likely misuse by
+        // checking if values look like raw counts (median >> 2 suggests counts, not
+        // transmission which should be in [0, ~2]).
+        if fitter == "poisson" && background {
+            let t_view = transmission.as_array();
+            // Sample a few values to check the data range without reading the full array.
+            let n = t_view.len().min(1000);
+            let mut sample_vals: Vec<f64> = t_view.iter().take(n).copied().collect();
+            sample_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let median = if sample_vals.is_empty() {
+                0.0
+            } else {
+                sample_vals[sample_vals.len() / 2]
+            };
+            if median > 5.0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "fitter='poisson' + background=True expects TRANSMISSION data (values ~0-2), \
+                     but the input has median={median:.1} which looks like raw counts. \
+                     When background=True, pass normalised transmission and uncertainty (same as LM), \
+                     not raw counts and open-beam."
+                )));
             }
-            let config = FitConfig::new(
-                e.to_vec(),
-                res_data,
-                isotope_names.clone(),
-                temperature_k,
-                res_fn,
-                init,
-                LmConfig {
-                    max_iter,
-                    ..LmConfig::default()
-                },
-            )
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        }
+        let mut config = FitConfig::new(
+            e.to_vec(),
+            res_data,
+            isotope_names.clone(),
+            temperature_k,
+            res_fn,
+            init,
+            LmConfig {
+                max_iter,
+                ..LmConfig::default()
+            },
+        )
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
-            // Clone arrays only after all validation passes.
-            // The .to_owned() is necessary because py.detach() releases the GIL and
-            // the closure needs 'static data; numpy views borrow GIL-protected memory.
-            let trans = transmission.as_array().to_owned();
-            let unc = uncertainty.as_array().to_owned();
-            let dead = dead_pixels.map(|d| d.as_array().to_owned());
-
-            // Release the GIL for the heavy per-pixel fitting.
-            // Pass views into spatial_map to avoid a second deep copy — the function
-            // internally transposes into its own owned layout.
-            let result = py.detach(move || {
-                nereids_pipeline::spatial::spatial_map(
-                    trans.view(),
-                    unc.view(),
-                    &config,
-                    dead.as_ref(),
-                    None,
-                    None,
-                )
-            });
-            let result =
-                result.map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-
-            let shape = (
-                result.converged_map.shape()[0],
-                result.converged_map.shape()[1],
-            );
-            let py_result = PySpatialResult {
-                density_maps: result
-                    .density_maps
-                    .into_iter()
-                    .map(|m| PyArray2::from_owned_array(py, m).unbind())
-                    .collect(),
-                uncertainty_maps: result
-                    .uncertainty_maps
-                    .into_iter()
-                    .map(|m| PyArray2::from_owned_array(py, m).unbind())
-                    .collect(),
-                chi_squared_map: PyArray2::from_owned_array(py, result.chi_squared_map).unbind(),
-                converged_map: PyArray2::from_owned_array(py, result.converged_map).unbind(),
-                n_converged: result.n_converged,
-                n_total: result.n_total,
-                isotope_names: result.isotope_labels,
-                shape,
-            };
-            Py::new(py, py_result).map(|p| p.into_any())
+        // Switch solver to Poisson KL when requested.
+        if fitter == "poisson" {
+            config = config.with_solver(SolverChoice::PoissonKL(PoissonConfig {
+                max_iter,
+                ..PoissonConfig::default()
+            }));
         }
 
-        "poisson" => {
-            // Stage 1: estimate flux + background from open-beam (second arg).
-            let sample = transmission.as_array().to_owned();
-            let open_beam = uncertainty.as_array().to_owned();
-            let dead = dead_pixels.map(|d| d.as_array().to_owned());
+        if background {
+            config = config.with_background(BackgroundConfig::default());
+        }
 
-            // Validate ROI bounds before feeding into estimate_nuisance.
-            let roi_ranges = match roi {
-                Some(r) => {
-                    let (height, width) = (sample.shape()[1], sample.shape()[2]);
-                    if r[0] >= r[1] || r[2] >= r[3] {
-                        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                            "roi must be [y0, y1, x0, x1] with y0<y1 and x0<x1, got {:?}",
-                            r,
-                        )));
-                    }
-                    if r[0] >= height || r[1] > height || r[2] >= width || r[3] > width {
-                        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                            "roi [{},{},{},{}] exceeds image dimensions ({}×{})",
-                            r[0], r[1], r[2], r[3], height, width,
-                        )));
-                    }
-                    Some((r[0]..r[1], r[2]..r[3]))
+        // Clone arrays only after all validation passes.
+        // The .to_owned() is necessary because py.detach() releases the GIL and
+        // the closure needs 'static data; numpy views borrow GIL-protected memory.
+        let trans = transmission.as_array().to_owned();
+        let unc = uncertainty.as_array().to_owned();
+        let dead = dead_pixels.map(|d| d.as_array().to_owned());
+
+        // Release the GIL for the heavy per-pixel fitting.
+        // Pass views into spatial_map to avoid a second deep copy — the function
+        // internally transposes into its own owned layout.
+        let result = py.detach(move || {
+            nereids_pipeline::spatial::spatial_map(
+                trans.view(),
+                unc.view(),
+                &config,
+                dead.as_ref(),
+                None,
+                None,
+            )
+        });
+        let result = result.map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+
+        let shape = (
+            result.converged_map.shape()[0],
+            result.converged_map.shape()[1],
+        );
+        let py_result = PySpatialResult {
+            density_maps: result
+                .density_maps
+                .into_iter()
+                .map(|m| PyArray2::from_owned_array(py, m).unbind())
+                .collect(),
+            uncertainty_maps: result
+                .uncertainty_maps
+                .into_iter()
+                .map(|m| PyArray2::from_owned_array(py, m).unbind())
+                .collect(),
+            chi_squared_map: PyArray2::from_owned_array(py, result.chi_squared_map).unbind(),
+            converged_map: PyArray2::from_owned_array(py, result.converged_map).unbind(),
+            n_converged: result.n_converged,
+            n_total: result.n_total,
+            isotope_names: result.isotope_labels,
+            shape,
+            anorm_map: result
+                .anorm_map
+                .map(|m| PyArray2::from_owned_array(py, m).unbind()),
+            background_maps: result.background_maps.map(|maps| {
+                let [a, b, c] = maps;
+                [
+                    PyArray2::from_owned_array(py, a).unbind(),
+                    PyArray2::from_owned_array(py, b).unbind(),
+                    PyArray2::from_owned_array(py, c).unbind(),
+                ]
+            }),
+        };
+        Py::new(py, py_result).map(|p| p.into_any())
+    } else if fitter == "poisson" {
+        // Pure Poisson path (no background): uses SparseConfig/sparse_reconstruct.
+        // Input: sample counts (transmission arg) + open-beam counts (uncertainty arg).
+        let sample = transmission.as_array().to_owned();
+        let open_beam = uncertainty.as_array().to_owned();
+        let dead = dead_pixels.map(|d| d.as_array().to_owned());
+
+        // Validate ROI bounds before feeding into estimate_nuisance.
+        let roi_ranges = match roi {
+            Some(r) => {
+                let (height, width) = (sample.shape()[1], sample.shape()[2]);
+                if r[0] >= r[1] || r[2] >= r[3] {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "roi must be [y0, y1, x0, x1] with y0<y1 and x0<x1, got {:?}",
+                        r,
+                    )));
                 }
-                None => None,
-            };
-            let sparse_config = SparseConfig::new(
-                e.to_vec(),
-                res_data,
-                isotope_names.clone(),
-                temperature_k,
-                res_fn,
-                init,
-                PoissonConfig {
-                    max_iter,
-                    ..PoissonConfig::default()
-                },
-            )
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+                if r[0] >= height || r[1] > height || r[2] >= width || r[3] > width {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "roi [{},{},{},{}] exceeds image dimensions ({}×{})",
+                        r[0], r[1], r[2], r[3], height, width,
+                    )));
+                }
+                Some((r[0]..r[1], r[2]..r[3]))
+            }
+            None => None,
+        };
+        let sparse_config = SparseConfig::new(
+            e.to_vec(),
+            res_data,
+            isotope_names.clone(),
+            temperature_k,
+            res_fn,
+            init,
+            PoissonConfig {
+                max_iter,
+                ..PoissonConfig::default()
+            },
+        )
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
-            // Release the GIL for nuisance estimation + per-pixel Poisson fitting.
-            let result = py.detach(move || {
-                let nuisance = estimate_nuisance(&open_beam, roi_ranges, dead.as_ref())?;
-                sparse_reconstruct(&sample, &nuisance, &sparse_config, dead.as_ref(), None)
-            });
-            let result =
-                result.map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        // Release the GIL for nuisance estimation + per-pixel Poisson fitting.
+        let result = py.detach(move || {
+            let nuisance = estimate_nuisance(&open_beam, roi_ranges, dead.as_ref())?;
+            sparse_reconstruct(&sample, &nuisance, &sparse_config, dead.as_ref(), None)
+        });
+        let result = result.map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
-            let shape = (result.nll_map.shape()[0], result.nll_map.shape()[1]);
-            let py_result = PySparseResult {
-                density_maps: result
-                    .density_maps
-                    .into_iter()
-                    .map(|m| PyArray2::from_owned_array(py, m).unbind())
-                    .collect(),
-                nll_map: PyArray2::from_owned_array(py, result.nll_map).unbind(),
-                converged_map: PyArray2::from_owned_array(py, result.converged_map).unbind(),
-                n_converged: result.n_converged,
-                n_total: result.n_total,
-                isotope_names,
-                shape,
-            };
-            Py::new(py, py_result).map(|p| p.into_any())
-        }
-
-        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+        let shape = (result.nll_map.shape()[0], result.nll_map.shape()[1]);
+        let py_result = PySparseResult {
+            density_maps: result
+                .density_maps
+                .into_iter()
+                .map(|m| PyArray2::from_owned_array(py, m).unbind())
+                .collect(),
+            nll_map: PyArray2::from_owned_array(py, result.nll_map).unbind(),
+            converged_map: PyArray2::from_owned_array(py, result.converged_map).unbind(),
+            n_converged: result.n_converged,
+            n_total: result.n_total,
+            isotope_names,
+            shape,
+        };
+        Py::new(py, py_result).map(|p| p.into_any())
+    } else {
+        Err(pyo3::exceptions::PyValueError::new_err(format!(
             "fitter must be 'lm' or 'poisson', got '{}'",
-            other,
-        ))),
+            fitter,
+        )))
     }
 }
 
@@ -1974,7 +2082,7 @@ fn py_spatial_map(
 /// Returns:
 ///     RegularizedResult with density maps, uncertainty maps, and diagnostics.
 #[pyfunction]
-#[pyo3(name = "spatial_map_regularized", signature = (transmission, uncertainty, energies, isotopes, temperature_k=300.0, initial_densities=None, dead_pixels=None, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, delta_e_us=None, max_iter=100, fitter="lm", threshold=0.05, smooth_iter=10, compute_uncertainty=true, regularize_temperature=true))]
+#[pyo3(name = "spatial_map_regularized", signature = (transmission, uncertainty, energies, isotopes, temperature_k=300.0, initial_densities=None, dead_pixels=None, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, delta_e_us=None, max_iter=100, fitter="lm", threshold=0.05, smooth_iter=10, compute_uncertainty=true, regularize_temperature=true, background=false))]
 fn py_spatial_map_regularized(
     py: Python<'_>,
     transmission: PyReadonlyArray3<f64>,
@@ -1995,6 +2103,7 @@ fn py_spatial_map_regularized(
     smooth_iter: usize,
     compute_uncertainty: bool,
     regularize_temperature: bool,
+    background: bool,
 ) -> PyResult<PyRegularizedResult> {
     let e = energies.as_slice()?;
 
@@ -2096,6 +2205,10 @@ fn py_spatial_map_regularized(
         }
     };
 
+    if background {
+        config = config.with_background(BackgroundConfig::default());
+    }
+
     let reg_config = RegularizationConfig {
         threshold,
         smooth_iter,
@@ -2154,6 +2267,17 @@ fn py_spatial_map_regularized(
         n_weak_directions: result.n_weak_directions,
         fisher_eigenvalues: PyArray1::from_vec(py, result.fisher_eigenvalues).unbind(),
         shape,
+        anorm_map: result
+            .anorm_map
+            .map(|m| PyArray2::from_owned_array(py, m).unbind()),
+        background_maps: result.background_maps.map(|maps| {
+            let [a, b, c] = maps;
+            [
+                PyArray2::from_owned_array(py, a).unbind(),
+                PyArray2::from_owned_array(py, b).unbind(),
+                PyArray2::from_owned_array(py, c).unbind(),
+            ]
+        }),
     })
 }
 
@@ -2944,6 +3068,111 @@ fn detect_dead_pixels<'py>(
     Ok(PyArray2::from_owned_array(py, mask))
 }
 
+/// Result of energy calibration.
+#[pyclass(name = "CalibrationResult")]
+#[derive(Debug)]
+struct PyCalibrationResult {
+    /// Fitted flight path length in metres.
+    flight_path_m: f64,
+    /// Fitted TOF delay in microseconds.
+    t0_us: f64,
+    /// Fitted total areal density in atoms/barn.
+    total_density: f64,
+    /// Reduced chi-squared at the best parameters.
+    reduced_chi_squared: f64,
+    /// Corrected energy grid.
+    energies_corrected: Py<PyArray1<f64>>,
+}
+
+#[pymethods]
+impl PyCalibrationResult {
+    #[getter]
+    fn flight_path_m(&self) -> f64 {
+        self.flight_path_m
+    }
+    #[getter]
+    fn t0_us(&self) -> f64 {
+        self.t0_us
+    }
+    #[getter]
+    fn total_density(&self) -> f64 {
+        self.total_density
+    }
+    #[getter]
+    fn reduced_chi_squared(&self) -> f64 {
+        self.reduced_chi_squared
+    }
+    #[getter]
+    fn energies_corrected<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        self.energies_corrected.bind(py).clone()
+    }
+    fn __repr__(&self) -> String {
+        format!(
+            "CalibrationResult(L={:.4}m, t0={:.2}µs, n={:.2e}, chi2r={:.4})",
+            self.flight_path_m, self.t0_us, self.total_density, self.reduced_chi_squared
+        )
+    }
+}
+
+/// Calibrate the energy axis by fitting flight path and TOF delay.
+///
+/// Finds the (L, t₀, n_total) that best align the ENDF resonance model
+/// with measured transmission data from a known-composition reference sample.
+///
+/// Args:
+///     energies_nominal: 1D ascending energy grid (eV) computed with assumed L.
+///     transmission: 1D measured transmission values.
+///     uncertainty: 1D per-bin uncertainty.
+///     isotopes: List of ResonanceData for the reference sample.
+///     abundances: Natural abundance fractions (same length as isotopes).
+///     assumed_flight_path_m: Flight path used to compute energies_nominal.
+///     temperature_k: Sample temperature in Kelvin (default 293.6).
+///
+/// Returns:
+///     CalibrationResult with fitted (L, t₀, n_total) and corrected energies.
+#[pyfunction]
+#[pyo3(name = "calibrate_energy", signature = (energies_nominal, transmission, uncertainty, isotopes, abundances, assumed_flight_path_m, temperature_k=293.6))]
+fn py_calibrate_energy(
+    py: Python<'_>,
+    energies_nominal: PyReadonlyArray1<f64>,
+    transmission: PyReadonlyArray1<f64>,
+    uncertainty: PyReadonlyArray1<f64>,
+    isotopes: Vec<PyResonanceData>,
+    abundances: Vec<f64>,
+    assumed_flight_path_m: f64,
+    temperature_k: f64,
+) -> PyResult<PyCalibrationResult> {
+    let e = energies_nominal.as_slice()?;
+    let t = transmission.as_slice()?;
+    let s = uncertainty.as_slice()?;
+
+    let res_data: Vec<nereids_endf::resonance::ResonanceData> = isotopes
+        .into_iter()
+        .map(|d| Arc::unwrap_or_clone(d.inner))
+        .collect();
+
+    let result = py.detach(move || {
+        nereids_pipeline::calibration::calibrate_energy(
+            e,
+            t,
+            s,
+            &res_data,
+            &abundances,
+            assumed_flight_path_m,
+            temperature_k,
+        )
+    });
+    let result = result.map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+
+    Ok(PyCalibrationResult {
+        flight_path_m: result.flight_path_m,
+        t0_us: result.t0_us,
+        total_density: result.total_density,
+        reduced_chi_squared: result.reduced_chi_squared,
+        energies_corrected: PyArray1::from_vec(py, result.energies_corrected).unbind(),
+    })
+}
+
 /// NEREIDS Python module.
 #[pymodule]
 fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -2983,5 +3212,7 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_trace_detectability_survey, m)?)?;
     m.add_function(wrap_pyfunction!(precompute_cross_sections, m)?)?;
     m.add_function(wrap_pyfunction!(detect_dead_pixels, m)?)?;
+    m.add_function(wrap_pyfunction!(py_calibrate_energy, m)?)?;
+    m.add_class::<PyCalibrationResult>()?;
     Ok(())
 }

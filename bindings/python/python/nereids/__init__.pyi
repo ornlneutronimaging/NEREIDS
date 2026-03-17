@@ -95,6 +95,34 @@ class FitResult:
         """Fitted background parameters (BackA, BackB, BackC)."""
         ...
 
+class CalibrationResult:
+    """Result of energy axis calibration."""
+
+    @property
+    def flight_path_m(self) -> float:
+        """Fitted flight path length in metres."""
+        ...
+
+    @property
+    def t0_us(self) -> float:
+        """Fitted TOF delay in microseconds."""
+        ...
+
+    @property
+    def total_density(self) -> float:
+        """Fitted total areal density in atoms/barn."""
+        ...
+
+    @property
+    def reduced_chi_squared(self) -> float:
+        """Reduced chi-squared at the best parameters."""
+        ...
+
+    @property
+    def energies_corrected(self) -> NDArray[np.float64]:
+        """Corrected energy grid (ascending, eV)."""
+        ...
+
 class TabulatedResolution:
     """Tabulated instrument resolution function."""
 
@@ -435,8 +463,13 @@ def spatial_map(
     max_iter: int = 100,
     fitter: str = "lm",
     roi: list[int] | None = None,
+    background: bool = False,
 ) -> SpatialResult | SparseResult:
-    """Run per-pixel fitting across a transmission image stack."""
+    """Run per-pixel fitting across a transmission image stack.
+
+    When ``background=True``, each pixel's model becomes
+    ``Anorm * exp(-sum(n_i * sigma_i)) + BackA + BackB/sqrt(E) + BackC*sqrt(E)``.
+    """
     ...
 
 def spatial_map_regularized(
@@ -458,6 +491,7 @@ def spatial_map_regularized(
     smooth_iter: int = 10,
     compute_uncertainty: bool = True,
     regularize_temperature: bool = True,
+    background: bool = False,
 ) -> RegularizedResult:
     """Run spatially regularized per-pixel fitting.
 
@@ -607,5 +641,21 @@ def detect_dead_pixels(
     NDArray[np.bool_]
         2D boolean mask with shape ``(height, width)``, where ``True`` marks
         a dead pixel (all-zero across the spectral axis).
+    """
+    ...
+
+def calibrate_energy(
+    energies_nominal: NDArray[np.float64],
+    transmission: NDArray[np.float64],
+    uncertainty: NDArray[np.float64],
+    isotopes: list[ResonanceData],
+    abundances: list[float],
+    assumed_flight_path_m: float,
+    temperature_k: float = 293.6,
+) -> CalibrationResult:
+    """Calibrate the energy axis by fitting flight path and TOF delay.
+
+    Finds the (L, t0, n_total) that best align the ENDF resonance model
+    with measured transmission data from a known-composition reference.
     """
     ...
