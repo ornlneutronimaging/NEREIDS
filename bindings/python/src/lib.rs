@@ -3153,7 +3153,7 @@ fn py_calibrate_energy(
         .collect();
 
     let instrument = resolution.map(|r| nereids_physics::transmission::InstrumentParams {
-        resolution: r.inner.clone(),
+        resolution: nereids_physics::resolution::ResolutionFunction::Tabulated(r.inner.clone()),
     });
 
     let result = py.detach(move || {
