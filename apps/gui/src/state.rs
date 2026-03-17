@@ -620,8 +620,6 @@ pub struct AppState {
 
     // -- Energy grid --
     pub energies: Option<Vec<f64>>,
-    pub tof_min_us: f64,
-    pub tof_max_us: f64,
 
     // -- Isotope selection --
     pub isotope_entries: Vec<IsotopeEntry>,
@@ -1265,8 +1263,6 @@ impl Default for AppState {
             proton_charge_ob: 1.0,
 
             energies: None,
-            tof_min_us: 1000.0,
-            tof_max_us: 20000.0,
 
             isotope_entries: Vec::new(),
             endf_library: EndfLibrary::EndfB8_0,

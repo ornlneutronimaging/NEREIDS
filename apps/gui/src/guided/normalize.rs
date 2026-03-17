@@ -476,7 +476,15 @@ pub(crate) fn prepare_transmission(state: &mut AppState) {
     }
 
     let n_tof = sample.shape()[0];
-    // Using uniform synthetic uncertainty since no open beam is available.
+    // FABRICATED UNCERTAINTY: TransmissionTiff mode has no open-beam data, so
+    // true per-bin Poisson uncertainty is unknown.  We assign a uniform σ = 0.01
+    // as a placeholder.  This means:
+    //   - χ² values are NOT physically meaningful (they reflect the arbitrary σ,
+    //     not actual measurement noise).
+    //   - Relative weights across bins are uniform, which may bias fits toward
+    //     high-transmission bins where the true σ is smaller.
+    //   - A better estimate would be σ = √(T / I₀_est) if an approximate I₀ is
+    //     available, but this mode does not provide one.
     let uncertainty = ndarray::Array3::from_elem(sample.raw_dim(), 0.01);
 
     match compute_energies(state, n_tof) {
@@ -498,78 +506,76 @@ pub(crate) fn prepare_transmission(state: &mut AppState) {
     state.status_message = "Transmission ready (synthetic uncertainty — see docs)".into();
 }
 
-/// Compute energy bin centers from spectrum file or synthetic TOF edges.
+/// Compute energy bin centers from the spectrum file loaded in state.
 ///
 /// Uses the spectrum file values and unit/kind settings from state.
-/// Falls back to synthetic linear TOF edges if no spectrum file is loaded
-/// (backward compatibility).
+/// Returns an error if no spectrum file is loaded — a real instrument
+/// spectrum is required for meaningful energy calibration.  Silently
+/// fabricating a synthetic linear TOF axis would place resonance
+/// positions at wrong energies, producing unphysical fit results.
 fn compute_energies(state: &AppState, n_tof: usize) -> Result<Vec<f64>, String> {
-    if let Some(ref values) = state.spectrum_values {
-        let energies = match (state.spectrum_unit, state.spectrum_kind) {
-            (SpectrumUnit::TofMicroseconds, SpectrumValueKind::BinEdges) => {
-                // TOF edges → energy centers via geometric mean
-                nereids_io::tof::tof_edges_to_energy_centers(values, &state.beamline)
-                    .map(|a| a.to_vec())
-                    .map_err(|e| format!("{}", e))?
-            }
-            (SpectrumUnit::TofMicroseconds, SpectrumValueKind::BinCenters) => {
-                // Convert each TOF center to energy directly
-                if !state.beamline.flight_path_m.is_finite() || state.beamline.flight_path_m <= 0.0
-                {
-                    return Err("Flight path must be positive and finite".into());
-                }
-                let mut energies: Vec<f64> = values
-                    .iter()
-                    .map(|&tof| {
-                        let corrected = tof - state.beamline.delay_us;
-                        if corrected <= 0.0 || !corrected.is_finite() {
-                            return Err(format!(
-                                "TOF {:.2} \u{03bc}s - delay {:.2} \u{03bc}s = {:.2} \u{03bc}s is not positive",
-                                tof, state.beamline.delay_us, corrected
-                            ));
-                        }
-                        Ok(nereids_core::constants::tof_to_energy(
-                            corrected,
-                            state.beamline.flight_path_m,
-                        ))
-                    })
-                    .collect::<Result<Vec<f64>, String>>()?;
-                // TOF ascending → energy descending, so reverse
-                energies.reverse();
-                energies
-            }
-            (SpectrumUnit::EnergyEv, SpectrumValueKind::BinEdges) => {
-                // Energy edges → geometric mean centers
-                if values.iter().any(|&v| v <= 0.0) {
-                    return Err("Energy bin edges must be positive for geometric mean".into());
-                }
-                values.windows(2).map(|w| (w[0] * w[1]).sqrt()).collect()
-            }
-            (SpectrumUnit::EnergyEv, SpectrumValueKind::BinCenters) => {
-                // Direct: energy centers
-                if values.iter().any(|&v| v <= 0.0) {
-                    return Err("Energy bin centers must be positive".into());
-                }
-                values.to_vec()
-            }
-        };
+    let values = state.spectrum_values.as_ref().ok_or_else(|| {
+        "No spectrum file loaded — a spectrum file is required to define \
+         the energy axis. Load a spectrum file in the Load step before \
+         proceeding to normalization."
+            .to_string()
+    })?;
 
-        if energies.len() != n_tof {
-            return Err(format!(
-                "Energy grid has {} points but data has {} frames — check spectrum unit/kind settings",
-                energies.len(),
-                n_tof
-            ));
+    let energies = match (state.spectrum_unit, state.spectrum_kind) {
+        (SpectrumUnit::TofMicroseconds, SpectrumValueKind::BinEdges) => {
+            // TOF edges → energy centers via geometric mean
+            nereids_io::tof::tof_edges_to_energy_centers(values, &state.beamline)
+                .map(|a| a.to_vec())
+                .map_err(|e| format!("{}", e))?
         }
+        (SpectrumUnit::TofMicroseconds, SpectrumValueKind::BinCenters) => {
+            // Convert each TOF center to energy directly
+            if !state.beamline.flight_path_m.is_finite() || state.beamline.flight_path_m <= 0.0 {
+                return Err("Flight path must be positive and finite".into());
+            }
+            let mut energies: Vec<f64> = values
+                .iter()
+                .map(|&tof| {
+                    let corrected = tof - state.beamline.delay_us;
+                    if corrected <= 0.0 || !corrected.is_finite() {
+                        return Err(format!(
+                            "TOF {:.2} \u{03bc}s - delay {:.2} \u{03bc}s = {:.2} \u{03bc}s is not positive",
+                            tof, state.beamline.delay_us, corrected
+                        ));
+                    }
+                    Ok(nereids_core::constants::tof_to_energy(
+                        corrected,
+                        state.beamline.flight_path_m,
+                    ))
+                })
+                .collect::<Result<Vec<f64>, String>>()?;
+            // TOF ascending → energy descending, so reverse
+            energies.reverse();
+            energies
+        }
+        (SpectrumUnit::EnergyEv, SpectrumValueKind::BinEdges) => {
+            // Energy edges → geometric mean centers
+            if values.iter().any(|&v| v <= 0.0) {
+                return Err("Energy bin edges must be positive for geometric mean".into());
+            }
+            values.windows(2).map(|w| (w[0] * w[1]).sqrt()).collect()
+        }
+        (SpectrumUnit::EnergyEv, SpectrumValueKind::BinCenters) => {
+            // Direct: energy centers
+            if values.iter().any(|&v| v <= 0.0) {
+                return Err("Energy bin centers must be positive".into());
+            }
+            values.to_vec()
+        }
+    };
 
-        Ok(energies)
-    } else {
-        // Fallback: synthetic linear TOF edges (backward compatibility)
-        let tof_edges =
-            nereids_io::tof::linspace_tof_edges(state.tof_min_us, state.tof_max_us, n_tof)
-                .map_err(|e| format!("{}", e))?;
-        nereids_io::tof::tof_edges_to_energy_centers(&tof_edges, &state.beamline)
-            .map(|a| a.to_vec())
-            .map_err(|e| format!("{}", e))
+    if energies.len() != n_tof {
+        return Err(format!(
+            "Energy grid has {} points but data has {} frames — check spectrum unit/kind settings",
+            energies.len(),
+            n_tof
+        ));
     }
+
+    Ok(energies)
 }
