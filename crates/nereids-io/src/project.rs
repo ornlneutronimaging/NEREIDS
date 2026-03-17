@@ -89,6 +89,10 @@ pub struct ProjectSnapshot {
 
     // -- intermediate (always embedded) --
     pub normalized: Option<Array3<f64>>,
+    /// D-1: Per-bin transmission uncertainty σ (same shape as normalized).
+    /// Previously missing from the snapshot, causing reloaded projects to
+    /// lose uncertainty information (reconstructed as zeros).
+    pub normalized_uncertainty: Option<Array3<f64>>,
     pub energies: Option<Vec<f64>>,
 
     // -- results (always embedded) --
@@ -166,6 +170,7 @@ impl Default for ProjectSnapshot {
             open_beam_data: None,
             spectrum_values: None,
             normalized: None,
+            normalized_uncertainty: None,
             energies: None,
             density_maps: None,
             uncertainty_maps: None,
@@ -531,6 +536,11 @@ fn write_intermediate(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), I
 
     if let Some(ref norm) = snap.normalized {
         write_chunked_3d(&inter, "normalized", norm, "/intermediate")?;
+    }
+
+    // D-1: Save per-bin transmission uncertainty alongside normalized data.
+    if let Some(ref unc) = snap.normalized_uncertainty {
+        write_chunked_3d(&inter, "normalized_uncertainty", unc, "/intermediate")?;
     }
 
     if let Some(ref energies) = snap.energies {
@@ -1086,6 +1096,20 @@ fn read_intermediate(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<()
         }
     }
 
+    // D-1: Load per-bin transmission uncertainty.
+    if let Ok(unc_ds) = inter.dataset("normalized_uncertainty") {
+        let shape = unc_ds.shape();
+        if shape.len() == 3 {
+            let data: Vec<f64> = unc_ds
+                .read_raw()
+                .map_err(|e| hdf5_err("/intermediate/normalized_uncertainty", e))?;
+            snap.normalized_uncertainty = Some(
+                Array3::from_shape_vec((shape[0], shape[1], shape[2]), data)
+                    .map_err(|e| hdf5_err("/intermediate/normalized_uncertainty reshape", e))?,
+            );
+        }
+    }
+
     if let Ok(e_ds) = inter.dataset("energies") {
         let data: Vec<f64> = e_ds
             .read_raw()
@@ -1408,6 +1432,7 @@ mod tests {
             open_beam_data: None,
             spectrum_values: None,
             normalized: None,
+            normalized_uncertainty: None,
             energies: None,
             density_maps: None,
             uncertainty_maps: None,

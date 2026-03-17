@@ -106,8 +106,9 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         })
         .collect();
 
-    // Normalized data (transmission array)
+    // Normalized data (transmission + uncertainty arrays)
     let normalized = state.normalized.as_ref().map(|nd| nd.transmission.clone());
+    let normalized_uncertainty = state.normalized.as_ref().map(|nd| nd.uncertainty.clone());
 
     // Results from spatial mapping
     let (
@@ -257,6 +258,7 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         open_beam_data: None,
         spectrum_values: None,
         normalized,
+        normalized_uncertainty,
         energies: state.energies.clone(),
         density_maps,
         uncertainty_maps,
@@ -809,10 +811,14 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
         state.last_save_mode = SaveDataMode::Linked;
     }
 
-    // 15. Restore intermediate data
+    // 15. Restore intermediate data (D-1: uncertainty now persisted)
     if let Some(transmission) = snap.normalized {
         let shape = transmission.raw_dim();
-        let uncertainty = ndarray::Array3::zeros(shape);
+        // Use saved uncertainty if available, otherwise fallback to zeros
+        // (backward compat with old project files that didn't save uncertainty).
+        let uncertainty = snap
+            .normalized_uncertainty
+            .unwrap_or_else(|| ndarray::Array3::zeros(shape));
         state.normalized = Some(Arc::new(NormalizedData {
             transmission,
             uncertainty,
