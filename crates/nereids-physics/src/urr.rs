@@ -12,7 +12,8 @@
 //!
 //! LRF=1: Γ_n(E) = 2 · P_L(ρ(E)) · GNO    [GNO = reduced neutron width]
 //! LRF=2: Γ_n(E) from tabulated energy grid using INT interpolation
-//!         (e.g. INT=2: lin-lin, INT=5: log-log)
+//!         INT=1 histogram, INT=2 lin-lin, INT=3 log-lin,
+//!         INT=4 lin-log, INT=5 log-log (all 5 ENDF codes supported)
 //!
 //! Γ_tot = Γ_n + GG + GF + GX
 //!
@@ -116,10 +117,14 @@ pub fn urr_cross_sections(urr: &UrrData, e_ev: f64, ap_fm: f64) -> (f64, f64, f6
                 (2.0 * p_l * gno, jg.d[0], 0.0_f64, jg.gg[0], jg.gf[0])
             } else {
                 // LRF=2: dispatch on the stored interpolation law.
-                let interp = if jg.int_code == 5 {
-                    log_log_interp
-                } else {
-                    lin_lin_interp
+                // ENDF-6 §0.5: INT=1 histogram, 2 lin-lin, 3 log-lin,
+                // 4 lin-log, 5 log-log.
+                let interp: fn(&[f64], &[f64], f64) -> f64 = match jg.int_code {
+                    1 => histogram_interp,
+                    3 => log_lin_interp,
+                    4 => lin_log_interp,
+                    5 => log_log_interp,
+                    _ => lin_lin_interp, // INT=2 and any unknown → lin-lin
                 };
                 let gn_i = interp(&jg.energies, &jg.gn, e_ev);
                 let d_i = interp(&jg.energies, &jg.d, e_ev);
@@ -210,6 +215,55 @@ fn lin_lin_interp(xs: &[f64], ys: &[f64], x: f64) -> f64 {
             return y0;
         }
         y0 + (x - x0) / dx * (y1 - y0)
+    })
+}
+
+/// Histogram interpolation (INT=1, clamped to table endpoints).
+///
+/// Returns the y-value at the left endpoint of each interval (step function).
+/// ENDF-6 §0.5: "y = y_i for x_i ≤ x < x_{i+1}".
+fn histogram_interp(xs: &[f64], ys: &[f64], x: f64) -> f64 {
+    table_interp(xs, ys, x, |_x, _x0, y0, _x1, _y1| y0)
+}
+
+/// Log-x / Linear-y interpolation (INT=3, clamped to table endpoints).
+///
+/// y(x) = y₀ + [ln(x) - ln(x₀)] / [ln(x₁) - ln(x₀)] × (y₁ - y₀)
+/// Falls back to lin-lin when any x ≤ 0 (log undefined).
+fn log_lin_interp(xs: &[f64], ys: &[f64], x: f64) -> f64 {
+    table_interp(xs, ys, x, |x, x0, y0, x1, y1| {
+        if x <= 0.0 || x0 <= 0.0 || x1 <= 0.0 {
+            let dx = x1 - x0;
+            return if dx.abs() < f64::EPSILON {
+                y0
+            } else {
+                y0 + (x - x0) / dx * (y1 - y0)
+            };
+        }
+        let denom = x1.ln() - x0.ln();
+        if denom.abs() < f64::EPSILON {
+            return y0;
+        }
+        let t = (x.ln() - x0.ln()) / denom;
+        y0 + t * (y1 - y0)
+    })
+}
+
+/// Linear-x / Log-y interpolation (INT=4, clamped to table endpoints).
+///
+/// y(x) = y₀ × (y₁/y₀)^[(x - x₀) / (x₁ - x₀)]
+/// Falls back to lin-lin when any y ≤ 0 (log undefined).
+fn lin_log_interp(xs: &[f64], ys: &[f64], x: f64) -> f64 {
+    table_interp(xs, ys, x, |x, x0, y0, x1, y1| {
+        let dx = x1 - x0;
+        if dx.abs() < f64::EPSILON {
+            return y0;
+        }
+        if y0 <= 0.0 || y1 <= 0.0 {
+            return y0 + (x - x0) / dx * (y1 - y0);
+        }
+        let t = (x - x0) / dx;
+        (y0.ln() + t * (y1.ln() - y0.ln())).exp()
     })
 }
 

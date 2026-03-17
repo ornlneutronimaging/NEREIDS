@@ -983,38 +983,6 @@ fn skip_urr_lfw1_body(lines: &[&str], pos: &mut usize, lrf: i32) -> Result<(), E
     Ok(())
 }
 
-/// Skip the tail of an LRF=2 URR section after an unsupported INT code is
-/// encountered mid-parse.
-///
-/// `remaining_j` is the number of J-blocks still to consume in the current
-/// L-group (each is CONT+LIST).  `remaining_l` is the number of full
-/// L-groups still to consume after the current one (each is CONT + NJS
-/// J-blocks of CONT+LIST).
-fn skip_remaining_lrf2(
-    lines: &[&str],
-    pos: &mut usize,
-    remaining_j: usize,
-    remaining_l: usize,
-) -> Result<(), EndfParseError> {
-    // Finish the current L-group's remaining J-blocks.
-    for _ in 0..remaining_j {
-        let j_cont = parse_cont(lines, pos)?;
-        let jn1 = checked_count(j_cont.n1, "N1")?;
-        parse_list_values(lines, pos, jn1)?;
-    }
-    // Consume subsequent L-groups in full.
-    for _ in 0..remaining_l {
-        let l_cont = parse_cont(lines, pos)?;
-        let njs = checked_count(l_cont.n1, "NJS")?;
-        for _ in 0..njs {
-            let j_cont = parse_cont(lines, pos)?;
-            let jn1 = checked_count(j_cont.n1, "N1")?;
-            parse_list_values(lines, pos, jn1)?;
-        }
-    }
-    Ok(())
-}
-
 /// Skip one background sub-record: a CONT+LIST pair plus (if LBK/LPS == 1)
 /// two TAB1 records for the real and imaginary tabulated parts.
 ///
@@ -1298,7 +1266,7 @@ fn parse_urr_range(
         }
     } else {
         // LRF=2: energy-dependent width tables, one LIST per (L, J).
-        for l_idx in 0..nls {
+        for _l_idx in 0..nls {
             // CONT: AWRI, 0, L, 0, NJS, 0
             let l_cont = parse_cont(ctx.lines, ctx.pos)?;
             let awri = l_cont.c1;
@@ -1321,7 +1289,7 @@ fn parse_urr_range(
             }
 
             let mut j_groups = Vec::with_capacity(njs);
-            for j_idx in 0..njs {
+            for _j_idx in 0..njs {
                 // CONT: AJ, 0, INT, 0, N1=6*(NE+1), N2=NE
                 let j_cont = parse_cont(ctx.lines, ctx.pos)?;
                 let aj = j_cont.c1;
@@ -1348,34 +1316,11 @@ fn parse_urr_range(
                     )));
                 }
 
-                // Supported interpolation laws: INT=2 (lin-lin) and INT=5 (log-log).
-                // INT=1/3/4 are valid ENDF but not yet implemented.  Rather
-                // than aborting the whole file parse (which would hide usable
-                // resolved ranges), consume the remaining LRF=2 body and
-                // return the range with urr=None so physics falls back to
-                // zero for this energy band.
+                // All ENDF interpolation laws (INT=1..5) are now supported
+                // in the URR physics module (urr.rs).
+                // INT=1: histogram, INT=2: lin-lin, INT=3: log-lin,
+                // INT=4: lin-log, INT=5: log-log.
                 // ENDF-6 §2.2.2.2; SAMMY unr/munr01.f90.
-                if int_code != 2 && int_code != 5 {
-                    // Consume this J-block's LIST record.
-                    parse_list_values(ctx.lines, ctx.pos, n1)?;
-                    // Consume any remaining J-blocks in this L-group and
-                    // all subsequent L-groups so `pos` is correctly advanced.
-                    skip_remaining_lrf2(ctx.lines, ctx.pos, njs - (j_idx + 1), nls - (l_idx + 1))?;
-                    return Ok(ResonanceRange {
-                        energy_low: ctx.energy_low,
-                        energy_high: ctx.energy_high,
-                        resolved: false,
-                        formalism: ResonanceFormalism::Unresolved,
-                        target_spin: spi,
-                        scattering_radius: ap,
-                        naps: ctx.naps,
-                        ap_table: ctx.ap_table.take(),
-                        l_groups: Vec::new(),
-                        rml: None,
-                        urr: None,
-                        r_external: vec![],
-                    });
-                }
 
                 let values = parse_list_values(ctx.lines, ctx.pos, n1)?;
 
