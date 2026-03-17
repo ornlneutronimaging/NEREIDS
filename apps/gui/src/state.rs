@@ -58,6 +58,9 @@ pub struct SessionCache {
     /// Whether the sidebar is collapsed (icon-only mode).
     #[serde(default)]
     pub sidebar_collapsed: bool,
+    /// Whether SAMMY-style background normalization is enabled.
+    #[serde(default)]
+    pub background_enabled: bool,
     /// Whether spatial regularization is enabled.
     #[serde(default)]
     pub regularize: bool,
@@ -150,6 +153,7 @@ impl SessionCache {
             rebin_factor: state.rebin_factor,
             rebin_applied: state.rebin_applied,
             sidebar_collapsed: state.sidebar_collapsed,
+            background_enabled: state.background_enabled,
             regularize: state.regularize,
             regularization_threshold: state.regularization_threshold,
             regularization_smooth_iter: state.regularization_smooth_iter,
@@ -224,6 +228,9 @@ impl SessionCache {
 
         // Restore sidebar state
         state.sidebar_collapsed = self.sidebar_collapsed;
+
+        // Restore background normalization state
+        state.background_enabled = self.background_enabled;
 
         // Restore regularization state
         state.regularize = self.regularize;
@@ -630,6 +637,11 @@ pub struct AppState {
     pub solver_method: SolverMethod,
     pub fit_temperature: bool,
     pub show_advanced_solver: bool,
+
+    // -- Background normalization --
+    /// Whether SAMMY-style background normalization is enabled.
+    /// Model: Anorm * T_inner(E) + BackA + BackB/sqrt(E) + BackC*sqrt(E)
+    pub background_enabled: bool,
 
     // -- Spatial regularization --
     /// Whether spatial regularization is enabled.
@@ -1267,6 +1279,7 @@ impl Default for AppState {
             solver_method: SolverMethod::PoissonKL,
             fit_temperature: false,
             show_advanced_solver: false,
+            background_enabled: false,
             regularize: false,
             regularization_threshold: 0.05,
             regularization_smooth_iter: 10,

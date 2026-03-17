@@ -11,6 +11,7 @@
 //! - [`sparse`] — TRINIDI-inspired two-stage reconstruction for low-count data
 //! - [`detectability`] — Trace-detectability analysis (pre-experiment SNR check)
 
+pub mod calibration;
 pub mod detectability;
 pub mod error;
 pub mod noise;

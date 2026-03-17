@@ -51,3 +51,4 @@ _fts_*.txt
 # Cargo lock for libraries is debatable; we keep it for reproducibility
 # (do NOT gitignore Cargo.lock)
 .prototypes/
+.research/

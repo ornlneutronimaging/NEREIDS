@@ -170,6 +170,10 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
                 "Fit temperature (slow for Spatial Map)",
             );
             ui.checkbox(
+                &mut state.background_enabled,
+                "Background normalization (2cm detector)",
+            );
+            ui.checkbox(
                 &mut state.lm_config.compute_covariance,
                 "Compute covariance (single-pixel/ROI only)",
             );
@@ -799,6 +803,10 @@ fn build_fit_config(state: &AppState) -> Result<FitConfig, String> {
         config = config
             .with_fit_temperature(true)
             .map_err(|e| format!("FitConfig temperature error: {e}"))?;
+    }
+
+    if state.background_enabled {
+        config = config.with_background(nereids_pipeline::pipeline::BackgroundConfig::default());
     }
 
     Ok(config)
