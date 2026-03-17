@@ -336,7 +336,10 @@ pub fn spatial_map(
         anorm_map,
         background_maps,
         n_converged,
-        n_total: results.len(),
+        // D-13: n_total is the number of ATTEMPTED pixels (excluding dead),
+        // not the number of successful fits.  Failed pixels are left as NaN
+        // in the maps.  This gives honest convergence percentages.
+        n_total: pixel_coords.len(),
     })
 }
 
