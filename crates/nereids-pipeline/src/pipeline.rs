@@ -657,13 +657,22 @@ pub fn fit_spectrum(
                 // not Y = Φ·T + B).  The analytical gradient formulas reduce
                 // correctly with Φ=1.
                 //
-                // NOTE: Poisson analytic path does NOT support background wrapping
-                // because it constructs its own model internally.  Background +
-                // Poisson + temperature is dispatched through the standard path,
-                // which uses finite-difference gradients.  FD gradients suffer
-                // from the density (~1e-4) vs temperature (~200) scale mismatch,
-                // so temperature fitting may be inaccurate in this combination.
-                // Users should prefer LM for background + temperature fitting.
+                // H3: Poisson analytic path does NOT support background wrapping.
+                // Background + Poisson + temperature would fall through to FD
+                // gradients, which produce inaccurate temperature fits due to
+                // the density (~1e-4) vs temperature (~200) scale mismatch.
+                // Reject this combination with a clear error instead of
+                // silently producing wrong results.
+                if bg_indices.is_some() && temperature_index.is_some() {
+                    return Err(PipelineError::InvalidParameter(
+                        "Poisson KL + background + temperature fitting is not supported: \
+                         the analytic gradient path cannot handle background wrapping, \
+                         and the finite-difference fallback produces inaccurate temperature \
+                         fits due to parameter scale mismatch. Use fitter='lm' for \
+                         background + temperature, or disable temperature fitting."
+                            .into(),
+                    ));
+                }
                 if bg_indices.is_some() {
                     dispatch_maybe_bg(&model, &mut params)?
                 } else {
