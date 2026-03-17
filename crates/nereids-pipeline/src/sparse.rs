@@ -338,11 +338,12 @@ pub fn estimate_nuisance(
         *f /= n_pix_f;
     }
 
-    // Background estimation: currently hardcoded to zero.  A future version
-    // could fit background from a sample-free ROI, but that requires knowing
-    // which pixels are sample-free.  Dead-pixel filtering above is still
-    // applied to both flux and background accumulators so that when real
-    // background estimation is added, the infrastructure is already in place.
+    // D-10: Background estimation: currently hardcoded to zero.  A future
+    // version could fit background from a sample-free ROI, but that requires
+    // knowing which pixels are sample-free.  Dead-pixel filtering above is
+    // still applied to both flux and background accumulators so that when
+    // real background estimation is added, the infrastructure is already in
+    // place.
     let background = vec![0.0f64; n_energies];
 
     Ok(NuisanceParams { flux, background })

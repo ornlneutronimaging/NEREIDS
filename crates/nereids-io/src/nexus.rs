@@ -225,7 +225,15 @@ pub struct EventBinningParams {
 /// converts TOF from nanoseconds to microseconds, then bins events into a
 /// `(n_bins, height, width)` histogram grid.
 ///
-/// Events outside the spatial bounds or TOF range are silently dropped.
+/// # Binning behaviour (D-8)
+///
+/// - **Out-of-range events are silently dropped**: events with TOF outside
+///   `[tof_min_us, tof_max_us)` or pixel coordinates outside `[0, width)` /
+///   `[0, height)` are excluded without warning. No count of dropped events
+///   is returned.
+/// - **Pixel coordinates are rounded to the nearest integer** (`f64::round()`
+///   then cast to `isize`), snapping sub-pixel positions to a discrete grid.
+///   Fractional coordinates exactly at 0.5 round up.
 pub fn load_nexus_events(
     path: &Path,
     params: &EventBinningParams,

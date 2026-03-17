@@ -35,6 +35,18 @@ pub enum SpectrumValueKind {
 ///
 /// Returns the first column of numeric values, skipping comment and header lines.
 /// Supports comma, tab, and whitespace as delimiters.
+///
+/// # Assumptions
+///
+/// - **Column semantics**: only the first numeric column is extracted; any
+///   additional columns (e.g., counts, intensity) are silently ignored.
+/// - **Units are not inferred**: the caller must know whether values represent
+///   TOF in microseconds or energy in eV and set [`SpectrumUnit`] accordingly.
+/// - **Malformed lines**: comment lines (`#`-prefixed) and blank lines are
+///   skipped.  The first non-comment, non-numeric line is treated as a header
+///   and skipped; a second such line is a hard error.
+/// - **Non-finite values** (NaN, Inf) produce a hard error.
+/// - **Minimum length**: at least 2 values are required.
 pub fn parse_spectrum_file(path: &Path) -> Result<Vec<f64>, IoError> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| IoError::FileNotFound(path.to_string_lossy().into_owned(), e))?;

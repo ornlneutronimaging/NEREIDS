@@ -5,7 +5,20 @@
 //! Provides a Pythonic API for:
 //! - Computing theoretical transmission spectra
 //! - Fitting measured transmission to recover isotopic compositions
+//!   (Levenberg-Marquardt chi-squared or Poisson NLL via `poisson_fit_analytic`)
 //! - Spatial mapping across imaging data
+//!
+//! ## Solvers
+//!
+//! Two fitting backends are available, selected by the `fitter` parameter
+//! of [`fit_spectrum`]:
+//!
+//! - **`"lm"`** (default) — Levenberg-Marquardt minimising chi-squared.
+//!   Requires calibrated uncertainties (`sigma`).
+//! - **`"poisson"`** — Poisson negative-log-likelihood with analytical
+//!   gradient (`poisson_fit_analytic`).  `sigma` is unused but required
+//!   for API consistency.  Uncertainties are not available from this
+//!   solver (returned as NaN).
 //!
 //! ## Usage
 //! ```python
@@ -19,8 +32,11 @@
 //! energies = np.linspace(1.0, 30.0, 1000)
 //! transmission = nereids.forward_model(energies, [(isotope, 0.001)], temperature_k=300.0)
 //!
-//! # Fit a measured spectrum
+//! # Fit a measured spectrum (LM solver, default)
 //! result = nereids.fit_spectrum(measured_t, sigma, energies, [isotope])
+//!
+//! # Fit with Poisson solver (uncertainties will be NaN)
+//! result = nereids.fit_spectrum(measured_t, sigma, energies, [isotope], fitter="poisson")
 //! ```
 
 use std::sync::Arc;
@@ -190,6 +206,9 @@ impl PyFitResult {
     /// Uncertainties on fitted densities.
     ///
     /// Returns NaN-filled array when covariance computation was skipped.
+    /// Uncertainty values are NaN when covariance is not available
+    /// (e.g., Poisson fits via `poisson_fit_analytic`, which does not
+    /// compute an analytic Hessian for uncertainty estimation).
     #[getter]
     fn uncertainties<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
         let unc = self
