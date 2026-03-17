@@ -3131,7 +3131,7 @@ impl PyCalibrationResult {
 /// Returns:
 ///     CalibrationResult with fitted (L, t₀, n_total) and corrected energies.
 #[pyfunction]
-#[pyo3(name = "calibrate_energy", signature = (energies_nominal, transmission, uncertainty, isotopes, abundances, assumed_flight_path_m, temperature_k=293.6))]
+#[pyo3(name = "calibrate_energy", signature = (energies_nominal, transmission, uncertainty, isotopes, abundances, assumed_flight_path_m, temperature_k=293.6, resolution=None))]
 fn py_calibrate_energy(
     py: Python<'_>,
     energies_nominal: PyReadonlyArray1<f64>,
@@ -3141,6 +3141,7 @@ fn py_calibrate_energy(
     abundances: Vec<f64>,
     assumed_flight_path_m: f64,
     temperature_k: f64,
+    resolution: Option<PyTabulatedResolution>,
 ) -> PyResult<PyCalibrationResult> {
     let e = energies_nominal.as_slice()?;
     let t = transmission.as_slice()?;
@@ -3151,6 +3152,10 @@ fn py_calibrate_energy(
         .map(|d| Arc::unwrap_or_clone(d.inner))
         .collect();
 
+    let instrument = resolution.map(|r| nereids_physics::transmission::InstrumentParams {
+        resolution: r.inner.clone(),
+    });
+
     let result = py.detach(move || {
         nereids_pipeline::calibration::calibrate_energy(
             e,
@@ -3160,6 +3165,7 @@ fn py_calibrate_energy(
             &abundances,
             assumed_flight_path_m,
             temperature_k,
+            instrument.as_ref(),
         )
     });
     let result = result.map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;

@@ -14,7 +14,7 @@
 //! chi² degradation (e.g. 436 → 2.7 for a 0.3% L correction on VENUS).
 
 use nereids_endf::resonance::ResonanceData;
-use nereids_physics::transmission::{self, SampleParams};
+use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
 
 use crate::error::PipelineError;
 
@@ -53,6 +53,10 @@ pub struct CalibrationResult {
 /// * `abundances` — Natural abundance fractions (same length as isotopes, sum ≤ 1)
 /// * `assumed_flight_path_m` — The L used to compute `energies_nominal`
 /// * `temperature_k` — Sample temperature for Doppler broadening
+/// * `resolution` — Optional instrument resolution function.  When provided,
+///   the forward model includes Doppler + resolution broadening, producing
+///   more accurate (L, t₀) fits.  Without resolution, fitted parameters
+///   absorb the missing broadening and may be biased.
 ///
 /// # Returns
 ///
@@ -66,6 +70,7 @@ pub fn calibrate_energy(
     abundances: &[f64],
     assumed_flight_path_m: f64,
     temperature_k: f64,
+    resolution: Option<&InstrumentParams>,
 ) -> Result<CalibrationResult, PipelineError> {
     let n = energies_nominal.len();
     if n == 0 {
@@ -152,6 +157,7 @@ pub fn calibrate_energy(
                     n_total,
                     temperature_k,
                     &valid,
+                    resolution,
                 );
                 if chi2 < best_chi2 {
                     best_chi2 = chi2;
@@ -204,6 +210,7 @@ pub fn calibrate_energy(
                     n_total,
                     temperature_k,
                     &valid,
+                    resolution,
                 );
                 if chi2 < best_chi2 {
                     best_chi2 = chi2;
@@ -256,6 +263,7 @@ pub fn calibrate_energy(
                     n_total,
                     temperature_k,
                     &valid,
+                    resolution,
                 );
                 if chi2 < best_chi2 {
                     best_chi2 = chi2;
@@ -299,6 +307,7 @@ fn compute_chi2(
     n_total: f64,
     temperature_k: f64,
     valid: &[bool],
+    resolution: Option<&InstrumentParams>,
 ) -> f64 {
     // Build (isotope, density) pairs
     let pairs: Vec<(ResonanceData, f64)> = isotopes
@@ -312,8 +321,9 @@ fn compute_chi2(
         Err(_) => return f64::INFINITY,
     };
 
-    // Compute forward model (no resolution for calibration — faster)
-    let model = match transmission::forward_model(energies, &sample, None) {
+    // P-5: Include resolution broadening when available.
+    // Without it, fitted L and t₀ absorb the missing broadening bias.
+    let model = match transmission::forward_model(energies, &sample, resolution) {
         Ok(m) => m,
         Err(_) => return f64::INFINITY,
     };
@@ -385,7 +395,7 @@ mod tests {
         // Add tiny noise (sigma = 0.01, no actual noise — just for chi2 weighting)
         let sigma = vec![0.01; e_nominal.len()];
 
-        // Calibrate
+        // Calibrate (no resolution — matches synthetic data generated without resolution)
         let result = calibrate_energy(
             &e_nominal,
             &t_model,
@@ -394,6 +404,7 @@ mod tests {
             &[1.0], // single isotope, abundance = 1.0
             assumed_l,
             temperature_k,
+            None,
         )
         .expect("Calibration failed");
 
