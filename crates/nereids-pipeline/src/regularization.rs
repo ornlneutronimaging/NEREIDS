@@ -61,13 +61,23 @@ pub struct RegularizedResult {
     /// Contains per-pixel standard deviations from the inverse Hessian
     /// of the penalized objective at convergence.
     pub uncertainty_maps: Vec<Array2<f64>>,
-    /// Reduced chi-squared map (from the initial per-pixel fit).
+    /// Reduced chi-squared map from the **initial** per-pixel fit.
+    ///
+    /// D-18: This is computed before regularization and does NOT reflect
+    /// the regularized densities.  The GUI must recompute chi-squared
+    /// from regularized parameters if an updated value is needed.
     pub chi_squared_map: Array2<f64>,
     /// Convergence map (from the initial per-pixel fit).
     pub converged_map: Array2<bool>,
     /// Regularized temperature map (if temperature fitting enabled).
     pub temperature_map: Option<Array2<f64>>,
     /// Temperature uncertainty map (if temperature fitting enabled).
+    ///
+    /// D-15: Currently always `None`.  Computing this requires extending
+    /// `compute_fisher_matrix` to include temperature as an additional
+    /// parameter dimension (n_isotopes + 1), then extracting the marginal
+    /// variance from the (n+1, n+1) entry of the inverse penalized
+    /// Hessian.  Not yet implemented.
     pub temperature_uncertainty_map: Option<Array2<f64>>,
     /// Isotope labels.
     pub isotope_labels: Vec<String>,
