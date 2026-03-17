@@ -123,13 +123,21 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
                     continue;
                 }
 
-                // LFW=1 (energy-dependent fission widths) has a different
-                // record layout from LFW=0.  We cannot parse it yet, but we
-                // must advance the cursor correctly so subsequent ranges
-                // (including resolved resonances) are still accessible.
+                // LFW=1 (energy-dependent fission widths):
+                // LRF=2: record layout identical to LFW=0 — handled below.
+                // LRF=1: different record layout (shared energy LIST).
                 // Reference: ENDF-6 §2.2.2.1 Case B; SAMMY File2Unres.f90.
-                if lfw != 0 {
-                    skip_urr_lfw1_body(&lines, &mut pos, lrf)?;
+                if lfw != 0 && lrf == 1 {
+                    let mut urr_ctx = RangeParseContext {
+                        lines: &lines,
+                        pos: &mut pos,
+                        energy_low,
+                        energy_high,
+                        naps: naps_urr,
+                        ap_table: ap_table_urr,
+                    };
+                    let urr_range = parse_urr_lfw1_lrf1(&mut urr_ctx)?;
+                    all_ranges.push(urr_range);
                     continue;
                 }
 
@@ -934,55 +942,6 @@ fn skip_urr_body(lines: &[&str], pos: &mut usize) -> Result<(), EndfParseError> 
     Ok(())
 }
 
-/// Skip a URR body with **LFW=1** (energy-dependent fission widths).
-///
-/// LFW=1 uses a fundamentally different record layout from LFW=0:
-/// an energy grid LIST record precedes the L-groups, and each J-group
-/// carries NE+6 values (6 header + NE fission widths) instead of the
-/// compact LFW=0 layout.
-///
-/// Structure consumed (ENDF-6 §2.2.2.1 Case B; SAMMY `File2Unres.f90` l.165):
-/// ```text
-/// CONT: SPI, AP, LSSF, 0, NE, NLS
-/// LIST: NE energy values (shared grid for all J-groups)
-/// For each L (NLS times):
-///   CONT: AWRI, 0, L, 0, NJS, 0
-///   For each J (NJS times):
-///     LIST: 6 header values + NE fission widths = NE+6 total
-/// ```
-///
-/// For LFW=1 with LRF=2 the layout is identical to the LFW=0/LRF=2 case
-/// (each J already has a full energy grid), so this function handles LRF=1
-/// specifically and delegates LRF=2 to the standard `skip_urr_body` logic.
-fn skip_urr_lfw1_body(lines: &[&str], pos: &mut usize, lrf: i32) -> Result<(), EndfParseError> {
-    if lrf != 1 {
-        // LFW=1 + LRF=2: same record layout as LFW=0/LRF=2.
-        // The existing generic skipper handles this correctly.
-        return skip_urr_body(lines, pos);
-    }
-
-    // LFW=1, LRF=1 (ENDF-6 "Case B"):
-    // CONT: SPI, AP, LSSF, 0, NE, NLS
-    let header = parse_cont(lines, pos)?;
-    let ne = checked_count(header.n1, "NE")?;
-    let nls = checked_count(header.n2, "NLS")?;
-
-    // LIST: NE energy values (shared energy grid).
-    parse_list_values(lines, pos, ne)?;
-
-    for _ in 0..nls {
-        // CONT: AWRI, 0, L, 0, NJS, 0
-        let l_cont = parse_cont(lines, pos)?;
-        let njs = checked_count(l_cont.n1, "NJS")?;
-
-        for _ in 0..njs {
-            // LIST: 6 header values + NE fission widths.
-            parse_list_values(lines, pos, ne + 6)?;
-        }
-    }
-    Ok(())
-}
-
 /// Skip one background sub-record: a CONT+LIST pair plus (if LBK/LPS == 1)
 /// two TAB1 records for the real and imaginary tabulated parts.
 ///
@@ -1171,33 +1130,104 @@ fn parse_endf_int(line: &str, field_index: usize) -> Result<i32, EndfParseError>
     )))
 }
 
-/// Parse an Unresolved Resonance Region (LRU=2) range.
+/// Parse a URR range with LFW=1, LRF=1 (energy-dependent fission widths,
+/// single-level BW).
 ///
-/// Supports LRF=1 (energy-independent widths) and LRF=2 (tabulated widths).
-///
-/// ## Units
-/// AP (scattering radius) is in ENDF units of 10⁻¹² cm = 10 fm (since
-/// 1 fm = 10⁻¹³ cm).  Converted to physics fm via `ENDF_RADIUS_TO_FM`
-/// (×10) at parse time, matching SAMMY `FillSammyRmatrixFromRMat.cpp` l.422.
-///
-/// ## LRF=1 record layout (ENDF-6 §2.2.2.1)
+/// ## Record layout (ENDF-6 §2.2.2.1 "Case B")
 /// ```text
-/// CONT: SPI, AP, 0, 0, NLS, 0
-/// For each L:
-///   CONT: AWRI, 0, L, 0, N1=6*NJS, N2=NJS
-///   LIST: NJS × [D, AJ, AMUN, GNO, GG, GF]
-/// ```
-///
-/// ## LRF=2 record layout (ENDF-6 §2.2.2.2)
-/// ```text
-/// CONT: SPI, AP, 0, 0, NLS, 0
+/// CONT: SPI, AP, LSSF, 0, NE, NLS
+/// LIST: NE energy values (shared fission width grid)
 /// For each L:
 ///   CONT: AWRI, 0, L, 0, NJS, 0
 ///   For each J:
-///     CONT: AJ, 0, INT, 0, N1=6*(NE+1), N2=NE
-///     LIST: row 0 = [0,0,0,AMUN,0,AMUF]   (DOF)
-///           rows 1..NE = [E,D,GX,GN,GG,GF]
+///     LIST: [D, AJ, AMUN, GNO, GG, 0] + NE fission widths
 /// ```
+///
+/// Other widths (D, GNO, GG) are energy-independent (single values).
+/// Only fission widths (GF) are tabulated at the shared energy grid.
+///
+/// Reference: ENDF-6 §2.2.2.1 Case B; SAMMY File2Unres.f90 l.165
+fn parse_urr_lfw1_lrf1(ctx: &mut RangeParseContext<'_>) -> Result<ResonanceRange, EndfParseError> {
+    // CONT: SPI, AP, LSSF, 0, NE, NLS
+    let header = parse_cont(ctx.lines, ctx.pos)?;
+    let spi = header.c1;
+    let ap = header.c2 * ENDF_RADIUS_TO_FM;
+    let ne = checked_count(header.n1, "NE")?;
+    let nls = checked_count(header.n2, "NLS")?;
+
+    // LIST: NE energy values (shared fission width grid)
+    let fission_energies = parse_list_values(ctx.lines, ctx.pos, ne)?;
+
+    let mut l_groups = Vec::with_capacity(nls);
+
+    for _ in 0..nls {
+        // CONT: AWRI, 0, L, 0, NJS, 0
+        let l_cont = parse_cont(ctx.lines, ctx.pos)?;
+        let awri = l_cont.c1;
+        let l = l_cont.l1 as u32;
+        let njs = checked_count(l_cont.n1, "NJS")?;
+
+        let mut j_groups = Vec::with_capacity(njs);
+
+        for _ in 0..njs {
+            // LIST: [D, AJ, AMUN, GNO, GG, 0] + NE fission widths
+            let values = parse_list_values(ctx.lines, ctx.pos, ne + 6)?;
+
+            let d = values[0];
+            let aj = values[1];
+            let amun = values[2];
+            let gno = values[3];
+            let gg = values[4];
+            // values[5] = 0 (unused)
+
+            // Fission widths from the shared energy grid
+            let gf: Vec<f64> = values[6..6 + ne].to_vec();
+
+            j_groups.push(UrrJGroup {
+                j: aj,
+                amun,
+                amuf: 0.0, // LRF=1 doesn't have AMUF
+                energies: fission_energies.clone(),
+                d: vec![d],
+                gx: vec![0.0],
+                gn: vec![gno],
+                gg: vec![gg],
+                gf,
+                int_code: 2, // Default lin-lin for fission width interpolation
+            });
+        }
+
+        l_groups.push(UrrLGroup { l, awri, j_groups });
+    }
+
+    Ok(ResonanceRange {
+        energy_low: ctx.energy_low,
+        energy_high: ctx.energy_high,
+        resolved: false,
+        formalism: ResonanceFormalism::Unresolved,
+        target_spin: spi,
+        scattering_radius: ap,
+        naps: ctx.naps,
+        ap_table: ctx.ap_table.take(),
+        l_groups: Vec::new(),
+        rml: None,
+        urr: Some(Box::new(UrrData {
+            lrf: 1,
+            spi,
+            ap,
+            e_low: ctx.energy_low,
+            e_high: ctx.energy_high,
+            l_groups,
+        })),
+        r_external: vec![],
+    })
+}
+
+/// Parse an Unresolved Resonance Region (LRU=2) range for LFW=0.
+///
+/// Supports LRF=1 (energy-independent widths) and LRF=2 (tabulated widths).
+/// For LFW=1/LRF=1, see `parse_urr_lfw1_lrf1`.
+/// For LFW=1/LRF=2, the record layout is identical to LFW=0/LRF=2.
 ///
 /// Reference: ENDF-6 Formats Manual §2.2.2; SAMMY `unr/munr03.f90`
 fn parse_urr_range(
@@ -2067,7 +2097,7 @@ mod tests {
     ///
     /// Test data: ../SAMMY/SAMMY/sammy/samtry/tr149/t149a.endf (MAT=9222, ZA=92233)
     #[test]
-    fn test_parse_u233_lfw1_urr_skipped() {
+    fn test_parse_u233_lfw1_urr_parsed() {
         let endf_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
@@ -2084,7 +2114,7 @@ mod tests {
         }
 
         let text = std::fs::read_to_string(&endf_path).unwrap();
-        let data = parse_endf_file2(&text).expect("U-233 must parse (LFW=1 URR skipped)");
+        let data = parse_endf_file2(&text).expect("U-233 must parse (LFW=1 URR now supported)");
 
         // The resolved range must be present.
         assert!(
@@ -2092,11 +2122,13 @@ mod tests {
             "U-233 must have at least one parsed range"
         );
 
-        // The LFW=1 URR range is skipped, so no range should have urr data.
+        // LFW=1 URR is now parsed — check if the URR range is present.
+        // U-233 may have LFW=1/LRF=1 which is now handled by parse_urr_lfw1_lrf1,
+        // or LFW=1/LRF=2 which passes through the standard parser.
         let urr_count = data.ranges.iter().filter(|r| r.urr.is_some()).count();
-        assert_eq!(
-            urr_count, 0,
-            "LFW=1 URR range must be skipped, but found {urr_count} URR ranges"
+        assert!(
+            urr_count >= 1,
+            "U-233 LFW=1 URR range should now be parsed, found {urr_count} URR ranges"
         );
 
         // At least one resolved range must exist.
@@ -2342,10 +2374,19 @@ mod tests {
             "                                                                  9222 0  0    0\n",
         );
 
-        let data = parse_endf_file2(ENDF).expect("LFW=1 URR must be skipped, not rejected");
-        // The URR range is skipped — no URR data returned.
+        let data = parse_endf_file2(ENDF).expect("LFW=1 URR parse should succeed");
+        // LFW=1/LRF=1 is now fully parsed — URR data should be present.
         let urr_count = data.ranges.iter().filter(|r| r.urr.is_some()).count();
-        assert_eq!(urr_count, 0, "LFW=1 URR must be skipped");
+        assert_eq!(urr_count, 1, "LFW=1/LRF=1 URR should be parsed");
+        let urr = data.ranges.iter().find(|r| r.urr.is_some()).unwrap();
+        let urr_data = urr.urr.as_ref().unwrap();
+        assert_eq!(urr_data.lrf, 1);
+        assert_eq!(urr_data.l_groups.len(), 1);
+        let jg = &urr_data.l_groups[0].j_groups[0];
+        // Fission widths should be energy-dependent (2 values from NE=2)
+        assert_eq!(jg.gf.len(), 2, "LFW=1 should have NE fission widths");
+        assert!((jg.gf[0] - 0.1).abs() < 1e-6, "GF[0] = {}", jg.gf[0]);
+        assert!((jg.gf[1] - 0.2).abs() < 1e-6, "GF[1] = {}", jg.gf[1]);
     }
 
     /// LRU=0 range with non-zero L1 in SPI/AP CONT is rejected.

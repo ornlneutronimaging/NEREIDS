@@ -114,7 +114,15 @@ pub fn urr_cross_sections(urr: &UrrData, e_ev: f64, ap_fm: f64) -> (f64, f64, f6
             // SAMMY ref: unr/munr03.f90 Csig3 — `Gn = Two*Pene*Gno` for LRF=1.
             let (gn_eff, d_eff, gx_eff, gg_eff, gf_eff) = if urr.lrf == 1 {
                 let gno = jg.gn[0]; // reduced neutron width (eV)
-                (2.0 * p_l * gno, jg.d[0], 0.0_f64, jg.gg[0], jg.gf[0])
+                // LFW=1: fission widths are energy-dependent (tabulated).
+                // LFW=0: fission width is a single constant.
+                let gf = if jg.gf.len() > 1 {
+                    // Interpolate fission width from shared energy grid.
+                    lin_lin_interp(&jg.energies, &jg.gf, e_ev)
+                } else {
+                    jg.gf[0]
+                };
+                (2.0 * p_l * gno, jg.d[0], 0.0_f64, jg.gg[0], gf)
             } else {
                 // LRF=2: dispatch on the stored interpolation law.
                 // ENDF-6 §0.5: INT=1 histogram, 2 lin-lin, 3 log-lin,
