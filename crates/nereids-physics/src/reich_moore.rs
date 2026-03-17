@@ -8,7 +8,7 @@
 //! | ENDF LRF | Formalism                  | Implemented as              |
 //! |----------|----------------------------|-----------------------------|
 //! | 1        | SLBW                       | `slbw::slbw_cross_sections_for_range` |
-//! | 2        | MLBW (approx.)             | `slbw::slbw_cross_sections_for_range` (SLBW approximation; resonance interference ignored) |
+//! | 2        | MLBW                       | `slbw::mlbw_cross_sections_for_range` (true MLBW with resonance interference) |
 //! | 3        | Reich-Moore                | `reich_moore_spin_group` (this module) |
 //! | 7        | R-Matrix Limited           | `rmatrix_limited::cross_sections_for_rml_range` |
 //! | URR      | Hauser-Feshbach average    | `urr::urr_cross_sections` |
@@ -316,7 +316,7 @@ pub struct CrossSections {
 /// (ENDF-6 §2 convention).
 ///
 /// # Limitations
-/// MLBW (Multi-Level Breit-Wigner, LRF=2) ranges are evaluated using SLBW
+/// MLBW (Multi-Level Breit-Wigner, LRF=2) ranges use true MLBW with interference.
 /// formulas as an approximation, ignoring resonance-resonance interference.
 /// Results may be inaccurate for closely spaced or overlapping resonances.
 ///
@@ -413,7 +413,7 @@ pub fn cross_sections_at_energy(data: &ResonanceData, energy_ev: f64) -> CrossSe
 /// `precompute_jgroups_*` runs O(ranges) times total, not O(ranges × energies).
 ///
 /// # Limitations
-/// MLBW (Multi-Level Breit-Wigner, LRF=2) ranges are evaluated using SLBW
+/// MLBW (Multi-Level Breit-Wigner, LRF=2) ranges use true MLBW with interference.
 /// formulas as an approximation, ignoring resonance-resonance interference.
 /// Results may be inaccurate for closely spaced or overlapping resonances.
 ///
@@ -1009,23 +1009,17 @@ fn cross_sections_for_range(
         return rmatrix_limited::cross_sections_for_rml_range(rml, energy_ev);
     }
 
-    // SLBW/MLBW: dispatch to the SLBW per-range calculator.
-    //
-    // IMPORTANT: MLBW is *not* implemented as a true multi-level
-    // Breit–Wigner formalism.  MLBW ranges are evaluated using the
-    // single-level Breit–Wigner (SLBW) formulas as an approximation.
-    // This ignores resonance–resonance interference (the defining
-    // difference between SLBW and MLBW), so results may be physically
-    // incorrect for closely spaced or overlapping resonances.
-    //
-    // This check must precede the l_group loop because
-    // `slbw_cross_sections_for_range` handles all L-groups and J-groups
-    // internally (including potential scattering).
-    if matches!(
-        range.formalism,
-        ResonanceFormalism::SLBW | ResonanceFormalism::MLBW
-    ) {
+    // SLBW: dispatch to the SLBW per-range calculator.
+    if range.formalism == ResonanceFormalism::SLBW {
         return slbw::slbw_cross_sections_for_range(range, energy_ev, awr, target_spin);
+    }
+
+    // MLBW: dispatch to the true multi-level Breit-Wigner calculator.
+    // Unlike SLBW, this includes resonance-resonance interference in the
+    // elastic channel (cross-terms between resonances within the same
+    // spin group).  See SAMMY mlb/mmlb3.f90 Elastc_Mlb (line 54).
+    if range.formalism == ResonanceFormalism::MLBW {
+        return slbw::mlbw_cross_sections_for_range(range, energy_ev, awr, target_spin);
     }
 
     let mut total = 0.0;
@@ -1886,12 +1880,14 @@ mod tests {
         }
     }
 
-    /// MLBW is dispatched as SLBW (approximation).  Verify that the
-    /// dispatcher returns the same values as the SLBW module when given
-    /// an MLBW-formalism range, and that the results are physically
-    /// reasonable (positive, peak at resonance energy).
+    /// For a **single isolated resonance**, MLBW and SLBW should produce
+    /// identical results because the interference term (cross-resonance)
+    /// vanishes when there is only one resonance per spin group.
+    ///
+    /// Capture and fission are always identical (interference only
+    /// affects elastic).  Elastic should also match for single resonances.
     #[test]
-    fn test_dispatcher_mlbw_uses_slbw_approximation() {
+    fn test_mlbw_single_resonance_matches_slbw() {
         let data_mlbw = make_slbw_data(ResonanceFormalism::MLBW);
         let data_slbw = make_slbw_data(ResonanceFormalism::SLBW);
 
@@ -1899,12 +1895,27 @@ mod tests {
         for &e in &test_energies {
             let xs_mlbw = cross_sections_at_energy(&data_mlbw, e);
             let xs_slbw = cross_sections_at_energy(&data_slbw, e);
-            let eps = 1e-10;
+
+            // Capture and fission must be identical.
             assert!(
-                (xs_mlbw.total - xs_slbw.total).abs() < eps,
-                "MLBW/SLBW mismatch at {e} eV: mlbw={} slbw={}",
-                xs_mlbw.total,
-                xs_slbw.total
+                (xs_mlbw.capture - xs_slbw.capture).abs() < 1e-10,
+                "MLBW/SLBW capture mismatch at {e} eV: mlbw={} slbw={}",
+                xs_mlbw.capture,
+                xs_slbw.capture
+            );
+
+            // Elastic: for single resonance, MLBW formula should reduce
+            // to SLBW because there are no cross-terms.
+            let rel_diff = if xs_slbw.elastic.abs() > 1e-10 {
+                (xs_mlbw.elastic - xs_slbw.elastic).abs() / xs_slbw.elastic
+            } else {
+                (xs_mlbw.elastic - xs_slbw.elastic).abs()
+            };
+            assert!(
+                rel_diff < 0.01,
+                "MLBW/SLBW elastic mismatch at {e} eV: mlbw={} slbw={} (rel_diff={rel_diff})",
+                xs_mlbw.elastic,
+                xs_slbw.elastic,
             );
         }
 

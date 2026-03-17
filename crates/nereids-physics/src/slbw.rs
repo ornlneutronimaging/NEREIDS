@@ -9,9 +9,9 @@
 //! For isolated, well-separated resonances, SLBW and Reich-Moore should
 //! give nearly identical results.
 //!
-//! This module also handles MLBW (Multi-Level Breit-Wigner) ranges, which are
-//! evaluated using the SLBW formulas as an approximation (see `reich_moore`
-//! module for details).
+//! This module also provides true MLBW (Multi-Level Breit-Wigner) via
+//! `mlbw_cross_sections_for_range`, which includes resonance-resonance
+//! interference in the elastic channel (see SAMMY `mlb/mmlb3.f90`).
 //!
 //! ## SAMMY Reference
 //! - `mlb/mmlb4.f90` Abpart_Mlb subroutine
@@ -359,6 +359,136 @@ pub(crate) fn slbw_evaluate_with_cached_jgroups(
             total += interf;
         }
     }
+
+    (total, elastic, capture, fission)
+}
+
+/// Compute **true MLBW** cross-sections for a single resolved resonance range.
+///
+/// MLBW differs from SLBW only in the **elastic** cross-section:
+/// it includes resonance-resonance interference (coherent sum over resonances
+/// in the collision matrix, instead of SLBW's incoherent sum).
+///
+/// Capture and fission are identical to SLBW (incoherent per-resonance sums).
+///
+/// ## SAMMY Reference
+/// - `mlb/mmlb4.f90` Abpart_Mlb
+/// - `mlb/mmlb3.f90` Elastc_Mlb
+///
+/// ## Physics
+/// The collision matrix element for a single neutron channel in MLBW is:
+///
+///   U_nn = e^{2iφ} · [1 - i · Σ_r Γ_n^r / (E_r - E - iΓ_tot^r/2)]
+///
+/// where the sum is the coherent sum over all resonances in the spin group.
+///
+/// Then:
+///   σ_elastic = (π/k²) · g_J · |1 - U_nn|²
+///   σ_total   = (2π/k²) · g_J · (1 - Re(U_nn))
+///
+/// For SLBW, |1-U|² is computed per-resonance and summed (incoherent).
+/// For MLBW, U is the coherent sum, then |1-U|² is computed once.
+pub fn mlbw_cross_sections_for_range(
+    range: &nereids_endf::resonance::ResonanceRange,
+    energy_ev: f64,
+    awr: f64,
+    target_spin: f64,
+) -> (f64, f64, f64, f64) {
+    use num_complex::Complex64;
+
+    let pi_over_k2 = channel::pi_over_k_squared_barns(energy_ev, awr);
+
+    let mut total = 0.0;
+    let mut elastic = 0.0;
+    let mut capture = 0.0;
+    let mut fission = 0.0;
+
+    for l_group in &range.l_groups {
+        let l = l_group.l;
+        let awr_l = if l_group.awr > 0.0 { l_group.awr } else { awr };
+
+        let scatt_radius = if l_group.apl > 0.0 {
+            l_group.apl
+        } else {
+            range.scattering_radius_at(energy_ev)
+        };
+        let pen_radius = if l_group.apl > 0.0 {
+            l_group.apl
+        } else if range.naps == 0 {
+            channel::endf_channel_radius_fm(awr_l)
+        } else {
+            scatt_radius
+        };
+
+        let rho_phase = channel::rho(energy_ev, awr_l, scatt_radius);
+        let rho_pen = channel::rho(energy_ev, awr_l, pen_radius);
+        let phi = penetrability::phase_shift(l, rho_phase);
+        let p_at_e = penetrability::penetrability(l, rho_pen);
+
+        // Phase factor: e^{2iφ} = cos(2φ) + i·sin(2φ)
+        let phase2 = Complex64::new((2.0 * phi).cos(), (2.0 * phi).sin());
+
+        let j_groups =
+            precompute_slbw_jgroups(&l_group.resonances, l, awr_l, range, l_group, target_spin);
+
+        for jg in &j_groups {
+            let g_j = jg.g_j;
+
+            // Coherent sum over resonances: X = Σ_r Γ_n^r / (E_r - E - iΓ_tot^r/2)
+            let mut x_sum = Complex64::new(0.0, 0.0);
+
+            for res in &jg.resonances {
+                let e_r = res.energy;
+                let gamma_n = if e_r.abs() > PIVOT_FLOOR && res.p_at_er > PIVOT_FLOOR {
+                    res.gn_abs * (energy_ev / e_r.abs()).sqrt() * p_at_e / res.p_at_er
+                } else {
+                    0.0
+                };
+
+                let gamma_total = gamma_n + res.gamma_g + res.gamma_f;
+                let de = energy_ev - e_r;
+                let denom = de * de + (gamma_total / 2.0).powi(2);
+
+                if denom < DIVISION_FLOOR {
+                    continue;
+                }
+
+                // Capture — identical to SLBW (incoherent per-resonance)
+                let sigma_c = pi_over_k2 * g_j * gamma_n * res.gamma_g / denom;
+                capture += sigma_c;
+
+                // Fission — identical to SLBW (incoherent per-resonance)
+                let sigma_f = pi_over_k2 * g_j * gamma_n * res.gamma_f / denom;
+                fission += sigma_f;
+
+                // Accumulate coherent sum for U-matrix:
+                // Γ_n / (E_r - E - iΓ_tot/2)
+                // = Γ_n · (E_r - E + iΓ_tot/2) / [(E_r-E)² + (Γ_tot/2)²]
+                // Note: de = E - E_r, so E_r - E = -de
+                let x_r = Complex64::new(
+                    gamma_n * (-de) / denom,
+                    gamma_n * (gamma_total / 2.0) / denom,
+                );
+                x_sum += x_r;
+            }
+
+            // Collision matrix: U_nn = e^{2iφ} · (1 - i·X)
+            let one_minus_ix = Complex64::new(1.0 + x_sum.im, -x_sum.re);
+            let u_nn = phase2 * one_minus_ix;
+
+            // σ_elastic = (π/k²) · g_J · |1 - U_nn|²
+            let one_minus_u = Complex64::new(1.0 - u_nn.re, -u_nn.im);
+            let sigma_el = pi_over_k2 * g_j * one_minus_u.norm_sqr();
+            elastic += sigma_el;
+
+            // σ_total = (2π/k²) · g_J · (1 - Re(U_nn))
+            let sigma_tot = 2.0 * pi_over_k2 * g_j * (1.0 - u_nn.re);
+            total += sigma_tot;
+        }
+    }
+
+    // Capture and fission already accumulated above.
+    // Total from optical theorem already includes all channels.
 
     (total, elastic, capture, fission)
 }
