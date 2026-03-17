@@ -75,6 +75,8 @@ pub struct NexusHistogramData {
     pub flight_path_m: Option<f64>,
     /// Dead pixel mask from `/entry/pixel_masks/dead`, if present.
     pub dead_pixels: Option<ndarray::Array2<bool>>,
+    /// Number of rotation angles summed (D-5). 1 means no collapse occurred.
+    pub n_rotation_angles: usize,
 }
 
 /// Probe a NeXus/HDF5 file for available data modalities and metadata.
@@ -152,7 +154,16 @@ pub fn load_nexus_histogram(path: &Path) -> Result<NexusHistogramData, IoError> 
         .read()
         .map_err(|e| IoError::InvalidParameter(format!("Failed to read histogram counts: {e}")))?;
 
-    // Sum over rotation angle axis (axis 0): [rot, y, x, tof] → [y, x, tof]
+    // D-5: Sum over rotation angle axis (axis 0): [rot, y, x, tof] → [y, x, tof]
+    // When n_rot > 1, this silently collapses multi-angle acquisitions.
+    // Log a warning so the user knows angles were combined.
+    let n_rot = shape[0];
+    if n_rot > 1 {
+        eprintln!(
+            "Warning: NeXus histogram has {n_rot} rotation angles — summing into a single \
+             volume. Multi-angle analysis is not yet supported."
+        );
+    }
     let summed = counts_u64.sum_axis(ndarray::Axis(0));
 
     // Convert to f64 and transpose [y, x, tof] → NEREIDS convention [tof, y, x]
@@ -189,6 +200,7 @@ pub fn load_nexus_histogram(path: &Path) -> Result<NexusHistogramData, IoError> 
         tof_edges_us,
         flight_path_m,
         dead_pixels,
+        n_rotation_angles: n_rot,
     })
 }
 
@@ -331,6 +343,7 @@ pub fn load_nexus_events(
         tof_edges_us,
         flight_path_m,
         dead_pixels,
+        n_rotation_angles: 1, // Event data has no rotation dimension
     })
 }
 
@@ -568,6 +581,9 @@ mod tests {
         assert!((data.tof_edges_us[2] - 3.0).abs() < 1e-10);
 
         assert_eq!(data.flight_path_m, Some(25.0));
+
+        // D-5: rotation angle count is carried through
+        assert_eq!(data.n_rotation_angles, 2);
     }
 
     #[test]

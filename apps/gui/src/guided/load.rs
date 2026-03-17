@@ -543,8 +543,14 @@ fn load_hdf5_histogram(state: &mut AppState) {
         Ok(data) => {
             let shape = data.counts.shape();
             state.preview_image = Some(data.counts.sum_axis(ndarray::Axis(0)));
+            // D-5: Report rotation angle count when angles were collapsed.
+            let angle_note = if data.n_rotation_angles > 1 {
+                format!(" ({} rotation angles summed)", data.n_rotation_angles)
+            } else {
+                String::new()
+            };
             state.status_message = format!(
-                "HDF5 histogram loaded: {} frames, {}×{} px",
+                "HDF5 histogram loaded: {} frames, {}×{} px{angle_note}",
                 shape[0], shape[1], shape[2]
             );
 
