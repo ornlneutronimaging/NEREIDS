@@ -378,7 +378,8 @@ pub fn coulomb_penetrability(l: u32, eta: f64, rho: f64) -> f64 {
 /// ## SAMMY Reference
 /// `coulomb/mrml08.f90` Coulfg output:
 /// `Scoul = Xx * (Fc(L)*Fcp(L)+Gc(L)*Gcp(L)) / (Fc(L)^2+Gc(L)^2)`
-pub fn coulomb_shift(l: u32, eta: f64, rho: f64) -> f64 {
+#[expect(dead_code, reason = "reserved for future charged-particle channels")]
+pub(crate) fn coulomb_shift(l: u32, eta: f64, rho: f64) -> f64 {
     match coulomb_wave_functions(l, eta, rho) {
         Some((fl, gl, flp, glp)) => {
             let asq = fl * fl + gl * gl;
@@ -395,7 +396,8 @@ pub fn coulomb_shift(l: u32, eta: f64, rho: f64) -> f64 {
 /// ## SAMMY Reference
 /// `coulomb/mrml08.f90` Coulfg output:
 /// `Sinphi = Fc(L)/A, Cosphi = Gc(L)/A` where `A = sqrt(Fc^2 + Gc^2)`
-pub fn coulomb_phase(l: u32, eta: f64, rho: f64) -> (f64, f64) {
+#[expect(dead_code, reason = "reserved for future charged-particle channels")]
+pub(crate) fn coulomb_phase(l: u32, eta: f64, rho: f64) -> (f64, f64) {
     match coulomb_wave_functions(l, eta, rho) {
         Some((fl, gl, _, _)) => {
             let a = (fl * fl + gl * gl).sqrt();

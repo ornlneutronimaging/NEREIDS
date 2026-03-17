@@ -245,7 +245,11 @@ fn bessel_fg_imaginary(l: u32, kappa: f64) -> ((f64, f64), (f64, f64)) {
 /// penetrability varies with energy.
 ///
 /// Reference: SAMMY `rml/mrml07.f` Pf function
-pub fn penetrability_derivative(l: u32, rho: f64) -> f64 {
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "reserved for future width-conversion utilities")
+)]
+pub(crate) fn penetrability_derivative(l: u32, rho: f64) -> f64 {
     let rho2 = rho * rho;
     match l {
         0 => 1.0,

@@ -18,7 +18,15 @@ use rand_distr::Poisson;
 /// * `transmission` — Clean 1D transmission spectrum, values in [0, 1].
 /// * `n_photons` — Open beam intensity I₀ (expected counts per bin before attenuation).
 /// * `seed` — Random seed for reproducibility.
-pub fn add_poisson_noise(transmission: &[f64], n_photons: f64, seed: u64) -> (Vec<f64>, Vec<f64>) {
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "test utility for synthetic noise generation")
+)]
+pub(crate) fn add_poisson_noise(
+    transmission: &[f64],
+    n_photons: f64,
+    seed: u64,
+) -> (Vec<f64>, Vec<f64>) {
     assert!(
         n_photons > 0.0,
         "n_photons must be positive, got {n_photons}"
@@ -59,7 +67,11 @@ pub fn add_poisson_noise(transmission: &[f64], n_photons: f64, seed: u64) -> (Ve
 /// * `shape` — Spatial dimensions `(height, width)`.
 /// * `n_photons` — Open beam intensity I₀.
 /// * `seed` — Random seed for reproducibility.
-pub fn generate_noisy_cube(
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "test utility for synthetic noise generation")
+)]
+pub(crate) fn generate_noisy_cube(
     transmission: &[f64],
     shape: (usize, usize),
     n_photons: f64,

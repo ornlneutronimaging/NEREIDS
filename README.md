@@ -136,7 +136,7 @@ nereids-endf          ENDF file retrieval, parsing, resonance data
     |
 nereids-physics       Cross-sections, broadening, transmission model
     |
-nereids-fitting       LM and Poisson/L-BFGS-B optimizers
+nereids-fitting       LM and Poisson/KL optimizers
     |
 nereids-io            TIFF/NeXus I/O, TOF normalization, rebinning
     |
@@ -152,7 +152,7 @@ nereids-pipeline      End-to-end orchestration, spatial mapping (rayon)
 | `nereids-endf` | ENDF file retrieval, caching, resonance parameter parsing |
 | `nereids-physics` | Cross-section calculation, broadening, transmission model |
 | `nereids-io` | TIFF/NeXus data I/O, VENUS normalization |
-| `nereids-fitting` | Optimization engine (LM, Poisson/L-BFGS-B) |
+| `nereids-fitting` | Optimization engine (LM, Poisson/KL) |
 | `nereids-pipeline` | End-to-end orchestration and spatial mapping |
 | `nereids-python` | PyO3 Python bindings for Jupyter |
 | `nereids-gui` | egui desktop application |

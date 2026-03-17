@@ -14,7 +14,8 @@
 pub mod calibration;
 pub mod detectability;
 pub mod error;
-pub mod noise;
+/// Test utility: synthetic noise generation for integration tests.
+pub(crate) mod noise;
 pub mod pipeline;
 pub mod regularization;
 pub mod sparse;

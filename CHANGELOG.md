@@ -41,7 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 #### Fitting & Analysis
 - Levenberg-Marquardt optimizer with analytical Beer-Lambert Jacobian
-- Poisson/KL divergence optimizer (L-BFGS-B) for low-count data
+- Poisson/KL divergence optimizer (analytic path preferred; L-BFGS-B available) for low-count data
 - Parallel per-pixel spatial mapping via rayon
 - Region-of-interest (ROI) spectrum fitting
 - Trace-element detectability analysis with energy-window optimization

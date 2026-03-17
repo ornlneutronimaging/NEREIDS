@@ -1233,8 +1233,15 @@ fn is_descent_direction(direction: &[f64], gradient: &[f64]) -> bool {
 /// * `params`          — Parameter set (modified in place).
 /// * `config`          — Optimizer configuration (including `lbfgsb_memory`).
 /// * `temp_ctx`        — Optional temperature-fitting context.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "L-BFGS-B path is test-exercised; may become production later"
+    )
+)]
 #[allow(clippy::too_many_arguments)]
-pub fn poisson_fit_lbfgsb(
+pub(crate) fn poisson_fit_lbfgsb(
     model: &dyn FitModel,
     y_obs: &[f64],
     flux: &[f64],
