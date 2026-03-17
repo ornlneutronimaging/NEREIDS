@@ -20,7 +20,7 @@ output spatially resolved isotopic composition maps.
 
 - **R-matrix cross-sections** -- Reich-Moore, SLBW, R-Matrix Limited (LRF=7),
   Unresolved Resonance Region (URR/Hauser-Feshbach), Coulomb channels
-- **Doppler broadening** -- Free Gas Model with crystal-lattice fallback
+- **Doppler broadening** -- Free Gas Model (crystal-lattice model planned, not yet implemented)
 - **Resolution broadening** -- Gaussian (channel width + flight path) and
   tabulated instrument functions
 - **ENDF/B data** -- automatic retrieval and caching from IAEA for all
