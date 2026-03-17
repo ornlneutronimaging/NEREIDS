@@ -569,7 +569,8 @@ pub fn sparse_reconstruct(
         nll_map,
         converged_map,
         n_converged,
-        n_total: results.len(),
+        // D-14: n_total counts attempted pixels, not successes.
+        n_total: pixel_coords.len(),
         nuisance: nuisance.clone(),
     })
 }
