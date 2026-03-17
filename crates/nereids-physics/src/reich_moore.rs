@@ -1768,7 +1768,7 @@ mod tests {
             .join("../SAMMY/SAMMY/samexm_new/ex027_new/ex027.endf");
 
         if !endf_path.exists() {
-            eprintln!("Skipping: SAMMY ENDF file not found at {:?}", endf_path);
+            println!("Skipping: SAMMY checkout not found at {:?}", endf_path);
             return;
         }
 
@@ -2172,7 +2172,7 @@ mod tests {
             .join("../SAMMY/SAMMY/samexm_new/ex027_new/ex027.endf");
 
         if !endf_path.exists() {
-            eprintln!("Skipping: SAMMY ENDF file not found at {:?}", endf_path);
+            println!("Skipping: SAMMY checkout not found at {:?}", endf_path);
             return;
         }
 

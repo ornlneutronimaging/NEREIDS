@@ -345,6 +345,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires network: downloads Hf-178 ENDF from IAEA"]
     fn test_calibrate_round_trip() {
         // Generate synthetic data with known L and t0, then recover them.
         let true_l = 25.08;
