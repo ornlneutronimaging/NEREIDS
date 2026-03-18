@@ -944,11 +944,8 @@ pub fn spatial_map_regularized_typed(
     // uncertainties become available, the LM path should use Gaussian metric.
     let metric = FisherMetric::Poisson;
 
-    let fisher = if config.transmission_background().is_some() {
-        let anorm_init = config
-            .transmission_background()
-            .map(|bg| bg.anorm_init)
-            .unwrap_or(1.0);
+    let fisher = if let Some(bg) = config.transmission_background() {
+        let anorm_init = bg.anorm_init;
         compute_fisher_matrix_with_background(
             &cross_sections,
             &reference_densities,
@@ -1065,12 +1062,49 @@ pub fn spatial_map_regularized_typed(
             .collect()
     };
 
+    // H2: Temperature smoothing — selective based on Fisher information,
+    // matching the density regularization approach.  Only smooth if the
+    // marginal temperature Fisher info is below the eigenvalue threshold.
+    let (temperature_map, temperature_uncertainty_map) =
+        if let Some(ref t_map) = initial.temperature_map {
+            if reg_config.regularize_temperature {
+                let temp_is_weak = if max_eig > 1e-30 {
+                    // F_TT proxy: trace(F_dd) / (4 T_k^2)
+                    // Temperature acts through Doppler width ~ sqrt(T),
+                    // so dσ/dT ~ σ/(2T) → F_TT ~ F_nn / (4T_k^2).
+                    let temp_k = config.temperature_k();
+                    let f_tt_proxy = fisher
+                        .iter()
+                        .enumerate()
+                        .map(|(i, row)| row[i])
+                        .sum::<f64>()
+                        / (4.0 * temp_k * temp_k).max(1e-30);
+                    f_tt_proxy < threshold_val
+                } else {
+                    true // degenerate Fisher → everything is weak
+                };
+
+                if temp_is_weak {
+                    let mut t_smoothed = t_map.clone();
+                    smooth_array2(&mut t_smoothed, reg_config.smooth_iter);
+                    (Some(t_smoothed), None)
+                } else {
+                    // Temperature is well-determined — don't smooth
+                    (Some(t_map.clone()), None)
+                }
+            } else {
+                (Some(t_map.clone()), None)
+            }
+        } else {
+            (None, None)
+        };
+
     Ok(SpatialResult {
         density_maps,
         uncertainty_maps,
         chi_squared_map: initial.chi_squared_map,
         converged_map: initial.converged_map,
-        temperature_map: initial.temperature_map,
+        temperature_map,
         isotope_labels: initial.isotope_labels,
         anorm_map: initial.anorm_map,
         background_maps: initial.background_maps,
@@ -1079,7 +1113,7 @@ pub fn spatial_map_regularized_typed(
         nll_map: initial.nll_map,
         n_weak_directions: Some(n_weak),
         fisher_eigenvalues: Some(eigenvalues),
-        temperature_uncertainty_map: None, // TODO: wire temperature regularization
+        temperature_uncertainty_map,
     })
 }
 
@@ -1379,5 +1413,66 @@ mod tests {
             mean > 0.0 && mean < 0.01,
             "Mean density should be reasonable, got {mean}"
         );
+    }
+
+    #[test]
+    fn test_spatial_map_regularized_typed_transmission() {
+        // Exercise the typed regularization path with UnifiedFitConfig +
+        // InputData3D::Transmission and verify n_weak_directions is populated.
+        use crate::pipeline::{SolverConfig, UnifiedFitConfig};
+        use crate::spatial::InputData3D;
+
+        let resonance_data = vec![w182_single_resonance()];
+        let energies: Vec<f64> = (0..100).map(|i| 1.0 + i as f64 * 0.1).collect();
+
+        let config = UnifiedFitConfig::new(
+            energies.clone(),
+            resonance_data.clone(),
+            vec!["W-182".to_string()],
+            300.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()));
+
+        let xs = broadened_cross_sections(&energies, &resonance_data, 300.0, None, None).unwrap();
+        let clean: Vec<f64> = (0..energies.len())
+            .map(|e| (-0.001 * xs[0][e]).exp())
+            .collect();
+        let (trans, unc) = generate_noisy_cube(&clean, (4, 4), 50.0, 42);
+
+        let input = InputData3D::Transmission {
+            transmission: trans.view(),
+            uncertainty: unc.view(),
+        };
+
+        let reg_config = RegularizationConfig {
+            compute_uncertainty: false,
+            ..Default::default()
+        };
+
+        let result =
+            spatial_map_regularized_typed(&input, &config, &reg_config, None, None, None).unwrap();
+
+        // Single isotope with threshold=0.05: one eigenvalue = 100% of max,
+        // so 0 weak directions.
+        assert_eq!(
+            result.n_weak_directions,
+            Some(0),
+            "Single isotope should have 0 weak directions"
+        );
+        assert!(
+            result.fisher_eigenvalues.is_some(),
+            "Fisher eigenvalues should be populated"
+        );
+        let evals = result.fisher_eigenvalues.as_ref().unwrap();
+        assert_eq!(evals.len(), 1);
+        assert!(evals[0] > 0.0);
+
+        // Density maps should be present and correctly shaped
+        assert_eq!(result.density_maps.len(), 1);
+        assert_eq!(result.density_maps[0].shape(), &[4, 4]);
+        assert_eq!(result.n_total, 16);
     }
 }

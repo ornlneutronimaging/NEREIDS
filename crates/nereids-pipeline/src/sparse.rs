@@ -375,10 +375,6 @@ pub fn estimate_nuisance(
 /// with [`InputData3D::Counts`](crate::spatial::InputData3D::Counts) instead.
 /// The typed API returns `SpatialResult` (not `SparseResult`) and handles
 /// nuisance estimation internally.
-#[deprecated(
-    since = "0.2.0",
-    note = "use spatial_map_typed with InputData3D::Counts instead"
-)]
 ///
 /// # Arguments
 /// * `sample_counts` — Raw sample counts (n_energies, height, width).
@@ -398,6 +394,10 @@ pub fn estimate_nuisance(
 /// Returns `PipelineError::ShapeMismatch` if array dimensions are inconsistent,
 /// or `PipelineError::Cancelled` if the cancellation token is set before any
 /// pixel completes.
+#[deprecated(
+    since = "0.2.0",
+    note = "use spatial_map_typed with InputData3D::Counts instead"
+)]
 pub fn sparse_reconstruct(
     sample_counts: &Array3<f64>,
     nuisance: &NuisanceParams,
