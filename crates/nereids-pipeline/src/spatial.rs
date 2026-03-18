@@ -683,6 +683,35 @@ pub fn spatial_map_typed(
     let is_counts = input.is_counts();
     let has_transmission_bg = config.transmission_background().is_some();
 
+    // For counts data: spatially average the open beam to get a stable flux
+    // estimate, matching what estimate_nuisance/sparse_reconstruct does.
+    // Without this, per-pixel open-beam shot noise contaminates the flux
+    // estimate and makes KL fits materially noisier.
+    let averaged_flux: Option<Vec<f64>> = if is_counts {
+        let n_e = data_b.shape()[2]; // data_b is transposed: (h, w, n_e)
+        let mut flux = vec![0.0f64; n_e];
+        let n_live = pixel_coords.len() as f64;
+        if n_live > 0.0 {
+            for &(y, x) in &pixel_coords {
+                let ob_spectrum = data_b.slice(s![y, x, ..]);
+                for (e, &v) in ob_spectrum.iter().enumerate() {
+                    flux[e] += v;
+                }
+            }
+            for v in &mut flux {
+                *v /= n_live;
+            }
+        }
+        Some(flux)
+    } else {
+        None
+    };
+    let background_zeros: Vec<f64> = if is_counts {
+        vec![0.0f64; data_b.shape()[2]]
+    } else {
+        Vec::new()
+    };
+
     // Fit all pixels in parallel
     let results: Vec<((usize, usize), SpectrumFitResult)> = pixel_coords
         .par_iter()
@@ -692,19 +721,22 @@ pub fn spatial_map_typed(
             }
 
             let spectrum_a: Vec<f64> = data_a.slice(s![y, x, ..]).to_vec();
-            let spectrum_b: Vec<f64> = data_b
-                .slice(s![y, x, ..])
-                .iter()
-                .map(|&v| if is_counts { v } else { v.max(1e-10) })
-                .collect();
 
             // Build per-pixel 1D InputData
             let pixel_input = if is_counts {
-                InputData::Counts {
+                // Use spatially-averaged flux (not per-pixel open beam) to avoid
+                // open-beam shot noise contaminating the density fit.
+                InputData::CountsWithNuisance {
                     sample_counts: spectrum_a.iter().map(|&v| v.max(0.0)).collect(),
-                    open_beam_counts: spectrum_b,
+                    flux: averaged_flux.as_ref().unwrap().clone(),
+                    background: background_zeros.clone(),
                 }
             } else {
+                let spectrum_b: Vec<f64> = data_b
+                    .slice(s![y, x, ..])
+                    .iter()
+                    .map(|&v| v.max(1e-10))
+                    .collect();
                 InputData::Transmission {
                     transmission: spectrum_a,
                     uncertainty: spectrum_b,
