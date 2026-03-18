@@ -3435,9 +3435,25 @@ fn py_spatial_map_typed<'py>(
     )
     .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
-    // Solver
+    // Solver — resolve "auto" eagerly so max_iter is always propagated.
     let solver_config = match solver {
-        "auto" => nereids_pipeline::pipeline::SolverConfig::Auto,
+        "auto" => {
+            if data.kind == "counts" {
+                nereids_pipeline::pipeline::SolverConfig::PoissonKL(
+                    nereids_fitting::poisson::PoissonConfig {
+                        max_iter,
+                        ..Default::default()
+                    },
+                )
+            } else {
+                nereids_pipeline::pipeline::SolverConfig::LevenbergMarquardt(
+                    nereids_fitting::lm::LmConfig {
+                        max_iter,
+                        ..Default::default()
+                    },
+                )
+            }
+        }
         "lm" => nereids_pipeline::pipeline::SolverConfig::LevenbergMarquardt(
             nereids_fitting::lm::LmConfig {
                 max_iter,
@@ -3486,7 +3502,10 @@ fn py_spatial_map_typed<'py>(
     // Dead pixels
     let dead_arr = dead_pixels.map(|dp| dp.as_array().to_owned());
 
-    // Run
+    // GIL held during computation.  InputData3D borrows PyInputData arrays
+    // which are not Send, so we cannot use py.allow_threads().  The existing
+    // py_spatial_map has the same limitation.  Rayon still parallelizes the
+    // per-pixel fitting within the GIL.
     let result = spatial_map_typed(&input, &config, dead_arr.as_ref(), None, None)
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 

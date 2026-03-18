@@ -1074,9 +1074,9 @@ impl<'a> crate::forward_model::ForwardModel for CountsModel<'a> {
     }
 
     fn n_params(&self) -> usize {
-        // CountsModel is a thin wrapper; the actual params belong to the
-        // inner transmission model.  We don't know the total count here,
-        // so return 0 — callers use ParameterSet for the authoritative count.
+        // Parameter count is determined by ParameterSet, not the model.
+        // Use ParameterSet::n_total() instead.  CountsModel wraps a
+        // transmission model and does not own or track the parameter vector.
         0
     }
 }

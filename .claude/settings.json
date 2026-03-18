@@ -34,7 +34,18 @@
       "Bash(codex review *)",
       "Bash(scripts/worktree-commit.sh *)",
       "Bash(./scripts/worktree-commit.sh *)",
-      "Bash(bash scripts/worktree-commit.sh *)"
+      "Bash(bash scripts/worktree-commit.sh *)",
+      "Read(//Users/chenzhang/github.com/NEREIDS/NEREIDS/**)",
+      "Bash(/tmp/audit_search.txt:*)",
+      "Bash(/tmp/analyze_test_scale.sh:*)",
+      "Bash(chmod +x /tmp/analyze_test_scale.sh)",
+      "Bash(/tmp/analyze_test_scale.sh)",
+      "Bash(git commit:*)",
+      "Bash(gradients.\"  Since the H3 fix, it returns an explicit error.  Updated:*)",
+      "Bash(do echo:*)",
+      "Bash(/tmp/check_orphaned.sh:*)",
+      "Bash(bash /tmp/check_orphaned.sh)",
+      "Bash(network\" — was making live ENDF downloads during test runs.:*)"
     ]
   }
 }

@@ -26,7 +26,11 @@ pub trait ForwardModel {
     /// with length equal to the number of data points.
     fn predict(&self, params: &[f64]) -> Result<Vec<f64>, FittingError>;
 
-    /// Analytical Jacobian: `J[i][j] = ∂predict[i] / ∂params[j]`.
+    /// Analytical Jacobian (column-major layout).
+    ///
+    /// Returns a `Vec` of column vectors: `result[j]` is the j-th column
+    /// (partial derivatives of all data points w.r.t. the j-th free
+    /// parameter), so `result[j][i] = ∂predict[i] / ∂params[free_param_indices[j]]`.
     ///
     /// Only the columns corresponding to `free_param_indices` are needed.
     /// Returns `None` to signal "use finite differences" (the default).

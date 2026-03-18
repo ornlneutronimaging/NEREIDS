@@ -387,6 +387,14 @@ pub fn fit_spectrum_typed(
 ) -> Result<SpectrumFitResult, PipelineError> {
     let n_e = config.energies().len();
 
+    // Validate temperature when fitting is requested
+    if config.fit_temperature && config.temperature_k < 1.0 {
+        return Err(PipelineError::InvalidParameter(format!(
+            "temperature must be >= 1.0 K when fit_temperature is true, got {}",
+            config.temperature_k,
+        )));
+    }
+
     // Validate input length matches energy grid
     if input.n_energies() != n_e {
         return Err(PipelineError::ShapeMismatch(format!(
@@ -550,6 +558,14 @@ fn fit_transmission_poisson(
     config: &UnifiedFitConfig,
     poisson_cfg: &PoissonConfig,
 ) -> Result<SpectrumFitResult, PipelineError> {
+    if config.fit_temperature {
+        return Err(PipelineError::InvalidParameter(
+            "Poisson KL on transmission does not support temperature fitting. \
+             Use solver='lm' or provide counts data."
+                .into(),
+        ));
+    }
+
     let n_isotopes = config.resonance_data().len();
 
     let mut param_vec = build_density_params(config);
@@ -588,6 +604,14 @@ fn fit_counts_poisson(
     config: &UnifiedFitConfig,
     poisson_cfg: &PoissonConfig,
 ) -> Result<SpectrumFitResult, PipelineError> {
+    if config.fit_temperature {
+        return Err(PipelineError::InvalidParameter(
+            "Temperature fitting is not yet supported for the counts+KL path. \
+             Use fixed temperature or provide transmission data with solver='lm'."
+                .into(),
+        ));
+    }
+
     let n_isotopes = config.resonance_data().len();
 
     let param_vec = build_density_params(config);
@@ -637,6 +661,9 @@ fn fit_counts_poisson(
 
     Ok(SpectrumFitResult {
         densities,
+        // Poisson KL does not produce a covariance matrix — uncertainties
+        // require Fisher information inversion (not yet implemented for the
+        // counts path).
         uncertainties: None,
         reduced_chi_squared: chi_sq / dof as f64,
         converged: pr.converged,

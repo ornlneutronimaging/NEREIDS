@@ -750,6 +750,11 @@ pub fn spatial_map_typed(
         None
     };
     let mut n_converged = 0;
+    let mut temperature_map: Option<Array2<f64>> = if config.fit_temperature() {
+        Some(Array2::from_elem((height, width), f64::NAN))
+    } else {
+        None
+    };
 
     for ((y, x), result) in &results {
         for i in 0..n_isotopes {
@@ -760,6 +765,9 @@ pub fn spatial_map_typed(
         }
         chi_squared_map[[*y, *x]] = result.reduced_chi_squared;
         converged_map[[*y, *x]] = result.converged;
+        if let (Some(t_map), Some(t)) = (&mut temperature_map, result.temperature_k) {
+            t_map[[*y, *x]] = t;
+        }
         if let Some(ref mut a_map) = anorm_map {
             a_map[[*y, *x]] = result.anorm;
         }
@@ -778,7 +786,7 @@ pub fn spatial_map_typed(
         uncertainty_maps,
         chi_squared_map,
         converged_map,
-        temperature_map: None, // TODO: wire temperature fitting for typed path
+        temperature_map,
         isotope_labels,
         anorm_map,
         background_maps,
