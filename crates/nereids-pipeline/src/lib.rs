@@ -1,3 +1,8 @@
+// Allow deprecated types within this crate — the old SolverChoice/SparseConfig/SparseResult
+// API is implemented here and used by the old entry points that are themselves deprecated.
+// External consumers will see the deprecation warnings when they use these types.
+#![allow(deprecated)]
+
 //! # nereids-pipeline
 //!
 //! End-to-end orchestration for neutron resonance imaging analysis.

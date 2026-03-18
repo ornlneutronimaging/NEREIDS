@@ -1060,6 +1060,27 @@ impl<'a> FitModel for CountsModel<'a> {
     }
 }
 
+// ── ForwardModel implementation for CountsModel (Phase 1) ────────────────
+
+impl<'a> crate::forward_model::ForwardModel for CountsModel<'a> {
+    fn predict(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+        self.evaluate(params)
+    }
+
+    // No analytical jacobian — uses finite differences (same as FitModel).
+
+    fn n_data(&self) -> usize {
+        self.flux.len()
+    }
+
+    fn n_params(&self) -> usize {
+        // Parameter count is determined by ParameterSet, not the model.
+        // Use ParameterSet::n_total() instead.  CountsModel wraps a
+        // transmission model and does not own or track the parameter vector.
+        0
+    }
+}
+
 /// L-BFGS memory: stores last `m` correction pairs for inverse Hessian
 /// approximation.
 ///

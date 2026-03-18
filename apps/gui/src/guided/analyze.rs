@@ -790,6 +790,7 @@ fn build_fit_config(state: &AppState) -> Result<FitConfig, String> {
 
     config = config.with_compute_covariance(state.lm_config.compute_covariance);
 
+    #[allow(deprecated)] // GUI still uses old FitConfig API; will migrate in future
     if state.solver_method == SolverMethod::PoissonKL {
         config = config.with_solver(nereids_pipeline::pipeline::SolverChoice::PoissonKL(
             nereids_fitting::poisson::PoissonConfig {
@@ -1208,6 +1209,10 @@ pub fn run_spatial_map(state: &mut AppState) {
                         background_maps: r.background_maps,
                         n_converged: r.n_converged,
                         n_total: r.n_total,
+                        nll_map: None,
+                        n_weak_directions: Some(r.n_weak_directions),
+                        fisher_eigenvalues: Some(r.fisher_eigenvalues),
+                        temperature_uncertainty_map: r.temperature_uncertainty_map,
                     }
                 })
             } else {

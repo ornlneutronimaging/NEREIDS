@@ -15,6 +15,7 @@
 //! - `trinidi/reconstruct.py` for Poisson-likelihood and APGM approach
 
 pub mod error;
+pub mod forward_model;
 pub mod lm;
 pub mod parameters;
 pub mod poisson;

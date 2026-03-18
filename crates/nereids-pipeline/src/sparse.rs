@@ -87,6 +87,14 @@ impl std::error::Error for SparseConfigError {}
 ///
 /// Fields are private to enforce validation invariants.
 /// Use [`SparseConfig::new`] to construct.
+///
+/// **Deprecated**: Use [`UnifiedFitConfig`](crate::pipeline::UnifiedFitConfig)
+/// with [`InputData::Counts`](crate::pipeline::InputData::Counts) instead.
+/// This type will be removed in v0.3.0.
+#[deprecated(
+    since = "0.2.0",
+    note = "use UnifiedFitConfig + InputData::Counts instead"
+)]
 #[derive(Debug, Clone)]
 pub struct SparseConfig {
     /// Energy grid in eV (ascending).
@@ -218,6 +226,14 @@ pub struct PixelResult {
 }
 
 /// Result of the full two-stage reconstruction.
+///
+/// **Deprecated**: Use [`SpatialResult`](crate::spatial::SpatialResult) instead.
+/// The typed API's `spatial_map_typed` with `InputData3D::Counts` always returns
+/// `SpatialResult`, which now includes the `nll_map` field.
+#[deprecated(
+    since = "0.2.0",
+    note = "use SpatialResult from spatial_map_typed instead"
+)]
 #[derive(Debug)]
 pub struct SparseResult {
     /// Density maps, one per isotope. Shape (height, width).
@@ -235,6 +251,10 @@ pub struct SparseResult {
 }
 
 /// Stage 1: Estimate nuisance parameters from region-averaged data.
+///
+/// **Note**: This function remains useful as a standalone preprocessing step.
+/// Power users can call it to inspect the flux estimate before passing it
+/// to `spatial_map_typed` via `InputData::CountsWithNuisance`.
 ///
 /// Averages open-beam counts over the ROI (excluding dead pixels) to
 /// produce a per-energy-bin flux estimate.  Background is currently set
@@ -351,6 +371,11 @@ pub fn estimate_nuisance(
 
 /// Stage 2: Per-pixel density reconstruction with Poisson likelihood.
 ///
+/// **Deprecated**: Use [`spatial_map_typed`](crate::spatial::spatial_map_typed)
+/// with [`InputData3D::Counts`](crate::spatial::InputData3D::Counts) instead.
+/// The typed API returns `SpatialResult` (not `SparseResult`) and handles
+/// nuisance estimation internally.
+///
 /// # Arguments
 /// * `sample_counts` — Raw sample counts (n_energies, height, width).
 /// * `nuisance` — Nuisance parameters from Stage 1.
@@ -369,6 +394,10 @@ pub fn estimate_nuisance(
 /// Returns `PipelineError::ShapeMismatch` if array dimensions are inconsistent,
 /// or `PipelineError::Cancelled` if the cancellation token is set before any
 /// pixel completes.
+#[deprecated(
+    since = "0.2.0",
+    note = "use spatial_map_typed with InputData3D::Counts instead"
+)]
 pub fn sparse_reconstruct(
     sample_counts: &Array3<f64>,
     nuisance: &NuisanceParams,
