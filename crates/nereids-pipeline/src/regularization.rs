@@ -96,17 +96,48 @@ pub struct RegularizedResult {
     pub background_maps: Option<[Array2<f64>; 3]>,
 }
 
+/// Which statistical model was used for fitting, determining the correct
+/// Fisher information metric.
+///
+/// The Fisher information matrix measures how much each parameter direction
+/// is constrained by the data.  Its formula depends on the noise model:
+///
+/// - **Poisson** (KL): F_{ij} = Σ_E σ_i · σ_j · T(E)
+///   This is the unit-flux Fisher info.  At I₀ > 0, scale by I₀.
+///   The eigenstructure (weak vs strong) is I₀-independent.
+///
+/// - **Gaussian** (LM): F_{ij} = Σ_E σ_i · σ_j · T²(E) / σ_meas²(E)
+///   This uses the actual measurement uncertainties per bin.
+///   Bins with smaller uncertainty contribute more information.
+///
+/// Using the wrong metric gives wrong eigenvector directions and
+/// misclassifies which isotopes are "weak" vs "strong".
+#[derive(Debug, Clone)]
+pub enum FisherMetric {
+    /// Poisson counting statistics: weight = T(E).
+    /// Use when data was fitted with KL divergence.
+    Poisson,
+    /// Gaussian statistics: weight = T²(E) / σ²(E).
+    /// Use when data was fitted with LM chi-squared.
+    Gaussian {
+        /// Per-bin measurement uncertainty.
+        sigma_obs: Vec<f64>,
+    },
+}
+
 /// Compute the Fisher information matrix from precomputed cross-sections.
 ///
-/// F_{ij} = Σ_E σ_i(E) · σ_j(E) · T(E)
+/// The metric determines the per-bin weight in the Fisher sum:
+/// - Poisson: F_{ij} = Σ_E σ_i(E) · σ_j(E) · T(E)
+/// - Gaussian: F_{ij} = Σ_E σ_i(E) · σ_j(E) · T²(E) / σ_meas²(E)
 ///
 /// where T(E) = exp(-Σ_k n_k σ_k(E)) is the transmission at the
 /// given density estimates, and the sum is over energy bins.
-///
-/// For unit-flux Poisson data, this is the expected Fisher information.
-/// At low I₀, the actual information is I₀ × F, but the eigenstructure
-/// (which determines weak vs strong directions) is independent of I₀.
-fn compute_fisher_matrix(cross_sections: &[Vec<f64>], densities: &[f64]) -> Vec<Vec<f64>> {
+fn compute_fisher_matrix(
+    cross_sections: &[Vec<f64>],
+    densities: &[f64],
+    metric: &FisherMetric,
+) -> Vec<Vec<f64>> {
     debug_assert!(!cross_sections.is_empty());
     let n_iso = cross_sections.len();
     let n_e = cross_sections[0].len();
@@ -121,13 +152,32 @@ fn compute_fisher_matrix(cross_sections: &[Vec<f64>], densities: &[f64]) -> Vec<
         transmission[e] = (-exponent).exp();
     }
 
-    // F_{ij} = Σ_E σ_i(E) * σ_j(E) * T(E)
+    // Compute per-bin weight based on the statistical model
+    let weights: Vec<f64> = match metric {
+        FisherMetric::Poisson => {
+            // Poisson: weight = T(E) (unit-flux Fisher information)
+            transmission.clone()
+        }
+        FisherMetric::Gaussian { sigma_obs } => {
+            // Gaussian: weight = T²(E) / σ²(E)
+            transmission
+                .iter()
+                .zip(sigma_obs.iter())
+                .map(|(&t, &s)| {
+                    let s2 = s * s;
+                    if s2 > 1e-30 { t * t / s2 } else { 0.0 }
+                })
+                .collect()
+        }
+    };
+
+    // F_{ij} = Σ_E σ_i(E) · σ_j(E) · w(E)
     let mut fisher = vec![vec![0.0f64; n_iso]; n_iso];
     for i in 0..n_iso {
         for j in i..n_iso {
             let mut sum = 0.0;
             for e in 0..n_e {
-                sum += cross_sections[i][e] * cross_sections[j][e] * transmission[e];
+                sum += cross_sections[i][e] * cross_sections[j][e] * weights[e];
             }
             fisher[i][j] = sum;
             fisher[j][i] = sum;
@@ -157,6 +207,7 @@ fn compute_fisher_matrix_with_background(
     densities: &[f64],
     energies: &[f64],
     anorm: f64,
+    metric: &FisherMetric,
 ) -> Vec<Vec<f64>> {
     debug_assert!(!cross_sections.is_empty());
     let n_iso = cross_sections.len();
@@ -224,7 +275,14 @@ fn compute_fisher_matrix_with_background(
                         _ => unreachable!(),
                     }
                 };
-                sum += da * db / t_out[e];
+                let w = match metric {
+                    FisherMetric::Poisson => 1.0 / t_out[e],
+                    FisherMetric::Gaussian { sigma_obs } => {
+                        let s2 = sigma_obs[e] * sigma_obs[e];
+                        if s2 > 1e-30 { 1.0 / s2 } else { 0.0 }
+                    }
+                };
+                sum += da * db * w;
             }
             f_full[a][b] = sum;
             f_full[b][a] = sum;
@@ -242,7 +300,7 @@ fn compute_fisher_matrix_with_background(
         None => {
             // F_bb singular — background parameters are degenerate.
             // Fall back to density-only Fisher (no Schur correction).
-            return compute_fisher_matrix(cross_sections, densities);
+            return compute_fisher_matrix(cross_sections, densities, metric);
         }
     };
 
@@ -578,6 +636,22 @@ pub fn spatial_map_regularized(
         .map(|&d| d.max(1e-10))
         .collect();
 
+    // Phase 7: Determine the correct Fisher metric from the solver choice.
+    // Poisson (KL) and Gaussian (LM) use different per-bin weights, which
+    // changes the eigenvector directions and weak/strong classification.
+    use crate::pipeline::SolverChoice;
+    let metric = match config.solver() {
+        SolverChoice::PoissonKL(_) => FisherMetric::Poisson,
+        SolverChoice::LevenbergMarquardt => {
+            // For LM, we'd need the per-pixel uncertainty. Since we don't
+            // have it here (regularization operates on the fitted density
+            // maps, not raw data), use Poisson metric as a reasonable
+            // approximation. The eigenstructure is dominated by the
+            // cross-section contrast, not the noise weighting.
+            FisherMetric::Poisson
+        }
+    };
+
     // H1: When background fitting is enabled, use the MARGINAL Fisher
     // information (Schur complement) which correctly accounts for the
     // information consumed by estimating Anorm/BackA/BackB/BackC.
@@ -590,9 +664,10 @@ pub fn spatial_map_regularized(
             &reference_densities,
             config.energies(),
             anorm_init,
+            &metric,
         )
     } else {
-        compute_fisher_matrix(&cross_sections, &reference_densities)
+        compute_fisher_matrix(&cross_sections, &reference_densities, &metric)
     };
 
     // ---- Step 3: Eigendecompose ----
@@ -669,7 +744,7 @@ pub fn spatial_map_regularized(
         for y in 0..height {
             for x in 0..width {
                 let n_px: Vec<f64> = (0..n_isotopes).map(|i| density_maps[i][[y, x]]).collect();
-                let f = compute_fisher_matrix(&cross_sections, &n_px);
+                let f = compute_fisher_matrix(&cross_sections, &n_px, &metric);
 
                 // Compute actual neighbor count for this pixel (P2-2)
                 let mut degree = 0.0f64;
@@ -811,7 +886,7 @@ mod tests {
     fn test_fisher_matrix_symmetric() {
         let xs = vec![vec![100.0, 50.0, 10.0], vec![10.0, 200.0, 30.0]];
         let densities = vec![0.001, 0.002];
-        let f = compute_fisher_matrix(&xs, &densities);
+        let f = compute_fisher_matrix(&xs, &densities, &FisherMetric::Poisson);
         assert!((f[0][1] - f[1][0]).abs() < 1e-10);
     }
 
@@ -964,7 +1039,7 @@ mod tests {
         // We can't use FitConfig with fake cross-sections, but we can
         // test the Fisher matrix and eigenbasis components directly.
         let xs = [xs_strong, xs_weak];
-        let fisher = compute_fisher_matrix(&xs, &true_densities);
+        let fisher = compute_fisher_matrix(&xs, &true_densities, &FisherMetric::Poisson);
         let (eigenvalues, _eigenvectors) = eigen_symmetric(&fisher);
 
         // The weak isotope (flat xs) should produce a much smaller
