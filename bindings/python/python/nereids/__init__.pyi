@@ -722,12 +722,19 @@ def spatial_map_typed(
     flight_path_m: float | None = None,
     delta_t_us: float | None = None,
     delta_l_m: float | None = None,
+    regularize: bool = False,
+    reg_threshold: float = 0.05,
+    reg_smooth_iter: int = 10,
 ) -> SpatialResult:
     """Spatial mapping using the typed input data API.
 
     Dispatches per-pixel fitting based on InputData type:
       - from_counts → Poisson KL on raw counts (optimal)
       - from_transmission → LM (default) or KL (solver="kl")
+
+    When regularize=True, applies Fisher eigenbasis selective spatial
+    regularization after the initial per-pixel fit. Uses the correct
+    Fisher metric (Poisson or Gaussian) based on the solver.
 
     Always returns SpatialResult.
     """

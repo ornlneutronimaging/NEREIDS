@@ -3388,6 +3388,9 @@ fn py_from_transmission<'py>(
     flight_path_m = None,
     delta_t_us = None,
     delta_l_m = None,
+    regularize = false,
+    reg_threshold = 0.05,
+    reg_smooth_iter = 10,
 ))]
 fn py_spatial_map_typed<'py>(
     py: Python<'py>,
@@ -3404,6 +3407,9 @@ fn py_spatial_map_typed<'py>(
     flight_path_m: Option<f64>,
     delta_t_us: Option<f64>,
     delta_l_m: Option<f64>,
+    regularize: bool,
+    reg_threshold: f64,
+    reg_smooth_iter: usize,
 ) -> PyResult<PySpatialResult> {
     let energies_vec = energies.as_slice()?.to_vec();
     let n_iso = isotopes.len();
@@ -3506,8 +3512,22 @@ fn py_spatial_map_typed<'py>(
     // which are not Send, so we cannot use py.allow_threads().  The existing
     // py_spatial_map has the same limitation.  Rayon still parallelizes the
     // per-pixel fitting within the GIL.
-    let result = spatial_map_typed(&input, &config, dead_arr.as_ref(), None, None)
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+    let result = if regularize {
+        use nereids_pipeline::regularization::{
+            RegularizationConfig, spatial_map_regularized_typed,
+        };
+        let reg_config = RegularizationConfig {
+            threshold: reg_threshold,
+            smooth_iter: reg_smooth_iter,
+            compute_uncertainty: true,
+            regularize_temperature: false,
+        };
+        spatial_map_regularized_typed(&input, &config, &reg_config, dead_arr.as_ref(), None, None)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?
+    } else {
+        spatial_map_typed(&input, &config, dead_arr.as_ref(), None, None)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?
+    };
 
     // Convert to PySpatialResult
     let density_maps: Vec<Py<PyArray2<f64>>> = result
