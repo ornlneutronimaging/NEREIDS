@@ -659,3 +659,76 @@ def calibrate_energy(
     with measured transmission data from a known-composition reference.
     """
     ...
+
+
+# ---------------------------------------------------------------------------
+# Typed Input Data API (Phase 5)
+# ---------------------------------------------------------------------------
+
+class InputData:
+    """Opaque typed input data for spatial mapping.
+
+    Created via ``from_counts()`` or ``from_transmission()``.
+    Passed to ``spatial_map_typed()``.
+    """
+
+    @property
+    def kind(self) -> str:
+        """'counts' or 'transmission'."""
+        ...
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        """(n_energies, height, width)."""
+        ...
+
+
+def from_counts(
+    sample_counts: NDArray[np.float64],
+    open_beam_counts: NDArray[np.float64],
+) -> InputData:
+    """Create InputData from raw detector counts and open beam.
+
+    The fitting engine uses Poisson KL by default (statistically
+    optimal for count data).
+    """
+    ...
+
+
+def from_transmission(
+    transmission: NDArray[np.float64],
+    uncertainty: NDArray[np.float64],
+) -> InputData:
+    """Create InputData from normalized transmission and uncertainty.
+
+    The fitting engine uses LM by default. Pass solver="kl" to
+    spatial_map_typed() for low-count transmission data.
+    """
+    ...
+
+
+def spatial_map_typed(
+    data: InputData,
+    energies: NDArray[np.float64],
+    isotopes: list[ResonanceData],
+    *,
+    temperature_k: float = 300.0,
+    initial_densities: list[float] | None = None,
+    dead_pixels: NDArray[np.bool_] | None = None,
+    max_iter: int = 200,
+    solver: str = "auto",
+    background: bool = False,
+    resolution: TabulatedResolution | None = None,
+    flight_path_m: float | None = None,
+    delta_t_us: float | None = None,
+    delta_l_m: float | None = None,
+) -> SpatialResult:
+    """Spatial mapping using the typed input data API.
+
+    Dispatches per-pixel fitting based on InputData type:
+      - from_counts → Poisson KL on raw counts (optimal)
+      - from_transmission → LM (default) or KL (solver="kl")
+
+    Always returns SpatialResult.
+    """
+    ...

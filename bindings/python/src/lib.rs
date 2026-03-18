@@ -3239,5 +3239,295 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(detect_dead_pixels, m)?)?;
     m.add_function(wrap_pyfunction!(py_calibrate_energy, m)?)?;
     m.add_class::<PyCalibrationResult>()?;
+    // Phase 5: Typed API
+    m.add_class::<PyInputData>()?;
+    m.add_function(wrap_pyfunction!(py_from_counts, m)?)?;
+    m.add_function(wrap_pyfunction!(py_from_transmission, m)?)?;
+    m.add_function(wrap_pyfunction!(py_spatial_map_typed, m)?)?;
     Ok(())
+}
+
+// ── Phase 5: Typed Python API ────────────────────────────────────────────
+
+use nereids_pipeline::pipeline::UnifiedFitConfig;
+use nereids_pipeline::spatial::{InputData3D, spatial_map_typed};
+
+/// Opaque wrapper around InputData3D for Python.
+///
+/// Created via `from_counts()` or `from_transmission()`.
+/// Passed to `spatial_map_typed()`.
+#[pyclass(name = "InputData")]
+struct PyInputData {
+    /// We store owned 3D arrays (ndarray::Array3) so the data lives
+    /// as long as the Python object.
+    kind: String, // "counts" or "transmission"
+    data_a: ndarray::Array3<f64>,
+    data_b: ndarray::Array3<f64>,
+}
+
+#[pymethods]
+impl PyInputData {
+    fn __repr__(&self) -> String {
+        let s = self.data_a.shape();
+        format!(
+            "InputData(kind={}, shape=({}, {}, {}))",
+            self.kind, s[0], s[1], s[2]
+        )
+    }
+
+    #[getter]
+    fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    #[getter]
+    fn shape(&self) -> (usize, usize, usize) {
+        let s = self.data_a.shape();
+        (s[0], s[1], s[2])
+    }
+}
+
+/// Create InputData from raw detector counts and open beam.
+///
+/// The fitting engine will use Poisson KL by default (statistically
+/// optimal for count data).
+///
+/// Args:
+///     sample_counts: 3D array (n_energies, height, width) of sample counts.
+///     open_beam_counts: 3D array (n_energies, height, width) of open beam counts.
+///
+/// Returns:
+///     InputData object to pass to spatial_map_typed().
+#[pyfunction]
+#[pyo3(name = "from_counts")]
+fn py_from_counts<'py>(
+    sample_counts: PyReadonlyArray3<'py, f64>,
+    open_beam_counts: PyReadonlyArray3<'py, f64>,
+) -> PyResult<PyInputData> {
+    let sample = sample_counts.as_array().to_owned();
+    let ob = open_beam_counts.as_array().to_owned();
+    if sample.shape() != ob.shape() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "sample shape {:?} != open_beam shape {:?}",
+            sample.shape(),
+            ob.shape()
+        )));
+    }
+    Ok(PyInputData {
+        kind: "counts".into(),
+        data_a: sample,
+        data_b: ob,
+    })
+}
+
+/// Create InputData from normalized transmission and uncertainty.
+///
+/// The fitting engine will use LM by default. Pass solver="kl" to use
+/// Poisson KL instead (for low-count transmission data).
+///
+/// Args:
+///     transmission: 3D array (n_energies, height, width) of transmission values.
+///     uncertainty: 3D array (n_energies, height, width) of uncertainties.
+///
+/// Returns:
+///     InputData object to pass to spatial_map_typed().
+#[pyfunction]
+#[pyo3(name = "from_transmission")]
+fn py_from_transmission<'py>(
+    transmission: PyReadonlyArray3<'py, f64>,
+    uncertainty: PyReadonlyArray3<'py, f64>,
+) -> PyResult<PyInputData> {
+    let t = transmission.as_array().to_owned();
+    let u = uncertainty.as_array().to_owned();
+    if t.shape() != u.shape() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "transmission shape {:?} != uncertainty shape {:?}",
+            t.shape(),
+            u.shape()
+        )));
+    }
+    Ok(PyInputData {
+        kind: "transmission".into(),
+        data_a: t,
+        data_b: u,
+    })
+}
+
+/// Spatial mapping using the typed input data API.
+///
+/// Dispatches per-pixel fitting based on the InputData type:
+///   - from_counts → Poisson KL on raw counts (statistically optimal)
+///   - from_transmission → LM by default, KL opt-in via solver="kl"
+///
+/// Always returns SpatialResult.
+///
+/// Args:
+///     data: InputData from from_counts() or from_transmission().
+///     energies: 1D energy grid in eV (ascending).
+///     isotopes: list of ResonanceData objects.
+///     temperature_k: Sample temperature in Kelvin (default 300).
+///     initial_densities: Initial density guesses (default 0.001 each).
+///     dead_pixels: Optional 2D boolean dead pixel mask.
+///     max_iter: Maximum iterations per pixel (default 200).
+///     solver: "auto" (default), "lm", or "kl".
+///     background: Enable SAMMY transmission background (only for transmission data).
+///     resolution: Optional resolution function.
+///
+/// Returns:
+///     SpatialResult with density_maps, chi_squared_map, converged_map, etc.
+#[pyfunction]
+#[pyo3(name = "spatial_map_typed", signature = (
+    data, energies, isotopes, *,
+    temperature_k = 300.0,
+    initial_densities = None,
+    dead_pixels = None,
+    max_iter = 200,
+    solver = "auto",
+    background = false,
+    resolution = None,
+    flight_path_m = None,
+    delta_t_us = None,
+    delta_l_m = None,
+))]
+fn py_spatial_map_typed<'py>(
+    py: Python<'py>,
+    data: &PyInputData,
+    energies: PyReadonlyArray1<'py, f64>,
+    isotopes: Vec<PyResonanceData>,
+    temperature_k: f64,
+    initial_densities: Option<Vec<f64>>,
+    dead_pixels: Option<PyReadonlyArray2<'py, bool>>,
+    max_iter: usize,
+    solver: &str,
+    background: bool,
+    resolution: Option<PyTabulatedResolution>,
+    flight_path_m: Option<f64>,
+    delta_t_us: Option<f64>,
+    delta_l_m: Option<f64>,
+) -> PyResult<PySpatialResult> {
+    let energies_vec = energies.as_slice()?.to_vec();
+    let n_iso = isotopes.len();
+
+    let iso_names: Vec<String> = isotopes
+        .iter()
+        .map(|i| {
+            let sym = nereids_core::elements::element_symbol(i.inner.isotope.z()).unwrap_or("?");
+            format!("{}-{}", sym, i.inner.isotope.a())
+        })
+        .collect();
+    let resonance_data: Vec<ResonanceData> = isotopes
+        .into_iter()
+        .map(|d| Arc::unwrap_or_clone(d.inner))
+        .collect();
+    let init_densities = initial_densities.unwrap_or_else(|| vec![0.001; n_iso]);
+
+    // Build resolution
+    let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution, None)?;
+
+    // Build config
+    let mut config = UnifiedFitConfig::new(
+        energies_vec,
+        resonance_data,
+        iso_names,
+        temperature_k,
+        res_fn,
+        init_densities,
+    )
+    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+
+    // Solver
+    let solver_config = match solver {
+        "auto" => nereids_pipeline::pipeline::SolverConfig::Auto,
+        "lm" => nereids_pipeline::pipeline::SolverConfig::LevenbergMarquardt(
+            nereids_fitting::lm::LmConfig {
+                max_iter,
+                ..Default::default()
+            },
+        ),
+        "kl" | "poisson" => nereids_pipeline::pipeline::SolverConfig::PoissonKL(
+            nereids_fitting::poisson::PoissonConfig {
+                max_iter,
+                ..Default::default()
+            },
+        ),
+        other => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Unknown solver: '{other}'. Use 'auto', 'lm', or 'kl'."
+            )));
+        }
+    };
+    config = config.with_solver(solver_config);
+
+    // Background (transmission only)
+    if background {
+        if data.kind == "counts" {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "background=True is only supported for transmission data. \
+                 Counts data uses nuisance estimation from the open beam.",
+            ));
+        }
+        config = config
+            .with_transmission_background(nereids_pipeline::pipeline::BackgroundConfig::default());
+    }
+
+    // Build InputData3D from the PyInputData
+    let input = if data.kind == "counts" {
+        InputData3D::Counts {
+            sample_counts: data.data_a.view(),
+            open_beam_counts: data.data_b.view(),
+        }
+    } else {
+        InputData3D::Transmission {
+            transmission: data.data_a.view(),
+            uncertainty: data.data_b.view(),
+        }
+    };
+
+    // Dead pixels
+    let dead_arr = dead_pixels.map(|dp| dp.as_array().to_owned());
+
+    // Run
+    let result = spatial_map_typed(&input, &config, dead_arr.as_ref(), None, None)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+    // Convert to PySpatialResult
+    let density_maps: Vec<Py<PyArray2<f64>>> = result
+        .density_maps
+        .iter()
+        .map(|m| PyArray2::from_array(py, m).into())
+        .collect();
+    let uncertainty_maps: Vec<Py<PyArray2<f64>>> = result
+        .uncertainty_maps
+        .iter()
+        .map(|m| PyArray2::from_array(py, m).into())
+        .collect();
+    let shape = (
+        result.converged_map.shape()[0],
+        result.converged_map.shape()[1],
+    );
+
+    let anorm_map = result
+        .anorm_map
+        .as_ref()
+        .map(|m| PyArray2::from_array(py, m).into());
+    let background_maps = result.background_maps.as_ref().map(|maps| {
+        [
+            PyArray2::from_array(py, &maps[0]).into(),
+            PyArray2::from_array(py, &maps[1]).into(),
+            PyArray2::from_array(py, &maps[2]).into(),
+        ]
+    });
+
+    Ok(PySpatialResult {
+        density_maps,
+        uncertainty_maps,
+        chi_squared_map: PyArray2::from_array(py, &result.chi_squared_map).into(),
+        converged_map: PyArray2::from_array(py, &result.converged_map).into(),
+        n_converged: result.n_converged,
+        n_total: result.n_total,
+        isotope_names: result.isotope_labels,
+        shape,
+        anorm_map,
+        background_maps,
+    })
 }
