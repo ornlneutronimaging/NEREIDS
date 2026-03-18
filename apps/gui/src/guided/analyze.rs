@@ -1208,6 +1208,10 @@ pub fn run_spatial_map(state: &mut AppState) {
                         background_maps: r.background_maps,
                         n_converged: r.n_converged,
                         n_total: r.n_total,
+                        nll_map: None,
+                        n_weak_directions: Some(r.n_weak_directions),
+                        fisher_eigenvalues: Some(r.fisher_eigenvalues),
+                        temperature_uncertainty_map: r.temperature_uncertainty_map,
                     }
                 })
             } else {
