@@ -344,6 +344,15 @@ impl UnifiedFitConfig {
     pub fn fit_temperature(&self) -> bool {
         self.fit_temperature
     }
+    pub fn transmission_background(&self) -> Option<&BackgroundConfig> {
+        self.transmission_background.as_ref()
+    }
+    pub fn counts_background(&self) -> Option<&CountsBackgroundConfig> {
+        self.counts_background.as_ref()
+    }
+    pub fn precomputed_cross_sections(&self) -> Option<&Arc<Vec<Vec<f64>>>> {
+        self.precomputed_cross_sections.as_ref()
+    }
 
     /// Resolve `SolverConfig::Auto` into a concrete solver for the given input.
     fn effective_solver(&self, input: &InputData) -> SolverConfig {
