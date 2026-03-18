@@ -602,6 +602,111 @@ impl<M: FitModel> FitModel for NormalizedTransmissionModel<M> {
     }
 }
 
+// ── ForwardModel implementations (Phase 1) ──────────────────────────────
+//
+// Each implementation delegates to the existing FitModel logic.
+// `predict` == `evaluate`, `jacobian` converts FlatMatrix → Vec<Vec<f64>>.
+
+use crate::forward_model::ForwardModel;
+
+impl ForwardModel for PrecomputedTransmissionModel {
+    fn predict(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+        self.evaluate(params)
+    }
+
+    fn jacobian(
+        &self,
+        params: &[f64],
+        free_param_indices: &[usize],
+        y_current: &[f64],
+    ) -> Option<Vec<Vec<f64>>> {
+        let fm = self.analytical_jacobian(params, free_param_indices, y_current)?;
+        Some(flat_matrix_to_vecs(&fm, free_param_indices.len()))
+    }
+
+    fn n_data(&self) -> usize {
+        if self.cross_sections.is_empty() {
+            0
+        } else {
+            self.cross_sections[0].len()
+        }
+    }
+
+    fn n_params(&self) -> usize {
+        // Max index in density_indices + 1
+        self.density_indices
+            .iter()
+            .copied()
+            .max()
+            .map_or(0, |m| m + 1)
+    }
+}
+
+impl ForwardModel for TransmissionFitModel {
+    fn predict(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+        self.evaluate(params)
+    }
+
+    fn jacobian(
+        &self,
+        params: &[f64],
+        free_param_indices: &[usize],
+        y_current: &[f64],
+    ) -> Option<Vec<Vec<f64>>> {
+        let fm = self.analytical_jacobian(params, free_param_indices, y_current)?;
+        Some(flat_matrix_to_vecs(&fm, free_param_indices.len()))
+    }
+
+    fn n_data(&self) -> usize {
+        self.energies.len()
+    }
+
+    fn n_params(&self) -> usize {
+        let max_density = self.density_indices.iter().copied().max().unwrap_or(0);
+        let max_temp = self.temperature_index.unwrap_or(0);
+        max_density.max(max_temp) + 1
+    }
+}
+
+impl<M: FitModel> ForwardModel for NormalizedTransmissionModel<M> {
+    fn predict(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+        self.evaluate(params)
+    }
+
+    fn jacobian(
+        &self,
+        params: &[f64],
+        free_param_indices: &[usize],
+        y_current: &[f64],
+    ) -> Option<Vec<Vec<f64>>> {
+        let fm = self.analytical_jacobian(params, free_param_indices, y_current)?;
+        Some(flat_matrix_to_vecs(&fm, free_param_indices.len()))
+    }
+
+    fn n_data(&self) -> usize {
+        self.sqrt_energies.len()
+    }
+
+    fn n_params(&self) -> usize {
+        // The background indices are the highest parameter indices.
+        self.anorm_index
+            .max(self.back_a_index)
+            .max(self.back_b_index)
+            .max(self.back_c_index)
+            + 1
+    }
+}
+
+/// Convert a `FlatMatrix` (row-major) to `Vec<Vec<f64>>` (column-major).
+///
+/// Returns `cols` vectors, each of length `fm.nrows()`.
+fn flat_matrix_to_vecs(fm: &FlatMatrix, cols: usize) -> Vec<Vec<f64>> {
+    let nrows = fm.nrows;
+    (0..cols)
+        .map(|j| (0..nrows).map(|i| fm.get(i, j)).collect())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1358,5 +1463,50 @@ mod tests {
             (fit_back_a - true_back_a).abs() < 0.001,
             "back_a: fitted={fit_back_a}, true={true_back_a}"
         );
+    }
+
+    // ── Phase 1: ForwardModel tests ──
+
+    #[test]
+    fn forward_model_predict_equals_fit_model_evaluate_precomputed() {
+        use crate::forward_model::ForwardModel;
+        let xs = vec![vec![1.0, 2.0, 3.0, 2.0, 1.5]];
+        let model = make_precomputed(xs, vec![0]);
+        let params = [0.001];
+        let fm_result = model.evaluate(&params).unwrap();
+        let fwd_result = model.predict(&params).unwrap();
+        assert_eq!(fm_result, fwd_result);
+        assert_eq!(model.n_data(), 5);
+        assert_eq!(model.n_params(), 1);
+    }
+
+    #[test]
+    fn forward_model_predict_equals_fit_model_evaluate_normalized() {
+        use crate::forward_model::ForwardModel;
+        let xs = vec![vec![1.0, 2.0, 3.0, 2.0, 1.5]];
+        let inner = make_precomputed(xs, vec![0]);
+        let energies = [4.0, 9.0, 16.0, 25.0, 36.0];
+        let model = NormalizedTransmissionModel::new(inner, &energies, 1, 2, 3, 4);
+        let params = [0.001, 0.95, 0.01, 0.0, 0.0];
+        let fm_result = model.evaluate(&params).unwrap();
+        let fwd_result = model.predict(&params).unwrap();
+        assert_eq!(fm_result, fwd_result);
+        assert_eq!(model.n_data(), 5);
+        assert_eq!(model.n_params(), 5);
+    }
+
+    #[test]
+    fn forward_model_jacobian_columns_match_precomputed() {
+        use crate::forward_model::ForwardModel;
+        let xs = vec![vec![1.0, 2.0, 3.0], vec![0.5, 1.5, 2.5]];
+        let model = make_precomputed(xs, vec![0, 1]);
+        let params = [0.001, 0.002];
+        let y = model.predict(&params).unwrap();
+        let free_indices = vec![0, 1];
+        let jac = model
+            .jacobian(&params, &free_indices, &y)
+            .expect("analytical jacobian should be available");
+        assert_eq!(jac.len(), 2); // 2 columns (one per free param)
+        assert_eq!(jac[0].len(), 3); // 3 rows (one per energy bin)
     }
 }
