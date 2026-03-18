@@ -512,7 +512,7 @@ pub enum InputData3D<'a> {
 
 impl InputData3D<'_> {
     /// Shape of the data: (n_energies, height, width).
-    fn shape(&self) -> (usize, usize, usize) {
+    pub fn shape(&self) -> (usize, usize, usize) {
         let s = match self {
             Self::Transmission { transmission, .. } => transmission.shape(),
             Self::Counts { sample_counts, .. } => sample_counts.shape(),
@@ -521,7 +521,7 @@ impl InputData3D<'_> {
     }
 
     /// Whether this is counts data.
-    fn is_counts(&self) -> bool {
+    pub fn is_counts(&self) -> bool {
         matches!(self, Self::Counts { .. })
     }
 }

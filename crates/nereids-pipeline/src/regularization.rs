@@ -873,6 +873,216 @@ pub fn spatial_map_regularized(
     })
 }
 
+// ── Typed API: spatial_map_regularized_typed ──────────────────────────────
+
+use crate::pipeline::UnifiedFitConfig;
+use crate::spatial::{InputData3D, SpatialResult, spatial_map_typed};
+
+/// Regularized spatial mapping using the typed input data API.
+///
+/// Same algorithm as [`spatial_map_regularized`] but uses the typed
+/// `InputData3D` + `UnifiedFitConfig` path. The Fisher metric is derived
+/// from the `SolverConfig`:
+/// - `PoissonKL` → Poisson metric (correct for KL)
+/// - `LevenbergMarquardt` → Poisson metric (approximation; eigenstructure
+///   is dominated by cross-section contrast)
+/// - `Auto` → resolved by `effective_solver`
+///
+/// Returns `SpatialResult` with regularization fields populated
+/// (`n_weak_directions`, `fisher_eigenvalues`).
+pub fn spatial_map_regularized_typed(
+    input: &InputData3D<'_>,
+    config: &UnifiedFitConfig,
+    reg_config: &RegularizationConfig,
+    dead_pixels: Option<&Array2<bool>>,
+    cancel: Option<&AtomicBool>,
+    progress: Option<&AtomicUsize>,
+) -> Result<SpatialResult, PipelineError> {
+    // Validate regularization config
+    if !reg_config.threshold.is_finite()
+        || reg_config.threshold <= 0.0
+        || reg_config.threshold >= 1.0
+    {
+        return Err(PipelineError::InvalidParameter(format!(
+            "threshold must be in (0, 1), got {}",
+            reg_config.threshold
+        )));
+    }
+
+    let (_, height, width) = input.shape();
+    let n_isotopes = config.resonance_data().len();
+
+    // Step 1: Per-pixel fitting via the typed path
+    let initial = spatial_map_typed(input, config, dead_pixels, cancel, progress)?;
+
+    // Step 2: Compute Fisher information matrix
+    let cross_sections: Vec<Vec<f64>> = if let Some(xs) = config.precomputed_cross_sections() {
+        xs.as_ref().clone()
+    } else {
+        use nereids_physics::transmission::{InstrumentParams, broadened_cross_sections};
+        let instrument = config.resolution().map(|r| InstrumentParams {
+            resolution: r.clone(),
+        });
+        broadened_cross_sections(
+            config.energies(),
+            config.resonance_data(),
+            config.temperature_k(),
+            instrument.as_ref(),
+            cancel,
+        )?
+    };
+
+    let reference_densities: Vec<f64> = config
+        .initial_densities()
+        .iter()
+        .map(|&d| d.max(1e-10))
+        .collect();
+
+    // Derive Fisher metric from the solver config.
+    // Currently all paths use Poisson metric — the eigenstructure is dominated
+    // by cross-section contrast, not noise weighting.  When per-pixel
+    // uncertainties become available, the LM path should use Gaussian metric.
+    let metric = FisherMetric::Poisson;
+
+    let fisher = if config.transmission_background().is_some() {
+        let anorm_init = config
+            .transmission_background()
+            .map(|bg| bg.anorm_init)
+            .unwrap_or(1.0);
+        compute_fisher_matrix_with_background(
+            &cross_sections,
+            &reference_densities,
+            config.energies(),
+            anorm_init,
+            &metric,
+        )
+    } else {
+        compute_fisher_matrix(&cross_sections, &reference_densities, &metric)
+    };
+
+    // Step 3: Eigendecompose
+    let (eigenvalues, eigenvectors) = eigen_symmetric(&fisher);
+    let max_eig = eigenvalues.iter().cloned().fold(0.0f64, f64::max);
+    let threshold_val = reg_config.threshold * max_eig;
+    let is_weak: Vec<bool> = if max_eig < 1e-30 {
+        vec![true; n_isotopes]
+    } else {
+        eigenvalues.iter().map(|&e| e < threshold_val).collect()
+    };
+    let n_weak = is_weak.iter().filter(|&&w| w).count();
+
+    // Step 4: Transform to eigenbasis
+    let mut eigen_maps: Vec<Array2<f64>> = (0..n_isotopes)
+        .map(|_| Array2::zeros((height, width)))
+        .collect();
+    for y in 0..height {
+        for x in 0..width {
+            let n_px: Vec<f64> = (0..n_isotopes)
+                .map(|k| initial.density_maps[k][[y, x]])
+                .collect();
+            for k in 0..n_isotopes {
+                let mut theta = 0.0;
+                for i in 0..n_isotopes {
+                    theta += eigenvectors[k][i] * n_px[i];
+                }
+                eigen_maps[k][[y, x]] = theta;
+            }
+        }
+    }
+
+    // Step 5: Selectively smooth weak components
+    selective_spatial_smooth(&mut eigen_maps, &is_weak, reg_config.smooth_iter);
+
+    // Step 6: Transform back to density space
+    let mut density_maps: Vec<Array2<f64>> = (0..n_isotopes)
+        .map(|_| Array2::zeros((height, width)))
+        .collect();
+    for y in 0..height {
+        for x in 0..width {
+            let theta: Vec<f64> = (0..n_isotopes).map(|k| eigen_maps[k][[y, x]]).collect();
+            for i in 0..n_isotopes {
+                let mut n_val = 0.0;
+                for k in 0..n_isotopes {
+                    n_val += eigenvectors[k][i] * theta[k];
+                }
+                density_maps[i][[y, x]] = n_val.max(0.0);
+            }
+        }
+    }
+
+    // Step 7: Uncertainty (same logic as old path)
+    let uncertainty_maps = if reg_config.compute_uncertainty {
+        let mut unc_maps: Vec<Array2<f64>> = (0..n_isotopes)
+            .map(|_| Array2::zeros((height, width)))
+            .collect();
+        for y in 0..height {
+            for x in 0..width {
+                let n_px: Vec<f64> = (0..n_isotopes).map(|i| density_maps[i][[y, x]]).collect();
+                let f = compute_fisher_matrix(&cross_sections, &n_px, &metric);
+                let mut degree = 0.0f64;
+                if y > 0 {
+                    degree += 1.0;
+                }
+                if y + 1 < height {
+                    degree += 1.0;
+                }
+                if x > 0 {
+                    degree += 1.0;
+                }
+                if x + 1 < width {
+                    degree += 1.0;
+                }
+                let mut h = f;
+                for j in 0..n_isotopes {
+                    if is_weak[j] {
+                        for r in 0..n_isotopes {
+                            for c in 0..n_isotopes {
+                                h[r][c] += eigenvectors[j][r] * eigenvectors[j][c] * degree;
+                            }
+                        }
+                    }
+                }
+                let (h_evals, h_evecs) = eigen_symmetric(&h);
+                for k in 0..n_isotopes {
+                    let mut inv_diag = 0.0;
+                    for (j, &lam) in h_evals.iter().enumerate() {
+                        if lam > 1e-30 {
+                            inv_diag += h_evecs[j][k] * h_evecs[j][k] / lam;
+                        }
+                    }
+                    unc_maps[k][[y, x]] = if inv_diag > 0.0 {
+                        inv_diag.sqrt()
+                    } else {
+                        f64::INFINITY
+                    };
+                }
+            }
+        }
+        unc_maps
+    } else {
+        (0..n_isotopes)
+            .map(|_| Array2::from_elem((height, width), f64::INFINITY))
+            .collect()
+    };
+
+    Ok(SpatialResult {
+        density_maps,
+        uncertainty_maps,
+        chi_squared_map: initial.chi_squared_map,
+        converged_map: initial.converged_map,
+        temperature_map: initial.temperature_map,
+        isotope_labels: initial.isotope_labels,
+        anorm_map: initial.anorm_map,
+        background_maps: initial.background_maps,
+        n_converged: initial.n_converged,
+        n_total: initial.n_total,
+        nll_map: initial.nll_map,
+        n_weak_directions: Some(n_weak),
+        fisher_eigenvalues: Some(eigenvalues),
+        temperature_uncertainty_map: None, // TODO: wire temperature regularization
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
