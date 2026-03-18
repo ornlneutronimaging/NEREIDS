@@ -704,29 +704,56 @@ fn build_density_params(config: &UnifiedFitConfig) -> Vec<FitParameter> {
 }
 
 fn append_background_params(param_vec: &mut Vec<FitParameter>, bg: &BackgroundConfig) {
+    // Anorm bounded to [0.5, 2.0] — physically reasonable normalization range.
+    // Previously unbounded [0, ∞), which allowed the fitter to absorb signal
+    // into anorm (e.g., anorm=15.9 with density=0.03×true).
+    // SAMMY also bounds normalization to a reasonable range.
     param_vec.push(if bg.fit_anorm {
         FitParameter {
             name: "anorm".into(),
             value: bg.anorm_init,
-            lower: 0.0,
-            upper: f64::INFINITY,
+            lower: 0.5,
+            upper: 2.0,
             fixed: false,
         }
     } else {
         FitParameter::fixed("anorm", bg.anorm_init)
     });
+    // Background terms bounded to [-0.5, 0.5].
+    // These are small corrections to the transmission baseline.
+    // Unbounded background allows the fitter to absorb resonance signal
+    // into the background polynomial, producing meaningless densities.
+    // SAMMY also constrains background to reasonable ranges.
     param_vec.push(if bg.fit_back_a {
-        FitParameter::unbounded("back_a", bg.back_a_init)
+        FitParameter {
+            name: "back_a".into(),
+            value: bg.back_a_init,
+            lower: -0.5,
+            upper: 0.5,
+            fixed: false,
+        }
     } else {
         FitParameter::fixed("back_a", bg.back_a_init)
     });
     param_vec.push(if bg.fit_back_b {
-        FitParameter::unbounded("back_b", bg.back_b_init)
+        FitParameter {
+            name: "back_b".into(),
+            value: bg.back_b_init,
+            lower: -0.5,
+            upper: 0.5,
+            fixed: false,
+        }
     } else {
         FitParameter::fixed("back_b", bg.back_b_init)
     });
     param_vec.push(if bg.fit_back_c {
-        FitParameter::unbounded("back_c", bg.back_c_init)
+        FitParameter {
+            name: "back_c".into(),
+            value: bg.back_c_init,
+            lower: -0.5,
+            upper: 0.5,
+            fixed: false,
+        }
     } else {
         FitParameter::fixed("back_c", bg.back_c_init)
     });
