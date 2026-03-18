@@ -790,6 +790,7 @@ fn build_fit_config(state: &AppState) -> Result<FitConfig, String> {
 
     config = config.with_compute_covariance(state.lm_config.compute_covariance);
 
+    #[allow(deprecated)] // GUI still uses old FitConfig API; will migrate in future
     if state.solver_method == SolverMethod::PoissonKL {
         config = config.with_solver(nereids_pipeline::pipeline::SolverChoice::PoissonKL(
             nereids_fitting::poisson::PoissonConfig {

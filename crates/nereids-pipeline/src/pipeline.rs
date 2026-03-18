@@ -4,6 +4,10 @@
 //! ENDF loading → cross-section calculation → broadening → fitting.
 //!
 //! This is the building block for the spatial mapping pipeline.
+//!
+//! This module contains both the deprecated `FitConfig`/`SolverChoice` API
+//! and the new typed `UnifiedFitConfig`/`SolverConfig`/`InputData` API.
+//! The old API is preserved for backward compatibility during the transition.
 
 use std::fmt;
 use std::sync::Arc;
@@ -22,6 +26,10 @@ use nereids_physics::transmission::{self as phys_transmission};
 use crate::error::PipelineError;
 
 /// Which optimizer to use for spectrum fitting.
+///
+/// **Deprecated**: Use [`SolverConfig`] instead, which carries solver-specific
+/// configuration inside each variant (making invalid combinations unrepresentable).
+#[deprecated(since = "0.2.0", note = "use SolverConfig instead")]
 #[derive(Debug, Clone, Default)]
 pub enum SolverChoice {
     /// Levenberg-Marquardt chi-squared minimizer (default).
