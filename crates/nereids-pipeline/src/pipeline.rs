@@ -76,6 +76,122 @@ impl Default for BackgroundConfig {
     }
 }
 
+// ── New typed pipeline API (Phase 0) ─────────────────────────────────────
+
+/// Typed input data — makes the data format explicit at the API boundary.
+///
+/// The two variants carry genuinely different data:
+/// - **Counts**: raw detector counts + open beam → Poisson statistics native
+/// - **Transmission**: normalized T = sample/open_beam + uncertainty → Gaussian statistics
+///
+/// `spatial_map_typed` dispatches to the correct fitting engine based on
+/// which variant is provided.  This eliminates the overloaded positional
+/// arguments that caused silent misinterpretation in the old API.
+#[derive(Debug, Clone)]
+pub enum InputData {
+    /// Pre-normalized transmission with Gaussian uncertainties.
+    ///
+    /// Use with LM (default) or Poisson KL (opt-in for low-count T data).
+    Transmission {
+        /// Measured transmission T(E), values typically in [0, 2].
+        transmission: Vec<f64>,
+        /// Per-bin uncertainty σ_T(E).
+        uncertainty: Vec<f64>,
+    },
+    /// Raw detector counts with open beam reference.
+    ///
+    /// Always uses Poisson KL (statistically optimal for count data).
+    /// The fitting engine works directly on counts — no information-losing
+    /// normalization to transmission.
+    Counts {
+        /// Sample counts per energy bin.
+        sample_counts: Vec<f64>,
+        /// Open-beam counts per energy bin (normalization reference).
+        open_beam_counts: Vec<f64>,
+    },
+    /// Counts with pre-estimated nuisance parameters (power users).
+    ///
+    /// Use when you want to inspect or override the flux estimate from
+    /// [`estimate_nuisance`] before fitting.
+    CountsWithNuisance {
+        /// Sample counts per energy bin.
+        sample_counts: Vec<f64>,
+        /// Estimated flux spectrum (from open beam spatial average).
+        flux: Vec<f64>,
+        /// Estimated detector background spectrum.
+        background: Vec<f64>,
+    },
+}
+
+impl InputData {
+    /// Number of energy bins.
+    pub fn n_energies(&self) -> usize {
+        match self {
+            Self::Transmission { transmission, .. } => transmission.len(),
+            Self::Counts { sample_counts, .. } => sample_counts.len(),
+            Self::CountsWithNuisance { sample_counts, .. } => sample_counts.len(),
+        }
+    }
+
+    /// Whether this is count data (Poisson-native).
+    pub fn is_counts(&self) -> bool {
+        matches!(self, Self::Counts { .. } | Self::CountsWithNuisance { .. })
+    }
+}
+
+/// Solver-specific configuration.
+///
+/// Replaces the old [`SolverChoice`] enum by carrying the full solver config
+/// inside each variant, making invalid combinations unrepresentable.
+#[derive(Debug, Clone, Default)]
+pub enum SolverConfig {
+    /// Levenberg-Marquardt chi-squared minimizer.
+    LevenbergMarquardt(LmConfig),
+    /// Poisson KL divergence minimizer (projected gradient + Armijo).
+    PoissonKL(PoissonConfig),
+    /// Automatic: Counts → PoissonKL, Transmission → LM.
+    #[default]
+    Auto,
+}
+
+/// Background model for the counts fitting engine.
+///
+/// In the counts domain, the forward model is:
+///   Y(E) = α₁ · [Φ(E) · exp(-Σ nᵢσᵢ(E))] + α₂ · B(E)
+///
+/// where Φ(E) is the incident flux and B(E) is detector/gamma background.
+/// Both are estimated from the open beam data via [`estimate_nuisance`].
+///
+/// This is structurally different from the transmission background model
+/// ([`BackgroundConfig`]) because:
+/// - Φ and B are estimated once from spatial averaging, not fitted per pixel
+/// - α₁ and α₂ are optional per-pixel scale corrections
+/// - All terms are non-negative (required for valid Poisson NLL)
+#[derive(Debug, Clone)]
+pub struct CountsBackgroundConfig {
+    /// Initial normalization scale (default 1.0).
+    pub alpha_1_init: f64,
+    /// Initial background scale (default 1.0).
+    pub alpha_2_init: f64,
+    /// Whether α₁ is free (true) or fixed (false).
+    pub fit_alpha_1: bool,
+    /// Whether α₂ is free (true) or fixed (false).
+    pub fit_alpha_2: bool,
+}
+
+impl Default for CountsBackgroundConfig {
+    fn default() -> Self {
+        Self {
+            alpha_1_init: 1.0,
+            alpha_2_init: 1.0,
+            fit_alpha_1: false,
+            fit_alpha_2: false,
+        }
+    }
+}
+
+// ── End Phase 0 types ────────────────────────────────────────────────────
+
 /// Errors from `FitConfig` construction.
 #[derive(Debug, PartialEq)]
 pub enum FitConfigError {
@@ -1611,5 +1727,53 @@ mod tests {
             result.background[0],
             true_back_a,
         );
+    }
+
+    // ── Phase 0: InputData + SolverConfig + CountsBackgroundConfig tests ──
+
+    #[test]
+    fn test_input_data_transmission_n_energies() {
+        let data = InputData::Transmission {
+            transmission: vec![0.9, 0.8, 0.7],
+            uncertainty: vec![0.01, 0.01, 0.01],
+        };
+        assert_eq!(data.n_energies(), 3);
+        assert!(!data.is_counts());
+    }
+
+    #[test]
+    fn test_input_data_counts_n_energies() {
+        let data = InputData::Counts {
+            sample_counts: vec![10.0, 20.0, 30.0, 40.0],
+            open_beam_counts: vec![100.0, 100.0, 100.0, 100.0],
+        };
+        assert_eq!(data.n_energies(), 4);
+        assert!(data.is_counts());
+    }
+
+    #[test]
+    fn test_input_data_counts_with_nuisance() {
+        let data = InputData::CountsWithNuisance {
+            sample_counts: vec![5.0, 6.0],
+            flux: vec![100.0, 100.0],
+            background: vec![0.5, 0.5],
+        };
+        assert_eq!(data.n_energies(), 2);
+        assert!(data.is_counts());
+    }
+
+    #[test]
+    fn test_solver_config_default_is_auto() {
+        let cfg = SolverConfig::default();
+        assert!(matches!(cfg, SolverConfig::Auto));
+    }
+
+    #[test]
+    fn test_counts_background_config_default() {
+        let cfg = CountsBackgroundConfig::default();
+        assert!((cfg.alpha_1_init - 1.0).abs() < f64::EPSILON);
+        assert!((cfg.alpha_2_init - 1.0).abs() < f64::EPSILON);
+        assert!(!cfg.fit_alpha_1);
+        assert!(!cfg.fit_alpha_2);
     }
 }
