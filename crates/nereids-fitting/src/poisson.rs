@@ -1081,6 +1081,136 @@ impl<'a> crate::forward_model::ForwardModel for CountsModel<'a> {
     }
 }
 
+use crate::lm::FlatMatrix;
+
+/// KL-compatible background model for transmission data.
+///
+/// Given a transmission model T_inner(θ), predicts:
+///
+///   T_out(E) = T_inner(E) + b₀ + b₁/√E
+///
+/// where b₀ and b₁ are the additive background parameters at indices
+/// `b0_index` and `b1_index` in the parameter vector.
+///
+/// Unlike `NormalizedTransmissionModel` (which uses `Anorm * T + BackA +
+/// BackB/√E + BackC√E` with 4 free parameters), this model:
+/// - Has only 2 background parameters (b₀, b₁), reducing overfitting risk
+/// - Constrains b₀, b₁ ≥ 0 via parameter bounds (physical: background
+///   adds counts, never subtracts), ensuring T_out > 0 for valid Poisson NLL
+/// - Does NOT multiply T_inner by a normalization factor — normalization
+///   is handled separately (nuisance estimation for counts, or pre-processing
+///   for transmission data)
+///
+/// ## Gradient
+///
+/// For `poisson_fit_analytic` integration:
+/// - ∂T_out/∂nₖ = ∂T_inner/∂nₖ = -σₖ(E)·T_inner(E)  (same as bare model)
+/// - ∂T_out/∂b₀ = 1
+/// - ∂T_out/∂b₁ = 1/√E
+pub struct TransmissionKLBackgroundModel<'a> {
+    /// Underlying transmission model (density parameters only).
+    pub inner: &'a dyn FitModel,
+    /// Precomputed 1/√E for each energy bin.
+    pub inv_sqrt_energies: Vec<f64>,
+    /// Index of b₀ (constant background) in the parameter vector.
+    pub b0_index: usize,
+    /// Index of b₁ (1/√E background) in the parameter vector.
+    pub b1_index: usize,
+}
+
+impl<'a> FitModel for TransmissionKLBackgroundModel<'a> {
+    fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+        let t_inner = self.inner.evaluate(params)?;
+        let b0 = params[self.b0_index];
+        let b1 = params[self.b1_index];
+        Ok(t_inner
+            .iter()
+            .zip(self.inv_sqrt_energies.iter())
+            .map(|(&t, &inv_sqrt_e)| t + b0 + b1 * inv_sqrt_e)
+            .collect())
+    }
+
+    fn analytical_jacobian(
+        &self,
+        params: &[f64],
+        free_param_indices: &[usize],
+        y_current: &[f64],
+    ) -> Option<FlatMatrix> {
+        let n_e = y_current.len();
+        let n_free = free_param_indices.len();
+
+        // Identify which free params are background vs inner model.
+        let b0_col = free_param_indices.iter().position(|&i| i == self.b0_index);
+        let b1_col = free_param_indices.iter().position(|&i| i == self.b1_index);
+
+        // Inner model free params (those not b0 or b1).
+        let inner_free: Vec<usize> = free_param_indices
+            .iter()
+            .copied()
+            .filter(|&i| i != self.b0_index && i != self.b1_index)
+            .collect();
+
+        // Get inner model Jacobian for density columns.
+        let inner_jac = if !inner_free.is_empty() {
+            // Evaluate inner model at current params to get T_inner for y_current.
+            let t_inner = self.inner.evaluate(params).ok()?;
+            self.inner
+                .analytical_jacobian(params, &inner_free, &t_inner)
+        } else {
+            None
+        };
+
+        let mut jacobian = FlatMatrix::zeros(n_e, n_free);
+
+        // Fill inner model columns (density, temperature).
+        // Inner Jacobian is the same as bare model — background doesn't
+        // affect ∂T_inner/∂nₖ.
+        if let Some(ref ij) = inner_jac {
+            let mut inner_col = 0;
+            for (col, &fp) in free_param_indices.iter().enumerate() {
+                if fp == self.b0_index || fp == self.b1_index {
+                    continue;
+                }
+                for row in 0..n_e {
+                    *jacobian.get_mut(row, col) = ij.get(row, inner_col);
+                }
+                inner_col += 1;
+            }
+        } else {
+            // No analytical inner Jacobian — fall back to FD for entire model.
+            return None;
+        }
+
+        // Background columns.
+        if let Some(col) = b0_col {
+            for row in 0..n_e {
+                *jacobian.get_mut(row, col) = 1.0; // ∂T_out/∂b₀ = 1
+            }
+        }
+        if let Some(col) = b1_col {
+            for row in 0..n_e {
+                *jacobian.get_mut(row, col) = self.inv_sqrt_energies[row]; // ∂T_out/∂b₁ = 1/√E
+            }
+        }
+
+        Some(jacobian)
+    }
+}
+
+impl<'a> crate::forward_model::ForwardModel for TransmissionKLBackgroundModel<'a> {
+    fn predict(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+        self.evaluate(params)
+    }
+
+    fn n_data(&self) -> usize {
+        self.inv_sqrt_energies.len()
+    }
+
+    fn n_params(&self) -> usize {
+        0 // Determined by ParameterSet, not the model.
+    }
+}
+
 /// L-BFGS memory: stores last `m` correction pairs for inverse Hessian
 /// approximation.
 ///

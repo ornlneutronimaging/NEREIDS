@@ -578,10 +578,29 @@ fn fit_transmission_poisson(
 
     let mut param_vec = build_density_params(config);
 
+    // KL background model: T_out = T_inner + b₀ + b₁/√E
+    // Uses 2 non-negative parameters instead of SAMMY's 4-parameter
+    // polynomial (which is incompatible with Poisson NLL due to
+    // potentially negative T_out values).
     let bg_base = param_vec.len();
-    let bg_indices = if let Some(bg) = &config.transmission_background {
-        append_background_params(&mut param_vec, bg);
-        Some((bg_base, bg_base + 1, bg_base + 2, bg_base + 3))
+    let kl_bg = if config.transmission_background.is_some() {
+        // b₀: constant additive background [0, 0.5]
+        param_vec.push(FitParameter {
+            name: "kl_b0".into(),
+            value: 0.0,
+            lower: 0.0,
+            upper: 0.5,
+            fixed: false,
+        });
+        // b₁: 1/√E background [0, 0.5]
+        param_vec.push(FitParameter {
+            name: "kl_b1".into(),
+            value: 0.0,
+            lower: 0.0,
+            upper: 0.5,
+            fixed: false,
+        });
+        Some((bg_base, bg_base + 1))
     } else {
         None
     };
@@ -590,10 +609,19 @@ fn fit_transmission_poisson(
 
     let model = build_transmission_model(config, n_isotopes, None)?;
 
-    // Dispatch through FitModel-based poisson_fit
-    let result = if let Some((ai, bai, bbi, bci)) = bg_indices {
-        let wrapped =
-            NormalizedTransmissionModel::new(&*model, config.energies(), ai, bai, bbi, bci);
+    // Dispatch with KL-native background model
+    let result = if let Some((b0_idx, b1_idx)) = kl_bg {
+        let inv_sqrt_e: Vec<f64> = config
+            .energies()
+            .iter()
+            .map(|&e| 1.0 / e.max(1e-10).sqrt())
+            .collect();
+        let wrapped = poisson::TransmissionKLBackgroundModel {
+            inner: &*model,
+            inv_sqrt_energies: inv_sqrt_e,
+            b0_index: b0_idx,
+            b1_index: b1_idx,
+        };
         let pr = poisson::poisson_fit(&wrapped, measured_t, &mut params, poisson_cfg)?;
         poisson_to_lm_result(&wrapped, measured_t, sigma, &pr, &params)
     } else {
@@ -601,7 +629,34 @@ fn fit_transmission_poisson(
         poisson_to_lm_result(&*model, measured_t, sigma, &pr, &params)
     }?;
 
-    extract_result(config, &result, n_isotopes, bg_indices)
+    // Map KL background params to SpectrumFitResult format.
+    // KL model has (b0, b1) not (anorm, backA, backB, backC).
+    // Store b0 in anorm slot, b1 in background[0] for now.
+    // TODO: clean up result format for KL background.
+    let densities: Vec<f64> = (0..n_isotopes).map(|i| result.params[i]).collect();
+    let uncertainties = result.covariance.as_ref().map(|cov| {
+        (0..n_isotopes)
+            .map(|i| cov.get(i, i).sqrt())
+            .collect::<Vec<_>>()
+    });
+
+    if let Some((b0_idx, b1_idx)) = kl_bg {
+        let b0 = result.params[b0_idx];
+        let b1 = result.params[b1_idx];
+        Ok(SpectrumFitResult {
+            densities,
+            uncertainties,
+            reduced_chi_squared: result.reduced_chi_squared,
+            converged: result.converged,
+            iterations: result.iterations,
+            temperature_k: None,
+            temperature_k_unc: None,
+            anorm: 1.0,                // KL doesn't use anorm
+            background: [b0, b1, 0.0], // b0, b1 stored in background slots
+        })
+    } else {
+        extract_result(config, &result, n_isotopes, None)
+    }
 }
 
 /// Counts + Poisson KL path (statistically optimal).
