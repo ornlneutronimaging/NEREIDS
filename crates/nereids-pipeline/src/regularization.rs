@@ -939,10 +939,41 @@ pub fn spatial_map_regularized_typed(
         .collect();
 
     // Derive Fisher metric from the solver config.
-    // Currently all paths use Poisson metric — the eigenstructure is dominated
-    // by cross-section contrast, not noise weighting.  When per-pixel
-    // uncertainties become available, the LM path should use Gaussian metric.
-    let metric = FisherMetric::Poisson;
+    // KL uses Poisson weighting: F_{ij} = Σ σ_i·σ_j·T(E)
+    // LM uses Gaussian weighting: F_{ij} = Σ σ_i·σ_j·T²(E)/σ²(E)
+    //
+    // For LM with transmission data, compute spatially-averaged
+    // uncertainty per energy bin from the input data.
+    // For counts data or when uncertainty is not available, fall back
+    // to Poisson metric (the eigenstructure is dominated by cross-section
+    // contrast, so the difference is typically small).
+    let metric = match config.solver() {
+        crate::pipeline::SolverConfig::PoissonKL(_) | crate::pipeline::SolverConfig::Auto => {
+            FisherMetric::Poisson
+        }
+        crate::pipeline::SolverConfig::LevenbergMarquardt(_) => {
+            if let InputData3D::Transmission { uncertainty, .. } = input {
+                let (n_e_shape, height, width) = input.shape();
+                let n_pixels = height * width;
+                let n_e = n_e_shape.min(config.energies().len());
+                let sigma_obs: Vec<f64> = (0..n_e)
+                    .map(|e| {
+                        let mut sum = 0.0;
+                        for y in 0..height {
+                            for x in 0..width {
+                                sum += uncertainty[[e, y, x]];
+                            }
+                        }
+                        (sum / n_pixels as f64).max(1e-10)
+                    })
+                    .collect();
+                FisherMetric::Gaussian { sigma_obs }
+            } else {
+                // Counts + LM: fall back to Poisson metric
+                FisherMetric::Poisson
+            }
+        }
+    };
 
     let fisher = if let Some(bg) = config.transmission_background() {
         let anorm_init = bg.anorm_init;
