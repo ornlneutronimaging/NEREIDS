@@ -835,8 +835,10 @@ pub fn poisson_fit_analytic(
             params.all_values_into(&mut all_vals_buf);
             let t_current = all_vals_buf[ctx.temperature_index];
             if !last_temperature.is_finite() || (t_current - last_temperature).abs() > 1e-15 {
+                // Use analytical derivative (1× broadening) when base_xs
+                // is available, fall back to FD (3×) otherwise.
                 let (xs_new, dxs_new) = if let Some(ref base) = ctx.base_xs {
-                    transmission::broadened_cross_sections_with_derivative_from_base(
+                    transmission::broadened_cross_sections_with_analytical_derivative_from_base(
                         &ctx.energies,
                         base,
                         &ctx.resonance_data,
@@ -1494,8 +1496,10 @@ pub(crate) fn poisson_fit_lbfgsb(
         if let Some(ctx) = &temp_ctx {
             let t_current = all_vals_buf[ctx.temperature_index];
             if !last_temperature.is_finite() || (t_current - last_temperature).abs() > 1e-15 {
+                // Use analytical derivative (1× broadening) when base_xs
+                // is available, fall back to FD (3×) otherwise.
                 let (xs_new, dxs_new) = if let Some(ref base) = ctx.base_xs {
-                    transmission::broadened_cross_sections_with_derivative_from_base(
+                    transmission::broadened_cross_sections_with_analytical_derivative_from_base(
                         &ctx.energies,
                         base,
                         &ctx.resonance_data,

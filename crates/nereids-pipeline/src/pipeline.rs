@@ -566,10 +566,12 @@ fn fit_transmission_poisson(
     config: &UnifiedFitConfig,
     poisson_cfg: &PoissonConfig,
 ) -> Result<SpectrumFitResult, PipelineError> {
-    if config.fit_temperature {
+    // KL+BG+temperature is not supported (NormalizedTransmissionModel
+    // doesn't support temperature in the Poisson gradient path).
+    if config.fit_temperature && config.transmission_background.is_some() {
         return Err(PipelineError::InvalidParameter(
-            "Poisson KL on transmission does not support temperature fitting. \
-             Use solver='lm' or provide counts data."
+            "Poisson KL with background + temperature fitting is not supported. \
+             Use KL without background, or LM with background."
                 .into(),
         ));
     }
@@ -578,13 +580,24 @@ fn fit_transmission_poisson(
 
     let mut param_vec = build_density_params(config);
 
+    // Temperature parameter (appended after densities, before background).
+    let temperature_index = if config.fit_temperature {
+        let idx = param_vec.len();
+        param_vec.push(FitParameter {
+            name: "temperature_k".into(),
+            value: config.temperature_k,
+            lower: 1.0,
+            upper: 5000.0,
+            fixed: false,
+        });
+        Some(idx)
+    } else {
+        None
+    };
+
     // KL background model: T_out = T_inner + b₀ + b₁/√E
-    // Uses 2 non-negative parameters instead of SAMMY's 4-parameter
-    // polynomial (which is incompatible with Poisson NLL due to
-    // potentially negative T_out values).
     let bg_base = param_vec.len();
     let kl_bg = if config.transmission_background.is_some() {
-        // b₀: constant additive background [0, 0.5]
         param_vec.push(FitParameter {
             name: "kl_b0".into(),
             value: 0.0,
@@ -592,7 +605,6 @@ fn fit_transmission_poisson(
             upper: 0.5,
             fixed: false,
         });
-        // b₁: 1/√E background [0, 0.5]
         param_vec.push(FitParameter {
             name: "kl_b1".into(),
             value: 0.0,
@@ -607,7 +619,27 @@ fn fit_transmission_poisson(
 
     let mut params = ParameterSet::new(param_vec);
 
-    let model = build_transmission_model(config, n_isotopes, None)?;
+    let model = build_transmission_model(config, n_isotopes, temperature_index)?;
+
+    // Build TemperatureContext for analytical gradient.
+    let temp_ctx = if config.fit_temperature {
+        Some(poisson::TemperatureContext {
+            temperature_index: temperature_index.unwrap(),
+            resonance_data: config.resonance_data().to_vec(),
+            energies: config.energies().to_vec(),
+            instrument: config.resolution.as_ref().map(|r| InstrumentParams {
+                resolution: r.clone(),
+            }),
+            base_xs: config.precomputed_base_xs.clone(),
+        })
+    } else {
+        None
+    };
+
+    // Get cross-sections for the analytical gradient path.
+    let xs = get_or_compute_cross_sections(config)?;
+    let density_indices: Vec<usize> = (0..n_isotopes).collect();
+    let flux_ones = vec![1.0; config.energies().len()]; // transmission: flux=1
 
     // Dispatch with KL-native background model
     let result = if let Some((b0_idx, b1_idx)) = kl_bg {
@@ -625,20 +657,29 @@ fn fit_transmission_poisson(
         let pr = poisson::poisson_fit(&wrapped, measured_t, &mut params, poisson_cfg)?;
         poisson_to_lm_result(&wrapped, measured_t, sigma, &pr, &params)
     } else {
-        let pr = poisson::poisson_fit(&*model, measured_t, &mut params, poisson_cfg)?;
+        // Use poisson_fit_analytic for density+temperature joint fitting.
+        let pr = poisson::poisson_fit_analytic(
+            &*model,
+            measured_t,
+            &flux_ones,
+            &xs,
+            &density_indices,
+            &mut params,
+            poisson_cfg,
+            temp_ctx.as_ref(),
+        )?;
         poisson_to_lm_result(&*model, measured_t, sigma, &pr, &params)
     }?;
 
-    // Map KL background params to SpectrumFitResult format.
-    // KL model has (b0, b1) not (anorm, backA, backB, backC).
-    // Store b0 in anorm slot, b1 in background[0] for now.
-    // TODO: clean up result format for KL background.
     let densities: Vec<f64> = (0..n_isotopes).map(|i| result.params[i]).collect();
     let uncertainties = result.covariance.as_ref().map(|cov| {
         (0..n_isotopes)
             .map(|i| cov.get(i, i).sqrt())
             .collect::<Vec<_>>()
     });
+
+    // Extract temperature from result if fitted.
+    let fitted_temp = temperature_index.map(|idx| result.params[idx]);
 
     if let Some((b0_idx, b1_idx)) = kl_bg {
         let b0 = result.params[b0_idx];
@@ -649,13 +690,17 @@ fn fit_transmission_poisson(
             reduced_chi_squared: result.reduced_chi_squared,
             converged: result.converged,
             iterations: result.iterations,
-            temperature_k: None,
+            temperature_k: fitted_temp,
             temperature_k_unc: None,
-            anorm: 1.0,                // KL doesn't use anorm
-            background: [b0, b1, 0.0], // b0, b1 stored in background slots
+            anorm: 1.0,
+            background: [b0, b1, 0.0],
         })
     } else {
-        extract_result(config, &result, n_isotopes, None)
+        let mut sr = extract_result(config, &result, n_isotopes, None)?;
+        if let Some(t) = fitted_temp {
+            sr.temperature_k = Some(t);
+        }
+        Ok(sr)
     }
 }
 
@@ -667,17 +712,25 @@ fn fit_counts_poisson(
     config: &UnifiedFitConfig,
     poisson_cfg: &PoissonConfig,
 ) -> Result<SpectrumFitResult, PipelineError> {
-    if config.fit_temperature {
-        return Err(PipelineError::InvalidParameter(
-            "Temperature fitting is not yet supported for the counts+KL path. \
-             Use fixed temperature or provide transmission data with solver='lm'."
-                .into(),
-        ));
-    }
-
     let n_isotopes = config.resonance_data().len();
 
-    let param_vec = build_density_params(config);
+    let mut param_vec = build_density_params(config);
+
+    // Temperature parameter (after densities).
+    let temperature_index = if config.fit_temperature {
+        let idx = param_vec.len();
+        param_vec.push(FitParameter {
+            name: "temperature_k".into(),
+            value: config.temperature_k,
+            lower: 1.0,
+            upper: 5000.0,
+            fixed: false,
+        });
+        Some(idx)
+    } else {
+        None
+    };
+
     let mut params = ParameterSet::new(param_vec);
 
     // Build precomputed transmission model
@@ -696,6 +749,21 @@ fn fit_counts_poisson(
         background,
     };
 
+    // Build TemperatureContext for analytical gradient.
+    let temp_ctx = if config.fit_temperature {
+        Some(poisson::TemperatureContext {
+            temperature_index: temperature_index.unwrap(),
+            resonance_data: config.resonance_data().to_vec(),
+            energies: config.energies().to_vec(),
+            instrument: config.resolution.as_ref().map(|r| InstrumentParams {
+                resolution: r.clone(),
+            }),
+            base_xs: config.precomputed_base_xs.clone(),
+        })
+    } else {
+        None
+    };
+
     let pr = poisson::poisson_fit_analytic(
         &counts_model,
         sample_counts,
@@ -704,7 +772,7 @@ fn fit_counts_poisson(
         &density_indices,
         &mut params,
         poisson_cfg,
-        None, // no temperature context for now
+        temp_ctx.as_ref(),
     )?;
 
     // Compute Pearson chi-squared for display
@@ -721,17 +789,15 @@ fn fit_counts_poisson(
         .sum();
 
     let densities: Vec<f64> = (0..n_isotopes).map(|i| pr.params[i]).collect();
+    let fitted_temp = temperature_index.map(|idx| pr.params[idx]);
 
     Ok(SpectrumFitResult {
         densities,
-        // Poisson KL does not produce a covariance matrix — uncertainties
-        // require Fisher information inversion (not yet implemented for the
-        // counts path).
         uncertainties: None,
         reduced_chi_squared: chi_sq / dof as f64,
         converged: pr.converged,
         iterations: pr.iterations,
-        temperature_k: None,
+        temperature_k: fitted_temp,
         temperature_k_unc: None,
         anorm: 1.0,
         background: [0.0, 0.0, 0.0],
