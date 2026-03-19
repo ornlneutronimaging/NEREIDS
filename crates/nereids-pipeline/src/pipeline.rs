@@ -733,18 +733,17 @@ fn fit_counts_poisson(
 
     let mut params = ParameterSet::new(param_vec);
 
-    // Build precomputed transmission model
+    // Build transmission model — use TransmissionFitModel when fitting
+    // temperature (it rebroadens on each evaluate), PrecomputedTransmissionModel
+    // when temperature is fixed (faster, uses cached cross-sections).
     let xs = get_or_compute_cross_sections(config)?;
     let density_indices: Vec<usize> = (0..n_isotopes).collect();
 
-    let t_model = PrecomputedTransmissionModel {
-        cross_sections: xs.clone(),
-        density_indices: Arc::new(density_indices.clone()),
-    };
+    let t_model = build_transmission_model(config, n_isotopes, temperature_index)?;
 
     // Wrap in counts model: Y = flux * T(theta) + background
     let counts_model = poisson::CountsModel {
-        transmission_model: &t_model,
+        transmission_model: &*t_model,
         flux,
         background,
     };
