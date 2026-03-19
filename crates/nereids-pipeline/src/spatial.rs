@@ -490,7 +490,7 @@ pub fn fit_roi(
 
 // ── Phase 3: InputData3D + spatial_map_typed ─────────────────────────────
 
-use crate::pipeline::{InputData, UnifiedFitConfig, fit_spectrum_typed};
+use crate::pipeline::{InputData, SolverConfig, UnifiedFitConfig, fit_spectrum_typed};
 
 /// 3D input data for spatial mapping.
 ///
@@ -724,12 +724,26 @@ pub fn spatial_map_typed(
 
             // Build per-pixel 1D InputData
             let pixel_input = if is_counts {
-                // Use spatially-averaged flux (not per-pixel open beam) to avoid
-                // open-beam shot noise contaminating the density fit.
-                InputData::CountsWithNuisance {
-                    sample_counts: spectrum_a.iter().map(|&v| v.max(0.0)).collect(),
-                    flux: averaged_flux.as_ref().unwrap().clone(),
-                    background: background_zeros.clone(),
+                let sample_clamped: Vec<f64> = spectrum_a.iter().map(|&v| v.max(0.0)).collect();
+                let ob_spectrum: Vec<f64> = data_b.slice(s![y, x, ..]).to_vec();
+
+                // Check effective solver: KL uses CountsWithNuisance (averaged
+                // flux), LM uses raw Counts (auto-converts to transmission
+                // inside fit_spectrum_typed).
+                let effective = fast_config.effective_solver(&InputData::Counts {
+                    sample_counts: sample_clamped.clone(),
+                    open_beam_counts: ob_spectrum.clone(),
+                });
+                match effective {
+                    SolverConfig::PoissonKL(_) => InputData::CountsWithNuisance {
+                        sample_counts: sample_clamped,
+                        flux: averaged_flux.as_ref().unwrap().clone(),
+                        background: background_zeros.clone(),
+                    },
+                    _ => InputData::Counts {
+                        sample_counts: sample_clamped,
+                        open_beam_counts: ob_spectrum,
+                    },
                 }
             } else {
                 let spectrum_b: Vec<f64> = data_b

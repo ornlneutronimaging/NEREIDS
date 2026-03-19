@@ -363,7 +363,7 @@ impl UnifiedFitConfig {
     }
 
     /// Resolve `SolverConfig::Auto` into a concrete solver for the given input.
-    fn effective_solver(&self, input: &InputData) -> SolverConfig {
+    pub(crate) fn effective_solver(&self, input: &InputData) -> SolverConfig {
         match &self.solver {
             SolverConfig::Auto => {
                 if input.is_counts() {
