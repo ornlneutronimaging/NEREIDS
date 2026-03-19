@@ -922,12 +922,142 @@ pub fn broadened_cross_sections_from_base(
         .collect()
 }
 
-/// Compute broadened cross-sections and their temperature derivative from
-/// precomputed unbroadened cross-sections.
+/// Compute broadened cross-sections and their **analytical** temperature
+/// derivative from precomputed unbroadened cross-sections.
 ///
-/// Like [`broadened_cross_sections_with_derivative`] but skips the expensive
-/// Reich-Moore calculation. Three calls to [`broadened_cross_sections_from_base`]
-/// at T, T+dT, T−dT.
+/// Uses `doppler_broaden_with_derivative` for exact ∂σ/∂T in a single pass
+/// (1× broadening), replacing the 3× FD approach. Resolution broadening is
+/// applied to both σ and ∂σ/∂T (valid because resolution is a linear operator).
+///
+/// Returns the same `BroadenedXsWithDerivative` type as the FD version.
+pub fn broadened_cross_sections_with_analytical_derivative_from_base(
+    energies: &[f64],
+    base_xs: &[Vec<f64>],
+    resonance_data: &[ResonanceData],
+    temperature_k: f64,
+    instrument: Option<&InstrumentParams>,
+) -> Result<BroadenedXsWithDerivative, TransmissionError> {
+    if base_xs.len() != resonance_data.len() {
+        return Err(TransmissionError::InputMismatch(format!(
+            "base_xs has {} isotopes but resonance_data has {}",
+            base_xs.len(),
+            resonance_data.len(),
+        )));
+    }
+    for (i, row) in base_xs.iter().enumerate() {
+        if row.len() != energies.len() {
+            return Err(TransmissionError::InputMismatch(format!(
+                "base_xs[{i}] has {} energies but expected {}",
+                row.len(),
+                energies.len(),
+            )));
+        }
+    }
+    if instrument.is_some() && !energies.windows(2).all(|w| w[0] <= w[1]) {
+        return Err(ResolutionError::UnsortedEnergies.into());
+    }
+
+    // Build auxiliary grid (same as broadened_cross_sections_from_base).
+    let rd_refs: Vec<&ResonanceData> = resonance_data.iter().collect();
+    let ext_grid = build_aux_grid(energies, instrument, &rd_refs);
+    let is_data_point: Option<Vec<bool>> = ext_grid.as_ref().map(|(ext_e, di)| {
+        let mut mask = vec![false; ext_e.len()];
+        for &idx in di {
+            mask[idx] = true;
+        }
+        mask
+    });
+
+    // Per-isotope: Doppler broaden with analytical derivative, then resolution.
+    type IsotopeXsDxs = Result<(Vec<f64>, Vec<f64>), TransmissionError>;
+    let results: Vec<IsotopeXsDxs> = base_xs
+        .par_iter()
+        .zip(resonance_data.par_iter())
+        .map(|(xs_raw, rd)| {
+            if let Some((ref ext_energies, ref data_indices)) = ext_grid {
+                let inst = instrument.unwrap();
+                let mask = is_data_point.as_ref().unwrap();
+
+                // Build extended XS on auxiliary grid.
+                let mut xs_ext = vec![0.0f64; ext_energies.len()];
+                for (data_i, &ext_i) in data_indices.iter().enumerate() {
+                    xs_ext[ext_i] = xs_raw[data_i];
+                }
+                for (j, &e) in ext_energies.iter().enumerate() {
+                    if !mask[j] {
+                        xs_ext[j] = reich_moore::cross_sections_at_energy(rd, e).total;
+                    }
+                }
+
+                // Doppler broaden + analytical derivative in one pass.
+                let (after_doppler, dxs_dt_doppler) = if temperature_k > 0.0 {
+                    let params = DopplerParams::new(temperature_k, rd.awr)?;
+                    doppler::doppler_broaden_with_derivative(ext_energies, &xs_ext, &params)?
+                } else {
+                    (xs_ext, vec![0.0; ext_energies.len()])
+                };
+
+                // Resolution broadening on both σ and ∂σ/∂T (linear operator).
+                let broadened = resolution::apply_resolution_presorted(
+                    ext_energies,
+                    &after_doppler,
+                    &inst.resolution,
+                );
+                let dxs_dt_broadened = resolution::apply_resolution_presorted(
+                    ext_energies,
+                    &dxs_dt_doppler,
+                    &inst.resolution,
+                );
+
+                // Extract data-grid points from extended grid.
+                let xs: Vec<f64> = data_indices.iter().map(|&i| broadened[i]).collect();
+                let dxs: Vec<f64> = data_indices.iter().map(|&i| dxs_dt_broadened[i]).collect();
+                Ok((xs, dxs))
+            } else {
+                // No auxiliary grid — data grid directly.
+                let (after_doppler, dxs_dt_doppler) = if temperature_k > 0.0 {
+                    let params = DopplerParams::new(temperature_k, rd.awr)?;
+                    doppler::doppler_broaden_with_derivative(energies, xs_raw, &params)?
+                } else {
+                    (xs_raw.clone(), vec![0.0; energies.len()])
+                };
+                let (xs, dxs) = if let Some(inst) = instrument {
+                    let xs = resolution::apply_resolution_presorted(
+                        energies,
+                        &after_doppler,
+                        &inst.resolution,
+                    );
+                    let dxs = resolution::apply_resolution_presorted(
+                        energies,
+                        &dxs_dt_doppler,
+                        &inst.resolution,
+                    );
+                    (xs, dxs)
+                } else {
+                    (after_doppler, dxs_dt_doppler)
+                };
+                Ok((xs, dxs))
+            }
+        })
+        .collect();
+
+    // Separate into (xs_all, dxs_all).
+    let mut xs_all = Vec::with_capacity(base_xs.len());
+    let mut dxs_all = Vec::with_capacity(base_xs.len());
+    for r in results {
+        let (xs, dxs) = r?;
+        xs_all.push(xs);
+        dxs_all.push(dxs);
+    }
+    Ok((xs_all, dxs_all))
+}
+
+/// Compute broadened cross-sections and their temperature derivative from
+/// precomputed unbroadened cross-sections using **finite differences**.
+///
+/// Three calls to [`broadened_cross_sections_from_base`] at T, T+dT, T−dT.
+/// Prefer [`broadened_cross_sections_with_analytical_derivative_from_base`]
+/// for exact derivatives at 1/3 the cost.
 pub fn broadened_cross_sections_with_derivative_from_base(
     energies: &[f64],
     base_xs: &[Vec<f64>],
