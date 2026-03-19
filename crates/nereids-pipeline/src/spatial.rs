@@ -674,11 +674,24 @@ pub fn spatial_map_typed(
         }
     };
 
-    // Build a config with precomputed XS and covariance disabled
-    let fast_config = config
-        .clone()
-        .with_precomputed_cross_sections(xs)
-        .with_compute_covariance(false);
+    // Precompute unbroadened (base) cross-sections for temperature fitting.
+    // This avoids 74× overhead from redundant Reich-Moore evaluation per
+    // KL iteration (112ms Reich-Moore vs 1.5ms Doppler rebroadening).
+    let fast_config = if config.fit_temperature() {
+        let base_xs: Vec<Vec<f64>> =
+            unbroadened_cross_sections(config.energies(), config.resonance_data(), cancel)
+                .map_err(PipelineError::Transmission)?;
+        config
+            .clone()
+            .with_precomputed_cross_sections(xs)
+            .with_precomputed_base_xs(Arc::new(base_xs))
+            .with_compute_covariance(false)
+    } else {
+        config
+            .clone()
+            .with_precomputed_cross_sections(xs)
+            .with_compute_covariance(false)
+    };
 
     let is_counts = input.is_counts();
     let has_transmission_bg = config.transmission_background().is_some();
