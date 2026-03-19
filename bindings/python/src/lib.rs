@@ -30,7 +30,7 @@
 //!
 //! # Compute transmission spectrum
 //! energies = np.linspace(1.0, 30.0, 1000)
-//! transmission = nereids.forward_model(energies, [(isotope, 0.001)], temperature_k=300.0)
+//! transmission = nereids.forward_model(energies, [(isotope, 0.001)], temperature_k=293.6)
 //!
 //! # Fit a measured spectrum (LM solver, default)
 //! result = nereids.fit_spectrum(measured_t, sigma, energies, [isotope])
@@ -695,7 +695,7 @@ fn cross_sections<'py>(
 /// Returns:
 ///     1D numpy array of transmission values.
 #[pyfunction]
-#[pyo3(signature = (energies, isotopes, temperature_k=0.0, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, delta_e_us=None))]
+#[pyo3(signature = (energies, isotopes, temperature_k=293.6, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, delta_e_us=None))]
 fn forward_model<'py>(
     py: Python<'py>,
     energies: PyReadonlyArray1<f64>,
@@ -769,7 +769,7 @@ fn forward_model<'py>(
 /// Returns:
 ///     FitResult with densities, uncertainties, and fit quality.
 #[pyfunction]
-#[pyo3(signature = (measured_t, sigma, energies, isotopes, temperature_k=0.0, initial_densities=None, max_iter=100, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, delta_e_us=None, fit_temperature=false, fitter="lm", background=false))]
+#[pyo3(signature = (measured_t, sigma, energies, isotopes, temperature_k=293.6, initial_densities=None, max_iter=100, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, delta_e_us=None, fit_temperature=false, fitter="lm", background=false))]
 fn fit_spectrum(
     py: Python<'_>,
     measured_t: PyReadonlyArray1<f64>,
@@ -1787,7 +1787,7 @@ fn py_apply_resolution<'py>(
 ///     SpatialResult (fitter='lm', or fitter='poisson' with background=True)
 ///     or SparseResult (fitter='poisson' without background).
 #[pyfunction]
-#[pyo3(name = "spatial_map", signature = (transmission, uncertainty, energies, isotopes, temperature_k=300.0, initial_densities=None, dead_pixels=None, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, delta_e_us=None, max_iter=100, fitter="lm", roi=None, background=false))]
+#[pyo3(name = "spatial_map", signature = (transmission, uncertainty, energies, isotopes, temperature_k=293.6, initial_densities=None, dead_pixels=None, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, delta_e_us=None, max_iter=100, fitter="lm", roi=None, background=false))]
 fn py_spatial_map(
     py: Python<'_>,
     transmission: PyReadonlyArray3<f64>,
@@ -2101,7 +2101,7 @@ fn py_spatial_map(
 /// Returns:
 ///     RegularizedResult with density maps, uncertainty maps, and diagnostics.
 #[pyfunction]
-#[pyo3(name = "spatial_map_regularized", signature = (transmission, uncertainty, energies, isotopes, temperature_k=300.0, initial_densities=None, dead_pixels=None, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, delta_e_us=None, max_iter=100, fitter="lm", threshold=0.05, smooth_iter=10, compute_uncertainty=true, regularize_temperature=true, background=false))]
+#[pyo3(name = "spatial_map_regularized", signature = (transmission, uncertainty, energies, isotopes, temperature_k=293.6, initial_densities=None, dead_pixels=None, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, delta_e_us=None, max_iter=100, fitter="lm", threshold=0.05, smooth_iter=10, compute_uncertainty=true, regularize_temperature=true, background=false))]
 fn py_spatial_map_regularized(
     py: Python<'_>,
     transmission: PyReadonlyArray3<f64>,
@@ -2331,7 +2331,7 @@ fn py_spatial_map_regularized(
 /// Returns:
 ///     FitResult with densities, uncertainties, and fit quality.
 #[pyfunction]
-#[pyo3(name = "fit_roi", signature = (transmission, uncertainty, y_range, x_range, energies, isotopes, temperature_k=300.0, initial_densities=None, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, delta_e_us=None, max_iter=100))]
+#[pyo3(name = "fit_roi", signature = (transmission, uncertainty, y_range, x_range, energies, isotopes, temperature_k=293.6, initial_densities=None, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, delta_e_us=None, max_iter=100))]
 fn py_fit_roi(
     py: Python<'_>,
     transmission: PyReadonlyArray3<f64>,
@@ -3009,7 +3009,7 @@ fn py_trace_detectability_survey(
 ///     List of 1D numpy arrays (one per isotope), each containing the broadened
 ///     total cross-section in barns on the supplied energy grid.
 #[pyfunction]
-#[pyo3(signature = (energies, isotopes, temperature_k=0.0, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, delta_e_us=None))]
+#[pyo3(signature = (energies, isotopes, temperature_k=293.6, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, delta_e_us=None))]
 fn precompute_cross_sections<'py>(
     py: Python<'py>,
     energies: PyReadonlyArray1<f64>,
