@@ -346,6 +346,8 @@ struct PySpatialResult {
     n_total: usize,
     isotope_names: Vec<String>,
     shape: (usize, usize),
+    /// Per-pixel fitted temperature (None when fit_temperature=False).
+    temperature_map: Option<Py<PyArray2<f64>>>,
     /// Per-pixel normalization factor (None when background=False).
     anorm_map: Option<Py<PyArray2<f64>>>,
     /// Per-pixel background parameters [BackA, BackB, BackC] (None when background=False).
@@ -400,6 +402,12 @@ impl PySpatialResult {
     #[getter]
     fn isotope_names(&self) -> Vec<String> {
         self.isotope_names.clone()
+    }
+
+    /// Per-pixel fitted temperature map (None when fit_temperature=False).
+    #[getter]
+    fn temperature_map<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray2<f64>>> {
+        self.temperature_map.as_ref().map(|m| m.bind(py).clone())
     }
 
     /// Per-pixel normalization factor Anorm (None when background fitting was disabled).
@@ -1986,6 +1994,9 @@ fn py_spatial_map(
             n_total: result.n_total,
             isotope_names: result.isotope_labels,
             shape,
+            temperature_map: result
+                .temperature_map
+                .map(|m| PyArray2::from_owned_array(py, m).unbind()),
             anorm_map: result
                 .anorm_map
                 .map(|m| PyArray2::from_owned_array(py, m).unbind()),
@@ -3378,7 +3389,8 @@ fn py_from_transmission<'py>(
 #[pyfunction]
 #[pyo3(name = "spatial_map_typed", signature = (
     data, energies, isotopes, *,
-    temperature_k = 300.0,
+    temperature_k = 293.6,
+    fit_temperature = false,
     initial_densities = None,
     dead_pixels = None,
     max_iter = 200,
@@ -3398,6 +3410,7 @@ fn py_spatial_map_typed<'py>(
     energies: PyReadonlyArray1<'py, f64>,
     isotopes: Vec<PyResonanceData>,
     temperature_k: f64,
+    fit_temperature: bool,
     initial_densities: Option<Vec<f64>>,
     dead_pixels: Option<PyReadonlyArray2<'py, bool>>,
     max_iter: usize,
@@ -3480,6 +3493,11 @@ fn py_spatial_map_typed<'py>(
     };
     config = config.with_solver(solver_config);
 
+    // Temperature fitting
+    if fit_temperature {
+        config = config.with_fit_temperature(true);
+    }
+
     // Background (transmission only)
     if background {
         if data.kind == "counts" {
@@ -3557,6 +3575,11 @@ fn py_spatial_map_typed<'py>(
         ]
     });
 
+    let temperature_map = result
+        .temperature_map
+        .as_ref()
+        .map(|m| PyArray2::from_array(py, m).into());
+
     Ok(PySpatialResult {
         density_maps,
         uncertainty_maps,
@@ -3566,6 +3589,7 @@ fn py_spatial_map_typed<'py>(
         n_total: result.n_total,
         isotope_names: result.isotope_labels,
         shape,
+        temperature_map,
         anorm_map,
         background_maps,
     })

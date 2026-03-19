@@ -713,6 +713,7 @@ def spatial_map_typed(
     isotopes: list[ResonanceData],
     *,
     temperature_k: float = 293.6,
+    fit_temperature: bool = False,
     initial_densities: list[float] | None = None,
     dead_pixels: NDArray[np.bool_] | None = None,
     max_iter: int = 200,
