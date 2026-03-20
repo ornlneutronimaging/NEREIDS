@@ -48,40 +48,17 @@ plt.tight_layout()
 plt.show()
 ```
 
-## Fit a Measured Spectrum
-
-```python
-# Simulate noisy measurement
-sigma = np.full_like(transmission, 0.01)
-noise = np.random.normal(0, 0.01, size=transmission.shape)
-measured = np.clip(transmission + noise, 0, 1)
-
-# Fit to recover the density
-result = nereids.fit_spectrum(
-    measured, sigma, energies, [u238],
-    temperature_k=300.0,
-    flight_path_m=25.0,
-    delta_t_us=5.0,
-    delta_l_m=0.005,
-)
-
-print(f"Fitted density: {result.densities[0]:.6f} atoms/barn")
-print(f"Uncertainty:    {result.uncertainties[0]:.6f}")
-print(f"Reduced chi^2:  {result.reduced_chi_squared:.3f}")
-print(f"Converged:      {result.converged}")
-```
-
 ## Spatial Mapping
 
-For imaging data (3D transmission arrays), use `spatial_map`:
+For imaging data (3D transmission arrays), use the typed API:
 
 ```python
 # transmission_3d: shape (n_energies, height, width)
 # uncertainty_3d:  shape (n_energies, height, width)
 
-result = nereids.spatial_map(
-    transmission_3d,
-    uncertainty_3d,
+data = nereids.from_transmission(transmission_3d, uncertainty_3d)
+result = nereids.spatial_map_typed(
+    data,
     energies,
     [u238],
     temperature_k=300.0,
@@ -93,6 +70,13 @@ result = nereids.spatial_map(
 # result.density_maps[0] is a 2D array of U-238 areal density at each pixel
 # result.converged_map shows which pixels converged
 print(f"Converged: {result.n_converged}/{result.n_total} pixels")
+```
+
+For raw count data (Poisson-optimal fitting):
+
+```python
+data = nereids.from_counts(sample_counts_3d, open_beam_counts_3d)
+result = nereids.spatial_map_typed(data, energies, [u238])
 ```
 
 ## Detectability Analysis

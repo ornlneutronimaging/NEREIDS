@@ -12,7 +12,7 @@ use crate::widgets::image_view::{
 };
 use egui_plot::{Line, Plot, PlotPoints, VLine};
 use ndarray::Axis;
-use nereids_pipeline::pipeline::FitConfig;
+use nereids_pipeline::pipeline::{BackgroundConfig, InputData, SolverConfig, UnifiedFitConfig};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -195,24 +195,6 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
                     );
                 });
             }
-        });
-    }
-
-    // -- Spatial regularization --
-    ui.add_space(4.0);
-    ui.checkbox(&mut state.regularize, "Spatial regularization");
-    if state.regularize {
-        ui.horizontal(|ui| {
-            ui.label("Threshold:");
-            ui.add(
-                egui::DragValue::new(&mut state.regularization_threshold)
-                    .range(0.01..=0.5)
-                    .speed(0.01),
-            );
-        });
-        ui.horizontal(|ui| {
-            ui.label("Smooth iter:");
-            ui.add(egui::DragValue::new(&mut state.regularization_smooth_iter).range(1..=50));
         });
     }
 
@@ -746,7 +728,7 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
 
 // ---- Fit Helpers ----
 
-fn build_fit_config(state: &AppState) -> Result<FitConfig, String> {
+fn build_fit_config(state: &AppState) -> Result<UnifiedFitConfig, String> {
     let energies = state
         .energies
         .as_ref()
@@ -777,37 +759,34 @@ fn build_fit_config(state: &AppState) -> Result<FitConfig, String> {
     )
     .map_err(|e| format!("{e} \u{2014} load a resolution file or disable broadening"))?;
 
-    let mut config = FitConfig::new(
+    let mut config = UnifiedFitConfig::new(
         energies,
         resonance_data,
         isotope_names,
         state.temperature_k,
         resolution,
         initial_densities,
-        state.lm_config.clone(),
     )
-    .map_err(|e| format!("FitConfig validation error: {e}"))?;
+    .map_err(|e| format!("Config validation error: {e}"))?;
 
     config = config.with_compute_covariance(state.lm_config.compute_covariance);
 
-    #[allow(deprecated)] // GUI still uses old FitConfig API; will migrate in future
-    if state.solver_method == SolverMethod::PoissonKL {
-        config = config.with_solver(nereids_pipeline::pipeline::SolverChoice::PoissonKL(
-            nereids_fitting::poisson::PoissonConfig {
-                max_iter: state.lm_config.max_iter,
-                ..Default::default()
-            },
-        ));
-    }
+    let solver = if state.solver_method == SolverMethod::PoissonKL {
+        SolverConfig::PoissonKL(nereids_fitting::poisson::PoissonConfig {
+            max_iter: state.lm_config.max_iter,
+            ..Default::default()
+        })
+    } else {
+        SolverConfig::LevenbergMarquardt(state.lm_config.clone())
+    };
+    config = config.with_solver(solver);
 
     if state.fit_temperature {
-        config = config
-            .with_fit_temperature(true)
-            .map_err(|e| format!("FitConfig temperature error: {e}"))?;
+        config = config.with_fit_temperature(true);
     }
 
     if state.background_enabled {
-        config = config.with_background(nereids_pipeline::pipeline::BackgroundConfig::default());
+        config = config.with_transmission_background(BackgroundConfig::default());
     }
 
     Ok(config)
@@ -878,7 +857,12 @@ fn fit_pixel(state: &mut AppState) {
         .map(|e| e.symbol.clone())
         .collect();
 
-    let result = match nereids_pipeline::pipeline::fit_spectrum(&t_spectrum, &sigma, &config) {
+    let input = InputData::Transmission {
+        transmission: t_spectrum,
+        uncertainty: sigma,
+    };
+
+    let result = match nereids_pipeline::pipeline::fit_spectrum_typed(&input, &config) {
         Ok(r) => r,
         Err(e) => {
             let msg = format!("Fit error: {e}");
@@ -1011,7 +995,12 @@ fn fit_roi(state: &mut AppState) {
         .map(|e| e.symbol.clone())
         .collect();
 
-    let result = match nereids_pipeline::pipeline::fit_spectrum(&avg_t, &sigma, &config) {
+    let roi_input = InputData::Transmission {
+        transmission: avg_t,
+        uncertainty: sigma,
+    };
+
+    let result = match nereids_pipeline::pipeline::fit_spectrum_typed(&roi_input, &config) {
         Ok(r) => r,
         Err(e) => {
             let msg = format!("ROI fit error: {e}");
@@ -1095,11 +1084,6 @@ pub fn run_spatial_map(state: &mut AppState) {
     // Snapshot ROIs at fit time for overlay rendering in Results
     state.fitting_rois = state.rois.clone();
 
-    // Capture regularization parameters before the thread closure borrows them.
-    let state_regularize = state.regularize;
-    let state_threshold = state.regularization_threshold;
-    let state_smooth_iter = state.regularization_smooth_iter;
-
     let (tx, rx) = mpsc::channel();
     state.pending_spatial = Some(rx);
     state.is_fitting = true;
@@ -1171,60 +1155,20 @@ pub fn run_spatial_map(state: &mut AppState) {
             })
         };
 
-        // Run spatial_map on the dedicated pool so its par_iter doesn't
+        // Run spatial_map_typed on the dedicated pool so its par_iter doesn't
         // share the global pool with inner physics par_iter calls.
+        let input = nereids_pipeline::spatial::InputData3D::Transmission {
+            transmission: norm.transmission.view(),
+            uncertainty: norm.uncertainty.view(),
+        };
         let result = pool.install(|| {
-            if state_regularize {
-                use nereids_pipeline::regularization::{
-                    RegularizationConfig, spatial_map_regularized,
-                };
-                let reg_config = RegularizationConfig {
-                    threshold: state_threshold,
-                    smooth_iter: state_smooth_iter,
-                    regularize_temperature: true,
-                    compute_uncertainty: true,
-                };
-                spatial_map_regularized(
-                    norm.transmission.view(),
-                    norm.uncertainty.view(),
-                    &config,
-                    &reg_config,
-                    dead_pixels.as_ref(),
-                    Some(&cancel),
-                    Some(&progress),
-                )
-                .map(|r| {
-                    // Convert RegularizedResult to SpatialResult for the
-                    // existing result display infrastructure.
-                    // D-12: Carry anorm_map and background_maps through
-                    // instead of dropping them.
-                    nereids_pipeline::spatial::SpatialResult {
-                        density_maps: r.density_maps,
-                        uncertainty_maps: r.uncertainty_maps,
-                        chi_squared_map: r.chi_squared_map,
-                        converged_map: r.converged_map,
-                        temperature_map: r.temperature_map,
-                        isotope_labels: r.isotope_labels,
-                        anorm_map: r.anorm_map,
-                        background_maps: r.background_maps,
-                        n_converged: r.n_converged,
-                        n_total: r.n_total,
-                        nll_map: None,
-                        n_weak_directions: Some(r.n_weak_directions),
-                        fisher_eigenvalues: Some(r.fisher_eigenvalues),
-                        temperature_uncertainty_map: r.temperature_uncertainty_map,
-                    }
-                })
-            } else {
-                nereids_pipeline::spatial::spatial_map(
-                    norm.transmission.view(),
-                    norm.uncertainty.view(),
-                    &config,
-                    dead_pixels.as_ref(),
-                    Some(&cancel),
-                    Some(&progress),
-                )
-            }
+            nereids_pipeline::spatial::spatial_map_typed(
+                &input,
+                &config,
+                dead_pixels.as_ref(),
+                Some(&cancel),
+                Some(&progress),
+            )
         });
 
         // Signal watcher to stop, then send result.

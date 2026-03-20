@@ -107,9 +107,9 @@ pub struct ProjectSnapshot {
     pub n_converged: Option<usize>,
     pub n_total: Option<usize>,
     pub result_isotope_labels: Option<Vec<String>>,
-    /// D-11/D-21: Per-pixel normalization factor from regularized fitting.
+    /// Per-pixel normalization factor (background fitting).
     pub anorm_map: Option<Array2<f64>>,
-    /// D-11/D-21: Per-pixel background [A, B, C] maps from regularized fitting.
+    /// Per-pixel background [A, B, C] maps (background fitting).
     /// Stored as 3 separate Array2 maps (one per coefficient).
     pub background_maps: Option<[Array2<f64>; 3]>,
 
@@ -667,7 +667,7 @@ fn write_results(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoErro
             .map_err(|e| hdf5_err("/results/temperature", e))?;
     }
 
-    // D-11/D-21: Save anorm and background maps from regularized fitting.
+    // Save anorm and background maps from spatial fitting.
     if let Some(ref a_map) = snap.anorm_map {
         let shape = [a_map.shape()[0], a_map.shape()[1]];
         let data: Vec<f64> = a_map.iter().copied().collect();

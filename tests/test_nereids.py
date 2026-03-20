@@ -468,157 +468,7 @@ class TestResolutionBroadening:
 # ===========================================================================
 
 
-class TestFitSpectrumLM:
-    """Tests for fit_spectrum() with the LM (default) fitter."""
-
-    def test_fit_single_isotope(self, u238_data):
-        """Fit synthetic transmission with known density, recover it."""
-        energies = np.linspace(1.0, 30.0, 500)
-        true_density = 0.002
-
-        # Generate synthetic "measured" transmission
-        t = np.asarray(
-            nereids.forward_model(energies, [(u238_data, true_density)])
-        )
-        sigma = np.full_like(t, 0.005)  # 0.5% constant uncertainty
-
-        result = nereids.fit_spectrum(
-            t, sigma, energies, [u238_data], max_iter=200
-        )
-        assert result.converged
-        densities = np.asarray(result.densities)
-        assert len(densities) == 1
-        assert abs(densities[0] - true_density) / true_density < 0.05
-
-    def test_fit_result_properties(self, u238_data):
-        """Check that FitResult has all expected properties."""
-        energies = np.linspace(1.0, 30.0, 200)
-        t = np.asarray(
-            nereids.forward_model(energies, [(u238_data, 0.001)])
-        )
-        sigma = np.full_like(t, 0.01)
-
-        result = nereids.fit_spectrum(t, sigma, energies, [u238_data])
-
-        assert isinstance(result.converged, bool)
-        assert isinstance(result.iterations, int)
-        assert isinstance(result.reduced_chi_squared, float)
-        assert len(np.asarray(result.densities)) == 1
-        assert len(np.asarray(result.uncertainties)) == 1
-
-    def test_fit_repr(self, u238_data):
-        energies = np.linspace(1.0, 30.0, 200)
-        t = np.asarray(
-            nereids.forward_model(energies, [(u238_data, 0.001)])
-        )
-        sigma = np.full_like(t, 0.01)
-        result = nereids.fit_spectrum(t, sigma, energies, [u238_data])
-        r = repr(result)
-        assert "FitResult" in r
-
-    def test_fit_temperature(self, u238_data):
-        """Fit with fit_temperature=True should return temperature fields."""
-        energies = np.linspace(1.0, 30.0, 500)
-        t = np.asarray(
-            nereids.forward_model(
-                energies, [(u238_data, 0.001)], temperature_k=300.0
-            )
-        )
-        sigma = np.full_like(t, 0.005)
-
-        result = nereids.fit_spectrum(
-            t,
-            sigma,
-            energies,
-            [u238_data],
-            temperature_k=300.0,
-            fit_temperature=True,
-        )
-        assert result.temperature_k is not None
-        assert result.temperature_k_unc is not None
-
-    def test_fit_noisy_data(self, u238_data):
-        """Fit with small noise should still converge."""
-        rng = np.random.default_rng(42)
-        energies = np.linspace(1.0, 30.0, 500)
-        true_density = 0.002
-
-        t_clean = np.asarray(
-            nereids.forward_model(energies, [(u238_data, true_density)])
-        )
-        noise = rng.normal(0, 0.002, size=t_clean.shape)
-        t_noisy = np.clip(t_clean + noise, 0.01, 1.0)
-        sigma = np.full_like(t_noisy, 0.005)
-
-        result = nereids.fit_spectrum(
-            t_noisy, sigma, energies, [u238_data], max_iter=200
-        )
-        assert result.converged
-        densities = np.asarray(result.densities)
-        # Within 20% of true value (noisy data)
-        assert abs(densities[0] - true_density) / true_density < 0.20
-
-
-# ===========================================================================
-# Poisson fitting
-# ===========================================================================
-
-
-class TestFitSpectrumPoisson:
-    """Tests for fit_spectrum() with the Poisson fitter."""
-
-    def test_poisson_basic(self, u238_data):
-        """Poisson fitter with synthetic transmission data."""
-        energies = np.linspace(1.0, 30.0, 300)
-        true_density = 0.002
-        open_beam_counts = 10000.0  # high counts for easy fitting
-
-        # Build clean transmission
-        t_clean = np.asarray(
-            nereids.forward_model(energies, [(u238_data, true_density)])
-        )
-
-        # Simulate Poisson counts, then convert to transmission + uncertainty
-        rng = np.random.default_rng(123)
-        sample_counts = rng.poisson(open_beam_counts * t_clean).astype(float)
-        measured_t = sample_counts / open_beam_counts
-        sigma = np.sqrt(np.maximum(sample_counts, 1.0)) / open_beam_counts
-
-        result = nereids.fit_spectrum(
-            measured_t,
-            sigma,
-            energies,
-            [u238_data],
-            fitter="poisson",
-            max_iter=200,
-        )
-        assert result.converged
-        densities = np.asarray(result.densities)
-        assert abs(densities[0] - true_density) / true_density < 0.20
-
-    def test_poisson_result_has_nll(self, u238_data):
-        """The reduced_chi_squared field contains NLL for Poisson fits."""
-        energies = np.linspace(1.0, 30.0, 200)
-        t = np.asarray(
-            nereids.forward_model(energies, [(u238_data, 0.001)])
-        )
-        sigma = np.full_like(t, 0.01)  # unused by Poisson, required for API
-
-        result = nereids.fit_spectrum(
-            t,
-            sigma,
-            energies,
-            [u238_data],
-            fitter="poisson",
-        )
-        assert isinstance(result.reduced_chi_squared, float)
-
-    def test_invalid_fitter_raises(self, u238_data):
-        energies = np.linspace(1.0, 30.0, 100)
-        t = np.ones(100)
-        s = np.ones(100)
-        with pytest.raises(ValueError, match="fitter must be"):
-            nereids.fit_spectrum(t, s, energies, [u238_data], fitter="bogus")
+# (TestFitSpectrumLM and TestFitSpectrumPoisson removed — old fit_spectrum API deleted)
 
 
 # ===========================================================================
@@ -626,8 +476,8 @@ class TestFitSpectrumPoisson:
 # ===========================================================================
 
 
-class TestSpatialMapLM:
-    """Tests for spatial_map() with the LM fitter."""
+class TestSpatialMapTransmission:
+    """Tests for spatial_map_typed() with from_transmission (LM solver)."""
 
     def test_basic_spatial_map(self, u238_data):
         """3x3 spatial map should return correct shapes."""
@@ -635,15 +485,16 @@ class TestSpatialMapLM:
         true_density = 0.002
         ny, nx = 3, 3
 
-        # Build a (n_e, ny, nx) transmission cube
+        # Build a (n_e, ny, nx) transmission cube at 293.6 K (default)
         t_1d = np.asarray(
             nereids.forward_model(energies, [(u238_data, true_density)])
         )
         trans = np.tile(t_1d[:, None, None], (1, ny, nx))
         unc = np.full_like(trans, 0.005)
 
-        result = nereids.spatial_map(
-            trans, unc, energies, [u238_data], temperature_k=0.0, max_iter=50
+        data = nereids.from_transmission(trans, unc)
+        result = nereids.spatial_map_typed(
+            data, energies, [u238_data], max_iter=50
         )
         # Should return SpatialResult
         assert hasattr(result, "density_maps")
@@ -675,8 +526,10 @@ class TestSpatialMapLM:
         trans = np.tile(t_1d[:, None, None], (1, 2, 2))
         unc = np.full_like(trans, 0.01)
 
-        result = nereids.spatial_map(
-            trans, unc, energies, [u238_data], max_iter=20
+        data = nereids.from_transmission(trans, unc)
+        # Use default temperature_k (293.6) to match forward_model default
+        result = nereids.spatial_map_typed(
+            data, energies, [u238_data], max_iter=20
         )
         r = repr(result)
         assert "SpatialResult" in r
@@ -687,10 +540,10 @@ class TestSpatialMapLM:
 # ===========================================================================
 
 
-class TestSpatialMapPoisson:
-    """Tests for spatial_map() with the Poisson fitter."""
+class TestSpatialMapCounts:
+    """Tests for spatial_map_typed() with from_counts (Poisson KL solver)."""
 
-    def test_poisson_spatial_map(self, u238_data):
+    def test_counts_spatial_map(self, u238_data):
         """Poisson spatial map with synthetic count data."""
         energies = np.linspace(1.0, 30.0, 150)
         true_density = 0.002
@@ -698,6 +551,7 @@ class TestSpatialMapPoisson:
         n_e = len(energies)
         ny, nx = 2, 2
 
+        # Use default temperature (293.6 K) for consistency
         t_1d = np.asarray(
             nereids.forward_model(energies, [(u238_data, true_density)])
         )
@@ -709,18 +563,16 @@ class TestSpatialMapPoisson:
             for x in range(nx):
                 sample[:, y, x] = rng.poisson(flux * t_1d).astype(float)
 
-        result = nereids.spatial_map(
-            sample,
-            open_beam,
+        data = nereids.from_counts(sample, open_beam)
+        result = nereids.spatial_map_typed(
+            data,
             energies,
             [u238_data],
-            temperature_k=0.0,
-            fitter="poisson",
             max_iter=50,
         )
-        # Should return SparseResult
+        # Should return SpatialResult (typed API always returns SpatialResult)
         assert hasattr(result, "density_maps")
-        assert hasattr(result, "nll_map")
+        assert hasattr(result, "chi_squared_map")
         assert hasattr(result, "converged_map")
 
         density_maps = result.density_maps
@@ -836,85 +688,18 @@ class TestTiffIO:
 class TestErrorHandling:
     """Tests for input validation and error messages."""
 
-    def test_empty_energies_fit(self, u238_data):
-        """Empty measurement array should raise ValueError."""
-        with pytest.raises(ValueError, match="must not be empty"):
-            nereids.fit_spectrum(
-                np.array([]),
-                np.array([]),
-                np.array([]),
-                [u238_data],
-            )
-
-    def test_length_mismatch_fit(self, u238_data):
-        """Mismatched array lengths should raise ValueError."""
-        e = np.linspace(1.0, 10.0, 100)
-        t = np.ones(50)  # wrong length
-        s = np.ones(50)
-        with pytest.raises(ValueError, match="must match"):
-            nereids.fit_spectrum(t, s, e, [u238_data])
-
-    def test_sigma_mismatch_fit(self, u238_data):
-        e = np.linspace(1.0, 10.0, 100)
-        t = np.ones(100)
-        s = np.ones(50)  # wrong length
-        with pytest.raises(ValueError, match="must match"):
-            nereids.fit_spectrum(t, s, e, [u238_data])
-
-    def test_empty_isotopes_fit(self):
-        e = np.linspace(1.0, 10.0, 100)
-        t = np.ones(100)
-        s = np.ones(100)
-        with pytest.raises(ValueError, match="isotopes"):
-            nereids.fit_spectrum(t, s, e, [])
-
-    def test_invalid_temperature_fit(self, u238_data):
-        e = np.linspace(1.0, 10.0, 100)
-        t = np.ones(100)
-        s = np.ones(100)
-        with pytest.raises(ValueError, match="temperature_k"):
-            nereids.fit_spectrum(
-                t, s, e, [u238_data], temperature_k=-1.0
-            )
-
-    def test_fit_temperature_too_low(self, u238_data):
-        """fit_temperature=True with temperature_k < 1.0 should raise."""
-        e = np.linspace(1.0, 10.0, 100)
-        t = np.ones(100)
-        s = np.ones(100)
-        with pytest.raises(ValueError, match="temperature_k"):
-            nereids.fit_spectrum(
-                t, s, e, [u238_data], temperature_k=0.5, fit_temperature=True
-            )
-
-    def test_spatial_map_empty_energies(self, u238_data):
-        trans = np.ones((0, 2, 2))
-        unc = np.ones((0, 2, 2))
-        with pytest.raises(ValueError, match="energies"):
-            nereids.spatial_map(trans, unc, np.array([]), [u238_data])
-
-    def test_spatial_map_shape_mismatch(self, u238_data):
+    def test_spatial_map_typed_shape_mismatch(self, u238_data):
         e = np.linspace(1.0, 10.0, 5)
         trans = np.ones((5, 3, 3))
         unc = np.ones((5, 3, 4))  # width mismatch
         with pytest.raises(ValueError, match="shape"):
-            nereids.spatial_map(trans, unc, e, [u238_data])
+            nereids.from_transmission(trans, unc)
 
-    def test_spatial_map_empty_isotopes(self):
-        e = np.linspace(1.0, 10.0, 5)
-        trans = np.ones((5, 3, 3))
-        unc = np.ones((5, 3, 3))
-        with pytest.raises(ValueError, match="isotopes"):
-            nereids.spatial_map(trans, unc, e, [])
-
-    def test_initial_densities_mismatch(self, u238_data):
-        e = np.linspace(1.0, 10.0, 100)
-        t = np.ones(100)
-        s = np.ones(100)
-        with pytest.raises(ValueError, match="initial_densities"):
-            nereids.fit_spectrum(
-                t, s, e, [u238_data], initial_densities=[0.001, 0.002]
-            )
+    def test_spatial_map_typed_empty_spectral(self, u238_data):
+        trans = np.ones((0, 2, 2))
+        unc = np.ones((0, 2, 2))
+        with pytest.raises(ValueError, match="spectral"):
+            nereids.from_transmission(trans, unc)
 
     def test_doppler_broaden_invalid_awr(self):
         e = np.linspace(1.0, 10.0, 100)
@@ -1010,101 +795,6 @@ class TestTraceDetectability:
 
 
 # ===========================================================================
-# Spatial map regularized
 # ===========================================================================
 
 
-@pytest.fixture(scope="module")
-def w182_endf():
-    """Load W-182 ENDF data (requires network on first run, cached after)."""
-    return nereids.load_endf(74, 182)
-
-
-class TestSpatialMapRegularized:
-    """Tests for spatial_map_regularized()."""
-
-    def test_basic_regularized(self, w182_endf):
-        """Smoke test: W-182, 4x4 grid, verify result shape and finiteness."""
-        energies = np.linspace(1.0, 100.0, 50)
-        true_density = 0.001
-        ny, nx = 4, 4
-        i0 = 50.0
-
-        # Build clean transmission via forward_model
-        t_clean = np.asarray(
-            nereids.forward_model(energies, [(w182_endf, true_density)])
-        )
-
-        # Simulate Poisson-noisy counts, convert back to transmission
-        rng = np.random.default_rng(42)
-        trans = np.zeros((len(energies), ny, nx))
-        unc = np.zeros_like(trans)
-        for y in range(ny):
-            for x in range(nx):
-                counts = rng.poisson(i0 * t_clean).astype(float)
-                counts = np.maximum(counts, 1.0)
-                trans[:, y, x] = counts / i0
-                unc[:, y, x] = np.sqrt(counts) / i0
-
-        result = nereids.spatial_map_regularized(
-            trans, unc, energies, [w182_endf],
-            temperature_k=0.0, max_iter=50,
-        )
-
-        # Verify type
-        assert isinstance(result, nereids.RegularizedResult)
-
-        # Density maps: one per isotope, correct spatial shape
-        density_maps = result.density_maps
-        assert len(density_maps) == 1
-        dmap = np.asarray(density_maps[0])
-        assert dmap.shape == (ny, nx)
-        assert np.all(np.isfinite(dmap))
-
-        # Uncertainty maps: one per isotope, correct shape, finite
-        uncertainty_maps = result.uncertainty_maps
-        assert len(uncertainty_maps) == 1
-        umap = np.asarray(uncertainty_maps[0])
-        assert umap.shape == (ny, nx)
-        assert np.all(np.isfinite(umap))
-
-        # Diagnostics
-        assert result.n_weak_directions >= 0
-        fisher_eigs = np.asarray(result.fisher_eigenvalues)
-        assert len(fisher_eigs) == 1  # 1 isotope -> 1 eigenvalue
-        assert np.all(np.isfinite(fisher_eigs))
-
-        # Chi-squared and convergence maps
-        assert np.asarray(result.chi_squared_map).shape == (ny, nx)
-        assert np.asarray(result.converged_map).shape == (ny, nx)
-        assert result.n_total == ny * nx
-
-    def test_single_isotope_no_weak_directions(self, w182_endf):
-        """Single isotope: the one eigenvalue is always 'strong' (threshold < 1.0)."""
-        energies = np.linspace(1.0, 100.0, 50)
-        true_density = 0.001
-        ny, nx = 2, 2
-        i0 = 50.0
-
-        t_clean = np.asarray(
-            nereids.forward_model(energies, [(w182_endf, true_density)])
-        )
-
-        rng = np.random.default_rng(99)
-        trans = np.zeros((len(energies), ny, nx))
-        unc = np.zeros_like(trans)
-        for y in range(ny):
-            for x in range(nx):
-                counts = rng.poisson(i0 * t_clean).astype(float)
-                counts = np.maximum(counts, 1.0)
-                trans[:, y, x] = counts / i0
-                unc[:, y, x] = np.sqrt(counts) / i0
-
-        result = nereids.spatial_map_regularized(
-            trans, unc, energies, [w182_endf],
-            temperature_k=0.0, max_iter=50,
-        )
-
-        # With a single isotope, the single eigenvalue is the max eigenvalue,
-        # so threshold * max == threshold * val < val => always strong.
-        assert result.n_weak_directions == 0
