@@ -412,6 +412,54 @@ pub fn fit_spectrum_typed(
         )));
     }
 
+    // Validate auxiliary array lengths match the primary data
+    match input {
+        InputData::Transmission {
+            transmission,
+            uncertainty,
+        } => {
+            if uncertainty.len() != transmission.len() {
+                return Err(PipelineError::ShapeMismatch(format!(
+                    "uncertainty length {} != transmission length {}",
+                    uncertainty.len(),
+                    transmission.len(),
+                )));
+            }
+        }
+        InputData::Counts {
+            sample_counts,
+            open_beam_counts,
+        } => {
+            if open_beam_counts.len() != sample_counts.len() {
+                return Err(PipelineError::ShapeMismatch(format!(
+                    "open_beam_counts length {} != sample_counts length {}",
+                    open_beam_counts.len(),
+                    sample_counts.len(),
+                )));
+            }
+        }
+        InputData::CountsWithNuisance {
+            sample_counts,
+            flux,
+            background,
+        } => {
+            if flux.len() != sample_counts.len() {
+                return Err(PipelineError::ShapeMismatch(format!(
+                    "flux length {} != sample_counts length {}",
+                    flux.len(),
+                    sample_counts.len(),
+                )));
+            }
+            if background.len() != sample_counts.len() {
+                return Err(PipelineError::ShapeMismatch(format!(
+                    "background length {} != sample_counts length {}",
+                    background.len(),
+                    sample_counts.len(),
+                )));
+            }
+        }
+    }
+
     let effective_solver = config.effective_solver(input);
 
     match (input, &effective_solver) {
@@ -484,7 +532,10 @@ pub fn fit_spectrum_typed(
     }
 }
 
-/// Convert counts to transmission: T = sample/open_beam, σ = √(sample)/open_beam.
+/// Convert counts to transmission: T = sample/open_beam, σ = √(max(sample,1))/open_beam.
+///
+/// Zero-count bins (sample == 0) get σ = 1e10 so the fitter effectively ignores them.
+/// Near-zero open beam bins use a floor of 1e-10 to avoid division by zero.
 fn counts_to_transmission(sample: &[f64], open_beam: &[f64]) -> (Vec<f64>, Vec<f64>) {
     let transmission: Vec<f64> = sample
         .iter()
@@ -495,10 +546,14 @@ fn counts_to_transmission(sample: &[f64], open_beam: &[f64]) -> (Vec<f64>, Vec<f
         .iter()
         .zip(open_beam.iter())
         .map(|(&s, &ob)| {
-            if ob > 0.0 {
-                s.max(1.0).sqrt() / ob
-            } else {
+            if ob <= 0.0 {
+                // No open beam signal — treat as dead bin
                 1e30
+            } else if s <= 0.0 {
+                // Zero sample counts — large σ so the fitter ignores this bin
+                1e10
+            } else {
+                s.max(1.0).sqrt() / ob.max(1e-10)
             }
         })
         .collect();

@@ -35,6 +35,15 @@ pub struct PoissonConfig {
     pub step_size: f64,
     /// Convergence tolerance used for both parameter displacement (L2 norm of step)
     /// and gradient-norm convergence checks in `poisson_fit` and `poisson_fit_analytic`.
+    ///
+    /// This single tolerance is shared across both convergence criteria. For joint
+    /// density + temperature fitting, the Fisher preconditioning (diagonal Hessian
+    /// normalization) in `poisson_fit_analytic` compensates for the large scale
+    /// mismatch between densities (~1e-4) and temperature (~200 K), but the
+    /// convergence check itself operates on raw (unpreconditioned) parameter values.
+    /// In practice this means the step-norm test is dominated by the temperature
+    /// component; tightening `tol_param` may be needed for precise density recovery
+    /// in joint fits.
     pub tol_param: f64,
     /// Armijo line search parameter (sufficient decrease).
     pub armijo_c: f64,
@@ -391,6 +400,11 @@ fn validate_analytic_inputs(
             actual: flux.len(),
             field: "flux",
         });
+    }
+    if flux.iter().any(|&v| !v.is_finite() || v < 0.0) {
+        return Err(FittingError::InvalidConfig(format!(
+            "{caller}: flux contains non-finite or negative values"
+        )));
     }
     if density_indices.len() != cross_sections.len() {
         return Err(FittingError::LengthMismatch {

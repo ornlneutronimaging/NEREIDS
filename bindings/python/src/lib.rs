@@ -3321,9 +3321,12 @@ impl PyInputData {
 /// The fitting engine will use Poisson KL by default (statistically
 /// optimal for count data).
 ///
+/// **Note:** Both arrays must have dtype `np.float64`. Neutron event histograms
+/// are naturally `int64`; call `.astype(np.float64)` before passing them here.
+///
 /// Args:
-///     sample_counts: 3D array (n_energies, height, width) of sample counts.
-///     open_beam_counts: 3D array (n_energies, height, width) of open beam counts.
+///     sample_counts: 3D float64 array (n_energies, height, width) of sample counts.
+///     open_beam_counts: 3D float64 array (n_energies, height, width) of open beam counts.
 ///
 /// Returns:
 ///     InputData object to pass to spatial_map_typed().
@@ -3342,6 +3345,11 @@ fn py_from_counts<'py>(
             ob.shape()
         )));
     }
+    if sample.shape()[0] == 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "spectral axis (dimension 0) must have at least 1 element",
+        ));
+    }
     Ok(PyInputData {
         kind: "counts".into(),
         data_a: sample,
@@ -3354,9 +3362,12 @@ fn py_from_counts<'py>(
 /// The fitting engine will use LM by default. Pass solver="kl" to use
 /// Poisson KL instead (for low-count transmission data).
 ///
+/// **Note:** Both arrays must have dtype `np.float64`. Call `.astype(np.float64)`
+/// if your arrays are a different type.
+///
 /// Args:
-///     transmission: 3D array (n_energies, height, width) of transmission values.
-///     uncertainty: 3D array (n_energies, height, width) of uncertainties.
+///     transmission: 3D float64 array (n_energies, height, width) of transmission values.
+///     uncertainty: 3D float64 array (n_energies, height, width) of uncertainties.
 ///
 /// Returns:
 ///     InputData object to pass to spatial_map_typed().
@@ -3374,6 +3385,11 @@ fn py_from_transmission<'py>(
             t.shape(),
             u.shape()
         )));
+    }
+    if t.shape()[0] == 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "spectral axis (dimension 0) must have at least 1 element",
+        ));
     }
     Ok(PyInputData {
         kind: "transmission".into(),
