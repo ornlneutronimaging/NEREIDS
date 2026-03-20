@@ -220,7 +220,11 @@ fn isotope_chips_flow(ui: &mut egui::Ui, state: &mut AppState) -> ChipFlowResult
     let mut changed = false;
     let locked = state.is_fetching_endf;
 
+    // Constrain width so horizontal_wrapped actually wraps instead of
+    // overflowing when many isotopes are present (e.g., all Te + Pb).
+    let max_w = ui.available_width();
     ui.horizontal_wrapped(|ui| {
+        ui.set_max_width(max_w);
         for (idx, entry) in state.isotope_entries.iter_mut().enumerate() {
             ui.add_enabled_ui(!locked, |ui| {
                 let action = design::isotope_chip(
