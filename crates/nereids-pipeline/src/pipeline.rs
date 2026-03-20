@@ -641,7 +641,21 @@ fn fit_transmission_poisson(
     let density_indices: Vec<usize> = (0..n_isotopes).collect();
     let flux_ones = vec![1.0; config.energies().len()]; // transmission: flux=1
 
-    // Dispatch with KL-native background model
+    // Build KL background context for analytical gradient (if bg enabled).
+    let kl_bg_analytic = kl_bg.map(|(b0_idx, b1_idx)| {
+        let inv_sqrt_e: Vec<f64> = config
+            .energies()
+            .iter()
+            .map(|&e| 1.0 / e.max(1e-10).sqrt())
+            .collect();
+        poisson::KLBackgroundCtx {
+            b0_index: b0_idx,
+            b1_index: b1_idx,
+            inv_sqrt_energies: inv_sqrt_e,
+        }
+    });
+
+    // Build the wrapped model for evaluation (needed for both bg and no-bg paths).
     let result = if let Some((b0_idx, b1_idx)) = kl_bg {
         let inv_sqrt_e: Vec<f64> = config
             .energies()
@@ -654,10 +668,21 @@ fn fit_transmission_poisson(
             b0_index: b0_idx,
             b1_index: b1_idx,
         };
-        let pr = poisson::poisson_fit(&wrapped, measured_t, &mut params, poisson_cfg)?;
+        // T1-1: Use poisson_fit_analytic with KL background context
+        // (was poisson_fit with FD gradient, 5× slower).
+        let pr = poisson::poisson_fit_analytic(
+            &wrapped,
+            measured_t,
+            &flux_ones,
+            &xs,
+            &density_indices,
+            &mut params,
+            poisson_cfg,
+            temp_ctx.as_ref(),
+            kl_bg_analytic.as_ref(),
+        )?;
         poisson_to_lm_result(&wrapped, measured_t, sigma, &pr, &params)
     } else {
-        // Use poisson_fit_analytic for density+temperature joint fitting.
         let pr = poisson::poisson_fit_analytic(
             &*model,
             measured_t,
@@ -667,6 +692,7 @@ fn fit_transmission_poisson(
             &mut params,
             poisson_cfg,
             temp_ctx.as_ref(),
+            None,
         )?;
         poisson_to_lm_result(&*model, measured_t, sigma, &pr, &params)
     }?;
@@ -772,6 +798,7 @@ fn fit_counts_poisson(
         &mut params,
         poisson_cfg,
         temp_ctx.as_ref(),
+        None, // kl_bg_ctx
     )?;
 
     // Compute Pearson chi-squared for display
@@ -1664,6 +1691,7 @@ pub fn fit_spectrum(
                         &mut params,
                         poisson_config,
                         Some(&temp_ctx),
+                        None, // kl_bg_ctx
                     )?;
 
                     let n_free = params.n_free();

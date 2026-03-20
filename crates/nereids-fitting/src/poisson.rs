@@ -496,6 +496,9 @@ struct AnalyticGradientCtx<'a> {
     density_indices: &'a [usize],
     all_vals: &'a [f64],
     dxs_dt: &'a [Vec<f64>],
+    /// KL background: (b₀ free-index, b₁ free-index, inv_sqrt_energies).
+    /// When present, appends ∂NLL/∂b₀ and ∂NLL/∂b₁ to the gradient.
+    kl_bg: Option<(usize, usize, &'a [f64])>,
 }
 
 /// Compute the analytical gradient of the Poisson NLL w.r.t. free parameters.
@@ -550,6 +553,27 @@ fn compute_analytic_gradient(ctx: &AnalyticGradientCtx<'_>) -> Vec<f64> {
             })
             .sum();
         grad[pos] = temp_grad;
+    }
+
+    // KL background gradient: ∂NLL/∂b₀ = Σ_E (1 − y_obs/Y)
+    //                         ∂NLL/∂b₁ = Σ_E (1 − y_obs/Y) / √E
+    if let Some((b0_pos, b1_pos, inv_sqrt_e)) = ctx.kl_bg {
+        let mut gb0 = 0.0f64;
+        let mut gb1 = 0.0f64;
+        for (e, ((&obs, &ym), &ise)) in ctx
+            .y_obs
+            .iter()
+            .zip(ctx.y_model.iter())
+            .zip(inv_sqrt_e.iter())
+            .enumerate()
+        {
+            let _ = e;
+            let rf = poisson_nll_grad_term(obs, ym);
+            gb0 += rf;
+            gb1 += rf * ise;
+        }
+        grad[b0_pos] = gb0;
+        grad[b1_pos] = gb1;
     }
 
     grad
@@ -713,6 +737,18 @@ pub struct TemperatureContext {
     pub base_xs: Option<Arc<Vec<Vec<f64>>>>,
 }
 
+/// KL background context for analytical gradient computation.
+///
+/// When present, adds ∂NLL/∂b₀ and ∂NLL/∂b₁ to the gradient.
+pub struct KLBackgroundCtx {
+    /// Free-parameter index for b₀ (constant additive background).
+    pub b0_index: usize,
+    /// Free-parameter index for b₁ (1/√E additive background).
+    pub b1_index: usize,
+    /// Precomputed 1/√E for each energy bin.
+    pub inv_sqrt_energies: Vec<f64>,
+}
+
 /// Run Poisson-likelihood optimization with an analytical gradient.
 ///
 /// Equivalent to [`poisson_fit`] but replaces the finite-difference gradient
@@ -741,10 +777,8 @@ pub struct TemperatureContext {
 /// * `temp_ctx`        — Optional temperature-fitting context.  When `Some`,
 ///   the optimizer recomputes cross-sections at the current temperature each
 ///   iteration and adds a ∂NLL/∂T gradient column.
-// The 8th parameter (`temp_ctx`) extends an existing 7-param function with
-// optional temperature-fitting context.  Bundling into a config struct would
-// break all call sites for marginal gain; a single `Option` is the minimal
-// extension that keeps the existing API intact.
+/// * `kl_bg_ctx`       — Optional KL background context.  When `Some`,
+///   adds ∂NLL/∂b₀ and ∂NLL/∂b₁ analytical gradient entries.
 #[allow(clippy::too_many_arguments)]
 pub fn poisson_fit_analytic(
     model: &dyn FitModel,
@@ -755,6 +789,7 @@ pub fn poisson_fit_analytic(
     params: &mut ParameterSet,
     config: &PoissonConfig,
     temp_ctx: Option<&TemperatureContext>,
+    kl_bg_ctx: Option<&KLBackgroundCtx>,
 ) -> Result<PoissonResult, FittingError> {
     let n_e = y_obs.len();
     validate_analytic_inputs(
@@ -889,6 +924,7 @@ pub fn poisson_fit_analytic(
             density_indices,
             all_vals: &all_vals_buf,
             dxs_dt: &dxs_dt,
+            kl_bg: kl_bg_ctx.map(|c| (c.b0_index, c.b1_index, c.inv_sqrt_energies.as_slice())),
         });
 
         // Check gradient norm for convergence
@@ -956,6 +992,25 @@ pub fn poisson_fit_analytic(
                     .sum::<f64>()
             })
             .collect();
+
+        // KL background Fisher diagonal: H_{b0,b0} = Σ 1/Y, H_{b1,b1} = Σ 1/(E·Y)
+        let mut hessian_diag = hessian_diag;
+        if let Some(bg) = kl_bg_ctx {
+            let (hb0, hb1) = y_model_now.iter().zip(bg.inv_sqrt_energies.iter()).fold(
+                (0.0f64, 0.0f64),
+                |(a0, a1), (&ym, &ise)| {
+                    let ym_safe = ym.max(POISSON_EPSILON);
+                    // ∂Y/∂b₀ = 1, ∂Y/∂b₁ = 1/√E
+                    (a0 + 1.0 / ym_safe, a1 + ise * ise / ym_safe)
+                },
+            );
+            if let Some(pos) = free_indices.iter().position(|&i| i == bg.b0_index) {
+                hessian_diag[pos] = hb0;
+            }
+            if let Some(pos) = free_indices.iter().position(|&i| i == bg.b1_index) {
+                hessian_diag[pos] = hb1;
+            }
+        }
 
         // search_dir = D * grad where D_ii = 1/H_ii (Newton scaling).
         let search_dir: Vec<f64> = grad
@@ -1547,6 +1602,7 @@ pub(crate) fn poisson_fit_lbfgsb(
             density_indices,
             all_vals: &all_vals_buf,
             dxs_dt: &dxs_dt,
+            kl_bg: None, // L-BFGS-B path doesn't support KL background
         });
 
         // Snapshot current free-parameter values into the reusable buffer
@@ -1876,6 +1932,7 @@ mod tests {
             &mut params_an,
             &PoissonConfig::default(),
             None,
+            None, // kl_bg_ctx
         )
         .unwrap();
 
@@ -1946,6 +2003,7 @@ mod tests {
             &mut params,
             &PoissonConfig::default(),
             None,
+            None, // kl_bg_ctx
         )
         .unwrap();
 
@@ -1990,6 +2048,7 @@ mod tests {
             &mut params,
             &PoissonConfig::default(),
             None,
+            None, // kl_bg_ctx
         )
         .unwrap();
 
@@ -2058,6 +2117,7 @@ mod tests {
             &mut params,
             &config,
             None,
+            None, // kl_bg_ctx
         )
         .unwrap();
 
@@ -2225,6 +2285,7 @@ mod tests {
             &mut params,
             &config,
             Some(&temp_ctx),
+            None, // kl_bg_ctx
         )
         .unwrap();
 
@@ -2341,6 +2402,7 @@ mod tests {
             &mut params,
             &PoissonConfig::default(),
             None,
+            None, // kl_bg_ctx
         )
         .unwrap();
 
@@ -2441,6 +2503,7 @@ mod tests {
             &mut params_an,
             &PoissonConfig::default(),
             None,
+            None, // kl_bg_ctx
         )
         .unwrap();
 

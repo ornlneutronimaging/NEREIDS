@@ -556,7 +556,8 @@ pub fn sparse_reconstruct(
                 t_model.density_indices.as_slice(),
                 &mut params,
                 config.poisson_config(),
-                None,
+                None, // temp_ctx
+                None, // kl_bg_ctx
             )
             .ok()?;
 
