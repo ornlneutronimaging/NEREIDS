@@ -398,7 +398,6 @@ pub fn mlbw_cross_sections_for_range(
 
     let pi_over_k2 = channel::pi_over_k_squared_barns(energy_ev, awr);
 
-    let mut total = 0.0;
     let mut elastic = 0.0;
     let mut capture = 0.0;
     let mut fission = 0.0;
@@ -425,8 +424,10 @@ pub fn mlbw_cross_sections_for_range(
         let phi = penetrability::phase_shift(l, rho_phase);
         let p_at_e = penetrability::penetrability(l, rho_pen);
 
-        // Phase factor: e^{2iφ} = cos(2φ) + i·sin(2φ)
-        let phase2 = Complex64::new((2.0 * phi).cos(), (2.0 * phi).sin());
+        // Phase factor: e^{-2iφ} = cos(2φ) - i·sin(2φ)
+        // SAMMY convention: U = e^{-2iφ} · (1 + iX), NOT e^{+2iφ}.
+        // See memory: "R-matrix phase convention: U = e^{-2iφ} · (1 + 2iX)"
+        let phase2 = Complex64::new((2.0 * phi).cos(), -(2.0 * phi).sin());
 
         let j_groups =
             precompute_slbw_jgroups(&l_group.resonances, l, awr_l, range, l_group, target_spin);
@@ -472,23 +473,30 @@ pub fn mlbw_cross_sections_for_range(
                 x_sum += x_r;
             }
 
-            // Collision matrix: U_nn = e^{2iφ} · (1 - i·X)
-            let one_minus_ix = Complex64::new(1.0 + x_sum.im, -x_sum.re);
-            let u_nn = phase2 * one_minus_ix;
+            // Collision matrix: U_nn = e^{-2iφ} · (1 + i·X)
+            // SAMMY convention (mmlb3.f90 Elastc_Mlb).
+            // Note: 1 + i·X = (1 - X_im) + i·X_re
+            let one_plus_ix = Complex64::new(1.0 - x_sum.im, x_sum.re);
+            let u_nn = phase2 * one_plus_ix;
 
             // σ_elastic = (π/k²) · g_J · |1 - U_nn|²
             let one_minus_u = Complex64::new(1.0 - u_nn.re, -u_nn.im);
             let sigma_el = pi_over_k2 * g_j * one_minus_u.norm_sqr();
             elastic += sigma_el;
 
-            // σ_total = (2π/k²) · g_J · (1 - Re(U_nn))
-            let sigma_tot = 2.0 * pi_over_k2 * g_j * (1.0 - u_nn.re);
-            total += sigma_tot;
+            // Total = elastic + capture + fission (NOT optical theorem).
+            // The optical theorem σ_total = 2π/k² · g · (1 - Re(U)) is only
+            // valid for a UNITARY S-matrix. In MLBW, capture and fission
+            // remove flux from the elastic channel, so |U| < 1 and the
+            // optical theorem overestimates absorption. Computing total as
+            // the sum of components is always correct.
+            // (Capture and fission already accumulated per-resonance above.)
         }
     }
 
-    // Capture and fission already accumulated above.
-    // Total from optical theorem already includes all channels.
+    // Total = sum of all components (elastic was accumulated per J-group,
+    // capture and fission per resonance).
+    let total = elastic + capture + fission;
 
     (total, elastic, capture, fission)
 }
