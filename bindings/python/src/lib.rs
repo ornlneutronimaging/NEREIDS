@@ -352,6 +352,10 @@ struct PySpatialResult {
     anorm_map: Option<Py<PyArray2<f64>>>,
     /// Per-pixel background parameters [BackA, BackB, BackC] (None when background=False).
     background_maps: Option<[Py<PyArray2<f64>>; 3]>,
+    /// Number of weak eigendirections (None when regularize=False).
+    n_weak_directions: Option<usize>,
+    /// Fisher eigenvalues (None when regularize=False).
+    fisher_eigenvalues: Option<Vec<f64>>,
 }
 
 #[pymethods]
@@ -423,6 +427,18 @@ impl PySpatialResult {
         self.background_maps
             .as_ref()
             .map(|maps| maps.iter().map(|m| m.bind(py).clone()).collect())
+    }
+
+    /// Number of weak eigendirections found by regularization (None when regularize=False).
+    #[getter]
+    fn n_weak_directions(&self) -> Option<usize> {
+        self.n_weak_directions
+    }
+
+    /// Fisher eigenvalues from regularization (None when regularize=False).
+    #[getter]
+    fn fisher_eigenvalues(&self) -> Option<Vec<f64>> {
+        self.fisher_eigenvalues.clone()
     }
 
     fn __repr__(&self) -> String {
@@ -2008,6 +2024,8 @@ fn py_spatial_map(
                     PyArray2::from_owned_array(py, c).unbind(),
                 ]
             }),
+            n_weak_directions: result.n_weak_directions,
+            fisher_eigenvalues: result.fisher_eigenvalues,
         };
         Py::new(py, py_result).map(|p| p.into_any())
     } else if fitter == "poisson" {
@@ -3538,7 +3556,7 @@ fn py_spatial_map_typed<'py>(
             threshold: reg_threshold,
             smooth_iter: reg_smooth_iter,
             compute_uncertainty: true,
-            regularize_temperature: false,
+            regularize_temperature: fit_temperature, // T1-3: match temperature fitting
         };
         spatial_map_regularized_typed(&input, &config, &reg_config, dead_arr.as_ref(), None, None)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?
@@ -3592,5 +3610,7 @@ fn py_spatial_map_typed<'py>(
         temperature_map,
         anorm_map,
         background_maps,
+        n_weak_directions: result.n_weak_directions,
+        fisher_eigenvalues: result.fisher_eigenvalues,
     })
 }

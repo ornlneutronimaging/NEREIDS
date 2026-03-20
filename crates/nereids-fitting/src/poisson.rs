@@ -1131,10 +1131,11 @@ impl<'a> crate::forward_model::ForwardModel for CountsModel<'a> {
     }
 
     fn n_params(&self) -> usize {
-        // Parameter count is determined by ParameterSet, not the model.
-        // Use ParameterSet::n_total() instead.  CountsModel wraps a
-        // transmission model and does not own or track the parameter vector.
-        0
+        // CountsModel doesn't own the parameter vector — the count is
+        // determined by ParameterSet. Return flux length as a proxy
+        // (n_data), since n_params is only used by ForwardModel consumers
+        // for buffer sizing, not by the Poisson optimizer.
+        self.flux.len()
     }
 }
 
@@ -1264,7 +1265,9 @@ impl<'a> crate::forward_model::ForwardModel for TransmissionKLBackgroundModel<'a
     }
 
     fn n_params(&self) -> usize {
-        0 // Determined by ParameterSet, not the model.
+        // The wrapper adds 2 background parameters (b0, b1).
+        // n_data from inner is a reasonable proxy for the base param count.
+        self.inv_sqrt_energies.len()
     }
 }
 
