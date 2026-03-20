@@ -525,11 +525,15 @@ fn add_selected_isotopes(state: &mut AppState) {
         }
     }
 
+    let mut added = 0usize;
     for (z, a) in &selected {
         let sym = nereids_core::elements::element_symbol(*z).unwrap_or("??");
         let symbol = format!("{}-{}", sym, a);
         match state.periodic_table_target {
             PeriodicTableTarget::Configure => {
+                if state.isotope_entries.iter().any(|e| e.z == *z && e.a == *a) {
+                    continue; // already present
+                }
                 // Always add with Pending status — the auto-fetch loop in
                 // configure_step will pick up new Pending entries once any
                 // active fetch completes.
@@ -546,6 +550,13 @@ fn add_selected_isotopes(state: &mut AppState) {
                 state.pixel_fit_result = None;
             }
             PeriodicTableTarget::ForwardModel => {
+                if state
+                    .fm_isotope_entries
+                    .iter()
+                    .any(|e| e.z == *z && e.a == *a)
+                {
+                    continue; // already present
+                }
                 state.fm_isotope_entries.push(IsotopeEntry {
                     z: *z,
                     a: *a,
@@ -559,6 +570,13 @@ fn add_selected_isotopes(state: &mut AppState) {
                 state.fm_per_isotope_spectra.clear();
             }
             PeriodicTableTarget::DetectMatrix => {
+                if state
+                    .detect_matrix_entries
+                    .iter()
+                    .any(|e| e.z == *z && e.a == *a)
+                {
+                    continue; // already present
+                }
                 state.detect_matrix_entries.push(IsotopeEntry {
                     z: *z,
                     a: *a,
@@ -571,6 +589,13 @@ fn add_selected_isotopes(state: &mut AppState) {
                 state.detect_results.clear();
             }
             PeriodicTableTarget::DetectTrace => {
+                if state
+                    .detect_trace_entries
+                    .iter()
+                    .any(|e| e.z == *z && e.a == *a)
+                {
+                    continue; // already present
+                }
                 state.detect_trace_entries.push(DetectTraceEntry {
                     z: *z,
                     a: *a,
@@ -581,6 +606,31 @@ fn add_selected_isotopes(state: &mut AppState) {
                 });
                 state.detect_results.clear();
             }
+        }
+        added += 1;
+    }
+
+    // Provide user feedback about what was added.
+    let skipped = selected.len() - added;
+    let is_fetching = match state.periodic_table_target {
+        PeriodicTableTarget::Configure => state.is_fetching_endf,
+        PeriodicTableTarget::ForwardModel => state.is_fetching_fm_endf,
+        PeriodicTableTarget::DetectMatrix | PeriodicTableTarget::DetectTrace => {
+            state.is_fetching_detect_endf
+        }
+    };
+    if added > 0 && is_fetching {
+        state.status_message =
+            format!("Added {added} isotope(s) \u{2014} will fetch after current batch completes");
+    } else if added > 0 {
+        state.status_message = format!("Added {added} isotope(s)");
+    }
+    if skipped > 0 {
+        let base = state.status_message.clone();
+        if base.is_empty() {
+            state.status_message = format!("Skipped {skipped} duplicate(s)");
+        } else {
+            state.status_message = format!("{base} (skipped {skipped} duplicate(s))");
         }
     }
 

@@ -2,7 +2,8 @@
 
 use crate::guided;
 use crate::state::{
-    AppState, EndfStatus, GuidedStep, ProvenanceEventKind, SaveDataMode, SessionCache, Tab, UiMode,
+    AppState, EndfStatus, FetchTarget, GuidedStep, ProvenanceEventKind, SaveDataMode, SessionCache,
+    Tab, UiMode,
 };
 use crate::studio;
 use crate::theme;
@@ -300,14 +301,13 @@ fn poll_pending_tasks(state: &mut AppState) {
         }
     }
 
-    // Poll Detectability ENDF fetch results (matched by (z, a) + is_detect_matrix)
+    // Poll Detectability ENDF fetch results (matched by (z, a) + FetchTarget)
     if let Some(ref rx) = state.pending_detect_endf {
         let mut disconnected = false;
         loop {
             match rx.try_recv() {
-                Ok(fetch) => {
-                    if fetch.is_detect_matrix {
-                        // Matrix entry — match by (z, a)
+                Ok(fetch) => match fetch.target {
+                    FetchTarget::DetectMatrix => {
                         if let Some(entry) = state
                             .detect_matrix_entries
                             .iter_mut()
@@ -326,8 +326,8 @@ fn poll_pending_tasks(state: &mut AppState) {
                                 }
                             }
                         }
-                    } else {
-                        // Trace entry — match by (z, a)
+                    }
+                    FetchTarget::DetectTrace => {
                         if let Some(entry) = state
                             .detect_trace_entries
                             .iter_mut()
@@ -347,7 +347,9 @@ fn poll_pending_tasks(state: &mut AppState) {
                             }
                         }
                     }
-                }
+                    // Configure/ForwardModel results never appear on this channel
+                    _ => {}
+                },
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     disconnected = true;

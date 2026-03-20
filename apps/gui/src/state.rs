@@ -238,18 +238,30 @@ impl SessionCache {
     }
 }
 
+/// Which target list an ENDF fetch result belongs to.
+///
+/// Replaces the former `is_detect_matrix: bool` flag, giving each call-site
+/// a self-documenting label instead of an opaque boolean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchTarget {
+    Configure,
+    ForwardModel,
+    DetectMatrix,
+    DetectTrace,
+}
+
 /// Result of a background ENDF fetch for a single isotope.
 ///
 /// Uses `(z, a)` to identify which isotope entry the result belongs to,
 /// rather than positional index which is fragile if the list is mutated
 /// during a background fetch.
 ///
-/// For detectability, `is_detect_matrix` distinguishes matrix entries from
-/// trace entries when the same `(z, a)` might appear in both lists.
+/// `target` distinguishes which list the result belongs to (Configure,
+/// ForwardModel, DetectMatrix, or DetectTrace).
 pub struct EndfFetchResult {
     pub z: u32,
     pub a: u32,
-    pub is_detect_matrix: bool,
+    pub target: FetchTarget,
     pub symbol: String,
     pub result: Result<ResonanceData, String>,
 }

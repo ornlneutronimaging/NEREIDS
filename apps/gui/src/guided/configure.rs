@@ -1,6 +1,6 @@
 //! Step 2: Configuration — beamline parameters, isotope selection, ENDF fetch.
 
-use crate::state::{AppState, EndfStatus, GuidedStep, PeriodicTableTarget};
+use crate::state::{AppState, EndfStatus, FetchTarget, GuidedStep, PeriodicTableTarget};
 use crate::widgets::design::{self, ChipAction, NavAction};
 use nereids_endf::retrieval::EndfLibrary;
 use std::sync::Arc;
@@ -334,7 +334,7 @@ fn fetch_endf_data(state: &mut AppState) {
             work.push(design::EndfWorkItem {
                 z: entry.z,
                 a: entry.a,
-                is_detect_matrix: false,
+                target: FetchTarget::Configure,
                 isotope,
                 symbol: entry.symbol.clone(),
                 library: state.endf_library,

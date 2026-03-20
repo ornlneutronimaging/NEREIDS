@@ -1,7 +1,7 @@
 //! Detectability tool — multi-matrix + trace isotope analysis with resolution broadening,
 //! verdict badges, hero stats, and delta-T spectrum plot.
 
-use crate::state::{AppState, EndfStatus, GuidedStep, PeriodicTableTarget};
+use crate::state::{AppState, EndfStatus, FetchTarget, GuidedStep, PeriodicTableTarget};
 use crate::widgets::design;
 use egui_plot::{HLine, Line, Plot, PlotPoints};
 use nereids_endf::retrieval::EndfLibrary;
@@ -692,7 +692,10 @@ pub(crate) fn copy_config_to_detect_matrix(state: &mut AppState) {
 }
 
 /// Fetch ENDF data for matrix + trace isotopes.
-/// Index convention: 0..N = matrix entries, N.. = trace entries at (index - N).
+///
+/// Results are matched by `(z, a)` + `FetchTarget` (DetectMatrix vs DetectTrace)
+/// so the receiver routes each result to the correct list regardless of
+/// list mutations during the background fetch.
 pub(crate) fn detect_fetch_endf_data(state: &mut AppState) {
     use nereids_core::types::Isotope;
     use nereids_endf::retrieval;
@@ -709,7 +712,7 @@ pub(crate) fn detect_fetch_endf_data(state: &mut AppState) {
                         work.push(design::EndfWorkItem {
                             z: entry.z,
                             a: entry.a,
-                            is_detect_matrix: true,
+                            target: FetchTarget::DetectMatrix,
                             isotope,
                             symbol: entry.symbol.clone(),
                             library: state.detect_endf_library,
@@ -741,7 +744,7 @@ pub(crate) fn detect_fetch_endf_data(state: &mut AppState) {
                         work.push(design::EndfWorkItem {
                             z: entry.z,
                             a: entry.a,
-                            is_detect_matrix: false,
+                            target: FetchTarget::DetectTrace,
                             isotope,
                             symbol: entry.symbol.clone(),
                             library: state.detect_endf_library,
@@ -776,18 +779,23 @@ pub(crate) fn detect_fetch_endf_data(state: &mut AppState) {
     }
 
     for item in &work {
-        if item.is_detect_matrix {
-            for entry in state.detect_matrix_entries.iter_mut() {
-                if entry.z == item.z && entry.a == item.a {
-                    entry.endf_status = EndfStatus::Fetching;
+        match item.target {
+            FetchTarget::DetectMatrix => {
+                for entry in state.detect_matrix_entries.iter_mut() {
+                    if entry.z == item.z && entry.a == item.a {
+                        entry.endf_status = EndfStatus::Fetching;
+                    }
                 }
             }
-        } else {
-            for entry in state.detect_trace_entries.iter_mut() {
-                if entry.z == item.z && entry.a == item.a {
-                    entry.endf_status = EndfStatus::Fetching;
+            FetchTarget::DetectTrace => {
+                for entry in state.detect_trace_entries.iter_mut() {
+                    if entry.z == item.z && entry.a == item.a {
+                        entry.endf_status = EndfStatus::Fetching;
+                    }
                 }
             }
+            // Configure/ForwardModel items are never in this work list
+            _ => {}
         }
     }
 

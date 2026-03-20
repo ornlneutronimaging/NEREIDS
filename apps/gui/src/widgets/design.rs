@@ -6,7 +6,8 @@
 //! §Tabs, §Badges, §Content Area, §Toolbar, §Drop Zones.
 
 use crate::state::{
-    AppState, EndfFetchResult, EndfStatus, GuidedStep, IsotopeEntry, ResolutionMode, SpectrumAxis,
+    AppState, EndfFetchResult, EndfStatus, FetchTarget, GuidedStep, IsotopeEntry, ResolutionMode,
+    SpectrumAxis,
 };
 use crate::theme::{ThemeColors, semantic};
 use egui::{Color32, CornerRadius, Margin, Rect, Response, RichText, Sense, Shadow, Stroke, Ui};
@@ -664,14 +665,12 @@ pub fn teleport_pill(ui: &mut Ui, label: &str, target: GuidedStep, state: &mut A
 
 /// Work item for the ENDF fetch worker.
 ///
-/// `is_detect_matrix` disambiguates matrix vs trace entries in the
-/// detectability tool (both lists may contain the same `(z, a)` pair).
-/// For Configure and Forward Model fetches, set it to `false` — the
-/// receiver ignores it for those targets.
+/// `target` identifies which list the result should be routed to:
+/// Configure, ForwardModel, DetectMatrix, or DetectTrace.
 pub(crate) struct EndfWorkItem {
     pub z: u32,
     pub a: u32,
-    pub is_detect_matrix: bool,
+    pub target: FetchTarget,
     pub isotope: Isotope,
     pub symbol: String,
     pub library: EndfLibrary,
@@ -694,12 +693,11 @@ pub(crate) fn endf_fetch_worker(
             break;
         }
         let Some(mat) = nereids_endf::retrieval::mat_number(&item.isotope) else {
-            // Send an error back instead of silently skipping — prevents
-            // the entry from being stuck at "Fetching" forever.
+            // Defensive: should be unreachable — callers pre-filter by mat_number
             let _ = tx.send(EndfFetchResult {
                 z: item.z,
                 a: item.a,
-                is_detect_matrix: item.is_detect_matrix,
+                target: item.target,
                 symbol: item.symbol.clone(),
                 result: Err(format!(
                     "No MAT number for {} — isotope not in ENDF database",
@@ -721,7 +719,7 @@ pub(crate) fn endf_fetch_worker(
         let _ = tx.send(EndfFetchResult {
             z: item.z,
             a: item.a,
-            is_detect_matrix: item.is_detect_matrix,
+            target: item.target,
             symbol: item.symbol,
             result,
         });

@@ -1,6 +1,8 @@
 //! Forward Model tool — independent isotope sandbox with live spectrum preview.
 
-use crate::state::{AppState, EndfStatus, GuidedStep, PeriodicTableTarget, SpectrumAxis};
+use crate::state::{
+    AppState, EndfStatus, FetchTarget, GuidedStep, PeriodicTableTarget, SpectrumAxis,
+};
 use crate::widgets::design;
 use egui_plot::{Line, Plot, PlotPoints};
 use nereids_endf::retrieval::EndfLibrary;
@@ -473,7 +475,7 @@ pub(crate) fn fm_fetch_endf_data(state: &mut AppState) {
             work.push(design::EndfWorkItem {
                 z: entry.z,
                 a: entry.a,
-                is_detect_matrix: false,
+                target: FetchTarget::ForwardModel,
                 isotope,
                 symbol: entry.symbol.clone(),
                 library: state.fm_endf_library,
