@@ -662,36 +662,67 @@ pub fn teleport_pill(ui: &mut Ui, label: &str, target: GuidedStep, state: &mut A
 
 // ── Shared Helpers ─────────────────────────────────────────────────
 
+/// Work item for the ENDF fetch worker.
+///
+/// `is_detect_matrix` disambiguates matrix vs trace entries in the
+/// detectability tool (both lists may contain the same `(z, a)` pair).
+/// For Configure and Forward Model fetches, set it to `false` — the
+/// receiver ignores it for those targets.
+pub(crate) struct EndfWorkItem {
+    pub z: u32,
+    pub a: u32,
+    pub is_detect_matrix: bool,
+    pub isotope: Isotope,
+    pub symbol: String,
+    pub library: EndfLibrary,
+}
+
 /// Background worker for ENDF data fetching.
 ///
 /// Runs inside a `std::thread::spawn` closure — iterates `work` items,
 /// fetches + parses each, and sends results on `tx`. Supports cancellation.
+/// Results are keyed by `(z, a)` so the receiver can match them to entries
+/// regardless of list mutations during the fetch.
 pub(crate) fn endf_fetch_worker(
-    work: Vec<(usize, Isotope, String, EndfLibrary)>,
+    work: Vec<EndfWorkItem>,
     cancel: Arc<AtomicBool>,
     tx: mpsc::Sender<EndfFetchResult>,
 ) {
     let retriever = nereids_endf::retrieval::EndfRetriever::new();
-    for (index, isotope, symbol, library) in work {
+    for item in work {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        let Some(mat) = nereids_endf::retrieval::mat_number(&isotope) else {
+        let Some(mat) = nereids_endf::retrieval::mat_number(&item.isotope) else {
+            // Send an error back instead of silently skipping — prevents
+            // the entry from being stuck at "Fetching" forever.
+            let _ = tx.send(EndfFetchResult {
+                z: item.z,
+                a: item.a,
+                is_detect_matrix: item.is_detect_matrix,
+                symbol: item.symbol.clone(),
+                result: Err(format!(
+                    "No MAT number for {} — isotope not in ENDF database",
+                    item.symbol
+                )),
+            });
             continue;
         };
-        let result = match retriever.get_endf_file(&isotope, library, mat) {
+        let result = match retriever.get_endf_file(&item.isotope, item.library, mat) {
             Ok((_path, endf_text)) => match nereids_endf::parser::parse_endf_file2(&endf_text) {
                 Ok(data) => Ok(data),
-                Err(e) => Err(format!("Parse error for {symbol}: {e}")),
+                Err(e) => Err(format!("Parse error for {}: {e}", item.symbol)),
             },
-            Err(e) => Err(format!("Fetch error for {symbol}: {e}")),
+            Err(e) => Err(format!("Fetch error for {}: {e}", item.symbol)),
         };
         if cancel.load(Ordering::Relaxed) {
             break;
         }
         let _ = tx.send(EndfFetchResult {
-            index,
-            symbol,
+            z: item.z,
+            a: item.a,
+            is_detect_matrix: item.is_detect_matrix,
+            symbol: item.symbol,
             result,
         });
     }

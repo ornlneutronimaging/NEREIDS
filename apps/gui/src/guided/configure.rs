@@ -311,7 +311,7 @@ fn fetch_endf_data(state: &mut AppState) {
     use nereids_core::types::Isotope;
     use nereids_endf::retrieval;
 
-    let mut work: Vec<(usize, Isotope, String, EndfLibrary)> = Vec::new();
+    let mut work: Vec<design::EndfWorkItem> = Vec::new();
     let mut failed_indices: Vec<usize> = Vec::new();
     for (i, entry) in state.isotope_entries.iter().enumerate() {
         if entry.enabled && entry.endf_status == EndfStatus::Pending {
@@ -331,7 +331,14 @@ fn fetch_endf_data(state: &mut AppState) {
                 failed_indices.push(i);
                 continue;
             }
-            work.push((i, isotope, entry.symbol.clone(), state.endf_library));
+            work.push(design::EndfWorkItem {
+                z: entry.z,
+                a: entry.a,
+                is_detect_matrix: false,
+                isotope,
+                symbol: entry.symbol.clone(),
+                library: state.endf_library,
+            });
         }
     }
     for i in failed_indices {
@@ -343,9 +350,11 @@ fn fetch_endf_data(state: &mut AppState) {
     }
 
     // Mark entries as Fetching before spawning the background thread
-    for (i, _, _, _) in &work {
-        if let Some(entry) = state.isotope_entries.get_mut(*i) {
-            entry.endf_status = EndfStatus::Fetching;
+    for item in &work {
+        for entry in state.isotope_entries.iter_mut() {
+            if entry.z == item.z && entry.a == item.a {
+                entry.endf_status = EndfStatus::Fetching;
+            }
         }
     }
 

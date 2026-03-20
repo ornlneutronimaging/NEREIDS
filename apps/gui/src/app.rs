@@ -195,14 +195,19 @@ fn poll_pending_tasks(state: &mut AppState) {
         }
     }
 
-    // Poll ENDF fetch results (streamed one per isotope)
+    // Poll ENDF fetch results (streamed one per isotope, matched by (z, a))
     if let Some(ref rx) = state.pending_endf {
         let mut disconnected = false;
         // Drain all available results this frame
         loop {
             match rx.try_recv() {
                 Ok(fetch) => {
-                    if let Some(entry) = state.isotope_entries.get_mut(fetch.index) {
+                    // Match by (z, a) — stable even if isotope list was mutated
+                    if let Some(entry) = state
+                        .isotope_entries
+                        .iter_mut()
+                        .find(|e| e.z == fetch.z && e.a == fetch.a)
+                    {
                         match fetch.result {
                             Ok(data) => {
                                 entry.resonance_data = Some(data);
@@ -249,13 +254,17 @@ fn poll_pending_tasks(state: &mut AppState) {
         }
     }
 
-    // Poll Forward Model ENDF fetch results
+    // Poll Forward Model ENDF fetch results (matched by (z, a))
     if let Some(ref rx) = state.pending_fm_endf {
         let mut disconnected = false;
         loop {
             match rx.try_recv() {
                 Ok(fetch) => {
-                    if let Some(entry) = state.fm_isotope_entries.get_mut(fetch.index) {
+                    if let Some(entry) = state
+                        .fm_isotope_entries
+                        .iter_mut()
+                        .find(|e| e.z == fetch.z && e.a == fetch.a)
+                    {
                         match fetch.result {
                             Ok(data) => {
                                 entry.resonance_data = Some(data);
@@ -291,18 +300,19 @@ fn poll_pending_tasks(state: &mut AppState) {
         }
     }
 
-    // Poll Detectability ENDF fetch results
-    // Index convention: 0..N = matrix entries, N.. = trace entries at (index - N)
-    // where N = state.detect_n_matrix_at_fetch (captured at fetch spawn time).
+    // Poll Detectability ENDF fetch results (matched by (z, a) + is_detect_matrix)
     if let Some(ref rx) = state.pending_detect_endf {
         let mut disconnected = false;
-        let n_matrix = state.detect_n_matrix_at_fetch;
         loop {
             match rx.try_recv() {
                 Ok(fetch) => {
-                    if fetch.index < n_matrix {
-                        // Matrix entry
-                        if let Some(entry) = state.detect_matrix_entries.get_mut(fetch.index) {
+                    if fetch.is_detect_matrix {
+                        // Matrix entry — match by (z, a)
+                        if let Some(entry) = state
+                            .detect_matrix_entries
+                            .iter_mut()
+                            .find(|e| e.z == fetch.z && e.a == fetch.a)
+                        {
                             match fetch.result {
                                 Ok(data) => {
                                     entry.resonance_data = Some(data);
@@ -317,9 +327,12 @@ fn poll_pending_tasks(state: &mut AppState) {
                             }
                         }
                     } else {
-                        // Trace entry at (index - N)
-                        let trace_idx = fetch.index - n_matrix;
-                        if let Some(entry) = state.detect_trace_entries.get_mut(trace_idx) {
+                        // Trace entry — match by (z, a)
+                        if let Some(entry) = state
+                            .detect_trace_entries
+                            .iter_mut()
+                            .find(|e| e.z == fetch.z && e.a == fetch.a)
+                        {
                             match fetch.result {
                                 Ok(data) => {
                                     entry.resonance_data = Some(data);

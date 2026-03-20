@@ -530,9 +530,9 @@ fn add_selected_isotopes(state: &mut AppState) {
         let symbol = format!("{}-{}", sym, a);
         match state.periodic_table_target {
             PeriodicTableTarget::Configure => {
-                if state.is_fetching_endf {
-                    continue;
-                }
+                // Always add with Pending status — the auto-fetch loop in
+                // configure_step will pick up new Pending entries once any
+                // active fetch completes.
                 state.isotope_entries.push(IsotopeEntry {
                     z: *z,
                     a: *a,
@@ -546,9 +546,6 @@ fn add_selected_isotopes(state: &mut AppState) {
                 state.pixel_fit_result = None;
             }
             PeriodicTableTarget::ForwardModel => {
-                if state.is_fetching_fm_endf {
-                    continue;
-                }
                 state.fm_isotope_entries.push(IsotopeEntry {
                     z: *z,
                     a: *a,
@@ -562,9 +559,6 @@ fn add_selected_isotopes(state: &mut AppState) {
                 state.fm_per_isotope_spectra.clear();
             }
             PeriodicTableTarget::DetectMatrix => {
-                if state.is_fetching_detect_endf {
-                    continue;
-                }
                 state.detect_matrix_entries.push(IsotopeEntry {
                     z: *z,
                     a: *a,
@@ -577,9 +571,6 @@ fn add_selected_isotopes(state: &mut AppState) {
                 state.detect_results.clear();
             }
             PeriodicTableTarget::DetectTrace => {
-                if state.is_fetching_detect_endf {
-                    continue;
-                }
                 state.detect_trace_entries.push(DetectTraceEntry {
                     z: *z,
                     a: *a,
