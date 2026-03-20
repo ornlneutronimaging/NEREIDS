@@ -34,7 +34,10 @@
 //!
 //! Collision matrix (SAMMY manual eq. III.D.4):
 //!   W_cc' = δ_cc' + 2i·Ξ_cc'
-//!   U_cc' = Ω_c · W_cc' · Ω_c'    where Ω_c = exp(iφ_c)
+//!   U_cc' = Ω_c · W_cc' · Ω_c'    where Ω_c = exp(-iφ_c)
+//!
+//!   TRUTH SOURCE: SAMMY rml/mrml11.f lines 14-18 (W = I + 2i·XXXX)
+//!   and lines 84-88 (elastic formula consistent with e^{-2iφ}).
 //!   Unitarity: |U| ≤ 1 always; hard sphere (R=0) → U = exp(2iφ)·I  ✓
 //!
 //! Cross sections per spin group (J,π), summed over entrance neutron channels c0:
@@ -650,10 +653,25 @@ fn spin_group_cross_sections(
     }
 
     // ── Collision matrix U = Ω · W · Ω, W = I + 2i·Ξ ────────────────────────
-    // Reference: SAMMY manual eq. III.D.4; SAMMY rml/mrml11.f Setxqx/Sectio
-    // Hard-sphere check: R=0 → XQ=0 → XXXX=0 → W=I → U = exp(2iφ)·I, |U|=1 ✓
+    //
+    // Phase convention: Ω_c = exp(-iφ_c), NOT exp(+iφ_c).
+    //
+    // TRUTH SOURCE: SAMMY rml/mrml11.f lines 14-18:
+    //   "W(c,c') = delta(c,c') + 2i XXXX(c,c')" (eq. III.D.4)
+    // And mrml11.f lines 84-88, the elastic formula:
+    //   "sin²(φ)·(1-2Xi) - sin(2φ)·Xr + Xr²+Xi²"
+    // is consistent ONLY with U = e^{-2iφ}·(I+2iX), not e^{+2iφ}.
+    //
+    // For hard sphere (W=I): |1-e^{-2iφ}|² = |1-e^{+2iφ}|² = 4sin²φ,
+    // so the sign error is invisible in unitarity tests. It ONLY manifests
+    // when resonances are present (W ≠ I), producing wrong interference
+    // patterns in elastic and incorrect total from optical theorem.
+    //
+    // History: same class of bug as the MLBW e^{+2iφ} error fixed in
+    // slbw.rs (commit f0eadc1). The negative exponent is the ENDF/SAMMY
+    // convention; the positive exponent is a common error.
     for c in 0..nch {
-        ws.omega[c] = Complex64::from_polar(1.0, ws.phi_c[c]);
+        ws.omega[c] = Complex64::from_polar(1.0, -ws.phi_c[c]);
     }
 
     for c in 0..nch {

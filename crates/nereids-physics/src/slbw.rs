@@ -378,7 +378,7 @@ pub(crate) fn slbw_evaluate_with_cached_jgroups(
 /// ## Physics
 /// The collision matrix element for a single neutron channel in MLBW is:
 ///
-///   U_nn = e^{2iφ} · [1 - i · Σ_r Γ_n^r / (E_r - E - iΓ_tot^r/2)]
+///   U_nn = e^{-2iφ} · [1 + i · Σ_r Γ_n^r / (E_r - E - iΓ_tot^r/2)]
 ///
 /// where the sum is the coherent sum over all resonances in the spin group.
 ///
@@ -425,8 +425,16 @@ pub fn mlbw_cross_sections_for_range(
         let p_at_e = penetrability::penetrability(l, rho_pen);
 
         // Phase factor: e^{-2iφ} = cos(2φ) - i·sin(2φ)
-        // SAMMY convention: U = e^{-2iφ} · (1 + iX), NOT e^{+2iφ}.
-        // See memory: "R-matrix phase convention: U = e^{-2iφ} · (1 + 2iX)"
+        //
+        // TRUTH SOURCE: SAMMY mlb/mmlb3.f90 Elastc_Mlb line 54.
+        // Convention: U = e^{-2iφ} · (1 + iX), NOT e^{+2iφ} · (1 - iX).
+        // The positive exponent was a bug (commit 5508fea) that caused
+        // negative total cross-sections for all MLBW isotopes (Hf-176/177/
+        // 178/179). Fixed in commit f0eadc1.
+        //
+        // Also confirmed by SAMMY rml/mrml11.f lines 84-88: the elastic
+        // formula sin²(φ)·(1-2Xi) - sin(2φ)·Xr + Xr²+Xi² is consistent
+        // ONLY with e^{-2iφ}.
         let phase2 = Complex64::new((2.0 * phi).cos(), -(2.0 * phi).sin());
 
         let j_groups =
@@ -786,5 +794,87 @@ mod tests {
             xs_diff.total.is_finite() && xs_diff.total > 0.0,
             "NAPS=0 with different AP should still produce valid XS"
         );
+    }
+
+    fn make_mlbw_multi_resonance_data() -> nereids_endf::resonance::ResonanceData {
+        use nereids_endf::resonance::*;
+        ResonanceData {
+            isotope: nereids_core::types::Isotope::new(72, 178).unwrap(),
+            za: 72178,
+            awr: 177.94,
+            ranges: vec![ResonanceRange {
+                energy_low: 0.0,
+                energy_high: 100.0,
+                formalism: ResonanceFormalism::MLBW,
+                naps: 0,
+                resolved: true,
+                scattering_radius: 9.48,
+                target_spin: 0.0,
+                l_groups: vec![LGroup {
+                    l: 0,
+                    awr: 177.94,
+                    apl: 0.0,
+                    qx: 0.0,
+                    lrx: 0,
+                    resonances: vec![
+                        Resonance {
+                            energy: 7.8,
+                            j: 0.5,
+                            gn: 0.002,
+                            gg: 0.060,
+                            gfa: 0.0,
+                            gfb: 0.0,
+                        },
+                        Resonance {
+                            energy: 16.9,
+                            j: 0.5,
+                            gn: 0.004,
+                            gg: 0.055,
+                            gfa: 0.0,
+                            gfb: 0.0,
+                        },
+                    ],
+                }],
+                rml: None,
+                ap_table: None,
+                urr: None,
+                r_external: vec![],
+            }],
+        }
+    }
+
+    /// MLBW cross-sections must be non-negative for multi-resonance data.
+    /// Guard: catches e^{+2iφ} phase convention bug (commit 5508fea, fixed f0eadc1).
+    #[test]
+    fn test_mlbw_multi_resonance_positive() {
+        use crate::reich_moore::cross_sections_at_energy;
+        let data = make_mlbw_multi_resonance_data();
+        for &e in &[1.0, 5.0, 7.0, 7.8, 8.0, 10.0, 12.0, 16.9, 17.0, 20.0, 50.0] {
+            let xs = cross_sections_at_energy(&data, e);
+            assert!(xs.total >= 0.0, "MLBW total < 0 at E={e}: {:.4}", xs.total);
+            assert!(
+                xs.elastic >= 0.0,
+                "MLBW elastic < 0 at E={e}: {:.4}",
+                xs.elastic
+            );
+        }
+    }
+
+    /// Total = elastic + capture + fission for MLBW.
+    /// Guard: catches optical theorem misuse (U not unitary for MLBW).
+    #[test]
+    fn test_mlbw_total_equals_components() {
+        use crate::reich_moore::cross_sections_at_energy;
+        let data = make_mlbw_multi_resonance_data();
+        for &e in &[1.0, 5.0, 7.8, 10.0, 50.0] {
+            let xs = cross_sections_at_energy(&data, e);
+            let sum = xs.elastic + xs.capture + xs.fission;
+            assert!(
+                (xs.total - sum).abs() < 1e-10,
+                "MLBW total ({:.6}) != el+cap+fis ({:.6}) at E={e}",
+                xs.total,
+                sum
+            );
+        }
     }
 }
