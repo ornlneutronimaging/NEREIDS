@@ -722,67 +722,6 @@ pub fn broadened_cross_sections_for_transmission(
     result
 }
 
-/// Compute broadened cross-sections and their temperature derivative.
-///
-/// Returns `(sigma_k, dsigma_k_dT)` where `sigma_k[k][e]` is the
-/// Doppler+resolution-broadened cross-section for isotope `k` at energy
-/// index `e`, and `dsigma_k_dT[k][e]` is its central finite-difference
-/// derivative with respect to temperature.
-///
-/// The derivative uses step size `dT = 1e-4 * (1 + T)`, which balances
-/// truncation error and roundoff for the T ~ 1..2000 K regime relevant
-/// to neutron resonance experiments.
-///
-/// # Cost
-/// Three calls to `broadened_cross_sections` (at T, T+dT, T-dT).
-///
-/// # Errors
-/// * [`TransmissionError::Resolution`] — if resolution broadening is
-///   enabled (`instrument` is `Some`) and `energies` is not sorted ascending.
-/// * [`TransmissionError::Doppler`] — if Doppler broadening is enabled
-///   (`temperature_k > 0.0`) and `DopplerParams` validation fails
-///   (e.g., non-positive or non-finite AWR).
-pub fn broadened_cross_sections_with_derivative(
-    energies: &[f64],
-    resonance_data: &[ResonanceData],
-    temperature_k: f64,
-    instrument: Option<&InstrumentParams>,
-) -> Result<BroadenedXsWithDerivative, TransmissionError> {
-    let dt = 1e-4 * (1.0 + temperature_k);
-    let t_up = temperature_k + dt;
-    let t_down = (temperature_k - dt).max(0.0); // stay physical
-    let actual_2dt = t_up - t_down;
-
-    // The three broadening calls at T, T+dT, T-dT are independent —
-    // run them concurrently with rayon::join.  No cancel token passed;
-    // TransmissionError::{Resolution, Doppler} can occur.
-    let (center_result, (up_result, down_result)) = rayon::join(
-        || broadened_cross_sections(energies, resonance_data, temperature_k, instrument, None),
-        || {
-            rayon::join(
-                || broadened_cross_sections(energies, resonance_data, t_up, instrument, None),
-                || broadened_cross_sections(energies, resonance_data, t_down, instrument, None),
-            )
-        },
-    );
-    let xs_center = center_result?;
-    let xs_up = up_result?;
-    let xs_down = down_result?;
-
-    let dxs_dt: Vec<Vec<f64>> = xs_up
-        .iter()
-        .zip(xs_down.iter())
-        .map(|(up, down)| {
-            up.iter()
-                .zip(down.iter())
-                .map(|(&u, &d)| (u - d) / actual_2dt)
-                .collect()
-        })
-        .collect();
-
-    Ok((xs_center, dxs_dt))
-}
-
 /// Compute unbroadened (raw Reich-Moore) cross-sections for each isotope.
 ///
 /// This is the temperature-independent first step of the forward model.
@@ -929,7 +868,7 @@ pub fn broadened_cross_sections_from_base(
 /// (1× broadening), replacing the 3× FD approach. Resolution broadening is
 /// applied to both σ and ∂σ/∂T (valid because resolution is a linear operator).
 ///
-/// Returns the same `BroadenedXsWithDerivative` type as the FD version.
+/// Returns `BroadenedXsWithDerivative`: `(sigma_k, dsigma_k_dT)`.
 pub fn broadened_cross_sections_with_analytical_derivative_from_base(
     energies: &[f64],
     base_xs: &[Vec<f64>],
@@ -1050,77 +989,6 @@ pub fn broadened_cross_sections_with_analytical_derivative_from_base(
         dxs_all.push(dxs);
     }
     Ok((xs_all, dxs_all))
-}
-
-/// Compute broadened cross-sections and their temperature derivative from
-/// precomputed unbroadened cross-sections using **finite differences**.
-///
-/// Three calls to [`broadened_cross_sections_from_base`] at T, T+dT, T−dT.
-/// Prefer [`broadened_cross_sections_with_analytical_derivative_from_base`]
-/// for exact derivatives at 1/3 the cost.
-pub fn broadened_cross_sections_with_derivative_from_base(
-    energies: &[f64],
-    base_xs: &[Vec<f64>],
-    resonance_data: &[ResonanceData],
-    temperature_k: f64,
-    instrument: Option<&InstrumentParams>,
-) -> Result<BroadenedXsWithDerivative, TransmissionError> {
-    let dt = 1e-4 * (1.0 + temperature_k);
-    let t_up = temperature_k + dt;
-    let t_down = (temperature_k - dt).max(0.0);
-    let actual_2dt = t_up - t_down;
-
-    // The three broadening calls at T, T+dT, T-dT are independent —
-    // run them concurrently with rayon::join.
-    let (center_result, (up_result, down_result)) = rayon::join(
-        || {
-            broadened_cross_sections_from_base(
-                energies,
-                base_xs,
-                resonance_data,
-                temperature_k,
-                instrument,
-            )
-        },
-        || {
-            rayon::join(
-                || {
-                    broadened_cross_sections_from_base(
-                        energies,
-                        base_xs,
-                        resonance_data,
-                        t_up,
-                        instrument,
-                    )
-                },
-                || {
-                    broadened_cross_sections_from_base(
-                        energies,
-                        base_xs,
-                        resonance_data,
-                        t_down,
-                        instrument,
-                    )
-                },
-            )
-        },
-    );
-    let xs_center = center_result?;
-    let xs_up = up_result?;
-    let xs_down = down_result?;
-
-    let dxs_dt: Vec<Vec<f64>> = xs_up
-        .iter()
-        .zip(xs_down.iter())
-        .map(|(up, down)| {
-            up.iter()
-                .zip(down.iter())
-                .map(|(&u, &d)| (u - d) / actual_2dt)
-                .collect()
-        })
-        .collect();
-
-    Ok((xs_center, dxs_dt))
 }
 
 /// Compute a transmission spectrum from precomputed unbroadened cross-sections.
@@ -1431,16 +1299,18 @@ mod tests {
     }
 
     #[test]
-    fn test_broadened_xs_derivative() {
-        // Verify ∂σ/∂T via Richardson-like consistency: compute the derivative
-        // at two different step sizes and check they agree to reasonable
-        // tolerance (the internal step dT = 1e-4*(1+T) is O(h²)-accurate).
+    fn test_broadened_xs_analytical_derivative() {
+        // Verify analytical ∂σ/∂T against a manual FD at a larger step (1 K)
+        // and check they agree to reasonable tolerance.
         let data = u238_single_resonance();
         let energies: Vec<f64> = (0..201).map(|i| 4.0 + (i as f64) * 0.025).collect();
         let temperature = 300.0;
 
-        let (xs, dxs_dt) = broadened_cross_sections_with_derivative(
+        let base_xs =
+            unbroadened_cross_sections(&energies, std::slice::from_ref(&data), None).unwrap();
+        let (xs, dxs_dt) = broadened_cross_sections_with_analytical_derivative_from_base(
             &energies,
+            &base_xs,
             std::slice::from_ref(&data),
             temperature,
             None,
@@ -1465,10 +1335,9 @@ mod tests {
             dxs_dt[0][idx_res]
         );
 
-        // Cross-check: compute a manual FD at a larger step (10×) and verify
-        // the two derivatives are consistent (within ~1% relative error on
-        // the derivative near the resonance peak).
-        let big_dt = 1.0; // 1 K step — much larger than internal 0.03 K
+        // Cross-check: compute a manual FD at a larger step and verify
+        // the analytical derivative is consistent (within ~5% relative error).
+        let big_dt = 1.0;
         let xs_up = broadened_cross_sections(
             &energies,
             std::slice::from_ref(&data),
@@ -1487,31 +1356,32 @@ mod tests {
             .collect();
 
         // Compare near the resonance where the derivative is large.
-        // Allow up to 5% relative difference due to O(h²) truncation.
-        let deriv_fine = dxs_dt[0][idx_res];
+        let deriv_analytical = dxs_dt[0][idx_res];
         let deriv_coarse = manual_deriv[idx_res];
-        let rel_err =
-            (deriv_fine - deriv_coarse).abs() / deriv_fine.abs().max(deriv_coarse.abs()).max(1e-30);
+        let rel_err = (deriv_analytical - deriv_coarse).abs()
+            / deriv_analytical.abs().max(deriv_coarse.abs()).max(1e-30);
         assert!(
             rel_err < 0.05,
-            "FD derivatives at two step sizes disagree: fine={}, coarse={}, rel_err={}",
-            deriv_fine,
+            "Analytical vs FD derivatives disagree: analytical={}, coarse={}, rel_err={}",
+            deriv_analytical,
             deriv_coarse,
             rel_err,
         );
     }
 
     #[test]
-    fn test_broadened_xs_derivative_low_temperature() {
+    fn test_broadened_xs_analytical_derivative_low_temperature() {
         // Regression test: derivative must have correct sign at low temperature.
-        // Before fix, t_down was clamped to 0.1 K, causing actual_2dt < 0
-        // and flipping the derivative sign for T < 0.1 K.
         let data = u238_single_resonance();
         let energies: Vec<f64> = (0..51).map(|i| 5.0 + (i as f64) * 0.1).collect();
 
-        // T = 0.05 K: was broken (t_down=0.1 > t_up=0.050105)
-        let (xs_low, dxs_low) = broadened_cross_sections_with_derivative(
+        let base_xs =
+            unbroadened_cross_sections(&energies, std::slice::from_ref(&data), None).unwrap();
+
+        // T = 0.05 K
+        let (xs_low, dxs_low) = broadened_cross_sections_with_analytical_derivative_from_base(
             &energies,
+            &base_xs,
             std::slice::from_ref(&data),
             0.05,
             None,
@@ -1526,9 +1396,10 @@ mod tests {
             }
         }
 
-        // T = 0.0 K: edge case (forward difference only)
-        let (xs_zero, dxs_zero) = broadened_cross_sections_with_derivative(
+        // T = 0.0 K: edge case
+        let (xs_zero, dxs_zero) = broadened_cross_sections_with_analytical_derivative_from_base(
             &energies,
+            &base_xs,
             std::slice::from_ref(&data),
             0.0,
             None,
@@ -1656,22 +1527,16 @@ mod tests {
     }
 
     #[test]
-    fn test_derivative_from_base_matches_derivative() {
+    fn test_analytical_derivative_from_base_shape_and_finiteness() {
+        // Verify the analytical derivative from base returns correct shapes
+        // and finite values.
         let data = u238_single_resonance();
         let temperature = 300.0;
         let energies: Vec<f64> = (0..201).map(|i| 4.0 + (i as f64) * 0.025).collect();
 
-        let (xs_ref, dxs_ref) = broadened_cross_sections_with_derivative(
-            &energies,
-            std::slice::from_ref(&data),
-            temperature,
-            None,
-        )
-        .unwrap();
-
         let base_xs =
             unbroadened_cross_sections(&energies, std::slice::from_ref(&data), None).unwrap();
-        let (xs_cached, dxs_cached) = broadened_cross_sections_with_derivative_from_base(
+        let (xs, dxs_dt) = broadened_cross_sections_with_analytical_derivative_from_base(
             &energies,
             &base_xs,
             std::slice::from_ref(&data),
@@ -1680,18 +1545,32 @@ mod tests {
         )
         .unwrap();
 
-        for (r, c) in xs_ref[0].iter().zip(xs_cached[0].iter()) {
-            assert!(
-                (r - c).abs() < 1e-12,
-                "XS mismatch: ref={}, cached={}",
-                r,
-                c
-            );
+        assert_eq!(xs.len(), 1);
+        assert_eq!(dxs_dt.len(), 1);
+        assert_eq!(xs[0].len(), energies.len());
+        assert_eq!(dxs_dt[0].len(), energies.len());
+
+        // All values should be finite.
+        for &v in &xs[0] {
+            assert!(v.is_finite(), "XS must be finite, got {v}");
         }
-        for (r, c) in dxs_ref[0].iter().zip(dxs_cached[0].iter()) {
+        for &v in &dxs_dt[0] {
+            assert!(v.is_finite(), "dXS/dT must be finite, got {v}");
+        }
+
+        // XS from base should match XS from full broadening.
+        let xs_full = broadened_cross_sections(
+            &energies,
+            std::slice::from_ref(&data),
+            temperature,
+            None,
+            None,
+        )
+        .unwrap();
+        for (r, c) in xs_full[0].iter().zip(xs[0].iter()) {
             assert!(
                 (r - c).abs() < 1e-12,
-                "dXS/dT mismatch: ref={}, cached={}",
+                "XS mismatch: full={}, from_base={}",
                 r,
                 c
             );

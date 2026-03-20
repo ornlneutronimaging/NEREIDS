@@ -199,8 +199,8 @@ pub fn spatial_map(
     let fast_config = if config.fit_temperature() {
         // Precompute unbroadened (Reich-Moore) cross-sections ONCE for all
         // pixels.  Without this, each pixel recomputes them inside
-        // TransmissionFitModel::new() and TemperatureContext construction,
-        // dominating total runtime for heavy nuclei (U-238: ~5000 resonances).
+        // TransmissionFitModel::new(), dominating total runtime for heavy
+        // nuclei (U-238: ~5000 resonances).
         let base_xs = match config.precomputed_base_xs().cloned() {
             Some(cached) => cached,
             None => {

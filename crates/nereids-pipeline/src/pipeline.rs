@@ -15,13 +15,12 @@ use std::sync::Arc;
 use nereids_endf::resonance::ResonanceData;
 use nereids_fitting::lm::{self, FitModel, LmConfig, LmResult};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
-use nereids_fitting::poisson::{self, PoissonConfig, TemperatureContext};
+use nereids_fitting::poisson::{self, PoissonConfig};
 use nereids_fitting::transmission_model::{
     NormalizedTransmissionModel, PrecomputedTransmissionModel, TransmissionFitModel,
 };
 use nereids_physics::resolution::ResolutionFunction;
 use nereids_physics::transmission::InstrumentParams;
-use nereids_physics::transmission::{self as phys_transmission};
 
 use crate::error::PipelineError;
 
@@ -676,41 +675,7 @@ fn fit_transmission_poisson(
 
     let model = build_transmission_model(config, n_isotopes, temperature_index)?;
 
-    // Build TemperatureContext for analytical gradient.
-    let temp_ctx = if config.fit_temperature {
-        Some(poisson::TemperatureContext {
-            temperature_index: temperature_index.unwrap(),
-            resonance_data: config.resonance_data().to_vec(),
-            energies: config.energies().to_vec(),
-            instrument: config.resolution.as_ref().map(|r| InstrumentParams {
-                resolution: r.clone(),
-            }),
-            base_xs: config.precomputed_base_xs.clone(),
-        })
-    } else {
-        None
-    };
-
-    // Get cross-sections for the analytical gradient path.
-    let xs = get_or_compute_cross_sections(config)?;
-    let density_indices: Vec<usize> = (0..n_isotopes).collect();
-    let flux_ones = vec![1.0; config.energies().len()]; // transmission: flux=1
-
-    // Build KL background context for analytical gradient (if bg enabled).
-    let kl_bg_analytic = kl_bg.map(|(b0_idx, b1_idx)| {
-        let inv_sqrt_e: Vec<f64> = config
-            .energies()
-            .iter()
-            .map(|&e| 1.0 / e.max(1e-10).sqrt())
-            .collect();
-        poisson::KLBackgroundCtx {
-            b0_index: b0_idx,
-            b1_index: b1_idx,
-            inv_sqrt_energies: inv_sqrt_e,
-        }
-    });
-
-    // Build the wrapped model for evaluation (needed for both bg and no-bg paths).
+    // Dispatch with KL-native background model or bare model.
     let result = if let Some((b0_idx, b1_idx)) = kl_bg {
         let inv_sqrt_e: Vec<f64> = config
             .energies()
@@ -723,32 +688,10 @@ fn fit_transmission_poisson(
             b0_index: b0_idx,
             b1_index: b1_idx,
         };
-        // T1-1: Use poisson_fit_analytic with KL background context
-        // (was poisson_fit with FD gradient, 5× slower).
-        let pr = poisson::poisson_fit_analytic(
-            &wrapped,
-            measured_t,
-            &flux_ones,
-            &xs,
-            &density_indices,
-            &mut params,
-            poisson_cfg,
-            temp_ctx.as_ref(),
-            kl_bg_analytic.as_ref(),
-        )?;
+        let pr = poisson::poisson_fit(&wrapped, measured_t, &mut params, poisson_cfg)?;
         poisson_to_lm_result(&wrapped, measured_t, sigma, &pr, &params)
     } else {
-        let pr = poisson::poisson_fit_analytic(
-            &*model,
-            measured_t,
-            &flux_ones,
-            &xs,
-            &density_indices,
-            &mut params,
-            poisson_cfg,
-            temp_ctx.as_ref(),
-            None,
-        )?;
+        let pr = poisson::poisson_fit(&*model, measured_t, &mut params, poisson_cfg)?;
         poisson_to_lm_result(&*model, measured_t, sigma, &pr, &params)
     }?;
 
@@ -814,12 +757,6 @@ fn fit_counts_poisson(
 
     let mut params = ParameterSet::new(param_vec);
 
-    // Build transmission model — use TransmissionFitModel when fitting
-    // temperature (it rebroadens on each evaluate), PrecomputedTransmissionModel
-    // when temperature is fixed (faster, uses cached cross-sections).
-    let xs = get_or_compute_cross_sections(config)?;
-    let density_indices: Vec<usize> = (0..n_isotopes).collect();
-
     let t_model = build_transmission_model(config, n_isotopes, temperature_index)?;
 
     // Wrap in counts model: Y = flux * T(theta) + background
@@ -829,32 +766,7 @@ fn fit_counts_poisson(
         background,
     };
 
-    // Build TemperatureContext for analytical gradient.
-    let temp_ctx = if config.fit_temperature {
-        Some(poisson::TemperatureContext {
-            temperature_index: temperature_index.unwrap(),
-            resonance_data: config.resonance_data().to_vec(),
-            energies: config.energies().to_vec(),
-            instrument: config.resolution.as_ref().map(|r| InstrumentParams {
-                resolution: r.clone(),
-            }),
-            base_xs: config.precomputed_base_xs.clone(),
-        })
-    } else {
-        None
-    };
-
-    let pr = poisson::poisson_fit_analytic(
-        &counts_model,
-        sample_counts,
-        flux,
-        &xs,
-        &density_indices,
-        &mut params,
-        poisson_cfg,
-        temp_ctx.as_ref(),
-        None, // kl_bg_ctx
-    )?;
+    let pr = poisson::poisson_fit(&counts_model, sample_counts, &mut params, poisson_cfg)?;
 
     // Compute Pearson chi-squared for display
     let y_model = counts_model.evaluate(&pr.params)?;
@@ -991,26 +903,6 @@ fn build_transmission_model(
         temperature_index,
         base_xs,
     )?))
-}
-
-/// Get precomputed cross-sections or compute them.
-fn get_or_compute_cross_sections(
-    config: &UnifiedFitConfig,
-) -> Result<Arc<Vec<Vec<f64>>>, PipelineError> {
-    if let Some(xs) = &config.precomputed_cross_sections {
-        return Ok(Arc::clone(xs));
-    }
-    let instrument = config.resolution.as_ref().map(|r| InstrumentParams {
-        resolution: r.clone(),
-    });
-    let xs = phys_transmission::broadened_cross_sections(
-        &config.energies,
-        &config.resonance_data,
-        config.temperature_k,
-        instrument.as_ref(),
-        None,
-    )?;
-    Ok(Arc::new(xs))
 }
 
 /// Convert PoissonResult to LmResult with Pearson chi-squared.
@@ -1183,7 +1075,7 @@ pub struct FitConfig {
     /// Precomputed unbroadened (Reich-Moore) cross-sections, one `Vec<f64>` per
     /// isotope.  When `Some` and temperature fitting is enabled, `fit_spectrum`
     /// skips the per-pixel Reich-Moore evaluation and uses `_from_base` variants
-    /// for both the `TransmissionFitModel` and `TemperatureContext`.
+    /// for the `TransmissionFitModel`.
     precomputed_base_xs: Option<Arc<Vec<Vec<f64>>>>,
     /// When `true`, `temperature_k` is treated as an initial guess and fitted
     /// jointly with the areal densities.
@@ -1672,82 +1564,10 @@ pub fn fit_spectrum(
         match config.solver() {
             SolverChoice::LevenbergMarquardt => dispatch_maybe_bg(&model, &mut params)?,
             SolverChoice::PoissonKL(poisson_config) => {
-                // The basic poisson_fit uses finite-difference gradient descent,
-                // which cannot effectively optimize temperature: the gradient is
-                // dominated by density parameters (scale ~1e-4) so the temperature
-                // (scale ~200) never moves.
-                //
-                // Use poisson_fit_analytic with Fisher preconditioning, which
-                // handles the scale mismatch via diagonal Hessian normalization.
-                //
-                // In transmission space, flux = 1.0 everywhere (since Y = T,
-                // not Y = Φ·T + B).  The analytical gradient formulas reduce
-                // correctly with Φ=1.
-                //
-                // H3: Poisson analytic path does NOT support background wrapping.
-                // Background + Poisson + temperature would fall through to FD
-                // gradients, which produce inaccurate temperature fits due to
-                // the density (~1e-4) vs temperature (~200) scale mismatch.
-                // Reject this combination with a clear error instead of
-                // silently producing wrong results.
-                if bg_indices.is_some() && temperature_index.is_some() {
-                    return Err(PipelineError::InvalidParameter(
-                        "Poisson KL + background + temperature fitting is not supported: \
-                         the analytic gradient path cannot handle background wrapping, \
-                         and the finite-difference fallback produces inaccurate temperature \
-                         fits due to parameter scale mismatch. Use fitter='lm' for \
-                         background + temperature, or disable temperature fitting."
-                            .into(),
-                    ));
-                }
                 if bg_indices.is_some() {
                     dispatch_maybe_bg(&model, &mut params)?
                 } else {
-                    let density_indices: Vec<usize> = (0..n_isotopes).collect();
-                    let instrument_plain = instrument.as_deref().cloned();
-
-                    // Use precomputed base_xs when available (spatial_map path);
-                    // fall back to computing them here (single-pixel path).
-                    let base_xs: Arc<Vec<Vec<f64>>> = match config.precomputed_base_xs() {
-                        Some(cached) => Arc::clone(cached),
-                        None => Arc::new(phys_transmission::unbroadened_cross_sections(
-                            config.energies(),
-                            config.resonance_data(),
-                            None,
-                        )?),
-                    };
-
-                    // Compute initial broadened XS from base (Doppler + resolution
-                    // only, no redundant Reich-Moore).
-                    let xs = phys_transmission::broadened_cross_sections_from_base(
-                        config.energies(),
-                        &base_xs,
-                        config.resonance_data(),
-                        config.temperature_k(),
-                        instrument.as_deref(),
-                    )?;
-
-                    let temp_ctx = TemperatureContext {
-                        temperature_index: n_isotopes,
-                        resonance_data: config.resonance_data().to_vec(),
-                        energies: config.energies().to_vec(),
-                        instrument: instrument_plain,
-                        base_xs: Some(base_xs),
-                    };
-
-                    let flux = vec![1.0f64; config.energies().len()];
-
-                    let pr = poisson::poisson_fit_analytic(
-                        &model,
-                        measured_t,
-                        &flux,
-                        &xs,
-                        &density_indices,
-                        &mut params,
-                        poisson_config,
-                        Some(&temp_ctx),
-                        None, // kl_bg_ctx
-                    )?;
+                    let pr = poisson::poisson_fit(&model, measured_t, &mut params, poisson_config)?;
 
                     let n_free = params.n_free();
                     let dof = measured_t.len().saturating_sub(n_free).max(1);
@@ -1838,6 +1658,7 @@ pub fn fit_spectrum(
 mod tests {
     use super::*;
     use nereids_fitting::lm::FitModel;
+    use nereids_physics::transmission as phys_transmission;
 
     use crate::test_helpers::u238_single_resonance;
 
@@ -2303,25 +2124,6 @@ mod tests {
             }),
             0.02, // 2% tolerance (Poisson solver slightly less precise)
             "1-isotope Poisson",
-        );
-    }
-
-    #[test]
-    fn test_fit_spectrum_multi_isotope_temperature_poisson() {
-        use crate::test_helpers::w182_single_resonance;
-        let u238 = u238_single_resonance();
-        let w182 = w182_single_resonance();
-        temperature_round_trip(
-            vec![u238, w182],
-            vec!["U-238".into(), "W-182".into()],
-            &[0.0005, 0.0003],
-            300.0,
-            SolverChoice::PoissonKL(PoissonConfig {
-                max_iter: 500,
-                ..PoissonConfig::default()
-            }),
-            0.02, // 2%
-            "2-isotope Poisson",
         );
     }
 

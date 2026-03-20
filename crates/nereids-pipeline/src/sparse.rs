@@ -541,25 +541,12 @@ pub fn sparse_reconstruct(
                 background: &nuisance.background,
             };
 
-            // Fit with Poisson likelihood using analytical gradient.
-            // Passing the precomputed cross-sections and flux enables
-            // poisson_fit_analytic to compute the full dNLL/dn_k gradient vector
-            // in one model evaluation per iteration instead of N_isotopes+1
-            // evaluations with finite differences (one base + one per parameter).
+            // Fit with Poisson likelihood.
             let mut params = param_template.clone();
 
-            let result = poisson::poisson_fit_analytic(
-                &counts_model,
-                &y_obs,
-                &nuisance.flux,
-                &xs,
-                t_model.density_indices.as_slice(),
-                &mut params,
-                config.poisson_config(),
-                None, // temp_ctx
-                None, // kl_bg_ctx
-            )
-            .ok()?;
+            let result =
+                poisson::poisson_fit(&counts_model, &y_obs, &mut params, config.poisson_config())
+                    .ok()?;
 
             let pixel_result = PixelResult {
                 densities: (0..n_isotopes).map(|i| result.params[i]).collect(),

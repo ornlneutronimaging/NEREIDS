@@ -5,7 +5,7 @@
 //! Provides a Pythonic API for:
 //! - Computing theoretical transmission spectra
 //! - Fitting measured transmission to recover isotopic compositions
-//!   (Levenberg-Marquardt chi-squared or Poisson NLL via `poisson_fit_analytic`)
+//!   (Levenberg-Marquardt chi-squared or Poisson NLL via `poisson_fit`)
 //! - Spatial mapping across imaging data
 //!
 //! ## Solvers
@@ -16,7 +16,7 @@
 //! - **`"lm"`** (default) — Levenberg-Marquardt minimising chi-squared.
 //!   Requires calibrated uncertainties (`sigma`).
 //! - **`"poisson"`** — Poisson negative-log-likelihood with analytical
-//!   gradient (`poisson_fit_analytic`).  `sigma` is unused but required
+//!   gradient (`poisson_fit`).  `sigma` is unused but required
 //!   for API consistency.  Uncertainties are not available from this
 //!   solver (returned as NaN).
 //!
@@ -56,7 +56,7 @@ use nereids_endf::resonance::{
 use nereids_endf::retrieval::{EndfLibrary, EndfRetriever, mat_number};
 use nereids_fitting::lm::{self, FitModel, LmConfig};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
-use nereids_fitting::poisson::{self, PoissonConfig, TemperatureContext};
+use nereids_fitting::poisson::{self, PoissonConfig};
 use nereids_fitting::transmission_model::{PrecomputedTransmissionModel, TransmissionFitModel};
 use nereids_io::normalization::{self as norm, NormalizationParams};
 use nereids_io::tof::BeamlineParams;
@@ -207,7 +207,7 @@ impl PyFitResult {
     ///
     /// Returns NaN-filled array when covariance computation was skipped.
     /// Uncertainty values are NaN when covariance is not available
-    /// (e.g., Poisson fits via `poisson_fit_analytic`, which does not
+    /// (e.g., Poisson fits via `poisson_fit`, which does not
     /// compute an analytic Hessian for uncertainty estimation).
     #[getter]
     fn uncertainties<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
@@ -1127,29 +1127,11 @@ fn fit_spectrum(
 
                 let mut params = ParameterSet::new(param_vec);
 
-                // Transmission-space formulation: flux = 1.0 everywhere since
-                // Y = T, not Y = Φ·T + B.  The analytical gradient formulas
-                // reduce correctly with Φ=1 (matches pipeline.rs).
-                let n_e = e_owned.len();
                 let density_indices: Arc<Vec<usize>> = Arc::new((0..n_isotopes).collect());
                 let xs_arc = Arc::new(xs);
                 let precomputed = PrecomputedTransmissionModel {
                     cross_sections: Arc::clone(&xs_arc),
                     density_indices: Arc::clone(&density_indices),
-                };
-
-                // When fitting temperature, share base_xs between
-                // TemperatureContext and TransmissionFitModel.
-                let temp_ctx = if fit_temperature {
-                    Some(TemperatureContext {
-                        temperature_index: n_isotopes,
-                        resonance_data: res_data.clone(),
-                        energies: e_owned.clone(),
-                        instrument: instrument.clone(),
-                        base_xs: base_xs_arc.clone(),
-                    })
-                } else {
-                    None
                 };
 
                 let full_model;
@@ -1169,25 +1151,14 @@ fn fit_spectrum(
                     &precomputed
                 };
 
-                let flux = vec![1.0f64; n_e];
-
                 let poisson_config = PoissonConfig {
                     max_iter,
                     ..PoissonConfig::default()
                 };
 
-                let poisson_result = poisson::poisson_fit_analytic(
-                    t_model,
-                    &y_obs,
-                    &flux,
-                    &*xs_arc,
-                    &density_indices,
-                    &mut params,
-                    &poisson_config,
-                    temp_ctx.as_ref(),
-                    None, // kl_bg_ctx
-                )
-                .map_err(|e| format!("poisson_fit_analytic failed: {e}"))?;
+                let poisson_result =
+                    poisson::poisson_fit(t_model, &y_obs, &mut params, &poisson_config)
+                        .map_err(|e| format!("poisson_fit failed: {e}"))?;
 
                 let densities: Vec<f64> =
                     (0..n_isotopes).map(|i| poisson_result.params[i]).collect();
