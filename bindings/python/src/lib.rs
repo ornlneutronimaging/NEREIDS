@@ -67,7 +67,6 @@ use nereids_physics::resolution::{
 use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
 use nereids_pipeline::detectability;
 use nereids_pipeline::pipeline::{BackgroundConfig, FitConfig, SolverChoice};
-use nereids_pipeline::regularization::{RegularizationConfig, spatial_map_regularized};
 use nereids_pipeline::sparse::{SparseConfig, estimate_nuisance, sparse_reconstruct};
 
 /// Python wrapper for ENDF resonance data.
@@ -352,10 +351,6 @@ struct PySpatialResult {
     anorm_map: Option<Py<PyArray2<f64>>>,
     /// Per-pixel background parameters [BackA, BackB, BackC] (None when background=False).
     background_maps: Option<[Py<PyArray2<f64>>; 3]>,
-    /// Number of weak eigendirections (None when regularize=False).
-    n_weak_directions: Option<usize>,
-    /// Fisher eigenvalues (None when regularize=False).
-    fisher_eigenvalues: Option<Vec<f64>>,
 }
 
 #[pymethods]
@@ -427,18 +422,6 @@ impl PySpatialResult {
         self.background_maps
             .as_ref()
             .map(|maps| maps.iter().map(|m| m.bind(py).clone()).collect())
-    }
-
-    /// Number of weak eigendirections found by regularization (None when regularize=False).
-    #[getter]
-    fn n_weak_directions(&self) -> Option<usize> {
-        self.n_weak_directions
-    }
-
-    /// Fisher eigenvalues from regularization (None when regularize=False).
-    #[getter]
-    fn fisher_eigenvalues(&self) -> Option<Vec<f64>> {
-        self.fisher_eigenvalues.clone()
     }
 
     fn __repr__(&self) -> String {
@@ -518,139 +501,6 @@ impl PySparseResult {
             self.isotope_names.len(),
             self.n_converged,
             self.n_total,
-        )
-    }
-}
-
-/// Result of spatially regularized (Fisher eigenbasis) fitting.
-///
-/// Returned by `spatial_map_regularized()`.  Contains the same density,
-/// chi-squared, and convergence maps as `SpatialResult`, plus
-/// regularization-specific diagnostics (weak directions, eigenvalues)
-/// and optional temperature maps.
-#[pyclass(name = "RegularizedResult")]
-struct PyRegularizedResult {
-    density_maps: Vec<Py<PyArray2<f64>>>,
-    uncertainty_maps: Vec<Py<PyArray2<f64>>>,
-    chi_squared_map: Py<PyArray2<f64>>,
-    converged_map: Py<PyArray2<bool>>,
-    temperature_map: Option<Py<PyArray2<f64>>>,
-    temperature_uncertainty_map: Option<Py<PyArray2<f64>>>,
-    n_converged: usize,
-    n_total: usize,
-    isotope_names: Vec<String>,
-    n_weak_directions: usize,
-    fisher_eigenvalues: Py<PyArray1<f64>>,
-    shape: (usize, usize),
-    /// Per-pixel normalization factor (None when background=False).
-    anorm_map: Option<Py<PyArray2<f64>>>,
-    /// Per-pixel background parameters [BackA, BackB, BackC] (None when background=False).
-    background_maps: Option<[Py<PyArray2<f64>>; 3]>,
-}
-
-#[pymethods]
-impl PyRegularizedResult {
-    /// Density maps as a list of 2D numpy arrays, one per isotope.
-    #[getter]
-    fn density_maps<'py>(&self, py: Python<'py>) -> Vec<Bound<'py, PyArray2<f64>>> {
-        self.density_maps
-            .iter()
-            .map(|m| m.bind(py).clone())
-            .collect()
-    }
-
-    /// Uncertainty maps as a list of 2D numpy arrays.
-    #[getter]
-    fn uncertainty_maps<'py>(&self, py: Python<'py>) -> Vec<Bound<'py, PyArray2<f64>>> {
-        self.uncertainty_maps
-            .iter()
-            .map(|m| m.bind(py).clone())
-            .collect()
-    }
-
-    /// Reduced chi-squared map.
-    #[getter]
-    fn chi_squared_map<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
-        self.chi_squared_map.bind(py).clone()
-    }
-
-    /// Convergence map (True = converged).
-    #[getter]
-    fn converged_map<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<bool>> {
-        self.converged_map.bind(py).clone()
-    }
-
-    /// Temperature map (None when temperature fitting is disabled).
-    #[getter]
-    fn temperature_map<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray2<f64>>> {
-        self.temperature_map.as_ref().map(|m| m.bind(py).clone())
-    }
-
-    /// Temperature uncertainty map (None when temperature fitting is disabled).
-    #[getter]
-    fn temperature_uncertainty_map<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> Option<Bound<'py, PyArray2<f64>>> {
-        self.temperature_uncertainty_map
-            .as_ref()
-            .map(|m| m.bind(py).clone())
-    }
-
-    /// Number of converged pixels.
-    #[getter]
-    fn n_converged(&self) -> usize {
-        self.n_converged
-    }
-
-    /// Total number of fitted pixels.
-    #[getter]
-    fn n_total(&self) -> usize {
-        self.n_total
-    }
-
-    /// Isotope names.
-    #[getter]
-    fn isotope_names(&self) -> Vec<String> {
-        self.isotope_names.clone()
-    }
-
-    /// Number of eigenvalue directions classified as "weak" and spatially smoothed.
-    #[getter]
-    fn n_weak_directions(&self) -> usize {
-        self.n_weak_directions
-    }
-
-    /// Fisher eigenvalues (ascending order).
-    #[getter]
-    fn fisher_eigenvalues<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
-        self.fisher_eigenvalues.bind(py).clone()
-    }
-
-    /// Per-pixel normalization factor Anorm (None when background fitting was disabled).
-    #[getter]
-    fn anorm_map<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray2<f64>>> {
-        self.anorm_map.as_ref().map(|m| m.bind(py).clone())
-    }
-
-    /// Per-pixel background parameter maps [BackA, BackB, BackC]
-    /// (None when background fitting was disabled).
-    #[getter]
-    fn background_maps<'py>(&self, py: Python<'py>) -> Option<Vec<Bound<'py, PyArray2<f64>>>> {
-        self.background_maps
-            .as_ref()
-            .map(|maps| maps.iter().map(|m| m.bind(py).clone()).collect())
-    }
-
-    fn __repr__(&self) -> String {
-        format!(
-            "RegularizedResult(shape={}x{}, isotopes={}, converged={}/{}, weak_dirs={})",
-            self.shape.0,
-            self.shape.1,
-            self.isotope_names.len(),
-            self.n_converged,
-            self.n_total,
-            self.n_weak_directions,
         )
     }
 }
@@ -1996,8 +1846,6 @@ fn py_spatial_map(
                     PyArray2::from_owned_array(py, c).unbind(),
                 ]
             }),
-            n_weak_directions: result.n_weak_directions,
-            fisher_eigenvalues: result.fisher_eigenvalues,
         };
         Py::new(py, py_result).map(|p| p.into_any())
     } else if fitter == "poisson" {
@@ -2069,236 +1917,6 @@ fn py_spatial_map(
             fitter,
         )))
     }
-}
-
-/// Run spatially regularized per-pixel fitting.
-///
-/// Performs per-pixel fitting followed by Fisher-eigenbasis spatial
-/// regularization.  Poorly-determined parameter directions (identified
-/// by small eigenvalues of the Fisher information matrix) are spatially
-/// smoothed while well-determined directions are left untouched.
-///
-/// Args:
-///     transmission: 3D array (n_energies, height, width) of normalised transmission.
-///     uncertainty: 3D array (n_energies, height, width) of per-bin uncertainty.
-///     energies: 1D numpy array of energy values in eV.
-///     isotopes: List of ResonanceData objects.
-///     temperature_k: Sample temperature in Kelvin (default 300.0).
-///     initial_densities: Initial guesses for areal densities (optional).
-///     dead_pixels: 2D bool numpy array marking dead pixels (optional).
-///     flight_path_m: Flight path for Gaussian resolution (optional).
-///     delta_t_us: Timing uncertainty for Gaussian resolution (optional).
-///     delta_l_m: Path length uncertainty for Gaussian resolution (optional).
-///     resolution: TabulatedResolution for tabulated broadening (optional).
-///     delta_e_us: Exponential tail parameter in SAMMY Deltae units (optional).
-///     max_iter: Maximum iterations per pixel (default 100).
-///     threshold: Eigenvalue threshold for weak direction detection (default 0.05).
-///     smooth_iter: Number of spatial smoothing iterations (default 10).
-///     compute_uncertainty: Whether to compute Laplace uncertainty (default True).
-///     regularize_temperature: Whether to include temperature in the Fisher
-///         eigenbasis analysis (default True).  Only has effect when temperature
-///         fitting is active in the FitConfig.
-///
-/// Returns:
-///     RegularizedResult with density maps, uncertainty maps, and diagnostics.
-#[pyfunction]
-#[pyo3(name = "spatial_map_regularized", signature = (transmission, uncertainty, energies, isotopes, temperature_k=293.6, initial_densities=None, dead_pixels=None, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, delta_e_us=None, max_iter=100, fitter="lm", threshold=0.05, smooth_iter=10, compute_uncertainty=true, regularize_temperature=true, background=false))]
-fn py_spatial_map_regularized(
-    py: Python<'_>,
-    transmission: PyReadonlyArray3<f64>,
-    uncertainty: PyReadonlyArray3<f64>,
-    energies: PyReadonlyArray1<f64>,
-    isotopes: Vec<PyResonanceData>,
-    temperature_k: f64,
-    initial_densities: Option<Vec<f64>>,
-    dead_pixels: Option<PyReadonlyArray2<bool>>,
-    flight_path_m: Option<f64>,
-    delta_t_us: Option<f64>,
-    delta_l_m: Option<f64>,
-    resolution: Option<PyTabulatedResolution>,
-    delta_e_us: Option<f64>,
-    max_iter: usize,
-    fitter: &str,
-    threshold: f64,
-    smooth_iter: usize,
-    compute_uncertainty: bool,
-    regularize_temperature: bool,
-    background: bool,
-) -> PyResult<PyRegularizedResult> {
-    let e = energies.as_slice()?;
-
-    if e.is_empty() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "energies must not be empty",
-        ));
-    }
-
-    // Validate shapes using cheap PyReadonly views before cloning
-    let t_shape = transmission.shape();
-    let u_shape = uncertainty.shape();
-    if t_shape != u_shape {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "transmission shape {:?} must match uncertainty shape {:?}",
-            t_shape, u_shape,
-        )));
-    }
-    if e.len() != t_shape[0] {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "energies length ({}) must match spectral axis ({}) of transmission",
-            e.len(),
-            t_shape[0],
-        )));
-    }
-    if let Some(ref dead) = dead_pixels {
-        let d_shape = dead.shape();
-        if d_shape[0] != t_shape[1] || d_shape[1] != t_shape[2] {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "dead_pixels shape ({}, {}) must match spatial dimensions ({}, {}) of transmission",
-                d_shape[0], d_shape[1], t_shape[1], t_shape[2],
-            )));
-        }
-    }
-
-    if isotopes.is_empty() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "isotopes list must not be empty",
-        ));
-    }
-
-    let n_isotopes = isotopes.len();
-    let isotope_names: Vec<String> = isotopes
-        .iter()
-        .map(|d| {
-            let sym = elements::element_symbol(d.inner.isotope.z()).unwrap_or("?");
-            format!("{}-{}", sym, d.inner.isotope.a())
-        })
-        .collect();
-    let res_data: Vec<ResonanceData> = isotopes
-        .into_iter()
-        .map(|d| Arc::unwrap_or_clone(d.inner))
-        .collect();
-
-    let init = initial_densities.unwrap_or_else(|| vec![0.001; n_isotopes]);
-    if init.len() != n_isotopes {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "initial_densities length ({}) must match isotopes length ({})",
-            init.len(),
-            n_isotopes,
-        )));
-    }
-
-    if !temperature_k.is_finite() || temperature_k < 0.0 {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "temperature_k must be finite and non-negative",
-        ));
-    }
-
-    let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution, delta_e_us)?;
-
-    let mut config = FitConfig::new(
-        e.to_vec(),
-        res_data,
-        isotope_names,
-        temperature_k,
-        res_fn,
-        init,
-        LmConfig {
-            max_iter,
-            ..LmConfig::default()
-        },
-    )
-    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-
-    // Set solver choice
-    config = match fitter {
-        "lm" => config,
-        "poisson" => config.with_solver(nereids_pipeline::pipeline::SolverChoice::PoissonKL(
-            PoissonConfig {
-                max_iter,
-                ..PoissonConfig::default()
-            },
-        )),
-        other => {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "fitter must be 'lm' or 'poisson', got '{other}'",
-            )));
-        }
-    };
-
-    if background {
-        config = config.with_background(BackgroundConfig::default());
-    }
-
-    let reg_config = RegularizationConfig {
-        threshold,
-        smooth_iter,
-        compute_uncertainty,
-        regularize_temperature,
-    };
-
-    // Clone arrays only after all validation passes.
-    let trans = transmission.as_array().to_owned();
-    let unc = uncertainty.as_array().to_owned();
-    let dead = dead_pixels.map(|d| d.as_array().to_owned());
-
-    // Release the GIL for the heavy per-pixel fitting + regularization.
-    let result = py.detach(move || {
-        spatial_map_regularized(
-            trans.view(),
-            unc.view(),
-            &config,
-            &reg_config,
-            dead.as_ref(),
-            None,
-            None,
-        )
-    });
-    let result = result.map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-
-    let shape = (
-        result.converged_map.shape()[0],
-        result.converged_map.shape()[1],
-    );
-    let temperature_map = result
-        .temperature_map
-        .map(|m| PyArray2::from_owned_array(py, m).unbind());
-    let temperature_uncertainty_map = result
-        .temperature_uncertainty_map
-        .map(|m| PyArray2::from_owned_array(py, m).unbind());
-
-    Ok(PyRegularizedResult {
-        density_maps: result
-            .density_maps
-            .into_iter()
-            .map(|m| PyArray2::from_owned_array(py, m).unbind())
-            .collect(),
-        uncertainty_maps: result
-            .uncertainty_maps
-            .into_iter()
-            .map(|m| PyArray2::from_owned_array(py, m).unbind())
-            .collect(),
-        chi_squared_map: PyArray2::from_owned_array(py, result.chi_squared_map).unbind(),
-        converged_map: PyArray2::from_owned_array(py, result.converged_map).unbind(),
-        temperature_map,
-        temperature_uncertainty_map,
-        n_converged: result.n_converged,
-        n_total: result.n_total,
-        isotope_names: result.isotope_labels,
-        n_weak_directions: result.n_weak_directions,
-        fisher_eigenvalues: PyArray1::from_vec(py, result.fisher_eigenvalues).unbind(),
-        shape,
-        anorm_map: result
-            .anorm_map
-            .map(|m| PyArray2::from_owned_array(py, m).unbind()),
-        background_maps: result.background_maps.map(|maps| {
-            let [a, b, c] = maps;
-            [
-                PyArray2::from_owned_array(py, a).unbind(),
-                PyArray2::from_owned_array(py, b).unbind(),
-                PyArray2::from_owned_array(py, c).unbind(),
-            ]
-        }),
-    })
 }
 
 /// Fit a single spectrum averaged over a region of interest.
@@ -3207,7 +2825,6 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTabulatedResolution>()?;
     m.add_class::<PySpatialResult>()?;
     m.add_class::<PySparseResult>()?;
-    m.add_class::<PyRegularizedResult>()?;
     m.add_class::<PyTraceDetectabilityReport>()?;
     m.add_function(wrap_pyfunction!(cross_sections, m)?)?;
     m.add_function(wrap_pyfunction!(forward_model, m)?)?;
@@ -3223,7 +2840,6 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(load_resolution, m)?)?;
     m.add_function(wrap_pyfunction!(py_apply_resolution, m)?)?;
     m.add_function(wrap_pyfunction!(py_spatial_map, m)?)?;
-    m.add_function(wrap_pyfunction!(py_spatial_map_regularized, m)?)?;
     m.add_function(wrap_pyfunction!(py_fit_roi, m)?)?;
     m.add_function(wrap_pyfunction!(load_tiff_stack, m)?)?;
     m.add_function(wrap_pyfunction!(load_tiff_folder, m)?)?;
@@ -3406,9 +3022,6 @@ fn py_from_transmission<'py>(
     flight_path_m = None,
     delta_t_us = None,
     delta_l_m = None,
-    regularize = false,
-    reg_threshold = 0.05,
-    reg_smooth_iter = 10,
 ))]
 fn py_spatial_map_typed<'py>(
     py: Python<'py>,
@@ -3426,9 +3039,6 @@ fn py_spatial_map_typed<'py>(
     flight_path_m: Option<f64>,
     delta_t_us: Option<f64>,
     delta_l_m: Option<f64>,
-    regularize: bool,
-    reg_threshold: f64,
-    reg_smooth_iter: usize,
 ) -> PyResult<PySpatialResult> {
     let energies_vec = energies.as_slice()?.to_vec();
     let n_iso = isotopes.len();
@@ -3536,22 +3146,8 @@ fn py_spatial_map_typed<'py>(
     // which are not Send, so we cannot use py.allow_threads().  The existing
     // py_spatial_map has the same limitation.  Rayon still parallelizes the
     // per-pixel fitting within the GIL.
-    let result = if regularize {
-        use nereids_pipeline::regularization::{
-            RegularizationConfig, spatial_map_regularized_typed,
-        };
-        let reg_config = RegularizationConfig {
-            threshold: reg_threshold,
-            smooth_iter: reg_smooth_iter,
-            compute_uncertainty: true,
-            regularize_temperature: fit_temperature, // T1-3: match temperature fitting
-        };
-        spatial_map_regularized_typed(&input, &config, &reg_config, dead_arr.as_ref(), None, None)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?
-    } else {
-        spatial_map_typed(&input, &config, dead_arr.as_ref(), None, None)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?
-    };
+    let result = spatial_map_typed(&input, &config, dead_arr.as_ref(), None, None)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
     // Convert to PySpatialResult
     let density_maps: Vec<Py<PyArray2<f64>>> = result
@@ -3598,7 +3194,5 @@ fn py_spatial_map_typed<'py>(
         temperature_map,
         anorm_map,
         background_maps,
-        n_weak_directions: result.n_weak_directions,
-        fisher_eigenvalues: result.fisher_eigenvalues,
     })
 }

@@ -61,27 +61,10 @@ pub struct SessionCache {
     /// Whether SAMMY-style background normalization is enabled.
     #[serde(default)]
     pub background_enabled: bool,
-    /// Whether spatial regularization is enabled.
-    #[serde(default)]
-    pub regularize: bool,
-    /// Eigenvalue threshold for weak direction classification (0.01-0.5).
-    #[serde(default = "default_regularization_threshold")]
-    pub regularization_threshold: f64,
-    /// Number of smoothing iterations for weak directions.
-    #[serde(default = "default_regularization_smooth_iter")]
-    pub regularization_smooth_iter: usize,
 }
 
 fn default_rebin_factor() -> usize {
     1
-}
-
-fn default_regularization_threshold() -> f64 {
-    0.05
-}
-
-fn default_regularization_smooth_iter() -> usize {
-    10
 }
 
 /// Serializable solver method for session cache.
@@ -154,9 +137,6 @@ impl SessionCache {
             rebin_applied: state.rebin_applied,
             sidebar_collapsed: state.sidebar_collapsed,
             background_enabled: state.background_enabled,
-            regularize: state.regularize,
-            regularization_threshold: state.regularization_threshold,
-            regularization_smooth_iter: state.regularization_smooth_iter,
         })
     }
 
@@ -231,11 +211,6 @@ impl SessionCache {
 
         // Restore background normalization state
         state.background_enabled = self.background_enabled;
-
-        // Restore regularization state
-        state.regularize = self.regularize;
-        state.regularization_threshold = self.regularization_threshold;
-        state.regularization_smooth_iter = self.regularization_smooth_iter;
 
         // Rebuild pipeline
         state.rebuild_pipeline();
@@ -640,14 +615,6 @@ pub struct AppState {
     /// Whether SAMMY-style background normalization is enabled.
     /// Model: Anorm * T_inner(E) + BackA + BackB/sqrt(E) + BackC*sqrt(E)
     pub background_enabled: bool,
-
-    // -- Spatial regularization --
-    /// Whether spatial regularization is enabled.
-    pub regularize: bool,
-    /// Eigenvalue threshold for weak direction classification (0.01-0.5).
-    pub regularization_threshold: f64,
-    /// Number of smoothing iterations for weak directions.
-    pub regularization_smooth_iter: usize,
 
     // -- Pixel / ROI selection --
     pub selected_pixel: Option<(usize, usize)>,
@@ -1276,9 +1243,6 @@ impl Default for AppState {
             fit_temperature: false,
             show_advanced_solver: false,
             background_enabled: false,
-            regularize: false,
-            regularization_threshold: 0.05,
-            regularization_smooth_iter: 10,
 
             selected_pixel: None,
             rois: Vec::new(),

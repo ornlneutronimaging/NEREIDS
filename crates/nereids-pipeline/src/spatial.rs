@@ -41,16 +41,6 @@ pub struct SpatialResult {
     pub n_converged: usize,
     /// Total number of pixels fitted.
     pub n_total: usize,
-
-    // ── Optional fields from regularization (Phase 4) ──
-    /// Negative log-likelihood map (populated for counts/KL path).
-    pub nll_map: Option<Array2<f64>>,
-    /// Number of Fisher weak directions (populated by regularization).
-    pub n_weak_directions: Option<usize>,
-    /// Fisher eigenvalues (populated by regularization).
-    pub fisher_eigenvalues: Option<Vec<f64>>,
-    /// Temperature uncertainty map from regularization's penalized Hessian.
-    pub temperature_uncertainty_map: Option<Array2<f64>>,
 }
 
 /// Run per-pixel fitting across a transmission image stack.
@@ -160,10 +150,6 @@ pub fn spatial_map(
         background_maps: None,
         n_converged: 0,
         n_total: 0,
-        nll_map: None,
-        n_weak_directions: None,
-        fisher_eigenvalues: None,
-        temperature_uncertainty_map: None,
     };
     if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
         return Err(PipelineError::Cancelled);
@@ -354,10 +340,6 @@ pub fn spatial_map(
         // not the number of successful fits.  Failed pixels are left as NaN
         // in the maps.  This gives honest convergence percentages.
         n_total: pixel_coords.len(),
-        nll_map: None,
-        n_weak_directions: None,
-        fisher_eigenvalues: None,
-        temperature_uncertainty_map: None,
     })
 }
 
@@ -617,10 +599,6 @@ pub fn spatial_map_typed(
             background_maps: None,
             n_converged: 0,
             n_total: 0,
-            nll_map: None,
-            n_weak_directions: None,
-            fisher_eigenvalues: None,
-            temperature_uncertainty_map: None,
         });
     }
 
@@ -851,10 +829,6 @@ pub fn spatial_map_typed(
         background_maps,
         n_converged,
         n_total: pixel_coords.len(),
-        nll_map: None,
-        n_weak_directions: None,
-        fisher_eigenvalues: None,
-        temperature_uncertainty_map: None,
     })
 }
 
