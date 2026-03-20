@@ -58,7 +58,6 @@ Full-scale demonstrations on reference datasets.
 | # | Notebook | Description |
 |---|----------|-------------|
 | 1 | [Spatial Mapping Demo](applications/01_spatial_mapping_demo.ipynb) | Complete NEREIDS pipeline on a reference dataset with real detector geometry |
-| 2 | [Spatial Regularization](applications/02_spatial_regularization.ipynb) | LM vs Poisson KL vs regularized fitting at low counts (Hf 6-isotope case) |
 
 ## Suggested Learning Path
 

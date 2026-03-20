@@ -30,7 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Free Gas Model Doppler broadening (O(N*W) optimized)
 - Resolution broadening: Gaussian (channel width + flight path) and
   tabulated instrument functions
-- Joint temperature + density fitting with Fisher preconditioning
+- Joint temperature + density fitting with bounds-based preconditioning
 
 #### Data Processing
 - ENDF/B resonance parameter loading from IAEA (all evaluated libraries)

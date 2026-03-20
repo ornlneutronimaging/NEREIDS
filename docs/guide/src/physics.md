@@ -68,7 +68,7 @@ Maximum-likelihood fitting for low-count data where Gaussian statistics break do
 
 - Module: [`poisson`](api/nereids_fitting/poisson/)
 - Reference: TRINIDI approach (`trinidi/reconstruct.py`)
-- Uses analytic gradients with Fisher preconditioning for joint density + temperature fits
+- Uses bounds-based preconditioning for joint density + temperature fits
 
 ## ENDF Nuclear Data
 

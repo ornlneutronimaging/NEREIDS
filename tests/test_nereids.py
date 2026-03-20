@@ -795,9 +795,6 @@ class TestTraceDetectability:
 
 
 # ===========================================================================
-# Spatial map regularized
 # ===========================================================================
 
 
-# (TestSpatialMapRegularized removed — spatial_map_regularized and
-# RegularizedResult deleted from the API)
