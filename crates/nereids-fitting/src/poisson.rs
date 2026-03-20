@@ -666,25 +666,49 @@ pub fn poisson_fit(
             break;
         }
 
-        // Backtracking line search with projected gradient.
+        // Diagonal preconditioning by parameter bound range.
         //
-        // Scale the initial step by the gradient norm so that the first trial
-        // moves parameters by approximately `step_size` regardless of how large
-        // the gradient is.  Without this normalisation, high-count Poisson data
-        // produces a large gradient (∝ √I₀), the fixed alpha=step_size initial
-        // step wildly overshoots, and 30 backtracking halvings are not enough to
-        // recover—causing the line search to fail even far from the optimum.
+        // For joint density+temperature fitting, parameter scales differ by
+        // 10^5+ (density ~0.001 vs temperature ~300). The raw gradient is
+        // dominated by the large-scale parameter. Preconditioning by the
+        // squared bound range gives Newton-like step sizes:
+        //   search_dir_j = grad_j * (upper_j - lower_j)^2
+        //
+        // This makes the optimizer take steps proportional to the natural
+        // range of each parameter, regardless of the gradient magnitude.
+        params.free_indices_into(&mut free_idx_buf);
+        let search_dir: Vec<f64> = grad
+            .iter()
+            .zip(free_idx_buf.iter())
+            .map(|(&g, &idx)| {
+                let p = &params.params[idx];
+                let range = p.upper - p.lower;
+                if range.is_finite() && range > 1e-10 {
+                    // Bounded parameter: scale by range² for Newton-like step
+                    g * range * range
+                } else {
+                    // Unbounded (e.g., density with upper=inf):
+                    // Use current value as scale proxy (like relative step)
+                    let scale = p.value.abs().max(1e-3);
+                    g * scale * scale
+                }
+            })
+            .collect();
+
+        let search_norm: f64 = search_dir.iter().map(|d| d * d).sum::<f64>().sqrt();
+
+        // Backtracking line search with preconditioned search direction.
         params.free_values_into(&mut free_vals_buf);
         old_free_buf.clear();
         old_free_buf.extend_from_slice(&free_vals_buf);
-        let initial_alpha = config.step_size / grad_norm.max(1.0);
+        let initial_alpha = config.step_size / search_norm.max(1.0);
 
         match backtracking_line_search(
             model,
             params,
             y_obs,
             &old_free_buf,
-            &grad,
+            &search_dir,
             initial_alpha,
             config,
             &grad,
@@ -701,16 +725,23 @@ pub fn poisson_fit(
             }
         }
 
-        // Convergence check: step size in parameter space.
-        // Using relative NLL change is unreliable for Poisson NLL — at high
-        // photon counts the NLL is large (∝ I₀·n_bins) so even a productive
-        // step has a tiny relative change.  Parameter displacement is a
-        // scale-invariant and physically meaningful stopping criterion.
+        // Convergence check: relative step size in parameter space.
+        // Each parameter's step is normalized by its scale so that
+        // temperature (range ~5000) doesn't dominate over density (range ~0.01).
         params.free_values_into(&mut free_vals_buf);
         let step_norm: f64 = old_free_buf
             .iter()
             .zip(free_vals_buf.iter())
-            .map(|(o, n)| (o - n).powi(2))
+            .zip(free_idx_buf.iter())
+            .map(|((o, n), &idx)| {
+                let range = params.params[idx].upper - params.params[idx].lower;
+                let scale = if range.is_finite() && range > 1e-10 {
+                    range
+                } else {
+                    o.abs().max(1e-3)
+                };
+                ((o - n) / scale).powi(2)
+            })
             .sum::<f64>()
             .sqrt();
         if step_norm < config.tol_param {
