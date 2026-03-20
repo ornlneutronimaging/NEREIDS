@@ -12,7 +12,7 @@ use crate::widgets::image_view::{
 };
 use egui_plot::{Line, Plot, PlotPoints, VLine};
 use ndarray::Axis;
-use nereids_pipeline::pipeline::FitConfig;
+use nereids_pipeline::pipeline::{BackgroundConfig, InputData, SolverConfig, UnifiedFitConfig};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -728,7 +728,7 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
 
 // ---- Fit Helpers ----
 
-fn build_fit_config(state: &AppState) -> Result<FitConfig, String> {
+fn build_fit_config(state: &AppState) -> Result<UnifiedFitConfig, String> {
     let energies = state
         .energies
         .as_ref()
@@ -759,37 +759,34 @@ fn build_fit_config(state: &AppState) -> Result<FitConfig, String> {
     )
     .map_err(|e| format!("{e} \u{2014} load a resolution file or disable broadening"))?;
 
-    let mut config = FitConfig::new(
+    let mut config = UnifiedFitConfig::new(
         energies,
         resonance_data,
         isotope_names,
         state.temperature_k,
         resolution,
         initial_densities,
-        state.lm_config.clone(),
     )
-    .map_err(|e| format!("FitConfig validation error: {e}"))?;
+    .map_err(|e| format!("Config validation error: {e}"))?;
 
     config = config.with_compute_covariance(state.lm_config.compute_covariance);
 
-    #[allow(deprecated)] // GUI still uses old FitConfig API; will migrate in future
-    if state.solver_method == SolverMethod::PoissonKL {
-        config = config.with_solver(nereids_pipeline::pipeline::SolverChoice::PoissonKL(
-            nereids_fitting::poisson::PoissonConfig {
-                max_iter: state.lm_config.max_iter,
-                ..Default::default()
-            },
-        ));
-    }
+    let solver = if state.solver_method == SolverMethod::PoissonKL {
+        SolverConfig::PoissonKL(nereids_fitting::poisson::PoissonConfig {
+            max_iter: state.lm_config.max_iter,
+            ..Default::default()
+        })
+    } else {
+        SolverConfig::LevenbergMarquardt(state.lm_config.clone())
+    };
+    config = config.with_solver(solver);
 
     if state.fit_temperature {
-        config = config
-            .with_fit_temperature(true)
-            .map_err(|e| format!("FitConfig temperature error: {e}"))?;
+        config = config.with_fit_temperature(true);
     }
 
     if state.background_enabled {
-        config = config.with_background(nereids_pipeline::pipeline::BackgroundConfig::default());
+        config = config.with_transmission_background(BackgroundConfig::default());
     }
 
     Ok(config)
@@ -860,7 +857,12 @@ fn fit_pixel(state: &mut AppState) {
         .map(|e| e.symbol.clone())
         .collect();
 
-    let result = match nereids_pipeline::pipeline::fit_spectrum(&t_spectrum, &sigma, &config) {
+    let input = InputData::Transmission {
+        transmission: t_spectrum,
+        uncertainty: sigma,
+    };
+
+    let result = match nereids_pipeline::pipeline::fit_spectrum_typed(&input, &config) {
         Ok(r) => r,
         Err(e) => {
             let msg = format!("Fit error: {e}");
@@ -993,7 +995,12 @@ fn fit_roi(state: &mut AppState) {
         .map(|e| e.symbol.clone())
         .collect();
 
-    let result = match nereids_pipeline::pipeline::fit_spectrum(&avg_t, &sigma, &config) {
+    let roi_input = InputData::Transmission {
+        transmission: avg_t,
+        uncertainty: sigma,
+    };
+
+    let result = match nereids_pipeline::pipeline::fit_spectrum_typed(&roi_input, &config) {
         Ok(r) => r,
         Err(e) => {
             let msg = format!("ROI fit error: {e}");
@@ -1148,12 +1155,15 @@ pub fn run_spatial_map(state: &mut AppState) {
             })
         };
 
-        // Run spatial_map on the dedicated pool so its par_iter doesn't
+        // Run spatial_map_typed on the dedicated pool so its par_iter doesn't
         // share the global pool with inner physics par_iter calls.
+        let input = nereids_pipeline::spatial::InputData3D::Transmission {
+            transmission: norm.transmission.view(),
+            uncertainty: norm.uncertainty.view(),
+        };
         let result = pool.install(|| {
-            nereids_pipeline::spatial::spatial_map(
-                norm.transmission.view(),
-                norm.uncertainty.view(),
+            nereids_pipeline::spatial::spatial_map_typed(
+                &input,
                 &config,
                 dead_pixels.as_ref(),
                 Some(&cancel),
