@@ -184,95 +184,19 @@ class SpatialResult:
         """Isotope names."""
         ...
 
-class SparseResult:
-    """Result of per-pixel sparse/Poisson fitting."""
-
-    @property
-    def density_maps(self) -> list[NDArray[np.float64]]:
-        """Density maps as a list of 2D arrays, one per isotope."""
-        ...
-
-    @property
-    def nll_map(self) -> NDArray[np.float64]:
-        """Poisson negative log-likelihood map."""
-        ...
-
-    @property
-    def converged_map(self) -> NDArray[np.bool_]:
-        """Convergence map (True = converged)."""
-        ...
-
-    @property
-    def n_converged(self) -> int:
-        """Number of converged pixels."""
-        ...
-
-    @property
-    def n_total(self) -> int:
-        """Total number of fitted pixels."""
-        ...
-
-    @property
-    def isotope_names(self) -> list[str]:
-        """Isotope names."""
-        ...
-
-class RegularizedResult:
-    """Result of spatially regularized (Fisher eigenbasis) fitting."""
-
-    @property
-    def density_maps(self) -> list[NDArray[np.float64]]:
-        """Density maps as a list of 2D arrays, one per isotope."""
-        ...
-
-    @property
-    def uncertainty_maps(self) -> list[NDArray[np.float64]]:
-        """Uncertainty maps as a list of 2D arrays."""
-        ...
-
-    @property
-    def chi_squared_map(self) -> NDArray[np.float64]:
-        """Reduced chi-squared map."""
-        ...
-
-    @property
-    def converged_map(self) -> NDArray[np.bool_]:
-        """Convergence map (True = converged)."""
-        ...
-
     @property
     def temperature_map(self) -> NDArray[np.float64] | None:
-        """Temperature map (None when temperature fitting is disabled)."""
+        """Per-pixel fitted temperature map (None when fit_temperature=False)."""
         ...
 
     @property
-    def temperature_uncertainty_map(self) -> NDArray[np.float64] | None:
-        """Temperature uncertainty map (None when temperature fitting is disabled)."""
+    def anorm_map(self) -> NDArray[np.float64] | None:
+        """Per-pixel normalization factor Anorm (None when background=False)."""
         ...
 
     @property
-    def n_converged(self) -> int:
-        """Number of converged pixels."""
-        ...
-
-    @property
-    def n_total(self) -> int:
-        """Total number of fitted pixels."""
-        ...
-
-    @property
-    def isotope_names(self) -> list[str]:
-        """Isotope names."""
-        ...
-
-    @property
-    def n_weak_directions(self) -> int:
-        """Number of eigenvalue directions classified as weak."""
-        ...
-
-    @property
-    def fisher_eigenvalues(self) -> NDArray[np.float64]:
-        """Fisher eigenvalues (ascending order)."""
+    def background_maps(self) -> list[NDArray[np.float64]] | None:
+        """Per-pixel background parameter maps [BackA, BackB, BackC] (None when background=False)."""
         ...
 
 class TraceDetectabilityReport:
@@ -341,34 +265,6 @@ def forward_model(
     delta_e_us: float | None = None,
 ) -> NDArray[np.float64]:
     """Compute theoretical transmission spectrum."""
-    ...
-
-def fit_spectrum(
-    measured_t: NDArray[np.float64],
-    sigma: NDArray[np.float64],
-    energies: NDArray[np.float64],
-    isotopes: list[ResonanceData],
-    temperature_k: float = 293.6,
-    initial_densities: list[float] | None = None,
-    max_iter: int = 100,
-    flight_path_m: float | None = None,
-    delta_t_us: float | None = None,
-    delta_l_m: float | None = None,
-    resolution: TabulatedResolution | None = None,
-    delta_e_us: float | None = None,
-    fit_temperature: bool = False,
-    fitter: str = "lm",
-    background: bool = False,
-) -> FitResult:
-    """Fit a measured transmission spectrum to recover isotopic areal densities.
-
-    When ``background=True``, the model becomes:
-
-        T(E) = Anorm * T_inner(E) + BackA + BackB/sqrt(E) + BackC*sqrt(E)
-
-    where Anorm and BackA/B/C are fitted jointly with the isotope densities.
-    This matches SAMMY's NORMAlization and BACKGround cards.
-    """
     ...
 
 def tof_to_energy(tof_us: float, flight_path_m: float) -> float:
@@ -445,82 +341,6 @@ def apply_resolution(
     resolution: TabulatedResolution,
 ) -> NDArray[np.float64]:
     """Apply tabulated resolution broadening to a spectrum."""
-    ...
-
-def spatial_map(
-    transmission: NDArray[np.float64],
-    uncertainty: NDArray[np.float64],
-    energies: NDArray[np.float64],
-    isotopes: list[ResonanceData],
-    temperature_k: float = 293.6,
-    initial_densities: list[float] | None = None,
-    dead_pixels: NDArray[np.bool_] | None = None,
-    flight_path_m: float | None = None,
-    delta_t_us: float | None = None,
-    delta_l_m: float | None = None,
-    resolution: TabulatedResolution | None = None,
-    delta_e_us: float | None = None,
-    max_iter: int = 100,
-    fitter: str = "lm",
-    roi: list[int] | None = None,
-    background: bool = False,
-) -> SpatialResult | SparseResult:
-    """Run per-pixel fitting across a transmission image stack.
-
-    When ``background=True``, each pixel's model becomes
-    ``Anorm * exp(-sum(n_i * sigma_i)) + BackA + BackB/sqrt(E) + BackC*sqrt(E)``.
-    """
-    ...
-
-def spatial_map_regularized(
-    transmission: NDArray[np.float64],
-    uncertainty: NDArray[np.float64],
-    energies: NDArray[np.float64],
-    isotopes: list[ResonanceData],
-    temperature_k: float = 293.6,
-    initial_densities: list[float] | None = None,
-    dead_pixels: NDArray[np.bool_] | None = None,
-    flight_path_m: float | None = None,
-    delta_t_us: float | None = None,
-    delta_l_m: float | None = None,
-    resolution: TabulatedResolution | None = None,
-    delta_e_us: float | None = None,
-    max_iter: int = 100,
-    fitter: str = "lm",
-    threshold: float = 0.05,
-    smooth_iter: int = 10,
-    compute_uncertainty: bool = True,
-    regularize_temperature: bool = True,
-    background: bool = False,
-) -> RegularizedResult:
-    """Run spatially regularized per-pixel fitting.
-
-    Uses Fisher eigenbasis selective regularization: identifies
-    poorly-determined parameter directions from the cross-section
-    structure and spatially smooths only those directions.
-
-    Temperature directions are included in the eigenbasis analysis
-    when temperature fitting is active in the FitConfig.
-    """
-    ...
-
-def fit_roi(
-    transmission: NDArray[np.float64],
-    uncertainty: NDArray[np.float64],
-    y_range: tuple[int, int],
-    x_range: tuple[int, int],
-    energies: NDArray[np.float64],
-    isotopes: list[ResonanceData],
-    temperature_k: float = 293.6,
-    initial_densities: list[float] | None = None,
-    flight_path_m: float | None = None,
-    delta_t_us: float | None = None,
-    delta_l_m: float | None = None,
-    resolution: TabulatedResolution | None = None,
-    delta_e_us: float | None = None,
-    max_iter: int = 100,
-) -> FitResult:
-    """Fit a single spectrum averaged over a region of interest."""
     ...
 
 def load_tiff_stack(path: str) -> NDArray[np.float64]:
@@ -723,19 +543,12 @@ def spatial_map_typed(
     flight_path_m: float | None = None,
     delta_t_us: float | None = None,
     delta_l_m: float | None = None,
-    regularize: bool = False,
-    reg_threshold: float = 0.05,
-    reg_smooth_iter: int = 10,
 ) -> SpatialResult:
     """Spatial mapping using the typed input data API.
 
     Dispatches per-pixel fitting based on InputData type:
       - from_counts → Poisson KL on raw counts (optimal)
       - from_transmission → LM (default) or KL (solver="kl")
-
-    When regularize=True, applies Fisher eigenbasis selective spatial
-    regularization after the initial per-pixel fit. Uses the correct
-    Fisher metric (Poisson or Gaussian) based on the solver.
 
     Always returns SpatialResult.
     """

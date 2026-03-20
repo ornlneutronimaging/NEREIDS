@@ -3,22 +3,18 @@
 //! PyO3 Python bindings for the NEREIDS neutron resonance imaging library.
 //!
 //! Provides a Pythonic API for:
-//! - Computing theoretical transmission spectra
-//! - Fitting measured transmission to recover isotopic compositions
-//!   (Levenberg-Marquardt chi-squared or Poisson NLL via `poisson_fit`)
-//! - Spatial mapping across imaging data
+//! - Computing theoretical transmission spectra (`forward_model`)
+//! - Spatial mapping across imaging data (`spatial_map_typed`)
+//! - Trace-detectability analysis (`trace_detectability`)
+//! - Energy calibration (`calibrate_energy`)
 //!
-//! ## Solvers
+//! ## Typed Input Data API
 //!
-//! Two fitting backends are available, selected by the `fitter` parameter
-//! of [`fit_spectrum`]:
+//! Use `from_counts()` or `from_transmission()` to create typed input data,
+//! then pass to `spatial_map_typed()` for per-pixel fitting:
 //!
-//! - **`"lm"`** (default) — Levenberg-Marquardt minimising chi-squared.
-//!   Requires calibrated uncertainties (`sigma`).
-//! - **`"poisson"`** — Poisson negative-log-likelihood with analytical
-//!   gradient (`poisson_fit`).  `sigma` is unused but required
-//!   for API consistency.  Uncertainties are not available from this
-//!   solver (returned as NaN).
+//! - **Counts** → Poisson KL (statistically optimal for raw detector counts)
+//! - **Transmission** → LM (default) or KL (opt-in via `solver="kl"`)
 //!
 //! ## Usage
 //! ```python
@@ -32,11 +28,9 @@
 //! energies = np.linspace(1.0, 30.0, 1000)
 //! transmission = nereids.forward_model(energies, [(isotope, 0.001)], temperature_k=293.6)
 //!
-//! # Fit a measured spectrum (LM solver, default)
-//! result = nereids.fit_spectrum(measured_t, sigma, energies, [isotope])
-//!
-//! # Fit with Poisson solver (uncertainties will be NaN)
-//! result = nereids.fit_spectrum(measured_t, sigma, energies, [isotope], fitter="poisson")
+//! # Spatial mapping with typed API
+//! data = nereids.from_transmission(transmission_3d, uncertainty_3d)
+//! result = nereids.spatial_map_typed(data, energies, [isotope])
 //! ```
 
 use std::sync::Arc;
@@ -54,10 +48,6 @@ use nereids_endf::resonance::{
     LGroup, Resonance, ResonanceData, ResonanceFormalism, ResonanceRange,
 };
 use nereids_endf::retrieval::{EndfLibrary, EndfRetriever, mat_number};
-use nereids_fitting::lm::{self, FitModel, LmConfig};
-use nereids_fitting::parameters::{FitParameter, ParameterSet};
-use nereids_fitting::poisson::{self, PoissonConfig};
-use nereids_fitting::transmission_model::{PrecomputedTransmissionModel, TransmissionFitModel};
 use nereids_io::normalization::{self as norm, NormalizationParams};
 use nereids_io::tof::BeamlineParams;
 use nereids_physics::doppler::{self, DopplerParams};

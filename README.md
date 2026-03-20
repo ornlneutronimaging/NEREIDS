@@ -108,18 +108,13 @@ transmission = nereids.forward_model(
     temperature_k=293.6,
 )
 
-# Fit the spectrum to recover densities
-result = nereids.fit_spectrum(
-    measured_t=transmission,
-    sigma=np.full_like(transmission, 0.01),
-    energies=energies,
-    isotopes=[u238, fe56],
-    temperature_k=293.6,
-)
+# Spatial mapping with typed API
+trans_3d = transmission[:, None, None] * np.ones((1, 4, 4))  # (n_e, ny, nx)
+sigma_3d = np.full_like(trans_3d, 0.01)
+data = nereids.from_transmission(trans_3d, sigma_3d)
+result = nereids.spatial_map_typed(data, energies, [u238, fe56])
 
-print(f"U-238: {result.densities[0]:.4f} at/barn (true: 0.005)")
-print(f"Fe-56: {result.densities[1]:.4f} at/barn (true: 0.01)")
-print(f"Converged: {result.converged}, chi2r: {result.reduced_chi_squared:.3f}")
+print(f"Converged: {result.n_converged}/{result.n_total} pixels")
 ```
 
 See the [examples/notebooks/](examples/notebooks/) directory for 17 tutorial

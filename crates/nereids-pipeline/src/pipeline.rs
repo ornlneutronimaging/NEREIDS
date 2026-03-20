@@ -101,8 +101,7 @@ pub enum InputData {
     },
     /// Counts with pre-estimated nuisance parameters (power users).
     ///
-    /// Use when you want to inspect or override the flux estimate from
-    /// [`estimate_nuisance`] before fitting.
+    /// Use when you want to inspect or override the flux estimate before fitting.
     CountsWithNuisance {
         /// Sample counts per energy bin.
         sample_counts: Vec<f64>,
@@ -131,8 +130,8 @@ impl InputData {
 
 /// Solver-specific configuration.
 ///
-/// Replaces the old [`SolverChoice`] enum by carrying the full solver config
-/// inside each variant, making invalid combinations unrepresentable.
+/// Carries the full solver config inside each variant, making invalid
+/// combinations unrepresentable.
 #[derive(Debug, Clone, Default)]
 pub enum SolverConfig {
     /// Levenberg-Marquardt chi-squared minimizer.
@@ -150,7 +149,7 @@ pub enum SolverConfig {
 ///   Y(E) = α₁ · [Φ(E) · exp(-Σ nᵢσᵢ(E))] + α₂ · B(E)
 ///
 /// where Φ(E) is the incident flux and B(E) is detector/gamma background.
-/// Both are estimated from the open beam data via [`estimate_nuisance`].
+/// Both are estimated from the open beam data via spatial averaging.
 ///
 /// This is structurally different from the transmission background model
 /// ([`BackgroundConfig`]) because:
@@ -186,7 +185,7 @@ impl Default for CountsBackgroundConfig {
 ///
 /// Unlike [`FitConfig`], this carries both transmission and counts background
 /// configs, and uses [`SolverConfig`] (which embeds solver-specific tuning)
-/// instead of separate `LmConfig` + `SolverChoice` fields.
+/// instead of separate `LmConfig` fields.
 #[derive(Debug, Clone)]
 pub struct UnifiedFitConfig {
     // ── Physics (shared by both engines) ──
@@ -993,8 +992,6 @@ pub enum FitConfigError {
     NonFiniteTemperature(f64),
     /// Temperature must be non-negative.
     NegativeTemperature(f64),
-    /// When fit_temperature is true, temperature must be >= 1.0 K.
-    FitTemperatureTooLow(f64),
 }
 
 impl fmt::Display for FitConfigError {
@@ -1018,12 +1015,6 @@ impl fmt::Display for FitConfigError {
             }
             Self::NegativeTemperature(v) => {
                 write!(f, "temperature must be non-negative, got {v}")
-            }
-            Self::FitTemperatureTooLow(v) => {
-                write!(
-                    f,
-                    "temperature must be >= 1.0 K when fit_temperature is true, got {v}"
-                )
             }
         }
     }
@@ -1432,5 +1423,78 @@ mod tests {
 
         let result = fit_spectrum_typed(&input, &config);
         assert!(result.is_err(), "CountsWithNuisance + LM should error");
+    }
+
+    /// Helper: build synthetic transmission at a given temperature.
+    fn synthetic_transmission_at_temp(
+        data: &ResonanceData,
+        true_density: f64,
+        temperature_k: f64,
+        energies: &[f64],
+    ) -> (Vec<f64>, Vec<f64>) {
+        let xs = phys_transmission::broadened_cross_sections(
+            energies,
+            std::slice::from_ref(data),
+            temperature_k,
+            None,
+            None,
+        )
+        .unwrap();
+        let model = PrecomputedTransmissionModel {
+            cross_sections: Arc::new(xs),
+            density_indices: Arc::new(vec![0]),
+        };
+        let t = model.evaluate(&[true_density]).unwrap();
+        let sigma: Vec<f64> = t.iter().map(|&v| 0.01 * v.max(0.01)).collect();
+        (t, sigma)
+    }
+
+    #[test]
+    fn test_typed_poisson_kl_with_temperature() {
+        let data = u238_single_resonance();
+        let true_density = 0.0005;
+        let true_temp = 350.0;
+        let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
+        let (t, sigma) = synthetic_transmission_at_temp(&data, true_density, true_temp, &energies);
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            300.0, // initial guess (off by 50 K)
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig {
+            max_iter: 500,
+            ..PoissonConfig::default()
+        }))
+        .with_fit_temperature(true);
+
+        let input = InputData::Transmission {
+            transmission: t,
+            uncertainty: sigma,
+        };
+
+        let result = fit_spectrum_typed(&input, &config).unwrap();
+
+        // Check density recovery (within 1%)
+        let fitted_density = result.densities[0];
+        assert!(
+            (fitted_density - true_density).abs() / true_density < 0.01,
+            "density: fitted={fitted_density}, true={true_density}, ratio={}",
+            (fitted_density - true_density).abs() / true_density,
+        );
+
+        // Check temperature recovery (within 1 K)
+        let fitted_temp = result
+            .temperature_k
+            .expect("temperature_k should be Some when fit_temperature=true");
+        assert!(
+            (fitted_temp - true_temp).abs() < 1.0,
+            "temperature: fitted={fitted_temp}, true={true_temp}, delta={}",
+            (fitted_temp - true_temp).abs(),
+        );
     }
 }

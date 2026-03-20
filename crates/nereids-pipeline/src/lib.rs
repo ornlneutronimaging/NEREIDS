@@ -16,7 +16,6 @@ pub mod error;
 /// Test utility: synthetic noise generation for integration tests.
 pub(crate) mod noise;
 pub mod pipeline;
-pub mod regularization;
 pub mod spatial;
 
 #[cfg(test)]

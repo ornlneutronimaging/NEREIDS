@@ -248,7 +248,7 @@ pub fn spatial_map_typed(
     let has_transmission_bg = config.transmission_background().is_some();
 
     // For counts data: spatially average the open beam to get a stable flux
-    // estimate, matching what estimate_nuisance/sparse_reconstruct does.
+    // estimate, reducing per-pixel open-beam shot noise.
     // Without this, per-pixel open-beam shot noise contaminates the flux
     // estimate and makes KL fits materially noisier.
     let averaged_flux: Option<Vec<f64>> = if is_counts {

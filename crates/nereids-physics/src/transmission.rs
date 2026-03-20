@@ -206,7 +206,8 @@ impl From<crate::doppler::DopplerError> for TransmissionError {
 /// `xs[k][e]` is the Doppler+resolution-broadened cross-section for isotope
 /// `k` at energy index `e`; `dxs_dt[k][e]` is the central finite-difference
 /// derivative with respect to temperature.
-pub type BroadenedXsWithDerivative = (Vec<Vec<f64>>, Vec<Vec<f64>>);
+#[cfg(test)]
+pub(crate) type BroadenedXsWithDerivative = (Vec<Vec<f64>>, Vec<Vec<f64>>);
 
 /// Compute transmission from cross-sections via Beer-Lambert law.
 ///
@@ -869,7 +870,8 @@ pub fn broadened_cross_sections_from_base(
 /// applied to both σ and ∂σ/∂T (valid because resolution is a linear operator).
 ///
 /// Returns `BroadenedXsWithDerivative`: `(sigma_k, dsigma_k_dT)`.
-pub fn broadened_cross_sections_with_analytical_derivative_from_base(
+#[cfg(test)]
+pub(crate) fn broadened_cross_sections_with_analytical_derivative_from_base(
     energies: &[f64],
     base_xs: &[Vec<f64>],
     resonance_data: &[ResonanceData],

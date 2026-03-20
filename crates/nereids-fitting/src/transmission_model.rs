@@ -129,9 +129,9 @@ impl FitModel for PrecomputedTransmissionModel {
 /// across calls at the same temperature), and the analytical Jacobian
 /// provides density columns directly plus a single FD column for temperature.
 ///
-/// `instrument` uses `Arc` so that parallel pixel loops (e.g. in `sparse.rs`)
-/// can share one copy of a potentially large tabulated resolution kernel
-/// via cheap reference-count increments instead of deep-cloning per pixel.
+/// `instrument` uses `Arc` so that parallel pixel loops can share one copy
+/// of a potentially large tabulated resolution kernel via cheap
+/// reference-count increments instead of deep-cloning per pixel.
 pub struct TransmissionFitModel {
     /// Energy grid (eV), ascending.
     energies: Vec<f64>,
