@@ -293,16 +293,26 @@ impl PyIsotopeGroup {
                 .collect()
         });
 
-        // Map results back into self.resonance_data.
-        for (i, result) in results.into_iter().enumerate() {
-            let data = result.map_err(|(is_parse, msg)| {
-                if is_parse {
-                    pyo3::exceptions::PyValueError::new_err(msg)
-                } else {
-                    pyo3::exceptions::PyRuntimeError::new_err(msg)
-                }
-            })?;
-            self.resonance_data[i] = Some(Arc::new(data));
+        // Stage all results first — if any failed, return error without
+        // modifying self.resonance_data (atomic update).
+        let staged: Vec<Arc<ResonanceData>> = results
+            .into_iter()
+            .enumerate()
+            .map(|(i, result)| {
+                result.map(|d| Arc::new(d)).map_err(|(is_parse, msg)| {
+                    let member = &self.inner.members()[i];
+                    let prefix = format!("Z={} A={}: ", member.0.z(), member.0.a());
+                    if is_parse {
+                        pyo3::exceptions::PyValueError::new_err(prefix + &msg)
+                    } else {
+                        pyo3::exceptions::PyRuntimeError::new_err(prefix + &msg)
+                    }
+                })
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        // All succeeded — swap in atomically.
+        for (i, data) in staged.into_iter().enumerate() {
+            self.resonance_data[i] = Some(data);
         }
 
         Ok(())
@@ -2243,6 +2253,11 @@ fn build_config_from_groups(
     res_fn: Option<ResolutionFunction>,
     initial_densities: Option<Vec<f64>>,
 ) -> PyResult<UnifiedFitConfig> {
+    if groups.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "groups must not be empty",
+        ));
+    }
     // Validate all groups are loaded
     for g in groups {
         if !g.is_loaded() {

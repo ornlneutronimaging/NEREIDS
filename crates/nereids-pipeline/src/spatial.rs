@@ -226,6 +226,25 @@ pub fn spatial_map_typed(
         }
     };
 
+    // When groups are active and temperature is NOT being fitted, collapse
+    // per-member broadened XS into per-group σ_eff once here.  This avoids
+    // redundant O(n_members × n_energies) collapsing inside
+    // build_transmission_model on every per-pixel call.
+    let xs = if !config.fit_temperature()
+        && let (Some(di), Some(dr)) = (&config.density_indices, &config.density_ratios)
+    {
+        let n_e = xs[0].len();
+        let mut eff = vec![vec![0.0f64; n_e]; n_maps];
+        for ((&idx, &ratio), member_xs) in di.iter().zip(dr.iter()).zip(xs.iter()) {
+            for (j, &sigma) in member_xs.iter().enumerate() {
+                eff[idx][j] += ratio * sigma;
+            }
+        }
+        Arc::new(eff)
+    } else {
+        xs
+    };
+
     // Precompute unbroadened (base) cross-sections for temperature fitting.
     // This avoids 74× overhead from redundant Reich-Moore evaluation per
     // KL iteration (112ms Reich-Moore vs 1.5ms Doppler rebroadening).
@@ -239,6 +258,9 @@ pub fn spatial_map_typed(
             .with_precomputed_base_xs(Arc::new(base_xs))
             .with_compute_covariance(false)
     } else {
+        // For non-temperature path: xs is already collapsed to σ_eff when
+        // groups are active, so build_transmission_model sees n_maps entries
+        // with identity mapping and no ratio folding needed.
         config
             .clone()
             .with_precomputed_cross_sections(xs)

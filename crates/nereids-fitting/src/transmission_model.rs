@@ -194,6 +194,13 @@ impl TransmissionFitModel {
         external_base_xs: Option<Arc<Vec<Vec<f64>>>>,
     ) -> Result<Self, FittingError> {
         let (density_indices, density_ratios) = density_mapping;
+        if density_indices.len() != resonance_data.len() {
+            return Err(FittingError::InvalidConfig(format!(
+                "density_indices has {} entries but resonance_data has {}",
+                density_indices.len(),
+                resonance_data.len(),
+            )));
+        }
         if density_ratios.len() != resonance_data.len() {
             return Err(FittingError::InvalidConfig(format!(
                 "density_ratios has {} entries but resonance_data has {}",

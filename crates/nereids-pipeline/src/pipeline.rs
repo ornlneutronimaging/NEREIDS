@@ -213,10 +213,10 @@ pub struct UnifiedFitConfig {
     // ── Isotope group mapping (optional) ──
     /// Maps member isotope index → density parameter index.
     /// `None` = identity mapping (one param per isotope, backward compat).
-    density_indices: Option<Vec<usize>>,
+    pub(crate) density_indices: Option<Vec<usize>>,
     /// Fractional ratio per member isotope.
     /// `None` = all 1.0 (backward compat).
-    density_ratios: Option<Vec<f64>>,
+    pub(crate) density_ratios: Option<Vec<f64>>,
     /// Number of density parameters (groups or isotopes).
     /// `None` = `resonance_data.len()` (backward compat).
     n_density_params: Option<usize>,
@@ -348,16 +348,14 @@ impl UnifiedFitConfig {
         let mut names = Vec::new();
         for (g_idx, (group, rd_list)) in groups.iter().enumerate() {
             if rd_list.len() != group.n_members() {
-                return Err(FitConfigError::NameCountMismatch {
-                    names: rd_list.len(),
-                    isotopes: group.n_members(),
+                return Err(FitConfigError::GroupMemberCountMismatch {
+                    group_name: group.name().to_string(),
+                    rd_count: rd_list.len(),
+                    member_count: group.n_members(),
                 });
             }
             names.push(group.name().to_string());
-            for (member_idx, ((_isotope, ratio), rd)) in
-                group.members().iter().zip(rd_list.iter()).enumerate()
-            {
-                let _ = member_idx;
+            for ((_isotope, ratio), rd) in group.members().iter().zip(rd_list.iter()) {
                 all_resonance_data.push(rd.clone());
                 all_indices.push(g_idx);
                 all_ratios.push(*ratio);
@@ -1081,6 +1079,12 @@ pub enum FitConfigError {
     DensityCountMismatch { densities: usize, isotopes: usize },
     /// isotope_names length must match resonance_data length.
     NameCountMismatch { names: usize, isotopes: usize },
+    /// resonance_data count must match group member count.
+    GroupMemberCountMismatch {
+        group_name: String,
+        rd_count: usize,
+        member_count: usize,
+    },
     /// Temperature must be finite.
     NonFiniteTemperature(f64),
     /// Temperature must be non-negative.
@@ -1102,6 +1106,14 @@ impl fmt::Display for FitConfigError {
             Self::NameCountMismatch { names, isotopes } => write!(
                 f,
                 "isotope_names length ({names}) must match resonance_data length ({isotopes})"
+            ),
+            Self::GroupMemberCountMismatch {
+                group_name,
+                rd_count,
+                member_count,
+            } => write!(
+                f,
+                "group '{group_name}': provided {rd_count} ResonanceData but group has {member_count} members"
             ),
             Self::NonFiniteTemperature(v) => {
                 write!(f, "temperature must be finite, got {v}")
@@ -1589,5 +1601,108 @@ mod tests {
             "temperature: fitted={fitted_temp}, true={true_temp}, delta={}",
             (fitted_temp - true_temp).abs(),
         );
+    }
+
+    /// Build a synthetic single-resonance ResonanceData for testing.
+    fn synthetic_rd(z: u32, a: u32, awr: f64, energy: f64) -> ResonanceData {
+        use nereids_endf::resonance::*;
+        ResonanceData {
+            isotope: nereids_core::types::Isotope::new(z, a).unwrap(),
+            za: z * 1000 + a,
+            awr,
+            ranges: vec![ResonanceRange {
+                energy_low: 1e-5,
+                energy_high: 1e4,
+                resolved: true,
+                formalism: ResonanceFormalism::ReichMoore,
+                target_spin: 0.0,
+                scattering_radius: 5.0,
+                naps: 1,
+                l_groups: vec![LGroup {
+                    l: 0,
+                    awr,
+                    apl: 0.0,
+                    qx: 0.0,
+                    lrx: 0,
+                    resonances: vec![Resonance {
+                        energy,
+                        j: 0.5,
+                        gn: 1e-3,
+                        gg: 1e-2,
+                        gfa: 0.0,
+                        gfb: 0.0,
+                    }],
+                }],
+                rml: None,
+                urr: None,
+                ap_table: None,
+                r_external: vec![],
+            }],
+        }
+    }
+
+    /// Round-trip test: create a group of 2 isotopes with known ratios,
+    /// generate synthetic transmission, fit with group constraints,
+    /// verify the fitted group density matches the true value.
+    #[test]
+    fn test_grouped_fit_spectrum_round_trip() {
+        use nereids_core::types::IsotopeGroup;
+
+        // Two synthetic isotopes with resonances at different energies
+        let rd1 = synthetic_rd(92, 235, 233.025, 5.0);
+        let rd2 = synthetic_rd(92, 238, 236.006, 7.0);
+
+        // Group with 60/40 ratio
+        let iso1 = nereids_core::types::Isotope::new(92, 235).unwrap();
+        let iso2 = nereids_core::types::Isotope::new(92, 238).unwrap();
+        let group =
+            IsotopeGroup::custom("U (60/40)".into(), vec![(iso1, 0.6), (iso2, 0.4)]).unwrap();
+
+        let energies: Vec<f64> = (0..301).map(|i| 1.0 + (i as f64) * 0.05).collect();
+        let true_density = 0.0005;
+
+        // Generate synthetic transmission using effective densities
+        let sample = nereids_physics::transmission::SampleParams::new(
+            0.0,
+            vec![
+                (rd1.clone(), true_density * 0.6),
+                (rd2.clone(), true_density * 0.4),
+            ],
+        )
+        .unwrap();
+        let transmission =
+            nereids_physics::transmission::forward_model(&energies, &sample, None).unwrap();
+        let uncertainty: Vec<f64> = transmission.iter().map(|&t| 0.01 * t.max(0.01)).collect();
+
+        // Build config with group
+        let config = UnifiedFitConfig::new(
+            energies.clone(),
+            vec![rd1.clone()],
+            vec!["placeholder".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_groups(&[(&group, &[rd1, rd2])], vec![0.001])
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()));
+
+        let input = InputData::Transmission {
+            transmission,
+            uncertainty,
+        };
+
+        let result = fit_spectrum_typed(&input, &config).unwrap();
+
+        // Should recover true density within 1%
+        assert_eq!(result.densities.len(), 1, "should have 1 group density");
+        let fitted = result.densities[0];
+        let rel_error = (fitted - true_density).abs() / true_density;
+        assert!(
+            rel_error < 0.01,
+            "group density: fitted={fitted}, true={true_density}, rel_error={rel_error}"
+        );
+        assert!(result.converged, "fit should converge");
     }
 }
