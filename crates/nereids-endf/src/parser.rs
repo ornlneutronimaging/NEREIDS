@@ -1381,8 +1381,52 @@ fn parse_urr_range(
                     gf.push(values[base + 5]);
                 }
 
-                // Validate that URR energy grid is strictly ascending to satisfy
-                // the precondition of table_interp ("xs must be strictly ascending").
+                // Deduplicate energy grid: some evaluations (e.g., JENDL-5
+                // Eu-151, Eu-153) contain duplicate energy points. SAMMY
+                // silently accepts these. We keep the LAST occurrence of
+                // each duplicate energy, matching SAMMY behavior.
+                // Exact f64 equality is correct: ENDF duplicates are
+                // bitwise-identical copies in the same file record.
+                // Issue: #402
+                {
+                    let n = energies.len();
+                    if n > 1 {
+                        // O(n) backwards compaction: keep last of each run.
+                        let mut write = n - 1;
+                        let mut last_e = energies[n - 1];
+                        let mut read = n - 1;
+                        while read > 0 {
+                            read -= 1;
+                            if energies[read] == last_e {
+                                continue;
+                            }
+                            write -= 1;
+                            energies[write] = energies[read];
+                            d[write] = d[read];
+                            gx[write] = gx[read];
+                            gn[write] = gn[read];
+                            gg[write] = gg[read];
+                            gf[write] = gf[read];
+                            last_e = energies[read];
+                        }
+                        let new_len = n - write;
+                        energies.copy_within(write..n, 0);
+                        d.copy_within(write..n, 0);
+                        gx.copy_within(write..n, 0);
+                        gn.copy_within(write..n, 0);
+                        gg.copy_within(write..n, 0);
+                        gf.copy_within(write..n, 0);
+                        energies.truncate(new_len);
+                        d.truncate(new_len);
+                        gx.truncate(new_len);
+                        gn.truncate(new_len);
+                        gg.truncate(new_len);
+                        gf.truncate(new_len);
+                    }
+                }
+
+                // Validate that the (now deduplicated) URR energy grid is
+                // strictly ascending (precondition of table_interp).
                 for i in 0..energies.len().saturating_sub(1) {
                     if energies[i] >= energies[i + 1] {
                         return Err(EndfParseError::UnsupportedFormat(format!(
@@ -2469,5 +2513,48 @@ mod tests {
             err.to_string().contains("Multiple materials"),
             "expected multi-MAT error, got: {err}"
         );
+    }
+
+    /// Verify URR energy deduplication keeps the last occurrence.
+    #[test]
+    #[allow(clippy::useless_vec)] // Vecs needed for mutation (truncate/copy_within)
+    fn test_urr_energy_dedup_keeps_last() {
+        // Simulate the dedup logic on mock parallel arrays.
+        let mut energies = vec![1.0, 2.0, 2.0, 3.0, 3.0, 3.0, 4.0];
+        let mut d = vec![10.0, 20.0, 21.0, 30.0, 31.0, 32.0, 40.0];
+        let mut gx = vec![0.0; 7];
+        let mut gn = vec![0.0; 7];
+        let mut gg = vec![0.0; 7];
+        let mut gf = vec![0.0; 7];
+
+        let n = energies.len();
+        if n > 1 {
+            let mut write = n - 1;
+            let mut last_e = energies[n - 1];
+            let mut read = n - 1;
+            while read > 0 {
+                read -= 1;
+                if energies[read] == last_e {
+                    continue;
+                }
+                write -= 1;
+                energies[write] = energies[read];
+                d[write] = d[read];
+                gx[write] = gx[read];
+                gn[write] = gn[read];
+                gg[write] = gg[read];
+                gf[write] = gf[read];
+                last_e = energies[read];
+            }
+            let new_len = n - write;
+            energies.copy_within(write..n, 0);
+            d.copy_within(write..n, 0);
+            energies.truncate(new_len);
+            d.truncate(new_len);
+        }
+
+        assert_eq!(energies, [1.0, 2.0, 3.0, 4.0]);
+        // d[1]=21.0 (last of the 2.0 pair), d[2]=32.0 (last of the 3.0 triple)
+        assert_eq!(d, [10.0, 21.0, 32.0, 40.0]);
     }
 }
