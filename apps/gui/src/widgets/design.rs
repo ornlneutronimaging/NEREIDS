@@ -6,8 +6,7 @@
 //! §Tabs, §Badges, §Content Area, §Toolbar, §Drop Zones.
 
 use crate::state::{
-    AppState, EndfFetchResult, EndfStatus, FetchTarget, GuidedStep, IsotopeEntry, ResolutionMode,
-    SpectrumAxis,
+    AppState, EndfFetchResult, EndfStatus, FetchTarget, GuidedStep, ResolutionMode, SpectrumAxis,
 };
 use crate::theme::{ThemeColors, semantic};
 use egui::{Color32, CornerRadius, Margin, Rect, Response, RichText, Sense, Shadow, Stroke, Ui};
@@ -926,11 +925,12 @@ pub(crate) fn build_spectrum_x_axis(
 
 /// Draw resonance energy dip markers on a spectrum plot (energy axis only).
 ///
-/// Iterates all enabled isotope entries with resonance data and draws a `VLine`
-/// for each resonance within the data x-range.
+/// Iterates all provided resonance data sets and draws a `VLine`
+/// for each resonance within the data x-range. The caller is responsible
+/// for collecting resonance data from both individual entries and group members.
 pub(crate) fn draw_resonance_dips(
     plot_ui: &mut egui_plot::PlotUi,
-    entries: &[IsotopeEntry],
+    all_resonance_data: &[nereids_endf::resonance::ResonanceData],
     x_values: &[f64],
 ) {
     let (x_min, x_max) = x_values
@@ -940,13 +940,7 @@ pub(crate) fn draw_resonance_dips(
         .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
             (lo.min(v), hi.max(v))
         });
-    for entry in entries {
-        if !entry.enabled {
-            continue;
-        }
-        let Some(ref res_data) = entry.resonance_data else {
-            continue;
-        };
+    for res_data in all_resonance_data {
         for range in &res_data.ranges {
             for lg in &range.l_groups {
                 for res in &lg.resonances {
@@ -963,48 +957,52 @@ pub(crate) fn draw_resonance_dips(
     }
 }
 
+/// Parameters for building a fit overlay line.
+pub(crate) struct FitLineParams<'a> {
+    pub result: &'a nereids_pipeline::pipeline::SpectrumFitResult,
+    pub resonance_data: &'a [nereids_endf::resonance::ResonanceData],
+    pub density_indices: &'a [usize],
+    pub density_ratios: &'a [f64],
+    pub energies: &'a [f64],
+    pub temperature_k: f64,
+    pub x_values: &'a [f64],
+    pub n_plot: usize,
+}
+
 /// Build a fit overlay line from a `SpectrumFitResult`.
 ///
-/// Returns `None` if the fit didn't converge, no enabled isotopes have resonance data,
+/// Returns `None` if the fit didn't converge, no resonance data is provided,
 /// or model construction fails.
-pub(crate) fn build_fit_line(
-    result: &nereids_pipeline::pipeline::SpectrumFitResult,
-    entries: &[IsotopeEntry],
-    energies: &[f64],
-    temperature_k: f64,
-    x_values: &[f64],
-    n_plot: usize,
-) -> Option<Line<'static>> {
-    if !result.converged {
+///
+/// `resonance_data` should contain data for ALL fitted entities
+/// (individual isotopes + group members). `density_indices` and `density_ratios`
+/// map each resonance data entry to a density parameter index and its abundance ratio.
+pub(crate) fn build_fit_line(p: &FitLineParams<'_>) -> Option<Line<'static>> {
+    if !p.result.converged {
         return None;
     }
-    let resonance_data: Vec<_> = entries
-        .iter()
-        .filter(|e| e.enabled && e.resonance_data.is_some())
-        .filter_map(|e| e.resonance_data.clone())
-        .collect();
-    if resonance_data.is_empty() {
+    if p.resonance_data.is_empty() {
         return None;
     }
-    let overlay_temp = result.temperature_k.unwrap_or(temperature_k);
-    let n = result.densities.len();
+    let resonance_data: Vec<_> = p.resonance_data.to_vec();
+    let overlay_temp = p.result.temperature_k.unwrap_or(p.temperature_k);
     let model = nereids_fitting::transmission_model::TransmissionFitModel::new(
-        energies.to_vec(),
+        p.energies.to_vec(),
         resonance_data,
         overlay_temp,
         None,
-        ((0..n).collect(), vec![1.0; n]),
+        (p.density_indices.to_vec(), p.density_ratios.to_vec()),
         None,
         None,
     )
     .ok()?;
 
     use nereids_fitting::lm::FitModel;
-    let fitted_t = model.evaluate(&result.densities).ok()?;
-    let n_fit = n_plot.min(fitted_t.len()).min(x_values.len());
+    let fitted_t = model.evaluate(&p.result.densities).ok()?;
+    let n_fit = p.n_plot.min(fitted_t.len()).min(p.x_values.len());
     let fit_points: PlotPoints = (0..n_fit)
-        .filter(|&i| x_values[i].is_finite())
-        .map(|i| [x_values[i], fitted_t[i]])
+        .filter(|&i| p.x_values[i].is_finite())
+        .map(|i| [p.x_values[i], fitted_t[i]])
         .collect();
     Some(Line::new("Fit", fit_points).width(2.0))
 }

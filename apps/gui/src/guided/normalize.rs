@@ -1,7 +1,8 @@
 //! Step 3: Normalize — transmission computation, preview, and analysis mode selection.
 
 use crate::state::{
-    AnalysisMode, AppState, InputMode, ProvenanceEventKind, SpectrumAxis, SpectrumDataSource,
+    AnalysisMode, AppState, EndfStatus, InputMode, ProvenanceEventKind, SpectrumAxis,
+    SpectrumDataSource,
 };
 use crate::widgets::design::{self, NavAction};
 use crate::widgets::image_view::show_viridis_image;
@@ -345,7 +346,22 @@ fn preview_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
             // Resonance dip markers (energy axis only)
             if state.show_resonance_dips && state.normalize_spectrum_axis == SpectrumAxis::EnergyEv
             {
-                design::draw_resonance_dips(plot_ui, &state.isotope_entries, &x_values);
+                let mut all_rd: Vec<nereids_endf::resonance::ResonanceData> = state
+                    .isotope_entries
+                    .iter()
+                    .filter(|e| e.enabled && e.resonance_data.is_some())
+                    .filter_map(|e| e.resonance_data.clone())
+                    .collect();
+                for g in &state.isotope_groups {
+                    if g.enabled && g.overall_status() == EndfStatus::Loaded {
+                        for m in &g.members {
+                            if let Some(rd) = &m.resonance_data {
+                                all_rd.push(rd.clone());
+                            }
+                        }
+                    }
+                }
+                design::draw_resonance_dips(plot_ui, &all_rd, &x_values);
             }
         });
 }

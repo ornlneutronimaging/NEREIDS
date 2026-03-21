@@ -636,6 +636,10 @@ fn add_selected_isotopes(state: &mut AppState) {
                 if state.isotope_entries.iter().any(|e| e.z == *z && e.a == *a) {
                     continue; // already present
                 }
+                // Skip if this element already has a group (avoid group+individual overlap)
+                if state.isotope_groups.iter().any(|g| g.z == *z) {
+                    continue;
+                }
                 // Always add with Pending status — the auto-fetch loop in
                 // configure_step will pick up new Pending entries once any
                 // active fetch completes.
@@ -767,11 +771,35 @@ fn add_element_group(state: &mut AppState, z: u32) {
     if natural.is_empty() {
         return;
     }
-    // Duplicate check
+    // Duplicate check: group already exists
     if state.isotope_groups.iter().any(|g| g.z == z) {
         state.status_message = "Element group already added".into();
         close_modal(state);
         return;
+    }
+    // Cross-check: warn if any of this element's natural isotopes exist as individuals
+    let overlapping: Vec<String> = natural
+        .iter()
+        .filter(|(iso, _)| {
+            state
+                .isotope_entries
+                .iter()
+                .any(|e| e.z == z && e.a == iso.a())
+        })
+        .map(|(iso, _)| {
+            let sym = nereids_core::elements::element_symbol(z).unwrap_or("??");
+            format!("{sym}-{}", iso.a())
+        })
+        .collect();
+    if !overlapping.is_empty() {
+        // Remove individual entries that overlap with the group
+        state
+            .isotope_entries
+            .retain(|e| !(e.z == z && natural.iter().any(|(iso, _)| iso.a() == e.a)));
+        state.status_message = format!(
+            "Removed individual {} (now in group)",
+            overlapping.join(", ")
+        );
     }
 
     // Propagate library choice

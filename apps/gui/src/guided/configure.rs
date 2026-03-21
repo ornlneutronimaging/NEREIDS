@@ -290,7 +290,7 @@ fn isotope_chips_flow(ui: &mut egui::Ui, state: &mut AppState) -> ChipFlowResult
         .show(ui, |ui| {
             // Individual isotope chips
             for (idx, entry) in state.isotope_entries.iter_mut().enumerate() {
-                if idx > 0 && idx % n_cols == 0 {
+                if idx > 0 && idx.is_multiple_of(n_cols) {
                     ui.end_row();
                 }
                 let action = design::isotope_chip(

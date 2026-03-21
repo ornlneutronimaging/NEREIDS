@@ -357,14 +357,18 @@ fn analysis_spectrum_column(ui: &mut egui::Ui, state: &mut AppState) {
     // Fit curve (if available)
     let fit_line = state.pixel_fit_result.as_ref().and_then(|result| {
         let energies = state.energies.as_ref()?;
-        design::build_fit_line(
+        let (all_rd, density_indices, density_ratios) =
+            collect_all_resonance_data_with_mapping(state);
+        design::build_fit_line(&design::FitLineParams {
             result,
-            &state.isotope_entries,
+            resonance_data: &all_rd,
+            density_indices: &density_indices,
+            density_ratios: &density_ratios,
             energies,
-            state.temperature_k,
-            &x_values,
+            temperature_k: state.temperature_k,
+            x_values: &x_values,
             n_plot,
-        )
+        })
     });
 
     // Spectrum plot
@@ -792,6 +796,9 @@ fn build_residuals_cache(
     }
 
     // Collect resonance data for enabled isotopes.
+    // Note: when groups are present, this only covers individual isotopes.
+    // Group residuals require group-to-density index mapping, which is a
+    // future enhancement — for now the length guard below returns None.
     let resonance_data: Vec<_> = state
         .isotope_entries
         .iter()
@@ -1232,4 +1239,42 @@ fn no_results_placeholder(ui: &mut egui::Ui) {
             .color(colors.fg3),
         );
     });
+}
+
+/// Collect all resonance data and density mapping from enabled isotopes + groups.
+///
+/// Order matches `build_fit_config()`: individuals first, then group members.
+fn collect_all_resonance_data_with_mapping(
+    state: &AppState,
+) -> (
+    Vec<nereids_endf::resonance::ResonanceData>,
+    Vec<usize>,
+    Vec<f64>,
+) {
+    let mut all_rd = Vec::new();
+    let mut indices = Vec::new();
+    let mut ratios = Vec::new();
+    let mut density_idx = 0usize;
+
+    for e in &state.isotope_entries {
+        if e.enabled && e.resonance_data.is_some() {
+            all_rd.push(e.resonance_data.clone().unwrap());
+            indices.push(density_idx);
+            ratios.push(1.0);
+            density_idx += 1;
+        }
+    }
+    for g in &state.isotope_groups {
+        if g.enabled && g.overall_status() == EndfStatus::Loaded {
+            for m in &g.members {
+                if let Some(rd) = &m.resonance_data {
+                    all_rd.push(rd.clone());
+                    indices.push(density_idx);
+                    ratios.push(m.ratio);
+                }
+            }
+            density_idx += 1;
+        }
+    }
+    (all_rd, indices, ratios)
 }

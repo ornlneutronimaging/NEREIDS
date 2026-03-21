@@ -203,8 +203,10 @@ fn poll_pending_tasks(state: &mut AppState) {
         loop {
             match rx.try_recv() {
                 Ok(fetch) => {
-                    // Match by (z, a) — stable even if isotope list was mutated
-                    let mut matched = false;
+                    // Match by (z, a) — stable even if isotope list was mutated.
+                    // Check BOTH individual entries AND group members for every
+                    // fetch result, because the same (z, a) can appear in both
+                    // lists (e.g., W-182 individually AND as part of a W group).
                     if let Some(entry) = state
                         .isotope_entries
                         .iter_mut()
@@ -223,31 +225,27 @@ fn poll_pending_tasks(state: &mut AppState) {
                                 state.status_message = msg.clone();
                             }
                         }
-                        matched = true;
                     }
                     // Also check group members (z on group, a on member)
-                    if !matched {
-                        for group in &mut state.isotope_groups {
-                            if group.z != fetch.z {
-                                continue;
-                            }
-                            if let Some(member) = group.members.iter_mut().find(|m| m.a == fetch.a)
-                            {
-                                match fetch.result {
-                                    Ok(data) => {
-                                        member.resonance_data = Some(data);
-                                        member.endf_status = EndfStatus::Loaded;
-                                        state.status_message = format!("Loaded {}", fetch.symbol);
-                                        state.spatial_result = None;
-                                        state.pixel_fit_result = None;
-                                    }
-                                    Err(msg) => {
-                                        member.endf_status = EndfStatus::Failed;
-                                        state.status_message = msg;
-                                    }
+                    for group in &mut state.isotope_groups {
+                        if group.z != fetch.z {
+                            continue;
+                        }
+                        if let Some(member) = group.members.iter_mut().find(|m| m.a == fetch.a) {
+                            match &fetch.result {
+                                Ok(data) => {
+                                    member.resonance_data = Some(data.clone());
+                                    member.endf_status = EndfStatus::Loaded;
+                                    state.status_message = format!("Loaded {}", fetch.symbol);
+                                    state.spatial_result = None;
+                                    state.pixel_fit_result = None;
                                 }
-                                break;
+                                Err(msg) => {
+                                    member.endf_status = EndfStatus::Failed;
+                                    state.status_message = msg.clone();
+                                }
                             }
+                            break;
                         }
                     }
                 }

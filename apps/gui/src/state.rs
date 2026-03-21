@@ -61,6 +61,10 @@ pub struct SessionCache {
     /// Whether SAMMY-style background normalization is enabled.
     #[serde(default)]
     pub background_enabled: bool,
+    /// Isotope groups: (z, name, members, density, enabled).
+    /// ResonanceData is not serialized — members get Pending status on restore.
+    #[serde(default)]
+    pub isotope_groups: Vec<CachedGroupEntry>,
 }
 
 fn default_rebin_factor() -> usize {
@@ -82,6 +86,24 @@ pub struct CachedIsotope {
     pub symbol: String,
     pub density: f64,
     pub enabled: bool,
+}
+
+/// A cached isotope group entry (serializable, without resonance data).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CachedGroupEntry {
+    pub z: u32,
+    pub name: String,
+    pub members: Vec<CachedGroupMember>,
+    pub initial_density: f64,
+    pub enabled: bool,
+}
+
+/// A cached group member (serializable, without resonance data).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CachedGroupMember {
+    pub a: u32,
+    pub symbol: String,
+    pub ratio: f64,
 }
 
 impl SessionCache {
@@ -137,6 +159,25 @@ impl SessionCache {
             rebin_applied: state.rebin_applied,
             sidebar_collapsed: state.sidebar_collapsed,
             background_enabled: state.background_enabled,
+            isotope_groups: state
+                .isotope_groups
+                .iter()
+                .map(|g| CachedGroupEntry {
+                    z: g.z,
+                    name: g.name.clone(),
+                    members: g
+                        .members
+                        .iter()
+                        .map(|m| CachedGroupMember {
+                            a: m.a,
+                            symbol: m.symbol.clone(),
+                            ratio: m.ratio,
+                        })
+                        .collect(),
+                    initial_density: g.initial_density,
+                    enabled: g.enabled,
+                })
+                .collect(),
         })
     }
 
@@ -164,6 +205,29 @@ impl SessionCache {
                 resonance_data: None,
                 enabled: c.enabled,
                 endf_status: EndfStatus::Pending,
+            })
+            .collect();
+
+        // Restore isotope groups (without resonance data — needs re-fetch)
+        state.isotope_groups = self
+            .isotope_groups
+            .iter()
+            .map(|g| IsotopeGroupEntry {
+                z: g.z,
+                name: g.name.clone(),
+                members: g
+                    .members
+                    .iter()
+                    .map(|m| GroupMemberState {
+                        a: m.a,
+                        symbol: m.symbol.clone(),
+                        ratio: m.ratio,
+                        resonance_data: None,
+                        endf_status: EndfStatus::Pending,
+                    })
+                    .collect(),
+                initial_density: g.initial_density,
+                enabled: g.enabled,
             })
             .collect();
 
@@ -880,6 +944,9 @@ pub struct GroupMemberState {
 impl IsotopeGroupEntry {
     /// Derived ENDF status: Loaded if all members Loaded, Failed if any Failed, etc.
     pub fn overall_status(&self) -> EndfStatus {
+        if self.members.is_empty() {
+            return EndfStatus::Pending;
+        }
         if self
             .members
             .iter()

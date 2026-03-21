@@ -308,12 +308,10 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
         // -- Density map display (read-only ROI overlay) --
         let n_isotopes = result.density_maps.len();
         if n_isotopes > 1 {
-            let current_name = state
-                .isotope_entries
-                .iter()
-                .filter(|e| e.enabled && e.resonance_data.is_some())
-                .nth(state.map_display_isotope.min(n_isotopes - 1))
-                .map(|e| e.symbol.as_str())
+            let labels = &result.isotope_labels;
+            let current_name = labels
+                .get(state.map_display_isotope.min(n_isotopes - 1))
+                .map(|s| s.as_str())
                 .unwrap_or("?");
             ui.horizontal(|ui| {
                 ui.label("Isotope:");
@@ -321,13 +319,7 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
                     .selected_text(current_name)
                     .show_ui(ui, |ui| {
                         for i in 0..n_isotopes {
-                            let name = state
-                                .isotope_entries
-                                .iter()
-                                .filter(|e| e.enabled && e.resonance_data.is_some())
-                                .nth(i)
-                                .map(|e| e.symbol.as_str())
-                                .unwrap_or("?");
+                            let name = labels.get(i).map(|s| s.as_str()).unwrap_or("?");
                             ui.selectable_value(&mut state.map_display_isotope, i, name);
                         }
                     });
@@ -524,6 +516,54 @@ fn apply_roi_editor_result(state: &mut AppState, result: RoiEditorResult) {
     }
 }
 
+/// Collect all resonance data from enabled individual isotopes and group members,
+/// along with the density mapping required by `TransmissionFitModel`.
+///
+/// Order matches `build_fit_config()`: individuals first (as single-member groups),
+/// then actual group members. Returns:
+/// - `all_rd`: flat list of ResonanceData (one per individual isotope + one per group member)
+/// - `density_indices`: maps each rd to a density parameter index
+/// - `density_ratios`: abundance ratio for each rd (1.0 for individuals)
+fn collect_all_resonance_data_with_mapping(
+    state: &AppState,
+) -> (
+    Vec<nereids_endf::resonance::ResonanceData>,
+    Vec<usize>,
+    Vec<f64>,
+) {
+    let mut all_rd = Vec::new();
+    let mut indices = Vec::new();
+    let mut ratios = Vec::new();
+    let mut density_idx = 0usize;
+
+    for e in &state.isotope_entries {
+        if e.enabled && e.resonance_data.is_some() {
+            all_rd.push(e.resonance_data.clone().unwrap());
+            indices.push(density_idx);
+            ratios.push(1.0);
+            density_idx += 1;
+        }
+    }
+    for g in &state.isotope_groups {
+        if g.enabled && g.overall_status() == EndfStatus::Loaded {
+            for m in &g.members {
+                if let Some(rd) = &m.resonance_data {
+                    all_rd.push(rd.clone());
+                    indices.push(density_idx);
+                    ratios.push(m.ratio);
+                }
+            }
+            density_idx += 1;
+        }
+    }
+    (all_rd, indices, ratios)
+}
+
+/// Collect all resonance data (without mapping) for draw_resonance_dips.
+fn collect_all_resonance_data(state: &AppState) -> Vec<nereids_endf::resonance::ResonanceData> {
+    collect_all_resonance_data_with_mapping(state).0
+}
+
 /// Clear downstream fit results when ROI changes.
 fn clear_analyze_downstream(state: &mut AppState) {
     state.pixel_fit_result = None;
@@ -645,14 +685,18 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
     // Fit result (if available)
     let fit_line = state.pixel_fit_result.as_ref().and_then(|result| {
         let energies = state.energies.as_ref()?;
-        design::build_fit_line(
+        let (all_rd, density_indices, density_ratios) =
+            collect_all_resonance_data_with_mapping(state);
+        design::build_fit_line(&design::FitLineParams {
             result,
-            &state.isotope_entries,
+            resonance_data: &all_rd,
+            density_indices: &density_indices,
+            density_ratios: &density_ratios,
             energies,
-            state.temperature_k,
-            &x_values,
+            temperature_k: state.temperature_k,
+            x_values: &x_values,
             n_plot,
-        )
+        })
     });
 
     // TOF position marker x-value
@@ -687,7 +731,8 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
 
             // Resonance dip markers (energy axis only, toggled)
             if state.show_resonance_dips && state.analyze_spectrum_axis == SpectrumAxis::EnergyEv {
-                design::draw_resonance_dips(plot_ui, &state.isotope_entries, &x_values);
+                let all_rd = collect_all_resonance_data(state);
+                design::draw_resonance_dips(plot_ui, &all_rd, &x_values);
             }
         });
 
@@ -712,23 +757,30 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
             }
         });
 
-        for (i, entry) in state
+        // Display per-entity density results — build labels in the same order
+        // as build_fit_config (individuals first, then groups).
+        let mut fit_labels: Vec<String> = state
             .isotope_entries
             .iter()
             .filter(|e| e.enabled && e.resonance_data.is_some())
-            .enumerate()
-        {
-            if i < result.densities.len() {
-                let unc_str = result
-                    .uncertainties
-                    .as_ref()
-                    .and_then(|u| u.get(i))
-                    .map_or("N/A".to_string(), |u| format!("{:.2e}", u));
-                ui.label(format!(
-                    "  {}: rho = {:.6e} +/- {} atoms/barn",
-                    entry.symbol, result.densities[i], unc_str
-                ));
+            .map(|e| e.symbol.clone())
+            .collect();
+        for g in &state.isotope_groups {
+            if g.enabled && g.overall_status() == EndfStatus::Loaded {
+                fit_labels.push(g.name.clone());
             }
+        }
+        for i in 0..result.densities.len() {
+            let name = fit_labels.get(i).map(|s| s.as_str()).unwrap_or("?");
+            let unc_str = result
+                .uncertainties
+                .as_ref()
+                .and_then(|u| u.get(i))
+                .map_or("N/A".to_string(), |u| format!("{:.2e}", u));
+            ui.label(format!(
+                "  {name}: rho = {:.6e} +/- {unc_str} atoms/barn",
+                result.densities[i]
+            ));
         }
     }
 }
@@ -926,12 +978,19 @@ fn fit_pixel(state: &mut AppState) {
         .map(|e| norm.uncertainty[[e, y, x]].max(1e-10))
         .collect();
 
-    let enabled_symbols: Vec<String> = state
+    let mut enabled_symbols: Vec<String> = state
         .isotope_entries
         .iter()
         .filter(|e| e.enabled && e.resonance_data.is_some())
         .map(|e| e.symbol.clone())
         .collect();
+    // Append group names in the same order as build_fit_config
+    // (individuals first as single-member groups, then actual groups).
+    for g in &state.isotope_groups {
+        if g.enabled && g.overall_status() == EndfStatus::Loaded {
+            enabled_symbols.push(g.name.clone());
+        }
+    }
 
     let input = InputData::Transmission {
         transmission: t_spectrum,
@@ -1064,12 +1123,18 @@ fn fit_roi(state: &mut AppState) {
         .map(|&w| if w > 0.0 { 1.0 / w.sqrt() } else { 1.0e30 })
         .collect();
 
-    let enabled_symbols: Vec<String> = state
+    let mut enabled_symbols: Vec<String> = state
         .isotope_entries
         .iter()
         .filter(|e| e.enabled && e.resonance_data.is_some())
         .map(|e| e.symbol.clone())
         .collect();
+    // Append group names in the same order as build_fit_config
+    for g in &state.isotope_groups {
+        if g.enabled && g.overall_status() == EndfStatus::Loaded {
+            enabled_symbols.push(g.name.clone());
+        }
+    }
 
     let roi_input = InputData::Transmission {
         transmission: avg_t,
