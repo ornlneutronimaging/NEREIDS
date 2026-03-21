@@ -220,13 +220,25 @@ fn isotope_chips_flow(ui: &mut egui::Ui, state: &mut AppState) -> ChipFlowResult
     let mut changed = false;
     let locked = state.is_fetching_endf;
 
-    // Constrain width so horizontal_wrapped actually wraps instead of
-    // overflowing when many isotopes are present (e.g., all Te + Pb).
-    let max_w = ui.available_width();
-    ui.horizontal_wrapped(|ui| {
-        ui.set_max_width(max_w);
-        for (idx, entry) in state.isotope_entries.iter_mut().enumerate() {
-            ui.add_enabled_ui(!locked, |ui| {
+    // Render chips in a dynamic grid that adapts to the available width.
+    // egui's horizontal_wrapped doesn't wrap Frame-based widgets, so we
+    // compute the number of columns from available width and chip size,
+    // then use egui::Grid for a clean multi-row layout.
+    let avail_w = ui.available_width();
+    let chip_width = 170.0; // approximate width per chip including spacing
+    let n_cols = ((avail_w / chip_width).floor() as usize).max(1);
+
+    if locked {
+        ui.disable();
+    }
+    egui::Grid::new("isotope_chip_grid")
+        .num_columns(n_cols)
+        .spacing([6.0, 6.0])
+        .show(ui, |ui| {
+            for (idx, entry) in state.isotope_entries.iter_mut().enumerate() {
+                if idx > 0 && idx % n_cols == 0 {
+                    ui.end_row();
+                }
                 let action = design::isotope_chip(
                     ui,
                     &entry.symbol,
@@ -245,9 +257,8 @@ fn isotope_chips_flow(ui: &mut egui::Ui, state: &mut AppState) -> ChipFlowResult
                     }
                     ChipAction::None => {}
                 }
-            });
-        }
-    });
+            }
+        });
 
     if let Some(idx) = to_remove {
         state.isotope_entries.remove(idx);
