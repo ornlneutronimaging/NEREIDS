@@ -1,6 +1,6 @@
 //! Step 2: Configuration — beamline parameters, isotope selection, ENDF fetch.
 
-use crate::state::{AppState, EndfStatus, GuidedStep, PeriodicTableTarget};
+use crate::state::{AppState, EndfStatus, FetchTarget, GuidedStep, PeriodicTableTarget};
 use crate::widgets::design::{self, ChipAction, NavAction};
 use nereids_endf::retrieval::EndfLibrary;
 use std::sync::Arc;
@@ -220,9 +220,25 @@ fn isotope_chips_flow(ui: &mut egui::Ui, state: &mut AppState) -> ChipFlowResult
     let mut changed = false;
     let locked = state.is_fetching_endf;
 
-    ui.horizontal_wrapped(|ui| {
-        for (idx, entry) in state.isotope_entries.iter_mut().enumerate() {
-            ui.add_enabled_ui(!locked, |ui| {
+    // Render chips in a dynamic grid that adapts to the available width.
+    // egui's horizontal_wrapped doesn't wrap Frame-based widgets, so we
+    // compute the number of columns from available width and chip size,
+    // then use egui::Grid for a clean multi-row layout.
+    let avail_w = ui.available_width();
+    let chip_width = 170.0; // approximate width per chip including spacing
+    let n_cols = ((avail_w / chip_width).floor() as usize).max(1);
+
+    if locked {
+        ui.disable();
+    }
+    egui::Grid::new("isotope_chip_grid")
+        .num_columns(n_cols)
+        .spacing([6.0, 6.0])
+        .show(ui, |ui| {
+            for (idx, entry) in state.isotope_entries.iter_mut().enumerate() {
+                if idx > 0 && idx % n_cols == 0 {
+                    ui.end_row();
+                }
                 let action = design::isotope_chip(
                     ui,
                     &entry.symbol,
@@ -241,9 +257,8 @@ fn isotope_chips_flow(ui: &mut egui::Ui, state: &mut AppState) -> ChipFlowResult
                     }
                     ChipAction::None => {}
                 }
-            });
-        }
-    });
+            }
+        });
 
     if let Some(idx) = to_remove {
         state.isotope_entries.remove(idx);
@@ -311,7 +326,7 @@ fn fetch_endf_data(state: &mut AppState) {
     use nereids_core::types::Isotope;
     use nereids_endf::retrieval;
 
-    let mut work: Vec<(usize, Isotope, String, EndfLibrary)> = Vec::new();
+    let mut work: Vec<design::EndfWorkItem> = Vec::new();
     let mut failed_indices: Vec<usize> = Vec::new();
     for (i, entry) in state.isotope_entries.iter().enumerate() {
         if entry.enabled && entry.endf_status == EndfStatus::Pending {
@@ -331,7 +346,14 @@ fn fetch_endf_data(state: &mut AppState) {
                 failed_indices.push(i);
                 continue;
             }
-            work.push((i, isotope, entry.symbol.clone(), state.endf_library));
+            work.push(design::EndfWorkItem {
+                z: entry.z,
+                a: entry.a,
+                target: FetchTarget::Configure,
+                isotope,
+                symbol: entry.symbol.clone(),
+                library: state.endf_library,
+            });
         }
     }
     for i in failed_indices {
@@ -343,9 +365,11 @@ fn fetch_endf_data(state: &mut AppState) {
     }
 
     // Mark entries as Fetching before spawning the background thread
-    for (i, _, _, _) in &work {
-        if let Some(entry) = state.isotope_entries.get_mut(*i) {
-            entry.endf_status = EndfStatus::Fetching;
+    for item in &work {
+        for entry in state.isotope_entries.iter_mut() {
+            if entry.z == item.z && entry.a == item.a {
+                entry.endf_status = EndfStatus::Fetching;
+            }
         }
     }
 

@@ -71,7 +71,9 @@ h5py = ">=3.15.1,<4"
 pandas = ">=3.0.1,<4"
 
 [tool.pixi.pypi-dependencies]
-fastmcp = ">=3.0"
+# fastmcp removed from default env — causes importlib-metadata conflict
+# with conda's pinned version. Install manually: pixi add --pypi fastmcp
+# when MCP server functionality is needed.
 
 [tool.pixi.tasks]
 build = { cmd = "env -u VIRTUAL_ENV maturin develop --release --manifest-path bindings/python/Cargo.toml" }

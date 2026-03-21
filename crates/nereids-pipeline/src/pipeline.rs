@@ -183,9 +183,8 @@ impl Default for CountsBackgroundConfig {
 
 /// Unified fit configuration for all data types and solvers.
 ///
-/// Unlike [`FitConfig`], this carries both transmission and counts background
-/// configs, and uses [`SolverConfig`] (which embeds solver-specific tuning)
-/// instead of separate `LmConfig` fields.
+/// Carries both transmission and counts background configs, and uses
+/// [`SolverConfig`] (which embeds solver-specific tuning).
 #[derive(Debug, Clone)]
 pub struct UnifiedFitConfig {
     // ── Physics (shared by both engines) ──

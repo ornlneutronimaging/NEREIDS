@@ -6,7 +6,8 @@
 //! §Tabs, §Badges, §Content Area, §Toolbar, §Drop Zones.
 
 use crate::state::{
-    AppState, EndfFetchResult, EndfStatus, GuidedStep, IsotopeEntry, ResolutionMode, SpectrumAxis,
+    AppState, EndfFetchResult, EndfStatus, FetchTarget, GuidedStep, IsotopeEntry, ResolutionMode,
+    SpectrumAxis,
 };
 use crate::theme::{ThemeColors, semantic};
 use egui::{Color32, CornerRadius, Margin, Rect, Response, RichText, Sense, Shadow, Stroke, Ui};
@@ -662,36 +663,64 @@ pub fn teleport_pill(ui: &mut Ui, label: &str, target: GuidedStep, state: &mut A
 
 // ── Shared Helpers ─────────────────────────────────────────────────
 
+/// Work item for the ENDF fetch worker.
+///
+/// `target` identifies which list the result should be routed to:
+/// Configure, ForwardModel, DetectMatrix, or DetectTrace.
+pub(crate) struct EndfWorkItem {
+    pub z: u32,
+    pub a: u32,
+    pub target: FetchTarget,
+    pub isotope: Isotope,
+    pub symbol: String,
+    pub library: EndfLibrary,
+}
+
 /// Background worker for ENDF data fetching.
 ///
 /// Runs inside a `std::thread::spawn` closure — iterates `work` items,
 /// fetches + parses each, and sends results on `tx`. Supports cancellation.
+/// Results are keyed by `(z, a)` so the receiver can match them to entries
+/// regardless of list mutations during the fetch.
 pub(crate) fn endf_fetch_worker(
-    work: Vec<(usize, Isotope, String, EndfLibrary)>,
+    work: Vec<EndfWorkItem>,
     cancel: Arc<AtomicBool>,
     tx: mpsc::Sender<EndfFetchResult>,
 ) {
     let retriever = nereids_endf::retrieval::EndfRetriever::new();
-    for (index, isotope, symbol, library) in work {
+    for item in work {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        let Some(mat) = nereids_endf::retrieval::mat_number(&isotope) else {
+        let Some(mat) = nereids_endf::retrieval::mat_number(&item.isotope) else {
+            // Defensive: should be unreachable — callers pre-filter by mat_number
+            let _ = tx.send(EndfFetchResult {
+                z: item.z,
+                a: item.a,
+                target: item.target,
+                symbol: item.symbol.clone(),
+                result: Err(format!(
+                    "No MAT number for {} — isotope not in ENDF database",
+                    item.symbol
+                )),
+            });
             continue;
         };
-        let result = match retriever.get_endf_file(&isotope, library, mat) {
+        let result = match retriever.get_endf_file(&item.isotope, item.library, mat) {
             Ok((_path, endf_text)) => match nereids_endf::parser::parse_endf_file2(&endf_text) {
                 Ok(data) => Ok(data),
-                Err(e) => Err(format!("Parse error for {symbol}: {e}")),
+                Err(e) => Err(format!("Parse error for {}: {e}", item.symbol)),
             },
-            Err(e) => Err(format!("Fetch error for {symbol}: {e}")),
+            Err(e) => Err(format!("Fetch error for {}: {e}", item.symbol)),
         };
         if cancel.load(Ordering::Relaxed) {
             break;
         }
         let _ = tx.send(EndfFetchResult {
-            index,
-            symbol,
+            z: item.z,
+            a: item.a,
+            target: item.target,
+            symbol: item.symbol,
             result,
         });
     }

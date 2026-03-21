@@ -238,9 +238,30 @@ impl SessionCache {
     }
 }
 
+/// Which target list an ENDF fetch result belongs to.
+///
+/// Replaces the former `is_detect_matrix: bool` flag, giving each call-site
+/// a self-documenting label instead of an opaque boolean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchTarget {
+    Configure,
+    ForwardModel,
+    DetectMatrix,
+    DetectTrace,
+}
+
 /// Result of a background ENDF fetch for a single isotope.
+///
+/// Uses `(z, a)` to identify which isotope entry the result belongs to,
+/// rather than positional index which is fragile if the list is mutated
+/// during a background fetch.
+///
+/// `target` distinguishes which list the result belongs to (Configure,
+/// ForwardModel, DetectMatrix, or DetectTrace).
 pub struct EndfFetchResult {
-    pub index: usize,
+    pub z: u32,
+    pub a: u32,
+    pub target: FetchTarget,
     pub symbol: String,
     pub result: Result<ResonanceData, String>,
 }
@@ -724,9 +745,6 @@ pub struct AppState {
     pub is_fetching_detect_endf: bool,
     pub detect_endf_library: EndfLibrary,
     pub detect_temperature_k: f64,
-    /// Number of matrix entries at the time the ENDF fetch was spawned.
-    /// Used by `poll_pending_tasks` to dispatch results correctly.
-    pub detect_n_matrix_at_fetch: usize,
     pub detect_resolution_enabled: bool,
     pub detect_resolution_mode: ResolutionMode,
 
@@ -1321,7 +1339,6 @@ impl Default for AppState {
             is_fetching_detect_endf: false,
             detect_endf_library: EndfLibrary::EndfB8_0,
             detect_temperature_k: 296.0,
-            detect_n_matrix_at_fetch: 0,
             detect_resolution_enabled: false,
             detect_resolution_mode: ResolutionMode::default(),
 

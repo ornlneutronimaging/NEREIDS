@@ -1,7 +1,7 @@
 //! Detectability tool — multi-matrix + trace isotope analysis with resolution broadening,
 //! verdict badges, hero stats, and delta-T spectrum plot.
 
-use crate::state::{AppState, EndfStatus, GuidedStep, PeriodicTableTarget};
+use crate::state::{AppState, EndfStatus, FetchTarget, GuidedStep, PeriodicTableTarget};
 use crate::widgets::design;
 use egui_plot::{HLine, Line, Plot, PlotPoints};
 use nereids_endf::retrieval::EndfLibrary;
@@ -692,13 +692,15 @@ pub(crate) fn copy_config_to_detect_matrix(state: &mut AppState) {
 }
 
 /// Fetch ENDF data for matrix + trace isotopes.
-/// Index convention: 0..N = matrix entries, N.. = trace entries at (index - N).
+///
+/// Results are matched by `(z, a)` + `FetchTarget` (DetectMatrix vs DetectTrace)
+/// so the receiver routes each result to the correct list regardless of
+/// list mutations during the background fetch.
 pub(crate) fn detect_fetch_endf_data(state: &mut AppState) {
     use nereids_core::types::Isotope;
     use nereids_endf::retrieval;
 
-    let n_matrix = state.detect_matrix_entries.len();
-    let mut work: Vec<(usize, Isotope, String, EndfLibrary)> = Vec::new();
+    let mut work: Vec<design::EndfWorkItem> = Vec::new();
     let mut failed_matrix: Vec<usize> = Vec::new();
     let mut failed_trace: Vec<usize> = Vec::new();
 
@@ -707,7 +709,14 @@ pub(crate) fn detect_fetch_endf_data(state: &mut AppState) {
             match Isotope::new(entry.z, entry.a) {
                 Ok(isotope) => {
                     if retrieval::mat_number(&isotope).is_some() {
-                        work.push((i, isotope, entry.symbol.clone(), state.detect_endf_library));
+                        work.push(design::EndfWorkItem {
+                            z: entry.z,
+                            a: entry.a,
+                            target: FetchTarget::DetectMatrix,
+                            isotope,
+                            symbol: entry.symbol.clone(),
+                            library: state.detect_endf_library,
+                        });
                     } else {
                         state.status_message = format!(
                             "No MAT number for matrix {} \u{2014} isotope not in database",
@@ -732,12 +741,14 @@ pub(crate) fn detect_fetch_endf_data(state: &mut AppState) {
             match Isotope::new(entry.z, entry.a) {
                 Ok(isotope) => {
                     if retrieval::mat_number(&isotope).is_some() {
-                        work.push((
-                            n_matrix + i,
+                        work.push(design::EndfWorkItem {
+                            z: entry.z,
+                            a: entry.a,
+                            target: FetchTarget::DetectTrace,
                             isotope,
-                            entry.symbol.clone(),
-                            state.detect_endf_library,
-                        ));
+                            symbol: entry.symbol.clone(),
+                            library: state.detect_endf_library,
+                        });
                     } else {
                         state.status_message = format!(
                             "No MAT number for {} \u{2014} isotope not in database",
@@ -767,15 +778,26 @@ pub(crate) fn detect_fetch_endf_data(state: &mut AppState) {
         return;
     }
 
-    for (idx, _, _, _) in &work {
-        if *idx < n_matrix {
-            state.detect_matrix_entries[*idx].endf_status = EndfStatus::Fetching;
-        } else if let Some(entry) = state.detect_trace_entries.get_mut(*idx - n_matrix) {
-            entry.endf_status = EndfStatus::Fetching;
+    for item in &work {
+        match item.target {
+            FetchTarget::DetectMatrix => {
+                for entry in state.detect_matrix_entries.iter_mut() {
+                    if entry.z == item.z && entry.a == item.a {
+                        entry.endf_status = EndfStatus::Fetching;
+                    }
+                }
+            }
+            FetchTarget::DetectTrace => {
+                for entry in state.detect_trace_entries.iter_mut() {
+                    if entry.z == item.z && entry.a == item.a {
+                        entry.endf_status = EndfStatus::Fetching;
+                    }
+                }
+            }
+            // Configure/ForwardModel items are never in this work list
+            _ => {}
         }
     }
-
-    state.detect_n_matrix_at_fetch = n_matrix;
 
     let (tx, rx) = mpsc::channel();
     state.pending_detect_endf = Some(rx);
