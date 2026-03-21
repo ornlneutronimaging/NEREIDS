@@ -908,12 +908,13 @@ pub(crate) fn build_fit_line(
         return None;
     }
     let overlay_temp = result.temperature_k.unwrap_or(temperature_k);
+    let n = result.densities.len();
     let model = nereids_fitting::transmission_model::TransmissionFitModel::new(
         energies.to_vec(),
         resonance_data,
         overlay_temp,
         None,
-        (0..result.densities.len()).collect(),
+        ((0..n).collect(), vec![1.0; n]),
         None,
         None,
     )

@@ -149,6 +149,10 @@ pub struct TransmissionFitModel {
     /// across threads.  `PrecomputedTransmissionModel` uses `Arc<Vec<usize>>`
     /// for its density_indices because it _is_ shared across rayon workers.
     density_indices: Vec<usize>,
+    /// Fractional ratio of each member isotope within its group.
+    /// For ungrouped isotopes, all values are 1.0.
+    /// When groups are active: `effective_density_i = params[density_indices[i]] * density_ratios[i]`
+    density_ratios: Vec<f64>,
     /// If `Some(idx)`, `params[idx]` is treated as the sample temperature (K)
     /// and included as a free parameter in the fit. The Doppler broadening
     /// kernel is recomputed at each `evaluate()` call.
@@ -185,10 +189,25 @@ impl TransmissionFitModel {
         resonance_data: Vec<ResonanceData>,
         temperature_k: f64,
         instrument: Option<Arc<InstrumentParams>>,
-        density_indices: Vec<usize>,
+        density_mapping: (Vec<usize>, Vec<f64>),
         temperature_index: Option<usize>,
         external_base_xs: Option<Arc<Vec<Vec<f64>>>>,
     ) -> Result<Self, FittingError> {
+        let (density_indices, density_ratios) = density_mapping;
+        if density_indices.len() != resonance_data.len() {
+            return Err(FittingError::InvalidConfig(format!(
+                "density_indices has {} entries but resonance_data has {}",
+                density_indices.len(),
+                resonance_data.len(),
+            )));
+        }
+        if density_ratios.len() != resonance_data.len() {
+            return Err(FittingError::InvalidConfig(format!(
+                "density_ratios has {} entries but resonance_data has {}",
+                density_ratios.len(),
+                resonance_data.len(),
+            )));
+        }
         if let Some(ti) = temperature_index
             && density_indices.contains(&ti)
         {
@@ -233,6 +252,7 @@ impl TransmissionFitModel {
             temperature_k,
             instrument,
             density_indices,
+            density_ratios,
             temperature_index,
             base_xs,
             cached_broadened_xs: RefCell::new(None),
@@ -291,23 +311,31 @@ impl FitModel for TransmissionFitModel {
                 xs
             };
 
-            // Beer-Lambert: T(E) = exp(-Σᵢ nᵢ · σᵢ(E))
+            // Beer-Lambert: T(E) = exp(-Σᵢ nᵢ · rᵢ · σᵢ(E))
+            // where rᵢ is the fractional ratio (1.0 for ungrouped isotopes).
             let n_e = self.energies.len();
             let mut neg_opt = vec![0.0f64; n_e];
             for (i, xs) in broadened_xs.iter().enumerate() {
                 let density = params[self.density_indices[i]];
+                let ratio = self.density_ratios[i];
                 for (j, &sigma) in xs.iter().enumerate() {
-                    neg_opt[j] -= density * sigma;
+                    neg_opt[j] -= density * ratio * sigma;
                 }
             }
             Ok(neg_opt.iter().map(|&d| d.exp()).collect())
         } else {
             // Original path: full forward model (no temperature fitting).
+            // Apply ratio weights: effective density = params[idx] * ratio.
             let isotopes: Vec<(ResonanceData, f64)> = self
                 .resonance_data
                 .iter()
-                .zip(self.density_indices.iter())
-                .map(|(rd, &idx): (&ResonanceData, &usize)| (rd.clone(), params[idx]))
+                .enumerate()
+                .map(|(i, rd)| {
+                    (
+                        rd.clone(),
+                        params[self.density_indices[i]] * self.density_ratios[i],
+                    )
+                })
                 .collect();
 
             let sample = SampleParams::new(temperature_k, isotopes)
@@ -370,12 +398,14 @@ impl FitModel for TransmissionFitModel {
             if temp_col == Some(col) {
                 continue; // temperature column handled below
             }
-            // Sum cross-sections of all isotopes tied to this free parameter.
+            // Sum ratio-weighted cross-sections of all isotopes tied to this free parameter.
+            // ∂T/∂N_g = -T(E) · Σ_{i∈g} rᵢ · σᵢ(E)
             let mut sigma_sum = vec![0.0f64; n_e];
             for (iso, &di) in self.density_indices.iter().enumerate() {
                 if di == fp_idx {
+                    let ratio = self.density_ratios[iso];
                     for (j, &sigma) in broadened_xs[iso].iter().enumerate() {
-                        sigma_sum[j] += sigma;
+                        sigma_sum[j] += ratio * sigma;
                     }
                 }
             }
@@ -399,12 +429,13 @@ impl FitModel for TransmissionFitModel {
             )
             .ok()?;
 
-            // Beer-Lambert at perturbed temperature with current densities.
+            // Beer-Lambert at perturbed temperature with current densities and ratios.
             let mut neg_opt = vec![0.0f64; n_e];
             for (iso, xs) in xs_perturbed.iter().enumerate() {
                 let density = params[self.density_indices[iso]];
+                let ratio = self.density_ratios[iso];
                 for (j, &sigma) in xs.iter().enumerate() {
-                    neg_opt[j] -= density * sigma;
+                    neg_opt[j] -= density * ratio * sigma;
                 }
             }
             let y_perturbed: Vec<f64> = neg_opt.iter().map(|&d| d.exp()).collect();
@@ -874,9 +905,16 @@ mod tests {
         // Generate synthetic data
         let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
 
-        let model =
-            TransmissionFitModel::new(energies.clone(), vec![data], 0.0, None, vec![0], None, None)
-                .unwrap();
+        let model = TransmissionFitModel::new(
+            energies.clone(),
+            vec![data],
+            0.0,
+            None,
+            (vec![0], vec![1.0]),
+            None,
+            None,
+        )
+        .unwrap();
 
         let y_obs = model.evaluate(&[true_thickness]).unwrap();
         let sigma = vec![0.01; y_obs.len()]; // 1% uncertainty
@@ -949,7 +987,7 @@ mod tests {
             vec![u238, other],
             0.0,
             None,
-            vec![0, 1],
+            (vec![0, 1], vec![1.0, 1.0]),
             None,
             None,
         )
@@ -1006,7 +1044,7 @@ mod tests {
             vec![data.clone()],
             0.0,
             None,
-            vec![0],
+            (vec![0], vec![1.0]),
             Some(1),
             None,
         )
@@ -1018,7 +1056,7 @@ mod tests {
             vec![data],
             300.0,
             None,
-            vec![0],
+            (vec![0], vec![1.0]),
             None,
             None,
         )
@@ -1057,7 +1095,7 @@ mod tests {
             vec![data],
             0.0, // ignored — temperature_index is set
             None,
-            vec![0],
+            (vec![0], vec![1.0]),
             Some(1), // params[1] = temperature
             None,
         )
@@ -1147,7 +1185,7 @@ mod tests {
             vec![data],
             0.0,
             None,
-            vec![0],
+            (vec![0], vec![1.0]),
             Some(1), // params[1] = temperature
             None,
         )
@@ -1208,9 +1246,16 @@ mod tests {
         let data = u238_single_resonance();
         let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
 
-        let model =
-            TransmissionFitModel::new(energies, vec![data], 0.0, None, vec![0], Some(1), None)
-                .unwrap();
+        let model = TransmissionFitModel::new(
+            energies,
+            vec![data],
+            0.0,
+            None,
+            (vec![0], vec![1.0]),
+            Some(1),
+            None,
+        )
+        .unwrap();
 
         // First call populates the cache.
         let y1 = model.evaluate(&[0.0005, 300.0]).unwrap();

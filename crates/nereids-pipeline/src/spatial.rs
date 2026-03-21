@@ -96,7 +96,8 @@ pub fn spatial_map_typed(
     progress: Option<&AtomicUsize>,
 ) -> Result<SpatialResult, PipelineError> {
     let (n_energies, height, width) = input.shape();
-    let n_isotopes = config.resonance_data().len();
+    // n_maps = number of density maps to return (one per group or per isotope).
+    let n_maps = config.n_density_params();
 
     // Validate shapes
     if n_energies != config.energies().len() {
@@ -158,10 +159,10 @@ pub fn spatial_map_typed(
     }
     if pixel_coords.is_empty() {
         return Ok(SpatialResult {
-            density_maps: (0..n_isotopes)
+            density_maps: (0..n_maps)
                 .map(|_| Array2::zeros((height, width)))
                 .collect(),
-            uncertainty_maps: (0..n_isotopes)
+            uncertainty_maps: (0..n_maps)
                 .map(|_| Array2::from_elem((height, width), f64::NAN))
                 .collect(),
             chi_squared_map: Array2::from_elem((height, width), f64::NAN),
@@ -225,6 +226,27 @@ pub fn spatial_map_typed(
         }
     };
 
+    // When groups are active and temperature is NOT being fitted, collapse
+    // per-member broadened XS into per-group σ_eff once here.  This avoids
+    // redundant O(n_members × n_energies) collapsing inside
+    // build_transmission_model on every per-pixel call.
+    let xs = if !config.fit_temperature()
+        && let (Some(di), Some(dr)) = (&config.density_indices, &config.density_ratios)
+        && xs.len() == di.len()
+        && di.len() == dr.len()
+    {
+        let n_e = xs[0].len();
+        let mut eff = vec![vec![0.0f64; n_e]; n_maps];
+        for ((&idx, &ratio), member_xs) in di.iter().zip(dr.iter()).zip(xs.iter()) {
+            for (j, &sigma) in member_xs.iter().enumerate() {
+                eff[idx][j] += ratio * sigma;
+            }
+        }
+        Arc::new(eff)
+    } else {
+        xs
+    };
+
     // Precompute unbroadened (base) cross-sections for temperature fitting.
     // This avoids 74× overhead from redundant Reich-Moore evaluation per
     // KL iteration (112ms Reich-Moore vs 1.5ms Doppler rebroadening).
@@ -238,9 +260,15 @@ pub fn spatial_map_typed(
             .with_precomputed_base_xs(Arc::new(base_xs))
             .with_compute_covariance(false)
     } else {
-        config
-            .clone()
-            .with_precomputed_cross_sections(xs)
+        // For non-temperature path: xs is already collapsed to σ_eff when
+        // groups are active, so clear group mapping to prevent double-collapse
+        // inside build_transmission_model.
+        let mut cfg = config.clone();
+        if cfg.density_indices.is_some() {
+            cfg.density_indices = None;
+            cfg.density_ratios = None;
+        }
+        cfg.with_precomputed_cross_sections(xs)
             .with_compute_covariance(false)
     };
 
@@ -337,10 +365,10 @@ pub fn spatial_map_typed(
     }
 
     // Assemble output maps
-    let mut density_maps: Vec<Array2<f64>> = (0..n_isotopes)
+    let mut density_maps: Vec<Array2<f64>> = (0..n_maps)
         .map(|_| Array2::zeros((height, width)))
         .collect();
-    let mut uncertainty_maps: Vec<Array2<f64>> = (0..n_isotopes)
+    let mut uncertainty_maps: Vec<Array2<f64>> = (0..n_maps)
         .map(|_| Array2::from_elem((height, width), f64::NAN))
         .collect();
     let mut chi_squared_map = Array2::from_elem((height, width), f64::NAN);
@@ -367,7 +395,7 @@ pub fn spatial_map_typed(
     };
 
     for ((y, x), result) in &results {
-        for i in 0..n_isotopes {
+        for i in 0..n_maps {
             density_maps[i][[*y, *x]] = result.densities[i];
             if let Some(ref unc) = result.uncertainties {
                 uncertainty_maps[i][[*y, *x]] = unc[i];
@@ -416,7 +444,7 @@ mod tests {
     use nereids_fitting::transmission_model::PrecomputedTransmissionModel;
 
     use crate::pipeline::{SolverConfig, UnifiedFitConfig};
-    use crate::test_helpers::u238_single_resonance;
+    use crate::test_helpers::{synthetic_single_resonance, u238_single_resonance};
 
     /// Build a 4x4 synthetic transmission stack from known density.
     fn synthetic_4x4_transmission(
@@ -629,5 +657,90 @@ mod tests {
 
         let result = spatial_map_typed(&input, &config, Some(&dead), None, None).unwrap();
         assert_eq!(result.n_total, 8, "Only 8 live pixels");
+    }
+
+    /// Spatial map with isotope groups: 2 isotopes in 1 group on a 2×2 grid.
+    /// Verifies group-level density recovery and that only 1 density map is returned.
+    #[test]
+    fn test_spatial_map_grouped() {
+        let rd1 = synthetic_single_resonance(92, 235, 233.025, 5.0);
+        let rd2 = synthetic_single_resonance(92, 238, 236.006, 7.0);
+
+        let iso1 = nereids_core::types::Isotope::new(92, 235).unwrap();
+        let iso2 = nereids_core::types::Isotope::new(92, 238).unwrap();
+        let group = nereids_core::types::IsotopeGroup::custom(
+            "U (60/40)".into(),
+            vec![(iso1, 0.6), (iso2, 0.4)],
+        )
+        .unwrap();
+
+        let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
+        let n_e = energies.len();
+        let true_density = 0.0005;
+
+        // Generate synthetic transmission for the group
+        let sample = nereids_physics::transmission::SampleParams::new(
+            0.0,
+            vec![
+                (rd1.clone(), true_density * 0.6),
+                (rd2.clone(), true_density * 0.4),
+            ],
+        )
+        .unwrap();
+        let t_1d = nereids_physics::transmission::forward_model(&energies, &sample, None).unwrap();
+        let s_1d: Vec<f64> = t_1d.iter().map(|&v| 0.01 * v.max(0.01)).collect();
+
+        // Fill 2×2 grid
+        let mut t_3d = Array3::zeros((n_e, 2, 2));
+        let mut u_3d = Array3::zeros((n_e, 2, 2));
+        for y in 0..2 {
+            for x in 0..2 {
+                for (i, (&t, &s)) in t_1d.iter().zip(s_1d.iter()).enumerate() {
+                    t_3d[[i, y, x]] = t;
+                    u_3d[[i, y, x]] = s;
+                }
+            }
+        }
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![rd1.clone()],
+            vec!["placeholder".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_groups(&[(&group, &[rd1, rd2])], vec![0.001])
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()));
+
+        let input = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+
+        let result = spatial_map_typed(&input, &config, None, None, None).unwrap();
+
+        // Should have 1 density map (1 group), not 2
+        assert_eq!(
+            result.density_maps.len(),
+            1,
+            "should have 1 group density map"
+        );
+        assert_eq!(result.isotope_labels, vec!["U (60/40)"]);
+        assert_eq!(result.n_total, 4);
+
+        // All pixels should recover true density within 5%
+        for y in 0..2 {
+            for x in 0..2 {
+                let fitted = result.density_maps[0][[y, x]];
+                let rel_error = (fitted - true_density).abs() / true_density;
+                assert!(
+                    rel_error < 0.05,
+                    "pixel ({y},{x}): fitted={fitted}, true={true_density}, rel_error={rel_error}"
+                );
+            }
+        }
     }
 }
