@@ -357,14 +357,18 @@ fn analysis_spectrum_column(ui: &mut egui::Ui, state: &mut AppState) {
     // Fit curve (if available)
     let fit_line = state.pixel_fit_result.as_ref().and_then(|result| {
         let energies = state.energies.as_ref()?;
-        design::build_fit_line(
+        let (all_rd, density_indices, density_ratios) =
+            design::collect_all_resonance_data_with_mapping(state);
+        design::build_fit_line(&design::FitLineParams {
             result,
-            &state.isotope_entries,
+            resonance_data: &all_rd,
+            density_indices: &density_indices,
+            density_ratios: &density_ratios,
             energies,
-            state.temperature_k,
-            &x_values,
+            temperature_k: state.temperature_k,
+            x_values: &x_values,
             n_plot,
-        )
+        })
     });
 
     // Spectrum plot
@@ -792,6 +796,9 @@ fn build_residuals_cache(
     }
 
     // Collect resonance data for enabled isotopes.
+    // Note: when groups are present, this only covers individual isotopes.
+    // Group residuals require group-to-density index mapping, which is a
+    // future enhancement — for now the length guard below returns None.
     let resonance_data: Vec<_> = state
         .isotope_entries
         .iter()
