@@ -209,6 +209,17 @@ pub struct UnifiedFitConfig {
     // ── Precomputed caches (injected by spatial_map_typed) ──
     precomputed_cross_sections: Option<Arc<Vec<Vec<f64>>>>,
     precomputed_base_xs: Option<Arc<Vec<Vec<f64>>>>,
+
+    // ── Isotope group mapping (optional) ──
+    /// Maps member isotope index → density parameter index.
+    /// `None` = identity mapping (one param per isotope, backward compat).
+    density_indices: Option<Vec<usize>>,
+    /// Fractional ratio per member isotope.
+    /// `None` = all 1.0 (backward compat).
+    density_ratios: Option<Vec<f64>>,
+    /// Number of density parameters (groups or isotopes).
+    /// `None` = `resonance_data.len()` (backward compat).
+    n_density_params: Option<usize>,
 }
 
 impl UnifiedFitConfig {
@@ -259,6 +270,9 @@ impl UnifiedFitConfig {
             counts_background: None,
             precomputed_cross_sections: None,
             precomputed_base_xs: None,
+            density_indices: None,
+            density_ratios: None,
+            n_density_params: None,
         })
     }
 
@@ -306,6 +320,58 @@ impl UnifiedFitConfig {
         self
     }
 
+    /// Configure isotope groups with ratio constraints.
+    ///
+    /// Each group binds multiple isotopes to one fitted density parameter.
+    /// `groups` is a slice of `(IsotopeGroup, member_resonance_data)` pairs.
+    /// `initial_densities` must have one entry per group.
+    ///
+    /// Replaces the existing per-isotope configuration with the expanded
+    /// group mapping (flattened resonance_data + density_indices + density_ratios).
+    pub fn with_groups(
+        mut self,
+        groups: &[(&nereids_core::types::IsotopeGroup, &[ResonanceData])],
+        initial_densities: Vec<f64>,
+    ) -> Result<Self, FitConfigError> {
+        if groups.is_empty() {
+            return Err(FitConfigError::EmptyResonanceData);
+        }
+        if initial_densities.len() != groups.len() {
+            return Err(FitConfigError::DensityCountMismatch {
+                densities: initial_densities.len(),
+                isotopes: groups.len(),
+            });
+        }
+        let mut all_resonance_data = Vec::new();
+        let mut all_indices = Vec::new();
+        let mut all_ratios = Vec::new();
+        let mut names = Vec::new();
+        for (g_idx, (group, rd_list)) in groups.iter().enumerate() {
+            if rd_list.len() != group.n_members() {
+                return Err(FitConfigError::NameCountMismatch {
+                    names: rd_list.len(),
+                    isotopes: group.n_members(),
+                });
+            }
+            names.push(group.name().to_string());
+            for (member_idx, ((_isotope, ratio), rd)) in
+                group.members().iter().zip(rd_list.iter()).enumerate()
+            {
+                let _ = member_idx;
+                all_resonance_data.push(rd.clone());
+                all_indices.push(g_idx);
+                all_ratios.push(*ratio);
+            }
+        }
+        self.resonance_data = all_resonance_data;
+        self.isotope_names = names;
+        self.initial_densities = initial_densities;
+        self.n_density_params = Some(groups.len());
+        self.density_indices = Some(all_indices);
+        self.density_ratios = Some(all_ratios);
+        Ok(self)
+    }
+
     // ── Accessors ──
 
     pub fn energies(&self) -> &[f64] {
@@ -340,6 +406,10 @@ impl UnifiedFitConfig {
     }
     pub fn precomputed_cross_sections(&self) -> Option<&Arc<Vec<Vec<f64>>>> {
         self.precomputed_cross_sections.as_ref()
+    }
+    /// Number of density parameters (one per group or per isotope).
+    pub fn n_density_params(&self) -> usize {
+        self.n_density_params.unwrap_or(self.resonance_data.len())
     }
 
     /// Resolve `SolverConfig::Auto` into a concrete solver for the given input.
@@ -547,7 +617,7 @@ fn fit_transmission_lm(
     config: &UnifiedFitConfig,
     lm_config: &LmConfig,
 ) -> Result<SpectrumFitResult, PipelineError> {
-    let n_isotopes = config.resonance_data().len();
+    let n_isotopes = config.n_density_params();
 
     // Build parameter vector
     let mut param_vec = build_density_params(config);
@@ -611,7 +681,7 @@ fn fit_transmission_poisson(
         ));
     }
 
-    let n_isotopes = config.resonance_data().len();
+    let n_isotopes = config.n_density_params();
 
     let mut param_vec = build_density_params(config);
 
@@ -717,7 +787,7 @@ fn fit_counts_poisson(
     config: &UnifiedFitConfig,
     poisson_cfg: &PoissonConfig,
 ) -> Result<SpectrumFitResult, PipelineError> {
-    let n_isotopes = config.resonance_data().len();
+    let n_isotopes = config.n_density_params();
 
     let mut param_vec = build_density_params(config);
 
@@ -860,12 +930,28 @@ fn build_transmission_model(
     n_isotopes: usize,
     temperature_index: Option<usize>,
 ) -> Result<Box<dyn FitModel>, PipelineError> {
+    let n_params = config.n_density_params();
     if !config.fit_temperature
         && let Some(xs) = &config.precomputed_cross_sections
     {
+        // When groups are active, compute σ_eff per group from member XS.
+        // For ungrouped isotopes, this is a no-op (identity mapping, ratio=1.0).
+        let effective_xs =
+            if let (Some(di), Some(dr)) = (&config.density_indices, &config.density_ratios) {
+                let n_e = xs[0].len();
+                let mut eff = vec![vec![0.0f64; n_e]; n_params];
+                for ((&idx, &ratio), member_xs) in di.iter().zip(dr.iter()).zip(xs.iter()) {
+                    for (j, &sigma) in member_xs.iter().enumerate() {
+                        eff[idx][j] += ratio * sigma;
+                    }
+                }
+                Arc::new(eff)
+            } else {
+                Arc::clone(xs)
+            };
         return Ok(Box::new(PrecomputedTransmissionModel {
-            cross_sections: Arc::clone(xs),
-            density_indices: Arc::new((0..n_isotopes).collect()),
+            cross_sections: effective_xs,
+            density_indices: Arc::new((0..n_params).collect()),
         }));
     }
 
@@ -875,12 +961,20 @@ fn build_transmission_model(
         .map(|r| Arc::new(InstrumentParams { resolution: r }));
 
     let base_xs = config.precomputed_base_xs.clone();
+    let density_ratios = config
+        .density_ratios
+        .clone()
+        .unwrap_or_else(|| vec![1.0; n_isotopes]);
+    let density_indices = config
+        .density_indices
+        .clone()
+        .unwrap_or_else(|| (0..n_isotopes).collect());
     Ok(Box::new(TransmissionFitModel::new(
         config.energies.clone(),
         config.resonance_data.clone(),
         config.temperature_k,
         instrument,
-        (0..n_isotopes).collect(),
+        (density_indices, density_ratios),
         temperature_index,
         base_xs,
     )?))

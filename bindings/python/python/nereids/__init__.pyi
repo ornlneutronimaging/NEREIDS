@@ -199,6 +199,72 @@ class SpatialResult:
         """Per-pixel background parameter maps [BackA, BackB, BackC] (None when background=False)."""
         ...
 
+class IsotopeGroup:
+    """A group of isotopes sharing one fitted density parameter.
+
+    Members have fixed fractional ratios summing to 1.0. During fitting,
+    the effective cross-section sigma_eff(E) = sum(f_i * sigma_i(E)) reduces
+    the group to a single virtual isotope with one free density parameter.
+    """
+
+    @staticmethod
+    def natural(z: int) -> IsotopeGroup:
+        """Create a group from all natural isotopes of element Z at IUPAC abundances."""
+        ...
+
+    @staticmethod
+    def subset(z: int, mass_numbers: list[int]) -> IsotopeGroup:
+        """Create a group from a subset of natural isotopes, re-normalized."""
+        ...
+
+    @staticmethod
+    def custom(name: str, members: list[tuple[int, int, float]]) -> IsotopeGroup:
+        """Create a group with arbitrary isotope/ratio pairs.
+
+        Args:
+            name: Display name for the group.
+            members: List of (z, a, ratio) tuples. Ratios must sum to 1.0.
+        """
+        ...
+
+    def load_endf(self, library: str | None = None) -> None:
+        """Fetch ENDF data for all members.
+
+        Args:
+            library: ENDF library name (default "endf8.1").
+        """
+        ...
+
+    @property
+    def name(self) -> str:
+        """Group display name (e.g., 'W (nat)', 'Eu-151/153')."""
+        ...
+
+    @property
+    def n_members(self) -> int:
+        """Number of member isotopes."""
+        ...
+
+    @property
+    def members(self) -> list[tuple[tuple[int, int], float]]:
+        """Member isotopes with their fractional ratios as ((z, a), ratio) tuples."""
+        ...
+
+    @property
+    def is_loaded(self) -> bool:
+        """Whether ENDF data has been loaded for all members."""
+        ...
+
+    @property
+    def resonance_data(self) -> list[ResonanceData]:
+        """Get loaded resonance data for all members.
+
+        Raises:
+            ValueError: If not all members have loaded ENDF data.
+        """
+        ...
+
+
 class TraceDetectabilityReport:
     """Result of a trace-detectability analysis."""
 
@@ -256,15 +322,21 @@ def cross_sections(
 
 def forward_model(
     energies: NDArray[np.float64],
-    isotopes: list[tuple[ResonanceData, float]],
+    isotopes: list[tuple[ResonanceData, float]] | None = None,
     temperature_k: float = 293.6,
     flight_path_m: float | None = None,
     delta_t_us: float | None = None,
     delta_l_m: float | None = None,
     resolution: TabulatedResolution | None = None,
     delta_e_us: float | None = None,
+    groups: list[tuple[IsotopeGroup, float]] | None = None,
 ) -> NDArray[np.float64]:
-    """Compute theoretical transmission spectrum."""
+    """Compute theoretical transmission spectrum.
+
+    Either ``isotopes`` or ``groups`` must be provided, but not both.
+    When ``groups`` is provided, each group is expanded into its members
+    with effective densities = group_density * member_ratio.
+    """
     ...
 
 def tof_to_energy(tof_us: float, flight_path_m: float) -> float:
@@ -530,7 +602,7 @@ def from_transmission(
 def spatial_map_typed(
     data: InputData,
     energies: NDArray[np.float64],
-    isotopes: list[ResonanceData],
+    isotopes: list[ResonanceData] | None = None,
     *,
     temperature_k: float = 293.6,
     fit_temperature: bool = False,
@@ -543,13 +615,57 @@ def spatial_map_typed(
     flight_path_m: float | None = None,
     delta_t_us: float | None = None,
     delta_l_m: float | None = None,
+    groups: list[IsotopeGroup] | None = None,
 ) -> SpatialResult:
     """Spatial mapping using the typed input data API.
 
+    Either ``isotopes`` or ``groups`` must be provided, but not both.
+    When ``groups`` is provided, each group maps to one fitted density parameter.
+
     Dispatches per-pixel fitting based on InputData type:
-      - from_counts → Poisson KL on raw counts (optimal)
-      - from_transmission → LM (default) or KL (solver="kl")
+      - from_counts -> Poisson KL on raw counts (optimal)
+      - from_transmission -> LM (default) or KL (solver="kl")
 
     Always returns SpatialResult.
+    """
+    ...
+
+
+def fit_spectrum_typed(
+    transmission: NDArray[np.float64],
+    uncertainty: NDArray[np.float64],
+    energies: NDArray[np.float64],
+    isotopes: list[tuple[ResonanceData, float]] | None = None,
+    *,
+    temperature_k: float = 293.6,
+    fit_temperature: bool = False,
+    max_iter: int = 200,
+    solver: str = "lm",
+    background: bool = False,
+    resolution: TabulatedResolution | None = None,
+    flight_path_m: float | None = None,
+    delta_t_us: float | None = None,
+    delta_l_m: float | None = None,
+    groups: list[IsotopeGroup] | None = None,
+    initial_densities: list[float] | None = None,
+) -> FitResult:
+    """Fit a single spectrum using the typed input data API.
+
+    Either ``isotopes`` or ``groups`` must be provided, but not both.
+    When ``groups`` is provided, each group maps to one fitted density parameter.
+
+    Args:
+        transmission: 1D transmission spectrum.
+        uncertainty: 1D uncertainty (same length as transmission).
+        energies: 1D energy grid in eV (ascending).
+        isotopes: List of (ResonanceData, initial_density) tuples.
+        temperature_k: Sample temperature in Kelvin (default 293.6).
+        fit_temperature: Whether to fit temperature (default False).
+        max_iter: Maximum iterations (default 200).
+        solver: 'auto' (default), 'lm', or 'kl'.
+        background: Enable SAMMY transmission background.
+        resolution: Optional resolution function.
+        groups: List of IsotopeGroup objects (mutually exclusive with isotopes).
+        initial_densities: Initial density guesses when using groups.
     """
     ...

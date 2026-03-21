@@ -42,7 +42,7 @@ use numpy::{
 use pyo3::prelude::*;
 
 use nereids_core::elements;
-use nereids_core::types::Isotope;
+use nereids_core::types::{Isotope, IsotopeGroup};
 use nereids_endf::parser::parse_endf_file2;
 use nereids_endf::resonance::{
     LGroup, Resonance, ResonanceData, ResonanceFormalism, ResonanceRange,
@@ -160,6 +160,213 @@ impl PyResonanceData {
         ls.sort();
         ls.dedup();
         ls
+    }
+}
+
+/// Parse a library name string into an `EndfLibrary` enum variant.
+fn parse_library_name(library: &str) -> PyResult<EndfLibrary> {
+    match library {
+        "endf8.0" | "endf/b-viii.0" => Ok(EndfLibrary::EndfB8_0),
+        "endf8.1" | "endf/b-viii.1" => Ok(EndfLibrary::EndfB8_1),
+        "jeff3.3" => Ok(EndfLibrary::Jeff3_3),
+        "jendl5" => Ok(EndfLibrary::Jendl5),
+        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Unknown library '{}'. Use one of: endf8.0, endf8.1, jeff3.3, jendl5",
+            library
+        ))),
+    }
+}
+
+/// Load and parse ENDF resonance data for a single isotope.
+///
+/// This helper encapsulates the retrieval + parse logic shared between
+/// `load_endf` and `PyIsotopeGroup.load_endf`. It does NOT hold the GIL
+/// and must be called from a `py.detach()` / `py.allow_threads()` closure.
+fn load_and_parse_endf(
+    isotope: &Isotope,
+    lib: EndfLibrary,
+    mat_num: u32,
+) -> Result<ResonanceData, (bool, String)> {
+    let retriever = EndfRetriever::new();
+    let (_path, contents) = retriever
+        .get_endf_file(isotope, lib, mat_num)
+        .map_err(|e| (false, format!("{}", e)))?;
+    let data =
+        parse_endf_file2(&contents).map_err(|e| (true, format!("ENDF parse error: {}", e)))?;
+    Ok(data)
+}
+
+/// Python wrapper for isotope groups.
+///
+/// An isotope group binds multiple isotopes with fixed fractional ratios
+/// to a single fitted density parameter. The effective cross-section
+/// `σ_eff(E) = Σ fᵢ · σᵢ(E)` reduces the group to a virtual isotope.
+#[pyclass(name = "IsotopeGroup", from_py_object)]
+#[derive(Clone)]
+struct PyIsotopeGroup {
+    inner: IsotopeGroup,
+    /// Loaded ENDF resonance data for each member (indexed by position).
+    resonance_data: Vec<Option<Arc<ResonanceData>>>,
+}
+
+#[pymethods]
+impl PyIsotopeGroup {
+    /// Create a group from all natural isotopes of element Z at IUPAC abundances.
+    #[staticmethod]
+    fn natural(z: u32) -> PyResult<Self> {
+        let group = IsotopeGroup::natural(z)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        let n = group.n_members();
+        Ok(Self {
+            inner: group,
+            resonance_data: vec![None; n],
+        })
+    }
+
+    /// Create a group from a subset of natural isotopes, re-normalized.
+    #[staticmethod]
+    fn subset(z: u32, mass_numbers: Vec<u32>) -> PyResult<Self> {
+        let group = IsotopeGroup::subset(z, &mass_numbers)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        let n = group.n_members();
+        Ok(Self {
+            inner: group,
+            resonance_data: vec![None; n],
+        })
+    }
+
+    /// Create a group with arbitrary isotope/ratio pairs.
+    ///
+    /// Args:
+    ///     name: Display name for the group.
+    ///     members: List of (z, a, ratio) tuples.
+    #[staticmethod]
+    fn custom(name: String, members: Vec<(u32, u32, f64)>) -> PyResult<Self> {
+        let isotope_members: Vec<(Isotope, f64)> = members
+            .into_iter()
+            .map(|(z, a, ratio)| {
+                let iso = Isotope::new(z, a).map_err(|e| {
+                    pyo3::exceptions::PyValueError::new_err(format!("Invalid isotope: {}", e))
+                })?;
+                Ok((iso, ratio))
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let group = IsotopeGroup::custom(name, isotope_members)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        let n = group.n_members();
+        Ok(Self {
+            inner: group,
+            resonance_data: vec![None; n],
+        })
+    }
+
+    /// Fetch ENDF data for all members.
+    ///
+    /// Args:
+    ///     library: ENDF library name (default "endf8.1").
+    #[pyo3(signature = (library=None))]
+    fn load_endf(&mut self, py: Python<'_>, library: Option<&str>) -> PyResult<()> {
+        let lib = parse_library_name(library.unwrap_or("endf8.1"))?;
+
+        // Collect (isotope, mat) pairs for all members up front.
+        let members: Vec<(Isotope, u32)> = self
+            .inner
+            .members()
+            .iter()
+            .map(|(iso, _)| {
+                let mat_num = mat_number(iso).ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "MAT number not found for Z={} A={}; cannot fetch ENDF data",
+                        iso.z(),
+                        iso.a(),
+                    ))
+                })?;
+                Ok((*iso, mat_num))
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+
+        // Release the GIL for the network I/O + parsing.
+        let results: Vec<Result<ResonanceData, (bool, String)>> = py.detach(move || {
+            members
+                .iter()
+                .map(|(iso, mat)| load_and_parse_endf(iso, lib, *mat))
+                .collect()
+        });
+
+        // Map results back into self.resonance_data.
+        for (i, result) in results.into_iter().enumerate() {
+            let data = result.map_err(|(is_parse, msg)| {
+                if is_parse {
+                    pyo3::exceptions::PyValueError::new_err(msg)
+                } else {
+                    pyo3::exceptions::PyRuntimeError::new_err(msg)
+                }
+            })?;
+            self.resonance_data[i] = Some(Arc::new(data));
+        }
+
+        Ok(())
+    }
+
+    /// Group display name.
+    #[getter]
+    fn name(&self) -> String {
+        self.inner.name().to_string()
+    }
+
+    /// Number of member isotopes.
+    #[getter]
+    fn n_members(&self) -> usize {
+        self.inner.n_members()
+    }
+
+    /// Member isotopes with their fractional ratios.
+    ///
+    /// Returns a list of ((z, a), ratio) tuples.
+    #[getter]
+    fn members(&self) -> Vec<((u32, u32), f64)> {
+        self.inner
+            .members()
+            .iter()
+            .map(|(iso, ratio)| ((iso.z(), iso.a()), *ratio))
+            .collect()
+    }
+
+    /// Whether ENDF data has been loaded for all members.
+    #[getter]
+    fn is_loaded(&self) -> bool {
+        self.resonance_data.iter().all(|d| d.is_some())
+    }
+
+    /// Get loaded resonance data for all members.
+    ///
+    /// Returns a list of ResonanceData objects, one per member.
+    ///
+    /// Raises:
+    ///     ValueError: If not all members have loaded ENDF data.
+    #[getter]
+    fn resonance_data(&self) -> PyResult<Vec<PyResonanceData>> {
+        if !self.resonance_data.iter().all(|d| d.is_some()) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "Not all group members have loaded ENDF data. Call load_endf() first.",
+            ));
+        }
+        Ok(self
+            .resonance_data
+            .iter()
+            .map(|d| PyResonanceData {
+                inner: d.clone().unwrap(),
+            })
+            .collect())
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "IsotopeGroup(name='{}', n_members={}, loaded={})",
+            self.inner.name(),
+            self.inner.n_members(),
+            self.is_loaded(),
+        )
     }
 }
 
@@ -473,10 +680,14 @@ fn cross_sections<'py>(
 /// (``flight_path_m``, ``delta_t_us``, ``delta_l_m``) or a tabulated
 /// resolution function (``resolution``). Providing both is an error.
 ///
+/// Either ``isotopes`` or ``groups`` must be provided, but not both.
+/// When ``groups`` is provided, each group is expanded into its members with
+/// effective densities = group_density × member_ratio.
+///
 /// Args:
 ///     energies: Energy grid in eV (1D numpy array).
-///     isotopes: List of (ResonanceData, areal_density) tuples.
-///     temperature_k: Sample temperature in Kelvin (default 0.0).
+///     isotopes: List of (ResonanceData, areal_density) tuples (mutually exclusive with groups).
+///     temperature_k: Sample temperature in Kelvin (default 293.6).
 ///     flight_path_m: Flight path in meters for Gaussian resolution (optional).
 ///     delta_t_us: Timing uncertainty in microseconds (optional).
 ///     delta_l_m: Path length uncertainty in meters (optional).
@@ -484,28 +695,62 @@ fn cross_sections<'py>(
 ///         default None/0.0). When non-zero, adds an exponential tail to the
 ///         resolution kernel (SAMMY Iesopr=3).
 ///     resolution: TabulatedResolution from ``load_resolution()`` (optional).
+///     groups: List of (IsotopeGroup, group_density) tuples (mutually exclusive with isotopes).
 ///
 /// Returns:
 ///     1D numpy array of transmission values.
 #[pyfunction]
-#[pyo3(signature = (energies, isotopes, temperature_k=293.6, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, delta_e_us=None))]
+#[pyo3(signature = (energies, isotopes=None, temperature_k=293.6, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, delta_e_us=None, groups=None))]
 fn forward_model<'py>(
     py: Python<'py>,
     energies: PyReadonlyArray1<f64>,
-    isotopes: Vec<(PyResonanceData, f64)>,
+    isotopes: Option<Vec<(PyResonanceData, f64)>>,
     temperature_k: f64,
     flight_path_m: Option<f64>,
     delta_t_us: Option<f64>,
     delta_l_m: Option<f64>,
     resolution: Option<PyTabulatedResolution>,
     delta_e_us: Option<f64>,
+    groups: Option<Vec<(PyIsotopeGroup, f64)>>,
 ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let has_isotopes = isotopes.is_some();
+    let has_groups = groups.is_some();
+    if has_isotopes && has_groups {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Provide either 'isotopes' or 'groups', not both.",
+        ));
+    }
+    if !has_isotopes && !has_groups {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Must provide either 'isotopes' or 'groups'.",
+        ));
+    }
+
     let e_owned = energies.as_slice()?.to_vec();
 
-    let sample_isotopes: Vec<(ResonanceData, f64)> = isotopes
-        .into_iter()
-        .map(|(d, thick)| (Arc::unwrap_or_clone(d.inner), thick))
-        .collect();
+    // Build sample isotopes list from either isotopes or groups
+    let sample_isotopes: Vec<(ResonanceData, f64)> = if let Some(isotopes) = isotopes {
+        isotopes
+            .into_iter()
+            .map(|(d, thick)| (Arc::unwrap_or_clone(d.inner), thick))
+            .collect()
+    } else {
+        let groups = groups.unwrap();
+        let mut expanded = Vec::new();
+        for (group, group_density) in &groups {
+            if !group.is_loaded() {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "IsotopeGroup '{}' has not been fully loaded. Call load_endf() first.",
+                    group.inner.name(),
+                )));
+            }
+            for (i, (_iso, ratio)) in group.inner.members().iter().enumerate() {
+                let rd = Arc::unwrap_or_clone(group.resonance_data[i].clone().unwrap());
+                expanded.push((rd, group_density * ratio));
+            }
+        }
+        expanded
+    };
 
     let sample = SampleParams::new(temperature_k, sample_isotopes)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
@@ -569,18 +814,7 @@ fn load_endf(
     library: &str,
     mat: Option<u32>,
 ) -> PyResult<PyResonanceData> {
-    let lib = match library {
-        "endf8.0" | "endf/b-viii.0" => EndfLibrary::EndfB8_0,
-        "endf8.1" | "endf/b-viii.1" => EndfLibrary::EndfB8_1,
-        "jeff3.3" => EndfLibrary::Jeff3_3,
-        "jendl5" => EndfLibrary::Jendl5,
-        _ => {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Unknown library '{}'. Use one of: endf8.0, endf8.1, jeff3.3, jendl5",
-                library
-            )));
-        }
-    };
+    let lib = parse_library_name(library)?;
 
     let isotope = Isotope::new(z, a)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid isotope: {}", e)))?;
@@ -600,17 +834,8 @@ fn load_endf(
     //
     // We tag errors so we can map retrieval failures → PyRuntimeError and
     // parse failures → PyValueError (preserving the pre-GIL-release contract).
-    let result: Result<ResonanceData, (bool, String)> = py.detach(move || {
-        let retriever = EndfRetriever::new();
-        let (_path, contents) = retriever
-            .get_endf_file(&isotope, lib, mat_num)
-            .map_err(|e| (false, format!("{}", e)))?;
-
-        let data =
-            parse_endf_file2(&contents).map_err(|e| (true, format!("ENDF parse error: {}", e)))?;
-
-        Ok(data)
-    });
+    let result: Result<ResonanceData, (bool, String)> =
+        py.detach(move || load_and_parse_endf(&isotope, lib, mat_num));
 
     let data = result.map_err(|(is_parse, msg)| {
         if is_parse {
@@ -1833,9 +2058,11 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCalibrationResult>()?;
     // Phase 5: Typed API
     m.add_class::<PyInputData>()?;
+    m.add_class::<PyIsotopeGroup>()?;
     m.add_function(wrap_pyfunction!(py_from_counts, m)?)?;
     m.add_function(wrap_pyfunction!(py_from_transmission, m)?)?;
     m.add_function(wrap_pyfunction!(py_spatial_map_typed, m)?)?;
+    m.add_function(wrap_pyfunction!(py_fit_spectrum_typed, m)?)?;
     Ok(())
 }
 
@@ -1961,31 +2188,192 @@ fn py_from_transmission<'py>(
     })
 }
 
+/// Parse a solver string into SolverConfig, resolving "auto" eagerly.
+fn parse_solver_config(
+    solver: &str,
+    is_counts: bool,
+    max_iter: usize,
+) -> PyResult<nereids_pipeline::pipeline::SolverConfig> {
+    match solver {
+        "auto" => {
+            if is_counts {
+                Ok(nereids_pipeline::pipeline::SolverConfig::PoissonKL(
+                    nereids_fitting::poisson::PoissonConfig {
+                        max_iter,
+                        ..Default::default()
+                    },
+                ))
+            } else {
+                Ok(
+                    nereids_pipeline::pipeline::SolverConfig::LevenbergMarquardt(
+                        nereids_fitting::lm::LmConfig {
+                            max_iter,
+                            ..Default::default()
+                        },
+                    ),
+                )
+            }
+        }
+        "lm" => Ok(
+            nereids_pipeline::pipeline::SolverConfig::LevenbergMarquardt(
+                nereids_fitting::lm::LmConfig {
+                    max_iter,
+                    ..Default::default()
+                },
+            ),
+        ),
+        "kl" | "poisson" => Ok(nereids_pipeline::pipeline::SolverConfig::PoissonKL(
+            nereids_fitting::poisson::PoissonConfig {
+                max_iter,
+                ..Default::default()
+            },
+        )),
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Unknown solver: '{other}'. Use 'auto', 'lm', or 'kl'."
+        ))),
+    }
+}
+
+/// Build `UnifiedFitConfig` from groups, returning the config and the number of
+/// density parameters (one per group) for initial_densities default.
+fn build_config_from_groups(
+    groups: &[PyIsotopeGroup],
+    energies_vec: Vec<f64>,
+    temperature_k: f64,
+    res_fn: Option<ResolutionFunction>,
+    initial_densities: Option<Vec<f64>>,
+) -> PyResult<UnifiedFitConfig> {
+    // Validate all groups are loaded
+    for g in groups {
+        if !g.is_loaded() {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "IsotopeGroup '{}' has not been fully loaded. Call load_endf() first.",
+                g.inner.name(),
+            )));
+        }
+    }
+
+    let n_groups = groups.len();
+    let init_densities = initial_densities.unwrap_or_else(|| vec![0.001; n_groups]);
+
+    // Build the groups slice for with_groups: &[(&IsotopeGroup, &[ResonanceData])]
+    let group_rd: Vec<Vec<ResonanceData>> = groups
+        .iter()
+        .map(|g| {
+            g.resonance_data
+                .iter()
+                .map(|d| Arc::unwrap_or_clone(d.clone().unwrap()))
+                .collect()
+        })
+        .collect();
+
+    let group_pairs: Vec<(&IsotopeGroup, &[ResonanceData])> = groups
+        .iter()
+        .zip(group_rd.iter())
+        .map(|(g, rd)| (&g.inner, rd.as_slice()))
+        .collect();
+
+    // Create a placeholder config first (with_groups requires a valid base config)
+    // We use the first member's data as placeholder — with_groups replaces everything.
+    let first_rd = Arc::unwrap_or_clone(groups[0].resonance_data[0].clone().unwrap());
+    let placeholder_name = groups[0].inner.name().to_string();
+    let base_config = UnifiedFitConfig::new(
+        energies_vec,
+        vec![first_rd],
+        vec![placeholder_name],
+        temperature_k,
+        res_fn,
+        vec![0.001],
+    )
+    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+
+    let config = base_config
+        .with_groups(&group_pairs, init_densities)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+
+    Ok(config)
+}
+
+/// Convert a pipeline `SpatialResult` to the Python `PySpatialResult`.
+fn spatial_result_to_py(
+    py: Python<'_>,
+    result: &nereids_pipeline::spatial::SpatialResult,
+) -> PySpatialResult {
+    let density_maps: Vec<Py<PyArray2<f64>>> = result
+        .density_maps
+        .iter()
+        .map(|m| PyArray2::from_array(py, m).into())
+        .collect();
+    let uncertainty_maps: Vec<Py<PyArray2<f64>>> = result
+        .uncertainty_maps
+        .iter()
+        .map(|m| PyArray2::from_array(py, m).into())
+        .collect();
+    let shape = (
+        result.converged_map.shape()[0],
+        result.converged_map.shape()[1],
+    );
+    let anorm_map = result
+        .anorm_map
+        .as_ref()
+        .map(|m| PyArray2::from_array(py, m).into());
+    let background_maps = result.background_maps.as_ref().map(|maps| {
+        [
+            PyArray2::from_array(py, &maps[0]).into(),
+            PyArray2::from_array(py, &maps[1]).into(),
+            PyArray2::from_array(py, &maps[2]).into(),
+        ]
+    });
+    let temperature_map = result
+        .temperature_map
+        .as_ref()
+        .map(|m| PyArray2::from_array(py, m).into());
+
+    PySpatialResult {
+        density_maps,
+        uncertainty_maps,
+        chi_squared_map: PyArray2::from_array(py, &result.chi_squared_map).into(),
+        converged_map: PyArray2::from_array(py, &result.converged_map).into(),
+        n_converged: result.n_converged,
+        n_total: result.n_total,
+        isotope_names: result.isotope_labels.clone(),
+        shape,
+        temperature_map,
+        anorm_map,
+        background_maps,
+    }
+}
+
 /// Spatial mapping using the typed input data API.
 ///
 /// Dispatches per-pixel fitting based on the InputData type:
 ///   - from_counts → Poisson KL on raw counts (statistically optimal)
 ///   - from_transmission → LM by default, KL opt-in via solver="kl"
 ///
+/// Either `isotopes` or `groups` must be provided, but not both.
+/// When `groups` is provided, each group maps to one fitted density parameter.
+///
 /// Always returns SpatialResult.
 ///
 /// Args:
 ///     data: InputData from from_counts() or from_transmission().
 ///     energies: 1D energy grid in eV (ascending).
-///     isotopes: list of ResonanceData objects.
-///     temperature_k: Sample temperature in Kelvin (default 300).
+///     isotopes: list of ResonanceData objects (mutually exclusive with groups).
+///     temperature_k: Sample temperature in Kelvin (default 293.6).
+///     fit_temperature: Whether to fit temperature per pixel (default False).
 ///     initial_densities: Initial density guesses (default 0.001 each).
 ///     dead_pixels: Optional 2D boolean dead pixel mask.
 ///     max_iter: Maximum iterations per pixel (default 200).
 ///     solver: "auto" (default), "lm", or "kl".
 ///     background: Enable SAMMY transmission background (only for transmission data).
 ///     resolution: Optional resolution function.
+///     groups: list of IsotopeGroup objects (mutually exclusive with isotopes).
 ///
 /// Returns:
 ///     SpatialResult with density_maps, chi_squared_map, converged_map, etc.
 #[pyfunction]
 #[pyo3(name = "spatial_map_typed", signature = (
-    data, energies, isotopes, *,
+    data, energies, isotopes=None, *,
     temperature_k = 293.6,
     fit_temperature = false,
     initial_densities = None,
@@ -1997,12 +2385,13 @@ fn py_from_transmission<'py>(
     flight_path_m = None,
     delta_t_us = None,
     delta_l_m = None,
+    groups = None,
 ))]
 fn py_spatial_map_typed<'py>(
     py: Python<'py>,
     data: &PyInputData,
     energies: PyReadonlyArray1<'py, f64>,
-    isotopes: Vec<PyResonanceData>,
+    isotopes: Option<Vec<PyResonanceData>>,
     temperature_k: f64,
     fit_temperature: bool,
     initial_densities: Option<Vec<f64>>,
@@ -2014,74 +2403,71 @@ fn py_spatial_map_typed<'py>(
     flight_path_m: Option<f64>,
     delta_t_us: Option<f64>,
     delta_l_m: Option<f64>,
+    groups: Option<Vec<PyIsotopeGroup>>,
 ) -> PyResult<PySpatialResult> {
-    let energies_vec = energies.as_slice()?.to_vec();
-    let n_iso = isotopes.len();
+    // Validate mutual exclusivity
+    let has_isotopes = isotopes.is_some();
+    let has_groups = groups.is_some();
+    if has_isotopes && has_groups {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Provide either 'isotopes' or 'groups', not both.",
+        ));
+    }
+    if !has_isotopes && !has_groups {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Must provide either 'isotopes' or 'groups'.",
+        ));
+    }
 
-    let iso_names: Vec<String> = isotopes
-        .iter()
-        .map(|i| {
-            let sym = nereids_core::elements::element_symbol(i.inner.isotope.z()).unwrap_or("?");
-            format!("{}-{}", sym, i.inner.isotope.a())
-        })
-        .collect();
-    let resonance_data: Vec<ResonanceData> = isotopes
-        .into_iter()
-        .map(|d| Arc::unwrap_or_clone(d.inner))
-        .collect();
-    let init_densities = initial_densities.unwrap_or_else(|| vec![0.001; n_iso]);
+    let energies_vec = energies.as_slice()?.to_vec();
 
     // Build resolution
     let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution, None)?;
 
-    // Build config
-    let mut config = UnifiedFitConfig::new(
-        energies_vec,
-        resonance_data,
-        iso_names,
-        temperature_k,
-        res_fn,
-        init_densities,
-    )
-    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    // Build config based on isotopes or groups
+    let mut config = if let Some(isotopes) = isotopes {
+        let n_iso = isotopes.len();
+        let iso_names: Vec<String> = isotopes
+            .iter()
+            .map(|i| {
+                let sym =
+                    nereids_core::elements::element_symbol(i.inner.isotope.z()).unwrap_or("?");
+                format!("{}-{}", sym, i.inner.isotope.a())
+            })
+            .collect();
+        let resonance_data: Vec<ResonanceData> = isotopes
+            .into_iter()
+            .map(|d| Arc::unwrap_or_clone(d.inner))
+            .collect();
+        let init_densities = initial_densities.unwrap_or_else(|| vec![0.001; n_iso]);
+
+        UnifiedFitConfig::new(
+            energies_vec,
+            resonance_data,
+            iso_names,
+            temperature_k,
+            res_fn,
+            init_densities,
+        )
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?
+    } else {
+        let groups = groups.unwrap();
+        if groups.is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "groups list must not be empty",
+            ));
+        }
+        build_config_from_groups(
+            &groups,
+            energies_vec,
+            temperature_k,
+            res_fn,
+            initial_densities,
+        )?
+    };
 
     // Solver — resolve "auto" eagerly so max_iter is always propagated.
-    let solver_config = match solver {
-        "auto" => {
-            if data.kind == "counts" {
-                nereids_pipeline::pipeline::SolverConfig::PoissonKL(
-                    nereids_fitting::poisson::PoissonConfig {
-                        max_iter,
-                        ..Default::default()
-                    },
-                )
-            } else {
-                nereids_pipeline::pipeline::SolverConfig::LevenbergMarquardt(
-                    nereids_fitting::lm::LmConfig {
-                        max_iter,
-                        ..Default::default()
-                    },
-                )
-            }
-        }
-        "lm" => nereids_pipeline::pipeline::SolverConfig::LevenbergMarquardt(
-            nereids_fitting::lm::LmConfig {
-                max_iter,
-                ..Default::default()
-            },
-        ),
-        "kl" | "poisson" => nereids_pipeline::pipeline::SolverConfig::PoissonKL(
-            nereids_fitting::poisson::PoissonConfig {
-                max_iter,
-                ..Default::default()
-            },
-        ),
-        other => {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Unknown solver: '{other}'. Use 'auto', 'lm', or 'kl'."
-            )));
-        }
-    };
+    let solver_config = parse_solver_config(solver, data.kind == "counts", max_iter)?;
     config = config.with_solver(solver_config);
 
     // Temperature fitting
@@ -2124,50 +2510,183 @@ fn py_spatial_map_typed<'py>(
     let result = spatial_map_typed(&input, &config, dead_arr.as_ref(), None, None)
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
-    // Convert to PySpatialResult
-    let density_maps: Vec<Py<PyArray2<f64>>> = result
-        .density_maps
-        .iter()
-        .map(|m| PyArray2::from_array(py, m).into())
-        .collect();
-    let uncertainty_maps: Vec<Py<PyArray2<f64>>> = result
-        .uncertainty_maps
-        .iter()
-        .map(|m| PyArray2::from_array(py, m).into())
-        .collect();
-    let shape = (
-        result.converged_map.shape()[0],
-        result.converged_map.shape()[1],
-    );
+    Ok(spatial_result_to_py(py, &result))
+}
 
-    let anorm_map = result
-        .anorm_map
-        .as_ref()
-        .map(|m| PyArray2::from_array(py, m).into());
-    let background_maps = result.background_maps.as_ref().map(|maps| {
-        [
-            PyArray2::from_array(py, &maps[0]).into(),
-            PyArray2::from_array(py, &maps[1]).into(),
-            PyArray2::from_array(py, &maps[2]).into(),
-        ]
-    });
+/// Fit a single spectrum using the typed input data API.
+///
+/// Dispatches per-pixel fitting based on the InputData type:
+///   - from_counts → Poisson KL on raw counts (statistically optimal)
+///   - from_transmission → LM by default, KL opt-in via solver="kl"
+///
+/// Either `isotopes` or `groups` must be provided, but not both.
+///
+/// Args:
+///     transmission: 1D transmission spectrum.
+///     uncertainty: 1D uncertainty (same length as transmission).
+///     energies: 1D energy grid in eV (ascending).
+///     isotopes: list of (ResonanceData, initial_density) tuples (mutually exclusive with groups).
+///     temperature_k: Sample temperature in Kelvin (default 293.6).
+///     fit_temperature: Whether to fit temperature (default False).
+///     max_iter: Maximum iterations (default 200).
+///     solver: "auto" (default), "lm", or "kl".
+///     background: Enable SAMMY transmission background.
+///     resolution: Optional resolution function.
+///     groups: list of IsotopeGroup objects (mutually exclusive with isotopes).
+///     initial_densities: Initial density guesses when using groups (default 0.001 each).
+///
+/// Returns:
+///     FitResult with densities, uncertainties, chi2, etc.
+#[pyfunction]
+#[pyo3(name = "fit_spectrum_typed", signature = (
+    transmission, uncertainty, energies, isotopes=None, *,
+    temperature_k = 293.6,
+    fit_temperature = false,
+    max_iter = 200,
+    solver = "lm",
+    background = false,
+    resolution = None,
+    flight_path_m = None,
+    delta_t_us = None,
+    delta_l_m = None,
+    groups = None,
+    initial_densities = None,
+))]
+fn py_fit_spectrum_typed<'py>(
+    py: Python<'py>,
+    transmission: PyReadonlyArray1<'py, f64>,
+    uncertainty: PyReadonlyArray1<'py, f64>,
+    energies: PyReadonlyArray1<'py, f64>,
+    isotopes: Option<Vec<(PyResonanceData, f64)>>,
+    temperature_k: f64,
+    fit_temperature: bool,
+    max_iter: usize,
+    solver: &str,
+    background: bool,
+    resolution: Option<PyTabulatedResolution>,
+    flight_path_m: Option<f64>,
+    delta_t_us: Option<f64>,
+    delta_l_m: Option<f64>,
+    groups: Option<Vec<PyIsotopeGroup>>,
+    initial_densities: Option<Vec<f64>>,
+) -> PyResult<PyFitResult> {
+    use nereids_pipeline::pipeline::{InputData, fit_spectrum_typed};
 
-    let temperature_map = result
-        .temperature_map
-        .as_ref()
-        .map(|m| PyArray2::from_array(py, m).into());
+    // Validate mutual exclusivity
+    let has_isotopes = isotopes.is_some();
+    let has_groups = groups.is_some();
+    if has_isotopes && has_groups {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Provide either 'isotopes' or 'groups', not both.",
+        ));
+    }
+    if !has_isotopes && !has_groups {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Must provide either 'isotopes' or 'groups'.",
+        ));
+    }
 
-    Ok(PySpatialResult {
-        density_maps,
-        uncertainty_maps,
-        chi_squared_map: PyArray2::from_array(py, &result.chi_squared_map).into(),
-        converged_map: PyArray2::from_array(py, &result.converged_map).into(),
-        n_converged: result.n_converged,
-        n_total: result.n_total,
-        isotope_names: result.isotope_labels,
-        shape,
-        temperature_map,
-        anorm_map,
-        background_maps,
+    let t_slice = transmission.as_slice()?;
+    let u_slice = uncertainty.as_slice()?;
+    let e_slice = energies.as_slice()?;
+
+    if t_slice.len() != u_slice.len() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "transmission length ({}) must match uncertainty length ({})",
+            t_slice.len(),
+            u_slice.len(),
+        )));
+    }
+    if t_slice.len() != e_slice.len() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "transmission length ({}) must match energies length ({})",
+            t_slice.len(),
+            e_slice.len(),
+        )));
+    }
+    require_non_empty_energy_grid(e_slice)?;
+
+    let energies_vec = e_slice.to_vec();
+
+    // Build resolution
+    let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution, None)?;
+
+    // Build config based on isotopes or groups
+    let mut config = if let Some(isotopes) = isotopes {
+        let iso_names: Vec<String> = isotopes
+            .iter()
+            .map(|(d, _)| {
+                let sym =
+                    nereids_core::elements::element_symbol(d.inner.isotope.z()).unwrap_or("?");
+                format!("{}-{}", sym, d.inner.isotope.a())
+            })
+            .collect();
+        let init_densities: Vec<f64> = isotopes.iter().map(|(_, d)| *d).collect();
+        let resonance_data: Vec<ResonanceData> = isotopes
+            .into_iter()
+            .map(|(d, _)| Arc::unwrap_or_clone(d.inner))
+            .collect();
+
+        UnifiedFitConfig::new(
+            energies_vec,
+            resonance_data,
+            iso_names,
+            temperature_k,
+            res_fn,
+            init_densities,
+        )
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?
+    } else {
+        let groups = groups.unwrap();
+        if groups.is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "groups list must not be empty",
+            ));
+        }
+        build_config_from_groups(
+            &groups,
+            energies_vec,
+            temperature_k,
+            res_fn,
+            initial_densities,
+        )?
+    };
+
+    // Solver
+    let solver_config = parse_solver_config(solver, false, max_iter)?;
+    config = config.with_solver(solver_config);
+
+    // Temperature fitting
+    if fit_temperature {
+        config = config.with_fit_temperature(true);
+    }
+
+    // Background
+    if background {
+        config = config
+            .with_transmission_background(nereids_pipeline::pipeline::BackgroundConfig::default());
+    }
+
+    // Build 1D InputData
+    let input = InputData::Transmission {
+        transmission: t_slice.to_vec(),
+        uncertainty: u_slice.to_vec(),
+    };
+
+    // Release the GIL for the fit computation.
+    let result = py.detach(move || fit_spectrum_typed(&input, &config).map_err(|e| e.to_string()));
+
+    let result = result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+
+    Ok(PyFitResult {
+        densities: result.densities,
+        uncertainties: result.uncertainties,
+        reduced_chi_squared: result.reduced_chi_squared,
+        converged: result.converged,
+        iterations: result.iterations,
+        temperature_k: result.temperature_k,
+        temperature_k_unc: result.temperature_k_unc,
+        anorm: result.anorm,
+        background: result.background,
     })
 }

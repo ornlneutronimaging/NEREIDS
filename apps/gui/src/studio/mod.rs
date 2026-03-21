@@ -814,12 +814,13 @@ fn build_residuals_cache(
         .map(|resolution| std::sync::Arc::new(InstrumentParams { resolution }))
     };
 
+    let n = densities.len();
     let model = nereids_fitting::transmission_model::TransmissionFitModel::new(
         energies.clone(),
         resonance_data,
         temperature_k,
         instrument,
-        (0..densities.len()).collect(),
+        ((0..n).collect(), vec![1.0; n]),
         None,
         None,
     )

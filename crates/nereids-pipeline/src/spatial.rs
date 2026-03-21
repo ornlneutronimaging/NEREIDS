@@ -96,7 +96,8 @@ pub fn spatial_map_typed(
     progress: Option<&AtomicUsize>,
 ) -> Result<SpatialResult, PipelineError> {
     let (n_energies, height, width) = input.shape();
-    let n_isotopes = config.resonance_data().len();
+    // n_maps = number of density maps to return (one per group or per isotope).
+    let n_maps = config.n_density_params();
 
     // Validate shapes
     if n_energies != config.energies().len() {
@@ -158,10 +159,10 @@ pub fn spatial_map_typed(
     }
     if pixel_coords.is_empty() {
         return Ok(SpatialResult {
-            density_maps: (0..n_isotopes)
+            density_maps: (0..n_maps)
                 .map(|_| Array2::zeros((height, width)))
                 .collect(),
-            uncertainty_maps: (0..n_isotopes)
+            uncertainty_maps: (0..n_maps)
                 .map(|_| Array2::from_elem((height, width), f64::NAN))
                 .collect(),
             chi_squared_map: Array2::from_elem((height, width), f64::NAN),
@@ -337,10 +338,10 @@ pub fn spatial_map_typed(
     }
 
     // Assemble output maps
-    let mut density_maps: Vec<Array2<f64>> = (0..n_isotopes)
+    let mut density_maps: Vec<Array2<f64>> = (0..n_maps)
         .map(|_| Array2::zeros((height, width)))
         .collect();
-    let mut uncertainty_maps: Vec<Array2<f64>> = (0..n_isotopes)
+    let mut uncertainty_maps: Vec<Array2<f64>> = (0..n_maps)
         .map(|_| Array2::from_elem((height, width), f64::NAN))
         .collect();
     let mut chi_squared_map = Array2::from_elem((height, width), f64::NAN);
@@ -367,7 +368,7 @@ pub fn spatial_map_typed(
     };
 
     for ((y, x), result) in &results {
-        for i in 0..n_isotopes {
+        for i in 0..n_maps {
             density_maps[i][[*y, *x]] = result.densities[i];
             if let Some(ref unc) = result.uncertainties {
                 uncertainty_maps[i][[*y, *x]] = unc[i];
