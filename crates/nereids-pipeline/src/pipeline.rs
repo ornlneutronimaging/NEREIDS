@@ -355,7 +355,17 @@ impl UnifiedFitConfig {
                 });
             }
             names.push(group.name().to_string());
-            for ((_isotope, ratio), rd) in group.members().iter().zip(rd_list.iter()) {
+            for ((isotope, ratio), rd) in group.members().iter().zip(rd_list.iter()) {
+                // Validate that the ResonanceData matches the expected member isotope.
+                if rd.isotope != *isotope {
+                    return Err(FitConfigError::GroupMemberIsotopeMismatch {
+                        group_name: group.name().to_string(),
+                        expected_z: isotope.z(),
+                        expected_a: isotope.a(),
+                        got_z: rd.isotope.z(),
+                        got_a: rd.isotope.a(),
+                    });
+                }
                 all_resonance_data.push(rd.clone());
                 all_indices.push(g_idx);
                 all_ratios.push(*ratio);
@@ -367,6 +377,9 @@ impl UnifiedFitConfig {
         self.n_density_params = Some(groups.len());
         self.density_indices = Some(all_indices);
         self.density_ratios = Some(all_ratios);
+        // Clear stale caches — the isotope set changed.
+        self.precomputed_cross_sections = None;
+        self.precomputed_base_xs = None;
         Ok(self)
     }
 
@@ -936,14 +949,20 @@ fn build_transmission_model(
         // For ungrouped isotopes, this is a no-op (identity mapping, ratio=1.0).
         let effective_xs =
             if let (Some(di), Some(dr)) = (&config.density_indices, &config.density_ratios) {
-                let n_e = xs[0].len();
-                let mut eff = vec![vec![0.0f64; n_e]; n_params];
-                for ((&idx, &ratio), member_xs) in di.iter().zip(dr.iter()).zip(xs.iter()) {
-                    for (j, &sigma) in member_xs.iter().enumerate() {
-                        eff[idx][j] += ratio * sigma;
+                // Only collapse when XS is per-member (shape matches mapping).
+                // If XS is already group-collapsed (len == n_params), skip.
+                if xs.len() == di.len() && di.len() == dr.len() {
+                    let n_e = xs[0].len();
+                    let mut eff = vec![vec![0.0f64; n_e]; n_params];
+                    for ((&idx, &ratio), member_xs) in di.iter().zip(dr.iter()).zip(xs.iter()) {
+                        for (j, &sigma) in member_xs.iter().enumerate() {
+                            eff[idx][j] += ratio * sigma;
+                        }
                     }
+                    Arc::new(eff)
+                } else {
+                    Arc::clone(xs)
                 }
-                Arc::new(eff)
             } else {
                 Arc::clone(xs)
             };
@@ -1085,6 +1104,14 @@ pub enum FitConfigError {
         rd_count: usize,
         member_count: usize,
     },
+    /// ResonanceData isotope doesn't match expected group member.
+    GroupMemberIsotopeMismatch {
+        group_name: String,
+        expected_z: u32,
+        expected_a: u32,
+        got_z: u32,
+        got_a: u32,
+    },
     /// Temperature must be finite.
     NonFiniteTemperature(f64),
     /// Temperature must be non-negative.
@@ -1101,7 +1128,7 @@ impl fmt::Display for FitConfigError {
                 isotopes,
             } => write!(
                 f,
-                "initial_densities length ({densities}) must match resonance_data length ({isotopes})"
+                "initial_densities length ({densities}) must match number of density parameters ({isotopes})"
             ),
             Self::NameCountMismatch { names, isotopes } => write!(
                 f,
@@ -1114,6 +1141,16 @@ impl fmt::Display for FitConfigError {
             } => write!(
                 f,
                 "group '{group_name}': provided {rd_count} ResonanceData but group has {member_count} members"
+            ),
+            Self::GroupMemberIsotopeMismatch {
+                group_name,
+                expected_z,
+                expected_a,
+                got_z,
+                got_a,
+            } => write!(
+                f,
+                "group '{group_name}': expected Z={expected_z} A={expected_a} but got Z={got_z} A={got_a}"
             ),
             Self::NonFiniteTemperature(v) => {
                 write!(f, "temperature must be finite, got {v}")

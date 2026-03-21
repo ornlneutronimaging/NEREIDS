@@ -2544,7 +2544,7 @@ fn py_spatial_map_typed<'py>(
 ///     temperature_k: Sample temperature in Kelvin (default 293.6).
 ///     fit_temperature: Whether to fit temperature (default False).
 ///     max_iter: Maximum iterations (default 200).
-///     solver: "auto" (default), "lm", or "kl".
+///     solver: "lm" (default), "kl", or "auto".
 ///     background: Enable SAMMY transmission background.
 ///     resolution: Optional resolution function.
 ///     groups: list of IsotopeGroup objects (mutually exclusive with isotopes).

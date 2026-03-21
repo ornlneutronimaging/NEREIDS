@@ -232,6 +232,8 @@ pub fn spatial_map_typed(
     // build_transmission_model on every per-pixel call.
     let xs = if !config.fit_temperature()
         && let (Some(di), Some(dr)) = (&config.density_indices, &config.density_ratios)
+        && xs.len() == di.len()
+        && di.len() == dr.len()
     {
         let n_e = xs[0].len();
         let mut eff = vec![vec![0.0f64; n_e]; n_maps];

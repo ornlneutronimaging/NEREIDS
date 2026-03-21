@@ -10,11 +10,10 @@ use nereids_endf::resonance::{
     LGroup, Resonance, ResonanceData, ResonanceFormalism, ResonanceRange,
 };
 
-/// Build a minimal U-238 `ResonanceData` with a single resonance at 6.674 eV.
+/// Build a synthetic single-resonance `ResonanceData` for any isotope.
 ///
-/// Used across pipeline, spatial, and sparse tests to avoid triplicating the
-/// same 30-line constructor.
-/// Build a synthetic single-resonance ResonanceData for any isotope.
+/// Used for group fitting tests where distinct isotopes with different
+/// resonance energies are needed.
 pub fn synthetic_single_resonance(z: u32, a: u32, awr: f64, energy: f64) -> ResonanceData {
     ResonanceData {
         isotope: Isotope::new(z, a).unwrap(),
@@ -51,6 +50,10 @@ pub fn synthetic_single_resonance(z: u32, a: u32, awr: f64, energy: f64) -> Reso
     }
 }
 
+/// Build a minimal U-238 `ResonanceData` with a single resonance at 6.674 eV.
+///
+/// Used across pipeline, spatial, and fitting tests to avoid duplicating
+/// the same constructor.
 pub fn u238_single_resonance() -> ResonanceData {
     ResonanceData {
         isotope: Isotope::new(92, 238).unwrap(),
