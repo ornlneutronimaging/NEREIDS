@@ -1006,3 +1006,47 @@ pub(crate) fn build_fit_line(p: &FitLineParams<'_>) -> Option<Line<'static>> {
         .collect();
     Some(Line::new("Fit", fit_points).width(2.0))
 }
+
+// ── Resonance Data Collection ──────────────────────────────────
+
+/// Collect all resonance data and density mapping from enabled isotopes + groups.
+///
+/// Order matches `build_fit_config()`: individuals first, then group members.
+/// Returns:
+/// - `all_rd`: flat list of ResonanceData (one per individual isotope + one per group member)
+/// - `density_indices`: maps each rd to a density parameter index
+/// - `density_ratios`: abundance ratio for each rd (1.0 for individuals)
+pub(crate) fn collect_all_resonance_data_with_mapping(
+    state: &AppState,
+) -> (
+    Vec<nereids_endf::resonance::ResonanceData>,
+    Vec<usize>,
+    Vec<f64>,
+) {
+    let mut all_rd = Vec::new();
+    let mut indices = Vec::new();
+    let mut ratios = Vec::new();
+    let mut density_idx = 0usize;
+
+    for e in &state.isotope_entries {
+        if e.enabled && e.resonance_data.is_some() {
+            all_rd.push(e.resonance_data.clone().unwrap());
+            indices.push(density_idx);
+            ratios.push(1.0);
+            density_idx += 1;
+        }
+    }
+    for g in &state.isotope_groups {
+        if g.enabled && g.overall_status() == EndfStatus::Loaded {
+            for m in &g.members {
+                if let Some(rd) = &m.resonance_data {
+                    all_rd.push(rd.clone());
+                    indices.push(density_idx);
+                    ratios.push(m.ratio);
+                }
+            }
+            density_idx += 1;
+        }
+    }
+    (all_rd, indices, ratios)
+}

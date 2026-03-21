@@ -628,16 +628,20 @@ fn add_selected_isotopes(state: &mut AppState) {
     }
 
     let mut added = 0usize;
+    let mut skipped_dup = 0usize;
+    let mut skipped_group = 0usize;
     for (z, a) in &selected {
         let sym = nereids_core::elements::element_symbol(*z).unwrap_or("??");
         let symbol = format!("{}-{}", sym, a);
         match state.periodic_table_target {
             PeriodicTableTarget::Configure => {
                 if state.isotope_entries.iter().any(|e| e.z == *z && e.a == *a) {
+                    skipped_dup += 1;
                     continue; // already present
                 }
                 // Skip if this element already has a group (avoid group+individual overlap)
                 if state.isotope_groups.iter().any(|g| g.z == *z) {
+                    skipped_group += 1;
                     continue;
                 }
                 // Always add with Pending status — the auto-fetch loop in
@@ -663,6 +667,7 @@ fn add_selected_isotopes(state: &mut AppState) {
                     .iter()
                     .any(|e| e.z == *z && e.a == *a)
                 {
+                    skipped_dup += 1;
                     continue; // already present
                 }
                 state.fm_isotope_entries.push(IsotopeEntry {
@@ -683,6 +688,7 @@ fn add_selected_isotopes(state: &mut AppState) {
                     .iter()
                     .any(|e| e.z == *z && e.a == *a)
                 {
+                    skipped_dup += 1;
                     continue; // already present
                 }
                 state.detect_matrix_entries.push(IsotopeEntry {
@@ -702,6 +708,7 @@ fn add_selected_isotopes(state: &mut AppState) {
                     .iter()
                     .any(|e| e.z == *z && e.a == *a)
                 {
+                    skipped_dup += 1;
                     continue; // already present
                 }
                 state.detect_trace_entries.push(DetectTraceEntry {
@@ -719,7 +726,6 @@ fn add_selected_isotopes(state: &mut AppState) {
     }
 
     // Provide user feedback about what was added.
-    let skipped = selected.len() - added;
     let is_fetching = match state.periodic_table_target {
         PeriodicTableTarget::Configure | PeriodicTableTarget::ConfigureGroup => {
             state.is_fetching_endf
@@ -736,11 +742,20 @@ fn add_selected_isotopes(state: &mut AppState) {
     } else if added > 0 {
         msg = format!("Added {added} isotope(s)");
     }
-    if skipped > 0 {
+    // Report separate skip reasons so users understand why isotopes were not added.
+    let mut skip_parts: Vec<String> = Vec::new();
+    if skipped_dup > 0 {
+        skip_parts.push(format!("{skipped_dup} duplicate(s) skipped"));
+    }
+    if skipped_group > 0 {
+        skip_parts.push(format!("{skipped_group} skipped (element group exists)"));
+    }
+    if !skip_parts.is_empty() {
+        let skip_msg = skip_parts.join(", ");
         if msg.is_empty() {
-            msg = format!("Skipped {skipped} duplicate(s)");
+            msg = skip_msg;
         } else {
-            msg = format!("{msg} (skipped {skipped} duplicate(s))");
+            msg = format!("{msg} ({skip_msg})");
         }
     }
     if !msg.is_empty() {

@@ -516,52 +516,9 @@ fn apply_roi_editor_result(state: &mut AppState, result: RoiEditorResult) {
     }
 }
 
-/// Collect all resonance data from enabled individual isotopes and group members,
-/// along with the density mapping required by `TransmissionFitModel`.
-///
-/// Order matches `build_fit_config()`: individuals first (as single-member groups),
-/// then actual group members. Returns:
-/// - `all_rd`: flat list of ResonanceData (one per individual isotope + one per group member)
-/// - `density_indices`: maps each rd to a density parameter index
-/// - `density_ratios`: abundance ratio for each rd (1.0 for individuals)
-fn collect_all_resonance_data_with_mapping(
-    state: &AppState,
-) -> (
-    Vec<nereids_endf::resonance::ResonanceData>,
-    Vec<usize>,
-    Vec<f64>,
-) {
-    let mut all_rd = Vec::new();
-    let mut indices = Vec::new();
-    let mut ratios = Vec::new();
-    let mut density_idx = 0usize;
-
-    for e in &state.isotope_entries {
-        if e.enabled && e.resonance_data.is_some() {
-            all_rd.push(e.resonance_data.clone().unwrap());
-            indices.push(density_idx);
-            ratios.push(1.0);
-            density_idx += 1;
-        }
-    }
-    for g in &state.isotope_groups {
-        if g.enabled && g.overall_status() == EndfStatus::Loaded {
-            for m in &g.members {
-                if let Some(rd) = &m.resonance_data {
-                    all_rd.push(rd.clone());
-                    indices.push(density_idx);
-                    ratios.push(m.ratio);
-                }
-            }
-            density_idx += 1;
-        }
-    }
-    (all_rd, indices, ratios)
-}
-
 /// Collect all resonance data (without mapping) for draw_resonance_dips.
 fn collect_all_resonance_data(state: &AppState) -> Vec<nereids_endf::resonance::ResonanceData> {
-    collect_all_resonance_data_with_mapping(state).0
+    design::collect_all_resonance_data_with_mapping(state).0
 }
 
 /// Clear downstream fit results when ROI changes.
@@ -686,7 +643,7 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
     let fit_line = state.pixel_fit_result.as_ref().and_then(|result| {
         let energies = state.energies.as_ref()?;
         let (all_rd, density_indices, density_ratios) =
-            collect_all_resonance_data_with_mapping(state);
+            design::collect_all_resonance_data_with_mapping(state);
         design::build_fit_line(&design::FitLineParams {
             result,
             resonance_data: &all_rd,
@@ -861,17 +818,27 @@ fn build_fit_config(state: &AppState) -> Result<UnifiedFitConfig, String> {
             .map(|(g, rd)| (g, rd.as_slice()))
             .collect();
 
-        // Build a dummy config first (with placeholder data), then replace via with_groups
-        let dummy_rd = vec![group_specs[0].1[0].clone()];
-        let dummy_names = vec!["placeholder".to_string()];
-        let dummy_densities = vec![0.001];
+        // Guard: group_specs must have at least one group with at least one member.
+        let (first_group, first_rd) = group_specs
+            .first()
+            .filter(|(_, rd)| !rd.is_empty())
+            .ok_or_else(|| {
+                "No groups with loaded resonance data — cannot build fit config".to_string()
+            })?;
+
+        // Build a base config using the first group's real data, then replace via with_groups.
+        // with_groups() replaces everything, so the base values are overwritten immediately,
+        // but using real data avoids sentinel values and documents the provenance.
+        let base_rd = vec![first_rd[0].clone()];
+        let base_names = vec![first_group.name().to_string()];
+        let base_densities = vec![group_densities[0]];
         let base = UnifiedFitConfig::new(
             energies,
-            dummy_rd,
-            dummy_names,
+            base_rd,
+            base_names,
             state.temperature_k,
             resolution,
-            dummy_densities,
+            base_densities,
         )
         .map_err(|e| format!("Config validation error: {e}"))?;
 
