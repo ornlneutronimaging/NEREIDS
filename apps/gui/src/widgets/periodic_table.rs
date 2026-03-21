@@ -416,21 +416,32 @@ pub fn periodic_table_modal(ctx: &egui::Context, state: &mut AppState) {
                             .max_decimals(if is_ppm { 1 } else { 6 }),
                     );
 
-                    let lib = state
-                        .periodic_table_library
-                        .get_or_insert(target_library(state));
-                    egui::ComboBox::from_id_salt("pt_lib")
-                        .selected_text(super::design::library_name(*lib))
-                        .show_ui(ui, |ui| {
-                            for (val, label) in [
-                                (EndfLibrary::EndfB8_0, "ENDF/B-VIII.0"),
-                                (EndfLibrary::EndfB8_1, "ENDF/B-VIII.1"),
-                                (EndfLibrary::Jeff3_3, "JEFF-3.3"),
-                                (EndfLibrary::Jendl5, "JENDL-5"),
-                            ] {
-                                ui.selectable_value(lib, val, label);
-                            }
-                        });
+                    // Disable library changes while a fetch is in progress
+                    // to prevent stale results from overwriting new entries.
+                    let fetching = match state.periodic_table_target {
+                        PeriodicTableTarget::Configure => state.is_fetching_endf,
+                        PeriodicTableTarget::ForwardModel => state.is_fetching_fm_endf,
+                        PeriodicTableTarget::DetectMatrix | PeriodicTableTarget::DetectTrace => {
+                            state.is_fetching_detect_endf
+                        }
+                    };
+                    ui.add_enabled_ui(!fetching, |ui| {
+                        let lib = state
+                            .periodic_table_library
+                            .get_or_insert(target_library(state));
+                        egui::ComboBox::from_id_salt("pt_lib")
+                            .selected_text(super::design::library_name(*lib))
+                            .show_ui(ui, |ui| {
+                                for (val, label) in [
+                                    (EndfLibrary::EndfB8_0, "ENDF/B-VIII.0"),
+                                    (EndfLibrary::EndfB8_1, "ENDF/B-VIII.1"),
+                                    (EndfLibrary::Jeff3_3, "JEFF-3.3"),
+                                    (EndfLibrary::Jendl5, "JENDL-5"),
+                                ] {
+                                    ui.selectable_value(lib, val, label);
+                                }
+                            });
+                    });
 
                     let n_sel = state.periodic_table_selected_isotopes.len();
                     if ui
@@ -619,19 +630,22 @@ fn add_selected_isotopes(state: &mut AppState) {
             state.is_fetching_detect_endf
         }
     };
+    // Build status message from scratch (don't append to stale old message).
+    let mut msg = String::new();
     if added > 0 && is_fetching {
-        state.status_message =
-            format!("Added {added} isotope(s) \u{2014} will fetch after current batch completes");
+        msg = format!("Added {added} isotope(s) \u{2014} will fetch after current batch completes");
     } else if added > 0 {
-        state.status_message = format!("Added {added} isotope(s)");
+        msg = format!("Added {added} isotope(s)");
     }
     if skipped > 0 {
-        let base = state.status_message.clone();
-        if base.is_empty() {
-            state.status_message = format!("Skipped {skipped} duplicate(s)");
+        if msg.is_empty() {
+            msg = format!("Skipped {skipped} duplicate(s)");
         } else {
-            state.status_message = format!("{base} (skipped {skipped} duplicate(s))");
+            msg = format!("{msg} (skipped {skipped} duplicate(s))");
         }
+    }
+    if !msg.is_empty() {
+        state.status_message = msg;
     }
 
     close_modal(state);
