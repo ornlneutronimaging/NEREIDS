@@ -412,6 +412,85 @@ pub fn isotope_chip(
     action
 }
 
+/// Compact group chip: colored dot + group name + member count badge + density + ENDF badge + X.
+///
+/// Same visual pattern as `isotope_chip` but with a member count label
+/// ("3 iso") to distinguish groups from individual isotopes.
+pub fn group_chip(
+    ui: &mut Ui,
+    name: &str,
+    n_members: usize,
+    density: f64,
+    endf_status: EndfStatus,
+    enabled: bool,
+    id: egui::Id,
+) -> ChipAction {
+    let tc = ThemeColors::from_ctx(ui.ctx());
+    let mut action = ChipAction::None;
+
+    let fill = if enabled { tc.bg3 } else { tc.bg2 };
+    egui::Frame::NONE
+        .fill(fill)
+        .stroke(Stroke::new(1.0, tc.border))
+        .corner_radius(CornerRadius::same(12))
+        .inner_margin(Margin::symmetric(8, 4))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+
+                // Colored dot (hash-based color from group name)
+                let dot_color = isotope_dot_color(name);
+                let (dot_rect, _) = ui.allocate_exact_size(egui::Vec2::splat(8.0), Sense::hover());
+                ui.painter()
+                    .circle_filled(dot_rect.center(), 4.0, dot_color);
+
+                // Enable/disable toggle via clicking the name
+                let sym_resp = ui.add(
+                    egui::Label::new(RichText::new(name).size(11.0).strong()).sense(Sense::click()),
+                );
+                if sym_resp.clicked() {
+                    action = ChipAction::ToggleEnabled;
+                }
+
+                // Member count badge
+                ui.label(
+                    RichText::new(format!("{n_members} iso"))
+                        .size(9.0)
+                        .color(tc.fg3),
+                );
+
+                // Density
+                ui.label(
+                    RichText::new(format!("{density:.4}"))
+                        .size(10.0)
+                        .color(tc.fg2),
+                );
+
+                // ENDF status badge
+                match endf_status {
+                    EndfStatus::Pending => badge(ui, "ENDF", BadgeVariant::Orange),
+                    EndfStatus::Fetching => {
+                        ui.spinner();
+                    }
+                    EndfStatus::Loaded => badge(ui, "ENDF", BadgeVariant::Green),
+                    EndfStatus::Failed => badge(ui, "FAIL", BadgeVariant::Red),
+                }
+
+                // Remove button
+                let x_resp = ui.add(
+                    egui::Button::new(RichText::new("\u{2715}").size(9.0).color(tc.fg3))
+                        .frame(false),
+                );
+                if x_resp.clicked() {
+                    action = ChipAction::Remove;
+                }
+            });
+        });
+
+    let _ = id; // reserved for density edit popup tracking
+    action
+}
+
 /// Deterministic dot color for an isotope symbol (hash-based hue).
 pub fn isotope_dot_color(symbol: &str) -> Color32 {
     let mut hash: u32 = 5381;

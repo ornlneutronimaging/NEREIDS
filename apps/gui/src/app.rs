@@ -204,23 +204,49 @@ fn poll_pending_tasks(state: &mut AppState) {
             match rx.try_recv() {
                 Ok(fetch) => {
                     // Match by (z, a) — stable even if isotope list was mutated
+                    let mut matched = false;
                     if let Some(entry) = state
                         .isotope_entries
                         .iter_mut()
                         .find(|e| e.z == fetch.z && e.a == fetch.a)
                     {
-                        match fetch.result {
+                        match &fetch.result {
                             Ok(data) => {
-                                entry.resonance_data = Some(data);
+                                entry.resonance_data = Some(data.clone());
                                 entry.endf_status = EndfStatus::Loaded;
                                 state.status_message = format!("Loaded {}", fetch.symbol);
-                                // Invalidate stale results — isotope data changed.
                                 state.spatial_result = None;
                                 state.pixel_fit_result = None;
                             }
                             Err(msg) => {
                                 entry.endf_status = EndfStatus::Failed;
-                                state.status_message = msg;
+                                state.status_message = msg.clone();
+                            }
+                        }
+                        matched = true;
+                    }
+                    // Also check group members (z on group, a on member)
+                    if !matched {
+                        for group in &mut state.isotope_groups {
+                            if group.z != fetch.z {
+                                continue;
+                            }
+                            if let Some(member) = group.members.iter_mut().find(|m| m.a == fetch.a)
+                            {
+                                match fetch.result {
+                                    Ok(data) => {
+                                        member.resonance_data = Some(data);
+                                        member.endf_status = EndfStatus::Loaded;
+                                        state.status_message = format!("Loaded {}", fetch.symbol);
+                                        state.spatial_result = None;
+                                        state.pixel_fit_result = None;
+                                    }
+                                    Err(msg) => {
+                                        member.endf_status = EndfStatus::Failed;
+                                        state.status_message = msg;
+                                    }
+                                }
+                                break;
                             }
                         }
                     }
@@ -239,16 +265,32 @@ fn poll_pending_tasks(state: &mut AppState) {
                 .iter()
                 .filter(|e| e.enabled && e.resonance_data.is_some())
                 .count();
-            if !state
+            let group_loaded_count: usize = state
+                .isotope_groups
+                .iter()
+                .filter(|g| g.enabled)
+                .map(|g| {
+                    g.members
+                        .iter()
+                        .filter(|m| m.resonance_data.is_some())
+                        .count()
+                })
+                .sum();
+            let any_missing_iso = state
                 .isotope_entries
                 .iter()
-                .any(|e| e.enabled && e.resonance_data.is_none())
-            {
+                .any(|e| e.enabled && e.resonance_data.is_none());
+            let any_missing_grp = state
+                .isotope_groups
+                .iter()
+                .any(|g| g.enabled && g.members.iter().any(|m| m.resonance_data.is_none()));
+            if !any_missing_iso && !any_missing_grp {
                 state.status_message = "All ENDF data loaded".into();
             }
+            let total = loaded_count + group_loaded_count;
             state.log_provenance(
                 ProvenanceEventKind::ConfigChanged,
-                format!("Fetched ENDF data for {loaded_count} isotopes"),
+                format!("Fetched ENDF data for {total} isotopes"),
             );
             state.is_fetching_endf = false;
             state.pending_endf = None;

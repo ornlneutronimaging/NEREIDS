@@ -5,7 +5,10 @@
 //! chips that add the isotope to the appropriate target list (Configure,
 //! Forward Model, or Detectability).
 
-use crate::state::{AppState, DetectTraceEntry, EndfStatus, IsotopeEntry, PeriodicTableTarget};
+use crate::state::{
+    AppState, DetectTraceEntry, EndfStatus, GroupMemberState, IsotopeEntry, IsotopeGroupEntry,
+    PeriodicTableTarget,
+};
 use egui::{Color32, CornerRadius};
 use nereids_endf::retrieval::EndfLibrary;
 
@@ -298,165 +301,245 @@ pub fn periodic_table_modal(ctx: &egui::Context, state: &mut AppState) {
             ui.add_space(8.0);
             ui.separator();
 
-            // --- Selected element info + multi-select isotope chips ---
-            if let Some(z) = state.periodic_table_selected_z {
-                let name = nereids_core::elements::element_name(z).unwrap_or("Unknown");
-                let sym = nereids_core::elements::element_symbol(z).unwrap_or("??");
-                ui.label(
-                    egui::RichText::new(format!("Z={z}  {sym} - {name}"))
-                        .strong()
-                        .size(14.0),
-                );
-
-                let natural = nereids_core::elements::natural_isotopes(z);
-                let known = nereids_core::elements::known_isotopes(z);
-
-                if natural.is_empty() && known.is_empty() {
-                    ui.label("No ENDF evaluations available.");
-                } else {
-                    // --- Natural isotopes (with abundance %) ---
-                    if !natural.is_empty() {
-                        ui.label("Natural isotopes:");
-                        ui.horizontal_wrapped(|ui| {
-                            for (iso, frac) in &natural {
-                                let a = iso.a();
-                                isotope_chip(ui, state, z, a, sym, Some(*frac), accent);
-                            }
-                        });
-                    }
-
-                    // --- Extra ENDF evaluations (no abundance) ---
-                    let natural_a: Vec<u32> = natural.iter().map(|(iso, _)| iso.a()).collect();
-                    let extra: Vec<u32> = known
-                        .iter()
-                        .map(|iso| iso.a())
-                        .filter(|a| !natural_a.contains(a))
-                        .collect();
-
-                    if !extra.is_empty() {
-                        let label = if natural.is_empty() {
-                            "ENDF evaluations:"
-                        } else {
-                            "Additional ENDF evaluations:"
-                        };
-                        ui.label(label);
-                        ui.horizontal_wrapped(|ui| {
-                            for a in &extra {
-                                isotope_chip(ui, state, z, *a, sym, None, accent);
-                            }
-                        });
-                    }
-                }
-            } else {
-                ui.label("Click an element to see its natural isotopes.");
-            }
-
-            // --- Custom isotope entry ---
-            ui.add_space(4.0);
-            egui::CollapsingHeader::new("Custom Isotope (manual Z/A)")
-                .default_open(false)
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Z:");
-                        ui.add(
-                            egui::DragValue::new(&mut state.periodic_table_custom_z)
-                                .range(1..=118_u32),
-                        );
-                        ui.label("A:");
-                        ui.add(
-                            egui::DragValue::new(&mut state.periodic_table_custom_a)
-                                .range(1..=999_u32),
-                        );
-                    });
-                    if state.periodic_table_custom_z > state.periodic_table_custom_a {
-                        state.periodic_table_custom_a = state.periodic_table_custom_z;
-                    }
-                    let cz = state.periodic_table_custom_z;
-                    let ca = state.periodic_table_custom_a;
-                    let csym = nereids_core::elements::element_symbol(cz).unwrap_or("??");
-                    let has_eval = nereids_core::elements::has_endf_evaluation(cz, ca);
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(format!("{csym}-{ca}")).strong());
-                        if has_eval {
-                            ui.label(
-                                egui::RichText::new("ENDF/B-VIII.0 eval available")
-                                    .color(Color32::from_rgb(34, 139, 34)),
-                            );
-                        } else {
-                            ui.label(
-                                egui::RichText::new("No ENDF/B-VIII.0 eval")
-                                    .color(Color32::from_rgb(200, 130, 0)),
-                            );
-                        }
-                    });
-                    let already = state.periodic_table_selected_isotopes.contains(&(cz, ca));
-                    if ui
-                        .add_enabled(!already, egui::Button::new(format!("Add {csym}-{ca}")))
-                        .clicked()
-                    {
-                        state.periodic_table_selected_isotopes.push((cz, ca));
-                    }
-                });
-
-            // --- Density + library + Add Selected ---
-            if !state.periodic_table_selected_isotopes.is_empty() {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    let is_ppm = state.periodic_table_target == PeriodicTableTarget::DetectTrace;
-                    let label = if is_ppm {
-                        "Conc. (ppm):"
-                    } else {
-                        "Density (at/barn):"
-                    };
-                    ui.label(label);
-                    ui.add(
-                        egui::DragValue::new(&mut state.periodic_table_density)
-                            .speed(if is_ppm { 10.0 } else { 0.0001 })
-                            .range(if is_ppm { 0.1..=1e6 } else { 1e-6..=1.0 })
-                            .max_decimals(if is_ppm { 1 } else { 6 }),
+            // --- ConfigureGroup: element-level group add (no individual isotope selection) ---
+            if state.periodic_table_target == PeriodicTableTarget::ConfigureGroup {
+                if let Some(z) = state.periodic_table_selected_z {
+                    let name = nereids_core::elements::element_name(z).unwrap_or("Unknown");
+                    let sym = nereids_core::elements::element_symbol(z).unwrap_or("??");
+                    ui.label(
+                        egui::RichText::new(format!("Z={z}  {sym} - {name}"))
+                            .strong()
+                            .size(14.0),
                     );
 
-                    // Disable library changes while a fetch is in progress
-                    // to prevent stale results from overwriting new entries.
-                    let fetching = match state.periodic_table_target {
-                        PeriodicTableTarget::Configure => state.is_fetching_endf,
-                        PeriodicTableTarget::ForwardModel => state.is_fetching_fm_endf,
-                        PeriodicTableTarget::DetectMatrix | PeriodicTableTarget::DetectTrace => {
-                            state.is_fetching_detect_endf
-                        }
-                    };
-                    ui.add_enabled_ui(!fetching, |ui| {
-                        let lib = state
-                            .periodic_table_library
-                            .get_or_insert(target_library(state));
-                        egui::ComboBox::from_id_salt("pt_lib")
-                            .selected_text(super::design::library_name(*lib))
-                            .show_ui(ui, |ui| {
-                                for (val, label) in [
-                                    (EndfLibrary::EndfB8_0, "ENDF/B-VIII.0"),
-                                    (EndfLibrary::EndfB8_1, "ENDF/B-VIII.1"),
-                                    (EndfLibrary::Jeff3_3, "JEFF-3.3"),
-                                    (EndfLibrary::Jendl5, "JENDL-5"),
-                                ] {
-                                    ui.selectable_value(lib, val, label);
+                    let natural = nereids_core::elements::natural_isotopes(z);
+                    if natural.is_empty() {
+                        ui.label("No natural isotopes for this element.");
+                    } else {
+                        ui.label("Natural isotopes in group:");
+                        let parts: Vec<String> = natural
+                            .iter()
+                            .map(|(iso, frac)| format!("{sym}-{} ({:.2}%)", iso.a(), frac * 100.0))
+                            .collect();
+                        ui.label(parts.join(", "));
+
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Density (at/barn):");
+                            ui.add(
+                                egui::DragValue::new(&mut state.periodic_table_density)
+                                    .speed(0.0001)
+                                    .range(1e-6..=1.0)
+                                    .max_decimals(6),
+                            );
+
+                            let fetching = state.is_fetching_endf;
+                            ui.add_enabled_ui(!fetching, |ui| {
+                                let lib = state
+                                    .periodic_table_library
+                                    .get_or_insert(target_library(state));
+                                egui::ComboBox::from_id_salt("pt_lib")
+                                    .selected_text(super::design::library_name(*lib))
+                                    .show_ui(ui, |ui| {
+                                        for (val, label) in [
+                                            (EndfLibrary::EndfB8_0, "ENDF/B-VIII.0"),
+                                            (EndfLibrary::EndfB8_1, "ENDF/B-VIII.1"),
+                                            (EndfLibrary::Jeff3_3, "JEFF-3.3"),
+                                            (EndfLibrary::Jendl5, "JENDL-5"),
+                                        ] {
+                                            ui.selectable_value(lib, val, label);
+                                        }
+                                    });
+                            });
+
+                            let already = state.isotope_groups.iter().any(|g| g.z == z);
+                            if ui
+                                .add_enabled(
+                                    !already,
+                                    egui::Button::new(
+                                        egui::RichText::new(format!("Add {sym} Group"))
+                                            .color(Color32::WHITE),
+                                    )
+                                    .fill(accent),
+                                )
+                                .clicked()
+                            {
+                                add_element_group(state, z);
+                            }
+                            if already {
+                                ui.label(
+                                    egui::RichText::new("(already added)")
+                                        .size(10.0)
+                                        .color(Color32::GRAY),
+                                );
+                            }
+                        });
+                    }
+                } else {
+                    ui.label("Click an element to add it as a natural isotope group.");
+                }
+            } else {
+                // --- Standard isotope selection (all other targets) ---
+                if let Some(z) = state.periodic_table_selected_z {
+                    let name = nereids_core::elements::element_name(z).unwrap_or("Unknown");
+                    let sym = nereids_core::elements::element_symbol(z).unwrap_or("??");
+                    ui.label(
+                        egui::RichText::new(format!("Z={z}  {sym} - {name}"))
+                            .strong()
+                            .size(14.0),
+                    );
+
+                    let natural = nereids_core::elements::natural_isotopes(z);
+                    let known = nereids_core::elements::known_isotopes(z);
+
+                    if natural.is_empty() && known.is_empty() {
+                        ui.label("No ENDF evaluations available.");
+                    } else {
+                        // --- Natural isotopes (with abundance %) ---
+                        if !natural.is_empty() {
+                            ui.label("Natural isotopes:");
+                            ui.horizontal_wrapped(|ui| {
+                                for (iso, frac) in &natural {
+                                    let a = iso.a();
+                                    isotope_chip(ui, state, z, a, sym, Some(*frac), accent);
                                 }
                             });
+                        }
+
+                        // --- Extra ENDF evaluations (no abundance) ---
+                        let natural_a: Vec<u32> = natural.iter().map(|(iso, _)| iso.a()).collect();
+                        let extra: Vec<u32> = known
+                            .iter()
+                            .map(|iso| iso.a())
+                            .filter(|a| !natural_a.contains(a))
+                            .collect();
+
+                        if !extra.is_empty() {
+                            let label = if natural.is_empty() {
+                                "ENDF evaluations:"
+                            } else {
+                                "Additional ENDF evaluations:"
+                            };
+                            ui.label(label);
+                            ui.horizontal_wrapped(|ui| {
+                                for a in &extra {
+                                    isotope_chip(ui, state, z, *a, sym, None, accent);
+                                }
+                            });
+                        }
+                    }
+                } else {
+                    ui.label("Click an element to see its natural isotopes.");
+                }
+
+                // --- Custom isotope entry ---
+                ui.add_space(4.0);
+                egui::CollapsingHeader::new("Custom Isotope (manual Z/A)")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Z:");
+                            ui.add(
+                                egui::DragValue::new(&mut state.periodic_table_custom_z)
+                                    .range(1..=118_u32),
+                            );
+                            ui.label("A:");
+                            ui.add(
+                                egui::DragValue::new(&mut state.periodic_table_custom_a)
+                                    .range(1..=999_u32),
+                            );
+                        });
+                        if state.periodic_table_custom_z > state.periodic_table_custom_a {
+                            state.periodic_table_custom_a = state.periodic_table_custom_z;
+                        }
+                        let cz = state.periodic_table_custom_z;
+                        let ca = state.periodic_table_custom_a;
+                        let csym = nereids_core::elements::element_symbol(cz).unwrap_or("??");
+                        let has_eval = nereids_core::elements::has_endf_evaluation(cz, ca);
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(format!("{csym}-{ca}")).strong());
+                            if has_eval {
+                                ui.label(
+                                    egui::RichText::new("ENDF/B-VIII.0 eval available")
+                                        .color(Color32::from_rgb(34, 139, 34)),
+                                );
+                            } else {
+                                ui.label(
+                                    egui::RichText::new("No ENDF/B-VIII.0 eval")
+                                        .color(Color32::from_rgb(200, 130, 0)),
+                                );
+                            }
+                        });
+                        let already = state.periodic_table_selected_isotopes.contains(&(cz, ca));
+                        if ui
+                            .add_enabled(!already, egui::Button::new(format!("Add {csym}-{ca}")))
+                            .clicked()
+                        {
+                            state.periodic_table_selected_isotopes.push((cz, ca));
+                        }
                     });
 
-                    let n_sel = state.periodic_table_selected_isotopes.len();
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new(format!("Add Selected ({n_sel})"))
-                                    .color(Color32::WHITE),
+                // --- Density + library + Add Selected ---
+                if !state.periodic_table_selected_isotopes.is_empty() {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        let is_ppm =
+                            state.periodic_table_target == PeriodicTableTarget::DetectTrace;
+                        let label = if is_ppm {
+                            "Conc. (ppm):"
+                        } else {
+                            "Density (at/barn):"
+                        };
+                        ui.label(label);
+                        ui.add(
+                            egui::DragValue::new(&mut state.periodic_table_density)
+                                .speed(if is_ppm { 10.0 } else { 0.0001 })
+                                .range(if is_ppm { 0.1..=1e6 } else { 1e-6..=1.0 })
+                                .max_decimals(if is_ppm { 1 } else { 6 }),
+                        );
+
+                        // Disable library changes while a fetch is in progress
+                        // to prevent stale results from overwriting new entries.
+                        let fetching = match state.periodic_table_target {
+                            PeriodicTableTarget::Configure
+                            | PeriodicTableTarget::ConfigureGroup => state.is_fetching_endf,
+                            PeriodicTableTarget::ForwardModel => state.is_fetching_fm_endf,
+                            PeriodicTableTarget::DetectMatrix
+                            | PeriodicTableTarget::DetectTrace => state.is_fetching_detect_endf,
+                        };
+                        ui.add_enabled_ui(!fetching, |ui| {
+                            let lib = state
+                                .periodic_table_library
+                                .get_or_insert(target_library(state));
+                            egui::ComboBox::from_id_salt("pt_lib")
+                                .selected_text(super::design::library_name(*lib))
+                                .show_ui(ui, |ui| {
+                                    for (val, label) in [
+                                        (EndfLibrary::EndfB8_0, "ENDF/B-VIII.0"),
+                                        (EndfLibrary::EndfB8_1, "ENDF/B-VIII.1"),
+                                        (EndfLibrary::Jeff3_3, "JEFF-3.3"),
+                                        (EndfLibrary::Jendl5, "JENDL-5"),
+                                    ] {
+                                        ui.selectable_value(lib, val, label);
+                                    }
+                                });
+                        });
+
+                        let n_sel = state.periodic_table_selected_isotopes.len();
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(format!("Add Selected ({n_sel})"))
+                                        .color(Color32::WHITE),
+                                )
+                                .fill(accent),
                             )
-                            .fill(accent),
-                        )
-                        .clicked()
-                    {
-                        add_selected_isotopes(state);
-                    }
-                });
+                            .clicked()
+                        {
+                            add_selected_isotopes(state);
+                        }
+                    });
+                }
             }
 
             ui.add_space(8.0);
@@ -497,7 +580,9 @@ fn add_selected_isotopes(state: &mut AppState) {
     // must be re-fetched (same pattern as the main library ComboBox).
     if let Some(lib) = state.periodic_table_library {
         let target_lib = match state.periodic_table_target {
-            PeriodicTableTarget::Configure => &mut state.endf_library,
+            PeriodicTableTarget::Configure | PeriodicTableTarget::ConfigureGroup => {
+                &mut state.endf_library
+            }
             PeriodicTableTarget::ForwardModel => &mut state.fm_endf_library,
             PeriodicTableTarget::DetectMatrix | PeriodicTableTarget::DetectTrace => {
                 &mut state.detect_endf_library
@@ -507,10 +592,16 @@ fn add_selected_isotopes(state: &mut AppState) {
             *target_lib = lib;
             // Clear existing resonance data so they get re-fetched with the new library
             match state.periodic_table_target {
-                PeriodicTableTarget::Configure => {
+                PeriodicTableTarget::Configure | PeriodicTableTarget::ConfigureGroup => {
                     for e in &mut state.isotope_entries {
                         e.resonance_data = None;
                         e.endf_status = EndfStatus::Pending;
+                    }
+                    for g in &mut state.isotope_groups {
+                        for m in &mut g.members {
+                            m.resonance_data = None;
+                            m.endf_status = EndfStatus::Pending;
+                        }
                     }
                 }
                 PeriodicTableTarget::ForwardModel => {
@@ -560,6 +651,8 @@ fn add_selected_isotopes(state: &mut AppState) {
                 state.spatial_result = None;
                 state.pixel_fit_result = None;
             }
+            // ConfigureGroup uses add_element_group(), not add_selected_isotopes()
+            PeriodicTableTarget::ConfigureGroup => continue,
             PeriodicTableTarget::ForwardModel => {
                 if state
                     .fm_isotope_entries
@@ -624,7 +717,9 @@ fn add_selected_isotopes(state: &mut AppState) {
     // Provide user feedback about what was added.
     let skipped = selected.len() - added;
     let is_fetching = match state.periodic_table_target {
-        PeriodicTableTarget::Configure => state.is_fetching_endf,
+        PeriodicTableTarget::Configure | PeriodicTableTarget::ConfigureGroup => {
+            state.is_fetching_endf
+        }
         PeriodicTableTarget::ForwardModel => state.is_fetching_fm_endf,
         PeriodicTableTarget::DetectMatrix | PeriodicTableTarget::DetectTrace => {
             state.is_fetching_detect_endf
@@ -654,12 +749,72 @@ fn add_selected_isotopes(state: &mut AppState) {
 /// Get the current ENDF library for the target context (default for library selector).
 fn target_library(state: &AppState) -> EndfLibrary {
     match state.periodic_table_target {
-        PeriodicTableTarget::Configure => state.endf_library,
+        PeriodicTableTarget::Configure | PeriodicTableTarget::ConfigureGroup => state.endf_library,
         PeriodicTableTarget::ForwardModel => state.fm_endf_library,
         PeriodicTableTarget::DetectMatrix | PeriodicTableTarget::DetectTrace => {
             state.detect_endf_library
         }
     }
+}
+
+/// Add an element as a natural-isotope group (e.g., all natural W isotopes
+/// sharing one density parameter).
+///
+/// Creates an `IsotopeGroupEntry` with members set to `Pending` so the
+/// auto-fetch loop in `configure_step` will pick them up.
+fn add_element_group(state: &mut AppState, z: u32) {
+    let natural = nereids_core::elements::natural_isotopes(z);
+    if natural.is_empty() {
+        return;
+    }
+    // Duplicate check
+    if state.isotope_groups.iter().any(|g| g.z == z) {
+        state.status_message = "Element group already added".into();
+        close_modal(state);
+        return;
+    }
+
+    // Propagate library choice
+    if let Some(lib) = state.periodic_table_library
+        && state.endf_library != lib
+    {
+        state.endf_library = lib;
+        for e in &mut state.isotope_entries {
+            e.resonance_data = None;
+            e.endf_status = EndfStatus::Pending;
+        }
+        for g in &mut state.isotope_groups {
+            for m in &mut g.members {
+                m.resonance_data = None;
+                m.endf_status = EndfStatus::Pending;
+            }
+        }
+    }
+
+    let sym = nereids_core::elements::element_symbol(z).unwrap_or("??");
+    let members: Vec<GroupMemberState> = natural
+        .iter()
+        .map(|(iso, ratio)| GroupMemberState {
+            a: iso.a(),
+            symbol: format!("{sym}-{}", iso.a()),
+            ratio: *ratio,
+            resonance_data: None,
+            endf_status: EndfStatus::Pending,
+        })
+        .collect();
+    let n = members.len();
+
+    state.isotope_groups.push(IsotopeGroupEntry {
+        z,
+        name: format!("{sym} (nat)"),
+        members,
+        initial_density: state.periodic_table_density,
+        enabled: true,
+    });
+    state.spatial_result = None;
+    state.pixel_fit_result = None;
+    state.status_message = format!("Added {sym} group ({n} isotopes)");
+    close_modal(state);
 }
 
 /// Toggleable isotope chip. Shows abundance % for natural isotopes,

@@ -5,7 +5,9 @@
 //! this redesign shows both side-by-side so the user can click a pixel on the
 //! map and immediately see its spectrum.
 
-use crate::state::{AppState, GuidedStep, InputMode, IsotopeEntry, SolverMethod, SpectrumAxis};
+use crate::state::{
+    AppState, EndfStatus, GuidedStep, InputMode, IsotopeEntry, SolverMethod, SpectrumAxis,
+};
 use crate::widgets::design::{self, NavAction};
 use crate::widgets::image_view::{
     RoiEditorResult, show_image_with_roi_editor, show_viridis_image, show_viridis_image_with_roi,
@@ -204,12 +206,17 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
     // Run buttons
     ui.label(egui::RichText::new("Run").strong());
 
+    let has_enabled_iso = state
+        .isotope_entries
+        .iter()
+        .any(|e| e.enabled && e.resonance_data.is_some());
+    let has_enabled_grp = state
+        .isotope_groups
+        .iter()
+        .any(|g| g.enabled && g.overall_status() == EndfStatus::Loaded);
     let ready = state.normalized.is_some()
         && state.energies.is_some()
-        && state
-            .isotope_entries
-            .iter()
-            .any(|e| e.enabled && e.resonance_data.is_some());
+        && (has_enabled_iso || has_enabled_grp);
 
     let can_run = ready && !state.is_fitting;
 
@@ -741,16 +748,16 @@ fn build_fit_config(state: &AppState) -> Result<UnifiedFitConfig, String> {
         .filter(|e| e.enabled && e.resonance_data.is_some())
         .collect();
 
-    if enabled.is_empty() {
+    // Collect enabled groups with all members loaded
+    let enabled_groups: Vec<_> = state
+        .isotope_groups
+        .iter()
+        .filter(|g| g.enabled && g.overall_status() == EndfStatus::Loaded)
+        .collect();
+
+    if enabled.is_empty() && enabled_groups.is_empty() {
         return Err("No enabled isotopes with resonance data".into());
     }
-
-    let resonance_data: Vec<_> = enabled
-        .iter()
-        .filter_map(|e| e.resonance_data.clone())
-        .collect();
-    let isotope_names: Vec<_> = enabled.iter().map(|e| e.symbol.clone()).collect();
-    let initial_densities: Vec<_> = enabled.iter().map(|e| e.initial_density).collect();
 
     let resolution = design::build_resolution_function(
         state.resolution_enabled,
@@ -759,15 +766,84 @@ fn build_fit_config(state: &AppState) -> Result<UnifiedFitConfig, String> {
     )
     .map_err(|e| format!("{e} \u{2014} load a resolution file or disable broadening"))?;
 
-    let mut config = UnifiedFitConfig::new(
-        energies,
-        resonance_data,
-        isotope_names,
-        state.temperature_k,
-        resolution,
-        initial_densities,
-    )
-    .map_err(|e| format!("Config validation error: {e}"))?;
+    // When groups are present, use with_groups() to build the config.
+    // Individual isotopes are wrapped as single-member groups for uniformity.
+    let mut config = if !enabled_groups.is_empty() {
+        use nereids_core::types::{Isotope, IsotopeGroup};
+        use nereids_endf::resonance::ResonanceData;
+
+        let mut group_specs: Vec<(IsotopeGroup, Vec<ResonanceData>)> = Vec::new();
+        let mut group_densities: Vec<f64> = Vec::new();
+
+        // Wrap individual isotopes as single-member groups
+        for iso in &enabled {
+            let isotope = Isotope::new(iso.z, iso.a)
+                .map_err(|e| format!("Invalid isotope {}: {e}", iso.symbol))?;
+            let group = IsotopeGroup::custom(iso.symbol.clone(), vec![(isotope, 1.0)])
+                .map_err(|e| format!("Group wrap error for {}: {e}", iso.symbol))?;
+            group_specs.push((group, vec![iso.resonance_data.clone().unwrap()]));
+            group_densities.push(iso.initial_density);
+        }
+
+        // Add actual groups
+        for g in &enabled_groups {
+            let members: Vec<(Isotope, f64)> = g
+                .members
+                .iter()
+                .map(|m| Isotope::new(g.z, m.a).map(|iso| (iso, m.ratio)))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Group {} isotope error: {e}", g.name))?;
+            let group = IsotopeGroup::custom(g.name.clone(), members)
+                .map_err(|e| format!("Group config error for {}: {e}", g.name))?;
+            let rd: Vec<ResonanceData> = g
+                .members
+                .iter()
+                .filter_map(|m| m.resonance_data.clone())
+                .collect();
+            group_specs.push((group, rd));
+            group_densities.push(g.initial_density);
+        }
+
+        let refs: Vec<(&IsotopeGroup, &[ResonanceData])> = group_specs
+            .iter()
+            .map(|(g, rd)| (g, rd.as_slice()))
+            .collect();
+
+        // Build a dummy config first (with placeholder data), then replace via with_groups
+        let dummy_rd = vec![group_specs[0].1[0].clone()];
+        let dummy_names = vec!["placeholder".to_string()];
+        let dummy_densities = vec![0.001];
+        let base = UnifiedFitConfig::new(
+            energies,
+            dummy_rd,
+            dummy_names,
+            state.temperature_k,
+            resolution,
+            dummy_densities,
+        )
+        .map_err(|e| format!("Config validation error: {e}"))?;
+
+        base.with_groups(&refs, group_densities)
+            .map_err(|e| format!("Group config error: {e}"))?
+    } else {
+        // No groups — use the standard per-isotope path
+        let resonance_data: Vec<_> = enabled
+            .iter()
+            .filter_map(|e| e.resonance_data.clone())
+            .collect();
+        let isotope_names: Vec<_> = enabled.iter().map(|e| e.symbol.clone()).collect();
+        let initial_densities: Vec<_> = enabled.iter().map(|e| e.initial_density).collect();
+
+        UnifiedFitConfig::new(
+            energies,
+            resonance_data,
+            isotope_names,
+            state.temperature_k,
+            resolution,
+            initial_densities,
+        )
+        .map_err(|e| format!("Config validation error: {e}"))?
+    };
 
     config = config.with_compute_covariance(state.lm_config.compute_covariance);
 

@@ -463,6 +463,7 @@ impl Default for TileDisplayState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeriodicTableTarget {
     Configure,
+    ConfigureGroup,
     ForwardModel,
     DetectMatrix,
     DetectTrace,
@@ -619,6 +620,7 @@ pub struct AppState {
 
     // -- Isotope selection --
     pub isotope_entries: Vec<IsotopeEntry>,
+    pub isotope_groups: Vec<IsotopeGroupEntry>,
     pub endf_library: EndfLibrary,
 
     // -- Instrument Resolution --
@@ -857,6 +859,51 @@ impl IsotopeEntry {
     }
 }
 
+/// A group of isotopes sharing one density parameter (e.g., all natural W).
+pub struct IsotopeGroupEntry {
+    pub z: u32,
+    pub name: String,
+    pub members: Vec<GroupMemberState>,
+    pub initial_density: f64,
+    pub enabled: bool,
+}
+
+/// State for a single member of an isotope group.
+pub struct GroupMemberState {
+    pub a: u32,
+    pub symbol: String,
+    pub ratio: f64,
+    pub resonance_data: Option<ResonanceData>,
+    pub endf_status: EndfStatus,
+}
+
+impl IsotopeGroupEntry {
+    /// Derived ENDF status: Loaded if all members Loaded, Failed if any Failed, etc.
+    pub fn overall_status(&self) -> EndfStatus {
+        if self
+            .members
+            .iter()
+            .all(|m| m.endf_status == EndfStatus::Loaded)
+        {
+            EndfStatus::Loaded
+        } else if self
+            .members
+            .iter()
+            .any(|m| m.endf_status == EndfStatus::Failed)
+        {
+            EndfStatus::Failed
+        } else if self
+            .members
+            .iter()
+            .any(|m| m.endf_status == EndfStatus::Fetching)
+        {
+            EndfStatus::Fetching
+        } else {
+            EndfStatus::Pending
+        }
+    }
+}
+
 /// ROI rectangle in pixel coordinates.
 #[derive(Debug, Clone, Copy)]
 pub struct RoiSelection {
@@ -1060,6 +1107,13 @@ impl AppState {
                 e.endf_status = EndfStatus::Pending;
             }
         }
+        for g in &mut self.isotope_groups {
+            for m in &mut g.members {
+                if m.endf_status == EndfStatus::Fetching {
+                    m.endf_status = EndfStatus::Pending;
+                }
+            }
+        }
         for e in &mut self.fm_isotope_entries {
             if e.endf_status == EndfStatus::Fetching {
                 e.endf_status = EndfStatus::Pending;
@@ -1250,6 +1304,7 @@ impl Default for AppState {
             energies: None,
 
             isotope_entries: Vec::new(),
+            isotope_groups: Vec::new(),
             endf_library: EndfLibrary::EndfB8_0,
 
             resolution_enabled: false,

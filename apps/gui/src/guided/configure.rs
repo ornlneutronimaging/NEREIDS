@@ -119,6 +119,12 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
                 e.resonance_data = None;
                 e.endf_status = EndfStatus::Pending;
             }
+            for g in &mut state.isotope_groups {
+                for m in &mut g.members {
+                    m.resonance_data = None;
+                    m.endf_status = EndfStatus::Pending;
+                }
+            }
             state.spatial_result = None;
             state.pixel_fit_result = None;
         }
@@ -136,19 +142,33 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
 
         // Add buttons (disabled during fetch)
         ui.add_enabled_ui(!state.is_fetching_endf, |ui| {
-            if ui.button("Add Isotope...").clicked() {
-                state.periodic_table_open = true;
-                state.periodic_table_target = PeriodicTableTarget::Configure;
-                state.periodic_table_selected_z = None;
-                state.periodic_table_density = 0.001; // at/barn default
-            }
+            ui.horizontal(|ui| {
+                if ui.button("Add Isotope...").clicked() {
+                    state.periodic_table_open = true;
+                    state.periodic_table_target = PeriodicTableTarget::Configure;
+                    state.periodic_table_selected_z = None;
+                    state.periodic_table_density = 0.001; // at/barn default
+                }
+                if ui.button("Add Element...").clicked() {
+                    state.periodic_table_open = true;
+                    state.periodic_table_target = PeriodicTableTarget::ConfigureGroup;
+                    state.periodic_table_selected_z = None;
+                    state.periodic_table_density = 0.001; // at/barn default
+                }
+            });
         });
 
         // Auto-fetch ENDF data when isotopes are pending
         let has_pending = state
             .isotope_entries
             .iter()
-            .any(|e| e.enabled && e.endf_status == EndfStatus::Pending);
+            .any(|e| e.enabled && e.endf_status == EndfStatus::Pending)
+            || state.isotope_groups.iter().any(|g| {
+                g.enabled
+                    && g.members
+                        .iter()
+                        .any(|m| m.endf_status == EndfStatus::Pending)
+            });
         if has_pending && !state.is_fetching_endf {
             fetch_endf_data(state);
         }
@@ -162,11 +182,24 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
         let has_failed = state
             .isotope_entries
             .iter()
-            .any(|e| e.enabled && e.endf_status == EndfStatus::Failed);
+            .any(|e| e.enabled && e.endf_status == EndfStatus::Failed)
+            || state.isotope_groups.iter().any(|g| {
+                g.enabled
+                    && g.members
+                        .iter()
+                        .any(|m| m.endf_status == EndfStatus::Failed)
+            });
         if has_failed && !state.is_fetching_endf && ui.button("Retry failed").clicked() {
             for e in &mut state.isotope_entries {
                 if e.endf_status == EndfStatus::Failed {
                     e.endf_status = EndfStatus::Pending;
+                }
+            }
+            for g in &mut state.isotope_groups {
+                for m in &mut g.members {
+                    if m.endf_status == EndfStatus::Failed {
+                        m.endf_status = EndfStatus::Pending;
+                    }
                 }
             }
         }
@@ -176,19 +209,33 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
     density_edit_window(ui, state);
 
     // --- Navigation buttons ---
-    let has_enabled = state.isotope_entries.iter().any(|e| e.enabled);
-    let all_loaded = state
+    let has_enabled_iso = state.isotope_entries.iter().any(|e| e.enabled);
+    let has_enabled_grp = state.isotope_groups.iter().any(|g| g.enabled);
+    let has_enabled = has_enabled_iso || has_enabled_grp;
+    let all_iso_loaded = state
         .isotope_entries
         .iter()
         .filter(|e| e.enabled)
         .all(|e| e.endf_status == EndfStatus::Loaded);
+    let all_grp_loaded = state
+        .isotope_groups
+        .iter()
+        .filter(|g| g.enabled)
+        .all(|g| g.overall_status() == EndfStatus::Loaded);
+    let all_loaded = all_iso_loaded && all_grp_loaded;
     let can_continue = has_enabled && all_loaded;
     let has_any_failed = state
         .isotope_entries
         .iter()
-        .any(|e| e.enabled && e.endf_status == EndfStatus::Failed);
+        .any(|e| e.enabled && e.endf_status == EndfStatus::Failed)
+        || state.isotope_groups.iter().any(|g| {
+            g.enabled
+                && g.members
+                    .iter()
+                    .any(|m| m.endf_status == EndfStatus::Failed)
+        });
     let nav_hint = if !has_enabled {
-        "Add an isotope to continue"
+        "Add an isotope or element group to continue"
     } else if has_any_failed {
         "Some isotopes failed \u{2014} remove or retry"
     } else {
@@ -217,6 +264,7 @@ struct ChipFlowResult {
 
 fn isotope_chips_flow(ui: &mut egui::Ui, state: &mut AppState) -> ChipFlowResult {
     let mut to_remove = None;
+    let mut group_to_remove = None;
     let mut changed = false;
     let locked = state.is_fetching_endf;
 
@@ -231,10 +279,16 @@ fn isotope_chips_flow(ui: &mut egui::Ui, state: &mut AppState) -> ChipFlowResult
     if locked {
         ui.disable();
     }
+
+    let n_individual = state.isotope_entries.len();
+    let n_groups = state.isotope_groups.len();
+    let total = n_individual + n_groups;
+
     egui::Grid::new("isotope_chip_grid")
         .num_columns(n_cols)
         .spacing([6.0, 6.0])
         .show(ui, |ui| {
+            // Individual isotope chips
             for (idx, entry) in state.isotope_entries.iter_mut().enumerate() {
                 if idx > 0 && idx % n_cols == 0 {
                     ui.end_row();
@@ -258,20 +312,48 @@ fn isotope_chips_flow(ui: &mut egui::Ui, state: &mut AppState) -> ChipFlowResult
                     ChipAction::None => {}
                 }
             }
+
+            // Group chips (continue same grid)
+            for (gidx, group) in state.isotope_groups.iter_mut().enumerate() {
+                let flat_idx = n_individual + gidx;
+                if flat_idx > 0 && flat_idx.is_multiple_of(n_cols) {
+                    ui.end_row();
+                }
+                let action = design::group_chip(
+                    ui,
+                    &group.name,
+                    group.members.len(),
+                    group.initial_density,
+                    group.overall_status(),
+                    group.enabled,
+                    egui::Id::new(("grp_chip", gidx)),
+                );
+                match action {
+                    ChipAction::Remove => {
+                        group_to_remove = Some(gidx);
+                    }
+                    ChipAction::ToggleEnabled => {
+                        group.enabled = !group.enabled;
+                        changed = true;
+                    }
+                    ChipAction::None => {}
+                }
+            }
         });
 
     if let Some(idx) = to_remove {
         state.isotope_entries.remove(idx);
         changed = true;
     }
+    if let Some(idx) = group_to_remove {
+        state.isotope_groups.remove(idx);
+        changed = true;
+    }
 
     // Click density in a chip to open the editor
     // (Handled via right-click or double-click on the chip in the future;
     //  for now, provide a simple "Edit densities" button if entries exist.)
-    if !state.isotope_entries.is_empty()
-        && !locked
-        && ui.small_button("Edit densities...").clicked()
-    {
+    if (total > 0) && !locked && ui.small_button("Edit densities...").clicked() {
         state.editing_isotope_density = Some(0);
     }
 
@@ -300,12 +382,28 @@ fn density_edit_window(ui: &mut egui::Ui, state: &mut AppState) {
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ui.ctx(), |ui| {
+            // Individual isotope densities
             for entry in state.isotope_entries.iter_mut() {
                 ui.horizontal(|ui| {
                     ui.label(&entry.symbol);
                     ui.add(
                         egui::DragValue::new(&mut entry.initial_density)
-                            .prefix("ρ₀=")
+                            .prefix("\u{03c1}\u{2080}=")
+                            .speed(0.0001)
+                            .range(0.0..=1.0),
+                    );
+                });
+            }
+            // Group densities
+            if !state.isotope_groups.is_empty() && !state.isotope_entries.is_empty() {
+                ui.separator();
+            }
+            for group in state.isotope_groups.iter_mut() {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(&group.name).strong());
+                    ui.add(
+                        egui::DragValue::new(&mut group.initial_density)
+                            .prefix("\u{03c1}\u{2080}=")
                             .speed(0.0001)
                             .range(0.0..=1.0),
                     );
@@ -360,6 +458,46 @@ fn fetch_endf_data(state: &mut AppState) {
         state.isotope_entries[i].endf_status = EndfStatus::Failed;
     }
 
+    // Also queue group members with Pending status
+    let mut failed_group_members: Vec<(usize, usize)> = Vec::new();
+    for (gi, group) in state.isotope_groups.iter().enumerate() {
+        if !group.enabled {
+            continue;
+        }
+        for (mi, member) in group.members.iter().enumerate() {
+            if member.endf_status != EndfStatus::Pending {
+                continue;
+            }
+            let isotope = match Isotope::new(group.z, member.a) {
+                Ok(iso) => iso,
+                Err(e) => {
+                    state.status_message = format!("Invalid isotope {}: {}", member.symbol, e);
+                    failed_group_members.push((gi, mi));
+                    continue;
+                }
+            };
+            if retrieval::mat_number(&isotope).is_none() {
+                state.status_message = format!(
+                    "No MAT number for {} \u{2014} isotope not in database",
+                    member.symbol
+                );
+                failed_group_members.push((gi, mi));
+                continue;
+            }
+            work.push(design::EndfWorkItem {
+                z: group.z,
+                a: member.a,
+                target: FetchTarget::Configure,
+                isotope,
+                symbol: member.symbol.clone(),
+                library: state.endf_library,
+            });
+        }
+    }
+    for (gi, mi) in failed_group_members {
+        state.isotope_groups[gi].members[mi].endf_status = EndfStatus::Failed;
+    }
+
     if work.is_empty() {
         return;
     }
@@ -369,6 +507,15 @@ fn fetch_endf_data(state: &mut AppState) {
         for entry in state.isotope_entries.iter_mut() {
             if entry.z == item.z && entry.a == item.a {
                 entry.endf_status = EndfStatus::Fetching;
+            }
+        }
+        for group in state.isotope_groups.iter_mut() {
+            if group.z == item.z {
+                for member in &mut group.members {
+                    if member.a == item.a {
+                        member.endf_status = EndfStatus::Fetching;
+                    }
+                }
             }
         }
     }
