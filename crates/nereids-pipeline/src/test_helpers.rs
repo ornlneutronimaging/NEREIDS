@@ -14,6 +14,43 @@ use nereids_endf::resonance::{
 ///
 /// Used across pipeline, spatial, and sparse tests to avoid triplicating the
 /// same 30-line constructor.
+/// Build a synthetic single-resonance ResonanceData for any isotope.
+pub fn synthetic_single_resonance(z: u32, a: u32, awr: f64, energy: f64) -> ResonanceData {
+    ResonanceData {
+        isotope: Isotope::new(z, a).unwrap(),
+        za: z * 1000 + a,
+        awr,
+        ranges: vec![ResonanceRange {
+            energy_low: 1e-5,
+            energy_high: 1e4,
+            resolved: true,
+            formalism: ResonanceFormalism::ReichMoore,
+            target_spin: 0.0,
+            scattering_radius: 5.0,
+            naps: 1,
+            l_groups: vec![LGroup {
+                l: 0,
+                awr,
+                apl: 0.0,
+                qx: 0.0,
+                lrx: 0,
+                resonances: vec![Resonance {
+                    energy,
+                    j: 0.5,
+                    gn: 1e-3,
+                    gg: 1e-2,
+                    gfa: 0.0,
+                    gfb: 0.0,
+                }],
+            }],
+            rml: None,
+            urr: None,
+            ap_table: None,
+            r_external: vec![],
+        }],
+    }
+}
+
 pub fn u238_single_resonance() -> ResonanceData {
     ResonanceData {
         isotope: Isotope::new(92, 238).unwrap(),

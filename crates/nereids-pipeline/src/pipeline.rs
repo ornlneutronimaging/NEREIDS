@@ -1155,6 +1155,7 @@ pub struct SpectrumFitResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::synthetic_single_resonance;
     use nereids_fitting::lm::FitModel;
     use nereids_physics::transmission as phys_transmission;
 
@@ -1603,44 +1604,6 @@ mod tests {
         );
     }
 
-    /// Build a synthetic single-resonance ResonanceData for testing.
-    fn synthetic_rd(z: u32, a: u32, awr: f64, energy: f64) -> ResonanceData {
-        use nereids_endf::resonance::*;
-        ResonanceData {
-            isotope: nereids_core::types::Isotope::new(z, a).unwrap(),
-            za: z * 1000 + a,
-            awr,
-            ranges: vec![ResonanceRange {
-                energy_low: 1e-5,
-                energy_high: 1e4,
-                resolved: true,
-                formalism: ResonanceFormalism::ReichMoore,
-                target_spin: 0.0,
-                scattering_radius: 5.0,
-                naps: 1,
-                l_groups: vec![LGroup {
-                    l: 0,
-                    awr,
-                    apl: 0.0,
-                    qx: 0.0,
-                    lrx: 0,
-                    resonances: vec![Resonance {
-                        energy,
-                        j: 0.5,
-                        gn: 1e-3,
-                        gg: 1e-2,
-                        gfa: 0.0,
-                        gfb: 0.0,
-                    }],
-                }],
-                rml: None,
-                urr: None,
-                ap_table: None,
-                r_external: vec![],
-            }],
-        }
-    }
-
     /// Round-trip test: create a group of 2 isotopes with known ratios,
     /// generate synthetic transmission, fit with group constraints,
     /// verify the fitted group density matches the true value.
@@ -1649,8 +1612,8 @@ mod tests {
         use nereids_core::types::IsotopeGroup;
 
         // Two synthetic isotopes with resonances at different energies
-        let rd1 = synthetic_rd(92, 235, 233.025, 5.0);
-        let rd2 = synthetic_rd(92, 238, 236.006, 7.0);
+        let rd1 = synthetic_single_resonance(92, 235, 233.025, 5.0);
+        let rd2 = synthetic_single_resonance(92, 238, 236.006, 7.0);
 
         // Group with 60/40 ratio
         let iso1 = nereids_core::types::Isotope::new(92, 235).unwrap();
