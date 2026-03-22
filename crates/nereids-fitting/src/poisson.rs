@@ -41,6 +41,8 @@ pub struct PoissonConfig {
     pub backtrack: f64,
     /// Relative diagonal damping for analytical Gauss-Newton / Fisher steps.
     pub gauss_newton_lambda: f64,
+    /// History size for the finite-difference L-BFGS fallback.
+    pub lbfgs_history: usize,
 }
 
 impl Default for PoissonConfig {
@@ -53,6 +55,7 @@ impl Default for PoissonConfig {
             armijo_c: 1e-4,
             backtrack: 0.5,
             gauss_newton_lambda: 1e-3,
+            lbfgs_history: 8,
         }
     }
 }
@@ -328,6 +331,18 @@ fn inactive_free_positions(
         .collect()
 }
 
+fn inactive_free_mask(
+    params: &ParameterSet,
+    free_param_indices: &[usize],
+    grad: &[f64],
+) -> Vec<bool> {
+    free_param_indices
+        .iter()
+        .zip(grad.iter())
+        .map(|(&idx, &g)| !is_bound_active(&params.params[idx], g))
+        .collect()
+}
+
 fn projected_gradient_norm(
     params: &ParameterSet,
     free_param_indices: &[usize],
@@ -356,6 +371,149 @@ fn extract_submatrix(matrix: &FlatMatrix, positions: &[usize]) -> FlatMatrix {
         }
     }
     sub
+}
+
+#[derive(Debug, Clone)]
+struct LbfgsHistory {
+    s_list: Vec<Vec<f64>>,
+    y_list: Vec<Vec<f64>>,
+    max_pairs: usize,
+}
+
+impl LbfgsHistory {
+    fn new(max_pairs: usize) -> Self {
+        Self {
+            s_list: Vec::with_capacity(max_pairs),
+            y_list: Vec::with_capacity(max_pairs),
+            max_pairs,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.s_list.clear();
+        self.y_list.clear();
+    }
+
+    fn update(&mut self, old_free: &[f64], new_free: &[f64], old_grad: &[f64], new_grad: &[f64]) {
+        if self.max_pairs == 0 {
+            return;
+        }
+        let s: Vec<f64> = new_free
+            .iter()
+            .zip(old_free.iter())
+            .map(|(&new, &old)| new - old)
+            .collect();
+        let y: Vec<f64> = new_grad
+            .iter()
+            .zip(old_grad.iter())
+            .map(|(&new, &old)| new - old)
+            .collect();
+        let sy = dot(&s, &y);
+        let s_norm = dot(&s, &s).sqrt();
+        let y_norm = dot(&y, &y).sqrt();
+        if sy <= 1e-12 * s_norm * y_norm.max(1.0) {
+            return;
+        }
+        if self.s_list.len() == self.max_pairs {
+            self.s_list.remove(0);
+            self.y_list.remove(0);
+        }
+        self.s_list.push(s);
+        self.y_list.push(y);
+    }
+
+    fn apply_on_positions(&self, grad: &[f64], positions: &[usize]) -> Option<Vec<f64>> {
+        if self.s_list.is_empty() || positions.is_empty() {
+            return None;
+        }
+
+        let mut q: Vec<f64> = positions.iter().map(|&pos| grad[pos]).collect();
+        let mut alpha = vec![0.0; self.s_list.len()];
+        let mut rho = vec![0.0; self.s_list.len()];
+        let mut used = vec![false; self.s_list.len()];
+
+        for i in (0..self.s_list.len()).rev() {
+            let s_sub = extract_positions(&self.s_list[i], positions);
+            let y_sub = extract_positions(&self.y_list[i], positions);
+            let sy = dot(&s_sub, &y_sub);
+            if sy <= 1e-12 {
+                continue;
+            }
+            rho[i] = 1.0 / sy;
+            used[i] = true;
+            alpha[i] = rho[i] * dot(&s_sub, &q);
+            axpy(&mut q, -alpha[i], &y_sub);
+        }
+
+        let gamma = used
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, &is_used)| {
+                if !is_used {
+                    return None;
+                }
+                let last_s = extract_positions(&self.s_list[i], positions);
+                let last_y = extract_positions(&self.y_list[i], positions);
+                let yy = dot(&last_y, &last_y);
+                (yy > 0.0).then_some(dot(&last_s, &last_y) / yy)
+            })
+            .unwrap_or(1.0);
+
+        let mut r: Vec<f64> = q.into_iter().map(|v| gamma * v).collect();
+        for i in 0..self.s_list.len() {
+            if !used[i] {
+                continue;
+            }
+            let s_sub = extract_positions(&self.s_list[i], positions);
+            let y_sub = extract_positions(&self.y_list[i], positions);
+            let beta = rho[i] * dot(&y_sub, &r);
+            axpy(&mut r, alpha[i] - beta, &s_sub);
+        }
+
+        let mut full = vec![0.0; grad.len()];
+        for (&pos, &value) in positions.iter().zip(r.iter()) {
+            full[pos] = value;
+        }
+        Some(full)
+    }
+}
+
+fn dot(a: &[f64], b: &[f64]) -> f64 {
+    a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum()
+}
+
+fn axpy(dst: &mut [f64], alpha: f64, src: &[f64]) {
+    for (d, &s) in dst.iter_mut().zip(src.iter()) {
+        *d += alpha * s;
+    }
+}
+
+fn extract_positions(values: &[f64], positions: &[usize]) -> Vec<f64> {
+    positions.iter().map(|&pos| values[pos]).collect()
+}
+
+fn parameter_scaled_gradient_direction(
+    params: &ParameterSet,
+    free_param_indices: &[usize],
+    grad: &[f64],
+) -> Vec<f64> {
+    grad.iter()
+        .zip(free_param_indices.iter())
+        .map(|(&g, &idx)| {
+            if is_bound_active(&params.params[idx], g) {
+                return 0.0;
+            }
+            let p = &params.params[idx];
+            let range = p.upper - p.lower;
+            if range.is_finite() && range > 1e-10 {
+                g * range * range
+            } else {
+                let scale = p.value.abs().max(1e-3);
+                g * scale * scale
+            }
+        })
+        .collect()
 }
 
 enum LineSearchResult {
@@ -546,6 +704,8 @@ pub fn poisson_fit(
     let mut old_free_buf: Vec<f64> = Vec::with_capacity(params.n_free());
     let mut trial_free_buf: Vec<f64> = Vec::with_capacity(params.n_free());
     let mut free_idx_buf: Vec<usize> = Vec::with_capacity(params.n_free());
+    let mut fd_history = LbfgsHistory::new(config.lbfgs_history);
+    let mut pending_fd_state: Option<(Vec<f64>, Vec<f64>, Vec<bool>)> = None;
 
     params.all_values_into(&mut all_vals_buf);
     let mut y_model = model.evaluate(&all_vals_buf)?;
@@ -594,6 +754,23 @@ pub fn poisson_fit(
 
         params.free_indices_into(&mut free_idx_buf);
 
+        let using_fd = analytical_step.is_none();
+        if using_fd {
+            params.free_values_into(&mut free_vals_buf);
+            let current_mask = inactive_free_mask(params, &free_idx_buf, &grad);
+            if let Some((prev_free, prev_grad, prev_mask)) = pending_fd_state.take() {
+                if prev_mask == current_mask {
+                    fd_history.update(&prev_free, &free_vals_buf, &prev_grad, &grad);
+                } else {
+                    fd_history.clear();
+                }
+            }
+            pending_fd_state = Some((free_vals_buf.clone(), grad.clone(), current_mask));
+        } else {
+            pending_fd_state.take();
+            fd_history.clear();
+        }
+
         // Use projected-gradient optimality for bound-constrained problems.
         let projected_grad_norm = projected_gradient_norm(params, &free_idx_buf, &grad);
         if projected_grad_norm < config.tol_param {
@@ -632,27 +809,29 @@ pub fn poisson_fit(
                 }
                 (dir, config.step_size)
             } else {
-                // FD path: keep the old range-based scaling as a cheap fallback
-                // when no analytical Jacobian is available.
-                let dir = grad
-                    .iter()
-                    .zip(free_idx_buf.iter())
-                    .map(|(&g, &idx)| {
-                        if is_bound_active(&params.params[idx], g) {
-                            return 0.0;
-                        }
-                        let p = &params.params[idx];
-                        let range = p.upper - p.lower;
-                        if range.is_finite() && range > 1e-10 {
-                            g * range * range
-                        } else {
-                            let scale = p.value.abs().max(1e-3);
-                            g * scale * scale
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                let search_norm: f64 = dir.iter().map(|d| d * d).sum::<f64>().sqrt();
-                (dir, config.step_size / search_norm.max(1.0))
+                // FD path: use limited-memory BFGS when history is available,
+                // falling back to parameter-scaled gradient descent otherwise.
+                let inactive_positions = inactive_free_positions(params, &free_idx_buf, &grad);
+                if inactive_positions.is_empty() {
+                    converged = true;
+                    break;
+                }
+                let used_history = !fd_history.s_list.is_empty();
+                let mut dir = fd_history
+                    .apply_on_positions(&grad, &inactive_positions)
+                    .unwrap_or_else(|| {
+                    parameter_scaled_gradient_direction(params, &free_idx_buf, &grad)
+                });
+                let descent = dot(&grad, &dir);
+                if !descent.is_finite() || descent <= 0.0 {
+                    dir = parameter_scaled_gradient_direction(params, &free_idx_buf, &grad);
+                }
+                if used_history && descent.is_finite() && descent > 0.0 {
+                    (dir, config.step_size)
+                } else {
+                    let search_norm: f64 = dir.iter().map(|d| d * d).sum::<f64>().sqrt();
+                    (dir, config.step_size / search_norm.max(1.0))
+                }
             };
 
         // Backtracking line search with preconditioned search direction.
@@ -679,6 +858,9 @@ pub fn poisson_fit(
                 nll: new_nll,
                 y_model: new_y_model,
             } => {
+                if !using_fd {
+                    pending_fd_state = None;
+                }
                 nll = new_nll;
                 y_model = new_y_model;
             }
@@ -1302,6 +1484,59 @@ mod tests {
     }
 
     #[test]
+    fn test_inactive_mask_changes_when_bound_activity_changes() {
+        let free_idx = vec![0, 1];
+        let params_at_bound = ParameterSet::new(vec![
+            FitParameter::non_negative("density", 0.0),
+            FitParameter::non_negative("temp", 1.0),
+        ]);
+        let params_free = ParameterSet::new(vec![
+            FitParameter::non_negative("density", 0.2),
+            FitParameter::non_negative("temp", 1.0),
+        ]);
+
+        let mask_at_bound = inactive_free_mask(&params_at_bound, &free_idx, &[0.3, -0.2]);
+        let mask_free = inactive_free_mask(&params_free, &free_idx, &[0.3, -0.2]);
+
+        assert_eq!(mask_at_bound, vec![false, true]);
+        assert_eq!(mask_free, vec![true, true]);
+        assert_ne!(
+            mask_at_bound, mask_free,
+            "active-set changes should invalidate FD quasi-Newton history"
+        );
+    }
+
+    #[test]
+    fn test_lbfgs_history_two_loop_matches_secant_direction() {
+        let mut history = LbfgsHistory::new(4);
+        history.update(&[0.0], &[1.0], &[0.0], &[2.0]);
+        let dir = history
+            .apply_on_positions(&[4.0], &[0])
+            .expect("history should produce a direction");
+        assert!(
+            (dir[0] - 2.0).abs() < 1e-12,
+            "1D secant pair should scale gradient by inverse curvature"
+        );
+    }
+
+    #[test]
+    fn test_lbfgs_subspace_ignores_active_components() {
+        let mut history = LbfgsHistory::new(4);
+        history.update(&[0.0, 0.0], &[1.0, 100.0], &[0.0, 0.0], &[2.0, 100.0]);
+        let dir = history
+            .apply_on_positions(&[4.0, 50.0], &[0])
+            .expect("subspace history should produce a direction");
+        assert!(
+            (dir[0] - 2.0).abs() < 1e-12,
+            "inactive-subspace L-BFGS should match 1D secant scaling on the free variable"
+        );
+        assert!(
+            dir[1].abs() < 1e-12,
+            "inactive-subspace L-BFGS should not leak blocked-variable history into the direction"
+        );
+    }
+
+    #[test]
     fn test_poisson_fit_converges_at_bound_active_optimum() {
         struct OffsetModel {
             base: Vec<f64>,
@@ -1343,6 +1578,134 @@ mod tests {
             result.params[0].abs() < 1e-12,
             "offset should stay pinned at lower bound, got {}",
             result.params[0]
+        );
+    }
+
+    #[test]
+    fn test_poisson_fit_fd_lbfgs_handles_coupled_two_parameter_model() {
+        struct CoupledExponentialModel {
+            x: Vec<f64>,
+        }
+
+        impl FitModel for CoupledExponentialModel {
+            fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+                let amp = params[0];
+                let decay = params[1];
+                Ok(self
+                    .x
+                    .iter()
+                    .map(|&x| amp * (-decay * x).exp() + 1.0)
+                    .collect())
+            }
+        }
+
+        let model = CoupledExponentialModel {
+            x: (0..60).map(|i| i as f64 * 0.08).collect(),
+        };
+        let true_params = [120.0, 0.45];
+        let y_obs = model.evaluate(&true_params).unwrap();
+        let mut params = ParameterSet::new(vec![
+            FitParameter::non_negative("amp", 30.0),
+            FitParameter::non_negative("decay", 1.2),
+        ]);
+        let config = PoissonConfig {
+            max_iter: 120,
+            lbfgs_history: 8,
+            ..PoissonConfig::default()
+        };
+        let result = poisson_fit(&model, &y_obs, &mut params, &config).unwrap();
+        let mut baseline_params = ParameterSet::new(vec![
+            FitParameter::non_negative("amp", 30.0),
+            FitParameter::non_negative("decay", 1.2),
+        ]);
+        let baseline = poisson_fit(
+            &model,
+            &y_obs,
+            &mut baseline_params,
+            &PoissonConfig {
+                lbfgs_history: 0,
+                ..config.clone()
+            },
+        )
+        .unwrap();
+
+        assert!(result.converged, "FD L-BFGS fit did not converge: {result:?}");
+        assert!(baseline.converged, "baseline FD fit should still converge: {baseline:?}");
+        assert!(
+            result.iterations <= 60,
+            "expected FD quasi-Newton path to converge well before max_iter; got {}",
+            result.iterations,
+        );
+        assert!(
+            result.iterations < baseline.iterations,
+            "L-BFGS fallback should beat no-history gradient scaling: lbfgs={} baseline={}",
+            result.iterations,
+            baseline.iterations,
+        );
+        assert!(
+            (result.params[0] - true_params[0]).abs() / true_params[0] < 0.02,
+            "amplitude fit={}, true={}",
+            result.params[0],
+            true_params[0],
+        );
+        assert!(
+            (result.params[1] - true_params[1]).abs() / true_params[1] < 0.02,
+            "decay fit={}, true={}",
+            result.params[1],
+            true_params[1],
+        );
+    }
+
+    #[test]
+    fn test_poisson_fit_fd_lbfgs_with_bound_active_offset_uses_subspace() {
+        struct OffsetDecayModel {
+            x: Vec<f64>,
+        }
+
+        impl FitModel for OffsetDecayModel {
+            fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+                let offset = params[0];
+                let decay = params[1];
+                Ok(self
+                    .x
+                    .iter()
+                    .map(|&x| offset + (-decay * x).exp())
+                    .collect())
+            }
+        }
+
+        let model = OffsetDecayModel {
+            x: (0..60).map(|i| i as f64 * 0.08).collect(),
+        };
+        let true_params = [0.0, 0.35];
+        let y_obs = model.evaluate(&true_params).unwrap();
+
+        let config = PoissonConfig {
+            max_iter: 120,
+            lbfgs_history: 8,
+            ..PoissonConfig::default()
+        };
+        let mut params = ParameterSet::new(vec![
+            FitParameter::non_negative("offset", 0.0),
+            FitParameter::non_negative("decay", 1.1),
+        ]);
+        let result = poisson_fit(&model, &y_obs, &mut params, &config).unwrap();
+        assert!(result.converged, "subspace FD L-BFGS fit did not converge: {result:?}");
+        assert!(
+            result.iterations <= 20,
+            "bound-active subspace FD fit should converge comfortably before max_iter; got {}",
+            result.iterations,
+        );
+        assert!(
+            result.params[0].abs() < 1e-8,
+            "offset should remain at the lower bound, got {}",
+            result.params[0]
+        );
+        assert!(
+            (result.params[1] - true_params[1]).abs() / true_params[1] < 0.02,
+            "decay fit={}, true={}",
+            result.params[1],
+            true_params[1],
         );
     }
 
