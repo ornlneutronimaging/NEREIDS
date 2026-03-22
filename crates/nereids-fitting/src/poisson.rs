@@ -282,13 +282,6 @@ fn compute_gradient(
     Ok(grad)
 }
 
-/// Project a point onto the feasible region (parameter bounds).
-fn project(params: &mut ParameterSet) {
-    for p in &mut params.params {
-        p.clamp();
-    }
-}
-
 fn normalized_step_norm(
     old_free: &[f64],
     new_free: &[f64],
@@ -516,11 +509,45 @@ fn parameter_scaled_gradient_direction(
         .collect()
 }
 
+fn max_feasible_step(
+    params: &ParameterSet,
+    free_param_indices: &[usize],
+    old_free: &[f64],
+    search_dir: &[f64],
+) -> f64 {
+    let mut alpha_max = f64::INFINITY;
+    for ((&idx, &x), &d) in free_param_indices
+        .iter()
+        .zip(old_free.iter())
+        .zip(search_dir.iter())
+    {
+        if d.abs() <= PIVOT_FLOOR {
+            continue;
+        }
+        let p = &params.params[idx];
+        let candidate = if d > 0.0 && p.lower.is_finite() {
+            (x - p.lower) / d
+        } else if d < 0.0 && p.upper.is_finite() {
+            (p.upper - x) / (-d)
+        } else {
+            f64::INFINITY
+        };
+        alpha_max = alpha_max.min(candidate);
+    }
+    alpha_max.max(0.0)
+}
+
 enum LineSearchResult {
-    Accepted { nll: f64, y_model: Vec<f64> },
+    Accepted {
+        nll: f64,
+        y_model: Vec<f64>,
+        hit_boundary: bool,
+    },
     Stagnated,
     Failed,
 }
+
+const MAX_FACE_STEPS_PER_ITER: usize = 4;
 
 /// Backtracking line search with Armijo condition.
 ///
@@ -571,18 +598,26 @@ fn backtracking_line_search(
     free_vals_buf: &mut Vec<f64>,
     trial_free_buf: &mut Vec<f64>,
 ) -> LineSearchResult {
-    let mut alpha = initial_alpha;
+    let alpha_max = max_feasible_step(params, free_param_indices, old_free, search_dir);
+    if alpha_max <= PIVOT_FLOOR {
+        params.set_free_values(old_free);
+        return LineSearchResult::Stagnated;
+    }
+    let mut alpha = initial_alpha.min(alpha_max);
     for _ in 0..50 {
-        // Trial step: x_new = project(x - alpha * search_dir)
+        // Trial step along the feasible path: x_new = x - alpha * d, with
+        // alpha capped so inactive-subspace directions hit bounds exactly
+        // instead of relying on projection to distort the step.
         trial_free_buf.clear();
-        trial_free_buf.extend(
-            old_free
-                .iter()
-                .zip(search_dir.iter())
-                .map(|(&v, &d)| v - alpha * d),
-        );
+        for ((&idx, &v), &d) in free_param_indices
+            .iter()
+            .zip(old_free.iter())
+            .zip(search_dir.iter())
+        {
+            let p = &params.params[idx];
+            trial_free_buf.push((v - alpha * d).clamp(p.lower, p.upper));
+        }
         params.set_free_values(trial_free_buf);
-        project(params);
 
         params.all_values_into(all_vals_buf);
         let trial_model = match model.evaluate(all_vals_buf) {
@@ -616,6 +651,8 @@ fn backtracking_line_search(
             return LineSearchResult::Accepted {
                 nll: trial_nll,
                 y_model: trial_model,
+                hit_boundary: alpha_max.is_finite()
+                    && (alpha_max - alpha).abs() <= 1e-12 * alpha_max.max(1.0),
             };
         }
 
@@ -631,6 +668,9 @@ fn backtracking_line_search(
 
         // Backtrack
         alpha *= config.backtrack;
+        if alpha <= PIVOT_FLOOR {
+            break;
+        }
     }
     params.set_free_values(old_free);
     LineSearchResult::Failed
@@ -725,69 +765,69 @@ pub fn poisson_fit(
     let mut converged = false;
     let mut iter = 0;
 
-    for _ in 0..config.max_iter {
+    'outer: for _ in 0..config.max_iter {
         iter += 1;
+        let mut face_steps = 0usize;
 
-        // Compute gradient: try analytical (grad = J^T · w) first,
-        // fall back to finite differences if the model doesn't provide
-        // an analytical Jacobian.
-        let analytical_step = compute_analytical_step_data(
-            model,
-            params,
-            y_obs,
-            &y_model,
-            &mut all_vals_buf,
-            &mut free_idx_buf,
-        );
-        let grad = if let Some(ref analytical) = analytical_step {
-            analytical.grad.clone()
-        } else {
-            compute_gradient(
+        loop {
+            // Compute gradient: try analytical (grad = J^T · w) first,
+            // fall back to finite differences if the model doesn't provide
+            // an analytical Jacobian.
+            let analytical_step = compute_analytical_step_data(
                 model,
                 params,
                 y_obs,
-                config.fd_step,
+                &y_model,
                 &mut all_vals_buf,
                 &mut free_idx_buf,
-            )?
-        };
+            );
+            let grad = if let Some(ref analytical) = analytical_step {
+                analytical.grad.clone()
+            } else {
+                compute_gradient(
+                    model,
+                    params,
+                    y_obs,
+                    config.fd_step,
+                    &mut all_vals_buf,
+                    &mut free_idx_buf,
+                )?
+            };
 
-        params.free_indices_into(&mut free_idx_buf);
+            params.free_indices_into(&mut free_idx_buf);
 
-        let using_fd = analytical_step.is_none();
-        if using_fd {
-            params.free_values_into(&mut free_vals_buf);
-            let current_mask = inactive_free_mask(params, &free_idx_buf, &grad);
-            if let Some((prev_free, prev_grad, prev_mask)) = pending_fd_state.take() {
-                if prev_mask == current_mask {
-                    fd_history.update(&prev_free, &free_vals_buf, &prev_grad, &grad);
-                } else {
-                    fd_history.clear();
+            let using_fd = analytical_step.is_none();
+            if using_fd {
+                params.free_values_into(&mut free_vals_buf);
+                let current_mask = inactive_free_mask(params, &free_idx_buf, &grad);
+                if let Some((prev_free, prev_grad, prev_mask)) = pending_fd_state.take() {
+                    if prev_mask == current_mask {
+                        fd_history.update(&prev_free, &free_vals_buf, &prev_grad, &grad);
+                    } else {
+                        fd_history.clear();
+                    }
                 }
+                pending_fd_state = Some((free_vals_buf.clone(), grad.clone(), current_mask));
+            } else {
+                pending_fd_state.take();
+                fd_history.clear();
             }
-            pending_fd_state = Some((free_vals_buf.clone(), grad.clone(), current_mask));
-        } else {
-            pending_fd_state.take();
-            fd_history.clear();
-        }
 
-        // Use projected-gradient optimality for bound-constrained problems.
-        let projected_grad_norm = projected_gradient_norm(params, &free_idx_buf, &grad);
-        if projected_grad_norm < config.tol_param {
-            converged = true;
-            break;
-        }
+            // Use projected-gradient optimality for bound-constrained problems.
+            let projected_grad_norm = projected_gradient_norm(params, &free_idx_buf, &grad);
+            if projected_grad_norm < config.tol_param {
+                converged = true;
+                break 'outer;
+            }
 
-        let (search_dir, initial_alpha): (Vec<f64>, f64) =
-            if let Some(ref analytical) = analytical_step {
+            let (search_dir, initial_alpha): (Vec<f64>, f64) = if let Some(ref analytical) =
+                analytical_step
+            {
                 let inactive_positions = inactive_free_positions(params, &free_idx_buf, &grad);
                 if inactive_positions.is_empty() {
                     converged = true;
-                    break;
+                    break 'outer;
                 }
-                // Take a damped Gauss-Newton / Fisher step on the analytical
-                // path. If the linear solve degenerates, fall back to the
-                // diagonal scaling instead of dropping to FD.
                 let reduced_fisher = extract_submatrix(&analytical.fisher, &inactive_positions);
                 let reduced_grad: Vec<f64> =
                     inactive_positions.iter().map(|&pos| grad[pos]).collect();
@@ -809,19 +849,17 @@ pub fn poisson_fit(
                 }
                 (dir, config.step_size)
             } else {
-                // FD path: use limited-memory BFGS when history is available,
-                // falling back to parameter-scaled gradient descent otherwise.
                 let inactive_positions = inactive_free_positions(params, &free_idx_buf, &grad);
                 if inactive_positions.is_empty() {
                     converged = true;
-                    break;
+                    break 'outer;
                 }
                 let used_history = !fd_history.s_list.is_empty();
                 let mut dir = fd_history
                     .apply_on_positions(&grad, &inactive_positions)
                     .unwrap_or_else(|| {
-                    parameter_scaled_gradient_direction(params, &free_idx_buf, &grad)
-                });
+                        parameter_scaled_gradient_direction(params, &free_idx_buf, &grad)
+                    });
                 let descent = dot(&grad, &dir);
                 if !descent.is_finite() || descent <= 0.0 {
                     dir = parameter_scaled_gradient_direction(params, &free_idx_buf, &grad);
@@ -834,54 +872,58 @@ pub fn poisson_fit(
                 }
             };
 
-        // Backtracking line search with preconditioned search direction.
-        params.free_values_into(&mut free_vals_buf);
-        old_free_buf.clear();
-        old_free_buf.extend_from_slice(&free_vals_buf);
+            params.free_values_into(&mut free_vals_buf);
+            old_free_buf.clear();
+            old_free_buf.extend_from_slice(&free_vals_buf);
 
-        match backtracking_line_search(
-            model,
-            params,
-            y_obs,
-            &old_free_buf,
-            &free_idx_buf,
-            &search_dir,
-            initial_alpha,
-            config,
-            &grad,
-            nll,
-            &mut all_vals_buf,
-            &mut free_vals_buf,
-            &mut trial_free_buf,
-        ) {
-            LineSearchResult::Accepted {
-                nll: new_nll,
-                y_model: new_y_model,
-            } => {
-                if !using_fd {
-                    pending_fd_state = None;
+            match backtracking_line_search(
+                model,
+                params,
+                y_obs,
+                &old_free_buf,
+                &free_idx_buf,
+                &search_dir,
+                initial_alpha,
+                config,
+                &grad,
+                nll,
+                &mut all_vals_buf,
+                &mut free_vals_buf,
+                &mut trial_free_buf,
+            ) {
+                LineSearchResult::Accepted {
+                    nll: new_nll,
+                    y_model: new_y_model,
+                    hit_boundary,
+                } => {
+                    if !using_fd {
+                        pending_fd_state = None;
+                    }
+                    nll = new_nll;
+                    y_model = new_y_model;
+
+                    if hit_boundary && face_steps < MAX_FACE_STEPS_PER_ITER {
+                        face_steps += 1;
+                        continue;
+                    }
                 }
-                nll = new_nll;
-                y_model = new_y_model;
+                LineSearchResult::Stagnated => {
+                    converged = true;
+                    break 'outer;
+                }
+                LineSearchResult::Failed => {
+                    break 'outer;
+                }
             }
-            LineSearchResult::Stagnated => {
-                converged = true;
-                break;
-            }
-            LineSearchResult::Failed => {
-                // Can't improve from this point; stop without claiming convergence.
-                // (params already restored by backtracking_line_search)
-                break;
-            }
-        }
 
-        // Convergence check: relative step size in parameter space.
-        // Each parameter's step is normalized by its scale so that
-        // temperature (range ~5000) doesn't dominate over density (range ~0.01).
-        params.free_values_into(&mut free_vals_buf);
-        let step_norm = normalized_step_norm(&old_free_buf, &free_vals_buf, params, &free_idx_buf);
-        if step_norm < config.tol_param {
-            converged = true;
+            params.free_values_into(&mut free_vals_buf);
+            let step_norm =
+                normalized_step_norm(&old_free_buf, &free_vals_buf, params, &free_idx_buf);
+            if step_norm < config.tol_param {
+                converged = true;
+                break 'outer;
+            }
+
             break;
         }
     }
@@ -1474,12 +1516,45 @@ mod tests {
         let grad = vec![0.25, -0.5];
 
         let inactive = inactive_free_positions(&params, &free_idx, &grad);
-        assert_eq!(inactive, vec![1], "lower-bound blocked density should be active");
+        assert_eq!(
+            inactive,
+            vec![1],
+            "lower-bound blocked density should be active"
+        );
 
         let pg_norm = projected_gradient_norm(&params, &free_idx, &grad);
         assert!(
             (pg_norm - 0.5).abs() < 1e-12,
             "projected gradient should ignore blocked lower-bound component"
+        );
+    }
+
+    #[test]
+    fn test_max_feasible_step_hits_lower_bound() {
+        let params = ParameterSet::new(vec![
+            FitParameter::non_negative("density", 0.2),
+            FitParameter::unbounded("temp", 300.0),
+        ]);
+        let alpha = max_feasible_step(&params, &[0, 1], &[0.2, 300.0], &[0.5, 0.0]);
+        assert!(
+            (alpha - 0.4).abs() < 1e-12,
+            "feasible step should stop exactly at lower bound"
+        );
+    }
+
+    #[test]
+    fn test_max_feasible_step_hits_upper_bound() {
+        let params = ParameterSet::new(vec![FitParameter {
+            name: "temp".into(),
+            value: 300.0,
+            lower: 1.0,
+            upper: 500.0,
+            fixed: false,
+        }]);
+        let alpha = max_feasible_step(&params, &[0], &[300.0], &[-50.0]);
+        assert!(
+            (alpha - 4.0).abs() < 1e-12,
+            "feasible step should stop exactly at upper bound"
         );
     }
 
@@ -1572,8 +1647,14 @@ mod tests {
 
         let result = poisson_fit(&model, &y_obs, &mut params, &PoissonConfig::default()).unwrap();
 
-        assert!(result.converged, "bound-active optimum should satisfy projected optimality");
-        assert_eq!(result.iterations, 1, "should stop on projected-gradient check");
+        assert!(
+            result.converged,
+            "bound-active optimum should satisfy projected optimality"
+        );
+        assert_eq!(
+            result.iterations, 1,
+            "should stop on projected-gradient check"
+        );
         assert!(
             result.params[0].abs() < 1e-12,
             "offset should stay pinned at lower bound, got {}",
@@ -1629,8 +1710,14 @@ mod tests {
         )
         .unwrap();
 
-        assert!(result.converged, "FD L-BFGS fit did not converge: {result:?}");
-        assert!(baseline.converged, "baseline FD fit should still converge: {baseline:?}");
+        assert!(
+            result.converged,
+            "FD L-BFGS fit did not converge: {result:?}"
+        );
+        assert!(
+            baseline.converged,
+            "baseline FD fit should still converge: {baseline:?}"
+        );
         assert!(
             result.iterations <= 60,
             "expected FD quasi-Newton path to converge well before max_iter; got {}",
@@ -1690,7 +1777,10 @@ mod tests {
             FitParameter::non_negative("decay", 1.1),
         ]);
         let result = poisson_fit(&model, &y_obs, &mut params, &config).unwrap();
-        assert!(result.converged, "subspace FD L-BFGS fit did not converge: {result:?}");
+        assert!(
+            result.converged,
+            "subspace FD L-BFGS fit did not converge: {result:?}"
+        );
         assert!(
             result.iterations <= 20,
             "bound-active subspace FD fit should converge comfortably before max_iter; got {}",
