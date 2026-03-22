@@ -1,6 +1,6 @@
 # NEREIDS Jupyter Notebooks
 
-18 tutorials organized into four tiers of increasing complexity.
+19 tutorials organized into four tiers of increasing complexity.
 Work through them in order, or jump to whichever tier matches your
 experience level.
 
@@ -50,6 +50,7 @@ End-to-end analysis recipes combining multiple building blocks.
 | 2 | [Trace Analysis](workflows/02_trace_analysis.ipynb) | Detect trace elements in a bulk matrix via energy-window optimization |
 | 3 | [Forward Model](workflows/03_forward_model_demo.ipynb) | Complete forward-modeling pipeline from ENDF data to synthetic spectra |
 | 4 | [Spatial Mapping (Synthetic)](workflows/04_spatial_mapping_synthetic.ipynb) | Per-pixel isotopic composition mapping on a synthetic phantom |
+| 5 | [Group Fitting](workflows/05_group_fitting.ipynb) | Constrained isotope group fitting — leverage natural abundance ratios |
 
 ## Tier 4: Applications
 
@@ -67,4 +68,4 @@ common API pattern.
 
 **Ready for fitting:** Building Blocks 3-4, then Workflows 1-2.
 
-**Spatial imaging:** Workflows 4, then Applications 1.
+**Spatial imaging:** Workflows 4-5, then Applications 1.
