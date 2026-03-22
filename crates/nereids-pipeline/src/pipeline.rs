@@ -1675,6 +1675,82 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_typed_poisson_kl_with_temperature_and_background() {
+        let data = u238_single_resonance();
+        let true_density = 0.0005;
+        let true_temp = 350.0;
+        let true_b0 = 0.012;
+        let true_b1 = 0.008;
+        let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
+        let (t, sigma) = synthetic_transmission_at_temp(&data, true_density, true_temp, &energies);
+        let measured_t: Vec<f64> = t
+            .iter()
+            .zip(energies.iter())
+            .map(|(&ti, &e)| ti + true_b0 + true_b1 / e.sqrt())
+            .collect();
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            300.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig {
+            max_iter: 120,
+            gauss_newton_lambda: 1e-4,
+            ..PoissonConfig::default()
+        }))
+        .with_fit_temperature(true)
+        .with_transmission_background(BackgroundConfig::default());
+
+        let input = InputData::Transmission {
+            transmission: measured_t,
+            uncertainty: sigma,
+        };
+
+        let result = fit_spectrum_typed(&input, &config).unwrap();
+
+        assert!(result.converged, "fit did not converge: {result:?}");
+        assert!(
+            result.iterations <= 80,
+            "expected KL background+temperature fit to converge well before max_iter; got {}",
+            result.iterations,
+        );
+
+        let fitted_density = result.densities[0];
+        assert!(
+            (fitted_density - true_density).abs() / true_density < 0.02,
+            "density: fitted={fitted_density}, true={true_density}, ratio={}",
+            (fitted_density - true_density).abs() / true_density,
+        );
+
+        let fitted_temp = result
+            .temperature_k
+            .expect("temperature_k should be Some when fit_temperature=true");
+        assert!(
+            (fitted_temp - true_temp).abs() < 3.0,
+            "temperature: fitted={fitted_temp}, true={true_temp}, delta={}",
+            (fitted_temp - true_temp).abs(),
+        );
+
+        assert!(
+            (result.background[0] - true_b0).abs() < 5e-3,
+            "background b0: fitted={}, true={}",
+            result.background[0],
+            true_b0,
+        );
+        assert!(
+            (result.background[1] - true_b1).abs() < 5e-3,
+            "background b1: fitted={}, true={}",
+            result.background[1],
+            true_b1,
+        );
+    }
+
     /// Round-trip test: create a group of 2 isotopes with known ratios,
     /// generate synthetic transmission, fit with group constraints,
     /// verify the fitted group density matches the true value.

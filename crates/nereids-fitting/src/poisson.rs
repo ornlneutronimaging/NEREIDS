@@ -7,8 +7,12 @@
 //!
 //! L(θ) = Σᵢ [y_model(θ)ᵢ - y_obs,ᵢ · ln(y_model(θ)ᵢ)]
 //!
-//! This is minimized using projected gradient descent with backtracking
-//! line search and bound constraints (non-negativity on densities).
+//! This is minimized using a projected optimizer:
+//! - damped Gauss-Newton / Fisher steps when an analytical Jacobian exists
+//! - finite-difference projected gradient fallback otherwise
+//!
+//! Both paths use backtracking line search and bound constraints
+//! (non-negativity on densities).
 //!
 //! ## TRINIDI Reference
 //! - `trinidi/reconstruct.py` — Poisson NLL and APGM optimizer
@@ -16,7 +20,7 @@
 use nereids_core::constants::{PIVOT_FLOOR, POISSON_EPSILON};
 
 use crate::error::FittingError;
-use crate::lm::FitModel;
+use crate::lm::{FitModel, FlatMatrix};
 use crate::parameters::ParameterSet;
 
 /// Configuration for the Poisson optimizer.
@@ -35,6 +39,8 @@ pub struct PoissonConfig {
     pub armijo_c: f64,
     /// Line search backtracking factor.
     pub backtrack: f64,
+    /// Relative diagonal damping for analytical Gauss-Newton / Fisher steps.
+    pub gauss_newton_lambda: f64,
 }
 
 impl Default for PoissonConfig {
@@ -46,6 +52,7 @@ impl Default for PoissonConfig {
             tol_param: 1e-8,
             armijo_c: 1e-4,
             backtrack: 0.5,
+            gauss_newton_lambda: 1e-3,
         }
     }
 }
@@ -166,18 +173,19 @@ fn poisson_nll_curvature(obs: f64, mdl: f64) -> f64 {
 struct AnalyticalStepData {
     /// Gradient of the Poisson NLL: grad = J^T · w.
     grad: Vec<f64>,
-    /// Diagonal Gauss-Newton / Fisher curvature: diag(J^T H J).
-    diag_hess: Vec<f64>,
+    /// Full Gauss-Newton / Fisher curvature approximation: J^T H J.
+    fisher: FlatMatrix,
 }
 
-/// Compute gradient and diagonal curvature of the Poisson NLL using the analytical Jacobian.
+/// Compute gradient and Gauss-Newton / Fisher curvature of the Poisson NLL
+/// using the analytical Jacobian.
 ///
 /// `grad_j = Σᵢ wᵢ · J_{i,j}` where `wᵢ = ∂NLL/∂y_model_i`
 /// and `J_{i,j} = ∂y_model_i/∂θⱼ` from `model.analytical_jacobian()`.
 ///
-/// The diagonal curvature uses the Poisson Hessian with respect to the model
-/// output, giving a cheap positive preconditioner:
-/// `diag_hess_j = Σᵢ hᵢ · J_{i,j}²` where `hᵢ = ∂²NLL/∂y_model_i²`.
+/// The curvature uses the Poisson Hessian with respect to the model output:
+/// `fisher_{j,k} = Σᵢ hᵢ · J_{i,j} · J_{i,k}` where
+/// `hᵢ = ∂²NLL/∂y_model_i²`.
 ///
 /// Returns `Some(step_data)` if the model provides an analytical Jacobian,
 /// `None` otherwise (caller should fall back to finite differences).
@@ -195,17 +203,19 @@ fn compute_analytical_step_data(
     let n_e = y_obs.len();
     let n_free = free_idx_buf.len();
     let mut grad = vec![0.0f64; n_free];
-    let mut diag_hess = vec![0.0f64; n_free];
+    let mut fisher = FlatMatrix::zeros(n_free, n_free);
     for i in 0..n_e {
         let w = poisson_nll_weight(y_obs[i], y_model[i]);
         let h = poisson_nll_curvature(y_obs[i], y_model[i]);
         for (g, j) in grad.iter_mut().zip(0..n_free) {
             let jij = jac.get(i, j);
             *g += w * jij;
-            diag_hess[j] += h * jij * jij;
+            for k in 0..n_free {
+                *fisher.get_mut(j, k) += h * jij * jac.get(i, k);
+            }
         }
     }
-    Some(AnalyticalStepData { grad, diag_hess })
+    Some(AnalyticalStepData { grad, fisher })
 }
 
 /// Compute gradient of Poisson NLL by finite differences.
@@ -451,10 +461,12 @@ fn try_early_return_fixed(
     }))
 }
 
-/// Run Poisson-likelihood optimization using projected gradient descent.
+/// Run Poisson-likelihood optimization using a projected KL optimizer.
 ///
-/// Uses backtracking line search with Armijo condition and
-/// projection onto parameter bounds after each step.
+/// Uses damped Gauss-Newton / Fisher steps when an analytical Jacobian is
+/// available, falling back to projected gradient descent otherwise. Both paths
+/// use backtracking line search with Armijo condition and projection onto
+/// parameter bounds after each step.
 ///
 /// # Arguments
 /// * `model` — Forward model (maps parameters → predicted counts).
@@ -541,15 +553,20 @@ pub fn poisson_fit(
         params.free_indices_into(&mut free_idx_buf);
         let (search_dir, initial_alpha): (Vec<f64>, f64) =
             if let Some(ref analytical) = analytical_step {
-                // Use a diagonal Gauss-Newton / Fisher preconditioner when the
-                // analytical Jacobian is available. This produces a scale-aware
-                // search direction for mixed density/temperature fits instead of
-                // the previous ad hoc range² scaling.
-                let dir = grad
-                    .iter()
-                    .zip(analytical.diag_hess.iter())
-                    .map(|(&g, &h)| g / h.max(1e-12))
-                    .collect();
+                // Take a damped Gauss-Newton / Fisher step on the analytical
+                // path. If the linear solve degenerates, fall back to the
+                // diagonal scaling instead of dropping to FD.
+                let dir = crate::lm::solve_damped_system(
+                    &analytical.fisher,
+                    &grad,
+                    config.gauss_newton_lambda,
+                )
+                .unwrap_or_else(|| {
+                    grad.iter()
+                        .enumerate()
+                        .map(|(j, &g)| g / analytical.fisher.get(j, j).max(1e-12))
+                        .collect()
+                });
                 (dir, config.step_size)
             } else {
                 // FD path: keep the old range-based scaling as a cheap fallback
@@ -723,8 +740,6 @@ impl<'a> crate::forward_model::ForwardModel for CountsModel<'a> {
         self.n_params
     }
 }
-
-use crate::lm::FlatMatrix;
 
 /// KL-compatible background model for transmission data.
 ///
@@ -1126,6 +1141,7 @@ mod tests {
 
         let config = PoissonConfig {
             max_iter: 200,
+            gauss_newton_lambda: 1e-4,
             ..PoissonConfig::default()
         };
         let result = poisson_fit(&model, &y_obs, &mut params, &config).unwrap();
@@ -1160,6 +1176,11 @@ mod tests {
             "temperature fit={fitted_temp} truth={}",
             true_params[temp_index],
         );
+        assert!(
+            result.iterations <= 80,
+            "expected analytical KL path to converge well before max_iter; got {}",
+            result.iterations,
+        );
     }
 
     #[test]
@@ -1192,6 +1213,155 @@ mod tests {
             (result.params[0] - true_b).abs() < 1e-6,
             "parameter drifted away from optimum: {}",
             result.params[0]
+        );
+    }
+
+    #[test]
+    fn test_poisson_fit_temperature_and_background_converges() {
+        struct TempTransmissionModel {
+            energies: Vec<f64>,
+        }
+
+        impl TempTransmissionModel {
+            fn sigma(&self, energy: f64, temp_k: f64) -> f64 {
+                let center = 6.0;
+                let amp = 110.0;
+                let base_width = 0.55;
+                let width = (base_width * (temp_k / 300.0).sqrt()).max(0.08);
+                let delta = energy - center;
+                amp * (-(delta * delta) / (2.0 * width * width)).exp()
+            }
+
+            fn dsigma_dt(&self, energy: f64, temp_k: f64) -> f64 {
+                let center = 6.0;
+                let amp = 110.0;
+                let base_width = 0.55;
+                let width = (base_width * (temp_k / 300.0).sqrt()).max(0.08);
+                let dwidth_dt = if temp_k > 0.0 {
+                    base_width / (2.0 * (300.0 * temp_k).sqrt())
+                } else {
+                    0.0
+                };
+                let delta = energy - center;
+                let gauss = (-(delta * delta) / (2.0 * width * width)).exp();
+                amp * gauss * (delta * delta) * dwidth_dt / width.powi(3)
+            }
+        }
+
+        impl FitModel for TempTransmissionModel {
+            fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+                let density = params[0];
+                let temp_k = params[1];
+                Ok(self
+                    .energies
+                    .iter()
+                    .map(|&energy| (-density * self.sigma(energy, temp_k)).exp())
+                    .collect())
+            }
+
+            fn analytical_jacobian(
+                &self,
+                params: &[f64],
+                free_param_indices: &[usize],
+                y_current: &[f64],
+            ) -> Option<FlatMatrix> {
+                let density = params[0];
+                let temp_k = params[1];
+                let mut jac = FlatMatrix::zeros(self.energies.len(), free_param_indices.len());
+                for (row, &energy) in self.energies.iter().enumerate() {
+                    let y = y_current[row];
+                    let sigma = self.sigma(energy, temp_k);
+                    let dsigma_dt = self.dsigma_dt(energy, temp_k);
+                    for (col, &fp) in free_param_indices.iter().enumerate() {
+                        let deriv = match fp {
+                            0 => -sigma * y,
+                            1 => -density * dsigma_dt * y,
+                            _ => unreachable!("unexpected parameter index {fp}"),
+                        };
+                        *jac.get_mut(row, col) = deriv;
+                    }
+                }
+                Some(jac)
+            }
+        }
+
+        let energies: Vec<f64> = (0..180).map(|i| 1.0 + 0.06 * i as f64).collect();
+        let inner = TempTransmissionModel {
+            energies: energies.clone(),
+        };
+        let inv_sqrt_energies: Vec<f64> = energies.iter().map(|&e| 1.0 / e.sqrt()).collect();
+        let wrapped = TransmissionKLBackgroundModel {
+            inner: &inner,
+            inv_sqrt_energies,
+            b0_index: 2,
+            b1_index: 3,
+            n_params: 4,
+        };
+
+        let true_params = vec![4.5e-4, 345.0, 0.012, 0.008];
+        let y_obs = wrapped.evaluate(&true_params).unwrap();
+
+        let mut params = ParameterSet::new(vec![
+            FitParameter::non_negative("density", 8.0e-4),
+            FitParameter {
+                name: "temperature_k".into(),
+                value: 290.0,
+                lower: 1.0,
+                upper: 5000.0,
+                fixed: false,
+            },
+            FitParameter {
+                name: "kl_b0".into(),
+                value: 0.0,
+                lower: 0.0,
+                upper: 0.5,
+                fixed: false,
+            },
+            FitParameter {
+                name: "kl_b1".into(),
+                value: 0.0,
+                lower: 0.0,
+                upper: 0.5,
+                fixed: false,
+            },
+        ]);
+
+        let config = PoissonConfig {
+            max_iter: 120,
+            gauss_newton_lambda: 1e-4,
+            ..PoissonConfig::default()
+        };
+        let result = poisson_fit(&wrapped, &y_obs, &mut params, &config).unwrap();
+
+        assert!(result.converged, "fit did not converge: {result:?}");
+        assert!(
+            result.iterations <= 80,
+            "expected convergence well before max_iter; got {}",
+            result.iterations,
+        );
+        assert!(
+            (result.params[0] - true_params[0]).abs() / true_params[0] < 0.05,
+            "density fit={}, true={}",
+            result.params[0],
+            true_params[0],
+        );
+        assert!(
+            (result.params[1] - true_params[1]).abs() < 8.0,
+            "temperature fit={}, true={}",
+            result.params[1],
+            true_params[1],
+        );
+        assert!(
+            (result.params[2] - true_params[2]).abs() < 5e-3,
+            "b0 fit={}, true={}",
+            result.params[2],
+            true_params[2],
+        );
+        assert!(
+            (result.params[3] - true_params[3]).abs() < 5e-3,
+            "b1 fit={}, true={}",
+            result.params[3],
+            true_params[3],
         );
     }
 }

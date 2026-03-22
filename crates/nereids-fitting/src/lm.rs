@@ -282,7 +282,7 @@ fn compute_jacobian(
 ///
 /// A is a flat n×n symmetric positive definite matrix (approximately).
 /// Returns the solution vector x.
-fn solve_damped_system(a: &FlatMatrix, b: &[f64], lambda: f64) -> Option<Vec<f64>> {
+pub(crate) fn solve_damped_system(a: &FlatMatrix, b: &[f64], lambda: f64) -> Option<Vec<f64>> {
     let n = b.len();
     if n == 0 {
         return Some(vec![]);
