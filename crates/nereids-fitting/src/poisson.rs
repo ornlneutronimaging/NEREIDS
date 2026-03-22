@@ -21,7 +21,7 @@ use nereids_core::constants::{PIVOT_FLOOR, POISSON_EPSILON};
 
 use crate::error::FittingError;
 use crate::lm::{FitModel, FlatMatrix};
-use crate::parameters::ParameterSet;
+use crate::parameters::{FitParameter, ParameterSet};
 
 /// Configuration for the Poisson optimizer.
 #[derive(Debug, Clone)]
@@ -309,6 +309,55 @@ fn normalized_step_norm(
         .sqrt()
 }
 
+fn is_bound_active(param: &FitParameter, grad: f64) -> bool {
+    let at_lower = param.lower.is_finite() && (param.value - param.lower).abs() <= PIVOT_FLOOR;
+    let at_upper = param.upper.is_finite() && (param.value - param.upper).abs() <= PIVOT_FLOOR;
+    (at_lower && grad > 0.0) || (at_upper && grad < 0.0)
+}
+
+fn inactive_free_positions(
+    params: &ParameterSet,
+    free_param_indices: &[usize],
+    grad: &[f64],
+) -> Vec<usize> {
+    free_param_indices
+        .iter()
+        .zip(grad.iter())
+        .enumerate()
+        .filter_map(|(pos, (&idx, &g))| (!is_bound_active(&params.params[idx], g)).then_some(pos))
+        .collect()
+}
+
+fn projected_gradient_norm(
+    params: &ParameterSet,
+    free_param_indices: &[usize],
+    grad: &[f64],
+) -> f64 {
+    free_param_indices
+        .iter()
+        .zip(grad.iter())
+        .map(|(&idx, &g)| {
+            if is_bound_active(&params.params[idx], g) {
+                0.0
+            } else {
+                g * g
+            }
+        })
+        .sum::<f64>()
+        .sqrt()
+}
+
+fn extract_submatrix(matrix: &FlatMatrix, positions: &[usize]) -> FlatMatrix {
+    let n = positions.len();
+    let mut sub = FlatMatrix::zeros(n, n);
+    for (row_out, &row_in) in positions.iter().enumerate() {
+        for (col_out, &col_in) in positions.iter().enumerate() {
+            *sub.get_mut(row_out, col_out) = matrix.get(row_in, col_in);
+        }
+    }
+    sub
+}
+
 enum LineSearchResult {
     Accepted { nll: f64, y_model: Vec<f64> },
     Stagnated,
@@ -543,30 +592,44 @@ pub fn poisson_fit(
             )?
         };
 
-        // Check gradient norm for convergence
-        let grad_norm: f64 = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
-        if grad_norm < config.tol_param {
+        params.free_indices_into(&mut free_idx_buf);
+
+        // Use projected-gradient optimality for bound-constrained problems.
+        let projected_grad_norm = projected_gradient_norm(params, &free_idx_buf, &grad);
+        if projected_grad_norm < config.tol_param {
             converged = true;
             break;
         }
 
-        params.free_indices_into(&mut free_idx_buf);
         let (search_dir, initial_alpha): (Vec<f64>, f64) =
             if let Some(ref analytical) = analytical_step {
+                let inactive_positions = inactive_free_positions(params, &free_idx_buf, &grad);
+                if inactive_positions.is_empty() {
+                    converged = true;
+                    break;
+                }
                 // Take a damped Gauss-Newton / Fisher step on the analytical
                 // path. If the linear solve degenerates, fall back to the
                 // diagonal scaling instead of dropping to FD.
-                let dir = crate::lm::solve_damped_system(
-                    &analytical.fisher,
-                    &grad,
+                let reduced_fisher = extract_submatrix(&analytical.fisher, &inactive_positions);
+                let reduced_grad: Vec<f64> =
+                    inactive_positions.iter().map(|&pos| grad[pos]).collect();
+                let reduced_dir = crate::lm::solve_damped_system(
+                    &reduced_fisher,
+                    &reduced_grad,
                     config.gauss_newton_lambda,
                 )
                 .unwrap_or_else(|| {
-                    grad.iter()
+                    reduced_grad
+                        .iter()
                         .enumerate()
-                        .map(|(j, &g)| g / analytical.fisher.get(j, j).max(1e-12))
+                        .map(|(j, &g)| g / reduced_fisher.get(j, j).max(1e-12))
                         .collect()
                 });
+                let mut dir = vec![0.0; grad.len()];
+                for (&pos, &value) in inactive_positions.iter().zip(reduced_dir.iter()) {
+                    dir[pos] = value;
+                }
                 (dir, config.step_size)
             } else {
                 // FD path: keep the old range-based scaling as a cheap fallback
@@ -575,6 +638,9 @@ pub fn poisson_fit(
                     .iter()
                     .zip(free_idx_buf.iter())
                     .map(|(&g, &idx)| {
+                        if is_bound_active(&params.params[idx], g) {
+                            return 0.0;
+                        }
                         let p = &params.params[idx];
                         let range = p.upper - p.lower;
                         if range.is_finite() && range > 1e-10 {
@@ -1212,6 +1278,70 @@ mod tests {
         assert!(
             (result.params[0] - true_b).abs() < 1e-6,
             "parameter drifted away from optimum: {}",
+            result.params[0]
+        );
+    }
+
+    #[test]
+    fn test_projected_gradient_ignores_lower_bound_blocked_direction() {
+        let params = ParameterSet::new(vec![
+            FitParameter::non_negative("density", 0.0),
+            FitParameter::unbounded("temp", 300.0),
+        ]);
+        let free_idx = vec![0, 1];
+        let grad = vec![0.25, -0.5];
+
+        let inactive = inactive_free_positions(&params, &free_idx, &grad);
+        assert_eq!(inactive, vec![1], "lower-bound blocked density should be active");
+
+        let pg_norm = projected_gradient_norm(&params, &free_idx, &grad);
+        assert!(
+            (pg_norm - 0.5).abs() < 1e-12,
+            "projected gradient should ignore blocked lower-bound component"
+        );
+    }
+
+    #[test]
+    fn test_poisson_fit_converges_at_bound_active_optimum() {
+        struct OffsetModel {
+            base: Vec<f64>,
+        }
+
+        impl FitModel for OffsetModel {
+            fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+                Ok(self.base.iter().map(|&b| b + params[0]).collect())
+            }
+
+            fn analytical_jacobian(
+                &self,
+                _params: &[f64],
+                free_param_indices: &[usize],
+                y_current: &[f64],
+            ) -> Option<FlatMatrix> {
+                let mut jac = FlatMatrix::zeros(y_current.len(), free_param_indices.len());
+                for (col, &fp) in free_param_indices.iter().enumerate() {
+                    assert_eq!(fp, 0);
+                    for row in 0..y_current.len() {
+                        *jac.get_mut(row, col) = 1.0;
+                    }
+                }
+                Some(jac)
+            }
+        }
+
+        let model = OffsetModel {
+            base: vec![10.0; 12],
+        };
+        let y_obs = vec![8.0; 12];
+        let mut params = ParameterSet::new(vec![FitParameter::non_negative("offset", 0.0)]);
+
+        let result = poisson_fit(&model, &y_obs, &mut params, &PoissonConfig::default()).unwrap();
+
+        assert!(result.converged, "bound-active optimum should satisfy projected optimality");
+        assert_eq!(result.iterations, 1, "should stop on projected-gradient check");
+        assert!(
+            result.params[0].abs() < 1e-12,
+            "offset should stay pinned at lower bound, got {}",
             result.params[0]
         );
     }
