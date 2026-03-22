@@ -682,16 +682,6 @@ fn fit_transmission_poisson(
     config: &UnifiedFitConfig,
     poisson_cfg: &PoissonConfig,
 ) -> Result<SpectrumFitResult, PipelineError> {
-    // KL+BG+temperature is not supported (NormalizedTransmissionModel
-    // doesn't support temperature in the Poisson gradient path).
-    if config.fit_temperature && config.transmission_background.is_some() {
-        return Err(PipelineError::InvalidParameter(
-            "Poisson KL with background + temperature fitting is not supported. \
-             Use KL without background, or LM with background."
-                .into(),
-        ));
-    }
-
     let n_density_params = config.n_density_params();
 
     let mut param_vec = build_density_params(config);
