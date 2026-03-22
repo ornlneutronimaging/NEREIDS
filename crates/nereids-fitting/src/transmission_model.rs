@@ -299,29 +299,12 @@ impl FitModel for TransmissionFitModel {
             // (same T, different lambda) and enables analytical_jacobian() to
             // read the broadened σ for density columns.
             //
-            // When temperature fitting is enabled, compute the analytical
-            // ∂σ/∂T derivative alongside σ in a single pass (~10% overhead).
-            // This eliminates the FD broadening call in analytical_jacobian().
+            // Derivative ∂σ/∂T is computed on-demand in analytical_jacobian(),
+            // NOT here — evaluate() is called many times during line search
+            // trials, and the derivative overhead would dominate.
             let broadened_xs = if (temperature_k - self.cached_temperature.get()).abs() < 1e-15 {
                 Rc::clone(self.cached_broadened_xs.borrow().as_ref().unwrap())
-            } else if self.temperature_index.is_some() {
-                // Temperature fitting: compute (σ, ∂σ/∂T) together.
-                let (xs_vec, dxs_vec) =
-                    transmission::broadened_cross_sections_with_analytical_derivative_from_base(
-                        &self.energies,
-                        base_xs,
-                        &self.resonance_data,
-                        temperature_k,
-                        self.instrument.as_deref(),
-                    )
-                    .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?;
-                let xs = Rc::new(xs_vec);
-                *self.cached_broadened_xs.borrow_mut() = Some(Rc::clone(&xs));
-                *self.cached_dxs_dt.borrow_mut() = Some(Rc::new(dxs_vec));
-                self.cached_temperature.set(temperature_k);
-                xs
             } else {
-                // No temperature fitting: forward-only broadening.
                 let xs = Rc::new(
                     transmission::broadened_cross_sections_from_base(
                         &self.energies,
@@ -333,6 +316,8 @@ impl FitModel for TransmissionFitModel {
                     .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?,
                 );
                 *self.cached_broadened_xs.borrow_mut() = Some(Rc::clone(&xs));
+                // Invalidate derivative cache — temperature changed, old ∂σ/∂T stale.
+                *self.cached_dxs_dt.borrow_mut() = None;
                 self.cached_temperature.set(temperature_k);
                 xs
             };
@@ -443,9 +428,30 @@ impl FitModel for TransmissionFitModel {
         //
         // Chain rule: ∂T(E)/∂T_temp = -T(E) · Σᵢ nᵢ · rᵢ · ∂σᵢ(E)/∂T
         //
-        // The ∂σᵢ/∂T was cached during evaluate() via
-        // broadened_cross_sections_with_analytical_derivative_from_base().
+        // Computed on-demand here (not in evaluate()) because evaluate()
+        // is called many times during line search trials where the
+        // derivative is not needed. Computing it here costs one extra
+        // broadening call per Jacobian, same as the old FD approach but
+        // with exact (not approximate) derivatives.
         if let Some(col) = temp_col {
+            // Compute ∂σ/∂T on-demand if not cached at current temperature.
+            {
+                let needs_compute = self.cached_dxs_dt.borrow().as_ref().is_none();
+                if needs_compute {
+                    let base_xs = self.base_xs.as_ref()?;
+                    let temperature_k = self.cached_temperature.get();
+                    let (_, dxs_vec) =
+                        transmission::broadened_cross_sections_with_analytical_derivative_from_base(
+                            &self.energies,
+                            base_xs,
+                            &self.resonance_data,
+                            temperature_k,
+                            self.instrument.as_deref(),
+                        )
+                        .ok()?;
+                    *self.cached_dxs_dt.borrow_mut() = Some(Rc::new(dxs_vec));
+                }
+            }
             let cached_dxs = self.cached_dxs_dt.borrow();
             let dxs_dt = cached_dxs.as_ref()?;
             for i in 0..n_e {

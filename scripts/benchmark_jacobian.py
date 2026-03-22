@@ -201,6 +201,68 @@ def main():
 
         print()
 
+    # ── Correctness verification: noiseless round-trip ──
+    print()
+    print("=" * 120)
+    print("CORRECTNESS VERIFICATION: Noiseless round-trip (perfect data)")
+    print("=" * 120)
+    print()
+
+    sigma_perfect = np.full_like(ENERGIES, 0.001)
+    n_pass = 0
+    n_fail = 0
+
+    for path_name, input_type, solver, background, fit_temperature in PATHS:
+        temp_k = TRUE_TEMP if fit_temperature else TEMP_K
+        T_true = np.asarray(nereids.forward_model(
+            ENERGIES,
+            groups=[(group_hf, TRUE_DENSITY)],
+            temperature_k=temp_k,
+            **RESOLUTION_KWARGS,
+        ))
+        # For counts path, use very high I0 to approximate noiseless
+        counts_s = (10000 * T_true).astype(float)
+        counts_ob = np.full_like(T_true, 10000.0)
+
+        d, t, c2, conv, elapsed, err = run_fit(
+            path_name, input_type, solver, background, fit_temperature,
+            T_true, sigma_perfect, counts_s, counts_ob, temp_k,
+        )
+
+        if err is not None:
+            print(f"  {path_name:<22} ERROR: {err[:60]}")
+            n_fail += 1
+            continue
+
+        d_err = abs(d - TRUE_DENSITY) / TRUE_DENSITY * 100
+        d_ok = d_err < 5.0  # 5% tolerance on noiseless
+
+        if fit_temperature and t is not None:
+            t_err = abs(t - TRUE_TEMP)
+            t_ok = t_err < 50.0  # 50K tolerance (temperature is weakly constrained)
+            status = "PASS" if (d_ok and t_ok and conv) else "FAIL"
+            detail = f"d={d:.6f} ({d_err:.2f}%)  T={t:.1f}K (err={t_err:.1f}K)  conv={conv}"
+        else:
+            t_ok = True
+            status = "PASS" if (d_ok and conv) else "FAIL"
+            detail = f"d={d:.6f} ({d_err:.2f}%)  conv={conv}"
+
+        if status == "PASS":
+            n_pass += 1
+        else:
+            n_fail += 1
+
+        print(f"  {path_name:<22} [{status}]  {detail}")
+
+    print()
+    print(f"Results: {n_pass} PASS, {n_fail} FAIL out of {n_pass + n_fail} paths")
+    if n_fail > 0:
+        print("*** CORRECTNESS REGRESSION DETECTED ***")
+        exit(1)
+    else:
+        print("All paths produce correct results on noiseless data.")
+
+    print()
     print("=" * 120)
     print("Benchmark complete.")
 

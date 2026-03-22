@@ -143,34 +143,69 @@ fn poisson_nll_weight(obs: f64, mdl: f64) -> f64 {
     }
 }
 
-/// Compute gradient of Poisson NLL using the analytical Jacobian.
+/// Per-bin Poisson NLL curvature: ∂²f(obs, mdl)/∂mdl².
+///
+/// For mdl > ε: h = obs / mdl²
+/// For mdl ≤ ε: curvature of the smooth quadratic extrapolation.
+#[inline]
+fn poisson_nll_curvature(obs: f64, mdl: f64) -> f64 {
+    if mdl > POISSON_EPSILON {
+        obs / (mdl * mdl)
+    } else {
+        let eps = POISSON_EPSILON;
+        if obs > 0.0 {
+            obs / (eps * eps)
+        } else {
+            1.0 / eps
+        }
+    }
+}
+
+/// Analytical first/second-order information for the Poisson objective.
+#[derive(Debug)]
+struct AnalyticalStepData {
+    /// Gradient of the Poisson NLL: grad = J^T · w.
+    grad: Vec<f64>,
+    /// Diagonal Gauss-Newton / Fisher curvature: diag(J^T H J).
+    diag_hess: Vec<f64>,
+}
+
+/// Compute gradient and diagonal curvature of the Poisson NLL using the analytical Jacobian.
 ///
 /// `grad_j = Σᵢ wᵢ · J_{i,j}` where `wᵢ = ∂NLL/∂y_model_i`
 /// and `J_{i,j} = ∂y_model_i/∂θⱼ` from `model.analytical_jacobian()`.
 ///
-/// Returns `Some(gradient)` if the model provides an analytical Jacobian,
+/// The diagonal curvature uses the Poisson Hessian with respect to the model
+/// output, giving a cheap positive preconditioner:
+/// `diag_hess_j = Σᵢ hᵢ · J_{i,j}²` where `hᵢ = ∂²NLL/∂y_model_i²`.
+///
+/// Returns `Some(step_data)` if the model provides an analytical Jacobian,
 /// `None` otherwise (caller should fall back to finite differences).
-fn compute_gradient_analytical(
+fn compute_analytical_step_data(
     model: &dyn FitModel,
     params: &ParameterSet,
     y_obs: &[f64],
     y_model: &[f64],
     all_vals_buf: &mut Vec<f64>,
     free_idx_buf: &mut Vec<usize>,
-) -> Option<Vec<f64>> {
+) -> Option<AnalyticalStepData> {
     params.all_values_into(all_vals_buf);
     params.free_indices_into(free_idx_buf);
     let jac = model.analytical_jacobian(all_vals_buf, free_idx_buf, y_model)?;
     let n_e = y_obs.len();
     let n_free = free_idx_buf.len();
     let mut grad = vec![0.0f64; n_free];
+    let mut diag_hess = vec![0.0f64; n_free];
     for i in 0..n_e {
         let w = poisson_nll_weight(y_obs[i], y_model[i]);
+        let h = poisson_nll_curvature(y_obs[i], y_model[i]);
         for (g, j) in grad.iter_mut().zip(0..n_free) {
-            *g += w * jac.get(i, j);
+            let jij = jac.get(i, j);
+            *g += w * jij;
+            diag_hess[j] += h * jij * jij;
         }
     }
-    Some(grad)
+    Some(AnalyticalStepData { grad, diag_hess })
 }
 
 /// Compute gradient of Poisson NLL by finite differences.
@@ -431,15 +466,16 @@ pub fn poisson_fit(
         // Compute gradient: try analytical (grad = J^T · w) first,
         // fall back to finite differences if the model doesn't provide
         // an analytical Jacobian.
-        let grad = if let Some(analytical_grad) = compute_gradient_analytical(
+        let analytical_step = compute_analytical_step_data(
             model,
             params,
             y_obs,
             &y_model,
             &mut all_vals_buf,
             &mut free_idx_buf,
-        ) {
-            analytical_grad
+        );
+        let grad = if let Some(ref analytical) = analytical_step {
+            analytical.grad.clone()
         } else {
             compute_gradient(
                 model,
@@ -458,42 +494,44 @@ pub fn poisson_fit(
             break;
         }
 
-        // Diagonal preconditioning by parameter bound range.
-        //
-        // For joint density+temperature fitting, parameter scales differ by
-        // 10^5+ (density ~0.001 vs temperature ~300). The raw gradient is
-        // dominated by the large-scale parameter. Preconditioning by the
-        // squared bound range gives Newton-like step sizes:
-        //   search_dir_j = grad_j * (upper_j - lower_j)^2
-        //
-        // This makes the optimizer take steps proportional to the natural
-        // range of each parameter, regardless of the gradient magnitude.
         params.free_indices_into(&mut free_idx_buf);
-        let search_dir: Vec<f64> = grad
-            .iter()
-            .zip(free_idx_buf.iter())
-            .map(|(&g, &idx)| {
-                let p = &params.params[idx];
-                let range = p.upper - p.lower;
-                if range.is_finite() && range > 1e-10 {
-                    // Bounded parameter: scale by range² for Newton-like step
-                    g * range * range
-                } else {
-                    // Unbounded (e.g., density with upper=inf):
-                    // Use current value as scale proxy (like relative step)
-                    let scale = p.value.abs().max(1e-3);
-                    g * scale * scale
-                }
-            })
-            .collect();
-
-        let search_norm: f64 = search_dir.iter().map(|d| d * d).sum::<f64>().sqrt();
+        let (search_dir, initial_alpha): (Vec<f64>, f64) =
+            if let Some(ref analytical) = analytical_step {
+                // Use a diagonal Gauss-Newton / Fisher preconditioner when the
+                // analytical Jacobian is available. This produces a scale-aware
+                // search direction for mixed density/temperature fits instead of
+                // the previous ad hoc range² scaling.
+                let dir = grad
+                    .iter()
+                    .zip(analytical.diag_hess.iter())
+                    .map(|(&g, &h)| g / h.max(1e-12))
+                    .collect();
+                (dir, config.step_size)
+            } else {
+                // FD path: keep the old range-based scaling as a cheap fallback
+                // when no analytical Jacobian is available.
+                let dir = grad
+                    .iter()
+                    .zip(free_idx_buf.iter())
+                    .map(|(&g, &idx)| {
+                        let p = &params.params[idx];
+                        let range = p.upper - p.lower;
+                        if range.is_finite() && range > 1e-10 {
+                            g * range * range
+                        } else {
+                            let scale = p.value.abs().max(1e-3);
+                            g * scale * scale
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let search_norm: f64 = dir.iter().map(|d| d * d).sum::<f64>().sqrt();
+                (dir, config.step_size / search_norm.max(1.0))
+            };
 
         // Backtracking line search with preconditioned search direction.
         params.free_values_into(&mut free_vals_buf);
         old_free_buf.clear();
         old_free_buf.extend_from_slice(&free_vals_buf);
-        let initial_alpha = config.step_size / search_norm.max(1.0);
 
         match backtracking_line_search(
             model,
@@ -935,5 +973,151 @@ mod tests {
         assert!((result[0] - 55.0).abs() < 1e-10);
         assert!((result[1] - 110.0).abs() < 1e-10);
         assert!((result[2] - 165.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_poisson_fit_multi_density_temperature_converges() {
+        struct MultiDensityCountsModel {
+            energies: Vec<f64>,
+            flux: Vec<f64>,
+            density_count: usize,
+            temp_index: usize,
+        }
+
+        impl MultiDensityCountsModel {
+            fn sigma(&self, iso: usize, energy: f64, temp_k: f64) -> f64 {
+                let center = 6.0 + iso as f64 * 4.5;
+                let amp = 150.0 + 25.0 * iso as f64;
+                let base_width = 0.8 + 0.12 * iso as f64;
+                let width_coeff = 0.05 + 0.01 * iso as f64;
+                let width = (base_width * (1.0 + width_coeff * (temp_k - 300.0) / 300.0)).max(0.1);
+                let delta = energy - center;
+                let gauss = (-(delta * delta) / (2.0 * width * width)).exp();
+                amp * gauss
+            }
+
+            fn dsigma_dt(&self, iso: usize, energy: f64, temp_k: f64) -> f64 {
+                let center = 6.0 + iso as f64 * 4.5;
+                let amp = 150.0 + 25.0 * iso as f64;
+                let base_width = 0.8 + 0.12 * iso as f64;
+                let width_coeff = 0.05 + 0.01 * iso as f64;
+                let width = (base_width * (1.0 + width_coeff * (temp_k - 300.0) / 300.0)).max(0.1);
+                let delta = energy - center;
+                let gauss = (-(delta * delta) / (2.0 * width * width)).exp();
+                let dwidth_dt = base_width * width_coeff / 300.0;
+                amp * gauss * (delta * delta) * dwidth_dt / width.powi(3)
+            }
+        }
+
+        impl FitModel for MultiDensityCountsModel {
+            fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+                let temp_k = params[self.temp_index];
+                let mut out = Vec::with_capacity(self.energies.len());
+                for (i, &energy) in self.energies.iter().enumerate() {
+                    let optical_depth = (0..self.density_count)
+                        .map(|iso| params[iso] * self.sigma(iso, energy, temp_k))
+                        .sum::<f64>();
+                    out.push(self.flux[i] * (-optical_depth).exp());
+                }
+                Ok(out)
+            }
+
+            fn analytical_jacobian(
+                &self,
+                params: &[f64],
+                free_param_indices: &[usize],
+                y_current: &[f64],
+            ) -> Option<crate::lm::FlatMatrix> {
+                let temp_k = params[self.temp_index];
+                let mut jac =
+                    crate::lm::FlatMatrix::zeros(self.energies.len(), free_param_indices.len());
+                for (row, &energy) in self.energies.iter().enumerate() {
+                    let y = y_current[row];
+                    let mut sum_n_dsigma_dt = 0.0;
+                    for (iso, &density) in params[..self.density_count].iter().enumerate() {
+                        sum_n_dsigma_dt += density * self.dsigma_dt(iso, energy, temp_k);
+                    }
+                    for (col, &fp) in free_param_indices.iter().enumerate() {
+                        let val = if fp == self.temp_index {
+                            -y * sum_n_dsigma_dt
+                        } else {
+                            -y * self.sigma(fp, energy, temp_k)
+                        };
+                        *jac.get_mut(row, col) = val;
+                    }
+                }
+                Some(jac)
+            }
+        }
+
+        let energies: Vec<f64> = (0..220).map(|i| 1.0 + 0.18 * i as f64).collect();
+        let flux: Vec<f64> = energies
+            .iter()
+            .map(|&e| 1500.0 * (1.0 + 0.15 * (e / 8.0).sin()).max(0.2))
+            .collect();
+        let density_count = 6usize;
+        let temp_index = density_count;
+        let model = MultiDensityCountsModel {
+            energies,
+            flux,
+            density_count,
+            temp_index,
+        };
+
+        let true_params = vec![3.2e-4, 2.4e-4, 1.7e-4, 1.1e-4, 7.5e-5, 4.2e-5, 360.0];
+        let y_obs = model.evaluate(&true_params).unwrap();
+
+        let mut params = ParameterSet::new(vec![
+            FitParameter::non_negative("n0", 6.0e-4),
+            FitParameter::non_negative("n1", 4.0e-4),
+            FitParameter::non_negative("n2", 2.5e-4),
+            FitParameter::non_negative("n3", 1.8e-4),
+            FitParameter::non_negative("n4", 1.0e-4),
+            FitParameter::non_negative("n5", 8.0e-5),
+            FitParameter {
+                name: "temperature_k".into(),
+                value: 300.0,
+                lower: 1.0,
+                upper: 5000.0,
+                fixed: false,
+            },
+        ]);
+
+        let config = PoissonConfig {
+            max_iter: 200,
+            ..PoissonConfig::default()
+        };
+        let result = poisson_fit(&model, &y_obs, &mut params, &config).unwrap();
+
+        assert!(
+            result.converged,
+            "multi-density+temperature Poisson fit did not converge after {} iterations",
+            result.iterations,
+        );
+        assert!(
+            result.iterations < config.max_iter,
+            "fit hit max_iter={}, params={:?}",
+            config.max_iter,
+            result.params,
+        );
+
+        for (i, (&fit, &truth)) in result.params[..density_count]
+            .iter()
+            .zip(true_params[..density_count].iter())
+            .enumerate()
+        {
+            let rel_err = (fit - truth).abs() / truth;
+            assert!(
+                rel_err < 0.10,
+                "density[{i}] fit={fit} truth={truth} rel_err={rel_err:.3}",
+            );
+        }
+
+        let fitted_temp = result.params[temp_index];
+        assert!(
+            (fitted_temp - true_params[temp_index]).abs() < 10.0,
+            "temperature fit={fitted_temp} truth={}",
+            true_params[temp_index],
+        );
     }
 }
