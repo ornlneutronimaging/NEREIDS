@@ -1,6 +1,6 @@
 # NEREIDS Jupyter Notebooks
 
-19 tutorials organized into four tiers of increasing complexity.
+Tutorials organized into four tiers of increasing complexity.
 Work through them in order, or jump to whichever tier matches your
 experience level.
 
@@ -68,4 +68,4 @@ common API pattern.
 
 **Ready for fitting:** Building Blocks 3-4, then Workflows 1-2.
 
-**Spatial imaging:** Workflows 4-5, then Applications 1.
+**Spatial imaging:** Workflows 4 and 5, then Applications 1.
