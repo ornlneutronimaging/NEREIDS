@@ -276,6 +276,35 @@ fn project(params: &mut ParameterSet) {
     }
 }
 
+fn normalized_step_norm(
+    old_free: &[f64],
+    new_free: &[f64],
+    params: &ParameterSet,
+    free_param_indices: &[usize],
+) -> f64 {
+    old_free
+        .iter()
+        .zip(new_free.iter())
+        .zip(free_param_indices.iter())
+        .map(|((&old, &new), &idx)| {
+            let range = params.params[idx].upper - params.params[idx].lower;
+            let scale = if range.is_finite() && range > 1e-10 {
+                range
+            } else {
+                old.abs().max(1e-3)
+            };
+            ((old - new) / scale).powi(2)
+        })
+        .sum::<f64>()
+        .sqrt()
+}
+
+enum LineSearchResult {
+    Accepted { nll: f64, y_model: Vec<f64> },
+    Stagnated,
+    Failed,
+}
+
 /// Backtracking line search with Armijo condition.
 ///
 /// Backtracking line search with Armijo sufficient-decrease condition:
@@ -315,6 +344,7 @@ fn backtracking_line_search(
     params: &mut ParameterSet,
     y_obs: &[f64],
     old_free: &[f64],
+    free_param_indices: &[usize],
     search_dir: &[f64],
     initial_alpha: f64,
     config: &PoissonConfig,
@@ -323,7 +353,7 @@ fn backtracking_line_search(
     all_vals_buf: &mut Vec<f64>,
     free_vals_buf: &mut Vec<f64>,
     trial_free_buf: &mut Vec<f64>,
-) -> Option<(f64, Vec<f64>)> {
+) -> LineSearchResult {
     let mut alpha = initial_alpha;
     for _ in 0..50 {
         // Trial step: x_new = project(x - alpha * search_dir)
@@ -357,6 +387,7 @@ fn backtracking_line_search(
 
         // Armijo condition: f(x_new) <= f(x) - c * descent
         params.free_values_into(free_vals_buf);
+        let step_norm = normalized_step_norm(old_free, free_vals_buf, params, free_param_indices);
         let descent = grad
             .iter()
             .zip(old_free.iter())
@@ -365,14 +396,27 @@ fn backtracking_line_search(
             .sum::<f64>();
 
         if trial_nll.is_finite() && trial_nll <= nll - config.armijo_c * descent {
-            return Some((trial_nll, trial_model));
+            return LineSearchResult::Accepted {
+                nll: trial_nll,
+                y_model: trial_model,
+            };
+        }
+
+        let nll_delta = (trial_nll - nll).abs();
+        let nll_scale = trial_nll.abs().max(nll.abs()).max(1.0);
+        if trial_nll.is_finite()
+            && step_norm < config.tol_param
+            && nll_delta <= config.tol_param * nll_scale
+        {
+            params.set_free_values(old_free);
+            return LineSearchResult::Stagnated;
         }
 
         // Backtrack
         alpha *= config.backtrack;
     }
     params.set_free_values(old_free);
-    None
+    LineSearchResult::Failed
 }
 
 /// Early return for all-fixed parameters: evaluate once and report.
@@ -538,6 +582,7 @@ pub fn poisson_fit(
             params,
             y_obs,
             &old_free_buf,
+            &free_idx_buf,
             &search_dir,
             initial_alpha,
             config,
@@ -547,11 +592,18 @@ pub fn poisson_fit(
             &mut free_vals_buf,
             &mut trial_free_buf,
         ) {
-            Some((new_nll, new_y_model)) => {
+            LineSearchResult::Accepted {
+                nll: new_nll,
+                y_model: new_y_model,
+            } => {
                 nll = new_nll;
                 y_model = new_y_model;
             }
-            None => {
+            LineSearchResult::Stagnated => {
+                converged = true;
+                break;
+            }
+            LineSearchResult::Failed => {
                 // Can't improve from this point; stop without claiming convergence.
                 // (params already restored by backtracking_line_search)
                 break;
@@ -562,21 +614,7 @@ pub fn poisson_fit(
         // Each parameter's step is normalized by its scale so that
         // temperature (range ~5000) doesn't dominate over density (range ~0.01).
         params.free_values_into(&mut free_vals_buf);
-        let step_norm: f64 = old_free_buf
-            .iter()
-            .zip(free_vals_buf.iter())
-            .zip(free_idx_buf.iter())
-            .map(|((o, n), &idx)| {
-                let range = params.params[idx].upper - params.params[idx].lower;
-                let scale = if range.is_finite() && range > 1e-10 {
-                    range
-                } else {
-                    o.abs().max(1e-3)
-                };
-                ((o - n) / scale).powi(2)
-            })
-            .sum::<f64>()
-            .sqrt();
+        let step_norm = normalized_step_norm(&old_free_buf, &free_vals_buf, params, &free_idx_buf);
         if step_norm < config.tol_param {
             converged = true;
             break;
@@ -608,6 +646,8 @@ pub struct CountsModel<'a> {
     pub flux: &'a [f64],
     /// Background counts per bin.
     pub background: &'a [f64],
+    /// Total parameter count in the wrapped model.
+    pub n_params: usize,
 }
 
 impl<'a> FitModel for CountsModel<'a> {
@@ -680,11 +720,7 @@ impl<'a> crate::forward_model::ForwardModel for CountsModel<'a> {
     }
 
     fn n_params(&self) -> usize {
-        // CountsModel doesn't own the parameter vector — the count is
-        // determined by ParameterSet. Return flux length as a proxy
-        // (n_data), since n_params is only used by ForwardModel consumers
-        // for buffer sizing, not by the Poisson optimizer.
-        self.flux.len()
+        self.n_params
     }
 }
 
@@ -722,6 +758,8 @@ pub struct TransmissionKLBackgroundModel<'a> {
     pub b0_index: usize,
     /// Index of b₁ (1/√E background) in the parameter vector.
     pub b1_index: usize,
+    /// Total parameter count in the wrapped model.
+    pub n_params: usize,
 }
 
 impl<'a> FitModel for TransmissionKLBackgroundModel<'a> {
@@ -813,9 +851,7 @@ impl<'a> crate::forward_model::ForwardModel for TransmissionKLBackgroundModel<'a
     }
 
     fn n_params(&self) -> usize {
-        // The wrapper adds 2 background parameters (b0, b1).
-        // n_data from inner is a reasonable proxy for the base param count.
-        self.inv_sqrt_energies.len()
+        self.n_params
     }
 }
 
@@ -966,6 +1002,7 @@ mod tests {
             transmission_model: &t_model,
             flux: &flux,
             background: &background,
+            n_params: 1,
         };
 
         // T = 0.5 → counts = flux*0.5 + background
@@ -973,6 +1010,10 @@ mod tests {
         assert!((result[0] - 55.0).abs() < 1e-10);
         assert!((result[1] - 110.0).abs() < 1e-10);
         assert!((result[2] - 165.0).abs() < 1e-10);
+        assert_eq!(
+            crate::forward_model::ForwardModel::n_params(&counts_model),
+            1
+        );
     }
 
     #[test]
@@ -1118,6 +1159,39 @@ mod tests {
             (fitted_temp - true_params[temp_index]).abs() < 10.0,
             "temperature fit={fitted_temp} truth={}",
             true_params[temp_index],
+        );
+    }
+
+    #[test]
+    fn test_poisson_fit_exact_optimum_without_analytical_jacobian_converges() {
+        let x: Vec<f64> = (0..20).map(|i| i as f64 * 0.5).collect();
+        let true_b = 0.5;
+        let flux: Vec<f64> = vec![1000.0; x.len()];
+
+        let model = ExponentialModel { x, flux };
+        let y_obs = model.evaluate(&[true_b]).unwrap();
+        let mut params = ParameterSet::new(vec![FitParameter::non_negative("b", true_b)]);
+        let config = PoissonConfig {
+            fd_step: 1e-4,
+            tol_param: 1e-12,
+            max_iter: 50,
+            ..PoissonConfig::default()
+        };
+
+        let result = poisson_fit(&model, &y_obs, &mut params, &config).unwrap();
+
+        assert!(
+            result.converged,
+            "exact-optimum FD fit should converge instead of exhausting line search"
+        );
+        assert!(
+            result.iterations < config.max_iter,
+            "fit should stop by convergence, not hit max_iter"
+        );
+        assert!(
+            (result.params[0] - true_b).abs() < 1e-6,
+            "parameter drifted away from optimum: {}",
+            result.params[0]
         );
     }
 }

@@ -604,6 +604,12 @@ pub fn levenberg_marquardt(
             .zip(delta.iter())
             .map(|(&v, &d)| v + d)
             .collect();
+        let param_change: f64 = delta
+            .iter()
+            .zip(free_vals_buf.iter())
+            .map(|(&d, &v)| (d / (v.abs() + PIVOT_FLOOR)).powi(2))
+            .sum::<f64>()
+            .sqrt();
         params.set_free_values(&trial_free);
 
         params.all_values_into(&mut all_vals_buf);
@@ -639,6 +645,9 @@ pub fn levenberg_marquardt(
             .map(|(&obs, &mdl)| obs - mdl)
             .collect();
         let trial_chi2 = chi_squared(&trial_residuals, &weights);
+        let chi2_delta = (trial_chi2 - chi2).abs();
+        let chi2_scale = chi2.abs().max(trial_chi2.abs()).max(1.0);
+        let chi2_stagnated = chi2_delta <= config.tol_chi2 * chi2_scale;
 
         if trial_chi2 < chi2 {
             // Accept step — cache y_trial so the next iteration can skip
@@ -653,18 +662,28 @@ pub fn levenberg_marquardt(
             // stopped moving.  The old third condition
             // `chi2 < tol_chi2 * n_data` was scale-dependent and could cause
             // premature convergence on data with small residuals.  (#108.2)
-            let param_change: f64 = delta
-                .iter()
-                .zip(free_vals_buf.iter())
-                .map(|(&d, &v)| (d / (v.abs() + PIVOT_FLOOR)).powi(2))
-                .sum::<f64>()
-                .sqrt();
-
             if rel_change < config.tol_chi2 || param_change < config.tol_param {
                 converged = true;
                 break;
             }
         } else {
+            // Numerical stagnation: the strict LM acceptance test keeps
+            // `trial_chi2 == chi2` in the reject path, but when both the
+            // objective change and parameter step are tiny we are already on a
+            // flat numerical floor and should report convergence instead of
+            // inflating lambda until breakout.
+            //
+            // Guard: only declare convergence if the fit is already on a
+            // numerically negligible chi² floor. This preserves the exact-fit
+            // flat-bottom fix without misclassifying a flat but poor model as
+            // converged.
+            let chi2_numerically_small = chi2 <= config.tol_chi2 * n_data as f64;
+            if chi2_stagnated && param_change < config.tol_param && chi2_numerically_small {
+                params.set_free_values(&free_vals_buf);
+                converged = true;
+                break;
+            }
+
             // Reject step, restore parameters.
             // y_current stays valid (parameters reverted to free_vals_buf snapshot).
             params.set_free_values(&free_vals_buf);
@@ -688,7 +707,7 @@ pub fn levenberg_marquardt(
     // inversion.  When `compute_covariance` is false (e.g. per-pixel spatial
     // mapping), we skip it entirely — the caller only needs densities and
     // chi-squared, not uncertainties.
-    let (covariance, uncertainties) = if config.compute_covariance {
+    let (covariance, uncertainties) = if converged && config.compute_covariance {
         let jacobian = compute_jacobian(
             model,
             params,
@@ -802,6 +821,39 @@ mod tests {
             result.params[1]
         );
         assert!(result.chi_squared < 1e-6);
+    }
+
+    #[test]
+    fn test_converges_on_exact_flat_bottom_without_lambda_breakout() {
+        // Exact data with zero initial damping reaches the optimum in one
+        // Newton step. The next iteration sits on a flat χ² floor where the
+        // strict `trial_chi2 < chi2` check must not force a false non-
+        // convergence.
+        let x: Vec<f64> = (0..10).map(|i| i as f64).collect();
+        let y_obs: Vec<f64> = x.iter().map(|&xi| 2.0 * xi + 3.0).collect();
+        let sigma = vec![1.0; 10];
+
+        let model = LinearModel { x };
+        let mut params = ParameterSet::new(vec![
+            FitParameter::unbounded("a", 0.0),
+            FitParameter::unbounded("b", 0.0),
+        ]);
+        let config = LmConfig {
+            lambda_init: 0.0,
+            ..LmConfig::default()
+        };
+
+        let result = levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &config).unwrap();
+
+        assert!(
+            result.converged,
+            "Fit should converge on an exact flat bottom"
+        );
+        assert!(result.chi_squared < 1e-20, "chi2 = {}", result.chi_squared);
+        assert!(
+            result.iterations < config.max_iter,
+            "LM should stop by convergence, not by iteration exhaustion"
+        );
     }
 
     #[test]
@@ -1089,6 +1141,11 @@ mod tests {
         assert!(
             !result.converged,
             "Flat model should not converge (lambda breakout)"
+        );
+        assert!(result.covariance.is_none(), "unconverged fit should not report covariance");
+        assert!(
+            result.uncertainties.is_none(),
+            "unconverged fit should not report uncertainties"
         );
     }
 

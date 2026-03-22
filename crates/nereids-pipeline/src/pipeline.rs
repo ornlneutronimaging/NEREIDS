@@ -739,6 +739,7 @@ fn fit_transmission_poisson(
             inv_sqrt_energies: inv_sqrt_e,
             b0_index: b0_idx,
             b1_index: b1_idx,
+            n_params: params.params.len(),
         };
         let pr = poisson::poisson_fit(&wrapped, measured_t, &mut params, poisson_cfg)?;
         poisson_to_lm_result(&wrapped, measured_t, sigma, &pr, &params)
@@ -748,11 +749,15 @@ fn fit_transmission_poisson(
     }?;
 
     let densities: Vec<f64> = (0..n_density_params).map(|i| result.params[i]).collect();
-    let uncertainties = result.covariance.as_ref().map(|cov| {
-        (0..n_density_params)
-            .map(|i| cov.get(i, i).sqrt())
-            .collect::<Vec<_>>()
-    });
+    let uncertainties = if result.converged {
+        result.covariance.as_ref().map(|cov| {
+            (0..n_density_params)
+                .map(|i| cov.get(i, i).sqrt())
+                .collect::<Vec<_>>()
+        })
+    } else {
+        None
+    };
 
     // Extract temperature from result if fitted.
     let fitted_temp = temperature_index.map(|idx| result.params[idx]);
@@ -816,6 +821,7 @@ fn fit_counts_poisson(
         transmission_model: &*t_model,
         flux,
         background,
+        n_params: params.params.len(),
     };
 
     let pr = poisson::poisson_fit(&counts_model, sample_counts, &mut params, poisson_cfg)?;
@@ -1036,30 +1042,39 @@ fn extract_result(
         (1.0, [0.0, 0.0, 0.0])
     };
 
-    let (uncertainties, temperature_k, temperature_k_unc) = match &result.uncertainties {
-        Some(unc_all) => {
-            let (temp_k, temp_unc) = if config.fit_temperature {
-                (
-                    Some(result.params[n_density_params]),
-                    Some(*unc_all.get(n_density_params).unwrap_or(&f64::NAN)),
-                )
-            } else {
-                (None, None)
-            };
-            let unc = unc_all
-                .get(..n_density_params)
-                .map(|s| s.to_vec())
-                .unwrap_or_else(|| vec![f64::NAN; n_density_params]);
-            (Some(unc), temp_k, temp_unc)
+    let (uncertainties, temperature_k, temperature_k_unc) = if result.converged {
+        match &result.uncertainties {
+            Some(unc_all) => {
+                let (temp_k, temp_unc) = if config.fit_temperature {
+                    (
+                        Some(result.params[n_density_params]),
+                        Some(*unc_all.get(n_density_params).unwrap_or(&f64::NAN)),
+                    )
+                } else {
+                    (None, None)
+                };
+                let unc = unc_all
+                    .get(..n_density_params)
+                    .map(|s| s.to_vec())
+                    .unwrap_or_else(|| vec![f64::NAN; n_density_params]);
+                (Some(unc), temp_k, temp_unc)
+            }
+            None => {
+                let temp_k = if config.fit_temperature {
+                    Some(result.params[n_density_params])
+                } else {
+                    None
+                };
+                (None, temp_k, None)
+            }
         }
-        None => {
-            let temp_k = if config.fit_temperature {
-                Some(result.params[n_density_params])
-            } else {
-                None
-            };
-            (None, temp_k, None)
-        }
+    } else {
+        let temp_k = if config.fit_temperature {
+            Some(result.params[n_density_params])
+        } else {
+            None
+        };
+        (None, temp_k, None)
     };
 
     Ok(SpectrumFitResult {
@@ -1311,6 +1326,39 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_result_drops_uncertainties_when_unconverged() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..21).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            293.6,
+            None,
+            vec![0.001],
+        )
+        .unwrap();
+
+        let result = LmResult {
+            chi_squared: 1.0,
+            reduced_chi_squared: 1.0,
+            iterations: 5,
+            converged: false,
+            params: vec![0.001],
+            covariance: Some(lm::FlatMatrix::zeros(1, 1)),
+            uncertainties: Some(vec![0.123]),
+        };
+
+        let extracted = extract_result(&config, &result, 1, None).unwrap();
+        assert!(!extracted.converged);
+        assert!(
+            extracted.uncertainties.is_none(),
+            "pipeline must not surface uncertainties from an unconverged fit"
+        );
+        assert!(extracted.temperature_k_unc.is_none());
+    }
+
+    #[test]
     fn test_typed_counts_kl_recovers_density() {
         let data = u238_single_resonance();
         let true_density = 0.0005;
@@ -1511,14 +1559,10 @@ mod tests {
         };
 
         let result = fit_spectrum_typed(&input, &config).unwrap();
-        // Noiseless synthetic data → chi2r ≈ 0 but LM may not flag "converged"
-        // because parameter-change tolerance is checked in a flat bottom.
         assert!(
-            result.converged || result.reduced_chi_squared < 1e-6,
-            "LM+BG should converge or reach chi2r≈0 (chi2r={}, iter={}, converged={})",
-            result.reduced_chi_squared,
-            result.iterations,
-            result.converged
+            result.converged,
+            "LM+BG should converge on noiseless synthetic data (chi2r={}, iter={})",
+            result.reduced_chi_squared, result.iterations
         );
         assert!(
             (result.densities[0] - true_density).abs() / true_density < 0.05,
