@@ -378,10 +378,9 @@ impl FitModel for TransmissionFitModel {
     /// - **Density columns**: `∂T/∂nᵢ = -σᵢ(E)·T(E)` using cached broadened XS
     ///   from the most recent `evaluate()` call.  Same formula as
     ///   `PrecomputedTransmissionModel`, zero extra broadening calls.
-    /// - **Temperature column**: single forward finite-difference perturbation
-    ///   at T+dT.  Requires one extra `broadened_cross_sections_from_base()`
-    ///   call, which is dramatically cheaper than the N_free calls the LM
-    ///   solver would make with a full FD Jacobian.
+    /// - **Temperature column**: analytical chain rule using cached `∂σ/∂T`
+    ///   from `evaluate()`.  `∂T/∂T_temp = -T(E) · Σᵢ nᵢ·rᵢ·∂σᵢ/∂T`.
+    ///   Zero extra broadening calls (derivative cached alongside σ).
     ///
     /// Returns `None` for the no-base_xs path (full forward model), which
     /// falls back to finite-difference in the LM solver.
