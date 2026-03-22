@@ -1142,7 +1142,10 @@ mod tests {
             !result.converged,
             "Flat model should not converge (lambda breakout)"
         );
-        assert!(result.covariance.is_none(), "unconverged fit should not report covariance");
+        assert!(
+            result.covariance.is_none(),
+            "unconverged fit should not report covariance"
+        );
         assert!(
             result.uncertainties.is_none(),
             "unconverged fit should not report uncertainties"

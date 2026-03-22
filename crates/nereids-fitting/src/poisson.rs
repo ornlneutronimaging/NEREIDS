@@ -820,57 +820,56 @@ pub fn poisson_fit(
                 break 'outer;
             }
 
-            let (search_dir, initial_alpha): (Vec<f64>, f64) = if let Some(ref analytical) =
-                analytical_step
-            {
-                let inactive_positions = inactive_free_positions(params, &free_idx_buf, &grad);
-                if inactive_positions.is_empty() {
-                    converged = true;
-                    break 'outer;
-                }
-                let reduced_fisher = extract_submatrix(&analytical.fisher, &inactive_positions);
-                let reduced_grad: Vec<f64> =
-                    inactive_positions.iter().map(|&pos| grad[pos]).collect();
-                let reduced_dir = crate::lm::solve_damped_system(
-                    &reduced_fisher,
-                    &reduced_grad,
-                    config.gauss_newton_lambda,
-                )
-                .unwrap_or_else(|| {
-                    reduced_grad
-                        .iter()
-                        .enumerate()
-                        .map(|(j, &g)| g / reduced_fisher.get(j, j).max(1e-12))
-                        .collect()
-                });
-                let mut dir = vec![0.0; grad.len()];
-                for (&pos, &value) in inactive_positions.iter().zip(reduced_dir.iter()) {
-                    dir[pos] = value;
-                }
-                (dir, config.step_size)
-            } else {
-                let inactive_positions = inactive_free_positions(params, &free_idx_buf, &grad);
-                if inactive_positions.is_empty() {
-                    converged = true;
-                    break 'outer;
-                }
-                let used_history = !fd_history.s_list.is_empty();
-                let mut dir = fd_history
-                    .apply_on_positions(&grad, &inactive_positions)
+            let (search_dir, initial_alpha): (Vec<f64>, f64) =
+                if let Some(ref analytical) = analytical_step {
+                    let inactive_positions = inactive_free_positions(params, &free_idx_buf, &grad);
+                    if inactive_positions.is_empty() {
+                        converged = true;
+                        break 'outer;
+                    }
+                    let reduced_fisher = extract_submatrix(&analytical.fisher, &inactive_positions);
+                    let reduced_grad: Vec<f64> =
+                        inactive_positions.iter().map(|&pos| grad[pos]).collect();
+                    let reduced_dir = crate::lm::solve_damped_system(
+                        &reduced_fisher,
+                        &reduced_grad,
+                        config.gauss_newton_lambda,
+                    )
                     .unwrap_or_else(|| {
-                        parameter_scaled_gradient_direction(params, &free_idx_buf, &grad)
+                        reduced_grad
+                            .iter()
+                            .enumerate()
+                            .map(|(j, &g)| g / reduced_fisher.get(j, j).max(1e-12))
+                            .collect()
                     });
-                let descent = dot(&grad, &dir);
-                if !descent.is_finite() || descent <= 0.0 {
-                    dir = parameter_scaled_gradient_direction(params, &free_idx_buf, &grad);
-                }
-                if used_history && descent.is_finite() && descent > 0.0 {
+                    let mut dir = vec![0.0; grad.len()];
+                    for (&pos, &value) in inactive_positions.iter().zip(reduced_dir.iter()) {
+                        dir[pos] = value;
+                    }
                     (dir, config.step_size)
                 } else {
-                    let search_norm: f64 = dir.iter().map(|d| d * d).sum::<f64>().sqrt();
-                    (dir, config.step_size / search_norm.max(1.0))
-                }
-            };
+                    let inactive_positions = inactive_free_positions(params, &free_idx_buf, &grad);
+                    if inactive_positions.is_empty() {
+                        converged = true;
+                        break 'outer;
+                    }
+                    let used_history = !fd_history.s_list.is_empty();
+                    let mut dir = fd_history
+                        .apply_on_positions(&grad, &inactive_positions)
+                        .unwrap_or_else(|| {
+                            parameter_scaled_gradient_direction(params, &free_idx_buf, &grad)
+                        });
+                    let descent = dot(&grad, &dir);
+                    if !descent.is_finite() || descent <= 0.0 {
+                        dir = parameter_scaled_gradient_direction(params, &free_idx_buf, &grad);
+                    }
+                    if used_history && descent.is_finite() && descent > 0.0 {
+                        (dir, config.step_size)
+                    } else {
+                        let search_norm: f64 = dir.iter().map(|d| d * d).sum::<f64>().sqrt();
+                        (dir, config.step_size / search_norm.max(1.0))
+                    }
+                };
 
             params.free_values_into(&mut free_vals_buf);
             old_free_buf.clear();
