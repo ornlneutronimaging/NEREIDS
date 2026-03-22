@@ -122,6 +122,57 @@ fn poisson_nll_term(obs: f64, mdl: f64) -> f64 {
     }
 }
 
+/// Per-bin Poisson NLL weight: ∂f(obs, mdl)/∂mdl.
+///
+/// For mdl > ε: w = 1 - obs/mdl
+/// For mdl ≤ ε: derivative of the smooth quadratic extrapolation,
+///   w = grad_eps - hess_eps · (ε - mdl), continuous at boundary.
+#[inline]
+fn poisson_nll_weight(obs: f64, mdl: f64) -> f64 {
+    if mdl > POISSON_EPSILON {
+        1.0 - obs / mdl
+    } else {
+        let eps = POISSON_EPSILON;
+        let grad_eps = 1.0 - obs / eps;
+        let hess_eps = if obs > 0.0 {
+            obs / (eps * eps)
+        } else {
+            1.0 / eps
+        };
+        grad_eps - hess_eps * (eps - mdl)
+    }
+}
+
+/// Compute gradient of Poisson NLL using the analytical Jacobian.
+///
+/// `grad_j = Σᵢ wᵢ · J_{i,j}` where `wᵢ = ∂NLL/∂y_model_i`
+/// and `J_{i,j} = ∂y_model_i/∂θⱼ` from `model.analytical_jacobian()`.
+///
+/// Returns `Some(gradient)` if the model provides an analytical Jacobian,
+/// `None` otherwise (caller should fall back to finite differences).
+fn compute_gradient_analytical(
+    model: &dyn FitModel,
+    params: &ParameterSet,
+    y_obs: &[f64],
+    y_model: &[f64],
+    all_vals_buf: &mut Vec<f64>,
+    free_idx_buf: &mut Vec<usize>,
+) -> Option<Vec<f64>> {
+    params.all_values_into(all_vals_buf);
+    params.free_indices_into(free_idx_buf);
+    let jac = model.analytical_jacobian(all_vals_buf, free_idx_buf, y_model)?;
+    let n_e = y_obs.len();
+    let n_free = free_idx_buf.len();
+    let mut grad = vec![0.0f64; n_free];
+    for i in 0..n_e {
+        let w = poisson_nll_weight(y_obs[i], y_model[i]);
+        for (g, j) in grad.iter_mut().zip(0..n_free) {
+            *g += w * jac.get(i, j);
+        }
+    }
+    Some(grad)
+}
+
 /// Compute gradient of Poisson NLL by finite differences.
 ///
 /// `all_vals_buf` is a reusable scratch buffer for `params.all_values_into()`,
@@ -213,8 +264,9 @@ fn project(params: &mut ParameterSet) {
 ///   reused across backtracking iterations to avoid up to 50 allocations.
 ///
 /// # Returns
-/// `Some(new_nll)` if a step was accepted, `None` if the line search exhausted
-/// all backtracking attempts without finding an acceptable step.
+/// `Some((new_nll, y_model))` if a step was accepted, `None` if the line search
+/// exhausted all backtracking attempts. Returns the model output alongside NLL
+/// so the caller can cache it for the next analytical gradient computation.
 ///
 /// # Failure contract
 ///
@@ -236,7 +288,7 @@ fn backtracking_line_search(
     all_vals_buf: &mut Vec<f64>,
     free_vals_buf: &mut Vec<f64>,
     trial_free_buf: &mut Vec<f64>,
-) -> Option<f64> {
+) -> Option<(f64, Vec<f64>)> {
     let mut alpha = initial_alpha;
     for _ in 0..50 {
         // Trial step: x_new = project(x - alpha * search_dir)
@@ -278,7 +330,7 @@ fn backtracking_line_search(
             .sum::<f64>();
 
         if trial_nll.is_finite() && trial_nll <= nll - config.armijo_c * descent {
-            return Some(trial_nll);
+            return Some((trial_nll, trial_model));
         }
 
         // Backtrack
@@ -356,7 +408,7 @@ pub fn poisson_fit(
     let mut free_idx_buf: Vec<usize> = Vec::with_capacity(params.n_free());
 
     params.all_values_into(&mut all_vals_buf);
-    let y_model = model.evaluate(&all_vals_buf)?;
+    let mut y_model = model.evaluate(&all_vals_buf)?;
     let mut nll = poisson_nll(y_obs, &y_model);
 
     // Guard: if the initial NLL is non-finite, bail out immediately rather
@@ -376,15 +428,28 @@ pub fn poisson_fit(
     for _ in 0..config.max_iter {
         iter += 1;
 
-        // Compute gradient
-        let grad = compute_gradient(
+        // Compute gradient: try analytical (grad = J^T · w) first,
+        // fall back to finite differences if the model doesn't provide
+        // an analytical Jacobian.
+        let grad = if let Some(analytical_grad) = compute_gradient_analytical(
             model,
             params,
             y_obs,
-            config.fd_step,
+            &y_model,
             &mut all_vals_buf,
             &mut free_idx_buf,
-        )?;
+        ) {
+            analytical_grad
+        } else {
+            compute_gradient(
+                model,
+                params,
+                y_obs,
+                config.fd_step,
+                &mut all_vals_buf,
+                &mut free_idx_buf,
+            )?
+        };
 
         // Check gradient norm for convergence
         let grad_norm: f64 = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
@@ -444,7 +509,10 @@ pub fn poisson_fit(
             &mut free_vals_buf,
             &mut trial_free_buf,
         ) {
-            Some(new_nll) => nll = new_nll,
+            Some((new_nll, new_y_model)) => {
+                nll = new_nll;
+                y_model = new_y_model;
+            }
             None => {
                 // Can't improve from this point; stop without claiming convergence.
                 // (params already restored by backtracking_line_search)
@@ -527,6 +595,36 @@ impl<'a> FitModel for CountsModel<'a> {
             .zip(self.background.iter())
             .map(|((&t, &f), &b)| f * t + b)
             .collect())
+    }
+
+    /// Analytical Jacobian: ∂Y/∂θ = flux · ∂T_inner/∂θ.
+    ///
+    /// Background is constant w.r.t. θ and drops out.
+    fn analytical_jacobian(
+        &self,
+        params: &[f64],
+        free_param_indices: &[usize],
+        y_current: &[f64],
+    ) -> Option<FlatMatrix> {
+        let n_e = y_current.len();
+        // Recover inner transmission: T = (Y - background) / flux
+        let t_inner: Vec<f64> = y_current
+            .iter()
+            .zip(self.flux.iter())
+            .zip(self.background.iter())
+            .map(|((&y, &f), &b)| if f.abs() > 1e-30 { (y - b) / f } else { 0.0 })
+            .collect();
+        let inner_jac =
+            self.transmission_model
+                .analytical_jacobian(params, free_param_indices, &t_inner)?;
+        let n_free = free_param_indices.len();
+        let mut jac = FlatMatrix::zeros(n_e, n_free);
+        for i in 0..n_e {
+            for j in 0..n_free {
+                *jac.get_mut(i, j) = self.flux[i] * inner_jac.get(i, j);
+            }
+        }
+        Some(jac)
     }
 }
 
