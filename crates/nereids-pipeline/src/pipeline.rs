@@ -727,6 +727,16 @@ fn fit_transmission_poisson(
 
     let model = build_transmission_model(config, n_density_params, temperature_index)?;
 
+    let polish_cfg = if kl_bg.is_some() && temperature_index.is_some() {
+        let mut cfg = poisson_cfg.clone();
+        cfg.max_iter = cfg.max_iter.clamp(20, 80);
+        cfg.tol_param = (cfg.tol_param * 1e-3).max(1e-12);
+        cfg.gauss_newton_lambda = (cfg.gauss_newton_lambda * 0.1).max(1e-8);
+        Some(cfg)
+    } else {
+        None
+    };
+
     // Dispatch with KL-native background model or bare model.
     let result = if let Some((b0_idx, b1_idx)) = kl_bg {
         let inv_sqrt_e: Vec<f64> = config
@@ -741,7 +751,18 @@ fn fit_transmission_poisson(
             b1_index: b1_idx,
             n_params: params.params.len(),
         };
-        let pr = poisson::poisson_fit(&wrapped, measured_t, &mut params, poisson_cfg)?;
+        let mut pr = poisson::poisson_fit(&wrapped, measured_t, &mut params, poisson_cfg)?;
+        if pr.converged {
+            if let Some(ref polish) = polish_cfg {
+                let polish_result = poisson::poisson_fit(&wrapped, measured_t, &mut params, polish)?;
+                if polish_result.converged {
+                    pr = poisson::PoissonResult {
+                        iterations: pr.iterations + polish_result.iterations,
+                        ..polish_result
+                    };
+                }
+            }
+        }
         poisson_to_lm_result(&wrapped, measured_t, sigma, &pr, &params)
     } else {
         let pr = poisson::poisson_fit(&*model, measured_t, &mut params, poisson_cfg)?;
@@ -1814,5 +1835,99 @@ mod tests {
             "group density: fitted={fitted}, true={true_density}, rel_error={rel_error}"
         );
         assert!(result.converged, "fit should converge");
+    }
+
+    #[test]
+    fn test_grouped_poisson_kl_with_temperature_and_background_noiseless() {
+        use nereids_core::types::IsotopeGroup;
+
+        let rd1 = synthetic_single_resonance(72, 176, 8.5, 5.0);
+        let rd2 = synthetic_single_resonance(72, 178, 17.0, 7.5);
+        let rd3 = synthetic_single_resonance(72, 180, 29.0, 6.0);
+
+        let hf176 = nereids_core::types::Isotope::new(72, 176).unwrap();
+        let hf178 = nereids_core::types::Isotope::new(72, 178).unwrap();
+        let hf180 = nereids_core::types::Isotope::new(72, 180).unwrap();
+        let group = IsotopeGroup::custom(
+            "Hf-like (3 member)".into(),
+            vec![(hf176, 0.2), (hf178, 0.5), (hf180, 0.3)],
+        )
+        .unwrap();
+
+        let energies: Vec<f64> = (0..300)
+            .map(|i| 1.0 + (49.0 * i as f64) / 299.0)
+            .collect();
+        let true_density = 0.001;
+        let true_temp = 400.0;
+        let true_b0 = 0.012;
+        let true_b1 = 0.008;
+
+        let sample = nereids_physics::transmission::SampleParams::new(
+            true_temp,
+            vec![
+                (rd1.clone(), true_density * 0.2),
+                (rd2.clone(), true_density * 0.5),
+                (rd3.clone(), true_density * 0.3),
+            ],
+        )
+        .unwrap();
+        let pure_t =
+            nereids_physics::transmission::forward_model(&energies, &sample, None).unwrap();
+        let measured_t: Vec<f64> = pure_t
+            .iter()
+            .zip(energies.iter())
+            .map(|(&t, &e)| t + true_b0 + true_b1 / e.sqrt())
+            .collect();
+        let sigma = vec![0.001; energies.len()];
+
+        let config = UnifiedFitConfig::new(
+            energies.clone(),
+            vec![rd1.clone()],
+            vec!["placeholder".into()],
+            293.6,
+            None,
+            vec![0.0008],
+        )
+        .unwrap()
+        .with_groups(&[(&group, &[rd1, rd2, rd3])], vec![0.0008])
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig {
+            max_iter: 200,
+            gauss_newton_lambda: 1e-4,
+            ..PoissonConfig::default()
+        }))
+        .with_fit_temperature(true)
+        .with_transmission_background(BackgroundConfig::default());
+
+        let input = InputData::Transmission {
+            transmission: measured_t,
+            uncertainty: sigma,
+        };
+
+        let result = fit_spectrum_typed(&input, &config).unwrap();
+
+        assert!(result.converged, "fit did not converge: {result:?}");
+        assert!(
+            (result.densities[0] - true_density).abs() / true_density < 0.005,
+            "density: fitted={}, true={true_density}",
+            result.densities[0]
+        );
+        let fitted_temp = result
+            .temperature_k
+            .expect("temperature_k should be Some when fit_temperature=true");
+        assert!(
+            (fitted_temp - true_temp).abs() < 8.0,
+            "temperature: fitted={fitted_temp}, true={true_temp}",
+        );
+        assert!(
+            (result.background[0] - true_b0).abs() < 5e-3,
+            "background b0: fitted={}, true={true_b0}",
+            result.background[0]
+        );
+        assert!(
+            (result.background[1] - true_b1).abs() < 5e-3,
+            "background b1: fitted={}, true={true_b1}",
+            result.background[1]
+        );
     }
 }
