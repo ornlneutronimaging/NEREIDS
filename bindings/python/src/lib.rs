@@ -2667,7 +2667,8 @@ fn py_fit_spectrum_typed<'py>(
         )?
     };
 
-    // Solver
+    // Solver — is_counts=false because this function only accepts transmission+uncertainty,
+    // so "auto" always resolves to LM (the signature default is "lm" to match).
     let solver_config = parse_solver_config(solver, false, max_iter)?;
     config = config.with_solver(solver_config);
 

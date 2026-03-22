@@ -477,10 +477,26 @@ impl IsotopeGroup {
                 "no natural isotopes for Z={z}"
             )));
         }
+        // Normalize ratios to sum to exactly 1.0 (IUPAC data may have
+        // rounding errors in the last decimal place).
+        let total: f64 = isotopes.iter().map(|(_, r)| r).sum();
+        if !total.is_finite() || total <= 0.0 {
+            return Err(NereidsError::InvalidParameter(format!(
+                "natural isotope abundances for Z={z} sum to {total} (expected ~1.0)"
+            )));
+        }
+        let members: Vec<_> = if (total - 1.0).abs() > 1e-10 {
+            isotopes
+                .into_iter()
+                .map(|(iso, r)| (iso, r / total))
+                .collect()
+        } else {
+            isotopes
+        };
         let sym = elements::element_symbol(z).unwrap_or("?");
         Ok(Self {
             name: format!("{sym} (nat)"),
-            members: isotopes,
+            members,
         })
     }
 

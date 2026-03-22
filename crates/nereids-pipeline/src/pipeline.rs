@@ -628,7 +628,7 @@ fn fit_transmission_lm(
     config: &UnifiedFitConfig,
     lm_config: &LmConfig,
 ) -> Result<SpectrumFitResult, PipelineError> {
-    let n_isotopes = config.n_density_params();
+    let n_density_params = config.n_density_params();
 
     // Build parameter vector
     let mut param_vec = build_density_params(config);
@@ -642,7 +642,7 @@ fn fit_transmission_lm(
             upper: 5000.0,
             fixed: false,
         });
-        Some(n_isotopes)
+        Some(n_density_params)
     } else {
         None
     };
@@ -661,7 +661,7 @@ fn fit_transmission_lm(
     lm_cfg.compute_covariance = config.compute_covariance;
 
     // Build model
-    let model = build_transmission_model(config, n_isotopes, _temperature_index)?;
+    let model = build_transmission_model(config, n_density_params, _temperature_index)?;
 
     // Dispatch with optional background wrapping
     let result = if let Some((ai, bai, bbi, bci)) = bg_indices {
@@ -672,7 +672,7 @@ fn fit_transmission_lm(
         lm::levenberg_marquardt(&*model, measured_t, sigma, &mut params, &lm_cfg)?
     };
 
-    extract_result(config, &result, n_isotopes, bg_indices)
+    extract_result(config, &result, n_density_params, bg_indices)
 }
 
 /// Transmission + Poisson KL path.
@@ -692,7 +692,7 @@ fn fit_transmission_poisson(
         ));
     }
 
-    let n_isotopes = config.n_density_params();
+    let n_density_params = config.n_density_params();
 
     let mut param_vec = build_density_params(config);
 
@@ -735,7 +735,7 @@ fn fit_transmission_poisson(
 
     let mut params = ParameterSet::new(param_vec);
 
-    let model = build_transmission_model(config, n_isotopes, temperature_index)?;
+    let model = build_transmission_model(config, n_density_params, temperature_index)?;
 
     // Dispatch with KL-native background model or bare model.
     let result = if let Some((b0_idx, b1_idx)) = kl_bg {
@@ -757,9 +757,9 @@ fn fit_transmission_poisson(
         poisson_to_lm_result(&*model, measured_t, sigma, &pr, &params)
     }?;
 
-    let densities: Vec<f64> = (0..n_isotopes).map(|i| result.params[i]).collect();
+    let densities: Vec<f64> = (0..n_density_params).map(|i| result.params[i]).collect();
     let uncertainties = result.covariance.as_ref().map(|cov| {
-        (0..n_isotopes)
+        (0..n_density_params)
             .map(|i| cov.get(i, i).sqrt())
             .collect::<Vec<_>>()
     });
@@ -782,7 +782,7 @@ fn fit_transmission_poisson(
             background: [b0, b1, 0.0],
         })
     } else {
-        let mut sr = extract_result(config, &result, n_isotopes, None)?;
+        let mut sr = extract_result(config, &result, n_density_params, None)?;
         if let Some(t) = fitted_temp {
             sr.temperature_k = Some(t);
         }
@@ -798,7 +798,7 @@ fn fit_counts_poisson(
     config: &UnifiedFitConfig,
     poisson_cfg: &PoissonConfig,
 ) -> Result<SpectrumFitResult, PipelineError> {
-    let n_isotopes = config.n_density_params();
+    let n_density_params = config.n_density_params();
 
     let mut param_vec = build_density_params(config);
 
@@ -819,7 +819,7 @@ fn fit_counts_poisson(
 
     let mut params = ParameterSet::new(param_vec);
 
-    let t_model = build_transmission_model(config, n_isotopes, temperature_index)?;
+    let t_model = build_transmission_model(config, n_density_params, temperature_index)?;
 
     // Wrap in counts model: Y = flux * T(theta) + background
     let counts_model = poisson::CountsModel {
@@ -843,7 +843,7 @@ fn fit_counts_poisson(
         })
         .sum();
 
-    let densities: Vec<f64> = (0..n_isotopes).map(|i| pr.params[i]).collect();
+    let densities: Vec<f64> = (0..n_density_params).map(|i| pr.params[i]).collect();
     let fitted_temp = temperature_index.map(|idx| pr.params[idx]);
 
     Ok(SpectrumFitResult {
@@ -938,7 +938,7 @@ fn append_background_params(param_vec: &mut Vec<FitParameter>, bg: &BackgroundCo
 /// Build the transmission forward model, selecting precomputed or full path.
 fn build_transmission_model(
     config: &UnifiedFitConfig,
-    n_isotopes: usize,
+    n_density_params: usize,
     temperature_index: Option<usize>,
 ) -> Result<Box<dyn FitModel>, PipelineError> {
     let n_params = config.n_density_params();
@@ -981,11 +981,11 @@ fn build_transmission_model(
     let density_ratios = config
         .density_ratios
         .clone()
-        .unwrap_or_else(|| vec![1.0; n_isotopes]);
+        .unwrap_or_else(|| vec![1.0; n_density_params]);
     let density_indices = config
         .density_indices
         .clone()
-        .unwrap_or_else(|| (0..n_isotopes).collect());
+        .unwrap_or_else(|| (0..n_density_params).collect());
     Ok(Box::new(TransmissionFitModel::new(
         config.energies.clone(),
         config.resonance_data.clone(),
@@ -1032,10 +1032,10 @@ fn poisson_to_lm_result(
 fn extract_result(
     config: &UnifiedFitConfig,
     result: &LmResult,
-    n_isotopes: usize,
+    n_density_params: usize,
     bg_indices: Option<(usize, usize, usize, usize)>,
 ) -> Result<SpectrumFitResult, PipelineError> {
-    let densities: Vec<f64> = (0..n_isotopes).map(|i| result.params[i]).collect();
+    let densities: Vec<f64> = (0..n_density_params).map(|i| result.params[i]).collect();
 
     let (anorm, background) = if let Some((ai, bai, bbi, bci)) = bg_indices {
         (
@@ -1050,21 +1050,21 @@ fn extract_result(
         Some(unc_all) => {
             let (temp_k, temp_unc) = if config.fit_temperature {
                 (
-                    Some(result.params[n_isotopes]),
-                    Some(*unc_all.get(n_isotopes).unwrap_or(&f64::NAN)),
+                    Some(result.params[n_density_params]),
+                    Some(*unc_all.get(n_density_params).unwrap_or(&f64::NAN)),
                 )
             } else {
                 (None, None)
             };
             let unc = unc_all
-                .get(..n_isotopes)
+                .get(..n_density_params)
                 .map(|s| s.to_vec())
-                .unwrap_or_else(|| vec![f64::NAN; n_isotopes]);
+                .unwrap_or_else(|| vec![f64::NAN; n_density_params]);
             (Some(unc), temp_k, temp_unc)
         }
         None => {
             let temp_k = if config.fit_temperature {
-                Some(result.params[n_isotopes])
+                Some(result.params[n_density_params])
             } else {
                 None
             };
