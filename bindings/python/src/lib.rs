@@ -10,7 +10,8 @@
 //!
 //! ## Typed Input Data API
 //!
-//! Use `from_counts()` or `from_transmission()` to create typed input data,
+//! Use `from_counts()`, `from_counts_with_nuisance()`, or `from_transmission()`
+//! to create typed input data,
 //! then pass to `spatial_map_typed()` for per-pixel fitting:
 //!
 //! - **Counts** → Poisson KL (statistically optimal for raw detector counts)
@@ -2073,9 +2074,11 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyInputData>()?;
     m.add_class::<PyIsotopeGroup>()?;
     m.add_function(wrap_pyfunction!(py_from_counts, m)?)?;
+    m.add_function(wrap_pyfunction!(py_from_counts_with_nuisance, m)?)?;
     m.add_function(wrap_pyfunction!(py_from_transmission, m)?)?;
     m.add_function(wrap_pyfunction!(py_spatial_map_typed, m)?)?;
     m.add_function(wrap_pyfunction!(py_fit_spectrum_typed, m)?)?;
+    m.add_function(wrap_pyfunction!(py_fit_counts_spectrum_typed, m)?)?;
     Ok(())
 }
 
@@ -2086,7 +2089,7 @@ use nereids_pipeline::spatial::{InputData3D, spatial_map_typed};
 
 /// Opaque wrapper around InputData3D for Python.
 ///
-/// Created via `from_counts()` or `from_transmission()`.
+/// Created via `from_counts()`, `from_counts_with_nuisance()`, or `from_transmission()`.
 /// Passed to `spatial_map_typed()`.
 #[pyclass(name = "InputData")]
 struct PyInputData {
@@ -2095,6 +2098,7 @@ struct PyInputData {
     kind: String, // "counts" or "transmission"
     data_a: ndarray::Array3<f64>,
     data_b: ndarray::Array3<f64>,
+    data_c: Option<ndarray::Array3<f64>>,
 }
 
 #[pymethods]
@@ -2157,6 +2161,48 @@ fn py_from_counts<'py>(
         kind: "counts".into(),
         data_a: sample,
         data_b: ob,
+        data_c: None,
+    })
+}
+
+/// Create InputData from raw detector counts plus explicit nuisance spectra.
+///
+/// Use this when the detector/counts background spectrum has been estimated
+/// outside NEREIDS and should be supplied explicitly.
+#[pyfunction]
+#[pyo3(name = "from_counts_with_nuisance")]
+fn py_from_counts_with_nuisance<'py>(
+    sample_counts: PyReadonlyArray3<'py, f64>,
+    flux: PyReadonlyArray3<'py, f64>,
+    background: PyReadonlyArray3<'py, f64>,
+) -> PyResult<PyInputData> {
+    let sample = sample_counts.as_array().to_owned();
+    let flux_arr = flux.as_array().to_owned();
+    let background_arr = background.as_array().to_owned();
+    if sample.shape() != flux_arr.shape() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "sample shape {:?} != flux shape {:?}",
+            sample.shape(),
+            flux_arr.shape()
+        )));
+    }
+    if sample.shape() != background_arr.shape() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "sample shape {:?} != background shape {:?}",
+            sample.shape(),
+            background_arr.shape()
+        )));
+    }
+    if sample.shape()[0] == 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "spectral axis (dimension 0) must have at least 1 element",
+        ));
+    }
+    Ok(PyInputData {
+        kind: "counts_with_nuisance".into(),
+        data_a: sample,
+        data_b: flux_arr,
+        data_c: Some(background_arr),
     })
 }
 
@@ -2198,6 +2244,7 @@ fn py_from_transmission<'py>(
         kind: "transmission".into(),
         data_a: t,
         data_b: u,
+        data_c: None,
     })
 }
 
@@ -2374,7 +2421,8 @@ fn spatial_result_to_py(
 /// Always returns SpatialResult.
 ///
 /// Args:
-///     data: InputData from from_counts() or from_transmission().
+///     data: InputData from `from_counts()`, `from_counts_with_nuisance()`,
+///         or `from_transmission()`.
 ///     energies: 1D energy grid in eV (ascending).
 ///     isotopes: list of ResonanceData objects (mutually exclusive with groups).
 ///     temperature_k: Sample temperature in Kelvin (default 293.6).
@@ -2387,6 +2435,12 @@ fn spatial_result_to_py(
 ///         For transmission data this uses the transmission-domain background model.
 ///         For counts data this enables the same transmission background inside the
 ///         count-domain KL/LM pipelines.
+///     fit_alpha_1: Fit counts nuisance flux scale `alpha_1` when using
+///         `from_counts_with_nuisance()`.
+///     fit_alpha_2: Fit detector-background scale `alpha_2` when using
+///         `from_counts_with_nuisance()`.
+///     alpha_1_init: Initial value for `alpha_1` (default 1.0).
+///     alpha_2_init: Initial value for `alpha_2` (default 1.0).
 ///     resolution: Optional resolution function.
 ///     groups: list of IsotopeGroup objects (mutually exclusive with isotopes).
 ///
@@ -2402,6 +2456,10 @@ fn spatial_result_to_py(
     max_iter = 200,
     solver = "auto",
     background = false,
+    fit_alpha_1 = false,
+    fit_alpha_2 = false,
+    alpha_1_init = 1.0,
+    alpha_2_init = 1.0,
     resolution = None,
     flight_path_m = None,
     delta_t_us = None,
@@ -2420,6 +2478,10 @@ fn py_spatial_map_typed<'py>(
     max_iter: usize,
     solver: &str,
     background: bool,
+    fit_alpha_1: bool,
+    fit_alpha_2: bool,
+    alpha_1_init: f64,
+    alpha_2_init: f64,
     resolution: Option<PyTabulatedResolution>,
     flight_path_m: Option<f64>,
     delta_t_us: Option<f64>,
@@ -2501,18 +2563,39 @@ fn py_spatial_map_typed<'py>(
         config = config
             .with_transmission_background(nereids_pipeline::pipeline::BackgroundConfig::default());
     }
+    if fit_alpha_1 || fit_alpha_2 || alpha_1_init != 1.0 || alpha_2_init != 1.0 {
+        if data.kind != "counts_with_nuisance" {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "counts background scaling requires from_counts_with_nuisance() input",
+            ));
+        }
+        config = config.with_counts_background(nereids_pipeline::pipeline::CountsBackgroundConfig {
+            alpha_1_init,
+            alpha_2_init,
+            fit_alpha_1,
+            fit_alpha_2,
+        });
+    }
 
     // Build InputData3D from the PyInputData
-    let input = if data.kind == "counts" {
-        InputData3D::Counts {
+    let input = match data.kind.as_str() {
+        "counts" => InputData3D::Counts {
             sample_counts: data.data_a.view(),
             open_beam_counts: data.data_b.view(),
-        }
-    } else {
-        InputData3D::Transmission {
+        },
+        "counts_with_nuisance" => InputData3D::CountsWithNuisance {
+            sample_counts: data.data_a.view(),
+            flux: data.data_b.view(),
+            background: data
+                .data_c
+                .as_ref()
+                .expect("counts_with_nuisance requires background data")
+                .view(),
+        },
+        _ => InputData3D::Transmission {
             transmission: data.data_a.view(),
             uncertainty: data.data_b.view(),
-        }
+        },
     };
 
     // Dead pixels
@@ -2526,6 +2609,220 @@ fn py_spatial_map_typed<'py>(
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
     Ok(spatial_result_to_py(py, &result))
+}
+
+/// Fit a single raw-count spectrum using the typed input data API.
+///
+/// Either `isotopes` or `groups` must be provided, but not both.
+///
+/// Args:
+///     sample_counts: 1D sample counts spectrum.
+///     open_beam_counts: 1D open-beam counts reference.
+///     energies: 1D energy grid in eV (ascending).
+///     isotopes: list of (ResonanceData, initial_density) tuples (mutually exclusive with groups).
+///     temperature_k: Sample temperature in Kelvin (default 293.6).
+///     fit_temperature: Whether to fit temperature (default False).
+///     max_iter: Maximum iterations (default 200).
+///     solver: "lm" (default), "kl", or "auto".
+///     background: Enable transmission-lift background inside the counts fit.
+///     detector_background: Optional detector/counts background reference.
+///     fit_alpha_1: Fit flux-scale nuisance parameter `alpha_1`.
+///     fit_alpha_2: Fit detector-background scale nuisance parameter `alpha_2`.
+///     alpha_1_init: Initial value for `alpha_1` (default 1.0).
+///     alpha_2_init: Initial value for `alpha_2` (default 1.0).
+///     resolution: Optional resolution function.
+///     groups: list of IsotopeGroup objects (mutually exclusive with isotopes).
+///     initial_densities: Initial density guesses when using groups (default 0.001 each).
+///
+/// Returns:
+///     FitResult with densities, uncertainties, chi2, etc.
+///
+/// For raw-count fitting, use `fit_counts_spectrum_typed(...)`.
+#[pyfunction]
+#[pyo3(name = "fit_counts_spectrum_typed", signature = (
+    sample_counts, open_beam_counts, energies, isotopes=None, *,
+    temperature_k = 293.6,
+    fit_temperature = false,
+    max_iter = 200,
+    solver = "auto",
+    background = false,
+    detector_background = None,
+    fit_alpha_1 = false,
+    fit_alpha_2 = false,
+    alpha_1_init = 1.0,
+    alpha_2_init = 1.0,
+    resolution = None,
+    flight_path_m = None,
+    delta_t_us = None,
+    delta_l_m = None,
+    groups = None,
+    initial_densities = None,
+))]
+fn py_fit_counts_spectrum_typed<'py>(
+    py: Python<'py>,
+    sample_counts: PyReadonlyArray1<'py, f64>,
+    open_beam_counts: PyReadonlyArray1<'py, f64>,
+    energies: PyReadonlyArray1<'py, f64>,
+    isotopes: Option<Vec<(PyResonanceData, f64)>>,
+    temperature_k: f64,
+    fit_temperature: bool,
+    max_iter: usize,
+    solver: &str,
+    background: bool,
+    detector_background: Option<PyReadonlyArray1<'py, f64>>,
+    fit_alpha_1: bool,
+    fit_alpha_2: bool,
+    alpha_1_init: f64,
+    alpha_2_init: f64,
+    resolution: Option<PyTabulatedResolution>,
+    flight_path_m: Option<f64>,
+    delta_t_us: Option<f64>,
+    delta_l_m: Option<f64>,
+    groups: Option<Vec<PyIsotopeGroup>>,
+    initial_densities: Option<Vec<f64>>,
+) -> PyResult<PyFitResult> {
+    use nereids_pipeline::pipeline::{
+        fit_spectrum_typed, CountsBackgroundConfig, InputData, UnifiedFitConfig,
+    };
+
+    let has_isotopes = isotopes.is_some();
+    let has_groups = groups.is_some();
+    if has_isotopes && has_groups {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Provide either 'isotopes' or 'groups', not both.",
+        ));
+    }
+    if !has_isotopes && !has_groups {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Must provide either 'isotopes' or 'groups'.",
+        ));
+    }
+
+    let sample_slice = sample_counts.as_slice()?;
+    let ob_slice = open_beam_counts.as_slice()?;
+    let e_slice = energies.as_slice()?;
+    if sample_slice.len() != ob_slice.len() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "sample_counts length ({}) must match open_beam_counts length ({})",
+            sample_slice.len(),
+            ob_slice.len(),
+        )));
+    }
+    if sample_slice.len() != e_slice.len() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "sample_counts length ({}) must match energies length ({})",
+            sample_slice.len(),
+            e_slice.len(),
+        )));
+    }
+    require_non_empty_energy_grid(e_slice)?;
+
+    let detector_background_vec = if let Some(bg) = detector_background {
+        let bg_slice = bg.as_slice()?;
+        if bg_slice.len() != sample_slice.len() {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "detector_background length ({}) must match sample_counts length ({})",
+                bg_slice.len(),
+                sample_slice.len(),
+            )));
+        }
+        Some(bg_slice.to_vec())
+    } else {
+        None
+    };
+    if fit_alpha_2 && detector_background_vec.is_none() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "fit_alpha_2 requires detector_background to be provided",
+        ));
+    }
+
+    let energies_vec = e_slice.to_vec();
+    let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution, None)?;
+
+    let mut config = if let Some(isotopes) = isotopes {
+        let iso_names: Vec<String> = isotopes
+            .iter()
+            .map(|(d, _)| {
+                let sym =
+                    nereids_core::elements::element_symbol(d.inner.isotope.z()).unwrap_or("?");
+                format!("{}-{}", sym, d.inner.isotope.a())
+            })
+            .collect();
+        let init_densities: Vec<f64> = isotopes.iter().map(|(_, d)| *d).collect();
+        let resonance_data: Vec<ResonanceData> = isotopes
+            .into_iter()
+            .map(|(d, _)| Arc::unwrap_or_clone(d.inner))
+            .collect();
+
+        UnifiedFitConfig::new(
+            energies_vec,
+            resonance_data,
+            iso_names,
+            temperature_k,
+            res_fn,
+            init_densities,
+        )
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?
+    } else {
+        let groups = groups.unwrap();
+        if groups.is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "groups list must not be empty",
+            ));
+        }
+        build_config_from_groups(
+            &groups,
+            energies_vec,
+            temperature_k,
+            res_fn,
+            initial_densities,
+        )?
+    };
+
+    config = config.with_solver(parse_solver_config(solver, true, max_iter)?);
+    if fit_temperature {
+        config = config.with_fit_temperature(true);
+    }
+    if background {
+        config = config
+            .with_transmission_background(nereids_pipeline::pipeline::BackgroundConfig::default());
+    }
+    if fit_alpha_1 || fit_alpha_2 || alpha_1_init != 1.0 || alpha_2_init != 1.0 {
+        config = config.with_counts_background(CountsBackgroundConfig {
+            alpha_1_init,
+            alpha_2_init,
+            fit_alpha_1,
+            fit_alpha_2,
+        });
+    }
+
+    let input = if let Some(bg) = detector_background_vec {
+        InputData::CountsWithNuisance {
+            sample_counts: sample_slice.to_vec(),
+            flux: ob_slice.to_vec(),
+            background: bg,
+        }
+    } else {
+        InputData::Counts {
+            sample_counts: sample_slice.to_vec(),
+            open_beam_counts: ob_slice.to_vec(),
+        }
+    };
+
+    let result = py.detach(move || fit_spectrum_typed(&input, &config).map_err(|e| e.to_string()));
+    let result = result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+
+    Ok(PyFitResult {
+        densities: result.densities,
+        uncertainties: result.uncertainties,
+        reduced_chi_squared: result.reduced_chi_squared,
+        converged: result.converged,
+        iterations: result.iterations,
+        temperature_k: result.temperature_k,
+        temperature_k_unc: result.temperature_k_unc,
+        anorm: result.anorm,
+        background: result.background,
+    })
 }
 
 /// Fit a single spectrum using the typed input data API.

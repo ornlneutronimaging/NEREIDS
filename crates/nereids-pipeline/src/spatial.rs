@@ -65,6 +65,12 @@ pub enum InputData3D<'a> {
         sample_counts: ArrayView3<'a, f64>,
         open_beam_counts: ArrayView3<'a, f64>,
     },
+    /// Raw detector counts with explicit nuisance spectra.
+    CountsWithNuisance {
+        sample_counts: ArrayView3<'a, f64>,
+        flux: ArrayView3<'a, f64>,
+        background: ArrayView3<'a, f64>,
+    },
 }
 
 impl InputData3D<'_> {
@@ -73,13 +79,9 @@ impl InputData3D<'_> {
         let s = match self {
             Self::Transmission { transmission, .. } => transmission.shape(),
             Self::Counts { sample_counts, .. } => sample_counts.shape(),
+            Self::CountsWithNuisance { sample_counts, .. } => sample_counts.shape(),
         };
         (s[0], s[1], s[2])
-    }
-
-    /// Whether this is counts data.
-    pub(crate) fn is_counts(&self) -> bool {
-        matches!(self, Self::Counts { .. })
     }
 }
 
@@ -133,6 +135,26 @@ pub fn spatial_map_typed(
                 )));
             }
         }
+        InputData3D::CountsWithNuisance {
+            sample_counts,
+            flux,
+            background,
+        } => {
+            if flux.shape() != sample_counts.shape() {
+                return Err(PipelineError::ShapeMismatch(format!(
+                    "flux shape {:?} != sample shape {:?}",
+                    flux.shape(),
+                    sample_counts.shape(),
+                )));
+            }
+            if background.shape() != sample_counts.shape() {
+                return Err(PipelineError::ShapeMismatch(format!(
+                    "background shape {:?} != sample shape {:?}",
+                    background.shape(),
+                    sample_counts.shape(),
+                )));
+            }
+        }
     }
     if let Some(dp) = dead_pixels
         && dp.shape() != [height, width]
@@ -155,6 +177,8 @@ pub fn spatial_map_typed(
     }
 
     let isotope_labels = config.isotope_names().to_vec();
+    let has_background_outputs =
+        config.transmission_background().is_some() || config.counts_background().is_some();
 
     if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
         return Err(PipelineError::Cancelled);
@@ -169,17 +193,33 @@ pub fn spatial_map_typed(
                 .collect(),
             chi_squared_map: Array2::from_elem((height, width), f64::NAN),
             converged_map: Array2::from_elem((height, width), false),
-            temperature_map: None,
+            temperature_map: if config.fit_temperature() {
+                Some(Array2::from_elem((height, width), f64::NAN))
+            } else {
+                None
+            },
             isotope_labels,
-            anorm_map: None,
-            background_maps: None,
+            anorm_map: if has_background_outputs {
+                Some(Array2::from_elem((height, width), f64::NAN))
+            } else {
+                None
+            },
+            background_maps: if has_background_outputs {
+                Some([
+                    Array2::from_elem((height, width), f64::NAN),
+                    Array2::from_elem((height, width), f64::NAN),
+                    Array2::from_elem((height, width), f64::NAN),
+                ])
+            } else {
+                None
+            },
             n_converged: 0,
             n_total: 0,
         });
     }
 
-    // Transpose data to (height, width, n_energies) for cache locality
-    let (data_a, data_b) = match input {
+    // Transpose data to (height, width, n_energies) for cache locality.
+    let (data_a, data_b, data_c) = match input {
         InputData3D::Transmission {
             transmission,
             uncertainty,
@@ -192,7 +232,7 @@ pub fn spatial_map_typed(
                 .permuted_axes([1, 2, 0])
                 .as_standard_layout()
                 .into_owned();
-            (a, b)
+            (a, b, None)
         }
         InputData3D::Counts {
             sample_counts,
@@ -206,7 +246,26 @@ pub fn spatial_map_typed(
                 .permuted_axes([1, 2, 0])
                 .as_standard_layout()
                 .into_owned();
-            (a, b)
+            (a, b, None)
+        }
+        InputData3D::CountsWithNuisance {
+            sample_counts,
+            flux,
+            background,
+        } => {
+            let a = sample_counts
+                .permuted_axes([1, 2, 0])
+                .as_standard_layout()
+                .into_owned();
+            let b = flux
+                .permuted_axes([1, 2, 0])
+                .as_standard_layout()
+                .into_owned();
+            let c = background
+                .permuted_axes([1, 2, 0])
+                .as_standard_layout()
+                .into_owned();
+            (a, b, Some(c))
         }
     };
 
@@ -274,14 +333,11 @@ pub fn spatial_map_typed(
             .with_compute_covariance(false)
     };
 
-    let is_counts = input.is_counts();
-    let has_transmission_bg = config.transmission_background().is_some();
-
     // For counts data: spatially average the open beam to get a stable flux
     // estimate, reducing per-pixel open-beam shot noise.
     // Without this, per-pixel open-beam shot noise contaminates the flux
     // estimate and makes KL fits materially noisier.
-    let averaged_flux: Option<Vec<f64>> = if is_counts {
+    let averaged_flux: Option<Vec<f64>> = if matches!(input, InputData3D::Counts { .. }) {
         let n_e = data_b.shape()[2]; // data_b is transposed: (h, w, n_e)
         let mut flux = vec![0.0f64; n_e];
         let n_live = pixel_coords.len() as f64;
@@ -300,7 +356,7 @@ pub fn spatial_map_typed(
     } else {
         None
     };
-    let background_zeros: Vec<f64> = if is_counts {
+    let background_zeros: Vec<f64> = if matches!(input, InputData3D::Counts { .. }) {
         vec![0.0f64; data_b.shape()[2]]
     } else {
         Vec::new()
@@ -317,40 +373,53 @@ pub fn spatial_map_typed(
             let spectrum_a: Vec<f64> = data_a.slice(s![y, x, ..]).to_vec();
 
             // Build per-pixel 1D InputData
-            let pixel_input = if is_counts {
-                let sample_clamped: Vec<f64> = spectrum_a.iter().map(|&v| v.max(0.0)).collect();
-                let ob_spectrum: Vec<f64> = data_b.slice(s![y, x, ..]).to_vec();
+            let pixel_input = match input {
+                InputData3D::Counts { .. } => {
+                    let sample_clamped: Vec<f64> =
+                        spectrum_a.iter().map(|&v| v.max(0.0)).collect();
+                    let ob_spectrum: Vec<f64> = data_b.slice(s![y, x, ..]).to_vec();
 
-                // Check effective solver: KL uses CountsWithNuisance (averaged
-                // flux), LM uses raw Counts (auto-converts to transmission
-                // inside fit_spectrum_typed).
-                let effective = fast_config.effective_solver(&InputData::Counts {
-                    sample_counts: sample_clamped.clone(),
-                    open_beam_counts: ob_spectrum.clone(),
-                });
-                match effective {
-                    SolverConfig::PoissonKL(_) => InputData::CountsWithNuisance {
-                        sample_counts: sample_clamped,
-                        flux: averaged_flux.as_ref().unwrap().clone(),
-                        // Spatial counts path currently assumes zero detector
-                        // background unless the caller provides nuisance inputs
-                        // through the single-spectrum API.
-                        background: background_zeros.clone(),
-                    },
-                    _ => InputData::Counts {
-                        sample_counts: sample_clamped,
-                        open_beam_counts: ob_spectrum,
-                    },
+                    // Check effective solver: KL uses CountsWithNuisance
+                    // (averaged flux), LM uses raw Counts (auto-converts to
+                    // transmission inside fit_spectrum_typed).
+                    let effective = fast_config.effective_solver(&InputData::Counts {
+                        sample_counts: sample_clamped.clone(),
+                        open_beam_counts: ob_spectrum.clone(),
+                    });
+                    match effective {
+                        SolverConfig::PoissonKL(_) => InputData::CountsWithNuisance {
+                            sample_counts: sample_clamped,
+                            flux: averaged_flux.as_ref().unwrap().clone(),
+                            // Raw-count spatial path currently assumes zero
+                            // detector background unless the caller provides
+                            // explicit nuisance spectra.
+                            background: background_zeros.clone(),
+                        },
+                        _ => InputData::Counts {
+                            sample_counts: sample_clamped,
+                            open_beam_counts: ob_spectrum,
+                        },
+                    }
                 }
-            } else {
-                let spectrum_b: Vec<f64> = data_b
-                    .slice(s![y, x, ..])
-                    .iter()
-                    .map(|&v| v.max(1e-10))
-                    .collect();
-                InputData::Transmission {
-                    transmission: spectrum_a,
-                    uncertainty: spectrum_b,
+                InputData3D::CountsWithNuisance { .. } => InputData::CountsWithNuisance {
+                    sample_counts: spectrum_a.iter().map(|&v| v.max(0.0)).collect(),
+                    flux: data_b.slice(s![y, x, ..]).to_vec(),
+                    background: data_c
+                        .as_ref()
+                        .expect("CountsWithNuisance requires background cube")
+                        .slice(s![y, x, ..])
+                        .to_vec(),
+                },
+                InputData3D::Transmission { .. } => {
+                    let spectrum_b: Vec<f64> = data_b
+                        .slice(s![y, x, ..])
+                        .iter()
+                        .map(|&v| v.max(1e-10))
+                        .collect();
+                    InputData::Transmission {
+                        transmission: spectrum_a,
+                        uncertainty: spectrum_b,
+                    }
                 }
             };
 
@@ -378,12 +447,12 @@ pub fn spatial_map_typed(
         .collect();
     let mut chi_squared_map = Array2::from_elem((height, width), f64::NAN);
     let mut converged_map = Array2::from_elem((height, width), false);
-    let mut anorm_map: Option<Array2<f64>> = if has_transmission_bg {
+    let mut anorm_map: Option<Array2<f64>> = if has_background_outputs {
         Some(Array2::from_elem((height, width), f64::NAN))
     } else {
         None
     };
-    let mut background_maps: Option<[Array2<f64>; 3]> = if has_transmission_bg {
+    let mut background_maps: Option<[Array2<f64>; 3]> = if has_background_outputs {
         Some([
             Array2::from_elem((height, width), f64::NAN),
             Array2::from_elem((height, width), f64::NAN),
@@ -629,6 +698,82 @@ mod tests {
             result.n_converged,
             result.n_total
         );
+    }
+
+    #[test]
+    fn test_spatial_map_typed_counts_with_nuisance_surfaces_background_maps() {
+        let data = u238_single_resonance();
+        let true_density = 0.002;
+        let true_alpha1 = 0.92;
+        let true_alpha2 = 1.35;
+        let energies: Vec<f64> = (0..101).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let (t_3d, _) = synthetic_4x4_transmission(&data, true_density, &energies);
+        let n_e = energies.len();
+
+        let mut sample = Array3::zeros((n_e, 4, 4));
+        let mut flux = Array3::zeros((n_e, 4, 4));
+        let mut background = Array3::zeros((n_e, 4, 4));
+        for y in 0..4 {
+            for x in 0..4 {
+                for (i, &e) in energies.iter().enumerate() {
+                    let bg = 30.0 + 8.0 / e.sqrt();
+                    flux[[i, y, x]] = 120.0;
+                    background[[i, y, x]] = bg;
+                    sample[[i, y, x]] = true_alpha1 * flux[[i, y, x]] * t_3d[[i, y, x]]
+                        + true_alpha2 * bg;
+                }
+            }
+        }
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
+        .with_counts_background(crate::pipeline::CountsBackgroundConfig {
+            alpha_1_init: 1.0,
+            alpha_2_init: 1.0,
+            fit_alpha_1: true,
+            fit_alpha_2: true,
+        });
+
+        let input = InputData3D::CountsWithNuisance {
+            sample_counts: sample.view(),
+            flux: flux.view(),
+            background: background.view(),
+        };
+
+        let result = spatial_map_typed(&input, &config, None, None, None).unwrap();
+        assert_eq!(result.n_total, 16);
+        assert_eq!(result.n_converged, 16);
+        assert!(result.anorm_map.is_some(), "counts background runs should surface anorm_map");
+        assert!(
+            result.background_maps.is_some(),
+            "counts background runs should surface background_maps"
+        );
+        let mean_alpha1 = result
+            .anorm_map
+            .as_ref()
+            .unwrap()
+            .iter()
+            .copied()
+            .sum::<f64>()
+            / 16.0;
+        let mean_alpha2 = result
+            .background_maps
+            .as_ref()
+            .unwrap()[2]
+            .iter()
+            .copied()
+            .sum::<f64>()
+            / 16.0;
+        assert!((mean_alpha1 - true_alpha1).abs() < 5e-3);
+        assert!((mean_alpha2 - true_alpha2).abs() < 5e-3);
     }
 
     #[test]
