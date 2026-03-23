@@ -38,6 +38,7 @@ pub fn load_step(ui: &mut egui::Ui, state: &mut AppState) {
         state.invalidate_results();
         state.sample_data = None;
         state.open_beam_data = None;
+        state.hdf5_ob_path = None;
         state.load_error = false;
     }
 
@@ -371,6 +372,7 @@ fn hdf5_event_tab(ui: &mut egui::Ui, state: &mut AppState) {
 /// Optional open beam NeXus file picker for HDF5 modes.
 /// When provided, enables proper normalization (T = sample/OB) and
 /// counts-domain KL fitting.
+// TODO: async OB loading for large files
 fn hdf5_ob_picker(ui: &mut egui::Ui, state: &mut AppState) {
     design::card(ui, |ui| {
         ui.label(
@@ -384,7 +386,7 @@ fn hdf5_ob_picker(ui: &mut egui::Ui, state: &mut AppState) {
             .hdf5_ob_path
             .as_ref()
             .map(|p| p.display().to_string())
-            .unwrap_or_default();
+            .unwrap_or_else(|| "Click to select open beam...".to_string());
         let resp = design::drop_zone(ui, loaded, &display, "Open beam HDF5 (.h5, .hdf5, .nxs)");
         if resp.clicked()
             && let Some(path) = rfd::FileDialog::new()
@@ -392,14 +394,57 @@ fn hdf5_ob_picker(ui: &mut egui::Ui, state: &mut AppState) {
                 .pick_file()
         {
             state.hdf5_ob_path = Some(path.clone());
-            match nereids_io::nexus::load_nexus_histogram(&path) {
-                Ok(data) => {
-                    state.open_beam_data = Some(std::sync::Arc::new(data.counts));
-                    state.status_message = "Open beam loaded".into();
+            // Dispatch event vs histogram loading based on input mode
+            let ob_result = if state.input_mode == InputMode::Hdf5Event {
+                // Use same binning params as sample
+                let params = nereids_io::nexus::EventBinningParams {
+                    n_bins: state.event_n_bins,
+                    tof_min_us: state.event_tof_min_us,
+                    tof_max_us: state.event_tof_max_us,
+                    height: state.event_height,
+                    width: state.event_width,
+                };
+                nereids_io::nexus::load_nexus_events(&path, &params)
+                    .map(|d| (d.counts, d.tof_edges_us))
+            } else {
+                nereids_io::nexus::load_nexus_histogram(&path).map(|d| (d.counts, d.tof_edges_us))
+            };
+            match ob_result {
+                Ok((ob_counts, ob_tof_edges)) => {
+                    // P1-7: Validate shape matches sample
+                    if let Some(ref sample) = state.sample_data
+                        && sample.shape() != ob_counts.shape()
+                    {
+                        state.status_message = format!(
+                            "OB shape {:?} != sample {:?}",
+                            ob_counts.shape(),
+                            sample.shape()
+                        );
+                        state.hdf5_ob_path = None;
+                        return;
+                    }
+                    // P1-9: Check TOF bin count matches spectrum values
+                    let tof_warning = state.spectrum_values.as_ref().and_then(|sv| {
+                        let n_ob_tof = ob_tof_edges.len();
+                        let n_sv = sv.len();
+                        if n_ob_tof != n_sv {
+                            Some(format!(
+                                " (warning: OB has {} TOF edges vs sample spectrum {})",
+                                n_ob_tof, n_sv
+                            ))
+                        } else {
+                            None
+                        }
+                    });
+                    state.open_beam_data = Some(Arc::new(ob_counts));
+                    state.status_message =
+                        format!("Open beam loaded{}", tof_warning.as_deref().unwrap_or(""));
                 }
                 Err(e) => {
                     state.status_message = format!("Open beam load failed: {e}");
                     state.hdf5_ob_path = None;
+                    // P1-8: Clear data on failure
+                    state.open_beam_data = None;
                 }
             }
         }
@@ -436,6 +481,7 @@ fn hdf5_drop_zone(ui: &mut egui::Ui, state: &mut AppState) {
         state.invalidate_results();
         state.sample_data = None;
         state.open_beam_data = None;
+        state.hdf5_ob_path = None;
         state.load_error = false;
         state.nexus_probe_error = None;
 

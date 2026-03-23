@@ -124,7 +124,11 @@ fn run_normalize(state: &mut AppState) -> Result<(), String> {
     match state.input_mode {
         InputMode::TransmissionTiff | InputMode::Hdf5Histogram | InputMode::Hdf5Event => {
             if state.sample_data.is_some() {
-                crate::guided::normalize::prepare_transmission(state);
+                if state.open_beam_data.is_some() {
+                    crate::guided::normalize::normalize_hdf5_with_ob(state);
+                } else {
+                    crate::guided::normalize::prepare_transmission(state);
+                }
             }
             if state.normalized.is_none() {
                 return Err("Failed to prepare transmission data".into());

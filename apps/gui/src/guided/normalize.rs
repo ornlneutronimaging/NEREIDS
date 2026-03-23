@@ -544,36 +544,44 @@ pub(crate) fn prepare_transmission(state: &mut AppState) {
 
 /// Normalize HDF5 counts with open beam: T = sample / open_beam.
 /// Uses real counting statistics for uncertainty.
-fn normalize_hdf5_with_ob(state: &mut AppState) {
+pub(crate) fn normalize_hdf5_with_ob(state: &mut AppState) {
     state.cancel_pending_tasks();
     state.pixel_fit_result = None;
     state.spatial_result = None;
 
-    let sample = match state.sample_data {
-        Some(ref d) => (**d).clone(),
+    // Clone Arcs (O(1)) to avoid deep-cloning multi-GB arrays.
+    let sample_arc = match state.sample_data {
+        Some(ref d) => Arc::clone(d),
         None => return,
     };
-    let open_beam = match state.open_beam_data {
-        Some(ref d) => (**d).clone(),
+    let ob_arc = match state.open_beam_data {
+        Some(ref d) => Arc::clone(d),
         None => return,
     };
 
-    if sample.shape() != open_beam.shape() {
+    if sample_arc.shape() != ob_arc.shape() {
         state.status_message = format!(
             "Shape mismatch: sample {:?} vs OB {:?}",
-            sample.shape(),
-            open_beam.shape()
+            sample_arc.shape(),
+            ob_arc.shape()
         );
+        // Clear OB to break the infinite retry loop — the caller checks
+        // `open_beam_data.is_some()` and will route to `prepare_transmission`.
+        state.open_beam_data = None;
         return;
     }
 
-    let n_tof = sample.shape()[0];
+    let n_tof = sample_arc.shape()[0];
 
-    // Simple normalization: T = sample / max(OB, 1)
-    // σ = sqrt(sample) / max(OB, 1) (Poisson on sample counts)
-    let ob_safe = open_beam.mapv(|v| v.max(1.0));
-    let transmission = &sample / &ob_safe;
-    let uncertainty = sample.mapv(|v| v.max(1.0).sqrt()) / &ob_safe;
+    // Normalization: T = sample / max(OB, 1)
+    // Combined Poisson uncertainty on both sample and OB:
+    //   σ_T = T * sqrt(1/max(sample,1) + 1/max(OB,1))
+    // Guard against division by zero with .max(1.0).
+    let ob_safe = ob_arc.mapv(|v| v.max(1.0));
+    let transmission = &*sample_arc / &ob_safe;
+    let sample_safe = sample_arc.mapv(|v| v.max(1.0));
+    let uncertainty = &transmission
+        * &(&sample_safe.mapv(|v| 1.0 / v) + &ob_safe.mapv(|v| 1.0 / v)).mapv(f64::sqrt);
 
     match compute_energies(state, n_tof) {
         Ok(energies) => state.energies = Some(energies),

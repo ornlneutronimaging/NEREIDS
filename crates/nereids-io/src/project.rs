@@ -75,6 +75,8 @@ pub struct ProjectSnapshot {
     pub open_beam_path: Option<String>,
     pub spectrum_path: Option<String>,
     pub hdf5_path: Option<String>,
+    /// Path to the HDF5 open beam file (HDF5 modes only).
+    pub hdf5_ob_path: Option<String>,
     /// "tof_us" | "energy_ev"
     pub spectrum_unit: String,
     /// "bin_edges" | "bin_centers"
@@ -133,6 +135,10 @@ pub struct ProjectSnapshot {
     /// True when per-bin uncertainty was estimated (not measured).
     /// Drives chi-squared warning display in the GUI.
     pub uncertainty_is_estimated: Option<bool>,
+    /// Whether LM background fitting (Anorm + BackA/B/C) is enabled.
+    pub lm_background_enabled: Option<bool>,
+    /// Whether KL background fitting (b0 + b1/sqrt(E)) is enabled.
+    pub kl_background_enabled: Option<bool>,
 
     // -- endf_cache --
     /// (symbol, resonance_data) pairs for offline loading.
@@ -176,6 +182,7 @@ impl Default for ProjectSnapshot {
             open_beam_path: None,
             spectrum_path: None,
             hdf5_path: None,
+            hdf5_ob_path: None,
             spectrum_unit: String::new(),
             spectrum_kind: String::new(),
             rebin_factor: 0,
@@ -210,6 +217,8 @@ impl Default for ProjectSnapshot {
             single_fit_anorm: None,
             single_fit_background: None,
             uncertainty_is_estimated: None,
+            lm_background_enabled: None,
+            kl_background_enabled: None,
             endf_cache: vec![],
             provenance: vec![],
         }
@@ -410,6 +419,12 @@ fn write_config(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoError
     if let Some(ue) = snap.uncertainty_is_estimated {
         write_bool_attr(&solver, "uncertainty_is_estimated", ue)?;
     }
+    if let Some(lm_bg) = snap.lm_background_enabled {
+        write_bool_attr(&solver, "lm_background_enabled", lm_bg)?;
+    }
+    if let Some(kl_bg) = snap.kl_background_enabled {
+        write_bool_attr(&solver, "kl_background_enabled", kl_bg)?;
+    }
 
     // Resolution
     let res = config
@@ -480,6 +495,9 @@ fn write_data_links(
     }
     if let Some(ref p) = snap.hdf5_path {
         write_str_attr(&links, "hdf5_path", p)?;
+    }
+    if let Some(ref p) = snap.hdf5_ob_path {
+        write_str_attr(&links, "hdf5_ob_path", p)?;
     }
 
     // Write embedded data if present
@@ -1052,6 +1070,8 @@ fn read_config(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoEr
     snap.temperature_k = read_f64_attr(&solver, "temperature_k")?;
     snap.fit_temperature = read_bool_attr(&solver, "fit_temperature")?;
     snap.uncertainty_is_estimated = read_bool_attr(&solver, "uncertainty_is_estimated").ok();
+    snap.lm_background_enabled = read_bool_attr(&solver, "lm_background_enabled").ok();
+    snap.kl_background_enabled = read_bool_attr(&solver, "kl_background_enabled").ok();
 
     // Resolution
     let res = config
@@ -1093,6 +1113,7 @@ fn read_data_links(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), 
     snap.open_beam_path = read_str_attr_opt(&links, "open_beam_path");
     snap.spectrum_path = read_str_attr_opt(&links, "spectrum_path");
     snap.hdf5_path = read_str_attr_opt(&links, "hdf5_path");
+    snap.hdf5_ob_path = read_str_attr_opt(&links, "hdf5_ob_path");
 
     // Read embedded data if mode is "embedded"
     if snap.data_mode == "embedded" {
@@ -1553,6 +1574,7 @@ mod tests {
             open_beam_path: Some("/data/ob".into()),
             spectrum_path: Some("/data/spectrum.txt".into()),
             hdf5_path: None,
+            hdf5_ob_path: None,
             spectrum_unit: "tof_us".into(),
             spectrum_kind: "bin_edges".into(),
             rebin_factor: 1,
@@ -1587,6 +1609,8 @@ mod tests {
             single_fit_anorm: None,
             single_fit_background: None,
             uncertainty_is_estimated: Some(false),
+            lm_background_enabled: None,
+            kl_background_enabled: None,
             endf_cache: vec![],
             provenance: vec![],
         }

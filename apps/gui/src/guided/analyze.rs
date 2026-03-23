@@ -43,7 +43,11 @@ pub fn analyze_step(ui: &mut egui::Ui, state: &mut AppState) {
         && state.sample_data.is_some()
         && state.spectrum_values.is_some()
     {
-        crate::guided::normalize::prepare_transmission(state);
+        if state.open_beam_data.is_some() {
+            crate::guided::normalize::normalize_hdf5_with_ob(state);
+        } else {
+            crate::guided::normalize::prepare_transmission(state);
+        }
     }
 
     ui.horizontal(|ui| {
@@ -171,14 +175,18 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
                 &mut state.fit_temperature,
                 "Fit temperature (slow for Spatial Map)",
             );
-            ui.checkbox(
-                &mut state.lm_background_enabled,
-                "LM background (SAMMY: Anorm + BackA/B/C)",
-            );
-            ui.checkbox(
-                &mut state.kl_background_enabled,
-                "KL background (b\u{2080} + b\u{2081}/\u{221A}E)",
-            );
+            if matches!(state.solver_method, SolverMethod::LevenbergMarquardt) {
+                ui.checkbox(
+                    &mut state.lm_background_enabled,
+                    "LM background (SAMMY: Anorm + BackA/B/C)",
+                );
+            }
+            if matches!(state.solver_method, SolverMethod::PoissonKL) {
+                ui.checkbox(
+                    &mut state.kl_background_enabled,
+                    "KL background (b\u{2080} + b\u{2081}/\u{221A}E)",
+                );
+            }
             ui.checkbox(
                 &mut state.lm_config.compute_covariance,
                 "Compute covariance (single-pixel/ROI only)",

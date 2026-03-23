@@ -235,6 +235,8 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         temperature_k: state.temperature_k,
         fit_temperature: state.fit_temperature,
         uncertainty_is_estimated: Some(state.uncertainty_is_estimated),
+        lm_background_enabled: Some(state.lm_background_enabled),
+        kl_background_enabled: Some(state.kl_background_enabled),
         resolution_enabled: state.resolution_enabled,
         resolution_kind: resolution_kind.into(),
         delta_t_us,
@@ -257,6 +259,10 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
             .map(|p| p.to_string_lossy().into_owned()),
         hdf5_path: state
             .hdf5_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned()),
+        hdf5_ob_path: state
+            .hdf5_ob_path
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned()),
         spectrum_unit: spectrum_unit.into(),
@@ -726,6 +732,8 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
     state.temperature_k = snap.temperature_k;
     state.fit_temperature = snap.fit_temperature;
     state.uncertainty_is_estimated = snap.uncertainty_is_estimated.unwrap_or(false);
+    state.lm_background_enabled = snap.lm_background_enabled.unwrap_or(false);
+    state.kl_background_enabled = snap.kl_background_enabled.unwrap_or(false);
 
     // 10. Restore resolution
     state.resolution_enabled = snap.resolution_enabled;
@@ -802,6 +810,13 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
         p
     });
     state.hdf5_path = snap.hdf5_path.map(|s| {
+        let p = PathBuf::from(&s);
+        if !p.exists() {
+            missing.push(s);
+        }
+        p
+    });
+    state.hdf5_ob_path = snap.hdf5_ob_path.map(|s| {
         let p = PathBuf::from(&s);
         if !p.exists() {
             missing.push(s);
