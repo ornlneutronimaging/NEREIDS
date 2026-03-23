@@ -46,6 +46,34 @@ pub struct ProjectSnapshot {
     pub isotope_density: Vec<f64>,
     pub isotope_enabled: Vec<bool>,
 
+    // -- config/isotope_groups --
+    /// Z for each group.
+    pub isotope_group_z: Vec<u32>,
+    /// Group display names (e.g., "Hf (nat)").
+    pub isotope_group_names: Vec<String>,
+    /// Per-group members as JSON: [{"a":176,"symbol":"Hf-176","ratio":0.0526}, ...]
+    pub isotope_group_members_json: Vec<String>,
+    /// Initial density per group.
+    pub isotope_group_density: Vec<f64>,
+    /// Enabled flag per group.
+    pub isotope_group_enabled: Vec<bool>,
+
+    // -- meta/workflow --
+    /// Input mode: "tiff_pair" | "transmission_tiff" | "hdf5_histogram" | "hdf5_event".
+    /// Empty string triggers heuristic fallback for old project files.
+    pub input_mode: String,
+    /// Analysis mode: "full_spatial" | "roi_single" | "spatial_binning".
+    pub analysis_mode: String,
+    /// Binning factor for SpatialBinning analysis mode.
+    pub spatial_binning_factor: Option<u8>,
+
+    // -- config/event_params --
+    pub event_n_bins: u32,
+    pub event_tof_min_us: f64,
+    pub event_tof_max_us: f64,
+    pub event_height: u32,
+    pub event_width: u32,
+
     // -- config/solver --
     /// "lm" | "poisson_kl"
     pub solver_method: String,
@@ -166,6 +194,19 @@ impl Default for ProjectSnapshot {
             isotope_symbol: vec![],
             isotope_density: vec![],
             isotope_enabled: vec![],
+            isotope_group_z: vec![],
+            isotope_group_names: vec![],
+            isotope_group_members_json: vec![],
+            isotope_group_density: vec![],
+            isotope_group_enabled: vec![],
+            input_mode: String::new(),
+            analysis_mode: String::new(),
+            spatial_binning_factor: None,
+            event_n_bins: 0,
+            event_tof_min_us: 0.0,
+            event_tof_max_us: 0.0,
+            event_height: 0,
+            event_width: 0,
             solver_method: String::new(),
             max_iter: 0,
             temperature_k: 0.0,
@@ -406,6 +447,83 @@ fn write_config(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoError
             .create("enabled")
             .and_then(|ds| ds.write_raw(&enabled))
             .map_err(|e| hdf5_err("/config/isotopes/enabled", e))?;
+    }
+
+    // Isotope groups (parallel arrays as datasets, with JSON for ragged members)
+    if !snap.isotope_group_z.is_empty() {
+        let ig = config
+            .create_group("isotope_groups")
+            .map_err(|e| hdf5_err("create /config/isotope_groups", e))?;
+        let ng = snap.isotope_group_z.len();
+
+        ig.new_dataset::<u32>()
+            .shape([ng])
+            .create("z")
+            .and_then(|ds| ds.write_raw(&snap.isotope_group_z))
+            .map_err(|e| hdf5_err("/config/isotope_groups/z", e))?;
+
+        let names: Vec<VarLenUnicode> = snap
+            .isotope_group_names
+            .iter()
+            .map(|s| {
+                s.parse()
+                    .map_err(|e| hdf5_err("parse VarLenUnicode group name", e))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        ig.new_dataset::<VarLenUnicode>()
+            .shape([ng])
+            .create("names")
+            .and_then(|ds| ds.write_raw(&names))
+            .map_err(|e| hdf5_err("/config/isotope_groups/names", e))?;
+
+        let members_json: Vec<VarLenUnicode> = snap
+            .isotope_group_members_json
+            .iter()
+            .map(|s| {
+                s.parse()
+                    .map_err(|e| hdf5_err("parse VarLenUnicode group members_json", e))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        ig.new_dataset::<VarLenUnicode>()
+            .shape([ng])
+            .create("members_json")
+            .and_then(|ds| ds.write_raw(&members_json))
+            .map_err(|e| hdf5_err("/config/isotope_groups/members_json", e))?;
+
+        ig.new_dataset::<f64>()
+            .shape([ng])
+            .create("density")
+            .and_then(|ds| ds.write_raw(&snap.isotope_group_density))
+            .map_err(|e| hdf5_err("/config/isotope_groups/density", e))?;
+
+        let g_enabled: Vec<u8> = snap
+            .isotope_group_enabled
+            .iter()
+            .map(|&b| u8::from(b))
+            .collect();
+        ig.new_dataset::<u8>()
+            .shape([ng])
+            .create("enabled")
+            .and_then(|ds| ds.write_raw(&g_enabled))
+            .map_err(|e| hdf5_err("/config/isotope_groups/enabled", e))?;
+    }
+
+    // Workflow mode + event params
+    write_str_attr(&config, "input_mode", &snap.input_mode)?;
+    write_str_attr(&config, "analysis_mode", &snap.analysis_mode)?;
+    if let Some(factor) = snap.spatial_binning_factor {
+        write_u32_attr(&config, "spatial_binning_factor", factor as u32)?;
+    }
+
+    if snap.event_n_bins > 0 {
+        let ep = config
+            .create_group("event_params")
+            .map_err(|e| hdf5_err("create /config/event_params", e))?;
+        write_u32_attr(&ep, "n_bins", snap.event_n_bins)?;
+        write_f64_attr(&ep, "tof_min_us", snap.event_tof_min_us)?;
+        write_f64_attr(&ep, "tof_max_us", snap.event_tof_max_us)?;
+        write_u32_attr(&ep, "height", snap.event_height)?;
+        write_u32_attr(&ep, "width", snap.event_width)?;
     }
 
     // Solver
@@ -1092,6 +1210,46 @@ fn read_config(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoEr
         }
     }
 
+    // Isotope groups (backward-compatible: old files may lack this group)
+    if let Ok(ig) = config.group("isotope_groups") {
+        if let Ok(z_ds) = ig.dataset("z") {
+            snap.isotope_group_z = z_ds.read_raw().unwrap_or_default();
+        }
+        if let Ok(names_ds) = ig.dataset("names") {
+            let names_vlu: Vec<VarLenUnicode> = names_ds.read_raw().unwrap_or_default();
+            snap.isotope_group_names = names_vlu.iter().map(|v| v.as_str().to_string()).collect();
+        }
+        if let Ok(mj_ds) = ig.dataset("members_json") {
+            let mj_vlu: Vec<VarLenUnicode> = mj_ds.read_raw().unwrap_or_default();
+            snap.isotope_group_members_json =
+                mj_vlu.iter().map(|v| v.as_str().to_string()).collect();
+        }
+        if let Ok(d_ds) = ig.dataset("density") {
+            snap.isotope_group_density = d_ds.read_raw().unwrap_or_default();
+        }
+        if let Ok(en_ds) = ig.dataset("enabled") {
+            let en_raw: Vec<u8> = en_ds.read_raw().unwrap_or_default();
+            snap.isotope_group_enabled = en_raw.iter().map(|&v| v != 0).collect();
+        }
+    }
+
+    // Workflow mode + event params (backward-compatible: empty string triggers heuristic)
+    snap.input_mode = read_str_attr_opt(&config, "input_mode").unwrap_or_default();
+    snap.analysis_mode = read_str_attr_opt(&config, "analysis_mode").unwrap_or_default();
+    snap.spatial_binning_factor = config
+        .attr("spatial_binning_factor")
+        .and_then(|a| a.read_scalar::<u32>())
+        .ok()
+        .map(|v| v as u8);
+
+    if let Ok(ep) = config.group("event_params") {
+        snap.event_n_bins = read_u32_attr(&ep, "n_bins").unwrap_or(0);
+        snap.event_tof_min_us = read_f64_attr(&ep, "tof_min_us").unwrap_or(0.0);
+        snap.event_tof_max_us = read_f64_attr(&ep, "tof_max_us").unwrap_or(0.0);
+        snap.event_height = read_u32_attr(&ep, "height").unwrap_or(0);
+        snap.event_width = read_u32_attr(&ep, "width").unwrap_or(0);
+    }
+
     // ENDF library
     snap.endf_library = read_str_attr(&config, "endf_library")?;
 
@@ -1558,6 +1716,19 @@ mod tests {
             isotope_symbol: vec![],
             isotope_density: vec![],
             isotope_enabled: vec![],
+            isotope_group_z: vec![],
+            isotope_group_names: vec![],
+            isotope_group_members_json: vec![],
+            isotope_group_density: vec![],
+            isotope_group_enabled: vec![],
+            input_mode: String::new(),
+            analysis_mode: String::new(),
+            spatial_binning_factor: None,
+            event_n_bins: 0,
+            event_tof_min_us: 0.0,
+            event_tof_max_us: 0.0,
+            event_height: 0,
+            event_width: 0,
             solver_method: "lm".into(),
             max_iter: 20,
             temperature_k: 300.0,

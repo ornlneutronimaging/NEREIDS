@@ -11,9 +11,9 @@ use nereids_io::spectrum::{SpectrumUnit, SpectrumValueKind};
 use nereids_pipeline::spatial::SpatialResult;
 
 use crate::state::{
-    AppState, DataType, EndfStatus, FitFeedback, FittingType, GuidedStep, InputMode, IsotopeEntry,
-    ProvenanceEvent, ProvenanceEventKind, ResolutionMode, RoiSelection, SaveDataMode, SolverMethod,
-    UiMode,
+    AnalysisMode, AppState, DataType, EndfStatus, FitFeedback, FittingType, GroupMemberState,
+    GuidedStep, InputMode, IsotopeEntry, IsotopeGroupEntry, ProvenanceEvent, ProvenanceEventKind,
+    ResolutionMode, RoiSelection, SaveDataMode, SolverMethod, UiMode,
 };
 use crate::widgets::design::library_name;
 
@@ -95,8 +95,34 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         isotope_enabled.push(entry.enabled);
     }
 
-    // ENDF cache: collect all resonance_data from isotope entries
-    let endf_cache: Vec<(String, nereids_endf::resonance::ResonanceData)> = state
+    // Isotope group config
+    let isotope_group_z: Vec<u32> = state.isotope_groups.iter().map(|g| g.z).collect();
+    let isotope_group_names: Vec<String> = state
+        .isotope_groups
+        .iter()
+        .map(|g| g.name.clone())
+        .collect();
+    let isotope_group_members_json: Vec<String> = state
+        .isotope_groups
+        .iter()
+        .map(|g| {
+            let members: Vec<serde_json::Value> = g
+                .members
+                .iter()
+                .map(|m| serde_json::json!({"a": m.a, "symbol": m.symbol, "ratio": m.ratio}))
+                .collect();
+            serde_json::to_string(&members).unwrap_or_default()
+        })
+        .collect();
+    let isotope_group_density: Vec<f64> = state
+        .isotope_groups
+        .iter()
+        .map(|g| g.initial_density)
+        .collect();
+    let isotope_group_enabled: Vec<bool> = state.isotope_groups.iter().map(|g| g.enabled).collect();
+
+    // ENDF cache: collect all resonance_data from isotope entries AND group members
+    let mut endf_cache: Vec<(String, nereids_endf::resonance::ResonanceData)> = state
         .isotope_entries
         .iter()
         .filter_map(|e| {
@@ -105,6 +131,14 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
                 .map(|rd| (e.symbol.clone(), rd.clone()))
         })
         .collect();
+    // Also include group members' resonance data (dedup handled by writer)
+    for group in &state.isotope_groups {
+        for member in &group.members {
+            if let Some(ref rd) = member.resonance_data {
+                endf_cache.push((member.symbol.clone(), rd.clone()));
+            }
+        }
+    }
 
     // Normalized data (transmission + uncertainty arrays)
     let normalized = state.normalized.as_ref().map(|nd| nd.transmission.clone());
@@ -230,6 +264,33 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         isotope_symbol,
         isotope_density,
         isotope_enabled,
+        isotope_group_z,
+        isotope_group_names,
+        isotope_group_members_json,
+        isotope_group_density,
+        isotope_group_enabled,
+        input_mode: match state.input_mode {
+            InputMode::TiffPair => "tiff_pair",
+            InputMode::TransmissionTiff => "transmission_tiff",
+            InputMode::Hdf5Histogram => "hdf5_histogram",
+            InputMode::Hdf5Event => "hdf5_event",
+        }
+        .into(),
+        analysis_mode: match state.analysis_mode {
+            AnalysisMode::FullSpatialMap => "full_spatial",
+            AnalysisMode::RoiSingleSpectrum => "roi_single",
+            AnalysisMode::SpatialBinning(_) => "spatial_binning",
+        }
+        .into(),
+        spatial_binning_factor: match state.analysis_mode {
+            AnalysisMode::SpatialBinning(n) => Some(n),
+            _ => None,
+        },
+        event_n_bins: state.event_n_bins as u32,
+        event_tof_min_us: state.event_tof_min_us,
+        event_tof_max_us: state.event_tof_max_us,
+        event_height: state.event_height as u32,
+        event_width: state.event_width as u32,
         solver_method: solver_method.into(),
         max_iter: state.lm_config.max_iter.min(u32::MAX as usize) as u32,
         temperature_k: state.temperature_k,
@@ -669,14 +730,40 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
     // 3. Rebuild pipeline
     state.rebuild_pipeline();
 
-    // 4. Derive input_mode heuristically
-    state.input_mode = match (snap.data_type.as_str(), snap.hdf5_path.is_some()) {
-        ("events", true) => InputMode::Hdf5Event,
-        ("events", false) => InputMode::TiffPair,
-        ("pre_normalized", _) => InputMode::TiffPair,
-        ("transmission", _) => InputMode::TransmissionTiff,
-        _ => InputMode::TiffPair,
+    // 4. Restore input_mode (use persisted value if available, fall back to heuristic for old files)
+    state.input_mode = if snap.input_mode.is_empty() {
+        // Old heuristic (backward compat)
+        match (snap.data_type.as_str(), snap.hdf5_path.is_some()) {
+            ("events", true) => InputMode::Hdf5Event,
+            ("events", false) => InputMode::TiffPair,
+            ("pre_normalized", _) => InputMode::TiffPair,
+            ("transmission", _) => InputMode::TransmissionTiff,
+            _ => InputMode::TiffPair,
+        }
+    } else {
+        match snap.input_mode.as_str() {
+            "transmission_tiff" => InputMode::TransmissionTiff,
+            "hdf5_histogram" => InputMode::Hdf5Histogram,
+            "hdf5_event" => InputMode::Hdf5Event,
+            _ => InputMode::TiffPair,
+        }
     };
+
+    // 4b. Restore analysis mode
+    state.analysis_mode = match snap.analysis_mode.as_str() {
+        "roi_single" => AnalysisMode::RoiSingleSpectrum,
+        "spatial_binning" => AnalysisMode::SpatialBinning(snap.spatial_binning_factor.unwrap_or(2)),
+        _ => AnalysisMode::FullSpatialMap,
+    };
+
+    // 4c. Restore event params
+    if snap.event_n_bins > 0 {
+        state.event_n_bins = snap.event_n_bins as usize;
+        state.event_tof_min_us = snap.event_tof_min_us;
+        state.event_tof_max_us = snap.event_tof_max_us;
+        state.event_height = snap.event_height as usize;
+        state.event_width = snap.event_width as usize;
+    }
 
     // 5. Restore beamline
     state.beamline.flight_path_m = snap.flight_path_m;
@@ -722,6 +809,49 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
             }
         })
         .collect();
+
+    // 8b. Restore isotope groups with ENDF cache
+    state.isotope_groups.clear();
+    let n_groups = snap
+        .isotope_group_z
+        .len()
+        .min(snap.isotope_group_names.len())
+        .min(snap.isotope_group_density.len());
+    for i in 0..n_groups {
+        let members: Vec<GroupMemberState> = snap
+            .isotope_group_members_json
+            .get(i)
+            .and_then(|json| serde_json::from_str::<Vec<serde_json::Value>>(json).ok())
+            .unwrap_or_default()
+            .iter()
+            .map(|v| {
+                let a = v["a"].as_u64().unwrap_or(0) as u32;
+                let symbol = v["symbol"].as_str().unwrap_or("").to_string();
+                let ratio = v["ratio"].as_f64().unwrap_or(0.0);
+                // Check ENDF cache for this symbol
+                let rd = endf_cache.get(&symbol).cloned();
+                let status = if rd.is_some() {
+                    EndfStatus::Loaded
+                } else {
+                    EndfStatus::Pending
+                };
+                GroupMemberState {
+                    a,
+                    symbol,
+                    ratio,
+                    resonance_data: rd,
+                    endf_status: status,
+                }
+            })
+            .collect();
+        state.isotope_groups.push(IsotopeGroupEntry {
+            z: snap.isotope_group_z[i],
+            name: snap.isotope_group_names[i].clone(),
+            members,
+            initial_density: snap.isotope_group_density[i],
+            enabled: snap.isotope_group_enabled.get(i).copied().unwrap_or(true),
+        });
+    }
 
     // 9. Restore solver
     state.solver_method = match snap.solver_method.as_str() {
