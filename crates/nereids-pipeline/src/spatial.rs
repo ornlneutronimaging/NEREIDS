@@ -375,8 +375,7 @@ pub fn spatial_map_typed(
             // Build per-pixel 1D InputData
             let pixel_input = match input {
                 InputData3D::Counts { .. } => {
-                    let sample_clamped: Vec<f64> =
-                        spectrum_a.iter().map(|&v| v.max(0.0)).collect();
+                    let sample_clamped: Vec<f64> = spectrum_a.iter().map(|&v| v.max(0.0)).collect();
                     let ob_spectrum: Vec<f64> = data_b.slice(s![y, x, ..]).to_vec();
 
                     // Check effective solver: KL uses CountsWithNuisance
@@ -719,8 +718,8 @@ mod tests {
                     let bg = 30.0 + 8.0 / e.sqrt();
                     flux[[i, y, x]] = 120.0;
                     background[[i, y, x]] = bg;
-                    sample[[i, y, x]] = true_alpha1 * flux[[i, y, x]] * t_3d[[i, y, x]]
-                        + true_alpha2 * bg;
+                    sample[[i, y, x]] =
+                        true_alpha1 * flux[[i, y, x]] * t_3d[[i, y, x]] + true_alpha2 * bg;
                 }
             }
         }
@@ -751,7 +750,10 @@ mod tests {
         let result = spatial_map_typed(&input, &config, None, None, None).unwrap();
         assert_eq!(result.n_total, 16);
         assert_eq!(result.n_converged, 16);
-        assert!(result.anorm_map.is_some(), "counts background runs should surface anorm_map");
+        assert!(
+            result.anorm_map.is_some(),
+            "counts background runs should surface anorm_map"
+        );
         assert!(
             result.background_maps.is_some(),
             "counts background runs should surface background_maps"
@@ -764,10 +766,7 @@ mod tests {
             .copied()
             .sum::<f64>()
             / 16.0;
-        let mean_alpha2 = result
-            .background_maps
-            .as_ref()
-            .unwrap()[2]
+        let mean_alpha2 = result.background_maps.as_ref().unwrap()[2]
             .iter()
             .copied()
             .sum::<f64>()

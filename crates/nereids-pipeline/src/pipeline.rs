@@ -2079,10 +2079,7 @@ mod tests {
         let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
         let (t, _) = synthetic_transmission(&data, true_density, &energies);
         let flux = vec![120.0; energies.len()];
-        let background: Vec<f64> = energies
-            .iter()
-            .map(|&e| 30.0 + 8.0 / e.sqrt())
-            .collect();
+        let background: Vec<f64> = energies.iter().map(|&e| 30.0 + 8.0 / e.sqrt()).collect();
         let sample_counts: Vec<f64> = t
             .iter()
             .zip(flux.iter())

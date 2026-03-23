@@ -2569,12 +2569,13 @@ fn py_spatial_map_typed<'py>(
                 "counts background scaling requires from_counts_with_nuisance() input",
             ));
         }
-        config = config.with_counts_background(nereids_pipeline::pipeline::CountsBackgroundConfig {
-            alpha_1_init,
-            alpha_2_init,
-            fit_alpha_1,
-            fit_alpha_2,
-        });
+        config =
+            config.with_counts_background(nereids_pipeline::pipeline::CountsBackgroundConfig {
+                alpha_1_init,
+                alpha_2_init,
+                fit_alpha_1,
+                fit_alpha_2,
+            });
     }
 
     // Build InputData3D from the PyInputData
@@ -2682,7 +2683,7 @@ fn py_fit_counts_spectrum_typed<'py>(
     initial_densities: Option<Vec<f64>>,
 ) -> PyResult<PyFitResult> {
     use nereids_pipeline::pipeline::{
-        fit_spectrum_typed, CountsBackgroundConfig, InputData, UnifiedFitConfig,
+        CountsBackgroundConfig, InputData, UnifiedFitConfig, fit_spectrum_typed,
     };
 
     let has_isotopes = isotopes.is_some();
