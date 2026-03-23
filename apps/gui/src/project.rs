@@ -109,9 +109,10 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
             let members: Vec<serde_json::Value> = g
                 .members
                 .iter()
+                .filter(|m| m.ratio.is_finite())
                 .map(|m| serde_json::json!({"a": m.a, "symbol": m.symbol, "ratio": m.ratio}))
                 .collect();
-            serde_json::to_string(&members).unwrap_or_default()
+            serde_json::to_string(&members).unwrap_or_else(|_| "[]".to_string())
         })
         .collect();
     let isotope_group_density: Vec<f64> = state
@@ -772,6 +773,12 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
         state.event_tof_max_us = snap.event_tof_max_us;
         state.event_height = snap.event_height as usize;
         state.event_width = snap.event_width as usize;
+    } else if matches!(state.input_mode, InputMode::Hdf5Event) {
+        state.event_n_bins = 0;
+        state.event_tof_min_us = 0.0;
+        state.event_tof_max_us = 0.0;
+        state.event_height = 0;
+        state.event_width = 0;
     }
 
     // 5. Restore beamline
@@ -853,6 +860,7 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
                     endf_status: status,
                 }
             })
+            .filter(|m| m.a > 0 && !m.symbol.is_empty())
             .collect();
         state.isotope_groups.push(IsotopeGroupEntry {
             z: snap.isotope_group_z[i],

@@ -58,7 +58,7 @@ pub struct ProjectSnapshot {
     /// Enabled flag per group.
     pub isotope_group_enabled: Vec<bool>,
 
-    // -- meta/workflow --
+    // -- config/workflow --
     /// Input mode: "tiff_pair" | "transmission_tiff" | "hdf5_histogram" | "hdf5_event".
     /// Empty string triggers heuristic fallback for old project files.
     pub input_mode: String,
@@ -451,10 +451,24 @@ fn write_config(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoError
 
     // Isotope groups (parallel arrays as datasets, with JSON for ragged members)
     if !snap.isotope_group_z.is_empty() {
+        let ng = snap.isotope_group_z.len();
+        if snap.isotope_group_names.len() != ng
+            || snap.isotope_group_members_json.len() != ng
+            || snap.isotope_group_density.len() != ng
+            || snap.isotope_group_enabled.len() != ng
+        {
+            return Err(IoError::InvalidParameter(format!(
+                "isotope_group arrays have mismatched lengths: z={ng}, names={}, members={}, density={}, enabled={}",
+                snap.isotope_group_names.len(),
+                snap.isotope_group_members_json.len(),
+                snap.isotope_group_density.len(),
+                snap.isotope_group_enabled.len(),
+            )));
+        }
+
         let ig = config
             .create_group("isotope_groups")
             .map_err(|e| hdf5_err("create /config/isotope_groups", e))?;
-        let ng = snap.isotope_group_z.len();
 
         ig.new_dataset::<u32>()
             .shape([ng])
@@ -1213,22 +1227,32 @@ fn read_config(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoEr
     // Isotope groups (backward-compatible: old files may lack this group)
     if let Ok(ig) = config.group("isotope_groups") {
         if let Ok(z_ds) = ig.dataset("z") {
-            snap.isotope_group_z = z_ds.read_raw().unwrap_or_default();
+            snap.isotope_group_z = z_ds
+                .read_raw()
+                .map_err(|e| hdf5_err("/config/isotope_groups/z", e))?;
         }
         if let Ok(names_ds) = ig.dataset("names") {
-            let names_vlu: Vec<VarLenUnicode> = names_ds.read_raw().unwrap_or_default();
+            let names_vlu: Vec<VarLenUnicode> = names_ds
+                .read_raw()
+                .map_err(|e| hdf5_err("/config/isotope_groups/names", e))?;
             snap.isotope_group_names = names_vlu.iter().map(|v| v.as_str().to_string()).collect();
         }
         if let Ok(mj_ds) = ig.dataset("members_json") {
-            let mj_vlu: Vec<VarLenUnicode> = mj_ds.read_raw().unwrap_or_default();
+            let mj_vlu: Vec<VarLenUnicode> = mj_ds
+                .read_raw()
+                .map_err(|e| hdf5_err("/config/isotope_groups/members_json", e))?;
             snap.isotope_group_members_json =
                 mj_vlu.iter().map(|v| v.as_str().to_string()).collect();
         }
         if let Ok(d_ds) = ig.dataset("density") {
-            snap.isotope_group_density = d_ds.read_raw().unwrap_or_default();
+            snap.isotope_group_density = d_ds
+                .read_raw()
+                .map_err(|e| hdf5_err("/config/isotope_groups/density", e))?;
         }
         if let Ok(en_ds) = ig.dataset("enabled") {
-            let en_raw: Vec<u8> = en_ds.read_raw().unwrap_or_default();
+            let en_raw: Vec<u8> = en_ds
+                .read_raw()
+                .map_err(|e| hdf5_err("/config/isotope_groups/enabled", e))?;
             snap.isotope_group_enabled = en_raw.iter().map(|&v| v != 0).collect();
         }
     }
@@ -1240,7 +1264,7 @@ fn read_config(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoEr
         .attr("spatial_binning_factor")
         .and_then(|a| a.read_scalar::<u32>())
         .ok()
-        .map(|v| v as u8);
+        .and_then(|v| u8::try_from(v).ok());
 
     if let Ok(ep) = config.group("event_params") {
         snap.event_n_bins = read_u32_attr(&ep, "n_bins").unwrap_or(0);
