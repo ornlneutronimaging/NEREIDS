@@ -77,6 +77,23 @@ pub struct NexusHistogramData {
     pub dead_pixels: Option<ndarray::Array2<bool>>,
     /// Number of rotation angles summed (D-5). 1 means no collapse occurred.
     pub n_rotation_angles: usize,
+    /// Event retention statistics (only populated for event-mode loading).
+    pub event_stats: Option<EventRetentionStats>,
+}
+
+/// Statistics on how many events were kept vs dropped during histogramming.
+#[derive(Debug, Clone)]
+pub struct EventRetentionStats {
+    /// Total events read from the file.
+    pub total: usize,
+    /// Events successfully histogrammed.
+    pub kept: usize,
+    /// Events dropped due to non-finite TOF (NaN/Inf).
+    pub dropped_non_finite: usize,
+    /// Events dropped due to TOF outside `[tof_min, tof_max)`.
+    pub dropped_tof_range: usize,
+    /// Events dropped due to pixel coordinates outside detector bounds.
+    pub dropped_spatial: usize,
 }
 
 /// Probe a NeXus/HDF5 file for available data modalities and metadata.
@@ -201,6 +218,7 @@ pub fn load_nexus_histogram(path: &Path) -> Result<NexusHistogramData, IoError> 
         flight_path_m,
         dead_pixels,
         n_rotation_angles: n_rot,
+        event_stats: None, // histogram mode, not events
     })
 }
 
@@ -308,35 +326,39 @@ pub fn load_nexus_events(
     let tof_edges_us =
         crate::tof::linspace_tof_edges(params.tof_min_us, params.tof_max_us, params.n_bins)?;
 
-    // Histogram events
+    // Histogram events with retention tracking.
     let dt_us = (params.tof_max_us - params.tof_min_us) / params.n_bins as f64;
     let mut counts = Array3::<f64>::zeros((params.n_bins, params.height, params.width));
+    let total = tof_ns.len();
+    let mut kept = 0usize;
+    let mut dropped_non_finite = 0usize;
+    let mut dropped_tof_range = 0usize;
+    let mut dropped_spatial = 0usize;
 
     for i in 0..tof_ns.len() {
         let tof_us = tof_ns[i] as f64 / 1000.0; // ns → µs
         if !tof_us.is_finite() {
+            dropped_non_finite += 1;
             continue;
         }
 
-        // Skip events outside TOF range
         if tof_us < params.tof_min_us || tof_us >= params.tof_max_us {
+            dropped_tof_range += 1;
             continue;
         }
 
-        // Pixel coordinates (round to nearest integer)
         let px = x_coords[i].round() as isize;
         let py = y_coords[i].round() as isize;
 
-        // Skip events outside spatial bounds
         if px < 0 || py < 0 || px >= params.width as isize || py >= params.height as isize {
+            dropped_spatial += 1;
             continue;
         }
 
         let tof_bin = ((tof_us - params.tof_min_us) / dt_us) as usize;
-        // Clamp to last bin (guard against floating-point rounding near the upper boundary)
         let tof_bin = tof_bin.min(params.n_bins - 1);
-
         counts[[tof_bin, py as usize, px as usize]] += 1.0;
+        kept += 1;
     }
 
     // Read flight path
@@ -351,7 +373,14 @@ pub fn load_nexus_events(
         tof_edges_us,
         flight_path_m,
         dead_pixels,
-        n_rotation_angles: 1, // Event data has no rotation dimension
+        n_rotation_angles: 1,
+        event_stats: Some(EventRetentionStats {
+            total,
+            kept,
+            dropped_non_finite,
+            dropped_tof_range,
+            dropped_spatial,
+        }),
     })
 }
 

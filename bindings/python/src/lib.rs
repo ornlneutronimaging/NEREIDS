@@ -552,6 +552,7 @@ struct PySpatialResult {
     converged_map: Py<PyArray2<bool>>,
     n_converged: usize,
     n_total: usize,
+    n_failed: usize,
     isotope_names: Vec<String>,
     shape: (usize, usize),
     /// Per-pixel fitted temperature (None when fit_temperature=False).
@@ -604,6 +605,12 @@ impl PySpatialResult {
     #[getter]
     fn n_total(&self) -> usize {
         self.n_total
+    }
+
+    /// Number of pixels where the fitter returned a hard error (NaN density).
+    #[getter]
+    fn n_failed(&self) -> usize {
+        self.n_failed
     }
 
     /// Isotope names.
@@ -2401,6 +2408,7 @@ fn spatial_result_to_py(
         converged_map: PyArray2::from_array(py, &result.converged_map).into(),
         n_converged: result.n_converged,
         n_total: result.n_total,
+        n_failed: result.n_failed,
         isotope_names: result.isotope_labels.clone(),
         shape,
         temperature_map,

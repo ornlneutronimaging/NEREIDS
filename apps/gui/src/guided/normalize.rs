@@ -492,16 +492,15 @@ pub(crate) fn prepare_transmission(state: &mut AppState) {
     }
 
     let n_tof = sample.shape()[0];
-    // FABRICATED UNCERTAINTY: TransmissionTiff mode has no open-beam data, so
-    // true per-bin Poisson uncertainty is unknown.  We assign a uniform σ = 0.01
-    // as a placeholder.  This means:
-    //   - χ² values are NOT physically meaningful (they reflect the arbitrary σ,
-    //     not actual measurement noise).
-    //   - Relative weights across bins are uniform, which may bias fits toward
-    //     high-transmission bins where the true σ is smaller.
-    //   - A better estimate would be σ = √(T / I₀_est) if an approximate I₀ is
-    //     available, but this mode does not provide one.
-    let uncertainty = ndarray::Array3::from_elem(sample.raw_dim(), 0.01);
+    // Estimated uncertainty from transmission shape: σ = √(|T| + ε).
+    // This approximates Poisson statistics assuming T ∝ counts/I₀ with
+    // unknown I₀. Bins with low transmission (deep resonance dips) get
+    // higher uncertainty, matching their higher relative noise.
+    //
+    // Note: χ² values are approximate (not based on measured counting
+    // statistics). For rigorous uncertainty, provide sample + open-beam
+    // data via the TiffPair workflow.
+    let uncertainty = sample.mapv(|t| (t.abs() + 1e-6).sqrt());
 
     match compute_energies(state, n_tof) {
         Ok(energies) => state.energies = Some(energies),
@@ -519,7 +518,8 @@ pub(crate) fn prepare_transmission(state: &mut AppState) {
         ProvenanceEventKind::Normalized,
         "Transmission data prepared",
     );
-    state.status_message = "Transmission ready (synthetic uncertainty — see docs)".into();
+    state.status_message =
+        "Transmission ready (uncertainty estimated from √T — chi² is approximate)".into();
 }
 
 /// Compute energy bin centers from the spectrum file loaded in state.

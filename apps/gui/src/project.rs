@@ -872,6 +872,7 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
             background_maps: snap.background_maps,
             n_converged: snap.n_converged.unwrap_or(0),
             n_total: snap.n_total.unwrap_or(0),
+            n_failed: 0, // not persisted in project files
         };
         state.init_tile_display(n_maps);
         state.spatial_result = Some(result);
