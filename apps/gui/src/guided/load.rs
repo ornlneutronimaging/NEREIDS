@@ -423,22 +423,37 @@ fn hdf5_ob_picker(ui: &mut egui::Ui, state: &mut AppState) {
                         state.hdf5_ob_path = None;
                         return;
                     }
-                    // P1-9: Check TOF bin count matches spectrum values
-                    let tof_warning = state.spectrum_values.as_ref().and_then(|sv| {
-                        let n_ob_tof = ob_tof_edges.len();
-                        let n_sv = sv.len();
-                        if n_ob_tof != n_sv {
-                            Some(format!(
-                                " (warning: OB has {} TOF edges vs sample spectrum {})",
-                                n_ob_tof, n_sv
-                            ))
-                        } else {
-                            None
+                    // Validate TOF grid matches sample — reject if edges differ.
+                    // Positional bin pairing in the counts path is only correct
+                    // when sample and OB share the exact same TOF grid.
+                    if let Some(ref sv) = state.spectrum_values {
+                        if ob_tof_edges.len() != sv.len() {
+                            state.status_message = format!(
+                                "OB rejected: {} TOF edges vs sample {} — grids must match",
+                                ob_tof_edges.len(),
+                                sv.len()
+                            );
+                            state.hdf5_ob_path = None;
+                            return;
                         }
-                    });
+                        let max_edge_diff: f64 = ob_tof_edges
+                            .iter()
+                            .zip(sv.iter())
+                            .map(|(a, b)| (a - b).abs())
+                            .fold(0.0f64, f64::max);
+                        let edge_scale = sv.last().copied().unwrap_or(1.0).max(1.0);
+                        if max_edge_diff > 1e-6 * edge_scale {
+                            state.status_message = format!(
+                                "OB rejected: TOF edges differ (max delta = {:.3} µs) — \
+                                 sample and OB must use the same TOF grid",
+                                max_edge_diff
+                            );
+                            state.hdf5_ob_path = None;
+                            return;
+                        }
+                    }
                     state.open_beam_data = Some(Arc::new(ob_counts));
-                    state.status_message =
-                        format!("Open beam loaded{}", tof_warning.as_deref().unwrap_or(""));
+                    state.status_message = "Open beam loaded".to_string();
                 }
                 Err(e) => {
                     state.status_message = format!("Open beam load failed: {e}");
