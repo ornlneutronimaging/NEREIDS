@@ -493,18 +493,21 @@ pub(crate) fn prepare_transmission(state: &mut AppState) {
     }
 
     let n_tof = sample.shape()[0];
-    // Estimated uncertainty: σ ∝ √|T| from Poisson statistics.
+    // Uniform uncertainty: σ = 1 for all bins.
     //
-    // If T = N/I₀ where N ~ Poisson(I₀·T), then σ_T = √(T/I₀) ∝ √T
-    // when I₀ is constant but unknown. This gives:
-    //   - High-T bins (T≈1, baseline): σ ≈ 1 → low weight in chi-squared
-    //   - Low-T bins (T≈0, resonance dips): σ ≈ 0 → high weight
+    // TransmissionTiff mode has no open-beam data, so true per-bin
+    // Poisson uncertainty is unknown. Using uniform weights ensures the
+    // fitter treats all bins equally — no fabricated weighting pattern
+    // that could bias fitted densities toward specific spectral features.
     //
-    // This is the correct proportionality for Poisson-weighted fitting.
-    // The absolute scale is arbitrary (I₀ unknown), so chi-squared values
-    // are approximate. For rigorous uncertainty, provide sample + open-beam
-    // data via the TiffPair workflow.
-    let uncertainty = sample.mapv(|t| (t.abs() + 1e-6).sqrt());
+    // Consequence: chi-squared values are not physically meaningful
+    // (they reflect residuals in transmission units, not statistical
+    // significance). The GUI marks them as "(approx.)" via
+    // `uncertainty_is_estimated`.
+    //
+    // For rigorous uncertainty-weighted fitting, provide sample +
+    // open-beam data via the TiffPair workflow.
+    let uncertainty = ndarray::Array3::from_elem(sample.raw_dim(), 1.0);
 
     match compute_energies(state, n_tof) {
         Ok(energies) => state.energies = Some(energies),
