@@ -5,7 +5,14 @@ use crate::widgets::design::{self, BadgeVariant};
 use crate::widgets::image_view::{apply_colormap, data_range, render_to_rgba};
 
 /// Summary statistics card showing convergence and density stats.
-pub fn summary_card(ui: &mut egui::Ui, result: &nereids_pipeline::spatial::SpatialResult) {
+///
+/// When `uncertainty_is_estimated` is true, chi-squared values are displayed
+/// with a warning badge since they are based on estimated (not measured) uncertainty.
+pub fn summary_card(
+    ui: &mut egui::Ui,
+    result: &nereids_pipeline::spatial::SpatialResult,
+    uncertainty_is_estimated: bool,
+) {
     let pct = if result.n_total > 0 {
         100.0 * result.n_converged as f64 / result.n_total as f64
     } else {
@@ -52,6 +59,15 @@ pub fn summary_card(ui: &mut egui::Ui, result: &nereids_pipeline::spatial::Spati
                     let chi2_text = format!("{:.2}", mean_chi2);
                     design::badge(ui, &chi2_text, chi2_variant);
                 });
+                if uncertainty_is_estimated {
+                    ui.label(
+                        egui::RichText::new(
+                            "⚠ chi² approximate (uncertainty estimated, not measured)",
+                        )
+                        .small()
+                        .color(crate::theme::semantic::ORANGE),
+                    );
+                }
             }
 
             // Mean temperature (if available)

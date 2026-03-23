@@ -460,6 +460,7 @@ pub(crate) fn normalize_data(state: &mut AppState) {
             }
 
             state.normalized = Some(Arc::new(norm));
+            state.uncertainty_is_estimated = false; // real counting statistics
             state.log_provenance(
                 ProvenanceEventKind::Normalized,
                 "Normalization complete (Method 2)",
@@ -517,9 +518,10 @@ pub(crate) fn prepare_transmission(state: &mut AppState) {
         transmission: sample,
         uncertainty,
     }));
+    state.uncertainty_is_estimated = true;
     state.log_provenance(
         ProvenanceEventKind::Normalized,
-        "Transmission data prepared",
+        "Transmission data prepared (uncertainty estimated from √T)",
     );
     state.status_message =
         "Transmission ready (uncertainty estimated from √T — chi² is approximate)".into();

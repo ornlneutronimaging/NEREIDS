@@ -703,7 +703,17 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 ("NOT converged", crate::theme::semantic::RED)
             };
             ui.label(egui::RichText::new(label).color(color).strong());
-            ui.label(format!("chi2_r = {:.4}", result.reduced_chi_squared));
+            if state.uncertainty_is_estimated {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "chi2_r = {:.4} (approx.)",
+                        result.reduced_chi_squared
+                    ))
+                    .color(crate::theme::semantic::ORANGE),
+                );
+            } else {
+                ui.label(format!("chi2_r = {:.4}", result.reduced_chi_squared));
+            }
             ui.label(format!("iter = {}", result.iterations));
             if let Some(t) = result.temperature_k {
                 if let Some(u) = result.temperature_k_unc {
@@ -996,10 +1006,15 @@ fn fit_pixel(state: &mut AppState) {
         }
     };
 
+    let chi2_suffix = if state.uncertainty_is_estimated {
+        " (approx.)"
+    } else {
+        ""
+    };
     let summary = if result.converged {
         format!(
-            "Pixel ({},{}) converged, \u{03C7}\u{00B2}\u{1D63} = {:.4}",
-            y, x, result.reduced_chi_squared
+            "Pixel ({},{}) converged, \u{03C7}\u{00B2}\u{1D63} = {:.4}{}",
+            y, x, result.reduced_chi_squared, chi2_suffix
         )
     } else {
         format!("Pixel ({},{}) did NOT converge", y, x)

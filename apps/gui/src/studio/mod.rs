@@ -999,7 +999,7 @@ fn parameter_sidebar(ctx: &egui::Context, state: &mut AppState) {
                 ui.add_space(6.0);
 
                 if let Some(ref result) = state.spatial_result {
-                    result_widgets::summary_card(ui, result);
+                    result_widgets::summary_card(ui, result, state.uncertainty_is_estimated);
                 }
             });
         });
