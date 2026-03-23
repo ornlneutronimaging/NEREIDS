@@ -448,6 +448,43 @@ fn analysis_spectrum_column(ui: &mut egui::Ui, state: &mut AppState) {
                 });
             }
         }
+
+        // Group density results
+        let enabled_individual_count = state
+            .isotope_entries
+            .iter()
+            .filter(|e| e.enabled && e.resonance_data.is_some())
+            .count();
+        let mut group_idx = enabled_individual_count;
+        for group in &state.isotope_groups {
+            if group.enabled && group.overall_status() == EndfStatus::Loaded {
+                if group_idx < result.densities.len() {
+                    let dot_color = design::isotope_dot_color(&group.name);
+                    ui.horizontal(|ui| {
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                        ui.painter().circle_filled(rect.center(), 4.0, dot_color);
+                        if state.uncertainty_is_estimated {
+                            ui.label(format!(
+                                "{}: {:.4e}",
+                                group.name, result.densities[group_idx]
+                            ));
+                        } else {
+                            let unc_str = result
+                                .uncertainties
+                                .as_ref()
+                                .and_then(|u| u.get(group_idx))
+                                .map_or("N/A".to_string(), |u| format!("{:.2e}", u));
+                            ui.label(format!(
+                                "{}: {:.4e} \u{00b1} {}",
+                                group.name, result.densities[group_idx], unc_str
+                            ));
+                        }
+                    });
+                }
+                group_idx += 1;
+            }
+        }
     }
 }
 
@@ -874,6 +911,12 @@ fn build_residuals_cache(
         design::collect_all_resonance_data_with_mapping(state);
     if resonance_data.is_empty() {
         return None;
+    }
+
+    // Guard: density parameter count must match the mapping's expected count.
+    let n_density_params = density_indices.iter().max().map_or(0, |&m| m + 1);
+    if densities.len() < n_density_params {
+        return None; // stale result with different isotope config
     }
 
     // Build instrument params from current resolution settings.

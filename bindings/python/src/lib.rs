@@ -2646,7 +2646,7 @@ fn py_spatial_map_typed<'py>(
 /// Returns:
 ///     FitResult with densities, uncertainties, chi2, etc.
 ///
-/// For raw-count fitting, use `fit_counts_spectrum_typed(...)`.
+/// For pre-normalized transmission data, use `fit_spectrum_typed(...)`.
 #[pyfunction]
 #[pyo3(name = "fit_counts_spectrum_typed", signature = (
     sample_counts, open_beam_counts, energies, isotopes=None, *,
