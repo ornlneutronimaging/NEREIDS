@@ -524,10 +524,9 @@ pub(crate) fn prepare_transmission(state: &mut AppState) {
     state.uncertainty_is_estimated = true;
     state.log_provenance(
         ProvenanceEventKind::Normalized,
-        "Transmission data prepared (uncertainty estimated from √T)",
+        "Transmission data prepared (uniform σ=1 — no open-beam data)",
     );
-    state.status_message =
-        "Transmission ready (uncertainty estimated from √T — chi² is approximate)".into();
+    state.status_message = "Transmission ready (uniform weighting — chi² is approximate)".into();
 }
 
 /// Compute energy bin centers from the spectrum file loaded in state.
