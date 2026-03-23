@@ -1030,6 +1030,126 @@ impl<'a> crate::forward_model::ForwardModel for CountsModel<'a> {
     }
 }
 
+/// Counts model with optional nuisance scaling of signal and detector background.
+///
+/// Given a transmission model `T(θ)`, predicts:
+///
+///   Y(E) = α₁ · [Φ(E) · T(θ)] + α₂ · B(E)
+///
+/// where `α₁` and `α₂` are parameter-vector entries.
+pub struct CountsBackgroundScaleModel<'a> {
+    /// Underlying transmission model.
+    pub transmission_model: &'a dyn FitModel,
+    /// Incident flux spectrum.
+    pub flux: &'a [f64],
+    /// Detector background spectrum.
+    pub background: &'a [f64],
+    /// Index of α₁ in the parameter vector.
+    pub alpha1_index: usize,
+    /// Index of α₂ in the parameter vector.
+    pub alpha2_index: usize,
+    /// Total parameter count in the wrapped model.
+    pub n_params: usize,
+}
+
+impl<'a> FitModel for CountsBackgroundScaleModel<'a> {
+    fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+        let transmission = self.transmission_model.evaluate(params)?;
+        let alpha1 = params[self.alpha1_index];
+        let alpha2 = params[self.alpha2_index];
+        debug_assert_eq!(transmission.len(), self.flux.len());
+        debug_assert_eq!(self.flux.len(), self.background.len());
+        Ok(transmission
+            .iter()
+            .zip(self.flux.iter())
+            .zip(self.background.iter())
+            .map(|((&t, &f), &b)| alpha1 * f * t + alpha2 * b)
+            .collect())
+    }
+
+    fn analytical_jacobian(
+        &self,
+        params: &[f64],
+        free_param_indices: &[usize],
+        y_current: &[f64],
+    ) -> Option<FlatMatrix> {
+        let n_e = y_current.len();
+        let n_free = free_param_indices.len();
+        let alpha1 = params[self.alpha1_index];
+        let alpha2 = params[self.alpha2_index];
+        let alpha1_col = free_param_indices.iter().position(|&i| i == self.alpha1_index);
+        let alpha2_col = free_param_indices.iter().position(|&i| i == self.alpha2_index);
+        let inner_free: Vec<usize> = free_param_indices
+            .iter()
+            .copied()
+            .filter(|&i| i != self.alpha1_index && i != self.alpha2_index)
+            .collect();
+
+        let t_inner: Vec<f64> = y_current
+            .iter()
+            .zip(self.background.iter())
+            .zip(self.flux.iter())
+            .map(|((&y, &b), &f)| {
+                if f.abs() > 1e-30 && alpha1.abs() > 1e-30 {
+                    (y - alpha2 * b) / (alpha1 * f)
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+
+        let inner_jac = if !inner_free.is_empty() {
+            self.transmission_model
+                .analytical_jacobian(params, &inner_free, &t_inner)
+        } else {
+            None
+        };
+
+        let mut jacobian = FlatMatrix::zeros(n_e, n_free);
+        if let Some(ref ij) = inner_jac {
+            let mut inner_col = 0;
+            for (col, &fp) in free_param_indices.iter().enumerate() {
+                if fp == self.alpha1_index || fp == self.alpha2_index {
+                    continue;
+                }
+                for row in 0..n_e {
+                    *jacobian.get_mut(row, col) = alpha1 * self.flux[row] * ij.get(row, inner_col);
+                }
+                inner_col += 1;
+            }
+        } else if !inner_free.is_empty() {
+            return None;
+        }
+
+        if let Some(col) = alpha1_col {
+            for row in 0..n_e {
+                *jacobian.get_mut(row, col) = self.flux[row] * t_inner[row];
+            }
+        }
+        if let Some(col) = alpha2_col {
+            for row in 0..n_e {
+                *jacobian.get_mut(row, col) = self.background[row];
+            }
+        }
+
+        Some(jacobian)
+    }
+}
+
+impl<'a> crate::forward_model::ForwardModel for CountsBackgroundScaleModel<'a> {
+    fn predict(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+        self.evaluate(params)
+    }
+
+    fn n_data(&self) -> usize {
+        self.flux.len()
+    }
+
+    fn n_params(&self) -> usize {
+        self.n_params
+    }
+}
+
 /// KL-compatible background model for transmission data.
 ///
 /// Given a transmission model T_inner(θ), predicts:
@@ -1317,6 +1437,55 @@ mod tests {
         assert_eq!(
             crate::forward_model::ForwardModel::n_params(&counts_model),
             1
+        );
+    }
+
+    #[test]
+    fn test_counts_background_scale_model() {
+        struct ConstTransmission;
+        impl FitModel for ConstTransmission {
+            fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+                Ok(vec![params[0]; 3])
+            }
+
+            fn analytical_jacobian(
+                &self,
+                _params: &[f64],
+                free_param_indices: &[usize],
+                _y_current: &[f64],
+            ) -> Option<FlatMatrix> {
+                let mut jac = FlatMatrix::zeros(3, free_param_indices.len());
+                for (col, &fp) in free_param_indices.iter().enumerate() {
+                    if fp == 0 {
+                        for row in 0..3 {
+                            *jac.get_mut(row, col) = 1.0;
+                        }
+                    }
+                }
+                Some(jac)
+            }
+        }
+
+        let t_model = ConstTransmission;
+        let flux = [100.0, 200.0, 300.0];
+        let background = [5.0, 10.0, 15.0];
+        let counts_model = CountsBackgroundScaleModel {
+            transmission_model: &t_model,
+            flux: &flux,
+            background: &background,
+            alpha1_index: 1,
+            alpha2_index: 2,
+            n_params: 3,
+        };
+
+        let params = [0.5, 0.8, 1.5];
+        let result = counts_model.evaluate(&params).unwrap();
+        assert!((result[0] - 47.5).abs() < 1e-10);
+        assert!((result[1] - 95.0).abs() < 1e-10);
+        assert!((result[2] - 142.5).abs() < 1e-10);
+        assert_eq!(
+            crate::forward_model::ForwardModel::n_params(&counts_model),
+            3
         );
     }
 

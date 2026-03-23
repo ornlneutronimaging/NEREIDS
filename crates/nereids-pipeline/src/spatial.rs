@@ -33,9 +33,11 @@ pub struct SpatialResult {
     /// Ensures display labels stay in sync with density data even if the
     /// user modifies the isotope list after fitting.
     pub isotope_labels: Vec<String>,
-    /// Per-pixel normalization factor map (when background fitting is enabled).
+    /// Per-pixel normalization / signal-scale map (when background fitting is enabled).
     pub anorm_map: Option<Array2<f64>>,
-    /// Per-pixel background parameter maps [BackA, BackB, BackC] (when background enabled).
+    /// Per-pixel background parameter maps.
+    /// Transmission LM uses `[BackA, BackB, BackC]`.
+    /// Counts KL background uses `[b0, b1, alpha_2]`.
     pub background_maps: Option<[Array2<f64>; 3]>,
     /// Number of pixels that converged.
     pub n_converged: usize,
@@ -330,6 +332,9 @@ pub fn spatial_map_typed(
                     SolverConfig::PoissonKL(_) => InputData::CountsWithNuisance {
                         sample_counts: sample_clamped,
                         flux: averaged_flux.as_ref().unwrap().clone(),
+                        // Spatial counts path currently assumes zero detector
+                        // background unless the caller provides nuisance inputs
+                        // through the single-spectrum API.
                         background: background_zeros.clone(),
                     },
                     _ => InputData::Counts {
@@ -366,7 +371,7 @@ pub fn spatial_map_typed(
 
     // Assemble output maps
     let mut density_maps: Vec<Array2<f64>> = (0..n_maps)
-        .map(|_| Array2::zeros((height, width)))
+        .map(|_| Array2::from_elem((height, width), f64::NAN))
         .collect();
     let mut uncertainty_maps: Vec<Array2<f64>> = (0..n_maps)
         .map(|_| Array2::from_elem((height, width), f64::NAN))
@@ -374,15 +379,15 @@ pub fn spatial_map_typed(
     let mut chi_squared_map = Array2::from_elem((height, width), f64::NAN);
     let mut converged_map = Array2::from_elem((height, width), false);
     let mut anorm_map: Option<Array2<f64>> = if has_transmission_bg {
-        Some(Array2::from_elem((height, width), 1.0))
+        Some(Array2::from_elem((height, width), f64::NAN))
     } else {
         None
     };
     let mut background_maps: Option<[Array2<f64>; 3]> = if has_transmission_bg {
         Some([
-            Array2::zeros((height, width)),
-            Array2::zeros((height, width)),
-            Array2::zeros((height, width)),
+            Array2::from_elem((height, width), f64::NAN),
+            Array2::from_elem((height, width), f64::NAN),
+            Array2::from_elem((height, width), f64::NAN),
         ])
     } else {
         None
@@ -657,6 +662,47 @@ mod tests {
 
         let result = spatial_map_typed(&input, &config, Some(&dead), None, None).unwrap();
         assert_eq!(result.n_total, 8, "Only 8 live pixels");
+    }
+
+    #[test]
+    fn test_spatial_map_failed_pixels_remain_nan() {
+        let data = u238_single_resonance();
+        let true_density = 0.0005;
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        let (sample, ob) = synthetic_4x4_counts(&data, true_density, &energies, 1000.0);
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
+        .with_counts_background(crate::pipeline::CountsBackgroundConfig {
+            alpha_1_init: 1.0,
+            alpha_2_init: 1.0,
+            fit_alpha_1: false,
+            fit_alpha_2: true,
+        });
+
+        let input = InputData3D::Counts {
+            sample_counts: sample.view(),
+            open_beam_counts: ob.view(),
+        };
+
+        let result = spatial_map_typed(&input, &config, None, None, None).unwrap();
+        assert_eq!(result.n_converged, 0);
+        assert!(
+            result.density_maps[0].iter().all(|v| v.is_nan()),
+            "failed pixels must remain NaN rather than looking like zero-density fits"
+        );
+        assert!(
+            result.chi_squared_map.iter().all(|v| v.is_nan()),
+            "failed pixels must retain NaN chi-squared"
+        );
     }
 
     /// Spatial map with isotope groups: 2 isotopes in 1 group on a 2×2 grid.

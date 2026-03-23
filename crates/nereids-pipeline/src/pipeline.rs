@@ -149,11 +149,12 @@ pub enum SolverConfig {
 ///   Y(E) = α₁ · [Φ(E) · exp(-Σ nᵢσᵢ(E))] + α₂ · B(E)
 ///
 /// where Φ(E) is the incident flux and B(E) is detector/gamma background.
-/// Both are estimated from the open beam data via spatial averaging.
+/// The reference Φ(E) / B(E) spectra are supplied by the caller or by
+/// spatial pre-processing; this config only controls the fitted scale factors.
 ///
 /// This is structurally different from the transmission background model
 /// ([`BackgroundConfig`]) because:
-/// - Φ and B are estimated once from spatial averaging, not fitted per pixel
+/// - Φ and B are reference spectra, not fitted per pixel
 /// - α₁ and α₂ are optional per-pixel scale corrections
 /// - All terms are non-negative (required for valid Poisson NLL)
 #[derive(Debug, Clone)]
@@ -448,7 +449,7 @@ impl UnifiedFitConfig {
 /// | Transmission | LM | LM chi-squared with optional SAMMY background |
 /// | Transmission | KL | Poisson NLL on transmission with optional background |
 /// | Counts | KL | Poisson NLL on raw counts (statistically optimal) |
-/// | Counts | LM | Convert to T internally, warn, route to LM |
+/// | Counts | LM | Convert to T internally and route to LM |
 /// | CountsWithNuisance | KL | Direct Poisson with user-supplied nuisance |
 pub fn fit_spectrum_typed(
     input: &InputData,
@@ -550,7 +551,8 @@ pub fn fit_spectrum_typed(
             },
             SolverConfig::PoissonKL(poisson_cfg),
         ) => {
-            // Estimate nuisance (flux + background) from open beam
+            // Use open beam as the flux reference. Detector background is
+            // currently assumed zero on this convenience path.
             let flux: Vec<f64> = open_beam_counts.to_vec();
             let background = vec![0.0f64; n_e];
             fit_counts_poisson(sample_counts, &flux, &background, config, poisson_cfg)
@@ -566,7 +568,7 @@ pub fn fit_spectrum_typed(
             SolverConfig::PoissonKL(poisson_cfg),
         ) => fit_counts_poisson(sample_counts, flux, background, config, poisson_cfg),
 
-        // ── Counts + LM: convert to transmission, warn ──
+        // ── Counts + LM: convert to transmission ──
         (
             InputData::Counts {
                 sample_counts,
@@ -701,7 +703,7 @@ fn fit_transmission_poisson(
         None
     };
 
-    // KL background model: T_out = T_inner + b₀ + b₁/√E
+    // KL transmission background model: T_out = T_inner + b₀ + b₁/√E
     let bg_base = param_vec.len();
     let kl_bg = if config.transmission_background.is_some() {
         param_vec.push(FitParameter {
@@ -855,6 +857,50 @@ fn fit_counts_poisson(
         None
     };
 
+    let counts_bg = if let Some(bg) = config.counts_background() {
+        if bg.fit_alpha_1 && flux.iter().all(|&v| v.abs() <= 1e-12) {
+            return Err(PipelineError::InvalidParameter(
+                "counts background alpha_1 cannot be fitted with zero flux reference".into(),
+            ));
+        }
+        if bg.fit_alpha_2 && background.iter().all(|&v| v.abs() <= 1e-12) {
+            return Err(PipelineError::InvalidParameter(
+                "counts background alpha_2 cannot be fitted with zero detector background reference"
+                    .into(),
+            ));
+        }
+
+        let alpha1_idx = param_vec.len();
+        param_vec.push(if bg.fit_alpha_1 {
+            FitParameter {
+                name: "alpha_1".into(),
+                value: bg.alpha_1_init,
+                lower: 0.0,
+                upper: 10.0,
+                fixed: false,
+            }
+        } else {
+            FitParameter::fixed("alpha_1", bg.alpha_1_init)
+        });
+
+        let alpha2_idx = param_vec.len();
+        param_vec.push(if bg.fit_alpha_2 {
+            FitParameter {
+                name: "alpha_2".into(),
+                value: bg.alpha_2_init,
+                lower: 0.0,
+                upper: 10.0,
+                fixed: false,
+            }
+        } else {
+            FitParameter::fixed("alpha_2", bg.alpha_2_init)
+        });
+
+        Some((alpha1_idx, alpha2_idx))
+    } else {
+        None
+    };
+
     let mut params = ParameterSet::new(param_vec);
 
     let t_model = build_transmission_model(config, n_density_params, temperature_index)?;
@@ -874,25 +920,55 @@ fn fit_counts_poisson(
             b1_index: b1_idx,
             n_params: params.params.len(),
         };
-        let counts_model = poisson::CountsModel {
-            transmission_model: &wrapped,
-            flux,
-            background,
-            n_params: params.params.len(),
+        let (pr, y_model) = if let Some((alpha1_idx, alpha2_idx)) = counts_bg {
+            let counts_model = poisson::CountsBackgroundScaleModel {
+                transmission_model: &wrapped,
+                flux,
+                background,
+                alpha1_index: alpha1_idx,
+                alpha2_index: alpha2_idx,
+                n_params: params.params.len(),
+            };
+            let pr = poisson::poisson_fit(&counts_model, sample_counts, &mut params, poisson_cfg)?;
+            let y_model = counts_model.evaluate(&pr.params)?;
+            (pr, y_model)
+        } else {
+            let counts_model = poisson::CountsModel {
+                transmission_model: &wrapped,
+                flux,
+                background,
+                n_params: params.params.len(),
+            };
+            let pr = poisson::poisson_fit(&counts_model, sample_counts, &mut params, poisson_cfg)?;
+            let y_model = counts_model.evaluate(&pr.params)?;
+            (pr, y_model)
         };
-        let pr = poisson::poisson_fit(&counts_model, sample_counts, &mut params, poisson_cfg)?;
-        let y_model = counts_model.evaluate(&pr.params)?;
         (pr, y_model)
     } else {
-        // Wrap in counts model: Y = flux * T(theta) + background
-        let counts_model = poisson::CountsModel {
-            transmission_model: &*t_model,
-            flux,
-            background,
-            n_params: params.params.len(),
+        let (pr, y_model) = if let Some((alpha1_idx, alpha2_idx)) = counts_bg {
+            let counts_model = poisson::CountsBackgroundScaleModel {
+                transmission_model: &*t_model,
+                flux,
+                background,
+                alpha1_index: alpha1_idx,
+                alpha2_index: alpha2_idx,
+                n_params: params.params.len(),
+            };
+            let pr = poisson::poisson_fit(&counts_model, sample_counts, &mut params, poisson_cfg)?;
+            let y_model = counts_model.evaluate(&pr.params)?;
+            (pr, y_model)
+        } else {
+            // Wrap in counts model: Y = flux * T(theta) + background
+            let counts_model = poisson::CountsModel {
+                transmission_model: &*t_model,
+                flux,
+                background,
+                n_params: params.params.len(),
+            };
+            let pr = poisson::poisson_fit(&counts_model, sample_counts, &mut params, poisson_cfg)?;
+            let y_model = counts_model.evaluate(&pr.params)?;
+            (pr, y_model)
         };
-        let pr = poisson::poisson_fit(&counts_model, sample_counts, &mut params, poisson_cfg)?;
-        let y_model = counts_model.evaluate(&pr.params)?;
         (pr, y_model)
     };
 
@@ -908,10 +984,12 @@ fn fit_counts_poisson(
 
     let densities: Vec<f64> = (0..n_density_params).map(|i| pr.params[i]).collect();
     let fitted_temp = temperature_index.map(|idx| pr.params[idx]);
+    let fitted_alpha1 = counts_bg.map_or(1.0, |(alpha1_idx, _)| pr.params[alpha1_idx]);
+    let fitted_alpha2 = counts_bg.map_or(0.0, |(_, alpha2_idx)| pr.params[alpha2_idx]);
     let fitted_background = if let Some((b0_idx, b1_idx)) = kl_bg {
-        [pr.params[b0_idx], pr.params[b1_idx], 0.0]
+        [pr.params[b0_idx], pr.params[b1_idx], fitted_alpha2]
     } else {
-        [0.0, 0.0, 0.0]
+        [0.0, 0.0, fitted_alpha2]
     };
 
     Ok(SpectrumFitResult {
@@ -922,7 +1000,7 @@ fn fit_counts_poisson(
         iterations: pr.iterations,
         temperature_k: fitted_temp,
         temperature_k_unc: None,
-        anorm: 1.0,
+        anorm: fitted_alpha1,
         background: fitted_background,
     })
 }
@@ -1260,9 +1338,12 @@ pub struct SpectrumFitResult {
     pub temperature_k: Option<f64>,
     /// 1-sigma uncertainty on the fitted temperature (from covariance matrix).
     pub temperature_k_unc: Option<f64>,
-    /// Fitted normalization factor (1.0 if background not enabled).
+    /// Fitted normalization / signal-scale parameter.
+    /// Transmission LM uses `Anorm`; counts background scaling uses `alpha_1`.
     pub anorm: f64,
-    /// Fitted background parameters \[BackA, BackB, BackC\] (all 0.0 if not enabled).
+    /// Fitted background parameter triplet.
+    /// Transmission LM uses `[BackA, BackB, BackC]`.
+    /// Counts KL background uses `[b0, b1, alpha_2]`.
     pub background: [f64; 3],
 }
 
@@ -1368,7 +1449,7 @@ mod tests {
     #[test]
     fn test_typed_transmission_lm_recovers_density() {
         let data = u238_single_resonance();
-        let true_density = 0.0005;
+        let true_density = 0.002;
         let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
         let (t, sigma) = synthetic_transmission(&data, true_density, &energies);
 
@@ -1433,7 +1514,7 @@ mod tests {
     #[test]
     fn test_typed_counts_kl_recovers_density() {
         let data = u238_single_resonance();
-        let true_density = 0.0005;
+        let true_density = 0.002;
         let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
         let (sample, open_beam) = synthetic_counts(&data, true_density, &energies, 1000.0);
 
@@ -1953,6 +2034,73 @@ mod tests {
             (result.background[1] - true_b1).abs() < 5e-3,
             "background b1: fitted={}, true={true_b1}",
             result.background[1]
+        );
+    }
+
+    #[test]
+    fn test_typed_counts_poisson_kl_with_counts_background_scales() {
+        let data = u238_single_resonance();
+        let true_density = 0.002;
+        let true_alpha1 = 0.92;
+        let true_alpha2 = 1.35;
+        let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
+        let (t, _) = synthetic_transmission(&data, true_density, &energies);
+        let flux = vec![120.0; energies.len()];
+        let background: Vec<f64> = energies
+            .iter()
+            .map(|&e| 30.0 + 8.0 / e.sqrt())
+            .collect();
+        let sample_counts: Vec<f64> = t
+            .iter()
+            .zip(flux.iter())
+            .zip(background.iter())
+            .map(|((&ti, &f), &bg)| true_alpha1 * f * ti + true_alpha2 * bg)
+            .collect();
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig {
+            max_iter: 120,
+            gauss_newton_lambda: 1e-4,
+            ..PoissonConfig::default()
+        }))
+        .with_counts_background(CountsBackgroundConfig {
+            alpha_1_init: 1.0,
+            alpha_2_init: 1.0,
+            fit_alpha_1: true,
+            fit_alpha_2: true,
+        });
+
+        let input = InputData::CountsWithNuisance {
+            sample_counts,
+            flux,
+            background,
+        };
+
+        let result = fit_spectrum_typed(&input, &config).unwrap();
+
+        assert!(result.converged, "fit did not converge: {result:?}");
+        assert!(
+            (result.densities[0] - true_density).abs() / true_density < 0.02,
+            "density: fitted={}, true={true_density}",
+            result.densities[0]
+        );
+        assert!(
+            (result.anorm - true_alpha1).abs() < 5e-3,
+            "alpha_1/anorm: fitted={}, true={true_alpha1}",
+            result.anorm
+        );
+        assert!(
+            (result.background[2] - true_alpha2).abs() < 5e-3,
+            "alpha_2/background[2]: fitted={}, true={true_alpha2}",
+            result.background[2]
         );
     }
 

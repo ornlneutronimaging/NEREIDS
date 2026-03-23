@@ -393,9 +393,12 @@ struct PyFitResult {
     temperature_k: Option<f64>,
     /// 1-sigma uncertainty on fitted temperature (K).
     temperature_k_unc: Option<f64>,
-    /// Fitted normalization factor (1.0 when background not enabled).
+    /// Fitted normalization / signal-scale parameter.
+    /// Transmission LM uses `Anorm`; counts background scaling uses `alpha_1`.
     anorm: f64,
-    /// Fitted background parameters [BackA, BackB, BackC] (all 0.0 when not enabled).
+    /// Fitted background parameter triplet.
+    /// Transmission LM uses `[BackA, BackB, BackC]`.
+    /// Counts KL background uses `[b0, b1, alpha_2]`.
     background: [f64; 3],
 }
 
@@ -453,13 +456,13 @@ impl PyFitResult {
         self.temperature_k_unc
     }
 
-    /// Fitted normalization factor (1.0 if background not enabled).
+    /// Fitted normalization / signal-scale parameter.
     #[getter]
     fn anorm(&self) -> f64 {
         self.anorm
     }
 
-    /// Fitted background parameters (BackA, BackB, BackC).
+    /// Fitted background parameter triplet.
     #[getter]
     fn background(&self) -> [f64; 3] {
         self.background
@@ -552,9 +555,9 @@ struct PySpatialResult {
     shape: (usize, usize),
     /// Per-pixel fitted temperature (None when fit_temperature=False).
     temperature_map: Option<Py<PyArray2<f64>>>,
-    /// Per-pixel normalization factor (None when background=False).
+    /// Per-pixel normalization / signal-scale map (None when background=False).
     anorm_map: Option<Py<PyArray2<f64>>>,
-    /// Per-pixel background parameters [BackA, BackB, BackC] (None when background=False).
+    /// Per-pixel background parameter maps (None when background=False).
     background_maps: Option<[Py<PyArray2<f64>>; 3]>,
 }
 
@@ -620,8 +623,8 @@ impl PySpatialResult {
         self.anorm_map.as_ref().map(|m| m.bind(py).clone())
     }
 
-    /// Per-pixel background parameter maps [BackA, BackB, BackC]
-    /// (None when background fitting was disabled).
+    /// Per-pixel background parameter maps
+    /// (transmission LM: `[BackA, BackB, BackC]`; counts KL: `[b0, b1, alpha_2]`).
     #[getter]
     fn background_maps<'py>(&self, py: Python<'py>) -> Option<Vec<Bound<'py, PyArray2<f64>>>> {
         self.background_maps
