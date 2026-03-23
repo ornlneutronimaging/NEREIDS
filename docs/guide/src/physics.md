@@ -50,7 +50,8 @@ total cross-section for isotope i.
 
 - Module: [`transmission`](api/nereids_physics/transmission/)
 - SAMMY reference: `cro/`, `xxx/` modules, manual Sec 2, Sec 5
-- Handles multi-isotope samples with individual Doppler temperatures
+- Handles multi-isotope samples with shared Doppler temperature
+  (one global temperature parameter, optionally fitted jointly with densities)
 
 ## Fitting Engines
 

@@ -2646,7 +2646,7 @@ fn py_spatial_map_typed<'py>(
 /// Returns:
 ///     FitResult with densities, uncertainties, chi2, etc.
 ///
-/// For raw-count fitting, use `fit_counts_spectrum_typed(...)`.
+/// For pre-normalized transmission data, use `fit_spectrum_typed(...)`.
 #[pyfunction]
 #[pyo3(name = "fit_counts_spectrum_typed", signature = (
     sample_counts, open_beam_counts, energies, isotopes=None, *,
@@ -2834,16 +2834,15 @@ fn py_fit_counts_spectrum_typed<'py>(
     })
 }
 
-/// Fit a single spectrum using the typed input data API.
+/// Fit a single pre-normalized transmission spectrum.
 ///
-/// Dispatches per-pixel fitting based on the InputData type:
-///   - from_counts → Poisson KL on raw counts (statistically optimal)
-///   - from_transmission → LM by default, KL opt-in via solver="kl"
+/// This function accepts **transmission** data only (T = sample/open-beam).
+/// For raw-count fitting, use `fit_counts_spectrum_typed(...)`.
 ///
 /// Either `isotopes` or `groups` must be provided, but not both.
 ///
 /// Args:
-///     transmission: 1D transmission spectrum.
+///     transmission: 1D transmission spectrum (pre-normalized).
 ///     uncertainty: 1D uncertainty (same length as transmission).
 ///     energies: 1D energy grid in eV (ascending).
 ///     isotopes: list of (ResonanceData, initial_density) tuples (mutually exclusive with groups).

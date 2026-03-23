@@ -448,6 +448,51 @@ fn analysis_spectrum_column(ui: &mut egui::Ui, state: &mut AppState) {
                 });
             }
         }
+
+        // Group density results — only display when the result length matches
+        // the current config (guards against stale results after config change).
+        let enabled_individual_count = state
+            .isotope_entries
+            .iter()
+            .filter(|e| e.enabled && e.resonance_data.is_some())
+            .count();
+        let enabled_group_count = state
+            .isotope_groups
+            .iter()
+            .filter(|g| g.enabled && g.overall_status() == EndfStatus::Loaded)
+            .count();
+        if enabled_individual_count + enabled_group_count == result.densities.len() {
+            let mut group_idx = enabled_individual_count;
+            for group in &state.isotope_groups {
+                if group.enabled && group.overall_status() == EndfStatus::Loaded {
+                    if group_idx < result.densities.len() {
+                        let dot_color = design::isotope_dot_color(&group.name);
+                        ui.horizontal(|ui| {
+                            let (rect, _) = ui
+                                .allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                            ui.painter().circle_filled(rect.center(), 4.0, dot_color);
+                            if state.uncertainty_is_estimated {
+                                ui.label(format!(
+                                    "{}: {:.4e}",
+                                    group.name, result.densities[group_idx]
+                                ));
+                            } else {
+                                let unc_str = result
+                                    .uncertainties
+                                    .as_ref()
+                                    .and_then(|u| u.get(group_idx))
+                                    .map_or("N/A".to_string(), |u| format!("{:.2e}", u));
+                                ui.label(format!(
+                                    "{}: {:.4e} \u{00b1} {}",
+                                    group.name, result.densities[group_idx], unc_str
+                                ));
+                            }
+                        });
+                    }
+                    group_idx += 1;
+                }
+            }
+        }
     }
 }
 
@@ -572,7 +617,7 @@ fn bottom_dock(ctx: &egui::Context, state: &mut AppState) {
 
 /// Isotopes table (read-only reference view; editing is in the left sidebar).
 fn dock_isotopes(ui: &mut egui::Ui, state: &AppState) {
-    if state.isotope_entries.is_empty() {
+    if state.isotope_entries.is_empty() && state.isotope_groups.is_empty() {
         ui.label(
             egui::RichText::new(
                 "No isotopes configured. Add isotopes in Guided \u{2192} Configure.",
@@ -640,6 +685,55 @@ fn dock_isotopes(ui: &mut egui::Ui, state: &AppState) {
                 ui.end_row();
             }
         });
+
+    // Isotope groups
+    if !state.isotope_groups.is_empty() {
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("Groups").small().strong());
+        ui.add_space(4.0);
+
+        egui::Grid::new("dock_group_grid")
+            .num_columns(4)
+            .spacing([12.0, 4.0])
+            .striped(true)
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new("On").small().strong());
+                ui.label(egui::RichText::new("Name").small().strong());
+                ui.label(egui::RichText::new("Density").small().strong());
+                ui.label(egui::RichText::new("ENDF").small().strong());
+                ui.end_row();
+
+                for group in &state.isotope_groups {
+                    let icon = if group.enabled {
+                        "\u{2611}"
+                    } else {
+                        "\u{2610}"
+                    };
+                    ui.label(egui::RichText::new(icon).small());
+
+                    ui.horizontal(|ui| {
+                        let dot_color = design::isotope_dot_color(&group.name);
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                        ui.painter().circle_filled(rect.center(), 3.0, dot_color);
+                        ui.label(egui::RichText::new(&group.name).small());
+                    });
+
+                    ui.label(egui::RichText::new(format!("{:.4e}", group.initial_density)).small());
+
+                    let status = group.overall_status();
+                    let (badge_text, badge_variant) = match status {
+                        EndfStatus::Pending => ("Pending", design::BadgeVariant::Orange),
+                        EndfStatus::Fetching => ("...", design::BadgeVariant::Orange),
+                        EndfStatus::Loaded => ("OK", design::BadgeVariant::Green),
+                        EndfStatus::Failed => ("ERR", design::BadgeVariant::Red),
+                    };
+                    design::badge(ui, badge_text, badge_variant);
+
+                    ui.end_row();
+                }
+            });
+    }
 }
 
 /// Residuals dock tab — shows residual plot + statistics for the selected pixel.
@@ -820,18 +914,17 @@ fn build_residuals_cache(
         return None;
     }
 
-    // Collect resonance data for enabled isotopes.
-    // Note: when groups are present, this only covers individual isotopes.
-    // Group residuals require group-to-density index mapping, which is a
-    // future enhancement — for now the length guard below returns None.
-    let resonance_data: Vec<_> = state
-        .isotope_entries
-        .iter()
-        .filter(|e| e.enabled && e.resonance_data.is_some())
-        .filter_map(|e| e.resonance_data.clone())
-        .collect();
-    if resonance_data.len() != densities.len() {
+    // Collect resonance data for all enabled isotopes and groups.
+    let (resonance_data, density_indices, density_ratios) =
+        design::collect_all_resonance_data_with_mapping(state);
+    if resonance_data.is_empty() {
         return None;
+    }
+
+    // Guard: density parameter count must match the mapping's expected count.
+    let n_density_params = density_indices.iter().max().map_or(0, |&m| m + 1);
+    if densities.len() != n_density_params {
+        return None; // stale result with different isotope config
     }
 
     // Build instrument params from current resolution settings.
@@ -846,13 +939,12 @@ fn build_residuals_cache(
         .map(|resolution| std::sync::Arc::new(InstrumentParams { resolution }))
     };
 
-    let n = densities.len();
     let model = nereids_fitting::transmission_model::TransmissionFitModel::new(
         energies.clone(),
         resonance_data,
         temperature_k,
         instrument,
-        ((0..n).collect(), vec![1.0; n]),
+        (density_indices, density_ratios),
         None,
         None,
     )
@@ -1195,7 +1287,7 @@ fn isotopes_card(ui: &mut egui::Ui, state: &mut AppState) {
     use crate::state::GuidedStep;
 
     design::card_with_header(ui, "Isotopes", None, |ui| {
-        if state.isotope_entries.is_empty() {
+        if state.isotope_entries.is_empty() && state.isotope_groups.is_empty() {
             ui.label(
                 egui::RichText::new("No isotopes — configure in Guided mode.")
                     .small()
@@ -1238,6 +1330,53 @@ fn isotopes_card(ui: &mut egui::Ui, state: &mut AppState) {
 
                 // ENDF status
                 let (badge_text, badge_variant) = match state.isotope_entries[i].endf_status {
+                    crate::state::EndfStatus::Pending => ("?", design::BadgeVariant::Orange),
+                    crate::state::EndfStatus::Fetching => ("..", design::BadgeVariant::Orange),
+                    crate::state::EndfStatus::Loaded => ("\u{2713}", design::BadgeVariant::Green),
+                    crate::state::EndfStatus::Failed => ("!", design::BadgeVariant::Red),
+                };
+                design::badge(ui, badge_text, badge_variant);
+            });
+        }
+
+        // Isotope groups
+        for i in 0..state.isotope_groups.len() {
+            ui.horizontal(|ui| {
+                // Enable checkbox
+                let prev_enabled = state.isotope_groups[i].enabled;
+                ui.add_enabled(
+                    !locked,
+                    egui::Checkbox::without_text(&mut state.isotope_groups[i].enabled),
+                );
+                if state.isotope_groups[i].enabled != prev_enabled {
+                    state.mark_dirty(GuidedStep::Analyze);
+                    state.pixel_fit_result = None;
+                    state.residuals_cache = None;
+                }
+
+                // Colored dot + name
+                let dot_color = design::isotope_dot_color(&state.isotope_groups[i].name);
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                ui.painter().circle_filled(rect.center(), 3.0, dot_color);
+                ui.label(egui::RichText::new(&state.isotope_groups[i].name).small());
+
+                // Editable density
+                let prev_density = state.isotope_groups[i].initial_density;
+                ui.add_enabled(
+                    !locked,
+                    egui::DragValue::new(&mut state.isotope_groups[i].initial_density)
+                        .speed(1e-5)
+                        .range(0.0..=1.0),
+                );
+                if state.isotope_groups[i].initial_density != prev_density {
+                    state.mark_dirty(GuidedStep::Analyze);
+                    state.pixel_fit_result = None;
+                    state.residuals_cache = None;
+                }
+
+                // ENDF status
+                let status = state.isotope_groups[i].overall_status();
+                let (badge_text, badge_variant) = match status {
                     crate::state::EndfStatus::Pending => ("?", design::BadgeVariant::Orange),
                     crate::state::EndfStatus::Fetching => ("..", design::BadgeVariant::Orange),
                     crate::state::EndfStatus::Loaded => ("\u{2713}", design::BadgeVariant::Green),
