@@ -129,6 +129,11 @@ pub struct ProjectSnapshot {
     /// Fitted background [BackA, BackB, BackC] from single-pixel fit.
     pub single_fit_background: Option<[f64; 3]>,
 
+    // -- flags --
+    /// True when per-bin uncertainty was estimated (not measured).
+    /// Drives chi-squared warning display in the GUI.
+    pub uncertainty_is_estimated: Option<bool>,
+
     // -- endf_cache --
     /// (symbol, resonance_data) pairs for offline loading.
     pub endf_cache: Vec<(String, ResonanceData)>,
@@ -204,6 +209,7 @@ impl Default for ProjectSnapshot {
             single_fit_labels: None,
             single_fit_anorm: None,
             single_fit_background: None,
+            uncertainty_is_estimated: None,
             endf_cache: vec![],
             provenance: vec![],
         }
@@ -401,6 +407,9 @@ fn write_config(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoError
     write_u32_attr(&solver, "max_iter", snap.max_iter)?;
     write_f64_attr(&solver, "temperature_k", snap.temperature_k)?;
     write_bool_attr(&solver, "fit_temperature", snap.fit_temperature)?;
+    if let Some(ue) = snap.uncertainty_is_estimated {
+        write_bool_attr(&solver, "uncertainty_is_estimated", ue)?;
+    }
 
     // Resolution
     let res = config
@@ -1042,6 +1051,7 @@ fn read_config(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoEr
     snap.max_iter = read_u32_attr(&solver, "max_iter")?;
     snap.temperature_k = read_f64_attr(&solver, "temperature_k")?;
     snap.fit_temperature = read_bool_attr(&solver, "fit_temperature")?;
+    snap.uncertainty_is_estimated = read_bool_attr(&solver, "uncertainty_is_estimated").ok();
 
     // Resolution
     let res = config
@@ -1576,6 +1586,7 @@ mod tests {
             single_fit_labels: None,
             single_fit_anorm: None,
             single_fit_background: None,
+            uncertainty_is_estimated: Some(false),
             endf_cache: vec![],
             provenance: vec![],
         }

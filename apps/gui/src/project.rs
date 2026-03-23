@@ -234,6 +234,7 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         max_iter: state.lm_config.max_iter.min(u32::MAX as usize) as u32,
         temperature_k: state.temperature_k,
         fit_temperature: state.fit_temperature,
+        uncertainty_is_estimated: Some(state.uncertainty_is_estimated),
         resolution_enabled: state.resolution_enabled,
         resolution_kind: resolution_kind.into(),
         delta_t_us,
@@ -724,6 +725,7 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
     state.lm_config.max_iter = snap.max_iter as usize;
     state.temperature_k = snap.temperature_k;
     state.fit_temperature = snap.fit_temperature;
+    state.uncertainty_is_estimated = snap.uncertainty_is_estimated.unwrap_or(false);
 
     // 10. Restore resolution
     state.resolution_enabled = snap.resolution_enabled;

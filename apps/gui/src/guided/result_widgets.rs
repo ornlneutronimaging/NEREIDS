@@ -247,7 +247,17 @@ pub fn pixel_inspector(ui: &mut egui::Ui, state: &AppState) {
         &format!("Pixel Inspector ({}, {})", y, x),
         conv_badge,
         |ui| {
-            ui.label(format!("chi2_r = {:.4}", result.chi_squared_map[[y, x]]));
+            if state.uncertainty_is_estimated {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "chi2_r = {:.4} (approx.)",
+                        result.chi_squared_map[[y, x]]
+                    ))
+                    .color(crate::theme::semantic::ORANGE),
+                );
+            } else {
+                ui.label(format!("chi2_r = {:.4}", result.chi_squared_map[[y, x]]));
+            }
 
             if let Some(ref t_map) = result.temperature_map {
                 let t = t_map[[y, x]];
