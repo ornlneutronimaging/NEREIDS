@@ -2479,4 +2479,69 @@ mod tests {
         assert!(loaded.single_fit_pixel.is_none());
         assert!(loaded.single_fit_labels.is_none());
     }
+
+    #[test]
+    fn test_roundtrip_isotope_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt_groups.nrd.h5");
+        let mut snap = minimal_snapshot();
+
+        snap.isotope_group_z = vec![72, 74];
+        snap.isotope_group_names = vec!["Hf (nat)".into(), "W (nat)".into()];
+        snap.isotope_group_density = vec![0.001, 0.0005];
+        snap.isotope_group_enabled = vec![true, false];
+        snap.isotope_group_members_json = vec![
+            r#"[{"a":177,"symbol":"Hf-177","ratio":0.186},{"a":178,"symbol":"Hf-178","ratio":0.273}]"#.into(),
+            r#"[{"a":182,"symbol":"W-182","ratio":0.265}]"#.into(),
+        ];
+
+        save_project(&path, &snap).unwrap();
+        let loaded = load_project(&path).unwrap();
+
+        assert_eq!(loaded.isotope_group_z, vec![72, 74]);
+        assert_eq!(loaded.isotope_group_names, vec!["Hf (nat)", "W (nat)"]);
+        assert!((loaded.isotope_group_density[0] - 0.001).abs() < 1e-10);
+        assert!((loaded.isotope_group_density[1] - 0.0005).abs() < 1e-10);
+        assert_eq!(loaded.isotope_group_enabled, vec![true, false]);
+        assert_eq!(loaded.isotope_group_members_json.len(), 2);
+
+        // Parse first group's JSON and verify members
+        let members: Vec<serde_json::Value> =
+            serde_json::from_str(&loaded.isotope_group_members_json[0]).unwrap();
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0]["a"].as_u64().unwrap(), 177);
+        assert_eq!(members[0]["symbol"].as_str().unwrap(), "Hf-177");
+        assert!((members[0]["ratio"].as_f64().unwrap() - 0.186).abs() < 1e-10);
+        assert_eq!(members[1]["a"].as_u64().unwrap(), 178);
+        assert_eq!(members[1]["symbol"].as_str().unwrap(), "Hf-178");
+        assert!((members[1]["ratio"].as_f64().unwrap() - 0.273).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_roundtrip_workflow_mode_and_event_params() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt_workflow.nrd.h5");
+        let mut snap = minimal_snapshot();
+
+        snap.input_mode = "hdf5_event".into();
+        snap.analysis_mode = "spatial_binning".into();
+        snap.spatial_binning_factor = Some(4);
+        snap.event_n_bins = 500;
+        snap.event_tof_min_us = 10.0;
+        snap.event_tof_max_us = 30000.0;
+        snap.event_height = 512;
+        snap.event_width = 512;
+
+        save_project(&path, &snap).unwrap();
+        let loaded = load_project(&path).unwrap();
+
+        assert_eq!(loaded.input_mode, "hdf5_event");
+        assert_eq!(loaded.analysis_mode, "spatial_binning");
+        assert_eq!(loaded.spatial_binning_factor, Some(4));
+        assert_eq!(loaded.event_n_bins, 500);
+        assert!((loaded.event_tof_min_us - 10.0).abs() < 1e-10);
+        assert!((loaded.event_tof_max_us - 30000.0).abs() < 1e-10);
+        assert_eq!(loaded.event_height, 512);
+        assert_eq!(loaded.event_width, 512);
+    }
 }

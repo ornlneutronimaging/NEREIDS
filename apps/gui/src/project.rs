@@ -816,7 +816,8 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
         .isotope_group_z
         .len()
         .min(snap.isotope_group_names.len())
-        .min(snap.isotope_group_density.len());
+        .min(snap.isotope_group_density.len())
+        .min(snap.isotope_group_members_json.len());
     for i in 0..n_groups {
         let members: Vec<GroupMemberState> = snap
             .isotope_group_members_json
