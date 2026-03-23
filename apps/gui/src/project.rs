@@ -749,11 +749,20 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
         }
     };
 
-    // 4b. Restore analysis mode
+    // 4b. Restore analysis mode — for old files without analysis_mode,
+    // derive from fitting_type so single-spectrum projects don't become maps.
     state.analysis_mode = match snap.analysis_mode.as_str() {
         "roi_single" => AnalysisMode::RoiSingleSpectrum,
         "spatial_binning" => AnalysisMode::SpatialBinning(snap.spatial_binning_factor.unwrap_or(2)),
-        _ => AnalysisMode::FullSpatialMap,
+        "full_spatial" => AnalysisMode::FullSpatialMap,
+        _ => {
+            // Legacy fallback: single → RoiSingleSpectrum, spatial → FullSpatialMap
+            if snap.fitting_type == "single" {
+                AnalysisMode::RoiSingleSpectrum
+            } else {
+                AnalysisMode::FullSpatialMap
+            }
+        }
     };
 
     // 4c. Restore event params
