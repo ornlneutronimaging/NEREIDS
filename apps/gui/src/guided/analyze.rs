@@ -959,9 +959,26 @@ fn fit_pixel(state: &mut AppState) {
         }
     }
 
-    let input = InputData::Transmission {
-        transmission: t_spectrum,
-        uncertainty: sigma,
+    let input = if state.input_mode == InputMode::TiffPair {
+        if let (Some(sample), Some(open_beam)) = (&state.sample_data, &state.open_beam_data) {
+            let sample_counts: Vec<f64> = (0..n_energies).map(|e| sample[[e, y, x]]).collect();
+            let open_beam_counts: Vec<f64> =
+                (0..n_energies).map(|e| open_beam[[e, y, x]]).collect();
+            InputData::Counts {
+                sample_counts,
+                open_beam_counts,
+            }
+        } else {
+            InputData::Transmission {
+                transmission: t_spectrum,
+                uncertainty: sigma,
+            }
+        }
+    } else {
+        InputData::Transmission {
+            transmission: t_spectrum,
+            uncertainty: sigma,
+        }
     };
 
     let result = match nereids_pipeline::pipeline::fit_spectrum_typed(&input, &config) {
@@ -1047,6 +1064,7 @@ fn fit_roi(state: &mut AppState) {
     let mut sum_t = vec![0.0f64; n_tof];
     let mut sum_w = vec![0.0f64; n_tof]; // inverse-variance weights
     let mut n_pixels = 0usize;
+    let mut pixels: Vec<(usize, usize)> = Vec::new();
 
     for y in 0..height {
         for x in 0..width {
@@ -1054,6 +1072,7 @@ fn fit_roi(state: &mut AppState) {
                 continue;
             }
             n_pixels += 1;
+            pixels.push((y, x));
             for t in 0..n_tof {
                 let val = norm.transmission[[t, y, x]];
                 let sig = norm.uncertainty[[t, y, x]];
@@ -1103,9 +1122,39 @@ fn fit_roi(state: &mut AppState) {
         }
     }
 
-    let roi_input = InputData::Transmission {
-        transmission: avg_t,
-        uncertainty: sigma,
+    let roi_input = if state.input_mode == InputMode::TiffPair {
+        if let (Some(sample), Some(open_beam)) = (&state.sample_data, &state.open_beam_data) {
+            let sample_counts: Vec<f64> = (0..shape[0])
+                .map(|t| {
+                    pixels
+                        .iter()
+                        .map(|&(y, x)| sample[[t, y, x]].max(0.0))
+                        .sum::<f64>()
+                })
+                .collect();
+            let open_beam_counts: Vec<f64> = (0..shape[0])
+                .map(|t| {
+                    pixels
+                        .iter()
+                        .map(|&(y, x)| open_beam[[t, y, x]].max(0.0))
+                        .sum::<f64>()
+                })
+                .collect();
+            InputData::Counts {
+                sample_counts,
+                open_beam_counts,
+            }
+        } else {
+            InputData::Transmission {
+                transmission: avg_t,
+                uncertainty: sigma,
+            }
+        }
+    } else {
+        InputData::Transmission {
+            transmission: avg_t,
+            uncertainty: sigma,
+        }
     };
 
     let result = match nereids_pipeline::pipeline::fit_spectrum_typed(&roi_input, &config) {
@@ -1206,6 +1255,9 @@ pub fn run_spatial_map(state: &mut AppState) {
     };
     let (fp, progress) = crate::state::FittingProgress::new(n_live);
     state.fitting_progress = Some(fp);
+    let input_mode = state.input_mode;
+    let sample_data = state.sample_data.clone();
+    let open_beam_data = state.open_beam_data.clone();
 
     // Clone the egui context so the background thread can poke the GUI
     // event loop directly via ctx.request_repaint().  This sends an
@@ -1265,9 +1317,23 @@ pub fn run_spatial_map(state: &mut AppState) {
 
         // Run spatial_map_typed on the dedicated pool so its par_iter doesn't
         // share the global pool with inner physics par_iter calls.
-        let input = nereids_pipeline::spatial::InputData3D::Transmission {
-            transmission: norm.transmission.view(),
-            uncertainty: norm.uncertainty.view(),
+        let input = if input_mode == InputMode::TiffPair {
+            if let (Some(sample), Some(open_beam)) = (&sample_data, &open_beam_data) {
+                nereids_pipeline::spatial::InputData3D::Counts {
+                    sample_counts: sample.view(),
+                    open_beam_counts: open_beam.view(),
+                }
+            } else {
+                nereids_pipeline::spatial::InputData3D::Transmission {
+                    transmission: norm.transmission.view(),
+                    uncertainty: norm.uncertainty.view(),
+                }
+            }
+        } else {
+            nereids_pipeline::spatial::InputData3D::Transmission {
+                transmission: norm.transmission.view(),
+                uncertainty: norm.uncertainty.view(),
+            }
         };
         let result = pool.install(|| {
             nereids_pipeline::spatial::spatial_map_typed(

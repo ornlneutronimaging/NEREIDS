@@ -169,6 +169,10 @@ pub struct TransmissionFitModel {
     /// `FitModel::evaluate` takes `&self`.  Safe because `TransmissionFitModel`
     /// is constructed per-pixel and never shared across threads.
     cached_broadened_xs: RefCell<Option<Rc<Vec<Vec<f64>>>>>,
+    /// Cached analytical temperature derivative ∂σ/∂T, computed on-demand
+    /// by `analytical_jacobian()` when the temperature column is needed.
+    /// Invalidated when temperature changes (cleared in `evaluate()`).
+    cached_dxs_dt: RefCell<Option<Rc<Vec<Vec<f64>>>>>,
     /// Temperature at which `cached_broadened_xs` was computed.
     /// `Cell` is sufficient because `f64` is `Copy`.
     cached_temperature: Cell<f64>,
@@ -256,6 +260,7 @@ impl TransmissionFitModel {
             temperature_index,
             base_xs,
             cached_broadened_xs: RefCell::new(None),
+            cached_dxs_dt: RefCell::new(None),
             cached_temperature: Cell::new(f64::NAN),
         })
     }
@@ -293,6 +298,10 @@ impl FitModel for TransmissionFitModel {
             // Caching avoids redundant Doppler broadening on rejected LM steps
             // (same T, different lambda) and enables analytical_jacobian() to
             // read the broadened σ for density columns.
+            //
+            // Derivative ∂σ/∂T is computed on-demand in analytical_jacobian(),
+            // NOT here — evaluate() is called many times during line search
+            // trials, and the derivative overhead would dominate.
             let broadened_xs = if (temperature_k - self.cached_temperature.get()).abs() < 1e-15 {
                 Rc::clone(self.cached_broadened_xs.borrow().as_ref().unwrap())
             } else {
@@ -307,6 +316,8 @@ impl FitModel for TransmissionFitModel {
                     .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?,
                 );
                 *self.cached_broadened_xs.borrow_mut() = Some(Rc::clone(&xs));
+                // Invalidate derivative cache — temperature changed, old ∂σ/∂T stale.
+                *self.cached_dxs_dt.borrow_mut() = None;
                 self.cached_temperature.set(temperature_k);
                 xs
             };
@@ -352,10 +363,12 @@ impl FitModel for TransmissionFitModel {
     /// - **Density columns**: `∂T/∂nᵢ = -σᵢ(E)·T(E)` using cached broadened XS
     ///   from the most recent `evaluate()` call.  Same formula as
     ///   `PrecomputedTransmissionModel`, zero extra broadening calls.
-    /// - **Temperature column**: single forward finite-difference perturbation
-    ///   at T+dT.  Requires one extra `broadened_cross_sections_from_base()`
-    ///   call, which is dramatically cheaper than the N_free calls the LM
-    ///   solver would make with a full FD Jacobian.
+    /// - **Temperature column**: analytical chain rule via on-demand `∂σ/∂T`.
+    ///   `∂T/∂T_temp = -T(E) · Σᵢ nᵢ·rᵢ·∂σᵢ/∂T`.  The derivative is
+    ///   computed once per temperature via
+    ///   `broadened_cross_sections_with_analytical_derivative_from_base()`
+    ///   and cached until temperature changes.  Costs one broadening call
+    ///   per Jacobian (same as the old FD approach, but exact).
     ///
     /// Returns `None` for the no-base_xs path (full forward model), which
     /// falls back to finite-difference in the LM solver.
@@ -367,7 +380,7 @@ impl FitModel for TransmissionFitModel {
     ) -> Option<FlatMatrix> {
         // Only provide analytical Jacobian when base_xs is available
         // (temperature-fitting fast path with cached broadened XS).
-        let base_xs = self.base_xs.as_ref()?;
+        let _base_xs_guard = self.base_xs.as_ref()?;
         let cached_xs = self.cached_broadened_xs.borrow();
         let broadened_xs = cached_xs.as_ref()?;
 
@@ -414,34 +427,44 @@ impl FitModel for TransmissionFitModel {
             }
         }
 
-        // ── Temperature column: forward FD at T+dT ──
+        // ── Temperature column: analytical ∂T/∂T_temp ──
+        //
+        // Chain rule: ∂T(E)/∂T_temp = -T(E) · Σᵢ nᵢ · rᵢ · ∂σᵢ(E)/∂T
+        //
+        // Computed on-demand here (not in evaluate()) because evaluate()
+        // is called many times during line search trials where the
+        // derivative is not needed. Computing it here costs one extra
+        // broadening call per Jacobian, same as the old FD approach but
+        // with exact (not approximate) derivatives.
         if let Some(col) = temp_col {
-            let temperature_k = self.cached_temperature.get();
-            let dt = 1e-6 * (1.0 + temperature_k.abs());
-            let t_perturbed = temperature_k + dt;
-
-            let xs_perturbed = transmission::broadened_cross_sections_from_base(
-                &self.energies,
-                base_xs,
-                &self.resonance_data,
-                t_perturbed,
-                self.instrument.as_deref(),
-            )
-            .ok()?;
-
-            // Beer-Lambert at perturbed temperature with current densities and ratios.
-            let mut neg_opt = vec![0.0f64; n_e];
-            for (iso, xs) in xs_perturbed.iter().enumerate() {
-                let density = params[self.density_indices[iso]];
-                let ratio = self.density_ratios[iso];
-                for (j, &sigma) in xs.iter().enumerate() {
-                    neg_opt[j] -= density * ratio * sigma;
+            // Compute ∂σ/∂T on-demand if not cached at current temperature.
+            {
+                let needs_compute = self.cached_dxs_dt.borrow().as_ref().is_none();
+                if needs_compute {
+                    let base_xs = self.base_xs.as_ref()?;
+                    let temperature_k = self.cached_temperature.get();
+                    let (_, dxs_vec) =
+                        transmission::broadened_cross_sections_with_analytical_derivative_from_base(
+                            &self.energies,
+                            base_xs,
+                            &self.resonance_data,
+                            temperature_k,
+                            self.instrument.as_deref(),
+                        )
+                        .ok()?;
+                    *self.cached_dxs_dt.borrow_mut() = Some(Rc::new(dxs_vec));
                 }
             }
-            let y_perturbed: Vec<f64> = neg_opt.iter().map(|&d| d.exp()).collect();
-
+            let cached_dxs = self.cached_dxs_dt.borrow();
+            let dxs_dt = cached_dxs.as_ref()?;
             for i in 0..n_e {
-                *jacobian.get_mut(i, col) = (y_perturbed[i] - y_current[i]) / dt;
+                let mut sum_n_dsigma = 0.0f64;
+                for (iso, dxs) in dxs_dt.iter().enumerate() {
+                    let density = params[self.density_indices[iso]];
+                    let ratio = self.density_ratios[iso];
+                    sum_n_dsigma += density * ratio * dxs[i];
+                }
+                *jacobian.get_mut(i, col) = -y_current[i] * sum_n_dsigma;
             }
         }
 

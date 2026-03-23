@@ -149,11 +149,26 @@ pub enum SolverConfig {
 ///   Y(E) = α₁ · [Φ(E) · exp(-Σ nᵢσᵢ(E))] + α₂ · B(E)
 ///
 /// where Φ(E) is the incident flux and B(E) is detector/gamma background.
-/// Both are estimated from the open beam data via spatial averaging.
+/// The reference Φ(E) / B(E) spectra are supplied by the caller or by
+/// spatial pre-processing; this config only controls the fitted scale factors.
+///
+/// Important distinction:
+/// - This is a detector-space counts background model `B(E)`.
+/// - It is NOT the same as the transmission-lift background used by
+///   `BackgroundConfig`, which models additive uplift of the apparent
+///   transmission curve (for example gamma-tail structure that pushes
+///   transmission upward).
+///
+/// For VENUS MCP/TPX event detectors, the current working assumption is:
+/// - raw/open-beam is the correct normalization baseline
+/// - dark-current / CCD-style electronic offset is not modeled
+/// - rare ghost counts may exist at the hardware level, but are currently
+///   treated as negligible unless a detector-background reference spectrum
+///   is explicitly provided
 ///
 /// This is structurally different from the transmission background model
 /// ([`BackgroundConfig`]) because:
-/// - Φ and B are estimated once from spatial averaging, not fitted per pixel
+/// - Φ and B are reference spectra, not fitted per pixel
 /// - α₁ and α₂ are optional per-pixel scale corrections
 /// - All terms are non-negative (required for valid Poisson NLL)
 #[derive(Debug, Clone)]
@@ -448,7 +463,7 @@ impl UnifiedFitConfig {
 /// | Transmission | LM | LM chi-squared with optional SAMMY background |
 /// | Transmission | KL | Poisson NLL on transmission with optional background |
 /// | Counts | KL | Poisson NLL on raw counts (statistically optimal) |
-/// | Counts | LM | Convert to T internally, warn, route to LM |
+/// | Counts | LM | Convert to T internally and route to LM |
 /// | CountsWithNuisance | KL | Direct Poisson with user-supplied nuisance |
 pub fn fit_spectrum_typed(
     input: &InputData,
@@ -550,7 +565,20 @@ pub fn fit_spectrum_typed(
             },
             SolverConfig::PoissonKL(poisson_cfg),
         ) => {
-            // Estimate nuisance (flux + background) from open beam
+            // Convenience counts path:
+            // - open beam is used as the flux reference Φ(E)
+            // - detector-space counts background B_det(E) is currently
+            //   assumed zero unless the caller explicitly supplies nuisance
+            //   spectra via CountsWithNuisance
+            //
+            // This does NOT disable transmission background fitting.
+            // If config.transmission_background is enabled, fit_counts_poisson
+            // still fits the additive transmission-lift terms [b0, b1] inside
+            // the bracketed transmission model:
+            //   Y(E) = Φ(E) * [T(E) + b0 + b1/sqrt(E)] + B_det(E)
+            //
+            // That transmission-lift background is the mechanism currently
+            // used to absorb gamma-tail structure in VENUS-style data.
             let flux: Vec<f64> = open_beam_counts.to_vec();
             let background = vec![0.0f64; n_e];
             fit_counts_poisson(sample_counts, &flux, &background, config, poisson_cfg)
@@ -566,7 +594,7 @@ pub fn fit_spectrum_typed(
             SolverConfig::PoissonKL(poisson_cfg),
         ) => fit_counts_poisson(sample_counts, flux, background, config, poisson_cfg),
 
-        // ── Counts + LM: convert to transmission, warn ──
+        // ── Counts + LM: convert to transmission ──
         (
             InputData::Counts {
                 sample_counts,
@@ -682,16 +710,6 @@ fn fit_transmission_poisson(
     config: &UnifiedFitConfig,
     poisson_cfg: &PoissonConfig,
 ) -> Result<SpectrumFitResult, PipelineError> {
-    // KL+BG+temperature is not supported (NormalizedTransmissionModel
-    // doesn't support temperature in the Poisson gradient path).
-    if config.fit_temperature && config.transmission_background.is_some() {
-        return Err(PipelineError::InvalidParameter(
-            "Poisson KL with background + temperature fitting is not supported. \
-             Use KL without background, or LM with background."
-                .into(),
-        ));
-    }
-
     let n_density_params = config.n_density_params();
 
     let mut param_vec = build_density_params(config);
@@ -711,7 +729,7 @@ fn fit_transmission_poisson(
         None
     };
 
-    // KL background model: T_out = T_inner + b₀ + b₁/√E
+    // KL transmission background model: T_out = T_inner + b₀ + b₁/√E
     let bg_base = param_vec.len();
     let kl_bg = if config.transmission_background.is_some() {
         param_vec.push(FitParameter {
@@ -737,6 +755,16 @@ fn fit_transmission_poisson(
 
     let model = build_transmission_model(config, n_density_params, temperature_index)?;
 
+    let polish_cfg = if kl_bg.is_some() && temperature_index.is_some() {
+        let mut cfg = poisson_cfg.clone();
+        cfg.max_iter = cfg.max_iter.clamp(20, 80);
+        cfg.tol_param = (cfg.tol_param * 1e-3).max(1e-12);
+        cfg.gauss_newton_lambda = (cfg.gauss_newton_lambda * 0.1).max(1e-8);
+        Some(cfg)
+    } else {
+        None
+    };
+
     // Dispatch with KL-native background model or bare model.
     let result = if let Some((b0_idx, b1_idx)) = kl_bg {
         let inv_sqrt_e: Vec<f64> = config
@@ -749,8 +777,20 @@ fn fit_transmission_poisson(
             inv_sqrt_energies: inv_sqrt_e,
             b0_index: b0_idx,
             b1_index: b1_idx,
+            n_params: params.params.len(),
         };
-        let pr = poisson::poisson_fit(&wrapped, measured_t, &mut params, poisson_cfg)?;
+        let mut pr = poisson::poisson_fit(&wrapped, measured_t, &mut params, poisson_cfg)?;
+        if pr.converged
+            && let Some(ref polish) = polish_cfg
+        {
+            let polish_result = poisson::poisson_fit(&wrapped, measured_t, &mut params, polish)?;
+            if polish_result.converged {
+                pr = poisson::PoissonResult {
+                    iterations: pr.iterations + polish_result.iterations,
+                    ..polish_result
+                };
+            }
+        }
         poisson_to_lm_result(&wrapped, measured_t, sigma, &pr, &params)
     } else {
         let pr = poisson::poisson_fit(&*model, measured_t, &mut params, poisson_cfg)?;
@@ -758,11 +798,15 @@ fn fit_transmission_poisson(
     }?;
 
     let densities: Vec<f64> = (0..n_density_params).map(|i| result.params[i]).collect();
-    let uncertainties = result.covariance.as_ref().map(|cov| {
-        (0..n_density_params)
-            .map(|i| cov.get(i, i).sqrt())
-            .collect::<Vec<_>>()
-    });
+    let uncertainties = if result.converged {
+        result.covariance.as_ref().map(|cov| {
+            (0..n_density_params)
+                .map(|i| cov.get(i, i).sqrt())
+                .collect::<Vec<_>>()
+        })
+    } else {
+        None
+    };
 
     // Extract temperature from result if fitted.
     let fitted_temp = temperature_index.map(|idx| result.params[idx]);
@@ -817,23 +861,151 @@ fn fit_counts_poisson(
         None
     };
 
+    // KL background model: T_out = T_inner + b₀ + b₁/√E
+    let bg_base = param_vec.len();
+    let kl_bg = if config.transmission_background.is_some() {
+        param_vec.push(FitParameter {
+            name: "kl_b0".into(),
+            value: 0.0,
+            lower: 0.0,
+            upper: 0.5,
+            fixed: false,
+        });
+        param_vec.push(FitParameter {
+            name: "kl_b1".into(),
+            value: 0.0,
+            lower: 0.0,
+            upper: 0.5,
+            fixed: false,
+        });
+        Some((bg_base, bg_base + 1))
+    } else {
+        None
+    };
+
+    let counts_bg = if let Some(bg) = config.counts_background() {
+        // CountsBackgroundConfig only scales a supplied detector/background
+        // reference spectrum. It does not invent one from the open beam.
+        //
+        // If the caller wants to fit alpha_2, they must provide a nonzero
+        // background reference. This is deliberate: for MCP/TPX event data,
+        // any residual ghost/detector counts are currently treated as
+        // negligible unless independently characterized.
+        if bg.fit_alpha_1 && flux.iter().all(|&v| v.abs() <= 1e-12) {
+            return Err(PipelineError::InvalidParameter(
+                "counts background alpha_1 cannot be fitted with zero flux reference".into(),
+            ));
+        }
+        if bg.fit_alpha_2 && background.iter().all(|&v| v.abs() <= 1e-12) {
+            return Err(PipelineError::InvalidParameter(
+                "counts background alpha_2 cannot be fitted with zero detector background reference"
+                    .into(),
+            ));
+        }
+
+        let alpha1_idx = param_vec.len();
+        param_vec.push(if bg.fit_alpha_1 {
+            FitParameter {
+                name: "alpha_1".into(),
+                value: bg.alpha_1_init,
+                lower: 0.0,
+                upper: 10.0,
+                fixed: false,
+            }
+        } else {
+            FitParameter::fixed("alpha_1", bg.alpha_1_init)
+        });
+
+        let alpha2_idx = param_vec.len();
+        param_vec.push(if bg.fit_alpha_2 {
+            FitParameter {
+                name: "alpha_2".into(),
+                value: bg.alpha_2_init,
+                lower: 0.0,
+                upper: 10.0,
+                fixed: false,
+            }
+        } else {
+            FitParameter::fixed("alpha_2", bg.alpha_2_init)
+        });
+
+        Some((alpha1_idx, alpha2_idx))
+    } else {
+        None
+    };
+
     let mut params = ParameterSet::new(param_vec);
 
     let t_model = build_transmission_model(config, n_density_params, temperature_index)?;
-
-    // Wrap in counts model: Y = flux * T(theta) + background
-    let counts_model = poisson::CountsModel {
-        transmission_model: &*t_model,
-        flux,
-        background,
-    };
-
-    let pr = poisson::poisson_fit(&counts_model, sample_counts, &mut params, poisson_cfg)?;
-
-    // Compute Pearson chi-squared for display
-    let y_model = counts_model.evaluate(&pr.params)?;
     let n_free = params.n_free();
     let dof = sample_counts.len().saturating_sub(n_free).max(1);
+
+    let (pr, y_model) = if let Some((b0_idx, b1_idx)) = kl_bg {
+        let inv_sqrt_e: Vec<f64> = config
+            .energies()
+            .iter()
+            .map(|&e| 1.0 / e.max(1e-10).sqrt())
+            .collect();
+        let wrapped = poisson::TransmissionKLBackgroundModel {
+            inner: &*t_model,
+            inv_sqrt_energies: inv_sqrt_e,
+            b0_index: b0_idx,
+            b1_index: b1_idx,
+            n_params: params.params.len(),
+        };
+        let (pr, y_model) = if let Some((alpha1_idx, alpha2_idx)) = counts_bg {
+            let counts_model = poisson::CountsBackgroundScaleModel {
+                transmission_model: &wrapped,
+                flux,
+                background,
+                alpha1_index: alpha1_idx,
+                alpha2_index: alpha2_idx,
+                n_params: params.params.len(),
+            };
+            let pr = poisson::poisson_fit(&counts_model, sample_counts, &mut params, poisson_cfg)?;
+            let y_model = counts_model.evaluate(&pr.params)?;
+            (pr, y_model)
+        } else {
+            let counts_model = poisson::CountsModel {
+                transmission_model: &wrapped,
+                flux,
+                background,
+                n_params: params.params.len(),
+            };
+            let pr = poisson::poisson_fit(&counts_model, sample_counts, &mut params, poisson_cfg)?;
+            let y_model = counts_model.evaluate(&pr.params)?;
+            (pr, y_model)
+        };
+        (pr, y_model)
+    } else {
+        let (pr, y_model) = if let Some((alpha1_idx, alpha2_idx)) = counts_bg {
+            let counts_model = poisson::CountsBackgroundScaleModel {
+                transmission_model: &*t_model,
+                flux,
+                background,
+                alpha1_index: alpha1_idx,
+                alpha2_index: alpha2_idx,
+                n_params: params.params.len(),
+            };
+            let pr = poisson::poisson_fit(&counts_model, sample_counts, &mut params, poisson_cfg)?;
+            let y_model = counts_model.evaluate(&pr.params)?;
+            (pr, y_model)
+        } else {
+            // Wrap in counts model: Y = flux * T(theta) + background
+            let counts_model = poisson::CountsModel {
+                transmission_model: &*t_model,
+                flux,
+                background,
+                n_params: params.params.len(),
+            };
+            let pr = poisson::poisson_fit(&counts_model, sample_counts, &mut params, poisson_cfg)?;
+            let y_model = counts_model.evaluate(&pr.params)?;
+            (pr, y_model)
+        };
+        (pr, y_model)
+    };
+
+    // Compute Pearson chi-squared for display
     let chi_sq: f64 = sample_counts
         .iter()
         .zip(y_model.iter())
@@ -845,6 +1017,13 @@ fn fit_counts_poisson(
 
     let densities: Vec<f64> = (0..n_density_params).map(|i| pr.params[i]).collect();
     let fitted_temp = temperature_index.map(|idx| pr.params[idx]);
+    let fitted_alpha1 = counts_bg.map_or(1.0, |(alpha1_idx, _)| pr.params[alpha1_idx]);
+    let fitted_alpha2 = counts_bg.map_or(0.0, |(_, alpha2_idx)| pr.params[alpha2_idx]);
+    let fitted_background = if let Some((b0_idx, b1_idx)) = kl_bg {
+        [pr.params[b0_idx], pr.params[b1_idx], fitted_alpha2]
+    } else {
+        [0.0, 0.0, fitted_alpha2]
+    };
 
     Ok(SpectrumFitResult {
         densities,
@@ -854,8 +1033,8 @@ fn fit_counts_poisson(
         iterations: pr.iterations,
         temperature_k: fitted_temp,
         temperature_k_unc: None,
-        anorm: 1.0,
-        background: [0.0, 0.0, 0.0],
+        anorm: fitted_alpha1,
+        background: fitted_background,
     })
 }
 
@@ -1046,30 +1225,39 @@ fn extract_result(
         (1.0, [0.0, 0.0, 0.0])
     };
 
-    let (uncertainties, temperature_k, temperature_k_unc) = match &result.uncertainties {
-        Some(unc_all) => {
-            let (temp_k, temp_unc) = if config.fit_temperature {
-                (
-                    Some(result.params[n_density_params]),
-                    Some(*unc_all.get(n_density_params).unwrap_or(&f64::NAN)),
-                )
-            } else {
-                (None, None)
-            };
-            let unc = unc_all
-                .get(..n_density_params)
-                .map(|s| s.to_vec())
-                .unwrap_or_else(|| vec![f64::NAN; n_density_params]);
-            (Some(unc), temp_k, temp_unc)
+    let (uncertainties, temperature_k, temperature_k_unc) = if result.converged {
+        match &result.uncertainties {
+            Some(unc_all) => {
+                let (temp_k, temp_unc) = if config.fit_temperature {
+                    (
+                        Some(result.params[n_density_params]),
+                        Some(*unc_all.get(n_density_params).unwrap_or(&f64::NAN)),
+                    )
+                } else {
+                    (None, None)
+                };
+                let unc = unc_all
+                    .get(..n_density_params)
+                    .map(|s| s.to_vec())
+                    .unwrap_or_else(|| vec![f64::NAN; n_density_params]);
+                (Some(unc), temp_k, temp_unc)
+            }
+            None => {
+                let temp_k = if config.fit_temperature {
+                    Some(result.params[n_density_params])
+                } else {
+                    None
+                };
+                (None, temp_k, None)
+            }
         }
-        None => {
-            let temp_k = if config.fit_temperature {
-                Some(result.params[n_density_params])
-            } else {
-                None
-            };
-            (None, temp_k, None)
-        }
+    } else {
+        let temp_k = if config.fit_temperature {
+            Some(result.params[n_density_params])
+        } else {
+            None
+        };
+        (None, temp_k, None)
     };
 
     Ok(SpectrumFitResult {
@@ -1183,9 +1371,12 @@ pub struct SpectrumFitResult {
     pub temperature_k: Option<f64>,
     /// 1-sigma uncertainty on the fitted temperature (from covariance matrix).
     pub temperature_k_unc: Option<f64>,
-    /// Fitted normalization factor (1.0 if background not enabled).
+    /// Fitted normalization / signal-scale parameter.
+    /// Transmission LM uses `Anorm`; counts background scaling uses `alpha_1`.
     pub anorm: f64,
-    /// Fitted background parameters \[BackA, BackB, BackC\] (all 0.0 if not enabled).
+    /// Fitted background parameter triplet.
+    /// Transmission LM uses `[BackA, BackB, BackC]`.
+    /// Counts KL background uses `[b0, b1, alpha_2]`.
     pub background: [f64; 3],
 }
 
@@ -1291,7 +1482,7 @@ mod tests {
     #[test]
     fn test_typed_transmission_lm_recovers_density() {
         let data = u238_single_resonance();
-        let true_density = 0.0005;
+        let true_density = 0.002;
         let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
         let (t, sigma) = synthetic_transmission(&data, true_density, &energies);
 
@@ -1321,9 +1512,42 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_result_drops_uncertainties_when_unconverged() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..21).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            293.6,
+            None,
+            vec![0.001],
+        )
+        .unwrap();
+
+        let result = LmResult {
+            chi_squared: 1.0,
+            reduced_chi_squared: 1.0,
+            iterations: 5,
+            converged: false,
+            params: vec![0.001],
+            covariance: Some(lm::FlatMatrix::zeros(1, 1)),
+            uncertainties: Some(vec![0.123]),
+        };
+
+        let extracted = extract_result(&config, &result, 1, None).unwrap();
+        assert!(!extracted.converged);
+        assert!(
+            extracted.uncertainties.is_none(),
+            "pipeline must not surface uncertainties from an unconverged fit"
+        );
+        assert!(extracted.temperature_k_unc.is_none());
+    }
+
+    #[test]
     fn test_typed_counts_kl_recovers_density() {
         let data = u238_single_resonance();
-        let true_density = 0.0005;
+        let true_density = 0.002;
         let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
         let (sample, open_beam) = synthetic_counts(&data, true_density, &energies, 1000.0);
 
@@ -1521,14 +1745,10 @@ mod tests {
         };
 
         let result = fit_spectrum_typed(&input, &config).unwrap();
-        // Noiseless synthetic data → chi2r ≈ 0 but LM may not flag "converged"
-        // because parameter-change tolerance is checked in a flat bottom.
         assert!(
-            result.converged || result.reduced_chi_squared < 1e-6,
-            "LM+BG should converge or reach chi2r≈0 (chi2r={}, iter={}, converged={})",
-            result.reduced_chi_squared,
-            result.iterations,
-            result.converged
+            result.converged,
+            "LM+BG should converge on noiseless synthetic data (chi2r={}, iter={})",
+            result.reduced_chi_squared, result.iterations
         );
         assert!(
             (result.densities[0] - true_density).abs() / true_density < 0.05,
@@ -1641,6 +1861,279 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_typed_poisson_kl_with_temperature_and_background() {
+        let data = u238_single_resonance();
+        let true_density = 0.0005;
+        let true_temp = 350.0;
+        let true_b0 = 0.012;
+        let true_b1 = 0.008;
+        let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
+        let (t, sigma) = synthetic_transmission_at_temp(&data, true_density, true_temp, &energies);
+        let measured_t: Vec<f64> = t
+            .iter()
+            .zip(energies.iter())
+            .map(|(&ti, &e)| ti + true_b0 + true_b1 / e.sqrt())
+            .collect();
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            300.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig {
+            max_iter: 120,
+            gauss_newton_lambda: 1e-4,
+            ..PoissonConfig::default()
+        }))
+        .with_fit_temperature(true)
+        .with_transmission_background(BackgroundConfig::default());
+
+        let input = InputData::Transmission {
+            transmission: measured_t,
+            uncertainty: sigma,
+        };
+
+        let result = fit_spectrum_typed(&input, &config).unwrap();
+
+        assert!(result.converged, "fit did not converge: {result:?}");
+        assert!(
+            result.iterations <= 80,
+            "expected KL background+temperature fit to converge well before max_iter; got {}",
+            result.iterations,
+        );
+
+        let fitted_density = result.densities[0];
+        assert!(
+            (fitted_density - true_density).abs() / true_density < 0.02,
+            "density: fitted={fitted_density}, true={true_density}, ratio={}",
+            (fitted_density - true_density).abs() / true_density,
+        );
+
+        let fitted_temp = result
+            .temperature_k
+            .expect("temperature_k should be Some when fit_temperature=true");
+        assert!(
+            (fitted_temp - true_temp).abs() < 3.0,
+            "temperature: fitted={fitted_temp}, true={true_temp}, delta={}",
+            (fitted_temp - true_temp).abs(),
+        );
+
+        assert!(
+            (result.background[0] - true_b0).abs() < 5e-3,
+            "background b0: fitted={}, true={}",
+            result.background[0],
+            true_b0,
+        );
+        assert!(
+            (result.background[1] - true_b1).abs() < 5e-3,
+            "background b1: fitted={}, true={}",
+            result.background[1],
+            true_b1,
+        );
+    }
+
+    #[test]
+    fn test_typed_counts_poisson_kl_with_background() {
+        let data = u238_single_resonance();
+        let true_density = 0.0005;
+        let true_b0 = 0.012;
+        let true_b1 = 0.008;
+        let detector_bg = 2.0;
+        let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
+        let (t, _) = synthetic_transmission(&data, true_density, &energies);
+        let flux = vec![1000.0; energies.len()];
+        let background = vec![detector_bg; energies.len()];
+        let sample_counts: Vec<f64> = t
+            .iter()
+            .zip(energies.iter())
+            .zip(flux.iter())
+            .zip(background.iter())
+            .map(|(((&ti, &e), &f), &bg)| f * (ti + true_b0 + true_b1 / e.sqrt()) + bg)
+            .collect();
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig {
+            max_iter: 120,
+            gauss_newton_lambda: 1e-4,
+            ..PoissonConfig::default()
+        }))
+        .with_transmission_background(BackgroundConfig::default());
+
+        let input = InputData::CountsWithNuisance {
+            sample_counts,
+            flux,
+            background,
+        };
+
+        let result = fit_spectrum_typed(&input, &config).unwrap();
+
+        assert!(result.converged, "fit did not converge: {result:?}");
+        assert!(
+            (result.densities[0] - true_density).abs() / true_density < 0.02,
+            "density: fitted={}, true={true_density}",
+            result.densities[0]
+        );
+        assert!(
+            (result.background[0] - true_b0).abs() < 5e-3,
+            "background b0: fitted={}, true={true_b0}",
+            result.background[0]
+        );
+        assert!(
+            (result.background[1] - true_b1).abs() < 5e-3,
+            "background b1: fitted={}, true={true_b1}",
+            result.background[1]
+        );
+    }
+
+    #[test]
+    fn test_typed_counts_poisson_kl_with_temperature_and_background() {
+        let data = u238_single_resonance();
+        let true_density = 0.0005;
+        let true_temp = 350.0;
+        let true_b0 = 0.012;
+        let true_b1 = 0.008;
+        let detector_bg = 2.0;
+        let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
+        let (t, _) = synthetic_transmission_at_temp(&data, true_density, true_temp, &energies);
+        let flux = vec![1000.0; energies.len()];
+        let background = vec![detector_bg; energies.len()];
+        let sample_counts: Vec<f64> = t
+            .iter()
+            .zip(energies.iter())
+            .zip(flux.iter())
+            .zip(background.iter())
+            .map(|(((&ti, &e), &f), &bg)| f * (ti + true_b0 + true_b1 / e.sqrt()) + bg)
+            .collect();
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            300.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig {
+            max_iter: 120,
+            gauss_newton_lambda: 1e-4,
+            ..PoissonConfig::default()
+        }))
+        .with_fit_temperature(true)
+        .with_transmission_background(BackgroundConfig::default());
+
+        let input = InputData::CountsWithNuisance {
+            sample_counts,
+            flux,
+            background,
+        };
+
+        let result = fit_spectrum_typed(&input, &config).unwrap();
+
+        assert!(result.converged, "fit did not converge: {result:?}");
+        assert!(
+            (result.densities[0] - true_density).abs() / true_density < 0.02,
+            "density: fitted={}, true={true_density}",
+            result.densities[0]
+        );
+
+        let fitted_temp = result
+            .temperature_k
+            .expect("temperature_k should be Some when fit_temperature=true");
+        assert!(
+            (fitted_temp - true_temp).abs() < 3.0,
+            "temperature: fitted={fitted_temp}, true={true_temp}, delta={}",
+            (fitted_temp - true_temp).abs(),
+        );
+        assert!(
+            (result.background[0] - true_b0).abs() < 5e-3,
+            "background b0: fitted={}, true={true_b0}",
+            result.background[0]
+        );
+        assert!(
+            (result.background[1] - true_b1).abs() < 5e-3,
+            "background b1: fitted={}, true={true_b1}",
+            result.background[1]
+        );
+    }
+
+    #[test]
+    fn test_typed_counts_poisson_kl_with_counts_background_scales() {
+        let data = u238_single_resonance();
+        let true_density = 0.002;
+        let true_alpha1 = 0.92;
+        let true_alpha2 = 1.35;
+        let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
+        let (t, _) = synthetic_transmission(&data, true_density, &energies);
+        let flux = vec![120.0; energies.len()];
+        let background: Vec<f64> = energies.iter().map(|&e| 30.0 + 8.0 / e.sqrt()).collect();
+        let sample_counts: Vec<f64> = t
+            .iter()
+            .zip(flux.iter())
+            .zip(background.iter())
+            .map(|((&ti, &f), &bg)| true_alpha1 * f * ti + true_alpha2 * bg)
+            .collect();
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig {
+            max_iter: 120,
+            gauss_newton_lambda: 1e-4,
+            ..PoissonConfig::default()
+        }))
+        .with_counts_background(CountsBackgroundConfig {
+            alpha_1_init: 1.0,
+            alpha_2_init: 1.0,
+            fit_alpha_1: true,
+            fit_alpha_2: true,
+        });
+
+        let input = InputData::CountsWithNuisance {
+            sample_counts,
+            flux,
+            background,
+        };
+
+        let result = fit_spectrum_typed(&input, &config).unwrap();
+
+        assert!(result.converged, "fit did not converge: {result:?}");
+        assert!(
+            (result.densities[0] - true_density).abs() / true_density < 0.02,
+            "density: fitted={}, true={true_density}",
+            result.densities[0]
+        );
+        assert!(
+            (result.anorm - true_alpha1).abs() < 5e-3,
+            "alpha_1/anorm: fitted={}, true={true_alpha1}",
+            result.anorm
+        );
+        assert!(
+            (result.background[2] - true_alpha2).abs() < 5e-3,
+            "alpha_2/background[2]: fitted={}, true={true_alpha2}",
+            result.background[2]
+        );
+    }
+
     /// Round-trip test: create a group of 2 isotopes with known ratios,
     /// generate synthetic transmission, fit with group constraints,
     /// verify the fitted group density matches the true value.
@@ -1704,5 +2197,97 @@ mod tests {
             "group density: fitted={fitted}, true={true_density}, rel_error={rel_error}"
         );
         assert!(result.converged, "fit should converge");
+    }
+
+    #[test]
+    fn test_grouped_poisson_kl_with_temperature_and_background_noiseless() {
+        use nereids_core::types::IsotopeGroup;
+
+        let rd1 = synthetic_single_resonance(72, 176, 8.5, 5.0);
+        let rd2 = synthetic_single_resonance(72, 178, 17.0, 7.5);
+        let rd3 = synthetic_single_resonance(72, 180, 29.0, 6.0);
+
+        let hf176 = nereids_core::types::Isotope::new(72, 176).unwrap();
+        let hf178 = nereids_core::types::Isotope::new(72, 178).unwrap();
+        let hf180 = nereids_core::types::Isotope::new(72, 180).unwrap();
+        let group = IsotopeGroup::custom(
+            "Hf-like (3 member)".into(),
+            vec![(hf176, 0.2), (hf178, 0.5), (hf180, 0.3)],
+        )
+        .unwrap();
+
+        let energies: Vec<f64> = (0..300).map(|i| 1.0 + (49.0 * i as f64) / 299.0).collect();
+        let true_density = 0.001;
+        let true_temp = 400.0;
+        let true_b0 = 0.012;
+        let true_b1 = 0.008;
+
+        let sample = nereids_physics::transmission::SampleParams::new(
+            true_temp,
+            vec![
+                (rd1.clone(), true_density * 0.2),
+                (rd2.clone(), true_density * 0.5),
+                (rd3.clone(), true_density * 0.3),
+            ],
+        )
+        .unwrap();
+        let pure_t =
+            nereids_physics::transmission::forward_model(&energies, &sample, None).unwrap();
+        let measured_t: Vec<f64> = pure_t
+            .iter()
+            .zip(energies.iter())
+            .map(|(&t, &e)| t + true_b0 + true_b1 / e.sqrt())
+            .collect();
+        let sigma = vec![0.001; energies.len()];
+
+        let config = UnifiedFitConfig::new(
+            energies.clone(),
+            vec![rd1.clone()],
+            vec!["placeholder".into()],
+            293.6,
+            None,
+            vec![0.0008],
+        )
+        .unwrap()
+        .with_groups(&[(&group, &[rd1, rd2, rd3])], vec![0.0008])
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig {
+            max_iter: 200,
+            gauss_newton_lambda: 1e-4,
+            ..PoissonConfig::default()
+        }))
+        .with_fit_temperature(true)
+        .with_transmission_background(BackgroundConfig::default());
+
+        let input = InputData::Transmission {
+            transmission: measured_t,
+            uncertainty: sigma,
+        };
+
+        let result = fit_spectrum_typed(&input, &config).unwrap();
+
+        assert!(result.converged, "fit did not converge: {result:?}");
+        assert!(
+            (result.densities[0] - true_density).abs() / true_density < 0.005,
+            "density: fitted={}, true={true_density}",
+            result.densities[0]
+        );
+        let fitted_temp = result
+            .temperature_k
+            .expect("temperature_k should be Some when fit_temperature=true");
+        assert!(
+            (fitted_temp - true_temp).abs() < 8.0,
+            "temperature: fitted={fitted_temp}, true={true_temp}",
+        );
+        assert!(
+            (result.background[0] - true_b0).abs() < 5e-3,
+            "background b0: fitted={}, true={true_b0}",
+            result.background[0]
+        );
+        assert!(
+            (result.background[1] - true_b1).abs() < 5e-3,
+            "background b1: fitted={}, true={true_b1}",
+            result.background[1]
+        );
     }
 }

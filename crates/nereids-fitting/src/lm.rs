@@ -192,6 +192,30 @@ fn chi_squared(residuals: &[f64], weights: &[f64]) -> f64 {
         .sum()
 }
 
+/// Infinity norm of the gradient, scaled by local curvature and residual size.
+///
+/// This is a dimensionless first-order optimality measure for least squares:
+/// small values indicate that the current point is stationary even when χ² is
+/// nonzero because the data are noisy or the model is imperfect.
+fn scaled_gradient_inf_norm(jtw_j: &FlatMatrix, jtw_r: &[f64], chi2: f64) -> f64 {
+    let residual_scale = chi2.sqrt().max(1.0);
+    let mut max_scaled: f64 = 0.0;
+    for (j, &grad_j) in jtw_r.iter().enumerate() {
+        let curvature = jtw_j.get(j, j).abs().sqrt();
+        let scale = curvature * residual_scale + PIVOT_FLOOR;
+        max_scaled = max_scaled.max(grad_j.abs() / scale);
+    }
+    max_scaled
+}
+
+/// Whether the local model has meaningful curvature in at least one free direction.
+///
+/// Purely flat models (J = 0 everywhere) should still report failure rather than
+/// "converged", even though their gradient is numerically zero.
+fn has_informative_curvature(jtw_j: &FlatMatrix) -> bool {
+    (0..jtw_j.nrows).any(|j| jtw_j.get(j, j) > LM_DIAGONAL_FLOOR)
+}
+
 /// Compute the Jacobian, preferring an analytical formula over finite differences.
 ///
 /// `y_current` must equal `model.evaluate(&params.all_values())` at the
@@ -282,7 +306,7 @@ fn compute_jacobian(
 ///
 /// A is a flat n×n symmetric positive definite matrix (approximately).
 /// Returns the solution vector x.
-fn solve_damped_system(a: &FlatMatrix, b: &[f64], lambda: f64) -> Option<Vec<f64>> {
+pub(crate) fn solve_damped_system(a: &FlatMatrix, b: &[f64], lambda: f64) -> Option<Vec<f64>> {
     let n = b.len();
     if n == 0 {
         return Some(vec![]);
@@ -589,6 +613,8 @@ pub fn levenberg_marquardt(
                 }
             }
         }
+        let scaled_grad_inf = scaled_gradient_inf_norm(&jtw_j, &jtw_r, chi2);
+        let informative_curvature = has_informative_curvature(&jtw_j);
 
         // Solve (JᵀWJ + λ·diag(JᵀWJ)) · δ = JᵀWr
         let delta = match solve_damped_system(&jtw_j, &jtw_r, lambda) {
@@ -604,6 +630,12 @@ pub fn levenberg_marquardt(
             .zip(delta.iter())
             .map(|(&v, &d)| v + d)
             .collect();
+        let param_change: f64 = delta
+            .iter()
+            .zip(free_vals_buf.iter())
+            .map(|(&d, &v)| (d / (v.abs() + PIVOT_FLOOR)).powi(2))
+            .sum::<f64>()
+            .sqrt();
         params.set_free_values(&trial_free);
 
         params.all_values_into(&mut all_vals_buf);
@@ -639,6 +671,9 @@ pub fn levenberg_marquardt(
             .map(|(&obs, &mdl)| obs - mdl)
             .collect();
         let trial_chi2 = chi_squared(&trial_residuals, &weights);
+        let chi2_delta = (trial_chi2 - chi2).abs();
+        let chi2_scale = chi2.abs().max(trial_chi2.abs()).max(1.0);
+        let chi2_stagnated = chi2_delta <= config.tol_chi2 * chi2_scale;
 
         if trial_chi2 < chi2 {
             // Accept step — cache y_trial so the next iteration can skip
@@ -653,18 +688,29 @@ pub fn levenberg_marquardt(
             // stopped moving.  The old third condition
             // `chi2 < tol_chi2 * n_data` was scale-dependent and could cause
             // premature convergence on data with small residuals.  (#108.2)
-            let param_change: f64 = delta
-                .iter()
-                .zip(free_vals_buf.iter())
-                .map(|(&d, &v)| (d / (v.abs() + PIVOT_FLOOR)).powi(2))
-                .sum::<f64>()
-                .sqrt();
-
             if rel_change < config.tol_chi2 || param_change < config.tol_param {
                 converged = true;
                 break;
             }
         } else {
+            // Numerical stagnation: the strict LM acceptance test keeps
+            // `trial_chi2 == chi2` in the reject path, but when both the
+            // objective change and parameter step are tiny, the optimizer may
+            // already be at a nonzero-χ² stationary point (noisy data,
+            // correlated parameters, imperfect model). Report convergence if
+            // the gradient is also tiny and the local model has real
+            // curvature, rather than inflating lambda until breakout.
+            let grad_tol = config.tol_chi2.sqrt().max(config.tol_param.sqrt());
+            if chi2_stagnated
+                && param_change < config.tol_param
+                && scaled_grad_inf < grad_tol
+                && informative_curvature
+            {
+                params.set_free_values(&free_vals_buf);
+                converged = true;
+                break;
+            }
+
             // Reject step, restore parameters.
             // y_current stays valid (parameters reverted to free_vals_buf snapshot).
             params.set_free_values(&free_vals_buf);
@@ -688,7 +734,7 @@ pub fn levenberg_marquardt(
     // inversion.  When `compute_covariance` is false (e.g. per-pixel spatial
     // mapping), we skip it entirely — the caller only needs densities and
     // chi-squared, not uncertainties.
-    let (covariance, uncertainties) = if config.compute_covariance {
+    let (covariance, uncertainties) = if converged && config.compute_covariance {
         let jacobian = compute_jacobian(
             model,
             params,
@@ -802,6 +848,85 @@ mod tests {
             result.params[1]
         );
         assert!(result.chi_squared < 1e-6);
+    }
+
+    #[test]
+    fn test_converges_on_exact_flat_bottom_without_lambda_breakout() {
+        // Exact data with zero initial damping reaches the optimum in one
+        // Newton step. The next iteration sits on a flat χ² floor where the
+        // strict `trial_chi2 < chi2` check must not force a false non-
+        // convergence.
+        let x: Vec<f64> = (0..10).map(|i| i as f64).collect();
+        let y_obs: Vec<f64> = x.iter().map(|&xi| 2.0 * xi + 3.0).collect();
+        let sigma = vec![1.0; 10];
+
+        let model = LinearModel { x };
+        let mut params = ParameterSet::new(vec![
+            FitParameter::unbounded("a", 0.0),
+            FitParameter::unbounded("b", 0.0),
+        ]);
+        let config = LmConfig {
+            lambda_init: 0.0,
+            ..LmConfig::default()
+        };
+
+        let result = levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &config).unwrap();
+
+        assert!(
+            result.converged,
+            "Fit should converge on an exact flat bottom"
+        );
+        assert!(result.chi_squared < 1e-20, "chi2 = {}", result.chi_squared);
+        assert!(
+            result.iterations < config.max_iter,
+            "LM should stop by convergence, not by iteration exhaustion"
+        );
+    }
+
+    #[test]
+    fn test_converges_on_nonzero_chi2_stationary_point() {
+        // Noisy overdetermined data have a nonzero-chi2 optimum. With very
+        // strict tolerances, the accepted step to the optimum does not trip
+        // the accept-branch convergence checks, so the next iteration reaches
+        // a reject-path stationary point with trial_chi2 == chi2.
+        struct AffineModel {
+            x: Vec<f64>,
+        }
+        impl FitModel for AffineModel {
+            fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+                let a = params[0];
+                let b = params[1];
+                Ok(self.x.iter().map(|&x| a * x + b).collect())
+            }
+        }
+
+        let model = AffineModel {
+            x: vec![0.0, 1.0, 2.0, 3.0, 4.0],
+        };
+        let y_obs = vec![0.1, 0.9, 2.2, 2.8, 4.1];
+        let sigma = vec![1.0; y_obs.len()];
+        let mut params = ParameterSet::new(vec![
+            FitParameter::unbounded("a", 0.0),
+            FitParameter::unbounded("b", 0.0),
+        ]);
+        let config = LmConfig {
+            max_iter: 200,
+            tol_chi2: 1e-16,
+            tol_param: 1e-16,
+            ..LmConfig::default()
+        };
+
+        let result = levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &config).unwrap();
+
+        assert!(
+            result.converged,
+            "stationary nonzero-chi2 optimum should converge instead of lambda breakout"
+        );
+        assert!(
+            result.reduced_chi_squared.is_finite() && result.reduced_chi_squared > 0.0,
+            "expected nonzero reduced chi2 at noisy optimum, got {}",
+            result.reduced_chi_squared
+        );
     }
 
     #[test]
@@ -1089,6 +1214,14 @@ mod tests {
         assert!(
             !result.converged,
             "Flat model should not converge (lambda breakout)"
+        );
+        assert!(
+            result.covariance.is_none(),
+            "unconverged fit should not report covariance"
+        );
+        assert!(
+            result.uncertainties.is_none(),
+            "unconverged fit should not report uncertainties"
         );
     }
 
