@@ -408,8 +408,12 @@ fn analysis_spectrum_column(ui: &mut egui::Ui, state: &mut AppState) {
             }
             ui.label(format!("iter = {}", result.iterations));
             if let Some(t) = result.temperature_k {
-                if let Some(u) = result.temperature_k_unc {
-                    ui.label(format!("T = {t:.1} \u{00b1} {u:.1} K"));
+                if !state.uncertainty_is_estimated {
+                    if let Some(u) = result.temperature_k_unc {
+                        ui.label(format!("T = {t:.1} \u{00b1} {u:.1} K"));
+                    } else {
+                        ui.label(format!("T = {t:.1} K"));
+                    }
                 } else {
                     ui.label(format!("T = {t:.1} K"));
                 }
@@ -423,20 +427,24 @@ fn analysis_spectrum_column(ui: &mut egui::Ui, state: &mut AppState) {
             .enumerate()
         {
             if i < result.densities.len() {
-                let unc_str = result
-                    .uncertainties
-                    .as_ref()
-                    .and_then(|u| u.get(i))
-                    .map_or("N/A".to_string(), |u| format!("{:.2e}", u));
                 let dot_color = design::isotope_dot_color(&entry.symbol);
                 ui.horizontal(|ui| {
                     let (rect, _) =
                         ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
                     ui.painter().circle_filled(rect.center(), 4.0, dot_color);
-                    ui.label(format!(
-                        "{}: {:.4e} \u{00b1} {}",
-                        entry.symbol, result.densities[i], unc_str
-                    ));
+                    if state.uncertainty_is_estimated {
+                        ui.label(format!("{}: {:.4e}", entry.symbol, result.densities[i]));
+                    } else {
+                        let unc_str = result
+                            .uncertainties
+                            .as_ref()
+                            .and_then(|u| u.get(i))
+                            .map_or("N/A".to_string(), |u| format!("{:.2e}", u));
+                        ui.label(format!(
+                            "{}: {:.4e} \u{00b1} {}",
+                            entry.symbol, result.densities[i], unc_str
+                        ));
+                    }
                 });
             }
         }

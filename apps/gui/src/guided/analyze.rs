@@ -716,8 +716,12 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
             }
             ui.label(format!("iter = {}", result.iterations));
             if let Some(t) = result.temperature_k {
-                if let Some(u) = result.temperature_k_unc {
-                    ui.label(format!("T = {t:.1} \u{00b1} {u:.1} K"));
+                if !state.uncertainty_is_estimated {
+                    if let Some(u) = result.temperature_k_unc {
+                        ui.label(format!("T = {t:.1} \u{00b1} {u:.1} K"));
+                    } else {
+                        ui.label(format!("T = {t:.1} K"));
+                    }
                 } else {
                     ui.label(format!("T = {t:.1} K"));
                 }
@@ -739,15 +743,22 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
         }
         for i in 0..result.densities.len() {
             let name = fit_labels.get(i).map(|s| s.as_str()).unwrap_or("?");
-            let unc_str = result
-                .uncertainties
-                .as_ref()
-                .and_then(|u| u.get(i))
-                .map_or("N/A".to_string(), |u| format!("{:.2e}", u));
-            ui.label(format!(
-                "  {name}: rho = {:.6e} +/- {unc_str} atoms/barn",
-                result.densities[i]
-            ));
+            if state.uncertainty_is_estimated {
+                ui.label(format!(
+                    "  {name}: rho = {:.6e} atoms/barn",
+                    result.densities[i]
+                ));
+            } else {
+                let unc_str = result
+                    .uncertainties
+                    .as_ref()
+                    .and_then(|u| u.get(i))
+                    .map_or("N/A".to_string(), |u| format!("{:.2e}", u));
+                ui.label(format!(
+                    "  {name}: rho = {:.6e} +/- {unc_str} atoms/barn",
+                    result.densities[i]
+                ));
+            }
         }
     }
 }
