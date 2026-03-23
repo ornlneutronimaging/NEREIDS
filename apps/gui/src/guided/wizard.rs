@@ -125,7 +125,7 @@ fn wizard_q2(ui: &mut egui::Ui, state: &mut AppState) {
         ui,
         "Raw Events (HDF5/NeXus)",
         "Time-stamped neutron detection events. Requires binning into \
-         histogram before normalization. Both sample and open beam files needed.",
+         histogram before fitting. Open beam file is optional (enables counts-domain fitting).",
         Some("Full flexibility"),
         selected_events,
     ) {
@@ -375,7 +375,7 @@ fn limitations_for(fitting: FittingType, data: DataType) -> Vec<&'static str> {
     match (fitting, data) {
         (FittingType::Spatial, DataType::Events) => vec![
             "Full flexibility: choose bin count, mode, and TOF range.",
-            "Requires both sample and open beam event files.",
+            "Open beam file is optional (enables counts-domain KL fitting).",
             "ROI crops the result region (each pixel fitted independently).",
         ],
         (FittingType::Single, DataType::Events) => vec![

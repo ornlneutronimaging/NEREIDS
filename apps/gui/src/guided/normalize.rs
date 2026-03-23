@@ -75,15 +75,28 @@ fn normalization_controls_card(ui: &mut egui::Ui, state: &mut AppState) {
         match state.input_mode {
             InputMode::TransmissionTiff | InputMode::Hdf5Histogram | InputMode::Hdf5Event => {
                 if state.normalized.is_some() && state.energies.is_some() {
-                    let label = match state.input_mode {
-                        InputMode::Hdf5Histogram => "HDF5 histogram data ready.",
-                        InputMode::Hdf5Event => "Histogrammed event data ready.",
-                        _ => "Transmission data ready (pre-normalized).",
+                    let label = if state.open_beam_data.is_some() {
+                        "Normalized (sample/OB). Counts-domain fitting available."
+                    } else {
+                        match state.input_mode {
+                            InputMode::Hdf5Histogram => {
+                                "HDF5 histogram data ready (no OB — uniform weighting)."
+                            }
+                            InputMode::Hdf5Event => {
+                                "Histogrammed event data ready (no OB — uniform weighting)."
+                            }
+                            _ => "Transmission data ready (pre-normalized).",
+                        }
                     };
                     ui.label(label);
                 } else if state.sample_data.is_some() && state.spectrum_values.is_some() {
-                    // Auto-prepare: pre-normalized/HDF5 data needs no user action.
-                    prepare_transmission(state);
+                    // Auto-prepare: when OB is available, do proper normalization.
+                    // Otherwise, wrap as transmission with uniform uncertainty.
+                    if state.open_beam_data.is_some() {
+                        normalize_hdf5_with_ob(state);
+                    } else {
+                        prepare_transmission(state);
+                    }
                     ui.label("Preparing data...");
                 } else {
                     ui.label("Load data first (Step 1).");
@@ -527,6 +540,78 @@ pub(crate) fn prepare_transmission(state: &mut AppState) {
         "Transmission data prepared (uniform σ=1 — no open-beam data)",
     );
     state.status_message = "Transmission ready (uniform weighting — chi² is approximate)".into();
+}
+
+/// Normalize HDF5 counts with open beam: T = sample / open_beam.
+/// Uses real counting statistics for uncertainty.
+pub(crate) fn normalize_hdf5_with_ob(state: &mut AppState) {
+    state.cancel_pending_tasks();
+    state.pixel_fit_result = None;
+    state.spatial_result = None;
+
+    // Clone Arcs (O(1)) to avoid deep-cloning multi-GB arrays.
+    let sample_arc = match state.sample_data {
+        Some(ref d) => Arc::clone(d),
+        None => return,
+    };
+    let ob_arc = match state.open_beam_data {
+        Some(ref d) => Arc::clone(d),
+        None => return,
+    };
+
+    if sample_arc.shape() != ob_arc.shape() {
+        state.status_message = format!(
+            "Shape mismatch: sample {:?} vs OB {:?}",
+            sample_arc.shape(),
+            ob_arc.shape()
+        );
+        // Clear OB to break the infinite retry loop — the caller checks
+        // `open_beam_data.is_some()` and will route to `prepare_transmission`.
+        state.open_beam_data = None;
+        state.hdf5_ob_path = None;
+        return;
+    }
+
+    let n_tof = sample_arc.shape()[0];
+
+    // Normalization: T = sample / max(OB, 1)
+    // Combined Poisson uncertainty on both sample and OB:
+    //   σ_T = T * sqrt(1/max(sample,1) + 1/max(OB,1))
+    // Guard against division by zero with .max(1.0).
+    //
+    // Single-pass Zip: compute transmission and uncertainty together,
+    // avoiding intermediate temporaries (ob_safe, sample_safe, etc.).
+    let mut transmission = Array3::zeros(sample_arc.raw_dim());
+    let mut uncertainty = Array3::zeros(sample_arc.raw_dim());
+    ndarray::Zip::from(&mut transmission)
+        .and(&mut uncertainty)
+        .and(&*sample_arc)
+        .and(&*ob_arc)
+        .for_each(|t, u, &s, &ob| {
+            let ob_safe = ob.max(1.0);
+            let s_safe = s.max(1.0);
+            *t = s / ob_safe;
+            *u = *t * (1.0 / s_safe + 1.0 / ob_safe).sqrt();
+        });
+
+    match compute_energies(state, n_tof) {
+        Ok(energies) => state.energies = Some(energies),
+        Err(e) => {
+            state.status_message = format!("Energy conversion: {}", e);
+            return;
+        }
+    }
+
+    state.normalized = Some(Arc::new(nereids_io::normalization::NormalizedData {
+        transmission,
+        uncertainty,
+    }));
+    state.uncertainty_is_estimated = false; // real counting statistics
+    state.log_provenance(
+        ProvenanceEventKind::Normalized,
+        "HDF5 normalized with open beam (T = sample/OB)",
+    );
+    state.status_message = "Normalized with open beam — counts-domain fitting available".into();
 }
 
 /// Compute energy bin centers from the spectrum file loaded in state.

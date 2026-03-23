@@ -38,6 +38,7 @@ pub fn load_step(ui: &mut egui::Ui, state: &mut AppState) {
         state.invalidate_results();
         state.sample_data = None;
         state.open_beam_data = None;
+        state.hdf5_ob_path = None;
         state.load_error = false;
     }
 
@@ -324,6 +325,9 @@ fn hdf5_histogram_tab(ui: &mut egui::Ui, state: &mut AppState) {
         show_nexus_metadata(ui, state);
     });
 
+    // Open beam file (optional — enables counts-domain KL fitting)
+    hdf5_ob_picker(ui, state);
+
     show_hdf5_tree(ui, state);
 
     // Auto-load histogram when file is selected and has histogram data
@@ -357,9 +361,121 @@ fn hdf5_event_tab(ui: &mut egui::Ui, state: &mut AppState) {
         show_nexus_metadata(ui, state);
     });
 
+    // Open beam file (optional — enables counts-domain KL fitting)
+    hdf5_ob_picker(ui, state);
+
     show_hdf5_tree(ui, state);
 
     show_loaded_info(ui, state);
+}
+
+/// Optional open beam NeXus file picker for HDF5 modes.
+/// When provided, enables proper normalization (T = sample/OB) and
+/// counts-domain KL fitting.
+// TODO: async OB loading for large files
+fn hdf5_ob_picker(ui: &mut egui::Ui, state: &mut AppState) {
+    design::card(ui, |ui| {
+        ui.label(
+            egui::RichText::new("Open beam (optional — enables counts-domain fitting)")
+                .size(10.0)
+                .color(ThemeColors::from_ctx(ui.ctx()).fg3),
+        );
+        ui.add_space(4.0);
+        let loaded = state.open_beam_data.is_some();
+        let display = state
+            .hdf5_ob_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "Click to select open beam...".to_string());
+        let resp = design::drop_zone(ui, loaded, &display, "Open beam HDF5 (.h5, .hdf5, .nxs)");
+        if resp.clicked()
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("HDF5", &["h5", "hdf5", "nxs", "nx5"])
+                .pick_file()
+        {
+            state.hdf5_ob_path = Some(path.clone());
+            // Dispatch event vs histogram loading based on input mode
+            let ob_result = if state.input_mode == InputMode::Hdf5Event {
+                // Use same binning params as sample
+                let params = nereids_io::nexus::EventBinningParams {
+                    n_bins: state.event_n_bins,
+                    tof_min_us: state.event_tof_min_us,
+                    tof_max_us: state.event_tof_max_us,
+                    height: state.event_height,
+                    width: state.event_width,
+                };
+                nereids_io::nexus::load_nexus_events(&path, &params)
+                    .map(|d| (d.counts, d.tof_edges_us))
+            } else {
+                nereids_io::nexus::load_nexus_histogram(&path).map(|d| (d.counts, d.tof_edges_us))
+            };
+            match ob_result {
+                Ok((ob_counts, ob_tof_edges)) => {
+                    // P1-7: Validate shape matches sample
+                    if let Some(ref sample) = state.sample_data
+                        && sample.shape() != ob_counts.shape()
+                    {
+                        state.status_message = format!(
+                            "OB shape {:?} != sample {:?}",
+                            ob_counts.shape(),
+                            sample.shape()
+                        );
+                        state.hdf5_ob_path = None;
+                        state.open_beam_data = None;
+                        return;
+                    }
+                    // Validate TOF grid matches sample — reject if edges differ.
+                    // Positional bin pairing in the counts path is only correct
+                    // when sample and OB share the exact same TOF grid.
+                    if let Some(ref sv) = state.spectrum_values {
+                        if ob_tof_edges.len() != sv.len() {
+                            state.status_message = format!(
+                                "OB rejected: {} TOF edges vs sample {} — grids must match",
+                                ob_tof_edges.len(),
+                                sv.len()
+                            );
+                            state.hdf5_ob_path = None;
+                            state.open_beam_data = None;
+                            return;
+                        }
+                        let max_edge_diff: f64 = ob_tof_edges
+                            .iter()
+                            .zip(sv.iter())
+                            .map(|(a, b)| (a - b).abs())
+                            .fold(0.0f64, f64::max);
+                        let edge_scale = sv.last().copied().unwrap_or(1.0).max(1.0);
+                        if max_edge_diff > 1e-6 * edge_scale {
+                            state.status_message = format!(
+                                "OB rejected: TOF edges differ (max delta = {:.3} µs) — \
+                                 sample and OB must use the same TOF grid",
+                                max_edge_diff
+                            );
+                            state.hdf5_ob_path = None;
+                            state.open_beam_data = None;
+                            return;
+                        }
+                    }
+                    state.open_beam_data = Some(Arc::new(ob_counts));
+                    state.normalized = None;
+                    state.invalidate_results();
+                    state.status_message = "Open beam loaded".to_string();
+                }
+                Err(e) => {
+                    state.status_message = format!("Open beam load failed: {e}");
+                    state.hdf5_ob_path = None;
+                    // P1-8: Clear data on failure
+                    state.open_beam_data = None;
+                }
+            }
+        }
+        if loaded && ui.small_button("Clear OB").clicked() {
+            state.hdf5_ob_path = None;
+            state.open_beam_data = None;
+            state.normalized = None;
+            state.invalidate_results();
+            state.status_message = "Open beam cleared".into();
+        }
+    });
 }
 
 // ── HDF5 shared helpers ────────────────────────────────────────
@@ -387,6 +503,7 @@ fn hdf5_drop_zone(ui: &mut egui::Ui, state: &mut AppState) {
         state.invalidate_results();
         state.sample_data = None;
         state.open_beam_data = None;
+        state.hdf5_ob_path = None;
         state.load_error = false;
         state.nexus_probe_error = None;
 
