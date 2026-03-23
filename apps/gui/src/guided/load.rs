@@ -324,6 +324,9 @@ fn hdf5_histogram_tab(ui: &mut egui::Ui, state: &mut AppState) {
         show_nexus_metadata(ui, state);
     });
 
+    // Open beam file (optional — enables counts-domain KL fitting)
+    hdf5_ob_picker(ui, state);
+
     show_hdf5_tree(ui, state);
 
     // Auto-load histogram when file is selected and has histogram data
@@ -357,9 +360,55 @@ fn hdf5_event_tab(ui: &mut egui::Ui, state: &mut AppState) {
         show_nexus_metadata(ui, state);
     });
 
+    // Open beam file (optional — enables counts-domain KL fitting)
+    hdf5_ob_picker(ui, state);
+
     show_hdf5_tree(ui, state);
 
     show_loaded_info(ui, state);
+}
+
+/// Optional open beam NeXus file picker for HDF5 modes.
+/// When provided, enables proper normalization (T = sample/OB) and
+/// counts-domain KL fitting.
+fn hdf5_ob_picker(ui: &mut egui::Ui, state: &mut AppState) {
+    design::card(ui, |ui| {
+        ui.label(
+            egui::RichText::new("Open beam (optional — enables counts-domain fitting)")
+                .size(10.0)
+                .color(ThemeColors::from_ctx(ui.ctx()).fg3),
+        );
+        ui.add_space(4.0);
+        let loaded = state.hdf5_ob_path.is_some();
+        let display = state
+            .hdf5_ob_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let resp = design::drop_zone(ui, loaded, &display, "Open beam HDF5 (.h5, .hdf5, .nxs)");
+        if resp.clicked()
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("HDF5", &["h5", "hdf5", "nxs", "nx5"])
+                .pick_file()
+        {
+            state.hdf5_ob_path = Some(path.clone());
+            match nereids_io::nexus::load_nexus_histogram(&path) {
+                Ok(data) => {
+                    state.open_beam_data = Some(std::sync::Arc::new(data.counts));
+                    state.status_message = "Open beam loaded".into();
+                }
+                Err(e) => {
+                    state.status_message = format!("Open beam load failed: {e}");
+                    state.hdf5_ob_path = None;
+                }
+            }
+        }
+        if loaded && ui.small_button("Clear OB").clicked() {
+            state.hdf5_ob_path = None;
+            state.open_beam_data = None;
+            state.status_message = "Open beam cleared".into();
+        }
+    });
 }
 
 // ── HDF5 shared helpers ────────────────────────────────────────

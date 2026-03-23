@@ -172,8 +172,12 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
                 "Fit temperature (slow for Spatial Map)",
             );
             ui.checkbox(
-                &mut state.background_enabled,
-                "Background normalization (2cm detector)",
+                &mut state.lm_background_enabled,
+                "LM background (SAMMY: Anorm + BackA/B/C)",
+            );
+            ui.checkbox(
+                &mut state.kl_background_enabled,
+                "KL background (b\u{2080} + b\u{2081}/\u{221A}E)",
             );
             ui.checkbox(
                 &mut state.lm_config.compute_covariance,
@@ -901,7 +905,12 @@ fn build_fit_config(state: &AppState) -> Result<UnifiedFitConfig, String> {
         config = config.with_fit_temperature(true);
     }
 
-    if state.background_enabled {
+    // Background: solver-aware. LM uses 4-param SAMMY, KL uses 2-param b₀+b₁.
+    let bg_enabled = match state.solver_method {
+        SolverMethod::LevenbergMarquardt => state.lm_background_enabled,
+        SolverMethod::PoissonKL => state.kl_background_enabled,
+    };
+    if bg_enabled {
         config = config.with_transmission_background(BackgroundConfig::default());
     }
 
@@ -980,20 +989,16 @@ fn fit_pixel(state: &mut AppState) {
         }
     }
 
-    let input = if state.input_mode == InputMode::TiffPair {
-        if let (Some(sample), Some(open_beam)) = (&state.sample_data, &state.open_beam_data) {
-            let sample_counts: Vec<f64> = (0..n_energies).map(|e| sample[[e, y, x]]).collect();
-            let open_beam_counts: Vec<f64> =
-                (0..n_energies).map(|e| open_beam[[e, y, x]]).collect();
-            InputData::Counts {
-                sample_counts,
-                open_beam_counts,
-            }
-        } else {
-            InputData::Transmission {
-                transmission: t_spectrum,
-                uncertainty: sigma,
-            }
+    // Use counts-domain input when both sample and open beam are available,
+    // regardless of input mode. This enables the statistically optimal KL
+    // path for TiffPair AND HDF5 modes with loaded open beam.
+    let input = if let (Some(sample), Some(open_beam)) = (&state.sample_data, &state.open_beam_data)
+    {
+        let sample_counts: Vec<f64> = (0..n_energies).map(|e| sample[[e, y, x]]).collect();
+        let open_beam_counts: Vec<f64> = (0..n_energies).map(|e| open_beam[[e, y, x]]).collect();
+        InputData::Counts {
+            sample_counts,
+            open_beam_counts,
         }
     } else {
         InputData::Transmission {
@@ -1148,7 +1153,8 @@ fn fit_roi(state: &mut AppState) {
         }
     }
 
-    let roi_input = if state.input_mode == InputMode::TiffPair {
+    // Use counts-domain when both sample and open beam are available.
+    let roi_input =
         if let (Some(sample), Some(open_beam)) = (&state.sample_data, &state.open_beam_data) {
             let sample_counts: Vec<f64> = (0..shape[0])
                 .map(|t| {
@@ -1175,13 +1181,7 @@ fn fit_roi(state: &mut AppState) {
                 transmission: avg_t,
                 uncertainty: sigma,
             }
-        }
-    } else {
-        InputData::Transmission {
-            transmission: avg_t,
-            uncertainty: sigma,
-        }
-    };
+        };
 
     let result = match nereids_pipeline::pipeline::fit_spectrum_typed(&roi_input, &config) {
         Ok(r) => r,
@@ -1286,7 +1286,6 @@ pub fn run_spatial_map(state: &mut AppState) {
     };
     let (fp, progress) = crate::state::FittingProgress::new(n_live);
     state.fitting_progress = Some(fp);
-    let input_mode = state.input_mode;
     let sample_data = state.sample_data.clone();
     let open_beam_data = state.open_beam_data.clone();
 
@@ -1348,17 +1347,11 @@ pub fn run_spatial_map(state: &mut AppState) {
 
         // Run spatial_map_typed on the dedicated pool so its par_iter doesn't
         // share the global pool with inner physics par_iter calls.
-        let input = if input_mode == InputMode::TiffPair {
-            if let (Some(sample), Some(open_beam)) = (&sample_data, &open_beam_data) {
-                nereids_pipeline::spatial::InputData3D::Counts {
-                    sample_counts: sample.view(),
-                    open_beam_counts: open_beam.view(),
-                }
-            } else {
-                nereids_pipeline::spatial::InputData3D::Transmission {
-                    transmission: norm.transmission.view(),
-                    uncertainty: norm.uncertainty.view(),
-                }
+        // Use counts-domain when both sample and open beam are available.
+        let input = if let (Some(sample), Some(open_beam)) = (&sample_data, &open_beam_data) {
+            nereids_pipeline::spatial::InputData3D::Counts {
+                sample_counts: sample.view(),
+                open_beam_counts: open_beam.view(),
             }
         } else {
             nereids_pipeline::spatial::InputData3D::Transmission {

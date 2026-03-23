@@ -58,9 +58,12 @@ pub struct SessionCache {
     /// Whether the sidebar is collapsed (icon-only mode).
     #[serde(default)]
     pub sidebar_collapsed: bool,
-    /// Whether SAMMY-style background normalization is enabled.
+    /// LM background enabled (SAMMY 4-param).
     #[serde(default)]
-    pub background_enabled: bool,
+    pub lm_background_enabled: bool,
+    /// KL background enabled (b₀ + b₁/√E).
+    #[serde(default)]
+    pub kl_background_enabled: bool,
     /// Isotope groups: (z, name, members, density, enabled).
     /// ResonanceData is not serialized — members get Pending status on restore.
     #[serde(default)]
@@ -158,7 +161,8 @@ impl SessionCache {
             rebin_factor: state.rebin_factor,
             rebin_applied: state.rebin_applied,
             sidebar_collapsed: state.sidebar_collapsed,
-            background_enabled: state.background_enabled,
+            lm_background_enabled: state.lm_background_enabled,
+            kl_background_enabled: state.kl_background_enabled,
             isotope_groups: state
                 .isotope_groups
                 .iter()
@@ -274,7 +278,8 @@ impl SessionCache {
         state.sidebar_collapsed = self.sidebar_collapsed;
 
         // Restore background normalization state
-        state.background_enabled = self.background_enabled;
+        state.lm_background_enabled = self.lm_background_enabled;
+        state.kl_background_enabled = self.kl_background_enabled;
 
         // Rebuild pipeline
         state.rebuild_pipeline();
@@ -706,9 +711,12 @@ pub struct AppState {
     pub uncertainty_is_estimated: bool,
 
     // -- Background normalization --
-    /// Whether SAMMY-style background normalization is enabled.
+    /// LM background: SAMMY 4-param model.
     /// Model: Anorm * T_inner(E) + BackA + BackB/sqrt(E) + BackC*sqrt(E)
-    pub background_enabled: bool,
+    pub lm_background_enabled: bool,
+    /// KL background: 2-param additive model.
+    /// Model: T_inner(E) + b₀ + b₁/sqrt(E)
+    pub kl_background_enabled: bool,
 
     // -- Pixel / ROI selection --
     pub selected_pixel: Option<(usize, usize)>,
@@ -763,6 +771,9 @@ pub struct AppState {
 
     // -- HDF5/NeXus --
     pub hdf5_path: Option<PathBuf>,
+    /// Open beam NeXus file for HDF5 histogram/event modes.
+    /// When set, enables counts-domain fitting (T = sample/OB).
+    pub hdf5_ob_path: Option<PathBuf>,
     pub nexus_metadata: Option<NexusMetadata>,
     /// Inline error message from NeXus probe (shown in red below metadata).
     pub nexus_probe_error: Option<String>,
@@ -1390,7 +1401,8 @@ impl Default for AppState {
             fit_temperature: false,
             show_advanced_solver: false,
             uncertainty_is_estimated: false,
-            background_enabled: false,
+            lm_background_enabled: false,
+            kl_background_enabled: false,
 
             selected_pixel: None,
             rois: Vec::new(),
@@ -1421,6 +1433,7 @@ impl Default for AppState {
             egui_ctx: None,
 
             hdf5_path: None,
+            hdf5_ob_path: None,
             nexus_metadata: None,
             nexus_probe_error: None,
             event_n_bins: 500,
