@@ -47,7 +47,17 @@
       "Bash(bash /tmp/check_orphaned.sh)",
       "Bash(network\" — was making live ENDF downloads during test runs.:*)",
       "Bash(pixi run python -c \":*)",
-      "Read(//dev/**)"
+      "Read(//dev/**)",
+      "Bash(pixi run:*)",
+      "Bash(do python3:*)",
+      "Bash(git bisect:*)",
+      "Bash(do gh:*)",
+      "Bash(find /Users/chenzhang/github.com/NEREIDS/NEREIDS/docs -type f \\\\\\(-name *.md -o -name *.rst \\\\\\))",
+      "Bash(/tmp/issue_body.md:*)",
+      "Bash(tee /tmp/benchmark_feature.txt)",
+      "Bash(tee /tmp/benchmark_main.txt)",
+      "Bash(tee /tmp/benchmark_feature_v2.txt)",
+      "Bash(tee /tmp/benchmark_fisher.txt)"
     ]
   }
 }

@@ -152,6 +152,20 @@ pub enum SolverConfig {
 /// The reference Φ(E) / B(E) spectra are supplied by the caller or by
 /// spatial pre-processing; this config only controls the fitted scale factors.
 ///
+/// Important distinction:
+/// - This is a detector-space counts background model `B(E)`.
+/// - It is NOT the same as the transmission-lift background used by
+///   `BackgroundConfig`, which models additive uplift of the apparent
+///   transmission curve (for example gamma-tail structure that pushes
+///   transmission upward).
+///
+/// For VENUS MCP/TPX event detectors, the current working assumption is:
+/// - raw/open-beam is the correct normalization baseline
+/// - dark-current / CCD-style electronic offset is not modeled
+/// - rare ghost counts may exist at the hardware level, but are currently
+///   treated as negligible unless a detector-background reference spectrum
+///   is explicitly provided
+///
 /// This is structurally different from the transmission background model
 /// ([`BackgroundConfig`]) because:
 /// - Φ and B are reference spectra, not fitted per pixel
@@ -551,8 +565,20 @@ pub fn fit_spectrum_typed(
             },
             SolverConfig::PoissonKL(poisson_cfg),
         ) => {
-            // Use open beam as the flux reference. Detector background is
-            // currently assumed zero on this convenience path.
+            // Convenience counts path:
+            // - open beam is used as the flux reference Φ(E)
+            // - detector-space counts background B_det(E) is currently
+            //   assumed zero unless the caller explicitly supplies nuisance
+            //   spectra via CountsWithNuisance
+            //
+            // This does NOT disable transmission background fitting.
+            // If config.transmission_background is enabled, fit_counts_poisson
+            // still fits the additive transmission-lift terms [b0, b1] inside
+            // the bracketed transmission model:
+            //   Y(E) = Φ(E) * [T(E) + b0 + b1/sqrt(E)] + B_det(E)
+            //
+            // That transmission-lift background is the mechanism currently
+            // used to absorb gamma-tail structure in VENUS-style data.
             let flux: Vec<f64> = open_beam_counts.to_vec();
             let background = vec![0.0f64; n_e];
             fit_counts_poisson(sample_counts, &flux, &background, config, poisson_cfg)
@@ -858,6 +884,13 @@ fn fit_counts_poisson(
     };
 
     let counts_bg = if let Some(bg) = config.counts_background() {
+        // CountsBackgroundConfig only scales a supplied detector/background
+        // reference spectrum. It does not invent one from the open beam.
+        //
+        // If the caller wants to fit alpha_2, they must provide a nonzero
+        // background reference. This is deliberate: for MCP/TPX event data,
+        // any residual ghost/detector counts are currently treated as
+        // negligible unless independently characterized.
         if bg.fit_alpha_1 && flux.iter().all(|&v| v.abs() <= 1e-12) {
             return Err(PipelineError::InvalidParameter(
                 "counts background alpha_1 cannot be fitted with zero flux reference".into(),
