@@ -704,7 +704,10 @@ def fit_counts_spectrum_typed(
 ) -> FitResult:
     """Fit a single raw-count spectrum (sample + open-beam counts).
 
-    This function accepts raw counts and builds a Poisson KL model internally.
+    This function accepts raw counts and dispatches to the appropriate solver:
+    ``'auto'`` (default) selects Poisson KL for counts data, ``'kl'`` forces
+    Poisson KL, and ``'lm'`` forces Levenberg-Marquardt on normalised
+    transmission.
     For pre-normalized transmission data, use ``fit_spectrum_typed(...)``.
 
     Either ``isotopes`` or ``groups`` must be provided, but not both.
@@ -718,7 +721,7 @@ def fit_counts_spectrum_typed(
         temperature_k: Sample temperature in Kelvin (default 293.6).
         fit_temperature: Whether to fit temperature (default False).
         max_iter: Maximum iterations (default 200).
-        solver: 'lm' (default), 'kl', or 'auto'.
+        solver: 'auto' (default), 'kl', or 'lm'.
         background: Enable transmission-lift background inside the counts fit.
         detector_background: Optional detector/counts background reference.
         fit_alpha_1: Fit flux-scale nuisance parameter alpha_1.
