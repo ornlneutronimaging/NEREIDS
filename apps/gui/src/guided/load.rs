@@ -421,6 +421,7 @@ fn hdf5_ob_picker(ui: &mut egui::Ui, state: &mut AppState) {
                             sample.shape()
                         );
                         state.hdf5_ob_path = None;
+                        state.open_beam_data = None;
                         return;
                     }
                     // Validate TOF grid matches sample — reject if edges differ.
@@ -434,6 +435,7 @@ fn hdf5_ob_picker(ui: &mut egui::Ui, state: &mut AppState) {
                                 sv.len()
                             );
                             state.hdf5_ob_path = None;
+                            state.open_beam_data = None;
                             return;
                         }
                         let max_edge_diff: f64 = ob_tof_edges
@@ -449,6 +451,7 @@ fn hdf5_ob_picker(ui: &mut egui::Ui, state: &mut AppState) {
                                 max_edge_diff
                             );
                             state.hdf5_ob_path = None;
+                            state.open_beam_data = None;
                             return;
                         }
                     }
