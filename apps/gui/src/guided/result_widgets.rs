@@ -282,20 +282,24 @@ pub fn pixel_inspector(ui: &mut egui::Ui, state: &AppState) {
             for (i, entry) in enabled.iter().enumerate() {
                 if i < result.density_maps.len() {
                     let density = result.density_maps[i][[y, x]];
-                    let unc = result.uncertainty_maps.get(i).map(|u| u[[y, x]]).map_or(
-                        "N/A".to_string(),
-                        |u| {
-                            if u.is_finite() {
-                                format!("{:.2e}", u)
-                            } else {
-                                "N/A".to_string()
-                            }
-                        },
-                    );
-                    ui.label(format!(
-                        "  {}: {:.6e} +/- {} atoms/barn",
-                        entry.symbol, density, unc
-                    ));
+                    if state.uncertainty_is_estimated {
+                        ui.label(format!("  {}: {:.6e} atoms/barn", entry.symbol, density));
+                    } else {
+                        let unc = result.uncertainty_maps.get(i).map(|u| u[[y, x]]).map_or(
+                            "N/A".to_string(),
+                            |u| {
+                                if u.is_finite() {
+                                    format!("{:.2e}", u)
+                                } else {
+                                    "N/A".to_string()
+                                }
+                            },
+                        );
+                        ui.label(format!(
+                            "  {}: {:.6e} +/- {} atoms/barn",
+                            entry.symbol, density, unc
+                        ));
+                    }
                 }
             }
         },
