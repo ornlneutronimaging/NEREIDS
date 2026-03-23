@@ -654,13 +654,16 @@ def fit_spectrum_typed(
     groups: list[IsotopeGroup] | None = None,
     initial_densities: list[float] | None = None,
 ) -> FitResult:
-    """Fit a single spectrum using the typed input data API.
+    """Fit a single pre-normalized transmission spectrum.
+
+    This function accepts **transmission** data only (T = sample/open-beam).
+    For raw-count fitting, use ``fit_counts_spectrum_typed(...)``.
 
     Either ``isotopes`` or ``groups`` must be provided, but not both.
     When ``groups`` is provided, each group maps to one fitted density parameter.
 
     Args:
-        transmission: 1D transmission spectrum.
+        transmission: 1D pre-normalized transmission spectrum.
         uncertainty: 1D uncertainty (same length as transmission).
         energies: 1D energy grid in eV (ascending).
         isotopes: List of (ResonanceData, initial_density) tuples.
@@ -669,6 +672,59 @@ def fit_spectrum_typed(
         max_iter: Maximum iterations (default 200).
         solver: 'lm' (default), 'kl', or 'auto'.
         background: Enable SAMMY transmission background.
+        resolution: Optional resolution function.
+        groups: List of IsotopeGroup objects (mutually exclusive with isotopes).
+        initial_densities: Initial density guesses when using groups.
+    """
+    ...
+
+
+def fit_counts_spectrum_typed(
+    sample_counts: NDArray[np.float64],
+    open_beam_counts: NDArray[np.float64],
+    energies: NDArray[np.float64],
+    isotopes: list[tuple[ResonanceData, float]] | None = None,
+    *,
+    temperature_k: float = 293.6,
+    fit_temperature: bool = False,
+    max_iter: int = 200,
+    solver: str = "auto",
+    background: bool = False,
+    detector_background: NDArray[np.float64] | None = None,
+    fit_alpha_1: bool = False,
+    fit_alpha_2: bool = False,
+    alpha_1_init: float = 1.0,
+    alpha_2_init: float = 1.0,
+    resolution: TabulatedResolution | None = None,
+    flight_path_m: float | None = None,
+    delta_t_us: float | None = None,
+    delta_l_m: float | None = None,
+    groups: list[IsotopeGroup] | None = None,
+    initial_densities: list[float] | None = None,
+) -> FitResult:
+    """Fit a single raw-count spectrum (sample + open-beam counts).
+
+    This function accepts raw counts and builds a Poisson KL model internally.
+    For pre-normalized transmission data, use ``fit_spectrum_typed(...)``.
+
+    Either ``isotopes`` or ``groups`` must be provided, but not both.
+    When ``groups`` is provided, each group maps to one fitted density parameter.
+
+    Args:
+        sample_counts: 1D sample counts spectrum.
+        open_beam_counts: 1D open-beam counts reference.
+        energies: 1D energy grid in eV (ascending).
+        isotopes: List of (ResonanceData, initial_density) tuples.
+        temperature_k: Sample temperature in Kelvin (default 293.6).
+        fit_temperature: Whether to fit temperature (default False).
+        max_iter: Maximum iterations (default 200).
+        solver: 'lm' (default), 'kl', or 'auto'.
+        background: Enable transmission-lift background inside the counts fit.
+        detector_background: Optional detector/counts background reference.
+        fit_alpha_1: Fit flux-scale nuisance parameter alpha_1.
+        fit_alpha_2: Fit detector-background scale nuisance parameter alpha_2.
+        alpha_1_init: Initial value for alpha_1 (default 1.0).
+        alpha_2_init: Initial value for alpha_2 (default 1.0).
         resolution: Optional resolution function.
         groups: List of IsotopeGroup objects (mutually exclusive with isotopes).
         initial_densities: Initial density guesses when using groups.
