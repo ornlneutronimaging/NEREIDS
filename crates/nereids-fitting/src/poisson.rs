@@ -1077,8 +1077,12 @@ impl<'a> FitModel for CountsBackgroundScaleModel<'a> {
         let n_free = free_param_indices.len();
         let alpha1 = params[self.alpha1_index];
         let alpha2 = params[self.alpha2_index];
-        let alpha1_col = free_param_indices.iter().position(|&i| i == self.alpha1_index);
-        let alpha2_col = free_param_indices.iter().position(|&i| i == self.alpha2_index);
+        let alpha1_col = free_param_indices
+            .iter()
+            .position(|&i| i == self.alpha1_index);
+        let alpha2_col = free_param_indices
+            .iter()
+            .position(|&i| i == self.alpha2_index);
         let inner_free: Vec<usize> = free_param_indices
             .iter()
             .copied()
@@ -1122,13 +1126,13 @@ impl<'a> FitModel for CountsBackgroundScaleModel<'a> {
         }
 
         if let Some(col) = alpha1_col {
-            for row in 0..n_e {
-                *jacobian.get_mut(row, col) = self.flux[row] * t_inner[row];
+            for (row, (&f, &t)) in self.flux.iter().zip(t_inner.iter()).enumerate() {
+                *jacobian.get_mut(row, col) = f * t;
             }
         }
         if let Some(col) = alpha2_col {
-            for row in 0..n_e {
-                *jacobian.get_mut(row, col) = self.background[row];
+            for (row, &bg) in self.background.iter().enumerate() {
+                *jacobian.get_mut(row, col) = bg;
             }
         }
 
