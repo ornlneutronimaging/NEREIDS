@@ -381,7 +381,7 @@ fn hdf5_ob_picker(ui: &mut egui::Ui, state: &mut AppState) {
                 .color(ThemeColors::from_ctx(ui.ctx()).fg3),
         );
         ui.add_space(4.0);
-        let loaded = state.hdf5_ob_path.is_some();
+        let loaded = state.open_beam_data.is_some();
         let display = state
             .hdf5_ob_path
             .as_ref()
@@ -456,6 +456,8 @@ fn hdf5_ob_picker(ui: &mut egui::Ui, state: &mut AppState) {
                         }
                     }
                     state.open_beam_data = Some(Arc::new(ob_counts));
+                    state.normalized = None;
+                    state.invalidate_results();
                     state.status_message = "Open beam loaded".to_string();
                 }
                 Err(e) => {
@@ -469,6 +471,8 @@ fn hdf5_ob_picker(ui: &mut egui::Ui, state: &mut AppState) {
         if loaded && ui.small_button("Clear OB").clicked() {
             state.hdf5_ob_path = None;
             state.open_beam_data = None;
+            state.normalized = None;
+            state.invalidate_results();
             state.status_message = "Open beam cleared".into();
         }
     });

@@ -997,10 +997,11 @@ fn fit_pixel(state: &mut AppState) {
         }
     }
 
-    // Use counts-domain input when both sample and open beam are available,
-    // regardless of input mode. This enables the statistically optimal KL
-    // path for TiffPair AND HDF5 modes with loaded open beam.
-    let input = if let (Some(sample), Some(open_beam)) = (&state.sample_data, &state.open_beam_data)
+    // Use counts-domain input only when the solver is Poisson KL AND both
+    // sample and open beam are available. LM always uses Transmission.
+    let use_counts = matches!(state.solver_method, SolverMethod::PoissonKL);
+    let input = if use_counts
+        && let (Some(sample), Some(open_beam)) = (&state.sample_data, &state.open_beam_data)
     {
         let sample_counts: Vec<f64> = (0..n_energies).map(|e| sample[[e, y, x]]).collect();
         let open_beam_counts: Vec<f64> = (0..n_energies).map(|e| open_beam[[e, y, x]]).collect();
@@ -1161,35 +1162,38 @@ fn fit_roi(state: &mut AppState) {
         }
     }
 
-    // Use counts-domain when both sample and open beam are available.
-    let roi_input =
-        if let (Some(sample), Some(open_beam)) = (&state.sample_data, &state.open_beam_data) {
-            let sample_counts: Vec<f64> = (0..shape[0])
-                .map(|t| {
-                    pixels
-                        .iter()
-                        .map(|&(y, x)| sample[[t, y, x]].max(0.0))
-                        .sum::<f64>()
-                })
-                .collect();
-            let open_beam_counts: Vec<f64> = (0..shape[0])
-                .map(|t| {
-                    pixels
-                        .iter()
-                        .map(|&(y, x)| open_beam[[t, y, x]].max(0.0))
-                        .sum::<f64>()
-                })
-                .collect();
-            InputData::Counts {
-                sample_counts,
-                open_beam_counts,
-            }
-        } else {
-            InputData::Transmission {
-                transmission: avg_t,
-                uncertainty: sigma,
-            }
-        };
+    // Use counts-domain only when the solver is Poisson KL AND both
+    // sample and open beam are available. LM always uses Transmission.
+    let use_counts = matches!(state.solver_method, SolverMethod::PoissonKL);
+    let roi_input = if use_counts
+        && let (Some(sample), Some(open_beam)) = (&state.sample_data, &state.open_beam_data)
+    {
+        let sample_counts: Vec<f64> = (0..shape[0])
+            .map(|t| {
+                pixels
+                    .iter()
+                    .map(|&(y, x)| sample[[t, y, x]].max(0.0))
+                    .sum::<f64>()
+            })
+            .collect();
+        let open_beam_counts: Vec<f64> = (0..shape[0])
+            .map(|t| {
+                pixels
+                    .iter()
+                    .map(|&(y, x)| open_beam[[t, y, x]].max(0.0))
+                    .sum::<f64>()
+            })
+            .collect();
+        InputData::Counts {
+            sample_counts,
+            open_beam_counts,
+        }
+    } else {
+        InputData::Transmission {
+            transmission: avg_t,
+            uncertainty: sigma,
+        }
+    };
 
     let result = match nereids_pipeline::pipeline::fit_spectrum_typed(&roi_input, &config) {
         Ok(r) => r,
@@ -1355,8 +1359,12 @@ pub fn run_spatial_map(state: &mut AppState) {
 
         // Run spatial_map_typed on the dedicated pool so its par_iter doesn't
         // share the global pool with inner physics par_iter calls.
-        // Use counts-domain when both sample and open beam are available.
-        let input = if let (Some(sample), Some(open_beam)) = (&sample_data, &open_beam_data) {
+        // Use counts-domain only when the solver is Poisson KL AND both
+        // sample and open beam are available. LM always uses Transmission.
+        let use_counts = matches!(config.solver(), SolverConfig::PoissonKL(_));
+        let input = if use_counts
+            && let (Some(sample), Some(open_beam)) = (&sample_data, &open_beam_data)
+        {
             nereids_pipeline::spatial::InputData3D::Counts {
                 sample_counts: sample.view(),
                 open_beam_counts: open_beam.view(),

@@ -59,7 +59,7 @@ pub struct SessionCache {
     #[serde(default)]
     pub sidebar_collapsed: bool,
     /// LM background enabled (SAMMY 4-param).
-    #[serde(default)]
+    #[serde(default, alias = "background_enabled")]
     pub lm_background_enabled: bool,
     /// KL background enabled (b₀ + b₁/√E).
     #[serde(default)]

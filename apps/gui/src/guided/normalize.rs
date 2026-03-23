@@ -568,6 +568,7 @@ pub(crate) fn normalize_hdf5_with_ob(state: &mut AppState) {
         // Clear OB to break the infinite retry loop — the caller checks
         // `open_beam_data.is_some()` and will route to `prepare_transmission`.
         state.open_beam_data = None;
+        state.hdf5_ob_path = None;
         return;
     }
 
@@ -577,11 +578,21 @@ pub(crate) fn normalize_hdf5_with_ob(state: &mut AppState) {
     // Combined Poisson uncertainty on both sample and OB:
     //   σ_T = T * sqrt(1/max(sample,1) + 1/max(OB,1))
     // Guard against division by zero with .max(1.0).
-    let ob_safe = ob_arc.mapv(|v| v.max(1.0));
-    let transmission = &*sample_arc / &ob_safe;
-    let sample_safe = sample_arc.mapv(|v| v.max(1.0));
-    let uncertainty = &transmission
-        * &(&sample_safe.mapv(|v| 1.0 / v) + &ob_safe.mapv(|v| 1.0 / v)).mapv(f64::sqrt);
+    //
+    // Single-pass Zip: compute transmission and uncertainty together,
+    // avoiding intermediate temporaries (ob_safe, sample_safe, etc.).
+    let mut transmission = Array3::zeros(sample_arc.raw_dim());
+    let mut uncertainty = Array3::zeros(sample_arc.raw_dim());
+    ndarray::Zip::from(&mut transmission)
+        .and(&mut uncertainty)
+        .and(&*sample_arc)
+        .and(&*ob_arc)
+        .for_each(|t, u, &s, &ob| {
+            let ob_safe = ob.max(1.0);
+            let s_safe = s.max(1.0);
+            *t = s / ob_safe;
+            *u = *t * (1.0 / s_safe + 1.0 / ob_safe).sqrt();
+        });
 
     match compute_energies(state, n_tof) {
         Ok(energies) => state.energies = Some(energies),
