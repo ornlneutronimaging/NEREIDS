@@ -48,7 +48,14 @@ pub fn summary_card(
             if !chi2_vals.is_empty() {
                 let mean_chi2: f64 = chi2_vals.iter().sum::<f64>() / chi2_vals.len() as f64;
                 ui.horizontal(|ui| {
-                    ui.label(format!("Mean chi2_r: {:.4}", mean_chi2));
+                    if uncertainty_is_estimated {
+                        ui.label(
+                            egui::RichText::new(format!("Mean chi2_r: {:.4} (approx.)", mean_chi2))
+                                .color(crate::theme::semantic::ORANGE),
+                        );
+                    } else {
+                        ui.label(format!("Mean chi2_r: {:.4}", mean_chi2));
+                    }
                     let chi2_variant = if mean_chi2 < 2.0 {
                         BadgeVariant::Green
                     } else if mean_chi2 < 5.0 {

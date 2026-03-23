@@ -1187,10 +1187,15 @@ fn fit_roi(state: &mut AppState) {
         }
     };
 
+    let chi2_suffix = if state.uncertainty_is_estimated {
+        " (approx.)"
+    } else {
+        ""
+    };
     let summary = if result.converged {
         format!(
-            "ROI fit ({n_pixels} px) converged, \u{03C7}\u{00B2}\u{1D63} = {:.4}",
-            result.reduced_chi_squared
+            "ROI fit ({n_pixels} px) converged, \u{03C7}\u{00B2}\u{1D63} = {:.4}{}",
+            result.reduced_chi_squared, chi2_suffix
         )
     } else {
         format!("ROI fit ({n_pixels} px) did NOT converge")

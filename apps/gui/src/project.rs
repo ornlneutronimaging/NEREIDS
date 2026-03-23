@@ -906,8 +906,16 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
                 .zip(result.densities.iter())
                 .map(|(s, &d)| (s.clone(), d))
                 .collect();
+            let chi2_suffix = if state.uncertainty_is_estimated {
+                " (approx.)"
+            } else {
+                ""
+            };
             let summary = if result.converged {
-                format!("Converged, chi2_r = {:.4}", result.reduced_chi_squared)
+                format!(
+                    "Converged, chi2_r = {:.4}{}",
+                    result.reduced_chi_squared, chi2_suffix
+                )
             } else {
                 "Did not converge".to_string()
             };

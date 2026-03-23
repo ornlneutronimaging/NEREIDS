@@ -719,7 +719,14 @@ fn dock_residuals(ui: &mut egui::Ui, state: &mut AppState) {
             (&format!("{:.2e}", cache.rms), "RMS"),
             (&format!("{:.2e}", cache.max_abs), "Max |r|"),
             (&cache.n_points.to_string(), "Points"),
-            (&format!("{:.4}", cache.chi2_r), "\u{03c7}\u{00b2}_r"),
+            (
+                &if state.uncertainty_is_estimated {
+                    format!("{:.4}~", cache.chi2_r)
+                } else {
+                    format!("{:.4}", cache.chi2_r)
+                },
+                "\u{03c7}\u{00b2}_r",
+            ),
         ],
     );
     ui.add_space(4.0);
