@@ -1076,7 +1076,6 @@ impl<'a> FitModel for CountsBackgroundScaleModel<'a> {
         let n_e = y_current.len();
         let n_free = free_param_indices.len();
         let alpha1 = params[self.alpha1_index];
-        let alpha2 = params[self.alpha2_index];
         let alpha1_col = free_param_indices
             .iter()
             .position(|&i| i == self.alpha1_index);
@@ -1089,18 +1088,13 @@ impl<'a> FitModel for CountsBackgroundScaleModel<'a> {
             .filter(|&i| i != self.alpha1_index && i != self.alpha2_index)
             .collect();
 
-        let t_inner: Vec<f64> = y_current
-            .iter()
-            .zip(self.background.iter())
-            .zip(self.flux.iter())
-            .map(|((&y, &b), &f)| {
-                if f.abs() > 1e-30 && alpha1.abs() > 1e-30 {
-                    (y - alpha2 * b) / (alpha1 * f)
-                } else {
-                    0.0
-                }
-            })
-            .collect();
+        // Evaluate the inner transmission model directly instead of
+        // reconstructing from y_current — reconstruction via
+        // (y - alpha2*b)/(alpha1*f) is undefined when alpha1 ≈ 0.
+        let t_inner = match self.transmission_model.evaluate(params) {
+            Ok(t) => t,
+            Err(_) => return None,
+        };
 
         let inner_jac = if !inner_free.is_empty() {
             self.transmission_model

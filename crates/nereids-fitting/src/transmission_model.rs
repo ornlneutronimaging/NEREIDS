@@ -169,9 +169,9 @@ pub struct TransmissionFitModel {
     /// `FitModel::evaluate` takes `&self`.  Safe because `TransmissionFitModel`
     /// is constructed per-pixel and never shared across threads.
     cached_broadened_xs: RefCell<Option<Rc<Vec<Vec<f64>>>>>,
-    /// Cached analytical temperature derivative ∂σ/∂T from the last
-    /// `evaluate()` call (when temperature fitting is enabled).  Used by
-    /// `analytical_jacobian()` for the temperature column without FD.
+    /// Cached analytical temperature derivative ∂σ/∂T, computed on-demand
+    /// by `analytical_jacobian()` when the temperature column is needed.
+    /// Invalidated when temperature changes (cleared in `evaluate()`).
     cached_dxs_dt: RefCell<Option<Rc<Vec<Vec<f64>>>>>,
     /// Temperature at which `cached_broadened_xs` was computed.
     /// `Cell` is sufficient because `f64` is `Copy`.
@@ -363,9 +363,12 @@ impl FitModel for TransmissionFitModel {
     /// - **Density columns**: `∂T/∂nᵢ = -σᵢ(E)·T(E)` using cached broadened XS
     ///   from the most recent `evaluate()` call.  Same formula as
     ///   `PrecomputedTransmissionModel`, zero extra broadening calls.
-    /// - **Temperature column**: analytical chain rule using cached `∂σ/∂T`
-    ///   from `evaluate()`.  `∂T/∂T_temp = -T(E) · Σᵢ nᵢ·rᵢ·∂σᵢ/∂T`.
-    ///   Zero extra broadening calls (derivative cached alongside σ).
+    /// - **Temperature column**: analytical chain rule via on-demand `∂σ/∂T`.
+    ///   `∂T/∂T_temp = -T(E) · Σᵢ nᵢ·rᵢ·∂σᵢ/∂T`.  The derivative is
+    ///   computed once per temperature via
+    ///   `broadened_cross_sections_with_analytical_derivative_from_base()`
+    ///   and cached until temperature changes.  Costs one broadening call
+    ///   per Jacobian (same as the old FD approach, but exact).
     ///
     /// Returns `None` for the no-base_xs path (full forward model), which
     /// falls back to finite-difference in the LM solver.
