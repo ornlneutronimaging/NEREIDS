@@ -703,11 +703,25 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 ("NOT converged", crate::theme::semantic::RED)
             };
             ui.label(egui::RichText::new(label).color(color).strong());
-            ui.label(format!("chi2_r = {:.4}", result.reduced_chi_squared));
+            if state.uncertainty_is_estimated {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "chi2_r = {:.4} (approx.)",
+                        result.reduced_chi_squared
+                    ))
+                    .color(crate::theme::semantic::ORANGE),
+                );
+            } else {
+                ui.label(format!("chi2_r = {:.4}", result.reduced_chi_squared));
+            }
             ui.label(format!("iter = {}", result.iterations));
             if let Some(t) = result.temperature_k {
-                if let Some(u) = result.temperature_k_unc {
-                    ui.label(format!("T = {t:.1} \u{00b1} {u:.1} K"));
+                if !state.uncertainty_is_estimated {
+                    if let Some(u) = result.temperature_k_unc {
+                        ui.label(format!("T = {t:.1} \u{00b1} {u:.1} K"));
+                    } else {
+                        ui.label(format!("T = {t:.1} K"));
+                    }
                 } else {
                     ui.label(format!("T = {t:.1} K"));
                 }
@@ -729,15 +743,22 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
         }
         for i in 0..result.densities.len() {
             let name = fit_labels.get(i).map(|s| s.as_str()).unwrap_or("?");
-            let unc_str = result
-                .uncertainties
-                .as_ref()
-                .and_then(|u| u.get(i))
-                .map_or("N/A".to_string(), |u| format!("{:.2e}", u));
-            ui.label(format!(
-                "  {name}: rho = {:.6e} +/- {unc_str} atoms/barn",
-                result.densities[i]
-            ));
+            if state.uncertainty_is_estimated {
+                ui.label(format!(
+                    "  {name}: rho = {:.6e} atoms/barn",
+                    result.densities[i]
+                ));
+            } else {
+                let unc_str = result
+                    .uncertainties
+                    .as_ref()
+                    .and_then(|u| u.get(i))
+                    .map_or("N/A".to_string(), |u| format!("{:.2e}", u));
+                ui.label(format!(
+                    "  {name}: rho = {:.6e} +/- {unc_str} atoms/barn",
+                    result.densities[i]
+                ));
+            }
         }
     }
 }
@@ -996,10 +1017,15 @@ fn fit_pixel(state: &mut AppState) {
         }
     };
 
+    let chi2_suffix = if state.uncertainty_is_estimated {
+        " (approx.)"
+    } else {
+        ""
+    };
     let summary = if result.converged {
         format!(
-            "Pixel ({},{}) converged, \u{03C7}\u{00B2}\u{1D63} = {:.4}",
-            y, x, result.reduced_chi_squared
+            "Pixel ({},{}) converged, \u{03C7}\u{00B2}\u{1D63} = {:.4}{}",
+            y, x, result.reduced_chi_squared, chi2_suffix
         )
     } else {
         format!("Pixel ({},{}) did NOT converge", y, x)
@@ -1172,10 +1198,15 @@ fn fit_roi(state: &mut AppState) {
         }
     };
 
+    let chi2_suffix = if state.uncertainty_is_estimated {
+        " (approx.)"
+    } else {
+        ""
+    };
     let summary = if result.converged {
         format!(
-            "ROI fit ({n_pixels} px) converged, \u{03C7}\u{00B2}\u{1D63} = {:.4}",
-            result.reduced_chi_squared
+            "ROI fit ({n_pixels} px) converged, \u{03C7}\u{00B2}\u{1D63} = {:.4}{}",
+            result.reduced_chi_squared, chi2_suffix
         )
     } else {
         format!("ROI fit ({n_pixels} px) did NOT converge")

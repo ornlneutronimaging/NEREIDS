@@ -43,6 +43,10 @@ pub struct SpatialResult {
     pub n_converged: usize,
     /// Total number of pixels fitted.
     pub n_total: usize,
+    /// Number of pixels where the fitter returned an error (not just
+    /// non-convergence — a hard failure like invalid parameters or NaN
+    /// model output). These pixels have NaN density and false convergence.
+    pub n_failed: usize,
 }
 
 // ── Phase 3: InputData3D + spatial_map_typed ─────────────────────────────
@@ -215,6 +219,7 @@ pub fn spatial_map_typed(
             },
             n_converged: 0,
             n_total: 0,
+            n_failed: 0,
         });
     }
 
@@ -363,6 +368,7 @@ pub fn spatial_map_typed(
     };
 
     // Fit all pixels in parallel
+    let failed_count = AtomicUsize::new(0);
     let results: Vec<((usize, usize), SpectrumFitResult)> = pixel_coords
         .par_iter()
         .filter_map(|&(y, x)| {
@@ -424,7 +430,10 @@ pub fn spatial_map_typed(
 
             let out = match fit_spectrum_typed(&pixel_input, &fast_config) {
                 Ok(result) => Some(((y, x), result)),
-                Err(_) => None,
+                Err(_) => {
+                    failed_count.fetch_add(1, Ordering::Relaxed);
+                    None
+                }
             };
             if let Some(p) = progress {
                 p.fetch_add(1, Ordering::Relaxed);
@@ -503,6 +512,7 @@ pub fn spatial_map_typed(
         background_maps,
         n_converged,
         n_total: pixel_coords.len(),
+        n_failed: failed_count.load(Ordering::Relaxed),
     })
 }
 

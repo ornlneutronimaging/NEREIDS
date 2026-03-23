@@ -460,6 +460,7 @@ pub(crate) fn normalize_data(state: &mut AppState) {
             }
 
             state.normalized = Some(Arc::new(norm));
+            state.uncertainty_is_estimated = false; // real counting statistics
             state.log_provenance(
                 ProvenanceEventKind::Normalized,
                 "Normalization complete (Method 2)",
@@ -492,16 +493,21 @@ pub(crate) fn prepare_transmission(state: &mut AppState) {
     }
 
     let n_tof = sample.shape()[0];
-    // FABRICATED UNCERTAINTY: TransmissionTiff mode has no open-beam data, so
-    // true per-bin Poisson uncertainty is unknown.  We assign a uniform σ = 0.01
-    // as a placeholder.  This means:
-    //   - χ² values are NOT physically meaningful (they reflect the arbitrary σ,
-    //     not actual measurement noise).
-    //   - Relative weights across bins are uniform, which may bias fits toward
-    //     high-transmission bins where the true σ is smaller.
-    //   - A better estimate would be σ = √(T / I₀_est) if an approximate I₀ is
-    //     available, but this mode does not provide one.
-    let uncertainty = ndarray::Array3::from_elem(sample.raw_dim(), 0.01);
+    // Uniform uncertainty: σ = 1 for all bins.
+    //
+    // TransmissionTiff mode has no open-beam data, so true per-bin
+    // Poisson uncertainty is unknown. Using uniform weights ensures the
+    // fitter treats all bins equally — no fabricated weighting pattern
+    // that could bias fitted densities toward specific spectral features.
+    //
+    // Consequence: chi-squared values are not physically meaningful
+    // (they reflect residuals in transmission units, not statistical
+    // significance). The GUI marks them as "(approx.)" via
+    // `uncertainty_is_estimated`.
+    //
+    // For rigorous uncertainty-weighted fitting, provide sample +
+    // open-beam data via the TiffPair workflow.
+    let uncertainty = ndarray::Array3::from_elem(sample.raw_dim(), 1.0);
 
     match compute_energies(state, n_tof) {
         Ok(energies) => state.energies = Some(energies),
@@ -515,11 +521,12 @@ pub(crate) fn prepare_transmission(state: &mut AppState) {
         transmission: sample,
         uncertainty,
     }));
+    state.uncertainty_is_estimated = true;
     state.log_provenance(
         ProvenanceEventKind::Normalized,
-        "Transmission data prepared",
+        "Transmission data prepared (uniform σ=1 — no open-beam data)",
     );
-    state.status_message = "Transmission ready (synthetic uncertainty — see docs)".into();
+    state.status_message = "Transmission ready (uniform weighting — chi² is approximate)".into();
 }
 
 /// Compute energy bin centers from the spectrum file loaded in state.

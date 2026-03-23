@@ -119,6 +119,7 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         temperature_map,
         n_converged,
         n_total,
+        n_failed,
         result_isotope_labels,
         anorm_map,
         background_maps,
@@ -131,12 +132,15 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
             sr.temperature_map.clone(),
             Some(sr.n_converged),
             Some(sr.n_total),
+            Some(sr.n_failed),
             Some(sr.isotope_labels.clone()),
             sr.anorm_map.clone(),
             sr.background_maps.clone(),
         )
     } else {
-        (None, None, None, None, None, None, None, None, None, None)
+        (
+            None, None, None, None, None, None, None, None, None, None, None,
+        )
     };
 
     // Single-pixel fit results
@@ -230,6 +234,7 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         max_iter: state.lm_config.max_iter.min(u32::MAX as usize) as u32,
         temperature_k: state.temperature_k,
         fit_temperature: state.fit_temperature,
+        uncertainty_is_estimated: Some(state.uncertainty_is_estimated),
         resolution_enabled: state.resolution_enabled,
         resolution_kind: resolution_kind.into(),
         delta_t_us,
@@ -272,6 +277,7 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         temperature_map,
         n_converged,
         n_total,
+        n_failed,
         result_isotope_labels,
         anorm_map,
         background_maps,
@@ -719,6 +725,7 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
     state.lm_config.max_iter = snap.max_iter as usize;
     state.temperature_k = snap.temperature_k;
     state.fit_temperature = snap.fit_temperature;
+    state.uncertainty_is_estimated = snap.uncertainty_is_estimated.unwrap_or(false);
 
     // 10. Restore resolution
     state.resolution_enabled = snap.resolution_enabled;
@@ -872,6 +879,7 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
             background_maps: snap.background_maps,
             n_converged: snap.n_converged.unwrap_or(0),
             n_total: snap.n_total.unwrap_or(0),
+            n_failed: snap.n_failed.unwrap_or(0),
         };
         state.init_tile_display(n_maps);
         state.spatial_result = Some(result);
@@ -898,8 +906,16 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
                 .zip(result.densities.iter())
                 .map(|(s, &d)| (s.clone(), d))
                 .collect();
+            let chi2_suffix = if state.uncertainty_is_estimated {
+                " (approx.)"
+            } else {
+                ""
+            };
             let summary = if result.converged {
-                format!("Converged, chi2_r = {:.4}", result.reduced_chi_squared)
+                format!(
+                    "Converged, chi2_r = {:.4}{}",
+                    result.reduced_chi_squared, chi2_suffix
+                )
             } else {
                 "Did not converge".to_string()
             };

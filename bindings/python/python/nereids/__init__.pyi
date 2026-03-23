@@ -180,6 +180,11 @@ class SpatialResult:
         ...
 
     @property
+    def n_failed(self) -> int:
+        """Number of pixels where the fitter returned a hard error (NaN density)."""
+        ...
+
+    @property
     def isotope_names(self) -> list[str]:
         """Isotope names."""
         ...

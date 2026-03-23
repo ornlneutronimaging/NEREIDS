@@ -41,7 +41,7 @@ pub fn results_step(ui: &mut egui::Ui, state: &mut AppState) {
     let result = state.spatial_result.as_ref().unwrap();
 
     // -- Summary Statistics Card --
-    result_widgets::summary_card(ui, result);
+    result_widgets::summary_card(ui, result, state.uncertainty_is_estimated);
     ui.add_space(4.0);
 
     // -- Stat Row --

@@ -114,10 +114,24 @@ fn histogram_events(state: &mut AppState) {
         Ok(data) => {
             let shape = data.counts.shape();
             state.preview_image = Some(data.counts.sum_axis(ndarray::Axis(0)));
-            state.status_message = format!(
-                "Events histogrammed: {} bins, {}×{} px",
-                shape[0], shape[1], shape[2]
-            );
+            if let Some(ref stats) = data.event_stats {
+                state.status_message = format!(
+                    "Histogrammed {}/{} events ({} bins, {}×{} px) — dropped: {} TOF range, {} spatial, {} non-finite",
+                    stats.kept,
+                    stats.total,
+                    shape[0],
+                    shape[1],
+                    shape[2],
+                    stats.dropped_tof_range,
+                    stats.dropped_spatial,
+                    stats.dropped_non_finite,
+                );
+            } else {
+                state.status_message = format!(
+                    "Events histogrammed: {} bins, {}×{} px",
+                    shape[0], shape[1], shape[2]
+                );
+            }
 
             state.spectrum_values = Some(Arc::new(data.tof_edges_us.clone()));
             state.spectrum_unit = nereids_io::spectrum::SpectrumUnit::TofMicroseconds;

@@ -395,11 +395,25 @@ fn analysis_spectrum_column(ui: &mut egui::Ui, state: &mut AppState) {
                 ("NOT converged", crate::theme::semantic::RED)
             };
             ui.label(egui::RichText::new(label).color(color).strong());
-            ui.label(format!("chi2_r = {:.4}", result.reduced_chi_squared));
+            if state.uncertainty_is_estimated {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "chi2_r = {:.4} (approx.)",
+                        result.reduced_chi_squared
+                    ))
+                    .color(crate::theme::semantic::ORANGE),
+                );
+            } else {
+                ui.label(format!("chi2_r = {:.4}", result.reduced_chi_squared));
+            }
             ui.label(format!("iter = {}", result.iterations));
             if let Some(t) = result.temperature_k {
-                if let Some(u) = result.temperature_k_unc {
-                    ui.label(format!("T = {t:.1} \u{00b1} {u:.1} K"));
+                if !state.uncertainty_is_estimated {
+                    if let Some(u) = result.temperature_k_unc {
+                        ui.label(format!("T = {t:.1} \u{00b1} {u:.1} K"));
+                    } else {
+                        ui.label(format!("T = {t:.1} K"));
+                    }
                 } else {
                     ui.label(format!("T = {t:.1} K"));
                 }
@@ -413,20 +427,24 @@ fn analysis_spectrum_column(ui: &mut egui::Ui, state: &mut AppState) {
             .enumerate()
         {
             if i < result.densities.len() {
-                let unc_str = result
-                    .uncertainties
-                    .as_ref()
-                    .and_then(|u| u.get(i))
-                    .map_or("N/A".to_string(), |u| format!("{:.2e}", u));
                 let dot_color = design::isotope_dot_color(&entry.symbol);
                 ui.horizontal(|ui| {
                     let (rect, _) =
                         ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
                     ui.painter().circle_filled(rect.center(), 4.0, dot_color);
-                    ui.label(format!(
-                        "{}: {:.4e} \u{00b1} {}",
-                        entry.symbol, result.densities[i], unc_str
-                    ));
+                    if state.uncertainty_is_estimated {
+                        ui.label(format!("{}: {:.4e}", entry.symbol, result.densities[i]));
+                    } else {
+                        let unc_str = result
+                            .uncertainties
+                            .as_ref()
+                            .and_then(|u| u.get(i))
+                            .map_or("N/A".to_string(), |u| format!("{:.2e}", u));
+                        ui.label(format!(
+                            "{}: {:.4e} \u{00b1} {}",
+                            entry.symbol, result.densities[i], unc_str
+                        ));
+                    }
                 });
             }
         }
@@ -709,7 +727,14 @@ fn dock_residuals(ui: &mut egui::Ui, state: &mut AppState) {
             (&format!("{:.2e}", cache.rms), "RMS"),
             (&format!("{:.2e}", cache.max_abs), "Max |r|"),
             (&cache.n_points.to_string(), "Points"),
-            (&format!("{:.4}", cache.chi2_r), "\u{03c7}\u{00b2}_r"),
+            (
+                &if state.uncertainty_is_estimated {
+                    format!("{:.4}~", cache.chi2_r)
+                } else {
+                    format!("{:.4}", cache.chi2_r)
+                },
+                "\u{03c7}\u{00b2}_r",
+            ),
         ],
     );
     ui.add_space(4.0);
@@ -999,7 +1024,7 @@ fn parameter_sidebar(ctx: &egui::Context, state: &mut AppState) {
                 ui.add_space(6.0);
 
                 if let Some(ref result) = state.spatial_result {
-                    result_widgets::summary_card(ui, result);
+                    result_widgets::summary_card(ui, result, state.uncertainty_is_estimated);
                 }
             });
         });

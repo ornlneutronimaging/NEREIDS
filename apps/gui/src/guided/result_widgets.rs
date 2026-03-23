@@ -5,7 +5,14 @@ use crate::widgets::design::{self, BadgeVariant};
 use crate::widgets::image_view::{apply_colormap, data_range, render_to_rgba};
 
 /// Summary statistics card showing convergence and density stats.
-pub fn summary_card(ui: &mut egui::Ui, result: &nereids_pipeline::spatial::SpatialResult) {
+///
+/// When `uncertainty_is_estimated` is true, chi-squared values are displayed
+/// with a warning badge since they are based on estimated (not measured) uncertainty.
+pub fn summary_card(
+    ui: &mut egui::Ui,
+    result: &nereids_pipeline::spatial::SpatialResult,
+    uncertainty_is_estimated: bool,
+) {
     let pct = if result.n_total > 0 {
         100.0 * result.n_converged as f64 / result.n_total as f64
     } else {
@@ -41,7 +48,14 @@ pub fn summary_card(ui: &mut egui::Ui, result: &nereids_pipeline::spatial::Spati
             if !chi2_vals.is_empty() {
                 let mean_chi2: f64 = chi2_vals.iter().sum::<f64>() / chi2_vals.len() as f64;
                 ui.horizontal(|ui| {
-                    ui.label(format!("Mean chi2_r: {:.4}", mean_chi2));
+                    if uncertainty_is_estimated {
+                        ui.label(
+                            egui::RichText::new(format!("Mean chi2_r: {:.4} (approx.)", mean_chi2))
+                                .color(crate::theme::semantic::ORANGE),
+                        );
+                    } else {
+                        ui.label(format!("Mean chi2_r: {:.4}", mean_chi2));
+                    }
                     let chi2_variant = if mean_chi2 < 2.0 {
                         BadgeVariant::Green
                     } else if mean_chi2 < 5.0 {
@@ -52,6 +66,15 @@ pub fn summary_card(ui: &mut egui::Ui, result: &nereids_pipeline::spatial::Spati
                     let chi2_text = format!("{:.2}", mean_chi2);
                     design::badge(ui, &chi2_text, chi2_variant);
                 });
+                if uncertainty_is_estimated {
+                    ui.label(
+                        egui::RichText::new(
+                            "⚠ chi² approximate (uncertainty estimated, not measured)",
+                        )
+                        .small()
+                        .color(crate::theme::semantic::ORANGE),
+                    );
+                }
             }
 
             // Mean temperature (if available)
@@ -231,7 +254,17 @@ pub fn pixel_inspector(ui: &mut egui::Ui, state: &AppState) {
         &format!("Pixel Inspector ({}, {})", y, x),
         conv_badge,
         |ui| {
-            ui.label(format!("chi2_r = {:.4}", result.chi_squared_map[[y, x]]));
+            if state.uncertainty_is_estimated {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "chi2_r = {:.4} (approx.)",
+                        result.chi_squared_map[[y, x]]
+                    ))
+                    .color(crate::theme::semantic::ORANGE),
+                );
+            } else {
+                ui.label(format!("chi2_r = {:.4}", result.chi_squared_map[[y, x]]));
+            }
 
             if let Some(ref t_map) = result.temperature_map {
                 let t = t_map[[y, x]];
@@ -249,20 +282,24 @@ pub fn pixel_inspector(ui: &mut egui::Ui, state: &AppState) {
             for (i, entry) in enabled.iter().enumerate() {
                 if i < result.density_maps.len() {
                     let density = result.density_maps[i][[y, x]];
-                    let unc = result.uncertainty_maps.get(i).map(|u| u[[y, x]]).map_or(
-                        "N/A".to_string(),
-                        |u| {
-                            if u.is_finite() {
-                                format!("{:.2e}", u)
-                            } else {
-                                "N/A".to_string()
-                            }
-                        },
-                    );
-                    ui.label(format!(
-                        "  {}: {:.6e} +/- {} atoms/barn",
-                        entry.symbol, density, unc
-                    ));
+                    if state.uncertainty_is_estimated {
+                        ui.label(format!("  {}: {:.6e} atoms/barn", entry.symbol, density));
+                    } else {
+                        let unc = result.uncertainty_maps.get(i).map(|u| u[[y, x]]).map_or(
+                            "N/A".to_string(),
+                            |u| {
+                                if u.is_finite() {
+                                    format!("{:.2e}", u)
+                                } else {
+                                    "N/A".to_string()
+                                }
+                            },
+                        );
+                        ui.label(format!(
+                            "  {}: {:.6e} +/- {} atoms/barn",
+                            entry.symbol, density, unc
+                        ));
+                    }
                 }
             }
         },

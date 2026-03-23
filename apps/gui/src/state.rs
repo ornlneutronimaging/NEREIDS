@@ -698,6 +698,13 @@ pub struct AppState {
     pub fit_temperature: bool,
     pub show_advanced_solver: bool,
 
+    // -- Uncertainty provenance --
+    /// True when per-bin uncertainty was estimated from transmission shape
+    /// (TransmissionTiff, HDF5 auto-prepare) rather than measured from
+    /// sample + open-beam counting statistics. When true, chi-squared
+    /// values are approximate and should be displayed with a warning.
+    pub uncertainty_is_estimated: bool,
+
     // -- Background normalization --
     /// Whether SAMMY-style background normalization is enabled.
     /// Model: Anorm * T_inner(E) + BackA + BackB/sqrt(E) + BackC*sqrt(E)
@@ -1382,6 +1389,7 @@ impl Default for AppState {
             solver_method: SolverMethod::PoissonKL,
             fit_temperature: false,
             show_advanced_solver: false,
+            uncertainty_is_estimated: false,
             background_enabled: false,
 
             selected_pixel: None,

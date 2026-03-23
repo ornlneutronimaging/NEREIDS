@@ -47,7 +47,8 @@
       "Bash(bash /tmp/check_orphaned.sh)",
       "Bash(network\" — was making live ENDF downloads during test runs.:*)",
       "Bash(pixi run python -c \":*)",
-      "Read(//dev/**)"
+      "Read(//dev/**)",
+      "Bash(gh issue:*)"
     ]
   }
 }

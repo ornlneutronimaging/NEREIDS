@@ -77,6 +77,28 @@ pub struct NexusHistogramData {
     pub dead_pixels: Option<ndarray::Array2<bool>>,
     /// Number of rotation angles summed (D-5). 1 means no collapse occurred.
     pub n_rotation_angles: usize,
+    /// Event retention statistics (only populated for event-mode loading).
+    pub event_stats: Option<EventRetentionStats>,
+}
+
+/// Statistics on how many events were kept vs dropped during histogramming.
+#[derive(Debug, Clone)]
+pub struct EventRetentionStats {
+    /// Total events read from the file.
+    pub total: usize,
+    /// Events successfully histogrammed.
+    pub kept: usize,
+    /// Events dropped due to non-finite values in TOF or spatial coordinates.
+    ///
+    /// For u64 TOF input (`event_time_offset`), the TOF channel is always
+    /// finite, so the TOF path contributes zero to this counter. Non-finite
+    /// values arise from the f64 x/y pixel coordinates (NaN or Inf from
+    /// upstream processing or detector artifacts).
+    pub dropped_non_finite: usize,
+    /// Events dropped due to TOF outside `[tof_min, tof_max)`.
+    pub dropped_tof_range: usize,
+    /// Events dropped due to pixel coordinates outside detector bounds.
+    pub dropped_spatial: usize,
 }
 
 /// Probe a NeXus/HDF5 file for available data modalities and metadata.
@@ -201,6 +223,7 @@ pub fn load_nexus_histogram(path: &Path) -> Result<NexusHistogramData, IoError> 
         flight_path_m,
         dead_pixels,
         n_rotation_angles: n_rot,
+        event_stats: None, // histogram mode, not events
     })
 }
 
@@ -227,10 +250,11 @@ pub struct EventBinningParams {
 ///
 /// # Binning behaviour (D-8)
 ///
-/// - **Out-of-range events are silently dropped**: events with TOF outside
-///   `[tof_min_us, tof_max_us)` or pixel coordinates outside `[0, width)` /
-///   `[0, height)` are excluded without warning. No count of dropped events
-///   is returned.
+/// - **Out-of-range events are dropped and counted**: events with TOF outside
+///   `[tof_min_us, tof_max_us)`, pixel coordinates outside `[0, width)` /
+///   `[0, height)`, or non-finite spatial coordinates are excluded. Per-category
+///   drop counts are returned in [`EventRetentionStats`] via
+///   [`NexusHistogramData::event_stats`].
 /// - **Pixel coordinates are rounded to the nearest integer** (`f64::round()`
 ///   then cast to `isize`), snapping sub-pixel positions to a discrete grid.
 ///   Fractional coordinates exactly at 0.5 round up.
@@ -308,35 +332,45 @@ pub fn load_nexus_events(
     let tof_edges_us =
         crate::tof::linspace_tof_edges(params.tof_min_us, params.tof_max_us, params.n_bins)?;
 
-    // Histogram events
+    // Histogram events with retention tracking.
     let dt_us = (params.tof_max_us - params.tof_min_us) / params.n_bins as f64;
     let mut counts = Array3::<f64>::zeros((params.n_bins, params.height, params.width));
+    let total = tof_ns.len();
+    let mut kept = 0usize;
+    let mut dropped_non_finite = 0usize;
+    let mut dropped_tof_range = 0usize;
+    let mut dropped_spatial = 0usize;
 
     for i in 0..tof_ns.len() {
         let tof_us = tof_ns[i] as f64 / 1000.0; // ns → µs
         if !tof_us.is_finite() {
+            dropped_non_finite += 1;
             continue;
         }
 
-        // Skip events outside TOF range
         if tof_us < params.tof_min_us || tof_us >= params.tof_max_us {
+            dropped_tof_range += 1;
             continue;
         }
 
-        // Pixel coordinates (round to nearest integer)
-        let px = x_coords[i].round() as isize;
-        let py = y_coords[i].round() as isize;
+        let xf = x_coords[i];
+        let yf = y_coords[i];
+        if !xf.is_finite() || !yf.is_finite() {
+            dropped_non_finite += 1;
+            continue;
+        }
+        let px = xf.round() as isize;
+        let py = yf.round() as isize;
 
-        // Skip events outside spatial bounds
         if px < 0 || py < 0 || px >= params.width as isize || py >= params.height as isize {
+            dropped_spatial += 1;
             continue;
         }
 
         let tof_bin = ((tof_us - params.tof_min_us) / dt_us) as usize;
-        // Clamp to last bin (guard against floating-point rounding near the upper boundary)
         let tof_bin = tof_bin.min(params.n_bins - 1);
-
         counts[[tof_bin, py as usize, px as usize]] += 1.0;
+        kept += 1;
     }
 
     // Read flight path
@@ -346,12 +380,25 @@ pub fn load_nexus_events(
     // Read dead pixel mask
     let dead_pixels = read_dead_pixel_mask(&entry);
 
+    debug_assert_eq!(
+        total,
+        kept + dropped_non_finite + dropped_tof_range + dropped_spatial,
+        "event retention accounting mismatch"
+    );
+
     Ok(NexusHistogramData {
         counts,
         tof_edges_us,
         flight_path_m,
         dead_pixels,
-        n_rotation_angles: 1, // Event data has no rotation dimension
+        n_rotation_angles: 1,
+        event_stats: Some(EventRetentionStats {
+            total,
+            kept,
+            dropped_non_finite,
+            dropped_tof_range,
+            dropped_spatial,
+        }),
     })
 }
 
@@ -702,6 +749,17 @@ mod tests {
 
         assert_eq!(data.flight_path_m, Some(25.0));
         assert_eq!(data.tof_edges_us.len(), 3); // n_bins + 1 edges
+
+        // All 3 events kept, none dropped
+        let stats = data
+            .event_stats
+            .as_ref()
+            .expect("event_stats should be Some");
+        assert_eq!(stats.total, 3);
+        assert_eq!(stats.kept, 3);
+        assert_eq!(stats.dropped_non_finite, 0);
+        assert_eq!(stats.dropped_tof_range, 0);
+        assert_eq!(stats.dropped_spatial, 0);
     }
 
     #[test]
@@ -733,6 +791,17 @@ mod tests {
         let total: f64 = data.counts.iter().sum();
         assert_eq!(total, 1.0);
         assert_eq!(data.counts[[0, 0, 0]], 1.0);
+
+        // 1 kept, 1 dropped by TOF range, 1 dropped by spatial bounds
+        let stats = data
+            .event_stats
+            .as_ref()
+            .expect("event_stats should be Some");
+        assert_eq!(stats.total, 3);
+        assert_eq!(stats.kept, 1);
+        assert_eq!(stats.dropped_non_finite, 0);
+        assert_eq!(stats.dropped_tof_range, 1);
+        assert_eq!(stats.dropped_spatial, 1);
     }
 
     #[test]
@@ -755,6 +824,17 @@ mod tests {
 
         let total: f64 = data.counts.iter().sum();
         assert_eq!(total, 0.0);
+
+        // Zero events in, zero events out
+        let stats = data
+            .event_stats
+            .as_ref()
+            .expect("event_stats should be Some");
+        assert_eq!(stats.total, 0);
+        assert_eq!(stats.kept, 0);
+        assert_eq!(stats.dropped_non_finite, 0);
+        assert_eq!(stats.dropped_tof_range, 0);
+        assert_eq!(stats.dropped_spatial, 0);
     }
 
     #[test]
@@ -809,5 +889,41 @@ mod tests {
             .find(|e| e.path == "/entry/histogram/data")
             .unwrap();
         assert!(data_entry.shape.is_some());
+    }
+
+    #[test]
+    fn test_nan_xy_coords_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nan_xy.h5");
+
+        // 4 events: 1 good, 1 NaN x, 1 Inf y, 1 good
+        let tof_ns = vec![1_500_000, 1_500_000, 1_500_000, 2_500_000];
+        let x = vec![0.0, f64::NAN, 0.0, 1.0];
+        let y = vec![0.0, 0.0, f64::INFINITY, 0.0];
+        create_test_events(&path, &tof_ns, &x, &y, None);
+
+        let params = EventBinningParams {
+            n_bins: 2,
+            tof_min_us: 1000.0,
+            tof_max_us: 3000.0,
+            height: 2,
+            width: 3,
+        };
+
+        let data = load_nexus_events(&path, &params).unwrap();
+
+        // Only 2 good events should be counted
+        let total_counts: f64 = data.counts.iter().sum();
+        assert_eq!(total_counts, 2.0);
+
+        let stats = data
+            .event_stats
+            .as_ref()
+            .expect("event_stats should be Some");
+        assert_eq!(stats.total, 4);
+        assert_eq!(stats.kept, 2);
+        assert_eq!(stats.dropped_non_finite, 2);
+        assert_eq!(stats.dropped_tof_range, 0);
+        assert_eq!(stats.dropped_spatial, 0);
     }
 }
