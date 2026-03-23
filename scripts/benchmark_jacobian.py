@@ -66,8 +66,12 @@ PATHS = [
     ("Trans+KL+bg+temp",   "transmission", "kl", True,  True),
     ("Counts+KL",          "counts",       "kl", False, False),
     ("Counts+KL+temp",     "counts",       "kl", False, True),
+    ("Counts+KL+bg",       "counts",       "kl", True,  False),
+    ("Counts+KL+bg+temp",  "counts",       "kl", True,  True),
     ("Counts+LM",          "counts",       "lm", False, False),
     ("Counts+LM+temp",     "counts",       "lm", False, True),
+    ("Counts+LM+bg",       "counts",       "lm", True,  False),
+    ("Counts+LM+bg+temp",  "counts",       "lm", True,  True),
 ]
 
 

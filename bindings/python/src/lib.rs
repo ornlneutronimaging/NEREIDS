@@ -2380,7 +2380,10 @@ fn spatial_result_to_py(
 ///     dead_pixels: Optional 2D boolean dead pixel mask.
 ///     max_iter: Maximum iterations per pixel (default 200).
 ///     solver: "auto" (default), "lm", or "kl".
-///     background: Enable SAMMY transmission background (only for transmission data).
+///     background: Enable transmission-background fitting.
+///         For transmission data this uses the transmission-domain background model.
+///         For counts data this enables the same transmission background inside the
+///         count-domain KL/LM pipelines.
 ///     resolution: Optional resolution function.
 ///     groups: list of IsotopeGroup objects (mutually exclusive with isotopes).
 ///
@@ -2490,14 +2493,8 @@ fn py_spatial_map_typed<'py>(
         config = config.with_fit_temperature(true);
     }
 
-    // Background (transmission only)
+    // Background
     if background {
-        if data.kind == "counts" {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "background=True is only supported for transmission data. \
-                 Counts data uses nuisance estimation from the open beam.",
-            ));
-        }
         config = config
             .with_transmission_background(nereids_pipeline::pipeline::BackgroundConfig::default());
     }
