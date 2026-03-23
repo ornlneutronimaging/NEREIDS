@@ -492,15 +492,15 @@ pub(crate) fn prepare_transmission(state: &mut AppState) {
     }
 
     let n_tof = sample.shape()[0];
-    // Estimated uncertainty from transmission shape: σ = √(|T| + ε).
-    // This approximates Poisson statistics assuming T ∝ counts/I₀ with
-    // unknown I₀. Bins with low transmission (deep resonance dips) get
-    // higher uncertainty, matching their higher relative noise.
+    // Estimated uncertainty: σ ∝ 1/√|T| approximates inverse Poisson
+    // weighting when I₀ is unknown. Low-T bins (deep resonance dips, few
+    // counts) get HIGH uncertainty (low weight); high-T bins (many counts)
+    // get LOW uncertainty (high weight).
     //
     // Note: χ² values are approximate (not based on measured counting
     // statistics). For rigorous uncertainty, provide sample + open-beam
     // data via the TiffPair workflow.
-    let uncertainty = sample.mapv(|t| (t.abs() + 1e-6).sqrt());
+    let uncertainty = sample.mapv(|t| 1.0 / (t.abs() + 1e-6).sqrt());
 
     match compute_energies(state, n_tof) {
         Ok(energies) => state.energies = Some(energies),

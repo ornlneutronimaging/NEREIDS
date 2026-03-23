@@ -106,6 +106,7 @@ pub struct ProjectSnapshot {
     pub temperature_map: Option<Array2<f64>>,
     pub n_converged: Option<usize>,
     pub n_total: Option<usize>,
+    pub n_failed: Option<usize>,
     pub result_isotope_labels: Option<Vec<String>>,
     /// Per-pixel normalization factor (background fitting).
     pub anorm_map: Option<Array2<f64>>,
@@ -188,6 +189,7 @@ impl Default for ProjectSnapshot {
             temperature_map: None,
             n_converged: None,
             n_total: None,
+            n_failed: None,
             result_isotope_labels: None,
             anorm_map: None,
             background_maps: None,
@@ -705,6 +707,9 @@ fn write_results(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoErro
     }
     if let Some(nt) = snap.n_total {
         write_u64_attr(&results, "n_total", nt as u64)?;
+    }
+    if let Some(nf) = snap.n_failed {
+        write_u64_attr(&results, "n_failed", nf as u64)?;
     }
 
     if let Some(ref labels) = snap.result_isotope_labels
@@ -1388,6 +1393,9 @@ fn read_results(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoE
     if let Ok(nt) = read_u64_attr(&results, "n_total") {
         snap.n_total = Some(nt as usize);
     }
+    if let Ok(nf) = read_u64_attr(&results, "n_failed") {
+        snap.n_failed = Some(nf as usize);
+    }
 
     // Single-pixel fit results
     if let Ok(sf) = results.group("single_fit") {
@@ -1553,6 +1561,7 @@ mod tests {
             temperature_map: None,
             n_converged: None,
             n_total: None,
+            n_failed: None,
             result_isotope_labels: None,
             anorm_map: None,
             background_maps: None,
@@ -1608,6 +1617,7 @@ mod tests {
         snap.converged_map = Some(Array2::from_elem((3, 4), true));
         snap.n_converged = Some(12);
         snap.n_total = Some(12);
+        snap.n_failed = Some(0);
         snap.result_isotope_labels = Some(vec!["W-182".into()]);
         save_project(&path, &snap).unwrap();
 
@@ -1629,6 +1639,8 @@ mod tests {
         // Check attrs
         let nc: u64 = results.attr("n_converged").unwrap().read_scalar().unwrap();
         assert_eq!(nc, 12);
+        let nf: u64 = results.attr("n_failed").unwrap().read_scalar().unwrap();
+        assert_eq!(nf, 0);
     }
 
     #[test]
@@ -1854,6 +1866,7 @@ mod tests {
         snap.temperature_map = Some(Array2::from_elem((3, 4), 295.0));
         snap.n_converged = Some(12);
         snap.n_total = Some(12);
+        snap.n_failed = Some(1);
         snap.result_isotope_labels = Some(vec!["W-182".into(), "Fe-56".into()]);
         save_project(&path, &snap).unwrap();
         let loaded = load_project(&path).unwrap();
@@ -1877,6 +1890,7 @@ mod tests {
 
         assert_eq!(loaded.n_converged, Some(12));
         assert_eq!(loaded.n_total, Some(12));
+        assert_eq!(loaded.n_failed, Some(1));
         assert_eq!(
             loaded.result_isotope_labels,
             Some(vec!["W-182".into(), "Fe-56".into()])
