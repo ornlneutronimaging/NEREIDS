@@ -547,6 +547,8 @@ mod tests {
         let model = PrecomputedTransmissionModel {
             cross_sections: Arc::new(xs),
             density_indices: Arc::new(vec![0]),
+            energies: None,
+            instrument: None,
         };
         let t_1d = model.evaluate(&[true_density]).unwrap();
         let sigma_1d: Vec<f64> = t_1d.iter().map(|&v| 0.01 * v.max(0.01)).collect();

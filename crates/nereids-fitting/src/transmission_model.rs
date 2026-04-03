@@ -9,27 +9,30 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use nereids_endf::resonance::ResonanceData;
+use nereids_physics::resolution;
 use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
 
 use crate::error::FittingError;
 use crate::lm::{FitModel, FlatMatrix};
 
-/// Transmission model backed by precomputed broadened cross-sections.
+/// Transmission model backed by precomputed Doppler-broadened cross-sections.
 ///
-/// The expensive physics steps (resonance → σ(E), Doppler broadening,
-/// resolution broadening) are computed once and stored.  Each `evaluate()`
-/// call performs only the Beer-Lambert step:
+/// The expensive physics steps (resonance → σ(E), Doppler broadening) are
+/// computed once and stored.  Each `evaluate()` call performs Beer-Lambert
+/// and, when `instrument` is present, resolution broadening on the total
+/// transmission:
 ///
-///   T(E) = exp(−Σᵢ nᵢ · σ_D,i(E))
+///   T(E) = R ⊗ exp(−Σᵢ nᵢ · σ_{D,i}(E))
 ///
-/// which is O(N_energy) instead of O(N_energy × N_resonances).  For a
-/// 128×128 spatial map this is ~100–1000× faster than `TransmissionFitModel`.
+/// Issue #442: resolution broadening is applied to T(E) after Beer-Lambert,
+/// not to σ(E) before.
 ///
 /// Construct via `nereids_physics::transmission::broadened_cross_sections`,
 /// then wrap in `Arc` so the same precomputed data is shared read-only
 /// across all rayon worker threads.
 pub struct PrecomputedTransmissionModel {
-    /// Broadened cross-sections σ_D(E) per isotope, shape \[n_isotopes\]\[n_energies\].
+    /// Doppler-broadened cross-sections σ_D(E) per isotope,
+    /// shape \[n_isotopes\]\[n_energies\].
     pub cross_sections: Arc<Vec<Vec<f64>>>,
     /// Mapping: `params[density_indices[i]]` is the density of isotope `i`.
     ///
@@ -39,6 +42,13 @@ pub struct PrecomputedTransmissionModel {
     /// Kept `pub` (not `pub(crate)`) because the Python bindings
     /// (`nereids-python`) construct and access this field directly.
     pub density_indices: Arc<Vec<usize>>,
+    /// Energy grid (eV), required for resolution broadening.
+    /// `None` when resolution is disabled — Beer-Lambert only.
+    pub energies: Option<Arc<Vec<f64>>>,
+    /// Instrument resolution parameters.
+    /// When `Some`, resolution broadening is applied to the total
+    /// transmission after Beer-Lambert in `evaluate()`.
+    pub instrument: Option<Arc<InstrumentParams>>,
 }
 
 impl FitModel for PrecomputedTransmissionModel {
@@ -62,13 +72,30 @@ impl FitModel for PrecomputedTransmissionModel {
                 neg_opt[j] -= density * sigma;
             }
         }
-        Ok(neg_opt.iter().map(|&d| d.exp()).collect())
+        let transmission: Vec<f64> = neg_opt.iter().map(|&d| d.exp()).collect();
+
+        // Issue #442: apply resolution broadening to total transmission
+        // AFTER Beer-Lambert.  This is the SAMMY-correct ordering.
+        if let (Some(inst), Some(energies)) = (&self.instrument, &self.energies) {
+            let t_broadened =
+                resolution::apply_resolution(energies, &transmission, &inst.resolution).map_err(
+                    |e| FittingError::EvaluationFailed(format!("resolution broadening: {e}")),
+                )?;
+            Ok(t_broadened)
+        } else {
+            Ok(transmission)
+        }
     }
 
     /// Analytical Jacobian for the Beer-Lambert transmission model.
     ///
     /// T(E) = exp(-Σᵢ nᵢ · σᵢ(E))
     /// ∂T/∂nᵢ = -σᵢ(E) · T(E)
+    ///
+    /// When resolution is enabled, the correct derivative is
+    /// ∂[R⊗T]/∂nᵢ = R⊗[-σᵢ·T] (resolution is a linear operator).
+    /// This is not yet implemented (issue #442 Step 4); returns `None`
+    /// to fall back to finite-difference Jacobians.
     ///
     /// Costs O(N_energy × N_isotopes) with zero extra evaluate() calls,
     /// because T(E) is already in `y_current` from the LM loop.
@@ -80,6 +107,12 @@ impl FitModel for PrecomputedTransmissionModel {
         free_param_indices: &[usize],
         y_current: &[f64],
     ) -> Option<FlatMatrix> {
+        // Issue #442: fall back to FD when resolution is enabled.
+        // The analytical form ∂[R⊗T]/∂nᵢ is deferred to Step 4.
+        if self.instrument.is_some() {
+            return None;
+        }
+
         let n_e = y_current.len();
         let n_free = free_param_indices.len();
 
@@ -774,14 +807,13 @@ mod tests {
     /// Verify Beer-Lambert: T(E) = exp(-Σᵢ nᵢ·σᵢ(E)).
     #[test]
     fn precomputed_evaluate_matches_beer_lambert() {
-        let xs = Arc::new(vec![
-            vec![1.0, 2.0, 3.0], // isotope 0
-            vec![0.5, 0.5, 0.5], // isotope 1
-        ]);
-        let model = PrecomputedTransmissionModel {
-            cross_sections: xs,
-            density_indices: Arc::new(vec![0, 1]),
-        };
+        let model = make_precomputed(
+            vec![
+                vec![1.0, 2.0, 3.0], // isotope 0
+                vec![0.5, 0.5, 0.5], // isotope 1
+            ],
+            vec![0, 1],
+        );
 
         let params = [0.2f64, 0.4f64];
         let y = model.evaluate(&params).unwrap();
@@ -806,14 +838,13 @@ mod tests {
     /// Analytical Jacobian ∂T/∂nᵢ = -σᵢ(E)·T(E) must match central-difference FD.
     #[test]
     fn precomputed_analytical_jacobian_matches_finite_difference() {
-        let xs = Arc::new(vec![
-            vec![1.0, 2.0, 3.0], // isotope 0
-            vec![0.5, 0.5, 0.5], // isotope 1
-        ]);
-        let model = PrecomputedTransmissionModel {
-            cross_sections: xs,
-            density_indices: Arc::new(vec![0, 1]),
-        };
+        let model = make_precomputed(
+            vec![
+                vec![1.0, 2.0, 3.0], // isotope 0
+                vec![0.5, 0.5, 0.5], // isotope 1
+            ],
+            vec![0, 1],
+        );
 
         let params = [0.2f64, 0.4f64];
         let y = model.evaluate(&params).unwrap();
@@ -853,14 +884,13 @@ mod tests {
     #[test]
     fn precomputed_jacobian_tied_parameters_sums_both_isotopes() {
         // Two isotopes mapped to the same density parameter (index 0).
-        let xs = Arc::new(vec![
-            vec![1.0, 2.0, 3.0], // isotope 0
-            vec![0.5, 1.0, 1.5], // isotope 1 — tied to same param
-        ]);
-        let model = PrecomputedTransmissionModel {
-            cross_sections: xs,
-            density_indices: Arc::new(vec![0, 0]), // both isotopes share param[0]
-        };
+        let model = make_precomputed(
+            vec![
+                vec![1.0, 2.0, 3.0], // isotope 0
+                vec![0.5, 1.0, 1.5], // isotope 1 — tied to same param
+            ],
+            vec![0, 0], // both isotopes share param[0]
+        );
 
         let params = [0.1f64];
         let y = model.evaluate(&params).unwrap();
@@ -1303,7 +1333,8 @@ mod tests {
 
     // ── NormalizedTransmissionModel ─────────────────────────────────────────
 
-    /// Helper: make a PrecomputedTransmissionModel with given cross-sections.
+    /// Helper: make a PrecomputedTransmissionModel with given cross-sections
+    /// and no resolution (Beer-Lambert only).
     fn make_precomputed(
         xs: Vec<Vec<f64>>,
         density_indices: Vec<usize>,
@@ -1311,6 +1342,8 @@ mod tests {
         PrecomputedTransmissionModel {
             cross_sections: Arc::new(xs),
             density_indices: Arc::new(density_indices),
+            energies: None,
+            instrument: None,
         }
     }
 
@@ -1576,5 +1609,122 @@ mod tests {
             .expect("analytical jacobian should be available");
         assert_eq!(jac.len(), 2); // 2 columns (one per free param)
         assert_eq!(jac[0].len(), 3); // 3 rows (one per energy bin)
+    }
+
+    // ── Issue #442 Step 3 regression tests ─────────────────────────────────
+
+    /// Issue #442: PrecomputedTransmissionModel with resolution must match
+    /// forward_model() with resolution for the same single-isotope sample.
+    #[test]
+    fn precomputed_with_resolution_matches_forward_model() {
+        use nereids_physics::resolution::ResolutionFunction;
+
+        let data = u238_single_resonance();
+        let thickness = 0.0005;
+        let temperature = 300.0;
+        let energies: Vec<f64> = (0..401).map(|i| 4.0 + (i as f64) * 0.015).collect();
+
+        let inst = Arc::new(InstrumentParams {
+            resolution: ResolutionFunction::Gaussian(
+                nereids_physics::resolution::ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
+            ),
+        });
+
+        // Reference: forward_model() (already fixed in Step 1).
+        let sample = SampleParams::new(temperature, vec![(data.clone(), thickness)]).unwrap();
+        let t_forward = transmission::forward_model(&energies, &sample, Some(&inst)).unwrap();
+
+        // Precomputed path: Doppler-only XS → PrecomputedTransmissionModel.
+        let xs = transmission::broadened_cross_sections(
+            &energies,
+            std::slice::from_ref(&data),
+            temperature,
+            Some(&inst), // aux grid for Doppler accuracy
+            None,
+        )
+        .unwrap();
+        let model = PrecomputedTransmissionModel {
+            cross_sections: Arc::new(xs),
+            density_indices: Arc::new(vec![0]),
+            energies: Some(Arc::new(energies.clone())),
+            instrument: Some(Arc::clone(&inst)),
+        };
+        let t_precomputed = model.evaluate(&[thickness]).unwrap();
+
+        // Both should agree closely on the interior grid.
+        // Small differences are expected from extended-grid Doppler
+        // in forward_model vs data-grid Doppler in broadened_cross_sections.
+        let interior = 20..energies.len() - 20;
+        let mut max_err = 0.0f64;
+        for i in interior {
+            let err = (t_forward[i] - t_precomputed[i]).abs();
+            max_err = max_err.max(err);
+        }
+        assert!(
+            max_err < 0.02,
+            "PrecomputedTransmissionModel with resolution should match \
+             forward_model.  Max error = {max_err}"
+        );
+    }
+
+    /// Issue #442: PrecomputedTransmissionModel without resolution must
+    /// behave identically to the pre-fix version (pure Beer-Lambert).
+    #[test]
+    fn precomputed_without_resolution_unchanged() {
+        let model_no_res = make_precomputed(
+            vec![vec![100.0, 200.0, 50.0]], // one isotope
+            vec![0],
+        );
+        let params = [0.001f64]; // density
+        let t = model_no_res.evaluate(&params).unwrap();
+
+        // Expected: pure Beer-Lambert.
+        let expected: Vec<f64> = [100.0, 200.0, 50.0]
+            .iter()
+            .map(|&sigma| (-params[0] * sigma).exp())
+            .collect();
+
+        for (i, (&ti, &ei)) in t.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (ti - ei).abs() < 1e-14,
+                "No-resolution mismatch at bin {i}: got {ti}, expected {ei}"
+            );
+        }
+
+        // Analytical Jacobian should still be available when instrument is None.
+        let y = model_no_res.evaluate(&params).unwrap();
+        assert!(
+            model_no_res
+                .analytical_jacobian(&params, &[0], &y)
+                .is_some(),
+            "Analytical Jacobian must be available when instrument is None"
+        );
+    }
+
+    /// Issue #442: PrecomputedTransmissionModel analytical Jacobian must
+    /// fall back to None when resolution is enabled.
+    #[test]
+    fn precomputed_jacobian_disabled_with_resolution() {
+        use nereids_physics::resolution::ResolutionFunction;
+
+        let energies: Vec<f64> = (0..100).map(|i| 1.0 + i as f64 * 0.1).collect();
+        let inst = Arc::new(InstrumentParams {
+            resolution: ResolutionFunction::Gaussian(
+                nereids_physics::resolution::ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
+            ),
+        });
+        let model = PrecomputedTransmissionModel {
+            cross_sections: Arc::new(vec![vec![10.0; 100]]),
+            density_indices: Arc::new(vec![0]),
+            energies: Some(Arc::new(energies)),
+            instrument: Some(inst),
+        };
+        let params = [0.001f64];
+        let y = model.evaluate(&params).unwrap();
+        assert!(
+            model.analytical_jacobian(&params, &[0], &y).is_none(),
+            "Analytical Jacobian must return None when resolution is enabled \
+             (issue #442 Step 4 not yet implemented)"
+        );
     }
 }
