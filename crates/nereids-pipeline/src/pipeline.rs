@@ -1145,9 +1145,19 @@ fn build_transmission_model(
             } else {
                 Arc::clone(xs)
             };
+        // Issue #442: pass energies + instrument so evaluate() applies
+        // resolution after Beer-Lambert on total transmission.
+        let instrument = config
+            .resolution
+            .clone()
+            .map(|r| Arc::new(InstrumentParams { resolution: r }));
         return Ok(Box::new(PrecomputedTransmissionModel {
             cross_sections: effective_xs,
             density_indices: Arc::new((0..n_params).collect()),
+            energies: instrument
+                .as_ref()
+                .map(|_| Arc::new(config.energies.clone())),
+            instrument,
         }));
     }
 
@@ -1460,6 +1470,8 @@ mod tests {
                 .unwrap(),
             ]),
             density_indices: Arc::new(vec![0]),
+            energies: None,
+            instrument: None,
         };
         let t = model.evaluate(&[true_density]).unwrap();
         let sigma: Vec<f64> = t.iter().map(|&v| 0.01 * v.max(0.01)).collect();
@@ -1806,6 +1818,8 @@ mod tests {
         let model = PrecomputedTransmissionModel {
             cross_sections: Arc::new(xs),
             density_indices: Arc::new(vec![0]),
+            energies: None,
+            instrument: None,
         };
         let t = model.evaluate(&[true_density]).unwrap();
         let sigma: Vec<f64> = t.iter().map(|&v| 0.01 * v.max(0.01)).collect();
