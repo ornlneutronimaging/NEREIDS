@@ -1888,4 +1888,133 @@ mod tests {
             );
         }
     }
+
+    // ── Issue #442 Step 7: derivative helper containment ───────────────────
+
+    /// Issue #442 Step 7: `broadened_cross_sections_with_analytical_derivative_from_base()`
+    /// must return Doppler-only σ and Doppler-only ∂σ/∂T even when instrument
+    /// is present.  Resolution broadening must NOT be applied inside.
+    #[test]
+    fn test_derivative_helper_is_doppler_only_with_instrument() {
+        let data = u238_single_resonance();
+        let temperature = 300.0;
+        let energies: Vec<f64> = (0..201).map(|i| 4.0 + (i as f64) * 0.025).collect();
+
+        let inst = InstrumentParams {
+            resolution: resolution::ResolutionFunction::Gaussian(
+                resolution::ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
+            ),
+        };
+
+        let base_xs =
+            unbroadened_cross_sections(&energies, std::slice::from_ref(&data), None).unwrap();
+
+        // With instrument.
+        let (xs_inst, dxs_inst) = broadened_cross_sections_with_analytical_derivative_from_base(
+            &energies,
+            &base_xs,
+            std::slice::from_ref(&data),
+            temperature,
+            Some(&inst),
+        )
+        .unwrap();
+
+        // Without instrument.
+        let (xs_none, dxs_none) = broadened_cross_sections_with_analytical_derivative_from_base(
+            &energies,
+            &base_xs,
+            std::slice::from_ref(&data),
+            temperature,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(xs_inst.len(), 1);
+        assert_eq!(dxs_inst.len(), 1);
+
+        // Both should return Doppler-only.  Compute what resolution-broadened
+        // σ would look like, and verify the with-instrument result is closer
+        // to the no-instrument result than to the resolved version.
+        let sigma_resolved =
+            resolution::apply_resolution(&energies, &xs_none[0], &inst.resolution).unwrap();
+
+        let idx_dip = energies
+            .iter()
+            .position(|&e| (e - 6.674).abs() < 0.05)
+            .unwrap();
+
+        // σ check: with-instrument should be close to no-instrument (Doppler-only),
+        // not to the resolution-broadened version.
+        let diff_doppler = (xs_inst[0][idx_dip] - xs_none[0][idx_dip]).abs();
+        let diff_resolved = (xs_inst[0][idx_dip] - sigma_resolved[idx_dip]).abs();
+        assert!(
+            diff_doppler < diff_resolved,
+            "derivative helper σ with instrument should be Doppler-only. \
+             diff(inst, none) = {diff_doppler}, diff(inst, resolved) = {diff_resolved}"
+        );
+
+        // ∂σ/∂T check: same pattern — should be Doppler-only derivative.
+        let dxs_resolved =
+            resolution::apply_resolution(&energies, &dxs_none[0], &inst.resolution).unwrap();
+        let ddiff_doppler = (dxs_inst[0][idx_dip] - dxs_none[0][idx_dip]).abs();
+        let ddiff_resolved = (dxs_inst[0][idx_dip] - dxs_resolved[idx_dip]).abs();
+        assert!(
+            ddiff_doppler < ddiff_resolved,
+            "derivative helper ∂σ/∂T with instrument should be Doppler-only. \
+             diff(inst, none) = {ddiff_doppler}, diff(inst, resolved) = {ddiff_resolved}"
+        );
+    }
+
+    /// Issue #442 Step 7: derivative helper without resolution must be
+    /// unchanged — same σ and ∂σ/∂T as before.
+    #[test]
+    fn test_derivative_helper_no_resolution_unchanged() {
+        let data = u238_single_resonance();
+        let temperature = 300.0;
+        let energies: Vec<f64> = (0..201).map(|i| 4.0 + (i as f64) * 0.025).collect();
+
+        let base_xs =
+            unbroadened_cross_sections(&energies, std::slice::from_ref(&data), None).unwrap();
+
+        let (xs, dxs) = broadened_cross_sections_with_analytical_derivative_from_base(
+            &energies,
+            &base_xs,
+            std::slice::from_ref(&data),
+            temperature,
+            None,
+        )
+        .unwrap();
+
+        // σ should match broadened_cross_sections (no instrument).
+        let xs_ref = broadened_cross_sections(
+            &energies,
+            std::slice::from_ref(&data),
+            temperature,
+            None,
+            None,
+        )
+        .unwrap();
+
+        for (i, (&a, &b)) in xs[0].iter().zip(xs_ref[0].iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-12,
+                "σ mismatch at E[{i}]: derivative_helper={a}, broadened={b}"
+            );
+        }
+
+        // ∂σ/∂T should be finite and non-trivial near resonance.
+        assert_eq!(dxs.len(), 1);
+        assert_eq!(dxs[0].len(), energies.len());
+        let idx_res = energies
+            .iter()
+            .position(|&e| (e - 6.674).abs() < 0.05)
+            .unwrap();
+        assert!(
+            dxs[0][idx_res].abs() > 0.0,
+            "∂σ/∂T should be non-zero near resonance"
+        );
+        for &d in &dxs[0] {
+            assert!(d.is_finite(), "∂σ/∂T must be finite");
+        }
+    }
 }
