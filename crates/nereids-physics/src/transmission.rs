@@ -488,8 +488,9 @@ pub fn forward_model(
 ///
 /// This is the expensive physics step that should be done **once** before
 /// fitting many pixels with the same isotopes and energy grid.  The result
-/// feeds directly into `nereids_fitting::transmission_model::PrecomputedTransmissionModel`,
-/// which applies Beer-Lambert and then resolution broadening per-pixel.
+/// feeds into `nereids_fitting::transmission_model::PrecomputedTransmissionModel`,
+/// which currently applies Beer-Lambert only.  Post-Beer-Lambert resolution
+/// broadening per-pixel is not yet implemented (issue #442 Step 3).
 ///
 /// # Arguments
 /// * `energies`        — Energy grid in eV (sorted ascending).
