@@ -963,10 +963,17 @@ pub fn broadened_cross_sections_with_analytical_derivative_from_base(
 
 /// Compute a transmission spectrum from precomputed unbroadened cross-sections.
 ///
-/// Applies Doppler broadening, resolution broadening, and Beer-Lambert
-/// using cached base XS. This skips the expensive Reich-Moore calculation,
-/// making it suitable for use inside `TransmissionFitModel::evaluate()` when
-/// temperature is a free parameter.
+/// Applies Doppler broadening and Beer-Lambert using cached base XS,
+/// then resolution broadening on the total transmission (issue #442).
+/// This skips the expensive Reich-Moore calculation, making it suitable
+/// for use inside `TransmissionFitModel::evaluate()` when temperature
+/// is a free parameter.
+///
+/// Pipeline:
+///   1. Doppler-broaden base σ (via `broadened_cross_sections_from_base`)
+///   2. Accumulate total attenuation: Σᵢ nᵢ·σ_{D,i}
+///   3. Beer-Lambert: T = exp(−attenuation)
+///   4. Resolution: T_broad = R ⊗ T  (when instrument is present)
 pub fn forward_model_from_base_xs(
     energies: &[f64],
     base_xs: &[Vec<f64>],
@@ -988,7 +995,8 @@ pub fn forward_model_from_base_xs(
         return Ok(vec![]);
     }
 
-    let broadened = broadened_cross_sections_from_base(
+    // Step 1: Doppler-only σ (resolution NOT applied — issue #442).
+    let doppler_xs = broadened_cross_sections_from_base(
         energies,
         base_xs,
         resonance_data,
@@ -996,8 +1004,9 @@ pub fn forward_model_from_base_xs(
         instrument,
     )?;
 
+    // Step 2-3: accumulate attenuation, Beer-Lambert.
     let mut total_attenuation = vec![0.0f64; n];
-    for (xs, &thickness) in broadened.iter().zip(thicknesses.iter()) {
+    for (xs, &thickness) in doppler_xs.iter().zip(thicknesses.iter()) {
         if thickness <= 0.0 {
             continue;
         }
@@ -1005,8 +1014,15 @@ pub fn forward_model_from_base_xs(
             total_attenuation[i] += thickness * xs[i];
         }
     }
+    let transmission: Vec<f64> = total_attenuation.iter().map(|&att| (-att).exp()).collect();
 
-    Ok(total_attenuation.iter().map(|&att| (-att).exp()).collect())
+    // Step 4: resolution broadening on total transmission.
+    if let Some(inst) = instrument {
+        resolution::apply_resolution(energies, &transmission, &inst.resolution)
+            .map_err(TransmissionError::from)
+    } else {
+        Ok(transmission)
+    }
 }
 
 #[cfg(test)]
@@ -1771,5 +1787,105 @@ mod tests {
              diff(with_inst, no_inst) = {diff_doppler}, \
              diff(with_inst, resolved) = {diff_resolved}"
         );
+    }
+
+    // ── Issue #442 Step 5: forward_model_from_base_xs resolution ordering ──
+
+    /// Issue #442 Step 5: `forward_model_from_base_xs()` with resolution must
+    /// match `forward_model()` with resolution for the same sample.
+    #[test]
+    fn test_forward_model_from_base_xs_matches_forward_model_with_resolution() {
+        let data = u238_single_resonance();
+        let thickness = 0.0005;
+        let temperature = 300.0;
+        let energies: Vec<f64> = (0..401).map(|i| 4.0 + (i as f64) * 0.015).collect();
+
+        let inst = InstrumentParams {
+            resolution: resolution::ResolutionFunction::Gaussian(
+                resolution::ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
+            ),
+        };
+
+        // Reference: forward_model() (fixed in Step 1).
+        let sample = SampleParams::new(temperature, vec![(data.clone(), thickness)]).unwrap();
+        let t_ref = forward_model(&energies, &sample, Some(&inst)).unwrap();
+
+        // Base-XS path: unbroadened → forward_model_from_base_xs with resolution.
+        let base_xs =
+            unbroadened_cross_sections(&energies, std::slice::from_ref(&data), None).unwrap();
+        let t_base = forward_model_from_base_xs(
+            &energies,
+            &base_xs,
+            std::slice::from_ref(&data),
+            &[thickness],
+            temperature,
+            Some(&inst),
+        )
+        .unwrap();
+
+        // Both use resolution after Beer-Lambert but may differ slightly
+        // due to extended-grid Doppler in forward_model vs data-grid Doppler
+        // in broadened_cross_sections_from_base.
+        let interior = 20..energies.len() - 20;
+        let mut max_err = 0.0f64;
+        for i in interior.clone() {
+            max_err = max_err.max((t_ref[i] - t_base[i]).abs());
+        }
+        assert!(
+            max_err < 0.02,
+            "forward_model_from_base_xs with resolution should match \
+             forward_model.  Max error = {max_err}"
+        );
+
+        // Verify resolution actually made a difference (not a vacuous test).
+        let t_no_res = forward_model_from_base_xs(
+            &energies,
+            &base_xs,
+            std::slice::from_ref(&data),
+            &[thickness],
+            temperature,
+            None,
+        )
+        .unwrap();
+        let res_diff: f64 = interior
+            .map(|i| (t_base[i] - t_no_res[i]).abs())
+            .fold(0.0f64, f64::max);
+        assert!(
+            res_diff > 1e-4,
+            "Resolution should make a measurable difference, but max diff = {res_diff}"
+        );
+    }
+
+    /// Issue #442 Step 5: `forward_model_from_base_xs()` without resolution
+    /// must remain unchanged (matches existing no-resolution test).
+    #[test]
+    fn test_forward_model_from_base_xs_no_resolution_unchanged() {
+        let data = u238_single_resonance();
+        let thickness = 0.0005;
+        let temperature = 300.0;
+        let energies: Vec<f64> = (0..201).map(|i| 4.0 + (i as f64) * 0.025).collect();
+
+        let sample = SampleParams::new(temperature, vec![(data.clone(), thickness)]).unwrap();
+        let t_ref = forward_model(&energies, &sample, None).unwrap();
+
+        let base_xs =
+            unbroadened_cross_sections(&energies, std::slice::from_ref(&data), None).unwrap();
+        let t_base = forward_model_from_base_xs(
+            &energies,
+            &base_xs,
+            std::slice::from_ref(&data),
+            &[thickness],
+            temperature,
+            None,
+        )
+        .unwrap();
+
+        for (i, (&r, &b)) in t_ref.iter().zip(t_base.iter()).enumerate() {
+            assert!(
+                (r - b).abs() < 1e-12,
+                "No-resolution mismatch at E[{i}]={}: ref={r}, base={b}",
+                energies[i]
+            );
+        }
     }
 }
