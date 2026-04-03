@@ -411,6 +411,15 @@ impl FitModel for TransmissionFitModel {
         free_param_indices: &[usize],
         y_current: &[f64],
     ) -> Option<FlatMatrix> {
+        // Issue #442 Step 4: when resolution is enabled, the analytical
+        // Jacobian ∂T/∂nᵢ = -σᵢ·T assumes T = exp(-Σnσ), but the actual
+        // model is T_out = R⊗exp(-Σnσ).  The correct form
+        // ∂[R⊗T]/∂nᵢ = R⊗[-σᵢ·T] is not yet implemented.
+        // Fall back to finite-difference.
+        if self.instrument.is_some() {
+            return None;
+        }
+
         // Only provide analytical Jacobian when base_xs is available
         // (temperature-fitting fast path with cached broadened XS).
         let _base_xs_guard = self.base_xs.as_ref()?;
@@ -1725,6 +1734,74 @@ mod tests {
             model.analytical_jacobian(&params, &[0], &y).is_none(),
             "Analytical Jacobian must return None when resolution is enabled \
              (issue #442 Step 4 not yet implemented)"
+        );
+    }
+
+    // ── Issue #442 Step 4: TransmissionFitModel Jacobian containment ───────
+
+    /// Issue #442 Step 4: TransmissionFitModel analytical Jacobian must
+    /// return None when resolution is enabled (density + temperature paths).
+    #[test]
+    fn transmission_fit_model_jacobian_disabled_with_resolution() {
+        use nereids_physics::resolution::ResolutionFunction;
+
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..101).map(|i| 4.0 + (i as f64) * 0.05).collect();
+        let inst = Arc::new(InstrumentParams {
+            resolution: ResolutionFunction::Gaussian(
+                nereids_physics::resolution::ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
+            ),
+        });
+
+        // Temperature-fitting path (base_xs present).
+        let model = TransmissionFitModel::new(
+            energies.clone(),
+            vec![data.clone()],
+            300.0,
+            Some(inst),
+            (vec![0], vec![1.0]),
+            Some(1), // temperature_index
+            None,    // external_base_xs — will be computed internally
+        )
+        .unwrap();
+
+        // params = [density, temperature]
+        let params = [0.0005, 300.0];
+        let y = model.evaluate(&params).unwrap();
+
+        assert!(
+            model.analytical_jacobian(&params, &[0, 1], &y).is_none(),
+            "TransmissionFitModel analytical Jacobian must return None \
+             when resolution is enabled"
+        );
+    }
+
+    /// Issue #442 Step 4: TransmissionFitModel analytical Jacobian must
+    /// remain available when resolution is NOT enabled.
+    #[test]
+    fn transmission_fit_model_jacobian_available_without_resolution() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..101).map(|i| 4.0 + (i as f64) * 0.05).collect();
+
+        // Temperature-fitting path, no resolution.
+        let model = TransmissionFitModel::new(
+            energies,
+            vec![data],
+            300.0,
+            None, // no instrument
+            (vec![0], vec![1.0]),
+            Some(1),
+            None,
+        )
+        .unwrap();
+
+        let params = [0.0005, 300.0];
+        let y = model.evaluate(&params).unwrap();
+
+        assert!(
+            model.analytical_jacobian(&params, &[0, 1], &y).is_some(),
+            "TransmissionFitModel analytical Jacobian must be available \
+             when resolution is disabled"
         );
     }
 }
