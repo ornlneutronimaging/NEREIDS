@@ -1879,25 +1879,33 @@ fn precompute_cross_sections<'py>(
         ));
     }
 
+    // Issue #442: resolution-broadened cross-sections are not physically
+    // meaningful for transmission fitting.  Resolution broadening must be
+    // applied after Beer-Lambert on the total transmission, which depends
+    // on per-pixel densities and cannot be precomputed as broadened σ.
+    let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution, delta_e_us)?;
+    if res_fn.is_some() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "precompute_cross_sections() cannot apply resolution broadening to \
+             cross-sections.  For transmission data, resolution broadening must \
+             be applied after Beer-Lambert on the total transmission T(E), not \
+             to individual cross-sections σ(E).  Use forward_model() instead, \
+             which applies resolution in the correct order.  \
+             To get Doppler-only cross-sections, omit the resolution parameters.",
+        ));
+    }
+
     let res_data: Vec<ResonanceData> = isotopes
         .into_iter()
         .map(|d| Arc::unwrap_or_clone(d.inner))
         .collect();
-    let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution, delta_e_us)?;
-    let instrument = res_fn.map(|r| InstrumentParams { resolution: r });
 
     // Copy numpy slice to owned Vec so we can release the GIL.
     let e_owned = e.to_vec();
 
-    // Release the GIL for the heavy Doppler + resolution broadening.
+    // Release the GIL for the heavy Doppler broadening.
     let xs = py.detach(move || {
-        transmission::broadened_cross_sections(
-            &e_owned,
-            &res_data,
-            temperature_k,
-            instrument.as_ref(),
-            None,
-        )
+        transmission::broadened_cross_sections(&e_owned, &res_data, temperature_k, None, None)
     });
 
     // GIL is re-acquired after detach returns — use `py` directly.

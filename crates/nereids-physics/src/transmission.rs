@@ -476,18 +476,28 @@ pub fn forward_model(
     }
 }
 
-/// Compute Doppler- and resolution-broadened cross-sections for each isotope.
+/// Compute Doppler-broadened cross-sections for each isotope.
+///
+/// Returns **Doppler-only** cross-sections.  Resolution broadening is NOT
+/// applied here because it must be applied after Beer-Lambert on the total
+/// transmission for physically correct results (issue #442).
+///
+/// When `instrument` is `Some`, the auxiliary extended grid is still
+/// constructed for Doppler boundary accuracy, but the resolution
+/// convolution is not performed.
 ///
 /// This is the expensive physics step that should be done **once** before
 /// fitting many pixels with the same isotopes and energy grid.  The result
 /// feeds directly into `nereids_fitting::transmission_model::PrecomputedTransmissionModel`,
-/// making per-pixel Beer-Lambert evaluation trivial.
+/// which applies Beer-Lambert and then resolution broadening per-pixel.
 ///
 /// # Arguments
 /// * `energies`        — Energy grid in eV (sorted ascending).
 /// * `resonance_data`  — Resonance parameters for each isotope.
 /// * `temperature_k`   — Sample temperature for Doppler broadening.
 /// * `instrument`      — Optional instrument resolution parameters.
+///   Used only for auxiliary grid construction (Doppler boundary accuracy).
+///   Resolution broadening is NOT applied.
 /// * `cancel`          — Optional cancellation token.  Cancellation is checked
 ///   at the start of each isotope's parallel task; in-flight tasks run to
 ///   completion (consistent with the rayon pattern in `spatial.rs`).
@@ -499,8 +509,8 @@ pub fn forward_model(
 /// * [`TransmissionError::Cancelled`] — if the `cancel` flag was observed
 ///   during parallel execution (either before an isotope started or after
 ///   all tasks completed).
-/// * [`TransmissionError::Resolution`] — if resolution broadening is enabled
-///   (`instrument` is `Some`) and `energies` is not sorted ascending.
+/// * [`TransmissionError::Resolution`] — if `instrument` is `Some` and
+///   `energies` is not sorted ascending.
 /// * [`TransmissionError::Doppler`] — if Doppler broadening is enabled
 ///   (`temperature_k > 0.0`) and `DopplerParams` validation fails
 ///   (e.g., non-positive or non-finite AWR).
@@ -524,9 +534,10 @@ pub fn broadened_cross_sections(
     let rd_refs: Vec<&ResonanceData> = resonance_data.iter().collect();
     let ext_grid = build_aux_grid(energies, instrument, &rd_refs);
 
-    // Parallelize across isotopes — Doppler + resolution broadening for each
-    // isotope is independent and this is the dominant cost in the forward model
-    // pipeline.  Cancellation is checked per-isotope inside the parallel map.
+    // Parallelize across isotopes — Doppler broadening for each isotope is
+    // independent.  Resolution is NOT applied here (issue #442: resolution
+    // must be applied after Beer-Lambert on total transmission).
+    // Cancellation is checked per-isotope inside the parallel map.
     let result: Result<Vec<Vec<f64>>, TransmissionError> = resonance_data
         .par_iter()
         .map(|rd| {
@@ -535,12 +546,11 @@ pub fn broadened_cross_sections(
                 return Err(TransmissionError::Cancelled);
             }
 
-            // When an extended grid is available, evaluate XS + Doppler +
-            // resolution on the extended grid, then extract at data positions.
-            // The boundary extension ensures the resolution broadening
-            // convolution kernel is fully supported at all data points.
+            // When an extended grid is available, evaluate XS + Doppler on
+            // the extended grid, then extract at data positions.  The
+            // boundary extension improves Doppler broadening accuracy near
+            // grid edges and narrow resonances.
             let xs = if let Some((ref ext_energies, ref data_indices)) = ext_grid {
-                let inst = instrument.unwrap();
                 let unbroadened: Vec<f64> = ext_energies
                     .iter()
                     .map(|&e| reich_moore::cross_sections_at_energy(rd, e).total)
@@ -551,33 +561,18 @@ pub fn broadened_cross_sections(
                 } else {
                     unbroadened
                 };
-                let broadened = resolution::apply_resolution_presorted(
-                    ext_energies,
-                    &after_doppler,
-                    &inst.resolution,
-                );
-                data_indices.iter().map(|&i| broadened[i]).collect()
+                data_indices.iter().map(|&i| after_doppler[i]).collect()
             } else {
-                // No extended grid: Doppler on data grid, then resolution
-                // on data grid if instrument is present.
+                // No extended grid: Doppler on data grid only.
                 let unbroadened: Vec<f64> = energies
                     .iter()
                     .map(|&e| reich_moore::cross_sections_at_energy(rd, e).total)
                     .collect();
-                let after_doppler = if temperature_k > 0.0 {
+                if temperature_k > 0.0 {
                     let params = DopplerParams::new(temperature_k, rd.awr)?;
                     doppler::doppler_broaden(energies, &unbroadened, &params)?
                 } else {
                     unbroadened
-                };
-                if let Some(inst) = instrument {
-                    resolution::apply_resolution_presorted(
-                        energies,
-                        &after_doppler,
-                        &inst.resolution,
-                    )
-                } else {
-                    after_doppler
                 }
             };
 
@@ -764,8 +759,11 @@ pub fn unbroadened_cross_sections(
     result
 }
 
-/// Compute Doppler- and resolution-broadened cross-sections from precomputed
-/// unbroadened cross-sections.
+/// Compute Doppler-broadened cross-sections from precomputed unbroadened
+/// cross-sections.
+///
+/// Returns **Doppler-only** cross-sections.  Resolution broadening is NOT
+/// applied (issue #442: must be applied after Beer-Lambert on total T).
 ///
 /// Like [`broadened_cross_sections`] but skips the expensive Reich-Moore
 /// calculation (step 1). Use [`unbroadened_cross_sections`] to compute
@@ -815,12 +813,12 @@ pub fn broadened_cross_sections_from_base(
         mask
     });
 
+    // Resolution is NOT applied (issue #442).  Doppler broadening only.
     base_xs
         .par_iter()
         .zip(resonance_data.par_iter())
         .map(|(xs_raw, rd)| {
             if let Some((ref ext_energies, ref data_indices)) = ext_grid {
-                let inst = instrument.unwrap();
                 let mask = is_data_point.as_ref().unwrap();
 
                 // Build extended XS: copy cached data-grid values, evaluate new points.
@@ -840,41 +838,30 @@ pub fn broadened_cross_sections_from_base(
                 } else {
                     xs_ext
                 };
-                let broadened = resolution::apply_resolution_presorted(
-                    ext_energies,
-                    &after_doppler,
-                    &inst.resolution,
-                );
-                Ok(data_indices.iter().map(|&i| broadened[i]).collect())
+                Ok(data_indices.iter().map(|&i| after_doppler[i]).collect())
             } else {
-                // No auxiliary grid — original path on data grid.
+                // No auxiliary grid — Doppler on data grid only.
                 let after_doppler = if temperature_k > 0.0 {
                     let params = DopplerParams::new(temperature_k, rd.awr)?;
                     doppler::doppler_broaden(energies, xs_raw, &params)?
                 } else {
                     xs_raw.clone()
                 };
-                let xs = if let Some(inst) = instrument {
-                    resolution::apply_resolution_presorted(
-                        energies,
-                        &after_doppler,
-                        &inst.resolution,
-                    )
-                } else {
-                    after_doppler
-                };
-                Ok(xs)
+                Ok(after_doppler)
             }
         })
         .collect()
 }
 
-/// Compute broadened cross-sections and their **analytical** temperature
-/// derivative from precomputed unbroadened cross-sections.
+/// Compute Doppler-broadened cross-sections and their **analytical**
+/// temperature derivative from precomputed unbroadened cross-sections.
+///
+/// Returns **Doppler-only** cross-sections and derivatives.  Resolution
+/// broadening is NOT applied (issue #442: must be applied after
+/// Beer-Lambert on total T).
 ///
 /// Uses `doppler_broaden_with_derivative` for exact ∂σ/∂T in a single pass
-/// (1× broadening), replacing the 3× FD approach. Resolution broadening is
-/// applied to both σ and ∂σ/∂T (valid because resolution is a linear operator).
+/// (1× broadening), replacing the 3× FD approach.
 ///
 /// Returns `BroadenedXsWithDerivative`: `(sigma_k, dsigma_k_dT)`.
 pub fn broadened_cross_sections_with_analytical_derivative_from_base(
@@ -915,14 +902,14 @@ pub fn broadened_cross_sections_with_analytical_derivative_from_base(
         mask
     });
 
-    // Per-isotope: Doppler broaden with analytical derivative, then resolution.
+    // Per-isotope: Doppler broaden with analytical derivative.
+    // Resolution is NOT applied (issue #442).
     type IsotopeXsDxs = Result<(Vec<f64>, Vec<f64>), TransmissionError>;
     let results: Vec<IsotopeXsDxs> = base_xs
         .par_iter()
         .zip(resonance_data.par_iter())
         .map(|(xs_raw, rd)| {
             if let Some((ref ext_energies, ref data_indices)) = ext_grid {
-                let inst = instrument.unwrap();
                 let mask = is_data_point.as_ref().unwrap();
 
                 // Build extended XS on auxiliary grid.
@@ -937,6 +924,7 @@ pub fn broadened_cross_sections_with_analytical_derivative_from_base(
                 }
 
                 // Doppler broaden + analytical derivative in one pass.
+                // Resolution is NOT applied (issue #442).
                 let (after_doppler, dxs_dt_doppler) = if temperature_k > 0.0 {
                     let params = DopplerParams::new(temperature_k, rd.awr)?;
                     doppler::doppler_broaden_with_derivative(ext_energies, &xs_ext, &params)?
@@ -944,46 +932,19 @@ pub fn broadened_cross_sections_with_analytical_derivative_from_base(
                     (xs_ext, vec![0.0; ext_energies.len()])
                 };
 
-                // Resolution broadening on both σ and ∂σ/∂T (linear operator).
-                let broadened = resolution::apply_resolution_presorted(
-                    ext_energies,
-                    &after_doppler,
-                    &inst.resolution,
-                );
-                let dxs_dt_broadened = resolution::apply_resolution_presorted(
-                    ext_energies,
-                    &dxs_dt_doppler,
-                    &inst.resolution,
-                );
-
                 // Extract data-grid points from extended grid.
-                let xs: Vec<f64> = data_indices.iter().map(|&i| broadened[i]).collect();
-                let dxs: Vec<f64> = data_indices.iter().map(|&i| dxs_dt_broadened[i]).collect();
+                let xs: Vec<f64> = data_indices.iter().map(|&i| after_doppler[i]).collect();
+                let dxs: Vec<f64> = data_indices.iter().map(|&i| dxs_dt_doppler[i]).collect();
                 Ok((xs, dxs))
             } else {
-                // No auxiliary grid — data grid directly.
+                // No auxiliary grid — Doppler on data grid only.
                 let (after_doppler, dxs_dt_doppler) = if temperature_k > 0.0 {
                     let params = DopplerParams::new(temperature_k, rd.awr)?;
                     doppler::doppler_broaden_with_derivative(energies, xs_raw, &params)?
                 } else {
                     (xs_raw.clone(), vec![0.0; energies.len()])
                 };
-                let (xs, dxs) = if let Some(inst) = instrument {
-                    let xs = resolution::apply_resolution_presorted(
-                        energies,
-                        &after_doppler,
-                        &inst.resolution,
-                    );
-                    let dxs = resolution::apply_resolution_presorted(
-                        energies,
-                        &dxs_dt_doppler,
-                        &inst.resolution,
-                    );
-                    (xs, dxs)
-                } else {
-                    (after_doppler, dxs_dt_doppler)
-                };
-                Ok((xs, dxs))
+                Ok((after_doppler, dxs_dt_doppler))
             }
         })
         .collect();
@@ -1684,6 +1645,130 @@ mod tests {
             ordering_diff > 1e-4,
             "The two orderings should differ measurably at the resonance dip, \
              but max diff = {ordering_diff}. Test parameters may be too weak."
+        );
+    }
+
+    /// Issue #442 containment: `broadened_cross_sections()` must return
+    /// Doppler-only σ even when `instrument` is `Some`.  Resolution
+    /// broadening must NOT be applied inside this function.
+    #[test]
+    fn test_broadened_xs_is_doppler_only_with_instrument() {
+        let data = u238_single_resonance();
+        let temperature = 300.0;
+        let energies: Vec<f64> = (0..201).map(|i| 4.0 + (i as f64) * 0.025).collect();
+
+        let inst = InstrumentParams {
+            resolution: resolution::ResolutionFunction::Gaussian(
+                resolution::ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
+            ),
+        };
+
+        // With instrument (used for aux grid, but NOT for resolution broadening).
+        let xs_with_inst = broadened_cross_sections(
+            &energies,
+            std::slice::from_ref(&data),
+            temperature,
+            Some(&inst),
+            None,
+        )
+        .unwrap();
+
+        // Without instrument (pure Doppler on data grid).
+        let xs_no_inst = broadened_cross_sections(
+            &energies,
+            std::slice::from_ref(&data),
+            temperature,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Both should return Doppler-only σ.  The with-instrument path uses
+        // the extended grid for Doppler which may produce slightly different
+        // values, but they must be close (no resolution smoothing).
+        assert_eq!(xs_with_inst.len(), 1);
+        assert_eq!(xs_no_inst.len(), 1);
+        assert_eq!(xs_with_inst[0].len(), energies.len());
+
+        // Compute what resolution-broadened σ would look like.
+        let sigma_resolved =
+            resolution::apply_resolution(&energies, &xs_no_inst[0], &inst.resolution).unwrap();
+
+        // The with-instrument result must NOT match the resolution-broadened version.
+        // Near the resonance dip, resolution broadening smooths the peak — the
+        // Doppler-only result should have a deeper dip than the resolved one.
+        let idx_dip = energies
+            .iter()
+            .position(|&e| (e - 6.674).abs() < 0.05)
+            .unwrap();
+        let diff_doppler = (xs_with_inst[0][idx_dip] - xs_no_inst[0][idx_dip]).abs();
+        let diff_resolved = (xs_with_inst[0][idx_dip] - sigma_resolved[idx_dip]).abs();
+
+        // The Doppler-only values from both paths should be closer to each
+        // other than to the resolution-broadened value.
+        assert!(
+            diff_doppler < diff_resolved,
+            "broadened_cross_sections with instrument should return Doppler-only σ, \
+             not resolution-broadened σ.  \
+             diff(with_inst, no_inst) = {diff_doppler}, \
+             diff(with_inst, resolved) = {diff_resolved}"
+        );
+    }
+
+    /// Issue #442 containment: `broadened_cross_sections_from_base()` must
+    /// return Doppler-only σ even when `instrument` is `Some`.
+    #[test]
+    fn test_broadened_from_base_is_doppler_only_with_instrument() {
+        let data = u238_single_resonance();
+        let temperature = 300.0;
+        let energies: Vec<f64> = (0..201).map(|i| 4.0 + (i as f64) * 0.025).collect();
+
+        let inst = InstrumentParams {
+            resolution: resolution::ResolutionFunction::Gaussian(
+                resolution::ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
+            ),
+        };
+
+        let base_xs =
+            unbroadened_cross_sections(&energies, std::slice::from_ref(&data), None).unwrap();
+
+        // With instrument.
+        let xs_with_inst = broadened_cross_sections_from_base(
+            &energies,
+            &base_xs,
+            std::slice::from_ref(&data),
+            temperature,
+            Some(&inst),
+        )
+        .unwrap();
+
+        // Without instrument.
+        let xs_no_inst = broadened_cross_sections_from_base(
+            &energies,
+            &base_xs,
+            std::slice::from_ref(&data),
+            temperature,
+            None,
+        )
+        .unwrap();
+
+        // Both should produce Doppler-only σ.  With-instrument may use
+        // extended grid, but the extracted data-grid values should be close.
+        let sigma_resolved =
+            resolution::apply_resolution(&energies, &xs_no_inst[0], &inst.resolution).unwrap();
+
+        let idx_dip = energies
+            .iter()
+            .position(|&e| (e - 6.674).abs() < 0.05)
+            .unwrap();
+        let diff_doppler = (xs_with_inst[0][idx_dip] - xs_no_inst[0][idx_dip]).abs();
+        let diff_resolved = (xs_with_inst[0][idx_dip] - sigma_resolved[idx_dip]).abs();
+
+        assert!(
+            diff_doppler < diff_resolved,
+            "broadened_cross_sections_from_base with instrument should return Doppler-only σ. \
+             diff(with_inst, no_inst) = {diff_doppler}, \
+             diff(with_inst, resolved) = {diff_resolved}"
         );
     }
 }

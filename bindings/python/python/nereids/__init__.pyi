@@ -515,10 +515,16 @@ def precompute_cross_sections(
     resolution: TabulatedResolution | None = None,
     delta_e_us: float | None = None,
 ) -> list[NDArray[np.float64]]:
-    """Precompute Doppler- and resolution-broadened total cross-sections.
+    """Precompute Doppler-broadened total cross-sections.
 
-    Returns one broadened total cross-section array per isotope. This is the
-    expensive physics step; caching the result avoids redundant computation.
+    Returns one Doppler-broadened total cross-section array per isotope.
+    This is the expensive physics step; caching the result avoids redundant
+    computation.
+
+    Raises ``ValueError`` if any resolution parameters are passed.
+    Resolution broadening cannot be precomputed as broadened cross-sections
+    because it must be applied after Beer-Lambert on the total transmission,
+    which depends on per-pixel densities.  Use ``forward_model()`` instead.
     """
     ...
 

@@ -273,14 +273,31 @@ fn validate_broadened_cross_sections(
         )
         .unwrap()
     } else {
-        transmission::broadened_cross_sections(
+        // broadened_cross_sections returns Doppler-only σ (issue #442).
+        // For non-transmission observables (total XS, etc.), resolution on σ
+        // IS the correct physics, so apply it explicitly here.
+        let mut xs = transmission::broadened_cross_sections(
             &energies,
             &[resonance_data],
             temperature,
             instrument.as_ref(),
             None,
         )
-        .unwrap()
+        .unwrap();
+        if let Some(ref inst) = instrument {
+            xs = xs
+                .into_iter()
+                .map(|sigma| {
+                    nereids_physics::resolution::apply_resolution(
+                        &energies,
+                        &sigma,
+                        &inst.resolution,
+                    )
+                    .unwrap()
+                })
+                .collect();
+        }
+        xs
     };
 
     let xs_total = &broadened[0]; // Single isotope.
@@ -1017,7 +1034,10 @@ fn validate_cross_sections_multi(
     } else {
         inp.temperature_k
     };
-    let broadened = transmission::broadened_cross_sections(
+    // broadened_cross_sections returns Doppler-only σ (issue #442).
+    // For total cross-section observables, resolution on σ IS correct physics,
+    // so apply it explicitly per-isotope here.
+    let mut broadened = transmission::broadened_cross_sections(
         &energies,
         &resonance_data_vec,
         temperature,
@@ -1025,6 +1045,15 @@ fn validate_cross_sections_multi(
         None,
     )
     .unwrap();
+    if let Some(ref inst) = instrument {
+        broadened = broadened
+            .into_iter()
+            .map(|sigma| {
+                nereids_physics::resolution::apply_resolution(&energies, &sigma, &inst.resolution)
+                    .unwrap()
+            })
+            .collect();
+    }
 
     // Abundance-weighted sum: σ_total[j] = Σ_i abundance_i · σ_i[j].
     let n_points = energies.len();
