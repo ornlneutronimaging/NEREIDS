@@ -94,11 +94,11 @@ impl FitModel for PrecomputedTransmissionModel {
     ///   ∂T/∂nᵢ = -σᵢ(E) · T(E)
     ///
     /// With resolution (R is a linear operator):
-    ///   T_obs(E) = R[T](E) = R[exp(-Σᵢ nᵢ · σᵢ)](E)
-    ///   ∂T_obs/∂nᵢ = R[-σᵢ(E) · T(E)]
+    ///   T_obs(E) = R\[T\](E) = R\[exp(-Σᵢ nᵢ · σᵢ)\](E)
+    ///   ∂T_obs/∂nᵢ = R\[-σᵢ(E) · T(E)\]
     ///
     /// For grouped isotopes sharing density parameter N_g:
-    ///   ∂T_obs/∂N_g = R[-(Σ_{i∈g} σᵢ(E)) · T(E)]
+    ///   ∂T_obs/∂N_g = R\[-(Σ_{i∈g} σᵢ(E)) · T(E)\]
     fn analytical_jacobian(
         &self,
         params: &[f64],
@@ -444,8 +444,8 @@ impl FitModel for TransmissionFitModel {
     ///   ∂T/∂Temp = -T · Σᵢ nᵢ rᵢ ∂σᵢ/∂T
     ///
     /// With resolution (R is a linear operator):
-    ///   ∂T_obs/∂N_g = R[-(Σ_{i∈g} rᵢ σᵢ) · T]
-    ///   ∂T_obs/∂Temp = R[-T · Σᵢ nᵢ rᵢ ∂σᵢ/∂T]
+    ///   ∂T_obs/∂N_g = R\[-(Σ_{i∈g} rᵢ σᵢ) · T\]
+    ///   ∂T_obs/∂Temp = R\[-T · Σᵢ nᵢ rᵢ ∂σᵢ/∂T\]
     ///
     /// Returns `None` only when `base_xs` is not available (full forward
     /// model path falls back to FD) or when the temperature cache is stale.
