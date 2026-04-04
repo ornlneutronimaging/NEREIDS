@@ -89,38 +89,32 @@ impl FitModel for PrecomputedTransmissionModel {
 
     /// Analytical Jacobian for the Beer-Lambert transmission model.
     ///
-    /// T(E) = exp(-Σᵢ nᵢ · σᵢ(E))
-    /// ∂T/∂nᵢ = -σᵢ(E) · T(E)
+    /// Without resolution:
+    ///   T(E) = exp(-Σᵢ nᵢ · σᵢ(E))
+    ///   ∂T/∂nᵢ = -σᵢ(E) · T(E)
     ///
-    /// When resolution is enabled, the correct derivative is
-    /// ∂[R⊗T]/∂nᵢ = R⊗[-σᵢ·T] (resolution is a linear operator).
-    /// This is not yet implemented (issue #442 Step 4); returns `None`
-    /// to fall back to finite-difference Jacobians.
+    /// With resolution (R is a linear operator):
+    ///   T_obs(E) = R\[T\](E) = R\[exp(-Σᵢ nᵢ · σᵢ)\](E)
+    ///   ∂T_obs/∂nᵢ = R\[-σᵢ(E) · T(E)\]
     ///
-    /// Costs O(N_energy × N_isotopes) with zero extra evaluate() calls,
-    /// because T(E) is already in `y_current` from the LM loop.
-    /// This eliminates N_free extra evaluate() calls per LM iteration
-    /// compared to finite-difference Jacobians.
+    /// For grouped isotopes sharing density parameter N_g:
+    ///   ∂T_obs/∂N_g = R\[-(Σ_{i∈g} σᵢ(E)) · T(E)\]
     fn analytical_jacobian(
         &self,
-        _params: &[f64],
+        params: &[f64],
         free_param_indices: &[usize],
         y_current: &[f64],
     ) -> Option<FlatMatrix> {
-        // Issue #442: fall back to FD when resolution is enabled.
-        // The analytical form ∂[R⊗T]/∂nᵢ is deferred to Step 4.
-        if self.instrument.is_some() {
+        let n_e = if self.cross_sections.is_empty() {
             return None;
-        }
-
-        let n_e = y_current.len();
+        } else {
+            self.cross_sections[0].len()
+        };
         let n_free = free_param_indices.len();
 
         // For each free parameter, sum the cross-sections of every isotope
-        // tied to that parameter index.  The Beer-Lambert derivative is:
-        //   ∂T/∂n_fp = -T(E) · Σ_{iso: density_indices[iso]==fp_idx} σ_iso(E)
-        // Using only the first match (via .position) would give the wrong
-        // gradient whenever multiple isotopes share one density parameter.
+        // tied to that parameter index.
+        //   ∂T/∂N_g = -(Σ_{iso∈g} σ_iso(E)) · T(E)
         let fp_xs_sums: Vec<Vec<f64>> = free_param_indices
             .iter()
             .map(|&fp_idx| {
@@ -136,16 +130,43 @@ impl FitModel for PrecomputedTransmissionModel {
             })
             .collect();
 
-        // jacobian.get(i, j) = ∂T(E_i)/∂params[free_param_indices[j]]
-        //                    = -(Σ σ_iso(E_i)) · T(E_i)   (Beer-Lambert derivative)
-        let mut jacobian = FlatMatrix::zeros(n_e, n_free);
-        for i in 0..n_e {
-            for (j, xs_sum) in fp_xs_sums.iter().enumerate() {
-                *jacobian.get_mut(i, j) = -xs_sum[i] * y_current[i];
+        // When resolution is enabled, we need the UNRESOLVED T(E) = exp(-Σnσ)
+        // to form the inner derivative -σ·T, then apply resolution.
+        // y_current is T_obs = R[T], which is NOT the same as T.
+        if let (Some(inst), Some(energies)) = (&self.instrument, &self.energies) {
+            // Recompute unresolved T from cross-sections and current params.
+            let mut neg_opt = vec![0.0f64; n_e];
+            for (i, xs) in self.cross_sections.iter().enumerate() {
+                let density = params[self.density_indices[i]];
+                for (j, &sigma) in xs.iter().enumerate() {
+                    neg_opt[j] -= density * sigma;
+                }
             }
-        }
+            let t_unresolved: Vec<f64> = neg_opt.iter().map(|&d| d.exp()).collect();
 
-        Some(jacobian)
+            // ∂T_obs/∂N_g = R[-σ_sum(E) · T_unresolved(E)]
+            let mut jacobian = FlatMatrix::zeros(n_e, n_free);
+            for (col, xs_sum) in fp_xs_sums.iter().enumerate() {
+                let inner_deriv: Vec<f64> =
+                    (0..n_e).map(|i| -xs_sum[i] * t_unresolved[i]).collect();
+                let resolved_deriv =
+                    resolution::apply_resolution(energies, &inner_deriv, &inst.resolution).ok()?;
+                for (i, &val) in resolved_deriv.iter().enumerate() {
+                    *jacobian.get_mut(i, col) = val;
+                }
+            }
+            Some(jacobian)
+        } else {
+            // No resolution: ∂T/∂N_g = -σ_sum(E) · T(E)
+            // y_current IS T(E) directly.
+            let mut jacobian = FlatMatrix::zeros(n_e, n_free);
+            for i in 0..n_e {
+                for (j, xs_sum) in fp_xs_sums.iter().enumerate() {
+                    *jacobian.get_mut(i, j) = -xs_sum[i] * y_current[i];
+                }
+            }
+            Some(jacobian)
+        }
     }
 }
 
@@ -416,21 +437,24 @@ impl FitModel for TransmissionFitModel {
     ///
     /// Returns `None` for the no-base_xs path (full forward model), which
     /// falls back to finite-difference in the LM solver.
+    /// Analytical Jacobian for density and temperature fitting.
+    ///
+    /// Without resolution:
+    ///   ∂T/∂N_g = -(Σ_{i∈g} rᵢ σᵢ) · T
+    ///   ∂T/∂Temp = -T · Σᵢ nᵢ rᵢ ∂σᵢ/∂T
+    ///
+    /// With resolution (R is a linear operator):
+    ///   ∂T_obs/∂N_g = R\[-(Σ_{i∈g} rᵢ σᵢ) · T\]
+    ///   ∂T_obs/∂Temp = R\[-T · Σᵢ nᵢ rᵢ ∂σᵢ/∂T\]
+    ///
+    /// Returns `None` only when `base_xs` is not available (full forward
+    /// model path falls back to FD) or when the temperature cache is stale.
     fn analytical_jacobian(
         &self,
         params: &[f64],
         free_param_indices: &[usize],
         y_current: &[f64],
     ) -> Option<FlatMatrix> {
-        // Issue #442 Step 4: when resolution is enabled, the analytical
-        // Jacobian ∂T/∂nᵢ = -σᵢ·T assumes T = exp(-Σnσ), but the actual
-        // model is T_out = R⊗exp(-Σnσ).  The correct form
-        // ∂[R⊗T]/∂nᵢ = R⊗[-σᵢ·T] is not yet implemented.
-        // Fall back to finite-difference.
-        if self.instrument.is_some() {
-            return None;
-        }
-
         // Only provide analytical Jacobian when base_xs is available
         // (temperature-fitting fast path with cached broadened XS).
         let _base_xs_guard = self.base_xs.as_ref()?;
@@ -438,13 +462,9 @@ impl FitModel for TransmissionFitModel {
         let broadened_xs = cached_xs.as_ref()?;
 
         // Guard: verify the cache matches the current parameter temperature.
-        // After a rejected LM trial step, evaluate() may have updated the cache
-        // to the trial temperature while the solver reverted params to the
-        // accepted point.  Using stale XS would give an incorrect Jacobian.
         if let Some(ti) = self.temperature_index {
             let param_temp = params[ti];
             if (param_temp - self.cached_temperature.get()).abs() > 1e-15 {
-                // Cache is stale — fall back to finite-difference Jacobian.
                 return None;
             }
         }
@@ -453,19 +473,35 @@ impl FitModel for TransmissionFitModel {
         let n_free = free_param_indices.len();
         let mut jacobian = FlatMatrix::zeros(n_e, n_free);
 
-        // Identify which free parameter column is the temperature (if any).
         let temp_col = self
             .temperature_index
             .and_then(|ti| free_param_indices.iter().position(|&fp| fp == ti));
 
-        // ── Density columns: ∂T/∂nᵢ = -σᵢ(E)·T(E) ──
-        // Same formula as PrecomputedTransmissionModel::analytical_jacobian.
+        // When resolution is enabled, we need the UNRESOLVED T to form
+        // inner derivatives, then apply resolution.  y_current is T_obs = R[T].
+        let t_unresolved: Option<Vec<f64>> = if self.instrument.is_some() {
+            let mut neg_opt = vec![0.0f64; n_e];
+            for (iso, xs) in broadened_xs.iter().enumerate() {
+                let density = params[self.density_indices[iso]];
+                let ratio = self.density_ratios[iso];
+                for (j, &sigma) in xs.iter().enumerate() {
+                    neg_opt[j] -= density * ratio * sigma;
+                }
+            }
+            Some(neg_opt.iter().map(|&d| d.exp()).collect())
+        } else {
+            None
+        };
+
+        // Helper: the T(E) to use for inner derivatives.
+        // With resolution: unresolved T.  Without: y_current IS T.
+        let t_for_deriv: &[f64] = t_unresolved.as_deref().unwrap_or(y_current);
+
+        // ── Density columns: ∂T/∂N_g or ∂T_obs/∂N_g ──
         for (col, &fp_idx) in free_param_indices.iter().enumerate() {
             if temp_col == Some(col) {
-                continue; // temperature column handled below
+                continue;
             }
-            // Sum ratio-weighted cross-sections of all isotopes tied to this free parameter.
-            // ∂T/∂N_g = -T(E) · Σ_{i∈g} rᵢ · σᵢ(E)
             let mut sigma_sum = vec![0.0f64; n_e];
             for (iso, &di) in self.density_indices.iter().enumerate() {
                 if di == fp_idx {
@@ -475,22 +511,26 @@ impl FitModel for TransmissionFitModel {
                     }
                 }
             }
-            for i in 0..n_e {
-                *jacobian.get_mut(i, col) = -sigma_sum[i] * y_current[i];
+            // Inner derivative: -σ_sum · T_unresolved
+            let inner: Vec<f64> = (0..n_e).map(|i| -sigma_sum[i] * t_for_deriv[i]).collect();
+
+            if let Some(ref inst) = self.instrument {
+                // ∂T_obs/∂N_g = R[inner]
+                let resolved =
+                    resolution::apply_resolution(&self.energies, &inner, &inst.resolution).ok()?;
+                for (i, &val) in resolved.iter().enumerate() {
+                    *jacobian.get_mut(i, col) = val;
+                }
+            } else {
+                for (i, &val) in inner.iter().enumerate() {
+                    *jacobian.get_mut(i, col) = val;
+                }
             }
         }
 
-        // ── Temperature column: analytical ∂T/∂T_temp ──
-        //
-        // Chain rule: ∂T(E)/∂T_temp = -T(E) · Σᵢ nᵢ · rᵢ · ∂σᵢ(E)/∂T
-        //
-        // Computed on-demand here (not in evaluate()) because evaluate()
-        // is called many times during line search trials where the
-        // derivative is not needed. Computing it here costs one extra
-        // broadening call per Jacobian, same as the old FD approach but
-        // with exact (not approximate) derivatives.
+        // ── Temperature column: ∂T/∂Temp or ∂T_obs/∂Temp ──
         if let Some(col) = temp_col {
-            // Compute ∂σ/∂T on-demand if not cached at current temperature.
+            // Compute ∂σ/∂T on-demand if not cached.
             {
                 let needs_compute = self.cached_dxs_dt.borrow().as_ref().is_none();
                 if needs_compute {
@@ -510,14 +550,30 @@ impl FitModel for TransmissionFitModel {
             }
             let cached_dxs = self.cached_dxs_dt.borrow();
             let dxs_dt = cached_dxs.as_ref()?;
-            for i in 0..n_e {
-                let mut sum_n_dsigma = 0.0f64;
-                for (iso, dxs) in dxs_dt.iter().enumerate() {
-                    let density = params[self.density_indices[iso]];
-                    let ratio = self.density_ratios[iso];
-                    sum_n_dsigma += density * ratio * dxs[i];
+
+            // Inner derivative: -T · Σᵢ nᵢ rᵢ ∂σᵢ/∂T
+            let inner: Vec<f64> = (0..n_e)
+                .map(|i| {
+                    let mut sum_n_dsigma = 0.0f64;
+                    for (iso, dxs) in dxs_dt.iter().enumerate() {
+                        let density = params[self.density_indices[iso]];
+                        let ratio = self.density_ratios[iso];
+                        sum_n_dsigma += density * ratio * dxs[i];
+                    }
+                    -t_for_deriv[i] * sum_n_dsigma
+                })
+                .collect();
+
+            if let Some(ref inst) = self.instrument {
+                let resolved =
+                    resolution::apply_resolution(&self.energies, &inner, &inst.resolution).ok()?;
+                for (i, &val) in resolved.iter().enumerate() {
+                    *jacobian.get_mut(i, col) = val;
                 }
-                *jacobian.get_mut(i, col) = -y_current[i] * sum_n_dsigma;
+            } else {
+                for (i, &val) in inner.iter().enumerate() {
+                    *jacobian.get_mut(i, col) = val;
+                }
             }
         }
 
@@ -1721,10 +1777,67 @@ mod tests {
         );
     }
 
-    /// Issue #442: PrecomputedTransmissionModel analytical Jacobian must
-    /// fall back to None when resolution is enabled.
+    /// PrecomputedTransmissionModel with resolution: analytical Jacobian
+    /// exists and density derivative matches finite difference.
     #[test]
-    fn precomputed_jacobian_disabled_with_resolution() {
+    fn precomputed_jacobian_with_resolution_matches_fd() {
+        use nereids_physics::resolution::ResolutionFunction;
+
+        let data = u238_single_resonance();
+        let temperature = 300.0;
+        let energies: Vec<f64> = (0..201).map(|i| 4.0 + (i as f64) * 0.025).collect();
+        let inst = Arc::new(InstrumentParams {
+            resolution: ResolutionFunction::Gaussian(
+                nereids_physics::resolution::ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
+            ),
+        });
+
+        let xs = transmission::broadened_cross_sections(
+            &energies,
+            std::slice::from_ref(&data),
+            temperature,
+            Some(&inst),
+            None,
+        )
+        .unwrap();
+        let model = PrecomputedTransmissionModel {
+            cross_sections: Arc::new(xs),
+            density_indices: Arc::new(vec![0]),
+            energies: Some(Arc::new(energies.clone())),
+            instrument: Some(Arc::clone(&inst)),
+        };
+
+        let params = [0.0005f64];
+        let y = model.evaluate(&params).unwrap();
+
+        let jac = model
+            .analytical_jacobian(&params, &[0], &y)
+            .expect("analytical Jacobian must be available with resolution");
+
+        // Finite-difference reference.
+        let h = 1e-7;
+        let y_plus = model.evaluate(&[params[0] + h]).unwrap();
+        let y_minus = model.evaluate(&[params[0] - h]).unwrap();
+
+        let interior = 20..energies.len() - 20;
+        let mut max_rel_err = 0.0f64;
+        for i in interior {
+            let fd = (y_plus[i] - y_minus[i]) / (2.0 * h);
+            let ana = jac.get(i, 0);
+            let denom = fd.abs().max(ana.abs()).max(1e-30);
+            max_rel_err = max_rel_err.max((ana - fd).abs() / denom);
+        }
+        assert!(
+            max_rel_err < 0.01,
+            "PrecomputedTM analytical Jacobian with resolution vs FD: \
+             max relative error = {max_rel_err}"
+        );
+    }
+
+    /// PrecomputedTransmissionModel with resolution + shared density param:
+    /// grouped isotope Jacobian matches FD.
+    #[test]
+    fn precomputed_jacobian_grouped_with_resolution_matches_fd() {
         use nereids_physics::resolution::ResolutionFunction;
 
         let energies: Vec<f64> = (0..100).map(|i| 1.0 + i as f64 * 0.1).collect();
@@ -1733,73 +1846,115 @@ mod tests {
                 nereids_physics::resolution::ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
             ),
         });
+        // Two isotopes sharing one density parameter.
+        let xs = vec![vec![10.0; 100], vec![5.0; 100]];
         let model = PrecomputedTransmissionModel {
-            cross_sections: Arc::new(vec![vec![10.0; 100]]),
-            density_indices: Arc::new(vec![0]),
-            energies: Some(Arc::new(energies)),
-            instrument: Some(inst),
+            cross_sections: Arc::new(xs),
+            density_indices: Arc::new(vec![0, 0]), // both share param[0]
+            energies: Some(Arc::new(energies.clone())),
+            instrument: Some(Arc::clone(&inst)),
         };
+
         let params = [0.001f64];
         let y = model.evaluate(&params).unwrap();
+        let jac = model
+            .analytical_jacobian(&params, &[0], &y)
+            .expect("analytical Jacobian must be available");
+
+        let h = 1e-7;
+        let y_plus = model.evaluate(&[params[0] + h]).unwrap();
+        let y_minus = model.evaluate(&[params[0] - h]).unwrap();
+
+        let mut max_rel_err = 0.0f64;
+        for i in 10..energies.len() - 10 {
+            let fd = (y_plus[i] - y_minus[i]) / (2.0 * h);
+            let ana = jac.get(i, 0);
+            let denom = fd.abs().max(ana.abs()).max(1e-30);
+            max_rel_err = max_rel_err.max((ana - fd).abs() / denom);
+        }
         assert!(
-            model.analytical_jacobian(&params, &[0], &y).is_none(),
-            "Analytical Jacobian must return None when resolution is enabled \
-             (issue #442 Step 4 not yet implemented)"
+            max_rel_err < 0.01,
+            "Grouped PrecomputedTM analytical Jacobian with resolution vs FD: \
+             max relative error = {max_rel_err}"
         );
     }
 
-    // ── Issue #442 Step 4: TransmissionFitModel Jacobian containment ───────
+    // ── TransmissionFitModel Jacobian with resolution ──────────────────────
 
-    /// Issue #442 Step 4: TransmissionFitModel analytical Jacobian must
-    /// return None when resolution is enabled (density + temperature paths).
+    /// TransmissionFitModel with resolution: analytical Jacobian exists and
+    /// density + temperature columns match finite difference.
     #[test]
-    fn transmission_fit_model_jacobian_disabled_with_resolution() {
+    fn transmission_fit_model_jacobian_with_resolution_matches_fd() {
         use nereids_physics::resolution::ResolutionFunction;
 
         let data = u238_single_resonance();
-        let energies: Vec<f64> = (0..101).map(|i| 4.0 + (i as f64) * 0.05).collect();
+        let energies: Vec<f64> = (0..201).map(|i| 4.0 + (i as f64) * 0.025).collect();
         let inst = Arc::new(InstrumentParams {
             resolution: ResolutionFunction::Gaussian(
                 nereids_physics::resolution::ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
             ),
         });
 
-        // Temperature-fitting path (base_xs present).
         let model = TransmissionFitModel::new(
             energies.clone(),
-            vec![data.clone()],
+            vec![data],
             300.0,
             Some(inst),
             (vec![0], vec![1.0]),
-            Some(1), // temperature_index
-            None,    // external_base_xs — will be computed internally
+            Some(1), // temperature_index = 1
+            None,
         )
         .unwrap();
 
-        // params = [density, temperature]
-        let params = [0.0005, 300.0];
+        let params = [0.0005f64, 300.0];
         let y = model.evaluate(&params).unwrap();
+        let free = vec![0usize, 1usize];
 
-        assert!(
-            model.analytical_jacobian(&params, &[0, 1], &y).is_none(),
-            "TransmissionFitModel analytical Jacobian must return None \
-             when resolution is enabled"
-        );
+        let jac = model
+            .analytical_jacobian(&params, &free, &y)
+            .expect("analytical Jacobian must be available with resolution");
+
+        // FD for each free param.
+        let h_density = 1e-7;
+        let h_temp = 0.01; // temperature needs larger step
+
+        for (col, (&fp_idx, &h)) in free.iter().zip([h_density, h_temp].iter()).enumerate() {
+            let mut p_plus = params;
+            let mut p_minus = params;
+            p_plus[fp_idx] += h;
+            p_minus[fp_idx] -= h;
+            let y_plus = model.evaluate(&p_plus).unwrap();
+            let y_minus = model.evaluate(&p_minus).unwrap();
+
+            let interior = 20..energies.len() - 20;
+            let mut max_rel_err = 0.0f64;
+            for i in interior {
+                let fd = (y_plus[i] - y_minus[i]) / (2.0 * h);
+                let ana = jac.get(i, col);
+                let denom = fd.abs().max(ana.abs()).max(1e-30);
+                max_rel_err = max_rel_err.max((ana - fd).abs() / denom);
+            }
+            let label = if col == 0 { "density" } else { "temperature" };
+            assert!(
+                max_rel_err < 0.05,
+                "TransmissionFitModel {label} column with resolution vs FD: \
+                 max relative error = {max_rel_err}"
+            );
+        }
     }
 
-    /// Issue #442 Step 4: TransmissionFitModel analytical Jacobian must
-    /// remain available when resolution is NOT enabled.
+    /// TransmissionFitModel without resolution: analytical Jacobian still
+    /// available and unchanged.
     #[test]
     fn transmission_fit_model_jacobian_available_without_resolution() {
         let data = u238_single_resonance();
         let energies: Vec<f64> = (0..101).map(|i| 4.0 + (i as f64) * 0.05).collect();
 
-        // Temperature-fitting path, no resolution.
         let model = TransmissionFitModel::new(
             energies,
             vec![data],
             300.0,
-            None, // no instrument
+            None,
             (vec![0], vec![1.0]),
             Some(1),
             None,
