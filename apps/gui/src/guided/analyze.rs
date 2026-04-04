@@ -656,6 +656,14 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
         let energies = state.energies.as_ref()?;
         let (all_rd, density_indices, density_ratios) =
             design::collect_all_resonance_data_with_mapping(state);
+        let instrument = design::build_resolution_function(
+            state.resolution_enabled,
+            &state.resolution_mode,
+            state.beamline.flight_path_m,
+        )
+        .ok()
+        .flatten()
+        .map(|r| Arc::new(nereids_physics::transmission::InstrumentParams { resolution: r }));
         design::build_fit_line(&design::FitLineParams {
             result,
             resonance_data: &all_rd,
@@ -665,6 +673,7 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
             temperature_k: state.temperature_k,
             x_values: &x_values,
             n_plot,
+            instrument,
         })
     });
 

@@ -366,7 +366,18 @@ impl FitModel for TransmissionFitModel {
                     neg_opt[j] -= density * ratio * sigma;
                 }
             }
-            Ok(neg_opt.iter().map(|&d| d.exp()).collect())
+            let transmission: Vec<f64> = neg_opt.iter().map(|&d| d.exp()).collect();
+
+            // Issue #442: apply resolution broadening to total transmission
+            // AFTER Beer-Lambert.
+            if let Some(ref inst) = self.instrument {
+                resolution::apply_resolution(&self.energies, &transmission, &inst.resolution)
+                    .map_err(|e| {
+                        FittingError::EvaluationFailed(format!("resolution broadening: {e}"))
+                    })
+            } else {
+                Ok(transmission)
+            }
         } else {
             // Original path: full forward model (no temperature fitting).
             // Apply ratio weights: effective density = params[idx] * ratio.
@@ -1802,6 +1813,148 @@ mod tests {
             model.analytical_jacobian(&params, &[0, 1], &y).is_some(),
             "TransmissionFitModel analytical Jacobian must be available \
              when resolution is disabled"
+        );
+    }
+
+    // ── Issue #442: TransmissionFitModel temperature-path resolution fix ───
+
+    /// TransmissionFitModel::evaluate() with fit_temperature=true and
+    /// resolution enabled must match forward_model() for the same sample.
+    #[test]
+    fn transmission_fit_model_temp_path_with_resolution_matches_forward_model() {
+        use nereids_physics::resolution::ResolutionFunction;
+
+        let data = u238_single_resonance();
+        let thickness = 0.0005;
+        let temperature = 300.0;
+        let energies: Vec<f64> = (0..401).map(|i| 4.0 + (i as f64) * 0.015).collect();
+
+        let inst = Arc::new(InstrumentParams {
+            resolution: ResolutionFunction::Gaussian(
+                nereids_physics::resolution::ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
+            ),
+        });
+
+        // Reference: forward_model() (corrected in Step 1).
+        let sample = SampleParams::new(temperature, vec![(data.clone(), thickness)]).unwrap();
+        let t_ref = transmission::forward_model(&energies, &sample, Some(&inst)).unwrap();
+
+        // Temperature-fitting path through TransmissionFitModel.
+        let model = TransmissionFitModel::new(
+            energies.clone(),
+            vec![data],
+            temperature,
+            Some(Arc::clone(&inst)),
+            (vec![0], vec![1.0]),
+            Some(1), // temperature_index
+            None,
+        )
+        .unwrap();
+
+        // params = [density, temperature]
+        let t_model = model.evaluate(&[thickness, temperature]).unwrap();
+
+        // Compare on interior (skip boundary effects from extended grid
+        // differences between forward_model and broadened_cross_sections_from_base).
+        let interior = 20..energies.len() - 20;
+        let mut max_err = 0.0f64;
+        for i in interior {
+            max_err = max_err.max((t_ref[i] - t_model[i]).abs());
+        }
+        assert!(
+            max_err < 0.02,
+            "TransmissionFitModel temperature path with resolution should match \
+             forward_model.  Max error = {max_err}"
+        );
+    }
+
+    /// TransmissionFitModel temperature path without resolution must be
+    /// unchanged (pure Doppler + Beer-Lambert).
+    #[test]
+    fn transmission_fit_model_temp_path_no_resolution_unchanged() {
+        let data = u238_single_resonance();
+        let thickness = 0.0005;
+        let temperature = 300.0;
+        let energies: Vec<f64> = (0..201).map(|i| 4.0 + (i as f64) * 0.025).collect();
+
+        // Reference: forward_model without resolution.
+        let sample = SampleParams::new(temperature, vec![(data.clone(), thickness)]).unwrap();
+        let t_ref = transmission::forward_model(&energies, &sample, None).unwrap();
+
+        // TransmissionFitModel, no resolution.
+        let model = TransmissionFitModel::new(
+            energies.clone(),
+            vec![data],
+            temperature,
+            None,
+            (vec![0], vec![1.0]),
+            Some(1),
+            None,
+        )
+        .unwrap();
+
+        let t_model = model.evaluate(&[thickness, temperature]).unwrap();
+
+        for (i, (&r, &m)) in t_ref.iter().zip(t_model.iter()).enumerate() {
+            assert!(
+                (r - m).abs() < 1e-12,
+                "No-resolution mismatch at E[{i}]={}: ref={r}, model={m}",
+                energies[i]
+            );
+        }
+    }
+
+    /// Resolution-enabled temperature path must produce measurably different
+    /// results from the unresolved path (verifies resolution is being applied).
+    #[test]
+    fn transmission_fit_model_temp_path_resolution_makes_difference() {
+        use nereids_physics::resolution::ResolutionFunction;
+
+        let data = u238_single_resonance();
+        let thickness = 0.0005;
+        let temperature = 300.0;
+        let energies: Vec<f64> = (0..401).map(|i| 4.0 + (i as f64) * 0.015).collect();
+
+        let inst = Arc::new(InstrumentParams {
+            resolution: ResolutionFunction::Gaussian(
+                nereids_physics::resolution::ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
+            ),
+        });
+
+        // With resolution.
+        let model_res = TransmissionFitModel::new(
+            energies.clone(),
+            vec![data.clone()],
+            temperature,
+            Some(inst),
+            (vec![0], vec![1.0]),
+            Some(1),
+            None,
+        )
+        .unwrap();
+        let t_res = model_res.evaluate(&[thickness, temperature]).unwrap();
+
+        // Without resolution.
+        let model_no = TransmissionFitModel::new(
+            energies.clone(),
+            vec![data],
+            temperature,
+            None,
+            (vec![0], vec![1.0]),
+            Some(1),
+            None,
+        )
+        .unwrap();
+        let t_no = model_no.evaluate(&[thickness, temperature]).unwrap();
+
+        let interior = 20..energies.len() - 20;
+        let max_diff: f64 = interior
+            .map(|i| (t_res[i] - t_no[i]).abs())
+            .fold(0.0f64, f64::max);
+        assert!(
+            max_diff > 1e-4,
+            "Resolution should make a measurable difference in the temperature \
+             path, but max diff = {max_diff}"
         );
     }
 }
