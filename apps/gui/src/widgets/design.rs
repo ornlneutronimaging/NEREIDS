@@ -967,6 +967,9 @@ pub(crate) struct FitLineParams<'a> {
     pub temperature_k: f64,
     pub x_values: &'a [f64],
     pub n_plot: usize,
+    /// Instrument resolution for the fit overlay.
+    /// When `Some`, the overlay applies resolution after Beer-Lambert.
+    pub instrument: Option<std::sync::Arc<nereids_physics::transmission::InstrumentParams>>,
 }
 
 /// Build a fit overlay line from a `SpectrumFitResult`.
@@ -990,7 +993,7 @@ pub(crate) fn build_fit_line(p: &FitLineParams<'_>) -> Option<Line<'static>> {
         p.energies.to_vec(),
         resonance_data,
         overlay_temp,
-        None,
+        p.instrument.clone(),
         (p.density_indices.to_vec(), p.density_ratios.to_vec()),
         None,
         None,
