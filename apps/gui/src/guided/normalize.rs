@@ -574,13 +574,19 @@ pub(crate) fn normalize_hdf5_with_ob(state: &mut AppState) {
 
     let n_tof = sample_arc.shape()[0];
 
-    // Normalization: T = sample / max(OB, 1)
-    // Combined Poisson uncertainty on both sample and OB:
-    //   σ_T = T * sqrt(1/max(sample,1) + 1/max(OB,1))
-    // Guard against division by zero with .max(1.0).
+    // Normalization: T = sample / OB
     //
-    // Single-pass Zip: compute transmission and uncertainty together,
-    // avoiding intermediate temporaries (ob_safe, sample_safe, etc.).
+    // Uncertainty uses the same absolute-error formula as the canonical
+    // nereids_io::normalization::normalize():
+    //
+    //   σ_T = (1/c_o) · √(c_s_eff + c_s²/c_o)
+    //
+    // where c_s_eff = max(c_s, 0.5) is a Bayesian floor (Jeffreys prior)
+    // ensuring σ > 0 even when sample counts are zero.  This prevents
+    // infinite LM weights at T=0 bins.  No proton charge correction is
+    // applied (HDF5 path does not carry proton charges; pc_ratio = 1.0).
+    //
+    // When OB ≤ 0: T=0, σ=∞ (invalid bin, effectively masked by solver).
     let mut transmission = Array3::zeros(sample_arc.raw_dim());
     let mut uncertainty = Array3::zeros(sample_arc.raw_dim());
     ndarray::Zip::from(&mut transmission)
@@ -588,10 +594,18 @@ pub(crate) fn normalize_hdf5_with_ob(state: &mut AppState) {
         .and(&*sample_arc)
         .and(&*ob_arc)
         .for_each(|t, u, &s, &ob| {
-            let ob_safe = ob.max(1.0);
-            let s_safe = s.max(1.0);
-            *t = s / ob_safe;
-            *u = *t * (1.0 / s_safe + 1.0 / ob_safe).sqrt();
+            let c_s = s.max(0.0);
+            let c_o = ob.max(0.0);
+            if c_o > 0.0 {
+                *t = c_s / c_o;
+                // Absolute-error form: σ > 0 even at T=0 via Bayesian floor.
+                let c_s_eff = if c_s > 0.0 { c_s } else { 0.5 };
+                let abs_var = (1.0 / c_o).powi(2) * (c_s_eff + c_s * c_s / c_o);
+                *u = abs_var.sqrt();
+            } else {
+                *t = 0.0;
+                *u = f64::INFINITY;
+            }
         });
 
     match compute_energies(state, n_tof) {

@@ -409,6 +409,54 @@ mod tests {
         );
     }
 
+    /// Verify that σ > 0 for zero sample counts ensures finite LM weight.
+    /// This is the Bayesian floor guarantee: weight = 1/σ² must not be ∞.
+    #[test]
+    fn test_normalize_zero_sample_produces_finite_lm_weight() {
+        let sample = Array3::from_elem((5, 1, 1), 0.0);
+        let ob = Array3::from_elem((5, 1, 1), 500.0);
+        let params = NormalizationParams {
+            proton_charge_sample: 1.0,
+            proton_charge_ob: 1.0,
+        };
+
+        let result = normalize(&sample, &ob, &params, None).unwrap();
+        for t in 0..5 {
+            let sigma = result.uncertainty[[t, 0, 0]];
+            assert!(
+                sigma.is_finite() && sigma > 0.0,
+                "σ must be finite and positive at T=0, got {sigma}"
+            );
+            let weight = 1.0 / (sigma * sigma);
+            assert!(
+                weight.is_finite(),
+                "LM weight 1/σ² must be finite at T=0, got {weight}"
+            );
+        }
+    }
+
+    /// Verify uncertainty at low OB counts is finite and well-behaved.
+    #[test]
+    fn test_normalize_low_ob_counts() {
+        // OB = 2 counts: very low but nonzero
+        let sample = Array3::from_elem((1, 1, 1), 1.0);
+        let ob = Array3::from_elem((1, 1, 1), 2.0);
+        let params = NormalizationParams {
+            proton_charge_sample: 1.0,
+            proton_charge_ob: 1.0,
+        };
+
+        let result = normalize(&sample, &ob, &params, None).unwrap();
+        let sigma = result.uncertainty[[0, 0, 0]];
+        assert!(sigma.is_finite() && sigma > 0.0, "σ = {sigma}");
+        // σ should be large relative to T (very noisy at low counts)
+        let t = result.transmission[[0, 0, 0]];
+        assert!(
+            sigma > 0.1 * t,
+            "σ should be a significant fraction of T at low OB counts: σ={sigma}, T={t}"
+        );
+    }
+
     #[test]
     fn test_detect_dead_pixels() {
         let mut data = Array3::<f64>::zeros((3, 2, 2));
