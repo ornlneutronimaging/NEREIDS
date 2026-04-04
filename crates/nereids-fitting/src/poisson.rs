@@ -71,6 +71,17 @@ pub struct PoissonResult {
     pub converged: bool,
     /// Final parameter values (all parameters, including fixed).
     pub params: Vec<f64>,
+    /// Local covariance estimate from the inverse Fisher information matrix
+    /// at the converged parameters: `F⁻¹ = (J^T H J)⁻¹` where
+    /// `H = diag(obs/model²)` is the Poisson Hessian.
+    ///
+    /// This is a local curvature estimate, NOT a Bayesian posterior.
+    /// `None` when the Fisher matrix is singular, the fit did not converge,
+    /// or the analytical Jacobian is not available.
+    pub covariance: Option<FlatMatrix>,
+    /// Standard errors of free parameters: `√diag(F⁻¹)`.
+    /// `None` when covariance is not available.
+    pub uncertainties: Option<Vec<f64>>,
 }
 
 /// Compute Poisson negative log-likelihood.
@@ -698,6 +709,8 @@ fn try_early_return_fixed(
             iterations: 0,
             converged: false,
             params: params.all_values(),
+            covariance: None,
+            uncertainties: None,
         }));
     }
     Ok(Some(PoissonResult {
@@ -705,7 +718,59 @@ fn try_early_return_fixed(
         iterations: 0,
         converged: true,
         params: params.all_values(),
+        covariance: None,
+        uncertainties: None,
     }))
+}
+
+/// Build the Poisson Fisher information matrix via finite-difference Jacobian.
+///
+/// Used as fallback when the model does not provide an analytical Jacobian
+/// (e.g., `TransmissionFitModel` without base_xs).  Returns `None` if any
+/// model evaluation fails during the FD perturbation.
+fn compute_fd_fisher(
+    model: &dyn FitModel,
+    params: &mut ParameterSet,
+    y_obs: &[f64],
+    y_model: &[f64],
+    fd_step: f64,
+    all_vals_buf: &mut Vec<f64>,
+    free_idx_buf: &mut Vec<usize>,
+) -> Option<FlatMatrix> {
+    params.free_indices_into(free_idx_buf);
+    let n_free = free_idx_buf.len();
+    let n_e = y_obs.len();
+
+    let mut jac = FlatMatrix::zeros(n_e, n_free);
+    for (col, &fi) in free_idx_buf.iter().enumerate() {
+        let orig = params.params[fi].value;
+        let h = fd_step * orig.abs().max(fd_step);
+
+        params.params[fi].value = orig + h;
+        params.all_values_into(all_vals_buf);
+        let y_plus = model.evaluate(all_vals_buf).ok()?;
+
+        params.params[fi].value = orig - h;
+        params.all_values_into(all_vals_buf);
+        let y_minus = model.evaluate(all_vals_buf).ok()?;
+
+        params.params[fi].value = orig;
+        for (i, (&yp, &ym)) in y_plus.iter().zip(y_minus.iter()).enumerate() {
+            *jac.get_mut(i, col) = (yp - ym) / (2.0 * h);
+        }
+    }
+
+    let mut fisher = FlatMatrix::zeros(n_free, n_free);
+    for i in 0..n_e {
+        let h_i = poisson_nll_curvature(y_obs[i], y_model[i]);
+        for j in 0..n_free {
+            let jij = jac.get(i, j);
+            for k in 0..n_free {
+                *fisher.get_mut(j, k) += h_i * jij * jac.get(i, k);
+            }
+        }
+    }
+    Some(fisher)
 }
 
 /// Run Poisson-likelihood optimization using a projected KL optimizer.
@@ -759,6 +824,8 @@ pub fn poisson_fit(
             iterations: 0,
             converged: false,
             params: params.all_values(),
+            covariance: None,
+            uncertainties: None,
         });
     }
 
@@ -927,11 +994,70 @@ pub fn poisson_fit(
         }
     }
 
+    // Compute local covariance from the inverse Fisher information matrix
+    // at the converged parameters: cov = (J^T H J)^{-1}.
+    // This is a local curvature estimate, not a Bayesian posterior.
+    let (covariance, uncertainties) = if converged {
+        // Recompute y_model at final params (may have changed during last iteration).
+        params.all_values_into(&mut all_vals_buf);
+        let y_final = model.evaluate(&all_vals_buf)?;
+
+        // Build the Fisher information matrix J^T H J from the Jacobian at
+        // the converged parameters.  Try the analytical Jacobian first; fall
+        // back to finite differences if not available.
+        let fisher_opt = if let Some(step_data) = compute_analytical_step_data(
+            model,
+            params,
+            y_obs,
+            &y_final,
+            &mut all_vals_buf,
+            &mut free_idx_buf,
+        ) {
+            Some(step_data.fisher)
+        } else {
+            // Build Fisher via FD Jacobian.
+            compute_fd_fisher(
+                model,
+                params,
+                y_obs,
+                &y_final,
+                config.fd_step,
+                &mut all_vals_buf,
+                &mut free_idx_buf,
+            )
+        };
+
+        if let Some(fisher) = fisher_opt {
+            if let Some(cov) = crate::lm::invert_matrix(&fisher) {
+                let n_free = cov.nrows;
+                let unc: Vec<f64> = (0..n_free)
+                    .map(|i| {
+                        let d = cov.get(i, i);
+                        if d.is_finite() && d > 0.0 {
+                            d.sqrt()
+                        } else {
+                            f64::NAN
+                        }
+                    })
+                    .collect();
+                (Some(cov), Some(unc))
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
+
     Ok(PoissonResult {
         nll,
         iterations: iter,
         converged,
         params: params.all_values(),
+        covariance,
+        uncertainties,
     })
 }
 

@@ -810,6 +810,12 @@ fn fit_transmission_poisson(
 
     // Extract temperature from result if fitted.
     let fitted_temp = temperature_index.map(|idx| result.params[idx]);
+    let fitted_temp_unc = temperature_index.and_then(|idx| {
+        result
+            .uncertainties
+            .as_ref()
+            .and_then(|u| u.get(idx).copied())
+    });
 
     if let Some((b0_idx, b1_idx)) = kl_bg {
         let b0 = result.params[b0_idx];
@@ -821,7 +827,7 @@ fn fit_transmission_poisson(
             converged: result.converged,
             iterations: result.iterations,
             temperature_k: fitted_temp,
-            temperature_k_unc: None,
+            temperature_k_unc: fitted_temp_unc,
             anorm: 1.0,
             background: [b0, b1, 0.0],
         })
@@ -1025,14 +1031,35 @@ fn fit_counts_poisson(
         [0.0, 0.0, fitted_alpha2]
     };
 
+    // Extract per-parameter uncertainties from the Poisson Fisher covariance.
+    // The uncertainty vector from PoissonResult is indexed by free-parameter
+    // position.  Map to density and temperature slots.
+    let (uncertainties, temperature_k_unc) = if let Some(ref unc_all) = pr.uncertainties {
+        let dens_unc: Vec<f64> = (0..n_density_params)
+            .map(|i| *unc_all.get(i).unwrap_or(&f64::NAN))
+            .collect();
+        let t_unc = temperature_index.and_then(|idx| {
+            // Temperature is at free-param position = idx within the param vector.
+            // Find its position in the free-parameter list.
+            params
+                .free_indices()
+                .iter()
+                .position(|&fi| fi == idx)
+                .and_then(|pos| unc_all.get(pos).copied())
+        });
+        (Some(dens_unc), t_unc)
+    } else {
+        (None, None)
+    };
+
     Ok(SpectrumFitResult {
         densities,
-        uncertainties: None,
+        uncertainties,
         reduced_chi_squared: chi_sq / dof as f64,
         converged: pr.converged,
         iterations: pr.iterations,
         temperature_k: fitted_temp,
-        temperature_k_unc: None,
+        temperature_k_unc,
         anorm: fitted_alpha1,
         background: fitted_background,
     })
@@ -1212,8 +1239,8 @@ fn poisson_to_lm_result(
         iterations: pr.iterations,
         converged: pr.converged,
         params: pr.params.clone(),
-        covariance: None,
-        uncertainties: None,
+        covariance: pr.covariance.clone(),
+        uncertainties: pr.uncertainties.clone(),
     })
 }
 
@@ -2303,5 +2330,157 @@ mod tests {
             "background b1: fitted={}, true={true_b1}",
             result.background[1]
         );
+    }
+
+    // ── Phase 2: KL fitting uncertainty tests ──────────────────────────────
+
+    #[test]
+    fn test_kl_counts_returns_density_uncertainty() {
+        let data = u238_single_resonance();
+        let true_density = 0.002;
+        let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
+        let (sample, open_beam) = synthetic_counts(&data, true_density, &energies, 1000.0);
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()));
+
+        let input = InputData::Counts {
+            sample_counts: sample,
+            open_beam_counts: open_beam,
+        };
+        let result = fit_spectrum_typed(&input, &config).unwrap();
+        assert!(result.converged);
+        let unc = result
+            .uncertainties
+            .as_ref()
+            .expect("KL 1D fit should return density uncertainties");
+        assert_eq!(unc.len(), 1);
+        assert!(
+            unc[0].is_finite() && unc[0] > 0.0,
+            "density unc = {}",
+            unc[0]
+        );
+        assert!(
+            unc[0] < result.densities[0],
+            "unc ({}) should be < density ({}) for high-count data",
+            unc[0],
+            result.densities[0]
+        );
+    }
+
+    #[test]
+    fn test_kl_counts_returns_temperature_uncertainty() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..201).map(|i| 4.0 + (i as f64) * 0.05).collect();
+        let (sample, open_beam) = synthetic_counts(&data, 0.001, &energies, 1000.0);
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            350.0,
+            None,
+            vec![0.0005],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
+        .with_fit_temperature(true);
+
+        let input = InputData::Counts {
+            sample_counts: sample,
+            open_beam_counts: open_beam,
+        };
+        let result = fit_spectrum_typed(&input, &config).unwrap();
+        assert!(result.converged);
+        let unc = result
+            .uncertainties
+            .as_ref()
+            .expect("KL+temp fit should return density uncertainties");
+        assert!(
+            unc[0].is_finite() && unc[0] > 0.0,
+            "density unc = {}",
+            unc[0]
+        );
+        let t_unc = result
+            .temperature_k_unc
+            .expect("KL+temp fit should return temperature uncertainty");
+        assert!(
+            t_unc.is_finite() && t_unc > 0.0,
+            "temperature unc = {t_unc}"
+        );
+    }
+
+    #[test]
+    fn test_kl_counts_with_background_returns_uncertainty() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..201).map(|i| 4.0 + (i as f64) * 0.05).collect();
+        let (sample, open_beam) = synthetic_counts(&data, 0.001, &energies, 1000.0);
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            300.0,
+            None,
+            vec![0.0005],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
+        .with_fit_temperature(true)
+        .with_transmission_background(BackgroundConfig::default());
+
+        let input = InputData::Counts {
+            sample_counts: sample,
+            open_beam_counts: open_beam,
+        };
+        let result = fit_spectrum_typed(&input, &config).unwrap();
+        assert!(result.converged);
+        let unc = result
+            .uncertainties
+            .as_ref()
+            .expect("KL+bg fit should return density uncertainties");
+        assert!(
+            unc[0].is_finite() && unc[0] > 0.0,
+            "density unc = {}",
+            unc[0]
+        );
+    }
+
+    #[test]
+    fn test_lm_uncertainty_not_regressed() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
+        let (t, sigma) = synthetic_transmission(&data, 0.001, &energies);
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.0005],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()));
+
+        let input = InputData::Transmission {
+            transmission: t,
+            uncertainty: sigma,
+        };
+        let result = fit_spectrum_typed(&input, &config).unwrap();
+        assert!(result.converged);
+        let unc = result
+            .uncertainties
+            .as_ref()
+            .expect("LM should still return uncertainties");
+        assert!(unc[0].is_finite() && unc[0] > 0.0);
     }
 }

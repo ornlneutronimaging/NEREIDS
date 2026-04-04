@@ -372,7 +372,7 @@ pub(crate) fn solve_damped_system(a: &FlatMatrix, b: &[f64], lambda: f64) -> Opt
 /// Invert a symmetric positive definite matrix (for covariance).
 ///
 /// Input: flat n×n matrix. Output: flat n×n inverse, or None if singular.
-fn invert_matrix(a: &FlatMatrix) -> Option<FlatMatrix> {
+pub(crate) fn invert_matrix(a: &FlatMatrix) -> Option<FlatMatrix> {
     let n = a.nrows;
     if n == 0 {
         return Some(FlatMatrix::zeros(0, 0));
