@@ -195,6 +195,12 @@ class SpatialResult:
         ...
 
     @property
+    def temperature_uncertainty_map(self) -> NDArray[np.float64] | None:
+        """Per-pixel temperature uncertainty map (None when fit_temperature=False).
+        Entries are NaN where uncertainty was unavailable for that pixel."""
+        ...
+
+    @property
     def anorm_map(self) -> NDArray[np.float64] | None:
         """Per-pixel normalization factor Anorm (None when background=False)."""
         ...
