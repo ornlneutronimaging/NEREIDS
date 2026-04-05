@@ -107,6 +107,12 @@ pub fn normalize(
     for t in 0..n_tof {
         for y in 0..height {
             for x in 0..width {
+                // Dark-current subtraction.  The DC noise contribution to
+                // the uncertainty is omitted — Var(DC) is not included in
+                // the error propagation below.  This is acceptable when DC
+                // is small relative to signal counts (typical for VENUS MCP
+                // detectors), but underestimates σ_T for very low-signal bins
+                // where DC is comparable to the sample or OB counts.
                 let dc = dark_current.map_or(0.0, |dc| dc[[y, x]]);
                 let c_s = (sample[[t, y, x]] - dc).max(0.0);
                 let c_o = (open_beam[[t, y, x]] - dc).max(0.0);

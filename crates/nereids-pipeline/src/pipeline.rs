@@ -594,7 +594,13 @@ pub fn fit_spectrum_typed(
             SolverConfig::PoissonKL(poisson_cfg),
         ) => fit_counts_poisson(sample_counts, flux, background, config, poisson_cfg),
 
-        // ── Counts + LM: convert to transmission ──
+        // ── Counts + LM: convert to transmission (approximate path) ──
+        //
+        // This is NOT a native counts-domain LM engine.  Counts are divided
+        // (sample/OB) to produce transmission, with σ ≈ √max(sample,1)/OB
+        // as a simplified Poisson-to-Gaussian conversion.  Poisson structure
+        // is lost.  For statistically correct low-count fitting, use the
+        // Poisson KL solver (`solver="kl"` or `SolverConfig::Auto`).
         (
             InputData::Counts {
                 sample_counts,
@@ -602,7 +608,6 @@ pub fn fit_spectrum_typed(
             },
             SolverConfig::LevenbergMarquardt(lm_cfg),
         ) => {
-            // Convert counts to transmission: T = sample/open_beam
             let (transmission, uncertainty) =
                 counts_to_transmission(sample_counts, open_beam_counts);
             fit_transmission_lm(&transmission, &uncertainty, config, lm_cfg)
@@ -625,6 +630,15 @@ pub fn fit_spectrum_typed(
 ///
 /// Zero-count bins (sample == 0) get σ = 1e10 so the fitter effectively ignores them.
 /// Near-zero open beam bins use a floor of 1e-10 to avoid division by zero.
+/// Convert raw counts to transmission with approximate Poisson uncertainty.
+///
+/// This is a simplified conversion for the Counts+LM fallback path.
+/// The uncertainty σ ≈ √max(sample,1)/OB is a Gaussian approximation of
+/// Poisson statistics, valid when counts are high (≥ ~20).  At low counts,
+/// this overestimates confidence relative to the Poisson KL solver.
+///
+/// Zero-count and zero-OB bins are marked with sentinel uncertainties
+/// (1e10 and 1e30 respectively) so the LM solver effectively ignores them.
 fn counts_to_transmission(sample: &[f64], open_beam: &[f64]) -> (Vec<f64>, Vec<f64>) {
     let transmission: Vec<f64> = sample
         .iter()

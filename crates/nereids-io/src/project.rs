@@ -2052,6 +2052,52 @@ mod tests {
         assert!(results.dataset("temperature").is_err());
     }
 
+    /// Phase 4: temperature_uncertainty_map survives project round-trip.
+    #[test]
+    fn test_roundtrip_temperature_uncertainty_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t_unc.nrd.h5");
+        let mut snap = minimal_snapshot();
+        snap.temperature_map = Some(Array2::from_elem((3, 4), 300.0));
+        snap.temperature_uncertainty_map = Some(Array2::from_elem((3, 4), 5.2));
+        snap.density_maps = Some(vec![Array2::from_elem((3, 4), 0.001)]);
+        snap.converged_map = Some(Array2::from_elem((3, 4), true));
+        snap.n_converged = Some(12);
+        snap.n_total = Some(12);
+        save_project(&path, &snap).unwrap();
+
+        let loaded = load_project(&path).unwrap();
+        let tu = loaded
+            .temperature_uncertainty_map
+            .expect("temperature_uncertainty_map should survive round-trip");
+        assert_eq!(tu.shape(), [3, 4]);
+        assert!((tu[[0, 0]] - 5.2).abs() < 1e-10);
+    }
+
+    /// Phase 4: older project files without temperature_uncertainty load as None.
+    #[test]
+    fn test_load_old_project_without_temperature_uncertainty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.nrd.h5");
+        let mut snap = minimal_snapshot();
+        snap.temperature_map = Some(Array2::from_elem((3, 4), 300.0));
+        // Deliberately do NOT set temperature_uncertainty_map.
+        snap.density_maps = Some(vec![Array2::from_elem((3, 4), 0.001)]);
+        snap.converged_map = Some(Array2::from_elem((3, 4), true));
+        snap.n_converged = Some(12);
+        snap.n_total = Some(12);
+        save_project(&path, &snap).unwrap();
+
+        let loaded = load_project(&path).unwrap();
+        assert!(loaded.temperature_map.is_some());
+        // The field was None when saved, so the HDF5 dataset was not written.
+        // On load, missing dataset → None.  This is backward-compatible.
+        assert!(
+            loaded.temperature_uncertainty_map.is_none(),
+            "old project without temperature_uncertainty should load as None"
+        );
+    }
+
     #[test]
     fn test_save_beamline_config() {
         let dir = tempfile::tempdir().unwrap();
