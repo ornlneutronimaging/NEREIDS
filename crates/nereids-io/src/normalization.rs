@@ -107,6 +107,12 @@ pub fn normalize(
     for t in 0..n_tof {
         for y in 0..height {
             for x in 0..width {
+                // Dark-current subtraction.  The DC noise contribution to
+                // the uncertainty is omitted — Var(DC) is not included in
+                // the error propagation below.  This is acceptable when DC
+                // is small relative to signal counts (typical for VENUS MCP
+                // detectors), but underestimates σ_T for very low-signal bins
+                // where DC is comparable to the sample or OB counts.
                 let dc = dark_current.map_or(0.0, |dc| dc[[y, x]]);
                 let c_s = (sample[[t, y, x]] - dc).max(0.0);
                 let c_o = (open_beam[[t, y, x]] - dc).max(0.0);
@@ -406,6 +412,54 @@ mod tests {
         assert!(
             result.is_err(),
             "should reject mismatched dark_current shape"
+        );
+    }
+
+    /// Verify that σ > 0 for zero sample counts ensures finite LM weight.
+    /// This is the Bayesian floor guarantee: weight = 1/σ² must not be ∞.
+    #[test]
+    fn test_normalize_zero_sample_produces_finite_lm_weight() {
+        let sample = Array3::from_elem((5, 1, 1), 0.0);
+        let ob = Array3::from_elem((5, 1, 1), 500.0);
+        let params = NormalizationParams {
+            proton_charge_sample: 1.0,
+            proton_charge_ob: 1.0,
+        };
+
+        let result = normalize(&sample, &ob, &params, None).unwrap();
+        for t in 0..5 {
+            let sigma = result.uncertainty[[t, 0, 0]];
+            assert!(
+                sigma.is_finite() && sigma > 0.0,
+                "σ must be finite and positive at T=0, got {sigma}"
+            );
+            let weight = 1.0 / (sigma * sigma);
+            assert!(
+                weight.is_finite(),
+                "LM weight 1/σ² must be finite at T=0, got {weight}"
+            );
+        }
+    }
+
+    /// Verify uncertainty at low OB counts is finite and well-behaved.
+    #[test]
+    fn test_normalize_low_ob_counts() {
+        // OB = 2 counts: very low but nonzero
+        let sample = Array3::from_elem((1, 1, 1), 1.0);
+        let ob = Array3::from_elem((1, 1, 1), 2.0);
+        let params = NormalizationParams {
+            proton_charge_sample: 1.0,
+            proton_charge_ob: 1.0,
+        };
+
+        let result = normalize(&sample, &ob, &params, None).unwrap();
+        let sigma = result.uncertainty[[0, 0, 0]];
+        assert!(sigma.is_finite() && sigma > 0.0, "σ = {sigma}");
+        // σ should be large relative to T (very noisy at low counts)
+        let t = result.transmission[[0, 0, 0]];
+        assert!(
+            sigma > 0.1 * t,
+            "σ should be a significant fraction of T at low OB counts: σ={sigma}, T={t}"
         );
     }
 

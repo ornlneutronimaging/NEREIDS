@@ -557,6 +557,8 @@ struct PySpatialResult {
     shape: (usize, usize),
     /// Per-pixel fitted temperature (None when fit_temperature=False).
     temperature_map: Option<Py<PyArray2<f64>>>,
+    /// Per-pixel temperature uncertainty (None when fit_temperature=False).
+    temperature_uncertainty_map: Option<Py<PyArray2<f64>>>,
     /// Per-pixel normalization / signal-scale map (None when background=False).
     anorm_map: Option<Py<PyArray2<f64>>>,
     /// Per-pixel background parameter maps (None when background=False).
@@ -623,6 +625,18 @@ impl PySpatialResult {
     #[getter]
     fn temperature_map<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray2<f64>>> {
         self.temperature_map.as_ref().map(|m| m.bind(py).clone())
+    }
+
+    /// Per-pixel temperature uncertainty map (None when fit_temperature=False).
+    /// Entries are NaN where uncertainty was unavailable for that pixel.
+    #[getter]
+    fn temperature_uncertainty_map<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> Option<Bound<'py, PyArray2<f64>>> {
+        self.temperature_uncertainty_map
+            .as_ref()
+            .map(|m| m.bind(py).clone())
     }
 
     /// Per-pixel normalization factor Anorm (None when background fitting was disabled).
@@ -2408,6 +2422,10 @@ fn spatial_result_to_py(
         .temperature_map
         .as_ref()
         .map(|m| PyArray2::from_array(py, m).into());
+    let temperature_uncertainty_map = result
+        .temperature_uncertainty_map
+        .as_ref()
+        .map(|m| PyArray2::from_array(py, m).into());
 
     PySpatialResult {
         density_maps,
@@ -2420,6 +2438,7 @@ fn spatial_result_to_py(
         isotope_names: result.isotope_labels.clone(),
         shape,
         temperature_map,
+        temperature_uncertainty_map,
         anorm_map,
         background_maps,
     }

@@ -134,6 +134,7 @@ pub struct ProjectSnapshot {
     pub chi_squared_map: Option<Array2<f64>>,
     pub converged_map: Option<Array2<bool>>,
     pub temperature_map: Option<Array2<f64>>,
+    pub temperature_uncertainty_map: Option<Array2<f64>>,
     pub n_converged: Option<usize>,
     pub n_total: Option<usize>,
     pub n_failed: Option<usize>,
@@ -240,6 +241,7 @@ impl Default for ProjectSnapshot {
             chi_squared_map: None,
             converged_map: None,
             temperature_map: None,
+            temperature_uncertainty_map: None,
             n_converged: None,
             n_total: None,
             n_failed: None,
@@ -826,6 +828,19 @@ fn write_results(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoErro
             .create("temperature")
             .and_then(|ds| ds.write_raw(&data))
             .map_err(|e| hdf5_err("/results/temperature", e))?;
+    }
+
+    if let Some(ref tu_map) = snap.temperature_uncertainty_map {
+        let shape = [tu_map.shape()[0], tu_map.shape()[1]];
+        let data: Vec<f64> = tu_map.iter().copied().collect();
+        results
+            .new_dataset::<f64>()
+            .shape(shape)
+            .chunk(shape)
+            .deflate(4)
+            .create("temperature_uncertainty")
+            .and_then(|ds| ds.write_raw(&data))
+            .map_err(|e| hdf5_err("/results/temperature_uncertainty", e))?;
     }
 
     // Save anorm and background maps from spatial fitting.
@@ -1561,6 +1576,20 @@ fn read_results(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoE
         }
     }
 
+    // Temperature uncertainty map (optional — absent in older project files).
+    if let Ok(tu_ds) = results.dataset("temperature_uncertainty") {
+        let shape = tu_ds.shape();
+        if shape.len() == 2 {
+            let data: Vec<f64> = tu_ds
+                .read_raw()
+                .map_err(|e| hdf5_err("/results/temperature_uncertainty", e))?;
+            snap.temperature_uncertainty_map = Some(
+                Array2::from_shape_vec((shape[0], shape[1]), data)
+                    .map_err(|e| hdf5_err("/results/temperature_uncertainty reshape", e))?,
+            );
+        }
+    }
+
     // D-11/D-21: Anorm map
     if let Ok(a_ds) = results.dataset("anorm") {
         let shape = a_ds.shape();
@@ -1786,6 +1815,7 @@ mod tests {
             chi_squared_map: None,
             converged_map: None,
             temperature_map: None,
+            temperature_uncertainty_map: None,
             n_converged: None,
             n_total: None,
             n_failed: None,
@@ -2020,6 +2050,52 @@ mod tests {
         let file = hdf5::File::open(&path).unwrap();
         let results = file.group("results").unwrap();
         assert!(results.dataset("temperature").is_err());
+    }
+
+    /// Phase 4: temperature_uncertainty_map survives project round-trip.
+    #[test]
+    fn test_roundtrip_temperature_uncertainty_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t_unc.nrd.h5");
+        let mut snap = minimal_snapshot();
+        snap.temperature_map = Some(Array2::from_elem((3, 4), 300.0));
+        snap.temperature_uncertainty_map = Some(Array2::from_elem((3, 4), 5.2));
+        snap.density_maps = Some(vec![Array2::from_elem((3, 4), 0.001)]);
+        snap.converged_map = Some(Array2::from_elem((3, 4), true));
+        snap.n_converged = Some(12);
+        snap.n_total = Some(12);
+        save_project(&path, &snap).unwrap();
+
+        let loaded = load_project(&path).unwrap();
+        let tu = loaded
+            .temperature_uncertainty_map
+            .expect("temperature_uncertainty_map should survive round-trip");
+        assert_eq!(tu.shape(), [3, 4]);
+        assert!((tu[[0, 0]] - 5.2).abs() < 1e-10);
+    }
+
+    /// Phase 4: older project files without temperature_uncertainty load as None.
+    #[test]
+    fn test_load_old_project_without_temperature_uncertainty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.nrd.h5");
+        let mut snap = minimal_snapshot();
+        snap.temperature_map = Some(Array2::from_elem((3, 4), 300.0));
+        // Deliberately do NOT set temperature_uncertainty_map.
+        snap.density_maps = Some(vec![Array2::from_elem((3, 4), 0.001)]);
+        snap.converged_map = Some(Array2::from_elem((3, 4), true));
+        snap.n_converged = Some(12);
+        snap.n_total = Some(12);
+        save_project(&path, &snap).unwrap();
+
+        let loaded = load_project(&path).unwrap();
+        assert!(loaded.temperature_map.is_some());
+        // The field was None when saved, so the HDF5 dataset was not written.
+        // On load, missing dataset → None.  This is backward-compatible.
+        assert!(
+            loaded.temperature_uncertainty_map.is_none(),
+            "old project without temperature_uncertainty should load as None"
+        );
     }
 
     #[test]

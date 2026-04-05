@@ -29,6 +29,10 @@ pub struct SpatialResult {
     pub converged_map: Array2<bool>,
     /// Fitted temperature map (K). `Some` when `config.fit_temperature()` is true.
     pub temperature_map: Option<Array2<f64>>,
+    /// Per-pixel temperature uncertainty map (K, 1-sigma).
+    /// `Some` when `config.fit_temperature()` is true.
+    /// Entries are NaN where uncertainty was unavailable for that pixel.
+    pub temperature_uncertainty_map: Option<Array2<f64>>,
     /// Isotope labels captured at compute time, one per density map.
     /// Ensures display labels stay in sync with density data even if the
     /// user modifies the isotope list after fitting.
@@ -202,6 +206,11 @@ pub fn spatial_map_typed(
             } else {
                 None
             },
+            temperature_uncertainty_map: if config.fit_temperature() {
+                Some(Array2::from_elem((height, width), f64::NAN))
+            } else {
+                None
+            },
             isotope_labels,
             anorm_map: if has_background_outputs {
                 Some(Array2::from_elem((height, width), f64::NAN))
@@ -324,7 +333,7 @@ pub fn spatial_map_typed(
             .clone()
             .with_precomputed_cross_sections(xs)
             .with_precomputed_base_xs(Arc::new(base_xs))
-            .with_compute_covariance(false)
+            .with_compute_covariance(true)
     } else {
         // For non-temperature path: xs is already collapsed to σ_eff when
         // groups are active, so clear group mapping to prevent double-collapse
@@ -335,7 +344,7 @@ pub fn spatial_map_typed(
             cfg.density_ratios = None;
         }
         cfg.with_precomputed_cross_sections(xs)
-            .with_compute_covariance(false)
+            .with_compute_covariance(true)
     };
 
     // For counts data: spatially average the open beam to get a stable flux
@@ -475,6 +484,11 @@ pub fn spatial_map_typed(
     } else {
         None
     };
+    let mut temperature_uncertainty_map: Option<Array2<f64>> = if config.fit_temperature() {
+        Some(Array2::from_elem((height, width), f64::NAN))
+    } else {
+        None
+    };
 
     for ((y, x), result) in &results {
         for i in 0..n_maps {
@@ -487,6 +501,11 @@ pub fn spatial_map_typed(
         converged_map[[*y, *x]] = result.converged;
         if let (Some(t_map), Some(t)) = (&mut temperature_map, result.temperature_k) {
             t_map[[*y, *x]] = t;
+        }
+        if let (Some(tu_map), Some(tu)) =
+            (&mut temperature_uncertainty_map, result.temperature_k_unc)
+        {
+            tu_map[[*y, *x]] = tu;
         }
         if let Some(ref mut a_map) = anorm_map {
             a_map[[*y, *x]] = result.anorm;
@@ -507,6 +526,7 @@ pub fn spatial_map_typed(
         chi_squared_map,
         converged_map,
         temperature_map,
+        temperature_uncertainty_map,
         isotope_labels,
         anorm_map,
         background_maps,
@@ -943,6 +963,200 @@ mod tests {
                     "pixel ({y},{x}): fitted={fitted}, true={true_density}, rel_error={rel_error}"
                 );
             }
+        }
+    }
+
+    // ── Phase 3: Spatial uncertainty propagation tests ──────────────────────
+
+    /// Spatial LM transmission fit populates density uncertainty maps.
+    #[test]
+    fn test_spatial_lm_populates_density_uncertainty() {
+        let rd = u238_single_resonance();
+        let energies: Vec<f64> = (0..101).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let (mut t_3d, u_3d) = synthetic_4x4_transmission(&rd, 0.001, &energies);
+        // Add deterministic pseudo-noise so reduced chi-squared > 0
+        // (a perfect fit gives chi2r=0, zeroing covariance).
+        for y in 0..4 {
+            for x in 0..4 {
+                for e in 0..energies.len() {
+                    let noise = 0.002 * ((e * 7 + y * 13 + x * 29) % 17) as f64 / 17.0 - 0.001;
+                    t_3d[[e, y, x]] = (t_3d[[e, y, x]] + noise).max(0.001);
+                }
+            }
+        }
+        let data = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![rd],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.0005],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()));
+
+        let result = spatial_map_typed(&data, &config, None, None, None).unwrap();
+        assert!(result.n_converged > 0, "some pixels should converge");
+        // Uncertainty maps should have finite positive values for converged pixels.
+        let unc_map = &result.uncertainty_maps[0];
+        let conv_map = &result.converged_map;
+        let mut n_finite = 0;
+        for y in 0..4 {
+            for x in 0..4 {
+                if conv_map[[y, x]] {
+                    let u = unc_map[[y, x]];
+                    assert!(
+                        u.is_finite() && u > 0.0,
+                        "LM density unc at ({y},{x}) should be finite+positive, got {u}"
+                    );
+                    n_finite += 1;
+                }
+            }
+        }
+        assert!(
+            n_finite > 0,
+            "at least one converged pixel should have finite unc"
+        );
+    }
+
+    /// Spatial KL counts fit populates density uncertainty maps.
+    #[test]
+    fn test_spatial_kl_populates_density_uncertainty() {
+        let rd = u238_single_resonance();
+        let energies: Vec<f64> = (0..101).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let (t_3d, _) = synthetic_4x4_transmission(&rd, 0.001, &energies);
+        // Convert to counts: OB=1000, sample = OB * T
+        let ob_3d = Array3::from_elem(t_3d.raw_dim(), 1000.0);
+        let sample_3d = &t_3d * &ob_3d;
+        let data = InputData3D::Counts {
+            sample_counts: sample_3d.view(),
+            open_beam_counts: ob_3d.view(),
+        };
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![rd],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.0005],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()));
+
+        let result = spatial_map_typed(&data, &config, None, None, None).unwrap();
+        assert!(result.n_converged > 0);
+        let unc_map = &result.uncertainty_maps[0];
+        let conv_map = &result.converged_map;
+        let mut n_finite = 0;
+        for y in 0..4 {
+            for x in 0..4 {
+                if conv_map[[y, x]] {
+                    let u = unc_map[[y, x]];
+                    assert!(
+                        u.is_finite() && u > 0.0,
+                        "KL density unc at ({y},{x}) should be finite+positive, got {u}"
+                    );
+                    n_finite += 1;
+                }
+            }
+        }
+        assert!(n_finite > 0);
+    }
+
+    /// Spatial temperature-fitting populates temperature_uncertainty_map.
+    #[test]
+    fn test_spatial_temperature_uncertainty_map() {
+        let rd = u238_single_resonance();
+        let energies: Vec<f64> = (0..101).map(|i| 4.0 + (i as f64) * 0.05).collect();
+        let (mut t_3d, u_3d) = synthetic_4x4_transmission(&rd, 0.001, &energies);
+        // Add pseudo-noise for nonzero chi2r.
+        for y in 0..4 {
+            for x in 0..4 {
+                for e in 0..energies.len() {
+                    let noise = 0.002 * ((e * 7 + y * 13 + x * 29) % 17) as f64 / 17.0 - 0.001;
+                    t_3d[[e, y, x]] = (t_3d[[e, y, x]] + noise).max(0.001);
+                }
+            }
+        }
+        let data = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![rd],
+            vec!["U-238".into()],
+            300.0,
+            None,
+            vec![0.0005],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
+        .with_fit_temperature(true);
+
+        let result = spatial_map_typed(&data, &config, None, None, None).unwrap();
+        assert!(result.temperature_map.is_some());
+        let tu_map = result
+            .temperature_uncertainty_map
+            .as_ref()
+            .expect("temperature_uncertainty_map should be Some when fit_temperature=true");
+        assert_eq!(tu_map.shape(), [4, 4]);
+        // At least some converged pixels should have finite temperature uncertainty.
+        let mut n_finite = 0;
+        for y in 0..4 {
+            for x in 0..4 {
+                if result.converged_map[[y, x]] {
+                    let tu = tu_map[[y, x]];
+                    if tu.is_finite() && tu > 0.0 {
+                        n_finite += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            n_finite > 0,
+            "at least one converged pixel should have finite temperature uncertainty"
+        );
+    }
+
+    /// Unconverged pixels remain NaN, not zero-filled.
+    #[test]
+    fn test_spatial_unconverged_pixels_are_nan() {
+        let rd = u238_single_resonance();
+        let energies: Vec<f64> = (0..101).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        // Create data where pixel (0,0) is dead (all zeros)
+        let (mut t_3d, mut u_3d) = synthetic_4x4_transmission(&rd, 0.001, &energies);
+        for e in 0..energies.len() {
+            t_3d[[e, 0, 0]] = 0.0;
+            u_3d[[e, 0, 0]] = f64::INFINITY;
+        }
+        let data = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![rd],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.0005],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()));
+
+        let result = spatial_map_typed(&data, &config, None, None, None).unwrap();
+        // Pixel (0,0) should not converge and uncertainty should remain NaN.
+        if !result.converged_map[[0, 0]] {
+            let u = result.uncertainty_maps[0][[0, 0]];
+            assert!(
+                u.is_nan(),
+                "unconverged pixel uncertainty should be NaN, got {u}"
+            );
         }
     }
 }

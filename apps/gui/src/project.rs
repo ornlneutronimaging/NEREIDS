@@ -152,6 +152,7 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         chi_squared_map,
         converged_map,
         temperature_map,
+        temperature_uncertainty_map,
         n_converged,
         n_total,
         n_failed,
@@ -165,6 +166,7 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
             Some(sr.chi_squared_map.clone()),
             Some(sr.converged_map.clone()),
             sr.temperature_map.clone(),
+            sr.temperature_uncertainty_map.clone(),
             Some(sr.n_converged),
             Some(sr.n_total),
             Some(sr.n_failed),
@@ -174,7 +176,7 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         )
     } else {
         (
-            None, None, None, None, None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None, None, None, None,
         )
     };
 
@@ -343,6 +345,7 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         chi_squared_map,
         converged_map,
         temperature_map,
+        temperature_uncertainty_map,
         n_converged,
         n_total,
         n_failed,
@@ -1027,6 +1030,7 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
             chi_squared_map,
             converged_map,
             temperature_map: snap.temperature_map,
+            temperature_uncertainty_map: snap.temperature_uncertainty_map,
             isotope_labels: snap.result_isotope_labels.unwrap_or_else(|| {
                 // Fallback for project files created before labels were stored
                 // in SpatialResult — derive from the restored isotope entries.

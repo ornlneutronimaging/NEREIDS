@@ -195,6 +195,9 @@ pub(crate) fn apply_rebin(state: &mut AppState, is_transmission: bool) {
 
     state.rebin_applied = true;
     state.energies = None;
+    // Rebinning invalidates the normalized data, forcing re-normalization
+    // from the rebinned counts.  This ensures uncertainty is recomputed
+    // from the rebinned counts rather than becoming stale.
     state.normalized = None;
     state.spatial_result = None;
     state.pixel_fit_result = None;
