@@ -821,8 +821,8 @@ def _create_synthetic_nexus_histogram(path, n_tof=10, height=4, width=4):
         # TOF edges in nanoseconds (n_tof + 1) — dataset name matches VENUS schema
         tof_ns = np.linspace(1e4, 5e4, n_tof + 1)
         hist.create_dataset("time_of_flight", data=tof_ns)
-        # Flight path
-        entry.attrs["L1"] = 25.0
+        # Flight path — attribute name matches VENUS schema expected by Rust reader
+        entry.attrs["flight_path_m"] = 25.0
 
 
 def _create_synthetic_nexus_events(path, n_events=1000, height=4, width=4):
@@ -841,8 +841,8 @@ def _create_synthetic_nexus_events(path, n_events=1000, height=4, width=4):
         y = rng.uniform(0, height - 1, size=n_events)
         neutrons.create_dataset("x", data=x)
         neutrons.create_dataset("y", data=y)
-        # Flight path
-        entry.attrs["L1"] = 25.0
+        # Flight path — attribute name matches VENUS schema
+        entry.attrs["flight_path_m"] = 25.0
 
 
 @pytest.mark.skipif(not HAS_H5PY, reason="h5py not installed")
@@ -856,6 +856,7 @@ class TestNexusIO:
         assert isinstance(meta, nereids.NexusMetadata)
         assert meta.has_histogram is True
         assert meta.has_events is False
+        assert meta.flight_path_m == pytest.approx(25.0)
 
     def test_probe_nexus_events(self, tmp_path):
         path = str(tmp_path / "events.h5")
@@ -875,6 +876,8 @@ class TestNexusIO:
         assert data.n_rotation_angles == 1
         # Counts should be non-negative
         assert np.all(data.counts >= 0)
+        # Flight path from metadata
+        assert data.flight_path_m == pytest.approx(25.0)
 
     def test_load_nexus_events(self, tmp_path):
         path = str(tmp_path / "events.h5")

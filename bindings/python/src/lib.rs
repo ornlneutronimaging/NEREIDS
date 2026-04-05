@@ -2196,10 +2196,21 @@ impl PyNexusData {
 ///
 /// Returns:
 ///     NexusMetadata with has_histogram, has_events, n_events, etc.
+/// Map nereids_io::IoError to appropriate Python exception.
+fn map_io_error(e: nereids_io::error::IoError) -> pyo3::PyErr {
+    use nereids_io::error::IoError;
+    match e {
+        IoError::FileNotFound(..) => pyo3::exceptions::PyFileNotFoundError::new_err(format!("{e}")),
+        IoError::InvalidParameter(..) | IoError::ShapeMismatch(..) => {
+            pyo3::exceptions::PyValueError::new_err(format!("{e}"))
+        }
+        _ => pyo3::exceptions::PyIOError::new_err(format!("{e}")),
+    }
+}
+
 #[pyfunction]
 fn probe_nexus(path: &str) -> PyResult<PyNexusMetadata> {
-    let meta = nereids_io::nexus::probe_nexus(std::path::Path::new(path))
-        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{e}")))?;
+    let meta = nereids_io::nexus::probe_nexus(std::path::Path::new(path)).map_err(map_io_error)?;
     Ok(PyNexusMetadata { inner: meta })
 }
 
@@ -2216,7 +2227,7 @@ fn probe_nexus(path: &str) -> PyResult<PyNexusMetadata> {
 #[pyfunction]
 fn load_nexus_histogram(py: Python<'_>, path: &str) -> PyResult<PyNexusData> {
     let data = nereids_io::nexus::load_nexus_histogram(std::path::Path::new(path))
-        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{e}")))?;
+        .map_err(map_io_error)?;
     Ok(nexus_data_to_py(py, data))
 }
 
@@ -2254,7 +2265,7 @@ fn load_nexus_events(
         width,
     };
     let data = nereids_io::nexus::load_nexus_events(std::path::Path::new(path), &params)
-        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{e}")))?;
+        .map_err(map_io_error)?;
     Ok(nexus_data_to_py(py, data))
 }
 
