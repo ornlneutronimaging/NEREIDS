@@ -48,7 +48,22 @@
       "Bash(network\" — was making live ENDF downloads during test runs.:*)",
       "Bash(pixi run python -c \":*)",
       "Read(//dev/**)",
-      "Bash(gh issue:*)"
+      "Bash(gh issue:*)",
+      "WebFetch(domain:pmc.ncbi.nlm.nih.gov)",
+      "WebFetch(domain:www.nature.com)",
+      "WebFetch(domain:pubmed.ncbi.nlm.nih.gov)",
+      "WebFetch(domain:academic.oup.com)",
+      "WebFetch(domain:pubs.aip.org)",
+      "WebFetch(domain:www.ncbi.nlm.nih.gov)",
+      "WebFetch(domain:www.osti.gov)",
+      "WebFetch(domain:arxiv.org)",
+      "Bash(ps -ax)",
+      "Bash(while ps:*)",
+      "Bash(do sleep:*)",
+      "Bash(while ! ls /Users/chenzhang/github.com/NEREIDS/NEREIDS/.research/spatial-regularization/results/phase2_huber_full/results.json)",
+      "Bash(git reset:*)",
+      "Bash(ps -p 39340 -o pid,time)",
+      "Bash(while kill:*)"
     ]
   }
 }
