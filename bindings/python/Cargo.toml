@@ -14,7 +14,7 @@ crate-type = ["cdylib"]
 nereids-core = { workspace = true }
 nereids-endf = { workspace = true }
 nereids-physics = { workspace = true }
-nereids-io = { workspace = true }
+nereids-io = { workspace = true, features = ["hdf5"] }
 nereids-fitting = { workspace = true }
 nereids-pipeline = { workspace = true }
 pyo3 = { workspace = true }

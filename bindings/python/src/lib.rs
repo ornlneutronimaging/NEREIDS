@@ -2064,6 +2064,220 @@ fn py_calibrate_energy(
     })
 }
 
+// ── NeXus I/O Bindings ──────────────────────────────────────────────────
+
+/// Result of probing a NeXus file for available data.
+#[pyclass(name = "NexusMetadata")]
+struct PyNexusMetadata {
+    inner: nereids_io::nexus::NexusMetadata,
+}
+
+#[pymethods]
+impl PyNexusMetadata {
+    /// Whether the file contains a pre-histogrammed dataset.
+    #[getter]
+    fn has_histogram(&self) -> bool {
+        self.inner.has_histogram
+    }
+
+    /// Whether the file contains event data.
+    #[getter]
+    fn has_events(&self) -> bool {
+        self.inner.has_events
+    }
+
+    /// Shape of the histogram dataset as (rotation, y, x, tof), if present.
+    #[getter]
+    fn histogram_shape(&self) -> Option<[usize; 4]> {
+        self.inner.histogram_shape
+    }
+
+    /// Number of neutron events, if present.
+    #[getter]
+    fn n_events(&self) -> Option<usize> {
+        self.inner.n_events
+    }
+
+    /// Flight path in metres from file metadata, if present.
+    #[getter]
+    fn flight_path_m(&self) -> Option<f64> {
+        self.inner.flight_path_m
+    }
+
+    /// TOF offset in nanoseconds, if present.
+    #[getter]
+    fn tof_offset_ns(&self) -> Option<f64> {
+        self.inner.tof_offset_ns
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "NexusMetadata(histogram={}, events={}, n_events={:?}, flight_path={:?})",
+            self.inner.has_histogram,
+            self.inner.has_events,
+            self.inner.n_events,
+            self.inner.flight_path_m,
+        )
+    }
+}
+
+/// Result of loading NeXus histogram or event data.
+#[pyclass(name = "NexusData")]
+struct PyNexusData {
+    counts: Py<PyArray3<f64>>,
+    tof_edges_us: Py<PyArray1<f64>>,
+    flight_path_m: Option<f64>,
+    dead_pixels: Option<Py<PyArray2<bool>>>,
+    n_rotation_angles: usize,
+    event_total: Option<usize>,
+    event_kept: Option<usize>,
+}
+
+#[pymethods]
+impl PyNexusData {
+    /// 3D counts array with shape (n_tof, height, width).
+    #[getter]
+    fn counts<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray3<f64>> {
+        self.counts.bind(py).clone()
+    }
+
+    /// TOF bin edges in microseconds (length = n_tof + 1).
+    #[getter]
+    fn tof_edges_us<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        self.tof_edges_us.bind(py).clone()
+    }
+
+    /// Flight path in metres from file metadata, if present.
+    #[getter]
+    fn flight_path_m(&self) -> Option<f64> {
+        self.flight_path_m
+    }
+
+    /// Dead pixel mask (height, width), if present.  True = dead.
+    #[getter]
+    fn dead_pixels<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray2<bool>>> {
+        self.dead_pixels.as_ref().map(|m| m.bind(py).clone())
+    }
+
+    /// Number of rotation angles summed (1 for single-angle data).
+    #[getter]
+    fn n_rotation_angles(&self) -> usize {
+        self.n_rotation_angles
+    }
+
+    /// Total events before filtering (event data only).
+    #[getter]
+    fn event_total(&self) -> Option<usize> {
+        self.event_total
+    }
+
+    /// Events kept after filtering (event data only).
+    #[getter]
+    fn event_kept(&self) -> Option<usize> {
+        self.event_kept
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> String {
+        let shape = self.counts.bind(py).shape();
+        format!(
+            "NexusData(shape=({}, {}, {}), tof_bins={}, flight_path={:?})",
+            shape[0], shape[1], shape[2], shape[0], self.flight_path_m,
+        )
+    }
+}
+
+/// Probe a NeXus/HDF5 file for available data without loading it.
+///
+/// Returns metadata about what the file contains (histogram, events,
+/// flight path, etc.) without reading the full dataset.
+///
+/// Args:
+///     path: Path to the NeXus/HDF5 file.
+///
+/// Returns:
+///     NexusMetadata with has_histogram, has_events, n_events, etc.
+#[pyfunction]
+fn probe_nexus(path: &str) -> PyResult<PyNexusMetadata> {
+    let meta = nereids_io::nexus::probe_nexus(std::path::Path::new(path))
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{e}")))?;
+    Ok(PyNexusMetadata { inner: meta })
+}
+
+/// Load pre-histogrammed counts from a NeXus/HDF5 file.
+///
+/// Reads `/entry/histogram/counts` (4D: rotation × y × x × tof),
+/// sums over rotation angles, and transposes to (tof, y, x).
+///
+/// Args:
+///     path: Path to the NeXus/HDF5 file.
+///
+/// Returns:
+///     NexusData with counts, tof_edges_us, flight_path_m, dead_pixels.
+#[pyfunction]
+fn load_nexus_histogram(py: Python<'_>, path: &str) -> PyResult<PyNexusData> {
+    let data = nereids_io::nexus::load_nexus_histogram(std::path::Path::new(path))
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{e}")))?;
+    Ok(nexus_data_to_py(py, data))
+}
+
+/// Load event data from a NeXus/HDF5 file, histogramming into TOF bins.
+///
+/// Reads `/entry/neutrons/event_time_offset`, `/x`, `/y` and bins
+/// events into a linear TOF grid with the specified parameters.
+///
+/// Args:
+///     path: Path to the NeXus/HDF5 file.
+///     n_bins: Number of TOF bins.
+///     tof_min_us: Minimum TOF in microseconds.
+///     tof_max_us: Maximum TOF in microseconds.
+///     height: Detector height in pixels.
+///     width: Detector width in pixels.
+///
+/// Returns:
+///     NexusData with counts, tof_edges_us, flight_path_m, and event stats.
+#[pyfunction]
+#[pyo3(signature = (path, n_bins, tof_min_us, tof_max_us, height, width))]
+fn load_nexus_events(
+    py: Python<'_>,
+    path: &str,
+    n_bins: usize,
+    tof_min_us: f64,
+    tof_max_us: f64,
+    height: usize,
+    width: usize,
+) -> PyResult<PyNexusData> {
+    let params = nereids_io::nexus::EventBinningParams {
+        n_bins,
+        tof_min_us,
+        tof_max_us,
+        height,
+        width,
+    };
+    let data = nereids_io::nexus::load_nexus_events(std::path::Path::new(path), &params)
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{e}")))?;
+    Ok(nexus_data_to_py(py, data))
+}
+
+/// Convert Rust NexusHistogramData to Python PyNexusData.
+fn nexus_data_to_py(py: Python<'_>, data: nereids_io::nexus::NexusHistogramData) -> PyNexusData {
+    let (event_total, event_kept) = data
+        .event_stats
+        .as_ref()
+        .map(|s| (Some(s.total), Some(s.kept)))
+        .unwrap_or((None, None));
+    PyNexusData {
+        counts: PyArray3::from_owned_array(py, data.counts).unbind(),
+        tof_edges_us: PyArray1::from_vec(py, data.tof_edges_us).unbind(),
+        flight_path_m: data.flight_path_m,
+        dead_pixels: data
+            .dead_pixels
+            .map(|dp| PyArray2::from_owned_array(py, dp).unbind()),
+        n_rotation_angles: data.n_rotation_angles,
+        event_total,
+        event_kept,
+    }
+}
+
 /// NEREIDS Python module.
 #[pymodule]
 fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -2086,6 +2300,11 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_apply_resolution, m)?)?;
     m.add_function(wrap_pyfunction!(load_tiff_stack, m)?)?;
     m.add_function(wrap_pyfunction!(load_tiff_folder, m)?)?;
+    m.add_class::<PyNexusMetadata>()?;
+    m.add_class::<PyNexusData>()?;
+    m.add_function(wrap_pyfunction!(probe_nexus, m)?)?;
+    m.add_function(wrap_pyfunction!(load_nexus_histogram, m)?)?;
+    m.add_function(wrap_pyfunction!(load_nexus_events, m)?)?;
     m.add_function(wrap_pyfunction!(normalize, m)?)?;
     m.add_function(wrap_pyfunction!(tof_to_energy_centers, m)?)?;
     m.add_function(wrap_pyfunction!(py_element_symbol, m)?)?;

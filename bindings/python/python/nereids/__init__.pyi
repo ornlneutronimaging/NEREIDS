@@ -9,6 +9,50 @@ from numpy.typing import NDArray
 # Classes
 # ---------------------------------------------------------------------------
 
+class NexusMetadata:
+    """Metadata from probing a NeXus/HDF5 file."""
+
+    @property
+    def has_histogram(self) -> bool: ...
+    @property
+    def has_events(self) -> bool: ...
+    @property
+    def histogram_shape(self) -> tuple[int, int, int, int] | None: ...
+    @property
+    def n_events(self) -> int | None: ...
+    @property
+    def flight_path_m(self) -> float | None: ...
+    @property
+    def tof_offset_ns(self) -> float | None: ...
+
+class NexusData:
+    """Result of loading NeXus histogram or event data."""
+
+    @property
+    def counts(self) -> NDArray[np.float64]:
+        """3D counts array (n_tof, height, width)."""
+        ...
+    @property
+    def tof_edges_us(self) -> NDArray[np.float64]:
+        """TOF bin edges in microseconds (length = n_tof + 1)."""
+        ...
+    @property
+    def flight_path_m(self) -> float | None: ...
+    @property
+    def dead_pixels(self) -> NDArray[np.bool_] | None:
+        """Dead pixel mask (height, width). True = dead."""
+        ...
+    @property
+    def n_rotation_angles(self) -> int: ...
+    @property
+    def event_total(self) -> int | None:
+        """Total events before filtering (event data only)."""
+        ...
+    @property
+    def event_kept(self) -> int | None:
+        """Events kept after filtering (event data only)."""
+        ...
+
 class ResonanceData:
     """ENDF resonance data for an isotope."""
 
@@ -435,6 +479,33 @@ def load_tiff_folder(
     pattern: str | None = None,
 ) -> NDArray[np.float64]:
     """Load a folder of single-frame TIFFs into a 3D numpy array."""
+    ...
+
+def probe_nexus(path: str) -> NexusMetadata:
+    """Probe a NeXus/HDF5 file for available data without loading it."""
+    ...
+
+def load_nexus_histogram(path: str) -> NexusData:
+    """Load pre-histogrammed counts from a NeXus/HDF5 file.
+
+    Reads ``/entry/histogram/counts``, sums over rotation angles,
+    and returns a ``NexusData`` with shape ``(n_tof, height, width)``.
+    """
+    ...
+
+def load_nexus_events(
+    path: str,
+    n_bins: int,
+    tof_min_us: float,
+    tof_max_us: float,
+    height: int,
+    width: int,
+) -> NexusData:
+    """Load event data from a NeXus/HDF5 file, histogramming into TOF bins.
+
+    Reads ``/entry/neutrons/event_time_offset``, ``/x``, ``/y`` and bins
+    events into a linear TOF grid.
+    """
     ...
 
 def normalize(
