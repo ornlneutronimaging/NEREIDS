@@ -864,6 +864,7 @@ class TestNexusIO:
         meta = nereids.probe_nexus(path)
         assert meta.has_events is True
         assert meta.n_events == 1000
+        assert meta.flight_path_m == pytest.approx(25.0)
 
     def test_load_nexus_histogram(self, tmp_path):
         path = str(tmp_path / "hist.h5")
@@ -899,6 +900,7 @@ class TestNexusIO:
         assert data.event_kept is not None
         assert data.event_kept > 0
         assert data.event_kept <= 5000
+        assert data.flight_path_m == pytest.approx(25.0)
 
     def test_load_nexus_histogram_bad_path(self):
         with pytest.raises(IOError):
