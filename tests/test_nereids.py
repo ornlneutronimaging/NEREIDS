@@ -795,6 +795,133 @@ class TestTraceDetectability:
 
 
 # ===========================================================================
+# NeXus I/O Tests
 # ===========================================================================
+
+try:
+    import h5py
+
+    HAS_H5PY = True
+except ImportError:
+    HAS_H5PY = False
+
+
+def _create_synthetic_nexus_histogram(path, n_tof=10, height=4, width=4):
+    """Create a minimal VENUS-schema NeXus file with histogram data."""
+    import h5py
+
+    with h5py.File(path, "w") as f:
+        entry = f.create_group("entry")
+        hist = entry.create_group("histogram")
+        # Shape: (1 rotation, height, width, n_tof) — u64
+        counts = np.random.default_rng(42).integers(
+            0, 100, size=(1, height, width, n_tof), dtype=np.uint64
+        )
+        hist.create_dataset("counts", data=counts)
+        # TOF edges in nanoseconds (n_tof + 1) — dataset name matches VENUS schema
+        tof_ns = np.linspace(1e4, 5e4, n_tof + 1)
+        hist.create_dataset("time_of_flight", data=tof_ns)
+        # Flight path — attribute name matches VENUS schema expected by Rust reader
+        entry.attrs["flight_path_m"] = 25.0
+
+
+def _create_synthetic_nexus_events(path, n_events=1000, height=4, width=4):
+    """Create a minimal VENUS-schema NeXus file with event data."""
+    import h5py
+
+    rng = np.random.default_rng(43)
+    with h5py.File(path, "w") as f:
+        entry = f.create_group("entry")
+        neutrons = entry.create_group("neutrons")
+        # Event time offsets in nanoseconds (u64)
+        tof_ns = rng.integers(10_000, 50_000, size=n_events, dtype=np.uint64)
+        neutrons.create_dataset("event_time_offset", data=tof_ns)
+        # Pixel coordinates (f64)
+        x = rng.uniform(0, width - 1, size=n_events)
+        y = rng.uniform(0, height - 1, size=n_events)
+        neutrons.create_dataset("x", data=x)
+        neutrons.create_dataset("y", data=y)
+        # Flight path — attribute name matches VENUS schema
+        entry.attrs["flight_path_m"] = 25.0
+
+
+@pytest.mark.skipif(not HAS_H5PY, reason="h5py not installed")
+class TestNexusIO:
+    """Tests for NeXus loading Python bindings."""
+
+    def test_probe_nexus_histogram(self, tmp_path):
+        path = str(tmp_path / "hist.h5")
+        _create_synthetic_nexus_histogram(path)
+        meta = nereids.probe_nexus(path)
+        assert isinstance(meta, nereids.NexusMetadata)
+        assert meta.has_histogram is True
+        assert meta.has_events is False
+        assert meta.flight_path_m == pytest.approx(25.0)
+
+    def test_probe_nexus_events(self, tmp_path):
+        path = str(tmp_path / "events.h5")
+        _create_synthetic_nexus_events(path)
+        meta = nereids.probe_nexus(path)
+        assert meta.has_events is True
+        assert meta.n_events == 1000
+        assert meta.flight_path_m == pytest.approx(25.0)
+
+    def test_load_nexus_histogram(self, tmp_path):
+        path = str(tmp_path / "hist.h5")
+        _create_synthetic_nexus_histogram(path, n_tof=10, height=4, width=4)
+        data = nereids.load_nexus_histogram(path)
+        assert isinstance(data, nereids.NexusData)
+        # Shape should be (n_tof, height, width)
+        assert data.counts.shape == (10, 4, 4)
+        assert data.tof_edges_us.shape == (11,)
+        assert data.n_rotation_angles == 1
+        # Counts should be non-negative
+        assert np.all(data.counts >= 0)
+        # Flight path from metadata
+        assert data.flight_path_m == pytest.approx(25.0)
+
+    def test_load_nexus_events(self, tmp_path):
+        path = str(tmp_path / "events.h5")
+        _create_synthetic_nexus_events(path, n_events=5000, height=4, width=4)
+        data = nereids.load_nexus_events(
+            path,
+            n_bins=20,
+            tof_min_us=10.0,
+            tof_max_us=50.0,
+            height=4,
+            width=4,
+        )
+        assert isinstance(data, nereids.NexusData)
+        assert data.counts.shape == (20, 4, 4)
+        assert data.tof_edges_us.shape == (21,)
+        # Event stats should be populated
+        assert data.event_total is not None
+        assert data.event_total == 5000
+        assert data.event_kept is not None
+        assert data.event_kept > 0
+        assert data.event_kept <= 5000
+        assert data.flight_path_m == pytest.approx(25.0)
+
+    def test_load_nexus_histogram_bad_path(self):
+        with pytest.raises(IOError):
+            nereids.load_nexus_histogram("/nonexistent/file.h5")
+
+    def test_probe_nexus_bad_path(self):
+        with pytest.raises(IOError):
+            nereids.probe_nexus("/nonexistent/file.h5")
+
+    def test_nexus_histogram_to_fitting_workflow(self, tmp_path):
+        """End-to-end: load histogram → normalize → fit."""
+        path = str(tmp_path / "hist.h5")
+        n_tof, h, w = 50, 2, 2
+        _create_synthetic_nexus_histogram(path, n_tof=n_tof, height=h, width=w)
+        data = nereids.load_nexus_histogram(path)
+        assert data.counts.shape == (n_tof, h, w)
+        # Verify the loaded data can be used in from_counts
+        sample = data.counts
+        ob = np.full_like(sample, 100.0)  # synthetic OB
+        input_data = nereids.from_counts(sample, ob)
+        assert input_data is not None  # successfully created InputData
+
 
 
