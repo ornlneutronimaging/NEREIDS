@@ -724,6 +724,11 @@ fn fit_transmission_poisson(
     config: &UnifiedFitConfig,
     poisson_cfg: &PoissonConfig,
 ) -> Result<SpectrumFitResult, PipelineError> {
+    // Forward covariance flag from UnifiedFitConfig to PoissonConfig.
+    let mut poisson_cfg = poisson_cfg.clone();
+    poisson_cfg.compute_covariance = config.compute_covariance;
+    let poisson_cfg = &poisson_cfg;
+
     let n_density_params = config.n_density_params();
 
     let mut param_vec = build_density_params(config);
@@ -862,6 +867,11 @@ fn fit_counts_poisson(
     config: &UnifiedFitConfig,
     poisson_cfg: &PoissonConfig,
 ) -> Result<SpectrumFitResult, PipelineError> {
+    // Forward covariance flag from UnifiedFitConfig to PoissonConfig.
+    let mut poisson_cfg = poisson_cfg.clone();
+    poisson_cfg.compute_covariance = config.compute_covariance;
+    let poisson_cfg = &poisson_cfg;
+
     let n_density_params = config.n_density_params();
 
     let mut param_vec = build_density_params(config);
