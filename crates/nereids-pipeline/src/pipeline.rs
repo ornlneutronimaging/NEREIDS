@@ -798,7 +798,16 @@ fn fit_transmission_poisson(
             b1_index: b1_idx,
             n_params: params.params.len(),
         };
-        let mut pr = poisson::poisson_fit(&wrapped, measured_t, &mut params, poisson_cfg)?;
+        // When polish is planned, skip covariance on the first fit (it will
+        // be discarded). Only the polish computes covariance.
+        let first_cfg = if polish_cfg.is_some() {
+            let mut cfg = poisson_cfg.clone();
+            cfg.compute_covariance = false;
+            cfg
+        } else {
+            poisson_cfg.clone()
+        };
+        let mut pr = poisson::poisson_fit(&wrapped, measured_t, &mut params, &first_cfg)?;
         if pr.converged
             && let Some(ref polish) = polish_cfg
         {
