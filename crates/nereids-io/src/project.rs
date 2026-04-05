@@ -830,6 +830,19 @@ fn write_results(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoErro
             .map_err(|e| hdf5_err("/results/temperature", e))?;
     }
 
+    if let Some(ref tu_map) = snap.temperature_uncertainty_map {
+        let shape = [tu_map.shape()[0], tu_map.shape()[1]];
+        let data: Vec<f64> = tu_map.iter().copied().collect();
+        results
+            .new_dataset::<f64>()
+            .shape(shape)
+            .chunk(shape)
+            .deflate(4)
+            .create("temperature_uncertainty")
+            .and_then(|ds| ds.write_raw(&data))
+            .map_err(|e| hdf5_err("/results/temperature_uncertainty", e))?;
+    }
+
     // Save anorm and background maps from spatial fitting.
     if let Some(ref a_map) = snap.anorm_map {
         let shape = [a_map.shape()[0], a_map.shape()[1]];
@@ -1559,6 +1572,20 @@ fn read_results(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoE
             snap.temperature_map = Some(
                 Array2::from_shape_vec((shape[0], shape[1]), data)
                     .map_err(|e| hdf5_err("/results/temperature reshape", e))?,
+            );
+        }
+    }
+
+    // Temperature uncertainty map (optional — absent in older project files).
+    if let Ok(tu_ds) = results.dataset("temperature_uncertainty") {
+        let shape = tu_ds.shape();
+        if shape.len() == 2 {
+            let data: Vec<f64> = tu_ds
+                .read_raw()
+                .map_err(|e| hdf5_err("/results/temperature_uncertainty", e))?;
+            snap.temperature_uncertainty_map = Some(
+                Array2::from_shape_vec((shape[0], shape[1]), data)
+                    .map_err(|e| hdf5_err("/results/temperature_uncertainty reshape", e))?,
             );
         }
     }
