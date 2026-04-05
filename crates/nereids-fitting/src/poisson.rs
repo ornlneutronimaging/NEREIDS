@@ -744,7 +744,7 @@ fn compute_fd_fisher(
     let mut jac = FlatMatrix::zeros(n_e, n_free);
     for (col, &fi) in free_idx_buf.iter().enumerate() {
         let orig = params.params[fi].value;
-        let h = fd_step * orig.abs().max(fd_step);
+        let h = fd_step * (1.0 + orig.abs());
 
         params.params[fi].value = orig + h;
         params.all_values_into(all_vals_buf);
