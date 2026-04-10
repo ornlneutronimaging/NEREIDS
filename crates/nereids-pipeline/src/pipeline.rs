@@ -15,10 +15,11 @@ use nereids_fitting::lm::{self, FitModel, LmConfig, LmResult};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
 use nereids_fitting::poisson::{self, PoissonConfig};
 use nereids_fitting::transmission_model::{
-    NormalizedTransmissionModel, PrecomputedTransmissionModel, TransmissionFitModel,
+    EnergyScaleTransmissionModel, NormalizedTransmissionModel, PrecomputedTransmissionModel,
+    TransmissionFitModel,
 };
 use nereids_physics::resolution::ResolutionFunction;
-use nereids_physics::transmission::InstrumentParams;
+use nereids_physics::transmission::{self as nereids_transmission, InstrumentParams};
 
 use crate::error::PipelineError;
 
@@ -26,11 +27,15 @@ use crate::error::PipelineError;
 ///
 /// When enabled, the transmission model becomes:
 ///   T_out(E) = Anorm × T_inner(E) + BackA + BackB / √E + BackC × √E
+///            + BackD × exp(−BackF / √E)
 ///
-/// These 4 parameters are fitted jointly with the isotope densities.
+/// The first 4 background parameters (Anorm, BackA, BackB, BackC) are always
+/// available.  The exponential tail (BackD, BackF) is optional and disabled
+/// by default (`fit_back_d = false`, `fit_back_f = false`).
 ///
 /// ## SAMMY Reference
 /// SAMMY manual Sec III.E.2 — NORMAlization and BACKGround cards.
+/// SAMMY fits up to 6 background terms; we implement all 6.
 #[derive(Debug, Clone)]
 pub struct BackgroundConfig {
     /// Initial value for the normalization factor (default 1.0).
@@ -41,6 +46,16 @@ pub struct BackgroundConfig {
     pub back_b_init: f64,
     /// Initial value for the √E background term (default 0.0).
     pub back_c_init: f64,
+    /// Initial value for the exponential amplitude (default 0.01).
+    ///
+    /// Must be > 0 when `fit_back_f` is true, otherwise the Jacobian
+    /// column for BackF is identically zero and BackF cannot be learned.
+    pub back_d_init: f64,
+    /// Initial value for the exponential decay constant (default 1.0).
+    ///
+    /// Units: √eV.  Must be > 0 when `fit_back_d` is true, otherwise
+    /// BackD is indistinguishable from BackA (both become constants).
+    pub back_f_init: f64,
     /// Whether Anorm is free (true) or fixed (false).
     pub fit_anorm: bool,
     /// Whether BackA is free (true) or fixed (false).
@@ -49,6 +64,10 @@ pub struct BackgroundConfig {
     pub fit_back_b: bool,
     /// Whether BackC is free (true) or fixed (false).
     pub fit_back_c: bool,
+    /// Whether BackD (exponential amplitude) is free (true) or fixed (false).
+    pub fit_back_d: bool,
+    /// Whether BackF (exponential decay constant) is free (true) or fixed (false).
+    pub fit_back_f: bool,
 }
 
 impl Default for BackgroundConfig {
@@ -58,12 +77,30 @@ impl Default for BackgroundConfig {
             back_a_init: 0.0,
             back_b_init: 0.0,
             back_c_init: 0.0,
+            back_d_init: 0.01,
+            back_f_init: 1.0,
             fit_anorm: true,
             fit_back_a: true,
             fit_back_b: true,
             fit_back_c: true,
+            fit_back_d: false,
+            fit_back_f: false,
         }
     }
+}
+
+/// Indices of SAMMY background parameters in the full parameter vector.
+///
+/// Replaces the previous 4-tuple representation and supports the optional
+/// exponential tail terms (BackD, BackF).
+#[derive(Debug, Clone, Copy)]
+struct BackgroundIndices {
+    anorm: usize,
+    back_a: usize,
+    back_b: usize,
+    back_c: usize,
+    back_d: Option<usize>,
+    back_f: Option<usize>,
 }
 
 // ── New typed pipeline API (Phase 0) ─────────────────────────────────────
@@ -225,6 +262,18 @@ pub struct UnifiedFitConfig {
     precomputed_cross_sections: Option<Arc<Vec<Vec<f64>>>>,
     precomputed_base_xs: Option<Arc<Vec<Vec<f64>>>>,
 
+    // ── Energy-scale calibration (SAMMY TZERO equivalent) ──
+    /// When true, fit t₀ (μs) and L_scale (dimensionless) parameters.
+    /// These adjust the energy axis during fitting:
+    ///   E_corr = (TOF_FACTOR * L * L_scale / (t_nom - t₀))²
+    fit_energy_scale: bool,
+    /// Initial t₀ value in microseconds (default 0.0).
+    t0_init_us: f64,
+    /// Initial L_scale value (dimensionless, default 1.0).
+    l_scale_init: f64,
+    /// Flight path in meters for TOF↔energy conversion (default from resolution or 25.0).
+    flight_path_m: f64,
+
     // ── Isotope group mapping (optional) ──
     /// Maps member isotope index → density parameter index.
     /// `None` = identity mapping (one param per isotope, backward compat).
@@ -285,6 +334,10 @@ impl UnifiedFitConfig {
             counts_background: None,
             precomputed_cross_sections: None,
             precomputed_base_xs: None,
+            fit_energy_scale: false,
+            t0_init_us: 0.0,
+            l_scale_init: 1.0,
+            flight_path_m: 25.0,
             density_indices: None,
             density_ratios: None,
             n_density_params: None,
@@ -308,6 +361,25 @@ impl UnifiedFitConfig {
     #[must_use]
     pub fn with_compute_covariance(mut self, v: bool) -> Self {
         self.compute_covariance = v;
+        self
+    }
+
+    /// Enable energy-scale fitting (SAMMY TZERO equivalent).
+    ///
+    /// Adds t₀ (μs) and L_scale (dimensionless) as fit parameters.
+    /// These adjust the energy axis during fitting to correct for
+    /// flight-path and timing-offset uncertainties.
+    #[must_use]
+    pub fn with_energy_scale(
+        mut self,
+        t0_init_us: f64,
+        l_scale_init: f64,
+        flight_path_m: f64,
+    ) -> Self {
+        self.fit_energy_scale = true;
+        self.t0_init_us = t0_init_us;
+        self.l_scale_init = l_scale_init;
+        self.flight_path_m = flight_path_m;
         self
     }
 
@@ -689,32 +761,149 @@ fn fit_transmission_lm(
         None
     };
 
-    // Background parameters
-    let bg_base = param_vec.len();
-    let bg_indices = if let Some(bg) = &config.transmission_background {
-        append_background_params(&mut param_vec, bg);
-        Some((bg_base, bg_base + 1, bg_base + 2, bg_base + 3))
+    // Guard: energy-scale + temperature fitting is not yet supported.
+    // The EnergyScaleTransmissionModel does not wire the temperature parameter.
+    if config.fit_energy_scale && config.fit_temperature {
+        return Err(PipelineError::InvalidParameter(
+            "fit_energy_scale and fit_temperature cannot both be true: \
+             EnergyScaleTransmissionModel does not support temperature fitting yet"
+                .into(),
+        ));
+    }
+
+    // Energy-scale parameters (SAMMY TZERO equivalent)
+    let energy_scale_indices = if config.fit_energy_scale {
+        let t0_idx = param_vec.len();
+        param_vec.push(FitParameter {
+            name: "t0_us".into(),
+            value: config.t0_init_us,
+            lower: -10.0,
+            upper: 10.0,
+            fixed: false,
+        });
+        let ls_idx = param_vec.len();
+        param_vec.push(FitParameter {
+            name: "l_scale".into(),
+            value: config.l_scale_init,
+            lower: 0.99,
+            upper: 1.01,
+            fixed: false,
+        });
+        Some((t0_idx, ls_idx))
     } else {
         None
     };
+
+    // Background parameters
+    let bg_indices = config
+        .transmission_background
+        .as_ref()
+        .map(|bg| append_background_params(&mut param_vec, bg));
 
     let mut params = ParameterSet::new(param_vec);
     let mut lm_cfg = lm_config.clone();
     lm_cfg.compute_covariance = config.compute_covariance;
 
-    // Build model
-    let model = build_transmission_model(config, n_density_params, _temperature_index)?;
+    // Build model — use EnergyScaleTransmissionModel when energy-scale is enabled
+    let model: Box<dyn FitModel> = if let Some((t0_idx, ls_idx)) = energy_scale_indices {
+        // Energy-scale model needs precomputed Doppler-broadened cross-sections.
+        // Precompute them if not already available.
+        let n_params = config.n_density_params();
+        let xs = if let Some(xs) = &config.precomputed_cross_sections {
+            Arc::clone(xs)
+        } else {
+            // Precompute Doppler-broadened σ(E) on the nominal energy grid.
+            // Resolution is NOT applied here — it's done inside the model's evaluate().
+            let instrument = config
+                .resolution
+                .clone()
+                .map(|r| Arc::new(InstrumentParams { resolution: r }));
+            let xs_raw = nereids_transmission::broadened_cross_sections(
+                config.energies(),
+                &config.resonance_data,
+                config.temperature_k,
+                instrument.as_deref(),
+                None,
+            )
+            .map_err(PipelineError::Transmission)?;
+            Arc::new(xs_raw)
+        };
+        // Collapse grouped isotopes if needed
+        let effective_xs =
+            if let (Some(di), Some(dr)) = (&config.density_indices, &config.density_ratios) {
+                if xs.len() == di.len() && di.len() == dr.len() {
+                    let n_e = xs[0].len();
+                    let mut eff = vec![vec![0.0f64; n_e]; n_params];
+                    for ((&idx, &ratio), member_xs) in di.iter().zip(dr.iter()).zip(xs.iter()) {
+                        for (j, &sigma) in member_xs.iter().enumerate() {
+                            eff[idx][j] += ratio * sigma;
+                        }
+                    }
+                    Arc::new(eff)
+                } else {
+                    xs
+                }
+            } else {
+                xs
+            };
+        // After group-collapsing, effective_xs has n_params entries.
+        // Use identity mapping because each XS entry maps to its own
+        // density parameter (same as PrecomputedTransmissionModel line 1443).
+        let density_indices: Vec<usize> = (0..n_params).collect();
+        let instrument = config
+            .resolution
+            .clone()
+            .map(|r| Arc::new(InstrumentParams { resolution: r }));
+        Box::new(EnergyScaleTransmissionModel::new(
+            effective_xs,
+            Arc::new(density_indices),
+            config.energies.clone(),
+            config.flight_path_m,
+            t0_idx,
+            ls_idx,
+            instrument,
+        ))
+    } else {
+        build_transmission_model(config, n_density_params, _temperature_index)?
+    };
 
     // Dispatch with optional background wrapping
-    let result = if let Some((ai, bai, bbi, bci)) = bg_indices {
-        let wrapped =
-            NormalizedTransmissionModel::new(&*model, config.energies(), ai, bai, bbi, bci);
+    let result = if let Some(bi) = bg_indices {
+        let wrapped = if let (Some(di), Some(fi)) = (bi.back_d, bi.back_f) {
+            NormalizedTransmissionModel::new_with_exponential(
+                &*model,
+                config.energies(),
+                bi.anorm,
+                bi.back_a,
+                bi.back_b,
+                bi.back_c,
+                di,
+                fi,
+            )
+        } else {
+            NormalizedTransmissionModel::new(
+                &*model,
+                config.energies(),
+                bi.anorm,
+                bi.back_a,
+                bi.back_b,
+                bi.back_c,
+            )
+        };
         lm::levenberg_marquardt(&wrapped, measured_t, sigma, &mut params, &lm_cfg)?
     } else {
         lm::levenberg_marquardt(&*model, measured_t, sigma, &mut params, &lm_cfg)?
     };
 
-    extract_result(config, &result, n_density_params, bg_indices)
+    let mut sr = extract_result(config, &result, n_density_params, bg_indices)?;
+
+    // Populate energy-scale results if fitted.
+    if let Some((t0_idx, ls_idx)) = energy_scale_indices {
+        sr.t0_us = Some(result.params[t0_idx]);
+        sr.l_scale = Some(result.params[ls_idx]);
+    }
+
+    Ok(sr)
 }
 
 /// Transmission + Poisson KL path.
@@ -858,6 +1047,10 @@ fn fit_transmission_poisson(
             temperature_k_unc: fitted_temp_unc,
             anorm: 1.0,
             background: [b0, b1, 0.0],
+            back_d: 0.0,
+            back_f: 0.0,
+            t0_us: None,
+            l_scale: None,
         })
     } else {
         let mut sr = extract_result(config, &result, n_density_params, None)?;
@@ -1095,6 +1288,10 @@ fn fit_counts_poisson(
         temperature_k_unc,
         anorm: fitted_alpha1,
         background: fitted_background,
+        back_d: 0.0,
+        back_f: 0.0,
+        t0_us: None,
+        l_scale: None,
     })
 }
 
@@ -1118,11 +1315,15 @@ fn build_density_params(config: &UnifiedFitConfig) -> Vec<FitParameter> {
         .collect()
 }
 
-fn append_background_params(param_vec: &mut Vec<FitParameter>, bg: &BackgroundConfig) {
+fn append_background_params(
+    param_vec: &mut Vec<FitParameter>,
+    bg: &BackgroundConfig,
+) -> BackgroundIndices {
     // Anorm bounded to [0.5, 2.0] — physically reasonable normalization range.
     // Previously unbounded [0, ∞), which allowed the fitter to absorb signal
     // into anorm (e.g., anorm=15.9 with density=0.03×true).
     // SAMMY also bounds normalization to a reasonable range.
+    let anorm = param_vec.len();
     param_vec.push(if bg.fit_anorm {
         FitParameter {
             name: "anorm".into(),
@@ -1139,6 +1340,7 @@ fn append_background_params(param_vec: &mut Vec<FitParameter>, bg: &BackgroundCo
     // Unbounded background allows the fitter to absorb resonance signal
     // into the background polynomial, producing meaningless densities.
     // SAMMY also constrains background to reasonable ranges.
+    let back_a = param_vec.len();
     param_vec.push(if bg.fit_back_a {
         FitParameter {
             name: "back_a".into(),
@@ -1150,6 +1352,7 @@ fn append_background_params(param_vec: &mut Vec<FitParameter>, bg: &BackgroundCo
     } else {
         FitParameter::fixed("back_a", bg.back_a_init)
     });
+    let back_b = param_vec.len();
     param_vec.push(if bg.fit_back_b {
         FitParameter {
             name: "back_b".into(),
@@ -1161,6 +1364,7 @@ fn append_background_params(param_vec: &mut Vec<FitParameter>, bg: &BackgroundCo
     } else {
         FitParameter::fixed("back_b", bg.back_b_init)
     });
+    let back_c = param_vec.len();
     param_vec.push(if bg.fit_back_c {
         FitParameter {
             name: "back_c".into(),
@@ -1172,6 +1376,49 @@ fn append_background_params(param_vec: &mut Vec<FitParameter>, bg: &BackgroundCo
     } else {
         FitParameter::fixed("back_c", bg.back_c_init)
     });
+
+    // Exponential tail: BackD × exp(−BackF / √E).
+    // SAMMY manual Sec III.E.2 — terms 5-6.
+    // BackD (amplitude): non-negative, bounded [0, 1].
+    // BackF (decay constant in √eV units): non-negative, bounded [0, 100].
+    // Note: if BackD_init = 0, the Jacobian column for BackF is identically
+    // zero and the optimizer cannot learn BackF.  The default init (0.01)
+    // avoids this.
+    let back_d = if bg.fit_back_d {
+        let idx = param_vec.len();
+        param_vec.push(FitParameter {
+            name: "back_d".into(),
+            value: bg.back_d_init,
+            lower: 0.0,
+            upper: 1.0,
+            fixed: false,
+        });
+        Some(idx)
+    } else {
+        None
+    };
+    let back_f = if bg.fit_back_f {
+        let idx = param_vec.len();
+        param_vec.push(FitParameter {
+            name: "back_f".into(),
+            value: bg.back_f_init,
+            lower: 0.0,
+            upper: 100.0,
+            fixed: false,
+        });
+        Some(idx)
+    } else {
+        None
+    };
+
+    BackgroundIndices {
+        anorm,
+        back_a,
+        back_b,
+        back_c,
+        back_d,
+        back_f,
+    }
 }
 
 /// Build the transmission forward model, selecting precomputed or full path.
@@ -1282,17 +1529,25 @@ fn extract_result(
     config: &UnifiedFitConfig,
     result: &LmResult,
     n_density_params: usize,
-    bg_indices: Option<(usize, usize, usize, usize)>,
+    bg_indices: Option<BackgroundIndices>,
 ) -> Result<SpectrumFitResult, PipelineError> {
     let densities: Vec<f64> = (0..n_density_params).map(|i| result.params[i]).collect();
 
-    let (anorm, background) = if let Some((ai, bai, bbi, bci)) = bg_indices {
+    let (anorm, background, back_d, back_f) = if let Some(bi) = bg_indices {
+        let bd = bi.back_d.map_or(0.0, |i| result.params[i]);
+        let bf = bi.back_f.map_or(0.0, |i| result.params[i]);
         (
-            result.params[ai],
-            [result.params[bai], result.params[bbi], result.params[bci]],
+            result.params[bi.anorm],
+            [
+                result.params[bi.back_a],
+                result.params[bi.back_b],
+                result.params[bi.back_c],
+            ],
+            bd,
+            bf,
         )
     } else {
-        (1.0, [0.0, 0.0, 0.0])
+        (1.0, [0.0, 0.0, 0.0], 0.0, 0.0)
     };
 
     let (uncertainties, temperature_k, temperature_k_unc) = if result.converged {
@@ -1340,6 +1595,256 @@ fn extract_result(
         temperature_k_unc,
         anorm,
         background,
+        back_d,
+        back_f,
+        t0_us: None,
+        l_scale: None,
+    })
+}
+
+// ── Research: exact Jacobian/Fisher at arbitrary parameters ──────────────
+
+/// Result of Jacobian/Fisher evaluation at given parameters.
+///
+/// Produced by [`evaluate_jacobian_and_fisher`], which builds the same model
+/// chain as the production fitting pipeline but evaluates at the caller's
+/// parameter values instead of optimising.
+pub struct ModelJacobianResult {
+    /// Analytical Jacobian J (n_data × n_free), row-major.
+    pub jacobian: lm::FlatMatrix,
+    /// Expected Poisson Fisher F = Jᵀ diag(1/μ) J (n_free × n_free).
+    pub fisher: lm::FlatMatrix,
+    /// Model prediction μ(E) at the evaluation point.
+    pub model_prediction: Vec<f64>,
+    /// Names of free parameters, in Jacobian column order.
+    pub param_names: Vec<String>,
+}
+
+/// Evaluate the exact resolved analytical Jacobian and expected Poisson Fisher
+/// at given parameter values, using the same model construction as the
+/// production counts-domain fitting pipeline.
+///
+/// This is a research-oriented function: it builds the full model chain
+/// (transmission model → optional background wrappers → counts model),
+/// evaluates once at the provided parameters, computes the analytical
+/// Jacobian, and assembles the expected Fisher information matrix.
+///
+/// No optimisation is performed.
+///
+/// # Arguments
+///
+/// * `config` — Unified fit configuration (energies, resonance data,
+///   resolution, initial_densities used as evaluation densities, etc.)
+/// * `flux` — Open-beam counts Φ(E) (length = n_energy)
+/// * `background` — Detector background B(E) (length = n_energy, zeros if none)
+///
+/// Density evaluation values come from `config.initial_densities`.
+/// Temperature evaluation value comes from `config.temperature_k`.
+/// α₁/α₂ evaluation values come from `config.counts_background` init fields.
+pub fn evaluate_jacobian_and_fisher(
+    config: &UnifiedFitConfig,
+    flux: &[f64],
+    background: &[f64],
+) -> Result<ModelJacobianResult, PipelineError> {
+    let n_density_params = config.n_density_params();
+
+    // ── Build parameter vector (mirrors fit_counts_poisson) ─────────
+    let mut param_vec = build_density_params(config);
+
+    let temperature_index = if config.fit_temperature {
+        let idx = param_vec.len();
+        param_vec.push(FitParameter {
+            name: "temperature_k".into(),
+            value: config.temperature_k,
+            lower: 1.0,
+            upper: 5000.0,
+            fixed: false,
+        });
+        Some(idx)
+    } else {
+        None
+    };
+
+    let kl_bg = if config.transmission_background.is_some() {
+        let base = param_vec.len();
+        param_vec.push(FitParameter {
+            name: "kl_b0".into(),
+            value: 0.0,
+            lower: 0.0,
+            upper: 0.5,
+            fixed: false,
+        });
+        param_vec.push(FitParameter {
+            name: "kl_b1".into(),
+            value: 0.0,
+            lower: 0.0,
+            upper: 0.5,
+            fixed: false,
+        });
+        Some((base, base + 1))
+    } else {
+        None
+    };
+
+    let counts_bg = if let Some(bg) = config.counts_background() {
+        let alpha1_idx = param_vec.len();
+        param_vec.push(if bg.fit_alpha_1 {
+            FitParameter {
+                name: "alpha_1".into(),
+                value: bg.alpha_1_init,
+                lower: 0.0,
+                upper: 10.0,
+                fixed: false,
+            }
+        } else {
+            FitParameter::fixed("alpha_1", bg.alpha_1_init)
+        });
+        let alpha2_idx = param_vec.len();
+        param_vec.push(if bg.fit_alpha_2 {
+            FitParameter {
+                name: "alpha_2".into(),
+                value: bg.alpha_2_init,
+                lower: 0.0,
+                upper: 10.0,
+                fixed: false,
+            }
+        } else {
+            FitParameter::fixed("alpha_2", bg.alpha_2_init)
+        });
+        Some((alpha1_idx, alpha2_idx))
+    } else {
+        None
+    };
+
+    let params = ParameterSet::new(param_vec);
+    let all_vals = params.all_values();
+    let free_idx = params.free_indices();
+    let n_free = free_idx.len();
+
+    // Collect free parameter names.
+    let param_names: Vec<String> = free_idx
+        .iter()
+        .map(|&i| params.params[i].name.to_string())
+        .collect();
+
+    // ── Precompute cross-sections so that analytical Jacobian is available ──
+    // For the density-only case (no temperature fitting), the model uses
+    // PrecomputedTransmissionModel which requires precomputed XS.
+    // For the temperature case, TransmissionFitModel computes base_xs in
+    // its constructor.  Either way, precomputing here ensures the analytical
+    // Jacobian path is always available.
+    let config_with_xs;
+    let effective_config = if config.precomputed_cross_sections.is_none() && !config.fit_temperature
+    {
+        let instrument = config
+            .resolution
+            .clone()
+            .map(|r| Arc::new(InstrumentParams { resolution: r }));
+        let xs = nereids_physics::transmission::broadened_cross_sections(
+            config.energies(),
+            &config.resonance_data,
+            config.temperature_k,
+            instrument.as_deref(),
+            None,
+        )
+        .map_err(PipelineError::Transmission)?;
+        config_with_xs = config.clone().with_precomputed_cross_sections(Arc::new(xs));
+        &config_with_xs
+    } else {
+        config
+    };
+
+    // ── Build transmission model (same as production path) ──────────
+    let t_model = build_transmission_model(effective_config, n_density_params, temperature_index)?;
+
+    // ── Build counts model chain and evaluate ───────────────────────
+    // Use a closure that evaluates and computes Jacobian for any FitModel.
+    let evaluate_and_jacobian =
+        |model: &dyn FitModel| -> Result<(Vec<f64>, lm::FlatMatrix), PipelineError> {
+            let y_model = model.evaluate(&all_vals)?;
+            let jac = model
+                .analytical_jacobian(&all_vals, &free_idx, &y_model)
+                .ok_or_else(|| {
+                    PipelineError::InvalidParameter(
+                        "analytical Jacobian not available for this model configuration".into(),
+                    )
+                })?;
+            Ok((y_model, jac))
+        };
+
+    let (y_model, jac) = if let Some((b0_idx, b1_idx)) = kl_bg {
+        let inv_sqrt_e: Vec<f64> = config
+            .energies()
+            .iter()
+            .map(|&e| 1.0 / e.max(1e-10).sqrt())
+            .collect();
+        let wrapped = poisson::TransmissionKLBackgroundModel {
+            inner: &*t_model,
+            inv_sqrt_energies: inv_sqrt_e,
+            b0_index: b0_idx,
+            b1_index: b1_idx,
+            n_params: params.params.len(),
+        };
+        if let Some((a1, a2)) = counts_bg {
+            let cm = poisson::CountsBackgroundScaleModel {
+                transmission_model: &wrapped,
+                flux,
+                background,
+                alpha1_index: a1,
+                alpha2_index: a2,
+                n_params: params.params.len(),
+            };
+            evaluate_and_jacobian(&cm)?
+        } else {
+            let cm = poisson::CountsModel {
+                transmission_model: &wrapped,
+                flux,
+                background,
+                n_params: params.params.len(),
+            };
+            evaluate_and_jacobian(&cm)?
+        }
+    } else if let Some((a1, a2)) = counts_bg {
+        let cm = poisson::CountsBackgroundScaleModel {
+            transmission_model: &*t_model,
+            flux,
+            background,
+            alpha1_index: a1,
+            alpha2_index: a2,
+            n_params: params.params.len(),
+        };
+        evaluate_and_jacobian(&cm)?
+    } else {
+        let cm = poisson::CountsModel {
+            transmission_model: &*t_model,
+            flux,
+            background,
+            n_params: params.params.len(),
+        };
+        evaluate_and_jacobian(&cm)?
+    };
+
+    // ── Assemble expected Poisson Fisher: F = Jᵀ diag(1/μ) J ───────
+    let mut fisher = lm::FlatMatrix::zeros(n_free, n_free);
+    for (i, &mu_i) in y_model.iter().enumerate() {
+        let mu_inv = 1.0 / mu_i.max(1e-30);
+        for a in 0..n_free {
+            let ja = jac.get(i, a);
+            for b in 0..=a {
+                let jb = jac.get(i, b);
+                *fisher.get_mut(a, b) += ja * jb * mu_inv;
+                if a != b {
+                    *fisher.get_mut(b, a) += ja * jb * mu_inv;
+                }
+            }
+        }
+    }
+
+    Ok(ModelJacobianResult {
+        jacobian: jac,
+        fisher,
+        model_prediction: y_model,
+        param_names,
     })
 }
 
@@ -1448,6 +1953,18 @@ pub struct SpectrumFitResult {
     /// Transmission LM uses `[BackA, BackB, BackC]`.
     /// Counts KL background uses `[b0, b1, alpha_2]`.
     pub background: [f64; 3],
+    /// Fitted exponential background amplitude (SAMMY BackD).
+    /// Zero when the exponential tail is not fitted.
+    pub back_d: f64,
+    /// Fitted exponential background decay constant (SAMMY BackF).
+    /// Zero when the exponential tail is not fitted.
+    pub back_f: f64,
+    /// Fitted TOF offset in microseconds (SAMMY TZERO t₀).
+    /// `None` when energy-scale fitting is not enabled.
+    pub t0_us: Option<f64>,
+    /// Fitted flight-path scale factor (SAMMY TZERO L₀, dimensionless).
+    /// `None` when energy-scale fitting is not enabled.
+    pub l_scale: Option<f64>,
 }
 
 #[cfg(test)]
@@ -2515,5 +3032,120 @@ mod tests {
             .as_ref()
             .expect("LM should still return uncertainties");
         assert!(unc[0].is_finite() && unc[0] > 0.0);
+    }
+
+    // ── Energy-scale fitting tests ──
+
+    /// fit_energy_scale + fit_temperature must be rejected.
+    #[test]
+    fn test_energy_scale_rejects_temperature() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..101).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let (t_obs, sigma) = synthetic_transmission(&data, 0.002, &energies);
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            293.6,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(Default::default()))
+        .with_fit_temperature(true)
+        .with_energy_scale(0.0, 1.0, 25.0);
+
+        let input = InputData::Transmission {
+            transmission: t_obs,
+            uncertainty: sigma,
+        };
+        let err = fit_spectrum_typed(&input, &config);
+        assert!(err.is_err(), "energy_scale + temperature should fail");
+        let msg = err.unwrap_err().to_string();
+        assert!(
+            msg.contains("fit_energy_scale") && msg.contains("fit_temperature"),
+            "error should mention both flags: {msg}"
+        );
+    }
+
+    /// Energy-scale fitting returns t0_us and l_scale in the result.
+    #[test]
+    fn test_energy_scale_returns_fitted_params() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
+        let (t_obs, sigma) = synthetic_transmission(&data, 0.002, &energies);
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            293.6,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(Default::default()))
+        .with_transmission_background(BackgroundConfig::default())
+        .with_energy_scale(0.0, 1.0, 25.0);
+
+        let input = InputData::Transmission {
+            transmission: t_obs,
+            uncertainty: sigma,
+        };
+        let result = fit_spectrum_typed(&input, &config).unwrap();
+        assert!(result.converged, "Fit should converge");
+        assert!(
+            result.t0_us.is_some(),
+            "t0_us should be Some when energy-scale is fitted"
+        );
+        assert!(
+            result.l_scale.is_some(),
+            "l_scale should be Some when energy-scale is fitted"
+        );
+        let t0 = result.t0_us.unwrap();
+        let ls = result.l_scale.unwrap();
+        // Values should be finite (not NaN/Inf) and within bounds
+        assert!(t0.is_finite(), "t0 should be finite, got {t0}");
+        assert!(ls.is_finite(), "l_scale should be finite, got {ls}");
+        assert!(t0.abs() < 10.0, "t0 should be within bounds, got {t0}");
+        assert!(
+            ls > 0.98 && ls < 1.02,
+            "l_scale should be within bounds, got {ls}"
+        );
+    }
+
+    /// Without energy-scale fitting, t0_us and l_scale should be None.
+    #[test]
+    fn test_no_energy_scale_returns_none() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
+        let (t_obs, sigma) = synthetic_transmission(&data, 0.002, &energies);
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            293.6,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(Default::default()))
+        .with_transmission_background(BackgroundConfig::default());
+
+        let input = InputData::Transmission {
+            transmission: t_obs,
+            uncertainty: sigma,
+        };
+        let result = fit_spectrum_typed(&input, &config).unwrap();
+        assert!(
+            result.t0_us.is_none(),
+            "t0_us should be None without energy-scale"
+        );
+        assert!(
+            result.l_scale.is_none(),
+            "l_scale should be None without energy-scale"
+        );
     }
 }

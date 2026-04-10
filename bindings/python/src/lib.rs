@@ -401,6 +401,18 @@ struct PyFitResult {
     /// Transmission LM uses `[BackA, BackB, BackC]`.
     /// Counts KL background uses `[b0, b1, alpha_2]`.
     background: [f64; 3],
+    /// Fitted exponential background amplitude (SAMMY BackD).
+    /// Zero when exponential tail is not fitted.
+    back_d: f64,
+    /// Fitted exponential background decay constant (SAMMY BackF).
+    /// Zero when exponential tail is not fitted.
+    back_f: f64,
+    /// Fitted TOF offset in microseconds (SAMMY TZERO t₀).
+    /// None when energy-scale fitting is not enabled.
+    t0_us: Option<f64>,
+    /// Fitted flight-path scale factor (SAMMY TZERO L₀, dimensionless).
+    /// None when energy-scale fitting is not enabled.
+    l_scale: Option<f64>,
 }
 
 #[pymethods]
@@ -467,6 +479,34 @@ impl PyFitResult {
     #[getter]
     fn background(&self) -> [f64; 3] {
         self.background
+    }
+
+    /// Fitted exponential background amplitude (SAMMY BackD).
+    /// Zero when exponential tail is not fitted.
+    #[getter]
+    fn back_d(&self) -> f64 {
+        self.back_d
+    }
+
+    /// Fitted exponential background decay constant (SAMMY BackF).
+    /// Zero when exponential tail is not fitted.
+    #[getter]
+    fn back_f(&self) -> f64 {
+        self.back_f
+    }
+
+    /// Fitted TOF offset in microseconds (SAMMY TZERO t₀).
+    /// None when energy-scale fitting is not enabled.
+    #[getter]
+    fn t0_us(&self) -> Option<f64> {
+        self.t0_us
+    }
+
+    /// Fitted flight-path scale factor (SAMMY TZERO L₀).
+    /// None when energy-scale fitting is not enabled.
+    #[getter]
+    fn l_scale(&self) -> Option<f64> {
+        self.l_scale
     }
 
     fn __repr__(&self) -> String {
@@ -2338,6 +2378,8 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_spatial_map_typed, m)?)?;
     m.add_function(wrap_pyfunction!(py_fit_spectrum_typed, m)?)?;
     m.add_function(wrap_pyfunction!(py_fit_counts_spectrum_typed, m)?)?;
+    m.add_class::<PyModelJacobianResult>()?;
+    m.add_function(wrap_pyfunction!(py_compute_model_jacobian, m)?)?;
     Ok(())
 }
 
@@ -2912,6 +2954,10 @@ fn py_spatial_map_typed<'py>(
     max_iter = 200,
     solver = "auto",
     background = false,
+    fit_back_d = false,
+    fit_back_f = false,
+    back_d_init = 0.01,
+    back_f_init = 1.0,
     detector_background = None,
     fit_alpha_1 = false,
     fit_alpha_2 = false,
@@ -2935,6 +2981,10 @@ fn py_fit_counts_spectrum_typed<'py>(
     max_iter: usize,
     solver: &str,
     background: bool,
+    fit_back_d: bool,
+    fit_back_f: bool,
+    back_d_init: f64,
+    back_f_init: f64,
     detector_background: Option<PyReadonlyArray1<'py, f64>>,
     fit_alpha_1: bool,
     fit_alpha_2: bool,
@@ -3050,8 +3100,12 @@ fn py_fit_counts_spectrum_typed<'py>(
         config = config.with_fit_temperature(true);
     }
     if background {
-        config = config
-            .with_transmission_background(nereids_pipeline::pipeline::BackgroundConfig::default());
+        let mut bg = nereids_pipeline::pipeline::BackgroundConfig::default();
+        bg.fit_back_d = fit_back_d;
+        bg.fit_back_f = fit_back_f;
+        bg.back_d_init = back_d_init;
+        bg.back_f_init = back_f_init;
+        config = config.with_transmission_background(bg);
     }
     if fit_alpha_1 || fit_alpha_2 || alpha_1_init != 1.0 || alpha_2_init != 1.0 {
         config = config.with_counts_background(CountsBackgroundConfig {
@@ -3088,6 +3142,253 @@ fn py_fit_counts_spectrum_typed<'py>(
         temperature_k_unc: result.temperature_k_unc,
         anorm: result.anorm,
         background: result.background,
+        back_d: result.back_d,
+        back_f: result.back_f,
+        t0_us: result.t0_us,
+        l_scale: result.l_scale,
+    })
+}
+
+// ── Research: exact Jacobian/Fisher at arbitrary parameters ──────────────
+
+/// Result of exact Jacobian/Fisher evaluation from the Rust engine.
+#[pyclass(name = "ModelJacobianResult")]
+struct PyModelJacobianResult {
+    jacobian_data: Vec<f64>,
+    jacobian_nrows: usize,
+    jacobian_ncols: usize,
+    fisher_data: Vec<f64>,
+    fisher_n: usize,
+    model_prediction: Vec<f64>,
+    param_names: Vec<String>,
+}
+
+#[pymethods]
+impl PyModelJacobianResult {
+    /// Analytical Jacobian J (n_energy × n_free_params), row-major.
+    #[getter]
+    fn jacobian<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
+        let shape = [self.jacobian_nrows, self.jacobian_ncols];
+        let arr =
+            ndarray::Array2::from_shape_vec(shape, self.jacobian_data.clone()).expect("shape ok");
+        PyArray2::from_owned_array(py, arr)
+    }
+
+    /// Expected Poisson Fisher F = Jᵀ diag(1/μ) J (n_free × n_free).
+    #[getter]
+    fn fisher<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
+        let shape = [self.fisher_n, self.fisher_n];
+        let arr =
+            ndarray::Array2::from_shape_vec(shape, self.fisher_data.clone()).expect("shape ok");
+        PyArray2::from_owned_array(py, arr)
+    }
+
+    /// Model prediction μ(E) at the evaluation point.
+    #[getter]
+    fn model_prediction<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        numpy::PyArray1::from_vec(py, self.model_prediction.clone())
+    }
+
+    /// Names of free parameters in Jacobian column order.
+    #[getter]
+    fn param_names(&self) -> Vec<String> {
+        self.param_names.clone()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "ModelJacobianResult(n_data={}, n_free={}, params={:?})",
+            self.jacobian_nrows, self.jacobian_ncols, self.param_names
+        )
+    }
+}
+
+/// Compute the exact resolved analytical Jacobian and expected Fisher at given
+/// parameter values.
+///
+/// Uses the same model construction as ``fit_counts_spectrum_typed()`` but does
+/// **not** optimise — evaluates once at the provided densities/temperature and
+/// returns the exact Jacobian and Fisher from the Rust engine.
+///
+/// This is a research-oriented function for Fisher-based regularisation studies.
+///
+/// Either ``isotopes`` or ``groups`` must be provided, but not both.
+/// When ``groups`` is provided, each group maps to one density parameter
+/// (same semantics as ``fit_counts_spectrum_typed``).
+///
+/// Args:
+///     open_beam_counts: Incident flux Φ(E) (1D array, length n_energy).
+///     energies: Energy grid in eV (1D array, sorted ascending).
+///     isotopes: List of (ResonanceData, density_at_eval_point) tuples.
+///     temperature_k: Temperature at which to evaluate (default 293.6 K).
+///     fit_temperature: If True, include temperature as a free parameter
+///         in the Jacobian.
+///     flight_path_m, delta_t_us, delta_l_m: Gaussian resolution parameters.
+///     resolution: Tabulated resolution object.
+///     detector_background: Detector background B(E) for counts background model.
+///     fit_alpha_1: If True, include signal scale α₁ as free parameter.
+///     fit_alpha_2: If True, include background scale α₂ as free parameter.
+///     alpha_1: Signal scale evaluation value (default 1.0).
+///     alpha_2: Background scale evaluation value (default 1.0).
+///     groups: List of IsotopeGroup objects (mutually exclusive with isotopes).
+///     initial_densities: Initial/evaluation densities when using groups.
+///
+/// Returns:
+///     ModelJacobianResult with jacobian, fisher, model_prediction, param_names.
+#[pyfunction]
+#[pyo3(name = "compute_model_jacobian", signature = (
+    open_beam_counts, energies, isotopes=None, *,
+    temperature_k = 293.6,
+    fit_temperature = false,
+    flight_path_m = None,
+    delta_t_us = None,
+    delta_l_m = None,
+    resolution = None,
+    detector_background = None,
+    fit_alpha_1 = false,
+    fit_alpha_2 = false,
+    alpha_1 = 1.0,
+    alpha_2 = 1.0,
+    groups = None,
+    initial_densities = None,
+))]
+fn py_compute_model_jacobian<'py>(
+    py: Python<'py>,
+    open_beam_counts: PyReadonlyArray1<'py, f64>,
+    energies: PyReadonlyArray1<'py, f64>,
+    isotopes: Option<Vec<(PyResonanceData, f64)>>,
+    temperature_k: f64,
+    fit_temperature: bool,
+    flight_path_m: Option<f64>,
+    delta_t_us: Option<f64>,
+    delta_l_m: Option<f64>,
+    resolution: Option<PyTabulatedResolution>,
+    detector_background: Option<PyReadonlyArray1<'py, f64>>,
+    fit_alpha_1: bool,
+    fit_alpha_2: bool,
+    alpha_1: f64,
+    alpha_2: f64,
+    groups: Option<Vec<PyIsotopeGroup>>,
+    initial_densities: Option<Vec<f64>>,
+) -> PyResult<PyModelJacobianResult> {
+    use nereids_pipeline::pipeline::{CountsBackgroundConfig, evaluate_jacobian_and_fisher};
+
+    let has_isotopes = isotopes.is_some();
+    let has_groups = groups.is_some();
+    if has_isotopes && has_groups {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Provide either 'isotopes' or 'groups', not both.",
+        ));
+    }
+    if !has_isotopes && !has_groups {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Must provide either 'isotopes' or 'groups'.",
+        ));
+    }
+
+    let ob_slice = open_beam_counts.as_slice()?;
+    let e_slice = energies.as_slice()?;
+    require_non_empty_energy_grid(e_slice)?;
+
+    if ob_slice.len() != e_slice.len() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "open_beam_counts length ({}) must match energies length ({})",
+            ob_slice.len(),
+            e_slice.len(),
+        )));
+    }
+
+    if fit_alpha_2 && detector_background.is_none() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "fit_alpha_2 requires detector_background to be provided",
+        ));
+    }
+
+    let det_bg_vec = if let Some(ref bg) = detector_background {
+        let bg_s = bg.as_slice()?;
+        if bg_s.len() != e_slice.len() {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "detector_background length ({}) must match energies length ({})",
+                bg_s.len(),
+                e_slice.len(),
+            )));
+        }
+        bg_s.to_vec()
+    } else {
+        vec![0.0; e_slice.len()]
+    };
+
+    let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution, None)?;
+    let energies_vec = e_slice.to_vec();
+
+    let mut config = if let Some(isotopes) = isotopes {
+        let iso_names: Vec<String> = isotopes
+            .iter()
+            .map(|(d, _)| {
+                let sym =
+                    nereids_core::elements::element_symbol(d.inner.isotope.z()).unwrap_or("?");
+                format!("{}-{}", sym, d.inner.isotope.a())
+            })
+            .collect();
+        let init_densities: Vec<f64> = isotopes.iter().map(|(_, d)| *d).collect();
+        let resonance_data: Vec<ResonanceData> = isotopes
+            .into_iter()
+            .map(|(d, _)| Arc::unwrap_or_clone(d.inner))
+            .collect();
+
+        UnifiedFitConfig::new(
+            energies_vec,
+            resonance_data,
+            iso_names,
+            temperature_k,
+            res_fn,
+            init_densities,
+        )
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?
+    } else {
+        let groups = groups.unwrap();
+        if groups.is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "groups list must not be empty",
+            ));
+        }
+        build_config_from_groups(
+            &groups,
+            energies_vec,
+            temperature_k,
+            res_fn,
+            initial_densities,
+        )?
+    };
+
+    if fit_temperature {
+        config = config.with_fit_temperature(true);
+    }
+    if fit_alpha_1 || fit_alpha_2 || alpha_1 != 1.0 || alpha_2 != 1.0 {
+        config = config.with_counts_background(CountsBackgroundConfig {
+            alpha_1_init: alpha_1,
+            alpha_2_init: alpha_2,
+            fit_alpha_1,
+            fit_alpha_2,
+        });
+    }
+
+    let flux = ob_slice.to_vec();
+    let background = det_bg_vec;
+
+    let result = py.detach(move || {
+        evaluate_jacobian_and_fisher(&config, &flux, &background).map_err(|e| e.to_string())
+    });
+    let result = result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+
+    Ok(PyModelJacobianResult {
+        jacobian_data: result.jacobian.data,
+        jacobian_nrows: result.jacobian.nrows,
+        jacobian_ncols: result.jacobian.ncols,
+        fisher_data: result.fisher.data,
+        fisher_n: result.fisher.nrows,
+        model_prediction: result.model_prediction,
+        param_names: result.param_names,
     })
 }
 
@@ -3122,6 +3423,14 @@ fn py_fit_counts_spectrum_typed<'py>(
     max_iter = 200,
     solver = "lm",
     background = false,
+    fit_back_d = false,
+    fit_back_f = false,
+    back_d_init = 0.01,
+    back_f_init = 1.0,
+    fit_energy_scale = false,
+    t0_init_us = 0.0,
+    l_scale_init = 1.0,
+    energy_scale_flight_path_m = 25.0,
     resolution = None,
     flight_path_m = None,
     delta_t_us = None,
@@ -3140,6 +3449,14 @@ fn py_fit_spectrum_typed<'py>(
     max_iter: usize,
     solver: &str,
     background: bool,
+    fit_back_d: bool,
+    fit_back_f: bool,
+    back_d_init: f64,
+    back_f_init: f64,
+    fit_energy_scale: bool,
+    t0_init_us: f64,
+    l_scale_init: f64,
+    energy_scale_flight_path_m: f64,
     resolution: Option<PyTabulatedResolution>,
     flight_path_m: Option<f64>,
     delta_t_us: Option<f64>,
@@ -3241,8 +3558,17 @@ fn py_fit_spectrum_typed<'py>(
 
     // Background
     if background {
-        config = config
-            .with_transmission_background(nereids_pipeline::pipeline::BackgroundConfig::default());
+        let mut bg = nereids_pipeline::pipeline::BackgroundConfig::default();
+        bg.fit_back_d = fit_back_d;
+        bg.fit_back_f = fit_back_f;
+        bg.back_d_init = back_d_init;
+        bg.back_f_init = back_f_init;
+        config = config.with_transmission_background(bg);
+    }
+
+    // Energy-scale calibration (SAMMY TZERO equivalent)
+    if fit_energy_scale {
+        config = config.with_energy_scale(t0_init_us, l_scale_init, energy_scale_flight_path_m);
     }
 
     // Build 1D InputData
@@ -3266,5 +3592,9 @@ fn py_fit_spectrum_typed<'py>(
         temperature_k_unc: result.temperature_k_unc,
         anorm: result.anorm,
         background: result.background,
+        back_d: result.back_d,
+        back_f: result.back_f,
+        t0_us: result.t0_us,
+        l_scale: result.l_scale,
     })
 }

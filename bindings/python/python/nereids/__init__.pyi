@@ -139,6 +139,16 @@ class FitResult:
         """Fitted background parameters (BackA, BackB, BackC)."""
         ...
 
+    @property
+    def back_d(self) -> float:
+        """Fitted exponential background amplitude (SAMMY BackD). Zero when not fitted."""
+        ...
+
+    @property
+    def back_f(self) -> float:
+        """Fitted exponential background decay constant (SAMMY BackF). Zero when not fitted."""
+        ...
+
 class CalibrationResult:
     """Result of energy axis calibration."""
 
@@ -730,6 +740,10 @@ def fit_spectrum_typed(
     max_iter: int = 200,
     solver: str = "lm",
     background: bool = False,
+    fit_back_d: bool = False,
+    fit_back_f: bool = False,
+    back_d_init: float = 0.01,
+    back_f_init: float = 1.0,
     resolution: TabulatedResolution | None = None,
     flight_path_m: float | None = None,
     delta_t_us: float | None = None,
@@ -773,6 +787,10 @@ def fit_counts_spectrum_typed(
     max_iter: int = 200,
     solver: str = "auto",
     background: bool = False,
+    fit_back_d: bool = False,
+    fit_back_f: bool = False,
+    back_d_init: float = 0.01,
+    back_f_init: float = 1.0,
     detector_background: NDArray[np.float64] | None = None,
     fit_alpha_1: bool = False,
     fit_alpha_2: bool = False,
@@ -814,5 +832,59 @@ def fit_counts_spectrum_typed(
         resolution: Optional resolution function.
         groups: List of IsotopeGroup objects (mutually exclusive with isotopes).
         initial_densities: Initial density guesses when using groups.
+    """
+    ...
+
+class ModelJacobianResult:
+    """Result of exact Jacobian/Fisher evaluation from the Rust engine."""
+
+    @property
+    def jacobian(self) -> NDArray[np.float64]:
+        """Analytical Jacobian (n_energy × n_free_params), row-major."""
+        ...
+
+    @property
+    def fisher(self) -> NDArray[np.float64]:
+        """Expected Poisson Fisher F = J^T diag(1/μ) J (n_free × n_free)."""
+        ...
+
+    @property
+    def model_prediction(self) -> NDArray[np.float64]:
+        """Model prediction μ(E) at the evaluation point."""
+        ...
+
+    @property
+    def param_names(self) -> list[str]:
+        """Names of free parameters in Jacobian column order."""
+        ...
+
+def compute_model_jacobian(
+    open_beam_counts: NDArray[np.float64],
+    energies: NDArray[np.float64],
+    isotopes: list[tuple[ResonanceData, float]] | None = None,
+    *,
+    temperature_k: float = 293.6,
+    fit_temperature: bool = False,
+    flight_path_m: float | None = None,
+    delta_t_us: float | None = None,
+    delta_l_m: float | None = None,
+    resolution: TabulatedResolution | None = None,
+    detector_background: NDArray[np.float64] | None = None,
+    fit_alpha_1: bool = False,
+    fit_alpha_2: bool = False,
+    alpha_1: float = 1.0,
+    alpha_2: float = 1.0,
+    groups: list[IsotopeGroup] | None = None,
+    initial_densities: list[float] | None = None,
+) -> ModelJacobianResult:
+    """Compute exact resolved analytical Jacobian and expected Fisher.
+
+    Uses the same model construction as ``fit_counts_spectrum_typed()`` but
+    evaluates at the given parameter values without optimising.
+
+    Either ``isotopes`` or ``groups`` must be provided, but not both.
+    When ``groups`` is provided, each group maps to one density parameter.
+
+    Research-oriented function for Fisher-based regularisation studies.
     """
     ...
