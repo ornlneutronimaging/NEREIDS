@@ -1335,7 +1335,7 @@ fn fit_counts_poisson(
         }
     };
 
-    // Compute Pearson chi-squared for display
+    // Pearson chi-squared for counts domain: Σ (obs - model)² / model
     let chi_sq: f64 = sample_counts
         .iter()
         .zip(y_model.iter())
