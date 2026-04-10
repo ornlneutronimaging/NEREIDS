@@ -2958,6 +2958,10 @@ fn py_spatial_map_typed<'py>(
     fit_back_f = false,
     back_d_init = 0.01,
     back_f_init = 1.0,
+    fit_energy_scale = false,
+    t0_init_us = 0.0,
+    l_scale_init = 1.0,
+    energy_scale_flight_path_m = 25.0,
     detector_background = None,
     fit_alpha_1 = false,
     fit_alpha_2 = false,
@@ -2985,6 +2989,10 @@ fn py_fit_counts_spectrum_typed<'py>(
     fit_back_f: bool,
     back_d_init: f64,
     back_f_init: f64,
+    fit_energy_scale: bool,
+    t0_init_us: f64,
+    l_scale_init: f64,
+    energy_scale_flight_path_m: f64,
     detector_background: Option<PyReadonlyArray1<'py, f64>>,
     fit_alpha_1: bool,
     fit_alpha_2: bool,
@@ -3106,6 +3114,9 @@ fn py_fit_counts_spectrum_typed<'py>(
         bg.back_d_init = back_d_init;
         bg.back_f_init = back_f_init;
         config = config.with_transmission_background(bg);
+    }
+    if fit_energy_scale {
+        config = config.with_energy_scale(t0_init_us, l_scale_init, energy_scale_flight_path_m);
     }
     if fit_alpha_1 || fit_alpha_2 || alpha_1_init != 1.0 || alpha_2_init != 1.0 {
         config = config.with_counts_background(CountsBackgroundConfig {
