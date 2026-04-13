@@ -338,6 +338,384 @@ fn deviance_curvature(s: f64, o: f64, t: f64, c: f64) -> f64 {
     2.0 * n * c / (t_safe * one_plus_ct * one_plus_ct)
 }
 
+// ======================================================================
+// joint_poisson_fit — two-stage solver (damped Fisher + Nelder-Mead polish)
+// ======================================================================
+
+use crate::lm::{invert_matrix, solve_damped_system};
+use crate::nelder_mead::{NelderMeadConfig, nelder_mead_minimize};
+
+/// Configuration for [`joint_poisson_fit`].
+#[derive(Debug, Clone)]
+pub struct JointPoissonFitConfig {
+    /// Maximum number of damped-Fisher iterations in stage 1.
+    pub max_iter: usize,
+    /// Initial damping factor (Marquardt λ) on the Fisher matrix diagonal.
+    pub lambda_init: f64,
+    /// Multiplicative factor to increase λ on a rejected step.
+    pub lambda_up: f64,
+    /// Multiplicative factor to decrease λ on an accepted step.
+    pub lambda_down: f64,
+    /// Armijo sufficient-decrease coefficient.
+    pub armijo_c: f64,
+    /// Backtracking factor during line search.
+    pub backtrack: f64,
+    /// Convergence tolerance on relative deviance change.
+    pub tol_d: f64,
+    /// Convergence tolerance on normalized parameter step.
+    pub tol_param: f64,
+    /// Finite-difference step for gradient fallback.
+    pub fd_step: f64,
+    /// Enable Nelder-Mead polish after stage 1 (memo 35 §P2.1).
+    ///
+    /// Default `true`.  Set to `false` only when the caller has external
+    /// evidence that the stage-1 minimum is global for the current regime
+    /// (e.g., a no-background fit with a known convex likelihood).
+    pub enable_polish: bool,
+    /// Polish (Nelder-Mead) configuration.  Used only when
+    /// `enable_polish == true`.  Defaults match memo 35 §P2.1 tolerances.
+    pub polish: NelderMeadConfig,
+    /// Compute and return the Fisher covariance and parameter uncertainties.
+    pub compute_covariance: bool,
+}
+
+impl Default for JointPoissonFitConfig {
+    fn default() -> Self {
+        Self {
+            max_iter: 200,
+            lambda_init: 1e-3,
+            lambda_up: 10.0,
+            lambda_down: 0.1,
+            armijo_c: 1e-4,
+            backtrack: 0.5,
+            tol_d: 1e-8,
+            tol_param: 1e-8,
+            fd_step: 1e-6,
+            enable_polish: true,
+            polish: NelderMeadConfig {
+                // EG5 used scipy's xatol=1e-9, fatol=1e-10 for the polish
+                // regime.  Match that here.
+                xatol: 1e-9,
+                fatol: 1e-10,
+                max_iter: 5000,
+                initial_step_frac: 0.02,
+                initial_step_abs: 1e-4,
+            },
+            compute_covariance: true,
+        }
+    }
+}
+
+/// Outcome of [`joint_poisson_fit`].
+#[derive(Debug, Clone)]
+pub struct JointPoissonResult {
+    /// Final deviance D at the fitted parameters.
+    pub deviance: f64,
+    /// D / (n − k).  Primary GOF statistic per memo 35 §P1.2.
+    pub deviance_per_dof: f64,
+    /// Number of data bins (n).
+    pub n_data: usize,
+    /// Number of free parameters (k).
+    pub n_free: usize,
+    /// Iterations performed in the damped-Fisher stage.
+    pub gn_iterations: usize,
+    /// Iterations performed by the Nelder-Mead polish stage (0 if disabled).
+    pub polish_iterations: usize,
+    /// `true` when the stage-1 (damped Fisher) optimizer met its `tol_d`
+    /// and `tol_param` criteria before hitting `max_iter`.
+    pub gn_converged: bool,
+    /// `true` when the Nelder-Mead polish met `xatol` and `fatol` before
+    /// `max_iter` (always `false` if `enable_polish == false`).
+    pub polish_converged: bool,
+    /// `true` when the polish step lowered the deviance below the stage-1
+    /// best value.  Useful diagnostic — if polish improved D materially,
+    /// stage 1 likely stalled.
+    pub polish_improved: bool,
+    /// Final parameter values (all parameters, including fixed).
+    pub params: Vec<f64>,
+    /// Inverse Fisher covariance of free parameters (n_free × n_free),
+    /// computed at the final θ.  `None` if the Fisher matrix was singular
+    /// or `compute_covariance == false`.
+    pub covariance: Option<FlatMatrix>,
+    /// `√diag(covariance)` for each free parameter, in free-index order.
+    pub uncertainties: Option<Vec<f64>>,
+}
+
+/// Two-stage joint-Poisson fit: damped Fisher stage followed by
+/// Nelder-Mead polish.
+///
+/// **Memo 35 §P1 + §P2 requirements** this function satisfies:
+///
+/// - Minimizes the **conditional binomial deviance** `D(θ)`
+///   ([`JointPoissonObjective::deviance`]), not fixed-flux Poisson NLL.
+/// - Reports `D / (n − k)` as the primary GOF (P1.2).
+/// - Honours an **explicit `c = Q_s/Q_ob`** stored in the objective (P1.3).
+/// - Runs Nelder-Mead **polish** after the gradient stage to escape the
+///   EG2-S1 C_full initial-point stall (P2.1).
+/// - Exposes `gn_converged` and `polish_converged` separately so callers
+///   do not rely on a single "success" flag — acceptance is meant to come
+///   from the deviance value (P2.3).
+///
+/// The damped-Fisher stage uses LM-style acceptance: a step is accepted if
+/// it satisfies an Armijo condition on D; on rejection, λ is increased and
+/// the step is recomputed.  Bounds are enforced via projection (clamp).
+pub fn joint_poisson_fit(
+    objective: &JointPoissonObjective<'_>,
+    params: &mut ParameterSet,
+    config: &JointPoissonFitConfig,
+) -> Result<JointPoissonResult, FittingError> {
+    let n_data = objective.n_data();
+    if n_data == 0 {
+        return Err(FittingError::EmptyData);
+    }
+
+    // Stage 1: damped Fisher with Armijo backtracking.
+    let stage1 = damped_fisher_stage(objective, params, config)?;
+
+    // Capture stage-1 best.
+    let best_d_stage1 = stage1.deviance;
+    let gn_iterations = stage1.iterations;
+    let gn_converged = stage1.converged;
+
+    // Stage 2: Nelder-Mead polish on free parameters, seeded from stage-1 θ.
+    let mut polish_iterations = 0usize;
+    let mut polish_converged = false;
+    let mut polish_improved = false;
+    if config.enable_polish {
+        let free_idx = params.free_indices();
+        let bounds: Vec<(f64, f64)> = free_idx
+            .iter()
+            .map(|&i| (params.params[i].lower, params.params[i].upper))
+            .collect();
+        let x0: Vec<f64> = free_idx.iter().map(|&i| params.params[i].value).collect();
+
+        // Snapshot fixed parameters so the closure can rebuild the full
+        // parameter vector for each evaluation.
+        let all_values_snapshot = params.all_values();
+
+        let obj_closure = |x: &[f64]| -> Result<f64, FittingError> {
+            let mut all = all_values_snapshot.clone();
+            for (j, &idx) in free_idx.iter().enumerate() {
+                all[idx] = x[j];
+            }
+            objective.deviance(&all)
+        };
+        let nm = nelder_mead_minimize(obj_closure, &x0, Some(&bounds), &config.polish)?;
+        polish_iterations = nm.iterations;
+        polish_converged = nm.self_converged;
+        if nm.fun < best_d_stage1 {
+            polish_improved = true;
+            // Commit polish result to the parameter set.
+            for (j, &idx) in free_idx.iter().enumerate() {
+                params.params[idx].value = nm.x[j];
+                params.params[idx].clamp();
+            }
+        }
+    }
+
+    let final_values = params.all_values();
+    let final_deviance = objective.deviance(&final_values)?;
+    let n_free = params.n_free();
+    let dof = (n_data as isize - n_free as isize).max(1) as f64;
+    let deviance_per_dof = final_deviance / dof;
+
+    // Covariance from inverse Fisher at the final θ.
+    let (covariance, uncertainties) = if config.compute_covariance {
+        let free_idx = params.free_indices();
+        match objective.fisher_information(&final_values, &free_idx)? {
+            Some(info) => match invert_matrix(&info) {
+                Some(cov) => {
+                    let u: Vec<f64> = (0..cov.nrows)
+                        .map(|i| {
+                            let v = cov.get(i, i);
+                            if v > 0.0 { v.sqrt() } else { f64::NAN }
+                        })
+                        .collect();
+                    (Some(cov), Some(u))
+                }
+                None => (None, None),
+            },
+            None => (None, None),
+        }
+    } else {
+        (None, None)
+    };
+
+    Ok(JointPoissonResult {
+        deviance: final_deviance,
+        deviance_per_dof,
+        n_data,
+        n_free,
+        gn_iterations,
+        polish_iterations,
+        gn_converged,
+        polish_converged,
+        polish_improved,
+        params: final_values,
+        covariance,
+        uncertainties,
+    })
+}
+
+/// Stage 1 output.
+struct Stage1Output {
+    deviance: f64,
+    iterations: usize,
+    converged: bool,
+}
+
+/// Damped-Fisher stage (Gauss-Newton / Marquardt on the deviance).
+///
+/// Mirrors the structure of `lm.rs` but on the joint-Poisson objective.
+/// Falls back to finite-difference gradient when the model has no
+/// analytical Jacobian.
+fn damped_fisher_stage(
+    objective: &JointPoissonObjective<'_>,
+    params: &mut ParameterSet,
+    config: &JointPoissonFitConfig,
+) -> Result<Stage1Output, FittingError> {
+    let mut lambda = config.lambda_init;
+    let mut iter = 0usize;
+    let mut converged = false;
+
+    let mut all_vals = params.all_values();
+    let mut d_current = objective.deviance(&all_vals)?;
+
+    while iter < config.max_iter {
+        iter += 1;
+        let free_idx = params.free_indices();
+        let n_free = free_idx.len();
+        if n_free == 0 {
+            converged = true;
+            break;
+        }
+
+        // Gradient (analytical if available, FD otherwise).
+        let grad = match objective.deviance_gradient_analytical(&all_vals, &free_idx)? {
+            Some(g) => g,
+            None => objective.deviance_gradient_fd(params, config.fd_step)?,
+        };
+        // Fisher information (Gauss-Newton curvature).  If absent, use a
+        // diagonal identity fallback scaled by gradient magnitude — this
+        // degenerates the stage into projected gradient descent, which is
+        // exactly how `poisson.rs` behaves in the FD regime.
+        let info = match objective.fisher_information(&all_vals, &free_idx)? {
+            Some(m) => m,
+            None => {
+                let mut ident = FlatMatrix::zeros(n_free, n_free);
+                for i in 0..n_free {
+                    *ident.get_mut(i, i) = 1.0;
+                }
+                ident
+            }
+        };
+        // Solve (I + λ diag(I)) δ = -g.
+        let neg_grad: Vec<f64> = grad.iter().map(|&g| -g).collect();
+        let step = match solve_damped_system(&info, &neg_grad, lambda) {
+            Some(s) => s,
+            None => {
+                // Singular Fisher at current θ.  Increase damping and retry
+                // on the next iteration.
+                lambda *= config.lambda_up;
+                if lambda > 1e16 {
+                    break;
+                }
+                continue;
+            }
+        };
+
+        // Armijo line search with projection.
+        let grad_dot_step = grad
+            .iter()
+            .zip(step.iter())
+            .map(|(&g, &s)| g * s)
+            .sum::<f64>();
+        // If the step isn't a descent direction w.r.t. D, flip sign (fallback
+        // to negative gradient direction).
+        let effective_step: Vec<f64> = if grad_dot_step >= 0.0 {
+            grad.iter().map(|&g| -g).collect()
+        } else {
+            step
+        };
+
+        let mut alpha = 1.0;
+        let mut accepted = false;
+        let d0 = d_current;
+        let mut trial_vals = all_vals.clone();
+        for _ in 0..50 {
+            for (j, &idx) in free_idx.iter().enumerate() {
+                trial_vals[idx] = all_vals[idx] + alpha * effective_step[j];
+            }
+            // Project onto bounds.
+            for &idx in free_idx.iter() {
+                let lo = params.params[idx].lower;
+                let hi = params.params[idx].upper;
+                if trial_vals[idx] < lo {
+                    trial_vals[idx] = lo;
+                }
+                if trial_vals[idx] > hi {
+                    trial_vals[idx] = hi;
+                }
+            }
+            let d_trial = match objective.deviance(&trial_vals) {
+                Ok(v) if v.is_finite() => v,
+                _ => f64::INFINITY,
+            };
+            // Armijo condition: f(x+αp) ≤ f(x) + c·α·⟨g, p⟩ (descent).  When
+            // we flipped to -grad above, ⟨g, p⟩ = -||g||² < 0.
+            let gdotp = grad
+                .iter()
+                .zip(effective_step.iter())
+                .map(|(&g, &s)| g * s)
+                .sum::<f64>();
+            if d_trial <= d0 + config.armijo_c * alpha * gdotp {
+                accepted = true;
+                break;
+            }
+            alpha *= config.backtrack;
+            if alpha < 1e-16 {
+                break;
+            }
+        }
+
+        if accepted {
+            // Commit step.
+            for &idx in free_idx.iter() {
+                params.params[idx].value = trial_vals[idx];
+                params.params[idx].clamp();
+            }
+            let rel_change =
+                (d_current - objective.deviance(&trial_vals)?) / d_current.abs().max(1.0);
+            all_vals = params.all_values();
+            let new_d = objective.deviance(&all_vals)?;
+            let step_norm_sq = effective_step
+                .iter()
+                .map(|&s| (alpha * s).powi(2))
+                .sum::<f64>();
+            let step_norm = step_norm_sq.sqrt();
+            d_current = new_d;
+            lambda = (lambda * config.lambda_down).max(1e-16);
+
+            if rel_change.abs() < config.tol_d && step_norm < config.tol_param {
+                converged = true;
+                break;
+            }
+        } else {
+            // Rejected: increase damping and try again.
+            lambda *= config.lambda_up;
+            if lambda > 1e16 {
+                break;
+            }
+        }
+    }
+
+    Ok(Stage1Output {
+        deviance: d_current,
+        iterations: iter,
+        converged,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -771,5 +1149,335 @@ mod tests {
         // Determinant > 0 (rank-2 identifiable).
         let det = info.get(0, 0) * info.get(1, 1) - i01 * i10;
         assert!(det > 0.0, "Fisher matrix determinant = {det}");
+    }
+
+    // ==================================================================
+    // joint_poisson_fit — end-to-end integration tests
+    // ==================================================================
+
+    /// A wrapped transmission model: T_out = A_n · T_inner + B_A + B_B/√E + B_C·√E.
+    /// Models the full counts-path background structure of memo 35 §P2.2.
+    struct BackgroundedTransmission<'a> {
+        inner: &'a dyn FitModel,
+        energies: &'a [f64],
+        n_idx: usize,
+        a_idx: usize,
+        b_a_idx: usize,
+        b_b_idx: usize,
+        b_c_idx: usize,
+        n_params: usize,
+    }
+
+    impl<'a> FitModel for BackgroundedTransmission<'a> {
+        fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+            // Pass the "density" parameter to the inner model as its param 0.
+            let t_inner = self.inner.evaluate(&[params[self.n_idx]])?;
+            let a_n = params[self.a_idx];
+            let b_a = params[self.b_a_idx];
+            let b_b = params[self.b_b_idx];
+            let b_c = params[self.b_c_idx];
+            Ok(t_inner
+                .iter()
+                .zip(self.energies.iter())
+                .map(|(&t, &e)| {
+                    let inv_sqrt_e = if e > 0.0 { 1.0 / e.sqrt() } else { 0.0 };
+                    let sqrt_e = if e > 0.0 { e.sqrt() } else { 0.0 };
+                    a_n * t + b_a + b_b * inv_sqrt_e + b_c * sqrt_e
+                })
+                .collect())
+        }
+        // No analytical jacobian — forces the fitter onto FD fallback, which
+        // is the stress test (memo 35 §P2.1 notes FD + over-parameterization
+        // as the stall trigger).
+    }
+
+    /// Exponential-in-E model: T_inner = exp(−n · σ(E)), σ(E) = 1.
+    /// Effectively a single-parameter constant transmission when σ=1 flat.
+    /// Uses an energy-dependent "cross section" so Jacobian is identifiable.
+    struct ExpDecayModel<'a> {
+        sigma: &'a [f64],
+    }
+    impl<'a> FitModel for ExpDecayModel<'a> {
+        fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+            let n = params[0];
+            Ok(self
+                .sigma
+                .iter()
+                .map(|&s| (-n * s).exp().max(POISSON_EPSILON))
+                .collect())
+        }
+        fn analytical_jacobian(
+            &self,
+            _params: &[f64],
+            free_param_indices: &[usize],
+            y_current: &[f64],
+        ) -> Option<FlatMatrix> {
+            // ∂T/∂n = -σ · T
+            let n_e = y_current.len();
+            let n_free = free_param_indices.len();
+            let mut jac = FlatMatrix::zeros(n_e, n_free);
+            for (i, &y_i) in y_current.iter().enumerate() {
+                for (j, &pi) in free_param_indices.iter().enumerate() {
+                    *jac.get_mut(i, j) = if pi == 0 { -self.sigma[i] * y_i } else { 0.0 };
+                }
+            }
+            Some(jac)
+        }
+    }
+
+    /// Deterministic Poisson generator (Knuth for small λ, Gaussian for
+    /// large).  Duplicated from asymptote test so each test is self-contained.
+    struct Xorshift(u64);
+    impl Xorshift {
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn uniform(&mut self) -> f64 {
+            (self.next_u64() as f64) / (u64::MAX as f64)
+        }
+        fn poisson(&mut self, lambda: f64) -> f64 {
+            if lambda <= 0.0 {
+                return 0.0;
+            }
+            if lambda > 30.0 {
+                let u1 = self.uniform().max(1e-12);
+                let u2 = self.uniform();
+                let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+                return (lambda + z * lambda.sqrt()).round().max(0.0);
+            }
+            let l = (-lambda).exp();
+            let mut k: f64 = 0.0;
+            let mut p: f64 = 1.0;
+            loop {
+                k += 1.0;
+                let u = self.uniform();
+                p *= u;
+                if p <= l {
+                    return k - 1.0;
+                }
+                if k > 1000.0 {
+                    return k - 1.0;
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Matched-model single-parameter recovery at c = 5.98.
+    // This is the EG1 "proposed" cell in miniature — verify |bias| < 1%
+    // and D / (n − k) ∈ [0.85, 1.15] without needing the polish.
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_joint_poisson_fit_matched_model_single_param() {
+        // Energies 1..10, flat cross section σ = 1.  Truth n = 0.3.
+        let n_bins = 200;
+        let sigma = vec![1.0_f64; n_bins];
+        let model = ExpDecayModel { sigma: &sigma };
+        let n_true = 0.3_f64;
+        let c = 5.98;
+        let lam = 3000.0; // OB target ~500 counts/bin
+        let t_true = model.evaluate(&[n_true]).unwrap();
+
+        let mut rng = Xorshift(0x1234_5678_9ABC_DEF0);
+        let o: Vec<f64> = (0..n_bins).map(|_| rng.poisson(lam / c)).collect();
+        let s: Vec<f64> = (0..n_bins).map(|i| rng.poisson(lam * t_true[i])).collect();
+
+        let obj = JointPoissonObjective {
+            model: &model,
+            o: &o,
+            s: &s,
+            c,
+        };
+        let mut params = ParameterSet::new(vec![FitParameter::non_negative("n", 0.1)]);
+        let cfg = JointPoissonFitConfig {
+            enable_polish: true,
+            ..Default::default()
+        };
+        let result = joint_poisson_fit(&obj, &mut params, &cfg).unwrap();
+
+        let n_fit = result.params[0];
+        let rel_bias = (n_fit - n_true) / n_true;
+        assert!(
+            rel_bias.abs() < 0.01,
+            "density bias {rel_bias} exceeds 1% (n_fit={n_fit} n_true={n_true})"
+        );
+        assert!(
+            (0.85..=1.15).contains(&result.deviance_per_dof),
+            "D/(n-k) out of band: {}",
+            result.deviance_per_dof
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Polish-never-worsens invariant on a backgrounded fit.  Memo 35 §P2.1
+    // claims NM polish reduces D materially when stage-1 stalls.  At the
+    // unit-test scale we verify the testable invariant: enabling polish
+    // never produces a larger final D than disabling it on the same data.
+    //
+    // Note: on this over-parameterized (5-free-param) synthetic with only
+    // 150 bins, the deviance surface has multiple near-equal minima —
+    // exactly the identifiability ambiguity §P2.2 targets.  Density
+    // recovery under over-parameterization is therefore *not* a unit-test
+    // contract here; it is tested end-to-end with the single-parameter
+    // matched-model test above.
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_joint_poisson_fit_polish_does_not_worsen_deviance() {
+        let n_bins = 150;
+        let energies: Vec<f64> = (0..n_bins).map(|i| 1.0 + 0.5 * i as f64).collect();
+        let sigma: Vec<f64> = energies.iter().map(|&e| 1.0 / e).collect();
+        let inner = ExpDecayModel { sigma: &sigma };
+
+        // Truth: n = 0.3, A_n = 0.9, no additive bg.
+        let n_true = 0.3_f64;
+        let a_n_true = 0.9_f64;
+        let t_inner_true = inner.evaluate(&[n_true]).unwrap();
+        let t_true: Vec<f64> = t_inner_true.iter().map(|&t| a_n_true * t).collect();
+
+        let c = 5.98_f64;
+        let lam = 5000.0_f64;
+        let mut rng = Xorshift(0xF00D_FACE_DEAD_BEEF);
+        let o: Vec<f64> = (0..n_bins).map(|_| rng.poisson(lam / c)).collect();
+        let s: Vec<f64> = (0..n_bins).map(|i| rng.poisson(lam * t_true[i])).collect();
+
+        let bg_model = BackgroundedTransmission {
+            inner: &inner,
+            energies: &energies,
+            n_idx: 0,
+            a_idx: 1,
+            b_a_idx: 2,
+            b_b_idx: 3,
+            b_c_idx: 4,
+            n_params: 5,
+        };
+        let _ = bg_model.n_params; // silence dead-code warning
+
+        let obj = JointPoissonObjective {
+            model: &bg_model,
+            o: &o,
+            s: &s,
+            c,
+        };
+
+        // x0 analogous to EG2-S1 regime: n near truth, A_n = 1, all
+        // additive bg at 0, bg bounds tight to curb degeneracy.
+        let mk_params = || {
+            ParameterSet::new(vec![
+                FitParameter::non_negative("n", 0.25),
+                FitParameter::non_negative("A_n", 1.0),
+                FitParameter {
+                    name: "B_A".into(),
+                    value: 0.0,
+                    lower: -0.05,
+                    upper: 0.05,
+                    fixed: false,
+                },
+                FitParameter {
+                    name: "B_B".into(),
+                    value: 0.0,
+                    lower: -0.05,
+                    upper: 0.05,
+                    fixed: false,
+                },
+                FitParameter {
+                    name: "B_C".into(),
+                    value: 0.0,
+                    lower: -0.05,
+                    upper: 0.05,
+                    fixed: false,
+                },
+            ])
+        };
+
+        let mut params_no_polish = mk_params();
+        let cfg_no_polish = JointPoissonFitConfig {
+            enable_polish: false,
+            ..Default::default()
+        };
+        let r_no_polish = joint_poisson_fit(&obj, &mut params_no_polish, &cfg_no_polish).unwrap();
+
+        let mut params_polish = mk_params();
+        let cfg_polish = JointPoissonFitConfig {
+            enable_polish: true,
+            ..Default::default()
+        };
+        let r_polish = joint_poisson_fit(&obj, &mut params_polish, &cfg_polish).unwrap();
+
+        // Invariant: enabling polish must not increase final D.
+        assert!(
+            r_polish.deviance <= r_no_polish.deviance + 1e-6,
+            "polish worsened D: D_polish={} D_no_polish={}",
+            r_polish.deviance,
+            r_no_polish.deviance
+        );
+
+        // When polish_improved flag is set, polish D must be strictly
+        // better than stage-1 D (consistency check on the flag semantics).
+        if r_polish.polish_improved {
+            assert!(
+                r_polish.deviance < r_no_polish.deviance,
+                "polish_improved=true but D_polish={} >= D_no_polish={}",
+                r_polish.deviance,
+                r_no_polish.deviance
+            );
+        }
+
+        // The fit should return a physically sensible density (positive,
+        // finite, within an order of magnitude of truth — not a strict
+        // recovery test, just a sanity check).
+        let n_fit = r_polish.params[0];
+        assert!(n_fit.is_finite() && n_fit > 0.0);
+        assert!(
+            n_fit > 0.1 && n_fit < 0.8,
+            "density grossly off: n_fit={n_fit} (truth={n_true})"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Fit result carries gn_converged and polish_converged separately
+    // (memo 35 §P2.3 — acceptance from deviance value, not one flag).
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_joint_poisson_fit_exposes_separate_converged_flags() {
+        let n_bins = 50;
+        let sigma = vec![0.5_f64; n_bins];
+        let model = ExpDecayModel { sigma: &sigma };
+        let n_true = 0.2;
+        let c = 2.0;
+        let lam = 500.0;
+        let t_true = model.evaluate(&[n_true]).unwrap();
+        let mut rng = Xorshift(0xABAD_CAFE_BABE_F00D);
+        let o: Vec<f64> = (0..n_bins).map(|_| rng.poisson(lam / c)).collect();
+        let s: Vec<f64> = (0..n_bins).map(|i| rng.poisson(lam * t_true[i])).collect();
+
+        let obj = JointPoissonObjective {
+            model: &model,
+            o: &o,
+            s: &s,
+            c,
+        };
+        let mut params = ParameterSet::new(vec![FitParameter::non_negative("n", 0.1)]);
+        let cfg = JointPoissonFitConfig {
+            enable_polish: true,
+            ..Default::default()
+        };
+        let r = joint_poisson_fit(&obj, &mut params, &cfg).unwrap();
+
+        // Both flags exist; at least one should be true on this easy case.
+        assert!(r.gn_converged || r.polish_converged);
+        assert!(r.n_data == n_bins);
+        assert!(r.n_free == 1);
+        assert!(r.deviance > 0.0);
+        assert!(r.deviance_per_dof.is_finite());
+        // Uncertainty present (compute_covariance default true).
+        assert!(r.uncertainties.is_some());
+        let u = r.uncertainties.as_ref().unwrap();
+        assert_eq!(u.len(), 1);
+        assert!(u[0].is_finite() && u[0] > 0.0);
     }
 }

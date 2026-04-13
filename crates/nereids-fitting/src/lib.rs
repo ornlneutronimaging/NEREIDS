@@ -7,6 +7,7 @@
 //! - [`lm`] — Levenberg-Marquardt least-squares optimizer
 //! - [`poisson`] — Poisson-likelihood optimizer for low-count data
 //! - [`joint_poisson`] — Joint-Poisson profile binomial deviance (counts path)
+//! - [`nelder_mead`] — Bounded Nelder-Mead polish optimizer
 //! - [`transmission_model`] — Transmission forward model adapter for fitting
 //!
 //! ## SAMMY Reference
@@ -19,6 +20,7 @@ pub mod error;
 pub mod forward_model;
 pub mod joint_poisson;
 pub mod lm;
+pub mod nelder_mead;
 pub mod parameters;
 pub mod poisson;
 pub mod transmission_model;
