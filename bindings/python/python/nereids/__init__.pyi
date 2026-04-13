@@ -149,6 +149,26 @@ class FitResult:
         """Fitted exponential background decay constant (SAMMY BackF). Zero when not fitted."""
         ...
 
+    @property
+    def t0_us(self) -> float | None:
+        """Fitted TOF offset (SAMMY TZERO t0) in microseconds, or None."""
+        ...
+
+    @property
+    def l_scale(self) -> float | None:
+        """Fitted flight-path scale factor (SAMMY TZERO L0), or None."""
+        ...
+
+    @property
+    def deviance_per_dof(self) -> float | None:
+        """Joint-Poisson conditional binomial deviance / (n - k).
+
+        Primary goodness-of-fit for ``solver='joint_poisson'`` per memo 35
+        §P1.2.  ``None`` for LM and legacy Poisson-KL paths (those populate
+        ``reduced_chi_squared`` with Pearson chi-squared / (n - k) instead).
+        """
+        ...
+
 class CalibrationResult:
     """Result of energy axis calibration."""
 
@@ -796,6 +816,7 @@ def fit_counts_spectrum_typed(
     fit_alpha_2: bool = False,
     alpha_1_init: float = 1.0,
     alpha_2_init: float = 1.0,
+    c: float = 1.0,
     resolution: TabulatedResolution | None = None,
     flight_path_m: float | None = None,
     delta_t_us: float | None = None,
@@ -805,10 +826,14 @@ def fit_counts_spectrum_typed(
 ) -> FitResult:
     """Fit a single raw-count spectrum (sample + open-beam counts).
 
-    This function accepts raw counts and dispatches to the appropriate solver:
-    ``'auto'`` (default) selects Poisson KL for counts data, ``'kl'`` forces
-    Poisson KL, and ``'lm'`` forces Levenberg-Marquardt on normalised
-    transmission.
+    Dispatches to a counts-domain solver based on ``solver``:
+    ``'auto'`` (default) and ``'kl'`` / ``'poisson'`` select the fixed-flux
+    Poisson-KL engine; ``'lm'`` forces Levenberg-Marquardt on normalised
+    transmission; ``'joint_poisson'`` selects the joint-Poisson profile
+    binomial-deviance fitter (memo 35 §P1/§P2), which requires an explicit
+    proton-charge ratio ``c = Q_s / Q_ob`` and populates
+    ``FitResult.deviance_per_dof`` as the primary goodness-of-fit.
+
     For pre-normalized transmission data, use ``fit_spectrum_typed(...)``.
 
     Either ``isotopes`` or ``groups`` must be provided, but not both.
@@ -822,13 +847,18 @@ def fit_counts_spectrum_typed(
         temperature_k: Sample temperature in Kelvin (default 293.6).
         fit_temperature: Whether to fit temperature (default False).
         max_iter: Maximum iterations (default 200).
-        solver: 'auto' (default), 'kl', or 'lm'.
+        solver: 'auto' (default), 'kl', 'lm', or 'joint_poisson'.
         background: Enable transmission-lift background inside the counts fit.
         detector_background: Optional detector/counts background reference.
-        fit_alpha_1: Fit flux-scale nuisance parameter alpha_1.
-        fit_alpha_2: Fit detector-background scale nuisance parameter alpha_2.
+        fit_alpha_1: Fit flux-scale nuisance parameter alpha_1 (not supported
+            for ``solver='joint_poisson'`` — the profile lambda-hat absorbs
+            the flux scale).
+        fit_alpha_2: Fit detector-background scale nuisance parameter alpha_2
+            (not supported for ``solver='joint_poisson'``; deferred to P3).
         alpha_1_init: Initial value for alpha_1 (default 1.0).
         alpha_2_init: Initial value for alpha_2 (default 1.0).
+        c: Proton-charge ratio ``Q_s / Q_ob`` for ``solver='joint_poisson'``
+            (memo 35 §P1.3).  Default 1.0.  Ignored by other solvers.
         resolution: Optional resolution function.
         groups: List of IsotopeGroup objects (mutually exclusive with isotopes).
         initial_densities: Initial density guesses when using groups.

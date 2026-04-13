@@ -771,6 +771,7 @@ mod tests {
             alpha_2_init: 1.0,
             fit_alpha_1: true,
             fit_alpha_2: true,
+            c: 1.0,
         });
 
         let input = InputData3D::CountsWithNuisance {
@@ -862,6 +863,7 @@ mod tests {
             alpha_2_init: 1.0,
             fit_alpha_1: false,
             fit_alpha_2: true,
+            c: 1.0,
         });
 
         let input = InputData3D::Counts {

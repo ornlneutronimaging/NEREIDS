@@ -11,6 +11,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use nereids_endf::resonance::ResonanceData;
+use nereids_fitting::joint_poisson::{self, JointPoissonFitConfig, JointPoissonObjective};
 use nereids_fitting::lm::{self, FitModel, LmConfig, LmResult};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
 use nereids_fitting::poisson::{self, PoissonConfig};
@@ -173,9 +174,17 @@ impl InputData {
 pub enum SolverConfig {
     /// Levenberg-Marquardt chi-squared minimizer.
     LevenbergMarquardt(LmConfig),
-    /// Poisson KL divergence minimizer (projected gradient + Armijo).
+    /// Fixed-flux Poisson KL (legacy counts path; see memo 35 §P1 for the
+    /// GOF-reporting limitations compared to [`SolverConfig::JointPoisson`]).
     PoissonKL(PoissonConfig),
-    /// Automatic: Counts → PoissonKL, Transmission → LM.
+    /// Joint-Poisson profile-binomial-deviance fitter (memo 35 §P1/§P2).
+    ///
+    /// Uses an explicit proton-charge ratio `c = Q_s/Q_ob`
+    /// (from `CountsBackgroundConfig::c`) and reports `D/(n − k)` as the
+    /// primary GOF.  Stage-1 damped Fisher followed by optional Nelder-Mead
+    /// polish (see [`JointPoissonFitConfig`]).
+    JointPoisson(JointPoissonFitConfig),
+    /// Automatic: Counts → PoissonKL (legacy default), Transmission → LM.
     #[default]
     Auto,
 }
@@ -218,6 +227,17 @@ pub struct CountsBackgroundConfig {
     pub fit_alpha_1: bool,
     /// Whether α₂ is free (true) or fixed (false).
     pub fit_alpha_2: bool,
+    /// Proton-charge ratio `c = Q_s / Q_ob` for the joint-Poisson solver
+    /// (memo 35 §P1.3 — "make `c` a first-class API parameter").
+    ///
+    /// Default `1.0`, which is **only** correct when the caller has already
+    /// PC-normalized the open-beam counts so that `flux = c · O`.  For
+    /// `SolverConfig::JointPoisson`, set this to the actual
+    /// `Q_sample / Q_open_beam` ratio and pass raw open-beam counts —
+    /// the solver will profile out λ itself.
+    ///
+    /// Ignored by `SolverConfig::PoissonKL` and LM paths.
+    pub c: f64,
 }
 
 impl Default for CountsBackgroundConfig {
@@ -227,6 +247,7 @@ impl Default for CountsBackgroundConfig {
             alpha_2_init: 1.0,
             fit_alpha_1: false,
             fit_alpha_2: false,
+            c: 1.0,
         }
     }
 }
@@ -688,7 +709,40 @@ pub fn fit_spectrum_typed(
         // ── CountsWithNuisance + LM: not meaningful ──
         (InputData::CountsWithNuisance { .. }, SolverConfig::LevenbergMarquardt(_)) => {
             Err(PipelineError::InvalidParameter(
-                "CountsWithNuisance requires PoissonKL solver (LM cannot use nuisance parameters)"
+                "CountsWithNuisance requires a counts-domain solver (LM cannot use nuisance parameters)"
+                    .into(),
+            ))
+        }
+
+        // ── Joint-Poisson dispatch (memo 35 §P1/§P2) ──
+        (
+            InputData::Counts {
+                sample_counts,
+                open_beam_counts,
+            },
+            SolverConfig::JointPoisson(jp_cfg),
+        ) => {
+            // Use raw open-beam counts as O; joint-Poisson profiles λ̂ out
+            // using the explicit c from CountsBackgroundConfig.
+            let bg = vec![0.0f64; n_e];
+            fit_counts_joint_poisson(sample_counts, open_beam_counts, &bg, config, jp_cfg)
+        }
+        (
+            InputData::CountsWithNuisance {
+                sample_counts,
+                flux,
+                background,
+            },
+            SolverConfig::JointPoisson(jp_cfg),
+        ) => fit_counts_joint_poisson(sample_counts, flux, background, config, jp_cfg),
+
+        // Joint-Poisson requires counts input — transmission data doesn't
+        // have the (O, S) pair needed for the conditional-binomial form.
+        (InputData::Transmission { .. }, SolverConfig::JointPoisson(_)) => {
+            Err(PipelineError::InvalidParameter(
+                "JointPoisson solver requires raw counts (sample + open-beam), \
+                 not a transmission ratio.  Provide InputData::Counts or use LM/PoissonKL \
+                 on transmission data."
                     .into(),
             ))
         }
@@ -1397,6 +1451,224 @@ fn fit_counts_poisson(
         back_f,
         t0_us: energy_scale_indices.map(|(t0_idx, _)| pr.params[t0_idx]),
         l_scale: energy_scale_indices.map(|(_, ls_idx)| pr.params[ls_idx]),
+        deviance_per_dof: None,
+    })
+}
+
+/// Joint-Poisson counts-path fitter (memo 35 §P1/§P2).
+///
+/// Builds a pure transmission `FitModel` (density + optional temperature +
+/// optional energy-scale) and feeds it to [`joint_poisson::joint_poisson_fit`]
+/// together with explicit `(O, S, c)`.  Returns a [`SpectrumFitResult`] with
+/// `deviance_per_dof = Some(...)` as the primary GOF (memo 35 §P1.2).
+/// `reduced_chi_squared` is set to the same value so GUI consumers that
+/// still read the legacy field see a deviance-based metric.
+///
+/// Current scope (P1 + P2 only): `fit_alpha_1`, `fit_alpha_2`, non-zero
+/// `detector_background`, and `transmission_background` are all rejected
+/// with an error.  The profile `λ̂` absorbs the global flux scale (so
+/// `alpha_1` is redundant); `B_det` / `alpha_2` and `B_A/B_B/B_C` wiring
+/// are deferred to memo 35 §P3 / §P2.2 follow-up.
+fn fit_counts_joint_poisson(
+    sample_counts: &[f64],
+    flux: &[f64],
+    detector_background: &[f64],
+    config: &UnifiedFitConfig,
+    jp_cfg: &JointPoissonFitConfig,
+) -> Result<SpectrumFitResult, PipelineError> {
+    // ── Compatibility gates (memo 35 §P3 items are out of scope here) ──
+    if let Some(bg) = config.counts_background()
+        && (bg.fit_alpha_1 || bg.fit_alpha_2)
+    {
+        return Err(PipelineError::InvalidParameter(
+            "joint-Poisson solver does not support fit_alpha_1/fit_alpha_2: \
+             the profile lambda-hat absorbs the global flux scale (alpha_1 redundant); \
+             alpha_2 / B_det wiring is deferred to memo 35 §P3."
+                .into(),
+        ));
+    }
+    if detector_background.iter().any(|&v| v.abs() > 1e-12) {
+        return Err(PipelineError::InvalidParameter(
+            "joint-Poisson solver with non-zero detector_background is not yet supported \
+             (B_det wiring deferred to memo 35 §P3.2)."
+                .into(),
+        ));
+    }
+    if config.transmission_background.is_some() {
+        return Err(PipelineError::InvalidParameter(
+            "joint-Poisson solver with transmission_background is not yet supported \
+             (B_A/B_B/B_C wiring deferred; memo 35 §P2.2 operational rule will be \
+             enforced when those parameters are plumbed into the counts path)."
+                .into(),
+        ));
+    }
+
+    let c = config.counts_background().map(|b| b.c).unwrap_or(1.0);
+    if !(c.is_finite() && c > 0.0) {
+        return Err(PipelineError::InvalidParameter(format!(
+            "joint-Poisson solver requires finite c > 0 in CountsBackgroundConfig, got {c}",
+        )));
+    }
+
+    // ── Build parameter vector (mirrors fit_counts_poisson structure) ──
+    let n_density_params = config.n_density_params();
+    let mut param_vec = build_density_params(config);
+
+    if config.fit_temperature && config.fit_energy_scale {
+        return Err(PipelineError::InvalidParameter(
+            "fit_energy_scale and fit_temperature cannot both be true: \
+             EnergyScaleTransmissionModel does not support temperature fitting yet"
+                .into(),
+        ));
+    }
+    let temperature_index = if config.fit_temperature {
+        let idx = param_vec.len();
+        param_vec.push(FitParameter {
+            name: "temperature_k".into(),
+            value: config.temperature_k,
+            lower: 1.0,
+            upper: 5000.0,
+            fixed: false,
+        });
+        Some(idx)
+    } else {
+        None
+    };
+
+    let energy_scale_indices = if config.fit_energy_scale {
+        let t0_idx = param_vec.len();
+        param_vec.push(FitParameter {
+            name: "t0_us".into(),
+            value: config.t0_init_us,
+            lower: -10.0,
+            upper: 10.0,
+            fixed: false,
+        });
+        let ls_idx = param_vec.len();
+        param_vec.push(FitParameter {
+            name: "l_scale".into(),
+            value: config.l_scale_init,
+            lower: 0.99,
+            upper: 1.01,
+            fixed: false,
+        });
+        Some((t0_idx, ls_idx))
+    } else {
+        None
+    };
+
+    let mut params = ParameterSet::new(param_vec);
+
+    // ── Build pure transmission model ──
+    let t_model: Box<dyn FitModel> = if let Some((t0_idx, ls_idx)) = energy_scale_indices {
+        let n_params = config.n_density_params();
+        let xs = if let Some(xs) = &config.precomputed_cross_sections {
+            Arc::clone(xs)
+        } else {
+            let instrument = config
+                .resolution
+                .clone()
+                .map(|r| Arc::new(InstrumentParams { resolution: r }));
+            let xs_raw = nereids_transmission::broadened_cross_sections(
+                config.energies(),
+                &config.resonance_data,
+                config.temperature_k,
+                instrument.as_deref(),
+                None,
+            )
+            .map_err(PipelineError::Transmission)?;
+            Arc::new(xs_raw)
+        };
+        let effective_xs =
+            if let (Some(di), Some(dr)) = (&config.density_indices, &config.density_ratios) {
+                if xs.len() == di.len() && di.len() == dr.len() {
+                    let n_e = xs[0].len();
+                    let mut eff = vec![vec![0.0f64; n_e]; n_params];
+                    for ((&idx, &ratio), member_xs) in di.iter().zip(dr.iter()).zip(xs.iter()) {
+                        for (j, &sigma_val) in member_xs.iter().enumerate() {
+                            eff[idx][j] += ratio * sigma_val;
+                        }
+                    }
+                    Arc::new(eff)
+                } else {
+                    xs
+                }
+            } else {
+                xs
+            };
+        let density_indices: Vec<usize> = (0..n_params).collect();
+        let instrument = config
+            .resolution
+            .clone()
+            .map(|r| Arc::new(InstrumentParams { resolution: r }));
+        Box::new(EnergyScaleTransmissionModel::new(
+            effective_xs,
+            Arc::new(density_indices),
+            config.energies.clone(),
+            config.flight_path_m,
+            t0_idx,
+            ls_idx,
+            instrument,
+        ))
+    } else {
+        build_transmission_model(config, n_density_params, temperature_index)?
+    };
+
+    // ── Run joint-Poisson fit ──
+    let objective = JointPoissonObjective {
+        model: &*t_model,
+        o: flux,
+        s: sample_counts,
+        c,
+    };
+    let mut cfg = jp_cfg.clone();
+    cfg.compute_covariance = config.compute_covariance;
+    let result = joint_poisson::joint_poisson_fit(&objective, &mut params, &cfg)
+        .map_err(|e| PipelineError::InvalidParameter(format!("joint-Poisson fit failed: {e}")))?;
+
+    // ── Extract fitted quantities ──
+    let densities: Vec<f64> = (0..n_density_params).map(|i| result.params[i]).collect();
+
+    let (uncertainties, temperature_k_unc) = if let Some(ref unc_all) = result.uncertainties {
+        let dens_unc: Vec<f64> = (0..n_density_params)
+            .map(|i| *unc_all.get(i).unwrap_or(&f64::NAN))
+            .collect();
+        let t_unc = temperature_index.and_then(|idx| {
+            params
+                .free_indices()
+                .iter()
+                .position(|&fi| fi == idx)
+                .and_then(|pos| unc_all.get(pos).copied())
+        });
+        (Some(dens_unc), t_unc)
+    } else {
+        (None, None)
+    };
+    let fitted_temp = temperature_index.map(|idx| result.params[idx]);
+
+    // Convergence signal per memo 35 §P2.3: the deviance value is the
+    // acceptance criterion, but we expose a boolean to preserve the
+    // existing SpectrumFitResult shape.  Report True when EITHER stage
+    // self-flagged convergence (whichever accepts).
+    let converged = result.gn_converged || result.polish_converged;
+
+    Ok(SpectrumFitResult {
+        densities,
+        uncertainties,
+        // Back-compat bridge: reduced_chi_squared carries D/(n−k) for the
+        // joint-Poisson path.  Memo 35 §P1.2 — Pearson χ² is secondary.
+        reduced_chi_squared: result.deviance_per_dof,
+        converged,
+        iterations: result.gn_iterations + result.polish_iterations,
+        temperature_k: fitted_temp,
+        temperature_k_unc,
+        anorm: 1.0, // no Anorm parameter in joint-Poisson (subsumed into λ̂)
+        background: [0.0, 0.0, 0.0],
+        back_d: 0.0,
+        back_f: 0.0,
+        t0_us: energy_scale_indices.map(|(t0_idx, _)| result.params[t0_idx]),
+        l_scale: energy_scale_indices.map(|(_, ls_idx)| result.params[ls_idx]),
+        deviance_per_dof: Some(result.deviance_per_dof),
     })
 }
 
@@ -1704,6 +1976,7 @@ fn extract_result(
         back_f,
         t0_us: None,
         l_scale: None,
+        deviance_per_dof: None,
     })
 }
 
@@ -2070,6 +2343,13 @@ pub struct SpectrumFitResult {
     /// Fitted flight-path scale factor (SAMMY TZERO L₀, dimensionless).
     /// `None` when energy-scale fitting is not enabled.
     pub l_scale: Option<f64>,
+    /// Joint-Poisson conditional binomial deviance divided by `(n − k)`
+    /// (memo 35 §P1.2 — primary GOF for `SolverConfig::JointPoisson`).
+    ///
+    /// `Some(D/dof)` when the joint-Poisson solver was used;
+    /// `None` for LM and legacy Poisson-KL paths (those populate
+    /// `reduced_chi_squared` with Pearson χ² / (n−k) instead).
+    pub deviance_per_dof: Option<f64>,
 }
 
 #[cfg(test)]
@@ -2802,6 +3082,7 @@ mod tests {
             alpha_2_init: 1.0,
             fit_alpha_1: true,
             fit_alpha_2: true,
+            c: 1.0,
         });
 
         let input = InputData::CountsWithNuisance {
@@ -3257,5 +3538,141 @@ mod tests {
             result.l_scale.is_none(),
             "l_scale should be None without energy-scale"
         );
+    }
+
+    // ==================================================================
+    // Joint-Poisson solver integration tests (memo 35 §P1/§P2)
+    // ==================================================================
+
+    /// End-to-end: joint-Poisson density recovery at c = 5.98 on synthetic
+    /// matched-model counts, via `fit_spectrum_typed`.  Verifies that
+    /// `SpectrumFitResult.deviance_per_dof` is populated (P1.2) and that
+    /// density is recovered to within 5% on a single-resonance spectrum
+    /// under expected (noise-free) counts.
+    #[test]
+    fn test_joint_poisson_density_recovery_c_5_98() {
+        let data = u238_single_resonance();
+        let true_density = 0.0005_f64;
+        let c = 5.98_f64;
+        let lam_ob = 1000.0_f64; // expected open-beam counts per bin (O rate)
+        let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
+        let (t, _) = synthetic_transmission(&data, true_density, &energies);
+
+        // Noise-free expectations under joint-Poisson model:
+        //   E[O] = lam_ob, E[S] = c · lam_ob · T
+        let open_beam_counts: Vec<f64> = vec![lam_ob; energies.len()];
+        let sample_counts: Vec<f64> = t.iter().map(|&ti| c * lam_ob * ti).collect();
+
+        let jp_cfg = JointPoissonFitConfig::default();
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::JointPoisson(jp_cfg))
+        .with_counts_background(CountsBackgroundConfig {
+            c,
+            ..Default::default()
+        });
+
+        let input = InputData::Counts {
+            sample_counts,
+            open_beam_counts,
+        };
+        let result = fit_spectrum_typed(&input, &config).unwrap();
+
+        // Deviance-based GOF is populated (P1.2).
+        let d_per_dof = result
+            .deviance_per_dof
+            .expect("joint-Poisson solver must populate deviance_per_dof");
+        assert!(
+            d_per_dof.is_finite() && d_per_dof >= 0.0,
+            "deviance_per_dof = {d_per_dof} is not a valid GOF"
+        );
+        // On noise-free expected counts, D should be very small (approaches
+        // zero in the matched-model limit; allow some slack for numerical
+        // error in the forward model).
+        assert!(
+            d_per_dof < 0.5,
+            "noise-free expected-counts fit should give D/dof ≈ 0, got {d_per_dof}"
+        );
+        // Density recovery.
+        let rel_bias = (result.densities[0] - true_density) / true_density;
+        assert!(
+            rel_bias.abs() < 0.05,
+            "density bias {rel_bias} > 5%: fitted={} truth={true_density}",
+            result.densities[0]
+        );
+        // Back-compat: reduced_chi_squared mirrors deviance_per_dof.
+        assert!((result.reduced_chi_squared - d_per_dof).abs() < 1e-12);
+    }
+
+    /// `JointPoisson` rejects `fit_alpha_1` / `fit_alpha_2` — the profile
+    /// `λ̂` absorbs the global flux scale, so `alpha_1` is redundant;
+    /// `alpha_2` / B_det wiring is P3-deferred.
+    #[test]
+    fn test_joint_poisson_rejects_alpha_fit() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.05).collect();
+        let (t, _) = synthetic_transmission(&data, 0.0005, &energies);
+        let open_beam_counts: Vec<f64> = vec![500.0; energies.len()];
+        let sample_counts: Vec<f64> = t.iter().map(|&ti| 500.0 * ti).collect();
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::JointPoisson(JointPoissonFitConfig::default()))
+        .with_counts_background(CountsBackgroundConfig {
+            fit_alpha_1: true,
+            c: 1.0,
+            ..Default::default()
+        });
+
+        let input = InputData::Counts {
+            sample_counts,
+            open_beam_counts,
+        };
+        let err = fit_spectrum_typed(&input, &config).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("fit_alpha_1") || msg.contains("alpha_1"),
+            "expected alpha_1 rejection message, got: {msg}"
+        );
+    }
+
+    /// `JointPoisson` rejects transmission input (no O/S pair available).
+    #[test]
+    fn test_joint_poisson_rejects_transmission_input() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.05).collect();
+        let (t, u) = synthetic_transmission(&data, 0.0005, &energies);
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::JointPoisson(JointPoissonFitConfig::default()));
+
+        let input = InputData::Transmission {
+            transmission: t,
+            uncertainty: u,
+        };
+        let err = fit_spectrum_typed(&input, &config).unwrap_err();
+        assert!(err.to_string().contains("JointPoisson"));
     }
 }

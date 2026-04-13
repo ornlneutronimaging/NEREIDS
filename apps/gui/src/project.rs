@@ -1069,6 +1069,7 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
             back_f: 0.0,
             t0_us: None,
             l_scale: None,
+            deviance_per_dof: None,
         };
         // Rebuild FitFeedback from the restored result
         if let Some(ref labels) = snap.single_fit_labels {

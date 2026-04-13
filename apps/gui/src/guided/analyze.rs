@@ -724,16 +724,23 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 ("NOT converged", crate::theme::semantic::RED)
             };
             ui.label(egui::RichText::new(label).color(color).strong());
+            // Memo 35 §P1.2: when the joint-Poisson solver populated
+            // deviance_per_dof, label as D/dof; else keep chi2_r.
+            let gof_label = if result.deviance_per_dof.is_some() {
+                "D/dof"
+            } else {
+                "chi2_r"
+            };
             if state.uncertainty_is_estimated {
                 ui.label(
                     egui::RichText::new(format!(
-                        "chi2_r = {:.4} (approx.)",
-                        result.reduced_chi_squared
+                        "{} = {:.4} (approx.)",
+                        gof_label, result.reduced_chi_squared
                     ))
                     .color(crate::theme::semantic::ORANGE),
                 );
             } else {
-                ui.label(format!("chi2_r = {:.4}", result.reduced_chi_squared));
+                ui.label(format!("{} = {:.4}", gof_label, result.reduced_chi_squared));
             }
             ui.label(format!("iter = {}", result.iterations));
             if let Some(t) = result.temperature_k {

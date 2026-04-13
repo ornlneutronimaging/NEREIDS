@@ -413,6 +413,9 @@ struct PyFitResult {
     /// Fitted flight-path scale factor (SAMMY TZERO L₀, dimensionless).
     /// None when energy-scale fitting is not enabled.
     l_scale: Option<f64>,
+    /// Joint-Poisson conditional binomial deviance / (n − k).
+    /// `Some(...)` only for `solver="joint_poisson"`; memo 35 §P1.2.
+    deviance_per_dof: Option<f64>,
 }
 
 #[pymethods]
@@ -507,6 +510,17 @@ impl PyFitResult {
     #[getter]
     fn l_scale(&self) -> Option<f64> {
         self.l_scale
+    }
+
+    /// Joint-Poisson conditional binomial deviance divided by (n − k).
+    ///
+    /// Primary goodness-of-fit statistic for ``solver="joint_poisson"``
+    /// (memo 35 §P1.2 — replaces the fixed-flux Pearson that scaled with
+    /// ``c``).  Returns ``None`` for LM and legacy Poisson-KL paths; those
+    /// populate ``reduced_chi_squared`` with Pearson χ² / (n − k) instead.
+    #[getter]
+    fn deviance_per_dof(&self) -> Option<f64> {
+        self.deviance_per_dof
     }
 
     fn __repr__(&self) -> String {
@@ -2589,8 +2603,14 @@ fn parse_solver_config(
                 ..Default::default()
             },
         )),
+        "joint_poisson" => Ok(nereids_pipeline::pipeline::SolverConfig::JointPoisson(
+            nereids_fitting::joint_poisson::JointPoissonFitConfig {
+                max_iter,
+                ..Default::default()
+            },
+        )),
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Unknown solver: '{other}'. Use 'auto', 'lm', or 'kl'."
+            "Unknown solver: '{other}'. Use 'auto', 'lm', 'kl', or 'joint_poisson'."
         ))),
     }
 }
@@ -2882,6 +2902,7 @@ fn py_spatial_map_typed<'py>(
                 alpha_2_init,
                 fit_alpha_1,
                 fit_alpha_2,
+                c: 1.0,
             });
     }
 
@@ -2967,6 +2988,7 @@ fn py_spatial_map_typed<'py>(
     fit_alpha_2 = false,
     alpha_1_init = 1.0,
     alpha_2_init = 1.0,
+    c = 1.0,
     resolution = None,
     flight_path_m = None,
     delta_t_us = None,
@@ -2998,6 +3020,7 @@ fn py_fit_counts_spectrum_typed<'py>(
     fit_alpha_2: bool,
     alpha_1_init: f64,
     alpha_2_init: f64,
+    c: f64,
     resolution: Option<PyTabulatedResolution>,
     flight_path_m: Option<f64>,
     delta_t_us: Option<f64>,
@@ -3118,12 +3141,22 @@ fn py_fit_counts_spectrum_typed<'py>(
     if fit_energy_scale {
         config = config.with_energy_scale(t0_init_us, l_scale_init, energy_scale_flight_path_m);
     }
-    if fit_alpha_1 || fit_alpha_2 || alpha_1_init != 1.0 || alpha_2_init != 1.0 {
+    // Attach CountsBackgroundConfig whenever any of its fields deviates from
+    // the default — including c, which is the explicit proton-charge ratio
+    // (memo 35 §P1.3) required by the JointPoisson solver.
+    if fit_alpha_1
+        || fit_alpha_2
+        || alpha_1_init != 1.0
+        || alpha_2_init != 1.0
+        || c != 1.0
+        || solver == "joint_poisson"
+    {
         config = config.with_counts_background(CountsBackgroundConfig {
             alpha_1_init,
             alpha_2_init,
             fit_alpha_1,
             fit_alpha_2,
+            c,
         });
     }
 
@@ -3157,6 +3190,7 @@ fn py_fit_counts_spectrum_typed<'py>(
         back_f: result.back_f,
         t0_us: result.t0_us,
         l_scale: result.l_scale,
+        deviance_per_dof: result.deviance_per_dof,
     })
 }
 
@@ -3381,6 +3415,7 @@ fn py_compute_model_jacobian<'py>(
             alpha_2_init: alpha_2,
             fit_alpha_1,
             fit_alpha_2,
+            c: 1.0,
         });
     }
 
@@ -3607,5 +3642,6 @@ fn py_fit_spectrum_typed<'py>(
         back_f: result.back_f,
         t0_us: result.t0_us,
         l_scale: result.l_scale,
+        deviance_per_dof: result.deviance_per_dof,
     })
 }
