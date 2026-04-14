@@ -235,7 +235,15 @@ class SpatialResult:
 
     @property
     def chi_squared_map(self) -> NDArray[np.float64]:
-        """Reduced chi-squared map."""
+        """Reduced chi-squared map.  For the counts-KL dispatch this mirrors
+        ``deviance_per_dof_map`` (back-compat)."""
+        ...
+
+    @property
+    def deviance_per_dof_map(self) -> NDArray[np.float64] | None:
+        """Counts-KL conditional binomial deviance / (n − k) per pixel
+        (memo 35 §P1.2).  ``None`` for LM-only runs and for transmission +
+        PoissonKL (those populate ``chi_squared_map`` with Pearson χ²/dof)."""
         ...
 
     @property
@@ -729,6 +737,12 @@ def spatial_map_typed(
     max_iter: int = 200,
     solver: str = "auto",
     background: bool = False,
+    fit_alpha_1: bool = False,
+    fit_alpha_2: bool = False,
+    alpha_1_init: float = 1.0,
+    alpha_2_init: float = 1.0,
+    c: float = 1.0,
+    enable_polish: bool | None = None,
     resolution: TabulatedResolution | None = None,
     flight_path_m: float | None = None,
     delta_t_us: float | None = None,
@@ -741,10 +755,26 @@ def spatial_map_typed(
     When ``groups`` is provided, each group maps to one fitted density parameter.
 
     Dispatches per-pixel fitting based on InputData type:
-      - from_counts -> Poisson KL on raw counts (optimal)
-      - from_transmission -> LM (default) or KL (solver="kl")
+      - from_counts / from_counts_with_nuisance + solver="kl" / "auto"
+        -> counts-KL (joint-Poisson deviance) — the counts-path solver
+        validated in memo 35 §P1/§P2 and memo 38.
+      - from_transmission + solver="lm" (default for transmission) -> LM.
+      - from_transmission + solver="kl" -> Poisson NLL on transmission values
+        (legacy niche).
 
-    Always returns SpatialResult.
+    Args:
+        data: InputData from `from_counts()`, `from_counts_with_nuisance()`,
+            or `from_transmission()`.
+        c: Proton-charge ratio ``Q_s / Q_ob`` for the counts-KL dispatch
+            (memo 35 §P1.3).  Default 1.0 (assumes caller PC-normalized
+            the flux already).  Ignored for LM / transmission-KL paths.
+        enable_polish: Override the Nelder-Mead polish flag.  ``None``
+            (default) = the dispatcher auto-disables polish when
+            ``n_pixels > 1`` (memo 38 §6 — polish costs ~1000 s per pixel
+            on realistic data).  ``True`` forces polish on, ``False`` off.
+
+    Always returns SpatialResult.  For counts-KL runs,
+    ``SpatialResult.deviance_per_dof_map`` is populated as the primary GOF.
     """
     ...
 

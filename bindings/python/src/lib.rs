@@ -603,6 +603,9 @@ struct PySpatialResult {
     density_maps: Vec<Py<PyArray2<f64>>>,
     uncertainty_maps: Vec<Py<PyArray2<f64>>>,
     chi_squared_map: Py<PyArray2<f64>>,
+    /// Counts-KL conditional binomial deviance / (n − k) per pixel
+    /// (memo 35 §P1.2).  None for transmission-only and LM-only runs.
+    deviance_per_dof_map: Option<Py<PyArray2<f64>>>,
     converged_map: Py<PyArray2<bool>>,
     n_converged: usize,
     n_total: usize,
@@ -643,6 +646,23 @@ impl PySpatialResult {
     #[getter]
     fn chi_squared_map<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
         self.chi_squared_map.bind(py).clone()
+    }
+
+    /// Counts-KL conditional binomial deviance per degree of freedom.
+    ///
+    /// Primary goodness-of-fit for ``solver="kl"`` on counts data
+    /// (memo 35 §P1.2 — replaces the fixed-flux Pearson that scaled
+    /// with ``c``).  Returns ``None`` for LM fits and transmission +
+    /// PoissonKL; those populate ``chi_squared_map`` with Pearson χ² /
+    /// (n − k) instead.
+    #[getter]
+    fn deviance_per_dof_map<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> Option<Bound<'py, PyArray2<f64>>> {
+        self.deviance_per_dof_map
+            .as_ref()
+            .map(|m| m.bind(py).clone())
     }
 
     /// Convergence map (True = converged).
@@ -2597,20 +2617,21 @@ fn parse_solver_config(
                 },
             ),
         ),
-        "kl" | "poisson" => Ok(nereids_pipeline::pipeline::SolverConfig::PoissonKL(
-            nereids_fitting::poisson::PoissonConfig {
-                max_iter,
-                ..Default::default()
-            },
-        )),
-        "joint_poisson" => Ok(nereids_pipeline::pipeline::SolverConfig::JointPoisson(
-            nereids_fitting::joint_poisson::JointPoissonFitConfig {
-                max_iter,
-                ..Default::default()
-            },
-        )),
+        // "kl" is the canonical counts-KL name post Phase-0 collapse.
+        // "poisson" is accepted as a synonym.  "joint_poisson" is kept as
+        // a soft-deprecated alias that routes to the same dispatch — the
+        // joint-Poisson / conditional-binomial-deviance implementation IS
+        // the KL solver; there is only one counts-KL path.
+        "kl" | "poisson" | "joint_poisson" => {
+            Ok(nereids_pipeline::pipeline::SolverConfig::PoissonKL(
+                nereids_fitting::poisson::PoissonConfig {
+                    max_iter,
+                    ..Default::default()
+                },
+            ))
+        }
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Unknown solver: '{other}'. Use 'auto', 'lm', 'kl', or 'joint_poisson'."
+            "Unknown solver: '{other}'. Use 'auto', 'lm', or 'kl'."
         ))),
     }
 }
@@ -2718,11 +2739,16 @@ fn spatial_result_to_py(
         .temperature_uncertainty_map
         .as_ref()
         .map(|m| PyArray2::from_array(py, m).into());
+    let deviance_per_dof_map = result
+        .deviance_per_dof_map
+        .as_ref()
+        .map(|m| PyArray2::from_array(py, m).into());
 
     PySpatialResult {
         density_maps,
         uncertainty_maps,
         chi_squared_map: PyArray2::from_array(py, &result.chi_squared_map).into(),
+        deviance_per_dof_map,
         converged_map: PyArray2::from_array(py, &result.converged_map).into(),
         n_converged: result.n_converged,
         n_total: result.n_total,
@@ -2787,12 +2813,15 @@ fn spatial_result_to_py(
     fit_alpha_2 = false,
     alpha_1_init = 1.0,
     alpha_2_init = 1.0,
+    c = 1.0,
+    enable_polish = None,
     resolution = None,
     flight_path_m = None,
     delta_t_us = None,
     delta_l_m = None,
     groups = None,
 ))]
+#[allow(clippy::too_many_arguments)]
 fn py_spatial_map_typed<'py>(
     py: Python<'py>,
     data: &PyInputData,
@@ -2809,6 +2838,8 @@ fn py_spatial_map_typed<'py>(
     fit_alpha_2: bool,
     alpha_1_init: f64,
     alpha_2_init: f64,
+    c: f64,
+    enable_polish: Option<bool>,
     resolution: Option<PyTabulatedResolution>,
     flight_path_m: Option<f64>,
     delta_t_us: Option<f64>,
@@ -2902,8 +2933,23 @@ fn py_spatial_map_typed<'py>(
                 alpha_2_init,
                 fit_alpha_1,
                 fit_alpha_2,
-                c: 1.0,
+                c,
             });
+    } else if c != 1.0 && (data.kind == "counts" || data.kind == "counts_with_nuisance") {
+        // Caller provided `c` without alpha fitting — attach a minimal
+        // CountsBackgroundConfig carrying just the proton-charge ratio.
+        config = config.with_counts_background(
+            nereids_pipeline::pipeline::CountsBackgroundConfig {
+                c,
+                ..Default::default()
+            },
+        );
+    }
+
+    // Polish override (memo 35 §P2.1; memo 38 §6).  None = auto-disable
+    // when n_pixels > 1 inside spatial_map_typed.
+    if let Some(v) = enable_polish {
+        config = config.with_counts_enable_polish(Some(v));
     }
 
     // Build InputData3D from the PyInputData
