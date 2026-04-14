@@ -207,6 +207,82 @@ impl<'a> JointPoissonObjective<'a> {
         Ok(Some(info))
     }
 
+    /// Finite-difference Fisher information.
+    ///
+    /// Fallback for callers whose transmission model does not implement
+    /// [`FitModel::analytical_jacobian`] (so [`fisher_information`] returns
+    /// `None`).  Builds the transmission Jacobian column-by-column via
+    /// central differences and assembles
+    ///
+    ///   `I(θ)_{j,k} = Σ_i h_i · J_{i,j} · J_{i,k}`
+    ///
+    /// where `h_i = ∂² D / ∂ T_i²` (see [`deviance_curvature`]).  Returns
+    /// `Ok(None)` only if the base model evaluation itself fails.
+    pub fn fisher_information_fd(
+        &self,
+        params: &mut ParameterSet,
+        fd_step: f64,
+    ) -> Result<Option<FlatMatrix>, FittingError> {
+        let free_idx = params.free_indices();
+        let base_values = params.all_values();
+        let t_base = self.model.evaluate(&base_values)?;
+        let n_e = t_base.len();
+        let n_free = free_idx.len();
+        if n_free == 0 {
+            return Ok(Some(FlatMatrix::zeros(0, 0)));
+        }
+        let mut jac = FlatMatrix::zeros(n_e, n_free);
+        for (col, &idx) in free_idx.iter().enumerate() {
+            let original = params.params[idx].value;
+            let step = fd_step * (1.0 + original.abs());
+            params.params[idx].value = original + step;
+            params.params[idx].clamp();
+            let forward_step = params.params[idx].value - original;
+            let t_plus = if forward_step.abs() >= PIVOT_FLOOR {
+                Some(self.model.evaluate(&params.all_values())?)
+            } else {
+                None
+            };
+            params.params[idx].value = original - step;
+            params.params[idx].clamp();
+            let backward_step = original - params.params[idx].value;
+            let t_minus = if backward_step.abs() >= PIVOT_FLOOR {
+                Some(self.model.evaluate(&params.all_values())?)
+            } else {
+                None
+            };
+            params.params[idx].value = original;
+            let (t_a, t_b, denom) = match (t_plus, t_minus) {
+                (Some(tp), Some(tm)) => (tp, tm, forward_step + backward_step),
+                (Some(tp), None) => (tp, t_base.clone(), forward_step),
+                (None, Some(tm)) => (t_base.clone(), tm, backward_step),
+                (None, None) => continue,
+            };
+            if denom.abs() < PIVOT_FLOOR {
+                continue;
+            }
+            for i in 0..n_e {
+                *jac.get_mut(i, col) = (t_a[i] - t_b[i]) / denom;
+            }
+        }
+        let mut info = FlatMatrix::zeros(n_free, n_free);
+        for (i, ((&t_i, &o_i), &s_i)) in t_base
+            .iter()
+            .zip(self.o.iter())
+            .zip(self.s.iter())
+            .enumerate()
+        {
+            let h = deviance_curvature(s_i, o_i, t_i, self.c);
+            for j in 0..n_free {
+                let jij = jac.get(i, j);
+                for k in 0..n_free {
+                    *info.get_mut(j, k) += h * jij * jac.get(i, k);
+                }
+            }
+        }
+        Ok(Some(info))
+    }
+
     /// Finite-difference gradient of the deviance.
     ///
     /// Central differences on each free parameter.  Used as a fallback when
@@ -519,10 +595,17 @@ pub fn joint_poisson_fit(
     let dof = (n_data as isize - n_free as isize).max(1) as f64;
     let deviance_per_dof = final_deviance / dof;
 
-    // Covariance from inverse Fisher at the final θ.
+    // Covariance from inverse Fisher at the final θ.  Uses the analytical
+    // Jacobian when the transmission model provides one; otherwise falls
+    // back to finite-difference Jacobian assembled into the Fisher form —
+    // so callers always get uncertainties for identifiable parameters.
     let (covariance, uncertainties) = if config.compute_covariance {
         let free_idx = params.free_indices();
-        match objective.fisher_information(&final_values, &free_idx)? {
+        let info_opt = match objective.fisher_information(&final_values, &free_idx)? {
+            Some(info) => Some(info),
+            None => objective.fisher_information_fd(params, config.fd_step)?,
+        };
+        match info_opt {
             Some(info) => match invert_matrix(&info) {
                 Some(cov) => {
                     let u: Vec<f64> = (0..cov.nrows)

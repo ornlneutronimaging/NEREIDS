@@ -731,82 +731,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_spatial_map_typed_counts_with_nuisance_surfaces_background_maps() {
-        let data = u238_single_resonance();
-        let true_density = 0.002;
-        let true_alpha1 = 0.92;
-        let true_alpha2 = 1.35;
-        let energies: Vec<f64> = (0..101).map(|i| 1.0 + (i as f64) * 0.1).collect();
-        let (t_3d, _) = synthetic_4x4_transmission(&data, true_density, &energies);
-        let n_e = energies.len();
-
-        let mut sample = Array3::zeros((n_e, 4, 4));
-        let mut flux = Array3::zeros((n_e, 4, 4));
-        let mut background = Array3::zeros((n_e, 4, 4));
-        for y in 0..4 {
-            for x in 0..4 {
-                for (i, &e) in energies.iter().enumerate() {
-                    let bg = 30.0 + 8.0 / e.sqrt();
-                    flux[[i, y, x]] = 120.0;
-                    background[[i, y, x]] = bg;
-                    sample[[i, y, x]] =
-                        true_alpha1 * flux[[i, y, x]] * t_3d[[i, y, x]] + true_alpha2 * bg;
-                }
-            }
-        }
-
-        let config = UnifiedFitConfig::new(
-            energies,
-            vec![data],
-            vec!["U-238".into()],
-            0.0,
-            None,
-            vec![0.001],
-        )
-        .unwrap()
-        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
-        .with_counts_background(crate::pipeline::CountsBackgroundConfig {
-            alpha_1_init: 1.0,
-            alpha_2_init: 1.0,
-            fit_alpha_1: true,
-            fit_alpha_2: true,
-            c: 1.0,
-        });
-
-        let input = InputData3D::CountsWithNuisance {
-            sample_counts: sample.view(),
-            flux: flux.view(),
-            background: background.view(),
-        };
-
-        let result = spatial_map_typed(&input, &config, None, None, None).unwrap();
-        assert_eq!(result.n_total, 16);
-        assert_eq!(result.n_converged, 16);
-        assert!(
-            result.anorm_map.is_some(),
-            "counts background runs should surface anorm_map"
-        );
-        assert!(
-            result.background_maps.is_some(),
-            "counts background runs should surface background_maps"
-        );
-        let mean_alpha1 = result
-            .anorm_map
-            .as_ref()
-            .unwrap()
-            .iter()
-            .copied()
-            .sum::<f64>()
-            / 16.0;
-        let mean_alpha2 = result.background_maps.as_ref().unwrap()[2]
-            .iter()
-            .copied()
-            .sum::<f64>()
-            / 16.0;
-        assert!((mean_alpha1 - true_alpha1).abs() < 5e-3);
-        assert!((mean_alpha2 - true_alpha2).abs() < 5e-3);
-    }
+    // Removed as part of the counts-KL collapse (Phase 0):
+    //   test_spatial_map_typed_counts_with_nuisance_surfaces_background_maps
+    // Tested fit_alpha_1 / fit_alpha_2 nuisance fitting on a 4×4 spatial
+    // grid, which is no longer supported on the counts-KL dispatch (the
+    // joint-Poisson profile λ̂ absorbs alpha_1 and alpha_2 / B_det is
+    // P3.2-deferred; memo 35 §P3).  The SAMMY-style A_n + B_A/B/C spatial
+    // wiring is covered by `test_spatial_map_typed_counts_poisson_with_transmission_bg`.
 
     #[test]
     fn test_spatial_map_typed_dead_pixels() {

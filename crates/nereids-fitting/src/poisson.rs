@@ -1,18 +1,27 @@
-//! Poisson-likelihood optimizer for low-count neutron data.
+//! Poisson-likelihood optimizer for low-count neutron data (transmission
+//! path).
 //!
-//! When neutron counts are low (< ~30 per bin), the Gaussian/chi-squared
-//! assumption breaks down and Poisson statistics must be used directly.
+//! Minimizes the single-arm Poisson negative log-likelihood
 //!
-//! ## Negative log-likelihood
+//! ```text
+//! L(θ) = Σᵢ [y_model(θ)ᵢ − y_obs,ᵢ · ln(y_model(θ)ᵢ)]
+//! ```
 //!
-//! L(θ) = Σᵢ [y_model(θ)ᵢ - y_obs,ᵢ · ln(y_model(θ)ᵢ)]
+//! using a projected damped Gauss-Newton / Fisher optimizer with
+//! backtracking line search and finite-difference fallback.
 //!
-//! This is minimized using a projected optimizer:
-//! - damped Gauss-Newton / Fisher steps when an analytical Jacobian exists
-//! - finite-difference projected gradient fallback otherwise
-//!
-//! Both paths use backtracking line search and bound constraints
-//! (non-negativity on densities).
+//! **Scope note.**  In the current pipeline this solver is only reached
+//! for the **transmission + PoissonKL** path (via
+//! [`crate::transmission_model::TransmissionKLBackgroundModel`]).  The
+//! **counts** path uses the joint-Poisson conditional-binomial-deviance
+//! solver in [`crate::joint_poisson`] (memo 35 §P1/§P2), which replaces
+//! the older fixed-flux counts NLL that lived here before the P2.2 /
+//! counts-KL collapse.  The helpers [`CountsModel`] and
+//! [`CountsBackgroundScaleModel`] exposed from this module are retained
+//! for the Fisher-info research helper
+//! [`crate::lm`]-side `evaluate_jacobian_and_fisher` and the spatial-
+//! regularization prototype scripts (Epic #394); they are not part of
+//! the production fit path.
 //!
 //! ## TRINIDI Reference
 //! - `trinidi/reconstruct.py` — Poisson NLL and APGM optimizer

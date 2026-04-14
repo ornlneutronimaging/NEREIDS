@@ -172,19 +172,23 @@ impl InputData {
 /// combinations unrepresentable.
 #[derive(Debug, Clone, Default)]
 pub enum SolverConfig {
-    /// Levenberg-Marquardt chi-squared minimizer.
+    /// Levenberg-Marquardt chi-squared minimizer (transmission path).
     LevenbergMarquardt(LmConfig),
-    /// Fixed-flux Poisson KL (legacy counts path; see memo 35 §P1 for the
-    /// GOF-reporting limitations compared to [`SolverConfig::JointPoisson`]).
-    PoissonKL(PoissonConfig),
-    /// Joint-Poisson profile-binomial-deviance fitter (memo 35 §P1/§P2).
+    /// Poisson-KL counts-domain fitter.
     ///
-    /// Uses an explicit proton-charge ratio `c = Q_s/Q_ob`
-    /// (from `CountsBackgroundConfig::c`) and reports `D/(n − k)` as the
-    /// primary GOF.  Stage-1 damped Fisher followed by optional Nelder-Mead
-    /// polish (see [`JointPoissonFitConfig`]).
-    JointPoisson(JointPoissonFitConfig),
-    /// Automatic: Counts → PoissonKL (legacy default), Transmission → LM.
+    /// For **counts** inputs this dispatches to the joint-Poisson profile-
+    /// binomial-deviance path (`joint_poisson_fit`) validated in memo 35
+    /// §P1/§P2 and memo 38.  Uses an explicit `c = Q_s/Q_ob` from
+    /// `CountsBackgroundConfig::c` and reports `D/(n − k)` as the primary
+    /// GOF.  Stage-1 damped Fisher + optional Nelder-Mead polish (see
+    /// [`nereids_fitting::joint_poisson::JointPoissonFitConfig`]).
+    ///
+    /// For **transmission** inputs this dispatches to Poisson NLL on the
+    /// transmission values directly (legacy path, unchanged).  The payload
+    /// `PoissonConfig` carries `max_iter` common to both dispatches.
+    PoissonKL(PoissonConfig),
+    /// Automatic: Counts → PoissonKL (counts-domain joint-Poisson),
+    /// Transmission → LM.
     #[default]
     Auto,
 }
@@ -219,24 +223,30 @@ pub enum SolverConfig {
 /// - All terms are non-negative (required for valid Poisson NLL)
 #[derive(Debug, Clone)]
 pub struct CountsBackgroundConfig {
-    /// Initial normalization scale (default 1.0).
+    /// **Research-only.** Initial α₁ flux-scale value used by
+    /// [`crate::pipeline::evaluate_jacobian_and_fisher`] (Fisher-info
+    /// research helper, Epic #394).  Not honoured by the production fit
+    /// path; `SolverConfig::PoissonKL` profiles the flux via `λ̂` and
+    /// rejects alpha fitting.
     pub alpha_1_init: f64,
-    /// Initial background scale (default 1.0).
+    /// **Research-only.** Initial α₂ detector-bg-scale value, same
+    /// provisions as `alpha_1_init`.
     pub alpha_2_init: f64,
-    /// Whether α₁ is free (true) or fixed (false).
+    /// **Research-only.** Fit α₁ flag — only consumed by
+    /// `evaluate_jacobian_and_fisher`.  Passing `true` through
+    /// `SolverConfig::PoissonKL` on counts input yields an error.
     pub fit_alpha_1: bool,
-    /// Whether α₂ is free (true) or fixed (false).
+    /// **Research-only.** Fit α₂ flag — see `fit_alpha_1`.
     pub fit_alpha_2: bool,
-    /// Proton-charge ratio `c = Q_s / Q_ob` for the joint-Poisson solver
+    /// Proton-charge ratio `c = Q_s / Q_ob` for the counts-KL solver
     /// (memo 35 §P1.3 — "make `c` a first-class API parameter").
     ///
-    /// Default `1.0`, which is **only** correct when the caller has already
-    /// PC-normalized the open-beam counts so that `flux = c · O`.  For
-    /// `SolverConfig::JointPoisson`, set this to the actual
-    /// `Q_sample / Q_open_beam` ratio and pass raw open-beam counts —
-    /// the solver will profile out λ itself.
-    ///
-    /// Ignored by `SolverConfig::PoissonKL` and LM paths.
+    /// Default `1.0`, correct only when the caller has already PC-
+    /// normalized the open-beam counts so that `flux = c · O`.  For the
+    /// counts-KL dispatch (`SolverConfig::PoissonKL` on counts input),
+    /// set this to the actual `Q_sample / Q_open_beam` ratio and pass
+    /// raw open-beam counts — the joint-Poisson solver will profile
+    /// `λ̂` itself.  Ignored by LM paths.
     pub c: f64,
 }
 
@@ -278,6 +288,14 @@ pub struct UnifiedFitConfig {
     transmission_background: Option<BackgroundConfig>,
     /// Counts-domain background for the counts engine.
     counts_background: Option<CountsBackgroundConfig>,
+
+    // ── Joint-Poisson solver knobs (counts path only) ──
+    /// When `Some(false)`, the counts-KL dispatch disables Nelder-Mead polish
+    /// (stage-1 damped Fisher only).  When `Some(true)`, polish is forced on
+    /// regardless of context.  When `None`, the dispatcher picks a default:
+    /// polish on for single-spectrum fits, off for per-pixel spatial maps
+    /// (memo 38 §6 recommendation — 17 min polish per pixel is untenable).
+    counts_enable_polish: Option<bool>,
 
     // ── Precomputed caches (injected by spatial_map_typed) ──
     precomputed_cross_sections: Option<Arc<Vec<Vec<f64>>>>,
@@ -353,6 +371,7 @@ impl UnifiedFitConfig {
             solver: SolverConfig::Auto,
             transmission_background: None,
             counts_background: None,
+            counts_enable_polish: None,
             precomputed_cross_sections: None,
             precomputed_base_xs: None,
             fit_energy_scale: false,
@@ -413,6 +432,16 @@ impl UnifiedFitConfig {
     #[must_use]
     pub fn with_counts_background(mut self, bg: CountsBackgroundConfig) -> Self {
         self.counts_background = Some(bg);
+        self
+    }
+
+    /// Override the Nelder-Mead polish flag for the counts-KL dispatch.
+    /// `Some(true)` forces polish on, `Some(false)` forces it off, `None`
+    /// (the default) lets the dispatcher pick (polish on for single-spectrum,
+    /// off for spatial maps per memo 38 §6).
+    #[must_use]
+    pub fn with_counts_enable_polish(mut self, v: Option<bool>) -> Self {
+        self.counts_enable_polish = v;
         self
     }
 
@@ -522,6 +551,10 @@ impl UnifiedFitConfig {
     }
     pub fn counts_background(&self) -> Option<&CountsBackgroundConfig> {
         self.counts_background.as_ref()
+    }
+    /// Counts-KL polish override (see [`Self::with_counts_enable_polish`]).
+    pub fn counts_enable_polish(&self) -> Option<bool> {
+        self.counts_enable_polish
     }
     pub fn precomputed_cross_sections(&self) -> Option<&Arc<Vec<Vec<f64>>>> {
         self.precomputed_cross_sections.as_ref()
@@ -650,7 +683,14 @@ pub fn fit_spectrum_typed(
             SolverConfig::PoissonKL(poisson_cfg),
         ) => fit_transmission_poisson(transmission, uncertainty, config, poisson_cfg),
 
-        // ── Counts + KL: statistically optimal path ──
+        // ── Counts + KL: joint-Poisson profile-binomial-deviance path ──
+        //
+        // The counts-KL solver is now the joint-Poisson fitter validated in
+        // memo 35 §P1/§P2 and memo 38.  Uses the explicit `c = Q_s/Q_ob` from
+        // `CountsBackgroundConfig::c` and reports `D/(n − k)` as the primary
+        // GOF.  Detector-space counts background `B_det` is assumed zero
+        // here; the `CountsWithNuisance` arm lets callers supply a
+        // detector-bg spectrum.
         (
             InputData::Counts {
                 sample_counts,
@@ -658,23 +698,14 @@ pub fn fit_spectrum_typed(
             },
             SolverConfig::PoissonKL(poisson_cfg),
         ) => {
-            // Convenience counts path:
-            // - open beam is used as the flux reference Φ(E)
-            // - detector-space counts background B_det(E) is currently
-            //   assumed zero unless the caller explicitly supplies nuisance
-            //   spectra via CountsWithNuisance
-            //
-            // This does NOT disable transmission background fitting.
-            // If config.transmission_background is enabled, fit_counts_poisson
-            // still fits the additive transmission-lift terms [b0, b1] inside
-            // the bracketed transmission model:
-            //   Y(E) = Φ(E) * [T(E) + b0 + b1/sqrt(E)] + B_det(E)
-            //
-            // That transmission-lift background is the mechanism currently
-            // used to absorb gamma-tail structure in VENUS-style data.
-            let flux: Vec<f64> = open_beam_counts.to_vec();
-            let background = vec![0.0f64; n_e];
-            fit_counts_poisson(sample_counts, &flux, &background, config, poisson_cfg)
+            let bg = vec![0.0f64; n_e];
+            fit_counts_joint_poisson(
+                sample_counts,
+                open_beam_counts,
+                &bg,
+                config,
+                &poisson_to_joint_poisson_config(poisson_cfg, config),
+            )
         }
 
         // ── CountsWithNuisance + KL: user-supplied nuisance ──
@@ -685,7 +716,13 @@ pub fn fit_spectrum_typed(
                 background,
             },
             SolverConfig::PoissonKL(poisson_cfg),
-        ) => fit_counts_poisson(sample_counts, flux, background, config, poisson_cfg),
+        ) => fit_counts_joint_poisson(
+            sample_counts,
+            flux,
+            background,
+            config,
+            &poisson_to_joint_poisson_config(poisson_cfg, config),
+        ),
 
         // ── Counts + LM: convert to transmission (approximate path) ──
         //
@@ -693,7 +730,8 @@ pub fn fit_spectrum_typed(
         // (sample/OB) to produce transmission, with σ ≈ √max(sample,1)/OB
         // as a simplified Poisson-to-Gaussian conversion.  Poisson structure
         // is lost.  For statistically correct low-count fitting, use the
-        // Poisson KL solver (`solver="kl"` or `SolverConfig::Auto`).
+        // Poisson KL solver (`solver="kl"` or `SolverConfig::Auto`), which
+        // now routes to the joint-Poisson path per memo 35 §P1.
         (
             InputData::Counts {
                 sample_counts,
@@ -714,42 +752,28 @@ pub fn fit_spectrum_typed(
             ))
         }
 
-        // ── Joint-Poisson dispatch (memo 35 §P1/§P2) ──
-        (
-            InputData::Counts {
-                sample_counts,
-                open_beam_counts,
-            },
-            SolverConfig::JointPoisson(jp_cfg),
-        ) => {
-            // Use raw open-beam counts as O; joint-Poisson profiles λ̂ out
-            // using the explicit c from CountsBackgroundConfig.
-            let bg = vec![0.0f64; n_e];
-            fit_counts_joint_poisson(sample_counts, open_beam_counts, &bg, config, jp_cfg)
-        }
-        (
-            InputData::CountsWithNuisance {
-                sample_counts,
-                flux,
-                background,
-            },
-            SolverConfig::JointPoisson(jp_cfg),
-        ) => fit_counts_joint_poisson(sample_counts, flux, background, config, jp_cfg),
-
-        // Joint-Poisson requires counts input — transmission data doesn't
-        // have the (O, S) pair needed for the conditional-binomial form.
-        (InputData::Transmission { .. }, SolverConfig::JointPoisson(_)) => {
-            Err(PipelineError::InvalidParameter(
-                "JointPoisson solver requires raw counts (sample + open-beam), \
-                 not a transmission ratio.  Provide InputData::Counts or use LM/PoissonKL \
-                 on transmission data."
-                    .into(),
-            ))
-        }
-
         // Auto should be resolved by effective_solver
         (_, SolverConfig::Auto) => unreachable!("Auto should be resolved before dispatch"),
     }
+}
+
+/// Translate the user-facing `PoissonConfig` (payload of `SolverConfig::PoissonKL`)
+/// into the internal `JointPoissonFitConfig` required by `joint_poisson_fit`.
+///
+/// Copies `max_iter` (the only field both structures meaningfully share) and
+/// applies any spatial-level polish override carried on the `UnifiedFitConfig`.
+fn poisson_to_joint_poisson_config(
+    poisson_cfg: &PoissonConfig,
+    config: &UnifiedFitConfig,
+) -> JointPoissonFitConfig {
+    let mut jp_cfg = JointPoissonFitConfig {
+        max_iter: poisson_cfg.max_iter,
+        ..Default::default()
+    };
+    if let Some(override_val) = config.counts_enable_polish() {
+        jp_cfg.enable_polish = override_val;
+    }
+    jp_cfg
 }
 
 /// Convert counts to transmission: T = sample/open_beam, σ = √(max(sample,1))/open_beam.
@@ -801,20 +825,6 @@ fn fit_transmission_lm(
     // Build parameter vector
     let mut param_vec = build_density_params(config);
 
-    // Temperature parameter
-    let _temperature_index = if config.fit_temperature {
-        param_vec.push(FitParameter {
-            name: "temperature_k".into(),
-            value: config.temperature_k,
-            lower: 1.0,
-            upper: 5000.0,
-            fixed: false,
-        });
-        Some(n_density_params)
-    } else {
-        None
-    };
-
     // Guard: energy-scale + temperature fitting is not yet supported.
     // The EnergyScaleTransmissionModel does not wire the temperature parameter.
     if config.fit_energy_scale && config.fit_temperature {
@@ -825,28 +835,8 @@ fn fit_transmission_lm(
         ));
     }
 
-    // Energy-scale parameters (SAMMY TZERO equivalent)
-    let energy_scale_indices = if config.fit_energy_scale {
-        let t0_idx = param_vec.len();
-        param_vec.push(FitParameter {
-            name: "t0_us".into(),
-            value: config.t0_init_us,
-            lower: -10.0,
-            upper: 10.0,
-            fixed: false,
-        });
-        let ls_idx = param_vec.len();
-        param_vec.push(FitParameter {
-            name: "l_scale".into(),
-            value: config.l_scale_init,
-            lower: 0.99,
-            upper: 1.01,
-            fixed: false,
-        });
-        Some((t0_idx, ls_idx))
-    } else {
-        None
-    };
+    let _temperature_index = append_temperature_param(&mut param_vec, config);
+    let energy_scale_indices = append_energy_scale_params(&mut param_vec, config);
 
     // Background parameters
     let bg_indices = config
@@ -979,7 +969,6 @@ fn fit_transmission_poisson(
     let n_density_params = config.n_density_params();
     let mut param_vec = build_density_params(config);
 
-    // Temperature parameter
     if config.fit_temperature && config.fit_energy_scale {
         return Err(PipelineError::InvalidParameter(
             "fit_energy_scale and fit_temperature cannot both be true: \
@@ -987,42 +976,8 @@ fn fit_transmission_poisson(
                 .into(),
         ));
     }
-    let temperature_index = if config.fit_temperature {
-        let idx = param_vec.len();
-        param_vec.push(FitParameter {
-            name: "temperature_k".into(),
-            value: config.temperature_k,
-            lower: 1.0,
-            upper: 5000.0,
-            fixed: false,
-        });
-        Some(idx)
-    } else {
-        None
-    };
-
-    // Energy-scale parameters (same as LM path)
-    let energy_scale_indices = if config.fit_energy_scale {
-        let t0_idx = param_vec.len();
-        param_vec.push(FitParameter {
-            name: "t0_us".into(),
-            value: config.t0_init_us,
-            lower: -10.0,
-            upper: 10.0,
-            fixed: false,
-        });
-        let ls_idx = param_vec.len();
-        param_vec.push(FitParameter {
-            name: "l_scale".into(),
-            value: config.l_scale_init,
-            lower: 0.99,
-            upper: 1.01,
-            fixed: false,
-        });
-        Some((t0_idx, ls_idx))
-    } else {
-        None
-    };
+    let temperature_index = append_temperature_param(&mut param_vec, config);
+    let energy_scale_indices = append_energy_scale_params(&mut param_vec, config);
 
     // Background parameters — use same SAMMY-style model as LM
     let bg_indices = config
@@ -1139,322 +1094,6 @@ fn fit_transmission_poisson(
     Ok(sr)
 }
 
-/// Counts + Poisson KL path (statistically optimal).
-///
-/// Uses the same model architecture as the LM and KL-transmission paths:
-/// - `EnergyScaleTransmissionModel` when energy-scale fitting is enabled
-/// - `NormalizedTransmissionModel` for SAMMY-style background (Anorm + BackA/B/C)
-/// - `CountsModel` / `CountsBackgroundScaleModel` for the counts wrapper
-fn fit_counts_poisson(
-    sample_counts: &[f64],
-    flux: &[f64],
-    background: &[f64],
-    config: &UnifiedFitConfig,
-    poisson_cfg: &PoissonConfig,
-) -> Result<SpectrumFitResult, PipelineError> {
-    let mut poisson_cfg = poisson_cfg.clone();
-    poisson_cfg.compute_covariance = config.compute_covariance;
-    let poisson_cfg = &poisson_cfg;
-
-    let n_density_params = config.n_density_params();
-    let mut param_vec = build_density_params(config);
-
-    // Temperature parameter
-    if config.fit_temperature && config.fit_energy_scale {
-        return Err(PipelineError::InvalidParameter(
-            "fit_energy_scale and fit_temperature cannot both be true: \
-             EnergyScaleTransmissionModel does not support temperature fitting yet"
-                .into(),
-        ));
-    }
-    let temperature_index = if config.fit_temperature {
-        let idx = param_vec.len();
-        param_vec.push(FitParameter {
-            name: "temperature_k".into(),
-            value: config.temperature_k,
-            lower: 1.0,
-            upper: 5000.0,
-            fixed: false,
-        });
-        Some(idx)
-    } else {
-        None
-    };
-
-    // Energy-scale parameters (same as LM/KL-transmission paths)
-    let energy_scale_indices = if config.fit_energy_scale {
-        let t0_idx = param_vec.len();
-        param_vec.push(FitParameter {
-            name: "t0_us".into(),
-            value: config.t0_init_us,
-            lower: -10.0,
-            upper: 10.0,
-            fixed: false,
-        });
-        let ls_idx = param_vec.len();
-        param_vec.push(FitParameter {
-            name: "l_scale".into(),
-            value: config.l_scale_init,
-            lower: 0.99,
-            upper: 1.01,
-            fixed: false,
-        });
-        Some((t0_idx, ls_idx))
-    } else {
-        None
-    };
-
-    // Transmission background — use same SAMMY-style model as LM
-    let bg_indices = config
-        .transmission_background
-        .as_ref()
-        .map(|bg| append_background_params(&mut param_vec, bg));
-
-    // Counts-domain background (alpha_1, alpha_2 scaling)
-    let counts_bg = if let Some(bg) = config.counts_background() {
-        if bg.fit_alpha_1 && flux.iter().all(|&v| v.abs() <= 1e-12) {
-            return Err(PipelineError::InvalidParameter(
-                "counts background alpha_1 cannot be fitted with zero flux reference".into(),
-            ));
-        }
-        if bg.fit_alpha_2 && background.iter().all(|&v| v.abs() <= 1e-12) {
-            return Err(PipelineError::InvalidParameter(
-                "counts background alpha_2 cannot be fitted with zero detector background reference"
-                    .into(),
-            ));
-        }
-
-        let alpha1_idx = param_vec.len();
-        param_vec.push(if bg.fit_alpha_1 {
-            FitParameter {
-                name: "alpha_1".into(),
-                value: bg.alpha_1_init,
-                lower: 0.0,
-                upper: 10.0,
-                fixed: false,
-            }
-        } else {
-            FitParameter::fixed("alpha_1", bg.alpha_1_init)
-        });
-
-        let alpha2_idx = param_vec.len();
-        param_vec.push(if bg.fit_alpha_2 {
-            FitParameter {
-                name: "alpha_2".into(),
-                value: bg.alpha_2_init,
-                lower: 0.0,
-                upper: 10.0,
-                fixed: false,
-            }
-        } else {
-            FitParameter::fixed("alpha_2", bg.alpha_2_init)
-        });
-
-        Some((alpha1_idx, alpha2_idx))
-    } else {
-        None
-    };
-
-    let mut params = ParameterSet::new(param_vec);
-
-    // Build inner transmission model (energy-scale or precomputed)
-    let t_model: Box<dyn FitModel> = if let Some((t0_idx, ls_idx)) = energy_scale_indices {
-        let n_params = config.n_density_params();
-        let xs = if let Some(xs) = &config.precomputed_cross_sections {
-            Arc::clone(xs)
-        } else {
-            let instrument = config
-                .resolution
-                .clone()
-                .map(|r| Arc::new(InstrumentParams { resolution: r }));
-            let xs_raw = nereids_transmission::broadened_cross_sections(
-                config.energies(),
-                &config.resonance_data,
-                config.temperature_k,
-                instrument.as_deref(),
-                None,
-            )
-            .map_err(PipelineError::Transmission)?;
-            Arc::new(xs_raw)
-        };
-        let effective_xs =
-            if let (Some(di), Some(dr)) = (&config.density_indices, &config.density_ratios) {
-                if xs.len() == di.len() && di.len() == dr.len() {
-                    let n_e = xs[0].len();
-                    let mut eff = vec![vec![0.0f64; n_e]; n_params];
-                    for ((&idx, &ratio), member_xs) in di.iter().zip(dr.iter()).zip(xs.iter()) {
-                        for (j, &sigma_val) in member_xs.iter().enumerate() {
-                            eff[idx][j] += ratio * sigma_val;
-                        }
-                    }
-                    Arc::new(eff)
-                } else {
-                    xs
-                }
-            } else {
-                xs
-            };
-        let density_indices: Vec<usize> = (0..n_params).collect();
-        let instrument = config
-            .resolution
-            .clone()
-            .map(|r| Arc::new(InstrumentParams { resolution: r }));
-        Box::new(EnergyScaleTransmissionModel::new(
-            effective_xs,
-            Arc::new(density_indices),
-            config.energies.clone(),
-            config.flight_path_m,
-            t0_idx,
-            ls_idx,
-            instrument,
-        ))
-    } else {
-        build_transmission_model(config, n_density_params, temperature_index)?
-    };
-
-    let n_free = params.n_free();
-    let dof = sample_counts.len().saturating_sub(n_free).max(1);
-
-    // Build the model chain: transmission → background → counts
-    // The transmission background wraps the inner model with Anorm + BackA/B/C
-    // The counts model wraps that with flux * T + detector_background
-    let (pr, y_model) = if let Some(bi) = bg_indices {
-        let wrapped = if let (Some(di), Some(fi)) = (bi.back_d, bi.back_f) {
-            NormalizedTransmissionModel::new_with_exponential(
-                &*t_model,
-                config.energies(),
-                bi.anorm,
-                bi.back_a,
-                bi.back_b,
-                bi.back_c,
-                di,
-                fi,
-            )
-        } else {
-            NormalizedTransmissionModel::new(
-                &*t_model,
-                config.energies(),
-                bi.anorm,
-                bi.back_a,
-                bi.back_b,
-                bi.back_c,
-            )
-        };
-        if let Some((alpha1_idx, alpha2_idx)) = counts_bg {
-            let counts_model = poisson::CountsBackgroundScaleModel {
-                transmission_model: &wrapped,
-                flux,
-                background,
-                alpha1_index: alpha1_idx,
-                alpha2_index: alpha2_idx,
-                n_params: params.params.len(),
-            };
-            let pr = poisson::poisson_fit(&counts_model, sample_counts, &mut params, poisson_cfg)?;
-            let y_model = counts_model.evaluate(&pr.params)?;
-            (pr, y_model)
-        } else {
-            let counts_model = poisson::CountsModel {
-                transmission_model: &wrapped,
-                flux,
-                background,
-                n_params: params.params.len(),
-            };
-            let pr = poisson::poisson_fit(&counts_model, sample_counts, &mut params, poisson_cfg)?;
-            let y_model = counts_model.evaluate(&pr.params)?;
-            (pr, y_model)
-        }
-    } else {
-        if let Some((alpha1_idx, alpha2_idx)) = counts_bg {
-            let counts_model = poisson::CountsBackgroundScaleModel {
-                transmission_model: &*t_model,
-                flux,
-                background,
-                alpha1_index: alpha1_idx,
-                alpha2_index: alpha2_idx,
-                n_params: params.params.len(),
-            };
-            let pr = poisson::poisson_fit(&counts_model, sample_counts, &mut params, poisson_cfg)?;
-            let y_model = counts_model.evaluate(&pr.params)?;
-            (pr, y_model)
-        } else {
-            let counts_model = poisson::CountsModel {
-                transmission_model: &*t_model,
-                flux,
-                background,
-                n_params: params.params.len(),
-            };
-            let pr = poisson::poisson_fit(&counts_model, sample_counts, &mut params, poisson_cfg)?;
-            let y_model = counts_model.evaluate(&pr.params)?;
-            (pr, y_model)
-        }
-    };
-
-    // Pearson chi-squared for counts domain: Σ (obs - model)² / model
-    let chi_sq: f64 = sample_counts
-        .iter()
-        .zip(y_model.iter())
-        .map(|(&obs, &mdl)| {
-            let expected = mdl.max(1e-10);
-            (obs - expected).powi(2) / expected
-        })
-        .sum();
-
-    let densities: Vec<f64> = (0..n_density_params).map(|i| pr.params[i]).collect();
-    let fitted_temp = temperature_index.map(|idx| pr.params[idx]);
-
-    let (anorm, bg_array, back_d, back_f) = if let Some(bi) = bg_indices {
-        let bd = bi.back_d.map_or(0.0, |i| pr.params[i]);
-        let bf = bi.back_f.map_or(0.0, |i| pr.params[i]);
-        (
-            pr.params[bi.anorm],
-            [
-                pr.params[bi.back_a],
-                pr.params[bi.back_b],
-                pr.params[bi.back_c],
-            ],
-            bd,
-            bf,
-        )
-    } else {
-        let fitted_alpha1 = counts_bg.map_or(1.0, |(a1, _)| pr.params[a1]);
-        let fitted_alpha2 = counts_bg.map_or(0.0, |(_, a2)| pr.params[a2]);
-        (fitted_alpha1, [0.0, 0.0, fitted_alpha2], 0.0, 0.0)
-    };
-
-    let (uncertainties, temperature_k_unc) = if let Some(ref unc_all) = pr.uncertainties {
-        let dens_unc: Vec<f64> = (0..n_density_params)
-            .map(|i| *unc_all.get(i).unwrap_or(&f64::NAN))
-            .collect();
-        let t_unc = temperature_index.and_then(|idx| {
-            params
-                .free_indices()
-                .iter()
-                .position(|&fi| fi == idx)
-                .and_then(|pos| unc_all.get(pos).copied())
-        });
-        (Some(dens_unc), t_unc)
-    } else {
-        (None, None)
-    };
-
-    Ok(SpectrumFitResult {
-        densities,
-        uncertainties,
-        reduced_chi_squared: chi_sq / dof as f64,
-        converged: pr.converged,
-        iterations: pr.iterations,
-        temperature_k: fitted_temp,
-        temperature_k_unc,
-        anorm,
-        background: bg_array,
-        back_d,
-        back_f,
-        t0_us: energy_scale_indices.map(|(t0_idx, _)| pr.params[t0_idx]),
-        l_scale: energy_scale_indices.map(|(_, ls_idx)| pr.params[ls_idx]),
-        deviance_per_dof: None,
-    })
-}
-
 /// Joint-Poisson counts-path fitter (memo 35 §P1/§P2).
 ///
 /// Builds a pure transmission `FitModel` (density + optional temperature +
@@ -1537,41 +1176,8 @@ fn fit_counts_joint_poisson(
                 .into(),
         ));
     }
-    let temperature_index = if config.fit_temperature {
-        let idx = param_vec.len();
-        param_vec.push(FitParameter {
-            name: "temperature_k".into(),
-            value: config.temperature_k,
-            lower: 1.0,
-            upper: 5000.0,
-            fixed: false,
-        });
-        Some(idx)
-    } else {
-        None
-    };
-
-    let energy_scale_indices = if config.fit_energy_scale {
-        let t0_idx = param_vec.len();
-        param_vec.push(FitParameter {
-            name: "t0_us".into(),
-            value: config.t0_init_us,
-            lower: -10.0,
-            upper: 10.0,
-            fixed: false,
-        });
-        let ls_idx = param_vec.len();
-        param_vec.push(FitParameter {
-            name: "l_scale".into(),
-            value: config.l_scale_init,
-            lower: 0.99,
-            upper: 1.01,
-            fixed: false,
-        });
-        Some((t0_idx, ls_idx))
-    } else {
-        None
-    };
+    let temperature_index = append_temperature_param(&mut param_vec, config);
+    let energy_scale_indices = append_energy_scale_params(&mut param_vec, config);
 
     // ── Transmission background (A_n + B_A/B/C) parameters, P2.2 ──
     // Use the same SAMMY-style param block as the LM transmission path.
@@ -1760,6 +1366,60 @@ fn build_density_params(config: &UnifiedFitConfig) -> Vec<FitParameter> {
             )
         })
         .collect()
+}
+
+/// Append a temperature parameter to the fit vector if
+/// `config.fit_temperature` is `true`.  Returns the parameter index.
+///
+/// Bounds [1.0, 5000.0] K match the transmission / counts fit paths.
+/// Temperature unit is Kelvin; the initial value is `config.temperature_k`.
+fn append_temperature_param(
+    param_vec: &mut Vec<FitParameter>,
+    config: &UnifiedFitConfig,
+) -> Option<usize> {
+    if !config.fit_temperature {
+        return None;
+    }
+    let idx = param_vec.len();
+    param_vec.push(FitParameter {
+        name: "temperature_k".into(),
+        value: config.temperature_k,
+        lower: 1.0,
+        upper: 5000.0,
+        fixed: false,
+    });
+    Some(idx)
+}
+
+/// Append SAMMY TZERO energy-scale parameters (t_0 and L_scale) when
+/// `config.fit_energy_scale` is `true`.  Returns `(t0_idx, l_scale_idx)`.
+///
+/// Bounds: `t_0 ∈ [-10.0, 10.0] μs` and `L_scale ∈ [0.99, 1.01]`
+/// (dimensionless).  Matches the LM / KL transmission paths.
+fn append_energy_scale_params(
+    param_vec: &mut Vec<FitParameter>,
+    config: &UnifiedFitConfig,
+) -> Option<(usize, usize)> {
+    if !config.fit_energy_scale {
+        return None;
+    }
+    let t0_idx = param_vec.len();
+    param_vec.push(FitParameter {
+        name: "t0_us".into(),
+        value: config.t0_init_us,
+        lower: -10.0,
+        upper: 10.0,
+        fixed: false,
+    });
+    let ls_idx = param_vec.len();
+    param_vec.push(FitParameter {
+        name: "l_scale".into(),
+        value: config.l_scale_init,
+        lower: 0.99,
+        upper: 1.01,
+        fixed: false,
+    });
+    Some((t0_idx, ls_idx))
 }
 
 fn append_background_params(
@@ -2413,12 +2073,14 @@ pub struct SpectrumFitResult {
     /// Fitted flight-path scale factor (SAMMY TZERO L₀, dimensionless).
     /// `None` when energy-scale fitting is not enabled.
     pub l_scale: Option<f64>,
-    /// Joint-Poisson conditional binomial deviance divided by `(n − k)`
-    /// (memo 35 §P1.2 — primary GOF for `SolverConfig::JointPoisson`).
+    /// Conditional binomial deviance divided by `(n − k)`
+    /// (memo 35 §P1.2 — primary GOF for the counts-KL dispatch, i.e.
+    /// `SolverConfig::PoissonKL` on `InputData::Counts` or
+    /// `InputData::CountsWithNuisance`).
     ///
-    /// `Some(D/dof)` when the joint-Poisson solver was used;
-    /// `None` for LM and legacy Poisson-KL paths (those populate
-    /// `reduced_chi_squared` with Pearson χ² / (n−k) instead).
+    /// `Some(D/dof)` when the counts-KL (joint-Poisson) path was used;
+    /// `None` for the LM path and for transmission + PoissonKL (those
+    /// populate `reduced_chi_squared` with Pearson χ² / (n−k) instead).
     pub deviance_per_dof: Option<f64>,
 }
 
@@ -2983,203 +2645,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_typed_counts_poisson_kl_with_background() {
-        let data = u238_single_resonance();
-        let true_density = 0.0005;
-        let true_b0 = 0.012;
-        let true_b1 = 0.008;
-        let detector_bg = 2.0;
-        let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
-        let (t, _) = synthetic_transmission(&data, true_density, &energies);
-        let flux = vec![1000.0; energies.len()];
-        let background = vec![detector_bg; energies.len()];
-        let sample_counts: Vec<f64> = t
-            .iter()
-            .zip(energies.iter())
-            .zip(flux.iter())
-            .zip(background.iter())
-            .map(|(((&ti, &e), &f), &bg)| f * (ti + true_b0 + true_b1 / e.sqrt()) + bg)
-            .collect();
-
-        let config = UnifiedFitConfig::new(
-            energies,
-            vec![data],
-            vec!["U-238".into()],
-            0.0,
-            None,
-            vec![0.001],
-        )
-        .unwrap()
-        .with_solver(SolverConfig::PoissonKL(PoissonConfig {
-            max_iter: 120,
-            gauss_newton_lambda: 1e-4,
-            ..PoissonConfig::default()
-        }))
-        .with_transmission_background(BackgroundConfig::default());
-
-        let input = InputData::CountsWithNuisance {
-            sample_counts,
-            flux,
-            background,
-        };
-
-        let result = fit_spectrum_typed(&input, &config).unwrap();
-
-        assert!(result.converged, "fit did not converge: {result:?}");
-        assert!(
-            (result.densities[0] - true_density).abs() / true_density < 0.02,
-            "density: fitted={}, true={true_density}",
-            result.densities[0]
-        );
-        assert!(
-            (result.background[0] - true_b0).abs() < 5e-3,
-            "background b0: fitted={}, true={true_b0}",
-            result.background[0]
-        );
-        assert!(
-            (result.background[1] - true_b1).abs() < 5e-3,
-            "background b1: fitted={}, true={true_b1}",
-            result.background[1]
-        );
-    }
-
-    #[test]
-    fn test_typed_counts_poisson_kl_with_temperature_and_background() {
-        let data = u238_single_resonance();
-        let true_density = 0.0005;
-        let true_temp = 350.0;
-        let true_b0 = 0.012;
-        let true_b1 = 0.008;
-        let detector_bg = 2.0;
-        let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
-        let (t, _) = synthetic_transmission_at_temp(&data, true_density, true_temp, &energies);
-        let flux = vec![1000.0; energies.len()];
-        let background = vec![detector_bg; energies.len()];
-        let sample_counts: Vec<f64> = t
-            .iter()
-            .zip(energies.iter())
-            .zip(flux.iter())
-            .zip(background.iter())
-            .map(|(((&ti, &e), &f), &bg)| f * (ti + true_b0 + true_b1 / e.sqrt()) + bg)
-            .collect();
-
-        let config = UnifiedFitConfig::new(
-            energies,
-            vec![data],
-            vec!["U-238".into()],
-            300.0,
-            None,
-            vec![0.001],
-        )
-        .unwrap()
-        .with_solver(SolverConfig::PoissonKL(PoissonConfig {
-            max_iter: 120,
-            gauss_newton_lambda: 1e-4,
-            ..PoissonConfig::default()
-        }))
-        .with_fit_temperature(true)
-        .with_transmission_background(BackgroundConfig::default());
-
-        let input = InputData::CountsWithNuisance {
-            sample_counts,
-            flux,
-            background,
-        };
-
-        let result = fit_spectrum_typed(&input, &config).unwrap();
-
-        assert!(result.converged, "fit did not converge: {result:?}");
-        assert!(
-            (result.densities[0] - true_density).abs() / true_density < 0.02,
-            "density: fitted={}, true={true_density}",
-            result.densities[0]
-        );
-
-        let fitted_temp = result
-            .temperature_k
-            .expect("temperature_k should be Some when fit_temperature=true");
-        assert!(
-            (fitted_temp - true_temp).abs() < 3.0,
-            "temperature: fitted={fitted_temp}, true={true_temp}, delta={}",
-            (fitted_temp - true_temp).abs(),
-        );
-        assert!(
-            (result.background[0] - true_b0).abs() < 5e-3,
-            "background b0: fitted={}, true={true_b0}",
-            result.background[0]
-        );
-        assert!(
-            (result.background[1] - true_b1).abs() < 5e-3,
-            "background b1: fitted={}, true={true_b1}",
-            result.background[1]
-        );
-    }
-
-    #[test]
-    fn test_typed_counts_poisson_kl_with_counts_background_scales() {
-        let data = u238_single_resonance();
-        let true_density = 0.002;
-        let true_alpha1 = 0.92;
-        let true_alpha2 = 1.35;
-        let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
-        let (t, _) = synthetic_transmission(&data, true_density, &energies);
-        let flux = vec![120.0; energies.len()];
-        let background: Vec<f64> = energies.iter().map(|&e| 30.0 + 8.0 / e.sqrt()).collect();
-        let sample_counts: Vec<f64> = t
-            .iter()
-            .zip(flux.iter())
-            .zip(background.iter())
-            .map(|((&ti, &f), &bg)| true_alpha1 * f * ti + true_alpha2 * bg)
-            .collect();
-
-        let config = UnifiedFitConfig::new(
-            energies,
-            vec![data],
-            vec!["U-238".into()],
-            0.0,
-            None,
-            vec![0.001],
-        )
-        .unwrap()
-        .with_solver(SolverConfig::PoissonKL(PoissonConfig {
-            max_iter: 120,
-            gauss_newton_lambda: 1e-4,
-            ..PoissonConfig::default()
-        }))
-        .with_counts_background(CountsBackgroundConfig {
-            alpha_1_init: 1.0,
-            alpha_2_init: 1.0,
-            fit_alpha_1: true,
-            fit_alpha_2: true,
-            c: 1.0,
-        });
-
-        let input = InputData::CountsWithNuisance {
-            sample_counts,
-            flux,
-            background,
-        };
-
-        let result = fit_spectrum_typed(&input, &config).unwrap();
-
-        assert!(result.converged, "fit did not converge: {result:?}");
-        assert!(
-            (result.densities[0] - true_density).abs() / true_density < 0.02,
-            "density: fitted={}, true={true_density}",
-            result.densities[0]
-        );
-        assert!(
-            (result.anorm - true_alpha1).abs() < 5e-3,
-            "alpha_1/anorm: fitted={}, true={true_alpha1}",
-            result.anorm
-        );
-        assert!(
-            (result.background[2] - true_alpha2).abs() < 5e-3,
-            "alpha_2/background[2]: fitted={}, true={true_alpha2}",
-            result.background[2]
-        );
-    }
+    // Removed as part of the counts-KL collapse (Phase 0):
+    //   - test_typed_counts_poisson_kl_with_background
+    //   - test_typed_counts_poisson_kl_with_temperature_and_background
+    //   - test_typed_counts_poisson_kl_with_counts_background_scales
+    // These tested the legacy fixed-flux `fit_counts_poisson` path with
+    // nonzero detector_background and alpha_1/alpha_2 nuisance fitting.
+    // The new counts-KL dispatch (joint-Poisson profile deviance) rejects
+    // nonzero detector_background (P3.2-deferred) and alpha_1/alpha_2
+    // (λ̂ absorbs the global flux scale; memo 35 §P1).  End-to-end
+    // counts+PoissonKL coverage is provided by
+    // `test_joint_poisson_density_recovery_c_5_98` and
+    // `test_joint_poisson_with_transmission_background`.
 
     /// Round-trip test: create a group of 2 isotopes with known ratios,
     /// generate synthetic transmission, fit with group constraints,
@@ -3633,7 +3110,6 @@ mod tests {
         let open_beam_counts: Vec<f64> = vec![lam_ob; energies.len()];
         let sample_counts: Vec<f64> = t.iter().map(|&ti| c * lam_ob * ti).collect();
 
-        let jp_cfg = JointPoissonFitConfig::default();
         let config = UnifiedFitConfig::new(
             energies,
             vec![data],
@@ -3643,7 +3119,7 @@ mod tests {
             vec![0.001],
         )
         .unwrap()
-        .with_solver(SolverConfig::JointPoisson(jp_cfg))
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
         .with_counts_background(CountsBackgroundConfig {
             c,
             ..Default::default()
@@ -3701,7 +3177,7 @@ mod tests {
             vec![0.001],
         )
         .unwrap()
-        .with_solver(SolverConfig::JointPoisson(JointPoissonFitConfig::default()))
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
         .with_counts_background(CountsBackgroundConfig {
             fit_alpha_1: true,
             c: 1.0,
@@ -3720,9 +3196,11 @@ mod tests {
         );
     }
 
-    /// `JointPoisson` rejects transmission input (no O/S pair available).
+    /// Transmission + PoissonKL is a valid combination (routes to
+    /// `fit_transmission_poisson`, unchanged by the counts-KL collapse).
+    /// This test asserts the transmission-KL path still works end-to-end.
     #[test]
-    fn test_joint_poisson_rejects_transmission_input() {
+    fn test_transmission_poisson_kl_dispatches_to_transmission_path() {
         let data = u238_single_resonance();
         let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.05).collect();
         let (t, u) = synthetic_transmission(&data, 0.0005, &energies);
@@ -3736,14 +3214,18 @@ mod tests {
             vec![0.001],
         )
         .unwrap()
-        .with_solver(SolverConfig::JointPoisson(JointPoissonFitConfig::default()));
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()));
 
         let input = InputData::Transmission {
             transmission: t,
             uncertainty: u,
         };
-        let err = fit_spectrum_typed(&input, &config).unwrap_err();
-        assert!(err.to_string().contains("JointPoisson"));
+        let r = fit_spectrum_typed(&input, &config).unwrap();
+        // Transmission-KL path does NOT report deviance_per_dof (that's
+        // the counts-domain joint-Poisson GOF only); reduced_chi_squared
+        // is the transmission Poisson NLL measure.
+        assert!(r.deviance_per_dof.is_none());
+        assert!(r.reduced_chi_squared.is_finite());
     }
 
     // ──────────────────────────────────────────────────────────────────
@@ -3801,7 +3283,7 @@ mod tests {
             vec![0.001],
         )
         .unwrap()
-        .with_solver(SolverConfig::JointPoisson(JointPoissonFitConfig::default()))
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
         .with_counts_background(CountsBackgroundConfig {
             c,
             ..Default::default()
@@ -3874,7 +3356,7 @@ mod tests {
             vec![0.001],
         )
         .unwrap()
-        .with_solver(SolverConfig::JointPoisson(JointPoissonFitConfig::default()))
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
         .with_counts_background(CountsBackgroundConfig {
             c: 1.0,
             ..Default::default()
@@ -3916,7 +3398,7 @@ mod tests {
             vec![0.001],
         )
         .unwrap()
-        .with_solver(SolverConfig::JointPoisson(JointPoissonFitConfig::default()))
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
         .with_counts_background(CountsBackgroundConfig {
             c: 1.0,
             ..Default::default()
