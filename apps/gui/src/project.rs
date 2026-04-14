@@ -1028,6 +1028,10 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
             density_maps,
             uncertainty_maps,
             chi_squared_map,
+            // Project-file restores predate the D/dof map; leave None until
+            // we decide whether to persist it (low priority — the map is
+            // reproducible by re-running spatial_map_typed).
+            deviance_per_dof_map: None,
             converged_map,
             temperature_map: snap.temperature_map,
             temperature_uncertainty_map: snap.temperature_uncertainty_map,

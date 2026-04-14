@@ -23,8 +23,16 @@ pub struct SpatialResult {
     pub density_maps: Vec<Array2<f64>>,
     /// Uncertainty maps, one per isotope.
     pub uncertainty_maps: Vec<Array2<f64>>,
-    /// Reduced chi-squared map.
+    /// Reduced chi-squared map.  For the counts-KL dispatch (joint-Poisson
+    /// deviance per memo 35 §P1.2) this is back-compat-mirrored to
+    /// `D/(n−k)`; the semantically-correct per-pixel value is also
+    /// exposed as [`Self::deviance_per_dof_map`].
     pub chi_squared_map: Array2<f64>,
+    /// Per-pixel conditional binomial deviance `D/(n−k)` map.  `Some` when
+    /// the effective per-pixel solver is the counts-KL dispatch
+    /// (joint-Poisson); `None` for LM-only runs and transmission+PoissonKL
+    /// where Pearson χ²/dof is the GOF.
+    pub deviance_per_dof_map: Option<Array2<f64>>,
     /// Convergence map (true = converged).
     pub converged_map: Array2<bool>,
     /// Fitted temperature map (K). `Some` when `config.fit_temperature()` is true.
@@ -90,6 +98,13 @@ impl InputData3D<'_> {
             Self::CountsWithNuisance { sample_counts, .. } => sample_counts.shape(),
         };
         (s[0], s[1], s[2])
+    }
+
+    /// `true` when the input is a counts variant (Counts or CountsWithNuisance)
+    /// — i.e. the per-pixel dispatch goes through the counts-KL path
+    /// (joint-Poisson deviance) rather than transmission.
+    pub fn is_counts(&self) -> bool {
+        matches!(self, Self::Counts { .. } | Self::CountsWithNuisance { .. })
     }
 }
 
@@ -200,6 +215,11 @@ pub fn spatial_map_typed(
                 .map(|_| Array2::from_elem((height, width), f64::NAN))
                 .collect(),
             chi_squared_map: Array2::from_elem((height, width), f64::NAN),
+            deviance_per_dof_map: if input.is_counts() {
+                Some(Array2::from_elem((height, width), f64::NAN))
+            } else {
+                None
+            },
             converged_map: Array2::from_elem((height, width), false),
             temperature_map: if config.fit_temperature() {
                 Some(Array2::from_elem((height, width), f64::NAN))
@@ -347,6 +367,19 @@ pub fn spatial_map_typed(
             .with_compute_covariance(true)
     };
 
+    // Auto-disable Nelder-Mead polish for multi-pixel counts-KL spatial
+    // maps (memo 38 §6 recommendation).  Polish is a single-spectrum
+    // research knob — on the VENUS Hf 120min aggregated fit it took
+    // ~1 000 s; at 512 × 512 pixels that is untenable even with rayon.
+    // Per-pixel fits also rarely hit the over-parameterized stall regime
+    // polish targets.  The caller can force polish back on via
+    // [`UnifiedFitConfig::with_counts_enable_polish(Some(true))`].
+    let fast_config = if pixel_coords.len() > 1 && fast_config.counts_enable_polish().is_none() {
+        fast_config.with_counts_enable_polish(Some(false))
+    } else {
+        fast_config
+    };
+
     // For counts data: spatially average the open beam to get a stable flux
     // estimate, reducing per-pixel open-beam shot noise.
     // Without this, per-pixel open-beam shot noise contaminates the flux
@@ -463,6 +496,11 @@ pub fn spatial_map_typed(
         .map(|_| Array2::from_elem((height, width), f64::NAN))
         .collect();
     let mut chi_squared_map = Array2::from_elem((height, width), f64::NAN);
+    let mut deviance_per_dof_map: Option<Array2<f64>> = if input.is_counts() {
+        Some(Array2::from_elem((height, width), f64::NAN))
+    } else {
+        None
+    };
     let mut converged_map = Array2::from_elem((height, width), false);
     let mut anorm_map: Option<Array2<f64>> = if has_background_outputs {
         Some(Array2::from_elem((height, width), f64::NAN))
@@ -498,6 +536,9 @@ pub fn spatial_map_typed(
             }
         }
         chi_squared_map[[*y, *x]] = result.reduced_chi_squared;
+        if let (Some(dpd), Some(v)) = (&mut deviance_per_dof_map, result.deviance_per_dof) {
+            dpd[[*y, *x]] = v;
+        }
         converged_map[[*y, *x]] = result.converged;
         if let (Some(t_map), Some(t)) = (&mut temperature_map, result.temperature_k) {
             t_map[[*y, *x]] = t;
@@ -524,6 +565,7 @@ pub fn spatial_map_typed(
         density_maps,
         uncertainty_maps,
         chi_squared_map,
+        deviance_per_dof_map,
         converged_map,
         temperature_map,
         temperature_uncertainty_map,
@@ -1091,5 +1133,122 @@ mod tests {
                 "unconverged pixel uncertainty should be NaN, got {u}"
             );
         }
+    }
+
+    // ── Counts-KL spatial path (post-collapse) ────────────────────────
+
+    /// Spatial counts-KL dispatch routes through `fit_counts_joint_poisson`
+    /// and populates `deviance_per_dof_map`.  Polish auto-disable makes
+    /// the per-pixel fits fast enough to run in a unit test; the result
+    /// still recovers density on noise-free synthetic.
+    #[test]
+    fn test_spatial_map_typed_counts_kl_populates_deviance_per_dof_map() {
+        let data = u238_single_resonance();
+        let true_density = 0.0005;
+        let energies: Vec<f64> = (0..101).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let (t_3d, _) = synthetic_4x4_transmission(&data, true_density, &energies);
+        let n_e = energies.len();
+
+        // Synthesize counts: c=2.0, lam_ob=500.  E[O]=lam_ob, E[S]=c·lam_ob·T.
+        let c_val = 2.0_f64;
+        let lam_ob = 500.0_f64;
+        let mut sample = Array3::zeros((n_e, 4, 4));
+        let mut open_beam = Array3::from_elem((n_e, 4, 4), lam_ob);
+        for y in 0..4 {
+            for x in 0..4 {
+                for (i, _) in energies.iter().enumerate() {
+                    open_beam[[i, y, x]] = lam_ob;
+                    sample[[i, y, x]] = c_val * lam_ob * t_3d[[i, y, x]];
+                }
+            }
+        }
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
+        .with_counts_background(crate::pipeline::CountsBackgroundConfig {
+            c: c_val,
+            ..Default::default()
+        });
+
+        let input = InputData3D::Counts {
+            sample_counts: sample.view(),
+            open_beam_counts: open_beam.view(),
+        };
+        let r = spatial_map_typed(&input, &config, None, None, None).unwrap();
+        // Deviance map populated (counts-KL path).
+        let dpd = r
+            .deviance_per_dof_map
+            .as_ref()
+            .expect("counts-KL spatial should populate deviance_per_dof_map");
+        assert_eq!(dpd.shape(), &[4, 4]);
+        let sample_val = dpd[[0, 0]];
+        assert!(
+            sample_val.is_finite(),
+            "deviance_per_dof_map[0,0] = {sample_val} (should be finite)"
+        );
+        // Density recovery (noise-free).
+        let density_mean: f64 = r.density_maps[0].iter().copied().sum::<f64>() / 16.0;
+        assert!(
+            (density_mean - true_density).abs() / true_density < 0.05,
+            "mean density {density_mean} vs truth {true_density}",
+        );
+    }
+
+    /// Polish auto-disable: the per-pixel dispatcher disables Nelder-Mead
+    /// polish when n_pixels > 1 and the caller hasn't overridden.
+    /// Verified indirectly by timing — with polish on the fit would hit
+    /// the ~1000-iter cap; auto-disable keeps it fast.
+    #[test]
+    fn test_spatial_map_typed_counts_kl_auto_disables_polish() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let (t_3d, _) = synthetic_4x4_transmission(&data, 0.0005, &energies);
+        let n_e = energies.len();
+
+        let mut sample = Array3::zeros((n_e, 4, 4));
+        let open_beam = Array3::from_elem((n_e, 4, 4), 500.0);
+        for y in 0..4 {
+            for x in 0..4 {
+                for i in 0..n_e {
+                    sample[[i, y, x]] = 500.0 * t_3d[[i, y, x]];
+                }
+            }
+        }
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()));
+
+        let input = InputData3D::Counts {
+            sample_counts: sample.view(),
+            open_beam_counts: open_beam.view(),
+        };
+        let start = std::time::Instant::now();
+        let r = spatial_map_typed(&input, &config, None, None, None).unwrap();
+        let elapsed = start.elapsed();
+        // With polish auto-disabled, the 4x4 grid (16 pixels) on a tiny
+        // 51-bin spectrum should complete well under 10 s even in debug
+        // builds.  With polish enabled per pixel we'd expect ≥ several
+        // seconds per pixel × 16 pixels = much longer.
+        assert!(
+            elapsed.as_secs() < 30,
+            "spatial counts-KL ran for {elapsed:?} — polish autodisable may not be in effect",
+        );
+        assert!(r.deviance_per_dof_map.is_some());
     }
 }
