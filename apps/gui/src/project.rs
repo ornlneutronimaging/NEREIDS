@@ -301,6 +301,8 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         uncertainty_is_estimated: Some(state.uncertainty_is_estimated),
         lm_background_enabled: Some(state.lm_background_enabled),
         kl_background_enabled: Some(state.kl_background_enabled),
+        kl_c_ratio: Some(state.kl_c_ratio),
+        kl_enable_polish_override: Some(state.kl_enable_polish_override),
         resolution_enabled: state.resolution_enabled,
         resolution_kind: resolution_kind.into(),
         delta_t_us,
@@ -885,6 +887,8 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
     state.uncertainty_is_estimated = snap.uncertainty_is_estimated.unwrap_or(false);
     state.lm_background_enabled = snap.lm_background_enabled.unwrap_or(false);
     state.kl_background_enabled = snap.kl_background_enabled.unwrap_or(false);
+    state.kl_c_ratio = snap.kl_c_ratio.unwrap_or(1.0);
+    state.kl_enable_polish_override = snap.kl_enable_polish_override.unwrap_or(None);
 
     // 10. Restore resolution
     state.resolution_enabled = snap.resolution_enabled;

@@ -838,7 +838,11 @@ fn fit_transmission_lm(
     let _temperature_index = append_temperature_param(&mut param_vec, config);
     let energy_scale_indices = append_energy_scale_params(&mut param_vec, config);
 
-    // Background parameters
+    // Background parameters (rejects partial BackD/BackF; see
+    // validate_transmission_background docstring).
+    if let Some(bg) = config.transmission_background.as_ref() {
+        validate_transmission_background(bg)?;
+    }
     let bg_indices = config
         .transmission_background
         .as_ref()
@@ -979,7 +983,11 @@ fn fit_transmission_poisson(
     let temperature_index = append_temperature_param(&mut param_vec, config);
     let energy_scale_indices = append_energy_scale_params(&mut param_vec, config);
 
-    // Background parameters — use same SAMMY-style model as LM
+    // Background parameters — use same SAMMY-style model as LM, with the
+    // same partial-BackD/BackF rejection.
+    if let Some(bg) = config.transmission_background.as_ref() {
+        validate_transmission_background(bg)?;
+    }
     let bg_indices = config
         .transmission_background
         .as_ref()
@@ -1423,6 +1431,36 @@ fn append_energy_scale_params(
         fixed: false,
     });
     Some((t0_idx, ls_idx))
+}
+
+/// Validate that the SAMMY-style `BackgroundConfig` is internally
+/// consistent for the purposes of the production fit dispatch.
+///
+/// **BackD / BackF must travel together.**  The
+/// `NormalizedTransmissionModel` exponential-tail wrapper takes both
+/// indices or neither (`new_with_exponential` requires both, `new` takes
+/// neither).  Allowing only one of `fit_back_d` / `fit_back_f` would
+/// leave the other parameter registered as "free" but absent from the
+/// objective and Jacobian — silently fitting nothing while reporting a
+/// misleading initial value back to the caller.  Reject the partial
+/// configuration up-front with a clear error.
+///
+/// Idempotent on valid configs; intended to be called by every
+/// production fit entry that takes a `transmission_background`.
+pub(crate) fn validate_transmission_background(bg: &BackgroundConfig) -> Result<(), PipelineError> {
+    if bg.fit_back_d != bg.fit_back_f {
+        return Err(PipelineError::InvalidParameter(format!(
+            "transmission_background: fit_back_d ({}) and fit_back_f ({}) \
+             must both be true or both be false. The exponential tail \
+             wrapper (BackD · exp(−BackF / √E)) requires both parameters \
+             together; enabling only one leaves the other registered but \
+             unused, silently producing the initial value as the fitted \
+             result. Either enable both (to fit the exponential tail) or \
+             disable both (4-term wrapper without exponential).",
+            bg.fit_back_d, bg.fit_back_f,
+        )));
+    }
+    Ok(())
 }
 
 fn append_background_params(
@@ -3421,6 +3459,124 @@ mod tests {
         assert!(
             err.to_string().contains("BackD") || err.to_string().contains("§P4"),
             "expected BackD/BackF rejection, got: {err}"
+        );
+    }
+
+    /// Partial BackD/BackF configurations are rejected with a clear error
+    /// on the LM transmission path.  Regression for code-review finding:
+    /// pre-fix, `append_background_params` allocated a free index for the
+    /// enabled tail parameter but `NormalizedTransmissionModel::new`
+    /// (4-term wrapper, fall-back when only one of back_d/back_f was
+    /// `Some`) ignored it — the parameter sat at its initial value and
+    /// fitter reported it as the "fitted" result.
+    #[test]
+    fn test_lm_transmission_rejects_partial_back_d_only() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.05).collect();
+        let (t, u) = synthetic_transmission(&data, 0.0005, &energies);
+
+        let bg = BackgroundConfig {
+            // BackD enabled, BackF disabled — the partial config the
+            // pre-fix code silently accepted.
+            fit_back_d: true,
+            fit_back_f: false,
+            ..BackgroundConfig::default()
+        };
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
+        .with_transmission_background(bg);
+
+        let input = InputData::Transmission {
+            transmission: t,
+            uncertainty: u,
+        };
+        let err = fit_spectrum_typed(&input, &config).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("fit_back_d") && msg.contains("fit_back_f"),
+            "expected partial-BackD/F rejection mentioning both flags, got: {msg}"
+        );
+    }
+
+    /// Symmetric case: BackF enabled without BackD — same rejection.
+    #[test]
+    fn test_lm_transmission_rejects_partial_back_f_only() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.05).collect();
+        let (t, u) = synthetic_transmission(&data, 0.0005, &energies);
+
+        let bg = BackgroundConfig {
+            fit_back_d: false,
+            fit_back_f: true,
+            ..BackgroundConfig::default()
+        };
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
+        .with_transmission_background(bg);
+
+        let input = InputData::Transmission {
+            transmission: t,
+            uncertainty: u,
+        };
+        let err = fit_spectrum_typed(&input, &config).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("fit_back_d") && msg.contains("fit_back_f"),
+            "expected partial-BackD/F rejection mentioning both flags, got: {msg}"
+        );
+    }
+
+    /// Same rule on the transmission Poisson-KL path.
+    #[test]
+    fn test_transmission_poisson_kl_rejects_partial_back_d_f() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.05).collect();
+        let (t, u) = synthetic_transmission(&data, 0.0005, &energies);
+
+        let bg = BackgroundConfig {
+            fit_back_d: true,
+            fit_back_f: false,
+            ..BackgroundConfig::default()
+        };
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
+        .with_transmission_background(bg);
+
+        let input = InputData::Transmission {
+            transmission: t,
+            uncertainty: u,
+        };
+        let err = fit_spectrum_typed(&input, &config).unwrap_err();
+        assert!(
+            err.to_string().contains("fit_back_d"),
+            "expected partial-BackD/F rejection on transmission-PoissonKL path"
         );
     }
 }

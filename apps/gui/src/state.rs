@@ -64,6 +64,15 @@ pub struct SessionCache {
     /// KL background enabled (b₀ + b₁/√E).
     #[serde(default)]
     pub kl_background_enabled: bool,
+    /// Counts-KL proton-charge ratio `c = Q_s / Q_ob` (memo 35 §P1.3).
+    /// Defaults to 1.0 (caller PC-normalized the flux upstream).
+    #[serde(default = "default_kl_c_ratio")]
+    pub kl_c_ratio: f64,
+    /// Counts-KL Nelder-Mead polish override.  `None` = dispatcher
+    /// auto-disables polish for multi-pixel spatial fits (memo 38 §6).
+    /// `Some(true/false)` forces polish on/off.
+    #[serde(default)]
+    pub kl_enable_polish_override: Option<bool>,
     /// Isotope groups: (z, name, members, density, enabled).
     /// ResonanceData is not serialized — members get Pending status on restore.
     #[serde(default)]
@@ -79,6 +88,11 @@ fn default_rebin_factor() -> usize {
 pub enum CachedSolverMethod {
     LevenbergMarquardt,
     PoissonKL,
+}
+
+/// Default for SessionCache::kl_c_ratio when a saved session predates the field.
+fn default_kl_c_ratio() -> f64 {
+    1.0
 }
 
 /// A cached isotope entry (serializable).
@@ -163,6 +177,8 @@ impl SessionCache {
             sidebar_collapsed: state.sidebar_collapsed,
             lm_background_enabled: state.lm_background_enabled,
             kl_background_enabled: state.kl_background_enabled,
+            kl_c_ratio: state.kl_c_ratio,
+            kl_enable_polish_override: state.kl_enable_polish_override,
             isotope_groups: state
                 .isotope_groups
                 .iter()
@@ -280,6 +296,8 @@ impl SessionCache {
         // Restore background normalization state
         state.lm_background_enabled = self.lm_background_enabled;
         state.kl_background_enabled = self.kl_background_enabled;
+        state.kl_c_ratio = self.kl_c_ratio;
+        state.kl_enable_polish_override = self.kl_enable_polish_override;
 
         // Rebuild pipeline
         state.rebuild_pipeline();

@@ -168,6 +168,15 @@ pub struct ProjectSnapshot {
     pub lm_background_enabled: Option<bool>,
     /// Whether KL background fitting (b0 + b1/sqrt(E)) is enabled.
     pub kl_background_enabled: Option<bool>,
+    /// Counts-KL proton-charge ratio `c = Q_s / Q_ob` (memo 35 §P1.3).
+    /// `None` for project files predating the field; restore-side
+    /// defaults to 1.0.
+    pub kl_c_ratio: Option<f64>,
+    /// Counts-KL Nelder-Mead polish override (memo 38 §6).  `None` =
+    /// dispatcher auto-disable for multi-pixel; `Some(true/false)` =
+    /// forced.  Outer `Option` distinguishes "not stored" from
+    /// "explicitly None".
+    pub kl_enable_polish_override: Option<Option<bool>>,
 
     // -- endf_cache --
     /// (symbol, resonance_data) pairs for offline loading.
@@ -262,6 +271,8 @@ impl Default for ProjectSnapshot {
             uncertainty_is_estimated: None,
             lm_background_enabled: None,
             kl_background_enabled: None,
+            kl_c_ratio: None,
+            kl_enable_polish_override: None,
             endf_cache: vec![],
             provenance: vec![],
         }
@@ -558,6 +569,19 @@ fn write_config(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoError
     }
     if let Some(kl_bg) = snap.kl_background_enabled {
         write_bool_attr(&solver, "kl_background_enabled", kl_bg)?;
+    }
+    if let Some(c) = snap.kl_c_ratio {
+        write_f64_attr(&solver, "kl_c_ratio", c)?;
+    }
+    // Tri-state polish override is encoded as a string attribute so the
+    // distinction between "auto" (None) and "Some(false)" is preserved.
+    if let Some(polish) = snap.kl_enable_polish_override {
+        let s = match polish {
+            None => "auto",
+            Some(true) => "on",
+            Some(false) => "off",
+        };
+        write_str_attr(&solver, "kl_polish_override", s)?;
     }
 
     // Resolution
@@ -1219,6 +1243,15 @@ fn read_config(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoEr
     snap.uncertainty_is_estimated = read_bool_attr(&solver, "uncertainty_is_estimated").ok();
     snap.lm_background_enabled = read_bool_attr(&solver, "lm_background_enabled").ok();
     snap.kl_background_enabled = read_bool_attr(&solver, "kl_background_enabled").ok();
+    snap.kl_c_ratio = read_f64_attr(&solver, "kl_c_ratio").ok();
+    snap.kl_enable_polish_override =
+        read_str_attr(&solver, "kl_polish_override")
+            .ok()
+            .map(|s| match s.as_str() {
+                "on" => Some(true),
+                "off" => Some(false),
+                _ => None,
+            });
 
     // Resolution
     let res = config
@@ -1836,6 +1869,8 @@ mod tests {
             uncertainty_is_estimated: Some(false),
             lm_background_enabled: None,
             kl_background_enabled: None,
+            kl_c_ratio: None,
+            kl_enable_polish_override: None,
             endf_cache: vec![],
             provenance: vec![],
         }

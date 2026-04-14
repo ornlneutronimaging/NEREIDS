@@ -170,6 +170,15 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
     }
 
     if state.show_advanced_solver {
+        // Snapshot KL solver controls so we can detect a change after the
+        // panel runs and invalidate cached fit results.  egui's
+        // `selectable_value` mutates state in place with no change
+        // callback, so the previous-value-capture pattern (per MEMORY.md
+        // "GUI state management lesson") is the cleanest way.
+        let prev_kl_background_enabled = state.kl_background_enabled;
+        let prev_kl_c_ratio = state.kl_c_ratio;
+        let prev_kl_polish = state.kl_enable_polish_override;
+
         ui.indent("advanced_solver", |ui| {
             ui.checkbox(
                 &mut state.fit_temperature,
@@ -252,6 +261,18 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
                 });
             }
         });
+
+        // If any KL-solver control changed, downstream fit results no
+        // longer reflect the active configuration — invalidate them so
+        // the Results panel doesn't show stale densities/D-per-dof.
+        // Compare bit-pattern for the f64 to avoid the +0.0 == -0.0
+        // edge case, then exact compare for the bool / Option<bool>.
+        let kl_changed = state.kl_background_enabled != prev_kl_background_enabled
+            || state.kl_c_ratio.to_bits() != prev_kl_c_ratio.to_bits()
+            || state.kl_enable_polish_override != prev_kl_polish;
+        if kl_changed {
+            clear_analyze_downstream(state);
+        }
     }
 
     ui.add_space(8.0);

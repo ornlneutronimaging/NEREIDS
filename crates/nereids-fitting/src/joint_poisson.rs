@@ -601,8 +601,22 @@ pub fn joint_poisson_fit(
 
     // Covariance from inverse Fisher at the final θ.  Uses the analytical
     // Jacobian when the transmission model provides one; otherwise falls
-    // back to finite-difference Jacobian assembled into the Fisher form —
-    // so callers always get uncertainties for identifiable parameters.
+    // back to finite-difference Jacobian assembled into the deviance-
+    // Hessian form — so callers always get uncertainties for identifiable
+    // parameters.
+    //
+    // **Scale note (covariance vs Newton step).**  `fisher_information`
+    // assembles `H_D = Σ h_i · J·J^T` with `h_i = ∂² D / ∂ T_i² = 2 · I_TT_i`
+    // (see [`deviance_curvature`]).  This `2·I` form is exactly what the
+    // damped-Fisher Newton step needs, since stepping on D with
+    // `Δθ = -H_D^{-1} · ∇D = -(2I)^{-1} · (-2 ∇L) = I^{-1} · ∇L`
+    // recovers the Fisher-scoring direction on the log-likelihood L.
+    //
+    // For the asymptotic MLE covariance, however, the Cramér-Rao bound is
+    // `Cov(θ̂) = I^{-1}`, NOT `H_D^{-1} = (2I)^{-1} = I^{-1}/2`.  Inverting
+    // `H_D` and using it directly would under-report variance by 2× and
+    // standard errors by √2 × — a real bug caught in review.  We rescale
+    // the inverse here: `I^{-1} = 2 · H_D^{-1}`.
     let (covariance, uncertainties) = if config.compute_covariance {
         let free_idx = params.free_indices();
         let info_opt = match objective.fisher_information(&final_values, &free_idx)? {
@@ -611,7 +625,12 @@ pub fn joint_poisson_fit(
         };
         match info_opt {
             Some(info) => match invert_matrix(&info) {
-                Some(cov) => {
+                Some(mut cov) => {
+                    // Rescale: invert_matrix returned (2I)^{-1}; multiply
+                    // every entry by 2 to obtain I^{-1}.
+                    for v in cov.data.iter_mut() {
+                        *v *= 2.0;
+                    }
                     let u: Vec<f64> = (0..cov.nrows)
                         .map(|i| {
                             let v = cov.get(i, i);
@@ -1566,5 +1585,59 @@ mod tests {
         let u = r.uncertainties.as_ref().unwrap();
         assert_eq!(u.len(), 1);
         assert!(u[0].is_finite() && u[0] > 0.0);
+    }
+
+    // ------------------------------------------------------------------
+    // Reported uncertainty matches the analytical Cramér-Rao bound
+    // I^{-1} (NOT (2I)^{-1} — the Hessian-of-D inverse, which would
+    // under-report σ by √2).  Caught in code review of memo-35 §P1
+    // implementation; see `joint_poisson_fit` covariance-extraction
+    // doc-comment for the rescaling rationale.
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_uncertainty_matches_analytical_fisher_inverse() {
+        // Construct a single-parameter constant-T model on noise-free
+        // expected counts: O_i = λ/c, S_i = λ·T (per memo 35 §4.1).
+        // With ConstModel (J_i = ∂T/∂θ = 1), the analytical Fisher is
+        //   I(T) = Σ_i (O_i + S_i)·c / (T·(1+cT)²)
+        //        = N · λ · (1+cT)/c · c / (T·(1+cT)²)
+        //        = N · λ / (T · (1+cT))
+        // and σ_T = √(I^{-1}) = √( T·(1+cT) / (N·λ) ).
+        let n_bins = 200;
+        let t_true = 0.5_f64;
+        let c = 2.0_f64;
+        let lam = 100.0_f64;
+        let o: Vec<f64> = vec![lam / c; n_bins];
+        let s: Vec<f64> = vec![lam * t_true; n_bins];
+        let model = ConstModel { n_e: n_bins };
+        let obj = JointPoissonObjective {
+            model: &model,
+            o: &o,
+            s: &s,
+            c,
+        };
+        let mut params = ParameterSet::new(vec![FitParameter::non_negative("T", t_true)]);
+        let cfg = JointPoissonFitConfig {
+            // Disable polish for a clean Newton-only fit (avoids NM-tail
+            // perturbations of the final θ that would shift σ slightly).
+            enable_polish: false,
+            ..Default::default()
+        };
+        let r = joint_poisson_fit(&obj, &mut params, &cfg).unwrap();
+        let sigma_reported = r.uncertainties.as_ref().expect("σ available")[0];
+
+        // Analytical Cramér-Rao σ.
+        let sigma_analytical = (t_true * (1.0 + c * t_true) / (n_bins as f64 * lam)).sqrt();
+
+        // The pre-fix (uncompensated) value would be σ_analytical / √2 —
+        // tighten the tolerance below √2 so the regression is caught.
+        let rel_err = (sigma_reported - sigma_analytical).abs() / sigma_analytical;
+        assert!(
+            rel_err < 0.05,
+            "reported σ = {sigma_reported} vs analytical I^{{-1}}^(1/2) = \
+             {sigma_analytical} (rel_err = {rel_err}); pre-fix code reported \
+             σ_analytical / √2 ≈ {} which would give rel_err ≈ 0.293",
+            sigma_analytical / 2.0_f64.sqrt(),
+        );
     }
 }

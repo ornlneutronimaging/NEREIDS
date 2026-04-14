@@ -212,6 +212,18 @@ pub fn spatial_map_typed(
     let has_background_outputs =
         config.transmission_background().is_some() || config.counts_background().is_some();
 
+    // Whether the per-pixel dispatch routes through the counts-KL
+    // (joint-Poisson) solver.  True iff the input is counts AND the
+    // effective solver is either explicit `PoissonKL` or `Auto`
+    // (Auto resolves to PoissonKL on counts input).  When false (LM
+    // dispatch on counts, or any transmission input), per-pixel
+    // SpectrumFitResult.deviance_per_dof is `None`, so the spatial
+    // deviance_per_dof_map should also be `None` — otherwise GUI /
+    // Python consumers using `is_some()` to label GOF as "D/dof"
+    // would mislabel an all-NaN map.
+    let dispatches_to_counts_kl =
+        input.is_counts() && !matches!(config.solver(), SolverConfig::LevenbergMarquardt(_));
+
     if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
         return Err(PipelineError::Cancelled);
     }
@@ -224,7 +236,7 @@ pub fn spatial_map_typed(
                 .map(|_| Array2::from_elem((height, width), f64::NAN))
                 .collect(),
             chi_squared_map: Array2::from_elem((height, width), f64::NAN),
-            deviance_per_dof_map: if input.is_counts() {
+            deviance_per_dof_map: if dispatches_to_counts_kl {
                 Some(Array2::from_elem((height, width), f64::NAN))
             } else {
                 None
@@ -534,7 +546,7 @@ pub fn spatial_map_typed(
         .map(|_| Array2::from_elem((height, width), f64::NAN))
         .collect();
     let mut chi_squared_map = Array2::from_elem((height, width), f64::NAN);
-    let mut deviance_per_dof_map: Option<Array2<f64>> = if input.is_counts() {
+    let mut deviance_per_dof_map: Option<Array2<f64>> = if dispatches_to_counts_kl {
         Some(Array2::from_elem((height, width), f64::NAN))
     } else {
         None
@@ -1292,5 +1304,76 @@ mod tests {
             "spatial counts-KL ran for {elapsed:?} — polish autodisable may not be in effect",
         );
         assert!(r.deviance_per_dof_map.is_some());
+    }
+
+    /// `(Counts, LM)` spatial dispatch must NOT allocate a
+    /// `deviance_per_dof_map` — the per-pixel LM path doesn't populate
+    /// `deviance_per_dof`, so an `Some(all-NaN)` map would mislead GUI /
+    /// Python consumers that switch the GOF label on `is_some()`.
+    #[test]
+    fn test_spatial_map_typed_counts_lm_no_deviance_map() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let (t_3d, _) = synthetic_4x4_transmission(&data, 0.0005, &energies);
+        let n_e = energies.len();
+        let mut sample = Array3::zeros((n_e, 4, 4));
+        let open_beam = Array3::from_elem((n_e, 4, 4), 500.0);
+        for y in 0..4 {
+            for x in 0..4 {
+                for i in 0..n_e {
+                    sample[[i, y, x]] = 500.0 * t_3d[[i, y, x]];
+                }
+            }
+        }
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        // Force LM (counts → transmission conversion under the hood); no
+        // deviance is computed by that dispatch.
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()));
+
+        let input = InputData3D::Counts {
+            sample_counts: sample.view(),
+            open_beam_counts: open_beam.view(),
+        };
+        let r = spatial_map_typed(&input, &config, None, None, None).unwrap();
+        assert!(
+            r.deviance_per_dof_map.is_none(),
+            "(Counts, LM) must not allocate deviance_per_dof_map (would mislabel GOF in GUI)"
+        );
+        // chi_squared_map (Pearson) is the GOF on the LM path.
+        assert!(r.chi_squared_map.iter().any(|v| v.is_finite()));
+    }
+
+    /// Transmission input must never produce a `deviance_per_dof_map`
+    /// (regardless of solver — the counts-KL dispatch isn't reached).
+    #[test]
+    fn test_spatial_map_typed_transmission_no_deviance_map() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let (t_3d, u_3d) = synthetic_4x4_transmission(&data, 0.0005, &energies);
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap();
+        let input = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+        let r = spatial_map_typed(&input, &config, None, None, None).unwrap();
+        assert!(r.deviance_per_dof_map.is_none());
     }
 }
