@@ -778,8 +778,12 @@ mod tests {
     // Tested fit_alpha_1 / fit_alpha_2 nuisance fitting on a 4×4 spatial
     // grid, which is no longer supported on the counts-KL dispatch (the
     // joint-Poisson profile λ̂ absorbs alpha_1 and alpha_2 / B_det is
-    // P3.2-deferred; memo 35 §P3).  The SAMMY-style A_n + B_A/B/C spatial
-    // wiring is covered by `test_spatial_map_typed_counts_poisson_with_transmission_bg`.
+    // P3.2-deferred; memo 35 §P3).  The SAMMY-style A_n + B_A/B/C wiring
+    // on counts input is covered at pipeline scale by
+    // `test_joint_poisson_with_transmission_background` (pipeline.rs);
+    // a dedicated 3D-grid counterpart is not currently a test invariant
+    // (spatial_map_typed is a thin per-pixel dispatcher over
+    // fit_spectrum_typed, which is already covered).
 
     #[test]
     fn test_spatial_map_typed_dead_pixels() {

@@ -3157,9 +3157,9 @@ mod tests {
         assert!((result.reduced_chi_squared - d_per_dof).abs() < 1e-12);
     }
 
-    /// `JointPoisson` rejects `fit_alpha_1` / `fit_alpha_2` — the profile
-    /// `λ̂` absorbs the global flux scale, so `alpha_1` is redundant;
-    /// `alpha_2` / B_det wiring is P3-deferred.
+    /// Counts-KL dispatch rejects `fit_alpha_1` / `fit_alpha_2` — the
+    /// profile `λ̂` absorbs the global flux scale (alpha_1 redundant);
+    /// alpha_2 / B_det wiring is P3-deferred per memo 35 §P3.
     #[test]
     fn test_joint_poisson_rejects_alpha_fit() {
         let data = u238_single_resonance();

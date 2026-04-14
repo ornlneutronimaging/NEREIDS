@@ -413,8 +413,8 @@ struct PyFitResult {
     /// Fitted flight-path scale factor (SAMMY TZERO L₀, dimensionless).
     /// None when energy-scale fitting is not enabled.
     l_scale: Option<f64>,
-    /// Joint-Poisson conditional binomial deviance / (n − k).
-    /// `Some(...)` only for `solver="joint_poisson"`; memo 35 §P1.2.
+    /// Conditional binomial deviance / (n − k).  `Some(...)` only for the
+    /// counts-KL dispatch (`solver="kl"` on counts input); memo 35 §P1.2.
     deviance_per_dof: Option<f64>,
 }
 
@@ -512,12 +512,13 @@ impl PyFitResult {
         self.l_scale
     }
 
-    /// Joint-Poisson conditional binomial deviance divided by (n − k).
+    /// Conditional binomial deviance divided by (n − k) from the counts-KL
+    /// dispatch (joint-Poisson profile-deviance fitter per memo 35 §P1.2).
     ///
-    /// Primary goodness-of-fit statistic for ``solver="joint_poisson"``
-    /// (memo 35 §P1.2 — replaces the fixed-flux Pearson that scaled with
-    /// ``c``).  Returns ``None`` for LM and legacy Poisson-KL paths; those
-    /// populate ``reduced_chi_squared`` with Pearson χ² / (n − k) instead.
+    /// Primary goodness-of-fit statistic for ``solver="kl"`` on counts
+    /// data — replaces the fixed-flux Pearson χ² that scaled with ``c``.
+    /// Returns ``None`` for LM fits and for transmission + PoissonKL;
+    /// those populate ``reduced_chi_squared`` with Pearson χ² / (n − k).
     #[getter]
     fn deviance_per_dof(&self) -> Option<f64> {
         self.deviance_per_dof
@@ -656,10 +657,7 @@ impl PySpatialResult {
     /// PoissonKL; those populate ``chi_squared_map`` with Pearson χ² /
     /// (n − k) instead.
     #[getter]
-    fn deviance_per_dof_map<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> Option<Bound<'py, PyArray2<f64>>> {
+    fn deviance_per_dof_map<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray2<f64>>> {
         self.deviance_per_dof_map
             .as_ref()
             .map(|m| m.bind(py).clone())
@@ -2938,12 +2936,11 @@ fn py_spatial_map_typed<'py>(
     } else if c != 1.0 && (data.kind == "counts" || data.kind == "counts_with_nuisance") {
         // Caller provided `c` without alpha fitting — attach a minimal
         // CountsBackgroundConfig carrying just the proton-charge ratio.
-        config = config.with_counts_background(
-            nereids_pipeline::pipeline::CountsBackgroundConfig {
+        config =
+            config.with_counts_background(nereids_pipeline::pipeline::CountsBackgroundConfig {
                 c,
                 ..Default::default()
-            },
-        );
+            });
     }
 
     // Polish override (memo 35 §P2.1; memo 38 §6).  None = auto-disable
@@ -3189,12 +3186,14 @@ fn py_fit_counts_spectrum_typed<'py>(
     }
     // Attach CountsBackgroundConfig whenever any of its fields deviates from
     // the default — including c, which is the explicit proton-charge ratio
-    // (memo 35 §P1.3) required by the JointPoisson solver.
+    // (memo 35 §P1.3) consumed by the counts-KL (joint-Poisson) dispatch.
     if fit_alpha_1
         || fit_alpha_2
         || alpha_1_init != 1.0
         || alpha_2_init != 1.0
         || c != 1.0
+        || solver == "kl"
+        || solver == "poisson"
         || solver == "joint_poisson"
     {
         config = config.with_counts_background(CountsBackgroundConfig {
