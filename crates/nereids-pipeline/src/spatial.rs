@@ -124,6 +124,23 @@ impl InputData3D<'_> {
 ///   caller-supplied per-pixel flux and background cubes.  No averaging.
 ///
 /// Always returns [`SpatialResult`].
+/// Apply the multi-pixel polish auto-disable rule (memo 38 §6).
+///
+/// For `n_pixels > 1`, return a config with `counts_enable_polish`
+/// forced to `Some(false)` UNLESS the caller already set an explicit
+/// override — in which case the caller's choice wins.  For `n_pixels
+/// <= 1` or when the caller overrode, the config is returned as-is.
+///
+/// Extracted as a pure helper so the decision logic is directly
+/// unit-testable without timing-based assertions in spatial tests.
+fn apply_spatial_polish_default(config: UnifiedFitConfig, n_pixels: usize) -> UnifiedFitConfig {
+    if n_pixels > 1 && config.counts_enable_polish().is_none() {
+        config.with_counts_enable_polish(Some(false))
+    } else {
+        config
+    }
+}
+
 pub fn spatial_map_typed(
     input: &InputData3D<'_>,
     config: &UnifiedFitConfig,
@@ -395,11 +412,7 @@ pub fn spatial_map_typed(
     // Per-pixel fits also rarely hit the over-parameterized stall regime
     // polish targets.  The caller can force polish back on via
     // [`UnifiedFitConfig::with_counts_enable_polish(Some(true))`].
-    let fast_config = if pixel_coords.len() > 1 && fast_config.counts_enable_polish().is_none() {
-        fast_config.with_counts_enable_polish(Some(false))
-    } else {
-        fast_config
-    };
+    let fast_config = apply_spatial_polish_default(fast_config, pixel_coords.len());
 
     // ── Modeling choice: spatially-averaged open-beam flux ──
     //
@@ -1256,12 +1269,65 @@ mod tests {
         );
     }
 
-    /// Polish auto-disable: the per-pixel dispatcher disables Nelder-Mead
-    /// polish when n_pixels > 1 and the caller hasn't overridden.
-    /// Verified indirectly by timing — with polish on the fit would hit
-    /// the ~1000-iter cap; auto-disable keeps it fast.
+    /// Polish auto-disable: the `apply_spatial_polish_default` helper
+    /// sets `counts_enable_polish = Some(false)` for multi-pixel fits
+    /// when the caller has not overridden it.  This asserts the decision
+    /// directly (no timing-based heuristics — tested by checking the
+    /// resolved config).
     #[test]
-    fn test_spatial_map_typed_counts_kl_auto_disables_polish() {
+    fn test_apply_spatial_polish_default_multi_pixel_auto_disables() {
+        // Minimal UnifiedFitConfig — the helper only reads
+        // `counts_enable_polish`, so the rest can be stub data.
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..10).map(|i| 1.0 + i as f64).collect();
+        let cfg = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap();
+
+        // Multi-pixel (n > 1), no caller override → auto-disabled.
+        assert_eq!(cfg.counts_enable_polish(), None);
+        let resolved = apply_spatial_polish_default(cfg.clone(), 16);
+        assert_eq!(
+            resolved.counts_enable_polish(),
+            Some(false),
+            "multi-pixel with no override should auto-disable polish"
+        );
+
+        // Single-pixel (n = 1) → no change (let single-spectrum default on).
+        let resolved = apply_spatial_polish_default(cfg.clone(), 1);
+        assert_eq!(
+            resolved.counts_enable_polish(),
+            None,
+            "single-pixel should preserve the caller's unset state"
+        );
+
+        // Caller explicitly turned polish on → multi-pixel must respect it.
+        let cfg_forced_on = cfg.clone().with_counts_enable_polish(Some(true));
+        let resolved = apply_spatial_polish_default(cfg_forced_on, 16);
+        assert_eq!(
+            resolved.counts_enable_polish(),
+            Some(true),
+            "caller override Some(true) must be preserved for multi-pixel"
+        );
+
+        // Caller explicitly turned polish off → still off.
+        let cfg_forced_off = cfg.with_counts_enable_polish(Some(false));
+        let resolved = apply_spatial_polish_default(cfg_forced_off, 16);
+        assert_eq!(resolved.counts_enable_polish(), Some(false));
+    }
+
+    /// End-to-end: counts-KL spatial map populates `deviance_per_dof_map`
+    /// and completes without hitting the polish maxiter cap.  No
+    /// wall-clock assertion — relies on the helper test above for the
+    /// auto-disable decision.
+    #[test]
+    fn test_spatial_map_typed_counts_kl_populates_map_without_polish_regression() {
         let data = u238_single_resonance();
         let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.1).collect();
         let (t_3d, _) = synthetic_4x4_transmission(&data, 0.0005, &energies);
@@ -1292,18 +1358,11 @@ mod tests {
             sample_counts: sample.view(),
             open_beam_counts: open_beam.view(),
         };
-        let start = std::time::Instant::now();
         let r = spatial_map_typed(&input, &config, None, None, None).unwrap();
-        let elapsed = start.elapsed();
-        // With polish auto-disabled, the 4x4 grid (16 pixels) on a tiny
-        // 51-bin spectrum should complete well under 10 s even in debug
-        // builds.  With polish enabled per pixel we'd expect ≥ several
-        // seconds per pixel × 16 pixels = much longer.
-        assert!(
-            elapsed.as_secs() < 30,
-            "spatial counts-KL ran for {elapsed:?} — polish autodisable may not be in effect",
-        );
         assert!(r.deviance_per_dof_map.is_some());
+        // All 16 live pixels should have a finite D/dof value.
+        let dpd = r.deviance_per_dof_map.as_ref().unwrap();
+        assert!(dpd.iter().all(|v| v.is_finite()));
     }
 
     /// `(Counts, LM)` spatial dispatch must NOT allocate a

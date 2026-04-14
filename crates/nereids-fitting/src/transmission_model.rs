@@ -934,18 +934,42 @@ impl EnergyScaleTransmissionModel {
     }
 
     /// Compute the corrected energy grid for given (t₀, L_scale).
+    ///
+    /// **Physical bound on `t0_us`.**  The corrected TOF is `tof - t0_us`,
+    /// where `tof = tof_factor · L / √E_nom`.  For the corrected grid to
+    /// remain physical, `tof_corr > 0` must hold for every bin — i.e.
+    /// `t0_us < min_i(tof_i) = tof_factor · L / √(max E_nom)`.  The
+    /// `EnergyScaleTransmissionModel` pipeline registers `t0_us` with
+    /// bounds of ±10 μs, which safely satisfies this invariant for VENUS
+    /// (L = 25 m, E ≤ 200 eV gives `min_tof ≈ 17.7 μs`).
+    ///
+    /// As a defensive measure — if a caller ever invokes this function
+    /// with a `t0_us` that would push any bin's `tof_corr` below zero —
+    /// we clamp `t0_us` to just under `min_tof` so the corrected grid
+    /// stays monotone and physical.  This is a safety net; the expected
+    /// path is that the optimizer's parameter bounds keep `t0_us` well
+    /// below the clamp threshold.
     fn corrected_energies(&self, t0_us: f64, l_scale: f64) -> Vec<f64> {
+        if self.nominal_energies.is_empty() {
+            return Vec::new();
+        }
         let l_eff = self.flight_path_m * l_scale;
+        // min(tof) over the grid = tof_factor * L / sqrt(max E_nom).
+        let min_tof = self
+            .nominal_energies
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, |acc, e| {
+                acc.min(self.tof_factor * self.flight_path_m / e.sqrt())
+            });
+        let t0_limit = min_tof * (1.0 - 1.0e-12);
+        let t0_clamped = t0_us.min(t0_limit);
         self.nominal_energies
             .iter()
             .map(|&e_nom| {
                 let tof = self.tof_factor * self.flight_path_m / e_nom.sqrt();
-                let tof_corr = tof - t0_us;
-                if tof_corr <= 0.0 {
-                    e_nom // fallback: no correction
-                } else {
-                    (self.tof_factor * l_eff / tof_corr).powi(2)
-                }
+                let tof_corr = tof - t0_clamped;
+                (self.tof_factor * l_eff / tof_corr).powi(2)
             })
             .collect()
     }

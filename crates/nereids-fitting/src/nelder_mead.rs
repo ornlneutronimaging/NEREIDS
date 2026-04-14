@@ -22,10 +22,12 @@
 //! ## Convergence
 //!
 //! Terminates when both
-//! - the maximum vertex-to-centroid coordinate distance is below `xatol`, AND
+//! - the maximum coordinate distance from any simplex vertex to the current
+//!   best vertex (`simplex[0]`) is below `xatol`, AND
 //! - the range of objective values across the simplex is below `fatol`.
 //!
-//! This matches scipy's `optimize.minimize(method='Nelder-Mead')` behaviour.
+//! This matches scipy's `optimize.minimize(method='Nelder-Mead')` simplex-
+//! spread check (`max(|sim[i] - sim[0]|)` over coordinates) behaviour.
 
 use crate::error::FittingError;
 
@@ -39,8 +41,13 @@ pub struct NelderMeadConfig {
     /// Maximum number of simplex iterations (each iteration = at most a
     /// constant number of objective evaluations).
     pub max_iter: usize,
-    /// Initial simplex edge length as a fraction of `max(|x_0|, 1)`.
-    /// Set to 0.05 by default (5% perturbation).
+    /// Initial simplex edge length, used as a signed multiplier on each
+    /// coordinate: `step_i = initial_step_frac * x0_i` (so 0.05 gives a
+    /// 5 % perturbation in the direction of the coordinate's sign).
+    /// When `|x0_i| < 1e-8` the fallback `initial_step_abs` is used
+    /// instead.  Note: this is NOT `initial_step_frac * max(|x0|, 1)`
+    /// — for `|x0| < 1` the perturbation is therefore smaller than
+    /// `initial_step_frac` itself.
     pub initial_step_frac: f64,
     /// Small absolute initial step for parameters whose `|x_0| < 1e-8`.
     pub initial_step_abs: f64,
@@ -219,7 +226,8 @@ where
         let fmin = fvals[0];
         let fmax = fvals[n];
         let frange = fmax - fmin;
-        // Max vertex-to-vertex coordinate distance.
+        // Max coordinate distance from any vertex to the best vertex
+        // (`simplex[0]`).  Matches the scipy Nelder-Mead spread check.
         let mut xrange = 0.0f64;
         for v in simplex.iter() {
             for (j, &xj) in v.iter().enumerate() {

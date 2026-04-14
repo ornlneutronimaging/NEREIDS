@@ -97,9 +97,15 @@ impl<'a> JointPoissonObjective<'a> {
     /// D = 2 · Σ [ S·ln(S/(Np)) + O·ln(O/(N(1−p))) ] with
     /// `p = cT/(1+cT)`, `N = O+S`, and `x·ln(x/0) → 0`.
     ///
-    /// For `T ≤ ε` or `1+cT ≤ ε`, uses a smooth quadratic extrapolation in T
-    /// analogous to the smooth-NLL trick in `poisson.rs`, so gradient-based
-    /// optimizers see a C¹ objective rather than a cliff.
+    /// Near invalid or numerically tiny transmission values, the per-bin
+    /// evaluation ([`binomial_deviance_term`]) uses `t.max(POISSON_EPSILON)`
+    /// to clamp T away from zero before entering the logarithms and the
+    /// `1/(1+cT)` factor.  This avoids singular logs and division-by-zero
+    /// but is a piecewise clamp, not a smooth quadratic extrapolation —
+    /// D(T) is C⁰ at the clamp boundary, not C¹.  In practice this is
+    /// adequate because the optimizer's transmission values come from a
+    /// `FitModel` that keeps T bounded well above POISSON_EPSILON for
+    /// physically plausible density / nuisance parameter values.
     pub fn deviance_from_transmission(&self, t: &[f64]) -> f64 {
         debug_assert_eq!(t.len(), self.o.len());
         debug_assert_eq!(t.len(), self.s.len());
