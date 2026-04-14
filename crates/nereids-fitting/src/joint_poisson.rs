@@ -210,14 +210,18 @@ impl<'a> JointPoissonObjective<'a> {
     /// Finite-difference Fisher information.
     ///
     /// Fallback for callers whose transmission model does not implement
-    /// [`FitModel::analytical_jacobian`] (so [`fisher_information`] returns
-    /// `None`).  Builds the transmission Jacobian column-by-column via
-    /// central differences and assembles
+    /// [`FitModel::analytical_jacobian`] — i.e., when
+    /// [`Self::fisher_information`] would return `None`.  Builds the
+    /// transmission Jacobian column-by-column via central differences and
+    /// assembles
     ///
     ///   `I(θ)_{j,k} = Σ_i h_i · J_{i,j} · J_{i,k}`
     ///
-    /// where `h_i = ∂² D / ∂ T_i²` (see [`deviance_curvature`]).  Returns
-    /// `Ok(None)` only if the base model evaluation itself fails.
+    /// where `h_i = ∂² D / ∂ T_i²` is the per-bin deviance curvature
+    /// `2·(O_i + S_i)·c / (T_i·(1 + c·T_i)²)` (Fisher-scoring form derived
+    /// from binomial logit-link Var(S | N) = N·p·(1−p) with d logit p / dT
+    /// = 1/T — see the module-level docstring §Model).  Returns `Ok(None)`
+    /// only if the base model evaluation itself fails.
     pub fn fisher_information_fd(
         &self,
         params: &mut ParameterSet,

@@ -12,7 +12,7 @@
 //!
 //! **Scope note.**  In the current pipeline this solver is only reached
 //! for the **transmission + PoissonKL** path (via
-//! [`crate::transmission_model::TransmissionKLBackgroundModel`]).  The
+//! `crate::transmission_model::TransmissionKLBackgroundModel`).  The
 //! **counts** path uses the joint-Poisson conditional-binomial-deviance
 //! solver in [`crate::joint_poisson`] (memo 35 §P1/§P2), which replaces
 //! the older fixed-flux counts NLL that lived here before the P2.2 /
