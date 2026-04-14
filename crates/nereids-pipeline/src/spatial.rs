@@ -111,8 +111,17 @@ impl InputData3D<'_> {
 /// Spatial mapping using the typed input data API.
 ///
 /// Dispatches per-pixel fitting based on the `InputData3D` variant:
-/// - **Transmission**: per-pixel LM or KL on transmission values
-/// - **Counts**: per-pixel KL on raw counts (preserves Poisson statistics)
+/// - **Transmission**: per-pixel LM (or KL, opt-in) on transmission values.
+/// - **Counts**: per-pixel counts-KL dispatch (joint-Poisson conditional
+///   binomial deviance per memo 35 §P1) on the sample cube, paired
+///   against the **spatially-averaged open-beam flux**.  See the inline
+///   comment on `averaged_flux` for the rationale: this is a deliberate
+///   bias-variance trade that reduces per-pixel OB shot-noise at the
+///   cost of the exact per-pixel paired joint-Poisson observation model.
+///   Callers needing the exact paired form should supply per-pixel
+///   nuisance spectra via [`InputData3D::CountsWithNuisance`] instead.
+/// - **CountsWithNuisance**: per-pixel counts-KL dispatch with the
+///   caller-supplied per-pixel flux and background cubes.  No averaging.
 ///
 /// Always returns [`SpatialResult`].
 pub fn spatial_map_typed(
@@ -380,10 +389,39 @@ pub fn spatial_map_typed(
         fast_config
     };
 
-    // For counts data: spatially average the open beam to get a stable flux
-    // estimate, reducing per-pixel open-beam shot noise.
-    // Without this, per-pixel open-beam shot noise contaminates the flux
-    // estimate and makes KL fits materially noisier.
+    // ── Modeling choice: spatially-averaged open-beam flux ──
+    //
+    // For `InputData3D::Counts`, every pixel's sample spectrum is paired
+    // with the **same** open-beam spectrum: the spatial average across
+    // all live pixels (`pixel_coords`).  This is INTENTIONAL, not a
+    // per-pixel paired observation.  The rationale:
+    //
+    // 1. The open-beam counts `O(E)` are a *reference flux* that is
+    //    approximately spatially uniform (the sample casts a shadow
+    //    on an otherwise flat beam profile).  Averaging reduces the
+    //    shot-noise contamination of the flux estimate by √n_pixels.
+    // 2. In the joint-Poisson profile-deviance form
+    //    (`λ̂_i = c·(O_i + S_i) / (1 + c·T_i)`), a noisy per-pixel
+    //    `O_i` propagates directly into `λ̂_i`, which in turn inflates
+    //    the deviance without improving density recovery.
+    //
+    // This is a bias-variance trade: we lose the exact per-pixel paired
+    // likelihood structure in exchange for a tighter density-fidelity
+    // variance across pixels.  Empirically (evidence/37-…json), this is
+    // the right call for the VENUS-style "flat beam with a masking
+    // sample" geometry.
+    //
+    // **If this isn't the right assumption for your data** — e.g. you
+    // have a genuinely spatially-varying beam profile and pre-estimated
+    // per-pixel flux + detector-background spectra — use
+    // [`InputData3D::CountsWithNuisance`] instead.  That variant
+    // bypasses the averaging and pairs each pixel's sample with the
+    // caller-supplied per-pixel flux and bg spectra.
+    //
+    // TODO(future): expose a config flag to switch the counts dispatch
+    // between "averaged OB" (current, stability-oriented) and "raw
+    // per-pixel OB" (exact paired joint-Poisson) if a use case arises
+    // where both options are needed at call sites.
     let averaged_flux: Option<Vec<f64>> = if matches!(input, InputData3D::Counts { .. }) {
         let n_e = data_b.shape()[2]; // data_b is transposed: (h, w, n_e)
         let mut flux = vec![0.0f64; n_e];

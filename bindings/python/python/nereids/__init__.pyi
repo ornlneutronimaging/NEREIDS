@@ -161,11 +161,15 @@ class FitResult:
 
     @property
     def deviance_per_dof(self) -> float | None:
-        """Joint-Poisson conditional binomial deviance / (n - k).
+        """Conditional binomial deviance / (n - k) from the counts-KL
+        dispatch (joint-Poisson profile-deviance fitter).
 
-        Primary goodness-of-fit for ``solver='joint_poisson'`` per memo 35
-        §P1.2.  ``None`` for LM and legacy Poisson-KL paths (those populate
-        ``reduced_chi_squared`` with Pearson chi-squared / (n - k) instead).
+        Primary goodness-of-fit for ``solver='kl'`` (or the
+        ``'poisson'`` / ``'joint_poisson'`` aliases) on counts data,
+        per memo 35 §P1.2 — replaces the fixed-flux Pearson chi-squared
+        that scaled with ``c``.  ``None`` for LM fits and for
+        transmission + PoissonKL (those populate
+        ``reduced_chi_squared`` with Pearson chi-squared / (n - k)).
         """
         ...
 
@@ -857,12 +861,18 @@ def fit_counts_spectrum_typed(
     """Fit a single raw-count spectrum (sample + open-beam counts).
 
     Dispatches to a counts-domain solver based on ``solver``:
-    ``'auto'`` (default) and ``'kl'`` / ``'poisson'`` select the fixed-flux
-    Poisson-KL engine; ``'lm'`` forces Levenberg-Marquardt on normalised
-    transmission; ``'joint_poisson'`` selects the joint-Poisson profile
-    binomial-deviance fitter (memo 35 §P1/§P2), which requires an explicit
-    proton-charge ratio ``c = Q_s / Q_ob`` and populates
-    ``FitResult.deviance_per_dof`` as the primary goodness-of-fit.
+
+    - ``'auto'`` (default), ``'kl'``, ``'poisson'``, and ``'joint_poisson'``
+      all route to the **counts-KL dispatch**: the joint-Poisson profile
+      binomial-deviance fitter (memo 35 §P1/§P2; collapsed to a single
+      path in this PR).  Uses the explicit proton-charge ratio
+      ``c = Q_s / Q_ob`` from the ``c`` kwarg and populates
+      ``FitResult.deviance_per_dof`` as the primary GOF.
+      ``'joint_poisson'`` is kept as a compatibility alias; prefer ``'kl'``
+      for new code.
+    - ``'lm'`` converts counts to transmission internally and runs
+      Levenberg-Marquardt on the resulting ratio (information-lossy
+      fallback).
 
     For pre-normalized transmission data, use ``fit_spectrum_typed(...)``.
 
@@ -877,18 +887,26 @@ def fit_counts_spectrum_typed(
         temperature_k: Sample temperature in Kelvin (default 293.6).
         fit_temperature: Whether to fit temperature (default False).
         max_iter: Maximum iterations (default 200).
-        solver: 'auto' (default), 'kl', 'lm', or 'joint_poisson'.
-        background: Enable transmission-lift background inside the counts fit.
-        detector_background: Optional detector/counts background reference.
-        fit_alpha_1: Fit flux-scale nuisance parameter alpha_1 (not supported
-            for ``solver='joint_poisson'`` — the profile lambda-hat absorbs
-            the flux scale).
-        fit_alpha_2: Fit detector-background scale nuisance parameter alpha_2
-            (not supported for ``solver='joint_poisson'``; deferred to P3).
-        alpha_1_init: Initial value for alpha_1 (default 1.0).
-        alpha_2_init: Initial value for alpha_2 (default 1.0).
-        c: Proton-charge ratio ``Q_s / Q_ob`` for ``solver='joint_poisson'``
-            (memo 35 §P1.3).  Default 1.0.  Ignored by other solvers.
+        solver: ``'auto'`` (default), ``'kl'`` / ``'poisson'`` /
+            ``'joint_poisson'`` (all equivalent — counts-KL dispatch),
+            or ``'lm'``.
+        background: Enable the SAMMY-style transmission-background
+            wrapper inside the counts-KL fit (A_n + B_A + B_B/√E + B_C√E).
+        detector_background: Optional detector/counts background reference
+            (for LM-converted path only; counts-KL rejects non-zero values,
+            deferred to memo 35 §P3.2).
+        fit_alpha_1: Research-only; rejected by the counts-KL dispatch
+            because the profile λ̂ absorbs the global flux scale.
+        fit_alpha_2: Research-only; rejected by the counts-KL dispatch
+            (B_det / alpha_2 wiring deferred to memo 35 §P3.2).
+        alpha_1_init: Initial value for alpha_1 (default 1.0); only
+            consumed by the research Fisher helper.
+        alpha_2_init: Initial value for alpha_2 (default 1.0); same.
+        c: Proton-charge ratio ``Q_s / Q_ob`` (memo 35 §P1.3).  Default
+            1.0 assumes the caller has already PC-normalized the flux.
+            For raw VENUS-style counts, set this to the actual ratio
+            (typically ~5–6).  Used by the counts-KL dispatch; ignored
+            by the LM path.
         resolution: Optional resolution function.
         groups: List of IsotopeGroup objects (mutually exclusive with isotopes).
         initial_densities: Initial density guesses when using groups.

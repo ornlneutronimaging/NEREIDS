@@ -2615,11 +2615,12 @@ fn parse_solver_config(
                 },
             ),
         ),
-        // "kl" is the canonical counts-KL name post Phase-0 collapse.
-        // "poisson" is accepted as a synonym.  "joint_poisson" is kept as
-        // a soft-deprecated alias that routes to the same dispatch — the
-        // joint-Poisson / conditional-binomial-deviance implementation IS
-        // the KL solver; there is only one counts-KL path.
+        // Counts-KL dispatch.  "kl" is the canonical name;  "poisson" and
+        // "joint_poisson" are compatibility aliases that resolve to the
+        // same path — the joint-Poisson / conditional-binomial-deviance
+        // implementation IS the KL solver.  No runtime deprecation
+        // warning is emitted; the aliases simply accept the older name
+        // strings so existing user scripts keep working.
         "kl" | "poisson" | "joint_poisson" => {
             Ok(nereids_pipeline::pipeline::SolverConfig::PoissonKL(
                 nereids_fitting::poisson::PoissonConfig {

@@ -1165,7 +1165,10 @@ fn fit_counts_joint_poisson(
         )));
     }
 
-    // ── Build parameter vector (mirrors fit_counts_poisson structure) ──
+    // ── Build parameter vector (density → temperature → energy-scale →
+    // transmission background), using the shared
+    // append_temperature_param / append_energy_scale_params /
+    // append_background_params helpers.
     let n_density_params = config.n_density_params();
     let mut param_vec = build_density_params(config);
 
@@ -1756,7 +1759,12 @@ pub fn evaluate_jacobian_and_fisher(
 ) -> Result<ModelJacobianResult, PipelineError> {
     let n_density_params = config.n_density_params();
 
-    // ── Build parameter vector (mirrors fit_counts_poisson) ─────────
+    // ── Build parameter vector — preserves the pre-collapse fixed-flux
+    // layout (density → temperature → transmission_background → α₁/α₂)
+    // that the research Fisher helper has historically used.  NOT
+    // equivalent to the production counts-KL dispatch's parameter
+    // layout; kept unchanged for Epic #394 research-script compatibility.
+    //     ─────────────────────────────────────────────────────────
     let mut param_vec = build_density_params(config);
 
     let temperature_index = if config.fit_temperature {

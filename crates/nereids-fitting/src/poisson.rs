@@ -1133,15 +1133,24 @@ pub fn poisson_fit(
     })
 }
 
-/// Convert transmission model + counts to a counts-based forward model.
+/// Fixed-flux counts-domain forward model: `Y_model = flux × T_model(θ) + background`.
 ///
-/// Given:
-///   Y_model = flux × T_model(θ) + background
-///
-/// This wraps a transmission model to predict observed counts.
+/// **Retained for the research Fisher helper, not for production fitting.**
+/// The production counts-KL dispatch (`SolverConfig::PoissonKL` on
+/// `InputData::Counts` / `InputData::CountsWithNuisance`) goes through
+/// the joint-Poisson conditional-binomial-deviance path in
+/// [`crate::joint_poisson`] per memo 35 §P1/§P2.  `CountsModel` and
+/// [`CountsBackgroundScaleModel`] below are consumed only by
+/// `nereids_pipeline::pipeline::evaluate_jacobian_and_fisher` (the
+/// Fisher-info research helper used by the spatial-regularization
+/// epic #394) and by this module's `#[cfg(test)]` tests.  They assume
+/// the caller has pre-computed `flux = c · O` (i.e. `c` is baked into
+/// `flux` — the convention that memo 35 §P1 flagged as error-prone for
+/// end users, which is precisely why the production path no longer
+/// uses this struct).
 ///
 /// The `flux` and `background` slices must have the same length as the
-/// transmission vector returned by the inner model. In debug builds,
+/// transmission vector returned by the inner model.  In debug builds,
 /// `evaluate()` asserts this invariant.
 pub struct CountsModel<'a> {
     /// Underlying transmission model.
@@ -1228,7 +1237,14 @@ impl<'a> crate::forward_model::ForwardModel for CountsModel<'a> {
     }
 }
 
-/// Counts model with optional nuisance scaling of signal and detector background.
+/// Fixed-flux counts model with optional α₁ / α₂ nuisance scaling of
+/// signal and detector background.
+///
+/// **Retained for the research Fisher helper, not for production fitting.**
+/// See [`CountsModel`] for the scope note — the production counts-KL
+/// dispatch does not use this struct; it is reached only from
+/// `evaluate_jacobian_and_fisher` (Epic #394 spatial-regularization
+/// prototype) and from this module's `#[cfg(test)]` tests.
 ///
 /// Given a transmission model `T(θ)`, predicts:
 ///
