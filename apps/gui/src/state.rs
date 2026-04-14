@@ -714,9 +714,20 @@ pub struct AppState {
     /// LM background: SAMMY 4-param model.
     /// Model: Anorm * T_inner(E) + BackA + BackB/sqrt(E) + BackC*sqrt(E)
     pub lm_background_enabled: bool,
-    /// KL background: 2-param additive model.
-    /// Model: T_inner(E) + b₀ + b₁/sqrt(E)
+    /// KL background: SAMMY 4-term wrapper (joint-Poisson compatible).
+    /// Model: Anorm * T_inner(E) + BackA + BackB/sqrt(E) + BackC*sqrt(E)
     pub kl_background_enabled: bool,
+    /// Proton-charge ratio c = Q_s / Q_ob for the counts-KL solver
+    /// (memo 35 §P1.3).  Default 1.0 = caller PC-normalized the flux
+    /// upstream.  For raw-count VENUS data, set to the actual
+    /// Q_sample/Q_open_beam ratio (typically ~5–6).
+    pub kl_c_ratio: f64,
+    /// Override for Nelder-Mead polish on the counts-KL path.  `None`
+    /// lets `spatial_map_typed` auto-disable polish when n_pixels > 1
+    /// (memo 38 §6 — 17 min/pixel polish cost).  `Some(true)` forces
+    /// polish on even at spatial scale (research use only);
+    /// `Some(false)` forces off.
+    pub kl_enable_polish_override: Option<bool>,
 
     // -- Pixel / ROI selection --
     pub selected_pixel: Option<(usize, usize)>,
@@ -1403,6 +1414,8 @@ impl Default for AppState {
             uncertainty_is_estimated: false,
             lm_background_enabled: false,
             kl_background_enabled: false,
+            kl_c_ratio: 1.0,
+            kl_enable_polish_override: None,
 
             selected_pixel: None,
             rois: Vec::new(),

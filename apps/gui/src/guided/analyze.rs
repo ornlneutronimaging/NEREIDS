@@ -184,8 +184,50 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
             if matches!(state.solver_method, SolverMethod::PoissonKL) {
                 ui.checkbox(
                     &mut state.kl_background_enabled,
-                    "KL background (b\u{2080} + b\u{2081}/\u{221A}E)",
+                    "KL background (SAMMY: A\u{2099} + B_A + B_B/\u{221A}E + B_C\u{221A}E)",
                 );
+                ui.horizontal(|ui| {
+                    ui.label("c = Q_s / Q_ob:");
+                    ui.add(
+                        egui::DragValue::new(&mut state.kl_c_ratio)
+                            .speed(0.01)
+                            .range(1e-4..=100.0),
+                    )
+                    .on_hover_text(
+                        "Proton-charge ratio for the counts-KL solver \
+                         (memo 35 §P1.3).  Leave at 1.0 when the \
+                         caller has already PC-normalized the flux.",
+                    );
+                });
+                // Polish override (memo 38 §6).  For spatial maps the
+                // default (None = auto-disable when n_pixels > 1) is the
+                // right choice.  Exposing an explicit toggle is
+                // research-oriented; wire as a tri-state via ComboBox
+                // so the distinction between "auto" and "forced off" is
+                // visible.
+                ui.horizontal(|ui| {
+                    ui.label("Polish:");
+                    let selected = match state.kl_enable_polish_override {
+                        None => "Auto (on for single / off for spatial)",
+                        Some(true) => "On (forced)",
+                        Some(false) => "Off (forced)",
+                    };
+                    egui::ComboBox::from_id_salt("kl_polish_override")
+                        .selected_text(selected)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut state.kl_enable_polish_override, None, "Auto");
+                            ui.selectable_value(
+                                &mut state.kl_enable_polish_override,
+                                Some(true),
+                                "On (forced)",
+                            );
+                            ui.selectable_value(
+                                &mut state.kl_enable_polish_override,
+                                Some(false),
+                                "Off (forced)",
+                            );
+                        });
+                });
             }
             ui.checkbox(
                 &mut state.lm_config.compute_covariance,
@@ -929,13 +971,30 @@ fn build_fit_config(state: &AppState) -> Result<UnifiedFitConfig, String> {
         config = config.with_fit_temperature(true);
     }
 
-    // Background: solver-aware. LM uses 4-param SAMMY, KL uses 2-param b₀+b₁.
+    // Background: solver-aware.  Both LM and counts-KL use the SAMMY
+    // 4-term wrapper (Anorm + BackA + BackB/√E + BackC·√E).  Post P2.2,
+    // the KL path routes through joint-Poisson with this wrapper too.
     let bg_enabled = match state.solver_method {
         SolverMethod::LevenbergMarquardt => state.lm_background_enabled,
         SolverMethod::PoissonKL => state.kl_background_enabled,
     };
     if bg_enabled {
         config = config.with_transmission_background(BackgroundConfig::default());
+    }
+
+    // Counts-KL options: proton-charge ratio + polish override.  Both
+    // are no-ops for the LM dispatch.
+    if matches!(state.solver_method, SolverMethod::PoissonKL) {
+        if (state.kl_c_ratio - 1.0).abs() > 1e-12 {
+            config =
+                config.with_counts_background(nereids_pipeline::pipeline::CountsBackgroundConfig {
+                    c: state.kl_c_ratio,
+                    ..Default::default()
+                });
+        }
+        if state.kl_enable_polish_override.is_some() {
+            config = config.with_counts_enable_polish(state.kl_enable_polish_override);
+        }
     }
 
     Ok(config)
