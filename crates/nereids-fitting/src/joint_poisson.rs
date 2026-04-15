@@ -98,13 +98,13 @@ impl<'a> JointPoissonObjective<'a> {
     /// `p = cT/(1+cT)`, `N = O+S`, and `x·ln(x/0) → 0`.
     ///
     /// Near invalid or numerically tiny transmission values, the per-bin
-    /// evaluation ([`binomial_deviance_term`]) uses `t.max(POISSON_EPSILON)`
+    /// evaluation (`binomial_deviance_term`) uses `t.max(POISSON_EPSILON)`
     /// to clamp T away from zero before entering the logarithms and the
     /// `1/(1+cT)` factor.  This avoids singular logs and division-by-zero
     /// but is a piecewise clamp, not a smooth quadratic extrapolation —
     /// D(T) is C⁰ at the clamp boundary, not C¹.  In practice this is
     /// adequate because the optimizer's transmission values come from a
-    /// `FitModel` that keeps T bounded well above POISSON_EPSILON for
+    /// `FitModel` that keeps T bounded well above `POISSON_EPSILON` for
     /// physically plausible density / nuisance parameter values.
     pub fn deviance_from_transmission(&self, t: &[f64]) -> f64 {
         debug_assert_eq!(t.len(), self.o.len());
