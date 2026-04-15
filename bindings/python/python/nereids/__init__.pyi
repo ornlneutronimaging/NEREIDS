@@ -296,6 +296,18 @@ class SpatialResult:
         """Per-pixel background parameter maps [BackA, BackB, BackC] (None when background=False)."""
         ...
 
+    @property
+    def t0_us_map(self) -> NDArray[np.float64] | None:
+        """Per-pixel SAMMY TZERO offset t0 (µs) map.
+        ``None`` when the run did not use ``fit_energy_scale=True``."""
+        ...
+
+    @property
+    def l_scale_map(self) -> NDArray[np.float64] | None:
+        """Per-pixel SAMMY TZERO flight-path scale factor map.
+        ``None`` when the run did not use ``fit_energy_scale=True``."""
+        ...
+
 class IsotopeGroup:
     """A group of isotopes sharing one fitted density parameter.
 
@@ -747,6 +759,10 @@ def spatial_map_typed(
     alpha_2_init: float = 1.0,
     c: float = 1.0,
     enable_polish: bool | None = None,
+    fit_energy_scale: bool = False,
+    t0_init_us: float = 0.0,
+    l_scale_init: float = 1.0,
+    energy_scale_flight_path_m: float = 25.0,
     resolution: TabulatedResolution | None = None,
     flight_path_m: float | None = None,
     delta_t_us: float | None = None,
@@ -776,9 +792,19 @@ def spatial_map_typed(
             (default) = the dispatcher auto-disables polish when
             ``n_pixels > 1`` (memo 38 §6 — polish costs ~1000 s per pixel
             on realistic data).  ``True`` forces polish on, ``False`` off.
+        fit_energy_scale: Fit per-pixel SAMMY TZERO calibration
+            (t0 and L_scale).  Required for real VENUS data to match SAMMY
+            chi-squared performance — without it, sharp resonances are
+            offset in TOF and per-pixel chi-squared explodes.
+        t0_init_us: Initial TOF offset in microseconds (default 0.0).
+        l_scale_init: Initial flight-path scale factor (default 1.0).
+        energy_scale_flight_path_m: Nominal flight path (m) for the
+            energy-scale model (default 25.0).
 
     Always returns SpatialResult.  For counts-KL runs,
     ``SpatialResult.deviance_per_dof_map`` is populated as the primary GOF.
+    When ``fit_energy_scale=True``, per-pixel ``t0_us_map`` and
+    ``l_scale_map`` are populated on the returned SpatialResult.
     """
     ...
 

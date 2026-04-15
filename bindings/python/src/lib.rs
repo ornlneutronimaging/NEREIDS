@@ -621,6 +621,10 @@ struct PySpatialResult {
     anorm_map: Option<Py<PyArray2<f64>>>,
     /// Per-pixel background parameter maps (None when background=False).
     background_maps: Option<[Py<PyArray2<f64>>; 3]>,
+    /// Per-pixel fitted TZERO t0 (µs) map (None when fit_energy_scale=False).
+    t0_us_map: Option<Py<PyArray2<f64>>>,
+    /// Per-pixel fitted TZERO L_scale map (None when fit_energy_scale=False).
+    l_scale_map: Option<Py<PyArray2<f64>>>,
 }
 
 #[pymethods]
@@ -724,6 +728,20 @@ impl PySpatialResult {
         self.background_maps
             .as_ref()
             .map(|maps| maps.iter().map(|m| m.bind(py).clone()).collect())
+    }
+
+    /// Per-pixel SAMMY TZERO offset t0 (µs) map.
+    /// `None` when the run did not fit energy scale.
+    #[getter]
+    fn t0_us_map<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray2<f64>>> {
+        self.t0_us_map.as_ref().map(|m| m.bind(py).clone())
+    }
+
+    /// Per-pixel SAMMY TZERO flight-path scale factor map.
+    /// `None` when the run did not fit energy scale.
+    #[getter]
+    fn l_scale_map<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray2<f64>>> {
+        self.l_scale_map.as_ref().map(|m| m.bind(py).clone())
     }
 
     fn __repr__(&self) -> String {
@@ -2742,6 +2760,14 @@ fn spatial_result_to_py(
         .deviance_per_dof_map
         .as_ref()
         .map(|m| PyArray2::from_array(py, m).into());
+    let t0_us_map = result
+        .t0_us_map
+        .as_ref()
+        .map(|m| PyArray2::from_array(py, m).into());
+    let l_scale_map = result
+        .l_scale_map
+        .as_ref()
+        .map(|m| PyArray2::from_array(py, m).into());
 
     PySpatialResult {
         density_maps,
@@ -2758,6 +2784,8 @@ fn spatial_result_to_py(
         temperature_uncertainty_map,
         anorm_map,
         background_maps,
+        t0_us_map,
+        l_scale_map,
     }
 }
 
@@ -2793,6 +2821,12 @@ fn spatial_result_to_py(
 ///         `from_counts_with_nuisance()`.
 ///     alpha_1_init: Initial value for `alpha_1` (default 1.0).
 ///     alpha_2_init: Initial value for `alpha_2` (default 1.0).
+///     fit_energy_scale: Fit per-pixel SAMMY TZERO calibration (t0, L_scale).
+///         Required for real VENUS counts data to match SAMMY chi2 performance.
+///     t0_init_us: Initial TOF offset in microseconds (default 0.0).
+///     l_scale_init: Initial flight-path scale factor (default 1.0).
+///     energy_scale_flight_path_m: Nominal flight path (m) for the
+///         energy-scale model. Must match the grid used to compute `energies`.
 ///     resolution: Optional resolution function.
 ///     groups: list of IsotopeGroup objects (mutually exclusive with isotopes).
 ///
@@ -2814,6 +2848,10 @@ fn spatial_result_to_py(
     alpha_2_init = 1.0,
     c = 1.0,
     enable_polish = None,
+    fit_energy_scale = false,
+    t0_init_us = 0.0,
+    l_scale_init = 1.0,
+    energy_scale_flight_path_m = 25.0,
     resolution = None,
     flight_path_m = None,
     delta_t_us = None,
@@ -2839,6 +2877,10 @@ fn py_spatial_map_typed<'py>(
     alpha_2_init: f64,
     c: f64,
     enable_polish: Option<bool>,
+    fit_energy_scale: bool,
+    t0_init_us: f64,
+    l_scale_init: f64,
+    energy_scale_flight_path_m: f64,
     resolution: Option<PyTabulatedResolution>,
     flight_path_m: Option<f64>,
     delta_t_us: Option<f64>,
@@ -2948,6 +2990,14 @@ fn py_spatial_map_typed<'py>(
     // when n_pixels > 1 inside spatial_map_typed.
     if let Some(v) = enable_polish {
         config = config.with_counts_enable_polish(Some(v));
+    }
+
+    // Energy-scale calibration (SAMMY TZERO equivalent).  Required for
+    // real VENUS data — without it, sharp resonances are offset ~0.5 us
+    // in TOF and per-pixel chi2 explodes (see memo on NEREIDS↔SAMMY
+    // parity for VENUS Hf 120min).
+    if fit_energy_scale {
+        config = config.with_energy_scale(t0_init_us, l_scale_init, energy_scale_flight_path_m);
     }
 
     // Build InputData3D from the PyInputData

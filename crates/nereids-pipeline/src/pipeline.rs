@@ -556,6 +556,11 @@ impl UnifiedFitConfig {
     pub fn counts_enable_polish(&self) -> Option<bool> {
         self.counts_enable_polish
     }
+    /// Whether SAMMY TZERO energy-scale calibration is enabled
+    /// (see [`Self::with_energy_scale`]).
+    pub fn fit_energy_scale(&self) -> bool {
+        self.fit_energy_scale
+    }
     pub fn precomputed_cross_sections(&self) -> Option<&Arc<Vec<Vec<f64>>>> {
         self.precomputed_cross_sections.as_ref()
     }

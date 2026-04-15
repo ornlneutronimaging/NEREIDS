@@ -51,6 +51,13 @@ pub struct SpatialResult {
     /// Transmission LM uses `[BackA, BackB, BackC]`.
     /// Counts KL background uses `[b0, b1, alpha_2]`.
     pub background_maps: Option<[Array2<f64>; 3]>,
+    /// Per-pixel fitted SAMMY TZERO offset (µs) map.
+    /// `Some` when `config.fit_energy_scale` is true; `None` otherwise.
+    /// Entries are NaN where the per-pixel fit hard-failed.
+    pub t0_us_map: Option<Array2<f64>>,
+    /// Per-pixel fitted SAMMY TZERO flight-path scale factor.
+    /// `Some` when `config.fit_energy_scale` is true; `None` otherwise.
+    pub l_scale_map: Option<Array2<f64>>,
     /// Number of pixels that converged.
     pub n_converged: usize,
     /// Total number of pixels fitted.
@@ -281,6 +288,16 @@ pub fn spatial_map_typed(
                     Array2::from_elem((height, width), f64::NAN),
                     Array2::from_elem((height, width), f64::NAN),
                 ])
+            } else {
+                None
+            },
+            t0_us_map: if config.fit_energy_scale() {
+                Some(Array2::from_elem((height, width), f64::NAN))
+            } else {
+                None
+            },
+            l_scale_map: if config.fit_energy_scale() {
+                Some(Array2::from_elem((height, width), f64::NAN))
             } else {
                 None
             },
@@ -579,6 +596,16 @@ pub fn spatial_map_typed(
     } else {
         None
     };
+    let mut t0_us_map: Option<Array2<f64>> = if config.fit_energy_scale() {
+        Some(Array2::from_elem((height, width), f64::NAN))
+    } else {
+        None
+    };
+    let mut l_scale_map: Option<Array2<f64>> = if config.fit_energy_scale() {
+        Some(Array2::from_elem((height, width), f64::NAN))
+    } else {
+        None
+    };
     let mut n_converged = 0;
     let mut temperature_map: Option<Array2<f64>> = if config.fit_temperature() {
         Some(Array2::from_elem((height, width), f64::NAN))
@@ -619,6 +646,12 @@ pub fn spatial_map_typed(
             bg_maps[1][[*y, *x]] = result.background[1];
             bg_maps[2][[*y, *x]] = result.background[2];
         }
+        if let (Some(map), Some(v)) = (&mut t0_us_map, result.t0_us) {
+            map[[*y, *x]] = v;
+        }
+        if let (Some(map), Some(v)) = (&mut l_scale_map, result.l_scale) {
+            map[[*y, *x]] = v;
+        }
         if result.converged {
             n_converged += 1;
         }
@@ -635,6 +668,8 @@ pub fn spatial_map_typed(
         isotope_labels,
         anorm_map,
         background_maps,
+        t0_us_map,
+        l_scale_map,
         n_converged,
         n_total: pixel_coords.len(),
         n_failed: failed_count.load(Ordering::Relaxed),
@@ -1434,5 +1469,93 @@ mod tests {
         };
         let r = spatial_map_typed(&input, &config, None, None, None).unwrap();
         assert!(r.deviance_per_dof_map.is_none());
+    }
+
+    /// `fit_energy_scale=True` on the spatial path routes per-pixel TZERO
+    /// calibration through the same config used by single-spectrum fits,
+    /// populates `t0_us_map` and `l_scale_map`, and leaves them `None`
+    /// when the flag is off.  Regression against the prior gap where
+    /// the Python binding accepted `fit_energy_scale` for single
+    /// spectra but not for spatial, forcing callers to pre-calibrate.
+    #[test]
+    fn test_spatial_map_typed_fit_energy_scale_populates_maps() {
+        let rd = u238_single_resonance();
+        let energies: Vec<f64> = (0..101).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let (t_3d, u_3d) = synthetic_4x4_transmission(&rd, 0.001, &energies);
+        let data = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![rd],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.0005],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
+        .with_energy_scale(0.0, 1.0, 25.0);
+
+        let result = spatial_map_typed(&data, &config, None, None, None).unwrap();
+        let t0_map = result
+            .t0_us_map
+            .as_ref()
+            .expect("t0_us_map must be Some when fit_energy_scale=true");
+        let l_map = result
+            .l_scale_map
+            .as_ref()
+            .expect("l_scale_map must be Some when fit_energy_scale=true");
+        assert_eq!(t0_map.shape(), [4, 4]);
+        assert_eq!(l_map.shape(), [4, 4]);
+        // Synthetic data was generated on the nominal grid (no offset),
+        // so at least one converged pixel should recover t0 ≈ 0 and
+        // L_scale ≈ 1 with finite numeric values.
+        let mut n_finite = 0;
+        for y in 0..4 {
+            for x in 0..4 {
+                if t0_map[[y, x]].is_finite() && l_map[[y, x]].is_finite() {
+                    n_finite += 1;
+                }
+            }
+        }
+        // Wiring check: at least one pixel's TZERO params round-tripped
+        // from the per-pixel SpectrumFitResult into the spatial map.
+        // Physical recovery of exact t0=0 / L=1 is not asserted here
+        // because LM with noise-free data on the nominal grid can stall
+        // at the initial values (zero gradient) without propagating
+        // them through the uncertainty pass; parameter-value checks
+        // belong in dedicated fitting-level tests (transmission_model.rs).
+        assert!(
+            n_finite > 0,
+            "at least one pixel should populate t0_us_map and l_scale_map (finite)"
+        );
+    }
+
+    /// Without `fit_energy_scale`, the TZERO maps are `None` — gate check.
+    #[test]
+    fn test_spatial_map_typed_no_energy_scale_no_maps() {
+        let rd = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        let (t_3d, u_3d) = synthetic_4x4_transmission(&rd, 0.001, &energies);
+        let data = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![rd],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.0005],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()));
+
+        let result = spatial_map_typed(&data, &config, None, None, None).unwrap();
+        assert!(result.t0_us_map.is_none());
+        assert!(result.l_scale_map.is_none());
     }
 }
