@@ -8,6 +8,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 
+use nereids_core::constants::{EV_TO_JOULES, NEUTRON_MASS_KG};
 use nereids_endf::resonance::ResonanceData;
 use nereids_physics::resolution;
 use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
@@ -918,9 +919,12 @@ impl EnergyScaleTransmissionModel {
         l_scale_index: usize,
         instrument: Option<Arc<transmission::InstrumentParams>>,
     ) -> Self {
-        // TOF_FACTOR = sqrt(m_n / (2 * eV)) * 1e6 [μs·√eV/m]
-        // m_n = 1.6749e-27 kg, eV = 1.602e-19 J
-        let tof_factor = (0.5 * 1.6749e-27 / 1.602e-19_f64).sqrt() * 1.0e6;
+        // TOF_FACTOR = sqrt(m_n / (2 · eV)) · 1e6 [μs·√eV/m].
+        // Use the CODATA 2018 values from nereids-core::constants so that
+        // this model, calibration.rs, and core::tof_to_energy all agree to
+        // machine precision (previously the inline approximations differed
+        // by ~5e-5 relative, enough to visibly shift sharp resonances).
+        let tof_factor = (0.5 * NEUTRON_MASS_KG / EV_TO_JOULES).sqrt() * 1.0e6;
         Self {
             cross_sections,
             density_indices,
