@@ -139,6 +139,40 @@ class FitResult:
         """Fitted background parameters (BackA, BackB, BackC)."""
         ...
 
+    @property
+    def back_d(self) -> float:
+        """Fitted exponential background amplitude (SAMMY BackD). Zero when not fitted."""
+        ...
+
+    @property
+    def back_f(self) -> float:
+        """Fitted exponential background decay constant (SAMMY BackF). Zero when not fitted."""
+        ...
+
+    @property
+    def t0_us(self) -> float | None:
+        """Fitted TOF offset (SAMMY TZERO t0) in microseconds, or None."""
+        ...
+
+    @property
+    def l_scale(self) -> float | None:
+        """Fitted flight-path scale factor (SAMMY TZERO L0), or None."""
+        ...
+
+    @property
+    def deviance_per_dof(self) -> float | None:
+        """Conditional binomial deviance / (n - k) from the counts-KL
+        dispatch (joint-Poisson profile-deviance fitter).
+
+        Primary goodness-of-fit for ``solver='kl'`` (or the
+        ``'poisson'`` / ``'joint_poisson'`` aliases) on counts data,
+        per memo 35 §P1.2 — replaces the fixed-flux Pearson chi-squared
+        that scaled with ``c``.  ``None`` for LM fits and for
+        transmission + PoissonKL (those populate
+        ``reduced_chi_squared`` with Pearson chi-squared / (n - k)).
+        """
+        ...
+
 class CalibrationResult:
     """Result of energy axis calibration."""
 
@@ -205,7 +239,15 @@ class SpatialResult:
 
     @property
     def chi_squared_map(self) -> NDArray[np.float64]:
-        """Reduced chi-squared map."""
+        """Reduced chi-squared map.  For the counts-KL dispatch this mirrors
+        ``deviance_per_dof_map`` (back-compat)."""
+        ...
+
+    @property
+    def deviance_per_dof_map(self) -> NDArray[np.float64] | None:
+        """Counts-KL conditional binomial deviance / (n − k) per pixel
+        (memo 35 §P1.2).  ``None`` for LM-only runs and for transmission +
+        PoissonKL (those populate ``chi_squared_map`` with Pearson χ²/dof)."""
         ...
 
     @property
@@ -699,6 +741,12 @@ def spatial_map_typed(
     max_iter: int = 200,
     solver: str = "auto",
     background: bool = False,
+    fit_alpha_1: bool = False,
+    fit_alpha_2: bool = False,
+    alpha_1_init: float = 1.0,
+    alpha_2_init: float = 1.0,
+    c: float = 1.0,
+    enable_polish: bool | None = None,
     resolution: TabulatedResolution | None = None,
     flight_path_m: float | None = None,
     delta_t_us: float | None = None,
@@ -711,10 +759,26 @@ def spatial_map_typed(
     When ``groups`` is provided, each group maps to one fitted density parameter.
 
     Dispatches per-pixel fitting based on InputData type:
-      - from_counts -> Poisson KL on raw counts (optimal)
-      - from_transmission -> LM (default) or KL (solver="kl")
+      - from_counts / from_counts_with_nuisance + solver="kl" / "auto"
+        -> counts-KL (joint-Poisson deviance) — the counts-path solver
+        validated in memo 35 §P1/§P2 and memo 38.
+      - from_transmission + solver="lm" (default for transmission) -> LM.
+      - from_transmission + solver="kl" -> Poisson NLL on transmission values
+        (legacy niche).
 
-    Always returns SpatialResult.
+    Args:
+        data: InputData from `from_counts()`, `from_counts_with_nuisance()`,
+            or `from_transmission()`.
+        c: Proton-charge ratio ``Q_s / Q_ob`` for the counts-KL dispatch
+            (memo 35 §P1.3).  Default 1.0 (assumes caller PC-normalized
+            the flux already).  Ignored for LM / transmission-KL paths.
+        enable_polish: Override the Nelder-Mead polish flag.  ``None``
+            (default) = the dispatcher auto-disables polish when
+            ``n_pixels > 1`` (memo 38 §6 — polish costs ~1000 s per pixel
+            on realistic data).  ``True`` forces polish on, ``False`` off.
+
+    Always returns SpatialResult.  For counts-KL runs,
+    ``SpatialResult.deviance_per_dof_map`` is populated as the primary GOF.
     """
     ...
 
@@ -730,6 +794,14 @@ def fit_spectrum_typed(
     max_iter: int = 200,
     solver: str = "lm",
     background: bool = False,
+    fit_back_d: bool = False,
+    fit_back_f: bool = False,
+    back_d_init: float = 0.01,
+    back_f_init: float = 1.0,
+    fit_energy_scale: bool = False,
+    t0_init_us: float = 0.0,
+    l_scale_init: float = 1.0,
+    energy_scale_flight_path_m: float = 25.0,
     resolution: TabulatedResolution | None = None,
     flight_path_m: float | None = None,
     delta_t_us: float | None = None,
@@ -773,11 +845,20 @@ def fit_counts_spectrum_typed(
     max_iter: int = 200,
     solver: str = "auto",
     background: bool = False,
+    fit_back_d: bool = False,
+    fit_back_f: bool = False,
+    back_d_init: float = 0.01,
+    back_f_init: float = 1.0,
+    fit_energy_scale: bool = False,
+    t0_init_us: float = 0.0,
+    l_scale_init: float = 1.0,
+    energy_scale_flight_path_m: float = 25.0,
     detector_background: NDArray[np.float64] | None = None,
     fit_alpha_1: bool = False,
     fit_alpha_2: bool = False,
     alpha_1_init: float = 1.0,
     alpha_2_init: float = 1.0,
+    c: float = 1.0,
     resolution: TabulatedResolution | None = None,
     flight_path_m: float | None = None,
     delta_t_us: float | None = None,
@@ -787,10 +868,20 @@ def fit_counts_spectrum_typed(
 ) -> FitResult:
     """Fit a single raw-count spectrum (sample + open-beam counts).
 
-    This function accepts raw counts and dispatches to the appropriate solver:
-    ``'auto'`` (default) selects Poisson KL for counts data, ``'kl'`` forces
-    Poisson KL, and ``'lm'`` forces Levenberg-Marquardt on normalised
-    transmission.
+    Dispatches to a counts-domain solver based on ``solver``:
+
+    - ``'auto'`` (default), ``'kl'``, ``'poisson'``, and ``'joint_poisson'``
+      all route to the **counts-KL dispatch**: the joint-Poisson profile
+      binomial-deviance fitter (memo 35 §P1/§P2; collapsed to a single
+      path in this PR).  Uses the explicit proton-charge ratio
+      ``c = Q_s / Q_ob`` from the ``c`` kwarg and populates
+      ``FitResult.deviance_per_dof`` as the primary GOF.
+      ``'joint_poisson'`` is kept as a compatibility alias; prefer ``'kl'``
+      for new code.
+    - ``'lm'`` converts counts to transmission internally and runs
+      Levenberg-Marquardt on the resulting ratio (information-lossy
+      fallback).
+
     For pre-normalized transmission data, use ``fit_spectrum_typed(...)``.
 
     Either ``isotopes`` or ``groups`` must be provided, but not both.
@@ -804,15 +895,82 @@ def fit_counts_spectrum_typed(
         temperature_k: Sample temperature in Kelvin (default 293.6).
         fit_temperature: Whether to fit temperature (default False).
         max_iter: Maximum iterations (default 200).
-        solver: 'auto' (default), 'kl', or 'lm'.
-        background: Enable transmission-lift background inside the counts fit.
-        detector_background: Optional detector/counts background reference.
-        fit_alpha_1: Fit flux-scale nuisance parameter alpha_1.
-        fit_alpha_2: Fit detector-background scale nuisance parameter alpha_2.
-        alpha_1_init: Initial value for alpha_1 (default 1.0).
-        alpha_2_init: Initial value for alpha_2 (default 1.0).
+        solver: ``'auto'`` (default), ``'kl'`` / ``'poisson'`` /
+            ``'joint_poisson'`` (all equivalent — counts-KL dispatch),
+            or ``'lm'``.
+        background: Enable the SAMMY-style transmission-background
+            wrapper inside the counts-KL fit (A_n + B_A + B_B/√E + B_C√E).
+        detector_background: Optional detector/counts background reference
+            (for LM-converted path only; counts-KL rejects non-zero values,
+            deferred to memo 35 §P3.2).
+        fit_alpha_1: Research-only; rejected by the counts-KL dispatch
+            because the profile λ̂ absorbs the global flux scale.
+        fit_alpha_2: Research-only; rejected by the counts-KL dispatch
+            (B_det / alpha_2 wiring deferred to memo 35 §P3.2).
+        alpha_1_init: Initial value for alpha_1 (default 1.0); only
+            consumed by the research Fisher helper.
+        alpha_2_init: Initial value for alpha_2 (default 1.0); same.
+        c: Proton-charge ratio ``Q_s / Q_ob`` (memo 35 §P1.3).  Default
+            1.0 assumes the caller has already PC-normalized the flux.
+            For raw VENUS-style counts, set this to the actual ratio
+            (typically ~5–6).  Used by the counts-KL dispatch; ignored
+            by the LM path.
         resolution: Optional resolution function.
         groups: List of IsotopeGroup objects (mutually exclusive with isotopes).
         initial_densities: Initial density guesses when using groups.
+    """
+    ...
+
+class ModelJacobianResult:
+    """Result of exact Jacobian/Fisher evaluation from the Rust engine."""
+
+    @property
+    def jacobian(self) -> NDArray[np.float64]:
+        """Analytical Jacobian (n_energy × n_free_params), row-major."""
+        ...
+
+    @property
+    def fisher(self) -> NDArray[np.float64]:
+        """Expected Poisson Fisher F = J^T diag(1/μ) J (n_free × n_free)."""
+        ...
+
+    @property
+    def model_prediction(self) -> NDArray[np.float64]:
+        """Model prediction μ(E) at the evaluation point."""
+        ...
+
+    @property
+    def param_names(self) -> list[str]:
+        """Names of free parameters in Jacobian column order."""
+        ...
+
+def compute_model_jacobian(
+    open_beam_counts: NDArray[np.float64],
+    energies: NDArray[np.float64],
+    isotopes: list[tuple[ResonanceData, float]] | None = None,
+    *,
+    temperature_k: float = 293.6,
+    fit_temperature: bool = False,
+    flight_path_m: float | None = None,
+    delta_t_us: float | None = None,
+    delta_l_m: float | None = None,
+    resolution: TabulatedResolution | None = None,
+    detector_background: NDArray[np.float64] | None = None,
+    fit_alpha_1: bool = False,
+    fit_alpha_2: bool = False,
+    alpha_1: float = 1.0,
+    alpha_2: float = 1.0,
+    groups: list[IsotopeGroup] | None = None,
+    initial_densities: list[float] | None = None,
+) -> ModelJacobianResult:
+    """Compute exact resolved analytical Jacobian and expected Fisher.
+
+    Uses the same model construction as ``fit_counts_spectrum_typed()`` but
+    evaluates at the given parameter values without optimising.
+
+    Either ``isotopes`` or ``groups`` must be provided, but not both.
+    When ``groups`` is provided, each group maps to one density parameter.
+
+    Research-oriented function for Fisher-based regularisation studies.
     """
     ...

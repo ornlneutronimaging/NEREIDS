@@ -64,6 +64,15 @@ pub struct SessionCache {
     /// KL background enabled (b₀ + b₁/√E).
     #[serde(default)]
     pub kl_background_enabled: bool,
+    /// Counts-KL proton-charge ratio `c = Q_s / Q_ob` (memo 35 §P1.3).
+    /// Defaults to 1.0 (caller PC-normalized the flux upstream).
+    #[serde(default = "default_kl_c_ratio")]
+    pub kl_c_ratio: f64,
+    /// Counts-KL Nelder-Mead polish override.  `None` = dispatcher
+    /// auto-disables polish for multi-pixel spatial fits (memo 38 §6).
+    /// `Some(true/false)` forces polish on/off.
+    #[serde(default)]
+    pub kl_enable_polish_override: Option<bool>,
     /// Isotope groups: (z, name, members, density, enabled).
     /// ResonanceData is not serialized — members get Pending status on restore.
     #[serde(default)]
@@ -79,6 +88,11 @@ fn default_rebin_factor() -> usize {
 pub enum CachedSolverMethod {
     LevenbergMarquardt,
     PoissonKL,
+}
+
+/// Default for SessionCache::kl_c_ratio when a saved session predates the field.
+fn default_kl_c_ratio() -> f64 {
+    1.0
 }
 
 /// A cached isotope entry (serializable).
@@ -163,6 +177,8 @@ impl SessionCache {
             sidebar_collapsed: state.sidebar_collapsed,
             lm_background_enabled: state.lm_background_enabled,
             kl_background_enabled: state.kl_background_enabled,
+            kl_c_ratio: state.kl_c_ratio,
+            kl_enable_polish_override: state.kl_enable_polish_override,
             isotope_groups: state
                 .isotope_groups
                 .iter()
@@ -280,6 +296,8 @@ impl SessionCache {
         // Restore background normalization state
         state.lm_background_enabled = self.lm_background_enabled;
         state.kl_background_enabled = self.kl_background_enabled;
+        state.kl_c_ratio = self.kl_c_ratio;
+        state.kl_enable_polish_override = self.kl_enable_polish_override;
 
         // Rebuild pipeline
         state.rebuild_pipeline();
@@ -714,9 +732,20 @@ pub struct AppState {
     /// LM background: SAMMY 4-param model.
     /// Model: Anorm * T_inner(E) + BackA + BackB/sqrt(E) + BackC*sqrt(E)
     pub lm_background_enabled: bool,
-    /// KL background: 2-param additive model.
-    /// Model: T_inner(E) + b₀ + b₁/sqrt(E)
+    /// KL background: SAMMY 4-term wrapper (joint-Poisson compatible).
+    /// Model: Anorm * T_inner(E) + BackA + BackB/sqrt(E) + BackC*sqrt(E)
     pub kl_background_enabled: bool,
+    /// Proton-charge ratio c = Q_s / Q_ob for the counts-KL solver
+    /// (memo 35 §P1.3).  Default 1.0 = caller PC-normalized the flux
+    /// upstream.  For raw-count VENUS data, set to the actual
+    /// Q_sample/Q_open_beam ratio (typically ~5–6).
+    pub kl_c_ratio: f64,
+    /// Override for Nelder-Mead polish on the counts-KL path.  `None`
+    /// lets `spatial_map_typed` auto-disable polish when n_pixels > 1
+    /// (memo 38 §6 — 17 min/pixel polish cost).  `Some(true)` forces
+    /// polish on even at spatial scale (research use only);
+    /// `Some(false)` forces off.
+    pub kl_enable_polish_override: Option<bool>,
 
     // -- Pixel / ROI selection --
     pub selected_pixel: Option<(usize, usize)>,
@@ -1403,6 +1432,8 @@ impl Default for AppState {
             uncertainty_is_estimated: false,
             lm_background_enabled: false,
             kl_background_enabled: false,
+            kl_c_ratio: 1.0,
+            kl_enable_polish_override: None,
 
             selected_pixel: None,
             rois: Vec::new(),

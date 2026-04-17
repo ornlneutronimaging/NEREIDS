@@ -584,15 +584,21 @@ impl FitModel for TransmissionFitModel {
 /// Wraps a transmission model with SAMMY-style normalization and background.
 ///
 /// T_out(E) = Anorm × T_inner(E) + BackA + BackB / √E + BackC × √E
+///          + BackD × exp(−BackF / √E)
 ///
 /// The normalization and background parameters are additional entries in the
 /// parameter vector, appended after the density (and optional temperature)
 /// parameters of the inner model.
 ///
+/// The exponential tail (BackD, BackF) is optional.  When
+/// `back_d_index` and `back_f_index` are `None`, the model reduces to
+/// the 4-parameter form.
+///
 /// ## SAMMY Reference
 /// SAMMY manual Sec III.E.2 — NORMAlization and BACKGround cards.
-/// SAMMY fits up to 4 background terms; we implement the same 4:
-///   Anorm, constant BackA, 1/√E term BackB, √E term BackC.
+/// SAMMY fits up to 6 background terms; we implement all 6:
+///   Anorm, constant BackA, 1/√E term BackB, √E term BackC,
+///   exponential amplitude BackD, exponential decay BackF.
 pub struct NormalizedTransmissionModel<M: FitModel> {
     /// The inner (pure Beer-Lambert) transmission model.
     inner: M,
@@ -608,10 +614,16 @@ pub struct NormalizedTransmissionModel<M: FitModel> {
     back_b_index: usize,
     /// Index of the BackC (√E background) parameter.
     back_c_index: usize,
+    /// Index of BackD (exponential amplitude) in the parameter vector.
+    /// `None` disables the exponential tail term.
+    back_d_index: Option<usize>,
+    /// Index of BackF (exponential decay constant) in the parameter vector.
+    /// `None` disables the exponential tail term.
+    back_f_index: Option<usize>,
 }
 
 impl<M: FitModel> NormalizedTransmissionModel<M> {
-    /// Create a new normalized transmission model.
+    /// Create a new normalized transmission model (4-parameter, no exponential tail).
     ///
     /// # Arguments
     /// * `inner` — The inner transmission model (Beer-Lambert).
@@ -641,6 +653,44 @@ impl<M: FitModel> NormalizedTransmissionModel<M> {
             back_a_index,
             back_b_index,
             back_c_index,
+            back_d_index: None,
+            back_f_index: None,
+        }
+    }
+
+    /// Create a normalized transmission model with the SAMMY exponential tail.
+    ///
+    /// Adds BackD × exp(−BackF / √E) to the 4-parameter background model.
+    ///
+    /// # Arguments
+    /// * `back_d_index` — Index of BackD (exponential amplitude) in the parameter vector.
+    /// * `back_f_index` — Index of BackF (exponential decay constant) in the parameter vector.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_exponential(
+        inner: M,
+        energies: &[f64],
+        anorm_index: usize,
+        back_a_index: usize,
+        back_b_index: usize,
+        back_c_index: usize,
+        back_d_index: usize,
+        back_f_index: usize,
+    ) -> Self {
+        let sqrt_energies: Vec<f64> = energies.iter().map(|&e| e.sqrt()).collect();
+        let inv_sqrt_energies: Vec<f64> = sqrt_energies
+            .iter()
+            .map(|&se| if se > 0.0 { 1.0 / se } else { 0.0 })
+            .collect();
+        Self {
+            inner,
+            sqrt_energies,
+            inv_sqrt_energies,
+            anorm_index,
+            back_a_index,
+            back_b_index,
+            back_c_index,
+            back_d_index: Some(back_d_index),
+            back_f_index: Some(back_f_index),
         }
     }
 }
@@ -653,14 +703,25 @@ impl<M: FitModel> FitModel for NormalizedTransmissionModel<M> {
         let back_b = params[self.back_b_index];
         let back_c = params[self.back_c_index];
 
+        // Optional exponential tail: BackD × exp(−BackF / √E)
+        let (back_d, back_f) = match (self.back_d_index, self.back_f_index) {
+            (Some(di), Some(fi)) => (params[di], params[fi]),
+            _ => (0.0, 0.0),
+        };
+        let has_exp = self.back_d_index.is_some();
+
         let result: Vec<f64> = t_inner
             .iter()
             .enumerate()
             .map(|(i, &t)| {
-                anorm * t
+                let mut val = anorm * t
                     + back_a
                     + back_b * self.inv_sqrt_energies[i]
-                    + back_c * self.sqrt_energies[i]
+                    + back_c * self.sqrt_energies[i];
+                if has_exp {
+                    val += back_d * (-back_f * self.inv_sqrt_energies[i]).exp();
+                }
+                val
             })
             .collect();
         Ok(result)
@@ -675,6 +736,8 @@ impl<M: FitModel> FitModel for NormalizedTransmissionModel<M> {
     /// - ∂T_out/∂BackA  = 1
     /// - ∂T_out/∂BackB  = 1/√E
     /// - ∂T_out/∂BackC  = √E
+    /// - ∂T_out/∂BackD  = exp(−BackF / √E)
+    /// - ∂T_out/∂BackF  = −BackD × exp(−BackF / √E) / √E
     fn analytical_jacobian(
         &self,
         params: &[f64],
@@ -692,18 +755,24 @@ impl<M: FitModel> FitModel for NormalizedTransmissionModel<M> {
         let anorm = params[self.anorm_index];
 
         // Identify which free params are background params vs inner params.
-        let bg_indices = [
+        let mut bg_indices_set = vec![
             self.anorm_index,
             self.back_a_index,
             self.back_b_index,
             self.back_c_index,
         ];
+        if let Some(di) = self.back_d_index {
+            bg_indices_set.push(di);
+        }
+        if let Some(fi) = self.back_f_index {
+            bg_indices_set.push(fi);
+        }
 
         // Collect inner model's free param indices (those not in bg_indices).
         let inner_free_indices: Vec<usize> = free_param_indices
             .iter()
             .copied()
-            .filter(|idx| !bg_indices.contains(idx))
+            .filter(|idx| !bg_indices_set.contains(idx))
             .collect();
 
         // Get inner Jacobian if there are inner free params.
@@ -714,6 +783,19 @@ impl<M: FitModel> FitModel for NormalizedTransmissionModel<M> {
         } else {
             None
         };
+
+        // Precompute exp(−BackF / √E) for the exponential tail columns.
+        let exp_terms: Vec<f64> =
+            if let (Some(di), Some(fi)) = (self.back_d_index, self.back_f_index) {
+                let _back_d = params[di];
+                let back_f = params[fi];
+                self.inv_sqrt_energies
+                    .iter()
+                    .map(|&inv_se| (-back_f * inv_se).exp())
+                    .collect()
+            } else {
+                vec![]
+            };
 
         let mut jacobian = FlatMatrix::zeros(n_e, n_free);
 
@@ -744,6 +826,21 @@ impl<M: FitModel> FitModel for NormalizedTransmissionModel<M> {
                 for (i, &se) in self.sqrt_energies.iter().enumerate() {
                     *jacobian.get_mut(i, col) = se;
                 }
+            } else if self.back_d_index == Some(fp_idx) {
+                // ∂T_out/∂BackD = exp(−BackF / √E)
+                for (i, &et) in exp_terms.iter().enumerate() {
+                    *jacobian.get_mut(i, col) = et;
+                }
+            } else if self.back_f_index == Some(fp_idx) {
+                // ∂T_out/∂BackF = −BackD × exp(−BackF / √E) / √E
+                let back_d = params[self.back_d_index.unwrap()];
+                for (i, (&et, &inv_se)) in exp_terms
+                    .iter()
+                    .zip(self.inv_sqrt_energies.iter())
+                    .enumerate()
+                {
+                    *jacobian.get_mut(i, col) = -back_d * et * inv_se;
+                }
             } else if let Some(&inner_col) = inner_col_map.get(&fp_idx) {
                 // Inner model parameter: ∂T_out/∂p = Anorm × ∂T_inner/∂p
                 if let Some(ref jac) = inner_jac {
@@ -758,6 +855,259 @@ impl<M: FitModel> FitModel for NormalizedTransmissionModel<M> {
             } else {
                 // Unknown parameter — should not happen, but fall back to FD.
                 return None;
+            }
+        }
+
+        Some(jacobian)
+    }
+}
+
+// ── Energy-scale transmission model (SAMMY TZERO equivalent) ─────────────
+
+/// Transmission model with energy-scale calibration parameters (t₀, L_scale).
+///
+/// Wraps precomputed cross-sections and re-maps the energy grid at each
+/// evaluation:
+///   1. Convert nominal energy → TOF: `t = TOF_FACTOR * L / √E_nom`
+///   2. Apply calibration: `t_corr = t - t₀`, `E_corr = (TOF_FACTOR * L * L_scale / t_corr)²`
+///   3. Interpolate cross-sections σ(E_nom) → σ(E_corr)
+///   4. Beer-Lambert + resolution on the corrected grid
+///
+/// This is equivalent to SAMMY's TZERO parameters.
+///
+/// The Jacobian for t₀ and L_scale is computed via finite differences
+/// (the energy-grid remapping is nonlinear and not easily differentiable
+/// analytically through the interpolation + resolution pipeline).
+pub struct EnergyScaleTransmissionModel {
+    /// Precomputed cross-sections on the NOMINAL energy grid.
+    cross_sections: Arc<Vec<Vec<f64>>>,
+    /// Density parameter indices (same as PrecomputedTransmissionModel).
+    density_indices: Arc<Vec<usize>>,
+    /// Nominal energy grid (eV, ascending).
+    nominal_energies: Vec<f64>,
+    /// Flight path length in meters (used for TOF↔energy conversion).
+    flight_path_m: f64,
+    /// TOF factor: sqrt(m_n / (2 * eV)) in μs·√eV/m.
+    tof_factor: f64,
+    /// Index of t₀ (μs) in the parameter vector.
+    t0_index: usize,
+    /// Index of L_scale (dimensionless) in the parameter vector.
+    l_scale_index: usize,
+    /// Instrument resolution parameters (applied after Beer-Lambert).
+    instrument: Option<Arc<transmission::InstrumentParams>>,
+}
+
+impl EnergyScaleTransmissionModel {
+    /// Create a new energy-scale transmission model.
+    ///
+    /// # Arguments
+    /// * `cross_sections` — Precomputed σ(E) on the nominal grid.
+    /// * `density_indices` — Maps isotope index → parameter index.
+    /// * `nominal_energies` — Energy grid in eV (ascending).
+    /// * `flight_path_m` — Nominal flight path in meters.
+    /// * `t0_index` — Index of t₀ parameter.
+    /// * `l_scale_index` — Index of L_scale parameter.
+    /// * `instrument` — Optional resolution function.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        cross_sections: Arc<Vec<Vec<f64>>>,
+        density_indices: Arc<Vec<usize>>,
+        nominal_energies: Vec<f64>,
+        flight_path_m: f64,
+        t0_index: usize,
+        l_scale_index: usize,
+        instrument: Option<Arc<transmission::InstrumentParams>>,
+    ) -> Self {
+        // TOF_FACTOR = sqrt(m_n / (2 * eV)) * 1e6 [μs·√eV/m]
+        // m_n = 1.6749e-27 kg, eV = 1.602e-19 J
+        let tof_factor = (0.5 * 1.6749e-27 / 1.602e-19_f64).sqrt() * 1.0e6;
+        Self {
+            cross_sections,
+            density_indices,
+            nominal_energies,
+            flight_path_m,
+            tof_factor,
+            t0_index,
+            l_scale_index,
+            instrument,
+        }
+    }
+
+    /// Compute the corrected energy grid for given (t₀, L_scale).
+    ///
+    /// **Physical bound on `t0_us`.**  The corrected TOF is `tof - t0_us`,
+    /// where `tof = tof_factor · L / √E_nom`.  For the corrected grid to
+    /// remain physical, `tof_corr > 0` must hold for every bin — i.e.
+    /// `t0_us < min_i(tof_i) = tof_factor · L / √(max E_nom)`.  The
+    /// `EnergyScaleTransmissionModel` pipeline registers `t0_us` with
+    /// bounds of ±10 μs, which safely satisfies this invariant for VENUS
+    /// (L = 25 m, E ≤ 200 eV gives `min_tof ≈ 17.7 μs`).
+    ///
+    /// As a defensive measure — if a caller ever invokes this function
+    /// with a `t0_us` that would push any bin's `tof_corr` below zero —
+    /// we clamp `t0_us` to just under `min_tof` so the corrected grid
+    /// stays monotone and physical.  This is a safety net; the expected
+    /// path is that the optimizer's parameter bounds keep `t0_us` well
+    /// below the clamp threshold.
+    fn corrected_energies(&self, t0_us: f64, l_scale: f64) -> Vec<f64> {
+        if self.nominal_energies.is_empty() {
+            return Vec::new();
+        }
+        let l_eff = self.flight_path_m * l_scale;
+        // min(tof) over the grid = tof_factor * L / sqrt(max E_nom).
+        let min_tof = self
+            .nominal_energies
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, |acc, e| {
+                acc.min(self.tof_factor * self.flight_path_m / e.sqrt())
+            });
+        let t0_limit = min_tof * (1.0 - 1.0e-12);
+        let t0_clamped = t0_us.min(t0_limit);
+        self.nominal_energies
+            .iter()
+            .map(|&e_nom| {
+                let tof = self.tof_factor * self.flight_path_m / e_nom.sqrt();
+                let tof_corr = tof - t0_clamped;
+                (self.tof_factor * l_eff / tof_corr).powi(2)
+            })
+            .collect()
+    }
+
+    /// Interpolate a cross-section array from nominal grid to corrected grid.
+    fn interpolate_xs(nominal_e: &[f64], xs: &[f64], corrected_e: &[f64]) -> Vec<f64> {
+        corrected_e
+            .iter()
+            .map(|&e_corr| {
+                // Binary search in the nominal (ascending) grid
+                let n = nominal_e.len();
+                if e_corr <= nominal_e[0] {
+                    return xs[0];
+                }
+                if e_corr >= nominal_e[n - 1] {
+                    return xs[n - 1];
+                }
+                let pos = nominal_e.partition_point(|&e| e < e_corr);
+                let i = if pos == 0 { 0 } else { pos - 1 };
+                let frac = (e_corr - nominal_e[i]) / (nominal_e[i + 1] - nominal_e[i]);
+                xs[i] + frac * (xs[i + 1] - xs[i])
+            })
+            .collect()
+    }
+
+    /// Evaluate transmission at given parameters (densities + t0 + l_scale).
+    fn evaluate_at(&self, params: &[f64], e_corr: &[f64]) -> Result<Vec<f64>, FittingError> {
+        let n_e = self.nominal_energies.len();
+
+        // Interpolate cross-sections to corrected energy grid
+        let mut neg_opt = vec![0.0f64; n_e];
+        for (i, xs) in self.cross_sections.iter().enumerate() {
+            let density = params[self.density_indices[i]];
+            let xs_interp = Self::interpolate_xs(&self.nominal_energies, xs, e_corr);
+            for (j, &sigma) in xs_interp.iter().enumerate() {
+                neg_opt[j] -= density * sigma;
+            }
+        }
+        let transmission: Vec<f64> = neg_opt.iter().map(|&d| d.exp()).collect();
+
+        // Resolution broadening on the corrected grid
+        if let Some(inst) = &self.instrument {
+            let t_broadened = resolution::apply_resolution(e_corr, &transmission, &inst.resolution)
+                .map_err(|e| {
+                    FittingError::EvaluationFailed(format!("resolution broadening: {e}"))
+                })?;
+            Ok(t_broadened)
+        } else {
+            Ok(transmission)
+        }
+    }
+}
+
+impl FitModel for EnergyScaleTransmissionModel {
+    fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+        let t0 = params[self.t0_index];
+        let l_scale = params[self.l_scale_index];
+        let e_corr = self.corrected_energies(t0, l_scale);
+        self.evaluate_at(params, &e_corr)
+    }
+
+    /// Jacobian: analytical for density parameters, finite-difference for t₀ and L_scale.
+    fn analytical_jacobian(
+        &self,
+        params: &[f64],
+        free_param_indices: &[usize],
+        _y_current: &[f64],
+    ) -> Option<FlatMatrix> {
+        let n_e = self.nominal_energies.len();
+        let n_free = free_param_indices.len();
+        let mut jacobian = FlatMatrix::zeros(n_e, n_free);
+
+        let t0 = params[self.t0_index];
+        let l_scale = params[self.l_scale_index];
+        let e_corr = self.corrected_energies(t0, l_scale);
+
+        // Compute unresolved T and interpolated cross-sections for density derivatives
+        let mut neg_opt = vec![0.0f64; n_e];
+        let mut interp_xs_all: Vec<Vec<f64>> = Vec::new();
+        for (i, xs) in self.cross_sections.iter().enumerate() {
+            let density = params[self.density_indices[i]];
+            let xs_interp = Self::interpolate_xs(&self.nominal_energies, xs, &e_corr);
+            for (j, &sigma) in xs_interp.iter().enumerate() {
+                neg_opt[j] -= density * sigma;
+            }
+            interp_xs_all.push(xs_interp);
+        }
+        let t_unresolved: Vec<f64> = neg_opt.iter().map(|&d| d.exp()).collect();
+
+        for (col, &fp_idx) in free_param_indices.iter().enumerate() {
+            if fp_idx == self.t0_index || fp_idx == self.l_scale_index {
+                // Finite difference for energy-scale parameters
+                let h = if fp_idx == self.t0_index { 1e-4 } else { 1e-7 };
+                let mut p_plus = params.to_vec();
+                let mut p_minus = params.to_vec();
+                p_plus[fp_idx] += h;
+                p_minus[fp_idx] -= h;
+                let y_plus = match self.evaluate(&p_plus) {
+                    Ok(v) => v,
+                    Err(_) => return None,
+                };
+                let y_minus = match self.evaluate(&p_minus) {
+                    Ok(v) => v,
+                    Err(_) => return None,
+                };
+                for i in 0..n_e {
+                    *jacobian.get_mut(i, col) = (y_plus[i] - y_minus[i]) / (2.0 * h);
+                }
+            } else {
+                // Density parameter: analytical derivative
+                // ∂T/∂n_g = -(Σ_{iso∈g} σ_iso(E)) · T_unresolved(E)
+                let mut sigma_sum = vec![0.0f64; n_e];
+                for (iso, &di) in self.density_indices.iter().enumerate() {
+                    if di == fp_idx {
+                        for (j, &sigma) in interp_xs_all[iso].iter().enumerate() {
+                            sigma_sum[j] += sigma;
+                        }
+                    }
+                }
+                let inner_deriv: Vec<f64> =
+                    (0..n_e).map(|i| -sigma_sum[i] * t_unresolved[i]).collect();
+
+                // Apply resolution to derivative if enabled
+                if let Some(inst) = &self.instrument {
+                    let resolved_deriv =
+                        match resolution::apply_resolution(&e_corr, &inner_deriv, &inst.resolution)
+                        {
+                            Ok(v) => v,
+                            Err(_) => return None,
+                        };
+                    for (i, &val) in resolved_deriv.iter().enumerate() {
+                        *jacobian.get_mut(i, col) = val;
+                    }
+                } else {
+                    for (i, &val) in inner_deriv.iter().enumerate() {
+                        *jacobian.get_mut(i, col) = val;
+                    }
+                }
             }
         }
 
@@ -852,11 +1202,42 @@ impl<M: FitModel> ForwardModel for NormalizedTransmissionModel<M> {
 
     fn n_params(&self) -> usize {
         // The background indices are the highest parameter indices.
-        self.anorm_index
+        let mut max_idx = self
+            .anorm_index
             .max(self.back_a_index)
             .max(self.back_b_index)
-            .max(self.back_c_index)
-            + 1
+            .max(self.back_c_index);
+        if let Some(di) = self.back_d_index {
+            max_idx = max_idx.max(di);
+        }
+        if let Some(fi) = self.back_f_index {
+            max_idx = max_idx.max(fi);
+        }
+        max_idx + 1
+    }
+}
+
+impl ForwardModel for EnergyScaleTransmissionModel {
+    fn predict(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+        self.evaluate(params)
+    }
+
+    fn jacobian(
+        &self,
+        params: &[f64],
+        free_param_indices: &[usize],
+        y_current: &[f64],
+    ) -> Option<Vec<Vec<f64>>> {
+        let fm = self.analytical_jacobian(params, free_param_indices, y_current)?;
+        Some(flat_matrix_to_vecs(&fm, free_param_indices.len()))
+    }
+
+    fn n_data(&self) -> usize {
+        self.nominal_energies.len()
+    }
+
+    fn n_params(&self) -> usize {
+        self.t0_index.max(self.l_scale_index) + 1
     }
 }
 
@@ -2110,6 +2491,405 @@ mod tests {
             max_diff > 1e-4,
             "Resolution should make a measurable difference in the temperature \
              path, but max diff = {max_diff}"
+        );
+    }
+
+    // ── Exponential background (BackD, BackF) tests ──
+
+    /// Verify that new_with_exponential evaluate() matches the formula:
+    /// T_out = Anorm*T_inner + BackA + BackB/√E + BackC*√E + BackD*exp(-BackF/√E)
+    #[test]
+    fn exponential_evaluate_formula_correct() {
+        let xs = vec![vec![1.0, 2.0, 3.0]];
+        let inner = make_precomputed(xs, vec![0]);
+        let energies = [4.0, 9.0, 25.0]; // sqrt = [2, 3, 5]
+
+        let model =
+            NormalizedTransmissionModel::new_with_exponential(inner, &energies, 1, 2, 3, 4, 5, 6);
+
+        // params: [density, anorm, back_a, back_b, back_c, back_d, back_f]
+        let density = 0.1;
+        let anorm = 1.02;
+        let back_a = 0.01;
+        let back_b = 0.005;
+        let back_c = 0.002;
+        let back_d = 0.05;
+        let back_f = 3.0;
+        let params = [density, anorm, back_a, back_b, back_c, back_d, back_f];
+
+        let y = model.evaluate(&params).unwrap();
+
+        // Manually compute expected
+        let xs_vals = [1.0, 2.0, 3.0];
+        let sqrt_e = [2.0, 3.0, 5.0];
+        for i in 0..3 {
+            let t_inner = (-density * xs_vals[i]).exp();
+            let expected = anorm * t_inner
+                + back_a
+                + back_b / sqrt_e[i]
+                + back_c * sqrt_e[i]
+                + back_d * (-back_f / sqrt_e[i]).exp();
+            assert!(
+                (y[i] - expected).abs() < 1e-12,
+                "bin {i}: got {}, expected {expected}",
+                y[i]
+            );
+        }
+    }
+
+    /// Analytical Jacobian for BackD and BackF columns must match central FD.
+    #[test]
+    fn exponential_jacobian_matches_finite_difference() {
+        let xs = vec![vec![1.0, 2.0, 3.0, 0.5, 1.5]];
+        let inner = make_precomputed(xs, vec![0]);
+        let energies = [0.1, 1.0, 4.0, 25.0, 100.0]; // span 0.1–100 eV
+
+        let model =
+            NormalizedTransmissionModel::new_with_exponential(inner, &energies, 1, 2, 3, 4, 5, 6);
+
+        // params: [density, anorm, back_a, back_b, back_c, back_d, back_f]
+        let params = [0.1, 1.02, 0.01, 0.005, 0.002, 0.05, 3.0];
+        let y = model.evaluate(&params).unwrap();
+        let free_indices: Vec<usize> = (0..7).collect();
+
+        let jac = model
+            .analytical_jacobian(&params, &free_indices, &y)
+            .expect("analytical Jacobian should be available");
+
+        // Central finite difference for all parameters
+        let h = 1e-7;
+        for (col, &pidx) in free_indices.iter().enumerate() {
+            let mut p_plus = params.to_vec();
+            let mut p_minus = params.to_vec();
+            p_plus[pidx] += h;
+            p_minus[pidx] -= h;
+            let y_plus = model.evaluate(&p_plus).unwrap();
+            let y_minus = model.evaluate(&p_minus).unwrap();
+
+            for row in 0..energies.len() {
+                let fd = (y_plus[row] - y_minus[row]) / (2.0 * h);
+                let anal = jac.get(row, col);
+                let abs_err = (anal - fd).abs();
+                let rel_err = abs_err / fd.abs().max(1e-15);
+                assert!(
+                    rel_err < 1e-5 || abs_err < 1e-10,
+                    "param {pidx} (col {col}), bin {row}: analytical={anal:.10e}, \
+                     fd={fd:.10e}, rel_err={rel_err:.2e}"
+                );
+            }
+        }
+    }
+
+    /// Round-trip: fit recovers all 6 background + density from noiseless data.
+    #[test]
+    fn exponential_fit_recovers_all_params() {
+        let xs = vec![vec![1.0, 2.0, 3.0, 2.0, 1.5, 0.8, 1.2, 2.5]];
+        let inner = make_precomputed(xs, vec![0]);
+        let energies = [0.5, 1.0, 4.0, 9.0, 16.0, 25.0, 36.0, 64.0];
+
+        let model =
+            NormalizedTransmissionModel::new_with_exponential(inner, &energies, 1, 2, 3, 4, 5, 6);
+
+        // True parameters
+        let true_density = 0.15;
+        let true_anorm = 1.02;
+        let true_back_a = 0.01;
+        let true_back_b = 0.005;
+        let true_back_c = 0.002;
+        let true_back_d = 0.03;
+        let true_back_f = 2.0;
+        let true_params = [
+            true_density,
+            true_anorm,
+            true_back_a,
+            true_back_b,
+            true_back_c,
+            true_back_d,
+            true_back_f,
+        ];
+
+        let y_obs = model.evaluate(&true_params).unwrap();
+        let sigma = vec![0.001; y_obs.len()];
+
+        let mut params = ParameterSet::new(vec![
+            FitParameter::non_negative("density", 0.1),
+            FitParameter {
+                name: "anorm".into(),
+                value: 1.0,
+                lower: 0.5,
+                upper: 1.5,
+                fixed: false,
+            },
+            FitParameter {
+                name: "back_a".into(),
+                value: 0.0,
+                lower: -0.5,
+                upper: 0.5,
+                fixed: false,
+            },
+            FitParameter {
+                name: "back_b".into(),
+                value: 0.0,
+                lower: -0.5,
+                upper: 0.5,
+                fixed: false,
+            },
+            FitParameter {
+                name: "back_c".into(),
+                value: 0.0,
+                lower: -0.5,
+                upper: 0.5,
+                fixed: false,
+            },
+            FitParameter {
+                name: "back_d".into(),
+                value: 0.01,
+                lower: 0.0,
+                upper: 1.0,
+                fixed: false,
+            },
+            FitParameter {
+                name: "back_f".into(),
+                value: 1.0,
+                lower: 0.0,
+                upper: 100.0,
+                fixed: false,
+            },
+        ]);
+
+        let config = LmConfig {
+            max_iter: 500,
+            ..LmConfig::default()
+        };
+
+        let result = lm::levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &config).unwrap();
+
+        assert!(result.converged, "Fit should converge");
+
+        let fitted = &result.params;
+        let check = |name, fitted_val: f64, true_val: f64, tol: f64| {
+            let err = (fitted_val - true_val).abs();
+            let rel = err / true_val.abs().max(1e-10);
+            assert!(
+                rel < tol || err < 1e-6,
+                "{name}: fitted={fitted_val:.6}, true={true_val:.6}, rel_err={rel:.4}"
+            );
+        };
+
+        check("density", fitted[0], true_density, 0.10);
+        check("anorm", fitted[1], true_anorm, 0.10);
+        check("back_a", fitted[2], true_back_a, 0.10);
+        check("back_b", fitted[3], true_back_b, 0.10);
+        check("back_c", fitted[4], true_back_c, 0.10);
+        check("back_d", fitted[5], true_back_d, 0.10);
+        check("back_f", fitted[6], true_back_f, 0.10);
+    }
+
+    // ── EnergyScaleTransmissionModel tests ──
+
+    /// Verify that corrected_energies shifts the grid correctly.
+    #[test]
+    fn energy_scale_corrected_energies() {
+        let xs = vec![vec![1.0; 5]];
+        let energies = vec![10.0, 20.0, 50.0, 100.0, 200.0];
+        let model = EnergyScaleTransmissionModel::new(
+            std::sync::Arc::new(xs),
+            std::sync::Arc::new(vec![0]),
+            energies.clone(),
+            25.0,
+            1, // t0_index
+            2, // l_scale_index
+            None,
+        );
+
+        // With t0=0, l_scale=1: corrected energies should equal nominal
+        let e_corr = model.corrected_energies(0.0, 1.0);
+        for (i, (&nom, &corr)) in energies.iter().zip(e_corr.iter()).enumerate() {
+            assert!(
+                (nom - corr).abs() / nom < 1e-10,
+                "bin {i}: nominal={nom}, corrected={corr}"
+            );
+        }
+
+        // With l_scale > 1: all corrected energies should increase
+        let e_corr_ls = model.corrected_energies(0.0, 1.005);
+        for (i, (&nom, &corr)) in energies.iter().zip(e_corr_ls.iter()).enumerate() {
+            assert!(
+                corr > nom,
+                "bin {i}: l_scale=1.005 should increase energy, got nom={nom}, corr={corr}"
+            );
+        }
+
+        // With t0 > 0: energies should increase (shorter effective TOF)
+        let e_corr_t0 = model.corrected_energies(1.0, 1.0);
+        for (i, (&nom, &corr)) in energies.iter().zip(e_corr_t0.iter()).enumerate() {
+            assert!(
+                corr > nom,
+                "bin {i}: t0=1.0 should increase energy, got nom={nom}, corr={corr}"
+            );
+        }
+    }
+
+    /// Verify interpolate_xs produces correct results.
+    #[test]
+    fn energy_scale_interpolate_xs() {
+        let nominal_e = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let xs = vec![10.0, 20.0, 30.0, 40.0, 50.0];
+
+        // Exact grid points
+        let result =
+            EnergyScaleTransmissionModel::interpolate_xs(&nominal_e, &xs, &[1.0, 3.0, 5.0]);
+        assert!((result[0] - 10.0).abs() < 1e-10);
+        assert!((result[1] - 30.0).abs() < 1e-10);
+        assert!((result[2] - 50.0).abs() < 1e-10);
+
+        // Midpoints
+        let result = EnergyScaleTransmissionModel::interpolate_xs(&nominal_e, &xs, &[1.5, 2.5]);
+        assert!((result[0] - 15.0).abs() < 1e-10);
+        assert!((result[1] - 25.0).abs() < 1e-10);
+
+        // Out of range: clamp
+        let result = EnergyScaleTransmissionModel::interpolate_xs(&nominal_e, &xs, &[0.5, 6.0]);
+        assert!((result[0] - 10.0).abs() < 1e-10); // below range
+        assert!((result[1] - 50.0).abs() < 1e-10); // above range
+    }
+
+    /// Verify evaluate returns identity at t0=0, l_scale=1.
+    #[test]
+    fn energy_scale_evaluate_identity() {
+        let xs = vec![vec![1.0, 2.0, 3.0, 2.0, 1.5]];
+        let energies = vec![4.0, 9.0, 16.0, 25.0, 36.0];
+        let model_es = EnergyScaleTransmissionModel::new(
+            std::sync::Arc::new(xs.clone()),
+            std::sync::Arc::new(vec![0]),
+            energies.clone(),
+            25.0,
+            1, // t0_index
+            2, // l_scale_index
+            None,
+        );
+
+        let model_pre = make_precomputed(xs, vec![0]);
+
+        let density = 0.1;
+        let params_es = [density, 0.0, 1.0]; // t0=0, l_scale=1
+        let params_pre = [density];
+
+        let y_es = model_es.evaluate(&params_es).unwrap();
+        let y_pre = model_pre.evaluate(&params_pre).unwrap();
+
+        for (i, (&a, &b)) in y_es.iter().zip(y_pre.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-10,
+                "bin {i}: energy_scale={a}, precomputed={b}"
+            );
+        }
+    }
+
+    /// Jacobian for energy-scale model: density columns must match FD.
+    #[test]
+    fn energy_scale_jacobian_density_matches_fd() {
+        let xs = vec![vec![1.0, 2.0, 3.0, 2.0, 1.5]];
+        let energies = vec![4.0, 9.0, 16.0, 25.0, 36.0];
+        let model = EnergyScaleTransmissionModel::new(
+            std::sync::Arc::new(xs),
+            std::sync::Arc::new(vec![0]),
+            energies.clone(),
+            25.0,
+            1,
+            2,
+            None,
+        );
+
+        let params = [0.1, 0.5, 1.002]; // density, t0, l_scale
+        let y = model.evaluate(&params).unwrap();
+        let free = vec![0, 1, 2];
+        let jac = model
+            .analytical_jacobian(&params, &free, &y)
+            .expect("Jacobian should be available");
+
+        let h = 1e-7;
+        for (col, &pidx) in free.iter().enumerate() {
+            let mut pp = params.to_vec();
+            let mut pm = params.to_vec();
+            pp[pidx] += h;
+            pm[pidx] -= h;
+            let yp = model.evaluate(&pp).unwrap();
+            let ym = model.evaluate(&pm).unwrap();
+            for row in 0..energies.len() {
+                let fd = (yp[row] - ym[row]) / (2.0 * h);
+                let anal = jac.get(row, col);
+                let abs_err = (anal - fd).abs();
+                let rel_err = abs_err / fd.abs().max(1e-15);
+                assert!(
+                    rel_err < 1e-3 || abs_err < 1e-8,
+                    "param {pidx} col {col} bin {row}: anal={anal:.6e} fd={fd:.6e} rel={rel_err:.2e}"
+                );
+            }
+        }
+    }
+
+    /// LM fit with energy-scale model recovers l_scale from shifted data.
+    ///
+    /// Uses a sharp Breit-Wigner-like resonance on a dense grid so the
+    /// energy shift is unambiguous.  Only l_scale is varied (t0 fixed
+    /// at 0) to avoid degenerate local minima.
+    #[test]
+    fn energy_scale_fit_recovers_l_scale() {
+        let n = 200;
+        let energies: Vec<f64> = (0..n).map(|i| 10.0 + (i as f64) * 0.5).collect();
+        // Breit-Wigner-like cross-section: σ = 100 / ((E-50)^2 + 1)
+        let xs: Vec<f64> = energies
+            .iter()
+            .map(|&e| 100.0 / ((e - 50.0).powi(2) + 1.0))
+            .collect();
+
+        let true_density = 0.001;
+        let true_ls = 1.003;
+
+        let model = EnergyScaleTransmissionModel::new(
+            std::sync::Arc::new(vec![xs]),
+            std::sync::Arc::new(vec![0]),
+            energies,
+            25.0,
+            1, // t0_index (fixed at 0)
+            2, // l_scale_index
+            None,
+        );
+        let true_params = [true_density, 0.0, true_ls];
+        let y_obs = model.evaluate(&true_params).unwrap();
+        let sigma = vec![0.001; y_obs.len()];
+
+        let mut params = ParameterSet::new(vec![
+            FitParameter::non_negative("density", 0.0005),
+            FitParameter::fixed("t0", 0.0),
+            FitParameter {
+                name: "l_scale".into(),
+                value: 1.0,
+                lower: 0.99,
+                upper: 1.01,
+                fixed: false,
+            },
+        ]);
+
+        let config = LmConfig {
+            max_iter: 200,
+            ..LmConfig::default()
+        };
+
+        let result = lm::levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &config).unwrap();
+
+        assert!(result.converged, "Fit should converge");
+        let f = &result.params;
+        assert!(
+            (f[0] - true_density).abs() / true_density < 0.05,
+            "density: fitted={}, true={true_density}",
+            f[0]
+        );
+        assert!(
+            (f[2] - true_ls).abs() < 0.001,
+            "l_scale: fitted={}, true={true_ls}",
+            f[2]
         );
     }
 }

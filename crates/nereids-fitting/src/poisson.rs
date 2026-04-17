@@ -1,18 +1,27 @@
-//! Poisson-likelihood optimizer for low-count neutron data.
+//! Poisson-likelihood optimizer for low-count neutron data (transmission
+//! path).
 //!
-//! When neutron counts are low (< ~30 per bin), the Gaussian/chi-squared
-//! assumption breaks down and Poisson statistics must be used directly.
+//! Minimizes the single-arm Poisson negative log-likelihood
 //!
-//! ## Negative log-likelihood
+//! ```text
+//! L(θ) = Σᵢ [y_model(θ)ᵢ − y_obs,ᵢ · ln(y_model(θ)ᵢ)]
+//! ```
 //!
-//! L(θ) = Σᵢ [y_model(θ)ᵢ - y_obs,ᵢ · ln(y_model(θ)ᵢ)]
+//! using a projected damped Gauss-Newton / Fisher optimizer with
+//! backtracking line search and finite-difference fallback.
 //!
-//! This is minimized using a projected optimizer:
-//! - damped Gauss-Newton / Fisher steps when an analytical Jacobian exists
-//! - finite-difference projected gradient fallback otherwise
-//!
-//! Both paths use backtracking line search and bound constraints
-//! (non-negativity on densities).
+//! **Scope note.**  In the current pipeline this solver is only reached
+//! for the **transmission + PoissonKL** path (via
+//! `crate::transmission_model::TransmissionKLBackgroundModel`).  The
+//! **counts** path uses the joint-Poisson conditional-binomial-deviance
+//! solver in [`crate::joint_poisson`] (memo 35 §P1/§P2), which replaces
+//! the older fixed-flux counts NLL that lived here before the P2.2 /
+//! counts-KL collapse.  The helpers [`CountsModel`] and
+//! [`CountsBackgroundScaleModel`] exposed from this module are retained
+//! for the Fisher-info research helper
+//! [`crate::lm`]-side `evaluate_jacobian_and_fisher` and the spatial-
+//! regularization prototype scripts (Epic #394); they are not part of
+//! the production fit path.
 //!
 //! ## TRINIDI Reference
 //! - `trinidi/reconstruct.py` — Poisson NLL and APGM optimizer
@@ -1124,15 +1133,24 @@ pub fn poisson_fit(
     })
 }
 
-/// Convert transmission model + counts to a counts-based forward model.
+/// Fixed-flux counts-domain forward model: `Y_model = flux × T_model(θ) + background`.
 ///
-/// Given:
-///   Y_model = flux × T_model(θ) + background
-///
-/// This wraps a transmission model to predict observed counts.
+/// **Retained for the research Fisher helper, not for production fitting.**
+/// The production counts-KL dispatch (`SolverConfig::PoissonKL` on
+/// `InputData::Counts` / `InputData::CountsWithNuisance`) goes through
+/// the joint-Poisson conditional-binomial-deviance path in
+/// [`crate::joint_poisson`] per memo 35 §P1/§P2.  `CountsModel` and
+/// [`CountsBackgroundScaleModel`] below are consumed only by
+/// `nereids_pipeline::pipeline::evaluate_jacobian_and_fisher` (the
+/// Fisher-info research helper used by the spatial-regularization
+/// epic #394) and by this module's `#[cfg(test)]` tests.  They assume
+/// the caller has pre-computed `flux = c · O` (i.e. `c` is baked into
+/// `flux` — the convention that memo 35 §P1 flagged as error-prone for
+/// end users, which is precisely why the production path no longer
+/// uses this struct).
 ///
 /// The `flux` and `background` slices must have the same length as the
-/// transmission vector returned by the inner model. In debug builds,
+/// transmission vector returned by the inner model.  In debug builds,
 /// `evaluate()` asserts this invariant.
 pub struct CountsModel<'a> {
     /// Underlying transmission model.
@@ -1219,7 +1237,14 @@ impl<'a> crate::forward_model::ForwardModel for CountsModel<'a> {
     }
 }
 
-/// Counts model with optional nuisance scaling of signal and detector background.
+/// Fixed-flux counts model with optional α₁ / α₂ nuisance scaling of
+/// signal and detector background.
+///
+/// **Retained for the research Fisher helper, not for production fitting.**
+/// See [`CountsModel`] for the scope note — the production counts-KL
+/// dispatch does not use this struct; it is reached only from
+/// `evaluate_jacobian_and_fisher` (Epic #394 spatial-regularization
+/// prototype) and from this module's `#[cfg(test)]` tests.
 ///
 /// Given a transmission model `T(θ)`, predicts:
 ///

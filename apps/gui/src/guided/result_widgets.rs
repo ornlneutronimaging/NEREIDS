@@ -36,7 +36,14 @@ pub fn summary_card(
                 result.n_converged, result.n_total, pct
             ));
 
-            // Mean chi2_r
+            // Mean GOF.  Label swaps to "D/dof" for the counts-KL
+            // dispatch (when deviance_per_dof_map is populated) —
+            // memo 35 §P1.2 naming.
+            let gof_label = if result.deviance_per_dof_map.is_some() {
+                "D/dof"
+            } else {
+                "chi2_r"
+            };
             let chi2_vals: Vec<f64> = result
                 .chi_squared_map
                 .iter()
@@ -50,11 +57,14 @@ pub fn summary_card(
                 ui.horizontal(|ui| {
                     if uncertainty_is_estimated {
                         ui.label(
-                            egui::RichText::new(format!("Mean chi2_r: {:.4} (approx.)", mean_chi2))
-                                .color(crate::theme::semantic::ORANGE),
+                            egui::RichText::new(format!(
+                                "Mean {}: {:.4} (approx.)",
+                                gof_label, mean_chi2
+                            ))
+                            .color(crate::theme::semantic::ORANGE),
                         );
                     } else {
-                        ui.label(format!("Mean chi2_r: {:.4}", mean_chi2));
+                        ui.label(format!("Mean {}: {:.4}", gof_label, mean_chi2));
                     }
                     let chi2_variant = if mean_chi2 < 2.0 {
                         BadgeVariant::Green
@@ -254,16 +264,26 @@ pub fn pixel_inspector(ui: &mut egui::Ui, state: &AppState) {
         &format!("Pixel Inspector ({}, {})", y, x),
         conv_badge,
         |ui| {
+            let pixel_label = if result.deviance_per_dof_map.is_some() {
+                "D/dof"
+            } else {
+                "chi2_r"
+            };
             if state.uncertainty_is_estimated {
                 ui.label(
                     egui::RichText::new(format!(
-                        "chi2_r = {:.4} (approx.)",
+                        "{} = {:.4} (approx.)",
+                        pixel_label,
                         result.chi_squared_map[[y, x]]
                     ))
                     .color(crate::theme::semantic::ORANGE),
                 );
             } else {
-                ui.label(format!("chi2_r = {:.4}", result.chi_squared_map[[y, x]]));
+                ui.label(format!(
+                    "{} = {:.4}",
+                    pixel_label,
+                    result.chi_squared_map[[y, x]]
+                ));
             }
 
             if let Some(ref t_map) = result.temperature_map {

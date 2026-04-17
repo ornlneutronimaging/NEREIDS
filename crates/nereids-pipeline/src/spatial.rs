@@ -23,8 +23,16 @@ pub struct SpatialResult {
     pub density_maps: Vec<Array2<f64>>,
     /// Uncertainty maps, one per isotope.
     pub uncertainty_maps: Vec<Array2<f64>>,
-    /// Reduced chi-squared map.
+    /// Reduced chi-squared map.  For the counts-KL dispatch (joint-Poisson
+    /// deviance per memo 35 §P1.2) this is back-compat-mirrored to
+    /// `D/(n−k)`; the semantically-correct per-pixel value is also
+    /// exposed as [`Self::deviance_per_dof_map`].
     pub chi_squared_map: Array2<f64>,
+    /// Per-pixel conditional binomial deviance `D/(n−k)` map.  `Some` when
+    /// the effective per-pixel solver is the counts-KL dispatch
+    /// (joint-Poisson); `None` for LM-only runs and transmission+PoissonKL
+    /// where Pearson χ²/dof is the GOF.
+    pub deviance_per_dof_map: Option<Array2<f64>>,
     /// Convergence map (true = converged).
     pub converged_map: Array2<bool>,
     /// Fitted temperature map (K). `Some` when `config.fit_temperature()` is true.
@@ -91,15 +99,48 @@ impl InputData3D<'_> {
         };
         (s[0], s[1], s[2])
     }
+
+    /// `true` when the input is a counts variant (Counts or CountsWithNuisance)
+    /// — i.e. the per-pixel dispatch goes through the counts-KL path
+    /// (joint-Poisson deviance) rather than transmission.
+    pub fn is_counts(&self) -> bool {
+        matches!(self, Self::Counts { .. } | Self::CountsWithNuisance { .. })
+    }
 }
 
 /// Spatial mapping using the typed input data API.
 ///
 /// Dispatches per-pixel fitting based on the `InputData3D` variant:
-/// - **Transmission**: per-pixel LM or KL on transmission values
-/// - **Counts**: per-pixel KL on raw counts (preserves Poisson statistics)
+/// - **Transmission**: per-pixel LM (or KL, opt-in) on transmission values.
+/// - **Counts**: per-pixel counts-KL dispatch (joint-Poisson conditional
+///   binomial deviance per memo 35 §P1) on the sample cube, paired
+///   against the **spatially-averaged open-beam flux**.  See the inline
+///   comment on `averaged_flux` for the rationale: this is a deliberate
+///   bias-variance trade that reduces per-pixel OB shot-noise at the
+///   cost of the exact per-pixel paired joint-Poisson observation model.
+///   Callers needing the exact paired form should supply per-pixel
+///   nuisance spectra via [`InputData3D::CountsWithNuisance`] instead.
+/// - **CountsWithNuisance**: per-pixel counts-KL dispatch with the
+///   caller-supplied per-pixel flux and background cubes.  No averaging.
 ///
 /// Always returns [`SpatialResult`].
+/// Apply the multi-pixel polish auto-disable rule (memo 38 §6).
+///
+/// For `n_pixels > 1`, return a config with `counts_enable_polish`
+/// forced to `Some(false)` UNLESS the caller already set an explicit
+/// override — in which case the caller's choice wins.  For `n_pixels
+/// <= 1` or when the caller overrode, the config is returned as-is.
+///
+/// Extracted as a pure helper so the decision logic is directly
+/// unit-testable without timing-based assertions in spatial tests.
+fn apply_spatial_polish_default(config: UnifiedFitConfig, n_pixels: usize) -> UnifiedFitConfig {
+    if n_pixels > 1 && config.counts_enable_polish().is_none() {
+        config.with_counts_enable_polish(Some(false))
+    } else {
+        config
+    }
+}
+
 pub fn spatial_map_typed(
     input: &InputData3D<'_>,
     config: &UnifiedFitConfig,
@@ -188,6 +229,18 @@ pub fn spatial_map_typed(
     let has_background_outputs =
         config.transmission_background().is_some() || config.counts_background().is_some();
 
+    // Whether the per-pixel dispatch routes through the counts-KL
+    // (joint-Poisson) solver.  True iff the input is counts AND the
+    // effective solver is either explicit `PoissonKL` or `Auto`
+    // (Auto resolves to PoissonKL on counts input).  When false (LM
+    // dispatch on counts, or any transmission input), per-pixel
+    // SpectrumFitResult.deviance_per_dof is `None`, so the spatial
+    // deviance_per_dof_map should also be `None` — otherwise GUI /
+    // Python consumers using `is_some()` to label GOF as "D/dof"
+    // would mislabel an all-NaN map.
+    let dispatches_to_counts_kl =
+        input.is_counts() && !matches!(config.solver(), SolverConfig::LevenbergMarquardt(_));
+
     if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
         return Err(PipelineError::Cancelled);
     }
@@ -200,6 +253,11 @@ pub fn spatial_map_typed(
                 .map(|_| Array2::from_elem((height, width), f64::NAN))
                 .collect(),
             chi_squared_map: Array2::from_elem((height, width), f64::NAN),
+            deviance_per_dof_map: if dispatches_to_counts_kl {
+                Some(Array2::from_elem((height, width), f64::NAN))
+            } else {
+                None
+            },
             converged_map: Array2::from_elem((height, width), false),
             temperature_map: if config.fit_temperature() {
                 Some(Array2::from_elem((height, width), f64::NAN))
@@ -347,10 +405,48 @@ pub fn spatial_map_typed(
             .with_compute_covariance(true)
     };
 
-    // For counts data: spatially average the open beam to get a stable flux
-    // estimate, reducing per-pixel open-beam shot noise.
-    // Without this, per-pixel open-beam shot noise contaminates the flux
-    // estimate and makes KL fits materially noisier.
+    // Auto-disable Nelder-Mead polish for multi-pixel counts-KL spatial
+    // maps (memo 38 §6 recommendation).  Polish is a single-spectrum
+    // research knob — on the VENUS Hf 120min aggregated fit it took
+    // ~1 000 s; at 512 × 512 pixels that is untenable even with rayon.
+    // Per-pixel fits also rarely hit the over-parameterized stall regime
+    // polish targets.  The caller can force polish back on via
+    // [`UnifiedFitConfig::with_counts_enable_polish(Some(true))`].
+    let fast_config = apply_spatial_polish_default(fast_config, pixel_coords.len());
+
+    // ── Modeling choice: spatially-averaged open-beam flux ──
+    //
+    // For `InputData3D::Counts`, every pixel's sample spectrum is paired
+    // with the **same** open-beam spectrum: the spatial average across
+    // all live pixels (`pixel_coords`).  This is INTENTIONAL, not a
+    // per-pixel paired observation.  The rationale:
+    //
+    // 1. The open-beam counts `O(E)` are a *reference flux* that is
+    //    approximately spatially uniform (the sample casts a shadow
+    //    on an otherwise flat beam profile).  Averaging reduces the
+    //    shot-noise contamination of the flux estimate by √n_pixels.
+    // 2. In the joint-Poisson profile-deviance form
+    //    (`λ̂_i = c·(O_i + S_i) / (1 + c·T_i)`), a noisy per-pixel
+    //    `O_i` propagates directly into `λ̂_i`, which in turn inflates
+    //    the deviance without improving density recovery.
+    //
+    // This is a bias-variance trade: we lose the exact per-pixel paired
+    // likelihood structure in exchange for a tighter density-fidelity
+    // variance across pixels.  Empirically (evidence/37-…json), this is
+    // the right call for the VENUS-style "flat beam with a masking
+    // sample" geometry.
+    //
+    // **If this isn't the right assumption for your data** — e.g. you
+    // have a genuinely spatially-varying beam profile and pre-estimated
+    // per-pixel flux + detector-background spectra — use
+    // [`InputData3D::CountsWithNuisance`] instead.  That variant
+    // bypasses the averaging and pairs each pixel's sample with the
+    // caller-supplied per-pixel flux and bg spectra.
+    //
+    // TODO(future): expose a config flag to switch the counts dispatch
+    // between "averaged OB" (current, stability-oriented) and "raw
+    // per-pixel OB" (exact paired joint-Poisson) if a use case arises
+    // where both options are needed at call sites.
     let averaged_flux: Option<Vec<f64>> = if matches!(input, InputData3D::Counts { .. }) {
         let n_e = data_b.shape()[2]; // data_b is transposed: (h, w, n_e)
         let mut flux = vec![0.0f64; n_e];
@@ -463,6 +559,11 @@ pub fn spatial_map_typed(
         .map(|_| Array2::from_elem((height, width), f64::NAN))
         .collect();
     let mut chi_squared_map = Array2::from_elem((height, width), f64::NAN);
+    let mut deviance_per_dof_map: Option<Array2<f64>> = if dispatches_to_counts_kl {
+        Some(Array2::from_elem((height, width), f64::NAN))
+    } else {
+        None
+    };
     let mut converged_map = Array2::from_elem((height, width), false);
     let mut anorm_map: Option<Array2<f64>> = if has_background_outputs {
         Some(Array2::from_elem((height, width), f64::NAN))
@@ -498,6 +599,9 @@ pub fn spatial_map_typed(
             }
         }
         chi_squared_map[[*y, *x]] = result.reduced_chi_squared;
+        if let (Some(dpd), Some(v)) = (&mut deviance_per_dof_map, result.deviance_per_dof) {
+            dpd[[*y, *x]] = v;
+        }
         converged_map[[*y, *x]] = result.converged;
         if let (Some(t_map), Some(t)) = (&mut temperature_map, result.temperature_k) {
             t_map[[*y, *x]] = t;
@@ -524,6 +628,7 @@ pub fn spatial_map_typed(
         density_maps,
         uncertainty_maps,
         chi_squared_map,
+        deviance_per_dof_map,
         converged_map,
         temperature_map,
         temperature_uncertainty_map,
@@ -731,81 +836,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_spatial_map_typed_counts_with_nuisance_surfaces_background_maps() {
-        let data = u238_single_resonance();
-        let true_density = 0.002;
-        let true_alpha1 = 0.92;
-        let true_alpha2 = 1.35;
-        let energies: Vec<f64> = (0..101).map(|i| 1.0 + (i as f64) * 0.1).collect();
-        let (t_3d, _) = synthetic_4x4_transmission(&data, true_density, &energies);
-        let n_e = energies.len();
-
-        let mut sample = Array3::zeros((n_e, 4, 4));
-        let mut flux = Array3::zeros((n_e, 4, 4));
-        let mut background = Array3::zeros((n_e, 4, 4));
-        for y in 0..4 {
-            for x in 0..4 {
-                for (i, &e) in energies.iter().enumerate() {
-                    let bg = 30.0 + 8.0 / e.sqrt();
-                    flux[[i, y, x]] = 120.0;
-                    background[[i, y, x]] = bg;
-                    sample[[i, y, x]] =
-                        true_alpha1 * flux[[i, y, x]] * t_3d[[i, y, x]] + true_alpha2 * bg;
-                }
-            }
-        }
-
-        let config = UnifiedFitConfig::new(
-            energies,
-            vec![data],
-            vec!["U-238".into()],
-            0.0,
-            None,
-            vec![0.001],
-        )
-        .unwrap()
-        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
-        .with_counts_background(crate::pipeline::CountsBackgroundConfig {
-            alpha_1_init: 1.0,
-            alpha_2_init: 1.0,
-            fit_alpha_1: true,
-            fit_alpha_2: true,
-        });
-
-        let input = InputData3D::CountsWithNuisance {
-            sample_counts: sample.view(),
-            flux: flux.view(),
-            background: background.view(),
-        };
-
-        let result = spatial_map_typed(&input, &config, None, None, None).unwrap();
-        assert_eq!(result.n_total, 16);
-        assert_eq!(result.n_converged, 16);
-        assert!(
-            result.anorm_map.is_some(),
-            "counts background runs should surface anorm_map"
-        );
-        assert!(
-            result.background_maps.is_some(),
-            "counts background runs should surface background_maps"
-        );
-        let mean_alpha1 = result
-            .anorm_map
-            .as_ref()
-            .unwrap()
-            .iter()
-            .copied()
-            .sum::<f64>()
-            / 16.0;
-        let mean_alpha2 = result.background_maps.as_ref().unwrap()[2]
-            .iter()
-            .copied()
-            .sum::<f64>()
-            / 16.0;
-        assert!((mean_alpha1 - true_alpha1).abs() < 5e-3);
-        assert!((mean_alpha2 - true_alpha2).abs() < 5e-3);
-    }
+    // Removed as part of the counts-KL collapse (Phase 0):
+    //   test_spatial_map_typed_counts_with_nuisance_surfaces_background_maps
+    // Tested fit_alpha_1 / fit_alpha_2 nuisance fitting on a 4×4 spatial
+    // grid, which is no longer supported on the counts-KL dispatch (the
+    // joint-Poisson profile λ̂ absorbs alpha_1 and alpha_2 / B_det is
+    // P3.2-deferred; memo 35 §P3).  The SAMMY-style A_n + B_A/B/C wiring
+    // on counts input is covered at pipeline scale by
+    // `test_joint_poisson_with_transmission_background` (pipeline.rs);
+    // a dedicated 3D-grid counterpart is not currently a test invariant
+    // (spatial_map_typed is a thin per-pixel dispatcher over
+    // fit_spectrum_typed, which is already covered).
 
     #[test]
     fn test_spatial_map_typed_dead_pixels() {
@@ -862,6 +903,7 @@ mod tests {
             alpha_2_init: 1.0,
             fit_alpha_1: false,
             fit_alpha_2: true,
+            c: 1.0,
         });
 
         let input = InputData3D::Counts {
@@ -1158,5 +1200,239 @@ mod tests {
                 "unconverged pixel uncertainty should be NaN, got {u}"
             );
         }
+    }
+
+    // ── Counts-KL spatial path (post-collapse) ────────────────────────
+
+    /// Spatial counts-KL dispatch routes through `fit_counts_joint_poisson`
+    /// and populates `deviance_per_dof_map`.  Polish auto-disable makes
+    /// the per-pixel fits fast enough to run in a unit test; the result
+    /// still recovers density on noise-free synthetic.
+    #[test]
+    fn test_spatial_map_typed_counts_kl_populates_deviance_per_dof_map() {
+        let data = u238_single_resonance();
+        let true_density = 0.0005;
+        let energies: Vec<f64> = (0..101).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let (t_3d, _) = synthetic_4x4_transmission(&data, true_density, &energies);
+        let n_e = energies.len();
+
+        // Synthesize counts: c=2.0, lam_ob=500.  E[O]=lam_ob, E[S]=c·lam_ob·T.
+        let c_val = 2.0_f64;
+        let lam_ob = 500.0_f64;
+        let mut sample = Array3::zeros((n_e, 4, 4));
+        let mut open_beam = Array3::from_elem((n_e, 4, 4), lam_ob);
+        for y in 0..4 {
+            for x in 0..4 {
+                for (i, _) in energies.iter().enumerate() {
+                    open_beam[[i, y, x]] = lam_ob;
+                    sample[[i, y, x]] = c_val * lam_ob * t_3d[[i, y, x]];
+                }
+            }
+        }
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
+        .with_counts_background(crate::pipeline::CountsBackgroundConfig {
+            c: c_val,
+            ..Default::default()
+        });
+
+        let input = InputData3D::Counts {
+            sample_counts: sample.view(),
+            open_beam_counts: open_beam.view(),
+        };
+        let r = spatial_map_typed(&input, &config, None, None, None).unwrap();
+        // Deviance map populated (counts-KL path).
+        let dpd = r
+            .deviance_per_dof_map
+            .as_ref()
+            .expect("counts-KL spatial should populate deviance_per_dof_map");
+        assert_eq!(dpd.shape(), &[4, 4]);
+        let sample_val = dpd[[0, 0]];
+        assert!(
+            sample_val.is_finite(),
+            "deviance_per_dof_map[0,0] = {sample_val} (should be finite)"
+        );
+        // Density recovery (noise-free).
+        let density_mean: f64 = r.density_maps[0].iter().copied().sum::<f64>() / 16.0;
+        assert!(
+            (density_mean - true_density).abs() / true_density < 0.05,
+            "mean density {density_mean} vs truth {true_density}",
+        );
+    }
+
+    /// Polish auto-disable: the `apply_spatial_polish_default` helper
+    /// sets `counts_enable_polish = Some(false)` for multi-pixel fits
+    /// when the caller has not overridden it.  This asserts the decision
+    /// directly (no timing-based heuristics — tested by checking the
+    /// resolved config).
+    #[test]
+    fn test_apply_spatial_polish_default_multi_pixel_auto_disables() {
+        // Minimal UnifiedFitConfig — the helper only reads
+        // `counts_enable_polish`, so the rest can be stub data.
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..10).map(|i| 1.0 + i as f64).collect();
+        let cfg = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap();
+
+        // Multi-pixel (n > 1), no caller override → auto-disabled.
+        assert_eq!(cfg.counts_enable_polish(), None);
+        let resolved = apply_spatial_polish_default(cfg.clone(), 16);
+        assert_eq!(
+            resolved.counts_enable_polish(),
+            Some(false),
+            "multi-pixel with no override should auto-disable polish"
+        );
+
+        // Single-pixel (n = 1) → no change (let single-spectrum default on).
+        let resolved = apply_spatial_polish_default(cfg.clone(), 1);
+        assert_eq!(
+            resolved.counts_enable_polish(),
+            None,
+            "single-pixel should preserve the caller's unset state"
+        );
+
+        // Caller explicitly turned polish on → multi-pixel must respect it.
+        let cfg_forced_on = cfg.clone().with_counts_enable_polish(Some(true));
+        let resolved = apply_spatial_polish_default(cfg_forced_on, 16);
+        assert_eq!(
+            resolved.counts_enable_polish(),
+            Some(true),
+            "caller override Some(true) must be preserved for multi-pixel"
+        );
+
+        // Caller explicitly turned polish off → still off.
+        let cfg_forced_off = cfg.with_counts_enable_polish(Some(false));
+        let resolved = apply_spatial_polish_default(cfg_forced_off, 16);
+        assert_eq!(resolved.counts_enable_polish(), Some(false));
+    }
+
+    /// End-to-end: counts-KL spatial map populates `deviance_per_dof_map`
+    /// and completes without hitting the polish maxiter cap.  No
+    /// wall-clock assertion — relies on the helper test above for the
+    /// auto-disable decision.
+    #[test]
+    fn test_spatial_map_typed_counts_kl_populates_map_without_polish_regression() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let (t_3d, _) = synthetic_4x4_transmission(&data, 0.0005, &energies);
+        let n_e = energies.len();
+
+        let mut sample = Array3::zeros((n_e, 4, 4));
+        let open_beam = Array3::from_elem((n_e, 4, 4), 500.0);
+        for y in 0..4 {
+            for x in 0..4 {
+                for i in 0..n_e {
+                    sample[[i, y, x]] = 500.0 * t_3d[[i, y, x]];
+                }
+            }
+        }
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()));
+
+        let input = InputData3D::Counts {
+            sample_counts: sample.view(),
+            open_beam_counts: open_beam.view(),
+        };
+        let r = spatial_map_typed(&input, &config, None, None, None).unwrap();
+        assert!(r.deviance_per_dof_map.is_some());
+        // All 16 live pixels should have a finite D/dof value.
+        let dpd = r.deviance_per_dof_map.as_ref().unwrap();
+        assert!(dpd.iter().all(|v| v.is_finite()));
+    }
+
+    /// `(Counts, LM)` spatial dispatch must NOT allocate a
+    /// `deviance_per_dof_map` — the per-pixel LM path doesn't populate
+    /// `deviance_per_dof`, so an `Some(all-NaN)` map would mislead GUI /
+    /// Python consumers that switch the GOF label on `is_some()`.
+    #[test]
+    fn test_spatial_map_typed_counts_lm_no_deviance_map() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let (t_3d, _) = synthetic_4x4_transmission(&data, 0.0005, &energies);
+        let n_e = energies.len();
+        let mut sample = Array3::zeros((n_e, 4, 4));
+        let open_beam = Array3::from_elem((n_e, 4, 4), 500.0);
+        for y in 0..4 {
+            for x in 0..4 {
+                for i in 0..n_e {
+                    sample[[i, y, x]] = 500.0 * t_3d[[i, y, x]];
+                }
+            }
+        }
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        // Force LM (counts → transmission conversion under the hood); no
+        // deviance is computed by that dispatch.
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()));
+
+        let input = InputData3D::Counts {
+            sample_counts: sample.view(),
+            open_beam_counts: open_beam.view(),
+        };
+        let r = spatial_map_typed(&input, &config, None, None, None).unwrap();
+        assert!(
+            r.deviance_per_dof_map.is_none(),
+            "(Counts, LM) must not allocate deviance_per_dof_map (would mislabel GOF in GUI)"
+        );
+        // chi_squared_map (Pearson) is the GOF on the LM path.
+        assert!(r.chi_squared_map.iter().any(|v| v.is_finite()));
+    }
+
+    /// Transmission input must never produce a `deviance_per_dof_map`
+    /// (regardless of solver — the counts-KL dispatch isn't reached).
+    #[test]
+    fn test_spatial_map_typed_transmission_no_deviance_map() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let (t_3d, u_3d) = synthetic_4x4_transmission(&data, 0.0005, &energies);
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap();
+        let input = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+        let r = spatial_map_typed(&input, &config, None, None, None).unwrap();
+        assert!(r.deviance_per_dof_map.is_none());
     }
 }

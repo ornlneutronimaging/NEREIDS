@@ -170,6 +170,15 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
     }
 
     if state.show_advanced_solver {
+        // Snapshot KL solver controls so we can detect a change after the
+        // panel runs and invalidate cached fit results.  egui's
+        // `selectable_value` mutates state in place with no change
+        // callback, so the previous-value-capture pattern (per MEMORY.md
+        // "GUI state management lesson") is the cleanest way.
+        let prev_kl_background_enabled = state.kl_background_enabled;
+        let prev_kl_c_ratio = state.kl_c_ratio;
+        let prev_kl_polish = state.kl_enable_polish_override;
+
         ui.indent("advanced_solver", |ui| {
             ui.checkbox(
                 &mut state.fit_temperature,
@@ -184,8 +193,50 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
             if matches!(state.solver_method, SolverMethod::PoissonKL) {
                 ui.checkbox(
                     &mut state.kl_background_enabled,
-                    "KL background (b\u{2080} + b\u{2081}/\u{221A}E)",
+                    "KL background (SAMMY: A\u{2099} + B_A + B_B/\u{221A}E + B_C\u{221A}E)",
                 );
+                ui.horizontal(|ui| {
+                    ui.label("c = Q_s / Q_ob:");
+                    ui.add(
+                        egui::DragValue::new(&mut state.kl_c_ratio)
+                            .speed(0.01)
+                            .range(1e-4..=100.0),
+                    )
+                    .on_hover_text(
+                        "Proton-charge ratio for the counts-KL solver \
+                         (memo 35 §P1.3).  Leave at 1.0 when the \
+                         caller has already PC-normalized the flux.",
+                    );
+                });
+                // Polish override (memo 38 §6).  For spatial maps the
+                // default (None = auto-disable when n_pixels > 1) is the
+                // right choice.  Exposing an explicit toggle is
+                // research-oriented; wire as a tri-state via ComboBox
+                // so the distinction between "auto" and "forced off" is
+                // visible.
+                ui.horizontal(|ui| {
+                    ui.label("Polish:");
+                    let selected = match state.kl_enable_polish_override {
+                        None => "Auto (on for single / off for spatial)",
+                        Some(true) => "On (forced)",
+                        Some(false) => "Off (forced)",
+                    };
+                    egui::ComboBox::from_id_salt("kl_polish_override")
+                        .selected_text(selected)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut state.kl_enable_polish_override, None, "Auto");
+                            ui.selectable_value(
+                                &mut state.kl_enable_polish_override,
+                                Some(true),
+                                "On (forced)",
+                            );
+                            ui.selectable_value(
+                                &mut state.kl_enable_polish_override,
+                                Some(false),
+                                "Off (forced)",
+                            );
+                        });
+                });
             }
             ui.checkbox(
                 &mut state.lm_config.compute_covariance,
@@ -210,6 +261,18 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
                 });
             }
         });
+
+        // If any KL-solver control changed, downstream fit results no
+        // longer reflect the active configuration — invalidate them so
+        // the Results panel doesn't show stale densities/D-per-dof.
+        // Compare bit-pattern for the f64 to avoid the +0.0 == -0.0
+        // edge case, then exact compare for the bool / Option<bool>.
+        let kl_changed = state.kl_background_enabled != prev_kl_background_enabled
+            || state.kl_c_ratio.to_bits() != prev_kl_c_ratio.to_bits()
+            || state.kl_enable_polish_override != prev_kl_polish;
+        if kl_changed {
+            clear_analyze_downstream(state);
+        }
     }
 
     ui.add_space(8.0);
@@ -724,16 +787,23 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 ("NOT converged", crate::theme::semantic::RED)
             };
             ui.label(egui::RichText::new(label).color(color).strong());
+            // Memo 35 §P1.2: when the joint-Poisson solver populated
+            // deviance_per_dof, label as D/dof; else keep chi2_r.
+            let gof_label = if result.deviance_per_dof.is_some() {
+                "D/dof"
+            } else {
+                "chi2_r"
+            };
             if state.uncertainty_is_estimated {
                 ui.label(
                     egui::RichText::new(format!(
-                        "chi2_r = {:.4} (approx.)",
-                        result.reduced_chi_squared
+                        "{} = {:.4} (approx.)",
+                        gof_label, result.reduced_chi_squared
                     ))
                     .color(crate::theme::semantic::ORANGE),
                 );
             } else {
-                ui.label(format!("chi2_r = {:.4}", result.reduced_chi_squared));
+                ui.label(format!("{} = {:.4}", gof_label, result.reduced_chi_squared));
             }
             ui.label(format!("iter = {}", result.iterations));
             if let Some(t) = result.temperature_k {
@@ -922,13 +992,30 @@ fn build_fit_config(state: &AppState) -> Result<UnifiedFitConfig, String> {
         config = config.with_fit_temperature(true);
     }
 
-    // Background: solver-aware. LM uses 4-param SAMMY, KL uses 2-param b₀+b₁.
+    // Background: solver-aware.  Both LM and counts-KL use the SAMMY
+    // 4-term wrapper (Anorm + BackA + BackB/√E + BackC·√E).  Post P2.2,
+    // the KL path routes through joint-Poisson with this wrapper too.
     let bg_enabled = match state.solver_method {
         SolverMethod::LevenbergMarquardt => state.lm_background_enabled,
         SolverMethod::PoissonKL => state.kl_background_enabled,
     };
     if bg_enabled {
         config = config.with_transmission_background(BackgroundConfig::default());
+    }
+
+    // Counts-KL options: proton-charge ratio + polish override.  Both
+    // are no-ops for the LM dispatch.
+    if matches!(state.solver_method, SolverMethod::PoissonKL) {
+        if (state.kl_c_ratio - 1.0).abs() > 1e-12 {
+            config =
+                config.with_counts_background(nereids_pipeline::pipeline::CountsBackgroundConfig {
+                    c: state.kl_c_ratio,
+                    ..Default::default()
+                });
+        }
+        if state.kl_enable_polish_override.is_some() {
+            config = config.with_counts_enable_polish(state.kl_enable_polish_override);
+        }
     }
 
     Ok(config)
