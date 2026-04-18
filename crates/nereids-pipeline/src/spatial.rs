@@ -16,26 +16,43 @@ use crate::error::PipelineError;
 use crate::pipeline::SpectrumFitResult;
 
 /// Result of spatial mapping over a 2D image.
+///
+/// **NaN-on-failure contract (issue #458 B1/B2):**
+/// every per-pixel parameter map
+/// (`density_maps`, `uncertainty_maps`, `chi_squared_map`,
+/// `deviance_per_dof_map`, `temperature_map`,
+/// `temperature_uncertainty_map`, `anorm_map`, `background_maps`,
+/// `t0_us_map`, `l_scale_map`) contains `NaN` at every pixel where
+/// `converged_map` is `false`.  The only map written unconditionally
+/// is `converged_map` itself — it is how callers discover that a
+/// pixel failed.  Callers rendering numeric values should gate on
+/// `converged_map` (or check `value.is_finite()`) to avoid displaying
+/// the placeholder `NaN`.
 #[derive(Debug)]
 pub struct SpatialResult {
     /// Fitted areal density maps, one per isotope.
     /// Each Array2 has shape (height, width).
+    /// NaN at pixels where `converged_map` is `false`.
     pub density_maps: Vec<Array2<f64>>,
     /// Uncertainty maps, one per isotope.
+    /// NaN at pixels where `converged_map` is `false`.
     pub uncertainty_maps: Vec<Array2<f64>>,
     /// Reduced chi-squared map.  For the counts-KL dispatch (joint-Poisson
     /// deviance per memo 35 §P1.2) this is back-compat-mirrored to
     /// `D/(n−k)`; the semantically-correct per-pixel value is also
     /// exposed as [`Self::deviance_per_dof_map`].
+    /// NaN at pixels where `converged_map` is `false`.
     pub chi_squared_map: Array2<f64>,
     /// Per-pixel conditional binomial deviance `D/(n−k)` map.  `Some` when
     /// the effective per-pixel solver is the counts-KL dispatch
     /// (joint-Poisson); `None` for LM-only runs and transmission+PoissonKL
     /// where Pearson χ²/dof is the GOF.
+    /// NaN at pixels where `converged_map` is `false`.
     pub deviance_per_dof_map: Option<Array2<f64>>,
     /// Convergence map (true = converged).
     pub converged_map: Array2<bool>,
     /// Fitted temperature map (K). `Some` when `config.fit_temperature()` is true.
+    /// NaN at pixels where `converged_map` is `false`.
     pub temperature_map: Option<Array2<f64>>,
     /// Per-pixel temperature uncertainty map (K, 1-sigma).
     /// `Some` when `config.fit_temperature()` is true.
@@ -46,11 +63,21 @@ pub struct SpatialResult {
     /// user modifies the isotope list after fitting.
     pub isotope_labels: Vec<String>,
     /// Per-pixel normalization / signal-scale map (when background fitting is enabled).
+    /// NaN at pixels where `converged_map` is `false`.
     pub anorm_map: Option<Array2<f64>>,
     /// Per-pixel background parameter maps.
     /// Transmission LM uses `[BackA, BackB, BackC]`.
     /// Counts KL background uses `[b0, b1, alpha_2]`.
+    /// NaN at pixels where `converged_map` is `false`.
     pub background_maps: Option<[Array2<f64>; 3]>,
+    /// Per-pixel fitted SAMMY TZERO offset (µs) map.
+    /// `Some` when `config.fit_energy_scale` is true; `None` otherwise.
+    /// NaN at pixels where `converged_map` is `false`.
+    pub t0_us_map: Option<Array2<f64>>,
+    /// Per-pixel fitted SAMMY TZERO flight-path scale factor.
+    /// `Some` when `config.fit_energy_scale` is true; `None` otherwise.
+    /// NaN at pixels where `converged_map` is `false`.
+    pub l_scale_map: Option<Array2<f64>>,
     /// Number of pixels that converged.
     pub n_converged: usize,
     /// Total number of pixels fitted.
@@ -214,6 +241,53 @@ pub fn spatial_map_typed(
         )));
     }
 
+    // Reject known-broken configurations at entry.
+    //
+    // Issue #458 B3: per-pixel LM with `fit_energy_scale=True` on
+    // counts data is numerically ill-conditioned.  On real VENUS Hf
+    // 120 min, only ~8 % of pixels converged; `t0` drifts to the
+    // ±10 µs bounds while `density` absorbs the compensating shift
+    // (4-order-of-magnitude errors).  Reject upfront with a pointer
+    // to the global-calibration workaround.
+    //
+    // Note: the LM-on-transmission path with `fit_energy_scale=True`
+    // has the same structural issue, but is left unblocked here —
+    // per-pixel transmission has higher SNR per bin (pre-normalised
+    // by open-beam) and this combination is sometimes useful for
+    // calibration crosschecks.  The config still produces NaN maps
+    // for failed pixels thanks to B1 gating.
+    if input.is_counts()
+        && matches!(config.solver(), SolverConfig::LevenbergMarquardt(_))
+        && config.fit_energy_scale()
+    {
+        return Err(PipelineError::InvalidParameter(
+            "spatial_map_typed: solver='lm' + fit_energy_scale=true on counts input is \
+             numerically unstable per-pixel (issue #458 B3). Recommended workaround: fit \
+             TZERO once on the aggregated spectrum via fit_counts_spectrum_typed, then \
+             build the corrected energy grid and pass it to spatial_map_typed with \
+             fit_energy_scale=false. For counts data, solver='kl' (or 'auto') is robust \
+             with per-pixel TZERO fitting."
+                .into(),
+        ));
+    }
+
+    // Issue #458 (Codex review): `fit_energy_scale` + `fit_temperature`
+    // is not a supported combination — `EnergyScaleTransmissionModel`
+    // and the temperature-fitting path are mutually exclusive at the
+    // single-spectrum fitter (`pipeline.rs:830, 976, 1183`).  Without
+    // this spatial-layer guard, every per-pixel call would error and
+    // `spatial_map_typed` would report `n_failed == n_total` with an
+    // all-NaN map — a silently-failed map is worse than a clear error.
+    if config.fit_energy_scale() && config.fit_temperature() {
+        return Err(PipelineError::InvalidParameter(
+            "spatial_map_typed: fit_energy_scale=true and fit_temperature=true cannot \
+             both be set — EnergyScaleTransmissionModel does not support temperature \
+             fitting. Choose one: either calibrate TZERO with a fixed temperature, or \
+             fit temperature on the nominal energy grid."
+                .into(),
+        ));
+    }
+
     // Collect live pixel coordinates
     let mut pixel_coords: Vec<(usize, usize)> = Vec::new();
     for y in 0..height {
@@ -245,9 +319,15 @@ pub fn spatial_map_typed(
         return Err(PipelineError::Cancelled);
     }
     if pixel_coords.is_empty() {
+        // All pixels filtered out (typically by `dead_pixels` mask).  Per
+        // the NaN-on-failure contract (issue #458 B1 + Copilot review),
+        // every parameter map must be NaN at every pixel — including
+        // density, which was previously initialised with zeros here.
+        // `converged_map` is all `false`, which is the caller's signal
+        // that no fits ran.
         return Ok(SpatialResult {
             density_maps: (0..n_maps)
-                .map(|_| Array2::zeros((height, width)))
+                .map(|_| Array2::from_elem((height, width), f64::NAN))
                 .collect(),
             uncertainty_maps: (0..n_maps)
                 .map(|_| Array2::from_elem((height, width), f64::NAN))
@@ -281,6 +361,16 @@ pub fn spatial_map_typed(
                     Array2::from_elem((height, width), f64::NAN),
                     Array2::from_elem((height, width), f64::NAN),
                 ])
+            } else {
+                None
+            },
+            t0_us_map: if config.fit_energy_scale() {
+                Some(Array2::from_elem((height, width), f64::NAN))
+            } else {
+                None
+            },
+            l_scale_map: if config.fit_energy_scale() {
+                Some(Array2::from_elem((height, width), f64::NAN))
             } else {
                 None
             },
@@ -579,6 +669,16 @@ pub fn spatial_map_typed(
     } else {
         None
     };
+    let mut t0_us_map: Option<Array2<f64>> = if config.fit_energy_scale() {
+        Some(Array2::from_elem((height, width), f64::NAN))
+    } else {
+        None
+    };
+    let mut l_scale_map: Option<Array2<f64>> = if config.fit_energy_scale() {
+        Some(Array2::from_elem((height, width), f64::NAN))
+    } else {
+        None
+    };
     let mut n_converged = 0;
     let mut temperature_map: Option<Array2<f64>> = if config.fit_temperature() {
         Some(Array2::from_elem((height, width), f64::NAN))
@@ -591,7 +691,39 @@ pub fn spatial_map_typed(
         None
     };
 
+    // Aggregate per-pixel fit results into 2-D maps.
+    //
+    // **Only the `converged_map` entry is written unconditionally.**
+    // All other per-pixel parameter writes are gated on
+    // `result.converged`, so un-converged pixels keep their initial
+    // `NaN` value from the allocation above.
+    //
+    // Rationale (issue #458 B1/B2): the LM solver's
+    // `LAMBDA_BREAKOUT` and stagnation paths restore `params` to the
+    // last-accepted trial step and return `converged = false`.  That
+    // "last accepted" state can be arbitrarily far from optimal if
+    // LM walked astray before getting stuck — e.g., on real VENUS
+    // per-pixel counts with TZERO enabled, LM pins `t0` at the
+    // ±10 µs bound and lets `density` absorb the drift, producing
+    // densities 4 orders of magnitude off.  Writing those garbage
+    // values into the density/t0/L/background maps masked an 8 %
+    // convergence rate as "map of mostly-sensible numbers with a
+    // few outliers" rather than "map of NaN holes with a few fits".
+    //
+    // NaN-on-failure is also the convention asserted by
+    // `test_spatial_map_failed_pixels_remain_nan`; this block makes
+    // it hold for *every* non-converged pixel, not only the hard
+    // failure path.
     for ((y, x), result) in &results {
+        // Always record the convergence flag — this is how callers
+        // discover that a pixel failed.
+        converged_map[[*y, *x]] = result.converged;
+        if !result.converged {
+            continue;
+        }
+
+        n_converged += 1;
+
         for i in 0..n_maps {
             density_maps[i][[*y, *x]] = result.densities[i];
             if let Some(ref unc) = result.uncertainties {
@@ -602,7 +734,6 @@ pub fn spatial_map_typed(
         if let (Some(dpd), Some(v)) = (&mut deviance_per_dof_map, result.deviance_per_dof) {
             dpd[[*y, *x]] = v;
         }
-        converged_map[[*y, *x]] = result.converged;
         if let (Some(t_map), Some(t)) = (&mut temperature_map, result.temperature_k) {
             t_map[[*y, *x]] = t;
         }
@@ -619,8 +750,11 @@ pub fn spatial_map_typed(
             bg_maps[1][[*y, *x]] = result.background[1];
             bg_maps[2][[*y, *x]] = result.background[2];
         }
-        if result.converged {
-            n_converged += 1;
+        if let (Some(map), Some(v)) = (&mut t0_us_map, result.t0_us) {
+            map[[*y, *x]] = v;
+        }
+        if let (Some(map), Some(v)) = (&mut l_scale_map, result.l_scale) {
+            map[[*y, *x]] = v;
         }
     }
 
@@ -635,6 +769,8 @@ pub fn spatial_map_typed(
         isotope_labels,
         anorm_map,
         background_maps,
+        t0_us_map,
+        l_scale_map,
         n_converged,
         n_total: pixel_coords.len(),
         n_failed: failed_count.load(Ordering::Relaxed),
@@ -1165,17 +1301,25 @@ mod tests {
         );
     }
 
-    /// Unconverged pixels remain NaN, not zero-filled.
+    /// Unconverged pixels remain NaN across **every** output map
+    /// (density, uncertainty, chi², t0, l_scale, temperature, anorm,
+    /// background) — not just uncertainty.  Issue #458 B1/B2:
+    /// previously, failed LM fits that restored to their last-accepted
+    /// trial step wrote those drifted parameter values into the maps
+    /// with `converged=false`, producing a "4096 pixels with sensible
+    /// densities, 92 % of which are converged=false" result that
+    /// masked catastrophic fit failure.
     #[test]
     fn test_spatial_unconverged_pixels_are_nan() {
         let rd = u238_single_resonance();
         let energies: Vec<f64> = (0..101).map(|i| 1.0 + (i as f64) * 0.1).collect();
-        // Create data where pixel (0,0) is dead (all zeros)
-        let (mut t_3d, mut u_3d) = synthetic_4x4_transmission(&rd, 0.001, &energies);
-        for e in 0..energies.len() {
-            t_3d[[e, 0, 0]] = 0.0;
-            u_3d[[e, 0, 0]] = f64::INFINITY;
-        }
+        // Pick a deliberately wrong initial density (100× true) and cap
+        // LM at one iteration so the fit MUST return with
+        // `converged=false` and `params = last_walked_step` ≠ initial.
+        // This mimics the real-world pattern the bug produced: a fit
+        // that walked partway toward the optimum, then ran out of
+        // iterations.
+        let (t_3d, u_3d) = synthetic_4x4_transmission(&rd, 0.001, &energies);
         let data = InputData3D::Transmission {
             transmission: t_3d.view(),
             uncertainty: u_3d.view(),
@@ -1186,19 +1330,68 @@ mod tests {
             vec!["U-238".into()],
             0.0,
             None,
-            vec![0.0005],
+            vec![0.1], // 100× true — LM can't reach optimum in 1 iter.
         )
         .unwrap()
-        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()));
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig {
+            max_iter: 1,
+            ..Default::default()
+        }))
+        .with_transmission_background(crate::pipeline::BackgroundConfig::default());
 
         let result = spatial_map_typed(&data, &config, None, None, None).unwrap();
-        // Pixel (0,0) should not converge and uncertainty should remain NaN.
-        if !result.converged_map[[0, 0]] {
-            let u = result.uncertainty_maps[0][[0, 0]];
+
+        // At least one pixel must fail to converge under this setup —
+        // the point of the test is to verify NaN-on-failure for the
+        // aggregation path, so we locate an unconverged pixel and
+        // check every map at that pixel.
+        let unconverged_pixel = (0..4)
+            .flat_map(|y| (0..4).map(move |x| (y, x)))
+            .find(|(y, x)| !result.converged_map[[*y, *x]]);
+        let (uy, ux) = match unconverged_pixel {
+            Some(p) => p,
+            None => panic!(
+                "every pixel converged in max_iter=1 + 100×-off initial density setup — \
+                 test is no longer exercising the un-converged aggregation path; \
+                 tighten the setup (larger offset or fewer iterations)"
+            ),
+        };
+
+        // Every output map must be NaN at that pixel.
+        for (i, m) in result.density_maps.iter().enumerate() {
+            let v = m[[uy, ux]];
             assert!(
-                u.is_nan(),
-                "unconverged pixel uncertainty should be NaN, got {u}"
+                v.is_nan(),
+                "density_maps[{i}] at unconverged pixel ({uy},{ux}) must be NaN, got {v}"
             );
+        }
+        for (i, m) in result.uncertainty_maps.iter().enumerate() {
+            let v = m[[uy, ux]];
+            assert!(
+                v.is_nan(),
+                "uncertainty_maps[{i}] at unconverged pixel ({uy},{ux}) must be NaN, got {v}"
+            );
+        }
+        let chi2 = result.chi_squared_map[[uy, ux]];
+        assert!(
+            chi2.is_nan(),
+            "chi_squared_map at unconverged pixel ({uy},{ux}) must be NaN, got {chi2}"
+        );
+        if let Some(ref a_map) = result.anorm_map {
+            let v = a_map[[uy, ux]];
+            assert!(
+                v.is_nan(),
+                "anorm_map at unconverged pixel ({uy},{ux}) must be NaN, got {v}"
+            );
+        }
+        if let Some(ref bg) = result.background_maps {
+            for (i, m) in bg.iter().enumerate() {
+                let v = m[[uy, ux]];
+                assert!(
+                    v.is_nan(),
+                    "background_maps[{i}] at unconverged pixel ({uy},{ux}) must be NaN, got {v}"
+                );
+            }
         }
     }
 
@@ -1434,5 +1627,230 @@ mod tests {
         };
         let r = spatial_map_typed(&input, &config, None, None, None).unwrap();
         assert!(r.deviance_per_dof_map.is_none());
+    }
+
+    /// `fit_energy_scale=True` on the spatial path routes per-pixel TZERO
+    /// calibration through the same config used by single-spectrum fits,
+    /// populates `t0_us_map` and `l_scale_map`, and leaves them `None`
+    /// when the flag is off.  Regression against the prior gap where
+    /// the Python binding accepted `fit_energy_scale` for single
+    /// spectra but not for spatial, forcing callers to pre-calibrate.
+    #[test]
+    fn test_spatial_map_typed_fit_energy_scale_populates_maps() {
+        let rd = u238_single_resonance();
+        let energies: Vec<f64> = (0..101).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let (t_3d, u_3d) = synthetic_4x4_transmission(&rd, 0.001, &energies);
+        let data = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![rd],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.0005],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
+        .with_energy_scale(0.0, 1.0, 25.0);
+
+        let result = spatial_map_typed(&data, &config, None, None, None).unwrap();
+        let t0_map = result
+            .t0_us_map
+            .as_ref()
+            .expect("t0_us_map must be Some when fit_energy_scale=true");
+        let l_map = result
+            .l_scale_map
+            .as_ref()
+            .expect("l_scale_map must be Some when fit_energy_scale=true");
+        assert_eq!(t0_map.shape(), [4, 4]);
+        assert_eq!(l_map.shape(), [4, 4]);
+        // Post-#458 B1 semantics:
+        //   * Converged pixel  → finite t0 / L_scale in the maps
+        //   * Un-converged pixel → NaN in the maps (the LM last-walked
+        //     value is NOT leaked)
+        // Parameter-value correctness (t0 ≈ 0, L ≈ 1 on noise-free
+        // nominal-grid data) is tested at the fitting layer, not here;
+        // this test only exercises wiring + aggregation gating.
+        for y in 0..4 {
+            for x in 0..4 {
+                let converged = result.converged_map[[y, x]];
+                let t0 = t0_map[[y, x]];
+                let ls = l_map[[y, x]];
+                if converged {
+                    assert!(
+                        t0.is_finite() && ls.is_finite(),
+                        "converged pixel ({y},{x}) must have finite t0/L, got t0={t0}, L={ls}"
+                    );
+                } else {
+                    assert!(
+                        t0.is_nan() && ls.is_nan(),
+                        "un-converged pixel ({y},{x}) must have NaN t0/L (B1 gating), got t0={t0}, L={ls}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Without `fit_energy_scale`, the TZERO maps are `None` — gate check.
+    #[test]
+    fn test_spatial_map_typed_no_energy_scale_no_maps() {
+        let rd = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        let (t_3d, u_3d) = synthetic_4x4_transmission(&rd, 0.001, &energies);
+        let data = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![rd],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.0005],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()));
+
+        let result = spatial_map_typed(&data, &config, None, None, None).unwrap();
+        assert!(result.t0_us_map.is_none());
+        assert!(result.l_scale_map.is_none());
+    }
+
+    /// `(Counts + LM + fit_energy_scale=true)` must be rejected at
+    /// `spatial_map_typed` entry (issue #458 B3).  The combination
+    /// passed silently before and produced 92 % non-convergence with
+    /// garbage parameter values on real VENUS data.
+    #[test]
+    fn test_spatial_map_typed_rejects_counts_lm_with_energy_scale() {
+        let rd = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        let (sample, ob) = synthetic_4x4_counts(&rd, 0.001, &energies, 1000.0);
+        let data = InputData3D::Counts {
+            sample_counts: sample.view(),
+            open_beam_counts: ob.view(),
+        };
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![rd],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.0005],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
+        .with_energy_scale(0.0, 1.0, 25.0);
+
+        let err = spatial_map_typed(&data, &config, None, None, None)
+            .expect_err("LM + counts + fit_energy_scale must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("fit_energy_scale") && msg.contains("lm"),
+            "error message should name both culprits, got: {msg}"
+        );
+        assert!(
+            msg.contains("#458"),
+            "error message should reference the tracking issue, got: {msg}"
+        );
+    }
+
+    /// `(Counts + KL + fit_energy_scale=true)` is allowed — KL is
+    /// robust per-pixel even with energy-scale on real data.
+    #[test]
+    fn test_spatial_map_typed_allows_counts_kl_with_energy_scale() {
+        let rd = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        let (sample, ob) = synthetic_4x4_counts(&rd, 0.001, &energies, 1000.0);
+        let data = InputData3D::Counts {
+            sample_counts: sample.view(),
+            open_beam_counts: ob.view(),
+        };
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![rd],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.0005],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
+        .with_energy_scale(0.0, 1.0, 25.0);
+
+        let result = spatial_map_typed(&data, &config, None, None, None)
+            .expect("KL + counts + fit_energy_scale must be allowed");
+        assert!(result.t0_us_map.is_some());
+    }
+
+    /// `fit_energy_scale + fit_temperature` must be rejected at
+    /// spatial entry (Codex review follow-up to #458).  The
+    /// single-spectrum fitter errors on this combination, but without
+    /// a spatial-layer guard every pixel would error and
+    /// `spatial_map_typed` would silently return `n_failed == n_total`
+    /// with an all-NaN map instead of a clear error.
+    #[test]
+    fn test_spatial_map_typed_rejects_energy_scale_with_temperature() {
+        let rd = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        let (t_3d, u_3d) = synthetic_4x4_transmission(&rd, 0.001, &energies);
+        let data = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![rd],
+            vec!["U-238".into()],
+            300.0,
+            None,
+            vec![0.0005],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
+        .with_fit_temperature(true)
+        .with_energy_scale(0.0, 1.0, 25.0);
+
+        let err = spatial_map_typed(&data, &config, None, None, None)
+            .expect_err("fit_energy_scale + fit_temperature must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("fit_energy_scale") && msg.contains("fit_temperature"),
+            "error message should name both culprits, got: {msg}"
+        );
+    }
+
+    /// `(Transmission + LM + fit_energy_scale=true)` is allowed —
+    /// per-pixel transmission has higher SNR per bin than raw counts
+    /// and this combination is sometimes useful for calibration
+    /// crosschecks.  NaN-on-failure gating (B1) still protects
+    /// downstream consumers.
+    #[test]
+    fn test_spatial_map_typed_allows_transmission_lm_with_energy_scale() {
+        let rd = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        let (t_3d, u_3d) = synthetic_4x4_transmission(&rd, 0.001, &energies);
+        let data = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![rd],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.0005],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
+        .with_energy_scale(0.0, 1.0, 25.0);
+
+        let result = spatial_map_typed(&data, &config, None, None, None)
+            .expect("LM + transmission + fit_energy_scale must be allowed");
+        assert!(result.t0_us_map.is_some());
     }
 }

@@ -621,6 +621,10 @@ struct PySpatialResult {
     anorm_map: Option<Py<PyArray2<f64>>>,
     /// Per-pixel background parameter maps (None when background=False).
     background_maps: Option<[Py<PyArray2<f64>>; 3]>,
+    /// Per-pixel fitted TZERO t0 (µs) map (None when fit_energy_scale=False).
+    t0_us_map: Option<Py<PyArray2<f64>>>,
+    /// Per-pixel fitted TZERO L_scale map (None when fit_energy_scale=False).
+    l_scale_map: Option<Py<PyArray2<f64>>>,
 }
 
 #[pymethods]
@@ -724,6 +728,20 @@ impl PySpatialResult {
         self.background_maps
             .as_ref()
             .map(|maps| maps.iter().map(|m| m.bind(py).clone()).collect())
+    }
+
+    /// Per-pixel SAMMY TZERO offset t0 (µs) map.
+    /// `None` when the run did not fit energy scale.
+    #[getter]
+    fn t0_us_map<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray2<f64>>> {
+        self.t0_us_map.as_ref().map(|m| m.bind(py).clone())
+    }
+
+    /// Per-pixel SAMMY TZERO flight-path scale factor map.
+    /// `None` when the run did not fit energy scale.
+    #[getter]
+    fn l_scale_map<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray2<f64>>> {
+        self.l_scale_map.as_ref().map(|m| m.bind(py).clone())
     }
 
     fn __repr__(&self) -> String {
@@ -2635,6 +2653,41 @@ fn parse_solver_config(
     }
 }
 
+/// Validate the SAMMY TZERO kwargs before they reach
+/// `UnifiedFitConfig::with_energy_scale`.  Shared across
+/// `py_spatial_map_typed`, `py_fit_spectrum_typed`, and
+/// `py_fit_counts_spectrum_typed`.
+///
+/// Issue #458 (Copilot review on PR #461): without these checks, NaN /
+/// Inf / non-positive values flowed into
+/// `EnergyScaleTransmissionModel::corrected_energies`, which divides
+/// by TOF values derived from `flight_path_m`.  Garbage inputs yielded
+/// NaN grids and confusing `PyRuntimeError`s from the solver rather
+/// than an actionable `PyValueError` at the binding boundary.
+fn validate_energy_scale_params(
+    t0_init_us: f64,
+    l_scale_init: f64,
+    energy_scale_flight_path_m: f64,
+) -> PyResult<()> {
+    if !t0_init_us.is_finite() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "t0_init_us must be finite when fit_energy_scale=True, got {t0_init_us}"
+        )));
+    }
+    if !l_scale_init.is_finite() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "l_scale_init must be finite when fit_energy_scale=True, got {l_scale_init}"
+        )));
+    }
+    if !energy_scale_flight_path_m.is_finite() || energy_scale_flight_path_m <= 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "energy_scale_flight_path_m must be finite and positive when \
+             fit_energy_scale=True, got {energy_scale_flight_path_m}"
+        )));
+    }
+    Ok(())
+}
+
 /// Build `UnifiedFitConfig` from groups, returning the config and the number of
 /// density parameters (one per group) for initial_densities default.
 fn build_config_from_groups(
@@ -2742,6 +2795,14 @@ fn spatial_result_to_py(
         .deviance_per_dof_map
         .as_ref()
         .map(|m| PyArray2::from_array(py, m).into());
+    let t0_us_map = result
+        .t0_us_map
+        .as_ref()
+        .map(|m| PyArray2::from_array(py, m).into());
+    let l_scale_map = result
+        .l_scale_map
+        .as_ref()
+        .map(|m| PyArray2::from_array(py, m).into());
 
     PySpatialResult {
         density_maps,
@@ -2758,6 +2819,8 @@ fn spatial_result_to_py(
         temperature_uncertainty_map,
         anorm_map,
         background_maps,
+        t0_us_map,
+        l_scale_map,
     }
 }
 
@@ -2793,6 +2856,12 @@ fn spatial_result_to_py(
 ///         `from_counts_with_nuisance()`.
 ///     alpha_1_init: Initial value for `alpha_1` (default 1.0).
 ///     alpha_2_init: Initial value for `alpha_2` (default 1.0).
+///     fit_energy_scale: Fit per-pixel SAMMY TZERO calibration (t0, L_scale).
+///         Required for real VENUS counts data to match SAMMY chi2 performance.
+///     t0_init_us: Initial TOF offset in microseconds (default 0.0).
+///     l_scale_init: Initial flight-path scale factor (default 1.0).
+///     energy_scale_flight_path_m: Nominal flight path (m) for the
+///         energy-scale model. Must match the grid used to compute `energies`.
 ///     resolution: Optional resolution function.
 ///     groups: list of IsotopeGroup objects (mutually exclusive with isotopes).
 ///
@@ -2814,6 +2883,10 @@ fn spatial_result_to_py(
     alpha_2_init = 1.0,
     c = 1.0,
     enable_polish = None,
+    fit_energy_scale = false,
+    t0_init_us = 0.0,
+    l_scale_init = 1.0,
+    energy_scale_flight_path_m = 25.0,
     resolution = None,
     flight_path_m = None,
     delta_t_us = None,
@@ -2839,6 +2912,10 @@ fn py_spatial_map_typed<'py>(
     alpha_2_init: f64,
     c: f64,
     enable_polish: Option<bool>,
+    fit_energy_scale: bool,
+    t0_init_us: f64,
+    l_scale_init: f64,
+    energy_scale_flight_path_m: f64,
     resolution: Option<PyTabulatedResolution>,
     flight_path_m: Option<f64>,
     delta_t_us: Option<f64>,
@@ -2857,6 +2934,56 @@ fn py_spatial_map_typed<'py>(
         return Err(pyo3::exceptions::PyValueError::new_err(
             "Must provide either 'isotopes' or 'groups'.",
         ));
+    }
+
+    // ── Issue #458 V1-V3: input validation at the binding boundary ──
+
+    // V1: proton-charge ratio `c` is used by the counts-KL dispatch to
+    // relate sample to open-beam flux.  It is ignored on the
+    // transmission path, so we only validate it when the input is a
+    // counts variant — otherwise a user passing (say) `c=0.0` with
+    // transmission data would see a misleading error about a value
+    // that was never consulted.  Non-positive or non-finite values
+    // produce garbage fits deep in `joint_poisson_fit`; reject here
+    // with a clear message instead of letting a PyRuntimeError
+    // bubble up from the solver.
+    let is_counts_input = data.kind == "counts" || data.kind == "counts_with_nuisance";
+    if is_counts_input && (!c.is_finite() || c <= 0.0) {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "c (proton-charge ratio Q_s/Q_ob) must be positive and finite, got {c}",
+        )));
+    }
+
+    // V2: `initial_densities`, when supplied, must all be finite and
+    // non-negative.  NaN/Inf propagates through the solver and
+    // produces meaningless output; negative densities are non-physical
+    // (and LM's analytical Jacobian for exp(-n·σ) assumes n ≥ 0).
+    if let Some(ref init_d) = initial_densities {
+        for (i, &d) in init_d.iter().enumerate() {
+            if !d.is_finite() || d < 0.0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "initial_densities[{i}] must be finite and non-negative, got {d}",
+                )));
+            }
+        }
+    }
+
+    // V3: shape validation against the input data cube.
+    let data_shape = data.data_a.shape();
+    let (data_n_e, data_h, data_w) = (data_shape[0], data_shape[1], data_shape[2]);
+    let n_e_supplied = energies.as_slice()?.len();
+    if n_e_supplied != data_n_e {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "energies length ({n_e_supplied}) != data spectral axis length ({data_n_e})",
+        )));
+    }
+    if let Some(ref dp) = dead_pixels {
+        let dp_shape = dp.as_array().shape().to_vec();
+        if dp_shape != [data_h, data_w] {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "dead_pixels shape {dp_shape:?} != data spatial dims ({data_h}, {data_w})",
+            )));
+        }
     }
 
     let energies_vec = energies.as_slice()?.to_vec();
@@ -2907,7 +3034,13 @@ fn py_spatial_map_typed<'py>(
     };
 
     // Solver — resolve "auto" eagerly so max_iter is always propagated.
-    let solver_config = parse_solver_config(solver, data.kind == "counts", max_iter)?;
+    // Issue #458 B4: `data.kind` is one of `"counts"`, `"counts_with_nuisance"`,
+    // or the transmission string produced by `from_transmission()`.  Both
+    // counts variants should route `solver="auto"` to the counts-KL
+    // (joint-Poisson) dispatch — `data.kind == "counts"` alone misses
+    // `counts_with_nuisance`, which silently fell through to LM before.
+    // (`is_counts_input` computed earlier for V1 validation.)
+    let solver_config = parse_solver_config(solver, is_counts_input, max_iter)?;
     config = config.with_solver(solver_config);
 
     // Temperature fitting
@@ -2948,6 +3081,15 @@ fn py_spatial_map_typed<'py>(
     // when n_pixels > 1 inside spatial_map_typed.
     if let Some(v) = enable_polish {
         config = config.with_counts_enable_polish(Some(v));
+    }
+
+    // Energy-scale calibration (SAMMY TZERO equivalent).  Required for
+    // real VENUS data — without it, sharp resonances are offset ~0.5 us
+    // in TOF and per-pixel chi2 explodes (see memo on NEREIDS↔SAMMY
+    // parity for VENUS Hf 120min).
+    if fit_energy_scale {
+        validate_energy_scale_params(t0_init_us, l_scale_init, energy_scale_flight_path_m)?;
+        config = config.with_energy_scale(t0_init_us, l_scale_init, energy_scale_flight_path_m);
     }
 
     // Build InputData3D from the PyInputData
@@ -3108,6 +3250,33 @@ fn py_fit_counts_spectrum_typed<'py>(
     }
     require_non_empty_energy_grid(e_slice)?;
 
+    // Issue #458 V1: reject non-positive / non-finite `c` (Q_s / Q_ob).
+    if !c.is_finite() || c <= 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "c (proton-charge ratio Q_s/Q_ob) must be positive and finite, got {c}",
+        )));
+    }
+    // Issue #458 V2: reject non-finite / negative initial densities —
+    // both in `initial_densities` kwarg and in `isotopes: list[(rd, d)]`.
+    if let Some(ref init_d) = initial_densities {
+        for (i, &d) in init_d.iter().enumerate() {
+            if !d.is_finite() || d < 0.0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "initial_densities[{i}] must be finite and non-negative, got {d}",
+                )));
+            }
+        }
+    }
+    if let Some(ref iso) = isotopes {
+        for (i, (_, d)) in iso.iter().enumerate() {
+            if !d.is_finite() || *d < 0.0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "isotopes[{i}] initial density must be finite and non-negative, got {d}",
+                )));
+            }
+        }
+    }
+
     let detector_background_vec = if let Some(bg) = detector_background {
         let bg_slice = bg.as_slice()?;
         if bg_slice.len() != sample_slice.len() {
@@ -3183,6 +3352,7 @@ fn py_fit_counts_spectrum_typed<'py>(
         config = config.with_transmission_background(bg);
     }
     if fit_energy_scale {
+        validate_energy_scale_params(t0_init_us, l_scale_init, energy_scale_flight_path_m)?;
         config = config.with_energy_scale(t0_init_us, l_scale_init, energy_scale_flight_path_m);
     }
     // Attach CountsBackgroundConfig whenever any of its fields deviates from
@@ -3592,6 +3762,27 @@ fn py_fit_spectrum_typed<'py>(
     }
     require_non_empty_energy_grid(e_slice)?;
 
+    // Issue #458 V2: reject non-finite / negative initial densities.
+    if let Some(ref init_d) = initial_densities {
+        for (i, &d) in init_d.iter().enumerate() {
+            if !d.is_finite() || d < 0.0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "initial_densities[{i}] must be finite and non-negative, got {d}",
+                )));
+            }
+        }
+    }
+    // Also validate embedded densities passed through `isotopes: list[(ResonanceData, float)]`.
+    if let Some(ref iso) = isotopes {
+        for (i, (_, d)) in iso.iter().enumerate() {
+            if !d.is_finite() || *d < 0.0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "isotopes[{i}] initial density must be finite and non-negative, got {d}",
+                )));
+            }
+        }
+    }
+
     let energies_vec = e_slice.to_vec();
 
     // Build resolution
@@ -3660,6 +3851,7 @@ fn py_fit_spectrum_typed<'py>(
 
     // Energy-scale calibration (SAMMY TZERO equivalent)
     if fit_energy_scale {
+        validate_energy_scale_params(t0_init_us, l_scale_init, energy_scale_flight_path_m)?;
         config = config.with_energy_scale(t0_init_us, l_scale_init, energy_scale_flight_path_m);
     }
 

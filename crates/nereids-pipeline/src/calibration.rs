@@ -13,15 +13,20 @@
 //! resonance positions shift in the energy domain, causing catastrophic
 //! chi² degradation (e.g. 436 → 2.7 for a 0.3% L correction on VENUS).
 
+use nereids_core::constants::{EV_TO_JOULES, NEUTRON_MASS_KG};
 use nereids_endf::resonance::ResonanceData;
 use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
 
 use crate::error::PipelineError;
 
-/// Neutron mass constant: C = m_n / (2 · eV) = 5.2276e-9 eV·s²/m²
+/// Neutron mass constant: C = m_n / (2 · eV) ≈ 5.2276e-9 eV·s²/m².
 ///
 /// E [eV] = C · (L [m] / t [s])²
-const NEUTRON_MASS_CONSTANT: f64 = 0.5 * 1.6749e-27 / 1.602e-19;
+///
+/// Uses the CODATA 2018 values from `nereids_core::constants` so that
+/// this calibration path, `EnergyScaleTransmissionModel`, and
+/// `core::tof_to_energy` all agree to machine precision.
+const NEUTRON_MASS_CONSTANT: f64 = 0.5 * NEUTRON_MASS_KG / EV_TO_JOULES;
 
 /// Result of energy calibration.
 #[derive(Debug, Clone)]

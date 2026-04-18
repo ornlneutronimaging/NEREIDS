@@ -583,6 +583,208 @@ class TestSpatialMapCounts:
         # Density recovery: Poisson is noisier, so use wider tolerance
         np.testing.assert_allclose(dmap, true_density, rtol=0.5)
 
+    def test_spatial_rejects_non_positive_c(self, u238_data):
+        """Issue #458 V1: spatial_map_typed must reject c <= 0 or NaN at the
+        binding boundary with a clear PyValueError, not let it crash deep in
+        the solver as an opaque PyRuntimeError."""
+        energies = np.linspace(1.0, 10.0, 20)
+        n_e = len(energies)
+        sample = np.full((n_e, 2, 2), 100.0)
+        ob = np.full((n_e, 2, 2), 200.0)
+        data = nereids.from_counts(sample, ob)
+
+        for bad_c in (0.0, -1.0, float("nan"), float("inf")):
+            with pytest.raises(ValueError, match="c.*positive and finite"):
+                nereids.spatial_map_typed(
+                    data, energies, [u238_data], c=bad_c, max_iter=5
+                )
+
+    def test_spatial_c_validation_scoped_to_counts(self, u238_data):
+        """Issue #458 V1 (Codex follow-up): `c` is only consumed on counts
+        inputs.  A transmission caller who passes `c=0.0` should NOT be
+        rejected — the value is ignored on their path.  Rejecting it would
+        produce a misleading error that doesn't apply to their input type.
+        """
+        energies = np.linspace(1.0, 10.0, 20)
+        n_e = len(energies)
+        t = np.full((n_e, 2, 2), 0.5)
+        u = np.full((n_e, 2, 2), 0.01)
+        data = nereids.from_transmission(t, u)
+
+        # Should not raise — `c=0.0` is ignored on the transmission path.
+        result = nereids.spatial_map_typed(
+            data, energies, [u238_data], c=0.0, solver="lm", max_iter=5
+        )
+        assert result is not None  # call succeeded
+
+    def test_spatial_rejects_bad_initial_densities(self, u238_data):
+        """Issue #458 V2: spatial_map_typed must reject NaN / negative
+        initial densities at the binding boundary."""
+        energies = np.linspace(1.0, 10.0, 20)
+        n_e = len(energies)
+        sample = np.full((n_e, 2, 2), 100.0)
+        ob = np.full((n_e, 2, 2), 200.0)
+        data = nereids.from_counts(sample, ob)
+
+        for bad in ([float("nan")], [-0.001], [0.001, float("inf")]):
+            with pytest.raises(ValueError, match="initial_densities.*finite and non-negative"):
+                nereids.spatial_map_typed(
+                    data,
+                    energies,
+                    [u238_data] if len(bad) == 1 else [u238_data, u238_data],
+                    initial_densities=bad,
+                    max_iter=5,
+                )
+
+    def test_spatial_rejects_shape_mismatches(self, u238_data):
+        """Issue #458 V3: spatial_map_typed must reject energies and
+        dead_pixels shape mismatches upfront with a clear PyValueError,
+        rather than letting them panic deep in the Rust pipeline."""
+        energies = np.linspace(1.0, 10.0, 20)
+        n_e = len(energies)
+        sample = np.full((n_e, 3, 4), 100.0)
+        ob = np.full((n_e, 3, 4), 200.0)
+        data = nereids.from_counts(sample, ob)
+
+        # energies length mismatch
+        short_energies = energies[:10]
+        with pytest.raises(ValueError, match="energies length.*data spectral axis length"):
+            nereids.spatial_map_typed(data, short_energies, [u238_data], max_iter=5)
+
+        # dead_pixels shape mismatch
+        wrong_mask = np.zeros((5, 5), dtype=bool)
+        with pytest.raises(ValueError, match="dead_pixels shape.*data spatial dims"):
+            nereids.spatial_map_typed(
+                data,
+                energies,
+                [u238_data],
+                dead_pixels=wrong_mask,
+                max_iter=5,
+            )
+
+    def test_spatial_rejects_bad_tzero_params(self, u238_data):
+        """Issue #458 (Copilot review on PR #461): when `fit_energy_scale=True`,
+        the TZERO kwargs `t0_init_us`, `l_scale_init`, and
+        `energy_scale_flight_path_m` must be validated at the binding
+        boundary.  Non-finite or non-positive values (for flight path)
+        produced opaque PyRuntimeError from the solver rather than a clear
+        PyValueError.
+        """
+        energies = np.linspace(1.0, 10.0, 20)
+        n_e = len(energies)
+        t = np.full((n_e, 2, 2), 0.5)
+        u = np.full((n_e, 2, 2), 0.01)
+        data = nereids.from_transmission(t, u)
+
+        # t0_init_us non-finite
+        for bad_t0 in (float("nan"), float("inf"), float("-inf")):
+            with pytest.raises(ValueError, match="t0_init_us must be finite"):
+                nereids.spatial_map_typed(
+                    data, energies, [u238_data],
+                    solver="lm",
+                    fit_energy_scale=True,
+                    t0_init_us=bad_t0,
+                    max_iter=5,
+                )
+
+        # l_scale_init non-finite
+        for bad_l in (float("nan"), float("inf")):
+            with pytest.raises(ValueError, match="l_scale_init must be finite"):
+                nereids.spatial_map_typed(
+                    data, energies, [u238_data],
+                    solver="lm",
+                    fit_energy_scale=True,
+                    l_scale_init=bad_l,
+                    max_iter=5,
+                )
+
+        # flight_path_m non-positive or non-finite
+        for bad_fp in (0.0, -1.0, float("nan"), float("inf")):
+            with pytest.raises(ValueError, match="energy_scale_flight_path_m"):
+                nereids.spatial_map_typed(
+                    data, energies, [u238_data],
+                    solver="lm",
+                    fit_energy_scale=True,
+                    energy_scale_flight_path_m=bad_fp,
+                    max_iter=5,
+                )
+
+    def test_spatial_all_dead_pixels_returns_nan_density(self, u238_data):
+        """Issue #458 (Copilot review on PR #461): when every pixel is
+        masked dead, the early-return path must honour the NaN-on-failure
+        contract — density_maps must be NaN, not zeros.
+        """
+        energies = np.linspace(1.0, 10.0, 20)
+        n_e = len(energies)
+        h, w = 3, 3
+        t = np.full((n_e, h, w), 0.5)
+        u = np.full((n_e, h, w), 0.01)
+        data = nereids.from_transmission(t, u)
+        all_dead = np.ones((h, w), dtype=bool)
+
+        result = nereids.spatial_map_typed(
+            data, energies, [u238_data],
+            solver="lm",
+            dead_pixels=all_dead,
+            max_iter=5,
+        )
+        # converged_map is the signal that no fits ran.
+        assert result.n_converged == 0
+        assert result.n_total == 0
+        # density_map must be all NaN (not zero-filled).
+        density = np.asarray(result.density_maps[0])
+        assert density.shape == (h, w)
+        assert np.all(np.isnan(density)), (
+            "all-dead-pixels early-return must honour NaN-on-failure contract; "
+            "got density map with non-NaN entries"
+        )
+
+    def test_counts_with_nuisance_auto_dispatches_to_kl(self, u238_data):
+        """Regression for issue #458 B4.
+
+        `spatial_map_typed(solver="auto")` with a `from_counts_with_nuisance`
+        input must dispatch to the counts-KL (joint-Poisson) path — previously
+        the ``data.kind == "counts"`` check in the Python binding missed the
+        `"counts_with_nuisance"` variant and silently fell through to LM.
+
+        Proxy observable: the counts-KL dispatch populates
+        `deviance_per_dof_map`; LM on counts does not.  If we see
+        `deviance_per_dof_map is not None`, the auto-dispatch is correct.
+        """
+        energies = np.linspace(1.0, 30.0, 80)
+        true_density = 0.002
+        flux = 4000.0
+        n_e = len(energies)
+        ny, nx = 2, 2
+
+        t_1d = np.asarray(
+            nereids.forward_model(energies, [(u238_data, true_density)])
+        )
+
+        rng = np.random.default_rng(1234)
+        flux_3d = np.full((n_e, ny, nx), flux)
+        # Explicit nuisance spectra: flux and zero detector background.
+        background_3d = np.zeros((n_e, ny, nx))
+        sample_3d = np.zeros((n_e, ny, nx))
+        for y in range(ny):
+            for x in range(nx):
+                sample_3d[:, y, x] = rng.poisson(flux * t_1d).astype(float)
+
+        data = nereids.from_counts_with_nuisance(sample_3d, flux_3d, background_3d)
+        result = nereids.spatial_map_typed(
+            data,
+            energies,
+            [u238_data],
+            solver="auto",
+            max_iter=50,
+        )
+        # Definitive signal that we routed through the counts-KL dispatch:
+        assert result.deviance_per_dof_map is not None, (
+            "from_counts_with_nuisance + solver='auto' should dispatch to "
+            "counts-KL (joint-Poisson), which populates deviance_per_dof_map. "
+            "None means the binding mis-dispatched to LM (issue #458 B4)."
+        )
+
 
 # ===========================================================================
 # Normalization

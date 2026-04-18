@@ -1052,6 +1052,10 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
             // D-11/D-21: Now persisted; None for old project files.
             anorm_map: snap.anorm_map,
             background_maps: snap.background_maps,
+            // TZERO maps are not yet persisted in project files — None on
+            // restore.  Re-running spatial_map_typed regenerates them.
+            t0_us_map: None,
+            l_scale_map: None,
             n_converged: snap.n_converged.unwrap_or(0),
             n_total: snap.n_total.unwrap_or(0),
             n_failed: snap.n_failed.unwrap_or(0),
