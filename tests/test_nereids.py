@@ -599,6 +599,24 @@ class TestSpatialMapCounts:
                     data, energies, [u238_data], c=bad_c, max_iter=5
                 )
 
+    def test_spatial_c_validation_scoped_to_counts(self, u238_data):
+        """Issue #458 V1 (Codex follow-up): `c` is only consumed on counts
+        inputs.  A transmission caller who passes `c=0.0` should NOT be
+        rejected — the value is ignored on their path.  Rejecting it would
+        produce a misleading error that doesn't apply to their input type.
+        """
+        energies = np.linspace(1.0, 10.0, 20)
+        n_e = len(energies)
+        t = np.full((n_e, 2, 2), 0.5)
+        u = np.full((n_e, 2, 2), 0.01)
+        data = nereids.from_transmission(t, u)
+
+        # Should not raise — `c=0.0` is ignored on the transmission path.
+        result = nereids.spatial_map_typed(
+            data, energies, [u238_data], c=0.0, solver="lm", max_iter=5
+        )
+        assert result is not None  # call succeeded
+
     def test_spatial_rejects_bad_initial_densities(self, u238_data):
         """Issue #458 V2: spatial_map_typed must reject NaN / negative
         initial densities at the binding boundary."""

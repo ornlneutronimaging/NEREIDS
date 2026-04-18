@@ -2904,11 +2904,16 @@ fn py_spatial_map_typed<'py>(
     // ── Issue #458 V1-V3: input validation at the binding boundary ──
 
     // V1: proton-charge ratio `c` is used by the counts-KL dispatch to
-    // relate sample to open-beam flux.  Non-positive or non-finite
-    // values produce garbage fits deep in `joint_poisson_fit`; reject
-    // here with a clear message instead of letting a PyRuntimeError
+    // relate sample to open-beam flux.  It is ignored on the
+    // transmission path, so we only validate it when the input is a
+    // counts variant — otherwise a user passing (say) `c=0.0` with
+    // transmission data would see a misleading error about a value
+    // that was never consulted.  Non-positive or non-finite values
+    // produce garbage fits deep in `joint_poisson_fit`; reject here
+    // with a clear message instead of letting a PyRuntimeError
     // bubble up from the solver.
-    if !c.is_finite() || c <= 0.0 {
+    let is_counts_input = data.kind == "counts" || data.kind == "counts_with_nuisance";
+    if is_counts_input && (!c.is_finite() || c <= 0.0) {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
             "c (proton-charge ratio Q_s/Q_ob) must be positive and finite, got {c}",
         )));
@@ -2999,8 +3004,8 @@ fn py_spatial_map_typed<'py>(
     // counts variants should route `solver="auto"` to the counts-KL
     // (joint-Poisson) dispatch — `data.kind == "counts"` alone misses
     // `counts_with_nuisance`, which silently fell through to LM before.
-    let is_counts = data.kind == "counts" || data.kind == "counts_with_nuisance";
-    let solver_config = parse_solver_config(solver, is_counts, max_iter)?;
+    // (`is_counts_input` computed earlier for V1 validation.)
+    let solver_config = parse_solver_config(solver, is_counts_input, max_iter)?;
     config = config.with_solver(solver_config);
 
     // Temperature fitting

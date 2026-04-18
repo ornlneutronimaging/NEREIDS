@@ -16,26 +16,43 @@ use crate::error::PipelineError;
 use crate::pipeline::SpectrumFitResult;
 
 /// Result of spatial mapping over a 2D image.
+///
+/// **NaN-on-failure contract (issue #458 B1/B2):**
+/// every per-pixel parameter map
+/// (`density_maps`, `uncertainty_maps`, `chi_squared_map`,
+/// `deviance_per_dof_map`, `temperature_map`,
+/// `temperature_uncertainty_map`, `anorm_map`, `background_maps`,
+/// `t0_us_map`, `l_scale_map`) contains `NaN` at every pixel where
+/// `converged_map` is `false`.  The only map written unconditionally
+/// is `converged_map` itself — it is how callers discover that a
+/// pixel failed.  Callers rendering numeric values should gate on
+/// `converged_map` (or check `value.is_finite()`) to avoid displaying
+/// the placeholder `NaN`.
 #[derive(Debug)]
 pub struct SpatialResult {
     /// Fitted areal density maps, one per isotope.
     /// Each Array2 has shape (height, width).
+    /// NaN at pixels where `converged_map` is `false`.
     pub density_maps: Vec<Array2<f64>>,
     /// Uncertainty maps, one per isotope.
+    /// NaN at pixels where `converged_map` is `false`.
     pub uncertainty_maps: Vec<Array2<f64>>,
     /// Reduced chi-squared map.  For the counts-KL dispatch (joint-Poisson
     /// deviance per memo 35 §P1.2) this is back-compat-mirrored to
     /// `D/(n−k)`; the semantically-correct per-pixel value is also
     /// exposed as [`Self::deviance_per_dof_map`].
+    /// NaN at pixels where `converged_map` is `false`.
     pub chi_squared_map: Array2<f64>,
     /// Per-pixel conditional binomial deviance `D/(n−k)` map.  `Some` when
     /// the effective per-pixel solver is the counts-KL dispatch
     /// (joint-Poisson); `None` for LM-only runs and transmission+PoissonKL
     /// where Pearson χ²/dof is the GOF.
+    /// NaN at pixels where `converged_map` is `false`.
     pub deviance_per_dof_map: Option<Array2<f64>>,
     /// Convergence map (true = converged).
     pub converged_map: Array2<bool>,
     /// Fitted temperature map (K). `Some` when `config.fit_temperature()` is true.
+    /// NaN at pixels where `converged_map` is `false`.
     pub temperature_map: Option<Array2<f64>>,
     /// Per-pixel temperature uncertainty map (K, 1-sigma).
     /// `Some` when `config.fit_temperature()` is true.
@@ -46,10 +63,12 @@ pub struct SpatialResult {
     /// user modifies the isotope list after fitting.
     pub isotope_labels: Vec<String>,
     /// Per-pixel normalization / signal-scale map (when background fitting is enabled).
+    /// NaN at pixels where `converged_map` is `false`.
     pub anorm_map: Option<Array2<f64>>,
     /// Per-pixel background parameter maps.
     /// Transmission LM uses `[BackA, BackB, BackC]`.
     /// Counts KL background uses `[b0, b1, alpha_2]`.
+    /// NaN at pixels where `converged_map` is `false`.
     pub background_maps: Option<[Array2<f64>; 3]>,
     /// Per-pixel fitted SAMMY TZERO offset (µs) map.
     /// `Some` when `config.fit_energy_scale` is true; `None` otherwise.
@@ -247,6 +266,23 @@ pub fn spatial_map_typed(
              build the corrected energy grid and pass it to spatial_map_typed with \
              fit_energy_scale=false. For counts data, solver='kl' (or 'auto') is robust \
              with per-pixel TZERO fitting."
+                .into(),
+        ));
+    }
+
+    // Issue #458 (Codex review): `fit_energy_scale` + `fit_temperature`
+    // is not a supported combination — `EnergyScaleTransmissionModel`
+    // and the temperature-fitting path are mutually exclusive at the
+    // single-spectrum fitter (`pipeline.rs:830, 976, 1183`).  Without
+    // this spatial-layer guard, every per-pixel call would error and
+    // `spatial_map_typed` would report `n_failed == n_total` with an
+    // all-NaN map — a silently-failed map is worse than a clear error.
+    if config.fit_energy_scale() && config.fit_temperature() {
+        return Err(PipelineError::InvalidParameter(
+            "spatial_map_typed: fit_energy_scale=true and fit_temperature=true cannot \
+             both be set — EnergyScaleTransmissionModel does not support temperature \
+             fitting. Choose one: either calibrate TZERO with a fixed temperature, or \
+             fit temperature on the nominal energy grid."
                 .into(),
         ));
     }
@@ -1741,6 +1777,43 @@ mod tests {
         let result = spatial_map_typed(&data, &config, None, None, None)
             .expect("KL + counts + fit_energy_scale must be allowed");
         assert!(result.t0_us_map.is_some());
+    }
+
+    /// `fit_energy_scale + fit_temperature` must be rejected at
+    /// spatial entry (Codex review follow-up to #458).  The
+    /// single-spectrum fitter errors on this combination, but without
+    /// a spatial-layer guard every pixel would error and
+    /// `spatial_map_typed` would silently return `n_failed == n_total`
+    /// with an all-NaN map instead of a clear error.
+    #[test]
+    fn test_spatial_map_typed_rejects_energy_scale_with_temperature() {
+        let rd = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        let (t_3d, u_3d) = synthetic_4x4_transmission(&rd, 0.001, &energies);
+        let data = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![rd],
+            vec!["U-238".into()],
+            300.0,
+            None,
+            vec![0.0005],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
+        .with_fit_temperature(true)
+        .with_energy_scale(0.0, 1.0, 25.0);
+
+        let err = spatial_map_typed(&data, &config, None, None, None)
+            .expect_err("fit_energy_scale + fit_temperature must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("fit_energy_scale") && msg.contains("fit_temperature"),
+            "error message should name both culprits, got: {msg}"
+        );
     }
 
     /// `(Transmission + LM + fit_energy_scale=true)` is allowed —
