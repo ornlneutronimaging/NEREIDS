@@ -2901,6 +2901,51 @@ fn py_spatial_map_typed<'py>(
         ));
     }
 
+    // ── Issue #458 V1-V3: input validation at the binding boundary ──
+
+    // V1: proton-charge ratio `c` is used by the counts-KL dispatch to
+    // relate sample to open-beam flux.  Non-positive or non-finite
+    // values produce garbage fits deep in `joint_poisson_fit`; reject
+    // here with a clear message instead of letting a PyRuntimeError
+    // bubble up from the solver.
+    if !c.is_finite() || c <= 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "c (proton-charge ratio Q_s/Q_ob) must be positive and finite, got {c}",
+        )));
+    }
+
+    // V2: `initial_densities`, when supplied, must all be finite and
+    // non-negative.  NaN/Inf propagates through the solver and
+    // produces meaningless output; negative densities are non-physical
+    // (and LM's analytical Jacobian for exp(-n·σ) assumes n ≥ 0).
+    if let Some(ref init_d) = initial_densities {
+        for (i, &d) in init_d.iter().enumerate() {
+            if !d.is_finite() || d < 0.0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "initial_densities[{i}] must be finite and non-negative, got {d}",
+                )));
+            }
+        }
+    }
+
+    // V3: shape validation against the input data cube.
+    let data_shape = data.data_a.shape();
+    let (data_n_e, data_h, data_w) = (data_shape[0], data_shape[1], data_shape[2]);
+    let n_e_supplied = energies.as_slice()?.len();
+    if n_e_supplied != data_n_e {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "energies length ({n_e_supplied}) != data spectral axis length ({data_n_e})",
+        )));
+    }
+    if let Some(ref dp) = dead_pixels {
+        let dp_shape = dp.as_array().shape().to_vec();
+        if dp_shape != [data_h, data_w] {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "dead_pixels shape {dp_shape:?} != data spatial dims ({data_h}, {data_w})",
+            )));
+        }
+    }
+
     let energies_vec = energies.as_slice()?.to_vec();
 
     // Build resolution
@@ -2949,7 +2994,13 @@ fn py_spatial_map_typed<'py>(
     };
 
     // Solver — resolve "auto" eagerly so max_iter is always propagated.
-    let solver_config = parse_solver_config(solver, data.kind == "counts", max_iter)?;
+    // Issue #458 B4: `data.kind` is one of `"counts"`, `"counts_with_nuisance"`,
+    // or the transmission string produced by `from_transmission()`.  Both
+    // counts variants should route `solver="auto"` to the counts-KL
+    // (joint-Poisson) dispatch — `data.kind == "counts"` alone misses
+    // `counts_with_nuisance`, which silently fell through to LM before.
+    let is_counts = data.kind == "counts" || data.kind == "counts_with_nuisance";
+    let solver_config = parse_solver_config(solver, is_counts, max_iter)?;
     config = config.with_solver(solver_config);
 
     // Temperature fitting
@@ -3157,6 +3208,33 @@ fn py_fit_counts_spectrum_typed<'py>(
         )));
     }
     require_non_empty_energy_grid(e_slice)?;
+
+    // Issue #458 V1: reject non-positive / non-finite `c` (Q_s / Q_ob).
+    if !c.is_finite() || c <= 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "c (proton-charge ratio Q_s/Q_ob) must be positive and finite, got {c}",
+        )));
+    }
+    // Issue #458 V2: reject non-finite / negative initial densities —
+    // both in `initial_densities` kwarg and in `isotopes: list[(rd, d)]`.
+    if let Some(ref init_d) = initial_densities {
+        for (i, &d) in init_d.iter().enumerate() {
+            if !d.is_finite() || d < 0.0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "initial_densities[{i}] must be finite and non-negative, got {d}",
+                )));
+            }
+        }
+    }
+    if let Some(ref iso) = isotopes {
+        for (i, (_, d)) in iso.iter().enumerate() {
+            if !d.is_finite() || *d < 0.0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "isotopes[{i}] initial density must be finite and non-negative, got {d}",
+                )));
+            }
+        }
+    }
 
     let detector_background_vec = if let Some(bg) = detector_background {
         let bg_slice = bg.as_slice()?;
@@ -3641,6 +3719,27 @@ fn py_fit_spectrum_typed<'py>(
         )));
     }
     require_non_empty_energy_grid(e_slice)?;
+
+    // Issue #458 V2: reject non-finite / negative initial densities.
+    if let Some(ref init_d) = initial_densities {
+        for (i, &d) in init_d.iter().enumerate() {
+            if !d.is_finite() || d < 0.0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "initial_densities[{i}] must be finite and non-negative, got {d}",
+                )));
+            }
+        }
+    }
+    // Also validate embedded densities passed through `isotopes: list[(ResonanceData, float)]`.
+    if let Some(ref iso) = isotopes {
+        for (i, (_, d)) in iso.iter().enumerate() {
+            if !d.is_finite() || *d < 0.0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "isotopes[{i}] initial density must be finite and non-negative, got {d}",
+                )));
+            }
+        }
+    }
 
     let energies_vec = e_slice.to_vec();
 
