@@ -2653,6 +2653,41 @@ fn parse_solver_config(
     }
 }
 
+/// Validate the SAMMY TZERO kwargs before they reach
+/// `UnifiedFitConfig::with_energy_scale`.  Shared across
+/// `py_spatial_map_typed`, `py_fit_spectrum_typed`, and
+/// `py_fit_counts_spectrum_typed`.
+///
+/// Issue #458 (Copilot review on PR #461): without these checks, NaN /
+/// Inf / non-positive values flowed into
+/// `EnergyScaleTransmissionModel::corrected_energies`, which divides
+/// by TOF values derived from `flight_path_m`.  Garbage inputs yielded
+/// NaN grids and confusing `PyRuntimeError`s from the solver rather
+/// than an actionable `PyValueError` at the binding boundary.
+fn validate_energy_scale_params(
+    t0_init_us: f64,
+    l_scale_init: f64,
+    energy_scale_flight_path_m: f64,
+) -> PyResult<()> {
+    if !t0_init_us.is_finite() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "t0_init_us must be finite when fit_energy_scale=True, got {t0_init_us}"
+        )));
+    }
+    if !l_scale_init.is_finite() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "l_scale_init must be finite when fit_energy_scale=True, got {l_scale_init}"
+        )));
+    }
+    if !energy_scale_flight_path_m.is_finite() || energy_scale_flight_path_m <= 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "energy_scale_flight_path_m must be finite and positive when \
+             fit_energy_scale=True, got {energy_scale_flight_path_m}"
+        )));
+    }
+    Ok(())
+}
+
 /// Build `UnifiedFitConfig` from groups, returning the config and the number of
 /// density parameters (one per group) for initial_densities default.
 fn build_config_from_groups(
@@ -3053,6 +3088,7 @@ fn py_spatial_map_typed<'py>(
     // in TOF and per-pixel chi2 explodes (see memo on NEREIDS↔SAMMY
     // parity for VENUS Hf 120min).
     if fit_energy_scale {
+        validate_energy_scale_params(t0_init_us, l_scale_init, energy_scale_flight_path_m)?;
         config = config.with_energy_scale(t0_init_us, l_scale_init, energy_scale_flight_path_m);
     }
 
@@ -3316,6 +3352,7 @@ fn py_fit_counts_spectrum_typed<'py>(
         config = config.with_transmission_background(bg);
     }
     if fit_energy_scale {
+        validate_energy_scale_params(t0_init_us, l_scale_init, energy_scale_flight_path_m)?;
         config = config.with_energy_scale(t0_init_us, l_scale_init, energy_scale_flight_path_m);
     }
     // Attach CountsBackgroundConfig whenever any of its fields deviates from
@@ -3814,6 +3851,7 @@ fn py_fit_spectrum_typed<'py>(
 
     // Energy-scale calibration (SAMMY TZERO equivalent)
     if fit_energy_scale {
+        validate_energy_scale_params(t0_init_us, l_scale_init, energy_scale_flight_path_m)?;
         config = config.with_energy_scale(t0_init_us, l_scale_init, energy_scale_flight_path_m);
     }
 

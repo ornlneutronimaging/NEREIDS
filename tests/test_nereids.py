@@ -662,6 +662,83 @@ class TestSpatialMapCounts:
                 max_iter=5,
             )
 
+    def test_spatial_rejects_bad_tzero_params(self, u238_data):
+        """Issue #458 (Copilot review on PR #461): when `fit_energy_scale=True`,
+        the TZERO kwargs `t0_init_us`, `l_scale_init`, and
+        `energy_scale_flight_path_m` must be validated at the binding
+        boundary.  Non-finite or non-positive values (for flight path)
+        produced opaque PyRuntimeError from the solver rather than a clear
+        PyValueError.
+        """
+        energies = np.linspace(1.0, 10.0, 20)
+        n_e = len(energies)
+        t = np.full((n_e, 2, 2), 0.5)
+        u = np.full((n_e, 2, 2), 0.01)
+        data = nereids.from_transmission(t, u)
+
+        # t0_init_us non-finite
+        for bad_t0 in (float("nan"), float("inf"), float("-inf")):
+            with pytest.raises(ValueError, match="t0_init_us must be finite"):
+                nereids.spatial_map_typed(
+                    data, energies, [u238_data],
+                    solver="lm",
+                    fit_energy_scale=True,
+                    t0_init_us=bad_t0,
+                    max_iter=5,
+                )
+
+        # l_scale_init non-finite
+        for bad_l in (float("nan"), float("inf")):
+            with pytest.raises(ValueError, match="l_scale_init must be finite"):
+                nereids.spatial_map_typed(
+                    data, energies, [u238_data],
+                    solver="lm",
+                    fit_energy_scale=True,
+                    l_scale_init=bad_l,
+                    max_iter=5,
+                )
+
+        # flight_path_m non-positive or non-finite
+        for bad_fp in (0.0, -1.0, float("nan"), float("inf")):
+            with pytest.raises(ValueError, match="energy_scale_flight_path_m"):
+                nereids.spatial_map_typed(
+                    data, energies, [u238_data],
+                    solver="lm",
+                    fit_energy_scale=True,
+                    energy_scale_flight_path_m=bad_fp,
+                    max_iter=5,
+                )
+
+    def test_spatial_all_dead_pixels_returns_nan_density(self, u238_data):
+        """Issue #458 (Copilot review on PR #461): when every pixel is
+        masked dead, the early-return path must honour the NaN-on-failure
+        contract — density_maps must be NaN, not zeros.
+        """
+        energies = np.linspace(1.0, 10.0, 20)
+        n_e = len(energies)
+        h, w = 3, 3
+        t = np.full((n_e, h, w), 0.5)
+        u = np.full((n_e, h, w), 0.01)
+        data = nereids.from_transmission(t, u)
+        all_dead = np.ones((h, w), dtype=bool)
+
+        result = nereids.spatial_map_typed(
+            data, energies, [u238_data],
+            solver="lm",
+            dead_pixels=all_dead,
+            max_iter=5,
+        )
+        # converged_map is the signal that no fits ran.
+        assert result.n_converged == 0
+        assert result.n_total == 0
+        # density_map must be all NaN (not zero-filled).
+        density = np.asarray(result.density_maps[0])
+        assert density.shape == (h, w)
+        assert np.all(np.isnan(density)), (
+            "all-dead-pixels early-return must honour NaN-on-failure contract; "
+            "got density map with non-NaN entries"
+        )
+
     def test_counts_with_nuisance_auto_dispatches_to_kl(self, u238_data):
         """Regression for issue #458 B4.
 

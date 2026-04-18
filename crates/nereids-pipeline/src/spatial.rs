@@ -72,10 +72,11 @@ pub struct SpatialResult {
     pub background_maps: Option<[Array2<f64>; 3]>,
     /// Per-pixel fitted SAMMY TZERO offset (µs) map.
     /// `Some` when `config.fit_energy_scale` is true; `None` otherwise.
-    /// Entries are NaN where the per-pixel fit hard-failed.
+    /// NaN at pixels where `converged_map` is `false`.
     pub t0_us_map: Option<Array2<f64>>,
     /// Per-pixel fitted SAMMY TZERO flight-path scale factor.
     /// `Some` when `config.fit_energy_scale` is true; `None` otherwise.
+    /// NaN at pixels where `converged_map` is `false`.
     pub l_scale_map: Option<Array2<f64>>,
     /// Number of pixels that converged.
     pub n_converged: usize,
@@ -318,9 +319,15 @@ pub fn spatial_map_typed(
         return Err(PipelineError::Cancelled);
     }
     if pixel_coords.is_empty() {
+        // All pixels filtered out (typically by `dead_pixels` mask).  Per
+        // the NaN-on-failure contract (issue #458 B1 + Copilot review),
+        // every parameter map must be NaN at every pixel — including
+        // density, which was previously initialised with zeros here.
+        // `converged_map` is all `false`, which is the caller's signal
+        // that no fits ran.
         return Ok(SpatialResult {
             density_maps: (0..n_maps)
-                .map(|_| Array2::zeros((height, width)))
+                .map(|_| Array2::from_elem((height, width), f64::NAN))
                 .collect(),
             uncertainty_maps: (0..n_maps)
                 .map(|_| Array2::from_elem((height, width), f64::NAN))
