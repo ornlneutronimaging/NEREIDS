@@ -36,7 +36,7 @@
 
 use std::path::Path;
 
-use ndarray::Array3;
+use ndarray::{Array3, s};
 
 use crate::error::IoError;
 
@@ -262,24 +262,51 @@ pub fn load_nexus_histogram_with_mode(
         MultiAngleMode::SelectAngle(idx) if idx >= n_rot => {
             return Err(IoError::InvalidParameter(format!(
                 "MultiAngleMode::SelectAngle({idx}) out of range: file has {n_rot} \
-                 rotation angle(s), valid indices are 0..{n_rot}"
+                 rotation angle(s); valid indices are 0..{n_rot} (exclusive, i.e. \
+                 last valid index is {last})",
+                last = n_rot - 1
             )));
         }
         _ => {}
     }
 
-    let counts_u64: ndarray::Array4<u64> = counts_ds
-        .read()
-        .map_err(|e| IoError::InvalidParameter(format!("Failed to read histogram counts: {e}")))?;
-
-    // Collapse the rotation-angle axis according to the caller's policy
-    // (issue #430).  For single-angle files all three modes are
-    // equivalent — they just take the only slice that exists.
-    // (Validation above already ruled out every rejection case, so
-    // `Error` here is guaranteed to have n_rot == 1.)
-    let combined_yxtof = match mode {
-        MultiAngleMode::Error | MultiAngleMode::Sum => counts_u64.sum_axis(ndarray::Axis(0)),
-        MultiAngleMode::SelectAngle(idx) => counts_u64.index_axis(ndarray::Axis(0), idx).to_owned(),
+    // Read only the rotation-angle slice(s) the caller actually needs
+    // (Copilot review on PR-B).  Reading the full 4D cube when the
+    // caller wants one projection is wasteful on production
+    // multi-angle files (multi-GB per acquisition).
+    //
+    // - `Error` is guaranteed to have `n_rot == 1` (validated above),
+    //   so we hyperslab-read the single projection.
+    // - `Sum` on a single-angle file is identity with `Error`.
+    // - `Sum` on a multi-angle file needs every angle; the full read
+    //   is unavoidable and the legacy opt-in carries its memory cost.
+    // - `SelectAngle(idx)` hyperslab-reads only the selected
+    //   projection — the other angles' bytes never enter memory.
+    //
+    // All paths produce a `[y, x, tof]` 3D `u64` array ready for the
+    // f64 conversion + transpose below.
+    let combined_yxtof: ndarray::Array3<u64> = match mode {
+        MultiAngleMode::Error | MultiAngleMode::Sum if n_rot == 1 => {
+            counts_ds.read_slice(s![0, .., .., ..]).map_err(|e| {
+                IoError::InvalidParameter(format!("Failed to read single-angle slice: {e}"))
+            })?
+        }
+        MultiAngleMode::Sum => {
+            let full: ndarray::Array4<u64> = counts_ds.read().map_err(|e| {
+                IoError::InvalidParameter(format!("Failed to read histogram counts: {e}"))
+            })?;
+            full.sum_axis(ndarray::Axis(0))
+        }
+        MultiAngleMode::SelectAngle(idx) => {
+            counts_ds.read_slice(s![idx, .., .., ..]).map_err(|e| {
+                IoError::InvalidParameter(format!("Failed to read selected-angle slice: {e}"))
+            })?
+        }
+        MultiAngleMode::Error => {
+            // Unreachable: n_rot > 1 was rejected above, n_rot == 1 is
+            // matched by the first arm, n_rot == 0 was rejected earlier.
+            unreachable!("Error mode reached with n_rot = {n_rot}")
+        }
     };
 
     // Convert to f64 and transpose [y, x, tof] → NEREIDS convention [tof, y, x]

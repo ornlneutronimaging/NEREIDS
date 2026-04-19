@@ -410,9 +410,14 @@ fn hdf5_ob_picker(ui: &mut egui::Ui, state: &mut AppState) {
                 // Issue #430: the loader refuses multi-angle files by
                 // default to prevent silent sum-over-angles.  The GUI
                 // makes the explicit opt-in to preserve existing
-                // single-volume analysis behaviour, and surfaces the
-                // angle count in the status banner below so the user
-                // knows projections were combined.
+                // single-volume analysis behaviour on OB input.
+                //
+                // NOTE: this branch does not currently surface the
+                // rotation-angle count to the user via the status
+                // banner — we discard `data.n_rotation_angles` when
+                // mapping to `(counts, tof_edges)`.  The sample-load
+                // path below *does* surface it; parity is tracked as
+                // a follow-up UX issue (#462).
                 nereids_io::nexus::load_nexus_histogram_with_mode(
                     &path,
                     nereids_io::nexus::MultiAngleMode::Sum,
