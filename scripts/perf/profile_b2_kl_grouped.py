@@ -1,6 +1,6 @@
 """Profile driver: spatial B.2 KL+grouped on a 4x4 crop.
 
-Signals readiness via /tmp/a1_ready (shared with run_sample.sh).
+Signals readiness via /tmp/b2_ready (consumed by run_sample_b2.sh).
 Baseline: ~0.5s/pixel on 64x64. A 4x4 crop runs in ~8s.
 """
 from __future__ import annotations
@@ -73,7 +73,7 @@ def main() -> None:
         dead_pixels=dead_pixels,
     )
 
-    Path("/tmp/a1_ready").write_text("ready\n")
+    Path("/tmp/b2_ready").write_text("ready\n")
 
     t0 = time.time()
     r = nereids.spatial_map_typed(

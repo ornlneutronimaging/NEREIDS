@@ -4,12 +4,12 @@ cd "$(dirname "$0")/../.."
 
 PY_BIN=$(pixi info --json 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['environments_info'][0]['prefix'])")/bin/python
 
-rm -f /tmp/a1_ready
+rm -f /tmp/b2_ready
 "$PY_BIN" scripts/perf/profile_b2_kl_grouped.py &
 PID=$!
 
 for _ in $(seq 1 1200); do
-    if [ -f /tmp/a1_ready ]; then break; fi
+    if [ -f /tmp/b2_ready ]; then break; fi
     sleep 0.05
 done
 sleep 0.2

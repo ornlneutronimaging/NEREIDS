@@ -56,40 +56,13 @@ def parse(path: Path):
 
     inclusive = defaultdict(int)
     self_time = defaultdict(int)
-
-    # depth → current frame name at that depth. When we see a frame at depth d,
-    # the current "deeper" entries are superseded.
-    stack: list[tuple[int, str, int]] = []  # (depth, name, count)
-
     total_samples = 0
 
-    for raw_line in text[start:end]:
-        m = LINE_RE.match(raw_line)
-        if not m:
-            continue
-        indent = m.group("indent")
-        # depth = number of leading whitespace units (use the tree drawing chars)
-        # Every "+" or "|" or ":" or " " etc. contributes to indent width.
-        depth = len(indent)
-        count = int(m.group("count"))
-        name = clean_symbol(m.group("name"))
-
-        # Pop deeper-or-equal frames.
-        while stack and stack[-1][0] >= depth:
-            stack.pop()
-        stack.append((depth, name, count))
-
-        # Inclusive: every frame from root to here gets +count. But the parent
-        # will already have added count through its own line (since sample
-        # output lists each frame in the tree). So we only count THIS line.
-        inclusive[name] += count
-
-    # We need to find the "leaves" — lines whose sample count is not
-    # explained by a deeper sibling. Re-walk and track whether a frame
-    # has any child lines immediately indented deeper. This is trickier.
-    # Simpler: a frame at depth d with count N is a leaf iff the next
-    # line is either the same depth or shallower.
-    lines = []
+    # Parse the Call graph region into a flat (depth, count, name) list.
+    # The format is pre-order DFS: the first line deeper than a frame is
+    # its first child; subsequent deeper lines are either siblings at that
+    # same depth or their descendants.
+    lines: list[tuple[int, int, str]] = []
     for raw_line in text[start:end]:
         m = LINE_RE.match(raw_line)
         if not m:
@@ -102,30 +75,18 @@ def parse(path: Path):
             )
         )
 
+    # Inclusive time: each frame in the tree gets credited with the samples
+    # recorded at its own line (parent-child accounting is already baked
+    # into the sample output — a parent line's count always equals the
+    # sum of its children's counts plus any self time).
+    for _, count, name in lines:
+        inclusive[name] += count
+
+    # Self time: a frame's count minus the sum of its immediate children's
+    # counts.  In the pre-order sample tree, immediate children are the
+    # descendants at the `first_child_depth` level, which is the first
+    # deeper indentation encountered after the frame's line.
     for i, (d, c, n) in enumerate(lines):
-        # Look ahead: if the next line is deeper, this frame has descendants
-        # → those samples belong to the child, so "self" at this frame =
-        # count - sum(deeper children directly under it).
-        j = i + 1
-        child_sum = 0
-        while j < len(lines):
-            dj, cj, nj = lines[j]
-            if dj <= d:
-                break
-            if dj > d and all(lines[k][0] > d for k in range(i + 1, j)):
-                # `j` is a direct child only if every line between i and j
-                # is deeper than d. But since sample output is pre-order DFS,
-                # the first deeper line after i is always a direct child;
-                # subsequent deeper lines may be descendants, not siblings.
-                pass
-            # Immediate children have depth strictly greater than d AND the
-            # path from i to j never dips back to d. Since the tree is
-            # pre-order, we just track: immediate child when depth == d+k
-            # where k is the fixed indent-per-level increment.
-            j += 1
-        # Simpler self calc: self = count of this frame minus sum of its
-        # immediate children's counts. Immediate children are lines with
-        # depth of the *first* descendant.
         if i + 1 >= len(lines) or lines[i + 1][0] <= d:
             # No descendants → all of `c` is self time.
             self_time[n] += c

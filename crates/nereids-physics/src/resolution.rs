@@ -995,8 +995,9 @@ impl TabulatedResolution {
     ///
     /// Math is identical to the previous binary-search implementation —
     /// same formula, same order of floating-point operations — so output
-    /// is bit-exact with the reference implementation pinned by
-    /// `test_broaden_presorted_bit_exact_vs_reference`.
+    /// is bit-exact with the reference implementation pinned by the
+    /// shared `broaden_presorted_reference` harness in the test module
+    /// (see the `test_broaden_presorted_bit_exact_*` suite).
     pub(crate) fn broaden_presorted(&self, energies: &[f64], spectrum: &[f64]) -> Vec<f64> {
         let n = energies.len();
         if n == 0 {
@@ -1056,15 +1057,27 @@ impl TabulatedResolution {
                     continue;
                 }
 
-                // Walk bracket_hi DOWN while energies[bracket_hi - 1] >= e_prime.
+                // Walk bracket_hi DOWN with upper-bound semantics: stop as
+                // soon as `energies[bracket_hi - 1] <= e_prime`.  The strict
+                // `>` (not `>=`) condition matches the reference
+                // `interp_spectrum` binary search, where `energies[mid] <= e`
+                // advances `lo`, so an exact match lands with `lo == k`,
+                // `hi == k + 1`, `frac == 0`.  Using `>=` here would leave
+                // `bracket_hi == k`, yielding `frac == 1` and computing
+                // `spectrum[k-1] + (spectrum[k] - spectrum[k-1])`, which is
+                // numerically equal to `spectrum[k]` but not bit-exact due
+                // to IEEE 754 rounding when `a + (b - a)` differs from `b`
+                // by ≤1 ULP.
                 // Guard on bracket_hi >= 1 so we never underflow to 0.
-                while bracket_hi > 1 && energies[bracket_hi - 1] >= e_prime {
+                while bracket_hi > 1 && energies[bracket_hi - 1] > e_prime {
                     bracket_hi -= 1;
                 }
                 // Walk UP if we overshot (can happen on the first iteration
                 // when e_prime starts near e_max; also a safety net for
                 // pathological kernels whose monotonicity is violated).
-                while bracket_hi < n - 1 && energies[bracket_hi] < e_prime {
+                // Use `<=` (strict inequality for advancement) so exact
+                // matches don't over-advance past the reference's bracket.
+                while bracket_hi < n - 1 && energies[bracket_hi] <= e_prime {
                     bracket_hi += 1;
                 }
 
@@ -1750,8 +1763,8 @@ mod tests {
 
     #[test]
     fn test_broaden_presorted_bit_exact_short_grid() {
-        // Edge case: 2-point grid.  Tests the n=1 pass-through guard and
-        // bracket_hi bounds.
+        // Edge case: 2-point grid.  Exercises the smallest grid that has
+        // a valid (lo, hi) bracket — tests bracket_hi bounds handling.
         let tab = synthetic_tab_resolution();
         let energies = vec![10.0, 12.0];
         let spectrum = vec![0.5, 0.8];
@@ -1759,6 +1772,48 @@ mod tests {
         let reference = broaden_presorted_reference(&tab, &energies, &spectrum);
         let actual = tab.broaden_presorted(&energies, &spectrum);
         assert_bit_exact(&reference, &actual, "short_grid");
+    }
+
+    #[test]
+    fn test_broaden_presorted_bit_exact_single_point_grid() {
+        // Edge case: 1-point grid.  Exercises the n == 1 early-return
+        // pass-through guard that the optimized path adds (no bracket
+        // available for interpolation).
+        let tab = synthetic_tab_resolution();
+        let energies = vec![10.0];
+        let spectrum = vec![0.5];
+
+        let reference = broaden_presorted_reference(&tab, &energies, &spectrum);
+        let actual = tab.broaden_presorted(&energies, &spectrum);
+        assert_bit_exact(&reference, &actual, "single_point_grid");
+    }
+
+    #[test]
+    fn test_broaden_presorted_bit_exact_exact_equality_target() {
+        // Regression: exercise the tie-break case where `e_prime` lands
+        // exactly on a grid point.  The kernel has a point at dt=0, so
+        // `e_prime == energies[i]` exactly at the center kernel offset
+        // for every target `i`.  The optimized path must match the
+        // reference's upper-bound binary-search semantics bit-exactly.
+        let tab = synthetic_tab_resolution();
+        // Irregular-spacing grid so the spectrum interp at the equality
+        // point isn't trivially reducible to the input value.
+        let mut energies: Vec<f64> = Vec::new();
+        let mut e = 3.0f64;
+        for k in 0..800 {
+            energies.push(e);
+            e += 0.05 + 0.01 * (k as f64).sin();
+        }
+        // Spectrum with large local gradient so `a + (b - a)` vs `b`
+        // would diverge at 1 ULP if the tie-break were wrong.
+        let spectrum: Vec<f64> = energies
+            .iter()
+            .map(|&e| 1.0e10 * (-(((e - 6.0) / 0.2).powi(2))).exp() + 1.0e-10 * e)
+            .collect();
+
+        let reference = broaden_presorted_reference(&tab, &energies, &spectrum);
+        let actual = tab.broaden_presorted(&energies, &spectrum);
+        assert_bit_exact(&reference, &actual, "exact_equality_target");
     }
 
     #[test]
@@ -1785,24 +1840,32 @@ mod tests {
         assert_bit_exact(&reference, &actual, "random_spectrum");
     }
 
+    /// Real PLEIADES bl10 resolution file + real Hf-like resonance
+    /// spectrum on the full VENUS analysis grid.  This is the closest
+    /// regression of the production A.1 / B.2 workload.
+    ///
+    /// Marked `#[ignore]` because `_fts_bl10_0p5meV_1keV_25pts.txt` is
+    /// gitignored at the repo root per the "not approved for public
+    /// release" policy (.gitignore line 48).  Run locally with:
+    ///
+    /// ```text
+    /// cargo test -p nereids-physics \
+    ///   test_broaden_presorted_bit_exact_on_pleiades_resolution \
+    ///   -- --ignored --nocapture
+    /// ```
     #[test]
+    #[ignore = "requires PLEIADES resolution file `_fts_bl10_0p5meV_1keV_25pts.txt` at repo root (gitignored by policy)"]
     fn test_broaden_presorted_bit_exact_on_pleiades_resolution() {
-        // Real PLEIADES bl10 resolution file + real Hf-like resonance
-        // spectrum on the full VENUS analysis grid.  This is the closest
-        // regression of the production A.1 / B.2 workload.
-        //
-        // Skips if the file is not available in the repo root.
         let res_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
             .parent()
             .unwrap()
             .join("_fts_bl10_0p5meV_1keV_25pts.txt");
-        if !res_path.exists() {
-            println!("skip: {res_path:?} not found (PLEIADES resolution file)");
-            return;
-        }
-        let text = std::fs::read_to_string(&res_path).unwrap();
+        let text = std::fs::read_to_string(&res_path).expect(
+            "missing PLEIADES resolution file `_fts_bl10_0p5meV_1keV_25pts.txt` at the repo root \
+             (the file is gitignored per policy; place it locally before running this test)",
+        );
         let tab = TabulatedResolution::from_text(&text, 25.0).unwrap();
 
         // Production-like grid: uniform 7..200 eV with ~3500 bins
@@ -1834,7 +1897,7 @@ mod tests {
     ///   test_broaden_presorted_bench -- --ignored --nocapture
     /// ```
     #[test]
-    #[ignore]
+    #[ignore = "microbenchmark; requires PLEIADES resolution file `_fts_bl10_0p5meV_1keV_25pts.txt` at repo root"]
     fn test_broaden_presorted_bench() {
         let res_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -1842,11 +1905,9 @@ mod tests {
             .parent()
             .unwrap()
             .join("_fts_bl10_0p5meV_1keV_25pts.txt");
-        if !res_path.exists() {
-            println!("skip: {res_path:?} not found");
-            return;
-        }
-        let text = std::fs::read_to_string(&res_path).unwrap();
+        let text = std::fs::read_to_string(&res_path).expect(
+            "missing PLEIADES resolution file at repo root (see `#[ignore]` message for details)",
+        );
         let tab = TabulatedResolution::from_text(&text, 25.0).unwrap();
 
         let n = 3471;
