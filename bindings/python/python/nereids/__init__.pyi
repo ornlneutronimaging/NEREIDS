@@ -539,11 +539,26 @@ def probe_nexus(path: str) -> NexusMetadata:
     """Probe a NeXus/HDF5 file for available data without loading it."""
     ...
 
-def load_nexus_histogram(path: str) -> NexusData:
+def load_nexus_histogram(
+    path: str,
+    multi_angle_mode: str = "error",
+    angle_index: int = 0,
+) -> NexusData:
     """Load pre-histogrammed counts from a NeXus/HDF5 file.
 
-    Reads ``/entry/histogram/counts``, sums over rotation angles,
-    and returns a ``NexusData`` with shape ``(n_tof, height, width)``.
+    Reads ``/entry/histogram/counts`` (4D: ``rot × y × x × tof``) and
+    returns a ``NexusData`` with shape ``(n_tof, height, width)``.
+
+    **Issue #430**: by default this function refuses multi-angle files
+    (``n_rot > 1``).  Silently summing over rotation angles at load
+    time destroys projection-resolved information; callers must
+    choose explicitly via ``multi_angle_mode``:
+
+    - ``"error"`` (default): reject multi-angle files with a clear
+      ``ValueError``.
+    - ``"sum"``: sum over all rotation angles into a single
+      ``(tof, y, x)`` volume (legacy behaviour, now opt-in).
+    - ``"select"``: extract a single projection at ``angle_index``.
     """
     ...
 

@@ -1027,6 +1027,29 @@ def _create_synthetic_nexus_histogram(path, n_tof=10, height=4, width=4):
         entry.attrs["flight_path_m"] = 25.0
 
 
+def _create_synthetic_nexus_histogram_multi_angle(
+    path, n_rot=3, n_tof=10, height=4, width=4, seed=42
+):
+    """Create a NeXus histogram file with more than one rotation angle.
+
+    Used to exercise issue #430: the default loader must refuse these
+    files, and explicit multi-angle policies (``sum`` / ``select``)
+    must produce predictable output.
+    """
+    import h5py
+
+    with h5py.File(path, "w") as f:
+        entry = f.create_group("entry")
+        hist = entry.create_group("histogram")
+        counts = np.random.default_rng(seed).integers(
+            0, 100, size=(n_rot, height, width, n_tof), dtype=np.uint64
+        )
+        hist.create_dataset("counts", data=counts)
+        tof_ns = np.linspace(1e4, 5e4, n_tof + 1)
+        hist.create_dataset("time_of_flight", data=tof_ns)
+        entry.attrs["flight_path_m"] = 25.0
+
+
 def _create_synthetic_nexus_events(path, n_events=1000, height=4, width=4):
     """Create a minimal VENUS-schema NeXus file with event data."""
     import h5py
@@ -1111,6 +1134,61 @@ class TestNexusIO:
     def test_probe_nexus_bad_path(self):
         with pytest.raises(IOError):
             nereids.probe_nexus("/nonexistent/file.h5")
+
+    def test_load_nexus_histogram_rejects_multi_angle_by_default(self, tmp_path):
+        """Issue #430: default `load_nexus_histogram(path)` must refuse
+        multi-angle files — silent sum-over-angles is a data-loss bug
+        the loader used to hide."""
+        path = str(tmp_path / "multi_angle.h5")
+        _create_synthetic_nexus_histogram_multi_angle(path, n_rot=3)
+        with pytest.raises(ValueError, match="3 rotation angles"):
+            nereids.load_nexus_histogram(path)
+
+    def test_load_nexus_histogram_multi_angle_sum_mode(self, tmp_path):
+        """Issue #430: opt-in `multi_angle_mode='sum'` recovers the
+        legacy auto-sum behaviour."""
+        path = str(tmp_path / "multi_angle_sum.h5")
+        _create_synthetic_nexus_histogram_multi_angle(
+            path, n_rot=3, n_tof=5, height=2, width=2
+        )
+        data = nereids.load_nexus_histogram(path, multi_angle_mode="sum")
+        # Summed into single volume, per-angle info is lost.
+        assert data.counts.shape == (5, 2, 2)
+        assert data.n_rotation_angles == 3
+        # Sum across angles must not exceed 3 × max(single-angle) = 3 × 99.
+        assert np.all(data.counts <= 3 * 99)
+
+    def test_load_nexus_histogram_multi_angle_select_mode(self, tmp_path):
+        """Issue #430: `multi_angle_mode='select'` extracts a single
+        projection by `angle_index`."""
+        path = str(tmp_path / "multi_angle_select.h5")
+        _create_synthetic_nexus_histogram_multi_angle(
+            path, n_rot=3, n_tof=5, height=2, width=2
+        )
+        data0 = nereids.load_nexus_histogram(
+            path, multi_angle_mode="select", angle_index=0
+        )
+        data1 = nereids.load_nexus_histogram(
+            path, multi_angle_mode="select", angle_index=1
+        )
+        assert data0.counts.shape == (5, 2, 2)
+        assert data1.counts.shape == (5, 2, 2)
+        # Different angles yield different counts for random-seeded data.
+        assert not np.array_equal(data0.counts, data1.counts)
+
+        # Out-of-range angle index → ValueError
+        with pytest.raises(ValueError, match="SelectAngle.*out of range"):
+            nereids.load_nexus_histogram(
+                path, multi_angle_mode="select", angle_index=99
+            )
+
+    def test_load_nexus_histogram_unknown_mode_rejected(self, tmp_path):
+        """Invalid `multi_angle_mode` string must error with a clear
+        message listing the allowed values."""
+        path = str(tmp_path / "mode_str.h5")
+        _create_synthetic_nexus_histogram(path, n_tof=5, height=2, width=2)
+        with pytest.raises(ValueError, match="multi_angle_mode.*error.*sum.*select"):
+            nereids.load_nexus_histogram(path, multi_angle_mode="average")
 
     def test_nexus_histogram_to_fitting_workflow(self, tmp_path):
         """End-to-end: load histogram → normalize → fit."""

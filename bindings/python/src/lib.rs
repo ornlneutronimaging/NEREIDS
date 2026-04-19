@@ -2306,17 +2306,48 @@ fn probe_nexus(path: &str) -> PyResult<PyNexusMetadata> {
 
 /// Load pre-histogrammed counts from a NeXus/HDF5 file.
 ///
-/// Reads `/entry/histogram/counts` (4D: rotation × y × x × tof),
-/// sums over rotation angles, and transposes to (tof, y, x).
+/// Reads `/entry/histogram/counts` (4D: rotation × y × x × tof) and
+/// transposes the caller-selected single-angle slice to
+/// `(tof, y, x)`.
+///
+/// **Issue #430**: by default this function refuses multi-angle files
+/// (more than one rotation angle) because silently summing them
+/// destroys projection-resolved information on import.  Callers with
+/// a multi-angle file must choose a policy via `multi_angle_mode`.
 ///
 /// Args:
 ///     path: Path to the NeXus/HDF5 file.
+///     multi_angle_mode: one of:
+///         - ``"error"`` (default): reject multi-angle files with a clear error.
+///         - ``"sum"``: sum over all rotation angles into one volume
+///           (legacy behaviour, now opt-in).
+///         - ``"select"``: extract a single rotation angle by
+///           ``angle_index`` (default 0).
+///     angle_index: index of the rotation angle to extract when
+///         ``multi_angle_mode="select"``.  Ignored otherwise.
 ///
 /// Returns:
 ///     NexusData with counts, tof_edges_us, flight_path_m, dead_pixels.
 #[pyfunction]
-fn load_nexus_histogram(py: Python<'_>, path: &str) -> PyResult<PyNexusData> {
-    let data = nereids_io::nexus::load_nexus_histogram(std::path::Path::new(path))
+#[pyo3(signature = (path, multi_angle_mode="error", angle_index=0))]
+fn load_nexus_histogram(
+    py: Python<'_>,
+    path: &str,
+    multi_angle_mode: &str,
+    angle_index: usize,
+) -> PyResult<PyNexusData> {
+    use nereids_io::nexus::MultiAngleMode;
+    let mode = match multi_angle_mode {
+        "error" => MultiAngleMode::Error,
+        "sum" => MultiAngleMode::Sum,
+        "select" => MultiAngleMode::SelectAngle(angle_index),
+        other => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "multi_angle_mode must be 'error', 'sum', or 'select', got {other:?}"
+            )));
+        }
+    };
+    let data = nereids_io::nexus::load_nexus_histogram_with_mode(std::path::Path::new(path), mode)
         .map_err(map_io_error)?;
     Ok(nexus_data_to_py(py, data))
 }
