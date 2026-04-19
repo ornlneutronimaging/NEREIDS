@@ -233,6 +233,41 @@ pub fn load_nexus_histogram_with_mode(
         )));
     }
 
+    // Validate the rotation-angle policy BEFORE reading the full 4D
+    // counts dataset (Codex review on PR-B): the check is purely
+    // metadata-driven and the rejection paths should be cheap.  Reading
+    // the full u64 cube just to error out is wasteful on production
+    // multi-angle NeXus files (easily multi-GB), and historically
+    // caused OOM-before-error on the default "refuse" code path.
+    let n_rot = shape[0];
+    if n_rot == 0 {
+        // Degenerate file with a zero-sized rotation-angle axis.
+        // Reject rather than produce an all-zero output (which would
+        // look like a valid-but-empty measurement).
+        return Err(IoError::InvalidParameter(
+            "NeXus histogram has zero rotation angles; /entry/histogram/counts axis 0 must \
+             be >= 1"
+                .into(),
+        ));
+    }
+    match mode {
+        MultiAngleMode::Error if n_rot > 1 => {
+            return Err(IoError::InvalidParameter(format!(
+                "NeXus histogram has {n_rot} rotation angles — refusing to silently \
+                 combine them (issue #430).  Call load_nexus_histogram_with_mode with \
+                 MultiAngleMode::Sum to preserve the legacy sum-over-angles behaviour, \
+                 or MultiAngleMode::SelectAngle(i) to extract a single projection."
+            )));
+        }
+        MultiAngleMode::SelectAngle(idx) if idx >= n_rot => {
+            return Err(IoError::InvalidParameter(format!(
+                "MultiAngleMode::SelectAngle({idx}) out of range: file has {n_rot} \
+                 rotation angle(s), valid indices are 0..{n_rot}"
+            )));
+        }
+        _ => {}
+    }
+
     let counts_u64: ndarray::Array4<u64> = counts_ds
         .read()
         .map_err(|e| IoError::InvalidParameter(format!("Failed to read histogram counts: {e}")))?;
@@ -240,29 +275,11 @@ pub fn load_nexus_histogram_with_mode(
     // Collapse the rotation-angle axis according to the caller's policy
     // (issue #430).  For single-angle files all three modes are
     // equivalent — they just take the only slice that exists.
-    let n_rot = shape[0];
+    // (Validation above already ruled out every rejection case, so
+    // `Error` here is guaranteed to have n_rot == 1.)
     let combined_yxtof = match mode {
-        MultiAngleMode::Error => {
-            if n_rot > 1 {
-                return Err(IoError::InvalidParameter(format!(
-                    "NeXus histogram has {n_rot} rotation angles — refusing to silently \
-                     combine them (issue #430).  Call load_nexus_histogram_with_mode with \
-                     MultiAngleMode::Sum to preserve the legacy sum-over-angles behaviour, \
-                     or MultiAngleMode::SelectAngle(i) to extract a single projection."
-                )));
-            }
-            counts_u64.sum_axis(ndarray::Axis(0))
-        }
-        MultiAngleMode::Sum => counts_u64.sum_axis(ndarray::Axis(0)),
-        MultiAngleMode::SelectAngle(idx) => {
-            if idx >= n_rot {
-                return Err(IoError::InvalidParameter(format!(
-                    "MultiAngleMode::SelectAngle({idx}) out of range: file has {n_rot} \
-                     rotation angle(s), valid indices are 0..{n_rot}"
-                )));
-            }
-            counts_u64.index_axis(ndarray::Axis(0), idx).to_owned()
-        }
+        MultiAngleMode::Error | MultiAngleMode::Sum => counts_u64.sum_axis(ndarray::Axis(0)),
+        MultiAngleMode::SelectAngle(idx) => counts_u64.index_axis(ndarray::Axis(0), idx).to_owned(),
     };
 
     // Convert to f64 and transpose [y, x, tof] → NEREIDS convention [tof, y, x]
@@ -783,19 +800,81 @@ mod tests {
     }
 
     /// `MultiAngleMode::Error` on a single-angle file is a no-op:
-    /// `n_rot == 1` is the trivial non-collapsing case.
+    /// `n_rot == 1` is the trivial non-collapsing case.  All three
+    /// modes must produce identical output here.
     #[test]
-    fn test_load_nexus_histogram_error_mode_allows_single_angle() {
+    fn test_load_nexus_histogram_single_angle_mode_parity() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("single_error.h5");
+        let path = dir.path().join("single_parity.h5");
         let counts = vec![7u64; 2 * 3 * 2];
         let tof_ns = vec![1000.0, 2000.0, 3000.0];
         create_test_histogram(&path, &counts, [1, 2, 3, 2], &tof_ns, None);
 
-        let data = load_nexus_histogram_with_mode(&path, MultiAngleMode::Error).unwrap();
-        assert_eq!(data.n_rotation_angles, 1);
-        // Value preserved (not doubled or summed — single angle)
-        assert_eq!(data.counts[[0, 0, 0]], 7.0);
+        let d_err = load_nexus_histogram_with_mode(&path, MultiAngleMode::Error).unwrap();
+        let d_sum = load_nexus_histogram_with_mode(&path, MultiAngleMode::Sum).unwrap();
+        let d_sel = load_nexus_histogram_with_mode(&path, MultiAngleMode::SelectAngle(0)).unwrap();
+        // All three modes produce the same output on a single-angle file.
+        assert_eq!(d_err.counts, d_sum.counts);
+        assert_eq!(d_err.counts, d_sel.counts);
+        // Value preserved (not doubled — single angle).
+        assert_eq!(d_err.counts[[0, 0, 0]], 7.0);
+        assert_eq!(d_err.n_rotation_angles, 1);
+    }
+
+    /// A zero-angle file (degenerate, `shape[0] == 0`) must be
+    /// rejected on every mode — otherwise `Sum` would produce an
+    /// all-zero output indistinguishable from a valid but dark
+    /// measurement, and `Error` would silently accept the degenerate
+    /// file.
+    #[test]
+    fn test_load_nexus_histogram_zero_angles_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zero_angles.h5");
+        let counts: Vec<u64> = Vec::new();
+        let tof_ns = vec![1000.0, 2000.0, 3000.0];
+        create_test_histogram(&path, &counts, [0, 2, 3, 2], &tof_ns, None);
+
+        for mode in [
+            MultiAngleMode::Error,
+            MultiAngleMode::Sum,
+            MultiAngleMode::SelectAngle(0),
+        ] {
+            let err = load_nexus_histogram_with_mode(&path, mode).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("zero rotation angles"),
+                "mode {mode:?} zero-angle rejection should name the axis, got: {msg}"
+            );
+        }
+    }
+
+    /// Codex review: `MultiAngleMode::Error` must reject multi-angle
+    /// files BEFORE reading the full 4D counts dataset.  On a real
+    /// multi-angle file this dataset can be multi-GB; wasting a read
+    /// to then error out is prohibitive.  This test uses metadata
+    /// (shape is 4D, n_rot > 1) from a tiny synthetic fixture to
+    /// assert the error is returned — the underlying file is
+    /// small here, but the code-path assertion is that rejection
+    /// happens via the shape check alone.  (We can't assert "no
+    /// read happened" directly without hooking HDF5, but the
+    /// structural guarantee is preserved by the order of
+    /// statements in `load_nexus_histogram_with_mode`.)
+    #[test]
+    fn test_multi_angle_rejection_happens_before_counts_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big_shape.h5");
+        // Small synthetic file, but with shape[0]=4 so we exercise the
+        // rejection path.
+        let counts = vec![1u64; 4 * 2 * 3 * 2];
+        let tof_ns = vec![1000.0, 2000.0, 3000.0];
+        create_test_histogram(&path, &counts, [4, 2, 3, 2], &tof_ns, None);
+
+        let err = load_nexus_histogram_with_mode(&path, MultiAngleMode::Error).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("4 rotation angles") && msg.contains("#430"),
+            "error message should name angle count + reference the issue, got: {msg}"
+        );
     }
 
     #[test]
