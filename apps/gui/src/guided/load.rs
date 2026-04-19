@@ -407,7 +407,17 @@ fn hdf5_ob_picker(ui: &mut egui::Ui, state: &mut AppState) {
                 nereids_io::nexus::load_nexus_events(&path, &params)
                     .map(|d| (d.counts, d.tof_edges_us))
             } else {
-                nereids_io::nexus::load_nexus_histogram(&path).map(|d| (d.counts, d.tof_edges_us))
+                // Issue #430: the loader refuses multi-angle files by
+                // default to prevent silent sum-over-angles.  The GUI
+                // makes the explicit opt-in to preserve existing
+                // single-volume analysis behaviour, and surfaces the
+                // angle count in the status banner below so the user
+                // knows projections were combined.
+                nereids_io::nexus::load_nexus_histogram_with_mode(
+                    &path,
+                    nereids_io::nexus::MultiAngleMode::Sum,
+                )
+                .map(|d| (d.counts, d.tof_edges_us))
             };
             match ob_result {
                 Ok((ob_counts, ob_tof_edges)) => {
@@ -656,13 +666,23 @@ fn load_hdf5_histogram(state: &mut AppState) {
 
     state.invalidate_results();
 
-    match nereids_io::nexus::load_nexus_histogram(&path) {
+    // Issue #430: explicit opt-in to the legacy sum-over-angles
+    // behaviour on the sample-data load.  The status banner below
+    // tells the user how many angles were combined.
+    match nereids_io::nexus::load_nexus_histogram_with_mode(
+        &path,
+        nereids_io::nexus::MultiAngleMode::Sum,
+    ) {
         Ok(data) => {
             let shape = data.counts.shape();
             state.preview_image = Some(data.counts.sum_axis(ndarray::Axis(0)));
             // D-5: Report rotation angle count when angles were collapsed.
             let angle_note = if data.n_rotation_angles > 1 {
-                format!(" ({} rotation angles summed)", data.n_rotation_angles)
+                format!(
+                    " ({} rotation angles summed — multi-angle analysis not yet supported, \
+                     see #430)",
+                    data.n_rotation_angles
+                )
             } else {
                 String::new()
             };
