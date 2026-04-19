@@ -982,11 +982,34 @@ impl TabulatedResolution {
 
     /// Tabulated resolution broadening assuming the energy grid is already
     /// validated (sorted ascending, same length as spectrum).
+    ///
+    /// ## Inner-loop optimization (perf work, 2026-04)
+    ///
+    /// The per-kernel-point spectrum interpolation uses a **two-pointer
+    /// walk** instead of a binary search: `e_prime` is monotonically
+    /// decreasing in `k` (since `dt = offsets[k]` is non-decreasing,
+    /// `TOF' = tof_center + dt` is non-decreasing, and `E' = (L/TOF')²`
+    /// is non-increasing).  We maintain `bracket_hi` as the smallest
+    /// index into `energies[]` whose value is `>= e_prime`, and walk it
+    /// downward as `k` advances.  Amortized O(1) per kernel point.
+    ///
+    /// Math is identical to the previous binary-search implementation —
+    /// same formula, same order of floating-point operations — so output
+    /// is bit-exact with the reference implementation pinned by the
+    /// shared `broaden_presorted_reference` harness in the test module
+    /// (see the `test_broaden_presorted_bit_exact_*` suite).
     pub(crate) fn broaden_presorted(&self, energies: &[f64], spectrum: &[f64]) -> Vec<f64> {
         let n = energies.len();
         if n == 0 {
             return vec![];
         }
+        if n == 1 {
+            // No bracket available; pass through.
+            return spectrum.to_vec();
+        }
+
+        let e_min = energies[0];
+        let e_max = energies[n - 1];
 
         let mut result = vec![0.0f64; n];
 
@@ -1002,13 +1025,18 @@ impl TabulatedResolution {
 
             // Compute interpolated kernel on the fly to avoid O(N * kernel_len) memory
             let (offsets, weights) = self.interpolated_kernel(e);
+            let n_k = offsets.len();
 
-            // Convolve: for each kernel point, find the energy corresponding to
-            // tof_center + dt_offset, then interpolate spectrum at that energy.
+            // Two-pointer walk: bracket_hi is the smallest j s.t. energies[j] >= e_prime.
+            // e_prime decreases monotonically with k (kernel offsets are non-decreasing
+            // in TOF); bracket_hi therefore only moves downward.  Seed at the top and
+            // let the first `k` walk it down to the right starting bracket.
+            let mut bracket_hi: usize = n - 1;
+
             let mut sum = 0.0;
             let mut norm = 0.0;
 
-            for k in 0..offsets.len() {
+            for k in 0..n_k {
                 let dt = offsets[k];
                 let w = weights[k];
                 if w <= 0.0 {
@@ -1023,18 +1051,54 @@ impl TabulatedResolution {
                 // Convert TOF to energy: E' = (TOF_FACTOR * L / t')^2
                 let e_prime = (TOF_FACTOR * self.flight_path_m / tof_prime).powi(2);
 
-                // Interpolate spectrum at e_prime; skip if outside the grid
-                let s = match interp_spectrum(energies, spectrum, e_prime) {
-                    Some(v) => v,
-                    None => continue,
+                // Skip if e_prime is outside the grid (matches interp_spectrum's
+                // `None` return on out-of-range).
+                if e_prime < e_min || e_prime > e_max {
+                    continue;
+                }
+
+                // Walk bracket_hi DOWN with upper-bound semantics: stop as
+                // soon as `energies[bracket_hi - 1] <= e_prime`.  The strict
+                // `>` (not `>=`) condition matches the reference
+                // `interp_spectrum` binary search, where `energies[mid] <= e`
+                // advances `lo`, so an exact match lands with `lo == k`,
+                // `hi == k + 1`, `frac == 0`.  Using `>=` here would leave
+                // `bracket_hi == k`, yielding `frac == 1` and computing
+                // `spectrum[k-1] + (spectrum[k] - spectrum[k-1])`, which is
+                // numerically equal to `spectrum[k]` but not bit-exact due
+                // to IEEE 754 rounding when `a + (b - a)` differs from `b`
+                // by ≤1 ULP.
+                // Guard on bracket_hi >= 1 so we never underflow to 0.
+                while bracket_hi > 1 && energies[bracket_hi - 1] > e_prime {
+                    bracket_hi -= 1;
+                }
+                // Walk UP if we overshot (can happen on the first iteration
+                // when e_prime starts near e_max; also a safety net for
+                // pathological kernels whose monotonicity is violated).
+                // Use `<=` (strict inequality for advancement) so exact
+                // matches don't over-advance past the reference's bracket.
+                while bracket_hi < n - 1 && energies[bracket_hi] <= e_prime {
+                    bracket_hi += 1;
+                }
+
+                let lo = bracket_hi - 1;
+                let hi = bracket_hi;
+                let span = energies[hi] - energies[lo];
+                // Match interp_spectrum's NEAR_ZERO_FLOOR guard: return
+                // spectrum[lo] directly when the bracket span is degenerate.
+                let s = if span.abs() < NEAR_ZERO_FLOOR {
+                    spectrum[lo]
+                } else {
+                    let frac = (e_prime - energies[lo]) / span;
+                    spectrum[lo] + frac * (spectrum[hi] - spectrum[lo])
                 };
 
                 // Trapezoidal weight for the TOF integral
-                let dt_width = if k > 0 && k < offsets.len() - 1 {
+                let dt_width = if k > 0 && k < n_k - 1 {
                     (offsets[k + 1] - offsets[k - 1]) * 0.5
-                } else if k == 0 && offsets.len() > 1 {
+                } else if k == 0 && n_k > 1 {
                     offsets[1] - offsets[0]
-                } else if k == offsets.len() - 1 && offsets.len() > 1 {
+                } else if k == n_k - 1 && n_k > 1 {
                     offsets[k] - offsets[k - 1]
                 } else {
                     1.0
@@ -1114,42 +1178,6 @@ impl TabulatedResolution {
             }
         }
     }
-}
-
-/// Linear interpolation of spectrum at an arbitrary energy.
-///
-/// Returns `None` if `e` is outside the grid range, so callers can
-/// exclude off-grid kernel samples instead of clamping to boundary values.
-fn interp_spectrum(energies: &[f64], spectrum: &[f64], e: f64) -> Option<f64> {
-    let n = energies.len();
-    if n == 0 {
-        return None;
-    }
-    if e < energies[0] || e > energies[n - 1] {
-        return None;
-    }
-
-    // Binary search for bracketing index
-    let mut lo = 0;
-    let mut hi = n - 1;
-    while hi - lo > 1 {
-        let mid = (lo + hi) / 2;
-        if energies[mid] <= e {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-
-    // Guard: if energies[hi] == energies[lo] (duplicate grid points or
-    // single-point grid where lo==hi), the denominator is zero.  Return the
-    // value at the lower bracket to avoid NaN.
-    let span = energies[hi] - energies[lo];
-    if span.abs() < NEAR_ZERO_FLOOR {
-        return Some(spectrum[lo]);
-    }
-    let frac = (e - energies[lo]) / span;
-    Some(spectrum[lo] + frac * (spectrum[hi] - spectrum[lo]))
 }
 
 /// Apply resolution broadening using either Gaussian or tabulated kernel.
@@ -1535,5 +1563,390 @@ mod tests {
         let p = ResolutionParams::new(25.0, 1.0, 0.01, 0.0).unwrap();
         assert!((p.delta_e_us() - 0.0).abs() < 1e-15);
         assert!(!p.has_exponential_tail());
+    }
+
+    // ─── broaden_presorted bit-exact equivalence harness ─────────────────────
+    //
+    // The optimized broaden_presorted uses a two-pointer walk instead of
+    // binary search inside the inner convolution loop.  These tests pin
+    // the math: the same formula, in the same order, must yield bit-exact
+    // output against a canonical reference implementation that preserves
+    // the pre-optimization code path.
+
+    /// Binary-search spectrum interpolation.  Preserved here because the
+    /// reference broaden_presorted uses it; the production inner loop now
+    /// uses a two-pointer walk and no longer needs this helper.
+    fn interp_spectrum(energies: &[f64], spectrum: &[f64], e: f64) -> Option<f64> {
+        let n = energies.len();
+        if n == 0 {
+            return None;
+        }
+        if e < energies[0] || e > energies[n - 1] {
+            return None;
+        }
+        let mut lo = 0;
+        let mut hi = n - 1;
+        while hi - lo > 1 {
+            let mid = (lo + hi) / 2;
+            if energies[mid] <= e {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let span = energies[hi] - energies[lo];
+        if span.abs() < NEAR_ZERO_FLOOR {
+            return Some(spectrum[lo]);
+        }
+        let frac = (e - energies[lo]) / span;
+        Some(spectrum[lo] + frac * (spectrum[hi] - spectrum[lo]))
+    }
+
+    /// Reference implementation — the pre-optimization broaden_presorted.
+    /// Kept in the test module only; used solely as the equivalence oracle.
+    fn broaden_presorted_reference(
+        tab: &TabulatedResolution,
+        energies: &[f64],
+        spectrum: &[f64],
+    ) -> Vec<f64> {
+        let n = energies.len();
+        if n == 0 {
+            return vec![];
+        }
+
+        let mut result = vec![0.0f64; n];
+
+        for i in 0..n {
+            let e = energies[i];
+            if e <= 0.0 {
+                result[i] = spectrum[i];
+                continue;
+            }
+
+            let tof_center = TOF_FACTOR * tab.flight_path_m / e.sqrt();
+            let (offsets, weights) = tab.interpolated_kernel(e);
+
+            let mut sum = 0.0;
+            let mut norm = 0.0;
+
+            for k in 0..offsets.len() {
+                let dt = offsets[k];
+                let w = weights[k];
+                if w <= 0.0 {
+                    continue;
+                }
+
+                let tof_prime = tof_center + dt;
+                if tof_prime <= 0.0 {
+                    continue;
+                }
+
+                let e_prime = (TOF_FACTOR * tab.flight_path_m / tof_prime).powi(2);
+
+                let s = match interp_spectrum(energies, spectrum, e_prime) {
+                    Some(v) => v,
+                    None => continue,
+                };
+
+                let dt_width = if k > 0 && k < offsets.len() - 1 {
+                    (offsets[k + 1] - offsets[k - 1]) * 0.5
+                } else if k == 0 && offsets.len() > 1 {
+                    offsets[1] - offsets[0]
+                } else if k == offsets.len() - 1 && offsets.len() > 1 {
+                    offsets[k] - offsets[k - 1]
+                } else {
+                    1.0
+                };
+
+                let weight = w * dt_width.abs();
+                sum += weight * s;
+                norm += weight;
+            }
+
+            result[i] = if norm > DIVISION_FLOOR {
+                sum / norm
+            } else {
+                spectrum[i]
+            };
+        }
+
+        result
+    }
+
+    /// Synthetic TabulatedResolution with 3 reference energies and a
+    /// triangular kernel of varying widths.  Deterministic, no I/O.
+    fn synthetic_tab_resolution() -> TabulatedResolution {
+        fn triangle(width_us: f64, n: usize) -> (Vec<f64>, Vec<f64>) {
+            let half = width_us;
+            let dt_step = 2.0 * half / (n - 1) as f64;
+            let offsets: Vec<f64> = (0..n).map(|i| -half + i as f64 * dt_step).collect();
+            let weights: Vec<f64> = offsets
+                .iter()
+                .map(|&dt| (1.0 - dt.abs() / half).max(0.0))
+                .collect();
+            (offsets, weights)
+        }
+        TabulatedResolution {
+            ref_energies: vec![5.0, 50.0, 500.0],
+            kernels: vec![triangle(0.5, 31), triangle(1.0, 41), triangle(2.0, 51)],
+            flight_path_m: 25.0,
+        }
+    }
+
+    fn assert_bit_exact(reference: &[f64], actual: &[f64], label: &str) {
+        assert_eq!(reference.len(), actual.len(), "{label}: length mismatch");
+        for (i, (&a, &b)) in reference.iter().zip(actual.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "{label}: element {i} mismatch: reference={a:.17e} actual={b:.17e}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_broaden_presorted_bit_exact_synthetic_uniform() {
+        let tab = synthetic_tab_resolution();
+        // Uniform log-spaced grid typical of VENUS analysis.
+        let energies: Vec<f64> = (0..401).map(|i| 7.0 + i as f64 * 0.4825).collect();
+        // Triangular dip + smooth background (resonance-like spectrum).
+        let spectrum: Vec<f64> = energies
+            .iter()
+            .enumerate()
+            .map(|(i, &e)| 0.9 - 0.7 * (-((e - 50.0).powi(2) / 4.0)).exp() + 0.001 * (i as f64))
+            .collect();
+
+        let reference = broaden_presorted_reference(&tab, &energies, &spectrum);
+        let actual = tab.broaden_presorted(&energies, &spectrum);
+        assert_bit_exact(&reference, &actual, "synthetic_uniform");
+    }
+
+    #[test]
+    fn test_broaden_presorted_bit_exact_synthetic_nonuniform() {
+        let tab = synthetic_tab_resolution();
+        // Non-uniform: denser near 6.674 eV (resonance-like), sparser far away.
+        let energies: Vec<f64> = {
+            let mut e = Vec::new();
+            for i in 0..200 {
+                e.push(5.0 + (i as f64) * 0.05);
+            }
+            for i in 0..100 {
+                e.push(15.0 + (i as f64) * 0.5);
+            }
+            for i in 0..50 {
+                e.push(65.0 + (i as f64) * 2.0);
+            }
+            e
+        };
+        let spectrum: Vec<f64> = energies
+            .iter()
+            .map(|&e| 1.0 - 0.5 * (-((e - 6.674).powi(2) / 0.1)).exp())
+            .collect();
+
+        let reference = broaden_presorted_reference(&tab, &energies, &spectrum);
+        let actual = tab.broaden_presorted(&energies, &spectrum);
+        assert_bit_exact(&reference, &actual, "synthetic_nonuniform");
+    }
+
+    #[test]
+    fn test_broaden_presorted_bit_exact_constant_spectrum() {
+        // Constant spectrum must pass through unchanged (within trapezoid
+        // normalization) — preserves integral exactly.
+        let tab = synthetic_tab_resolution();
+        let energies: Vec<f64> = (0..501).map(|i| 1.0 + i as f64 * 0.5).collect();
+        let spectrum = vec![0.42f64; energies.len()];
+
+        let reference = broaden_presorted_reference(&tab, &energies, &spectrum);
+        let actual = tab.broaden_presorted(&energies, &spectrum);
+        assert_bit_exact(&reference, &actual, "constant_spectrum");
+    }
+
+    #[test]
+    fn test_broaden_presorted_bit_exact_short_grid() {
+        // Edge case: 2-point grid.  Exercises the smallest grid that has
+        // a valid (lo, hi) bracket — tests bracket_hi bounds handling.
+        let tab = synthetic_tab_resolution();
+        let energies = vec![10.0, 12.0];
+        let spectrum = vec![0.5, 0.8];
+
+        let reference = broaden_presorted_reference(&tab, &energies, &spectrum);
+        let actual = tab.broaden_presorted(&energies, &spectrum);
+        assert_bit_exact(&reference, &actual, "short_grid");
+    }
+
+    #[test]
+    fn test_broaden_presorted_bit_exact_single_point_grid() {
+        // Edge case: 1-point grid.  Exercises the n == 1 early-return
+        // pass-through guard that the optimized path adds (no bracket
+        // available for interpolation).
+        let tab = synthetic_tab_resolution();
+        let energies = vec![10.0];
+        let spectrum = vec![0.5];
+
+        let reference = broaden_presorted_reference(&tab, &energies, &spectrum);
+        let actual = tab.broaden_presorted(&energies, &spectrum);
+        assert_bit_exact(&reference, &actual, "single_point_grid");
+    }
+
+    #[test]
+    fn test_broaden_presorted_bit_exact_exact_equality_target() {
+        // Regression: exercise the tie-break case where `e_prime` lands
+        // exactly on a grid point.  The kernel has a point at dt=0, so
+        // `e_prime == energies[i]` exactly at the center kernel offset
+        // for every target `i`.  The optimized path must match the
+        // reference's upper-bound binary-search semantics bit-exactly.
+        let tab = synthetic_tab_resolution();
+        // Irregular-spacing grid so the spectrum interp at the equality
+        // point isn't trivially reducible to the input value.
+        let mut energies: Vec<f64> = Vec::new();
+        let mut e = 3.0f64;
+        for k in 0..800 {
+            energies.push(e);
+            e += 0.05 + 0.01 * (k as f64).sin();
+        }
+        // Spectrum with large local gradient so `a + (b - a)` vs `b`
+        // would diverge at 1 ULP if the tie-break were wrong.
+        let spectrum: Vec<f64> = energies
+            .iter()
+            .map(|&e| 1.0e10 * (-(((e - 6.0) / 0.2).powi(2))).exp() + 1.0e-10 * e)
+            .collect();
+
+        let reference = broaden_presorted_reference(&tab, &energies, &spectrum);
+        let actual = tab.broaden_presorted(&energies, &spectrum);
+        assert_bit_exact(&reference, &actual, "exact_equality_target");
+    }
+
+    #[test]
+    fn test_broaden_presorted_bit_exact_random_spectrum() {
+        // Random spectrum with varied magnitudes exercises the interpolation
+        // arithmetic across sign changes and scales.
+        let tab = synthetic_tab_resolution();
+        let energies: Vec<f64> = (0..1001).map(|i| 2.0 + i as f64 * 0.2).collect();
+        // Deterministic pseudo-random via a simple LCG (no external dep).
+        let mut state: u64 = 0xDEAD_BEEF_CAFE_BABE;
+        let spectrum: Vec<f64> = energies
+            .iter()
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let f = ((state >> 33) as f64) / (u32::MAX as f64);
+                f * 2.0 - 1.0
+            })
+            .collect();
+
+        let reference = broaden_presorted_reference(&tab, &energies, &spectrum);
+        let actual = tab.broaden_presorted(&energies, &spectrum);
+        assert_bit_exact(&reference, &actual, "random_spectrum");
+    }
+
+    /// Real PLEIADES bl10 resolution file + real Hf-like resonance
+    /// spectrum on the full VENUS analysis grid.  This is the closest
+    /// regression of the production A.1 / B.2 workload.
+    ///
+    /// Marked `#[ignore]` because `_fts_bl10_0p5meV_1keV_25pts.txt` is
+    /// gitignored at the repo root per the "not approved for public
+    /// release" policy (.gitignore line 48).  Run locally with:
+    ///
+    /// ```text
+    /// cargo test -p nereids-physics \
+    ///   test_broaden_presorted_bit_exact_on_pleiades_resolution \
+    ///   -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "requires PLEIADES resolution file `_fts_bl10_0p5meV_1keV_25pts.txt` at repo root (gitignored by policy)"]
+    fn test_broaden_presorted_bit_exact_on_pleiades_resolution() {
+        let res_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("_fts_bl10_0p5meV_1keV_25pts.txt");
+        let text = std::fs::read_to_string(&res_path).expect(
+            "missing PLEIADES resolution file `_fts_bl10_0p5meV_1keV_25pts.txt` at the repo root \
+             (the file is gitignored per policy; place it locally before running this test)",
+        );
+        let tab = TabulatedResolution::from_text(&text, 25.0).unwrap();
+
+        // Production-like grid: uniform 7..200 eV with ~3500 bins
+        let n = 3471;
+        let energies: Vec<f64> = (0..n)
+            .map(|i| 7.0 + i as f64 * ((200.0 - 7.0) / (n - 1) as f64))
+            .collect();
+        // Resonance-dip spectrum (toy model, exercises the math regardless
+        // of actual Hf σ, which is what we want for an interp test).
+        let spectrum: Vec<f64> = energies
+            .iter()
+            .map(|&e| {
+                1.0 - 0.8 * (-((e - 7.8).powi(2) / 0.01)).exp()
+                    - 0.5 * (-((e - 13.9).powi(2) / 0.04)).exp()
+                    - 0.6 * (-((e - 22.4).powi(2) / 0.1)).exp()
+            })
+            .collect();
+
+        let reference = broaden_presorted_reference(&tab, &energies, &spectrum);
+        let actual = tab.broaden_presorted(&energies, &spectrum);
+        assert_bit_exact(&reference, &actual, "pleiades_real_resolution");
+    }
+
+    /// Microbenchmark: two-pointer broaden_presorted vs binary-search
+    /// reference.  Run with:
+    ///
+    /// ```text
+    /// cargo test --release -p nereids-physics \
+    ///   test_broaden_presorted_bench -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "microbenchmark; requires PLEIADES resolution file `_fts_bl10_0p5meV_1keV_25pts.txt` at repo root"]
+    fn test_broaden_presorted_bench() {
+        let res_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("_fts_bl10_0p5meV_1keV_25pts.txt");
+        let text = std::fs::read_to_string(&res_path).expect(
+            "missing PLEIADES resolution file at repo root (see `#[ignore]` message for details)",
+        );
+        let tab = TabulatedResolution::from_text(&text, 25.0).unwrap();
+
+        let n = 3471;
+        let energies: Vec<f64> = (0..n)
+            .map(|i| 7.0 + i as f64 * ((200.0 - 7.0) / (n - 1) as f64))
+            .collect();
+        let spectrum: Vec<f64> = energies
+            .iter()
+            .map(|&e| {
+                1.0 - 0.8 * (-((e - 7.8).powi(2) / 0.01)).exp()
+                    - 0.6 * (-((e - 22.4).powi(2) / 0.1)).exp()
+            })
+            .collect();
+
+        let repeats = 30;
+
+        let start = std::time::Instant::now();
+        let mut sink_ref = 0.0f64;
+        for _ in 0..repeats {
+            let r = broaden_presorted_reference(&tab, &energies, &spectrum);
+            sink_ref += r.iter().sum::<f64>();
+        }
+        let t_ref = start.elapsed();
+
+        let start = std::time::Instant::now();
+        let mut sink_new = 0.0f64;
+        for _ in 0..repeats {
+            let r = tab.broaden_presorted(&energies, &spectrum);
+            sink_new += r.iter().sum::<f64>();
+        }
+        let t_new = start.elapsed();
+
+        let speedup = t_ref.as_secs_f64() / t_new.as_secs_f64();
+        println!(
+            "broaden_presorted microbench (n_grid={n}, repeats={repeats}, 499-pt kernel):\n\
+             reference (binary search): {t_ref:?}  (sink={sink_ref:.3})\n\
+             two-pointer walk         : {t_new:?}  (sink={sink_new:.3})\n\
+             speedup                  : {speedup:.2}x"
+        );
+        assert_eq!(sink_ref.to_bits(), sink_new.to_bits());
     }
 }
