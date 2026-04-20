@@ -1204,4 +1204,107 @@ class TestNexusIO:
         assert input_data is not None  # successfully created InputData
 
 
+# ---------------------------------------------------------------------------
+# Real VENUS regression gate (issue #465)
+# ---------------------------------------------------------------------------
+#
+# Guards against silent changes to the MLBW dispatch path.  The fit below
+# runs on a committed aggregated VENUS Hf 120 min spectrum + the committed
+# Hf-177 ENDF fixture (LRF=2, MLBW) with a Gaussian resolution derived from
+# the VENUS beamline parameters.  If any future change shifts a fit output
+# on this real-data workload, the assertion fails and the PR cannot land
+# without an explicit re-baseline + explanation.
+#
+# The fit deliberately uses a single MLBW isotope + no background so the
+# failure mode is physics-clean (bit-exact bracket of the MLBW evaluator)
+# rather than masked by incidental model complexity.  The expected values
+# are those produced by the fixed code path introduced in issue #465 — a
+# mismatch means either the MLBW evaluator drifted or the batch / per-point
+# paths disagreed again.
+
+
+class TestVenusMlbwRegression:
+    """Real-data regression for the issue #465 MLBW correctness fix.
+
+    Uses the committed aggregated VENUS Hf 120 min spectrum and the
+    committed Hf-177 ENDF file to lock a single LM fit's outputs
+    bit-exactly.  Any change to cross-section evaluation that shifts a
+    real-world fit result fails this test.
+    """
+
+    @pytest.fixture
+    def venus_data(self):
+        """Aggregated VENUS Hf 120 min spectrum + Hf-177 MLBW isotope.
+
+        Skips if the committed fixtures are not present (they are
+        checked into ``tests/data/`` — absence means a broken checkout).
+        """
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        fixture = os.path.join(root, "tests/data/venus/aggregated_hf_120min.npz")
+        endf = os.path.join(root, "tests/data/endf/Hf-177.endf")
+        if not os.path.exists(fixture) or not os.path.exists(endf):
+            pytest.skip(f"VENUS / Hf-177 fixtures missing: {fixture}, {endf}")
+        with np.load(fixture) as f:
+            E = np.ascontiguousarray(f["energies_ev"])
+            S_agg = np.ascontiguousarray(f["sample_counts"])
+            O_agg = np.ascontiguousarray(f["open_beam_counts"])
+            c = float(f["pc_ratio"])
+        hf177 = nereids.load_endf_file(endf)
+        return E, S_agg, O_agg, c, hf177
+
+    def test_mlbw_lm_fit_is_bit_exact(self, venus_data):
+        """LM fit on aggregated Hf-177 must produce bit-exact baseline values.
+
+        Regression gate for #465.  If this fails:
+          - The MLBW evaluator has been modified (intentional change → rebaseline).
+          - The batch / per-point dispatch has drifted (unintentional → bug).
+
+        Do not weaken the assertion to an `approx` tolerance without
+        investigating first — the whole point is that both code paths
+        share the same evaluator, so outputs are bit-exact by construction.
+        """
+        E, S_agg, O_agg, c, hf177 = venus_data
+
+        T_agg = S_agg / np.maximum(c * O_agg, 1.0)
+        sigT_agg = T_agg * np.sqrt(
+            1.0 / np.maximum(S_agg, 1.0) + 1.0 / np.maximum(O_agg, 1.0)
+        )
+
+        result = nereids.fit_spectrum_typed(
+            transmission=T_agg,
+            uncertainty=sigT_agg,
+            energies=E,
+            solver="lm",
+            temperature_k=293.6,
+            isotopes=[(hf177, 1.0e-5)],
+            max_iter=100,
+            background=False,
+            flight_path_m=25.0,
+            delta_t_us=0.5,
+            delta_l_m=0.005,
+        )
+
+        # Bit-exact baseline captured on main after the #465 fix.
+        # See `scripts/fixtures/extract_venus_aggregated.py` for fixture
+        # derivation. If these values need to change, document why in
+        # the commit message and ensure the shift is semantically motivated
+        # (not a floating-point drift from an unrelated optimisation).
+        EXPECTED_DENSITY = 0.00011222100300548643
+        EXPECTED_CHI2_R = 218950.98638784938
+        EXPECTED_ITERATIONS = 27
+        EXPECTED_CONVERGED = True
+
+        assert float(result.densities[0]) == EXPECTED_DENSITY, (
+            f"density drifted: got {float(result.densities[0])!r}, "
+            f"expected {EXPECTED_DENSITY!r}"
+        )
+        assert (
+            float(result.reduced_chi_squared) == EXPECTED_CHI2_R
+        ), f"chi2_r drifted: got {float(result.reduced_chi_squared)!r}, expected {EXPECTED_CHI2_R!r}"
+        assert (
+            int(result.iterations) == EXPECTED_ITERATIONS
+        ), f"iteration count drifted: got {int(result.iterations)}, expected {EXPECTED_ITERATIONS}"
+        assert (
+            bool(result.converged) == EXPECTED_CONVERGED
+        ), f"convergence flag drifted: got {bool(result.converged)}, expected {EXPECTED_CONVERGED}"
 
