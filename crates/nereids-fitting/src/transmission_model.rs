@@ -1123,6 +1123,44 @@ impl FitModel for EnergyScaleTransmissionModel {
         }
         let t_unresolved: Vec<f64> = neg_opt.iter().map(|&d| d.exp()).collect();
 
+        // Density-column plan cache: when the Jacobian has ≥ 2 density
+        // columns sharing the current (t0, l_scale) grid, build one
+        // broadening plan here and reuse it across every density-col
+        // `apply_resolution_with_plan`.  FD columns (t0, l_scale) go
+        // through `self.evaluate(p_plus/minus)` → `apply_resolution`
+        // unchanged — they each work at a DIFFERENT (t0, l_scale) so
+        // a single-grid plan would miss every time.
+        //
+        // Hit-rate analysis (see PR body):
+        //   - N_density = 1 (A.1 / B.1 / KL+grouped+TZERO): 1 hit, plan
+        //     build ≈ broaden cost → net-neutral.  Guard `>= 2` makes
+        //     this path a no-op: `density_plan` stays None, and
+        //     `apply_resolution_with_plan(None, …)` forwards to the
+        //     original `apply_resolution`, bit-exact.
+        //   - N_density = 6 (B.3, KL+per-iso+TZERO): 6 hits → ~45%
+        //     speedup on density-col broadening + ~30–40% wall on
+        //     the Jacobian call.
+        let n_density_cols = free_param_indices
+            .iter()
+            .filter(|&&fp_idx| fp_idx != self.t0_index && fp_idx != self.l_scale_index)
+            .count();
+        // Only tabulated resolution has a meaningful plan; Gaussian
+        // would burn an O(n) sorted-grid validation only to return
+        // `None`, so we short-circuit here and stay byte-identical to
+        // the pre-cache Gaussian hot path (Copilot #1).
+        let density_plan = if n_density_cols >= 2
+            && let Some(inst) = &self.instrument
+            && matches!(
+                inst.resolution,
+                nereids_physics::resolution::ResolutionFunction::Tabulated(_)
+            ) {
+            resolution::build_resolution_plan(&e_corr, &inst.resolution)
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+
         for (col, &fp_idx) in free_param_indices.iter().enumerate() {
             if fp_idx == self.t0_index || fp_idx == self.l_scale_index {
                 // Finite difference for energy-scale parameters
@@ -1156,17 +1194,24 @@ impl FitModel for EnergyScaleTransmissionModel {
                 let inner_deriv: Vec<f64> =
                     (0..n_e).map(|i| -sigma_sum[i] * t_unresolved[i]).collect();
 
-                // Apply resolution to derivative if enabled.  The
-                // non-plan path matches `evaluate_at` above; see its
-                // comment for why the (t0, l_scale)-keyed plan cache
-                // is not wired here.
+                // Apply resolution to derivative if enabled.
+                //
+                // When `density_plan` is Some (N_density ≥ 2) we
+                // hit the hoisted broadening plan built above.  When
+                // None (N_density ≤ 1 or Gaussian resolution),
+                // `apply_resolution_with_plan(None, …)` transparently
+                // forwards to `apply_resolution` — bit-exact with
+                // pre-cache main.
                 if let Some(inst) = &self.instrument {
-                    let resolved_deriv =
-                        match resolution::apply_resolution(&e_corr, &inner_deriv, &inst.resolution)
-                        {
-                            Ok(v) => v,
-                            Err(_) => return None,
-                        };
+                    let resolved_deriv = match resolution::apply_resolution_with_plan(
+                        density_plan.as_ref(),
+                        &e_corr,
+                        &inner_deriv,
+                        &inst.resolution,
+                    ) {
+                        Ok(v) => v,
+                        Err(_) => return None,
+                    };
                     for (i, &val) in resolved_deriv.iter().enumerate() {
                         *jacobian.get_mut(i, col) = val;
                     }

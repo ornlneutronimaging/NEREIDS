@@ -75,26 +75,34 @@ def main() -> None:
 
     Path("/tmp/b2_ready").write_text("ready\n")
 
+    # Post-PR #468 the 4x4 B.2 fit runs in ~0.2 s, which is shorter
+    # than the `/usr/bin/sample` startup handshake.  Repeat the fit
+    # enough times to cover a full 5–6 s sampling window so the
+    # profile isn't empty.  The per-run bit-exactness is preserved
+    # (same inputs every call).
+    N_REPEATS = 25
     t0 = time.time()
-    r = nereids.spatial_map_typed(
-        data=input_data,
-        energies=E_cal,
-        solver="kl",
-        c=c,
-        temperature_k=TEMP_K,
-        groups=[hf_group],
-        initial_densities=[INIT_DENSITY],
-        max_iter=MAX_ITER,
-        background=True,
-        resolution=res,
-        dead_pixels=dead_pixels,
-    )
+    for _ in range(N_REPEATS):
+        r = nereids.spatial_map_typed(
+            data=input_data,
+            energies=E_cal,
+            solver="kl",
+            c=c,
+            temperature_k=TEMP_K,
+            groups=[hf_group],
+            initial_densities=[INIT_DENSITY],
+            max_iter=MAX_ITER,
+            background=True,
+            resolution=res,
+            dead_pixels=dead_pixels,
+        )
     wall = time.time() - t0
     n_px = (CROP_Y1 - CROP_Y0) * (CROP_X1 - CROP_X0)
     conv = np.asarray(r.converged_map)
     dens = np.asarray(r.density_maps[0])
     print(
-        f"B.2 KL 4x4: wall={wall:.2f}s n_px={n_px} converged={int(conv.sum())}/{n_px} "
+        f"B.2 KL 4x4 (x{N_REPEATS}): wall={wall:.2f}s per-call={wall/N_REPEATS:.3f}s "
+        f"n_px={n_px} converged={int(conv.sum())}/{n_px} "
         f"median_density={np.nanmedian(dens):.4e}"
     )
 
