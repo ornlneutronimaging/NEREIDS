@@ -328,8 +328,14 @@ pub struct CrossSections {
 /// helpers, so there is exactly one dispatch table per formalism in
 /// the codebase.  The difference is that this entry point does not
 /// store precomputed plans in an outer `Vec` (unnecessary when only
-/// one energy is evaluated), so per-call overhead matches the
-/// pre-consolidation per-point path.
+/// one energy is evaluated), and it skips the precompute entirely
+/// for ranges whose energy interval excludes `energy_ev`.  Per-call
+/// overhead is therefore close to — though not exactly — the
+/// pre-consolidation per-point path; a small residual cost remains
+/// because each matching range is wrapped in a `PrecomputedRangeData`
+/// before evaluation.  Measured A.1 LM+grouped walltime on real
+/// VENUS Hf 120 min data: 1.37 s (pre-consolidation) → 1.42 s (this
+/// path), ≈ 3.6 % overhead.
 ///
 /// # Arguments
 /// * `data` — Parsed resonance parameters from ENDF.

@@ -5,7 +5,6 @@ so no network access or ENDF downloads are required.
 """
 
 import os
-import sys
 import tempfile
 
 import numpy as np
@@ -1237,14 +1236,22 @@ class TestVenusMlbwRegression:
     def venus_data(self):
         """Aggregated VENUS Hf 120 min spectrum + Hf-177 MLBW isotope.
 
-        Skips if the committed fixtures are not present (they are
-        checked into ``tests/data/`` — absence means a broken checkout).
+        **Fails** (not skips) if the committed fixtures are not present:
+        they are checked into ``tests/data/`` so their absence means a
+        broken checkout or a packaging step that stripped them, which
+        would silently hide the regression gate.
         """
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         fixture = os.path.join(root, "tests/data/venus/aggregated_hf_120min.npz")
         endf = os.path.join(root, "tests/data/endf/Hf-177.endf")
         if not os.path.exists(fixture) or not os.path.exists(endf):
-            pytest.skip(f"VENUS / Hf-177 fixtures missing: {fixture}, {endf}")
+            pytest.fail(
+                f"VENUS / Hf-177 regression-gate fixtures missing: "
+                f"{fixture}, {endf}. "
+                f"These are committed under tests/data/; absence means a broken "
+                f"checkout. Do NOT silently skip — refusing to run the gate is a "
+                f"regression by itself."
+            )
         with np.load(fixture) as f:
             E = np.ascontiguousarray(f["energies_ev"])
             S_agg = np.ascontiguousarray(f["sample_counts"])
@@ -1253,32 +1260,22 @@ class TestVenusMlbwRegression:
         hf177 = nereids.load_endf_file(endf)
         return E, S_agg, O_agg, c, hf177
 
-    @pytest.mark.skipif(
-        sys.platform != "darwin",
-        reason=(
-            "Bit-exact LM baseline was captured on macOS (Accelerate BLAS). "
-            "Sum/dot ordering in other BLAS backends (OpenBLAS, MKL) can "
-            "diverge at the ULP level on this ill-conditioned single-MLBW-"
-            "isotope fit, producing spurious gate failures that would mask "
-            "real regressions.  The cross_sections_on_grid MLBW path is "
-            "already covered everywhere by the Rust test "
-            "test_batch_matches_per_point_mlbw_synthetic + "
-            "test_batch_matches_per_point_hf177_real_endf (bit-exact on "
-            "any platform).  This Python gate adds a real-fit anchor on "
-            "the platform that produced the committed baseline."
-        ),
-    )
-    def test_mlbw_lm_fit_is_bit_exact(self, venus_data):
-        """LM fit on aggregated Hf-177 must produce bit-exact baseline values.
+    def test_mlbw_lm_fit_matches_baseline(self, venus_data):
+        """LM fit on aggregated Hf-177 must match the committed baseline.
 
-        Regression gate for #465.  If this fails:
-          - The MLBW evaluator has been modified (intentional change → rebaseline).
-          - The batch / per-point dispatch has drifted (unintentional → bug).
+        Regression gate for #465.  The #465 bug produced up to 33 %
+        relative error on this workload's σ; any serious dispatch /
+        evaluator regression therefore shifts the converged density by
+        orders of magnitude more than the ``rel=1e-6`` tolerance used
+        here.
 
-        Do not weaken the assertion to an `approx` tolerance without
-        investigating first — the whole point is that both code paths
-        share the same evaluator, so outputs are bit-exact by construction
-        when BLAS ordering is held constant (see the `skipif` above).
+        Note: bit-exact (`==`) was used initially but relaxed to a tight
+        ``pytest.approx`` because LM traverses BLAS and sum/dot
+        ordering differs between Accelerate (macOS) and OpenBLAS
+        (Linux CI), which flapped the gate without catching real bugs.
+        ``rel=1e-6`` is three orders of magnitude tighter than the
+        smallest regression this test is meant to catch, so the gate
+        still fires on any real correctness drift.
         """
         E, S_agg, O_agg, c, hf177 = venus_data
 
@@ -1301,27 +1298,36 @@ class TestVenusMlbwRegression:
             delta_l_m=0.005,
         )
 
-        # Bit-exact baseline captured on main after the #465 fix.
-        # See `scripts/fixtures/extract_venus_aggregated.py` for fixture
-        # derivation. If these values need to change, document why in
-        # the commit message and ensure the shift is semantically motivated
-        # (not a floating-point drift from an unrelated optimisation).
+        # Baseline captured on the fixed code (macOS Accelerate).
+        # Tolerance is loose enough to absorb BLAS-ordering noise across
+        # Linux CI / macOS dev / any future backend, but orders of
+        # magnitude tighter than the ~33 % MLBW dispatch error this gate
+        # is meant to catch.
         EXPECTED_DENSITY = 0.00011222100300548643
         EXPECTED_CHI2_R = 218950.98638784938
         EXPECTED_ITERATIONS = 27
-        EXPECTED_CONVERGED = True
 
-        assert float(result.densities[0]) == EXPECTED_DENSITY, (
+        FLOAT_TOL = pytest.approx
+        assert float(result.densities[0]) == FLOAT_TOL(EXPECTED_DENSITY, rel=1e-6), (
             f"density drifted: got {float(result.densities[0])!r}, "
-            f"expected {EXPECTED_DENSITY!r}"
+            f"expected {EXPECTED_DENSITY!r} (±1e-6 rel)"
         )
-        assert (
-            float(result.reduced_chi_squared) == EXPECTED_CHI2_R
-        ), f"chi2_r drifted: got {float(result.reduced_chi_squared)!r}, expected {EXPECTED_CHI2_R!r}"
-        assert (
-            int(result.iterations) == EXPECTED_ITERATIONS
-        ), f"iteration count drifted: got {int(result.iterations)}, expected {EXPECTED_ITERATIONS}"
-        assert (
-            bool(result.converged) == EXPECTED_CONVERGED
-        ), f"convergence flag drifted: got {bool(result.converged)}, expected {EXPECTED_CONVERGED}"
+        assert float(result.reduced_chi_squared) == FLOAT_TOL(
+            EXPECTED_CHI2_R, rel=1e-6
+        ), (
+            f"chi2_r drifted: got {float(result.reduced_chi_squared)!r}, "
+            f"expected {EXPECTED_CHI2_R!r} (±1e-6 rel)"
+        )
+        # LM step acceptance can shift iteration count by ±1 or ±2 on
+        # different BLAS backends; assert "close enough" rather than
+        # exact.  Any dispatch regression would move this by orders of
+        # magnitude (or hit max_iter without converging).
+        assert abs(int(result.iterations) - EXPECTED_ITERATIONS) <= 3, (
+            f"iteration count drifted: got {int(result.iterations)}, "
+            f"expected ~{EXPECTED_ITERATIONS} (±3)"
+        )
+        assert bool(result.converged) is True, (
+            f"fit did not converge: got converged={bool(result.converged)}. "
+            f"A dispatch regression can prevent convergence entirely — investigate."
+        )
 

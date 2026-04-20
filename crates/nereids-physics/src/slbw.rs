@@ -12,8 +12,10 @@
 //! This module also provides true MLBW (Multi-Level Breit-Wigner) via
 //! `mlbw_evaluate_with_cached_jgroups`, which includes resonance-resonance
 //! interference in the elastic channel (see SAMMY `mlb/mmlb3.f90`).
-//! MLBW is dispatched through `reich_moore::cross_sections_on_grid` (the
-//! single public entry point) like every other formalism.
+//! MLBW is dispatched through the `reich_moore` crate's unified
+//! precompute+evaluate pipeline (public entry points
+//! `cross_sections_at_energy` and `cross_sections_on_grid`) like every
+//! other formalism.
 //!
 //! ## SAMMY Reference
 //! - `mlb/mmlb4.f90` Abpart_Mlb subroutine
