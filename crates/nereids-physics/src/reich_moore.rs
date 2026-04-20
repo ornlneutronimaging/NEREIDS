@@ -323,13 +323,13 @@ pub struct CrossSections {
 /// (ENDF-6 §2 convention).
 ///
 /// Shares the **same precompute+evaluate pipeline** as
-/// [`cross_sections_on_grid`] — both entry points call
-/// [`precompute_range_data`] and [`evaluate_precomputed_range`], so
-/// there is exactly one dispatch table per formalism in the codebase.
-/// The difference is that this entry point does not store precomputed
-/// plans in an outer `Vec` (unnecessary when only one energy is
-/// evaluated), so per-call overhead matches the pre-consolidation
-/// per-point path.
+/// [`cross_sections_on_grid`] — both entry points call the same
+/// (private) `precompute_range_data` and `evaluate_precomputed_range`
+/// helpers, so there is exactly one dispatch table per formalism in
+/// the codebase.  The difference is that this entry point does not
+/// store precomputed plans in an outer `Vec` (unnecessary when only
+/// one energy is evaluated), so per-call overhead matches the
+/// pre-consolidation per-point path.
 ///
 /// # Arguments
 /// * `data` — Parsed resonance parameters from ENDF.
