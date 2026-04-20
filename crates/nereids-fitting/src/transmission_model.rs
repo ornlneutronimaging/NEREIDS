@@ -347,7 +347,7 @@ impl TransmissionFitModel {
         })
     }
 
-    /// Attach a prebuilt resolution plan for [`Self::energies`].
+    /// Attach a prebuilt resolution plan for the model's energy grid.
     ///
     /// Safe to call before any `evaluate()`.  Caller contract:
     /// `plan.target_energies() == energies` — violating this yields

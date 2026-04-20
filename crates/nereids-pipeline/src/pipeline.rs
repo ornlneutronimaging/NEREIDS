@@ -469,7 +469,7 @@ impl UnifiedFitConfig {
 
     /// Attach a prebuilt resolution plan for the config's energy grid.
     ///
-    /// The caller (typically [`spatial_map_typed`]) must ensure that
+    /// The caller (typically `spatial_map_typed`) must ensure that
     /// `plan.target_energies()` equals `self.energies()`, otherwise
     /// the fit-model layer will return a length-mismatch error when
     /// broadening.
