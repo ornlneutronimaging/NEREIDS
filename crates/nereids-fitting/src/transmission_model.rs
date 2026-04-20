@@ -1144,9 +1144,16 @@ impl FitModel for EnergyScaleTransmissionModel {
             .iter()
             .filter(|&&fp_idx| fp_idx != self.t0_index && fp_idx != self.l_scale_index)
             .count();
+        // Only tabulated resolution has a meaningful plan; Gaussian
+        // would burn an O(n) sorted-grid validation only to return
+        // `None`, so we short-circuit here and stay byte-identical to
+        // the pre-cache Gaussian hot path (Copilot #1).
         let density_plan = if n_density_cols >= 2
             && let Some(inst) = &self.instrument
-        {
+            && matches!(
+                inst.resolution,
+                nereids_physics::resolution::ResolutionFunction::Tabulated(_)
+            ) {
             resolution::build_resolution_plan(&e_corr, &inst.resolution)
                 .ok()
                 .flatten()

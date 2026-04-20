@@ -315,9 +315,9 @@ def run_b3() -> dict:
 def run_kl_periso_tzero() -> dict:
     """KL+per-iso+TZERO on 4x4 VENUS Hf crop — added in this PR to
     verify the solver-agnostic nature of the
-    `EnergyScaleTransmissionModel` plan cache.  Not in #459's
-    benchmark set but enabled by `test_spatial_map_typed_allows_
-    counts_kl_with_energy_scale`.
+    `EnergyScaleTransmissionModel` plan cache. Not in #459's
+    benchmark set but enabled by
+    `test_spatial_map_typed_allows_counts_kl_with_energy_scale`.
     """
     return _run_periso_tzero(
         solver="kl",

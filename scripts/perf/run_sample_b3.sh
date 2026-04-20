@@ -20,4 +20,11 @@ sleep 0.2
 
 wait "$PID" 2>/dev/null || true
 
-echo "profile: /tmp/b3.sample.txt ($(wc -l </tmp/b3.sample.txt) lines)"
+# `set -e` would abort if /tmp/b3.sample.txt never got created (sample
+# missing on non-macOS, permission denied, target exited early) — give
+# a helpful message instead.  Copilot #2.
+if [ -f /tmp/b3.sample.txt ]; then
+    echo "profile: /tmp/b3.sample.txt ($(wc -l </tmp/b3.sample.txt) lines)"
+else
+    echo "profile: /tmp/b3.sample.txt was not created (sampling may be unavailable, permission denied, or the target exited before sample could attach)"
+fi
