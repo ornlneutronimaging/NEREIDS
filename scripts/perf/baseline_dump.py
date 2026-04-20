@@ -223,8 +223,117 @@ def run_b1() -> dict:
     }
 
 
+def _run_periso_tzero(solver: str, crop_size: int, label: str, max_iter: int) -> dict:
+    """Shared runner for per-isotope spatial fits with TZERO (B.3 / KL+periso+TZERO).
+
+    Uses a `crop_size × crop_size` pixel window centred on (255, 255).
+    4x4 default keeps the fixture under ~20 s for LM and under ~5 s for
+    KL on the current branch.
+    """
+    with h5py.File(H5, "r") as f:
+        E_full = f["Hf/120min/transmission/spectrum/energy_eV"][:]
+        S3d_raw = f["Hf/120min/counts/sample"][:][::-1, :, :]
+        O3d_raw = f["Hf/open_beam/counts"][:][::-1, :, :]
+        Q_s = float(f["Hf/120min/proton_charges/sample_values_uC"][:].sum())
+        Q_ob = float(f["Hf/120min/proton_charges/ob_values_uC"][0])
+    y0 = 255 - crop_size // 2
+    x0 = 255 - crop_size // 2
+    y1 = y0 + crop_size
+    x1 = x0 + crop_size
+    mask = (E_full >= ENERGY_MIN) & (E_full <= ENERGY_MAX)
+    E = np.ascontiguousarray(E_full[mask])
+    S3d = np.ascontiguousarray(S3d_raw[mask][:, y0:y1, x0:x1]).astype(np.float64)
+    O3d = np.ascontiguousarray(O3d_raw[mask][:, y0:y1, x0:x1]).astype(np.float64)
+    c = Q_s / Q_ob
+
+    hf_group = nereids.IsotopeGroup.natural(72)
+    hf_group.load_endf()
+    resonance_data_list = list(hf_group.resonance_data)
+    members = hf_group.members
+    initial_densities = [1.6e-4 * ratio for _, ratio in members]
+
+    res = nereids.load_resolution(str(RES_FILE), FLIGHT_PATH_M)
+    dead_pixels = np.zeros((S3d.shape[1], S3d.shape[2]), dtype=bool)
+
+    if solver == "lm":
+        T3d = S3d / np.maximum(c * O3d, 1.0)
+        sig3d = T3d * np.sqrt(
+            1.0 / np.maximum(S3d, 1.0) + 1.0 / np.maximum(O3d, 1.0)
+        )
+        input_data = nereids.from_transmission(T3d, sig3d)
+    else:
+        input_data = nereids.from_counts(S3d, O3d)
+
+    kwargs = dict(
+        data=input_data,
+        energies=E,
+        isotopes=resonance_data_list,
+        solver=solver,
+        temperature_k=TEMP_K,
+        initial_densities=initial_densities,
+        max_iter=max_iter,
+        background=True,
+        fit_energy_scale=True,
+        t0_init_us=0.5,
+        l_scale_init=1.005,
+        energy_scale_flight_path_m=FLIGHT_PATH_M,
+        resolution=res,
+        dead_pixels=dead_pixels,
+    )
+    if solver == "kl":
+        kwargs["c"] = c
+
+    t0 = time.time()
+    r = nereids.spatial_map_typed(**kwargs)
+    wall = time.time() - t0
+    # Capture all 6 per-isotope density maps so any per-iso regression
+    # surfaces in the diff (not just the summed or primary isotope).
+    density_hex: list[list[str]] = []
+    for m in r.density_maps:
+        density_hex.append(_array_hex(np.asarray(m)))
+    conv = np.asarray(r.converged_map)
+    return {
+        "name": label,
+        "wall_s": wall,
+        "n_pixels": int(conv.size),
+        "converged_count": int(conv.sum()),
+        "density_per_iso_hex": density_hex,
+        "converged_hex": _array_hex(conv.astype(np.float64)),
+    }
+
+
+def run_b3() -> dict:
+    """B.3: spatial LM+per-iso+TZERO on 4x4 VENUS Hf crop."""
+    return _run_periso_tzero(
+        solver="lm",
+        crop_size=4,
+        label="B3_spatial_LM_periso_background_tzero_4x4",
+        max_iter=200,
+    )
+
+
+def run_kl_periso_tzero() -> dict:
+    """KL+per-iso+TZERO on 4x4 VENUS Hf crop — added in this PR to
+    verify the solver-agnostic nature of the
+    `EnergyScaleTransmissionModel` plan cache.  Not in #459's
+    benchmark set but enabled by `test_spatial_map_typed_allows_
+    counts_kl_with_energy_scale`.
+    """
+    return _run_periso_tzero(
+        solver="kl",
+        crop_size=4,
+        label="KL_spatial_periso_background_tzero_4x4",
+        max_iter=200,
+    )
+
+
 def dump_baseline(out: Path, include_b1: bool) -> None:
-    data = {"a1": run_a1(), "b2": run_b2()}
+    data = {
+        "a1": run_a1(),
+        "b2": run_b2(),
+        "b3": run_b3(),
+        "kl_periso_tzero": run_kl_periso_tzero(),
+    }
     if include_b1:
         data["b1"] = run_b1()
     out.write_text(json.dumps(data, indent=2) + "\n")
@@ -254,6 +363,13 @@ def _diff(label: str, base: dict, cur: dict) -> list[str]:
             if len(bv) != len(cv):
                 diffs.append(f"{label}.{key}: length {len(bv)} vs {len(cv)}")
                 continue
+            if bv and isinstance(bv[0], list):
+                # Nested list-of-lists (e.g. density_per_iso_hex): diff each
+                # sub-list recursively so per-isotope mismatches surface
+                # with their isotope + pixel indices.
+                for i, (sub_b, sub_c) in enumerate(zip(bv, cv)):
+                    diffs.extend(_diff(f"{label}.{key}[{i}]", {"v": sub_b}, {"v": sub_c}))
+                continue
             mismatches = [i for i, (b, c) in enumerate(zip(bv, cv)) if b != c]
             if mismatches:
                 diffs.append(
@@ -275,7 +391,12 @@ def verify_baseline(path: Path, include_b1: bool) -> int:
     # stays as an explicit opt-in for the dump phase; on verify we
     # honour whatever the JSON actually holds.
     effective_include_b1 = include_b1 or ("b1" in base)
-    cur = {"a1": run_a1(), "b2": run_b2()}
+    cur = {
+        "a1": run_a1(),
+        "b2": run_b2(),
+        "b3": run_b3(),
+        "kl_periso_tzero": run_kl_periso_tzero(),
+    }
     if effective_include_b1:
         cur["b1"] = run_b1()
     diffs: list[str] = []
