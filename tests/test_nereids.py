@@ -5,6 +5,7 @@ so no network access or ENDF downloads are required.
 """
 
 import os
+import sys
 import tempfile
 
 import numpy as np
@@ -1252,6 +1253,21 @@ class TestVenusMlbwRegression:
         hf177 = nereids.load_endf_file(endf)
         return E, S_agg, O_agg, c, hf177
 
+    @pytest.mark.skipif(
+        sys.platform != "darwin",
+        reason=(
+            "Bit-exact LM baseline was captured on macOS (Accelerate BLAS). "
+            "Sum/dot ordering in other BLAS backends (OpenBLAS, MKL) can "
+            "diverge at the ULP level on this ill-conditioned single-MLBW-"
+            "isotope fit, producing spurious gate failures that would mask "
+            "real regressions.  The cross_sections_on_grid MLBW path is "
+            "already covered everywhere by the Rust test "
+            "test_batch_matches_per_point_mlbw_synthetic + "
+            "test_batch_matches_per_point_hf177_real_endf (bit-exact on "
+            "any platform).  This Python gate adds a real-fit anchor on "
+            "the platform that produced the committed baseline."
+        ),
+    )
     def test_mlbw_lm_fit_is_bit_exact(self, venus_data):
         """LM fit on aggregated Hf-177 must produce bit-exact baseline values.
 
@@ -1261,7 +1277,8 @@ class TestVenusMlbwRegression:
 
         Do not weaken the assertion to an `approx` tolerance without
         investigating first — the whole point is that both code paths
-        share the same evaluator, so outputs are bit-exact by construction.
+        share the same evaluator, so outputs are bit-exact by construction
+        when BLAS ordering is held constant (see the `skipif` above).
         """
         E, S_agg, O_agg, c, hf177 = venus_data
 

@@ -317,14 +317,14 @@ pub(crate) fn slbw_evaluate_with_cached_jgroups(
 /// Evaluate **true MLBW** cross-sections for a single L-group using
 /// pre-cached J-groups (resonance-resonance interference in elastic).
 ///
-/// This is the per-energy inner loop extracted from
-/// `mlbw_cross_sections_for_range`, used by the batch grid path
-/// (`cross_sections_on_grid`) so that J-group precomputation happens
-/// only once per range even when many energy points are evaluated.
-///
-/// Sharing a single evaluator between the per-point and batch paths is
-/// what prevents the #465 class of bug (the batch dispatcher previously
-/// routed MLBW ranges through `slbw_evaluate_with_cached_jgroups`,
+/// This is the per-energy MLBW inner loop.  The batch grid path
+/// (`reich_moore::cross_sections_on_grid`) precomputes the J-groups
+/// once per range and calls this evaluator at each energy; the
+/// single-energy entry point (`reich_moore::cross_sections_at_energy`)
+/// goes through the same precompute+evaluate pipeline.  Both callers
+/// share exactly this evaluator — which is what prevents the #465
+/// class of bug (the batch dispatcher previously routed MLBW ranges
+/// through `slbw_evaluate_with_cached_jgroups`,
 /// silently computing SLBW's incoherent elastic sum instead of MLBW's
 /// coherent sum).
 ///

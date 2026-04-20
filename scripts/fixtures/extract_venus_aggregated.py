@@ -12,7 +12,8 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-ROOT = Path("/Users/chenzhang/github.com/NEREIDS/NEREIDS")
+# Repo root is two levels above this script (scripts/fixtures/ → scripts/ → repo).
+ROOT = Path(__file__).resolve().parents[2]
 H5 = ROOT / ".research/spatial-regularization/data/counts/resonance_data_2cm.h5"
 OUT = ROOT / "tests/data/venus/aggregated_hf_120min.npz"
 
@@ -43,7 +44,7 @@ np.savez_compressed(
     description=np.array(
         "VENUS Hf 120 min aggregated (summed over 512x512). "
         "Energy range 7..200 eV (3471 bins after mask). "
-        "Produced by scripts/extract_venus_fixture.py from "
+        "Produced by scripts/fixtures/extract_venus_aggregated.py from "
         ".research/spatial-regularization/data/counts/resonance_data_2cm.h5 "
         "(private dataset, not redistributable). The aggregated spectra are "
         "used by the #465 MLBW regression test to lock fit behaviour against "

@@ -346,15 +346,25 @@ pub fn cross_sections_at_energy(data: &ResonanceData, energy_ev: f64) -> CrossSe
     let mut fission = 0.0;
 
     for (range_idx, range) in data.ranges.iter().enumerate() {
-        let plan = precompute_range_data(range, range_idx, data, awr);
-        let in_range = if plan.half_open_upper {
-            energy_ev >= plan.energy_low && energy_ev < plan.energy_high
+        // Cheap interval check FIRST — precompute is O(n_resonances) per range,
+        // so building a plan for a range that doesn't cover `energy_ev` wastes
+        // meaningful work on multi-range isotopes or energies outside the
+        // resolved band.  The `next_starts_here` logic here must match
+        // `precompute_range_data` exactly (same half-open convention).
+        let next_starts_here = data
+            .ranges
+            .get(range_idx + 1)
+            .is_some_and(|next| next.energy_low == range.energy_high && range_is_evaluable(next));
+        let in_range = if next_starts_here {
+            energy_ev >= range.energy_low && energy_ev < range.energy_high
         } else {
-            energy_ev >= plan.energy_low && energy_ev <= plan.energy_high
+            energy_ev >= range.energy_low && energy_ev <= range.energy_high
         };
         if !in_range {
             continue;
         }
+
+        let plan = precompute_range_data(range, range_idx, data, awr);
         let (t, e, c, f) = evaluate_precomputed_range(&plan, energy_ev, awr);
         total += t;
         elastic += e;
@@ -2215,8 +2225,9 @@ mod tests {
     /// Synthetic MLBW fixture: the batch API and per-point API MUST agree
     /// bit-exactly.  This is the root cause of #465 — the batch
     /// dispatcher lumped MLBW into the SLBW evaluator (incoherent sum)
-    /// while the per-point dispatcher correctly routed through
-    /// `mlbw_cross_sections_for_range` (coherent sum).
+    /// while the per-point dispatcher correctly routed through the
+    /// coherent-sum MLBW evaluator.  Both paths now share
+    /// `slbw::mlbw_evaluate_with_cached_jgroups`.
     #[test]
     fn test_batch_matches_per_point_mlbw_synthetic() {
         let data = make_mlbw_two_resonance_same_j();
@@ -2265,7 +2276,14 @@ mod tests {
     /// relative divergence on the VENUS analysis grid).
     ///
     /// The ENDF file is committed under `tests/data/endf/Hf-177.endf`
-    /// (~2.8 MB, public domain, see the README there).
+    /// at the workspace root (~2.8 MB, public domain, see the README
+    /// there).  The fixture lives outside `crates/nereids-physics/` so
+    /// it is not included by `cargo package` when this crate is
+    /// published in isolation.  When the fixture is absent the test
+    /// skips with a note rather than panicking, so standalone crate
+    /// checkouts still see a clean `cargo test` run.  In the full
+    /// workspace (where the fixture is always present) the gate runs
+    /// as normal.
     #[test]
     fn test_batch_matches_per_point_hf177_real_endf() {
         use nereids_endf::parser::parse_endf_file2;
@@ -2275,12 +2293,17 @@ mod tests {
             .parent()
             .unwrap()
             .join("tests/data/endf/Hf-177.endf");
-        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-            panic!(
-                "missing Hf-177 fixture at {path:?}: {e} \
-                 (this test depends on the committed fixture; see tests/data/endf/README.md)"
-            )
-        });
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                println!(
+                    "skipping test_batch_matches_per_point_hf177_real_endf: \
+                     fixture not available at {path:?}: {e}. \
+                     Run from the full NEREIDS workspace to exercise this regression gate."
+                );
+                return;
+            }
+        };
         let data = parse_endf_file2(&text).unwrap();
 
         // 500 points spanning the resolved MLBW range (up to 250 eV).
