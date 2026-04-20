@@ -8,6 +8,7 @@ use rayon::prelude::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use nereids_physics::resolution::build_resolution_plan;
 use nereids_physics::transmission::{
     InstrumentParams, broadened_cross_sections, unbroadened_cross_sections,
 };
@@ -470,6 +471,36 @@ pub fn spatial_map_typed(
         xs
     };
 
+    // Build the resolution broadening plan once for the shared grid.
+    //
+    // The plan is valid for any per-pixel fit that applies resolution
+    // on the (fixed) data energy grid — i.e. every spatial dispatch
+    // EXCEPT the energy-scale (TZERO) path, where the grid changes
+    // per (t0, l_scale) trial.  For that case the plan would always
+    // miss so we skip the build and let
+    // `EnergyScaleTransmissionModel` manage its own (t0, l_scale)-
+    // keyed plan cache.
+    //
+    // `build_resolution_plan` returns `None` for Gaussian resolution
+    // (no worthwhile cache at this level) and `Some(plan)` for
+    // tabulated kernels.  The error branch only fires on an unsorted
+    // grid, which [`broadened_cross_sections`] above would have
+    // already rejected — but propagating the error here keeps the
+    // validation surface consistent.
+    let resolution_plan: Option<Arc<nereids_physics::resolution::ResolutionPlan>> =
+        if !config.fit_energy_scale() {
+            match config.resolution() {
+                Some(res) => build_resolution_plan(config.energies(), res)
+                    .map_err(|e| {
+                        PipelineError::InvalidParameter(format!("resolution plan build: {e}"))
+                    })?
+                    .map(Arc::new),
+                None => None,
+            }
+        } else {
+            None
+        };
+
     // Precompute unbroadened (base) cross-sections for temperature fitting.
     // This avoids 74× overhead from redundant Reich-Moore evaluation per
     // KL iteration (112ms Reich-Moore vs 1.5ms Doppler rebroadening).
@@ -477,11 +508,15 @@ pub fn spatial_map_typed(
         let base_xs: Vec<Vec<f64>> =
             unbroadened_cross_sections(config.energies(), config.resonance_data(), cancel)
                 .map_err(PipelineError::Transmission)?;
-        config
+        let mut cfg = config
             .clone()
             .with_precomputed_cross_sections(xs)
             .with_precomputed_base_xs(Arc::new(base_xs))
-            .with_compute_covariance(true)
+            .with_compute_covariance(true);
+        if let Some(plan) = resolution_plan.clone() {
+            cfg = cfg.with_precomputed_resolution_plan(plan);
+        }
+        cfg
     } else {
         // For non-temperature path: xs is already collapsed to σ_eff when
         // groups are active, so clear group mapping to prevent double-collapse
@@ -491,8 +526,13 @@ pub fn spatial_map_typed(
             cfg.density_indices = None;
             cfg.density_ratios = None;
         }
-        cfg.with_precomputed_cross_sections(xs)
-            .with_compute_covariance(true)
+        let mut cfg = cfg
+            .with_precomputed_cross_sections(xs)
+            .with_compute_covariance(true);
+        if let Some(plan) = resolution_plan.clone() {
+            cfg = cfg.with_precomputed_resolution_plan(plan);
+        }
+        cfg
     };
 
     // Auto-disable Nelder-Mead polish for multi-pixel counts-KL spatial
@@ -810,6 +850,7 @@ mod tests {
             density_indices: Arc::new(vec![0]),
             energies: None,
             instrument: None,
+            resolution_plan: None,
         };
         let t_1d = model.evaluate(&[true_density]).unwrap();
         let sigma_1d: Vec<f64> = t_1d.iter().map(|&v| 0.01 * v.max(0.01)).collect();

@@ -300,6 +300,15 @@ pub struct UnifiedFitConfig {
     // ── Precomputed caches (injected by spatial_map_typed) ──
     precomputed_cross_sections: Option<Arc<Vec<Vec<f64>>>>,
     precomputed_base_xs: Option<Arc<Vec<Vec<f64>>>>,
+    /// Resolution broadening plan built once for `(energies, resolution)`.
+    ///
+    /// Populated by [`spatial_map_typed`] when the data grid is shared
+    /// across every pixel, so each per-pixel fit reuses a single
+    /// hoisted TOF / kernel-interpolation / bracket table instead of
+    /// rebuilding it every broadening call.  `None` ⇒ the fit-model
+    /// layer falls back to the per-call broadening path with byte-
+    /// identical output.
+    precomputed_resolution_plan: Option<Arc<nereids_physics::resolution::ResolutionPlan>>,
 
     // ── Energy-scale calibration (SAMMY TZERO equivalent) ──
     /// When true, fit t₀ (μs) and L_scale (dimensionless) parameters.
@@ -374,6 +383,7 @@ impl UnifiedFitConfig {
             counts_enable_polish: None,
             precomputed_cross_sections: None,
             precomputed_base_xs: None,
+            precomputed_resolution_plan: None,
             fit_energy_scale: false,
             t0_init_us: 0.0,
             l_scale_init: 1.0,
@@ -454,6 +464,21 @@ impl UnifiedFitConfig {
     #[must_use]
     pub fn with_precomputed_base_xs(mut self, xs: Arc<Vec<Vec<f64>>>) -> Self {
         self.precomputed_base_xs = Some(xs);
+        self
+    }
+
+    /// Attach a prebuilt resolution plan for the config's energy grid.
+    ///
+    /// The caller (typically [`spatial_map_typed`]) must ensure that
+    /// `plan.target_energies()` equals `self.energies()`, otherwise
+    /// the fit-model layer will return a length-mismatch error when
+    /// broadening.
+    #[must_use]
+    pub fn with_precomputed_resolution_plan(
+        mut self,
+        plan: Arc<nereids_physics::resolution::ResolutionPlan>,
+    ) -> Self {
+        self.precomputed_resolution_plan = Some(plan);
         self
     }
 
@@ -1611,6 +1636,11 @@ fn build_transmission_model(
             .resolution
             .clone()
             .map(|r| Arc::new(InstrumentParams { resolution: r }));
+        let resolution_plan = if instrument.is_some() {
+            config.precomputed_resolution_plan.clone()
+        } else {
+            None
+        };
         return Ok(Box::new(PrecomputedTransmissionModel {
             cross_sections: effective_xs,
             density_indices: Arc::new((0..n_params).collect()),
@@ -1618,6 +1648,7 @@ fn build_transmission_model(
                 .as_ref()
                 .map(|_| Arc::new(config.energies.clone())),
             instrument,
+            resolution_plan,
         }));
     }
 
@@ -1635,15 +1666,23 @@ fn build_transmission_model(
         .density_indices
         .clone()
         .unwrap_or_else(|| (0..n_density_params).collect());
-    Ok(Box::new(TransmissionFitModel::new(
-        config.energies.clone(),
-        config.resonance_data.clone(),
-        config.temperature_k,
-        instrument,
-        (density_indices, density_ratios),
-        temperature_index,
-        base_xs,
-    )?))
+    let resolution_plan = if instrument.is_some() {
+        config.precomputed_resolution_plan.clone()
+    } else {
+        None
+    };
+    Ok(Box::new(
+        TransmissionFitModel::new(
+            config.energies.clone(),
+            config.resonance_data.clone(),
+            config.temperature_k,
+            instrument,
+            (density_indices, density_ratios),
+            temperature_index,
+            base_xs,
+        )?
+        .with_resolution_plan(resolution_plan),
+    ))
 }
 
 /// Convert PoissonResult to LmResult with Pearson chi-squared.
@@ -2217,6 +2256,7 @@ mod tests {
             density_indices: Arc::new(vec![0]),
             energies: None,
             instrument: None,
+            resolution_plan: None,
         };
         let t = model.evaluate(&[true_density]).unwrap();
         let sigma: Vec<f64> = t.iter().map(|&v| 0.01 * v.max(0.01)).collect();
@@ -2565,6 +2605,7 @@ mod tests {
             density_indices: Arc::new(vec![0]),
             energies: None,
             instrument: None,
+            resolution_plan: None,
         };
         let t = model.evaluate(&[true_density]).unwrap();
         let sigma: Vec<f64> = t.iter().map(|&v| 0.01 * v.max(0.01)).collect();
