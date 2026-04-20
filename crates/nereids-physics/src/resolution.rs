@@ -1638,9 +1638,10 @@ pub fn apply_resolution_with_plan(
         // the target grid in separate `Arc`s whose storage may or
         // may not alias; bit-exact content equality is the only
         // robust invariant.  The cost is one full grid scan per
-        // broadening call (O(n), ~3 KB for VENUS 3471-point grid) —
-        // orders of magnitude cheaper than the broadening itself
-        // and cheap vs the silent-staleness failure mode.
+        // broadening call (O(n), ~27 KB of f64 values for the VENUS
+        // 3471-point grid) — orders of magnitude cheaper than the
+        // broadening itself and cheap vs the silent-staleness
+        // failure mode.
         let plan_grid = p.target_energies();
         for i in 0..plan_grid.len() {
             if plan_grid[i].to_bits() != energies[i].to_bits() {

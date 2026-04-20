@@ -241,8 +241,18 @@ def _diff(label: str, base: dict, cur: dict) -> list[str]:
         bv = base[key]
         cv = cur.get(key)
         if isinstance(bv, list):
-            if len(bv) != len(cv or []):
-                diffs.append(f"{label}.{key}: length {len(bv)} vs {len(cv or [])}")
+            if not isinstance(cv, list):
+                # A missing / non-list current value cannot be
+                # zip-compared against the saved list — treat it as
+                # an explicit mismatch so verify reports a clean
+                # diff rather than raising `TypeError: NoneType ...`.
+                diffs.append(
+                    f"{label}.{key}: base is list of length {len(bv)} "
+                    f"but cur is {type(cv).__name__} ({cv!r})"
+                )
+                continue
+            if len(bv) != len(cv):
+                diffs.append(f"{label}.{key}: length {len(bv)} vs {len(cv)}")
                 continue
             mismatches = [i for i, (b, c) in enumerate(zip(bv, cv)) if b != c]
             if mismatches:

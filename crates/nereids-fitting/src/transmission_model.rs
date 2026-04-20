@@ -350,8 +350,10 @@ impl TransmissionFitModel {
     /// Attach a prebuilt resolution plan for the model's energy grid.
     ///
     /// Safe to call before any `evaluate()`.  Caller contract:
-    /// `plan.target_energies() == energies` — violating this yields
-    /// a length-mismatch error on the first broadening call.
+    /// `plan.target_energies() == energies` — violating this will
+    /// fail on the first broadening call, either via a length
+    /// mismatch or, for a different same-length grid,
+    /// `ResolutionError::PlanGridMismatch`.
     #[must_use]
     pub fn with_resolution_plan(mut self, plan: Option<Arc<ResolutionPlan>>) -> Self {
         self.resolution_plan = plan;

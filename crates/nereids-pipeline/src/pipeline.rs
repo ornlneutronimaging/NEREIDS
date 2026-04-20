@@ -471,8 +471,9 @@ impl UnifiedFitConfig {
     ///
     /// The caller (typically `spatial_map_typed`) must ensure that
     /// `plan.target_energies()` equals `self.energies()`, otherwise
-    /// the fit-model layer will return a length-mismatch error when
-    /// broadening.
+    /// the fit-model layer will return either a length-mismatch
+    /// error or `ResolutionError::PlanGridMismatch` (for a different
+    /// same-length grid) on the first broadening call.
     #[must_use]
     pub fn with_precomputed_resolution_plan(
         mut self,

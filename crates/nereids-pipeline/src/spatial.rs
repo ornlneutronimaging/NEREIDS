@@ -486,15 +486,24 @@ pub fn spatial_map_typed(
     // grid; when `precomputed_cross_sections` is already cached
     // (`config.precomputed_cross_sections().is_some()`), the
     // `broadened_cross_sections` call above is skipped, so the plan
-    // build here is the *first* sort-check in that path — propagating
-    // the error keeps the pipeline surface consistent regardless of
-    // cache state.
+    // build here is the *first* sort-check in that path.  Wrapping
+    // the `ResolutionError` via `TransmissionError::from` keeps the
+    // outward-facing error variant (`PipelineError::Transmission`)
+    // consistent regardless of cache state.
     let resolution_plan: Option<Arc<nereids_physics::resolution::ResolutionPlan>> =
         if !config.fit_energy_scale() {
             match config.resolution() {
+                // Route the unsorted-grid failure through
+                // `TransmissionError::Resolution` so callers observe
+                // the same error variant whether or not
+                // `precomputed_cross_sections` is cached (the non-
+                // cached path already surfaces this via
+                // `broadened_cross_sections`).  Copilot #7.
                 Some(res) => build_resolution_plan(config.energies(), res)
                     .map_err(|e| {
-                        PipelineError::InvalidParameter(format!("resolution plan build: {e}"))
+                        PipelineError::Transmission(
+                            nereids_physics::transmission::TransmissionError::from(e),
+                        )
                     })?
                     .map(Arc::new),
                 None => None,
@@ -1014,14 +1023,20 @@ mod tests {
             .to_string()
     }
 
-    /// Gate: per-pixel spatial output is bit-exact whether the
-    /// resolution plan is attached (tabulated kernel → spatial
-    /// builds a plan) or not (Gaussian kernel → no plan built).
-    /// This is the in-tree version of the VENUS A.1 / B.2 baseline
-    /// check; every production plan dispatch must produce the same
-    /// density, convergence flag, and χ² as the non-plan path.
+    /// Gate: end-to-end smoke + determinism test for the per-pixel
+    /// spatial path with an attached resolution plan (tabulated
+    /// kernel).  Asserts that `spatial_map_typed` runs to
+    /// completion, most pixels converge, the recovered mean density
+    /// is sensible on the synthetic fixture, and every converged
+    /// pixel in the 4×4 crop produces a bit-identical density (no
+    /// plan-cache state leaks across the rayon fanout).
+    ///
+    /// Exact `apply_resolution` / `apply_resolution_with_plan`
+    /// equivalence is covered bit-for-bit by the unit tests in
+    /// `resolution.rs`; this spatial test only confirms that plan
+    /// attachment does not disturb the higher-level dispatch.
     #[test]
-    fn test_spatial_map_typed_bit_exact_with_resolution_plan() {
+    fn test_spatial_map_typed_with_resolution_plan_converges_and_is_deterministic() {
         use nereids_physics::resolution::{ResolutionFunction, TabulatedResolution};
 
         let data = u238_single_resonance();
@@ -1049,21 +1064,6 @@ mod tests {
         };
 
         let result_with_plan = spatial_map_typed(&input, &config, None, None, None).unwrap();
-
-        // Reference path: disable the plan by injecting an empty
-        // `precomputed_cross_sections` that forces the spatial
-        // dispatch to skip the plan attach — actually, since the
-        // plan attach is controlled by `!fit_energy_scale` (not by
-        // xs precomputation), we can't disable it via the config
-        // surface.  Instead, re-run with a Gaussian kernel of
-        // matched width — this should produce bit-different but
-        // finite output, so it's a sanity pass rather than a plan-
-        // vs-no-plan comparison.  For the true bit-exact plan-vs-
-        // no-plan check, we compare each per-pixel spectrum against
-        // the apply_resolution / apply_resolution_with_plan
-        // equivalence proved by the resolution.rs unit tests: the
-        // test here only needs to confirm that attaching a plan did
-        // not break `spatial_map_typed` end-to-end.
         assert_eq!(result_with_plan.n_total, 16);
         assert!(
             result_with_plan.n_converged >= 14,
