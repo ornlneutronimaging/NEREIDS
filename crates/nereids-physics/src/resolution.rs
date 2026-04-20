@@ -59,6 +59,16 @@ pub enum ResolutionError {
     UnsortedEnergies,
     /// The energy grid and data arrays have mismatched lengths.
     LengthMismatch { energies: usize, data: usize },
+    /// A [`ResolutionPlan`] was passed together with an `energies`
+    /// slice that does not match the grid the plan was built for.
+    ///
+    /// Cheapest-available check hierarchy: length mismatch is caught
+    /// first via [`Self::LengthMismatch`] (`plan.len() ==
+    /// energies.len()` is necessary but not sufficient); a content
+    /// mismatch fires `PlanGridMismatch` with the index of the first
+    /// differing element so callers can diagnose silent-staleness
+    /// bugs at the cache layer.
+    PlanGridMismatch { first_diff_index: usize },
 }
 
 impl fmt::Display for ResolutionError {
@@ -72,6 +82,12 @@ impl fmt::Display for ResolutionError {
                 f,
                 "energy grid length ({}) must match data length ({})",
                 energies, data
+            ),
+            Self::PlanGridMismatch { first_diff_index } => write!(
+                f,
+                "resolution plan was built for a different energy grid than was \
+                 passed to apply_resolution_with_plan (first differing index: {})",
+                first_diff_index,
             ),
         }
     }
@@ -1540,6 +1556,105 @@ pub(crate) fn apply_resolution_presorted(
     }
 }
 
+/// Build a broadening plan for `(energies, resolution)`.
+///
+/// Returns `Some(plan)` for [`ResolutionFunction::Tabulated`] — the
+/// plan hoists the per-target TOF / kernel-interpolation / bracket
+/// / trap-weight work that would otherwise run on every call to
+/// [`apply_resolution`].  Returns `None` for
+/// [`ResolutionFunction::Gaussian`] — the Gaussian path has no
+/// meaningful pixel-invariant kernel structure to cache at this
+/// level, so callers fall back to the per-call broadening path with
+/// no loss.
+///
+/// Callers that want a single-branch API can unconditionally call
+/// [`apply_resolution_with_plan`] passing `plan.as_ref()`; when the
+/// plan is `None` it transparently forwards to the non-plan path and
+/// returns byte-identical output.
+///
+/// # Errors
+/// Returns [`ResolutionError::UnsortedEnergies`] if `energies` is not
+/// non-descending — the same precondition that [`apply_resolution`]
+/// enforces per-call.
+pub fn build_resolution_plan(
+    energies: &[f64],
+    resolution: &ResolutionFunction,
+) -> Result<Option<ResolutionPlan>, ResolutionError> {
+    match resolution {
+        ResolutionFunction::Gaussian(_) => {
+            if !energies.windows(2).all(|w| w[0] <= w[1]) {
+                return Err(ResolutionError::UnsortedEnergies);
+            }
+            Ok(None)
+        }
+        ResolutionFunction::Tabulated(tab) => tab.plan(energies).map(Some),
+    }
+}
+
+/// Apply resolution broadening, optionally via a pre-built
+/// [`ResolutionPlan`].
+///
+/// When `plan` is `Some(p)` and `resolution` is a tabulated kernel,
+/// `p.apply(spectrum)` runs the cached per-target broadening inner
+/// loop — the expensive TOF / kernel-interpolation / bracket work
+/// was already captured at plan build time.
+///
+/// When `plan` is `None`, or when `resolution` is Gaussian, the call
+/// forwards to [`apply_resolution`] and is byte-identical to the
+/// un-planned path.
+///
+/// # Errors
+/// * Returns the same errors as [`apply_resolution`] on the non-plan
+///   path.
+/// * Returns [`ResolutionError::LengthMismatch`] if the plan was built
+///   for a different-length grid than `energies`, or if
+///   `energies.len() != spectrum.len()`.
+/// * Returns [`ResolutionError::PlanGridMismatch`] if the plan was
+///   built for a different grid of the same length — the cached
+///   `(lo_idx, frac, weight)` entries encode brackets into the old
+///   grid and would silently produce a wrong broadened spectrum if
+///   applied.
+pub fn apply_resolution_with_plan(
+    plan: Option<&ResolutionPlan>,
+    energies: &[f64],
+    spectrum: &[f64],
+    resolution: &ResolutionFunction,
+) -> Result<Vec<f64>, ResolutionError> {
+    if let Some(p) = plan
+        && matches!(resolution, ResolutionFunction::Tabulated(_))
+    {
+        validate_inputs(energies, spectrum)?;
+        if p.len() != energies.len() {
+            return Err(ResolutionError::LengthMismatch {
+                energies: energies.len(),
+                data: p.len(),
+            });
+        }
+        // Grid-identity check.  A plan built for a different grid of
+        // the same length would still pass the length check and then
+        // gather spectrum values at brackets that belong to the old
+        // grid — silently corrupt output.  Pointer identity is not
+        // enough here because callers legitimately hold the plan and
+        // the target grid in separate `Arc`s whose storage may or
+        // may not alias; bit-exact content equality is the only
+        // robust invariant.  The cost is one full grid scan per
+        // broadening call (O(n), ~27 KB of f64 values for the VENUS
+        // 3471-point grid) — orders of magnitude cheaper than the
+        // broadening itself and cheap vs the silent-staleness
+        // failure mode.
+        let plan_grid = p.target_energies();
+        for i in 0..plan_grid.len() {
+            if plan_grid[i].to_bits() != energies[i].to_bits() {
+                return Err(ResolutionError::PlanGridMismatch {
+                    first_diff_index: i,
+                });
+            }
+        }
+        return Ok(p.apply(spectrum));
+    }
+    apply_resolution(energies, spectrum, resolution)
+}
+
 /// Errors from resolution file parsing.
 #[derive(Debug)]
 pub enum ResolutionParseError {
@@ -2361,6 +2476,129 @@ mod tests {
         // Wrong spectrum length — caller error should panic with a
         // clear message rather than silently producing garbage.
         let _ = plan.apply(&[0.1, 0.2]);
+    }
+
+    // ─── apply_resolution_with_plan / _presorted_with_plan dispatch harness ───
+    //
+    // These gates cover the public/crate-visible wrappers added for
+    // production plan-caching.  Every production caller (fit-model
+    // layer, spatial dispatch) goes through one of these two entries;
+    // their dispatch choices must be byte-identical to the non-plan
+    // paths they replace.
+
+    #[test]
+    fn test_apply_resolution_with_plan_tabulated_matches_non_plan_path() {
+        let tab = synthetic_tab_resolution();
+        let resolution = ResolutionFunction::Tabulated(Arc::new(tab.clone()));
+        let energies: Vec<f64> = (0..128).map(|i| 1.0 + i as f64 * (200.0 / 128.0)).collect();
+        let spectrum: Vec<f64> = energies
+            .iter()
+            .map(|&e| 1.0 - 0.3 * (-((e - 20.0).powi(2) / 4.0)).exp())
+            .collect();
+
+        let baseline = apply_resolution(&energies, &spectrum, &resolution).unwrap();
+
+        let plan = build_resolution_plan(&energies, &resolution).unwrap();
+        assert!(
+            plan.is_some(),
+            "tabulated resolution must produce Some(plan)"
+        );
+        let planned =
+            apply_resolution_with_plan(plan.as_ref(), &energies, &spectrum, &resolution).unwrap();
+        assert_eq!(planned.len(), baseline.len());
+        for (i, (&a, &b)) in baseline.iter().zip(planned.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "apply_resolution_with_plan mismatch at {i}: baseline={a} planned={b}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_apply_resolution_with_plan_gaussian_returns_none_plan_and_matches() {
+        let resolution =
+            ResolutionFunction::Gaussian(ResolutionParams::new(25.0, 1.0e-3, 0.02, 0.01).unwrap());
+        let energies: Vec<f64> = (0..64).map(|i| 1.0 + i as f64 * 3.0).collect();
+        let spectrum: Vec<f64> = energies.iter().map(|&e| 1.0 / e).collect();
+
+        let plan = build_resolution_plan(&energies, &resolution).unwrap();
+        assert!(
+            plan.is_none(),
+            "Gaussian resolution must not produce a plan"
+        );
+
+        let baseline = apply_resolution(&energies, &spectrum, &resolution).unwrap();
+        let planned =
+            apply_resolution_with_plan(plan.as_ref(), &energies, &spectrum, &resolution).unwrap();
+        assert_eq!(planned.len(), baseline.len());
+        for (i, (&a, &b)) in baseline.iter().zip(planned.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "gaussian fallback mismatch at {i}: baseline={a} planned={b}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_apply_resolution_with_plan_rejects_same_length_different_grid() {
+        // Codex finding: `p.len() == energies.len()` is necessary
+        // but not sufficient.  A plan built for one grid and applied
+        // to a different same-length grid would silently gather
+        // spectrum values at brackets belonging to the original grid
+        // — wrong σ output without any error surfaced.  The grid-
+        // identity check in `apply_resolution_with_plan` guards this
+        // failure mode and reports the first differing index.
+        let tab = synthetic_tab_resolution();
+        let resolution = ResolutionFunction::Tabulated(Arc::new(tab.clone()));
+        let energies_plan: Vec<f64> = (0..32).map(|i| 1.0 + i as f64).collect();
+        let mut energies_apply = energies_plan.clone();
+        // Perturb a single interior point so lengths still match.
+        energies_apply[5] += 0.25;
+        let spectrum = vec![0.7; energies_apply.len()];
+
+        let plan = tab.plan(&energies_plan).unwrap();
+        let result =
+            apply_resolution_with_plan(Some(&plan), &energies_apply, &spectrum, &resolution);
+        match result {
+            Err(ResolutionError::PlanGridMismatch { first_diff_index }) => {
+                assert_eq!(first_diff_index, 5);
+            }
+            other => panic!("expected PlanGridMismatch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_apply_resolution_with_plan_rejects_length_mismatch() {
+        let tab = synthetic_tab_resolution();
+        let resolution = ResolutionFunction::Tabulated(Arc::new(tab.clone()));
+        let energies_plan: Vec<f64> = (0..32).map(|i| 1.0 + i as f64).collect();
+        let energies_apply: Vec<f64> = (0..48).map(|i| 1.0 + i as f64).collect();
+        let spectrum = vec![0.5; energies_apply.len()];
+
+        let plan = tab.plan(&energies_plan).unwrap();
+        let result =
+            apply_resolution_with_plan(Some(&plan), &energies_apply, &spectrum, &resolution);
+        match result {
+            Err(ResolutionError::LengthMismatch { energies, data }) => {
+                assert_eq!(energies, 48);
+                assert_eq!(data, 32);
+            }
+            other => panic!("expected LengthMismatch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_build_resolution_plan_rejects_unsorted_energies_for_gaussian() {
+        // Gaussian returns None on success, but must still reject an
+        // unsorted grid — callers use `build_resolution_plan` to
+        // centralise the sort-check so the downstream `apply` path can
+        // skip it.
+        let resolution =
+            ResolutionFunction::Gaussian(ResolutionParams::new(25.0, 1.0e-3, 0.02, 0.01).unwrap());
+        let result = build_resolution_plan(&[3.0, 1.0, 2.0], &resolution);
+        assert!(matches!(result, Err(ResolutionError::UnsortedEnergies)));
     }
 
     #[test]

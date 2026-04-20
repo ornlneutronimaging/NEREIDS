@@ -8,6 +8,7 @@ use rayon::prelude::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use nereids_physics::resolution::build_resolution_plan;
 use nereids_physics::transmission::{
     InstrumentParams, broadened_cross_sections, unbroadened_cross_sections,
 };
@@ -470,6 +471,47 @@ pub fn spatial_map_typed(
         xs
     };
 
+    // Build the resolution broadening plan once for the shared grid.
+    //
+    // The plan is valid for any per-pixel fit that applies resolution
+    // on the (fixed) data energy grid — i.e. every spatial dispatch
+    // EXCEPT the energy-scale (TZERO) path, where the grid changes
+    // per (t0, l_scale) trial.  In that case the plan would always
+    // miss so we skip the build; `EnergyScaleTransmissionModel` runs
+    // the non-plan broadening path (see its `evaluate_at` comment).
+    //
+    // `build_resolution_plan` returns `None` for Gaussian resolution
+    // (no worthwhile cache at this level) and `Some(plan)` for
+    // tabulated kernels.  The error branch fires only on an unsorted
+    // grid; when `precomputed_cross_sections` is already cached
+    // (`config.precomputed_cross_sections().is_some()`), the
+    // `broadened_cross_sections` call above is skipped, so the plan
+    // build here is the *first* sort-check in that path.  Wrapping
+    // the `ResolutionError` via `TransmissionError::from` keeps the
+    // outward-facing error variant (`PipelineError::Transmission`)
+    // consistent regardless of cache state.
+    let resolution_plan: Option<Arc<nereids_physics::resolution::ResolutionPlan>> =
+        if !config.fit_energy_scale() {
+            match config.resolution() {
+                // Route the unsorted-grid failure through
+                // `TransmissionError::Resolution` so callers observe
+                // the same error variant whether or not
+                // `precomputed_cross_sections` is cached (the non-
+                // cached path already surfaces this via
+                // `broadened_cross_sections`).  Copilot #7.
+                Some(res) => build_resolution_plan(config.energies(), res)
+                    .map_err(|e| {
+                        PipelineError::Transmission(
+                            nereids_physics::transmission::TransmissionError::from(e),
+                        )
+                    })?
+                    .map(Arc::new),
+                None => None,
+            }
+        } else {
+            None
+        };
+
     // Precompute unbroadened (base) cross-sections for temperature fitting.
     // This avoids 74× overhead from redundant Reich-Moore evaluation per
     // KL iteration (112ms Reich-Moore vs 1.5ms Doppler rebroadening).
@@ -477,11 +519,15 @@ pub fn spatial_map_typed(
         let base_xs: Vec<Vec<f64>> =
             unbroadened_cross_sections(config.energies(), config.resonance_data(), cancel)
                 .map_err(PipelineError::Transmission)?;
-        config
+        let mut cfg = config
             .clone()
             .with_precomputed_cross_sections(xs)
             .with_precomputed_base_xs(Arc::new(base_xs))
-            .with_compute_covariance(true)
+            .with_compute_covariance(true);
+        if let Some(plan) = resolution_plan.clone() {
+            cfg = cfg.with_precomputed_resolution_plan(plan);
+        }
+        cfg
     } else {
         // For non-temperature path: xs is already collapsed to σ_eff when
         // groups are active, so clear group mapping to prevent double-collapse
@@ -491,8 +537,13 @@ pub fn spatial_map_typed(
             cfg.density_indices = None;
             cfg.density_ratios = None;
         }
-        cfg.with_precomputed_cross_sections(xs)
-            .with_compute_covariance(true)
+        let mut cfg = cfg
+            .with_precomputed_cross_sections(xs)
+            .with_compute_covariance(true);
+        if let Some(plan) = resolution_plan.clone() {
+            cfg = cfg.with_precomputed_resolution_plan(plan);
+        }
+        cfg
     };
 
     // Auto-disable Nelder-Mead polish for multi-pixel counts-KL spatial
@@ -810,6 +861,7 @@ mod tests {
             density_indices: Arc::new(vec![0]),
             energies: None,
             instrument: None,
+            resolution_plan: None,
         };
         let t_1d = model.evaluate(&[true_density]).unwrap();
         let sigma_1d: Vec<f64> = t_1d.iter().map(|&v| 0.01 * v.max(0.01)).collect();
@@ -936,6 +988,123 @@ mod tests {
             (mean - true_density).abs() / true_density < 0.10,
             "KL mean density: {mean}, true: {true_density}"
         );
+    }
+
+    /// Build a minimal synthetic tabulated resolution kernel.  Two
+    /// reference energies × a 5-point triangular offset-weight block
+    /// is enough to exercise the plan build + apply hot path without
+    /// pulling in the external VENUS resolution file.
+    ///
+    /// The kernel width is deliberately small (sub-microsecond) so
+    /// broadening perturbs a non-broadened synthetic spectrum only
+    /// slightly — keeps the spatial fit in its convergence basin
+    /// without building a full R⊗T forward pass into the test
+    /// fixture.
+    fn synthetic_tabulated_text() -> String {
+        // File format (parsed by TabulatedResolution::from_text):
+        //   header line
+        //   separator line
+        //   for each block: energy marker line, then N offset/weight
+        //   pairs, then a blank line between blocks.
+        "header\n---\n\
+         5.0 0.0\n\
+         -0.01 0.0\n\
+         -0.005 0.5\n\
+         0.0 1.0\n\
+         0.005 0.5\n\
+         0.01 0.0\n\
+         \n\
+         200.0 0.0\n\
+         -0.02 0.0\n\
+         -0.01 0.5\n\
+         0.0 1.0\n\
+         0.01 0.5\n\
+         0.02 0.0\n"
+            .to_string()
+    }
+
+    /// Gate: end-to-end smoke + determinism test for the per-pixel
+    /// spatial path with an attached resolution plan (tabulated
+    /// kernel).  Asserts that `spatial_map_typed` runs to
+    /// completion, most pixels converge, the recovered mean density
+    /// is sensible on the synthetic fixture, and every converged
+    /// pixel in the 4×4 crop produces a bit-identical density (no
+    /// plan-cache state leaks across the rayon fanout).
+    ///
+    /// Exact `apply_resolution` / `apply_resolution_with_plan`
+    /// equivalence is covered bit-for-bit by the unit tests in
+    /// `resolution.rs`; this spatial test only confirms that plan
+    /// attachment does not disturb the higher-level dispatch.
+    #[test]
+    fn test_spatial_map_typed_with_resolution_plan_converges_and_is_deterministic() {
+        use nereids_physics::resolution::{ResolutionFunction, TabulatedResolution};
+
+        let data = u238_single_resonance();
+        let true_density = 0.0005;
+        let energies: Vec<f64> = (0..101).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let (t_3d, u_3d) = synthetic_4x4_transmission(&data, true_density, &energies);
+
+        let tab = TabulatedResolution::from_text(&synthetic_tabulated_text(), 25.0).unwrap();
+        let resolution = ResolutionFunction::Tabulated(Arc::new(tab));
+
+        let config = UnifiedFitConfig::new(
+            energies.clone(),
+            vec![data.clone()],
+            vec!["U-238".into()],
+            0.0,
+            Some(resolution),
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()));
+
+        let input = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+
+        let result_with_plan = spatial_map_typed(&input, &config, None, None, None).unwrap();
+        assert_eq!(result_with_plan.n_total, 16);
+        assert!(
+            result_with_plan.n_converged >= 14,
+            "plan path: {} / 16 pixels converged",
+            result_with_plan.n_converged,
+        );
+
+        let d = &result_with_plan.density_maps[0];
+        let conv = &result_with_plan.converged_map;
+        let mean: f64 = d
+            .iter()
+            .zip(conv.iter())
+            .filter(|(_, c)| **c)
+            .map(|(d, _)| *d)
+            .sum::<f64>()
+            / result_with_plan.n_converged.max(1) as f64;
+        assert!(
+            (mean - true_density).abs() / true_density < 0.10,
+            "mean density with plan: {mean}, true: {true_density}"
+        );
+
+        // Every converged pixel in the 4x4 crop shares the identical
+        // input spectrum, so every density-map entry must be bit-
+        // equal to every other converged entry.  This catches any
+        // plan-cache corruption that would leak pixel-specific state
+        // across the rayon fanout.
+        let reference = d
+            .iter()
+            .zip(conv.iter())
+            .find(|(_, c)| **c)
+            .map(|(d, _)| *d)
+            .expect("at least one pixel converged");
+        for (&cell, &c) in d.iter().zip(conv.iter()) {
+            if c {
+                assert_eq!(
+                    cell.to_bits(),
+                    reference.to_bits(),
+                    "plan cache leaked pixel-specific state: density cell {cell} != reference {reference}"
+                );
+            }
+        }
     }
 
     #[test]

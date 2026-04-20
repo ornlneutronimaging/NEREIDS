@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use nereids_core::constants::{EV_TO_JOULES, NEUTRON_MASS_KG};
 use nereids_endf::resonance::ResonanceData;
-use nereids_physics::resolution;
+use nereids_physics::resolution::{self, ResolutionPlan};
 use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
 
 use crate::error::FittingError;
@@ -50,6 +50,16 @@ pub struct PrecomputedTransmissionModel {
     /// When `Some`, resolution broadening is applied to the total
     /// transmission after Beer-Lambert in `evaluate()`.
     pub instrument: Option<Arc<InstrumentParams>>,
+    /// Optional pre-built broadening plan for `(energies, resolution)`.
+    ///
+    /// When a caller builds the plan once (e.g. spatial dispatch for
+    /// a grid shared across every pixel) and passes it via
+    /// `with_resolution_plan`, `evaluate()` and `analytical_jacobian()`
+    /// skip the per-call kernel-interp / bracket / trap-weight work
+    /// and reduce each broadening call to a gather + multiply-add.
+    /// `None` ⇒ fall back to the per-call broadening path, byte-
+    /// identical output.
+    pub resolution_plan: Option<Arc<ResolutionPlan>>,
 }
 
 impl FitModel for PrecomputedTransmissionModel {
@@ -78,10 +88,13 @@ impl FitModel for PrecomputedTransmissionModel {
         // Issue #442: apply resolution broadening to total transmission
         // AFTER Beer-Lambert.  This is the SAMMY-correct ordering.
         if let (Some(inst), Some(energies)) = (&self.instrument, &self.energies) {
-            let t_broadened =
-                resolution::apply_resolution(energies, &transmission, &inst.resolution).map_err(
-                    |e| FittingError::EvaluationFailed(format!("resolution broadening: {e}")),
-                )?;
+            let t_broadened = resolution::apply_resolution_with_plan(
+                self.resolution_plan.as_deref(),
+                energies,
+                &transmission,
+                &inst.resolution,
+            )
+            .map_err(|e| FittingError::EvaluationFailed(format!("resolution broadening: {e}")))?;
             Ok(t_broadened)
         } else {
             Ok(transmission)
@@ -150,8 +163,13 @@ impl FitModel for PrecomputedTransmissionModel {
             for (col, xs_sum) in fp_xs_sums.iter().enumerate() {
                 let inner_deriv: Vec<f64> =
                     (0..n_e).map(|i| -xs_sum[i] * t_unresolved[i]).collect();
-                let resolved_deriv =
-                    resolution::apply_resolution(energies, &inner_deriv, &inst.resolution).ok()?;
+                let resolved_deriv = resolution::apply_resolution_with_plan(
+                    self.resolution_plan.as_deref(),
+                    energies,
+                    &inner_deriv,
+                    &inst.resolution,
+                )
+                .ok()?;
                 for (i, &val) in resolved_deriv.iter().enumerate() {
                     *jacobian.get_mut(i, col) = val;
                 }
@@ -231,6 +249,14 @@ pub struct TransmissionFitModel {
     /// Temperature at which `cached_broadened_xs` was computed.
     /// `Cell` is sufficient because `f64` is `Copy`.
     cached_temperature: Cell<f64>,
+    /// Optional prebuilt resolution plan for [`Self::energies`].
+    ///
+    /// When a caller (typically spatial dispatch) builds the plan
+    /// once for a shared grid, passing it here lets every per-pixel
+    /// `evaluate()` / `analytical_jacobian()` call reuse the hoisted
+    /// TOF / kernel-interp / bracket work.  `None` ⇒ per-call
+    /// broadening (same output as pre-plan main).
+    resolution_plan: Option<Arc<ResolutionPlan>>,
 }
 
 impl TransmissionFitModel {
@@ -317,7 +343,21 @@ impl TransmissionFitModel {
             cached_broadened_xs: RefCell::new(None),
             cached_dxs_dt: RefCell::new(None),
             cached_temperature: Cell::new(f64::NAN),
+            resolution_plan: None,
         })
+    }
+
+    /// Attach a prebuilt resolution plan for the model's energy grid.
+    ///
+    /// Safe to call before any `evaluate()`.  Caller contract:
+    /// `plan.target_energies() == energies` — violating this will
+    /// fail on the first broadening call, either via a length
+    /// mismatch or, for a different same-length grid,
+    /// `ResolutionError::PlanGridMismatch`.
+    #[must_use]
+    pub fn with_resolution_plan(mut self, plan: Option<Arc<ResolutionPlan>>) -> Self {
+        self.resolution_plan = plan;
+        self
     }
 }
 
@@ -393,10 +433,13 @@ impl FitModel for TransmissionFitModel {
             // Issue #442: apply resolution broadening to total transmission
             // AFTER Beer-Lambert.
             if let Some(ref inst) = self.instrument {
-                resolution::apply_resolution(&self.energies, &transmission, &inst.resolution)
-                    .map_err(|e| {
-                        FittingError::EvaluationFailed(format!("resolution broadening: {e}"))
-                    })
+                resolution::apply_resolution_with_plan(
+                    self.resolution_plan.as_deref(),
+                    &self.energies,
+                    &transmission,
+                    &inst.resolution,
+                )
+                .map_err(|e| FittingError::EvaluationFailed(format!("resolution broadening: {e}")))
             } else {
                 Ok(transmission)
             }
@@ -517,8 +560,13 @@ impl FitModel for TransmissionFitModel {
 
             if let Some(ref inst) = self.instrument {
                 // ∂T_obs/∂N_g = R[inner]
-                let resolved =
-                    resolution::apply_resolution(&self.energies, &inner, &inst.resolution).ok()?;
+                let resolved = resolution::apply_resolution_with_plan(
+                    self.resolution_plan.as_deref(),
+                    &self.energies,
+                    &inner,
+                    &inst.resolution,
+                )
+                .ok()?;
                 for (i, &val) in resolved.iter().enumerate() {
                     *jacobian.get_mut(i, col) = val;
                 }
@@ -566,8 +614,13 @@ impl FitModel for TransmissionFitModel {
                 .collect();
 
             if let Some(ref inst) = self.instrument {
-                let resolved =
-                    resolution::apply_resolution(&self.energies, &inner, &inst.resolution).ok()?;
+                let resolved = resolution::apply_resolution_with_plan(
+                    self.resolution_plan.as_deref(),
+                    &self.energies,
+                    &inner,
+                    &inst.resolution,
+                )
+                .ok()?;
                 for (i, &val) in resolved.iter().enumerate() {
                     *jacobian.get_mut(i, col) = val;
                 }
@@ -1014,7 +1067,14 @@ impl EnergyScaleTransmissionModel {
         }
         let transmission: Vec<f64> = neg_opt.iter().map(|&d| d.exp()).collect();
 
-        // Resolution broadening on the corrected grid
+        // Resolution broadening on the corrected grid.  The corrected
+        // grid changes with (t0, l_scale), and within one LM iteration
+        // the FD columns for t0 and L_scale rebuild the plan twice
+        // each — on real-VENUS A.1 that miss rate outweighs the
+        // density-column hits and leaves the plan cache net-negative.
+        // The non-plan path stays here until the aux-grid hoist
+        // (#459 B1/B2) gives us a grid that's fixed across the entire
+        // Jacobian call.
         if let Some(inst) = &self.instrument {
             let t_broadened = resolution::apply_resolution(e_corr, &transmission, &inst.resolution)
                 .map_err(|e| {
@@ -1096,7 +1156,10 @@ impl FitModel for EnergyScaleTransmissionModel {
                 let inner_deriv: Vec<f64> =
                     (0..n_e).map(|i| -sigma_sum[i] * t_unresolved[i]).collect();
 
-                // Apply resolution to derivative if enabled
+                // Apply resolution to derivative if enabled.  The
+                // non-plan path matches `evaluate_at` above; see its
+                // comment for why the (t0, l_scale)-keyed plan cache
+                // is not wired here.
                 if let Some(inst) = &self.instrument {
                     let resolved_deriv =
                         match resolution::apply_resolution(&e_corr, &inner_deriv, &inst.resolution)
@@ -1805,6 +1868,7 @@ mod tests {
             density_indices: Arc::new(density_indices),
             energies: None,
             instrument: None,
+            resolution_plan: None,
         }
     }
 
@@ -2109,6 +2173,7 @@ mod tests {
             density_indices: Arc::new(vec![0]),
             energies: Some(Arc::new(energies.clone())),
             instrument: Some(Arc::clone(&inst)),
+            resolution_plan: None,
         };
         let t_precomputed = model.evaluate(&[thickness]).unwrap();
 
@@ -2190,6 +2255,7 @@ mod tests {
             density_indices: Arc::new(vec![0]),
             energies: Some(Arc::new(energies.clone())),
             instrument: Some(Arc::clone(&inst)),
+            resolution_plan: None,
         };
 
         let params = [0.0005f64];
@@ -2238,6 +2304,7 @@ mod tests {
             density_indices: Arc::new(vec![0, 0]), // both share param[0]
             energies: Some(Arc::new(energies.clone())),
             instrument: Some(Arc::clone(&inst)),
+            resolution_plan: None,
         };
 
         let params = [0.001f64];
