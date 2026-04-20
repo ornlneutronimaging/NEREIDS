@@ -4,9 +4,12 @@ Baseline for this workload (from issue #459 / `section_B_64x64.json`):
   per-pixel LM+grouped+TZERO on 64x64 = 10 230 s total → ~30 s / converged pixel,
   8.4 % convergence rate.
 
-A 2x2 crop is 4 pixels; even with low max_iter, non-converged pixels burn
-close to the max-iter budget.  We use `max_iter=50` to keep the profile
-collection under ~2 min while still capturing the LM+TZERO hotspot mix.
+A 2x2 crop is 4 pixels; non-converged pixels burn close to the max-iter
+budget.  We use `max_iter=200` to let the LM loop reach the same
+convergence-edge regime as the production workload (max_iter=500) while
+keeping profile collection under ~10 s wall.  `run_sample_b1.sh` records
+for 100 s at 1 ms intervals, which typically captures the full LM
+trajectory on the 4-pixel crop even if all pixels hit max_iter.
 
 Signals readiness via /tmp/b1_ready (consumed by run_sample_b1.sh).
 """

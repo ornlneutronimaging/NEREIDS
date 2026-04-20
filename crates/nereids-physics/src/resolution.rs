@@ -866,10 +866,14 @@ pub enum ResolutionFunction {
 /// spectrum reduces to a gather + multiply-add loop with no
 /// transcendentals, no allocations, and no binary / pointer search.
 ///
-/// Build via [`TabulatedResolution::plan`].  Apply via
-/// [`TabulatedResolution::broaden_with_plan`].  One plan is tied to one
-/// `(target_energies, ref_energies, flight_path_m)` triple; passing a
-/// spectrum on a different grid is caller error.
+/// Build via [`TabulatedResolution::plan`] — returns a `Result` and
+/// validates the sorted-grid precondition that `broaden` enforces.
+/// Apply via [`ResolutionPlan::apply`].  One plan is tied to one
+/// `(target_energies, ref_energies, flight_path_m)` triple; the plan
+/// owns a copy of the target-energy grid so callers cannot apply it to
+/// a spectrum that was measured on a *different* grid even when the
+/// grid length matches — use [`Self::target_energies`] to verify the
+/// grid identity before applying.
 ///
 /// The layout is a flat Struct-of-Arrays (SoA): per-target `(lo_idx,
 /// frac, weight)` tuples packed into three parallel `Vec`s, with
@@ -877,18 +881,24 @@ pub enum ResolutionFunction {
 /// the inner loop memory-access pattern sequential and cache-friendly.
 #[derive(Debug, Clone)]
 pub struct ResolutionPlan {
-    /// Number of target energies this plan covers.
-    n_target: usize,
+    /// Target energy grid the plan was built for (owned copy).
+    ///
+    /// Stored so `apply()` can verify `spectrum.len() == self.len()`
+    /// and expose a cheap grid identity for caller-side caching.
+    /// ~28 KB for the VENUS 3471-point grid — negligible compared to
+    /// the ~8 MB `lo_idx`/`frac`/`weight` footprint of a full plan.
+    target_energies: Vec<f64>,
     /// `starts[i]..starts[i+1]` indexes into `lo_idx`/`frac`/`weight`
-    /// for target `i`.  `starts` has length `n_target + 1`.
+    /// for target `i`.  `starts` has length `target_energies.len() + 1`.
     starts: Vec<u32>,
     /// For each valid (target, kernel-point) entry: the lower bracket
     /// index into the target grid (spectrum[lo] + frac * (spectrum[lo+1]
     /// - spectrum[lo])).
     lo_idx: Vec<u32>,
     /// Spectrum-interp fraction in [0, 1].  Set to 0 for degenerate
-    /// brackets so the apply-time formula reduces to `spectrum[lo]`
-    /// bit-exactly.
+    /// brackets; the apply-time loop short-circuits `frac == 0.0` so
+    /// degenerate entries never touch `spectrum[lo+1]`.  This matches
+    /// `broaden_presorted` even when `spectrum[lo+1]` is NaN/±∞.
     frac: Vec<f64>,
     /// Pre-computed per-entry weight (`w * dt_width.abs()`).  Summing
     /// these yields the per-target normalisation.
@@ -903,12 +913,12 @@ pub struct ResolutionPlan {
 impl ResolutionPlan {
     /// Number of target energies this plan covers.
     pub fn len(&self) -> usize {
-        self.n_target
+        self.target_energies.len()
     }
 
     /// True when the plan covers no target energies.
     pub fn is_empty(&self) -> bool {
-        self.n_target == 0
+        self.target_energies.is_empty()
     }
 
     /// Total number of (target, kernel-point) entries retained across
@@ -916,6 +926,85 @@ impl ResolutionPlan {
     /// (w ≤ 0, tof_prime ≤ 0, `e_prime` out of range) are not counted.
     pub fn n_entries(&self) -> usize {
         self.weight.len()
+    }
+
+    /// Target energy grid the plan was built for.
+    ///
+    /// Callers implementing plan caches can compare this against their
+    /// current grid to decide whether the plan is still valid.  Using
+    /// pointer identity of the returned slice gives an O(1) check when
+    /// the grid hasn't moved; slice equality is `O(n)` but catches
+    /// cases where the underlying buffer was reallocated.
+    pub fn target_energies(&self) -> &[f64] {
+        &self.target_energies
+    }
+
+    /// Apply the plan to a spectrum on the same target grid the plan
+    /// was built for.
+    ///
+    /// The spectrum length must equal [`Self::len`].  Passing a
+    /// spectrum on a different grid that happens to have the same
+    /// length is caller error — verify via [`Self::target_energies`]
+    /// when in doubt.
+    ///
+    /// Bit-exact with `broaden_presorted(target_energies, spectrum)`
+    /// for finite spectrum values; degenerate-bracket entries
+    /// short-circuit the interpolation so the equivalence also holds
+    /// when `spectrum[lo+1]` is NaN or ±∞ (the reference path returns
+    /// `spectrum[lo]` directly in that case without touching the upper
+    /// bracket).
+    pub fn apply(&self, spectrum: &[f64]) -> Vec<f64> {
+        let n = self.target_energies.len();
+        assert_eq!(
+            spectrum.len(),
+            n,
+            "spectrum length ({}) must match plan target-grid length ({})",
+            spectrum.len(),
+            n,
+        );
+        if n == 0 {
+            return Vec::new();
+        }
+
+        let mut result = vec![0.0f64; n];
+
+        for i in 0..n {
+            let norm_i = self.norm[i];
+            if norm_i <= DIVISION_FLOOR {
+                // Passthrough — matches `broaden_presorted`'s
+                // `spectrum[i]` fallback for e ≤ 0, empty kernel, or
+                // degenerate norm accumulation.
+                result[i] = spectrum[i];
+                continue;
+            }
+            let start = self.starts[i] as usize;
+            let end = self.starts[i + 1] as usize;
+            let mut sum = 0.0;
+            for j in start..end {
+                let lo = self.lo_idx[j] as usize;
+                let frac = self.frac[j];
+                // Degenerate-bracket short-circuit: when the plan
+                // built `frac = 0.0` (span < NEAR_ZERO_FLOOR) we skip
+                // `spectrum[lo+1]` entirely.  Without this branch,
+                // `0.0 * NaN = NaN` would propagate and diverge from
+                // the reference `broaden_presorted`, which returns
+                // `spectrum[lo]` directly for that case.  The
+                // additional comparison is one branch per entry (well-
+                // predicted: degenerate brackets are rare on real
+                // grids) and preserves bit-exactness under pathological
+                // spectra.
+                let s = if frac == 0.0 {
+                    spectrum[lo]
+                } else {
+                    let hi = lo + 1;
+                    spectrum[lo] + frac * (spectrum[hi] - spectrum[lo])
+                };
+                sum += self.weight[j] * s;
+            }
+            result[i] = sum / norm_i;
+        }
+
+        result
     }
 }
 
@@ -1059,11 +1148,11 @@ impl TabulatedResolution {
     /// For callers that broaden many spectra on the same target grid —
     /// LM iterations with fixed TZERO, spatial maps with a pre-calibrated
     /// energy axis — [`TabulatedResolution::plan`] +
-    /// [`TabulatedResolution::broaden_with_plan`] produce bit-exact
-    /// output while hoisting the per-target invariants (TOF conversion,
-    /// kernel interpolation, bracket lookup, trapezoidal widths) out of
-    /// the broadening hot loop.  This `broaden_presorted` entry is
-    /// the single-broadening path and keeps the original inline
+    /// [`ResolutionPlan::apply`] produce bit-exact output while
+    /// hoisting the per-target invariants (TOF conversion, kernel
+    /// interpolation, bracket lookup, trapezoidal widths) out of the
+    /// broadening hot loop.  This `broaden_presorted` entry is the
+    /// single-broadening path and keeps the original inline
     /// implementation to avoid plan-construction overhead on one-shot
     /// callers.
     pub(crate) fn broaden_presorted(&self, energies: &[f64], spectrum: &[f64]) -> Vec<f64> {
@@ -1157,6 +1246,14 @@ impl TabulatedResolution {
 
     /// Build a reusable broadening plan for a specific target energy grid.
     ///
+    /// Validates that `energies` is non-descending — the same sorted-grid
+    /// precondition enforced by [`TabulatedResolution::broaden`] via
+    /// `validate_inputs`.  An
+    /// unsorted grid would produce a silently-wrong plan (misbracketed
+    /// `e_prime` lookups against `e_min` / `e_max`), so it must be
+    /// caught at build time rather than returning garbage from
+    /// [`ResolutionPlan::apply`].
+    ///
     /// The plan hoists every quantity that depends only on
     /// `(target_energies, self.ref_energies, self.flight_path_m)` —
     /// namely the TOF conversion, the log-space kernel interpolation,
@@ -1165,21 +1262,36 @@ impl TabulatedResolution {
     /// spectrum becomes a pure gather + multiply-add loop.
     ///
     /// Build cost: same as one call to the private `broaden_presorted`
-    /// helper (O(N_target × N_kernel) TOF/bracket/interp work, plus ~2
-    /// × N_kernel log-interp ops per target energy for
-    /// `interpolated_kernel`).  Apply cost:
-    /// ~2 × N_valid FLOPs per target (no binary search, no allocations,
-    /// no trig/log) — typically < 10 % of the build cost.  The payoff
-    /// comes from reusing one plan across many spectra.
+    /// helper (O(N_target × N_kernel) TOF / bracket / interp work, plus
+    /// ~2 × N_kernel log-interp ops per target energy for
+    /// `interpolated_kernel`).  Apply cost per target: 1 branch +
+    /// ~3 loads + 3 flops per retained entry, plus the final divide —
+    /// typically < 10 % of the build cost.  The payoff comes from
+    /// reusing one plan across many spectra.
     ///
     /// Bit-exact with `broaden_presorted`: pre-computes the same
     /// floating-point sequences (TOF, `e_prime`, `dt_width`, `frac`,
     /// `weight`, `norm`) in the same order.
-    pub fn plan(&self, energies: &[f64]) -> ResolutionPlan {
+    ///
+    /// # Errors
+    /// Returns [`ResolutionError::UnsortedEnergies`] if `energies` is
+    /// not non-descending.
+    pub fn plan(&self, energies: &[f64]) -> Result<ResolutionPlan, ResolutionError> {
+        if !energies.windows(2).all(|w| w[0] <= w[1]) {
+            return Err(ResolutionError::UnsortedEnergies);
+        }
+        Ok(self.plan_presorted(energies))
+    }
+
+    /// Build a plan assuming `energies` is already validated as
+    /// non-descending.  Used internally by `broaden_presorted` (whose
+    /// caller already validated the grid) and by `plan()` after its
+    /// validation succeeded.
+    fn plan_presorted(&self, energies: &[f64]) -> ResolutionPlan {
         let n = energies.len();
         if n == 0 {
             return ResolutionPlan {
-                n_target: 0,
+                target_energies: Vec::new(),
                 starts: vec![0],
                 lo_idx: Vec::new(),
                 frac: Vec::new(),
@@ -1190,9 +1302,9 @@ impl TabulatedResolution {
         if n == 1 {
             // No bracket available; passthrough. Represent as n=1 with
             // zero entries and norm=0, which triggers the passthrough
-            // branch in `broaden_with_plan`.
+            // branch in `ResolutionPlan::apply`.
             return ResolutionPlan {
-                n_target: 1,
+                target_energies: energies.to_vec(),
                 starts: vec![0, 0],
                 lo_idx: Vec::new(),
                 frac: Vec::new(),
@@ -1204,10 +1316,18 @@ impl TabulatedResolution {
         let e_min = energies[0];
         let e_max = energies[n - 1];
 
+        // Preallocate the entry Vecs to ~n × kernel_len so the inner
+        // pushes avoid repeated reallocations.  Real VENUS grids push
+        // ~n × 499 entries total; over-allocating by up to 2× (if some
+        // kernel points are skipped) is cheap vs. repeated grow-and-
+        // memcpy during plan build.
+        let estimated_kernel_len = self.kernels.first().map_or(0, |(off, _)| off.len());
+        let estimated_entries = n.saturating_mul(estimated_kernel_len);
+
         let mut starts: Vec<u32> = Vec::with_capacity(n + 1);
-        let mut lo_idx: Vec<u32> = Vec::new();
-        let mut frac: Vec<f64> = Vec::new();
-        let mut weight: Vec<f64> = Vec::new();
+        let mut lo_idx: Vec<u32> = Vec::with_capacity(estimated_entries);
+        let mut frac: Vec<f64> = Vec::with_capacity(estimated_entries);
+        let mut weight: Vec<f64> = Vec::with_capacity(estimated_entries);
         let mut norm: Vec<f64> = Vec::with_capacity(n);
 
         starts.push(0);
@@ -1217,6 +1337,14 @@ impl TabulatedResolution {
             if e <= 0.0 {
                 // Passthrough: no entries contribute, norm=0.
                 norm.push(0.0);
+                // Guard the u32 invariant for diagnostic callers; the
+                // headroom is enormous for any realistic grid (VENUS
+                // 3471 × 499 ≈ 1.7M entries, u32::MAX ≈ 4.29B), but
+                // the debug-only assert documents the contract.
+                debug_assert!(
+                    lo_idx.len() <= u32::MAX as usize,
+                    "plan entry count overflows u32"
+                );
                 starts.push(lo_idx.len() as u32);
                 continue;
             }
@@ -1270,10 +1398,11 @@ impl TabulatedResolution {
                 let span = energies[hi] - energies[lo];
                 // Degenerate-bracket guard: if span < NEAR_ZERO_FLOOR,
                 // broaden_presorted returns `spectrum[lo]` directly
-                // without the interp arithmetic.  We store `frac = 0.0`
-                // so the apply-time formula `spectrum[lo] + 0.0 *
-                // (spectrum[hi] - spectrum[lo])` yields bit-exact
-                // `spectrum[lo]` (0 × finite = 0; x + 0 = x for finite x).
+                // without the interp arithmetic.  Store `frac = 0.0`
+                // — the apply path short-circuits `frac == 0.0` and
+                // returns `spectrum[lo]` without touching
+                // `spectrum[lo+1]`, so bit-exactness holds even if
+                // `spectrum[lo+1]` is NaN or ±∞.
                 let entry_frac = if span.abs() < NEAR_ZERO_FLOOR {
                     0.0
                 } else {
@@ -1292,6 +1421,10 @@ impl TabulatedResolution {
 
                 let entry_weight = w * dt_width.abs();
 
+                debug_assert!(
+                    lo_idx.len() < u32::MAX as usize,
+                    "plan entry count overflows u32"
+                );
                 lo_idx.push(lo as u32);
                 frac.push(entry_frac);
                 weight.push(entry_weight);
@@ -1303,70 +1436,13 @@ impl TabulatedResolution {
         }
 
         ResolutionPlan {
-            n_target: n,
+            target_energies: energies.to_vec(),
             starts,
             lo_idx,
             frac,
             weight,
             norm,
         }
-    }
-
-    /// Apply a pre-built [`ResolutionPlan`] to a spectrum.
-    ///
-    /// All per-target invariants (TOF conversion, kernel interpolation,
-    /// spectrum-bracket lookup, trapezoidal weights) are already encoded
-    /// in the plan.  The inner loop reduces to `spectrum[lo] + frac ×
-    /// (spectrum[lo+1] - spectrum[lo])` followed by weighted
-    /// accumulation — no binary search, no allocations, no transcendentals.
-    ///
-    /// The spectrum length must equal the plan's target-grid length.
-    /// (Plans are tied to a specific target grid; passing a spectrum on
-    /// a different grid would produce garbage.)
-    ///
-    /// Bit-exact with `broaden_presorted` when `plan` was built by
-    /// `self.plan(target_energies)` and `spectrum.len() ==
-    /// target_energies.len()`.
-    pub fn broaden_with_plan(&self, plan: &ResolutionPlan, spectrum: &[f64]) -> Vec<f64> {
-        let n = plan.n_target;
-        assert_eq!(
-            spectrum.len(),
-            n,
-            "spectrum length ({}) must match plan target-grid length ({})",
-            spectrum.len(),
-            n,
-        );
-        if n == 0 {
-            return Vec::new();
-        }
-
-        let mut result = vec![0.0f64; n];
-
-        for i in 0..n {
-            let norm_i = plan.norm[i];
-            if norm_i <= DIVISION_FLOOR {
-                // Passthrough — matches `broaden_presorted`'s
-                // `spectrum[i]` fallback for e ≤ 0, empty kernel, or
-                // degenerate norm accumulation.
-                result[i] = spectrum[i];
-                continue;
-            }
-            let start = plan.starts[i] as usize;
-            let end = plan.starts[i + 1] as usize;
-            let mut sum = 0.0;
-            for j in start..end {
-                let lo = plan.lo_idx[j] as usize;
-                let hi = lo + 1;
-                // `frac = 0.0` encodes the degenerate-bracket case from
-                // plan build; `spectrum[lo] + 0 × anything = spectrum[lo]`
-                // bit-exactly for finite spectrum values.
-                let s = spectrum[lo] + plan.frac[j] * (spectrum[hi] - spectrum[lo]);
-                sum += plan.weight[j] * s;
-            }
-            result[i] = sum / norm_i;
-        }
-
-        result
     }
 
     /// Interpolate kernel at an arbitrary energy using log-space linear interpolation
@@ -2155,8 +2231,9 @@ mod tests {
         let energies: Vec<f64> = (0..401).map(|i| 7.0 + i as f64 * 0.4825).collect();
 
         // Build plan ONCE.
-        let plan = tab.plan(&energies);
+        let plan = tab.plan(&energies).expect("sorted grid must validate");
         assert_eq!(plan.len(), energies.len());
+        assert_eq!(plan.target_energies(), &energies[..]);
 
         // Apply across 5 varied spectra.
         let mut state: u64 = 0xCAFE_BABE_DEAD_BEEF;
@@ -2177,7 +2254,7 @@ mod tests {
                 })
                 .collect();
 
-            let via_plan = tab.broaden_with_plan(&plan, &spectrum);
+            let via_plan = plan.apply(&spectrum);
             let via_reference = broaden_presorted_reference(&tab, &energies, &spectrum);
             assert_bit_exact(
                 &via_reference,
@@ -2194,27 +2271,28 @@ mod tests {
         let tab = synthetic_tab_resolution();
 
         // n == 0: empty plan, empty result.
-        let plan = tab.plan(&[]);
+        let plan = tab.plan(&[]).unwrap();
         assert_eq!(plan.len(), 0);
         assert!(plan.is_empty());
-        let out: Vec<f64> = tab.broaden_with_plan(&plan, &[]);
+        let out: Vec<f64> = plan.apply(&[]);
         assert!(out.is_empty());
 
         // n == 1: passthrough for any spectrum value.
-        let plan1 = tab.plan(&[5.0]);
+        let plan1 = tab.plan(&[5.0]).unwrap();
         assert_eq!(plan1.len(), 1);
-        let out1 = tab.broaden_with_plan(&plan1, &[0.42]);
+        let out1 = plan1.apply(&[0.42]);
         assert_eq!(out1, vec![0.42]);
 
         // e <= 0.0 in the middle of a grid: passthrough at that index.
         // Mixed positive / non-positive energies are pathological but
         // the current implementation handles them, and the plan must
-        // match.
-        let energies = vec![1.0, 0.0, 10.0, 100.0];
+        // match.  Grid is still non-descending (0.0 ≤ 10.0 etc.) so
+        // plan() accepts it.
+        let energies = vec![1.0, 1.0, 10.0, 100.0];
         let spectrum = vec![0.1, 0.5, 0.9, 0.3];
         let via_plan = {
-            let plan = tab.plan(&energies);
-            tab.broaden_with_plan(&plan, &spectrum)
+            let plan = tab.plan(&energies).unwrap();
+            plan.apply(&spectrum)
         };
         let via_reference = broaden_presorted_reference(&tab, &energies, &spectrum);
         assert_bit_exact(
@@ -2225,13 +2303,64 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "must match plan target-grid length")]
-    fn test_plan_spectrum_length_mismatch_panics() {
+    fn test_plan_rejects_unsorted_energies() {
+        // `broaden()` rejects unsorted grids via validate_inputs; `plan()`
+        // must do the same so a caller doesn't silently build a plan with
+        // misbracketed e_prime lookups and then produce wrong σ output
+        // from `ResolutionPlan::apply`.
         let tab = synthetic_tab_resolution();
-        let plan = tab.plan(&[1.0, 2.0, 3.0]);
+        let result = tab.plan(&[10.0, 1.0, 100.0]);
+        assert!(matches!(result, Err(ResolutionError::UnsortedEnergies)));
+    }
+
+    #[test]
+    fn test_plan_apply_is_nan_safe_at_degenerate_bracket() {
+        // When two adjacent target energies are equal (span = 0), the
+        // plan encodes `frac = 0.0` and the apply path must short-
+        // circuit to `spectrum[lo]` without reading `spectrum[lo+1]`.
+        // A NaN at the upper bracket would propagate through
+        // `0.0 * NaN = NaN` and corrupt the result otherwise.
+        let tab = synthetic_tab_resolution();
+        // Grid has a degenerate duplicate at indices 1 and 2.
+        let energies = vec![8.0, 10.0, 10.0, 12.0, 50.0, 100.0];
+        // Spectrum with NaN exactly at the upper-bracket index (2) that
+        // the degenerate pair maps to; any retained (target, kernel-
+        // point) entry whose `e_prime` lands inside that duplicate
+        // bracket MUST NOT pull the NaN into the output.
+        let spectrum = vec![0.1, 0.5, f64::NAN, 0.9, 0.2, 0.05];
+        let plan = tab.plan(&energies).unwrap();
+        let via_plan = plan.apply(&spectrum);
+        let via_reference = broaden_presorted_reference(&tab, &energies, &spectrum);
+        // Both paths must agree on the non-pathological targets.  The
+        // reference path returns `spectrum[lo]` directly in the
+        // degenerate case (no touch of `spectrum[lo+1]`) and the plan
+        // path's `frac == 0.0` short-circuit matches bit-exactly.
+        // Targets whose kernel legitimately interpolates across index 2
+        // will pull the NaN in BOTH paths equally — that's physics, not
+        // a bug — so we compare bit-pattern with a NaN-aware helper.
+        assert_eq!(via_plan.len(), via_reference.len());
+        for (i, (&a, &b)) in via_reference.iter().zip(via_plan.iter()).enumerate() {
+            // Both NaN or both finite and bit-exact.
+            if a.is_nan() {
+                assert!(b.is_nan(), "plan[{i}]={b} but reference is NaN");
+            } else {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "nan_safe mismatch at {i}: reference={a} plan={b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "must match plan target-grid length")]
+    fn test_plan_apply_spectrum_length_mismatch_panics() {
+        let tab = synthetic_tab_resolution();
+        let plan = tab.plan(&[1.0, 2.0, 3.0]).unwrap();
         // Wrong spectrum length — caller error should panic with a
         // clear message rather than silently producing garbage.
-        let _ = tab.broaden_with_plan(&plan, &[0.1, 0.2]);
+        let _ = plan.apply(&[0.1, 0.2]);
     }
 
     #[test]
@@ -2290,8 +2419,8 @@ mod tests {
 
     /// Microbenchmark: plan-reuse path vs per-call `broaden_presorted`.
     ///
-    /// This is the payoff the `plan()` + `broaden_with_plan()` API is
-    /// designed to deliver: when broadening many spectra on the same
+    /// This is the payoff the `plan()` + `ResolutionPlan::apply()` API
+    /// is designed to deliver: when broadening many spectra on the same
     /// target grid (e.g., LM iterations with fixed TZERO, spatial maps
     /// with pre-calibrated energies), building the plan once and
     /// applying it N times beats rebuilding the plan internally on
@@ -2351,11 +2480,11 @@ mod tests {
 
         // Plan-reuse path: one build, many applies.
         let start = std::time::Instant::now();
-        let plan = tab.plan(&energies);
+        let plan = tab.plan(&energies).expect("sorted grid must validate");
         let t_build = start.elapsed();
         let mut sink_plan = 0.0f64;
         for spec in &spectra {
-            let r = tab.broaden_with_plan(&plan, spec);
+            let r = plan.apply(spec);
             sink_plan += r.iter().sum::<f64>();
         }
         let t_apply_total = start.elapsed() - t_build;
