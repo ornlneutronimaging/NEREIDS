@@ -59,6 +59,16 @@ pub enum ResolutionError {
     UnsortedEnergies,
     /// The energy grid and data arrays have mismatched lengths.
     LengthMismatch { energies: usize, data: usize },
+    /// A [`ResolutionPlan`] was passed together with an `energies`
+    /// slice that does not match the grid the plan was built for.
+    ///
+    /// Cheapest-available check hierarchy: length mismatch is caught
+    /// first via [`Self::LengthMismatch`] (`plan.len() ==
+    /// energies.len()` is necessary but not sufficient); a content
+    /// mismatch fires `PlanGridMismatch` with the index of the first
+    /// differing element so callers can diagnose silent-staleness
+    /// bugs at the cache layer.
+    PlanGridMismatch { first_diff_index: usize },
 }
 
 impl fmt::Display for ResolutionError {
@@ -72,6 +82,12 @@ impl fmt::Display for ResolutionError {
                 f,
                 "energy grid length ({}) must match data length ({})",
                 energies, data
+            ),
+            Self::PlanGridMismatch { first_diff_index } => write!(
+                f,
+                "resolution plan was built for a different energy grid than was \
+                 passed to apply_resolution_with_plan (first differing index: {})",
+                first_diff_index,
             ),
         }
     }
@@ -1593,6 +1609,11 @@ pub fn build_resolution_plan(
 /// * Returns [`ResolutionError::LengthMismatch`] if the plan was built
 ///   for a different-length grid than `energies`, or if
 ///   `energies.len() != spectrum.len()`.
+/// * Returns [`ResolutionError::PlanGridMismatch`] if the plan was
+///   built for a different grid of the same length — the cached
+///   `(lo_idx, frac, weight)` entries encode brackets into the old
+///   grid and would silently produce a wrong broadened spectrum if
+///   applied.
 pub fn apply_resolution_with_plan(
     plan: Option<&ResolutionPlan>,
     energies: &[f64],
@@ -1608,6 +1629,25 @@ pub fn apply_resolution_with_plan(
                 energies: energies.len(),
                 data: p.len(),
             });
+        }
+        // Grid-identity check.  A plan built for a different grid of
+        // the same length would still pass the length check and then
+        // gather spectrum values at brackets that belong to the old
+        // grid — silently corrupt output.  Pointer identity is not
+        // enough here because callers legitimately hold the plan and
+        // the target grid in separate `Arc`s whose storage may or
+        // may not alias; bit-exact content equality is the only
+        // robust invariant.  The cost is one full grid scan per
+        // broadening call (O(n), ~3 KB for VENUS 3471-point grid) —
+        // orders of magnitude cheaper than the broadening itself
+        // and cheap vs the silent-staleness failure mode.
+        let plan_grid = p.target_energies();
+        for i in 0..plan_grid.len() {
+            if plan_grid[i].to_bits() != energies[i].to_bits() {
+                return Err(ResolutionError::PlanGridMismatch {
+                    first_diff_index: i,
+                });
+            }
         }
         return Ok(p.apply(spectrum));
     }
@@ -2497,6 +2537,34 @@ mod tests {
                 b.to_bits(),
                 "gaussian fallback mismatch at {i}: baseline={a} planned={b}"
             );
+        }
+    }
+
+    #[test]
+    fn test_apply_resolution_with_plan_rejects_same_length_different_grid() {
+        // Codex finding: `p.len() == energies.len()` is necessary
+        // but not sufficient.  A plan built for one grid and applied
+        // to a different same-length grid would silently gather
+        // spectrum values at brackets belonging to the original grid
+        // — wrong σ output without any error surfaced.  The grid-
+        // identity check in `apply_resolution_with_plan` guards this
+        // failure mode and reports the first differing index.
+        let tab = synthetic_tab_resolution();
+        let resolution = ResolutionFunction::Tabulated(Arc::new(tab.clone()));
+        let energies_plan: Vec<f64> = (0..32).map(|i| 1.0 + i as f64).collect();
+        let mut energies_apply = energies_plan.clone();
+        // Perturb a single interior point so lengths still match.
+        energies_apply[5] += 0.25;
+        let spectrum = vec![0.7; energies_apply.len()];
+
+        let plan = tab.plan(&energies_plan).unwrap();
+        let result =
+            apply_resolution_with_plan(Some(&plan), &energies_apply, &spectrum, &resolution);
+        match result {
+            Err(ResolutionError::PlanGridMismatch { first_diff_index }) => {
+                assert_eq!(first_diff_index, 5);
+            }
+            other => panic!("expected PlanGridMismatch, got {:?}", other),
         }
     }
 

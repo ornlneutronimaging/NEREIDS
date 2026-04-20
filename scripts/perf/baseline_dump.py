@@ -258,14 +258,28 @@ def _diff(label: str, base: dict, cur: dict) -> list[str]:
 
 def verify_baseline(path: Path, include_b1: bool) -> int:
     base = json.loads(path.read_text())
+    # Every case captured in the baseline must be re-run on verify.
+    # Otherwise a baseline saved with --include-b1 could silently print
+    # "BASELINE OK" when verified without --include-b1, skipping the B.1
+    # comparison entirely (Codex finding).  `--include-b1` on the CLI
+    # stays as an explicit opt-in for the dump phase; on verify we
+    # honour whatever the JSON actually holds.
+    effective_include_b1 = include_b1 or ("b1" in base)
     cur = {"a1": run_a1(), "b2": run_b2()}
-    if include_b1:
+    if effective_include_b1:
         cur["b1"] = run_b1()
     diffs: list[str] = []
+    missing: list[str] = []
     for k in base:
         if k not in cur:
+            missing.append(k)
             continue
         diffs.extend(_diff(k, base[k], cur[k]))
+    if missing:
+        print("BASELINE MISMATCH: saved cases missing from current run:")
+        for k in missing:
+            print(f"  {k}")
+        return 1
     if diffs:
         print("BASELINE MISMATCH:")
         for d in diffs:
