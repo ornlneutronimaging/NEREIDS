@@ -984,38 +984,120 @@ impl ResolutionPlan {
 
         let mut result = vec![0.0f64; n];
 
+        // Pre-bind plan slices once per call and pre-slice each
+        // target's entry range before the hot loop.  This is a
+        // bounds-check-elimination (BCE) refactor — every per-entry
+        // index is proven in-bounds by the invariants established in
+        // `plan_presorted`, so the inner loop uses `get_unchecked`
+        // with SAFETY comments citing those invariants.  The compiler
+        // then auto-vectorizes the inner compute where profitable.
+        //
+        // We deliberately do NOT use explicit 2-wide SIMD here — an
+        // experiment via the `wide` crate (commit abandoned;
+        // `perf-lessons.md`) showed that 2-wide f64x2 with gather
+        // emulation is net-negative on AArch64 Neon vs the compiler's
+        // scalar auto-vectorization of the BCE'd inner loop.  On
+        // wider targets (x86 AVX2 / AVX-512) a SIMD rewrite could
+        // still pay off but is out of scope here.
+        //
+        // Control flow, accumulation order, and the `frac == 0.0`
+        // NaN-safety short-circuit are all preserved exactly so the
+        // bit-exact contract with `broaden_presorted` holds for
+        // finite AND pathological (NaN, ±∞) spectra.
+        let lo_idx = self.lo_idx.as_slice();
+        let frac_all = self.frac.as_slice();
+        let weight_all = self.weight.as_slice();
+        let starts = self.starts.as_slice();
+        let norm = self.norm.as_slice();
+        let spec = spectrum;
+
+        // Defence-in-depth: debug-only invariant checks right after
+        // slice binding, so a future change to `plan_presorted` that
+        // silently violates the `unsafe { get_unchecked }` SAFETY
+        // claims below fails loudly in debug builds.  Zero release-
+        // build cost.  Copilot review finding on PR #470.
+        debug_assert_eq!(starts.len(), n + 1);
+        debug_assert_eq!(
+            starts.last().copied(),
+            Some(lo_idx.len() as u32),
+            "plan_presorted invariant: starts.last() must equal lo_idx.len()",
+        );
+        debug_assert_eq!(lo_idx.len(), frac_all.len());
+        debug_assert_eq!(lo_idx.len(), weight_all.len());
+        debug_assert_eq!(norm.len(), n);
+        debug_assert_eq!(spec.len(), n);
+
         for i in 0..n {
-            let norm_i = self.norm[i];
+            let norm_i = norm[i];
             if norm_i <= DIVISION_FLOOR {
                 // Passthrough — matches `broaden_presorted`'s
                 // `spectrum[i]` fallback for e ≤ 0, empty kernel, or
                 // degenerate norm accumulation.
-                result[i] = spectrum[i];
+                result[i] = spec[i];
                 continue;
             }
-            let start = self.starts[i] as usize;
-            let end = self.starts[i + 1] as usize;
-            let mut sum = 0.0;
-            for j in start..end {
-                let lo = self.lo_idx[j] as usize;
-                let frac = self.frac[j];
+            let start = starts[i] as usize;
+            let end = starts[i + 1] as usize;
+            // Zip-compatible pre-bound slices of exactly `end - start`
+            // elements each — the per-j bounds check is elided by the
+            // compiler because the slice length bounds the loop.
+            let los = &lo_idx[start..end];
+            let fracs = &frac_all[start..end];
+            let ws = &weight_all[start..end];
+
+            let mut sum = 0.0f64;
+            for k in 0..los.len() {
+                // SAFETY: `k < los.len()` is guaranteed by the range;
+                // `los`, `fracs`, and `ws` all have length `end - start`
+                // (same subslice bounds), so each `get_unchecked(k)`
+                // read is in-bounds.
+                let lo = unsafe { *los.get_unchecked(k) } as usize;
+                let frac = unsafe { *fracs.get_unchecked(k) };
+                let w = unsafe { *ws.get_unchecked(k) };
+
                 // Degenerate-bracket short-circuit: when the plan
-                // built `frac = 0.0` (span < NEAR_ZERO_FLOOR) we skip
+                // built `frac = -0.0` (span < NEAR_ZERO_FLOOR) we skip
                 // `spectrum[lo+1]` entirely.  Without this branch,
                 // `0.0 * NaN = NaN` would propagate and diverge from
                 // the reference `broaden_presorted`, which returns
-                // `spectrum[lo]` directly for that case.  The
-                // additional comparison is one branch per entry (well-
-                // predicted: degenerate brackets are rare on real
-                // grids) and preserves bit-exactness under pathological
-                // spectra.
-                let s = if frac == 0.0 {
-                    spectrum[lo]
+                // `spectrum[lo]` directly for that case.  Branch is
+                // well-predicted (degenerate brackets are rare on
+                // real grids) and preserves bit-exactness under
+                // pathological spectra.
+                //
+                // The check MUST use `to_bits()` because the non-
+                // degenerate path can legitimately produce
+                // `frac == +0.0` when `e_prime == energies[lo]`
+                // exactly.  In that case `broaden_presorted` still
+                // reads `spectrum[lo+1]` (and propagates NaN if
+                // present there), so the short-circuit MUST NOT
+                // trigger.  `+0.0 == -0.0` returns `true` but
+                // `(+0.0).to_bits() != (-0.0).to_bits()`, so the
+                // bit-pattern check disambiguates exactly which
+                // semantic `plan_presorted` meant.  Copilot review
+                // finding on PR #470.
+                let s = if frac.to_bits() == (-0.0_f64).to_bits() {
+                    // SAFETY: `lo < n` by plan invariant.
+                    // `plan_presorted` only pushes `lo = bracket_hi - 1`
+                    // with `bracket_hi ∈ [1, n - 1]`, so `lo ∈
+                    // [0, n - 2]`.  `spec.len() == n` by the
+                    // precondition assert at the top of `apply`.
+                    unsafe { *spec.get_unchecked(lo) }
                 } else {
-                    let hi = lo + 1;
-                    spectrum[lo] + frac * (spectrum[hi] - spectrum[lo])
+                    // SAFETY: same `lo ∈ [0, n - 2]` invariant, so
+                    // `lo + 1 ∈ [1, n - 1]` is also in-bounds.
+                    let s_lo = unsafe { *spec.get_unchecked(lo) };
+                    let s_hi = unsafe { *spec.get_unchecked(lo + 1) };
+                    s_lo + frac * (s_hi - s_lo)
                 };
-                sum += self.weight[j] * s;
+                // Serial accumulation preserved — no multi-accumulator
+                // reassociation, no SIMD lane-wise tree reduce.
+                // IEEE-754 addition is not associative; changing the
+                // order would break bit-exactness with
+                // `broaden_presorted_reference` (and all
+                // `*_bit_exact_*` unit tests + real-VENUS
+                // `baseline_dump.py --verify`).
+                sum += w * s;
             }
             result[i] = sum / norm_i;
         }
@@ -1414,13 +1496,23 @@ impl TabulatedResolution {
                 let span = energies[hi] - energies[lo];
                 // Degenerate-bracket guard: if span < NEAR_ZERO_FLOOR,
                 // broaden_presorted returns `spectrum[lo]` directly
-                // without the interp arithmetic.  Store `frac = 0.0`
-                // — the apply path short-circuits `frac == 0.0` and
-                // returns `spectrum[lo]` without touching
-                // `spectrum[lo+1]`, so bit-exactness holds even if
-                // `spectrum[lo+1]` is NaN or ±∞.
+                // without the interp arithmetic.  Store `frac = -0.0`
+                // — the apply path short-circuits on the exact bit
+                // pattern of `-0.0` and returns `spectrum[lo]` without
+                // touching `spectrum[lo+1]`, so bit-exactness holds
+                // even if `spectrum[lo+1]` is NaN or ±∞.
+                //
+                // `-0.0` (negative-signed zero) is used as the sentinel
+                // because the non-degenerate path can legitimately
+                // produce `frac == +0.0` when `e_prime == energies[lo]`
+                // exactly — in that case `broaden_presorted` still
+                // reads `spectrum[lo+1]` (and propagates NaN if present
+                // there), so the apply path MUST do the same.  `+0.0`
+                // and `-0.0` compare equal under `==` but differ in
+                // `to_bits()`, which is what apply uses to disambiguate.
+                //  Copilot review finding on PR #470.
                 let entry_frac = if span.abs() < NEAR_ZERO_FLOOR {
-                    0.0
+                    -0.0_f64
                 } else {
                     (e_prime - energies[lo]) / span
                 };
@@ -2463,6 +2555,69 @@ mod tests {
                     a.to_bits(),
                     b.to_bits(),
                     "nan_safe mismatch at {i}: reference={a} plan={b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_plan_apply_exact_match_frac_plus_zero_propagates_nan() {
+        // Regression gate for the subtle P1 Copilot caught on PR #470.
+        //
+        // When `e_prime` aligns EXACTLY with a grid point `energies[lo]`,
+        // `plan_presorted`'s interp fraction computes to `+0.0`, yet the
+        // bracket is NOT degenerate (span is a normal positive float).
+        // In that case `broaden_presorted` still evaluates
+        //   s = spectrum[lo] + (+0.0) * (spectrum[lo+1] - spectrum[lo])
+        // which, for `spectrum[lo+1] = NaN`, reads `0.0 * NaN = NaN` and
+        // propagates `NaN` into `s`.  The earlier `frac == 0.0` branch
+        // in `ResolutionPlan::apply` incorrectly treated this case as
+        // degenerate (since `+0.0 == -0.0` under `==`) and short-circuited
+        // to `spectrum[lo]`, producing a finite output where the scalar
+        // reference produced NaN.
+        //
+        // Fix: `plan_presorted` now stores `-0.0` (negative-signed zero)
+        // for the degenerate sentinel, and `apply` disambiguates via
+        // `to_bits()`, so the non-degenerate `+0.0` path correctly reads
+        // `spectrum[lo+1]` and propagates NaN.
+        let tab = synthetic_tab_resolution();
+
+        // Grid has a point at energy = 10.0.  We engineer a target grid
+        // where the broadened kernel at one of the targets produces an
+        // `e_prime` that aligns exactly with `energies[lo]` of one of its
+        // retained entries.  Achieved by building a coarse target grid
+        // and letting the two-pointer walk land on an exact match on at
+        // least one (target, kernel-point) pair.
+        let energies: Vec<f64> = (0..32).map(|i| 1.0 + i as f64).collect();
+        // Spectrum with NaN scattered at multiple lo+1 indices.  At
+        // least one retained plan entry in this synthetic configuration
+        // will have `frac == +0.0` from an exact-match case, which must
+        // propagate NaN in apply.
+        let mut spectrum = vec![0.5_f64; energies.len()];
+        for v in &mut spectrum[3..] {
+            *v = f64::NAN;
+        }
+        let plan = tab.plan(&energies).unwrap();
+        let via_plan = plan.apply(&spectrum);
+        let via_reference = broaden_presorted_reference(&tab, &energies, &spectrum);
+
+        // Bit-exact equivalence on all targets, including NaN-propagated
+        // ones.  This test would FAIL pre-fix (plan returns finite where
+        // reference returns NaN for any exact-match plan entry with a
+        // NaN at `lo+1`).
+        assert_eq!(via_plan.len(), via_reference.len());
+        for (i, (&a, &b)) in via_reference.iter().zip(via_plan.iter()).enumerate() {
+            if a.is_nan() {
+                assert!(
+                    b.is_nan(),
+                    "target {i}: reference produced NaN (NaN propagated through \
+                     exact-match `frac = +0.0` path) but plan returned finite {b}",
+                );
+            } else {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "target {i}: reference={a} plan={b}"
                 );
             }
         }
