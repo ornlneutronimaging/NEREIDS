@@ -1011,6 +1011,22 @@ impl ResolutionPlan {
         let norm = self.norm.as_slice();
         let spec = spectrum;
 
+        // Defence-in-depth: debug-only invariant checks right after
+        // slice binding, so a future change to `plan_presorted` that
+        // silently violates the `unsafe { get_unchecked }` SAFETY
+        // claims below fails loudly in debug builds.  Zero release-
+        // build cost.  Copilot review finding on PR #470.
+        debug_assert_eq!(starts.len(), n + 1);
+        debug_assert_eq!(
+            starts.last().copied(),
+            Some(lo_idx.len() as u32),
+            "plan_presorted invariant: starts.last() must equal lo_idx.len()",
+        );
+        debug_assert_eq!(lo_idx.len(), frac_all.len());
+        debug_assert_eq!(lo_idx.len(), weight_all.len());
+        debug_assert_eq!(norm.len(), n);
+        debug_assert_eq!(spec.len(), n);
+
         for i in 0..n {
             let norm_i = norm[i];
             if norm_i <= DIVISION_FLOOR {
@@ -1040,7 +1056,7 @@ impl ResolutionPlan {
                 let w = unsafe { *ws.get_unchecked(k) };
 
                 // Degenerate-bracket short-circuit: when the plan
-                // built `frac = 0.0` (span < NEAR_ZERO_FLOOR) we skip
+                // built `frac = -0.0` (span < NEAR_ZERO_FLOOR) we skip
                 // `spectrum[lo+1]` entirely.  Without this branch,
                 // `0.0 * NaN = NaN` would propagate and diverge from
                 // the reference `broaden_presorted`, which returns
@@ -1048,7 +1064,19 @@ impl ResolutionPlan {
                 // well-predicted (degenerate brackets are rare on
                 // real grids) and preserves bit-exactness under
                 // pathological spectra.
-                let s = if frac == 0.0 {
+                //
+                // The check MUST use `to_bits()` because the non-
+                // degenerate path can legitimately produce
+                // `frac == +0.0` when `e_prime == energies[lo]`
+                // exactly.  In that case `broaden_presorted` still
+                // reads `spectrum[lo+1]` (and propagates NaN if
+                // present there), so the short-circuit MUST NOT
+                // trigger.  `+0.0 == -0.0` returns `true` but
+                // `(+0.0).to_bits() != (-0.0).to_bits()`, so the
+                // bit-pattern check disambiguates exactly which
+                // semantic `plan_presorted` meant.  Copilot review
+                // finding on PR #470.
+                let s = if frac.to_bits() == (-0.0_f64).to_bits() {
                     // SAFETY: `lo < n` by plan invariant.
                     // `plan_presorted` only pushes `lo = bracket_hi - 1`
                     // with `bracket_hi ∈ [1, n - 1]`, so `lo ∈
@@ -1468,13 +1496,23 @@ impl TabulatedResolution {
                 let span = energies[hi] - energies[lo];
                 // Degenerate-bracket guard: if span < NEAR_ZERO_FLOOR,
                 // broaden_presorted returns `spectrum[lo]` directly
-                // without the interp arithmetic.  Store `frac = 0.0`
-                // — the apply path short-circuits `frac == 0.0` and
-                // returns `spectrum[lo]` without touching
-                // `spectrum[lo+1]`, so bit-exactness holds even if
-                // `spectrum[lo+1]` is NaN or ±∞.
+                // without the interp arithmetic.  Store `frac = -0.0`
+                // — the apply path short-circuits on the exact bit
+                // pattern of `-0.0` and returns `spectrum[lo]` without
+                // touching `spectrum[lo+1]`, so bit-exactness holds
+                // even if `spectrum[lo+1]` is NaN or ±∞.
+                //
+                // `-0.0` (negative-signed zero) is used as the sentinel
+                // because the non-degenerate path can legitimately
+                // produce `frac == +0.0` when `e_prime == energies[lo]`
+                // exactly — in that case `broaden_presorted` still
+                // reads `spectrum[lo+1]` (and propagates NaN if present
+                // there), so the apply path MUST do the same.  `+0.0`
+                // and `-0.0` compare equal under `==` but differ in
+                // `to_bits()`, which is what apply uses to disambiguate.
+                //  Copilot review finding on PR #470.
                 let entry_frac = if span.abs() < NEAR_ZERO_FLOOR {
-                    0.0
+                    -0.0_f64
                 } else {
                     (e_prime - energies[lo]) / span
                 };
@@ -2517,6 +2555,69 @@ mod tests {
                     a.to_bits(),
                     b.to_bits(),
                     "nan_safe mismatch at {i}: reference={a} plan={b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_plan_apply_exact_match_frac_plus_zero_propagates_nan() {
+        // Regression gate for the subtle P1 Copilot caught on PR #470.
+        //
+        // When `e_prime` aligns EXACTLY with a grid point `energies[lo]`,
+        // `plan_presorted`'s interp fraction computes to `+0.0`, yet the
+        // bracket is NOT degenerate (span is a normal positive float).
+        // In that case `broaden_presorted` still evaluates
+        //   s = spectrum[lo] + (+0.0) * (spectrum[lo+1] - spectrum[lo])
+        // which, for `spectrum[lo+1] = NaN`, reads `0.0 * NaN = NaN` and
+        // propagates `NaN` into `s`.  The earlier `frac == 0.0` branch
+        // in `ResolutionPlan::apply` incorrectly treated this case as
+        // degenerate (since `+0.0 == -0.0` under `==`) and short-circuited
+        // to `spectrum[lo]`, producing a finite output where the scalar
+        // reference produced NaN.
+        //
+        // Fix: `plan_presorted` now stores `-0.0` (negative-signed zero)
+        // for the degenerate sentinel, and `apply` disambiguates via
+        // `to_bits()`, so the non-degenerate `+0.0` path correctly reads
+        // `spectrum[lo+1]` and propagates NaN.
+        let tab = synthetic_tab_resolution();
+
+        // Grid has a point at energy = 10.0.  We engineer a target grid
+        // where the broadened kernel at one of the targets produces an
+        // `e_prime` that aligns exactly with `energies[lo]` of one of its
+        // retained entries.  Achieved by building a coarse target grid
+        // and letting the two-pointer walk land on an exact match on at
+        // least one (target, kernel-point) pair.
+        let energies: Vec<f64> = (0..32).map(|i| 1.0 + i as f64).collect();
+        // Spectrum with NaN scattered at multiple lo+1 indices.  At
+        // least one retained plan entry in this synthetic configuration
+        // will have `frac == +0.0` from an exact-match case, which must
+        // propagate NaN in apply.
+        let mut spectrum = vec![0.5_f64; energies.len()];
+        for v in &mut spectrum[3..] {
+            *v = f64::NAN;
+        }
+        let plan = tab.plan(&energies).unwrap();
+        let via_plan = plan.apply(&spectrum);
+        let via_reference = broaden_presorted_reference(&tab, &energies, &spectrum);
+
+        // Bit-exact equivalence on all targets, including NaN-propagated
+        // ones.  This test would FAIL pre-fix (plan returns finite where
+        // reference returns NaN for any exact-match plan entry with a
+        // NaN at `lo+1`).
+        assert_eq!(via_plan.len(), via_reference.len());
+        for (i, (&a, &b)) in via_reference.iter().zip(via_plan.iter()).enumerate() {
+            if a.is_nan() {
+                assert!(
+                    b.is_nan(),
+                    "target {i}: reference produced NaN (NaN propagated through \
+                     exact-match `frac = +0.0` path) but plan returned finite {b}",
+                );
+            } else {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "target {i}: reference={a} plan={b}"
                 );
             }
         }

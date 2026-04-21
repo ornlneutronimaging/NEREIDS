@@ -6,9 +6,11 @@ This profile verifies whether the FD t0/L_scale cost (that motivates
 (gradient + Fisher info) — 8 FD broaden_presorted per iter vs LM's
 4/iter.
 
-Wall per call is ~0.2 s on the 4×4 crop post-PR #469, so we
-wrap the measured fit in a short repeat loop to cover a 5–6 s
-sampling window.
+Wall per call is on the order of a few seconds on the 4×4 crop
+(~3.2 s measured in the PR #469 baseline), so `N_REPEATS = 3`
+yields an aggregate sampling window of roughly 9–10 s — enough
+for `/usr/bin/sample`'s 15 s default window to collect a solid
+profile without blowing up wall time for the driver.
 """
 
 from __future__ import annotations
