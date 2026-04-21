@@ -984,38 +984,92 @@ impl ResolutionPlan {
 
         let mut result = vec![0.0f64; n];
 
+        // Pre-bind plan slices once per call and pre-slice each
+        // target's entry range before the hot loop.  This is a
+        // bounds-check-elimination (BCE) refactor — every per-entry
+        // index is proven in-bounds by the invariants established in
+        // `plan_presorted`, so the inner loop uses `get_unchecked`
+        // with SAFETY comments citing those invariants.  The compiler
+        // then auto-vectorizes the inner compute where profitable.
+        //
+        // We deliberately do NOT use explicit 2-wide SIMD here — an
+        // experiment via the `wide` crate (commit abandoned;
+        // `perf-lessons.md`) showed that 2-wide f64x2 with gather
+        // emulation is net-negative on AArch64 Neon vs the compiler's
+        // scalar auto-vectorization of the BCE'd inner loop.  On
+        // wider targets (x86 AVX2 / AVX-512) a SIMD rewrite could
+        // still pay off but is out of scope here.
+        //
+        // Control flow, accumulation order, and the `frac == 0.0`
+        // NaN-safety short-circuit are all preserved exactly so the
+        // bit-exact contract with `broaden_presorted` holds for
+        // finite AND pathological (NaN, ±∞) spectra.
+        let lo_idx = self.lo_idx.as_slice();
+        let frac_all = self.frac.as_slice();
+        let weight_all = self.weight.as_slice();
+        let starts = self.starts.as_slice();
+        let norm = self.norm.as_slice();
+        let spec = spectrum;
+
         for i in 0..n {
-            let norm_i = self.norm[i];
+            let norm_i = norm[i];
             if norm_i <= DIVISION_FLOOR {
                 // Passthrough — matches `broaden_presorted`'s
                 // `spectrum[i]` fallback for e ≤ 0, empty kernel, or
                 // degenerate norm accumulation.
-                result[i] = spectrum[i];
+                result[i] = spec[i];
                 continue;
             }
-            let start = self.starts[i] as usize;
-            let end = self.starts[i + 1] as usize;
-            let mut sum = 0.0;
-            for j in start..end {
-                let lo = self.lo_idx[j] as usize;
-                let frac = self.frac[j];
+            let start = starts[i] as usize;
+            let end = starts[i + 1] as usize;
+            // Zip-compatible pre-bound slices of exactly `end - start`
+            // elements each — the per-j bounds check is elided by the
+            // compiler because the slice length bounds the loop.
+            let los = &lo_idx[start..end];
+            let fracs = &frac_all[start..end];
+            let ws = &weight_all[start..end];
+
+            let mut sum = 0.0f64;
+            for k in 0..los.len() {
+                // SAFETY: `k < los.len()` is guaranteed by the range;
+                // `los`, `fracs`, and `ws` all have length `end - start`
+                // (same subslice bounds), so each `get_unchecked(k)`
+                // read is in-bounds.
+                let lo = unsafe { *los.get_unchecked(k) } as usize;
+                let frac = unsafe { *fracs.get_unchecked(k) };
+                let w = unsafe { *ws.get_unchecked(k) };
+
                 // Degenerate-bracket short-circuit: when the plan
                 // built `frac = 0.0` (span < NEAR_ZERO_FLOOR) we skip
                 // `spectrum[lo+1]` entirely.  Without this branch,
                 // `0.0 * NaN = NaN` would propagate and diverge from
                 // the reference `broaden_presorted`, which returns
-                // `spectrum[lo]` directly for that case.  The
-                // additional comparison is one branch per entry (well-
-                // predicted: degenerate brackets are rare on real
-                // grids) and preserves bit-exactness under pathological
-                // spectra.
+                // `spectrum[lo]` directly for that case.  Branch is
+                // well-predicted (degenerate brackets are rare on
+                // real grids) and preserves bit-exactness under
+                // pathological spectra.
                 let s = if frac == 0.0 {
-                    spectrum[lo]
+                    // SAFETY: `lo < n` by plan invariant.
+                    // `plan_presorted` only pushes `lo = bracket_hi - 1`
+                    // with `bracket_hi ∈ [1, n - 1]`, so `lo ∈
+                    // [0, n - 2]`.  `spec.len() == n` by the
+                    // precondition assert at the top of `apply`.
+                    unsafe { *spec.get_unchecked(lo) }
                 } else {
-                    let hi = lo + 1;
-                    spectrum[lo] + frac * (spectrum[hi] - spectrum[lo])
+                    // SAFETY: same `lo ∈ [0, n - 2]` invariant, so
+                    // `lo + 1 ∈ [1, n - 1]` is also in-bounds.
+                    let s_lo = unsafe { *spec.get_unchecked(lo) };
+                    let s_hi = unsafe { *spec.get_unchecked(lo + 1) };
+                    s_lo + frac * (s_hi - s_lo)
                 };
-                sum += self.weight[j] * s;
+                // Serial accumulation preserved — no multi-accumulator
+                // reassociation, no SIMD lane-wise tree reduce.
+                // IEEE-754 addition is not associative; changing the
+                // order would break bit-exactness with
+                // `broaden_presorted_reference` (and all
+                // `*_bit_exact_*` unit tests + real-VENUS
+                // `baseline_dump.py --verify`).
+                sum += w * s;
             }
             result[i] = sum / norm_i;
         }
