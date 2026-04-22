@@ -69,6 +69,11 @@ pub enum ResolutionError {
     /// differing element so callers can diagnose silent-staleness
     /// bugs at the cache layer.
     PlanGridMismatch { first_diff_index: usize },
+    /// A [`ResolutionMatrix`] was passed together with an `energies`
+    /// slice that does not match the grid the matrix was compiled for.
+    /// Same semantics as [`Self::PlanGridMismatch`] but for the CSR
+    /// path (see [`apply_r`]).
+    MatrixGridMismatch { first_diff_index: usize },
 }
 
 impl fmt::Display for ResolutionError {
@@ -87,6 +92,12 @@ impl fmt::Display for ResolutionError {
                 f,
                 "resolution plan was built for a different energy grid than was \
                  passed to apply_resolution_with_plan (first differing index: {})",
+                first_diff_index,
+            ),
+            Self::MatrixGridMismatch { first_diff_index } => write!(
+                f,
+                "resolution matrix was compiled for a different energy grid than was \
+                 passed to apply_r (first differing index: {})",
                 first_diff_index,
             ),
         }
@@ -1104,6 +1115,223 @@ impl ResolutionPlan {
 
         result
     }
+
+    /// Compile this plan into a row-stochastic CSR
+    /// [`ResolutionMatrix`].
+    ///
+    /// The compiled matrix is an explicit sparse representation of
+    /// the resolution operator `R` on the plan's target grid.  Each
+    /// row sums to 1.0 to machine precision (passthrough rows store
+    /// a single `(i, i, 1.0)` entry to match [`ResolutionPlan::apply`]
+    /// 's `norm ≤ DIVISION_FLOOR` fallback).
+    ///
+    /// Degenerate-bracket handling uses the `-0.0` sentinel
+    /// convention introduced in PR #470: if `plan.frac[e]` has the
+    /// bit pattern of `-0.0`, the entry contributes `weight / norm`
+    /// at column `lo` only (no `lo+1` bracket).  A regular `+0.0`
+    /// frac contributes `weight * 1.0 / norm` at `lo` and
+    /// `weight * 0.0 / norm = 0.0` at `lo+1` — those zero columns
+    /// are retained in CSR with `value = 0.0` to preserve
+    /// downstream NaN-safety if the consumer re-multiplies by a
+    /// spectrum containing NaN at `lo+1`.
+    ///
+    /// **Equivalence contract**: [`apply_r`] on the compiled matrix
+    /// produces per-element output within `1e-13` relative tolerance
+    /// of [`Self::apply`] on the same spectrum — not bit-exact,
+    /// because the CSR matvec sums contributions in column order
+    /// while `apply` sums in entry order and IEEE-754 addition is
+    /// non-associative.
+    pub fn compile_to_matrix(&self) -> ResolutionMatrix {
+        let n = self.target_energies.len();
+        let mut row_starts: Vec<u32> = Vec::with_capacity(n + 1);
+        row_starts.push(0);
+        let mut col_indices: Vec<u32> = Vec::new();
+        let mut values: Vec<f64> = Vec::new();
+
+        // Reusable per-row accumulator.  Columns accumulate into a
+        // BTreeMap keyed by spectrum index so the final CSR row is
+        // emitted in ascending column order — the required CSR
+        // invariant and the condition the `apply_r` equivalence
+        // bound depends on.
+        let mut acc: std::collections::BTreeMap<u32, f64> = std::collections::BTreeMap::new();
+
+        for i in 0..n {
+            acc.clear();
+            let norm_i = self.norm[i];
+            if norm_i <= DIVISION_FLOOR {
+                // Passthrough row — matches `apply`'s early return.
+                col_indices.push(i as u32);
+                values.push(1.0);
+                row_starts.push(col_indices.len() as u32);
+                continue;
+            }
+            let start = self.starts[i] as usize;
+            let end = self.starts[i + 1] as usize;
+            for e in start..end {
+                let lo = self.lo_idx[e];
+                let frac = self.frac[e];
+                let w = self.weight[e];
+                if frac.to_bits() == (-0.0_f64).to_bits() {
+                    // Degenerate bracket — `apply` reads `spec[lo]`
+                    // only, so the CSR row contributes only at `lo`.
+                    *acc.entry(lo).or_insert(0.0) += w / norm_i;
+                } else {
+                    // Regular linear-interp entry: `w * ((1 - frac)
+                    // * spec[lo] + frac * spec[lo + 1]) / norm_i`.
+                    *acc.entry(lo).or_insert(0.0) += w * (1.0 - frac) / norm_i;
+                    *acc.entry(lo + 1).or_insert(0.0) += w * frac / norm_i;
+                }
+            }
+            for (&col, &val) in acc.iter() {
+                col_indices.push(col);
+                values.push(val);
+            }
+            row_starts.push(col_indices.len() as u32);
+        }
+
+        ResolutionMatrix {
+            target_energies: self.target_energies.clone(),
+            row_starts,
+            col_indices,
+            values,
+        }
+    }
+}
+
+/// Row-stochastic CSR representation of the resolution operator `R`
+/// on a fixed target energy grid.
+///
+/// Built from a [`ResolutionPlan`] via
+/// [`ResolutionPlan::compile_to_matrix`].  Exposed so downstream
+/// surrogates (see epic #472) can access the row-local entries
+/// `R_{i, j}` directly for LP / quadrature construction.
+///
+/// Owns a copy of the target energy grid for the same reason
+/// [`ResolutionPlan`] does: caller-side grid-identity checks and
+/// explicit grid-mismatch errors via
+/// [`ResolutionError::MatrixGridMismatch`].
+#[derive(Debug, Clone)]
+pub struct ResolutionMatrix {
+    /// Target energy grid the matrix was compiled for (owned copy).
+    target_energies: Vec<f64>,
+    /// `row_starts[i]..row_starts[i+1]` indexes into
+    /// `col_indices`/`values` for row `i`.  Length `n + 1`.
+    row_starts: Vec<u32>,
+    /// Column indices in ascending order within each row.
+    col_indices: Vec<u32>,
+    /// CSR values.  Row `i` sums to 1.0 within machine precision
+    /// (passthrough rows store exactly `1.0` at column `i`).
+    values: Vec<f64>,
+}
+
+impl ResolutionMatrix {
+    /// Number of rows (target-grid size) covered by this matrix.
+    pub fn len(&self) -> usize {
+        self.target_energies.len()
+    }
+
+    /// True when the matrix covers no target energies.
+    pub fn is_empty(&self) -> bool {
+        self.target_energies.is_empty()
+    }
+
+    /// Total number of non-zero entries stored.  Includes structural
+    /// zeros retained from regular-bracket `frac == +0.0` entries.
+    pub fn nnz(&self) -> usize {
+        self.values.len()
+    }
+
+    /// Target energy grid the matrix was compiled for.
+    pub fn target_energies(&self) -> &[f64] {
+        &self.target_energies
+    }
+
+    /// CSR row-start offsets.  `row_starts()[i]..row_starts()[i+1]`
+    /// names the entry range for row `i`.  Length `len() + 1`.
+    pub fn row_starts(&self) -> &[u32] {
+        &self.row_starts
+    }
+
+    /// CSR column indices.  Sorted ascending within each row.
+    pub fn col_indices(&self) -> &[u32] {
+        &self.col_indices
+    }
+
+    /// CSR values.  Each row sums to 1.0 to machine precision.
+    pub fn values(&self) -> &[f64] {
+        &self.values
+    }
+}
+
+/// Apply a compiled [`ResolutionMatrix`] to a spectrum on the same
+/// target grid the matrix was compiled for.
+///
+/// Output is numerically equivalent to [`ResolutionPlan::apply`] on
+/// the same spectrum within `1e-13` relative tolerance per element;
+/// not bit-exact, because CSR matvec sums in column order while
+/// `ResolutionPlan::apply` sums in entry order.
+///
+/// # Panics
+///
+/// Panics if `spectrum.len() != matrix.len()`.  Use
+/// [`apply_resolution_with_matrix`] for a checked entrypoint that
+/// returns [`ResolutionError::LengthMismatch`] instead.
+pub fn apply_r(matrix: &ResolutionMatrix, spectrum: &[f64]) -> Vec<f64> {
+    let n = matrix.len();
+    assert_eq!(
+        spectrum.len(),
+        n,
+        "spectrum length ({}) must match matrix grid length ({})",
+        spectrum.len(),
+        n,
+    );
+    let mut out = vec![0.0f64; n];
+    for (i, out_i) in out.iter_mut().enumerate() {
+        let start = matrix.row_starts[i] as usize;
+        let end = matrix.row_starts[i + 1] as usize;
+        let mut sum = 0.0f64;
+        for e in start..end {
+            let col = matrix.col_indices[e] as usize;
+            sum += matrix.values[e] * spectrum[col];
+        }
+        *out_i = sum;
+    }
+    out
+}
+
+/// Checked variant of [`apply_r`] that validates the matrix was
+/// compiled for `energies` before applying.
+///
+/// Returns [`ResolutionError::LengthMismatch`] when the lengths
+/// differ and [`ResolutionError::MatrixGridMismatch`] when the
+/// lengths match but the grid contents differ.
+pub fn apply_resolution_with_matrix(
+    energies: &[f64],
+    matrix: &ResolutionMatrix,
+    spectrum: &[f64],
+) -> Result<Vec<f64>, ResolutionError> {
+    if energies.len() != matrix.len() {
+        return Err(ResolutionError::LengthMismatch {
+            energies: energies.len(),
+            data: matrix.len(),
+        });
+    }
+    if spectrum.len() != matrix.len() {
+        return Err(ResolutionError::LengthMismatch {
+            energies: matrix.len(),
+            data: spectrum.len(),
+        });
+    }
+    for (i, (e_cur, e_ref)) in energies.iter().zip(matrix.target_energies()).enumerate() {
+        // `to_bits()` equality catches `-0.0 vs +0.0` and NaN-bit
+        // differences that float `==` silently accepts or rejects.
+        if e_cur.to_bits() != e_ref.to_bits() {
+            return Err(ResolutionError::MatrixGridMismatch {
+                first_diff_index: i,
+            });
+        }
+    }
+    Ok(apply_r(matrix, spectrum))
 }
 
 impl TabulatedResolution {
@@ -2893,5 +3121,274 @@ mod tests {
             t_build + t_apply_total,
         );
         assert_eq!(sink_percall.to_bits(), sink_plan.to_bits());
+    }
+
+    // ---------- ResolutionMatrix (CSR compile) tests ----------
+
+    /// Helper: build a TabulatedResolution + plan + matrix on a
+    /// uniform energy grid using the VENUS fixture kernel.
+    fn build_fixture_plan_and_matrix(
+        n_grid: usize,
+    ) -> (Vec<f64>, ResolutionPlan, ResolutionMatrix) {
+        let res = TabulatedResolution::from_file("../../_fts_bl10_0p5meV_1keV_25pts.txt", 25.0)
+            .expect("load VENUS resolution fixture");
+        let energies: Vec<f64> = (0..n_grid)
+            .map(|i| 7.0 + (200.0 - 7.0) * (i as f64) / ((n_grid - 1) as f64))
+            .collect();
+        let plan = res.plan(&energies).expect("build plan on sorted grid");
+        let matrix = plan.compile_to_matrix();
+        (energies, plan, matrix)
+    }
+
+    #[test]
+    fn resolution_matrix_is_row_stochastic() {
+        let (_energies, _plan, matrix) = build_fixture_plan_and_matrix(512);
+        for i in 0..matrix.len() {
+            let start = matrix.row_starts()[i] as usize;
+            let end = matrix.row_starts()[i + 1] as usize;
+            let row_sum: f64 = matrix.values()[start..end].iter().sum();
+            assert!(
+                (row_sum - 1.0).abs() < 1e-13,
+                "row {} sum = {} (expected 1.0 within 1e-13)",
+                i,
+                row_sum,
+            );
+        }
+    }
+
+    #[test]
+    fn resolution_matrix_apply_equivalent_to_plan_apply() {
+        let (_energies, plan, matrix) = build_fixture_plan_and_matrix(512);
+        // Realistic test spectrum: Beer-Lambert with a Gaussian
+        // resonance dip, avoids the all-ones trivial case.
+        let n_grid = matrix.len();
+        let spec: Vec<f64> = (0..n_grid)
+            .map(|i| {
+                let e = 7.0 + (200.0 - 7.0) * (i as f64) / ((n_grid - 1) as f64);
+                let sigma = 50.0 * (-((e - 80.0).powi(2)) / 8.0).exp()
+                    + 10.0 * (-((e - 150.0).powi(2)) / 4.0).exp();
+                (-1.6e-4 * sigma).exp()
+            })
+            .collect();
+        let plan_out = plan.apply(&spec);
+        let matrix_out = apply_r(&matrix, &spec);
+        let mut max_rel = 0.0f64;
+        for (a, b) in plan_out.iter().zip(matrix_out.iter()) {
+            let denom = a.abs().max(1e-300);
+            let rel = (a - b).abs() / denom;
+            if rel > max_rel {
+                max_rel = rel;
+            }
+        }
+        assert!(
+            max_rel < 1e-13,
+            "apply_r vs plan.apply max relative mismatch = {:.3e} (expected < 1e-13)",
+            max_rel,
+        );
+    }
+
+    #[test]
+    fn resolution_matrix_apply_equivalent_across_densities() {
+        let (_energies, plan, matrix) = build_fixture_plan_and_matrix(512);
+        let n_grid = matrix.len();
+        for &n_density in &[1e-5_f64, 1e-4, 1.6e-4, 1e-3] {
+            let spec: Vec<f64> = (0..n_grid)
+                .map(|i| {
+                    let e = 7.0 + (200.0 - 7.0) * (i as f64) / ((n_grid - 1) as f64);
+                    let sigma = 50.0 * (-((e - 80.0).powi(2)) / 8.0).exp()
+                        + 10.0 * (-((e - 150.0).powi(2)) / 4.0).exp();
+                    (-n_density * sigma).exp()
+                })
+                .collect();
+            let plan_out = plan.apply(&spec);
+            let matrix_out = apply_r(&matrix, &spec);
+            let mut max_rel = 0.0f64;
+            for (a, b) in plan_out.iter().zip(matrix_out.iter()) {
+                let denom = a.abs().max(1e-300);
+                let rel = (a - b).abs() / denom;
+                if rel > max_rel {
+                    max_rel = rel;
+                }
+            }
+            assert!(
+                max_rel < 1e-13,
+                "density n={:.1e}: max rel mismatch {:.3e} (expected < 1e-13)",
+                n_density,
+                max_rel,
+            );
+        }
+    }
+
+    #[test]
+    fn resolution_matrix_csr_column_indices_sorted_per_row() {
+        let (_energies, _plan, matrix) = build_fixture_plan_and_matrix(256);
+        for i in 0..matrix.len() {
+            let start = matrix.row_starts()[i] as usize;
+            let end = matrix.row_starts()[i + 1] as usize;
+            let row_cols = &matrix.col_indices()[start..end];
+            for w in row_cols.windows(2) {
+                assert!(
+                    w[0] < w[1],
+                    "row {} col_indices not strictly ascending: {:?}",
+                    i,
+                    row_cols,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resolution_matrix_grid_mismatch_detected() {
+        let (energies, _plan, matrix) = build_fixture_plan_and_matrix(128);
+        let spec = vec![1.0_f64; matrix.len()];
+
+        // Same grid → passes.
+        let ok = apply_resolution_with_matrix(&energies, &matrix, &spec);
+        assert!(ok.is_ok());
+
+        // Perturb one energy → MatrixGridMismatch with the
+        // offending index.
+        let mut mutated = energies.clone();
+        mutated[37] += 1e-12;
+        let err = apply_resolution_with_matrix(&mutated, &matrix, &spec)
+            .expect_err("grid mismatch must error");
+        assert_eq!(
+            err,
+            ResolutionError::MatrixGridMismatch {
+                first_diff_index: 37,
+            }
+        );
+    }
+
+    #[test]
+    fn resolution_matrix_length_mismatch_detected() {
+        let (energies, _plan, matrix) = build_fixture_plan_and_matrix(64);
+        let short_spec = vec![1.0_f64; matrix.len() - 1];
+        let err = apply_resolution_with_matrix(&energies, &matrix, &short_spec)
+            .expect_err("length mismatch must error");
+        assert!(matches!(err, ResolutionError::LengthMismatch { .. }));
+    }
+
+    #[test]
+    fn resolution_matrix_empty_plan() {
+        // `plan_presorted` on an empty slice yields an empty plan;
+        // compile must not panic and must produce a valid empty
+        // matrix.
+        let res = TabulatedResolution::from_file("../../_fts_bl10_0p5meV_1keV_25pts.txt", 25.0)
+            .expect("load fixture");
+        let empty: Vec<f64> = Vec::new();
+        let plan = res.plan(&empty).expect("plan empty grid");
+        let matrix = plan.compile_to_matrix();
+        assert_eq!(matrix.len(), 0);
+        assert!(matrix.is_empty());
+        assert_eq!(matrix.nnz(), 0);
+    }
+
+    /// Microbenchmark: `apply_r` (ResolutionMatrix CSR) vs
+    /// `ResolutionPlan::apply`, 3471-bin VENUS production grid × 100
+    /// spectra. Exercised manually to decide whether the CSR compile +
+    /// CSR matvec beats the plan's two-pointer walk at the
+    /// no-SIMD-no-unsafe baseline promised in #473.
+    ///
+    /// Run manually with:
+    ///
+    /// ```text
+    /// cargo test --release -p nereids-physics \
+    ///   resolution_matrix_apply_microbench -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "microbenchmark; requires PLEIADES resolution file `_fts_bl10_0p5meV_1keV_25pts.txt` at repo root"]
+    fn resolution_matrix_apply_microbench() {
+        let res_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("_fts_bl10_0p5meV_1keV_25pts.txt");
+        let text = std::fs::read_to_string(&res_path).expect(
+            "missing PLEIADES resolution file at repo root (see `#[ignore]` message for details)",
+        );
+        let tab = TabulatedResolution::from_text(&text, 25.0).unwrap();
+
+        let n = 3471_usize;
+        let energies: Vec<f64> = (0..n)
+            .map(|i| 7.0 + i as f64 * ((200.0 - 7.0) / (n - 1) as f64))
+            .collect();
+        let plan = tab.plan(&energies).expect("sorted grid must validate");
+
+        let t_compile = std::time::Instant::now();
+        let matrix = plan.compile_to_matrix();
+        let t_compile = t_compile.elapsed();
+
+        let spec: Vec<f64> = energies
+            .iter()
+            .map(|&e| {
+                let sigma = 50.0 * (-((e - 80.0).powi(2)) / 8.0).exp()
+                    + 10.0 * (-((e - 150.0).powi(2)) / 4.0).exp();
+                (-1.6e-4 * sigma).exp()
+            })
+            .collect();
+
+        let repeats = 100_usize;
+
+        // Warm both paths so the first call's cache-miss latency
+        // does not skew the micro-times.
+        for _ in 0..5 {
+            let _ = plan.apply(&spec);
+            let _ = apply_r(&matrix, &spec);
+        }
+
+        let start = std::time::Instant::now();
+        let mut sink_plan = 0.0f64;
+        for _ in 0..repeats {
+            sink_plan += plan.apply(&spec).iter().sum::<f64>();
+        }
+        let t_plan = start.elapsed();
+
+        let start = std::time::Instant::now();
+        let mut sink_matrix = 0.0f64;
+        for _ in 0..repeats {
+            sink_matrix += apply_r(&matrix, &spec).iter().sum::<f64>();
+        }
+        let t_matrix = start.elapsed();
+
+        let speedup = t_plan.as_secs_f64() / t_matrix.as_secs_f64();
+        println!(
+            "ResolutionMatrix microbench (n_grid={n}, {repeats} spectra):\n\
+             compile (once)       : {:?}  ({} nnz)\n\
+             plan.apply × {repeats} : {:?}\n\
+             apply_r   × {repeats} : {:?}\n\
+             speedup vs plan      : {:.2}x\n\
+             sinks (plan/matrix)  : {:.6e} / {:.6e}",
+            t_compile,
+            matrix.nnz(),
+            t_plan,
+            t_matrix,
+            speedup,
+            sink_plan,
+            sink_matrix,
+        );
+    }
+
+    #[test]
+    fn resolution_matrix_preserves_passthrough_rows() {
+        // A passthrough row (plan.norm[i] ≤ DIVISION_FLOOR) must
+        // compile to a single CSR entry at (i, i, 1.0) so that
+        // `apply_r` matches `plan.apply`'s spec[i] fallback.
+        let (_energies, plan, matrix) = build_fixture_plan_and_matrix(64);
+        for i in 0..plan.len() {
+            if plan.norm[i] <= constants::DIVISION_FLOOR {
+                let start = matrix.row_starts()[i] as usize;
+                let end = matrix.row_starts()[i + 1] as usize;
+                assert_eq!(
+                    end - start,
+                    1,
+                    "passthrough row {} should have exactly 1 entry",
+                    i,
+                );
+                assert_eq!(matrix.col_indices()[start] as usize, i);
+                assert_eq!(matrix.values()[start].to_bits(), 1.0_f64.to_bits());
+            }
+        }
     }
 }
