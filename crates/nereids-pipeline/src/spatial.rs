@@ -659,11 +659,12 @@ pub fn spatial_map_typed(
     // local plan means the exact `apply_resolution_with_plan` path
     // runs as today.  PR #475 benched both Lanczos σ-pushforward
     // Gauss quadrature and Chebyshev-in-density on real VENUS
-    // (3471-bin production grid): Chebyshev won 12.2× vs exact at
-    // 1e-15 accuracy, vs Lanczos 7.1× at 4e-15.  Lanczos code was
-    // deleted per the issue's "drop the loser" contract; this
-    // build site now always returns the Chebyshev variant via the
-    // public `ScalarSurrogatePlan` type alias (= `ScalarChebyshevPlan`).
+    // (3471-bin production grid); Chebyshev won on both the
+    // accuracy (≤ 2e-15 vs ≤ 4e-15) and wall-time axes.  Lanczos
+    // code was deleted per the issue's "drop the loser" contract;
+    // this build site now always returns the Chebyshev variant
+    // via the public `ScalarSurrogatePlan` type alias
+    // (= `ScalarChebyshevPlan`).
     let caller_scalar = config.precomputed_sparse_scalar_plan().cloned();
     let sparse_scalar_plan: Option<Arc<nereids_physics::surrogate::ScalarSurrogatePlan>> =
         if !config.fit_temperature()
@@ -678,6 +679,18 @@ pub fn spatial_map_typed(
             // winner).  Training box: 2 × the initial density;
             // Chebyshev's interpolant is exact at its nodes and
             // tight (≤ 1e-15 rel err) across the box.
+            //
+            // **Known limitation — deferred to PR #476** (mirrors
+            // the cubature policy, see lines 578-588): if
+            // `initial_densities[0]` is near zero the floor clamps
+            // `n_max` to 2e-6, but the solver may explore well
+            // past that.  The `scalar_density_within_box` guard in
+            // `transmission_model.rs` catches this and falls back
+            // to the exact `ResolutionPlan` path, so the worst
+            // outcome is lost speedup — never silent accuracy
+            // loss.  PR #476 (trust-region wrapper) owns
+            // box-rebuild-on-escape and replaces this static
+            // policy.  Claude round-1 P2-#5 on PR #475.
             const CHEBYSHEV_NODES: usize = 16;
             let n_max: f64 = 2.0 * config.initial_densities()[0].max(1e-6);
             match nereids_physics::surrogate::ScalarChebyshevPlan::build(
@@ -699,10 +712,25 @@ pub fn spatial_map_typed(
             None
         };
     // Preserve caller-supplied scalar plan if local build didn't run.
+    // Grid-identity check uses `to_bits()` per element (matches
+    // `scalar_eligible` / `cubature_eligible`), not `==`, so `-0.0`
+    // vs `+0.0` and NaN-bit mismatches can't silently slip through
+    // the caller-fallback pre-filter.  Claude round-1 P2 on PR #475.
     let sparse_scalar_plan = sparse_scalar_plan.or_else(|| {
         caller_scalar.filter(|p| {
-            p.len() == xs.first().map(|r| r.len()).unwrap_or(0)
-                && p.target_energies() == config.energies()
+            let expected_len = xs.first().map(|r| r.len()).unwrap_or(0);
+            if p.len() != expected_len {
+                return false;
+            }
+            let plan_grid = p.target_energies();
+            let cfg_grid = config.energies();
+            if plan_grid.len() != cfg_grid.len() {
+                return false;
+            }
+            plan_grid
+                .iter()
+                .zip(cfg_grid)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
         })
     });
 

@@ -718,12 +718,11 @@ impl SparseEmpiricalCubaturePlan {
 // scalar path gets a dedicated surrogate.  PR #475 built both
 // round-2 candidates (Lanczos σ-pushforward Gauss quadrature,
 // Chebyshev-in-density) side-by-side and benched them on the real
-// VENUS 3471-bin production grid:
-//
-//     Lanczos Gauss (m = 6):  fwd = 34 µs,  max_err = 4e-15, 7.1× vs exact.
-//     Chebyshev    (M = 16):  fwd = 20 µs,  max_err = 2e-15, 12.2× vs exact.
-//
-// **Chebyshev won**.  Lanczos + Gauss-pushforward machinery was
+// VENUS 3471-bin production grid.  Chebyshev won both the
+// accuracy (max_err ≤ 2e-15 vs ≤ 4e-15) **and** the wall-time
+// axis by a wide margin — the ordering is stable across
+// hardware, even though absolute µs-per-row numbers aren't.
+// **Chebyshev won**; Lanczos + Gauss-pushforward machinery was
 // deleted per the issue's "drop the loser" contract — no
 // same-name-different-function duplication.  If future research
 // finds a better scalar surrogate, the public
@@ -795,9 +794,10 @@ pub struct ScalarChebyshevPlan {
 impl ScalarChebyshevPlan {
     /// Build an `M`-node Chebyshev-in-density plan from a
     /// [`ResolutionMatrix`] + scalar σ + density box `[0, n_max]`.
-    /// Internally calls [`apply_r`] `M` times (one per Chebyshev
-    /// node) to get exact row evaluations, then runs a per-row
-    /// discrete cosine transform to extract Chebyshev coefficients.
+    /// Internally calls [`crate::resolution::apply_r`] `M` times
+    /// (one per Chebyshev node) to get exact row evaluations, then
+    /// runs a per-row discrete cosine transform to extract
+    /// Chebyshev coefficients.
     ///
     /// Cost: `M × N × avg_nnz_per_row` FMAs for the exact sampling
     /// pass, plus `M^2` per row for the DCT (matrix-vector form,
@@ -987,9 +987,9 @@ impl ScalarChebyshevPlan {
 /// layers (see `TransmissionFitModel` / `PrecomputedTransmissionModel`).
 ///
 /// This was an enum of `Gauss` vs `Chebyshev` during PR #475's
-/// bench-off period; Chebyshev won the real-VENUS bench (12.2×
-/// vs exact, 1e-15 accuracy at VENUS density) and Lanczos Gauss
-/// was deleted per the issue's "drop the loser" contract.
+/// bench-off period; Chebyshev won the real-VENUS bench on both
+/// accuracy (≤ 2e-15 vs ≤ 4e-15) and wall-time axes, and Lanczos
+/// Gauss was deleted per the issue's "drop the loser" contract.
 /// The type alias is kept as a public stable name so callers and
 /// downstream dispatch code aren't coupled to the winning impl's
 /// concrete type — if a future research sprint finds a better
@@ -1731,10 +1731,10 @@ mod tests {
     /// VENUS density (issue #475 success criterion) and logs
     /// per-call wall time.  PR #475 benched this against a
     /// Lanczos σ-pushforward Gauss quadrature on the same kernel
-    /// and picked Chebyshev (12.2× vs exact, 1.89e-15 accuracy)
-    /// over Gauss (7.1× vs exact, 4.00e-15 accuracy).  Lanczos
-    /// code has been deleted; this test now pins the winner's
-    /// numbers as a regression guard.
+    /// and picked Chebyshev — it won on both accuracy
+    /// (≤ 2e-15 vs ≤ 4e-15) and wall-time.  Exact speedup ratios
+    /// are hardware-dependent and intentionally not pinned here;
+    /// the accuracy bound stays portable.
     #[test]
     #[ignore = "requires PLEIADES resolution file `_fts_bl10_0p5meV_1keV_25pts.txt` at repo root (gitignored by policy)"]
     fn scalar_chebyshev_real_venus_k1_regression() {

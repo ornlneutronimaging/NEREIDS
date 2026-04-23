@@ -76,9 +76,14 @@ pub struct PrecomputedTransmissionModel {
     ///
     /// Mutually exclusive with `sparse_cubature_plan` in practice —
     /// the cubature dispatch fires only for `k ≥ 2` and the scalar
-    /// plan only for `k == 1`.  Either-or dispatch over
-    /// [`ScalarSurrogatePlan::Gauss`] or
-    /// [`ScalarSurrogatePlan::Chebyshev`].
+    /// plan only for `k == 1`.  The type alias
+    /// `ScalarSurrogatePlan = ScalarChebyshevPlan` is kept as a
+    /// stable public name so a future scalar surrogate can swap in
+    /// without touching this field or any dispatch call site.
+    /// PR #475 picked Chebyshev-in-density over Lanczos Gauss
+    /// quadrature after a real-VENUS bench-off (Chebyshev won on
+    /// both the accuracy and wall-time axes; see
+    /// `nereids_physics::surrogate` module docs).
     pub sparse_scalar_plan: Option<Arc<ScalarSurrogatePlan>>,
 }
 
@@ -444,26 +449,31 @@ impl FitModel for PrecomputedTransmissionModel {
                 // Jacobian.  `None` for any free param that isn't a
                 // density param → fall through to the exact path.
                 //
-                // **Known caveat (Codex round-5 P2 on PR #480)**:
-                // if `free_param_indices` contains non-density
-                // slots, `col_map` is `None` and analytical_jacobian
+                // **Known caveat (Codex round-5 P2 on PR #480,
+                // extended to scalar path in PR #475)**: if
+                // `free_param_indices` contains non-density slots,
+                // `col_map` is `None` and analytical_jacobian
                 // falls through to the exact derivatives — but
                 // `evaluate()` unconditionally dispatches the
-                // cubature forward when eligible.  That mix can
-                // feed LM a Jacobian for a slightly different
-                // function than the forward.  In the current
-                // layered architecture
+                // cubature forward when eligible.  The scalar
+                // (k = 1) Jacobian branch below has an analogous
+                // stronger guard
+                // (`free_param_indices == [density_param]`) that
+                // similarly falls through when any nuisance slot
+                // is free, while its `evaluate()` path fires on
+                // `scalar_eligible` alone — the same eval/Jac
+                // mix.  In the current layered architecture
                 // (`NormalizedTransmissionModel` /
                 // `TransmissionKLBackgroundModel` wrap the inner
                 // `PrecomputedTransmissionModel` before any
                 // non-density nuisance parameter reaches this
                 // layer), `free_param_indices` here is always the
-                // density slots, so the mismatch cannot arise via
-                // the standard pipeline.  A defence-in-depth fix
-                // (route evaluate() through a context that knows
-                // about free params) is deferred to the scalar /
-                // trust-region PRs (#475 / #476) that also revisit
-                // this dispatch surface.
+                // density slots, so neither mismatch can arise
+                // via the standard pipeline.  A defence-in-depth
+                // fix (route `evaluate()` through a context that
+                // knows about free params) is deferred to the
+                // trust-region PR (#476) that will revisit this
+                // dispatch surface.
                 let col_map: Option<Vec<usize>> = free_param_indices
                     .iter()
                     .map(|&fp| params_indices.iter().position(|&i| i == fp))
@@ -3010,6 +3020,264 @@ mod tests {
                 "cubature dispatch must fire on single-spectrum path without a separate ResolutionPlan attached",
             );
         }
+    }
+
+    // ── Scalar (k = 1) dispatch-guard tests ───────────────────────────
+    //
+    // Claude round-1 P2-#8 on PR #475.  The cubature tests above cover
+    // the k ≥ 2 path; the scalar path is a separate surrogate with its
+    // own eligibility guard (`scalar_eligible`) and its own
+    // density-box guard (`scalar_density_within_box`).  These tests
+    // exercise the scalar-specific guards: k=1-only, grid-identity
+    // via `to_bits()`, tabulated-only instrument resolution,
+    // density-box escape, and that the pure no-plan path remains
+    // byte-identical to pre-PR #475 main.
+
+    /// Helper: build a synthetic scalar (k = 1) Chebyshev plan on the
+    /// same grid as the cubature helpers.
+    fn build_scalar_plan(
+        matrix: &nereids_physics::resolution::ResolutionMatrix,
+        sigma_k1: &[f64],
+        n_max: f64,
+    ) -> Arc<ScalarSurrogatePlan> {
+        Arc::new(
+            nereids_physics::surrogate::ScalarChebyshevPlan::build(matrix, sigma_k1, n_max, 16)
+                .expect("synthetic scalar Chebyshev build"),
+        )
+    }
+
+    #[test]
+    fn fit_model_scalar_dispatches_at_k1() {
+        // k = 1 with both the scalar plan and the resolution plan
+        // installed: evaluate() must return the scalar plan's
+        // forward output.  At the Chebyshev node density the plan
+        // reproduces exact `apply_r ∘ exp(-nσ)` to machine
+        // precision, so comparing to the plan's own forward is a
+        // byte-identical check.
+        let n_grid = 40_usize;
+        let (energies, plan, matrix) = synthetic_resolution_setup(n_grid, 4);
+        let sigmas = synthetic_sigmas(n_grid, 1);
+        let n_max = 2.0 * 1e-4_f64;
+        let scalar = build_scalar_plan(&matrix, &sigmas[0], n_max);
+
+        let model = make_trivial_fit_model(energies.clone(), 1)
+            .with_resolution_plan(Some(Arc::clone(&plan)))
+            .with_sparse_scalar_plan(Some(Arc::clone(&scalar)));
+
+        let n = [0.5 * n_max];
+        let t_model = model.evaluate(&n).unwrap();
+        let t_scalar = scalar.forward_scalar(n[0]);
+        assert_eq!(t_model.len(), n_grid);
+        for (a, b) in t_model.iter().zip(t_scalar.iter()) {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "TransmissionFitModel scalar dispatch must return forward_scalar() byte-exact",
+            );
+        }
+    }
+
+    #[test]
+    fn fit_model_scalar_jacobian_matches_scalar_derivative() {
+        // analytical_jacobian at a density inside the box must
+        // return exactly `scalar.forward_and_derivative_scalar(n)`'s
+        // derivative as the single column.
+        let n_grid = 40_usize;
+        let (energies, plan, matrix) = synthetic_resolution_setup(n_grid, 4);
+        let sigmas = synthetic_sigmas(n_grid, 1);
+        let n_max = 2.0 * 1e-4_f64;
+        let scalar = build_scalar_plan(&matrix, &sigmas[0], n_max);
+
+        let model = make_trivial_fit_model(energies, 1)
+            .with_resolution_plan(Some(Arc::clone(&plan)))
+            .with_sparse_scalar_plan(Some(Arc::clone(&scalar)));
+
+        let n = [0.5 * n_max];
+        let y_curr = model.evaluate(&n).unwrap();
+        let jac = model
+            .analytical_jacobian(&n, &[0], &y_curr)
+            .expect("scalar Jacobian path on TransmissionFitModel");
+        let (_t_ref, dt_ref) = scalar.forward_and_derivative_scalar(n[0]);
+        assert_eq!(jac.ncols, 1);
+        assert_eq!(jac.nrows, n_grid);
+        for (i, &dt_i) in dt_ref.iter().enumerate().take(n_grid) {
+            assert_eq!(
+                jac.get(i, 0).to_bits(),
+                dt_i.to_bits(),
+                "row {i}: TransmissionFitModel must return scalar dT/dn byte-exact",
+            );
+        }
+    }
+
+    #[test]
+    fn fit_model_scalar_falls_back_at_k2() {
+        // k = 2 with a scalar plan installed → `scalar_eligible`
+        // returns false (`n_density_params != 1`), dispatch MUST
+        // fall back to the exact `exp(-Σ n σ) + apply_resolution`
+        // path.  Prove fallback via byte-identity vs a no-plan
+        // model with the same k = 2 grid.
+        let n_grid = 40_usize;
+        let (energies, plan, matrix) = synthetic_resolution_setup(n_grid, 4);
+        let sigmas_k2 = synthetic_sigmas(n_grid, 2);
+        let sigma_k1_stale = synthetic_sigmas(n_grid, 1).remove(0);
+        let n_max = 2.0 * 1e-4_f64;
+        let scalar = build_scalar_plan(&matrix, &sigma_k1_stale, n_max);
+
+        // Model has k = 2 but a scalar plan is installed → must
+        // fall back (scalar_eligible rejects `n_density_params != 1`).
+        let model_with_plan = make_trivial_fit_model(energies.clone(), 2)
+            .with_resolution_plan(Some(Arc::clone(&plan)))
+            .with_sparse_scalar_plan(Some(Arc::clone(&scalar)));
+        let model_without_plan =
+            make_trivial_fit_model(energies, 2).with_resolution_plan(Some(Arc::clone(&plan)));
+
+        // Feed both models the same σ stack so the exact path is
+        // identical.  `TransmissionFitModel` uses its own internal
+        // computed σ path — in this synthetic test both models
+        // build the same way from make_trivial_fit_model and no
+        // σ is precomputed, so evaluate() builds σ from each
+        // isotope's resonance data (empty ranges → σ ≡ 0).
+        //   With σ ≡ 0: exp(-Σ n σ) = 1 everywhere, so both
+        //   evaluate outputs are the broadened 1-vector.  Byte
+        //   identity proves the scalar plan did NOT fire
+        //   (if it had, output would use `sigma_k1_stale` and
+        //   differ).
+        let _ = sigmas_k2;
+        let n = [1e-4_f64, 2e-4];
+        let t_with = model_with_plan.evaluate(&n).unwrap();
+        let t_without = model_without_plan.evaluate(&n).unwrap();
+        for (a, b) in t_with.iter().zip(t_without.iter()) {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "scalar plan MUST NOT fire at k=2; evaluate() must match no-plan byte-exactly",
+            );
+        }
+    }
+
+    #[test]
+    fn fit_model_scalar_falls_back_on_grid_mismatch() {
+        // Build a scalar plan on one grid, install on a model with
+        // a DIFFERENT same-length grid.  Dispatch must refuse via
+        // the `to_bits()` grid-identity check.
+        let n_grid = 40_usize;
+        let (energies_a, plan_a, matrix) = synthetic_resolution_setup(n_grid, 4);
+        let sigmas = synthetic_sigmas(n_grid, 1);
+        let n_max = 2.0 * 1e-4_f64;
+        let scalar = build_scalar_plan(&matrix, &sigmas[0], n_max);
+
+        // Shifted grid — same length, different bit pattern.
+        let energies_b: Vec<f64> = energies_a.iter().map(|&e| e + 1.0).collect();
+
+        // Install the stale (grid-A) scalar plan on a grid-B model.
+        // Note: install without a resolution plan so only the
+        // scalar plan's grid-identity check gates dispatch.
+        let _ = plan_a;
+        let model_with_stale_plan =
+            make_trivial_fit_model(energies_b.clone(), 1).with_sparse_scalar_plan(Some(scalar));
+        let model_without_plan = make_trivial_fit_model(energies_b, 1);
+
+        let n = [0.25 * n_max];
+        let t_stale = model_with_stale_plan.evaluate(&n).unwrap();
+        let t_exact = model_without_plan.evaluate(&n).unwrap();
+        for (a, b) in t_stale.iter().zip(t_exact.iter()) {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "stale-grid scalar plan MUST NOT fire; evaluate() must match no-plan byte-exactly",
+            );
+        }
+    }
+
+    #[test]
+    fn fit_model_scalar_falls_back_when_density_escapes_box() {
+        // scalar.density_box() auto-set to n_max during build.  A
+        // density at 2× n_max is > 1.5× tolerance → guard fires →
+        // fall back to exact path byte-identically.
+        let n_grid = 40_usize;
+        let (energies, plan, matrix) = synthetic_resolution_setup(n_grid, 4);
+        let sigmas = synthetic_sigmas(n_grid, 1);
+        let n_max = 2.0 * 1e-4_f64;
+        let scalar = build_scalar_plan(&matrix, &sigmas[0], n_max);
+
+        let model_with = make_trivial_fit_model(energies.clone(), 1)
+            .with_resolution_plan(Some(Arc::clone(&plan)))
+            .with_sparse_scalar_plan(Some(Arc::clone(&scalar)));
+        let model_without =
+            make_trivial_fit_model(energies, 1).with_resolution_plan(Some(Arc::clone(&plan)));
+
+        // Escape: 2× the training n_max → beyond the 1.5× tolerance.
+        let n_escape = [2.0 * n_max];
+        let t_with = model_with.evaluate(&n_escape).unwrap();
+        let t_without = model_without.evaluate(&n_escape).unwrap();
+        for (a, b) in t_with.iter().zip(t_without.iter()) {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "scalar density-box escape guard MUST fall back to exact path byte-identically",
+            );
+        }
+    }
+
+    #[test]
+    fn fit_model_scalar_rejects_nonfinite_and_negative_density() {
+        // `scalar_density_within_box` rejects NaN, ±∞, and negative
+        // densities — falling back to exact.  Prove via byte-identity
+        // against a no-plan model.
+        let n_grid = 40_usize;
+        let (energies, plan, matrix) = synthetic_resolution_setup(n_grid, 4);
+        let sigmas = synthetic_sigmas(n_grid, 1);
+        let n_max = 2.0 * 1e-4_f64;
+        let scalar = build_scalar_plan(&matrix, &sigmas[0], n_max);
+
+        let model_with = make_trivial_fit_model(energies.clone(), 1)
+            .with_resolution_plan(Some(Arc::clone(&plan)))
+            .with_sparse_scalar_plan(Some(Arc::clone(&scalar)));
+        let model_without =
+            make_trivial_fit_model(energies, 1).with_resolution_plan(Some(Arc::clone(&plan)));
+
+        for bad_n in [f64::NAN, f64::INFINITY, -1e-6_f64] {
+            let n = [bad_n];
+            let t_with = model_with.evaluate(&n).unwrap();
+            let t_without = model_without.evaluate(&n).unwrap();
+            for (i, (a, b)) in t_with.iter().zip(t_without.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "n = {bad_n}: scalar guard must fall back byte-exactly; row {i}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_density_within_box_direct_guard() {
+        // Unit-test the scalar_density_within_box helper directly
+        // without going through the model dispatch.  Verifies the
+        // 1.5× tolerance exactly matches the cubature's convention.
+        let n_grid = 16_usize;
+        let (_energies, _plan, matrix) = synthetic_resolution_setup(n_grid, 2);
+        let sigmas = synthetic_sigmas(n_grid, 1);
+        let n_max = 1e-4_f64;
+        let plan =
+            nereids_physics::surrogate::ScalarChebyshevPlan::build(&matrix, &sigmas[0], n_max, 16)
+                .expect("build");
+
+        // Inside the box.
+        assert!(scalar_density_within_box(&plan, 0.0));
+        assert!(scalar_density_within_box(&plan, 0.5 * n_max));
+        assert!(scalar_density_within_box(&plan, n_max));
+        // Inside the 1.5× tolerance.
+        assert!(scalar_density_within_box(&plan, 1.49 * n_max));
+        assert!(scalar_density_within_box(&plan, 1.5 * n_max));
+        // Beyond the tolerance.
+        assert!(!scalar_density_within_box(&plan, 1.5001 * n_max));
+        assert!(!scalar_density_within_box(&plan, 2.0 * n_max));
+        // Non-finite and negative must be rejected.
+        assert!(!scalar_density_within_box(&plan, f64::NAN));
+        assert!(!scalar_density_within_box(&plan, f64::INFINITY));
+        assert!(!scalar_density_within_box(&plan, f64::NEG_INFINITY));
+        assert!(!scalar_density_within_box(&plan, -1e-9));
     }
 
     #[test]
