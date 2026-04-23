@@ -11,7 +11,7 @@ use std::sync::Arc;
 use nereids_core::constants::{EV_TO_JOULES, NEUTRON_MASS_KG};
 use nereids_endf::resonance::ResonanceData;
 use nereids_physics::resolution::{self, ResolutionFunction, ResolutionPlan};
-use nereids_physics::surrogate::SparseEmpiricalCubaturePlan;
+use nereids_physics::surrogate::{ScalarSurrogatePlan, SparseEmpiricalCubaturePlan};
 use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
 
 use crate::error::FittingError;
@@ -72,6 +72,14 @@ pub struct PrecomputedTransmissionModel {
     /// back to the exact path, so the default behaviour is
     /// byte-identical to main.
     pub sparse_cubature_plan: Option<Arc<SparseEmpiricalCubaturePlan>>,
+    /// Optional scalar (k = 1) surrogate plan (epic #472, PR #475).
+    ///
+    /// Mutually exclusive with `sparse_cubature_plan` in practice —
+    /// the cubature dispatch fires only for `k ≥ 2` and the scalar
+    /// plan only for `k == 1`.  Either-or dispatch over
+    /// [`ScalarSurrogatePlan::Gauss`] or
+    /// [`ScalarSurrogatePlan::Chebyshev`].
+    pub sparse_scalar_plan: Option<Arc<ScalarSurrogatePlan>>,
 }
 
 /// Deduplicate `density_indices` and return the distinct density-
@@ -156,6 +164,60 @@ fn density_param_indices(density_indices: &[usize]) -> Vec<usize> {
 /// `with_precomputed_base_xs` / `with_groups` all clearing the
 /// cached cubature (see pipeline.rs), so a refit through the
 /// standard surface cannot hit this case.
+/// Check whether a scalar (k = 1) surrogate plan is eligible given
+/// the model's energy grid, active tabulated resolution, and
+/// `n_density_params == 1`.  Parallels
+/// [`cubature_eligible`] for the multi-isotope path — same
+/// grid-identity + `Tabulated(_)` variant guards, same
+/// optional-ResolutionPlan transitive check.  Epic #472, PR #475.
+fn scalar_eligible(
+    plan: &ScalarSurrogatePlan,
+    energies: &[f64],
+    instrument_resolution: &ResolutionFunction,
+    resolution_plan: Option<&ResolutionPlan>,
+    n_density_params: usize,
+) -> bool {
+    if n_density_params != 1 {
+        return false;
+    }
+    if plan.len() != energies.len() {
+        return false;
+    }
+    if !matches!(instrument_resolution, ResolutionFunction::Tabulated(_)) {
+        return false;
+    }
+    let plan_grid = plan.target_energies();
+    for (e_cur, e_plan) in energies.iter().zip(plan_grid) {
+        if e_cur.to_bits() != e_plan.to_bits() {
+            return false;
+        }
+    }
+    if let Some(res_plan) = resolution_plan {
+        if res_plan.target_energies().len() != energies.len() {
+            return false;
+        }
+        for (e_cur, e_res) in energies.iter().zip(res_plan.target_energies()) {
+            if e_cur.to_bits() != e_res.to_bits() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Check whether the scalar iterate `n` is inside the surrogate's
+/// recorded training box `[0, train_max]` with 50 % tolerance.
+fn scalar_density_within_box(plan: &ScalarSurrogatePlan, n: f64) -> bool {
+    let Some(train_max) = plan.density_box() else {
+        return true;
+    };
+    if !n.is_finite() || n < 0.0 {
+        return false;
+    }
+    const TOLERANCE: f64 = 1.5;
+    n <= train_max * TOLERANCE
+}
+
 /// Check whether the current density iterate `n` is inside the
 /// training region recorded on the cubature plan, with a 50 %
 /// expansion tolerance to avoid thrashing at the box boundary.
@@ -285,6 +347,27 @@ impl FitModel for PrecomputedTransmissionModel {
             }
         }
 
+        // Scalar (k = 1) surrogate fast path — same eligibility
+        // stack as the cubature, gated on `n_density_params == 1`.
+        // Epic #472, PR #475.
+        if let (Some(scalar), Some(inst), Some(energies)) =
+            (&self.sparse_scalar_plan, &self.instrument, &self.energies)
+        {
+            let params_indices = density_param_indices(&self.density_indices);
+            if scalar_eligible(
+                scalar,
+                energies,
+                &inst.resolution,
+                self.resolution_plan.as_deref(),
+                params_indices.len(),
+            ) {
+                let n = params[params_indices[0]];
+                if scalar_density_within_box(scalar, n) {
+                    return Ok(scalar.forward_scalar(n));
+                }
+            }
+        }
+
         let mut neg_opt = vec![0.0f64; n_e];
         // #109.1: No density > 0 guard — let Beer-Lambert handle all densities
         // naturally.  exp(−n·σ) is well-defined for negative n (gives T > 1,
@@ -400,6 +483,34 @@ impl FitModel for PrecomputedTransmissionModel {
                         return Some(jacobian);
                     }
                     // Density outside box → fall through to exact.
+                }
+            }
+        }
+
+        // Scalar (k = 1) surrogate Jacobian fast path — epic #472 PR
+        // #475.  For a scalar fit `free_param_indices = [0]`, so
+        // the Jacobian has one column.
+        if let (Some(scalar), Some(inst), Some(energies)) =
+            (&self.sparse_scalar_plan, &self.instrument, &self.energies)
+        {
+            let params_indices = density_param_indices(&self.density_indices);
+            if scalar_eligible(
+                scalar,
+                energies,
+                &inst.resolution,
+                self.resolution_plan.as_deref(),
+                params_indices.len(),
+            ) && free_param_indices.len() == 1
+                && free_param_indices[0] == params_indices[0]
+            {
+                let n = params[params_indices[0]];
+                if scalar_density_within_box(scalar, n) {
+                    let (_t, dt) = scalar.forward_and_derivative_scalar(n);
+                    let mut jacobian = FlatMatrix::zeros(n_e, 1);
+                    for (i, &v) in dt.iter().enumerate() {
+                        *jacobian.get_mut(i, 0) = v;
+                    }
+                    return Some(jacobian);
                 }
             }
         }
@@ -544,6 +655,10 @@ pub struct TransmissionFitModel {
     /// the σ the cubature was built against becomes stale so the
     /// dispatch silently falls back.
     sparse_cubature_plan: Option<Arc<SparseEmpiricalCubaturePlan>>,
+    /// Optional scalar (k = 1) surrogate plan (epic #472, PR #475).
+    /// Parallel to `sparse_cubature_plan` but dispatches only for
+    /// `n_density_params == 1`.
+    sparse_scalar_plan: Option<Arc<ScalarSurrogatePlan>>,
 }
 
 impl TransmissionFitModel {
@@ -632,6 +747,7 @@ impl TransmissionFitModel {
             cached_temperature: Cell::new(f64::NAN),
             resolution_plan: None,
             sparse_cubature_plan: None,
+            sparse_scalar_plan: None,
         })
     }
 
@@ -657,6 +773,15 @@ impl TransmissionFitModel {
         plan: Option<Arc<SparseEmpiricalCubaturePlan>>,
     ) -> Self {
         self.sparse_cubature_plan = plan;
+        self
+    }
+
+    /// Attach a prebuilt scalar (k = 1) surrogate plan.  See
+    /// [`PrecomputedTransmissionModel::sparse_scalar_plan`] for the
+    /// dispatch conditions.  Epic #472 PR #475.
+    #[must_use]
+    pub fn with_sparse_scalar_plan(mut self, plan: Option<Arc<ScalarSurrogatePlan>>) -> Self {
+        self.sparse_scalar_plan = plan;
         self
     }
 }
@@ -700,6 +825,25 @@ impl FitModel for TransmissionFitModel {
                     return Ok(cubature.forward(&n));
                 }
                 // Density escaped training box → fall through.
+            }
+        }
+
+        // Scalar (k = 1) surrogate fast path — epic #472, PR #475.
+        if let (Some(scalar), Some(inst)) = (&self.sparse_scalar_plan, &self.instrument)
+            && self.temperature_index.is_none()
+        {
+            let params_indices = density_param_indices(&self.density_indices);
+            if scalar_eligible(
+                scalar,
+                &self.energies,
+                &inst.resolution,
+                self.resolution_plan.as_deref(),
+                params_indices.len(),
+            ) {
+                let n = params[params_indices[0]];
+                if scalar_density_within_box(scalar, n) {
+                    return Ok(scalar.forward_scalar(n));
+                }
             }
         }
 
@@ -862,6 +1006,35 @@ impl FitModel for TransmissionFitModel {
                         }
                         return Some(jacobian);
                     }
+                }
+            }
+        }
+
+        // Scalar (k = 1) surrogate Jacobian fast path — epic #472 PR
+        // #475.  Must match `evaluate()` dispatch conditions + the
+        // single-density constraint on free params.
+        if let (Some(scalar), Some(inst)) = (&self.sparse_scalar_plan, &self.instrument)
+            && self.temperature_index.is_none()
+        {
+            let params_indices = density_param_indices(&self.density_indices);
+            if scalar_eligible(
+                scalar,
+                &self.energies,
+                &inst.resolution,
+                self.resolution_plan.as_deref(),
+                params_indices.len(),
+            ) && free_param_indices.len() == 1
+                && free_param_indices[0] == params_indices[0]
+            {
+                let n = params[params_indices[0]];
+                if scalar_density_within_box(scalar, n) {
+                    let n_e = self.energies.len();
+                    let (_t, dt) = scalar.forward_and_derivative_scalar(n);
+                    let mut jacobian = FlatMatrix::zeros(n_e, 1);
+                    for (i, &v) in dt.iter().enumerate() {
+                        *jacobian.get_mut(i, 0) = v;
+                    }
+                    return Some(jacobian);
                 }
             }
         }
@@ -2282,6 +2455,7 @@ mod tests {
             instrument: None,
             resolution_plan: None,
             sparse_cubature_plan: None,
+            sparse_scalar_plan: None,
         }
     }
 
@@ -2417,6 +2591,7 @@ mod tests {
             instrument: Some(make_trivial_instrument()),
             resolution_plan: Some(Arc::clone(&plan)),
             sparse_cubature_plan: Some(Arc::clone(&cubature)),
+            sparse_scalar_plan: None,
         };
 
         // Evaluate at a training density: cubature ≡ exact to LP
@@ -2497,6 +2672,7 @@ mod tests {
             instrument: Some(make_trivial_instrument()),
             resolution_plan: None,
             sparse_cubature_plan: Some(Arc::clone(&cubature_k2)),
+            sparse_scalar_plan: None,
         };
         let model_without_plan = PrecomputedTransmissionModel {
             cross_sections: Arc::new(sigmas_k1.clone()),
@@ -2505,6 +2681,7 @@ mod tests {
             instrument: Some(make_trivial_instrument()),
             resolution_plan: None,
             sparse_cubature_plan: None,
+            sparse_scalar_plan: None,
         };
 
         let n = [1e-4_f64];
@@ -2540,6 +2717,7 @@ mod tests {
             instrument: None,
             resolution_plan: None,
             sparse_cubature_plan: None,
+            sparse_scalar_plan: None,
         };
 
         let n = [1e-4_f64, 1e-4];
@@ -2576,6 +2754,7 @@ mod tests {
             instrument: Some(make_trivial_instrument()),
             resolution_plan: Some(Arc::clone(&plan)),
             sparse_cubature_plan: Some(Arc::clone(&cubature)),
+            sparse_scalar_plan: None,
         };
 
         // Use anchor density: LP pins Jacobian exactly here.
@@ -3149,6 +3328,7 @@ mod tests {
             instrument: Some(Arc::clone(&inst)),
             resolution_plan: None,
             sparse_cubature_plan: None,
+            sparse_scalar_plan: None,
         };
         let t_precomputed = model.evaluate(&[thickness]).unwrap();
 
@@ -3232,6 +3412,7 @@ mod tests {
             instrument: Some(Arc::clone(&inst)),
             resolution_plan: None,
             sparse_cubature_plan: None,
+            sparse_scalar_plan: None,
         };
 
         let params = [0.0005f64];
@@ -3282,6 +3463,7 @@ mod tests {
             instrument: Some(Arc::clone(&inst)),
             resolution_plan: None,
             sparse_cubature_plan: None,
+            sparse_scalar_plan: None,
         };
 
         let params = [0.001f64];

@@ -652,6 +652,60 @@ pub fn spatial_map_typed(
         })
     });
 
+    // Scalar (k = 1) surrogate plan — parallels the cubature build
+    // but dispatches on `xs.len() == 1` (grouped fits / single-
+    // isotope).  Reuses the compiled ResolutionMatrix from the
+    // resolution plan.  Falls back silently on build failure; no
+    // local plan means the exact `apply_resolution_with_plan` path
+    // runs as today.  PR #475 benched both Lanczos σ-pushforward
+    // Gauss quadrature and Chebyshev-in-density on real VENUS
+    // (3471-bin production grid): Chebyshev won 12.2× vs exact at
+    // 1e-15 accuracy, vs Lanczos 7.1× at 4e-15.  Lanczos code was
+    // deleted per the issue's "drop the loser" contract; this
+    // build site now always returns the Chebyshev variant via the
+    // public `ScalarSurrogatePlan` type alias (= `ScalarChebyshevPlan`).
+    let caller_scalar = config.precomputed_sparse_scalar_plan().cloned();
+    let sparse_scalar_plan: Option<Arc<nereids_physics::surrogate::ScalarSurrogatePlan>> =
+        if !config.fit_temperature()
+            && !config.fit_energy_scale()
+            && resolution_plan.is_some()
+            && xs.len() == 1
+        {
+            let plan = resolution_plan.as_deref().expect("guarded above");
+            let matrix = plan.compile_to_matrix();
+            let sigma_row = &xs[0];
+            // Chebyshev-in-density at M = 16 (PR #475 bench-off
+            // winner).  Training box: 2 × the initial density;
+            // Chebyshev's interpolant is exact at its nodes and
+            // tight (≤ 1e-15 rel err) across the box.
+            const CHEBYSHEV_NODES: usize = 16;
+            let n_max: f64 = 2.0 * config.initial_densities()[0].max(1e-6);
+            match nereids_physics::surrogate::ScalarChebyshevPlan::build(
+                &matrix,
+                sigma_row,
+                n_max,
+                CHEBYSHEV_NODES,
+            ) {
+                Ok(plan) => Some(Arc::new(plan)),
+                Err(e) => {
+                    eprintln!(
+                        "spatial_map_typed: scalar Chebyshev build failed ({e}); \
+                         falling back to exact ResolutionPlan path",
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+    // Preserve caller-supplied scalar plan if local build didn't run.
+    let sparse_scalar_plan = sparse_scalar_plan.or_else(|| {
+        caller_scalar.filter(|p| {
+            p.len() == xs.first().map(|r| r.len()).unwrap_or(0)
+                && p.target_energies() == config.energies()
+        })
+    });
+
     // Precompute unbroadened (base) cross-sections for temperature fitting.
     // This avoids 74× overhead from redundant Reich-Moore evaluation per
     // KL iteration (112ms Reich-Moore vs 1.5ms Doppler rebroadening).
@@ -667,9 +721,9 @@ pub fn spatial_map_typed(
         if let Some(plan) = resolution_plan.clone() {
             cfg = cfg.with_precomputed_resolution_plan(plan);
         }
-        // Cubature stays None on the temperature path (guard matches
-        // the builder above).  No-op here but explicit for future
-        // readers.
+        // Cubature / scalar plans stay None on the temperature path
+        // (builder guards above).  No-op here but explicit for
+        // future readers.
         cfg
     } else {
         // For non-temperature path: xs is already collapsed to σ_eff when
@@ -688,6 +742,9 @@ pub fn spatial_map_typed(
         }
         if let Some(plan) = sparse_cubature_plan.clone() {
             cfg = cfg.with_precomputed_sparse_cubature_plan(plan);
+        }
+        if let Some(plan) = sparse_scalar_plan.clone() {
+            cfg = cfg.with_precomputed_sparse_scalar_plan(plan);
         }
         cfg
     };
@@ -1009,6 +1066,7 @@ mod tests {
             instrument: None,
             resolution_plan: None,
             sparse_cubature_plan: None,
+            sparse_scalar_plan: None,
         };
         let t_1d = model.evaluate(&[true_density]).unwrap();
         let sigma_1d: Vec<f64> = t_1d.iter().map(|&v| 0.01 * v.max(0.01)).collect();

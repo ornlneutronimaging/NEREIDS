@@ -321,6 +321,10 @@ pub struct UnifiedFitConfig {
     /// silently falls back to the exact path.
     precomputed_sparse_cubature_plan:
         Option<Arc<nereids_physics::surrogate::SparseEmpiricalCubaturePlan>>,
+    /// Scalar (k = 1) surrogate plan for the grouped-Hf / single-
+    /// isotope path.  Parallel to `precomputed_sparse_cubature_plan`
+    /// but dispatches at `k == 1`.  Epic #472, PR #475.
+    precomputed_sparse_scalar_plan: Option<Arc<nereids_physics::surrogate::ScalarSurrogatePlan>>,
 
     // ── Energy-scale calibration (SAMMY TZERO equivalent) ──
     /// When true, fit t₀ (μs) and L_scale (dimensionless) parameters.
@@ -397,6 +401,7 @@ impl UnifiedFitConfig {
             precomputed_base_xs: None,
             precomputed_resolution_plan: None,
             precomputed_sparse_cubature_plan: None,
+            precomputed_sparse_scalar_plan: None,
             fit_energy_scale: false,
             t0_init_us: 0.0,
             l_scale_init: 1.0,
@@ -476,6 +481,7 @@ impl UnifiedFitConfig {
         // plan would silently produce wrong forward / Jacobian
         // values for the new σ (Codex round-3 P3 on PR #480).
         self.precomputed_sparse_cubature_plan = None;
+        self.precomputed_sparse_scalar_plan = None;
         self
     }
 
@@ -486,6 +492,7 @@ impl UnifiedFitConfig {
         // the cubature's σ stack becomes stale.  Invalidate for
         // the same reason as `with_precomputed_cross_sections`.
         self.precomputed_sparse_cubature_plan = None;
+        self.precomputed_sparse_scalar_plan = None;
         self
     }
 
@@ -528,6 +535,20 @@ impl UnifiedFitConfig {
         plan: Arc<nereids_physics::surrogate::SparseEmpiricalCubaturePlan>,
     ) -> Self {
         self.precomputed_sparse_cubature_plan = Some(plan);
+        self
+    }
+
+    /// Attach a prebuilt scalar (k = 1) surrogate plan.  Epic #472,
+    /// PR #475.  Same invalidation discipline as the cubature: the
+    /// plan is cleared on `with_groups` / `with_precomputed_cross_sections`
+    /// / `with_precomputed_base_xs`, so a stale σ cannot silently
+    /// dispatch.
+    #[must_use]
+    pub fn with_precomputed_sparse_scalar_plan(
+        mut self,
+        plan: Arc<nereids_physics::surrogate::ScalarSurrogatePlan>,
+    ) -> Self {
+        self.precomputed_sparse_scalar_plan = Some(plan);
         self
     }
 
@@ -598,6 +619,7 @@ impl UnifiedFitConfig {
         // `cubature_eligible` accepts the same k + grid (Codex round 1
         // P2 on PR #480).
         self.precomputed_sparse_cubature_plan = None;
+        self.precomputed_sparse_scalar_plan = None;
         Ok(self)
     }
 
@@ -611,6 +633,14 @@ impl UnifiedFitConfig {
         &self,
     ) -> Option<&Arc<nereids_physics::surrogate::SparseEmpiricalCubaturePlan>> {
         self.precomputed_sparse_cubature_plan.as_ref()
+    }
+
+    /// Caller-attached scalar (k = 1) surrogate plan, if any.  Epic
+    /// #472, PR #475.
+    pub fn precomputed_sparse_scalar_plan(
+        &self,
+    ) -> Option<&Arc<nereids_physics::surrogate::ScalarSurrogatePlan>> {
+        self.precomputed_sparse_scalar_plan.as_ref()
     }
 
     pub fn energies(&self) -> &[f64] {
@@ -1712,6 +1742,11 @@ fn build_transmission_model(
         } else {
             None
         };
+        let sparse_scalar_plan = if instrument.is_some() {
+            config.precomputed_sparse_scalar_plan.clone()
+        } else {
+            None
+        };
         return Ok(Box::new(PrecomputedTransmissionModel {
             cross_sections: effective_xs,
             density_indices: Arc::new((0..n_params).collect()),
@@ -1721,6 +1756,7 @@ fn build_transmission_model(
             instrument,
             resolution_plan,
             sparse_cubature_plan,
+            sparse_scalar_plan,
         }));
     }
 
@@ -1748,6 +1784,11 @@ fn build_transmission_model(
     } else {
         None
     };
+    let sparse_scalar_plan = if instrument.is_some() {
+        config.precomputed_sparse_scalar_plan.clone()
+    } else {
+        None
+    };
     Ok(Box::new(
         TransmissionFitModel::new(
             config.energies.clone(),
@@ -1759,7 +1800,8 @@ fn build_transmission_model(
             base_xs,
         )?
         .with_resolution_plan(resolution_plan)
-        .with_sparse_cubature_plan(sparse_cubature_plan),
+        .with_sparse_cubature_plan(sparse_cubature_plan)
+        .with_sparse_scalar_plan(sparse_scalar_plan),
     ))
 }
 
@@ -2336,6 +2378,7 @@ mod tests {
             instrument: None,
             resolution_plan: None,
             sparse_cubature_plan: None,
+            sparse_scalar_plan: None,
         };
         let t = model.evaluate(&[true_density]).unwrap();
         let sigma: Vec<f64> = t.iter().map(|&v| 0.01 * v.max(0.01)).collect();
@@ -2686,6 +2729,7 @@ mod tests {
             instrument: None,
             resolution_plan: None,
             sparse_cubature_plan: None,
+            sparse_scalar_plan: None,
         };
         let t = model.evaluate(&[true_density]).unwrap();
         let sigma: Vec<f64> = t.iter().map(|&v| 0.01 * v.max(0.01)).collect();

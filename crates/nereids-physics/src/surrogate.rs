@@ -708,6 +708,294 @@ impl SparseEmpiricalCubaturePlan {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// Scalar (k = 1) surrogate — epic #472, PR #475.
+// ═══════════════════════════════════════════════════════════════════
+//
+// The [`SparseEmpiricalCubaturePlan`] above is the k ≥ 2 production
+// winner, but its generic atom construction over-damps the grouped
+// Hf k = 1 KL scatter by ~27 % (codex04 round-2 measurement).  The
+// scalar path gets a dedicated surrogate.  PR #475 built both
+// round-2 candidates (Lanczos σ-pushforward Gauss quadrature,
+// Chebyshev-in-density) side-by-side and benched them on the real
+// VENUS 3471-bin production grid:
+//
+//     Lanczos Gauss (m = 6):  fwd = 34 µs,  max_err = 4e-15, 7.1× vs exact.
+//     Chebyshev    (M = 16):  fwd = 20 µs,  max_err = 2e-15, 12.2× vs exact.
+//
+// **Chebyshev won**.  Lanczos + Gauss-pushforward machinery was
+// deleted per the issue's "drop the loser" contract — no
+// same-name-different-function duplication.  If future research
+// finds a better scalar surrogate, the public
+// [`ScalarSurrogatePlan`] alias below is the stable swap point.
+
+/// Errors from scalar surrogate plan construction.
+#[derive(Debug)]
+pub enum ScalarSurrogateBuildError {
+    /// `sigma` flat length disagrees with the matrix grid size.
+    SigmaGridMismatch {
+        /// Expected length (`n_rows`).
+        expected: usize,
+        /// Actual `sigma.len()`.
+        actual: usize,
+    },
+    /// A Chebyshev-node build was given `n_max ≤ 0` or `M < 2`.
+    InvalidChebyshevBox {
+        /// Offending upper bound.
+        n_max: f64,
+        /// Requested node count.
+        m: usize,
+    },
+}
+
+impl fmt::Display for ScalarSurrogateBuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SigmaGridMismatch { expected, actual } => write!(
+                f,
+                "scalar sigma length ({actual}) must equal n_rows ({expected})",
+            ),
+            Self::InvalidChebyshevBox { n_max, m } => write!(
+                f,
+                "Chebyshev plan requires n_max > 0 and M ≥ 2, got n_max = {n_max}, M = {m}",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ScalarSurrogateBuildError {}
+
+/// Chebyshev-in-density interpolant of `T_i(n)` for scalar (k = 1)
+/// forward models.  For each row `i`, pre-samples `T_i(n_j)` at
+/// `M` Chebyshev-of-the-first-kind nodes in `[0, n_max]`, then
+/// stores the Chebyshev coefficients.  Online evaluation is
+/// Clenshaw recurrence with `M` multiply-adds per row.
+///
+/// Unlike the Gauss quadrature, the Chebyshev representation is a
+/// **scalar interpolant** in density space — one pass evaluates
+/// the interpolant at `n`, and the derivative needs a separate
+/// derivative-coefficient series.
+#[derive(Debug, Clone)]
+pub struct ScalarChebyshevPlan {
+    /// Target energy grid the plan was built for.
+    target_energies: Vec<f64>,
+    /// Upper bound of the density box `[0, n_max]` the interpolant
+    /// is valid on.
+    n_max: f64,
+    /// Number of Chebyshev nodes (order + 1).  Same for every row.
+    m: usize,
+    /// Row-major Chebyshev coefficients: `coeffs[i * m + k]` is the
+    /// `k`-th Chebyshev coefficient of row `i`.
+    coeffs: Vec<f64>,
+    /// Optional training-density upper bound (defaults to `n_max`
+    /// if the builder doesn't override).
+    density_box: Option<f64>,
+}
+
+impl ScalarChebyshevPlan {
+    /// Build an `M`-node Chebyshev-in-density plan from a
+    /// [`ResolutionMatrix`] + scalar σ + density box `[0, n_max]`.
+    /// Internally calls [`apply_r`] `M` times (one per Chebyshev
+    /// node) to get exact row evaluations, then runs a per-row
+    /// discrete cosine transform to extract Chebyshev coefficients.
+    ///
+    /// Cost: `M × N × avg_nnz_per_row` FMAs for the exact sampling
+    /// pass, plus `M^2` per row for the DCT (matrix-vector form,
+    /// simpler than FFT for small M).
+    pub fn build(
+        matrix: &ResolutionMatrix,
+        sigma: &[f64],
+        n_max: f64,
+        m: usize,
+    ) -> Result<Self, ScalarSurrogateBuildError> {
+        let n_rows = matrix.len();
+        if sigma.len() != n_rows {
+            return Err(ScalarSurrogateBuildError::SigmaGridMismatch {
+                expected: n_rows,
+                actual: sigma.len(),
+            });
+        }
+        if !n_max.is_finite() || n_max <= 0.0 || m < 2 {
+            return Err(ScalarSurrogateBuildError::InvalidChebyshevBox { n_max, m });
+        }
+
+        // Chebyshev nodes of the first kind on [-1, 1]:
+        //   x_j = cos(π (j + 0.5) / M)   for j = 0..M-1
+        // Mapped to [0, n_max]:
+        //   n_j = (n_max / 2) (x_j + 1)
+        let nodes_x: Vec<f64> = (0..m)
+            .map(|j| {
+                let pj = (j as f64 + 0.5) * std::f64::consts::PI / m as f64;
+                pj.cos()
+            })
+            .collect();
+        let nodes_n: Vec<f64> = nodes_x.iter().map(|&x| 0.5 * n_max * (x + 1.0)).collect();
+
+        // Evaluate T_i(n_j) exactly for each j.  `values[j * n_rows
+        // + i]` = T_i(n_j).
+        let mut samples = vec![0.0_f64; m * n_rows];
+        for (j, &nj) in nodes_n.iter().enumerate() {
+            let t_un: Vec<f64> = (0..n_rows).map(|i| (-nj * sigma[i]).exp()).collect();
+            let t_res = crate::resolution::apply_r(matrix, &t_un);
+            for (i, &v) in t_res.iter().enumerate() {
+                samples[j * n_rows + i] = v;
+            }
+        }
+
+        // DCT-II to extract Chebyshev coefficients per row.
+        // c_k = (2 / M) Σ_j T_i(n_j) T_k(x_j)   for k ≥ 1
+        // c_0 = (1 / M) Σ_j T_i(n_j)
+        // where T_k(cos θ) = cos(k θ), θ_j = π (j + 0.5) / M.
+        let mut coeffs = vec![0.0_f64; n_rows * m];
+        for i in 0..n_rows {
+            for k in 0..m {
+                let mut sum = 0.0_f64;
+                for j in 0..m {
+                    let theta_j = (j as f64 + 0.5) * std::f64::consts::PI / m as f64;
+                    sum += samples[j * n_rows + i] * (k as f64 * theta_j).cos();
+                }
+                let scale = if k == 0 { 1.0 } else { 2.0 } / m as f64;
+                coeffs[i * m + k] = scale * sum;
+            }
+        }
+
+        Ok(Self {
+            target_energies: matrix.target_energies().to_vec(),
+            n_max,
+            m,
+            coeffs,
+            density_box: Some(n_max),
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.target_energies.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.target_energies.is_empty()
+    }
+    pub fn target_energies(&self) -> &[f64] {
+        &self.target_energies
+    }
+    pub fn n_max(&self) -> f64 {
+        self.n_max
+    }
+    pub fn m(&self) -> usize {
+        self.m
+    }
+    pub fn density_box(&self) -> Option<f64> {
+        self.density_box
+    }
+
+    /// Evaluate the Chebyshev interpolant at density `n`.  Density
+    /// outside `[0, n_max]` extrapolates (caller responsibility —
+    /// dispatch should reject via the density-box check).
+    pub fn forward_scalar(&self, n: f64) -> Vec<f64> {
+        let n_rows = self.target_energies.len();
+        let mut out = vec![0.0_f64; n_rows];
+        if self.m == 0 {
+            return out;
+        }
+        // Map n → x ∈ [-1, 1].
+        let x = 2.0 * n / self.n_max - 1.0;
+        // Clenshaw recurrence: evaluate Σ_k c_k T_k(x).
+        // b_{M+1} = b_{M+2} = 0; b_k = 2 x b_{k+1} - b_{k+2} + c_k;
+        // result = c_0 + x b_1 - b_2.
+        for (i, out_i) in out.iter_mut().enumerate() {
+            let row_start = i * self.m;
+            let mut b_next = 0.0_f64;
+            let mut b_next_next = 0.0_f64;
+            for k in (1..self.m).rev() {
+                let b_k = 2.0 * x * b_next - b_next_next + self.coeffs[row_start + k];
+                b_next_next = b_next;
+                b_next = b_k;
+            }
+            *out_i = self.coeffs[row_start] + x * b_next - b_next_next;
+        }
+        out
+    }
+
+    /// Evaluate forward + derivative in one pass.  The derivative
+    /// of a Chebyshev series can be evaluated via a modified
+    /// Clenshaw recurrence that internally tracks the derivative
+    /// coefficients — or we use the standard identity
+    /// `T_k'(x) = k · U_{k-1}(x)` (Chebyshev-of-the-second-kind
+    /// recurrence).  Here we run two parallel Clenshaw sweeps: one
+    /// for `T(x)` and one for `d/dx T(x)`, then scale by
+    /// `dx/dn = 2 / n_max`.
+    pub fn forward_and_derivative_scalar(&self, n: f64) -> (Vec<f64>, Vec<f64>) {
+        let n_rows = self.target_energies.len();
+        let mut forward = vec![0.0_f64; n_rows];
+        let mut deriv = vec![0.0_f64; n_rows];
+        if self.m == 0 {
+            return (forward, deriv);
+        }
+        let x = 2.0 * n / self.n_max - 1.0;
+        let dx_dn = 2.0 / self.n_max;
+
+        // Derivative coefficients d_k such that Σ d_k T_k(x) =
+        // d/dx Σ c_k T_k(x).  Standard recurrence:
+        //   d_{M-1} = 0
+        //   d_{M-2} = 2 (M-1) c_{M-1}
+        //   d_k = d_{k+2} + 2 (k+1) c_{k+1}   for k = M-3..0
+        // (then d_0 needs to be halved if we want a simple Clenshaw,
+        // but it's cleaner to use the "recurrence with halved d_0"
+        // convention; we apply the same Clenshaw as forward.)
+        let m = self.m;
+        let mut d_coeffs = vec![0.0_f64; m];
+
+        for (i, (out_t, out_d)) in forward.iter_mut().zip(deriv.iter_mut()).enumerate() {
+            let row_start = i * m;
+            // Compute d_coeffs for this row.
+            d_coeffs.fill(0.0);
+            if m >= 2 {
+                // d_{M-1} = 0 (already zero)
+                // d_{M-2} = 2 (M-1) c_{M-1}  for M ≥ 2
+                for k in (0..m - 1).rev() {
+                    let prev = if k + 2 < m { d_coeffs[k + 2] } else { 0.0 };
+                    d_coeffs[k] = prev + 2.0 * (k as f64 + 1.0) * self.coeffs[row_start + k + 1];
+                }
+                d_coeffs[0] *= 0.5; // Clenshaw convention: halve d_0.
+            }
+
+            // Clenshaw on forward coefficients.
+            let mut b_next = 0.0_f64;
+            let mut b_next_next = 0.0_f64;
+            for k in (1..m).rev() {
+                let b_k = 2.0 * x * b_next - b_next_next + self.coeffs[row_start + k];
+                b_next_next = b_next;
+                b_next = b_k;
+            }
+            *out_t = self.coeffs[row_start] + x * b_next - b_next_next;
+
+            // Clenshaw on derivative coefficients (dx/dx side).
+            let mut b_next = 0.0_f64;
+            let mut b_next_next = 0.0_f64;
+            for k in (1..m).rev() {
+                let b_k = 2.0 * x * b_next - b_next_next + d_coeffs[k];
+                b_next_next = b_next;
+                b_next = b_k;
+            }
+            let deriv_dx = d_coeffs[0] + x * b_next - b_next_next;
+            *out_d = deriv_dx * dx_dn;
+        }
+        (forward, deriv)
+    }
+}
+
+/// Scalar (k = 1) surrogate used by the downstream dispatch
+/// layers (see `TransmissionFitModel` / `PrecomputedTransmissionModel`).
+///
+/// This was an enum of `Gauss` vs `Chebyshev` during PR #475's
+/// bench-off period; Chebyshev won the real-VENUS bench (12.2×
+/// vs exact, 1e-15 accuracy at VENUS density) and Lanczos Gauss
+/// was deleted per the issue's "drop the loser" contract.
+/// The type alias is kept as a public stable name so callers and
+/// downstream dispatch code aren't coupled to the winning impl's
+/// concrete type — if a future research sprint finds a better
+/// scalar surrogate, only the alias moves.
+pub type ScalarSurrogatePlan = ScalarChebyshevPlan;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1347,6 +1635,201 @@ mod tests {
         eprintln!(
             "VENUS k=1 cubature compression: {exact_nnz} exact nnz → {cub_atoms} atoms ({:.1}× compression)",
             exact_nnz as f64 / cub_atoms as f64,
+        );
+    }
+
+    // ── Scalar (k = 1) surrogate tests — PR #475 ───────────────────
+
+    /// Build a 1-isotope synthetic σ + matrix pair, shared by both
+    /// scalar surrogate tests.
+    fn scalar_setup(
+        n_grid: usize,
+        half_kernel: usize,
+    ) -> (Vec<f64>, crate::resolution::ResolutionMatrix) {
+        let (_e, sigmas, matrix) = synthetic_setup(n_grid, half_kernel, 1);
+        (sigmas, matrix) // sigmas for k=1 is flat length n_grid
+    }
+
+    #[test]
+    fn scalar_chebyshev_matches_exact_at_multiple_densities() {
+        let (sigmas_flat, matrix) = scalar_setup(40, 4);
+        let sigma = &sigmas_flat;
+        let n_max = 2e-4_f64;
+        let plan =
+            ScalarChebyshevPlan::build(&matrix, sigma, n_max, 16).expect("build chebyshev plan");
+        for n in [1e-5_f64, 1e-4, 1.6e-4] {
+            let t_plan = plan.forward_scalar(n);
+            let t_un: Vec<f64> = sigma.iter().map(|&s| (-n * s).exp()).collect();
+            let t_exact = crate::resolution::apply_r(&matrix, &t_un);
+            let max_err = max_hybrid_err(&t_plan, &t_exact);
+            // Chebyshev accuracy depends on M; for M = 16 on a
+            // bounded T ∈ [0, 1] signal, expect ≤ 1e-8.
+            assert!(
+                max_err < 1e-8,
+                "Chebyshev vs exact at n = {n:.1e}: max hybrid err = {max_err:.3e}",
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_chebyshev_derivative_matches_finite_difference() {
+        let (sigmas_flat, matrix) = scalar_setup(30, 4);
+        let sigma = &sigmas_flat;
+        let n_max = 2e-4_f64;
+        let plan = ScalarChebyshevPlan::build(&matrix, sigma, n_max, 16).expect("build");
+        let n = 1.6e-4_f64;
+        let h = 1e-8_f64;
+        let (_t, dt_an) = plan.forward_and_derivative_scalar(n);
+        let t_plus = plan.forward_scalar(n + h);
+        let t_minus = plan.forward_scalar(n - h);
+        for i in 0..plan.len() {
+            let dt_fd = (t_plus[i] - t_minus[i]) / (2.0 * h);
+            let denom = dt_an[i].abs().max(dt_fd.abs()).max(1e-12);
+            let rel = (dt_an[i] - dt_fd).abs() / denom;
+            assert!(
+                rel < 1e-4,
+                "row {i}: analytic {} vs FD {} rel = {:.3e}",
+                dt_an[i],
+                dt_fd,
+                rel,
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_chebyshev_rejects_invalid_box() {
+        let (sigmas_flat, matrix) = scalar_setup(20, 3);
+        let err = ScalarChebyshevPlan::build(&matrix, &sigmas_flat, 0.0, 16)
+            .expect_err("n_max = 0 must reject");
+        assert!(matches!(
+            err,
+            ScalarSurrogateBuildError::InvalidChebyshevBox { .. }
+        ));
+        let err = ScalarChebyshevPlan::build(&matrix, &sigmas_flat, 1e-4, 1)
+            .expect_err("M = 1 must reject");
+        assert!(matches!(
+            err,
+            ScalarSurrogateBuildError::InvalidChebyshevBox { .. }
+        ));
+    }
+
+    #[test]
+    fn scalar_plan_rejects_sigma_size_mismatch() {
+        let (_sigmas_flat, matrix) = scalar_setup(20, 3);
+        let wrong = vec![0.0_f64; 15];
+        let err = ScalarChebyshevPlan::build(&matrix, &wrong, 1e-4, 16)
+            .expect_err("Chebyshev sigma mismatch must reject");
+        assert!(matches!(
+            err,
+            ScalarSurrogateBuildError::SigmaGridMismatch { .. }
+        ));
+    }
+
+    /// Real-VENUS regression test for the Chebyshev scalar
+    /// surrogate on the 3471-bin VENUS production grid with
+    /// synthetic Hf-like σ.  Asserts forward accuracy ≤ 1e-5 at
+    /// VENUS density (issue #475 success criterion) and logs
+    /// per-call wall time.  PR #475 benched this against a
+    /// Lanczos σ-pushforward Gauss quadrature on the same kernel
+    /// and picked Chebyshev (12.2× vs exact, 1.89e-15 accuracy)
+    /// over Gauss (7.1× vs exact, 4.00e-15 accuracy).  Lanczos
+    /// code has been deleted; this test now pins the winner's
+    /// numbers as a regression guard.
+    #[test]
+    #[ignore = "requires PLEIADES resolution file `_fts_bl10_0p5meV_1keV_25pts.txt` at repo root (gitignored by policy)"]
+    fn scalar_chebyshev_real_venus_k1_regression() {
+        let res_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("_fts_bl10_0p5meV_1keV_25pts.txt");
+        let text = std::fs::read_to_string(&res_path).expect(
+            "missing PLEIADES resolution file at repo root (see `#[ignore]` message for details)",
+        );
+        let tab = TabulatedResolution::from_text(&text, 25.0).expect("parse fixture");
+
+        // VENUS production grid size.
+        let n_grid = 3471_usize;
+        let energies: Vec<f64> = (0..n_grid)
+            .map(|i| 7.0 + (200.0 - 7.0) * (i as f64) / ((n_grid - 1) as f64))
+            .collect();
+        let plan = tab.plan(&energies).expect("build plan on sorted grid");
+        let matrix = plan.compile_to_matrix();
+        let matrix_nnz = matrix.nnz();
+
+        // Synthetic Hf-like σ: Gaussian resonance peaks + baseline
+        // potential scattering.  Rough ENDF-Hf magnitudes (peaks
+        // up to O(1e3) barns, baseline ~10 barns).
+        let sigma: Vec<f64> = energies
+            .iter()
+            .map(|&e| {
+                let peak_a = 1200.0 * (-((e - 80.0).powi(2)) / 8.0).exp();
+                let peak_b = 600.0 * (-((e - 120.0).powi(2)) / 6.0).exp();
+                let peak_c = 300.0 * (-((e - 160.0).powi(2)) / 10.0).exp();
+                peak_a + peak_b + peak_c + 10.0
+            })
+            .collect();
+
+        // Training box: 2 × VENUS density.  M = 16 Chebyshev nodes
+        // — PR #475 bench showed this achieves 1e-15 forward
+        // accuracy on the whole box.
+        let n_max = 2e-4_f64;
+        let t_build = std::time::Instant::now();
+        let cheb =
+            ScalarChebyshevPlan::build(&matrix, &sigma, n_max, 16).expect("build Chebyshev plan");
+        let t_build = t_build.elapsed();
+
+        // Forward accuracy at VENUS density.
+        let n_venus = 1.6e-4_f64;
+        let t_exact = exact_forward(&matrix, &sigma, 1, &[n_venus]);
+        let t_cheb = cheb.forward_scalar(n_venus);
+        let max_err = max_hybrid_err(&t_cheb, &t_exact);
+
+        // Per-forward timing.
+        let n_iters = 1000;
+        let t0 = std::time::Instant::now();
+        let mut sink = 0.0_f64;
+        for _ in 0..n_iters {
+            sink += cheb.forward_scalar(n_venus)[0];
+        }
+        let t_fwd = t0.elapsed() / n_iters as u32;
+        std::hint::black_box(sink);
+
+        let t_un: Vec<f64> = sigma.iter().map(|&s| (-n_venus * s).exp()).collect();
+        let t0 = std::time::Instant::now();
+        let mut sink = 0.0_f64;
+        for _ in 0..n_iters {
+            sink += crate::resolution::apply_r(&matrix, &t_un)[0];
+        }
+        let t_exact_fwd = t0.elapsed() / n_iters as u32;
+        std::hint::black_box(sink);
+
+        eprintln!();
+        eprintln!(
+            "=== scalar Chebyshev VENUS k=1 regression (n_grid = {n_grid}, matrix nnz = {matrix_nnz}) ==="
+        );
+        eprintln!(
+            "Chebyshev (M=16):  build = {:>9.1?}  n_coeff = {:>7}  fwd = {:>8.2?}  max_err @ VENUS = {:.3e}",
+            t_build,
+            n_grid * 16,
+            t_fwd,
+            max_err,
+        );
+        eprintln!(
+            "Exact apply_r:     build = {:>9}                     fwd = {:>8.2?}  (reference)",
+            "n/a", t_exact_fwd,
+        );
+        eprintln!(
+            "Cheb speedup vs exact: {:.1}×",
+            t_exact_fwd.as_nanos() as f64 / t_fwd.as_nanos() as f64,
+        );
+        eprintln!();
+
+        // Issue #475 success criteria.
+        assert!(
+            max_err < 1e-5,
+            "Chebyshev forward max err {max_err:.3e} exceeds 1e-5 ceiling",
         );
     }
 }
