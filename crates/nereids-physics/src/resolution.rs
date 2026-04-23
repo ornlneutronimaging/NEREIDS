@@ -69,6 +69,11 @@ pub enum ResolutionError {
     /// differing element so callers can diagnose silent-staleness
     /// bugs at the cache layer.
     PlanGridMismatch { first_diff_index: usize },
+    /// A [`ResolutionMatrix`] was passed together with an `energies`
+    /// slice that does not match the grid the matrix was compiled for.
+    /// Same semantics as [`Self::PlanGridMismatch`] but for the CSR
+    /// path (see [`apply_r`]).
+    MatrixGridMismatch { first_diff_index: usize },
 }
 
 impl fmt::Display for ResolutionError {
@@ -87,6 +92,12 @@ impl fmt::Display for ResolutionError {
                 f,
                 "resolution plan was built for a different energy grid than was \
                  passed to apply_resolution_with_plan (first differing index: {})",
+                first_diff_index,
+            ),
+            Self::MatrixGridMismatch { first_diff_index } => write!(
+                f,
+                "resolution matrix was compiled for a different energy grid than was \
+                 passed to apply_resolution_with_matrix (first differing index: {})",
                 first_diff_index,
             ),
         }
@@ -1104,6 +1115,298 @@ impl ResolutionPlan {
 
         result
     }
+
+    /// Compile this plan into a row-stochastic CSR
+    /// [`ResolutionMatrix`].
+    ///
+    /// The compiled matrix is an explicit sparse representation of
+    /// the resolution operator `R` on the plan's target grid.  Each
+    /// row sums to 1.0 to machine precision (passthrough rows store
+    /// a single `(i, i, 1.0)` entry to match [`ResolutionPlan::apply`]
+    /// 's `norm ≤ DIVISION_FLOOR` fallback).
+    ///
+    /// Degenerate-bracket handling uses the `-0.0` sentinel
+    /// convention introduced in PR #470: if `plan.frac[e]` has the
+    /// bit pattern of `-0.0`, the entry contributes `weight / norm`
+    /// at column `lo` only (no `lo+1` bracket).  A regular `+0.0`
+    /// frac contributes `weight * 1.0 / norm` at `lo` and
+    /// `weight * 0.0 / norm = 0.0` at `lo+1` — those zero columns
+    /// are retained in CSR with `value = 0.0` to preserve
+    /// downstream NaN-safety if the consumer re-multiplies by a
+    /// spectrum containing NaN at `lo+1`.
+    ///
+    /// # Equivalence contract (finite spectra only)
+    ///
+    /// For a spectrum with **all finite values**, [`apply_r`] on the
+    /// compiled matrix produces per-element output within `1e-12`
+    /// relative tolerance of [`Self::apply`] on the same spectrum —
+    /// not bit-exact, because the CSR matvec sums contributions in
+    /// column order while `apply` sums in entry order and IEEE-754
+    /// addition is non-associative.  The `1e-12` bound accounts for
+    /// accumulation error across the ~82 entries per row on the
+    /// 3471-bin VENUS production grid (500 × 2.22e-16 ≈ 1.1e-13 per
+    /// row; `1e-12` leaves comfortable headroom).
+    ///
+    /// # Non-finite and near-overflow spectra
+    ///
+    /// The equivalence bound does **NOT** extend to spectra with
+    /// `NaN` / `±∞` values, **nor to near-f64::MAX overflow inputs**
+    /// (Codex round-2 P3).  Both divergences trace back to the same
+    /// algebraic rewrite:
+    ///
+    /// * [`Self::apply`] computes each entry as `spec[lo] + frac *
+    ///   (spec[lo+1] - spec[lo])`, which can overflow the
+    ///   subtraction even for finite inputs (opposite-sign
+    ///   f64::MAX → `-∞`).
+    /// * The compiled CSR form splits the interp into `(1 - frac) *
+    ///   spec[lo] + frac * spec[lo + 1]`, which scales before
+    ///   summing and stays finite in the same case.
+    ///
+    /// For bounded finite Beer-Lambert transmissions (`T ∈ [0, 1]`)
+    /// neither divergence can arise; callers who deliberately pass
+    /// non-finite or near-overflow spectra (e.g., as debug sentinels
+    /// or out-of-range diagnostics) must not rely on cross-API
+    /// equivalence.  See `resolution_matrix_nonfinite_contract` and
+    /// `resolution_matrix_large_finite_contract` for executable
+    /// demonstrations.
+    pub fn compile_to_matrix(&self) -> ResolutionMatrix {
+        let n = self.target_energies.len();
+        let mut row_starts: Vec<u32> = Vec::with_capacity(n + 1);
+        row_starts.push(0);
+        let mut col_indices: Vec<u32> = Vec::new();
+        let mut values: Vec<f64> = Vec::new();
+
+        // Reusable per-row accumulator.  Columns accumulate into a
+        // BTreeMap keyed by spectrum index so the final CSR row is
+        // emitted in ascending column order — the required CSR
+        // invariant and the condition the `apply_r` equivalence
+        // bound depends on.
+        let mut acc: std::collections::BTreeMap<u32, f64> = std::collections::BTreeMap::new();
+
+        for i in 0..n {
+            acc.clear();
+            let norm_i = self.norm[i];
+            if norm_i <= DIVISION_FLOOR {
+                // Passthrough row — matches `apply`'s early return.
+                col_indices.push(i as u32);
+                values.push(1.0);
+                // See u32-overflow `debug_assert!` below — the same
+                // bound applies after every `push`.
+                debug_assert!(
+                    col_indices.len() <= u32::MAX as usize,
+                    "CSR row_starts/col_indices u32 overflow: nnz = {}",
+                    col_indices.len(),
+                );
+                row_starts.push(col_indices.len() as u32);
+                continue;
+            }
+            let start = self.starts[i] as usize;
+            let end = self.starts[i + 1] as usize;
+            for e in start..end {
+                let lo = self.lo_idx[e];
+                let frac = self.frac[e];
+                let w = self.weight[e];
+                if frac.to_bits() == (-0.0_f64).to_bits() {
+                    // Degenerate bracket — `apply` reads `spec[lo]`
+                    // only, so the CSR row contributes only at `lo`.
+                    *acc.entry(lo).or_insert(0.0) += w / norm_i;
+                } else {
+                    // Regular linear-interp entry: `w * ((1 - frac)
+                    // * spec[lo] + frac * spec[lo + 1]) / norm_i`.
+                    *acc.entry(lo).or_insert(0.0) += w * (1.0 - frac) / norm_i;
+                    *acc.entry(lo + 1).or_insert(0.0) += w * frac / norm_i;
+                }
+            }
+            for (&col, &val) in acc.iter() {
+                col_indices.push(col);
+                values.push(val);
+            }
+            // Defence-in-depth: a future large-grid caller that
+            // accumulates more than u32::MAX entries would silently
+            // truncate the `as u32` cast below.  The `plan_presorted`
+            // helper already has matching `debug_assert!` guards on
+            // its u32 offsets (resolution.rs, `plan_presorted`).
+            debug_assert!(
+                col_indices.len() <= u32::MAX as usize,
+                "CSR row_starts/col_indices u32 overflow: nnz = {}",
+                col_indices.len(),
+            );
+            row_starts.push(col_indices.len() as u32);
+        }
+
+        ResolutionMatrix {
+            target_energies: self.target_energies.clone(),
+            row_starts,
+            col_indices,
+            values,
+        }
+    }
+}
+
+/// Row-stochastic CSR representation of the resolution operator `R`
+/// on a fixed target energy grid.
+///
+/// Built from a [`ResolutionPlan`] via
+/// [`ResolutionPlan::compile_to_matrix`].  Exposed so downstream
+/// surrogates (see epic #472) can access the row-local entries
+/// `R_{i, j}` directly for LP / quadrature construction.
+///
+/// Owns a copy of the target energy grid for the same reason
+/// [`ResolutionPlan`] does: caller-side grid-identity checks and
+/// explicit grid-mismatch errors via
+/// [`ResolutionError::MatrixGridMismatch`].
+#[derive(Debug, Clone)]
+pub struct ResolutionMatrix {
+    /// Target energy grid the matrix was compiled for (owned copy).
+    target_energies: Vec<f64>,
+    /// `row_starts[i]..row_starts[i+1]` indexes into
+    /// `col_indices`/`values` for row `i`.  Length `n + 1`.
+    row_starts: Vec<u32>,
+    /// Column indices in ascending order within each row.
+    col_indices: Vec<u32>,
+    /// CSR values.  Row `i` sums to 1.0 within machine precision
+    /// (passthrough rows store exactly `1.0` at column `i`).
+    values: Vec<f64>,
+}
+
+impl ResolutionMatrix {
+    /// Number of rows (target-grid size) covered by this matrix.
+    pub fn len(&self) -> usize {
+        self.target_energies.len()
+    }
+
+    /// True when the matrix covers no target energies.
+    pub fn is_empty(&self) -> bool {
+        self.target_energies.is_empty()
+    }
+
+    /// Total number of stored entries (structural nnz).
+    ///
+    /// Regular-bracket entries with `frac == +0.0` retain a
+    /// zero-valued contribution at the `lo + 1` column to preserve
+    /// NaN-safety under re-application to spectra with NaN at that
+    /// column; those stored zeros are counted in this total.
+    pub fn nnz(&self) -> usize {
+        self.values.len()
+    }
+
+    /// Target energy grid the matrix was compiled for.
+    pub fn target_energies(&self) -> &[f64] {
+        &self.target_energies
+    }
+
+    /// CSR row-start offsets.  `row_starts()[i]..row_starts()[i+1]`
+    /// names the entry range for row `i`.  Length `len() + 1`.
+    pub fn row_starts(&self) -> &[u32] {
+        &self.row_starts
+    }
+
+    /// CSR column indices.  Sorted ascending within each row.
+    pub fn col_indices(&self) -> &[u32] {
+        &self.col_indices
+    }
+
+    /// CSR values.  Each row sums to 1.0 to machine precision.
+    pub fn values(&self) -> &[f64] {
+        &self.values
+    }
+}
+
+/// Apply a compiled [`ResolutionMatrix`] to a spectrum on the same
+/// target grid the matrix was compiled for.
+///
+/// For finite spectra, the output is numerically equivalent to
+/// [`ResolutionPlan::apply`] on the same spectrum within `1e-12`
+/// relative tolerance per element; not bit-exact, because CSR matvec
+/// sums in column order while `ResolutionPlan::apply` sums in entry
+/// order.
+///
+/// # Non-finite and near-overflow inputs
+///
+/// See [`ResolutionPlan::compile_to_matrix`] for the full contract
+/// on `NaN` / `±∞` spectra **and on near-f64::MAX finite spectra** —
+/// the equivalence bound does not extend to either.  Production
+/// forward models feed Beer-Lambert transmissions (`T ∈ [0, 1]`) so
+/// the distinction never arises in practice.
+///
+/// # Panics
+///
+/// Panics if `spectrum.len() != matrix.len()`.  Use
+/// [`apply_resolution_with_matrix`] for a checked entrypoint that
+/// returns [`ResolutionError::LengthMismatch`] instead.
+pub fn apply_r(matrix: &ResolutionMatrix, spectrum: &[f64]) -> Vec<f64> {
+    let n = matrix.len();
+    assert_eq!(
+        spectrum.len(),
+        n,
+        "spectrum length ({}) must match matrix grid length ({})",
+        spectrum.len(),
+        n,
+    );
+    let mut out = vec![0.0f64; n];
+    for (i, out_i) in out.iter_mut().enumerate() {
+        let start = matrix.row_starts[i] as usize;
+        let end = matrix.row_starts[i + 1] as usize;
+        let mut sum = 0.0f64;
+        for e in start..end {
+            let col = matrix.col_indices[e] as usize;
+            sum += matrix.values[e] * spectrum[col];
+        }
+        *out_i = sum;
+    }
+    out
+}
+
+/// Checked variant of [`apply_r`] that validates the matrix was
+/// compiled for `energies` before applying.
+///
+/// Returns [`ResolutionError::LengthMismatch`] when either
+/// `energies` or `spectrum` has a length that disagrees with the
+/// matrix grid size.  For the `spectrum` check, the `energies` field
+/// of the returned error holds the matrix grid length (the required
+/// length) so callers can read it as "expected vs got".  Returns
+/// [`ResolutionError::MatrixGridMismatch`] when the lengths match
+/// but the grid contents differ (per-element `to_bits()` compare).
+///
+/// Unlike [`apply_resolution_with_plan`], this entrypoint does not
+/// call [`validate_inputs`] to enforce an ascending `energies` grid.
+/// That check is redundant here: the plan that produced the matrix
+/// was itself built on a sorted grid (via [`TabulatedResolution::plan`]
+/// which runs [`validate_inputs`]), and the stored `target_energies`
+/// copy is used in the `to_bits()` grid-identity check above.  Any
+/// `energies` slice that is not bit-identical to the matrix's stored
+/// copy — including an unsorted permutation of the same values —
+/// fails with [`ResolutionError::MatrixGridMismatch`].
+pub fn apply_resolution_with_matrix(
+    energies: &[f64],
+    matrix: &ResolutionMatrix,
+    spectrum: &[f64],
+) -> Result<Vec<f64>, ResolutionError> {
+    if energies.len() != matrix.len() {
+        return Err(ResolutionError::LengthMismatch {
+            energies: energies.len(),
+            data: matrix.len(),
+        });
+    }
+    if spectrum.len() != matrix.len() {
+        // Reuse the `LengthMismatch` variant for the spectrum branch:
+        // `energies` = expected length (matrix grid size), `data` =
+        // actual spectrum length.  See docstring above.
+        return Err(ResolutionError::LengthMismatch {
+            energies: matrix.len(),
+            data: spectrum.len(),
+        });
+    }
+    for (i, (e_cur, e_ref)) in energies.iter().zip(matrix.target_energies()).enumerate() {
+        // `to_bits()` equality catches `-0.0 vs +0.0` and NaN-bit
+        // differences that float `==` silently accepts or rejects.
+        if e_cur.to_bits() != e_ref.to_bits() {
+            return Err(ResolutionError::MatrixGridMismatch {
+                first_diff_index: i,
+            });
+        }
+    }
+    Ok(apply_r(matrix, spectrum))
 }
 
 impl TabulatedResolution {
@@ -2893,5 +3196,714 @@ mod tests {
             t_build + t_apply_total,
         );
         assert_eq!(sink_percall.to_bits(), sink_plan.to_bits());
+    }
+
+    // ---------- ResolutionMatrix (CSR compile) tests ----------
+    //
+    // Two tiers of tests:
+    //
+    // 1. **CI-hermetic synthetic tests** — use hand-constructed
+    //    `ResolutionPlan`s via `make_synthetic_plan`; no fixture
+    //    dependency, run on every `cargo test` invocation.  Cover
+    //    passthrough rows, `-0.0` sentinel rows, regular
+    //    linear-interp rows, CSR invariants, and the non-finite
+    //    contract exclusion.
+    //
+    // 2. **Fixture-dependent tests** (`#[ignore]`) — require
+    //    `_fts_bl10_0p5meV_1keV_25pts.txt` at the repo root (a
+    //    gitignored PLEIADES file).  Cover end-to-end equivalence
+    //    against the production VENUS operator at realistic grid
+    //    sizes (512, 3471).  Run locally with `-- --ignored`.  Same
+    //    pattern as `test_broaden_presorted_bit_exact_on_pleiades_resolution`
+    //    already in this module.
+
+    /// Helper: build a TabulatedResolution + plan + matrix on a
+    /// uniform energy grid using the VENUS fixture kernel.  Only used
+    /// by `#[ignore]`d tests because the fixture file is gitignored
+    /// at the repo root per the "not approved for public release"
+    /// policy (.gitignore line 49).
+    fn build_fixture_plan_and_matrix(
+        n_grid: usize,
+    ) -> (Vec<f64>, ResolutionPlan, ResolutionMatrix) {
+        let res_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("_fts_bl10_0p5meV_1keV_25pts.txt");
+        let text = std::fs::read_to_string(&res_path).expect(
+            "missing PLEIADES resolution file `_fts_bl10_0p5meV_1keV_25pts.txt` at the repo root \
+             (the file is gitignored per policy; place it locally before running this test)",
+        );
+        let res =
+            TabulatedResolution::from_text(&text, 25.0).expect("parse VENUS resolution fixture");
+        let energies: Vec<f64> = (0..n_grid)
+            .map(|i| 7.0 + (200.0 - 7.0) * (i as f64) / ((n_grid - 1) as f64))
+            .collect();
+        let plan = res.plan(&energies).expect("build plan on sorted grid");
+        let matrix = plan.compile_to_matrix();
+        (energies, plan, matrix)
+    }
+
+    /// Hybrid abs+rel tolerance used across equivalence tests.  Guards
+    /// against the `a ≈ 0` trap where `a.abs().max(1e-300)` produces
+    /// meaningless relative errors for genuinely-zero reference values.
+    fn max_hybrid_err(a: &[f64], b: &[f64]) -> f64 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| {
+                let denom = x.abs().max(y.abs()).max(1e-12);
+                (x - y).abs() / denom
+            })
+            .fold(0.0_f64, f64::max)
+    }
+
+    /// Build a synthetic multi-row plan with realistic overlap
+    /// patterns — used as a CI-hermetic stand-in for the VENUS
+    /// kernel.  Each target row `i` draws weights from a triangular
+    /// kernel around column `i`, normalized so the row is
+    /// row-stochastic.  `half_kernel` controls the spread.
+    fn make_synthetic_overlap_plan(n_grid: usize, half_kernel: usize) -> ResolutionPlan {
+        assert!(n_grid > 2 * half_kernel, "grid too small for kernel");
+        let energies: Vec<f64> = (0..n_grid).map(|i| 10.0 + i as f64).collect();
+        let mut rows: Vec<SyntheticRow> = Vec::with_capacity(n_grid);
+        for i in 0..n_grid {
+            let lo_min = i.saturating_sub(half_kernel);
+            // Clamp so `lo ∈ [0, n_grid - 2]` — the linear-interp
+            // branch reads `spec[lo + 1]`, and the `-0.0` sentinel is
+            // the only way to safely go up to `lo = n_grid - 1`.  We
+            // keep all synthetic entries on the regular branch here.
+            let lo_max = (i + half_kernel).min(n_grid - 2);
+            let entries: Vec<SyntheticEntry> = (lo_min..=lo_max)
+                .map(|lo| {
+                    let d = (lo as i64 - i as i64).abs() as f64;
+                    let w = 1.0 - d / (half_kernel as f64 + 1.0);
+                    // A uniform `frac = 0.5` distributes each entry's
+                    // weight evenly across `lo` and `lo + 1`, which
+                    // exercises the regular linear-interp branch of
+                    // `compile_to_matrix`.
+                    SyntheticEntry {
+                        lo: lo as u32,
+                        frac: 0.5,
+                        weight: w,
+                    }
+                })
+                .collect();
+            let norm: f64 = entries.iter().map(|e| e.weight).sum();
+            rows.push(SyntheticRow { entries, norm });
+        }
+        make_synthetic_plan(energies, rows)
+    }
+
+    /// CI-hermetic: row-stochasticity on a synthetic multi-row plan.
+    #[test]
+    fn resolution_matrix_is_row_stochastic_synthetic() {
+        let plan = make_synthetic_overlap_plan(40, 5);
+        let matrix = plan.compile_to_matrix();
+        for i in 0..matrix.len() {
+            let start = matrix.row_starts()[i] as usize;
+            let end = matrix.row_starts()[i + 1] as usize;
+            let row_sum: f64 = matrix.values()[start..end].iter().sum();
+            assert!(
+                (row_sum - 1.0).abs() < 1e-13,
+                "row {} sum = {} (expected 1.0 within 1e-13)",
+                i,
+                row_sum,
+            );
+        }
+    }
+
+    /// CI-hermetic: equivalence of `apply_r` and `plan.apply` on a
+    /// synthetic multi-row plan, 40-point grid, half-kernel 5.
+    #[test]
+    fn resolution_matrix_apply_equivalent_to_plan_apply_synthetic() {
+        let plan = make_synthetic_overlap_plan(40, 5);
+        let matrix = plan.compile_to_matrix();
+        // Beer-Lambert-shaped synthetic spectrum, bounded [0, 1].
+        let spec: Vec<f64> = (0..matrix.len())
+            .map(|i| {
+                let x = i as f64 / 39.0;
+                1.0 - 0.7 * (-((x - 0.5).powi(2)) / 0.01).exp()
+            })
+            .collect();
+        let plan_out = plan.apply(&spec);
+        let matrix_out = apply_r(&matrix, &spec);
+        let max_err = max_hybrid_err(&plan_out, &matrix_out);
+        assert!(
+            max_err < 1e-12,
+            "synthetic apply_r vs plan.apply max hybrid err = {:.3e} (expected < 1e-12)",
+            max_err,
+        );
+    }
+
+    /// CI-hermetic: CSR column indices strictly ascending per row on
+    /// a synthetic multi-row plan.
+    #[test]
+    fn resolution_matrix_csr_column_indices_sorted_per_row_synthetic() {
+        let plan = make_synthetic_overlap_plan(30, 4);
+        let matrix = plan.compile_to_matrix();
+        for i in 0..matrix.len() {
+            let start = matrix.row_starts()[i] as usize;
+            let end = matrix.row_starts()[i + 1] as usize;
+            let row_cols = &matrix.col_indices()[start..end];
+            for w in row_cols.windows(2) {
+                assert!(
+                    w[0] < w[1],
+                    "row {} col_indices not strictly ascending: {:?}",
+                    i,
+                    row_cols,
+                );
+            }
+        }
+    }
+
+    /// CI-hermetic: grid-mismatch / length-mismatch detection via
+    /// `apply_resolution_with_matrix` on a synthetic plan.
+    #[test]
+    fn resolution_matrix_grid_and_length_mismatch_synthetic() {
+        let plan = make_synthetic_overlap_plan(16, 3);
+        let matrix = plan.compile_to_matrix();
+        let n = matrix.len();
+        let energies: Vec<f64> = (0..n).map(|i| 10.0 + i as f64).collect();
+        let spec = vec![1.0_f64; n];
+
+        // Same grid + length → passes.
+        assert!(apply_resolution_with_matrix(&energies, &matrix, &spec).is_ok());
+
+        // Perturb one energy → MatrixGridMismatch with offending
+        // index.
+        let mut mutated = energies.clone();
+        mutated[7] += 1e-12;
+        let err = apply_resolution_with_matrix(&mutated, &matrix, &spec)
+            .expect_err("grid mismatch must error");
+        assert_eq!(
+            err,
+            ResolutionError::MatrixGridMismatch {
+                first_diff_index: 7,
+            }
+        );
+
+        // Short spectrum → LengthMismatch.
+        let short = vec![1.0_f64; n - 1];
+        let err = apply_resolution_with_matrix(&energies, &matrix, &short)
+            .expect_err("length mismatch must error");
+        assert!(matches!(err, ResolutionError::LengthMismatch { .. }));
+    }
+
+    /// End-to-end bit-level equivalence on the real VENUS kernel,
+    /// 512-point grid.  Gated on the PLEIADES fixture per the
+    /// established `#[ignore]` pattern in this module.
+    #[test]
+    #[ignore = "requires PLEIADES resolution file `_fts_bl10_0p5meV_1keV_25pts.txt` at repo root (gitignored by policy)"]
+    fn resolution_matrix_is_row_stochastic_on_venus_kernel() {
+        let (_energies, _plan, matrix) = build_fixture_plan_and_matrix(512);
+        for i in 0..matrix.len() {
+            let start = matrix.row_starts()[i] as usize;
+            let end = matrix.row_starts()[i + 1] as usize;
+            let row_sum: f64 = matrix.values()[start..end].iter().sum();
+            assert!(
+                (row_sum - 1.0).abs() < 1e-13,
+                "row {} sum = {} (expected 1.0 within 1e-13)",
+                i,
+                row_sum,
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires PLEIADES resolution file `_fts_bl10_0p5meV_1keV_25pts.txt` at repo root (gitignored by policy)"]
+    fn resolution_matrix_apply_equivalent_to_plan_apply_on_venus_kernel() {
+        let (_energies, plan, matrix) = build_fixture_plan_and_matrix(512);
+        let n_grid = matrix.len();
+        let spec: Vec<f64> = (0..n_grid)
+            .map(|i| {
+                let e = 7.0 + (200.0 - 7.0) * (i as f64) / ((n_grid - 1) as f64);
+                let sigma = 50.0 * (-((e - 80.0).powi(2)) / 8.0).exp()
+                    + 10.0 * (-((e - 150.0).powi(2)) / 4.0).exp();
+                (-1.6e-4 * sigma).exp()
+            })
+            .collect();
+        let plan_out = plan.apply(&spec);
+        let matrix_out = apply_r(&matrix, &spec);
+        let max_err = max_hybrid_err(&plan_out, &matrix_out);
+        assert!(
+            max_err < 1e-12,
+            "apply_r vs plan.apply max hybrid err = {:.3e} (expected < 1e-12)",
+            max_err,
+        );
+    }
+
+    /// Production-grid guardrail for the `1e-12` tolerance documented
+    /// on [`ResolutionPlan::compile_to_matrix`].  The 3471-bin VENUS
+    /// grid has ~82 entries per row, so accumulation error is an
+    /// order of magnitude larger than on the synthetic multi-row
+    /// tests above; this test pins the equivalence bound at
+    /// production scale so a future regression in either `apply` or
+    /// `apply_r` summation order fails loudly.  Logs the observed
+    /// `max_hybrid_err` via `eprintln!` so `-- --ignored --nocapture`
+    /// runs surface the actual headroom against the 1e-12 ceiling.
+    #[test]
+    #[ignore = "requires PLEIADES resolution file `_fts_bl10_0p5meV_1keV_25pts.txt` at repo root (gitignored by policy)"]
+    fn resolution_matrix_apply_equivalent_at_production_grid() {
+        let (_energies, plan, matrix) = build_fixture_plan_and_matrix(3471);
+        let n_grid = matrix.len();
+        // Same Beer-Lambert test spectrum as the 512-point test.
+        let spec: Vec<f64> = (0..n_grid)
+            .map(|i| {
+                let e = 7.0 + (200.0 - 7.0) * (i as f64) / ((n_grid - 1) as f64);
+                let sigma = 50.0 * (-((e - 80.0).powi(2)) / 8.0).exp()
+                    + 10.0 * (-((e - 150.0).powi(2)) / 4.0).exp();
+                (-1.6e-4 * sigma).exp()
+            })
+            .collect();
+        let plan_out = plan.apply(&spec);
+        let matrix_out = apply_r(&matrix, &spec);
+        let max_err = max_hybrid_err(&plan_out, &matrix_out);
+        eprintln!(
+            "3471-grid apply_r vs plan.apply observed max_hybrid_err = {:.3e} \
+             (ceiling 1e-12; theoretical bound ~1e-13 per row × 82 rows/entry)",
+            max_err,
+        );
+        assert!(
+            max_err < 1e-12,
+            "3471-grid apply_r vs plan.apply max hybrid err = {:.3e} (expected < 1e-12)",
+            max_err,
+        );
+    }
+
+    #[test]
+    #[ignore = "requires PLEIADES resolution file `_fts_bl10_0p5meV_1keV_25pts.txt` at repo root (gitignored by policy)"]
+    fn resolution_matrix_apply_equivalent_across_densities() {
+        let (_energies, plan, matrix) = build_fixture_plan_and_matrix(512);
+        let n_grid = matrix.len();
+        for &n_density in &[1e-5_f64, 1e-4, 1.6e-4, 1e-3] {
+            let spec: Vec<f64> = (0..n_grid)
+                .map(|i| {
+                    let e = 7.0 + (200.0 - 7.0) * (i as f64) / ((n_grid - 1) as f64);
+                    let sigma = 50.0 * (-((e - 80.0).powi(2)) / 8.0).exp()
+                        + 10.0 * (-((e - 150.0).powi(2)) / 4.0).exp();
+                    (-n_density * sigma).exp()
+                })
+                .collect();
+            let plan_out = plan.apply(&spec);
+            let matrix_out = apply_r(&matrix, &spec);
+            let max_err = max_hybrid_err(&plan_out, &matrix_out);
+            assert!(
+                max_err < 1e-12,
+                "density n={:.1e}: max hybrid err {:.3e} (expected < 1e-12)",
+                n_density,
+                max_err,
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires PLEIADES resolution file `_fts_bl10_0p5meV_1keV_25pts.txt` at repo root (gitignored by policy)"]
+    fn resolution_matrix_csr_column_indices_sorted_per_row() {
+        let (_energies, _plan, matrix) = build_fixture_plan_and_matrix(256);
+        for i in 0..matrix.len() {
+            let start = matrix.row_starts()[i] as usize;
+            let end = matrix.row_starts()[i + 1] as usize;
+            let row_cols = &matrix.col_indices()[start..end];
+            for w in row_cols.windows(2) {
+                assert!(
+                    w[0] < w[1],
+                    "row {} col_indices not strictly ascending: {:?}",
+                    i,
+                    row_cols,
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires PLEIADES resolution file `_fts_bl10_0p5meV_1keV_25pts.txt` at repo root (gitignored by policy)"]
+    fn resolution_matrix_grid_mismatch_detected() {
+        let (energies, _plan, matrix) = build_fixture_plan_and_matrix(128);
+        let spec = vec![1.0_f64; matrix.len()];
+
+        // Same grid → passes.
+        let ok = apply_resolution_with_matrix(&energies, &matrix, &spec);
+        assert!(ok.is_ok());
+
+        // Perturb one energy → MatrixGridMismatch with the
+        // offending index.
+        let mut mutated = energies.clone();
+        mutated[37] += 1e-12;
+        let err = apply_resolution_with_matrix(&mutated, &matrix, &spec)
+            .expect_err("grid mismatch must error");
+        assert_eq!(
+            err,
+            ResolutionError::MatrixGridMismatch {
+                first_diff_index: 37,
+            }
+        );
+    }
+
+    #[test]
+    #[ignore = "requires PLEIADES resolution file `_fts_bl10_0p5meV_1keV_25pts.txt` at repo root (gitignored by policy)"]
+    fn resolution_matrix_length_mismatch_detected() {
+        let (energies, _plan, matrix) = build_fixture_plan_and_matrix(64);
+        let short_spec = vec![1.0_f64; matrix.len() - 1];
+        let err = apply_resolution_with_matrix(&energies, &matrix, &short_spec)
+            .expect_err("length mismatch must error");
+        assert!(matches!(err, ResolutionError::LengthMismatch { .. }));
+    }
+
+    #[test]
+    fn resolution_matrix_empty_plan() {
+        // Compile must not panic and must produce a valid empty
+        // matrix when the plan itself is empty.  Build the empty
+        // plan synthetically (no fixture needed) — an empty
+        // `target_energies` plus empty `norm` / `starts = [0]`
+        // yields the same zero-row plan that
+        // `TabulatedResolution::plan(&[])` would produce.
+        let plan = make_synthetic_plan(Vec::new(), Vec::new());
+        let matrix = plan.compile_to_matrix();
+        assert_eq!(matrix.len(), 0);
+        assert!(matrix.is_empty());
+        assert_eq!(matrix.nnz(), 0);
+    }
+
+    /// Microbenchmark: `apply_r` (ResolutionMatrix CSR) vs
+    /// `ResolutionPlan::apply`, 3471-bin VENUS production grid × 100
+    /// spectra. Exercised manually to decide whether the CSR compile +
+    /// CSR matvec beats the plan's two-pointer walk at the
+    /// no-SIMD-no-unsafe baseline promised in #473.
+    ///
+    /// Run manually with:
+    ///
+    /// ```text
+    /// cargo test --release -p nereids-physics \
+    ///   resolution_matrix_apply_microbench -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "microbenchmark; requires PLEIADES resolution file `_fts_bl10_0p5meV_1keV_25pts.txt` at repo root"]
+    fn resolution_matrix_apply_microbench() {
+        let res_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("_fts_bl10_0p5meV_1keV_25pts.txt");
+        let text = std::fs::read_to_string(&res_path).expect(
+            "missing PLEIADES resolution file at repo root (see `#[ignore]` message for details)",
+        );
+        let tab = TabulatedResolution::from_text(&text, 25.0).unwrap();
+
+        let n = 3471_usize;
+        let energies: Vec<f64> = (0..n)
+            .map(|i| 7.0 + i as f64 * ((200.0 - 7.0) / (n - 1) as f64))
+            .collect();
+        let plan = tab.plan(&energies).expect("sorted grid must validate");
+
+        let t_compile = std::time::Instant::now();
+        let matrix = plan.compile_to_matrix();
+        let t_compile = t_compile.elapsed();
+
+        let spec: Vec<f64> = energies
+            .iter()
+            .map(|&e| {
+                let sigma = 50.0 * (-((e - 80.0).powi(2)) / 8.0).exp()
+                    + 10.0 * (-((e - 150.0).powi(2)) / 4.0).exp();
+                (-1.6e-4 * sigma).exp()
+            })
+            .collect();
+
+        let repeats = 100_usize;
+
+        // Warm both paths so the first call's cache-miss latency
+        // does not skew the micro-times.
+        for _ in 0..5 {
+            let _ = plan.apply(&spec);
+            let _ = apply_r(&matrix, &spec);
+        }
+
+        let start = std::time::Instant::now();
+        let mut sink_plan = 0.0f64;
+        for _ in 0..repeats {
+            sink_plan += plan.apply(&spec).iter().sum::<f64>();
+        }
+        let t_plan = start.elapsed();
+
+        let start = std::time::Instant::now();
+        let mut sink_matrix = 0.0f64;
+        for _ in 0..repeats {
+            sink_matrix += apply_r(&matrix, &spec).iter().sum::<f64>();
+        }
+        let t_matrix = start.elapsed();
+
+        let speedup = t_plan.as_secs_f64() / t_matrix.as_secs_f64();
+        println!(
+            "ResolutionMatrix microbench (n_grid={n}, {repeats} spectra):\n\
+             compile (once)       : {:?}  ({} nnz)\n\
+             plan.apply × {repeats} : {:?}\n\
+             apply_r   × {repeats} : {:?}\n\
+             speedup vs plan      : {:.2}x\n\
+             sinks (plan/matrix)  : {:.6e} / {:.6e}",
+            t_compile,
+            matrix.nnz(),
+            t_plan,
+            t_matrix,
+            speedup,
+            sink_plan,
+            sink_matrix,
+        );
+    }
+
+    /// Hand-construct a `ResolutionPlan` that deliberately exercises
+    /// both the passthrough branch (`norm ≤ DIVISION_FLOOR`) and the
+    /// `-0.0` degenerate-bracket sentinel — neither of which is
+    /// reached on the VENUS fixture at the tested grid sizes.  The
+    /// Round-1 audit flagged the earlier fixture-based passthrough
+    /// test as vacuous, so this replacement verifies the two unreached
+    /// branches with direct assertions on the resulting CSR.
+    fn make_synthetic_plan(target_energies: Vec<f64>, rows: Vec<SyntheticRow>) -> ResolutionPlan {
+        let n = target_energies.len();
+        assert_eq!(rows.len(), n);
+        let mut starts: Vec<u32> = Vec::with_capacity(n + 1);
+        starts.push(0);
+        let mut lo_idx: Vec<u32> = Vec::new();
+        let mut frac: Vec<f64> = Vec::new();
+        let mut weight: Vec<f64> = Vec::new();
+        let mut norm: Vec<f64> = Vec::with_capacity(n);
+        for row in &rows {
+            norm.push(row.norm);
+            for entry in &row.entries {
+                lo_idx.push(entry.lo);
+                frac.push(entry.frac);
+                weight.push(entry.weight);
+            }
+            starts.push(lo_idx.len() as u32);
+        }
+        ResolutionPlan {
+            target_energies,
+            starts,
+            lo_idx,
+            frac,
+            weight,
+            norm,
+        }
+    }
+
+    struct SyntheticRow {
+        entries: Vec<SyntheticEntry>,
+        norm: f64,
+    }
+
+    struct SyntheticEntry {
+        lo: u32,
+        frac: f64,
+        weight: f64,
+    }
+
+    #[test]
+    fn resolution_matrix_passthrough_row_compiles_to_identity_entry() {
+        // Row 0: passthrough via norm ≤ DIVISION_FLOOR.
+        // Row 1: regular linear-interp entry (lo=1 → reads cols 1, 2).
+        // Row 2: degenerate `-0.0` sentinel entry (lo=2 → reads col 2 only).
+        //
+        // Grid has 4 cells so `lo ∈ [0, n-2] = [0, 2]` holds for all
+        // entries — this preserves the `ResolutionPlan::apply` SAFETY
+        // invariant that `lo + 1 < n` even if a future refactor
+        // weakens the `-0.0` sentinel short-circuit (round-2 self-
+        // audit NEW-P2 #1).
+        let plan = make_synthetic_plan(
+            vec![10.0, 20.0, 30.0, 40.0],
+            vec![
+                SyntheticRow {
+                    entries: vec![],
+                    // 0.0 is <= DIVISION_FLOOR, so row 0 goes through
+                    // the passthrough branch.
+                    norm: 0.0,
+                },
+                SyntheticRow {
+                    entries: vec![SyntheticEntry {
+                        lo: 1,
+                        frac: 0.25,
+                        weight: 1.0,
+                    }],
+                    norm: 1.0,
+                },
+                SyntheticRow {
+                    entries: vec![SyntheticEntry {
+                        lo: 2,
+                        frac: -0.0,
+                        weight: 1.0,
+                    }],
+                    norm: 1.0,
+                },
+                // Row 3: passthrough too, to round out the 4-cell grid.
+                SyntheticRow {
+                    entries: vec![],
+                    norm: 0.0,
+                },
+            ],
+        );
+        let matrix = plan.compile_to_matrix();
+
+        // Row 0 — single (0, 0, 1.0).
+        let r0_start = matrix.row_starts()[0] as usize;
+        let r0_end = matrix.row_starts()[1] as usize;
+        assert_eq!(r0_end - r0_start, 1, "passthrough row must have 1 entry");
+        assert_eq!(matrix.col_indices()[r0_start], 0);
+        assert_eq!(matrix.values()[r0_start].to_bits(), 1.0_f64.to_bits());
+
+        // Row 1 — linear-interp: contributes at col 1 and col 2.
+        let r1_start = matrix.row_starts()[1] as usize;
+        let r1_end = matrix.row_starts()[2] as usize;
+        assert_eq!(
+            r1_end - r1_start,
+            2,
+            "linear-interp row must have 2 entries"
+        );
+        assert_eq!(matrix.col_indices()[r1_start], 1);
+        assert_eq!(matrix.col_indices()[r1_start + 1], 2);
+        assert!((matrix.values()[r1_start] - 0.75).abs() < 1e-14);
+        assert!((matrix.values()[r1_start + 1] - 0.25).abs() < 1e-14);
+
+        // Row 2 — `-0.0` sentinel: single entry at col 2 (no col 3).
+        let r2_start = matrix.row_starts()[2] as usize;
+        let r2_end = matrix.row_starts()[3] as usize;
+        assert_eq!(
+            r2_end - r2_start,
+            1,
+            "-0.0 sentinel row must have exactly 1 entry (not 2)",
+        );
+        assert_eq!(matrix.col_indices()[r2_start], 2);
+        assert_eq!(matrix.values()[r2_start].to_bits(), 1.0_f64.to_bits());
+
+        // Cross-check with apply semantics: spec[3] is chosen so the
+        // sentinel row, if buggy, would contaminate the output.
+        // Both `plan.apply` and `apply_r` must ignore spec[3] at
+        // row 2.
+        let spec = vec![7.0, 11.0, 13.0, 999.0];
+        let plan_out = plan.apply(&spec);
+        let matrix_out = apply_r(&matrix, &spec);
+        // Row 0 passthrough: out[0] = spec[0] = 7.
+        assert!((matrix_out[0] - 7.0).abs() < 1e-14);
+        assert!((plan_out[0] - 7.0).abs() < 1e-14);
+        // Row 1: 0.75 * spec[1] + 0.25 * spec[2] = 0.75*11 + 0.25*13 = 11.5.
+        assert!((matrix_out[1] - 11.5).abs() < 1e-14);
+        assert!((plan_out[1] - 11.5).abs() < 1e-14);
+        // Row 2 sentinel: 1.0 * spec[2] = 13 — NOT 999 (would indicate
+        // spec[lo+1] was read).
+        assert!((matrix_out[2] - 13.0).abs() < 1e-14);
+        assert!((plan_out[2] - 13.0).abs() < 1e-14);
+        // Row 3 passthrough: out[3] = spec[3] = 999.
+        assert!((matrix_out[3] - 999.0).abs() < 1e-14);
+        assert!((plan_out[3] - 999.0).abs() < 1e-14);
+    }
+
+    /// Documents (and guards) the explicit contract exclusion on
+    /// non-finite spectra between `ResolutionPlan::apply` and
+    /// `apply_r`.  See [`ResolutionPlan::compile_to_matrix`] docstring
+    /// for the full reasoning; this test simply pins the divergence
+    /// so a future unification attempt fails loudly.
+    #[test]
+    fn resolution_matrix_nonfinite_contract() {
+        // 3-cell grid so `lo = 0` for the regular row reads cols 0, 1
+        // and the sentinel row at `lo = 1` reads col 1 only — `lo ∈
+        // [0, n-2] = [0, 1]` satisfied.
+        let plan = make_synthetic_plan(
+            vec![10.0, 20.0, 30.0],
+            vec![
+                SyntheticRow {
+                    entries: vec![SyntheticEntry {
+                        lo: 0,
+                        frac: 0.5,
+                        weight: 1.0,
+                    }],
+                    norm: 1.0,
+                },
+                SyntheticRow {
+                    entries: vec![SyntheticEntry {
+                        lo: 1,
+                        frac: -0.0, // sentinel: short-circuit to spec[lo]
+                        weight: 1.0,
+                    }],
+                    norm: 1.0,
+                },
+                SyntheticRow {
+                    entries: vec![],
+                    norm: 0.0, // passthrough
+                },
+            ],
+        );
+        let matrix = plan.compile_to_matrix();
+
+        // Spectrum with same-sign infinities in both bins of row 0's
+        // non-degenerate bracket.
+        let inf_spec = vec![f64::INFINITY, f64::INFINITY, 0.0];
+        let plan_out = plan.apply(&inf_spec);
+        let matrix_out = apply_r(&matrix, &inf_spec);
+
+        // Row 0: plan.apply evaluates `s_lo + frac * (s_hi - s_lo)`
+        // = `+∞ + 0.5 * (+∞ - +∞)` = `+∞ + 0.5 * NaN` = NaN.
+        // apply_r evaluates `0.5 * +∞ + 0.5 * +∞` = `+∞`.
+        assert!(plan_out[0].is_nan(), "plan.apply must produce NaN on ∞+∞");
+        assert!(matrix_out[0].is_infinite(), "apply_r collapses ∞+∞ to ∞");
+
+        // Row 1 (sentinel): both paths short-circuit to spec[lo] = ∞,
+        // so there is no divergence here.
+        assert!(plan_out[1].is_infinite());
+        assert!(matrix_out[1].is_infinite());
+    }
+
+    /// Round-2 Codex P3: documents (and guards) the analogous
+    /// divergence on **finite spectra near f64 overflow**.  With
+    /// opposite-sign neighboring bins at f64::MAX, `plan.apply`'s
+    /// `s_lo + frac * (s_hi - s_lo)` overflows in the subtraction
+    /// and returns `±∞`, while `apply_r`'s `(1 - frac) * s_lo +
+    /// frac * s_hi` stays finite because the overflow is avoided by
+    /// scaling before summation.  This is why the equivalence
+    /// contract on [`ResolutionPlan::compile_to_matrix`] is scoped
+    /// to bounded finite spectra (Beer-Lambert `T ∈ [0, 1]`) — no
+    /// production forward model can hit this case.
+    #[test]
+    fn resolution_matrix_large_finite_contract() {
+        let plan = make_synthetic_plan(
+            vec![10.0, 20.0, 30.0],
+            vec![
+                SyntheticRow {
+                    entries: vec![SyntheticEntry {
+                        lo: 0,
+                        frac: 0.5,
+                        weight: 1.0,
+                    }],
+                    norm: 1.0,
+                },
+                SyntheticRow {
+                    entries: vec![],
+                    norm: 0.0, // passthrough
+                },
+                SyntheticRow {
+                    entries: vec![],
+                    norm: 0.0,
+                },
+            ],
+        );
+        let matrix = plan.compile_to_matrix();
+
+        // Opposite-sign large finite bins at row 0's non-degenerate
+        // bracket.  `s_hi - s_lo = -f64::MAX - f64::MAX = -∞`.
+        let big_spec = vec![f64::MAX, -f64::MAX, 0.0];
+        let plan_out = plan.apply(&big_spec);
+        let matrix_out = apply_r(&matrix, &big_spec);
+
+        // plan.apply: s_lo + frac * (s_hi - s_lo) = MAX + 0.5 * (-∞)
+        // = MAX + -∞ = -∞.
+        assert!(
+            plan_out[0].is_infinite() && plan_out[0] < 0.0,
+            "plan.apply must overflow to -∞ on opposite-sign MAX bins; got {}",
+            plan_out[0],
+        );
+        // apply_r: 0.5 * MAX + 0.5 * -MAX = 0.
+        assert!(
+            matrix_out[0].is_finite(),
+            "apply_r must stay finite (scaled before summation); got {}",
+            matrix_out[0],
+        );
+        assert!(matrix_out[0].abs() < 1e-280);
     }
 }
