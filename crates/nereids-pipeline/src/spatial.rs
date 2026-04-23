@@ -547,6 +547,22 @@ pub fn spatial_map_typed(
                 sigmas_flat.extend_from_slice(row);
             }
             if sigmas_flat.len() == k * n_rows {
+                // Invariant pinning: the caller (this function's xs
+                // assembly above) must have pre-aggregated σ by
+                // isotope-group ratios so `xs[j]` already stores the
+                // per-density-param effective σ that the cubature
+                // builder needs.  If a future refactor inserts a
+                // different σ mutation after this point, or the
+                // collapse stops running first, the builder will
+                // receive wrong σ and this assertion catches it in
+                // debug builds.  Codex/Claude round-1 P2 on PR #480.
+                debug_assert_eq!(
+                    sigmas_flat.len(),
+                    k * n_rows,
+                    "cubature σ dimensions: expected {k} × {n_rows} = {}, got {}",
+                    k * n_rows,
+                    sigmas_flat.len(),
+                );
                 // Training box: 2 × the initial density — same convention
                 // the codex04 reference uses.  Anchor at the midpoint
                 // (0.5 × train_max).
@@ -563,15 +579,29 @@ pub fn spatial_map_typed(
                 nereids_physics::surrogate::SparseEmpiricalCubaturePlan::default_jacobian_anchor(
                     &train_max,
                 );
-                nereids_physics::surrogate::SparseEmpiricalCubaturePlan::build(
+                match nereids_physics::surrogate::SparseEmpiricalCubaturePlan::build(
                     &matrix,
                     &sigmas_flat,
                     k,
                     &training,
                     &anchor,
-                )
-                .ok()
-                .map(Arc::new)
+                ) {
+                    Ok(plan) => Some(Arc::new(plan)),
+                    Err(e) => {
+                        // Surface the build failure to stderr rather
+                        // than silently swallow it — downstream fits
+                        // continue via the exact path, but a missing
+                        // cubature on a supposedly-eligible call is
+                        // a debugging signal that deserves
+                        // visibility.  Codex/Claude round-1 P2 on
+                        // PR #480.
+                        eprintln!(
+                            "spatial_map_typed: sparse cubature build failed ({e}); \
+                             falling back to exact ResolutionPlan path for this call",
+                        );
+                        None
+                    }
+                }
             } else {
                 None
             }

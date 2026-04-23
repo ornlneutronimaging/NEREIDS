@@ -582,6 +582,13 @@ impl UnifiedFitConfig {
         // Clear stale caches — the isotope set changed.
         self.precomputed_cross_sections = None;
         self.precomputed_base_xs = None;
+        // Clear the cubature plan too: atoms are σ-coordinates in
+        // ℝ^k and `k` / σ-stack change when groups are reconfigured,
+        // so a stale plan would silently produce wrong forward /
+        // Jacobian values for the new isotope set even if
+        // `cubature_eligible` accepts the same k + grid (Codex round 1
+        // P2 on PR #480).
+        self.precomputed_sparse_cubature_plan = None;
         Ok(self)
     }
 
