@@ -598,7 +598,15 @@ pub fn spatial_map_typed(
                     &training,
                     &anchor,
                 ) {
-                    Ok(plan) => Some(Arc::new(plan)),
+                    Ok(plan) => {
+                        // Record the training box on the plan so
+                        // the per-pixel dispatch can safely refuse
+                        // to fire when a fit iterate escapes the
+                        // trained region — rather than silently
+                        // running the surrogate out-of-domain.
+                        // Codex round-4 P1 on PR #480.
+                        Some(Arc::new(plan.with_density_box(train_max.clone())))
+                    }
                     Err(e) => {
                         // Surface the build failure to stderr rather
                         // than silently swallow it — downstream fits

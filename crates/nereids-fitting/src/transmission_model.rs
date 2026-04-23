@@ -74,12 +74,23 @@ pub struct PrecomputedTransmissionModel {
     pub sparse_cubature_plan: Option<Arc<SparseEmpiricalCubaturePlan>>,
 }
 
-/// Deduplicate `density_indices` preserving order of first appearance.
-/// Returns the sequence of distinct density-parameter indices — e.g.
+/// Deduplicate `density_indices` and return the distinct density-
+/// parameter indices **sorted ascending by value** — e.g.
 /// `[0,0,0,0,0,0]` (grouped) → `[0]`; `[0,1,2,3,4,5]` (ungrouped) →
-/// `[0,1,2,3,4,5]`.  Used by the cubature dispatch to extract the
-/// per-group density vector at the same length / order the cubature
-/// was built against.
+/// `[0,1,2,3,4,5]`; `[1,0,1]` (non-monotonic group layout) →
+/// `[0,1]` (NOT first-appearance order `[1,0]`).
+///
+/// **Why sorted-by-value, not first-appearance?** The cubature
+/// dispatch maps `n[j] = params[result[j]]` onto the cubature's
+/// j-th atom column.  The cubature was built from a σ stack
+/// indexed by density-param index (`sigmas[j * n_rows + ℓ] =
+/// σ_{param_j}(E'_ℓ)`) — so atom column `j` corresponds to
+/// density param `j`.  Using sorted-by-value output keeps the
+/// dispatched `params[result[j]]` aligned with `cubature.atoms()`
+/// at column `j` regardless of the user's `density_indices`
+/// ordering.  First-appearance order would swap columns for
+/// non-monotonic mappings, returning wrong transmissions and
+/// wrong Jacobians.  Codex round-4 P2 on PR #480.
 fn density_param_indices(density_indices: &[usize]) -> Vec<usize> {
     let mut seen: Vec<usize> = Vec::with_capacity(density_indices.len());
     for &i in density_indices {
@@ -87,6 +98,7 @@ fn density_param_indices(density_indices: &[usize]) -> Vec<usize> {
             seen.push(i);
         }
     }
+    seen.sort_unstable();
     seen
 }
 
@@ -115,6 +127,51 @@ fn density_param_indices(density_indices: &[usize]) -> Vec<usize> {
 /// tabulated kernel has been swapped to a different operator on
 /// the same energy grid since the cubature was built.  Codex
 /// round-2 P2 on PR #480.
+///
+/// **Known caveat (same-grid kernel swap)**: if a caller rebuilds
+/// the tabulated resolution plan for a *different kernel* on the
+/// same energy grid without rebuilding the cubature, the grid
+/// bit-check here passes but the atom weights still encode the
+/// OLD operator.  Guarding against this requires a kernel
+/// fingerprint on the cubature plan, which is out of scope for
+/// this PR (Codex round-4 P2 on PR #480).  Upstream callers are
+/// responsible for clearing the cubature when they swap kernels;
+/// in spatial dispatch this is enforced by
+/// `UnifiedFitConfig::with_precomputed_cross_sections` /
+/// `with_precomputed_base_xs` / `with_groups` all clearing the
+/// cached cubature (see pipeline.rs), so a refit through the
+/// standard surface cannot hit this case.
+/// Check whether the current density iterate `n` is inside the
+/// training region recorded on the cubature plan, with a 50 %
+/// expansion tolerance to avoid thrashing at the box boundary.
+/// When the plan has no recorded box, accepts unconditionally
+/// (caller is responsible; legacy code path).
+///
+/// Returns `false` when any component escapes the tolerance-
+/// expanded box OR is negative, OR is not finite.  Codex round-4
+/// P1 on PR #480: without this, a spatial fit whose per-pixel
+/// optimum drifts beyond `2 × initial_densities` silently runs the
+/// surrogate out of domain.
+fn density_within_box(plan: &SparseEmpiricalCubaturePlan, n: &[f64]) -> bool {
+    let Some(train_max) = plan.density_box() else {
+        // No box recorded — caller accepts the risk.
+        return true;
+    };
+    if train_max.len() != n.len() {
+        return false;
+    }
+    const TOLERANCE: f64 = 1.5; // 50 % slack above train_max
+    for (&n_i, &max_i) in n.iter().zip(train_max) {
+        if !n_i.is_finite() || n_i < 0.0 {
+            return false;
+        }
+        if n_i > max_i * TOLERANCE {
+            return false;
+        }
+    }
+    true
+}
+
 fn cubature_eligible(
     plan: &SparseEmpiricalCubaturePlan,
     energies: &[f64],
@@ -192,7 +249,12 @@ impl FitModel for PrecomputedTransmissionModel {
                 params_indices.len(),
             ) {
                 let n: Vec<f64> = params_indices.iter().map(|&i| params[i]).collect();
-                return Ok(cubature.forward(&n));
+                if density_within_box(cubature, &n) {
+                    return Ok(cubature.forward(&n));
+                }
+                // Density escaped the training box — fall through
+                // to the exact path (cubature accuracy degrades
+                // quickly outside the trained region).
             }
         }
 
@@ -277,16 +339,19 @@ impl FitModel for PrecomputedTransmissionModel {
                     .collect();
                 if let Some(col_map) = col_map {
                     let n: Vec<f64> = params_indices.iter().map(|&i| params[i]).collect();
-                    let (_t, jac_flat) = cubature.forward_and_jacobian(&n);
-                    // jac_flat[i * k + ell] = ∂T_i / ∂n_ell
-                    let k = params_indices.len();
-                    let mut jacobian = FlatMatrix::zeros(n_e, n_free);
-                    for (col, &ell) in col_map.iter().enumerate() {
-                        for i in 0..n_e {
-                            *jacobian.get_mut(i, col) = jac_flat[i * k + ell];
+                    if density_within_box(cubature, &n) {
+                        let (_t, jac_flat) = cubature.forward_and_jacobian(&n);
+                        // jac_flat[i * k + ell] = ∂T_i / ∂n_ell
+                        let k = params_indices.len();
+                        let mut jacobian = FlatMatrix::zeros(n_e, n_free);
+                        for (col, &ell) in col_map.iter().enumerate() {
+                            for i in 0..n_e {
+                                *jacobian.get_mut(i, col) = jac_flat[i * k + ell];
+                            }
                         }
+                        return Some(jacobian);
                     }
-                    return Some(jacobian);
+                    // Density outside box → fall through to exact.
                 }
             }
         }
@@ -583,7 +648,10 @@ impl FitModel for TransmissionFitModel {
                 // per-group density vector and multiplies by the
                 // pre-aggregated atoms internally.
                 let n: Vec<f64> = params_indices.iter().map(|&i| params[i]).collect();
-                return Ok(cubature.forward(&n));
+                if density_within_box(cubature, &n) {
+                    return Ok(cubature.forward(&n));
+                }
+                // Density escaped training box → fall through.
             }
         }
 
@@ -731,16 +799,21 @@ impl FitModel for TransmissionFitModel {
                     .collect();
                 if let Some(col_map) = col_map {
                     let n: Vec<f64> = params_indices.iter().map(|&i| params[i]).collect();
-                    let (_t, jac_flat) = cubature.forward_and_jacobian(&n);
-                    let k = params_indices.len();
-                    let n_e = self.energies.len();
-                    let mut jacobian = FlatMatrix::zeros(n_e, free_param_indices.len());
-                    for (col, &ell) in col_map.iter().enumerate() {
-                        for i in 0..n_e {
-                            *jacobian.get_mut(i, col) = jac_flat[i * k + ell];
+                    if density_within_box(cubature, &n) {
+                        // In-box: take the cubature Jacobian fast
+                        // path.  Out-of-box falls through to the
+                        // exact analytical Jacobian below.
+                        let (_t, jac_flat) = cubature.forward_and_jacobian(&n);
+                        let k = params_indices.len();
+                        let n_e = self.energies.len();
+                        let mut jacobian = FlatMatrix::zeros(n_e, free_param_indices.len());
+                        for (col, &ell) in col_map.iter().enumerate() {
+                            for i in 0..n_e {
+                                *jacobian.get_mut(i, col) = jac_flat[i * k + ell];
+                            }
                         }
+                        return Some(jacobian);
                     }
-                    return Some(jacobian);
                 }
             }
         }
@@ -2625,6 +2698,66 @@ mod tests {
                  (Codex PR #480 round-1 P1 regression guard)",
             );
         }
+    }
+
+    #[test]
+    fn fit_model_cubature_falls_back_when_density_escapes_box() {
+        // Build cubature with train_max = [1e-4, 1e-4], install
+        // the density_box, then call evaluate() with a density
+        // WELL beyond the 1.5× tolerance.  Dispatch must fall back
+        // to the exact path rather than silently extrapolate the
+        // surrogate outside its trained region.  Codex round-4 P1
+        // on PR #480.
+        let n_grid = 40_usize;
+        let (energies, plan, matrix) = synthetic_resolution_setup(n_grid, 4);
+        let sigmas = synthetic_sigmas(n_grid, 2);
+        let train_max = vec![1e-4_f64, 1e-4];
+
+        // Build cubature AND attach the density_box.
+        let cubature = {
+            let flat: Vec<f64> = sigmas.iter().flat_map(|s| s.iter().copied()).collect();
+            let training = SparseEmpiricalCubaturePlan::default_training_points(&train_max);
+            let anchor = SparseEmpiricalCubaturePlan::default_jacobian_anchor(&train_max);
+            Arc::new(
+                SparseEmpiricalCubaturePlan::build(&matrix, &flat, 2, &training, &anchor)
+                    .expect("build")
+                    .with_density_box(train_max.clone()),
+            )
+        };
+
+        let model_with = make_trivial_fit_model(energies.clone(), 2)
+            .with_resolution_plan(Some(Arc::clone(&plan)))
+            .with_sparse_cubature_plan(Some(Arc::clone(&cubature)));
+        let model_without =
+            make_trivial_fit_model(energies, 2).with_resolution_plan(Some(Arc::clone(&plan)));
+
+        // Escape: 5× the training max → well outside the 1.5× tolerance.
+        let n_escape = [5.0 * train_max[0], 5.0 * train_max[1]];
+        let t_with = model_with.evaluate(&n_escape).unwrap();
+        let t_without = model_without.evaluate(&n_escape).unwrap();
+        // If the guard fired correctly, the cubature-installed
+        // model falls back to the exact path and produces the same
+        // output as the no-plan model — byte-identical.
+        for (a, b) in t_with.iter().zip(t_without.iter()) {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "density-box escape guard MUST fall back to exact path byte-identically",
+            );
+        }
+    }
+
+    #[test]
+    fn density_param_indices_sorted_by_value() {
+        // First-appearance order would swap columns for non-
+        // monotonic group layouts like [1, 0, 1].  Sorted-by-value
+        // keeps dispatch aligned with the cubature's σ-stack
+        // indexing (`sigmas[j * n_rows + ℓ]` = σ for density param
+        // j).  Codex round-4 P2 on PR #480.
+        assert_eq!(density_param_indices(&[0, 0, 0]), vec![0]);
+        assert_eq!(density_param_indices(&[0, 1, 2, 3]), vec![0, 1, 2, 3]);
+        assert_eq!(density_param_indices(&[1, 0, 1]), vec![0, 1]);
+        assert_eq!(density_param_indices(&[3, 1, 2, 0, 2]), vec![0, 1, 2, 3]);
     }
 
     /// Verify that NormalizedTransmissionModel with identity normalization
