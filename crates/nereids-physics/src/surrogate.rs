@@ -145,7 +145,7 @@ impl std::error::Error for CubatureBuildError {}
 ///
 /// Built once per `(grid, isotope_set, training_densities, anchor)`
 /// tuple and applied repeatedly during LM / KL iterations via
-/// [`Self::forward`] and [`Self::jacobian`].
+/// [`Self::forward`] and [`Self::forward_and_jacobian`].
 #[derive(Debug, Clone)]
 pub struct SparseEmpiricalCubaturePlan {
     /// Target energy grid the plan was built for (owned copy, same
@@ -295,6 +295,7 @@ impl SparseEmpiricalCubaturePlan {
         let mut w_exact: Vec<f64> = Vec::new(); // |support|
         let mut phi_fwd: Vec<f64> = Vec::new(); // n_train × |support|, row-major over rows
         let mut phi_grad: Vec<f64> = Vec::new(); // k × |support|
+        let mut grad_base: Vec<f64> = Vec::new(); // |support| — exp(-anchor · σ_q) hoisted out of ell loop
         let mut target: Vec<f64> = Vec::new(); // phi_rows
         let mut phi_col_buf: Vec<(microlp::Variable, f64)> = Vec::new();
 
@@ -367,7 +368,8 @@ impl SparseEmpiricalCubaturePlan {
             // layout).
             phi_grad.clear();
             phi_grad.reserve(k * support_len);
-            let mut grad_base: Vec<f64> = Vec::with_capacity(support_len);
+            grad_base.clear();
+            grad_base.reserve(support_len);
             for q in 0..support_len {
                 let mut dot = 0.0_f64;
                 for j in 0..k {
@@ -882,13 +884,8 @@ mod tests {
     fn cubature_forward_matches_exact_at_training_densities() {
         let (_e, sigmas, matrix) = synthetic_setup(40, 4, 2);
         let train_max = [2e-4_f64, 1.5e-4];
-        let training: Vec<Vec<f64>> = vec![
-            vec![0.25 * train_max[0], 0.25 * train_max[1]],
-            vec![0.75 * train_max[0], 0.75 * train_max[1]],
-            vec![train_max[0], 0.0],
-            vec![0.0, train_max[1]],
-        ];
-        let anchor: Vec<f64> = train_max.iter().map(|x| 0.5 * x).collect();
+        let training = SparseEmpiricalCubaturePlan::default_training_points(&train_max);
+        let anchor = SparseEmpiricalCubaturePlan::default_jacobian_anchor(&train_max);
         let cub = SparseEmpiricalCubaturePlan::build(&matrix, &sigmas, 2, &training, &anchor)
             .expect("build");
 
@@ -911,13 +908,8 @@ mod tests {
     fn cubature_forward_held_out_bounded_error() {
         let (_e, sigmas, matrix) = synthetic_setup(40, 4, 2);
         let train_max = [2e-4_f64, 1.5e-4];
-        let training: Vec<Vec<f64>> = vec![
-            vec![0.25 * train_max[0], 0.25 * train_max[1]],
-            vec![0.75 * train_max[0], 0.75 * train_max[1]],
-            vec![train_max[0], 0.0],
-            vec![0.0, train_max[1]],
-        ];
-        let anchor: Vec<f64> = train_max.iter().map(|x| 0.5 * x).collect();
+        let training = SparseEmpiricalCubaturePlan::default_training_points(&train_max);
+        let anchor = SparseEmpiricalCubaturePlan::default_jacobian_anchor(&train_max);
         let cub = SparseEmpiricalCubaturePlan::build(&matrix, &sigmas, 2, &training, &anchor)
             .expect("build");
 
@@ -944,22 +936,8 @@ mod tests {
     fn cubature_jacobian_matches_exact_at_anchor() {
         let (_e, sigmas, matrix) = synthetic_setup(30, 4, 3);
         let train_max = [2e-4_f64, 1.5e-4, 1e-4];
-        let training: Vec<Vec<f64>> = vec![
-            vec![
-                0.25 * train_max[0],
-                0.25 * train_max[1],
-                0.25 * train_max[2],
-            ],
-            vec![
-                0.75 * train_max[0],
-                0.75 * train_max[1],
-                0.75 * train_max[2],
-            ],
-            vec![train_max[0], 0.0, 0.0],
-            vec![0.0, train_max[1], 0.0],
-            vec![0.0, 0.0, train_max[2]],
-        ];
-        let anchor: Vec<f64> = train_max.iter().map(|x| 0.5 * x).collect();
+        let training = SparseEmpiricalCubaturePlan::default_training_points(&train_max);
+        let anchor = SparseEmpiricalCubaturePlan::default_jacobian_anchor(&train_max);
         let cub = SparseEmpiricalCubaturePlan::build(&matrix, &sigmas, 3, &training, &anchor)
             .expect("build");
 
@@ -983,11 +961,8 @@ mod tests {
     fn cubature_rows_are_probability_measures() {
         let (_e, sigmas, matrix) = synthetic_setup(30, 4, 2);
         let train_max = [2e-4_f64, 1.5e-4];
-        let training = vec![
-            vec![0.25 * train_max[0], 0.25 * train_max[1]],
-            vec![0.75 * train_max[0], 0.75 * train_max[1]],
-        ];
-        let anchor = vec![0.5 * train_max[0], 0.5 * train_max[1]];
+        let training = SparseEmpiricalCubaturePlan::default_training_points(&train_max);
+        let anchor = SparseEmpiricalCubaturePlan::default_jacobian_anchor(&train_max);
         let cub = SparseEmpiricalCubaturePlan::build(&matrix, &sigmas, 2, &training, &anchor)
             .expect("build");
         for i in 0..cub.len() {
@@ -1009,17 +984,9 @@ mod tests {
     fn cubature_k6_builds_and_evaluates() {
         let (_e, sigmas, matrix) = synthetic_setup(30, 4, 6);
         let train_max: Vec<f64> = (0..6).map(|j| 1e-4 * (1.0 + 0.2 * j as f64)).collect();
-        // S training points = 2 midpoints + k unit-vector points = 8.
-        let mut training: Vec<Vec<f64>> = vec![
-            train_max.iter().map(|&x| 0.25 * x).collect(),
-            train_max.iter().map(|&x| 0.75 * x).collect(),
-        ];
-        for j in 0..6 {
-            let mut p = vec![0.0_f64; 6];
-            p[j] = train_max[j];
-            training.push(p);
-        }
-        let anchor: Vec<f64> = train_max.iter().map(|&x| 0.5 * x).collect();
+        // S training points = 2 midpoints + k axis-aligned points = 8.
+        let training = SparseEmpiricalCubaturePlan::default_training_points(&train_max);
+        let anchor = SparseEmpiricalCubaturePlan::default_jacobian_anchor(&train_max);
         let cub = SparseEmpiricalCubaturePlan::build(&matrix, &sigmas, 6, &training, &anchor)
             .expect("k=6 build");
 
@@ -1167,12 +1134,8 @@ mod tests {
             .collect();
 
         let train_max = [2e-4_f64];
-        let training = vec![
-            vec![0.25 * train_max[0]],
-            vec![0.75 * train_max[0]],
-            vec![train_max[0]],
-        ];
-        let anchor = vec![0.5 * train_max[0]];
+        let training = SparseEmpiricalCubaturePlan::default_training_points(&train_max);
+        let anchor = SparseEmpiricalCubaturePlan::default_jacobian_anchor(&train_max);
         let cub = SparseEmpiricalCubaturePlan::build(&matrix, &sigma, 1, &training, &anchor)
             .expect("build k=1 cubature on real VENUS kernel");
 

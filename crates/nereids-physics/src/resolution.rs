@@ -1369,14 +1369,15 @@ pub fn apply_r(matrix: &ResolutionMatrix, spectrum: &[f64]) -> Vec<f64> {
 /// but the grid contents differ (per-element `to_bits()` compare).
 ///
 /// Unlike [`apply_resolution_with_plan`], this entrypoint does not
-/// call [`validate_inputs`] to enforce an ascending `energies` grid.
-/// That check is redundant here: the plan that produced the matrix
-/// was itself built on a sorted grid (via [`TabulatedResolution::plan`]
-/// which runs [`validate_inputs`]), and the stored `target_energies`
-/// copy is used in the `to_bits()` grid-identity check above.  Any
-/// `energies` slice that is not bit-identical to the matrix's stored
-/// copy — including an unsorted permutation of the same values —
-/// fails with [`ResolutionError::MatrixGridMismatch`].
+/// enforce an ascending `energies` grid through the crate's internal
+/// `validate_inputs` helper.  That check is redundant here: the plan
+/// that produced the matrix was itself built on a sorted grid (via
+/// [`TabulatedResolution::plan`], which validates sortedness), and the
+/// stored `target_energies` copy is used in the `to_bits()`
+/// grid-identity check above.  Any `energies` slice that is not
+/// bit-identical to the matrix's stored copy — including an unsorted
+/// permutation of the same values — fails with
+/// [`ResolutionError::MatrixGridMismatch`].
 pub fn apply_resolution_with_matrix(
     energies: &[f64],
     matrix: &ResolutionMatrix,
