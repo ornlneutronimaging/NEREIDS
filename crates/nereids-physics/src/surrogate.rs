@@ -330,21 +330,59 @@ impl SparseEmpiricalCubaturePlan {
 
             // Non-trivial row (support_len ≥ 2).  Build normalized
             // exact-weight distribution + collect support-column σ
-            // vectors.  Row sum guard: the source matrix is
-            // row-stochastic (Σ = 1 to machine precision), so
-            // `row_sum > 0` always for non-zero support; divide
-            // safely.
+            // vectors.
+            //
+            // **Zero-weight CSR cells MUST be filtered out** before
+            // they reach the LP.  [`ResolutionPlan::compile_to_matrix`]
+            // deliberately retains `value == 0.0` entries for the
+            // `frac == +0.0` branch to preserve downstream NaN-safety
+            // when the matrix is re-applied to a spectrum containing
+            // NaN at `lo + 1`.  But the cubature LP has a zero
+            // objective, so the simplex is free to assign positive
+            // mass to any zero-weight variable — the training
+            // constraints pass trivially (w_exact = 0 → target
+            // contribution = 0), yet held-out forward/Jacobian
+            // predictions can pick up mass at energies the exact
+            // resolution operator never samples.  Filter them here
+            // so no zero-R column ever becomes an LP variable or a
+            // stored atom.  Codex round-3 finding on PR #474a.
+            //
+            // Row sum guard: the source matrix is row-stochastic
+            // (Σ_q R_{iq} = 1 to machine precision), so dropping
+            // exactly-zero columns preserves `row_sum > 0`.
             let row_sum: f64 = support_vals.iter().sum();
             support_sigma.clear();
             support_sigma.reserve(k * support_len);
             w_exact.clear();
             w_exact.reserve(support_len);
             for (q, &col_u32) in support_cols.iter().enumerate() {
+                if support_vals[q] == 0.0 {
+                    continue;
+                }
                 let col = col_u32 as usize;
                 for j in 0..k {
                     support_sigma.push(sigmas[j * n_rows + col]);
                 }
                 w_exact.push(support_vals[q] / row_sum);
+            }
+            // Effective support length after dropping zero-weight
+            // CSR cells.  Subsequent LP / feature-matrix code uses
+            // this, not the original `support_len` that included
+            // zero-weight cells.
+            let support_len = w_exact.len();
+
+            // Re-check the degenerate cases on the filtered support.
+            // If all CSR cells happened to be zero, treat like an
+            // empty row.  If exactly one survives, take the shortcut.
+            if support_len == 0 {
+                row_starts.push(weights.len() as u32);
+                continue;
+            }
+            if support_len == 1 {
+                weights.push(1.0);
+                atoms.extend_from_slice(&support_sigma[..k]);
+                row_starts.push(weights.len() as u32);
+                continue;
             }
 
             // Build per-row feature matrix phi (row-major over feature
@@ -836,6 +874,83 @@ mod tests {
         let anchor = SparseEmpiricalCubaturePlan::default_jacobian_anchor(&train_max);
         for (i, &m) in train_max.iter().enumerate() {
             assert!((anchor[i] - 0.5 * m).abs() < 1e-15);
+        }
+    }
+
+    /// Zero-weight CSR cells retained by
+    /// [`crate::resolution::ResolutionPlan::compile_to_matrix`] for
+    /// NaN-safety (the `frac == +0.0` branch) MUST NOT become
+    /// cubature atoms, even though the LP's zero objective would let
+    /// the simplex put arbitrary mass on them.  Codex round-3 finding
+    /// on PR #474a — this test guards against regression.
+    #[test]
+    fn cubature_rejects_zero_weight_csr_cells_as_atoms() {
+        // Hand-construct a 5-cell synthetic plan where every
+        // regular-bracket entry has `frac = +0.0`, producing CSR
+        // rows with an explicit `(lo + 1, 0.0)` zero-weight column.
+        let energies: Vec<f64> = (0..5).map(|i| 10.0 + i as f64).collect();
+        let mut starts: Vec<u32> = vec![0];
+        let mut lo_idx: Vec<u32> = Vec::new();
+        let mut frac: Vec<f64> = Vec::new();
+        let mut weight: Vec<f64> = Vec::new();
+        let mut norm: Vec<f64> = Vec::new();
+        for i in 0..5 {
+            // Row i: one regular-bracket entry at lo = i.min(3) with
+            // frac = +0.0.  This produces CSR columns {i.min(3),
+            // i.min(3) + 1} with values {1.0, 0.0} respectively.
+            let lo = i.min(3);
+            lo_idx.push(lo as u32);
+            frac.push(0.0); // +0.0, not the -0.0 sentinel
+            weight.push(1.0);
+            norm.push(1.0);
+            starts.push(lo_idx.len() as u32);
+        }
+        let plan = crate::resolution::test_support::plan_from_raw_parts(
+            energies, starts, lo_idx, frac, weight, norm,
+        );
+        let matrix = plan.compile_to_matrix();
+
+        // Confirm the matrix actually has zero-weight CSR cells.
+        let total_nnz = matrix.nnz();
+        let zero_weight_cells = matrix.values().iter().filter(|&&v| v == 0.0).count();
+        assert!(
+            zero_weight_cells > 0,
+            "test fixture must include zero-weight CSR cells — got {total_nnz} nnz, {zero_weight_cells} zero",
+        );
+
+        // Build a cubature.  The resulting atoms must correspond ONLY
+        // to CSR cells with non-zero weight.
+        let sigmas = vec![0.5_f64, 1.0, 1.5, 2.0, 2.5];
+        let train_max = [1e-4_f64];
+        let training = SparseEmpiricalCubaturePlan::default_training_points(&train_max);
+        let anchor = SparseEmpiricalCubaturePlan::default_jacobian_anchor(&train_max);
+        let cub = SparseEmpiricalCubaturePlan::build(&matrix, &sigmas, 1, &training, &anchor)
+            .expect("build must succeed on zero-weight-cell fixture");
+
+        // Collect the σ values retained as atoms; each must correspond
+        // to a support column with non-zero CSR value.  With k = 1,
+        // the atom sigma is either 0.5, 1.0, 1.5, 2.0, or 2.5 —
+        // whichever column was non-zero in the source row.
+        for (i, window) in cub.row_starts().windows(2).enumerate() {
+            let (s, e) = (window[0] as usize, window[1] as usize);
+            for q in s..e {
+                let atom_sigma = cub.atoms()[q];
+                // The corresponding CSR cell at the nearest source
+                // column must have non-zero weight.
+                let row_start = matrix.row_starts()[i] as usize;
+                let row_end = matrix.row_starts()[i + 1] as usize;
+                let row_cols = &matrix.col_indices()[row_start..row_end];
+                let row_vals = &matrix.values()[row_start..row_end];
+                let source_nonzero = row_cols
+                    .iter()
+                    .zip(row_vals)
+                    .find(|&(&col, _)| (sigmas[col as usize] - atom_sigma).abs() < 1e-15)
+                    .map(|(_, &v)| v);
+                assert!(
+                    source_nonzero.is_some() && source_nonzero.unwrap() > 0.0,
+                    "row {i} atom sigma {atom_sigma} has no non-zero source in CSR row",
+                );
+            }
         }
     }
 
