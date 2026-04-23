@@ -116,17 +116,30 @@ fn density_param_indices(density_indices: &[usize]) -> Vec<usize> {
 /// `apply_resolution_with_plan` already enforces — Codex round-1 P1
 /// on PR #480).
 ///
-/// **Resolution-operator tie**: the cubature fast path folds
+/// **Tabulated-kernel tie**: the cubature fast path folds
 /// `apply_resolution*` into its atom sweep — skipping it when the
-/// model otherwise would have applied a DIFFERENT kernel is a
-/// silent wrong-answer path.  Require `resolution_plan.is_some()`
-/// so that (a) Gaussian-resolution models never hit the cubature
-/// path (a plan is only built for tabulated resolution), and
-/// (b) the active resolution plan's grid must match the cubature
-/// plan's grid bit-for-bit — catching the case where the
-/// tabulated kernel has been swapped to a different operator on
-/// the same energy grid since the cubature was built.  Codex
-/// round-2 P2 on PR #480.
+/// model otherwise would have applied a Gaussian kernel is a
+/// silent wrong-answer path.  We require
+/// `matches!(instrument_resolution, ResolutionFunction::Tabulated(_))`
+/// so Gaussian-resolution models never hit the cubature path (a
+/// plan is only ever built against a tabulated kernel).  Codex
+/// round-3 P2 on PR #480.
+///
+/// **Optional `resolution_plan` cross-check**: when a prebuilt
+/// `ResolutionPlan` is attached (e.g., via
+/// `spatial_map_typed`'s plan-hoist pathway), we additionally
+/// verify its grid matches the cubature plan's grid — defence-in-
+/// depth against a
+/// `with_precomputed_resolution_plan(plan_A) +
+/// with_precomputed_sparse_cubature_plan(plan_B_on_different_grid)`
+/// mis-configuration.  When no resolution plan is attached (the
+/// default on the single-spectrum entrypoint, where
+/// `fit_spectrum_typed` / `build_transmission_model` don't
+/// synthesize one), eligibility falls back to the cubature-plan
+/// grid check alone; this keeps the `with_precomputed_sparse_cubature_plan`
+/// API usable on the single-spectrum surface without the caller
+/// having to pre-build a matching `ResolutionPlan` just to unlock
+/// the fast path.
 ///
 /// **Known caveat (same-grid kernel swap)**: if a caller rebuilds
 /// the tabulated resolution plan for a *different kernel* on the
@@ -198,27 +211,39 @@ fn cubature_eligible(
     if !matches!(instrument_resolution, ResolutionFunction::Tabulated(_)) {
         return false;
     }
-    // An active tabulated-resolution plan must ALSO be installed on
-    // the model.  Without this, the cubature would silently skip
-    // `apply_resolution*` for a model whose tabulated kernel has
-    // been swapped to a different operator since the cubature was
-    // built.
-    let Some(res_plan) = resolution_plan else {
-        return false;
-    };
-    if res_plan.target_energies().len() != energies.len() {
-        return false;
-    }
     // Per-element `to_bits()` grid identity check catches `-0.0` vs
     // `+0.0` and NaN-bit differences that float `==` silently
-    // accepts or rejects.  Checked against BOTH the cubature plan's
-    // grid AND the active resolution plan's grid — transitive
-    // identity through the model's energies slice.
+    // accepts or rejects.  The cubature plan's own grid is the
+    // primary reference (atoms are indexed against it).
     let cub_grid = plan.target_energies();
-    let res_grid = res_plan.target_energies();
-    for ((e_cur, e_cub), e_res) in energies.iter().zip(cub_grid).zip(res_grid) {
-        if e_cur.to_bits() != e_cub.to_bits() || e_cur.to_bits() != e_res.to_bits() {
+    for (e_cur, e_cub) in energies.iter().zip(cub_grid) {
+        if e_cur.to_bits() != e_cub.to_bits() {
             return false;
+        }
+    }
+    // Defense-in-depth: when a ResolutionPlan is ALSO attached,
+    // verify transitive grid identity.  Catches the
+    // `with_precomputed_resolution_plan(plan_A) +
+    // with_precomputed_sparse_cubature_plan(plan_B_on_different_grid)`
+    // mis-configuration case.  When no resolution plan is attached
+    // (typical single-spectrum entrypoint —
+    // `fit_spectrum_typed` / `build_transmission_model` don't
+    // synthesize one by default), the in-model resolution broaden
+    // path falls back to per-call `apply_resolution` and the
+    // cubature's self-check above is the grid guard.  Codex
+    // separate-review finding on PR #481 inception: the round-2
+    // "resolution_plan.is_some() required" was over-strict and
+    // silently disabled the fast path on the single-spectrum
+    // surface.
+    if let Some(res_plan) = resolution_plan {
+        if res_plan.target_energies().len() != energies.len() {
+            return false;
+        }
+        let res_grid = res_plan.target_energies();
+        for (e_cur, e_res) in energies.iter().zip(res_grid) {
+            if e_cur.to_bits() != e_res.to_bits() {
+                return false;
+            }
         }
     }
     true
@@ -2764,6 +2789,41 @@ mod tests {
                 a.to_bits(),
                 b.to_bits(),
                 "density-box escape guard MUST fall back to exact path byte-identically",
+            );
+        }
+    }
+
+    #[test]
+    fn fit_model_cubature_dispatches_without_resolution_plan_attached() {
+        // Single-spectrum regression: callers of the non-spatial
+        // `fit_spectrum_typed` / `build_transmission_model` path
+        // attach a cubature via
+        // `UnifiedFitConfig::with_precomputed_sparse_cubature_plan`
+        // but typically don't also pre-build a `ResolutionPlan` (the
+        // per-call `apply_resolution` broaden path is used
+        // otherwise).  The cubature fast path MUST still fire — the
+        // prior round-2 `resolution_plan.is_some()` requirement
+        // made the new API inert on this surface.  Codex separate-
+        // review finding on PR #481.
+        let n_grid = 40_usize;
+        let (energies, _plan, matrix) = synthetic_resolution_setup(n_grid, 4);
+        let sigmas = synthetic_sigmas(n_grid, 2);
+        let train_max = vec![1e-4_f64, 1e-4];
+        let cubature = build_cubature(&matrix, &sigmas, train_max.clone());
+
+        // Intentionally NOT installing a resolution plan.  The
+        // instrument's tabulated resolution is enough.
+        let model = make_trivial_fit_model(energies.clone(), 2)
+            .with_sparse_cubature_plan(Some(Arc::clone(&cubature)));
+
+        let n = [0.25 * train_max[0], 0.25 * train_max[1]];
+        let t_model = model.evaluate(&n).unwrap();
+        let t_cub = cubature.forward(&n);
+        for (a, b) in t_model.iter().zip(t_cub.iter()) {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "cubature dispatch must fire on single-spectrum path without a separate ResolutionPlan attached",
             );
         }
     }
