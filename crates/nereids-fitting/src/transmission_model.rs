@@ -92,13 +92,15 @@ pub struct PrecomputedTransmissionModel {
 /// non-monotonic mappings, returning wrong transmissions and
 /// wrong Jacobians.  Codex round-4 P2 on PR #480.
 fn density_param_indices(density_indices: &[usize]) -> Vec<usize> {
-    let mut seen: Vec<usize> = Vec::with_capacity(density_indices.len());
-    for &i in density_indices {
-        if !seen.contains(&i) {
-            seen.push(i);
-        }
-    }
+    // `sort_unstable` + `dedup` is O(n log n) and avoids the O(n²)
+    // cost of repeated `Vec::contains` scans.  This runs on every
+    // `evaluate()` / `analytical_jacobian()` call, so the linear-
+    // scan version showed up in spatial-map profiling once the
+    // per-pixel cubature dispatch started firing.  Copilot Phase B
+    // finding on PR #481.
+    let mut seen: Vec<usize> = density_indices.to_vec();
     seen.sort_unstable();
+    seen.dedup();
     seen
 }
 
@@ -2370,10 +2372,12 @@ mod tests {
         )
     }
 
-    /// Build an `InstrumentParams` wrapping a trivial Gaussian
-    /// resolution — only needed because the dispatch guards check
-    /// `instrument.is_some()`.  The actual resolution broadening
-    /// wouldn't fire on the cubature path (cubature replaces it).
+    /// Build an `InstrumentParams` wrapping a trivial delta-like
+    /// tabulated resolution (single ref energy, δ-kernel).  Used
+    /// only because the dispatch guards check `instrument.is_some()`
+    /// AND require `ResolutionFunction::Tabulated(_)`.  The actual
+    /// broadening wouldn't fire on the cubature path regardless
+    /// (cubature folds `apply_resolution*` into its atom sweep).
     fn make_trivial_instrument() -> Arc<InstrumentParams> {
         use nereids_physics::resolution::ResolutionFunction;
         // Tabulated resolution required for cubature-dispatch tests:
@@ -2468,10 +2472,11 @@ mod tests {
         // ineligible plan.  A false-positive dispatch would violate
         // this invariant because the k=2 cubature's atoms live in
         // ℝ² and `cubature.forward([n])` would panic on the
-        // assert_eq in `PySparseCubature::forward` — OR, worse, if
-        // the guard check accidentally accepted a k=2 plan for a
-        // k=1 model the output would numerically differ from
-        // straight Beer-Lambert by more than floating-point noise.
+        // input-length check in `SparseEmpiricalCubaturePlan::forward`
+        // — OR, worse, if the guard check accidentally accepted a
+        // k=2 plan for a k=1 model the output would numerically
+        // differ from straight Beer-Lambert by more than
+        // floating-point noise.
         let n_grid = 40_usize;
         // `plan` intentionally unused here: this test wants both
         // model variants in the no-dispatch state (no cubature can
