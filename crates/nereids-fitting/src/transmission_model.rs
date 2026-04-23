@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use nereids_core::constants::{EV_TO_JOULES, NEUTRON_MASS_KG};
 use nereids_endf::resonance::ResonanceData;
-use nereids_physics::resolution::{self, ResolutionPlan};
+use nereids_physics::resolution::{self, ResolutionFunction, ResolutionPlan};
 use nereids_physics::surrogate::SparseEmpiricalCubaturePlan;
 use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
 
@@ -118,6 +118,7 @@ fn density_param_indices(density_indices: &[usize]) -> Vec<usize> {
 fn cubature_eligible(
     plan: &SparseEmpiricalCubaturePlan,
     energies: &[f64],
+    instrument_resolution: &ResolutionFunction,
     resolution_plan: Option<&ResolutionPlan>,
     n_density_params: usize,
 ) -> bool {
@@ -131,11 +132,20 @@ fn cubature_eligible(
     if plan.len() != energies.len() {
         return false;
     }
-    // An active tabulated-resolution plan must be installed on the
-    // model.  Without this, the cubature would silently skip
-    // `apply_resolution*` for a Gaussian-resolution model or a
-    // model whose tabulated kernel has been swapped to a different
-    // operator since the cubature was built.
+    // Gaussian-resolution models must NOT hit the cubature path:
+    // the cubature was built against a TabulatedResolution kernel
+    // (it's the only kernel `ResolutionPlan::compile_to_matrix`
+    // accepts), so firing it on a Gaussian-active model would
+    // silently replace Gaussian broadening with a tabulated
+    // surrogate.  Codex round-3 P2 on PR #480.
+    if !matches!(instrument_resolution, ResolutionFunction::Tabulated(_)) {
+        return false;
+    }
+    // An active tabulated-resolution plan must ALSO be installed on
+    // the model.  Without this, the cubature would silently skip
+    // `apply_resolution*` for a model whose tabulated kernel has
+    // been swapped to a different operator since the cubature was
+    // built.
     let Some(res_plan) = resolution_plan else {
         return false;
     };
@@ -170,13 +180,14 @@ impl FitModel for PrecomputedTransmissionModel {
         // the grid + isotope count, and instrument resolution is
         // enabled (cubature folds both `exp(-Σ n σ)` and `apply_R`
         // into a single per-row atom sweep).  See epic #472.
-        if let (Some(cubature), Some(_inst), Some(energies)) =
+        if let (Some(cubature), Some(inst), Some(energies)) =
             (&self.sparse_cubature_plan, &self.instrument, &self.energies)
         {
             let params_indices = density_param_indices(&self.density_indices);
             if cubature_eligible(
                 cubature,
                 energies,
+                &inst.resolution,
                 self.resolution_plan.as_deref(),
                 params_indices.len(),
             ) {
@@ -246,13 +257,14 @@ impl FitModel for PrecomputedTransmissionModel {
         // (cubature can't produce Jacobian columns for non-density
         // params like background / normalization, which are the
         // calling layer's responsibility).
-        if let (Some(cubature), Some(_inst), Some(energies)) =
+        if let (Some(cubature), Some(inst), Some(energies)) =
             (&self.sparse_cubature_plan, &self.instrument, &self.energies)
         {
             let params_indices = density_param_indices(&self.density_indices);
             if cubature_eligible(
                 cubature,
                 energies,
+                &inst.resolution,
                 self.resolution_plan.as_deref(),
                 params_indices.len(),
             ) {
@@ -553,13 +565,14 @@ impl FitModel for TransmissionFitModel {
         // temperature fit (σ the cubature was built against must not
         // change at runtime).  k=1 grouped case and per-isotope T-fit
         // falls through to the exact path.  See epic #472.
-        if let (Some(cubature), Some(_inst)) = (&self.sparse_cubature_plan, &self.instrument)
+        if let (Some(cubature), Some(inst)) = (&self.sparse_cubature_plan, &self.instrument)
             && self.temperature_index.is_none()
         {
             let params_indices = density_param_indices(&self.density_indices);
             if cubature_eligible(
                 cubature,
                 &self.energies,
+                &inst.resolution,
                 self.resolution_plan.as_deref(),
                 params_indices.len(),
             ) {
@@ -701,13 +714,14 @@ impl FitModel for TransmissionFitModel {
     ) -> Option<FlatMatrix> {
         // Cubature fast path — same eligibility as `evaluate()` plus
         // the requirement that every free param is a density param.
-        if let (Some(cubature), Some(_inst)) = (&self.sparse_cubature_plan, &self.instrument)
+        if let (Some(cubature), Some(inst)) = (&self.sparse_cubature_plan, &self.instrument)
             && self.temperature_index.is_none()
         {
             let params_indices = density_param_indices(&self.density_indices);
             if cubature_eligible(
                 cubature,
                 &self.energies,
+                &inst.resolution,
                 self.resolution_plan.as_deref(),
                 params_indices.len(),
             ) {
@@ -2242,13 +2256,16 @@ mod tests {
     /// `instrument.is_some()`.  The actual resolution broadening
     /// wouldn't fire on the cubature path (cubature replaces it).
     fn make_trivial_instrument() -> Arc<InstrumentParams> {
-        use nereids_physics::resolution::{ResolutionFunction, ResolutionParams};
-        // Gaussian with all-zero widths → identity broadening.  The
-        // cubature-dispatch tests only need `instrument.is_some()`
-        // to fire the eligibility guards; actual broadening never
-        // runs on the cubature path.
-        let res_params = ResolutionParams::new(25.0, 0.0, 0.0, 0.0).unwrap();
-        let res_fn = ResolutionFunction::Gaussian(res_params);
+        use nereids_physics::resolution::ResolutionFunction;
+        // Tabulated resolution required for cubature-dispatch tests:
+        // round-3 P2 guard refuses the dispatch when the active
+        // instrument resolution isn't `ResolutionFunction::Tabulated`.
+        // The test_support helper builds a minimal delta-like kernel;
+        // the broadening never actually runs on the cubature path
+        // (cubature.forward replaces apply_resolution entirely).
+        let tab =
+            Arc::new(nereids_physics::resolution::test_support::trivial_tabulated_resolution(25.0));
+        let res_fn = ResolutionFunction::Tabulated(tab);
         Arc::new(InstrumentParams { resolution: res_fn })
     }
 

@@ -471,12 +471,21 @@ impl UnifiedFitConfig {
     #[must_use]
     pub fn with_precomputed_cross_sections(mut self, xs: Arc<Vec<Vec<f64>>>) -> Self {
         self.precomputed_cross_sections = Some(xs);
+        // A new XS cache invalidates any prebuilt cubature — the
+        // cubature's atoms encode the OLD σ stack, so reusing the
+        // plan would silently produce wrong forward / Jacobian
+        // values for the new σ (Codex round-3 P3 on PR #480).
+        self.precomputed_sparse_cubature_plan = None;
         self
     }
 
     #[must_use]
     pub fn with_precomputed_base_xs(mut self, xs: Arc<Vec<Vec<f64>>>) -> Self {
         self.precomputed_base_xs = Some(xs);
+        // Base XS swap implies σ will be re-Doppler-broadened, so
+        // the cubature's σ stack becomes stale.  Invalidate for
+        // the same reason as `with_precomputed_cross_sections`.
+        self.precomputed_sparse_cubature_plan = None;
         self
     }
 
