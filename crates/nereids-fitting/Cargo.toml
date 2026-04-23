@@ -12,3 +12,6 @@ categories = ["science"]
 nereids-core = { workspace = true }
 nereids-endf = { workspace = true }
 nereids-physics = { workspace = true }
+
+[dev-dependencies]
+nereids-physics = { workspace = true, features = ["test-support"] }

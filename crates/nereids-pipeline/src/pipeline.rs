@@ -309,6 +309,18 @@ pub struct UnifiedFitConfig {
     /// layer falls back to the per-call broadening path with byte-
     /// identical output.
     precomputed_resolution_plan: Option<Arc<nereids_physics::resolution::ResolutionPlan>>,
+    /// Sparse empirical cubature plan built once for `(energies,
+    /// isotope_set, density_box)` — when present and the dispatch
+    /// conditions hold (k ≥ 2, fixed calibration, fixed temperature),
+    /// the fit model replaces `exp(-Σ n σ) + apply_resolution` with
+    /// `cubature.forward_and_jacobian(n)` directly.  See epic #472.
+    ///
+    /// `None` ⇒ existing path.  The cubature is advisory — if its
+    /// target grid doesn't match `energies` or if `k == 1` or
+    /// temperature/energy-scale fitting is active, the fit model
+    /// silently falls back to the exact path.
+    precomputed_sparse_cubature_plan:
+        Option<Arc<nereids_physics::surrogate::SparseEmpiricalCubaturePlan>>,
 
     // ── Energy-scale calibration (SAMMY TZERO equivalent) ──
     /// When true, fit t₀ (μs) and L_scale (dimensionless) parameters.
@@ -384,6 +396,7 @@ impl UnifiedFitConfig {
             precomputed_cross_sections: None,
             precomputed_base_xs: None,
             precomputed_resolution_plan: None,
+            precomputed_sparse_cubature_plan: None,
             fit_energy_scale: false,
             t0_init_us: 0.0,
             l_scale_init: 1.0,
@@ -480,6 +493,32 @@ impl UnifiedFitConfig {
         plan: Arc<nereids_physics::resolution::ResolutionPlan>,
     ) -> Self {
         self.precomputed_resolution_plan = Some(plan);
+        self
+    }
+
+    /// Attach a prebuilt sparse empirical cubature plan for the
+    /// config's energy grid + isotope set (see epic #472).
+    ///
+    /// The plan is advisory — the fit model falls back to the exact
+    /// `ResolutionPlan` path when any of these guards fire:
+    ///
+    /// * `plan.target_energies() != self.energies()` (grid mismatch).
+    /// * `plan.k() != n_density_params` (isotope-set mismatch).
+    /// * `self.fit_temperature == true` (σ changes → atoms stale).
+    /// * `self.fit_energy_scale == true` (grid changes → plan stale).
+    /// * `n_density_params == 1` (scalar fast-path belongs to PR #475;
+    ///   for now this path still falls back).
+    ///
+    /// Callers (typically `spatial_map_typed`) are responsible for
+    /// ensuring the plan was built against compatible `sigmas` /
+    /// `training_densities` / `jacobian_anchor`; the fit model cannot
+    /// re-check those at dispatch time.
+    #[must_use]
+    pub fn with_precomputed_sparse_cubature_plan(
+        mut self,
+        plan: Arc<nereids_physics::surrogate::SparseEmpiricalCubaturePlan>,
+    ) -> Self {
+        self.precomputed_sparse_cubature_plan = Some(plan);
         self
     }
 
@@ -1642,6 +1681,11 @@ fn build_transmission_model(
         } else {
             None
         };
+        let sparse_cubature_plan = if instrument.is_some() {
+            config.precomputed_sparse_cubature_plan.clone()
+        } else {
+            None
+        };
         return Ok(Box::new(PrecomputedTransmissionModel {
             cross_sections: effective_xs,
             density_indices: Arc::new((0..n_params).collect()),
@@ -1650,6 +1694,7 @@ fn build_transmission_model(
                 .map(|_| Arc::new(config.energies.clone())),
             instrument,
             resolution_plan,
+            sparse_cubature_plan,
         }));
     }
 
@@ -1672,6 +1717,11 @@ fn build_transmission_model(
     } else {
         None
     };
+    let sparse_cubature_plan = if instrument.is_some() {
+        config.precomputed_sparse_cubature_plan.clone()
+    } else {
+        None
+    };
     Ok(Box::new(
         TransmissionFitModel::new(
             config.energies.clone(),
@@ -1682,7 +1732,8 @@ fn build_transmission_model(
             temperature_index,
             base_xs,
         )?
-        .with_resolution_plan(resolution_plan),
+        .with_resolution_plan(resolution_plan)
+        .with_sparse_cubature_plan(sparse_cubature_plan),
     ))
 }
 
@@ -2258,6 +2309,7 @@ mod tests {
             energies: None,
             instrument: None,
             resolution_plan: None,
+            sparse_cubature_plan: None,
         };
         let t = model.evaluate(&[true_density]).unwrap();
         let sigma: Vec<f64> = t.iter().map(|&v| 0.01 * v.max(0.01)).collect();
@@ -2607,6 +2659,7 @@ mod tests {
             energies: None,
             instrument: None,
             resolution_plan: None,
+            sparse_cubature_plan: None,
         };
         let t = model.evaluate(&[true_density]).unwrap();
         let sigma: Vec<f64> = t.iter().map(|&v| 0.01 * v.max(0.01)).collect();

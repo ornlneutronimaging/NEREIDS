@@ -512,6 +512,73 @@ pub fn spatial_map_typed(
             None
         };
 
+    // Build the sparse empirical cubature plan (epic #472) when the
+    // fit is on the k ≥ 2 multi-isotope fixed-calibration path.  The
+    // plan compiles the exact ResolutionMatrix from the resolution
+    // plan above, then runs a per-row feasibility LP to collapse each
+    // row to ≤ `S + k + 1` atoms.  One-shot cost per spatial_map
+    // call, amortized across every pixel.  Falls back to `None` when:
+    //   * no resolution plan (Gaussian or missing);
+    //   * temperature or energy-scale fitting is active (σ / grid
+    //     can change at runtime, invalidating atoms);
+    //   * k == 1 (scalar fast-path is PR #475's scope);
+    //   * xs is not pre-collapsed to per-group σ (cubature needs the
+    //     final σ stack, not per-isotope σ × ratios).
+    let sparse_cubature_plan: Option<Arc<nereids_physics::surrogate::SparseEmpiricalCubaturePlan>> =
+        if !config.fit_temperature()
+            && !config.fit_energy_scale()
+            && resolution_plan.is_some()
+            && xs.len() >= 2
+        {
+            let plan = resolution_plan.as_deref().expect("guarded above");
+            let matrix = plan.compile_to_matrix();
+            let k = xs.len();
+            let n_rows = matrix.len();
+            // Flatten xs (Vec<Vec<f64>> of shape [k][n_rows]) into the
+            // row-major `sigmas[j * n_rows + ℓ]` layout the cubature
+            // builder expects.
+            let mut sigmas_flat = Vec::with_capacity(k * n_rows);
+            for row in xs.iter() {
+                if row.len() != n_rows {
+                    // Shape mismatch — surrender cubature, fall back.
+                    sigmas_flat.clear();
+                    break;
+                }
+                sigmas_flat.extend_from_slice(row);
+            }
+            if sigmas_flat.len() == k * n_rows {
+                // Training box: 2 × the initial density — same convention
+                // the codex04 reference uses.  Anchor at the midpoint
+                // (0.5 × train_max).
+                let train_max: Vec<f64> = config
+                    .initial_densities()
+                    .iter()
+                    .map(|&n0| 2.0 * n0.max(1e-6))
+                    .collect();
+                let training =
+                nereids_physics::surrogate::SparseEmpiricalCubaturePlan::default_training_points(
+                    &train_max,
+                );
+                let anchor =
+                nereids_physics::surrogate::SparseEmpiricalCubaturePlan::default_jacobian_anchor(
+                    &train_max,
+                );
+                nereids_physics::surrogate::SparseEmpiricalCubaturePlan::build(
+                    &matrix,
+                    &sigmas_flat,
+                    k,
+                    &training,
+                    &anchor,
+                )
+                .ok()
+                .map(Arc::new)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
     // Precompute unbroadened (base) cross-sections for temperature fitting.
     // This avoids 74× overhead from redundant Reich-Moore evaluation per
     // KL iteration (112ms Reich-Moore vs 1.5ms Doppler rebroadening).
@@ -527,6 +594,9 @@ pub fn spatial_map_typed(
         if let Some(plan) = resolution_plan.clone() {
             cfg = cfg.with_precomputed_resolution_plan(plan);
         }
+        // Cubature stays None on the temperature path (guard matches
+        // the builder above).  No-op here but explicit for future
+        // readers.
         cfg
     } else {
         // For non-temperature path: xs is already collapsed to σ_eff when
@@ -542,6 +612,9 @@ pub fn spatial_map_typed(
             .with_compute_covariance(true);
         if let Some(plan) = resolution_plan.clone() {
             cfg = cfg.with_precomputed_resolution_plan(plan);
+        }
+        if let Some(plan) = sparse_cubature_plan.clone() {
+            cfg = cfg.with_precomputed_sparse_cubature_plan(plan);
         }
         cfg
     };
@@ -862,6 +935,7 @@ mod tests {
             energies: None,
             instrument: None,
             resolution_plan: None,
+            sparse_cubature_plan: None,
         };
         let t_1d = model.evaluate(&[true_density]).unwrap();
         let sigma_1d: Vec<f64> = t_1d.iter().map(|&v| 0.01 * v.max(0.01)).collect();
