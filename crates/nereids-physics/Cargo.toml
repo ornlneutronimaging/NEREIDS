@@ -8,6 +8,15 @@ repository.workspace = true
 keywords = ["cross-section", "neutron", "resonance", "physics", "sammy"]
 categories = ["science"]
 
+[features]
+default = []
+# Exposes internal test-only constructors (e.g. `resolution::test_support`)
+# across crate boundaries.  Downstream crates enable this in their
+# dev-dependencies to construct synthetic `ResolutionPlan` /
+# `SparseEmpiricalCubaturePlan` instances for CI-hermetic tests.  Not
+# intended for production builds; never enabled by default.
+test-support = []
+
 [dependencies]
 nereids-core = { workspace = true }
 nereids-endf = { workspace = true }

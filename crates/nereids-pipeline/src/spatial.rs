@@ -512,6 +512,146 @@ pub fn spatial_map_typed(
             None
         };
 
+    // Build the sparse empirical cubature plan (epic #472) when the
+    // fit is on the k ≥ 2 multi-isotope fixed-calibration path.  The
+    // plan compiles the exact ResolutionMatrix from the resolution
+    // plan above, then runs a per-row feasibility LP to collapse each
+    // row to ≤ `S + k + 1` atoms.  One-shot cost per spatial_map
+    // call, amortized across every pixel.  Falls back to `None` when:
+    //   * no resolution plan (Gaussian or missing);
+    //   * temperature or energy-scale fitting is active (σ / grid
+    //     can change at runtime, invalidating atoms);
+    //   * k == 1 (scalar fast-path is PR #475's scope);
+    //   * xs is not pre-collapsed to per-group σ (cubature needs the
+    //     final σ stack, not per-isotope σ × ratios).
+    // Capture any caller-supplied cubature plan BEFORE the local
+    // rebuild pathway — the `with_precomputed_cross_sections` setter
+    // clears `precomputed_sparse_cubature_plan` as a defence against
+    // stale-XS dispatch (Codex round-3 P3 on PR #480), so without
+    // this snapshot a plan the caller attached via
+    // `UnifiedFitConfig::with_precomputed_sparse_cubature_plan` would
+    // be dropped and lost on every call.  Codex round-5 P3 on PR #480.
+    let caller_cubature = config.precomputed_sparse_cubature_plan().cloned();
+    let sparse_cubature_plan: Option<Arc<nereids_physics::surrogate::SparseEmpiricalCubaturePlan>> =
+        if !config.fit_temperature()
+            && !config.fit_energy_scale()
+            && resolution_plan.is_some()
+            && xs.len() >= 2
+        {
+            let plan = resolution_plan.as_deref().expect("guarded above");
+            let matrix = plan.compile_to_matrix();
+            let k = xs.len();
+            let n_rows = matrix.len();
+            // Flatten xs (Vec<Vec<f64>> of shape [k][n_rows]) into the
+            // row-major `sigmas[j * n_rows + ℓ]` layout the cubature
+            // builder expects.
+            let mut sigmas_flat = Vec::with_capacity(k * n_rows);
+            for row in xs.iter() {
+                if row.len() != n_rows {
+                    // Shape mismatch — surrender cubature, fall back.
+                    sigmas_flat.clear();
+                    break;
+                }
+                sigmas_flat.extend_from_slice(row);
+            }
+            if sigmas_flat.len() == k * n_rows {
+                // Invariant pinning: the caller (this function's xs
+                // assembly above) must have pre-aggregated σ by
+                // isotope-group ratios so `xs[j]` already stores the
+                // per-density-param effective σ that the cubature
+                // builder needs.  If a future refactor inserts a
+                // different σ mutation after this point, or the
+                // collapse stops running first, the builder will
+                // receive wrong σ and this assertion catches it in
+                // debug builds.  Codex/Claude round-1 P2 on PR #480.
+                debug_assert_eq!(
+                    sigmas_flat.len(),
+                    k * n_rows,
+                    "cubature σ dimensions: expected {k} × {n_rows} = {}, got {}",
+                    k * n_rows,
+                    sigmas_flat.len(),
+                );
+                // Training box: 2 × the initial density — same convention
+                // the codex04 reference uses.  Anchor at the midpoint
+                // (0.5 × train_max).
+                //
+                // **Known limitation — deferred to PR #476**: this
+                // policy doesn't cross-check the solver's actual
+                // fit-bound constraints.  If `initial_densities`
+                // is near zero (or far from where the solver
+                // actually explores), the cubature is built for a
+                // box that may not contain the fit trajectory, and
+                // held-out forward accuracy degrades silently.
+                // PR #476 (trust-region wrapper) owns box
+                // invalidation / rebuild-on-escape and naturally
+                // replaces this static policy; see Claude round-1
+                // P2-b on PR #480.
+                let train_max: Vec<f64> = config
+                    .initial_densities()
+                    .iter()
+                    .map(|&n0| 2.0 * n0.max(1e-6))
+                    .collect();
+                let training =
+                nereids_physics::surrogate::SparseEmpiricalCubaturePlan::default_training_points(
+                    &train_max,
+                );
+                let anchor =
+                nereids_physics::surrogate::SparseEmpiricalCubaturePlan::default_jacobian_anchor(
+                    &train_max,
+                );
+                match nereids_physics::surrogate::SparseEmpiricalCubaturePlan::build(
+                    &matrix,
+                    &sigmas_flat,
+                    k,
+                    &training,
+                    &anchor,
+                ) {
+                    Ok(plan) => {
+                        // Record the training box on the plan so
+                        // the per-pixel dispatch can safely refuse
+                        // to fire when a fit iterate escapes the
+                        // trained region — rather than silently
+                        // running the surrogate out-of-domain.
+                        // Codex round-4 P1 on PR #480.
+                        Some(Arc::new(plan.with_density_box(train_max.clone())))
+                    }
+                    Err(e) => {
+                        // Surface the build failure to stderr rather
+                        // than silently swallow it — downstream fits
+                        // continue via the exact path, but a missing
+                        // cubature on a supposedly-eligible call is
+                        // a debugging signal that deserves
+                        // visibility.  Codex/Claude round-1 P2 on
+                        // PR #480.
+                        eprintln!(
+                            "spatial_map_typed: sparse cubature build failed ({e}); \
+                             falling back to exact ResolutionPlan path for this call",
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+    // Caller-fallback: if we didn't build a local plan (build
+    // failed, or conditions weren't met), but the caller supplied
+    // one that matches the current grid + k, reuse it.  This
+    // saves the LP build cost on repeat spatial_map calls that
+    // share the same `(grid, isotope_set, density_box)` and
+    // preserves explicit `with_precomputed_sparse_cubature_plan`
+    // attachments across the setter chain below.
+    let sparse_cubature_plan = sparse_cubature_plan.or_else(|| {
+        caller_cubature.filter(|p| {
+            p.len() == xs.first().map(|r| r.len()).unwrap_or(0)
+                && p.k() == xs.len()
+                && p.target_energies() == config.energies()
+        })
+    });
+
     // Precompute unbroadened (base) cross-sections for temperature fitting.
     // This avoids 74× overhead from redundant Reich-Moore evaluation per
     // KL iteration (112ms Reich-Moore vs 1.5ms Doppler rebroadening).
@@ -527,6 +667,9 @@ pub fn spatial_map_typed(
         if let Some(plan) = resolution_plan.clone() {
             cfg = cfg.with_precomputed_resolution_plan(plan);
         }
+        // Cubature stays None on the temperature path (guard matches
+        // the builder above).  No-op here but explicit for future
+        // readers.
         cfg
     } else {
         // For non-temperature path: xs is already collapsed to σ_eff when
@@ -542,6 +685,9 @@ pub fn spatial_map_typed(
             .with_compute_covariance(true);
         if let Some(plan) = resolution_plan.clone() {
             cfg = cfg.with_precomputed_resolution_plan(plan);
+        }
+        if let Some(plan) = sparse_cubature_plan.clone() {
+            cfg = cfg.with_precomputed_sparse_cubature_plan(plan);
         }
         cfg
     };
@@ -862,6 +1008,7 @@ mod tests {
             energies: None,
             instrument: None,
             resolution_plan: None,
+            sparse_cubature_plan: None,
         };
         let t_1d = model.evaluate(&[true_density]).unwrap();
         let sigma_1d: Vec<f64> = t_1d.iter().map(|&v| 0.01 * v.max(0.01)).collect();

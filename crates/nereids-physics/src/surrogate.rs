@@ -167,6 +167,15 @@ pub struct SparseEmpiricalCubaturePlan {
     /// Row-major flat storage of atom coordinates in ℝ^k.  Length
     /// `k * weights.len()`.  Atom `q` occupies indices `k*q .. k*(q+1)`.
     atoms: Vec<f64>,
+    /// Optional training-density upper bound — the per-isotope
+    /// `train_max` used to build the plan.  When set, dispatch
+    /// layers can compare the current fit iterate against it and
+    /// fall back to the exact path when the iterate strays beyond
+    /// the box (with a tolerance multiplier to avoid thrashing).
+    /// `None` means "no box information available; dispatch cannot
+    /// safety-check against it".  Set via
+    /// [`Self::with_density_box`].  Codex round-4 P1 on PR #480.
+    density_box: Option<Vec<f64>>,
 }
 
 impl SparseEmpiricalCubaturePlan {
@@ -282,6 +291,7 @@ impl SparseEmpiricalCubaturePlan {
                 row_starts: vec![0],
                 weights: Vec::new(),
                 atoms: Vec::new(),
+                density_box: None,
             });
         }
 
@@ -540,6 +550,7 @@ impl SparseEmpiricalCubaturePlan {
             row_starts,
             weights,
             atoms,
+            density_box: None,
         })
     }
 
@@ -588,6 +599,39 @@ impl SparseEmpiricalCubaturePlan {
     /// `atoms()[k * q .. k * (q + 1)]`.
     pub fn atoms(&self) -> &[f64] {
         &self.atoms
+    }
+
+    /// Training-density upper bound recorded at build time, if any.
+    /// Dispatch layers use this to detect when the fit iterate
+    /// escapes the training region and safely fall back to the
+    /// exact path (cubature accuracy degrades quickly outside the
+    /// trained box).  `None` when the caller chose not to record
+    /// one — in that case dispatch cannot safety-check.
+    pub fn density_box(&self) -> Option<&[f64]> {
+        self.density_box.as_deref()
+    }
+
+    /// Attach the training-density upper bound (`train_max`) used
+    /// during build, so dispatch can refuse to fire on iterates
+    /// that escape the trained region.  Builder-style; returns
+    /// `self` for chaining.  Callers in `spatial_map_typed`
+    /// populate this with the same `train_max` vector fed into
+    /// [`Self::default_training_points`] / [`Self::default_jacobian_anchor`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `train_max.len() != self.k()`.
+    #[must_use]
+    pub fn with_density_box(mut self, train_max: Vec<f64>) -> Self {
+        assert_eq!(
+            train_max.len(),
+            self.k,
+            "train_max length ({}) must equal k ({})",
+            train_max.len(),
+            self.k,
+        );
+        self.density_box = Some(train_max);
+        self
     }
 
     /// Evaluate the surrogate forward model `T_i(n)` at density vector

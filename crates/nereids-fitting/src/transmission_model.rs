@@ -10,7 +10,8 @@ use std::sync::Arc;
 
 use nereids_core::constants::{EV_TO_JOULES, NEUTRON_MASS_KG};
 use nereids_endf::resonance::ResonanceData;
-use nereids_physics::resolution::{self, ResolutionPlan};
+use nereids_physics::resolution::{self, ResolutionFunction, ResolutionPlan};
+use nereids_physics::surrogate::SparseEmpiricalCubaturePlan;
 use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
 
 use crate::error::FittingError;
@@ -60,6 +61,194 @@ pub struct PrecomputedTransmissionModel {
     /// `None` ⇒ fall back to the per-call broadening path, byte-
     /// identical output.
     pub resolution_plan: Option<Arc<ResolutionPlan>>,
+    /// Optional sparse empirical cubature plan (epic #472).
+    ///
+    /// When the plan is present AND its `target_energies` match this
+    /// model's energy grid AND `cubature.k() == n_density_params`
+    /// AND no temperature / energy-scale fitting is active, the
+    /// `evaluate()` / `analytical_jacobian()` fast path calls
+    /// `cubature.forward_and_jacobian(n)` directly instead of
+    /// `exp(-Σ n σ) + apply_resolution`.  Any guard failure falls
+    /// back to the exact path, so the default behaviour is
+    /// byte-identical to main.
+    pub sparse_cubature_plan: Option<Arc<SparseEmpiricalCubaturePlan>>,
+}
+
+/// Deduplicate `density_indices` and return the distinct density-
+/// parameter indices **sorted ascending by value** — e.g.
+/// `[0,0,0,0,0,0]` (grouped) → `[0]`; `[0,1,2,3,4,5]` (ungrouped) →
+/// `[0,1,2,3,4,5]`; `[1,0,1]` (non-monotonic group layout) →
+/// `[0,1]` (NOT first-appearance order `[1,0]`).
+///
+/// **Why sorted-by-value, not first-appearance?** The cubature
+/// dispatch maps `n[j] = params[result[j]]` onto the cubature's
+/// j-th atom column.  The cubature was built from a σ stack
+/// indexed by density-param index (`sigmas[j * n_rows + ℓ] =
+/// σ_{param_j}(E'_ℓ)`) — so atom column `j` corresponds to
+/// density param `j`.  Using sorted-by-value output keeps the
+/// dispatched `params[result[j]]` aligned with `cubature.atoms()`
+/// at column `j` regardless of the user's `density_indices`
+/// ordering.  First-appearance order would swap columns for
+/// non-monotonic mappings, returning wrong transmissions and
+/// wrong Jacobians.  Codex round-4 P2 on PR #480.
+fn density_param_indices(density_indices: &[usize]) -> Vec<usize> {
+    // `sort_unstable` + `dedup` is O(n log n) and avoids the O(n²)
+    // cost of repeated `Vec::contains` scans.  This runs on every
+    // `evaluate()` / `analytical_jacobian()` call, so the linear-
+    // scan version showed up in spatial-map profiling once the
+    // per-pixel cubature dispatch started firing.  Copilot Phase B
+    // finding on PR #481.
+    let mut seen: Vec<usize> = density_indices.to_vec();
+    seen.sort_unstable();
+    seen.dedup();
+    seen
+}
+
+/// Check whether a cubature-based forward evaluation is eligible
+/// given the plan, the model's energy grid, the model's active
+/// resolution plan, and density-param structure.  Centralized so
+/// `evaluate`, `analytical_jacobian`, and both model types share a
+/// single predicate.
+///
+/// **Grid identity** (not just length) matters: a cached plan from a
+/// previous spatial call on a different grid with the same bin count
+/// would silently return forward/Jacobian values for the stale grid.
+/// We compare `plan.target_energies()` against the model's `energies`
+/// via `to_bits()` per element (same contract
+/// `apply_resolution_with_plan` already enforces — Codex round-1 P1
+/// on PR #480).
+///
+/// **Tabulated-kernel tie**: the cubature fast path folds
+/// `apply_resolution*` into its atom sweep — skipping it when the
+/// model otherwise would have applied a Gaussian kernel is a
+/// silent wrong-answer path.  We require
+/// `matches!(instrument_resolution, ResolutionFunction::Tabulated(_))`
+/// so Gaussian-resolution models never hit the cubature path (a
+/// plan is only ever built against a tabulated kernel).  Codex
+/// round-3 P2 on PR #480.
+///
+/// **Optional `resolution_plan` cross-check**: when a prebuilt
+/// `ResolutionPlan` is attached (e.g., via
+/// `spatial_map_typed`'s plan-hoist pathway), we additionally
+/// verify its grid matches the cubature plan's grid — defence-in-
+/// depth against a
+/// `with_precomputed_resolution_plan(plan_A) +
+/// with_precomputed_sparse_cubature_plan(plan_B_on_different_grid)`
+/// mis-configuration.  When no resolution plan is attached (the
+/// default on the single-spectrum entrypoint, where
+/// `fit_spectrum_typed` / `build_transmission_model` don't
+/// synthesize one), eligibility falls back to the cubature-plan
+/// grid check alone; this keeps the `with_precomputed_sparse_cubature_plan`
+/// API usable on the single-spectrum surface without the caller
+/// having to pre-build a matching `ResolutionPlan` just to unlock
+/// the fast path.
+///
+/// **Known caveat (same-grid kernel swap)**: if a caller rebuilds
+/// the tabulated resolution plan for a *different kernel* on the
+/// same energy grid without rebuilding the cubature, the grid
+/// bit-check here passes but the atom weights still encode the
+/// OLD operator.  Guarding against this requires a kernel
+/// fingerprint on the cubature plan, which is out of scope for
+/// this PR (Codex round-4 P2 on PR #480).  Upstream callers are
+/// responsible for clearing the cubature when they swap kernels;
+/// in spatial dispatch this is enforced by
+/// `UnifiedFitConfig::with_precomputed_cross_sections` /
+/// `with_precomputed_base_xs` / `with_groups` all clearing the
+/// cached cubature (see pipeline.rs), so a refit through the
+/// standard surface cannot hit this case.
+/// Check whether the current density iterate `n` is inside the
+/// training region recorded on the cubature plan, with a 50 %
+/// expansion tolerance to avoid thrashing at the box boundary.
+/// When the plan has no recorded box, accepts unconditionally
+/// (caller is responsible; legacy code path).
+///
+/// Returns `false` when any component escapes the tolerance-
+/// expanded box OR is negative, OR is not finite.  Codex round-4
+/// P1 on PR #480: without this, a spatial fit whose per-pixel
+/// optimum drifts beyond `2 × initial_densities` silently runs the
+/// surrogate out of domain.
+fn density_within_box(plan: &SparseEmpiricalCubaturePlan, n: &[f64]) -> bool {
+    let Some(train_max) = plan.density_box() else {
+        // No box recorded — caller accepts the risk.
+        return true;
+    };
+    if train_max.len() != n.len() {
+        return false;
+    }
+    const TOLERANCE: f64 = 1.5; // 50 % slack above train_max
+    for (&n_i, &max_i) in n.iter().zip(train_max) {
+        if !n_i.is_finite() || n_i < 0.0 {
+            return false;
+        }
+        if n_i > max_i * TOLERANCE {
+            return false;
+        }
+    }
+    true
+}
+
+fn cubature_eligible(
+    plan: &SparseEmpiricalCubaturePlan,
+    energies: &[f64],
+    instrument_resolution: &ResolutionFunction,
+    resolution_plan: Option<&ResolutionPlan>,
+    n_density_params: usize,
+) -> bool {
+    // k ≥ 2: PR #475 (scalar k=1 branch) handles the grouped case.
+    if n_density_params < 2 {
+        return false;
+    }
+    if plan.k() != n_density_params {
+        return false;
+    }
+    if plan.len() != energies.len() {
+        return false;
+    }
+    // Gaussian-resolution models must NOT hit the cubature path:
+    // the cubature was built against a TabulatedResolution kernel
+    // (it's the only kernel `ResolutionPlan::compile_to_matrix`
+    // accepts), so firing it on a Gaussian-active model would
+    // silently replace Gaussian broadening with a tabulated
+    // surrogate.  Codex round-3 P2 on PR #480.
+    if !matches!(instrument_resolution, ResolutionFunction::Tabulated(_)) {
+        return false;
+    }
+    // Per-element `to_bits()` grid identity check catches `-0.0` vs
+    // `+0.0` and NaN-bit differences that float `==` silently
+    // accepts or rejects.  The cubature plan's own grid is the
+    // primary reference (atoms are indexed against it).
+    let cub_grid = plan.target_energies();
+    for (e_cur, e_cub) in energies.iter().zip(cub_grid) {
+        if e_cur.to_bits() != e_cub.to_bits() {
+            return false;
+        }
+    }
+    // Defense-in-depth: when a ResolutionPlan is ALSO attached,
+    // verify transitive grid identity.  Catches the
+    // `with_precomputed_resolution_plan(plan_A) +
+    // with_precomputed_sparse_cubature_plan(plan_B_on_different_grid)`
+    // mis-configuration case.  When no resolution plan is attached
+    // (typical single-spectrum entrypoint —
+    // `fit_spectrum_typed` / `build_transmission_model` don't
+    // synthesize one by default), the in-model resolution broaden
+    // path falls back to per-call `apply_resolution` and the
+    // cubature's self-check above is the grid guard.  Codex
+    // separate-review finding on PR #481 inception: the round-2
+    // "resolution_plan.is_some() required" was over-strict and
+    // silently disabled the fast path on the single-spectrum
+    // surface.
+    if let Some(res_plan) = resolution_plan {
+        if res_plan.target_energies().len() != energies.len() {
+            return false;
+        }
+        let res_grid = res_plan.target_energies();
+        for (e_cur, e_res) in energies.iter().zip(res_grid) {
+            if e_cur.to_bits() != e_res.to_bits() {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 impl FitModel for PrecomputedTransmissionModel {
@@ -70,6 +259,32 @@ impl FitModel for PrecomputedTransmissionModel {
             ));
         }
         let n_e = self.cross_sections[0].len();
+
+        // Cubature fast path: when the plan is installed, matches
+        // the grid + isotope count, and instrument resolution is
+        // enabled (cubature folds both `exp(-Σ n σ)` and `apply_R`
+        // into a single per-row atom sweep).  See epic #472.
+        if let (Some(cubature), Some(inst), Some(energies)) =
+            (&self.sparse_cubature_plan, &self.instrument, &self.energies)
+        {
+            let params_indices = density_param_indices(&self.density_indices);
+            if cubature_eligible(
+                cubature,
+                energies,
+                &inst.resolution,
+                self.resolution_plan.as_deref(),
+                params_indices.len(),
+            ) {
+                let n: Vec<f64> = params_indices.iter().map(|&i| params[i]).collect();
+                if density_within_box(cubature, &n) {
+                    return Ok(cubature.forward(&n));
+                }
+                // Density escaped the training box — fall through
+                // to the exact path (cubature accuracy degrades
+                // quickly outside the trained region).
+            }
+        }
+
         let mut neg_opt = vec![0.0f64; n_e];
         // #109.1: No density > 0 guard — let Beer-Lambert handle all densities
         // naturally.  exp(−n·σ) is well-defined for negative n (gives T > 1,
@@ -125,6 +340,69 @@ impl FitModel for PrecomputedTransmissionModel {
             self.cross_sections[0].len()
         };
         let n_free = free_param_indices.len();
+
+        // Cubature fast path: same eligibility as `evaluate()` plus
+        // the requirement that every free param is a density param
+        // (cubature can't produce Jacobian columns for non-density
+        // params like background / normalization, which are the
+        // calling layer's responsibility).
+        if let (Some(cubature), Some(inst), Some(energies)) =
+            (&self.sparse_cubature_plan, &self.instrument, &self.energies)
+        {
+            let params_indices = density_param_indices(&self.density_indices);
+            if cubature_eligible(
+                cubature,
+                energies,
+                &inst.resolution,
+                self.resolution_plan.as_deref(),
+                params_indices.len(),
+            ) {
+                // Map each free param to its column in the cubature
+                // Jacobian.  `None` for any free param that isn't a
+                // density param → fall through to the exact path.
+                //
+                // **Known caveat (Codex round-5 P2 on PR #480)**:
+                // if `free_param_indices` contains non-density
+                // slots, `col_map` is `None` and analytical_jacobian
+                // falls through to the exact derivatives — but
+                // `evaluate()` unconditionally dispatches the
+                // cubature forward when eligible.  That mix can
+                // feed LM a Jacobian for a slightly different
+                // function than the forward.  In the current
+                // layered architecture
+                // (`NormalizedTransmissionModel` /
+                // `TransmissionKLBackgroundModel` wrap the inner
+                // `PrecomputedTransmissionModel` before any
+                // non-density nuisance parameter reaches this
+                // layer), `free_param_indices` here is always the
+                // density slots, so the mismatch cannot arise via
+                // the standard pipeline.  A defence-in-depth fix
+                // (route evaluate() through a context that knows
+                // about free params) is deferred to the scalar /
+                // trust-region PRs (#475 / #476) that also revisit
+                // this dispatch surface.
+                let col_map: Option<Vec<usize>> = free_param_indices
+                    .iter()
+                    .map(|&fp| params_indices.iter().position(|&i| i == fp))
+                    .collect();
+                if let Some(col_map) = col_map {
+                    let n: Vec<f64> = params_indices.iter().map(|&i| params[i]).collect();
+                    if density_within_box(cubature, &n) {
+                        let (_t, jac_flat) = cubature.forward_and_jacobian(&n);
+                        // jac_flat[i * k + ell] = ∂T_i / ∂n_ell
+                        let k = params_indices.len();
+                        let mut jacobian = FlatMatrix::zeros(n_e, n_free);
+                        for (col, &ell) in col_map.iter().enumerate() {
+                            for i in 0..n_e {
+                                *jacobian.get_mut(i, col) = jac_flat[i * k + ell];
+                            }
+                        }
+                        return Some(jacobian);
+                    }
+                    // Density outside box → fall through to exact.
+                }
+            }
+        }
 
         // For each free parameter, sum the cross-sections of every isotope
         // tied to that parameter index.
@@ -257,6 +535,15 @@ pub struct TransmissionFitModel {
     /// TOF / kernel-interp / bracket work.  `None` ⇒ per-call
     /// broadening (same output as pre-plan main).
     resolution_plan: Option<Arc<ResolutionPlan>>,
+    /// Optional sparse empirical cubature plan (epic #472).
+    ///
+    /// See [`PrecomputedTransmissionModel::sparse_cubature_plan`]
+    /// for the dispatch contract.  In this per-pixel model the
+    /// cubature is additionally constrained: if `temperature_index`
+    /// is `Some` or the temperature changes between evaluate calls,
+    /// the σ the cubature was built against becomes stale so the
+    /// dispatch silently falls back.
+    sparse_cubature_plan: Option<Arc<SparseEmpiricalCubaturePlan>>,
 }
 
 impl TransmissionFitModel {
@@ -344,6 +631,7 @@ impl TransmissionFitModel {
             cached_dxs_dt: RefCell::new(None),
             cached_temperature: Cell::new(f64::NAN),
             resolution_plan: None,
+            sparse_cubature_plan: None,
         })
     }
 
@@ -357,6 +645,18 @@ impl TransmissionFitModel {
     #[must_use]
     pub fn with_resolution_plan(mut self, plan: Option<Arc<ResolutionPlan>>) -> Self {
         self.resolution_plan = plan;
+        self
+    }
+
+    /// Attach a prebuilt sparse empirical cubature plan.  See
+    /// [`PrecomputedTransmissionModel::sparse_cubature_plan`] for the
+    /// dispatch conditions.
+    #[must_use]
+    pub fn with_sparse_cubature_plan(
+        mut self,
+        plan: Option<Arc<SparseEmpiricalCubaturePlan>>,
+    ) -> Self {
+        self.sparse_cubature_plan = plan;
         self
     }
 }
@@ -373,6 +673,35 @@ impl FitModel for TransmissionFitModel {
             "temperature_index out of bounds for params (len={})",
             params.len(),
         );
+
+        // Cubature fast path: plan present, resolution on, no
+        // temperature fit (σ the cubature was built against must not
+        // change at runtime).  k=1 grouped case and per-isotope T-fit
+        // falls through to the exact path.  See epic #472.
+        if let (Some(cubature), Some(inst)) = (&self.sparse_cubature_plan, &self.instrument)
+            && self.temperature_index.is_none()
+        {
+            let params_indices = density_param_indices(&self.density_indices);
+            if cubature_eligible(
+                cubature,
+                &self.energies,
+                &inst.resolution,
+                self.resolution_plan.as_deref(),
+                params_indices.len(),
+            ) {
+                // Caller contract: for grouped fits the cubature
+                // was built with σ already aggregated by ratios
+                // (`σ_group_j = Σ_{i ∈ group_j} ratio_i · σ_i`),
+                // so the online `forward(n)` receives only the
+                // per-group density vector and multiplies by the
+                // pre-aggregated atoms internally.
+                let n: Vec<f64> = params_indices.iter().map(|&i| params[i]).collect();
+                if density_within_box(cubature, &n) {
+                    return Ok(cubature.forward(&n));
+                }
+                // Density escaped training box → fall through.
+            }
+        }
 
         let temperature_k = match self.temperature_index {
             Some(idx) => params[idx],
@@ -499,6 +828,44 @@ impl FitModel for TransmissionFitModel {
         free_param_indices: &[usize],
         y_current: &[f64],
     ) -> Option<FlatMatrix> {
+        // Cubature fast path — same eligibility as `evaluate()` plus
+        // the requirement that every free param is a density param.
+        if let (Some(cubature), Some(inst)) = (&self.sparse_cubature_plan, &self.instrument)
+            && self.temperature_index.is_none()
+        {
+            let params_indices = density_param_indices(&self.density_indices);
+            if cubature_eligible(
+                cubature,
+                &self.energies,
+                &inst.resolution,
+                self.resolution_plan.as_deref(),
+                params_indices.len(),
+            ) {
+                let col_map: Option<Vec<usize>> = free_param_indices
+                    .iter()
+                    .map(|&fp| params_indices.iter().position(|&i| i == fp))
+                    .collect();
+                if let Some(col_map) = col_map {
+                    let n: Vec<f64> = params_indices.iter().map(|&i| params[i]).collect();
+                    if density_within_box(cubature, &n) {
+                        // In-box: take the cubature Jacobian fast
+                        // path.  Out-of-box falls through to the
+                        // exact analytical Jacobian below.
+                        let (_t, jac_flat) = cubature.forward_and_jacobian(&n);
+                        let k = params_indices.len();
+                        let n_e = self.energies.len();
+                        let mut jacobian = FlatMatrix::zeros(n_e, free_param_indices.len());
+                        for (col, &ell) in col_map.iter().enumerate() {
+                            for i in 0..n_e {
+                                *jacobian.get_mut(i, col) = jac_flat[i * k + ell];
+                            }
+                        }
+                        return Some(jacobian);
+                    }
+                }
+            }
+        }
+
         // Only provide analytical Jacobian when base_xs is available
         // (temperature-fitting fast path with cached broadened XS).
         let _base_xs_guard = self.base_xs.as_ref()?;
@@ -1914,7 +2281,569 @@ mod tests {
             energies: None,
             instrument: None,
             resolution_plan: None,
+            sparse_cubature_plan: None,
         }
+    }
+
+    // ── Cubature dispatch tests (epic #472, PR #474b) ───────────────────
+
+    /// Helper: build a synthetic resolution kernel + plan + matrix.
+    /// CI-hermetic (no PLEIADES fixture) using the same synthetic-
+    /// overlap-plan pattern as the surrogate module's tests.
+    fn synthetic_resolution_setup(
+        n_grid: usize,
+        half_kernel: usize,
+    ) -> (
+        Vec<f64>,
+        Arc<ResolutionPlan>,
+        nereids_physics::resolution::ResolutionMatrix,
+    ) {
+        assert!(n_grid > 2 * half_kernel);
+        let energies: Vec<f64> = (0..n_grid).map(|i| 10.0 + i as f64).collect();
+        let mut starts: Vec<u32> = vec![0];
+        let mut lo_idx: Vec<u32> = Vec::new();
+        let mut frac_arr: Vec<f64> = Vec::new();
+        let mut weight_arr: Vec<f64> = Vec::new();
+        let mut norm: Vec<f64> = Vec::with_capacity(n_grid);
+        for i in 0..n_grid {
+            let lo_min = i.saturating_sub(half_kernel);
+            let lo_max = (i + half_kernel).min(n_grid - 2);
+            let mut row_norm = 0.0_f64;
+            for lo in lo_min..=lo_max {
+                let d = (lo as i64 - i as i64).abs() as f64;
+                let w = 1.0 - d / (half_kernel as f64 + 1.0);
+                lo_idx.push(lo as u32);
+                frac_arr.push(0.5);
+                weight_arr.push(w);
+                row_norm += w;
+            }
+            norm.push(row_norm);
+            starts.push(lo_idx.len() as u32);
+        }
+        let plan = nereids_physics::resolution::test_support::plan_from_raw_parts(
+            energies.clone(),
+            starts,
+            lo_idx,
+            frac_arr,
+            weight_arr,
+            norm,
+        );
+        let matrix = plan.compile_to_matrix();
+        (energies, Arc::new(plan), matrix)
+    }
+
+    /// Helper: build a k-isotope synthetic σ stack.
+    fn synthetic_sigmas(n_grid: usize, k: usize) -> Vec<Vec<f64>> {
+        let mut out = Vec::with_capacity(k);
+        for j in 0..k {
+            let center = 10.0 + (j as f64 + 1.0) * (n_grid as f64) / (k as f64 + 1.0);
+            let width = 3.0;
+            out.push(
+                (0..n_grid)
+                    .map(|ell| {
+                        let e = 10.0 + ell as f64;
+                        100.0 * (-((e - center).powi(2)) / (width * width)).exp() + 5.0
+                    })
+                    .collect(),
+            );
+        }
+        out
+    }
+
+    /// Helper: build a sparse cubature plan against a known
+    /// (matrix, σ stack) pair, with the canonical codex04 training
+    /// rule.
+    fn build_cubature(
+        matrix: &nereids_physics::resolution::ResolutionMatrix,
+        sigmas: &[Vec<f64>],
+        train_max: Vec<f64>,
+    ) -> Arc<SparseEmpiricalCubaturePlan> {
+        let k = sigmas.len();
+        let n_rows = matrix.len();
+        let mut flat = Vec::with_capacity(k * n_rows);
+        for row in sigmas {
+            flat.extend_from_slice(row);
+        }
+        let training = SparseEmpiricalCubaturePlan::default_training_points(&train_max);
+        let anchor = SparseEmpiricalCubaturePlan::default_jacobian_anchor(&train_max);
+        Arc::new(
+            SparseEmpiricalCubaturePlan::build(matrix, &flat, k, &training, &anchor)
+                .expect("synthetic cubature build"),
+        )
+    }
+
+    /// Build an `InstrumentParams` wrapping a trivial delta-like
+    /// tabulated resolution (single ref energy, δ-kernel).  Used
+    /// only because the dispatch guards check `instrument.is_some()`
+    /// AND require `ResolutionFunction::Tabulated(_)`.  The actual
+    /// broadening wouldn't fire on the cubature path regardless
+    /// (cubature folds `apply_resolution*` into its atom sweep).
+    fn make_trivial_instrument() -> Arc<InstrumentParams> {
+        use nereids_physics::resolution::ResolutionFunction;
+        // Tabulated resolution required for cubature-dispatch tests:
+        // round-3 P2 guard refuses the dispatch when the active
+        // instrument resolution isn't `ResolutionFunction::Tabulated`.
+        // The test_support helper builds a minimal delta-like kernel;
+        // the broadening never actually runs on the cubature path
+        // (cubature.forward replaces apply_resolution entirely).
+        let tab =
+            Arc::new(nereids_physics::resolution::test_support::trivial_tabulated_resolution(25.0));
+        let res_fn = ResolutionFunction::Tabulated(tab);
+        Arc::new(InstrumentParams { resolution: res_fn })
+    }
+
+    #[test]
+    fn precomputed_cubature_dispatches_at_k2_matching_k() {
+        // k = 2 with an installed cubature plan: evaluate should
+        // return the cubature's forward output (which differs from
+        // the exact `exp(-Σ n σ) + apply_r` path ONLY at held-out
+        // densities; at training densities the LP pins them exactly).
+        let n_grid = 40_usize;
+        let (energies, plan, matrix) = synthetic_resolution_setup(n_grid, 4);
+        let sigmas = synthetic_sigmas(n_grid, 2);
+        let train_max = vec![1e-4_f64, 1e-4];
+        let cubature = build_cubature(&matrix, &sigmas, train_max.clone());
+
+        // Build the model with cubature installed.  The resolution
+        // plan MUST also be installed for the cubature dispatch to
+        // fire — without it, `cubature_eligible` refuses the plan
+        // on the grounds that the cubature would be silently
+        // bypassing an unknown resolution operator (Codex round-2
+        // P2 guard).
+        let mut model = PrecomputedTransmissionModel {
+            cross_sections: Arc::new(sigmas.clone()),
+            density_indices: Arc::new(vec![0, 1]),
+            energies: Some(Arc::new(energies.clone())),
+            instrument: Some(make_trivial_instrument()),
+            resolution_plan: Some(Arc::clone(&plan)),
+            sparse_cubature_plan: Some(Arc::clone(&cubature)),
+        };
+
+        // Evaluate at a training density: cubature ≡ exact to LP
+        // tolerance.
+        let n = [0.25 * train_max[0], 0.25 * train_max[1]];
+        let t_cubature = model.evaluate(&n).unwrap();
+
+        // Disable cubature → exact cannot match bit-for-bit (different
+        // summation order).  But we can compute the cubature output
+        // directly and confirm it equals what `evaluate()` returned.
+        model.sparse_cubature_plan = None;
+        let t_exact_via_r = {
+            // exp(-Σ n σ) then apply_r
+            let n_grid_local = n_grid;
+            let mut neg_opt = vec![0.0_f64; n_grid_local];
+            for (j, &nj) in n.iter().enumerate() {
+                for (ell, &sig) in sigmas[j].iter().enumerate() {
+                    neg_opt[ell] -= nj * sig;
+                }
+            }
+            let t_un: Vec<f64> = neg_opt.iter().map(|&d| d.exp()).collect();
+            nereids_physics::resolution::apply_r(&matrix, &t_un)
+        };
+        let t_cubature_direct = cubature.forward(&n);
+
+        // Sanity: cubature direct output matches what evaluate() returned.
+        for (a, b) in t_cubature.iter().zip(t_cubature_direct.iter()) {
+            assert!((a - b).abs() < 1e-14);
+        }
+        // Cubature vs exact at training density: LP-pinned equivalence.
+        let max_err = t_cubature
+            .iter()
+            .zip(t_exact_via_r.iter())
+            .map(|(a, b)| {
+                let denom = a.abs().max(b.abs()).max(1e-12);
+                (a - b).abs() / denom
+            })
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_err < 1e-9,
+            "at training density, cubature vs exact max err = {max_err:.3e}",
+        );
+    }
+
+    #[test]
+    fn precomputed_cubature_falls_back_at_k1() {
+        // k = 1 with a k=2 cubature → cubature_eligible returns false
+        // (plan.k mismatch with n_density_params), dispatch MUST
+        // fall back to the exact `exp(-n σ) + apply_resolution`
+        // path.  We prove fallback via byte-identity: constructing a
+        // second model WITHOUT the cubature plan must produce
+        // exactly the same output as the first model WITH the
+        // ineligible plan.  A false-positive dispatch would violate
+        // this invariant because the k=2 cubature's atoms live in
+        // ℝ² and `cubature.forward([n])` would panic on the
+        // input-length check in `SparseEmpiricalCubaturePlan::forward`
+        // — OR, worse, if the guard check accidentally accepted a
+        // k=2 plan for a k=1 model the output would numerically
+        // differ from straight Beer-Lambert by more than
+        // floating-point noise.
+        let n_grid = 40_usize;
+        // `plan` intentionally unused here: this test wants both
+        // model variants in the no-dispatch state (no cubature can
+        // fire because k=1 vs cubature.k=2), so installing a
+        // resolution plan would add work without changing the
+        // tested invariant.
+        let (energies, _plan, matrix) = synthetic_resolution_setup(n_grid, 4);
+        let sigmas_k2 = synthetic_sigmas(n_grid, 2);
+        let cubature_k2 = build_cubature(&matrix, &sigmas_k2, vec![1e-4_f64, 1e-4]);
+
+        // Model has k = 1 (only one isotope in cross_sections), but a
+        // k = 2 cubature is installed → must fall back.
+        let sigmas_k1 = synthetic_sigmas(n_grid, 1);
+        let model_with_plan = PrecomputedTransmissionModel {
+            cross_sections: Arc::new(sigmas_k1.clone()),
+            density_indices: Arc::new(vec![0]),
+            energies: Some(Arc::new(energies.clone())),
+            instrument: Some(make_trivial_instrument()),
+            resolution_plan: None,
+            sparse_cubature_plan: Some(Arc::clone(&cubature_k2)),
+        };
+        let model_without_plan = PrecomputedTransmissionModel {
+            cross_sections: Arc::new(sigmas_k1.clone()),
+            density_indices: Arc::new(vec![0]),
+            energies: Some(Arc::new(energies.clone())),
+            instrument: Some(make_trivial_instrument()),
+            resolution_plan: None,
+            sparse_cubature_plan: None,
+        };
+
+        let n = [1e-4_f64];
+        let t_with = model_with_plan.evaluate(&n).unwrap();
+        let t_without = model_without_plan.evaluate(&n).unwrap();
+        assert_eq!(t_with.len(), n_grid);
+        assert_eq!(t_without.len(), n_grid);
+        // Byte identity: ineligible-plan dispatch MUST equal
+        // no-plan dispatch exactly.
+        for (a, b) in t_with.iter().zip(t_without.iter()) {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "fallback path must be byte-identical to the no-plan path; \
+                 otherwise the k=2 cubature is silently firing on a k=1 model",
+            );
+        }
+    }
+
+    #[test]
+    fn precomputed_cubature_no_plan_means_exact_path() {
+        // No cubature installed → byte-identical to pre-PR #474b
+        // main.  This is the regression guard: the dispatch addition
+        // must not change the default forward path.
+        let n_grid = 40_usize;
+        let (_energies, _plan, _matrix) = synthetic_resolution_setup(n_grid, 4);
+        let sigmas = synthetic_sigmas(n_grid, 2);
+
+        let model = PrecomputedTransmissionModel {
+            cross_sections: Arc::new(sigmas.clone()),
+            density_indices: Arc::new(vec![0, 1]),
+            energies: None,
+            instrument: None,
+            resolution_plan: None,
+            sparse_cubature_plan: None,
+        };
+
+        let n = [1e-4_f64, 1e-4];
+        let t = model.evaluate(&n).unwrap();
+        // Exact Beer-Lambert: T = exp(-Σ n σ).
+        for (ell, &t_val) in t.iter().enumerate() {
+            let tau: f64 = sigmas
+                .iter()
+                .zip(n.iter())
+                .map(|(s, &ni)| ni * s[ell])
+                .sum();
+            let expected = (-tau).exp();
+            assert!(
+                (t_val - expected).abs() < 1e-14,
+                "at ell={ell}: got {t_val}, expected {expected}",
+            );
+        }
+    }
+
+    #[test]
+    fn precomputed_cubature_jacobian_matches_forward_derivative() {
+        // Cubature Jacobian columns should equal the per-isotope
+        // derivatives of the cubature forward output at the anchor.
+        let n_grid = 40_usize;
+        let (energies, plan, matrix) = synthetic_resolution_setup(n_grid, 4);
+        let sigmas = synthetic_sigmas(n_grid, 2);
+        let train_max = vec![1e-4_f64, 1e-4];
+        let cubature = build_cubature(&matrix, &sigmas, train_max.clone());
+
+        let model = PrecomputedTransmissionModel {
+            cross_sections: Arc::new(sigmas),
+            density_indices: Arc::new(vec![0, 1]),
+            energies: Some(Arc::new(energies)),
+            instrument: Some(make_trivial_instrument()),
+            resolution_plan: Some(Arc::clone(&plan)),
+            sparse_cubature_plan: Some(Arc::clone(&cubature)),
+        };
+
+        // Use anchor density: LP pins Jacobian exactly here.
+        let anchor = SparseEmpiricalCubaturePlan::default_jacobian_anchor(&train_max);
+        let y_curr = model.evaluate(&anchor).unwrap();
+        let jac = model
+            .analytical_jacobian(&anchor, &[0, 1], &y_curr)
+            .expect("cubature Jacobian path");
+
+        // Cross-check: cubature.forward_and_jacobian should give the
+        // same J.
+        let (_t_ref, jac_flat_ref) = cubature.forward_and_jacobian(&anchor);
+        for i in 0..n_grid {
+            for col in 0..2 {
+                let from_model = jac.get(i, col);
+                let from_cubature = jac_flat_ref[i * 2 + col];
+                assert!(
+                    (from_model - from_cubature).abs() < 1e-14,
+                    "row {i} col {col}: model = {from_model}, cubature = {from_cubature}",
+                );
+            }
+        }
+    }
+
+    // ── TransmissionFitModel cubature dispatch tests ──────────────────
+    //
+    // The per-pixel `TransmissionFitModel` fires the cubature path
+    // with extra guards (`temperature_index.is_none()` for σ stack
+    // stability).  These tests exercise BOTH `evaluate()` and
+    // `analytical_jacobian()` directly on `TransmissionFitModel`,
+    // not the precomputed variant.  Claude round-1 P1 on PR #480.
+
+    /// Build a minimal `TransmissionFitModel` with a single trivial
+    /// resonance per isotope + the synthetic σ used for the
+    /// Precomputed tests, so the cubature dispatch condition can
+    /// trigger without loading full ENDF data.
+    fn make_trivial_fit_model(energies: Vec<f64>, k: usize) -> TransmissionFitModel {
+        // Build k synthetic Isotope / ResonanceData pairs — the fit
+        // model doesn't actually consult them when the cubature
+        // dispatch fires (cubature.forward replaces `exp(-Σ n σ) +
+        // apply_resolution`).  But the constructor still validates
+        // the count.
+        // Minimal ResonanceData — the cubature dispatch fires
+        // before any ENDF-derived code runs, so `ranges` can be
+        // empty.  When the dispatch falls through (tests that check
+        // the exact path), we don't exercise cross_sections from
+        // these resonance_data either; the model uses
+        // `precomputed_cross_sections` / `base_xs`.
+        let resonance_data: Vec<ResonanceData> = (0..k)
+            .map(|j| {
+                let iso = Isotope::new(40 + j as u32, 96 + j as u32).unwrap();
+                ResonanceData {
+                    isotope: iso,
+                    za: ((40 + j) * 1000 + (96 + j)) as u32,
+                    awr: 96.0 + j as f64,
+                    ranges: vec![],
+                }
+            })
+            .collect();
+
+        TransmissionFitModel::new(
+            energies,
+            resonance_data,
+            293.6,
+            Some(make_trivial_instrument()),
+            ((0..k).collect(), vec![1.0; k]),
+            None,
+            None,
+        )
+        .expect("TransmissionFitModel::new")
+    }
+
+    #[test]
+    fn fit_model_cubature_dispatches_at_anchor() {
+        // Build a k = 2 cubature and a TransmissionFitModel whose
+        // density_indices / ratios map directly (identity) onto it.
+        // `evaluate()` at the anchor density MUST equal
+        // `cubature.forward(anchor)` exactly — the LP equality
+        // constraint pins it.
+        let n_grid = 40_usize;
+        let (energies, plan, matrix) = synthetic_resolution_setup(n_grid, 4);
+        let sigmas = synthetic_sigmas(n_grid, 2);
+        let train_max = vec![1e-4_f64, 1e-4];
+        let cubature = build_cubature(&matrix, &sigmas, train_max.clone());
+
+        // Install BOTH the resolution plan and the cubature plan:
+        // the round-2 eligibility guard requires `resolution_plan.is_some()`
+        // so the cubature doesn't silently bypass an unknown
+        // resolution operator (Codex round-2 P2 on PR #480).
+        let model = make_trivial_fit_model(energies.clone(), 2)
+            .with_resolution_plan(Some(Arc::clone(&plan)))
+            .with_sparse_cubature_plan(Some(cubature.clone()));
+
+        // Evaluate at a training density (LP pins exactly) → model
+        // output equals cubature output.
+        let n = [0.25 * train_max[0], 0.25 * train_max[1]];
+        let t_model = model.evaluate(&n).unwrap();
+        let t_cub = cubature.forward(&n);
+        assert_eq!(t_model.len(), n_grid);
+        for (a, b) in t_model.iter().zip(t_cub.iter()) {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "TransmissionFitModel cubature dispatch must return cubature.forward() byte-exact at the LP-pinned anchor",
+            );
+        }
+    }
+
+    #[test]
+    fn fit_model_cubature_jacobian_matches_cubature_output() {
+        // Same pattern as the Precomputed Jacobian test but on
+        // TransmissionFitModel.  analytical_jacobian at the anchor
+        // density must return exactly `cubature.forward_and_jacobian(n)`'s
+        // J matrix.
+        let n_grid = 40_usize;
+        let (energies, plan, matrix) = synthetic_resolution_setup(n_grid, 4);
+        let sigmas = synthetic_sigmas(n_grid, 2);
+        let train_max = vec![1e-4_f64, 1e-4];
+        let cubature = build_cubature(&matrix, &sigmas, train_max.clone());
+
+        let model = make_trivial_fit_model(energies, 2)
+            .with_resolution_plan(Some(Arc::clone(&plan)))
+            .with_sparse_cubature_plan(Some(cubature.clone()));
+
+        let anchor = SparseEmpiricalCubaturePlan::default_jacobian_anchor(&train_max);
+        let y_curr = model.evaluate(&anchor).unwrap();
+        let jac = model
+            .analytical_jacobian(&anchor, &[0, 1], &y_curr)
+            .expect("cubature Jacobian path on TransmissionFitModel");
+        let (_t_ref, jac_flat_ref) = cubature.forward_and_jacobian(&anchor);
+        for i in 0..n_grid {
+            for col in 0..2 {
+                let from_model = jac.get(i, col);
+                let from_cubature = jac_flat_ref[i * 2 + col];
+                assert_eq!(
+                    from_model.to_bits(),
+                    from_cubature.to_bits(),
+                    "row {i} col {col}: TransmissionFitModel must return cubature J byte-exact",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fit_model_cubature_falls_back_on_grid_mismatch() {
+        // Build a cubature on one grid, install it on a model with a
+        // DIFFERENT same-length grid.  Dispatch must refuse the plan
+        // via the new `to_bits()` grid-identity check and produce
+        // byte-identical output to the no-plan model (exact path).
+        let n_grid = 40_usize;
+        let (energies_a, _plan, matrix) = synthetic_resolution_setup(n_grid, 4);
+        let sigmas = synthetic_sigmas(n_grid, 2);
+        let train_max = vec![1e-4_f64, 1e-4];
+        let cubature = build_cubature(&matrix, &sigmas, train_max);
+
+        // A different same-length grid (shifted by 1 eV).
+        let energies_b: Vec<f64> = energies_a.iter().map(|&e| e + 1.0).collect();
+
+        let model_with_stale_plan =
+            make_trivial_fit_model(energies_b.clone(), 2).with_sparse_cubature_plan(Some(cubature));
+        let model_without_plan = make_trivial_fit_model(energies_b, 2);
+
+        let n = [1e-5_f64, 1e-5];
+        let t_stale = model_with_stale_plan.evaluate(&n).unwrap();
+        let t_exact = model_without_plan.evaluate(&n).unwrap();
+        for (a, b) in t_stale.iter().zip(t_exact.iter()) {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "stale-grid cubature plan MUST NOT fire; evaluate() must match no-plan byte-exactly \
+                 (Codex PR #480 round-1 P1 regression guard)",
+            );
+        }
+    }
+
+    #[test]
+    fn fit_model_cubature_falls_back_when_density_escapes_box() {
+        // Build cubature with train_max = [1e-4, 1e-4], install
+        // the density_box, then call evaluate() with a density
+        // WELL beyond the 1.5× tolerance.  Dispatch must fall back
+        // to the exact path rather than silently extrapolate the
+        // surrogate outside its trained region.  Codex round-4 P1
+        // on PR #480.
+        let n_grid = 40_usize;
+        let (energies, plan, matrix) = synthetic_resolution_setup(n_grid, 4);
+        let sigmas = synthetic_sigmas(n_grid, 2);
+        let train_max = vec![1e-4_f64, 1e-4];
+
+        // Build cubature AND attach the density_box.
+        let cubature = {
+            let flat: Vec<f64> = sigmas.iter().flat_map(|s| s.iter().copied()).collect();
+            let training = SparseEmpiricalCubaturePlan::default_training_points(&train_max);
+            let anchor = SparseEmpiricalCubaturePlan::default_jacobian_anchor(&train_max);
+            Arc::new(
+                SparseEmpiricalCubaturePlan::build(&matrix, &flat, 2, &training, &anchor)
+                    .expect("build")
+                    .with_density_box(train_max.clone()),
+            )
+        };
+
+        let model_with = make_trivial_fit_model(energies.clone(), 2)
+            .with_resolution_plan(Some(Arc::clone(&plan)))
+            .with_sparse_cubature_plan(Some(Arc::clone(&cubature)));
+        let model_without =
+            make_trivial_fit_model(energies, 2).with_resolution_plan(Some(Arc::clone(&plan)));
+
+        // Escape: 5× the training max → well outside the 1.5× tolerance.
+        let n_escape = [5.0 * train_max[0], 5.0 * train_max[1]];
+        let t_with = model_with.evaluate(&n_escape).unwrap();
+        let t_without = model_without.evaluate(&n_escape).unwrap();
+        // If the guard fired correctly, the cubature-installed
+        // model falls back to the exact path and produces the same
+        // output as the no-plan model — byte-identical.
+        for (a, b) in t_with.iter().zip(t_without.iter()) {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "density-box escape guard MUST fall back to exact path byte-identically",
+            );
+        }
+    }
+
+    #[test]
+    fn fit_model_cubature_dispatches_without_resolution_plan_attached() {
+        // Single-spectrum regression: callers of the non-spatial
+        // `fit_spectrum_typed` / `build_transmission_model` path
+        // attach a cubature via
+        // `UnifiedFitConfig::with_precomputed_sparse_cubature_plan`
+        // but typically don't also pre-build a `ResolutionPlan` (the
+        // per-call `apply_resolution` broaden path is used
+        // otherwise).  The cubature fast path MUST still fire — the
+        // prior round-2 `resolution_plan.is_some()` requirement
+        // made the new API inert on this surface.  Codex separate-
+        // review finding on PR #481.
+        let n_grid = 40_usize;
+        let (energies, _plan, matrix) = synthetic_resolution_setup(n_grid, 4);
+        let sigmas = synthetic_sigmas(n_grid, 2);
+        let train_max = vec![1e-4_f64, 1e-4];
+        let cubature = build_cubature(&matrix, &sigmas, train_max.clone());
+
+        // Intentionally NOT installing a resolution plan.  The
+        // instrument's tabulated resolution is enough.
+        let model = make_trivial_fit_model(energies.clone(), 2)
+            .with_sparse_cubature_plan(Some(Arc::clone(&cubature)));
+
+        let n = [0.25 * train_max[0], 0.25 * train_max[1]];
+        let t_model = model.evaluate(&n).unwrap();
+        let t_cub = cubature.forward(&n);
+        for (a, b) in t_model.iter().zip(t_cub.iter()) {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "cubature dispatch must fire on single-spectrum path without a separate ResolutionPlan attached",
+            );
+        }
+    }
+
+    #[test]
+    fn density_param_indices_sorted_by_value() {
+        // First-appearance order would swap columns for non-
+        // monotonic group layouts like [1, 0, 1].  Sorted-by-value
+        // keeps dispatch aligned with the cubature's σ-stack
+        // indexing (`sigmas[j * n_rows + ℓ]` = σ for density param
+        // j).  Codex round-4 P2 on PR #480.
+        assert_eq!(density_param_indices(&[0, 0, 0]), vec![0]);
+        assert_eq!(density_param_indices(&[0, 1, 2, 3]), vec![0, 1, 2, 3]);
+        assert_eq!(density_param_indices(&[1, 0, 1]), vec![0, 1]);
+        assert_eq!(density_param_indices(&[3, 1, 2, 0, 2]), vec![0, 1, 2, 3]);
     }
 
     /// Verify that NormalizedTransmissionModel with identity normalization
@@ -2219,6 +3148,7 @@ mod tests {
             energies: Some(Arc::new(energies.clone())),
             instrument: Some(Arc::clone(&inst)),
             resolution_plan: None,
+            sparse_cubature_plan: None,
         };
         let t_precomputed = model.evaluate(&[thickness]).unwrap();
 
@@ -2301,6 +3231,7 @@ mod tests {
             energies: Some(Arc::new(energies.clone())),
             instrument: Some(Arc::clone(&inst)),
             resolution_plan: None,
+            sparse_cubature_plan: None,
         };
 
         let params = [0.0005f64];
@@ -2350,6 +3281,7 @@ mod tests {
             energies: Some(Arc::new(energies.clone())),
             instrument: Some(Arc::clone(&inst)),
             resolution_plan: None,
+            sparse_cubature_plan: None,
         };
 
         let params = [0.001f64];

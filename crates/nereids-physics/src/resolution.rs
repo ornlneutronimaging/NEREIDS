@@ -2069,22 +2069,26 @@ impl fmt::Display for ResolutionParseError {
 
 impl std::error::Error for ResolutionParseError {}
 
-/// Test-only helpers exposed to other `nereids-physics` test modules
-/// that need to synthesize a [`ResolutionPlan`] without going through
-/// the full `TabulatedResolution::plan` path.  Gated `#[cfg(test)]` so
-/// the raw constructor never ships in a release build.
-#[cfg(test)]
-pub(crate) mod test_support {
-    use super::ResolutionPlan;
+/// Test-only helpers for building synthetic [`ResolutionPlan`] /
+/// [`TabulatedResolution`] instances without going through the full
+/// parse-from-text path.  Gated behind `#[cfg(test)]` for in-crate
+/// tests and the `test-support` feature flag for downstream-crate
+/// tests.  Never ships in a release build with `test-support =
+/// false` (the default), so the raw constructors remain out of the
+/// production API surface.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
+    use super::{ResolutionPlan, TabulatedResolution};
 
     /// Build a [`ResolutionPlan`] directly from its SoA fields.
     ///
     /// The caller is responsible for maintaining the invariants that
     /// `plan_presorted` normally enforces (`starts.last() ==
     /// lo_idx.len()`, lo_idx in [0, n-2] for regular entries, etc.).
-    /// Used by surrogate-module tests to construct hand-designed
-    /// plans that exercise specific CSR patterns.
-    pub(crate) fn plan_from_raw_parts(
+    /// Used by surrogate-module tests + downstream crate tests to
+    /// construct hand-designed plans that exercise specific CSR
+    /// patterns.
+    pub fn plan_from_raw_parts(
         target_energies: Vec<f64>,
         starts: Vec<u32>,
         lo_idx: Vec<u32>,
@@ -2099,6 +2103,22 @@ pub(crate) mod test_support {
             frac,
             weight,
             norm,
+        }
+    }
+
+    /// Build a minimal [`TabulatedResolution`] with a single
+    /// reference energy and a trivial delta-like kernel — just
+    /// enough for tests that need an `InstrumentParams` with a
+    /// tabulated resolution (e.g., to exercise cubature dispatch
+    /// guards that refuse Gaussian resolution).  The broadening
+    /// would be effectively identity if anyone ever called it, but
+    /// typical consumers (cubature dispatch tests) never invoke the
+    /// kernel.
+    pub fn trivial_tabulated_resolution(flight_path_m: f64) -> TabulatedResolution {
+        TabulatedResolution {
+            ref_energies: vec![100.0],
+            kernels: vec![(vec![-1e-6, 0.0, 1e-6], vec![0.0, 1.0, 0.0])],
+            flight_path_m,
         }
     }
 }
