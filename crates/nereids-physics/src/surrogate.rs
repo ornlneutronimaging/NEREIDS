@@ -55,11 +55,14 @@ use crate::resolution::ResolutionMatrix;
 /// Errors from [`SparseEmpiricalCubaturePlan`] construction.
 #[derive(Debug)]
 pub enum CubatureBuildError {
-    /// `sigmas` shape disagrees with the matrix grid size.
+    /// Flat `sigmas` storage has the wrong total element count.
+    ///
+    /// `sigmas` is stored row-major as `sigmas[j * n_rows + ℓ] =
+    /// σ_j(E'_ℓ)`, so the expected total length is `k * n_rows`.
     SigmaGridMismatch {
-        /// Expected (matrix grid size).
+        /// Expected total element count (`k * n_rows`).
         expected: usize,
-        /// Actual (`sigmas.shape().1`).
+        /// Actual `sigmas.len()`.
         actual: usize,
     },
     /// Zero isotopes supplied — the cubature has no meaning for k = 0.
@@ -101,7 +104,7 @@ impl fmt::Display for CubatureBuildError {
         match self {
             Self::SigmaGridMismatch { expected, actual } => write!(
                 f,
-                "sigmas second axis ({actual}) must match matrix grid size ({expected})",
+                "sigmas flat length ({actual}) must equal k * n_rows ({expected})",
             ),
             Self::ZeroIsotopes => write!(f, "cubature requires at least one isotope"),
             Self::ZeroTrainingDensities => {
@@ -228,8 +231,12 @@ impl SparseEmpiricalCubaturePlan {
     /// ```
     ///
     /// where `w_exact_support = R[i, support] / Σ_q R[i, support[q]]`
-    /// is the uniform (non-sparse) weight distribution that serves as a
-    /// feasibility fallback.  The returned basic feasible solution has
+    /// is the **exact full-support row measure** (the existing
+    /// non-sparse weight distribution — NOT uniform; the entries
+    /// carry the kernel shape).  It serves as the feasibility
+    /// fallback for the LP: the identity `x = w_exact_support`
+    /// always satisfies the equality constraints, so a feasible
+    /// solution exists.  The returned basic feasible solution has
     /// at most `S + k + 1` nonzero entries (Carathéodory).
     pub fn build(
         matrix: &ResolutionMatrix,
@@ -473,10 +480,15 @@ impl SparseEmpiricalCubaturePlan {
             // Solve.  If `microlp` fails (it may on numerically
             // degenerate row supports — e.g., identical σ across the
             // row, which is physically rare but possible), fall back
-            // to the exact uniform distribution.  This preserves
-            // correctness at the cost of giving up compression on
-            // that row; an LpInfeasible error is never propagated to
-            // the caller.
+            // to the exact full-support row measure `w_exact`.  This
+            // preserves correctness at the cost of giving up
+            // compression on that row.  The `LpInfeasible` error
+            // variant (returned below) only fires if BOTH the LP
+            // solution AND the `w_exact` fallback produce an empty
+            // active set after the `WEIGHT_EPSILON` filter — which
+            // is physically impossible on a valid row-stochastic
+            // `ResolutionMatrix` row (`Σ w_exact = 1` implies at
+            // least one entry exceeds `1 / support_len > 1e-12`).
             let sparse_weights: Vec<f64> = match problem.solve() {
                 Ok(solution) => vars.iter().map(|&v| solution.var_value(v)).collect(),
                 Err(_) => w_exact.clone(),
