@@ -566,6 +566,18 @@ pub fn spatial_map_typed(
                 // Training box: 2 × the initial density — same convention
                 // the codex04 reference uses.  Anchor at the midpoint
                 // (0.5 × train_max).
+                //
+                // **Known limitation — deferred to PR #476**: this
+                // policy doesn't cross-check the solver's actual
+                // fit-bound constraints.  If `initial_densities`
+                // is near zero (or far from where the solver
+                // actually explores), the cubature is built for a
+                // box that may not contain the fit trajectory, and
+                // held-out forward accuracy degrades silently.
+                // PR #476 (trust-region wrapper) owns box
+                // invalidation / rebuild-on-escape and naturally
+                // replaces this static policy; see Claude round-1
+                // P2-b on PR #480.
                 let train_max: Vec<f64> = config
                     .initial_densities()
                     .iter()
