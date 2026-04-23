@@ -13,3 +13,5 @@ nereids-core = { workspace = true }
 nereids-endf = { workspace = true }
 num-complex = { workspace = true }
 rayon = { workspace = true }
+microlp = { workspace = true }
+

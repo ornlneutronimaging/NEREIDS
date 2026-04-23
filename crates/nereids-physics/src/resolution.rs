@@ -1369,14 +1369,15 @@ pub fn apply_r(matrix: &ResolutionMatrix, spectrum: &[f64]) -> Vec<f64> {
 /// but the grid contents differ (per-element `to_bits()` compare).
 ///
 /// Unlike [`apply_resolution_with_plan`], this entrypoint does not
-/// call [`validate_inputs`] to enforce an ascending `energies` grid.
-/// That check is redundant here: the plan that produced the matrix
-/// was itself built on a sorted grid (via [`TabulatedResolution::plan`]
-/// which runs [`validate_inputs`]), and the stored `target_energies`
-/// copy is used in the `to_bits()` grid-identity check above.  Any
-/// `energies` slice that is not bit-identical to the matrix's stored
-/// copy — including an unsorted permutation of the same values —
-/// fails with [`ResolutionError::MatrixGridMismatch`].
+/// enforce an ascending `energies` grid through the crate's internal
+/// `validate_inputs` helper.  That check is redundant here: the plan
+/// that produced the matrix was itself built on a sorted grid (via
+/// [`TabulatedResolution::plan`], which validates sortedness), and the
+/// stored `target_energies` copy is used in the `to_bits()`
+/// grid-identity check above.  Any `energies` slice that is not
+/// bit-identical to the matrix's stored copy — including an unsorted
+/// permutation of the same values — fails with
+/// [`ResolutionError::MatrixGridMismatch`].
 pub fn apply_resolution_with_matrix(
     energies: &[f64],
     matrix: &ResolutionMatrix,
@@ -2067,6 +2068,40 @@ impl fmt::Display for ResolutionParseError {
 }
 
 impl std::error::Error for ResolutionParseError {}
+
+/// Test-only helpers exposed to other `nereids-physics` test modules
+/// that need to synthesize a [`ResolutionPlan`] without going through
+/// the full `TabulatedResolution::plan` path.  Gated `#[cfg(test)]` so
+/// the raw constructor never ships in a release build.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::ResolutionPlan;
+
+    /// Build a [`ResolutionPlan`] directly from its SoA fields.
+    ///
+    /// The caller is responsible for maintaining the invariants that
+    /// `plan_presorted` normally enforces (`starts.last() ==
+    /// lo_idx.len()`, lo_idx in [0, n-2] for regular entries, etc.).
+    /// Used by surrogate-module tests to construct hand-designed
+    /// plans that exercise specific CSR patterns.
+    pub(crate) fn plan_from_raw_parts(
+        target_energies: Vec<f64>,
+        starts: Vec<u32>,
+        lo_idx: Vec<u32>,
+        frac: Vec<f64>,
+        weight: Vec<f64>,
+        norm: Vec<f64>,
+    ) -> ResolutionPlan {
+        ResolutionPlan {
+            target_energies,
+            starts,
+            lo_idx,
+            frac,
+            weight,
+            norm,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
