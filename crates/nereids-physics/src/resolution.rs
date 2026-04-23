@@ -97,7 +97,7 @@ impl fmt::Display for ResolutionError {
             Self::MatrixGridMismatch { first_diff_index } => write!(
                 f,
                 "resolution matrix was compiled for a different energy grid than was \
-                 passed to apply_r (first differing index: {})",
+                 passed to apply_resolution_with_matrix (first differing index: {})",
                 first_diff_index,
             ),
         }
