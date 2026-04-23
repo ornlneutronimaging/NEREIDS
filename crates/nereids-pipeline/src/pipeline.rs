@@ -603,6 +603,16 @@ impl UnifiedFitConfig {
 
     // ── Accessors ──
 
+    /// Caller-attached sparse empirical cubature plan, if any.
+    /// `spatial_map_typed` reads this so a pre-existing plan is
+    /// preserved instead of being clobbered by the local rebuild
+    /// pathway (Codex round-5 P3 on PR #480).
+    pub fn precomputed_sparse_cubature_plan(
+        &self,
+    ) -> Option<&Arc<nereids_physics::surrogate::SparseEmpiricalCubaturePlan>> {
+        self.precomputed_sparse_cubature_plan.as_ref()
+    }
+
     pub fn energies(&self) -> &[f64] {
         &self.energies
     }

@@ -333,6 +333,27 @@ impl FitModel for PrecomputedTransmissionModel {
                 // Map each free param to its column in the cubature
                 // Jacobian.  `None` for any free param that isn't a
                 // density param → fall through to the exact path.
+                //
+                // **Known caveat (Codex round-5 P2 on PR #480)**:
+                // if `free_param_indices` contains non-density
+                // slots, `col_map` is `None` and analytical_jacobian
+                // falls through to the exact derivatives — but
+                // `evaluate()` unconditionally dispatches the
+                // cubature forward when eligible.  That mix can
+                // feed LM a Jacobian for a slightly different
+                // function than the forward.  In the current
+                // layered architecture
+                // (`NormalizedTransmissionModel` /
+                // `TransmissionKLBackgroundModel` wrap the inner
+                // `PrecomputedTransmissionModel` before any
+                // non-density nuisance parameter reaches this
+                // layer), `free_param_indices` here is always the
+                // density slots, so the mismatch cannot arise via
+                // the standard pipeline.  A defence-in-depth fix
+                // (route evaluate() through a context that knows
+                // about free params) is deferred to the scalar /
+                // trust-region PRs (#475 / #476) that also revisit
+                // this dispatch surface.
                 let col_map: Option<Vec<usize>> = free_param_indices
                     .iter()
                     .map(|&fp| params_indices.iter().position(|&i| i == fp))

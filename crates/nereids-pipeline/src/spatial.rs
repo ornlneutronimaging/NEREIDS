@@ -524,6 +524,14 @@ pub fn spatial_map_typed(
     //   * k == 1 (scalar fast-path is PR #475's scope);
     //   * xs is not pre-collapsed to per-group σ (cubature needs the
     //     final σ stack, not per-isotope σ × ratios).
+    // Capture any caller-supplied cubature plan BEFORE the local
+    // rebuild pathway — the `with_precomputed_cross_sections` setter
+    // clears `precomputed_sparse_cubature_plan` as a defence against
+    // stale-XS dispatch (Codex round-3 P3 on PR #480), so without
+    // this snapshot a plan the caller attached via
+    // `UnifiedFitConfig::with_precomputed_sparse_cubature_plan` would
+    // be dropped and lost on every call.  Codex round-5 P3 on PR #480.
+    let caller_cubature = config.precomputed_sparse_cubature_plan().cloned();
     let sparse_cubature_plan: Option<Arc<nereids_physics::surrogate::SparseEmpiricalCubaturePlan>> =
         if !config.fit_temperature()
             && !config.fit_energy_scale()
@@ -628,6 +636,21 @@ pub fn spatial_map_typed(
         } else {
             None
         };
+
+    // Caller-fallback: if we didn't build a local plan (build
+    // failed, or conditions weren't met), but the caller supplied
+    // one that matches the current grid + k, reuse it.  This
+    // saves the LP build cost on repeat spatial_map calls that
+    // share the same `(grid, isotope_set, density_box)` and
+    // preserves explicit `with_precomputed_sparse_cubature_plan`
+    // attachments across the setter chain below.
+    let sparse_cubature_plan = sparse_cubature_plan.or_else(|| {
+        caller_cubature.filter(|p| {
+            p.len() == xs.first().map(|r| r.len()).unwrap_or(0)
+                && p.k() == xs.len()
+                && p.target_energies() == config.energies()
+        })
+    });
 
     // Precompute unbroadened (base) cross-sections for temperature fitting.
     // This avoids 74× overhead from redundant Reich-Moore evaluation per
