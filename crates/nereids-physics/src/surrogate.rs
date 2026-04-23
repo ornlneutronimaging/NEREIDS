@@ -148,12 +148,16 @@ impl std::error::Error for CubatureBuildError {}
 /// [`Self::forward`] and [`Self::jacobian`].
 #[derive(Debug, Clone)]
 pub struct SparseEmpiricalCubaturePlan {
-    /// Number of rows (= target grid size the matrix was compiled for).
-    n_rows: usize,
+    /// Target energy grid the plan was built for (owned copy, same
+    /// pattern as [`crate::resolution::ResolutionPlan`] /
+    /// [`crate::resolution::ResolutionMatrix`]).  Callers implementing
+    /// plan caches compare this against their current grid to decide
+    /// whether the plan is still valid.
+    target_energies: Vec<f64>,
     /// Number of isotopes (per-atom dimensionality).
     k: usize,
     /// `row_starts[i]..row_starts[i+1]` — CSR-style row offsets.
-    /// Length `n_rows + 1`.
+    /// Length `target_energies.len() + 1`.
     row_starts: Vec<u32>,
     /// Per-atom nonneg weights.  Within each row, `Σ_q weights[q] = 1`.
     weights: Vec<f64>,
@@ -163,6 +167,37 @@ pub struct SparseEmpiricalCubaturePlan {
 }
 
 impl SparseEmpiricalCubaturePlan {
+    /// Canonical default training-density rule from the codex04
+    /// round-2 reference: for an upper-bound density vector
+    /// `train_max ∈ ℝ^k`, return `S = 2 + k` training points
+    /// consisting of `0.25 * train_max`, `0.75 * train_max`, and the
+    /// k axis-aligned "unit" points `train_max[i] · e_i` (all other
+    /// components zero).  Exposed as a helper so callers — including
+    /// the wiring in PR #474b — don't have to hand-roll the rule.
+    ///
+    /// Duplicates are NOT removed.  In practice the rule produces
+    /// `S = k + 2` distinct points for any `k ≥ 1` with all
+    /// `train_max[i] > 0`.
+    pub fn default_training_points(train_max: &[f64]) -> Vec<Vec<f64>> {
+        let k = train_max.len();
+        let mut points: Vec<Vec<f64>> = Vec::with_capacity(k + 2);
+        points.push(train_max.iter().map(|&x| 0.25 * x).collect());
+        points.push(train_max.iter().map(|&x| 0.75 * x).collect());
+        for (i, &max_i) in train_max.iter().enumerate() {
+            let mut p = vec![0.0_f64; k];
+            p[i] = max_i;
+            points.push(p);
+        }
+        points
+    }
+
+    /// Canonical default Jacobian anchor from the codex04 round-2
+    /// reference: `0.5 * train_max`, the midpoint of the density
+    /// box.
+    pub fn default_jacobian_anchor(train_max: &[f64]) -> Vec<f64> {
+        train_max.iter().map(|&x| 0.5 * x).collect()
+    }
+
     /// Build a Tchakaloff sparse-cubature plan row-by-row from an exact
     /// [`ResolutionMatrix`] + isotope cross-section stack.
     ///
@@ -235,7 +270,7 @@ impl SparseEmpiricalCubaturePlan {
         // Empty matrix — return an empty plan.
         if n_rows == 0 {
             return Ok(Self {
-                n_rows: 0,
+                target_energies: matrix.target_energies().to_vec(),
                 k,
                 row_starts: vec![0],
                 weights: Vec::new(),
@@ -279,13 +314,26 @@ impl SparseEmpiricalCubaturePlan {
                 continue;
             }
 
-            // Row sum (≈ 1.0 for non-passthrough; 1.0 exactly for
-            // passthrough rows which the LP skip below still handles
-            // correctly).  Guard against numerical drift.
-            let row_sum: f64 = support_vals.iter().sum();
+            // Shortcut: if the row support has only 1 column, the
+            // cubature is that single atom with weight 1.  No LP and
+            // no feature matrix needed.  Must check BEFORE building
+            // w_exact / phi to avoid the work the shortcut then
+            // discards.
+            if support_len == 1 {
+                let col = support_cols[0] as usize;
+                weights.push(1.0);
+                atoms.extend((0..k).map(|j| sigmas[j * n_rows + col]));
+                row_starts.push(weights.len() as u32);
+                continue;
+            }
 
-            // Collect support-column σ vectors (k per column) + build
-            // normalized exact weights.
+            // Non-trivial row (support_len ≥ 2).  Build normalized
+            // exact-weight distribution + collect support-column σ
+            // vectors.  Row sum guard: the source matrix is
+            // row-stochastic (Σ = 1 to machine precision), so
+            // `row_sum > 0` always for non-zero support; divide
+            // safely.
+            let row_sum: f64 = support_vals.iter().sum();
             support_sigma.clear();
             support_sigma.reserve(k * support_len);
             w_exact.clear();
@@ -296,16 +344,6 @@ impl SparseEmpiricalCubaturePlan {
                     support_sigma.push(sigmas[j * n_rows + col]);
                 }
                 w_exact.push(support_vals[q] / row_sum);
-            }
-
-            // Shortcut: if the row support has only 1 column, the
-            // cubature is that single atom with weight 1.  No LP
-            // needed.
-            if support_len == 1 {
-                weights.push(1.0);
-                atoms.extend_from_slice(&support_sigma[..k]);
-                row_starts.push(weights.len() as u32);
-                continue;
             }
 
             // Build per-row feature matrix phi (row-major over feature
@@ -321,15 +359,25 @@ impl SparseEmpiricalCubaturePlan {
                     phi_fwd.push((-dot).exp());
                 }
             }
+            // Jacobian features `phi_grad[ℓ, q] = σ_{ℓ,q} · exp(-n* ·
+            // σ_q)`.  The `exp(-n* · σ_q)` factor depends only on `q`,
+            // not `ℓ`, so hoist it into a row-local `grad_base[q]`
+            // buffer to avoid recomputing |support| × k exponentials
+            // (matches the codex04 Python reference's `phi_grad_base`
+            // layout).
             phi_grad.clear();
             phi_grad.reserve(k * support_len);
+            let mut grad_base: Vec<f64> = Vec::with_capacity(support_len);
+            for q in 0..support_len {
+                let mut dot = 0.0_f64;
+                for j in 0..k {
+                    dot += jacobian_anchor[j] * support_sigma[q * k + j];
+                }
+                grad_base.push((-dot).exp());
+            }
             for ell in 0..k {
                 for q in 0..support_len {
-                    let mut dot = 0.0_f64;
-                    for j in 0..k {
-                        dot += jacobian_anchor[j] * support_sigma[q * k + j];
-                    }
-                    phi_grad.push(support_sigma[q * k + ell] * (-dot).exp());
+                    phi_grad.push(support_sigma[q * k + ell] * grad_base[q]);
                 }
             }
 
@@ -435,7 +483,7 @@ impl SparseEmpiricalCubaturePlan {
         }
 
         Ok(Self {
-            n_rows,
+            target_energies: matrix.target_energies().to_vec(),
             k,
             row_starts,
             weights,
@@ -445,12 +493,12 @@ impl SparseEmpiricalCubaturePlan {
 
     /// Number of rows (target-grid size) covered by this plan.
     pub fn len(&self) -> usize {
-        self.n_rows
+        self.target_energies.len()
     }
 
     /// True when the plan covers no target energies.
     pub fn is_empty(&self) -> bool {
-        self.n_rows == 0
+        self.target_energies.is_empty()
     }
 
     /// Number of isotopes (per-atom dimensionality).
@@ -461,6 +509,16 @@ impl SparseEmpiricalCubaturePlan {
     /// Total number of stored atoms across all rows.
     pub fn n_atoms(&self) -> usize {
         self.weights.len()
+    }
+
+    /// Target energy grid the plan was built for.
+    ///
+    /// Mirrors [`crate::resolution::ResolutionPlan::target_energies`]
+    /// / [`crate::resolution::ResolutionMatrix::target_energies`] —
+    /// callers implementing plan caches compare this against their
+    /// current grid to decide whether the plan is still valid.
+    pub fn target_energies(&self) -> &[f64] {
+        &self.target_energies
     }
 
     /// CSR row-start offsets.  `row_starts()[i]..row_starts()[i+1]`
@@ -494,7 +552,7 @@ impl SparseEmpiricalCubaturePlan {
             n.len(),
             self.k,
         );
-        let mut out = vec![0.0_f64; self.n_rows];
+        let mut out = vec![0.0_f64; self.target_energies.len()];
         for (i, out_i) in out.iter_mut().enumerate() {
             let s = self.row_starts[i] as usize;
             let e = self.row_starts[i + 1] as usize;
@@ -529,9 +587,9 @@ impl SparseEmpiricalCubaturePlan {
             n.len(),
             self.k,
         );
-        let mut forward = vec![0.0_f64; self.n_rows];
-        let mut jac = vec![0.0_f64; self.n_rows * self.k];
-        for i in 0..self.n_rows {
+        let mut forward = vec![0.0_f64; self.target_energies.len()];
+        let mut jac = vec![0.0_f64; self.target_energies.len() * self.k];
+        for i in 0..self.target_energies.len() {
             let s = self.row_starts[i] as usize;
             let e = self.row_starts[i + 1] as usize;
             let mut t_i = 0.0_f64;
@@ -733,6 +791,86 @@ mod tests {
         assert_eq!(cub.len(), 0);
         assert!(cub.is_empty());
         assert_eq!(cub.n_atoms(), 0);
+        assert!(cub.target_energies().is_empty());
+    }
+
+    #[test]
+    fn cubature_target_energies_mirror_matrix_grid() {
+        let (energies, sigmas, matrix) = synthetic_setup(20, 3, 2);
+        let train_max = [1e-4_f64, 1e-4];
+        let training = SparseEmpiricalCubaturePlan::default_training_points(&train_max);
+        let anchor = SparseEmpiricalCubaturePlan::default_jacobian_anchor(&train_max);
+        let cub = SparseEmpiricalCubaturePlan::build(&matrix, &sigmas, 2, &training, &anchor)
+            .expect("build");
+        // target_energies must byte-match the matrix's stored grid so
+        // callers can use it as a cache key (same pattern as
+        // ResolutionPlan / ResolutionMatrix).
+        assert_eq!(cub.target_energies(), matrix.target_energies());
+        assert_eq!(cub.target_energies(), energies.as_slice());
+    }
+
+    #[test]
+    fn cubature_default_training_points_shape() {
+        let train_max = [1e-4_f64, 2e-4, 5e-5];
+        let pts = SparseEmpiricalCubaturePlan::default_training_points(&train_max);
+        // S = k + 2 = 5 points for k = 3.
+        assert_eq!(pts.len(), 5);
+        for p in &pts {
+            assert_eq!(p.len(), 3);
+        }
+        // First two points are quarter / three-quarter of train_max.
+        for (i, &m) in train_max.iter().enumerate() {
+            assert!((pts[0][i] - 0.25 * m).abs() < 1e-15);
+            assert!((pts[1][i] - 0.75 * m).abs() < 1e-15);
+        }
+        // Remaining k points are axis-aligned.
+        for (i, &max_i) in train_max.iter().enumerate() {
+            for (j, &value) in pts[2 + i].iter().enumerate() {
+                let expected = if i == j { max_i } else { 0.0 };
+                assert!((value - expected).abs() < 1e-15);
+            }
+        }
+        // Anchor is the midpoint.
+        let anchor = SparseEmpiricalCubaturePlan::default_jacobian_anchor(&train_max);
+        for (i, &m) in train_max.iter().enumerate() {
+            assert!((anchor[i] - 0.5 * m).abs() < 1e-15);
+        }
+    }
+
+    #[test]
+    fn cubature_build_error_display() {
+        // Cover each error variant's Display message so a future
+        // refactor that breaks the formatting fails loudly.
+        let e = CubatureBuildError::ZeroIsotopes;
+        assert!(format!("{e}").contains("at least one isotope"));
+
+        let e = CubatureBuildError::ZeroTrainingDensities;
+        assert!(format!("{e}").contains("at least one training density"));
+
+        let e = CubatureBuildError::SigmaGridMismatch {
+            expected: 100,
+            actual: 50,
+        };
+        let s = format!("{e}");
+        assert!(s.contains("sigmas") && s.contains("100") && s.contains("50"));
+
+        let e = CubatureBuildError::TrainingDensityLength {
+            expected: 3,
+            actual: 2,
+            index: 7,
+        };
+        let s = format!("{e}");
+        assert!(s.contains("training_densities[7]") && s.contains("length 2"));
+
+        let e = CubatureBuildError::AnchorLength {
+            expected: 3,
+            actual: 5,
+        };
+        let s = format!("{e}");
+        assert!(s.contains("jacobian_anchor") && s.contains("length 5"));
+
+        let e = CubatureBuildError::LpInfeasible { row: 42 };
+        assert!(format!("{e}").contains("row 42"));
     }
 
     /// Forward equivalence at the training densities: the cubature's
