@@ -745,6 +745,25 @@ pub enum ScalarSurrogateBuildError {
         /// Requested node count.
         m: usize,
     },
+    /// The Chebyshev interpolant cannot reach target accuracy on the
+    /// requested `[0, n_max]` box with `M` nodes — the box is too
+    /// wide for the σ profile.  Chebyshev converges exponentially in
+    /// `M` for smooth `T(n) = exp(-n σ)`, but if `max(n_max · σ)` is
+    /// large the interpolant loses precision.  Callers should either
+    /// shrink `n_max` (preferred — tighter fit-exploration bounds
+    /// fix this) or increase `M`.  Codex PR #475 round-2 P2.
+    InsufficientAccuracyOnBox {
+        /// Requested density box upper bound.
+        n_max: f64,
+        /// Chebyshev node count that failed.
+        m: usize,
+        /// Measured maximum relative error of the interpolant
+        /// against the exact `apply_r ∘ exp(-n σ)` on the box
+        /// (evaluated at midpoints between Chebyshev nodes).
+        max_rel_err: f64,
+        /// Required tolerance (currently `1e-6`).
+        tolerance: f64,
+    },
 }
 
 impl fmt::Display for ScalarSurrogateBuildError {
@@ -757,6 +776,17 @@ impl fmt::Display for ScalarSurrogateBuildError {
             Self::InvalidChebyshevBox { n_max, m } => write!(
                 f,
                 "Chebyshev plan requires n_max > 0 and M ≥ 2, got n_max = {n_max}, M = {m}",
+            ),
+            Self::InsufficientAccuracyOnBox {
+                n_max,
+                m,
+                max_rel_err,
+                tolerance,
+            } => write!(
+                f,
+                "Chebyshev plan ({m} nodes) on box [0, {n_max}] hit max rel err \
+                 {max_rel_err:.3e} > tolerance {tolerance:.0e}; either shrink n_max \
+                 (solver exploration range) or increase M",
             ),
         }
     }
@@ -859,13 +889,54 @@ impl ScalarChebyshevPlan {
             }
         }
 
-        Ok(Self {
+        // Build-time accuracy self-check — Codex PR #475 round-2 P2.
+        //
+        // Chebyshev interpolants are exact at their nodes by
+        // construction; the test points that reveal how wide the
+        // box can safely be are the **midpoints** between
+        // Chebyshev nodes (where the standard Chebyshev error
+        // bound attains its supremum on the box).  We evaluate
+        // the just-built interpolant at those midpoints, compare
+        // to the exact `apply_r ∘ exp(-n σ)`, and refuse to
+        // return a plan that blows the accuracy budget.
+        //
+        // The threshold (`1e-6` max rel err) matches the "close
+        // to exact" bar in the scalar-surrogate docstrings.  For
+        // typical VENUS fits (τ_peak ≲ 1, box = 2 × initial
+        // density) the interpolant achieves ≤ 1e-15 — this
+        // guard fires only when a caller passes a pathologically
+        // wide box.
+        let plan = Self {
             target_energies: matrix.target_energies().to_vec(),
             n_max,
             m,
             coeffs,
             density_box: Some(n_max),
-        })
+        };
+        const TOLERANCE: f64 = 1e-6;
+        let mut max_rel_err = 0.0_f64;
+        for j in 0..m.saturating_sub(1) {
+            // Midpoint between Chebyshev node j and j+1, in density space.
+            let n_mid = 0.5 * (nodes_n[j] + nodes_n[j + 1]);
+            let t_interp = plan.forward_scalar(n_mid);
+            let t_un: Vec<f64> = (0..n_rows).map(|i| (-n_mid * sigma[i]).exp()).collect();
+            let t_exact = crate::resolution::apply_r(matrix, &t_un);
+            for (a, b) in t_interp.iter().zip(t_exact.iter()) {
+                let abs = (a - b).abs();
+                let rel = abs / a.abs().max(b.abs()).max(1e-15);
+                max_rel_err = max_rel_err.max(abs.min(rel));
+            }
+        }
+        if !max_rel_err.is_finite() || max_rel_err > TOLERANCE {
+            return Err(ScalarSurrogateBuildError::InsufficientAccuracyOnBox {
+                n_max,
+                m,
+                max_rel_err,
+                tolerance: TOLERANCE,
+            });
+        }
+
+        Ok(plan)
     }
 
     pub fn len(&self) -> usize {
@@ -1711,6 +1782,40 @@ mod tests {
             err,
             ScalarSurrogateBuildError::InvalidChebyshevBox { .. }
         ));
+    }
+
+    #[test]
+    fn scalar_chebyshev_rejects_overwide_box() {
+        // Codex PR #475 round-2 P2: build-time self-check refuses
+        // boxes where 16-node Chebyshev can't resolve the
+        // exp(-n · σ) surface.  A pathologically wide box on the
+        // synthetic σ used by scalar_setup exceeds the 1e-6
+        // tolerance and must be rejected.
+        let (sigma, matrix) = scalar_setup(40, 4);
+        // The scalar_setup σ has max ≈ 105 on a Gaussian peak.
+        // At n_max = 2.0, τ_peak ≈ 210 → exp(-210) underflows and
+        // the Chebyshev polynomial can't possibly track it with
+        // M = 16 nodes.  Must reject at build time rather than
+        // quietly return a plan that produces huge forward errors
+        // on dispatch.
+        let err = ScalarChebyshevPlan::build(&matrix, &sigma, 2.0, 16)
+            .expect_err("overwide box must reject");
+        match err {
+            ScalarSurrogateBuildError::InsufficientAccuracyOnBox {
+                n_max,
+                m,
+                max_rel_err,
+                tolerance,
+            } => {
+                assert_eq!(n_max, 2.0);
+                assert_eq!(m, 16);
+                assert!(
+                    max_rel_err > tolerance,
+                    "expected max_rel_err {max_rel_err:.3e} > tolerance {tolerance:.0e}",
+                );
+            }
+            other => panic!("expected InsufficientAccuracyOnBox, got {other:?}"),
+        }
     }
 
     #[test]

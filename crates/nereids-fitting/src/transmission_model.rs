@@ -211,7 +211,27 @@ fn scalar_eligible(
 }
 
 /// Check whether the scalar iterate `n` is inside the surrogate's
-/// recorded training box `[0, train_max]` with 50 % tolerance.
+/// recorded training box `[0, train_max]` — **strict** `n ≤ train_max`,
+/// unlike the cubature's 1.5× tolerance.
+///
+/// Chebyshev-in-density is a polynomial interpolant.  Inside
+/// `[0, n_max]` it is exact at the M = 16 nodes and tight (≤ 1e-15
+/// rel err) between them; outside, the interpolant diverges
+/// exponentially in `(n - n_max) / n_max`.  Codex PR #475 round 2
+/// measured **73 % relative error at `1.5 × n_max`** and catastrophic
+/// divergence beyond — exactly the "silently wrong forward"
+/// failure mode that would corrupt a fit without the solver
+/// ever seeing an error flag.
+///
+/// The cubature's 1.5× tolerance is safe because LP-matched atoms
+/// moment-match the σ-pushforward measure and generalize gracefully
+/// past the box; Chebyshev polynomials do not.  So the scalar
+/// box is a **hard boundary**: the solver must either stay inside
+/// or trigger the exact-path fallback.  Because the spatial build
+/// site sets `n_max = 2 × initial_density`, the initial iterate
+/// sits at 50 % of the box — with plenty of room for solver
+/// exploration up to 2× the initial density before the guard
+/// fires.
 fn scalar_density_within_box(plan: &ScalarSurrogatePlan, n: f64) -> bool {
     let Some(train_max) = plan.density_box() else {
         return true;
@@ -219,8 +239,7 @@ fn scalar_density_within_box(plan: &ScalarSurrogatePlan, n: f64) -> bool {
     if !n.is_finite() || n < 0.0 {
         return false;
     }
-    const TOLERANCE: f64 = 1.5;
-    n <= train_max * TOLERANCE
+    n <= train_max
 }
 
 /// Check whether the current density iterate `n` is inside the
@@ -3191,9 +3210,11 @@ mod tests {
 
     #[test]
     fn fit_model_scalar_falls_back_when_density_escapes_box() {
-        // scalar.density_box() auto-set to n_max during build.  A
-        // density at 2× n_max is > 1.5× tolerance → guard fires →
-        // fall back to exact path byte-identically.
+        // scalar.density_box() auto-set to n_max during build.
+        // Chebyshev can't safely extrapolate (Codex PR #475 round-2
+        // P1); the guard is strict `n ≤ n_max`.  A density at
+        // 2× n_max is well outside → fall back to exact path
+        // byte-identically.
         let n_grid = 40_usize;
         let (energies, plan, matrix) = synthetic_resolution_setup(n_grid, 4);
         let sigmas = synthetic_sigmas(n_grid, 1);
@@ -3206,7 +3227,7 @@ mod tests {
         let model_without =
             make_trivial_fit_model(energies, 1).with_resolution_plan(Some(Arc::clone(&plan)));
 
-        // Escape: 2× the training n_max → beyond the 1.5× tolerance.
+        // Escape: 2× the training n_max → past the strict box.
         let n_escape = [2.0 * n_max];
         let t_with = model_with.evaluate(&n_escape).unwrap();
         let t_without = model_without.evaluate(&n_escape).unwrap();
@@ -3253,8 +3274,11 @@ mod tests {
     #[test]
     fn scalar_density_within_box_direct_guard() {
         // Unit-test the scalar_density_within_box helper directly
-        // without going through the model dispatch.  Verifies the
-        // 1.5× tolerance exactly matches the cubature's convention.
+        // without going through the model dispatch.  Chebyshev is a
+        // polynomial interpolant that diverges exponentially outside
+        // `[0, n_max]` — Codex PR #475 round 2 measured 73 % rel err
+        // at `1.5 × n_max`.  The guard is therefore **strict**
+        // `n ≤ train_max`, not the cubature's 1.5× tolerance.
         let n_grid = 16_usize;
         let (_energies, _plan, matrix) = synthetic_resolution_setup(n_grid, 2);
         let sigmas = synthetic_sigmas(n_grid, 1);
@@ -3263,15 +3287,18 @@ mod tests {
             nereids_physics::surrogate::ScalarChebyshevPlan::build(&matrix, &sigmas[0], n_max, 16)
                 .expect("build");
 
-        // Inside the box.
+        // Inside the box: accepted.
         assert!(scalar_density_within_box(&plan, 0.0));
         assert!(scalar_density_within_box(&plan, 0.5 * n_max));
         assert!(scalar_density_within_box(&plan, n_max));
-        // Inside the 1.5× tolerance.
-        assert!(scalar_density_within_box(&plan, 1.49 * n_max));
-        assert!(scalar_density_within_box(&plan, 1.5 * n_max));
-        // Beyond the tolerance.
-        assert!(!scalar_density_within_box(&plan, 1.5001 * n_max));
+        // Any positive excursion past the box is rejected (Codex
+        // round-2 P1 fix on PR #475 — no more 1.5× tolerance).
+        assert!(!scalar_density_within_box(
+            &plan,
+            n_max * (1.0 + f64::EPSILON)
+        ));
+        assert!(!scalar_density_within_box(&plan, 1.01 * n_max));
+        assert!(!scalar_density_within_box(&plan, 1.5 * n_max));
         assert!(!scalar_density_within_box(&plan, 2.0 * n_max));
         // Non-finite and negative must be rejected.
         assert!(!scalar_density_within_box(&plan, f64::NAN));

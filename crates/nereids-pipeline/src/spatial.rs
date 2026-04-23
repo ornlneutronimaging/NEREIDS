@@ -678,17 +678,26 @@ pub fn spatial_map_typed(
             // Chebyshev-in-density at M = 16 (PR #475 bench-off
             // winner).  Training box: 2 × the initial density;
             // Chebyshev's interpolant is exact at its nodes and
-            // tight (≤ 1e-15 rel err) across the box.
+            // tight (≤ 1e-15 rel err) across a well-chosen box.
+            //
+            // If `n_max` is too wide for 16 nodes to resolve
+            // `exp(-n · σ)` accurately (e.g. caller passes a
+            // giant `initial_density` on a strong-peak σ), the
+            // build's midpoint self-check fires and returns
+            // `InsufficientAccuracyOnBox`; we log and fall back
+            // to the exact path rather than install a plan that
+            // could corrupt the fit.  Codex PR #475 round-2 P2.
             //
             // **Known limitation — deferred to PR #476** (mirrors
             // the cubature policy, see lines 578-588): if
             // `initial_densities[0]` is near zero the floor clamps
             // `n_max` to 2e-6, but the solver may explore well
             // past that.  The `scalar_density_within_box` guard in
-            // `transmission_model.rs` catches this and falls back
-            // to the exact `ResolutionPlan` path, so the worst
-            // outcome is lost speedup — never silent accuracy
-            // loss.  PR #476 (trust-region wrapper) owns
+            // `transmission_model.rs` catches this (strict
+            // `n ≤ n_max` post-round-2 P1) and falls back to the
+            // exact `ResolutionPlan` path, so the worst outcome
+            // is lost speedup — never silent accuracy loss.
+            // PR #476 (trust-region wrapper) owns
             // box-rebuild-on-escape and replaces this static
             // policy.  Claude round-1 P2-#5 on PR #475.
             const CHEBYSHEV_NODES: usize = 16;
