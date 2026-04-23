@@ -30,5 +30,6 @@ pub mod reich_moore;
 pub mod resolution;
 pub mod rmatrix_limited;
 pub mod slbw;
+pub mod surrogate;
 pub mod transmission;
 pub mod urr;
