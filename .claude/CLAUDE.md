@@ -134,3 +134,41 @@ when working single-threaded on one feature branch.
 - `../SAMMY`    — physics reference (resonance formalism, SAMMY source)
 - `../PLEIADES` — ORNL data normalisation helpers, ENDF retrieval
 - `../trinidi`  — sparsity-handling reference (Purdue/LANL, mostly abandoned)
+
+## Documentation hygiene — no investigation / audit / debugging memos in `docs/`
+
+`docs/` is **user-facing**. Only these subtrees belong there:
+
+| Subtree | What belongs |
+|---------|--------------|
+| `docs/adr/`        | Architectural decision records — one per non-trivial, durable design choice |
+| `docs/guide/`      | User-facing how-to guides |
+| `docs/references/` | External-facing reference material (file formats, CLI, API) |
+
+**Anything else does not belong in `docs/`.** In particular:
+
+- **Audit memos** (impact analysis of a bug fix, which research scripts
+  were affected, etc.) — belong in the PR body. When the PR merges,
+  the memo is preserved in the commit + PR history where it is actually
+  searchable. Do not create `docs/audit/` or similar.
+- **Investigation / ablation / debugging notes** (step-by-step inquiry
+  into a performance question, correctness hypothesis, etc.) — belong in
+  `.research/` (gitignored; session-private) or in the PR body if the
+  investigation directly motivates a concrete code change.
+- **Design specs / requirements drafts** — belong inline with the code
+  they specify (rustdoc on the struct / module they describe) or in
+  `docs/adr/` if treated as a durable decision.  Not as a floating
+  `docs/<feature>-requirements.md`.
+
+If I feel compelled to commit a memo under `docs/`, I stop and check:
+(a) is this user-facing reference that someone reading the project
+cold will want to read?  If yes, it fits one of the subtrees above.
+If no, it belongs in `.research/` or the PR body.  **When in doubt,
+ask the user before creating the file** — do not invent a new
+`docs/<whatever>/` directory to make the artifact commit-able.
+
+This rule exists because past agent work (PR #466's `docs/audit/`,
+this very kind of investigation) has repeatedly put transient memos
+under `docs/` on the theory that "it's documentation, it belongs in
+docs" — that's the wrong mental model.  User-facing documentation is
+a narrower category than "anything that is prose + markdown."

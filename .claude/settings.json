@@ -64,6 +64,22 @@
       "Bash(git reset:*)",
       "Bash(ps -p 39340 -o pid,time)",
       "Bash(while kill:*)"
+    ],
+    "deny": [
+      "Bash(git add -A*)",
+      "Bash(git add --all*)",
+      "Bash(git add .)",
+      "Bash(git add . *)",
+      "Bash(git add -u*)",
+      "Bash(git add --update*)",
+      "Bash(git commit -a*)",
+      "Bash(git commit --all*)",
+      "Bash(git commit -Sa*)",
+      "Bash(git commit -aS*)",
+      "Bash(git stash push -u*)",
+      "Bash(git stash push --include-untracked*)",
+      "Bash(git stash -u*)",
+      "Bash(git stash --include-untracked*)"
     ]
   }
 }

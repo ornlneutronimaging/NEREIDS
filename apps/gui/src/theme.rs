@@ -2,7 +2,7 @@
 
 use egui::Color32;
 
-/// Dark mode palette (from gui-requirements.md §17).
+/// Dark mode palette.
 pub mod dark {
     use egui::Color32;
     pub const BG: Color32 = Color32::from_rgb(0x1c, 0x1c, 0x1e);
