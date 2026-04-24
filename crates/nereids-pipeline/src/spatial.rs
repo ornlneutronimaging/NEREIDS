@@ -667,13 +667,11 @@ pub fn spatial_map_typed(
     // (= `ScalarChebyshevPlan`).
     let caller_scalar = config.precomputed_sparse_scalar_plan().cloned();
     let sparse_scalar_plan: Option<Arc<nereids_physics::surrogate::ScalarSurrogatePlan>> =
-        if !config.fit_temperature()
+        if let Some(plan) = resolution_plan.as_ref()
+            && !config.fit_temperature()
             && !config.fit_energy_scale()
-            && resolution_plan.is_some()
             && xs.len() == 1
         {
-            let plan = resolution_plan.as_deref().expect("guarded above");
-            let matrix = plan.compile_to_matrix();
             let sigma_row = &xs[0];
             // Chebyshev-in-density at M = 16 (PR #475 bench-off
             // winner).  Training box: 2 × the initial density;
@@ -703,7 +701,7 @@ pub fn spatial_map_typed(
             const CHEBYSHEV_NODES: usize = 16;
             let n_max: f64 = 2.0 * config.initial_densities()[0].max(1e-6);
             match nereids_physics::surrogate::ScalarChebyshevPlan::build(
-                &matrix,
+                Arc::clone(plan),
                 sigma_row,
                 n_max,
                 CHEBYSHEV_NODES,

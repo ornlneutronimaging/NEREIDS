@@ -819,25 +819,60 @@ pub struct ScalarChebyshevPlan {
     /// Optional training-density upper bound (defaults to `n_max`
     /// if the builder doesn't override).
     density_box: Option<f64>,
+    /// Shared reference to the [`crate::resolution::ResolutionPlan`]
+    /// the plan was built from.  Dispatch uses `Arc::ptr_eq` between
+    /// this and the model's currently attached resolution plan as
+    /// an O(1) identity check to refuse stale plans on the same
+    /// energy grid.  Independent review on PR #475.
+    source_resolution_plan: std::sync::Arc<crate::resolution::ResolutionPlan>,
+    /// FNV-1a-64 fingerprint of the σ slice (`to_bits()` per
+    /// element) the plan was built from.  Dispatch recomputes
+    /// from the model's current σ and compares — catches stale
+    /// plans where the grid is unchanged but σ differs.
+    sigma_fingerprint: u64,
+}
+
+/// FNV-1a-64 hash of an `f64` slice by bit pattern — used for
+/// scalar-surrogate dispatch's σ-identity check.
+pub fn fingerprint_f64_slice(xs: &[f64]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut h = FNV_OFFSET;
+    for &v in xs {
+        h ^= v.to_bits();
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h
 }
 
 impl ScalarChebyshevPlan {
-    /// Build an `M`-node Chebyshev-in-density plan from a
-    /// [`ResolutionMatrix`] + scalar σ + density box `[0, n_max]`.
-    /// Internally calls [`crate::resolution::apply_r`] `M` times
-    /// (one per Chebyshev node) to get exact row evaluations, then
-    /// runs a per-row discrete cosine transform to extract
-    /// Chebyshev coefficients.
+    /// Build an `M`-node Chebyshev-in-density plan from a shared
+    /// [`crate::resolution::ResolutionPlan`] + scalar σ + density
+    /// box `[0, n_max]`.
     ///
-    /// Cost: `M × N × avg_nnz_per_row` FMAs for the exact sampling
-    /// pass, plus `M^2` per row for the DCT (matrix-vector form,
-    /// simpler than FFT for small M).
+    /// The `source_resolution_plan` `Arc` is **stored on the plan**
+    /// so the dispatch-time eligibility check can use
+    /// `Arc::ptr_eq` to refuse stale plans on the same grid
+    /// (independent review on PR #475).  A matching σ fingerprint
+    /// is also computed and stored for the same reason: same-grid
+    /// σ-mismatch would otherwise trigger silently-wrong
+    /// transmissions.
+    ///
+    /// Internally calls `source_resolution_plan.compile_to_matrix()`
+    /// once, then `crate::resolution::apply_r` `M` times (one per
+    /// Chebyshev node) to get exact row evaluations, then runs a
+    /// per-row discrete cosine transform to extract Chebyshev
+    /// coefficients.
+    ///
+    /// Cost: one matrix compile + `M × N × avg_nnz_per_row` FMAs
+    /// for the exact sampling pass, plus `M^2` per row for the DCT.
     pub fn build(
-        matrix: &ResolutionMatrix,
+        source_resolution_plan: std::sync::Arc<crate::resolution::ResolutionPlan>,
         sigma: &[f64],
         n_max: f64,
         m: usize,
     ) -> Result<Self, ScalarSurrogateBuildError> {
+        let matrix = source_resolution_plan.compile_to_matrix();
         let n_rows = matrix.len();
         if sigma.len() != n_rows {
             return Err(ScalarSurrogateBuildError::SigmaGridMismatch {
@@ -866,7 +901,7 @@ impl ScalarChebyshevPlan {
         let mut samples = vec![0.0_f64; m * n_rows];
         for (j, &nj) in nodes_n.iter().enumerate() {
             let t_un: Vec<f64> = (0..n_rows).map(|i| (-nj * sigma[i]).exp()).collect();
-            let t_res = crate::resolution::apply_r(matrix, &t_un);
+            let t_res = crate::resolution::apply_r(&matrix, &t_un);
             for (i, &v) in t_res.iter().enumerate() {
                 samples[j * n_rows + i] = v;
             }
@@ -906,12 +941,15 @@ impl ScalarChebyshevPlan {
         // density) the interpolant achieves ≤ 1e-15 — this
         // guard fires only when a caller passes a pathologically
         // wide box.
+        let sigma_fingerprint = fingerprint_f64_slice(sigma);
         let plan = Self {
             target_energies: matrix.target_energies().to_vec(),
             n_max,
             m,
             coeffs,
             density_box: Some(n_max),
+            source_resolution_plan: std::sync::Arc::clone(&source_resolution_plan),
+            sigma_fingerprint,
         };
         const TOLERANCE: f64 = 1e-6;
         let mut max_rel_err = 0.0_f64;
@@ -920,11 +958,18 @@ impl ScalarChebyshevPlan {
             let n_mid = 0.5 * (nodes_n[j] + nodes_n[j + 1]);
             let t_interp = plan.forward_scalar(n_mid);
             let t_un: Vec<f64> = (0..n_rows).map(|i| (-n_mid * sigma[i]).exp()).collect();
-            let t_exact = crate::resolution::apply_r(matrix, &t_un);
+            let t_exact = crate::resolution::apply_r(&matrix, &t_un);
+            // Plain relative error with a 1e-15 denominator floor
+            // (matches `max_hybrid_err` conventions elsewhere in
+            // the crate).  Copilot PR #475 round-3 P2: the previous
+            // `abs.min(rel)` could dramatically under-report when
+            // `|a|, |b|` are both small, hiding catastrophic
+            // divergence where the interpolant drifts to O(1)
+            // while the exact value tends to 0.
             for (a, b) in t_interp.iter().zip(t_exact.iter()) {
                 let abs = (a - b).abs();
                 let rel = abs / a.abs().max(b.abs()).max(1e-15);
-                max_rel_err = max_rel_err.max(abs.min(rel));
+                max_rel_err = max_rel_err.max(rel);
             }
         }
         if !max_rel_err.is_finite() || max_rel_err > TOLERANCE {
@@ -956,6 +1001,20 @@ impl ScalarChebyshevPlan {
     }
     pub fn density_box(&self) -> Option<f64> {
         self.density_box
+    }
+    /// Accessor for the shared
+    /// [`crate::resolution::ResolutionPlan`] the plan was built from.
+    /// Dispatch uses `Arc::ptr_eq` between this and the model's
+    /// currently attached `resolution_plan` as the O(1) identity
+    /// check that refuses stale plans on the same grid.
+    pub fn source_resolution_plan(&self) -> &std::sync::Arc<crate::resolution::ResolutionPlan> {
+        &self.source_resolution_plan
+    }
+    /// FNV-1a-64 fingerprint of the σ slice (by `to_bits()`) the
+    /// plan was built from.  Dispatch recomputes from the model's
+    /// current σ and compares to catch same-grid σ-mismatch.
+    pub fn sigma_fingerprint(&self) -> u64 {
+        self.sigma_fingerprint
     }
 
     /// Evaluate the Chebyshev interpolant at density `n`.  Density
@@ -1082,7 +1141,12 @@ mod tests {
         n_grid: usize,
         half_kernel: usize,
         k: usize,
-    ) -> (Vec<f64>, Vec<f64>, crate::resolution::ResolutionMatrix) {
+    ) -> (
+        Vec<f64>,
+        Vec<f64>,
+        crate::resolution::ResolutionMatrix,
+        std::sync::Arc<crate::resolution::ResolutionPlan>,
+    ) {
         assert!(n_grid > 2 * half_kernel);
         let energies: Vec<f64> = (0..n_grid).map(|i| 10.0 + i as f64).collect();
         // Build a ResolutionMatrix from a hand-constructed plan with
@@ -1150,7 +1214,8 @@ mod tests {
                 sigmas[j * n_grid + ell] = 100.0 * g + 5.0;
             }
         }
-        (energies, sigmas, matrix)
+        let plan_arc = std::sync::Arc::new(plan);
+        (energies, sigmas, matrix, plan_arc)
     }
 
     /// Helper that exposes a way to build a `ResolutionPlan` from raw
@@ -1207,7 +1272,7 @@ mod tests {
 
     #[test]
     fn cubature_rejects_zero_isotopes() {
-        let (_e, _s, matrix) = synthetic_setup(20, 3, 2);
+        let (_e, _s, matrix, _plan) = synthetic_setup(20, 3, 2);
         let err = SparseEmpiricalCubaturePlan::build(&matrix, &[], 0, &[vec![0.0]], &[0.0])
             .expect_err("k = 0 must reject");
         assert!(matches!(err, CubatureBuildError::ZeroIsotopes));
@@ -1215,7 +1280,7 @@ mod tests {
 
     #[test]
     fn cubature_rejects_mismatched_sigmas() {
-        let (_e, _s, matrix) = synthetic_setup(20, 3, 2);
+        let (_e, _s, matrix, _plan) = synthetic_setup(20, 3, 2);
         let err = SparseEmpiricalCubaturePlan::build(
             &matrix,
             &[0.0; 7], // wrong length
@@ -1251,7 +1316,7 @@ mod tests {
 
     #[test]
     fn cubature_target_energies_mirror_matrix_grid() {
-        let (energies, sigmas, matrix) = synthetic_setup(20, 3, 2);
+        let (energies, sigmas, matrix, _plan) = synthetic_setup(20, 3, 2);
         let train_max = [1e-4_f64, 1e-4];
         let training = SparseEmpiricalCubaturePlan::default_training_points(&train_max);
         let anchor = SparseEmpiricalCubaturePlan::default_jacobian_anchor(&train_max);
@@ -1412,7 +1477,7 @@ mod tests {
     /// `n^(s)` — row by row.
     #[test]
     fn cubature_forward_matches_exact_at_training_densities() {
-        let (_e, sigmas, matrix) = synthetic_setup(40, 4, 2);
+        let (_e, sigmas, matrix, _plan) = synthetic_setup(40, 4, 2);
         let train_max = [2e-4_f64, 1.5e-4];
         let training = SparseEmpiricalCubaturePlan::default_training_points(&train_max);
         let anchor = SparseEmpiricalCubaturePlan::default_jacobian_anchor(&train_max);
@@ -1436,7 +1501,7 @@ mod tests {
     /// ≤1e-3 max abs error band that codex04 measured on real VENUS.
     #[test]
     fn cubature_forward_held_out_bounded_error() {
-        let (_e, sigmas, matrix) = synthetic_setup(40, 4, 2);
+        let (_e, sigmas, matrix, _plan) = synthetic_setup(40, 4, 2);
         let train_max = [2e-4_f64, 1.5e-4];
         let training = SparseEmpiricalCubaturePlan::default_training_points(&train_max);
         let anchor = SparseEmpiricalCubaturePlan::default_jacobian_anchor(&train_max);
@@ -1464,7 +1529,7 @@ mod tests {
     /// LP tolerance.
     #[test]
     fn cubature_jacobian_matches_exact_at_anchor() {
-        let (_e, sigmas, matrix) = synthetic_setup(30, 4, 3);
+        let (_e, sigmas, matrix, _plan) = synthetic_setup(30, 4, 3);
         let train_max = [2e-4_f64, 1.5e-4, 1e-4];
         let training = SparseEmpiricalCubaturePlan::default_training_points(&train_max);
         let anchor = SparseEmpiricalCubaturePlan::default_jacobian_anchor(&train_max);
@@ -1489,7 +1554,7 @@ mod tests {
     /// Row weights sum to 1 after renormalization.
     #[test]
     fn cubature_rows_are_probability_measures() {
-        let (_e, sigmas, matrix) = synthetic_setup(30, 4, 2);
+        let (_e, sigmas, matrix, _plan) = synthetic_setup(30, 4, 2);
         let train_max = [2e-4_f64, 1.5e-4];
         let training = SparseEmpiricalCubaturePlan::default_training_points(&train_max);
         let anchor = SparseEmpiricalCubaturePlan::default_jacobian_anchor(&train_max);
@@ -1512,7 +1577,7 @@ mod tests {
     /// structural shape.
     #[test]
     fn cubature_k6_builds_and_evaluates() {
-        let (_e, sigmas, matrix) = synthetic_setup(30, 4, 6);
+        let (_e, sigmas, matrix, _plan) = synthetic_setup(30, 4, 6);
         let train_max: Vec<f64> = (0..6).map(|j| 1e-4 * (1.0 + 0.2 * j as f64)).collect();
         // S training points = 2 midpoints + k axis-aligned points = 8.
         let training = SparseEmpiricalCubaturePlan::default_training_points(&train_max);
@@ -1716,18 +1781,22 @@ mod tests {
     fn scalar_setup(
         n_grid: usize,
         half_kernel: usize,
-    ) -> (Vec<f64>, crate::resolution::ResolutionMatrix) {
-        let (_e, sigmas, matrix) = synthetic_setup(n_grid, half_kernel, 1);
-        (sigmas, matrix) // sigmas for k=1 is flat length n_grid
+    ) -> (
+        Vec<f64>,
+        crate::resolution::ResolutionMatrix,
+        std::sync::Arc<crate::resolution::ResolutionPlan>,
+    ) {
+        let (_e, sigmas, matrix, plan) = synthetic_setup(n_grid, half_kernel, 1);
+        (sigmas, matrix, plan) // sigmas for k=1 is flat length n_grid
     }
 
     #[test]
     fn scalar_chebyshev_matches_exact_at_multiple_densities() {
-        let (sigmas_flat, matrix) = scalar_setup(40, 4);
+        let (sigmas_flat, matrix, res_plan) = scalar_setup(40, 4);
         let sigma = &sigmas_flat;
         let n_max = 2e-4_f64;
         let plan =
-            ScalarChebyshevPlan::build(&matrix, sigma, n_max, 16).expect("build chebyshev plan");
+            ScalarChebyshevPlan::build(res_plan, sigma, n_max, 16).expect("build chebyshev plan");
         for n in [1e-5_f64, 1e-4, 1.6e-4] {
             let t_plan = plan.forward_scalar(n);
             let t_un: Vec<f64> = sigma.iter().map(|&s| (-n * s).exp()).collect();
@@ -1744,10 +1813,10 @@ mod tests {
 
     #[test]
     fn scalar_chebyshev_derivative_matches_finite_difference() {
-        let (sigmas_flat, matrix) = scalar_setup(30, 4);
+        let (sigmas_flat, _matrix, res_plan) = scalar_setup(30, 4);
         let sigma = &sigmas_flat;
         let n_max = 2e-4_f64;
-        let plan = ScalarChebyshevPlan::build(&matrix, sigma, n_max, 16).expect("build");
+        let plan = ScalarChebyshevPlan::build(res_plan, sigma, n_max, 16).expect("build");
         let n = 1.6e-4_f64;
         let h = 1e-8_f64;
         let (_t, dt_an) = plan.forward_and_derivative_scalar(n);
@@ -1769,14 +1838,15 @@ mod tests {
 
     #[test]
     fn scalar_chebyshev_rejects_invalid_box() {
-        let (sigmas_flat, matrix) = scalar_setup(20, 3);
-        let err = ScalarChebyshevPlan::build(&matrix, &sigmas_flat, 0.0, 16)
-            .expect_err("n_max = 0 must reject");
+        let (sigmas_flat, _matrix, res_plan) = scalar_setup(20, 3);
+        let err =
+            ScalarChebyshevPlan::build(std::sync::Arc::clone(&res_plan), &sigmas_flat, 0.0, 16)
+                .expect_err("n_max = 0 must reject");
         assert!(matches!(
             err,
             ScalarSurrogateBuildError::InvalidChebyshevBox { .. }
         ));
-        let err = ScalarChebyshevPlan::build(&matrix, &sigmas_flat, 1e-4, 1)
+        let err = ScalarChebyshevPlan::build(res_plan, &sigmas_flat, 1e-4, 1)
             .expect_err("M = 1 must reject");
         assert!(matches!(
             err,
@@ -1791,14 +1861,16 @@ mod tests {
         // exp(-n · σ) surface.  A pathologically wide box on the
         // synthetic σ used by scalar_setup exceeds the 1e-6
         // tolerance and must be rejected.
-        let (sigma, matrix) = scalar_setup(40, 4);
+        let (sigma, _matrix, res_plan) = scalar_setup(40, 4);
         // The scalar_setup σ has max ≈ 105 on a Gaussian peak.
-        // At n_max = 2.0, τ_peak ≈ 210 → exp(-210) underflows and
-        // the Chebyshev polynomial can't possibly track it with
-        // M = 16 nodes.  Must reject at build time rather than
-        // quietly return a plan that produces huge forward errors
-        // on dispatch.
-        let err = ScalarChebyshevPlan::build(&matrix, &sigma, 2.0, 16)
+        // At n_max = 2.0, τ_peak ≈ 210 → exp(-210) becomes
+        // extremely small (~7e-92, still representable in f64 but
+        // way below the dynamic range where smooth interpolation
+        // converges).  The Chebyshev polynomial can't track this
+        // with M = 16 nodes.  Must reject at build time rather
+        // than quietly return a plan that produces huge forward
+        // errors on dispatch.
+        let err = ScalarChebyshevPlan::build(res_plan, &sigma, 2.0, 16)
             .expect_err("overwide box must reject");
         match err {
             ScalarSurrogateBuildError::InsufficientAccuracyOnBox {
@@ -1820,9 +1892,9 @@ mod tests {
 
     #[test]
     fn scalar_plan_rejects_sigma_size_mismatch() {
-        let (_sigmas_flat, matrix) = scalar_setup(20, 3);
+        let (_sigmas_flat, _matrix, res_plan) = scalar_setup(20, 3);
         let wrong = vec![0.0_f64; 15];
-        let err = ScalarChebyshevPlan::build(&matrix, &wrong, 1e-4, 16)
+        let err = ScalarChebyshevPlan::build(res_plan, &wrong, 1e-4, 16)
             .expect_err("Chebyshev sigma mismatch must reject");
         assert!(matches!(
             err,
@@ -1859,7 +1931,7 @@ mod tests {
         let energies: Vec<f64> = (0..n_grid)
             .map(|i| 7.0 + (200.0 - 7.0) * (i as f64) / ((n_grid - 1) as f64))
             .collect();
-        let plan = tab.plan(&energies).expect("build plan on sorted grid");
+        let plan = std::sync::Arc::new(tab.plan(&energies).expect("build plan on sorted grid"));
         let matrix = plan.compile_to_matrix();
         let matrix_nnz = matrix.nnz();
 
@@ -1881,8 +1953,8 @@ mod tests {
         // accuracy on the whole box.
         let n_max = 2e-4_f64;
         let t_build = std::time::Instant::now();
-        let cheb =
-            ScalarChebyshevPlan::build(&matrix, &sigma, n_max, 16).expect("build Chebyshev plan");
+        let cheb = ScalarChebyshevPlan::build(std::sync::Arc::clone(&plan), &sigma, n_max, 16)
+            .expect("build Chebyshev plan");
         let t_build = t_build.elapsed();
 
         // Forward accuracy at VENUS density.

@@ -170,16 +170,22 @@ fn density_param_indices(density_indices: &[usize]) -> Vec<usize> {
 /// cached cubature (see pipeline.rs), so a refit through the
 /// standard surface cannot hit this case.
 /// Check whether a scalar (k = 1) surrogate plan is eligible given
-/// the model's energy grid, active tabulated resolution, and
-/// `n_density_params == 1`.  Parallels
-/// [`cubature_eligible`] for the multi-isotope path — same
-/// grid-identity + `Tabulated(_)` variant guards, same
-/// optional-ResolutionPlan transitive check.  Epic #472, PR #475.
+/// the model's energy grid, active tabulated resolution,
+/// attached `ResolutionPlan`, current σ row, and
+/// `n_density_params == 1`.  Parallels [`cubature_eligible`] for
+/// the multi-isotope path on grid-identity + `Tabulated(_)` guard,
+/// and **additionally** enforces content identity via the
+/// source-`ResolutionPlan` `Arc::ptr_eq` check and a σ
+/// fingerprint — closing the same-grid stale-plan correctness hole
+/// an independent review surfaced on PR #475: a plan built from
+/// different σ or a different kernel but attached on the same
+/// energy grid must never dispatch the surrogate.
 fn scalar_eligible(
     plan: &ScalarSurrogatePlan,
     energies: &[f64],
     instrument_resolution: &ResolutionFunction,
-    resolution_plan: Option<&ResolutionPlan>,
+    resolution_plan: Option<&Arc<ResolutionPlan>>,
+    sigma_row: &[f64],
     n_density_params: usize,
 ) -> bool {
     if n_density_params != 1 {
@@ -197,15 +203,43 @@ fn scalar_eligible(
             return false;
         }
     }
-    if let Some(res_plan) = resolution_plan {
-        if res_plan.target_energies().len() != energies.len() {
+    // Source-`ResolutionPlan` identity via `Arc::ptr_eq` — O(1)
+    // check that the plan was built from the SAME resolution
+    // kernel the model is currently using.  An independent
+    // review reproduction on PR #475 showed that the grid-only
+    // check was insufficient: a plan built for a different
+    // tabulated kernel on an identical grid would silently
+    // dispatch and return transmissions shifted by ~0.13
+    // absolute.  Requiring the model to attach the exact same
+    // `Arc<ResolutionPlan>` the scalar plan was built from
+    // closes that hole.
+    let Some(model_plan) = resolution_plan else {
+        return false;
+    };
+    if !Arc::ptr_eq(model_plan, plan.source_resolution_plan()) {
+        return false;
+    }
+    // Transitive grid-identity on `resolution_plan` (retained from
+    // the previous check — catches an `Arc::ptr_eq`-true pair whose
+    // inner grid has been mutated out from under us, e.g. a
+    // `Mutex<ResolutionPlan>` unsafe pattern; defence-in-depth).
+    if model_plan.target_energies().len() != energies.len() {
+        return false;
+    }
+    for (e_cur, e_res) in energies.iter().zip(model_plan.target_energies()) {
+        if e_cur.to_bits() != e_res.to_bits() {
             return false;
         }
-        for (e_cur, e_res) in energies.iter().zip(res_plan.target_energies()) {
-            if e_cur.to_bits() != e_res.to_bits() {
-                return false;
-            }
-        }
+    }
+    // σ fingerprint: same-grid-different-σ would otherwise pass
+    // every grid check.  FNV-1a-64 over `to_bits()` is fast
+    // (~3 µs for 3471-point VENUS grid) and cryptographically
+    // sufficient for catching unintentional mismatch; matched-bit
+    // collisions would require an adversarial σ, which isn't a
+    // threat model here (the wrong-σ bug surfaces from
+    // copy-paste caller errors).
+    if nereids_physics::surrogate::fingerprint_f64_slice(sigma_row) != plan.sigma_fingerprint() {
+        return false;
     }
     true
 }
@@ -373,18 +407,30 @@ impl FitModel for PrecomputedTransmissionModel {
 
         // Scalar (k = 1) surrogate fast path — same eligibility
         // stack as the cubature, gated on `n_density_params == 1`.
-        // Epic #472, PR #475.
+        // Epic #472, PR #475.  The content-identity guards
+        // (σ-fingerprint + Arc::ptr_eq on source resolution plan)
+        // close the same-grid stale-plan hole the independent
+        // review surfaced.
         if let (Some(scalar), Some(inst), Some(energies)) =
             (&self.sparse_scalar_plan, &self.instrument, &self.energies)
         {
             let params_indices = density_param_indices(&self.density_indices);
-            if scalar_eligible(
-                scalar,
-                energies,
-                &inst.resolution,
-                self.resolution_plan.as_deref(),
-                params_indices.len(),
-            ) {
+            // Only fire when the σ stack is the single collapsed
+            // row the scalar plan was built from (spatial's
+            // post-grouping shape).  Non-collapsed k = 1 flows
+            // cannot safely dispatch here.
+            if self.cross_sections.len() == 1
+                && self.density_indices.len() == 1
+                && self.density_indices[0] == params_indices[0]
+                && scalar_eligible(
+                    scalar,
+                    energies,
+                    &inst.resolution,
+                    self.resolution_plan.as_ref(),
+                    &self.cross_sections[0],
+                    params_indices.len(),
+                )
+            {
                 let n = params[params_indices[0]];
                 if scalar_density_within_box(scalar, n) {
                     return Ok(scalar.forward_scalar(n));
@@ -523,13 +569,18 @@ impl FitModel for PrecomputedTransmissionModel {
             (&self.sparse_scalar_plan, &self.instrument, &self.energies)
         {
             let params_indices = density_param_indices(&self.density_indices);
-            if scalar_eligible(
-                scalar,
-                energies,
-                &inst.resolution,
-                self.resolution_plan.as_deref(),
-                params_indices.len(),
-            ) && free_param_indices.len() == 1
+            if self.cross_sections.len() == 1
+                && self.density_indices.len() == 1
+                && self.density_indices[0] == params_indices[0]
+                && scalar_eligible(
+                    scalar,
+                    energies,
+                    &inst.resolution,
+                    self.resolution_plan.as_ref(),
+                    &self.cross_sections[0],
+                    params_indices.len(),
+                )
+                && free_param_indices.len() == 1
                 && free_param_indices[0] == params_indices[0]
             {
                 let n = params[params_indices[0]];
@@ -857,24 +908,19 @@ impl FitModel for TransmissionFitModel {
             }
         }
 
-        // Scalar (k = 1) surrogate fast path — epic #472, PR #475.
-        if let (Some(scalar), Some(inst)) = (&self.sparse_scalar_plan, &self.instrument)
-            && self.temperature_index.is_none()
-        {
-            let params_indices = density_param_indices(&self.density_indices);
-            if scalar_eligible(
-                scalar,
-                &self.energies,
-                &inst.resolution,
-                self.resolution_plan.as_deref(),
-                params_indices.len(),
-            ) {
-                let n = params[params_indices[0]];
-                if scalar_density_within_box(scalar, n) {
-                    return Ok(scalar.forward_scalar(n));
-                }
-            }
-        }
+        // Scalar (k = 1) surrogate fast path was removed from this
+        // model in PR #475's round-4 fixes: the independent review
+        // showed that `TransmissionFitModel`'s on-the-fly σ compute
+        // couldn't be cheaply fingerprint-checked against the
+        // plan's σ, leaving a same-grid stale-plan correctness
+        // hole.  Production spatial dispatch attaches scalar plans
+        // to [`PrecomputedTransmissionModel`] (via
+        // `UnifiedFitConfig::with_precomputed_cross_sections` +
+        // `with_precomputed_sparse_scalar_plan`), which DOES
+        // enforce σ-fingerprint + Arc::ptr_eq guards.  The
+        // `sparse_scalar_plan` field and setter remain here for
+        // API consistency with `PrecomputedTransmissionModel`, but
+        // this model will always fall through to the exact path.
 
         let temperature_k = match self.temperature_index {
             Some(idx) => params[idx],
@@ -1039,34 +1085,9 @@ impl FitModel for TransmissionFitModel {
             }
         }
 
-        // Scalar (k = 1) surrogate Jacobian fast path — epic #472 PR
-        // #475.  Must match `evaluate()` dispatch conditions + the
-        // single-density constraint on free params.
-        if let (Some(scalar), Some(inst)) = (&self.sparse_scalar_plan, &self.instrument)
-            && self.temperature_index.is_none()
-        {
-            let params_indices = density_param_indices(&self.density_indices);
-            if scalar_eligible(
-                scalar,
-                &self.energies,
-                &inst.resolution,
-                self.resolution_plan.as_deref(),
-                params_indices.len(),
-            ) && free_param_indices.len() == 1
-                && free_param_indices[0] == params_indices[0]
-            {
-                let n = params[params_indices[0]];
-                if scalar_density_within_box(scalar, n) {
-                    let n_e = self.energies.len();
-                    let (_t, dt) = scalar.forward_and_derivative_scalar(n);
-                    let mut jacobian = FlatMatrix::zeros(n_e, 1);
-                    for (i, &v) in dt.iter().enumerate() {
-                        *jacobian.get_mut(i, 0) = v;
-                    }
-                    return Some(jacobian);
-                }
-            }
-        }
+        // Scalar (k = 1) surrogate Jacobian fast path removed in
+        // PR #475 round-4 — see the docstring at the corresponding
+        // site in `TransmissionFitModel::evaluate()` above.
 
         // Only provide analytical Jacobian when base_xs is available
         // (temperature-fitting fast path with cached broadened XS).
@@ -3052,36 +3073,64 @@ mod tests {
     // density-box escape, and that the pure no-plan path remains
     // byte-identical to pre-PR #475 main.
 
-    /// Helper: build a synthetic scalar (k = 1) Chebyshev plan on the
-    /// same grid as the cubature helpers.
+    /// Helper: build a synthetic scalar (k = 1) Chebyshev plan on
+    /// the same grid as the cubature helpers.  Takes an
+    /// `Arc<ResolutionPlan>` so tests can share the same Arc
+    /// pointer with the model's `resolution_plan` (required by the
+    /// post-round-4 `Arc::ptr_eq` dispatch guard).
     fn build_scalar_plan(
-        matrix: &nereids_physics::resolution::ResolutionMatrix,
+        res_plan: Arc<ResolutionPlan>,
         sigma_k1: &[f64],
         n_max: f64,
     ) -> Arc<ScalarSurrogatePlan> {
         Arc::new(
-            nereids_physics::surrogate::ScalarChebyshevPlan::build(matrix, sigma_k1, n_max, 16)
+            nereids_physics::surrogate::ScalarChebyshevPlan::build(res_plan, sigma_k1, n_max, 16)
                 .expect("synthetic scalar Chebyshev build"),
         )
     }
 
+    /// Helper: build a `PrecomputedTransmissionModel` with the
+    /// caller-chosen σ / k / resolution-plan / scalar-plan state.
+    /// Mirrors `make_trivial_fit_model` but targets the model that
+    /// actually dispatches scalar in production (spatial routes
+    /// scalar-eligible k=1 through `PrecomputedTransmissionModel`).
+    fn make_precomp_for_scalar(
+        energies: Vec<f64>,
+        sigmas: Vec<Vec<f64>>,
+        density_indices: Vec<usize>,
+        resolution_plan: Option<Arc<ResolutionPlan>>,
+        scalar_plan: Option<Arc<ScalarSurrogatePlan>>,
+    ) -> PrecomputedTransmissionModel {
+        PrecomputedTransmissionModel {
+            cross_sections: Arc::new(sigmas),
+            density_indices: Arc::new(density_indices),
+            energies: Some(Arc::new(energies)),
+            instrument: Some(make_trivial_instrument()),
+            resolution_plan,
+            sparse_cubature_plan: None,
+            sparse_scalar_plan: scalar_plan,
+        }
+    }
+
     #[test]
-    fn fit_model_scalar_dispatches_at_k1() {
+    fn precomputed_scalar_dispatches_at_k1() {
         // k = 1 with both the scalar plan and the resolution plan
-        // installed: evaluate() must return the scalar plan's
-        // forward output.  At the Chebyshev node density the plan
-        // reproduces exact `apply_r ∘ exp(-nσ)` to machine
-        // precision, so comparing to the plan's own forward is a
-        // byte-identical check.
+        // installed (same Arc) and σ matching the plan's
+        // fingerprint: evaluate() must return the scalar plan's
+        // forward output byte-exact.
         let n_grid = 40_usize;
-        let (energies, plan, matrix) = synthetic_resolution_setup(n_grid, 4);
+        let (energies, res_plan, _matrix) = synthetic_resolution_setup(n_grid, 4);
         let sigmas = synthetic_sigmas(n_grid, 1);
         let n_max = 2.0 * 1e-4_f64;
-        let scalar = build_scalar_plan(&matrix, &sigmas[0], n_max);
+        let scalar = build_scalar_plan(Arc::clone(&res_plan), &sigmas[0], n_max);
 
-        let model = make_trivial_fit_model(energies.clone(), 1)
-            .with_resolution_plan(Some(Arc::clone(&plan)))
-            .with_sparse_scalar_plan(Some(Arc::clone(&scalar)));
+        let model = make_precomp_for_scalar(
+            energies,
+            sigmas,
+            vec![0],
+            Some(Arc::clone(&res_plan)),
+            Some(Arc::clone(&scalar)),
+        );
 
         let n = [0.5 * n_max];
         let t_model = model.evaluate(&n).unwrap();
@@ -3091,31 +3140,32 @@ mod tests {
             assert_eq!(
                 a.to_bits(),
                 b.to_bits(),
-                "TransmissionFitModel scalar dispatch must return forward_scalar() byte-exact",
+                "scalar dispatch must return forward_scalar() byte-exact",
             );
         }
     }
 
     #[test]
-    fn fit_model_scalar_jacobian_matches_scalar_derivative() {
-        // analytical_jacobian at a density inside the box must
-        // return exactly `scalar.forward_and_derivative_scalar(n)`'s
-        // derivative as the single column.
+    fn precomputed_scalar_jacobian_matches_derivative() {
         let n_grid = 40_usize;
-        let (energies, plan, matrix) = synthetic_resolution_setup(n_grid, 4);
+        let (energies, res_plan, _matrix) = synthetic_resolution_setup(n_grid, 4);
         let sigmas = synthetic_sigmas(n_grid, 1);
         let n_max = 2.0 * 1e-4_f64;
-        let scalar = build_scalar_plan(&matrix, &sigmas[0], n_max);
+        let scalar = build_scalar_plan(Arc::clone(&res_plan), &sigmas[0], n_max);
 
-        let model = make_trivial_fit_model(energies, 1)
-            .with_resolution_plan(Some(Arc::clone(&plan)))
-            .with_sparse_scalar_plan(Some(Arc::clone(&scalar)));
+        let model = make_precomp_for_scalar(
+            energies,
+            sigmas,
+            vec![0],
+            Some(Arc::clone(&res_plan)),
+            Some(Arc::clone(&scalar)),
+        );
 
         let n = [0.5 * n_max];
         let y_curr = model.evaluate(&n).unwrap();
         let jac = model
             .analytical_jacobian(&n, &[0], &y_curr)
-            .expect("scalar Jacobian path on TransmissionFitModel");
+            .expect("scalar Jacobian path");
         let (_t_ref, dt_ref) = scalar.forward_and_derivative_scalar(n[0]);
         assert_eq!(jac.ncols, 1);
         assert_eq!(jac.nrows, n_grid);
@@ -3123,111 +3173,142 @@ mod tests {
             assert_eq!(
                 jac.get(i, 0).to_bits(),
                 dt_i.to_bits(),
-                "row {i}: TransmissionFitModel must return scalar dT/dn byte-exact",
+                "row {i}: scalar dT/dn must be byte-exact",
             );
         }
     }
 
     #[test]
-    fn fit_model_scalar_falls_back_at_k2() {
+    fn precomputed_scalar_falls_back_at_k2() {
         // k = 2 with a scalar plan installed → `scalar_eligible`
-        // returns false (`n_density_params != 1`), dispatch MUST
-        // fall back to the exact `exp(-Σ n σ) + apply_resolution`
-        // path.  Prove fallback via byte-identity vs a no-plan
-        // model with the same k = 2 grid.
+        // rejects `cross_sections.len() == 1` guard (k=2 model has
+        // 2 σ rows).  Dispatch falls back.
         let n_grid = 40_usize;
-        let (energies, plan, matrix) = synthetic_resolution_setup(n_grid, 4);
+        let (energies, res_plan, _matrix) = synthetic_resolution_setup(n_grid, 4);
         let sigmas_k2 = synthetic_sigmas(n_grid, 2);
-        let sigma_k1_stale = synthetic_sigmas(n_grid, 1).remove(0);
+        let sigma_k1 = synthetic_sigmas(n_grid, 1).remove(0);
         let n_max = 2.0 * 1e-4_f64;
-        let scalar = build_scalar_plan(&matrix, &sigma_k1_stale, n_max);
+        let scalar = build_scalar_plan(Arc::clone(&res_plan), &sigma_k1, n_max);
 
-        // Model has k = 2 but a scalar plan is installed → must
-        // fall back (scalar_eligible rejects `n_density_params != 1`).
-        let model_with_plan = make_trivial_fit_model(energies.clone(), 2)
-            .with_resolution_plan(Some(Arc::clone(&plan)))
-            .with_sparse_scalar_plan(Some(Arc::clone(&scalar)));
-        let model_without_plan =
-            make_trivial_fit_model(energies, 2).with_resolution_plan(Some(Arc::clone(&plan)));
-
-        // Feed both models the same σ stack so the exact path is
-        // identical.  `TransmissionFitModel` uses its own internal
-        // computed σ path — in this synthetic test both models
-        // build the same way from make_trivial_fit_model and no
-        // σ is precomputed, so evaluate() builds σ from each
-        // isotope's resonance data (empty ranges → σ ≡ 0).
-        //   With σ ≡ 0: exp(-Σ n σ) = 1 everywhere, so both
-        //   evaluate outputs are the broadened 1-vector.  Byte
-        //   identity proves the scalar plan did NOT fire
-        //   (if it had, output would use `sigma_k1_stale` and
-        //   differ).
-        let _ = sigmas_k2;
+        let model_with = make_precomp_for_scalar(
+            energies.clone(),
+            sigmas_k2.clone(),
+            vec![0, 1],
+            Some(Arc::clone(&res_plan)),
+            Some(scalar),
+        );
+        let model_without = make_precomp_for_scalar(
+            energies,
+            sigmas_k2,
+            vec![0, 1],
+            Some(Arc::clone(&res_plan)),
+            None,
+        );
         let n = [1e-4_f64, 2e-4];
-        let t_with = model_with_plan.evaluate(&n).unwrap();
-        let t_without = model_without_plan.evaluate(&n).unwrap();
+        let t_with = model_with.evaluate(&n).unwrap();
+        let t_without = model_without.evaluate(&n).unwrap();
         for (a, b) in t_with.iter().zip(t_without.iter()) {
             assert_eq!(
                 a.to_bits(),
                 b.to_bits(),
-                "scalar plan MUST NOT fire at k=2; evaluate() must match no-plan byte-exactly",
+                "scalar plan must refuse k=2 dispatch → byte-identical fallback",
             );
         }
     }
 
     #[test]
-    fn fit_model_scalar_falls_back_on_grid_mismatch() {
-        // Build a scalar plan on one grid, install on a model with
-        // a DIFFERENT same-length grid.  Dispatch must refuse via
-        // the `to_bits()` grid-identity check.
+    fn precomputed_scalar_falls_back_on_stale_resolution_plan() {
+        // Independent review P1 reproduction on PR #475: same-grid
+        // DIFFERENT-kernel ResolutionPlan swap must not silently
+        // dispatch.  The `Arc::ptr_eq` guard on the scalar plan's
+        // stored source plan is the O(1) check that closes this.
         let n_grid = 40_usize;
-        let (energies_a, plan_a, matrix) = synthetic_resolution_setup(n_grid, 4);
+        let (energies, res_plan_a, _matrix) = synthetic_resolution_setup(n_grid, 4);
         let sigmas = synthetic_sigmas(n_grid, 1);
         let n_max = 2.0 * 1e-4_f64;
-        let scalar = build_scalar_plan(&matrix, &sigmas[0], n_max);
+        let scalar = build_scalar_plan(Arc::clone(&res_plan_a), &sigmas[0], n_max);
 
-        // Shifted grid — same length, different bit pattern.
-        let energies_b: Vec<f64> = energies_a.iter().map(|&e| e + 1.0).collect();
-
-        // Install the stale (grid-A) scalar plan on a grid-B model.
-        // Note: install without a resolution plan so only the
-        // scalar plan's grid-identity check gates dispatch.
-        let _ = plan_a;
-        let model_with_stale_plan =
-            make_trivial_fit_model(energies_b.clone(), 1).with_sparse_scalar_plan(Some(scalar));
-        let model_without_plan = make_trivial_fit_model(energies_b, 1);
-
+        // Build a DIFFERENT ResolutionPlan on the same grid (wider
+        // kernel) and attach it to the model.  Even though the
+        // grid matches bit-for-bit, the scalar plan was built from
+        // res_plan_a and its `source_resolution_plan` Arc differs
+        // from res_plan_b → dispatch refuses.
+        let (_e_b, res_plan_b, _matrix_b) = synthetic_resolution_setup(n_grid, 6);
+        let model_stale = make_precomp_for_scalar(
+            energies.clone(),
+            sigmas.clone(),
+            vec![0],
+            Some(Arc::clone(&res_plan_b)),
+            Some(Arc::clone(&scalar)),
+        );
+        let model_noplan =
+            make_precomp_for_scalar(energies, sigmas, vec![0], Some(res_plan_b), None);
         let n = [0.25 * n_max];
-        let t_stale = model_with_stale_plan.evaluate(&n).unwrap();
-        let t_exact = model_without_plan.evaluate(&n).unwrap();
+        let t_stale = model_stale.evaluate(&n).unwrap();
+        let t_exact = model_noplan.evaluate(&n).unwrap();
         for (a, b) in t_stale.iter().zip(t_exact.iter()) {
             assert_eq!(
                 a.to_bits(),
                 b.to_bits(),
-                "stale-grid scalar plan MUST NOT fire; evaluate() must match no-plan byte-exactly",
+                "scalar plan with non-ptr_eq source_resolution_plan MUST NOT fire",
             );
         }
     }
 
     #[test]
-    fn fit_model_scalar_falls_back_when_density_escapes_box() {
-        // scalar.density_box() auto-set to n_max during build.
-        // Chebyshev can't safely extrapolate (Codex PR #475 round-2
-        // P1); the guard is strict `n ≤ n_max`.  A density at
-        // 2× n_max is well outside → fall back to exact path
-        // byte-identically.
+    fn precomputed_scalar_falls_back_on_stale_sigma() {
+        // Independent review P1 reproduction on PR #475: plan built
+        // from σ_A, attached to a model whose cross_sections[0] is
+        // σ_B on the same grid with the same resolution plan →
+        // σ-fingerprint mismatch forces fallback.
         let n_grid = 40_usize;
-        let (energies, plan, matrix) = synthetic_resolution_setup(n_grid, 4);
+        let (energies, res_plan, _matrix) = synthetic_resolution_setup(n_grid, 4);
+        let sigma_a = synthetic_sigmas(n_grid, 1);
+        // σ_B: flip one element of σ_A so the fingerprint differs
+        // but the shape / magnitude is plausible.
+        let mut sigma_b = sigma_a.clone();
+        sigma_b[0][n_grid / 2] += 1.0; // tiny perturbation → different fingerprint
+        let n_max = 2.0 * 1e-4_f64;
+        let scalar = build_scalar_plan(Arc::clone(&res_plan), &sigma_a[0], n_max);
+
+        let model_stale = make_precomp_for_scalar(
+            energies.clone(),
+            sigma_b.clone(),
+            vec![0],
+            Some(Arc::clone(&res_plan)),
+            Some(scalar),
+        );
+        let model_noplan =
+            make_precomp_for_scalar(energies, sigma_b, vec![0], Some(res_plan), None);
+        let n = [0.25 * n_max];
+        let t_stale = model_stale.evaluate(&n).unwrap();
+        let t_exact = model_noplan.evaluate(&n).unwrap();
+        for (a, b) in t_stale.iter().zip(t_exact.iter()) {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "σ-fingerprint mismatch MUST force fallback → byte-identical to no-plan",
+            );
+        }
+    }
+
+    #[test]
+    fn precomputed_scalar_falls_back_when_density_escapes_box() {
+        let n_grid = 40_usize;
+        let (energies, res_plan, _matrix) = synthetic_resolution_setup(n_grid, 4);
         let sigmas = synthetic_sigmas(n_grid, 1);
         let n_max = 2.0 * 1e-4_f64;
-        let scalar = build_scalar_plan(&matrix, &sigmas[0], n_max);
+        let scalar = build_scalar_plan(Arc::clone(&res_plan), &sigmas[0], n_max);
 
-        let model_with = make_trivial_fit_model(energies.clone(), 1)
-            .with_resolution_plan(Some(Arc::clone(&plan)))
-            .with_sparse_scalar_plan(Some(Arc::clone(&scalar)));
+        let model_with = make_precomp_for_scalar(
+            energies.clone(),
+            sigmas.clone(),
+            vec![0],
+            Some(Arc::clone(&res_plan)),
+            Some(Arc::clone(&scalar)),
+        );
         let model_without =
-            make_trivial_fit_model(energies, 1).with_resolution_plan(Some(Arc::clone(&plan)));
-
-        // Escape: 2× the training n_max → past the strict box.
+            make_precomp_for_scalar(energies, sigmas, vec![0], Some(Arc::clone(&res_plan)), None);
         let n_escape = [2.0 * n_max];
         let t_with = model_with.evaluate(&n_escape).unwrap();
         let t_without = model_without.evaluate(&n_escape).unwrap();
@@ -3235,28 +3316,28 @@ mod tests {
             assert_eq!(
                 a.to_bits(),
                 b.to_bits(),
-                "scalar density-box escape guard MUST fall back to exact path byte-identically",
+                "density-box escape guard must fall back byte-identically",
             );
         }
     }
 
     #[test]
-    fn fit_model_scalar_rejects_nonfinite_and_negative_density() {
-        // `scalar_density_within_box` rejects NaN, ±∞, and negative
-        // densities — falling back to exact.  Prove via byte-identity
-        // against a no-plan model.
+    fn precomputed_scalar_rejects_nonfinite_density() {
         let n_grid = 40_usize;
-        let (energies, plan, matrix) = synthetic_resolution_setup(n_grid, 4);
+        let (energies, res_plan, _matrix) = synthetic_resolution_setup(n_grid, 4);
         let sigmas = synthetic_sigmas(n_grid, 1);
         let n_max = 2.0 * 1e-4_f64;
-        let scalar = build_scalar_plan(&matrix, &sigmas[0], n_max);
+        let scalar = build_scalar_plan(Arc::clone(&res_plan), &sigmas[0], n_max);
 
-        let model_with = make_trivial_fit_model(energies.clone(), 1)
-            .with_resolution_plan(Some(Arc::clone(&plan)))
-            .with_sparse_scalar_plan(Some(Arc::clone(&scalar)));
+        let model_with = make_precomp_for_scalar(
+            energies.clone(),
+            sigmas.clone(),
+            vec![0],
+            Some(Arc::clone(&res_plan)),
+            Some(Arc::clone(&scalar)),
+        );
         let model_without =
-            make_trivial_fit_model(energies, 1).with_resolution_plan(Some(Arc::clone(&plan)));
-
+            make_precomp_for_scalar(energies, sigmas, vec![0], Some(Arc::clone(&res_plan)), None);
         for bad_n in [f64::NAN, f64::INFINITY, -1e-6_f64] {
             let n = [bad_n];
             let t_with = model_with.evaluate(&n).unwrap();
@@ -3280,11 +3361,11 @@ mod tests {
         // at `1.5 × n_max`.  The guard is therefore **strict**
         // `n ≤ train_max`, not the cubature's 1.5× tolerance.
         let n_grid = 16_usize;
-        let (_energies, _plan, matrix) = synthetic_resolution_setup(n_grid, 2);
+        let (_energies, res_plan, _matrix) = synthetic_resolution_setup(n_grid, 2);
         let sigmas = synthetic_sigmas(n_grid, 1);
         let n_max = 1e-4_f64;
         let plan =
-            nereids_physics::surrogate::ScalarChebyshevPlan::build(&matrix, &sigmas[0], n_max, 16)
+            nereids_physics::surrogate::ScalarChebyshevPlan::build(res_plan, &sigmas[0], n_max, 16)
                 .expect("build");
 
         // Inside the box: accepted.
