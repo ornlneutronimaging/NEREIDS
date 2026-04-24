@@ -1548,19 +1548,62 @@ pub struct EnergyScaleTransmissionModel {
     /// `L_scale` hit different bit-patterns and correctly miss the
     /// cache; they pay one plan build per probe (vs one broaden
     /// today) for a small marginal cost offset by the 4 amortized
-    /// hits.  `RefCell` is safe: `TransmissionFitModel`-family models
-    /// are rebuilt per-pixel and never shared across rayon workers.
-    /// Issue #483 item A1.
-    cached_plan: RefCell<Option<CachedPlanEntry>>,
+    /// hits.
+    ///
+    /// **Capacity 2** (FIFO on miss): this survives LM backtracking,
+    /// where a proposed-but-rejected trial step evaluates at a new
+    /// `(t0, L)` key and would otherwise evict the accepted-step
+    /// plan.  With capacity 2, the accepted plan stays resident
+    /// alongside the trial plan; if the trial is rejected, the next
+    /// iteration's evaluate at the accepted `(t0, L)` still hits.
+    /// Only when a genuine new accepted step lands do we start
+    /// aging the oldest entry out.  Independent-review catch on
+    /// PR #484 (#483 A1).
+    ///
+    /// `RefCell` is safe: `TransmissionFitModel`-family models are
+    /// rebuilt per-pixel and never shared across rayon workers.
+    cached_plans: RefCell<CachedPlanRing>,
 }
 
-/// One-entry `(t0_bits, l_scale_bits)` → `ResolutionPlan` cache.  Named
-/// struct to keep the field type within clippy's `type_complexity`
-/// budget.  Issue #483 item A1.
-#[derive(Debug)]
+/// One `(t0_bits, l_scale_bits)` → `ResolutionPlan` entry.  Named
+/// struct to keep the cache field type within clippy's
+/// `type_complexity` budget.
+#[derive(Debug, Clone)]
 struct CachedPlanEntry {
     key: (u64, u64),
     plan: Arc<ResolutionPlan>,
+}
+
+/// Capacity-2 FIFO ring of plan entries.  Two entries suffice to
+/// survive a single-trial LM backtrack (accepted + trial); deeper
+/// backtracking chains still lose the accepted plan eventually, but
+/// those are rare in production and cheaper to miss than the default
+/// non-plan path.  Issue #483 A1, independent-review hardening.
+#[derive(Debug, Default)]
+struct CachedPlanRing {
+    /// Slot 0 is the most-recently-inserted entry; slot 1 is the
+    /// previous entry.  Lookup checks both; insert shifts 0 → 1 and
+    /// places the new entry at 0.
+    slots: [Option<CachedPlanEntry>; 2],
+}
+
+impl CachedPlanRing {
+    fn lookup(&self, key: (u64, u64)) -> Option<Arc<ResolutionPlan>> {
+        for slot in &self.slots {
+            if let Some(entry) = slot
+                && entry.key == key
+            {
+                return Some(Arc::clone(&entry.plan));
+            }
+        }
+        None
+    }
+
+    fn insert(&mut self, entry: CachedPlanEntry) {
+        // Shift oldest out, newest to slot 0.
+        self.slots[1] = self.slots[0].take();
+        self.slots[0] = Some(entry);
+    }
 }
 
 impl EnergyScaleTransmissionModel {
@@ -1599,21 +1642,26 @@ impl EnergyScaleTransmissionModel {
             t0_index,
             l_scale_index,
             instrument,
-            cached_plan: RefCell::new(None),
+            cached_plans: RefCell::new(CachedPlanRing::default()),
         }
     }
 
     /// Build or reuse the broadening plan for the current `(t0, L_scale)`
-    /// probe.  One-entry cache keyed on raw `f64` bits, matching the
-    /// invariant that `corrected_energies(t0, L)` is a pure function of
-    /// `(t0_bits, L_bits)` and `self.nominal_energies` (fixed for the
-    /// model's lifetime).
+    /// probe.  Capacity-2 FIFO ring keyed on raw `f64` bits, matching
+    /// the invariant that `corrected_energies(t0, L)` is a pure
+    /// function of `(t0_bits, L_bits)` and `self.nominal_energies`
+    /// (fixed for the model's lifetime).
+    ///
+    /// Capacity 2 survives one LM backtrack rejection: the previous
+    /// (accepted) entry stays in slot 1 while the trial-step entry
+    /// occupies slot 0, so a rejection followed by an evaluate at the
+    /// restored accepted `(t0, L)` still hits.  Independent-review
+    /// catch on PR #484 (#483 A1).
     ///
     /// Returns `None` for Gaussian resolution (no plan representation)
     /// or when the `build_resolution_plan` call fails (unsorted grid) —
     /// both cases transparently fall back to the non-plan
     /// `apply_resolution` path via `apply_resolution_with_plan(None, …)`.
-    /// Issue #483 item A1.
     fn cached_resolution_plan(
         &self,
         t0_us: f64,
@@ -1629,17 +1677,15 @@ impl EnergyScaleTransmissionModel {
             return None;
         }
         let key = (t0_us.to_bits(), l_scale.to_bits());
-        if let Some(entry) = self.cached_plan.borrow().as_ref()
-            && entry.key == key
-        {
-            return Some(Arc::clone(&entry.plan));
+        if let Some(plan) = self.cached_plans.borrow().lookup(key) {
+            return Some(plan);
         }
-        // Miss: build, store, return.
+        // Miss: build, insert, return.
         let plan = resolution::build_resolution_plan(e_corr, &inst.resolution)
             .ok()
             .flatten()?;
         let arc = Arc::new(plan);
-        *self.cached_plan.borrow_mut() = Some(CachedPlanEntry {
+        self.cached_plans.borrow_mut().insert(CachedPlanEntry {
             key,
             plan: Arc::clone(&arc),
         });
