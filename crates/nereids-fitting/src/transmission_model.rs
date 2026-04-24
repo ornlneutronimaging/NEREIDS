@@ -1539,6 +1539,28 @@ pub struct EnergyScaleTransmissionModel {
     l_scale_index: usize,
     /// Instrument resolution parameters (applied after Beer-Lambert).
     instrument: Option<Arc<transmission::InstrumentParams>>,
+    /// Plan cache keyed on `(t0_bits, l_scale_bits)`.  Within one KL
+    /// outer iteration (deviance + gradient + Fisher all at the same
+    /// `params`) `evaluate_at` is called 3× at identical `(t0, L)`;
+    /// the density-column path of `analytical_jacobian` wants a plan
+    /// at that same `(t0, L)` too — that's 4 cache hits per outer
+    /// iter on KL+periso+TZERO.  Finite-difference probes for `t0` /
+    /// `L_scale` hit different bit-patterns and correctly miss the
+    /// cache; they pay one plan build per probe (vs one broaden
+    /// today) for a small marginal cost offset by the 4 amortized
+    /// hits.  `RefCell` is safe: `TransmissionFitModel`-family models
+    /// are rebuilt per-pixel and never shared across rayon workers.
+    /// Issue #483 item A1.
+    cached_plan: RefCell<Option<CachedPlanEntry>>,
+}
+
+/// One-entry `(t0_bits, l_scale_bits)` → `ResolutionPlan` cache.  Named
+/// struct to keep the field type within clippy's `type_complexity`
+/// budget.  Issue #483 item A1.
+#[derive(Debug)]
+struct CachedPlanEntry {
+    key: (u64, u64),
+    plan: Arc<ResolutionPlan>,
 }
 
 impl EnergyScaleTransmissionModel {
@@ -1577,7 +1599,51 @@ impl EnergyScaleTransmissionModel {
             t0_index,
             l_scale_index,
             instrument,
+            cached_plan: RefCell::new(None),
         }
+    }
+
+    /// Build or reuse the broadening plan for the current `(t0, L_scale)`
+    /// probe.  One-entry cache keyed on raw `f64` bits, matching the
+    /// invariant that `corrected_energies(t0, L)` is a pure function of
+    /// `(t0_bits, L_bits)` and `self.nominal_energies` (fixed for the
+    /// model's lifetime).
+    ///
+    /// Returns `None` for Gaussian resolution (no plan representation)
+    /// or when the `build_resolution_plan` call fails (unsorted grid) —
+    /// both cases transparently fall back to the non-plan
+    /// `apply_resolution` path via `apply_resolution_with_plan(None, …)`.
+    /// Issue #483 item A1.
+    fn cached_resolution_plan(
+        &self,
+        t0_us: f64,
+        l_scale: f64,
+        e_corr: &[f64],
+    ) -> Option<Arc<ResolutionPlan>> {
+        let inst = self.instrument.as_ref()?;
+        if !matches!(
+            inst.resolution,
+            nereids_physics::resolution::ResolutionFunction::Tabulated(_)
+        ) {
+            // Gaussian resolution has no plan; nothing to cache.
+            return None;
+        }
+        let key = (t0_us.to_bits(), l_scale.to_bits());
+        if let Some(entry) = self.cached_plan.borrow().as_ref()
+            && entry.key == key
+        {
+            return Some(Arc::clone(&entry.plan));
+        }
+        // Miss: build, store, return.
+        let plan = resolution::build_resolution_plan(e_corr, &inst.resolution)
+            .ok()
+            .flatten()?;
+        let arc = Arc::new(plan);
+        *self.cached_plan.borrow_mut() = Some(CachedPlanEntry {
+            key,
+            plan: Arc::clone(&arc),
+        });
+        Some(arc)
     }
 
     /// Compute the corrected energy grid for given (t₀, L_scale).
@@ -1643,7 +1709,21 @@ impl EnergyScaleTransmissionModel {
     }
 
     /// Evaluate transmission at given parameters (densities + t0 + l_scale).
-    fn evaluate_at(&self, params: &[f64], e_corr: &[f64]) -> Result<Vec<f64>, FittingError> {
+    ///
+    /// When `use_plan_cache` is `true`, the struct-level `(t0, L_scale)`-
+    /// keyed plan cache is consulted and populated — appropriate for
+    /// evaluate calls that will be followed by more work at the SAME
+    /// probe (e.g. `FitModel::evaluate` + `analytical_jacobian` density
+    /// cols within one KL outer iter).  When `false`, broadening goes
+    /// through the non-plan path unchanged — appropriate for the
+    /// one-shot LM FD probes at `(t0 ± h, L)` / `(t0, L ± h)` where
+    /// a plan build has no reuse to amortize.  Issue #483 A1.
+    fn evaluate_at_with_cache(
+        &self,
+        params: &[f64],
+        e_corr: &[f64],
+        use_plan_cache: bool,
+    ) -> Result<Vec<f64>, FittingError> {
         let n_e = self.nominal_energies.len();
 
         // Interpolate cross-sections to corrected energy grid
@@ -1657,19 +1737,21 @@ impl EnergyScaleTransmissionModel {
         }
         let transmission: Vec<f64> = neg_opt.iter().map(|&d| d.exp()).collect();
 
-        // Resolution broadening on the corrected grid.  The corrected
-        // grid changes with (t0, l_scale), and within one LM iteration
-        // the FD columns for t0 and L_scale rebuild the plan twice
-        // each — on real-VENUS A.1 that miss rate outweighs the
-        // density-column hits and leaves the plan cache net-negative.
-        // The non-plan path stays here until the aux-grid hoist
-        // (#459 B1/B2) gives us a grid that's fixed across the entire
-        // Jacobian call.
         if let Some(inst) = &self.instrument {
-            let t_broadened = resolution::apply_resolution(e_corr, &transmission, &inst.resolution)
-                .map_err(|e| {
-                    FittingError::EvaluationFailed(format!("resolution broadening: {e}"))
-                })?;
+            let plan = if use_plan_cache {
+                let t0 = params[self.t0_index];
+                let l_scale = params[self.l_scale_index];
+                self.cached_resolution_plan(t0, l_scale, e_corr)
+            } else {
+                None
+            };
+            let t_broadened = resolution::apply_resolution_with_plan(
+                plan.as_deref(),
+                e_corr,
+                &transmission,
+                &inst.resolution,
+            )
+            .map_err(|e| FittingError::EvaluationFailed(format!("resolution broadening: {e}")))?;
             Ok(t_broadened)
         } else {
             Ok(transmission)
@@ -1682,7 +1764,15 @@ impl FitModel for EnergyScaleTransmissionModel {
         let t0 = params[self.t0_index];
         let l_scale = params[self.l_scale_index];
         let e_corr = self.corrected_energies(t0, l_scale);
-        self.evaluate_at(params, &e_corr)
+        // Public `evaluate` uses the plan cache: downstream the
+        // Jacobian (+ joint-Poisson's gradient + Fisher) will re-call
+        // `evaluate` at the SAME `(t0, L_scale)` before the next LM
+        // step, and the density-col path of `analytical_jacobian`
+        // also wants a plan at this probe — all of those hit the
+        // cache.  LM's own FD probes at `(t0 ± h, L_scale ± h)` go
+        // through a dedicated non-cache path in `analytical_jacobian`
+        // below, so they don't add plan-build overhead.  Issue #483 A1.
+        self.evaluate_at_with_cache(params, &e_corr, true)
     }
 
     /// Jacobian: analytical for density parameters, finite-difference for t₀ and L_scale.
@@ -1713,57 +1803,57 @@ impl FitModel for EnergyScaleTransmissionModel {
         }
         let t_unresolved: Vec<f64> = neg_opt.iter().map(|&d| d.exp()).collect();
 
-        // Density-column plan cache: when the Jacobian has ≥ 2 density
-        // columns sharing the current (t0, l_scale) grid, build one
-        // broadening plan here and reuse it across every density-col
-        // `apply_resolution_with_plan`.  FD columns (t0, l_scale) go
-        // through `self.evaluate(p_plus/minus)` → `apply_resolution`
-        // unchanged — they each work at a DIFFERENT (t0, l_scale) so
-        // a single-grid plan would miss every time.
+        // Density-column plan: Issue #483 A1 routes through the
+        // struct-level `(t0, L_scale)`-keyed cache.  When
+        // `self.evaluate(params)` ran earlier in the same KL outer
+        // iteration (for deviance or the forward at the line-search
+        // point), the cache was already populated at the current
+        // `(t0, L_scale)` and this lookup is a cheap Arc clone.
+        // When the Jacobian runs stand-alone (no prior evaluate) the
+        // lookup misses once and the returned plan is installed for
+        // any subsequent evaluate / jacobian at the same probe.
         //
-        // Hit-rate analysis (see PR body):
-        //   - N_density = 1 (A.1 / B.1 / KL+grouped+TZERO): 1 hit, plan
-        //     build ≈ broaden cost → net-neutral.  Guard `>= 2` makes
-        //     this path a no-op: `density_plan` stays None, and
-        //     `apply_resolution_with_plan(None, …)` forwards to the
-        //     original `apply_resolution`, bit-exact.
-        //   - N_density = 6 (B.3, KL+per-iso+TZERO): 6 hits → ~45%
-        //     speedup on density-col broadening + ~30–40% wall on
-        //     the Jacobian call.
-        let n_density_cols = free_param_indices
-            .iter()
-            .filter(|&&fp_idx| fp_idx != self.t0_index && fp_idx != self.l_scale_index)
-            .count();
-        // Only tabulated resolution has a meaningful plan; Gaussian
-        // would burn an O(n) sorted-grid validation only to return
-        // `None`, so we short-circuit here and stay byte-identical to
-        // the pre-cache Gaussian hot path (Copilot #1).
-        let density_plan = if n_density_cols >= 2
-            && let Some(inst) = &self.instrument
-            && matches!(
-                inst.resolution,
-                nereids_physics::resolution::ResolutionFunction::Tabulated(_)
-            ) {
-            resolution::build_resolution_plan(&e_corr, &inst.resolution)
-                .ok()
-                .flatten()
-        } else {
-            None
-        };
+        // The `n_density_cols >= 2` gate from the PR #469 era is
+        // dropped here: the cache makes the plan build a one-shot
+        // cost amortized across every evaluate at `(t0, L_scale)` in
+        // the surrounding KL iteration, so even the N_density = 1
+        // case (A.1 / KL+grouped+TZERO) now benefits from plan
+        // reuse across 3 evaluates + 2 jacobians per outer iter.
+        // The non-tabulated / build-failure branches still return
+        // `None` → `apply_resolution_with_plan(None, …)` forwards
+        // byte-identically to `apply_resolution`.
+        let density_plan = self.cached_resolution_plan(t0, l_scale, &e_corr);
 
         for (col, &fp_idx) in free_param_indices.iter().enumerate() {
             if fp_idx == self.t0_index || fp_idx == self.l_scale_index {
-                // Finite difference for energy-scale parameters
+                // Finite difference for energy-scale parameters.
+                //
+                // FD probes land at `(t0 ± h, L_scale ± h)` — each a
+                // unique `(t0, L_scale)` key that misses the struct
+                // plan cache and would add one plan-build per probe
+                // without any reuse to amortize.  Route them through
+                // `evaluate_at_with_cache(..., false)` so they stay on
+                // the original non-plan `apply_resolution` path.  The
+                // public `FitModel::evaluate` path continues to use
+                // the cache for the many-uses-per-probe callers
+                // (KL solver's deviance + gradient + Fisher at the
+                // current probe).  Issue #483 A1.
                 let h = if fp_idx == self.t0_index { 1e-4 } else { 1e-7 };
                 let mut p_plus = params.to_vec();
                 let mut p_minus = params.to_vec();
                 p_plus[fp_idx] += h;
                 p_minus[fp_idx] -= h;
-                let y_plus = match self.evaluate(&p_plus) {
+                let t0_plus = p_plus[self.t0_index];
+                let l_plus = p_plus[self.l_scale_index];
+                let t0_minus = p_minus[self.t0_index];
+                let l_minus = p_minus[self.l_scale_index];
+                let e_corr_plus = self.corrected_energies(t0_plus, l_plus);
+                let e_corr_minus = self.corrected_energies(t0_minus, l_minus);
+                let y_plus = match self.evaluate_at_with_cache(&p_plus, &e_corr_plus, false) {
                     Ok(v) => v,
                     Err(_) => return None,
                 };
-                let y_minus = match self.evaluate(&p_minus) {
+                let y_minus = match self.evaluate_at_with_cache(&p_minus, &e_corr_minus, false) {
                     Ok(v) => v,
                     Err(_) => return None,
                 };
@@ -1786,15 +1876,16 @@ impl FitModel for EnergyScaleTransmissionModel {
 
                 // Apply resolution to derivative if enabled.
                 //
-                // When `density_plan` is Some (N_density ≥ 2) we
-                // hit the hoisted broadening plan built above.  When
-                // None (N_density ≤ 1 or Gaussian resolution),
+                // When `density_plan` is `Some` (tabulated resolution
+                // + populated cache) we hit the struct-level
+                // `(t0, L_scale)`-keyed plan.  When `None` (Gaussian
+                // resolution or build failure),
                 // `apply_resolution_with_plan(None, …)` transparently
                 // forwards to `apply_resolution` — bit-exact with
-                // pre-cache main.
+                // the pre-cache path.  Issue #483 A1.
                 if let Some(inst) = &self.instrument {
                     let resolved_deriv = match resolution::apply_resolution_with_plan(
-                        density_plan.as_ref(),
+                        density_plan.as_deref(),
                         &e_corr,
                         &inner_deriv,
                         &inst.resolution,
