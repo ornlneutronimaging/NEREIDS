@@ -652,6 +652,95 @@ pub fn spatial_map_typed(
         })
     });
 
+    // Scalar (k = 1) surrogate plan — parallels the cubature build
+    // but dispatches on `xs.len() == 1` (grouped fits / single-
+    // isotope).  Reuses the compiled ResolutionMatrix from the
+    // resolution plan.  Falls back silently on build failure; no
+    // local plan means the exact `apply_resolution_with_plan` path
+    // runs as today.  PR #475 benched both Lanczos σ-pushforward
+    // Gauss quadrature and Chebyshev-in-density on real VENUS
+    // (3471-bin production grid); Chebyshev won on both the
+    // accuracy (≤ 2e-15 vs ≤ 4e-15) and wall-time axes.  Lanczos
+    // code was deleted per the issue's "drop the loser" contract;
+    // this build site now always returns the Chebyshev variant
+    // via the public `ScalarSurrogatePlan` type alias
+    // (= `ScalarChebyshevPlan`).
+    let caller_scalar = config.precomputed_sparse_scalar_plan().cloned();
+    let sparse_scalar_plan: Option<Arc<nereids_physics::surrogate::ScalarSurrogatePlan>> =
+        if let Some(plan) = resolution_plan.as_ref()
+            && !config.fit_temperature()
+            && !config.fit_energy_scale()
+            && xs.len() == 1
+        {
+            let sigma_row = &xs[0];
+            // Chebyshev-in-density at M = 16 (PR #475 bench-off
+            // winner).  Training box: 2 × the initial density;
+            // Chebyshev's interpolant is exact at its nodes and
+            // tight (≤ 1e-15 rel err) across a well-chosen box.
+            //
+            // If `n_max` is too wide for 16 nodes to resolve
+            // `exp(-n · σ)` accurately (e.g. caller passes a
+            // giant `initial_density` on a strong-peak σ), the
+            // build's midpoint self-check fires and returns
+            // `InsufficientAccuracyOnBox`; we log and fall back
+            // to the exact path rather than install a plan that
+            // could corrupt the fit.  Codex PR #475 round-2 P2.
+            //
+            // **Known limitation — deferred to PR #476** (mirrors
+            // the cubature policy, see lines 578-588): if
+            // `initial_densities[0]` is near zero the floor clamps
+            // `n_max` to 2e-6, but the solver may explore well
+            // past that.  The `scalar_density_within_box` guard in
+            // `transmission_model.rs` catches this (strict
+            // `n ≤ n_max` post-round-2 P1) and falls back to the
+            // exact `ResolutionPlan` path, so the worst outcome
+            // is lost speedup — never silent accuracy loss.
+            // PR #476 (trust-region wrapper) owns
+            // box-rebuild-on-escape and replaces this static
+            // policy.  Claude round-1 P2-#5 on PR #475.
+            const CHEBYSHEV_NODES: usize = 16;
+            let n_max: f64 = 2.0 * config.initial_densities()[0].max(1e-6);
+            match nereids_physics::surrogate::ScalarChebyshevPlan::build(
+                Arc::clone(plan),
+                sigma_row,
+                n_max,
+                CHEBYSHEV_NODES,
+            ) {
+                Ok(plan) => Some(Arc::new(plan)),
+                Err(e) => {
+                    eprintln!(
+                        "spatial_map_typed: scalar Chebyshev build failed ({e}); \
+                         falling back to exact ResolutionPlan path",
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+    // Preserve caller-supplied scalar plan if local build didn't run.
+    // Grid-identity check uses `to_bits()` per element (matches
+    // `scalar_eligible` / `cubature_eligible`), not `==`, so `-0.0`
+    // vs `+0.0` and NaN-bit mismatches can't silently slip through
+    // the caller-fallback pre-filter.  Claude round-1 P2 on PR #475.
+    let sparse_scalar_plan = sparse_scalar_plan.or_else(|| {
+        caller_scalar.filter(|p| {
+            let expected_len = xs.first().map(|r| r.len()).unwrap_or(0);
+            if p.len() != expected_len {
+                return false;
+            }
+            let plan_grid = p.target_energies();
+            let cfg_grid = config.energies();
+            if plan_grid.len() != cfg_grid.len() {
+                return false;
+            }
+            plan_grid
+                .iter()
+                .zip(cfg_grid)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        })
+    });
+
     // Precompute unbroadened (base) cross-sections for temperature fitting.
     // This avoids 74× overhead from redundant Reich-Moore evaluation per
     // KL iteration (112ms Reich-Moore vs 1.5ms Doppler rebroadening).
@@ -667,9 +756,9 @@ pub fn spatial_map_typed(
         if let Some(plan) = resolution_plan.clone() {
             cfg = cfg.with_precomputed_resolution_plan(plan);
         }
-        // Cubature stays None on the temperature path (guard matches
-        // the builder above).  No-op here but explicit for future
-        // readers.
+        // Cubature / scalar plans stay None on the temperature path
+        // (builder guards above).  No-op here but explicit for
+        // future readers.
         cfg
     } else {
         // For non-temperature path: xs is already collapsed to σ_eff when
@@ -688,6 +777,9 @@ pub fn spatial_map_typed(
         }
         if let Some(plan) = sparse_cubature_plan.clone() {
             cfg = cfg.with_precomputed_sparse_cubature_plan(plan);
+        }
+        if let Some(plan) = sparse_scalar_plan.clone() {
+            cfg = cfg.with_precomputed_sparse_scalar_plan(plan);
         }
         cfg
     };
@@ -1009,6 +1101,7 @@ mod tests {
             instrument: None,
             resolution_plan: None,
             sparse_cubature_plan: None,
+            sparse_scalar_plan: None,
         };
         let t_1d = model.evaluate(&[true_density]).unwrap();
         let sigma_1d: Vec<f64> = t_1d.iter().map(|&v| 0.01 * v.max(0.01)).collect();
