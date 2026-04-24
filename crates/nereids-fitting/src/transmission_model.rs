@@ -1544,11 +1544,12 @@ pub struct EnergyScaleTransmissionModel {
     /// `params`) `evaluate_at` is called 3× at identical `(t0, L)`;
     /// the density-column path of `analytical_jacobian` wants a plan
     /// at that same `(t0, L)` too — that's 4 cache hits per outer
-    /// iter on KL+periso+TZERO.  Finite-difference probes for `t0` /
-    /// `L_scale` hit different bit-patterns and correctly miss the
-    /// cache; they pay one plan build per probe (vs one broaden
-    /// today) for a small marginal cost offset by the 4 amortized
-    /// hits.
+    /// iter on KL+periso+TZERO.  Finite-difference probes land at a
+    /// different `(t0, L)` bit-pattern from the accepted probe and
+    /// are routed through `evaluate_at_with_cache(..., false)` so
+    /// they stay on the non-plan broadening path — no plan is built
+    /// or inserted for FD probes, so they neither miss nor pollute
+    /// the cache.
     ///
     /// **Capacity 2** (FIFO on miss): this survives LM backtracking,
     /// where a proposed-but-rejected trial step evaluates at a new
@@ -1669,8 +1670,11 @@ impl EnergyScaleTransmissionModel {
         e_corr: &[f64],
     ) -> Option<Arc<ResolutionPlan>> {
         let inst = self.instrument.as_ref()?;
+        // Match on a reference to `inst.resolution` defensively so the
+        // check never attempts to move a non-`Copy` `ResolutionFunction`
+        // out of a shared `Arc<InstrumentParams>` (Copilot PR #484 P2).
         if !matches!(
-            inst.resolution,
+            &inst.resolution,
             nereids_physics::resolution::ResolutionFunction::Tabulated(_)
         ) {
             // Gaussian resolution has no plan; nothing to cache.
@@ -1815,9 +1819,11 @@ impl FitModel for EnergyScaleTransmissionModel {
         // `evaluate` at the SAME `(t0, L_scale)` before the next LM
         // step, and the density-col path of `analytical_jacobian`
         // also wants a plan at this probe — all of those hit the
-        // cache.  LM's own FD probes at `(t0 ± h, L_scale ± h)` go
-        // through a dedicated non-cache path in `analytical_jacobian`
-        // below, so they don't add plan-build overhead.  Issue #483 A1.
+        // cache.  LM's own FD probes — one-coordinate-at-a-time
+        // central differences at `(t0 ± h, L_scale)` or
+        // `(t0, L_scale ± h)` — go through a dedicated non-cache
+        // path in `analytical_jacobian` below, so they don't add
+        // plan-build overhead.  Issue #483 A1.
         self.evaluate_at_with_cache(params, &e_corr, true)
     }
 
@@ -1874,14 +1880,17 @@ impl FitModel for EnergyScaleTransmissionModel {
             if fp_idx == self.t0_index || fp_idx == self.l_scale_index {
                 // Finite difference for energy-scale parameters.
                 //
-                // FD probes land at `(t0 ± h, L_scale ± h)` — each a
-                // unique `(t0, L_scale)` key that misses the struct
-                // plan cache and would add one plan-build per probe
-                // without any reuse to amortize.  Route them through
-                // `evaluate_at_with_cache(..., false)` so they stay on
-                // the original non-plan `apply_resolution` path.  The
-                // public `FitModel::evaluate` path continues to use
-                // the cache for the many-uses-per-probe callers
+                // Central-difference probes perturb one coordinate at
+                // a time: `(t0 ± h, L_scale)` when differentiating in
+                // `t0`, or `(t0, L_scale ± h)` when differentiating
+                // in `L_scale`.  Each perturbed point is a distinct
+                // `(t0, L_scale)` key that would miss the struct
+                // plan cache, and building a plan for the probe has
+                // no reuse to amortize.  Route them through
+                // `evaluate_at_with_cache(..., false)` so they stay
+                // on the original non-plan `apply_resolution` path.
+                // The public `FitModel::evaluate` path continues to
+                // use the cache for the many-uses-per-probe callers
                 // (KL solver's deviance + gradient + Fisher at the
                 // current probe).  Issue #483 A1.
                 let h = if fp_idx == self.t0_index { 1e-4 } else { 1e-7 };
