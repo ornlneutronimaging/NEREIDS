@@ -10,6 +10,7 @@ use crate::widgets::design;
 pub fn toolbar(ctx: &egui::Context, state: &mut AppState) {
     let colors = ThemeColors::from_ctx(ctx);
     egui::TopBottomPanel::top("toolbar")
+        .exact_height(48.0)
         .frame(
             egui::Frame::NONE
                 .fill(colors.bg2)
