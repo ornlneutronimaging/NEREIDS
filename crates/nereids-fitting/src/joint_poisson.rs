@@ -452,14 +452,38 @@ pub struct JointPoissonFitConfig {
     pub tol_param: f64,
     /// Finite-difference step for gradient fallback.
     pub fd_step: f64,
-    /// Enable Nelder-Mead polish after stage 1 (memo 35 §P2.1).
+    /// Enable Nelder-Mead polish after stage 1.
     ///
-    /// Default `true`.  Set to `false` only when the caller has external
-    /// evidence that the stage-1 minimum is global for the current regime
-    /// (e.g., a no-background fit with a known convex likelihood).
+    /// Default `false` as of #486.  The polish tolerances
+    /// (`xatol = 1e-9, fatol = 1e-10`) were originally matched to the
+    /// EG5 synthetic benchmark (memo 35 §P2.1) where D stays O(1), so
+    /// `fatol` is physically meaningful.  On real-data regimes where
+    /// D saturates at 10⁴–10⁵ (un-modelled upstream physics —
+    /// memo 35 §P3/§P4), `fatol / D` drops below f64 ULP and polish
+    /// cannot self-terminate — it burns its full `max_iter = 5000`
+    /// every fit at 70–260× wall cost, and the three-scenario
+    /// ablation on real VENUS Hf 120-min data (issue #486) showed
+    /// the resulting parameter shift is ≤ 0.35 Fisher σ on every
+    /// parameter in every scenario — i.e. below the solver's own
+    /// reported uncertainty floor.
+    ///
+    /// The polish mechanism itself is sound (self-terminates cleanly
+    /// on synthetic D≈1 data per ablation S3); only the absolute
+    /// tolerance defaults are mis-calibrated for real counts data.
+    /// A future scale-aware rescale (`fatol_rel` vs `D_stage1`) can
+    /// re-enable polish as a useful opt-in refinement.
+    ///
+    /// Set this to `true` (via `with_counts_enable_polish(Some(true))`
+    /// at the pipeline level) when you specifically want the polish
+    /// stage on a synthetic / clean-data scenario where the absolute
+    /// tolerance defaults are physically meaningful.
     pub enable_polish: bool,
     /// Polish (Nelder-Mead) configuration.  Used only when
-    /// `enable_polish == true`.  Defaults match memo 35 §P2.1 tolerances.
+    /// `enable_polish == true`.  Default `xatol = 1e-9`, `fatol = 1e-10`
+    /// match the EG5 synthetic benchmark tolerances from memo 35 §P2.1
+    /// — physically meaningful when `D ≈ 1` (clean data) but sub-f64-
+    /// ULP on real counts where `D ≈ 10⁴`–`10⁵`, which is why
+    /// `enable_polish` defaults to `false`.  See #486.
     pub polish: NelderMeadConfig,
     /// Compute and return the Fisher covariance and parameter uncertainties.
     pub compute_covariance: bool,
@@ -477,10 +501,24 @@ impl Default for JointPoissonFitConfig {
             tol_d: 1e-8,
             tol_param: 1e-8,
             fd_step: 1e-6,
-            enable_polish: true,
+            // #486: flipped from `true` to `false` after a three-scenario
+            // ablation on real VENUS data showed polish burning full
+            // `max_iter = 5000` at 70-260× wall cost for ≤ 0.35 Fisher σ
+            // parameter movement.  The absolute tolerances below are
+            // physically meaningful for synthetic (D ≈ 1) benchmarks and
+            // dead on real counts data (D ≈ 10⁵).  Opt in via
+            // `UnifiedFitConfig::with_counts_enable_polish(Some(true))`
+            // when you specifically want the polish stage.  See the
+            // field doc on `enable_polish` for details.
+            enable_polish: false,
             polish: NelderMeadConfig {
-                // EG5 used scipy's xatol=1e-9, fatol=1e-10 for the polish
-                // regime.  Match that here.
+                // Tolerances tuned for the EG5 synthetic regime (memo 35
+                // §P2.1) — `fatol = 1e-10` vs D ≈ 1 is a physically
+                // meaningful "deviance isn't budging" check.  On real
+                // counts data where D ≈ 10⁵ the same absolute value is
+                // sub-ULP; polish can't self-terminate and is disabled
+                // by the default above.  A future scale-aware rescale
+                // (`fatol_rel` vs D_stage1) is tracked as a follow-up.
                 xatol: 1e-9,
                 fatol: 1e-10,
                 max_iter: 5000,
