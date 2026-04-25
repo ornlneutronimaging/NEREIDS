@@ -3504,7 +3504,15 @@ mod tests {
             c,
             ..Default::default()
         })
-        .with_transmission_background(bg);
+        .with_transmission_background(bg)
+        // #486: polish defaults off for real-data regimes where its
+        // `fatol = 1e-10` is sub-ULP.  This noise-free synthetic fit
+        // is exactly the regime polish was designed for (D → 0
+        // achievable, `fatol` physically meaningful) and the test
+        // asserts `D/dof < 1.0` which Gauss-Newton alone cannot reach
+        // on this 5-free-parameter fit due to the documented n ↔ A_n
+        // correlation stall.  Opt in explicitly.
+        .with_counts_enable_polish(Some(true));
 
         let input = InputData::Counts {
             sample_counts,
@@ -3521,6 +3529,7 @@ mod tests {
         // stress test is the VENUS evaluation in the companion memo.
 
         // Deviance-based GOF populated and → 0 on noise-free expected counts.
+        // Requires polish (see `with_counts_enable_polish(Some(true))` above).
         let dpd = r.deviance_per_dof.expect("joint-Poisson must report D/dof");
         assert!(
             dpd < 1.0,

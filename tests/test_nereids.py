@@ -787,6 +787,95 @@ class TestSpatialMapCounts:
 
 
 # ===========================================================================
+# fit_counts_spectrum_typed — single-spectrum counts-KL bindings
+# ===========================================================================
+
+
+class TestFitCountsSpectrumTyped:
+    """Tests for the single-spectrum counts-KL binding."""
+
+    def test_enable_polish_kwarg_accepted_and_toggles_behavior(self, u238_data):
+        """Issue #486: `enable_polish` kwarg must be accepted on the
+        Python `fit_counts_spectrum_typed` binding, default `None` must
+        fall through to the library default (now ``False``), and
+        explicit ``True``/``False`` must produce different iteration
+        counts on a synthetic case.
+
+        This is the regression test guarding against a future binding
+        refactor silently dropping the kwarg or stranding the override
+        plumbing — Copilot Phase B catch on PR #487.
+        """
+        # Tiny synthetic counts setup — uses the U-238 single-resonance
+        # fixture so the test runs without ENDF retrieval.
+        energies = np.linspace(1.0, 30.0, 200)
+        true_density = 0.0008
+        flux = 1000.0  # open-beam mean cts/bin
+
+        t_1d = np.asarray(
+            nereids.forward_model(energies, [(u238_data, true_density)])
+        )
+        rng = np.random.default_rng(20260424)
+        open_beam = rng.poisson(np.full_like(t_1d, flux)).astype(float)
+        sample = rng.poisson(flux * t_1d).astype(float)
+        # Floor open_beam at 1 to avoid divide-by-zero in the c-norm path.
+        open_beam = np.maximum(open_beam, 1.0)
+
+        kwargs = dict(
+            sample_counts=sample,
+            open_beam_counts=open_beam,
+            energies=energies,
+            isotopes=[(u238_data, true_density)],
+            solver="kl",
+            c=1.0,
+            temperature_k=293.6,
+            max_iter=200,
+        )
+
+        # Default kwarg → library default (False post-#486) → fast.
+        r_default = nereids.fit_counts_spectrum_typed(**kwargs)
+        # Explicit False → same path as default, gates against future drift.
+        r_off = nereids.fit_counts_spectrum_typed(**kwargs, enable_polish=False)
+        # Explicit True → opt-in polish → must run more iterations than
+        # polish-off on a regime where polish has any room to move
+        # (NM still runs even if it doesn't improve, so iter count
+        # rises by polish_iters >= 1).
+        r_on = nereids.fit_counts_spectrum_typed(**kwargs, enable_polish=True)
+
+        # All three must converge / produce a valid result.
+        for r in (r_default, r_off, r_on):
+            assert r.densities[0] > 0.0
+            assert r.iterations > 0
+
+        # Default == explicit-False: the kwarg's `None` path must not
+        # accidentally toggle polish on.
+        assert r_default.iterations == r_off.iterations, (
+            f"enable_polish=None must match enable_polish=False; "
+            f"got iter None={r_default.iterations} False={r_off.iterations}"
+        )
+
+        # Explicit True must produce more iterations than False — polish
+        # is the only stage that runs after Gauss-Newton convergence,
+        # so any non-zero polish_iters bumps the summed iteration count.
+        assert r_on.iterations > r_off.iterations, (
+            f"enable_polish=True must run more iterations than =False; "
+            f"got True={r_on.iterations} False={r_off.iterations}"
+        )
+
+        # All three should agree on the converged density to within
+        # Fisher σ — polish should not move the answer beyond solver
+        # noise on this synthetic case (matches issue #486 ablation
+        # finding: shift ≤ 0.35 σ on every parameter / scenario).
+        d_off = float(r_off.densities[0])
+        d_on = float(r_on.densities[0])
+        sigma = float(r_on.uncertainties[0])
+        if np.isfinite(sigma) and sigma > 0.0:
+            assert abs(d_on - d_off) / sigma < 1.0, (
+                f"polish moved density beyond 1σ: "
+                f"|Δn|/σ = {abs(d_on - d_off) / sigma:.3f}"
+            )
+
+
+# ===========================================================================
 # Normalization
 # ===========================================================================
 

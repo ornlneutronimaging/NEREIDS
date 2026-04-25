@@ -906,6 +906,7 @@ def fit_counts_spectrum_typed(
     delta_l_m: float | None = None,
     groups: list[IsotopeGroup] | None = None,
     initial_densities: list[float] | None = None,
+    enable_polish: bool | None = None,
 ) -> FitResult:
     """Fit a single raw-count spectrum (sample + open-beam counts).
 
@@ -959,6 +960,15 @@ def fit_counts_spectrum_typed(
         resolution: Optional resolution function.
         groups: List of IsotopeGroup objects (mutually exclusive with isotopes).
         initial_densities: Initial density guesses when using groups.
+        enable_polish: Override the Nelder-Mead polish flag for the
+            counts-KL solver.  ``None`` (default) falls through to the
+            library default — currently ``False`` (#486) because the
+            polish ``fatol = 1e-10`` is sub-ULP on real counts data
+            where ``D`` saturates at ``10⁴``-``10⁵`` and burns
+            ``max_iter = 5000`` for ≤ 0.35 Fisher σ parameter
+            movement.  Pass ``True`` to opt in for synthetic / clean
+            (``D ≈ 1``) regimes where the absolute tolerance is
+            physically meaningful; ``False`` to force off explicitly.
     """
     ...
 
