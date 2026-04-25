@@ -7,6 +7,7 @@ use crate::theme::{ThemeColors, semantic};
 pub fn status_bar(ctx: &egui::Context, state: &AppState, rss_bytes: u64) {
     let colors = ThemeColors::from_ctx(ctx);
     egui::TopBottomPanel::bottom("status_bar")
+        .exact_height(28.0)
         .frame(
             egui::Frame::NONE
                 .fill(colors.bg2)

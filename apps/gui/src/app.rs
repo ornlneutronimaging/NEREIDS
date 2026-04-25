@@ -51,18 +51,8 @@ impl NereidsApp {
             memory: crate::telemetry::MemoryTelemetry::new(),
         }
     }
-}
 
-impl eframe::App for NereidsApp {
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        // If a background save is in progress, block until it completes
-        // to avoid corrupting the HDF5 file.
-        if let Some(handle) = self.state.save_join_handle.take() {
-            handle.join().ok();
-        }
-    }
-
-    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+    fn save_session_cache(&self, storage: &mut dyn eframe::Storage) {
         if let Some(cache) = SessionCache::from_state(&self.state) {
             eframe::set_value(storage, SESSION_CACHE_KEY, &cache);
         } else {
@@ -71,7 +61,30 @@ impl eframe::App for NereidsApp {
         }
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn wait_for_background_save(&mut self) {
+        // If a background save is in progress, block until it completes
+        // to avoid corrupting the HDF5 file.
+        if let Some(handle) = self.state.save_join_handle.take() {
+            handle.join().ok();
+        }
+    }
+}
+
+impl eframe::App for NereidsApp {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.wait_for_background_save();
+
+        // macOS/AppKit can abort after eframe returns from `on_exit` while
+        // tearing down winit's NSView touch-bar observer.
+        #[cfg(target_os = "macos")]
+        std::process::exit(0);
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        self.save_session_cache(storage);
+    }
+
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // Apply theme (skip if unchanged to avoid 80+ color assignments per frame)
         let resolved = theme::resolve_dark_mode(ctx, self.state.theme_preference);
         if self.state.last_applied_dark_mode != Some(resolved) {
@@ -87,6 +100,15 @@ impl eframe::App for NereidsApp {
 
         // Refresh memory telemetry (750ms interval)
         self.memory.refresh(ctx.input(|i| i.time));
+
+        #[cfg(target_os = "macos")]
+        if ctx.input(|i| i.viewport().close_requested()) {
+            if let Some(storage) = frame.storage_mut() {
+                self.save_session_cache(storage);
+            }
+            self.wait_for_background_save();
+            std::process::exit(0);
+        }
 
         // Keep repainting while background work is in progress.
         // Fitting also has a dedicated watcher thread that pokes via
