@@ -85,6 +85,9 @@ impl eframe::App for NereidsApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        #[cfg(not(target_os = "macos"))]
+        let _ = frame;
+
         // Apply theme (skip if unchanged to avoid 80+ color assignments per frame)
         let resolved = theme::resolve_dark_mode(ctx, self.state.theme_preference);
         if self.state.last_applied_dark_mode != Some(resolved) {
