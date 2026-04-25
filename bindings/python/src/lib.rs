@@ -3179,6 +3179,16 @@ fn py_spatial_map_typed<'py>(
 ///     resolution: Optional resolution function.
 ///     groups: list of IsotopeGroup objects (mutually exclusive with isotopes).
 ///     initial_densities: Initial density guesses when using groups (default 0.001 each).
+///     enable_polish: Override the Nelder-Mead polish phase on the
+///         counts-KL solver (default ``None`` → use the library default,
+///         which is ``False`` as of #486 because polish's absolute
+///         ``fatol = 1e-10`` is sub-f64-ULP on real-data deviance scales
+///         where ``D ≈ 10⁴``–``10⁵``, so polish hits ``max_iter = 5000``
+///         every fit at 70-260× wall cost for ≤ 0.35 Fisher σ parameter
+///         shift).  Pass ``True`` to opt in for clean / synthetic fits
+///         where ``D → 0`` is achievable and the polish tolerances are
+///         physically meaningful.  See ``JointPoissonFitConfig``
+///         ``enable_polish`` field doc for details.
 ///
 /// Returns:
 ///     FitResult with densities, uncertainties, chi2, etc.
