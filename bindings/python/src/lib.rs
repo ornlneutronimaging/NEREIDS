@@ -3212,6 +3212,7 @@ fn py_spatial_map_typed<'py>(
     delta_l_m = None,
     groups = None,
     initial_densities = None,
+    enable_polish = None,
 ))]
 fn py_fit_counts_spectrum_typed<'py>(
     py: Python<'py>,
@@ -3244,6 +3245,7 @@ fn py_fit_counts_spectrum_typed<'py>(
     delta_l_m: Option<f64>,
     groups: Option<Vec<PyIsotopeGroup>>,
     initial_densities: Option<Vec<f64>>,
+    enable_polish: Option<bool>,
 ) -> PyResult<PyFitResult> {
     use nereids_pipeline::pipeline::{
         CountsBackgroundConfig, InputData, UnifiedFitConfig, fit_spectrum_typed,
@@ -3419,6 +3421,15 @@ fn py_fit_counts_spectrum_typed<'py>(
             open_beam_counts: ob_slice.to_vec(),
         }
     };
+
+    // #486: counts-KL polish override.  Default `None` falls through to
+    // the Rust `JointPoissonFitConfig::default().enable_polish` (now
+    // `false`).  Pass `enable_polish=True` to opt back in for clean /
+    // synthetic fits where the polish tolerances are physically
+    // meaningful (see the field doc on `JointPoissonFitConfig::enable_polish`).
+    if let Some(v) = enable_polish {
+        config = config.with_counts_enable_polish(Some(v));
+    }
 
     let result = py.detach(move || fit_spectrum_typed(&input, &config).map_err(|e| e.to_string()));
     let result = result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;

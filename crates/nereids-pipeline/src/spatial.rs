@@ -1901,7 +1901,7 @@ mod tests {
             "multi-pixel with no override should auto-disable polish"
         );
 
-        // Single-pixel (n = 1) → no change (let single-spectrum default on).
+        // Single-pixel (n = 1) → no change (let the library default decide).
         let resolved = apply_spatial_polish_default(cfg.clone(), 1);
         assert_eq!(
             resolved.counts_enable_polish(),
