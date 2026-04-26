@@ -337,6 +337,12 @@ pub struct UnifiedFitConfig {
     l_scale_init: f64,
     /// Flight path in meters for TOF↔energy conversion (default from resolution or 25.0).
     flight_path_m: f64,
+    /// Method for the t0 / L_scale Jacobian columns. `None` defers to
+    /// `EnergyScaleJacobianMethod::from_env`: it uses the
+    /// `NEREIDS_TZERO_JACOBIAN` env var when set, and otherwise falls
+    /// back to `PartialGal` (the default since issue #489).
+    /// `Some(_)` bypasses both the env var and the default.
+    tzero_jacobian_method: Option<nereids_fitting::transmission_model::EnergyScaleJacobianMethod>,
 
     // ── Isotope group mapping (optional) ──
     /// Maps member isotope index → density parameter index.
@@ -409,7 +415,22 @@ impl UnifiedFitConfig {
             density_indices: None,
             density_ratios: None,
             n_density_params: None,
+            tzero_jacobian_method: None,
         })
+    }
+
+    /// Override the method used for the t0 / L_scale Jacobian columns
+    /// in `EnergyScaleTransmissionModel`. `None` (default) defers to
+    /// the model's own default selection via
+    /// `EnergyScaleJacobianMethod::from_env`: `PartialGal` since issue
+    /// #489 unless overridden by `NEREIDS_TZERO_JACOBIAN`.
+    #[must_use]
+    pub fn with_tzero_jacobian_method(
+        mut self,
+        method: Option<nereids_fitting::transmission_model::EnergyScaleJacobianMethod>,
+    ) -> Self {
+        self.tzero_jacobian_method = method;
+        self
     }
 
     // ── Builder methods ──
@@ -1028,7 +1049,7 @@ fn fit_transmission_lm(
             .resolution
             .clone()
             .map(|r| Arc::new(InstrumentParams { resolution: r }));
-        Box::new(EnergyScaleTransmissionModel::new(
+        let mut es_model = EnergyScaleTransmissionModel::new(
             effective_xs,
             Arc::new(density_indices),
             config.energies.clone(),
@@ -1036,7 +1057,11 @@ fn fit_transmission_lm(
             t0_idx,
             ls_idx,
             instrument,
-        ))
+        );
+        if let Some(method) = config.tzero_jacobian_method {
+            es_model = es_model.with_jacobian_method(method);
+        }
+        Box::new(es_model)
     } else {
         build_transmission_model(config, n_density_params, _temperature_index)?
     };
@@ -1163,7 +1188,7 @@ fn fit_transmission_poisson(
             .resolution
             .clone()
             .map(|r| Arc::new(InstrumentParams { resolution: r }));
-        Box::new(EnergyScaleTransmissionModel::new(
+        let mut es_model = EnergyScaleTransmissionModel::new(
             effective_xs,
             Arc::new(density_indices),
             config.energies.clone(),
@@ -1171,7 +1196,11 @@ fn fit_transmission_poisson(
             t0_idx,
             ls_idx,
             instrument,
-        ))
+        );
+        if let Some(method) = config.tzero_jacobian_method {
+            es_model = es_model.with_jacobian_method(method);
+        }
+        Box::new(es_model)
     } else {
         build_transmission_model(config, n_density_params, temperature_index)?
     };
@@ -1368,7 +1397,7 @@ fn fit_counts_joint_poisson(
             .resolution
             .clone()
             .map(|r| Arc::new(InstrumentParams { resolution: r }));
-        Box::new(EnergyScaleTransmissionModel::new(
+        let mut es_model = EnergyScaleTransmissionModel::new(
             effective_xs,
             Arc::new(density_indices),
             config.energies.clone(),
@@ -1376,7 +1405,11 @@ fn fit_counts_joint_poisson(
             t0_idx,
             ls_idx,
             instrument,
-        ))
+        );
+        if let Some(method) = config.tzero_jacobian_method {
+            es_model = es_model.with_jacobian_method(method);
+        }
+        Box::new(es_model)
     } else {
         build_transmission_model(config, n_density_params, temperature_index)?
     };
