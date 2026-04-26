@@ -2723,12 +2723,13 @@ fn validate_energy_scale_params(
 /// `EnergyScaleJacobianMethod` enum.
 ///
 /// Recognised values (case-insensitive):
-/// - `"fd2"`, `"finite-difference"`, `"finite_difference"` → FiniteDifference (default).
-/// - `"partial-gal"`, `"partial_gal"`                       → PartialGal (issue #489).
-/// - `"chain"`, `"frozen-r"`, `"frozen_r"`                  → FrozenResolutionChainRule.
+/// - `"fd2"`, `"finite-difference"`, `"finite_difference"` → FiniteDifference.
+/// - `"partial-gal"`, `"partial_gal"`                      → PartialGal.
+/// - `"chain"`, `"frozen-r"`, `"frozen_r"`                 → FrozenResolutionChainRule.
 ///
-/// `None` returns `Ok(None)` (no override; the Rust model uses its own
-/// default, which falls back to the `NEREIDS_TZERO_JACOBIAN` env var).
+/// `None` returns `Ok(None)`, deferring to the Rust model's
+/// `EnergyScaleJacobianMethod::from_env`: the `NEREIDS_TZERO_JACOBIAN`
+/// env var when set, otherwise `PartialGal` (default since issue #489).
 fn parse_tzero_jacobian(
     s: Option<&str>,
 ) -> PyResult<Option<nereids_fitting::transmission_model::EnergyScaleJacobianMethod>> {
@@ -2750,7 +2751,10 @@ fn parse_tzero_jacobian(
         EnergyScaleJacobianMethod::FrozenResolutionChainRule
     } else {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "tzero_jacobian must be one of \"fd2\", \"partial_gal\", \"chain\", got {name:?}"
+            "tzero_jacobian must be one of: \
+             \"fd2\", \"finite-difference\", \"finite_difference\"; \
+             \"partial-gal\", \"partial_gal\"; \
+             \"chain\", \"frozen-r\", \"frozen_r\"; got {name:?}"
         )));
     };
     Ok(Some(m))

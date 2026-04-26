@@ -874,6 +874,105 @@ class TestFitCountsSpectrumTyped:
                 f"|Δn|/σ = {abs(d_on - d_off) / sigma:.3f}"
             )
 
+    def test_tzero_jacobian_kwarg_accepted_and_alias_resolution(self, u238_data):
+        """Issue #489: `tzero_jacobian` kwarg must be accepted on the
+        Python `fit_counts_spectrum_typed` binding, default `None` must
+        defer to the library default (PartialGal post-#489), explicit
+        ``"fd2"`` / ``"partial_gal"`` / ``"chain"`` must all be accepted,
+        and underscore + dash aliases must resolve identically.
+
+        Guards against a future binding refactor silently dropping the
+        kwarg or stranding the override plumbing — same defect class
+        Copilot caught on PR #487 polish-off.
+        """
+        energies = np.linspace(1.0, 30.0, 200)
+        true_density = 0.0008
+        flux = 1000.0
+
+        t_1d = np.asarray(
+            nereids.forward_model(energies, [(u238_data, true_density)])
+        )
+        rng = np.random.default_rng(20260426)
+        open_beam = rng.poisson(np.full_like(t_1d, flux)).astype(float)
+        sample = rng.poisson(flux * t_1d).astype(float)
+        open_beam = np.maximum(open_beam, 1.0)
+
+        kwargs = dict(
+            sample_counts=sample,
+            open_beam_counts=open_beam,
+            energies=energies,
+            isotopes=[(u238_data, true_density)],
+            solver="kl",
+            c=1.0,
+            temperature_k=293.6,
+            max_iter=200,
+            fit_energy_scale=True,
+            t0_init_us=0.0,
+            l_scale_init=1.0,
+        )
+
+        # Default kwarg None == explicit "partial_gal" (post-#489 default).
+        r_default = nereids.fit_counts_spectrum_typed(**kwargs)
+        r_pg = nereids.fit_counts_spectrum_typed(
+            **kwargs, tzero_jacobian="partial_gal"
+        )
+        # Underscore / dash aliases.
+        r_pg_dash = nereids.fit_counts_spectrum_typed(
+            **kwargs, tzero_jacobian="partial-gal"
+        )
+        # Explicit FD2 opt-out.
+        r_fd2 = nereids.fit_counts_spectrum_typed(**kwargs, tzero_jacobian="fd2")
+        r_fd2_dash = nereids.fit_counts_spectrum_typed(
+            **kwargs, tzero_jacobian="finite-difference"
+        )
+        # Frozen-R chain rule alias variants.
+        r_chain = nereids.fit_counts_spectrum_typed(
+            **kwargs, tzero_jacobian="chain"
+        )
+        r_chain_dash = nereids.fit_counts_spectrum_typed(
+            **kwargs, tzero_jacobian="frozen-r"
+        )
+        r_chain_underscore = nereids.fit_counts_spectrum_typed(
+            **kwargs, tzero_jacobian="frozen_r"
+        )
+
+        # All variants must produce a valid result.
+        for r in (
+            r_default,
+            r_pg,
+            r_pg_dash,
+            r_fd2,
+            r_fd2_dash,
+            r_chain,
+            r_chain_dash,
+            r_chain_underscore,
+        ):
+            assert r.densities[0] > 0.0
+            assert r.iterations > 0
+            assert np.isfinite(r.t0_us)
+            assert np.isfinite(r.l_scale)
+
+        # Default == explicit "partial_gal": the None path must defer
+        # to PartialGal, not FD2 or chain.
+        assert r_default.densities[0] == r_pg.densities[0], (
+            f"tzero_jacobian=None must match =\"partial_gal\"; got "
+            f"None={r_default.densities[0]} pg={r_pg.densities[0]}"
+        )
+        assert r_default.t0_us == r_pg.t0_us
+        assert r_default.l_scale == r_pg.l_scale
+
+        # Underscore / dash aliases must resolve identically.
+        assert r_pg.densities[0] == r_pg_dash.densities[0]
+        assert r_fd2.densities[0] == r_fd2_dash.densities[0]
+        assert r_chain.densities[0] == r_chain_dash.densities[0]
+        assert r_chain.densities[0] == r_chain_underscore.densities[0]
+
+        # Invalid value must raise ValueError listing the supported set.
+        with pytest.raises(ValueError, match="tzero_jacobian must be one of"):
+            nereids.fit_counts_spectrum_typed(
+                **kwargs, tzero_jacobian="not-a-real-method"
+            )
+
 
 # ===========================================================================
 # Normalization

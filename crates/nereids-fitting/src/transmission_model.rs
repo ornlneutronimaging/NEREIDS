@@ -1519,9 +1519,12 @@ impl<M: FitModel> FitModel for NormalizedTransmissionModel<M> {
 ///
 /// This is equivalent to SAMMY's TZERO parameters.
 ///
-/// The Jacobian for t₀ and L_scale is computed via finite differences
-/// (the energy-grid remapping is nonlinear and not easily differentiable
-/// analytically through the interpolation + resolution pipeline).
+/// The Jacobian for t₀ and L_scale defaults to **partial-GAL** since
+/// issue #489: central FD on `t0` only (2 evals) plus an inline rank-1
+/// derivation of the `L_scale` column. The previous central-FD-on-both
+/// (4-eval) behaviour is reachable via `with_jacobian_method`,
+/// `NEREIDS_TZERO_JACOBIAN=fd2`, or `tzero_jacobian="fd2"` Python kwarg.
+/// See [`EnergyScaleJacobianMethod`] for full method documentation.
 pub struct EnergyScaleTransmissionModel {
     /// Precomputed cross-sections on the NOMINAL energy grid.
     cross_sections: Arc<Vec<Vec<f64>>>,
@@ -1564,10 +1567,11 @@ pub struct EnergyScaleTransmissionModel {
     /// `RefCell` is safe: `TransmissionFitModel`-family models are
     /// rebuilt per-pixel and never shared across rayon workers.
     cached_plans: RefCell<CachedPlanRing>,
-    /// Method for the t0 / L_scale Jacobian columns. Default
-    /// `FiniteDifference` (current production behaviour). Can be
-    /// overridden per-instance via `with_jacobian_method` or globally
-    /// via the `NEREIDS_TZERO_JACOBIAN` env var.
+    /// Method for the t0 / L_scale Jacobian columns. Initialised from
+    /// [`EnergyScaleJacobianMethod::from_env`] in [`Self::new`], which
+    /// defaults to `PartialGal` since issue #489 (and respects the
+    /// `NEREIDS_TZERO_JACOBIAN` env var as a global override). Can be
+    /// overridden per-instance via [`Self::with_jacobian_method`].
     jacobian_method: EnergyScaleJacobianMethod,
 }
 
@@ -1619,13 +1623,19 @@ impl CachedPlanRing {
 ///   (2 evaluations); derive `L_scale` column inline via the rank-1
 ///   identity `J[:, L_scale] = ((tof - t0) / L_scale) * J[:, t0]` per
 ///   energy bin. Halves the FD probe count on workloads where both
-///   calibration parameters are free; structurally exact when the
-///   resolution kernel depends on `(t0, L_scale)` solely through the
-///   corrected energy grid. `broaden_presorted` uses
-///   `self.flight_path_m` (not the model's `L_nominal * L_scale`) so
-///   tabulated kernels satisfy this property.  On real VENUS Hf
-///   120-min KL+per-iso+TZERO 4×4: 15/16 pixels converge within
-///   0.1·σ_Fisher of FD2; median wall-time speedup 1.28× over FD2.
+///   calibration parameters are free.
+///
+///   **Correctness regime**: exact in the no-resolution limit and the
+///   narrow-kernel limit. With a non-trivial resolution operator `R`,
+///   the rank-1 simplification additionally assumes per-bin uniformity
+///   of `(tof - t0) / L_scale` over the kernel support — necessary
+///   because `R` mixes source bins whose ratios differ. `broaden_presorted`
+///   uses `self.flight_path_m` (not the model's `L_nominal * L_scale`) so
+///   tabulated kernels satisfy the structural factorisation through
+///   `e_corr`, but the per-bin homogeneity assumption is empirical.
+///   On real VENUS Hf 120-min KL+per-iso+TZERO 4×4 the approximation is
+///   tight enough that 15/16 pixels converge within 0.1·σ_Fisher of FD2;
+///   median wall-time speedup 1.28× over FD2.
 /// - `FiniteDifference`: central FD on the full inner forward chain,
 ///   4 forward evaluations per Jacobian (h_t0=1e-4, h_ls=1e-7).
 ///   The pre-#489 production default; reachable via
@@ -1644,7 +1654,24 @@ pub enum EnergyScaleJacobianMethod {
 }
 
 impl EnergyScaleJacobianMethod {
+    /// Resolve the default Jacobian method from the
+    /// `NEREIDS_TZERO_JACOBIAN` env var.
+    ///
+    /// The env var is read **once per process** via a `OnceLock`. Per
+    /// `EnergyScaleTransmissionModel::new` is hot under
+    /// `spatial_map_typed` (one model per pixel; 262 144 calls per
+    /// 512×512 map), so `std::env::var` would otherwise be a syscall
+    /// hot spot. Tests that need to swap the default must use
+    /// `EnergyScaleTransmissionModel::with_jacobian_method` (which
+    /// bypasses the cache); changing the env var mid-process has no
+    /// effect.
     fn from_env() -> Self {
+        use std::sync::OnceLock;
+        static CACHED: OnceLock<EnergyScaleJacobianMethod> = OnceLock::new();
+        *CACHED.get_or_init(Self::resolve_env_uncached)
+    }
+
+    fn resolve_env_uncached() -> Self {
         match std::env::var("NEREIDS_TZERO_JACOBIAN") {
             Ok(v)
                 if v.eq_ignore_ascii_case("fd2")
@@ -1653,7 +1680,11 @@ impl EnergyScaleJacobianMethod {
             {
                 Self::FiniteDifference
             }
-            Ok(v) if v.eq_ignore_ascii_case("chain") || v.eq_ignore_ascii_case("frozen-r") => {
+            Ok(v)
+                if v.eq_ignore_ascii_case("chain")
+                    || v.eq_ignore_ascii_case("frozen-r")
+                    || v.eq_ignore_ascii_case("frozen_r") =>
+            {
                 Self::FrozenResolutionChainRule
             }
             // Default (and explicit `"partial-gal"` / `"partial_gal"`)
@@ -2038,36 +2069,57 @@ impl FitModel for EnergyScaleTransmissionModel {
         let l_scale_free_pos = free_param_indices
             .iter()
             .position(|&idx| idx == self.l_scale_index);
-        // For partial-GAL we need t0 and L_scale columns paired so the
-        // L_scale column can be derived from the t0 column. Compute
-        // the t0 FD column up-front when both are free so the loop
-        // below can re-use it.
+        // Partial-GAL t0 FD pair (precomputed once; the L_scale column
+        // is derived from this column inline below). Skipped when:
+        // - method is not PartialGal, OR
+        // - either t0 or L_scale is fixed (the rank-1 derivation needs
+        //   both columns paired), OR
+        // - `t0 + h` would land at or above the `corrected_energies`
+        //   clamp (`min_tof * (1 - 1e-12)`). At the clamp, both `±h`
+        //   probes collapse to the same clamped value: the t0 FD column
+        //   becomes ~0, and the rank-1 L_scale column would also be ~0
+        //   even though `corrected_energies` does NOT clamp on
+        //   `L_scale`. Falling through here lets the standard
+        //   per-coordinate FD path below compute the L_scale column
+        //   correctly. Issue #489 review L5.
         let partial_gal_t0_column = if energy_scale_method == EnergyScaleJacobianMethod::PartialGal
             && t0_free_pos.is_some()
             && l_scale_free_pos.is_some()
         {
             let h = 1e-4;
-            let mut p_plus = params.to_vec();
-            let mut p_minus = params.to_vec();
-            p_plus[self.t0_index] += h;
-            p_minus[self.t0_index] -= h;
-            let e_corr_plus =
-                self.corrected_energies(p_plus[self.t0_index], p_plus[self.l_scale_index]);
-            let e_corr_minus =
-                self.corrected_energies(p_minus[self.t0_index], p_minus[self.l_scale_index]);
-            let y_plus = match self.evaluate_at_with_cache(&p_plus, &e_corr_plus, false) {
-                Ok(v) => v,
-                Err(_) => return None,
-            };
-            let y_minus = match self.evaluate_at_with_cache(&p_minus, &e_corr_minus, false) {
-                Ok(v) => v,
-                Err(_) => return None,
-            };
-            let mut col = vec![0.0f64; n_e];
-            for i in 0..n_e {
-                col[i] = (y_plus[i] - y_minus[i]) / (2.0 * h);
+            let min_tof_us = self
+                .nominal_energies
+                .iter()
+                .map(|&e| self.tof_factor * self.flight_path_m / e.sqrt())
+                .fold(f64::INFINITY, f64::min);
+            let t0_limit = min_tof_us * (1.0 - 1.0e-12);
+            // Need (t0 + h) strictly below the clamp so the +h probe
+            // returns a distinct corrected grid; otherwise fall through.
+            if t0 + h >= t0_limit {
+                None
+            } else {
+                let mut p_plus = params.to_vec();
+                let mut p_minus = params.to_vec();
+                p_plus[self.t0_index] += h;
+                p_minus[self.t0_index] -= h;
+                let e_corr_plus =
+                    self.corrected_energies(p_plus[self.t0_index], p_plus[self.l_scale_index]);
+                let e_corr_minus =
+                    self.corrected_energies(p_minus[self.t0_index], p_minus[self.l_scale_index]);
+                let y_plus = match self.evaluate_at_with_cache(&p_plus, &e_corr_plus, false) {
+                    Ok(v) => v,
+                    Err(_) => return None,
+                };
+                let y_minus = match self.evaluate_at_with_cache(&p_minus, &e_corr_minus, false) {
+                    Ok(v) => v,
+                    Err(_) => return None,
+                };
+                let mut col = vec![0.0f64; n_e];
+                for i in 0..n_e {
+                    col[i] = (y_plus[i] - y_minus[i]) / (2.0 * h);
+                }
+                Some(col)
             }
-            Some(col)
         } else {
             None
         };
@@ -2141,13 +2193,18 @@ impl FitModel for EnergyScaleTransmissionModel {
                 // column comes from a single pre-computed FD pair (above),
                 // and the L_scale column is the per-bin rank-1 derivation
                 //   J[:, L_scale]_i = ((tof_i - t0_clamped) / L_scale) * J[:, t0]_i.
-                // The factorisation through the resolution-internal TOF
-                // vector is exact when `R` depends on `(t0, L_scale)`
-                // only through `e_corr` — see `broaden_presorted` which
-                // uses `self.flight_path_m` (not the model's
-                // `L_nominal * L_scale`) for `tof_center` / `e_prime`.
-                // When only one of the two parameters is free, we fall
-                // through to the standard FD path below.
+                //
+                // The structural factorisation through `e_corr` holds
+                // when `R` depends on `(t0, L_scale)` only through
+                // `e_corr` — `broaden_presorted` uses `self.flight_path_m`
+                // (not the model's `L_nominal * L_scale`) for
+                // `tof_center` / `e_prime`, so tabulated kernels satisfy
+                // it. The per-bin rank-1 simplification additionally
+                // assumes per-bin homogeneity of `(tof - t0) / L_scale`
+                // across the kernel support; see the
+                // `EnergyScaleJacobianMethod` doc for the empirical
+                // characterisation. When only one of t0 / L_scale is
+                // free, we fall through to the standard FD path below.
                 if let Some(partial_t0_col) = &partial_gal_t0_column {
                     if fp_idx == self.t0_index {
                         for (i, &val) in partial_t0_col.iter().enumerate() {
@@ -4953,6 +5010,13 @@ mod tests {
     fn partial_gal_no_resolution_matches_fd2() {
         let xs = vec![vec![1.0, 2.0, 3.0, 2.0, 1.5]];
         let energies = vec![4.0, 9.0, 16.0, 25.0, 36.0];
+        // Pin both reference and alt models explicitly via
+        // `with_jacobian_method` so the test is independent of the
+        // process-global `NEREIDS_TZERO_JACOBIAN` env var.  Without
+        // pinning, the post-#489 default of `PartialGal` would make
+        // the "FD2 reference" actually run partial-GAL (vacuous
+        // self-comparison), and `NEREIDS_TZERO_JACOBIAN=chain` would
+        // run chain-rule against partial-GAL (wrong comparison).
         let mut model = EnergyScaleTransmissionModel::new(
             std::sync::Arc::new(xs),
             std::sync::Arc::new(vec![0]),
@@ -4961,12 +5025,13 @@ mod tests {
             1, // t0_index
             2, // l_scale_index
             None,
-        );
+        )
+        .with_jacobian_method(EnergyScaleJacobianMethod::FiniteDifference);
 
         let params = [0.1, 0.05, 1.002]; // density, t0, l_scale
         let free = vec![0, 1, 2];
 
-        // FD2 reference Jacobian (default method).
+        // FD2 reference Jacobian (explicitly pinned above).
         let jac_fd2 = model
             .analytical_jacobian(&params, &free, &model.evaluate(&params).unwrap())
             .expect("FD2 Jacobian should be available");

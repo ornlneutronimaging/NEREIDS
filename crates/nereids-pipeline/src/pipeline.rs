@@ -337,10 +337,11 @@ pub struct UnifiedFitConfig {
     l_scale_init: f64,
     /// Flight path in meters for TOF↔energy conversion (default from resolution or 25.0).
     flight_path_m: f64,
-    /// Method for the t0 / L_scale Jacobian columns. `None` lets the
-    /// fit model pick its default (currently `FiniteDifference`, with
-    /// the `NEREIDS_TZERO_JACOBIAN` env var as a global override).
-    /// `Some(_)` overrides the env var. Issue #489.
+    /// Method for the t0 / L_scale Jacobian columns. `None` defers to
+    /// `EnergyScaleJacobianMethod::from_env`: it uses the
+    /// `NEREIDS_TZERO_JACOBIAN` env var when set, and otherwise falls
+    /// back to `PartialGal` (the default since issue #489).
+    /// `Some(_)` bypasses both the env var and the default.
     tzero_jacobian_method: Option<nereids_fitting::transmission_model::EnergyScaleJacobianMethod>,
 
     // ── Isotope group mapping (optional) ──
@@ -420,9 +421,9 @@ impl UnifiedFitConfig {
 
     /// Override the method used for the t0 / L_scale Jacobian columns
     /// in `EnergyScaleTransmissionModel`. `None` (default) defers to
-    /// the model's own default (FiniteDifference, with
-    /// `NEREIDS_TZERO_JACOBIAN` env var as global override).
-    /// Issue #489.
+    /// the model's own default selection via
+    /// `EnergyScaleJacobianMethod::from_env`: `PartialGal` since issue
+    /// #489 unless overridden by `NEREIDS_TZERO_JACOBIAN`.
     #[must_use]
     pub fn with_tzero_jacobian_method(
         mut self,
