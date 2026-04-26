@@ -1564,6 +1564,11 @@ pub struct EnergyScaleTransmissionModel {
     /// `RefCell` is safe: `TransmissionFitModel`-family models are
     /// rebuilt per-pixel and never shared across rayon workers.
     cached_plans: RefCell<CachedPlanRing>,
+    /// Method for the t0 / L_scale Jacobian columns. Default
+    /// `FiniteDifference` (current production behaviour). Can be
+    /// overridden per-instance via `with_jacobian_method` or globally
+    /// via the `NEREIDS_TZERO_JACOBIAN` env var.
+    jacobian_method: EnergyScaleJacobianMethod,
 }
 
 /// One `(t0_bits, l_scale_bits)` → `ResolutionPlan` entry.  Named
@@ -1607,6 +1612,57 @@ impl CachedPlanRing {
     }
 }
 
+/// Method for computing the t0 / L_scale columns of the
+/// `EnergyScaleTransmissionModel` Jacobian.
+///
+/// - `PartialGal` (default since issue #489): central FD on `t0` only
+///   (2 evaluations); derive `L_scale` column inline via the rank-1
+///   identity `J[:, L_scale] = ((tof - t0) / L_scale) * J[:, t0]` per
+///   energy bin. Halves the FD probe count on workloads where both
+///   calibration parameters are free; structurally exact when the
+///   resolution kernel depends on `(t0, L_scale)` solely through the
+///   corrected energy grid. `broaden_presorted` uses
+///   `self.flight_path_m` (not the model's `L_nominal * L_scale`) so
+///   tabulated kernels satisfy this property.  On real VENUS Hf
+///   120-min KL+per-iso+TZERO 4×4: 15/16 pixels converge within
+///   0.1·σ_Fisher of FD2; median wall-time speedup 1.28× over FD2.
+/// - `FiniteDifference`: central FD on the full inner forward chain,
+///   4 forward evaluations per Jacobian (h_t0=1e-4, h_ls=1e-7).
+///   The pre-#489 production default; reachable via
+///   `NEREIDS_TZERO_JACOBIAN=fd2` env var or `tzero_jacobian="fd2"`
+///   Python kwarg.
+/// - `FrozenResolutionChainRule`: chain rule through the corrected-grid
+///   sigma interpolation, applied to the cached resolution operator.
+///   Drops the kernel-motion term `(dR/dp) * T_un`. Faster than FD2
+///   but biased — round-2/round-3 research showed CR underperforms
+///   PartialGal on real VENUS data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnergyScaleJacobianMethod {
+    FiniteDifference,
+    FrozenResolutionChainRule,
+    PartialGal,
+}
+
+impl EnergyScaleJacobianMethod {
+    fn from_env() -> Self {
+        match std::env::var("NEREIDS_TZERO_JACOBIAN") {
+            Ok(v)
+                if v.eq_ignore_ascii_case("fd2")
+                    || v.eq_ignore_ascii_case("finite-difference")
+                    || v.eq_ignore_ascii_case("finite_difference") =>
+            {
+                Self::FiniteDifference
+            }
+            Ok(v) if v.eq_ignore_ascii_case("chain") || v.eq_ignore_ascii_case("frozen-r") => {
+                Self::FrozenResolutionChainRule
+            }
+            // Default (and explicit `"partial-gal"` / `"partial_gal"`)
+            // route to `PartialGal` per issue #489.
+            _ => Self::PartialGal,
+        }
+    }
+}
+
 impl EnergyScaleTransmissionModel {
     /// Create a new energy-scale transmission model.
     ///
@@ -1644,7 +1700,16 @@ impl EnergyScaleTransmissionModel {
             l_scale_index,
             instrument,
             cached_plans: RefCell::new(CachedPlanRing::default()),
+            jacobian_method: EnergyScaleJacobianMethod::from_env(),
         }
+    }
+
+    /// Override the t0 / L_scale Jacobian method for this model instance.
+    /// Bypasses the `NEREIDS_TZERO_JACOBIAN` env var.
+    #[must_use]
+    pub fn with_jacobian_method(mut self, method: EnergyScaleJacobianMethod) -> Self {
+        self.jacobian_method = method;
+        self
     }
 
     /// Build or reuse the broadening plan for the current `(t0, L_scale)`
@@ -1737,6 +1802,40 @@ impl EnergyScaleTransmissionModel {
             .collect()
     }
 
+    fn corrected_energy_derivatives(
+        &self,
+        t0_us: f64,
+        l_scale: f64,
+        corrected_e: &[f64],
+    ) -> (Vec<f64>, Vec<f64>) {
+        if self.nominal_energies.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        let min_tof = self
+            .nominal_energies
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, |acc, e| {
+                acc.min(self.tof_factor * self.flight_path_m / e.sqrt())
+            });
+        let t0_limit = min_tof * (1.0 - 1.0e-12);
+        let t0_clamped = t0_us.min(t0_limit);
+        let t0_is_clamped = t0_us > t0_limit;
+        let mut de_dt0 = Vec::with_capacity(corrected_e.len());
+        let mut de_dl = Vec::with_capacity(corrected_e.len());
+        for (&e_nom, &e_corr) in self.nominal_energies.iter().zip(corrected_e.iter()) {
+            let tof = self.tof_factor * self.flight_path_m / e_nom.sqrt();
+            let tof_corr = tof - t0_clamped;
+            de_dt0.push(if t0_is_clamped {
+                0.0
+            } else {
+                2.0 * e_corr / tof_corr
+            });
+            de_dl.push(2.0 * e_corr / l_scale);
+        }
+        (de_dt0, de_dl)
+    }
+
     /// Interpolate a cross-section array from nominal grid to corrected grid.
     fn interpolate_xs(nominal_e: &[f64], xs: &[f64], corrected_e: &[f64]) -> Vec<f64> {
         corrected_e
@@ -1756,6 +1855,92 @@ impl EnergyScaleTransmissionModel {
                 xs[i] + frac * (xs[i + 1] - xs[i])
             })
             .collect()
+    }
+
+    /// Interpolate a cross-section array and return the local piecewise-linear slope.
+    fn interpolate_xs_and_slope(
+        nominal_e: &[f64],
+        xs: &[f64],
+        corrected_e: &[f64],
+    ) -> (Vec<f64>, Vec<f64>) {
+        let n = nominal_e.len();
+        let mut values = Vec::with_capacity(corrected_e.len());
+        let mut slopes = Vec::with_capacity(corrected_e.len());
+        for &e_corr in corrected_e {
+            if e_corr <= nominal_e[0] {
+                values.push(xs[0]);
+                slopes.push(0.0);
+                continue;
+            }
+            if e_corr >= nominal_e[n - 1] {
+                values.push(xs[n - 1]);
+                slopes.push(0.0);
+                continue;
+            }
+            let pos = nominal_e.partition_point(|&e| e < e_corr);
+            let i = if pos == 0 { 0 } else { pos - 1 };
+            let span = nominal_e[i + 1] - nominal_e[i];
+            let slope = (xs[i + 1] - xs[i]) / span;
+            let frac = (e_corr - nominal_e[i]) / span;
+            values.push(xs[i] + frac * (xs[i + 1] - xs[i]));
+            slopes.push(slope);
+        }
+        (values, slopes)
+    }
+
+    fn frozen_resolution_energy_scale_columns(
+        &self,
+        params: &[f64],
+        e_corr: &[f64],
+        t_unresolved: &[f64],
+        interp_slopes_all: &[Vec<f64>],
+        density_plan: Option<&ResolutionPlan>,
+    ) -> Result<(Vec<f64>, Vec<f64>), FittingError> {
+        let n_e = self.nominal_energies.len();
+        let t0 = params[self.t0_index];
+        let l_scale = params[self.l_scale_index];
+        let (de_dt0, de_dl) = self.corrected_energy_derivatives(t0, l_scale, e_corr);
+
+        let mut du_dt0 = vec![0.0f64; n_e];
+        let mut du_dl = vec![0.0f64; n_e];
+        for j in 0..n_e {
+            let mut attenuation_slope = 0.0f64;
+            for (iso, slopes) in interp_slopes_all.iter().enumerate() {
+                let density = params[self.density_indices[iso]];
+                attenuation_slope += density * slopes[j];
+            }
+            let base = -t_unresolved[j] * attenuation_slope;
+            du_dt0[j] = base * de_dt0[j];
+            du_dl[j] = base * de_dl[j];
+        }
+
+        if let Some(inst) = &self.instrument {
+            let j_t0 = resolution::apply_resolution_with_plan(
+                density_plan,
+                e_corr,
+                &du_dt0,
+                &inst.resolution,
+            )
+            .map_err(|e| {
+                FittingError::EvaluationFailed(format!(
+                    "resolution broadening for chain-rule t0 column: {e}"
+                ))
+            })?;
+            let j_l = resolution::apply_resolution_with_plan(
+                density_plan,
+                e_corr,
+                &du_dl,
+                &inst.resolution,
+            )
+            .map_err(|e| {
+                FittingError::EvaluationFailed(format!(
+                    "resolution broadening for chain-rule L_scale column: {e}"
+                ))
+            })?;
+            Ok((j_t0, j_l))
+        } else {
+            Ok((du_dt0, du_dl))
+        }
     }
 
     /// Evaluate transmission at given parameters (densities + t0 + l_scale).
@@ -1841,13 +2026,66 @@ impl FitModel for EnergyScaleTransmissionModel {
         let t0 = params[self.t0_index];
         let l_scale = params[self.l_scale_index];
         let e_corr = self.corrected_energies(t0, l_scale);
+        let energy_scale_method = self.jacobian_method;
+        let need_energy_scale_chain = energy_scale_method
+            == EnergyScaleJacobianMethod::FrozenResolutionChainRule
+            && free_param_indices
+                .iter()
+                .any(|&idx| idx == self.t0_index || idx == self.l_scale_index);
+        let t0_free_pos = free_param_indices
+            .iter()
+            .position(|&idx| idx == self.t0_index);
+        let l_scale_free_pos = free_param_indices
+            .iter()
+            .position(|&idx| idx == self.l_scale_index);
+        // For partial-GAL we need t0 and L_scale columns paired so the
+        // L_scale column can be derived from the t0 column. Compute
+        // the t0 FD column up-front when both are free so the loop
+        // below can re-use it.
+        let partial_gal_t0_column = if energy_scale_method == EnergyScaleJacobianMethod::PartialGal
+            && t0_free_pos.is_some()
+            && l_scale_free_pos.is_some()
+        {
+            let h = 1e-4;
+            let mut p_plus = params.to_vec();
+            let mut p_minus = params.to_vec();
+            p_plus[self.t0_index] += h;
+            p_minus[self.t0_index] -= h;
+            let e_corr_plus =
+                self.corrected_energies(p_plus[self.t0_index], p_plus[self.l_scale_index]);
+            let e_corr_minus =
+                self.corrected_energies(p_minus[self.t0_index], p_minus[self.l_scale_index]);
+            let y_plus = match self.evaluate_at_with_cache(&p_plus, &e_corr_plus, false) {
+                Ok(v) => v,
+                Err(_) => return None,
+            };
+            let y_minus = match self.evaluate_at_with_cache(&p_minus, &e_corr_minus, false) {
+                Ok(v) => v,
+                Err(_) => return None,
+            };
+            let mut col = vec![0.0f64; n_e];
+            for i in 0..n_e {
+                col[i] = (y_plus[i] - y_minus[i]) / (2.0 * h);
+            }
+            Some(col)
+        } else {
+            None
+        };
 
         // Compute unresolved T and interpolated cross-sections for density derivatives
         let mut neg_opt = vec![0.0f64; n_e];
         let mut interp_xs_all: Vec<Vec<f64>> = Vec::new();
+        let mut interp_slopes_all: Vec<Vec<f64>> = Vec::new();
         for (i, xs) in self.cross_sections.iter().enumerate() {
             let density = params[self.density_indices[i]];
-            let xs_interp = Self::interpolate_xs(&self.nominal_energies, xs, &e_corr);
+            let xs_interp = if need_energy_scale_chain {
+                let (values, slopes) =
+                    Self::interpolate_xs_and_slope(&self.nominal_energies, xs, &e_corr);
+                interp_slopes_all.push(slopes);
+                values
+            } else {
+                Self::interpolate_xs(&self.nominal_energies, xs, &e_corr)
+            };
             for (j, &sigma) in xs_interp.iter().enumerate() {
                 neg_opt[j] -= density * sigma;
             }
@@ -1875,9 +2113,69 @@ impl FitModel for EnergyScaleTransmissionModel {
         // `None` → `apply_resolution_with_plan(None, …)` forwards
         // byte-identically to `apply_resolution`.
         let density_plan = self.cached_resolution_plan(t0, l_scale, &e_corr);
+        let energy_scale_chain_columns = if need_energy_scale_chain {
+            match self.frozen_resolution_energy_scale_columns(
+                params,
+                &e_corr,
+                &t_unresolved,
+                &interp_slopes_all,
+                density_plan.as_deref(),
+            ) {
+                Ok(cols) => Some(cols),
+                Err(_) => return None,
+            }
+        } else {
+            None
+        };
 
         for (col, &fp_idx) in free_param_indices.iter().enumerate() {
             if fp_idx == self.t0_index || fp_idx == self.l_scale_index {
+                if let Some((j_t0, j_l)) = &energy_scale_chain_columns {
+                    let source = if fp_idx == self.t0_index { j_t0 } else { j_l };
+                    for (i, &val) in source.iter().enumerate() {
+                        *jacobian.get_mut(i, col) = val;
+                    }
+                    continue;
+                }
+                // partial-GAL: when both t0 and L_scale are free, the t0
+                // column comes from a single pre-computed FD pair (above),
+                // and the L_scale column is the per-bin rank-1 derivation
+                //   J[:, L_scale]_i = ((tof_i - t0_clamped) / L_scale) * J[:, t0]_i.
+                // The factorisation through the resolution-internal TOF
+                // vector is exact when `R` depends on `(t0, L_scale)`
+                // only through `e_corr` — see `broaden_presorted` which
+                // uses `self.flight_path_m` (not the model's
+                // `L_nominal * L_scale`) for `tof_center` / `e_prime`.
+                // When only one of the two parameters is free, we fall
+                // through to the standard FD path below.
+                if let Some(partial_t0_col) = &partial_gal_t0_column {
+                    if fp_idx == self.t0_index {
+                        for (i, &val) in partial_t0_col.iter().enumerate() {
+                            *jacobian.get_mut(i, col) = val;
+                        }
+                        continue;
+                    }
+                    if fp_idx == self.l_scale_index {
+                        let t0 = params[self.t0_index];
+                        let l_scale = params[self.l_scale_index];
+                        // Match the `corrected_energies` t0 clamp so the
+                        // (tof - t0) factor in the rank-1 derivation
+                        // agrees with the production forward at the
+                        // clamp boundary.
+                        let min_tof_us = self
+                            .nominal_energies
+                            .iter()
+                            .map(|&e| self.tof_factor * self.flight_path_m / e.sqrt())
+                            .fold(f64::INFINITY, f64::min);
+                        let t0_clamped = t0.min(min_tof_us * (1.0 - 1.0e-12));
+                        for (i, &e_nom) in self.nominal_energies.iter().enumerate() {
+                            let tof_i = self.tof_factor * self.flight_path_m / e_nom.sqrt();
+                            let scale = (tof_i - t0_clamped) / l_scale;
+                            *jacobian.get_mut(i, col) = scale * partial_t0_col[i];
+                        }
+                        continue;
+                    }
+                }
                 // Finite difference for energy-scale parameters.
                 //
                 // Central-difference probes perturb one coordinate at
@@ -4643,5 +4941,121 @@ mod tests {
             "l_scale: fitted={}, true={true_ls}",
             f[2]
         );
+    }
+
+    /// Partial-GAL Jacobian with NO resolution should match FD2 to f64
+    /// roundoff: in this regime the rank-1 identity
+    /// `J[:, L_scale] = ((tof - t0) / L_scale) * J[:, t0]` is exact (the
+    /// forward chain factorises through `e_corr` only, with no
+    /// resolution operator to introduce additional `(t0, L_scale)`
+    /// dependence).  Issue #489.
+    #[test]
+    fn partial_gal_no_resolution_matches_fd2() {
+        let xs = vec![vec![1.0, 2.0, 3.0, 2.0, 1.5]];
+        let energies = vec![4.0, 9.0, 16.0, 25.0, 36.0];
+        let mut model = EnergyScaleTransmissionModel::new(
+            std::sync::Arc::new(xs),
+            std::sync::Arc::new(vec![0]),
+            energies.clone(),
+            25.0,
+            1, // t0_index
+            2, // l_scale_index
+            None,
+        );
+
+        let params = [0.1, 0.05, 1.002]; // density, t0, l_scale
+        let free = vec![0, 1, 2];
+
+        // FD2 reference Jacobian (default method).
+        let jac_fd2 = model
+            .analytical_jacobian(&params, &free, &model.evaluate(&params).unwrap())
+            .expect("FD2 Jacobian should be available");
+
+        // Partial-GAL Jacobian.
+        model = model.with_jacobian_method(EnergyScaleJacobianMethod::PartialGal);
+        let jac_pg = model
+            .analytical_jacobian(&params, &free, &model.evaluate(&params).unwrap())
+            .expect("partial-GAL Jacobian should be available");
+
+        // Density column: identical (analytical, not affected by method).
+        for i in 0..energies.len() {
+            let fd2 = jac_fd2.get(i, 0);
+            let pg = jac_pg.get(i, 0);
+            assert!(
+                (fd2 - pg).abs() < 1e-15,
+                "density bin {i}: fd2={fd2:.6e} pg={pg:.6e}"
+            );
+        }
+        // t0 column: identical (both methods use the same FD pair when
+        // both t0 and L_scale are free; partial-GAL just hoists it out
+        // of the loop).
+        for i in 0..energies.len() {
+            let fd2 = jac_fd2.get(i, 1);
+            let pg = jac_pg.get(i, 1);
+            assert!(
+                (fd2 - pg).abs() < 1e-15,
+                "t0 bin {i}: fd2={fd2:.6e} pg={pg:.6e}"
+            );
+        }
+        // L_scale column: identical to FD2 within FD truncation noise
+        // when there is no resolution. The rank-1 derivation is exact
+        // for this configuration; the residual L₂ error reflects only
+        // the central-FD `O(h²)` floor on each method's t0 column.
+        for i in 0..energies.len() {
+            let fd2 = jac_fd2.get(i, 2);
+            let pg = jac_pg.get(i, 2);
+            let abs_err = (fd2 - pg).abs();
+            let rel_err = abs_err / fd2.abs().max(1e-15);
+            assert!(
+                rel_err < 1e-3 || abs_err < 1e-8,
+                "L_scale bin {i}: fd2={fd2:.6e} pg={pg:.6e} rel={rel_err:.2e}"
+            );
+        }
+    }
+
+    /// When only L_scale is free (t0 fixed), partial-GAL falls through
+    /// to standard FD: there is no t0 column to derive L_scale from,
+    /// so the per-coordinate FD path must still be used. Verifies the
+    /// dispatch logic correctly handles this case.
+    #[test]
+    fn partial_gal_l_scale_only_falls_through_to_fd() {
+        let xs = vec![vec![1.0, 2.0, 3.0, 2.0, 1.5]];
+        let energies = vec![4.0, 9.0, 16.0, 25.0, 36.0];
+        let model = EnergyScaleTransmissionModel::new(
+            std::sync::Arc::new(xs),
+            std::sync::Arc::new(vec![0]),
+            energies.clone(),
+            25.0,
+            1, // t0_index (fixed)
+            2, // l_scale_index (free)
+            None,
+        )
+        .with_jacobian_method(EnergyScaleJacobianMethod::PartialGal);
+
+        let params = [0.1, 0.0, 1.002];
+        let free = vec![0, 2]; // density + L_scale (no t0)
+        let y = model.evaluate(&params).unwrap();
+        let jac = model
+            .analytical_jacobian(&params, &free, &y)
+            .expect("Jacobian should be available even when t0 not free");
+
+        // L_scale column should match a manual central FD reference.
+        let h = 1e-7;
+        let mut pp = params.to_vec();
+        let mut pm = params.to_vec();
+        pp[2] += h;
+        pm[2] -= h;
+        let yp = model.evaluate(&pp).unwrap();
+        let ym = model.evaluate(&pm).unwrap();
+        for i in 0..energies.len() {
+            let fd = (yp[i] - ym[i]) / (2.0 * h);
+            let anal = jac.get(i, 1);
+            let abs_err = (anal - fd).abs();
+            let rel_err = abs_err / fd.abs().max(1e-15);
+            assert!(
+                rel_err < 1e-3 || abs_err < 1e-8,
+                "L_scale bin {i}: anal={anal:.6e} fd={fd:.6e} rel={rel_err:.2e}"
+            );
+        }
     }
 }

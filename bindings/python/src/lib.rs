@@ -2719,6 +2719,43 @@ fn validate_energy_scale_params(
     Ok(())
 }
 
+/// Parse the optional `tzero_jacobian` Python kwarg into the Rust
+/// `EnergyScaleJacobianMethod` enum.
+///
+/// Recognised values (case-insensitive):
+/// - `"fd2"`, `"finite-difference"`, `"finite_difference"` → FiniteDifference (default).
+/// - `"partial-gal"`, `"partial_gal"`                       → PartialGal (issue #489).
+/// - `"chain"`, `"frozen-r"`, `"frozen_r"`                  → FrozenResolutionChainRule.
+///
+/// `None` returns `Ok(None)` (no override; the Rust model uses its own
+/// default, which falls back to the `NEREIDS_TZERO_JACOBIAN` env var).
+fn parse_tzero_jacobian(
+    s: Option<&str>,
+) -> PyResult<Option<nereids_fitting::transmission_model::EnergyScaleJacobianMethod>> {
+    use nereids_fitting::transmission_model::EnergyScaleJacobianMethod;
+    let Some(name) = s else {
+        return Ok(None);
+    };
+    let m = if name.eq_ignore_ascii_case("fd2")
+        || name.eq_ignore_ascii_case("finite-difference")
+        || name.eq_ignore_ascii_case("finite_difference")
+    {
+        EnergyScaleJacobianMethod::FiniteDifference
+    } else if name.eq_ignore_ascii_case("partial-gal") || name.eq_ignore_ascii_case("partial_gal") {
+        EnergyScaleJacobianMethod::PartialGal
+    } else if name.eq_ignore_ascii_case("chain")
+        || name.eq_ignore_ascii_case("frozen-r")
+        || name.eq_ignore_ascii_case("frozen_r")
+    {
+        EnergyScaleJacobianMethod::FrozenResolutionChainRule
+    } else {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "tzero_jacobian must be one of \"fd2\", \"partial_gal\", \"chain\", got {name:?}"
+        )));
+    };
+    Ok(Some(m))
+}
+
 /// Build `UnifiedFitConfig` from groups, returning the config and the number of
 /// density parameters (one per group) for initial_densities default.
 fn build_config_from_groups(
@@ -2923,6 +2960,7 @@ fn spatial_result_to_py(
     delta_t_us = None,
     delta_l_m = None,
     groups = None,
+    tzero_jacobian = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn py_spatial_map_typed<'py>(
@@ -2952,6 +2990,7 @@ fn py_spatial_map_typed<'py>(
     delta_t_us: Option<f64>,
     delta_l_m: Option<f64>,
     groups: Option<Vec<PyIsotopeGroup>>,
+    tzero_jacobian: Option<&str>,
 ) -> PyResult<PySpatialResult> {
     // Validate mutual exclusivity
     let has_isotopes = isotopes.is_some();
@@ -3122,6 +3161,10 @@ fn py_spatial_map_typed<'py>(
         validate_energy_scale_params(t0_init_us, l_scale_init, energy_scale_flight_path_m)?;
         config = config.with_energy_scale(t0_init_us, l_scale_init, energy_scale_flight_path_m);
     }
+    let tzero_method = parse_tzero_jacobian(tzero_jacobian)?;
+    if tzero_method.is_some() {
+        config = config.with_tzero_jacobian_method(tzero_method);
+    }
 
     // Build InputData3D from the PyInputData
     let input = match data.kind.as_str() {
@@ -3223,6 +3266,7 @@ fn py_spatial_map_typed<'py>(
     groups = None,
     initial_densities = None,
     enable_polish = None,
+    tzero_jacobian = None,
 ))]
 fn py_fit_counts_spectrum_typed<'py>(
     py: Python<'py>,
@@ -3256,6 +3300,7 @@ fn py_fit_counts_spectrum_typed<'py>(
     groups: Option<Vec<PyIsotopeGroup>>,
     initial_densities: Option<Vec<f64>>,
     enable_polish: Option<bool>,
+    tzero_jacobian: Option<&str>,
 ) -> PyResult<PyFitResult> {
     use nereids_pipeline::pipeline::{
         CountsBackgroundConfig, InputData, UnifiedFitConfig, fit_spectrum_typed,
@@ -3397,6 +3442,10 @@ fn py_fit_counts_spectrum_typed<'py>(
     if fit_energy_scale {
         validate_energy_scale_params(t0_init_us, l_scale_init, energy_scale_flight_path_m)?;
         config = config.with_energy_scale(t0_init_us, l_scale_init, energy_scale_flight_path_m);
+    }
+    let tzero_method = parse_tzero_jacobian(tzero_jacobian)?;
+    if tzero_method.is_some() {
+        config = config.with_tzero_jacobian_method(tzero_method);
     }
     // Attach CountsBackgroundConfig whenever any of its fields deviates from
     // the default — including c, which is the explicit proton-charge ratio
@@ -3751,6 +3800,7 @@ fn py_compute_model_jacobian<'py>(
     delta_l_m = None,
     groups = None,
     initial_densities = None,
+    tzero_jacobian = None,
 ))]
 fn py_fit_spectrum_typed<'py>(
     py: Python<'py>,
@@ -3777,6 +3827,7 @@ fn py_fit_spectrum_typed<'py>(
     delta_l_m: Option<f64>,
     groups: Option<Vec<PyIsotopeGroup>>,
     initial_densities: Option<Vec<f64>>,
+    tzero_jacobian: Option<&str>,
 ) -> PyResult<PyFitResult> {
     use nereids_pipeline::pipeline::{InputData, fit_spectrum_typed};
 
@@ -3905,6 +3956,10 @@ fn py_fit_spectrum_typed<'py>(
     if fit_energy_scale {
         validate_energy_scale_params(t0_init_us, l_scale_init, energy_scale_flight_path_m)?;
         config = config.with_energy_scale(t0_init_us, l_scale_init, energy_scale_flight_path_m);
+    }
+    let tzero_method = parse_tzero_jacobian(tzero_jacobian)?;
+    if tzero_method.is_some() {
+        config = config.with_tzero_jacobian_method(tzero_method);
     }
 
     // Build 1D InputData
