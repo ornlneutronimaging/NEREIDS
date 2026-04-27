@@ -725,11 +725,16 @@ pub struct AppState {
     pub lm_config: LmConfig,
     pub solver_method: SolverMethod,
     pub fit_temperature: bool,
-    /// Fit energy-scale calibration (TZERO `t₀` μs + flight-path `L_scale`)
-    /// as free parameters per SAMMY equivalent.  Mutually exclusive with
-    /// `fit_temperature` — pipeline returns a hard error if both are set
-    /// (`pipeline.rs` ~L977).  Initial values come from `state.beamline`
-    /// (`delay_us`, `flight_path_m`); `L_scale` initial is 1.0.
+    /// Fit residual energy-scale calibration (TZERO `t₀` μs + flight-path
+    /// `L_scale`) as free parameters per SAMMY equivalent.  Mutually
+    /// exclusive with `fit_temperature` — pipeline returns a hard error
+    /// if both are set (`pipeline.rs` ~L977).
+    ///
+    /// Initial values: `t₀ = 0.0` and `L_scale = 1.0` (identity seeds).
+    /// The configured Delay has already been subtracted when the energy
+    /// grid was built (`nereids-io::tof::tof_edges_to_energy`), so `t₀`
+    /// represents the residual offset on top of the corrected grid;
+    /// `L_scale` multiplies the nominal `flight_path_m`.
     pub fit_energy_scale: bool,
     pub show_advanced_solver: bool,
 

@@ -202,11 +202,14 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
                 ),
             )
             .on_hover_text(
-                "Adds the time-zero offset t\u{2080} (\u{03BC}s) and \
-                 flight-path scale L_scale (dimensionless) as free \
-                 parameters during the fit.  Initial values come from \
-                 the Configure step's Beamline Parameters (Delay, \
-                 Flight Path); L_scale starts at 1.0.  Mutually \
+                "Adds the residual time-zero offset t\u{2080} (\u{03BC}s) \
+                 and flight-path scale L_scale (dimensionless) as free \
+                 parameters during the fit.  Both seed at identity \
+                 (t\u{2080} = 0.0, L_scale = 1.0) — the nominal Delay \
+                 has already been subtracted when building the energy \
+                 grid, and L_scale multiplies the configured Flight \
+                 Path.  Optimiser bound: t\u{2080} \u{2208} \u{00B1}10 \
+                 \u{03BC}s, L_scale \u{2208} [0.99, 1.01].  Mutually \
                  exclusive with Fit temperature.",
             );
             if matches!(state.solver_method, SolverMethod::LevenbergMarquardt) {
@@ -1020,13 +1023,24 @@ fn build_fit_config(state: &AppState) -> Result<UnifiedFitConfig, String> {
     }
 
     // Energy-scale calibration: TZERO t₀ (μs) + flight-path L_scale
-    // (dimensionless) as free parameters.  Initial values come from
-    // the Configure step's Beamline Parameters; L_scale starts at 1.0
-    // by convention.  Pipeline rejects the combination with
-    // fit_temperature; the UI grey-out should prevent that path.
+    // (dimensionless) as free parameters.  Pipeline rejects the
+    // combination with fit_temperature; the UI grey-out should
+    // prevent that path.
+    //
+    // **Why `t0_init_us = 0.0`** (not `state.beamline.delay_us`):
+    // `tof_edges_to_energy` (`nereids-io::tof`) already subtracts
+    // the configured Delay from raw TOF before building the nominal
+    // energy grid the model sees.  The fit `t0` parameter therefore
+    // represents the *residual* timing offset on top of that
+    // already-corrected grid — its physical zero is 0.0 μs, and the
+    // optimiser bound is ±10 μs (`pipeline::add_energy_scale_params`).
+    // Seeding at the configured Delay would double-subtract and, for
+    // VENUS-typical delays > 10 μs, fall outside the bound.
+    //
+    // `L_scale = 1.0` (identity) seeds the multiplicative correction
+    // on top of the nominal `flight_path_m` the grid was built with.
     if state.fit_energy_scale {
-        config =
-            config.with_energy_scale(state.beamline.delay_us, 1.0, state.beamline.flight_path_m);
+        config = config.with_energy_scale(0.0, 1.0, state.beamline.flight_path_m);
     }
 
     // Background: solver-aware.  Both LM and counts-KL use the SAMMY
