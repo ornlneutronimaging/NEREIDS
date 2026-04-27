@@ -221,7 +221,7 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
     }
 
     if state.show_advanced_solver {
-        // Snapshot KL solver controls so we can detect a change after the
+        // Snapshot solver controls so we can detect a change after the
         // panel runs and invalidate cached fit results.  egui's
         // `selectable_value` mutates state in place with no change
         // callback, so the previous-value-capture pattern (per MEMORY.md
@@ -231,6 +231,10 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
         let prev_kl_polish = state.kl_enable_polish_override;
         let prev_fit_temperature = state.fit_temperature;
         let prev_fit_energy_scale = state.fit_energy_scale;
+        let prev_lm_background_enabled = state.lm_background_enabled;
+        let prev_compute_covariance = state.lm_config.compute_covariance;
+        let prev_tol_param = state.lm_config.tol_param;
+        let prev_lambda_init = state.lm_config.lambda_init;
 
         ui.indent("advanced_solver", |ui| {
             // Fit temperature and Fit energy scale are mutually exclusive
@@ -341,7 +345,7 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
             }
         });
 
-        // If any KL-solver control changed, downstream fit results no
+        // If any solver control changed, downstream fit results no
         // longer reflect the active configuration — invalidate them so
         // the Results panel doesn't show stale densities/D-per-dof.
         // Compare bit-pattern for the f64 to avoid the +0.0 == -0.0
@@ -350,7 +354,11 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
             || state.kl_c_ratio.to_bits() != prev_kl_c_ratio.to_bits()
             || state.kl_enable_polish_override != prev_kl_polish
             || state.fit_temperature != prev_fit_temperature
-            || state.fit_energy_scale != prev_fit_energy_scale;
+            || state.fit_energy_scale != prev_fit_energy_scale
+            || state.lm_background_enabled != prev_lm_background_enabled
+            || state.lm_config.compute_covariance != prev_compute_covariance
+            || state.lm_config.tol_param.to_bits() != prev_tol_param.to_bits()
+            || state.lm_config.lambda_init.to_bits() != prev_lambda_init.to_bits();
         if solver_changed {
             clear_analyze_downstream(state);
         }
