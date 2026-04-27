@@ -231,6 +231,7 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
         let prev_kl_polish = state.kl_enable_polish_override;
         let prev_fit_temperature = state.fit_temperature;
         let prev_fit_energy_scale = state.fit_energy_scale;
+        let prev_lm_background_enabled = state.lm_background_enabled;
 
         ui.indent("advanced_solver", |ui| {
             // Fit temperature and Fit energy scale are mutually exclusive
@@ -341,7 +342,7 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
             }
         });
 
-        // If any KL-solver control changed, downstream fit results no
+        // If any solver control changed, downstream fit results no
         // longer reflect the active configuration — invalidate them so
         // the Results panel doesn't show stale densities/D-per-dof.
         // Compare bit-pattern for the f64 to avoid the +0.0 == -0.0
@@ -350,7 +351,8 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
             || state.kl_c_ratio.to_bits() != prev_kl_c_ratio.to_bits()
             || state.kl_enable_polish_override != prev_kl_polish
             || state.fit_temperature != prev_fit_temperature
-            || state.fit_energy_scale != prev_fit_energy_scale;
+            || state.fit_energy_scale != prev_fit_energy_scale
+            || state.lm_background_enabled != prev_lm_background_enabled;
         if solver_changed {
             clear_analyze_downstream(state);
         }
