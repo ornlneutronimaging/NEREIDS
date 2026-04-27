@@ -708,7 +708,7 @@ pub(crate) fn detect_fetch_endf_data(state: &mut AppState) {
         if entry.endf_status == EndfStatus::Pending {
             match Isotope::new(entry.z, entry.a) {
                 Ok(isotope) => {
-                    if retrieval::mat_number(&isotope).is_some() {
+                    if retrieval::mat_number(&isotope, state.detect_endf_library).is_some() {
                         work.push(design::EndfWorkItem {
                             z: entry.z,
                             a: entry.a,
@@ -740,7 +740,7 @@ pub(crate) fn detect_fetch_endf_data(state: &mut AppState) {
         if entry.endf_status == EndfStatus::Pending {
             match Isotope::new(entry.z, entry.a) {
                 Ok(isotope) => {
-                    if retrieval::mat_number(&isotope).is_some() {
+                    if retrieval::mat_number(&isotope, state.detect_endf_library).is_some() {
                         work.push(design::EndfWorkItem {
                             z: entry.z,
                             a: entry.a,

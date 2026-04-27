@@ -25,6 +25,9 @@ pub enum EndfLibrary {
     Jeff3_3,
     /// JENDL-5 (Japanese library).
     Jendl5,
+    /// TENDL-2023 (TALYS-based, 2,300 ground-state isotopes including activation
+    /// products and transuranics not covered by the major evaluated libraries).
+    Tendl2023,
 }
 
 impl EndfLibrary {
@@ -35,6 +38,7 @@ impl EndfLibrary {
             Self::EndfB8_1 => "ENDF-B-VIII.1/n",
             Self::Jeff3_3 => "JEFF-3.3/n",
             Self::Jendl5 => "JENDL-5/n",
+            Self::Tendl2023 => "TENDL-2023/n",
         }
     }
 
@@ -45,6 +49,7 @@ impl EndfLibrary {
             Self::EndfB8_1 => "ENDF-B-VIII.1",
             Self::Jeff3_3 => "JEFF-3.3",
             Self::Jendl5 => "JENDL-5",
+            Self::Tendl2023 => "TENDL-2023",
         }
     }
 
@@ -52,7 +57,7 @@ impl EndfLibrary {
     ///
     /// IAEA uses two naming conventions (MAT always 4-digit zero-padded):
     /// - VIII.0, JEFF-3.3: MAT-first `n_{mat:04}_{z}-{Sym}-{a}.zip` (Z unpadded)
-    /// - VIII.1, JENDL-5: Z-first   `n_{z:03}-{Sym}-{a}_{mat:04}.zip` (Z 3-digit)
+    /// - VIII.1, JENDL-5, TENDL-2023: Z-first `n_{z:03}-{Sym}-{a}_{mat:04}.zip` (Z 3-digit)
     fn zip_filename(&self, isotope: &Isotope, mat: u32) -> String {
         let sym = elements::element_symbol(isotope.z()).unwrap_or("X");
         let z = isotope.z();
@@ -61,7 +66,7 @@ impl EndfLibrary {
             Self::EndfB8_0 | Self::Jeff3_3 => {
                 format!("n_{mat:04}_{z}-{sym}-{a}.zip")
             }
-            Self::EndfB8_1 | Self::Jendl5 => {
+            Self::EndfB8_1 | Self::Jendl5 | Self::Tendl2023 => {
                 format!("n_{z:03}-{sym}-{a}_{mat:04}.zip")
             }
         }
@@ -266,14 +271,22 @@ impl Default for EndfRetriever {
     }
 }
 
-/// Look up the ENDF MAT number for a ground-state isotope.
+/// Look up the ENDF MAT number for a ground-state isotope, library-aware.
 ///
-/// Covers 535 isotopes from the ENDF/B-VIII.0 neutrons sublibrary
-/// (via the `endf-mat` crate). This replaces the previous hand-coded
-/// 47-entry table and fixes several incorrect MAT values (Cd-113,
-/// Hf-177/178, W-182/183/184/186 were off by one isotope offset).
-pub fn mat_number(isotope: &Isotope) -> Option<u32> {
-    endf_mat::mat_number(isotope.z(), isotope.a())
+/// Dispatches to the underlying `endf-mat` table for the requested library:
+/// - `Tendl2023`: ~2,300 ground-state isotopes from the TENDL-2023 neutrons sublibrary.
+/// - All other variants: 535 isotopes from the ENDF/B-VIII.0 neutrons sublibrary
+///   (the MAT numbers in ENDF/B-VIII.1, JEFF-3.3, and JENDL-5 are identical to
+///   ENDF/B-VIII.0 for the isotopes they share).
+///
+/// MAT numbers are *almost* universal across libraries; the one documented exception
+/// is Es-255, which is MAT 9916 in ENDF/B-VIII.0 and MAT 9915 in TENDL-2023. The
+/// library-aware lookup ensures the correct MAT is used to construct retrieval URLs.
+pub fn mat_number(isotope: &Isotope, library: EndfLibrary) -> Option<u32> {
+    match library {
+        EndfLibrary::Tendl2023 => endf_mat::mat_number_tendl(isotope.z(), isotope.a()),
+        _ => endf_mat::mat_number(isotope.z(), isotope.a()),
+    }
 }
 
 /// Errors from ENDF retrieval operations.

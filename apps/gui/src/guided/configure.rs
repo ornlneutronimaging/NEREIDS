@@ -436,7 +436,7 @@ fn fetch_endf_data(state: &mut AppState) {
                     continue;
                 }
             };
-            if retrieval::mat_number(&isotope).is_none() {
+            if retrieval::mat_number(&isotope, state.endf_library).is_none() {
                 state.status_message = format!(
                     "No MAT number for {} — isotope not in database",
                     entry.symbol
@@ -476,7 +476,7 @@ fn fetch_endf_data(state: &mut AppState) {
                     continue;
                 }
             };
-            if retrieval::mat_number(&isotope).is_none() {
+            if retrieval::mat_number(&isotope, state.endf_library).is_none() {
                 state.status_message = format!(
                     "No MAT number for {} \u{2014} isotope not in database",
                     member.symbol

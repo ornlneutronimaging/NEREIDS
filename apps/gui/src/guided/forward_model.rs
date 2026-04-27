@@ -464,7 +464,7 @@ pub(crate) fn fm_fetch_endf_data(state: &mut AppState) {
                     continue;
                 }
             };
-            if retrieval::mat_number(&isotope).is_none() {
+            if retrieval::mat_number(&isotope, state.fm_endf_library).is_none() {
                 state.status_message = format!(
                     "No MAT number for {} — isotope not in database",
                     entry.symbol

@@ -300,7 +300,7 @@ mod tests {
         use nereids_endf::parser::parse_endf_file2;
 
         let isotope = Isotope::new(z, a).unwrap();
-        let mat = mat_number(&isotope).unwrap_or_else(|| {
+        let mat = mat_number(&isotope, EndfLibrary::EndfB8_1).unwrap_or_else(|| {
             panic!("No MAT number for Z={z} A={a}");
         });
         let retriever = EndfRetriever::new();
