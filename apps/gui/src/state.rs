@@ -261,6 +261,7 @@ impl SessionCache {
             "ENDF/B-VIII.1" => nereids_endf::retrieval::EndfLibrary::EndfB8_1,
             "JEFF-3.3" => nereids_endf::retrieval::EndfLibrary::Jeff3_3,
             "JENDL-5" => nereids_endf::retrieval::EndfLibrary::Jendl5,
+            "TENDL-2023" => nereids_endf::retrieval::EndfLibrary::Tendl2023,
             _ => nereids_endf::retrieval::EndfLibrary::EndfB8_0,
         };
 

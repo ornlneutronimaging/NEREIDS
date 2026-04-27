@@ -10,7 +10,8 @@ use crate::state::{
     PeriodicTableTarget,
 };
 use egui::{Color32, CornerRadius};
-use nereids_endf::retrieval::EndfLibrary;
+use nereids_core::types::Isotope;
+use nereids_endf::retrieval::{self, EndfLibrary};
 
 // ---------------------------------------------------------------------------
 // Element categories for color coding
@@ -346,6 +347,7 @@ pub fn periodic_table_modal(ctx: &egui::Context, state: &mut AppState) {
                                             (EndfLibrary::EndfB8_1, "ENDF/B-VIII.1"),
                                             (EndfLibrary::Jeff3_3, "JEFF-3.3"),
                                             (EndfLibrary::Jendl5, "JENDL-5"),
+                                            (EndfLibrary::Tendl2023, "TENDL-2023"),
                                         ] {
                                             ui.selectable_value(lib, val, label);
                                         }
@@ -380,6 +382,14 @@ pub fn periodic_table_modal(ctx: &egui::Context, state: &mut AppState) {
                 }
             } else {
                 // --- Standard isotope selection (all other targets) ---
+                // Resolve the library this modal is filtering against.  The
+                // get_or_insert pattern matches the dropdown sites below; the
+                // dereference releases the &mut borrow before we read state
+                // for natural_isotopes / known_isotopes_for.
+                let lib: EndfLibrary = {
+                    let target = target_library(state);
+                    *state.periodic_table_library.get_or_insert(target)
+                };
                 if let Some(z) = state.periodic_table_selected_z {
                     let name = nereids_core::elements::element_name(z).unwrap_or("Unknown");
                     let sym = nereids_core::elements::element_symbol(z).unwrap_or("??");
@@ -390,7 +400,10 @@ pub fn periodic_table_modal(ctx: &egui::Context, state: &mut AppState) {
                     );
 
                     let natural = nereids_core::elements::natural_isotopes(z);
-                    let known = nereids_core::elements::known_isotopes(z);
+                    let known: Vec<Isotope> = retrieval::known_isotopes_for(z, lib)
+                        .into_iter()
+                        .filter_map(|a| Isotope::new(z, a).ok())
+                        .collect();
 
                     if natural.is_empty() && known.is_empty() {
                         ui.label("No ENDF evaluations available.");
@@ -455,17 +468,18 @@ pub fn periodic_table_modal(ctx: &egui::Context, state: &mut AppState) {
                         let cz = state.periodic_table_custom_z;
                         let ca = state.periodic_table_custom_a;
                         let csym = nereids_core::elements::element_symbol(cz).unwrap_or("??");
-                        let has_eval = nereids_core::elements::has_endf_evaluation(cz, ca);
+                        let has_eval = retrieval::has_endf_evaluation_for(cz, ca, lib);
+                        let lib_label = super::design::library_name(lib);
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new(format!("{csym}-{ca}")).strong());
                             if has_eval {
                                 ui.label(
-                                    egui::RichText::new("ENDF/B-VIII.0 eval available")
+                                    egui::RichText::new(format!("{lib_label} eval available"))
                                         .color(Color32::from_rgb(34, 139, 34)),
                                 );
                             } else {
                                 ui.label(
-                                    egui::RichText::new("No ENDF/B-VIII.0 eval")
+                                    egui::RichText::new(format!("No {lib_label} eval"))
                                         .color(Color32::from_rgb(200, 130, 0)),
                                 );
                             }
@@ -519,6 +533,7 @@ pub fn periodic_table_modal(ctx: &egui::Context, state: &mut AppState) {
                                         (EndfLibrary::EndfB8_1, "ENDF/B-VIII.1"),
                                         (EndfLibrary::Jeff3_3, "JEFF-3.3"),
                                         (EndfLibrary::Jendl5, "JENDL-5"),
+                                        (EndfLibrary::Tendl2023, "TENDL-2023"),
                                     ] {
                                         ui.selectable_value(lib, val, label);
                                     }

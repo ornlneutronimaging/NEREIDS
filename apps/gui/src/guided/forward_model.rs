@@ -117,6 +117,7 @@ pub(crate) fn fm_isotopes_card(ui: &mut egui::Ui, state: &mut AppState) {
                             (EndfLibrary::EndfB8_1, "ENDF/B-VIII.1"),
                             (EndfLibrary::Jeff3_3, "JEFF-3.3"),
                             (EndfLibrary::Jendl5, "JENDL-5"),
+                            (EndfLibrary::Tendl2023, "TENDL-2023"),
                         ] {
                             ui.selectable_value(&mut state.fm_endf_library, val, label);
                         }
@@ -464,7 +465,7 @@ pub(crate) fn fm_fetch_endf_data(state: &mut AppState) {
                     continue;
                 }
             };
-            if retrieval::mat_number(&isotope).is_none() {
+            if retrieval::mat_number(&isotope, state.fm_endf_library).is_none() {
                 state.status_message = format!(
                     "No MAT number for {} — isotope not in database",
                     entry.symbol

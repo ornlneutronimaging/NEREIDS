@@ -171,8 +171,9 @@ fn parse_library_name(library: &str) -> PyResult<EndfLibrary> {
         "endf8.1" | "endf/b-viii.1" => Ok(EndfLibrary::EndfB8_1),
         "jeff3.3" => Ok(EndfLibrary::Jeff3_3),
         "jendl5" => Ok(EndfLibrary::Jendl5),
+        "tendl2023" | "tendl-2023" => Ok(EndfLibrary::Tendl2023),
         _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Unknown library '{}'. Use one of: endf8.0, endf8.1, jeff3.3, jendl5",
+            "Unknown library '{}'. Use one of: endf8.0, endf8.1, jeff3.3, jendl5, tendl2023",
             library
         ))),
     }
@@ -275,7 +276,7 @@ impl PyIsotopeGroup {
             .members()
             .iter()
             .map(|(iso, _)| {
-                let mat_num = mat_number(iso).ok_or_else(|| {
+                let mat_num = mat_number(iso, lib).ok_or_else(|| {
                     pyo3::exceptions::PyValueError::new_err(format!(
                         "MAT number not found for Z={} A={}; cannot fetch ENDF data",
                         iso.z(),
@@ -946,7 +947,7 @@ fn load_endf(
 
     let mat_num = match mat {
         Some(m) => m,
-        None => mat_number(&isotope).ok_or_else(|| {
+        None => mat_number(&isotope, lib).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(format!(
                 "MAT number not found for Z={} A={}; provide mat= explicitly",
                 z, a

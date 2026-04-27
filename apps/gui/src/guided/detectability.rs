@@ -67,6 +67,7 @@ pub(crate) fn detect_library_selector(ui: &mut egui::Ui, state: &mut AppState, l
                         (EndfLibrary::EndfB8_1, "ENDF/B-VIII.1"),
                         (EndfLibrary::Jeff3_3, "JEFF-3.3"),
                         (EndfLibrary::Jendl5, "JENDL-5"),
+                        (EndfLibrary::Tendl2023, "TENDL-2023"),
                     ] {
                         ui.selectable_value(&mut state.detect_endf_library, val, label);
                     }
@@ -708,7 +709,7 @@ pub(crate) fn detect_fetch_endf_data(state: &mut AppState) {
         if entry.endf_status == EndfStatus::Pending {
             match Isotope::new(entry.z, entry.a) {
                 Ok(isotope) => {
-                    if retrieval::mat_number(&isotope).is_some() {
+                    if retrieval::mat_number(&isotope, state.detect_endf_library).is_some() {
                         work.push(design::EndfWorkItem {
                             z: entry.z,
                             a: entry.a,
@@ -740,7 +741,7 @@ pub(crate) fn detect_fetch_endf_data(state: &mut AppState) {
         if entry.endf_status == EndfStatus::Pending {
             match Isotope::new(entry.z, entry.a) {
                 Ok(isotope) => {
-                    if retrieval::mat_number(&isotope).is_some() {
+                    if retrieval::mat_number(&isotope, state.detect_endf_library).is_some() {
                         work.push(design::EndfWorkItem {
                             z: entry.z,
                             a: entry.a,

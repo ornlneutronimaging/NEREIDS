@@ -365,7 +365,8 @@ mod tests {
             use nereids_endf::retrieval::{EndfLibrary, EndfRetriever, mat_number};
 
             let isotope = Isotope::new(72, 178).unwrap();
-            let mat = mat_number(&isotope).expect("No MAT number for Hf-178");
+            let mat =
+                mat_number(&isotope, EndfLibrary::EndfB8_0).expect("No MAT number for Hf-178");
             let retriever = EndfRetriever::new();
             let (_path, contents) = retriever
                 .get_endf_file(&isotope, EndfLibrary::EndfB8_0, mat)

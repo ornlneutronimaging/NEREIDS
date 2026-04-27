@@ -722,6 +722,7 @@ pub fn library_name(lib: EndfLibrary) -> &'static str {
         EndfLibrary::EndfB8_1 => "ENDF/B-VIII.1",
         EndfLibrary::Jeff3_3 => "JEFF-3.3",
         EndfLibrary::Jendl5 => "JENDL-5",
+        EndfLibrary::Tendl2023 => "TENDL-2023",
     }
 }
 
@@ -770,7 +771,7 @@ pub(crate) fn endf_fetch_worker(
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        let Some(mat) = nereids_endf::retrieval::mat_number(&item.isotope) else {
+        let Some(mat) = nereids_endf::retrieval::mat_number(&item.isotope, item.library) else {
             // Defensive: should be unreachable — callers pre-filter by mat_number
             let _ = tx.send(EndfFetchResult {
                 z: item.z,
