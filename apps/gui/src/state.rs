@@ -73,6 +73,10 @@ pub struct SessionCache {
     /// `Some(true/false)` forces polish on/off.
     #[serde(default)]
     pub kl_enable_polish_override: Option<bool>,
+    /// Fit energy-scale calibration (TZERO `t₀` + flight-path `L_scale`)
+    /// as free parameters.  Mutually exclusive with `fit_temperature`.
+    #[serde(default)]
+    pub fit_energy_scale: bool,
     /// Isotope groups: (z, name, members, density, enabled).
     /// ResonanceData is not serialized — members get Pending status on restore.
     #[serde(default)]
@@ -179,6 +183,7 @@ impl SessionCache {
             kl_background_enabled: state.kl_background_enabled,
             kl_c_ratio: state.kl_c_ratio,
             kl_enable_polish_override: state.kl_enable_polish_override,
+            fit_energy_scale: state.fit_energy_scale,
             isotope_groups: state
                 .isotope_groups
                 .iter()
@@ -298,6 +303,7 @@ impl SessionCache {
         state.kl_background_enabled = self.kl_background_enabled;
         state.kl_c_ratio = self.kl_c_ratio;
         state.kl_enable_polish_override = self.kl_enable_polish_override;
+        state.fit_energy_scale = self.fit_energy_scale;
 
         // Rebuild pipeline
         state.rebuild_pipeline();
@@ -719,6 +725,12 @@ pub struct AppState {
     pub lm_config: LmConfig,
     pub solver_method: SolverMethod,
     pub fit_temperature: bool,
+    /// Fit energy-scale calibration (TZERO `t₀` μs + flight-path `L_scale`)
+    /// as free parameters per SAMMY equivalent.  Mutually exclusive with
+    /// `fit_temperature` — pipeline returns a hard error if both are set
+    /// (`pipeline.rs` ~L977).  Initial values come from `state.beamline`
+    /// (`delay_us`, `flight_path_m`); `L_scale` initial is 1.0.
+    pub fit_energy_scale: bool,
     pub show_advanced_solver: bool,
 
     // -- Uncertainty provenance --
@@ -1428,6 +1440,7 @@ impl Default for AppState {
             lm_config: LmConfig::default(),
             solver_method: SolverMethod::PoissonKL,
             fit_temperature: false,
+            fit_energy_scale: false,
             show_advanced_solver: false,
             uncertainty_is_estimated: false,
             lm_background_enabled: false,

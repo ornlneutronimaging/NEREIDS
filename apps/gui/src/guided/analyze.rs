@@ -178,11 +178,36 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
         let prev_kl_background_enabled = state.kl_background_enabled;
         let prev_kl_c_ratio = state.kl_c_ratio;
         let prev_kl_polish = state.kl_enable_polish_override;
+        let prev_fit_temperature = state.fit_temperature;
+        let prev_fit_energy_scale = state.fit_energy_scale;
 
         ui.indent("advanced_solver", |ui| {
-            ui.checkbox(
-                &mut state.fit_temperature,
-                "Fit temperature (slow for Spatial Map)",
+            // Fit temperature and Fit energy scale are mutually exclusive
+            // (pipeline returns a hard error if both are true — see
+            // `pipeline.rs` ~L977).  Grey out each when the other is on so
+            // the constraint is visible in the UI rather than only at fit
+            // time.
+            ui.add_enabled(
+                !state.fit_energy_scale,
+                egui::Checkbox::new(
+                    &mut state.fit_temperature,
+                    "Fit temperature (slow for Spatial Map)",
+                ),
+            );
+            ui.add_enabled(
+                !state.fit_temperature,
+                egui::Checkbox::new(
+                    &mut state.fit_energy_scale,
+                    "Fit energy scale (TZERO t\u{2080} + L_scale, SAMMY equivalent)",
+                ),
+            )
+            .on_hover_text(
+                "Adds the time-zero offset t\u{2080} (\u{03BC}s) and \
+                 flight-path scale L_scale (dimensionless) as free \
+                 parameters during the fit.  Initial values come from \
+                 the Configure step's Beamline Parameters (Delay, \
+                 Flight Path); L_scale starts at 1.0.  Mutually \
+                 exclusive with Fit temperature.",
             );
             if matches!(state.solver_method, SolverMethod::LevenbergMarquardt) {
                 ui.checkbox(
@@ -267,10 +292,12 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
         // the Results panel doesn't show stale densities/D-per-dof.
         // Compare bit-pattern for the f64 to avoid the +0.0 == -0.0
         // edge case, then exact compare for the bool / Option<bool>.
-        let kl_changed = state.kl_background_enabled != prev_kl_background_enabled
+        let solver_changed = state.kl_background_enabled != prev_kl_background_enabled
             || state.kl_c_ratio.to_bits() != prev_kl_c_ratio.to_bits()
-            || state.kl_enable_polish_override != prev_kl_polish;
-        if kl_changed {
+            || state.kl_enable_polish_override != prev_kl_polish
+            || state.fit_temperature != prev_fit_temperature
+            || state.fit_energy_scale != prev_fit_energy_scale;
+        if solver_changed {
             clear_analyze_downstream(state);
         }
     }
@@ -990,6 +1017,16 @@ fn build_fit_config(state: &AppState) -> Result<UnifiedFitConfig, String> {
 
     if state.fit_temperature {
         config = config.with_fit_temperature(true);
+    }
+
+    // Energy-scale calibration: TZERO t₀ (μs) + flight-path L_scale
+    // (dimensionless) as free parameters.  Initial values come from
+    // the Configure step's Beamline Parameters; L_scale starts at 1.0
+    // by convention.  Pipeline rejects the combination with
+    // fit_temperature; the UI grey-out should prevent that path.
+    if state.fit_energy_scale {
+        config =
+            config.with_energy_scale(state.beamline.delay_us, 1.0, state.beamline.flight_path_m);
     }
 
     // Background: solver-aware.  Both LM and counts-KL use the SAMMY
