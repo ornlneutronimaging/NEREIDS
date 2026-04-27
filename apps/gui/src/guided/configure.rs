@@ -109,6 +109,11 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
                                 EndfLibrary::Jendl5,
                                 "JENDL-5",
                             );
+                            ui.selectable_value(
+                                &mut state.endf_library,
+                                EndfLibrary::Tendl2023,
+                                "TENDL-2023",
+                            );
                         });
                 });
             });

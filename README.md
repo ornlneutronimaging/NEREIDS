@@ -24,7 +24,8 @@ output spatially resolved isotopic composition maps.
 - **Resolution broadening** -- Gaussian (channel width + flight path) and
   tabulated instrument functions
 - **ENDF/B data** -- automatic retrieval and caching from IAEA for all
-  evaluated libraries (ENDF/B-VIII.0, JEFF-3.3, JENDL-5, etc.)
+  evaluated libraries (ENDF/B-VIII.0, ENDF/B-VIII.1, JEFF-3.3, JENDL-5,
+  TENDL-2023)
 - **Spectrum fitting** -- Levenberg-Marquardt and Poisson/KL divergence
   optimizers with analytical Jacobians
 - **Spatial mapping** -- parallel per-pixel fitting via rayon for 2D
