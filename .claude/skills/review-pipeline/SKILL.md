@@ -93,27 +93,94 @@ per worktree with this prompt:
 > 5. Run `cargo test --workspace --exclude nereids-python` to verify tests pass
 >    (workspace-wide, because changes often ripple across crates)
 
-### External Review (Codex CLI)
+### External Review (Codex CLI) — TEMPORARILY DISABLED
 
-Unless `--skip-codex` is in `$ARGUMENTS`, also launch one `Bash` command
-per worktree in the **same message**:
+**Status (April 2026):** Codex review is currently driven manually by the
+user outside this pipeline. Skip the automated `codex exec` step until the
+local codex-cli access issue is resolved (the installed binary is too old
+for the current API and ChatGPT-account model gating prevents falling back
+to an older model — see "Known pitfalls" below). When the user's local
+codex-cli is upgraded and accepted by the API, re-enable by removing this
+notice and uncommenting the launch step.
+
+When re-enabled, also launch one `Bash` command per worktree in the **same
+message** as the Claude self-audit, unless `--skip-codex` is in
+`$ARGUMENTS`.
+
+There is **no `codex review` subcommand** in current codex-cli (verified
+against 0.46 and 0.125, April 2026). The slash command `/review` exists
+but is interactive-only — it cannot be driven from `codex exec`. The
+canonical headless invocation is `codex exec` with an explicit review
+prompt; a native `codex exec review` is requested in
+[openai/codex#6432](https://github.com/openai/codex/issues/6432) but
+not yet shipped.
+
+Use this pattern (one Bash call per worktree):
 
 ```bash
-cd {worktree_path} && codex review --base main 2>&1
+codex exec --sandbox read-only --skip-git-repo-check \
+  -C {worktree_path} \
+  --output-last-message /tmp/codex-review-{branch_slug}.md \
+  "$(cat <<'PROMPT'
+You are reviewing the changes on the current branch (HEAD) against `main`
+in the NEREIDS repository.
+
+1. Run `git diff main...HEAD` to see all changes.
+2. Read each changed file in full.
+3. Audit for:
+   - Logic bugs, panics (unwrap, expect, array indexing)
+   - Missing input validation
+   - Numerical stability (division by zero, NaN propagation, overflow)
+   - Physics correctness (for nereids-physics / nereids-endf)
+   - API consistency with existing patterns
+   - Edge cases (empty inputs, zero counts, exactly-determined systems)
+4. Report findings as:
+   - **P1** (must fix) — correctness bugs, panics, data corruption
+   - **P2** (should fix) — robustness, style, minor improvements
+   - Include `file:line` references for each finding.
+5. If you find nothing significant, say so explicitly. Be terse.
+PROMPT
+)"
 ```
 
-**Codex CLI fallback chain** (syntax changes between versions):
-1. `cd {path} && codex review --base main 2>&1` (primary)
-2. `cd {path} && codex review 2>&1` (fallback if --base fails)
+Then read the file at `/tmp/codex-review-{branch_slug}.md` for the final
+review verdict; the JSONL on stdout is the streaming transcript and is
+mostly noise for our purposes.
 
-**Known pitfalls** (as of Feb 2026):
-- `--approval` flag removed — do not use
-- `--base` and positional `[PROMPT]` are mutually exclusive
-- Piping via stdin does not work
-- Notion MCP was removed from Codex config
+**Why these flags:**
+- `--sandbox read-only` — review only reads code; no need for write access.
+- `--skip-git-repo-check` — defensive; we always invoke from inside a repo
+  but this avoids friction in nested-worktree edge cases.
+- `-C {worktree_path}` — sets working dir explicitly so `git diff main...HEAD`
+  resolves correctly per worktree.
+- `--output-last-message <file>` — captures the agent's final message
+  cleanly; far easier than parsing JSONL.
 
-If Codex fails (network, license, timeout), note the failure and continue.
-Codex is supplementary, not blocking.
+**Known pitfalls** (as of April 2026, codex-cli 0.46 → 0.125):
+
+- The `review` subcommand was removed (or was never a thing in 0.x). Do
+  not use `codex review --base main` — it errors with
+  `unexpected argument '--base' found / Usage: codex <PROMPT>`.
+- Slash commands (`/review`, `/test`, etc.) work only in interactive
+  TUI sessions; they cannot be invoked from `codex exec`.
+- The default model in codex-cli config (`~/.codex/config.toml`) must
+  match what the local CLI binary supports. As of 0.46 the default
+  `gpt-5.5` is rejected as *"requires a newer version of Codex"*; as
+  of 0.122+ it works. If the binary is too old, upgrade before relying
+  on Codex review — overriding with `-m gpt-5` does NOT help on
+  ChatGPT-account auth (returns *"not supported when using Codex with
+  a ChatGPT account"*). Per-version compatibility is unstable; keep
+  the binary current.
+- `codex exec` reads the prompt from stdin if you pass `-` or omit the
+  positional, but heredoc-injected positional prompts (as above) are
+  the most reliable form across versions.
+- Avoid `--full-auto` for review — it grants `workspace-write` sandbox,
+  which is broader than the read-only review needs.
+
+If Codex fails (network, license, model rejection, binary out of date),
+note the failure and continue. Codex is supplementary, not blocking. The
+Claude self-audit is the load-bearing reviewer; Codex provides
+cross-confirmation when available.
 
 ---
 
