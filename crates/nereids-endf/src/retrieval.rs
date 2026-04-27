@@ -289,6 +289,31 @@ pub fn mat_number(isotope: &Isotope, library: EndfLibrary) -> Option<u32> {
     }
 }
 
+/// All mass numbers with an evaluation for element Z in the given library.
+///
+/// Library-aware counterpart to [`endf_mat::known_isotopes`] (which is
+/// ENDF/B-VIII.0-only) — must be used wherever the GUI surfaces the set of
+/// selectable isotopes for the *currently selected* library, otherwise
+/// TENDL-2023-only isotopes (e.g. Fm-247) will be silently hidden.
+pub fn known_isotopes_for(z: u32, library: EndfLibrary) -> Vec<u32> {
+    match library {
+        EndfLibrary::Tendl2023 => endf_mat::known_isotopes_tendl(z),
+        _ => endf_mat::known_isotopes(z),
+    }
+}
+
+/// Whether the given library has an evaluation for `(Z, A)`.
+///
+/// Library-aware counterpart to [`endf_mat::has_endf_evaluation`] — must be
+/// used by GUI availability indicators that depend on the *currently
+/// selected* library.
+pub fn has_endf_evaluation_for(z: u32, a: u32, library: EndfLibrary) -> bool {
+    match library {
+        EndfLibrary::Tendl2023 => endf_mat::has_endf_evaluation_tendl(z, a),
+        _ => endf_mat::has_endf_evaluation(z, a),
+    }
+}
+
 /// Errors from ENDF retrieval operations.
 #[derive(Debug, thiserror::Error)]
 pub enum EndfRetrievalError {

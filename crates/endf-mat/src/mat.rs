@@ -75,6 +75,37 @@ pub fn has_endf_evaluation(z: u32, a: u32) -> bool {
     mat_number(z, a).is_some()
 }
 
+/// All mass numbers with TENDL-2023 evaluations for element Z.
+///
+/// Counterpart to [`known_isotopes`] for the TENDL-2023 table (~2,300
+/// ground-state isotopes; substantially more coverage than ENDF/B-VIII.0).
+///
+/// # Examples
+/// ```
+/// let fm = endf_mat::known_isotopes_tendl(100);
+/// assert!(fm.contains(&247));        // Fm-247: TENDL-only
+/// assert!(!endf_mat::known_isotopes(100).contains(&247));
+/// ```
+pub fn known_isotopes_tendl(z: u32) -> Vec<u32> {
+    let start = TENDL_2023_MAT_TABLE.partition_point(|&(tz, _, _)| tz < z);
+    TENDL_2023_MAT_TABLE[start..]
+        .iter()
+        .take_while(|&&(tz, _, _)| tz == z)
+        .map(|&(_, a, _)| a)
+        .collect()
+}
+
+/// Whether the TENDL-2023 neutrons sublibrary has an evaluation for (Z, A).
+///
+/// # Examples
+/// ```
+/// assert!(endf_mat::has_endf_evaluation_tendl(100, 247)); // Fm-247: TENDL-only
+/// assert!(!endf_mat::has_endf_evaluation(100, 247));      // not in ENDF/B-VIII.0
+/// ```
+pub fn has_endf_evaluation_tendl(z: u32, a: u32) -> bool {
+    mat_number_tendl(z, a).is_some()
+}
+
 // Auto-generated from ENDF/B-VIII.0 neutrons.list
 // 535 ground-state isotopes (metastable states excluded)
 // Format: (Z, A, MAT) — sorted by (Z, A)

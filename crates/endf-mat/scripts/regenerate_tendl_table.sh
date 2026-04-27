@@ -21,7 +21,10 @@ set -euo pipefail
 
 URL="https://www-nds.iaea.org/public/download-endf/TENDL-2023/n/"
 
-listing=$(curl -s --max-time 60 "$URL")
+listing=$(curl -fsSL --max-time 60 "$URL") || {
+    echo "ERROR: failed to fetch $URL (curl returned non-2xx or transport error)" >&2
+    exit 1
+}
 if [ -z "$listing" ]; then
     echo "ERROR: empty listing from $URL" >&2
     exit 1
@@ -61,7 +64,8 @@ cat <<EOF
 // Source: https://www-nds.iaea.org/public/download-endf/TENDL-2023/n/
 // $count entries (TENDL-2023 ground-state neutron sublibrary).
 // DO NOT EDIT BY HAND — re-run the regenerator if the upstream listing changes.
-const TENDL_2023_MAT_TABLE: &[(u32, u32, u32)] = &[
+#[rustfmt::skip]
+static TENDL_2023_MAT_TABLE: &[(u32, u32, u32)] = &[
 EOF
 
 printf '%s\n' "$triples" | awk '{ printf "    (%d, %d, %d),\n", $1, $2, $3 }'
