@@ -1,9 +1,13 @@
 //! Step 4: Analyze -- solver configuration, fit execution, spectrum/map display.
 //!
-//! Layout: 3-column simultaneous view (controls | image | spectrum+results).
-//! The previous tab-based layout hid the map and spectrum in separate tabs;
-//! this redesign shows both side-by-side so the user can click a pixel on the
-//! map and immediately see its spectrum.
+//! Layout: 2-column outer (controls | content), with the content column
+//! stacked vertically (image on top ≈60%, spectrum on bottom ≈40%).
+//! The previous design docked image + spectrum side-by-side, which forced
+//! the square-aspect detector image and the wide-aspect resonance spectrum
+//! to share the same horizontal width budget — neither fit.  Stacking lets
+//! the image land near 1:1 and gives the spectrum the full content-column
+//! width for its many TOF bins (issue #504).  See `analyze_step` for the
+//! detailed diagram.
 
 use crate::state::{
     AppState, EndfStatus, GuidedStep, InputMode, IsotopeEntry, SolverMethod, SpectrumAxis,
@@ -21,19 +25,22 @@ use std::sync::mpsc;
 
 /// Draw the Analyze step content.
 ///
-/// Three-column layout:
+/// Two-column outer layout with the right column stacked:
 /// ```text
-/// +-- Controls (scroll) --+-- Image (clickable) --+-- Spectrum + Results --+
-/// | Fit Parameters        | viridis density map   | Pixel: (y, x)         |
-/// | ROI controls          | OR preview image      | [y DragValue] [x DV]  |
-/// | Run buttons           |                       |                       |
-/// | Fitting spinner       | Click to select pixel | [Spectrum Plot]       |
-/// | [Isotope selector     | Pixel: (y, x) shown   | Measured + Fit lines  |
-/// |  for map display]     |                       |                       |
-/// |                       | [Convergence map      | Fit results:          |
-/// |                       |  below if available]  | chi2_r, densities     |
-/// +-----------------------+-----------------------+-----------------------+
+/// +-- Controls (scroll) --+-- Image (top ≈60%) ----------------------+
+/// | Fit Parameters        | viridis density map / preview            |
+/// | Solver method         |  · click = select pixel                  |
+/// | Advanced              |  · shift+drag = draw ROI                 |
+/// | Run buttons           +------------------------------------------+
+/// | Fitting spinner       | Spectrum (bottom ≈40%)                   |
+/// | Isotope selector      | Measured · c·OB · Fit lines (full width) |
+/// | Convergence summary   | Pixel selectors · resonance dips · ...   |
+/// |                       | Per-pixel fit results: chi2_r, ρ̂ list   |
+/// +-----------------------+------------------------------------------+
 /// ```
+/// Stacking image + spectrum lets the image land near 1:1 and gives
+/// the spectrum the full content-column width for its many TOF bins
+/// (issue #504).
 pub fn analyze_step(ui: &mut egui::Ui, state: &mut AppState) {
     // Auto-prepare pre-normalized data if the user skipped the Normalize step.
     if matches!(
@@ -61,9 +68,35 @@ pub fn analyze_step(ui: &mut egui::Ui, state: &mut AppState) {
     let available_width = ui.available_width();
     let controls_width = 220.0_f32.min(available_width * 0.2);
 
-    // Reserve height for nav buttons (~40px) below the 3-column region.
-    let col_height = (ui.available_height() - 40.0).max(300.0);
+    // Style-derived spacing — adapts to the user's egui scale / theme
+    // overrides instead of baking in default-theme pixel values.
+    // `item_spacing.x` defaults to 8 px; the 6× multiplier covers
+    // (controls↔content separator + 2 inner column edges + outer frame
+    // margin) at default scale and scales with the theme.
+    // `item_spacing.y` is the visual height a `ui.separator()` consumes
+    // between stacked rows.
+    let outer_row_padding = ui.spacing().item_spacing.x * 6.0;
+    let inter_row_padding = ui.spacing().item_spacing.y.max(6.0);
 
+    // Preferred minimum height for the spectrum pane (header rows ~50
+    // + plot floor 200 + fit-result card ~70).  When the window is
+    // tall enough the spectrum gets at least this; when it isn't, the
+    // partition shrinks the spectrum proportionally rather than
+    // forcing the column past the window edge and clipping the nav
+    // strip below.  See partition logic + `.min(stacked_height)` clamp.
+    const MIN_SPECTRUM_HEIGHT: f32 = 280.0;
+
+    // `col_height` is the available room above the nav strip — never
+    // force it higher than what the window allocates.  A previous
+    // attempt set a 440 px floor to guarantee the partition couldn't
+    // produce negative regions; that pushed the nav strip past the
+    // visible area on shorter screens (cross-confirmed by user demo
+    // run, post-Round-1 review).  The partition below is now
+    // overflow-safe by construction via `.min(stacked_height)` instead.
+    let col_height = (ui.available_height() - 40.0).max(120.0);
+
+    // Two-column outer layout: narrow controls column + stacked content.
+    // See module-level docstring + the diagram on `analyze_step`.
     ui.horizontal(|ui| {
         // Column 1: fit controls (scrollable — content can exceed viewport)
         ui.allocate_ui_with_layout(
@@ -81,30 +114,48 @@ pub fn analyze_step(ui: &mut egui::Ui, state: &mut AppState) {
 
         ui.separator();
 
-        // Remaining width split between image and spectrum panels.
-        // Account for separators + item spacing + right-edge padding.
-        let remaining = (available_width - controls_width - 48.0).max(200.0);
-        let image_width = remaining * 0.45;
-        let spectrum_width = remaining * 0.55;
+        // Column 2: stacked content — image on top, spectrum below.
+        // The partition guarantees `image_h + sep + spectrum_h ==
+        // col_height` by construction (overflow-safe), so children
+        // cannot push past the parent and overlap the nav strip.
+        //
+        // Approach:
+        //   1. Compute the preferred 60/40 split.
+        //   2. Bias the spectrum to at least `MIN_SPECTRUM_HEIGHT`
+        //      *when there's room*, otherwise let it use whatever
+        //      stacked_height is available.
+        //   3. The `.min(stacked_height)` clamp on `spectrum_height`
+        //      caps the partition so its sum can never exceed
+        //      `col_height` regardless of how short the window is.
+        //   4. On very short windows, the image collapses before the
+        //      nav strip is sacrificed — a deliberate trade-off.
+        let content_width = (available_width - controls_width - outer_row_padding).max(200.0);
+        let stacked_height = (col_height - inter_row_padding).max(0.0);
+        let preferred_image_height = (stacked_height * 0.60).floor();
+        let preferred_spectrum_height =
+            (stacked_height - preferred_image_height).max(MIN_SPECTRUM_HEIGHT);
+        let spectrum_height = preferred_spectrum_height.min(stacked_height);
+        let image_height = (stacked_height - spectrum_height).max(0.0);
 
-        // Column 2: image viewer (NO ScrollArea — image uses available_height
-        // to fill the column vertically instead of floating in the top half).
         ui.allocate_ui_with_layout(
-            egui::vec2(image_width, col_height),
+            egui::vec2(content_width, col_height),
             egui::Layout::top_down(egui::Align::LEFT),
             |ui| {
-                image_panel(ui, state);
-            },
-        );
-
-        ui.separator();
-
-        // Column 3: spectrum + results
-        ui.allocate_ui_with_layout(
-            egui::vec2(spectrum_width, col_height),
-            egui::Layout::top_down(egui::Align::LEFT),
-            |ui| {
-                spectrum_panel(ui, state);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(content_width, image_height),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| {
+                        image_panel(ui, state);
+                    },
+                );
+                ui.separator();
+                ui.allocate_ui_with_layout(
+                    egui::vec2(content_width, spectrum_height),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| {
+                        spectrum_panel(ui, state);
+                    },
+                );
             },
         );
     });
@@ -895,80 +946,88 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
             }
         });
 
-    // Fit results below the plot
+    // Fit results below the plot — wrapped in a vertical ScrollArea so
+    // per-isotope fits with many entities (≥5 isotope rows) don't push
+    // the bottom of the card past the spectrum panel allocation and
+    // overlap the nav strip.  At default density list size the scroll
+    // bar simply doesn't appear.
     if let Some(ref result) = state.pixel_fit_result {
         ui.separator();
-        ui.horizontal(|ui| {
-            let (label, color) = if result.converged {
-                ("Converged", crate::theme::semantic::GREEN)
-            } else {
-                ("NOT converged", crate::theme::semantic::RED)
-            };
-            ui.label(egui::RichText::new(label).color(color).strong());
-            // Memo 35 §P1.2: when the joint-Poisson solver populated
-            // deviance_per_dof, label as D/dof; else keep chi2_r.
-            let gof_label = if result.deviance_per_dof.is_some() {
-                "D/dof"
-            } else {
-                "chi2_r"
-            };
-            if state.uncertainty_is_estimated {
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{} = {:.4} (approx.)",
-                        gof_label, result.reduced_chi_squared
-                    ))
-                    .color(crate::theme::semantic::ORANGE),
-                );
-            } else {
-                ui.label(format!("{} = {:.4}", gof_label, result.reduced_chi_squared));
-            }
-            ui.label(format!("iter = {}", result.iterations));
-            if let Some(t) = result.temperature_k {
-                if !state.uncertainty_is_estimated {
-                    if let Some(u) = result.temperature_k_unc {
-                        ui.label(format!("T = {t:.1} \u{00b1} {u:.1} K"));
+        egui::ScrollArea::vertical()
+            .id_salt("analyze_fit_results")
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let (label, color) = if result.converged {
+                        ("Converged", crate::theme::semantic::GREEN)
                     } else {
-                        ui.label(format!("T = {t:.1} K"));
+                        ("NOT converged", crate::theme::semantic::RED)
+                    };
+                    ui.label(egui::RichText::new(label).color(color).strong());
+                    // Memo 35 §P1.2: when the joint-Poisson solver populated
+                    // deviance_per_dof, label as D/dof; else keep chi2_r.
+                    let gof_label = if result.deviance_per_dof.is_some() {
+                        "D/dof"
+                    } else {
+                        "chi2_r"
+                    };
+                    if state.uncertainty_is_estimated {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} = {:.4} (approx.)",
+                                gof_label, result.reduced_chi_squared
+                            ))
+                            .color(crate::theme::semantic::ORANGE),
+                        );
+                    } else {
+                        ui.label(format!("{} = {:.4}", gof_label, result.reduced_chi_squared));
                     }
-                } else {
-                    ui.label(format!("T = {t:.1} K"));
-                }
-            }
-        });
+                    ui.label(format!("iter = {}", result.iterations));
+                    if let Some(t) = result.temperature_k {
+                        if !state.uncertainty_is_estimated {
+                            if let Some(u) = result.temperature_k_unc {
+                                ui.label(format!("T = {t:.1} \u{00b1} {u:.1} K"));
+                            } else {
+                                ui.label(format!("T = {t:.1} K"));
+                            }
+                        } else {
+                            ui.label(format!("T = {t:.1} K"));
+                        }
+                    }
+                });
 
-        // Display per-entity density results — build labels in the same order
-        // as build_fit_config (individuals first, then groups).
-        let mut fit_labels: Vec<String> = state
-            .isotope_entries
-            .iter()
-            .filter(|e| e.enabled && e.resonance_data.is_some())
-            .map(|e| e.symbol.clone())
-            .collect();
-        for g in &state.isotope_groups {
-            if g.enabled && g.overall_status() == EndfStatus::Loaded {
-                fit_labels.push(g.name.clone());
-            }
-        }
-        for i in 0..result.densities.len() {
-            let name = fit_labels.get(i).map(|s| s.as_str()).unwrap_or("?");
-            if state.uncertainty_is_estimated {
-                ui.label(format!(
-                    "  {name}: rho = {:.6e} atoms/barn",
-                    result.densities[i]
-                ));
-            } else {
-                let unc_str = result
-                    .uncertainties
-                    .as_ref()
-                    .and_then(|u| u.get(i))
-                    .map_or("N/A".to_string(), |u| format!("{:.2e}", u));
-                ui.label(format!(
-                    "  {name}: rho = {:.6e} +/- {unc_str} atoms/barn",
-                    result.densities[i]
-                ));
-            }
-        }
+                // Display per-entity density results — build labels in the same order
+                // as build_fit_config (individuals first, then groups).
+                let mut fit_labels: Vec<String> = state
+                    .isotope_entries
+                    .iter()
+                    .filter(|e| e.enabled && e.resonance_data.is_some())
+                    .map(|e| e.symbol.clone())
+                    .collect();
+                for g in &state.isotope_groups {
+                    if g.enabled && g.overall_status() == EndfStatus::Loaded {
+                        fit_labels.push(g.name.clone());
+                    }
+                }
+                for i in 0..result.densities.len() {
+                    let name = fit_labels.get(i).map(|s| s.as_str()).unwrap_or("?");
+                    if state.uncertainty_is_estimated {
+                        ui.label(format!(
+                            "  {name}: rho = {:.6e} atoms/barn",
+                            result.densities[i]
+                        ));
+                    } else {
+                        let unc_str = result
+                            .uncertainties
+                            .as_ref()
+                            .and_then(|u| u.get(i))
+                            .map_or("N/A".to_string(), |u| format!("{:.2e}", u));
+                        ui.label(format!(
+                            "  {name}: rho = {:.6e} +/- {unc_str} atoms/barn",
+                            result.densities[i]
+                        ));
+                    }
+                }
+            });
     }
 }
 
