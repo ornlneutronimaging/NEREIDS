@@ -21,19 +21,22 @@ use std::sync::mpsc;
 
 /// Draw the Analyze step content.
 ///
-/// Three-column layout:
+/// Two-column outer layout with the right column stacked:
 /// ```text
-/// +-- Controls (scroll) --+-- Image (clickable) --+-- Spectrum + Results --+
-/// | Fit Parameters        | viridis density map   | Pixel: (y, x)         |
-/// | ROI controls          | OR preview image      | [y DragValue] [x DV]  |
-/// | Run buttons           |                       |                       |
-/// | Fitting spinner       | Click to select pixel | [Spectrum Plot]       |
-/// | [Isotope selector     | Pixel: (y, x) shown   | Measured + Fit lines  |
-/// |  for map display]     |                       |                       |
-/// |                       | [Convergence map      | Fit results:          |
-/// |                       |  below if available]  | chi2_r, densities     |
-/// +-----------------------+-----------------------+-----------------------+
+/// +-- Controls (scroll) --+-- Image (top ≈60%) ----------------------+
+/// | Fit Parameters        | viridis density map / preview            |
+/// | Solver method         |  · click = select pixel                  |
+/// | Advanced              |  · shift+drag = draw ROI                 |
+/// | Run buttons           +------------------------------------------+
+/// | Fitting spinner       | Spectrum (bottom ≈40%)                   |
+/// | Isotope selector      | Measured · c·OB · Fit lines (full width) |
+/// | Convergence summary   | Pixel selectors · resonance dips · ...   |
+/// |                       | Per-pixel fit results: chi2_r, ρ̂ list   |
+/// +-----------------------+------------------------------------------+
 /// ```
+/// Stacking image + spectrum lets the image land near 1:1 and gives
+/// the spectrum the full content-column width for its many TOF bins
+/// (issue #504).
 pub fn analyze_step(ui: &mut egui::Ui, state: &mut AppState) {
     // Auto-prepare pre-normalized data if the user skipped the Normalize step.
     if matches!(
@@ -61,9 +64,18 @@ pub fn analyze_step(ui: &mut egui::Ui, state: &mut AppState) {
     let available_width = ui.available_width();
     let controls_width = 220.0_f32.min(available_width * 0.2);
 
-    // Reserve height for nav buttons (~40px) below the 3-column region.
+    // Reserve height for nav buttons (~40px) below the content region.
     let col_height = (ui.available_height() - 40.0).max(300.0);
 
+    // Two-column outer layout: narrow controls column + wide content
+    // column (image on top, spectrum below).  The previous design
+    // docked image and spectrum side-by-side, which forced the
+    // square-aspect image and the wide-aspect resonance spectrum to
+    // share the same horizontal width budget — neither fit.  Stacking
+    // them lets the image land near 1:1 (top region's height ~= its
+    // allocated width on typical screens) and gives the spectrum the
+    // full content-column width for its ~thousands of TOF bins
+    // (issue #504).
     ui.horizontal(|ui| {
         // Column 1: fit controls (scrollable — content can exceed viewport)
         ui.allocate_ui_with_layout(
@@ -81,30 +93,32 @@ pub fn analyze_step(ui: &mut egui::Ui, state: &mut AppState) {
 
         ui.separator();
 
-        // Remaining width split between image and spectrum panels.
-        // Account for separators + item spacing + right-edge padding.
-        let remaining = (available_width - controls_width - 48.0).max(200.0);
-        let image_width = remaining * 0.45;
-        let spectrum_width = remaining * 0.55;
+        // Column 2: stacked content — image on top (≈60%), spectrum
+        // below (≈40%).  Account for the controls separator + outer
+        // padding when computing remaining width.
+        let content_width = (available_width - controls_width - 48.0).max(200.0);
+        let image_height = (col_height * 0.60).floor();
+        let spectrum_height = (col_height - image_height - 8.0).max(180.0);
 
-        // Column 2: image viewer (NO ScrollArea — image uses available_height
-        // to fill the column vertically instead of floating in the top half).
         ui.allocate_ui_with_layout(
-            egui::vec2(image_width, col_height),
+            egui::vec2(content_width, col_height),
             egui::Layout::top_down(egui::Align::LEFT),
             |ui| {
-                image_panel(ui, state);
-            },
-        );
-
-        ui.separator();
-
-        // Column 3: spectrum + results
-        ui.allocate_ui_with_layout(
-            egui::vec2(spectrum_width, col_height),
-            egui::Layout::top_down(egui::Align::LEFT),
-            |ui| {
-                spectrum_panel(ui, state);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(content_width, image_height),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| {
+                        image_panel(ui, state);
+                    },
+                );
+                ui.separator();
+                ui.allocate_ui_with_layout(
+                    egui::vec2(content_width, spectrum_height),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| {
+                        spectrum_panel(ui, state);
+                    },
+                );
             },
         );
     });
