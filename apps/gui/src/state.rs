@@ -1267,6 +1267,25 @@ impl AppState {
         self.detect_results.clear();
     }
 
+    /// Clear only fit / normalization-downstream state.  Use this when
+    /// something changes that invalidates the current normalization +
+    /// fit (e.g. open-beam swap) but leaves the source sample data,
+    /// spectrum values, energies, ROIs, and selection valid.
+    ///
+    /// Contrast with `invalidate_results`, which additionally nukes
+    /// the data layer (sample, spectrum, energies, preview, ROIs,
+    /// rebin state) and is appropriate when the **source** changes.
+    pub fn invalidate_fit_results(&mut self) {
+        self.cancel_pending_tasks();
+        self.normalized = None;
+        self.pixel_fit_result = None;
+        self.residuals_cache = None;
+        self.spatial_result = None;
+        self.last_fit_feedback = None;
+        self.fitting_rois.clear();
+        self.export_status = None;
+    }
+
     /// Clear pixel selection, ROI, results, normalization, and cancel pending tasks.
     /// Called when the underlying data changes.
     pub fn invalidate_results(&mut self) {

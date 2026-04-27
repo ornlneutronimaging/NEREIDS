@@ -471,8 +471,14 @@ fn hdf5_ob_picker(ui: &mut egui::Ui, state: &mut AppState) {
                         }
                     }
                     state.open_beam_data = Some(Arc::new(ob_counts));
-                    state.normalized = None;
-                    state.invalidate_results();
+                    // OB swap invalidates normalization + fit results,
+                    // but NOT the sample's TOF spectrum, energies,
+                    // preview image, ROIs, or rebin state.  The broad
+                    // `invalidate_results()` would clear `spectrum_values`,
+                    // which gates the Continue button on Hdf5Histogram
+                    // mode (`has_required_data`) — using the narrow
+                    // variant keeps Continue enabled.
+                    state.invalidate_fit_results();
                     state.status_message = "Open beam loaded".to_string();
                 }
                 Err(e) => {
@@ -486,8 +492,9 @@ fn hdf5_ob_picker(ui: &mut egui::Ui, state: &mut AppState) {
         if loaded && ui.small_button("Clear OB").clicked() {
             state.hdf5_ob_path = None;
             state.open_beam_data = None;
-            state.normalized = None;
-            state.invalidate_results();
+            // Same reasoning as the load path above — OB removal
+            // invalidates downstream fit/normalization state only.
+            state.invalidate_fit_results();
             state.status_message = "Open beam cleared".into();
         }
     });
