@@ -462,11 +462,27 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 state.analyze_tof_slice_index = n_tof - 1;
             }
 
-            ui.label("Transmission (TOF slice):");
-            let slice = norm
-                .transmission
-                .index_axis(Axis(0), state.analyze_tof_slice_index)
-                .to_owned();
+            // Display source follows the input data: counts when both
+            // sample + OB are loaded (TiffPair, Hdf5* with OB), else
+            // the normalised transmission ratio.  TransmissionTiff is
+            // always transmission (the input itself is a ratio).
+            let show_counts = display_as_counts(state);
+            let (label, slice) = if show_counts {
+                let s = state
+                    .sample_data
+                    .as_ref()
+                    .unwrap()
+                    .index_axis(Axis(0), state.analyze_tof_slice_index)
+                    .to_owned();
+                ("Sample counts (TOF slice):", s)
+            } else {
+                let s = norm
+                    .transmission
+                    .index_axis(Axis(0), state.analyze_tof_slice_index)
+                    .to_owned();
+                ("Transmission (TOF slice):", s)
+            };
+            ui.label(label);
 
             let sel_roi = state.selected_roi;
             let sel_px = state.selected_pixel;
@@ -636,6 +652,20 @@ fn clear_analyze_downstream(state: &mut AppState) {
 
 // ---- Spectrum Panel (Column 3) ----
 
+/// Whether the Analyze panels should display raw sample counts +
+/// open-beam reference rather than the normalised transmission ratio.
+///
+/// The rule is **input-data-driven**, not solver-driven: KL works with
+/// either domain.  Counts mode requires both sample + OB to be loaded
+/// (so the c·OB reference line and counts-scale fit overlay are
+/// computable), and the input mode must not be `TransmissionTiff` (a
+/// pre-normalised transmission stack — its raw input *is* a ratio).
+fn display_as_counts(state: &AppState) -> bool {
+    state.sample_data.is_some()
+        && state.open_beam_data.is_some()
+        && !matches!(state.input_mode, InputMode::TransmissionTiff)
+}
+
 fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
     // Pixel selector (manual override via DragValues)
     ui.horizontal(|ui| {
@@ -737,14 +767,59 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
         return;
     }
 
-    // Measured spectrum (skip points where x is non-finite, e.g. from non-positive energies)
-    let measured_points: PlotPoints = (0..n_plot)
-        .filter(|&i| x_values[i].is_finite())
-        .map(|i| [x_values[i], norm.transmission[[i, y, x]]])
-        .collect();
+    // Display source follows the input data type, not the solver
+    // (KL works with both transmission and counts).  Counts mode is
+    // active iff the user has both sample + OB loaded for a non-
+    // TransmissionTiff mode.
+    let show_counts = display_as_counts(state);
+
+    // Per-bin multiplier `c · OB[i, y, x]` — used to scale both the
+    // fit overlay (T_fit → expected sample counts) and the OB
+    // reference line.  Empty when not in counts mode.
+    let counts_scale: Vec<f64> = if show_counts {
+        let ob = state.open_beam_data.as_ref().unwrap();
+        let c = state.kl_c_ratio;
+        (0..n_plot).map(|i| c * ob[[i, y, x]]).collect()
+    } else {
+        Vec::new()
+    };
+
+    // Measured spectrum (skip points where x is non-finite, e.g. from
+    // non-positive energies).  In counts mode plot raw sample counts;
+    // else plot the normalised transmission ratio.
+    let measured_points: PlotPoints = if show_counts {
+        let sample = state.sample_data.as_ref().unwrap();
+        (0..n_plot)
+            .filter(|&i| x_values[i].is_finite())
+            .map(|i| [x_values[i], sample[[i, y, x]]])
+            .collect()
+    } else {
+        (0..n_plot)
+            .filter(|&i| x_values[i].is_finite())
+            .map(|i| [x_values[i], norm.transmission[[i, y, x]]])
+            .collect()
+    };
     let measured_line = Line::new("Measured", measured_points);
 
-    // Fit result (if available)
+    // OB reference line (counts mode only): the c·OB curve the KL
+    // model multiplies T against to predict sample counts.  Showing
+    // it makes the data flow into the solver visible.
+    let ob_line = if show_counts {
+        let pts: PlotPoints = (0..n_plot)
+            .filter(|&i| x_values[i].is_finite())
+            .map(|i| [x_values[i], counts_scale[i]])
+            .collect();
+        Some(Line::new("c \u{00B7} OB", pts))
+    } else {
+        None
+    };
+
+    // Fit result (if available).  In counts mode, scale T_fit by
+    // `c · OB[i, y, x]` so the overlay sits on the same axis as the
+    // raw sample-counts measured line.  This omits the fitted Anorm
+    // + LM background polynomial (BackA + BackB/√E + BackC·√E) — both
+    // are typically small, and a fully-correct counts overlay needs
+    // the joint-Poisson forward model.  Tracked as a follow-up.
     let fit_line = state.pixel_fit_result.as_ref().and_then(|result| {
         let energies = state.energies.as_ref()?;
         let (all_rd, density_indices, density_ratios) =
@@ -767,6 +842,11 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
             x_values: &x_values,
             n_plot,
             instrument,
+            y_multiplier: if show_counts {
+                Some(&counts_scale)
+            } else {
+                None
+            },
         })
     });
 
@@ -780,13 +860,21 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
     let plot_height = (ui.available_height() - 100.0).max(200.0);
 
     // Plot
+    let y_label = if show_counts {
+        "Counts"
+    } else {
+        "Transmission"
+    };
     Plot::new("spectrum_plot")
         .height(plot_height)
         .x_axis_label(x_label)
-        .y_axis_label("Transmission")
+        .y_axis_label(y_label)
         .legend(egui_plot::Legend::default())
         .show(ui, |plot_ui| {
             plot_ui.line(measured_line);
+            if let Some(ob) = ob_line {
+                plot_ui.line(ob);
+            }
             if let Some(fit) = fit_line {
                 plot_ui.line(fit);
             }

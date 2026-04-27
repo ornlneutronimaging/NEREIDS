@@ -970,6 +970,11 @@ pub(crate) struct FitLineParams<'a> {
     /// Instrument resolution for the fit overlay.
     /// When `Some`, the overlay applies resolution after Beer-Lambert.
     pub instrument: Option<std::sync::Arc<nereids_physics::transmission::InstrumentParams>>,
+    /// Optional per-bin multiplier applied to the fitted transmission
+    /// before plotting.  Use this to scale T_fit to expected sample
+    /// counts in counts-mode display: `multiplier[i] = c · OB[i, y, x]`.
+    /// Length must be ≥ `n_plot`; ignored when `None`.
+    pub y_multiplier: Option<&'a [f64]>,
 }
 
 /// Build a fit overlay line from a `SpectrumFitResult`.
@@ -1005,7 +1010,13 @@ pub(crate) fn build_fit_line(p: &FitLineParams<'_>) -> Option<Line<'static>> {
     let n_fit = p.n_plot.min(fitted_t.len()).min(p.x_values.len());
     let fit_points: PlotPoints = (0..n_fit)
         .filter(|&i| p.x_values[i].is_finite())
-        .map(|i| [p.x_values[i], fitted_t[i]])
+        .map(|i| {
+            let y = match p.y_multiplier {
+                Some(m) if i < m.len() => m[i] * fitted_t[i],
+                _ => fitted_t[i],
+            };
+            [p.x_values[i], y]
+        })
         .collect();
     Some(Line::new("Fit", fit_points).width(2.0))
 }

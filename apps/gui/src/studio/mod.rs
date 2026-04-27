@@ -379,6 +379,7 @@ fn analysis_spectrum_column(ui: &mut egui::Ui, state: &mut AppState) {
             x_values: &x_values,
             n_plot,
             instrument,
+            y_multiplier: None,
         })
     });
 
