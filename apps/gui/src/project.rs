@@ -298,6 +298,7 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         max_iter: state.lm_config.max_iter.min(u32::MAX as usize) as u32,
         temperature_k: state.temperature_k,
         fit_temperature: state.fit_temperature,
+        fit_energy_scale: Some(state.fit_energy_scale),
         uncertainty_is_estimated: Some(state.uncertainty_is_estimated),
         lm_background_enabled: Some(state.lm_background_enabled),
         kl_background_enabled: Some(state.kl_background_enabled),
@@ -884,6 +885,7 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
     state.lm_config.max_iter = snap.max_iter as usize;
     state.temperature_k = snap.temperature_k;
     state.fit_temperature = snap.fit_temperature;
+    state.fit_energy_scale = snap.fit_energy_scale.unwrap_or(false);
     state.uncertainty_is_estimated = snap.uncertainty_is_estimated.unwrap_or(false);
     state.lm_background_enabled = snap.lm_background_enabled.unwrap_or(false);
     state.kl_background_enabled = snap.kl_background_enabled.unwrap_or(false);

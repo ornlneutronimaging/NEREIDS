@@ -80,6 +80,10 @@ pub struct ProjectSnapshot {
     pub max_iter: u32,
     pub temperature_k: f64,
     pub fit_temperature: bool,
+    /// Fit residual energy-scale calibration (TZERO `t₀` + flight-path
+    /// `L_scale`).  `Option` for backwards compatibility — projects
+    /// saved before this field was introduced load as `None` (= false).
+    pub fit_energy_scale: Option<bool>,
 
     // -- config/resolution --
     pub resolution_enabled: bool,
@@ -221,6 +225,7 @@ impl Default for ProjectSnapshot {
             max_iter: 0,
             temperature_k: 0.0,
             fit_temperature: false,
+            fit_energy_scale: None,
             resolution_enabled: false,
             resolution_kind: String::new(),
             delta_t_us: None,
@@ -561,6 +566,9 @@ fn write_config(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoError
     write_u32_attr(&solver, "max_iter", snap.max_iter)?;
     write_f64_attr(&solver, "temperature_k", snap.temperature_k)?;
     write_bool_attr(&solver, "fit_temperature", snap.fit_temperature)?;
+    if let Some(fes) = snap.fit_energy_scale {
+        write_bool_attr(&solver, "fit_energy_scale", fes)?;
+    }
     if let Some(ue) = snap.uncertainty_is_estimated {
         write_bool_attr(&solver, "uncertainty_is_estimated", ue)?;
     }
@@ -1240,6 +1248,7 @@ fn read_config(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoEr
     snap.max_iter = read_u32_attr(&solver, "max_iter")?;
     snap.temperature_k = read_f64_attr(&solver, "temperature_k")?;
     snap.fit_temperature = read_bool_attr(&solver, "fit_temperature")?;
+    snap.fit_energy_scale = read_bool_attr(&solver, "fit_energy_scale").ok();
     snap.uncertainty_is_estimated = read_bool_attr(&solver, "uncertainty_is_estimated").ok();
     snap.lm_background_enabled = read_bool_attr(&solver, "lm_background_enabled").ok();
     snap.kl_background_enabled = read_bool_attr(&solver, "kl_background_enabled").ok();
@@ -1819,6 +1828,7 @@ mod tests {
             max_iter: 20,
             temperature_k: 300.0,
             fit_temperature: false,
+            fit_energy_scale: None,
             resolution_enabled: false,
             resolution_kind: "gaussian".into(),
             delta_t_us: Some(1.5),

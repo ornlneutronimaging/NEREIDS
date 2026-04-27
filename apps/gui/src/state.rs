@@ -73,6 +73,10 @@ pub struct SessionCache {
     /// `Some(true/false)` forces polish on/off.
     #[serde(default)]
     pub kl_enable_polish_override: Option<bool>,
+    /// Fit energy-scale calibration (TZERO `t₀` + flight-path `L_scale`)
+    /// as free parameters.  Mutually exclusive with `fit_temperature`.
+    #[serde(default)]
+    pub fit_energy_scale: bool,
     /// Isotope groups: (z, name, members, density, enabled).
     /// ResonanceData is not serialized — members get Pending status on restore.
     #[serde(default)]
@@ -179,6 +183,7 @@ impl SessionCache {
             kl_background_enabled: state.kl_background_enabled,
             kl_c_ratio: state.kl_c_ratio,
             kl_enable_polish_override: state.kl_enable_polish_override,
+            fit_energy_scale: state.fit_energy_scale,
             isotope_groups: state
                 .isotope_groups
                 .iter()
@@ -298,6 +303,7 @@ impl SessionCache {
         state.kl_background_enabled = self.kl_background_enabled;
         state.kl_c_ratio = self.kl_c_ratio;
         state.kl_enable_polish_override = self.kl_enable_polish_override;
+        state.fit_energy_scale = self.fit_energy_scale;
 
         // Rebuild pipeline
         state.rebuild_pipeline();
@@ -719,6 +725,17 @@ pub struct AppState {
     pub lm_config: LmConfig,
     pub solver_method: SolverMethod,
     pub fit_temperature: bool,
+    /// Fit residual energy-scale calibration (TZERO `t₀` μs + flight-path
+    /// `L_scale`) as free parameters per SAMMY equivalent.  Mutually
+    /// exclusive with `fit_temperature` — pipeline returns a hard error
+    /// if both are set (`pipeline.rs` ~L977).
+    ///
+    /// Initial values: `t₀ = 0.0` and `L_scale = 1.0` (identity seeds).
+    /// The configured Delay has already been subtracted when the energy
+    /// grid was built (`nereids-io::tof::tof_edges_to_energy`), so `t₀`
+    /// represents the residual offset on top of the corrected grid;
+    /// `L_scale` multiplies the nominal `flight_path_m`.
+    pub fit_energy_scale: bool,
     pub show_advanced_solver: bool,
 
     // -- Uncertainty provenance --
@@ -1250,6 +1267,25 @@ impl AppState {
         self.detect_results.clear();
     }
 
+    /// Clear only fit / normalization-downstream state.  Use this when
+    /// something changes that invalidates the current normalization +
+    /// fit (e.g. open-beam swap) but leaves the source sample data,
+    /// spectrum values, energies, ROIs, and selection valid.
+    ///
+    /// Contrast with `invalidate_results`, which additionally nukes
+    /// the data layer (sample, spectrum, energies, preview, ROIs,
+    /// rebin state) and is appropriate when the **source** changes.
+    pub fn invalidate_fit_results(&mut self) {
+        self.cancel_pending_tasks();
+        self.normalized = None;
+        self.pixel_fit_result = None;
+        self.residuals_cache = None;
+        self.spatial_result = None;
+        self.last_fit_feedback = None;
+        self.fitting_rois.clear();
+        self.export_status = None;
+    }
+
     /// Clear pixel selection, ROI, results, normalization, and cancel pending tasks.
     /// Called when the underlying data changes.
     pub fn invalidate_results(&mut self) {
@@ -1428,6 +1464,7 @@ impl Default for AppState {
             lm_config: LmConfig::default(),
             solver_method: SolverMethod::PoissonKL,
             fit_temperature: false,
+            fit_energy_scale: false,
             show_advanced_solver: false,
             uncertainty_is_estimated: false,
             lm_background_enabled: false,
