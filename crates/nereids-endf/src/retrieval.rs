@@ -12,6 +12,7 @@ use nereids_core::types::Isotope;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// ENDF evaluated nuclear data libraries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +74,9 @@ pub struct EndfRetriever {
     cache_root: PathBuf,
     /// Base URL for IAEA downloads.
     base_url: String,
+    /// Shared HTTP client with explicit connect/total timeouts so a transport
+    /// stall surfaces as a clear error instead of hanging the GUI worker.
+    client: reqwest::blocking::Client,
 }
 
 impl EndfRetriever {
@@ -85,6 +89,7 @@ impl EndfRetriever {
         Self {
             cache_root,
             base_url: "https://www-nds.iaea.org/public/download-endf".to_string(),
+            client: build_http_client(),
         }
     }
 
@@ -93,6 +98,7 @@ impl EndfRetriever {
         Self {
             cache_root: cache_dir.into(),
             base_url: "https://www-nds.iaea.org/public/download-endf".to_string(),
+            client: build_http_client(),
         }
     }
 
@@ -152,8 +158,12 @@ impl EndfRetriever {
         let zip_filename = library.zip_filename(isotope, mat);
         let url = format!("{}/{}/{}", self.base_url, library.url_path(), zip_filename);
 
-        let response = reqwest::blocking::get(&url).map_err(|e| {
-            EndfRetrievalError::NetworkError(format!("Failed to connect to {}: {}", url, e))
+        let response = self.client.get(&url).send().map_err(|e| {
+            EndfRetrievalError::NetworkError(format!(
+                "Failed to fetch {}: {}",
+                url,
+                format_error_chain(&e)
+            ))
         })?;
 
         let status = response.status();
@@ -175,7 +185,10 @@ impl EndfRetriever {
         }
 
         let bytes = response.bytes().map_err(|e| {
-            EndfRetrievalError::NetworkError(format!("Failed to read response body: {}", e))
+            EndfRetrievalError::NetworkError(format!(
+                "Failed to read response body: {}",
+                format_error_chain(&e)
+            ))
         })?;
 
         // Extract ENDF file from ZIP archive.
@@ -282,4 +295,31 @@ pub enum EndfRetrievalError {
 
     #[error("Isotope not found in MAT database: {0}")]
     UnknownIsotope(String),
+}
+
+/// Build the shared HTTP client used for ENDF downloads.
+///
+/// Connect timeout is short so DNS/TLS failures surface fast; total timeout
+/// is generous because some library zips are several hundred KB over slow
+/// links. ENDF zip files top out around ~1 MB.
+fn build_http_client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(60))
+        .build()
+        .expect("failed to build reqwest blocking client")
+}
+
+/// Render an error and its full `source()` chain on one line. reqwest's outer
+/// `Display` is uninformative ("error sending request for url ...") — the
+/// real cause (TLS, DNS, refused, timeout) lives in the source chain.
+fn format_error_chain(err: &dyn std::error::Error) -> String {
+    let mut out = err.to_string();
+    let mut cur = err.source();
+    while let Some(s) = cur {
+        out.push_str(": ");
+        out.push_str(&s.to_string());
+        cur = s.source();
+    }
+    out
 }
