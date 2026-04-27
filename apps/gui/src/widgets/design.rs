@@ -958,6 +958,69 @@ pub(crate) fn draw_resonance_dips(
     }
 }
 
+/// Convert a resonance energy (eV) into the spectrum's active x-axis units.
+///
+/// Returns `None` when the conversion is undefined (TOF axis with non-positive
+/// energy or a missing flight path). Mirrors the energy→TOF transform used in
+/// [`build_spectrum_x_axis`] so tick positions in the per-isotope strips align
+/// pixel-for-pixel with the main spectrum's resonance dips.
+pub(crate) fn resonance_energy_to_axis(
+    energy_ev: f64,
+    axis: SpectrumAxis,
+    flight_path_m: f64,
+    delay_us: f64,
+) -> Option<f64> {
+    match axis {
+        SpectrumAxis::EnergyEv => Some(energy_ev),
+        SpectrumAxis::TofMicroseconds => {
+            if energy_ev > 0.0 && flight_path_m.is_finite() && flight_path_m > 0.0 {
+                Some(nereids_core::constants::energy_to_tof(energy_ev, flight_path_m) + delay_us)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Render one isotope's resolved-resonance positions as tick marks inside a
+/// linked-axis strip plot. Resolves `(z, a)` colour via [`isotope_dot_color`]
+/// at the call site; this helper just iterates the resonance tree, converts
+/// each energy to the active axis units, culls to the visible x-window, and
+/// emits one `VLine` per in-range tick.
+///
+/// Used by the GSAS-II-style per-isotope tick-marks panel ([analyze.rs])
+/// to attribute each spectrum dip to a specific isotope. URR ranges are
+/// skipped (no per-resonance grid, only bounds).
+pub(crate) fn draw_isotope_tick_strip(
+    plot_ui: &mut egui_plot::PlotUi,
+    resonance_data: &nereids_endf::resonance::ResonanceData,
+    axis: SpectrumAxis,
+    flight_path_m: f64,
+    delay_us: f64,
+    color: Color32,
+) {
+    let bounds = plot_ui.transform().bounds();
+    let (x_lo, x_hi) = (bounds.min()[0], bounds.max()[0]);
+    // Plot bounds can be inverted/empty on the very first frame before egui
+    // has laid out the linked-axis group; bail to avoid plotting garbage.
+    if !x_lo.is_finite() || !x_hi.is_finite() || x_lo >= x_hi {
+        return;
+    }
+    for range in resonance_data.ranges.iter().filter(|r| r.resolved) {
+        for lg in &range.l_groups {
+            for res in &lg.resonances {
+                let Some(x) = resonance_energy_to_axis(res.energy, axis, flight_path_m, delay_us)
+                else {
+                    continue;
+                };
+                if x >= x_lo && x <= x_hi {
+                    plot_ui.vline(VLine::new("", x).color(color).width(1.0));
+                }
+            }
+        }
+    }
+}
+
 /// Parameters for building a fit overlay line.
 pub(crate) struct FitLineParams<'a> {
     pub result: &'a nereids_pipeline::pipeline::SpectrumFitResult,

@@ -914,9 +914,37 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
         .get(state.analyze_tof_slice_index.min(n_plot.saturating_sub(1)))
         .copied();
 
-    // Reserve space below the plot for the fit-result summary so it
-    // doesn't get clipped at the column bottom.
-    let plot_height = (ui.available_height() - 100.0).max(200.0);
+    // Per-isotope resonance tick strips (GSAS-II-style fit-diagnostic panel,
+    // issue #510).  Each loaded isotope gets a thin row below the spectrum
+    // showing its resolved-resonance positions, color-keyed to match the
+    // isotope chips elsewhere in the UI.  Strips share the spectrum's
+    // x-axis via egui_plot's `link_axis`, so panning/zooming the spectrum
+    // moves all strip ticks in lockstep.  Gated on `show_resonance_dips`
+    // (same toggle that controls the on-main-plot dip overlay) so a single
+    // user action turns ALL resonance indicators on or off.
+    const STRIP_HEIGHT: f32 = 18.0;
+    const STRIP_LABEL_WIDTH: f32 = 80.0;
+    const MAX_VISIBLE_STRIPS: usize = 6;
+    let strip_isotopes: Vec<&crate::state::IsotopeEntry> = if state.show_resonance_dips {
+        state
+            .isotope_entries
+            .iter()
+            .filter(|e| e.enabled && e.resonance_data.is_some())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let n_strips = strip_isotopes.len();
+    let strips_total_height = if n_strips > 0 {
+        // +4.0 padding for the separator above the strip block.
+        (n_strips.min(MAX_VISIBLE_STRIPS) as f32) * STRIP_HEIGHT + 4.0
+    } else {
+        0.0
+    };
+
+    // Reserve space below the plot for the fit-result summary AND the
+    // tick strips so neither gets clipped at the column bottom.
+    let plot_height = (ui.available_height() - 100.0 - strips_total_height).max(200.0);
 
     // Plot
     let y_label = if show_counts {
@@ -929,6 +957,7 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
         .x_axis_label(x_label)
         .y_axis_label(y_label)
         .legend(egui_plot::Legend::default())
+        .link_axis("analyze_xaxis", [true, false])
         .show(ui, |plot_ui| {
             plot_ui.line(measured_line);
             if let Some(ob) = ob_line {
@@ -953,6 +982,55 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 design::draw_resonance_dips(plot_ui, &all_rd, &x_values);
             }
         });
+
+    // Tick strips below the main plot.  When n_strips > MAX_VISIBLE_STRIPS,
+    // a vertical scrollbar appears and we cap the area at the visible-cap
+    // height so the strip block never displaces the fit-summary panel.
+    if n_strips > 0 {
+        ui.add_space(2.0);
+        egui::ScrollArea::vertical()
+            .id_salt("analyze_tick_strips")
+            .max_height(strips_total_height)
+            .show(ui, |ui| {
+                for entry in &strip_isotopes {
+                    let Some(data) = entry.resonance_data.as_ref() else {
+                        continue;
+                    };
+                    let color = design::isotope_dot_color(&entry.symbol);
+                    let label = format!("{}-{}", entry.symbol, entry.a);
+                    ui.horizontal(|ui| {
+                        let row_width = ui.available_width();
+                        let plot_width = (row_width - STRIP_LABEL_WIDTH).max(100.0);
+                        ui.allocate_ui(egui::vec2(plot_width, STRIP_HEIGHT), |ui| {
+                            Plot::new(format!("tick_strip_{}_{}", entry.z, entry.a))
+                                .height(STRIP_HEIGHT)
+                                .show_axes([false, false])
+                                .show_grid([false, false])
+                                .show_x(false)
+                                .show_y(false)
+                                .allow_zoom(false)
+                                .allow_drag(false)
+                                .allow_scroll(false)
+                                .allow_boxed_zoom(false)
+                                .link_axis("analyze_xaxis", [true, false])
+                                .show(ui, |plot_ui| {
+                                    design::draw_isotope_tick_strip(
+                                        plot_ui,
+                                        data,
+                                        state.analyze_spectrum_axis,
+                                        state.beamline.flight_path_m,
+                                        state.beamline.delay_us,
+                                        color,
+                                    );
+                                });
+                        });
+                        ui.allocate_ui(egui::vec2(STRIP_LABEL_WIDTH, STRIP_HEIGHT), |ui| {
+                            ui.label(egui::RichText::new(&label).color(color).strong());
+                        });
+                    });
+                }
+            });
+    }
 
     // Fit results below the plot — wrapped in a vertical ScrollArea so
     // per-isotope fits with many entities (≥5 isotope rows) don't push
