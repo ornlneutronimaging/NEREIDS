@@ -78,19 +78,22 @@ pub fn analyze_step(ui: &mut egui::Ui, state: &mut AppState) {
     let outer_row_padding = ui.spacing().item_spacing.x * 6.0;
     let inter_row_padding = ui.spacing().item_spacing.y.max(6.0);
 
-    // Minimum heights — image needs enough pixels to be useful at 1:1
-    // and the spectrum needs room for two header rows (~50 px) + the
-    // plot's 200 px floor + the fit-result card (~70 px for ~3 isotope
-    // rows; further isotopes scroll inside `spectrum_panel` per the
-    // ScrollArea added on the post-plot block).
-    const MIN_IMAGE_HEIGHT: f32 = 150.0;
+    // Preferred minimum height for the spectrum pane (header rows ~50
+    // + plot floor 200 + fit-result card ~70).  When the window is
+    // tall enough the spectrum gets at least this; when it isn't, the
+    // partition shrinks the spectrum proportionally rather than
+    // forcing the column past the window edge and clipping the nav
+    // strip below.  See partition logic + `.min(stacked_height)` clamp.
     const MIN_SPECTRUM_HEIGHT: f32 = 280.0;
 
-    // `col_height` floor must be MIN_IMAGE_HEIGHT + inter_row + MIN_SPECTRUM
-    // so the partition below cannot produce negative regions.  Plus the
-    // ~40 px reserved below for nav buttons.  At default spacing this
-    // works out to 150 + 8 + 280 = 438; round up to 440 for clarity.
-    let col_height = (ui.available_height() - 40.0).max(440.0);
+    // `col_height` is the available room above the nav strip — never
+    // force it higher than what the window allocates.  A previous
+    // attempt set a 440 px floor to guarantee the partition couldn't
+    // produce negative regions; that pushed the nav strip past the
+    // visible area on shorter screens (cross-confirmed by user demo
+    // run, post-Round-1 review).  The partition below is now
+    // overflow-safe by construction via `.min(stacked_height)` instead.
+    let col_height = (ui.available_height() - 40.0).max(120.0);
 
     // Two-column outer layout: narrow controls column + stacked content.
     // See module-level docstring + the diagram on `analyze_step`.
@@ -112,21 +115,27 @@ pub fn analyze_step(ui: &mut egui::Ui, state: &mut AppState) {
         ui.separator();
 
         // Column 2: stacked content — image on top, spectrum below.
-        // The partition guarantees `image_h + sep + spectrum_h == col_height`
-        // by construction, so children cannot overflow the parent
-        // allocation and overlap the nav strip below.  Approach
-        // (cross-confirmed by Copilot review on PR #506):
-        //   1. Compute the desired 60/40 split.
-        //   2. Floor `spectrum_height` at `MIN_SPECTRUM_HEIGHT` so the
-        //      fit-result card always has room.
-        //   3. Floor `image_height` at `MIN_IMAGE_HEIGHT` so the image
-        //      stays useful even when the spectrum's minimum dominates.
-        //   4. The `col_height` floor above guarantees the sum fits.
+        // The partition guarantees `image_h + sep + spectrum_h ==
+        // col_height` by construction (overflow-safe), so children
+        // cannot push past the parent and overlap the nav strip.
+        //
+        // Approach:
+        //   1. Compute the preferred 60/40 split.
+        //   2. Bias the spectrum to at least `MIN_SPECTRUM_HEIGHT`
+        //      *when there's room*, otherwise let it use whatever
+        //      stacked_height is available.
+        //   3. The `.min(stacked_height)` clamp on `spectrum_height`
+        //      caps the partition so its sum can never exceed
+        //      `col_height` regardless of how short the window is.
+        //   4. On very short windows, the image collapses before the
+        //      nav strip is sacrificed — a deliberate trade-off.
         let content_width = (available_width - controls_width - outer_row_padding).max(200.0);
         let stacked_height = (col_height - inter_row_padding).max(0.0);
-        let desired_image_height = (stacked_height * 0.60).floor();
-        let spectrum_height = (stacked_height - desired_image_height).max(MIN_SPECTRUM_HEIGHT);
-        let image_height = (stacked_height - spectrum_height).max(MIN_IMAGE_HEIGHT);
+        let preferred_image_height = (stacked_height * 0.60).floor();
+        let preferred_spectrum_height =
+            (stacked_height - preferred_image_height).max(MIN_SPECTRUM_HEIGHT);
+        let spectrum_height = preferred_spectrum_height.min(stacked_height);
+        let image_height = (stacked_height - spectrum_height).max(0.0);
 
         ui.allocate_ui_with_layout(
             egui::vec2(content_width, col_height),
