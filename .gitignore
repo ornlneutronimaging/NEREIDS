@@ -54,3 +54,6 @@ _fts_*.txt
 .research/
 .claude/settings.json
 tmp/
+
+# do not track manuscript folders
+.manuscripts/
