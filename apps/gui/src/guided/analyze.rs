@@ -14,7 +14,7 @@ use crate::widgets::image_view::{
     RoiEditorResult, apply_colormap, data_range, show_image_with_roi_editor, show_viridis_image,
     show_viridis_image_with_roi,
 };
-use egui_plot::{Line, Plot, PlotPoints, PlotTransform, Points, VLine};
+use egui_plot::{Corner, Line, Plot, PlotPoints, PlotTransform, Points, VLine};
 use ndarray::Axis;
 use nereids_pipeline::pipeline::{
     BackgroundConfig, InputData, SolverConfig, SpectrumFitResult, UnifiedFitConfig,
@@ -27,6 +27,26 @@ struct TickRow<'a> {
     label: String,
     color: egui::Color32,
     data: &'a nereids_endf::resonance::ResonanceData,
+}
+
+enum ImageToolStripCenter {
+    None,
+    Tof { n_bins: usize },
+    Isotope { labels: Vec<String> },
+}
+
+#[derive(Clone)]
+struct DraggedResonanceRuler {
+    label: String,
+    color: egui::Color32,
+    axis_x: f64,
+    energy_ev: f64,
+}
+
+struct TickCandidate {
+    axis_x: f64,
+    energy_ev: f64,
+    x_pos: f32,
 }
 
 /// Draw the Analyze step content.
@@ -150,17 +170,16 @@ fn ensure_selected_pixel(state: &mut AppState) {
 
 // ---- Fit Controls ----
 
-fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
+fn fit_controls(ui: &mut egui::Ui, state: &mut AppState, available_height_hint: f32) {
     // -- Solver configuration --
-    ui.label(egui::RichText::new("Solver").strong());
-
-    ui.horizontal(|ui| {
+    let method_text = match state.solver_method {
+        SolverMethod::LevenbergMarquardt => "Levenberg-Marquardt",
+        SolverMethod::PoissonKL => "Poisson KL",
+    };
+    let draw_method = |ui: &mut egui::Ui, state: &mut AppState| {
         ui.label("Method:");
         egui::ComboBox::from_id_salt("solver_method")
-            .selected_text(match state.solver_method {
-                SolverMethod::LevenbergMarquardt => "Levenberg-Marquardt",
-                SolverMethod::PoissonKL => "Poisson KL",
-            })
+            .selected_text(method_text)
             .show_ui(ui, |ui| {
                 ui.selectable_value(
                     &mut state.solver_method,
@@ -173,15 +192,27 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
                     "Poisson KL",
                 );
             });
-    });
-
-    ui.horizontal(|ui| {
+    };
+    let draw_max_iter = |ui: &mut egui::Ui, state: &mut AppState| {
         ui.label("Max iter:");
         ui.add(egui::DragValue::new(&mut state.lm_config.max_iter).range(1..=10000));
-    });
+    };
+
+    if ui.available_width() >= 330.0 {
+        ui.horizontal(|ui| {
+            draw_method(ui, state);
+            ui.separator();
+            draw_max_iter(ui, state);
+        });
+    } else {
+        ui.horizontal(|ui| draw_method(ui, state));
+        ui.horizontal(|ui| draw_max_iter(ui, state));
+    }
 
     // Advanced solver controls (collapsible)
-    let gear = if state.show_advanced_solver {
+    let auto_show_advanced = available_height_hint > 300.0;
+    let show_advanced = auto_show_advanced || state.show_advanced_solver;
+    let gear = if show_advanced {
         "\u{2699} Advanced \u{25b2}"
     } else {
         "\u{2699} Advanced \u{25bc}"
@@ -193,7 +224,7 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
         state.show_advanced_solver = !state.show_advanced_solver;
     }
 
-    if state.show_advanced_solver {
+    if show_advanced {
         // Snapshot solver controls so we can detect a change after the
         // panel runs and invalidate cached fit results.  egui's
         // `selectable_value` mutates state in place with no change
@@ -209,28 +240,29 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
         let prev_tol_param = state.lm_config.tol_param;
         let prev_lambda_init = state.lm_config.lambda_init;
 
-        ui.indent("advanced_solver", |ui| {
-            // Fit temperature and Fit energy scale are mutually exclusive
-            // (pipeline returns a hard error if both are true — see
-            // `pipeline.rs` ~L977).  Grey out each when the other is on so
-            // the constraint is visible in the UI rather than only at fit
-            // time.
-            ui.add_enabled(
-                !state.fit_energy_scale,
-                egui::Checkbox::new(
-                    &mut state.fit_temperature,
-                    "Fit temperature (slow for Spatial Map)",
-                ),
-            );
-            ui.add_enabled(
-                !state.fit_temperature,
-                egui::Checkbox::new(
-                    &mut state.fit_energy_scale,
-                    "Fit energy scale (TZERO t\u{2080} + L_scale, SAMMY equivalent)",
-                ),
-            )
-            .on_hover_text(
-                "Adds the residual time-zero offset t\u{2080} (\u{03BC}s) \
+        let draw_advanced_solver = |ui: &mut egui::Ui, state: &mut AppState| {
+            ui.indent("advanced_solver", |ui| {
+                // Fit temperature and Fit energy scale are mutually exclusive
+                // (pipeline returns a hard error if both are true — see
+                // `pipeline.rs` ~L977).  Grey out each when the other is on so
+                // the constraint is visible in the UI rather than only at fit
+                // time.
+                ui.add_enabled(
+                    !state.fit_energy_scale,
+                    egui::Checkbox::new(
+                        &mut state.fit_temperature,
+                        "Fit temperature (slow for Spatial Map)",
+                    ),
+                );
+                ui.add_enabled(
+                    !state.fit_temperature,
+                    egui::Checkbox::new(
+                        &mut state.fit_energy_scale,
+                        "Fit energy scale (TZERO t\u{2080} + L_scale, SAMMY equivalent)",
+                    ),
+                )
+                .on_hover_text(
+                    "Adds the residual time-zero offset t\u{2080} (\u{03BC}s) \
                  and flight-path scale L_scale (dimensionless) as free \
                  parameters during the fit.  Both seed at identity \
                  (t\u{2080} = 0.0, L_scale = 1.0) — the nominal Delay \
@@ -239,84 +271,99 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
                  Path.  Optimiser bound: t\u{2080} \u{2208} \u{00B1}10 \
                  \u{03BC}s, L_scale \u{2208} [0.99, 1.01].  Mutually \
                  exclusive with Fit temperature.",
-            );
-            if matches!(state.solver_method, SolverMethod::LevenbergMarquardt) {
-                ui.checkbox(
-                    &mut state.lm_background_enabled,
-                    "LM background (SAMMY: Anorm + BackA/B/C)",
                 );
-            }
-            if matches!(state.solver_method, SolverMethod::PoissonKL) {
-                ui.checkbox(
-                    &mut state.kl_background_enabled,
-                    "KL background (SAMMY: A\u{2099} + B_A + B_B/\u{221A}E + B_C\u{221A}E)",
-                );
-                ui.horizontal(|ui| {
-                    ui.label("c = Q_s / Q_ob:");
-                    ui.add(
-                        egui::DragValue::new(&mut state.kl_c_ratio)
-                            .speed(0.01)
-                            .range(1e-4..=100.0),
-                    )
-                    .on_hover_text(
-                        "Proton-charge ratio for the counts-KL solver \
+                if matches!(state.solver_method, SolverMethod::LevenbergMarquardt) {
+                    ui.checkbox(
+                        &mut state.lm_background_enabled,
+                        "LM background (SAMMY: Anorm + BackA/B/C)",
+                    );
+                }
+                if matches!(state.solver_method, SolverMethod::PoissonKL) {
+                    ui.checkbox(
+                        &mut state.kl_background_enabled,
+                        "KL background (SAMMY: A\u{2099} + B_A + B_B/\u{221A}E + B_C\u{221A}E)",
+                    );
+                    ui.horizontal(|ui| {
+                        ui.label("c = Q_s / Q_ob:");
+                        ui.add(
+                            egui::DragValue::new(&mut state.kl_c_ratio)
+                                .speed(0.01)
+                                .range(1e-4..=100.0),
+                        )
+                        .on_hover_text(
+                            "Proton-charge ratio for the counts-KL solver \
                          (memo 35 §P1.3).  Leave at 1.0 when the \
                          caller has already PC-normalized the flux.",
-                    );
-                });
-                // Polish override (memo 38 §6).  For spatial maps the
-                // default (None = auto-disable when n_pixels > 1) is the
-                // right choice.  Exposing an explicit toggle is
-                // research-oriented; wire as a tri-state via ComboBox
-                // so the distinction between "auto" and "forced off" is
-                // visible.
-                ui.horizontal(|ui| {
-                    ui.label("Polish:");
-                    let selected = match state.kl_enable_polish_override {
-                        None => "Auto (on for single / off for spatial)",
-                        Some(true) => "On (forced)",
-                        Some(false) => "Off (forced)",
-                    };
-                    egui::ComboBox::from_id_salt("kl_polish_override")
-                        .selected_text(selected)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut state.kl_enable_polish_override, None, "Auto");
-                            ui.selectable_value(
-                                &mut state.kl_enable_polish_override,
-                                Some(true),
-                                "On (forced)",
-                            );
-                            ui.selectable_value(
-                                &mut state.kl_enable_polish_override,
-                                Some(false),
-                                "Off (forced)",
-                            );
-                        });
-                });
-            }
-            ui.checkbox(
-                &mut state.lm_config.compute_covariance,
-                "Compute covariance (single-pixel/ROI only)",
-            );
-            ui.horizontal(|ui| {
-                ui.label("Tol (param):");
-                ui.add(
-                    egui::DragValue::new(&mut state.lm_config.tol_param)
-                        .speed(1e-9)
-                        .range(1e-12..=1.0),
+                        );
+                    });
+                    // Polish override (memo 38 §6).  For spatial maps the
+                    // default (None = auto-disable when n_pixels > 1) is the
+                    // right choice.  Exposing an explicit toggle is
+                    // research-oriented; wire as a tri-state via ComboBox
+                    // so the distinction between "auto" and "forced off" is
+                    // visible.
+                    ui.horizontal(|ui| {
+                        ui.label("Polish:");
+                        let selected = match state.kl_enable_polish_override {
+                            None => "Auto (on for single / off for spatial)",
+                            Some(true) => "On (forced)",
+                            Some(false) => "Off (forced)",
+                        };
+                        egui::ComboBox::from_id_salt("kl_polish_override")
+                            .selected_text(selected)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut state.kl_enable_polish_override,
+                                    None,
+                                    "Auto",
+                                );
+                                ui.selectable_value(
+                                    &mut state.kl_enable_polish_override,
+                                    Some(true),
+                                    "On (forced)",
+                                );
+                                ui.selectable_value(
+                                    &mut state.kl_enable_polish_override,
+                                    Some(false),
+                                    "Off (forced)",
+                                );
+                            });
+                    });
+                }
+                ui.checkbox(
+                    &mut state.lm_config.compute_covariance,
+                    "Compute covariance (single-pixel/ROI only)",
                 );
-            });
-            if state.solver_method == SolverMethod::LevenbergMarquardt {
                 ui.horizontal(|ui| {
-                    ui.label("Lambda init:");
+                    ui.label("Tol (param):");
                     ui.add(
-                        egui::DragValue::new(&mut state.lm_config.lambda_init)
-                            .speed(1e-4)
-                            .range(1e-10..=1e6),
+                        egui::DragValue::new(&mut state.lm_config.tol_param)
+                            .speed(1e-9)
+                            .range(1e-12..=1.0),
                     );
                 });
-            }
-        });
+                if state.solver_method == SolverMethod::LevenbergMarquardt {
+                    ui.horizontal(|ui| {
+                        ui.label("Lambda init:");
+                        ui.add(
+                            egui::DragValue::new(&mut state.lm_config.lambda_init)
+                                .speed(1e-4)
+                                .range(1e-10..=1e6),
+                        );
+                    });
+                }
+            });
+        };
+
+        if auto_show_advanced {
+            draw_advanced_solver(ui, state);
+        } else {
+            egui::ScrollArea::vertical()
+                .id_salt("advanced_solver_scroll")
+                .max_height(160.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| draw_advanced_solver(ui, state));
+        }
 
         // If any solver control changed, downstream fit results no
         // longer reflect the active configuration — invalidate them so
@@ -390,7 +437,7 @@ fn run_action_buttons(ui: &mut egui::Ui, state: &mut AppState) {
     });
 }
 
-fn image_tool_strip(ui: &mut egui::Ui, state: &mut AppState, n_tof: Option<usize>) {
+fn image_tool_strip(ui: &mut egui::Ui, state: &mut AppState, center: ImageToolStripCenter) {
     ui.horizontal(|ui| {
         let has_sel = state.selected_roi.is_some_and(|i| i < state.rois.len());
         if ui
@@ -430,14 +477,35 @@ fn image_tool_strip(ui: &mut egui::Ui, state: &mut AppState, n_tof: Option<usize
 
         ui.separator();
 
-        if let Some(n_tof) = n_tof {
-            let slider = egui::Slider::new(
-                &mut state.analyze_tof_slice_index,
-                0..=n_tof.saturating_sub(1),
-            )
-            .show_value(true);
-            ui.add_sized([150.0, 18.0], slider)
-                .on_hover_text("TOF slice shown in the image");
+        match center {
+            ImageToolStripCenter::None => {}
+            ImageToolStripCenter::Tof { n_bins } => {
+                let slider_width = (ui.available_width() - 118.0).clamp(180.0, 360.0);
+                let slider = egui::Slider::new(
+                    &mut state.analyze_tof_slice_index,
+                    0..=n_bins.saturating_sub(1),
+                )
+                .show_value(true);
+                ui.add_sized([slider_width, 18.0], slider)
+                    .on_hover_text("TOF slice shown in the image");
+            }
+            ImageToolStripCenter::Isotope { labels } => {
+                let n_isotopes = labels.len();
+                if n_isotopes > 1 {
+                    let idx = state.map_display_isotope.min(n_isotopes - 1);
+                    let current = labels.get(idx).map(String::as_str).unwrap_or("?");
+                    egui::ComboBox::from_id_salt("isotope_map_select")
+                        .selected_text(current)
+                        .width(88.0)
+                        .show_ui(ui, |ui| {
+                            for (i, name) in labels.iter().enumerate() {
+                                ui.selectable_value(&mut state.map_display_isotope, i, name);
+                            }
+                        })
+                        .response
+                        .on_hover_text("Density map isotope");
+                }
+            }
         }
 
         ui.separator();
@@ -581,39 +649,28 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
     if let Some(ref result) = state.spatial_result {
         // -- Density map display (read-only ROI overlay) --
         let n_isotopes = result.density_maps.len();
-        if n_isotopes > 1 {
-            let labels = &result.isotope_labels;
-            let current_name = labels
-                .get(state.map_display_isotope.min(n_isotopes - 1))
-                .map(|s| s.as_str())
-                .unwrap_or("?");
-            ui.horizontal(|ui| {
-                ui.label("Isotope:");
-                egui::ComboBox::from_id_salt("isotope_map_select")
-                    .selected_text(current_name)
-                    .show_ui(ui, |ui| {
-                        for i in 0..n_isotopes {
-                            let name = labels.get(i).map(|s| s.as_str()).unwrap_or("?");
-                            ui.selectable_value(&mut state.map_display_isotope, i, name);
-                        }
-                    });
-            });
-        }
-
         if n_isotopes == 0 {
             ui.label("No density maps available.");
             return;
         }
 
         let idx = state.map_display_isotope.min(n_isotopes - 1);
+        let isotope_labels = result
+            .isotope_labels
+            .iter()
+            .map(|s| compact_isotope_label_from_name(s))
+            .collect();
 
-        ui.label("Density (atoms/barn):");
         let (clicked, image_rect) = show_viridis_image_with_roi(
             ui,
             &result.density_maps[idx],
             "density_tex",
             &state.rois,
-            state.selected_pixel,
+            if state.selected_roi.is_some() {
+                None
+            } else {
+                state.selected_pixel
+            },
         );
         image_color_bar(
             ui,
@@ -621,7 +678,13 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
             crate::state::Colormap::Viridis,
             image_rect.width(),
         );
-        image_tool_strip(ui, state, None);
+        image_tool_strip(
+            ui,
+            state,
+            ImageToolStripCenter::Isotope {
+                labels: isotope_labels,
+            },
+        );
         if let Some((y, x)) = clicked {
             state.selected_pixel = Some((y, x));
             state.selected_roi = None;
@@ -683,7 +746,7 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 crate::state::Colormap::Viridis,
                 image_rect.width(),
             );
-            image_tool_strip(ui, state, Some(n_tof));
+            image_tool_strip(ui, state, ImageToolStripCenter::Tof { n_bins: n_tof });
         }
     } else if let Some(ref preview) = state.preview_image {
         // -- Raw preview with interactive ROI editor --
@@ -709,7 +772,7 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
             crate::state::Colormap::Viridis,
             image_rect.width(),
         );
-        image_tool_strip(ui, state, None);
+        image_tool_strip(ui, state, ImageToolStripCenter::None);
         apply_roi_editor_result(state, editor_result);
     } else {
         ui.label("Load and normalize data to see preview.");
@@ -717,10 +780,11 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
 
     ui.add_space(8.0);
     ui.separator();
+    let fit_controls_height = (ui.available_height() - 4.0).max(120.0);
     egui::ScrollArea::vertical()
         .id_salt("analyze_image_fit_controls")
-        .max_height((ui.available_height() - 4.0).max(120.0))
-        .show(ui, |ui| fit_controls(ui, state));
+        .max_height(fit_controls_height)
+        .show(ui, |ui| fit_controls(ui, state, fit_controls_height));
 }
 
 fn image_color_bar(
@@ -928,6 +992,15 @@ fn selected_pixel_fit_result_for_overlay(
 fn isotope_track_label(symbol: &str, a: u32) -> String {
     let bare_symbol = symbol.split_once('-').map_or(symbol, |(s, _)| s);
     format!("{}{}", superscript_u32(a), bare_symbol)
+}
+
+fn compact_isotope_label_from_name(name: &str) -> String {
+    if let Some((symbol, mass)) = name.split_once('-')
+        && let Ok(a) = mass.parse::<u32>()
+    {
+        return format!("{}{}", superscript_u32(a), symbol);
+    }
+    name.to_string()
 }
 
 fn superscript_u32(value: u32) -> String {
@@ -1298,7 +1371,7 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
         .height(plot_height)
         .x_axis_label(x_label)
         .y_axis_label(y_label)
-        .legend(egui_plot::Legend::default())
+        .legend(egui_plot::Legend::default().position(Corner::RightBottom))
         .link_axis("analyze_xaxis", [true, false])
         .show(ui, |plot_ui| {
             plot_ui.points(measured_points);
@@ -1322,6 +1395,7 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
     // Tick strips below the main plot.  When n_strips > MAX_VISIBLE_STRIPS,
     // a vertical scrollbar appears and we cap the area at the visible-cap
     // height so the strip block never displaces the fit-summary panel.
+    let mut dragged_ruler = None;
     if n_strips > 0 {
         ui.add_space(2.0);
         egui::ScrollArea::vertical()
@@ -1329,9 +1403,16 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
             .max_height(strips_total_height)
             .show(ui, |ui| {
                 for (i, row) in strip_rows.iter().enumerate() {
-                    draw_aligned_tick_row(ui, i, row, &plot_response.transform, state);
+                    if let Some(ruler) =
+                        draw_aligned_tick_row(ui, i, row, &plot_response.transform, state)
+                    {
+                        dragged_ruler = Some(ruler);
+                    }
                 }
             });
+    }
+    if let Some(ruler) = dragged_ruler {
+        draw_dragged_resonance_ruler(ui, &plot_response.transform, &ruler, state);
     }
 }
 
@@ -1341,19 +1422,19 @@ fn draw_aligned_tick_row(
     row: &TickRow<'_>,
     transform: &PlotTransform,
     state: &AppState,
-) {
+) -> Option<DraggedResonanceRuler> {
     const STRIP_HEIGHT: f32 = 18.0;
 
     let available_width = ui.available_width();
     let (response, painter) = ui.allocate_painter(
         egui::vec2(available_width, STRIP_HEIGHT),
-        egui::Sense::hover(),
+        egui::Sense::click_and_drag(),
     );
     let plot_frame = *transform.frame();
     let track_left = plot_frame.left().max(response.rect.left());
     let track_right = plot_frame.right().min(response.rect.right());
     if track_right <= track_left {
-        return;
+        return None;
     }
 
     let track_rect = egui::Rect::from_min_max(
@@ -1371,9 +1452,10 @@ fn draw_aligned_tick_row(
     let x_lo = bounds.min()[0];
     let x_hi = bounds.max()[0];
     if !x_lo.is_finite() || !x_hi.is_finite() || x_lo >= x_hi {
-        return;
+        return None;
     }
 
+    let mut candidates = Vec::new();
     for range in row.data.ranges.iter().filter(|r| r.resolved) {
         for lg in &range.l_groups {
             for res in &lg.resonances {
@@ -1391,6 +1473,11 @@ fn draw_aligned_tick_row(
                 let x_pos = transform
                     .position_from_point_x(x)
                     .clamp(track_rect.left(), track_rect.right());
+                candidates.push(TickCandidate {
+                    axis_x: x,
+                    energy_ev: res.energy,
+                    x_pos,
+                });
                 painter.line_segment(
                     [
                         egui::pos2(x_pos, track_rect.top()),
@@ -1421,7 +1508,98 @@ fn draw_aligned_tick_row(
             row.color,
         );
     }
-    response.on_hover_text(format!("{} resonance track #{}", row.label, row_index + 1));
+    let response = response.on_hover_text(format!(
+        "{} resonance track #{}\nDrag a tick upward to compare it against the spectrum",
+        row.label,
+        row_index + 1
+    ));
+    dragged_resonance_from_response(ui, response, &candidates, row)
+}
+
+fn dragged_resonance_from_response(
+    ui: &mut egui::Ui,
+    response: egui::Response,
+    candidates: &[TickCandidate],
+    row: &TickRow<'_>,
+) -> Option<DraggedResonanceRuler> {
+    let drag_key = egui::Id::new("analyze_dragged_resonance_ruler");
+
+    if response.drag_started()
+        && let Some(pointer) = response.interact_pointer_pos()
+        && let Some(candidate) = candidates
+            .iter()
+            .min_by(|a, b| {
+                (a.x_pos - pointer.x)
+                    .abs()
+                    .total_cmp(&(b.x_pos - pointer.x).abs())
+            })
+            .filter(|candidate| (candidate.x_pos - pointer.x).abs() <= 12.0)
+    {
+        ui.data_mut(|data| {
+            data.insert_temp(
+                drag_key,
+                DraggedResonanceRuler {
+                    label: row.label.clone(),
+                    color: row.color,
+                    axis_x: candidate.axis_x,
+                    energy_ev: candidate.energy_ev,
+                },
+            );
+        });
+    }
+
+    if response.drag_stopped() {
+        ui.data_mut(|data| data.remove::<DraggedResonanceRuler>(drag_key));
+        return None;
+    }
+
+    if response.dragged() {
+        return ui.data(|data| data.get_temp::<DraggedResonanceRuler>(drag_key));
+    }
+
+    None
+}
+
+fn draw_dragged_resonance_ruler(
+    ui: &egui::Ui,
+    transform: &PlotTransform,
+    ruler: &DraggedResonanceRuler,
+    state: &AppState,
+) {
+    let frame = *transform.frame();
+    let x = transform
+        .position_from_point_x(ruler.axis_x)
+        .clamp(frame.left(), frame.right());
+    let pointer_y = ui
+        .input(|i| i.pointer.hover_pos())
+        .map_or(frame.top() + 14.0, |pos| {
+            pos.y.clamp(frame.top() + 14.0, frame.bottom() - 14.0)
+        });
+    let label = match state.analyze_spectrum_axis {
+        SpectrumAxis::EnergyEv => format!("{}  {:.4} eV", ruler.label, ruler.energy_ev),
+        SpectrumAxis::TofMicroseconds => {
+            format!(
+                "{}  {:.4} \u{03bc}s ({:.4} eV)",
+                ruler.label, ruler.axis_x, ruler.energy_ev
+            )
+        }
+    };
+
+    let painter = ui.ctx().layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("analyze_dragged_resonance_ruler_layer"),
+    ));
+    painter.line_segment(
+        [egui::pos2(x, frame.top()), egui::pos2(x, frame.bottom())],
+        egui::Stroke::new(2.0, ruler.color),
+    );
+    painter.text(
+        egui::pos2(x + 6.0, pointer_y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(12.0),
+        ruler.color,
+    );
 }
 
 fn fit_results_panel(ui: &mut egui::Ui, state: &AppState, result: &SpectrumFitResult) {
