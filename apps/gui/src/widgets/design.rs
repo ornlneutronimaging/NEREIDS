@@ -982,45 +982,6 @@ pub(crate) fn resonance_energy_to_axis(
     }
 }
 
-/// Render one isotope's resolved-resonance positions as tick marks inside a
-/// linked-axis strip plot. Resolves `(z, a)` colour via [`isotope_dot_color`]
-/// at the call site; this helper just iterates the resonance tree, converts
-/// each energy to the active axis units, culls to the visible x-window, and
-/// emits one `VLine` per in-range tick.
-///
-/// Used by the GSAS-II-style per-isotope tick-marks panel ([analyze.rs])
-/// to attribute each spectrum dip to a specific isotope. URR ranges are
-/// skipped (no per-resonance grid, only bounds).
-pub(crate) fn draw_isotope_tick_strip(
-    plot_ui: &mut egui_plot::PlotUi,
-    resonance_data: &nereids_endf::resonance::ResonanceData,
-    axis: SpectrumAxis,
-    flight_path_m: f64,
-    delay_us: f64,
-    color: Color32,
-) {
-    let bounds = plot_ui.transform().bounds();
-    let (x_lo, x_hi) = (bounds.min()[0], bounds.max()[0]);
-    // Plot bounds can be inverted/empty on the very first frame before egui
-    // has laid out the linked-axis group; bail to avoid plotting garbage.
-    if !x_lo.is_finite() || !x_hi.is_finite() || x_lo >= x_hi {
-        return;
-    }
-    for range in resonance_data.ranges.iter().filter(|r| r.resolved) {
-        for lg in &range.l_groups {
-            for res in &lg.resonances {
-                let Some(x) = resonance_energy_to_axis(res.energy, axis, flight_path_m, delay_us)
-                else {
-                    continue;
-                };
-                if x >= x_lo && x <= x_hi {
-                    plot_ui.vline(VLine::new("", x).color(color).width(1.0));
-                }
-            }
-        }
-    }
-}
-
 /// Parameters for building a fit overlay line.
 pub(crate) struct FitLineParams<'a> {
     pub result: &'a nereids_pipeline::pipeline::SpectrumFitResult,
@@ -1082,7 +1043,11 @@ pub(crate) fn build_fit_line(p: &FitLineParams<'_>) -> Option<Line<'static>> {
             [p.x_values[i], y]
         })
         .collect();
-    Some(Line::new("Fit", fit_points).width(2.0))
+    Some(
+        Line::new("Fit", fit_points)
+            .width(1.25)
+            .color(egui::Color32::from_rgba_unmultiplied(0, 122, 255, 170)),
+    )
 }
 
 // ── Resonance Data Collection ──────────────────────────────────

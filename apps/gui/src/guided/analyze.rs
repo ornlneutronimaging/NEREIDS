@@ -1,46 +1,44 @@
 //! Step 4: Analyze -- solver configuration, fit execution, spectrum/map display.
 //!
-//! Layout: 2-column outer (controls | content), with the content column
-//! stacked vertically (image on top ≈60%, spectrum on bottom ≈40%).
-//! The previous design docked image + spectrum side-by-side, which forced
-//! the square-aspect detector image and the wide-aspect resonance spectrum
-//! to share the same horizontal width budget — neither fit.  Stacking lets
-//! the image land near 1:1 and gives the spectrum the full content-column
-//! width for its many TOF bins (issue #504).  See `analyze_step` for the
-//! detailed diagram.
+//! Layout: asymmetric analysis cockpit: square image workbench and run controls
+//! on the left, spectrum + resonance tracks in the wide center workspace, and
+//! fit results in an on-demand drawer.  The Guided sidebar and app
+//! toolbar/status live outside this page; `analyze_step` works inside the
+//! remaining central viewport.
 
 use crate::state::{
-    AppState, EndfStatus, GuidedStep, InputMode, IsotopeEntry, SolverMethod, SpectrumAxis,
+    AppState, EndfStatus, InputMode, IsotopeEntry, RoiSelection, SolverMethod, SpectrumAxis,
 };
 use crate::widgets::design::{self, NavAction};
 use crate::widgets::image_view::{
-    RoiEditorResult, show_image_with_roi_editor, show_viridis_image, show_viridis_image_with_roi,
+    RoiEditorResult, apply_colormap, data_range, show_image_with_roi_editor, show_viridis_image,
+    show_viridis_image_with_roi,
 };
-use egui_plot::{Line, Plot, PlotPoints, VLine};
+use egui_plot::{Line, Plot, PlotPoints, PlotTransform, Points, VLine};
 use ndarray::Axis;
-use nereids_pipeline::pipeline::{BackgroundConfig, InputData, SolverConfig, UnifiedFitConfig};
+use nereids_pipeline::pipeline::{
+    BackgroundConfig, InputData, SolverConfig, SpectrumFitResult, UnifiedFitConfig,
+};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
+struct TickRow<'a> {
+    label: String,
+    color: egui::Color32,
+    data: &'a nereids_endf::resonance::ResonanceData,
+}
+
 /// Draw the Analyze step content.
 ///
-/// Two-column outer layout with the right column stacked:
+/// Two-column cockpit layout:
 /// ```text
-/// +-- Controls (scroll) --+-- Image (top ≈60%) ----------------------+
-/// | Fit Parameters        | viridis density map / preview            |
-/// | Solver method         |  · click = select pixel                  |
-/// | Advanced              |  · shift+drag = draw ROI                 |
-/// | Run buttons           +------------------------------------------+
-/// | Fitting spinner       | Spectrum (bottom ≈40%)                   |
-/// | Isotope selector      | Measured · c·OB · Fit lines (full width) |
-/// | Convergence summary   | Pixel selectors · resonance dips · ...   |
-/// |                       | Per-pixel fit results: chi2_r, ρ̂ list   |
-/// +-----------------------+------------------------------------------+
+/// +-- Image workbench + run controls --+-- Spectrum + isotope tracks -------+
+/// | density/preview + colorbar          | measured · c·OB · fit lines       |
+/// |  · click pixel / shift+drag ROI     | linked resonance tick strips      |
+/// |  · solver/run controls              | shared energy / TOF axis          |
+/// +-------------------------------------+-----------------------------------+
 /// ```
-/// Stacking image + spectrum lets the image land near 1:1 and gives
-/// the spectrum the full content-column width for its many TOF bins
-/// (issue #504).
 pub fn analyze_step(ui: &mut egui::Ui, state: &mut AppState) {
     // Auto-prepare pre-normalized data if the user skipped the Normalize step.
     if matches!(
@@ -56,109 +54,38 @@ pub fn analyze_step(ui: &mut egui::Ui, state: &mut AppState) {
             crate::guided::normalize::prepare_transmission(state);
         }
     }
-
-    ui.horizontal(|ui| {
-        ui.heading("Analyze");
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            design::teleport_pill(ui, "← Forward Model", GuidedStep::ForwardModel, state);
-        });
-    });
-    ui.separator();
+    ensure_selected_pixel(state);
 
     let available_width = ui.available_width();
-    let controls_width = 220.0_f32.min(available_width * 0.2);
+    let spacing_x = ui.spacing().item_spacing.x;
 
-    // Style-derived spacing — adapts to the user's egui scale / theme
-    // overrides instead of baking in default-theme pixel values.
-    // `item_spacing.x` defaults to 8 px; the 6× multiplier covers
-    // (controls↔content separator + 2 inner column edges + outer frame
-    // margin) at default scale and scales with the theme.
-    // `item_spacing.y` is the visual height a `ui.separator()` consumes
-    // between stacked rows.
-    let outer_row_padding = ui.spacing().item_spacing.x * 6.0;
-    let inter_row_padding = ui.spacing().item_spacing.y.max(6.0);
-
-    // Preferred minimum height for the spectrum pane (header rows ~50
-    // + plot floor 200 + fit-result card ~70).  When the window is
-    // tall enough the spectrum gets at least this; when it isn't, the
-    // partition shrinks the spectrum proportionally rather than
-    // forcing the column past the window edge and clipping the nav
-    // strip below.  See partition logic + `.min(stacked_height)` clamp.
-    const MIN_SPECTRUM_HEIGHT: f32 = 280.0;
-
-    // `col_height` is the available room above the nav strip — never
-    // force it higher than what the window allocates.  A previous
-    // attempt set a 440 px floor to guarantee the partition couldn't
-    // produce negative regions; that pushed the nav strip past the
-    // visible area on shorter screens (cross-confirmed by user demo
-    // run, post-Round-1 review).  The partition below is now
-    // overflow-safe by construction via `.min(stacked_height)` instead.
+    // `col_height` is the available room above the nav strip. Keep this bounded
+    // by the real viewport height; Analyze is intentionally not inside a page
+    // ScrollArea so fixed-aspect image sizing can use `available_height()`.
     let col_height = (ui.available_height() - 40.0).max(120.0);
+    let (image_width, spectrum_width) = cockpit_column_widths(available_width, spacing_x);
 
-    // Two-column outer layout: narrow controls column + stacked content.
-    // See module-level docstring + the diagram on `analyze_step`.
     ui.horizontal(|ui| {
-        // Column 1: fit controls (scrollable — content can exceed viewport)
         ui.allocate_ui_with_layout(
-            egui::vec2(controls_width, col_height),
+            egui::vec2(image_width, col_height),
             egui::Layout::top_down(egui::Align::LEFT),
             |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("analyze_controls")
-                    .show(ui, |ui| {
-                        fit_controls(ui, state);
-                        convergence_summary(ui, state);
-                    });
+                image_panel(ui, state);
             },
         );
 
         ui.separator();
 
-        // Column 2: stacked content — image on top, spectrum below.
-        // The partition guarantees `image_h + sep + spectrum_h ==
-        // col_height` by construction (overflow-safe), so children
-        // cannot push past the parent and overlap the nav strip.
-        //
-        // Approach:
-        //   1. Compute the preferred 60/40 split.
-        //   2. Bias the spectrum to at least `MIN_SPECTRUM_HEIGHT`
-        //      *when there's room*, otherwise let it use whatever
-        //      stacked_height is available.
-        //   3. The `.min(stacked_height)` clamp on `spectrum_height`
-        //      caps the partition so its sum can never exceed
-        //      `col_height` regardless of how short the window is.
-        //   4. On very short windows, the image collapses before the
-        //      nav strip is sacrificed — a deliberate trade-off.
-        let content_width = (available_width - controls_width - outer_row_padding).max(200.0);
-        let stacked_height = (col_height - inter_row_padding).max(0.0);
-        let preferred_image_height = (stacked_height * 0.60).floor();
-        let preferred_spectrum_height =
-            (stacked_height - preferred_image_height).max(MIN_SPECTRUM_HEIGHT);
-        let spectrum_height = preferred_spectrum_height.min(stacked_height);
-        let image_height = (stacked_height - spectrum_height).max(0.0);
-
         ui.allocate_ui_with_layout(
-            egui::vec2(content_width, col_height),
+            egui::vec2(spectrum_width, col_height),
             egui::Layout::top_down(egui::Align::LEFT),
             |ui| {
-                ui.allocate_ui_with_layout(
-                    egui::vec2(content_width, image_height),
-                    egui::Layout::top_down(egui::Align::LEFT),
-                    |ui| {
-                        image_panel(ui, state);
-                    },
-                );
-                ui.separator();
-                ui.allocate_ui_with_layout(
-                    egui::vec2(content_width, spectrum_height),
-                    egui::Layout::top_down(egui::Align::LEFT),
-                    |ui| {
-                        spectrum_panel(ui, state);
-                    },
-                );
+                spectrum_panel(ui, state);
             },
         );
     });
+
+    fit_info_drawer(ui.ctx(), state);
 
     // -- Navigation --
     let can_continue = state.spatial_result.is_some();
@@ -173,6 +100,52 @@ pub fn analyze_step(ui: &mut egui::Ui, state: &mut AppState) {
         NavAction::Continue => state.nav_next(),
         NavAction::None => {}
     }
+}
+
+fn cockpit_column_widths(available_width: f32, spacing_x: f32) -> (f32, f32) {
+    const IMAGE_MIN: f32 = 340.0;
+    const IMAGE_MAX: f32 = 720.0;
+    const CENTER_MIN: f32 = 520.0;
+
+    // Account for the separator and surrounding horizontal layout spacing.
+    let chrome = spacing_x * 4.0;
+    let usable = (available_width - chrome).max(120.0);
+    let minimum_total = CENTER_MIN + IMAGE_MIN;
+
+    if usable < minimum_total {
+        let image = usable * 0.42;
+        let center = usable - image;
+        return (image, center);
+    }
+
+    let mut image = (usable * 0.38).clamp(IMAGE_MIN, IMAGE_MAX);
+    let mut center = usable - image;
+
+    if center < CENTER_MIN {
+        let deficit = CENTER_MIN - center;
+        let image_take = deficit.min(image - IMAGE_MIN);
+        image -= image_take;
+        center = usable - image;
+    }
+
+    (image, center.max(160.0))
+}
+
+fn ensure_selected_pixel(state: &mut AppState) {
+    if state.selected_pixel.is_some() {
+        return;
+    }
+
+    let Some(ref norm) = state.normalized else {
+        return;
+    };
+
+    let shape = norm.transmission.shape();
+    if shape.len() < 3 || shape[1] == 0 || shape[2] == 0 {
+        return;
+    }
+
+    state.selected_pixel = Some((shape[1] / 2, shape[2] / 2));
 }
 
 // ---- Fit Controls ----
@@ -364,12 +337,20 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
         }
     }
 
-    ui.add_space(8.0);
-    ui.separator();
+    if state.is_fitting {
+        if let Some(ref fp) = state.fitting_progress {
+            let done = fp.done();
+            let total = fp.total();
+            let frac = fp.fraction();
+            crate::widgets::design::progress_mini(ui, frac, &format!("{done}/{total} px"));
+        } else {
+            ui.spinner();
+            ui.label("Fitting...");
+        }
+    }
+}
 
-    // Run buttons
-    ui.label(egui::RichText::new("Run").strong());
-
+fn run_action_buttons(ui: &mut egui::Ui, state: &mut AppState) {
     let has_enabled_iso = state
         .isotope_entries
         .iter()
@@ -384,63 +365,192 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
 
     let can_run = ready && !state.is_fitting;
 
-    ui.add_enabled_ui(can_run, |ui| {
-        if ui.button("Fit Selected Pixel").clicked() {
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(can_run, egui::Button::new("●"))
+            .on_hover_text("Fit selected pixel")
+            .clicked()
+        {
             fit_pixel(state);
         }
-        if ui.button("Fit ROI Average").clicked() {
+        if ui
+            .add_enabled(can_run, egui::Button::new("▣"))
+            .on_hover_text("Fit ROI average")
+            .clicked()
+        {
             fit_roi(state);
         }
-        if ui.button("Spatial Map (all pixels)").clicked() {
+        if ui
+            .add_enabled(can_run, egui::Button::new("▦"))
+            .on_hover_text("Fit spatial map for all pixels")
+            .clicked()
+        {
             run_spatial_map(state);
         }
     });
+}
 
-    if state.is_fitting {
-        if let Some(ref fp) = state.fitting_progress {
-            let done = fp.done();
-            let total = fp.total();
-            let frac = fp.fraction();
-            crate::widgets::design::progress_mini(ui, frac, &format!("{done}/{total} px"));
-        } else {
-            ui.spinner();
-            ui.label("Fitting...");
+fn image_tool_strip(ui: &mut egui::Ui, state: &mut AppState, n_tof: Option<usize>) {
+    ui.horizontal(|ui| {
+        let has_sel = state.selected_roi.is_some_and(|i| i < state.rois.len());
+        if ui
+            .add_enabled(has_sel, egui::Button::new("⌫"))
+            .on_hover_text("Delete selected ROI")
+            .clicked()
+            && let Some(idx) = state.selected_roi
+            && idx < state.rois.len()
+        {
+            state.log_provenance(
+                crate::state::ProvenanceEventKind::ConfigChanged,
+                format!("ROI #{} deleted", idx + 1),
+            );
+            state.rois.remove(idx);
+            state.selected_roi = match state.selected_roi {
+                Some(s) if s == idx => None,
+                Some(s) if s > idx => Some(s - 1),
+                other => other,
+            };
+            clear_analyze_downstream(state);
         }
+
+        if ui
+            .add_enabled(!state.rois.is_empty(), egui::Button::new("⊘"))
+            .on_hover_text("Clear all ROIs")
+            .clicked()
+        {
+            let n = state.rois.len();
+            state.log_provenance(
+                crate::state::ProvenanceEventKind::ConfigChanged,
+                format!("Cleared all {n} ROIs"),
+            );
+            state.rois.clear();
+            state.selected_roi = None;
+            clear_analyze_downstream(state);
+        }
+
+        ui.separator();
+
+        if let Some(n_tof) = n_tof {
+            let slider = egui::Slider::new(
+                &mut state.analyze_tof_slice_index,
+                0..=n_tof.saturating_sub(1),
+            )
+            .show_value(true);
+            ui.add_sized([150.0, 18.0], slider)
+                .on_hover_text("TOF slice shown in the image");
+        }
+
+        ui.separator();
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            run_action_buttons(ui, state);
+        });
+    });
+}
+
+fn has_fit_details(state: &AppState) -> bool {
+    if state.pixel_fit_result.is_some() || state.last_fit_feedback.is_some() {
+        return true;
     }
 
-    // -- Fit feedback card --
-    if let Some(ref fb) = state.last_fit_feedback {
-        ui.add_space(8.0);
-        let (border_color, bg_color) = if fb.success {
-            (
-                egui::Color32::from_rgb(60, 160, 60),
-                egui::Color32::from_rgba_premultiplied(30, 80, 30, 40),
-            )
-        } else {
-            (
-                egui::Color32::from_rgb(200, 60, 60),
-                egui::Color32::from_rgba_premultiplied(80, 30, 30, 40),
-            )
-        };
-        egui::Frame::default()
-            .fill(bg_color)
-            .stroke(egui::Stroke::new(1.5, border_color))
-            .corner_radius(4.0)
-            .inner_margin(6.0)
-            .show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new(&fb.summary)
-                        .color(border_color)
-                        .strong(),
-                );
-                for (symbol, density) in &fb.densities {
-                    ui.label(format!("  {symbol}: {density:.4e} at/barn"));
-                }
-                if let Some(t) = fb.temperature_k {
-                    ui.label(format!("  T = {t:.1} K"));
-                }
-            });
+    let Some((y, x)) = state.selected_pixel else {
+        return false;
+    };
+    state.spatial_result.as_ref().is_some_and(|r| {
+        y < r.converged_map.shape()[0] && x < r.converged_map.shape()[1] && r.converged_map[[y, x]]
+    })
+}
+
+fn fit_info_button(ui: &mut egui::Ui, state: &mut AppState) {
+    let enabled = has_fit_details(state);
+    let response = ui.add_enabled(
+        enabled,
+        egui::Button::new(egui::RichText::new("i").strong()).small(),
+    );
+    if response.clicked() {
+        state.show_analyze_fit_info = true;
     }
+    response.on_hover_text(if enabled {
+        "Show fit details"
+    } else {
+        "Run a fit to enable fit details"
+    });
+}
+
+fn fit_info_drawer(ctx: &egui::Context, state: &mut AppState) {
+    if !has_fit_details(state) {
+        state.show_analyze_fit_info = false;
+        return;
+    }
+    if !state.show_analyze_fit_info {
+        return;
+    }
+
+    let mut open = state.show_analyze_fit_info;
+    egui::Window::new("Fit Details")
+        .open(&mut open)
+        .default_width(360.0)
+        .default_height(420.0)
+        .resizable(true)
+        .collapsible(false)
+        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-24.0, 96.0))
+        .show(ctx, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("analyze_fit_details_drawer")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    fit_feedback_panel(ui, state);
+
+                    let selected_fit = state
+                        .selected_pixel
+                        .and_then(|(y, x)| selected_pixel_fit_result_for_overlay(state, y, x));
+                    if let Some(ref result) = selected_fit {
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.label(egui::RichText::new("Selected Fit").strong());
+                        ui.add_space(4.0);
+                        fit_results_panel(ui, state, result);
+                    }
+
+                    convergence_summary(ui, state);
+                });
+        });
+    state.show_analyze_fit_info = open;
+}
+
+fn fit_feedback_panel(ui: &mut egui::Ui, state: &AppState) {
+    let Some(ref fb) = state.last_fit_feedback else {
+        return;
+    };
+
+    let (border_color, bg_color) = if fb.success {
+        (
+            egui::Color32::from_rgb(60, 160, 60),
+            egui::Color32::from_rgba_premultiplied(30, 80, 30, 40),
+        )
+    } else {
+        (
+            egui::Color32::from_rgb(200, 60, 60),
+            egui::Color32::from_rgba_premultiplied(80, 30, 30, 40),
+        )
+    };
+    egui::Frame::default()
+        .fill(bg_color)
+        .stroke(egui::Stroke::new(1.5, border_color))
+        .corner_radius(4.0)
+        .inner_margin(6.0)
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(&fb.summary)
+                    .color(border_color)
+                    .strong(),
+            );
+            for (symbol, density) in &fb.densities {
+                ui.label(format!("{symbol}: {density:.4e} at/barn"));
+            }
+            if let Some(t) = fb.temperature_k {
+                ui.label(format!("T = {t:.1} K"));
+            }
+        });
 }
 
 /// Small convergence map + summary, shown in the controls column after spatial map.
@@ -498,15 +608,23 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
         let idx = state.map_display_isotope.min(n_isotopes - 1);
 
         ui.label("Density (atoms/barn):");
-        let (clicked, _rect) = show_viridis_image_with_roi(
+        let (clicked, image_rect) = show_viridis_image_with_roi(
             ui,
             &result.density_maps[idx],
             "density_tex",
             &state.rois,
             state.selected_pixel,
         );
+        image_color_bar(
+            ui,
+            &result.density_maps[idx],
+            crate::state::Colormap::Viridis,
+            image_rect.width(),
+        );
+        image_tool_strip(ui, state, None);
         if let Some((y, x)) = clicked {
             state.selected_pixel = Some((y, x));
+            state.selected_roi = None;
             state.pixel_fit_result = None;
             state.residuals_cache = None;
             state.last_fit_feedback = None;
@@ -544,8 +662,12 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
             ui.label(label);
 
             let sel_roi = state.selected_roi;
-            let sel_px = state.selected_pixel;
-            let (editor_result, _rect) = show_image_with_roi_editor(
+            let sel_px = if sel_roi.is_some() {
+                None
+            } else {
+                state.selected_pixel
+            };
+            let (editor_result, image_rect) = show_image_with_roi_editor(
                 ui,
                 &slice,
                 "analyze_preview_tex",
@@ -555,21 +677,24 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 sel_px,
             );
             apply_roi_editor_result(state, editor_result);
-
-            ui.add(
-                egui::Slider::new(
-                    &mut state.analyze_tof_slice_index,
-                    0..=n_tof.saturating_sub(1),
-                )
-                .text("TOF bin"),
+            image_color_bar(
+                ui,
+                &slice,
+                crate::state::Colormap::Viridis,
+                image_rect.width(),
             );
+            image_tool_strip(ui, state, Some(n_tof));
         }
     } else if let Some(ref preview) = state.preview_image {
         // -- Raw preview with interactive ROI editor --
         ui.label("Preview (summed counts):");
         let sel_roi = state.selected_roi;
-        let sel_px = state.selected_pixel;
-        let (editor_result, _rect) = show_image_with_roi_editor(
+        let sel_px = if sel_roi.is_some() {
+            None
+        } else {
+            state.selected_pixel
+        };
+        let (editor_result, image_rect) = show_image_with_roi_editor(
             ui,
             preview,
             "preview_tex",
@@ -578,69 +703,75 @@ fn image_panel(ui: &mut egui::Ui, state: &mut AppState) {
             sel_roi,
             sel_px,
         );
+        image_color_bar(
+            ui,
+            preview,
+            crate::state::Colormap::Viridis,
+            image_rect.width(),
+        );
+        image_tool_strip(ui, state, None);
         apply_roi_editor_result(state, editor_result);
     } else {
         ui.label("Load and normalize data to see preview.");
     }
 
-    // ROI toolbar (only in preview mode, not when viewing density maps)
-    if state.spatial_result.is_none()
-        && (state.normalized.is_some() || state.preview_image.is_some())
-    {
-        ui.horizontal(|ui| {
-            let has_sel = state.selected_roi.is_some_and(|i| i < state.rois.len());
-            if ui
-                .add_enabled(has_sel, egui::Button::new("Delete ROI"))
-                .clicked()
-                && let Some(idx) = state.selected_roi
-                && idx < state.rois.len()
-            {
-                state.log_provenance(
-                    crate::state::ProvenanceEventKind::ConfigChanged,
-                    format!("ROI #{} deleted", idx + 1),
-                );
-                state.rois.remove(idx);
-                // Adjust selection: if deleted ROI was selected, clear.
-                // If a higher-indexed ROI was selected, shift down.
-                state.selected_roi = match state.selected_roi {
-                    Some(s) if s == idx => None,
-                    Some(s) if s > idx => Some(s - 1),
-                    other => other,
-                };
-                clear_analyze_downstream(state);
-            }
-            if ui
-                .add_enabled(!state.rois.is_empty(), egui::Button::new("Clear ROIs"))
-                .clicked()
-            {
-                let n = state.rois.len();
-                state.log_provenance(
-                    crate::state::ProvenanceEventKind::ConfigChanged,
-                    format!("Cleared all {n} ROIs"),
-                );
-                state.rois.clear();
-                state.selected_roi = None;
-                clear_analyze_downstream(state);
-            }
-            if !state.rois.is_empty() {
-                ui.label(
-                    egui::RichText::new(format!("{} ROI(s)", state.rois.len()))
-                        .small()
-                        .weak(),
-                );
-            }
-        });
-        ui.label(
-            egui::RichText::new("Click to select pixel · Shift+drag to draw ROI")
-                .small()
-                .weak(),
+    ui.add_space(8.0);
+    ui.separator();
+    egui::ScrollArea::vertical()
+        .id_salt("analyze_image_fit_controls")
+        .max_height((ui.available_height() - 4.0).max(120.0))
+        .show(ui, |ui| fit_controls(ui, state));
+}
+
+fn image_color_bar(
+    ui: &mut egui::Ui,
+    data: &ndarray::Array2<f64>,
+    colormap: crate::state::Colormap,
+    target_width: f32,
+) {
+    let width = target_width.min(ui.available_width()).max(96.0).round();
+    if !width.is_finite() {
+        return;
+    }
+    let (vmin, vmax) = data_range(data);
+    let (response, painter) = ui.allocate_painter(egui::vec2(width, 10.0), egui::Sense::hover());
+    let steps = 96;
+    for i in 0..steps {
+        let t0 = i as f32 / steps as f32;
+        let t1 = (i + 1) as f32 / steps as f32;
+        let (r, g, b) = apply_colormap(colormap, t0 as f64);
+        let x0 = response.rect.left() + t0 * response.rect.width();
+        let x1 = response.rect.left() + t1 * response.rect.width();
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(x0, response.rect.top()),
+                egui::pos2(x1, response.rect.bottom()),
+            ),
+            0.0,
+            egui::Color32::from_rgb(r, g, b),
         );
     }
+    painter.rect_stroke(
+        response.rect,
+        0.0,
+        egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+        egui::StrokeKind::Inside,
+    );
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(format_value(vmin)).small().weak());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(egui::RichText::new(format_value(vmax)).small().weak());
+        });
+    });
+}
 
-    // Show selected pixel coordinates as feedback
-    if let Some((y, x)) = state.selected_pixel {
-        ui.add_space(4.0);
-        ui.label(format!("Selected pixel: ({}, {})", y, x));
+fn format_value(value: f64) -> String {
+    if !value.is_finite() {
+        "NaN".to_string()
+    } else if value.abs() >= 1.0e4 || (value != 0.0 && value.abs() < 1.0e-3) {
+        format!("{value:.3e}")
+    } else {
+        format!("{value:.4}")
     }
 }
 
@@ -667,6 +798,7 @@ fn apply_roi_editor_result(state: &mut AppState, result: RoiEditorResult) {
             if index < state.rois.len() {
                 state.rois[index] = new_roi;
                 clear_analyze_downstream(state);
+                state.selected_roi = Some(index);
                 state.log_provenance(
                     crate::state::ProvenanceEventKind::ConfigChanged,
                     format!(
@@ -680,14 +812,29 @@ fn apply_roi_editor_result(state: &mut AppState, result: RoiEditorResult) {
                 );
             }
         }
+        RoiEditorResult::Moving { index, new_roi } => {
+            if index < state.rois.len() {
+                state.rois[index] = new_roi;
+                state.selected_roi = Some(index);
+                state.pixel_fit_result = None;
+                state.residuals_cache = None;
+                state.last_fit_feedback = None;
+                state.show_analyze_fit_info = false;
+            }
+        }
         RoiEditorResult::Selected(idx) => {
             state.selected_roi = Some(idx);
+            state.pixel_fit_result = None;
+            state.residuals_cache = None;
+            state.last_fit_feedback = None;
+            state.show_analyze_fit_info = false;
         }
         RoiEditorResult::Deselected => {
             state.selected_roi = None;
         }
         RoiEditorResult::ClickedPixel(y, x) => {
             state.selected_pixel = Some((y, x));
+            state.selected_roi = None;
             state.pixel_fit_result = None;
             state.residuals_cache = None;
             state.last_fit_feedback = None;
@@ -696,17 +843,13 @@ fn apply_roi_editor_result(state: &mut AppState, result: RoiEditorResult) {
     }
 }
 
-/// Collect all resonance data (without mapping) for draw_resonance_dips.
-fn collect_all_resonance_data(state: &AppState) -> Vec<nereids_endf::resonance::ResonanceData> {
-    design::collect_all_resonance_data_with_mapping(state).0
-}
-
 /// Clear downstream fit results when ROI changes.
 fn clear_analyze_downstream(state: &mut AppState) {
     state.pixel_fit_result = None;
     state.spatial_result = None;
     state.last_fit_feedback = None;
     state.fitting_rois.clear();
+    state.show_analyze_fit_info = false;
 }
 
 // ---- Spectrum Panel (Column 3) ----
@@ -725,14 +868,156 @@ fn display_as_counts(state: &AppState) -> bool {
         && !matches!(state.input_mode, InputMode::TransmissionTiff)
 }
 
+fn selected_pixel_fit_result_for_overlay(
+    state: &AppState,
+    y: usize,
+    x: usize,
+) -> Option<SpectrumFitResult> {
+    if let Some(result) = state.pixel_fit_result.clone() {
+        return Some(result);
+    }
+
+    let result = state.spatial_result.as_ref()?;
+    let shape = result.converged_map.shape();
+    if y >= shape[0] || x >= shape[1] || !result.converged_map[[y, x]] {
+        return None;
+    }
+
+    let densities: Vec<f64> = result.density_maps.iter().map(|map| map[[y, x]]).collect();
+    if densities.is_empty() || densities.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+
+    let uncertainties = if result.uncertainty_maps.len() == densities.len() {
+        Some(
+            result
+                .uncertainty_maps
+                .iter()
+                .map(|map| map[[y, x]])
+                .collect(),
+        )
+    } else {
+        None
+    };
+
+    let background = result.background_maps.as_ref().map_or([0.0; 3], |maps| {
+        [maps[0][[y, x]], maps[1][[y, x]], maps[2][[y, x]]]
+    });
+
+    Some(SpectrumFitResult {
+        densities,
+        uncertainties,
+        reduced_chi_squared: result.chi_squared_map[[y, x]],
+        converged: true,
+        iterations: 0,
+        temperature_k: result.temperature_map.as_ref().map(|map| map[[y, x]]),
+        temperature_k_unc: result
+            .temperature_uncertainty_map
+            .as_ref()
+            .map(|map| map[[y, x]]),
+        anorm: result.anorm_map.as_ref().map_or(1.0, |map| map[[y, x]]),
+        background,
+        back_d: 0.0,
+        back_f: 0.0,
+        t0_us: result.t0_us_map.as_ref().map(|map| map[[y, x]]),
+        l_scale: result.l_scale_map.as_ref().map(|map| map[[y, x]]),
+        deviance_per_dof: result.deviance_per_dof_map.as_ref().map(|map| map[[y, x]]),
+    })
+}
+
+fn isotope_track_label(symbol: &str, a: u32) -> String {
+    let bare_symbol = symbol.split_once('-').map_or(symbol, |(s, _)| s);
+    format!("{}{}", superscript_u32(a), bare_symbol)
+}
+
+fn superscript_u32(value: u32) -> String {
+    value
+        .to_string()
+        .chars()
+        .map(|c| match c {
+            '0' => '⁰',
+            '1' => '¹',
+            '2' => '²',
+            '3' => '³',
+            '4' => '⁴',
+            '5' => '⁵',
+            '6' => '⁶',
+            '7' => '⁷',
+            '8' => '⁸',
+            '9' => '⁹',
+            _ => c,
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+enum SpectrumSelection {
+    Pixel { y: usize, x: usize },
+    Roi { index: usize, roi: RoiSelection },
+}
+
+fn active_spectrum_selection(state: &AppState) -> Option<SpectrumSelection> {
+    if let Some(index) = state.selected_roi
+        && let Some(&roi) = state.rois.get(index)
+        && roi.y_end > roi.y_start
+        && roi.x_end > roi.x_start
+    {
+        return Some(SpectrumSelection::Roi { index, roi });
+    }
+
+    state
+        .selected_pixel
+        .map(|(y, x)| SpectrumSelection::Pixel { y, x })
+}
+
+fn roi_mean_at(data: &ndarray::Array3<f64>, i: usize, roi: RoiSelection) -> f64 {
+    let shape = data.shape();
+    let y0 = roi.y_start.min(shape[1]);
+    let y1 = roi.y_end.min(shape[1]);
+    let x0 = roi.x_start.min(shape[2]);
+    let x1 = roi.x_end.min(shape[2]);
+    if y0 >= y1 || x0 >= x1 {
+        return f64::NAN;
+    }
+
+    let mut sum = 0.0;
+    let mut n = 0usize;
+    for yy in y0..y1 {
+        for xx in x0..x1 {
+            let v = data[[i, yy, xx]];
+            if v.is_finite() {
+                sum += v;
+                n += 1;
+            }
+        }
+    }
+    if n == 0 { f64::NAN } else { sum / n as f64 }
+}
+
 fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
-    // Pixel selector (manual override via DragValues)
+    let selection = active_spectrum_selection(state);
+
+    // Active selection selector. Pixel coordinate editing is intentionally
+    // disabled while an ROI is selected because the spectrum is ROI-averaged.
     ui.horizontal(|ui| {
-        ui.label("Pixel:");
-        if let Some((y, x)) = state.selected_pixel {
-            ui.label(format!("({}, {})", y, x));
-        } else {
-            ui.label("(none selected)");
+        ui.label("Selection:");
+        match selection {
+            Some(SpectrumSelection::Roi { index, roi }) => {
+                ui.label(format!(
+                    "ROI {}  y:{}-{} x:{}-{}",
+                    index + 1,
+                    roi.y_start,
+                    roi.y_end.saturating_sub(1),
+                    roi.x_start,
+                    roi.x_end.saturating_sub(1)
+                ));
+            }
+            Some(SpectrumSelection::Pixel { y, x }) => {
+                ui.label(format!("Pixel ({y}, {x})"));
+            }
+            None => {
+                ui.label("(none)");
+            }
         }
         if let Some(ref norm) = state.normalized {
             let shape = norm.transmission.shape();
@@ -741,16 +1026,19 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
 
             let mut y_val = state.selected_pixel.map_or(0, |(y, _)| y);
             let mut x_val = state.selected_pixel.map_or(0, |(_, x)| x);
+            let pixel_mode = !matches!(selection, Some(SpectrumSelection::Roi { .. }));
 
             let y_changed = ui
-                .add(
+                .add_enabled(
+                    pixel_mode,
                     egui::DragValue::new(&mut y_val)
                         .prefix("y: ")
                         .range(0..=height.saturating_sub(1)),
                 )
                 .changed();
             let x_changed = ui
-                .add(
+                .add_enabled(
+                    pixel_mode,
                     egui::DragValue::new(&mut x_val)
                         .prefix("x: ")
                         .range(0..=width.saturating_sub(1)),
@@ -759,10 +1047,14 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
 
             if y_changed || x_changed {
                 state.selected_pixel = Some((y_val, x_val));
+                state.selected_roi = None;
                 state.pixel_fit_result = None;
                 state.residuals_cache = None;
             }
         }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            fit_info_button(ui, state);
+        });
     });
 
     // Axis toggle + resonance dips
@@ -779,7 +1071,7 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
             "TOF (\u{03bc}s)",
         );
         ui.separator();
-        ui.checkbox(&mut state.show_resonance_dips, "Resonances");
+        ui.checkbox(&mut state.show_resonance_dips, "Resonance tracks");
     });
 
     let norm = match state.normalized {
@@ -807,16 +1099,18 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
         return;
     };
 
-    let (y, x) = match state.selected_pixel {
-        Some(px) => px,
+    let selection = match selection {
+        Some(selection) => selection,
         None => {
-            ui.label("Select a pixel to view its spectrum.");
+            ui.label("Select a pixel or ROI to view its spectrum.");
             return;
         }
     };
 
     let shape = norm.transmission.shape();
-    if y >= shape[1] || x >= shape[2] {
+    if let SpectrumSelection::Pixel { y, x } = selection
+        && (y >= shape[1] || x >= shape[2])
+    {
         ui.label("Selected pixel is out of bounds. Click the image to select a new pixel.");
         return;
     }
@@ -838,7 +1132,12 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
     let counts_scale: Vec<f64> = if show_counts {
         let ob = state.open_beam_data.as_ref().unwrap();
         let c = state.kl_c_ratio;
-        (0..n_plot).map(|i| c * ob[[i, y, x]]).collect()
+        (0..n_plot)
+            .map(|i| match selection {
+                SpectrumSelection::Pixel { y, x } => c * ob[[i, y, x]],
+                SpectrumSelection::Roi { roi, .. } => c * roi_mean_at(ob, i, roi),
+            })
+            .collect()
     } else {
         Vec::new()
     };
@@ -850,15 +1149,29 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
         let sample = state.sample_data.as_ref().unwrap();
         (0..n_plot)
             .filter(|&i| x_values[i].is_finite())
-            .map(|i| [x_values[i], sample[[i, y, x]]])
+            .map(|i| {
+                let y_value = match selection {
+                    SpectrumSelection::Pixel { y, x } => sample[[i, y, x]],
+                    SpectrumSelection::Roi { roi, .. } => roi_mean_at(sample, i, roi),
+                };
+                [x_values[i], y_value]
+            })
             .collect()
     } else {
         (0..n_plot)
             .filter(|&i| x_values[i].is_finite())
-            .map(|i| [x_values[i], norm.transmission[[i, y, x]]])
+            .map(|i| {
+                let y_value = match selection {
+                    SpectrumSelection::Pixel { y, x } => norm.transmission[[i, y, x]],
+                    SpectrumSelection::Roi { roi, .. } => roi_mean_at(&norm.transmission, i, roi),
+                };
+                [x_values[i], y_value]
+            })
             .collect()
     };
-    let measured_line = Line::new("Measured", measured_points);
+    let measured_points = Points::new("Measured", measured_points)
+        .radius(1.4)
+        .color(crate::theme::semantic::RED);
 
     // OB reference line (counts mode only): the c·OB curve the KL
     // model multiplies T against to predict sample counts.  Showing
@@ -879,7 +1192,11 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
     // + LM background polynomial (BackA + BackB/√E + BackC·√E) — both
     // are typically small, and a fully-correct counts overlay needs
     // the joint-Poisson forward model.  Tracked as a follow-up.
-    let fit_line = state.pixel_fit_result.as_ref().and_then(|result| {
+    let fit_result_for_overlay = match selection {
+        SpectrumSelection::Pixel { y, x } => selected_pixel_fit_result_for_overlay(state, y, x),
+        SpectrumSelection::Roi { .. } => state.pixel_fit_result.clone(),
+    };
+    let fit_line = fit_result_for_overlay.as_ref().and_then(|result| {
         let energies = state.energies.as_ref()?;
         let (all_rd, density_indices, density_ratios) =
             design::collect_all_resonance_data_with_mapping(state);
@@ -930,13 +1247,7 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
     // overlay are using — otherwise users fitting an element group would see
     // dips on the spectrum with no per-isotope row to attribute them to.
     const STRIP_HEIGHT: f32 = 18.0;
-    const STRIP_LABEL_WIDTH: f32 = 80.0;
     const MAX_VISIBLE_STRIPS: usize = 6;
-    struct TickRow<'a> {
-        label: String,
-        color: egui::Color32,
-        data: &'a nereids_endf::resonance::ResonanceData,
-    }
     let mut strip_rows: Vec<TickRow<'_>> = Vec::new();
     if state.show_resonance_dips {
         for entry in &state.isotope_entries {
@@ -944,7 +1255,7 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 && let Some(data) = entry.resonance_data.as_ref()
             {
                 strip_rows.push(TickRow {
-                    label: format!("{}-{}", entry.symbol, entry.a),
+                    label: isotope_track_label(&entry.symbol, entry.a),
                     color: design::isotope_dot_color(&entry.symbol),
                     data,
                 });
@@ -955,7 +1266,7 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 for member in &group.members {
                     if let Some(data) = member.resonance_data.as_ref() {
                         strip_rows.push(TickRow {
-                            label: format!("{}-{}", member.symbol, member.a),
+                            label: isotope_track_label(&member.symbol, member.a),
                             color: design::isotope_dot_color(&member.symbol),
                             data,
                         });
@@ -972,9 +1283,10 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
         0.0
     };
 
-    // Reserve space below the plot for the fit-result summary AND the
-    // tick strips so neither gets clipped at the column bottom.
-    let plot_height = (ui.available_height() - 100.0 - strips_total_height).max(200.0);
+    // Reserve space below the plot for the tick strips so neither the plot nor
+    // the track viewport pushes past the cockpit column. Fit results live in
+    // the right inspector, not below the spectrum.
+    let plot_height = (ui.available_height() - 20.0 - strips_total_height).max(220.0);
 
     // Plot
     let y_label = if show_counts {
@@ -982,14 +1294,14 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
     } else {
         "Transmission"
     };
-    Plot::new("spectrum_plot")
+    let plot_response = Plot::new("spectrum_plot")
         .height(plot_height)
         .x_axis_label(x_label)
         .y_axis_label(y_label)
         .legend(egui_plot::Legend::default())
         .link_axis("analyze_xaxis", [true, false])
         .show(ui, |plot_ui| {
-            plot_ui.line(measured_line);
+            plot_ui.points(measured_points);
             if let Some(ob) = ob_line {
                 plot_ui.line(ob);
             }
@@ -1005,12 +1317,6 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
                         .style(egui_plot::LineStyle::dashed_dense()),
                 );
             }
-
-            // Resonance dip markers (energy axis only, toggled)
-            if state.show_resonance_dips && state.analyze_spectrum_axis == SpectrumAxis::EnergyEv {
-                let all_rd = collect_all_resonance_data(state);
-                design::draw_resonance_dips(plot_ui, &all_rd, &x_values);
-            }
         });
 
     // Tick strips below the main plot.  When n_strips > MAX_VISIBLE_STRIPS,
@@ -1023,131 +1329,182 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
             .max_height(strips_total_height)
             .show(ui, |ui| {
                 for (i, row) in strip_rows.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        let row_width = ui.available_width();
-                        let plot_width = (row_width - STRIP_LABEL_WIDTH).max(100.0);
-                        ui.allocate_ui(egui::vec2(plot_width, STRIP_HEIGHT), |ui| {
-                            Plot::new(format!("tick_strip_{i}"))
-                                .height(STRIP_HEIGHT)
-                                .show_axes([false, false])
-                                .show_grid([false, false])
-                                .show_x(false)
-                                .show_y(false)
-                                .allow_zoom(false)
-                                .allow_drag(false)
-                                .allow_scroll(false)
-                                .allow_boxed_zoom(false)
-                                // Defensive y-bounds: VLines render against the
-                                // pixel viewport regardless of y-data, but with
-                                // no points pushed egui_plot's auto-bounds is an
-                                // implicit contract.  Pinning [0, 1] makes the
-                                // strip's vertical extent explicit and resilient
-                                // to egui_plot version bumps.
-                                .include_y(0.0)
-                                .include_y(1.0)
-                                .link_axis("analyze_xaxis", [true, false])
-                                .show(ui, |plot_ui| {
-                                    design::draw_isotope_tick_strip(
-                                        plot_ui,
-                                        row.data,
-                                        state.analyze_spectrum_axis,
-                                        state.beamline.flight_path_m,
-                                        state.beamline.delay_us,
-                                        row.color,
-                                    );
-                                });
-                        });
-                        ui.allocate_ui(egui::vec2(STRIP_LABEL_WIDTH, STRIP_HEIGHT), |ui| {
-                            ui.label(egui::RichText::new(&row.label).color(row.color).strong());
-                        });
-                    });
+                    draw_aligned_tick_row(ui, i, row, &plot_response.transform, state);
                 }
             });
     }
+}
 
-    // Fit results below the plot — wrapped in a vertical ScrollArea so
-    // per-isotope fits with many entities (≥5 isotope rows) don't push
-    // the bottom of the card past the spectrum panel allocation and
-    // overlap the nav strip.  At default density list size the scroll
-    // bar simply doesn't appear.
-    if let Some(ref result) = state.pixel_fit_result {
-        ui.separator();
-        egui::ScrollArea::vertical()
-            .id_salt("analyze_fit_results")
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let (label, color) = if result.converged {
-                        ("Converged", crate::theme::semantic::GREEN)
-                    } else {
-                        ("NOT converged", crate::theme::semantic::RED)
-                    };
-                    ui.label(egui::RichText::new(label).color(color).strong());
-                    // Memo 35 §P1.2: when the joint-Poisson solver populated
-                    // deviance_per_dof, label as D/dof; else keep chi2_r.
-                    let gof_label = if result.deviance_per_dof.is_some() {
-                        "D/dof"
-                    } else {
-                        "chi2_r"
-                    };
-                    if state.uncertainty_is_estimated {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{} = {:.4} (approx.)",
-                                gof_label, result.reduced_chi_squared
-                            ))
-                            .color(crate::theme::semantic::ORANGE),
-                        );
-                    } else {
-                        ui.label(format!("{} = {:.4}", gof_label, result.reduced_chi_squared));
-                    }
-                    ui.label(format!("iter = {}", result.iterations));
-                    if let Some(t) = result.temperature_k {
-                        if !state.uncertainty_is_estimated {
-                            if let Some(u) = result.temperature_k_unc {
-                                ui.label(format!("T = {t:.1} \u{00b1} {u:.1} K"));
-                            } else {
-                                ui.label(format!("T = {t:.1} K"));
-                            }
-                        } else {
-                            ui.label(format!("T = {t:.1} K"));
-                        }
-                    }
-                });
+fn draw_aligned_tick_row(
+    ui: &mut egui::Ui,
+    row_index: usize,
+    row: &TickRow<'_>,
+    transform: &PlotTransform,
+    state: &AppState,
+) {
+    const STRIP_HEIGHT: f32 = 18.0;
 
-                // Display per-entity density results — build labels in the same order
-                // as build_fit_config (individuals first, then groups).
-                let mut fit_labels: Vec<String> = state
-                    .isotope_entries
-                    .iter()
-                    .filter(|e| e.enabled && e.resonance_data.is_some())
-                    .map(|e| e.symbol.clone())
-                    .collect();
-                for g in &state.isotope_groups {
-                    if g.enabled && g.overall_status() == EndfStatus::Loaded {
-                        fit_labels.push(g.name.clone());
-                    }
-                }
-                for i in 0..result.densities.len() {
-                    let name = fit_labels.get(i).map(|s| s.as_str()).unwrap_or("?");
-                    if state.uncertainty_is_estimated {
-                        ui.label(format!(
-                            "  {name}: rho = {:.6e} atoms/barn",
-                            result.densities[i]
-                        ));
-                    } else {
-                        let unc_str = result
-                            .uncertainties
-                            .as_ref()
-                            .and_then(|u| u.get(i))
-                            .map_or("N/A".to_string(), |u| format!("{:.2e}", u));
-                        ui.label(format!(
-                            "  {name}: rho = {:.6e} +/- {unc_str} atoms/barn",
-                            result.densities[i]
-                        ));
-                    }
-                }
-            });
+    let available_width = ui.available_width();
+    let (response, painter) = ui.allocate_painter(
+        egui::vec2(available_width, STRIP_HEIGHT),
+        egui::Sense::hover(),
+    );
+    let plot_frame = *transform.frame();
+    let track_left = plot_frame.left().max(response.rect.left());
+    let track_right = plot_frame.right().min(response.rect.right());
+    if track_right <= track_left {
+        return;
     }
+
+    let track_rect = egui::Rect::from_min_max(
+        egui::pos2(track_left, response.rect.top() + 2.0),
+        egui::pos2(track_right, response.rect.bottom() - 2.0),
+    );
+    painter.rect_stroke(
+        track_rect,
+        2.0,
+        egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+        egui::StrokeKind::Inside,
+    );
+
+    let bounds = transform.bounds();
+    let x_lo = bounds.min()[0];
+    let x_hi = bounds.max()[0];
+    if !x_lo.is_finite() || !x_hi.is_finite() || x_lo >= x_hi {
+        return;
+    }
+
+    for range in row.data.ranges.iter().filter(|r| r.resolved) {
+        for lg in &range.l_groups {
+            for res in &lg.resonances {
+                let Some(x) = design::resonance_energy_to_axis(
+                    res.energy,
+                    state.analyze_spectrum_axis,
+                    state.beamline.flight_path_m,
+                    state.beamline.delay_us,
+                ) else {
+                    continue;
+                };
+                if x < x_lo || x > x_hi {
+                    continue;
+                }
+                let x_pos = transform
+                    .position_from_point_x(x)
+                    .clamp(track_rect.left(), track_rect.right());
+                painter.line_segment(
+                    [
+                        egui::pos2(x_pos, track_rect.top()),
+                        egui::pos2(x_pos, track_rect.bottom()),
+                    ],
+                    egui::Stroke::new(1.0, row.color),
+                );
+            }
+        }
+    }
+
+    let label_right = (track_left - 6.0).max(response.rect.left());
+    if label_right > response.rect.left() + 18.0 {
+        let label_rect = egui::Rect::from_min_max(
+            egui::pos2(response.rect.left(), response.rect.top()),
+            egui::pos2(label_right, response.rect.bottom()),
+        );
+        painter.circle_filled(
+            egui::pos2(label_rect.left() + 7.0, label_rect.center().y),
+            3.0,
+            row.color,
+        );
+        painter.text(
+            egui::pos2(label_rect.left() + 14.0, label_rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            &row.label,
+            egui::FontId::proportional(12.0),
+            row.color,
+        );
+    }
+    response.on_hover_text(format!("{} resonance track #{}", row.label, row_index + 1));
+}
+
+fn fit_results_panel(ui: &mut egui::Ui, state: &AppState, result: &SpectrumFitResult) {
+    ui.horizontal_wrapped(|ui| {
+        let (label, color) = if result.converged {
+            ("Converged", crate::theme::semantic::GREEN)
+        } else {
+            ("NOT converged", crate::theme::semantic::RED)
+        };
+        ui.label(egui::RichText::new(label).color(color).strong());
+        // Memo 35 §P1.2: when the joint-Poisson solver populated
+        // deviance_per_dof, label as D/dof; else keep chi2_r.
+        let gof_label = if result.deviance_per_dof.is_some() {
+            "D/dof"
+        } else {
+            "chi2_r"
+        };
+        if state.uncertainty_is_estimated {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} = {:.4} (approx.)",
+                    gof_label, result.reduced_chi_squared
+                ))
+                .color(crate::theme::semantic::ORANGE),
+            );
+        } else {
+            ui.label(format!("{} = {:.4}", gof_label, result.reduced_chi_squared));
+        }
+        ui.label(format!("iter = {}", result.iterations));
+        if let Some(t) = result.temperature_k {
+            if !state.uncertainty_is_estimated {
+                if let Some(u) = result.temperature_k_unc {
+                    ui.label(format!("T = {t:.1} \u{00b1} {u:.1} K"));
+                } else {
+                    ui.label(format!("T = {t:.1} K"));
+                }
+            } else {
+                ui.label(format!("T = {t:.1} K"));
+            }
+        }
+    });
+
+    ui.add_space(4.0);
+
+    // Display per-entity density results — build labels in the same order
+    // as build_fit_config (individuals first, then groups).
+    let mut fit_labels: Vec<String> = state
+        .isotope_entries
+        .iter()
+        .filter(|e| e.enabled && e.resonance_data.is_some())
+        .map(|e| e.symbol.clone())
+        .collect();
+    for g in &state.isotope_groups {
+        if g.enabled && g.overall_status() == EndfStatus::Loaded {
+            fit_labels.push(g.name.clone());
+        }
+    }
+    egui::Grid::new("analyze_fit_result_grid")
+        .num_columns(3)
+        .spacing([8.0, 4.0])
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new("Entity").small().strong());
+            ui.label(egui::RichText::new("Density").small().strong());
+            ui.label(egui::RichText::new("Unc.").small().strong());
+            ui.end_row();
+
+            for i in 0..result.densities.len() {
+                let name = fit_labels.get(i).map(|s| s.as_str()).unwrap_or("?");
+                ui.label(name);
+                ui.label(format!("{:.6e}", result.densities[i]));
+                if state.uncertainty_is_estimated {
+                    ui.label("approx.");
+                } else {
+                    let unc_str = result
+                        .uncertainties
+                        .as_ref()
+                        .and_then(|u| u.get(i))
+                        .map_or("N/A".to_string(), |u| format!("{:.2e}", u));
+                    ui.label(unc_str);
+                }
+                ui.end_row();
+            }
+        });
 }
 
 // ---- Fit Helpers ----

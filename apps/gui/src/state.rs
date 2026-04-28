@@ -775,6 +775,8 @@ pub struct AppState {
     pub fitting_rois: Vec<RoiSelection>,
     /// Toggle: show provenance history popup window.
     pub show_history_window: bool,
+    /// Toggle: show the on-demand Analyze fit-details drawer.
+    pub show_analyze_fit_info: bool,
 
     // -- Results --
     pub pixel_fit_result: Option<SpectrumFitResult>,
@@ -1478,6 +1480,7 @@ impl Default for AppState {
             selected_roi: None,
             fitting_rois: Vec::new(),
             show_history_window: false,
+            show_analyze_fit_info: false,
 
             pixel_fit_result: None,
             fit_result_gen: 0,

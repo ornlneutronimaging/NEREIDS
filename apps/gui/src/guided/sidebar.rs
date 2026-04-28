@@ -7,8 +7,13 @@ use egui::{Align, Color32, CornerRadius, Layout, Margin, RichText, Sense, Stroke
 /// Render the guided mode sidebar with step navigation.
 pub fn guided_sidebar(ctx: &egui::Context, state: &mut AppState) {
     let colors = ThemeColors::from_ctx(ctx);
-    let panel_width = if state.sidebar_collapsed { 56.0 } else { 240.0 };
-    let margin = if state.sidebar_collapsed {
+    let force_compact = state.guided_step == GuidedStep::Analyze;
+    let panel_width = if state.sidebar_collapsed || force_compact {
+        56.0
+    } else {
+        240.0
+    };
+    let margin = if state.sidebar_collapsed || force_compact {
         Margin::symmetric(4, 12)
     } else {
         Margin::symmetric(12, 16)
@@ -24,8 +29,8 @@ pub fn guided_sidebar(ctx: &egui::Context, state: &mut AppState) {
                 .stroke(Stroke::new(1.0, colors.border)),
         )
         .show(ctx, |ui| {
-            if state.sidebar_collapsed {
-                collapsed_sidebar(ui, state, &colors);
+            if state.sidebar_collapsed || force_compact {
+                collapsed_sidebar(ui, state, &colors, force_compact);
             } else {
                 expanded_sidebar(ui, state, &colors);
             }
@@ -33,9 +38,17 @@ pub fn guided_sidebar(ctx: &egui::Context, state: &mut AppState) {
 }
 
 /// Collapsed sidebar: toggle button + badge-only step rows with tooltips.
-fn collapsed_sidebar(ui: &mut egui::Ui, state: &mut AppState, colors: &ThemeColors) {
+fn collapsed_sidebar(
+    ui: &mut egui::Ui,
+    state: &mut AppState,
+    colors: &ThemeColors,
+    force_compact: bool,
+) {
     // Expand toggle
-    if ui
+    if force_compact {
+        ui.label(RichText::new(">>").size(11.0).color(colors.fg3))
+            .on_hover_text("Analyze uses the compact sidebar");
+    } else if ui
         .add(egui::Button::new(RichText::new(">>").size(11.0).color(colors.fg2)).frame(false))
         .on_hover_text("Expand sidebar")
         .clicked()

@@ -37,6 +37,8 @@ pub enum RoiEditorResult {
     DrawnNew(RoiSelection),
     /// User finished moving an existing ROI to a new position.
     Moved { index: usize, new_roi: RoiSelection },
+    /// User is moving an existing ROI; update dependent views without logging.
+    Moving { index: usize, new_roi: RoiSelection },
     /// User clicked on an existing ROI to select it.
     Selected(usize),
     /// User clicked on empty space, deselecting the current ROI.
@@ -239,10 +241,16 @@ pub fn show_image_with_roi_editor(
                     orig,
                     grab_y,
                     grab_x,
-                    ..
+                    index,
                 } => {
                     let moved = move_roi(&orig, grab_y, grab_x, cy, cx, dims);
                     draw_roi_draft_overlay(&painter, image_rect, dims, &moved);
+                    if moved.y_end > moved.y_start && moved.x_end > moved.x_start {
+                        result = RoiEditorResult::Moving {
+                            index,
+                            new_roi: moved,
+                        };
+                    }
                 }
             }
         }
