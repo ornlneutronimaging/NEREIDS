@@ -922,19 +922,49 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
     // moves all strip ticks in lockstep.  Gated on `show_resonance_dips`
     // (same toggle that controls the on-main-plot dip overlay) so a single
     // user action turns ALL resonance indicators on or off.
+    //
+    // Iteration order MIRRORS `design::collect_all_resonance_data_with_mapping`:
+    // individual isotope_entries first, then enabled-and-fully-loaded group
+    // members.  Keeping the same gate (`g.enabled && overall_status() ==
+    // Loaded`) ensures the strips show exactly the resonances the fit + dip
+    // overlay are using — otherwise users fitting an element group would see
+    // dips on the spectrum with no per-isotope row to attribute them to.
     const STRIP_HEIGHT: f32 = 18.0;
     const STRIP_LABEL_WIDTH: f32 = 80.0;
     const MAX_VISIBLE_STRIPS: usize = 6;
-    let strip_isotopes: Vec<&crate::state::IsotopeEntry> = if state.show_resonance_dips {
-        state
-            .isotope_entries
-            .iter()
-            .filter(|e| e.enabled && e.resonance_data.is_some())
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let n_strips = strip_isotopes.len();
+    struct TickRow<'a> {
+        label: String,
+        color: egui::Color32,
+        data: &'a nereids_endf::resonance::ResonanceData,
+    }
+    let mut strip_rows: Vec<TickRow<'_>> = Vec::new();
+    if state.show_resonance_dips {
+        for entry in &state.isotope_entries {
+            if entry.enabled
+                && let Some(data) = entry.resonance_data.as_ref()
+            {
+                strip_rows.push(TickRow {
+                    label: format!("{}-{}", entry.symbol, entry.a),
+                    color: design::isotope_dot_color(&entry.symbol),
+                    data,
+                });
+            }
+        }
+        for group in &state.isotope_groups {
+            if group.enabled && group.overall_status() == EndfStatus::Loaded {
+                for member in &group.members {
+                    if let Some(data) = member.resonance_data.as_ref() {
+                        strip_rows.push(TickRow {
+                            label: format!("{}-{}", member.symbol, member.a),
+                            color: design::isotope_dot_color(&member.symbol),
+                            data,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    let n_strips = strip_rows.len();
     let strips_total_height = if n_strips > 0 {
         // +4.0 padding for the separator above the strip block.
         (n_strips.min(MAX_VISIBLE_STRIPS) as f32) * STRIP_HEIGHT + 4.0
@@ -992,17 +1022,12 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
             .id_salt("analyze_tick_strips")
             .max_height(strips_total_height)
             .show(ui, |ui| {
-                for entry in &strip_isotopes {
-                    let Some(data) = entry.resonance_data.as_ref() else {
-                        continue;
-                    };
-                    let color = design::isotope_dot_color(&entry.symbol);
-                    let label = format!("{}-{}", entry.symbol, entry.a);
+                for (i, row) in strip_rows.iter().enumerate() {
                     ui.horizontal(|ui| {
                         let row_width = ui.available_width();
                         let plot_width = (row_width - STRIP_LABEL_WIDTH).max(100.0);
                         ui.allocate_ui(egui::vec2(plot_width, STRIP_HEIGHT), |ui| {
-                            Plot::new(format!("tick_strip_{}_{}", entry.z, entry.a))
+                            Plot::new(format!("tick_strip_{i}"))
                                 .height(STRIP_HEIGHT)
                                 .show_axes([false, false])
                                 .show_grid([false, false])
@@ -1012,20 +1037,28 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
                                 .allow_drag(false)
                                 .allow_scroll(false)
                                 .allow_boxed_zoom(false)
+                                // Defensive y-bounds: VLines render against the
+                                // pixel viewport regardless of y-data, but with
+                                // no points pushed egui_plot's auto-bounds is an
+                                // implicit contract.  Pinning [0, 1] makes the
+                                // strip's vertical extent explicit and resilient
+                                // to egui_plot version bumps.
+                                .include_y(0.0)
+                                .include_y(1.0)
                                 .link_axis("analyze_xaxis", [true, false])
                                 .show(ui, |plot_ui| {
                                     design::draw_isotope_tick_strip(
                                         plot_ui,
-                                        data,
+                                        row.data,
                                         state.analyze_spectrum_axis,
                                         state.beamline.flight_path_m,
                                         state.beamline.delay_us,
-                                        color,
+                                        row.color,
                                     );
                                 });
                         });
                         ui.allocate_ui(egui::vec2(STRIP_LABEL_WIDTH, STRIP_HEIGHT), |ui| {
-                            ui.label(egui::RichText::new(&label).color(color).strong());
+                            ui.label(egui::RichText::new(&row.label).color(row.color).strong());
                         });
                     });
                 }
