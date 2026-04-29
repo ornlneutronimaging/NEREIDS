@@ -7,8 +7,13 @@ use egui::{Align, Color32, CornerRadius, Layout, Margin, RichText, Sense, Stroke
 /// Render the guided mode sidebar with step navigation.
 pub fn guided_sidebar(ctx: &egui::Context, state: &mut AppState) {
     let colors = ThemeColors::from_ctx(ctx);
-    let panel_width = if state.sidebar_collapsed { 56.0 } else { 240.0 };
-    let margin = if state.sidebar_collapsed {
+    let force_compact = state.guided_step == GuidedStep::Analyze;
+    let panel_width = if state.sidebar_collapsed || force_compact {
+        56.0
+    } else {
+        240.0
+    };
+    let margin = if state.sidebar_collapsed || force_compact {
         Margin::symmetric(4, 12)
     } else {
         Margin::symmetric(12, 16)
@@ -24,8 +29,8 @@ pub fn guided_sidebar(ctx: &egui::Context, state: &mut AppState) {
                 .stroke(Stroke::new(1.0, colors.border)),
         )
         .show(ctx, |ui| {
-            if state.sidebar_collapsed {
-                collapsed_sidebar(ui, state, &colors);
+            if state.sidebar_collapsed || force_compact {
+                collapsed_sidebar(ui, state, &colors, force_compact);
             } else {
                 expanded_sidebar(ui, state, &colors);
             }
@@ -33,9 +38,15 @@ pub fn guided_sidebar(ctx: &egui::Context, state: &mut AppState) {
 }
 
 /// Collapsed sidebar: toggle button + badge-only step rows with tooltips.
-fn collapsed_sidebar(ui: &mut egui::Ui, state: &mut AppState, colors: &ThemeColors) {
-    // Expand toggle
-    if ui
+fn collapsed_sidebar(
+    ui: &mut egui::Ui,
+    state: &mut AppState,
+    colors: &ThemeColors,
+    force_compact: bool,
+) {
+    if force_compact {
+        ui.add_space(12.0);
+    } else if ui
         .add(egui::Button::new(RichText::new(">>").size(11.0).color(colors.fg2)).frame(false))
         .on_hover_text("Expand sidebar")
         .clicked()
@@ -212,17 +223,11 @@ fn collapsed_step_badge(
     let step = entry.step;
     let is_active = state.guided_step == step;
     let is_complete = step_is_complete(step, state);
-    let display_num = state.step_display_number(step);
     let sub = step_subtitle(step, state);
     let tooltip = if sub.is_empty() {
         step.label().to_string()
     } else {
         format!("{}\n{}", step.label(), sub)
-    };
-
-    let badge_text = match display_num {
-        Some(n) => n.to_string(),
-        None => "\u{2014}".to_string(),
     };
 
     let row_fill = if is_active {
@@ -240,6 +245,7 @@ fn collapsed_step_badge(
             ui.with_layout(Layout::top_down(Align::Center), |ui| {
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), Sense::hover());
                 let center = rect.center();
+                let icon = step_icon(step);
 
                 if is_active {
                     ui.painter()
@@ -247,7 +253,7 @@ fn collapsed_step_badge(
                     ui.painter().text(
                         center,
                         egui::Align2::CENTER_CENTER,
-                        &badge_text,
+                        icon,
                         egui::FontId::proportional(11.0),
                         Color32::WHITE,
                     );
@@ -256,18 +262,17 @@ fn collapsed_step_badge(
                     ui.painter().text(
                         center,
                         egui::Align2::CENTER_CENTER,
-                        "\u{2713}",
+                        icon,
                         egui::FontId::proportional(11.0),
                         Color32::WHITE,
                     );
                 } else {
-                    ui.painter().circle_filled(center, 10.0, colors.bg3);
                     ui.painter()
                         .circle_stroke(center, 10.0, Stroke::new(1.0, colors.border));
                     ui.painter().text(
                         center,
                         egui::Align2::CENTER_CENTER,
-                        &badge_text,
+                        icon,
                         egui::FontId::proportional(11.0),
                         colors.fg3,
                     );
@@ -337,6 +342,21 @@ fn collapsed_tool_badge(
     resp.on_hover_text(title);
 }
 
+fn step_icon(step: GuidedStep) -> &'static str {
+    match step {
+        GuidedStep::Configure => "\u{2699}",
+        GuidedStep::Load => "\u{21E9}",
+        GuidedStep::Bin => "\u{25A6}",
+        GuidedStep::Rebin => "\u{21C4}",
+        GuidedStep::Normalize => "\u{25D2}",
+        GuidedStep::Analyze => "\u{25CE}",
+        GuidedStep::Results => "\u{25A3}",
+        GuidedStep::Landing | GuidedStep::Wizard => "\u{25CB}",
+        GuidedStep::ForwardModel => "\u{21D2}",
+        GuidedStep::Detectability => "\u{2605}",
+    }
+}
+
 /// Render the provenance history popup window (call from top-level update).
 pub fn history_window(ctx: &egui::Context, state: &mut AppState) {
     if !state.show_history_window || state.provenance_log.is_empty() {
@@ -404,7 +424,6 @@ fn pipeline_step_row(
     let step = entry.step;
     let is_active = state.guided_step == step;
     let is_complete = step_is_complete(step, state);
-    let display_num = state.step_display_number(step);
 
     let row_fill = if is_active {
         colors.accent
@@ -420,15 +439,10 @@ fn pipeline_step_row(
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
 
-                // Number badge (20×20)
+                // Step badge (20×20)
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), Sense::hover());
                 let center = rect.center();
-
-                // Badge text: number for required, "—" for optional
-                let badge_text = match display_num {
-                    Some(n) => n.to_string(),
-                    None => "\u{2014}".to_string(), // em dash
-                };
+                let icon = step_icon(step);
 
                 if is_active {
                     ui.painter()
@@ -436,7 +450,7 @@ fn pipeline_step_row(
                     ui.painter().text(
                         center,
                         egui::Align2::CENTER_CENTER,
-                        &badge_text,
+                        icon,
                         egui::FontId::proportional(11.0),
                         Color32::WHITE,
                     );
@@ -445,19 +459,18 @@ fn pipeline_step_row(
                     ui.painter().text(
                         center,
                         egui::Align2::CENTER_CENTER,
-                        "\u{2713}",
+                        icon,
                         egui::FontId::proportional(11.0),
                         Color32::WHITE,
                     );
                 } else {
-                    // Pending: bg3 fill + border
-                    ui.painter().circle_filled(center, 10.0, colors.bg3);
+                    // Pending: outlined icon, not a filled status dot.
                     ui.painter()
                         .circle_stroke(center, 10.0, Stroke::new(1.0, colors.border));
                     ui.painter().text(
                         center,
                         egui::Align2::CENTER_CENTER,
-                        &badge_text,
+                        icon,
                         egui::FontId::proportional(11.0),
                         colors.fg3,
                     );
