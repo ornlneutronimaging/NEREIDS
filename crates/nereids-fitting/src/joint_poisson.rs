@@ -62,9 +62,9 @@ pub struct JointPoissonObjective<'a> {
     pub s: &'a [f64],
     /// Proton-charge ratio `c = Q_s / Q_ob`.  Must be strictly positive.
     pub c: f64,
-    /// Optional per-bin active mask (SAMMY REGION-equivalent fit-energy
-    /// -range restriction).  When `Some(m)`, only bins where `m[i]` is
-    /// `true` contribute to the deviance / gradient / Fisher
+    /// Optional per-bin active mask (SAMMY REGION-equivalent
+    /// fit-energy-range restriction).  When `Some(m)`, only bins where
+    /// `m[i]` is `true` contribute to the deviance / gradient / Fisher
     /// information; the model is still evaluated on the full grid so
     /// resolution broadening at the boundaries is correct.  When
     /// `None`, all bins are active (default behaviour).

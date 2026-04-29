@@ -88,7 +88,9 @@ pub struct ProjectSnapshot {
     /// equivalent, `MIN ENERGY` / `MAX ENERGY` SAM52 cards).
     /// `None` (default) = full grid.  Projects saved before this field
     /// was introduced load as `None` via the HDF5 reader's missing-
-    /// dataset handling.
+    /// attribute handling — the bounds are stored as two scalar
+    /// attributes (`fit_energy_range_min_ev` / `fit_energy_range_max_ev`)
+    /// on `/config/solver`, not as a dataset.
     pub fit_energy_range: Option<(f64, f64)>,
 
     // -- config/resolution --

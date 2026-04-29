@@ -1129,6 +1129,26 @@ fn fit_transmission_lm(
         config.fit_energy_range(),
     );
 
+    // When a fit-energy-range is configured, reject the call early if
+    // the user's `[E_min, E_max]` selects fewer than 2 active bins on
+    // the configured grid.  The LM core's `n_active < n_free` check
+    // would also catch this on the main path, but a dispatcher-level
+    // rejection gives the user a clear "range too narrow" error
+    // instead of a confusing non-converged result.
+    if let Some((e_min, e_max)) = config.fit_energy_range() {
+        let n_active = nereids_fitting::active_mask::active_count(
+            active_mask.as_deref(),
+            config.energies().len(),
+        );
+        if n_active < 2 {
+            return Err(PipelineError::InvalidParameter(format!(
+                "fit_energy_range [{e_min}, {e_max}] eV selects {n_active} active bin(s) \
+                 on the configured energy grid; at least 2 active bins are required \
+                 for LM transmission fitting"
+            )));
+        }
+    }
+
     // Dispatch with optional background wrapping
     let result = if let Some(bi) = bg_indices {
         let wrapped = if let (Some(di), Some(fi)) = (bi.back_d, bi.back_f) {
@@ -1522,6 +1542,24 @@ fn fit_counts_joint_poisson(
         config.fit_energy_range(),
     );
     let active_mask_slice = active_mask.as_deref();
+
+    // Reject early when the configured range selects fewer than 2
+    // active bins on the grid.  `joint_poisson_fit` already rejects
+    // the `n_active < n_free` case (and the new `n_active == 0`
+    // early-return), but a dispatcher-level rejection gives users a
+    // clear "range too narrow" error instead of a non-converged JP
+    // result.
+    if let Some((e_min, e_max)) = config.fit_energy_range() {
+        let n_active =
+            nereids_fitting::active_mask::active_count(active_mask_slice, config.energies().len());
+        if n_active < 2 {
+            return Err(PipelineError::InvalidParameter(format!(
+                "fit_energy_range [{e_min}, {e_max}] eV selects {n_active} active bin(s) \
+                 on the configured energy grid; at least 2 active bins are required \
+                 for joint-Poisson fitting"
+            )));
+        }
+    }
 
     let result;
     if let Some(bi) = bg_indices {
@@ -4079,6 +4117,73 @@ mod tests {
                 && (msg.contains("Poisson") || msg.contains("poisson")),
             "expected rejection message mentioning fit_energy_range and the \
              Poisson-KL path; got: {msg}"
+        );
+    }
+
+    /// LM dispatcher must reject `fit_energy_range` that selects fewer
+    /// than 2 active bins on the configured grid with a clear
+    /// "range too narrow" error — instead of a confusing non-converged
+    /// LM result.  Regression for #517 R3 P2 (Copilot finding #2).
+    #[test]
+    fn test_fit_energy_range_lm_rejects_too_narrow() {
+        let data = u238_single_resonance();
+        // 0.5..10.5 eV in 0.5 eV steps.  Range [4.6, 4.7] selects
+        // exactly zero bins (no grid point inside; closest are 4.5
+        // and 5.0).
+        let energies: Vec<f64> = (0..21).map(|i| 0.5 + (i as f64) * 0.5).collect();
+        let (t, sigma) = synthetic_transmission(&data, 0.002, &energies);
+        let cfg = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
+        .with_fit_energy_range(Some((4.6, 4.7)))
+        .unwrap();
+        let input = InputData::Transmission {
+            transmission: t,
+            uncertainty: sigma,
+        };
+        let err = fit_spectrum_typed(&input, &cfg).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("fit_energy_range") && msg.contains("active bin"),
+            "expected too-narrow-range rejection; got: {msg}"
+        );
+    }
+
+    /// Joint-Poisson dispatcher must reject too-narrow ranges with the
+    /// same clear error.  Regression for #517 R3 P2 (Copilot #3).
+    #[test]
+    fn test_fit_energy_range_jp_rejects_too_narrow() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..21).map(|i| 0.5 + (i as f64) * 0.5).collect();
+        let (sample, open_beam) = synthetic_counts(&data, 0.002, &energies, 1000.0);
+        let cfg = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
+        .with_fit_energy_range(Some((4.6, 4.7)))
+        .unwrap();
+        let input = InputData::Counts {
+            sample_counts: sample,
+            open_beam_counts: open_beam,
+        };
+        let err = fit_spectrum_typed(&input, &cfg).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("fit_energy_range") && msg.contains("active bin"),
+            "expected too-narrow-range rejection; got: {msg}"
         );
     }
 }
