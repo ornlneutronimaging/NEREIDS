@@ -1357,11 +1357,13 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
     };
 
     // Fit result (if available).  In counts mode, scale T_fit by
-    // `c · OB[i, y, x]` so the overlay sits on the same axis as the
-    // raw sample-counts measured line.  This omits the fitted Anorm
-    // + LM background polynomial (BackA + BackB/√E + BackC·√E) — both
-    // are typically small, and a fully-correct counts overlay needs
-    // the joint-Poisson forward model.  Tracked as a follow-up.
+    // `c · OB[i, y, x]` (via the `y_multiplier` field on `FitLineParams`)
+    // so the overlay sits on the same axis as the raw sample-counts
+    // measured line.  `build_fit_line` itself applies the fitted Anorm
+    // and the SAMMY 6-term background polynomial
+    // (BackA + BackB/√E + BackC·√E + BackD·exp(-BackF/√E)) before
+    // multiplying by the counts scale, so the overlay reflects the
+    // full forward model the solver fit — not just bare T·c·OB.
     let fit_result_for_overlay = match selection {
         SpectrumSelection::Pixel { y, x } => selected_pixel_fit_result_for_overlay(state, y, x),
         SpectrumSelection::Roi { .. } => state.pixel_fit_result.clone(),
@@ -1476,10 +1478,24 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
         0.0
     };
 
-    // Reserve space below the plot for the tick strips so neither the plot nor
-    // the track viewport pushes past the cockpit column. Fit results live in
-    // the right inspector, not below the spectrum.
-    let plot_height = (ui.available_height() - 20.0 - strips_total_height).max(220.0);
+    // Reserve space below the plot for the tick strips so neither the plot
+    // nor the track viewport pushes past the cockpit column.  Fit results
+    // live in the right inspector, not below the spectrum.
+    //
+    // No hard floor: the plot claims exactly what's left after the strip
+    // block (`strips_total_height`) and a 20 px buffer.  With the picker's
+    // `MAX_VISIBLE_STRIPS = 6`, the strip block peaks at 6×18 + 4 +
+    // footer 22 = 134 px.  In a typical desktop window (`col_height` ≈
+    // 600+) the plot gets the lion's share; in a small window with many
+    // strips it collapses gracefully (egui draws axis labels at any
+    // height).  The user can recover plot space by hiding tracks via the
+    // picker or by enlarging the window.
+    //
+    // The `.max(0.0)` is defensive — `ui.available_height()` is never
+    // negative in practice, but the subtractions could drive the
+    // expression negative if some future call site allocates the panel
+    // with insufficient room.
+    let plot_height = (ui.available_height() - 20.0 - strips_total_height).max(0.0);
 
     // Plot
     let y_label = if show_counts {

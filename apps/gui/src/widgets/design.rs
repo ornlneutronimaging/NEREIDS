@@ -1050,12 +1050,37 @@ pub(crate) fn build_fit_line(p: &FitLineParams<'_>) -> Option<Line<'static>> {
     use nereids_fitting::lm::FitModel;
     let fitted_t = model.evaluate(&p.result.densities).ok()?;
     let n_fit = p.n_plot.min(fitted_t.len()).min(p.x_values.len());
+    // Apply the fitted Anorm + SAMMY 6-term background polynomial so the
+    // overlay matches the actual forward model the solver fitted, not just
+    // bare Beer-Lambert transmission.
+    //
+    //   y = Anorm · T(E) + BackA + BackB/√E + BackC·√E + BackD·exp(-BackF/√E)
+    //
+    // Then `y_multiplier` (= c·OB[i] in counts mode) scales the result to
+    // the displayed y-axis.  When bg fit was absent, the pipeline emits
+    // `anorm = 1.0` and `background = [0, 0, 0]` (memo 35 §P1 convention,
+    // pipeline.rs:1488-1499), so this reduces to bare T·multiplier — i.e.
+    // identical to the pre-fix overlay for fits without background.
     let fit_points: PlotPoints = (0..n_fit)
         .filter(|&i| p.x_values[i].is_finite())
         .map(|i| {
+            let e = p.energies.get(i).copied().unwrap_or(f64::NAN);
+            let bg_poly = if e > 0.0 && e.is_finite() {
+                let sqrt_e = e.sqrt();
+                p.result.background[0]
+                    + p.result.background[1] / sqrt_e
+                    + p.result.background[2] * sqrt_e
+                    + p.result.back_d * (-p.result.back_f / sqrt_e).exp()
+            } else {
+                // Non-positive or non-finite energy: skip the polynomial.
+                // BackB/√E and BackD·exp(-BackF/√E) blow up at E ≤ 0, and
+                // the spectrum already filters non-finite x via build_spectrum_x_axis.
+                0.0
+            };
+            let y_corrected = p.result.anorm * fitted_t[i] + bg_poly;
             let y = match p.y_multiplier {
-                Some(m) if i < m.len() => m[i] * fitted_t[i],
-                _ => fitted_t[i],
+                Some(m) if i < m.len() => m[i] * y_corrected,
+                _ => y_corrected,
             };
             [p.x_values[i], y]
         })

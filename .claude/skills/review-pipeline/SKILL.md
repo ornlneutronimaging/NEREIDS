@@ -93,25 +93,17 @@ per worktree with this prompt:
 > 5. Run `cargo test --workspace --exclude nereids-python` to verify tests pass
 >    (workspace-wide, because changes often ripple across crates)
 
-### External Review (Codex CLI) — TEMPORARILY DISABLED
+### External Review (Codex CLI)
 
-**Status (April 2026):** Codex review is currently driven manually by the
-user outside this pipeline. Skip the automated `codex exec` step until the
-local codex-cli access issue is resolved (the installed binary is too old
-for the current API and ChatGPT-account model gating prevents falling back
-to an older model — see "Known pitfalls" below). When the user's local
-codex-cli is upgraded and accepted by the API, re-enable by removing this
-notice and uncommenting the launch step.
-
-When re-enabled, also launch one `Bash` command per worktree in the **same
-message** as the Claude self-audit, unless `--skip-codex` is in
-`$ARGUMENTS`.
+Unless `--skip-codex` is in `$ARGUMENTS`, also launch one `Bash` command
+per worktree in the **same message** as the Claude self-audit so they
+run concurrently.
 
 There is **no `codex review` subcommand** in current codex-cli (verified
-against 0.46 and 0.125, April 2026). The slash command `/review` exists
-but is interactive-only — it cannot be driven from `codex exec`. The
-canonical headless invocation is `codex exec` with an explicit review
-prompt; a native `codex exec review` is requested in
+against 0.125, April 2026). The slash command `/review` exists but is
+interactive-only — it cannot be driven from `codex exec`. The canonical
+headless invocation is `codex exec` with an explicit review prompt; a
+native `codex exec review` is requested in
 [openai/codex#6432](https://github.com/openai/codex/issues/6432) but
 not yet shipped.
 
@@ -156,21 +148,25 @@ mostly noise for our purposes.
 - `--output-last-message <file>` — captures the agent's final message
   cleanly; far easier than parsing JSONL.
 
-**Known pitfalls** (as of April 2026, codex-cli 0.46 → 0.125):
+**Known pitfalls** (verified against codex-cli 0.125, April 2026):
 
-- The `review` subcommand was removed (or was never a thing in 0.x). Do
-  not use `codex review --base main` — it errors with
+- There is **no `codex review` subcommand**. Don't use `codex review
+  --base main` — it errors with
   `unexpected argument '--base' found / Usage: codex <PROMPT>`.
+  A native `codex exec review` is requested in
+  [openai/codex#6432](https://github.com/openai/codex/issues/6432) but
+  not yet shipped. Use `codex exec` with an explicit review prompt,
+  per the pattern above.
 - Slash commands (`/review`, `/test`, etc.) work only in interactive
   TUI sessions; they cannot be invoked from `codex exec`.
-- The default model in codex-cli config (`~/.codex/config.toml`) must
-  match what the local CLI binary supports. As of 0.46 the default
-  `gpt-5.5` is rejected as *"requires a newer version of Codex"*; as
-  of 0.122+ it works. If the binary is too old, upgrade before relying
-  on Codex review — overriding with `-m gpt-5` does NOT help on
-  ChatGPT-account auth (returns *"not supported when using Codex with
-  a ChatGPT account"*). Per-version compatibility is unstable; keep
-  the binary current.
+- **codex-cli + API model gating drift fast.** Earlier this year the
+  installed 0.46 binary was rejected by the API as *"requires a newer
+  version of Codex"* for the default `gpt-5.5` model, and overriding
+  with `-m gpt-5` failed on ChatGPT-account auth (*"not supported when
+  using Codex with a ChatGPT account"*). If you see either of those
+  errors, the fix is to upgrade codex-cli (`brew upgrade codex` or
+  `npm i -g @openai/codex@latest`). Do NOT spend time trying to work
+  around with model overrides — keep the binary current.
 - `codex exec` reads the prompt from stdin if you pass `-` or omit the
   positional, but heredoc-injected positional prompts (as above) are
   the most reliable form across versions.

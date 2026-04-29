@@ -63,12 +63,25 @@ pub struct SpatialResult {
     /// Ensures display labels stay in sync with density data even if the
     /// user modifies the isotope list after fitting.
     pub isotope_labels: Vec<String>,
-    /// Per-pixel normalization / signal-scale map (when background fitting is enabled).
+    /// Per-pixel SAMMY `Anorm` map (when background fitting is enabled).
     /// NaN at pixels where `converged_map` is `false`.
     pub anorm_map: Option<Array2<f64>>,
-    /// Per-pixel background parameter maps.
-    /// Transmission LM uses `[BackA, BackB, BackC]`.
-    /// Counts KL background uses `[b0, b1, alpha_2]`.
+    /// Per-pixel SAMMY background polynomial coefficient maps —
+    /// **only the first three coefficients** `[BackA, BackB, BackC]` of
+    /// the SAMMY 6-term form
+    /// `bg(E) = BackA + BackB/√E + BackC·√E + BackD·exp(-BackF/√E)`.
+    /// Both LM-transmission and counts-KL paths use these semantics
+    /// (legacy alpha-fitting `[b0, b1, alpha_2]` layout was retired with
+    /// `fit_counts_poisson` in PR #450).
+    ///
+    /// **Limitation:** the exponential `BackD`/`BackF` terms are NOT
+    /// surfaced per-pixel.  Counts-KL never fits them (always 0); LM
+    /// transmission can fit them at the per-pixel level but the
+    /// resulting `back_d`/`back_f` are dropped when collating spatial
+    /// outputs.  If a downstream consumer needs the full 6-term
+    /// background reconstruction per-pixel, extend `SpatialResult`
+    /// with `back_d_map`/`back_f_map` (filed as a follow-up if needed).
+    ///
     /// NaN at pixels where `converged_map` is `false`.
     pub background_maps: Option<[Array2<f64>; 3]>,
     /// Per-pixel fitted SAMMY TZERO offset (µs) map.

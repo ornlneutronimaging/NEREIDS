@@ -2,6 +2,7 @@
   "permissions": {
     "allow": [
       "Bash(git commit *)",
+      "Bash(git commit:*)",
       "Bash(git push *)",
       "Bash(git add *)",
       "Bash(git status*)",
@@ -13,6 +14,8 @@
       "Bash(git worktree *)",
       "Bash(git show *)",
       "Bash(git stash *)",
+      "Bash(git ls-remote *)",
+      "Bash(git reset:*)",
       "Bash(cd *&&*git *)",
       "Bash(cargo test *)",
       "Bash(cargo fmt *)",
@@ -23,26 +26,28 @@
       "Bash(pixi run *)",
       "Bash(cd *&&*pixi *)",
       "Bash(gh issue *)",
+      "Bash(gh issue:*)",
       "Bash(gh pr *)",
       "Bash(gh api *)",
-      "Bash(codex review *)",
+      "Bash(gh run *)",
       "Bash(scripts/worktree-commit.sh *)",
       "Bash(./scripts/worktree-commit.sh *)",
       "Bash(bash scripts/worktree-commit.sh *)",
-      "Read(//Users/chenzhang/github.com/NEREIDS/NEREIDS/**)",
-      "Bash(git commit:*)",
-      "Bash(pixi run python -c \":*)",
-      "Read(//dev/**)",
-      "Bash(gh issue:*)",
-      "WebFetch(domain:pmc.ncbi.nlm.nih.gov)",
-      "WebFetch(domain:www.nature.com)",
-      "WebFetch(domain:pubmed.ncbi.nlm.nih.gov)",
-      "WebFetch(domain:academic.oup.com)",
-      "WebFetch(domain:pubs.aip.org)",
-      "WebFetch(domain:www.ncbi.nlm.nih.gov)",
-      "WebFetch(domain:www.osti.gov)",
-      "WebFetch(domain:arxiv.org)",
-      "Bash(git reset:*)"
+      "Bash(grep *)",
+      "Bash(awk *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+      "Bash(wc *)",
+      "Bash(sort *)",
+      "Bash(uniq *)",
+      "Bash(cut *)",
+      "Bash(comm *)",
+      "Bash(join *)",
+      "Bash(tr *)",
+      "Bash(ls *)",
+      "Bash(printf *)",
+      "Bash(echo *)",
+      "Bash(sed *)"
     ],
     "deny": [
       "Bash(git add -A*)",
@@ -59,6 +64,9 @@
       "Bash(git stash push --include-untracked*)",
       "Bash(git stash -u*)",
       "Bash(git stash --include-untracked*)"
+    ],
+    "additionalDirectories": [
+      "/tmp"
     ]
   }
 }
