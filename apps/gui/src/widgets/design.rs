@@ -960,21 +960,38 @@ pub(crate) fn draw_resonance_dips(
 
 /// Convert a resonance energy (eV) into the spectrum's active x-axis units.
 ///
-/// Returns `None` when the conversion is undefined (TOF axis with non-positive
-/// energy or a missing flight path). Mirrors the energy→TOF transform used in
-/// [`build_spectrum_x_axis`] so tick positions in the per-isotope strips align
-/// pixel-for-pixel with the main spectrum's resonance dips.
+/// Mirrors the energy→TOF transform in [`build_spectrum_x_axis`] **including
+/// the fallback branch**: when the TOF axis is selected but `flight_path_m`
+/// is invalid (zero, negative, or non-finite), `build_spectrum_x_axis` falls
+/// back to plotting energy values whenever the input data is in `EnergyEv`
+/// units (and silently relabels the axis). To keep tick positions aligned
+/// with the actual rendered x-axis in that fallback case, this helper does
+/// the same — returns `Some(energy_ev)` when the TOF conversion is undefined
+/// AND the spectrum input is energy-valued.
+///
+/// Returns `None` only when no axis position can be derived: TOF axis with
+/// invalid `flight_path_m` AND spectrum input is already in TOF units (in
+/// which case the spectrum cannot be aligned with energy-input resonances
+/// without a flight path).
 pub(crate) fn resonance_energy_to_axis(
     energy_ev: f64,
     axis: SpectrumAxis,
+    spectrum_unit: SpectrumUnit,
     flight_path_m: f64,
     delay_us: f64,
 ) -> Option<f64> {
     match axis {
         SpectrumAxis::EnergyEv => Some(energy_ev),
         SpectrumAxis::TofMicroseconds => {
-            if energy_ev > 0.0 && flight_path_m.is_finite() && flight_path_m > 0.0 {
+            let can_convert = energy_ev > 0.0 && flight_path_m.is_finite() && flight_path_m > 0.0;
+            if can_convert {
                 Some(nereids_core::constants::energy_to_tof(energy_ev, flight_path_m) + delay_us)
+            } else if matches!(spectrum_unit, SpectrumUnit::EnergyEv) {
+                // Mirror `build_spectrum_x_axis` fallback: when TOF
+                // conversion is unavailable but input is energy-valued,
+                // the spectrum falls back to plotting energy. Strips
+                // need to do the same to stay aligned.
+                Some(energy_ev)
             } else {
                 None
             }

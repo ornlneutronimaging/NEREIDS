@@ -1603,6 +1603,7 @@ fn draw_aligned_tick_row(
                 let Some(x) = design::resonance_energy_to_axis(
                     res.energy,
                     state.analyze_spectrum_axis,
+                    state.spectrum_unit,
                     state.beamline.flight_path_m,
                     state.beamline.delay_us,
                 ) else {
