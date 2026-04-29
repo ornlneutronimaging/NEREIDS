@@ -513,6 +513,26 @@ pub fn levenberg_marquardt_with_mask(
     }
     let n_active = crate::active_mask::active_count(active_mask, n_data);
 
+    // SAMMY REGION-equivalent fit-energy-range (#514): a mask with
+    // zero active bins means the user's `[E_min, E_max]` does not
+    // overlap the energy grid.  No data contributes to the cost
+    // function — return non-converged with NaN χ² rather than
+    // falling through to the all-fixed fast-return path (which would
+    // report `converged: true, chi_squared: 0` from a zero-row sum)
+    // or to the main optimisation loop (where `n_active < n_free`
+    // would catch it but only after wasted setup work).
+    if n_active == 0 {
+        return Ok(LmResult {
+            chi_squared: f64::NAN,
+            reduced_chi_squared: f64::NAN,
+            iterations: 0,
+            converged: false,
+            params: params.all_values(),
+            covariance: None,
+            uncertainties: None,
+        });
+    }
+
     let n_free = params.n_free();
 
     // Early return when all parameters are fixed: evaluate once and report the
@@ -1713,5 +1733,63 @@ mod tests {
         assert!(result.chi_squared.is_finite());
         assert!((result.params[0] - 2.0).abs() < 1e-6);
         assert!((result.params[1] - 3.0).abs() < 1e-6);
+    }
+
+    /// A zero-active mask (the user's range misses the grid entirely)
+    /// must return non-converged regardless of whether parameters are
+    /// free or fixed.  Pre-fix the all-fixed fast-return path would
+    /// report `converged: true, chi_squared: 0` from a sum over zero
+    /// rows — a deceptive "success" with no data behind it.
+    #[test]
+    fn test_lm_active_mask_all_false_returns_non_converged() {
+        let x: Vec<f64> = (0..5).map(|i| i as f64).collect();
+        let y: Vec<f64> = x.iter().map(|&xi| 2.0 * xi + 3.0).collect();
+        let sigma = vec![1.0; 5];
+        let mask = vec![false; 5];
+        let model = LinearModel { x: x.clone() };
+
+        // (a) All parameters free.
+        let mut params_free = ParameterSet::new(vec![
+            FitParameter::unbounded("a", 1.0),
+            FitParameter::unbounded("b", 1.0),
+        ]);
+        let r_free = levenberg_marquardt_with_mask(
+            &model,
+            &y,
+            &sigma,
+            &mut params_free,
+            &LmConfig::default(),
+            Some(&mask),
+        )
+        .unwrap();
+        assert!(
+            !r_free.converged,
+            "n_free > 0 + zero-active mask must NOT report converged"
+        );
+        assert!(r_free.chi_squared.is_nan());
+        assert!(r_free.reduced_chi_squared.is_nan());
+
+        // (b) All parameters fixed → n_free == 0 (the path #517 R3
+        //     specifically failed before the n_active==0 early-return).
+        let mut params_fixed = ParameterSet::new(vec![
+            FitParameter::fixed("a", 1.0),
+            FitParameter::fixed("b", 0.0),
+        ]);
+        let r_fixed = levenberg_marquardt_with_mask(
+            &model,
+            &y,
+            &sigma,
+            &mut params_fixed,
+            &LmConfig::default(),
+            Some(&mask),
+        )
+        .unwrap();
+        assert!(
+            !r_fixed.converged,
+            "n_free == 0 + zero-active mask must NOT report converged \
+             (sum over zero rows would be 0, masquerading as a perfect fit)"
+        );
+        assert!(r_fixed.chi_squared.is_nan());
+        assert!(r_fixed.reduced_chi_squared.is_nan());
     }
 }

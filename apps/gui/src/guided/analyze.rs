@@ -1914,27 +1914,33 @@ fn fit_results_panel(ui: &mut egui::Ui, state: &AppState, result: &SpectrumFitRe
 // ---- Fit Helpers ----
 
 /// Number of resolution-FWHM widths to extend the fit-energy-range
-/// slice on each side as a "kernel margin".  SAMMY user manual §IIID.6
-/// (REGION) recommends 3–5×FWHM; we pick 5× for safety so resonance
-/// shoulders just inside the boundaries are correctly broadened.
+/// slice on each side as a "kernel margin" for **Gaussian** resolution.
+/// SAMMY user manual §IIID.6 (REGION) recommends 3–5×FWHM; we pick 5×
+/// for safety so resonance shoulders just inside the boundaries are
+/// correctly broadened.  At 5×FWHM ≈ 5.9σ the Gaussian kernel is below
+/// 10⁻¹³ of peak — well past the broadening footprint.
 const FIT_RANGE_MARGIN_FWHM: f64 = 5.0;
-
-/// Tabulated-resolution fallback fractional kernel width.  The
-/// `TabulatedResolution` type does not expose an in-eV FWHM accessor
-/// (its kernels are TOF-domain), so we fall back to a conservative
-/// fraction of the boundary energy.  Typical neutron-imaging tabulated
-/// resolution is well under 1% FWHM, so 10% × `FIT_RANGE_MARGIN_FWHM`
-/// covers the broadening footprint with a wide safety factor.
-const TABULATED_FRACTIONAL_FALLBACK: f64 = 0.1;
 
 /// Resolution-kernel margin (eV) to add at energy `e_ev` when slicing
 /// for the fit-energy-range filter (SAMMY REGION-equivalent, #514).
-/// Returns `0.0` when no resolution is configured.
+///
+/// - **None**: no resolution → no broadening footprint → `0.0`.
+/// - **Gaussian**: extend by `FIT_RANGE_MARGIN_FWHM × FWHM(E)`.  The
+///   kernel has infinite tails; 5×FWHM puts the residual amplitude
+///   below 10⁻¹³ of peak.
+/// - **Tabulated**: use `TabulatedResolution::kernel_support_ev(E)`,
+///   the eV distance over which the discrete kernel has positive
+///   weight at `E`.  Past this distance the kernel is exactly zero,
+///   so 1× the support fully captures the broadening footprint — no
+///   safety multiplier needed.  The support is computed from the
+///   actual kernel offsets via the chain-rule TOF→eV conversion (see
+///   `TabulatedResolution::kernel_support_ev`), so the margin tracks
+///   the loaded resolution file rather than a hand-picked constant.
 fn kernel_margin_ev(e_ev: f64, resolution: Option<&ResolutionFunction>) -> f64 {
     match resolution {
         None => 0.0,
         Some(ResolutionFunction::Gaussian(p)) => FIT_RANGE_MARGIN_FWHM * p.fwhm(e_ev),
-        Some(ResolutionFunction::Tabulated(_)) => TABULATED_FRACTIONAL_FALLBACK * e_ev.abs(),
+        Some(ResolutionFunction::Tabulated(t)) => t.kernel_support_ev(e_ev),
     }
 }
 

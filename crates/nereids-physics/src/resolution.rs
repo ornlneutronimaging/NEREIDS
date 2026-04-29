@@ -872,6 +872,77 @@ impl TabulatedResolution {
     pub fn flight_path_m(&self) -> f64 {
         self.flight_path_m
     }
+
+    /// Kernel support at energy `e_ev`, in eV.
+    ///
+    /// Returns the maximum energy offset over which the tabulated
+    /// kernel has non-zero weight at energy `e_ev`.  Past this
+    /// distance the kernel is exactly zero, so the broadening
+    /// footprint at a given target energy is fully contained within
+    /// `[e_ev − support, e_ev + support]`.
+    ///
+    /// Computation:
+    ///
+    /// 1. Find the bracketing reference kernel(s) for `e_ev` via
+    ///    binary search on the sorted `ref_energies` grid.
+    /// 2. Take `max(|tof_offset|)` over all bracketing kernels'
+    ///    entries with positive weight.  Using both bracketing
+    ///    kernels (rather than the single nearest) is conservative —
+    ///    over-estimating the margin is safer than under-estimating
+    ///    when the kernel is interpolated between references.
+    /// 3. Convert TOF offset to energy offset via
+    ///    `|ΔE| = 2·E^(3/2) / (TOF_FACTOR·L) · |Δt|`,
+    ///    the magnitude of `dE/dt` at `e_ev` along the TOF→E mapping
+    ///    `t = TOF_FACTOR·L/√E` (chain rule).
+    ///
+    /// Returns `0.0` for non-positive `e_ev`, an empty kernel set, or
+    /// a non-positive flight path.  Used by the GUI's
+    /// fit-energy-range slicing to extend the model-evaluation grid
+    /// beyond the user's `[E_min, E_max]` so the SAMMY REGION-
+    /// equivalent broadening at the boundaries is correct (#514).
+    #[must_use]
+    pub fn kernel_support_ev(&self, e_ev: f64) -> f64 {
+        if e_ev <= 0.0 || !e_ev.is_finite() {
+            return 0.0;
+        }
+        if self.kernels.is_empty() || self.flight_path_m <= 0.0 {
+            return 0.0;
+        }
+        // Use binary_search to distinguish exact hits from
+        // between-ref interpolation:
+        //   Ok(idx)  → e_ev exactly matches ref_energies[idx]; use
+        //              that single kernel.
+        //   Err(idx) → idx is the insertion point.  Use the
+        //              bracketing kernels at idx-1 (lower) and idx
+        //              (upper); clip to grid bounds when e_ev falls
+        //              outside the ref range.
+        let n = self.ref_energies.len();
+        let mut max_dt_us: f64 = 0.0;
+        let visit = |idx: usize, max_dt_us: &mut f64| {
+            let (offsets, weights) = &self.kernels[idx];
+            for (&dt, &w) in offsets.iter().zip(weights.iter()) {
+                if w > 0.0 && dt.is_finite() {
+                    *max_dt_us = max_dt_us.max(dt.abs());
+                }
+            }
+        };
+        match self.ref_energies.binary_search_by(|probe| {
+            probe
+                .partial_cmp(&e_ev)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }) {
+            Ok(idx) => visit(idx, &mut max_dt_us),
+            Err(0) => visit(0, &mut max_dt_us),
+            Err(idx) if idx >= n => visit(n - 1, &mut max_dt_us),
+            Err(idx) => {
+                visit(idx - 1, &mut max_dt_us);
+                visit(idx, &mut max_dt_us);
+            }
+        }
+        // |dE/dt| = 2·E^(3/2)/(TOF_FACTOR·L)
+        let de_per_dt = 2.0 * e_ev.powf(1.5) / (TOF_FACTOR * self.flight_path_m);
+        de_per_dt * max_dt_us
+    }
 }
 
 /// Resolution function: either analytical Gaussian or tabulated from Monte Carlo.
@@ -3960,5 +4031,101 @@ mod tests {
             matrix_out[0],
         );
         assert!(matrix_out[0].abs() < 1e-280);
+    }
+
+    // ------------------------------------------------------------------
+    // TabulatedResolution::kernel_support_ev — used by SAMMY REGION
+    // -equivalent fit-energy-range margin computation (#514).
+    // ------------------------------------------------------------------
+
+    /// `synthetic_tab_resolution` uses triangular kernels whose
+    /// outermost entries (`weight = 1 - |dt|/half`) are exactly zero
+    /// at `dt = ±half`; the actual non-zero support is the next-
+    /// outermost entry at `±half · (1 - 1/(n-1))`.
+    fn triangle_dt_max(half: f64, n: usize) -> f64 {
+        // dt_step = 2*half / (n-1); next-outermost = half - dt_step
+        half - 2.0 * half / (n - 1) as f64
+    }
+
+    /// At a reference energy with a known kernel half-width in TOF, the
+    /// support in eV must satisfy `|ΔE| = 2·E^(3/2)/(TOF_FACTOR·L)·|Δt|`.
+    /// At E = 50 eV the triangle kernel has half = 1.0 μs, n = 41, so
+    /// the largest non-zero offset is `1.0 · (1 − 1/40) = 0.975`.
+    #[test]
+    fn test_tabulated_kernel_support_at_ref_energy_matches_chain_rule() {
+        let r = synthetic_tab_resolution();
+        let e: f64 = 50.0;
+        let dt_max = triangle_dt_max(1.0, 41);
+        let expected = 2.0 * e.powf(1.5) / (TOF_FACTOR * 25.0) * dt_max;
+        let got = r.kernel_support_ev(e);
+        assert!(
+            (got - expected).abs() / expected < 1e-12,
+            "support at ref energy: got {got}, expected {expected}"
+        );
+    }
+
+    /// Between two reference energies the support uses the larger of
+    /// the two bracketing kernels (conservative).  At E = 100 eV the
+    /// brackets are 50 eV (half = 1.0, n = 41) and 500 eV (half = 2.0,
+    /// n = 51); the larger non-zero offset is `2.0 · (1 − 1/50) = 1.96`.
+    #[test]
+    fn test_tabulated_kernel_support_uses_larger_bracketing_kernel() {
+        let r = synthetic_tab_resolution();
+        let e: f64 = 100.0;
+        let dt_max = triangle_dt_max(2.0, 51);
+        let expected = 2.0 * e.powf(1.5) / (TOF_FACTOR * 25.0) * dt_max;
+        let got = r.kernel_support_ev(e);
+        assert!(
+            (got - expected).abs() / expected < 1e-12,
+            "support between refs: got {got}, expected {expected}"
+        );
+    }
+
+    /// Below the lowest ref energy: use the lowest ref kernel.
+    /// Above the highest ref energy: use the highest ref kernel.
+    #[test]
+    fn test_tabulated_kernel_support_uses_nearest_outside_grid() {
+        let r = synthetic_tab_resolution();
+        // Below grid (ref_min = 5 eV; triangle(half=0.5, n=31)).
+        let e_low: f64 = 1.0;
+        let exp_low = 2.0 * e_low.powf(1.5) / (TOF_FACTOR * 25.0) * triangle_dt_max(0.5, 31);
+        assert!((r.kernel_support_ev(e_low) - exp_low).abs() / exp_low < 1e-12);
+        // Above grid (ref_max = 500 eV; triangle(half=2.0, n=51)).
+        let e_hi: f64 = 1000.0;
+        let exp_hi = 2.0 * e_hi.powf(1.5) / (TOF_FACTOR * 25.0) * triangle_dt_max(2.0, 51);
+        assert!((r.kernel_support_ev(e_hi) - exp_hi).abs() / exp_hi < 1e-12);
+    }
+
+    /// Non-positive / non-finite energy → 0.0 (no broadening footprint).
+    #[test]
+    fn test_tabulated_kernel_support_returns_zero_for_invalid_energy() {
+        let r = synthetic_tab_resolution();
+        assert_eq!(r.kernel_support_ev(0.0), 0.0);
+        assert_eq!(r.kernel_support_ev(-1.0), 0.0);
+        assert_eq!(r.kernel_support_ev(f64::NAN), 0.0);
+        assert_eq!(r.kernel_support_ev(f64::INFINITY), 0.0);
+    }
+
+    /// Zero-weight tail entries must not inflate the support; only
+    /// `weights[i] > 0` entries count.
+    #[test]
+    fn test_tabulated_kernel_support_ignores_zero_weight_entries() {
+        // Build a kernel where the outermost entries have weight 0.
+        let offsets = vec![-10.0, -1.0, 0.0, 1.0, 10.0];
+        let weights = vec![0.0, 0.5, 1.0, 0.5, 0.0];
+        let r = TabulatedResolution {
+            ref_energies: vec![100.0],
+            kernels: vec![(offsets, weights)],
+            flight_path_m: 25.0,
+        };
+        let e: f64 = 100.0;
+        // Expected support uses dt_max = 1.0 (the outermost zero-weight
+        // entries at ±10 are ignored), not 10.0.
+        let expected = 2.0 * e.powf(1.5) / (TOF_FACTOR * 25.0) * 1.0;
+        let got = r.kernel_support_ev(e);
+        assert!(
+            (got - expected).abs() / expected < 1e-12,
+            "support should ignore zero-weight entries: got {got}, expected {expected}"
+        );
     }
 }

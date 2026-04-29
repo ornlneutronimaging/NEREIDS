@@ -658,6 +658,34 @@ pub fn joint_poisson_fit(
         });
     }
 
+    // SAMMY REGION-equivalent fit-energy-range (#514): zero active
+    // bins means the user's `[E_min, E_max]` does not overlap the
+    // configured grid.  No data contributes to the deviance — return
+    // non-converged with NaN before falling through.  Without this
+    // the all-bins-masked path would compute deviance = 0 (sum over
+    // zero rows) which combined with `n_free == 0` (all-fixed params)
+    // would report `gn_converged: true, deviance: 0` from a fit that
+    // saw no data.
+    let n_free_initial = params.n_free();
+    let n_active_initial = objective.n_active();
+    if n_active_initial == 0 {
+        return Ok(JointPoissonResult {
+            deviance: f64::NAN,
+            deviance_per_dof: f64::NAN,
+            n_data,
+            n_active: 0,
+            n_free: n_free_initial,
+            gn_iterations: 0,
+            polish_iterations: 0,
+            gn_converged: false,
+            polish_converged: false,
+            polish_improved: false,
+            params: params.all_values(),
+            covariance: None,
+            uncertainties: None,
+        });
+    }
+
     // Underdetermined-check: when a fit-energy-range mask leaves fewer
     // active bins than free parameters, the problem is rank-deficient
     // and any deviance / dof ratio would be deceptive (the previous
@@ -665,8 +693,6 @@ pub fn joint_poisson_fit(
     // empty / too-narrow masks).  Mirror LM's behaviour at
     // `lm.rs:578-588`: return a non-converged result up-front, before
     // wasting cycles on the damped-Fisher stage.
-    let n_free_initial = params.n_free();
-    let n_active_initial = objective.n_active();
     if n_active_initial < n_free_initial {
         return Ok(JointPoissonResult {
             deviance: f64::NAN,
@@ -1956,6 +1982,38 @@ mod tests {
         assert_eq!(r.n_free, 1);
         assert!(r.covariance.is_none());
         assert!(r.uncertainties.is_none());
+    }
+
+    /// Zero active bins with **all parameters fixed** (`n_free == 0`)
+    /// must still return non-converged.  Without the
+    /// `n_active == 0` early-return, the underdetermined check
+    /// `n_active < n_free` is `0 < 0` → false, so the function would
+    /// fall through to the main loop, compute `deviance = 0` from the
+    /// empty sum, and `dof = 0` → `deviance_per_dof = NaN` — but
+    /// `gn_converged` could still be `true`, masquerading as a
+    /// successful fit on no data.  Regression for #517 R3 P1 (#514).
+    #[test]
+    fn test_joint_poisson_rejects_zero_active_with_no_free_params() {
+        let n_bins = 5;
+        let o: Vec<f64> = vec![10.0; n_bins];
+        let s: Vec<f64> = vec![5.0; n_bins];
+        let mask = vec![false; n_bins];
+        let model = ConstModel { n_e: n_bins };
+        let obj = JointPoissonObjective {
+            model: &model,
+            o: &o,
+            s: &s,
+            c: 1.0,
+            active_mask: Some(&mask),
+        };
+        let mut params = ParameterSet::new(vec![FitParameter::fixed("T", 0.5)]);
+        let r = joint_poisson_fit(&obj, &mut params, &JointPoissonFitConfig::default()).unwrap();
+        assert!(!r.gn_converged);
+        assert!(!r.polish_converged);
+        assert!(r.deviance.is_nan());
+        assert!(r.deviance_per_dof.is_nan());
+        assert_eq!(r.n_active, 0);
+        assert_eq!(r.n_free, 0);
     }
 
     /// `joint_poisson_fit` validates active-mask length up-front and
