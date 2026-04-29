@@ -1478,22 +1478,24 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
         0.0
     };
 
-    // Reserve space below the plot for the tick strips so neither the plot nor
-    // the track viewport pushes past the cockpit column. Fit results live in
-    // the right inspector, not below the spectrum.
+    // Reserve space below the plot for the tick strips so neither the plot
+    // nor the track viewport pushes past the cockpit column.  Fit results
+    // live in the right inspector, not below the spectrum.
     //
-    // Floor budget at 160 px (was 220).  With the picker's
-    // `MAX_VISIBLE_STRIPS = 6`, `strips_total_height` peaks at 6×18 + 4 +
-    // footer 22 = 134 px.  In typical use (≤ 2-3 strips) the plot still
-    // gets the available height minus strips, and the floor is inactive.
+    // No hard floor: the plot claims exactly what's left after the strip
+    // block (`strips_total_height`) and a 20 px buffer.  With the picker's
+    // `MAX_VISIBLE_STRIPS = 6`, the strip block peaks at 6×18 + 4 +
+    // footer 22 = 134 px.  In a typical desktop window (`col_height` ≈
+    // 600+) the plot gets the lion's share; in a small window with many
+    // strips it collapses gracefully (egui draws axis labels at any
+    // height).  The user can recover plot space by hiding tracks via the
+    // picker or by enlarging the window.
     //
-    // Caveat: the `spectrum_panel` itself consumes ~40-50 px above the plot
-    // for the pixel-info + axis-toggle header rows, so at the 6-strip +
-    // ~300 px col_height corner case the budget can still under-fit by
-    // ~60 px.  The 220→160 change is a net improvement (the old floor
-    // was guaranteed to overflow there); the residual corner-case
-    // overflow is tracked separately and isn't blocking.
-    let plot_height = (ui.available_height() - 20.0 - strips_total_height).max(160.0);
+    // The `.max(0.0)` is defensive — `ui.available_height()` is never
+    // negative in practice, but the subtractions could drive the
+    // expression negative if some future call site allocates the panel
+    // with insufficient room.
+    let plot_height = (ui.available_height() - 20.0 - strips_total_height).max(0.0);
 
     // Plot
     let y_label = if show_counts {
