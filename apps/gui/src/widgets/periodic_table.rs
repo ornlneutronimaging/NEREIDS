@@ -451,13 +451,14 @@ pub fn periodic_table_modal(ctx: &egui::Context, state: &mut AppState) {
                     // fetch time with no MAT number (e.g. Br-79/Br-81 chips under
                     // CENDL-3.2, which has no Br entries; or partial Cd coverage
                     // under CENDL-3.2 where only Cd-113 is present).
+                    let known_mass_numbers = retrieval::known_isotopes_for(z, lib);
                     let known_a: std::collections::HashSet<u32> =
-                        retrieval::known_isotopes_for(z, lib).into_iter().collect();
+                        known_mass_numbers.iter().copied().collect();
                     let natural: Vec<(Isotope, f64)> = nereids_core::elements::natural_isotopes(z)
                         .into_iter()
                         .filter(|(iso, _)| known_a.contains(&iso.a()))
                         .collect();
-                    let known: Vec<Isotope> = known_a
+                    let known: Vec<Isotope> = known_mass_numbers
                         .iter()
                         .filter_map(|&a| Isotope::new(z, a).ok())
                         .collect();
@@ -543,7 +544,10 @@ pub fn periodic_table_modal(ctx: &egui::Context, state: &mut AppState) {
                         });
                         let already = state.periodic_table_selected_isotopes.contains(&(cz, ca));
                         if ui
-                            .add_enabled(!already, egui::Button::new(format!("Add {csym}-{ca}")))
+                            .add_enabled(
+                                !already && has_eval,
+                                egui::Button::new(format!("Add {csym}-{ca}")),
+                            )
                             .clicked()
                         {
                             state.periodic_table_selected_isotopes.push((cz, ca));
@@ -689,6 +693,7 @@ fn add_selected_isotopes(state: &mut AppState) {
         .copied()
         .filter(|&(z, a)| retrieval::has_endf_evaluation_for(z, a, lib))
         .collect();
+    let skipped_unavailable = state.periodic_table_selected_isotopes.len() - selected.len();
 
     // Propagate PT library choice to the target's library field.
     // If the user selected a different library, existing resonance data
@@ -864,6 +869,12 @@ fn add_selected_isotopes(state: &mut AppState) {
     }
     if skipped_group > 0 {
         skip_parts.push(format!("{skipped_group} skipped (element group exists)"));
+    }
+    if skipped_unavailable > 0 {
+        let lib_label = super::design::library_name(lib);
+        skip_parts.push(format!(
+            "{skipped_unavailable} skipped (not in {lib_label})"
+        ));
     }
     if !skip_parts.is_empty() {
         let skip_msg = skip_parts.join(", ");
