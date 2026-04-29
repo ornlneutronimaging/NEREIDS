@@ -541,7 +541,16 @@ pub fn levenberg_marquardt_with_mask(
         // return converged=false rather than silently propagating NaN chi².
         // Covariance/uncertainties are None because the fit did not converge —
         // an unconverged result has no meaningful covariance to report.
-        if !y_model.iter().all(|v| v.is_finite()) {
+        //
+        // SAMMY REGION-equivalent fit-energy-range (#514): masked rows are
+        // skipped throughout the cost / normal-equation accumulators, so a
+        // non-finite model output at a masked bin should not abort the fit
+        // — only check finiteness on active rows.
+        let model_has_active_nonfinite = y_model
+            .iter()
+            .enumerate()
+            .any(|(i, v)| active_mask.is_none_or(|m| m[i]) && !v.is_finite());
+        if model_has_active_nonfinite {
             return Ok(LmResult {
                 chi_squared: f64::NAN,
                 reduced_chi_squared: f64::NAN,
@@ -728,9 +737,16 @@ pub fn levenberg_marquardt_with_mask(
             }
         };
 
-        // #113: If the model produced NaN/Inf, treat as a bad step (same as
-        // chi2 increase) — increase lambda and try again.
-        if y_trial.iter().any(|v| !v.is_finite()) {
+        // #113: If the model produced NaN/Inf at any *active* bin, treat as
+        // a bad step (same as chi2 increase) — increase lambda and try again.
+        // SAMMY REGION-equivalent fit-energy-range (#514): masked rows are
+        // skipped from χ² / JᵀWJ / JᵀWr / covariance, so a non-finite model
+        // output at a masked margin bin must not penalise the trial step.
+        let trial_has_active_nonfinite = y_trial
+            .iter()
+            .enumerate()
+            .any(|(i, v)| active_mask.is_none_or(|m| m[i]) && !v.is_finite());
+        if trial_has_active_nonfinite {
             params.set_free_values(&free_vals_buf);
             lambda *= config.lambda_up;
             if lambda > LAMBDA_BREAKOUT {
@@ -1636,5 +1652,66 @@ mod tests {
             "intercept should be 3.0, got {}",
             result.params[1]
         );
+    }
+
+    /// Regression for Round-2-pass-2 review: the global finite checks
+    /// on `y_model` / `y_trial` must skip masked bins.  A model that
+    /// returns NaN only at masked margin bins should not abort the fit
+    /// or get its trial step rejected.
+    #[test]
+    fn test_lm_active_mask_tolerates_model_nan_outside_range() {
+        // Linear model that injects NaN into masked bins.  The fit
+        // should still converge cleanly — the contract is that masked
+        // rows are completely irrelevant to the fit.
+        struct LinearModelWithMaskedNaN {
+            x: Vec<f64>,
+            mask: Vec<bool>,
+        }
+        impl FitModel for LinearModelWithMaskedNaN {
+            fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+                let a = params[0];
+                let b = params[1];
+                Ok(self
+                    .x
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &x)| if self.mask[i] { a * x + b } else { f64::NAN })
+                    .collect())
+            }
+        }
+
+        let x: Vec<f64> = (0..10).map(|i| i as f64).collect();
+        let y: Vec<f64> = x.iter().map(|&xi| 2.0 * xi + 3.0).collect();
+        let sigma = vec![1.0; 10];
+        let mask: Vec<bool> = vec![true; 5]
+            .into_iter()
+            .chain(std::iter::repeat_n(false, 5))
+            .collect();
+
+        let model = LinearModelWithMaskedNaN {
+            x: x.clone(),
+            mask: mask.clone(),
+        };
+        let mut params = ParameterSet::new(vec![
+            FitParameter::unbounded("a", 1.0),
+            FitParameter::unbounded("b", 1.0),
+        ]);
+        let result = levenberg_marquardt_with_mask(
+            &model,
+            &y,
+            &sigma,
+            &mut params,
+            &LmConfig::default(),
+            Some(&mask),
+        )
+        .unwrap();
+
+        assert!(
+            result.converged,
+            "fit should converge despite model NaN at masked bins"
+        );
+        assert!(result.chi_squared.is_finite());
+        assert!((result.params[0] - 2.0).abs() < 1e-6);
+        assert!((result.params[1] - 3.0).abs() < 1e-6);
     }
 }
