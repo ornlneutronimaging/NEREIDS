@@ -313,7 +313,26 @@ pub fn periodic_table_modal(ctx: &egui::Context, state: &mut AppState) {
                             .size(14.0),
                     );
 
+                    // Resolve the library this modal is filtering against so we can
+                    // gate group construction on library coverage.  A "natural group"
+                    // implicitly claims natural composition; if any natural member is
+                    // missing in the selected library, building the truncated group
+                    // would either renormalize partial ratios (changing the physics
+                    // — pure Cd-113 ≠ natural Cd) or auto-fail at fetch time.  Refuse
+                    // up front and tell the user instead.
+                    let lib: EndfLibrary = *state
+                        .periodic_table_library
+                        .get_or_insert(target_library(state));
+                    let known_a: std::collections::HashSet<u32> =
+                        retrieval::known_isotopes_for(z, lib).into_iter().collect();
                     let natural = nereids_core::elements::natural_isotopes(z);
+                    let missing_a: Vec<u32> = natural
+                        .iter()
+                        .map(|(iso, _)| iso.a())
+                        .filter(|a| !known_a.contains(a))
+                        .collect();
+                    let lib_label = super::design::library_name(lib);
+
                     if natural.is_empty() {
                         ui.label("No natural isotopes for this element.");
                     } else {
@@ -323,6 +342,26 @@ pub fn periodic_table_modal(ctx: &egui::Context, state: &mut AppState) {
                             .map(|(iso, frac)| format!("{sym}-{} ({:.2}%)", iso.a(), frac * 100.0))
                             .collect();
                         ui.label(parts.join(", "));
+
+                        if !missing_a.is_empty() {
+                            let missing_list: Vec<String> =
+                                missing_a.iter().map(|a| format!("{sym}-{a}")).collect();
+                            ui.add_space(2.0);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "⚠ {lib_label} is missing {}: {}. \
+                                     Switch library or add isotopes individually.",
+                                    if missing_a.len() == 1 {
+                                        "1 natural isotope"
+                                    } else {
+                                        "natural isotopes"
+                                    },
+                                    missing_list.join(", "),
+                                ))
+                                .color(Color32::from_rgb(0xC0, 0x80, 0x00))
+                                .size(11.0),
+                            );
+                        }
 
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
@@ -356,9 +395,10 @@ pub fn periodic_table_modal(ctx: &egui::Context, state: &mut AppState) {
                             });
 
                             let already = state.isotope_groups.iter().any(|g| g.z == z);
+                            let covered = missing_a.is_empty();
                             if ui
                                 .add_enabled(
-                                    !already,
+                                    !already && covered,
                                     egui::Button::new(
                                         egui::RichText::new(format!("Add {sym} Group"))
                                             .color(Color32::WHITE),
@@ -372,6 +412,12 @@ pub fn periodic_table_modal(ctx: &egui::Context, state: &mut AppState) {
                             if already {
                                 ui.label(
                                     egui::RichText::new("(already added)")
+                                        .size(10.0)
+                                        .color(Color32::GRAY),
+                                );
+                            } else if !covered {
+                                ui.label(
+                                    egui::RichText::new(format!("(not in {lib_label})"))
                                         .size(10.0)
                                         .color(Color32::GRAY),
                                 );
@@ -400,10 +446,20 @@ pub fn periodic_table_modal(ctx: &egui::Context, state: &mut AppState) {
                             .size(14.0),
                     );
 
-                    let natural = nereids_core::elements::natural_isotopes(z);
-                    let known: Vec<Isotope> = retrieval::known_isotopes_for(z, lib)
+                    // Filter natural isotopes by what the selected library actually
+                    // covers — otherwise the user gets clickable chips that fail at
+                    // fetch time with no MAT number (e.g. Br-79/Br-81 chips under
+                    // CENDL-3.2, which has no Br entries; or partial Cd coverage
+                    // under CENDL-3.2 where only Cd-113 is present).
+                    let known_a: std::collections::HashSet<u32> =
+                        retrieval::known_isotopes_for(z, lib).into_iter().collect();
+                    let natural: Vec<(Isotope, f64)> = nereids_core::elements::natural_isotopes(z)
                         .into_iter()
-                        .filter_map(|a| Isotope::new(z, a).ok())
+                        .filter(|(iso, _)| known_a.contains(&iso.a()))
+                        .collect();
+                    let known: Vec<Isotope> = known_a
+                        .iter()
+                        .filter_map(|&a| Isotope::new(z, a).ok())
                         .collect();
 
                     if natural.is_empty() && known.is_empty() {
@@ -798,9 +854,29 @@ fn target_library(state: &AppState) -> EndfLibrary {
 ///
 /// Creates an `IsotopeGroupEntry` with members set to `Pending` so the
 /// auto-fetch loop in `configure_step` will pick them up.
+///
+/// Refuses to construct a group if the selected library doesn't cover all
+/// natural isotopes — silently dropping members and renormalizing partial
+/// ratios would break the "natural composition" semantic (pure Cd-113 is
+/// not natural Cd).  The modal UI gates the trigger button on the same
+/// check; this is defense-in-depth.
 fn add_element_group(state: &mut AppState, z: u32) {
+    let lib = state
+        .periodic_table_library
+        .unwrap_or_else(|| target_library(state));
     let natural = nereids_core::elements::natural_isotopes(z);
     if natural.is_empty() {
+        return;
+    }
+    let known_a: std::collections::HashSet<u32> =
+        retrieval::known_isotopes_for(z, lib).into_iter().collect();
+    if !natural.iter().all(|(iso, _)| known_a.contains(&iso.a())) {
+        // UI should have prevented this, but refuse defensively rather than
+        // build a partial group that misrepresents natural composition.
+        let lib_label = super::design::library_name(lib);
+        state.status_message = format!(
+            "Cannot build natural group — {lib_label} is missing one or more natural isotopes"
+        );
         return;
     }
     // Duplicate check: group already exists
