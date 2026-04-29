@@ -68,9 +68,9 @@ Build a file overlap matrix and suggest merge order:
 
 Launch **all** review tasks in a **single message** (background mode) so
 they run concurrently. N worktrees produce up to 2N parallel tasks
-(N Codex subagents + N Codex commands).
+(N Claude subagents + N Codex commands).
 
-### Self-Audit (Codex Subagents)
+### Self-Audit (Claude Subagents)
 
 Launch one `Agent(subagent_type="general-purpose", run_in_background=true)`
 per worktree with this prompt:
@@ -104,7 +104,7 @@ codex-cli is upgraded and accepted by the API, re-enable by removing this
 notice and uncommenting the launch step.
 
 When re-enabled, also launch one `Bash` command per worktree in the **same
-message** as the Codex self-audit, unless `--skip-codex` is in
+message** as the Claude self-audit, unless `--skip-codex` is in
 `$ARGUMENTS`.
 
 There is **no `codex review` subcommand** in current codex-cli (verified
@@ -179,7 +179,7 @@ mostly noise for our purposes.
 
 If Codex fails (network, license, model rejection, binary out of date),
 note the failure and continue. Codex is supplementary, not blocking. The
-Codex self-audit is the load-bearing reviewer; Codex provides
+Claude self-audit is the load-bearing reviewer; Codex provides
 cross-confirmation when available.
 
 ---
@@ -190,8 +190,8 @@ After all reviews complete:
 
 1. Collect self-audit findings (from Agent results) and Codex findings (from Bash output)
 2. Merge into a unified report grouped by worktree/branch:
-   - **Cross-confirmed** issues (found by both Codex and Codex) — highest confidence
-   - **Codex-only** issues
+   - **Cross-confirmed** issues (found by both Claude and Codex) — highest confidence
+   - **Claude-only** issues
    - **Codex-only** issues
 3. For each finding, classify as:
    - **Fix now** — P1s and high-confidence P2s

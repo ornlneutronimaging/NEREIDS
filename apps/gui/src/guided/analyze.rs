@@ -24,6 +24,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
 struct TickRow<'a> {
+    z: u32,
+    a: u32,
     label: String,
     color: egui::Color32,
     data: &'a nereids_endf::resonance::ResonanceData,
@@ -106,6 +108,7 @@ pub fn analyze_step(ui: &mut egui::Ui, state: &mut AppState) {
     });
 
     fit_info_drawer(ui.ctx(), state);
+    isotope_track_picker(ui.ctx(), state);
 
     // -- Navigation --
     let can_continue = state.spatial_result.is_some();
@@ -133,22 +136,21 @@ fn cockpit_column_widths(available_width: f32, spacing_x: f32) -> (f32, f32) {
     let minimum_total = CENTER_MIN + IMAGE_MIN;
 
     if usable < minimum_total {
+        // Below the minimum: split proportionally and accept that both
+        // panels will be tight.
         let image = usable * 0.42;
         let center = usable - image;
         return (image, center);
     }
 
-    let mut image = (usable * 0.38).clamp(IMAGE_MIN, IMAGE_MAX);
-    let mut center = usable - image;
-
-    if center < CENTER_MIN {
-        let deficit = CENTER_MIN - center;
-        let image_take = deficit.min(image - IMAGE_MIN);
-        image -= image_take;
-        center = usable - image;
-    }
-
-    (image, center.max(160.0))
+    // Above the minimum: clamp the image to [IMAGE_MIN, IMAGE_MAX] and
+    // give the rest to the center.  Because IMAGE_MIN + CENTER_MIN ==
+    // minimum_total and image grows at 0.38 × usable (center at 0.62 ×
+    // usable), `center >= CENTER_MIN` is guaranteed throughout this
+    // branch — no deficit redistribution is needed.
+    let image = (usable * 0.38).clamp(IMAGE_MIN, IMAGE_MAX);
+    let center = usable - image;
+    (image, center)
 }
 
 fn ensure_selected_pixel(state: &mut AppState) {
@@ -583,6 +585,101 @@ fn fit_info_drawer(ctx: &egui::Context, state: &mut AppState) {
                 });
         });
     state.show_analyze_fit_info = open;
+}
+
+/// Floating popover that lets the user hide / show individual isotope tick
+/// strips when more isotopes are loaded than fit on-screen at once. Mirrors
+/// the iteration order of `collect_all_resonance_data_with_mapping` so the
+/// picker rows match the strip block's ordering exactly.
+fn isotope_track_picker(ctx: &egui::Context, state: &mut AppState) {
+    if !state.show_isotope_track_picker {
+        return;
+    }
+
+    // Snapshot the list of pickable isotopes BEFORE entering the closure so
+    // we don't hold simultaneous shared + mutable borrows on `state`.
+    struct PickerRow {
+        z: u32,
+        a: u32,
+        label: String,
+        color: egui::Color32,
+    }
+    let mut entries: Vec<PickerRow> = Vec::new();
+    for entry in &state.isotope_entries {
+        if entry.enabled && entry.resonance_data.is_some() {
+            entries.push(PickerRow {
+                z: entry.z,
+                a: entry.a,
+                label: isotope_track_label(&entry.symbol, entry.a),
+                color: design::isotope_dot_color(&entry.symbol),
+            });
+        }
+    }
+    for group in &state.isotope_groups {
+        if group.enabled && group.overall_status() == EndfStatus::Loaded {
+            for member in &group.members {
+                if member.resonance_data.is_some() {
+                    entries.push(PickerRow {
+                        z: group.z,
+                        a: member.a,
+                        label: isotope_track_label(&member.symbol, member.a),
+                        color: design::isotope_dot_color(&member.symbol),
+                    });
+                }
+            }
+        }
+    }
+
+    if entries.is_empty() {
+        state.show_isotope_track_picker = false;
+        return;
+    }
+
+    let mut open = state.show_isotope_track_picker;
+    egui::Window::new("Tick Strips")
+        .open(&mut open)
+        .default_width(280.0)
+        .default_height(320.0)
+        .resizable(true)
+        .collapsible(false)
+        .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-24.0, -120.0))
+        .show(ctx, |ui| {
+            ui.label(egui::RichText::new("Show diagnostic tick strip for:").small());
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if ui.small_button("Show all").clicked() {
+                    state.hidden_isotope_tracks.clear();
+                }
+                if ui.small_button("Hide all").clicked() {
+                    state.hidden_isotope_tracks = entries.iter().map(|r| (r.z, r.a)).collect();
+                }
+            });
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .id_salt("analyze_track_picker")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for row in &entries {
+                        let key = (row.z, row.a);
+                        let mut visible = !state.hidden_isotope_tracks.contains(&key);
+                        ui.horizontal(|ui| {
+                            if ui.checkbox(&mut visible, "").changed() {
+                                if visible {
+                                    state.hidden_isotope_tracks.remove(&key);
+                                } else {
+                                    state.hidden_isotope_tracks.insert(key);
+                                }
+                            }
+                            // Colored dot matching the strip's color.
+                            let (rect, _) = ui
+                                .allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                            ui.painter().circle_filled(rect.center(), 4.0, row.color);
+                            ui.label(egui::RichText::new(&row.label).color(row.color));
+                        });
+                    }
+                });
+        });
+    state.show_isotope_track_picker = open;
 }
 
 fn fit_feedback_panel(ui: &mut egui::Ui, state: &AppState) {
@@ -1328,6 +1425,8 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 && let Some(data) = entry.resonance_data.as_ref()
             {
                 strip_rows.push(TickRow {
+                    z: entry.z,
+                    a: entry.a,
                     label: isotope_track_label(&entry.symbol, entry.a),
                     color: design::isotope_dot_color(&entry.symbol),
                     data,
@@ -1339,6 +1438,8 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 for member in &group.members {
                     if let Some(data) = member.resonance_data.as_ref() {
                         strip_rows.push(TickRow {
+                            z: group.z,
+                            a: member.a,
                             label: isotope_track_label(&member.symbol, member.a),
                             color: design::isotope_dot_color(&member.symbol),
                             data,
@@ -1348,10 +1449,29 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
             }
         }
     }
-    let n_strips = strip_rows.len();
-    let strips_total_height = if n_strips > 0 {
+    // Apply the user's visibility filter (set via the picker popover).  Hidden
+    // tracks are still part of the fit — this only suppresses the diagnostic
+    // strip so the visible list stays focused when many isotopes are loaded.
+    let total_strip_count = strip_rows.len();
+    let visible_indices: Vec<usize> = strip_rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| !state.hidden_isotope_tracks.contains(&(r.z, r.a)))
+        .map(|(i, _)| i)
+        .take(MAX_VISIBLE_STRIPS)
+        .collect();
+    let n_strips = visible_indices.len();
+    let overflow_count = total_strip_count - n_strips;
+    let footer_height = if total_strip_count > 0
+        && (overflow_count > 0 || !state.hidden_isotope_tracks.is_empty())
+    {
+        STRIP_HEIGHT + 4.0
+    } else {
+        0.0
+    };
+    let strips_total_height = if n_strips > 0 || footer_height > 0.0 {
         // +4.0 padding for the separator above the strip block.
-        (n_strips.min(MAX_VISIBLE_STRIPS) as f32) * STRIP_HEIGHT + 4.0
+        (n_strips as f32) * STRIP_HEIGHT + 4.0 + footer_height
     } else {
         0.0
     };
@@ -1392,27 +1512,48 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
             }
         });
 
-    // Tick strips below the main plot.  When n_strips > MAX_VISIBLE_STRIPS,
-    // a vertical scrollbar appears and we cap the area at the visible-cap
-    // height so the strip block never displaces the fit-summary panel.
+    // Tick strips below the main plot.  Render up to `MAX_VISIBLE_STRIPS`
+    // visible (non-hidden) tracks directly into the spectrum column so the
+    // strip plot widths match the spectrum's plot frame pixel-for-pixel —
+    // no `ScrollArea` chrome to narrow the rightmost ticks.  Overflow and
+    // user-hidden tracks are reachable via the footer chip → picker popover.
     let mut dragged_ruler = None;
+    let mut open_picker = false;
     if n_strips > 0 {
         ui.add_space(2.0);
-        egui::ScrollArea::vertical()
-            .id_salt("analyze_tick_strips")
-            .max_height(strips_total_height)
-            .show(ui, |ui| {
-                for (i, row) in strip_rows.iter().enumerate() {
-                    if let Some(ruler) =
-                        draw_aligned_tick_row(ui, i, row, &plot_response.transform, state)
-                    {
-                        dragged_ruler = Some(ruler);
-                    }
-                }
-            });
+        for (slot, &source_index) in visible_indices.iter().enumerate() {
+            let row = &strip_rows[source_index];
+            if let Some(ruler) =
+                draw_aligned_tick_row(ui, slot, row, &plot_response.transform, state)
+            {
+                dragged_ruler = Some(ruler);
+            }
+        }
+    }
+    if total_strip_count > 0 && (overflow_count > 0 || !state.hidden_isotope_tracks.is_empty()) {
+        let hidden_count = state.hidden_isotope_tracks.len();
+        let label = if overflow_count > 0 && hidden_count > 0 {
+            format!("+{overflow_count} more  ({hidden_count} hidden)  [pick…]")
+        } else if overflow_count > 0 {
+            format!("+{overflow_count} more  [pick…]")
+        } else {
+            format!("{hidden_count} hidden  [pick…]")
+        };
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            if ui
+                .add(egui::Button::new(egui::RichText::new(label).small()).frame(false))
+                .clicked()
+            {
+                open_picker = true;
+            }
+        });
     }
     if let Some(ruler) = dragged_ruler {
         draw_dragged_resonance_ruler(ui, &plot_response.transform, &ruler, state);
+    }
+    if open_picker {
+        state.show_isotope_track_picker = !state.show_isotope_track_picker;
     }
 }
 

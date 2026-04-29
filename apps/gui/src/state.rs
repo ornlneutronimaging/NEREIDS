@@ -777,6 +777,13 @@ pub struct AppState {
     pub show_history_window: bool,
     /// Toggle: show the on-demand Analyze fit-details drawer.
     pub show_analyze_fit_info: bool,
+    /// Toggle: show the Analyze isotope tick-strip picker popover.
+    pub show_isotope_track_picker: bool,
+    /// Per-`(z, a)` set of isotope tick strips the user has hidden via the
+    /// picker. Hidden tracks are still part of the fit; only the diagnostic
+    /// strip is suppressed so the visible track list stays focused when many
+    /// isotopes are loaded.
+    pub hidden_isotope_tracks: std::collections::HashSet<(u32, u32)>,
 
     // -- Results --
     pub pixel_fit_result: Option<SpectrumFitResult>,
@@ -1481,6 +1488,8 @@ impl Default for AppState {
             fitting_rois: Vec::new(),
             show_history_window: false,
             show_analyze_fit_info: false,
+            show_isotope_track_picker: false,
+            hidden_isotope_tracks: std::collections::HashSet::new(),
 
             pixel_fit_result: None,
             fit_result_gen: 0,
