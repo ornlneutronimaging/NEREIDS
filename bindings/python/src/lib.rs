@@ -172,8 +172,9 @@ fn parse_library_name(library: &str) -> PyResult<EndfLibrary> {
         "jeff3.3" => Ok(EndfLibrary::Jeff3_3),
         "jendl5" => Ok(EndfLibrary::Jendl5),
         "tendl2023" | "tendl-2023" => Ok(EndfLibrary::Tendl2023),
+        "cendl3.2" | "cendl-3.2" => Ok(EndfLibrary::Cendl3_2),
         _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Unknown library '{}'. Use one of: endf8.0, endf8.1, jeff3.3, jendl5, tendl2023",
+            "Unknown library '{}'. Use one of: endf8.0, endf8.1, jeff3.3, jendl5, tendl2023, cendl3.2",
             library
         ))),
     }

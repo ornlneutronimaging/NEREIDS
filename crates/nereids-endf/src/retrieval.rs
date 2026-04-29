@@ -28,6 +28,11 @@ pub enum EndfLibrary {
     /// TENDL-2023 (TALYS-based, 2,300 ground-state isotopes including activation
     /// products and transuranics not covered by the major evaluated libraries).
     Tendl2023,
+    /// CENDL-3.2 (Chinese library, 258 ground-state isotopes plus free neutron;
+    /// Z=1–98 with no Br evaluations — no MAT entry for Br-79 / Br-81, so
+    /// `mat_number(.., EndfLibrary::Cendl3_2)` returns `None` for Br before any
+    /// retrieval call).
+    Cendl3_2,
 }
 
 impl EndfLibrary {
@@ -39,6 +44,7 @@ impl EndfLibrary {
             Self::Jeff3_3 => "JEFF-3.3/n",
             Self::Jendl5 => "JENDL-5/n",
             Self::Tendl2023 => "TENDL-2023/n",
+            Self::Cendl3_2 => "CENDL-3.2/n",
         }
     }
 
@@ -50,6 +56,7 @@ impl EndfLibrary {
             Self::Jeff3_3 => "JEFF-3.3",
             Self::Jendl5 => "JENDL-5",
             Self::Tendl2023 => "TENDL-2023",
+            Self::Cendl3_2 => "CENDL-3.2",
         }
     }
 
@@ -57,7 +64,8 @@ impl EndfLibrary {
     ///
     /// IAEA uses two naming conventions (MAT always 4-digit zero-padded):
     /// - VIII.0, JEFF-3.3: MAT-first `n_{mat:04}_{z}-{Sym}-{a}.zip` (Z unpadded)
-    /// - VIII.1, JENDL-5, TENDL-2023: Z-first `n_{z:03}-{Sym}-{a}_{mat:04}.zip` (Z 3-digit)
+    /// - VIII.1, JENDL-5, TENDL-2023, CENDL-3.2: Z-first
+    ///   `n_{z:03}-{Sym}-{a}_{mat:04}.zip` (Z 3-digit; free neutron uses `nn`)
     fn zip_filename(&self, isotope: &Isotope, mat: u32) -> String {
         let sym = elements::element_symbol(isotope.z()).unwrap_or("X");
         let z = isotope.z();
@@ -66,8 +74,9 @@ impl EndfLibrary {
             Self::EndfB8_0 | Self::Jeff3_3 => {
                 format!("n_{mat:04}_{z}-{sym}-{a}.zip")
             }
-            Self::EndfB8_1 | Self::Jendl5 | Self::Tendl2023 => {
-                format!("n_{z:03}-{sym}-{a}_{mat:04}.zip")
+            Self::EndfB8_1 | Self::Jendl5 | Self::Tendl2023 | Self::Cendl3_2 => {
+                let zip_sym = if z == 0 && a == 1 { "nn" } else { sym };
+                format!("n_{z:03}-{zip_sym}-{a}_{mat:04}.zip")
             }
         }
     }
@@ -275,16 +284,19 @@ impl Default for EndfRetriever {
 ///
 /// Dispatches to the underlying `endf-mat` table for the requested library:
 /// - `Tendl2023`: ~2,300 ground-state isotopes from the TENDL-2023 neutrons sublibrary.
+/// - `Cendl3_2`: 258 isotopes plus free neutron from the CENDL-3.2 neutrons sublibrary (no Br entries).
 /// - All other variants: 535 isotopes from the ENDF/B-VIII.0 neutrons sublibrary
 ///   (the MAT numbers in ENDF/B-VIII.1, JEFF-3.3, and JENDL-5 are identical to
 ///   ENDF/B-VIII.0 for the isotopes they share).
 ///
 /// MAT numbers are *almost* universal across libraries; the one documented exception
-/// is Es-255, which is MAT 9916 in ENDF/B-VIII.0 and MAT 9915 in TENDL-2023. The
-/// library-aware lookup ensures the correct MAT is used to construct retrieval URLs.
+/// is Es-255, which is MAT 9916 in ENDF/B-VIII.0 and MAT 9915 in TENDL-2023. CENDL-3.2
+/// has no MAT divergences from ENDF/B-VIII.0 for shared isotopes. The library-aware
+/// lookup ensures the correct MAT is used to construct retrieval URLs.
 pub fn mat_number(isotope: &Isotope, library: EndfLibrary) -> Option<u32> {
     match library {
         EndfLibrary::Tendl2023 => endf_mat::mat_number_tendl(isotope.z(), isotope.a()),
+        EndfLibrary::Cendl3_2 => endf_mat::mat_number_cendl(isotope.z(), isotope.a()),
         _ => endf_mat::mat_number(isotope.z(), isotope.a()),
     }
 }
@@ -294,10 +306,12 @@ pub fn mat_number(isotope: &Isotope, library: EndfLibrary) -> Option<u32> {
 /// Library-aware counterpart to [`endf_mat::known_isotopes`] (which is
 /// ENDF/B-VIII.0-only) — must be used wherever the GUI surfaces the set of
 /// selectable isotopes for the *currently selected* library, otherwise
-/// TENDL-2023-only isotopes (e.g. Fm-247) will be silently hidden.
+/// TENDL-2023-only isotopes (e.g. Fm-247) will be silently hidden, and Br
+/// will be incorrectly shown as available under CENDL-3.2.
 pub fn known_isotopes_for(z: u32, library: EndfLibrary) -> Vec<u32> {
     match library {
         EndfLibrary::Tendl2023 => endf_mat::known_isotopes_tendl(z),
+        EndfLibrary::Cendl3_2 => endf_mat::known_isotopes_cendl(z),
         _ => endf_mat::known_isotopes(z),
     }
 }
@@ -310,6 +324,7 @@ pub fn known_isotopes_for(z: u32, library: EndfLibrary) -> Vec<u32> {
 pub fn has_endf_evaluation_for(z: u32, a: u32, library: EndfLibrary) -> bool {
     match library {
         EndfLibrary::Tendl2023 => endf_mat::has_endf_evaluation_tendl(z, a),
+        EndfLibrary::Cendl3_2 => endf_mat::has_endf_evaluation_cendl(z, a),
         _ => endf_mat::has_endf_evaluation(z, a),
     }
 }
@@ -360,4 +375,24 @@ fn format_error_chain(err: &dyn std::error::Error) -> String {
         cur = s.source();
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cendl_neutron_uses_upstream_nn_filename() {
+        let neutron = Isotope::new(0, 1).unwrap();
+        assert_eq!(
+            EndfLibrary::Cendl3_2.zip_filename(&neutron, 25),
+            "n_000-nn-1_0025.zip"
+        );
+    }
+
+    #[test]
+    fn cendl_neutron_has_library_aware_mat_lookup() {
+        let neutron = Isotope::new(0, 1).unwrap();
+        assert_eq!(mat_number(&neutron, EndfLibrary::Cendl3_2), Some(25));
+    }
 }

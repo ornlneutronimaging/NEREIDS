@@ -723,6 +723,7 @@ pub fn library_name(lib: EndfLibrary) -> &'static str {
         EndfLibrary::Jeff3_3 => "JEFF-3.3",
         EndfLibrary::Jendl5 => "JENDL-5",
         EndfLibrary::Tendl2023 => "TENDL-2023",
+        EndfLibrary::Cendl3_2 => "CENDL-3.2",
     }
 }
 

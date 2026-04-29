@@ -39,8 +39,9 @@ pub use elements::{element_name, element_symbol, symbol_to_z};
 
 // MAT numbers
 pub use mat::{
-    has_endf_evaluation, has_endf_evaluation_tendl, isotope_from_mat, known_isotopes,
-    known_isotopes_tendl, mat_number, mat_number_tendl,
+    has_endf_evaluation, has_endf_evaluation_cendl, has_endf_evaluation_tendl, isotope_from_mat,
+    known_isotopes, known_isotopes_cendl, known_isotopes_tendl, mat_number, mat_number_cendl,
+    mat_number_tendl,
 };
 
 // Natural abundances
