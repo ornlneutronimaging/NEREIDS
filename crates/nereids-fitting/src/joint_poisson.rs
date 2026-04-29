@@ -578,8 +578,17 @@ pub struct JointPoissonResult {
     pub deviance: f64,
     /// D / (n − k).  Primary GOF statistic per memo 35 §P1.2.
     pub deviance_per_dof: f64,
-    /// Number of data bins (n).
+    /// Number of data bins on the configured grid (n).  This is the
+    /// total bin count; when a fit-energy-range mask is in effect, the
+    /// count of bins that actually contributed to the cost function is
+    /// reported separately as [`Self::n_active`].
     pub n_data: usize,
+    /// Number of *active* data bins — equal to `n_data` when no mask is
+    /// set, or the count of `true` entries in the objective's
+    /// `active_mask` otherwise.  The deviance / dof ratio uses
+    /// `(n_active − n_free)` so reduced deviance is unbiased when a
+    /// fit-energy-range mask is in effect (SAMMY REGION semantics, #514).
+    pub n_active: usize,
     /// Number of free parameters (k).
     pub n_free: usize,
     /// Iterations performed in the damped-Fisher stage.
@@ -634,6 +643,48 @@ pub fn joint_poisson_fit(
         return Err(FittingError::EmptyData);
     }
 
+    // Validate active-mask length up-front, mirroring the LM solver's
+    // length-mismatch early-return (#514).  A debug-assert deep in the
+    // deviance routines would silently pass through in release builds
+    // with a length mismatch, causing out-of-bounds index reads when
+    // the masked accumulator iterates `o`/`s`/`mask` together.
+    if let Some(m) = objective.active_mask
+        && m.len() != n_data
+    {
+        return Err(FittingError::LengthMismatch {
+            expected: n_data,
+            actual: m.len(),
+            field: "active_mask",
+        });
+    }
+
+    // Underdetermined-check: when a fit-energy-range mask leaves fewer
+    // active bins than free parameters, the problem is rank-deficient
+    // and any deviance / dof ratio would be deceptive (the previous
+    // `.max(1)` divisor produced a finite-looking deviance-per-dof for
+    // empty / too-narrow masks).  Mirror LM's behaviour at
+    // `lm.rs:578-588`: return a non-converged result up-front, before
+    // wasting cycles on the damped-Fisher stage.
+    let n_free_initial = params.n_free();
+    let n_active_initial = objective.n_active();
+    if n_active_initial < n_free_initial {
+        return Ok(JointPoissonResult {
+            deviance: f64::NAN,
+            deviance_per_dof: f64::NAN,
+            n_data,
+            n_active: n_active_initial,
+            n_free: n_free_initial,
+            gn_iterations: 0,
+            polish_iterations: 0,
+            gn_converged: false,
+            polish_converged: false,
+            polish_improved: false,
+            params: params.all_values(),
+            covariance: None,
+            uncertainties: None,
+        });
+    }
+
     // Stage 1: damped Fisher with Armijo backtracking.
     let stage1 = damped_fisher_stage(objective, params, config)?;
 
@@ -684,10 +735,18 @@ pub fn joint_poisson_fit(
     // Active-bin masking (SAMMY REGION): when a fit-energy-range mask
     // is in effect, dof must use the count of bins that contributed to
     // the deviance — otherwise deviance-per-dof is biased low by the
-    // ratio (n_active / n_data).
+    // ratio (n_active / n_data).  The `n_active < n_free` case has
+    // already been short-circuited above; here `n_active >= n_free`,
+    // so `dof` is non-negative and exactly-determined fits
+    // (`n_active == n_free`) report `deviance_per_dof = NaN` (0/0)
+    // as in LM (`lm.rs:784`).
     let n_active = objective.n_active();
-    let dof = (n_active as isize - n_free as isize).max(1) as f64;
-    let deviance_per_dof = final_deviance / dof;
+    let dof = n_active.saturating_sub(n_free);
+    let deviance_per_dof = if dof > 0 {
+        final_deviance / dof as f64
+    } else {
+        f64::NAN
+    };
 
     // Covariance from inverse Fisher at the final θ.  Uses the analytical
     // Jacobian when the transmission model provides one; otherwise falls
@@ -741,6 +800,7 @@ pub fn joint_poisson_fit(
         deviance: final_deviance,
         deviance_per_dof,
         n_data,
+        n_active,
         n_free,
         gn_iterations,
         polish_iterations,
@@ -1850,5 +1910,85 @@ mod tests {
                 "grad component {i}: masked={gm} subset={gs}"
             );
         }
+    }
+
+    /// `joint_poisson_fit` must reject an underdetermined (n_active <
+    /// n_free) configuration with a non-converged result and NaN
+    /// deviance / per-dof, mirroring the LM solver.  An all-`false`
+    /// active mask is the extreme case (`n_active == 0 < n_free`);
+    /// the prior `.max(1)` divisor produced a deceptive
+    /// finite-looking deviance-per-dof for empty / too-narrow masks.
+    /// Regression for Round-2 review fix #2 (#514).
+    #[test]
+    fn test_joint_poisson_rejects_zero_active_mask() {
+        let n_bins = 10;
+        let o: Vec<f64> = vec![50.0; n_bins];
+        let s: Vec<f64> = vec![25.0; n_bins];
+        let mask = vec![false; n_bins]; // n_active = 0
+        let model = ConstModel { n_e: n_bins };
+        let obj = JointPoissonObjective {
+            model: &model,
+            o: &o,
+            s: &s,
+            c: 1.0,
+            active_mask: Some(&mask),
+        };
+        let mut params = ParameterSet::new(vec![FitParameter::non_negative("T", 0.5)]);
+        let cfg = JointPoissonFitConfig::default();
+        let r = joint_poisson_fit(&obj, &mut params, &cfg).unwrap();
+
+        assert!(
+            !r.gn_converged && !r.polish_converged,
+            "underdetermined fit must report non-converged"
+        );
+        assert!(
+            r.deviance.is_nan(),
+            "underdetermined deviance must be NaN, got {}",
+            r.deviance
+        );
+        assert!(
+            r.deviance_per_dof.is_nan(),
+            "underdetermined deviance-per-dof must be NaN, got {}",
+            r.deviance_per_dof
+        );
+        assert_eq!(r.n_data, n_bins);
+        assert_eq!(r.n_active, 0);
+        assert_eq!(r.n_free, 1);
+        assert!(r.covariance.is_none());
+        assert!(r.uncertainties.is_none());
+    }
+
+    /// `joint_poisson_fit` validates active-mask length up-front and
+    /// returns `LengthMismatch` rather than relying on a debug-assert
+    /// deep in the deviance routines (which silently passes through in
+    /// release builds, then panics on out-of-bounds index reads).
+    /// Regression for Round-2 review fix #5 (#514).
+    #[test]
+    fn test_joint_poisson_rejects_active_mask_length_mismatch() {
+        let n_bins = 5;
+        let o: Vec<f64> = vec![10.0; n_bins];
+        let s: Vec<f64> = vec![5.0; n_bins];
+        let mask_wrong = vec![true, true, true]; // wrong length
+        let model = ConstModel { n_e: n_bins };
+        let obj = JointPoissonObjective {
+            model: &model,
+            o: &o,
+            s: &s,
+            c: 1.0,
+            active_mask: Some(&mask_wrong),
+        };
+        let mut params = ParameterSet::new(vec![FitParameter::non_negative("T", 0.5)]);
+        let cfg = JointPoissonFitConfig::default();
+        let err = joint_poisson_fit(&obj, &mut params, &cfg).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FittingError::LengthMismatch {
+                    field: "active_mask",
+                    ..
+                }
+            ),
+            "expected LengthMismatch on active_mask; got {err:?}"
+        );
     }
 }

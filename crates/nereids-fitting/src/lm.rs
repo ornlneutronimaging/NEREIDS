@@ -184,12 +184,23 @@ impl<M: FitModel + ?Sized> FitModel for &M {
 }
 
 /// Compute weighted chi-squared: Σ [(y_obs - y_model)² / σ²].
-fn chi_squared(residuals: &[f64], weights: &[f64]) -> f64 {
-    residuals
-        .iter()
-        .zip(weights.iter())
-        .map(|(&r, &w)| r * r * w)
-        .sum()
+///
+/// When `active_mask` is `Some(m)`, bins where `m[i]` is `false` are
+/// **skipped entirely** rather than zero-weighted.  Explicit row-skip
+/// matters when masked bins may contain non-finite residuals (e.g. NaN
+/// outside the user's fit-energy range): `0.0 * NaN = NaN`, so a
+/// zero-weight strategy would propagate NaN through the χ² accumulator
+/// even though the bin contributes no information.  See SAMMY REGION
+/// semantics (#514) and lm.rs Fix 4.
+fn chi_squared(residuals: &[f64], weights: &[f64], active_mask: Option<&[bool]>) -> f64 {
+    let mut sum = 0.0;
+    for (i, (&r, &w)) in residuals.iter().zip(weights.iter()).enumerate() {
+        if active_mask.is_some_and(|m| !m[i]) {
+            continue;
+        }
+        sum += r * r * w;
+    }
+    sum
 }
 
 /// Infinity norm of the gradient, scaled by local curvature and residual size.
@@ -547,7 +558,7 @@ pub fn levenberg_marquardt_with_mask(
             .zip(y_model.iter())
             .map(|(&obs, &mdl)| obs - mdl)
             .collect();
-        let chi2 = chi_squared(&residuals, &weights);
+        let chi2 = chi_squared(&residuals, &weights, active_mask);
         // #125.5: Compute dof via `n_active - n_free` (with `n_active = n_data`
         // when no mask is set) to mirror the main path and keep a single
         // visible formula.  When a fit-energy-range mask is in effect,
@@ -634,7 +645,7 @@ pub fn levenberg_marquardt_with_mask(
         .zip(y_current.iter())
         .map(|(&obs, &mdl)| obs - mdl)
         .collect();
-    let mut chi2 = chi_squared(&residuals, &weights);
+    let mut chi2 = chi_squared(&residuals, &weights, active_mask);
 
     let mut lambda = config.lambda_init;
     let mut converged = false;
@@ -655,11 +666,20 @@ pub fn levenberg_marquardt_with_mask(
             &mut free_idx_buf,
         )?;
 
-        // Build normal equations: JᵀWJ and JᵀWr
+        // Build normal equations: JᵀWJ and JᵀWr.
+        //
+        // Active-bin masking (SAMMY REGION, #514): explicitly skip
+        // masked rows rather than relying on weights[i] == 0 — the
+        // model or the residual at a masked margin bin may be NaN
+        // (e.g. when y_obs is NaN outside the user's fit-energy range),
+        // and `0.0 * NaN = NaN` would poison both accumulators.
         let mut jtw_j = FlatMatrix::zeros(n_free, n_free);
         let mut jtw_r = vec![0.0; n_free];
 
         for (i, (&wi, &ri)) in weights.iter().zip(residuals.iter()).enumerate() {
+            if active_mask.is_some_and(|m| !m[i]) {
+                continue;
+            }
             for (j, jtw_r_j) in jtw_r.iter_mut().enumerate() {
                 let jij = jacobian.get(i, j);
                 *jtw_r_j += jij * wi * ri;
@@ -725,7 +745,7 @@ pub fn levenberg_marquardt_with_mask(
             .zip(y_trial.iter())
             .map(|(&obs, &mdl)| obs - mdl)
             .collect();
-        let trial_chi2 = chi_squared(&trial_residuals, &weights);
+        let trial_chi2 = chi_squared(&trial_residuals, &weights, active_mask);
         let chi2_delta = (trial_chi2 - chi2).abs();
         let chi2_scale = chi2.abs().max(trial_chi2.abs()).max(1.0);
         let chi2_stagnated = chi2_delta <= config.tol_chi2 * chi2_scale;
@@ -798,8 +818,14 @@ pub fn levenberg_marquardt_with_mask(
             &mut all_vals_buf,
             &mut free_idx_buf,
         )?;
+        // Same active-mask row-skip semantics as the main assembly
+        // loop above — keeps the covariance free of NaN contributions
+        // from masked margin bins (#514).
         let mut jtw_j = FlatMatrix::zeros(n_free, n_free);
         for (i, &wi) in weights.iter().enumerate() {
+            if active_mask.is_some_and(|m| !m[i]) {
+                continue;
+            }
             for j in 0..n_free {
                 let jij = jacobian.get(i, j);
                 for k in 0..n_free {
@@ -1551,6 +1577,63 @@ mod tests {
         assert!(
             (result.params[1] - 3.0).abs() < 1e-6,
             "intercept should be 3.0 (corrupt outliers must be masked out), got {}",
+            result.params[1]
+        );
+    }
+
+    /// Out-of-mask `y_obs` containing `NaN` must not poison χ² /
+    /// JᵀWJ / JᵀWr.  Without explicit row-skip in the accumulator
+    /// loops, `0.0 (weight) * NaN (residual) = NaN` would propagate
+    /// through the fit despite the masked weight being zero.
+    /// Regression for Round-2 review fix #4.
+    #[test]
+    fn test_lm_active_mask_tolerates_nan_outside_range() {
+        // y = 2x + 3 inside the active mask; NaN outside.  A naive
+        // zero-weight implementation would return NaN χ² and fail to
+        // converge; the row-skip path should fit cleanly.
+        let x: Vec<f64> = (0..10).map(|i| i as f64).collect();
+        let mut y: Vec<f64> = x.iter().map(|&xi| 2.0 * xi + 3.0).collect();
+        for yi in y.iter_mut().skip(5) {
+            *yi = f64::NAN;
+        }
+        let sigma = vec![1.0; 10];
+        let mask = vec![true; 5]
+            .into_iter()
+            .chain(std::iter::repeat_n(false, 5))
+            .collect::<Vec<bool>>();
+
+        let model = LinearModel { x };
+        let mut params = ParameterSet::new(vec![
+            FitParameter::unbounded("a", 1.0),
+            FitParameter::unbounded("b", 1.0),
+        ]);
+        let result = levenberg_marquardt_with_mask(
+            &model,
+            &y,
+            &sigma,
+            &mut params,
+            &LmConfig::default(),
+            Some(&mask),
+        )
+        .unwrap();
+
+        assert!(
+            result.converged,
+            "fit should converge despite NaN outside the active mask"
+        );
+        assert!(
+            result.chi_squared.is_finite(),
+            "χ² should be finite (NaN poisoning prevented), got {}",
+            result.chi_squared
+        );
+        assert!(
+            (result.params[0] - 2.0).abs() < 1e-6,
+            "slope should be 2.0, got {}",
+            result.params[0]
+        );
+        assert!(
+            (result.params[1] - 3.0).abs() < 1e-6,
+            "intercept should be 3.0, got {}",
             result.params[1]
         );
     }

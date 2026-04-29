@@ -2007,6 +2007,57 @@ fn build_fit_config(state: &AppState) -> Result<(UnifiedFitConfig, Range<usize>)
         .as_ref()
         .ok_or_else(|| "No energy grid loaded".to_string())?;
 
+    // Validate that all loaded data cubes' spectral (axis-0) length
+    // matches the energy grid before any caller slices into them with
+    // the `energy_range` returned below.  A project-load mismatch (or
+    // a stale energy axis after re-normalising) would otherwise panic
+    // via out-of-bounds when `fit_pixel` / `fit_roi` / `run_spatial_map`
+    // index `data[[e, y, x]]` for `e >= shape[0]`.  This belongs in
+    // `build_fit_config` so all three call sites benefit (#514).
+    let n_energies = full_energies.len();
+    if let Some(norm) = state.normalized.as_ref() {
+        let shape = norm.transmission.shape();
+        if shape[0] != n_energies {
+            return Err(format!(
+                "Energy grid length ({n_energies}) does not match the loaded \
+                 transmission cube spectral axis ({}). Reload the project or \
+                 normalize again.",
+                shape[0]
+            ));
+        }
+        let unc_shape = norm.uncertainty.shape();
+        if unc_shape[0] != n_energies {
+            return Err(format!(
+                "Energy grid length ({n_energies}) does not match the loaded \
+                 transmission-uncertainty cube spectral axis ({}). Reload the \
+                 project or normalize again.",
+                unc_shape[0]
+            ));
+        }
+    }
+    if let Some(sample) = state.sample_data.as_ref() {
+        let shape = sample.shape();
+        if shape[0] != n_energies {
+            return Err(format!(
+                "Energy grid length ({n_energies}) does not match the loaded \
+                 sample-counts cube spectral axis ({}). Reload the project or \
+                 normalize again.",
+                shape[0]
+            ));
+        }
+    }
+    if let Some(open_beam) = state.open_beam_data.as_ref() {
+        let shape = open_beam.shape();
+        if shape[0] != n_energies {
+            return Err(format!(
+                "Energy grid length ({n_energies}) does not match the loaded \
+                 open-beam-counts cube spectral axis ({}). Reload the project \
+                 or normalize again.",
+                shape[0]
+            ));
+        }
+    }
+
     // Resolve the fit-energy-range slice.  When `state.fit_energy_range`
     // is `None`, we slice the entire grid (no behavioural change).
     // Otherwise we extend the active `[E_min, E_max]` by a kernel-FWHM
@@ -2198,8 +2249,12 @@ fn build_fit_config(state: &AppState) -> Result<(UnifiedFitConfig, Range<usize>)
     // Attach the user-specified fit-energy range (provenance + solver
     // mask).  The pipeline / solver paths build a per-bin active mask
     // from this `[E_min, E_max]` against the (already margin-extended)
-    // `energies` grid stored above (#514).
-    config = config.with_fit_energy_range(state.fit_energy_range);
+    // `energies` grid stored above (#514).  `with_fit_energy_range` is
+    // fallible: non-finite or reversed bounds are rejected here rather
+    // than silently producing an empty mask downstream.
+    config = config
+        .with_fit_energy_range(state.fit_energy_range)
+        .map_err(|e| format!("Config validation error: {e}"))?;
 
     Ok((config, energy_range))
 }

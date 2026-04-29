@@ -496,10 +496,29 @@ impl UnifiedFitConfig {
     /// joint-Poisson cost paths mask residuals outside `[min, max]` to
     /// zero so resonance broadening at the boundaries is correct.
     /// `None` (default) = full grid, no masking.
-    #[must_use]
-    pub fn with_fit_energy_range(mut self, range: Option<(f64, f64)>) -> Self {
+    ///
+    /// Validates the range up-front so non-finite or reversed bounds
+    /// (which would silently produce an empty active-bin mask and a
+    /// deceptive fit) are rejected at config-build time rather than
+    /// surfacing as a downstream solver error.
+    pub fn with_fit_energy_range(
+        mut self,
+        range: Option<(f64, f64)>,
+    ) -> Result<Self, FitConfigError> {
+        if let Some((lo, hi)) = range {
+            if !lo.is_finite() || !hi.is_finite() {
+                return Err(FitConfigError::InvalidFitEnergyRange(
+                    "fit_energy_range bounds must be finite",
+                ));
+            }
+            if lo >= hi {
+                return Err(FitConfigError::InvalidFitEnergyRange(
+                    "fit_energy_range min must be strictly less than max",
+                ));
+            }
+        }
         self.fit_energy_range = range;
-        self
+        Ok(self)
     }
 
     #[must_use]
@@ -1175,6 +1194,22 @@ fn fit_transmission_poisson(
     config: &UnifiedFitConfig,
     poisson_cfg: &PoissonConfig,
 ) -> Result<SpectrumFitResult, PipelineError> {
+    // SAMMY REGION-equivalent fit-energy-range (#514): the legacy
+    // transmission-domain `poisson_fit` does not honour an active mask,
+    // so silently routing the data here when the user set a fit range
+    // would bias the fit by including out-of-range bins (margin region)
+    // in the cost function.  Hard-reject up-front rather than producing
+    // a misleading "successful" fit.  Joint-Poisson (counts) and LM
+    // transmission both honour the mask correctly.
+    if config.fit_energy_range().is_some() {
+        return Err(PipelineError::InvalidParameter(
+            "fit_energy_range is not supported for the transmission + \
+             Poisson-KL solver path. Use joint-Poisson (provide sample + \
+             open-beam counts) or switch to the LM transmission solver."
+                .into(),
+        ));
+    }
+
     let mut poisson_cfg = poisson_cfg.clone();
     poisson_cfg.compute_covariance = config.compute_covariance;
     let poisson_cfg = &poisson_cfg;
@@ -2300,6 +2335,8 @@ pub enum FitConfigError {
     NonFiniteTemperature(f64),
     /// Temperature must be non-negative.
     NegativeTemperature(f64),
+    /// `fit_energy_range` bounds were non-finite or reversed/empty.
+    InvalidFitEnergyRange(&'static str),
 }
 
 impl fmt::Display for FitConfigError {
@@ -2341,6 +2378,9 @@ impl fmt::Display for FitConfigError {
             }
             Self::NegativeTemperature(v) => {
                 write!(f, "temperature must be non-negative, got {v}")
+            }
+            Self::InvalidFitEnergyRange(msg) => {
+                write!(f, "invalid fit_energy_range: {msg}")
             }
         }
     }
@@ -3892,12 +3932,57 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.fit_energy_range(), None);
 
-        let cfg = cfg.with_fit_energy_range(Some((5.0, 50.0)));
+        let cfg = cfg.with_fit_energy_range(Some((5.0, 50.0))).unwrap();
         assert_eq!(cfg.fit_energy_range(), Some((5.0, 50.0)));
 
         // Setting back to None clears it.
-        let cfg = cfg.with_fit_energy_range(None);
+        let cfg = cfg.with_fit_energy_range(None).unwrap();
         assert_eq!(cfg.fit_energy_range(), None);
+    }
+
+    /// `with_fit_energy_range` rejects non-finite or reversed bounds
+    /// rather than silently producing an empty active-bin mask
+    /// downstream.
+    #[test]
+    fn test_unified_fit_config_fit_energy_range_rejects_invalid() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..21).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let cfg = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap();
+
+        // Reversed range (lo > hi) is rejected.
+        let err = cfg
+            .clone()
+            .with_fit_energy_range(Some((10.0, 5.0)))
+            .unwrap_err();
+        assert!(matches!(err, FitConfigError::InvalidFitEnergyRange(_)));
+
+        // Empty range (lo == hi) is rejected — `lo < hi` strictly required.
+        let err = cfg
+            .clone()
+            .with_fit_energy_range(Some((5.0, 5.0)))
+            .unwrap_err();
+        assert!(matches!(err, FitConfigError::InvalidFitEnergyRange(_)));
+
+        // Non-finite bounds are rejected.
+        let err = cfg
+            .clone()
+            .with_fit_energy_range(Some((f64::NAN, 5.0)))
+            .unwrap_err();
+        assert!(matches!(err, FitConfigError::InvalidFitEnergyRange(_)));
+
+        let err = cfg
+            .clone()
+            .with_fit_energy_range(Some((5.0, f64::INFINITY)))
+            .unwrap_err();
+        assert!(matches!(err, FitConfigError::InvalidFitEnergyRange(_)));
     }
 
     /// LM fit with `fit_energy_range = Some((min, max))` on the full
@@ -3936,7 +4021,8 @@ mod tests {
         )
         .unwrap()
         .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
-        .with_fit_energy_range(Some((4.0, 8.0)));
+        .with_fit_energy_range(Some((4.0, 8.0)))
+        .unwrap();
 
         let input = InputData::Transmission {
             transmission: t,
@@ -3953,6 +4039,46 @@ mod tests {
             rel_err < 0.01,
             "fit_energy_range LM density {d_masked} should match full-grid {d_full} \
              within 1% (got rel_err = {rel_err})"
+        );
+    }
+
+    /// Transmission + PoissonKL with `fit_energy_range` set must be
+    /// hard-rejected at dispatch.  The legacy `poisson_fit` does not
+    /// honour the active-bin mask, so silently fitting on the
+    /// (margin-extended) grid would bias the result.  Joint-Poisson
+    /// (counts) and LM transmission both honour the mask correctly.
+    /// Regression for Round-2 review fix #1 (#514).
+    #[test]
+    fn test_fit_energy_range_rejected_on_transmission_poisson_path() {
+        let data = u238_single_resonance();
+        let true_density = 0.002;
+        let energies: Vec<f64> = (0..201).map(|i| 0.5 + (i as f64) * 0.05).collect();
+        let (t, sigma) = synthetic_transmission(&data, true_density, &energies);
+
+        let cfg = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
+        .with_fit_energy_range(Some((4.0, 8.0)))
+        .unwrap();
+
+        let input = InputData::Transmission {
+            transmission: t,
+            uncertainty: sigma,
+        };
+        let err = fit_spectrum_typed(&input, &cfg).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("fit_energy_range")
+                && (msg.contains("Poisson") || msg.contains("poisson")),
+            "expected rejection message mentioning fit_energy_range and the \
+             Poisson-KL path; got: {msg}"
         );
     }
 }
