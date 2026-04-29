@@ -114,6 +114,11 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
                                 EndfLibrary::Tendl2023,
                                 "TENDL-2023",
                             );
+                            ui.selectable_value(
+                                &mut state.endf_library,
+                                EndfLibrary::Cendl3_2,
+                                "CENDL-3.2",
+                            );
                         });
                 });
             });

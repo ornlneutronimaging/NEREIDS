@@ -348,6 +348,7 @@ pub fn periodic_table_modal(ctx: &egui::Context, state: &mut AppState) {
                                             (EndfLibrary::Jeff3_3, "JEFF-3.3"),
                                             (EndfLibrary::Jendl5, "JENDL-5"),
                                             (EndfLibrary::Tendl2023, "TENDL-2023"),
+                                            (EndfLibrary::Cendl3_2, "CENDL-3.2"),
                                         ] {
                                             ui.selectable_value(lib, val, label);
                                         }
@@ -534,6 +535,7 @@ pub fn periodic_table_modal(ctx: &egui::Context, state: &mut AppState) {
                                         (EndfLibrary::Jeff3_3, "JEFF-3.3"),
                                         (EndfLibrary::Jendl5, "JENDL-5"),
                                         (EndfLibrary::Tendl2023, "TENDL-2023"),
+                                        (EndfLibrary::Cendl3_2, "CENDL-3.2"),
                                     ] {
                                         ui.selectable_value(lib, val, label);
                                     }

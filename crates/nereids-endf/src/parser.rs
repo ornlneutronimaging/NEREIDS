@@ -2031,6 +2031,40 @@ mod tests {
         );
     }
 
+    /// Round-trip download + parse for CENDL-3.2 Ba-138 (research target #515).
+    ///
+    /// Run with: cargo test -p nereids-endf -- --ignored test_parse_ba138_cendl
+    ///
+    /// Validates that CENDL-3.2 retrieval, MAT lookup, ZIP extraction, and ENDF
+    /// parsing all work end-to-end against IAEA. Ba-138 was chosen because it's
+    /// the primary scintillator-relevant target in #515 and CENDL-3.2 is the
+    /// library this PR adds.
+    ///
+    /// **Network caveat**: 403s on commercial-VPN exit IPs (Cloudflare). Run
+    /// off-VPN.
+    #[test]
+    #[ignore = "requires network: downloads Ba-138 ENDF from IAEA (CENDL-3.2)"]
+    fn test_parse_ba138_cendl() {
+        use crate::retrieval::{EndfLibrary, EndfRetriever, mat_number};
+        use nereids_core::types::Isotope;
+
+        let retriever = EndfRetriever::new();
+        let isotope = Isotope::new(56, 138).unwrap();
+        let mat = mat_number(&isotope, EndfLibrary::Cendl3_2)
+            .expect("Ba-138 must be in CENDL-3.2 MAT table");
+        assert_eq!(mat, 5649, "Ba-138 MAT in CENDL-3.2 (matches ENDF/B-VIII.0)");
+
+        let (_, text) = retriever
+            .get_endf_file(&isotope, EndfLibrary::Cendl3_2, mat)
+            .expect("Failed to download Ba-138 CENDL-3.2 (off-VPN required)");
+
+        let data = parse_endf_file2(&text).expect("Failed to parse Ba-138 CENDL-3.2 ENDF");
+        assert!(
+            !data.ranges.is_empty(),
+            "Ba-138 should have at least one resonance range"
+        );
+    }
+
     /// Parse a minimal hand-crafted ENDF snippet with NRO=1 (energy-dependent
     /// scattering radius).
     ///
