@@ -578,10 +578,20 @@ pub fn periodic_table_modal(ctx: &egui::Context, state: &mut AppState) {
                             PeriodicTableTarget::DetectMatrix
                             | PeriodicTableTarget::DetectTrace => state.is_fetching_detect_endf,
                         };
+                        // Snapshot the library before the combobox so we can detect
+                        // a user-driven library change and prune already-selected
+                        // isotopes that aren't in the new library's coverage.
+                        // Without this, selecting Br-79 under ENDF/B then switching
+                        // this dropdown to CENDL-3.2 would still queue Br-79 (which
+                        // CENDL doesn't cover) on click of Add Selected.
+                        let prev_lib = *state
+                            .periodic_table_library
+                            .get_or_insert(target_library(state));
                         ui.add_enabled_ui(!fetching, |ui| {
                             let lib = state
                                 .periodic_table_library
-                                .get_or_insert(target_library(state));
+                                .as_mut()
+                                .expect("initialized via get_or_insert above");
                             egui::ComboBox::from_id_salt("pt_lib")
                                 .selected_text(super::design::library_name(*lib))
                                 .show_ui(ui, |ui| {
@@ -597,6 +607,24 @@ pub fn periodic_table_modal(ctx: &egui::Context, state: &mut AppState) {
                                     }
                                 });
                         });
+                        let new_lib = state
+                            .periodic_table_library
+                            .expect("initialized via get_or_insert above");
+                        if new_lib != prev_lib {
+                            let before = state.periodic_table_selected_isotopes.len();
+                            state.periodic_table_selected_isotopes.retain(|&(z, a)| {
+                                retrieval::has_endf_evaluation_for(z, a, new_lib)
+                            });
+                            let dropped = before - state.periodic_table_selected_isotopes.len();
+                            if dropped > 0 {
+                                let lib_label = super::design::library_name(new_lib);
+                                state.status_message = format!(
+                                    "Dropped {} isotope{} not in {lib_label}",
+                                    dropped,
+                                    if dropped == 1 { "" } else { "s" },
+                                );
+                            }
+                        }
 
                         let n_sel = state.periodic_table_selected_isotopes.len();
                         if ui
@@ -646,7 +674,21 @@ fn close_modal(state: &mut AppState) {
 /// Closes the modal afterwards.
 fn add_selected_isotopes(state: &mut AppState) {
     let density = state.periodic_table_density;
-    let selected = state.periodic_table_selected_isotopes.clone();
+    // Defense-in-depth: filter the selected set against the target library's
+    // coverage so a stale selection (e.g. Br-79 carried over from ENDF/B-VIII.0
+    // before the user switched to CENDL-3.2) can't reach the fetch queue.  The
+    // PT-library combobox prunes on change, but we re-check here in case any
+    // future caller mutates `periodic_table_selected_isotopes` after the user's
+    // last library interaction.
+    let lib = state
+        .periodic_table_library
+        .unwrap_or_else(|| target_library(state));
+    let selected: Vec<(u32, u32)> = state
+        .periodic_table_selected_isotopes
+        .iter()
+        .copied()
+        .filter(|&(z, a)| retrieval::has_endf_evaluation_for(z, a, lib))
+        .collect();
 
     // Propagate PT library choice to the target's library field.
     // If the user selected a different library, existing resonance data
