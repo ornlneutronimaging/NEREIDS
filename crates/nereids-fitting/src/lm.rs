@@ -184,12 +184,23 @@ impl<M: FitModel + ?Sized> FitModel for &M {
 }
 
 /// Compute weighted chi-squared: Σ [(y_obs - y_model)² / σ²].
-fn chi_squared(residuals: &[f64], weights: &[f64]) -> f64 {
-    residuals
-        .iter()
-        .zip(weights.iter())
-        .map(|(&r, &w)| r * r * w)
-        .sum()
+///
+/// When `active_mask` is `Some(m)`, bins where `m[i]` is `false` are
+/// **skipped entirely** rather than zero-weighted.  Explicit row-skip
+/// matters when masked bins may contain non-finite residuals (e.g. NaN
+/// outside the user's fit-energy range): `0.0 * NaN = NaN`, so a
+/// zero-weight strategy would propagate NaN through the χ² accumulator
+/// even though the bin contributes no information.  See SAMMY REGION
+/// semantics (#514) and lm.rs Fix 4.
+fn chi_squared(residuals: &[f64], weights: &[f64], active_mask: Option<&[bool]>) -> f64 {
+    let mut sum = 0.0;
+    for (i, (&r, &w)) in residuals.iter().zip(weights.iter()).enumerate() {
+        if active_mask.is_some_and(|m| !m[i]) {
+            continue;
+        }
+        sum += r * r * w;
+    }
+    sum
 }
 
 /// Infinity norm of the gradient, scaled by local curvature and residual size.
@@ -455,6 +466,31 @@ pub fn levenberg_marquardt(
     params: &mut ParameterSet,
     config: &LmConfig,
 ) -> Result<LmResult, FittingError> {
+    levenberg_marquardt_with_mask(model, y_obs, sigma, params, config, None)
+}
+
+/// Run the Levenberg-Marquardt optimizer with an optional per-bin
+/// active mask (SAMMY REGION-equivalent fit-energy-range restriction).
+///
+/// When `active_mask` is `Some(m)`:
+/// - bins where `m[i]` is `false` are excluded from χ² and the normal
+///   equations (weight zeroed before assembly), so they contribute
+///   nothing to the gradient or Hessian;
+/// - the model is still evaluated on the full grid so resolution
+///   broadening at the boundaries of the active region is correct;
+/// - `dof = n_active − n_free` where `n_active` is the count of
+///   active bins.
+///
+/// When `active_mask` is `None`, behaviour is identical to
+/// [`levenberg_marquardt`] (all bins active).
+pub fn levenberg_marquardt_with_mask(
+    model: &dyn FitModel,
+    y_obs: &[f64],
+    sigma: &[f64],
+    params: &mut ParameterSet,
+    config: &LmConfig,
+    active_mask: Option<&[bool]>,
+) -> Result<LmResult, FittingError> {
     let n_data = y_obs.len();
     if n_data == 0 {
         return Err(FittingError::EmptyData);
@@ -466,6 +502,36 @@ pub fn levenberg_marquardt(
             field: "sigma",
         });
     }
+    if let Some(m) = active_mask
+        && m.len() != n_data
+    {
+        return Err(FittingError::LengthMismatch {
+            expected: n_data,
+            actual: m.len(),
+            field: "active_mask",
+        });
+    }
+    let n_active = crate::active_mask::active_count(active_mask, n_data);
+
+    // SAMMY REGION-equivalent fit-energy-range (#514): a mask with
+    // zero active bins means the user's `[E_min, E_max]` does not
+    // overlap the energy grid.  No data contributes to the cost
+    // function — return non-converged with NaN χ² rather than
+    // falling through to the all-fixed fast-return path (which would
+    // report `converged: true, chi_squared: 0` from a zero-row sum)
+    // or to the main optimisation loop (where `n_active < n_free`
+    // would catch it but only after wasted setup work).
+    if n_active == 0 {
+        return Ok(LmResult {
+            chi_squared: f64::NAN,
+            reduced_chi_squared: f64::NAN,
+            iterations: 0,
+            converged: false,
+            params: params.all_values(),
+            covariance: None,
+            uncertainties: None,
+        });
+    }
 
     let n_free = params.n_free();
 
@@ -475,7 +541,13 @@ pub fn levenberg_marquardt(
     if n_free == 0 {
         let weights: Vec<f64> = sigma
             .iter()
-            .map(|&s| {
+            .enumerate()
+            .map(|(i, &s)| {
+                // Active-bin masking (SAMMY REGION): bins outside the
+                // user range contribute zero to χ².
+                if active_mask.is_some_and(|m| !m[i]) {
+                    return 0.0;
+                }
                 if !s.is_finite() || s <= 0.0 {
                     1.0 / 1e30
                 } else {
@@ -489,7 +561,16 @@ pub fn levenberg_marquardt(
         // return converged=false rather than silently propagating NaN chi².
         // Covariance/uncertainties are None because the fit did not converge —
         // an unconverged result has no meaningful covariance to report.
-        if !y_model.iter().all(|v| v.is_finite()) {
+        //
+        // SAMMY REGION-equivalent fit-energy-range (#514): masked rows are
+        // skipped throughout the cost / normal-equation accumulators, so a
+        // non-finite model output at a masked bin should not abort the fit
+        // — only check finiteness on active rows.
+        let model_has_active_nonfinite = y_model
+            .iter()
+            .enumerate()
+            .any(|(i, v)| active_mask.is_none_or(|m| m[i]) && !v.is_finite());
+        if model_has_active_nonfinite {
             return Ok(LmResult {
                 chi_squared: f64::NAN,
                 reduced_chi_squared: f64::NAN,
@@ -506,13 +587,13 @@ pub fn levenberg_marquardt(
             .zip(y_model.iter())
             .map(|(&obs, &mdl)| obs - mdl)
             .collect();
-        let chi2 = chi_squared(&residuals, &weights);
-        // #125.5: Compute dof via `n_data - n_free` (even though n_free == 0 here)
-        // to mirror the main path and keep a single visible formula.
-        let dof = n_data - n_free;
-        // Note: Given n_free == 0 and the earlier assert that n_data > 0,
-        // dof is always > 0 here; the guard below is a defensive check
-        // kept for consistency with the main path.
+        let chi2 = chi_squared(&residuals, &weights, active_mask);
+        // #125.5: Compute dof via `n_active - n_free` (with `n_active = n_data`
+        // when no mask is set) to mirror the main path and keep a single
+        // visible formula.  When a fit-energy-range mask is in effect,
+        // `n_active` reflects the count of bins that actually contributed
+        // to χ² (SAMMY REGION semantics).
+        let dof = n_active.saturating_sub(n_free);
         let reduced = if dof > 0 { chi2 / dof as f64 } else { f64::NAN };
         return Ok(LmResult {
             chi_squared: chi2,
@@ -525,12 +606,16 @@ pub fn levenberg_marquardt(
         });
     }
 
-    // #108.3: Underdetermined systems — when n_data < n_free, the problem is
+    // #108.3: Underdetermined systems — when n_active < n_free, the problem is
     // underdetermined and the Jacobian cannot be full rank.  Return early
     // with converged=false so callers can detect the problem.
-    // n_data == n_free is exactly determined (dof=0) and still solvable;
+    // n_active == n_free is exactly determined (dof=0) and still solvable;
     // we allow it and report reduced_chi_squared = NaN (0/0).
-    if n_data < n_free {
+    //
+    // When a fit-energy-range mask is in effect, the underdetermined
+    // check uses the active-bin count (SAMMY REGION semantics) — masked
+    // bins do not contribute information to the fit.
+    if n_active < n_free {
         return Ok(LmResult {
             chi_squared: f64::NAN,
             reduced_chi_squared: f64::NAN,
@@ -541,15 +626,25 @@ pub fn levenberg_marquardt(
             uncertainties: None,
         });
     }
-    let dof = n_data - n_free;
+    let dof = n_active - n_free;
 
     // #104: Validate sigma — division by zero or non-finite sigma would produce
     // NaN/Inf weights and silently corrupt the entire fit.  Clamp to a small
     // floor instead of rejecting outright, so callers with a few zero-sigma
     // bins still get a usable fit.
+    //
+    // Active-bin masking (SAMMY REGION): bins outside the user range
+    // get weight 0 here, which propagates through χ² and the JᵀWJ /
+    // JᵀWr normal-equation assembly to contribute exactly zero —
+    // covering both residual and gradient masking with no further
+    // changes downstream.
     let weights: Vec<f64> = sigma
         .iter()
-        .map(|&s| {
+        .enumerate()
+        .map(|(i, &s)| {
+            if active_mask.is_some_and(|m| !m[i]) {
+                return 0.0;
+            }
             if !s.is_finite() || s <= 0.0 {
                 // Treat as negligible weight (huge sigma) rather than panicking.
                 1.0 / 1e30
@@ -579,7 +674,7 @@ pub fn levenberg_marquardt(
         .zip(y_current.iter())
         .map(|(&obs, &mdl)| obs - mdl)
         .collect();
-    let mut chi2 = chi_squared(&residuals, &weights);
+    let mut chi2 = chi_squared(&residuals, &weights, active_mask);
 
     let mut lambda = config.lambda_init;
     let mut converged = false;
@@ -600,11 +695,20 @@ pub fn levenberg_marquardt(
             &mut free_idx_buf,
         )?;
 
-        // Build normal equations: JᵀWJ and JᵀWr
+        // Build normal equations: JᵀWJ and JᵀWr.
+        //
+        // Active-bin masking (SAMMY REGION, #514): explicitly skip
+        // masked rows rather than relying on weights[i] == 0 — the
+        // model or the residual at a masked margin bin may be NaN
+        // (e.g. when y_obs is NaN outside the user's fit-energy range),
+        // and `0.0 * NaN = NaN` would poison both accumulators.
         let mut jtw_j = FlatMatrix::zeros(n_free, n_free);
         let mut jtw_r = vec![0.0; n_free];
 
         for (i, (&wi, &ri)) in weights.iter().zip(residuals.iter()).enumerate() {
+            if active_mask.is_some_and(|m| !m[i]) {
+                continue;
+            }
             for (j, jtw_r_j) in jtw_r.iter_mut().enumerate() {
                 let jij = jacobian.get(i, j);
                 *jtw_r_j += jij * wi * ri;
@@ -653,9 +757,16 @@ pub fn levenberg_marquardt(
             }
         };
 
-        // #113: If the model produced NaN/Inf, treat as a bad step (same as
-        // chi2 increase) — increase lambda and try again.
-        if y_trial.iter().any(|v| !v.is_finite()) {
+        // #113: If the model produced NaN/Inf at any *active* bin, treat as
+        // a bad step (same as chi2 increase) — increase lambda and try again.
+        // SAMMY REGION-equivalent fit-energy-range (#514): masked rows are
+        // skipped from χ² / JᵀWJ / JᵀWr / covariance, so a non-finite model
+        // output at a masked margin bin must not penalise the trial step.
+        let trial_has_active_nonfinite = y_trial
+            .iter()
+            .enumerate()
+            .any(|(i, v)| active_mask.is_none_or(|m| m[i]) && !v.is_finite());
+        if trial_has_active_nonfinite {
             params.set_free_values(&free_vals_buf);
             lambda *= config.lambda_up;
             if lambda > LAMBDA_BREAKOUT {
@@ -670,7 +781,7 @@ pub fn levenberg_marquardt(
             .zip(y_trial.iter())
             .map(|(&obs, &mdl)| obs - mdl)
             .collect();
-        let trial_chi2 = chi_squared(&trial_residuals, &weights);
+        let trial_chi2 = chi_squared(&trial_residuals, &weights, active_mask);
         let chi2_delta = (trial_chi2 - chi2).abs();
         let chi2_scale = chi2.abs().max(trial_chi2.abs()).max(1.0);
         let chi2_stagnated = chi2_delta <= config.tol_chi2 * chi2_scale;
@@ -743,8 +854,14 @@ pub fn levenberg_marquardt(
             &mut all_vals_buf,
             &mut free_idx_buf,
         )?;
+        // Same active-mask row-skip semantics as the main assembly
+        // loop above — keeps the covariance free of NaN contributions
+        // from masked margin bins (#514).
         let mut jtw_j = FlatMatrix::zeros(n_free, n_free);
         for (i, &wi) in weights.iter().enumerate() {
+            if active_mask.is_some_and(|m| !m[i]) {
+                continue;
+            }
             for j in 0..n_free {
                 let jij = jacobian.get(i, j);
                 for k in 0..n_free {
@@ -1382,5 +1499,297 @@ mod tests {
             result.params[1],
             y_at_4,
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Active-bin mask (SAMMY REGION-equivalent fit-energy-range, #514).
+    // ------------------------------------------------------------------
+
+    /// LM with an `active_mask` that restricts to a subset of bins must
+    /// produce a fit equivalent to running on that subset directly —
+    /// validates that masking propagates through both the residual /
+    /// χ² accumulation AND the dof / reduced-χ² book-keeping.
+    #[test]
+    fn test_lm_active_mask_subset_equivalence() {
+        // Linear fit y = 2x + 3 on x = 0..10.  Mask = bins 0..5 only.
+        let x_full: Vec<f64> = (0..10).map(|i| i as f64).collect();
+        let y_full: Vec<f64> = x_full.iter().map(|&xi| 2.0 * xi + 3.0).collect();
+        let sigma_full = vec![1.0; 10];
+        let mask = vec![
+            true, true, true, true, true, false, false, false, false, false,
+        ];
+
+        let model = LinearModel { x: x_full.clone() };
+        let mut params = ParameterSet::new(vec![
+            FitParameter::unbounded("a", 1.0),
+            FitParameter::unbounded("b", 1.0),
+        ]);
+        let result_masked = levenberg_marquardt_with_mask(
+            &model,
+            &y_full,
+            &sigma_full,
+            &mut params,
+            &LmConfig::default(),
+            Some(&mask),
+        )
+        .unwrap();
+        assert!(result_masked.converged);
+        assert!((result_masked.params[0] - 2.0).abs() < 1e-6);
+        assert!((result_masked.params[1] - 3.0).abs() < 1e-6);
+
+        // Reference: same fit on the subset directly (no mask).
+        let x_sub = x_full[..5].to_vec();
+        let y_sub = y_full[..5].to_vec();
+        let sigma_sub = vec![1.0; 5];
+        let model_sub = LinearModel { x: x_sub };
+        let mut params_sub = ParameterSet::new(vec![
+            FitParameter::unbounded("a", 1.0),
+            FitParameter::unbounded("b", 1.0),
+        ]);
+        let result_sub = levenberg_marquardt(
+            &model_sub,
+            &y_sub,
+            &sigma_sub,
+            &mut params_sub,
+            &LmConfig::default(),
+        )
+        .unwrap();
+
+        // Recovered parameters and reduced-χ² (both fits noiseless,
+        // so reduced-χ² ≈ 0 in either case) must match.
+        for j in 0..2 {
+            assert!(
+                (result_masked.params[j] - result_sub.params[j]).abs() < 1e-6,
+                "param {j}: masked={} subset={}",
+                result_masked.params[j],
+                result_sub.params[j]
+            );
+        }
+        assert!(
+            (result_masked.reduced_chi_squared - result_sub.reduced_chi_squared).abs() < 1e-6,
+            "reduced-χ²: masked={} subset={}",
+            result_masked.reduced_chi_squared,
+            result_sub.reduced_chi_squared
+        );
+    }
+
+    /// Without the mask, residuals from the out-of-range half of the
+    /// grid would dominate χ² and pull the fit way off — the masked
+    /// fit must NOT be biased by them.
+    #[test]
+    fn test_lm_active_mask_excludes_out_of_range_residuals() {
+        // y = 2x + 3 inside the masked range; corrupt outliers outside.
+        let x: Vec<f64> = (0..10).map(|i| i as f64).collect();
+        let mut y: Vec<f64> = x.iter().map(|&xi| 2.0 * xi + 3.0).collect();
+        for yi in y.iter_mut().skip(5) {
+            *yi += 1000.0; // huge corruption outside the active mask
+        }
+        let sigma = vec![1.0; 10];
+        let mask = vec![true; 5]
+            .into_iter()
+            .chain(std::iter::repeat_n(false, 5))
+            .collect::<Vec<bool>>();
+
+        let model = LinearModel { x };
+        let mut params = ParameterSet::new(vec![
+            FitParameter::unbounded("a", 1.0),
+            FitParameter::unbounded("b", 1.0),
+        ]);
+        let result = levenberg_marquardt_with_mask(
+            &model,
+            &y,
+            &sigma,
+            &mut params,
+            &LmConfig::default(),
+            Some(&mask),
+        )
+        .unwrap();
+        assert!(result.converged);
+        assert!(
+            (result.params[0] - 2.0).abs() < 1e-6,
+            "slope should be 2.0 (corrupt outliers must be masked out), got {}",
+            result.params[0]
+        );
+        assert!(
+            (result.params[1] - 3.0).abs() < 1e-6,
+            "intercept should be 3.0 (corrupt outliers must be masked out), got {}",
+            result.params[1]
+        );
+    }
+
+    /// Out-of-mask `y_obs` containing `NaN` must not poison χ² /
+    /// JᵀWJ / JᵀWr.  Without explicit row-skip in the accumulator
+    /// loops, `0.0 (weight) * NaN (residual) = NaN` would propagate
+    /// through the fit despite the masked weight being zero.
+    /// Regression for Round-2 review fix #4.
+    #[test]
+    fn test_lm_active_mask_tolerates_nan_outside_range() {
+        // y = 2x + 3 inside the active mask; NaN outside.  A naive
+        // zero-weight implementation would return NaN χ² and fail to
+        // converge; the row-skip path should fit cleanly.
+        let x: Vec<f64> = (0..10).map(|i| i as f64).collect();
+        let mut y: Vec<f64> = x.iter().map(|&xi| 2.0 * xi + 3.0).collect();
+        for yi in y.iter_mut().skip(5) {
+            *yi = f64::NAN;
+        }
+        let sigma = vec![1.0; 10];
+        let mask = vec![true; 5]
+            .into_iter()
+            .chain(std::iter::repeat_n(false, 5))
+            .collect::<Vec<bool>>();
+
+        let model = LinearModel { x };
+        let mut params = ParameterSet::new(vec![
+            FitParameter::unbounded("a", 1.0),
+            FitParameter::unbounded("b", 1.0),
+        ]);
+        let result = levenberg_marquardt_with_mask(
+            &model,
+            &y,
+            &sigma,
+            &mut params,
+            &LmConfig::default(),
+            Some(&mask),
+        )
+        .unwrap();
+
+        assert!(
+            result.converged,
+            "fit should converge despite NaN outside the active mask"
+        );
+        assert!(
+            result.chi_squared.is_finite(),
+            "χ² should be finite (NaN poisoning prevented), got {}",
+            result.chi_squared
+        );
+        assert!(
+            (result.params[0] - 2.0).abs() < 1e-6,
+            "slope should be 2.0, got {}",
+            result.params[0]
+        );
+        assert!(
+            (result.params[1] - 3.0).abs() < 1e-6,
+            "intercept should be 3.0, got {}",
+            result.params[1]
+        );
+    }
+
+    /// Regression for Round-2-pass-2 review: the global finite checks
+    /// on `y_model` / `y_trial` must skip masked bins.  A model that
+    /// returns NaN only at masked margin bins should not abort the fit
+    /// or get its trial step rejected.
+    #[test]
+    fn test_lm_active_mask_tolerates_model_nan_outside_range() {
+        // Linear model that injects NaN into masked bins.  The fit
+        // should still converge cleanly — the contract is that masked
+        // rows are completely irrelevant to the fit.
+        struct LinearModelWithMaskedNaN {
+            x: Vec<f64>,
+            mask: Vec<bool>,
+        }
+        impl FitModel for LinearModelWithMaskedNaN {
+            fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+                let a = params[0];
+                let b = params[1];
+                Ok(self
+                    .x
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &x)| if self.mask[i] { a * x + b } else { f64::NAN })
+                    .collect())
+            }
+        }
+
+        let x: Vec<f64> = (0..10).map(|i| i as f64).collect();
+        let y: Vec<f64> = x.iter().map(|&xi| 2.0 * xi + 3.0).collect();
+        let sigma = vec![1.0; 10];
+        let mask: Vec<bool> = vec![true; 5]
+            .into_iter()
+            .chain(std::iter::repeat_n(false, 5))
+            .collect();
+
+        let model = LinearModelWithMaskedNaN {
+            x: x.clone(),
+            mask: mask.clone(),
+        };
+        let mut params = ParameterSet::new(vec![
+            FitParameter::unbounded("a", 1.0),
+            FitParameter::unbounded("b", 1.0),
+        ]);
+        let result = levenberg_marquardt_with_mask(
+            &model,
+            &y,
+            &sigma,
+            &mut params,
+            &LmConfig::default(),
+            Some(&mask),
+        )
+        .unwrap();
+
+        assert!(
+            result.converged,
+            "fit should converge despite model NaN at masked bins"
+        );
+        assert!(result.chi_squared.is_finite());
+        assert!((result.params[0] - 2.0).abs() < 1e-6);
+        assert!((result.params[1] - 3.0).abs() < 1e-6);
+    }
+
+    /// A zero-active mask (the user's range misses the grid entirely)
+    /// must return non-converged regardless of whether parameters are
+    /// free or fixed.  Pre-fix the all-fixed fast-return path would
+    /// report `converged: true, chi_squared: 0` from a sum over zero
+    /// rows — a deceptive "success" with no data behind it.
+    #[test]
+    fn test_lm_active_mask_all_false_returns_non_converged() {
+        let x: Vec<f64> = (0..5).map(|i| i as f64).collect();
+        let y: Vec<f64> = x.iter().map(|&xi| 2.0 * xi + 3.0).collect();
+        let sigma = vec![1.0; 5];
+        let mask = vec![false; 5];
+        let model = LinearModel { x: x.clone() };
+
+        // (a) All parameters free.
+        let mut params_free = ParameterSet::new(vec![
+            FitParameter::unbounded("a", 1.0),
+            FitParameter::unbounded("b", 1.0),
+        ]);
+        let r_free = levenberg_marquardt_with_mask(
+            &model,
+            &y,
+            &sigma,
+            &mut params_free,
+            &LmConfig::default(),
+            Some(&mask),
+        )
+        .unwrap();
+        assert!(
+            !r_free.converged,
+            "n_free > 0 + zero-active mask must NOT report converged"
+        );
+        assert!(r_free.chi_squared.is_nan());
+        assert!(r_free.reduced_chi_squared.is_nan());
+
+        // (b) All parameters fixed → n_free == 0 (the path #517 R3
+        //     specifically failed before the n_active==0 early-return).
+        let mut params_fixed = ParameterSet::new(vec![
+            FitParameter::fixed("a", 1.0),
+            FitParameter::fixed("b", 0.0),
+        ]);
+        let r_fixed = levenberg_marquardt_with_mask(
+            &model,
+            &y,
+            &sigma,
+            &mut params_fixed,
+            &LmConfig::default(),
+            Some(&mask),
+        )
+        .unwrap();
+        assert!(
+            !r_fixed.converged,
+            "n_free == 0 + zero-active mask must NOT report converged \
+             (sum over zero rows would be 0, masquerading as a perfect fit)"
+        );
+        assert!(r_fixed.chi_squared.is_nan());
+        assert!(r_fixed.reduced_chi_squared.is_nan());
     }
 }

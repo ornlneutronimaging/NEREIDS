@@ -344,6 +344,22 @@ pub struct UnifiedFitConfig {
     /// `Some(_)` bypasses both the env var and the default.
     tzero_jacobian_method: Option<nereids_fitting::transmission_model::EnergyScaleJacobianMethod>,
 
+    // ── Fit energy range restriction (SAMMY REGION equivalent) ──
+    /// User-specified fit-energy-range restriction.  When `Some((min,
+    /// max))`, the configured `energies` grid is expected to extend
+    /// beyond `[min, max]` by a kernel-margin (~5×FWHM); the GUI / pre-
+    /// processing layer slices the input data to that extended grid
+    /// before constructing this config.  The solver cost functions
+    /// (LM transmission and joint-Poisson PBD) mask residuals outside
+    /// `[min, max]` to zero so resonance contributions just inside the
+    /// boundaries are correctly broadened.
+    ///
+    /// `None` (default) = full grid, no masking.  Reduced χ² / dof
+    /// counts are computed against the active bin count when masking
+    /// is in effect.  See SAMMY user manual §IIID.6 ("REGION") and the
+    /// `MIN ENERGY` / `MAX ENERGY` SAM52 cards.
+    fit_energy_range: Option<(f64, f64)>,
+
     // ── Isotope group mapping (optional) ──
     /// Maps member isotope index → density parameter index.
     /// `None` = identity mapping (one param per isotope, backward compat).
@@ -416,6 +432,7 @@ impl UnifiedFitConfig {
             density_ratios: None,
             n_density_params: None,
             tzero_jacobian_method: None,
+            fit_energy_range: None,
         })
     }
 
@@ -470,6 +487,38 @@ impl UnifiedFitConfig {
         self.l_scale_init = l_scale_init;
         self.flight_path_m = flight_path_m;
         self
+    }
+
+    /// Restrict the fit cost function to bins inside `[min_eV, max_eV]`
+    /// (SAMMY REGION equivalent).  The configured `energies` grid is
+    /// expected to extend by ~5×FWHM beyond `[min, max]` on each side
+    /// (the GUI / pre-processing layer handles this); the LM and
+    /// joint-Poisson cost paths mask residuals outside `[min, max]` to
+    /// zero so resonance broadening at the boundaries is correct.
+    /// `None` (default) = full grid, no masking.
+    ///
+    /// Validates the range up-front so non-finite or reversed bounds
+    /// (which would silently produce an empty active-bin mask and a
+    /// deceptive fit) are rejected at config-build time rather than
+    /// surfacing as a downstream solver error.
+    pub fn with_fit_energy_range(
+        mut self,
+        range: Option<(f64, f64)>,
+    ) -> Result<Self, FitConfigError> {
+        if let Some((lo, hi)) = range {
+            if !lo.is_finite() || !hi.is_finite() {
+                return Err(FitConfigError::InvalidFitEnergyRange(
+                    "fit_energy_range bounds must be finite",
+                ));
+            }
+            if lo >= hi {
+                return Err(FitConfigError::InvalidFitEnergyRange(
+                    "fit_energy_range min must be strictly less than max",
+                ));
+            }
+        }
+        self.fit_energy_range = range;
+        Ok(self)
     }
 
     #[must_use]
@@ -702,6 +751,12 @@ impl UnifiedFitConfig {
     /// (see [`Self::with_energy_scale`]).
     pub fn fit_energy_scale(&self) -> bool {
         self.fit_energy_scale
+    }
+    /// User-specified fit-energy-range restriction (SAMMY REGION
+    /// equivalent), or `None` for full-grid fitting.
+    /// See [`Self::with_fit_energy_range`].
+    pub fn fit_energy_range(&self) -> Option<(f64, f64)> {
+        self.fit_energy_range
     }
     pub fn precomputed_cross_sections(&self) -> Option<&Arc<Vec<Vec<f64>>>> {
         self.precomputed_cross_sections.as_ref()
@@ -1066,6 +1121,34 @@ fn fit_transmission_lm(
         build_transmission_model(config, n_density_params, _temperature_index)?
     };
 
+    // Build the per-bin active mask (SAMMY REGION-equivalent fit-energy
+    // -range restriction).  `None` when no range is configured — the
+    // LM core treats that as "all bins active".
+    let active_mask = nereids_fitting::active_mask::build_active_mask(
+        config.energies(),
+        config.fit_energy_range(),
+    );
+
+    // When a fit-energy-range is configured, reject the call early if
+    // the user's `[E_min, E_max]` selects fewer than 2 active bins on
+    // the configured grid.  The LM core's `n_active < n_free` check
+    // would also catch this on the main path, but a dispatcher-level
+    // rejection gives the user a clear "range too narrow" error
+    // instead of a confusing non-converged result.
+    if let Some((e_min, e_max)) = config.fit_energy_range() {
+        let n_active = nereids_fitting::active_mask::active_count(
+            active_mask.as_deref(),
+            config.energies().len(),
+        );
+        if n_active < 2 {
+            return Err(PipelineError::InvalidParameter(format!(
+                "fit_energy_range [{e_min}, {e_max}] eV selects {n_active} active bin(s) \
+                 on the configured energy grid; at least 2 active bins are required \
+                 for LM transmission fitting"
+            )));
+        }
+    }
+
     // Dispatch with optional background wrapping
     let result = if let Some(bi) = bg_indices {
         let wrapped = if let (Some(di), Some(fi)) = (bi.back_d, bi.back_f) {
@@ -1089,9 +1172,23 @@ fn fit_transmission_lm(
                 bi.back_c,
             )
         };
-        lm::levenberg_marquardt(&wrapped, measured_t, sigma, &mut params, &lm_cfg)?
+        lm::levenberg_marquardt_with_mask(
+            &wrapped,
+            measured_t,
+            sigma,
+            &mut params,
+            &lm_cfg,
+            active_mask.as_deref(),
+        )?
     } else {
-        lm::levenberg_marquardt(&*model, measured_t, sigma, &mut params, &lm_cfg)?
+        lm::levenberg_marquardt_with_mask(
+            &*model,
+            measured_t,
+            sigma,
+            &mut params,
+            &lm_cfg,
+            active_mask.as_deref(),
+        )?
     };
 
     let mut sr = extract_result(config, &result, n_density_params, bg_indices)?;
@@ -1117,6 +1214,22 @@ fn fit_transmission_poisson(
     config: &UnifiedFitConfig,
     poisson_cfg: &PoissonConfig,
 ) -> Result<SpectrumFitResult, PipelineError> {
+    // SAMMY REGION-equivalent fit-energy-range (#514): the legacy
+    // transmission-domain `poisson_fit` does not honour an active mask,
+    // so silently routing the data here when the user set a fit range
+    // would bias the fit by including out-of-range bins (margin region)
+    // in the cost function.  Hard-reject up-front rather than producing
+    // a misleading "successful" fit.  Joint-Poisson (counts) and LM
+    // transmission both honour the mask correctly.
+    if config.fit_energy_range().is_some() {
+        return Err(PipelineError::InvalidParameter(
+            "fit_energy_range is not supported for the transmission + \
+             Poisson-KL solver path. Use joint-Poisson (provide sample + \
+             open-beam counts) or switch to the LM transmission solver."
+                .into(),
+        ));
+    }
+
     let mut poisson_cfg = poisson_cfg.clone();
     poisson_cfg.compute_covariance = config.compute_covariance;
     let poisson_cfg = &poisson_cfg;
@@ -1420,6 +1533,34 @@ fn fit_counts_joint_poisson(
     // Its analytical Jacobian chains through the inner model correctly,
     // so JointPoissonObjective picks up gradients for both density and
     // background parameters without further wiring.
+
+    // Build the per-bin active mask (SAMMY REGION-equivalent fit-energy
+    // -range restriction).  `None` when no range is configured — the
+    // JP objective treats that as "all bins active".
+    let active_mask = nereids_fitting::active_mask::build_active_mask(
+        config.energies(),
+        config.fit_energy_range(),
+    );
+    let active_mask_slice = active_mask.as_deref();
+
+    // Reject early when the configured range selects fewer than 2
+    // active bins on the grid.  `joint_poisson_fit` already rejects
+    // the `n_active < n_free` case (and the new `n_active == 0`
+    // early-return), but a dispatcher-level rejection gives users a
+    // clear "range too narrow" error instead of a non-converged JP
+    // result.
+    if let Some((e_min, e_max)) = config.fit_energy_range() {
+        let n_active =
+            nereids_fitting::active_mask::active_count(active_mask_slice, config.energies().len());
+        if n_active < 2 {
+            return Err(PipelineError::InvalidParameter(format!(
+                "fit_energy_range [{e_min}, {e_max}] eV selects {n_active} active bin(s) \
+                 on the configured energy grid; at least 2 active bins are required \
+                 for joint-Poisson fitting"
+            )));
+        }
+    }
+
     let result;
     if let Some(bi) = bg_indices {
         let wrapped = NormalizedTransmissionModel::new(
@@ -1435,6 +1576,7 @@ fn fit_counts_joint_poisson(
             o: flux,
             s: sample_counts,
             c,
+            active_mask: active_mask_slice,
         };
         let mut cfg = jp_cfg.clone();
         cfg.compute_covariance = config.compute_covariance;
@@ -1447,6 +1589,7 @@ fn fit_counts_joint_poisson(
             o: flux,
             s: sample_counts,
             c,
+            active_mask: active_mask_slice,
         };
         let mut cfg = jp_cfg.clone();
         cfg.compute_covariance = config.compute_covariance;
@@ -2230,6 +2373,8 @@ pub enum FitConfigError {
     NonFiniteTemperature(f64),
     /// Temperature must be non-negative.
     NegativeTemperature(f64),
+    /// `fit_energy_range` bounds were non-finite or reversed/empty.
+    InvalidFitEnergyRange(&'static str),
 }
 
 impl fmt::Display for FitConfigError {
@@ -2271,6 +2416,9 @@ impl fmt::Display for FitConfigError {
             }
             Self::NegativeTemperature(v) => {
                 write!(f, "temperature must be non-negative, got {v}")
+            }
+            Self::InvalidFitEnergyRange(msg) => {
+                write!(f, "invalid fit_energy_range: {msg}")
             }
         }
     }
@@ -3799,6 +3947,243 @@ mod tests {
         assert!(
             err.to_string().contains("fit_back_d"),
             "expected partial-BackD/F rejection on transmission-PoissonKL path"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Fit-energy-range provenance + masked equivalence (#514).
+    // ------------------------------------------------------------------
+
+    /// `with_fit_energy_range(...)` round-trips through the accessor.
+    #[test]
+    fn test_unified_fit_config_fit_energy_range_round_trips() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..21).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let cfg = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap();
+        assert_eq!(cfg.fit_energy_range(), None);
+
+        let cfg = cfg.with_fit_energy_range(Some((5.0, 50.0))).unwrap();
+        assert_eq!(cfg.fit_energy_range(), Some((5.0, 50.0)));
+
+        // Setting back to None clears it.
+        let cfg = cfg.with_fit_energy_range(None).unwrap();
+        assert_eq!(cfg.fit_energy_range(), None);
+    }
+
+    /// `with_fit_energy_range` rejects non-finite or reversed bounds
+    /// rather than silently producing an empty active-bin mask
+    /// downstream.
+    #[test]
+    fn test_unified_fit_config_fit_energy_range_rejects_invalid() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..21).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let cfg = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap();
+
+        // Reversed range (lo > hi) is rejected.
+        let err = cfg
+            .clone()
+            .with_fit_energy_range(Some((10.0, 5.0)))
+            .unwrap_err();
+        assert!(matches!(err, FitConfigError::InvalidFitEnergyRange(_)));
+
+        // Empty range (lo == hi) is rejected — `lo < hi` strictly required.
+        let err = cfg
+            .clone()
+            .with_fit_energy_range(Some((5.0, 5.0)))
+            .unwrap_err();
+        assert!(matches!(err, FitConfigError::InvalidFitEnergyRange(_)));
+
+        // Non-finite bounds are rejected.
+        let err = cfg
+            .clone()
+            .with_fit_energy_range(Some((f64::NAN, 5.0)))
+            .unwrap_err();
+        assert!(matches!(err, FitConfigError::InvalidFitEnergyRange(_)));
+
+        let err = cfg
+            .clone()
+            .with_fit_energy_range(Some((5.0, f64::INFINITY)))
+            .unwrap_err();
+        assert!(matches!(err, FitConfigError::InvalidFitEnergyRange(_)));
+    }
+
+    /// LM fit with `fit_energy_range = Some((min, max))` on the full
+    /// grid must yield the same density as the same fit run on the
+    /// `[min, max]` slice directly when the residual outside the range
+    /// is negligible (SAMMY REGION semantics, paper-acceptance test).
+    #[test]
+    fn test_fit_energy_range_lm_matches_subset_when_outside_negligible() {
+        let data = u238_single_resonance();
+        let true_density = 0.002;
+        // Wide grid: 0.5..10.5 eV in 0.05 eV steps.  The U-238 single
+        // resonance sits well inside [4, 8] eV, so a fit restricted to
+        // that range should recover the same density as the full-grid
+        // fit (residual outside is negligible).
+        let energies: Vec<f64> = (0..201).map(|i| 0.5 + (i as f64) * 0.05).collect();
+        let (t, sigma) = synthetic_transmission(&data, true_density, &energies);
+
+        let cfg_full = UnifiedFitConfig::new(
+            energies.clone(),
+            vec![data.clone()],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()));
+
+        let cfg_masked = UnifiedFitConfig::new(
+            energies.clone(),
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
+        .with_fit_energy_range(Some((4.0, 8.0)))
+        .unwrap();
+
+        let input = InputData::Transmission {
+            transmission: t,
+            uncertainty: sigma,
+        };
+        let r_full = fit_spectrum_typed(&input, &cfg_full).unwrap();
+        let r_masked = fit_spectrum_typed(&input, &cfg_masked).unwrap();
+        assert!(r_full.converged && r_masked.converged);
+
+        let d_full = r_full.densities[0];
+        let d_masked = r_masked.densities[0];
+        let rel_err = (d_full - d_masked).abs() / d_full.abs();
+        assert!(
+            rel_err < 0.01,
+            "fit_energy_range LM density {d_masked} should match full-grid {d_full} \
+             within 1% (got rel_err = {rel_err})"
+        );
+    }
+
+    /// Transmission + PoissonKL with `fit_energy_range` set must be
+    /// hard-rejected at dispatch.  The legacy `poisson_fit` does not
+    /// honour the active-bin mask, so silently fitting on the
+    /// (margin-extended) grid would bias the result.  Joint-Poisson
+    /// (counts) and LM transmission both honour the mask correctly.
+    /// Regression for Round-2 review fix #1 (#514).
+    #[test]
+    fn test_fit_energy_range_rejected_on_transmission_poisson_path() {
+        let data = u238_single_resonance();
+        let true_density = 0.002;
+        let energies: Vec<f64> = (0..201).map(|i| 0.5 + (i as f64) * 0.05).collect();
+        let (t, sigma) = synthetic_transmission(&data, true_density, &energies);
+
+        let cfg = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
+        .with_fit_energy_range(Some((4.0, 8.0)))
+        .unwrap();
+
+        let input = InputData::Transmission {
+            transmission: t,
+            uncertainty: sigma,
+        };
+        let err = fit_spectrum_typed(&input, &cfg).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("fit_energy_range")
+                && (msg.contains("Poisson") || msg.contains("poisson")),
+            "expected rejection message mentioning fit_energy_range and the \
+             Poisson-KL path; got: {msg}"
+        );
+    }
+
+    /// LM dispatcher must reject `fit_energy_range` that selects fewer
+    /// than 2 active bins on the configured grid with a clear
+    /// "range too narrow" error — instead of a confusing non-converged
+    /// LM result.  Regression for #517 R3 P2 (Copilot finding #2).
+    #[test]
+    fn test_fit_energy_range_lm_rejects_too_narrow() {
+        let data = u238_single_resonance();
+        // 0.5..10.5 eV in 0.5 eV steps.  Range [4.6, 4.7] selects
+        // exactly zero bins (no grid point inside; closest are 4.5
+        // and 5.0).
+        let energies: Vec<f64> = (0..21).map(|i| 0.5 + (i as f64) * 0.5).collect();
+        let (t, sigma) = synthetic_transmission(&data, 0.002, &energies);
+        let cfg = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
+        .with_fit_energy_range(Some((4.6, 4.7)))
+        .unwrap();
+        let input = InputData::Transmission {
+            transmission: t,
+            uncertainty: sigma,
+        };
+        let err = fit_spectrum_typed(&input, &cfg).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("fit_energy_range") && msg.contains("active bin"),
+            "expected too-narrow-range rejection; got: {msg}"
+        );
+    }
+
+    /// Joint-Poisson dispatcher must reject too-narrow ranges with the
+    /// same clear error.  Regression for #517 R3 P2 (Copilot #3).
+    #[test]
+    fn test_fit_energy_range_jp_rejects_too_narrow() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..21).map(|i| 0.5 + (i as f64) * 0.5).collect();
+        let (sample, open_beam) = synthetic_counts(&data, 0.002, &energies, 1000.0);
+        let cfg = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
+        .with_fit_energy_range(Some((4.6, 4.7)))
+        .unwrap();
+        let input = InputData::Counts {
+            sample_counts: sample,
+            open_beam_counts: open_beam,
+        };
+        let err = fit_spectrum_typed(&input, &cfg).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("fit_energy_range") && msg.contains("active bin"),
+            "expected too-narrow-range rejection; got: {msg}"
         );
     }
 }

@@ -77,6 +77,10 @@ pub struct SessionCache {
     /// as free parameters.  Mutually exclusive with `fit_temperature`.
     #[serde(default)]
     pub fit_energy_scale: bool,
+    /// Fit energy range restriction (SAMMY REGION equivalent).
+    /// `None` (default) = full grid.
+    #[serde(default)]
+    pub fit_energy_range: Option<(f64, f64)>,
     /// Isotope groups: (z, name, members, density, enabled).
     /// ResonanceData is not serialized — members get Pending status on restore.
     #[serde(default)]
@@ -184,6 +188,7 @@ impl SessionCache {
             kl_c_ratio: state.kl_c_ratio,
             kl_enable_polish_override: state.kl_enable_polish_override,
             fit_energy_scale: state.fit_energy_scale,
+            fit_energy_range: state.fit_energy_range,
             isotope_groups: state
                 .isotope_groups
                 .iter()
@@ -305,6 +310,7 @@ impl SessionCache {
         state.kl_c_ratio = self.kl_c_ratio;
         state.kl_enable_polish_override = self.kl_enable_polish_override;
         state.fit_energy_scale = self.fit_energy_scale;
+        state.fit_energy_range = self.fit_energy_range;
 
         // Rebuild pipeline
         state.rebuild_pipeline();
@@ -737,6 +743,13 @@ pub struct AppState {
     /// represents the residual offset on top of the corrected grid;
     /// `L_scale` multiplies the nominal `flight_path_m`.
     pub fit_energy_scale: bool,
+    /// Restrict the fit to `[min_eV, max_eV]` (SAMMY REGION equivalent,
+    /// SAMMY user manual §IIID.6 / SAM52 `MIN ENERGY` / `MAX ENERGY`).
+    /// `None` = full grid (default).  Both bounds must lie inside the
+    /// loaded energy grid; the resolution-kernel margin (~5×FWHM beyond
+    /// each boundary) is applied automatically in `build_fit_config`
+    /// so resonances near the boundaries are correctly broadened.
+    pub fit_energy_range: Option<(f64, f64)>,
     pub show_advanced_solver: bool,
 
     // -- Uncertainty provenance --
@@ -1475,6 +1488,7 @@ impl Default for AppState {
             solver_method: SolverMethod::PoissonKL,
             fit_temperature: false,
             fit_energy_scale: false,
+            fit_energy_range: None,
             show_advanced_solver: false,
             uncertainty_is_estimated: false,
             lm_background_enabled: false,
