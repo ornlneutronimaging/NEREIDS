@@ -52,7 +52,7 @@ _fts_*.txt
 # (do NOT gitignore Cargo.lock)
 .prototypes/
 .research/
-.claude/settings.json
+.claude/settings.local.json
 tmp/
 
 # do not track manuscript folders

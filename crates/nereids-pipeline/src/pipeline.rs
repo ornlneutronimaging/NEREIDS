@@ -2297,12 +2297,22 @@ pub struct SpectrumFitResult {
     pub temperature_k: Option<f64>,
     /// 1-sigma uncertainty on the fitted temperature (from covariance matrix).
     pub temperature_k_unc: Option<f64>,
-    /// Fitted normalization / signal-scale parameter.
-    /// Transmission LM uses `Anorm`; counts background scaling uses `alpha_1`.
+    /// Fitted normalization scale (SAMMY `Anorm`).  When background
+    /// fitting is disabled, the pipeline emits `1.0` (memo 35 §P1
+    /// convention — `λ̂` absorbs the scale).
     pub anorm: f64,
-    /// Fitted background parameter triplet.
-    /// Transmission LM uses `[BackA, BackB, BackC]`.
-    /// Counts KL background uses `[b0, b1, alpha_2]`.
+    /// Fitted background polynomial coefficients `[BackA, BackB, BackC]`
+    /// for the SAMMY-style 6-term background:
+    ///
+    /// ```text
+    /// bg(E) = BackA + BackB / √E + BackC · √E + BackD · exp(-BackF / √E)
+    /// ```
+    ///
+    /// Both LM-transmission and counts-KL solver paths use the same
+    /// SAMMY semantics here — the legacy alpha-fitting `[b0, b1,
+    /// alpha_2]` layout was removed when `fit_counts_poisson` was
+    /// retired in PR #450.  When background fitting is disabled, the
+    /// pipeline emits `[0.0, 0.0, 0.0]`.
     pub background: [f64; 3],
     /// Fitted exponential background amplitude (SAMMY BackD).
     /// Zero when the exponential tail is not fitted.

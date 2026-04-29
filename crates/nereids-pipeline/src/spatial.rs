@@ -63,13 +63,16 @@ pub struct SpatialResult {
     /// Ensures display labels stay in sync with density data even if the
     /// user modifies the isotope list after fitting.
     pub isotope_labels: Vec<String>,
-    /// Per-pixel normalization / signal-scale map (when background fitting is enabled).
+    /// Per-pixel SAMMY `Anorm` map (when background fitting is enabled).
     /// NaN at pixels where `converged_map` is `false`.
     pub anorm_map: Option<Array2<f64>>,
-    /// Per-pixel background parameter maps.
-    /// Transmission LM uses `[BackA, BackB, BackC]`.
-    /// Counts KL background uses `[b0, b1, alpha_2]`.
-    /// NaN at pixels where `converged_map` is `false`.
+    /// Per-pixel SAMMY background polynomial coefficient maps:
+    /// `[BackA, BackB, BackC]` for the 6-term form
+    /// `bg(E) = BackA + BackB/√E + BackC·√E + BackD·exp(-BackF/√E)`.
+    /// Both LM-transmission and counts-KL paths use these semantics —
+    /// the legacy alpha-fitting `[b0, b1, alpha_2]` layout was retired
+    /// with `fit_counts_poisson` in PR #450. NaN at pixels where
+    /// `converged_map` is `false`.
     pub background_maps: Option<[Array2<f64>; 3]>,
     /// Per-pixel fitted SAMMY TZERO offset (µs) map.
     /// `Some` when `config.fit_energy_scale` is true; `None` otherwise.

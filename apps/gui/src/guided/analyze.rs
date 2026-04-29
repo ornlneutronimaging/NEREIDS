@@ -1357,11 +1357,13 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
     };
 
     // Fit result (if available).  In counts mode, scale T_fit by
-    // `c · OB[i, y, x]` so the overlay sits on the same axis as the
-    // raw sample-counts measured line.  This omits the fitted Anorm
-    // + LM background polynomial (BackA + BackB/√E + BackC·√E) — both
-    // are typically small, and a fully-correct counts overlay needs
-    // the joint-Poisson forward model.  Tracked as a follow-up.
+    // `c · OB[i, y, x]` (via the `y_multiplier` field on `FitLineParams`)
+    // so the overlay sits on the same axis as the raw sample-counts
+    // measured line.  `build_fit_line` itself applies the fitted Anorm
+    // and the SAMMY 6-term background polynomial
+    // (BackA + BackB/√E + BackC·√E + BackD·exp(-BackF/√E)) before
+    // multiplying by the counts scale, so the overlay reflects the
+    // full forward model the solver fit — not just bare T·c·OB.
     let fit_result_for_overlay = match selection {
         SpectrumSelection::Pixel { y, x } => selected_pixel_fit_result_for_overlay(state, y, x),
         SpectrumSelection::Roi { .. } => state.pixel_fit_result.clone(),
@@ -1480,12 +1482,17 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
     // the track viewport pushes past the cockpit column. Fit results live in
     // the right inspector, not below the spectrum.
     //
-    // Floor budget at 160 px (was 220) so half-height windows don't overflow
-    // the parent cockpit-column allocation: with `MAX_VISIBLE_STRIPS = 6`
-    // (capped by the picker), `strips_total_height` is at most ~130 px, and
-    // 160 + 130 + 20 = 310 fits within `col_height ≈ 300+` on a 640 px
-    // viewport. At smaller column heights the plot collapses gracefully but
-    // the layout stays inside its allocation.
+    // Floor budget at 160 px (was 220).  With the picker's
+    // `MAX_VISIBLE_STRIPS = 6`, `strips_total_height` peaks at 6×18 + 4 +
+    // footer 22 = 134 px.  In typical use (≤ 2-3 strips) the plot still
+    // gets the available height minus strips, and the floor is inactive.
+    //
+    // Caveat: the `spectrum_panel` itself consumes ~40-50 px above the plot
+    // for the pixel-info + axis-toggle header rows, so at the 6-strip +
+    // ~300 px col_height corner case the budget can still under-fit by
+    // ~60 px.  The 220→160 change is a net improvement (the old floor
+    // was guaranteed to overflow there); the residual corner-case
+    // overflow is tracked separately and isn't blocking.
     let plot_height = (ui.available_height() - 20.0 - strips_total_height).max(160.0);
 
     // Plot
