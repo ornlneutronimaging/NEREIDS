@@ -269,21 +269,23 @@ pub fn pixel_inspector(ui: &mut egui::Ui, state: &AppState) {
             } else {
                 "chi2_r"
             };
+            // Per-pixel maps carry NaN at unconverged pixels (NaN-on-failure
+            // contract from #458 / PR-A B1/B2). Render an em-dash placeholder
+            // instead of the literal string "NaN" so the inspector stays
+            // legible — the "NOT converged" badge above already tells the
+            // user the fit failed.
+            let chi = result.chi_squared_map[[y, x]];
             if state.uncertainty_is_estimated {
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{} = {:.4} (approx.)",
-                        pixel_label,
-                        result.chi_squared_map[[y, x]]
-                    ))
-                    .color(crate::theme::semantic::ORANGE),
-                );
+                let text = if chi.is_finite() {
+                    format!("{pixel_label} = {chi:.4} (approx.)")
+                } else {
+                    format!("{pixel_label} = \u{2014}")
+                };
+                ui.label(egui::RichText::new(text).color(crate::theme::semantic::ORANGE));
+            } else if chi.is_finite() {
+                ui.label(format!("{pixel_label} = {chi:.4}"));
             } else {
-                ui.label(format!(
-                    "{} = {:.4}",
-                    pixel_label,
-                    result.chi_squared_map[[y, x]]
-                ));
+                ui.label(format!("{pixel_label} = \u{2014}"));
             }
 
             if let Some(ref t_map) = result.temperature_map {
@@ -302,7 +304,9 @@ pub fn pixel_inspector(ui: &mut egui::Ui, state: &AppState) {
             for (i, entry) in enabled.iter().enumerate() {
                 if i < result.density_maps.len() {
                     let density = result.density_maps[i][[y, x]];
-                    if state.uncertainty_is_estimated {
+                    if !density.is_finite() {
+                        ui.label(format!("  {}: \u{2014} atoms/barn", entry.symbol));
+                    } else if state.uncertainty_is_estimated {
                         ui.label(format!("  {}: {:.6e} atoms/barn", entry.symbol, density));
                     } else {
                         let unc = result.uncertainty_maps.get(i).map(|u| u[[y, x]]).map_or(
