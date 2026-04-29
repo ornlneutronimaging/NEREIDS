@@ -15,10 +15,12 @@ use crate::widgets::image_view::{
     show_viridis_image_with_roi,
 };
 use egui_plot::{Corner, Line, Plot, PlotPoints, PlotTransform, Points, VLine};
-use ndarray::Axis;
+use ndarray::{Axis, s};
+use nereids_physics::resolution::ResolutionFunction;
 use nereids_pipeline::pipeline::{
     BackgroundConfig, InputData, SolverConfig, SpectrumFitResult, UnifiedFitConfig,
 };
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -237,6 +239,7 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState, available_height_hint: 
         let prev_kl_polish = state.kl_enable_polish_override;
         let prev_fit_temperature = state.fit_temperature;
         let prev_fit_energy_scale = state.fit_energy_scale;
+        let prev_fit_energy_range = state.fit_energy_range;
         let prev_lm_background_enabled = state.lm_background_enabled;
         let prev_compute_covariance = state.lm_config.compute_covariance;
         let prev_tol_param = state.lm_config.tol_param;
@@ -274,6 +277,56 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState, available_height_hint: 
                  \u{03BC}s, L_scale \u{2208} [0.99, 1.01].  Mutually \
                  exclusive with Fit temperature.",
                 );
+                // SAMMY REGION-equivalent fit-energy-range restriction (#514).
+                // The checkbox toggles the `Option<(f64, f64)>` state field;
+                // toggling on initialises from the current full grid bounds
+                // so the user can narrow incrementally.  When set, the
+                // pipeline slices the data with a 5×FWHM kernel margin and
+                // the solvers mask residuals to the user's `[min, max]`.
+                let mut restrict_enabled = state.fit_energy_range.is_some();
+                let cb = ui
+                    .checkbox(
+                        &mut restrict_enabled,
+                        "Restrict fit energy range (SAMMY REGION)",
+                    )
+                    .on_hover_text(
+                        "Restrict the cost function to bins inside [min, max] eV \
+                         (SAMMY REGION / `MIN ENERGY` / `MAX ENERGY` cards).  \
+                         The resolution-kernel margin (~5×FWHM beyond each \
+                         boundary) is applied automatically so resonances \
+                         near the boundaries remain correctly broadened.  \
+                         Default: full grid.",
+                    );
+                if cb.changed() {
+                    state.fit_energy_range = if restrict_enabled {
+                        // Seed at the full-grid bounds so the user narrows
+                        // from there; if no grid is loaded, leave None
+                        // (the checkbox flips back when the seed fails).
+                        state
+                            .energies
+                            .as_ref()
+                            .and_then(|e| (e.len() >= 2).then_some((e[0], e[e.len() - 1])))
+                    } else {
+                        None
+                    };
+                }
+                if let Some((mut min_ev, mut max_ev)) = state.fit_energy_range {
+                    ui.horizontal(|ui| {
+                        ui.label("Min (eV):");
+                        ui.add(
+                            egui::DragValue::new(&mut min_ev)
+                                .speed(0.01)
+                                .range(0.0..=f64::INFINITY),
+                        );
+                        ui.label("Max (eV):");
+                        ui.add(
+                            egui::DragValue::new(&mut max_ev)
+                                .speed(0.01)
+                                .range(0.0..=f64::INFINITY),
+                        );
+                    });
+                    state.fit_energy_range = Some((min_ev, max_ev));
+                }
                 if matches!(state.solver_method, SolverMethod::LevenbergMarquardt) {
                     ui.checkbox(
                         &mut state.lm_background_enabled,
@@ -377,6 +430,7 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState, available_height_hint: 
             || state.kl_enable_polish_override != prev_kl_polish
             || state.fit_temperature != prev_fit_temperature
             || state.fit_energy_scale != prev_fit_energy_scale
+            || state.fit_energy_range != prev_fit_energy_range
             || state.lm_background_enabled != prev_lm_background_enabled
             || state.lm_config.compute_covariance != prev_compute_covariance
             || state.lm_config.tol_param.to_bits() != prev_tol_param.to_bits()
@@ -1526,6 +1580,20 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
                         .style(egui_plot::LineStyle::dashed_dense()),
                 );
             }
+
+            // SAMMY REGION fit-energy-range guides (#514).  Only render
+            // on the energy axis — the bounds are stored in eV and the
+            // TOF projection would require an extra energy↔TOF
+            // conversion for marginal user value.  Users can toggle to
+            // the eV axis to see the markers.
+            if state.analyze_spectrum_axis == SpectrumAxis::EnergyEv
+                && let Some((min_ev, max_ev)) = state.fit_energy_range
+            {
+                let style = egui_plot::LineStyle::dashed_dense();
+                let colour = egui::Color32::from_rgb(160, 160, 160);
+                plot_ui.vline(VLine::new("Fit min", min_ev).color(colour).style(style));
+                plot_ui.vline(VLine::new("Fit max", max_ev).color(colour).style(style));
+            }
         });
 
     // Tick strips below the main plot.  Render up to `MAX_VISIBLE_STRIPS`
@@ -1845,12 +1913,118 @@ fn fit_results_panel(ui: &mut egui::Ui, state: &AppState, result: &SpectrumFitRe
 
 // ---- Fit Helpers ----
 
-fn build_fit_config(state: &AppState) -> Result<UnifiedFitConfig, String> {
-    let energies = state
+/// Number of resolution-FWHM widths to extend the fit-energy-range
+/// slice on each side as a "kernel margin".  SAMMY user manual §IIID.6
+/// (REGION) recommends 3–5×FWHM; we pick 5× for safety so resonance
+/// shoulders just inside the boundaries are correctly broadened.
+const FIT_RANGE_MARGIN_FWHM: f64 = 5.0;
+
+/// Tabulated-resolution fallback fractional kernel width.  The
+/// `TabulatedResolution` type does not expose an in-eV FWHM accessor
+/// (its kernels are TOF-domain), so we fall back to a conservative
+/// fraction of the boundary energy.  Typical neutron-imaging tabulated
+/// resolution is well under 1% FWHM, so 10% × `FIT_RANGE_MARGIN_FWHM`
+/// covers the broadening footprint with a wide safety factor.
+const TABULATED_FRACTIONAL_FALLBACK: f64 = 0.1;
+
+/// Resolution-kernel margin (eV) to add at energy `e_ev` when slicing
+/// for the fit-energy-range filter (SAMMY REGION-equivalent, #514).
+/// Returns `0.0` when no resolution is configured.
+fn kernel_margin_ev(e_ev: f64, resolution: Option<&ResolutionFunction>) -> f64 {
+    match resolution {
+        None => 0.0,
+        Some(ResolutionFunction::Gaussian(p)) => FIT_RANGE_MARGIN_FWHM * p.fwhm(e_ev),
+        Some(ResolutionFunction::Tabulated(_)) => TABULATED_FRACTIONAL_FALLBACK * e_ev.abs(),
+    }
+}
+
+/// Compute extended-margin slice indices over `energies` for the
+/// active user-specified fit range `[e_min, e_max]`, applying a
+/// `FIT_RANGE_MARGIN_FWHM`×FWHM kernel margin on each side.  Returns
+/// the half-open `[lo, hi)` index range to apply to the energy grid
+/// and per-bin data arrays before passing to `UnifiedFitConfig`.
+///
+/// Validation:
+/// - `e_min` and `e_max` must be finite and `e_min < e_max`.
+/// - The active region must overlap the loaded grid.
+/// - The resulting slice must contain ≥ 2 bins (otherwise the LM /
+///   joint-Poisson cost paths cannot fit anything).
+fn fit_energy_range_indices(
+    energies: &[f64],
+    range: (f64, f64),
+    resolution: Option<&ResolutionFunction>,
+) -> Result<Range<usize>, String> {
+    let (e_min, e_max) = range;
+    if !e_min.is_finite() || !e_max.is_finite() {
+        return Err("Fit energy range bounds must be finite".into());
+    }
+    if e_min >= e_max {
+        return Err(format!(
+            "Fit energy range min ({e_min} eV) must be less than max ({e_max} eV)"
+        ));
+    }
+    if energies.len() < 2 {
+        return Err("Energy grid must have at least 2 points".into());
+    }
+    let grid_lo = energies[0];
+    let grid_hi = energies[energies.len() - 1];
+    if e_max < grid_lo || e_min > grid_hi {
+        return Err(format!(
+            "Fit energy range [{e_min}, {e_max}] eV does not overlap the loaded grid \
+             [{grid_lo}, {grid_hi}] eV"
+        ));
+    }
+
+    // Boundary-specific kernel margins.  At asymmetric resolution
+    // (timing / flight-path contributions scale differently with E),
+    // FWHM at e_max can be much larger than at e_min, so we compute
+    // each independently rather than using a single global margin.
+    let margin_lo = kernel_margin_ev(e_min, resolution);
+    let margin_hi = kernel_margin_ev(e_max, resolution);
+    let lo_target = e_min - margin_lo;
+    let hi_target = e_max + margin_hi;
+
+    // `partition_point` returns the first index where the predicate is
+    // false; for a sorted ascending grid this is exactly the lower /
+    // upper bracketing index for our half-open range.
+    let lo = energies.partition_point(|&e| e < lo_target);
+    let hi = energies.partition_point(|&e| e <= hi_target);
+    let lo = lo.min(energies.len());
+    let hi = hi.min(energies.len()).max(lo);
+
+    if hi.saturating_sub(lo) < 2 {
+        return Err(format!(
+            "Fit energy range [{e_min}, {e_max}] eV (with {FIT_RANGE_MARGIN_FWHM}×FWHM margin) \
+             yields fewer than 2 bins on the loaded grid"
+        ));
+    }
+    Ok(lo..hi)
+}
+
+fn build_fit_config(state: &AppState) -> Result<(UnifiedFitConfig, Range<usize>), String> {
+    let full_energies = state
         .energies
         .as_ref()
-        .ok_or_else(|| "No energy grid loaded".to_string())?
-        .clone();
+        .ok_or_else(|| "No energy grid loaded".to_string())?;
+
+    // Resolve the fit-energy-range slice.  When `state.fit_energy_range`
+    // is `None`, we slice the entire grid (no behavioural change).
+    // Otherwise we extend the active `[E_min, E_max]` by a kernel-FWHM
+    // margin so resonance broadening at the boundaries remains correct;
+    // the solver cost paths then mask residuals back to the inner
+    // active range (SAMMY REGION semantics, #514).
+    let resolution = design::build_resolution_function(
+        state.resolution_enabled,
+        &state.resolution_mode,
+        state.beamline.flight_path_m,
+    )
+    .map_err(|e| format!("{e} \u{2014} load a resolution file or disable broadening"))?;
+
+    let energy_range: Range<usize> = match state.fit_energy_range {
+        Some(range) => fit_energy_range_indices(full_energies, range, resolution.as_ref())?,
+        None => 0..full_energies.len(),
+    };
+    let energies: Vec<f64> = full_energies[energy_range.clone()].to_vec();
 
     let enabled: Vec<&IsotopeEntry> = state
         .isotope_entries
@@ -1868,13 +2042,6 @@ fn build_fit_config(state: &AppState) -> Result<UnifiedFitConfig, String> {
     if enabled.is_empty() && enabled_groups.is_empty() {
         return Err("No enabled isotopes with resonance data".into());
     }
-
-    let resolution = design::build_resolution_function(
-        state.resolution_enabled,
-        &state.resolution_mode,
-        state.beamline.flight_path_m,
-    )
-    .map_err(|e| format!("{e} \u{2014} load a resolution file or disable broadening"))?;
 
     // When groups are present, use with_groups() to build the config.
     // Individual isotopes are wrapped as single-member groups for uniformity.
@@ -2028,13 +2195,19 @@ fn build_fit_config(state: &AppState) -> Result<UnifiedFitConfig, String> {
         }
     }
 
-    Ok(config)
+    // Attach the user-specified fit-energy range (provenance + solver
+    // mask).  The pipeline / solver paths build a per-bin active mask
+    // from this `[E_min, E_max]` against the (already margin-extended)
+    // `energies` grid stored above (#514).
+    config = config.with_fit_energy_range(state.fit_energy_range);
+
+    Ok((config, energy_range))
 }
 
 fn fit_pixel(state: &mut AppState) {
     state.last_fit_feedback = None;
 
-    let config = match build_fit_config(state) {
+    let (config, energy_range) = match build_fit_config(state) {
         Ok(c) => c,
         Err(e) => {
             state.last_fit_feedback = Some(crate::state::FitFeedback {
@@ -2081,11 +2254,17 @@ fn fit_pixel(state: &mut AppState) {
         return;
     }
 
-    let n_energies = shape[0];
-    let t_spectrum: Vec<f64> = (0..n_energies)
+    // Slice per-bin data to the same `energy_range` produced by
+    // `build_fit_config` (SAMMY REGION-equivalent fit-energy-range
+    // restriction with kernel-margin extension, #514).  When the user
+    // hasn't restricted the range, `energy_range` is `0..n_energies`,
+    // so this is identical to the previous full-grid behaviour.
+    let t_spectrum: Vec<f64> = energy_range
+        .clone()
         .map(|e| norm.transmission[[e, y, x]])
         .collect();
-    let sigma: Vec<f64> = (0..n_energies)
+    let sigma: Vec<f64> = energy_range
+        .clone()
         .map(|e| norm.uncertainty[[e, y, x]].max(1e-10))
         .collect();
 
@@ -2109,8 +2288,9 @@ fn fit_pixel(state: &mut AppState) {
     let input = if use_counts
         && let (Some(sample), Some(open_beam)) = (&state.sample_data, &state.open_beam_data)
     {
-        let sample_counts: Vec<f64> = (0..n_energies).map(|e| sample[[e, y, x]]).collect();
-        let open_beam_counts: Vec<f64> = (0..n_energies).map(|e| open_beam[[e, y, x]]).collect();
+        let sample_counts: Vec<f64> = energy_range.clone().map(|e| sample[[e, y, x]]).collect();
+        let open_beam_counts: Vec<f64> =
+            energy_range.clone().map(|e| open_beam[[e, y, x]]).collect();
         InputData::Counts {
             sample_counts,
             open_beam_counts,
@@ -2172,7 +2352,7 @@ fn fit_pixel(state: &mut AppState) {
 fn fit_roi(state: &mut AppState) {
     state.last_fit_feedback = None;
 
-    let config = match build_fit_config(state) {
+    let (config, energy_range) = match build_fit_config(state) {
         Ok(c) => c,
         Err(e) => {
             state.last_fit_feedback = Some(crate::state::FitFeedback {
@@ -2243,17 +2423,24 @@ fn fit_roi(state: &mut AppState) {
         return;
     }
 
-    // Weighted average transmission and propagated uncertainty
-    let avg_t: Vec<f64> = sum_t
+    // Weighted average transmission and propagated uncertainty.
+    //
+    // We build the full-grid averaged arrays first, then slice to
+    // `energy_range` for the fit (SAMMY REGION-equivalent fit-energy-
+    // range restriction with kernel-margin extension, #514).  The
+    // ROI averaging is unaffected by the slice — it's the same
+    // `n_tof` arithmetic regardless of which bins end up in the fit.
+    let avg_t_full: Vec<f64> = sum_t
         .iter()
         .zip(sum_w.iter())
         .map(|(&s, &w)| if w > 0.0 { s / w } else { 0.0 })
         .collect();
-    // Bins with no valid pixels get negligible weight so the fitter ignores them.
-    let sigma: Vec<f64> = sum_w
+    let sigma_full: Vec<f64> = sum_w
         .iter()
         .map(|&w| if w > 0.0 { 1.0 / w.sqrt() } else { 1.0e30 })
         .collect();
+    let avg_t: Vec<f64> = avg_t_full[energy_range.clone()].to_vec();
+    let sigma: Vec<f64> = sigma_full[energy_range.clone()].to_vec();
 
     let mut enabled_symbols: Vec<String> = state
         .isotope_entries
@@ -2274,7 +2461,10 @@ fn fit_roi(state: &mut AppState) {
     let roi_input = if use_counts
         && let (Some(sample), Some(open_beam)) = (&state.sample_data, &state.open_beam_data)
     {
-        let sample_counts: Vec<f64> = (0..shape[0])
+        // Counts paths slice the energy axis to `energy_range` — same
+        // SAMMY REGION semantics as the LM transmission path above.
+        let sample_counts: Vec<f64> = energy_range
+            .clone()
             .map(|t| {
                 pixels
                     .iter()
@@ -2282,7 +2472,8 @@ fn fit_roi(state: &mut AppState) {
                     .sum::<f64>()
             })
             .collect();
-        let open_beam_counts: Vec<f64> = (0..shape[0])
+        let open_beam_counts: Vec<f64> = energy_range
+            .clone()
             .map(|t| {
                 pixels
                     .iter()
@@ -2351,7 +2542,7 @@ fn fit_roi(state: &mut AppState) {
 pub fn run_spatial_map(state: &mut AppState) {
     state.last_fit_feedback = None;
 
-    let config = match build_fit_config(state) {
+    let (config, energy_range) = match build_fit_config(state) {
         Ok(c) => c,
         Err(e) => {
             state.status_message = e;
@@ -2467,18 +2658,25 @@ pub fn run_spatial_map(state: &mut AppState) {
         // share the global pool with inner physics par_iter calls.
         // Use counts-domain only when the solver is Poisson KL AND both
         // sample and open beam are available. LM always uses Transmission.
+        //
+        // SAMMY REGION-equivalent fit-energy-range restriction (#514):
+        // when `state.fit_energy_range` is set, `build_fit_config` slices
+        // the energy grid to `energy_range` (with kernel-margin extension);
+        // here we slice the per-pixel data views to the same axis-0 range
+        // so the pipeline's shape-validation passes and per-pixel fits see
+        // a grid consistent with the configured `energies`.
         let use_counts = matches!(config.solver(), SolverConfig::PoissonKL(_));
         let input = if use_counts
             && let (Some(sample), Some(open_beam)) = (&sample_data, &open_beam_data)
         {
             nereids_pipeline::spatial::InputData3D::Counts {
-                sample_counts: sample.view(),
-                open_beam_counts: open_beam.view(),
+                sample_counts: sample.slice(s![energy_range.clone(), .., ..]),
+                open_beam_counts: open_beam.slice(s![energy_range.clone(), .., ..]),
             }
         } else {
             nereids_pipeline::spatial::InputData3D::Transmission {
-                transmission: norm.transmission.view(),
-                uncertainty: norm.uncertainty.view(),
+                transmission: norm.transmission.slice(s![energy_range.clone(), .., ..]),
+                uncertainty: norm.uncertainty.slice(s![energy_range.clone(), .., ..]),
             }
         };
         let result = pool.install(|| {

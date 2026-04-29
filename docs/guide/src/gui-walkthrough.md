@@ -75,6 +75,35 @@ with move, select, and delete operations.
 
 ![Analyze step](images/analyze-step.png)
 
+#### Restricting the fit energy range (SAMMY REGION)
+
+By default NEREIDS fits the entire loaded energy grid. The advanced solver
+panel exposes a **"Restrict fit energy range"** checkbox (SAMMY REGION
+equivalent — `MIN ENERGY` / `MAX ENERGY` SAM52 cards) that limits the cost
+function to a user-specified `[E_min, E_max]` window in eV. Common uses:
+
+- **Resolved-resonance region only** — exclude the unresolved-resonance and
+  high-energy tails where the model can't fit;
+- **Single resonance triplet** — focus on a specific feature for fine-grained
+  density / temperature work;
+- **SAMMY parity** — match the REGION restriction used in a reference SAMMY
+  fit so the comparison is apples-to-apples.
+
+When the checkbox is on, two grey dashed vertical lines on the spectrum plot
+mark the active boundaries (visible on the energy-eV axis). The reduced χ²
+and degrees-of-freedom reported in the fit details count only bins inside
+the active range.
+
+**Resolution-kernel margin (automatic):** the broadening kernel pulls model
+contributions from outside the user range. NEREIDS handles this transparently
+by extending the data slice by ~5×FWHM on each side and masking the cost
+function back to `[E_min, E_max]` — so resonances near the boundaries are
+correctly broadened without the user picking a custom margin. SAMMY user
+manual §IIID.6 recommends 3–5×FWHM; we use 5× for safety.
+
+The setting persists in `.nrd.h5` project files (`Option<(f64, f64)>`,
+default `None` = full grid for backwards compatibility).
+
 ### Results
 
 View density maps for each fitted isotope. Summary statistics show convergence

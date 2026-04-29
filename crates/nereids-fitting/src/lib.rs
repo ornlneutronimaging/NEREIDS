@@ -16,6 +16,7 @@
 //! ## TRINIDI Reference
 //! - `trinidi/reconstruct.py` for Poisson-likelihood and APGM approach
 
+pub mod active_mask;
 pub mod error;
 pub mod forward_model;
 pub mod joint_poisson;

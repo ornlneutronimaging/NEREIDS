@@ -299,6 +299,7 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         temperature_k: state.temperature_k,
         fit_temperature: state.fit_temperature,
         fit_energy_scale: Some(state.fit_energy_scale),
+        fit_energy_range: state.fit_energy_range,
         uncertainty_is_estimated: Some(state.uncertainty_is_estimated),
         lm_background_enabled: Some(state.lm_background_enabled),
         kl_background_enabled: Some(state.kl_background_enabled),
@@ -887,6 +888,7 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
     state.temperature_k = snap.temperature_k;
     state.fit_temperature = snap.fit_temperature;
     state.fit_energy_scale = snap.fit_energy_scale.unwrap_or(false);
+    state.fit_energy_range = snap.fit_energy_range;
     state.uncertainty_is_estimated = snap.uncertainty_is_estimated.unwrap_or(false);
     state.lm_background_enabled = snap.lm_background_enabled.unwrap_or(false);
     state.kl_background_enabled = snap.kl_background_enabled.unwrap_or(false);

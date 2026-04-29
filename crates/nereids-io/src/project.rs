@@ -84,6 +84,12 @@ pub struct ProjectSnapshot {
     /// `L_scale`).  `Option` for backwards compatibility — projects
     /// saved before this field was introduced load as `None` (= false).
     pub fit_energy_scale: Option<bool>,
+    /// User-specified fit energy range `[min_eV, max_eV]` (SAMMY REGION
+    /// equivalent, `MIN ENERGY` / `MAX ENERGY` SAM52 cards).
+    /// `None` (default) = full grid.  Projects saved before this field
+    /// was introduced load as `None` via the HDF5 reader's missing-
+    /// dataset handling.
+    pub fit_energy_range: Option<(f64, f64)>,
 
     // -- config/resolution --
     pub resolution_enabled: bool,
@@ -226,6 +232,7 @@ impl Default for ProjectSnapshot {
             temperature_k: 0.0,
             fit_temperature: false,
             fit_energy_scale: None,
+            fit_energy_range: None,
             resolution_enabled: false,
             resolution_kind: String::new(),
             delta_t_us: None,
@@ -568,6 +575,13 @@ fn write_config(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoError
     write_bool_attr(&solver, "fit_temperature", snap.fit_temperature)?;
     if let Some(fes) = snap.fit_energy_scale {
         write_bool_attr(&solver, "fit_energy_scale", fes)?;
+    }
+    if let Some((fr_min, fr_max)) = snap.fit_energy_range {
+        // SAMMY REGION-equivalent fit-energy-range bounds (#514).
+        // Stored as two scalar attributes so HDF5 introspection tools
+        // can read the values directly without parsing a packed tuple.
+        write_f64_attr(&solver, "fit_energy_range_min_ev", fr_min)?;
+        write_f64_attr(&solver, "fit_energy_range_max_ev", fr_max)?;
     }
     if let Some(ue) = snap.uncertainty_is_estimated {
         write_bool_attr(&solver, "uncertainty_is_estimated", ue)?;
@@ -1249,6 +1263,16 @@ fn read_config(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoEr
     snap.temperature_k = read_f64_attr(&solver, "temperature_k")?;
     snap.fit_temperature = read_bool_attr(&solver, "fit_temperature")?;
     snap.fit_energy_scale = read_bool_attr(&solver, "fit_energy_scale").ok();
+    // SAMMY REGION-equivalent fit-energy-range bounds (#514).  Both
+    // attributes must be present to populate the field; older project
+    // files load as `None` (= full-grid fit, the prior default).
+    snap.fit_energy_range = match (
+        read_f64_attr(&solver, "fit_energy_range_min_ev").ok(),
+        read_f64_attr(&solver, "fit_energy_range_max_ev").ok(),
+    ) {
+        (Some(min), Some(max)) => Some((min, max)),
+        _ => None,
+    };
     snap.uncertainty_is_estimated = read_bool_attr(&solver, "uncertainty_is_estimated").ok();
     snap.lm_background_enabled = read_bool_attr(&solver, "lm_background_enabled").ok();
     snap.kl_background_enabled = read_bool_attr(&solver, "kl_background_enabled").ok();
@@ -1829,6 +1853,7 @@ mod tests {
             temperature_k: 300.0,
             fit_temperature: false,
             fit_energy_scale: None,
+            fit_energy_range: None,
             resolution_enabled: false,
             resolution_kind: "gaussian".into(),
             delta_t_us: Some(1.5),

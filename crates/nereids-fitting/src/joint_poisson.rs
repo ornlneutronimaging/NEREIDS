@@ -62,12 +62,36 @@ pub struct JointPoissonObjective<'a> {
     pub s: &'a [f64],
     /// Proton-charge ratio `c = Q_s / Q_ob`.  Must be strictly positive.
     pub c: f64,
+    /// Optional per-bin active mask (SAMMY REGION-equivalent fit-energy
+    /// -range restriction).  When `Some(m)`, only bins where `m[i]` is
+    /// `true` contribute to the deviance / gradient / Fisher
+    /// information; the model is still evaluated on the full grid so
+    /// resolution broadening at the boundaries is correct.  When
+    /// `None`, all bins are active (default behaviour).
+    ///
+    /// Length must equal `o.len()`; the GUI / pipeline dispatch builds
+    /// it from the configured `[E_min, E_max]` against the energy grid.
+    pub active_mask: Option<&'a [bool]>,
 }
 
 impl<'a> JointPoissonObjective<'a> {
     /// Number of data bins.
     pub fn n_data(&self) -> usize {
         self.o.len()
+    }
+
+    /// Number of *active* data bins — `n_data` when no mask is set,
+    /// or the count of `true` entries in `active_mask` otherwise.
+    /// This is the count that should drive deviance-per-dof reporting.
+    pub fn n_active(&self) -> usize {
+        crate::active_mask::active_count(self.active_mask, self.o.len())
+    }
+
+    /// Predicate: is bin `i` active?  Returns `true` when no mask is
+    /// set (full-grid default).
+    #[inline]
+    fn bin_active(&self, i: usize) -> bool {
+        self.active_mask.is_none_or(|m| m[i])
     }
 
     /// Closed-form profile MLE for the per-bin flux: `λ̂ = c·(O+S) / (1+c·T)`.
@@ -109,8 +133,16 @@ impl<'a> JointPoissonObjective<'a> {
     pub fn deviance_from_transmission(&self, t: &[f64]) -> f64 {
         debug_assert_eq!(t.len(), self.o.len());
         debug_assert_eq!(t.len(), self.s.len());
+        debug_assert!(
+            self.active_mask.is_none_or(|m| m.len() == t.len()),
+            "active_mask length must match data"
+        );
         let mut d = 0.0;
-        for ((&t_i, &o_i), &s_i) in t.iter().zip(self.o.iter()).zip(self.s.iter()) {
+        for (i, ((&t_i, &o_i), &s_i)) in t.iter().zip(self.o.iter()).zip(self.s.iter()).enumerate()
+        {
+            if !self.bin_active(i) {
+                continue;
+            }
             d += binomial_deviance_term(s_i, o_i, t_i, self.c);
         }
         d
@@ -164,6 +196,9 @@ impl<'a> JointPoissonObjective<'a> {
         let mut grad = vec![0.0f64; n_free];
         for (i, (&t_i, (&o_i, &s_i))) in t.iter().zip(self.o.iter().zip(self.s.iter())).enumerate()
         {
+            if !self.bin_active(i) {
+                continue;
+            }
             let w = deviance_weight(s_i, o_i, t_i, self.c);
             for (g, col) in grad.iter_mut().zip(0..n_free) {
                 *g += w * jac.get(i, col);
@@ -202,6 +237,9 @@ impl<'a> JointPoissonObjective<'a> {
         let mut info = FlatMatrix::zeros(n_free, n_free);
         for (i, ((&t_i, &o_i), &s_i)) in t.iter().zip(self.o.iter()).zip(self.s.iter()).enumerate()
         {
+            if !self.bin_active(i) {
+                continue;
+            }
             let h = deviance_curvature(s_i, o_i, t_i, self.c);
             for j in 0..n_free {
                 let jij = jac.get(i, j);
@@ -282,6 +320,9 @@ impl<'a> JointPoissonObjective<'a> {
             .zip(self.s.iter())
             .enumerate()
         {
+            if !self.bin_active(i) {
+                continue;
+            }
             let h = deviance_curvature(s_i, o_i, t_i, self.c);
             for j in 0..n_free {
                 let jij = jac.get(i, j);
@@ -640,7 +681,12 @@ pub fn joint_poisson_fit(
     let final_values = params.all_values();
     let final_deviance = objective.deviance(&final_values)?;
     let n_free = params.n_free();
-    let dof = (n_data as isize - n_free as isize).max(1) as f64;
+    // Active-bin masking (SAMMY REGION): when a fit-energy-range mask
+    // is in effect, dof must use the count of bins that contributed to
+    // the deviance — otherwise deviance-per-dof is biased low by the
+    // ratio (n_active / n_data).
+    let n_active = objective.n_active();
+    let dof = (n_active as isize - n_free as isize).max(1) as f64;
     let deviance_per_dof = final_deviance / dof;
 
     // Covariance from inverse Fisher at the final θ.  Uses the analytical
@@ -965,6 +1011,7 @@ mod tests {
                 o: &[o],
                 s: &[s],
                 c,
+                active_mask: None,
             };
             let closed = obj.profile_lambda(t, o, s);
 
@@ -1012,6 +1059,7 @@ mod tests {
             o: &o,
             s: &s,
             c,
+            active_mask: None,
         };
         let d = obj.deviance_from_transmission(&t);
         assert!(d.abs() < 1e-8, "D should be ≈ 0 at exact match, got {d}");
@@ -1045,6 +1093,7 @@ mod tests {
             o: &o,
             s: &s,
             c,
+            active_mask: None,
         };
 
         // Evaluate gradient at a point slightly off truth so it is nonzero.
@@ -1145,6 +1194,7 @@ mod tests {
                 o: &o,
                 s: &s,
                 c,
+                active_mask: None,
             };
 
             // 1D grid search over T, then local refinement via Brent-like
@@ -1219,6 +1269,7 @@ mod tests {
             o: &[0.0, 10.0, 5.0],
             s: &[0.0, 5.0, 2.0],
             c: 1.5,
+            active_mask: None,
         };
         let d_full = obj.deviance_from_transmission(&[0.6, 0.6, 0.6]);
         // Drop the zero-N bin — result must be identical.
@@ -1227,6 +1278,7 @@ mod tests {
             o: &[10.0, 5.0],
             s: &[5.0, 2.0],
             c: 1.5,
+            active_mask: None,
         };
         let d_reduced = obj_reduced.deviance_from_transmission(&[0.6, 0.6]);
         assert!((d_full - d_reduced).abs() < 1e-12);
@@ -1250,6 +1302,7 @@ mod tests {
             o: &o,
             s: &s,
             c,
+            active_mask: None,
         };
         let mut ps = ParameterSet::new(vec![
             FitParameter::non_negative("theta_0", 0.85),
@@ -1284,6 +1337,7 @@ mod tests {
             o: &o,
             s: &s,
             c,
+            active_mask: None,
         };
         let info = obj
             .fisher_information(&theta, &[0, 1])
@@ -1442,6 +1496,7 @@ mod tests {
             o: &o,
             s: &s,
             c,
+            active_mask: None,
         };
         let mut params = ParameterSet::new(vec![FitParameter::non_negative("n", 0.1)]);
         let cfg = JointPoissonFitConfig {
@@ -1512,6 +1567,7 @@ mod tests {
             o: &o,
             s: &s,
             c,
+            active_mask: None,
         };
 
         // x0 analogous to EG2-S1 regime: n near truth, A_n = 1, all
@@ -1610,6 +1666,7 @@ mod tests {
             o: &o,
             s: &s,
             c,
+            active_mask: None,
         };
         let mut params = ParameterSet::new(vec![FitParameter::non_negative("n", 0.1)]);
         let cfg = JointPoissonFitConfig {
@@ -1659,6 +1716,7 @@ mod tests {
             o: &o,
             s: &s,
             c,
+            active_mask: None,
         };
         let mut params = ParameterSet::new(vec![FitParameter::non_negative("T", t_true)]);
         let cfg = JointPoissonFitConfig {
@@ -1683,5 +1741,114 @@ mod tests {
              σ_analytical / √2 ≈ {} which would give rel_err ≈ 0.293",
             sigma_analytical / 2.0_f64.sqrt(),
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Active-bin mask (SAMMY REGION-equivalent fit-energy-range, #514).
+    // ------------------------------------------------------------------
+
+    /// `deviance_from_transmission` with `active_mask` set must equal
+    /// the same call computed only over the `true` bins (subset
+    /// equivalence) — the masking is correct iff dropping out-of-mask
+    /// bins from `o`, `s`, `t` produces the same value.
+    #[test]
+    fn test_jp_active_mask_subset_equivalence() {
+        // 5-bin objective with an arbitrary mask — bins 1 and 3 active.
+        let o_full = [10.0, 20.0, 5.0, 15.0, 25.0];
+        let s_full = [4.0, 8.0, 1.0, 6.0, 12.0];
+        let t_full = [0.4, 0.5, 0.7, 0.6, 0.45];
+        let mask = [false, true, false, true, false];
+        let c = 1.5;
+        let model_full = ConstModel { n_e: 5 };
+        let obj_full = JointPoissonObjective {
+            model: &model_full,
+            o: &o_full,
+            s: &s_full,
+            c,
+            active_mask: Some(&mask),
+        };
+        let d_masked = obj_full.deviance_from_transmission(&t_full);
+
+        // Compare against an objective built directly on the active subset.
+        let o_sub = [o_full[1], o_full[3]];
+        let s_sub = [s_full[1], s_full[3]];
+        let t_sub = [t_full[1], t_full[3]];
+        let model_sub = ConstModel { n_e: 2 };
+        let obj_sub = JointPoissonObjective {
+            model: &model_sub,
+            o: &o_sub,
+            s: &s_sub,
+            c,
+            active_mask: None,
+        };
+        let d_subset = obj_sub.deviance_from_transmission(&t_sub);
+
+        assert!(
+            (d_masked - d_subset).abs() < 1e-12,
+            "masked deviance {d_masked} != subset deviance {d_subset}"
+        );
+
+        // Active-bin count should be 2, not 5.
+        assert_eq!(obj_full.n_active(), 2);
+        assert_eq!(obj_full.n_data(), 5);
+    }
+
+    /// Out-of-mask gradient contributions must drop to zero — verified
+    /// by comparing against an unmasked subset gradient.
+    #[test]
+    fn test_jp_active_mask_gradient_subset_equivalence() {
+        let e_full: Vec<f64> = (0..6).map(|i| 0.1 + 0.1 * i as f64).collect();
+        let theta_true = [0.95_f64, 0.05_f64];
+        let c = 2.0;
+        let lam = 100.0;
+        let model_full = LinearModel { e: &e_full };
+        let t_full = model_full.evaluate(&theta_true).unwrap();
+        let o_full: Vec<f64> = vec![lam / c; e_full.len()];
+        let s_full: Vec<f64> = t_full.iter().map(|&ti| lam * ti).collect();
+
+        // Mask = bins 2..5 active.
+        let mask = vec![false, false, true, true, true, false];
+        let obj_full = JointPoissonObjective {
+            model: &model_full,
+            o: &o_full,
+            s: &s_full,
+            c,
+            active_mask: Some(&mask),
+        };
+
+        let params_full = ParameterSet::new(vec![
+            FitParameter::non_negative("a", theta_true[0]),
+            FitParameter::non_negative("b", theta_true[1]),
+        ]);
+        let free_idx = params_full.free_indices();
+        let theta_eval = [0.9_f64, 0.07_f64];
+        let grad_masked = obj_full
+            .deviance_gradient_analytical(&theta_eval, &free_idx)
+            .unwrap()
+            .expect("analytical gradient");
+
+        // Subset reference: only bins 2..5.
+        let e_sub = e_full[2..5].to_vec();
+        let o_sub = o_full[2..5].to_vec();
+        let s_sub = s_full[2..5].to_vec();
+        let model_sub = LinearModel { e: &e_sub };
+        let obj_sub = JointPoissonObjective {
+            model: &model_sub,
+            o: &o_sub,
+            s: &s_sub,
+            c,
+            active_mask: None,
+        };
+        let grad_sub = obj_sub
+            .deviance_gradient_analytical(&theta_eval, &free_idx)
+            .unwrap()
+            .expect("analytical gradient");
+
+        for (i, (&gm, &gs)) in grad_masked.iter().zip(grad_sub.iter()).enumerate() {
+            assert!(
+                (gm - gs).abs() < 1e-9,
+                "grad component {i}: masked={gm} subset={gs}"
+            );
+        }
     }
 }

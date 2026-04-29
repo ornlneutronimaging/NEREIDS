@@ -455,6 +455,31 @@ pub fn levenberg_marquardt(
     params: &mut ParameterSet,
     config: &LmConfig,
 ) -> Result<LmResult, FittingError> {
+    levenberg_marquardt_with_mask(model, y_obs, sigma, params, config, None)
+}
+
+/// Run the Levenberg-Marquardt optimizer with an optional per-bin
+/// active mask (SAMMY REGION-equivalent fit-energy-range restriction).
+///
+/// When `active_mask` is `Some(m)`:
+/// - bins where `m[i]` is `false` are excluded from χ² and the normal
+///   equations (weight zeroed before assembly), so they contribute
+///   nothing to the gradient or Hessian;
+/// - the model is still evaluated on the full grid so resolution
+///   broadening at the boundaries of the active region is correct;
+/// - `dof = n_active − n_free` where `n_active` is the count of
+///   active bins.
+///
+/// When `active_mask` is `None`, behaviour is identical to
+/// [`levenberg_marquardt`] (all bins active).
+pub fn levenberg_marquardt_with_mask(
+    model: &dyn FitModel,
+    y_obs: &[f64],
+    sigma: &[f64],
+    params: &mut ParameterSet,
+    config: &LmConfig,
+    active_mask: Option<&[bool]>,
+) -> Result<LmResult, FittingError> {
     let n_data = y_obs.len();
     if n_data == 0 {
         return Err(FittingError::EmptyData);
@@ -466,6 +491,16 @@ pub fn levenberg_marquardt(
             field: "sigma",
         });
     }
+    if let Some(m) = active_mask
+        && m.len() != n_data
+    {
+        return Err(FittingError::LengthMismatch {
+            expected: n_data,
+            actual: m.len(),
+            field: "active_mask",
+        });
+    }
+    let n_active = crate::active_mask::active_count(active_mask, n_data);
 
     let n_free = params.n_free();
 
@@ -475,7 +510,13 @@ pub fn levenberg_marquardt(
     if n_free == 0 {
         let weights: Vec<f64> = sigma
             .iter()
-            .map(|&s| {
+            .enumerate()
+            .map(|(i, &s)| {
+                // Active-bin masking (SAMMY REGION): bins outside the
+                // user range contribute zero to χ².
+                if active_mask.is_some_and(|m| !m[i]) {
+                    return 0.0;
+                }
                 if !s.is_finite() || s <= 0.0 {
                     1.0 / 1e30
                 } else {
@@ -507,12 +548,12 @@ pub fn levenberg_marquardt(
             .map(|(&obs, &mdl)| obs - mdl)
             .collect();
         let chi2 = chi_squared(&residuals, &weights);
-        // #125.5: Compute dof via `n_data - n_free` (even though n_free == 0 here)
-        // to mirror the main path and keep a single visible formula.
-        let dof = n_data - n_free;
-        // Note: Given n_free == 0 and the earlier assert that n_data > 0,
-        // dof is always > 0 here; the guard below is a defensive check
-        // kept for consistency with the main path.
+        // #125.5: Compute dof via `n_active - n_free` (with `n_active = n_data`
+        // when no mask is set) to mirror the main path and keep a single
+        // visible formula.  When a fit-energy-range mask is in effect,
+        // `n_active` reflects the count of bins that actually contributed
+        // to χ² (SAMMY REGION semantics).
+        let dof = n_active.saturating_sub(n_free);
         let reduced = if dof > 0 { chi2 / dof as f64 } else { f64::NAN };
         return Ok(LmResult {
             chi_squared: chi2,
@@ -525,12 +566,16 @@ pub fn levenberg_marquardt(
         });
     }
 
-    // #108.3: Underdetermined systems — when n_data < n_free, the problem is
+    // #108.3: Underdetermined systems — when n_active < n_free, the problem is
     // underdetermined and the Jacobian cannot be full rank.  Return early
     // with converged=false so callers can detect the problem.
-    // n_data == n_free is exactly determined (dof=0) and still solvable;
+    // n_active == n_free is exactly determined (dof=0) and still solvable;
     // we allow it and report reduced_chi_squared = NaN (0/0).
-    if n_data < n_free {
+    //
+    // When a fit-energy-range mask is in effect, the underdetermined
+    // check uses the active-bin count (SAMMY REGION semantics) — masked
+    // bins do not contribute information to the fit.
+    if n_active < n_free {
         return Ok(LmResult {
             chi_squared: f64::NAN,
             reduced_chi_squared: f64::NAN,
@@ -541,15 +586,25 @@ pub fn levenberg_marquardt(
             uncertainties: None,
         });
     }
-    let dof = n_data - n_free;
+    let dof = n_active - n_free;
 
     // #104: Validate sigma — division by zero or non-finite sigma would produce
     // NaN/Inf weights and silently corrupt the entire fit.  Clamp to a small
     // floor instead of rejecting outright, so callers with a few zero-sigma
     // bins still get a usable fit.
+    //
+    // Active-bin masking (SAMMY REGION): bins outside the user range
+    // get weight 0 here, which propagates through χ² and the JᵀWJ /
+    // JᵀWr normal-equation assembly to contribute exactly zero —
+    // covering both residual and gradient masking with no further
+    // changes downstream.
     let weights: Vec<f64> = sigma
         .iter()
-        .map(|&s| {
+        .enumerate()
+        .map(|(i, &s)| {
+            if active_mask.is_some_and(|m| !m[i]) {
+                return 0.0;
+            }
             if !s.is_finite() || s <= 0.0 {
                 // Treat as negligible weight (huge sigma) rather than panicking.
                 1.0 / 1e30
@@ -1381,6 +1436,122 @@ mod tests {
             result.params[0],
             result.params[1],
             y_at_4,
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Active-bin mask (SAMMY REGION-equivalent fit-energy-range, #514).
+    // ------------------------------------------------------------------
+
+    /// LM with an `active_mask` that restricts to a subset of bins must
+    /// produce a fit equivalent to running on that subset directly —
+    /// validates that masking propagates through both the residual /
+    /// χ² accumulation AND the dof / reduced-χ² book-keeping.
+    #[test]
+    fn test_lm_active_mask_subset_equivalence() {
+        // Linear fit y = 2x + 3 on x = 0..10.  Mask = bins 0..5 only.
+        let x_full: Vec<f64> = (0..10).map(|i| i as f64).collect();
+        let y_full: Vec<f64> = x_full.iter().map(|&xi| 2.0 * xi + 3.0).collect();
+        let sigma_full = vec![1.0; 10];
+        let mask = vec![
+            true, true, true, true, true, false, false, false, false, false,
+        ];
+
+        let model = LinearModel { x: x_full.clone() };
+        let mut params = ParameterSet::new(vec![
+            FitParameter::unbounded("a", 1.0),
+            FitParameter::unbounded("b", 1.0),
+        ]);
+        let result_masked = levenberg_marquardt_with_mask(
+            &model,
+            &y_full,
+            &sigma_full,
+            &mut params,
+            &LmConfig::default(),
+            Some(&mask),
+        )
+        .unwrap();
+        assert!(result_masked.converged);
+        assert!((result_masked.params[0] - 2.0).abs() < 1e-6);
+        assert!((result_masked.params[1] - 3.0).abs() < 1e-6);
+
+        // Reference: same fit on the subset directly (no mask).
+        let x_sub = x_full[..5].to_vec();
+        let y_sub = y_full[..5].to_vec();
+        let sigma_sub = vec![1.0; 5];
+        let model_sub = LinearModel { x: x_sub };
+        let mut params_sub = ParameterSet::new(vec![
+            FitParameter::unbounded("a", 1.0),
+            FitParameter::unbounded("b", 1.0),
+        ]);
+        let result_sub = levenberg_marquardt(
+            &model_sub,
+            &y_sub,
+            &sigma_sub,
+            &mut params_sub,
+            &LmConfig::default(),
+        )
+        .unwrap();
+
+        // Recovered parameters and reduced-χ² (both fits noiseless,
+        // so reduced-χ² ≈ 0 in either case) must match.
+        for j in 0..2 {
+            assert!(
+                (result_masked.params[j] - result_sub.params[j]).abs() < 1e-6,
+                "param {j}: masked={} subset={}",
+                result_masked.params[j],
+                result_sub.params[j]
+            );
+        }
+        assert!(
+            (result_masked.reduced_chi_squared - result_sub.reduced_chi_squared).abs() < 1e-6,
+            "reduced-χ²: masked={} subset={}",
+            result_masked.reduced_chi_squared,
+            result_sub.reduced_chi_squared
+        );
+    }
+
+    /// Without the mask, residuals from the out-of-range half of the
+    /// grid would dominate χ² and pull the fit way off — the masked
+    /// fit must NOT be biased by them.
+    #[test]
+    fn test_lm_active_mask_excludes_out_of_range_residuals() {
+        // y = 2x + 3 inside the masked range; corrupt outliers outside.
+        let x: Vec<f64> = (0..10).map(|i| i as f64).collect();
+        let mut y: Vec<f64> = x.iter().map(|&xi| 2.0 * xi + 3.0).collect();
+        for yi in y.iter_mut().skip(5) {
+            *yi += 1000.0; // huge corruption outside the active mask
+        }
+        let sigma = vec![1.0; 10];
+        let mask = vec![true; 5]
+            .into_iter()
+            .chain(std::iter::repeat_n(false, 5))
+            .collect::<Vec<bool>>();
+
+        let model = LinearModel { x };
+        let mut params = ParameterSet::new(vec![
+            FitParameter::unbounded("a", 1.0),
+            FitParameter::unbounded("b", 1.0),
+        ]);
+        let result = levenberg_marquardt_with_mask(
+            &model,
+            &y,
+            &sigma,
+            &mut params,
+            &LmConfig::default(),
+            Some(&mask),
+        )
+        .unwrap();
+        assert!(result.converged);
+        assert!(
+            (result.params[0] - 2.0).abs() < 1e-6,
+            "slope should be 2.0 (corrupt outliers must be masked out), got {}",
+            result.params[0]
+        );
+        assert!(
+            (result.params[1] - 3.0).abs() < 1e-6,
+            "intercept should be 3.0 (corrupt outliers must be masked out), got {}",
+            result.params[1]
         );
     }
 }

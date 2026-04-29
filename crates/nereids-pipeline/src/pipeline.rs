@@ -344,6 +344,22 @@ pub struct UnifiedFitConfig {
     /// `Some(_)` bypasses both the env var and the default.
     tzero_jacobian_method: Option<nereids_fitting::transmission_model::EnergyScaleJacobianMethod>,
 
+    // ── Fit energy range restriction (SAMMY REGION equivalent) ──
+    /// User-specified fit-energy-range restriction.  When `Some((min,
+    /// max))`, the configured `energies` grid is expected to extend
+    /// beyond `[min, max]` by a kernel-margin (~5×FWHM); the GUI / pre-
+    /// processing layer slices the input data to that extended grid
+    /// before constructing this config.  The solver cost functions
+    /// (LM transmission and joint-Poisson PBD) mask residuals outside
+    /// `[min, max]` to zero so resonance contributions just inside the
+    /// boundaries are correctly broadened.
+    ///
+    /// `None` (default) = full grid, no masking.  Reduced χ² / dof
+    /// counts are computed against the active bin count when masking
+    /// is in effect.  See SAMMY user manual §IIID.6 ("REGION") and the
+    /// `MIN ENERGY` / `MAX ENERGY` SAM52 cards.
+    fit_energy_range: Option<(f64, f64)>,
+
     // ── Isotope group mapping (optional) ──
     /// Maps member isotope index → density parameter index.
     /// `None` = identity mapping (one param per isotope, backward compat).
@@ -416,6 +432,7 @@ impl UnifiedFitConfig {
             density_ratios: None,
             n_density_params: None,
             tzero_jacobian_method: None,
+            fit_energy_range: None,
         })
     }
 
@@ -469,6 +486,19 @@ impl UnifiedFitConfig {
         self.t0_init_us = t0_init_us;
         self.l_scale_init = l_scale_init;
         self.flight_path_m = flight_path_m;
+        self
+    }
+
+    /// Restrict the fit cost function to bins inside `[min_eV, max_eV]`
+    /// (SAMMY REGION equivalent).  The configured `energies` grid is
+    /// expected to extend by ~5×FWHM beyond `[min, max]` on each side
+    /// (the GUI / pre-processing layer handles this); the LM and
+    /// joint-Poisson cost paths mask residuals outside `[min, max]` to
+    /// zero so resonance broadening at the boundaries is correct.
+    /// `None` (default) = full grid, no masking.
+    #[must_use]
+    pub fn with_fit_energy_range(mut self, range: Option<(f64, f64)>) -> Self {
+        self.fit_energy_range = range;
         self
     }
 
@@ -702,6 +732,12 @@ impl UnifiedFitConfig {
     /// (see [`Self::with_energy_scale`]).
     pub fn fit_energy_scale(&self) -> bool {
         self.fit_energy_scale
+    }
+    /// User-specified fit-energy-range restriction (SAMMY REGION
+    /// equivalent), or `None` for full-grid fitting.
+    /// See [`Self::with_fit_energy_range`].
+    pub fn fit_energy_range(&self) -> Option<(f64, f64)> {
+        self.fit_energy_range
     }
     pub fn precomputed_cross_sections(&self) -> Option<&Arc<Vec<Vec<f64>>>> {
         self.precomputed_cross_sections.as_ref()
@@ -1066,6 +1102,14 @@ fn fit_transmission_lm(
         build_transmission_model(config, n_density_params, _temperature_index)?
     };
 
+    // Build the per-bin active mask (SAMMY REGION-equivalent fit-energy
+    // -range restriction).  `None` when no range is configured — the
+    // LM core treats that as "all bins active".
+    let active_mask = nereids_fitting::active_mask::build_active_mask(
+        config.energies(),
+        config.fit_energy_range(),
+    );
+
     // Dispatch with optional background wrapping
     let result = if let Some(bi) = bg_indices {
         let wrapped = if let (Some(di), Some(fi)) = (bi.back_d, bi.back_f) {
@@ -1089,9 +1133,23 @@ fn fit_transmission_lm(
                 bi.back_c,
             )
         };
-        lm::levenberg_marquardt(&wrapped, measured_t, sigma, &mut params, &lm_cfg)?
+        lm::levenberg_marquardt_with_mask(
+            &wrapped,
+            measured_t,
+            sigma,
+            &mut params,
+            &lm_cfg,
+            active_mask.as_deref(),
+        )?
     } else {
-        lm::levenberg_marquardt(&*model, measured_t, sigma, &mut params, &lm_cfg)?
+        lm::levenberg_marquardt_with_mask(
+            &*model,
+            measured_t,
+            sigma,
+            &mut params,
+            &lm_cfg,
+            active_mask.as_deref(),
+        )?
     };
 
     let mut sr = extract_result(config, &result, n_density_params, bg_indices)?;
@@ -1420,6 +1478,16 @@ fn fit_counts_joint_poisson(
     // Its analytical Jacobian chains through the inner model correctly,
     // so JointPoissonObjective picks up gradients for both density and
     // background parameters without further wiring.
+
+    // Build the per-bin active mask (SAMMY REGION-equivalent fit-energy
+    // -range restriction).  `None` when no range is configured — the
+    // JP objective treats that as "all bins active".
+    let active_mask = nereids_fitting::active_mask::build_active_mask(
+        config.energies(),
+        config.fit_energy_range(),
+    );
+    let active_mask_slice = active_mask.as_deref();
+
     let result;
     if let Some(bi) = bg_indices {
         let wrapped = NormalizedTransmissionModel::new(
@@ -1435,6 +1503,7 @@ fn fit_counts_joint_poisson(
             o: flux,
             s: sample_counts,
             c,
+            active_mask: active_mask_slice,
         };
         let mut cfg = jp_cfg.clone();
         cfg.compute_covariance = config.compute_covariance;
@@ -1447,6 +1516,7 @@ fn fit_counts_joint_poisson(
             o: flux,
             s: sample_counts,
             c,
+            active_mask: active_mask_slice,
         };
         let mut cfg = jp_cfg.clone();
         cfg.compute_covariance = config.compute_covariance;
@@ -3799,6 +3869,90 @@ mod tests {
         assert!(
             err.to_string().contains("fit_back_d"),
             "expected partial-BackD/F rejection on transmission-PoissonKL path"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Fit-energy-range provenance + masked equivalence (#514).
+    // ------------------------------------------------------------------
+
+    /// `with_fit_energy_range(...)` round-trips through the accessor.
+    #[test]
+    fn test_unified_fit_config_fit_energy_range_round_trips() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..21).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let cfg = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap();
+        assert_eq!(cfg.fit_energy_range(), None);
+
+        let cfg = cfg.with_fit_energy_range(Some((5.0, 50.0)));
+        assert_eq!(cfg.fit_energy_range(), Some((5.0, 50.0)));
+
+        // Setting back to None clears it.
+        let cfg = cfg.with_fit_energy_range(None);
+        assert_eq!(cfg.fit_energy_range(), None);
+    }
+
+    /// LM fit with `fit_energy_range = Some((min, max))` on the full
+    /// grid must yield the same density as the same fit run on the
+    /// `[min, max]` slice directly when the residual outside the range
+    /// is negligible (SAMMY REGION semantics, paper-acceptance test).
+    #[test]
+    fn test_fit_energy_range_lm_matches_subset_when_outside_negligible() {
+        let data = u238_single_resonance();
+        let true_density = 0.002;
+        // Wide grid: 0.5..10.5 eV in 0.05 eV steps.  The U-238 single
+        // resonance sits well inside [4, 8] eV, so a fit restricted to
+        // that range should recover the same density as the full-grid
+        // fit (residual outside is negligible).
+        let energies: Vec<f64> = (0..201).map(|i| 0.5 + (i as f64) * 0.05).collect();
+        let (t, sigma) = synthetic_transmission(&data, true_density, &energies);
+
+        let cfg_full = UnifiedFitConfig::new(
+            energies.clone(),
+            vec![data.clone()],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()));
+
+        let cfg_masked = UnifiedFitConfig::new(
+            energies.clone(),
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
+        .with_fit_energy_range(Some((4.0, 8.0)));
+
+        let input = InputData::Transmission {
+            transmission: t,
+            uncertainty: sigma,
+        };
+        let r_full = fit_spectrum_typed(&input, &cfg_full).unwrap();
+        let r_masked = fit_spectrum_typed(&input, &cfg_masked).unwrap();
+        assert!(r_full.converged && r_masked.converged);
+
+        let d_full = r_full.densities[0];
+        let d_masked = r_masked.densities[0];
+        let rel_err = (d_full - d_masked).abs() / d_full.abs();
+        assert!(
+            rel_err < 0.01,
+            "fit_energy_range LM density {d_masked} should match full-grid {d_full} \
+             within 1% (got rel_err = {rel_err})"
         );
     }
 }
