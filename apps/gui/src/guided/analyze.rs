@@ -1479,7 +1479,14 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
     // Reserve space below the plot for the tick strips so neither the plot nor
     // the track viewport pushes past the cockpit column. Fit results live in
     // the right inspector, not below the spectrum.
-    let plot_height = (ui.available_height() - 20.0 - strips_total_height).max(220.0);
+    //
+    // Floor budget at 160 px (was 220) so half-height windows don't overflow
+    // the parent cockpit-column allocation: with `MAX_VISIBLE_STRIPS = 6`
+    // (capped by the picker), `strips_total_height` is at most ~130 px, and
+    // 160 + 130 + 20 = 310 fits within `col_height ≈ 300+` on a 640 px
+    // viewport. At smaller column heights the plot collapses gracefully but
+    // the layout stays inside its allocation.
+    let plot_height = (ui.available_height() - 20.0 - strips_total_height).max(160.0);
 
     // Plot
     let y_label = if show_counts {
