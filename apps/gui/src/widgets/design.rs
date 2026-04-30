@@ -768,7 +768,7 @@ pub(crate) fn endf_fetch_worker(
     tx: mpsc::Sender<EndfFetchResult>,
 ) {
     let retriever = nereids_endf::retrieval::EndfRetriever::new();
-    for item in work {
+    for (idx, item) in work.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
@@ -791,7 +791,36 @@ pub(crate) fn endf_fetch_worker(
                 Ok(data) => Ok(data),
                 Err(e) => Err(format!("Parse error for {}: {e}", item.symbol)),
             },
-            Err(e) => Err(format!("Fetch error for {}: {e}", item.symbol)),
+            Err(e) => {
+                let blocked = e.is_remote_access_blocked();
+                let msg = format!("Fetch error for {}: {e}", item.symbol);
+                if blocked {
+                    let _ = tx.send(EndfFetchResult {
+                        z: item.z,
+                        a: item.a,
+                        target: item.target,
+                        symbol: item.symbol.clone(),
+                        result: Err(msg.clone()),
+                    });
+                    for skipped in &work[idx + 1..] {
+                        if cancel.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let _ = tx.send(EndfFetchResult {
+                            z: skipped.z,
+                            a: skipped.a,
+                            target: skipped.target,
+                            symbol: skipped.symbol.clone(),
+                            result: Err(format!(
+                                "Skipped {} because the upstream ENDF server blocked this batch; retry later.",
+                                skipped.symbol
+                            )),
+                        });
+                    }
+                    break;
+                }
+                Err(msg)
+            }
         };
         if cancel.load(Ordering::Relaxed) {
             break;
@@ -800,7 +829,7 @@ pub(crate) fn endf_fetch_worker(
             z: item.z,
             a: item.a,
             target: item.target,
-            symbol: item.symbol,
+            symbol: item.symbol.clone(),
             result,
         });
     }
