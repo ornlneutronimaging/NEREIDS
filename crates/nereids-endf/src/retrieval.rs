@@ -179,11 +179,15 @@ impl EndfRetriever {
         library: EndfLibrary,
         mat: u32,
     ) -> Result<String, EndfRetrievalError> {
-        if let Some(primary_url) = nndc_endf_url(isotope, library) {
-            if let Ok(text) = self.fetch_text(&primary_url, false) {
+        let nndc_url = nndc_endf_url(isotope, library);
+        let nndc_already_tried = if let Some(primary_url) = &nndc_url {
+            if let Ok(text) = self.fetch_text(primary_url, false) {
                 return Ok(text);
             }
-        }
+            true
+        } else {
+            false
+        };
 
         let zip_filename = library.zip_filename(isotope, mat);
         let url = format!("{}/{}/{}", self.base_url, library.url_path(), zip_filename);
@@ -191,9 +195,12 @@ impl EndfRetriever {
         match iaea_result {
             Ok(bytes) => return self.extract_endf_from_zip(&bytes),
             Err(err) if should_try_nndc_fallback(&err) => {
-                if let Some(fallback_url) = nndc_endf_url(isotope, library) {
-                    let text = self.fetch_text(&fallback_url, false)?;
-                    return Ok(text);
+                if !nndc_already_tried {
+                    if let Some(fallback_url) = &nndc_url {
+                        if let Ok(text) = self.fetch_text(fallback_url, false) {
+                            return Ok(text);
+                        }
+                    }
                 }
                 Err(err.into_retrieval_error(isotope, library))
             }
