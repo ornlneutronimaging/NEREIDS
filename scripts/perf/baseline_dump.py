@@ -57,10 +57,17 @@ def run_a1() -> dict:
         O3d_raw = f["Hf/open_beam/counts"][:][::-1, :, :]
         Q_s = float(f["Hf/120min/proton_charges/sample_values_uC"][:].sum())
         Q_ob = float(f["Hf/120min/proton_charges/ob_values_uC"][0])
-    mask = (E_full >= ENERGY_MIN) & (E_full <= ENERGY_MAX)
-    E = np.ascontiguousarray(E_full[mask])
-    S3d = np.ascontiguousarray(S3d_raw[mask]).astype(np.float64)
-    O3d = np.ascontiguousarray(O3d_raw[mask]).astype(np.float64)
+    # SAMMY REGION-equivalent: pass the full energy grid + per-bin
+    # data to NEREIDS and let the LM/JP cost paths mask residuals to
+    # `[ENERGY_MIN, ENERGY_MAX]` via `fit_energy_range`.  The model is
+    # evaluated on the full grid so resolution broadening at the
+    # boundaries is correct (#514) — equivalent to SAMMY's REGION cards
+    # which apply a kernel-margin internally.  Pre-PR-#514 this script
+    # cropped the data array directly, which truncated the kernel at
+    # the upper boundary near 200 eV.
+    E = np.ascontiguousarray(E_full)
+    S3d = np.ascontiguousarray(S3d_raw).astype(np.float64)
+    O3d = np.ascontiguousarray(O3d_raw).astype(np.float64)
     c = Q_s / Q_ob
     S_agg = S3d.sum(axis=(1, 2))
     O_agg = O3d.sum(axis=(1, 2))
@@ -89,6 +96,7 @@ def run_a1() -> dict:
         l_scale_init=1.005,
         energy_scale_flight_path_m=FLIGHT_PATH_M,
         resolution=res,
+        fit_energy_range=(ENERGY_MIN, ENERGY_MAX),
     )
     wall = time.time() - t0
     return {
@@ -112,13 +120,15 @@ def run_b2() -> dict:
         Q_ob = float(f["Hf/120min/proton_charges/ob_values_uC"][0])
     CROP_Y0, CROP_Y1 = 252, 256
     CROP_X0, CROP_X1 = 252, 256
-    mask = (E_full >= ENERGY_MIN) & (E_full <= ENERGY_MAX)
-    E = np.ascontiguousarray(E_full[mask])
+    # SAMMY REGION-equivalent: keep the FULL spectral axis, apply the
+    # pre-calibrated TZERO transformation to the whole grid, and let
+    # `fit_energy_range` mask the cost function (#514).  Spatial cropping
+    # in (y, x) is unchanged.
     S3d = np.ascontiguousarray(
-        S3d_raw[mask][:, CROP_Y0:CROP_Y1, CROP_X0:CROP_X1]
+        S3d_raw[:, CROP_Y0:CROP_Y1, CROP_X0:CROP_X1]
     ).astype(np.float64)
     O3d = np.ascontiguousarray(
-        O3d_raw[mask][:, CROP_Y0:CROP_Y1, CROP_X0:CROP_X1]
+        O3d_raw[:, CROP_Y0:CROP_Y1, CROP_X0:CROP_X1]
     ).astype(np.float64)
     c = Q_s / Q_ob
 
@@ -126,9 +136,21 @@ def run_b2() -> dict:
     L_SCALE = 1.0052452911520162
     tof_factor = (0.5 * 1.67492749804e-27 / 1.602176634e-19) ** 0.5 * 1.0e6
     L_eff = FLIGHT_PATH_M * L_SCALE
-    tof = tof_factor * FLIGHT_PATH_M / np.sqrt(E)
-    tof_corr = tof - T0_US
-    E_cal = np.ascontiguousarray((tof_factor * L_eff / tof_corr) ** 2)
+    # Apply TZERO calibration to the full nominal grid.  The
+    # transformation is monotonic, so the calibrated bins originally
+    # corresponding to nominal `[ENERGY_MIN, ENERGY_MAX]` map to a
+    # well-defined `[fit_min_cal, fit_max_cal]` range on the calibrated
+    # axis.
+    tof_full = tof_factor * FLIGHT_PATH_M / np.sqrt(E_full)
+    tof_corr_full = tof_full - T0_US
+    E_cal_full = np.ascontiguousarray((tof_factor * L_eff / tof_corr_full) ** 2)
+
+    def _tzero_cal(e_nominal: float) -> float:
+        tof = tof_factor * FLIGHT_PATH_M / np.sqrt(e_nominal)
+        return float((tof_factor * L_eff / (tof - T0_US)) ** 2)
+
+    fit_min_cal = _tzero_cal(ENERGY_MIN)
+    fit_max_cal = _tzero_cal(ENERGY_MAX)
 
     hf_group = nereids.IsotopeGroup.natural(72)
     hf_group.load_endf()
@@ -140,7 +162,7 @@ def run_b2() -> dict:
     t0 = time.time()
     r = nereids.spatial_map_typed(
         data=input_data,
-        energies=E_cal,
+        energies=E_cal_full,
         solver="kl",
         c=c,
         temperature_k=TEMP_K,
@@ -150,6 +172,7 @@ def run_b2() -> dict:
         background=True,
         resolution=res,
         dead_pixels=dead_pixels,
+        fit_energy_range=(fit_min_cal, fit_max_cal),
     )
     wall = time.time() - t0
     dens = np.asarray(r.density_maps[0])
@@ -173,13 +196,15 @@ def run_b1() -> dict:
         Q_ob = float(f["Hf/120min/proton_charges/ob_values_uC"][0])
     CROP_Y0, CROP_Y1 = 254, 256
     CROP_X0, CROP_X1 = 254, 256
-    mask = (E_full >= ENERGY_MIN) & (E_full <= ENERGY_MAX)
-    E = np.ascontiguousarray(E_full[mask])
+    # SAMMY REGION-equivalent: full nominal axis + `fit_energy_range`
+    # mask in the LM cost path (#514).  TZERO is FITTED (not pre-
+    # calibrated) here, so the axis stays nominal.
+    E = np.ascontiguousarray(E_full)
     S3d = np.ascontiguousarray(
-        S3d_raw[mask][:, CROP_Y0:CROP_Y1, CROP_X0:CROP_X1]
+        S3d_raw[:, CROP_Y0:CROP_Y1, CROP_X0:CROP_X1]
     ).astype(np.float64)
     O3d = np.ascontiguousarray(
-        O3d_raw[mask][:, CROP_Y0:CROP_Y1, CROP_X0:CROP_X1]
+        O3d_raw[:, CROP_Y0:CROP_Y1, CROP_X0:CROP_X1]
     ).astype(np.float64)
     c = Q_s / Q_ob
     T3d = S3d / np.maximum(c * O3d, 1.0)
@@ -209,6 +234,7 @@ def run_b1() -> dict:
         energy_scale_flight_path_m=FLIGHT_PATH_M,
         resolution=res,
         dead_pixels=dead_pixels,
+        fit_energy_range=(ENERGY_MIN, ENERGY_MAX),
     )
     wall = time.time() - t0
     dens = np.asarray(r.density_maps[0])
@@ -240,10 +266,11 @@ def _run_periso_tzero(solver: str, crop_size: int, label: str, max_iter: int) ->
     x0 = 255 - crop_size // 2
     y1 = y0 + crop_size
     x1 = x0 + crop_size
-    mask = (E_full >= ENERGY_MIN) & (E_full <= ENERGY_MAX)
-    E = np.ascontiguousarray(E_full[mask])
-    S3d = np.ascontiguousarray(S3d_raw[mask][:, y0:y1, x0:x1]).astype(np.float64)
-    O3d = np.ascontiguousarray(O3d_raw[mask][:, y0:y1, x0:x1]).astype(np.float64)
+    # SAMMY REGION-equivalent: full nominal axis + `fit_energy_range`
+    # mask in the per-pixel cost path (#514).
+    E = np.ascontiguousarray(E_full)
+    S3d = np.ascontiguousarray(S3d_raw[:, y0:y1, x0:x1]).astype(np.float64)
+    O3d = np.ascontiguousarray(O3d_raw[:, y0:y1, x0:x1]).astype(np.float64)
     c = Q_s / Q_ob
 
     hf_group = nereids.IsotopeGroup.natural(72)
@@ -279,6 +306,7 @@ def _run_periso_tzero(solver: str, crop_size: int, label: str, max_iter: int) ->
         energy_scale_flight_path_m=FLIGHT_PATH_M,
         resolution=res,
         dead_pixels=dead_pixels,
+        fit_energy_range=(ENERGY_MIN, ENERGY_MAX),
     )
     if solver == "kl":
         kwargs["c"] = c

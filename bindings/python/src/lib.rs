@@ -2966,6 +2966,7 @@ fn spatial_result_to_py(
     delta_l_m = None,
     groups = None,
     tzero_jacobian = None,
+    fit_energy_range = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn py_spatial_map_typed<'py>(
@@ -2996,6 +2997,7 @@ fn py_spatial_map_typed<'py>(
     delta_l_m: Option<f64>,
     groups: Option<Vec<PyIsotopeGroup>>,
     tzero_jacobian: Option<&str>,
+    fit_energy_range: Option<(f64, f64)>,
 ) -> PyResult<PySpatialResult> {
     // Validate mutual exclusivity
     let has_isotopes = isotopes.is_some();
@@ -3195,6 +3197,15 @@ fn py_spatial_map_typed<'py>(
     // Dead pixels
     let dead_arr = dead_pixels.map(|dp| dp.as_array().to_owned());
 
+    // SAMMY REGION-equivalent fit-energy-range (#514): mask residuals
+    // to bins inside [E_min, E_max] in both LM and joint-Poisson per-
+    // pixel cost paths.  The model is evaluated on the full grid so
+    // resolution broadening at the boundaries is correct.  No Python
+    // -side data slicing required.
+    config = config
+        .with_fit_energy_range(fit_energy_range)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+
     // GIL held during computation.  InputData3D borrows PyInputData arrays
     // which are not Send, so we cannot use py.allow_threads().  The existing
     // py_spatial_map has the same limitation.  Rayon still parallelizes the
@@ -3272,6 +3283,7 @@ fn py_spatial_map_typed<'py>(
     initial_densities = None,
     enable_polish = None,
     tzero_jacobian = None,
+    fit_energy_range = None,
 ))]
 fn py_fit_counts_spectrum_typed<'py>(
     py: Python<'py>,
@@ -3306,6 +3318,7 @@ fn py_fit_counts_spectrum_typed<'py>(
     initial_densities: Option<Vec<f64>>,
     enable_polish: Option<bool>,
     tzero_jacobian: Option<&str>,
+    fit_energy_range: Option<(f64, f64)>,
 ) -> PyResult<PyFitResult> {
     use nereids_pipeline::pipeline::{
         CountsBackgroundConfig, InputData, UnifiedFitConfig, fit_spectrum_typed,
@@ -3494,6 +3507,16 @@ fn py_fit_counts_spectrum_typed<'py>(
     if let Some(v) = enable_polish {
         config = config.with_counts_enable_polish(Some(v));
     }
+
+    // SAMMY REGION-equivalent fit-energy-range (#514): mask residuals
+    // to bins inside [E_min, E_max]; the joint-Poisson cost path
+    // honours the mask in deviance / gradient / Fisher loops.  No
+    // Python-side data slicing required — the model is evaluated on
+    // the full grid so resolution broadening at the boundaries is
+    // correct.
+    config = config
+        .with_fit_energy_range(fit_energy_range)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
     let result = py.detach(move || fit_spectrum_typed(&input, &config).map_err(|e| e.to_string()));
     let result = result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
@@ -3806,6 +3829,7 @@ fn py_compute_model_jacobian<'py>(
     groups = None,
     initial_densities = None,
     tzero_jacobian = None,
+    fit_energy_range = None,
 ))]
 fn py_fit_spectrum_typed<'py>(
     py: Python<'py>,
@@ -3833,6 +3857,7 @@ fn py_fit_spectrum_typed<'py>(
     groups: Option<Vec<PyIsotopeGroup>>,
     initial_densities: Option<Vec<f64>>,
     tzero_jacobian: Option<&str>,
+    fit_energy_range: Option<(f64, f64)>,
 ) -> PyResult<PyFitResult> {
     use nereids_pipeline::pipeline::{InputData, fit_spectrum_typed};
 
@@ -3966,6 +3991,17 @@ fn py_fit_spectrum_typed<'py>(
     if tzero_method.is_some() {
         config = config.with_tzero_jacobian_method(tzero_method);
     }
+
+    // SAMMY REGION-equivalent fit-energy-range (#514): when set, the
+    // LM cost-function masks residuals to bins inside [E_min, E_max].
+    // The Python caller is expected to pass full grid + per-bin data
+    // and let the solver-side mask handle the restriction; the model
+    // is still evaluated on the full grid so resolution broadening at
+    // the boundaries remains correct (no caller-side margin slicing
+    // needed).
+    config = config
+        .with_fit_energy_range(fit_energy_range)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
     // Build 1D InputData
     let input = InputData::Transmission {

@@ -44,13 +44,15 @@ def main() -> None:
         O3d_raw = f["Hf/open_beam/counts"][:][::-1, :, :]
         Q_s = float(f["Hf/120min/proton_charges/sample_values_uC"][:].sum())
         Q_ob = float(f["Hf/120min/proton_charges/ob_values_uC"][0])
-    mask = (E_full >= ENERGY_MIN) & (E_full <= ENERGY_MAX)
-    E = np.ascontiguousarray(E_full[mask])
+    # SAMMY REGION-equivalent: full nominal axis + `fit_energy_range`
+    # mask in the LM cost path (#514).  TZERO is FITTED here, so the
+    # axis stays nominal.  Spatial cropping in (y, x) is unchanged.
+    E = np.ascontiguousarray(E_full)
     S3d = np.ascontiguousarray(
-        S3d_raw[mask][:, CROP_Y0:CROP_Y1, CROP_X0:CROP_X1]
+        S3d_raw[:, CROP_Y0:CROP_Y1, CROP_X0:CROP_X1]
     ).astype(np.float64)
     O3d = np.ascontiguousarray(
-        O3d_raw[mask][:, CROP_Y0:CROP_Y1, CROP_X0:CROP_X1]
+        O3d_raw[:, CROP_Y0:CROP_Y1, CROP_X0:CROP_X1]
     ).astype(np.float64)
     c = Q_s / Q_ob
 
@@ -83,6 +85,7 @@ def main() -> None:
         energy_scale_flight_path_m=FLIGHT_PATH_M,
         resolution=res,
         dead_pixels=dead_pixels,
+        fit_energy_range=(ENERGY_MIN, ENERGY_MAX),
     )
 
     Path("/tmp/b1_ready").write_text("ready\n")
@@ -103,6 +106,7 @@ def main() -> None:
         energy_scale_flight_path_m=FLIGHT_PATH_M,
         resolution=res,
         dead_pixels=dead_pixels,
+        fit_energy_range=(ENERGY_MIN, ENERGY_MAX),
     )
     wall = time.time() - t0
     n_px = (CROP_Y1 - CROP_Y0) * (CROP_X1 - CROP_X0)
