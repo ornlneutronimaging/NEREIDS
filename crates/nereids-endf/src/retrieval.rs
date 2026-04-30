@@ -193,14 +193,13 @@ impl EndfRetriever {
         let url = format!("{}/{}/{}", self.base_url, library.url_path(), zip_filename);
         let iaea_result = self.fetch_bytes(&url, true);
         match iaea_result {
-            Ok(bytes) => return self.extract_endf_from_zip(&bytes),
+            Ok(bytes) => self.extract_endf_from_zip(&bytes),
             Err(err) if should_try_nndc_fallback(&err) => {
-                if !nndc_already_tried {
-                    if let Some(fallback_url) = &nndc_url {
-                        if let Ok(text) = self.fetch_text(fallback_url, false) {
-                            return Ok(text);
-                        }
-                    }
+                if !nndc_already_tried
+                    && let Some(fallback_url) = &nndc_url
+                    && let Ok(text) = self.fetch_text(fallback_url, false)
+                {
+                    return Ok(text);
                 }
                 Err(err.into_retrieval_error(isotope, library))
             }
