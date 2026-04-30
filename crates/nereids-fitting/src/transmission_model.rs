@@ -17,6 +17,25 @@ use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
 use crate::error::FittingError;
 use crate::lm::{FitModel, FlatMatrix};
 
+/// Threshold for `L_scale` division safety in the partial-GAL rank-1
+/// derivation of the energy-scale Jacobian.  When
+/// `|l_scale| < L_SCALE_EPSILON`, the per-bin
+/// `(tof_i - t0_clamped) / l_scale` factor in
+/// [`EnergyScaleTransmissionModel::analytical_jacobian`] blows up,
+/// and combined with the FD-based reference t0 column (which goes to
+/// ~0 at the same boundary) produces NaN entries in the L_scale
+/// Jacobian column.
+///
+/// Below this threshold the L_scale column falls through to the
+/// per-coordinate central-FD path that already follows the partial-GAL
+/// block in the same function.  `1.0e-12` matches the t0 clamp tolerance
+/// used in [`EnergyScaleTransmissionModel::corrected_energies`] and the
+/// partial-GAL t0 FD precompute — both clamps protect against the same
+/// `(tof - t0) / l_eff` blow-up at the energy-scale-degenerate corner.
+/// See PR #498 for the parallel t0 fallthrough and issue #500 for the
+/// L_scale gap closure.
+const L_SCALE_EPSILON: f64 = 1.0e-12;
+
 /// Transmission model backed by precomputed Doppler-broadened cross-sections.
 ///
 /// The expensive physics steps (resonance → σ(E), Doppler broadening) are
@@ -2213,24 +2232,40 @@ impl FitModel for EnergyScaleTransmissionModel {
                         continue;
                     }
                     if fp_idx == self.l_scale_index {
-                        let t0 = params[self.t0_index];
                         let l_scale = params[self.l_scale_index];
-                        // Match the `corrected_energies` t0 clamp so the
-                        // (tof - t0) factor in the rank-1 derivation
-                        // agrees with the production forward at the
-                        // clamp boundary.
-                        let min_tof_us = self
-                            .nominal_energies
-                            .iter()
-                            .map(|&e| self.tof_factor * self.flight_path_m / e.sqrt())
-                            .fold(f64::INFINITY, f64::min);
-                        let t0_clamped = t0.min(min_tof_us * (1.0 - 1.0e-12));
-                        for (i, &e_nom) in self.nominal_energies.iter().enumerate() {
-                            let tof_i = self.tof_factor * self.flight_path_m / e_nom.sqrt();
-                            let scale = (tof_i - t0_clamped) / l_scale;
-                            *jacobian.get_mut(i, col) = scale * partial_t0_col[i];
+                        // Issue #500: at `l_scale ≈ 0` the rank-1 factor
+                        // `(tof - t0_clamped) / l_scale` blows up and
+                        // produces NaN columns when combined with the
+                        // FD-based t0 reference (which goes to ~0 at the
+                        // same boundary).  Skip the partial-GAL path
+                        // and fall through to the per-coordinate FD
+                        // section below — mirrors the t0 clamp-boundary
+                        // fallthrough PR #498 added (when
+                        // `partial_gal_t0_column` is `None`, the entire
+                        // partial-GAL block is skipped).  Production
+                        // L_scale bounds are typically `[0.99, 1.01]`,
+                        // so this guard fires only at API edge cases.
+                        if l_scale.abs() >= L_SCALE_EPSILON {
+                            let t0 = params[self.t0_index];
+                            // Match the `corrected_energies` t0 clamp so the
+                            // (tof - t0) factor in the rank-1 derivation
+                            // agrees with the production forward at the
+                            // clamp boundary.
+                            let min_tof_us = self
+                                .nominal_energies
+                                .iter()
+                                .map(|&e| self.tof_factor * self.flight_path_m / e.sqrt())
+                                .fold(f64::INFINITY, f64::min);
+                            let t0_clamped = t0.min(min_tof_us * (1.0 - 1.0e-12));
+                            for (i, &e_nom) in self.nominal_energies.iter().enumerate() {
+                                let tof_i = self.tof_factor * self.flight_path_m / e_nom.sqrt();
+                                let scale = (tof_i - t0_clamped) / l_scale;
+                                *jacobian.get_mut(i, col) = scale * partial_t0_col[i];
+                            }
+                            continue;
                         }
-                        continue;
+                        // l_scale ≈ 0: do NOT `continue`; flow falls
+                        // through to the FD path below for this column.
                     }
                 }
                 // Finite difference for energy-scale parameters.
@@ -5121,6 +5156,82 @@ mod tests {
                 rel_err < 1e-3 || abs_err < 1e-8,
                 "L_scale bin {i}: anal={anal:.6e} fd={fd:.6e} rel={rel_err:.2e}"
             );
+        }
+    }
+
+    /// Regression for #500: at `l_scale ≈ 0` the partial-GAL rank-1
+    /// derivation `(tof - t0_clamped) / l_scale` divides by zero,
+    /// producing a NaN L_scale Jacobian column.  After the fix, the
+    /// L_scale column falls through to the per-coordinate FD path —
+    /// every Jacobian entry must be finite, and the L_scale column
+    /// must agree with the FD2 reference (which uses the same
+    /// per-coordinate FD).
+    ///
+    /// Setup mirrors `partial_gal_no_resolution_matches_fd2` so the
+    /// FD-tolerance comparison against FD2 stays apples-to-apples.
+    #[test]
+    fn partial_gal_l_scale_zero_falls_through_to_finite_jacobian() {
+        let xs = vec![vec![1.0, 2.0, 3.0, 2.0, 1.5]];
+        let energies = vec![4.0, 9.0, 16.0, 25.0, 36.0];
+        let mut model = EnergyScaleTransmissionModel::new(
+            std::sync::Arc::new(xs),
+            std::sync::Arc::new(vec![0]),
+            energies.clone(),
+            25.0,
+            1, // t0_index
+            2, // l_scale_index
+            None,
+        )
+        .with_jacobian_method(EnergyScaleJacobianMethod::FiniteDifference);
+
+        // l_scale = 0.0 — well below `L_SCALE_EPSILON = 1e-12` — so the
+        // partial-GAL guard fires and falls through to FD.
+        let params = [0.1, 0.05, 0.0]; // density, t0, l_scale = 0
+        let free = vec![0, 1, 2];
+
+        // FD2 reference Jacobian.  FD2 computes each column via its
+        // own per-coordinate FD pair, so it produces well-defined
+        // finite values at l_scale = 0 (no division by l_scale in the
+        // FD2 path).
+        let jac_fd2 = model
+            .analytical_jacobian(&params, &free, &model.evaluate(&params).unwrap())
+            .expect("FD2 Jacobian should be available at l_scale = 0");
+
+        // Partial-GAL Jacobian — with the #500 guard, L_scale column
+        // falls through to the same per-coordinate FD path.
+        model = model.with_jacobian_method(EnergyScaleJacobianMethod::PartialGal);
+        let jac_pg = model
+            .analytical_jacobian(&params, &free, &model.evaluate(&params).unwrap())
+            .expect("partial-GAL Jacobian should be available at l_scale = 0 (fallthrough to FD)");
+
+        // Primary regression: every entry finite.  Pre-fix the L_scale
+        // column would be NaN from the `1 / l_scale` division.
+        for i in 0..jac_pg.nrows {
+            for c in 0..jac_pg.ncols {
+                let v = jac_pg.get(i, c);
+                assert!(
+                    v.is_finite(),
+                    "partial-GAL Jacobian must be finite at l_scale = 0; \
+                     got non-finite at ({i},{c}) = {v}"
+                );
+            }
+        }
+
+        // Bit-equivalent to FD2 across every column — confirms the
+        // L_scale fallthrough lands on the same FD code path FD2 uses,
+        // and the density / t0 columns are unchanged by the guard.
+        for c in 0..jac_pg.ncols {
+            for i in 0..jac_pg.nrows {
+                let fd2 = jac_fd2.get(i, c);
+                let pg = jac_pg.get(i, c);
+                let abs_err = (fd2 - pg).abs();
+                let rel_err = abs_err / fd2.abs().max(1e-15);
+                assert!(
+                    rel_err < 1e-3 || abs_err < 1e-8,
+                    "partial-GAL must match FD2 at l_scale = 0; \
+                     col {c} bin {i}: fd2={fd2:.6e} pg={pg:.6e} rel={rel_err:.2e}"
+                );
+            }
         }
     }
 }
