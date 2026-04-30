@@ -38,10 +38,13 @@ def main() -> None:
         O3d_raw = f["Hf/open_beam/counts"][:][::-1, :, :]
         Q_s = float(f["Hf/120min/proton_charges/sample_values_uC"][:].sum())
         Q_ob = float(f["Hf/120min/proton_charges/ob_values_uC"][0])
-    mask = (E_full >= ENERGY_MIN) & (E_full <= ENERGY_MAX)
-    E = np.ascontiguousarray(E_full[mask])
-    S3d = np.ascontiguousarray(S3d_raw[mask]).astype(np.float64)
-    O3d = np.ascontiguousarray(O3d_raw[mask]).astype(np.float64)
+    # SAMMY REGION-equivalent: full nominal axis + `fit_energy_range`
+    # mask in the LM cost path (#514).  Pre-PR-#514 this script
+    # cropped the data array directly, which truncated the resolution
+    # kernel at the upper boundary near 200 eV.
+    E = np.ascontiguousarray(E_full)
+    S3d = np.ascontiguousarray(S3d_raw).astype(np.float64)
+    O3d = np.ascontiguousarray(O3d_raw).astype(np.float64)
     c = Q_s / Q_ob
     S_agg = S3d.sum(axis=(1, 2))
     O_agg = O3d.sum(axis=(1, 2))
@@ -72,6 +75,7 @@ def main() -> None:
         l_scale_init=L_SCALE_INIT,
         energy_scale_flight_path_m=FLIGHT_PATH_M,
         resolution=res,
+        fit_energy_range=(ENERGY_MIN, ENERGY_MAX),
     )
 
     # Measured: the real workload.
@@ -91,6 +95,7 @@ def main() -> None:
         l_scale_init=L_SCALE_INIT,
         energy_scale_flight_path_m=FLIGHT_PATH_M,
         resolution=res,
+        fit_energy_range=(ENERGY_MIN, ENERGY_MAX),
     )
     wall = time.time() - t0
     print(
