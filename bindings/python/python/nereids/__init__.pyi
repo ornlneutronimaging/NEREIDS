@@ -784,6 +784,7 @@ def spatial_map_typed(
     delta_l_m: float | None = None,
     groups: list[IsotopeGroup] | None = None,
     tzero_jacobian: str | None = None,
+    fit_energy_range: tuple[float, float] | None = None,
 ) -> SpatialResult:
     """Spatial mapping using the typed input data API.
 
@@ -851,6 +852,7 @@ def fit_spectrum_typed(
     groups: list[IsotopeGroup] | None = None,
     initial_densities: list[float] | None = None,
     tzero_jacobian: str | None = None,
+    fit_energy_range: tuple[float, float] | None = None,
 ) -> FitResult:
     """Fit a single pre-normalized transmission spectrum.
 
@@ -910,6 +912,7 @@ def fit_counts_spectrum_typed(
     initial_densities: list[float] | None = None,
     enable_polish: bool | None = None,
     tzero_jacobian: str | None = None,
+    fit_energy_range: tuple[float, float] | None = None,
 ) -> FitResult:
     """Fit a single raw-count spectrum (sample + open-beam counts).
 

@@ -56,18 +56,31 @@ def main() -> None:
         O3d_raw = f["Hf/open_beam/counts"][:][::-1, :, :]
         Q_s = float(f["Hf/120min/proton_charges/sample_values_uC"][:].sum())
         Q_ob = float(f["Hf/120min/proton_charges/ob_values_uC"][0])
-    mask = (E_full >= ENERGY_MIN) & (E_full <= ENERGY_MAX)
-    E = np.ascontiguousarray(E_full[mask])
-    S3d = np.ascontiguousarray(S3d_raw[mask][:, y0:y1, x0:x1]).astype(np.float64)
-    O3d = np.ascontiguousarray(O3d_raw[mask][:, y0:y1, x0:x1]).astype(np.float64)
+    # SAMMY REGION-equivalent: keep the FULL spectral axis, apply
+    # pre-calibrated TZERO to the whole grid, and let
+    # `fit_energy_range` mask the cost function (#514).
+    S3d = np.ascontiguousarray(S3d_raw[:, y0:y1, x0:x1]).astype(np.float64)
+    O3d = np.ascontiguousarray(O3d_raw[:, y0:y1, x0:x1]).astype(np.float64)
     c = Q_s / Q_ob
 
-    # Pre-calibrated TZERO (A.2 values), same as B.2 gate.
+    # Pre-calibrated TZERO (A.2 values), same as B.2 gate, applied to
+    # the full grid.
     tof_factor = (0.5 * 1.67492749804e-27 / 1.602176634e-19) ** 0.5 * 1.0e6
     L_eff = FLIGHT_PATH_M * L_SCALE
-    tof = tof_factor * FLIGHT_PATH_M / np.sqrt(E)
-    tof_corr = tof - T0_US
-    E_cal = np.ascontiguousarray((tof_factor * L_eff / tof_corr) ** 2)
+    # Guard: pre-PR-#519 the `mask = E_full >= 7.0` step filtered any
+    # bin with E ≤ 0 before sqrt; without it we assert the input axis
+    # is strictly positive so `sqrt(E_full)` can't inject NaN.
+    assert (E_full > 0).all(), "energy axis must be strictly positive"
+    tof_full = tof_factor * FLIGHT_PATH_M / np.sqrt(E_full)
+    tof_corr_full = tof_full - T0_US
+    E_cal_full = np.ascontiguousarray((tof_factor * L_eff / tof_corr_full) ** 2)
+
+    def _tzero_cal(e_nominal: float) -> float:
+        tof = tof_factor * FLIGHT_PATH_M / np.sqrt(e_nominal)
+        return float((tof_factor * L_eff / (tof - T0_US)) ** 2)
+
+    fit_min_cal = _tzero_cal(ENERGY_MIN)
+    fit_max_cal = _tzero_cal(ENERGY_MAX)
 
     hf_group = nereids.IsotopeGroup.natural(72)
     hf_group.load_endf()
@@ -78,7 +91,7 @@ def main() -> None:
     # Warm
     _ = nereids.spatial_map_typed(
         data=input_data,
-        energies=E_cal,
+        energies=E_cal_full,
         solver="kl",
         c=c,
         temperature_k=TEMP_K,
@@ -88,6 +101,7 @@ def main() -> None:
         background=True,
         resolution=res,
         dead_pixels=dead_pixels,
+        fit_energy_range=(fit_min_cal, fit_max_cal),
     )
 
     Path("/tmp/b2_at_scale_ready").write_text("ready\n")
@@ -95,7 +109,7 @@ def main() -> None:
     t0 = time.time()
     r = nereids.spatial_map_typed(
         data=input_data,
-        energies=E_cal,
+        energies=E_cal_full,
         solver="kl",
         c=c,
         temperature_k=TEMP_K,
@@ -105,6 +119,7 @@ def main() -> None:
         background=True,
         resolution=res,
         dead_pixels=dead_pixels,
+        fit_energy_range=(fit_min_cal, fit_max_cal),
     )
     wall = time.time() - t0
     n_px = crop * crop
