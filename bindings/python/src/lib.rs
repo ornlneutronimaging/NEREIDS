@@ -3200,8 +3200,8 @@ fn py_spatial_map_typed<'py>(
     // SAMMY REGION-equivalent fit-energy-range (#514): mask residuals
     // to bins inside [E_min, E_max] in both LM and joint-Poisson per-
     // pixel cost paths.  The model is evaluated on the full grid so
-    // resolution broadening at the boundaries is correct.  No Python
-    // -side data slicing required.
+    // resolution broadening at the boundaries is correct.
+    // No Python-side data slicing required.
     config = config
         .with_fit_energy_range(fit_energy_range)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;

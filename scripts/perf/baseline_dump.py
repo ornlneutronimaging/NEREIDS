@@ -143,10 +143,14 @@ def run_b2() -> dict:
     # axis.
     #
     # Guard: pre-PR-#519 the `mask = E_full >= 7.0` step filtered any
-    # bin with E ≤ 0 before sqrt; with the mask gone we assert the
+    # bin with E ≤ 0 before sqrt; with the mask gone we check the
     # input axis is strictly positive so `sqrt(E_full)` can't inject
     # NaN into `E_cal_full` and silently extend the active mask.
-    assert (E_full > 0).all(), "energy axis must be strictly positive"
+    # Use a runtime check rather than `assert` — `python -O` strips
+    # asserts, and a corrupt input axis injecting NaN downstream is
+    # much harder to debug than an upfront error.
+    if not np.all(E_full > 0):
+        raise ValueError("energy axis must be strictly positive")
     tof_full = tof_factor * FLIGHT_PATH_M / np.sqrt(E_full)
     tof_corr_full = tof_full - T0_US
     E_cal_full = np.ascontiguousarray((tof_factor * L_eff / tof_corr_full) ** 2)

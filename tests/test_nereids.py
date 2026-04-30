@@ -1527,10 +1527,12 @@ class TestVenusMlbwRegression:
 
 class TestFitEnergyRangeBindingParameter:
     """Tests for the SAMMY REGION-equivalent `fit_energy_range` parameter
-    on the three Python binding entry points (`fit_spectrum_typed`,
-    `fit_counts_spectrum_typed`, `spatial_map_typed`).  Locks in the
-    behaviour the perf scripts now depend on for SoftwareX-paper SAMMY
-    parity.
+    on `fit_spectrum_typed`.  The other two binding entry points
+    (`fit_counts_spectrum_typed`, `spatial_map_typed`) share the same
+    config-builder code path (`with_fit_energy_range(...).map_err(...)?`
+    after the rest of the chain), so a regression in the validation /
+    plumbing surfaces here too.  Locks in the behaviour the perf
+    scripts now depend on for SoftwareX-paper SAMMY parity.
     """
 
     def test_fit_spectrum_typed_full_grid_with_range_matches_pre_cropped(
@@ -1585,12 +1587,16 @@ class TestFitEnergyRangeBindingParameter:
         assert bool(r_cropped.converged) is True
         assert bool(r_ranged.converged) is True
 
-        # Densities should agree within ~1% — exact agreement is not
-        # required because pre-cropping truncates the kernel at the
-        # boundary while fit_energy_range applies the full broadening.
-        # Without resolution broadening configured (the default in this
-        # test), the two should be much closer (within ~1e-6 rel) since
-        # there's no kernel truncation effect.
+        # No resolution broadening is configured in this test, so the
+        # only difference between "pre-crop" and "full grid + range" is
+        # whether the LM cost path sums residuals over the same set of
+        # active bins — which it does (the mask matches the explicit
+        # crop bin-for-bin).  Densities therefore agree to numerical-
+        # noise tolerance.  We enforce 1e-4 — much tighter than any
+        # broadening-effect tolerance, but loose enough to absorb BLAS
+        # ordering noise across platforms.  Tightening below 1e-4 risks
+        # platform-flapping; loosening above 1e-4 lets a real masking
+        # regression slip through.
         rel_err = abs(r_cropped.densities[0] - r_ranged.densities[0]) / abs(
             r_ranged.densities[0]
         )
@@ -1644,17 +1650,28 @@ class TestFitEnergyRangeBindingParameter:
         t = np.asarray(nereids.forward_model(energies, [(u238_data, true_density)]))
         sigma = np.full_like(t, 0.005)
 
+        # Seed the fit away from the truth (5× too high) so a do-nothing
+        # solver path (e.g. a regression that treats `fit_energy_range
+        # = None` as "no active bins" → returns the initial parameters
+        # unchanged) is detectable: the assertion below would fire on
+        # the seed value `5e-3`, not on the true `1e-3`.
         r = nereids.fit_spectrum_typed(
             transmission=t,
             uncertainty=sigma,
             energies=energies,
-            isotopes=[(u238_data, true_density)],
+            isotopes=[(u238_data, 5.0 * true_density)],
             solver="lm",
             temperature_k=293.6,
             max_iter=100,
         )
-        # Recovery on noiseless data should be tight; this catches a
-        # regression where `None` is treated as a degenerate range.
+        # Recovery on noiseless data should be tight; with the wrong
+        # seed, this catches both "degenerate range" regressions AND
+        # any regression that prevents convergence outright.
         assert bool(r.converged) is True
-        assert abs(r.densities[0] - true_density) / true_density < 1e-3
+        assert abs(r.densities[0] - true_density) / true_density < 1e-3, (
+            f"density did not converge to truth: got {r.densities[0]:.6e}, "
+            f"expected {true_density:.6e} (initial seed was "
+            f"{5.0 * true_density:.6e}, so a do-nothing solver path "
+            f"would leave the param at the seed)"
+        )
 
