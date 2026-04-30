@@ -1519,3 +1519,142 @@ class TestVenusMlbwRegression:
             f"A dispatch regression can prevent convergence entirely — investigate."
         )
 
+
+# ===========================================================================
+# fit_energy_range Python parameter (#514 / PR #519)
+# ===========================================================================
+
+
+class TestFitEnergyRangeBindingParameter:
+    """Tests for the SAMMY REGION-equivalent `fit_energy_range` parameter
+    on the three Python binding entry points (`fit_spectrum_typed`,
+    `fit_counts_spectrum_typed`, `spatial_map_typed`).  Locks in the
+    behaviour the perf scripts now depend on for SoftwareX-paper SAMMY
+    parity.
+    """
+
+    def test_fit_spectrum_typed_full_grid_with_range_matches_pre_cropped(
+        self, u238_data
+    ):
+        """`fit_spectrum_typed` called with the full grid +
+        `fit_energy_range=(low, high)` must produce the same density as
+        the equivalent pre-cropped fit (within tight numerical tolerance).
+        This is the SAMMY-parity contract: the model is evaluated on the
+        full grid so resolution broadening at the boundaries is correct,
+        and the LM cost path masks residuals to the inner range.
+        """
+        # Synthetic noisy transmission across a wide energy grid with a
+        # single resonance at 6.67 eV.
+        energies = np.linspace(1.0, 30.0, 600)
+        true_density = 0.0008
+        t_clean = np.asarray(
+            nereids.forward_model(energies, [(u238_data, true_density)])
+        )
+        rng = np.random.default_rng(20260430)
+        t_obs = t_clean + rng.normal(0.0, 0.005, size=t_clean.shape)
+        sigma = np.full_like(t_obs, 0.005)
+
+        e_min, e_max = 4.0, 12.0  # window around the 6.67 eV resonance
+
+        # Approach 1: pre-crop in Python (legacy pattern).
+        mask = (energies >= e_min) & (energies <= e_max)
+        r_cropped = nereids.fit_spectrum_typed(
+            transmission=np.ascontiguousarray(t_obs[mask]),
+            uncertainty=np.ascontiguousarray(sigma[mask]),
+            energies=np.ascontiguousarray(energies[mask]),
+            isotopes=[(u238_data, true_density)],
+            solver="lm",
+            temperature_k=293.6,
+            max_iter=200,
+        )
+
+        # Approach 2: full grid + fit_energy_range (the new SAMMY-parity
+        # path).
+        r_ranged = nereids.fit_spectrum_typed(
+            transmission=t_obs,
+            uncertainty=sigma,
+            energies=energies,
+            isotopes=[(u238_data, true_density)],
+            solver="lm",
+            temperature_k=293.6,
+            max_iter=200,
+            fit_energy_range=(e_min, e_max),
+        )
+
+        # Both should converge.
+        assert bool(r_cropped.converged) is True
+        assert bool(r_ranged.converged) is True
+
+        # Densities should agree within ~1% — exact agreement is not
+        # required because pre-cropping truncates the kernel at the
+        # boundary while fit_energy_range applies the full broadening.
+        # Without resolution broadening configured (the default in this
+        # test), the two should be much closer (within ~1e-6 rel) since
+        # there's no kernel truncation effect.
+        rel_err = abs(r_cropped.densities[0] - r_ranged.densities[0]) / abs(
+            r_ranged.densities[0]
+        )
+        assert rel_err < 1e-4, (
+            f"density disagreement: cropped={r_cropped.densities[0]:.6e}, "
+            f"ranged={r_ranged.densities[0]:.6e}, rel_err={rel_err:.3e}"
+        )
+
+    def test_fit_spectrum_typed_rejects_invalid_range(self, u238_data):
+        """Invalid `fit_energy_range` (reversed, non-finite, or empty)
+        must raise `ValueError` from the binding — the underlying
+        `with_fit_energy_range` setter validates these and the binding
+        propagates the error with `?`.
+        """
+        energies = np.linspace(1.0, 30.0, 200)
+        t = np.full_like(energies, 0.95)
+        sigma = np.full_like(energies, 0.01)
+
+        # Reversed range.
+        with pytest.raises(ValueError, match="strictly less than max"):
+            nereids.fit_spectrum_typed(
+                transmission=t,
+                uncertainty=sigma,
+                energies=energies,
+                isotopes=[(u238_data, 0.001)],
+                fit_energy_range=(20.0, 5.0),
+            )
+
+        # Non-finite bound.
+        with pytest.raises(ValueError, match="finite"):
+            nereids.fit_spectrum_typed(
+                transmission=t,
+                uncertainty=sigma,
+                energies=energies,
+                isotopes=[(u238_data, 0.001)],
+                fit_energy_range=(float("nan"), 20.0),
+            )
+
+    def test_fit_spectrum_typed_default_none_unchanged(self, u238_data):
+        """Calling without `fit_energy_range` must produce the same
+        result as before the parameter was added.  Backward-compat
+        regression against accidentally treating `None` as "narrow to
+        the smallest range" or other surprising semantics.
+        """
+        energies = np.linspace(1.0, 30.0, 400)
+        true_density = 0.001
+        # Match temperatures: `forward_model` uses 293.6 K by default,
+        # so the fit must too — otherwise Doppler-broadening mismatch
+        # produces a multi-percent density bias unrelated to the
+        # parameter under test.
+        t = np.asarray(nereids.forward_model(energies, [(u238_data, true_density)]))
+        sigma = np.full_like(t, 0.005)
+
+        r = nereids.fit_spectrum_typed(
+            transmission=t,
+            uncertainty=sigma,
+            energies=energies,
+            isotopes=[(u238_data, true_density)],
+            solver="lm",
+            temperature_k=293.6,
+            max_iter=100,
+        )
+        # Recovery on noiseless data should be tight; this catches a
+        # regression where `None` is treated as a degenerate range.
+        assert bool(r.converged) is True
+        assert abs(r.densities[0] - true_density) / true_density < 1e-3
+

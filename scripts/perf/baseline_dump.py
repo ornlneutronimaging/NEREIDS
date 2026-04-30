@@ -141,6 +141,12 @@ def run_b2() -> dict:
     # corresponding to nominal `[ENERGY_MIN, ENERGY_MAX]` map to a
     # well-defined `[fit_min_cal, fit_max_cal]` range on the calibrated
     # axis.
+    #
+    # Guard: pre-PR-#519 the `mask = E_full >= 7.0` step filtered any
+    # bin with E ≤ 0 before sqrt; with the mask gone we assert the
+    # input axis is strictly positive so `sqrt(E_full)` can't inject
+    # NaN into `E_cal_full` and silently extend the active mask.
+    assert (E_full > 0).all(), "energy axis must be strictly positive"
     tof_full = tof_factor * FLIGHT_PATH_M / np.sqrt(E_full)
     tof_corr_full = tof_full - T0_US
     E_cal_full = np.ascontiguousarray((tof_factor * L_eff / tof_corr_full) ** 2)
