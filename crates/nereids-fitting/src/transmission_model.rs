@@ -17,8 +17,8 @@ use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
 use crate::error::FittingError;
 use crate::lm::{FitModel, FlatMatrix};
 
-/// Threshold for `L_scale` division safety in the partial-GAL rank-1
-/// derivation of the energy-scale Jacobian.  When
+/// Absolute-magnitude threshold for `L_scale` division safety in the
+/// partial-GAL rank-1 derivation of the energy-scale Jacobian.  When
 /// `|l_scale| < L_SCALE_EPSILON`, the per-bin
 /// `(tof_i - t0_clamped) / l_scale` factor in
 /// [`EnergyScaleTransmissionModel::analytical_jacobian`] blows up,
@@ -28,12 +28,17 @@ use crate::lm::{FitModel, FlatMatrix};
 ///
 /// Below this threshold the L_scale column falls through to the
 /// per-coordinate central-FD path that already follows the partial-GAL
-/// block in the same function.  `1.0e-12` matches the t0 clamp tolerance
-/// used in [`EnergyScaleTransmissionModel::corrected_energies`] and the
-/// partial-GAL t0 FD precompute — both clamps protect against the same
-/// `(tof - t0) / l_eff` blow-up at the energy-scale-degenerate corner.
-/// See PR #498 for the parallel t0 fallthrough and issue #500 for the
-/// L_scale gap closure.
+/// block in the same function.
+///
+/// **Note:** the literal `1.0e-12` matches the `1e-12` factor in the
+/// t0 clamp at [`EnergyScaleTransmissionModel::corrected_energies`]
+/// and the partial-GAL t0 FD precompute, but the semantic role
+/// differs — the t0 clamp is *relative* (`min_tof_us * (1 - 1e-12)`)
+/// while this constant is an *absolute* magnitude bound.  Both
+/// guards protect against the same `(tof - t0) / l_eff` blow-up at
+/// the energy-scale-degenerate corner; the value choice is
+/// coincident, not tied.  See PR #498 for the parallel t0
+/// fallthrough and issue #500 for the L_scale gap closure.
 const L_SCALE_EPSILON: f64 = 1.0e-12;
 
 /// Transmission model backed by precomputed Doppler-broadened cross-sections.
@@ -5186,6 +5191,24 @@ mod tests {
 
         // l_scale = 0.0 — well below `L_SCALE_EPSILON = 1e-12` — so the
         // partial-GAL guard fires and falls through to FD.
+        //
+        // **Active code path (regression target):** the test inputs
+        // are chosen so the new `L_SCALE_EPSILON` guard is what fires,
+        // *not* the older `t0 + h >= t0_limit` precompute fallthrough
+        // (PR #498).  Specifically:
+        //
+        //   - `min_tof_us = tof_factor * 25.0 / sqrt(36.0) ≈ 301 µs`
+        //   - `t0 + h = 0.05 + 1e-4 = 0.0501 µs ≪ 301 * (1 - 1e-12)`
+        //
+        // So `partial_gal_t0_column = Some(...)` (not `None`), the
+        // partial-GAL block at line ~2208 enters, and the L_scale
+        // branch reaches the new `l_scale.abs() < L_SCALE_EPSILON`
+        // guard.  Pre-fix, the inner `(tof_i - t0_clamped) / 0.0 =
+        // ±inf` then `inf * 0 = NaN` would poison the column.  If a
+        // future refactor changes these inputs, verify that
+        // `partial_gal_t0_column.is_some()` still holds for this test
+        // — otherwise the regression target shifts to a different
+        // code path.
         let params = [0.1, 0.05, 0.0]; // density, t0, l_scale = 0
         let free = vec![0, 1, 2];
 
