@@ -13,6 +13,21 @@ pip install nereids jupyter matplotlib numpy
 Notebooks that load ENDF data (`load_endf()`) require an internet
 connection on the first run; files are cached locally afterwards.
 
+## Verification Status
+
+These notebooks are maintained as current tutorials, but they are not executed
+by the repository docs workflow or CI. The underlying APIs are covered by Rust
+and Python tests; notebook execution should be treated as a release-time smoke
+check.
+
+External requirements:
+
+- ENDF-loading notebooks may need network access on first run.
+- The application notebook uses reference data from the
+  `tests/data/pleiades_data/` submodule and Git LFS.
+- Notebooks that use plotting require `matplotlib`; TIFF examples require
+  `tifffile` when writing local synthetic stacks.
+
 ## Tier 1: Foundations
 
 Core physics validation -- understand what NEREIDS computes and verify

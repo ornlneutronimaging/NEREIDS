@@ -95,10 +95,15 @@ with inner parallel operations (cross-section calculation, broadening).
 
 ### Python Bindings and MCP
 
-The Python bindings expose a high-level API (`load_endf`, `forward_model`,
-`fit_spectrum_typed`, `fit_counts_spectrum_typed`, `spatial_map_typed`) that
-maps directly to the Rust pipeline. NumPy arrays are zero-copy where possible
-via `numpy` crate integration.
+The Python bindings expose a high-level API (`load_endf`, `load_endf_file`,
+`forward_model`, `fit_spectrum_typed`, `fit_counts_spectrum_typed`,
+`spatial_map_typed`) that maps directly to the Rust pipeline. Typed input
+constructors (`from_transmission`, `from_counts`) select the fitting dispatch
+for spatial maps. TIFF/NeXus I/O helpers (`load_tiff_stack`,
+`load_tiff_folder`, `probe_nexus`, `load_nexus_histogram`,
+`load_nexus_events`, `tof_to_energy_centers`) expose the same spectral-axis
+conventions as `nereids-io`. NumPy arrays are zero-copy where possible via the
+`numpy` crate integration.
 
 The MCP server is a thin Python package layer over these bindings. It exposes
 low-level physics tools and manifest-driven workflow tools for local AI-agent

@@ -68,6 +68,29 @@ pixi run test-python
 cd docs/guide && mdbook build && mdbook serve
 ```
 
+## Documentation and Release Checklist
+
+Before a release or a documentation-focused PR, verify:
+
+- `pixi run doc-guide` builds the mdBook guide.
+- `pixi run doc-build` builds mdBook, builds Rustdoc, and copies Rustdoc to
+  `target/book/api`.
+- The [Python API reference](./python-api.md) matches the shipped
+  `bindings/python/python/nereids/__init__.pyi` stubs for public functions,
+  arguments, array shapes, and result objects.
+- The [Data I/O and NeXus/TOF](./data-io.md) page matches current TIFF,
+  NeXus, normalization, and `tof_to_energy_centers(...)` behavior.
+- PyPI metadata in `pyproject.toml` lists current optional extras, including
+  `mcp` and `gui`.
+- GUI installation docs cover both `pip install "nereids[gui]"` and the
+  direct `nereids-gui` package, plus Homebrew/source options.
+- GUI screenshots still match the current landing, guided workflow, studio,
+  and tools screens.
+- Notebook release notes state whether notebooks were smoke-run, which subset
+  was run, and which require ENDF network access or external PLEIADES/Git LFS
+  data.
+- Rust quickstart snippets have been checked against current public APIs.
+
 ## Project Structure
 
 ```text
@@ -99,5 +122,6 @@ NEREIDS/
 | Build Python | `pixi run build` |
 | Test Python | `pixi run test-python` |
 | Build docs | `cd docs/guide && mdbook build` |
+| Build full docs site | `pixi run doc-build` |
 | Serve docs | `cd docs/guide && mdbook serve` |
 | Build rustdoc | `cargo doc --workspace --no-deps --exclude nereids-python` |

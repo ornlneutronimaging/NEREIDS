@@ -29,7 +29,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Download and cache ENDF/B-VIII.1 data for U-238 (Z=92, A=238)
     let isotope = Isotope::new(92, 238)?;
     let retriever = EndfRetriever::new();
-    let mat = mat_number(&isotope).expect("U-238 has a known MAT number");
+    let mat = mat_number(&isotope, EndfLibrary::EndfB8_1)
+        .expect("U-238 has a known MAT number");
     let (_path, endf_text) = retriever.get_endf_file(&isotope, EndfLibrary::EndfB8_1, mat)?;
     let resonance_data = parse_endf_file2(&endf_text)?;
 
@@ -67,7 +68,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         vec![resonance_data],
         300.0,                   // temperature_k
         None,                    // no instrument resolution
-        vec![0],                 // density_indices
+        (vec![0], vec![1.0]),    // density_indices, density_ratios
         None,                    // no temperature fitting
         None,                    // no precomputed cross-sections
     )?;
@@ -91,3 +92,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 - See the [API Reference](api/nereids_pipeline/) for the full API
 - Explore the [Python quickstart](./quickstart-python.md) for a NumPy-based workflow
+
+## Verification Status
+
+The Rust API itself is checked by `cargo test`, `cargo clippy`, and
+`cargo doc --workspace --no-deps --exclude nereids-python`. This quickstart
+was `cargo check`-verified against the current local crates during the #527
+docs audit, but mdBook does not compile-test snippets as part of
+`pixi run doc-guide` or `pixi run doc-build`.
