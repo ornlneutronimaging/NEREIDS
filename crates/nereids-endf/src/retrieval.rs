@@ -17,8 +17,15 @@ use std::time::{Duration, Instant};
 
 const IAEA_BASE_URL: &str = "https://www-nds.iaea.org/public/download-endf";
 const NNDC_ENDF_BASE_URL: &str = "https://www.nndc.bnl.gov/endf-data/ENDF";
-const ENDF_USER_AGENT: &str =
-    "NEREIDS/0.1.8 (https://github.com/ornlneutronimaging/NEREIDS; ENDF cache)";
+// Polite, identifiable UA: many nuclear-data servers either require a non-default
+// UA or treat default `reqwest` traffic as a bot (issue #523, IAEA returning
+// HTTP 403 to v0.1.8 batch fetches). Version is derived from `CARGO_PKG_VERSION`
+// so it never drifts from `Cargo.toml`.
+const ENDF_USER_AGENT: &str = concat!(
+    "NEREIDS/",
+    env!("CARGO_PKG_VERSION"),
+    " (https://github.com/ornlneutronimaging/NEREIDS; contact: zhangc@ornl.gov)",
+);
 const IAEA_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(3);
 
 static LAST_IAEA_REQUEST: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
@@ -127,12 +134,18 @@ impl EndfRetriever {
     }
 
     /// Get the cache directory for a specific library.
-    fn cache_dir(&self, library: EndfLibrary) -> PathBuf {
+    ///
+    /// Public so the GUI can show users exactly where to drop a manually-
+    /// downloaded ENDF file when a fetch fails (issue #523).
+    pub fn cache_dir(&self, library: EndfLibrary) -> PathBuf {
         self.cache_root.join(library.cache_dir_name())
     }
 
     /// Get the cached ENDF file path for an isotope.
-    fn cache_file_path(&self, isotope: &Isotope, library: EndfLibrary) -> PathBuf {
+    ///
+    /// Public so callers can present the exact target path for manual file
+    /// drops; see [`Self::install_local_endf`] for the programmatic equivalent.
+    pub fn cache_file_path(&self, isotope: &Isotope, library: EndfLibrary) -> PathBuf {
         let sym = elements::element_symbol(isotope.z()).unwrap_or("X");
         let filename = format!("{}-{}.endf", sym, isotope.a());
         self.cache_dir(library).join(filename)
@@ -193,7 +206,7 @@ impl EndfRetriever {
         let url = format!("{}/{}/{}", self.base_url, library.url_path(), zip_filename);
         let iaea_result = self.fetch_bytes(&url, true);
         match iaea_result {
-            Ok(bytes) => self.extract_endf_from_zip(&bytes),
+            Ok(bytes) => extract_endf_from_zip(&bytes),
             Err(err) if should_try_nndc_fallback(&err) => {
                 if !nndc_already_tried
                     && let Some(fallback_url) = &nndc_url
@@ -246,50 +259,56 @@ impl EndfRetriever {
             .map_err(|e| EndfRetrievalError::Parse(format!("Invalid UTF-8 ENDF response: {e}")))
     }
 
-    /// Extract the ENDF data file from a ZIP archive.
-    ///
-    /// Looks for files ending in .endf, .dat, or .txt within the archive.
-    fn extract_endf_from_zip(&self, zip_bytes: &[u8]) -> Result<String, EndfRetrievalError> {
-        let cursor = std::io::Cursor::new(zip_bytes);
-        let mut archive = zip::ZipArchive::new(cursor)
-            .map_err(|e| EndfRetrievalError::Parse(format!("Invalid ZIP archive: {}", e)))?;
-
-        // Find the ENDF data file within the archive.
-        for i in 0..archive.len() {
-            let mut file = archive.by_index(i).map_err(|e| {
-                EndfRetrievalError::Parse(format!("Failed to read ZIP entry: {}", e))
-            })?;
-
-            let name = file.name().to_lowercase();
-            if name.ends_with(".endf") || name.ends_with(".dat") || name.ends_with(".txt") {
-                let mut contents = String::new();
-                file.read_to_string(&mut contents).map_err(|e| {
-                    EndfRetrievalError::Parse(format!("Failed to read ENDF content: {}", e))
-                })?;
-                return Ok(contents);
-            }
-        }
-
-        // If no obvious extension, try the first file.
-        if !archive.is_empty() {
-            let mut file = archive.by_index(0).map_err(|e| {
-                EndfRetrievalError::Parse(format!("Failed to read ZIP entry: {}", e))
-            })?;
-            let mut contents = String::new();
-            file.read_to_string(&mut contents).map_err(|e| {
-                EndfRetrievalError::Parse(format!("Failed to read ENDF content: {}", e))
-            })?;
-            return Ok(contents);
-        }
-
-        Err(EndfRetrievalError::Parse(
-            "No ENDF data file found in ZIP archive".to_string(),
-        ))
-    }
-
     /// Load an ENDF file from a local path (no download).
     pub fn load_local(path: &Path) -> Result<String, EndfRetrievalError> {
         fs::read_to_string(path).map_err(EndfRetrievalError::from)
+    }
+
+    /// Install a user-supplied ENDF file into the cache for `isotope`/`library`.
+    ///
+    /// Accepts either a raw ENDF text file (`.endf`, `.dat`, `.txt`, or
+    /// extensionless) or the IAEA ZIP archive distribution (`n_…_….zip`).
+    /// The file is parsed to verify that its declared isotope matches
+    /// `isotope`; on success the text is written to the canonical cache slot
+    /// returned by [`Self::cache_file_path`] and `(cache_path, text)` is
+    /// returned. Subsequent calls to [`Self::get_endf_file`] will then hit the
+    /// cache without any network access.
+    ///
+    /// This is the GUI's manual-upload escape hatch for users on networks
+    /// where IAEA/NNDC is blocked (issue #523).
+    pub fn install_local_endf(
+        &self,
+        isotope: &Isotope,
+        library: EndfLibrary,
+        source: &Path,
+    ) -> Result<(PathBuf, String), EndfRetrievalError> {
+        let raw = fs::read(source)?;
+        let endf_text = if looks_like_zip(source, &raw) {
+            extract_endf_from_zip(&raw)?
+        } else {
+            String::from_utf8(raw).map_err(|e| {
+                EndfRetrievalError::Parse(format!("ENDF file is not valid UTF-8: {e}"))
+            })?
+        };
+
+        // Validate the (Z, A) declared by the file's HEAD record matches the
+        // isotope the user intends to install. parse_endf_file2 reads the MF=2
+        // MT=151 HEAD which carries ZA = 1000*Z + A.
+        let parsed = crate::parser::parse_endf_file2(&endf_text)
+            .map_err(|e| EndfRetrievalError::Parse(format!("Failed to parse ENDF file: {e}")))?;
+        if parsed.isotope != *isotope {
+            return Err(EndfRetrievalError::IsotopeMismatch {
+                expected: isotope_label(isotope),
+                found: isotope_label(&parsed.isotope),
+            });
+        }
+
+        let cache_path = self.cache_file_path(isotope, library);
+        if let Some(parent) = cache_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&cache_path, &endf_text)?;
+        Ok((cache_path, endf_text))
     }
 
     /// Clear the cache for a specific library, or all if `None`.
@@ -385,6 +404,11 @@ pub enum EndfRetrievalError {
     #[error("{isotope} is not available in the {library} library")]
     NotInLibrary { isotope: String, library: String },
 
+    /// A user-supplied ENDF file did not describe the isotope it was being
+    /// installed against (issue #523, manual upload path).
+    #[error("ENDF file is for {found}, but expected {expected}")]
+    IsotopeMismatch { expected: String, found: String },
+
     #[error("Parse error: {0}")]
     Parse(String),
 
@@ -453,6 +477,60 @@ impl DownloadError {
             }
         }
     }
+}
+
+/// Extract the ENDF data file body from a ZIP archive.
+///
+/// Prefers archive entries ending in `.endf`, `.dat`, or `.txt`; falls back to
+/// the first entry if none match. IAEA distributes one ENDF per zip, so the
+/// fallback effectively only fires on hand-rolled archives.
+fn extract_endf_from_zip(zip_bytes: &[u8]) -> Result<String, EndfRetrievalError> {
+    let cursor = std::io::Cursor::new(zip_bytes);
+    let mut archive = zip::ZipArchive::new(cursor)
+        .map_err(|e| EndfRetrievalError::Parse(format!("Invalid ZIP archive: {}", e)))?;
+
+    for i in 0..archive.len() {
+        let mut file = archive
+            .by_index(i)
+            .map_err(|e| EndfRetrievalError::Parse(format!("Failed to read ZIP entry: {}", e)))?;
+        let name = file.name().to_lowercase();
+        if name.ends_with(".endf") || name.ends_with(".dat") || name.ends_with(".txt") {
+            let mut contents = String::new();
+            file.read_to_string(&mut contents).map_err(|e| {
+                EndfRetrievalError::Parse(format!("Failed to read ENDF content: {}", e))
+            })?;
+            return Ok(contents);
+        }
+    }
+
+    if !archive.is_empty() {
+        let mut file = archive
+            .by_index(0)
+            .map_err(|e| EndfRetrievalError::Parse(format!("Failed to read ZIP entry: {}", e)))?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents).map_err(|e| {
+            EndfRetrievalError::Parse(format!("Failed to read ENDF content: {}", e))
+        })?;
+        return Ok(contents);
+    }
+
+    Err(EndfRetrievalError::Parse(
+        "No ENDF data file found in ZIP archive".to_string(),
+    ))
+}
+
+/// Detect a ZIP archive by extension or PK magic bytes.
+///
+/// IAEA-distributed `n_…_….zip` files always start with `PK\x03\x04`. The
+/// magic-byte check covers the case where a user has stripped or renamed the
+/// extension before uploading.
+fn looks_like_zip(source: &Path, raw: &[u8]) -> bool {
+    let by_ext = source
+        .extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"));
+    let by_magic = raw.len() >= 4 && &raw[..4] == b"PK\x03\x04";
+    by_ext || by_magic
 }
 
 /// Build the shared HTTP client used for ENDF downloads.
@@ -579,5 +657,126 @@ mod tests {
             message: "blocked".into(),
         };
         assert!(err.is_remote_access_blocked());
+    }
+
+    /// Issue #523: the polite User-Agent must carry the live package version
+    /// and the contact metadata the IAEA acceptance criterion calls for.
+    #[test]
+    fn endf_user_agent_contains_version_and_contact() {
+        assert!(
+            ENDF_USER_AGENT.starts_with("NEREIDS/"),
+            "UA must start with NEREIDS/, got {ENDF_USER_AGENT:?}"
+        );
+        assert!(
+            ENDF_USER_AGENT.contains(env!("CARGO_PKG_VERSION")),
+            "UA must carry CARGO_PKG_VERSION, got {ENDF_USER_AGENT:?}"
+        );
+        assert!(
+            ENDF_USER_AGENT.contains("github.com/ornlneutronimaging/NEREIDS"),
+            "UA must include the project URL, got {ENDF_USER_AGENT:?}"
+        );
+        assert!(
+            ENDF_USER_AGENT.contains("contact: zhangc@ornl.gov"),
+            "UA must include a contact mailbox, got {ENDF_USER_AGENT:?}"
+        );
+    }
+
+    // Minimal valid ENDF MF=2/MT=151 fixture for W-184 — same shape as the
+    // krm3 fixture in parser.rs tests, kept inline so retrieval tests stay
+    // self-contained.
+    const W184_FIXTURE: &str = concat!(
+        " 7.418400+4 1.820000+2          0          0          1          07437 2151    1\n",
+        " 7.418400+4 1.000000+0          0          0          1          07437 2151    2\n",
+        " 1.000000-5 1.000000+3          1          7          0          07437 2151    3\n",
+        " 0.000000+0 7.000000-1          0          3          1          07437 2151    4\n",
+        " 0.000000+0 0.000000+0          1          0         12          17437 2151    5\n",
+        " 1.000000+0 1.820000+2 0.000000+0 0.000000+0 5.000000-1 0.000000+07437 2151    6\n",
+        " 0.000000+0 1.000000+0 0.000000+0 2.000000+0 1.000000+0 1.000000+07437 2151    7\n",
+        " 5.000000-1 0.000000+0          0          0         12          27437 2151    8\n",
+        " 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+07437 2151    9\n",
+        " 1.000000+0 0.000000+0 5.000000-1 0.000000+0 7.000000-1 7.000000-17437 2151   10\n",
+        " 0.000000+0 0.000000+0          0          0         12          27437 2151   11\n",
+        " 1.000000+1 2.500000-2 1.000000-3 0.000000+0 0.000000+0 0.000000+07437 2151   12\n",
+        " 2.000000+1 3.000000-2 2.000000-3 0.000000+0 0.000000+0 0.000000+07437 2151   13\n",
+    );
+
+    fn write_zip_with_endf(zip_path: &Path, inner_name: &str, body: &str) -> std::io::Result<()> {
+        let file = fs::File::create(zip_path)?;
+        let mut zw = zip::ZipWriter::new(file);
+        zw.start_file::<_, ()>(inner_name, zip::write::SimpleFileOptions::default())
+            .map_err(|e| std::io::Error::other(format!("zip start_file: {e}")))?;
+        std::io::Write::write_all(&mut zw, body.as_bytes())?;
+        zw.finish()
+            .map_err(|e| std::io::Error::other(format!("zip finish: {e}")))?;
+        Ok(())
+    }
+
+    #[test]
+    fn install_local_endf_accepts_raw_endf_with_matching_isotope() {
+        let cache = tempfile::tempdir().expect("tempdir");
+        let src = tempfile::NamedTempFile::new().expect("src file");
+        std::fs::write(src.path(), W184_FIXTURE).unwrap();
+
+        let retriever = EndfRetriever::with_cache_dir(cache.path());
+        let w184 = Isotope::new(74, 184).unwrap();
+        let (cache_path, text) = retriever
+            .install_local_endf(&w184, EndfLibrary::EndfB8_0, src.path())
+            .expect("install must succeed");
+
+        assert!(cache_path.exists(), "cache file must be written");
+        assert!(text.contains("7.418400+4"), "returned text matches input");
+        // Subsequent get_endf_file calls must read from cache (no network).
+        let (cached_path, cached_text) = retriever
+            .get_endf_file(&w184, EndfLibrary::EndfB8_0, 7437)
+            .expect("cache hit must succeed offline");
+        assert_eq!(cached_path, cache_path);
+        assert_eq!(cached_text, text);
+    }
+
+    #[test]
+    fn install_local_endf_accepts_zip_archive() {
+        let cache = tempfile::tempdir().expect("tempdir");
+        let zip_path = cache.path().join("upload.zip");
+        write_zip_with_endf(&zip_path, "n_7437_74-W-184.endf", W184_FIXTURE)
+            .expect("write zip fixture");
+
+        let retriever = EndfRetriever::with_cache_dir(cache.path());
+        let w184 = Isotope::new(74, 184).unwrap();
+        let (cache_path, _) = retriever
+            .install_local_endf(&w184, EndfLibrary::EndfB8_0, &zip_path)
+            .expect("zip install must succeed");
+        assert!(cache_path.exists());
+        assert_eq!(
+            fs::read_to_string(&cache_path).unwrap(),
+            W184_FIXTURE,
+            "cache must hold the extracted body, not the zip"
+        );
+    }
+
+    #[test]
+    fn install_local_endf_rejects_isotope_mismatch() {
+        let cache = tempfile::tempdir().expect("tempdir");
+        let src = tempfile::NamedTempFile::new().expect("src file");
+        std::fs::write(src.path(), W184_FIXTURE).unwrap();
+
+        let retriever = EndfRetriever::with_cache_dir(cache.path());
+        let hf180 = Isotope::new(72, 180).unwrap();
+        let err = retriever
+            .install_local_endf(&hf180, EndfLibrary::EndfB8_0, src.path())
+            .expect_err("must reject ZA mismatch");
+
+        match err {
+            EndfRetrievalError::IsotopeMismatch { expected, found } => {
+                assert!(expected.contains("Hf"), "expected label, got {expected}");
+                assert!(found.contains("W"), "found label, got {found}");
+            }
+            other => panic!("expected IsotopeMismatch, got {other:?}"),
+        }
+        assert!(
+            !retriever
+                .cache_file_path(&hf180, EndfLibrary::EndfB8_0)
+                .exists(),
+            "no cache file must be written on mismatch"
+        );
     }
 }

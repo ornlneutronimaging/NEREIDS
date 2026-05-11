@@ -165,6 +165,9 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
                     state.periodic_table_selected_z = None;
                     state.periodic_table_density = 0.001; // at/barn default
                 }
+                if ui.button("Load local ENDF file\u{2026}").clicked() {
+                    install_local_endf_dialog(state);
+                }
             });
         });
 
@@ -199,19 +202,33 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
                         .iter()
                         .any(|m| m.endf_status == EndfStatus::Failed)
             });
-        if has_failed && !state.is_fetching_endf && ui.button("Retry failed").clicked() {
-            for e in &mut state.isotope_entries {
-                if e.endf_status == EndfStatus::Failed {
-                    e.endf_status = EndfStatus::Pending;
+        if has_failed && !state.is_fetching_endf {
+            ui.add_space(4.0);
+            if ui.button("Retry failed").clicked() {
+                for e in &mut state.isotope_entries {
+                    if e.endf_status == EndfStatus::Failed {
+                        e.endf_status = EndfStatus::Pending;
+                    }
                 }
-            }
-            for g in &mut state.isotope_groups {
-                for m in &mut g.members {
-                    if m.endf_status == EndfStatus::Failed {
-                        m.endf_status = EndfStatus::Pending;
+                for g in &mut state.isotope_groups {
+                    for m in &mut g.members {
+                        if m.endf_status == EndfStatus::Failed {
+                            m.endf_status = EndfStatus::Pending;
+                        }
                     }
                 }
             }
+            ui.add_space(4.0);
+            let cache_dir =
+                nereids_endf::retrieval::EndfRetriever::new().cache_dir(state.endf_library);
+            ui.label(
+                egui::RichText::new(format!(
+                    "Offline fallback: drop the ENDF file at {} and click Retry, or use \u{201C}Load local ENDF file\u{2026}\u{201D} above.",
+                    cache_dir.display()
+                ))
+                .small()
+                .weak(),
+            );
         }
     });
 
@@ -537,4 +554,157 @@ fn fetch_endf_data(state: &mut AppState) {
     let cancel = Arc::clone(&state.cancel_token);
 
     std::thread::spawn(move || design::endf_fetch_worker(work, cancel, tx));
+}
+
+/// Manual ENDF upload escape hatch (issue #523): pick a local `.endf`/`.zip`
+/// from the filesystem and install it into the cache for whichever
+/// already-added isotope it describes. The retriever auto-validates that the
+/// file's HEAD record matches the matched entry's (Z, A) before writing.
+fn install_local_endf_dialog(state: &mut AppState) {
+    use nereids_core::types::Isotope;
+
+    let Some(path) = rfd::FileDialog::new()
+        .add_filter("ENDF", &["endf", "dat", "txt", "zip"])
+        .pick_file()
+    else {
+        return;
+    };
+
+    // Pre-parse the file briefly to discover its (Z, A). We re-read the file
+    // inside install_local_endf — the duplicated read is cheap (sub-MB) and
+    // keeps the dispatch decision separate from the install step.
+    let raw = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            state.status_message = format!("Could not read ENDF file: {e}");
+            return;
+        }
+    };
+    let text_for_peek = if raw.len() >= 4 && &raw[..4] == b"PK\x03\x04" {
+        // Zip — we don't need to extract twice; install_local_endf will do it.
+        // For routing, parse just the inner ENDF: easiest path is to delegate
+        // to the retriever once we know an isotope. So instead, scan for any
+        // entry whose (Z, A) reconciles against the parsed file post-install.
+        // Implement by trying each Failed/Pending entry until one matches.
+        None
+    } else {
+        Some(String::from_utf8_lossy(&raw).into_owned())
+    };
+
+    let candidate_za: Option<(u32, u32)> = text_for_peek
+        .as_deref()
+        .and_then(|t| nereids_endf::parser::parse_endf_file2(t).ok())
+        .map(|d| (d.isotope.z(), d.isotope.a()));
+
+    let retriever = nereids_endf::retrieval::EndfRetriever::new();
+
+    // Helper: try installing this file against the supplied (z, a).
+    let try_install = |z: u32, a: u32| -> Result<String, String> {
+        let isotope = Isotope::new(z, a).map_err(|e| e.to_string())?;
+        retriever
+            .install_local_endf(&isotope, state.endf_library, &path)
+            .map(|_| {
+                format!(
+                    "{}-{}",
+                    nereids_core::elements::element_symbol(z).unwrap_or("?"),
+                    a
+                )
+            })
+            .map_err(|e| e.to_string())
+    };
+
+    // Strategy: if peek succeeded, we know (z, a) directly. Otherwise (zip),
+    // try every Failed/Pending entry until one validates.
+    let mut installed: Option<String> = None;
+    let mut last_err: Option<String> = None;
+
+    let try_targets: Vec<(u32, u32)> = if let Some((z, a)) = candidate_za {
+        vec![(z, a)]
+    } else {
+        let mut tgts = Vec::new();
+        for e in &state.isotope_entries {
+            if e.endf_status != EndfStatus::Loaded {
+                tgts.push((e.z, e.a));
+            }
+        }
+        for g in &state.isotope_groups {
+            for m in &g.members {
+                if m.endf_status != EndfStatus::Loaded {
+                    tgts.push((g.z, m.a));
+                }
+            }
+        }
+        tgts
+    };
+
+    for (z, a) in &try_targets {
+        // Does the user actually have this isotope in their selection?
+        let in_list = state.isotope_entries.iter().any(|e| e.z == *z && e.a == *a)
+            || state
+                .isotope_groups
+                .iter()
+                .any(|g| g.z == *z && g.members.iter().any(|m| m.a == *a));
+        if !in_list {
+            continue;
+        }
+        match try_install(*z, *a) {
+            Ok(label) => {
+                installed = Some(label);
+                break;
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+
+    let Some(label) = installed else {
+        state.status_message = match (candidate_za, last_err) {
+            (Some((z, a)), _) => format!(
+                "ENDF file is for {}-{}, but no matching isotope in your selection. Add it first.",
+                nereids_core::elements::element_symbol(z).unwrap_or("?"),
+                a,
+            ),
+            (None, Some(e)) => format!("Could not install local ENDF: {e}"),
+            (None, None) => {
+                "Could not read local ENDF — no matching isotope in your selection.".to_string()
+            }
+        };
+        return;
+    };
+
+    // Mark the matching entry Pending so the auto-fetch loop runs it through
+    // the retriever, which now hits the cache slot we just populated.
+    let (z, a) = match candidate_za {
+        Some(za) => za,
+        None => {
+            // Find the (z, a) we actually installed against by symbol parse.
+            // try_targets is non-empty here because installed=Some(_).
+            try_targets
+                .iter()
+                .find(|(zz, aa)| {
+                    nereids_core::elements::element_symbol(*zz)
+                        .map(|s| format!("{}-{}", s, aa) == label)
+                        .unwrap_or(false)
+                })
+                .copied()
+                .unwrap_or((0, 0))
+        }
+    };
+    for e in &mut state.isotope_entries {
+        if e.z == z && e.a == a {
+            e.resonance_data = None;
+            e.endf_status = EndfStatus::Pending;
+        }
+    }
+    for g in &mut state.isotope_groups {
+        if g.z != z {
+            continue;
+        }
+        for m in &mut g.members {
+            if m.a == a {
+                m.resonance_data = None;
+                m.endf_status = EndfStatus::Pending;
+            }
+        }
+    }
+    state.status_message = format!("Loaded local ENDF for {label}");
 }
