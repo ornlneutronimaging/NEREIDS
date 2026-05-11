@@ -7,6 +7,7 @@ direct invocation validates all business logic.
 """
 
 import json
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -15,6 +16,8 @@ fastmcp = pytest.importorskip("fastmcp")
 
 import nereids
 from nereids.mcp.server import (
+    _fit_result_summary,
+    _json_safe,
     _registry,
     compute_cross_sections,
     compute_transmission,
@@ -424,3 +427,158 @@ class TestManifestWorkflowTools:
         stats = result["results"]["density_maps"][0]["density_atoms_per_barn"]
         assert stats["mean"] == pytest.approx(true_density, rel=0.15)
         assert (tmp_path / "output" / "nereids_density_map.npz").exists()
+
+    def test_nexus_density_map_aligns_counts_with_ascending_energy(
+        self, tmp_path, monkeypatch
+    ):
+        sample_path = tmp_path / "sample.nxs"
+        open_beam_path = tmp_path / "open_beam.nxs"
+        sample_path.touch()
+        open_beam_path.touch()
+        captured = {}
+
+        def fake_load_nexus_histogram(path):
+            if path == str(sample_path):
+                counts = np.asarray([[[90.0]], [[40.0]], [[10.0]]])
+            else:
+                counts = np.asarray([[[100.0]], [[100.0]], [[100.0]]])
+            return SimpleNamespace(
+                counts=counts,
+                tof_edges_us=np.asarray([1.0, 2.0, 3.0, 4.0]),
+                flight_path_m=25.0,
+            )
+
+        def fake_from_counts(sample, open_beam):
+            captured["sample"] = np.asarray(sample).copy()
+            captured["open_beam"] = np.asarray(open_beam).copy()
+            return {"sample": sample, "open_beam": open_beam}
+
+        def fake_spatial_map_typed(
+            input_data, energies, isotope_data, initial_densities, **kwargs
+        ):
+            captured["energies"] = np.asarray(energies).copy()
+            return SimpleNamespace(
+                chi_squared_map=np.zeros((1, 1)),
+                converged_map=np.ones((1, 1), dtype=bool),
+                deviance_per_dof_map=None,
+                density_maps=[np.full((1, 1), 0.002)],
+                uncertainty_maps=[np.full((1, 1), 0.0001)],
+                n_converged=1,
+                n_total=1,
+                n_failed=0,
+            )
+
+        monkeypatch.setattr(nereids, "load_nexus_histogram", fake_load_nexus_histogram)
+        monkeypatch.setattr(
+            nereids,
+            "tof_to_energy_centers",
+            lambda edges, flight_path, delay_us=0.0: np.asarray([9.0, 4.0, 1.0]),
+        )
+        monkeypatch.setattr(nereids, "from_counts", fake_from_counts)
+        monkeypatch.setattr(nereids, "spatial_map_typed", fake_spatial_map_typed)
+
+        _write_json_frontmatter_manifest(
+            tmp_path,
+            {
+                "mode": "density_map",
+                "data": {
+                    "kind": "nexus",
+                    "sample_path": sample_path.name,
+                    "open_beam_path": open_beam_path.name,
+                },
+                "isotopes": [_synthetic_u238_entry(initial_density=0.001)],
+                "fit": {"solver": "lm", "max_iter": 5},
+                "resolution": {"kind": "none"},
+                "output": {"directory": "output"},
+            },
+        )
+
+        result = process_resonance_dataset(str(tmp_path))
+
+        assert result["success"] is True
+        np.testing.assert_allclose(captured["energies"], [1.0, 4.0, 9.0])
+        np.testing.assert_allclose(captured["sample"][:, 0, 0], [10.0, 40.0, 90.0])
+
+    def test_process_rejects_mismatched_counts_shapes(self, tmp_path):
+        np.savez(
+            tmp_path / "counts.npz",
+            energies_ev=np.linspace(1.0, 5.0, 5),
+            sample_counts=np.ones(5),
+            open_beam_counts=np.ones(6),
+        )
+        _write_json_frontmatter_manifest(
+            tmp_path,
+            {
+                "mode": "single_spectrum",
+                "data": {"kind": "counts_npz", "path": "counts.npz"},
+                "isotopes": [_synthetic_u238_entry()],
+                "fit": {"solver": "lm", "max_iter": 5},
+                "resolution": {"kind": "none"},
+            },
+        )
+
+        result = process_resonance_dataset(str(tmp_path))
+
+        assert result["success"] is False
+        assert "matching shapes" in result["error"]
+
+    def test_process_rejects_mismatched_density_uncertainty_shapes(self, tmp_path):
+        np.savez(
+            tmp_path / "density-map.npz",
+            energies_ev=np.linspace(1.0, 5.0, 5),
+            transmission=np.ones((5, 2, 2)),
+            uncertainty=np.ones((5, 2, 3)),
+        )
+        _write_json_frontmatter_manifest(
+            tmp_path,
+            {
+                "mode": "density_map",
+                "data": {"kind": "transmission_npz", "path": "density-map.npz"},
+                "isotopes": [_synthetic_u238_entry()],
+                "fit": {"solver": "lm", "max_iter": 5},
+                "resolution": {"kind": "none"},
+            },
+        )
+
+        result = process_resonance_dataset(str(tmp_path))
+
+        assert result["success"] is False
+        assert "matching shapes" in result["error"]
+
+    def test_dry_run_rejects_missing_required_data_path(self, tmp_path):
+        _write_json_frontmatter_manifest(
+            tmp_path,
+            {
+                "mode": "single_spectrum",
+                "data": {"kind": "transmission_npz"},
+                "isotopes": [_synthetic_u238_entry()],
+                "fit": {"solver": "lm", "max_iter": 5},
+                "resolution": {"kind": "none"},
+            },
+        )
+
+        result = process_resonance_dataset(str(tmp_path), dry_run=True)
+
+        assert result["success"] is False
+        assert "single_spectrum workflow requires data.path" in result["validation"]["errors"]
+
+    def test_fit_summary_is_strict_json_safe(self):
+        result = SimpleNamespace(
+            densities=np.asarray([np.nan]),
+            uncertainties=np.asarray([np.inf]),
+            reduced_chi_squared=np.nan,
+            deviance_per_dof=np.inf,
+            converged=False,
+            iterations=0,
+            temperature_k=np.nan,
+            anorm=np.inf,
+            background=[np.nan],
+        )
+
+        summary = _fit_result_summary(result, ["U-238"])
+
+        assert summary["density_fits"][0]["density_atoms_per_barn"] is None
+        assert summary["density_fits"][0]["uncertainty_atoms_per_barn"] is None
+        assert summary["reduced_chi_squared"] is None
+        assert summary["deviance_per_dof"] is None
+        json.dumps(_json_safe(summary), allow_nan=False)

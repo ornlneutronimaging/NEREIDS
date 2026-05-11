@@ -41,9 +41,11 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, np.ndarray):
-        return value.tolist()
+        return _json_safe(value.tolist())
     if isinstance(value, np.generic):
-        return value.item()
+        return _json_safe(value.item())
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
     if isinstance(value, dict):
         return {str(k): _json_safe(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
@@ -261,12 +263,37 @@ def _validate_array(name: str, values: Any, ndim: int | None = None) -> np.ndarr
     return np.ascontiguousarray(arr)
 
 
+def _require_same_shape(
+    reference_name: str,
+    reference: np.ndarray,
+    *others: tuple[str, np.ndarray],
+) -> None:
+    """Require arrays that share a physical axis/layout to have equal shape."""
+    for name, arr in others:
+        if arr.shape != reference.shape:
+            raise ValueError(
+                f"{reference_name} and {name} must have matching shapes, "
+                f"got {reference.shape} and {arr.shape}"
+            )
+
+
+def _finite_float_or_none(value: Any) -> float | None:
+    scalar = float(value)
+    return scalar if math.isfinite(scalar) else None
+
+
 def _ascending_energy_grid(
     energies: np.ndarray, *aligned: np.ndarray
 ) -> tuple[np.ndarray, ...]:
     """Ensure energies are strictly ascending, reversing aligned arrays if needed."""
     grid = _validate_array("energies", energies, ndim=1)
     arrays = tuple(np.ascontiguousarray(a) for a in aligned)
+    for arr in arrays:
+        if arr.shape[0] != grid.size:
+            raise ValueError(
+                "aligned data first dimension must match energies, "
+                f"got {arr.shape[0]} and {grid.size}"
+            )
     diffs = np.diff(grid)
     if np.all(diffs > 0):
         return (grid, *arrays)
@@ -544,25 +571,25 @@ def _fit_result_summary(result: Any, names: list[str]) -> dict[str, Any]:
         entries.append(
             {
                 "isotope": name,
-                "density_atoms_per_barn": float(densities[i]),
-                "uncertainty_atoms_per_barn": float(uncertainties[i])
+                "density_atoms_per_barn": _finite_float_or_none(densities[i]),
+                "uncertainty_atoms_per_barn": _finite_float_or_none(uncertainties[i])
                 if i < len(uncertainties)
                 else None,
             }
         )
     return {
         "density_fits": entries,
-        "reduced_chi_squared": float(result.reduced_chi_squared),
+        "reduced_chi_squared": _finite_float_or_none(result.reduced_chi_squared),
         "deviance_per_dof": None
         if getattr(result, "deviance_per_dof", None) is None
-        else float(result.deviance_per_dof),
+        else _finite_float_or_none(result.deviance_per_dof),
         "converged": bool(result.converged),
         "iterations": int(result.iterations),
         "temperature_k": None
         if result.temperature_k is None
-        else float(result.temperature_k),
-        "anorm": float(result.anorm),
-        "background": [float(v) for v in result.background],
+        else _finite_float_or_none(result.temperature_k),
+        "anorm": _finite_float_or_none(result.anorm),
+        "background": [_finite_float_or_none(v) for v in result.background],
     }
 
 
@@ -605,6 +632,7 @@ def _process_single_spectrum(
         open_beam_key = data_config.get("open_beam_key", "open_beam_counts")
         sample = _validate_array("sample_counts", arrays[sample_key])
         open_beam = _validate_array("open_beam_counts", arrays[open_beam_key])
+        _require_same_shape("sample_counts", sample, ("open_beam_counts", open_beam))
         energies = _load_energy_grid(base, data_config, arrays, n_expected=sample.shape[0])
         energies, sample, open_beam = _ascending_energy_grid(energies, sample, open_beam)
         if sample.ndim == 3:
@@ -656,6 +684,7 @@ def _process_single_spectrum(
             uncertainty = np.full_like(
                 transmission, float(data_config.get("uncertainty", 0.01))
             )
+        _require_same_shape("transmission", transmission, ("uncertainty", uncertainty))
         energies = _load_energy_grid(base, data_config, arrays, n_expected=transmission.shape[0])
         energies, transmission, uncertainty = _ascending_energy_grid(
             energies, transmission, uncertainty
@@ -731,6 +760,7 @@ def _process_density_map(
             uncertainty = np.full_like(
                 transmission, float(data_config.get("uncertainty", 0.01))
             )
+        _require_same_shape("transmission", transmission, ("uncertainty", uncertainty))
         energies = _load_energy_grid(
             base, data_config, arrays, n_expected=transmission.shape[0]
         )
@@ -759,6 +789,7 @@ def _process_density_map(
             uncertainty = np.full_like(
                 transmission, float(data_config.get("uncertainty", 0.01))
             )
+        _require_same_shape("transmission", transmission, ("uncertainty", uncertainty))
         energies = _load_energy_grid(base, data_config, None, n_expected=transmission.shape[0])
         energies, transmission, uncertainty = _ascending_energy_grid(
             energies, transmission, uncertainty
@@ -781,6 +812,7 @@ def _process_density_map(
             arrays[data_config.get("open_beam_key", "open_beam_counts")],
             ndim=3,
         )
+        _require_same_shape("sample_counts", sample, ("open_beam_counts", open_beam))
         energies = _load_energy_grid(base, data_config, arrays, n_expected=sample.shape[0])
         energies, sample, open_beam = _ascending_energy_grid(energies, sample, open_beam)
         sample = _apply_roi(sample, data_config.get("roi") or config.get("roi"))
@@ -799,6 +831,7 @@ def _process_density_map(
         ob_data = nereids.load_nexus_histogram(str(open_beam_path))
         sample = _validate_array("sample_counts", sample_data.counts, ndim=3)
         open_beam = _validate_array("open_beam_counts", ob_data.counts, ndim=3)
+        _require_same_shape("sample_counts", sample, ("open_beam_counts", open_beam))
         flight_path = float(
             data_config.get(
                 "flight_path_m",
@@ -810,10 +843,8 @@ def _process_density_map(
             nereids.tof_to_energy_centers(sample_data.tof_edges_us, flight_path, delay_us),
             dtype=np.float64,
         )
-        # NeXus histograms are ascending TOF; NEREIDS fitting expects arrays
-        # aligned with ascending energy, so reverse the spectral axis.
-        sample = np.ascontiguousarray(sample[::-1, ...])
-        open_beam = np.ascontiguousarray(open_beam[::-1, ...])
+        # Ascending TOF produces descending energy centers; the shared grid helper
+        # reverses energies and aligned counts together exactly once.
         energies, sample, open_beam = _ascending_energy_grid(energies, sample, open_beam)
         sample = _apply_roi(sample, data_config.get("roi") or config.get("roi"))
         open_beam = _apply_roi(open_beam, data_config.get("roi") or config.get("roi"))
@@ -905,10 +936,43 @@ def _validate_workflow(manifest: dict[str, Any]) -> dict[str, Any]:
             "density_map, or spatial_map"
         )
 
+    effective_kind = _normalise_kind(
+        data_config.get("kind"),
+        "counts_npz"
+        if mode in {"single_spectrum", "fit_spectrum", "spectrum"}
+        else "transmission_npz",
+    )
+    has_path = data_config.get("path") is not None and data_config.get("path") != ""
+    has_sample_path = (
+        data_config.get("sample_path") is not None and data_config.get("sample_path") != ""
+    )
+    has_open_beam_path = (
+        data_config.get("open_beam_path") is not None
+        and data_config.get("open_beam_path") != ""
+    )
+    if mode in {"single_spectrum", "fit_spectrum", "spectrum"} and not has_path:
+        errors.append("single_spectrum workflow requires data.path")
+    elif mode in {"density_map", "spatial_map"}:
+        if effective_kind in {"nexus_histogram", "nexus"}:
+            if not has_sample_path or not has_open_beam_path:
+                errors.append("nexus density_map workflow requires sample_path and open_beam_path")
+        elif effective_kind in {
+            "transmission_npz",
+            "transmission",
+            "transmission_tiff",
+            "tiff",
+            "counts_npz",
+            "counts",
+        }:
+            if not has_path:
+                errors.append(f"{effective_kind} density_map workflow requires data.path")
+        else:
+            errors.append(f"unsupported density_map data kind: {effective_kind}")
+
     data_paths = []
     for key in ("path", "sample_path", "open_beam_path", "uncertainty_path"):
         value = data_config.get(key)
-        if value is None:
+        if value is None or value == "":
             continue
         path = _resolve_path(base, value)
         data_paths.append({"key": key, "path": str(path), "exists": path.exists()})
@@ -953,7 +1017,7 @@ def _validate_workflow(manifest: dict[str, Any]) -> dict[str, Any]:
         "manifest_path": manifest["manifest_path"],
         "dataset_path": manifest["dataset_path"],
         "mode": mode or None,
-        "data_kind": _normalise_kind(data_config.get("kind"), "unspecified"),
+        "data_kind": effective_kind,
         "data_paths": data_paths,
         "isotopes": _json_safe(entries),
     }
@@ -1382,14 +1446,14 @@ def process_resonance_dataset(
             raise ValueError(f"unsupported analysis mode: {mode}")
 
         summary_path = out / "nereids_mcp_result.json"
-        summary = {
+        summary = _json_safe({
             "success": True,
             "message": "NEREIDS resonance workflow completed",
             "manifest_path": manifest["manifest_path"],
             "validation_warnings": validation["warnings"],
-            "results": _json_safe(result),
-        }
-        summary_path.write_text(json.dumps(summary, indent=2))
+            "results": result,
+        })
+        summary_path.write_text(json.dumps(summary, indent=2, allow_nan=False))
         summary["summary_json"] = str(summary_path)
         return summary
     except Exception as exc:
