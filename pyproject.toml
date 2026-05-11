@@ -40,7 +40,7 @@ mcp = ["fastmcp>=3.0"]
 gui = ["nereids-gui==0.1.8"]
 
 [project.scripts]
-nereids-mcp = "nereids.mcp:mcp.run"
+nereids-mcp = "nereids.mcp:main"
 
 [build-system]
 requires = ["maturin>=1.0,<2.0"]

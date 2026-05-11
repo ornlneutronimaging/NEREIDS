@@ -22,4 +22,12 @@ def __getattr__(name):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-__all__ = ["mcp"]
+def main():
+    """Run the NEREIDS MCP server over stdio."""
+    _check_fastmcp()
+    from nereids.mcp.server import mcp
+
+    mcp.run()
+
+
+__all__ = ["mcp", "main"]

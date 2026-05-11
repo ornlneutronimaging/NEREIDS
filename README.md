@@ -73,6 +73,78 @@ pip install nereids-gui
 nereids-gui
 ```
 
+### MCP server for AI agents
+
+NEREIDS can run as a local [Model Context Protocol](https://modelcontextprotocol.io/)
+server so AI agents can inspect neutron-resonance data, fit spectra, and run
+spatial density-map workflows through the Python bindings.
+
+```bash
+pip install "nereids[mcp]"
+nereids-mcp
+```
+
+Example MCP client configuration:
+
+```json
+{
+  "mcpServers": {
+    "nereids": {
+      "command": "nereids-mcp"
+    }
+  }
+}
+```
+
+The server exposes low-level physics tools (`load_endf`,
+`compute_cross_sections`, `compute_transmission`, `detect_isotopes`) and
+workflow tools for agent-driven processing:
+
+- `extract_resonance_manifest(dataset_path)` reads an sMCP-style manifest.
+- `validate_resonance_dataset(dataset_path)` checks data, isotope, and
+  resolution configuration.
+- `process_resonance_dataset(dataset_path)` runs a `single_spectrum` or
+  `density_map` workflow and writes compact `.npz` result artifacts.
+
+Datasets can include `manifest_intermediate.md`, `smcp_manifest.md`,
+`nereids_manifest.md`, `nereids_mcp.json`, or `analysis.json`. Markdown
+manifests use frontmatter between `---` delimiters; JSON frontmatter is
+supported without extra YAML dependencies.
+
+See the [MCP server guide](docs/guide/src/mcp-server.md) for supported data
+kinds, manifest fields, NeXus histogram handling, and output artifacts.
+
+Minimal spectrum manifest:
+
+```markdown
+---
+{
+  "name": "venus-hf-spectrum",
+  "tool": "nereids",
+  "physics": "neutron-resonance",
+  "analysis": {
+    "mode": "single_spectrum",
+    "data": {
+      "kind": "counts_npz",
+      "path": "aggregated_hf_120min.npz",
+      "pc_ratio": 5.98
+    },
+    "isotopes": [
+      {"isotope": "Hf-177", "endf_file": "Hf-177.endf", "initial_density": 1e-5}
+    ],
+    "fit": {"solver": "lm", "fit_domain": "transmission", "max_iter": 100},
+    "resolution": {
+      "kind": "gaussian",
+      "flight_path_m": 25.0,
+      "delta_t_us": 0.5,
+      "delta_l_m": 0.005
+    },
+    "output": {"directory": "output"}
+  }
+}
+---
+```
+
 ### From source
 
 ```bash
