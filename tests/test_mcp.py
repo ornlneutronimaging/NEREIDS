@@ -6,19 +6,26 @@ The functions are plain Python under the @mcp.tool() decorator, so
 direct invocation validates all business logic.
 """
 
+import json
+
+import numpy as np
 import pytest
 
 fastmcp = pytest.importorskip("fastmcp")
 
+import nereids
 from nereids.mcp.server import (
     _registry,
     compute_cross_sections,
     compute_transmission,
     detect_isotopes,
+    extract_resonance_manifest,
     forward_model,
     get_resonance_parameters,
     list_isotopes,
     load_endf,
+    process_resonance_dataset,
+    validate_resonance_dataset,
 )
 
 
@@ -270,3 +277,150 @@ class TestInputValidation:
     def test_list_isotopes_invalid_z(self):
         with pytest.raises(ValueError, match="z must be"):
             list_isotopes(0)
+
+
+# ---------------------------------------------------------------------------
+# Manifest-driven workflow tools
+# ---------------------------------------------------------------------------
+
+
+def _synthetic_u238_entry(initial_density=0.001):
+    return {
+        "isotope": "U-238",
+        "initial_density": initial_density,
+        "synthetic_resonance": {
+            "z": 92,
+            "a": 238,
+            "awr": 236.006,
+            "scattering_radius": 9.48,
+            "target_spin": 0.0,
+            "resonances": [[6.67, 0.5, 0.0015, 0.023]],
+        },
+    }
+
+
+def _synthetic_u238_data():
+    return nereids.create_resonance_data(
+        z=92,
+        a=238,
+        awr=236.006,
+        scattering_radius=9.48,
+        resonances=[(6.67, 0.5, 0.0015, 0.023)],
+        target_spin=0.0,
+    )
+
+
+def _write_json_frontmatter_manifest(tmp_path, analysis):
+    frontmatter = {
+        "name": "synthetic-u238-mcp-demo",
+        "description": "Synthetic U-238 resonance processing test",
+        "tool": "nereids",
+        "physics": "neutron-resonance",
+        "version": "0.1.0",
+        "analysis": analysis,
+    }
+    path = tmp_path / "manifest_intermediate.md"
+    path.write_text(
+        "---\n"
+        + json.dumps(frontmatter, indent=2)
+        + "\n---\n"
+        + "# Synthetic NEREIDS MCP workflow\n"
+    )
+    return path
+
+
+class TestManifestWorkflowTools:
+    def test_extract_and_validate_manifest(self, tmp_path):
+        np.savez(
+            tmp_path / "spectrum.npz",
+            energies_ev=np.linspace(1.0, 30.0, 20),
+            transmission=np.ones(20),
+            uncertainty=np.full(20, 0.01),
+        )
+        manifest_path = _write_json_frontmatter_manifest(
+            tmp_path,
+            {
+                "mode": "single_spectrum",
+                "data": {"kind": "transmission_npz", "path": "spectrum.npz"},
+                "isotopes": [_synthetic_u238_entry()],
+                "fit": {"solver": "lm", "max_iter": 5},
+                "resolution": {"kind": "none"},
+            },
+        )
+
+        extracted = extract_resonance_manifest(str(tmp_path))
+        assert extracted["manifest_path"] == str(manifest_path)
+        assert extracted["frontmatter"]["tool"] == "nereids"
+
+        validation = validate_resonance_dataset(str(tmp_path))
+        assert validation["valid"] is True
+        assert validation["mode"] == "single_spectrum"
+        assert validation["data_paths"][0]["exists"] is True
+
+    def test_process_single_spectrum_manifest(self, tmp_path):
+        energies = np.linspace(1.0, 30.0, 160)
+        true_density = 0.002
+        isotope = _synthetic_u238_data()
+        transmission = np.asarray(
+            nereids.forward_model(energies, [(isotope, true_density)])
+        )
+        np.savez(
+            tmp_path / "spectrum.npz",
+            energies_ev=energies,
+            transmission=transmission,
+            uncertainty=np.full_like(transmission, 0.005),
+        )
+        _write_json_frontmatter_manifest(
+            tmp_path,
+            {
+                "mode": "single_spectrum",
+                "data": {"kind": "transmission_npz", "path": "spectrum.npz"},
+                "isotopes": [_synthetic_u238_entry(initial_density=0.001)],
+                "fit": {"solver": "lm", "max_iter": 50},
+                "resolution": {"kind": "none"},
+                "output": {"directory": "output"},
+            },
+        )
+
+        result = process_resonance_dataset(str(tmp_path))
+
+        assert result["success"] is True
+        fit = result["results"]["density_fits"][0]
+        assert fit["isotope"] == "U-238"
+        assert fit["density_atoms_per_barn"] == pytest.approx(true_density, rel=0.15)
+        assert (tmp_path / "output" / "nereids_spectrum_fit.npz").exists()
+        assert (tmp_path / "output" / "nereids_mcp_result.json").exists()
+
+    def test_process_density_map_manifest(self, tmp_path):
+        energies = np.linspace(1.0, 30.0, 120)
+        true_density = 0.002
+        isotope = _synthetic_u238_data()
+        spectrum = np.asarray(
+            nereids.forward_model(energies, [(isotope, true_density)])
+        )
+        transmission = np.tile(spectrum[:, None, None], (1, 2, 3))
+        np.savez(
+            tmp_path / "density-map.npz",
+            energies_ev=energies,
+            transmission=transmission,
+            uncertainty=np.full_like(transmission, 0.005),
+        )
+        _write_json_frontmatter_manifest(
+            tmp_path,
+            {
+                "mode": "density_map",
+                "data": {"kind": "transmission_npz", "path": "density-map.npz"},
+                "isotopes": [_synthetic_u238_entry(initial_density=0.001)],
+                "fit": {"solver": "lm", "max_iter": 50},
+                "resolution": {"kind": "none"},
+                "output": {"directory": "output"},
+            },
+        )
+
+        result = process_resonance_dataset(str(tmp_path))
+
+        assert result["success"] is True
+        assert result["results"]["n_converged"] == 6
+        stats = result["results"]["density_maps"][0]["density_atoms_per_barn"]
+        assert stats["mean"] == pytest.approx(true_density, rel=0.15)
+        assert (tmp_path / "output" / "nereids_density_map.npz").exists()
