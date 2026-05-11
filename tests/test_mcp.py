@@ -472,7 +472,7 @@ class TestManifestWorkflowTools:
         monkeypatch.setattr(
             nereids,
             "tof_to_energy_centers",
-            lambda edges, flight_path, delay_us=0.0: np.asarray([9.0, 4.0, 1.0]),
+            lambda edges, flight_path, delay_us=0.0: np.asarray([1.0, 4.0, 9.0]),
         )
         monkeypatch.setattr(nereids, "from_counts", fake_from_counts)
         monkeypatch.setattr(nereids, "spatial_map_typed", fake_spatial_map_typed)

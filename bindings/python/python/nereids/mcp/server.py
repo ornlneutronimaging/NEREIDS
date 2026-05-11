@@ -843,8 +843,11 @@ def _process_density_map(
             nereids.tof_to_energy_centers(sample_data.tof_edges_us, flight_path, delay_us),
             dtype=np.float64,
         )
-        # Ascending TOF produces descending energy centers; the shared grid helper
-        # reverses energies and aligned counts together exactly once.
+        # NeXus counts are loaded in TOF-bin order. The Python binding returns
+        # ascending energy centers, so reverse the counts to energy order first.
+        if np.all(np.diff(energies) > 0):
+            sample = np.ascontiguousarray(sample[::-1, ...])
+            open_beam = np.ascontiguousarray(open_beam[::-1, ...])
         energies, sample, open_beam = _ascending_energy_grid(energies, sample, open_beam)
         sample = _apply_roi(sample, data_config.get("roi") or config.get("roi"))
         open_beam = _apply_roi(open_beam, data_config.get("roi") or config.get("roi"))
