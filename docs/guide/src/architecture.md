@@ -93,8 +93,13 @@ Per-pixel fitting uses [rayon](https://docs.rs/rayon) for data parallelism.
 The outer pixel loop runs on a dedicated thread pool to avoid deadlocking
 with inner parallel operations (cross-section calculation, broadening).
 
-### Python Bindings via PyO3
+### Python Bindings and MCP
 
 The Python bindings expose a high-level API (`load_endf`, `forward_model`,
-`fit_spectrum`, `spatial_map`) that maps directly to the Rust pipeline.
-NumPy arrays are zero-copy where possible via `numpy` crate integration.
+`fit_spectrum_typed`, `fit_counts_spectrum_typed`, `spatial_map_typed`) that
+maps directly to the Rust pipeline. NumPy arrays are zero-copy where possible
+via `numpy` crate integration.
+
+The MCP server is a thin Python package layer over these bindings. It exposes
+low-level physics tools and manifest-driven workflow tools for local AI-agent
+orchestration; it does not add a separate fitting engine.

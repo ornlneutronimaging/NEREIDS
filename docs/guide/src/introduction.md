@@ -19,15 +19,16 @@ The analysis pipeline:
 4. **Fit** resonance models to measured transmission spectra
 5. **Map** fitted parameters (areal density, temperature) across each pixel
 
-## Three Deliverables
+## Interfaces
 
-NEREIDS ships in three forms:
+NEREIDS ships in several interfaces:
 
 | Deliverable | Use case |
 |-------------|----------|
 | **Rust library** (`nereids-*` crates) | Embed in Rust applications, maximum performance |
 | **Python bindings** (`pip install nereids`) | Jupyter notebooks, scripting, integration with NumPy/SciPy |
 | **Desktop GUI** (`nereids-gui`) | Interactive analysis with visual feedback |
+| **MCP server** (`nereids-mcp`) | Local AI-agent assisted analysis through manifest-driven workflows |
 
 ![NEREIDS landing page](images/landing.png)
 

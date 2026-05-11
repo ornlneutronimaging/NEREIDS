@@ -111,6 +111,9 @@ Datasets can include `manifest_intermediate.md`, `smcp_manifest.md`,
 manifests use frontmatter between `---` delimiters; JSON frontmatter is
 supported without extra YAML dependencies.
 
+See the [MCP server guide](docs/guide/src/mcp-server.md) for supported data
+kinds, manifest fields, NeXus histogram handling, and output artifacts.
+
 Minimal spectrum manifest:
 
 ```markdown

@@ -28,17 +28,30 @@ This requires the HDF5 C library to be installed on your system.
 ## Python Bindings
 
 ```bash
-pip install nereids          # available after first public release
+pip install nereids
 ```
 
 **Requirements**: Python 3.10+ and NumPy.
+
+## MCP Server
+
+The MCP server is installed as an optional Python extra:
+
+```bash
+pip install "nereids[mcp]"
+nereids-mcp
+```
+
+See the [MCP server](./mcp-server.md) chapter for client configuration and
+manifest-driven workflows.
 
 ## Desktop GUI
 
 ### macOS (Homebrew)
 
 ```bash
-brew install --cask ornlneutronimaging/nereids/nereids   # available after first public release
+brew tap ornlneutronimaging/nereids
+brew install --cask nereids
 ```
 
 ### From Source
