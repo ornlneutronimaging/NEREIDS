@@ -310,6 +310,23 @@ def _npz_arrays(path: Path) -> dict[str, np.ndarray]:
         return {key: np.asarray(data[key]) for key in data.files}
 
 
+def _require_npz_keys(
+    arrays: dict[str, np.ndarray],
+    keys: list[str],
+    *,
+    context: str,
+) -> None:
+    missing = [key for key in keys if key not in arrays]
+    if missing:
+        available = ", ".join(sorted(arrays)) or "<none>"
+        required = ", ".join(keys)
+        missing_text = ", ".join(missing)
+        raise ValueError(
+            f"{context} is missing required key(s): {missing_text}. "
+            f"Required keys: {required}. Available keys: {available}"
+        )
+
+
 def _load_energy_grid(
     base: Path,
     data_config: dict[str, Any],
@@ -541,6 +558,8 @@ def _apply_roi(cube: np.ndarray, roi: dict[str, Any] | None) -> np.ndarray:
     height = int(roi.get("height", cube.shape[1] - y0))
     if x0 < 0 or y0 < 0 or width <= 0 or height <= 0:
         raise ValueError(f"invalid ROI: {roi}")
+    if x0 + width > cube.shape[2] or y0 + height > cube.shape[1]:
+        raise ValueError(f"ROI {roi} exceeds cube bounds {cube.shape[1:]}")
     return np.ascontiguousarray(cube[:, y0 : y0 + height, x0 : x0 + width])
 
 
@@ -630,6 +649,11 @@ def _process_single_spectrum(
     if kind in {"counts_npz", "counts"}:
         sample_key = data_config.get("sample_key", "sample_counts")
         open_beam_key = data_config.get("open_beam_key", "open_beam_counts")
+        _require_npz_keys(
+            arrays,
+            [sample_key, open_beam_key],
+            context="single_spectrum counts data",
+        )
         sample = _validate_array("sample_counts", arrays[sample_key])
         open_beam = _validate_array("open_beam_counts", arrays[open_beam_key])
         _require_same_shape("sample_counts", sample, ("open_beam_counts", open_beam))
@@ -677,6 +701,11 @@ def _process_single_spectrum(
     elif kind in {"transmission_npz", "transmission", "spectrum"}:
         trans_key = data_config.get("transmission_key", "transmission")
         unc_key = data_config.get("uncertainty_key", "uncertainty")
+        _require_npz_keys(
+            arrays,
+            [trans_key],
+            context="single_spectrum transmission data",
+        )
         transmission = _validate_array("transmission", arrays[trans_key])
         if unc_key in arrays:
             uncertainty = _validate_array("uncertainty", arrays[unc_key])
@@ -753,6 +782,11 @@ def _process_density_map(
             raise ValueError("transmission_npz data requires a .npz data.path")
         trans_key = data_config.get("transmission_key", "transmission")
         unc_key = data_config.get("uncertainty_key", "uncertainty")
+        _require_npz_keys(
+            arrays,
+            [trans_key],
+            context="density_map transmission data",
+        )
         transmission = _validate_array("transmission", arrays[trans_key], ndim=3)
         if unc_key in arrays:
             uncertainty = _validate_array("uncertainty", arrays[unc_key], ndim=3)
@@ -804,12 +838,19 @@ def _process_density_map(
     elif kind in {"counts_npz", "counts"}:
         if arrays is None:
             raise ValueError("counts_npz data requires a .npz data.path")
+        sample_key = data_config.get("sample_key", "sample_counts")
+        open_beam_key = data_config.get("open_beam_key", "open_beam_counts")
+        _require_npz_keys(
+            arrays,
+            [sample_key, open_beam_key],
+            context="density_map counts data",
+        )
         sample = _validate_array(
-            "sample_counts", arrays[data_config.get("sample_key", "sample_counts")], ndim=3
+            "sample_counts", arrays[sample_key], ndim=3
         )
         open_beam = _validate_array(
             "open_beam_counts",
-            arrays[data_config.get("open_beam_key", "open_beam_counts")],
+            arrays[open_beam_key],
             ndim=3,
         )
         _require_same_shape("sample_counts", sample, ("open_beam_counts", open_beam))
@@ -832,6 +873,17 @@ def _process_density_map(
         sample = _validate_array("sample_counts", sample_data.counts, ndim=3)
         open_beam = _validate_array("open_beam_counts", ob_data.counts, ndim=3)
         _require_same_shape("sample_counts", sample, ("open_beam_counts", open_beam))
+        sample_tof_edges = _validate_array(
+            "sample_tof_edges_us", sample_data.tof_edges_us, ndim=1
+        )
+        open_beam_tof_edges = _validate_array(
+            "open_beam_tof_edges_us", ob_data.tof_edges_us, ndim=1
+        )
+        if (
+            sample_tof_edges.shape != open_beam_tof_edges.shape
+            or not np.allclose(sample_tof_edges, open_beam_tof_edges)
+        ):
+            raise ValueError("nexus sample and open_beam TOF bin edges must match")
         flight_path = float(
             data_config.get(
                 "flight_path_m",
@@ -840,7 +892,7 @@ def _process_density_map(
         )
         delay_us = float(data_config.get("delay_us", 0.0))
         energies = np.asarray(
-            nereids.tof_to_energy_centers(sample_data.tof_edges_us, flight_path, delay_us),
+            nereids.tof_to_energy_centers(sample_tof_edges, flight_path, delay_us),
             dtype=np.float64,
         )
         # NeXus counts are loaded in TOF-bin order. The Python binding returns
@@ -930,13 +982,16 @@ def _validate_workflow(manifest: dict[str, Any]) -> dict[str, Any]:
 
     tool = str(frontmatter.get("tool", config.get("tool", "nereids"))).lower()
     if tool not in {"nereids", "nereids-mcp", "smcp-nereids"}:
-        errors.append(f"manifest tool must be 'nereids', got {tool!r}")
+        errors.append(
+            "manifest tool must be one of 'nereids', 'nereids-mcp', "
+            f"or 'smcp-nereids', got {tool!r}"
+        )
 
     mode = _normalise_mode(config.get("mode", config.get("analysis_mode")))
     if mode not in {"single_spectrum", "fit_spectrum", "spectrum", "density_map", "spatial_map"}:
         errors.append(
             "analysis mode must be one of single_spectrum, fit_spectrum, "
-            "density_map, or spatial_map"
+            "spectrum, density_map, or spatial_map"
         )
 
     effective_kind = _normalise_kind(

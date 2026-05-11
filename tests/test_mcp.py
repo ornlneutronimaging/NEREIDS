@@ -522,6 +522,29 @@ class TestManifestWorkflowTools:
         assert result["success"] is False
         assert "matching shapes" in result["error"]
 
+    def test_process_reports_missing_counts_npz_key(self, tmp_path):
+        np.savez(
+            tmp_path / "counts.npz",
+            energies_ev=np.linspace(1.0, 5.0, 5),
+            sample_counts=np.ones(5),
+        )
+        _write_json_frontmatter_manifest(
+            tmp_path,
+            {
+                "mode": "single_spectrum",
+                "data": {"kind": "counts_npz", "path": "counts.npz"},
+                "isotopes": [_synthetic_u238_entry()],
+                "fit": {"solver": "lm", "max_iter": 5},
+                "resolution": {"kind": "none"},
+            },
+        )
+
+        result = process_resonance_dataset(str(tmp_path))
+
+        assert result["success"] is False
+        assert "missing required key(s): open_beam_counts" in result["error"]
+        assert "Available keys: energies_ev, sample_counts" in result["error"]
+
     def test_process_rejects_mismatched_density_uncertainty_shapes(self, tmp_path):
         np.savez(
             tmp_path / "density-map.npz",
@@ -544,6 +567,138 @@ class TestManifestWorkflowTools:
 
         assert result["success"] is False
         assert "matching shapes" in result["error"]
+
+    def test_process_reports_missing_density_npz_key(self, tmp_path):
+        np.savez(
+            tmp_path / "density-map.npz",
+            energies_ev=np.linspace(1.0, 5.0, 5),
+            sample_counts=np.ones((5, 2, 2)),
+        )
+        _write_json_frontmatter_manifest(
+            tmp_path,
+            {
+                "mode": "density_map",
+                "data": {"kind": "counts_npz", "path": "density-map.npz"},
+                "isotopes": [_synthetic_u238_entry()],
+                "fit": {"solver": "lm", "max_iter": 5},
+                "resolution": {"kind": "none"},
+            },
+        )
+
+        result = process_resonance_dataset(str(tmp_path))
+
+        assert result["success"] is False
+        assert "density_map counts data is missing required key(s)" in result["error"]
+        assert "open_beam_counts" in result["error"]
+
+    def test_process_reports_missing_density_transmission_key(self, tmp_path):
+        np.savez(
+            tmp_path / "density-map.npz",
+            energies_ev=np.linspace(1.0, 5.0, 5),
+            not_transmission=np.ones((5, 2, 2)),
+        )
+        _write_json_frontmatter_manifest(
+            tmp_path,
+            {
+                "mode": "density_map",
+                "data": {"kind": "transmission_npz", "path": "density-map.npz"},
+                "isotopes": [_synthetic_u238_entry()],
+                "fit": {"solver": "lm", "max_iter": 5},
+                "resolution": {"kind": "none"},
+            },
+        )
+
+        result = process_resonance_dataset(str(tmp_path))
+
+        assert result["success"] is False
+        assert "density_map transmission data is missing required key(s)" in result["error"]
+        assert "transmission" in result["error"]
+
+    def test_process_rejects_out_of_bounds_roi(self, tmp_path):
+        np.savez(
+            tmp_path / "density-map.npz",
+            energies_ev=np.linspace(1.0, 5.0, 5),
+            transmission=np.ones((5, 2, 2)),
+            uncertainty=np.ones((5, 2, 2)),
+        )
+        _write_json_frontmatter_manifest(
+            tmp_path,
+            {
+                "mode": "density_map",
+                "data": {
+                    "kind": "transmission_npz",
+                    "path": "density-map.npz",
+                    "roi": {"x0": 1, "y0": 0, "width": 2, "height": 1},
+                },
+                "isotopes": [_synthetic_u238_entry()],
+                "fit": {"solver": "lm", "max_iter": 5},
+                "resolution": {"kind": "none"},
+            },
+        )
+
+        result = process_resonance_dataset(str(tmp_path))
+
+        assert result["success"] is False
+        assert "exceeds cube bounds" in result["error"]
+
+    def test_process_rejects_mismatched_nexus_tof_edges(self, tmp_path, monkeypatch):
+        sample_path = tmp_path / "sample.nxs"
+        open_beam_path = tmp_path / "open_beam.nxs"
+        sample_path.touch()
+        open_beam_path.touch()
+
+        def fake_load_nexus_histogram(path):
+            tof_edges = (
+                np.asarray([1.0, 2.0, 3.0, 4.0])
+                if path == str(sample_path)
+                else np.asarray([1.0, 2.0, 3.2, 4.0])
+            )
+            return SimpleNamespace(
+                counts=np.ones((3, 1, 1)),
+                tof_edges_us=tof_edges,
+                flight_path_m=25.0,
+            )
+
+        monkeypatch.setattr(nereids, "load_nexus_histogram", fake_load_nexus_histogram)
+        _write_json_frontmatter_manifest(
+            tmp_path,
+            {
+                "mode": "density_map",
+                "data": {
+                    "kind": "nexus",
+                    "sample_path": sample_path.name,
+                    "open_beam_path": open_beam_path.name,
+                },
+                "isotopes": [_synthetic_u238_entry()],
+                "fit": {"solver": "lm", "max_iter": 5},
+                "resolution": {"kind": "none"},
+            },
+        )
+
+        result = process_resonance_dataset(str(tmp_path))
+
+        assert result["success"] is False
+        assert "TOF bin edges must match" in result["error"]
+
+    def test_validation_messages_match_allowed_values(self, tmp_path):
+        frontmatter = {
+            "name": "invalid-validation-demo",
+            "tool": "pleiades",
+            "analysis": {
+                "mode": "bad-mode",
+                "data": {"kind": "transmission_npz"},
+                "isotopes": [_synthetic_u238_entry()],
+            },
+        }
+        (tmp_path / "manifest_intermediate.md").write_text(
+            "---\n" + json.dumps(frontmatter) + "\n---\n"
+        )
+
+        result = validate_resonance_dataset(str(tmp_path))
+
+        assert result["valid"] is False
+        assert any("'nereids-mcp'" in error for error in result["errors"])
+        assert any("spectrum" in error for error in result["errors"])
 
     def test_dry_run_rejects_missing_required_data_path(self, tmp_path):
         _write_json_frontmatter_manifest(
