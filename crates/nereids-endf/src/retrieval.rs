@@ -264,6 +264,49 @@ impl EndfRetriever {
         fs::read_to_string(path).map_err(EndfRetrievalError::from)
     }
 
+    /// Peek a user-supplied ENDF source: decode the body and parse the HEAD
+    /// record so the caller can route the upload to the correct isotope entry.
+    ///
+    /// Accepts the same input forms as [`Self::install_local_endf`] — a raw
+    /// ENDF text file or the IAEA ZIP archive distribution — and returns the
+    /// isotope declared by the file's MF=2 MT=151 HEAD record alongside the
+    /// decoded text. The GUI uses this to dispatch a manual upload to the
+    /// matching `IsotopeEntry` without re-reading or re-extracting the file
+    /// during install (issue #523, P2: avoid N-pass zip extraction).
+    pub fn peek_local_endf(source: &Path) -> Result<(Isotope, String), EndfRetrievalError> {
+        let raw = fs::read(source)?;
+        let endf_text = if looks_like_zip(source, &raw) {
+            extract_endf_from_zip(&raw)?
+        } else {
+            String::from_utf8(raw).map_err(|e| {
+                EndfRetrievalError::Parse(format!("ENDF file is not valid UTF-8: {e}"))
+            })?
+        };
+        let parsed = crate::parser::parse_endf_file2(&endf_text)
+            .map_err(|e| EndfRetrievalError::Parse(format!("Failed to parse ENDF file: {e}")))?;
+        Ok((parsed.isotope, endf_text))
+    }
+
+    /// Write already-validated ENDF text to the canonical cache slot for
+    /// `isotope`/`library`. Returns the cache file path.
+    ///
+    /// Use this when the caller has already obtained `text` via
+    /// [`Self::peek_local_endf`] and confirmed the isotope. For one-shot
+    /// install-from-path, use [`Self::install_local_endf`] instead.
+    pub fn install_endf_text(
+        &self,
+        isotope: &Isotope,
+        library: EndfLibrary,
+        text: &str,
+    ) -> Result<PathBuf, EndfRetrievalError> {
+        let cache_path = self.cache_file_path(isotope, library);
+        if let Some(parent) = cache_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&cache_path, text)?;
+        Ok(cache_path)
+    }
+
     /// Install a user-supplied ENDF file into the cache for `isotope`/`library`.
     ///
     /// Accepts either a raw ENDF text file (`.endf`, `.dat`, `.txt`, or
@@ -282,32 +325,14 @@ impl EndfRetriever {
         library: EndfLibrary,
         source: &Path,
     ) -> Result<(PathBuf, String), EndfRetrievalError> {
-        let raw = fs::read(source)?;
-        let endf_text = if looks_like_zip(source, &raw) {
-            extract_endf_from_zip(&raw)?
-        } else {
-            String::from_utf8(raw).map_err(|e| {
-                EndfRetrievalError::Parse(format!("ENDF file is not valid UTF-8: {e}"))
-            })?
-        };
-
-        // Validate the (Z, A) declared by the file's HEAD record matches the
-        // isotope the user intends to install. parse_endf_file2 reads the MF=2
-        // MT=151 HEAD which carries ZA = 1000*Z + A.
-        let parsed = crate::parser::parse_endf_file2(&endf_text)
-            .map_err(|e| EndfRetrievalError::Parse(format!("Failed to parse ENDF file: {e}")))?;
-        if parsed.isotope != *isotope {
+        let (found, endf_text) = Self::peek_local_endf(source)?;
+        if found != *isotope {
             return Err(EndfRetrievalError::IsotopeMismatch {
                 expected: isotope_label(isotope),
-                found: isotope_label(&parsed.isotope),
+                found: isotope_label(&found),
             });
         }
-
-        let cache_path = self.cache_file_path(isotope, library);
-        if let Some(parent) = cache_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&cache_path, &endf_text)?;
+        let cache_path = self.install_endf_text(isotope, library, &endf_text)?;
         Ok((cache_path, endf_text))
     }
 
@@ -751,6 +776,25 @@ mod tests {
             W184_FIXTURE,
             "cache must hold the extracted body, not the zip"
         );
+    }
+
+    #[test]
+    fn peek_local_endf_extracts_isotope_from_zip_and_raw() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Raw .endf path
+        let raw_path = dir.path().join("W-184.endf");
+        std::fs::write(&raw_path, W184_FIXTURE).unwrap();
+        let (iso, text) = EndfRetriever::peek_local_endf(&raw_path).expect("raw peek");
+        assert_eq!(iso, Isotope::new(74, 184).unwrap());
+        assert_eq!(text, W184_FIXTURE);
+
+        // Zip path
+        let zip_path = dir.path().join("upload.zip");
+        write_zip_with_endf(&zip_path, "inner.endf", W184_FIXTURE).expect("zip");
+        let (iso_z, text_z) = EndfRetriever::peek_local_endf(&zip_path).expect("zip peek");
+        assert_eq!(iso_z, Isotope::new(74, 184).unwrap());
+        assert_eq!(text_z, W184_FIXTURE);
     }
 
     #[test]
