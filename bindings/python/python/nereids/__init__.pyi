@@ -141,12 +141,12 @@ class FitResult:
 
     @property
     def back_d(self) -> float | None:
-        """Fitted exponential background amplitude (SAMMY BackD), or None when ``fit_back_d=False``."""
+        """Fitted exponential background amplitude (SAMMY BackD), or None when ``background=False`` or ``fit_back_d=False``."""
         ...
 
     @property
     def back_f(self) -> float | None:
-        """Fitted exponential background decay constant (SAMMY BackF), or None when ``fit_back_f=False``."""
+        """Fitted exponential background decay constant (SAMMY BackF), or None when ``background=False`` or ``fit_back_f=False``."""
         ...
 
     @property
