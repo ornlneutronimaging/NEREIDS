@@ -62,23 +62,32 @@ container / server installs do not.
 
 ```bash
 sudo apt-get install -y \
-  libgtk-3-0 libxcursor1 libx11-xcb1 libxi6 libxrandr2 \
+  libgtk-3-0t64 libxcursor1 libx11-xcb1 libxi6 libxrandr2 \
   libxinerama1 libxxf86vm1 libxkbcommon-x11-0 libwayland-client0 \
   libgl1 libegl1
 ```
 
+On Ubuntu releases older than 24.04 the GTK 3 runtime is `libgtk-3-0`
+instead of `libgtk-3-0t64`; the older name still resolves on 24.04 via
+a transitional package.
+
 Contributors building from source additionally need the GTK 3
-development headers (`sudo apt-get install -y libgtk-3-dev`).
+development headers and `pkg-config`:
+
+```bash
+sudo apt-get install -y libgtk-3-dev pkg-config
+```
 
 **Fedora / RHEL (dnf):**
 
 ```bash
 sudo dnf install -y \
   gtk3 libXcursor libXi libXrandr libXinerama libxkbcommon-x11 \
-  wayland mesa-libGL mesa-libEGL
+  libwayland-client libwayland-cursor mesa-libGL mesa-libEGL
 ```
 
-Contributors building from source additionally need `gtk3-devel`.
+Contributors building from source additionally need `gtk3-devel` and
+`pkgconf-pkg-config`.
 
 **Headless / Docker / VM fallback:**
 
