@@ -596,7 +596,7 @@ def _fit_result_summary(result: Any, names: list[str]) -> dict[str, Any]:
                 else None,
             }
         )
-    return {
+    summary: dict[str, Any] = {
         "density_fits": entries,
         "reduced_chi_squared": _finite_float_or_none(result.reduced_chi_squared),
         "deviance_per_dof": None
@@ -610,6 +610,16 @@ def _fit_result_summary(result: Any, names: list[str]) -> dict[str, Any]:
         "anorm": _finite_float_or_none(result.anorm),
         "background": [_finite_float_or_none(v) for v in result.background],
     }
+    # Fitted TZERO (t0_us, l_scale) and exponential-background (back_d, back_f)
+    # parameters are populated on FitResult when the corresponding fit flags
+    # are set in the manifest's analysis.fit block. Emit them only when present
+    # so the schema stays backwards-compatible for fits that don't enable
+    # those flags (key absent rather than null, matching deviance_per_dof).
+    for attr in ("t0_us", "l_scale", "back_d", "back_f"):
+        value = getattr(result, attr, None)
+        if value is not None:
+            summary[attr] = _finite_float_or_none(value)
+    return summary
 
 
 def _process_single_spectrum(
@@ -954,9 +964,45 @@ def _process_density_map(
                 "uncertainty_atoms_per_barn": _array_stats(uncertainty_arr),
             }
         )
+
+    # SpatialResult exposes per-pixel anorm / background / t0 / l_scale maps
+    # whenever the spatial pipeline ran with the corresponding *feature*
+    # enabled (e.g. `background=True` materialises all three terms of
+    # `background_maps` — including NaN-per-pixel entries for terms that
+    # were not actually fit — and `fit_energy_scale=True` materialises
+    # both t0/L scale maps).  Save the raw arrays into the NPZ (so
+    # downstream consumers can reconstruct the model curve per-pixel) and
+    # surface aggregate stats in the JSON summary.  Per-pixel
+    # back_d_map / back_f_map are not yet exposed on SpatialResult;
+    # tracked as a Rust-side follow-up (#538).
+    fit_param_stats: dict[str, Any] = {}
+    anorm_map = getattr(result, "anorm_map", None)
+    if anorm_map is not None:
+        anorm_arr = np.asarray(anorm_map)
+        arrays_to_save["anorm_map"] = anorm_arr
+        fit_param_stats["anorm"] = _array_stats(anorm_arr)
+    background_maps = getattr(result, "background_maps", None)
+    if background_maps is not None:
+        bm_stats = []
+        for term_idx, bm in enumerate(background_maps):
+            bm_arr = np.asarray(bm)
+            arrays_to_save[f"background_term_{term_idx}_map"] = bm_arr
+            bm_stats.append(_array_stats(bm_arr))
+        fit_param_stats["background"] = bm_stats
+    t0_us_map = getattr(result, "t0_us_map", None)
+    if t0_us_map is not None:
+        t0_arr = np.asarray(t0_us_map)
+        arrays_to_save["t0_us_map"] = t0_arr
+        fit_param_stats["t0_us"] = _array_stats(t0_arr)
+    l_scale_map = getattr(result, "l_scale_map", None)
+    if l_scale_map is not None:
+        l_arr = np.asarray(l_scale_map)
+        arrays_to_save["l_scale_map"] = l_arr
+        fit_param_stats["l_scale"] = _array_stats(l_arr)
+
     np.savez_compressed(result_npz, **arrays_to_save)
 
-    return {
+    summary: dict[str, Any] = {
         "mode": "density_map",
         "input_kind": input_kind,
         "data_path": None if path is None else str(path),
@@ -970,6 +1016,9 @@ def _process_density_map(
         "density_maps": density_stats,
         "crop": crop,
     }
+    if fit_param_stats:
+        summary["fit_param_stats"] = fit_param_stats
+    return summary
 
 
 def _validate_workflow(manifest: dict[str, Any]) -> dict[str, Any]:

@@ -404,11 +404,20 @@ struct PyFitResult {
     /// Counts KL background uses `[b0, b1, alpha_2]`.
     background: [f64; 3],
     /// Fitted exponential background amplitude (SAMMY BackD).
-    /// Zero when exponential tail is not fitted.
-    back_d: f64,
+    /// `None` whenever the polynomial background model was not active
+    /// — i.e. either ``background=False`` (the bg model is never
+    /// attached, so the inner Rust ``FitResult.back_d`` is the
+    /// sentinel `0.0`) or ``background=True`` with ``fit_back_d=False``
+    /// (bg model attached but BackD was held at its initial value).
+    /// We surface that as `None` at the Python boundary so MCP
+    /// consumers can distinguish "fit was active and recovered 0.0"
+    /// from "exponential background never engaged" — mirroring the
+    /// `t0_us` / `l_scale` convention.
+    back_d: Option<f64>,
     /// Fitted exponential background decay constant (SAMMY BackF).
-    /// Zero when exponential tail is not fitted.
-    back_f: f64,
+    /// `None` when ``background=False`` OR ``fit_back_f=False``;
+    /// see `back_d` for the full rationale.
+    back_f: Option<f64>,
     /// Fitted TOF offset in microseconds (SAMMY TZERO t₀).
     /// None when energy-scale fitting is not enabled.
     t0_us: Option<f64>,
@@ -487,16 +496,16 @@ impl PyFitResult {
     }
 
     /// Fitted exponential background amplitude (SAMMY BackD).
-    /// Zero when exponential tail is not fitted.
+    /// `None` when ``background=False`` OR ``fit_back_d=False``.
     #[getter]
-    fn back_d(&self) -> f64 {
+    fn back_d(&self) -> Option<f64> {
         self.back_d
     }
 
     /// Fitted exponential background decay constant (SAMMY BackF).
-    /// Zero when exponential tail is not fitted.
+    /// `None` when ``background=False`` OR ``fit_back_f=False``.
     #[getter]
-    fn back_f(&self) -> f64 {
+    fn back_f(&self) -> Option<f64> {
         self.back_f
     }
 
@@ -3532,8 +3541,23 @@ fn py_fit_counts_spectrum_typed<'py>(
         temperature_k_unc: result.temperature_k_unc,
         anorm: result.anorm,
         background: result.background,
-        back_d: result.back_d,
-        back_f: result.back_f,
+        // BackD / BackF are only meaningful when the polynomial background
+        // model was actually attached (the `if background { ... }` block
+        // above never runs when `background=False`, so `result.back_d` and
+        // `result.back_f` are sentinel zeros from the inner Rust
+        // `FitResult`).  Reporting them in that case falsely tells MCP
+        // consumers the exponential tail was fitted, so we gate on both
+        // `background` AND the per-term flag.
+        back_d: if background && fit_back_d {
+            Some(result.back_d)
+        } else {
+            None
+        },
+        back_f: if background && fit_back_f {
+            Some(result.back_f)
+        } else {
+            None
+        },
         t0_us: result.t0_us,
         l_scale: result.l_scale,
         deviance_per_dof: result.deviance_per_dof,
@@ -4025,8 +4049,23 @@ fn py_fit_spectrum_typed<'py>(
         temperature_k_unc: result.temperature_k_unc,
         anorm: result.anorm,
         background: result.background,
-        back_d: result.back_d,
-        back_f: result.back_f,
+        // BackD / BackF are only meaningful when the polynomial background
+        // model was actually attached (the `if background { ... }` block
+        // above never runs when `background=False`, so `result.back_d` and
+        // `result.back_f` are sentinel zeros from the inner Rust
+        // `FitResult`).  Reporting them in that case falsely tells MCP
+        // consumers the exponential tail was fitted, so we gate on both
+        // `background` AND the per-term flag.
+        back_d: if background && fit_back_d {
+            Some(result.back_d)
+        } else {
+            None
+        },
+        back_f: if background && fit_back_f {
+            Some(result.back_f)
+        } else {
+            None
+        },
         t0_us: result.t0_us,
         l_scale: result.l_scale,
         deviance_per_dof: result.deviance_per_dof,
