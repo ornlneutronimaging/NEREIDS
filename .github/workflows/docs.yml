@@ -31,27 +31,23 @@ jobs:
           curl -sSL https://github.com/rust-lang/mdBook/releases/download/v0.4.43/mdbook-v0.4.43-x86_64-unknown-linux-gnu.tar.gz | tar xz -C "$HOME/.local/bin"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Build mdBook
-        working-directory: docs/guide
-        run: mdbook build
-
-      - name: Build rustdoc
-        run: cargo doc --workspace --no-deps --exclude nereids-python
-        env:
-          RUSTDOCFLAGS: -D warnings
-
-      - name: Combine mdBook + rustdoc
-        run: cp -r target/doc target/book/api
-
       - name: Install pixi
         uses: prefix-dev/setup-pixi@v0.9.4
         with:
           run-install: true
 
-      # `doc-python` declares `depends-on = ["build"]` in pyproject.toml,
-      # so pixi runs `maturin develop` automatically before pdoc imports the wheel.
-      - name: Build Python API reference (pdoc)
-        run: pixi run doc-python
+      # Drive the entire docs build through the `doc-build` pixi task. It
+      # orchestrates `doc-guide` (mdBook), `doc-api` (cargo doc), and
+      # `doc-python` (pdoc on the maturin-installed wheel), then `cp -r
+      # target/doc target/book/api` runs LAST as the task's cmd. Running
+      # the steps manually here would re-trigger mdBook via doc-python's
+      # depends-on after we'd already copied rustdoc into target/book/api,
+      # wiping the rustdoc artifact (mdBook clears its destination dir
+      # on every build).
+      - name: Build complete docs site
+        run: pixi run doc-build
+        env:
+          RUSTDOCFLAGS: -D warnings
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
