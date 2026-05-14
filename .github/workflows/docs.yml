@@ -43,6 +43,17 @@ jobs:
       - name: Combine mdBook + rustdoc
         run: cp -r target/doc target/book/api
 
+      - name: Install pixi
+        uses: prefix-dev/setup-pixi@v0.9.4
+        with:
+          run-install: true
+
+      - name: Build Python wheel (for pdoc import)
+        run: pixi run build
+
+      - name: Build Python API reference (pdoc)
+        run: pixi run doc-python
+
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:

@@ -1,9 +1,14 @@
 # Python API Reference
 
 The `nereids` Python package is a PyO3 layer over the Rust pipeline. This
-page gives Python users a browsable reference for the typed API exposed by the
-package and is maintained alongside the shipped `nereids/__init__.pyi` type
-stubs.
+page is a curated narrative reference covering the typed APIs Python users
+reach for most often, with argument tables, array-shape contracts, and
+dispatch rules.
+
+For the exhaustive auto-generated reference (every function, class, and
+attribute exported by the package), see the **[generated Python API
+reference](python/index.html)** built by [pdoc](https://pdoc.dev) from the
+installed wheel and the shipped `nereids/__init__.pyi` type stubs.
 
 Install the base package with:
 
@@ -297,20 +302,30 @@ nereids.tof_to_energy(tof_us, flight_path_m)
 nereids.energy_to_tof(energy_ev, flight_path_m)
 ```
 
-## API Generation Status
+## How This Page Is Generated
 
-The published docs site currently renders this mdBook Python reference plus
-the generated Rust API under `api/`. The Python page is maintained from the
-PyO3 docstrings and the PEP 561 stub file at
-`bindings/python/python/nereids/__init__.pyi`.
+The published docs site renders three things side by side:
 
-Before release, run:
+| Site path | Source | What it shows |
+|-----------|--------|---------------|
+| `/` (this page) | Hand-maintained `docs/guide/src/python-api.md` | Curated narrative tour of the typed APIs |
+| `/python/` | [pdoc](https://pdoc.dev) over the installed `nereids` wheel and `nereids/__init__.pyi` stubs | Auto-generated exhaustive reference |
+| `/api/` | `cargo doc` (rustdoc) | Rust crate API reference |
+
+To rebuild the whole site locally:
 
 ```bash
-pixi run doc-guide
-pixi run doc-build
+pixi run doc-build   # depends on: doc-guide, doc-api, doc-python
+pixi run doc         # serves target/book/ at http://localhost:8000
 ```
 
-`doc-build` builds the mdBook guide, builds Rustdoc, and copies Rustdoc into
-`target/book/api`. It does not execute notebooks or compile mdBook Rust
-snippets.
+`doc-python` invokes `pdoc -o target/book/python --no-show-source nereids`
+after `pixi run build` has produced an importable wheel. Whenever
+`bindings/python/python/nereids/__init__.pyi` or PyO3 docstrings in
+`bindings/python/src/lib.rs` change, both the auto-generated `python/`
+reference and any affected sections of this curated page should be reviewed
+in the same PR.
+
+This page does not execute notebooks or compile-test Python snippets. The
+Rust quickstart on this site IS compile-tested by `cargo check --workspace
+--examples` (see `crates/nereids-fitting/examples/quickstart.rs`).

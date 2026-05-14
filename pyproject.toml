@@ -70,6 +70,7 @@ tifffile = ">=2024.1"
 h5py = ">=3.15.1,<4"
 pandas = ">=3.0.1,<4"
 scipy = ">=1.17.1,<2"
+pdoc = ">=14"
 
 [tool.pixi.pypi-dependencies]
 # fastmcp removed from default env — causes importlib-metadata conflict
@@ -93,7 +94,8 @@ gui-debug = { cmd = "cargo run -p nereids-gui", description = "Run the GUI appli
 gui-bundle = { cmd = "cargo bundle --release", cwd = "apps/gui", description = "Bundle the GUI as a macOS .app" }
 doc-guide = { cmd = "mdbook build", cwd = "docs/guide", description = "Build the mdBook user guide (requires: cargo install mdbook)" }
 doc-api = { cmd = "cargo doc --workspace --no-deps --exclude nereids-python", description = "Build rustdoc API reference" }
-doc-build = { cmd = "cp -r target/doc target/book/api", depends-on = ["doc-guide", "doc-api"], description = "Build full docs site (mdBook + rustdoc)" }
+doc-python = { cmd = "pdoc -o target/book/python --no-show-source nereids", depends-on = ["build"], description = "Build Python API reference via pdoc (imports the installed nereids wheel)" }
+doc-build = { cmd = "cp -r target/doc target/book/api", depends-on = ["doc-guide", "doc-api", "doc-python"], description = "Build full docs site (mdBook + rustdoc + Python API)" }
 doc = { cmd = "python -m http.server 8000", cwd = "target/book", depends-on = ["doc-build"], description = "Build and serve docs locally at http://localhost:8000" }
 bump-version = { cmd = "bash scripts/bump-version.sh", description = "Bump version across workspace: pixi run bump-version 0.2.0 [--dry-run]" }
 gh-issues = { cmd = "python scripts/gh_issues.py", description = "Query GitHub issues/PRs consistently" }
