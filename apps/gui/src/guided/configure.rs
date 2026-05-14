@@ -555,18 +555,11 @@ fn fetch_endf_data(state: &mut AppState) {
     std::thread::spawn(move || design::endf_fetch_worker(work, cancel, tx));
 }
 
-/// Render the offline-fallback hint that lists the exact cache-file path for
-/// every Failed isotope under the active library, so users can `cp` a
-/// manually-downloaded ENDF straight into place (issue #523). Paths come from
-/// the free `default_cache_file_path` helper to avoid the per-frame
-/// `EndfRetriever::new()` cost that would otherwise build a reqwest client +
-/// TLS context just to read the cache layout.
-fn render_failed_cache_hint(ui: &mut egui::Ui, state: &AppState) {
-    use nereids_core::types::Isotope;
-    use nereids_endf::retrieval::default_cache_file_path;
-
-    const MAX_LINES: usize = 3;
-    let library = state.endf_library;
+/// Collect deduplicated `(Z, A)` coordinates of every enabled+Failed isotope
+/// in the user's selection — individual entries first, then group members.
+/// Pure read of state; lifted out of `render_failed_cache_hint` so the
+/// dedup/ordering logic can be unit-tested without an egui context.
+fn failed_isotope_keys(state: &AppState) -> Vec<(u32, u32)> {
     let mut failed: Vec<(u32, u32)> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for e in &state.isotope_entries {
@@ -584,6 +577,56 @@ fn render_failed_cache_hint(ui: &mut egui::Ui, state: &AppState) {
             }
         }
     }
+    failed
+}
+
+/// Whether `(z, a)` appears anywhere in the user's selection — individual
+/// entries or group members. The local-install dialog uses this to decide
+/// whether a peeked ENDF file routes to a real entry. Pure read; testable.
+fn isotope_in_selection(state: &AppState, z: u32, a: u32) -> bool {
+    state.isotope_entries.iter().any(|e| e.z == z && e.a == a)
+        || state
+            .isotope_groups
+            .iter()
+            .any(|g| g.z == z && g.members.iter().any(|m| m.a == a))
+}
+
+/// Clear cached resonance data on the entry matching `(z, a)` and reset its
+/// status to Pending so the auto-fetch loop re-reads it (now from the local
+/// cache). Hits both individual entries and group members.
+fn mark_isotope_pending(state: &mut AppState, z: u32, a: u32) {
+    for e in &mut state.isotope_entries {
+        if e.z == z && e.a == a {
+            e.resonance_data = None;
+            e.endf_status = EndfStatus::Pending;
+        }
+    }
+    for g in &mut state.isotope_groups {
+        if g.z != z {
+            continue;
+        }
+        for m in &mut g.members {
+            if m.a == a {
+                m.resonance_data = None;
+                m.endf_status = EndfStatus::Pending;
+            }
+        }
+    }
+}
+
+/// Render the offline-fallback hint that lists the exact cache-file path for
+/// every Failed isotope under the active library, so users can `cp` a
+/// manually-downloaded ENDF straight into place (issue #523). Paths come from
+/// the free `default_cache_file_path` helper to avoid the per-frame
+/// `EndfRetriever::new()` cost that would otherwise build a reqwest client +
+/// TLS context just to read the cache layout.
+fn render_failed_cache_hint(ui: &mut egui::Ui, state: &AppState) {
+    use nereids_core::types::Isotope;
+    use nereids_endf::retrieval::default_cache_file_path;
+
+    const MAX_LINES: usize = 3;
+    let library = state.endf_library;
+    let failed = failed_isotope_keys(state);
     if failed.is_empty() {
         return;
     }
@@ -650,12 +693,7 @@ fn install_local_endf_dialog(state: &mut AppState) {
         a,
     );
 
-    let in_selection = state.isotope_entries.iter().any(|e| e.z == z && e.a == a)
-        || state
-            .isotope_groups
-            .iter()
-            .any(|g| g.z == z && g.members.iter().any(|m| m.a == a));
-    if !in_selection {
+    if !isotope_in_selection(state, z, a) {
         state.status_message = format!(
             "ENDF file is for {label}, but no matching isotope in your selection. Add it first.",
         );
@@ -675,24 +713,172 @@ fn install_local_endf_dialog(state: &mut AppState) {
         return;
     }
 
-    // Mark the matching entry Pending so the auto-fetch loop runs it through
-    // the retriever, which now hits the cache slot we just populated.
-    for e in &mut state.isotope_entries {
-        if e.z == z && e.a == a {
-            e.resonance_data = None;
-            e.endf_status = EndfStatus::Pending;
-        }
-    }
-    for g in &mut state.isotope_groups {
-        if g.z != z {
-            continue;
-        }
-        for m in &mut g.members {
-            if m.a == a {
-                m.resonance_data = None;
-                m.endf_status = EndfStatus::Pending;
-            }
-        }
-    }
+    // Reset the matching entry to Pending so the auto-fetch loop runs it
+    // through the retriever, which now hits the cache slot we just populated.
+    mark_isotope_pending(state, z, a);
     state.status_message = format!("Loaded local ENDF for {label}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{GroupMemberState, IsotopeEntry, IsotopeGroupEntry};
+
+    fn entry(z: u32, a: u32, sym: &str, enabled: bool, status: EndfStatus) -> IsotopeEntry {
+        IsotopeEntry {
+            z,
+            a,
+            symbol: sym.into(),
+            initial_density: 0.001,
+            resonance_data: None,
+            enabled,
+            endf_status: status,
+        }
+    }
+
+    fn member(a: u32, sym: &str, status: EndfStatus) -> GroupMemberState {
+        GroupMemberState {
+            a,
+            symbol: sym.into(),
+            ratio: 1.0,
+            resonance_data: None,
+            endf_status: status,
+        }
+    }
+
+    fn group(
+        z: u32,
+        name: &str,
+        enabled: bool,
+        members: Vec<GroupMemberState>,
+    ) -> IsotopeGroupEntry {
+        IsotopeGroupEntry {
+            z,
+            name: name.into(),
+            members,
+            initial_density: 0.001,
+            enabled,
+        }
+    }
+
+    #[test]
+    fn failed_keys_collect_failed_entries_only() {
+        let state = AppState {
+            isotope_entries: vec![
+                entry(73, 181, "Ta-181", true, EndfStatus::Failed),
+                entry(72, 180, "Hf-180", true, EndfStatus::Loaded),
+                entry(74, 184, "W-184", true, EndfStatus::Pending),
+                entry(56, 138, "Ba-138", false, EndfStatus::Failed), // disabled, ignored
+            ],
+            ..Default::default()
+        };
+        let keys = failed_isotope_keys(&state);
+        assert_eq!(keys, vec![(73, 181)]);
+    }
+
+    #[test]
+    fn failed_keys_include_failed_group_members_and_dedup_across_lists() {
+        let state = AppState {
+            isotope_entries: vec![entry(73, 181, "Ta-181", true, EndfStatus::Failed)],
+            isotope_groups: vec![
+                group(
+                    74,
+                    "W natural",
+                    true,
+                    vec![
+                        member(182, "W-182", EndfStatus::Loaded),
+                        member(184, "W-184", EndfStatus::Failed),
+                    ],
+                ),
+                // Disabled group: members ignored even if Failed.
+                group(
+                    72,
+                    "Hf natural",
+                    false,
+                    vec![member(180, "Hf-180", EndfStatus::Failed)],
+                ),
+                // Duplicate of an individual entry — should be deduplicated.
+                group(
+                    73,
+                    "Ta dup",
+                    true,
+                    vec![member(181, "Ta-181", EndfStatus::Failed)],
+                ),
+            ],
+            ..Default::default()
+        };
+        let keys = failed_isotope_keys(&state);
+        // Ta-181 from individual entries first, then W-184 from active group;
+        // Hf-180 ignored (disabled group); Ta-181 dedup'd from second group.
+        assert_eq!(keys, vec![(73, 181), (74, 184)]);
+    }
+
+    #[test]
+    fn isotope_in_selection_matches_entries_and_group_members() {
+        let state = AppState {
+            isotope_entries: vec![entry(73, 181, "Ta-181", true, EndfStatus::Failed)],
+            isotope_groups: vec![group(
+                74,
+                "W natural",
+                true,
+                vec![
+                    member(182, "W-182", EndfStatus::Pending),
+                    member(184, "W-184", EndfStatus::Failed),
+                ],
+            )],
+            ..Default::default()
+        };
+        assert!(isotope_in_selection(&state, 73, 181), "individual entry");
+        assert!(isotope_in_selection(&state, 74, 184), "group member");
+        assert!(!isotope_in_selection(&state, 72, 180), "missing isotope");
+        // Group's (Z, members.A) is the only canonical form — a mismatched A is not in selection.
+        assert!(!isotope_in_selection(&state, 74, 200), "missing A in group");
+    }
+
+    #[test]
+    fn mark_pending_resets_status_and_data_for_entries() {
+        let mut state = AppState {
+            isotope_entries: vec![entry(73, 181, "Ta-181", true, EndfStatus::Failed)],
+            ..Default::default()
+        };
+
+        mark_isotope_pending(&mut state, 73, 181);
+        assert_eq!(state.isotope_entries[0].endf_status, EndfStatus::Pending);
+        assert!(state.isotope_entries[0].resonance_data.is_none());
+
+        // Mismatched (z, a) leaves entry alone.
+        let mut state2 = AppState {
+            isotope_entries: vec![entry(73, 181, "Ta-181", true, EndfStatus::Failed)],
+            ..Default::default()
+        };
+        mark_isotope_pending(&mut state2, 73, 180);
+        assert_eq!(state2.isotope_entries[0].endf_status, EndfStatus::Failed);
+    }
+
+    #[test]
+    fn mark_pending_resets_group_member_status_too() {
+        let mut state = AppState {
+            isotope_groups: vec![group(
+                74,
+                "W natural",
+                true,
+                vec![
+                    member(182, "W-182", EndfStatus::Loaded),
+                    member(184, "W-184", EndfStatus::Failed),
+                ],
+            )],
+            ..Default::default()
+        };
+        mark_isotope_pending(&mut state, 74, 184);
+        assert_eq!(
+            state.isotope_groups[0].members[0].endf_status,
+            EndfStatus::Loaded,
+            "W-182 untouched"
+        );
+        assert_eq!(
+            state.isotope_groups[0].members[1].endf_status,
+            EndfStatus::Pending,
+            "W-184 reset"
+        );
+    }
 }
