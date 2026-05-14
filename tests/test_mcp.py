@@ -844,6 +844,61 @@ class TestManifestWorkflowTools:
         # cannot break on the new fields.
         json.dumps(_json_safe(summary), allow_nan=False)
 
+    def test_fit_summary_omits_back_d_back_f_via_real_fit_when_disabled(self):
+        """Regression for the "omit-when-unset" contract on the *real*
+        `PyFitResult` (not just a SimpleNamespace stub).  Before the
+        Rust-side fix that changed `PyFitResult.back_d` / `back_f` to
+        `Option<f64>`, a real fit with `fit_back_d=False, fit_back_f=False`
+        produced `result.back_d == 0.0` (and ditto `back_f`), which the
+        summary's ``if value is not None`` gate would emit as
+        ``"back_d": 0.0`` — misleading consumers into thinking the
+        exponential background was enabled.  This test exercises the
+        real binding to lock that contract.
+        """
+        energies = np.linspace(4.0, 30.0, 200)
+        isotope = _synthetic_u238_data()
+        t = np.asarray(nereids.forward_model(energies, [(isotope, 1.0e-3)]))
+        sigma = np.full_like(t, 0.005)
+
+        result = nereids.fit_spectrum_typed(
+            transmission=t,
+            uncertainty=sigma,
+            energies=energies,
+            isotopes=[(isotope, 1.0e-3)],
+            solver="lm",
+            temperature_k=293.6,
+            max_iter=80,
+            # Note: background=True so the polynomial background runs,
+            # but fit_back_d / fit_back_f are deliberately false — only
+            # the exponential terms should be absent from the summary.
+            background=True,
+            fit_back_d=False,
+            fit_back_f=False,
+        )
+
+        # Real binding now returns None for unfit exponential terms.
+        assert result.back_d is None, (
+            f"PyFitResult.back_d should be None when fit_back_d=False, "
+            f"got {result.back_d!r}"
+        )
+        assert result.back_f is None, (
+            f"PyFitResult.back_f should be None when fit_back_f=False, "
+            f"got {result.back_f!r}"
+        )
+
+        summary = _fit_result_summary(result, ["U-238"])
+        assert "back_d" not in summary, (
+            f"summary should not carry back_d when fit_back_d=False, got "
+            f"{summary.get('back_d')!r}"
+        )
+        assert "back_f" not in summary, (
+            f"summary should not carry back_f when fit_back_f=False, got "
+            f"{summary.get('back_f')!r}"
+        )
+        # The polynomial background scalars must still be present.
+        assert "anorm" in summary
+        assert "background" in summary
+
     def test_process_single_spectrum_manifest_emits_energy_scale_keys(self, tmp_path):
         """Manifest-driven path: enabling `fit_energy_scale` / `fit_back_d`
         / `fit_back_f` in the manifest's analysis.fit block must surface
@@ -952,12 +1007,48 @@ class TestManifestWorkflowTools:
         for key in ("anorm", "background", "t0_us", "l_scale"):
             assert key in stats, f"fit_param_stats missing {key}: {sorted(stats)}"
         # The npz must carry the raw arrays so downstream consumers
-        # can reconstruct the model curve per pixel.
+        # can reconstruct the model curve per pixel.  Re-run the spatial
+        # fit independently with the same inputs and assert the NPZ
+        # arrays bit-match `SpatialResult.{anorm_map, t0_us_map,
+        # l_scale_map}`: this defends against a future refactor that
+        # swaps the wrong array into `arrays_to_save` (the inner fit
+        # is deterministic on a fixed cube, so bit-equal is the right
+        # tolerance, not approx).
+        independent = nereids.spatial_map_typed(
+            nereids.from_transmission(
+                cube, np.full_like(cube, 0.005)
+            ),
+            energies,
+            [isotope],
+            initial_densities=[true_density],
+            solver="lm",
+            temperature_k=293.6,
+            max_iter=80,
+            background=True,
+            fit_energy_scale=True,
+            t0_init_us=0.0,
+            l_scale_init=1.0,
+            energy_scale_flight_path_m=25.0,
+        )
         npz = np.load(tmp_path / "output" / "nereids_density_map.npz")
         try:
-            for arr_key in ("anorm_map", "t0_us_map", "l_scale_map"):
+            for arr_key, attr in (
+                ("anorm_map", "anorm_map"),
+                ("t0_us_map", "t0_us_map"),
+                ("l_scale_map", "l_scale_map"),
+            ):
                 assert arr_key in npz.files, (
                     f"density-map npz missing {arr_key}: {npz.files}"
+                )
+                expected = np.asarray(getattr(independent, attr))
+                np.testing.assert_array_equal(
+                    npz[arr_key],
+                    expected,
+                    err_msg=(
+                        f"NPZ {arr_key} does not match SpatialResult.{attr} — "
+                        f"the manifest-driven server may be writing the "
+                        f"wrong array under this key"
+                    ),
                 )
         finally:
             npz.close()

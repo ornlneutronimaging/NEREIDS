@@ -966,11 +966,15 @@ def _process_density_map(
         )
 
     # SpatialResult exposes per-pixel anorm / background / t0 / l_scale maps
-    # when the corresponding fit flags are set on the spatial pipeline.
-    # Save the raw arrays into the NPZ (so downstream consumers can
-    # reconstruct the model curve per-pixel) and surface aggregate stats
-    # in the JSON summary.  Per-pixel back_d_map / back_f_map are not yet
-    # exposed on SpatialResult; tracked as a Rust-side follow-up.
+    # whenever the spatial pipeline ran with the corresponding *feature*
+    # enabled (e.g. `background=True` materialises all three terms of
+    # `background_maps` — including NaN-per-pixel entries for terms that
+    # were not actually fit — and `fit_energy_scale=True` materialises
+    # both t0/L scale maps).  Save the raw arrays into the NPZ (so
+    # downstream consumers can reconstruct the model curve per-pixel) and
+    # surface aggregate stats in the JSON summary.  Per-pixel
+    # back_d_map / back_f_map are not yet exposed on SpatialResult;
+    # tracked as a Rust-side follow-up (#538).
     fit_param_stats: dict[str, Any] = {}
     anorm_map = getattr(result, "anorm_map", None)
     if anorm_map is not None:
