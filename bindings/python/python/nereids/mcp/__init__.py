@@ -1,21 +1,32 @@
 """NEREIDS MCP server -- expose nuclear data tools to AI agents."""
 
 
-def _check_fastmcp():
-    """Raise a helpful error if fastmcp is not installed."""
+def _fastmcp_available() -> bool:
     try:
         import fastmcp  # noqa: F401
     except ImportError:
-        raise ImportError(
-            "fastmcp is required for the MCP server. "
-            "Install it with: pip install nereids[mcp]"
-        ) from None
+        return False
+    return True
+
+
+_FASTMCP_INSTALL_MSG = (
+    "fastmcp is required for the MCP server. "
+    "Install it with: pip install nereids[mcp]"
+)
 
 
 # Lazy import: only create the server when actually accessed.
+# Raises AttributeError (not ImportError) when fastmcp is missing so that
+# attribute-walking tools (pdoc, IDE introspection) treat `mcp` as absent
+# rather than failing with an uncaught ImportError. The install instruction
+# is preserved in the AttributeError message.
 def __getattr__(name):
     if name == "mcp":
-        _check_fastmcp()
+        if not _fastmcp_available():
+            raise AttributeError(
+                f"module {__name__!r} attribute 'mcp' is unavailable: "
+                f"{_FASTMCP_INSTALL_MSG}"
+            )
         from nereids.mcp.server import mcp
 
         return mcp
@@ -24,7 +35,8 @@ def __getattr__(name):
 
 def main():
     """Run the NEREIDS MCP server over stdio."""
-    _check_fastmcp()
+    if not _fastmcp_available():
+        raise ImportError(_FASTMCP_INSTALL_MSG)
     from nereids.mcp.server import mcp
 
     mcp.run()

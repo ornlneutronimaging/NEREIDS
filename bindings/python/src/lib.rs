@@ -926,7 +926,7 @@ fn energy_to_tof(energy_ev: f64, flight_path_m: f64) -> f64 {
 ///     z: Atomic number (e.g. 92 for uranium).
 ///     a: Mass number (e.g. 238).
 ///     library: ENDF library name. One of "endf8.0", "endf8.1" (default),
-///              "jeff3.3", "jendl5".
+///              "jeff3.3", "jendl5", "tendl2023", "cendl3.2".
 ///     mat: ENDF MAT (material) number. If None, looks up from built-in table
 ///          (~40 common isotopes). Provide explicitly for uncommon isotopes.
 ///

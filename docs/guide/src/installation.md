@@ -33,6 +33,13 @@ pip install nereids
 
 **Requirements**: Python 3.10+ and NumPy.
 
+Optional extras published by the `nereids` package:
+
+```bash
+pip install "nereids[mcp]"  # installs the MCP server dependency
+pip install "nereids[gui]"  # pulls in the GUI wheel package when available
+```
+
 ## MCP Server
 
 The MCP server is installed as an optional Python extra:
@@ -46,6 +53,32 @@ See the [MCP server](./mcp-server.md) chapter for client configuration and
 manifest-driven workflows.
 
 ## Desktop GUI
+
+### Python Wheel
+
+```bash
+pip install "nereids[gui]"
+nereids-gui
+```
+
+The `[gui]` extra pulls in the separately-published `nereids-gui` wheel,
+which is what provides the `nereids-gui` console script (it is not declared
+in the base `nereids` package). If the install resolves but `nereids-gui`
+is not found on `PATH`, the `nereids-gui` wheel has not been published for
+your platform/Python version — verify with:
+
+```bash
+which nereids-gui    # should print a path; empty output means missing
+pip show nereids-gui # should print metadata; "not installed" means the
+                     # extra resolved a different way
+```
+
+You can also install the GUI distribution directly:
+
+```bash
+pip install nereids-gui
+nereids-gui
+```
 
 ### macOS (Homebrew)
 

@@ -74,11 +74,55 @@ crates (no drift in third-party deps).
 cargo fmt --all
 cargo clippy --workspace --exclude nereids-python --all-targets -- -D warnings
 cargo test --workspace --exclude nereids-python
+cargo check --workspace --exclude nereids-python --examples
 pixi run test-python
 ```
 
-All four must pass before tagging. If any fails, the release commit
+All five must pass before tagging. If any fails, the release commit
 should NOT be created.
+
+The `--examples` gate catches drift between mdBook quickstart snippets and
+the live crate APIs (the snippets in `docs/guide/src/quickstart-rust.md`
+are `{{#include}}`-spliced from `crates/nereids-fitting/examples/quickstart.rs`).
+
+## Step 4a: Docs build + extras smoke test (mandatory)
+
+```
+pixi run doc-build
+```
+
+`doc-build` chains `doc-guide` (mdBook), `doc-api` (rustdoc), and
+`doc-python` (pdoc on the installed wheel). Visually scan:
+
+- `target/book/index.html` — landing page
+- `target/book/api/` — rustdoc renders without missing items
+- `target/book/python/index.html` — pdoc reference is non-empty and the
+  typed APIs (`fit_spectrum_typed`, `spatial_map_typed`, `load_endf`, …)
+  appear under `nereids/nereids.html`
+- The curated `python-api.md` page reflects any new `__init__.pyi` surface
+
+Then verify both extras install on a clean venv. `pixi run build` is
+`maturin develop` and writes the wheel to a temp dir, so an explicit
+`maturin build --out target/wheels` is needed first; the smoke test then
+installs the newest matching wheel:
+
+```
+rm -rf target/wheels
+pixi run -- maturin build --release \
+  --manifest-path bindings/python/Cargo.toml --out target/wheels
+WHEEL="$(ls -t target/wheels/nereids-*.whl | head -1)"
+python -m venv /tmp/nereids-extras && source /tmp/nereids-extras/bin/activate
+pip install "${WHEEL}"
+pip install "${WHEEL}[gui]"   # exercises the gui extra
+pip install "${WHEEL}[mcp]"   # exercises the mcp extra
+python -c "import nereids; help(nereids.fit_spectrum_typed)" | head -5
+deactivate && rm -rf /tmp/nereids-extras
+```
+
+All three `pip install` lines must succeed on the target Python version
+declared in `pyproject.toml`. The `ls -t | head -1` is defensive against
+multiple wheels accumulating in `target/wheels/` across release-rehearsal
+runs — `rm -rf target/wheels` at the top is the cleaner reset path.
 
 ## Step 5: Commit + tag
 
@@ -169,11 +213,18 @@ gh release view v<NEW> >/dev/null 2>&1 && echo OK || echo MISSING
    notes captured the expected PRs and the release-asset list contains
    wheels (Linux+macOS+Win), sdist, GUI wheels (Linux+macOS), and the
    macOS DMG.
-2. **Homebrew tap** — visit `https://github.com/ornlneutronimaging/homebrew-nereids`
+2. **Docs site rebuilt.** The `docs.yml` workflow re-runs on every push to
+   `main`, so the release commit (Step 6) auto-triggers a Pages rebuild.
+   Confirm at `https://ornlneutronimaging.github.io/NEREIDS/`:
+   - mdBook landing page loads (`/`)
+   - rustdoc renders (`/api/`)
+   - pdoc Python reference renders (`/python/`) and reflects any new
+     `__init__.pyi` surface from this release
+3. **Homebrew tap** — visit `https://github.com/ornlneutronimaging/homebrew-nereids`
    and confirm the latest commit there bumped `Casks/nereids.rb`. (The
    workflow's `update-homebrew` job needs `HOMEBREW_TAP_TOKEN`; if absent
    it errors and the tap will be stale.)
-3. **Memory**: only update memory if the *release process itself* surfaced
+4. **Memory**: only update memory if the *release process itself* surfaced
    a non-obvious lesson (e.g. a new file location to bump, a CI flake
    pattern). Routine release outcomes are not memory-worthy.
 

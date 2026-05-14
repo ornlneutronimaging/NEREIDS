@@ -79,6 +79,57 @@ data = nereids.from_counts(sample_counts_3d, open_beam_counts_3d)
 result = nereids.spatial_map_typed(data, energies, [u238])
 ```
 
+## Single-Spectrum Fitting
+
+Use `fit_spectrum_typed(...)` for pre-normalized transmission spectra:
+
+```python
+uncertainty = np.full_like(transmission, 0.01)
+fit = nereids.fit_spectrum_typed(
+    transmission,
+    uncertainty,
+    energies,
+    [(u238, 0.0005)],
+    temperature_k=300.0,
+)
+print(fit.densities, fit.reduced_chi_squared)
+```
+
+Use `fit_counts_spectrum_typed(...)` for raw sample/open-beam counts:
+
+```python
+fit = nereids.fit_counts_spectrum_typed(
+    sample_counts_1d,
+    open_beam_counts_1d,
+    energies,
+    [(u238, 0.0005)],
+    c=sample_charge / open_beam_charge,
+)
+print(fit.densities, fit.deviance_per_dof)
+```
+
+See the [Python API reference](./python-api.md) for argument details, shape
+contracts, and result objects.
+
+## TIFF and NeXus Data
+
+TIFF and NeXus loaders use the spectral axis first:
+
+```python
+stack = nereids.load_tiff_stack("transmission_stack.tif")
+
+sample = nereids.load_nexus_histogram("sample.nxs")
+open_beam = nereids.load_nexus_histogram("open_beam.nxs")
+energies = nereids.tof_to_energy_centers(
+    sample.tof_edges_us,
+    sample.flight_path_m or 25.0,
+)
+```
+
+NeXus counts are loaded in ascending TOF order. Reverse axis 0 before fitting
+against the ascending energy centers returned by `tof_to_energy_centers(...)`.
+The [Data I/O and NeXus/TOF](./data-io.md) chapter covers the full workflow.
+
 ## Detectability Analysis
 
 Check whether a trace isotope is detectable in a given matrix:
@@ -104,5 +155,7 @@ print(f"Peak SNR: {report.peak_snr:.1f} at {report.peak_energy_ev:.2f} eV")
 
 - See the [GUI walkthrough](./gui-walkthrough.md) for interactive analysis
 - Use the [MCP server](./mcp-server.md) for local AI-agent assisted workflows
+- Browse the [Python API reference](./python-api.md)
+- Read [Data I/O and NeXus/TOF](./data-io.md) for TIFF, NeXus, and TOF data handling
 - Explore the [Architecture](./architecture.md) chapter for the crate structure
 - Browse the [API Reference](api/nereids_pipeline/) for the full Rust docs

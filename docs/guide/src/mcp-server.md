@@ -33,6 +33,22 @@ In the repository Pixi environment, `fastmcp` is intentionally not a default
 dependency because it can conflict with conda metadata packages. Install it
 manually in the environment when MCP support is needed.
 
+### Behavior when `fastmcp` is not installed
+
+The two entry points differ on purpose:
+
+| Entry point | Without `fastmcp` |
+|-------------|-------------------|
+| `nereids.mcp.main()` (called by the `nereids-mcp` console script) | Raises `ImportError("fastmcp is required for the MCP server. Install it with: pip install nereids[mcp]")`. |
+| `nereids.mcp.mcp` (lazy attribute) | Raises `AttributeError` with the same install instruction embedded in the message. |
+
+The attribute path raises `AttributeError` rather than `ImportError` so that
+attribute-walking tools (pdoc, IDE introspection, `hasattr`) can treat `mcp`
+as absent rather than crashing. Callers who explicitly catch `ImportError`
+to detect a "MCP not installed" state should switch to either calling
+`nereids.mcp.main()` (which still raises `ImportError`) or using
+`hasattr(nereids.mcp, "mcp")` as the feature-detection probe.
+
 ## Client Configuration
 
 An MCP client can launch the server with the `nereids-mcp` console script:

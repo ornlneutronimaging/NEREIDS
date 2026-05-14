@@ -3,6 +3,11 @@
 The NEREIDS desktop application provides interactive neutron resonance imaging
 analysis with visual feedback at every step.
 
+The screenshots on this page cover the current guided workflow screens:
+landing, load, configure, analyze, results, studio, forward model,
+detectability, and periodic table. When workflow labels, solver controls, or
+project-file behavior changes, refresh these images together with this page.
+
 ## Launch
 
 ```bash
@@ -21,18 +26,19 @@ cargo run --release -p nereids-gui
 
 The landing page presents three entry points:
 
-- **Single Spectrum** -- fit a single transmission spectrum to recover isotope densities
-- **Spatial Map** -- fit every pixel in a transmission image stack
-- **Tools** -- forward model, detectability analysis, periodic table
+- **Load & Fit Data** -- open the wizard for single-spectrum or spatial-map fitting
+- **Forward Model** -- explore theoretical transmission spectra without loading data
+- **Detectability** -- estimate trace-isotope sensitivity before an experiment
 
 ![Landing page](images/landing.png)
 
 ## Decision Wizard
 
-After selecting an entry point, a short wizard asks:
+After selecting **Load & Fit Data**, a short wizard asks:
 
 1. **Fitting type**: Single spectrum or spatial map
-2. **Data format**: Raw events (NeXus), pre-normalized TIFF, or transmission TIFF
+2. **Data format**: Raw Events (HDF5/NeXus), Histogram, Pre-Normalization,
+   or Transmission (Already Normalized)
 
 The wizard configures a dynamic pipeline with only the steps relevant to your
 data format. Six distinct pipelines are available.
@@ -49,9 +55,10 @@ file format and loads data when all fields are filled.
 
 ### Normalize
 
-For raw data pipelines (TIFF pair or NeXus events), the Normalize step computes
-transmission from sample and open-beam measurements. Pre-normalized and
-transmission TIFF pipelines skip this step automatically.
+For histogram/pre-normalization pipelines, including TIFF pair and HDF5
+sample/open-beam counts, the Normalize step computes transmission from sample
+and open-beam measurements. Raw event pipelines bin events first. Transmission
+pipelines skip normalization because `T(E) = I/I0` is already supplied.
 
 ### Configure
 
@@ -146,13 +153,14 @@ and verdict badges (DETECTABLE / NOT DETECTABLE / OPAQUE MATRIX).
 
 Interactive 18-column periodic table for selecting isotopes. Click an element
 to see its natural isotopes with abundance percentages. Supports multi-select
-with density input. ENDF/B-VIII.0 availability hints shown for each isotope.
+with density input. ENDF availability hints are shown for each isotope based
+on the currently selected data library.
 
 ![Periodic Table](images/periodic-table.png)
 
 ## Project Files
 
-Save and load analysis sessions as HDF5 project files (`.nereids`):
+Save and load analysis sessions as HDF5 project files (`.nrd.h5`):
 
 - **Cmd+S** (macOS) / **Ctrl+S** (Linux): quick-save
 - **File > Save**: save with dialog
