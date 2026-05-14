@@ -164,15 +164,15 @@ Keyword arguments:
 | `temperature_k=293.6` | Sample temperature in kelvin. |
 | `fit_temperature=False` | Fit sample temperature in addition to densities. |
 | `max_iter=200` | Maximum optimizer iterations. |
-| `solver="lm"` | `"lm"`, `"kl"`, or `"auto"` for transmission data. |
+| `solver="lm"` | `"lm"`, `"kl"`, `"auto"`, `"poisson"`, or `"joint_poisson"`. `"poisson"` and `"joint_poisson"` are aliases used by the counts dispatch and accepted here for symmetry. |
 | `background=False` | Enable SAMMY-style transmission background parameters. |
 | `fit_back_d=False`, `fit_back_f=False` | Fit optional exponential background terms. |
 | `back_d_init=0.01`, `back_f_init=1.0` | Initial exponential background values. |
 | `fit_energy_scale=False` | Fit TOF energy-scale parameters `t0_us` and `l_scale`. |
 | `t0_init_us=0.0`, `l_scale_init=1.0` | Initial energy-scale values. |
 | `energy_scale_flight_path_m=25.0` | Nominal flight path for energy-scale fitting. |
-| `resolution=...` | Tabulated resolution from `load_resolution(...)`. |
-| `flight_path_m=...`, `delta_t_us=...`, `delta_l_m=...` | Gaussian resolution parameters. |
+| `resolution=...` | Tabulated resolution from `load_resolution(...)`. **Mutually exclusive with the Gaussian parameters below** — pass either `resolution=` (tabulated) or the `flight_path_m`/`delta_t_us`/`delta_l_m` trio (Gaussian), never both. |
+| `flight_path_m=...`, `delta_t_us=...`, `delta_l_m=...` | Gaussian resolution parameters (mutually exclusive with `resolution=`). |
 | `fit_energy_range=(emin, emax)` | Restrict the cost function to an energy window. |
 | `groups=[...]` | Fit isotope groups instead of individual isotopes. |
 | `initial_densities=[...]` | Initial density guesses when fitting groups. |
@@ -268,8 +268,8 @@ Keyword arguments:
 | `fit_energy_scale=False` | Fit per-pixel `t0_us` and `l_scale` maps. |
 | `t0_init_us=0.0`, `l_scale_init=1.0` | Initial energy-scale values. |
 | `energy_scale_flight_path_m=25.0` | Nominal flight path for energy-scale fitting. |
-| `resolution=...` | Tabulated resolution from `load_resolution(...)`. |
-| `flight_path_m=...`, `delta_t_us=...`, `delta_l_m=...` | Gaussian resolution parameters. |
+| `resolution=...` | Tabulated resolution from `load_resolution(...)`. **Mutually exclusive with the Gaussian parameters below** — pass either `resolution=` (tabulated) or the `flight_path_m`/`delta_t_us`/`delta_l_m` trio (Gaussian), never both. |
+| `flight_path_m=...`, `delta_t_us=...`, `delta_l_m=...` | Gaussian resolution parameters (mutually exclusive with `resolution=`). |
 | `groups=[...]` | Fit isotope groups instead of individual isotopes. |
 | `tzero_jacobian="..."` | Select the TZERO Jacobian implementation. |
 | `fit_energy_range=(emin, emax)` | Restrict the cost function to an energy window. |

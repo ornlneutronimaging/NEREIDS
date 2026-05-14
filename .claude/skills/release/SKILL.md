@@ -101,19 +101,28 @@ pixi run doc-build
   appear under `nereids/nereids.html`
 - The curated `python-api.md` page reflects any new `__init__.pyi` surface
 
-Then verify both extras install on a clean venv:
+Then verify both extras install on a clean venv. `pixi run build` is
+`maturin develop` and writes the wheel to a temp dir, so an explicit
+`maturin build --out target/wheels` is needed first; the smoke test then
+installs the newest matching wheel:
 
 ```
+rm -rf target/wheels
+pixi run -- maturin build --release \
+  --manifest-path bindings/python/Cargo.toml --out target/wheels
+WHEEL="$(ls -t target/wheels/nereids-*.whl | head -1)"
 python -m venv /tmp/nereids-extras && source /tmp/nereids-extras/bin/activate
-pip install ./target/wheels/nereids-*.whl
-pip install "$(ls target/wheels/nereids-*.whl)[gui]"   # exercises the gui extra
-pip install "$(ls target/wheels/nereids-*.whl)[mcp]"   # exercises the mcp extra
+pip install "${WHEEL}"
+pip install "${WHEEL}[gui]"   # exercises the gui extra
+pip install "${WHEEL}[mcp]"   # exercises the mcp extra
 python -c "import nereids; help(nereids.fit_spectrum_typed)" | head -5
 deactivate && rm -rf /tmp/nereids-extras
 ```
 
-Both `pip install` lines must succeed on the target Python version
-declared in `pyproject.toml`.
+All three `pip install` lines must succeed on the target Python version
+declared in `pyproject.toml`. The `ls -t | head -1` is defensive against
+multiple wheels accumulating in `target/wheels/` across release-rehearsal
+runs — `rm -rf target/wheels` at the top is the cleaner reset path.
 
 ## Step 5: Commit + tag
 

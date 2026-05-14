@@ -48,9 +48,8 @@ jobs:
         with:
           run-install: true
 
-      - name: Build Python wheel (for pdoc import)
-        run: pixi run build
-
+      # `doc-python` declares `depends-on = ["build"]` in pyproject.toml,
+      # so pixi runs `maturin develop` automatically before pdoc imports the wheel.
       - name: Build Python API reference (pdoc)
         run: pixi run doc-python
 
