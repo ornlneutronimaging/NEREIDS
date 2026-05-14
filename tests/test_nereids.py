@@ -1675,3 +1675,224 @@ class TestFitEnergyRangeBindingParameter:
             f"would leave the param at the seed)"
         )
 
+
+# ===========================================================================
+# fit_energy_scale recovery (#531 — single-spectrum LM, SAMMY TZERO)
+# ===========================================================================
+
+
+# SAMMY TZERO time-of-flight constant: TOF_FACTOR = sqrt(m_n / (2·eV)) · 1e6.
+# Same formula as `EnergyScaleTransmissionModel::new` in
+# `crates/nereids-fitting/src/transmission_model.rs`, using the CODATA-2018
+# constants from `nereids-core::constants` (NEUTRON_MASS_KG = 1.674927498e-27,
+# EV_TO_JOULES = 1.602176634e-19) so this test stays bit-identical to the
+# Rust side; hardcoding 72.297 would drift by ~1e-5 relative on the energy
+# inversion and silently bias the recovered t0.
+_NEUTRON_MASS_KG = 1.674_927_498_04e-27
+_EV_TO_JOULES = 1.602_176_634e-19
+_TOF_FACTOR = np.sqrt(0.5 * _NEUTRON_MASS_KG / _EV_TO_JOULES) * 1.0e6
+
+
+def _measured_energies_for_known_tzero(
+    e_true: np.ndarray,
+    *,
+    t0_true_us: float,
+    l_scale_true: float,
+    l_nom_m: float,
+) -> np.ndarray:
+    """Inverse of `EnergyScaleTransmissionModel::corrected_energies`.
+
+    Given the *true* corrected energies the physics produced and the
+    instrument's true (t0, L_scale), return the *measured* (nominal)
+    energy grid the data would be reported on so that
+    `corrected_energies(E_meas, t0_true, L_scale_true) ≈ E_true`.
+
+    Forward map (Rust):
+        tof_meas[i] = TOF_FACTOR · L_nom / √E_meas[i]
+        E_corr[i]   = (TOF_FACTOR · L_eff / (tof_meas[i] − t0))²
+                    where L_eff = L_nom · L_scale.
+    Inverting for E_meas given E_true ≡ E_corr:
+        tof_meas[i] = t0 + TOF_FACTOR · L_nom · L_scale_true / √E_true[i]
+        E_meas[i]   = (TOF_FACTOR · L_nom / tof_meas[i])²
+    """
+    tof_meas = t0_true_us + _TOF_FACTOR * l_nom_m * l_scale_true / np.sqrt(e_true)
+    return (_TOF_FACTOR * l_nom_m / tof_meas) ** 2
+
+
+class TestFitEnergyScaleRecovery:
+    """Exercises the `fit_energy_scale=True` branch of `fit_spectrum_typed`
+    end-to-end.  This is the only Python-level test that does so — the
+    existing coverage in `crates/nereids-pipeline/src/spatial.rs` runs
+    the spatial pipeline (a different binding entry point) and would not
+    catch a silent regression in `py_fit_spectrum_typed`'s
+    `config.with_energy_scale(...)` branch.
+
+    Gate strategy (per #531).  The test injects a known (t0, L_scale)
+    calibration offset, then verifies the fit's *physically observable*
+    output — not the individual parameter values — for three reasons:
+
+    1.  (t0, L_scale) are coupled.  At a single resonance, position alone
+        gives one constraint for two unknowns; multiple resonances lift
+        the degeneracy, but the LM cost surface still has a shallow
+        valley along the line  ``t0 ≈ const - L_scale × something(E)``.
+        Tightening individual-parameter tolerances below the valley width
+        produces flaky tests without catching the regression we care
+        about (silent disable).
+    2.  At realistic neutron-imaging temperatures (293 K) the Doppler
+        kernel applied to the *corrected* energies is not bit-identical
+        to the kernel applied during data synthesis on the true grid;
+        this contributes a small residual bias (~few percent) to the
+        recovered density even on noiseless data, distinct from the
+        bug under test.
+    3.  The bug to catch is a silent ``fit_energy_scale=True`` disable.
+        That is detected by  (a) the χ² ratio between baseline (flag off)
+        and calibrated (flag on),  (b) the presence of finite t0_us /
+        l_scale on the FitResult,  and  (c) the recovered *effective*
+        energy mapping agreeing with truth.  All three would fail if the
+        flag silently became a no-op.
+    """
+
+    def test_recovers_injected_t0_and_l_scale(self):
+        L_NOM = 25.0
+        T0_TRUE = 0.5  # μs
+        L_SCALE_TRUE = 1.005
+        TRUE_DENSITY = 3.0e-4
+
+        # Multi-resonance U-238 fixture.  Three well-separated resonances
+        # (6.67 / 20.87 / 36.68 eV, standard SAMMY benchmark values)
+        # supply three position constraints — enough to lift the
+        # (t0, L_scale) degeneracy a single peak would leave (see
+        # class docstring point 1).
+        u238 = nereids.create_resonance_data(
+            z=92,
+            a=238,
+            awr=236.006,
+            scattering_radius=9.48,
+            resonances=[
+                (6.67, 0.5, 0.0015, 0.023),
+                (20.87, 0.5, 0.0103, 0.026),
+                (36.68, 0.5, 0.0344, 0.027),
+            ],
+            target_spin=0.0,
+        )
+
+        # True (corrected) energy grid spanning all three resonances.
+        # Linear-in-TOF sampling so peak widths are sampled uniformly
+        # in the data's native coordinate (matches real instruments).
+        tof_lo = _TOF_FACTOR * L_NOM / np.sqrt(45.0)
+        tof_hi = _TOF_FACTOR * L_NOM / np.sqrt(4.0)
+        tof_grid = np.linspace(tof_lo, tof_hi, 800)
+        e_true = np.sort((_TOF_FACTOR * L_NOM / tof_grid) ** 2)
+
+        # Clean transmission at the TRUE energies.  Match forward_model's
+        # default 293.6 K Doppler temperature on the fit side.
+        t_clean = np.asarray(
+            nereids.forward_model(e_true, [(u238, TRUE_DENSITY)])
+        )
+
+        # Measured energy grid: what the instrument reports given the
+        # unknown (T0_TRUE, L_SCALE_TRUE) calibration offset.  Without
+        # the energy-scale fit branch, the solver evaluates σ at this
+        # *wrong* grid and density / χ² blow up.
+        e_meas = _measured_energies_for_known_tzero(
+            e_true,
+            t0_true_us=T0_TRUE,
+            l_scale_true=L_SCALE_TRUE,
+            l_nom_m=L_NOM,
+        )
+
+        rng = np.random.default_rng(20260514)
+        sigma_noise = 0.005
+        t_obs = t_clean + rng.normal(0.0, sigma_noise, size=t_clean.shape)
+        sigma = np.full_like(t_obs, sigma_noise)
+
+        baseline_kwargs = dict(
+            transmission=t_obs,
+            uncertainty=sigma,
+            energies=e_meas,
+            isotopes=[(u238, TRUE_DENSITY)],
+            solver="lm",
+            temperature_k=293.6,
+            max_iter=200,
+        )
+
+        # Baseline: no energy-scale fit.  σ is evaluated at E_meas
+        # (shifted by the injected calibration), so the model peaks
+        # never line up with the data and χ² stays large.
+        r_baseline = nereids.fit_spectrum_typed(**baseline_kwargs)
+
+        # Energy-scale fit ON.  Solver maps E_meas → estimated E_true
+        # via internal `corrected_energies(t0, L_scale)`.
+        r_calibrated = nereids.fit_spectrum_typed(
+            **baseline_kwargs,
+            fit_energy_scale=True,
+            t0_init_us=0.0,
+            l_scale_init=1.0,
+            energy_scale_flight_path_m=L_NOM,
+        )
+
+        # 1. The calibrated fit must converge.
+        assert bool(r_calibrated.converged) is True, (
+            f"calibrated fit did not converge: "
+            f"iters={int(r_calibrated.iterations)}, "
+            f"chi2_r={float(r_calibrated.reduced_chi_squared):.4e}"
+        )
+
+        # 2. t0_us and l_scale must be populated (not None) on the
+        # FitResult.  A silent regression that dropped
+        # `config.with_energy_scale(...)` would leave these as None.
+        assert r_calibrated.t0_us is not None, (
+            "result.t0_us is None — fit_energy_scale=True was likely "
+            "silently disabled in py_fit_spectrum_typed"
+        )
+        assert r_calibrated.l_scale is not None, (
+            "result.l_scale is None — fit_energy_scale=True was likely "
+            "silently disabled in py_fit_spectrum_typed"
+        )
+        assert np.isfinite(float(r_calibrated.t0_us))
+        assert np.isfinite(float(r_calibrated.l_scale))
+
+        # 3. χ²-ratio gate — the primary silent-disable detector.  With
+        # the injected ~0.5 % calibration offset the baseline fit
+        # produces χ²_r ~ O(10²-10³); the calibrated fit drops it by
+        # at least 10× (typically 100×+).  If the flag is silently
+        # ignored, both fits return the same χ² and this fires.
+        chi2_baseline = float(r_baseline.reduced_chi_squared)
+        chi2_calibrated = float(r_calibrated.reduced_chi_squared)
+        assert chi2_calibrated < chi2_baseline / 10.0, (
+            f"calibrated χ²_r={chi2_calibrated:.4e} not ≥10× better than "
+            f"baseline χ²_r={chi2_baseline:.4e}; fit_energy_scale=True "
+            f"may be silently disabled"
+        )
+
+        # 4. Effective energy-mapping recovery.  Recompute the fit's
+        # corrected energies in Python using the SAME formula as
+        # `EnergyScaleTransmissionModel::corrected_energies`, then
+        # compare against E_true.  This gates the *physics* without
+        # being sensitive to which point in the (t0, L_scale) valley
+        # the LM solver settled at.  1 % relative is well inside the
+        # ~0.5 % calibration offset injected — a silent disable would
+        # leave the mapping at identity (E_corr = E_meas), producing
+        # max-rel-err ~5 % at the low-energy end of the grid.
+        tof_meas = _TOF_FACTOR * L_NOM / np.sqrt(e_meas)
+        l_eff_fit = L_NOM * float(r_calibrated.l_scale)
+        e_corr_fit = (_TOF_FACTOR * l_eff_fit / (tof_meas - float(r_calibrated.t0_us))) ** 2
+        max_rel_err = float(np.max(np.abs(e_corr_fit - e_true) / e_true))
+        assert max_rel_err < 1.0e-2, (
+            f"effective energy mapping not recovered: max rel err "
+            f"{max_rel_err:.3e}, fit_(t0, L_scale)="
+            f"({float(r_calibrated.t0_us):.4f}, "
+            f"{float(r_calibrated.l_scale):.6f})"
+        )
+
+        # 5. L_scale recovery is empirically stable across LM noise to
+        # within 1 % of truth — tighter than the (t0, L_scale) valley
+        # width but loose enough to absorb single-precision-noise-level
+        # LM step variation.  Catches regressions that scramble the L
+        # parameter without dropping the whole flag (where the χ²
+        # gate above would still pass).
+        l_scale_rel_err = abs(float(r_calibrated.l_scale) - L_SCALE_TRUE) / L_SCALE_TRUE
+        assert l_scale_rel_err < 1.0e-2, (
+            f"L_scale rel err {l_scale_rel_err:.3e} exceeds 1 %: "
+            f"got {float(r_calibrated.l_scale):.6f}, truth {L_SCALE_TRUE}"
+        )

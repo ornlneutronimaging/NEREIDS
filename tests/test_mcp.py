@@ -737,3 +737,264 @@ class TestManifestWorkflowTools:
         assert summary["reduced_chi_squared"] is None
         assert summary["deviance_per_dof"] is None
         json.dumps(_json_safe(summary), allow_nan=False)
+
+    def test_fit_summary_emits_energy_scale_and_background_fields(self):
+        """Issue #530: when the LM solver fits t0/L_scale/back_d/back_f,
+        those values must appear in the result summary.  Before the fix,
+        `_fit_result_summary` only emitted `anorm` and `background`;
+        the four extra scalars were silently dropped, making it
+        impossible to tell whether the manifest's fit flags were
+        exercised and impossible to reconstruct the model curve.
+        """
+        result = SimpleNamespace(
+            densities=np.asarray([0.001]),
+            uncertainties=np.asarray([1.0e-5]),
+            reduced_chi_squared=1.2,
+            deviance_per_dof=None,
+            converged=True,
+            iterations=17,
+            temperature_k=293.6,
+            anorm=0.99,
+            background=[0.01, -1e-4, 5e-7],
+            t0_us=0.4662,
+            l_scale=1.005273,
+            back_d=0.0796,
+            back_f=1.10e-4,
+        )
+
+        summary = _fit_result_summary(result, ["U-238"])
+
+        assert summary["t0_us"] == pytest.approx(0.4662)
+        assert summary["l_scale"] == pytest.approx(1.005273)
+        assert summary["back_d"] == pytest.approx(0.0796)
+        assert summary["back_f"] == pytest.approx(1.10e-4)
+        json.dumps(_json_safe(summary), allow_nan=False)
+
+    def test_fit_summary_omits_energy_scale_fields_when_unset(self):
+        """Backwards-compat: fits without the new flags emit a summary
+        with the four extra keys *absent* (not present-with-null), so
+        downstream consumers can keep using `"key" in summary` to
+        detect whether each flag was active.  Matches the existing
+        `deviance_per_dof` / `temperature_k` pattern.
+        """
+        result = SimpleNamespace(
+            densities=np.asarray([0.001]),
+            uncertainties=np.asarray([1.0e-5]),
+            reduced_chi_squared=1.2,
+            deviance_per_dof=None,
+            converged=True,
+            iterations=12,
+            temperature_k=293.6,
+            anorm=1.0,
+            background=[0.0, 0.0, 0.0],
+            t0_us=None,
+            l_scale=None,
+            back_d=None,
+            back_f=None,
+        )
+
+        summary = _fit_result_summary(result, ["U-238"])
+
+        assert "t0_us" not in summary
+        assert "l_scale" not in summary
+        assert "back_d" not in summary
+        assert "back_f" not in summary
+        # Existing keys must still be present.
+        assert "anorm" in summary
+        assert "background" in summary
+
+    def test_fit_summary_emits_energy_scale_via_real_fit(self):
+        """End-to-end variant of the SimpleNamespace gates above: drive a
+        real `nereids.fit_spectrum_typed` LM fit with `fit_energy_scale=True`
+        and confirm the new keys make it into the summary returned to MCP
+        callers.  Catches regressions where the binding stops populating
+        `result.t0_us` / `result.l_scale` on the actual `PyFitResult`.
+        """
+        energies = np.linspace(4.0, 30.0, 400)
+        isotope = _synthetic_u238_data()
+        t = np.asarray(nereids.forward_model(energies, [(isotope, 1.0e-3)]))
+        sigma = np.full_like(t, 0.005)
+
+        result = nereids.fit_spectrum_typed(
+            transmission=t,
+            uncertainty=sigma,
+            energies=energies,
+            isotopes=[(isotope, 1.0e-3)],
+            solver="lm",
+            temperature_k=293.6,
+            max_iter=100,
+            background=True,
+            fit_back_d=True,
+            fit_back_f=True,
+            fit_energy_scale=True,
+            t0_init_us=0.0,
+            l_scale_init=1.0,
+            energy_scale_flight_path_m=25.0,
+        )
+
+        summary = _fit_result_summary(result, ["U-238"])
+
+        for key in ("t0_us", "l_scale", "back_d", "back_f"):
+            assert key in summary, f"summary missing {key}: {sorted(summary)}"
+            value = summary[key]
+            assert isinstance(value, float) and np.isfinite(value), (
+                f"summary[{key!r}] not a finite float: {value!r}"
+            )
+        # Round-trip strict-JSON-safe so downstream MCP serialization
+        # cannot break on the new fields.
+        json.dumps(_json_safe(summary), allow_nan=False)
+
+    def test_process_single_spectrum_manifest_emits_energy_scale_keys(self, tmp_path):
+        """Manifest-driven path: enabling `fit_energy_scale` / `fit_back_d`
+        / `fit_back_f` in the manifest's analysis.fit block must surface
+        the corresponding scalars in the `results` block of the JSON the
+        MCP server returns.  Closes the #530 acceptance criterion.
+        """
+        energies = np.linspace(4.0, 30.0, 200)
+        true_density = 1.0e-3
+        isotope = _synthetic_u238_data()
+        transmission = np.asarray(
+            nereids.forward_model(energies, [(isotope, true_density)])
+        )
+        np.savez(
+            tmp_path / "spectrum.npz",
+            energies_ev=energies,
+            transmission=transmission,
+            uncertainty=np.full_like(transmission, 0.005),
+        )
+        _write_json_frontmatter_manifest(
+            tmp_path,
+            {
+                "mode": "single_spectrum",
+                "data": {"kind": "transmission_npz", "path": "spectrum.npz"},
+                "isotopes": [_synthetic_u238_entry(initial_density=true_density)],
+                "fit": {
+                    "solver": "lm",
+                    "max_iter": 80,
+                    "background": True,
+                    "fit_back_d": True,
+                    "fit_back_f": True,
+                    "fit_energy_scale": True,
+                    "t0_init_us": 0.0,
+                    "l_scale_init": 1.0,
+                    "energy_scale_flight_path_m": 25.0,
+                },
+                "resolution": {"kind": "none"},
+                "output": {"directory": "output"},
+            },
+        )
+
+        result = process_resonance_dataset(str(tmp_path))
+
+        assert result["success"] is True
+        results_block = result["results"]
+        for key in ("t0_us", "l_scale", "back_d", "back_f"):
+            assert key in results_block, (
+                f"results block missing {key}: keys={sorted(results_block)}"
+            )
+            assert isinstance(results_block[key], float)
+            assert np.isfinite(results_block[key])
+
+    def test_process_density_map_manifest_emits_fit_param_stats(self, tmp_path):
+        """Spatial counterpart of #530: `_process_density_map` previously
+        emitted only `density_maps` — no `anorm` / `background` / `t0` /
+        `L_scale` info, even though `SpatialResult` exposes those as
+        per-pixel maps when `fit_energy_scale` is on.  Backwards-compat:
+        the key is absent when no energy-scale-related maps are populated.
+        """
+        energies = np.linspace(4.0, 30.0, 120)
+        true_density = 1.0e-3
+        isotope = _synthetic_u238_data()
+        spectrum = np.asarray(
+            nereids.forward_model(energies, [(isotope, true_density)])
+        )
+        # Tiny 2x2 cube so the test stays fast.
+        cube = np.tile(spectrum[:, None, None], (1, 2, 2))
+        np.savez(
+            tmp_path / "density-map.npz",
+            energies_ev=energies,
+            transmission=cube,
+            uncertainty=np.full_like(cube, 0.005),
+        )
+        _write_json_frontmatter_manifest(
+            tmp_path,
+            {
+                "mode": "density_map",
+                "data": {"kind": "transmission_npz", "path": "density-map.npz"},
+                "isotopes": [_synthetic_u238_entry(initial_density=true_density)],
+                "fit": {
+                    "solver": "lm",
+                    "max_iter": 80,
+                    "background": True,
+                    "fit_energy_scale": True,
+                    "t0_init_us": 0.0,
+                    "l_scale_init": 1.0,
+                    "energy_scale_flight_path_m": 25.0,
+                },
+                "resolution": {"kind": "none"},
+                "output": {"directory": "output"},
+            },
+        )
+
+        result = process_resonance_dataset(str(tmp_path))
+
+        assert result["success"] is True
+        stats = result["results"].get("fit_param_stats")
+        assert stats is not None, (
+            f"fit_param_stats absent when fit_energy_scale=True; "
+            f"keys={sorted(result['results'])}"
+        )
+        # Per-pixel anorm + 3-term background + t0/L_scale maps must all
+        # be summarised — the four scalars `SpatialResult` exposes.
+        # `back_d` / `back_f` are NOT in the spatial result type yet
+        # (per-pixel back_d_map / back_f_map are not exposed on
+        # SpatialResult); tracked as a follow-up.
+        for key in ("anorm", "background", "t0_us", "l_scale"):
+            assert key in stats, f"fit_param_stats missing {key}: {sorted(stats)}"
+        # The npz must carry the raw arrays so downstream consumers
+        # can reconstruct the model curve per pixel.
+        npz = np.load(tmp_path / "output" / "nereids_density_map.npz")
+        try:
+            for arr_key in ("anorm_map", "t0_us_map", "l_scale_map"):
+                assert arr_key in npz.files, (
+                    f"density-map npz missing {arr_key}: {npz.files}"
+                )
+        finally:
+            npz.close()
+
+    def test_process_density_map_manifest_omits_fit_param_stats_by_default(
+        self, tmp_path
+    ):
+        """When no fit-energy-scale / per-pixel background flags are
+        set, the spatial summary must NOT carry a `fit_param_stats`
+        key — matching the pre-fix schema for unrelated consumers.
+        """
+        energies = np.linspace(4.0, 30.0, 120)
+        true_density = 1.0e-3
+        isotope = _synthetic_u238_data()
+        spectrum = np.asarray(
+            nereids.forward_model(energies, [(isotope, true_density)])
+        )
+        cube = np.tile(spectrum[:, None, None], (1, 2, 2))
+        np.savez(
+            tmp_path / "density-map.npz",
+            energies_ev=energies,
+            transmission=cube,
+            uncertainty=np.full_like(cube, 0.005),
+        )
+        _write_json_frontmatter_manifest(
+            tmp_path,
+            {
+                "mode": "density_map",
+                "data": {"kind": "transmission_npz", "path": "density-map.npz"},
+                "isotopes": [_synthetic_u238_entry(initial_density=true_density)],
+                "fit": {"solver": "lm", "max_iter": 50},
+                "resolution": {"kind": "none"},
+                "output": {"directory": "output"},
+            },
+        )
+
+        result = process_resonance_dataset(str(tmp_path))
+
+        assert result["success"] is True
+        assert "fit_param_stats" not in result["results"]
