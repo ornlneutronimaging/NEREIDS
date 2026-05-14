@@ -98,6 +98,31 @@ impl EndfLibrary {
     }
 }
 
+/// Compute the default on-disk cache directory for a given library without
+/// constructing an [`EndfRetriever`].
+///
+/// The retriever's constructor builds a `reqwest` blocking client + TLS
+/// configuration, which is wasted work when all the caller needs is the cache
+/// path for a UI hint or manual drop instruction. Mirrors the path layout
+/// that [`EndfRetriever::new`] would resolve to.
+pub fn default_cache_dir(library: EndfLibrary) -> PathBuf {
+    default_cache_root().join(library.cache_dir_name())
+}
+
+/// Compute the default cache file path for an isotope without constructing
+/// an [`EndfRetriever`]. Same layout as [`EndfRetriever::cache_file_path`].
+pub fn default_cache_file_path(isotope: &Isotope, library: EndfLibrary) -> PathBuf {
+    let sym = elements::element_symbol(isotope.z()).unwrap_or("X");
+    default_cache_dir(library).join(format!("{}-{}.endf", sym, isotope.a()))
+}
+
+fn default_cache_root() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(|| PathBuf::from(".cache"))
+        .join("nereids")
+        .join("endf")
+}
+
 /// ENDF file retrieval manager with local caching.
 pub struct EndfRetriever {
     /// Root cache directory.
@@ -113,12 +138,8 @@ pub struct EndfRetriever {
 impl EndfRetriever {
     /// Create a new retriever with default cache location (~/.cache/nereids/endf/).
     pub fn new() -> Self {
-        let cache_root = dirs::cache_dir()
-            .unwrap_or_else(|| PathBuf::from(".cache"))
-            .join("nereids")
-            .join("endf");
         Self {
-            cache_root,
+            cache_root: default_cache_root(),
             base_url: IAEA_BASE_URL.to_string(),
             client: build_http_client(),
         }
@@ -778,6 +799,29 @@ mod tests {
         );
     }
 
+    /// `default_cache_dir` / `default_cache_file_path` must agree with the
+    /// retriever's instance methods, otherwise UI hints would point users to
+    /// the wrong location after a fetch failure.
+    #[test]
+    fn default_cache_paths_agree_with_retriever_instance() {
+        let retriever = EndfRetriever::new();
+        let w184 = Isotope::new(74, 184).unwrap();
+        for lib in [
+            EndfLibrary::EndfB8_0,
+            EndfLibrary::EndfB8_1,
+            EndfLibrary::Jeff3_3,
+            EndfLibrary::Jendl5,
+            EndfLibrary::Tendl2023,
+            EndfLibrary::Cendl3_2,
+        ] {
+            assert_eq!(default_cache_dir(lib), retriever.cache_dir(lib));
+            assert_eq!(
+                default_cache_file_path(&w184, lib),
+                retriever.cache_file_path(&w184, lib)
+            );
+        }
+    }
+
     #[test]
     fn peek_local_endf_extracts_isotope_from_zip_and_raw() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -795,6 +839,36 @@ mod tests {
         let (iso_z, text_z) = EndfRetriever::peek_local_endf(&zip_path).expect("zip peek");
         assert_eq!(iso_z, Isotope::new(74, 184).unwrap());
         assert_eq!(text_z, W184_FIXTURE);
+    }
+
+    /// Regression for the `looks_like_zip` magic-byte branch: an upload whose
+    /// path has no `.zip` extension must still be detected via `PK\x03\x04`
+    /// and routed through the zip extractor. Without this test, the magic-byte
+    /// branch could silently regress to extension-only detection.
+    #[test]
+    fn install_local_endf_accepts_extensionless_zip_via_magic_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let zip_path = dir.path().join("upload-no-extension"); // no .zip suffix
+        write_zip_with_endf(&zip_path, "inner.endf", W184_FIXTURE).expect("write zip");
+
+        // Sanity-check we really did create a zip without the .zip extension.
+        assert!(zip_path.extension().is_none());
+        let head = std::fs::read(&zip_path).unwrap();
+        assert_eq!(&head[..4], b"PK\x03\x04");
+
+        let retriever = EndfRetriever::with_cache_dir(dir.path().join("cache"));
+        let w184 = Isotope::new(74, 184).unwrap();
+        let (cache_path, text) = retriever
+            .install_local_endf(&w184, EndfLibrary::EndfB8_0, &zip_path)
+            .expect("extensionless zip must still install");
+        assert!(cache_path.exists());
+        assert_eq!(text, W184_FIXTURE);
+
+        // peek_local_endf must also handle the extensionless zip.
+        let (iso, peeked_text) =
+            EndfRetriever::peek_local_endf(&zip_path).expect("peek must also work");
+        assert_eq!(iso, w184);
+        assert_eq!(peeked_text, W184_FIXTURE);
     }
 
     #[test]

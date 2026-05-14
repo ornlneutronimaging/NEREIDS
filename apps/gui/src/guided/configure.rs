@@ -150,7 +150,13 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
 
         ui.add_space(6.0);
 
-        // Add buttons (disabled during fetch)
+        // Add buttons (disabled during fetch). The local-install button also
+        // touches the shared on-disk cache, so it's gated on every ENDF fetch
+        // flag — not just Configure's — to keep manual writes from racing the
+        // Forward Model or Detectability workers reading/writing the same
+        // cache slot.
+        let any_fetch_active =
+            state.is_fetching_endf || state.is_fetching_fm_endf || state.is_fetching_detect_endf;
         ui.add_enabled_ui(!state.is_fetching_endf, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("Add Isotope...").clicked() {
@@ -165,9 +171,11 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
                     state.periodic_table_selected_z = None;
                     state.periodic_table_density = 0.001; // at/barn default
                 }
-                if ui.button("Load local ENDF file\u{2026}").clicked() {
-                    install_local_endf_dialog(state);
-                }
+                ui.add_enabled_ui(!any_fetch_active, |ui| {
+                    if ui.button("Load local ENDF file\u{2026}").clicked() {
+                        install_local_endf_dialog(state);
+                    }
+                });
             });
         });
 
@@ -219,16 +227,7 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
                 }
             }
             ui.add_space(4.0);
-            let cache_dir =
-                nereids_endf::retrieval::EndfRetriever::new().cache_dir(state.endf_library);
-            ui.label(
-                egui::RichText::new(format!(
-                    "Offline fallback: drop the ENDF file at {} and click Retry, or use \u{201C}Load local ENDF file\u{2026}\u{201D} above.",
-                    cache_dir.display()
-                ))
-                .small()
-                .weak(),
-            );
+            render_failed_cache_hint(ui, state);
         }
     });
 
@@ -554,6 +553,70 @@ fn fetch_endf_data(state: &mut AppState) {
     let cancel = Arc::clone(&state.cancel_token);
 
     std::thread::spawn(move || design::endf_fetch_worker(work, cancel, tx));
+}
+
+/// Render the offline-fallback hint that lists the exact cache-file path for
+/// every Failed isotope under the active library, so users can `cp` a
+/// manually-downloaded ENDF straight into place (issue #523). Paths come from
+/// the free `default_cache_file_path` helper to avoid the per-frame
+/// `EndfRetriever::new()` cost that would otherwise build a reqwest client +
+/// TLS context just to read the cache layout.
+fn render_failed_cache_hint(ui: &mut egui::Ui, state: &AppState) {
+    use nereids_core::types::Isotope;
+    use nereids_endf::retrieval::default_cache_file_path;
+
+    const MAX_LINES: usize = 3;
+    let library = state.endf_library;
+    let mut failed: Vec<(u32, u32)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for e in &state.isotope_entries {
+        if e.enabled && e.endf_status == EndfStatus::Failed && seen.insert((e.z, e.a)) {
+            failed.push((e.z, e.a));
+        }
+    }
+    for g in &state.isotope_groups {
+        if !g.enabled {
+            continue;
+        }
+        for m in &g.members {
+            if m.endf_status == EndfStatus::Failed && seen.insert((g.z, m.a)) {
+                failed.push((g.z, m.a));
+            }
+        }
+    }
+    if failed.is_empty() {
+        return;
+    }
+
+    ui.label(
+        egui::RichText::new(
+            "Offline fallback: copy the ENDF file to the path below, then click Retry — or use \u{201C}Load local ENDF file\u{2026}\u{201D} above:",
+        )
+        .small()
+        .weak(),
+    );
+    for &(z, a) in failed.iter().take(MAX_LINES) {
+        let Ok(iso) = Isotope::new(z, a) else {
+            continue;
+        };
+        let path = default_cache_file_path(&iso, library);
+        ui.label(
+            egui::RichText::new(format!("    {}", path.display()))
+                .small()
+                .weak()
+                .monospace(),
+        );
+    }
+    if failed.len() > MAX_LINES {
+        ui.label(
+            egui::RichText::new(format!(
+                "    \u{2026} and {} more",
+                failed.len() - MAX_LINES
+            ))
+            .small()
+            .weak(),
+        );
+    }
 }
 
 /// Manual ENDF upload escape hatch (issue #523): pick a local `.endf`/`.zip`
