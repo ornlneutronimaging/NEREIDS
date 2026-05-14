@@ -19,6 +19,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --exclude nereids-python
+      # Compile-check workspace examples so docs snippets cannot drift
+      # out of sync with the live crate APIs (see `crates/nereids-fitting/
+      # examples/quickstart.rs`, mirrored into `docs/guide/src/quickstart-rust.md`).
+      - run: cargo check --workspace --exclude nereids-python --examples
 
   # ── Formatting ─────────────────────────────────────────────────────
   fmt:
