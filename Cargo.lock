@@ -2752,6 +2752,7 @@ dependencies = [
  "nereids-core",
  "reqwest",
  "serde",
+ "tempfile",
  "thiserror 2.0.18",
  "zip",
 ]
