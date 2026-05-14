@@ -223,8 +223,11 @@ result = nereids.spatial_map_typed(
 )
 ```
 
-`solver="auto"` uses LM for `from_transmission(...)` data. `density_maps[0]`
-is the fitted U-238 map.
+For `from_transmission(...)` inputs the default `solver="lm"` and `solver="auto"`
+both route to LM (this is the dispatcher contract in `__init__.pyi`:
+"`from_transmission + solver="lm"` (default for transmission) → LM"). The
+explicit `solver="kl"` opt-in for `from_transmission` runs the legacy
+Poisson-NLL-on-transmission path. `density_maps[0]` is the fitted U-238 map.
 
 ### Raw Count Cubes
 
