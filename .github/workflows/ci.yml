@@ -18,6 +18,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install GTK 3 development headers (rfd backend)
+        run: sudo apt-get update -qq && sudo apt-get install -y libgtk-3-dev
       - run: cargo check --workspace --exclude nereids-python
 
   # ── Formatting ─────────────────────────────────────────────────────
@@ -42,6 +44,8 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Install GTK 3 development headers (rfd backend)
+        run: sudo apt-get update -qq && sudo apt-get install -y libgtk-3-dev
       - run: cargo clippy --workspace --exclude nereids-python --all-targets -- -D warnings
 
   # ── Tests (cross-platform) ─────────────────────────────────────────
@@ -59,6 +63,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install GTK 3 development headers (rfd backend, Linux only)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y libgtk-3-dev
       - name: Build
         run: cargo build --workspace --exclude nereids-python
       - name: Run tests
@@ -73,6 +80,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install GTK 3 development headers (rfd backend)
+        run: sudo apt-get update -qq && sudo apt-get install -y libgtk-3-dev
       - name: Build docs
         run: cargo doc --workspace --no-deps --exclude nereids-python
         env:
@@ -106,6 +115,8 @@ jobs:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Install GTK 3 development headers (rfd backend)
+        run: sudo apt-get update -qq && sudo apt-get install -y libgtk-3-dev
       - name: Generate coverage
         run: cargo llvm-cov --workspace --exclude nereids-python --lcov --output-path lcov.info
       - name: Upload to Codecov
