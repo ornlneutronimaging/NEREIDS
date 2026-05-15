@@ -25,6 +25,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install GTK 3 development headers (rfd backend)
+        run: sudo apt-get update -qq && sudo apt-get install -y libgtk-3-dev
+
       - name: Install mdBook
         run: |
           mkdir -p "$HOME/.local/bin"
