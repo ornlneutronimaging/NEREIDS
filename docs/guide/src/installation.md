@@ -62,14 +62,16 @@ container / server installs do not.
 
 ```bash
 sudo apt-get install -y \
-  libgtk-3-0t64 libxcursor1 libx11-xcb1 libxi6 libxrandr2 \
+  libgtk-3-0 libxcursor1 libx11-xcb1 libxi6 libxrandr2 \
   libxinerama1 libxxf86vm1 libxkbcommon-x11-0 libwayland-client0 \
-  libgl1 libegl1
+  libgl1 libgl1-mesa-dri libegl1
 ```
 
-On Ubuntu releases older than 24.04 the GTK 3 runtime is `libgtk-3-0`
-instead of `libgtk-3-0t64`; the older name still resolves on 24.04 via
-a transitional package.
+`libgtk-3-0` is portable across Debian and all current Ubuntu LTS
+releases. On Ubuntu 24.04 (Noble) it pulls in `libgtk-3-0t64` under
+the hood via the t64 transitional package. `libgl1-mesa-dri` is
+needed even with `LIBGL_ALWAYS_SOFTWARE=1` (below) because the
+software rasteriser is shipped as a Mesa DRI driver.
 
 Contributors building from source additionally need the GTK 3
 development headers and `pkg-config`:
@@ -83,7 +85,8 @@ sudo apt-get install -y libgtk-3-dev pkg-config
 ```bash
 sudo dnf install -y \
   gtk3 libXcursor libXi libXrandr libXinerama libxkbcommon-x11 \
-  libwayland-client libwayland-cursor mesa-libGL mesa-libEGL
+  libwayland-client libwayland-cursor \
+  mesa-libGL mesa-libEGL mesa-dri-drivers
 ```
 
 Contributors building from source additionally need `gtk3-devel` and
@@ -93,10 +96,13 @@ Contributors building from source additionally need `gtk3-devel` and
 
 If the GUI fails at startup with a GL initialisation error (common in
 Docker without GPU passthrough, or over SSH-X without GLX), force
-software rasterisation:
+software rasterisation by setting `LIBGL_ALWAYS_SOFTWARE=1` before
+launching the GUI:
 
 ```bash
 export LIBGL_ALWAYS_SOFTWARE=1
+cargo run --release -p nereids-gui   # from source
+# or, if installed as a binary:
 nereids-gui
 ```
 
