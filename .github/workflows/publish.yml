@@ -122,6 +122,7 @@ jobs:
           before-script-linux: |
             yum install -y cmake3 || yum install -y cmake
             ln -sf /usr/bin/cmake3 /usr/bin/cmake || true
+            yum install -y gtk3-devel
 
       # maturin working-directory puts output in apps/gui/dist
       - name: Upload GUI wheel
