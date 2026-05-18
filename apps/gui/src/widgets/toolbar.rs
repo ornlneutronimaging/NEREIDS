@@ -38,6 +38,9 @@ pub fn toolbar(ctx: &egui::Context, state: &mut AppState) {
                 ui.selectable_value(&mut state.ui_mode, UiMode::Guided, "Guided");
                 ui.selectable_value(&mut state.ui_mode, UiMode::Studio, "Studio");
 
+                // Help menu (log folder + log path) — issue #524
+                help_menu(ctx, ui);
+
                 // Trailing controls right-aligned
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // Theme toggle (rightmost) — cycles ☀ → ☽ → A
@@ -97,4 +100,45 @@ pub fn toolbar(ctx: &egui::Context, state: &mut AppState) {
                 });
             });
         });
+}
+
+/// Help dropdown: reveal the log folder or copy the active log file path.
+/// Added for issue #524 (file-based logging for user troubleshooting).
+fn help_menu(ctx: &egui::Context, ui: &mut egui::Ui) {
+    ui.menu_button("Help", |ui| {
+        if ui.button("Open log folder").clicked() {
+            // Spawn off the GUI thread because `opener::reveal` on Linux
+            // does a synchronous D-Bus round-trip to the FileManager1
+            // interface, and even `opener::open` shells out — neither
+            // should block frame rendering.
+            let file = crate::logging::log_file_path();
+            let dir = crate::logging::log_dir();
+            std::thread::spawn(move || reveal_log_in_file_manager(&file, &dir));
+            ui.close();
+        }
+        if ui.button("Copy log path").clicked() {
+            let path = crate::logging::log_file_path().display().to_string();
+            ctx.copy_text(path);
+            ui.close();
+        }
+    });
+}
+
+/// Reveal `file` in the platform file manager, falling back to opening
+/// the parent `dir` if reveal isn't possible. Runs on a detached worker
+/// thread to keep the GUI responsive.
+fn reveal_log_in_file_manager(file: &std::path::Path, dir: &std::path::Path) {
+    if file.exists() {
+        match opener::reveal(file) {
+            Ok(()) => return,
+            Err(err) => {
+                tracing::warn!(error = %err, "opener::reveal failed; falling back to open(dir)");
+            }
+        }
+    } else {
+        tracing::info!("today's log file not created yet; opening log directory");
+    }
+    if let Err(open_err) = opener::open(dir) {
+        tracing::error!(error = %open_err, "opener::open failed");
+    }
 }

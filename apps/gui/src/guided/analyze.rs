@@ -2687,6 +2687,7 @@ pub fn run_spatial_map(state: &mut AppState) {
     {
         Ok(p) => p,
         Err(e) => {
+            tracing::error!(error = %e, "rayon pool creation failed for spatial fit");
             state.status_message = format!("Failed to create thread pool: {e}");
             state.is_fitting = false;
             state.fitting_progress = None;
@@ -2694,7 +2695,9 @@ pub fn run_spatial_map(state: &mut AppState) {
         }
     };
 
+    tracing::info!(threads = n_threads, "spawning spatial-fit thread");
     std::thread::spawn(move || {
+        let _span = tracing::info_span!("spatial_map").entered();
         // Watcher thread: poke the GUI every 100ms so the progress bar
         // repaints.  Uses near-zero CPU (sleep + one syscall per wake).
         let done_flag = Arc::new(AtomicBool::new(false));

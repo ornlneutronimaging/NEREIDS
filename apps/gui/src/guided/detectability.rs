@@ -807,5 +807,6 @@ pub(crate) fn detect_fetch_endf_data(state: &mut AppState) {
     state.status_message = "Fetching ENDF data (Detect)...".into();
     let cancel = Arc::clone(&state.cancel_token);
 
+    tracing::info!(isotopes = work.len(), "spawning ENDF fetch (detectability)");
     std::thread::spawn(move || design::endf_fetch_worker(work, cancel, tx));
 }

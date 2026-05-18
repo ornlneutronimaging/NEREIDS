@@ -231,6 +231,36 @@ nereids-pipeline      End-to-end orchestration, spatial mapping (rayon)
 - **[API Reference](https://ornlneutronimaging.github.io/NEREIDS/api/nereids_pipeline/)** -- Rustdoc for all crates
 - **[Jupyter Notebooks](examples/notebooks/)** -- 17 tutorials organized by complexity
 
+## Troubleshooting
+
+### Log files
+
+The NEREIDS desktop GUI (`nereids-gui`) writes daily-rotated log files
+to a platform-specific data directory, retaining the last 7 days. Each
+day's file is named `nereids-gui.YYYY-MM-DD.log` (UTC date):
+
+| Platform | Log directory |
+|----------|---------------|
+| macOS    | `~/Library/Application Support/NEREIDS/logs/` |
+| Linux    | `~/.local/share/NEREIDS/logs/` (honours `$XDG_DATA_HOME`) |
+| Windows  | `%APPDATA%\NEREIDS\logs\` |
+
+From the running app, use **Help → Open log folder** (reveals today's
+log file in your platform's file manager) or **Help → Copy log path**
+to copy the full path to the clipboard.
+
+The default log level is `info`. Override with the `NEREIDS_LOG`
+environment variable (or the standard `RUST_LOG`), e.g.:
+
+```bash
+NEREIDS_LOG=debug nereids-gui
+NEREIDS_LOG="nereids_pipeline=trace,info" nereids-gui
+```
+
+`NEREIDS_LOG` takes precedence over `RUST_LOG`. Panics are captured to
+the log file with a backtrace before the process exits — please attach
+the relevant log file when reporting bugs.
+
 ## Citation
 
 If you use NEREIDS in your research, please cite:
