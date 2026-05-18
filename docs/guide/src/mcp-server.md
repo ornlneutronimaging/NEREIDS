@@ -11,6 +11,9 @@ The MCP interface is experimental. It is useful for demos and agent-assisted
 workflows, but the Python and Rust APIs remain the stable interfaces for
 scripted analysis.
 
+See also: [Data I/O and NeXus/TOF](./data-io.md) for the raw-Python NeXus,
+TIFF, normalization, and TOF energy-grid flow that the MCP workflow wraps.
+
 ## Installation
 
 Install the optional MCP dependency and run the stdio server:
@@ -172,15 +175,17 @@ file; real experiments normally do.
   configured with `sample_path` and `open_beam_path`.
 
 Paired arrays must have matching shapes. The number of energy points must
-match the first axis of the data arrays. Energy grids must be strictly
-monotonic; descending grids are reversed with the aligned arrays before
-fitting.
+match the first axis of the data arrays. See
+[Data I/O and NeXus/TOF](./data-io.md#tof-edges-to-energy-centers) for the
+energy-ordering contract (descending grids are reversed with the aligned
+arrays before fitting).
 
-For NeXus histogram inputs, NEREIDS loads counts in TOF-bin order and derives
-ascending energy centers with `tof_to_energy_centers(...)`. The MCP workflow
-converts the counts to the same ascending-energy order before fitting. If the
-manifest does not specify `flight_path_m`, the loader metadata is used when
-available, with a 25 m fallback. `delay_us` defaults to 0.
+For NeXus histogram inputs, MCP follows the conventions documented in
+[Data I/O and NeXus/TOF](./data-io.md). Briefly: NeXus loaders return counts
+in ascending TOF order; the workflow reverses counts to ascending-energy order
+via `tof_to_energy_centers(...)` before fitting. If the manifest does not
+specify `flight_path_m`, the loader metadata is used when available, with a
+25 m fallback. `delay_us` defaults to 0.
 
 Example NeXus density-map manifest:
 
