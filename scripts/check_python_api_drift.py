@@ -113,4 +113,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception as exc:  # noqa: BLE001 — exit code 2 is the contract
+        print(f"unexpected error: {exc.__class__.__name__}: {exc}", file=sys.stderr)
+        sys.exit(2)

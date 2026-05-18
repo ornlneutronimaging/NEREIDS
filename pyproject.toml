@@ -89,7 +89,7 @@ clean = { cmd = "cargo clean", description = "Remove all Rust build artifacts (t
 lint-fmt = { cmd = "cargo fmt --all --check", description = "Check formatting without applying" }
 lint-clippy = { cmd = "cargo clippy --workspace --exclude nereids-python --all-targets -- -D warnings", description = "Run clippy lints" }
 lint-docs = { cmd = "python scripts/check_python_api_drift.py", description = "Check __init__.pyi <-> python-api.md drift" }
-lint = { depends-on = ["lint-fmt", "lint-clippy"], description = "Run all linters" }
+lint = { depends-on = ["lint-fmt", "lint-clippy", "lint-docs"], description = "Run all linters" }
 gui = { cmd = "cargo run --release -p nereids-gui", description = "Run the GUI application (release)" }
 gui-debug = { cmd = "cargo run -p nereids-gui", description = "Run the GUI application (debug)" }
 gui-bundle = { cmd = "cargo bundle --release", cwd = "apps/gui", description = "Bundle the GUI as a macOS .app" }

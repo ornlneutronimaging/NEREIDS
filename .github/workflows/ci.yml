@@ -104,6 +104,12 @@ jobs:
         uses: prefix-dev/setup-pixi@v0.9.4
         with:
           run-install: true
+      # Drift gate: catches public symbols added to bindings/python/python/
+      # nereids/__init__.pyi without a corresponding update to
+      # docs/guide/src/python-api.md or the allowlist (issue #533). Runs
+      # on every PR — the same step in docs.yml only runs post-merge.
+      - name: Check curated Python API page is in sync with .pyi stubs
+        run: pixi run lint-docs
       - name: Build and test Python bindings
         run: pixi run test-python
 
