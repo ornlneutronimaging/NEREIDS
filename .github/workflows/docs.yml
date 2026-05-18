@@ -25,8 +25,11 @@ jobs:
     #                              own rust; the host rustup install is
     #                              the single source of truth.
     #   Swatinem/rust-cache     -> caches target/ for cargo doc + maturin
-    #   setup-pixi              -> Python + mdbook + pdoc (orchestrator
-    #                              deps; no rust here)
+    #   setup-pixi              -> Python + mdbook + pdoc + maturin
+    #                              (orchestrator deps; no rust here —
+    #                              maturin is the build front-end that
+    #                              wraps cargo + the rust toolchain
+    #                              installed above)
     #   pixi run doc-build      -> doc-guide (mdbook) + doc-api (cargo
     #                              doc) + doc-python (pdoc on installed
     #                              wheel)
