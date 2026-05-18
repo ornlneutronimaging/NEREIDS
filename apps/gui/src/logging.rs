@@ -18,8 +18,9 @@
 //! fall back to a stderr-only subscriber and emit a `tracing::error!`
 //! describing the failure. The app stays usable.
 
+use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, Once};
 use time::OffsetDateTime;
 use time::macros::format_description;
 use tracing_appender::non_blocking::WorkerGuard;
@@ -42,21 +43,28 @@ static GUARD: Mutex<Option<WorkerGuard>> = Mutex::new(None);
 /// the directory tree on demand. Falls back to `.cache/NEREIDS/logs`
 /// (relative to cwd) if `dirs::data_dir()` is unavailable.
 ///
-/// Note: a failure to create the directory is intentionally swallowed
-/// here. The caller ([`init`]) handles the downstream
-/// `RollingFileAppender::build` failure that follows.
+/// Directory-creation failure is reported through [`init`]'s diagnostic
+/// log line; callers of `log_dir` (e.g. the toolbar Help menu) get the
+/// would-be path either way so the UI can still display it. For the
+/// fallible variant, see [`compute_log_dir`].
 pub fn log_dir() -> PathBuf {
     let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from(".cache"));
-    compute_log_dir(&base)
+    compute_log_dir(&base).unwrap_or_else(|(path, _err)| path)
 }
 
 /// Pure variant of [`log_dir`] that takes the base data directory as a
 /// parameter — used by tests so they can point at a [`tempfile::TempDir`]
-/// instead of mutating the dev's real user-data folder.
-fn compute_log_dir(base: &Path) -> PathBuf {
+/// instead of mutating the dev's real user-data folder, and by [`init`]
+/// so a creation failure can be surfaced through the post-init log.
+///
+/// On failure, returns `Err((would_be_path, io::Error))` so callers
+/// can still report or display the intended path.
+fn compute_log_dir(base: &Path) -> Result<PathBuf, (PathBuf, io::Error)> {
     let dir = base.join(APP_DIR_NAME).join("logs");
-    let _ = std::fs::create_dir_all(&dir);
-    dir
+    match std::fs::create_dir_all(&dir) {
+        Ok(()) => Ok(dir),
+        Err(err) => Err((dir, err)),
+    }
 }
 
 /// Returns the path to today's log file as written by the rolling
@@ -87,14 +95,34 @@ fn current_utc_date() -> String {
 
 /// Initialise the global tracing subscriber.
 ///
+/// Idempotent: subsequent calls are no-ops. Gating with [`Once`]
+/// prevents the panic-hook chain from stacking on accidental double-init
+/// (each call would otherwise wrap the previous hook, producing
+/// duplicated panic-log records).
+///
 /// Never panics. On rolling-appender failure (unwritable directory,
-/// full disk, sandbox jail) falls back to a stderr-only subscriber
-/// and emits a `tracing::error!` describing the failure. The returned
-/// `WorkerGuard` (when the file appender came up) is stashed in a
-/// process-wide `Mutex<Option<WorkerGuard>>` and dropped by
-/// [`shutdown`] before any `std::process::exit(0)`.
+/// full disk, sandbox jail) falls back to a stderr-only subscriber and
+/// emits a `tracing::error!` describing the failure. The `WorkerGuard`
+/// (when the file appender came up) is stashed in a process-wide
+/// `Mutex<Option<WorkerGuard>>` and dropped by [`shutdown`] before any
+/// `std::process::exit(0)`.
 pub fn init() {
-    let dir = log_dir();
+    static INITIALISED: Once = Once::new();
+    INITIALISED.call_once(init_inner);
+}
+
+fn init_inner() {
+    let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from(".cache"));
+    let dir_result = compute_log_dir(&base);
+    // Either the canonical dir (success) or the would-be path (failure)
+    // — both are useful: the appender build below will fail-fast on
+    // the latter, and the diagnostic log will name the path the user
+    // can investigate.
+    let dir = match &dir_result {
+        Ok(p) => p.clone(),
+        Err((p, _)) => p.clone(),
+    };
+
     let appender_result = RollingFileAppender::builder()
         .rotation(Rotation::DAILY)
         .filename_prefix(LOG_FILE_PREFIX)
@@ -137,14 +165,26 @@ pub fn init() {
         .with_filter(env_filter());
 
     // `try_init` returns Err if another subscriber is already installed
-    // (e.g. accidental double-init in tests). Swallow it — the existing
-    // subscriber stays in charge.
+    // (e.g. accidental double-init in tests, though our `Once` gate
+    // makes that path unreachable from our own callers). Swallow it —
+    // the existing subscriber stays in charge.
     let _ = Registry::default()
         .with(file_layer)
         .with(stderr_layer)
         .try_init();
 
     install_panic_hook();
+
+    // Surface the dir-creation failure (if any) now that the subscriber
+    // is installed. Recorded as a warn so it stands out without being
+    // alarming on filesystems where this is genuinely transient.
+    if let Err((path, ref err)) = dir_result {
+        tracing::warn!(
+            dir = %path.display(),
+            error = %err,
+            "failed to create log directory; logging may be degraded"
+        );
+    }
 
     match appender_error {
         None => {
@@ -207,7 +247,7 @@ mod tests {
     #[test]
     fn compute_log_dir_tail_is_nereids_logs() {
         let tmp = tempdir().expect("tempdir");
-        let dir = compute_log_dir(tmp.path());
+        let dir = compute_log_dir(tmp.path()).expect("create log dir");
         let tail: Vec<String> = dir
             .components()
             .rev()
@@ -220,13 +260,30 @@ mod tests {
     #[test]
     fn compute_log_dir_creates_the_directory() {
         let tmp = tempdir().expect("tempdir");
-        let dir = compute_log_dir(tmp.path());
+        let dir = compute_log_dir(tmp.path()).expect("create log dir");
         assert!(
             dir.exists(),
             "compute_log_dir should create the directory: {}",
             dir.display()
         );
         assert!(dir.is_dir(), "expected a directory");
+    }
+
+    #[test]
+    fn compute_log_dir_surfaces_creation_error() {
+        // Point at a path that cannot become a directory: a regular
+        // file already exists at the would-be parent path. mkdir -p
+        // refuses to create children under a non-directory.
+        let tmp = tempdir().expect("tempdir");
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").expect("write blocker file");
+        let result = compute_log_dir(&blocker);
+        let Err((path, _err)) = result else {
+            panic!("expected Err, got {result:?}");
+        };
+        // The reported path is still the would-be log dir, useful for
+        // post-init diagnostics.
+        assert!(path.ends_with("NEREIDS/logs"));
     }
 
     #[test]
