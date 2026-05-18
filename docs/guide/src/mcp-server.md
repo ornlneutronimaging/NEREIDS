@@ -175,17 +175,18 @@ file; real experiments normally do.
   configured with `sample_path` and `open_beam_path`.
 
 Paired arrays must have matching shapes. The number of energy points must
-match the first axis of the data arrays. See
+match the first axis of the data arrays. Energy grids must be strictly
+monotonic. See
 [Data I/O and NeXus/TOF](./data-io.md#tof-edges-to-energy-centers) for the
 energy-ordering contract (descending grids are reversed with the aligned
 arrays before fitting).
 
 For NeXus histogram inputs, MCP follows the conventions documented in
 [Data I/O and NeXus/TOF](./data-io.md). Briefly: NeXus loaders return counts
-in ascending TOF order; the workflow reverses counts to ascending-energy order
-via `tof_to_energy_centers(...)` before fitting. If the manifest does not
-specify `flight_path_m`, the loader metadata is used when available, with a
-25 m fallback. `delay_us` defaults to 0.
+in ascending TOF order; the workflow derives ascending energy centers with
+`tof_to_energy_centers(...)` and reverses counts along axis 0 to match before
+fitting. If the manifest does not specify `flight_path_m`, the loader metadata
+is used when available, with a 25 m fallback. `delay_us` defaults to 0.
 
 Example NeXus density-map manifest:
 
