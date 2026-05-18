@@ -182,6 +182,11 @@ fn poll_pending_tasks(state: &mut AppState) {
     if let Some(ref rx) = state.pending_spatial {
         match rx.try_recv() {
             Ok(Ok(result)) => {
+                tracing::info!(
+                    converged = result.n_converged,
+                    total = result.n_total,
+                    "spatial map completed"
+                );
                 state.status_message = format!(
                     "Spatial map: {}/{} converged",
                     result.n_converged, result.n_total
@@ -204,6 +209,7 @@ fn poll_pending_tasks(state: &mut AppState) {
                 state.clear_dirty();
             }
             Ok(Err(err_msg)) => {
+                tracing::error!(error = %err_msg, "spatial map failed");
                 state.status_message = format!("Spatial map error: {err_msg}");
                 state.is_fitting = false;
                 state.fitting_progress = None;
@@ -211,6 +217,7 @@ fn poll_pending_tasks(state: &mut AppState) {
                 state.pending_spatial = None;
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                tracing::error!("spatial map task disconnected without result");
                 state.status_message = "Spatial map task failed".into();
                 state.is_fitting = false;
                 state.fitting_progress = None;
@@ -246,6 +253,7 @@ fn poll_pending_tasks(state: &mut AppState) {
                                 state.pixel_fit_result = None;
                             }
                             Err(msg) => {
+                                tracing::warn!(symbol = %fetch.symbol, error = %msg, "ENDF fetch failed");
                                 entry.endf_status = EndfStatus::Failed;
                                 state.status_message = msg.clone();
                             }
@@ -266,6 +274,7 @@ fn poll_pending_tasks(state: &mut AppState) {
                                     state.pixel_fit_result = None;
                                 }
                                 Err(msg) => {
+                                    tracing::warn!(symbol = %fetch.symbol, error = %msg, "ENDF group-member fetch failed");
                                     member.endf_status = EndfStatus::Failed;
                                     state.status_message = msg.clone();
                                 }
@@ -311,6 +320,7 @@ fn poll_pending_tasks(state: &mut AppState) {
                 state.status_message = "All ENDF data loaded".into();
             }
             let total = loaded_count + group_loaded_count;
+            tracing::info!(loaded = total, "ENDF batch fetch finished (configure)");
             state.log_provenance(
                 ProvenanceEventKind::ConfigChanged,
                 format!("Fetched ENDF data for {total} isotopes"),
@@ -340,6 +350,7 @@ fn poll_pending_tasks(state: &mut AppState) {
                                 state.fm_per_isotope_spectra.clear();
                             }
                             Err(msg) => {
+                                tracing::warn!(symbol = %fetch.symbol, error = %msg, "FM ENDF fetch failed");
                                 entry.endf_status = EndfStatus::Failed;
                                 state.status_message = msg;
                             }
@@ -361,6 +372,7 @@ fn poll_pending_tasks(state: &mut AppState) {
             {
                 state.status_message = "FM: all ENDF data loaded".into();
             }
+            tracing::info!("ENDF batch fetch finished (forward model)");
             state.is_fetching_fm_endf = false;
             state.pending_fm_endf = None;
         }
@@ -386,6 +398,7 @@ fn poll_pending_tasks(state: &mut AppState) {
                                         format!("Detect: loaded matrix {}", fetch.symbol);
                                 }
                                 Err(msg) => {
+                                    tracing::warn!(symbol = %fetch.symbol, error = %msg, "Detect matrix ENDF fetch failed");
                                     entry.endf_status = EndfStatus::Failed;
                                     state.status_message = msg;
                                 }
@@ -406,6 +419,7 @@ fn poll_pending_tasks(state: &mut AppState) {
                                         format!("Detect: loaded trace {}", fetch.symbol);
                                 }
                                 Err(msg) => {
+                                    tracing::warn!(symbol = %fetch.symbol, error = %msg, "Detect trace ENDF fetch failed");
                                     entry.endf_status = EndfStatus::Failed;
                                     state.status_message = msg;
                                 }
@@ -458,6 +472,13 @@ fn poll_pending_tasks(state: &mut AppState) {
                     state.status_message = format!("Detect: {}", parts.join("; "));
                 }
             }
+            tracing::info!(
+                matrix_loaded = loaded_matrix,
+                matrix_total = total_matrix,
+                trace_loaded = loaded_traces,
+                trace_total = total_traces,
+                "ENDF batch fetch finished (detectability)"
+            );
             state.is_fetching_detect_endf = false;
             state.pending_detect_endf = None;
         }
@@ -471,6 +492,7 @@ fn poll_pending_tasks(state: &mut AppState) {
                     SaveDataMode::Linked => "linked",
                     SaveDataMode::Embedded => "embedded",
                 };
+                tracing::info!(path = %path.display(), mode = %mode_label, "project saved");
                 state.project_file_path = Some(path.clone());
                 state.last_save_mode = mode;
                 state.status_message =
@@ -484,12 +506,14 @@ fn poll_pending_tasks(state: &mut AppState) {
                 state.save_join_handle = None;
             }
             Ok(Err(msg)) => {
+                tracing::error!(error = %msg, "project save failed");
                 state.status_message = format!("Save failed: {msg}");
                 state.is_saving = false;
                 state.pending_save = None;
                 state.save_join_handle = None;
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                tracing::error!("save task disconnected without result");
                 state.status_message = "Save task failed unexpectedly".into();
                 state.is_saving = false;
                 state.pending_save = None;

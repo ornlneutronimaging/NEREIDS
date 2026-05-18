@@ -5,6 +5,7 @@
 
 mod app;
 mod guided;
+mod logging;
 mod pipeline;
 mod project;
 mod state;
@@ -14,6 +15,10 @@ mod theme;
 mod widgets;
 
 fn main() -> eframe::Result {
+    // Init logging first so panics during option/storage/font setup
+    // are captured. `_log_guard` flushes pending records on Drop.
+    let _log_guard = logging::init();
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
@@ -34,6 +39,7 @@ fn main() -> eframe::Result {
             if let Some(ref path) = project_arg
                 && path.exists()
             {
+                tracing::info!(path = %path.display(), "loading project from CLI arg");
                 project::load_project_from_path(&mut app.state, path);
             }
             Ok(Box::new(app))

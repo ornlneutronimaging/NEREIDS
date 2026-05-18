@@ -577,6 +577,8 @@ fn execute_save(state: &mut AppState, path: &Path, mode: SaveDataMode) {
         mode
     };
 
+    tracing::info!(path = %path.display(), mode = ?mode, "saving project");
+
     let snap = snapshot_from_state(state);
     let path = path.to_path_buf();
 
@@ -676,11 +678,14 @@ pub fn load_project_dialog(state: &mut AppState) {
 
 /// Load a project file from `path` and apply the snapshot to `state`.
 pub fn load_project_from_path(state: &mut AppState, path: &Path) {
+    tracing::info!(path = %path.display(), "loading project");
     match nereids_io::project::load_project(path) {
         Ok(snap) => {
             state_from_snapshot(snap, state, path);
+            tracing::info!(path = %path.display(), "project loaded");
         }
         Err(e) => {
+            tracing::error!(path = %path.display(), error = %e, "project load failed");
             state.status_message = format!("Load failed: {e}");
         }
     }

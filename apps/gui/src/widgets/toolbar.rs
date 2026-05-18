@@ -38,6 +38,9 @@ pub fn toolbar(ctx: &egui::Context, state: &mut AppState) {
                 ui.selectable_value(&mut state.ui_mode, UiMode::Guided, "Guided");
                 ui.selectable_value(&mut state.ui_mode, UiMode::Studio, "Studio");
 
+                // Help menu (log folder + log path) — issue #524
+                help_menu(ctx, ui);
+
                 // Trailing controls right-aligned
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // Theme toggle (rightmost) — cycles ☀ → ☽ → A
@@ -97,4 +100,35 @@ pub fn toolbar(ctx: &egui::Context, state: &mut AppState) {
                 });
             });
         });
+}
+
+/// Help dropdown: reveal the log folder or copy the active log file path.
+/// Added for issue #524 (file-based logging for user troubleshooting).
+fn help_menu(ctx: &egui::Context, ui: &mut egui::Ui) {
+    ui.menu_button("Help", |ui| {
+        if ui.button("Open log folder").clicked() {
+            let file = crate::logging::log_file_path();
+            let dir = crate::logging::log_dir();
+            // `reveal` highlights the file in Finder/Explorer/Nautilus.
+            // On a fresh install the .log file may not exist yet, so fall
+            // back to opening the directory.
+            let reveal_result = if file.exists() {
+                opener::reveal(&file).map_err(|e| e.to_string())
+            } else {
+                Err("log file not yet created".to_string())
+            };
+            if let Err(err) = reveal_result {
+                tracing::warn!(error = %err, "opener::reveal failed; opening log dir");
+                if let Err(open_err) = opener::open(&dir) {
+                    tracing::error!(error = %open_err, "opener::open failed");
+                }
+            }
+            ui.close();
+        }
+        if ui.button("Copy log path").clicked() {
+            let path = crate::logging::log_file_path().display().to_string();
+            ctx.copy_text(path);
+            ui.close();
+        }
+    });
 }

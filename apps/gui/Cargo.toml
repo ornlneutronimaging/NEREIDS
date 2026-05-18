@@ -28,6 +28,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 rayon = { workspace = true }
 sysinfo = "0.33"
+dirs = { workspace = true }
+opener = { workspace = true }
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 # macOS app bundle configuration for cargo-bundle
 [package.metadata.bundle]

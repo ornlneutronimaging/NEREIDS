@@ -552,6 +552,7 @@ fn fetch_endf_data(state: &mut AppState) {
     state.status_message = "Fetching ENDF data...".into();
     let cancel = Arc::clone(&state.cancel_token);
 
+    tracing::info!(isotopes = work.len(), "spawning ENDF fetch (configure)");
     std::thread::spawn(move || design::endf_fetch_worker(work, cancel, tx));
 }
 
