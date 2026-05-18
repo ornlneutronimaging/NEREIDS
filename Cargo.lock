@@ -2959,6 +2959,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sysinfo",
+ "tempfile",
+ "time",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",

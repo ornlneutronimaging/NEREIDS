@@ -107,22 +107,13 @@ pub fn toolbar(ctx: &egui::Context, state: &mut AppState) {
 fn help_menu(ctx: &egui::Context, ui: &mut egui::Ui) {
     ui.menu_button("Help", |ui| {
         if ui.button("Open log folder").clicked() {
+            // Spawn off the GUI thread because `opener::reveal` on Linux
+            // does a synchronous D-Bus round-trip to the FileManager1
+            // interface, and even `opener::open` shells out — neither
+            // should block frame rendering.
             let file = crate::logging::log_file_path();
             let dir = crate::logging::log_dir();
-            // `reveal` highlights the file in Finder/Explorer/Nautilus.
-            // On a fresh install the .log file may not exist yet, so fall
-            // back to opening the directory.
-            let reveal_result = if file.exists() {
-                opener::reveal(&file).map_err(|e| e.to_string())
-            } else {
-                Err("log file not yet created".to_string())
-            };
-            if let Err(err) = reveal_result {
-                tracing::warn!(error = %err, "opener::reveal failed; opening log dir");
-                if let Err(open_err) = opener::open(&dir) {
-                    tracing::error!(error = %open_err, "opener::open failed");
-                }
-            }
+            std::thread::spawn(move || reveal_log_in_file_manager(&file, &dir));
             ui.close();
         }
         if ui.button("Copy log path").clicked() {
@@ -131,4 +122,23 @@ fn help_menu(ctx: &egui::Context, ui: &mut egui::Ui) {
             ui.close();
         }
     });
+}
+
+/// Reveal `file` in the platform file manager, falling back to opening
+/// the parent `dir` if reveal isn't possible. Runs on a detached worker
+/// thread to keep the GUI responsive.
+fn reveal_log_in_file_manager(file: &std::path::Path, dir: &std::path::Path) {
+    if file.exists() {
+        match opener::reveal(file) {
+            Ok(()) => return,
+            Err(err) => {
+                tracing::warn!(error = %err, "opener::reveal failed; falling back to open(dir)");
+            }
+        }
+    } else {
+        tracing::info!("today's log file not created yet; opening log directory");
+    }
+    if let Err(open_err) = opener::open(dir) {
+        tracing::error!(error = %open_err, "opener::open failed");
+    }
 }

@@ -236,17 +236,18 @@ nereids-pipeline      End-to-end orchestration, spatial mapping (rayon)
 ### Log files
 
 The NEREIDS desktop GUI (`nereids-gui`) writes daily-rotated log files
-to a platform-specific data directory, retaining the last 7 days:
+to a platform-specific data directory, retaining the last 7 days. Each
+day's file is named `nereids-gui.YYYY-MM-DD.log` (UTC date):
 
-| Platform | Path |
-|----------|------|
-| macOS    | `~/Library/Application Support/NEREIDS/logs/nereids-gui.log` |
-| Linux    | `~/.local/share/NEREIDS/logs/nereids-gui.log` (honours `$XDG_DATA_HOME`) |
-| Windows  | `%APPDATA%\NEREIDS\logs\nereids-gui.log` |
+| Platform | Log directory |
+|----------|---------------|
+| macOS    | `~/Library/Application Support/NEREIDS/logs/` |
+| Linux    | `~/.local/share/NEREIDS/logs/` (honours `$XDG_DATA_HOME`) |
+| Windows  | `%APPDATA%\NEREIDS\logs\` |
 
-From the running app, use **Help → Open log folder** (reveals the
-active log file in your platform's file manager) or **Help → Copy log
-path** to copy the path to the clipboard.
+From the running app, use **Help → Open log folder** (reveals today's
+log file in your platform's file manager) or **Help → Copy log path**
+to copy the full path to the clipboard.
 
 The default log level is `info`. Override with the `NEREIDS_LOG`
 environment variable (or the standard `RUST_LOG`), e.g.:

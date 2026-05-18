@@ -33,6 +33,10 @@ opener = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
+time = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 # macOS app bundle configuration for cargo-bundle
 [package.metadata.bundle]
