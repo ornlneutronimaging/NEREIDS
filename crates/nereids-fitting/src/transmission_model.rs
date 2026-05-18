@@ -5257,4 +5257,157 @@ mod tests {
             }
         }
     }
+
+    /// In-tree regression for the partial-GAL rank-1 approximation in
+    /// the presence of a non-trivial resolution kernel.  Issue #499.
+    ///
+    /// **Motivation.**  The empirical bound supporting the post-#489
+    /// default flip to `PartialGal` was measured on real VENUS Hf
+    /// 120-min KL+per-iso+TZERO 4×4 data: 15 of 16 fitted pixels landed
+    /// within 0.1·σ_Fisher of the FD2 reference for the L_scale
+    /// column.  That measurement lives in `.research/489_rust_validation/`
+    /// (gitignored), and uses the production USR/FTS tabulated
+    /// resolution kernel that ORNL release policy keeps out of the
+    /// repository.  Without an in-tree analogue, a future refactor
+    /// could silently regress the rank-1 bound on real workloads.
+    ///
+    /// **Synthetic stand-in.**  This test exercises the same code path
+    /// with a sharp Gaussian "resonance" cross-section convolved by a
+    /// Gaussian resolution kernel — a deliberately rough stand-in for
+    /// the SAMMY-format tabulated VENUS USR/FTS kernel.  The Gaussian
+    /// kernel is *not* a fidelity replacement; it is the simplest
+    /// non-trivial resolution operator that activates the partial-GAL
+    /// resolution-bearing branch without introducing a binary fixture.
+    ///
+    /// **Tolerance.**  Density and t0 columns retain the same tight
+    /// bound as the no-resolution test (the resolution operator does
+    /// not couple into those columns differently).  The L_scale column
+    /// is checked via relative L₂ norm against the FD2 reference with
+    /// tolerance `PARTIAL_GAL_REL_L2_TOLERANCE = 1e-2`.  On the
+    /// synthetic grid below the measured relative L₂ is `~6.4e-10`
+    /// (FD truncation-noise floor, not a true rank-1 residual — the
+    /// Gaussian kernel is mild enough that the rank-1 identity is
+    /// effectively exact here).  The tolerance is kept at 1e-2 as the
+    /// loose regression bound documented in #499; tightening below
+    /// 1e-2 is a future empirical question (the appropriate value
+    /// depends on the kernel shape and cross-section spikiness, which
+    /// vary across real workloads) and is explicitly out of scope.
+    /// The measured relative L₂ surfaces in the assert message if the
+    /// bound is ever exceeded so future tightening is straightforward.
+    #[test]
+    fn partial_gal_with_resolution_matches_fd2() {
+        use nereids_physics::resolution::{ResolutionFunction, ResolutionParams};
+
+        // Tolerance for relative L₂ error on the L_scale column.
+        // Measured rel L₂ on this synthetic grid is ~6.4e-10 — eight
+        // orders of magnitude below the bound — so 1e-2 is a loose
+        // regression guardrail.  See rustdoc above for why this is
+        // kept at 1e-2 rather than tightened (kernel-dependence of
+        // the real-workload bound is future empirical work).
+        const PARTIAL_GAL_REL_L2_TOLERANCE: f64 = 1e-2;
+
+        // 64-point uniform energy grid spanning 4.0–36.0 eV.
+        let n: usize = 64;
+        let e_lo = 4.0_f64;
+        let e_hi = 36.0_f64;
+        let step = (e_hi - e_lo) / (n as f64 - 1.0);
+        let energies: Vec<f64> = (0..n).map(|i| e_lo + (i as f64) * step).collect();
+
+        // Synthetic "spiky" cross-section: 1 + 10 * exp(-(E - 20)² / 4).
+        // Gaussian "resonance" centred at 20 eV with σ² = 2 (FWHM ≈ 3.33 eV).
+        let xs_vec: Vec<f64> = energies
+            .iter()
+            .map(|&e| {
+                let d = e - 20.0;
+                1.0 + 10.0 * (-(d * d) / 4.0).exp()
+            })
+            .collect();
+        let xs = vec![xs_vec];
+
+        // Gaussian resolution kernel — same constructor as the existing
+        // resolution-bearing tests (lines 4215+).  The numerical values
+        // (25.0, 0.5, 0.005, 0.0) come from the existing test fixtures
+        // and represent a "VENUS-like" Gaussian profile width.
+        let instrument = Some(Arc::new(InstrumentParams {
+            resolution: ResolutionFunction::Gaussian(
+                ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
+            ),
+        }));
+
+        // Pin FD2 first so the comparison is independent of the
+        // process-global `NEREIDS_TZERO_JACOBIAN` env var, matching
+        // the pattern used by `partial_gal_no_resolution_matches_fd2`.
+        let mut model = EnergyScaleTransmissionModel::new(
+            std::sync::Arc::new(xs),
+            std::sync::Arc::new(vec![0]),
+            energies.clone(),
+            25.0,
+            1, // t0_index
+            2, // l_scale_index
+            instrument,
+        )
+        .with_jacobian_method(EnergyScaleJacobianMethod::FiniteDifference);
+
+        let params = [0.1, 0.05, 1.002]; // density, t0, l_scale
+        let free = vec![0, 1, 2];
+
+        // FD2 reference Jacobian (explicitly pinned above).
+        let jac_fd2 = model
+            .analytical_jacobian(&params, &free, &model.evaluate(&params).unwrap())
+            .expect("FD2 Jacobian should be available with resolution kernel");
+
+        // Flip to partial-GAL.
+        model = model.with_jacobian_method(EnergyScaleJacobianMethod::PartialGal);
+        let jac_pg = model
+            .analytical_jacobian(&params, &free, &model.evaluate(&params).unwrap())
+            .expect("partial-GAL Jacobian should be available with resolution kernel");
+
+        // Density column: tight bound — resolution doesn't change the
+        // density derivative path.
+        for i in 0..energies.len() {
+            let fd2 = jac_fd2.get(i, 0);
+            let pg = jac_pg.get(i, 0);
+            let abs_err = (fd2 - pg).abs();
+            let rel_err = abs_err / fd2.abs().max(1e-15);
+            assert!(
+                rel_err < 1e-3 || abs_err < 1e-8,
+                "density bin {i}: fd2={fd2:.6e} pg={pg:.6e} rel={rel_err:.2e}"
+            );
+        }
+
+        // t0 column: tight bound — both methods use the same FD pair
+        // on t0 (partial-GAL just hoists it out of the per-coord loop).
+        for i in 0..energies.len() {
+            let fd2 = jac_fd2.get(i, 1);
+            let pg = jac_pg.get(i, 1);
+            let abs_err = (fd2 - pg).abs();
+            let rel_err = abs_err / fd2.abs().max(1e-15);
+            assert!(
+                rel_err < 1e-3 || abs_err < 1e-8,
+                "t0 bin {i}: fd2={fd2:.6e} pg={pg:.6e} rel={rel_err:.2e}"
+            );
+        }
+
+        // L_scale column: relative L₂ norm bound.  In the presence of
+        // a non-trivial resolution kernel the rank-1 identity is no
+        // longer exact; the resolution operator introduces an
+        // additional (t0, L_scale)-dependence that partial-GAL
+        // approximates as zero.  The bound captures the residual.
+        let mut num_sq = 0.0_f64;
+        let mut den_sq = 0.0_f64;
+        for i in 0..energies.len() {
+            let fd2 = jac_fd2.get(i, 2);
+            let pg = jac_pg.get(i, 2);
+            let diff = pg - fd2;
+            num_sq += diff * diff;
+            den_sq += fd2 * fd2;
+        }
+        let rel_l2 = (num_sq / den_sq.max(1e-30)).sqrt();
+        assert!(
+            rel_l2 < PARTIAL_GAL_REL_L2_TOLERANCE,
+            "L_scale rel L₂ = {rel_l2:.4e} exceeds tolerance {tol:.4e}; \
+             tighten or loosen `PARTIAL_GAL_REL_L2_TOLERANCE` (see rustdoc)",
+            tol = PARTIAL_GAL_REL_L2_TOLERANCE,
+        );
+    }
 }
