@@ -1,0 +1,70 @@
+# Symbols exported by bindings/python/python/nereids/__init__.pyi but not
+# narratively documented in docs/guide/src/python-api.md.  Each entry should
+# be revisited at release time — prefer moving entries OUT of this file by
+# documenting them, rather than letting it grow unboundedly.
+#
+# Format: one symbol per line; `#` starts a comment line; blank lines OK.
+# An entry being in this file means the drift gate
+# (scripts/check_python_api_drift.py) will not fail when the symbol is
+# absent from python-api.md.  See issue #533 for the rationale.
+
+# ---------------------------------------------------------------------------
+# Documented narratively in docs/guide/src/data-io.md instead
+# (TIFF/NeXus loaders, normalization, NeXus probe metadata).
+# ---------------------------------------------------------------------------
+probe_nexus
+normalize
+NexusMetadata
+
+# ---------------------------------------------------------------------------
+# Low-level physics building blocks — covered by the auto-generated pdoc
+# reference (/python/) and partially by docs/guide/src/physics.md, but with
+# no dedicated section in the curated python-api.md narrative yet.
+# ---------------------------------------------------------------------------
+cross_sections
+beer_lambert
+doppler_broaden
+resolution_broaden
+apply_resolution
+precompute_cross_sections
+
+# ---------------------------------------------------------------------------
+# Tabulated resolution helper class returned by load_resolution(...); the
+# load_resolution function IS referenced from python-api.md but the result
+# class itself has no narrative section.
+# ---------------------------------------------------------------------------
+TabulatedResolution
+
+# ---------------------------------------------------------------------------
+# Energy-axis calibration API (calibrate_energy + CalibrationResult); no
+# dedicated narrative section yet — pdoc reference covers the signature.
+# ---------------------------------------------------------------------------
+calibrate_energy
+CalibrationResult
+
+# ---------------------------------------------------------------------------
+# Trace-detectability API — used in quickstart-python.md but not given a
+# dedicated section in the curated python-api.md narrative.
+# ---------------------------------------------------------------------------
+trace_detectability
+trace_detectability_survey
+TraceDetectabilityReport
+
+# ---------------------------------------------------------------------------
+# Isotope-group helpers — referenced indirectly via `groups=[...]` rows in
+# the fitting tables but the IsotopeGroup class itself has no section yet.
+# ---------------------------------------------------------------------------
+IsotopeGroup
+
+# ---------------------------------------------------------------------------
+# Dead-pixel detection helper; partially covered by the spatial-mapping
+# "dead_pixels=" kwarg, but the detector itself has no section yet.
+# ---------------------------------------------------------------------------
+detect_dead_pixels
+
+# ---------------------------------------------------------------------------
+# Research-only Jacobian/Fisher evaluator (memo 38 follow-up work); no
+# narrative section yet — pdoc reference covers the signature.
+# ---------------------------------------------------------------------------
+compute_model_jacobian
+ModelJacobianResult
