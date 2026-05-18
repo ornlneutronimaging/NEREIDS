@@ -71,6 +71,7 @@ h5py = ">=3.15.1,<4"
 pandas = ">=3.0.1,<4"
 scipy = ">=1.17.1,<2"
 pdoc = ">=14"
+mdbook = ">=0.5,<0.6"
 
 [tool.pixi.pypi-dependencies]
 # fastmcp removed from default env — causes importlib-metadata conflict
@@ -92,7 +93,7 @@ lint = { depends-on = ["lint-fmt", "lint-clippy"], description = "Run all linter
 gui = { cmd = "cargo run --release -p nereids-gui", description = "Run the GUI application (release)" }
 gui-debug = { cmd = "cargo run -p nereids-gui", description = "Run the GUI application (debug)" }
 gui-bundle = { cmd = "cargo bundle --release", cwd = "apps/gui", description = "Bundle the GUI as a macOS .app" }
-doc-guide = { cmd = "mdbook build", cwd = "docs/guide", description = "Build the mdBook user guide (requires: cargo install mdbook)" }
+doc-guide = { cmd = "mdbook build", cwd = "docs/guide", description = "Build the mdBook user guide (mdbook is provided by the pixi env)" }
 doc-api = { cmd = "cargo doc --workspace --no-deps --exclude nereids-python", description = "Build rustdoc API reference" }
 doc-python = { cmd = "pdoc -o target/book/python --no-show-source nereids", depends-on = ["build", "doc-guide"], description = "Build Python API reference via pdoc (imports the installed nereids wheel; depends on doc-guide so mdBook's destination-dir clear cannot wipe target/book/python/)" }
 doc-build = { cmd = "cp -r target/doc target/book/api", depends-on = ["doc-guide", "doc-api", "doc-python"], description = "Build full docs site (mdBook + rustdoc + Python API)" }
