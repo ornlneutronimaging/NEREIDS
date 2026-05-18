@@ -66,6 +66,9 @@ counts-domain likelihood.
 
 ## NeXus Histogram Loading
 
+For agent-orchestrated NeXus workflows driven by a manifest, see
+[MCP Server](./mcp-server.md). This section covers the raw-Python loader.
+
 Use `probe_nexus(...)` to inspect a file without loading full data:
 
 ```python
