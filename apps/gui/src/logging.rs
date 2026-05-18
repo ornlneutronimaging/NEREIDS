@@ -53,7 +53,7 @@ pub fn log_dir() -> PathBuf {
 }
 
 /// Pure variant of [`log_dir`] that takes the base data directory as a
-/// parameter — used by tests so they can point at a [`tempfile::TempDir`]
+/// parameter — used by tests so they can point at a `tempfile::TempDir`
 /// instead of mutating the dev's real user-data folder, and by [`init`]
 /// so a creation failure can be surfaced through the post-init log.
 ///
