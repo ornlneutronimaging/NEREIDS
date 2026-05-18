@@ -69,9 +69,13 @@ def collect_documented_symbols(doc_path: Path, candidates: set[str]) -> set[str]
 
 
 def load_allowlist(path: Path) -> set[str]:
-    """Read one-symbol-per-line allowlist; ``#`` and blank lines are ignored."""
-    if not path.exists():
-        return set()
+    """Read one-symbol-per-line allowlist; ``#`` and blank lines are ignored.
+
+    The file is treated as a required input (see ``main``); callers
+    should verify ``path.exists()`` upstream so a missing/renamed
+    allowlist is reported via exit code 2 rather than silently
+    behaving as an empty set.
+    """
     entries: set[str] = set()
     for raw in path.read_text(encoding="utf-8").splitlines():
         line = raw.split("#", 1)[0].strip()
@@ -82,7 +86,7 @@ def load_allowlist(path: Path) -> set[str]:
 
 def main() -> int:
     argparse.ArgumentParser(description=__doc__).parse_args()
-    for required in (STUB_PATH, DOC_PATH):
+    for required in (STUB_PATH, DOC_PATH, ALLOWLIST_PATH):
         if not required.exists():
             print(f"error: required input missing: {required}", file=sys.stderr)
             return 2

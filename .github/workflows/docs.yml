@@ -21,6 +21,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Fail fast on drift between the PyO3 type stubs and the curated
+      # python-api.md page (issue #533).  The script is stdlib-only;
+      # running it BEFORE the (slow) rust + mdbook + pixi setup avoids
+      # paying ~1 min of environment-install cost when the drift gate
+      # fails.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Check curated Python API page is in sync with .pyi stubs
+        run: python scripts/check_python_api_drift.py
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
@@ -38,14 +49,6 @@ jobs:
         uses: prefix-dev/setup-pixi@v0.9.4
         with:
           run-install: true
-
-      # Fail fast on drift between the PyO3 type stubs and the curated
-      # python-api.md page (issue #533).  The script is stdlib-only, so
-      # no extra deps are pulled in.  Runs before the (slow) site build
-      # so reviewers get the drift signal even if the build step itself
-      # would have failed.
-      - name: Check curated Python API page is in sync with .pyi stubs
-        run: pixi run lint-docs
 
       # Drive the entire docs build through the `doc-build` pixi task. It
       # orchestrates `doc-guide` (mdBook), `doc-api` (cargo doc), and
