@@ -1,0 +1,41 @@
+# Codecov configuration for NEREIDS.
+# See https://docs.codecov.com/docs/codecov-yaml.
+#
+# Excluded paths
+# --------------
+# `apps/gui/**` — the egui desktop application is dominated by UI
+# button handlers, eframe lifecycle, panic hooks and global-state
+# plumbing that aren't realistically unit-testable without a
+# dedicated egui test harness (out of scope for the workspace today).
+# Pure helpers that ARE testable (e.g. date/path helpers in
+# `apps/gui/src/logging.rs`) still ship with unit tests and run as
+# part of `cargo test --workspace --exclude nereids-python` — their
+# results just don't roll up into codecov's project/patch numbers.
+# Re-include this path once an egui test harness lands.
+#
+# `bindings/python/**` is already excluded at the cargo level by the
+# coverage job (`cargo llvm-cov --workspace --exclude nereids-python`),
+# so it never reaches codecov in the first place — listed here only
+# for documentation completeness.
+#
+# Status thresholds
+# -----------------
+# `target: auto` means "no regression vs. the base commit". The 1 %
+# slack absorbs noise from refactors that move lines between files
+# without changing real test coverage; anything larger is a true drop
+# and should be investigated.
+
+ignore:
+  - "apps/gui/**"
+  - "bindings/python/**"
+
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 1%
+    patch:
+      default:
+        target: auto
+        threshold: 1%
