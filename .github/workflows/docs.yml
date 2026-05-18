@@ -39,6 +39,14 @@ jobs:
         with:
           run-install: true
 
+      # Fail fast on drift between the PyO3 type stubs and the curated
+      # python-api.md page (issue #533).  The script is stdlib-only, so
+      # no extra deps are pulled in.  Runs before the (slow) site build
+      # so reviewers get the drift signal even if the build step itself
+      # would have failed.
+      - name: Check curated Python API page is in sync with .pyi stubs
+        run: pixi run lint-docs
+
       # Drive the entire docs build through the `doc-build` pixi task. It
       # orchestrates `doc-guide` (mdBook), `doc-api` (cargo doc), and
       # `doc-python` (pdoc on the maturin-installed wheel), then `cp -r
