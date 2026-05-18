@@ -24,3 +24,11 @@ num-complex = { workspace = true }
 rayon = { workspace = true }
 microlp = { workspace = true }
 
+[dev-dependencies]
+# Integration tests under `tests/` are compiled as a separate crate
+# that links against the production build of `nereids-physics`, so
+# they cannot see items gated only by `#[cfg(test)]`.  Enabling the
+# `test-support` feature here exposes `resolution::test_support` to
+# the integration suite without leaking it into release builds.
+nereids-physics = { path = ".", features = ["test-support"] }
+

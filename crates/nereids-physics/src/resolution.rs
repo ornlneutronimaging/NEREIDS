@@ -2192,6 +2192,38 @@ pub mod test_support {
             flight_path_m,
         }
     }
+
+    /// Thin shim exposing the crate-internal
+    /// [`TabulatedResolution::broaden_presorted`] to integration
+    /// tests living under `crates/nereids-physics/tests/`.  The
+    /// internal method stays `pub(crate)` so the broader public
+    /// API surface (the operator-style `apply_resolution`,
+    /// `plan` / `apply` / `compile_to_matrix`) remains the
+    /// recommended entry point; this shim exists solely so the
+    /// fixture-gated bit-exact regression and microbenchmark
+    /// tests can call the optimized two-pointer walk directly.
+    pub fn broaden_presorted(
+        tab: &TabulatedResolution,
+        energies: &[f64],
+        spectrum: &[f64],
+    ) -> Vec<f64> {
+        tab.broaden_presorted(energies, spectrum)
+    }
+
+    /// Thin shim exposing the crate-internal
+    /// `TabulatedResolution::interpolated_kernel` to integration
+    /// tests.  Needed by the bit-exact equivalence oracle that
+    /// the fixture-gated regression test runs against the
+    /// optimized `broaden_presorted` path.
+    pub fn interpolated_kernel(tab: &TabulatedResolution, energy: f64) -> (Vec<f64>, Vec<f64>) {
+        tab.interpolated_kernel(energy)
+    }
+
+    /// The TOF↔energy conversion factor used by
+    /// `broaden_presorted` and its oracle.  Exposed so the
+    /// integration-test oracle uses the exact same constant as
+    /// the SUT, preserving bit-exact equivalence.
+    pub const TOF_FACTOR: f64 = super::TOF_FACTOR;
 }
 
 #[cfg(test)]
@@ -2802,62 +2834,16 @@ mod tests {
         assert_bit_exact(&reference, &actual, "random_spectrum");
     }
 
-    /// Real PLEIADES bl10 resolution file + real Hf-like resonance
-    /// spectrum on the full VENUS analysis grid.  This is the closest
-    /// regression of the production A.1 / B.2 workload.
-    ///
-    /// Marked `#[ignore]` because `_fts_bl10_0p5meV_1keV_25pts.txt` is
-    /// gitignored at the repo root per the "not approved for public
-    /// release" policy (.gitignore line 48).  Run locally with:
-    ///
-    /// ```text
-    /// cargo test -p nereids-physics \
-    ///   test_broaden_presorted_bit_exact_on_pleiades_resolution \
-    ///   -- --ignored --nocapture
-    /// ```
-    #[test]
-    #[ignore = "requires PLEIADES resolution file `_fts_bl10_0p5meV_1keV_25pts.txt` at repo root (gitignored by policy)"]
-    fn test_broaden_presorted_bit_exact_on_pleiades_resolution() {
-        let res_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("_fts_bl10_0p5meV_1keV_25pts.txt");
-        let text = std::fs::read_to_string(&res_path).expect(
-            "missing PLEIADES resolution file `_fts_bl10_0p5meV_1keV_25pts.txt` at the repo root \
-             (the file is gitignored per policy; place it locally before running this test)",
-        );
-        let tab = TabulatedResolution::from_text(&text, 25.0).unwrap();
+    // ---------------------------------------------------------------
+    // Fixture-gated regression test moved to
+    // `crates/nereids-physics/tests/venus_usr_resolution.rs`
+    // (`test_broaden_presorted_bit_exact_on_venus_usr`) — see issue
+    // #497.  The fixture (`_fts_bl10_0p5meV_1keV_25pts.txt`) is the
+    // VENUS instrument SAMMY-format tabulated resolution kernel; the
+    // integration test uses an early-return idiom keyed off
+    // `common::venus_usr_resolution_path()` instead of `#[ignore]`.
+    // ---------------------------------------------------------------
 
-        // Production-like grid: uniform 7..200 eV with ~3500 bins
-        let n = 3471;
-        let energies: Vec<f64> = (0..n)
-            .map(|i| 7.0 + i as f64 * ((200.0 - 7.0) / (n - 1) as f64))
-            .collect();
-        // Resonance-dip spectrum (toy model, exercises the math regardless
-        // of actual Hf σ, which is what we want for an interp test).
-        let spectrum: Vec<f64> = energies
-            .iter()
-            .map(|&e| {
-                1.0 - 0.8 * (-((e - 7.8).powi(2) / 0.01)).exp()
-                    - 0.5 * (-((e - 13.9).powi(2) / 0.04)).exp()
-                    - 0.6 * (-((e - 22.4).powi(2) / 0.1)).exp()
-            })
-            .collect();
-
-        let reference = broaden_presorted_reference(&tab, &energies, &spectrum);
-        let actual = tab.broaden_presorted(&energies, &spectrum);
-        assert_bit_exact(&reference, &actual, "pleiades_real_resolution");
-    }
-
-    /// Microbenchmark: two-pointer broaden_presorted vs binary-search
-    /// reference.  Run with:
-    ///
-    /// ```text
-    /// cargo test --release -p nereids-physics \
-    ///   test_broaden_presorted_bench -- --ignored --nocapture
-    /// ```
     #[test]
     fn test_plan_reuse_bit_exact_across_multiple_spectra() {
         // Core promise of ResolutionPlan: building the plan once and
@@ -3185,191 +3171,29 @@ mod tests {
         assert!(matches!(result, Err(ResolutionError::UnsortedEnergies)));
     }
 
-    #[test]
-    #[ignore = "microbenchmark; requires PLEIADES resolution file `_fts_bl10_0p5meV_1keV_25pts.txt` at repo root"]
-    fn test_broaden_presorted_bench() {
-        let res_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("_fts_bl10_0p5meV_1keV_25pts.txt");
-        let text = std::fs::read_to_string(&res_path).expect(
-            "missing PLEIADES resolution file at repo root (see `#[ignore]` message for details)",
-        );
-        let tab = TabulatedResolution::from_text(&text, 25.0).unwrap();
-
-        let n = 3471;
-        let energies: Vec<f64> = (0..n)
-            .map(|i| 7.0 + i as f64 * ((200.0 - 7.0) / (n - 1) as f64))
-            .collect();
-        let spectrum: Vec<f64> = energies
-            .iter()
-            .map(|&e| {
-                1.0 - 0.8 * (-((e - 7.8).powi(2) / 0.01)).exp()
-                    - 0.6 * (-((e - 22.4).powi(2) / 0.1)).exp()
-            })
-            .collect();
-
-        let repeats = 30;
-
-        let start = std::time::Instant::now();
-        let mut sink_ref = 0.0f64;
-        for _ in 0..repeats {
-            let r = broaden_presorted_reference(&tab, &energies, &spectrum);
-            sink_ref += r.iter().sum::<f64>();
-        }
-        let t_ref = start.elapsed();
-
-        let start = std::time::Instant::now();
-        let mut sink_new = 0.0f64;
-        for _ in 0..repeats {
-            let r = tab.broaden_presorted(&energies, &spectrum);
-            sink_new += r.iter().sum::<f64>();
-        }
-        let t_new = start.elapsed();
-
-        let speedup = t_ref.as_secs_f64() / t_new.as_secs_f64();
-        println!(
-            "broaden_presorted microbench (n_grid={n}, repeats={repeats}, 499-pt kernel):\n\
-             reference (binary search): {t_ref:?}  (sink={sink_ref:.3})\n\
-             two-pointer walk         : {t_new:?}  (sink={sink_new:.3})\n\
-             speedup                  : {speedup:.2}x"
-        );
-        assert_eq!(sink_ref.to_bits(), sink_new.to_bits());
-    }
-
-    /// Microbenchmark: plan-reuse path vs per-call `broaden_presorted`.
-    ///
-    /// This is the payoff the `plan()` + `ResolutionPlan::apply()` API
-    /// is designed to deliver: when broadening many spectra on the same
-    /// target grid (e.g., LM iterations with fixed TZERO, spatial maps
-    /// with pre-calibrated energies), building the plan once and
-    /// applying it N times beats rebuilding the plan internally on
-    /// every call.
-    ///
-    /// Run manually with:
-    ///
-    /// ```text
-    /// cargo test --release -p nereids-physics \
-    ///   test_plan_reuse_bench -- --ignored --nocapture
-    /// ```
-    #[test]
-    #[ignore = "microbenchmark; requires PLEIADES resolution file `_fts_bl10_0p5meV_1keV_25pts.txt` at repo root"]
-    fn test_plan_reuse_bench() {
-        let res_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("_fts_bl10_0p5meV_1keV_25pts.txt");
-        let text = std::fs::read_to_string(&res_path).expect(
-            "missing PLEIADES resolution file at repo root (see `#[ignore]` message for details)",
-        );
-        let tab = TabulatedResolution::from_text(&text, 25.0).unwrap();
-
-        let n = 3471;
-        let energies: Vec<f64> = (0..n)
-            .map(|i| 7.0 + i as f64 * ((200.0 - 7.0) / (n - 1) as f64))
-            .collect();
-
-        // Many spectra simulating an LM fit's sequence of evaluations.
-        let repeats = 100;
-        let mut state: u64 = 0xA5A5_A5A5_DEAD_BEEF;
-        let spectra: Vec<Vec<f64>> = (0..repeats)
-            .map(|_| {
-                energies
-                    .iter()
-                    .map(|&e| {
-                        state = state
-                            .wrapping_mul(6364136223846793005)
-                            .wrapping_add(1442695040888963407);
-                        let noise = ((state >> 33) as f64) / (u32::MAX as f64);
-                        1.0 - 0.8 * (-((e - 7.8).powi(2) / 0.01)).exp() + 1e-3 * noise
-                    })
-                    .collect()
-            })
-            .collect();
-
-        // Per-call path: same pipeline as today.  Build cost paid every call.
-        let start = std::time::Instant::now();
-        let mut sink_percall = 0.0f64;
-        for spec in &spectra {
-            let r = tab.broaden_presorted(&energies, spec);
-            sink_percall += r.iter().sum::<f64>();
-        }
-        let t_percall = start.elapsed();
-
-        // Plan-reuse path: one build, many applies.
-        let start = std::time::Instant::now();
-        let plan = tab.plan(&energies).expect("sorted grid must validate");
-        let t_build = start.elapsed();
-        let mut sink_plan = 0.0f64;
-        for spec in &spectra {
-            let r = plan.apply(spec);
-            sink_plan += r.iter().sum::<f64>();
-        }
-        let t_apply_total = start.elapsed() - t_build;
-
-        let speedup = t_percall.as_secs_f64() / (t_build + t_apply_total).as_secs_f64();
-        println!(
-            "plan-reuse microbench (n_grid={n}, {repeats} spectra, 499-pt kernel):\n\
-             per-call broaden_presorted : {t_percall:?}  (sink={sink_percall:.3})\n\
-             plan build (once)          : {t_build:?}\n\
-             apply × {repeats}          : {t_apply_total:?}\n\
-             total plan path            : {:?}  (sink={sink_plan:.3})\n\
-             speedup vs per-call        : {speedup:.2}x",
-            t_build + t_apply_total,
-        );
-        assert_eq!(sink_percall.to_bits(), sink_plan.to_bits());
-    }
+    // ---------------------------------------------------------------
+    // Fixture-gated microbenchmarks moved to
+    // `crates/nereids-physics/tests/venus_usr_resolution_microbench.rs`
+    // (`test_broaden_presorted_bench`, `test_plan_reuse_bench`,
+    // `resolution_matrix_apply_microbench`) — see issue #497.  They
+    // use the early-return idiom keyed off
+    // `common::venus_usr_resolution_path()` instead of `#[ignore]`.
+    // ---------------------------------------------------------------
 
     // ---------- ResolutionMatrix (CSR compile) tests ----------
     //
-    // Two tiers of tests:
+    // CI-hermetic synthetic tests — use hand-constructed
+    // `ResolutionPlan`s via `make_synthetic_plan`; no fixture
+    // dependency, run on every `cargo test` invocation.  Cover
+    // passthrough rows, `-0.0` sentinel rows, regular linear-interp
+    // rows, CSR invariants, and the non-finite contract exclusion.
     //
-    // 1. **CI-hermetic synthetic tests** — use hand-constructed
-    //    `ResolutionPlan`s via `make_synthetic_plan`; no fixture
-    //    dependency, run on every `cargo test` invocation.  Cover
-    //    passthrough rows, `-0.0` sentinel rows, regular
-    //    linear-interp rows, CSR invariants, and the non-finite
-    //    contract exclusion.
-    //
-    // 2. **Fixture-dependent tests** (`#[ignore]`) — require
-    //    `_fts_bl10_0p5meV_1keV_25pts.txt` at the repo root (a
-    //    gitignored PLEIADES file).  Cover end-to-end equivalence
-    //    against the production VENUS operator at realistic grid
-    //    sizes (512, 3471).  Run locally with `-- --ignored`.  Same
-    //    pattern as `test_broaden_presorted_bit_exact_on_pleiades_resolution`
-    //    already in this module.
-
-    /// Helper: build a TabulatedResolution + plan + matrix on a
-    /// uniform energy grid using the VENUS fixture kernel.  Only used
-    /// by `#[ignore]`d tests because the fixture file is gitignored
-    /// at the repo root per the "not approved for public release"
-    /// policy (.gitignore line 49).
-    fn build_fixture_plan_and_matrix(
-        n_grid: usize,
-    ) -> (Vec<f64>, ResolutionPlan, ResolutionMatrix) {
-        let res_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("_fts_bl10_0p5meV_1keV_25pts.txt");
-        let text = std::fs::read_to_string(&res_path).expect(
-            "missing PLEIADES resolution file `_fts_bl10_0p5meV_1keV_25pts.txt` at the repo root \
-             (the file is gitignored per policy; place it locally before running this test)",
-        );
-        let res =
-            TabulatedResolution::from_text(&text, 25.0).expect("parse VENUS resolution fixture");
-        let energies: Vec<f64> = (0..n_grid)
-            .map(|i| 7.0 + (200.0 - 7.0) * (i as f64) / ((n_grid - 1) as f64))
-            .collect();
-        let plan = res.plan(&energies).expect("build plan on sorted grid");
-        let matrix = plan.compile_to_matrix();
-        (energies, plan, matrix)
-    }
+    // Fixture-dependent end-to-end equivalence tests against the
+    // production VENUS USR operator (SAMMY-format kernel) at
+    // realistic grid sizes (512, 3471) live in
+    // `crates/nereids-physics/tests/venus_usr_resolution.rs` — see
+    // issue #497.  They use the early-return idiom keyed off
+    // `common::venus_usr_resolution_path()` instead of `#[ignore]`.
 
     /// Hybrid abs+rel tolerance used across equivalence tests.  Guards
     /// against the `a ≈ 0` trap where `a.abs().max(1e-300)` produces
@@ -3516,165 +3340,19 @@ mod tests {
         assert!(matches!(err, ResolutionError::LengthMismatch { .. }));
     }
 
-    /// End-to-end bit-level equivalence on the real VENUS kernel,
-    /// 512-point grid.  Gated on the PLEIADES fixture per the
-    /// established `#[ignore]` pattern in this module.
-    #[test]
-    #[ignore = "requires PLEIADES resolution file `_fts_bl10_0p5meV_1keV_25pts.txt` at repo root (gitignored by policy)"]
-    fn resolution_matrix_is_row_stochastic_on_venus_kernel() {
-        let (_energies, _plan, matrix) = build_fixture_plan_and_matrix(512);
-        for i in 0..matrix.len() {
-            let start = matrix.row_starts()[i] as usize;
-            let end = matrix.row_starts()[i + 1] as usize;
-            let row_sum: f64 = matrix.values()[start..end].iter().sum();
-            assert!(
-                (row_sum - 1.0).abs() < 1e-13,
-                "row {} sum = {} (expected 1.0 within 1e-13)",
-                i,
-                row_sum,
-            );
-        }
-    }
-
-    #[test]
-    #[ignore = "requires PLEIADES resolution file `_fts_bl10_0p5meV_1keV_25pts.txt` at repo root (gitignored by policy)"]
-    fn resolution_matrix_apply_equivalent_to_plan_apply_on_venus_kernel() {
-        let (_energies, plan, matrix) = build_fixture_plan_and_matrix(512);
-        let n_grid = matrix.len();
-        let spec: Vec<f64> = (0..n_grid)
-            .map(|i| {
-                let e = 7.0 + (200.0 - 7.0) * (i as f64) / ((n_grid - 1) as f64);
-                let sigma = 50.0 * (-((e - 80.0).powi(2)) / 8.0).exp()
-                    + 10.0 * (-((e - 150.0).powi(2)) / 4.0).exp();
-                (-1.6e-4 * sigma).exp()
-            })
-            .collect();
-        let plan_out = plan.apply(&spec);
-        let matrix_out = apply_r(&matrix, &spec);
-        let max_err = max_hybrid_err(&plan_out, &matrix_out);
-        assert!(
-            max_err < 1e-12,
-            "apply_r vs plan.apply max hybrid err = {:.3e} (expected < 1e-12)",
-            max_err,
-        );
-    }
-
-    /// Production-grid guardrail for the `1e-12` tolerance documented
-    /// on [`ResolutionPlan::compile_to_matrix`].  The 3471-bin VENUS
-    /// grid has ~82 entries per row, so accumulation error is an
-    /// order of magnitude larger than on the synthetic multi-row
-    /// tests above; this test pins the equivalence bound at
-    /// production scale so a future regression in either `apply` or
-    /// `apply_r` summation order fails loudly.  Logs the observed
-    /// `max_hybrid_err` via `eprintln!` so `-- --ignored --nocapture`
-    /// runs surface the actual headroom against the 1e-12 ceiling.
-    #[test]
-    #[ignore = "requires PLEIADES resolution file `_fts_bl10_0p5meV_1keV_25pts.txt` at repo root (gitignored by policy)"]
-    fn resolution_matrix_apply_equivalent_at_production_grid() {
-        let (_energies, plan, matrix) = build_fixture_plan_and_matrix(3471);
-        let n_grid = matrix.len();
-        // Same Beer-Lambert test spectrum as the 512-point test.
-        let spec: Vec<f64> = (0..n_grid)
-            .map(|i| {
-                let e = 7.0 + (200.0 - 7.0) * (i as f64) / ((n_grid - 1) as f64);
-                let sigma = 50.0 * (-((e - 80.0).powi(2)) / 8.0).exp()
-                    + 10.0 * (-((e - 150.0).powi(2)) / 4.0).exp();
-                (-1.6e-4 * sigma).exp()
-            })
-            .collect();
-        let plan_out = plan.apply(&spec);
-        let matrix_out = apply_r(&matrix, &spec);
-        let max_err = max_hybrid_err(&plan_out, &matrix_out);
-        eprintln!(
-            "3471-grid apply_r vs plan.apply observed max_hybrid_err = {:.3e} \
-             (ceiling 1e-12; theoretical bound ~1e-13 per row × 82 rows/entry)",
-            max_err,
-        );
-        assert!(
-            max_err < 1e-12,
-            "3471-grid apply_r vs plan.apply max hybrid err = {:.3e} (expected < 1e-12)",
-            max_err,
-        );
-    }
-
-    #[test]
-    #[ignore = "requires PLEIADES resolution file `_fts_bl10_0p5meV_1keV_25pts.txt` at repo root (gitignored by policy)"]
-    fn resolution_matrix_apply_equivalent_across_densities() {
-        let (_energies, plan, matrix) = build_fixture_plan_and_matrix(512);
-        let n_grid = matrix.len();
-        for &n_density in &[1e-5_f64, 1e-4, 1.6e-4, 1e-3] {
-            let spec: Vec<f64> = (0..n_grid)
-                .map(|i| {
-                    let e = 7.0 + (200.0 - 7.0) * (i as f64) / ((n_grid - 1) as f64);
-                    let sigma = 50.0 * (-((e - 80.0).powi(2)) / 8.0).exp()
-                        + 10.0 * (-((e - 150.0).powi(2)) / 4.0).exp();
-                    (-n_density * sigma).exp()
-                })
-                .collect();
-            let plan_out = plan.apply(&spec);
-            let matrix_out = apply_r(&matrix, &spec);
-            let max_err = max_hybrid_err(&plan_out, &matrix_out);
-            assert!(
-                max_err < 1e-12,
-                "density n={:.1e}: max hybrid err {:.3e} (expected < 1e-12)",
-                n_density,
-                max_err,
-            );
-        }
-    }
-
-    #[test]
-    #[ignore = "requires PLEIADES resolution file `_fts_bl10_0p5meV_1keV_25pts.txt` at repo root (gitignored by policy)"]
-    fn resolution_matrix_csr_column_indices_sorted_per_row() {
-        let (_energies, _plan, matrix) = build_fixture_plan_and_matrix(256);
-        for i in 0..matrix.len() {
-            let start = matrix.row_starts()[i] as usize;
-            let end = matrix.row_starts()[i + 1] as usize;
-            let row_cols = &matrix.col_indices()[start..end];
-            for w in row_cols.windows(2) {
-                assert!(
-                    w[0] < w[1],
-                    "row {} col_indices not strictly ascending: {:?}",
-                    i,
-                    row_cols,
-                );
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "requires PLEIADES resolution file `_fts_bl10_0p5meV_1keV_25pts.txt` at repo root (gitignored by policy)"]
-    fn resolution_matrix_grid_mismatch_detected() {
-        let (energies, _plan, matrix) = build_fixture_plan_and_matrix(128);
-        let spec = vec![1.0_f64; matrix.len()];
-
-        // Same grid → passes.
-        let ok = apply_resolution_with_matrix(&energies, &matrix, &spec);
-        assert!(ok.is_ok());
-
-        // Perturb one energy → MatrixGridMismatch with the
-        // offending index.
-        let mut mutated = energies.clone();
-        mutated[37] += 1e-12;
-        let err = apply_resolution_with_matrix(&mutated, &matrix, &spec)
-            .expect_err("grid mismatch must error");
-        assert_eq!(
-            err,
-            ResolutionError::MatrixGridMismatch {
-                first_diff_index: 37,
-            }
-        );
-    }
-
-    #[test]
-    #[ignore = "requires PLEIADES resolution file `_fts_bl10_0p5meV_1keV_25pts.txt` at repo root (gitignored by policy)"]
-    fn resolution_matrix_length_mismatch_detected() {
-        let (energies, _plan, matrix) = build_fixture_plan_and_matrix(64);
-        let short_spec = vec![1.0_f64; matrix.len() - 1];
-        let err = apply_resolution_with_matrix(&energies, &matrix, &short_spec)
-            .expect_err("length mismatch must error");
-        assert!(matches!(err, ResolutionError::LengthMismatch { .. }));
-    }
+    // ---------------------------------------------------------------
+    // Fixture-gated end-to-end VENUS USR equivalence tests moved to
+    // `crates/nereids-physics/tests/venus_usr_resolution.rs`
+    // (`resolution_matrix_is_row_stochastic_on_venus_kernel`,
+    //  `resolution_matrix_apply_equivalent_to_plan_apply_on_venus_kernel`,
+    //  `resolution_matrix_apply_equivalent_at_production_grid`,
+    //  `resolution_matrix_apply_equivalent_across_densities`,
+    //  `resolution_matrix_csr_column_indices_sorted_per_row`,
+    //  `resolution_matrix_grid_mismatch_detected`,
+    //  `resolution_matrix_length_mismatch_detected`) — see issue
+    // #497.  They use the early-return idiom keyed off
+    // `common::venus_usr_resolution_path()` instead of `#[ignore]`.
+    // ---------------------------------------------------------------
 
     #[test]
     fn resolution_matrix_empty_plan() {
@@ -3689,92 +3367,6 @@ mod tests {
         assert_eq!(matrix.len(), 0);
         assert!(matrix.is_empty());
         assert_eq!(matrix.nnz(), 0);
-    }
-
-    /// Microbenchmark: `apply_r` (ResolutionMatrix CSR) vs
-    /// `ResolutionPlan::apply`, 3471-bin VENUS production grid × 100
-    /// spectra. Exercised manually to decide whether the CSR compile +
-    /// CSR matvec beats the plan's two-pointer walk at the
-    /// no-SIMD-no-unsafe baseline promised in #473.
-    ///
-    /// Run manually with:
-    ///
-    /// ```text
-    /// cargo test --release -p nereids-physics \
-    ///   resolution_matrix_apply_microbench -- --ignored --nocapture
-    /// ```
-    #[test]
-    #[ignore = "microbenchmark; requires PLEIADES resolution file `_fts_bl10_0p5meV_1keV_25pts.txt` at repo root"]
-    fn resolution_matrix_apply_microbench() {
-        let res_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("_fts_bl10_0p5meV_1keV_25pts.txt");
-        let text = std::fs::read_to_string(&res_path).expect(
-            "missing PLEIADES resolution file at repo root (see `#[ignore]` message for details)",
-        );
-        let tab = TabulatedResolution::from_text(&text, 25.0).unwrap();
-
-        let n = 3471_usize;
-        let energies: Vec<f64> = (0..n)
-            .map(|i| 7.0 + i as f64 * ((200.0 - 7.0) / (n - 1) as f64))
-            .collect();
-        let plan = tab.plan(&energies).expect("sorted grid must validate");
-
-        let t_compile = std::time::Instant::now();
-        let matrix = plan.compile_to_matrix();
-        let t_compile = t_compile.elapsed();
-
-        let spec: Vec<f64> = energies
-            .iter()
-            .map(|&e| {
-                let sigma = 50.0 * (-((e - 80.0).powi(2)) / 8.0).exp()
-                    + 10.0 * (-((e - 150.0).powi(2)) / 4.0).exp();
-                (-1.6e-4 * sigma).exp()
-            })
-            .collect();
-
-        let repeats = 100_usize;
-
-        // Warm both paths so the first call's cache-miss latency
-        // does not skew the micro-times.
-        for _ in 0..5 {
-            let _ = plan.apply(&spec);
-            let _ = apply_r(&matrix, &spec);
-        }
-
-        let start = std::time::Instant::now();
-        let mut sink_plan = 0.0f64;
-        for _ in 0..repeats {
-            sink_plan += plan.apply(&spec).iter().sum::<f64>();
-        }
-        let t_plan = start.elapsed();
-
-        let start = std::time::Instant::now();
-        let mut sink_matrix = 0.0f64;
-        for _ in 0..repeats {
-            sink_matrix += apply_r(&matrix, &spec).iter().sum::<f64>();
-        }
-        let t_matrix = start.elapsed();
-
-        let speedup = t_plan.as_secs_f64() / t_matrix.as_secs_f64();
-        println!(
-            "ResolutionMatrix microbench (n_grid={n}, {repeats} spectra):\n\
-             compile (once)       : {:?}  ({} nnz)\n\
-             plan.apply × {repeats} : {:?}\n\
-             apply_r   × {repeats} : {:?}\n\
-             speedup vs plan      : {:.2}x\n\
-             sinks (plan/matrix)  : {:.6e} / {:.6e}",
-            t_compile,
-            matrix.nnz(),
-            t_plan,
-            t_matrix,
-            speedup,
-            sink_plan,
-            sink_matrix,
-        );
     }
 
     /// Hand-construct a `ResolutionPlan` that deliberately exercises
