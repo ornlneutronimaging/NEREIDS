@@ -3609,19 +3609,19 @@ fn py_fit_counts_spectrum_typed<'py>(
         anorm: result.anorm,
         background: result.background,
         // BackD / BackF are only meaningful when the polynomial background
-        // model was actually attached (the `if background { ... }` block
-        // above never runs when `background=False`, so `result.back_d` and
-        // `result.back_f` are sentinel zeros from the inner Rust
-        // `FitResult`).  Reporting them in that case falsely tells MCP
-        // consumers the exponential tail was fitted, so we gate on both
-        // `background` AND the per-term flag.
+        // model was actually attached.  Issue #538 (PR #548 round-2 review):
+        // `result.back_d` / `result.back_f` are now `Option<f64>` (None when
+        // the inner Rust fit didn't fit the exponential tail).  The outer
+        // gate on `background && fit_back_d` is defensive — it ensures
+        // PyFitResult.back_d is None whenever the caller didn't request the
+        // tail, regardless of any future change to the inner Rust contract.
         back_d: if background && fit_back_d {
-            Some(result.back_d)
+            result.back_d
         } else {
             None
         },
         back_f: if background && fit_back_f {
-            Some(result.back_f)
+            result.back_f
         } else {
             None
         },
@@ -4117,19 +4117,19 @@ fn py_fit_spectrum_typed<'py>(
         anorm: result.anorm,
         background: result.background,
         // BackD / BackF are only meaningful when the polynomial background
-        // model was actually attached (the `if background { ... }` block
-        // above never runs when `background=False`, so `result.back_d` and
-        // `result.back_f` are sentinel zeros from the inner Rust
-        // `FitResult`).  Reporting them in that case falsely tells MCP
-        // consumers the exponential tail was fitted, so we gate on both
-        // `background` AND the per-term flag.
+        // model was actually attached.  Issue #538 (PR #548 round-2 review):
+        // `result.back_d` / `result.back_f` are now `Option<f64>` (None when
+        // the inner Rust fit didn't fit the exponential tail).  The outer
+        // gate on `background && fit_back_d` is defensive — it ensures
+        // PyFitResult.back_d is None whenever the caller didn't request the
+        // tail, regardless of any future change to the inner Rust contract.
         back_d: if background && fit_back_d {
-            Some(result.back_d)
+            result.back_d
         } else {
             None
         },
         back_f: if background && fit_back_f {
-            Some(result.back_f)
+            result.back_f
         } else {
             None
         },

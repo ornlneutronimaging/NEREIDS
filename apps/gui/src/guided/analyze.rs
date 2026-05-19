@@ -1132,12 +1132,16 @@ fn selected_pixel_fit_result_for_overlay(
             .map(|map| map[[y, x]]),
         anorm: result.anorm_map.as_ref().map_or(1.0, |map| map[[y, x]]),
         background,
-        // Issue #538: when the spatial pipeline fit BackD/BackF
-        // per pixel, surface the value at (y, x); otherwise fall
-        // back to the sentinel `0.0` that `SpectrumFitResult.back_d`
-        // / `back_f` carry when the exponential tail was not fit.
-        back_d: result.back_d_map.as_ref().map_or(0.0, |map| map[[y, x]]),
-        back_f: result.back_f_map.as_ref().map_or(0.0, |map| map[[y, x]]),
+        // Issue #538 (PR #548 round-2 review): `SpectrumFitResult.back_d`
+        // / `back_f` are `Option<f64>` (None = "not fit").  Mapping
+        // `back_d_map` / `back_f_map` to `Option<f64>` here preserves
+        // the distinction across snapshot reload: when the maps are
+        // `None` (reload, or fit_back_d=false), the overlay carries
+        // `None`, and the curve renderer in `widgets::design::build_fit_line`
+        // drops the exponential-tail term rather than rendering a
+        // misleading 0.0-sentinel contribution.
+        back_d: result.back_d_map.as_ref().map(|map| map[[y, x]]),
+        back_f: result.back_f_map.as_ref().map(|map| map[[y, x]]),
         t0_us: result.t0_us_map.as_ref().map(|map| map[[y, x]]),
         l_scale: result.l_scale_map.as_ref().map(|map| map[[y, x]]),
         deviance_per_dof: result.deviance_per_dof_map.as_ref().map(|map| map[[y, x]]),

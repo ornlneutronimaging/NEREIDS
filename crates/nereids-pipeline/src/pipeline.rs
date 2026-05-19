@@ -1653,8 +1653,12 @@ fn fit_counts_joint_poisson(
         temperature_k_unc,
         anorm: anorm_out,
         background: bg_abc_out,
-        back_d: 0.0,
-        back_f: 0.0,
+        // Issue #538 (PR #548 round-2 review): joint-Poisson never fits
+        // the exponential tail.  `None` signals "tail not fit" to
+        // downstream consumers (GUI overlay curve drops the exponential
+        // term; PyO3 conversion passes through to Python as `None`).
+        back_d: None,
+        back_f: None,
         t0_us: energy_scale_indices.map(|(t0_idx, _)| result.params[t0_idx]),
         l_scale: energy_scale_indices.map(|(_, ls_idx)| result.params[ls_idx]),
         deviance_per_dof: Some(result.deviance_per_dof),
@@ -2021,22 +2025,26 @@ fn extract_result(
 ) -> Result<SpectrumFitResult, PipelineError> {
     let densities: Vec<f64> = (0..n_density_params).map(|i| result.params[i]).collect();
 
-    let (anorm, background, back_d, back_f) = if let Some(bi) = bg_indices {
-        let bd = bi.back_d.map_or(0.0, |i| result.params[i]);
-        let bf = bi.back_f.map_or(0.0, |i| result.params[i]);
-        (
-            result.params[bi.anorm],
-            [
-                result.params[bi.back_a],
-                result.params[bi.back_b],
-                result.params[bi.back_c],
-            ],
-            bd,
-            bf,
-        )
-    } else {
-        (1.0, [0.0, 0.0, 0.0], 0.0, 0.0)
-    };
+    let (anorm, background, back_d, back_f): (f64, [f64; 3], Option<f64>, Option<f64>) =
+        if let Some(bi) = bg_indices {
+            // Issue #538 (PR #548 round-2 review): `Option<f64>`
+            // distinguishes "exponential tail not fit" (None) from
+            // "fit produced zero" (Some(0.0)) — was a 0.0 sentinel.
+            let bd = bi.back_d.map(|i| result.params[i]);
+            let bf = bi.back_f.map(|i| result.params[i]);
+            (
+                result.params[bi.anorm],
+                [
+                    result.params[bi.back_a],
+                    result.params[bi.back_b],
+                    result.params[bi.back_c],
+                ],
+                bd,
+                bf,
+            )
+        } else {
+            (1.0, [0.0, 0.0, 0.0], None, None)
+        };
 
     let (uncertainties, temperature_k, temperature_k_unc) = if result.converged {
         match &result.uncertainties {
@@ -2463,11 +2471,20 @@ pub struct SpectrumFitResult {
     /// pipeline emits `[0.0, 0.0, 0.0]`.
     pub background: [f64; 3],
     /// Fitted exponential background amplitude (SAMMY BackD).
-    /// Zero when the exponential tail is not fitted.
-    pub back_d: f64,
+    /// `None` when the exponential tail is not fitted; `Some(value)`
+    /// when the LM transmission background was active with
+    /// `fit_back_d=true`.  Mirrors [`Self::t0_us`] /
+    /// [`Self::l_scale`] semantics so the GUI overlay can
+    /// distinguish "unfit" from "fitted to zero" without an ambiguous
+    /// `0.0` sentinel (issue #538, PR #548 round-2 review).
+    pub back_d: Option<f64>,
     /// Fitted exponential background decay constant (SAMMY BackF).
-    /// Zero when the exponential tail is not fitted.
-    pub back_f: f64,
+    /// `None` when the exponential tail is not fitted; `Some(value)`
+    /// when the LM transmission background was active with
+    /// `fit_back_f=true`.  Paired with [`Self::back_d`] — SAMMY
+    /// requires both flags toggled together (see
+    /// `validate_transmission_background`).
+    pub back_f: Option<f64>,
     /// Fitted TOF offset in microseconds (SAMMY TZERO t₀).
     /// `None` when energy-scale fitting is not enabled.
     pub t0_us: Option<f64>,

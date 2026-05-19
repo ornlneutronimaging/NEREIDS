@@ -335,22 +335,26 @@ pub fn spatial_map_typed(
         // BackF's Jacobian column zeros out at BackD ≈ 0 (and BackD
         // becomes a constant duplicate of BackA at BackF ≈ 0).  Reject
         // non-positive initial values so the LM solver does not silently
-        // produce all-NaN maps via a degenerate Jacobian.
-        if bg.fit_back_d && bg.back_d_init <= 0.0 {
+        // produce all-NaN maps via a degenerate Jacobian.  Round-2
+        // Codex review: also reject `NaN` / `+inf` — both pass `<= 0.0`
+        // checks (NaN comparisons are always false; +inf is > 0) but
+        // propagate into the fit parameters and silently corrupt the
+        // result.
+        if bg.fit_back_d && (!bg.back_d_init.is_finite() || bg.back_d_init <= 0.0) {
             return Err(PipelineError::InvalidParameter(format!(
-                "transmission_background.back_d_init must be strictly positive when \
-                 fit_back_d=true (got {}). BackF's Jacobian column zeros out at \
-                 BackD ≈ 0; non-positive initial values produce a degenerate fit that \
-                 LM cannot recover.",
+                "transmission_background.back_d_init must be finite and strictly \
+                 positive when fit_back_d=true (got {}). BackF's Jacobian column \
+                 zeros out at BackD ≈ 0; non-finite or non-positive initial values \
+                 produce a degenerate fit that LM cannot recover.",
                 bg.back_d_init,
             )));
         }
-        if bg.fit_back_f && bg.back_f_init <= 0.0 {
+        if bg.fit_back_f && (!bg.back_f_init.is_finite() || bg.back_f_init <= 0.0) {
             return Err(PipelineError::InvalidParameter(format!(
-                "transmission_background.back_f_init must be strictly positive when \
-                 fit_back_f=true (got {}). BackD becomes a constant duplicate of BackA \
-                 at BackF ≈ 0; non-positive initial values produce a degenerate fit \
-                 that LM cannot recover.",
+                "transmission_background.back_f_init must be finite and strictly \
+                 positive when fit_back_f=true (got {}). BackD becomes a constant \
+                 duplicate of BackA at BackF ≈ 0; non-finite or non-positive initial \
+                 values produce a degenerate fit that LM cannot recover.",
                 bg.back_f_init,
             )));
         }
@@ -1158,18 +1162,22 @@ pub fn spatial_map_typed(
             bg_maps[1][[*y, *x]] = result.background[1];
             bg_maps[2][[*y, *x]] = result.background[2];
         }
-        // Issue #538: the per-pixel `SpectrumFitResult` always carries
-        // `back_d`/`back_f` as `f64` (sentinel `0.0` when the bg model
-        // never fit them); the spatial result only materialises the
-        // maps when the LM transmission background actually fit them,
-        // matching the gating already enforced for `has_back_d_map` /
-        // `has_back_f_map` above.  No further `is_some`-style gate on
-        // the per-pixel result is needed.
+        // Issue #538 (PR #548 round-2 review): per-pixel
+        // `SpectrumFitResult` carries `back_d` / `back_f` as
+        // `Option<f64>` (None when the bg model never fit the
+        // exponential tail).  The spatial result only materialises the
+        // maps when the LM transmission background actually fit them
+        // (gated above via `has_back_d_map` / `has_back_f_map`), so a
+        // converged pixel here should always carry `Some(value)`.
+        // Fall back to NaN for the rare case of None at a converged
+        // pixel — that surfaces an upstream bug via the
+        // NaN-on-failure contract rather than a misleading sentinel
+        // `0.0`.
         if let Some(ref mut map) = back_d_map {
-            map[[*y, *x]] = result.back_d;
+            map[[*y, *x]] = result.back_d.unwrap_or(f64::NAN);
         }
         if let Some(ref mut map) = back_f_map {
-            map[[*y, *x]] = result.back_f;
+            map[[*y, *x]] = result.back_f.unwrap_or(f64::NAN);
         }
         if let (Some(map), Some(v)) = (&mut t0_us_map, result.t0_us) {
             map[[*y, *x]] = v;
@@ -2256,6 +2264,84 @@ mod tests {
         assert!(
             err.to_string().contains("back_f_init"),
             "error must reference back_f_init, got: {err}"
+        );
+    }
+
+    /// Issue #538 P1 (#548 round-2 review): NaN `back_d_init` is
+    /// rejected up-front.  Without the `is_finite()` guard, NaN passes
+    /// the `<= 0.0` check (NaN comparisons are always false) and
+    /// propagates into the fit parameters.
+    #[test]
+    fn test_spatial_map_back_d_init_nan_rejected() {
+        let rd = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        let (t_3d, u_3d) = synthetic_4x4_transmission(&rd, 0.001, &energies);
+        let data = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+        let bg = crate::pipeline::BackgroundConfig {
+            fit_back_d: true,
+            fit_back_f: true,
+            back_d_init: f64::NAN, // NaN — must be rejected
+            back_f_init: 1.0,
+            ..crate::pipeline::BackgroundConfig::default()
+        };
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![rd],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_transmission_background(bg);
+        let err = spatial_map_typed(&data, &config, None, None, None)
+            .expect_err("NaN back_d_init must be rejected up-front");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("back_d_init") && (msg.contains("finite") || msg.contains("NaN")),
+            "error must mention finite/NaN for back_d_init, got: {msg}"
+        );
+    }
+
+    /// Issue #538 P1 (#548 round-2 review): +inf `back_f_init` is
+    /// rejected up-front.  Without the `is_finite()` guard, +inf
+    /// passes the `<= 0.0` check (positive infinity is > 0) and
+    /// propagates into the fit parameters.
+    #[test]
+    fn test_spatial_map_back_f_init_inf_rejected() {
+        let rd = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        let (t_3d, u_3d) = synthetic_4x4_transmission(&rd, 0.001, &energies);
+        let data = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+        let bg = crate::pipeline::BackgroundConfig {
+            fit_back_d: true,
+            fit_back_f: true,
+            back_d_init: 0.01,
+            back_f_init: f64::INFINITY, // +inf — must be rejected
+            ..crate::pipeline::BackgroundConfig::default()
+        };
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![rd],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_transmission_background(bg);
+        let err = spatial_map_typed(&data, &config, None, None, None)
+            .expect_err("+inf back_f_init must be rejected up-front");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("back_f_init") && (msg.contains("finite") || msg.contains("inf")),
+            "error must mention finite/inf for back_f_init, got: {msg}"
         );
     }
 
