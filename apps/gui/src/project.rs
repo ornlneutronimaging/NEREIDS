@@ -1081,6 +1081,20 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
         state.spatial_result = Some(result);
     }
 
+    // Issue #538 / PR #548 review: per-pixel `back_d_map` / `back_f_map`
+    // are not yet persisted in project files, but the analyze overlay
+    // reads them via `map_or(0.0, …)` — so a reload would surface the
+    // unfit-sentinel `0.0` for back_d/back_f even when the original fit
+    // produced legitimate non-zero values.  To avoid the misleading
+    // sentinel, drop the restored in-memory `spatial_result` on reload
+    // so the user must re-run `spatial_map_typed` for a fresh fit.  The
+    // serialized snapshot fields (`density_maps`, `anorm_map`, …)
+    // remain on disk and are not affected; only the in-memory
+    // representation is cleared.  Note: until the user re-runs, an
+    // immediate save will serialize an empty spatial result — the user
+    // is expected to re-fit before saving over their data.
+    state.spatial_result = None;
+
     // 16b. Restore single-pixel fit results
     if let Some(densities) = snap.single_fit_densities {
         let uncertainties = snap.single_fit_uncertainties;
