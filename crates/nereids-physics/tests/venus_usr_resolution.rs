@@ -25,22 +25,35 @@ use nereids_physics::resolution::{
 //    the crate's public surface minimal per issue #497 scope) ─────
 
 fn interp_spectrum(energies: &[f64], spectrum: &[f64], e: f64) -> Option<f64> {
-    use nereids_core::constants::NEAR_ZERO_FLOOR;
-    if e < energies[0] || e > *energies.last().unwrap() {
+    // Verbatim copy of the canonical helper at
+    // crates/nereids-physics/src/resolution.rs:2541 (used by the
+    // in-src `broaden_presorted_reference` oracle).  Codex flagged
+    // an earlier rewritten variant in PR #545 round-1 review as
+    // semantically divergent (binary_search_by + early-return on
+    // exact hits vs upper-bound search + always-interpolate) —
+    // either path of divergence can flip the bit-exact comparison
+    // on exact-grid-hit / duplicate-grid edge cases.  Keep this in
+    // sync with the in-src version verbatim; if the production
+    // helper changes, mirror the change here.
+    let n = energies.len();
+    if n == 0 {
         return None;
     }
-    let lo = match energies
-        .binary_search_by(|x| x.partial_cmp(&e).unwrap_or(std::cmp::Ordering::Equal))
-    {
-        Ok(idx) => return Some(spectrum[idx]),
-        Err(idx) => idx.saturating_sub(1),
-    };
-    let hi = lo + 1;
-    if hi >= energies.len() {
-        return Some(spectrum[lo]);
+    if e < energies[0] || e > energies[n - 1] {
+        return None;
+    }
+    let mut lo = 0;
+    let mut hi = n - 1;
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2;
+        if energies[mid] <= e {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
     }
     let span = energies[hi] - energies[lo];
-    if span.abs() < NEAR_ZERO_FLOOR {
+    if span.abs() < nereids_core::constants::NEAR_ZERO_FLOOR {
         return Some(spectrum[lo]);
     }
     let frac = (e - energies[lo]) / span;

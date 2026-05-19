@@ -65,7 +65,7 @@ fn test_broaden_presorted_bench() {
     let t_new = start.elapsed();
 
     let speedup = t_ref.as_secs_f64() / t_new.as_secs_f64();
-    println!(
+    eprintln!(
         "broaden_presorted microbench (n_grid={n}, repeats={repeats}, 499-pt kernel):\n\
          reference (binary search): {t_ref:?}  (sink={sink_ref:.3})\n\
          two-pointer walk         : {t_new:?}  (sink={sink_new:.3})\n\
@@ -132,7 +132,7 @@ fn test_plan_reuse_bench() {
     let t_apply_total = start.elapsed() - t_build;
 
     let speedup = t_percall.as_secs_f64() / (t_build + t_apply_total).as_secs_f64();
-    println!(
+    eprintln!(
         "plan-reuse microbench (n_grid={n}, {repeats} spectra, 499-pt kernel):\n\
          per-call broaden_presorted : {t_percall:?}  (sink={sink_percall:.3})\n\
          plan build (once)          : {t_build:?}\n\
@@ -200,7 +200,7 @@ fn resolution_matrix_apply_microbench() {
     let t_matrix = start.elapsed();
 
     let speedup = t_plan.as_secs_f64() / t_matrix.as_secs_f64();
-    println!(
+    eprintln!(
         "ResolutionMatrix microbench (n_grid={n}, {repeats} spectra):\n\
          compile (once)       : {:?}  ({} nnz)\n\
          plan.apply × {repeats} : {:?}\n\
@@ -220,22 +220,30 @@ fn resolution_matrix_apply_microbench() {
 // ── Local helper duplicated from `src/resolution.rs` ─────────────
 
 fn interp_spectrum(energies: &[f64], spectrum: &[f64], e: f64) -> Option<f64> {
-    use nereids_core::constants::NEAR_ZERO_FLOOR;
-    if e < energies[0] || e > *energies.last().unwrap() {
+    // Verbatim copy of crates/nereids-physics/src/resolution.rs:2541.
+    // See PR #545 round-1 review (Codex) for why a "modernized"
+    // binary_search variant is wrong here: the oracle must match
+    // the in-src helper byte for byte so the bit-exact comparison
+    // does not silently flip on exact-grid-hit edge cases.
+    let n = energies.len();
+    if n == 0 {
         return None;
     }
-    let lo = match energies
-        .binary_search_by(|x| x.partial_cmp(&e).unwrap_or(std::cmp::Ordering::Equal))
-    {
-        Ok(idx) => return Some(spectrum[idx]),
-        Err(idx) => idx.saturating_sub(1),
-    };
-    let hi = lo + 1;
-    if hi >= energies.len() {
-        return Some(spectrum[lo]);
+    if e < energies[0] || e > energies[n - 1] {
+        return None;
+    }
+    let mut lo = 0;
+    let mut hi = n - 1;
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2;
+        if energies[mid] <= e {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
     }
     let span = energies[hi] - energies[lo];
-    if span.abs() < NEAR_ZERO_FLOOR {
+    if span.abs() < nereids_core::constants::NEAR_ZERO_FLOOR {
         return Some(spectrum[lo]);
     }
     let frac = (e - energies[lo]) / span;
