@@ -156,15 +156,18 @@ mostly noise for our purposes.
 - `--output-last-message <file>` — captures the agent's final message
   cleanly; far easier than parsing JSONL.
 
-**Known pitfalls** (verified against codex-cli 0.125, April 2026):
+**Known pitfalls** (verified against codex-cli 0.130, May 2026):
 
-- There is **no `codex review` subcommand**. Don't use `codex review
-  --base main` — it errors with
+- The top-level `codex review` subcommand does NOT exist. Don't use
+  `codex review --base main` — it errors with
   `unexpected argument '--base' found / Usage: codex <PROMPT>`.
-  A native `codex exec review` is requested in
-  [openai/codex#6432](https://github.com/openai/codex/issues/6432) but
-  not yet shipped. Use `codex exec` with an explicit review prompt,
-  per the pattern above.
+  However, `codex exec review --base <BRANCH>` **does** ship in
+  codex-cli 0.130+ (originally tracked in
+  [openai/codex#6432](https://github.com/openai/codex/issues/6432))
+  and accepts the prompt via stdin (`-`).  Adopting it workflow-wide
+  is tracked as a separate follow-up — the manual `codex exec` +
+  stdin prompt pattern above remains the canonical form here because
+  it works across all codex-cli versions.
 - Slash commands (`/review`, `/test`, etc.) work only in interactive
   TUI sessions; they cannot be invoked from `codex exec`.
 - **codex-cli + API model gating drift fast.** Earlier this year the
