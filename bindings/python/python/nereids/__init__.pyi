@@ -300,11 +300,12 @@ class SpatialResult:
     def back_d_map(self) -> NDArray[np.float64] | None:
         """Per-pixel SAMMY exponential background amplitude (BackD) map.
 
-        ``None`` whenever the LM transmission background was not active
-        (``background=False``) OR the exponential tail was not fit
-        (``fit_back_d=False``).  Counts-KL runs are always ``None``
-        because the joint-Poisson dispatch never fits BackD/BackF.
-        See issue #538."""
+        ``None`` whenever the polynomial transmission background was
+        not active (``background=False``) OR the exponential tail was
+        not fit (``fit_back_d=False``).  For counts inputs the map is
+        always ``None`` — the joint-Poisson dispatch (counts-KL) never
+        fits BackD/BackF, and the spatial pipeline rejects counts +
+        ``fit_back_d=True`` up-front (issue #538).  See issue #538."""
         ...
 
     @property

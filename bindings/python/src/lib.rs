@@ -3287,8 +3287,25 @@ fn py_spatial_map_typed<'py>(
     // which are not Send, so we cannot use py.allow_threads().  The existing
     // py_spatial_map has the same limitation.  Rayon still parallelizes the
     // per-pixel fitting within the GIL.
-    let result = spatial_map_typed(&input, &config, dead_arr.as_ref(), None, None)
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+    // Issue #538 (PR #548 round-3 review): map user-input
+    // configuration errors (unpaired fit_back_d/fit_back_f,
+    // non-finite/non-positive back_*_init, counts-KL + exponential
+    // tail) to `PyValueError`, matching the up-front PyValueError at
+    // the `background=False + fit_back_d=True` boundary above (line
+    // ~289).  Other PipelineError variants stay as PyRuntimeError —
+    // they signal solver / numeric failures, not bad input.
+    let result =
+        spatial_map_typed(&input, &config, dead_arr.as_ref(), None, None).map_err(|e| {
+            let msg = e.to_string();
+            if matches!(
+                e,
+                nereids_pipeline::error::PipelineError::InvalidParameter(_)
+            ) {
+                pyo3::exceptions::PyValueError::new_err(msg)
+            } else {
+                pyo3::exceptions::PyRuntimeError::new_err(msg)
+            }
+        })?;
 
     Ok(spatial_result_to_py(py, &result))
 }
