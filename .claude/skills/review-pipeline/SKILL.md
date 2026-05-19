@@ -112,11 +112,11 @@ flags, and output capture.  Adopting the native `codex review --base
 <BRANCH>` workflow-wide is tracked as a separate follow-up.
 
 Use this pattern (one Bash call per worktree). The prompt is written to a
-temp file and piped via stdin to avoid the
-heredoc-inside-command-substitution form (`codex exec "$(cat <<'EOF' ...
-EOF)"`), which has truncated or mangled prompts on recent PRs under
-certain shell snapshots — see #536. Temp file + stdin delivers the body
-verbatim across `codex-cli` versions.
+temp file and fed to `codex exec` via stdin redirection (`- < "$PROMPT_FILE"`)
+to avoid the heredoc-inside-command-substitution form (`codex exec
+"$(cat <<'EOF' ... EOF)"`), which has truncated or mangled prompts on
+recent PRs under certain shell snapshots — see #536. Temp file + stdin
+delivers the body verbatim across `codex-cli` versions.
 
 ```bash
 PROMPT_FILE=$(mktemp -t codex-review-{branch_slug}.XXXXXX)
@@ -170,11 +170,14 @@ mostly noise for our purposes.
   [openai/codex#6432](https://github.com/openai/codex/issues/6432).
   The error `unexpected argument '--base' found / Usage: codex
   <PROMPT>` is from pre-0.130 codex-cli where `review` was parsed as
-  a positional prompt instead of a subcommand; if you see that error,
-  upgrade codex-cli rather than working around it.  Adopting the
-  native subcommand workflow-wide is a separate follow-up — the
-  manual `codex exec` + stdin prompt pattern above remains the
-  canonical form here because it works across all codex-cli versions.
+  a positional prompt instead of a subcommand.  If you want to drive
+  the native `codex review --base <BRANCH>` workflow directly,
+  upgrade codex-cli to 0.130+.  **For this skill**, that upgrade is
+  not required — the manual `codex exec` + stdin prompt pattern
+  below is the canonical fallback and works across all codex-cli
+  versions (including environments where upgrading is not feasible).
+  Adopting the native subcommand workflow-wide is tracked as a
+  separate follow-up.
 - Slash commands (`/review`, `/test`, etc.) work only in interactive
   TUI sessions; they cannot be invoked from `codex exec`.
 - **codex-cli + API model gating drift fast.** Earlier this year the
