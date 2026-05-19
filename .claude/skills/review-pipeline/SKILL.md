@@ -158,16 +158,19 @@ mostly noise for our purposes.
 
 **Known pitfalls** (verified against codex-cli 0.130, May 2026):
 
-- The top-level `codex review` subcommand does NOT exist. Don't use
-  `codex review --base main` — it errors with
-  `unexpected argument '--base' found / Usage: codex <PROMPT>`.
-  However, `codex exec review --base <BRANCH>` **does** ship in
-  codex-cli 0.130+ (originally tracked in
-  [openai/codex#6432](https://github.com/openai/codex/issues/6432))
-  and accepts the prompt via stdin (`-`).  Adopting it workflow-wide
-  is tracked as a separate follow-up — the manual `codex exec` +
-  stdin prompt pattern above remains the canonical form here because
-  it works across all codex-cli versions.
+- **Native review subcommands**: codex-cli 0.130+ ships **both**
+  `codex review --base <BRANCH>` (top-level) and `codex exec review
+  --base <BRANCH>` (under `exec`).  Either accepts the prompt via
+  stdin (`-`) and supports `--uncommitted`, `--commit <SHA>`.  This
+  was tracked in
+  [openai/codex#6432](https://github.com/openai/codex/issues/6432).
+  The error `unexpected argument '--base' found / Usage: codex
+  <PROMPT>` is from pre-0.130 codex-cli where `review` was parsed as
+  a positional prompt instead of a subcommand; if you see that error,
+  upgrade codex-cli rather than working around it.  Adopting the
+  native subcommand workflow-wide is a separate follow-up — the
+  manual `codex exec` + stdin prompt pattern above remains the
+  canonical form here because it works across all codex-cli versions.
 - Slash commands (`/review`, `/test`, etc.) work only in interactive
   TUI sessions; they cannot be invoked from `codex exec`.
 - **codex-cli + API model gating drift fast.** Earlier this year the
