@@ -1097,17 +1097,13 @@ pub(crate) fn build_fit_line(p: &FitLineParams<'_>) -> Option<Line<'static>> {
             let e = p.energies.get(i).copied().unwrap_or(f64::NAN);
             let bg_poly = if e > 0.0 && e.is_finite() {
                 let sqrt_e = e.sqrt();
-                // Issue #538 (PR #548 round-2 review): SpectrumFitResult
-                // `back_d` / `back_f` are now `Option<f64>` — `None`
-                // means "exponential tail not fit" (e.g., counts-KL
-                // path, LM with `fit_back_d=false`, or a project-reload
-                // dropping the unpersisted maps).  Drop the tail term
-                // in that case so the rendered curve does not include a
-                // misleading nonzero contribution from a stale 0.0
-                // sentinel.  SAMMY pairs BackD/BackF (see
-                // `validate_transmission_background`), so the
-                // `(Some, Some)` arm is the only one that materialises
-                // a non-zero contribution in practice.
+                // `back_d` / `back_f` are `Option<f64>`: `None` means
+                // "exponential tail not fit" (counts-KL path, LM with
+                // `fit_back_d=false`, or a project reload that dropped
+                // the unpersisted maps).  Drop the tail term entirely
+                // in that case.  SAMMY pairs BackD/BackF, so
+                // `(Some, Some)` is the only arm that fires in
+                // practice.
                 let exp_tail = match (p.result.back_d, p.result.back_f) {
                     (Some(bd), Some(bf)) => bd * (-bf / sqrt_e).exp(),
                     _ => 0.0,

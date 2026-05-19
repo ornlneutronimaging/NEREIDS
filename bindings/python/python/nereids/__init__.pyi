@@ -305,7 +305,7 @@ class SpatialResult:
         not fit (``fit_back_d=False``).  For counts inputs the map is
         always ``None`` — the joint-Poisson dispatch (counts-KL) never
         fits BackD/BackF, and the spatial pipeline rejects counts +
-        ``fit_back_d=True`` up-front (issue #538).  See issue #538."""
+        ``fit_back_d=True`` up-front."""
         ...
 
     @property
@@ -830,7 +830,7 @@ def spatial_map_typed(
             ``BackD * exp(-BackF / √E)``.  SAMMY pairs the two — fitting
             only one is rejected.  Materialises
             :py:attr:`SpatialResult.back_d_map` /
-            :py:attr:`SpatialResult.back_f_map` per-pixel (issue #538).
+            :py:attr:`SpatialResult.back_f_map` per-pixel.
         back_d_init, back_f_init: Initial values for the exponential
             tail.  Both must be strictly positive when their fit flags
             are set (BackF's Jacobian column zeros out at BackD ≈ 0,
@@ -857,7 +857,7 @@ def spatial_map_typed(
     When ``fit_energy_scale=True``, per-pixel ``t0_us_map`` and
     ``l_scale_map`` are populated on the returned SpatialResult.  When
     ``background=True`` with ``fit_back_d=True`` / ``fit_back_f=True``,
-    per-pixel ``back_d_map`` / ``back_f_map`` are populated (issue #538).
+    per-pixel ``back_d_map`` / ``back_f_map`` are populated.
     """
     ...
 

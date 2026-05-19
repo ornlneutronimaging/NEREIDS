@@ -3180,14 +3180,13 @@ fn py_spatial_map_typed<'py>(
 
     // Background
     if background {
-        // Issue #538: plumb fit_back_d / fit_back_f / back_d_init /
-        // back_f_init through to `BackgroundConfig` so the LM
+        // Plumb `fit_back_d` / `fit_back_f` / `back_d_init` /
+        // `back_f_init` through to `BackgroundConfig` so the LM
         // transmission per-pixel fit can actually fit the exponential
-        // tail (BackD/BackF).  Without this, the spatial pipeline
-        // attached only the default config (both `fit_back_d` /
-        // `fit_back_f` = false) and the exposed `back_d_map` /
-        // `back_f_map` would never be `Some`.  Mirrors the single-
-        // spectrum `py_fit_spectrum_typed` wiring above.
+        // tail.  Without this, the spatial pipeline would attach only
+        // the default config (both flags `false`) and the exposed
+        // `back_d_map` / `back_f_map` would never be `Some`.  Mirrors
+        // the single-spectrum `py_fit_spectrum_typed` wiring above.
         let bg = nereids_pipeline::pipeline::BackgroundConfig {
             fit_back_d,
             fit_back_f,
@@ -3202,9 +3201,9 @@ fn py_spatial_map_typed<'py>(
         // binding boundary so the user gets a clear error rather than
         // a `back_d_map` / `back_f_map` of all None.
         return Err(pyo3::exceptions::PyValueError::new_err(
-            "fit_back_d / fit_back_f require background=True \
-             (issue #538): the exponential tail of the SAMMY background \
-             only exists when the polynomial background model is attached.",
+            "fit_back_d / fit_back_f require background=True: the \
+             exponential tail of the SAMMY background only exists when \
+             the polynomial background model is attached.",
         ));
     }
     if fit_alpha_1 || fit_alpha_2 || alpha_1_init != 1.0 || alpha_2_init != 1.0 {
@@ -3287,13 +3286,13 @@ fn py_spatial_map_typed<'py>(
     // which are not Send, so we cannot use py.allow_threads().  The existing
     // py_spatial_map has the same limitation.  Rayon still parallelizes the
     // per-pixel fitting within the GIL.
-    // Issue #538 (PR #548 round-3 review): map user-input
-    // configuration errors (unpaired fit_back_d/fit_back_f,
-    // non-finite/non-positive back_*_init, counts-KL + exponential
-    // tail) to `PyValueError`, matching the up-front PyValueError at
-    // the `background=False + fit_back_d=True` boundary above (line
-    // ~289).  Other PipelineError variants stay as PyRuntimeError —
-    // they signal solver / numeric failures, not bad input.
+    // Map user-input configuration errors (unpaired
+    // `fit_back_d`/`fit_back_f`, non-finite/non-positive `back_*_init`,
+    // counts-KL + exponential tail) to `PyValueError`, matching the
+    // up-front `PyValueError` at the `background=False +
+    // fit_back_d=True` boundary above.  Other `PipelineError`
+    // variants stay as `PyRuntimeError` — they signal solver /
+    // numeric failures, not bad input.
     let result =
         spatial_map_typed(&input, &config, dead_arr.as_ref(), None, None).map_err(|e| {
             let msg = e.to_string();
@@ -3625,13 +3624,14 @@ fn py_fit_counts_spectrum_typed<'py>(
         temperature_k_unc: result.temperature_k_unc,
         anorm: result.anorm,
         background: result.background,
-        // BackD / BackF are only meaningful when the polynomial background
-        // model was actually attached.  Issue #538 (PR #548 round-2 review):
-        // `result.back_d` / `result.back_f` are now `Option<f64>` (None when
-        // the inner Rust fit didn't fit the exponential tail).  The outer
-        // gate on `background && fit_back_d` is defensive — it ensures
-        // PyFitResult.back_d is None whenever the caller didn't request the
-        // tail, regardless of any future change to the inner Rust contract.
+        // BackD / BackF are only meaningful when the polynomial
+        // background model was actually attached.  `result.back_d` /
+        // `result.back_f` are `Option<f64>` (None when the inner
+        // Rust fit didn't fit the exponential tail).  The outer gate
+        // on `background && fit_back_d` is defensive — it ensures
+        // PyFitResult.back_d is None whenever the caller didn't
+        // request the tail, regardless of any future change to the
+        // inner Rust contract.
         back_d: if background && fit_back_d {
             result.back_d
         } else {
@@ -4133,13 +4133,14 @@ fn py_fit_spectrum_typed<'py>(
         temperature_k_unc: result.temperature_k_unc,
         anorm: result.anorm,
         background: result.background,
-        // BackD / BackF are only meaningful when the polynomial background
-        // model was actually attached.  Issue #538 (PR #548 round-2 review):
-        // `result.back_d` / `result.back_f` are now `Option<f64>` (None when
-        // the inner Rust fit didn't fit the exponential tail).  The outer
-        // gate on `background && fit_back_d` is defensive — it ensures
-        // PyFitResult.back_d is None whenever the caller didn't request the
-        // tail, regardless of any future change to the inner Rust contract.
+        // BackD / BackF are only meaningful when the polynomial
+        // background model was actually attached.  `result.back_d` /
+        // `result.back_f` are `Option<f64>` (None when the inner
+        // Rust fit didn't fit the exponential tail).  The outer gate
+        // on `background && fit_back_d` is defensive — it ensures
+        // PyFitResult.back_d is None whenever the caller didn't
+        // request the tail, regardless of any future change to the
+        // inner Rust contract.
         back_d: if background && fit_back_d {
             result.back_d
         } else {

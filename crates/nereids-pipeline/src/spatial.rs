@@ -83,21 +83,20 @@ pub struct SpatialResult {
     ///
     /// NaN at pixels where `converged_map` is `false`.
     pub background_maps: Option<[Array2<f64>; 3]>,
-    /// Per-pixel fitted SAMMY exponential background amplitude
-    /// `BackD` (issue #538).  `Some` only when the LM transmission
-    /// background path was active AND `fit_back_d=true`; `None`
-    /// otherwise (counts-KL runs, LM runs without a background model,
-    /// and LM runs that fit the polynomial terms but left the
-    /// exponential tail at its initial value).
+    /// Per-pixel fitted SAMMY exponential background amplitude `BackD`.
+    /// `Some` only when the LM transmission background path was active
+    /// AND `fit_back_d=true`; `None` otherwise (counts-KL runs, LM
+    /// runs without a background model, and LM runs that fit the
+    /// polynomial terms but left the exponential tail at its initial
+    /// value).
     /// NaN at pixels where `converged_map` is `false`.
     pub back_d_map: Option<Array2<f64>>,
     /// Per-pixel fitted SAMMY exponential background decay constant
-    /// `BackF` (issue #538).  `Some` only when the LM transmission
-    /// background path was active AND `fit_back_f=true`; `None`
-    /// otherwise.  Mirrors [`Self::back_d_map`]'s gating because
-    /// `BackD` and `BackF` are required to fit together (see
-    /// `validate_transmission_background` in
-    /// `crate::pipeline`).
+    /// `BackF`.  `Some` only when the LM transmission background path
+    /// was active AND `fit_back_f=true`; `None` otherwise.  Mirrors
+    /// [`Self::back_d_map`]'s gating because `BackD` and `BackF` are
+    /// required to fit together (see `validate_transmission_background`
+    /// in `crate::pipeline`).
     /// NaN at pixels where `converged_map` is `false`.
     pub back_f_map: Option<Array2<f64>>,
     /// Per-pixel fitted SAMMY TZERO offset (µs) map.
@@ -320,13 +319,13 @@ pub fn spatial_map_typed(
         ));
     }
 
-    // PR #548 Copilot review: `fit_spectrum_typed` rejects
-    // `CountsWithNuisance + LM` per-pixel (see pipeline.rs:950 —
-    // "CountsWithNuisance requires a counts-domain solver"), but
-    // `spatial_map_typed` swallows the per-pixel errors as `n_failed`
-    // and returns `Ok(SpatialResult)` with all-NaN maps.  Hoist the
-    // same rejection up-front so callers get a clear diagnostic
-    // instead of a silently-failed spatial result.
+    // `fit_spectrum_typed` rejects `CountsWithNuisance + LM` per-pixel
+    // (see `validate_input_solver` in `pipeline.rs` — "CountsWithNuisance
+    // requires a counts-domain solver"), but per-pixel errors here are
+    // swallowed as `n_failed` and `spatial_map_typed` returns
+    // `Ok(SpatialResult)` with all-NaN maps.  Hoist the rejection so
+    // callers get a clear diagnostic instead of a silently-failed
+    // spatial result.
     if matches!(input, InputData3D::CountsWithNuisance { .. })
         && matches!(config.solver(), SolverConfig::LevenbergMarquardt(_))
     {
@@ -340,13 +339,11 @@ pub fn spatial_map_typed(
         ));
     }
 
-    // Issue #538 (#548 review): hoist transmission-background BackD/BackF
-    // validation from the per-pixel solver up to the spatial dispatch.
-    // Without this, invalid configs (unpaired `fit_back_d`/`fit_back_f`,
-    // non-positive `back_*_init`, counts-KL plus exponential tail) get
-    // swallowed as `n_failed` per pixel and `spatial_map_typed` still
-    // returns `Ok(SpatialResult)` with all-NaN maps — silently failing
-    // is worse than a clear validation error.
+    // Validate `transmission_background` BackD/BackF here rather than
+    // per-pixel.  Invalid configs (unpaired flags, non-finite or non-
+    // positive init values, counts-KL plus exponential tail) would
+    // otherwise be swallowed as `n_failed` per pixel and produce an
+    // all-NaN map with no diagnostic.
     if let Some(bg) = config.transmission_background() {
         // SAMMY pairs BackD/BackF — enabling only one leaves the other
         // registered but unused.  Already enforced per-pixel in the LM
@@ -355,11 +352,10 @@ pub fn spatial_map_typed(
         // BackF's Jacobian column zeros out at BackD ≈ 0 (and BackD
         // becomes a constant duplicate of BackA at BackF ≈ 0).  Reject
         // non-positive initial values so the LM solver does not silently
-        // produce all-NaN maps via a degenerate Jacobian.  Round-2
-        // Codex review: also reject `NaN` / `+inf` — both pass `<= 0.0`
-        // checks (NaN comparisons are always false; +inf is > 0) but
-        // propagate into the fit parameters and silently corrupt the
-        // result.
+        // produce all-NaN maps via a degenerate Jacobian.  Also reject
+        // `NaN` / `+inf` — both pass `<= 0.0` (NaN comparisons are
+        // always false; +inf is > 0) but propagate into the fit
+        // parameters and silently corrupt the result.
         if bg.fit_back_d && (!bg.back_d_init.is_finite() || bg.back_d_init <= 0.0) {
             return Err(PipelineError::InvalidParameter(format!(
                 "transmission_background.back_d_init must be finite and strictly \
@@ -411,15 +407,13 @@ pub fn spatial_map_typed(
     let isotope_labels = config.isotope_names().to_vec();
     let has_background_outputs =
         config.transmission_background().is_some() || config.counts_background().is_some();
-    // Issue #538: the exponential `BackD`/`BackF` terms are LM-transmission-
-    // only.  The joint-Poisson (counts-KL) path never fits them — see
-    // `pipeline::fit_counts_joint_poisson` validation rejecting
-    // `fit_back_d || fit_back_f` and the surrounding inline note.  Gate
-    // both maps on the transmission-background config carrying the
-    // per-term `fit_back_d` / `fit_back_f` flags so callers can tell the
-    // difference between "map is full of NaN because no pixel converged"
-    // (`Some([NaN, ...])`) and "the exponential tail was never engaged"
-    // (`None`).
+    // The exponential `BackD` / `BackF` terms are LM-transmission-only:
+    // `fit_counts_joint_poisson` rejects `fit_back_d || fit_back_f` for
+    // the counts-KL path.  Gate both maps on the transmission-background
+    // config carrying the per-term `fit_back_d` / `fit_back_f` flags so
+    // callers can distinguish "map full of NaN because no pixel
+    // converged" (`Some([NaN, ...])`) from "the exponential tail was
+    // never engaged" (`None`).
     let has_back_d_map = config
         .transmission_background()
         .is_some_and(|bg| bg.fit_back_d);
@@ -1182,15 +1176,13 @@ pub fn spatial_map_typed(
             bg_maps[1][[*y, *x]] = result.background[1];
             bg_maps[2][[*y, *x]] = result.background[2];
         }
-        // Issue #538 (PR #548 round-2 review): per-pixel
         // `SpectrumFitResult` carries `back_d` / `back_f` as
-        // `Option<f64>` (None when the bg model never fit the
-        // exponential tail).  The spatial result only materialises the
-        // maps when the LM transmission background actually fit them
-        // (gated above via `has_back_d_map` / `has_back_f_map`), so a
-        // converged pixel here should always carry `Some(value)`.
-        // Fall back to NaN for the rare case of None at a converged
-        // pixel — that surfaces an upstream bug via the
+        // `Option<f64>` — `None` when the bg model never fit the
+        // exponential tail.  Maps here are only materialised when LM
+        // actually fit them (gated via `has_back_d_map` /
+        // `has_back_f_map`), so a converged pixel should always carry
+        // `Some(value)`.  Fall back to NaN for the rare case of `None`
+        // at a converged pixel — that surfaces an upstream bug via the
         // NaN-on-failure contract rather than a misleading sentinel
         // `0.0`.
         if let Some(ref mut map) = back_d_map {
@@ -1980,9 +1972,9 @@ mod tests {
         }
     }
 
-    /// Issue #538: `back_d_map` / `back_f_map` stay `None` whenever
-    /// `fit_back_d` / `fit_back_f` are left at their defaults, even
-    /// when a transmission background config is attached.  This is the
+    /// `back_d_map` / `back_f_map` stay `None` whenever `fit_back_d` /
+    /// `fit_back_f` are left at their defaults, even when a
+    /// transmission background config is attached.  This is the
     /// "exponential tail never engaged" arm of the gating contract.
     #[test]
     fn test_spatial_map_back_d_f_maps_none_when_fit_disabled() {
@@ -2021,18 +2013,16 @@ mod tests {
         );
     }
 
-    /// Issue #538: `back_d_map` / `back_f_map` are `Some` (and carry
-    /// finite values at converged pixels) when the LM transmission
-    /// background is fit with both exponential-tail flags set.
-    /// Synthesises a 4×4 cube with a known exponential tail on top of
-    /// U-238 absorption so the BackD/BackF Jacobian columns are not
-    /// degenerate (a smooth resonance-only model is unidentifiable in
-    /// BackD/BackF — `anorm` absorbs them — so the fitter stagnates
-    /// and converges = false on every pixel).  This mirrors the
-    /// single-spectrum coverage in
+    /// `back_d_map` / `back_f_map` are `Some` (and carry finite values
+    /// at converged pixels) when the LM transmission background is fit
+    /// with both exponential-tail flags set.  Synthesises a 4×4 cube
+    /// with a known exponential tail on top of U-238 absorption so the
+    /// BackD/BackF Jacobian columns are not degenerate (a smooth
+    /// resonance-only model is unidentifiable in BackD/BackF — `anorm`
+    /// absorbs them — so the fitter stagnates and converges = false on
+    /// every pixel).  Mirrors the single-spectrum coverage in
     /// `fitting::transmission_model::tests::exponential_fit_recovers_all_params`
-    /// while exercising the spatial aggregation path that issue #538
-    /// adds.
+    /// while exercising the spatial aggregation path.
     #[test]
     fn test_spatial_map_back_d_f_maps_some_when_fit_enabled() {
         let rd = u238_single_resonance();
@@ -2138,11 +2128,10 @@ mod tests {
         );
     }
 
-    /// Issue #538: counts-KL never fits the exponential tail, so the
-    /// `back_d_map` / `back_f_map` fields must remain `None` even when
-    /// the counts-KL background is attached.  This is the gate that
-    /// keeps the joint-Poisson dispatch from accidentally surfacing a
-    /// map of sentinel zeros.
+    /// Counts-KL never fits the exponential tail, so `back_d_map` /
+    /// `back_f_map` must remain `None` even when the counts-KL
+    /// background is attached.  Keeps the joint-Poisson dispatch from
+    /// accidentally surfacing a map of sentinel zeros.
     #[test]
     fn test_spatial_map_counts_kl_back_d_f_maps_are_none() {
         let rd = u238_single_resonance();
@@ -2174,11 +2163,10 @@ mod tests {
         );
     }
 
-    /// Issue #538 P1 (#548 review): unpaired `fit_back_d` /
-    /// `fit_back_f` must be rejected up-front by `spatial_map_typed`,
-    /// not just per-pixel.  Without this guard the per-pixel solver
-    /// errors are swallowed as `n_failed` and the caller sees an
-    /// all-NaN map with no diagnostic.
+    /// Unpaired `fit_back_d` / `fit_back_f` must be rejected up-front
+    /// by `spatial_map_typed`, not just per-pixel.  Without this guard
+    /// the per-pixel solver errors are swallowed as `n_failed` and the
+    /// caller sees an all-NaN map with no diagnostic.
     #[test]
     fn test_spatial_map_back_d_f_unpaired_rejected_up_front() {
         let rd = u238_single_resonance();
@@ -2214,9 +2202,9 @@ mod tests {
         );
     }
 
-    /// Issue #538 P1 (#548 review): non-positive `back_d_init` /
-    /// `back_f_init` is rejected up-front so the LM solver does not
-    /// silently produce a degenerate Jacobian.
+    /// Non-positive `back_d_init` is rejected up-front so the LM
+    /// solver does not silently produce a degenerate Jacobian (BackF's
+    /// column zeros out at BackD ≈ 0).
     #[test]
     fn test_spatial_map_back_d_init_non_positive_rejected() {
         let rd = u238_single_resonance();
@@ -2251,8 +2239,9 @@ mod tests {
         );
     }
 
-    /// Issue #538 P1 (#548 review): non-positive `back_f_init` is
-    /// rejected up-front for the same reason as `back_d_init`.
+    /// Non-positive `back_f_init` is rejected up-front for the same
+    /// reason as `back_d_init` (BackD becomes a duplicate of BackA at
+    /// BackF ≈ 0).
     #[test]
     fn test_spatial_map_back_f_init_non_positive_rejected() {
         let rd = u238_single_resonance();
@@ -2287,10 +2276,10 @@ mod tests {
         );
     }
 
-    /// Issue #538 P1 (#548 round-2 review): NaN `back_d_init` is
-    /// rejected up-front.  Without the `is_finite()` guard, NaN passes
-    /// the `<= 0.0` check (NaN comparisons are always false) and
-    /// propagates into the fit parameters.
+    /// NaN `back_d_init` is rejected up-front.  Without the
+    /// `is_finite()` guard, NaN passes the `<= 0.0` check (NaN
+    /// comparisons are always false) and propagates into the fit
+    /// parameters.
     #[test]
     fn test_spatial_map_back_d_init_nan_rejected() {
         let rd = u238_single_resonance();
@@ -2326,10 +2315,9 @@ mod tests {
         );
     }
 
-    /// Issue #538 P1 (#548 round-2 review): +inf `back_f_init` is
-    /// rejected up-front.  Without the `is_finite()` guard, +inf
-    /// passes the `<= 0.0` check (positive infinity is > 0) and
-    /// propagates into the fit parameters.
+    /// +inf `back_f_init` is rejected up-front.  Without the
+    /// `is_finite()` guard, +inf passes the `<= 0.0` check (positive
+    /// infinity is > 0) and propagates into the fit parameters.
     #[test]
     fn test_spatial_map_back_f_init_inf_rejected() {
         let rd = u238_single_resonance();
@@ -2365,11 +2353,11 @@ mod tests {
         );
     }
 
-    /// Issue #538 P1 (#548 review): the joint-Poisson (counts-KL)
-    /// dispatch combined with a `transmission_background` carrying
-    /// `fit_back_d=true` / `fit_back_f=true` is rejected up-front so
-    /// the user gets a clear diagnostic instead of an all-NaN map
-    /// from per-pixel `n_failed` swallowing.
+    /// The joint-Poisson (counts-KL) dispatch combined with a
+    /// `transmission_background` carrying `fit_back_d=true` /
+    /// `fit_back_f=true` is rejected up-front so the user gets a clear
+    /// diagnostic instead of an all-NaN map from per-pixel `n_failed`
+    /// swallowing.
     #[test]
     fn test_spatial_map_counts_kl_plus_back_d_rejected_up_front() {
         let rd = u238_single_resonance();
@@ -2406,12 +2394,11 @@ mod tests {
         );
     }
 
-    /// PR #548 Copilot review: `CountsWithNuisance + LM` is rejected
-    /// up-front so the caller does not get an all-NaN spatial result
-    /// from per-pixel `n_failed` swallowing.  `fit_spectrum_typed`
-    /// rejects this combo per-pixel (pipeline.rs:950); the hoisted
-    /// spatial-level rejection surfaces the same diagnostic at the
-    /// boundary instead of pretending the fit ran.
+    /// `CountsWithNuisance + LM` is rejected up-front so the caller
+    /// does not get an all-NaN spatial result from per-pixel `n_failed`
+    /// swallowing.  `fit_spectrum_typed` rejects this combo per-pixel;
+    /// the hoisted spatial-level rejection surfaces the same diagnostic
+    /// at the boundary instead of pretending the fit ran.
     #[test]
     fn test_spatial_map_counts_with_nuisance_plus_lm_rejected_up_front() {
         use ndarray::Array3;

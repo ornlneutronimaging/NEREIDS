@@ -1653,10 +1653,10 @@ fn fit_counts_joint_poisson(
         temperature_k_unc,
         anorm: anorm_out,
         background: bg_abc_out,
-        // Issue #538 (PR #548 round-2 review): joint-Poisson never fits
-        // the exponential tail.  `None` signals "tail not fit" to
-        // downstream consumers (GUI overlay curve drops the exponential
-        // term; PyO3 conversion passes through to Python as `None`).
+        // Joint-Poisson never fits the exponential tail.  `None`
+        // signals "tail not fit" to downstream consumers (GUI overlay
+        // curve drops the exponential term; PyO3 conversion passes
+        // through to Python as `None`).
         back_d: None,
         back_f: None,
         t0_us: energy_scale_indices.map(|(t0_idx, _)| result.params[t0_idx]),
@@ -2027,9 +2027,8 @@ fn extract_result(
 
     let (anorm, background, back_d, back_f): (f64, [f64; 3], Option<f64>, Option<f64>) =
         if let Some(bi) = bg_indices {
-            // Issue #538 (PR #548 round-2 review): `Option<f64>`
-            // distinguishes "exponential tail not fit" (None) from
-            // "fit produced zero" (Some(0.0)) — was a 0.0 sentinel.
+            // `Option<f64>` distinguishes "exponential tail not fit"
+            // (`None`) from "fit produced zero" (`Some(0.0)`).
             let bd = bi.back_d.map(|i| result.params[i]);
             let bf = bi.back_f.map(|i| result.params[i]);
             (
@@ -2476,7 +2475,7 @@ pub struct SpectrumFitResult {
     /// `fit_back_d=true`.  Mirrors [`Self::t0_us`] /
     /// [`Self::l_scale`] semantics so the GUI overlay can
     /// distinguish "unfit" from "fitted to zero" without an ambiguous
-    /// `0.0` sentinel (issue #538, PR #548 round-2 review).
+    /// `0.0` sentinel.
     pub back_d: Option<f64>,
     /// Fitted exponential background decay constant (SAMMY BackF).
     /// `None` when the exponential tail is not fitted; `Some(value)`

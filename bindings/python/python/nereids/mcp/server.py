@@ -525,8 +525,8 @@ def _spatial_fit_kwargs(
         "max_iter",
         "solver",
         "background",
-        # Issue #538: surface the SAMMY exponential background tail
-        # (`BackD`/`BackF`) at the MCP boundary so callers can request
+        # Surface the SAMMY exponential background tail
+        # (`BackD` / `BackF`) at the MCP boundary so callers can request
         # per-pixel `back_d_map` / `back_f_map`.
         "fit_back_d",
         "fit_back_f",
@@ -982,9 +982,9 @@ def _process_density_map(
     # reconstruct the model curve per-pixel) and surface aggregate
     # stats in the JSON summary.  Per-pixel ``back_d_map`` / ``back_f_map``
     # require ``background=True`` AND ``fit_back_d=True`` /
-    # ``fit_back_f=True`` (issue #538) — counts-KL runs always have them
-    # as ``None`` because the joint-Poisson dispatch never fits the
-    # SAMMY exponential tail.
+    # ``fit_back_f=True`` — counts-KL runs always have them as ``None``
+    # because the joint-Poisson dispatch never fits the SAMMY
+    # exponential tail.
     fit_param_stats: dict[str, Any] = {}
     anorm_map = getattr(result, "anorm_map", None)
     if anorm_map is not None:

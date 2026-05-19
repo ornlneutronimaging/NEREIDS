@@ -1063,10 +1063,9 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
             // D-11/D-21: Now persisted; None for old project files.
             anorm_map: snap.anorm_map,
             background_maps: snap.background_maps,
-            // Issue #538: per-pixel BackD/BackF maps are not yet
-            // persisted in project files (same precedent as the TZERO
-            // maps below).  Re-running spatial_map_typed regenerates
-            // them.
+            // Per-pixel BackD/BackF maps are not yet persisted in
+            // project files (same precedent as the TZERO maps below).
+            // Re-running `spatial_map_typed` regenerates them.
             back_d_map: None,
             back_f_map: None,
             // TZERO maps are not yet persisted in project files — None on
@@ -1094,12 +1093,11 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
             temperature_k_unc: snap.single_fit_temperature_unc,
             anorm: snap.single_fit_anorm.unwrap_or(1.0),
             background: snap.single_fit_background.unwrap_or([0.0, 0.0, 0.0]),
-            // Issue #538 (PR #548 round-2 review): `back_d` / `back_f`
-            // are now `Option<f64>` (None = "exponential tail not fit").
-            // The single-pixel snapshot fields don't yet persist these,
-            // so None on reload is the correct "not fit" signal — the
-            // curve renderer drops the exponential term, no misleading
-            // 0.0 sentinel.
+            // `back_d` / `back_f` are `Option<f64>` (`None` =
+            // exponential tail not fit).  The single-pixel snapshot
+            // fields don't yet persist these, so `None` on reload is
+            // the correct "not fit" signal — the curve renderer drops
+            // the exponential term, no misleading 0.0 sentinel.
             back_d: None,
             back_f: None,
             t0_us: None,
