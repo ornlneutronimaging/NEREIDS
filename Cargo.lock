@@ -2987,6 +2987,7 @@ dependencies = [
  "microlp",
  "nereids-core",
  "nereids-endf",
+ "nereids-physics",
  "num-complex",
  "rayon",
 ]

@@ -24,3 +24,17 @@ num-complex = { workspace = true }
 rayon = { workspace = true }
 microlp = { workspace = true }
 
+[dev-dependencies]
+# Integration tests under `tests/` are compiled as a separate crate
+# that links against the production build of `nereids-physics`, so
+# they cannot see items gated only by `#[cfg(test)]`.  Enabling the
+# `test-support` feature here exposes `resolution::test_support` to
+# the integration suite without leaking it into release builds.
+#
+# Inherits version + path from `[workspace.dependencies]` (see
+# workspace Cargo.toml) so `scripts/bump-version.sh` keeps the
+# version in sync automatically.  A path-only self-dep (without a
+# version) breaks `cargo publish` because crates.io rejects
+# manifests whose declared deps lack version constraints.
+nereids-physics = { workspace = true, features = ["test-support"] }
+
