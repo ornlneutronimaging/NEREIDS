@@ -1132,8 +1132,16 @@ fn selected_pixel_fit_result_for_overlay(
             .map(|map| map[[y, x]]),
         anorm: result.anorm_map.as_ref().map_or(1.0, |map| map[[y, x]]),
         background,
-        back_d: 0.0,
-        back_f: 0.0,
+        // `SpectrumFitResult.back_d` / `back_f` are `Option<f64>`
+        // (`None` = "not fit").  Mapping the spatial `back_d_map` /
+        // `back_f_map` to `Option<f64>` here preserves the
+        // distinction across snapshot reload: when the spatial maps
+        // are `None` (reload, or `fit_back_d=false`), the overlay
+        // carries `None` and `widgets::design::build_fit_line` drops
+        // the exponential-tail term rather than rendering a
+        // misleading 0.0-sentinel contribution.
+        back_d: result.back_d_map.as_ref().map(|map| map[[y, x]]),
+        back_f: result.back_f_map.as_ref().map(|map| map[[y, x]]),
         t0_us: result.t0_us_map.as_ref().map(|map| map[[y, x]]),
         l_scale: result.l_scale_map.as_ref().map(|map| map[[y, x]]),
         deviance_per_dof: result.deviance_per_dof_map.as_ref().map(|map| map[[y, x]]),

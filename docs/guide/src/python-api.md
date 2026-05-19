@@ -82,6 +82,8 @@ Returned by `spatial_map_typed(...)`.
 | `converged_map` | `NDArray[bool_]` | Per-pixel convergence flags. |
 | `n_converged`, `n_failed`, `n_total` | `int` | Pixel fit counts. |
 | `temperature_map` | `NDArray[float64] or None` | Fitted temperature map when enabled. |
+| `anorm_map`, `background_maps` | `NDArray[float64] / list[...] or None` | SAMMY `Anorm` and the polynomial background `[BackA, BackB, BackC]` per pixel when `background=True`. |
+| `back_d_map`, `back_f_map` | `NDArray[float64] or None` | SAMMY exponential background `BackD` / `BackF` per pixel when `background=True` and `fit_back_d=True` / `fit_back_f=True`. Counts-KL spatial runs always return `None` for both (the joint-Poisson dispatch never fits the exponential tail). |
 | `t0_us_map`, `l_scale_map` | `NDArray[float64] or None` | Energy-scale maps when enabled. |
 
 ### `NexusData`
@@ -264,6 +266,8 @@ Keyword arguments:
 | `max_iter=200` | Maximum per-pixel optimizer iterations. |
 | `solver="auto"` | Dispatch from input type unless explicitly set. |
 | `background=False` | Enable SAMMY-style background for LM/transmission paths. |
+| `fit_back_d=False`, `fit_back_f=False` | Fit the SAMMY exponential background tail (`BackD * exp(-BackF / √E)`).  Requires `background=True`.  Per-pixel `back_d_map` / `back_f_map` are populated on the returned `SpatialResult` (issue #538). |
+| `back_d_init=0.01`, `back_f_init=1.0` | Initial values for the exponential tail. |
 | `fit_alpha_1=False`, `fit_alpha_2=False` | Fit counts-domain nuisance/background terms. |
 | `alpha_1_init=1.0`, `alpha_2_init=1.0` | Initial nuisance/background values. |
 | `c=1.0` | Proton-charge ratio for counts-KL spatial fitting. |
