@@ -99,21 +99,29 @@ Unless `--skip-codex` is in `$ARGUMENTS`, also launch one `Bash` command
 per worktree in the **same message** as the Claude self-audit so they
 run concurrently.
 
-There is **no `codex review` subcommand** in current codex-cli (verified
-against 0.125, April 2026). The slash command `/review` exists but is
-interactive-only — it cannot be driven from `codex exec`. The canonical
-headless invocation is `codex exec` with an explicit review prompt; a
-native `codex exec review` is requested in
-[openai/codex#6432](https://github.com/openai/codex/issues/6432) but
-not yet shipped.
+codex-cli 0.130+ ships **both** a top-level `codex review` subcommand
+and `codex exec review` under `exec` (tracked in
+[openai/codex#6432](https://github.com/openai/codex/issues/6432)); the
+interactive `/review` slash command is separate and cannot be driven
+from `codex exec`.  Either native subcommand would work as a higher-
+level invocation, but **this skill uses the manual `codex exec` +
+explicit review prompt pattern below** because it is portable across
+all codex-cli versions (including environments stuck on older
+binaries) and gives us direct control over the prompt body, sandbox
+flags, and output capture.  Adopting the native `codex review --base
+<BRANCH>` workflow-wide is tracked as a separate follow-up.
 
-Use this pattern (one Bash call per worktree):
+Use this pattern (one Bash call per worktree). The prompt is written to a
+temp file and fed to `codex exec` via stdin redirection (`- < "$PROMPT_FILE"`)
+to avoid the heredoc-inside-command-substitution form (`codex exec
+"$(cat <<'EOF' ... EOF)"`), which has truncated or mangled prompts on
+recent PRs under certain shell snapshots — see #536. Temp file + stdin
+delivers the body verbatim across `codex-cli` versions.
 
 ```bash
-codex exec --sandbox read-only --skip-git-repo-check \
-  -C {worktree_path} \
-  --output-last-message /tmp/codex-review-{branch_slug}.md \
-  "$(cat <<'PROMPT'
+PROMPT_FILE=$(mktemp -t codex-review-{branch_slug}.XXXXXX)
+trap 'rm -f "$PROMPT_FILE"' EXIT
+cat > "$PROMPT_FILE" <<'PROMPT'
 You are reviewing the changes on the current branch (HEAD) against `main`
 in the NEREIDS repository.
 
@@ -132,7 +140,11 @@ in the NEREIDS repository.
    - Include `file:line` references for each finding.
 5. If you find nothing significant, say so explicitly. Be terse.
 PROMPT
-)"
+
+codex exec --sandbox read-only --skip-git-repo-check \
+  -C {worktree_path} \
+  --output-last-message /tmp/codex-review-{branch_slug}.md \
+  - < "$PROMPT_FILE"
 ```
 
 Then read the file at `/tmp/codex-review-{branch_slug}.md` for the final
@@ -148,15 +160,24 @@ mostly noise for our purposes.
 - `--output-last-message <file>` — captures the agent's final message
   cleanly; far easier than parsing JSONL.
 
-**Known pitfalls** (verified against codex-cli 0.125, April 2026):
+**Known pitfalls** (verified against codex-cli 0.130, May 2026):
 
-- There is **no `codex review` subcommand**. Don't use `codex review
-  --base main` — it errors with
-  `unexpected argument '--base' found / Usage: codex <PROMPT>`.
-  A native `codex exec review` is requested in
-  [openai/codex#6432](https://github.com/openai/codex/issues/6432) but
-  not yet shipped. Use `codex exec` with an explicit review prompt,
-  per the pattern above.
+- **Native review subcommands**: codex-cli 0.130+ ships **both**
+  `codex review --base <BRANCH>` (top-level) and `codex exec review
+  --base <BRANCH>` (under `exec`).  Either accepts the prompt via
+  stdin (`-`) and supports `--uncommitted`, `--commit <SHA>`.  This
+  was tracked in
+  [openai/codex#6432](https://github.com/openai/codex/issues/6432).
+  The error `unexpected argument '--base' found / Usage: codex
+  <PROMPT>` is from pre-0.130 codex-cli where `review` was parsed as
+  a positional prompt instead of a subcommand.  If you want to drive
+  the native `codex review --base <BRANCH>` workflow directly,
+  upgrade codex-cli to 0.130+.  **For this skill**, that upgrade is
+  not required — the manual `codex exec` + stdin prompt pattern
+  below is the canonical fallback and works across all codex-cli
+  versions (including environments where upgrading is not feasible).
+  Adopting the native subcommand workflow-wide is tracked as a
+  separate follow-up.
 - Slash commands (`/review`, `/test`, etc.) work only in interactive
   TUI sessions; they cannot be invoked from `codex exec`.
 - **codex-cli + API model gating drift fast.** Earlier this year the
@@ -167,9 +188,11 @@ mostly noise for our purposes.
   errors, the fix is to upgrade codex-cli (`brew upgrade codex` or
   `npm i -g @openai/codex@latest`). Do NOT spend time trying to work
   around with model overrides — keep the binary current.
-- `codex exec` reads the prompt from stdin if you pass `-` or omit the
-  positional, but heredoc-injected positional prompts (as above) are
-  the most reliable form across versions.
+- **Prompt delivery**: write the prompt to a temp file and pipe via stdin
+  (`codex exec ... - < "$PROMPT_FILE"`). The heredoc-inside-command-
+  substitution form (`codex exec "$(cat <<'EOF' ... EOF)"`) has been
+  observed to truncate/mangle prompts under certain shell snapshots —
+  see #536. Temp file + stdin is robust across versions.
 - Avoid `--full-auto` for review — it grants `workspace-write` sandbox,
   which is broader than the read-only review needs.
 
