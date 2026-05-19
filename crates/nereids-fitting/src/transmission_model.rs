@@ -5283,28 +5283,32 @@ mod tests {
     /// bound as the no-resolution test (the resolution operator does
     /// not couple into those columns differently).  The L_scale column
     /// is checked via relative L₂ norm against the FD2 reference with
-    /// tolerance `PARTIAL_GAL_REL_L2_TOLERANCE = 1e-2`.  On the
-    /// synthetic grid below the measured relative L₂ is `~6.4e-10`
-    /// (FD truncation-noise floor, not a true rank-1 residual — the
-    /// Gaussian kernel is mild enough that the rank-1 identity is
-    /// effectively exact here).  The tolerance is kept at 1e-2 as the
-    /// loose regression bound documented in #499; tightening below
-    /// 1e-2 is a future empirical question (the appropriate value
-    /// depends on the kernel shape and cross-section spikiness, which
-    /// vary across real workloads) and is explicitly out of scope.
-    /// The measured relative L₂ surfaces in the assert message if the
+    /// tolerance `PARTIAL_GAL_REL_L2_TOLERANCE = 3e-3`.  On the
+    /// synthetic grid below (kernel widened in round-1 review so the
+    /// kernel spans several bins and meaningfully broadens the
+    /// resonance) the measured relative L₂ is `~9.3e-4` — the
+    /// tolerance gives roughly 3× headroom over the current
+    /// measurement, tight enough to catch a non-trivial regression
+    /// of the rank-1 simplification while loose enough to absorb
+    /// FD-truncation noise.  An upstream pre-check (see below)
+    /// asserts the kernel itself is non-trivial so a future tweak
+    /// to grid spacing or kernel parameters cannot silently degrade
+    /// this back into a vacuous "no-resolution-in-disguise" test
+    /// (PR #544 round 1 caught exactly that regression).  The
+    /// measured relative L₂ surfaces in the assert message if the
     /// bound is ever exceeded so future tightening is straightforward.
     #[test]
     fn partial_gal_with_resolution_matches_fd2() {
         use nereids_physics::resolution::{ResolutionFunction, ResolutionParams};
 
         // Tolerance for relative L₂ error on the L_scale column.
-        // Measured rel L₂ on this synthetic grid is ~6.4e-10 — eight
-        // orders of magnitude below the bound — so 1e-2 is a loose
-        // regression guardrail.  See rustdoc above for why this is
-        // kept at 1e-2 rather than tightened (kernel-dependence of
-        // the real-workload bound is future empirical work).
-        const PARTIAL_GAL_REL_L2_TOLERANCE: f64 = 1e-2;
+        // Measured rel L₂ on this synthetic grid is ~9.3e-4; 3e-3
+        // gives ~3× headroom — tight enough to catch a non-trivial
+        // regression of the rank-1 simplification under resolution,
+        // loose enough to absorb FD truncation noise.  See rustdoc
+        // above for why this bound is conservative rather than the
+        // tighter empirical 0.1·σ_Fisher seen on real workloads.
+        const PARTIAL_GAL_REL_L2_TOLERANCE: f64 = 3e-3;
 
         // 64-point uniform energy grid spanning 4.0–36.0 eV.
         let n: usize = 64;
@@ -5324,13 +5328,18 @@ mod tests {
             .collect();
         let xs = vec![xs_vec];
 
-        // Gaussian resolution kernel — same constructor as the existing
-        // resolution-bearing tests (lines 4215+).  The numerical values
-        // (25.0, 0.5, 0.005, 0.0) come from the existing test fixtures
-        // and represent a "VENUS-like" Gaussian profile width.
+        // Gaussian resolution kernel — sized to be NON-TRIVIAL on the
+        // chosen grid.  Original review (PR #544 round 1) found that
+        // the existing-test parameters (0.5 µs / 0.005 m) produced a
+        // kernel σ_E ≈ 0.05 eV at 20 eV, smaller than one grid bin
+        // (0.5 eV) — the `resolution_broaden_presorted` fast path
+        // then fell back to passthrough and the comparison was
+        // vacuous.  These widened values (5.0 µs / 0.05 m) give
+        // σ_E ≈ 0.5 eV ≈ 1 bin, so the kernel spans several bins and
+        // actually broadens the resonance feature.
         let instrument = Some(Arc::new(InstrumentParams {
             resolution: ResolutionFunction::Gaussian(
-                ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
+                ResolutionParams::new(25.0, 5.0, 0.05, 0.0).unwrap(),
             ),
         }));
 
@@ -5338,7 +5347,7 @@ mod tests {
         // process-global `NEREIDS_TZERO_JACOBIAN` env var, matching
         // the pattern used by `partial_gal_no_resolution_matches_fd2`.
         let mut model = EnergyScaleTransmissionModel::new(
-            std::sync::Arc::new(xs),
+            std::sync::Arc::new(xs.clone()),
             std::sync::Arc::new(vec![0]),
             energies.clone(),
             25.0,
@@ -5350,6 +5359,39 @@ mod tests {
 
         let params = [0.1, 0.05, 1.002]; // density, t0, l_scale
         let free = vec![0, 1, 2];
+
+        // Pre-check: confirm the resolution kernel actually broadens
+        // the spectrum on this grid.  Round-1 review (PR #544) caught
+        // a kernel-too-narrow regression where this assertion would
+        // have failed; pin it explicitly so any future tuning of the
+        // grid or kernel parameters that re-introduces a vacuous
+        // kernel fails fast with a clear message rather than
+        // silently degrading into a no-resolution test.
+        let model_no_resolution = EnergyScaleTransmissionModel::new(
+            std::sync::Arc::new(xs),
+            std::sync::Arc::new(vec![0]),
+            energies.clone(),
+            25.0,
+            1,
+            2,
+            None,
+        )
+        .with_jacobian_method(EnergyScaleJacobianMethod::FiniteDifference);
+        let t_no_res = model_no_resolution.evaluate(&params).unwrap();
+        let t_with_res = model.evaluate(&params).unwrap();
+        let diff_inf = t_no_res
+            .iter()
+            .zip(t_with_res.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        let t_inf = t_no_res.iter().map(|x| x.abs()).fold(0.0_f64, f64::max);
+        assert!(
+            diff_inf > 1e-3 * t_inf,
+            "resolution kernel must broaden the spectrum nontrivially \
+             (got ||T_kernel - T_none||_∞ = {diff_inf:.3e}, ||T_none||_∞ = {t_inf:.3e}, \
+             ratio = {ratio:.3e}); widen the kernel or sharpen the resonance",
+            ratio = diff_inf / t_inf.max(1e-30),
+        );
 
         // FD2 reference Jacobian (explicitly pinned above).
         let jac_fd2 = model
