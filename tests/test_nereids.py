@@ -571,9 +571,28 @@ class TestSpatialMapTransmission:
         arrays when ``background=True`` and both ``fit_back_d`` /
         ``fit_back_f`` are set.  Uses the *real* PyO3 binding (not a
         SimpleNamespace stub) per the project's PyO3-contract testing
-        convention."""
-        energies = np.linspace(1.0, 30.0, 200)
+        convention.
+
+        Round-2 review (Codex): the original fixture was resonance-only
+        (no exponential tail injected), which made BackD/BackF
+        unidentifiable — ``anorm`` absorbed them and LM stalled at
+        ``back_d ≈ 0`` with `converged = false` per pixel, so the
+        finite-value assertion was vacuous or flaky.  Mirror the Rust
+        coverage in
+        ``test_spatial_map_back_d_f_maps_some_when_fit_enabled`` by
+        injecting a known ``BackD * exp(-BackF / √E)`` tail on top of
+        the resonance-only transmission so the BackD/BackF Jacobian
+        columns carry non-degenerate signal."""
+        # 1.0 to 11.0 eV (101 bins) matches the Rust fixture and keeps
+        # the 1/√E factor identifiable across the range.
+        energies = np.linspace(1.0, 11.0, 101)
         t_1d = np.asarray(nereids.forward_model(energies, [(u238_data, 0.001)]))
+        # Inject a known exponential tail so the BackD/BackF columns
+        # are not degenerate.  Values mirror the Rust test.
+        true_back_d = 0.03
+        true_back_f = 2.0
+        tail = true_back_d * np.exp(-true_back_f / np.sqrt(energies))
+        t_1d = t_1d + tail
         ny, nx = 2, 2
         trans = np.tile(t_1d[:, None, None], (1, ny, nx))
         unc = np.full_like(trans, 0.01)
@@ -583,7 +602,7 @@ class TestSpatialMapTransmission:
             data,
             energies,
             [u238_data],
-            max_iter=80,
+            max_iter=500,
             background=True,
             fit_back_d=True,
             fit_back_f=True,
@@ -603,9 +622,14 @@ class TestSpatialMapTransmission:
         assert bd.dtype == np.float64
         assert bf.dtype == np.float64
         # At least one converged pixel must populate a finite back_d/back_f
-        # value, otherwise the gating is vacuous.
+        # value, otherwise the gating is vacuous (matches the Rust
+        # `n_converged > 0` precondition).
         converged = np.asarray(result.converged_map)
-        assert converged.any(), "test fixture produced zero converged pixels"
+        assert converged.any(), (
+            "test fixture produced zero converged pixels — the LM fit failed "
+            "to recover BackD/BackF on the injected tail; the test fixture "
+            "is no longer exercising the gating contract"
+        )
         finite_bd = np.isfinite(bd[converged])
         finite_bf = np.isfinite(bf[converged])
         assert finite_bd.any() and finite_bf.any(), (
