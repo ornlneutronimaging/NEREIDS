@@ -405,27 +405,26 @@ fn hdf5_ob_picker(ui: &mut egui::Ui, state: &mut AppState) {
                     width: state.event_width,
                 };
                 nereids_io::nexus::load_nexus_events(&path, &params)
-                    .map(|d| (d.counts, d.tof_edges_us))
+                    .map(|d| (d.counts, d.tof_edges_us, d.n_rotation_angles))
             } else {
                 // Issue #430: the loader refuses multi-angle files by
                 // default to prevent silent sum-over-angles.  The GUI
                 // makes the explicit opt-in to preserve existing
                 // single-volume analysis behaviour on OB input.
                 //
-                // NOTE: this branch does not currently surface the
-                // rotation-angle count to the user via the status
-                // banner — we discard `data.n_rotation_angles` when
-                // mapping to `(counts, tof_edges)`.  The sample-load
-                // path below *does* surface it; parity is tracked as
-                // a follow-up UX issue (#462).
+                // Issue #462: surface the rotation-angle count to the
+                // user via the status banner, mirroring the sample-load
+                // path below.  `data.n_rotation_angles` is carried
+                // through the tuple so the success arm can build the
+                // same `angle_note` suffix.
                 nereids_io::nexus::load_nexus_histogram_with_mode(
                     &path,
                     nereids_io::nexus::MultiAngleMode::Sum,
                 )
-                .map(|d| (d.counts, d.tof_edges_us))
+                .map(|d| (d.counts, d.tof_edges_us, d.n_rotation_angles))
             };
             match ob_result {
-                Ok((ob_counts, ob_tof_edges)) => {
+                Ok((ob_counts, ob_tof_edges, n_rotation_angles)) => {
                     // P1-7: Validate shape matches sample
                     if let Some(ref sample) = state.sample_data
                         && sample.shape() != ob_counts.shape()
@@ -479,7 +478,19 @@ fn hdf5_ob_picker(ui: &mut egui::Ui, state: &mut AppState) {
                     // mode (`has_required_data`) — using the narrow
                     // variant keeps Continue enabled.
                     state.invalidate_fit_results();
-                    state.status_message = "Open beam loaded".to_string();
+                    // #462: mirror the sample-load rotation-angle note
+                    // so OB and sample banners use identical wording
+                    // when angles were collapsed.
+                    let angle_note = if n_rotation_angles > 1 {
+                        format!(
+                            " ({} rotation angles summed — multi-angle analysis not yet supported, \
+                             see #430)",
+                            n_rotation_angles
+                        )
+                    } else {
+                        String::new()
+                    };
+                    state.status_message = format!("Open beam loaded{angle_note}");
                 }
                 Err(e) => {
                     state.status_message = format!("Open beam load failed: {e}");
