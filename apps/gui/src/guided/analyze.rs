@@ -1132,8 +1132,12 @@ fn selected_pixel_fit_result_for_overlay(
             .map(|map| map[[y, x]]),
         anorm: result.anorm_map.as_ref().map_or(1.0, |map| map[[y, x]]),
         background,
-        back_d: 0.0,
-        back_f: 0.0,
+        // Issue #538: when the spatial pipeline fit BackD/BackF
+        // per pixel, surface the value at (y, x); otherwise fall
+        // back to the sentinel `0.0` that `SpectrumFitResult.back_d`
+        // / `back_f` carry when the exponential tail was not fit.
+        back_d: result.back_d_map.as_ref().map_or(0.0, |map| map[[y, x]]),
+        back_f: result.back_f_map.as_ref().map_or(0.0, |map| map[[y, x]]),
         t0_us: result.t0_us_map.as_ref().map(|map| map[[y, x]]),
         l_scale: result.l_scale_map.as_ref().map(|map| map[[y, x]]),
         deviance_per_dof: result.deviance_per_dof_map.as_ref().map(|map| map[[y, x]]),

@@ -525,6 +525,13 @@ def _spatial_fit_kwargs(
         "max_iter",
         "solver",
         "background",
+        # Issue #538: surface the SAMMY exponential background tail
+        # (`BackD`/`BackF`) at the MCP boundary so callers can request
+        # per-pixel `back_d_map` / `back_f_map`.
+        "fit_back_d",
+        "fit_back_f",
+        "back_d_init",
+        "back_f_init",
         "fit_alpha_1",
         "fit_alpha_2",
         "alpha_1_init",
@@ -965,16 +972,19 @@ def _process_density_map(
             }
         )
 
-    # SpatialResult exposes per-pixel anorm / background / t0 / l_scale maps
-    # whenever the spatial pipeline ran with the corresponding *feature*
-    # enabled (e.g. `background=True` materialises all three terms of
-    # `background_maps` — including NaN-per-pixel entries for terms that
-    # were not actually fit — and `fit_energy_scale=True` materialises
-    # both t0/L scale maps).  Save the raw arrays into the NPZ (so
-    # downstream consumers can reconstruct the model curve per-pixel) and
-    # surface aggregate stats in the JSON summary.  Per-pixel
-    # back_d_map / back_f_map are not yet exposed on SpatialResult;
-    # tracked as a Rust-side follow-up (#538).
+    # SpatialResult exposes per-pixel anorm / background / back_d /
+    # back_f / t0 / l_scale maps whenever the spatial pipeline ran with
+    # the corresponding *feature* enabled (e.g. `background=True`
+    # materialises all three terms of `background_maps` — including
+    # NaN-per-pixel entries for terms that were not actually fit — and
+    # `fit_energy_scale=True` materialises both t0/L scale maps).  Save
+    # the raw arrays into the NPZ (so downstream consumers can
+    # reconstruct the model curve per-pixel) and surface aggregate
+    # stats in the JSON summary.  Per-pixel ``back_d_map`` / ``back_f_map``
+    # require ``background=True`` AND ``fit_back_d=True`` /
+    # ``fit_back_f=True`` (issue #538) — counts-KL runs always have them
+    # as ``None`` because the joint-Poisson dispatch never fits the
+    # SAMMY exponential tail.
     fit_param_stats: dict[str, Any] = {}
     anorm_map = getattr(result, "anorm_map", None)
     if anorm_map is not None:
@@ -989,6 +999,16 @@ def _process_density_map(
             arrays_to_save[f"background_term_{term_idx}_map"] = bm_arr
             bm_stats.append(_array_stats(bm_arr))
         fit_param_stats["background"] = bm_stats
+    back_d_map = getattr(result, "back_d_map", None)
+    if back_d_map is not None:
+        back_d_arr = np.asarray(back_d_map)
+        arrays_to_save["back_d_map"] = back_d_arr
+        fit_param_stats["back_d"] = _array_stats(back_d_arr)
+    back_f_map = getattr(result, "back_f_map", None)
+    if back_f_map is not None:
+        back_f_arr = np.asarray(back_f_map)
+        arrays_to_save["back_f_map"] = back_f_arr
+        fit_param_stats["back_f"] = _array_stats(back_f_arr)
     t0_us_map = getattr(result, "t0_us_map", None)
     if t0_us_map is not None:
         t0_arr = np.asarray(t0_us_map)

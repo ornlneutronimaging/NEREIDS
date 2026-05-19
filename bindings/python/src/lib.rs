@@ -632,6 +632,12 @@ struct PySpatialResult {
     anorm_map: Option<Py<PyArray2<f64>>>,
     /// Per-pixel background parameter maps (None when background=False).
     background_maps: Option<[Py<PyArray2<f64>>; 3]>,
+    /// Per-pixel SAMMY BackD exponential-amplitude map
+    /// (None unless ``background=True`` AND ``fit_back_d=True``).
+    back_d_map: Option<Py<PyArray2<f64>>>,
+    /// Per-pixel SAMMY BackF exponential-decay-constant map
+    /// (None unless ``background=True`` AND ``fit_back_f=True``).
+    back_f_map: Option<Py<PyArray2<f64>>>,
     /// Per-pixel fitted TZERO t0 (µs) map (None when fit_energy_scale=False).
     t0_us_map: Option<Py<PyArray2<f64>>>,
     /// Per-pixel fitted TZERO L_scale map (None when fit_energy_scale=False).
@@ -739,6 +745,25 @@ impl PySpatialResult {
         self.background_maps
             .as_ref()
             .map(|maps| maps.iter().map(|m| m.bind(py).clone()).collect())
+    }
+
+    /// Per-pixel SAMMY exponential background amplitude (``BackD``) map.
+    /// ``None`` whenever the LM transmission background was not active
+    /// (``background=False``) OR the exponential tail was not fit
+    /// (``fit_back_d=False``).  Counts-KL runs are always ``None``
+    /// because the joint-Poisson dispatch never fits ``BackD``/``BackF``.
+    /// Mirrors the per-spectrum ``FitResult.back_d`` convention from
+    /// issue #537.
+    #[getter]
+    fn back_d_map<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray2<f64>>> {
+        self.back_d_map.as_ref().map(|m| m.bind(py).clone())
+    }
+
+    /// Per-pixel SAMMY exponential background decay constant (``BackF``) map.
+    /// ``None`` under the same conditions as :py:attr:`back_d_map`.
+    #[getter]
+    fn back_f_map<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray2<f64>>> {
+        self.back_f_map.as_ref().map(|m| m.bind(py).clone())
     }
 
     /// Per-pixel SAMMY TZERO offset t0 (µs) map.
@@ -2866,6 +2891,14 @@ fn spatial_result_to_py(
             PyArray2::from_array(py, &maps[2]).into(),
         ]
     });
+    let back_d_map = result
+        .back_d_map
+        .as_ref()
+        .map(|m| PyArray2::from_array(py, m).into());
+    let back_f_map = result
+        .back_f_map
+        .as_ref()
+        .map(|m| PyArray2::from_array(py, m).into());
     let temperature_map = result
         .temperature_map
         .as_ref()
@@ -2902,6 +2935,8 @@ fn spatial_result_to_py(
         temperature_uncertainty_map,
         anorm_map,
         background_maps,
+        back_d_map,
+        back_f_map,
         t0_us_map,
         l_scale_map,
     }
@@ -2960,6 +2995,10 @@ fn spatial_result_to_py(
     max_iter = 200,
     solver = "auto",
     background = false,
+    fit_back_d = false,
+    fit_back_f = false,
+    back_d_init = 0.01,
+    back_f_init = 1.0,
     fit_alpha_1 = false,
     fit_alpha_2 = false,
     alpha_1_init = 1.0,
@@ -2991,6 +3030,10 @@ fn py_spatial_map_typed<'py>(
     max_iter: usize,
     solver: &str,
     background: bool,
+    fit_back_d: bool,
+    fit_back_f: bool,
+    back_d_init: f64,
+    back_f_init: f64,
     fit_alpha_1: bool,
     fit_alpha_2: bool,
     alpha_1_init: f64,
@@ -3137,8 +3180,32 @@ fn py_spatial_map_typed<'py>(
 
     // Background
     if background {
-        config = config
-            .with_transmission_background(nereids_pipeline::pipeline::BackgroundConfig::default());
+        // Issue #538: plumb fit_back_d / fit_back_f / back_d_init /
+        // back_f_init through to `BackgroundConfig` so the LM
+        // transmission per-pixel fit can actually fit the exponential
+        // tail (BackD/BackF).  Without this, the spatial pipeline
+        // attached only the default config (both `fit_back_d` /
+        // `fit_back_f` = false) and the exposed `back_d_map` /
+        // `back_f_map` would never be `Some`.  Mirrors the single-
+        // spectrum `py_fit_spectrum_typed` wiring above.
+        let bg = nereids_pipeline::pipeline::BackgroundConfig {
+            fit_back_d,
+            fit_back_f,
+            back_d_init,
+            back_f_init,
+            ..nereids_pipeline::pipeline::BackgroundConfig::default()
+        };
+        config = config.with_transmission_background(bg);
+    } else if fit_back_d || fit_back_f {
+        // The exponential tail can only be fit when the background
+        // model is active.  Reject the silent-noop combination at the
+        // binding boundary so the user gets a clear error rather than
+        // a `back_d_map` / `back_f_map` of all None.
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "fit_back_d / fit_back_f require background=True \
+             (issue #538): the exponential tail of the SAMMY background \
+             only exists when the polynomial background model is attached.",
+        ));
     }
     if fit_alpha_1 || fit_alpha_2 || alpha_1_init != 1.0 || alpha_2_init != 1.0 {
         if data.kind != "counts_with_nuisance" {

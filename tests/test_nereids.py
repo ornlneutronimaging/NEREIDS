@@ -534,6 +534,107 @@ class TestSpatialMapTransmission:
         r = repr(result)
         assert "SpatialResult" in r
 
+    def test_spatial_map_back_d_f_maps_none_when_disabled(self, u238_data):
+        """Issue #538: ``back_d_map`` / ``back_f_map`` must be ``None``
+        whenever ``fit_back_d`` / ``fit_back_f`` are left at their
+        defaults — even when ``background=True`` attaches the polynomial
+        terms.  This is the "exponential tail never engaged" gate."""
+        energies = np.linspace(1.0, 30.0, 200)
+        t_1d = np.asarray(nereids.forward_model(energies, [(u238_data, 0.001)]))
+        trans = np.tile(t_1d[:, None, None], (1, 2, 2))
+        unc = np.full_like(trans, 0.01)
+
+        data = nereids.from_transmission(trans, unc)
+        result = nereids.spatial_map_typed(
+            data,
+            energies,
+            [u238_data],
+            max_iter=30,
+            background=True,
+            # fit_back_d / fit_back_f left at False (default).
+        )
+        # Polynomial background maps materialise.
+        assert result.anorm_map is not None
+        assert result.background_maps is not None
+        # Exponential tail maps stay None when not requested.
+        assert result.back_d_map is None, (
+            f"back_d_map must be None when fit_back_d=False, got "
+            f"{result.back_d_map!r}"
+        )
+        assert result.back_f_map is None, (
+            f"back_f_map must be None when fit_back_f=False, got "
+            f"{result.back_f_map!r}"
+        )
+
+    def test_spatial_map_back_d_f_maps_some_when_enabled(self, u238_data):
+        """Issue #538: ``back_d_map`` / ``back_f_map`` are 2-D float64
+        arrays when ``background=True`` and both ``fit_back_d`` /
+        ``fit_back_f`` are set.  Uses the *real* PyO3 binding (not a
+        SimpleNamespace stub) per the project's PyO3-contract testing
+        convention."""
+        energies = np.linspace(1.0, 30.0, 200)
+        t_1d = np.asarray(nereids.forward_model(energies, [(u238_data, 0.001)]))
+        ny, nx = 2, 2
+        trans = np.tile(t_1d[:, None, None], (1, ny, nx))
+        unc = np.full_like(trans, 0.01)
+
+        data = nereids.from_transmission(trans, unc)
+        result = nereids.spatial_map_typed(
+            data,
+            energies,
+            [u238_data],
+            max_iter=80,
+            background=True,
+            fit_back_d=True,
+            fit_back_f=True,
+            back_d_init=0.01,
+            back_f_init=1.0,
+        )
+        assert result.back_d_map is not None, (
+            "back_d_map must be populated when fit_back_d=True"
+        )
+        assert result.back_f_map is not None, (
+            "back_f_map must be populated when fit_back_f=True"
+        )
+        bd = np.asarray(result.back_d_map)
+        bf = np.asarray(result.back_f_map)
+        assert bd.shape == (ny, nx)
+        assert bf.shape == (ny, nx)
+        assert bd.dtype == np.float64
+        assert bf.dtype == np.float64
+        # At least one converged pixel must populate a finite back_d/back_f
+        # value, otherwise the gating is vacuous.
+        converged = np.asarray(result.converged_map)
+        assert converged.any(), "test fixture produced zero converged pixels"
+        finite_bd = np.isfinite(bd[converged])
+        finite_bf = np.isfinite(bf[converged])
+        assert finite_bd.any() and finite_bf.any(), (
+            f"at least one converged pixel must produce a finite back_d/back_f "
+            f"(finite_bd={finite_bd.sum()}, finite_bf={finite_bf.sum()})"
+        )
+
+    def test_spatial_map_back_d_f_requires_background_kwarg(self, u238_data):
+        """Issue #538: ``fit_back_d`` / ``fit_back_f`` with
+        ``background=False`` is rejected at the binding boundary —
+        the exponential tail of the SAMMY background only exists when
+        the polynomial background is attached, so silently producing
+        ``back_d_map=None`` would be misleading."""
+        energies = np.linspace(1.0, 30.0, 100)
+        t_1d = np.asarray(nereids.forward_model(energies, [(u238_data, 0.001)]))
+        trans = np.tile(t_1d[:, None, None], (1, 2, 2))
+        unc = np.full_like(trans, 0.01)
+        data = nereids.from_transmission(trans, unc)
+        with pytest.raises(ValueError, match="background=True"):
+            nereids.spatial_map_typed(
+                data,
+                energies,
+                [u238_data],
+                max_iter=10,
+                background=False,
+                fit_back_d=True,
+                fit_back_f=True,
+            )
+
 
 # ===========================================================================
 # Spatial mapping (Poisson)
