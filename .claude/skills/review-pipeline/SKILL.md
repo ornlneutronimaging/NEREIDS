@@ -99,13 +99,17 @@ Unless `--skip-codex` is in `$ARGUMENTS`, also launch one `Bash` command
 per worktree in the **same message** as the Claude self-audit so they
 run concurrently.
 
-There is **no `codex review` subcommand** in current codex-cli (verified
-against 0.125, April 2026). The slash command `/review` exists but is
-interactive-only — it cannot be driven from `codex exec`. The canonical
-headless invocation is `codex exec` with an explicit review prompt; a
-native `codex exec review` is requested in
-[openai/codex#6432](https://github.com/openai/codex/issues/6432) but
-not yet shipped.
+codex-cli 0.130+ ships **both** a top-level `codex review` subcommand
+and `codex exec review` under `exec` (tracked in
+[openai/codex#6432](https://github.com/openai/codex/issues/6432)); the
+interactive `/review` slash command is separate and cannot be driven
+from `codex exec`.  Either native subcommand would work as a higher-
+level invocation, but **this skill uses the manual `codex exec` +
+explicit review prompt pattern below** because it is portable across
+all codex-cli versions (including environments stuck on older
+binaries) and gives us direct control over the prompt body, sandbox
+flags, and output capture.  Adopting the native `codex review --base
+<BRANCH>` workflow-wide is tracked as a separate follow-up.
 
 Use this pattern (one Bash call per worktree). The prompt is written to a
 temp file and piped via stdin to avoid the
