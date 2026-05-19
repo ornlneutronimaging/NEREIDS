@@ -18,21 +18,41 @@
 //! other formalism.
 //!
 //! ## SAMMY Reference
-//! - `mlb/mmlb4.f90` Abpart_Mlb subroutine
-//! - SAMMY manual Section 2.1.1
+//! - `mlb/mmlb3.f90` Elastc_Mlb subroutine (line 56, SLBW branch) — the elastic
+//!   cross-section formula this module mirrors.
+//! - `mlb/mmlb4.f90` Abpart_Mlb subroutine — populates the Aaaone/Aaatwo/Aaathr
+//!   accumulators consumed by Elastc_Mlb.
+//! - `xxx/mxxx9.f90` lines 68-71 (`Cs2sn2`) — confirms SAMMY's `Cs/Si` arrays
+//!   hold `cos(2φ)/sin(2φ)`, not `cos(φ)/sin(φ)`.
+//! - SAMMY manual Section 2.1.1.
 //!
 //! ## Formulas
-//! For each resonance at energy E_r with total J:
+//! For each resonance at energy E_r with total J, write Δ = E − E_r and
+//! D = Δ² + (Γ_tot/2)². Then:
 //!
-//! σ_capture(E) = g_J × π/k² × Γ_n(E)·Γ_γ / ((E-E_r)² + (Γ/2)²)
+//! σ_capture(E) = g_J · π/k² · Γ_n(E)·Γ_γ / D
 //!
-//! σ_elastic(E) = g_J × π/k² × [Γ_n(E)² / ((E-E_r)² + (Γ/2)²)
-//!                + 2·sin(φ)·(Γ_n(E)·(E-E_r)·cos(φ) + Γ_n(E)·Γ/2·sin(φ))
-//!                  / ((E-E_r)² + (Γ/2)²)
-//!                + sin²(φ)]
+//! σ_elastic(E) = g_J · π/k² · [
+//!                  4·sin²φ                                  (potential)
+//!                + Γ_n(E)² / D                              (resonance peak)
+//!                + 2·Γ_n(E)·Δ·sin(2φ) / D                   (interference, Δ part)
+//!                − 2·Γ_n(E)·Γ_tot·sin²φ / D                 (interference, Γ part)
+//!              ]
 //!
 //! where Γ_n(E) = Γ_n(E_r) × √(E/E_r) × P_l(E)/P_l(E_r)
-//! and Γ = Γ_n(E) + Γ_γ + Γ_f
+//! and Γ_tot = Γ_n(E) + Γ_γ + Γ_f.
+//!
+//! The sign of the `Γ_tot·sin²φ` interference term is negative. This is
+//! equivalent to SAMMY's `(1 − cos2φ)·A + sin2φ·B + Aaathr·D` form at
+//! `mmlb3.f90:56` after substituting `A = 2 − Γ_n·Γ_tot/Den`, and to
+//! `σ_el = g_J · π/k² · |1 − U_nn|²` with
+//! `U_nn = e^{−2iφ} · [1 + iΓ_n / (E_r − E − iΓ_tot/2)]`.
+//!
+//! Issue #549: prior to this commit the term had the wrong sign (`+` instead
+//! of `−`). The bias was numerically invisible in the existing `samtry`
+//! validation suite because all SLBW test cases are at ρ ≪ 1 where
+//! sin²φ ≈ ρ². The high-ρ regression test lives at
+//! `crates/nereids-physics/tests/slbw_elastic_oracle.rs`.
 
 use nereids_core::constants::{DIVISION_FLOOR, PIVOT_FLOOR};
 use nereids_endf::resonance::ResonanceData;
@@ -302,11 +322,14 @@ pub(crate) fn slbw_evaluate_with_cached_jgroups(
             total += sigma_e_res;
 
             // Interference between resonance and potential scattering.
+            // The Γ_tot·sin²φ part is NEGATIVE: resonance attenuates the
+            // near-resonance potential scattering. See module docstring above
+            // for the derivation and SAMMY `mmlb3.f90:56` for the reference.
             let interf = pi_over_k2
                 * g_j
                 * 2.0
                 * gamma_n
-                * (de * cos_phi * 2.0 * sin_phi + (gamma_total / 2.0) * 2.0 * sin2_phi)
+                * (de * cos_phi * 2.0 * sin_phi - (gamma_total / 2.0) * 2.0 * sin2_phi)
                 / denom;
             elastic += interf;
             total += interf;
