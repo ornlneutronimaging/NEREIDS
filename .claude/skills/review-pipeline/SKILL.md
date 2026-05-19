@@ -107,13 +107,17 @@ native `codex exec review` is requested in
 [openai/codex#6432](https://github.com/openai/codex/issues/6432) but
 not yet shipped.
 
-Use this pattern (one Bash call per worktree):
+Use this pattern (one Bash call per worktree). The prompt is written to a
+temp file and piped via stdin to avoid the
+heredoc-inside-command-substitution form (`codex exec "$(cat <<'EOF' ...
+EOF)"`), which has truncated or mangled prompts on recent PRs under
+certain shell snapshots — see #536. Temp file + stdin delivers the body
+verbatim across `codex-cli` versions.
 
 ```bash
-codex exec --sandbox read-only --skip-git-repo-check \
-  -C {worktree_path} \
-  --output-last-message /tmp/codex-review-{branch_slug}.md \
-  "$(cat <<'PROMPT'
+PROMPT_FILE=$(mktemp -t codex-review-{branch_slug}.XXXXXX)
+trap 'rm -f "$PROMPT_FILE"' EXIT
+cat > "$PROMPT_FILE" <<'PROMPT'
 You are reviewing the changes on the current branch (HEAD) against `main`
 in the NEREIDS repository.
 
@@ -132,7 +136,11 @@ in the NEREIDS repository.
    - Include `file:line` references for each finding.
 5. If you find nothing significant, say so explicitly. Be terse.
 PROMPT
-)"
+
+codex exec --sandbox read-only --skip-git-repo-check \
+  -C {worktree_path} \
+  --output-last-message /tmp/codex-review-{branch_slug}.md \
+  - < "$PROMPT_FILE"
 ```
 
 Then read the file at `/tmp/codex-review-{branch_slug}.md` for the final
@@ -167,9 +175,11 @@ mostly noise for our purposes.
   errors, the fix is to upgrade codex-cli (`brew upgrade codex` or
   `npm i -g @openai/codex@latest`). Do NOT spend time trying to work
   around with model overrides — keep the binary current.
-- `codex exec` reads the prompt from stdin if you pass `-` or omit the
-  positional, but heredoc-injected positional prompts (as above) are
-  the most reliable form across versions.
+- **Prompt delivery**: write the prompt to a temp file and pipe via stdin
+  (`codex exec ... - < "$PROMPT_FILE"`). The heredoc-inside-command-
+  substitution form (`codex exec "$(cat <<'EOF' ... EOF)"`) has been
+  observed to truncate/mangle prompts under certain shell snapshots —
+  see #536. Temp file + stdin is robust across versions.
 - Avoid `--full-auto` for review — it grants `workspace-write` sandbox,
   which is broader than the read-only review needs.
 
