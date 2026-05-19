@@ -120,7 +120,9 @@ pub struct SpatialResult {
 
 // ── Phase 3: InputData3D + spatial_map_typed ─────────────────────────────
 
-use crate::pipeline::{InputData, SolverConfig, UnifiedFitConfig, fit_spectrum_typed};
+use crate::pipeline::{
+    InputData, SolverConfig, UnifiedFitConfig, fit_spectrum_typed, validate_transmission_background,
+};
 
 /// 3D input data for spatial mapping.
 ///
@@ -316,6 +318,59 @@ pub fn spatial_map_typed(
              fit temperature on the nominal energy grid."
                 .into(),
         ));
+    }
+
+    // Issue #538 (#548 review): hoist transmission-background BackD/BackF
+    // validation from the per-pixel solver up to the spatial dispatch.
+    // Without this, invalid configs (unpaired `fit_back_d`/`fit_back_f`,
+    // non-positive `back_*_init`, counts-KL plus exponential tail) get
+    // swallowed as `n_failed` per pixel and `spatial_map_typed` still
+    // returns `Ok(SpatialResult)` with all-NaN maps — silently failing
+    // is worse than a clear validation error.
+    if let Some(bg) = config.transmission_background() {
+        // SAMMY pairs BackD/BackF — enabling only one leaves the other
+        // registered but unused.  Already enforced per-pixel in the LM
+        // solver; surface up-front for the spatial dispatch.
+        validate_transmission_background(bg)?;
+        // BackF's Jacobian column zeros out at BackD ≈ 0 (and BackD
+        // becomes a constant duplicate of BackA at BackF ≈ 0).  Reject
+        // non-positive initial values so the LM solver does not silently
+        // produce all-NaN maps via a degenerate Jacobian.
+        if bg.fit_back_d && bg.back_d_init <= 0.0 {
+            return Err(PipelineError::InvalidParameter(format!(
+                "transmission_background.back_d_init must be strictly positive when \
+                 fit_back_d=true (got {}). BackF's Jacobian column zeros out at \
+                 BackD ≈ 0; non-positive initial values produce a degenerate fit that \
+                 LM cannot recover.",
+                bg.back_d_init,
+            )));
+        }
+        if bg.fit_back_f && bg.back_f_init <= 0.0 {
+            return Err(PipelineError::InvalidParameter(format!(
+                "transmission_background.back_f_init must be strictly positive when \
+                 fit_back_f=true (got {}). BackD becomes a constant duplicate of BackA \
+                 at BackF ≈ 0; non-positive initial values produce a degenerate fit \
+                 that LM cannot recover.",
+                bg.back_f_init,
+            )));
+        }
+        // The joint-Poisson (counts-KL) dispatch never fits the SAMMY
+        // exponential tail — `fit_counts_joint_poisson` rejects
+        // `fit_back_d || fit_back_f` per pixel.  Surface up-front so the
+        // user gets a clear diagnostic instead of an all-NaN map.
+        if (bg.fit_back_d || bg.fit_back_f)
+            && input.is_counts()
+            && !matches!(config.solver(), SolverConfig::LevenbergMarquardt(_))
+        {
+            return Err(PipelineError::InvalidParameter(
+                "spatial_map_typed: transmission_background with fit_back_d=true / \
+                 fit_back_f=true cannot be combined with the counts-KL (joint-Poisson) \
+                 dispatch. The joint-Poisson solver does not fit the SAMMY exponential \
+                 tail. Either switch to SolverConfig::LevenbergMarquardt or disable the \
+                 exponential tail (fit_back_d=false, fit_back_f=false)."
+                    .into(),
+            ));
+        }
     }
 
     // Collect live pixel coordinates
@@ -2088,6 +2143,160 @@ mod tests {
         assert!(
             result.back_f_map.is_none(),
             "back_f_map must be None on the counts-KL path"
+        );
+    }
+
+    /// Issue #538 P1 (#548 review): unpaired `fit_back_d` /
+    /// `fit_back_f` must be rejected up-front by `spatial_map_typed`,
+    /// not just per-pixel.  Without this guard the per-pixel solver
+    /// errors are swallowed as `n_failed` and the caller sees an
+    /// all-NaN map with no diagnostic.
+    #[test]
+    fn test_spatial_map_back_d_f_unpaired_rejected_up_front() {
+        let rd = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        let (t_3d, u_3d) = synthetic_4x4_transmission(&rd, 0.001, &energies);
+        let data = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+        let bg = crate::pipeline::BackgroundConfig {
+            fit_back_d: true,
+            fit_back_f: false, // unpaired — must be rejected
+            back_d_init: 0.01,
+            back_f_init: 1.0,
+            ..crate::pipeline::BackgroundConfig::default()
+        };
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![rd],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_transmission_background(bg);
+        let err = spatial_map_typed(&data, &config, None, None, None)
+            .expect_err("unpaired fit_back_d/fit_back_f must be rejected up-front");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("fit_back_d") && msg.contains("fit_back_f"),
+            "error message must reference both fit flags, got: {msg}"
+        );
+    }
+
+    /// Issue #538 P1 (#548 review): non-positive `back_d_init` /
+    /// `back_f_init` is rejected up-front so the LM solver does not
+    /// silently produce a degenerate Jacobian.
+    #[test]
+    fn test_spatial_map_back_d_init_non_positive_rejected() {
+        let rd = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        let (t_3d, u_3d) = synthetic_4x4_transmission(&rd, 0.001, &energies);
+        let data = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+        let bg = crate::pipeline::BackgroundConfig {
+            fit_back_d: true,
+            fit_back_f: true,
+            back_d_init: 0.0, // non-positive — must be rejected
+            back_f_init: 1.0,
+            ..crate::pipeline::BackgroundConfig::default()
+        };
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![rd],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_transmission_background(bg);
+        let err = spatial_map_typed(&data, &config, None, None, None)
+            .expect_err("back_d_init=0.0 with fit_back_d=true must be rejected up-front");
+        assert!(
+            err.to_string().contains("back_d_init"),
+            "error must reference back_d_init, got: {err}"
+        );
+    }
+
+    /// Issue #538 P1 (#548 review): non-positive `back_f_init` is
+    /// rejected up-front for the same reason as `back_d_init`.
+    #[test]
+    fn test_spatial_map_back_f_init_non_positive_rejected() {
+        let rd = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        let (t_3d, u_3d) = synthetic_4x4_transmission(&rd, 0.001, &energies);
+        let data = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+        let bg = crate::pipeline::BackgroundConfig {
+            fit_back_d: true,
+            fit_back_f: true,
+            back_d_init: 0.01,
+            back_f_init: -1.0, // negative — must be rejected
+            ..crate::pipeline::BackgroundConfig::default()
+        };
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![rd],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_transmission_background(bg);
+        let err = spatial_map_typed(&data, &config, None, None, None)
+            .expect_err("back_f_init=-1.0 with fit_back_f=true must be rejected up-front");
+        assert!(
+            err.to_string().contains("back_f_init"),
+            "error must reference back_f_init, got: {err}"
+        );
+    }
+
+    /// Issue #538 P1 (#548 review): the joint-Poisson (counts-KL)
+    /// dispatch combined with a `transmission_background` carrying
+    /// `fit_back_d=true` / `fit_back_f=true` is rejected up-front so
+    /// the user gets a clear diagnostic instead of an all-NaN map
+    /// from per-pixel `n_failed` swallowing.
+    #[test]
+    fn test_spatial_map_counts_kl_plus_back_d_rejected_up_front() {
+        let rd = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        let (sample, ob) = synthetic_4x4_counts(&rd, 0.0005, &energies, 1000.0);
+        let data = InputData3D::Counts {
+            sample_counts: sample.view(),
+            open_beam_counts: ob.view(),
+        };
+        let bg = crate::pipeline::BackgroundConfig {
+            fit_back_d: true,
+            fit_back_f: true,
+            back_d_init: 0.01,
+            back_f_init: 1.0,
+            ..crate::pipeline::BackgroundConfig::default()
+        };
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![rd],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
+        .with_transmission_background(bg);
+        let err = spatial_map_typed(&data, &config, None, None, None)
+            .expect_err("counts-KL + fit_back_d/fit_back_f must be rejected up-front");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("counts-KL") || msg.contains("joint-Poisson"),
+            "error must reference the counts-KL incompatibility, got: {msg}"
         );
     }
 
