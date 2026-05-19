@@ -320,6 +320,26 @@ pub fn spatial_map_typed(
         ));
     }
 
+    // PR #548 Copilot review: `fit_spectrum_typed` rejects
+    // `CountsWithNuisance + LM` per-pixel (see pipeline.rs:950 —
+    // "CountsWithNuisance requires a counts-domain solver"), but
+    // `spatial_map_typed` swallows the per-pixel errors as `n_failed`
+    // and returns `Ok(SpatialResult)` with all-NaN maps.  Hoist the
+    // same rejection up-front so callers get a clear diagnostic
+    // instead of a silently-failed spatial result.
+    if matches!(input, InputData3D::CountsWithNuisance { .. })
+        && matches!(config.solver(), SolverConfig::LevenbergMarquardt(_))
+    {
+        return Err(PipelineError::InvalidParameter(
+            "spatial_map_typed: InputData3D::CountsWithNuisance requires a counts-domain \
+             solver (joint-Poisson via SolverConfig::PoissonKL or SolverConfig::Auto); \
+             SolverConfig::LevenbergMarquardt cannot use the user-supplied nuisance \
+             parameters (alpha_1, alpha_2).  Choose a counts-domain solver, or drop the \
+             nuisance arm by passing `InputData3D::Counts` instead."
+                .into(),
+        ));
+    }
+
     // Issue #538 (#548 review): hoist transmission-background BackD/BackF
     // validation from the per-pixel solver up to the spatial dispatch.
     // Without this, invalid configs (unpaired `fit_back_d`/`fit_back_f`,
@@ -2383,6 +2403,47 @@ mod tests {
         assert!(
             msg.contains("counts-KL") || msg.contains("joint-Poisson"),
             "error must reference the counts-KL incompatibility, got: {msg}"
+        );
+    }
+
+    /// PR #548 Copilot review: `CountsWithNuisance + LM` is rejected
+    /// up-front so the caller does not get an all-NaN spatial result
+    /// from per-pixel `n_failed` swallowing.  `fit_spectrum_typed`
+    /// rejects this combo per-pixel (pipeline.rs:950); the hoisted
+    /// spatial-level rejection surfaces the same diagnostic at the
+    /// boundary instead of pretending the fit ran.
+    #[test]
+    fn test_spatial_map_counts_with_nuisance_plus_lm_rejected_up_front() {
+        use ndarray::Array3;
+        let rd = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        let (sample, _ob) = synthetic_4x4_counts(&rd, 0.0005, &energies, 1000.0);
+        // `CountsWithNuisance` carries (sample, flux, background) per
+        // pixel.  The validation under test fires before any field is
+        // consumed, so synthetic flat 4x4 arrays suffice.
+        let flux: Array3<f64> = Array3::from_elem((energies.len(), 4, 4), 1000.0);
+        let background: Array3<f64> = Array3::from_elem((energies.len(), 4, 4), 0.0);
+        let data = InputData3D::CountsWithNuisance {
+            sample_counts: sample.view(),
+            flux: flux.view(),
+            background: background.view(),
+        };
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![rd],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()));
+        let err = spatial_map_typed(&data, &config, None, None, None)
+            .expect_err("CountsWithNuisance + LM must be rejected up-front");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("CountsWithNuisance") && msg.contains("counts-domain"),
+            "error must mention CountsWithNuisance + counts-domain requirement, got: {msg}"
         );
     }
 
