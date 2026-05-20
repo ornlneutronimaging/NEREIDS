@@ -1329,11 +1329,13 @@ fn parse_urr_range(
                 let j_cont = parse_cont(ctx.lines, ctx.pos)?;
                 let aj = j_cont.c1;
                 let int_code = j_cont.l1; // interpolation law (L1 field)
-                // Negative INT is a malformed ENDF record, not merely an
-                // unimplemented mode — reject it outright.
-                if int_code < 0 {
+                // ENDF-6 §0.5 defines INT codes 1..=5 (1=histogram, 2=lin-lin,
+                // 3=log-x/lin-y, 4=lin-x/log-y, 5=log-log). Anything outside
+                // that range — including negative values and INT=0 or INT≥6 —
+                // is a malformed record, not merely an unimplemented mode.
+                if !(1..=5).contains(&int_code) {
                     return Err(EndfParseError::UnsupportedFormat(format!(
-                        "URR LRF=2 J={aj}: negative INT={int_code}"
+                        "URR LRF=2 J={aj}: INT={int_code} out of spec (expected 1..=5)"
                     )));
                 }
                 let n1 = checked_count(j_cont.n1, "N1")?; // 6*(NE+1)
@@ -1448,15 +1450,10 @@ fn parse_urr_range(
                     gn,
                     gg,
                     gf,
-                    int_code: {
-                        // By this point we have verified int_code is 2 or 5
-                        // (the early-return above handles all other values).
-                        debug_assert!(
-                            int_code == 2 || int_code == 5,
-                            "int_code must be 2 or 5, got {int_code}"
-                        );
-                        int_code as u32
-                    },
+                    // INT was validated to be in 1..=5 immediately after
+                    // parsing the per-J CONT record, so this cast is safe.
+                    // (urr.rs:130-136 dispatches on the full INT=1..=5 set.)
+                    int_code: int_code as u32,
                 });
             }
 
@@ -1685,10 +1682,15 @@ mod tests {
         assert_eq!(parse_endf_int(line, 2).unwrap(), 2);
     }
 
-    /// Parse the SAMMY ex027 ENDF file for U-238 (Reich-Moore, LRF=3).
+    /// Parse the vendored U-238 ENDF file (Reich-Moore, LRF=3).
     ///
-    /// This test validates against the SAMMY-distributed ENDF file.
-    /// The first positive-energy resonance of U-238 is at 6.674 eV.
+    /// This test validates against the public-domain U-238 ENDF/B-VIII.0
+    /// evaluation shipped at `examples/data/u238_ex027.endf` (the same
+    /// file SAMMY distributes as `samexm_new/ex027_new/ex027.endf`). The
+    /// first positive-energy resonance of U-238 is at 6.674 eV.
+    ///
+    /// Vendored under public-domain ENDF/B redistribution, so this gate
+    /// runs unconditionally on CI — no `Skipping…` fall-through.
     #[test]
     fn test_parse_u238_sammy_endf() {
         let endf_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1696,14 +1698,10 @@ mod tests {
             .unwrap()
             .parent()
             .unwrap()
-            .join("../SAMMY/SAMMY/samexm_new/ex027_new/ex027.endf");
+            .join("examples/data/u238_ex027.endf");
 
-        if !endf_path.exists() {
-            println!("Skipping: SAMMY checkout not found at {:?}", endf_path);
-            return;
-        }
-
-        let endf_text = std::fs::read_to_string(&endf_path).unwrap();
+        let endf_text = std::fs::read_to_string(&endf_path)
+            .unwrap_or_else(|e| panic!("vendored U-238 fixture missing at {endf_path:?}: {e}"));
         let data = parse_endf_file2(&endf_text).unwrap();
 
         // Basic structure checks.
@@ -2164,59 +2162,82 @@ mod tests {
         assert!((res.energy - 6.674).abs() < 1e-6);
     }
 
-    /// Parse U-233 ENDF (SAMMY test tr149) which has LFW=1 in its URR.
+    /// LFW=1 with LRF=2 (tabulated widths, U-233-style record).
     ///
-    /// U-233 has two energy ranges:
+    /// SAMMY test tr149 (`t149a.endf`, MAT=9222, ZA=92233) has two ranges:
     ///   - Range 0: LRU=1 (resolved, Reich-Moore / LRF=3)
     ///   - Range 1: LRU=2, LRF=2, **LFW=1** (energy-dependent fission widths)
     ///
-    /// The LFW=1 URR range is gracefully skipped (not parsed into UrrData)
-    /// because we don't yet support energy-dependent fission widths. The
-    /// resolved range must still be returned so fissile isotopes remain
-    /// usable for cross-section calculations.
+    /// ENDF-6 §2.2.2.2: for LFW=1/LRF=2 the per-(L,J) LIST layout is
+    /// **identical to LFW=0/LRF=2** (the fission widths are already
+    /// per-energy-point in the LIST tail), so the parser dispatches to
+    /// the shared `parse_urr_range` path and produces full URR data.
     ///
-    /// Test data: ../SAMMY/SAMMY/sammy/samtry/tr149/t149a.endf (MAT=9222, ZA=92233)
+    /// We previously gated this assertion on a `../SAMMY/...t149a.endf`
+    /// sibling checkout; on CI (and on any clean clone) the file was
+    /// absent and the test silently reported `ok` after a `Skipping…`
+    /// print. Vendoring the full tr149 ENDF would be heavy; instead we
+    /// synthesise a minimal but record-shape-faithful LFW=1/LRF=2
+    /// fixture so the assertion runs unconditionally.
     #[test]
-    fn test_parse_u233_lfw1_urr_parsed() {
-        let endf_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("../SAMMY/SAMMY/sammy/samtry/tr149/t149a.endf");
-
-        if !endf_path.exists() {
-            eprintln!(
-                "Skipping test: U-233 ENDF file not found at {:?}",
-                endf_path
-            );
-            return;
-        }
-
-        let text = std::fs::read_to_string(&endf_path).unwrap();
-        let data = parse_endf_file2(&text).expect("U-233 must parse (LFW=1 URR now supported)");
-
-        // The resolved range must be present.
-        assert!(
-            !data.ranges.is_empty(),
-            "U-233 must have at least one parsed range"
+    fn test_parse_u233_lfw1_lrf2_urr_parsed() {
+        // Minimal MF=2/MT=151 with two ranges, mirroring tr149 layout:
+        //   Range 0: LRU=1, LRF=3 (Reich-Moore) — one trivial resonance.
+        //   Range 1: LRU=2, LRF=2, LFW=1       — NLS=1, NJS=1, NE=2.
+        // LFW=1 is flagged on the isotope CONT (L2 field).
+        const ENDF: &str = concat!(
+            // HEAD: ZA=92233, AWR=231.038, NIS=1
+            " 9.223300+4 2.310380+2          0          0          1          09222 2151    1\n",
+            // Isotope CONT: ZAI=92233, ABN=1.0, LFW=1, NER=2
+            " 9.223300+4 1.000000+0          0          1          2          09222 2151    2\n",
+            // -- Range 0: LRU=1, LRF=3 (resolved RM), NRO=0, NAPS=0 --
+            " 1.000000-5 6.000000+2          1          3          0          09222 2151    3\n",
+            // RM CONT: SPI=2.5, AP=0.96931, NLS=1
+            " 2.500000+0 9.693100-1          0          0          1          09222 2151    4\n",
+            // L CONT: AWRI=231.038, APL=0, L=0, NRS=1 (N1=6, NRS=1)
+            " 2.310380+2 0.000000+0          0          0          6          19222 2151    5\n",
+            // One resonance: ER=10, AJ=2.0, GN=1e-3, GG=3.5e-2, GFA=0, GFB=0
+            " 1.000000+1 2.000000+0 1.000000-3 3.500000-2 0.000000+0 0.000000+09222 2151    6\n",
+            // -- Range 1: LRU=2, LRF=2 (URR tabulated), LFW inherited --
+            " 6.000000+2 3.000000+4          2          2          0          09222 2151    7\n",
+            // SPI/AP CONT: SPI=2.5, AP=0.96931, NLS=1
+            " 2.500000+0 9.693100-1          0          0          1          09222 2151    8\n",
+            // L CONT: AWRI=231.038, L=0, NJS=1
+            " 2.310380+2 0.000000+0          0          0          1          09222 2151    9\n",
+            // J CONT: AJ=2.0, INT=2 (lin-lin), N1=6*(NE+1)=18, N2=NE=2
+            " 2.000000+0 0.000000+0          2          0         18          29222 2151   10\n",
+            // LIST row 0 (DOF): [0, 0, 0, AMUN=1, 0, AMUF=1]
+            " 0.000000+0 0.000000+0 0.000000+0 1.000000+0 0.000000+0 1.000000+09222 2151   11\n",
+            // Row 1: E=600,   D=0.5, GX=0, GN=3e-4, GG=3.5e-2, GF=1e-3
+            " 6.000000+2 5.000000-1 0.000000+0 3.000000-4 3.500000-2 1.000000-39222 2151   12\n",
+            // Row 2: E=30000, D=0.6, GX=0, GN=4e-4, GG=3.5e-2, GF=2e-3
+            " 3.000000+4 6.000000-1 0.000000+0 4.000000-4 3.500000-2 2.000000-39222 2151   13\n",
         );
 
-        // LFW=1 URR is now parsed — check if the URR range is present.
-        // U-233 may have LFW=1/LRF=1 which is now handled by parse_urr_lfw1_lrf1,
-        // or LFW=1/LRF=2 which passes through the standard parser.
-        let urr_count = data.ranges.iter().filter(|r| r.urr.is_some()).count();
-        assert!(
-            urr_count >= 1,
-            "U-233 LFW=1 URR range should now be parsed, found {urr_count} URR ranges"
-        );
+        let data = parse_endf_file2(ENDF)
+            .expect("U-233 LFW=1/LRF=2 fixture must parse (record layout = LFW=0/LRF=2)");
 
-        // At least one resolved range must exist.
+        // Both ranges must round-trip: resolved + URR.
+        assert_eq!(data.ranges.len(), 2, "must have 2 ranges (resolved + URR)");
+
         let resolved_count = data.ranges.iter().filter(|r| r.resolved).count();
-        assert!(
-            resolved_count >= 1,
-            "U-233 must have at least one resolved range, found {resolved_count}"
+        assert_eq!(resolved_count, 1, "exactly one resolved range");
+
+        let urr_count = data.ranges.iter().filter(|r| r.urr.is_some()).count();
+        assert_eq!(urr_count, 1, "LFW=1/LRF=2 URR range must be parsed");
+
+        let urr = data.ranges[1].urr.as_ref().unwrap();
+        assert_eq!(urr.lrf, 2, "URR LRF must be 2");
+        assert_eq!(urr.l_groups.len(), 1, "one L-group");
+        let jg = &urr.l_groups[0].j_groups[0];
+        assert_eq!(
+            jg.gf.len(),
+            2,
+            "LFW=1/LRF=2 must carry NE per-energy fission widths"
         );
+        assert!((jg.gf[0] - 1e-3).abs() < 1e-14, "GF[0]={}", jg.gf[0]);
+        assert!((jg.gf[1] - 2e-3).abs() < 1e-14, "GF[1]={}", jg.gf[1]);
+        assert!((jg.amuf - 1.0).abs() < 1e-14, "AMUF must round-trip as 1");
     }
 
     /// Hand-crafted LRF=1 URR roundtrip test.
@@ -2307,6 +2328,96 @@ mod tests {
         assert!((jg1.d[0] - 0.4).abs() < 1e-10, "D must be 0.4 eV");
         assert!((jg1.gn[0] - 2e-4).abs() < 1e-14, "GNO must be 2e-4 eV");
         assert!((jg1.gf[0] - 1e-3).abs() < 1e-14, "GF must be 1e-3 eV");
+    }
+
+    /// LRF=2 URR with INT=3 (log-x / lin-y) parses successfully.
+    ///
+    /// Pins issue #553 / M2: between commit 9d7c6bb (which removed the
+    /// INT=1/3/4 early-return guard in the URR LRF=2 path and wired the
+    /// full INT=1..=5 dispatch in urr.rs) and this PR, a stale
+    /// `debug_assert!(int_code == 2 || int_code == 5, …)` survived in
+    /// the LIST consumer block. Debug builds therefore panicked on
+    /// otherwise valid INT=1, 3, or 4 evaluations; release builds — used
+    /// for `cargo test --release` and for end-user binaries — worked
+    /// correctly because `debug_assert!` is compiled out.
+    ///
+    /// This test is **explicitly written to fail in debug builds against
+    /// the pre-fix parser** and to pass under both `cargo test` and
+    /// `cargo test --release` once the assertion is removed and the INT
+    /// code is validated up-front (1..=5).
+    #[test]
+    fn test_parse_lrf2_urr_int3_roundtrip() {
+        // Minimal ENDF MF=2/MT=151 with one LRU=2/LRF=2 range:
+        // NLS=1 (L=0), NJS=1, NE=2 energy points, INT=3 (log-x/lin-y).
+        // LIST layout: row 0 = [0, 0, 0, AMUN, 0, AMUF]; rows 1..=NE = (E,
+        // D, GX, GN, GG, GF). Total = 6*(NE+1) = 18 floats = 3 lines.
+        const ENDF: &str = concat!(
+            // HEAD: ZA=92238, AWR=236.006, NIS=1
+            " 9.223800+4 2.360060+2          0          0          1          09237 2151    1\n",
+            // Isotope CONT: ABN=1, LFW=0, NER=1
+            " 9.223800+4 1.000000+0          0          0          1          09237 2151    2\n",
+            // Range CONT: EL=1e3, EH=1e5, LRU=2, LRF=2, NRO=0, NAPS=0
+            " 1.000000+3 1.000000+5          2          2          0          09237 2151    3\n",
+            // SPI/AP CONT: SPI=0, AP=0.9428, NLS=1
+            " 0.000000+0 9.428000-1          0          0          1          09237 2151    4\n",
+            // L CONT: AWRI=236, 0, L=0, 0, NJS=1, 0
+            " 2.360060+2 0.000000+0          0          0          1          09237 2151    5\n",
+            // J CONT: AJ=0.5, 0, INT=3 (log-x/lin-y), 0, N1=6*(NE+1)=18, N2=NE=2
+            " 5.000000-1 0.000000+0          3          0         18          29237 2151    6\n",
+            // LIST row 0 (DOF): [0, 0, 0, AMUN=1, 0, AMUF=0]
+            " 0.000000+0 0.000000+0 0.000000+0 1.000000+0 0.000000+0 0.000000+09237 2151    7\n",
+            // LIST row 1: E=1e3, D=20, GX=0, GN=1e-3, GG=2.3e-2, GF=0
+            " 1.000000+3 2.000000+1 0.000000+0 1.000000-3 2.300000-2 0.000000+09237 2151    8\n",
+            // LIST row 2: E=1e5, D=22, GX=0, GN=2e-3, GG=2.3e-2, GF=0
+            " 1.000000+5 2.200000+1 0.000000+0 2.000000-3 2.300000-2 0.000000+09237 2151    9\n",
+        );
+
+        let data = parse_endf_file2(ENDF).expect("LRF=2 URR with INT=3 must parse");
+        assert_eq!(data.ranges.len(), 1, "must have one URR range");
+        let urr = data.ranges[0]
+            .urr
+            .as_ref()
+            .expect("URR data must be present");
+        assert_eq!(urr.lrf, 2);
+        assert_eq!(urr.l_groups.len(), 1);
+        let jg = &urr.l_groups[0].j_groups[0];
+        assert_eq!(jg.int_code, 3, "INT code must round-trip as 3");
+        assert_eq!(jg.energies.len(), 2);
+        assert!((jg.energies[0] - 1e3).abs() < 1e-6);
+        assert!((jg.energies[1] - 1e5).abs() < 1e-3);
+        assert!((jg.amun - 1.0).abs() < 1e-14);
+        assert!((jg.gn[0] - 1e-3).abs() < 1e-14);
+        assert!((jg.gn[1] - 2e-3).abs() < 1e-14);
+    }
+
+    /// LRF=2 URR with INT=0 is rejected as a hard error.
+    ///
+    /// ENDF-6 §0.5 defines INT codes 1..=5 only. INT=0 is malformed,
+    /// not merely unsupported, so the parser surfaces it as
+    /// `UnsupportedFormat("INT=0 out of spec (expected 1..=5)")` rather
+    /// than panicking or silently defaulting to lin-lin.
+    #[test]
+    fn test_parse_lrf2_urr_int0_rejected() {
+        // Same skeleton as INT=3 test, but with INT=0 in the J CONT.
+        const ENDF: &str = concat!(
+            " 9.223800+4 2.360060+2          0          0          1          09237 2151    1\n",
+            " 9.223800+4 1.000000+0          0          0          1          09237 2151    2\n",
+            " 1.000000+3 1.000000+5          2          2          0          09237 2151    3\n",
+            " 0.000000+0 9.428000-1          0          0          1          09237 2151    4\n",
+            " 2.360060+2 0.000000+0          0          0          1          09237 2151    5\n",
+            // J CONT: INT=0 (out-of-spec)
+            " 5.000000-1 0.000000+0          0          0         18          29237 2151    6\n",
+            " 0.000000+0 0.000000+0 0.000000+0 1.000000+0 0.000000+0 0.000000+09237 2151    7\n",
+            " 1.000000+3 2.000000+1 0.000000+0 1.000000-3 2.300000-2 0.000000+09237 2151    8\n",
+            " 1.000000+5 2.200000+1 0.000000+0 2.000000-3 2.300000-2 0.000000+09237 2151    9\n",
+        );
+
+        let err = parse_endf_file2(ENDF).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("INT=0") && msg.contains("out of spec"),
+            "expected INT-out-of-spec rejection, got: {msg}"
+        );
     }
 
     // -----------------------------------------------------------------------
