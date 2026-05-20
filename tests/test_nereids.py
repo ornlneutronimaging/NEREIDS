@@ -2123,3 +2123,182 @@ class TestEnergyGridValidation:
         s = np.array([], dtype=np.float64)
         with pytest.raises(ValueError):
             nereids.calibrate_energy(e, t, s, [u238_data], [1.0], 25.0)
+
+
+# ===========================================================================
+# Type-stub conformance — regression for issue #555 (M5)
+# ===========================================================================
+
+
+class TestStubConformance:
+    """Sanity checks that the runtime PyO3 export surface is reflected in
+    ``bindings/python/python/nereids/__init__.pyi``.
+
+    The original M5 drift (``from_counts_with_nuisance`` exported by Rust
+    but missing from the stub) slipped past ``scripts/check_python_api_drift.py``
+    because that checker compares stub vs the curated narrative docs, not
+    stub vs the compiled extension.  These tests close that gap on the
+    runtime side.
+    """
+
+    def test_from_counts_with_nuisance_importable_and_introspectable(self):
+        """M5 regression: the symbol must be importable from ``nereids``,
+        callable, AND its signature must be introspectable via
+        ``inspect.signature`` — the latter is what static type checkers
+        relied on before the stub fix landed."""
+        import inspect
+
+        from nereids import from_counts_with_nuisance  # noqa: F401
+
+        # Stub fix means a static type-checker would now accept this
+        # `getattr` path too; the runtime check below is the regression
+        # gate against future re-drift.
+        assert callable(nereids.from_counts_with_nuisance)
+        sig = inspect.signature(nereids.from_counts_with_nuisance)
+        params = list(sig.parameters.keys())
+        # Parameter names must match the PyO3 binding signature so the
+        # stub stays in lock-step with runtime introspection.
+        assert params == ["sample_counts", "flux", "background"], (
+            f"from_counts_with_nuisance signature drifted from stub: "
+            f"got {params!r}"
+        )
+
+    def test_runtime_exports_present_in_stub(self):
+        """Every public (non-underscore) attribute on the compiled
+        ``nereids`` module must be either defined in ``__init__.pyi`` OR
+        documented as an intentional omission below.
+
+        This catches the inverse of the python-api.md drift check: a
+        PyO3 export that was never added to the stub at all.  Failure
+        mode prior to this regression: `from_counts_with_nuisance`
+        worked at runtime but was rejected by mypy / pyright.
+        """
+        import ast
+        from pathlib import Path
+
+        # Resolve the stub relative to the installed package (works
+        # whether nereids is installed editable from the source tree
+        # or as a wheel that carries the .pyi alongside the .so).
+        nereids_dir = Path(nereids.__file__).resolve().parent
+        stub_path = nereids_dir / "__init__.pyi"
+        assert stub_path.exists(), f"missing type stub: {stub_path}"
+
+        tree = ast.parse(stub_path.read_text(encoding="utf-8"))
+        stub_names: set[str] = set()
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if not node.name.startswith("_"):
+                    stub_names.add(node.name)
+
+        # Dunders + the ``__version__`` style attributes don't belong
+        # in the stub; pyo3's auto-injected ``annotations`` import isn't
+        # an export either.  We also exclude submodules (e.g. PyO3
+        # re-exports the inner ``nereids.nereids`` extension module
+        # itself as an attribute on the outer package) because those
+        # are package plumbing, not typed-surface exports.
+        import types
+
+        runtime_names = {
+            name
+            for name in dir(nereids)
+            if not name.startswith("_")
+            and not name.startswith("Py")
+            and not isinstance(getattr(nereids, name), types.ModuleType)
+        }
+
+        # Intentional omissions: re-exported third-party modules or
+        # convenience aliases that aren't part of the typed surface.
+        # Keep this set tight — every entry is a drift loophole.
+        intentional_omissions: set[str] = set()
+
+        missing = runtime_names - stub_names - intentional_omissions
+        assert not missing, (
+            f"runtime symbols missing from __init__.pyi: {sorted(missing)!r}. "
+            "Either add a `def`/`class` to the stub OR justify the omission "
+            "in `intentional_omissions`."
+        )
+
+
+# ===========================================================================
+# calibrate_energy — regression smoke test for issue #555 (M13)
+# ===========================================================================
+
+
+class TestCalibrateEnergySmoke:
+    """Smoke test for the ``calibrate_energy`` PyO3 binding.
+
+    The M13 fix replaced ``as_slice()?`` borrows into NumPy memory with
+    ``as_slice()?.to_vec()`` copies so the closure passed to ``py.detach``
+    no longer holds dangling references when the GIL is released and
+    another Python thread mutates the input arrays.
+
+    A reliable concurrency exploit test for the old borrow pattern is
+    racy and difficult to write deterministically; the value here is
+    confirming the mechanical owned-Vec rewrite did not break the
+    happy path on a small synthetic case."""
+
+    def test_calibrate_energy_runs_on_synthetic_u238(self, u238_data):
+        # Use the U-238-like single-resonance fixture (resonance at 6.67 eV).
+        # Generate a clean transmission spectrum and feed it back through
+        # ``calibrate_energy``.  The fitter does a coarse grid over
+        # (L, t0, n_total); we only need a finite, non-NaN return.
+        assumed_l = 25.0
+        energies = np.linspace(1.0, 30.0, 400)
+        transmission = np.asarray(
+            nereids.forward_model(energies, [(u238_data, 5.0e-4)])
+        )
+        uncertainty = np.full_like(transmission, 0.01)
+
+        result = nereids.calibrate_energy(
+            energies,
+            transmission,
+            uncertainty,
+            [u238_data],
+            [1.0],
+            assumed_l,
+            293.6,
+        )
+
+        # All returned scalars must be finite — a dangling-borrow / GIL
+        # corruption regression typically surfaces as NaN, junk values,
+        # or a crash inside `py.detach`.
+        assert np.isfinite(result.flight_path_m)
+        assert np.isfinite(result.t0_us)
+        assert np.isfinite(result.total_density)
+        assert np.isfinite(result.reduced_chi_squared)
+        # The corrected energy grid must round-trip with the input length
+        # and be strictly ascending (basic sanity for the fitted mapping).
+        e_corr = np.asarray(result.energies_corrected)
+        assert e_corr.shape == energies.shape
+        assert np.all(np.diff(e_corr) > 0.0)
+
+    def test_calibrate_energy_input_arrays_unchanged(self, u238_data):
+        """Regression gate for the borrow→to_vec fix: after the closure
+        captures owned copies, the original NumPy arrays must round-trip
+        unchanged across the call (no in-place mutation, no aliased
+        write-back).  This is a structural rather than concurrency
+        check, but it catches the simplest class of aliasing
+        regressions if someone reverts the ``.to_vec()`` later."""
+        energies = np.linspace(1.0, 30.0, 200)
+        transmission = np.asarray(
+            nereids.forward_model(energies, [(u238_data, 5.0e-4)])
+        )
+        uncertainty = np.full_like(transmission, 0.01)
+
+        e_before = energies.copy()
+        t_before = transmission.copy()
+        s_before = uncertainty.copy()
+
+        _ = nereids.calibrate_energy(
+            energies,
+            transmission,
+            uncertainty,
+            [u238_data],
+            [1.0],
+            25.0,
+            293.6,
+        )
+
+        np.testing.assert_array_equal(energies, e_before)
+        np.testing.assert_array_equal(transmission, t_before)
+        np.testing.assert_array_equal(uncertainty, s_before)

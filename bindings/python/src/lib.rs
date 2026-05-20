@@ -2178,9 +2178,16 @@ fn py_calibrate_energy(
     temperature_k: f64,
     resolution: Option<PyTabulatedResolution>,
 ) -> PyResult<PyCalibrationResult> {
-    let e = energies_nominal.as_slice()?;
-    let t = transmission.as_slice()?;
-    let s = uncertainty.as_slice()?;
+    // Copy NumPy slices to owned `Vec<f64>` *before* `py.detach` so the
+    // closure does not hold borrows into NumPy-owned memory across the GIL
+    // release.  rust-numpy 0.28 only guards borrows while the GIL is held;
+    // once detached another Python thread could mutate/reallocate the
+    // arrays and the inner Rust slices would dangle.  Every other
+    // `py.detach` site in this file follows the same `.as_slice()?.to_vec()`
+    // pattern — `calibrate_energy` was the lone outlier.
+    let e_owned = energies_nominal.as_slice()?.to_vec();
+    let t_owned = transmission.as_slice()?.to_vec();
+    let s_owned = uncertainty.as_slice()?.to_vec();
 
     // Validate the nominal energy grid up front so malformed energies
     // surface as ValueError rather than a release-mode `PanicException`
@@ -2215,9 +2222,9 @@ fn py_calibrate_energy(
 
     let result = py.detach(move || {
         nereids_pipeline::calibration::calibrate_energy(
-            e,
-            t,
-            s,
+            &e_owned,
+            &t_owned,
+            &s_owned,
             &res_data,
             &abundances,
             assumed_flight_path_m,

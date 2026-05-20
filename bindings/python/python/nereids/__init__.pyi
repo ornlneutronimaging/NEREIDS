@@ -763,6 +763,31 @@ def from_counts(
     ...
 
 
+def from_counts_with_nuisance(
+    sample_counts: NDArray[np.float64],
+    flux: NDArray[np.float64],
+    background: NDArray[np.float64],
+) -> InputData:
+    """Create InputData from raw detector counts plus explicit nuisance spectra.
+
+    Use this when the detector/counts background spectrum has been
+    estimated outside NEREIDS and should be supplied explicitly
+    alongside the open-beam flux.  Routes through the counts-KL
+    (joint-Poisson) dispatch when passed to ``spatial_map_typed`` /
+    ``fit_counts_spectrum_typed`` with ``solver="auto"`` / ``"kl"``.
+
+    Args:
+        sample_counts: 3D float64 array (n_energies, height, width).
+        flux: 3D float64 array (n_energies, height, width) of open-beam flux.
+        background: 3D float64 array (n_energies, height, width) of
+            detector/counts background.
+
+    Returns:
+        InputData object to pass to ``spatial_map_typed()``.
+    """
+    ...
+
+
 def from_transmission(
     transmission: NDArray[np.float64],
     uncertainty: NDArray[np.float64],

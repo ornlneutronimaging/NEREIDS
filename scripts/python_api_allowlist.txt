@@ -68,3 +68,14 @@ detect_dead_pixels
 # ---------------------------------------------------------------------------
 compute_model_jacobian
 ModelJacobianResult
+
+# ---------------------------------------------------------------------------
+# Typed-API counts+nuisance constructor (issue #555 M5).  ``from_counts``
+# and ``from_transmission`` are exercised in the curated narrative; the
+# nuisance variant is the explicit-background sibling and follows the
+# same shape, so it's covered by the surrounding section without a
+# dedicated heading.  Move OUT of the allowlist once
+# ``docs/guide/src/python-api.md`` gains an explicit "Counts with
+# explicit background" subsection.
+# ---------------------------------------------------------------------------
+from_counts_with_nuisance
