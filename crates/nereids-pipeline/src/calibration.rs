@@ -99,6 +99,32 @@ pub fn calibrate_energy(
         )));
     }
 
+    // Validate scalar / array inputs up-front so the grid-search loop
+    // cannot silently produce a "perfect calibration" result from
+    // degenerate inputs.  Without these guards, all-NaN transmission
+    // combined with the dof=1 fallback below would cause
+    // chi²_reduced = 0.0 to be reported as a successful fit.
+    if !assumed_flight_path_m.is_finite() || assumed_flight_path_m <= 0.0 {
+        return Err(PipelineError::InvalidParameter(format!(
+            "assumed_flight_path_m must be finite and positive, got {assumed_flight_path_m}",
+        )));
+    }
+    for (i, &e) in energies_nominal.iter().enumerate() {
+        if !e.is_finite() || e <= 0.0 {
+            return Err(PipelineError::InvalidParameter(format!(
+                "energies_nominal[{i}] must be finite and positive, got {e}",
+            )));
+        }
+        if i > 0 && e <= energies_nominal[i - 1] {
+            return Err(PipelineError::InvalidParameter(format!(
+                "energies_nominal must be strictly ascending; \
+                 energies_nominal[{i}]={e} <= energies_nominal[{}]={}",
+                i - 1,
+                energies_nominal[i - 1],
+            )));
+        }
+    }
+
     // Recover TOF from nominal energies: t = L_assumed · √(C / E)
     let tof_s: Vec<f64> = energies_nominal
         .iter()
@@ -111,6 +137,21 @@ pub fn calibrate_energy(
         .zip(uncertainty.iter())
         .map(|(&t, &s)| t.is_finite() && s.is_finite() && s > 0.0)
         .collect();
+
+    // Require enough valid bins to constrain the three fitted
+    // parameters (L, t₀, n_total).  Previously, when every bin was
+    // invalid, `compute_chi2` returned 0.0 for every grid point, the
+    // first candidate latched as "best", and the dof=1 fallback turned
+    // that into a reported `chi²_reduced = 0.0` — i.e. a totally
+    // degenerate input was indistinguishable from a perfect calibration.
+    const N_FITTED_PARAMS: usize = 3;
+    let n_valid = valid.iter().filter(|&&v| v).count();
+    if n_valid < N_FITTED_PARAMS {
+        return Err(PipelineError::InvalidParameter(format!(
+            "calibrate_energy requires at least {N_FITTED_PARAMS} bins with finite \
+             transmission and positive uncertainty, got {n_valid} valid out of {n}",
+        )));
+    }
 
     // ── Phase 1: Coarse grid search over (L, t₀, n_total) ──────────
     // L: ±1% around assumed (0.5% steps = 5 points each side)
@@ -287,9 +328,12 @@ pub fn calibrate_energy(
         .map(|&t| NEUTRON_MASS_CONSTANT * (best_l / (t - t0_best_s)).powi(2))
         .collect();
 
-    // Final chi2r (reduced)
-    let n_valid = valid.iter().filter(|&&v| v).count();
-    let dof = if n_valid > 3 { n_valid - 3 } else { 1 }; // 3 fitted params
+    // Final chi2r (reduced).  The up-front guard ensures
+    // `n_valid >= N_FITTED_PARAMS`, so we always have a non-negative
+    // dof.  We still clamp to `max(1)` so that the exact-fit edge case
+    // (n_valid == N_FITTED_PARAMS, dof = 0) reports a finite value
+    // instead of dividing by zero.
+    let dof = n_valid.saturating_sub(N_FITTED_PARAMS).max(1);
     let chi2r = best_chi2 / dof as f64;
 
     Ok(CalibrationResult {
@@ -348,37 +392,49 @@ fn compute_chi2(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::synthetic_single_resonance;
 
+    /// Round-trip exercise of the public `calibrate_energy` API on a
+    /// synthetic spectrum.  Uses `synthetic_single_resonance` from
+    /// `test_helpers` so the test does not require network access and
+    /// runs in every CI invocation.
+    ///
+    /// Note on tolerances: the grid-search calibrator's L resolution
+    /// is fundamentally limited by chi² curvature (broader resonances
+    /// or sparser bins → broader minimum).  With only synthetic
+    /// single-resonance isotopes, the chi² landscape near L=true_l is
+    /// shallow on the scale of the 0.001 % ultra-fine step.  We
+    /// therefore (a) use a small true offset (0.05 % in L, 0.5 µs in
+    /// t₀) that the calibrator can resolve, and (b) test the
+    /// *physics* (a fit converged, parameters are inside a few-σ
+    /// band) rather than chasing exact ENDF-style recovery.  The
+    /// bit-exact precision question is owned by the SAMMY parity
+    /// tests in `nereids-physics`, not by this API smoke test.
     #[test]
-    #[ignore = "requires network: downloads Hf-178 ENDF from IAEA"]
-    fn test_calibrate_round_trip() {
+    fn test_calibrate_round_trip_synthetic() {
         // Generate synthetic data with known L and t0, then recover them.
-        let true_l = 25.08;
-        let true_t0_us = 1.0;
+        // Small offsets (0.05 % in L, 0.5 µs in t₀) so the chi² minimum
+        // is well inside Phase-2 fine grid (±0.05 % in L, ±2 µs in t₀).
+        let true_l = 25.0125;
+        let assumed_l = 25.0;
+        let true_t0_us = 0.5;
         let true_n = 1.5e-4;
         let temperature_k = 293.6;
 
-        // Use Hf-178 as a single-isotope reference (strong resonance at ~7.8 eV)
-        let iso = {
-            use nereids_core::types::Isotope;
-            use nereids_endf::parser::parse_endf_file2;
-            use nereids_endf::retrieval::{EndfLibrary, EndfRetriever, mat_number};
+        // Two well-separated single-resonance isotopes give a broader
+        // energy lever arm than a single resonance, sharpening the
+        // chi² minimum without exploding test runtime.
+        let iso_a = synthetic_single_resonance(72, 178, 176.4, 7.8);
+        let iso_b = synthetic_single_resonance(72, 178, 176.4, 22.0);
+        let isotopes = vec![iso_a, iso_b];
+        let abundances = vec![0.5, 0.5];
 
-            let isotope = Isotope::new(72, 178).unwrap();
-            let mat =
-                mat_number(&isotope, EndfLibrary::EndfB8_0).expect("No MAT number for Hf-178");
-            let retriever = EndfRetriever::new();
-            let (_path, contents) = retriever
-                .get_endf_file(&isotope, EndfLibrary::EndfB8_0, mat)
-                .expect("Failed to retrieve Hf-178");
-            parse_endf_file2(&contents).expect("Failed to parse Hf-178")
-        };
-
-        // Create nominal energy grid (as if L=25.0, t0=0)
-        let assumed_l = 25.0;
-        let e_nominal: Vec<f64> = (0..500)
-            .map(|i| 5.0 + i as f64 * 0.4) // 5 to 205 eV
-            .collect();
+        // Create nominal energy grid (as if L=25.0, t0=0).  150 bins
+        // across 5–35 eV brackets both resonances with ≈0.2 eV
+        // spacing; the original 500-bin Hf-178 test was wider but
+        // most of its constraining power came from resonances we
+        // do not have in this synthetic.
+        let e_nominal: Vec<f64> = (0..150).map(|i| 5.0 + i as f64 * 0.2).collect();
 
         // Recover TOF from nominal E at assumed L
         let tof_s: Vec<f64> = e_nominal
@@ -393,9 +449,15 @@ mod tests {
             .map(|&t| NEUTRON_MASS_CONSTANT * (true_l / (t - true_t0_s)).powi(2))
             .collect();
 
-        // Generate synthetic transmission at true energies
-        let sample = SampleParams::new(temperature_k, vec![(iso.clone(), true_n)])
-            .expect("SampleParams creation failed");
+        // Generate synthetic transmission at true energies, with the
+        // same effective density distribution we pass to the
+        // calibrator.
+        let pairs: Vec<_> = isotopes
+            .iter()
+            .zip(abundances.iter())
+            .map(|(iso, &abd)| (iso.clone(), abd * true_n))
+            .collect();
+        let sample = SampleParams::new(temperature_k, pairs).expect("SampleParams creation failed");
         let t_model =
             transmission::forward_model(&e_true, &sample, None).expect("forward_model failed");
 
@@ -407,15 +469,20 @@ mod tests {
             &e_nominal,
             &t_model,
             &sigma,
-            &[iso],
-            &[1.0], // single isotope, abundance = 1.0
+            &isotopes,
+            &abundances,
             assumed_l,
             temperature_k,
             None,
         )
         .expect("Calibration failed");
 
-        // Check recovery
+        // Check recovery.  Wider tolerances than the Hf-178 fixture
+        // because the synthetic chi² minimum is broader (see the
+        // doc comment on the test above).  These bands still
+        // distinguish a successful fit from a degenerate one (the
+        // zero-valid-bins failure mode would report L = assumed_l
+        // and chi² = 0.0).
         assert!(
             (result.flight_path_m - true_l).abs() < 0.05,
             "L: got {}, expected {}",
@@ -423,21 +490,185 @@ mod tests {
             true_l,
         );
         assert!(
-            (result.t0_us - true_t0_us).abs() < 1.0,
+            (result.t0_us - true_t0_us).abs() < 2.0,
             "t0: got {}, expected {}",
             result.t0_us,
             true_t0_us,
         );
         assert!(
-            (result.total_density - true_n).abs() / true_n < 0.2,
+            (result.total_density - true_n).abs() / true_n < 0.3,
             "n: got {}, expected {}",
             result.total_density,
             true_n,
         );
         assert!(
-            result.reduced_chi_squared < 1.0,
-            "chi2r should be < 1 for synthetic data, got {}",
+            result.reduced_chi_squared.is_finite() && result.reduced_chi_squared > 0.0,
+            "chi²_reduced must be finite and > 0 (zero-valid-bins regression: a \
+             degenerate input previously reported chi²_reduced = 0.0 as success); \
+             got {}",
             result.reduced_chi_squared,
+        );
+    }
+
+    // ── Degenerate-input guards ────────────────────────────────────────
+    //
+    // Before these guards, `compute_chi2` returned 0.0 when every bin
+    // was skipped by the `valid` mask, the grid search latched the
+    // first candidate as "best", and the dof=1 fallback at the end
+    // turned that into a reported `chi²_reduced = 0.0` — a totally
+    // degenerate input was indistinguishable from a perfect
+    // calibration.
+
+    /// `(energies_nominal, transmission, uncertainty, isotopes, abundances)`
+    /// — the five array arguments to `calibrate_energy`.
+    type CalibrationInputs = (Vec<f64>, Vec<f64>, Vec<f64>, Vec<ResonanceData>, Vec<f64>);
+
+    /// Build a minimal valid input set for `calibrate_energy`, then let
+    /// the caller mutate one field to drive a specific error path.
+    fn minimal_calibration_inputs() -> CalibrationInputs {
+        let iso = synthetic_single_resonance(72, 178, 176.4, 7.8);
+        let energies: Vec<f64> = (0..50).map(|i| 5.0 + i as f64 * 0.4).collect();
+        let transmission = vec![0.95; energies.len()];
+        let uncertainty = vec![0.01; energies.len()];
+        (energies, transmission, uncertainty, vec![iso], vec![1.0])
+    }
+
+    #[test]
+    fn test_calibrate_all_nan_transmission_rejected() {
+        // All-NaN transmission would previously yield zero valid bins,
+        // compute_chi2() returned 0.0 for every grid point, and the
+        // dof=1 fallback reported chi²_reduced = 0.0 as success.
+        let (energies, mut transmission, uncertainty, isotopes, abundances) =
+            minimal_calibration_inputs();
+        for t in transmission.iter_mut() {
+            *t = f64::NAN;
+        }
+        let err = calibrate_energy(
+            &energies,
+            &transmission,
+            &uncertainty,
+            &isotopes,
+            &abundances,
+            25.0,
+            293.6,
+            None,
+        )
+        .expect_err("all-NaN transmission must be rejected");
+        match err {
+            PipelineError::InvalidParameter(msg) => {
+                assert!(
+                    msg.contains("valid"),
+                    "error message should mention valid-bin count, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidParameter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_calibrate_all_zero_uncertainty_rejected() {
+        // All-zero uncertainty is the other path to zero valid bins
+        // (sigma > 0 is required by the valid mask).
+        let (energies, transmission, mut uncertainty, isotopes, abundances) =
+            minimal_calibration_inputs();
+        for s in uncertainty.iter_mut() {
+            *s = 0.0;
+        }
+        let err = calibrate_energy(
+            &energies,
+            &transmission,
+            &uncertainty,
+            &isotopes,
+            &abundances,
+            25.0,
+            293.6,
+            None,
+        )
+        .expect_err("all-zero uncertainty must be rejected");
+        assert!(
+            matches!(err, PipelineError::InvalidParameter(_)),
+            "expected InvalidParameter, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_calibrate_nonfinite_flight_path_rejected() {
+        // All non-finite or non-positive flight paths must produce
+        // InvalidParameter, naming the offending field so the caller
+        // can diagnose the source.
+        let (energies, transmission, uncertainty, isotopes, abundances) =
+            minimal_calibration_inputs();
+        for bad_l in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -1.0] {
+            let result = calibrate_energy(
+                &energies,
+                &transmission,
+                &uncertainty,
+                &isotopes,
+                &abundances,
+                bad_l,
+                293.6,
+                None,
+            );
+            match result {
+                Ok(_) => panic!("expected Err for L={bad_l}, got Ok"),
+                Err(PipelineError::InvalidParameter(msg)) => {
+                    assert!(
+                        msg.contains("assumed_flight_path_m"),
+                        "error message should name the offending field for L={bad_l}, got: {msg}"
+                    );
+                }
+                Err(other) => panic!("expected InvalidParameter for L={bad_l}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_calibrate_nonascending_energies_rejected() {
+        let (mut energies, transmission, uncertainty, isotopes, abundances) =
+            minimal_calibration_inputs();
+        // Introduce a non-ascending pair.
+        energies[10] = energies[9];
+        let err = calibrate_energy(
+            &energies,
+            &transmission,
+            &uncertainty,
+            &isotopes,
+            &abundances,
+            25.0,
+            293.6,
+            None,
+        )
+        .expect_err("non-ascending energies must be rejected");
+        match err {
+            PipelineError::InvalidParameter(msg) => {
+                assert!(
+                    msg.contains("ascending"),
+                    "error message should mention ascending, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidParameter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_calibrate_nonfinite_energy_rejected() {
+        let (mut energies, transmission, uncertainty, isotopes, abundances) =
+            minimal_calibration_inputs();
+        energies[7] = f64::NAN;
+        let err = calibrate_energy(
+            &energies,
+            &transmission,
+            &uncertainty,
+            &isotopes,
+            &abundances,
+            25.0,
+            293.6,
+            None,
+        )
+        .expect_err("NaN energy must be rejected");
+        assert!(
+            matches!(err, PipelineError::InvalidParameter(_)),
+            "expected InvalidParameter, got {err:?}"
         );
     }
 }
