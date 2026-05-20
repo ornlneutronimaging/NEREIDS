@@ -1119,14 +1119,24 @@ fn parse_endf_int(line: &str, field_index: usize) -> Result<i32, EndfParseError>
     }
 
     // ENDF integers may have a decimal point (e.g., "1.000000+0" for 1).
-    // Try integer parse first, then float-to-int.
+    // Try integer parse first, then float-with-integral-value.
     if let Ok(v) = trimmed.parse::<i32>() {
         return Ok(v);
     }
 
-    // Try parsing as float then truncating.
+    // Try parsing as float, but reject non-integral values (e.g., "1.9e+0")
+    // rather than silently truncating.  Use the same ε=1e-6 tolerance as
+    // `parse_tab1`'s NBT/INT validation so that integer fields stored as
+    // ENDF floats ("1.000000+0") still round-trip, but a malformed
+    // "1.900000+0" is surfaced as an InvalidNumber rather than parsed as 1.
     if let Ok(v) = parse_endf_float(line, field_index) {
-        return Ok(v as i32);
+        if (v - v.round()).abs() > 1e-6 {
+            return Err(EndfParseError::InvalidNumber(format!(
+                "Non-integral value in ENDF int field: '{}' (={})",
+                field, v
+            )));
+        }
+        return Ok(v.round() as i32);
     }
 
     Err(EndfParseError::InvalidNumber(format!(
@@ -1241,9 +1251,14 @@ fn parse_urr_range(
 ) -> Result<ResonanceRange, EndfParseError> {
     use crate::resonance::{UrrData, UrrJGroup, UrrLGroup};
 
-    // Caller guarantees LFW=0 before entering this function.
-    // LFW=1 (energy-dependent fission widths) is handled by
-    // skip_urr_lfw1_body in the caller.
+    // This function handles two routes:
+    //   • LFW=0 (LRF=1 or LRF=2): the standard URR case.
+    //   • LFW=1 / LRF=2: the LIST layout is byte-identical to LFW=0/LRF=2
+    //     (the LFW=1 fission-width grid is embedded in the per-J LIST row
+    //     itself, not in a separate shared-grid block), so the caller
+    //     routes that combination here.
+    // LFW=1 / LRF=1 (energy-dependent fission widths with the shared-grid
+    // layout) is handled separately by `parse_urr_lfw1_lrf1`.
 
     // CONT: SPI, AP, 0, 0, NLS, 0
     // ENDF AP is in 10⁻¹² cm; convert to fm (×10).
@@ -1693,12 +1708,12 @@ mod tests {
     /// runs unconditionally on CI — no `Skipping…` fall-through.
     #[test]
     fn test_parse_u238_sammy_endf() {
-        let endf_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("examples/data/u238_ex027.endf");
+        // Crate-local copy so the test works when nereids-endf is built
+        // standalone (outside the workspace, where `examples/data/` is
+        // not packaged).  The original `examples/data/u238_ex027.endf`
+        // is kept for end-user example code.
+        let endf_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/u238_ex027.endf");
 
         let endf_text = std::fs::read_to_string(&endf_path)
             .unwrap_or_else(|e| panic!("vendored U-238 fixture missing at {endf_path:?}: {e}"));
@@ -2226,7 +2241,14 @@ mod tests {
         let urr_count = data.ranges.iter().filter(|r| r.urr.is_some()).count();
         assert_eq!(urr_count, 1, "LFW=1/LRF=2 URR range must be parsed");
 
-        let urr = data.ranges[1].urr.as_ref().unwrap();
+        // Select the URR range by predicate rather than by index — the
+        // fixture happens to place the URR at index 1, but the assertion
+        // should remain valid if the resolved/URR ordering ever changes.
+        let urr = data
+            .ranges
+            .iter()
+            .find_map(|r| r.urr.as_deref())
+            .expect("URR range must exist (already asserted by urr_count above)");
         assert_eq!(urr.lrf, 2, "URR LRF must be 2");
         assert_eq!(urr.l_groups.len(), 1, "one L-group");
         let jg = &urr.l_groups[0].j_groups[0];
@@ -2413,11 +2435,20 @@ mod tests {
         );
 
         let err = parse_endf_file2(ENDF).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("INT=0") && msg.contains("out of spec"),
-            "expected INT-out-of-spec rejection, got: {msg}"
-        );
+        // Match on the error variant structurally so the test only
+        // depends on the parser surfacing `UnsupportedFormat`, not on
+        // the exact `Display` wording of `EndfParseError`.  Then check
+        // the payload string for the diagnostic substrings.
+        match err {
+            EndfParseError::UnsupportedFormat(ref msg) => {
+                assert!(
+                    msg.contains("INT=0") && msg.contains("out of spec"),
+                    "expected INT-out-of-spec rejection in UnsupportedFormat payload, \
+                     got: {msg}"
+                );
+            }
+            other => panic!("expected EndfParseError::UnsupportedFormat for INT=0, got: {other:?}"),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2454,6 +2485,41 @@ mod tests {
             err.to_string().contains("too large"),
             "expected upper-bound error for i32::MAX, got: {err}"
         );
+    }
+
+    /// `parse_endf_int` rejects non-integral float values rather than
+    /// silently truncating.
+    ///
+    /// Without the strict check, an INT-field value stored as
+    /// `"1.900000+0"` would be cast as `1.9_f64 as i32 == 1`, masking
+    /// a malformed evaluation.  After the strict check, the parser
+    /// surfaces `InvalidNumber` immediately.
+    ///
+    /// The two field layouts:
+    ///   • field 0: integral float "1.000000+0" → returns Ok(1)
+    ///   • field 1: non-integral  "1.900000+0" → returns Err(InvalidNumber)
+    /// must both round-trip the standard ENDF integer-as-float encoding.
+    #[test]
+    fn test_parse_endf_int_rejects_non_integral_float() {
+        // 11-char fields, padded with leading space to match the ENDF column
+        // width.  Field 0 is integral; field 1 is non-integral.
+        const LINE: &str = " 1.000000+0 1.900000+0";
+
+        // Integral float must parse cleanly.
+        let ok = parse_endf_int(LINE, 0).expect("integral float must parse");
+        assert_eq!(ok, 1);
+
+        // Non-integral float must be rejected, not truncated to 1.
+        let err = parse_endf_int(LINE, 1).expect_err("non-integral must be rejected");
+        match err {
+            EndfParseError::InvalidNumber(ref msg) => {
+                assert!(
+                    msg.contains("Non-integral"),
+                    "expected Non-integral diagnostic, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidNumber, got: {other:?}"),
+        }
     }
 
     /// Negative L-value in a Breit-Wigner range is rejected.
