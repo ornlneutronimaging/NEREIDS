@@ -720,6 +720,7 @@ def calibrate_energy(
     abundances: list[float],
     assumed_flight_path_m: float,
     temperature_k: float = 293.6,
+    resolution: TabulatedResolution | None = None,
 ) -> CalibrationResult:
     """Calibrate the energy axis by fitting flight path and TOF delay.
 
@@ -773,8 +774,11 @@ def from_counts_with_nuisance(
     Use this when the detector/counts background spectrum has been
     estimated outside NEREIDS and should be supplied explicitly
     alongside the open-beam flux.  Routes through the counts-KL
-    (joint-Poisson) dispatch when passed to ``spatial_map_typed`` /
-    ``fit_counts_spectrum_typed`` with ``solver="auto"`` / ``"kl"``.
+    (joint-Poisson) dispatch when passed to ``spatial_map_typed``
+    with ``solver="auto"`` / ``"kl"``.  (Per-spectrum counts fitting
+    uses ``fit_counts_spectrum_typed``, which takes the raw 1D
+    ``sample_counts`` / ``open_beam_counts`` / ``detector_background``
+    arrays directly rather than an ``InputData`` wrapper.)
 
     Args:
         sample_counts: 3D float64 array (n_energies, height, width).

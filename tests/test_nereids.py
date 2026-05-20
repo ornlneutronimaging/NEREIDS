@@ -2196,13 +2196,19 @@ class TestStubConformance:
         # re-exports the inner ``nereids.nereids`` extension module
         # itself as an attribute on the outer package) because those
         # are package plumbing, not typed-surface exports.
+        #
+        # No ``Py*``-prefix filter: every current PyO3 export carries
+        # a ``#[pyclass(name = "...")]`` / ``#[pyo3(name = "...")]``
+        # attribute that strips the prefix on the Python side, so a
+        # runtime symbol that *did* start with ``Py`` would be a real
+        # surface (e.g. an unrenamed ``#[pyclass]``) and should be
+        # gated, not silently skipped.
         import types
 
         runtime_names = {
             name
             for name in dir(nereids)
             if not name.startswith("_")
-            and not name.startswith("Py")
             and not isinstance(getattr(nereids, name), types.ModuleType)
         }
 
@@ -2216,6 +2222,92 @@ class TestStubConformance:
             f"runtime symbols missing from __init__.pyi: {sorted(missing)!r}. "
             "Either add a `def`/`class` to the stub OR justify the omission "
             "in `intentional_omissions`."
+        )
+
+    def test_runtime_function_parameter_names_match_stub(self):
+        """Every top-level callable exported by the compiled ``nereids``
+        module must have parameter NAMES that match the stub signature
+        in ``__init__.pyi``.
+
+        This is the sibling drift gate to
+        ``test_runtime_exports_present_in_stub``: that test ensures the
+        *name* of every export is present; this one ensures the
+        *parameter names* of every function-shaped export are present.
+
+        Class methods are out of scope (PyO3 ``#[getter]`` /
+        ``#[pymethods]`` introspection is noisier and rarely drifts the
+        same way).  This guards against the M5/P2-1 failure mode where
+        a kwarg like ``resolution=`` was added to the PyO3 export but
+        not to the stub, so static type checkers rejected valid
+        runtime calls.
+        """
+        import ast
+        import inspect
+        from pathlib import Path
+
+        nereids_dir = Path(nereids.__file__).resolve().parent
+        stub_path = nereids_dir / "__init__.pyi"
+        tree = ast.parse(stub_path.read_text(encoding="utf-8"))
+
+        # Map of top-level function name -> ordered list of parameter
+        # names as declared in the stub.  We include positional-only,
+        # positional-or-keyword, the ``*`` marker is skipped, and
+        # keyword-only parameters are appended in declaration order.
+        # ``self`` / ``cls`` cannot appear at module scope; ignore
+        # ``*args`` / ``**kwargs`` because none of our exports use them
+        # and including them would only weaken the comparison.
+        stub_params: dict[str, list[str]] = {}
+        for node in tree.body:
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            if node.name.startswith("_"):
+                continue
+            names: list[str] = []
+            args = node.args
+            for arg in args.posonlyargs:
+                names.append(arg.arg)
+            for arg in args.args:
+                names.append(arg.arg)
+            for arg in args.kwonlyargs:
+                names.append(arg.arg)
+            stub_params[node.name] = names
+
+        mismatches: list[str] = []
+        for name, expected in stub_params.items():
+            rt_obj = getattr(nereids, name, None)
+            if rt_obj is None or not callable(rt_obj):
+                # Stub declares a function but runtime export is
+                # missing or non-callable: that is a different drift
+                # class, covered by the test above.
+                continue
+            try:
+                sig = inspect.signature(rt_obj)
+            except (TypeError, ValueError):
+                # PyO3 builtins can refuse signature introspection on
+                # rare overload shapes.  Skip rather than fail — the
+                # name-presence gate above still applies.
+                continue
+            # Drop *args / **kwargs entries on the runtime side too;
+            # we compare the named-parameter spine only.
+            actual = [
+                p.name
+                for p in sig.parameters.values()
+                if p.kind
+                not in (
+                    inspect.Parameter.VAR_POSITIONAL,
+                    inspect.Parameter.VAR_KEYWORD,
+                )
+            ]
+            if actual != expected:
+                mismatches.append(
+                    f"  {name}:\n"
+                    f"    stub:    {expected!r}\n"
+                    f"    runtime: {actual!r}"
+                )
+
+        assert not mismatches, (
+            "parameter-name drift between PyO3 runtime exports and "
+            "__init__.pyi:\n" + "\n".join(mismatches)
         )
 
 
