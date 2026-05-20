@@ -2021,3 +2021,105 @@ class TestFitEnergyScaleRecovery:
             f"L_scale rel err {l_scale_rel_err:.3e} exceeds 1 %: "
             f"got {float(r_calibrated.l_scale):.6f}, truth {L_SCALE_TRUE}"
         )
+
+
+# ===========================================================================
+# Issue #558 — energy-grid validation at the PyO3 boundary
+# ===========================================================================
+#
+# The SLBW / RML / URR / Reich-Moore leaves carry release-mode
+# `assert!(energy_ev.is_finite() && energy_ev > 0.0)` guards.  Every PyO3
+# entry that takes an `energies` argument must validate the grid before
+# any energy reaches those leaves so callers see a clean
+# ``ValueError`` instead of a ``pyo3_runtime.PanicException`` (which is
+# not a subclass of ``ValueError`` and bypasses normal Python error
+# handling).  These tests cover the PyO3 entries hardened in Round 3 of
+# PR #559 — ``forward_model``, ``spatial_map_typed``, and
+# ``calibrate_energy`` — and re-cover the earlier-rounds entries to
+# document the contract.
+
+class TestEnergyGridValidation:
+    """Every PyO3 entry that takes ``energies`` must reject malformed grids
+    with ``ValueError`` rather than leaking a ``PanicException`` from the
+    physics leaves' release-mode asserts (issue #558)."""
+
+    @pytest.mark.parametrize(
+        "bad_energies",
+        [
+            np.array([np.nan, 2.0, 3.0]),
+            np.array([1.0, np.inf, 3.0]),
+            np.array([0.0, 1.0, 2.0]),  # non-positive
+            np.array([-1.0, 1.0, 2.0]),
+            np.array([3.0, 1.0, 2.0]),  # not ascending
+            np.array([1.0, 1.0, 2.0]),  # not strictly ascending
+        ],
+    )
+    def test_cross_sections_rejects_invalid_grid(self, u238_data, bad_energies):
+        with pytest.raises(ValueError):
+            nereids.cross_sections(bad_energies, u238_data)
+
+    @pytest.mark.parametrize(
+        "bad_energies",
+        [
+            np.array([np.nan, 2.0, 3.0]),
+            np.array([1.0, np.inf, 3.0]),
+            np.array([0.0, 1.0, 2.0]),
+            np.array([-1.0, 1.0, 2.0]),
+            np.array([3.0, 1.0, 2.0]),
+        ],
+    )
+    def test_forward_model_rejects_invalid_grid(self, u238_data, bad_energies):
+        with pytest.raises(ValueError):
+            nereids.forward_model(bad_energies, [(u238_data, 0.001)])
+
+    @pytest.mark.parametrize(
+        "bad_energies",
+        [
+            np.array([np.nan, 2.0, 3.0]),
+            np.array([1.0, np.inf, 3.0]),
+            np.array([0.0, 1.0, 2.0]),
+            np.array([-1.0, 1.0, 2.0]),
+        ],
+    )
+    def test_spatial_map_typed_rejects_invalid_grid(self, u238_data, bad_energies):
+        # Build a tiny matching-shape transmission cube so the
+        # length check passes and we hit the energy-grid validator.
+        n_e = len(bad_energies)
+        t = np.ones((n_e, 1, 1), dtype=np.float64) * 0.9
+        u = np.ones((n_e, 1, 1), dtype=np.float64) * 0.01
+        data = nereids.from_transmission(t, u)
+        with pytest.raises(ValueError):
+            nereids.spatial_map_typed(
+                data, bad_energies, [u238_data], max_iter=2
+            )
+
+    @pytest.mark.parametrize(
+        "bad_energies",
+        [
+            np.array([np.nan, 2.0, 3.0]),
+            np.array([1.0, np.inf, 3.0]),
+            np.array([0.0, 1.0, 2.0]),
+            np.array([-1.0, 1.0, 2.0]),
+            np.array([3.0, 1.0, 2.0]),
+        ],
+    )
+    def test_calibrate_energy_rejects_invalid_grid(self, u238_data, bad_energies):
+        n_e = len(bad_energies)
+        t = np.full(n_e, 0.9, dtype=np.float64)
+        s = np.full(n_e, 0.01, dtype=np.float64)
+        with pytest.raises(ValueError):
+            nereids.calibrate_energy(
+                bad_energies,
+                t,
+                s,
+                [u238_data],
+                [1.0],
+                25.0,
+            )
+
+    def test_calibrate_energy_rejects_empty_grid(self, u238_data):
+        e = np.array([], dtype=np.float64)
+        t = np.array([], dtype=np.float64)
+        s = np.array([], dtype=np.float64)
+        with pytest.raises(ValueError):
+            nereids.calibrate_energy(e, t, s, [u238_data], [1.0], 25.0)
