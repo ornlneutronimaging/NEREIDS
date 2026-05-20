@@ -23,8 +23,8 @@
 //!
 //! ```text
 //! /entry/histogram/counts          — u64 4D [rot_angle, y, x, tof]
-//! /entry/histogram/time_of_flight  — f64 1D, nanoseconds
-//! /entry/neutrons/event_time_offset — u64 1D, nanoseconds
+//! /entry/histogram/time_of_flight  — f64 1D, TOF axis (see "Units" below)
+//! /entry/neutrons/event_time_offset — u64 1D, TOF per event (see "Units" below)
 //! /entry/neutrons/x                — f64 1D, pixel coordinate
 //! /entry/neutrons/y                — f64 1D, pixel coordinate
 //! /entry/pixel_masks/dead          — u8  2D [y, x]
@@ -33,12 +33,99 @@
 //! Metadata attributes on `/entry` or group level:
 //! - `flight_path_m` (f64)
 //! - `tof_offset_ns` (f64)
+//!
+//! ## Units convention
+//!
+//! **Canonical internal TOF unit: microseconds (µs).**  Every TOF
+//! quantity returned to NEREIDS callers — `tof_edges_us`,
+//! `EventBinningParams::tof_min_us`/`tof_max_us`, downstream
+//! `nereids_io::tof` energy conversions — is in µs.  All other parts of
+//! the pipeline (energy mapping, normalization, fitting) assume µs.
+//!
+//! On read, both `time_of_flight` (histogram path) and
+//! `event_time_offset` (events path) consult the HDF5 `units`
+//! attribute on the dataset (the NeXus/NXtof convention) and rescale
+//! to µs accordingly:
+//!
+//! | `units` attribute       | Rescale to µs |
+//! |-------------------------|---------------|
+//! | `ns`, `nanoseconds`     | `× 1e-3`      |
+//! | `us`, `µs`, `microseconds` | `× 1`      |
+//! | `ms`, `milliseconds`    | `× 1e3`       |
+//! | `s`, `seconds`          | `× 1e6`       |
+//! | (missing)               | `× 1e-3` (assume ns — rustpix legacy default) |
+//! | anything else           | hard error    |
+//!
+//! The "missing → assume ns" fallback preserves backward compatibility
+//! with the rustpix producer (`scripts/fixtures/extract_venus_hf_nexus.py`)
+//! which writes nanoseconds without a `units` attribute.  Any file
+//! that *does* set `units` is parsed strictly: an unrecognised value
+//! is rejected rather than silently mis-scaled.  This closes a
+//! 1000× silent-rescale bug on `units = "us"` (issue #554).
 
 use std::path::Path;
 
+use hdf5::types::VarLenUnicode;
 use ndarray::{Array3, s};
 
 use crate::error::IoError;
+
+/// Multiplicative scale factor from a NeXus `units` attribute string to
+/// the canonical internal unit (microseconds).
+///
+/// See the module-level "Units convention" table for the full mapping.
+/// `None` for the `units` attribute means "attribute absent" and falls
+/// back to the rustpix legacy assumption of nanoseconds.  Any
+/// recognised unit is matched case-insensitively after trimming
+/// surrounding whitespace.  An unrecognised non-empty string returns
+/// an error rather than silently mis-scaling.
+fn tof_scale_to_us(units: Option<&str>) -> Result<f64, IoError> {
+    match units {
+        // Absent attribute — rustpix legacy default.  The repository's
+        // own producers (`scripts/fixtures/extract_venus_hf_nexus.py`)
+        // write nanoseconds without a `units` attribute, so we
+        // preserve that contract for backward compatibility.
+        None => Ok(1e-3),
+        Some(raw) => {
+            let normalised = raw.trim().to_ascii_lowercase();
+            match normalised.as_str() {
+                "ns" | "nanosecond" | "nanoseconds" => Ok(1e-3),
+                // "µs" lowercases to "µs" — the only non-ASCII form we
+                // accept.  The two-byte UTF-8 µ (U+00B5) and the
+                // micro-sign U+03BC are both written verbatim by
+                // various NeXus producers; accept both.
+                "us" | "µs" | "\u{03bc}s" | "microsecond" | "microseconds" => Ok(1.0),
+                "ms" | "millisecond" | "milliseconds" => Ok(1e3),
+                "s" | "sec" | "second" | "seconds" => Ok(1e6),
+                _ => Err(IoError::InvalidParameter(format!(
+                    "Unsupported NeXus TOF units attribute {raw:?}: expected one of \
+                     'ns', 'us'/'µs', 'ms', 's' (case-insensitive); refusing to \
+                     guess a scale factor (issue #554)"
+                ))),
+            }
+        }
+    }
+}
+
+/// Read a string-valued attribute from an HDF5 `Location` (Group or
+/// Dataset both deref to `Location`), returning `None` if the
+/// attribute is absent and `Err` only if the attribute exists but
+/// cannot be decoded as a UTF-8 string.
+fn read_string_attr(loc: &hdf5::Location, name: &str) -> Result<Option<String>, IoError> {
+    // `Location::attr` returns Err if the attribute does not exist —
+    // map that case to `Ok(None)` rather than propagating, so callers
+    // can distinguish "absent" from "present but malformed".
+    let attr = match loc.attr(name) {
+        Ok(a) => a,
+        Err(_) => return Ok(None),
+    };
+    let value: VarLenUnicode = attr.read_scalar().map_err(|e| {
+        IoError::InvalidParameter(format!(
+            "Failed to read string attribute {name:?}: {e} (expected a UTF-8 string)"
+        ))
+    })?;
+    Ok(Some(value.as_str().to_string()))
+}
 
 /// Metadata probed from a NeXus/HDF5 file without loading full data.
 #[derive(Debug, Clone)]
@@ -418,10 +505,14 @@ pub fn load_nexus_events(
         .group("neutrons")
         .map_err(|e| IoError::InvalidParameter(format!("Missing /entry/neutrons group: {e}")))?;
 
-    // Read event arrays
-    let tof_ns: Vec<u64> = neutrons
-        .dataset("event_time_offset")
-        .map_err(|e| IoError::InvalidParameter(format!("Missing event_time_offset dataset: {e}")))?
+    // Read event arrays.  Open the dataset first so we can consult its
+    // `units` attribute (issue #554) before reading the data.
+    let tof_ds = neutrons.dataset("event_time_offset").map_err(|e| {
+        IoError::InvalidParameter(format!("Missing event_time_offset dataset: {e}"))
+    })?;
+    let tof_units = read_string_attr(&tof_ds, "units")?;
+    let tof_scale = tof_scale_to_us(tof_units.as_deref())?;
+    let tof_raw: Vec<u64> = tof_ds
         .read_1d()
         .map_err(|e| IoError::InvalidParameter(format!("Failed to read event_time_offset: {e}")))?
         .to_vec();
@@ -440,10 +531,10 @@ pub fn load_nexus_events(
         .map_err(|e| IoError::InvalidParameter(format!("Failed to read y: {e}")))?
         .to_vec();
 
-    if tof_ns.len() != x_coords.len() || tof_ns.len() != y_coords.len() {
+    if tof_raw.len() != x_coords.len() || tof_raw.len() != y_coords.len() {
         return Err(IoError::ShapeMismatch(format!(
             "Event arrays have mismatched lengths: tof={}, x={}, y={}",
-            tof_ns.len(),
+            tof_raw.len(),
             x_coords.len(),
             y_coords.len()
         )));
@@ -456,14 +547,18 @@ pub fn load_nexus_events(
     // Histogram events with retention tracking.
     let dt_us = (params.tof_max_us - params.tof_min_us) / params.n_bins as f64;
     let mut counts = Array3::<f64>::zeros((params.n_bins, params.height, params.width));
-    let total = tof_ns.len();
+    let total = tof_raw.len();
     let mut kept = 0usize;
     let mut dropped_non_finite = 0usize;
     let mut dropped_tof_range = 0usize;
     let mut dropped_spatial = 0usize;
 
-    for i in 0..tof_ns.len() {
-        let tof_us = tof_ns[i] as f64 / 1000.0; // ns → µs
+    for i in 0..tof_raw.len() {
+        // Convert raw TOF to canonical µs via the units-attribute scale
+        // factor (issue #554).  For the default rustpix case (`units`
+        // absent → ns assumed), `tof_scale` is `1e-3`, recovering the
+        // pre-fix expression `tof_raw[i] / 1000.0`.
+        let tof_us = tof_raw[i] as f64 * tof_scale;
         if !tof_us.is_finite() {
             dropped_non_finite += 1;
             continue;
@@ -569,7 +664,8 @@ fn probe_event_group(entry: &hdf5::Group) -> (bool, Option<usize>) {
     (n_events.is_some(), n_events)
 }
 
-/// Read TOF axis from the histogram group, converting ns → µs.
+/// Read TOF axis from the histogram group, rescaling to µs based on
+/// the dataset's `units` attribute (see module docs / issue #554).
 fn read_tof_axis(hist_group: &hdf5::Group) -> Result<Vec<f64>, IoError> {
     let tof_ds = hist_group.dataset("time_of_flight").map_err(|e| {
         IoError::InvalidParameter(format!(
@@ -577,13 +673,18 @@ fn read_tof_axis(hist_group: &hdf5::Group) -> Result<Vec<f64>, IoError> {
         ))
     })?;
 
-    let tof_ns: Vec<f64> = tof_ds
+    let raw: Vec<f64> = tof_ds
         .read_1d::<f64>()
         .map_err(|e| IoError::InvalidParameter(format!("Failed to read time_of_flight: {e}")))?
         .to_vec();
 
-    // Convert nanoseconds → microseconds
-    Ok(tof_ns.iter().map(|&ns| ns / 1000.0).collect())
+    // Consult the dataset's NeXus `units` attribute.  Missing →
+    // legacy nanoseconds assumption (rustpix); known value → use
+    // table; unknown value → hard error (no silent mis-scale).
+    let units = read_string_attr(&tof_ds, "units")?;
+    let scale = tof_scale_to_us(units.as_deref())?;
+
+    Ok(raw.iter().map(|&v| v * scale).collect())
 }
 
 /// Read a scalar f64 attribute from a group.
@@ -1188,5 +1289,314 @@ mod tests {
         assert_eq!(stats.dropped_non_finite, 2);
         assert_eq!(stats.dropped_tof_range, 0);
         assert_eq!(stats.dropped_spatial, 0);
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #554 — NeXus `units` attribute on TOF datasets must be
+    // honoured.  A file written with `units = "us"` was previously
+    // divided by 1000 silently, shifting the energy axis by 1000×.
+    // -----------------------------------------------------------------
+
+    /// Write a scalar string attribute on an HDF5 dataset.  Tests use
+    /// this to inject `units = "ns"`, `units = "us"`, etc. on the
+    /// `time_of_flight` / `event_time_offset` datasets.
+    fn write_units_attr(ds: &hdf5::Dataset, units: &str) {
+        let val: VarLenUnicode = units.parse().expect("parse units string");
+        ds.new_attr::<VarLenUnicode>()
+            .shape(())
+            .create("units")
+            .expect("create units attr")
+            .write_scalar(&val)
+            .expect("write units attr");
+    }
+
+    /// Variant of `create_test_histogram` that stamps a `units`
+    /// attribute on the `time_of_flight` dataset.
+    fn create_test_histogram_with_units(
+        path: &Path,
+        counts: &[u64],
+        shape: [usize; 4],
+        tof_values: &[f64],
+        units: Option<&str>,
+    ) {
+        let file = hdf5::File::create(path).expect("create test file");
+        let entry = file.create_group("entry").expect("create entry");
+        let hist = entry.create_group("histogram").expect("create histogram");
+        hist.new_dataset::<u64>()
+            .shape(shape)
+            .create("counts")
+            .expect("create counts")
+            .write_raw(counts)
+            .expect("write counts");
+        let tof_ds = hist
+            .new_dataset::<f64>()
+            .shape([tof_values.len()])
+            .create("time_of_flight")
+            .expect("create tof");
+        tof_ds.write_raw(tof_values).expect("write tof");
+        if let Some(u) = units {
+            write_units_attr(&tof_ds, u);
+        }
+    }
+
+    /// Variant of `create_test_events` that stamps a `units` attribute
+    /// on the `event_time_offset` dataset.
+    fn create_test_events_with_units(
+        path: &Path,
+        tof_values: &[u64],
+        x: &[f64],
+        y: &[f64],
+        units: Option<&str>,
+    ) {
+        let file = hdf5::File::create(path).expect("create");
+        let entry = file.create_group("entry").expect("create entry");
+        let neutrons = entry.create_group("neutrons").expect("create neutrons");
+        let tof_ds = neutrons
+            .new_dataset::<u64>()
+            .shape([tof_values.len()])
+            .create("event_time_offset")
+            .expect("create tof");
+        tof_ds.write_raw(tof_values).expect("write tof");
+        if let Some(u) = units {
+            write_units_attr(&tof_ds, u);
+        }
+        neutrons
+            .new_dataset::<f64>()
+            .shape([x.len()])
+            .create("x")
+            .expect("create x")
+            .write_raw(x)
+            .expect("write x");
+        neutrons
+            .new_dataset::<f64>()
+            .shape([y.len()])
+            .create("y")
+            .expect("create y")
+            .write_raw(y)
+            .expect("write y");
+    }
+
+    /// `tof_scale_to_us` table: each recognised spelling maps to the
+    /// documented multiplier.  Pure-helper test — exercises the lookup
+    /// without an HDF5 file.
+    #[test]
+    fn test_tof_scale_to_us_table() {
+        // Missing → legacy ns assumption.
+        assert!((tof_scale_to_us(None).unwrap() - 1e-3).abs() < 1e-15);
+        for (spelling, expected) in &[
+            ("ns", 1e-3),
+            ("Ns", 1e-3),
+            ("NS", 1e-3),
+            ("nanoseconds", 1e-3),
+            ("us", 1.0),
+            ("US", 1.0),
+            ("microseconds", 1.0),
+            ("µs", 1.0),
+            ("ms", 1e3),
+            ("milliseconds", 1e3),
+            ("s", 1e6),
+            ("seconds", 1e6),
+            ("  s  ", 1e6),
+        ] {
+            let got = tof_scale_to_us(Some(*spelling))
+                .unwrap_or_else(|e| panic!("spelling {spelling:?} unexpectedly errored: {e}"));
+            assert!(
+                (got - expected).abs() < 1e-15,
+                "spelling {spelling:?}: expected scale {expected}, got {got}"
+            );
+        }
+        // Unknown units must error — no silent fallback.
+        for bad in &["picoseconds", "ticks", "us per channel", "", "garbage"] {
+            let err = tof_scale_to_us(Some(*bad)).expect_err("unknown units must error");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("Unsupported NeXus TOF units"),
+                "error for {bad:?} should mention 'Unsupported NeXus TOF units', got: {msg}"
+            );
+        }
+    }
+
+    /// Histogram path with `units = "ns"` (current canonical
+    /// assumption): explicit ns annotation must produce the same µs
+    /// edges as the rustpix-legacy "no attribute, assume ns" path.
+    #[test]
+    fn test_load_nexus_histogram_units_ns_explicit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hist_units_ns.h5");
+        let counts = vec![0u64; 2];
+        // 3 ns edges → 0.001, 0.002, 0.003 µs
+        let tof_ns = vec![1.0, 2.0, 3.0];
+        create_test_histogram_with_units(&path, &counts, [1, 1, 1, 2], &tof_ns, Some("ns"));
+
+        let data = load_nexus_histogram(&path).expect("load with units=ns");
+        assert_eq!(data.tof_edges_us.len(), 3);
+        assert!((data.tof_edges_us[0] - 0.001).abs() < 1e-12);
+        assert!((data.tof_edges_us[1] - 0.002).abs() < 1e-12);
+        assert!((data.tof_edges_us[2] - 0.003).abs() < 1e-12);
+    }
+
+    /// Histogram path with `units = "us"` (NeXus-standard
+    /// microseconds): values must be passed through unchanged, NOT
+    /// divided by 1000.  Pre-#554 this produced a 1000× too-small
+    /// energy axis silently.
+    #[test]
+    fn test_load_nexus_histogram_units_us_no_rescale() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hist_units_us.h5");
+        let counts = vec![0u64; 4];
+        // µs values that would be catastrophically wrong if divided by 1000.
+        let tof_us = vec![1000.0, 2000.0, 3000.0, 4000.0, 5000.0];
+        create_test_histogram_with_units(&path, &counts, [1, 1, 1, 4], &tof_us, Some("us"));
+
+        let data = load_nexus_histogram(&path).expect("load with units=us");
+        assert_eq!(data.tof_edges_us.len(), 5);
+        for (i, &expected) in tof_us.iter().enumerate() {
+            assert!(
+                (data.tof_edges_us[i] - expected).abs() < 1e-9,
+                "edge {i}: expected {expected} µs (no rescale), got {} µs",
+                data.tof_edges_us[i]
+            );
+        }
+    }
+
+    /// Histogram path: NeXus `units = "s"` (seconds) must rescale
+    /// ×1e6 → µs.
+    #[test]
+    fn test_load_nexus_histogram_units_seconds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hist_units_s.h5");
+        let counts = vec![0u64; 2];
+        // 1 ms = 1000 µs, written as 0.001 s
+        let tof_s = vec![0.001, 0.002, 0.003];
+        create_test_histogram_with_units(&path, &counts, [1, 1, 1, 2], &tof_s, Some("s"));
+
+        let data = load_nexus_histogram(&path).expect("load with units=s");
+        assert!((data.tof_edges_us[0] - 1000.0).abs() < 1e-9);
+        assert!((data.tof_edges_us[1] - 2000.0).abs() < 1e-9);
+        assert!((data.tof_edges_us[2] - 3000.0).abs() < 1e-9);
+    }
+
+    /// Histogram path: unknown `units` must hard-error rather than
+    /// silently default to ns.  Without this check, a typo
+    /// (e.g. `"microsecond"` vs `"microseconds"`) could be mis-scaled
+    /// — and worse, an exotic-but-real unit (`"ticks"`) would be
+    /// silently dropped on the floor.
+    #[test]
+    fn test_load_nexus_histogram_units_unknown_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hist_units_bad.h5");
+        let counts = vec![0u64; 2];
+        let tof = vec![1.0, 2.0, 3.0];
+        create_test_histogram_with_units(&path, &counts, [1, 1, 1, 2], &tof, Some("picoseconds"));
+
+        let err = load_nexus_histogram(&path).expect_err("unknown units must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Unsupported NeXus TOF units") && msg.contains("picoseconds"),
+            "error should name the offending value, got: {msg}"
+        );
+    }
+
+    /// Histogram path: missing `units` attribute is allowed and
+    /// preserves the rustpix-legacy ns assumption.  This is the
+    /// backward-compatibility guarantee for files produced by
+    /// `scripts/fixtures/extract_venus_hf_nexus.py` etc., which write
+    /// nanoseconds without a `units` attribute.
+    #[test]
+    fn test_load_nexus_histogram_units_missing_legacy_ns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hist_units_missing.h5");
+        let counts = vec![0u64; 2];
+        let tof_ns = vec![1000.0, 2000.0, 3000.0];
+        // No `units` attribute → assume ns → 1.0 / 2.0 / 3.0 µs.
+        create_test_histogram_with_units(&path, &counts, [1, 1, 1, 2], &tof_ns, None);
+        let data = load_nexus_histogram(&path).expect("load with no units attr");
+        assert!((data.tof_edges_us[0] - 1.0).abs() < 1e-12);
+        assert!((data.tof_edges_us[1] - 2.0).abs() < 1e-12);
+        assert!((data.tof_edges_us[2] - 3.0).abs() < 1e-12);
+    }
+
+    /// Events path with `units = "us"`: the TOF binning must place
+    /// events at the correct µs values, NOT divide them by 1000.
+    /// Pre-#554 a file written in µs would have all events land
+    /// 1000× lower than the user-specified bins, leaving the
+    /// histogram empty / all dropped by `tof_range`.
+    #[test]
+    fn test_load_nexus_events_units_us_no_rescale() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events_units_us.h5");
+
+        // Events at 1500 µs and 2500 µs (written in µs, units=us).
+        let tof_us = vec![1500u64, 2500u64, 1800u64];
+        let x = vec![1.0, 1.0, 1.0];
+        let y = vec![0.0, 0.0, 0.0];
+        create_test_events_with_units(&path, &tof_us, &x, &y, Some("us"));
+
+        let params = EventBinningParams {
+            n_bins: 2,
+            tof_min_us: 1000.0,
+            tof_max_us: 3000.0,
+            height: 2,
+            width: 3,
+        };
+        let data = load_nexus_events(&path, &params).expect("load events with units=us");
+
+        // Bin 0: [1000, 2000) µs → 1500 + 1800 = 2 events
+        assert_eq!(data.counts[[0, 0, 1]], 2.0);
+        // Bin 1: [2000, 3000) µs → 2500 = 1 event
+        assert_eq!(data.counts[[1, 0, 1]], 1.0);
+        let stats = data.event_stats.as_ref().expect("event stats");
+        assert_eq!(stats.kept, 3);
+        assert_eq!(stats.dropped_tof_range, 0);
+    }
+
+    /// Events path with `units = "ns"` (explicit): same result as
+    /// the legacy "no attribute" path.
+    #[test]
+    fn test_load_nexus_events_units_ns_explicit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events_units_ns.h5");
+
+        // Events at 1500/2500/1800 µs, written in ns with units=ns.
+        let tof_ns = vec![1_500_000u64, 2_500_000u64, 1_800_000u64];
+        let x = vec![1.0, 1.0, 1.0];
+        let y = vec![0.0, 0.0, 0.0];
+        create_test_events_with_units(&path, &tof_ns, &x, &y, Some("ns"));
+
+        let params = EventBinningParams {
+            n_bins: 2,
+            tof_min_us: 1000.0,
+            tof_max_us: 3000.0,
+            height: 2,
+            width: 3,
+        };
+        let data = load_nexus_events(&path, &params).expect("load events with units=ns");
+        assert_eq!(data.counts[[0, 0, 1]], 2.0);
+        assert_eq!(data.counts[[1, 0, 1]], 1.0);
+    }
+
+    /// Events path: unknown `units` must hard-error.
+    #[test]
+    fn test_load_nexus_events_units_unknown_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events_units_bad.h5");
+        let tof = vec![1_500_000u64];
+        let x = vec![0.0];
+        let y = vec![0.0];
+        create_test_events_with_units(&path, &tof, &x, &y, Some("clock-ticks"));
+
+        let params = EventBinningParams {
+            n_bins: 2,
+            tof_min_us: 1000.0,
+            tof_max_us: 3000.0,
+            height: 2,
+            width: 3,
+        };
+        let err = load_nexus_events(&path, &params).expect_err("unknown units must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Unsupported NeXus TOF units") && msg.contains("clock-ticks"),
+            "error should name the offending value, got: {msg}"
+        );
     }
 }
