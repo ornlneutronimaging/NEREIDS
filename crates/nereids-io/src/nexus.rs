@@ -91,9 +91,12 @@ fn tof_scale_to_us(units: Option<&str>) -> Result<f64, IoError> {
             match normalised.as_str() {
                 "ns" | "nanosecond" | "nanoseconds" => Ok(1e-3),
                 // "µs" lowercases to "µs" — the only non-ASCII form we
-                // accept.  The two-byte UTF-8 µ (U+00B5) and the
-                // micro-sign U+03BC are both written verbatim by
-                // various NeXus producers; accept both.
+                // accept.  The MICRO SIGN U+00B5 (the literal "µ"
+                // appearing in source above) and the Greek small
+                // letter MU U+03BC are visually identical but are
+                // distinct Unicode codepoints; both are written
+                // verbatim by various NeXus producers, so we accept
+                // both.
                 "us" | "µs" | "\u{03bc}s" | "microsecond" | "microseconds" => Ok(1.0),
                 "ms" | "millisecond" | "milliseconds" => Ok(1e3),
                 "s" | "sec" | "second" | "seconds" => Ok(1e6),
@@ -111,14 +114,33 @@ fn tof_scale_to_us(units: Option<&str>) -> Result<f64, IoError> {
 /// Dataset both deref to `Location`), returning `None` if the
 /// attribute is absent and `Err` only if the attribute exists but
 /// cannot be decoded as a UTF-8 string.
+///
+/// Absence is detected via [`Location::attr_names`] (rather than
+/// catching any error from [`Location::attr`]) so that genuine HDF5
+/// errors — corrupt file, permission denied, internal failure —
+/// surface as [`IoError::InvalidParameter`] instead of silently
+/// becoming "attribute missing".  This was a latent bug pre-Round 2:
+/// the previous implementation mapped *every* `attr()` failure to
+/// `Ok(None)`, including non-"not found" errors.
 fn read_string_attr(loc: &hdf5::Location, name: &str) -> Result<Option<String>, IoError> {
-    // `Location::attr` returns Err if the attribute does not exist —
-    // map that case to `Ok(None)` rather than propagating, so callers
-    // can distinguish "absent" from "present but malformed".
-    let attr = match loc.attr(name) {
-        Ok(a) => a,
-        Err(_) => return Ok(None),
-    };
+    // Probe the attribute table first.  `attr_names()` is the only
+    // discriminator the hdf5-metno 0.12 `Error` enum exposes for
+    // "absent vs. other failure" — its `Error` is a flat
+    // `HDF5(ErrorStack) | Internal(String)` with no typed
+    // "attribute not found" variant.
+    let names = loc.attr_names().map_err(|e| {
+        IoError::InvalidParameter(format!(
+            "Failed to list attributes while looking for {name:?}: {e}"
+        ))
+    })?;
+    if !names.iter().any(|n| n == name) {
+        return Ok(None);
+    }
+    let attr = loc.attr(name).map_err(|e| {
+        IoError::InvalidParameter(format!(
+            "Failed to open attribute {name:?} (listed but unreadable): {e}"
+        ))
+    })?;
     let value: VarLenUnicode = attr.read_scalar().map_err(|e| {
         IoError::InvalidParameter(format!(
             "Failed to read string attribute {name:?}: {e} (expected a UTF-8 string)"
@@ -142,8 +164,11 @@ pub struct NexusMetadata {
     pub flight_path_m: Option<f64>,
     /// TOF offset in nanoseconds (from attributes), if present.
     pub tof_offset_ns: Option<f64>,
-    /// TOF bin edges or centers in nanoseconds, if present.
-    pub tof_edges_ns: Option<Vec<f64>>,
+    /// TOF bin edges or centers in **microseconds**, if present.  The
+    /// probe path consults the dataset's `units` attribute and
+    /// rescales to µs the same way [`load_nexus_histogram`] does, so
+    /// this field is unit-consistent with [`NexusHistogramData::tof_edges_us`].
+    pub tof_edges_us: Option<Vec<f64>>,
 }
 
 /// An entry in the HDF5 group/dataset tree hierarchy.
@@ -218,7 +243,7 @@ pub fn probe_nexus(path: &Path) -> Result<NexusMetadata, IoError> {
         .map_err(|e| IoError::InvalidParameter(format!("Missing /entry group: {e}")))?;
 
     // Probe histogram
-    let (has_histogram, histogram_shape, tof_edges_ns) = probe_histogram_group(&entry);
+    let (has_histogram, histogram_shape, tof_edges_us) = probe_histogram_group(&entry);
 
     // Probe events
     let (has_events, n_events) = probe_event_group(&entry);
@@ -234,7 +259,7 @@ pub fn probe_nexus(path: &Path) -> Result<NexusMetadata, IoError> {
         n_events,
         flight_path_m,
         tof_offset_ns,
-        tof_edges_ns,
+        tof_edges_us,
     })
 }
 
@@ -452,9 +477,21 @@ pub struct EventBinningParams {
 
 /// Load neutron event data from a NeXus file and histogram into a 3D grid.
 ///
-/// Reads `/entry/neutrons/event_time_offset` (u64 ns), `x` (f64), `y` (f64),
-/// converts TOF from nanoseconds to microseconds, then bins events into a
-/// `(n_bins, height, width)` histogram grid.
+/// Reads `/entry/neutrons/event_time_offset` (u64), `x` (f64), `y` (f64),
+/// rescales TOF to the canonical internal unit of microseconds based on
+/// the `event_time_offset` dataset's `units` attribute (issue #554), then
+/// bins events into a `(n_bins, height, width)` histogram grid.
+///
+/// # TOF units handling (issue #554)
+///
+/// The loader consults the NeXus `units` attribute on the
+/// `event_time_offset` dataset and rescales the raw `u64` channel
+/// counts to µs accordingly.  See the module-level "Units convention"
+/// table for the recognised values.  If the `units` attribute is
+/// absent, the loader falls back to the rustpix legacy assumption of
+/// nanoseconds (`× 1e-3`); if it is present but unrecognised, the
+/// call returns [`IoError::InvalidParameter`] rather than silently
+/// guessing a scale factor.
 ///
 /// # Binning behaviour (D-8)
 ///
@@ -621,6 +658,17 @@ pub fn load_nexus_events(
 // ---- Internal helpers ----
 
 /// Probe the histogram group for shape and TOF axis without loading counts.
+///
+/// The returned TOF edges are in **microseconds**, rescaled from the
+/// dataset's NeXus `units` attribute via [`tof_scale_to_us`] — the
+/// same logic the full [`load_nexus_histogram`] uses.  If the `units`
+/// attribute is unparseable, the TOF axis is dropped entirely
+/// (returned as `None`) rather than silently propagated at the wrong
+/// scale, matching the function's "any failure → no data for that
+/// field" contract.  Round 2 review (PR #561) found that the
+/// previous implementation returned the raw values verbatim — a
+/// silent 1000× error for any file written with `units = "us"`,
+/// symmetric with the load-path bug closed by issue #554.
 fn probe_histogram_group(entry: &hdf5::Group) -> (bool, Option<[usize; 4]>, Option<Vec<f64>>) {
     let hist = match entry.group("histogram") {
         Ok(g) => g,
@@ -639,14 +687,22 @@ fn probe_histogram_group(entry: &hdf5::Group) -> (bool, Option<[usize; 4]>, Opti
 
     let histogram_shape = Some([shape[0], shape[1], shape[2], shape[3]]);
 
-    // Try reading TOF axis
-    let tof_edges = hist
-        .dataset("time_of_flight")
-        .ok()
-        .and_then(|ds| ds.read_1d::<f64>().ok())
-        .map(|a| a.to_vec());
+    // Try reading TOF axis and rescaling to µs via the `units`
+    // attribute.  Any failure (missing dataset, read error,
+    // unparseable units attr) collapses to `None` — the probe is
+    // best-effort and must never poison the rest of the metadata.
+    let tof_edges_us = hist.dataset("time_of_flight").ok().and_then(|ds| {
+        let raw = ds.read_1d::<f64>().ok()?.to_vec();
+        // `read_string_attr` returns Ok(None) for absent and Err for
+        // genuine HDF5 failures; either should propagate to "no TOF
+        // axis" rather than fall through to the wrong-scale raw
+        // values.
+        let units = read_string_attr(&ds, "units").ok()?;
+        let scale = tof_scale_to_us(units.as_deref()).ok()?;
+        Some(raw.into_iter().map(|v| v * scale).collect())
+    });
 
-    (true, histogram_shape, tof_edges)
+    (true, histogram_shape, tof_edges_us)
 }
 
 /// Probe the neutron event group for event count.
@@ -822,8 +878,44 @@ mod tests {
         assert!(!meta.has_events);
         assert_eq!(meta.histogram_shape, Some([1, 2, 3, 4]));
         assert_eq!(meta.flight_path_m, Some(25.0));
-        assert!(meta.tof_edges_ns.is_some());
-        assert_eq!(meta.tof_edges_ns.unwrap().len(), 5);
+        // No `units` attribute on this fixture → rustpix legacy-ns
+        // assumption, so the probe rescales 1000/2000/.../5000 ns
+        // into 1/2/.../5 µs (× 1e-3).
+        let edges = meta.tof_edges_us.expect("probe should return TOF edges");
+        assert_eq!(edges.len(), 5);
+        for (i, &expected_us) in [1.0_f64, 2.0, 3.0, 4.0, 5.0].iter().enumerate() {
+            assert!(
+                (edges[i] - expected_us).abs() < 1e-12,
+                "edge {i}: expected {expected_us} µs, got {} µs",
+                edges[i]
+            );
+        }
+    }
+
+    /// Round 2 review: `probe_nexus` must respect the `units`
+    /// attribute on `time_of_flight` the same way `load_nexus_histogram`
+    /// does.  A file written with `units = "us"` must surface µs
+    /// values verbatim through the probe (no 1000× silent rescale).
+    #[test]
+    fn test_probe_nexus_histogram_units_us_no_rescale() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("probe_units_us.h5");
+
+        let counts = vec![0u64; 4];
+        // Values that would be wrong by 1000× if treated as ns.
+        let tof_us = vec![1000.0, 2000.0, 3000.0, 4000.0, 5000.0];
+        create_test_histogram_with_units(&path, &counts, [1, 1, 1, 4], &tof_us, Some("us"));
+
+        let meta = probe_nexus(&path).expect("probe with units=us");
+        let edges = meta.tof_edges_us.expect("TOF axis should be present");
+        assert_eq!(edges.len(), 5);
+        for (i, &expected_us) in tof_us.iter().enumerate() {
+            assert!(
+                (edges[i] - expected_us).abs() < 1e-9,
+                "probe edge {i}: expected {expected_us} µs (no rescale), got {} µs",
+                edges[i]
+            );
+        }
     }
 
     #[test]
