@@ -2195,19 +2195,19 @@ fn py_calibrate_energy(
     // guards inside `transmission::forward_model` → SLBW / RML / URR
     // leaves.  Calibration requires at least one data point to fit
     // (L, t₀, n_total), so an empty grid is also rejected.
-    require_non_empty_energy_grid(e)?;
-    if t.len() != e.len() {
+    require_non_empty_energy_grid(&e_owned)?;
+    if t_owned.len() != e_owned.len() {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
             "transmission length ({}) must match energies_nominal length ({})",
-            t.len(),
-            e.len(),
+            t_owned.len(),
+            e_owned.len(),
         )));
     }
-    if s.len() != e.len() {
+    if s_owned.len() != e_owned.len() {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
             "uncertainty length ({}) must match energies_nominal length ({})",
-            s.len(),
-            e.len(),
+            s_owned.len(),
+            e_owned.len(),
         )));
     }
 
