@@ -321,6 +321,25 @@ pub fn calibrate_energy(
         }
     }
 
+    // Post-grid-search sanity check: if every `compute_chi2` call along
+    // the entire 3-phase grid returned `f64::INFINITY` (e.g. because
+    // `SampleParams::new` or `forward_model` failed at every candidate,
+    // or because the residuals overflowed for non-finite-but-passing
+    // transmission values such as 1e308), `best_chi2` remains
+    // `INFINITY` and the caller would otherwise receive a
+    // `CalibrationResult { reduced_chi_squared: inf, .. }` — the same
+    // silent-failure class as the zero-valid-bins case the up-front
+    // guard now rejects.  Reject explicitly here so calibration
+    // failure is always an `Err`, never an `Ok` with a sentinel chi².
+    if !best_chi2.is_finite() {
+        return Err(PipelineError::InvalidParameter(format!(
+            "calibrate_energy: grid search produced no finite chi² across all \
+             (L, t₀, n_total) candidates — likely cause is forward-model failure \
+             or non-finite residuals (e.g. wildly out-of-scale transmission); \
+             best_chi2 = {best_chi2}",
+        )));
+    }
+
     // Compute corrected energy grid at the best parameters
     let t0_best_s = best_t0_us * 1e-6;
     let energies_corrected: Vec<f64> = tof_s
@@ -501,11 +520,21 @@ mod tests {
             result.total_density,
             true_n,
         );
+        // The synthetic round-trip uses noiseless data, so a grid point
+        // that lands on (or arbitrarily close to) the true parameters
+        // can legitimately yield chi² = 0.  Accept `>= 0.0` (the
+        // physically valid range) rather than `> 0.0`, which was a
+        // flake-prone strict-inequality.  The zero-valid-bins
+        // regression that previously reported chi² = 0.0 is now
+        // rejected up-front by the `n_valid >= N_FITTED_PARAMS` guard,
+        // and the all-infinity grid-search case is rejected by the
+        // post-search `best_chi2.is_finite()` guard — so finiteness
+        // alone is the meaningful check here.
         assert!(
-            result.reduced_chi_squared.is_finite() && result.reduced_chi_squared > 0.0,
-            "chi²_reduced must be finite and > 0 (zero-valid-bins regression: a \
-             degenerate input previously reported chi²_reduced = 0.0 as success); \
-             got {}",
+            result.reduced_chi_squared.is_finite() && result.reduced_chi_squared >= 0.0,
+            "chi²_reduced must be finite and >= 0 (degenerate-input regressions \
+             are caught up-front and post-search; this assertion guards against \
+             chi² leaking as inf or NaN); got {}",
             result.reduced_chi_squared,
         );
     }
@@ -644,6 +673,49 @@ mod tests {
                 assert!(
                     msg.contains("ascending"),
                     "error message should mention ascending, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidParameter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_calibrate_all_infinite_chi2_rejected() {
+        // Regression for the post-grid-search `best_chi2.is_finite()`
+        // guard.  Before the guard, an input whose every `compute_chi2`
+        // evaluation returned `f64::INFINITY` left `best_chi2`
+        // initialised at `INFINITY`, no candidate ever beat it, and the
+        // function returned `Ok(CalibrationResult { reduced_chi_squared:
+        // inf, .. })` — the same silent-failure surface as the
+        // zero-valid-bins case, just with infinity instead of zero.
+        //
+        // Driving the all-infinity path: feed finite but wildly
+        // out-of-scale transmission (1e308).  Each finite uncertainty
+        // (0.01) makes the residual ((1e308 − T_model) / 0.01) overflow
+        // to `+inf`, residual² is `inf`, the per-bin sum is `inf`, and
+        // every grid candidate returns `inf`.  Crucially, the
+        // transmission values stay `finite()` so they pass the up-front
+        // `t.is_finite()` mask and the new post-search guard is the
+        // only line of defence.
+        let (energies, _transmission, uncertainty, isotopes, abundances) =
+            minimal_calibration_inputs();
+        let transmission = vec![1e308; energies.len()];
+        let err = calibrate_energy(
+            &energies,
+            &transmission,
+            &uncertainty,
+            &isotopes,
+            &abundances,
+            25.0,
+            293.6,
+            None,
+        )
+        .expect_err("all-infinity chi² across the grid must be rejected");
+        match err {
+            PipelineError::InvalidParameter(msg) => {
+                assert!(
+                    msg.contains("finite chi²") || msg.contains("best_chi2"),
+                    "error message should explain the all-infinity grid-search failure, got: {msg}"
                 );
             }
             other => panic!("expected InvalidParameter, got {other:?}"),
