@@ -196,6 +196,17 @@ pub fn slbw_cross_sections_for_range(
     awr: f64,
     target_spin: f64,
 ) -> (f64, f64, f64, f64) {
+    // Defensive input validation at the public boundary (issue #558).
+    // See `urr::urr_cross_sections` for rationale.  The leaf
+    // `pi_over_k_squared_barns` retains its `debug_assert!`; this entry
+    // guard makes the precondition genuinely enforced in release builds
+    // for direct Rust callers that bypass the Python wrapper's
+    // `validate_energy_grid`.
+    assert!(
+        energy_ev.is_finite() && energy_ev > 0.0,
+        "expected positive finite energy_ev, got {energy_ev}"
+    );
+
     let pi_over_k2 = channel::pi_over_k_squared_barns(energy_ev, awr);
 
     let mut total = 0.0;
@@ -826,5 +837,73 @@ mod tests {
                 sum
             );
         }
+    }
+
+    // ─── Defensive input validation at the public boundary ──────────────────
+    //
+    // `slbw_cross_sections_for_range` is `pub`, so it can be called directly
+    // from any crate without going through the Python wrapper's
+    // `validate_energy_grid`.  The entry assertion turns malformed energies
+    // (zero, negative, NaN, infinity) into a loud panic at the public
+    // boundary, rather than letting them propagate into `pi_over_k_squared`
+    // (whose `debug_assert!` is invisible in release builds).  See issue #558.
+
+    fn make_minimal_slbw_range() -> nereids_endf::resonance::ResonanceRange {
+        ResonanceRange {
+            energy_low: 1e-5,
+            energy_high: 1e4,
+            resolved: true,
+            formalism: ResonanceFormalism::SLBW,
+            target_spin: 0.0,
+            scattering_radius: 9.4285,
+            naps: 1,
+            l_groups: vec![LGroup {
+                l: 0,
+                awr: 236.006,
+                apl: 0.0,
+                qx: 0.0,
+                lrx: 0,
+                resonances: vec![Resonance {
+                    energy: 6.674,
+                    j: 0.5,
+                    gn: 1.493e-3,
+                    gg: 23.0e-3,
+                    gfa: 0.0,
+                    gfb: 0.0,
+                }],
+            }],
+            rml: None,
+            urr: None,
+            ap_table: None,
+            r_external: vec![],
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "expected positive finite energy_ev")]
+    fn slbw_for_range_panics_on_zero_energy() {
+        let range = make_minimal_slbw_range();
+        let _ = slbw_cross_sections_for_range(&range, 0.0, 236.006, 0.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected positive finite energy_ev")]
+    fn slbw_for_range_panics_on_negative_energy() {
+        let range = make_minimal_slbw_range();
+        let _ = slbw_cross_sections_for_range(&range, -1.0, 236.006, 0.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected positive finite energy_ev")]
+    fn slbw_for_range_panics_on_nan_energy() {
+        let range = make_minimal_slbw_range();
+        let _ = slbw_cross_sections_for_range(&range, f64::NAN, 236.006, 0.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected positive finite energy_ev")]
+    fn slbw_for_range_panics_on_infinite_energy() {
+        let range = make_minimal_slbw_range();
+        let _ = slbw_cross_sections_for_range(&range, f64::INFINITY, 236.006, 0.0);
     }
 }

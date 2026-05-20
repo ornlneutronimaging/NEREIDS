@@ -185,6 +185,15 @@ fn resize_and_zero_bool(buf: &mut Vec<bool>, len: usize) {
 /// Iterates over all spin groups (J,π), sums their contributions.
 /// A single `RmlWorkspace` is allocated once and reused across spin groups.
 pub fn cross_sections_for_rml_range(rml: &RmlData, energy_ev: f64) -> (f64, f64, f64, f64) {
+    // Defensive input validation at the public boundary (issue #558).
+    // See `urr::urr_cross_sections` for rationale.  Catches malformed
+    // energies before any spin-group iteration, where empty spin-group
+    // vecs would otherwise silently return (0, 0, 0, 0) for NaN/∞.
+    assert!(
+        energy_ev.is_finite() && energy_ev > 0.0,
+        "expected positive finite energy_ev, got {energy_ev}"
+    );
+
     let mut total = 0.0;
     let mut elastic = 0.0;
     let mut capture = 0.0;
@@ -1250,5 +1259,53 @@ mod tests {
             "W-184 σ_capture: {:.4} b, σ_elastic: {:.4} b at 101.9 eV",
             xs_on_res.capture, xs_on_res.elastic
         );
+    }
+
+    // ─── Defensive input validation at the public boundary ──────────────────
+    //
+    // `cross_sections_for_rml_range` is `pub`, so it can be called directly
+    // from any crate without going through the Python wrapper's
+    // `validate_energy_grid`.  An empty `spin_groups` vec would otherwise
+    // silently return (0, 0, 0, 0) for malformed energies, hiding caller
+    // bugs.  The entry assertion fires before any spin-group iteration.
+    // See issue #558.
+
+    fn make_empty_rml() -> nereids_endf::resonance::RmlData {
+        nereids_endf::resonance::RmlData {
+            target_spin: 0.0,
+            awr: 183.0,
+            scattering_radius: 8.3,
+            krm: 2,
+            particle_pairs: vec![],
+            spin_groups: vec![],
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "expected positive finite energy_ev")]
+    fn rml_for_range_panics_on_zero_energy() {
+        let rml = make_empty_rml();
+        let _ = cross_sections_for_rml_range(&rml, 0.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected positive finite energy_ev")]
+    fn rml_for_range_panics_on_negative_energy() {
+        let rml = make_empty_rml();
+        let _ = cross_sections_for_rml_range(&rml, -1.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected positive finite energy_ev")]
+    fn rml_for_range_panics_on_nan_energy() {
+        let rml = make_empty_rml();
+        let _ = cross_sections_for_rml_range(&rml, f64::NAN);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected positive finite energy_ev")]
+    fn rml_for_range_panics_on_infinite_energy() {
+        let rml = make_empty_rml();
+        let _ = cross_sections_for_rml_range(&rml, f64::INFINITY);
     }
 }

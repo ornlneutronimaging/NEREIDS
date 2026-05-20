@@ -71,6 +71,20 @@ use crate::penetrability;
 ///   responsible for evaluating any AP(E) table (NRO≠0) or falling back
 ///   to the constant `urr.ap`.
 pub fn urr_cross_sections(urr: &UrrData, e_ev: f64, ap_fm: f64) -> (f64, f64, f64, f64) {
+    // Defensive input validation at the public boundary (issue #558).
+    // The dominant call path through `cross_sections_at_energy` is already
+    // gated by ENDF range bounds and the Python wrapper's
+    // `validate_energy_grid`, so this assertion should never fire in
+    // production.  It exists to make this `pub fn` safe for direct callers
+    // (other Rust crates, tests, future bindings) — surfacing malformed
+    // energies as a loud panic rather than letting NaN/∞ silently
+    // contaminate downstream arithmetic.  One branch at the public entry
+    // is well outside any inner loop.
+    assert!(
+        e_ev.is_finite() && e_ev > 0.0,
+        "expected positive finite e_ev, got {e_ev}"
+    );
+
     if e_ev < urr.e_low || e_ev > urr.e_high {
         return (0.0, 0.0, 0.0, 0.0);
     }
@@ -530,5 +544,43 @@ mod tests {
                 }],
             }],
         }
+    }
+
+    // ─── Defensive input validation at the public boundary ──────────────────
+    //
+    // `urr_cross_sections` is `pub`, so any Rust caller (other crates, tests,
+    // future integrations) can reach it directly without going through the
+    // Python wrapper's `validate_energy_grid`.  The body's internal guards
+    // (`urr.e_low ≤ e_ev ≤ urr.e_high`) silently return zeros for negative
+    // energies because `e_low > 0` for any well-formed URR range — that
+    // would hide a caller bug.  The entry assertion turns the footgun into
+    // a loud panic at the call site.  See issue #558.
+
+    #[test]
+    #[should_panic(expected = "expected positive finite e_ev")]
+    fn urr_panics_on_zero_energy() {
+        let urr = make_lrf1_urr(1000.0, 30_000.0);
+        let _ = urr_cross_sections(&urr, 0.0, urr.ap);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected positive finite e_ev")]
+    fn urr_panics_on_negative_energy() {
+        let urr = make_lrf1_urr(1000.0, 30_000.0);
+        let _ = urr_cross_sections(&urr, -1.0, urr.ap);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected positive finite e_ev")]
+    fn urr_panics_on_nan_energy() {
+        let urr = make_lrf1_urr(1000.0, 30_000.0);
+        let _ = urr_cross_sections(&urr, f64::NAN, urr.ap);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected positive finite e_ev")]
+    fn urr_panics_on_infinite_energy() {
+        let urr = make_lrf1_urr(1000.0, 30_000.0);
+        let _ = urr_cross_sections(&urr, f64::INFINITY, urr.ap);
     }
 }
