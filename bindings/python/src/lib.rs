@@ -795,11 +795,19 @@ impl PySpatialResult {
 /// Compute cross-sections at given energies for an isotope.
 ///
 /// Args:
-///     energies: Energy grid in eV (1D numpy array).
+///     energies: Energy grid in eV (1D numpy array).  Must be **strictly
+///         ascending**, with every value **finite and positive** — these
+///         constraints are enforced by ``validate_energy_grid`` before any
+///         physics is evaluated.  Empty grids are accepted and return
+///         empty arrays.
 ///     data: ResonanceData for the isotope.
 ///
 /// Returns:
 ///     Dictionary with 'total', 'elastic', 'capture', 'fission' arrays.
+///
+/// Raises:
+///     ValueError: If the grid contains NaN/∞, non-positive entries, or
+///         is not strictly ascending.
 #[pyfunction]
 fn cross_sections<'py>(
     py: Python<'py>,
@@ -895,7 +903,15 @@ fn forward_model<'py>(
         ));
     }
 
-    let e_owned = energies.as_slice()?.to_vec();
+    // Validate the energy grid up front so invalid input surfaces as
+    // ValueError rather than a release-mode `PanicException` from the
+    // per-point `assert!(energy_ev.is_finite() && energy_ev > 0.0)` guards
+    // added to the SLBW / RML / URR / Reich-Moore leaf paths.  Empty
+    // grids are accepted (the downstream `transmission::forward_model`
+    // returns an empty vector for an empty grid).
+    let e_slice = energies.as_slice()?;
+    validate_energy_grid(e_slice)?;
+    let e_owned = e_slice.to_vec();
 
     // Build sample isotopes list from either isotopes or groups
     let sample_isotopes: Vec<(ResonanceData, f64)> = if let Some(isotopes) = isotopes {
@@ -2166,6 +2182,28 @@ fn py_calibrate_energy(
     let t = transmission.as_slice()?;
     let s = uncertainty.as_slice()?;
 
+    // Validate the nominal energy grid up front so malformed energies
+    // surface as ValueError rather than a release-mode `PanicException`
+    // from the per-point `assert!(energy_ev.is_finite() && energy_ev > 0.0)`
+    // guards inside `transmission::forward_model` → SLBW / RML / URR
+    // leaves.  Calibration requires at least one data point to fit
+    // (L, t₀, n_total), so an empty grid is also rejected.
+    require_non_empty_energy_grid(e)?;
+    if t.len() != e.len() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "transmission length ({}) must match energies_nominal length ({})",
+            t.len(),
+            e.len(),
+        )));
+    }
+    if s.len() != e.len() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "uncertainty length ({}) must match energies_nominal length ({})",
+            s.len(),
+            e.len(),
+        )));
+    }
+
     let res_data: Vec<nereids_endf::resonance::ResonanceData> = isotopes
         .into_iter()
         .map(|d| Arc::unwrap_or_clone(d.inner))
@@ -3109,7 +3147,8 @@ fn py_spatial_map_typed<'py>(
     // V3: shape validation against the input data cube.
     let data_shape = data.data_a.shape();
     let (data_n_e, data_h, data_w) = (data_shape[0], data_shape[1], data_shape[2]);
-    let n_e_supplied = energies.as_slice()?.len();
+    let e_slice = energies.as_slice()?;
+    let n_e_supplied = e_slice.len();
     if n_e_supplied != data_n_e {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
             "energies length ({n_e_supplied}) != data spectral axis length ({data_n_e})",
@@ -3124,7 +3163,16 @@ fn py_spatial_map_typed<'py>(
         }
     }
 
-    let energies_vec = energies.as_slice()?.to_vec();
+    // Validate the energy grid up front so malformed energies surface as
+    // ValueError rather than a release-mode `PanicException` from the
+    // per-point `assert!(energy_ev.is_finite() && energy_ev > 0.0)`
+    // guards inside the rayon-parallelised pipeline precompute → SLBW /
+    // RML / URR leaves.  Empty grids are accepted and yield an empty
+    // result; per-pixel failures still degrade gracefully via
+    // `filter_map(Err(_) => None)`.
+    validate_energy_grid(e_slice)?;
+
+    let energies_vec = e_slice.to_vec();
 
     // Build resolution
     let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution, None)?;

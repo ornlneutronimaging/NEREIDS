@@ -190,6 +190,13 @@ pub fn slbw_cross_sections(data: &ResonanceData, energy_ev: f64) -> CrossSection
 /// batch/per-point bit-exact equivalence.
 ///
 /// Returns `(total, elastic, capture, fission)` in barns.
+///
+/// # Panics
+/// Panics if `energy_ev` is not finite or is non-positive.  This is a
+/// defensive guard at the public boundary; the Python wrapper and the
+/// SAMMY-style dispatcher already validate the energy grid via
+/// `validate_energy_grid`, so this assertion only fires for direct
+/// callers (other Rust crates, tests) that bypass the grid check.
 pub fn slbw_cross_sections_for_range(
     range: &nereids_endf::resonance::ResonanceRange,
     energy_ev: f64,

@@ -70,6 +70,13 @@ use crate::penetrability;
 /// * `ap_fm` — Scattering radius in fm at this energy.  The caller is
 ///   responsible for evaluating any AP(E) table (NRO≠0) or falling back
 ///   to the constant `urr.ap`.
+///
+/// # Panics
+/// Panics if `e_ev` is not finite or is non-positive.  This is a
+/// defensive guard at the public boundary; the Python wrapper and the
+/// SAMMY-style dispatcher already validate the energy grid via
+/// `validate_energy_grid`, so this assertion only fires for direct
+/// callers (other Rust crates, tests) that bypass the grid check.
 pub fn urr_cross_sections(urr: &UrrData, e_ev: f64, ap_fm: f64) -> (f64, f64, f64, f64) {
     // Defensive input validation at the public boundary (issue #558).
     // The dominant call path through `cross_sections_at_energy` is already

@@ -184,6 +184,13 @@ fn resize_and_zero_bool(buf: &mut Vec<bool>, len: usize) {
 ///
 /// Iterates over all spin groups (J,π), sums their contributions.
 /// A single `RmlWorkspace` is allocated once and reused across spin groups.
+///
+/// # Panics
+/// Panics if `energy_ev` is not finite or is non-positive.  This is a
+/// defensive guard at the public boundary; the Python wrapper and the
+/// SAMMY-style dispatcher already validate the energy grid via
+/// `validate_energy_grid`, so this assertion only fires for direct
+/// callers (other Rust crates, tests) that bypass the grid check.
 pub fn cross_sections_for_rml_range(rml: &RmlData, energy_ev: f64) -> (f64, f64, f64, f64) {
     // Defensive input validation at the public boundary (issue #558).
     // See `urr::urr_cross_sections` for rationale.  Catches malformed
