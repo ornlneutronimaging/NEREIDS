@@ -806,7 +806,15 @@ fn cross_sections<'py>(
     energies: PyReadonlyArray1<f64>,
     data: &PyResonanceData,
 ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    let e_owned = energies.as_slice()?.to_vec();
+    // Validate the full grid up front so invalid input surfaces as ValueError
+    // rather than a release-mode `PanicException` from the per-point
+    // `assert!(energy_ev.is_finite() && energy_ev > 0.0)` guards added to
+    // the SLBW / RML / URR leaf paths.  Sibling PyO3 entries
+    // (`doppler_broaden`, `resolution_broaden`, `forward_model`, etc.)
+    // already validate via this same helper; this entry was the lone gap.
+    let e_slice = energies.as_slice()?;
+    validate_energy_grid(e_slice)?;
+    let e_owned = e_slice.to_vec();
     let res_data = data.inner.clone();
 
     // Release the GIL for the cross-section computation.

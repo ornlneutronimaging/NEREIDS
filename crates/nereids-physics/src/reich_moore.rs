@@ -343,7 +343,24 @@ pub struct CrossSections {
 ///
 /// # Returns
 /// Cross-sections in barns.
+///
+/// # Panics
+/// Panics if `energy_ev` is non-finite or non-positive.  The leaf SLBW /
+/// RML / URR routines already enforce this precondition in release builds;
+/// hoisting the same assert to the top-level pub fn keeps the public
+/// contract symmetric so direct Rust callers cannot bypass validation
+/// by hitting a range that gates entry on a finite-only check (e.g. a
+/// pure-RM range with no SLBW/URR/RML leaf would otherwise silently
+/// return zeros when handed NaN).
 pub fn cross_sections_at_energy(data: &ResonanceData, energy_ev: f64) -> CrossSections {
+    // Symmetric public-API guard.  Matches `slbw_cross_sections_for_range`,
+    // `cross_sections_for_rml_range`, and `urr_cross_sections`.  One branch
+    // at the entry of this O(ranges × resonances) function is negligible.
+    assert!(
+        energy_ev.is_finite() && energy_ev > 0.0,
+        "expected positive finite energy_ev, got {energy_ev}"
+    );
+
     let awr = data.awr;
 
     let mut total = 0.0;
@@ -408,9 +425,28 @@ pub fn cross_sections_at_energy(data: &ResonanceData, energy_ev: f64) -> CrossSe
 ///
 /// # Returns
 /// Vector of cross-sections, one per energy point.
+///
+/// # Panics
+/// Panics if any element of `energies` is non-finite or non-positive.
+/// Validating the entire grid up-front (O(n) branch, one pass) means a
+/// single bad energy fails fast with a clear message instead of being
+/// hidden inside the inner loop, matches the symmetric contract on
+/// `cross_sections_at_energy`, and protects direct Rust callers from
+/// the same release-mode silent-zero footgun that the SLBW / RML / URR
+/// leaf asserts guard against per-point.
 pub fn cross_sections_on_grid(data: &ResonanceData, energies: &[f64]) -> Vec<CrossSections> {
     if energies.is_empty() {
         return Vec::new();
+    }
+
+    // Symmetric public-API guard.  See `cross_sections_at_energy` above.
+    // O(n) — negligible next to the per-range precompute and per-point
+    // resonance evaluation that follow.
+    for &energy_ev in energies {
+        assert!(
+            energy_ev.is_finite() && energy_ev > 0.0,
+            "expected positive finite energy_ev, got {energy_ev}"
+        );
     }
 
     let awr = data.awr;
@@ -2355,5 +2391,75 @@ mod tests {
              per_point={:.6e}  batch={:.6e}  rel_diff={max_rel:.3e}",
             energies[worst_idx], per_point[worst_idx], batch[worst_idx],
         );
+    }
+
+    // ─── Top-level pub-fn energy-validation guards ─────────────────────────
+    //
+    // Mirrors the SLBW / RML / URR test patterns: NaN, ±Inf, 0, and -1 must
+    // each panic with the canonical "expected positive finite energy_ev"
+    // message.  These tests gate the symmetric defense-in-depth contract on
+    // both Reich-Moore top-level pub fns so a future refactor cannot
+    // silently drop the assert.
+
+    fn make_minimal_rm_data() -> ResonanceData {
+        // Re-use the U-238 single-resonance helper: the energy used to call
+        // the function is what matters here, not the resonance parameters.
+        make_single_resonance_data(6.674, 1.493e-3, 23.0e-3, 0.5, 0, 236.006, 0.0, 9.4285)
+    }
+
+    #[test]
+    #[should_panic(expected = "expected positive finite energy_ev")]
+    fn cross_sections_at_energy_panics_on_nan() {
+        let data = make_minimal_rm_data();
+        let _ = cross_sections_at_energy(&data, f64::NAN);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected positive finite energy_ev")]
+    fn cross_sections_at_energy_panics_on_infinity() {
+        let data = make_minimal_rm_data();
+        let _ = cross_sections_at_energy(&data, f64::INFINITY);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected positive finite energy_ev")]
+    fn cross_sections_at_energy_panics_on_zero() {
+        let data = make_minimal_rm_data();
+        let _ = cross_sections_at_energy(&data, 0.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected positive finite energy_ev")]
+    fn cross_sections_at_energy_panics_on_negative() {
+        let data = make_minimal_rm_data();
+        let _ = cross_sections_at_energy(&data, -1.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected positive finite energy_ev")]
+    fn cross_sections_on_grid_panics_on_nan() {
+        let data = make_minimal_rm_data();
+        let _ = cross_sections_on_grid(&data, &[1.0, f64::NAN, 2.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected positive finite energy_ev")]
+    fn cross_sections_on_grid_panics_on_infinity() {
+        let data = make_minimal_rm_data();
+        let _ = cross_sections_on_grid(&data, &[1.0, f64::INFINITY]);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected positive finite energy_ev")]
+    fn cross_sections_on_grid_panics_on_zero() {
+        let data = make_minimal_rm_data();
+        let _ = cross_sections_on_grid(&data, &[1.0, 0.0, 2.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected positive finite energy_ev")]
+    fn cross_sections_on_grid_panics_on_negative() {
+        let data = make_minimal_rm_data();
+        let _ = cross_sections_on_grid(&data, &[-1.0, 1.0, 2.0]);
     }
 }
