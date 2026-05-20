@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed (breaking — `nereids-io`)
+
+- `NexusMetadata.tof_edges_ns: Option<Vec<f64>>` has been renamed to
+  `NexusMetadata.tof_edges_us: Option<Vec<f64>>`.  The old field name was
+  a misnomer: the values stored in it were already microseconds after
+  `units`-attribute rescaling inside `probe_histogram_group` — they were
+  never nanoseconds.  The field is now correctly named so callers do not
+  need to second-guess the unit at the API boundary.  No data conversion
+  is needed for downstream consumers; the numeric payload is unchanged.
+  Per semantic versioning for `0.x` crates, this is an acceptable
+  breaking change at this stage of the project; no external consumers
+  of this field have been identified in the workspace or sibling repos.
+
 ## [0.1.5] - 2025-03-11
 
 ### Fixed
