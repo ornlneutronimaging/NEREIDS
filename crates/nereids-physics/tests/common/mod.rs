@@ -110,14 +110,19 @@ pub fn synthetic_venus_usr_text() -> String {
     for i in 0..n_ref {
         let frac = (i as f64) / ((n_ref - 1) as f64);
         let e_ref = (log_e_min + frac * (log_e_max - log_e_min)).exp();
-        // Ref-energy line: <E>   0.0  (the parser treats the second
-        // column as a zero marker).
+        // Ref-energy line: <E>   0.0  (the parser ignores the second
+        // column on the first line of a block — see
+        // `TabulatedResolution::from_text`, which captures only `x`
+        // as `current_energy`; we emit `0.0` as a conventional
+        // placeholder).
         out.push_str(&format!("{e_ref:.15e}   0.000000000000000e+000\n"));
 
         // Triangular kernel: weights w(dt) = max(0, 1 − |dt|/half_width).
-        // Symmetric about dt = 0, with the dt = 0 sample omitted in
-        // production fixtures (the ref-energy line is the dt = 0
-        // marker) but we keep dt ≠ 0 samples both sides.
+        // Symmetric about dt = 0. Since `SYNTHETIC_POINTS_PER_BLOCK`
+        // is odd (41), the inner loop emits the dt = 0 sample at
+        // k = (n_pts − 1) / 2 in addition to the symmetric dt ≠ 0
+        // pairs; the parser accepts it as an ordinary (offset,
+        // weight) entry.
         let half = SYNTHETIC_HALF_WIDTH_US;
         let n_pts = SYNTHETIC_POINTS_PER_BLOCK;
         let dt_step = 2.0 * half / ((n_pts - 1) as f64);
