@@ -47,7 +47,7 @@ fn max_hybrid_err(a: &[f64], b: &[f64]) -> f64 {
 /// test does not re-measure that; it only checks forward-model
 /// correctness.
 #[test]
-fn cubature_real_venus_k1_forward_equivalence() {
+fn cubature_venus_like_k1_forward_equivalence() {
     let tab = common::synthetic_venus_usr_tab();
 
     // Smaller production-ish grid (512 instead of 3471) to keep
@@ -77,7 +77,7 @@ fn cubature_real_venus_k1_forward_equivalence() {
     let training = SparseEmpiricalCubaturePlan::default_training_points(&train_max);
     let anchor = SparseEmpiricalCubaturePlan::default_jacobian_anchor(&train_max);
     let cub = SparseEmpiricalCubaturePlan::build(&matrix, &sigma, 1, &training, &anchor)
-        .expect("build k=1 cubature on real VENUS kernel");
+        .expect("build k=1 cubature on VENUS-like kernel");
 
     // At each training density, cubature = exact.
     for n_s in training.iter() {
@@ -119,7 +119,7 @@ fn cubature_real_venus_k1_forward_equivalence() {
     );
 }
 
-/// Real-VENUS regression test for the Chebyshev scalar surrogate on
+/// VENUS-like regression test for the Chebyshev scalar surrogate on
 /// the 3471-bin VENUS production grid with synthetic Hf-like σ.
 /// Asserts forward accuracy ≤ 1e-5 at VENUS density (issue #475
 /// success criterion) and logs per-call wall time.  PR #475 benched
@@ -129,7 +129,7 @@ fn cubature_real_venus_k1_forward_equivalence() {
 /// hardware-dependent and intentionally not pinned here; the
 /// accuracy bound stays portable.
 #[test]
-fn scalar_chebyshev_real_venus_k1_regression() {
+fn scalar_chebyshev_venus_like_k1_regression() {
     let tab = common::synthetic_venus_usr_tab();
 
     // VENUS production grid size.

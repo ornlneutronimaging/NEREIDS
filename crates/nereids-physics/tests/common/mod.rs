@@ -10,7 +10,7 @@
 //! cannot vendor it under `tests/data/` to make CI exercise the real
 //! kernel.
 //!
-//! Previously, [`venus_usr_resolution_path`] returned
+//! Previously, a `venus_usr_resolution_path` helper returned
 //! `Option<PathBuf>::None` whenever the gitignored file was absent
 //! (i.e., on every CI run and every fresh checkout), and the 13
 //! fixture-gated tests in this directory all early-returned via
@@ -45,14 +45,16 @@ pub const SYNTHETIC_FLIGHT_PATH_M: f64 = 25.0;
 
 /// Half-width of the synthetic triangular kernel in TOF microseconds.
 ///
-/// Chosen large enough that, at the lower edge of the test grid
-/// (E = 7 eV), the energy-space FWHM `2·E^(3/2) / (TOF_FACTOR · L) · w`
-/// is several times the grid bin width on the 512-point uniform
-/// 7 – 200 eV grid — so broadening visibly couples neighbouring bins
-/// and [`assert_kernel_broadens`] sees a > 1 % deviation from the
-/// unbroadened input on the dip-shape probe spectrum below. The 0.5
-/// μs scale is the same order of magnitude as the production VENUS
-/// kernel's central-lobe half-width.
+/// The energy-space half-width `ΔE = 2·E / TOF · w` at the lower edge
+/// of the test grid (E = 7 eV, L = 25 m → TOF ≈ 683 µs) is only
+/// ≈ 0.010 eV, well below the 512-point uniform 7 – 200 eV grid bin
+/// width of ≈ 0.378 eV — i.e., the kernel is sub-bin at the low-energy
+/// edge. Broadening still visibly perturbs the dip-shape probe in
+/// [`assert_kernel_broadens`] because the probe is centred at the
+/// middle of the grid (E ≈ 103 eV), where the energy-space half-width
+/// grows like `E^(3/2)` and the kernel straddles several bins. The
+/// 0.5 μs scale is the same order of magnitude as the production
+/// VENUS kernel's central-lobe half-width.
 const SYNTHETIC_HALF_WIDTH_US: f64 = 0.5;
 
 /// Number of (offset, weight) samples per reference-energy block.
@@ -96,7 +98,7 @@ const SYNTHETIC_POINTS_PER_BLOCK: usize = 41;
 /// to the equivalence-tolerance arithmetic).
 pub fn synthetic_venus_usr_text() -> String {
     let mut out = String::new();
-    out.push_str("SYNTHETIC VENUS-like USR kernel — triangular FWHM 1us PSR\n");
+    out.push_str("SYNTHETIC VENUS-like USR kernel — triangular base 1us / FWHM 0.5us PSR\n");
     out.push_str("-----\n");
 
     // 25 log-spaced reference energies between 5e-3 eV and 1e3 eV.

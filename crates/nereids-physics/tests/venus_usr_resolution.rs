@@ -1,5 +1,5 @@
 //! Regression tests for the VENUS-like USR resolution operator and
-//! CSR-compiled [`crate::resolution::ResolutionMatrix`].
+//! CSR-compiled [`nereids_physics::resolution::ResolutionMatrix`].
 //!
 //! These tests build a synthetic SAMMY USR-format kernel via
 //! [`common::synthetic_venus_usr_tab`] (see that module for the
