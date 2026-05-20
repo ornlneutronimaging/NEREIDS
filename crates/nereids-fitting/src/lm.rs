@@ -305,8 +305,32 @@ fn compute_jacobian(
         };
         params.params[idx].value = original;
 
+        // Issue #552 M4: the main LM loop checks the trial step at
+        // :765-:768 via `trial_has_active_nonfinite`, but `compute_jacobian`
+        // is also called at :849 for the post-convergence covariance
+        // path, where no such guard runs.  A NaN row in the perturbed
+        // output divided by `actual_step` yields NaN in the Jacobian,
+        // which then poisons JᵀWJ and the inverse covariance.
+        //
+        // Per-cell skip (zero the entry) rather than whole-column skip:
+        // a NaN at a masked / inactive row is benign (the JᵀWJ assembly
+        // skips masked rows entirely via `active_mask.is_some_and(|m| !m[i])`
+        // at lm.rs :709 / :862), so a finite Jacobian row produced from a
+        // bad-but-masked probe must still be allowed to land in the
+        // column — see `test_lm_active_mask_tolerates_model_nan_outside_range`.
+        // The active-row NaNs that would otherwise propagate into JᵀWJ are
+        // zeroed here, which is the same numerical outcome as if the
+        // model had reported `Err` at that probe (skipped column, but
+        // per-row).
         for i in 0..n_data {
-            *jacobian.get_mut(i, j) = (perturbed[i] - y_current[i]) / actual_step;
+            let p = perturbed[i];
+            let y = y_current[i];
+            if p.is_finite() && y.is_finite() {
+                *jacobian.get_mut(i, j) = (p - y) / actual_step;
+            }
+            // else: leave at the zero-default; for active rows this is
+            // safe (matches the whole-column-skip outcome on Err), for
+            // masked rows it never gets read.
         }
     }
 
@@ -1791,5 +1815,86 @@ mod tests {
         );
         assert!(r_fixed.chi_squared.is_nan());
         assert!(r_fixed.reduced_chi_squared.is_nan());
+    }
+
+    // ==================================================================
+    // Issue #552 (M4) — NaN-in-Jacobian during FD probes.
+    //
+    // The main LM loop guards the trial step at the model.evaluate site
+    // (`trial_has_active_nonfinite` at :765-:768).  The silent surface
+    // is the post-convergence covariance Jacobian: it calls
+    // `compute_jacobian` directly at :849, which has no finiteness
+    // check on the per-column FD probe.  A NaN at any active row of the
+    // perturbed model output gets divided by `actual_step` and turned
+    // into NaN entries in the Jacobian — these poison `JᵀWJ` and the
+    // inverse covariance, which is reported as the "uncertainty" of
+    // the fit.
+    //
+    // Fix: when `compute_jacobian`'s FD probe returns any non-finite
+    // value, skip the column (zero derivative) rather than letting NaN
+    // through, mirroring the existing `Err` branch at :298-:304.
+    // ==================================================================
+
+    /// `compute_jacobian`'s FD path zeroes per-cell entries whose
+    /// perturbed model output is non-finite, rather than baking NaN
+    /// into the Jacobian (which then poisons the post-convergence
+    /// covariance computation).  Per-cell (not whole-column) so that a
+    /// NaN at a masked / inactive row leaves the rest of the column
+    /// usable — see `test_lm_active_mask_tolerates_model_nan_outside_range`
+    /// for the masked-NaN contract.
+    #[test]
+    fn test_compute_jacobian_skips_nan_perturbed_column() {
+        use crate::parameters::FitParameter;
+        // Two-parameter model.  Param 0 is well-behaved (returns
+        // `θ_0` constant).  Param 1 produces a NaN row at the +FD
+        // probe — exactly the "NaN-in-Jacobian during FD probes"
+        // signature from issue #552.
+        struct NanInColumn1 {
+            // Base value of param 1 — used to detect the perturbation.
+            p1_base: f64,
+        }
+        impl FitModel for NanInColumn1 {
+            fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+                // The +FD probe perturbs params[1] by ε; everything else
+                // keeps params[1] == self.p1_base.
+                let nan_row = (params[1] - self.p1_base).abs() > 1e-12;
+                let v = if nan_row { f64::NAN } else { params[0] };
+                Ok(vec![v; 4])
+            }
+            // No analytical_jacobian -> FD fallback drives compute_jacobian.
+        }
+        let model = NanInColumn1 { p1_base: 0.3 };
+        let mut params = ParameterSet::new(vec![
+            FitParameter::unbounded("p0", 0.5),
+            FitParameter::unbounded("p1", 0.3),
+        ]);
+        let y_current = vec![0.5; 4];
+        let mut all_vals_buf: Vec<f64> = Vec::new();
+        let mut free_idx_buf: Vec<usize> = Vec::new();
+        let jac = compute_jacobian(
+            &model,
+            &mut params,
+            &y_current,
+            1e-6,
+            &mut all_vals_buf,
+            &mut free_idx_buf,
+        )
+        .unwrap();
+        // Every entry must be finite — column 1 must have been skipped.
+        for (i, v) in jac.data.iter().enumerate() {
+            assert!(
+                v.is_finite(),
+                "compute_jacobian produced non-finite entry at index {i}: {v}"
+            );
+        }
+        // Column 1 was skipped -> all zeros.  Column 0 has the normal
+        // ∂T/∂θ_0 = 1 column from the well-behaved param.
+        for i in 0..jac.nrows {
+            assert_eq!(
+                jac.get(i, 1),
+                0.0,
+                "column 1 (NaN probe) should be zeroed, row {i}"
+            );
+        }
     }
 }

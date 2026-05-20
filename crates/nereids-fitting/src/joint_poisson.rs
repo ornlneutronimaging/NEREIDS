@@ -309,8 +309,22 @@ impl<'a> JointPoissonObjective<'a> {
             if denom.abs() < PIVOT_FLOOR {
                 continue;
             }
+            // Issue #552 M4: per-cell finiteness check.  The matching guard
+            // in lm.rs `compute_jacobian` zeroes NaN entries instead of
+            // dropping the column; the same pattern applies here because
+            // the downstream Fisher accumulator below already skips
+            // inactive rows (`bin_active(i)`), so a NaN at a masked /
+            // inactive row must not block the column for active rows.
+            // Active-row NaN is handled by [`deviance_curvature`], which
+            // returns 0 on non-finite `t_i` so the assembly stays clean.
             for i in 0..n_e {
-                *jac.get_mut(i, col) = (t_a[i] - t_b[i]) / denom;
+                let a = t_a[i];
+                let b = t_b[i];
+                if a.is_finite() && b.is_finite() {
+                    *jac.get_mut(i, col) = (a - b) / denom;
+                }
+                // else: leave at the zero-default; masked rows are never
+                // read by the active-bin filter in the Fisher loop.
             }
         }
         let mut info = FlatMatrix::zeros(n_free, n_free);
@@ -403,6 +417,17 @@ fn binomial_deviance_term(s: f64, o: f64, t: f64, c: f64) -> f64 {
         c.is_finite() && c > 0.0,
         "binomial_deviance_term: c must be finite and > 0, got {c}"
     );
+    // Issue #552 M14: `f64::max(NaN, ε)` returns `ε`, so a non-finite T
+    // would silently masquerade as a tiny positive transmission and the
+    // deviance would evaluate to a finite (but meaningless) value that
+    // the LM trial-step guard `Ok(v) if v.is_finite()` would accept.
+    // Return NaN so the deviance sum becomes NaN and the trial step is
+    // rejected.  The matching deviance_weight / deviance_curvature
+    // guards return 0, which keeps the gradient / Fisher accumulators
+    // clean rather than poisoning them with NaN contributions.
+    if !t.is_finite() {
+        return f64::NAN;
+    }
     let t_safe = t.max(POISSON_EPSILON);
     let n = s + o;
     if n <= 0.0 {
@@ -444,6 +469,17 @@ fn xlogy_ratio(x: f64, y: f64) -> f64 {
 /// done in [`binomial_deviance_term`]).
 #[inline]
 fn deviance_weight(s: f64, o: f64, t: f64, c: f64) -> f64 {
+    // Issue #552 M14: a non-finite T must not be folded into the
+    // gradient accumulator.  `f64::max(NaN, ε)` returns `ε`, which would
+    // turn a NaN bin into a finite gradient contribution scaled by the
+    // Jacobian and silently steer the optimizer.  Skip the bin (return
+    // 0) — the matching `binomial_deviance_term` returns NaN so the
+    // step is rejected by the trial-guard, but the gradient stays clean
+    // in case the caller is using it for diagnostics on a partially-bad
+    // grid.
+    if !t.is_finite() {
+        return 0.0;
+    }
     let t_safe = t.max(POISSON_EPSILON);
     let one_plus_ct = 1.0 + c * t_safe;
     -2.0 * (s - o * c * t_safe) / (t_safe * one_plus_ct)
@@ -459,6 +495,14 @@ fn deviance_weight(s: f64, o: f64, t: f64, c: f64) -> f64 {
 /// and ∂²D/∂T² = 2 · I_TT (since D = −2 · L_c).
 #[inline]
 fn deviance_curvature(s: f64, o: f64, t: f64, c: f64) -> f64 {
+    // Issue #552 M14: see the matching guard in [`deviance_weight`].
+    // A non-finite T would otherwise contribute a huge spurious
+    // curvature via `f64::max(NaN, ε) -> ε`, inflating the diagonal of
+    // the Fisher matrix and underestimating the corresponding parameter
+    // uncertainty (covariance = I⁻¹ entries shrink as I grows).
+    if !t.is_finite() {
+        return 0.0;
+    }
     let t_safe = t.max(POISSON_EPSILON);
     let n = s + o;
     let one_plus_ct = 1.0 + c * t_safe;
@@ -641,6 +685,31 @@ pub fn joint_poisson_fit(
     let n_data = objective.n_data();
     if n_data == 0 {
         return Err(FittingError::EmptyData);
+    }
+
+    // Issue #552 M3: validate `o` / `s` length and `c` up-front at the
+    // public entry point.  The inner per-bin helpers (`binomial_deviance_term`,
+    // `deviance_from_transmission`) use `debug_assert!` only, which is a no-op
+    // in release builds.  Without these hard checks:
+    //   - A length mismatch in `o` vs `s` silently truncates via `.zip()`,
+    //     minimising deviance on a sub-range of bins.
+    //   - A non-positive or non-finite `c` produces finite garbage
+    //     (e.g. zero `cT`, NaN denominators) that the LM happily descends.
+    // Both surface as "the fit converged" with bogus parameter values —
+    // exactly the failure mode the trial-step guard cannot catch because
+    // the deviance value is finite.
+    if objective.s.len() != n_data {
+        return Err(FittingError::LengthMismatch {
+            expected: n_data,
+            actual: objective.s.len(),
+            field: "sample_counts",
+        });
+    }
+    if !objective.c.is_finite() || objective.c <= 0.0 {
+        return Err(FittingError::InvalidConfig(format!(
+            "proton-charge ratio c = Q_s/Q_ob must be finite and > 0, got {}",
+            objective.c
+        )));
     }
 
     // Validate active-mask length up-front, mirroring the LM solver's
@@ -2048,5 +2117,293 @@ mod tests {
             ),
             "expected LengthMismatch on active_mask; got {err:?}"
         );
+    }
+
+    // ==================================================================
+    // Issue #552 (M3) — release-mode input validation at joint_poisson_fit.
+    //
+    // The inner `binomial_deviance_term` and `deviance_from_transmission`
+    // protect themselves with `debug_assert!` only.  Release builds skip
+    // those, so a length mismatch in `o` vs `s` silently truncates via
+    // `.zip()` and a non-positive `c` produces finite garbage that the
+    // optimizer happily minimises.  Validate at the public entry point.
+    // ==================================================================
+
+    /// `joint_poisson_fit` rejects an `o`/`s` length mismatch with a
+    /// `LengthMismatch` error rather than silently truncating via `.zip()`
+    /// and minimising bogus deviance on a sub-range of bins.
+    #[test]
+    fn test_joint_poisson_rejects_o_s_length_mismatch() {
+        let n_bins = 5;
+        let o: Vec<f64> = vec![10.0; n_bins];
+        // Deliberate mismatch: `s` has one fewer bin than `o`.
+        let s: Vec<f64> = vec![5.0; n_bins - 1];
+        let model = ConstModel { n_e: n_bins };
+        let obj = JointPoissonObjective {
+            model: &model,
+            o: &o,
+            s: &s,
+            c: 1.0,
+            active_mask: None,
+        };
+        let mut params = ParameterSet::new(vec![FitParameter::non_negative("T", 0.5)]);
+        let err =
+            joint_poisson_fit(&obj, &mut params, &JointPoissonFitConfig::default()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FittingError::LengthMismatch {
+                    field: "sample_counts",
+                    ..
+                }
+            ),
+            "expected LengthMismatch on sample_counts; got {err:?}"
+        );
+    }
+
+    /// `joint_poisson_fit` rejects a non-positive proton-charge ratio `c`
+    /// with `InvalidConfig` rather than falling through to the inner
+    /// `debug_assert!` (which is a no-op in release builds and lets the
+    /// optimizer minimise a garbage deviance landscape).
+    #[test]
+    fn test_joint_poisson_rejects_non_positive_c() {
+        let n_bins = 5;
+        let o: Vec<f64> = vec![10.0; n_bins];
+        let s: Vec<f64> = vec![5.0; n_bins];
+        let model = ConstModel { n_e: n_bins };
+        let mut params = ParameterSet::new(vec![FitParameter::non_negative("T", 0.5)]);
+        // c = 0 is the textbook degenerate case (no sample counts).
+        let obj_zero = JointPoissonObjective {
+            model: &model,
+            o: &o,
+            s: &s,
+            c: 0.0,
+            active_mask: None,
+        };
+        let err = joint_poisson_fit(&obj_zero, &mut params, &JointPoissonFitConfig::default())
+            .unwrap_err();
+        assert!(
+            matches!(err, FittingError::InvalidConfig(_)),
+            "expected InvalidConfig on c=0; got {err:?}"
+        );
+
+        // Negative c is unphysical.
+        let mut params2 = ParameterSet::new(vec![FitParameter::non_negative("T", 0.5)]);
+        let obj_neg = JointPoissonObjective {
+            model: &model,
+            o: &o,
+            s: &s,
+            c: -1.5,
+            active_mask: None,
+        };
+        let err = joint_poisson_fit(&obj_neg, &mut params2, &JointPoissonFitConfig::default())
+            .unwrap_err();
+        assert!(
+            matches!(err, FittingError::InvalidConfig(_)),
+            "expected InvalidConfig on c<0; got {err:?}"
+        );
+
+        // NaN c — caught by the same finiteness check.
+        let mut params3 = ParameterSet::new(vec![FitParameter::non_negative("T", 0.5)]);
+        let obj_nan = JointPoissonObjective {
+            model: &model,
+            o: &o,
+            s: &s,
+            c: f64::NAN,
+            active_mask: None,
+        };
+        let err = joint_poisson_fit(&obj_nan, &mut params3, &JointPoissonFitConfig::default())
+            .unwrap_err();
+        assert!(
+            matches!(err, FittingError::InvalidConfig(_)),
+            "expected InvalidConfig on c=NaN; got {err:?}"
+        );
+    }
+
+    // ==================================================================
+    // Issue #552 (M14) — `f64::max(NaN, ε) == ε` swallows active NaN T.
+    //
+    // Rust stdlib's `f64::max` returns the non-NaN argument when one is
+    // NaN, so `t.max(POISSON_EPSILON)` silently turns a NaN transmission
+    // into ε.  The deviance term then evaluates to a finite (large)
+    // number which passes the trial-step's `v.is_finite()` guard, so the
+    // optimizer accepts steps into regions where the model is broken.
+    //
+    // The fix returns NaN from `binomial_deviance_term` (so the deviance
+    // sum becomes NaN and the trial guard rejects the step) and 0 from
+    // `deviance_weight` / `deviance_curvature` (so the gradient / Fisher
+    // accumulators are not poisoned by the bad bin).
+    // ==================================================================
+
+    /// `binomial_deviance_term` returns NaN when `t` is non-finite — so
+    /// the per-bin sum poisons the deviance and the trial-step guard
+    /// (`Ok(v) if v.is_finite()`) rejects the step instead of silently
+    /// accepting a bogus-but-finite value.
+    #[test]
+    fn test_binomial_deviance_term_nan_t_returns_nan() {
+        // Pre-fix: `t.max(POISSON_EPSILON)` swallows NaN and returns a
+        // finite (but meaningless) deviance.
+        let d_nan_t = binomial_deviance_term(50.0, 10.0, f64::NAN, 2.0);
+        assert!(
+            d_nan_t.is_nan(),
+            "non-finite T must produce NaN deviance, not a finite shim; got {d_nan_t}"
+        );
+
+        // +inf / -inf likewise — they are not physical transmission values.
+        let d_inf_t = binomial_deviance_term(50.0, 10.0, f64::INFINITY, 2.0);
+        assert!(
+            d_inf_t.is_nan(),
+            "+inf T must produce NaN deviance; got {d_inf_t}"
+        );
+        let d_neg_inf_t = binomial_deviance_term(50.0, 10.0, f64::NEG_INFINITY, 2.0);
+        assert!(
+            d_neg_inf_t.is_nan(),
+            "-inf T must produce NaN deviance; got {d_neg_inf_t}"
+        );
+    }
+
+    /// `deviance_weight` returns 0 for non-finite `t` so the gradient
+    /// accumulator is not poisoned — bad bins drop out instead of
+    /// becoming silent NaN contributions weighted by the Jacobian.
+    #[test]
+    fn test_deviance_weight_nan_t_returns_zero() {
+        let w = deviance_weight(50.0, 10.0, f64::NAN, 2.0);
+        assert_eq!(w, 0.0, "non-finite T must give zero weight; got {w}");
+    }
+
+    /// `deviance_curvature` returns 0 for non-finite `t` so the Fisher
+    /// info accumulator is not poisoned.
+    #[test]
+    fn test_deviance_curvature_nan_t_returns_zero() {
+        let h = deviance_curvature(50.0, 10.0, f64::NAN, 2.0);
+        assert_eq!(h, 0.0, "non-finite T must give zero curvature; got {h}");
+    }
+
+    /// End-to-end: a model that returns NaN at some active bin makes the
+    /// deviance non-finite, the trial-step guard rejects it (rather than
+    /// accepting a bogus finite step), and the fit either bails out
+    /// non-converged or recovers without committing the bad step.  Prior
+    /// to the M14 fix the optimizer could silently accept the NaN step.
+    #[test]
+    fn test_joint_poisson_fit_rejects_nan_transmission() {
+        // Model that returns NaN at θ < 0.1 and a constant 0.5 otherwise.
+        struct NanAtSmallTheta;
+        impl FitModel for NanAtSmallTheta {
+            fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+                let t = if params[0] < 0.1 { f64::NAN } else { 0.5 };
+                Ok(vec![t; 4])
+            }
+            fn analytical_jacobian(
+                &self,
+                _params: &[f64],
+                free_param_indices: &[usize],
+                y_current: &[f64],
+            ) -> Option<FlatMatrix> {
+                let n_e = y_current.len();
+                let n_free = free_param_indices.len();
+                let mut jac = FlatMatrix::zeros(n_e, n_free);
+                for i in 0..n_e {
+                    for (j, &pi) in free_param_indices.iter().enumerate() {
+                        *jac.get_mut(i, j) = if pi == 0 { 1.0 } else { 0.0 };
+                    }
+                }
+                Some(jac)
+            }
+        }
+
+        let model = NanAtSmallTheta;
+        let n = 4;
+        let o = vec![10.0; n];
+        let s = vec![5.0; n];
+        let obj = JointPoissonObjective {
+            model: &model,
+            o: &o,
+            s: &s,
+            c: 1.0,
+            active_mask: None,
+        };
+        // Initial point lands in the NaN region.
+        let mut params = ParameterSet::new(vec![FitParameter::non_negative("T", 0.05)]);
+        let cfg = JointPoissonFitConfig::default();
+        let result = joint_poisson_fit(&obj, &mut params, &cfg);
+        match result {
+            Ok(r) => {
+                // The optimizer must NOT report a finite deviance from a
+                // NaN-T initial point — pre-fix it would do so by silently
+                // converting NaN to POISSON_EPSILON.  After the fix the
+                // deviance is NaN (initial eval propagates), or the fit
+                // never accepts a NaN step, or it ascends out of the NaN
+                // region and lands at the finite plateau (params[0] >= 0.1).
+                if r.params[0] < 0.1 {
+                    assert!(
+                        r.deviance.is_nan() && !r.gn_converged,
+                        "stayed in NaN region but reported finite deviance: {r:?}"
+                    );
+                }
+            }
+            Err(_) => {
+                // Acceptable: hard error from the initial evaluation.
+            }
+        }
+    }
+
+    // ==================================================================
+    // Issue #552 (M4) — NaN-in-Jacobian during FD probes (Fisher info).
+    //
+    // The post-convergence Fisher / covariance path builds a Jacobian
+    // via FD when the model has no analytical form.  If the FD probe
+    // straddles a region where the model returns NaN, the resulting
+    // column is poisoned and the inverse Fisher inherits NaN entries.
+    // The main LM loop's trial guard does not run here (it only checks
+    // the trial step in the main optimisation loop).
+    //
+    // Fix: skip the column on non-finite probe output, leaving its FD
+    // derivative as the zero default (consistent with the
+    // "model-evaluation-failed" branch already present at :298-:304).
+    // ==================================================================
+
+    /// `fisher_information_fd` zeroes per-cell entries whose FD probe
+    /// returned a non-finite model output, rather than baking NaN into
+    /// the Fisher matrix (and from there into the inverse covariance).
+    #[test]
+    fn test_fisher_information_fd_skips_nan_probe() {
+        // Model: T_i = θ_0 (constant).  Returns NaN whenever
+        // |θ_0 - 0.6| > 1e-3 — i.e. a NaN ring around the FD probe,
+        // but a finite value at the base point.
+        struct NanFdProbe;
+        impl FitModel for NanFdProbe {
+            fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+                let t = if (params[0] - 0.6).abs() > 1e-3 {
+                    f64::NAN
+                } else {
+                    params[0]
+                };
+                Ok(vec![t; 3])
+            }
+            // No analytical_jacobian -> Fisher info must use FD fallback.
+        }
+        let model = NanFdProbe;
+        let n = 3;
+        let o = vec![10.0; n];
+        let s = vec![5.0; n];
+        let obj = JointPoissonObjective {
+            model: &model,
+            o: &o,
+            s: &s,
+            c: 1.0,
+            active_mask: None,
+        };
+        let mut params = ParameterSet::new(vec![FitParameter::non_negative("T", 0.6)]);
+        let info = obj
+            .fisher_information_fd(&mut params, 1e-2)
+            .expect("fisher_information_fd should not return Err on a finite base")
+            .expect("fisher_information_fd should return Some(matrix)");
+        // Every entry must be finite — column was skipped on NaN probe.
+        for v in info.data.iter() {
+            assert!(
+                v.is_finite(),
+                "fisher_information_fd produced non-finite entry: {v}"
+            );
+        }
     }
 }
