@@ -2835,13 +2835,12 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Fixture-gated regression test moved to
+    // VENUS-like regression test moved to
     // `crates/nereids-physics/tests/venus_usr_resolution.rs`
     // (`test_broaden_presorted_bit_exact_on_venus_usr`) — see issue
-    // #497.  The fixture (`_fts_bl10_0p5meV_1keV_25pts.txt`) is the
-    // VENUS instrument SAMMY-format tabulated resolution kernel; the
-    // integration test uses an early-return idiom keyed off
-    // `common::venus_usr_resolution_path()` instead of `#[ignore]`.
+    // #497.  The integration test parses a synthetic SAMMY USR-format
+    // kernel via `common::synthetic_venus_usr_tab()` (the real VENUS
+    // BL10 fixture is not approved for public release; issue #557).
     // ---------------------------------------------------------------
 
     #[test]
@@ -3172,12 +3171,13 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Fixture-gated microbenchmarks moved to
+    // VENUS-like microbenchmarks moved to
     // `crates/nereids-physics/tests/venus_usr_resolution_microbench.rs`
     // (`test_broaden_presorted_bench`, `test_plan_reuse_bench`,
     // `resolution_matrix_apply_microbench`) — see issue #497.  They
-    // use the early-return idiom keyed off
-    // `common::venus_usr_resolution_path()` instead of `#[ignore]`.
+    // parse a synthetic SAMMY USR-format kernel via
+    // `common::synthetic_venus_usr_tab()` (the real VENUS BL10
+    // fixture is not approved for public release; issue #557).
     // ---------------------------------------------------------------
 
     // ---------- ResolutionMatrix (CSR compile) tests ----------
@@ -3188,12 +3188,11 @@ mod tests {
     // passthrough rows, `-0.0` sentinel rows, regular linear-interp
     // rows, CSR invariants, and the non-finite contract exclusion.
     //
-    // Fixture-dependent end-to-end equivalence tests against the
-    // production VENUS USR operator (SAMMY-format kernel) at
-    // realistic grid sizes (512, 3471) live in
+    // End-to-end equivalence tests against the VENUS-like USR
+    // operator (synthetic SAMMY-format kernel) at realistic grid
+    // sizes (512, 3471) live in
     // `crates/nereids-physics/tests/venus_usr_resolution.rs` — see
-    // issue #497.  They use the early-return idiom keyed off
-    // `common::venus_usr_resolution_path()` instead of `#[ignore]`.
+    // issues #497 and #557.
 
     /// Hybrid abs+rel tolerance used across equivalence tests.  Guards
     /// against the `a ≈ 0` trap where `a.abs().max(1e-300)` produces
@@ -3341,7 +3340,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Fixture-gated end-to-end VENUS USR equivalence tests moved to
+    // End-to-end VENUS-like USR equivalence tests moved to
     // `crates/nereids-physics/tests/venus_usr_resolution.rs`
     // (`resolution_matrix_is_row_stochastic_on_venus_kernel`,
     //  `resolution_matrix_apply_equivalent_to_plan_apply_on_venus_kernel`,
@@ -3349,9 +3348,9 @@ mod tests {
     //  `resolution_matrix_apply_equivalent_across_densities`,
     //  `resolution_matrix_csr_column_indices_sorted_per_row`,
     //  `resolution_matrix_grid_mismatch_detected`,
-    //  `resolution_matrix_length_mismatch_detected`) — see issue
-    // #497.  They use the early-return idiom keyed off
-    // `common::venus_usr_resolution_path()` instead of `#[ignore]`.
+    //  `resolution_matrix_length_mismatch_detected`) — see issues
+    // #497 and #557.  They parse a synthetic SAMMY USR-format kernel
+    // via `common::synthetic_venus_usr_tab()`.
     // ---------------------------------------------------------------
 
     #[test]

@@ -1,14 +1,15 @@
-//! Fixture-gated regression tests for the surrogate cubature and
-//! scalar-Chebyshev plans on the real VENUS USR resolution kernel
-//! (SAMMY-format).
+//! Regression tests for the surrogate cubature and scalar-Chebyshev
+//! plans on a synthetic VENUS-like SAMMY USR resolution kernel.
 //!
-//! When the fixture is absent (CI, fresh checkouts), each test
-//! early-returns and is reported as passing — no `#[ignore]` noise.
-//! See `tests/README.md` and issue #497.
+//! The kernel is the synthetic SAMMY USR-format kernel from
+//! [`common::synthetic_venus_usr_tab`]; the real VENUS BL10 fixture
+//! is not approved for public release (see `common/mod.rs` for the
+//! full rationale and issue #557 for the CI-coverage gap this
+//! replaces).
 
 mod common;
 
-use nereids_physics::resolution::{ResolutionMatrix, TabulatedResolution, apply_r};
+use nereids_physics::resolution::{ResolutionMatrix, apply_r};
 use nereids_physics::surrogate::{ScalarChebyshevPlan, SparseEmpiricalCubaturePlan};
 
 // ── Helpers duplicated from `src/surrogate.rs` ───────────────────
@@ -47,11 +48,7 @@ fn max_hybrid_err(a: &[f64], b: &[f64]) -> f64 {
 /// correctness.
 #[test]
 fn cubature_real_venus_k1_forward_equivalence() {
-    let Some(path) = common::venus_usr_resolution_path() else {
-        return;
-    };
-    let text = std::fs::read_to_string(&path).expect("read VENUS USR fixture");
-    let tab = TabulatedResolution::from_text(&text, 25.0).expect("parse fixture");
+    let tab = common::synthetic_venus_usr_tab();
 
     // Smaller production-ish grid (512 instead of 3471) to keep
     // LP-per-row cost tractable within a single test — the cubature
@@ -62,6 +59,7 @@ fn cubature_real_venus_k1_forward_equivalence() {
         .map(|i| 7.0 + (200.0 - 7.0) * (i as f64) / ((n_grid - 1) as f64))
         .collect();
     let plan = tab.plan(&energies).expect("build plan on sorted grid");
+    common::assert_kernel_broadens(&plan, &energies);
     let matrix = plan.compile_to_matrix();
 
     // Synthetic Gaussian-resonance σ on the real energy grid — we
@@ -132,11 +130,7 @@ fn cubature_real_venus_k1_forward_equivalence() {
 /// accuracy bound stays portable.
 #[test]
 fn scalar_chebyshev_real_venus_k1_regression() {
-    let Some(path) = common::venus_usr_resolution_path() else {
-        return;
-    };
-    let text = std::fs::read_to_string(&path).expect("read VENUS USR fixture");
-    let tab = TabulatedResolution::from_text(&text, 25.0).expect("parse fixture");
+    let tab = common::synthetic_venus_usr_tab();
 
     // VENUS production grid size.
     let n_grid = 3471_usize;
@@ -144,6 +138,7 @@ fn scalar_chebyshev_real_venus_k1_regression() {
         .map(|i| 7.0 + (200.0 - 7.0) * (i as f64) / ((n_grid - 1) as f64))
         .collect();
     let plan = std::sync::Arc::new(tab.plan(&energies).expect("build plan on sorted grid"));
+    common::assert_kernel_broadens(&plan, &energies);
     let matrix = plan.compile_to_matrix();
     let matrix_nnz = matrix.nnz();
 

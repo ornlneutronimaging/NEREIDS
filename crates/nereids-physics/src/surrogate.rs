@@ -1677,11 +1677,11 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Fixture-gated real-VENUS-kernel cubature regression
+    // VENUS-like cubature regression
     // (`cubature_real_venus_k1_forward_equivalence`) moved to
     // `crates/nereids-physics/tests/venus_usr_surrogate.rs` — see
-    // issue #497.  It uses the early-return idiom keyed off
-    // `common::venus_usr_resolution_path()` instead of `#[ignore]`.
+    // issues #497 and #557.  It parses a synthetic SAMMY USR-format
+    // kernel via `common::synthetic_venus_usr_tab()`.
     // ---------------------------------------------------------------
 
     // ── Scalar (k = 1) surrogate tests — PR #475 ───────────────────
@@ -1813,10 +1813,10 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Fixture-gated real-VENUS-kernel scalar Chebyshev regression
+    // VENUS-like scalar Chebyshev regression
     // (`scalar_chebyshev_real_venus_k1_regression`) moved to
     // `crates/nereids-physics/tests/venus_usr_surrogate.rs` — see
-    // issue #497.  It uses the early-return idiom keyed off
-    // `common::venus_usr_resolution_path()` instead of `#[ignore]`.
+    // issues #497 and #557.  It parses a synthetic SAMMY USR-format
+    // kernel via `common::synthetic_venus_usr_tab()`.
     // ---------------------------------------------------------------
 }
