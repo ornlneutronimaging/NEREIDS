@@ -1,4 +1,4 @@
-//! Fixture-gated microbenchmarks for the VENUS USR resolution
+//! Microbenchmarks for the synthetic VENUS-like USR resolution
 //! operator and CSR `ResolutionMatrix` apply paths.
 //!
 //! These are slow tests intentionally separated from the regression
@@ -7,9 +7,13 @@
 //! walk vs binary search, plan-reuse vs per-call, CSR matvec vs
 //! plan apply).
 //!
-//! When the VENUS USR fixture is absent (CI, fresh checkouts), each
-//! microbench early-returns and is reported as passing — no
-//! `#[ignore]` noise.  See issue #497.
+//! The kernel is the synthetic SAMMY USR-format kernel from
+//! [`common::synthetic_venus_usr_tab`]; see that module for the
+//! ORNL-release-policy rationale ruling out the real VENUS BL10
+//! fixture. Wall-clock numbers reported here are **lower bounds on
+//! the optimization payoff** because the synthetic kernel is narrower
+//! than the production fixture (~41 sample points vs ~500), but
+//! the relative-speedup math is robust to kernel size.
 //!
 //! Run manually with `--nocapture --release`, e.g.:
 //!
@@ -28,16 +32,19 @@ use nereids_physics::resolution::{TabulatedResolution, apply_r, test_support};
 /// the bit-exact regression test.
 #[test]
 fn test_broaden_presorted_bench() {
-    let Some(path) = common::venus_usr_resolution_path() else {
-        return;
-    };
-    let text = std::fs::read_to_string(&path).expect("read VENUS USR fixture");
-    let tab = TabulatedResolution::from_text(&text, 25.0).unwrap();
+    let tab = common::synthetic_venus_usr_tab();
 
     let n = 3471;
     let energies: Vec<f64> = (0..n)
         .map(|i| 7.0 + i as f64 * ((200.0 - 7.0) / (n - 1) as f64))
         .collect();
+    {
+        // No-op-regression pre-check: must precede the bit-exact
+        // sink-equality assertion below, which would pass vacuously
+        // if the kernel collapsed to a delta.
+        let pre_plan = tab.plan(&energies).expect("build plan on sorted grid");
+        common::assert_kernel_broadens(&pre_plan, &energies);
+    }
     let spectrum: Vec<f64> = energies
         .iter()
         .map(|&e| {
@@ -66,7 +73,7 @@ fn test_broaden_presorted_bench() {
 
     let speedup = t_ref.as_secs_f64() / t_new.as_secs_f64();
     eprintln!(
-        "broaden_presorted microbench (n_grid={n}, repeats={repeats}, 499-pt kernel):\n\
+        "broaden_presorted microbench (n_grid={n}, repeats={repeats}, synthetic kernel):\n\
          reference (binary search): {t_ref:?}  (sink={sink_ref:.3})\n\
          two-pointer walk         : {t_new:?}  (sink={sink_new:.3})\n\
          speedup                  : {speedup:.2}x"
@@ -82,16 +89,19 @@ fn test_broaden_presorted_bench() {
 /// the plan internally on every call.
 #[test]
 fn test_plan_reuse_bench() {
-    let Some(path) = common::venus_usr_resolution_path() else {
-        return;
-    };
-    let text = std::fs::read_to_string(&path).expect("read VENUS USR fixture");
-    let tab = TabulatedResolution::from_text(&text, 25.0).unwrap();
+    let tab = common::synthetic_venus_usr_tab();
 
     let n = 3471;
     let energies: Vec<f64> = (0..n)
         .map(|i| 7.0 + i as f64 * ((200.0 - 7.0) / (n - 1) as f64))
         .collect();
+    {
+        // No-op-regression pre-check: must precede the bit-exact
+        // sink-equality assertion below, which would pass vacuously
+        // if the kernel collapsed to a delta.
+        let pre_plan = tab.plan(&energies).expect("build plan on sorted grid");
+        common::assert_kernel_broadens(&pre_plan, &energies);
+    }
 
     // Many spectra simulating an LM fit's sequence of evaluations.
     let repeats = 100;
@@ -133,7 +143,7 @@ fn test_plan_reuse_bench() {
 
     let speedup = t_percall.as_secs_f64() / (t_build + t_apply_total).as_secs_f64();
     eprintln!(
-        "plan-reuse microbench (n_grid={n}, {repeats} spectra, 499-pt kernel):\n\
+        "plan-reuse microbench (n_grid={n}, {repeats} spectra, synthetic kernel):\n\
          per-call broaden_presorted : {t_percall:?}  (sink={sink_percall:.3})\n\
          plan build (once)          : {t_build:?}\n\
          apply × {repeats}          : {t_apply_total:?}\n\
@@ -145,23 +155,20 @@ fn test_plan_reuse_bench() {
 }
 
 /// `apply_r` (ResolutionMatrix CSR) vs `ResolutionPlan::apply`,
-/// 3471-bin VENUS production grid × 100 spectra.  Exercised
-/// manually to decide whether the CSR compile + CSR matvec beats
-/// the plan's two-pointer walk at the no-SIMD-no-unsafe baseline
-/// promised in #473.
+/// 3471-bin production grid × 100 spectra.  Exercised manually to
+/// decide whether the CSR compile + CSR matvec beats the plan's
+/// two-pointer walk at the no-SIMD-no-unsafe baseline promised in
+/// #473.
 #[test]
 fn resolution_matrix_apply_microbench() {
-    let Some(path) = common::venus_usr_resolution_path() else {
-        return;
-    };
-    let text = std::fs::read_to_string(&path).expect("read VENUS USR fixture");
-    let tab = TabulatedResolution::from_text(&text, 25.0).unwrap();
+    let tab = common::synthetic_venus_usr_tab();
 
     let n = 3471_usize;
     let energies: Vec<f64> = (0..n)
         .map(|i| 7.0 + i as f64 * ((200.0 - 7.0) / (n - 1) as f64))
         .collect();
     let plan = tab.plan(&energies).expect("sorted grid must validate");
+    common::assert_kernel_broadens(&plan, &energies);
 
     let t_compile = std::time::Instant::now();
     let matrix = plan.compile_to_matrix();
