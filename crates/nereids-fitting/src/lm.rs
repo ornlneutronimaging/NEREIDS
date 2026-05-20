@@ -305,20 +305,20 @@ fn compute_jacobian(
         };
         params.params[idx].value = original;
 
-        // Issue #552 M4: the main LM loop checks the trial step at
-        // :765-:768 via `trial_has_active_nonfinite`, but `compute_jacobian`
-        // is also called at :849 for the post-convergence covariance
-        // path, where no such guard runs.  A NaN row in the perturbed
-        // output divided by `actual_step` yields NaN in the Jacobian,
-        // which then poisons JᵀWJ and the inverse covariance.
+        // The main LM loop checks the trial step via
+        // `trial_has_active_nonfinite`, but `compute_jacobian` is also
+        // called from the post-convergence covariance path, where no
+        // such guard runs.  A NaN row in the perturbed output divided
+        // by `actual_step` would yield NaN in the Jacobian, which then
+        // poisons JᵀWJ and the inverse covariance.
         //
         // Per-cell skip (zero the entry) rather than whole-column skip:
         // a NaN at a masked / inactive row is benign (the JᵀWJ assembly
-        // skips masked rows entirely via `active_mask.is_some_and(|m| !m[i])`
-        // at lm.rs :709 / :862), so a finite Jacobian row produced from a
-        // bad-but-masked probe must still be allowed to land in the
-        // column — see `test_lm_active_mask_tolerates_model_nan_outside_range`.
-        // The active-row NaNs that would otherwise propagate into JᵀWJ are
+        // skips masked rows entirely via `active_mask.is_some_and(|m| !m[i])`),
+        // so a finite Jacobian row produced from a bad-but-masked probe
+        // must still be allowed to land in the column — see
+        // `test_lm_active_mask_tolerates_model_nan_outside_range`.  The
+        // active-row NaNs that would otherwise propagate into JᵀWJ are
         // zeroed here, which is the same numerical outcome as if the
         // model had reported `Err` at that probe (skipped column, but
         // per-row).
@@ -1818,21 +1818,19 @@ mod tests {
     }
 
     // ==================================================================
-    // Issue #552 (M4) — NaN-in-Jacobian during FD probes.
+    // NaN-in-Jacobian during FD probes.
     //
-    // The main LM loop guards the trial step at the model.evaluate site
-    // (`trial_has_active_nonfinite` at :765-:768).  The silent surface
-    // is the post-convergence covariance Jacobian: it calls
-    // `compute_jacobian` directly at :849, which has no finiteness
-    // check on the per-column FD probe.  A NaN at any active row of the
-    // perturbed model output gets divided by `actual_step` and turned
-    // into NaN entries in the Jacobian — these poison `JᵀWJ` and the
-    // inverse covariance, which is reported as the "uncertainty" of
-    // the fit.
+    // The main LM loop guards the trial step at the `model.evaluate`
+    // site via `trial_has_active_nonfinite`.  The silent surface is the
+    // post-convergence covariance Jacobian: it calls `compute_jacobian`
+    // directly, which has no finiteness check on the per-column FD
+    // probe.  A NaN at any active row of the perturbed model output
+    // gets divided by `actual_step` and turned into NaN entries in the
+    // Jacobian — these poison `JᵀWJ` and the inverse covariance, which
+    // is reported as the "uncertainty" of the fit.
     //
-    // Fix: when `compute_jacobian`'s FD probe returns any non-finite
-    // value, skip the column (zero derivative) rather than letting NaN
-    // through, mirroring the existing `Err` branch at :298-:304.
+    // `compute_jacobian`'s FD path zeros per-cell entries whose probe
+    // returned a non-finite value, mirroring the existing `Err` branch.
     // ==================================================================
 
     /// `compute_jacobian`'s FD path zeroes per-cell entries whose

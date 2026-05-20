@@ -2138,18 +2138,17 @@ impl FitModel for EnergyScaleTransmissionModel {
                     Ok(v) => v,
                     Err(_) => return None,
                 };
-                // Issue #552 M4: per-cell finiteness check.  Without it
-                // a NaN in `y_plus[i]` / `y_minus[i]` propagates into
-                // both the t0 column AND the L_scale column derived
-                // from it via the rank-1 reconstruction at
-                // `scale * partial_t0_col[i]` (~line 2280), poisoning
-                // the post-convergence covariance the same way lm.rs
-                // `compute_jacobian` was vulnerable.  Mirror that fix:
-                // zero the entry rather than dropping the column —
-                // masked rows (NaN by design in some test contracts)
-                // get skipped downstream by the active-mask row-skip in
-                // the LM normal-equation assembly, so a 0 in a masked
-                // row is benign.
+                // Per-cell finiteness check.  Without it a NaN in
+                // `y_plus[i]` / `y_minus[i]` propagates into both the
+                // t0 column AND the L_scale column derived from it via
+                // the rank-1 reconstruction at `scale * partial_t0_col[i]`
+                // (~line 2280), poisoning the post-convergence
+                // covariance the same way lm.rs `compute_jacobian` was
+                // vulnerable.  Mirror that fix: zero the entry rather
+                // than dropping the column — masked rows (NaN by design
+                // in some test contracts) get skipped downstream by the
+                // active-mask row-skip in the LM normal-equation
+                // assembly, so a 0 in a masked row is benign.
                 let mut col = vec![0.0f64; n_e];
                 for i in 0..n_e {
                     let a = y_plus[i];
@@ -2325,10 +2324,10 @@ impl FitModel for EnergyScaleTransmissionModel {
                     Ok(v) => v,
                     Err(_) => return None,
                 };
-                // Issue #552 M4: per-cell finiteness check — mirrors the
-                // lm.rs `compute_jacobian` FD path.  A NaN in the
-                // perturbed model at an active row would otherwise feed
-                // NaN through the post-convergence covariance; per-cell
+                // Per-cell finiteness check — mirrors the lm.rs
+                // `compute_jacobian` FD path.  A NaN in the perturbed
+                // model at an active row would otherwise feed NaN
+                // through the post-convergence covariance; per-cell
                 // skip leaves masked-row NaN benign (the LM normal-
                 // equation assembly already row-skips those).
                 for i in 0..n_e {
