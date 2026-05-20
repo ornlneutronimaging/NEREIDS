@@ -2144,8 +2144,17 @@ class TestStubConformance:
     def test_from_counts_with_nuisance_importable_and_introspectable(self):
         """M5 regression: the symbol must be importable from ``nereids``,
         callable, AND its signature must be introspectable via
-        ``inspect.signature`` — the latter is what static type checkers
-        relied on before the stub fix landed."""
+        ``inspect.signature``.
+
+        Tooling and users that rely on runtime signature introspection
+        (``inspect.signature``) — e.g. IDE REPL completions, Sphinx
+        ``autodoc``, ``help()`` — need the runtime signature to stay
+        consistent with the stub.  Static type checkers (mypy / pyright)
+        read the ``.pyi`` directly and don't use runtime introspection,
+        but a divergence between the stub and the compiled extension
+        still misleads either audience.  This test catches stub/runtime
+        drift in both directions.
+        """
         import inspect
 
         from nereids import from_counts_with_nuisance  # noqa: F401
