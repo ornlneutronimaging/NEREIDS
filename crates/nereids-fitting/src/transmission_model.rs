@@ -2138,9 +2138,26 @@ impl FitModel for EnergyScaleTransmissionModel {
                     Ok(v) => v,
                     Err(_) => return None,
                 };
+                // Per-cell finiteness check.  Without it a NaN in
+                // `y_plus[i]` / `y_minus[i]` propagates into both the
+                // t0 column AND the L_scale column derived from it via
+                // the rank-1 reconstruction at `scale * partial_t0_col[i]`
+                // (~line 2280), poisoning the post-convergence
+                // covariance the same way lm.rs `compute_jacobian` was
+                // vulnerable.  Mirror that fix: zero the entry rather
+                // than dropping the column — masked rows (NaN by design
+                // in some test contracts) get skipped downstream by the
+                // active-mask row-skip in the LM normal-equation
+                // assembly, so a 0 in a masked row is benign.
                 let mut col = vec![0.0f64; n_e];
                 for i in 0..n_e {
-                    col[i] = (y_plus[i] - y_minus[i]) / (2.0 * h);
+                    let a = y_plus[i];
+                    let b = y_minus[i];
+                    if a.is_finite() && b.is_finite() {
+                        col[i] = (a - b) / (2.0 * h);
+                    }
+                    // else: leave col[i] at 0.0; downstream L_scale
+                    // reconstruction `scale * 0 == 0` is consistent.
                 }
                 Some(col)
             }
@@ -2307,8 +2324,19 @@ impl FitModel for EnergyScaleTransmissionModel {
                     Ok(v) => v,
                     Err(_) => return None,
                 };
+                // Per-cell finiteness check — mirrors the lm.rs
+                // `compute_jacobian` FD path.  A NaN in the perturbed
+                // model at an active row would otherwise feed NaN
+                // through the post-convergence covariance; per-cell
+                // skip leaves masked-row NaN benign (the LM normal-
+                // equation assembly already row-skips those).
                 for i in 0..n_e {
-                    *jacobian.get_mut(i, col) = (y_plus[i] - y_minus[i]) / (2.0 * h);
+                    let a = y_plus[i];
+                    let b = y_minus[i];
+                    if a.is_finite() && b.is_finite() {
+                        *jacobian.get_mut(i, col) = (a - b) / (2.0 * h);
+                    }
+                    // else: leave at zero-default.
                 }
             } else {
                 // Density parameter: analytical derivative
