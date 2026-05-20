@@ -1628,25 +1628,22 @@ mod tests {
         }
     }
 
-    /// Parse full U-238 ENDF file and compute cross-sections.
+    /// Parse the full vendored U-238 ENDF and compute cross-sections.
     ///
-    /// Validates against SAMMY ex027 output (Doppler-broadened at 300K, but
-    /// we compare unbroadened RM values which should bracket the broadened data).
+    /// Validates against the SAMMY ex027 case (Doppler-broadened at 300 K),
+    /// against which we compare unbroadened RM values that should bracket
+    /// the broadened data. Fixture is shipped under this crate's
+    /// `tests/data/u238_ex027.endf` (public-domain ENDF/B-VIII.0) so the
+    /// gate runs even when the crate is built standalone (outside the
+    /// workspace, where `examples/data/` is not packaged).  The original
+    /// `examples/data/u238_ex027.endf` is kept for end-user example code.
     #[test]
     fn test_u238_full_endf_cross_sections() {
-        let endf_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("../SAMMY/SAMMY/samexm_new/ex027_new/ex027.endf");
+        let endf_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/u238_ex027.endf");
 
-        if !endf_path.exists() {
-            println!("Skipping: SAMMY checkout not found at {:?}", endf_path);
-            return;
-        }
-
-        let endf_text = std::fs::read_to_string(&endf_path).unwrap();
+        let endf_text = std::fs::read_to_string(&endf_path)
+            .unwrap_or_else(|e| panic!("vendored U-238 fixture missing at {endf_path:?}: {e}"));
         let data = nereids_endf::parser::parse_endf_file2(&endf_text).unwrap();
 
         // Compute cross-sections at several energies near the 6.674 eV resonance.
@@ -2035,22 +2032,17 @@ mod tests {
     }
 
     /// `cross_sections_on_grid` must match per-point for the full U-238
-    /// ENDF file (many resonances, L-groups, J-groups).
+    /// ENDF file (many resonances, L-groups, J-groups). Fixture is the
+    /// crate-local `tests/data/u238_ex027.endf`, so the gate runs
+    /// unconditionally on CI even when the crate is built standalone
+    /// (outside the workspace, where `examples/data/` is not packaged).
     #[test]
     fn test_grid_matches_per_point_u238_full() {
-        let endf_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("../SAMMY/SAMMY/samexm_new/ex027_new/ex027.endf");
+        let endf_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/u238_ex027.endf");
 
-        if !endf_path.exists() {
-            println!("Skipping: SAMMY checkout not found at {:?}", endf_path);
-            return;
-        }
-
-        let endf_text = std::fs::read_to_string(&endf_path).unwrap();
+        let endf_text = std::fs::read_to_string(&endf_path)
+            .unwrap_or_else(|e| panic!("vendored U-238 fixture missing at {endf_path:?}: {e}"));
         let data = nereids_endf::parser::parse_endf_file2(&endf_text).unwrap();
 
         let energies: Vec<f64> = (0..100).map(|i| 1.0 + i as f64 * 0.5).collect();
