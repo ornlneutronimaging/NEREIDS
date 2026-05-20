@@ -98,31 +98,39 @@ impl<'a> JointPoissonObjective<'a> {
     /// up-front validation (callers may invoke `deviance_from_transmission`,
     /// `deviance_gradient_analytical`, `fisher_information[_fd]`, etc.
     /// directly for diagnostics).  Mirrors the entry-point checks in
-    /// `joint_poisson_fit`: `o.len() == s.len()`, `c` finite and > 0, and
-    /// optional `active_mask` length agrees.  The `debug_assert!`s in the
-    /// per-bin helpers are no-ops in release builds — without this guard a
-    /// length mismatch in `s` would silently truncate via `.zip()` and a
-    /// non-positive / NaN `c` would produce finite garbage.
+    /// `joint_poisson_fit`: `o.len() == s.len()`, `c` finite and > 0, optional
+    /// `active_mask` length agrees, all `o[i]` / `s[i]` finite and >= 0, and
+    /// the caller-supplied transmission length agrees with `o.len()`.  The
+    /// `debug_assert!`s in the per-bin helpers are no-ops in release builds —
+    /// without this guard a length mismatch in `s` would silently truncate
+    /// via `.zip()` and a non-positive / NaN `c` would produce finite
+    /// garbage.
+    ///
+    /// **Error orientation.**  `FittingError::LengthMismatch` displays as
+    /// `"{field} length ({actual}) must match expected length ({expected})"`.
+    /// The objective's own invariants (`s.len()` vs `o.len()`, `mask.len()`
+    /// vs `o.len()`) are checked first, with `expected = o.len()` so the
+    /// message accurately names the offending field.  The caller-supplied
+    /// `t` length is then checked against `o.len()` with `field =
+    /// "transmission"` — pre-fix this branch reported `field =
+    /// "open_beam_counts"` with `expected = t_len`, which read as "the
+    /// open-beam array is wrong" when the actual fault was the caller's
+    /// transmission slice.
     fn validate_inputs(&self, t_len: usize) -> Result<(), FittingError> {
-        if self.o.len() != t_len {
+        // Internal invariants of the objective itself — these must hold
+        // regardless of what the caller passes for `t`.
+        if self.s.len() != self.o.len() {
             return Err(FittingError::LengthMismatch {
-                expected: t_len,
-                actual: self.o.len(),
-                field: "open_beam_counts",
-            });
-        }
-        if self.s.len() != t_len {
-            return Err(FittingError::LengthMismatch {
-                expected: t_len,
+                expected: self.o.len(),
                 actual: self.s.len(),
                 field: "sample_counts",
             });
         }
         if let Some(m) = self.active_mask
-            && m.len() != t_len
+            && m.len() != self.o.len()
         {
             return Err(FittingError::LengthMismatch {
-                expected: t_len,
+                expected: self.o.len(),
                 actual: m.len(),
                 field: "active_mask",
             });
@@ -133,6 +141,25 @@ impl<'a> JointPoissonObjective<'a> {
                 self.c
             )));
         }
+        // Caller-supplied length: the transmission slice must match the
+        // objective's bin count.
+        if t_len != self.o.len() {
+            return Err(FittingError::LengthMismatch {
+                expected: self.o.len(),
+                actual: t_len,
+                field: "transmission",
+            });
+        }
+        // Per-element count validation.  The entry point `joint_poisson_fit`
+        // also calls `validate_counts` up-front so the user gets the error
+        // before any LM work, but every public method that bypasses the
+        // entry point (`deviance_from_transmission`, `fisher_information`,
+        // `profile_lambda_per_bin`, …) must still reject non-finite /
+        // negative counts — the inner `binomial_deviance_term` /
+        // `xlogy_ratio` would otherwise propagate NaN past the zero-clamp
+        // (`NaN <= 0.0` is `false`) or silently swallow a negative as zero.
+        validate_counts(self.o, "open_beam_counts")?;
+        validate_counts(self.s, "sample_counts")?;
         Ok(())
     }
 
@@ -545,13 +572,23 @@ fn binomial_deviance_term(s: f64, o: f64, t: f64, c: f64) -> f64 {
 
 /// Reject non-finite or negative count arrays at public entry points.
 ///
-/// The per-bin `xlogy_ratio` helper treats `x <= 0.0` as the zero-count
-/// branch and returns 0, but `NaN <= 0.0` is `false`, so a NaN slips
-/// through and propagates `NaN · ln(NaN / y) = NaN` into the deviance
-/// sum.  A negative count likewise leaks past the zero-branch and
-/// produces a meaningless (but finite) log contribution.  Validate
-/// up-front so callers get a typed error instead of a "successful" fit
-/// on poisoned data.
+/// Two distinct failure modes motivate the up-front check:
+///
+/// - **Non-finite (NaN / ±∞).**  The per-bin `xlogy_ratio` helper treats
+///   `x <= 0.0` as the zero-count branch and returns 0, but `NaN <= 0.0`
+///   is `false`, so a NaN slips past the branch and propagates
+///   `NaN · ln(NaN / y) = NaN` straight into the deviance sum.  The LM
+///   trial-step guard then sees `Ok(NaN)` instead of a clean error.
+/// - **Negative.**  `x <= 0.0` *is* true for `x < 0.0`, so the zero-count
+///   branch silently swallows negatives and returns 0 — the deviance
+///   stays finite but the bin is treated as "no data", which is
+///   physically meaningless and conceals the upstream bug (subtraction
+///   artefact in TOF normalisation, signed-int overflow in the loader,
+///   etc.).  Negatives never produce NaN, but the "successful" fit
+///   silently discards real data.
+///
+/// Validate up-front so callers get a typed `InvalidConfig` error
+/// pointing at the offending bin instead of either failure mode.
 fn validate_counts(counts: &[f64], field: &'static str) -> Result<(), FittingError> {
     for (i, &v) in counts.iter().enumerate() {
         if !v.is_finite() || v < 0.0 {
@@ -2531,6 +2568,176 @@ mod tests {
                 v.is_finite(),
                 "fisher_information_fd produced non-finite entry: {v}"
             );
+        }
+    }
+
+    // ==================================================================
+    // Per-element count validation propagates through `validate_inputs`.
+    //
+    // Round-2 added `validate_counts` only at the `joint_poisson_fit`
+    // entry point.  Direct callers of `deviance_from_transmission` /
+    // `fisher_information_fd` / `profile_lambda_per_bin` (diagnostics
+    // paths) bypassed that check, so a NaN in `o` would propagate
+    // straight into the deviance sum via `NaN <= 0.0 == false` slipping
+    // past `xlogy_ratio`'s zero-branch, and a negative count would be
+    // silently swallowed as zero.  Round-3 lifts the per-element check
+    // into `validate_inputs`, which every public method already calls.
+    // These tests run in release mode (no `debug_assert!`) and verify
+    // the typed error reaches the caller.
+    // ==================================================================
+
+    /// `deviance_from_transmission` must reject a NaN open-beam count
+    /// with `InvalidConfig` rather than returning `Ok(NaN)` (or, worse,
+    /// `Ok(finite)` if a future `xlogy_ratio` rewrite handled NaN by
+    /// falling through to the zero branch).  Regression for Round-3
+    /// fix #1 — the inner `debug_assert!` is a no-op in release builds.
+    #[test]
+    fn test_deviance_from_transmission_rejects_non_finite_counts() {
+        let n_bins = 4;
+        let mut o = vec![10.0; n_bins];
+        o[2] = f64::NAN;
+        let s = vec![5.0; n_bins];
+        let model = ConstModel { n_e: n_bins };
+        let obj = JointPoissonObjective {
+            model: &model,
+            o: &o,
+            s: &s,
+            c: 1.0,
+            active_mask: None,
+        };
+        let t = vec![0.5; n_bins];
+        let err = obj.deviance_from_transmission(&t).unwrap_err();
+        assert!(
+            matches!(err, FittingError::InvalidConfig(ref msg) if msg.contains("open_beam_counts")),
+            "expected InvalidConfig naming open_beam_counts; got {err:?}"
+        );
+
+        // +inf likewise.
+        let mut s_inf = vec![5.0; n_bins];
+        s_inf[0] = f64::INFINITY;
+        let obj_inf = JointPoissonObjective {
+            model: &model,
+            o: &vec![10.0; n_bins],
+            s: &s_inf,
+            c: 1.0,
+            active_mask: None,
+        };
+        let err = obj_inf.deviance_from_transmission(&t).unwrap_err();
+        assert!(
+            matches!(err, FittingError::InvalidConfig(ref msg) if msg.contains("sample_counts")),
+            "expected InvalidConfig naming sample_counts; got {err:?}"
+        );
+    }
+
+    /// `deviance_from_transmission` must reject a negative count with
+    /// `InvalidConfig` rather than silently treating it as a zero-count
+    /// bin (which `xlogy_ratio`'s `x <= 0.0` branch would do).  Negatives
+    /// indicate an upstream loader / TOF-subtraction bug; swallowing
+    /// them as "no data" conceals the failure mode.
+    #[test]
+    fn test_deviance_from_transmission_rejects_negative_counts() {
+        let n_bins = 3;
+        let mut o = vec![10.0; n_bins];
+        o[1] = -2.0;
+        let s = vec![5.0; n_bins];
+        let model = ConstModel { n_e: n_bins };
+        let obj = JointPoissonObjective {
+            model: &model,
+            o: &o,
+            s: &s,
+            c: 1.0,
+            active_mask: None,
+        };
+        let t = vec![0.5; n_bins];
+        let err = obj.deviance_from_transmission(&t).unwrap_err();
+        assert!(
+            matches!(err, FittingError::InvalidConfig(ref msg) if msg.contains("open_beam_counts")),
+            "expected InvalidConfig naming open_beam_counts; got {err:?}"
+        );
+    }
+
+    /// The reorientation also reaches `profile_lambda_per_bin` and
+    /// `fisher_information_fd`: every public method that calls
+    /// `validate_inputs` now picks up the per-element check.
+    #[test]
+    fn test_other_public_methods_reject_non_finite_counts() {
+        let n_bins = 4;
+        let mut s = vec![5.0; n_bins];
+        s[3] = f64::NAN;
+        let o = vec![10.0; n_bins];
+        let model = ConstModel { n_e: n_bins };
+        let obj = JointPoissonObjective {
+            model: &model,
+            o: &o,
+            s: &s,
+            c: 1.0,
+            active_mask: None,
+        };
+        let t = vec![0.5; n_bins];
+
+        let err = obj.profile_lambda_per_bin(&t).unwrap_err();
+        assert!(
+            matches!(err, FittingError::InvalidConfig(_)),
+            "profile_lambda_per_bin: expected InvalidConfig; got {err:?}"
+        );
+
+        let params = vec![0.5];
+        let free_idx = vec![0];
+        let err = obj
+            .deviance_gradient_analytical(&params, &free_idx)
+            .unwrap_err();
+        assert!(
+            matches!(err, FittingError::InvalidConfig(_)),
+            "deviance_gradient_analytical: expected InvalidConfig; got {err:?}"
+        );
+
+        let err = obj.fisher_information(&params, &free_idx).unwrap_err();
+        assert!(
+            matches!(err, FittingError::InvalidConfig(_)),
+            "fisher_information: expected InvalidConfig; got {err:?}"
+        );
+
+        let mut ps = ParameterSet::new(vec![FitParameter::non_negative("T", 0.5)]);
+        let err = obj.fisher_information_fd(&mut ps, 1e-2).unwrap_err();
+        assert!(
+            matches!(err, FittingError::InvalidConfig(_)),
+            "fisher_information_fd: expected InvalidConfig; got {err:?}"
+        );
+    }
+
+    /// `validate_inputs` now reports caller-supplied transmission length
+    /// mismatches with `field = "transmission"` and `expected = o.len()`.
+    /// Pre-fix this used `field = "open_beam_counts"` with reversed
+    /// expected/actual, which read as "the open-beam array is wrong"
+    /// when the actual fault was the caller's `t` slice.  Regression
+    /// for Round-3 fix #2.
+    #[test]
+    fn test_validate_inputs_reports_transmission_length_mismatch_correctly() {
+        let n_bins = 5;
+        let o = vec![10.0; n_bins];
+        let s = vec![5.0; n_bins];
+        let model = ConstModel { n_e: n_bins };
+        let obj = JointPoissonObjective {
+            model: &model,
+            o: &o,
+            s: &s,
+            c: 1.0,
+            active_mask: None,
+        };
+        // Caller passes `t` shorter than `o`/`s`.
+        let t_short = vec![0.5; n_bins - 2];
+        let err = obj.deviance_from_transmission(&t_short).unwrap_err();
+        match err {
+            FittingError::LengthMismatch {
+                expected,
+                actual,
+                field,
+            } => {
+                assert_eq!(field, "transmission", "field must name `transmission`");
+                assert_eq!(expected, n_bins, "expected must be o.len()");
+                assert_eq!(actual, n_bins - 2, "actual must be t.len()");
+            }
+            other => panic!("expected LengthMismatch on transmission; got {other:?}"),
         }
     }
 }
