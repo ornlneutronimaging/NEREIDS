@@ -1238,11 +1238,18 @@ fn parse_urr_lfw1_lrf1(ctx: &mut RangeParseContext<'_>) -> Result<ResonanceRange
     })
 }
 
-/// Parse an Unresolved Resonance Region (LRU=2) range for LFW=0.
+/// Parse an Unresolved Resonance Region (LRU=2) range.
 ///
-/// Supports LRF=1 (energy-independent widths) and LRF=2 (tabulated widths).
-/// For LFW=1/LRF=1, see `parse_urr_lfw1_lrf1`.
-/// For LFW=1/LRF=2, the record layout is identical to LFW=0/LRF=2.
+/// Handles two routes:
+/// * LFW=0 (LRF=1 energy-independent or LRF=2 tabulated widths) — the
+///   standard URR case.
+/// * LFW=1 / LRF=2 — the LIST record layout is byte-identical to
+///   LFW=0/LRF=2 (the LFW=1 fission-width grid is embedded in each
+///   per-J LIST row rather than a separate shared-grid block), so the
+///   caller routes that combination here.
+///
+/// LFW=1 / LRF=1 (energy-dependent fission widths with the shared-grid
+/// layout) is handled separately by `parse_urr_lfw1_lrf1`.
 ///
 /// Reference: ENDF-6 Formats Manual §2.2.2; SAMMY `unr/munr03.f90`
 fn parse_urr_range(
@@ -1251,14 +1258,7 @@ fn parse_urr_range(
 ) -> Result<ResonanceRange, EndfParseError> {
     use crate::resonance::{UrrData, UrrJGroup, UrrLGroup};
 
-    // This function handles two routes:
-    //   • LFW=0 (LRF=1 or LRF=2): the standard URR case.
-    //   • LFW=1 / LRF=2: the LIST layout is byte-identical to LFW=0/LRF=2
-    //     (the LFW=1 fission-width grid is embedded in the per-J LIST row
-    //     itself, not in a separate shared-grid block), so the caller
-    //     routes that combination here.
-    // LFW=1 / LRF=1 (energy-dependent fission widths with the shared-grid
-    // layout) is handled separately by `parse_urr_lfw1_lrf1`.
+    // See function-level rustdoc for the LFW/LRF routing rules.
 
     // CONT: SPI, AP, 0, 0, NLS, 0
     // ENDF AP is in 10⁻¹² cm; convert to fm (×10).

@@ -1997,16 +1997,13 @@ mod tests {
 
     /// `cross_sections_on_grid` must match per-point for the full U-238
     /// ENDF file (many resonances, L-groups, J-groups). Fixture is the
-    /// vendored `examples/data/u238_ex027.endf`, so the gate runs
-    /// unconditionally on CI.
+    /// crate-local `tests/data/u238_ex027.endf`, so the gate runs
+    /// unconditionally on CI even when the crate is built standalone
+    /// (outside the workspace, where `examples/data/` is not packaged).
     #[test]
     fn test_grid_matches_per_point_u238_full() {
-        let endf_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("examples/data/u238_ex027.endf");
+        let endf_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/u238_ex027.endf");
 
         let endf_text = std::fs::read_to_string(&endf_path)
             .unwrap_or_else(|e| panic!("vendored U-238 fixture missing at {endf_path:?}: {e}"));
