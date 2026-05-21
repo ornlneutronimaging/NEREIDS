@@ -203,6 +203,29 @@ pub fn calibrate_energy(
         )));
     }
 
+    // Validate abundance values up-front.  Without this guard, non-finite
+    // or negative entries are silently multiplied into per-isotope
+    // densities (`abd * n_total`), `SampleParams::new` rejects the
+    // non-positive thickness, `compute_chi2` returns `INFINITY` for
+    // every grid point, and the user sees "no finite chi²" or boundary
+    // saturation rather than the actual cause (a bad abundance entry).
+    // Equivalent guards already exist for `assumed_flight_path_m` and
+    // `energies_nominal`; this closes the same gap for abundances.
+    let mut total_abundance = 0.0;
+    for (i, &abn) in abundances.iter().enumerate() {
+        if !abn.is_finite() || abn < 0.0 {
+            return Err(PipelineError::InvalidParameter(format!(
+                "calibrate_energy: abundances[{i}] = {abn} is not finite and non-negative"
+            )));
+        }
+        total_abundance += abn;
+    }
+    if total_abundance <= 0.0 {
+        return Err(PipelineError::InvalidParameter(
+            "calibrate_energy: sum of abundances must be strictly positive".into(),
+        ));
+    }
+
     // Validate scalar / array inputs up-front so the grid-search loop
     // cannot silently produce a "perfect calibration" result from
     // degenerate inputs.  Without these guards, all-NaN transmission
@@ -942,6 +965,103 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_calibrate_energy_rejects_negative_abundance() {
+        // A negative abundance silently flips the sign of `abd * n_total`
+        // and `SampleParams::new` rejects the non-positive thickness;
+        // every grid point then returns chi² = INFINITY and the user
+        // sees a "no finite chi²" boundary error.  The up-front guard
+        // converts this to an actionable diagnostic that names the
+        // offending index.
+        let (energies, transmission, uncertainty, isotopes, mut abundances) =
+            minimal_calibration_inputs();
+        abundances[0] = -0.5;
+        let err = calibrate_energy(
+            &energies,
+            &transmission,
+            &uncertainty,
+            &isotopes,
+            &abundances,
+            25.0,
+            293.6,
+            None,
+        )
+        .expect_err("negative abundance must be rejected");
+        match err {
+            PipelineError::InvalidParameter(msg) => {
+                assert!(
+                    msg.contains("abundances[0]"),
+                    "error message should name the offending index, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidParameter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_calibrate_energy_rejects_nan_abundance() {
+        // NaN bypasses naive `< 0.0` guards (NaN comparisons are always
+        // false), so the up-front check must pair `is_finite()` with the
+        // sign predicate.  Without this guard, `abd * n_total` is NaN
+        // for every density, every chi² is NaN, and the user sees a
+        // confusing boundary-saturation message.
+        let (energies, transmission, uncertainty, isotopes, mut abundances) =
+            minimal_calibration_inputs();
+        abundances[0] = f64::NAN;
+        let err = calibrate_energy(
+            &energies,
+            &transmission,
+            &uncertainty,
+            &isotopes,
+            &abundances,
+            25.0,
+            293.6,
+            None,
+        )
+        .expect_err("NaN abundance must be rejected");
+        match err {
+            PipelineError::InvalidParameter(msg) => {
+                assert!(
+                    msg.contains("abundances[0]"),
+                    "error message should name the offending index, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidParameter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_calibrate_energy_rejects_all_zero_abundances() {
+        // Each individual zero abundance is legal (the isotope is simply
+        // not present in this sample), but the sum being zero means
+        // every per-isotope density is zero and the transmission model
+        // collapses to T == 1 — the calibrator has no signal to fit
+        // (L, t₀, n_total) against.  Reject up-front rather than letting
+        // the search bottom out at the band boundary.
+        let (energies, transmission, uncertainty, isotopes, _) = minimal_calibration_inputs();
+        let abundances = vec![0.0; isotopes.len()];
+        let err = calibrate_energy(
+            &energies,
+            &transmission,
+            &uncertainty,
+            &isotopes,
+            &abundances,
+            25.0,
+            293.6,
+            None,
+        )
+        .expect_err("all-zero abundances must be rejected");
+        match err {
+            PipelineError::InvalidParameter(msg) => {
+                assert!(
+                    msg.contains("sum of abundances"),
+                    "error message should mention the zero-sum cause, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidParameter, got {other:?}"),
+        }
+    }
+
     // ── n_total search-band regression tests ──────────────────────────
     //
     // Before the golden-section refactor, `calibrate_energy` scanned
@@ -1013,8 +1133,9 @@ mod tests {
     }
 
     /// Near-lower-edge density: `true_n = 2e-5` sits just inside the
-    /// `[1e-5, 1e-2]` search band (one decade above the boundary
-    /// guard's `5 %`-linear tolerance window around `1e-5`).
+    /// `[1e-5, 1e-2]` search band — approximately 0.3 decades (a factor
+    /// of 2) above the lower bound, comfortably outside the boundary
+    /// guard's `5 %`-linear tolerance window around `1e-5`.
     /// Recovery must succeed; the test name keeps `1e_5` for
     /// continuity with the audit checklist, but the chosen density
     /// is deliberately above the boundary tolerance so the search

@@ -413,13 +413,6 @@ pub fn spatial_map_typed(
         )));
     }
 
-    // Hoist whole-config `InvalidParameter` rejections so they surface as
-    // a single boundary error instead of being swallowed pixel-by-pixel
-    // into an all-NaN `SpatialResult`.  See
-    // `validate_spatial_fit_preflight` for the full gate list and
-    // per-gate rationale.  Must run before any rayon work.
-    validate_spatial_fit_preflight(input, config)?;
-
     // Reject known-broken configurations at entry.
     //
     // Issue #458 B3: per-pixel LM with `fit_energy_scale=True` on
@@ -540,6 +533,23 @@ pub fn spatial_map_typed(
             ));
         }
     }
+
+    // Hoist whole-config `InvalidParameter` rejections so they surface as
+    // a single boundary error instead of being swallowed pixel-by-pixel
+    // into an all-NaN `SpatialResult`.  See
+    // `validate_spatial_fit_preflight` for the full gate list and
+    // per-gate rationale.  Must run before any rayon work.
+    //
+    // Ordering note: the preflight runs *after* the dispatch /
+    // solver-compatibility guards above (CountsWithNuisance + LM,
+    // fit_energy_scale + fit_temperature, transmission_background
+    // BackD/BackF interlocks, …).  The fit-range, temperature and
+    // alpha gates inside the preflight only meaningfully apply once
+    // the input → solver dispatch is known to be valid; otherwise
+    // a downstream "LM transmission active-bin" message would
+    // shadow the more fundamental "CountsWithNuisance requires a
+    // counts-domain solver" diagnostic.
+    validate_spatial_fit_preflight(input, config)?;
 
     // Collect live pixel coordinates
     let mut pixel_coords: Vec<(usize, usize)> = Vec::new();
@@ -1285,7 +1295,7 @@ pub fn spatial_map_typed(
     // few outliers" rather than "map of NaN holes with a few fits".
     //
     // NaN-on-failure is also the convention asserted by
-    // `test_spatial_map_failed_pixels_remain_nan`; this block makes
+    // `test_spatial_unconverged_pixels_are_nan`; this block makes
     // it hold for *every* non-converged pixel, not only the hard
     // failure path.
     for ((y, x), result) in &results {
@@ -2589,6 +2599,65 @@ mod tests {
         assert!(
             msg.contains("CountsWithNuisance") && msg.contains("counts-domain"),
             "error must mention CountsWithNuisance + counts-domain requirement, got: {msg}"
+        );
+    }
+
+    /// Diagnostic-priority regression: when a config violates both a
+    /// dispatch-level guard (e.g. `CountsWithNuisance + LM` is
+    /// rejected because LM cannot consume the nuisance arm) AND a
+    /// downstream preflight gate (e.g. `fit_energy_range` selects too
+    /// few active bins), the user must see the *dispatch* mismatch
+    /// first — the fit-range / temperature gates only meaningfully
+    /// apply once the dispatch is known to be valid.  Otherwise an
+    /// "LM transmission active-bin" message shadows the more
+    /// fundamental "requires a counts-domain solver" diagnostic.
+    #[test]
+    fn test_spatial_map_reports_solver_mismatch_before_fit_range_gate() {
+        use ndarray::Array3;
+        let rd = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        let (sample, _ob) = synthetic_4x4_counts(&rd, 0.0005, &energies, 1000.0);
+        let flux: Array3<f64> = Array3::from_elem((energies.len(), 4, 4), 1000.0);
+        let background: Array3<f64> = Array3::from_elem((energies.len(), 4, 4), 0.0);
+        let data = InputData3D::CountsWithNuisance {
+            sample_counts: sample.view(),
+            flux: flux.view(),
+            background: background.view(),
+        };
+        // Combine the dispatch-level violation (LM + CountsWithNuisance)
+        // with a downstream preflight violation (too-narrow
+        // `fit_energy_range` selecting < 2 active bins on the configured
+        // 0.2 eV grid).  Either guard could fire, but the dispatch
+        // mismatch is the actionable cause; the fit-range gate would
+        // never matter because the dispatch never reaches LM with this
+        // input.
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![rd],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
+        .with_fit_energy_range(Some((5.0, 5.05)))
+        .unwrap();
+
+        let err = spatial_map_typed(&data, &config, None, None, None)
+            .expect_err("CountsWithNuisance + LM + narrow fit_energy_range must be rejected");
+        let msg = err.to_string();
+        assert!(
+            matches!(err, PipelineError::InvalidParameter(_)),
+            "expected InvalidParameter, got {err:?}"
+        );
+        assert!(
+            msg.contains("CountsWithNuisance") && msg.contains("counts-domain"),
+            "error must surface the solver mismatch (not the fit-range gate), got: {msg}"
+        );
+        assert!(
+            !msg.contains("active bin"),
+            "error must not be the downstream fit-range diagnostic, got: {msg}"
         );
     }
 
