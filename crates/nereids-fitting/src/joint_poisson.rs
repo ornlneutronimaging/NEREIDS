@@ -955,11 +955,20 @@ pub fn joint_poisson_fit(
     // leave the polish flags at their default `false` values.  This path
     // is reachable from pipeline callers that pin all params and set
     // `with_counts_enable_polish(Some(true))`.
+    //
+    // Also short-circuit polish when stage 1 ended on a non-finite
+    // deviance: there is no meaningful starting deviance to refine, and
+    // the acceptance test `nm.fun < best_d_stage1` would degrade to
+    // `finite < NaN == false` (discarding the NM result) while
+    // `nm.self_converged` could still be `true`, leaking a spurious
+    // converged flag together with a NaN final deviance.  Mirrors the
+    // LM `n_free == 0` early-return at `lm.rs:584-607`, which refuses to
+    // report a converged fit when the model emits NaN at active bins.
     let mut polish_iterations = 0usize;
     let mut polish_converged = false;
     let mut polish_improved = false;
     let free_idx = params.free_indices();
-    if config.enable_polish && !free_idx.is_empty() {
+    if config.enable_polish && !free_idx.is_empty() && best_d_stage1.is_finite() {
         let bounds: Vec<(f64, f64)> = free_idx
             .iter()
             .map(|&i| (params.params[i].lower, params.params[i].upper))
@@ -2663,6 +2672,78 @@ mod tests {
             r.gn_iterations, 1,
             "all-fixed branch should report exactly one iteration",
         );
+    }
+
+    /// Polish path with at least one **free** parameter must not report
+    /// `polish_converged = true` when stage 1 ended on a non-finite
+    /// deviance.
+    ///
+    /// Without the `best_d_stage1.is_finite()` short-circuit in the polish
+    /// guard, Nelder-Mead would still run and return a finite `nm.fun`
+    /// (its infeasible-point handler maps NaN evaluations to `+∞` and
+    /// contracts away from them).  The commit test `nm.fun < best_d_stage1`
+    /// then reduces to `finite < NaN == false`, so the polish step is
+    /// discarded — but `polish_converged` would inherit `nm.self_converged`
+    /// regardless, leaking a spurious converged flag together with a NaN
+    /// final deviance.  Downstream pipeline code (`pipeline.rs`'s
+    /// `gn_converged || polish_converged`) would then surface that fit as
+    /// converged in the spatial map.
+    ///
+    /// Symmetric to the all-fixed NaN guard above: stage 2 refuses to run
+    /// when there is no finite stage-1 deviance to refine.
+    #[test]
+    fn test_joint_poisson_polish_does_not_report_converged_when_stage1_nan() {
+        struct NanModel {
+            n_e: usize,
+        }
+        impl FitModel for NanModel {
+            fn evaluate(&self, _params: &[f64]) -> Result<Vec<f64>, FittingError> {
+                Ok(vec![f64::NAN; self.n_e])
+            }
+        }
+
+        let n_bins = 5;
+        let o = vec![10.0; n_bins];
+        let s = vec![5.0; n_bins];
+        let model = NanModel { n_e: n_bins };
+        let obj = JointPoissonObjective {
+            model: &model,
+            o: &o,
+            s: &s,
+            c: 1.0,
+            active_mask: None,
+        };
+        // At least one FREE parameter so polish actually runs (unlike
+        // `test_joint_poisson_all_fixed_nan_transmission_with_polish_does_not_panic`,
+        // which exercises the empty-free-set short-circuit instead).
+        let mut params = ParameterSet::new(vec![FitParameter::non_negative("T", 0.5)]);
+        let cfg = JointPoissonFitConfig {
+            enable_polish: true,
+            ..JointPoissonFitConfig::default()
+        };
+
+        let r = joint_poisson_fit(&obj, &mut params, &cfg).unwrap();
+
+        assert!(
+            r.deviance.is_nan(),
+            "expected NaN deviance from NaN model; got {}",
+            r.deviance
+        );
+        assert!(!r.gn_converged, "stage 1 cannot converge on NaN deviance",);
+        assert!(
+            !r.polish_converged,
+            "stage 2 must not report converged when stage 1 ended non-finite",
+        );
+        assert!(
+            !r.polish_improved,
+            "polish cannot have improved a NaN starting deviance",
+        );
+        assert_eq!(
+            r.polish_iterations, 0,
+            "polish must not run when stage 1 is non-finite",
+        );
+        assert_eq!(r.n_free, 1);
+        assert_eq!(r.n_active, n_bins);
     }
 
     // ==================================================================
