@@ -545,7 +545,8 @@ fn parse_reich_moore_range(
 ///   LIST: [0, 0, 0, NRS, 6*NX, NX]                  ← resonance parameters
 ///         Per ENDF-6 §2.2.1.6 and SAMMY mrml01.f:413-415, NRS is in L2
 ///         (resonance count for this spin group) and NX is in N2 (number of
-///         packed 6-float ENDF rows = NRS · ceil((NCH+1)/6)); N1 = 6*NX.
+///         packed 6-float ENDF rows = NRS · ceil(stride/6) where stride is
+///         NCH+1 for KRM=2 and NCH+2 for KRM=3); N1 = 6*NX.
 ///         KRM=2: stride ≥ NCH+1; per resonance: [ER, γ_1, ..., γ_NCH, <padding>]
 ///         KRM=3: stride ≥ NCH+2; per resonance: [ER, Γγ, Γ_1, ..., Γ_NCH, <padding>]
 /// ```
@@ -678,8 +679,10 @@ fn parse_rmatrix_limited_range(
         // so that unsupported files fail fast without wasting allocation and
         // parsing work on records that will be discarded.
         if kbk != 0 {
+            let nch_plus_one_raw = sg_cont.n2;
             return Err(EndfParseError::UnsupportedFormat(format!(
-                "LRF=7 KBK={kbk} != 0 (R-external background): \
+                "LRF=7 KBK={kbk} != 0 (R-external background) for spin group with \
+                 NCH+1={nch_plus_one_raw}: \
                  the ENDF-6 manual vs. OpenScale layout dispute is unresolved and NEREIDS \
                  does not yet parse nonzero KBK. Use the SAMMY .par/.inp converter \
                  (sammy_to_resonance_data_multi) if R-external is required."
@@ -693,8 +696,10 @@ fn parse_rmatrix_limited_range(
         // KPS for the same reason: no validated reference layout, no real
         // evaluation to test against.
         if kps != 0 {
+            let nch_plus_one_raw = sg_cont.n2;
             return Err(EndfParseError::UnsupportedFormat(format!(
-                "LRF=7 KPS={kps} != 0 (tabulated penetrability/phase-shift override): \
+                "LRF=7 KPS={kps} != 0 (tabulated penetrability/phase-shift override) \
+                 for spin group with NCH+1={nch_plus_one_raw}: \
                  NEREIDS does not yet parse nonzero KPS. \
                  OpenScale itself rejects this case (\"kps > 0 for lrf=7 not yet supported\")."
             )));
@@ -789,7 +794,8 @@ fn parse_rmatrix_limited_range(
         // [C1=0, C2=0, L1=0, L2=NRS, N1=6*NX, N2=NX]:
         //   NRS lives in L2 (the resonance count for this spin group).
         //   NX  lives in N2 (number of packed 6-float ENDF data rows =
-        //       NRS · ceil((NCH+1)/6)), and N1 must equal 6*NX.
+        //       NRS · ceil(stride/6) where stride is NCH+1 for KRM=2 and
+        //       NCH+2 for KRM=3), and N1 must equal 6*NX.
         //
         // For spin groups where each resonance fits in one packed row
         // (NCH+1 ≤ 6 for KRM=2, NCH+2 ≤ 6 for KRM=3) NX == NRS and the
@@ -818,21 +824,43 @@ fn parse_rmatrix_limited_range(
                 6 * nx
             )));
         }
-        // NX = NRS · ceil((NCH+1)/6) per ENDF-6 §2.2.1.6, so NX is always an
-        // integer multiple of NRS (the per-resonance row count is constant
-        // within a spin group). A non-zero NRS with NX not divisible by NRS
-        // would yield a fractional stride (`6 * NX / NRS` non-integer) and
-        // mis-align resonance reads. Reject up-front rather than rely on the
-        // downstream `res_npl % nrs != 0` check, which is a weaker invariant.
+        // Per ENDF-6 §2.2.1.6, NX is the per-spin-group packed-row count:
+        //     NX = NRS · ceil(per_resonance_floats / 6)
+        // where the per-resonance float count is layout-dependent:
+        //     KRM=2: per_resonance = NCH+1  (ER + NCH reduced widths γ_c)
+        //     KRM=3: per_resonance = NCH+2  (ER + Γγ + NCH partial widths Γ_c)
+        // SAMMY rml/mrml01.f ENDF123 confirms the KRM=3 layout reads Gamgam
+        // at position 1 and (Gamma,I=1,Ichan) at positions 2..NCH+1.
+        // Because the per-resonance row count is constant within a spin
+        // group, NX is always an integer multiple of NRS. A non-zero NRS
+        // with NX not divisible by NRS would yield a fractional stride
+        // (`6 * NX / NRS` non-integer) and mis-align resonance reads.
+        // Reject up-front rather than rely on the downstream
+        // `res_npl % nrs != 0` check, which is a weaker invariant.
         if nrs > 0 && nx % nrs != 0 {
             return Err(EndfParseError::UnsupportedFormat(format!(
                 "LRF=7 resonance LIST: N2/NX ({nx}) is not a multiple of L2/NRS ({nrs}); \
-                 ENDF-6 §2.2.1.6 requires NX = NRS * ceil((NCH+1)/6)"
+                 ENDF-6 §2.2.1.6 requires NX = NRS * ceil(stride/6) where stride is \
+                 NCH+1 for KRM=2 and NCH+2 for KRM=3"
             )));
         }
-        if nrs == 0 && nx != 0 {
+        // Canonical empty spin group per ENDF-6 §2.2.1.6 and OpenScale's
+        // writer at File2.cpp:683-697:
+        //   list.setL2(spin->getNres());        // L2 = NRS
+        //   ...
+        //   // nx must be at least 1, even if nres=0
+        //   if (spin->getNres() == 0)
+        //       nx = 1;
+        //   list.setN1(6 * nx);                  // N1 = 6
+        //   list.setN2(nx);                      // N2 = 1
+        // The LIST body for the empty spin group is a single 6-float zero
+        // filler row. Reject any NRS=0 record that does not carry NX=1
+        // (NX=0 is malformed by OpenScale; NX>1 would imply phantom rows
+        // with no resonance count to anchor them).
+        if nrs == 0 && nx != 1 {
             return Err(EndfParseError::UnsupportedFormat(format!(
-                "LRF=7 resonance LIST: NRS=0 but NX={nx} (must be 0 when no resonances)"
+                "LRF=7 resonance LIST: NRS=0 requires NX=1 (single zero-filler row \
+                 per ENDF-6 §2.2.1.6 + OpenScale File2.cpp:683-697); got NX={nx}"
             )));
         }
         let res_values = parse_list_values(ctx.lines, ctx.pos, res_npl)?;
@@ -3130,14 +3158,15 @@ mod tests {
 
     /// LRF=7 resonance LIST with N2/NX not divisible by L2/NRS is rejected.
     ///
-    /// ENDF-6 §2.2.1.6 fixes NX = NRS · ceil((NCH+1)/6), so NX must be an
-    /// integer multiple of NRS (the per-resonance packed-row count is
-    /// constant within a spin group). A fixture with NRS=4 and NX=2 yields
-    /// a fractional stride 6·NX/NRS = 3 floats per resonance, which would
-    /// mis-align the resonance reads. Without the divisibility check, the
-    /// existing `res_npl == 6*nx` guard passes (12 == 6·2) and the
-    /// downstream `res_npl % nrs != 0` would also pass (12 % 4 == 0),
-    /// producing the bogus stride. The new guard catches this directly.
+    /// ENDF-6 §2.2.1.6 fixes NX = NRS · ceil(stride/6) where stride is NCH+1
+    /// for KRM=2 and NCH+2 for KRM=3, so NX must be an integer multiple of
+    /// NRS (the per-resonance packed-row count is constant within a spin
+    /// group). A fixture with NRS=4 and NX=2 yields a fractional stride
+    /// 6·NX/NRS = 3 floats per resonance, which would mis-align the
+    /// resonance reads. Without the divisibility check, the existing
+    /// `res_npl == 6*nx` guard passes (12 == 6·2) and the downstream
+    /// `res_npl % nrs != 0` would also pass (12 % 4 == 0), producing the
+    /// bogus stride. The new guard catches this directly.
     #[test]
     fn test_parse_lrf7_rejects_nx_not_multiple_of_nrs() {
         const ENDF: &str = concat!(
@@ -3188,6 +3217,131 @@ mod tests {
             other => {
                 panic!("expected UnsupportedFormat for NX not multiple of NRS, got {other:?}")
             }
+        }
+    }
+
+    /// LRF=7 spin group with zero resonances must be accepted when written in
+    /// the canonical ENDF-6 §2.2.1.6 form NRS=0, NX=1, NPL=6 (a single
+    /// six-float zero-filler row in the LIST body).
+    ///
+    /// OpenScale's reference writer at
+    /// `external/openScale/repo/packages/ScaleUtils/EndfLib/endf/File2.cpp:683-697`
+    /// pads the resonance LIST for empty spin groups:
+    ///
+    /// ```cpp
+    /// list.setL2(spin->getNres());        // L2 = NRS = 0
+    /// ...
+    /// // nx must be at least 1, even if nres=0
+    /// if (spin->getNres() == 0)
+    ///     nx = 1;
+    /// list.setN1(6 * nx);                  // N1 = 6
+    /// list.setN2(nx);                      // N2 = 1
+    /// ```
+    ///
+    /// A naive guard `if nrs == 0 && nx != 0 { reject }` would reject this
+    /// canonical pattern (NX=1 ≠ 0). The relaxed guard
+    /// `if nrs == 0 && nx != 1 { reject }` accepts it while still rejecting
+    /// malformed shapes such as NRS=0/NX=2.
+    #[test]
+    fn test_parse_lrf7_accepts_nrs_zero_nx_one_canonical_empty() {
+        const ENDF: &str = concat!(
+            // ── HEAD: ZA=74184, AWR=182, NIS=1 ──────────────────────────────
+            " 7.418400+4 1.820000+2          0          0          1          07437 2151    1\n",
+            // ── Isotope CONT: NER=1 ─────────────────────────────────────────
+            " 7.418400+4 1.000000+0          0          0          1          07437 2151    2\n",
+            // ── Range CONT: LRU=1, LRF=7, NRO=0, NAPS=0 ─────────────────────
+            " 1.000000-5 1.000000+3          1          7          0          07437 2151    3\n",
+            // ── LRF=7 CONT: SPI=0, AP=0.7, IFG=0, KRM=3, NJS=1, KRL=0 ───────
+            " 0.000000+0 7.000000-1          0          3          1          07437 2151    4\n",
+            // ── Particle-pair LIST CONT: NPP=1, N1=12, N2=1 ─────────────────
+            " 0.000000+0 0.000000+0          1          0         12          17437 2151    5\n",
+            " 1.000000+0 1.820000+2 0.000000+0 0.000000+0 5.000000-1 0.000000+07437 2151    6\n",
+            " 0.000000+0 1.000000+0 0.000000+0 2.000000+0 1.000000+0 1.000000+07437 2151    7\n",
+            // ── Spin-group LIST CONT: AJ=0.5, KBK=0, KPS=0, NPL=12, NCH+1=2 ─
+            " 5.000000-1 0.000000+0          0          0         12          27437 2151    8\n",
+            " 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+07437 2151    9\n",
+            " 1.000000+0 0.000000+0 5.000000-1 0.000000+0 7.000000-1 7.000000-17437 2151   10\n",
+            // ── Resonance LIST CONT: NRS=0 (L2), NPL=6 (N1=6*NX), NX=1 (N2) ─
+            // Canonical empty spin group per ENDF-6 §2.2.1.6 + OpenScale
+            // File2.cpp:683-697: a single six-float zero-filler row keeps the
+            // LIST body non-degenerate even when no resonances are present.
+            " 0.000000+0 0.000000+0          0          0          6          17437 2151   11\n",
+            // Six-float zero-filler row (NX=1 row of 6 zeros).
+            " 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+07437 2151   12\n",
+        );
+
+        let data = parse_endf_file2(ENDF)
+            .expect("LRF=7 fixture with NRS=0/NX=1 canonical empty spin group must parse cleanly");
+        let rml = data.ranges[0]
+            .rml
+            .as_ref()
+            .expect("LRF=7 range must have RmlData");
+        assert_eq!(
+            rml.spin_groups.len(),
+            1,
+            "must parse exactly one spin group"
+        );
+        let sg = &rml.spin_groups[0];
+        assert!(
+            sg.resonances.is_empty(),
+            "empty spin group must contain zero resonances, got {}",
+            sg.resonances.len()
+        );
+        assert_eq!(
+            sg.channels.len(),
+            1,
+            "empty spin group still carries its NCH channel definitions"
+        );
+    }
+
+    /// LRF=7 spin group with NRS=0 but NX≠1 is rejected as malformed.
+    ///
+    /// OpenScale's writer (File2.cpp:683-697) explicitly pads NX to 1 when
+    /// NRS=0, so any NRS=0 record with NX=0 (no filler row) or NX>1 (phantom
+    /// filler rows with nothing to anchor them) is not a valid ENDF-6 emission.
+    /// The previous over-permissive guard accepted NRS=0/NX=2 silently,
+    /// leaving the parser to read two zero-filled rows as "no resonances"
+    /// while the LIST body did contain data that some other reader might
+    /// interpret as resonance parameters.
+    #[test]
+    fn test_parse_lrf7_rejects_nrs_zero_nx_two_malformed() {
+        const ENDF: &str = concat!(
+            // ── HEAD: ZA=74184, AWR=182, NIS=1 ──────────────────────────────
+            " 7.418400+4 1.820000+2          0          0          1          07437 2151    1\n",
+            // ── Isotope CONT: NER=1 ─────────────────────────────────────────
+            " 7.418400+4 1.000000+0          0          0          1          07437 2151    2\n",
+            // ── Range CONT: LRU=1, LRF=7, NRO=0, NAPS=0 ─────────────────────
+            " 1.000000-5 1.000000+3          1          7          0          07437 2151    3\n",
+            // ── LRF=7 CONT: SPI=0, AP=0.7, IFG=0, KRM=3, NJS=1, KRL=0 ───────
+            " 0.000000+0 7.000000-1          0          3          1          07437 2151    4\n",
+            // ── Particle-pair LIST CONT: NPP=1, N1=12, N2=1 ─────────────────
+            " 0.000000+0 0.000000+0          1          0         12          17437 2151    5\n",
+            " 1.000000+0 1.820000+2 0.000000+0 0.000000+0 5.000000-1 0.000000+07437 2151    6\n",
+            " 0.000000+0 1.000000+0 0.000000+0 2.000000+0 1.000000+0 1.000000+07437 2151    7\n",
+            // ── Spin-group LIST CONT: AJ=0.5, KBK=0, KPS=0, NPL=12, NCH+1=2 ─
+            " 5.000000-1 0.000000+0          0          0         12          27437 2151    8\n",
+            " 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+07437 2151    9\n",
+            " 1.000000+0 0.000000+0 5.000000-1 0.000000+0 7.000000-1 7.000000-17437 2151   10\n",
+            // ── Resonance LIST CONT: NRS=0 (L2), NPL=12 (N1=6*NX), NX=2 (N2) ─
+            // Malformed: OpenScale requires NX=1 when NRS=0.
+            " 0.000000+0 0.000000+0          0          0         12          27437 2151   11\n",
+            " 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+07437 2151   12\n",
+            " 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+07437 2151   13\n",
+        );
+
+        let err = parse_endf_file2(ENDF).unwrap_err();
+        match &err {
+            EndfParseError::UnsupportedFormat(msg) => {
+                assert!(
+                    msg.contains("NRS=0"),
+                    "expected 'NRS=0' in error message, got: {msg}"
+                );
+                assert!(
+                    msg.contains("NX=2"),
+                    "expected 'NX=2' in error message, got: {msg}"
+                );
+            }
+            other => panic!("expected UnsupportedFormat for NRS=0/NX!=1, got {other:?}"),
         }
     }
 }
