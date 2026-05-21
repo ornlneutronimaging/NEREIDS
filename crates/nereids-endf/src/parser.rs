@@ -71,6 +71,17 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
     let awr = head.c2;
     let nis = checked_count(head.n1, "NIS")?; // number of isotopes (usually 1)
 
+    // ENDF-6 §2.1 requires NIS >= 1 for a valid resonance evaluation. NIS=0
+    // would leave the parser with no isotope subsection to read and fall
+    // through to a confusing "unconsumed data lines" downstream failure;
+    // reject up-front with a clear message.
+    if nis == 0 {
+        return Err(EndfParseError::UnsupportedFormat(
+            "MF=2 NIS=0: no isotopes declared. ENDF-6 §2.1 requires NIS >= 1 \
+             for a valid resonance evaluation."
+                .into(),
+        ));
+    }
     // ENDF-6 §2.1: a material with NIS>1 contains multiple isotope subsections,
     // each carrying its own ZAI, ABN, LFW, and NER ranges (e.g. natural-element
     // evaluations such as nat-C with ZAI={6012,6013}). The reference reader
@@ -87,7 +98,7 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
             "MF=2 NIS={nis} > 1 multi-isotope materials are not supported. \
              Each NEREIDS ResonanceData represents a single isotope. \
              For multi-isotope ENDF evaluations, split the material into per-isotope \
-             files or use sammy_to_resonance_data_multi from nereids-endf::sammy."
+             files or use sammy_to_resonance_data_multi from nereids_endf::sammy."
         )));
     }
 
@@ -531,7 +542,10 @@ fn parse_reich_moore_range(
 ///         First 6 values: header row [0, 0, 0, 0, 0, NCH]
 ///         NCH × 6 values: [IPP, L, SCH, BND, APE, APT] per channel
 ///
-///   LIST: [0, 0, 0, 0, NPL, NRS]                    ← resonance parameters
+///   LIST: [0, 0, 0, NRS, 6*NX, NX]                  ← resonance parameters
+///         Per ENDF-6 §2.2.1.6 and SAMMY mrml01.f:413-415, NRS is in L2
+///         (resonance count for this spin group) and NX is in N2 (number of
+///         packed 6-float ENDF rows = NRS · ceil((NCH+1)/6)); N1 = 6*NX.
 ///         KRM=2: stride ≥ NCH+1; per resonance: [ER, γ_1, ..., γ_NCH, <padding>]
 ///         KRM=3: stride ≥ NCH+2; per resonance: [ER, Γγ, Γ_1, ..., Γ_NCH, <padding>]
 /// ```
@@ -637,6 +651,54 @@ fn parse_rmatrix_limited_range(
         let pj = sg_cont.c2; // explicit parity field; may be 0.0 when parity is in sign(AJ)
         let kbk = sg_cont.l1; // background R-matrix flag
         let kps = sg_cont.l2; // phase shift flag
+
+        // KBK: background R-matrix correction (R-external function on a
+        // subset of channels). Per the printed ENDF-6 §2.2.1.6 Tables 2.4/2.5
+        // KBK is described as a nonzero flag with NCH background records,
+        // while the reference reader OpenScale
+        // (external/openScale/repo/packages/ScaleUtils/EndfLib/endf/File2.cpp:444-524)
+        // treats KBK as a sparse record count, with each subrecord's L1 holding
+        // the 1-based channel index and L2 holding the LBK formalism flag
+        // (LBK ∈ {0=no payload, 1=two TAB1, 2=LIST(5), 3=LIST(3)}). The two
+        // conventions disagree on (a) the loop bound, (b) the per-subrecord
+        // control-field positions, and (c) the payload shape per LBK value.
+        //
+        // No ENDF/B-VIII.0 evaluation in the local cache has nonzero KBK or
+        // KPS to disambiguate, and the only nonzero example located on disk
+        // is OpenScale's synthetic F-19 R-external test fixture
+        // (Ampx/TestRunner/test/data/polident/f19_rext.endf), which follows
+        // the OpenScale convention. NEREIDS's previous layout matched neither
+        // convention. Until a policy decision is made (strict-manual vs.
+        // OpenScale-compat) and a real ENDF/B-VIII.0 evaluation with R-external
+        // is available to validate against, reject nonzero KBK explicitly so
+        // the parser cannot silently misalign the stream past this spin group.
+        //
+        // The reject runs immediately after reading the spin-group CONT —
+        // before parsing the (potentially large) channel and resonance LISTs —
+        // so that unsupported files fail fast without wasting allocation and
+        // parsing work on records that will be discarded.
+        if kbk != 0 {
+            return Err(EndfParseError::UnsupportedFormat(format!(
+                "LRF=7 KBK={kbk} != 0 (R-external background): \
+                 the ENDF-6 manual vs. OpenScale layout dispute is unresolved and NEREIDS \
+                 does not yet parse nonzero KBK. Use the SAMMY .par/.inp converter \
+                 (sammy_to_resonance_data_multi) if R-external is required."
+            )));
+        }
+
+        // KPS: tabulated penetrability/phase-shift override per channel.
+        // Same documentation-vs-implementation dispute as KBK above
+        // (OpenScale File2.cpp:439-441 throws "kps > 0 for lrf=7 not yet
+        // supported" and never reads the subrecords). NEREIDS rejects nonzero
+        // KPS for the same reason: no validated reference layout, no real
+        // evaluation to test against.
+        if kps != 0 {
+            return Err(EndfParseError::UnsupportedFormat(format!(
+                "LRF=7 KPS={kps} != 0 (tabulated penetrability/phase-shift override): \
+                 NEREIDS does not yet parse nonzero KPS. \
+                 OpenScale itself rejects this case (\"kps > 0 for lrf=7 not yet supported\")."
+            )));
+        }
 
         // AJ encodes both the spin and, in some evaluations, the parity.
         // ENDF/B-VIII.0 evaluations such as W-184 use negative AJ for odd-parity
@@ -756,6 +818,23 @@ fn parse_rmatrix_limited_range(
                 6 * nx
             )));
         }
+        // NX = NRS · ceil((NCH+1)/6) per ENDF-6 §2.2.1.6, so NX is always an
+        // integer multiple of NRS (the per-resonance row count is constant
+        // within a spin group). A non-zero NRS with NX not divisible by NRS
+        // would yield a fractional stride (`6 * NX / NRS` non-integer) and
+        // mis-align resonance reads. Reject up-front rather than rely on the
+        // downstream `res_npl % nrs != 0` check, which is a weaker invariant.
+        if nrs > 0 && nx % nrs != 0 {
+            return Err(EndfParseError::UnsupportedFormat(format!(
+                "LRF=7 resonance LIST: N2/NX ({nx}) is not a multiple of L2/NRS ({nrs}); \
+                 ENDF-6 §2.2.1.6 requires NX = NRS * ceil((NCH+1)/6)"
+            )));
+        }
+        if nrs == 0 && nx != 0 {
+            return Err(EndfParseError::UnsupportedFormat(format!(
+                "LRF=7 resonance LIST: NRS=0 but NX={nx} (must be 0 when no resonances)"
+            )));
+        }
         let res_values = parse_list_values(ctx.lines, ctx.pos, res_npl)?;
 
         // C4: Validate stride before use — NPL must divide evenly by NRS, and each row
@@ -841,56 +920,14 @@ fn parse_rmatrix_limited_range(
             });
         }
 
-        // KBK: background R-matrix correction (R-external function on a
-        // subset of channels). Per the printed ENDF-6 §2.2.1.6 Tables 2.4/2.5
-        // KBK is described as a nonzero flag with NCH background records,
-        // while the reference reader OpenScale
-        // (external/openScale/repo/packages/ScaleUtils/EndfLib/endf/File2.cpp:444-524)
-        // treats KBK as a sparse record count, with each subrecord's L1 holding
-        // the 1-based channel index and L2 holding the LBK formalism flag
-        // (LBK ∈ {0=no payload, 1=two TAB1, 2=LIST(5), 3=LIST(3)}). The two
-        // conventions disagree on (a) the loop bound, (b) the per-subrecord
-        // control-field positions, and (c) the payload shape per LBK value.
-        //
-        // No ENDF/B-VIII.0 evaluation in the local cache has nonzero KBK or
-        // KPS to disambiguate, and the only nonzero example located on disk
-        // is OpenScale's synthetic F-19 R-external test fixture
-        // (Ampx/TestRunner/test/data/polident/f19_rext.endf), which follows
-        // the OpenScale convention. NEREIDS's previous layout matched neither
-        // convention. Until a policy decision is made (strict-manual vs.
-        // OpenScale-compat) and a real ENDF/B-VIII.0 evaluation with R-external
-        // is available to validate against, reject nonzero KBK explicitly so
-        // the parser cannot silently misalign the stream past this spin group.
-        if kbk != 0 {
-            return Err(EndfParseError::UnsupportedFormat(format!(
-                "LRF=7 KBK={kbk} != 0 (R-external background) in spin group with NCH={nch}: \
-                 the ENDF-6 manual vs. OpenScale layout dispute is unresolved and NEREIDS \
-                 does not yet parse nonzero KBK. Use the SAMMY .par/.inp converter \
-                 (sammy_to_resonance_data_multi) if R-external is required."
-            )));
-        }
-
-        // KPS: tabulated penetrability/phase-shift override per channel.
-        // Same documentation-vs-implementation dispute as KBK above
-        // (OpenScale File2.cpp:439-441 throws "kps > 0 for lrf=7 not yet
-        // supported" and never reads the subrecords). NEREIDS rejects nonzero
-        // KPS for the same reason: no validated reference layout, no real
-        // evaluation to test against.
-        if kps != 0 {
-            return Err(EndfParseError::UnsupportedFormat(format!(
-                "LRF=7 KPS={kps} != 0 (tabulated penetrability/phase-shift override) \
-                 in spin group with NCH={nch}: NEREIDS does not yet parse nonzero KPS. \
-                 OpenScale itself rejects this case (\"kps > 0 for lrf=7 not yet supported\")."
-            )));
-        }
-
         spin_groups.push(SpinGroup {
             j,
             parity,
             channels,
             resonances,
-            // Nonzero KBK/KPS are rejected above; any spin group that reaches
-            // this point has no background correction recorded.
+            // Nonzero KBK/KPS are rejected at the top of this loop iteration
+            // (immediately after the spin-group CONT is read), so any spin
+            // group that reaches this point has no background correction.
             has_background_correction: false,
         });
     }
@@ -3055,6 +3092,102 @@ mod tests {
                 );
             }
             other => panic!("expected UnsupportedFormat for KPS != 0, got {other:?}"),
+        }
+    }
+
+    /// MF=2 NIS=0 (no isotopes declared) is rejected up-front.
+    ///
+    /// ENDF-6 §2.1 requires NIS >= 1 for a valid resonance evaluation.
+    /// Without the explicit reject, NIS=0 would fall through the per-isotope
+    /// loop (zero iterations), leave the resonance section empty, and trip a
+    /// confusing downstream "unconsumed data lines" / empty-range failure
+    /// far from the actual root cause. The reject mirrors the NIS>1 guard
+    /// pattern so both invalid extremes return a clear UnsupportedFormat.
+    #[test]
+    fn test_parse_endf_rejects_nis_zero() {
+        // Minimal NIS=0 fixture: just the HEAD line with NIS=0. The HEAD's
+        // ZA=74184 (W-184) is a valid identifier, so any error must come
+        // from the NIS=0 guard, not from `isotope_from_za`.
+        // HEAD: ZA=74184, AWR=182, NIS=0
+        const ENDF: &str =
+            " 7.418400+4 1.820000+2          0          0          0          07437 2151    1\n";
+
+        let err = parse_endf_file2(ENDF).unwrap_err();
+        match &err {
+            EndfParseError::UnsupportedFormat(msg) => {
+                assert!(
+                    msg.contains("NIS=0"),
+                    "expected NIS=0 in error message, got: {msg}"
+                );
+                assert!(
+                    msg.contains("NIS >= 1"),
+                    "expected 'NIS >= 1' guidance in error message, got: {msg}"
+                );
+            }
+            other => panic!("expected UnsupportedFormat for NIS=0, got {other:?}"),
+        }
+    }
+
+    /// LRF=7 resonance LIST with N2/NX not divisible by L2/NRS is rejected.
+    ///
+    /// ENDF-6 §2.2.1.6 fixes NX = NRS · ceil((NCH+1)/6), so NX must be an
+    /// integer multiple of NRS (the per-resonance packed-row count is
+    /// constant within a spin group). A fixture with NRS=4 and NX=2 yields
+    /// a fractional stride 6·NX/NRS = 3 floats per resonance, which would
+    /// mis-align the resonance reads. Without the divisibility check, the
+    /// existing `res_npl == 6*nx` guard passes (12 == 6·2) and the
+    /// downstream `res_npl % nrs != 0` would also pass (12 % 4 == 0),
+    /// producing the bogus stride. The new guard catches this directly.
+    #[test]
+    fn test_parse_lrf7_rejects_nx_not_multiple_of_nrs() {
+        const ENDF: &str = concat!(
+            // ── HEAD: ZA=74184, AWR=182, NIS=1 ──────────────────────────────
+            " 7.418400+4 1.820000+2          0          0          1          07437 2151    1\n",
+            // ── Isotope CONT: NER=1 ─────────────────────────────────────────
+            " 7.418400+4 1.000000+0          0          0          1          07437 2151    2\n",
+            // ── Range CONT: LRU=1, LRF=7, NRO=0, NAPS=0 ─────────────────────
+            " 1.000000-5 1.000000+3          1          7          0          07437 2151    3\n",
+            // ── LRF=7 CONT: SPI=0, AP=0.7, IFG=0, KRM=3, NJS=1, KRL=0 ───────
+            " 0.000000+0 7.000000-1          0          3          1          07437 2151    4\n",
+            // ── Particle-pair LIST CONT: NPP=1, N1=12, N2=1 ─────────────────
+            " 0.000000+0 0.000000+0          1          0         12          17437 2151    5\n",
+            " 1.000000+0 1.820000+2 0.000000+0 0.000000+0 5.000000-1 0.000000+07437 2151    6\n",
+            " 0.000000+0 1.000000+0 0.000000+0 2.000000+0 1.000000+0 1.000000+07437 2151    7\n",
+            // ── Spin-group LIST CONT: AJ=0.5, KBK=0, KPS=0, NPL=12, NCH+1=2 ─
+            " 5.000000-1 0.000000+0          0          0         12          27437 2151    8\n",
+            // Header row + 1 channel row.
+            " 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+07437 2151    9\n",
+            " 1.000000+0 0.000000+0 5.000000-1 0.000000+0 7.000000-1 7.000000-17437 2151   10\n",
+            // ── Resonance LIST CONT: NRS=4 (L2), NPL=12 (N1), NX=2 (N2) ─────
+            // Invalid: NX=2 is not a multiple of NRS=4. NPL=6*NX=12 passes
+            // the existing res_npl==6*nx guard; only the new nx%nrs guard
+            // catches this.
+            " 0.000000+0 0.000000+0          0          4         12          27437 2151   11\n",
+            // 12 floats of (would-be) resonance data; never reached since the
+            // reject fires immediately after the resonance LIST CONT.
+            " 1.000000+1 2.500000-2 1.000000-3 0.000000+0 0.000000+0 0.000000+07437 2151   12\n",
+            " 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+07437 2151   13\n",
+        );
+
+        let err = parse_endf_file2(ENDF).unwrap_err();
+        match &err {
+            EndfParseError::UnsupportedFormat(msg) => {
+                assert!(
+                    msg.contains("not a multiple"),
+                    "expected 'not a multiple' in error message, got: {msg}"
+                );
+                assert!(
+                    msg.contains("NX (2)") || msg.contains("(2)"),
+                    "expected NX=2 to appear in error message, got: {msg}"
+                );
+                assert!(
+                    msg.contains("NRS (4)") || msg.contains("(4)"),
+                    "expected NRS=4 to appear in error message, got: {msg}"
+                );
+            }
+            other => {
+                panic!("expected UnsupportedFormat for NX not multiple of NRS, got {other:?}")
+            }
         }
     }
 }
