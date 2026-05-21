@@ -1096,7 +1096,16 @@ fn damped_fisher_stage(
         let free_idx = params.free_indices();
         let n_free = free_idx.len();
         if n_free == 0 {
-            converged = true;
+            // All parameters fixed: we are not optimizing; convergence is
+            // well-defined only if the already-computed deviance at the
+            // current parameters is finite.  If the model returned
+            // non-finite transmission, `binomial_deviance_term` propagates
+            // that as NaN deviance (see the non-finite-T contract at
+            // lines 525-554 / 552), and a non-finite deviance cannot be
+            // reported as a converged fit.  LM applies the same guard in
+            // its `n_free == 0` path at `lm.rs:584-607`; the matching LM
+            // regression is `test_all_fixed_params_nan_model`.
+            converged = d_current.is_finite();
             break;
         }
 
@@ -2508,6 +2517,66 @@ mod tests {
                 // Acceptable: hard error from the initial evaluation.
             }
         }
+    }
+
+    /// All-fixed parameters + NaN transmission must NOT be reported as
+    /// `gn_converged = true`.
+    ///
+    /// The `n_free == 0` shortcut in `damped_fisher_stage` previously set
+    /// `converged = true` unconditionally, so a fit with every parameter
+    /// fixed and a model that returns NaN at active bins would return
+    /// `deviance = NaN` together with `gn_converged = true`.  Downstream
+    /// pipeline code (`pipeline.rs`'s `gn_converged || polish_converged`)
+    /// would then surface that pixel as a "converged" fit in the spatial
+    /// map.  The guard at the top of `damped_fisher_stage` now keys
+    /// convergence off `d_current.is_finite()`.
+    ///
+    /// Mirrors `lm.rs::test_all_fixed_params_nan_model` (issue #125.1),
+    /// which exercises the equivalent guard in
+    /// `levenberg_marquardt_with_mask`.
+    #[test]
+    fn test_joint_poisson_all_fixed_nan_transmission_does_not_converge() {
+        struct NanModel {
+            n_e: usize,
+        }
+        impl FitModel for NanModel {
+            fn evaluate(&self, _params: &[f64]) -> Result<Vec<f64>, FittingError> {
+                Ok(vec![f64::NAN; self.n_e])
+            }
+        }
+
+        let n_bins = 5;
+        let o = vec![10.0; n_bins];
+        let s = vec![5.0; n_bins];
+        let model = NanModel { n_e: n_bins };
+        let obj = JointPoissonObjective {
+            model: &model,
+            o: &o,
+            s: &s,
+            c: 1.0,
+            active_mask: None,
+        };
+        let mut params = ParameterSet::new(vec![FitParameter::fixed("T", 0.5)]);
+        let cfg = JointPoissonFitConfig::default();
+
+        let r = joint_poisson_fit(&obj, &mut params, &cfg).unwrap();
+
+        assert!(
+            r.deviance.is_nan(),
+            "expected NaN deviance from all-fixed NaN model; got {}",
+            r.deviance
+        );
+        assert!(
+            r.deviance_per_dof.is_nan(),
+            "expected NaN deviance_per_dof; got {}",
+            r.deviance_per_dof
+        );
+        assert!(
+            !r.gn_converged,
+            "all-fixed NaN deviance must not be reported as GN-converged",
+        );
+        assert_eq!(r.n_free, 0);
+        assert_eq!(r.n_active, n_bins);
     }
 
     // ==================================================================
