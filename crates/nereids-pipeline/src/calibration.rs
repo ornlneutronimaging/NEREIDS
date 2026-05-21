@@ -30,15 +30,36 @@ const NEUTRON_MASS_CONSTANT: f64 = 0.5 * NEUTRON_MASS_KG / EV_TO_JOULES;
 
 /// Lower / upper bounds (log10) on the `n_total` (areal density,
 /// atoms/barn) search interval for `calibrate_energy`.  The search
-/// runs in `log10(n)` so the three-decade band is sampled with
-/// relative — rather than absolute — resolution.
+/// runs in `log10(n)` so the band is sampled with relative — rather
+/// than absolute — resolution.
+///
+/// The internal search band is `[~5e-6, ~2e-2]` atoms/barn (a third
+/// of a decade beyond each documented edge on either side).  The
+/// boundary-saturation guard (`CALIBRATION_LOG10_BOUNDARY_TOL`,
+/// ≈ 5 % in linear density) trims a sliver off each end, leaving
+/// the *documented* user-supported interval at exactly `[1e-5,
+/// 1e-2]`: the doc-stated edges are inside the tolerance window,
+/// not on it.
 ///
 /// `[1e-5, 1e-2]` covers every realistic VENUS / paper-relevant
 /// density: thin diluted samples down to ~1e-5 atoms/barn (trace
 /// detectability ~ Hf in matrix), the Hf calibration foil at
 /// ~1e-4, and 1 mm metal foils (U, W, Ni) up to ~1e-2 atoms/barn.
-const CALIBRATION_LOG10_N_LO: f64 = -5.0;
-const CALIBRATION_LOG10_N_HI: f64 = -2.0;
+/// Sample densities at the exact documented edges (`1e-5` or
+/// `1e-2`) are accepted because the search band extends ~0.3
+/// decades beyond them — without the buffer, a true optimum at
+/// the documented edge would trip the boundary guard with a
+/// "lies outside the band" diagnostic that contradicted the
+/// docstring.
+const CALIBRATION_LOG10_N_LO: f64 = -5.301; // log10(5e-6)
+const CALIBRATION_LOG10_N_HI: f64 = -1.699; // log10(2e-2)
+
+/// Documented lower / upper edges of the user-supported density
+/// interval in `log10(n)` space (`1e-5` and `1e-2` atoms/barn).
+/// Used only by the error message so the diagnostic states the
+/// edges the user expects to see, not the internal buffered band.
+const CALIBRATION_LOG10_N_LO_DOC: f64 = -5.0;
+const CALIBRATION_LOG10_N_HI_DOC: f64 = -2.0;
 
 /// Tolerance (in `log10(n)` space) at which the golden-section
 /// iteration terminates.  `5e-5` ≈ 0.01 % relative resolution on
@@ -49,8 +70,11 @@ const CALIBRATION_LOG10_N_TOL: f64 = 5e-5;
 /// Tolerance (in `log10(n)` space) for the boundary-saturation
 /// guard.  An optimum within `0.02` of either bound — about 5 %
 /// in linear density — almost always means the true minimum lies
-/// outside `[1e-5, 1e-2]` and the user should be told rather than
-/// silently handed a railed answer.
+/// outside the supported band and the user should be told rather
+/// than silently handed a railed answer.  The internal search band
+/// is widened so the *documented* edges (`1e-5`, `1e-2`) remain
+/// strictly inside the tolerance window even after this margin is
+/// applied.
 const CALIBRATION_LOG10_BOUNDARY_TOL: f64 = 0.02;
 
 /// Golden-section search for the `n_total` that minimises
@@ -139,19 +163,23 @@ pub struct CalibrationResult {
 /// The optimisation runs as three nested coarse → fine → ultra-fine
 /// grid scans on `(L, t₀)`.  At each `(L, t₀)` candidate, the third
 /// parameter `n_total` (total areal density, atoms/barn) is
-/// optimised by **golden-section search in `log10(n)` space** on the
-/// fixed interval `[1e-5, 1e-2]` atoms/barn.  Searching in log space
-/// gives uniform relative resolution across the three-decade band,
-/// which is necessary because realistic samples span from ~1e-5
-/// (trace) to ~1e-2 (1 mm metal foils).
+/// optimised by **golden-section search in `log10(n)` space** over
+/// the documented user-supported interval `[1e-5, 1e-2]`
+/// atoms/barn.  Searching in log space gives uniform relative
+/// resolution across the three-decade band, which is necessary
+/// because realistic samples span from ~1e-5 (trace) to ~1e-2
+/// (1 mm metal foils).
 ///
-/// If the optimum lands within ~5 % (linear) of either density
-/// bound, the function returns
+/// Internally the golden section runs on a slightly wider band
+/// (~5e-6 to ~2e-2) so the boundary-saturation guard's ~5 % linear
+/// tolerance does not exclude a true optimum at the documented
+/// edges; if the optimum lands inside the tolerance window — i.e.
+/// effectively at `1e-5` or `1e-2` — the function returns
 /// `Err(PipelineError::InvalidParameter)` rather than a silent
-/// boundary-saturated answer — a true minimum at the bound almost
-/// always means the real optimum lies outside `[1e-5, 1e-2]` and
-/// the caller should supply a better initial estimate or check
-/// the sample composition.
+/// boundary-saturated answer, because a true minimum at the edge
+/// almost always means the real optimum lies outside the supported
+/// interval and the caller should supply a better initial estimate
+/// or check the sample composition.
 ///
 /// # Arguments
 ///
@@ -492,16 +520,23 @@ pub fn calibrate_energy(
 
     // Boundary-saturation guard: if the n_total optimum lies within
     // tolerance of either density bound, the true minimum almost
-    // certainly sits outside the configured search range and the
+    // certainly sits outside the supported range and the
     // calibration is unreliable.  Returning `Ok` with `best_n` ≈
     // boundary would silently rail the density and let the (L, t₀)
     // parameters absorb the missing density freedom by compensating
     // bias — exactly the silent-failure pattern the post-search
     // chi² guard above also defends against, but with a boundary-
     // specific diagnostic.
+    //
+    // The internal search band is `[~5e-6, ~2e-2]`; the documented
+    // edges are `[1e-5, 1e-2]`.  Densities at the documented edges
+    // lie outside the tolerance window (a true optimum at `1e-5`
+    // sits ~0.3 decades above the internal lower bound, comfortably
+    // past the ~0.02-log10 tolerance) so the guard fires only when
+    // the optimum has actually saturated against the wider buffer.
     let log_best_n = best_n.log10();
-    let n_lo = 10f64.powf(CALIBRATION_LOG10_N_LO);
-    let n_hi = 10f64.powf(CALIBRATION_LOG10_N_HI);
+    let n_lo = 10f64.powf(CALIBRATION_LOG10_N_LO_DOC);
+    let n_hi = 10f64.powf(CALIBRATION_LOG10_N_HI_DOC);
     if (log_best_n - CALIBRATION_LOG10_N_LO).abs() < CALIBRATION_LOG10_BOUNDARY_TOL
         || (CALIBRATION_LOG10_N_HI - log_best_n).abs() < CALIBRATION_LOG10_BOUNDARY_TOL
     {
@@ -1133,22 +1168,17 @@ mod tests {
     }
 
     /// Near-lower-edge density: `true_n = 2e-5` sits just inside the
-    /// `[1e-5, 1e-2]` search band — approximately 0.3 decades (a factor
-    /// of 2) above the lower bound, comfortably outside the boundary
-    /// guard's `5 %`-linear tolerance window around `1e-5`.
-    /// Recovery must succeed; the test name keeps `1e_5` for
-    /// continuity with the audit checklist, but the chosen density
-    /// is deliberately above the boundary tolerance so the search
-    /// terminates inside the band and the guard does not fire.
-    /// Note the 30 % relative tolerance — at this low density the
-    /// chi² landscape is shallow (single-resonance synthetic, weak
-    /// signal), so the recovered density can drift further from the
-    /// true value than at mid-band; the test still meaningfully
-    /// distinguishes "we found roughly the right decade" from the
-    /// old behaviour of being unable to reach the value at all.
-    /// The `test_calibrate_energy_boundary_saturation_error` test
-    /// separately verifies the guard fires for genuinely-out-of-band
-    /// densities.
+    /// `[1e-5, 1e-2]` documented user-supported interval — approximately
+    /// 0.3 decades (a factor of 2) above the lower documented edge,
+    /// comfortably outside the boundary guard's `5 %`-linear tolerance
+    /// window.  Recovery must succeed.  Note the 30 % relative tolerance —
+    /// at this low density the chi² landscape is shallow (single-resonance
+    /// synthetic, weak signal), so the recovered density can drift further
+    /// from the true value than at mid-band; the test still meaningfully
+    /// distinguishes "we found roughly the right decade" from the old
+    /// behaviour of being unable to reach the value at all.  The
+    /// `test_calibrate_energy_boundary_saturation_error` test separately
+    /// verifies the guard fires for genuinely-out-of-band densities.
     #[test]
     fn test_calibrate_energy_recovers_density_1e_5() {
         let true_n = 2e-5;
@@ -1159,6 +1189,68 @@ mod tests {
             "n: got {}, expected {}",
             result.total_density,
             true_n,
+        );
+        assert!(result.reduced_chi_squared.is_finite());
+    }
+
+    /// Documented lower bound: `true_n = 1.0e-5` atoms/barn is exactly
+    /// the lower edge promised by the `calibrate_energy` rustdoc.  Before
+    /// the search-band widening the boundary-saturation guard's
+    /// `~5 %`-linear tolerance trimmed a sliver off either side and
+    /// rejected truly-at-the-edge optima with a "true optimum likely
+    /// lies outside this band" diagnostic that contradicted the docs.
+    /// With the internal band widened to `[~5e-6, ~2e-2]`, an optimum
+    /// at the documented edge sits ~0.3 decades inside the buffer and
+    /// is accepted — the user-facing contract here is that the call
+    /// returns `Ok(_)` (no boundary-saturation error) and recovers a
+    /// density close to truth in log-space, not that the recovered
+    /// value is bit-exactly bounded by the documented interval: chi²
+    /// minimisation can land slightly outside `[1e-5, 1e-2]` even when
+    /// the true density sits at the edge, and that is correct
+    /// behaviour for a smooth optimisation landscape.
+    #[test]
+    fn test_calibrate_energy_accepts_density_at_documented_lower_bound() {
+        let true_n = 1.0e-5;
+        let result = calibrate_round_trip_at_density(true_n)
+            .expect("calibration at the documented lower edge 1e-5 must succeed");
+        // Log-space tolerance because the chi² landscape is shallow at
+        // this trace density (single-resonance synthetic, weak signal):
+        // a recovered-vs-truth ratio of 2× corresponds to 0.3 in
+        // log10(n) and is the empirically reasonable precision floor.
+        let log_err = (result.total_density.log10() - true_n.log10()).abs();
+        assert!(
+            log_err < 0.3,
+            "log10(n) error {log_err} too large; recovered {} vs truth {true_n}",
+            result.total_density,
+        );
+        assert!(result.reduced_chi_squared.is_finite());
+    }
+
+    /// Documented upper bound: `true_n = 1.0e-2` atoms/barn is exactly
+    /// the upper edge promised by `calibrate_energy`'s rustdoc — the
+    /// `1 mm metal foil` use case that drives the SoftwareX paper's
+    /// calibration narrative.  Sister test to
+    /// `test_calibrate_energy_accepts_density_at_documented_lower_bound`;
+    /// the search-band widening keeps the upper documented edge inside
+    /// the boundary guard's tolerance buffer.  As with the lower-bound
+    /// test, the assertion is on chi²-resolution recovery (log-space
+    /// proximity to truth), not on hard-bounding the result inside
+    /// `[1e-5, 1e-2]` — a smooth optimum at the edge can land just
+    /// outside without indicating any defect.
+    #[test]
+    fn test_calibrate_energy_accepts_density_at_documented_upper_bound() {
+        let true_n = 1.0e-2;
+        let result = calibrate_round_trip_at_density(true_n)
+            .expect("calibration at the documented upper edge 1e-2 must succeed");
+        // Tighter log-space tolerance than the lower edge: at this
+        // high density the resonance is saturated, the chi²
+        // landscape is sharp and the (L, t₀, n) trade-off basin is
+        // narrow.  log_err < 0.05 ≈ 12 % linear is comfortable.
+        let log_err = (result.total_density.log10() - true_n.log10()).abs();
+        assert!(
+            log_err < 0.05,
+            "log10(n) error {log_err} too large; recovered {} vs truth {true_n}",
+            result.total_density,
         );
         assert!(result.reduced_chi_squared.is_finite());
     }

@@ -120,7 +120,8 @@ pub struct SpatialResult {
 // ── Phase 3: InputData3D + spatial_map_typed ─────────────────────────────
 
 use crate::pipeline::{
-    InputData, SolverConfig, UnifiedFitConfig, fit_spectrum_typed, validate_transmission_background,
+    InputData, SolverConfig, UnifiedFitConfig, count_free_params, fit_spectrum_typed,
+    required_active_bins, validate_transmission_background,
 };
 
 /// 3D input data for spatial mapping.
@@ -257,14 +258,22 @@ fn validate_spatial_fit_preflight(
         ));
     }
 
-    // Gate: `fit_energy_range` selects < 2 active bins on the
-    // configured grid.  The active-mask + grid are shared by every
-    // pixel, so the per-pixel `n_active < 2` rejection in the LM
-    // transmission path (`pipeline.rs::fit_transmission_lm`) and the
-    // joint-Poisson path (`pipeline.rs::fit_counts_joint_poisson`)
-    // both fire identically across the map.  We keep the same path-
-    // specific phrasing so the surfaced diagnostic matches the
-    // single-spectrum entry point's message.
+    // Gate: `fit_energy_range` selects fewer active bins than the
+    // dispatch can solve.  The active-mask + grid are shared by every
+    // pixel, so the per-pixel `n_active < required` rejection in the
+    // LM transmission path (`pipeline.rs::fit_transmission_lm`) and
+    // the joint-Poisson path (`pipeline.rs::fit_counts_joint_poisson`)
+    // both fire identically across the map.  We compute `required`
+    // from the config's free-parameter count (densities + temperature
+    // + energy-scale + transmission_background flags), clamped to a
+    // floor of 2 — that combined `max(2, n_free)` covers both the
+    // numerical-stability minimum and the underdetermined-system
+    // rejection.  Without the `n_free` factor, a config with
+    // multiple densities + background terms + temperature + energy-
+    // scale (n_free can reach ~10) would silently pass the preflight
+    // with a 3-bin window and every pixel would return non-converged
+    // / NaN — the all-NaN spatial-result class this preflight exists
+    // to prevent.  See [`required_active_bins`] in `pipeline.rs`.
     if let Some((e_min, e_max)) = config.fit_energy_range() {
         let active_mask = nereids_fitting::active_mask::build_active_mask(
             config.energies(),
@@ -274,7 +283,8 @@ fn validate_spatial_fit_preflight(
             active_mask.as_deref(),
             config.energies().len(),
         );
-        if n_active < 2 {
+        let required = required_active_bins(config);
+        if n_active < required {
             // Mirror the per-pixel string from whichever path the
             // dispatcher would actually take.  LM and joint-Poisson
             // both reach this branch; transmission + Poisson-KL is
@@ -286,8 +296,10 @@ fn validate_spatial_fit_preflight(
             };
             return Err(PipelineError::InvalidParameter(format!(
                 "fit_energy_range [{e_min}, {e_max}] eV selects {n_active} active bin(s) \
-                 on the configured energy grid; at least 2 active bins are required \
-                 for {path_msg} fitting"
+                 on the configured energy grid; at least {required} active bin(s) are \
+                 required for {path_msg} fitting with {n_free} free parameter(s) \
+                 (underdetermined when n_active < n_free)",
+                n_free = count_free_params(config),
             )));
         }
     }
@@ -3364,6 +3376,70 @@ mod tests {
         assert!(
             msg.contains("B_A") && msg.contains("fit_back_a"),
             "error must name the B_A requirement, got: {msg}"
+        );
+    }
+
+    /// Underdetermined-system rejection: a `fit_energy_range` window
+    /// that selects fewer active bins than the dispatch has free
+    /// parameters must be rejected up-front with a diagnostic that
+    /// names the underdetermined condition.  Before this guard, a
+    /// config with many free params (densities + temperature +
+    /// background) and a too-narrow window passed the old
+    /// `n_active < 2` floor but every per-pixel fit returned
+    /// non-converged, producing the silent all-NaN spatial result
+    /// that the rest of the preflight exists to eliminate.
+    #[test]
+    fn test_spatial_map_rejects_underdetermined_fit_range() {
+        let rd = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        let (t_3d, u_3d) = synthetic_4x4_transmission(&rd, 0.001, &energies);
+        let data = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+        // Free-parameter count for this config:
+        //   1 density + fit_temperature (=1) + fit_anorm + fit_back_a
+        //   + fit_back_b + fit_back_c (=4 background flags from the
+        //   BackgroundConfig::default())  →  n_free = 6.
+        // The fit_energy_range window [5.0, 5.5] picks up the grid
+        // points 5.0, 5.2, 5.4 → 3 active bins, comfortably above
+        // the legacy `n_active < 2` floor but below `n_free`, so the
+        // problem is structurally underdetermined and the LM core
+        // would return `converged=false` for every pixel.
+        let bg = crate::pipeline::BackgroundConfig::default();
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![rd],
+            vec!["U-238".into()],
+            // fit_temperature requires temperature_k >= 1.0; pick a
+            // physically reasonable value so the temperature gate
+            // does not pre-empt the underdetermined-system gate.
+            293.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
+        .with_fit_temperature(true)
+        .with_transmission_background(bg)
+        .with_fit_energy_range(Some((5.0, 5.5)))
+        .unwrap();
+
+        let err = spatial_map_typed(&data, &config, None, None, None)
+            .expect_err("underdetermined fit_energy_range must be rejected up-front");
+        let msg = err.to_string();
+        assert!(
+            matches!(err, PipelineError::InvalidParameter(_)),
+            "expected InvalidParameter, got {err:?}"
+        );
+        // Diagnostic must name both the active-bin count and the
+        // free-parameter requirement so the user can see *why* their
+        // window is too narrow.
+        assert!(
+            msg.contains("active bin")
+                && msg.contains("free parameter")
+                && msg.contains("underdetermined"),
+            "error must explain the underdetermined condition, got: {msg}"
         );
     }
 }
