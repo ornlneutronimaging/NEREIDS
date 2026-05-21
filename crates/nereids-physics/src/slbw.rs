@@ -622,11 +622,16 @@ mod tests {
         // Γ_n(E) = Γ_n(E_r) · P_l(E)/P_l(E_r) (no extra √(E/E_r) factor;
         // see module docstring). No broadening kernel is applied on either
         // side — both are evaluated on the same unbroadened energy grid, so
-        // Doppler is not a source of discrepancy here. The residual we expect
-        // for a single isolated s-wave resonance is the algebraic difference
-        // between RM's 3×3 channel-matrix denominator and SLBW's scalar
-        // (E − E_r) − iΓ/2 denominator, plus the MLBW interference term
-        // (single-level vs multi-level summation) — collectively much smaller
+        // Doppler is not a source of discrepancy here.
+        //
+        // For a single isolated resonance there is no multi-level interference
+        // contribution: MLBW summation degenerates to SLBW when only one
+        // resonance is present (the cross-resonance interference terms in
+        // SAMMY `mlb/mmlb3.f90` vanish term-by-term). The residual we expect
+        // is therefore purely the algebraic difference between RM's
+        // channel-matrix denominator det(I − K) (3×3 here: elastic + capture +
+        // two fission channels collapse to elastic + capture for Γ_f = 0) and
+        // SLBW's scalar (E − E_r) − iΓ/2 denominator. This is much smaller
         // than the ~10-15 % gap the previous comment claimed, which was a
         // symptom of a double-counted velocity factor that has since been
         // removed.
