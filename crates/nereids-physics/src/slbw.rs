@@ -620,10 +620,16 @@ mod tests {
         // Compare at several energies near the resonance peak.
         // Both formalisms apply the ENDF-6 §D.1.1 eq D.7 energy dependence
         // Γ_n(E) = Γ_n(E_r) · P_l(E)/P_l(E_r) (no extra √(E/E_r) factor;
-        // see module docstring), so for a single isolated s-wave resonance
-        // they should agree to within Doppler/MLBW-vs-SLBW differences,
-        // not by ~10-15 % as the previous comment claimed (that gap was
-        // a symptom of a double-counted velocity factor, now removed).
+        // see module docstring). No broadening kernel is applied on either
+        // side — both are evaluated on the same unbroadened energy grid, so
+        // Doppler is not a source of discrepancy here. The residual we expect
+        // for a single isolated s-wave resonance is the algebraic difference
+        // between RM's 3×3 channel-matrix denominator and SLBW's scalar
+        // (E − E_r) − iΓ/2 denominator, plus the MLBW interference term
+        // (single-level vs multi-level summation) — collectively much smaller
+        // than the ~10-15 % gap the previous comment claimed, which was a
+        // symptom of a double-counted velocity factor that has since been
+        // removed.
         for &e in &[6.5, 6.674, 7.0] {
             let rm = reich_moore::cross_sections_at_energy(&rm_data, e);
             let slbw = slbw_cross_sections(&slbw_data, e);

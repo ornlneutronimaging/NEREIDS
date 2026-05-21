@@ -74,7 +74,14 @@ impl fmt::Display for DopplerParamsError {
 impl std::error::Error for DopplerParamsError {}
 
 /// Errors from Doppler broadening computation (not parameter construction).
+///
+/// Marked `#[non_exhaustive]` because this enum is publicly exported from
+/// `nereids-physics` and may grow new validation variants over time (e.g. if
+/// future contracts add bounds on AWR/energy combinations). Without the
+/// attribute, adding a variant would be a SemVer-breaking change for any
+/// downstream crate that exhaustively matches on `DopplerError`.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum DopplerError {
     /// Energy and cross-section arrays have different lengths.
     LengthMismatch {
@@ -127,8 +134,7 @@ impl fmt::Display for DopplerError {
             ),
             Self::InvalidEnergy { index, value } => write!(
                 f,
-                "energies[{index}] = {value} is not finite or not strictly positive \
-                 (Doppler broadening requires every energy to satisfy is_finite() && > 0)"
+                "energies[{index}] = {value} is not finite or not strictly positive (Doppler broadening requires every energy to satisfy is_finite() && > 0)"
             ),
             Self::UnsortedEnergies {
                 index,
@@ -136,9 +142,7 @@ impl fmt::Display for DopplerError {
                 current,
             } => write!(
                 f,
-                "energies[{index}] = {current} is not strictly greater than \
-                 energies[{}] = {previous} (Doppler broadening requires the \
-                 energy grid to be strictly ascending)",
+                "energies[{index}] = {current} is not strictly greater than energies[{}] = {previous} (Doppler broadening requires the energy grid to be strictly ascending)",
                 index.saturating_sub(1)
             ),
         }
@@ -799,6 +803,48 @@ fn interpolate_cross_section(energies: &[f64], cross_sections: &[f64], energy: f
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- DopplerError Display rendering tests ---
+    //
+    // The Display impls use single-line format-string literals to avoid
+    // embedding indentation into the rendered error messages. These tests
+    // pin that contract: a stray `\<newline>    ` continuation in the
+    // literal would silently inject a run of spaces into the user-facing
+    // string and would only be caught by eyeballing log output.
+
+    #[test]
+    fn test_doppler_error_display_no_embedded_indentation() {
+        let e = DopplerError::InvalidEnergy {
+            index: 1,
+            value: f64::NAN,
+        };
+        let rendered = format!("{e}");
+        assert!(
+            !rendered.contains("  "),
+            "InvalidEnergy Display contains double-space (embedded indentation?): {rendered:?}"
+        );
+
+        let e = DopplerError::UnsortedEnergies {
+            index: 3,
+            previous: 4.0,
+            current: 2.5,
+        };
+        let rendered = format!("{e}");
+        assert!(
+            !rendered.contains("  "),
+            "UnsortedEnergies Display contains double-space (embedded indentation?): {rendered:?}"
+        );
+
+        let e = DopplerError::LengthMismatch {
+            energies: 5,
+            cross_sections: 4,
+        };
+        let rendered = format!("{e}");
+        assert!(
+            !rendered.contains("  "),
+            "LengthMismatch Display contains double-space (embedded indentation?): {rendered:?}"
+        );
+    }
 
     // --- DopplerParams::new() validation tests ---
 
