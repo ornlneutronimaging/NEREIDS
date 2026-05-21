@@ -1616,9 +1616,18 @@ class TestVenusMlbwRegression:
         # Linux CI / macOS dev / any future backend, but orders of
         # magnitude tighter than the ~33 % MLBW dispatch error this gate
         # is meant to catch.
-        EXPECTED_DENSITY = 0.00011222100300548643
-        EXPECTED_CHI2_R = 218950.98638784938
-        EXPECTED_ITERATIONS = 27
+        #
+        # Baseline regenerated after NV-1 SLBW/MLBW velocity-factor fix
+        # (issue #568): the buggy MLBW had Γ_n(E) ∝ E for s-wave instead
+        # of ∝ √E per ENDF-6 §D.1.1 eq D.7. After removing the extra
+        # √(E/E_r) factor at slbw.rs:314 / :427, MLBW σ in the wings is
+        # larger, so the LM fit on aggregated Hf-177 converges at a
+        # ~28 % lower density (1.122e-4 → 8.110e-5 atoms/barn) — the
+        # physically correct direction. Iteration count also dropped
+        # (27 → 14) because the corrected objective is less ill-conditioned.
+        EXPECTED_DENSITY = 8.110428369849131e-05
+        EXPECTED_CHI2_R = 219657.76973394692
+        EXPECTED_ITERATIONS = 14
 
         FLOAT_TOL = pytest.approx
         assert float(result.densities[0]) == FLOAT_TOL(EXPECTED_DENSITY, rel=1e-6), (

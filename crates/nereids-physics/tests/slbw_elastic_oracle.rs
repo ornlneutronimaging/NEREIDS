@@ -96,8 +96,10 @@ fn oracle_elastic_swave_single_resonance(data: &ResonanceData, energy_ev: f64) -
     let rho_r = rho(res.energy.abs(), awr, radius_r);
     let p_l_r = penetrability(0, rho_r);
 
-    // Γ_n(E) = Γ_n(E_r) · √(E/E_r) · P_l(E)/P_l(E_r)
-    let gamma_n = res.gn.abs() * (energy_ev / res.energy.abs()).sqrt() * p_l_e / p_l_r;
+    // Γ_n(E) = Γ_n(E_r) · P_l(E)/P_l(E_r) per ENDF-6 §D.1.1 eq D.7.
+    // The penetrability ratio already carries the full √E dependence
+    // for s-wave; an extra √(E/E_r) multiplier would double-count it.
+    let gamma_n = res.gn.abs() * p_l_e / p_l_r;
     let gamma_total = gamma_n + res.gg + res.gfa.abs() + res.gfb.abs();
 
     let de = energy_ev - res.energy;

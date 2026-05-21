@@ -2667,18 +2667,27 @@ fn test_tr129a_pu242_endf_total_xs() {
         "raa.plt",
     );
     // Pu-242: SLBW (LRF=1), total cross-section, no broadening.
-    // Known limitation: SLBW potential scattering differs from SAMMY at
-    // very low energies.  ENDF has NER=2 (RRR+URR) but only RRR is used.
+    // ENDF has NER=2 (RRR+URR) but only RRR is used in this comparison.
+    // After removing the double-counted √(E/E_r) velocity factor from
+    // Γ_n(E) per ENDF-6 §D.1.1 eq D.7 (matches NJOY/RECONR + SAMMY),
+    // mean error dropped from ~0.13 to ~0.003 and max from ~0.96 to ~0.013.
+    // Threshold tightened ~50× to lock in the improvement.
     assert!(!rd.ranges.is_empty());
     let result = validate_unbroadened_with_resonance_data(&rd, &plt, 0.05);
     eprintln!(
         "tr129a Pu242: max_rel={:.6}, mean_rel={:.6}, n={}, worst@{:.4} keV",
         result.max_rel_error, result.mean_rel_error, result.n_points, result.worst_energy_kev
     );
+    // Measured post-fix: mean ≈ 0.003, max ≈ 0.013.
     assert!(
-        result.mean_rel_error < 0.60,
-        "mean {:.4} > 60%",
+        result.mean_rel_error < 0.01,
+        "mean {:.4} > 1% (regression: velocity-factor double-count or worse)",
         result.mean_rel_error
+    );
+    assert!(
+        result.max_rel_error < 0.05,
+        "max {:.4} > 5% (regression: velocity-factor double-count or worse)",
+        result.max_rel_error
     );
 }
 
@@ -2691,26 +2700,28 @@ fn test_tr129c_na23_endf_total_xs() {
         "rcc.plt",
     );
     // Na-23: MLBW (LRF=2), total cross-section.
-    // True MLBW (coherent U-matrix) now implemented.  Only 3 reference points
-    // at coarse energies — agreement with SAMMY MLBW needs investigation
-    // for closely-spaced Na-23 resonances.  Track separately rather than
-    // using a loose threshold that hides real discrepancies.
+    // True MLBW (coherent U-matrix) implemented.  Only 3 reference points
+    // at coarse energies.  After removing the double-counted √(E/E_r)
+    // velocity factor from the MLBW Γ_n(E) formula (ENDF-6 §D.1.1 eq D.7,
+    // §D.1.2 says MLBW uses same conversion), mean error dropped from
+    // ~0.45 to ~0.002 and max from ~0.50 to ~0.004 — well within SAMMY's
+    // own ENDF reconstruction noise on this coarse 3-point grid.
     assert!(!rd.ranges.is_empty());
     let result = validate_unbroadened_with_resonance_data(&rd, &plt, 0.05);
     eprintln!(
         "tr129c Na23: max_rel={:.6}, mean_rel={:.6}, n={}, worst@{:.4} keV",
         result.max_rel_error, result.mean_rel_error, result.n_points, result.worst_energy_kev
     );
-    // TODO: MLBW Na-23 needs fine-grained comparison against SAMMY at
-    // resonance energies, not just 3 coarse points.  The current 45% mean
-    // error at 3 points may be dominated by a single high-energy point
-    // where URR contribution (not yet implemented) matters.
-    // Temporarily relax threshold to avoid blocking other fixes, but
-    // this MUST be investigated.
+    // Measured post-fix: mean ≈ 0.002, max ≈ 0.004.
     assert!(
-        result.mean_rel_error < 0.50,
-        "mean {:.4} > 50%",
+        result.mean_rel_error < 0.01,
+        "mean {:.4} > 1% (regression: velocity-factor double-count or worse)",
         result.mean_rel_error
+    );
+    assert!(
+        result.max_rel_error < 0.05,
+        "max {:.4} > 5% (regression: velocity-factor double-count or worse)",
+        result.max_rel_error
     );
 }
 
@@ -2737,18 +2748,24 @@ fn test_tr129g_am241_endf_total_xs() {
         "tape135_9543_2",
         "rgg.plt",
     );
-    // Am-241: MLBW (LRF=2), total cross-section.
-    // Known limitation: SLBW/MLBW potential scattering at very low energies
-    // differs from SAMMY (only 6 reference points).
+    // Am-241: MLBW (LRF=2), total cross-section, 6 reference points.
+    // After removing the double-counted √(E/E_r) velocity factor, mean
+    // error dropped from ~0.27 to ~0.19 and max from ~0.96 to ~0.76 —
+    // significant improvement but a residual MLBW/URR-coupling
+    // discrepancy remains (likely the URR contribution Am-241 has in
+    // NER=2 but this NEREIDS path does not yet include). Threshold
+    // tightened to 0.30 (mean) to lock in the velocity-factor portion
+    // of the improvement without blocking other work on the residual.
     assert!(!rd.ranges.is_empty());
     let result = validate_unbroadened_with_resonance_data(&rd, &plt, 0.05);
     eprintln!(
         "tr129g Am241: max_rel={:.6}, mean_rel={:.6}, n={}, worst@{:.4} keV",
         result.max_rel_error, result.mean_rel_error, result.n_points, result.worst_energy_kev
     );
+    // Measured post-fix: mean ≈ 0.19, max ≈ 0.76.
     assert!(
-        result.mean_rel_error < 0.80,
-        "mean {:.4} > 80%",
+        result.mean_rel_error < 0.30,
+        "mean {:.4} > 30% (regression: velocity-factor double-count or worse)",
         result.mean_rel_error
     );
 }
