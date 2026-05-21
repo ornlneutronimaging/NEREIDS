@@ -948,11 +948,18 @@ pub fn joint_poisson_fit(
     let gn_converged = stage1.converged;
 
     // Stage 2: Nelder-Mead polish on free parameters, seeded from stage-1 θ.
+    //
+    // Guard against the all-fixed configuration: `nelder_mead_minimize`
+    // requires a non-empty `x0` (asserts in `nelder_mead.rs`).  When every
+    // parameter is fixed there is nothing to polish, so skip stage 2 and
+    // leave the polish flags at their default `false` values.  This path
+    // is reachable from pipeline callers that pin all params and set
+    // `with_counts_enable_polish(Some(true))`.
     let mut polish_iterations = 0usize;
     let mut polish_converged = false;
     let mut polish_improved = false;
-    if config.enable_polish {
-        let free_idx = params.free_indices();
+    let free_idx = params.free_indices();
+    if config.enable_polish && !free_idx.is_empty() {
         let bounds: Vec<(f64, f64)> = free_idx
             .iter()
             .map(|&i| (params.params[i].lower, params.params[i].upper))
@@ -1100,11 +1107,11 @@ fn damped_fisher_stage(
             // well-defined only if the already-computed deviance at the
             // current parameters is finite.  If the model returned
             // non-finite transmission, `binomial_deviance_term` propagates
-            // that as NaN deviance (see the non-finite-T contract at
-            // lines 525-554 / 552), and a non-finite deviance cannot be
-            // reported as a converged fit.  LM applies the same guard in
-            // its `n_free == 0` path at `lm.rs:584-607`; the matching LM
-            // regression is `test_all_fixed_params_nan_model`.
+            // that as NaN deviance (see the non-finite-T contract documented
+            // on `binomial_deviance_term`), and a non-finite deviance cannot
+            // be reported as a converged fit.  LM applies the same guard in
+            // the `n_free == 0` branch of `levenberg_marquardt_with_mask`;
+            // the matching LM regression is `test_all_fixed_params_nan_model`.
             converged = d_current.is_finite();
             break;
         }
@@ -2577,6 +2584,85 @@ mod tests {
         );
         assert_eq!(r.n_free, 0);
         assert_eq!(r.n_active, n_bins);
+        // The damped-Fisher loop increments `iter` before the `n_free == 0`
+        // branch hits `break`, so the all-fixed path always reports exactly
+        // one iteration.  Lock that in so future loop refactors don't
+        // silently drift the iteration count.
+        assert_eq!(
+            r.gn_iterations, 1,
+            "all-fixed branch should report exactly one iteration",
+        );
+    }
+
+    /// Companion to [`test_joint_poisson_all_fixed_nan_transmission_does_not_converge`]
+    /// covering the polish-enabled path.
+    ///
+    /// `nelder_mead_minimize` asserts that `x0` is non-empty (see
+    /// `nelder_mead.rs`), which used to panic when stage 2 was invoked with
+    /// every parameter fixed.  The polish entry-point now short-circuits on
+    /// `free_indices().is_empty()`, so the call must return cleanly with
+    /// `polish_converged == false` and the stage-1 NaN deviance preserved.
+    /// Mirrors the pipeline configuration in `nereids-pipeline` where
+    /// `with_counts_enable_polish(Some(true))` is set independently of
+    /// whether the parameter set has any free entries.
+    #[test]
+    fn test_joint_poisson_all_fixed_nan_transmission_with_polish_does_not_panic() {
+        struct NanModel {
+            n_e: usize,
+        }
+        impl FitModel for NanModel {
+            fn evaluate(&self, _params: &[f64]) -> Result<Vec<f64>, FittingError> {
+                Ok(vec![f64::NAN; self.n_e])
+            }
+        }
+
+        let n_bins = 5;
+        let o = vec![10.0; n_bins];
+        let s = vec![5.0; n_bins];
+        let model = NanModel { n_e: n_bins };
+        let obj = JointPoissonObjective {
+            model: &model,
+            o: &o,
+            s: &s,
+            c: 1.0,
+            active_mask: None,
+        };
+        let mut params = ParameterSet::new(vec![FitParameter::fixed("T", 0.5)]);
+        let cfg = JointPoissonFitConfig {
+            enable_polish: true,
+            ..JointPoissonFitConfig::default()
+        };
+
+        // Must not panic — the empty-x0 guard short-circuits stage 2.
+        let r = joint_poisson_fit(&obj, &mut params, &cfg).unwrap();
+
+        assert!(
+            r.deviance.is_nan(),
+            "expected NaN deviance from all-fixed NaN model; got {}",
+            r.deviance
+        );
+        assert!(
+            !r.gn_converged,
+            "all-fixed NaN deviance must not be reported as GN-converged",
+        );
+        assert!(
+            !r.polish_converged,
+            "polish stage must report not-converged when skipped on all-fixed params",
+        );
+        assert!(
+            !r.polish_improved,
+            "polish stage cannot have improved the deviance when it was skipped",
+        );
+        assert_eq!(
+            r.polish_iterations, 0,
+            "polish stage must report zero iterations when skipped",
+        );
+        assert_eq!(r.n_free, 0);
+        assert_eq!(r.n_active, n_bins);
+        assert_eq!(
+            r.gn_iterations, 1,
+            "all-fixed branch should report exactly one iteration",
+        );
     }
 
     // ==================================================================
