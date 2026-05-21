@@ -39,8 +39,24 @@
 //!                − 2·Γ_n(E)·Γ_tot·sin²φ / D                 (interference, Γ part)
 //!              ]
 //!
-//! where Γ_n(E) = Γ_n(E_r) × √(E/E_r) × P_l(E)/P_l(E_r)
-//! and Γ_tot = Γ_n(E) + Γ_γ + Γ_f.
+//! where Γ_n(E) = Γ_n(E_r) × P_l(E)/P_l(E_r) per ENDF-6 §D.1.1 eq D.7
+//! (ENDF-102 Formats Manual, IAEA public PDF page 357), and
+//! Γ_tot = Γ_n(E) + Γ_γ + Γ_f.
+//!
+//! The penetrability ratio already carries the full energy dependence of
+//! the neutron width. For s-wave (l=0), P_0(ρ) = ρ ∝ √E, so the ratio
+//! P_0(E)/P_0(E_r) = √(E/E_r) supplies the entire √E low-energy scaling;
+//! multiplying by a separate √(E/E_r) factor double-counts the wave-number
+//! dependence and yields Γ_n ∝ E rather than the physically correct
+//! Γ_n ∝ √E (1/v capture). The reference implementations all use the
+//! penetrability-ratio-only form:
+//!
+//! - NJOY/RECONR `src/reconr.f90` `csslbw`/`csmlbw`/`csmlbw2`:
+//!   `gne = gn*pe*rper` (with `rper = 1/per`).
+//! - SAMMY `mlb/mmlb4.f90` `Abpart_Mlb` (lines 88-100) accumulates
+//!   `Γ_n(E) = 2·P_l(E)·γ_n²` from reduced amplitudes `γ_n` obtained via
+//!   `γ_n² = GN/(2·P_l(E_r))` (SAMMY `new/mnew3.f90:307-339` `Betset`),
+//!   which is algebraically identical to ENDF D.7 after substitution.
 //!
 //! The sign of the `Γ_tot·sin²φ` interference term is negative. This is
 //! equivalent to SAMMY's `(1 − cos2φ)·A + sin2φ·B + Aaathr·D` form at
@@ -63,8 +79,9 @@ use crate::reich_moore::{CrossSections, PrecomputedJGroup, group_resonances_by_j
 
 // ─── Per-resonance precomputed invariants for SLBW ────────────────────────────
 //
-// In SLBW, the energy-dependent neutron width is:
-//   Γ_n(E) = Γ_n(E_r) × √(E/E_r) × P_l(E)/P_l(E_r)
+// In SLBW, the energy-dependent neutron width is (ENDF-6 §D.1.1 eq D.7,
+// matching NJOY/RECONR `csslbw`/`csmlbw` and SAMMY `mlb/mmlb4.f90:88-100`):
+//   Γ_n(E) = Γ_n(E_r) × P_l(E)/P_l(E_r)
 //
 // The quantities that depend only on resonance parameters (not on E):
 //   - P_l(E_r): penetrability at resonance energy
@@ -307,11 +324,16 @@ pub(crate) fn slbw_evaluate_with_cached_jgroups(
         for res in &jg.resonances {
             let e_r = res.energy;
 
-            // Energy-dependent neutron width:
-            // Γ_n(E) = Γ_n(E_r) × √(E/E_r) × P_l(E)/P_l(E_r)
+            // Energy-dependent neutron width (ENDF-6 §D.1.1 eq D.7):
+            //   Γ_n(E) = Γ_n(E_r) × P_l(E)/P_l(E_r)
+            // The penetrability ratio already carries the full √E (s-wave)
+            // velocity dependence; an extra √(E/E_r) multiplier would
+            // double-count the wave-number factor (see module docstring).
+            // Matches NJOY/RECONR `csslbw` `gne = gn*pe*rper` and SAMMY
+            // `mlb/mmlb4.f90:88-100` after the reduced-amplitude substitution.
             // P_l(E_r) is pre-computed in res.p_at_er (Issue #87).
             let gamma_n = if e_r.abs() > PIVOT_FLOOR && res.p_at_er > PIVOT_FLOOR {
-                res.gn_abs * (energy_ev / e_r.abs()).sqrt() * p_at_e / res.p_at_er
+                res.gn_abs * p_at_e / res.p_at_er
             } else {
                 0.0
             };
@@ -423,8 +445,11 @@ pub(crate) fn mlbw_evaluate_with_cached_jgroups(
 
         for res in &jg.resonances {
             let e_r = res.energy;
+            // Energy-dependent neutron width (ENDF-6 §D.1.1 eq D.7;
+            // section D.1.2 states MLBW uses the same width conversion as
+            // SLBW). Matches NJOY/RECONR `csmlbw` `gne = gn*pe*rper`.
             let gamma_n = if e_r.abs() > PIVOT_FLOOR && res.p_at_er > PIVOT_FLOOR {
-                res.gn_abs * (energy_ev / e_r.abs()).sqrt() * p_at_e / res.p_at_er
+                res.gn_abs * p_at_e / res.p_at_er
             } else {
                 0.0
             };
@@ -593,10 +618,12 @@ mod tests {
         };
 
         // Compare at several energies near the resonance peak.
-        // Note: RM and SLBW differ in how they handle energy-dependent
-        // neutron widths away from the peak. SLBW includes an extra √(E/E_r)
-        // velocity factor in Γ_n(E), leading to ~10-15% differences in the
-        // resonance wings. At the peak and very near it, they agree well.
+        // Both formalisms apply the ENDF-6 §D.1.1 eq D.7 energy dependence
+        // Γ_n(E) = Γ_n(E_r) · P_l(E)/P_l(E_r) (no extra √(E/E_r) factor;
+        // see module docstring), so for a single isolated s-wave resonance
+        // they should agree to within Doppler/MLBW-vs-SLBW differences,
+        // not by ~10-15 % as the previous comment claimed (that gap was
+        // a symptom of a double-counted velocity factor, now removed).
         for &e in &[6.5, 6.674, 7.0] {
             let rm = reich_moore::cross_sections_at_energy(&rm_data, e);
             let slbw = slbw_cross_sections(&slbw_data, e);

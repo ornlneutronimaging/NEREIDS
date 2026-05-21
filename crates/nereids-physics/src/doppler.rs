@@ -83,6 +83,36 @@ pub enum DopplerError {
         /// Number of cross-section values.
         cross_sections: usize,
     },
+    /// An energy value is non-finite (NaN/±∞) or non-positive (≤ 0).
+    ///
+    /// The FGM velocity transform computes `v = √E`, so non-positive or
+    /// non-finite energies produce NaN velocities that silently propagate
+    /// through the convolution. Per-point guards in the convolution loop
+    /// rely on `v < FLOOR` comparisons which evaluate to `false` for NaN
+    /// (see "NaN bypasses guards" project convention), so the function
+    /// would return wrong outputs rather than erroring. The contract is
+    /// "every energy is finite and strictly positive."
+    InvalidEnergy {
+        /// Position in the energy array where the bad value was found.
+        index: usize,
+        /// The offending energy value.
+        value: f64,
+    },
+    /// The energy grid is not strictly increasing at `index`.
+    ///
+    /// `doppler_broaden` uses `partition_point` over the extended velocity
+    /// grid (built from `energies` via `v = √E`), which has an unspecified
+    /// return value on an unsorted slice and therefore would silently
+    /// produce garbage indices in release builds. The contract is
+    /// "energies are strictly ascending"; duplicate points are also rejected.
+    UnsortedEnergies {
+        /// Position where the strict-ascending invariant was first violated.
+        index: usize,
+        /// The previous (smaller-index) energy value.
+        previous: f64,
+        /// The current (larger-index) energy value that broke the invariant.
+        current: f64,
+    },
 }
 
 impl fmt::Display for DopplerError {
@@ -95,11 +125,59 @@ impl fmt::Display for DopplerError {
                 f,
                 "energies length ({energies}) must match cross_sections length ({cross_sections})"
             ),
+            Self::InvalidEnergy { index, value } => write!(
+                f,
+                "energies[{index}] = {value} is not finite or not strictly positive \
+                 (Doppler broadening requires every energy to satisfy is_finite() && > 0)"
+            ),
+            Self::UnsortedEnergies {
+                index,
+                previous,
+                current,
+            } => write!(
+                f,
+                "energies[{index}] = {current} is not strictly greater than \
+                 energies[{}] = {previous} (Doppler broadening requires the \
+                 energy grid to be strictly ascending)",
+                index.saturating_sub(1)
+            ),
         }
     }
 }
 
 impl std::error::Error for DopplerError {}
+
+/// Validate that `energies` satisfies the Doppler-broadening grid contract:
+/// every entry is finite, strictly positive, and strictly greater than the
+/// previous entry. An empty slice is permitted (the caller has its own
+/// length-handling fast path).
+///
+/// The check is O(n) and is run unconditionally on every entry to
+/// `doppler_broaden` and `doppler_broaden_with_derivative` so that
+/// malformed grids surface as a typed `Err` rather than silent NaN
+/// propagation or unspecified `partition_point` behaviour.
+fn validate_doppler_grid(energies: &[f64]) -> Result<(), DopplerError> {
+    for (i, &e) in energies.iter().enumerate() {
+        if !e.is_finite() || e <= 0.0 {
+            return Err(DopplerError::InvalidEnergy { index: i, value: e });
+        }
+        if i > 0 {
+            // Safe to use `e <= prev` here: the `is_finite()` check above
+            // already rejected any NaN entries, so the partial-ord comparison
+            // is total. (NaN comparisons returning false would otherwise
+            // silently let NaN through this branch.)
+            let prev = energies[i - 1];
+            if e <= prev {
+                return Err(DopplerError::UnsortedEnergies {
+                    index: i,
+                    previous: prev,
+                    current: e,
+                });
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Doppler broadening parameters.
 #[derive(Debug, Clone, Copy)]
@@ -188,12 +266,20 @@ fn erfc_val(x: f64) -> f64 {
 /// Free Gas Model integral from SAMMY manual Eq. III B1.7.
 ///
 /// # Arguments
-/// * `energies` — Energy grid in eV (must be positive and sorted ascending).
+/// * `energies` — Energy grid in eV. Every entry must satisfy
+///   `is_finite() && > 0.0`, and the grid must be **strictly ascending**
+///   (duplicates are rejected). The contract is enforced at the public
+///   boundary by `validate_doppler_grid`.
 /// * `cross_sections` — Unbroadened cross-sections in barns at each energy point.
 /// * `params` — Doppler broadening parameters (temperature and AWR).
 ///
 /// # Returns
 /// Doppler-broadened cross-sections in barns on the same energy grid.
+///
+/// # Errors
+/// * `DopplerError::LengthMismatch` if `energies.len() != cross_sections.len()`.
+/// * `DopplerError::InvalidEnergy` if any energy is non-finite or ≤ 0.
+/// * `DopplerError::UnsortedEnergies` if the grid is not strictly ascending.
 ///
 /// # Algorithm
 /// 1. Convert energy grid to velocity space (v = √E).
@@ -212,6 +298,13 @@ pub fn doppler_broaden(
             cross_sections: cross_sections.len(),
         });
     }
+
+    // Validate the energy-grid contract before any sqrt / partition_point /
+    // interpolation work. Without this guard, NaN energies would silently
+    // produce NaN velocities (and the per-point `v < FLOOR` check evaluates
+    // to false for NaN, allowing NaN to enter the convolution kernel), and
+    // unsorted grids would give unspecified `partition_point` indices.
+    validate_doppler_grid(energies)?;
 
     if params.temperature_k() <= 0.0 || energies.is_empty() {
         return Ok(cross_sections.to_vec());
@@ -453,6 +546,17 @@ pub fn doppler_broaden(
 ///
 /// SAMMY uses finite differences for this (mfgm4.f90 Xdofgm, Del=0.02).
 /// Our analytical approach is exact and avoids the 3× broadening cost.
+///
+/// # Arguments
+/// * `energies` — Energy grid in eV. Same contract as [`doppler_broaden`]:
+///   every entry must be finite and strictly positive, and the grid must
+///   be strictly ascending. The first `doppler_broaden` call below
+///   propagates the validation error through the `?` operator.
+/// * `cross_sections` — Unbroadened cross-sections in barns at each energy point.
+/// * `params` — Doppler broadening parameters (temperature and AWR).
+///
+/// # Errors
+/// Returns the same `DopplerError` variants as [`doppler_broaden`].
 pub fn doppler_broaden_with_derivative(
     energies: &[f64],
     cross_sections: &[f64],
