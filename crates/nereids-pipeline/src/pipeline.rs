@@ -1130,21 +1130,28 @@ fn fit_transmission_lm(
     );
 
     // When a fit-energy-range is configured, reject the call early if
-    // the user's `[E_min, E_max]` selects fewer than 2 active bins on
-    // the configured grid.  The LM core's `n_active < n_free` check
-    // would also catch this on the main path, but a dispatcher-level
-    // rejection gives the user a clear "range too narrow" error
-    // instead of a confusing non-converged result.
+    // the user's `[E_min, E_max]` selects fewer active bins than the
+    // dispatch can solve.  The LM core's `n_active < n_free` check
+    // would also catch the underdetermined case on the main path, but
+    // a dispatcher-level rejection gives the user a clear "range too
+    // narrow" error instead of a confusing non-converged result, and
+    // adds the `n_active < 2` numerical-stability floor so that even
+    // an `n_free == 1` fit gets at least one degree of freedom.  See
+    // [`required_active_bins`] for the combined `max(2, n_free)`
+    // requirement.
     if let Some((e_min, e_max)) = config.fit_energy_range() {
         let n_active = nereids_fitting::active_mask::active_count(
             active_mask.as_deref(),
             config.energies().len(),
         );
-        if n_active < 2 {
+        let required = required_active_bins(config);
+        if n_active < required {
             return Err(PipelineError::InvalidParameter(format!(
                 "fit_energy_range [{e_min}, {e_max}] eV selects {n_active} active bin(s) \
-                 on the configured energy grid; at least 2 active bins are required \
-                 for LM transmission fitting"
+                 on the configured energy grid; at least {required} active bin(s) are \
+                 required for LM transmission fitting with {n_free} free parameter(s) \
+                 (underdetermined when n_active < n_free)",
+                n_free = count_free_params(config),
             )));
         }
     }
@@ -1543,20 +1550,26 @@ fn fit_counts_joint_poisson(
     );
     let active_mask_slice = active_mask.as_deref();
 
-    // Reject early when the configured range selects fewer than 2
-    // active bins on the grid.  `joint_poisson_fit` already rejects
-    // the `n_active < n_free` case (and the new `n_active == 0`
-    // early-return), but a dispatcher-level rejection gives users a
-    // clear "range too narrow" error instead of a non-converged JP
-    // result.
+    // Reject early when the configured range selects fewer active
+    // bins than the joint-Poisson dispatch can solve.  `joint_poisson_fit`
+    // already rejects the `n_active < n_free` case (and the
+    // `n_active == 0` early-return), but a dispatcher-level rejection
+    // gives users a clear "range too narrow" error instead of a
+    // non-converged JP result, and adds the `n_active < 2` numerical-
+    // stability floor so even an `n_free == 1` fit gets at least one
+    // degree of freedom.  See [`required_active_bins`] for the
+    // combined `max(2, n_free)` requirement.
     if let Some((e_min, e_max)) = config.fit_energy_range() {
         let n_active =
             nereids_fitting::active_mask::active_count(active_mask_slice, config.energies().len());
-        if n_active < 2 {
+        let required = required_active_bins(config);
+        if n_active < required {
             return Err(PipelineError::InvalidParameter(format!(
                 "fit_energy_range [{e_min}, {e_max}] eV selects {n_active} active bin(s) \
-                 on the configured energy grid; at least 2 active bins are required \
-                 for joint-Poisson fitting"
+                 on the configured energy grid; at least {required} active bin(s) are \
+                 required for joint-Poisson fitting with {n_free} free parameter(s) \
+                 (underdetermined when n_active < n_free)",
+                n_free = count_free_params(config),
             )));
         }
     }
@@ -1767,6 +1780,72 @@ pub(crate) fn validate_transmission_background(bg: &BackgroundConfig) -> Result<
         )));
     }
     Ok(())
+}
+
+/// Count the number of free parameters the production LM transmission
+/// or joint-Poisson (counts-KL) dispatch will register for `config`.
+///
+/// Mirrors the parameter-vector assembly performed by
+/// [`fit_transmission_lm`], [`fit_counts_joint_poisson`] and the
+/// shared `build_density_params` / `append_*_param` helpers below:
+///
+/// * `n_density_params` density slots (always free).
+/// * `+1` if [`UnifiedFitConfig::fit_temperature`] is set.
+/// * `+2` if [`UnifiedFitConfig::fit_energy_scale`] is set
+///   (t_0 and L_scale).
+/// * For a transmission_background, the count of `true` flags on
+///   `(fit_anorm, fit_back_a, fit_back_b, fit_back_c, fit_back_d,
+///   fit_back_f)`.  The joint-Poisson dispatch rejects BackD/BackF
+///   up-front, but this helper counts them as free when set so the
+///   fail-fast diagnostic ordering (`underdetermined > BackD/BackF
+///   reject`) does not flip across paths.
+///
+/// Used both by [`validate_spatial_fit_preflight`] (whole-map
+/// rejection) and by the per-pixel LM / JP dispatchers
+/// (single-spectrum rejection) so the `n_active < required` bound
+/// stays in lockstep across the spatial / single-spectrum boundary.
+/// The research-only `fit_alpha_1` / `fit_alpha_2` flags on
+/// `CountsBackgroundConfig` are *not* counted: the joint-Poisson
+/// dispatch rejects them up-front and the LM path never wires them.
+pub(crate) fn count_free_params(config: &UnifiedFitConfig) -> usize {
+    let mut n_free = config.n_density_params();
+    if config.fit_temperature {
+        n_free += 1;
+    }
+    if config.fit_energy_scale {
+        n_free += 2;
+    }
+    if let Some(bg) = config.transmission_background.as_ref() {
+        n_free += usize::from(bg.fit_anorm);
+        n_free += usize::from(bg.fit_back_a);
+        n_free += usize::from(bg.fit_back_b);
+        n_free += usize::from(bg.fit_back_c);
+        n_free += usize::from(bg.fit_back_d);
+        n_free += usize::from(bg.fit_back_f);
+    }
+    n_free
+}
+
+/// Minimum number of active bins the LM / joint-Poisson dispatch
+/// requires for a fit on `config`.  Encodes two distinct constraints:
+///
+/// 1. **Underdetermined-system rejection**: a fit with `n_active <
+///    n_free` cannot be solved (the Jacobian cannot be full rank).
+///    Lifting this check out of the LM / joint-Poisson cores into
+///    the dispatcher gives the user an actionable error instead of
+///    silent NaN propagation through the spatial map.
+/// 2. **Numerical-stability floor**: even with `n_free == 1`, a
+///    one-active-bin fit (`n_active == 1`) is exactly determined
+///    (`dof == 0`) and gives no curvature for the LM step / no
+///    deviance signal for the joint-Poisson reduced GOF.  We keep
+///    the previous `n_active < 2` minimum so callers that relied
+///    on it (e.g. the spatial-preflight regression tests for
+///    narrow `fit_energy_range` windows) continue to receive the
+///    same actionable diagnostic.
+///
+/// The combined requirement is `max(2, count_free_params(config))`.
+pub(crate) fn required_active_bins(config: &UnifiedFitConfig) -> usize {
+    count_free_params(config).max(2)
 }
 
 fn append_background_params(

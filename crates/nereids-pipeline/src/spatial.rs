@@ -120,7 +120,8 @@ pub struct SpatialResult {
 // ── Phase 3: InputData3D + spatial_map_typed ─────────────────────────────
 
 use crate::pipeline::{
-    InputData, SolverConfig, UnifiedFitConfig, fit_spectrum_typed, validate_transmission_background,
+    InputData, SolverConfig, UnifiedFitConfig, count_free_params, fit_spectrum_typed,
+    required_active_bins, validate_transmission_background,
 };
 
 /// 3D input data for spatial mapping.
@@ -197,6 +198,158 @@ fn apply_spatial_polish_default(config: UnifiedFitConfig, n_pixels: usize) -> Un
     } else {
         config
     }
+}
+
+/// Hoist whole-config `InvalidParameter` rejections out of the per-pixel
+/// rayon closure so they surface as a single boundary error instead of
+/// silently degrading to an all-NaN `SpatialResult` via the
+/// `Err(_) => failed_count += 1` swallow at the bottom of the loop.
+///
+/// Every gate here mirrors a per-pixel `Err(PipelineError::InvalidParameter)`
+/// raised inside `fit_spectrum_typed` / `fit_transmission_kl` /
+/// `fit_counts_joint_poisson` whose decision depends only on
+/// `(input variant, config)` — i.e. fires identically for every pixel.
+/// Per-pixel error variants (numerical fit failure, per-pixel detector
+/// background contamination on `CountsWithNuisance`) intentionally stay
+/// inside the closure where they correctly produce a NaN-only single
+/// pixel rather than a whole-map error.
+///
+/// The error messages here are kept byte-identical to the originating
+/// per-pixel sites so the user-facing diagnostic does not bifurcate
+/// based on whether the call came through the single-spectrum or
+/// spatial entry point.
+fn validate_spatial_fit_preflight(
+    input: &InputData3D<'_>,
+    config: &UnifiedFitConfig,
+) -> Result<(), PipelineError> {
+    // Gate: `fit_temperature && temperature_k < 1.0` (mirrors
+    // `pipeline.rs::fit_spectrum_typed` temperature-init guard).
+    // Without hoisting, a user who forgets units and writes `0.025`
+    // for 25 meV would see `Ok(SpatialResult { n_converged: 0,
+    // density_maps: all-NaN })` instead of the actionable message.
+    if config.fit_temperature() && config.temperature_k() < 1.0 {
+        return Err(PipelineError::InvalidParameter(format!(
+            "temperature must be >= 1.0 K when fit_temperature is true, got {}",
+            config.temperature_k(),
+        )));
+    }
+
+    // Resolve `SolverConfig::Auto` against the input variant — counts
+    // → PoissonKL, transmission → LM.  `effective_solver` lives on
+    // `UnifiedFitConfig` but takes the 1D `InputData`; inline the
+    // resolution here so we do not have to materialise a 1D stub.
+    let is_counts = input.is_counts();
+    let is_kl = matches!(config.solver(), SolverConfig::PoissonKL(_))
+        || (matches!(config.solver(), SolverConfig::Auto) && is_counts);
+
+    // Gate: transmission + Poisson-KL solver path does not honour
+    // `fit_energy_range` — `fit_transmission_kl` rejects this
+    // combination per-pixel (`pipeline.rs::fit_transmission_kl`).
+    // Without hoisting, every pixel errors and the spatial layer
+    // hides the dispatch-level incompatibility.  Counts-KL (joint-
+    // Poisson) and LM transmission both honour the mask correctly,
+    // so this gate is scoped to the transmission + KL combination.
+    if !is_counts && is_kl && config.fit_energy_range().is_some() {
+        return Err(PipelineError::InvalidParameter(
+            "fit_energy_range is not supported for the transmission + \
+             Poisson-KL solver path. Use joint-Poisson (provide sample + \
+             open-beam counts) or switch to the LM transmission solver."
+                .into(),
+        ));
+    }
+
+    // Gate: `fit_energy_range` selects fewer active bins than the
+    // dispatch can solve.  The active-mask + grid are shared by every
+    // pixel, so the per-pixel `n_active < required` rejection in the
+    // LM transmission path (`pipeline.rs::fit_transmission_lm`) and
+    // the joint-Poisson path (`pipeline.rs::fit_counts_joint_poisson`)
+    // both fire identically across the map.  We compute `required`
+    // from the config's free-parameter count (densities + temperature
+    // + energy-scale + transmission_background flags), clamped to a
+    // floor of 2 — that combined `max(2, n_free)` covers both the
+    // numerical-stability minimum and the underdetermined-system
+    // rejection.  Without the `n_free` factor, a config with
+    // multiple densities + background terms + temperature + energy-
+    // scale (n_free can reach ~10) would silently pass the preflight
+    // with a 3-bin window and every pixel would return non-converged
+    // / NaN — the all-NaN spatial-result class this preflight exists
+    // to prevent.  See [`required_active_bins`] in `pipeline.rs`.
+    if let Some((e_min, e_max)) = config.fit_energy_range() {
+        let active_mask = nereids_fitting::active_mask::build_active_mask(
+            config.energies(),
+            config.fit_energy_range(),
+        );
+        let n_active = nereids_fitting::active_mask::active_count(
+            active_mask.as_deref(),
+            config.energies().len(),
+        );
+        let required = required_active_bins(config);
+        if n_active < required {
+            // Mirror the per-pixel string from whichever path the
+            // dispatcher would actually take.  LM and joint-Poisson
+            // both reach this branch; transmission + Poisson-KL is
+            // already rejected by the previous gate above.
+            let path_msg = if is_counts && is_kl {
+                "joint-Poisson"
+            } else {
+                "LM transmission"
+            };
+            return Err(PipelineError::InvalidParameter(format!(
+                "fit_energy_range [{e_min}, {e_max}] eV selects {n_active} active bin(s) \
+                 on the configured energy grid; at least {required} active bin(s) are \
+                 required for {path_msg} fitting with {n_free} free parameter(s) \
+                 (underdetermined when n_active < n_free)",
+                n_free = count_free_params(config),
+            )));
+        }
+    }
+
+    // ── Counts-KL (joint-Poisson) whole-config gates ────────────────
+    // Every gate below mirrors a per-pixel rejection in
+    // `pipeline.rs::fit_counts_joint_poisson`.  All fire identically
+    // across the map because they depend only on shared config flags
+    // (alpha fitting, B_A/B/C interlock, `c` value); per-pixel
+    // detector-background contamination is *not* hoisted because
+    // `CountsWithNuisance` carries per-pixel `background` slices and
+    // contamination is a legitimately per-pixel signal.
+    if is_counts && is_kl {
+        if let Some(bg) = config.counts_background() {
+            if bg.fit_alpha_1 || bg.fit_alpha_2 {
+                return Err(PipelineError::InvalidParameter(
+                    "joint-Poisson solver does not support fit_alpha_1/fit_alpha_2: \
+                     the profile lambda-hat absorbs the global flux scale (alpha_1 redundant); \
+                     alpha_2 / B_det wiring is deferred to memo 35 §P3."
+                        .into(),
+                ));
+            }
+            // `c` defaults to `1.0` when absent, matching the
+            // `.unwrap_or(1.0)` in `fit_counts_joint_poisson`; only an
+            // explicit non-finite or non-positive `c` is rejected.
+            // Python pre-validates this at the binding boundary so
+            // Python users hit a `ValueError` before this gate, but
+            // Rust core callers can still reach this path.
+            if !(bg.c.is_finite() && bg.c > 0.0) {
+                return Err(PipelineError::InvalidParameter(format!(
+                    "joint-Poisson solver requires finite c > 0 in CountsBackgroundConfig, got {}",
+                    bg.c,
+                )));
+            }
+        }
+        if let Some(bg) = config.transmission_background()
+            && (bg.fit_back_b || bg.fit_back_c)
+            && !bg.fit_back_a
+        {
+            return Err(PipelineError::InvalidParameter(
+                "joint-Poisson transmission_background: B_A (fit_back_a) must be \
+                 enabled whenever any of B_B / B_C is enabled (memo 35 §P2.2 — \
+                 A_n alone cannot absorb a constant offset; EG2 S2 C_An → −23% \
+                 density bias)."
+                    .into(),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 pub fn spatial_map_typed(
@@ -392,6 +545,23 @@ pub fn spatial_map_typed(
             ));
         }
     }
+
+    // Hoist whole-config `InvalidParameter` rejections so they surface as
+    // a single boundary error instead of being swallowed pixel-by-pixel
+    // into an all-NaN `SpatialResult`.  See
+    // `validate_spatial_fit_preflight` for the full gate list and
+    // per-gate rationale.  Must run before any rayon work.
+    //
+    // Ordering note: the preflight runs *after* the dispatch /
+    // solver-compatibility guards above (CountsWithNuisance + LM,
+    // fit_energy_scale + fit_temperature, transmission_background
+    // BackD/BackF interlocks, …).  The fit-range, temperature and
+    // alpha gates inside the preflight only meaningfully apply once
+    // the input → solver dispatch is known to be valid; otherwise
+    // a downstream "LM transmission active-bin" message would
+    // shadow the more fundamental "CountsWithNuisance requires a
+    // counts-domain solver" diagnostic.
+    validate_spatial_fit_preflight(input, config)?;
 
     // Collect live pixel coordinates
     let mut pixel_coords: Vec<(usize, usize)> = Vec::new();
@@ -1137,7 +1307,7 @@ pub fn spatial_map_typed(
     // few outliers" rather than "map of NaN holes with a few fits".
     //
     // NaN-on-failure is also the convention asserted by
-    // `test_spatial_map_failed_pixels_remain_nan`; this block makes
+    // `test_spatial_unconverged_pixels_are_nan`; this block makes
     // it hold for *every* non-converged pixel, not only the hard
     // failure path.
     for ((y, x), result) in &results {
@@ -1580,8 +1750,17 @@ mod tests {
         assert_eq!(result.n_total, 8, "Only 8 live pixels");
     }
 
+    /// Counts-KL + `fit_alpha_2=true` (and the symmetric `fit_alpha_1`
+    /// case) is a whole-config rejection that fires identically on
+    /// every pixel.  Previously this test codified the silent swallow:
+    /// the spatial layer returned `Ok(SpatialResult)` with `n_failed =
+    /// n_total` and an all-NaN density map, hiding the actionable
+    /// `joint-Poisson does not support fit_alpha_*` diagnostic from
+    /// the caller.  After the preflight hoist, the spatial call
+    /// surfaces the same `Err(InvalidParameter)` the single-spectrum
+    /// fitter would have raised — Python maps it to `PyValueError`.
     #[test]
-    fn test_spatial_map_failed_pixels_remain_nan() {
+    fn test_spatial_map_rejects_counts_kl_alpha_up_front() {
         let data = u238_single_resonance();
         let true_density = 0.0005;
         let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
@@ -1610,15 +1789,16 @@ mod tests {
             open_beam_counts: ob.view(),
         };
 
-        let result = spatial_map_typed(&input, &config, None, None, None).unwrap();
-        assert_eq!(result.n_converged, 0);
+        let err = spatial_map_typed(&input, &config, None, None, None)
+            .expect_err("counts-KL with fit_alpha_2 must be rejected up-front");
+        let msg = err.to_string();
         assert!(
-            result.density_maps[0].iter().all(|v| v.is_nan()),
-            "failed pixels must remain NaN rather than looking like zero-density fits"
+            matches!(err, PipelineError::InvalidParameter(_)),
+            "expected InvalidParameter, got {err:?}"
         );
         assert!(
-            result.chi_squared_map.iter().all(|v| v.is_nan()),
-            "failed pixels must retain NaN chi-squared"
+            msg.contains("fit_alpha_1") || msg.contains("fit_alpha_2"),
+            "error must name the offending flag, got: {msg}"
         );
     }
 
@@ -2434,6 +2614,65 @@ mod tests {
         );
     }
 
+    /// Diagnostic-priority regression: when a config violates both a
+    /// dispatch-level guard (e.g. `CountsWithNuisance + LM` is
+    /// rejected because LM cannot consume the nuisance arm) AND a
+    /// downstream preflight gate (e.g. `fit_energy_range` selects too
+    /// few active bins), the user must see the *dispatch* mismatch
+    /// first — the fit-range / temperature gates only meaningfully
+    /// apply once the dispatch is known to be valid.  Otherwise an
+    /// "LM transmission active-bin" message shadows the more
+    /// fundamental "requires a counts-domain solver" diagnostic.
+    #[test]
+    fn test_spatial_map_reports_solver_mismatch_before_fit_range_gate() {
+        use ndarray::Array3;
+        let rd = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        let (sample, _ob) = synthetic_4x4_counts(&rd, 0.0005, &energies, 1000.0);
+        let flux: Array3<f64> = Array3::from_elem((energies.len(), 4, 4), 1000.0);
+        let background: Array3<f64> = Array3::from_elem((energies.len(), 4, 4), 0.0);
+        let data = InputData3D::CountsWithNuisance {
+            sample_counts: sample.view(),
+            flux: flux.view(),
+            background: background.view(),
+        };
+        // Combine the dispatch-level violation (LM + CountsWithNuisance)
+        // with a downstream preflight violation (too-narrow
+        // `fit_energy_range` selecting < 2 active bins on the configured
+        // 0.2 eV grid).  Either guard could fire, but the dispatch
+        // mismatch is the actionable cause; the fit-range gate would
+        // never matter because the dispatch never reaches LM with this
+        // input.
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![rd],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
+        .with_fit_energy_range(Some((5.0, 5.05)))
+        .unwrap();
+
+        let err = spatial_map_typed(&data, &config, None, None, None)
+            .expect_err("CountsWithNuisance + LM + narrow fit_energy_range must be rejected");
+        let msg = err.to_string();
+        assert!(
+            matches!(err, PipelineError::InvalidParameter(_)),
+            "expected InvalidParameter, got {err:?}"
+        );
+        assert!(
+            msg.contains("CountsWithNuisance") && msg.contains("counts-domain"),
+            "error must surface the solver mismatch (not the fit-range gate), got: {msg}"
+        );
+        assert!(
+            !msg.contains("active bin"),
+            "error must not be the downstream fit-range diagnostic, got: {msg}"
+        );
+    }
+
     // ── Counts-KL spatial path (post-collapse) ────────────────────────
 
     /// Spatial counts-KL dispatch routes through `fit_counts_joint_poisson`
@@ -2891,5 +3130,316 @@ mod tests {
         let result = spatial_map_typed(&data, &config, None, None, None)
             .expect("LM + transmission + fit_energy_scale must be allowed");
         assert!(result.t0_us_map.is_some());
+    }
+
+    // ── NV-6 preflight hoist regression tests ────────────────────────
+    //
+    // Each of these constructs a whole-config rejection that the
+    // single-spectrum fitter would raise per-pixel.  Before the
+    // hoist, `spatial_map_typed` swallowed those errors at the rayon
+    // closure and returned `Ok(SpatialResult)` with `n_failed =
+    // n_total`, an all-NaN density map, and no diagnostic.  The fix
+    // wires `validate_spatial_fit_preflight` immediately after shape
+    // validation so every gate below surfaces as a single
+    // `Err(PipelineError::InvalidParameter)`.
+
+    #[test]
+    fn test_spatial_map_rejects_fit_temperature_below_one_up_front() {
+        let rd = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        let (t_3d, u_3d) = synthetic_4x4_transmission(&rd, 0.001, &energies);
+        let data = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+        // Sub-1 K initial temperature with `fit_temperature=true` is
+        // rejected by `fit_spectrum_typed` per-pixel.  Pick 0.5 K
+        // (the canonical "user wrote 25 meV instead of 25 K" case).
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![rd],
+            vec!["U-238".into()],
+            0.5,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
+        .with_fit_temperature(true);
+
+        let err = spatial_map_typed(&data, &config, None, None, None)
+            .expect_err("fit_temperature with temperature_k < 1.0 must be rejected up-front");
+        let msg = err.to_string();
+        assert!(
+            matches!(err, PipelineError::InvalidParameter(_)),
+            "expected InvalidParameter, got {err:?}"
+        );
+        assert!(
+            msg.contains("temperature") && msg.contains("1.0"),
+            "error must mention the 1.0 K floor, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_spatial_map_transmission_poisson_rejects_fit_energy_range_up_front() {
+        let rd = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        let (t_3d, u_3d) = synthetic_4x4_transmission(&rd, 0.001, &energies);
+        let data = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+        // Transmission + Poisson-KL + any `fit_energy_range` is
+        // unsupported because the transmission-domain `poisson_fit`
+        // does not honour the active mask.  The per-pixel rejection
+        // would otherwise silently produce an all-NaN map.
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![rd],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
+        .with_fit_energy_range(Some((2.0, 8.0)))
+        .unwrap();
+
+        let err = spatial_map_typed(&data, &config, None, None, None)
+            .expect_err("transmission + Poisson-KL + fit_energy_range must be rejected up-front");
+        let msg = err.to_string();
+        assert!(
+            matches!(err, PipelineError::InvalidParameter(_)),
+            "expected InvalidParameter, got {err:?}"
+        );
+        assert!(
+            msg.contains("fit_energy_range") && msg.contains("Poisson-KL"),
+            "error must name the incompatibility, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_spatial_map_lm_rejects_too_narrow_fit_energy_range_up_front() {
+        let rd = u238_single_resonance();
+        // Energies 1, 1.2, 1.4, ..., 11.0 → 51 bins on a 0.2 eV grid.
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        let (t_3d, u_3d) = synthetic_4x4_transmission(&rd, 0.001, &energies);
+        let data = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+        // Window narrower than one bin → at most one active bin on the
+        // grid; LM transmission needs at least 2.
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![rd],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
+        .with_fit_energy_range(Some((5.0, 5.05)))
+        .unwrap();
+
+        let err = spatial_map_typed(&data, &config, None, None, None)
+            .expect_err("LM with too-narrow fit_energy_range must be rejected up-front");
+        let msg = err.to_string();
+        assert!(
+            matches!(err, PipelineError::InvalidParameter(_)),
+            "expected InvalidParameter, got {err:?}"
+        );
+        assert!(
+            msg.contains("active bin") && msg.contains("LM transmission"),
+            "error must mention narrow active-bin count for the LM path, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_spatial_map_counts_kl_rejects_too_narrow_fit_energy_range_up_front() {
+        let rd = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        let (sample, ob) = synthetic_4x4_counts(&rd, 0.0005, &energies, 1000.0);
+        let data = InputData3D::Counts {
+            sample_counts: sample.view(),
+            open_beam_counts: ob.view(),
+        };
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![rd],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
+        .with_fit_energy_range(Some((5.0, 5.05)))
+        .unwrap();
+
+        let err = spatial_map_typed(&data, &config, None, None, None)
+            .expect_err("counts-KL with too-narrow fit_energy_range must be rejected up-front");
+        let msg = err.to_string();
+        assert!(
+            matches!(err, PipelineError::InvalidParameter(_)),
+            "expected InvalidParameter, got {err:?}"
+        );
+        assert!(
+            msg.contains("active bin") && msg.contains("joint-Poisson"),
+            "error must mention narrow active-bin count for the joint-Poisson path, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_spatial_map_counts_kl_rejects_invalid_c_up_front() {
+        let rd = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        let (sample, ob) = synthetic_4x4_counts(&rd, 0.0005, &energies, 1000.0);
+        let data = InputData3D::Counts {
+            sample_counts: sample.view(),
+            open_beam_counts: ob.view(),
+        };
+        // Non-positive `c` (`Q_s/Q_ob`) is invalid for the counts-KL
+        // dispatch.  Python pre-validates this at the binding
+        // boundary, but Rust core callers reach the per-pixel
+        // rejection — which the spatial layer used to swallow.
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![rd],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
+        .with_counts_background(crate::pipeline::CountsBackgroundConfig {
+            c: -1.0,
+            ..Default::default()
+        });
+
+        let err = spatial_map_typed(&data, &config, None, None, None)
+            .expect_err("counts-KL with non-positive c must be rejected up-front");
+        let msg = err.to_string();
+        assert!(
+            matches!(err, PipelineError::InvalidParameter(_)),
+            "expected InvalidParameter, got {err:?}"
+        );
+        assert!(
+            msg.contains("finite c > 0"),
+            "error must mention the c > 0 requirement, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_spatial_map_counts_kl_requires_back_a_for_back_b_c_up_front() {
+        let rd = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        let (sample, ob) = synthetic_4x4_counts(&rd, 0.0005, &energies, 1000.0);
+        let data = InputData3D::Counts {
+            sample_counts: sample.view(),
+            open_beam_counts: ob.view(),
+        };
+        // B_B fitted but B_A not fitted is rejected by the
+        // joint-Poisson dispatch (memo 35 §P2.2): A_n alone cannot
+        // absorb a constant offset.  Test the B_B branch; the B_C
+        // branch shares the same code path.
+        let bg = crate::pipeline::BackgroundConfig {
+            fit_back_a: false,
+            fit_back_b: true,
+            fit_back_c: false,
+            fit_back_d: false,
+            fit_back_f: false,
+            ..crate::pipeline::BackgroundConfig::default()
+        };
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![rd],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
+        .with_transmission_background(bg);
+
+        let err = spatial_map_typed(&data, &config, None, None, None)
+            .expect_err("counts-KL with B_B but no B_A must be rejected up-front");
+        let msg = err.to_string();
+        assert!(
+            matches!(err, PipelineError::InvalidParameter(_)),
+            "expected InvalidParameter, got {err:?}"
+        );
+        assert!(
+            msg.contains("B_A") && msg.contains("fit_back_a"),
+            "error must name the B_A requirement, got: {msg}"
+        );
+    }
+
+    /// Underdetermined-system rejection: a `fit_energy_range` window
+    /// that selects fewer active bins than the dispatch has free
+    /// parameters must be rejected up-front with a diagnostic that
+    /// names the underdetermined condition.  Before this guard, a
+    /// config with many free params (densities + temperature +
+    /// background) and a too-narrow window passed the old
+    /// `n_active < 2` floor but every per-pixel fit returned
+    /// non-converged, producing the silent all-NaN spatial result
+    /// that the rest of the preflight exists to eliminate.
+    #[test]
+    fn test_spatial_map_rejects_underdetermined_fit_range() {
+        let rd = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        let (t_3d, u_3d) = synthetic_4x4_transmission(&rd, 0.001, &energies);
+        let data = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+        // Free-parameter count for this config:
+        //   1 density + fit_temperature (=1) + fit_anorm + fit_back_a
+        //   + fit_back_b + fit_back_c (=4 background flags from the
+        //   BackgroundConfig::default())  →  n_free = 6.
+        // The fit_energy_range window [5.0, 5.5] picks up the grid
+        // points 5.0, 5.2, 5.4 → 3 active bins, comfortably above
+        // the legacy `n_active < 2` floor but below `n_free`, so the
+        // problem is structurally underdetermined and the LM core
+        // would return `converged=false` for every pixel.
+        let bg = crate::pipeline::BackgroundConfig::default();
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![rd],
+            vec!["U-238".into()],
+            // fit_temperature requires temperature_k >= 1.0; pick a
+            // physically reasonable value so the temperature gate
+            // does not pre-empt the underdetermined-system gate.
+            293.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
+        .with_fit_temperature(true)
+        .with_transmission_background(bg)
+        .with_fit_energy_range(Some((5.0, 5.5)))
+        .unwrap();
+
+        let err = spatial_map_typed(&data, &config, None, None, None)
+            .expect_err("underdetermined fit_energy_range must be rejected up-front");
+        let msg = err.to_string();
+        assert!(
+            matches!(err, PipelineError::InvalidParameter(_)),
+            "expected InvalidParameter, got {err:?}"
+        );
+        // Diagnostic must name both the active-bin count and the
+        // free-parameter requirement so the user can see *why* their
+        // window is too narrow.
+        assert!(
+            msg.contains("active bin")
+                && msg.contains("free parameter")
+                && msg.contains("underdetermined"),
+            "error must explain the underdetermined condition, got: {msg}"
+        );
     }
 }
