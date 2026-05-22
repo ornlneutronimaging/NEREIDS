@@ -1891,35 +1891,8 @@ mod tests {
         //
         // Floats use Fortran notation, e.g. "1.000000+1" = 1e1 = 10.0.
         // Integer fields written as right-justified 11-char strings.
-        const ENDF: &str = concat!(
-            // ── HEAD: ZA=74184, AWR=182, NIS=1 ──────────────────────────────
-            " 7.418400+4 1.820000+2          0          0          1          07437 2151    1\n",
-            // ── Isotope CONT: NER=1 ──────────────────────────────────────────
-            " 7.418400+4 1.000000+0          0          0          1          07437 2151    2\n",
-            // ── Range CONT: EL=1e-5, EH=1e3, LRU=1, LRF=7, NRO=0, NAPS=0 ──
-            " 1.000000-5 1.000000+3          1          7          0          07437 2151    3\n",
-            // ── LRF=7 CONT: SPI=0, AP=0.7, IFG=0, KRM=3, NJS=1, KRL=0 ─────
-            " 0.000000+0 7.000000-1          0          3          1          07437 2151    4\n",
-            // ── Particle-pair LIST CONT: NPP=1, NPL=12 ───────────────────────
-            " 0.000000+0 0.000000+0          1          0         12          17437 2151    5\n",
-            // Particle pair 1: MA=1, MB=182, ZA=0, ZB=0, IA=0.5, IB=0
-            " 1.000000+0 1.820000+2 0.000000+0 0.000000+0 5.000000-1 0.000000+07437 2151    6\n",
-            // Q=0, PNT=1, SHF=0, MT=2, PA=1, PB=1
-            " 0.000000+0 1.000000+0 0.000000+0 2.000000+0 1.000000+0 1.000000+07437 2151    7\n",
-            // ── Spin-group LIST CONT: AJ=0.5, KBK=0, KPS=0, NPL=12, NCH+1=2
-            " 5.000000-1 0.000000+0          0          0         12          27437 2151    8\n",
-            // Header row (6 zeros, ignored by parser)
-            " 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+07437 2151    9\n",
-            // Channel 0: IPP=1, L=0, SCH=0.5, BND=0, APE=0.7, APT=0.7
-            " 1.000000+0 0.000000+0 5.000000-1 0.000000+0 7.000000-1 7.000000-17437 2151   10\n",
-            // ── Resonance LIST CONT: NRS=2 (L2), NPL=12 (N1), NX=2 (N2) ─────
-            // ENDF-6 §2.2.1.6: [C1=0, C2=0, L1=0, L2=NRS, N1=6*NX, N2=NX].
-            " 0.000000+0 0.000000+0          0          2         12          27437 2151   11\n",
-            // res0: ER=10 eV, Γγ=0.025 eV, Γ_1=0.001 eV, (3 padding zeros)
-            " 1.000000+1 2.500000-2 1.000000-3 0.000000+0 0.000000+0 0.000000+07437 2151   12\n",
-            // res1: ER=20 eV, Γγ=0.030 eV, Γ_1=0.002 eV, (3 padding zeros)
-            " 2.000000+1 3.000000-2 2.000000-3 0.000000+0 0.000000+0 0.000000+07437 2151   13\n",
-        );
+        const ENDF: &str =
+            include_str!("../../../tests/data/synthetic/lrf7_krm3_resonance_column_order.endf");
 
         let data = parse_endf_file2(ENDF).expect("fixture must parse without error");
         let rml = data.ranges[0]
@@ -1980,39 +1953,8 @@ mod tests {
         // One spin group with 2 channels (elastic + photon); one resonance.
         //
         // Each ENDF line is 80 chars: 6×11-char fields + MAT(4)+MF(2)+MT(3)+NS(5).
-        const ENDF: &str = concat!(
-            // ── HEAD: ZA=74184, AWR=182, NIS=1 ─────────────────────────────────
-            " 7.418400+4 1.820000+2          0          0          1          07437 2151    1\n",
-            // ── Isotope CONT: NER=1 ─────────────────────────────────────────────
-            " 7.418400+4 1.000000+0          0          0          1          07437 2151    2\n",
-            // ── Range CONT: LRU=1, LRF=7, NRO=0 ────────────────────────────────
-            " 1.000000-5 1.000000+3          1          7          0          07437 2151    3\n",
-            // ── LRF=7 CONT: SPI=0, AP=0.7, IFG=0, KRM=2, NJS=1, KRL=0 ─────────
-            " 0.000000+0 7.000000-1          0          2          1          07437 2151    4\n",
-            // ── Particle-pair LIST CONT: NPP=2 in L1, N1=24, N2=2 ───────────────
-            " 0.000000+0 0.000000+0          2          0         24          27437 2151    5\n",
-            // Pair 1 (neutron+W184): MA=1, MB=182, ZA=0, ZB=0, IA=0.5, IB=0
-            " 1.000000+0 1.820000+2 0.000000+0 0.000000+0 5.000000-1 0.000000+07437 2151    6\n",
-            // Q=0, PNT=1, SHF=0, MT=2, PA=1, PB=1
-            " 0.000000+0 1.000000+0 0.000000+0 2.000000+0 1.000000+0 1.000000+07437 2151    7\n",
-            // Pair 2 (photon+W185): MA=0 (massless), MB=183, ZA=0, ZB=0, IA=0, IB=0.5
-            " 0.000000+0 1.830000+2 0.000000+0 0.000000+0 0.000000+0 5.000000-17437 2151    8\n",
-            // Q=6e6 eV (binding), PNT=0, SHF=0, MT=102 (capture), PA=1, PB=1
-            " 6.000000+6 0.000000+0 0.000000+0 1.020000+2 1.000000+0 1.000000+07437 2151    9\n",
-            // ── Spin-group LIST CONT: AJ=0.5, KBK=0, KPS=0, NPL=18, NCH+1=3 ────
-            " 5.000000-1 0.000000+0          0          0         18          37437 2151   10\n",
-            // Header row (6 zeros)
-            " 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+07437 2151   11\n",
-            // Channel 0 (elastic): IPP=1, L=0, SCH=0.5, BND=0, APE=0.7, APT=0.7
-            " 1.000000+0 0.000000+0 5.000000-1 0.000000+0 7.000000-1 7.000000-17437 2151   12\n",
-            // Channel 1 (photon): IPP=2, L=0, SCH=0, BND=0, APE=0, APT=0
-            " 2.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+07437 2151   13\n",
-            // ── Resonance LIST CONT: NRS=1 (L2), NPL=6 (N1), NX=1 (N2) ─────────
-            // ENDF-6 §2.2.1.6: [C1=0, C2=0, L1=0, L2=NRS, N1=6*NX, N2=NX].
-            " 0.000000+0 0.000000+0          0          1          6          17437 2151   14\n",
-            // res0: ER=10 eV, γ_elastic=0.001, γ_photon=0.004, 3 padding zeros
-            " 1.000000+1 1.000000-3 4.000000-3 0.000000+0 0.000000+0 0.000000+07437 2151   15\n",
-        );
+        const ENDF: &str =
+            include_str!("../../../tests/data/synthetic/lrf7_krm2_explicit_photon_channel.endf");
 
         let data = parse_endf_file2(ENDF).expect("KRM=2 photon channel must parse without error");
         let rml = data.ranges[0]
@@ -2091,26 +2033,7 @@ mod tests {
         //   SEND: all zeros
         // Each ENDF line: 66 data chars + 4-char MAT(9237) + 2-char MF(" 2")
         //   + 3-char MT("151") + 5-char SEQ = 80 chars total.
-        let endf = concat!(
-            // HEAD: ZA=92238, AWR=236.006, 0, 0, NIS=1, 0
-            " 9.223800+4 2.360060+2          0          0          1          09237 2151    1\n",
-            // Isotope CONT: ZAI=92238, ABN=1.0, 0, LFW=0, NER=1, 0
-            " 9.223800+4 1.000000+0          0          0          1          09237 2151    2\n",
-            // Range CONT: EL=1e-5, EH=1e4, LRU=1, LRF=3, NRO=1, NAPS=0
-            " 1.000000-5 1.000000+4          1          3          1          09237 2151    3\n",
-            // TAB1 CONT: C1=0, C2=0, L1=0, L2=0, NR=1, NP=2
-            " 0.000000+0 0.000000+0          0          0          1          29237 2151    4\n",
-            // TAB1 interp: NBT=2, INT=2 (4 padding zeros fill the 6-field line)
-            "          2          2          0          0          0          09237 2151    5\n",
-            // TAB1 data: (1.0, 8.0), (1000.0, 10.0); remaining 2 slots are padding
-            " 1.000000+0 8.000000+0 1.000000+3 1.000000+1 0.000000+0 0.000000+09237 2151    6\n",
-            // RM CONT: SPI=0.0, AP=9.0, 0, 0, NLS=1, 0
-            " 0.000000+0 9.000000+0          0          0          1          09237 2151    7\n",
-            // L CONT: AWRI=236.006, 0, L=0, 0, 6*NRS=6, NRS=1
-            " 2.360060+2 0.000000+0          0          0          6          19237 2151    8\n",
-            // Resonance: ER=6.674, AJ=0.5, GN=1.493e-3, GG=23e-3, GFA=0, GFB=0
-            " 6.674000+0 5.000000-1 1.493000-3 2.300000-2 0.000000+0 0.000000+09237 2151    9\n",
-        );
+        let endf = include_str!("../../../tests/data/synthetic/lrf3_nro1_tab1.endf");
 
         let data = parse_endf_file2(endf).expect("NRO=1 fixture must parse cleanly");
         assert_eq!(data.ranges.len(), 1, "one energy range");
@@ -2180,34 +2103,7 @@ mod tests {
         //   Range 0: LRU=1, LRF=3 (Reich-Moore) — one trivial resonance.
         //   Range 1: LRU=2, LRF=2, LFW=1       — NLS=1, NJS=1, NE=2.
         // LFW=1 is flagged on the isotope CONT (L2 field).
-        const ENDF: &str = concat!(
-            // HEAD: ZA=92233, AWR=231.038, NIS=1
-            " 9.223300+4 2.310380+2          0          0          1          09222 2151    1\n",
-            // Isotope CONT: ZAI=92233, ABN=1.0, LFW=1, NER=2
-            " 9.223300+4 1.000000+0          0          1          2          09222 2151    2\n",
-            // -- Range 0: LRU=1, LRF=3 (resolved RM), NRO=0, NAPS=0 --
-            " 1.000000-5 6.000000+2          1          3          0          09222 2151    3\n",
-            // RM CONT: SPI=2.5, AP=0.96931, NLS=1
-            " 2.500000+0 9.693100-1          0          0          1          09222 2151    4\n",
-            // L CONT: AWRI=231.038, APL=0, L=0, NRS=1 (N1=6, NRS=1)
-            " 2.310380+2 0.000000+0          0          0          6          19222 2151    5\n",
-            // One resonance: ER=10, AJ=2.0, GN=1e-3, GG=3.5e-2, GFA=0, GFB=0
-            " 1.000000+1 2.000000+0 1.000000-3 3.500000-2 0.000000+0 0.000000+09222 2151    6\n",
-            // -- Range 1: LRU=2, LRF=2 (URR tabulated), LFW inherited --
-            " 6.000000+2 3.000000+4          2          2          0          09222 2151    7\n",
-            // SPI/AP CONT: SPI=2.5, AP=0.96931, NLS=1
-            " 2.500000+0 9.693100-1          0          0          1          09222 2151    8\n",
-            // L CONT: AWRI=231.038, L=0, NJS=1
-            " 2.310380+2 0.000000+0          0          0          1          09222 2151    9\n",
-            // J CONT: AJ=2.0, INT=2 (lin-lin), N1=6*(NE+1)=18, N2=NE=2
-            " 2.000000+0 0.000000+0          2          0         18          29222 2151   10\n",
-            // LIST row 0 (DOF): [0, 0, 0, AMUN=1, 0, AMUF=1]
-            " 0.000000+0 0.000000+0 0.000000+0 1.000000+0 0.000000+0 1.000000+09222 2151   11\n",
-            // Row 1: E=600,   D=0.5, GX=0, GN=3e-4, GG=3.5e-2, GF=1e-3
-            " 6.000000+2 5.000000-1 0.000000+0 3.000000-4 3.500000-2 1.000000-39222 2151   12\n",
-            // Row 2: E=30000, D=0.6, GX=0, GN=4e-4, GG=3.5e-2, GF=2e-3
-            " 3.000000+4 6.000000-1 0.000000+0 4.000000-4 3.500000-2 2.000000-39222 2151   13\n",
-        );
+        const ENDF: &str = include_str!("../../../tests/data/synthetic/u233_lfw1_lrf2_urr.endf");
 
         let data = parse_endf_file2(ENDF)
             .expect("U-233 LFW=1/LRF=2 fixture must parse (record layout = LFW=0/LRF=2)");
@@ -2260,30 +2156,7 @@ mod tests {
         //   J=3.0: D=0.4 eV, AMUN=1, GNO=2e-4 eV, GG=3.0e-2 eV, GF=1e-3 eV
         //
         // Each ENDF line: 66 data chars + MAT(4) MF(2) MT(3) SEQ(5) = 80 chars.
-        const ENDF: &str = concat!(
-            // ── HEAD: ZA=92233, AWR=231.038, NIS=1 ─────────────────────────
-            " 9.223300+4 2.310380+2          0          0          1          09222 2151    1\n",
-            // ── Isotope CONT: ZAI=92233, ABN=1.0, LFW=0, NER=2 ─────────────
-            " 9.223300+4 1.000000+0          0          0          2          09222 2151    2\n",
-            // ── Range 0: EL=1e-5, EH=600, LRU=1, LRF=3 (resolved RM) ───────
-            " 1.000000-5 6.000000+2          1          3          0          09222 2151    3\n",
-            // RM CONT: SPI=2.5, AP=0.96931, NLS=1
-            " 2.500000+0 9.693100-1          0          0          1          09222 2151    4\n",
-            // L CONT: AWRI=231.038, APL=0, L=0, NRS=1
-            " 2.310380+2 0.000000+0          0          0          6          19222 2151    5\n",
-            // One resonance: ER=10 eV, AJ=2.0, GN=1e-3, GG=3.5e-2, GFA=0, GFB=0
-            " 1.000000+1 2.000000+0 1.000000-3 3.500000-2 0.000000+0 0.000000+09222 2151    6\n",
-            // ── Range 1: EL=600, EH=3e4, LRU=2, LRF=1 (URR) ────────────────
-            " 6.000000+2 3.000000+4          2          1          0          09222 2151    7\n",
-            // URR CONT: SPI=2.5, AP=0.96931, NLS=1
-            " 2.500000+0 9.693100-1          0          0          1          09222 2151    8\n",
-            // L=0 CONT: AWRI=231.038, L=0, N1=12(=6*NJS), N2=2(=NJS)
-            " 2.310380+2 0.000000+0          0          0         12          29222 2151    9\n",
-            // J=2.0: D=0.5,  AJ=2.0, AMUN=1.0, GNO=3e-4,  GG=3.5e-2, GF=0
-            " 5.000000-1 2.000000+0 1.000000+0 3.000000-4 3.500000-2 0.000000+09222 2151   10\n",
-            // J=3.0: D=0.4,  AJ=3.0, AMUN=1.0, GNO=2e-4,  GG=3.0e-2, GF=1e-3
-            " 4.000000-1 3.000000+0 1.000000+0 2.000000-4 3.000000-2 1.000000-39222 2151   11\n",
-        );
+        const ENDF: &str = include_str!("../../../tests/data/synthetic/lrf1_urr_roundtrip.endf");
 
         let data = parse_endf_file2(ENDF).expect("LRF=1 URR fixture must parse cleanly");
 
@@ -2353,26 +2226,8 @@ mod tests {
         // NLS=1 (L=0), NJS=1, NE=2 energy points, INT=3 (log-x/lin-y).
         // LIST layout: row 0 = [0, 0, 0, AMUN, 0, AMUF]; rows 1..=NE = (E,
         // D, GX, GN, GG, GF). Total = 6*(NE+1) = 18 floats = 3 lines.
-        const ENDF: &str = concat!(
-            // HEAD: ZA=92238, AWR=236.006, NIS=1
-            " 9.223800+4 2.360060+2          0          0          1          09237 2151    1\n",
-            // Isotope CONT: ABN=1, LFW=0, NER=1
-            " 9.223800+4 1.000000+0          0          0          1          09237 2151    2\n",
-            // Range CONT: EL=1e3, EH=1e5, LRU=2, LRF=2, NRO=0, NAPS=0
-            " 1.000000+3 1.000000+5          2          2          0          09237 2151    3\n",
-            // SPI/AP CONT: SPI=0, AP=0.9428, NLS=1
-            " 0.000000+0 9.428000-1          0          0          1          09237 2151    4\n",
-            // L CONT: AWRI=236, 0, L=0, 0, NJS=1, 0
-            " 2.360060+2 0.000000+0          0          0          1          09237 2151    5\n",
-            // J CONT: AJ=0.5, 0, INT=3 (log-x/lin-y), 0, N1=6*(NE+1)=18, N2=NE=2
-            " 5.000000-1 0.000000+0          3          0         18          29237 2151    6\n",
-            // LIST row 0 (DOF): [0, 0, 0, AMUN=1, 0, AMUF=0]
-            " 0.000000+0 0.000000+0 0.000000+0 1.000000+0 0.000000+0 0.000000+09237 2151    7\n",
-            // LIST row 1: E=1e3, D=20, GX=0, GN=1e-3, GG=2.3e-2, GF=0
-            " 1.000000+3 2.000000+1 0.000000+0 1.000000-3 2.300000-2 0.000000+09237 2151    8\n",
-            // LIST row 2: E=1e5, D=22, GX=0, GN=2e-3, GG=2.3e-2, GF=0
-            " 1.000000+5 2.200000+1 0.000000+0 2.000000-3 2.300000-2 0.000000+09237 2151    9\n",
-        );
+        const ENDF: &str =
+            include_str!("../../../tests/data/synthetic/lrf2_urr_int3_roundtrip.endf");
 
         let data = parse_endf_file2(ENDF).expect("LRF=2 URR with INT=3 must parse");
         assert_eq!(data.ranges.len(), 1, "must have one URR range");
@@ -2401,18 +2256,8 @@ mod tests {
     #[test]
     fn test_parse_lrf2_urr_int0_rejected() {
         // Same skeleton as INT=3 test, but with INT=0 in the J CONT.
-        const ENDF: &str = concat!(
-            " 9.223800+4 2.360060+2          0          0          1          09237 2151    1\n",
-            " 9.223800+4 1.000000+0          0          0          1          09237 2151    2\n",
-            " 1.000000+3 1.000000+5          2          2          0          09237 2151    3\n",
-            " 0.000000+0 9.428000-1          0          0          1          09237 2151    4\n",
-            " 2.360060+2 0.000000+0          0          0          1          09237 2151    5\n",
-            // J CONT: INT=0 (out-of-spec)
-            " 5.000000-1 0.000000+0          0          0         18          29237 2151    6\n",
-            " 0.000000+0 0.000000+0 0.000000+0 1.000000+0 0.000000+0 0.000000+09237 2151    7\n",
-            " 1.000000+3 2.000000+1 0.000000+0 1.000000-3 2.300000-2 0.000000+09237 2151    8\n",
-            " 1.000000+5 2.200000+1 0.000000+0 2.000000-3 2.300000-2 0.000000+09237 2151    9\n",
-        );
+        const ENDF: &str =
+            include_str!("../../../tests/data/synthetic/lrf2_urr_int0_rejected.endf");
 
         let err = parse_endf_file2(ENDF).unwrap_err();
         // Match on the error variant structurally so the test only
@@ -2510,20 +2355,8 @@ mod tests {
     fn test_bw_negative_l_rejected() {
         // Minimal SLBW fixture: HEAD + isotope CONT + range CONT + SPI/AP CONT +
         // L-group CONT with L=-1 (field 3 = -1).
-        const ENDF: &str = concat!(
-            // HEAD: ZA=92238, AWR=236, NIS=1
-            " 9.223800+4 2.360000+2          0          0          1          09237 2151    1\n",
-            // Isotope CONT: NER=1
-            " 9.223800+4 1.000000+0          0          0          1          09237 2151    2\n",
-            // Range CONT: LRU=1, LRF=1 (SLBW), NRO=0, NAPS=0
-            " 1.000000-5 1.000000+4          1          1          0          09237 2151    3\n",
-            // SPI/AP CONT: SPI=0, AP=9.4, NLS=1
-            " 0.000000+0 9.400000-1          0          0          1          09237 2151    4\n",
-            // L-group CONT: AWRI=236, QX=0, L=-1 (invalid), LRX=0, N1=6, NRS=1
-            " 2.360000+2 0.000000+0         -1          0          6          19237 2151    5\n",
-            // Resonance data (won't be reached)
-            " 6.674000+0 5.000000-1 2.500000-2 1.493000-3 2.300000-2 0.000000+09237 2151    6\n",
-        );
+        const ENDF: &str =
+            include_str!("../../../tests/data/synthetic/lrf1_bw_negative_l_rejected.endf");
 
         let err = parse_endf_file2(ENDF).unwrap_err();
         assert!(
@@ -2535,20 +2368,8 @@ mod tests {
     /// Negative L-value in a Reich-Moore range is rejected.
     #[test]
     fn test_rm_negative_l_rejected() {
-        const ENDF: &str = concat!(
-            // HEAD: ZA=92238, AWR=236, NIS=1
-            " 9.223800+4 2.360000+2          0          0          1          09237 2151    1\n",
-            // Isotope CONT: NER=1
-            " 9.223800+4 1.000000+0          0          0          1          09237 2151    2\n",
-            // Range CONT: LRU=1, LRF=3 (Reich-Moore), NRO=0, NAPS=0
-            " 1.000000-5 1.000000+4          1          3          0          09237 2151    3\n",
-            // SPI/AP CONT: SPI=0, AP=9.4, NLS=1
-            " 0.000000+0 9.400000-1          0          0          1          09237 2151    4\n",
-            // L-group CONT: AWRI=236, APL=0, L=-2 (invalid), 0, N1=6, NRS=1
-            " 2.360000+2 0.000000+0         -2          0          6          19237 2151    5\n",
-            // Resonance data (won't be reached)
-            " 6.674000+0 5.000000-1 1.493000-3 2.300000-2 0.000000+0 0.000000+09237 2151    6\n",
-        );
+        const ENDF: &str =
+            include_str!("../../../tests/data/synthetic/lrf3_rm_negative_l_rejected.endf");
 
         let err = parse_endf_file2(ENDF).unwrap_err();
         assert!(
@@ -2563,16 +2384,8 @@ mod tests {
     /// NLS=0 (no L-groups for scattering-radius-only ranges).
     #[test]
     fn test_lru0_nonzero_nls_rejected() {
-        const ENDF: &str = concat!(
-            // HEAD: ZA=92238, AWR=236, NIS=1
-            " 9.223800+4 2.360000+2          0          0          1          09237 2151    1\n",
-            // Isotope CONT: NER=1
-            " 9.223800+4 1.000000+0          0          0          1          09237 2151    2\n",
-            // Range CONT: LRU=0 (scattering-radius-only), LRF=0, NRO=0, NAPS=0
-            " 1.000000-5 1.000000+4          0          0          0          09237 2151    3\n",
-            // SPI/AP CONT: SPI=0, AP=9.4, L1=0, L2=0, NLS=3 (invalid!), N2=0
-            " 0.000000+0 9.400000-1          0          0          3          09237 2151    4\n",
-        );
+        const ENDF: &str =
+            include_str!("../../../tests/data/synthetic/lru0_nonzero_nls_rejected.endf");
 
         let err = parse_endf_file2(ENDF).unwrap_err();
         assert!(
@@ -2590,26 +2403,8 @@ mod tests {
     /// This synthetic snippet has: NE=2, NLS=1, NJS=1.
     #[test]
     fn test_lfw1_urr_gracefully_skipped() {
-        const ENDF: &str = concat!(
-            // HEAD: ZA=92233, AWR=231.038, NIS=1
-            " 9.223300+4 2.310380+2          0          0          1          09222 2151    1\n",
-            // Isotope CONT: ZAI=92233, ABN=1.0, LFW=1, NER=1
-            " 9.223300+4 1.000000+0          0          1          1          09222 2151    2\n",
-            // Range CONT: EL=600, EH=3e4, LRU=2, LRF=1, NRO=0, NAPS=0
-            " 6.000000+2 3.000000+4          2          1          0          09222 2151    3\n",
-            // --- LFW=1, LRF=1 body (Case B) ---
-            // CONT: SPI=3.5, AP=9.4, LSSF=0, 0, NE=2, NLS=1
-            " 3.500000+0 9.400000-1          0          0          2          19222 2151    4\n",
-            // LIST: 2 energy values (NE=2, padded to 6 per line)
-            " 6.000000+2 3.000000+4 0.000000+0 0.000000+0 0.000000+0 0.000000+09222 2151    5\n",
-            // L=0 CONT: AWRI=231, 0, L=0, 0, NJS=1, 0
-            " 2.310380+2 0.000000+0          0          0          1          09222 2151    6\n",
-            // J=3.0 LIST: 6 header + NE=2 fission widths = 8 values (→ 2 lines of 6)
-            " 1.000000+1 3.000000+0 1.000000+0 5.000000-2 4.000000-2 0.000000+09222 2151    7\n",
-            " 1.000000-1 2.000000-1 0.000000+0 0.000000+0 0.000000+0 0.000000+09222 2151    8\n",
-            // SEND
-            "                                                                  9222 0  0    0\n",
-        );
+        const ENDF: &str =
+            include_str!("../../../tests/data/synthetic/lfw1_urr_gracefully_skipped.endf");
 
         let data = parse_endf_file2(ENDF).expect("LFW=1 URR parse should succeed");
         // LFW=1/LRF=1 is now fully parsed — URR data should be present.
@@ -2633,16 +2428,8 @@ mod tests {
     /// malformed or mis-identified record.
     #[test]
     fn test_lru0_nonzero_l1_rejected() {
-        const ENDF: &str = concat!(
-            // HEAD: ZA=92238, AWR=236, NIS=1
-            " 9.223800+4 2.360000+2          0          0          1          09237 2151    1\n",
-            // Isotope CONT: NER=1
-            " 9.223800+4 1.000000+0          0          0          1          09237 2151    2\n",
-            // Range CONT: LRU=0 (scattering-radius-only), LRF=0, NRO=0, NAPS=0
-            " 1.000000-5 1.000000+4          0          0          0          09237 2151    3\n",
-            // SPI/AP CONT: SPI=0, AP=9.4, L1=5 (invalid!), L2=0, NLS=0, N2=0
-            " 0.000000+0 9.400000-1          5          0          0          09237 2151    4\n",
-        );
+        const ENDF: &str =
+            include_str!("../../../tests/data/synthetic/lru0_nonzero_l1_rejected.endf");
 
         let err = parse_endf_file2(ENDF).unwrap_err();
         assert!(
@@ -2654,20 +2441,8 @@ mod tests {
     /// N1 != 6*NRS in a BW range CONT is rejected.
     #[test]
     fn test_bw_n1_nrs_mismatch_rejected() {
-        const ENDF: &str = concat!(
-            // HEAD: ZA=92238, AWR=236, NIS=1
-            " 9.223800+4 2.360000+2          0          0          1          09237 2151    1\n",
-            // Isotope CONT: NER=1
-            " 9.223800+4 1.000000+0          0          0          1          09237 2151    2\n",
-            // Range CONT: LRU=1, LRF=1 (SLBW), NRO=0, NAPS=0
-            " 1.000000-5 1.000000+4          1          1          0          09237 2151    3\n",
-            // SPI/AP CONT: SPI=0, AP=9.4, NLS=1
-            " 0.000000+0 9.400000-1          0          0          1          09237 2151    4\n",
-            // L-group CONT: AWRI=236, QX=0, L=0, LRX=0, N1=7 (should be 6), NRS=1
-            " 2.360000+2 0.000000+0          0          0          7          19237 2151    5\n",
-            // Resonance data (won't be fully consumed)
-            " 6.674000+0 5.000000-1 2.500000-2 1.493000-3 2.300000-2 0.000000+09237 2151    6\n",
-        );
+        const ENDF: &str =
+            include_str!("../../../tests/data/synthetic/lrf1_bw_n1_nrs_mismatch_rejected.endf");
 
         let err = parse_endf_file2(ENDF).unwrap_err();
         assert!(
@@ -2682,22 +2457,7 @@ mod tests {
     fn test_multi_mat_detection() {
         // A valid single-range SLBW file with an extra trailing data line
         // that still carries MF=2/MT=151 tags.
-        const ENDF: &str = concat!(
-            // HEAD: ZA=92238, AWR=236, NIS=1
-            " 9.223800+4 2.360000+2          0          0          1          09237 2151    1\n",
-            // Isotope CONT: NER=1
-            " 9.223800+4 1.000000+0          0          0          1          09237 2151    2\n",
-            // Range CONT: LRU=1, LRF=1 (SLBW), NRO=0, NAPS=0
-            " 1.000000-5 1.000000+4          1          1          0          09237 2151    3\n",
-            // SPI/AP CONT: SPI=0, AP=9.4, NLS=1
-            " 0.000000+0 9.400000-1          0          0          1          09237 2151    4\n",
-            // L-group CONT: AWRI=236, QX=0, L=0, LRX=0, N1=6, NRS=1
-            " 2.360000+2 0.000000+0          0          0          6          19237 2151    5\n",
-            // Resonance data
-            " 6.674000+0 5.000000-1 2.500000-2 1.493000-3 2.300000-2 0.000000+09237 2151    6\n",
-            // Extra unconsumed line (another material's HEAD)
-            " 2.600500+4 2.503200+1          0          0          1          02631 2151    1\n",
-        );
+        const ENDF: &str = include_str!("../../../tests/data/synthetic/multi_mat_detection.endf");
 
         let err = parse_endf_file2(ENDF).unwrap_err();
         assert!(
@@ -2772,30 +2532,7 @@ mod tests {
         // ZA=29000 (nat-Cu); for NIS=1 callers that would be rejected by
         // `isotope_from_za` with an "A=0" error, but the NIS=2 check runs
         // first and returns the expected UnsupportedFormat.
-        const ENDF: &str = concat!(
-            // HEAD: ZA=29000 (natural Cu), AWR=63, NIS=2
-            " 2.900000+4 6.300000+1          0          0          2          02963 2151    1\n",
-            // ── Isotope 1 (Cu-63) CONT: ZAI=29063, ABN=0.6917, LFW=0, NER=1 ─
-            " 2.906300+4 6.917000-1          0          0          1          02963 2151    2\n",
-            // Range CONT: LRU=1, LRF=1 (SLBW), NRO=0, NAPS=0
-            " 1.000000-5 1.000000+4          1          1          0          02963 2151    3\n",
-            // SPI/AP CONT: SPI=0, AP=7.0, NLS=1
-            " 0.000000+0 7.000000-1          0          0          1          02963 2151    4\n",
-            // L-group CONT: AWRI=62.4, QX=0, L=0, LRX=0, N1=6, NRS=1
-            " 6.240000+1 0.000000+0          0          0          6          12963 2151    5\n",
-            // Resonance data
-            " 5.790000+2 5.000000-1 4.700000-1 1.000000-2 4.600000-1 0.000000+02963 2151    6\n",
-            // ── Isotope 2 (Cu-65) CONT: ZAI=29065, ABN=0.3083, LFW=0, NER=1 ─
-            " 2.906500+4 3.083000-1          0          0          1          02963 2151    7\n",
-            // Range CONT: LRU=1, LRF=1 (SLBW), NRO=0, NAPS=0
-            " 1.000000-5 1.000000+4          1          1          0          02963 2151    8\n",
-            // SPI/AP CONT: SPI=0, AP=7.0, NLS=1
-            " 0.000000+0 7.000000-1          0          0          1          02963 2151    9\n",
-            // L-group CONT: AWRI=64.4, QX=0, L=0, LRX=0, N1=6, NRS=1
-            " 6.440000+1 0.000000+0          0          0          6          12963 2151   10\n",
-            // Resonance data
-            " 2.300000+2 1.500000+0 2.000000-1 5.000000-3 1.950000-1 0.000000+02963 2151   11\n",
-        );
+        const ENDF: &str = include_str!("../../../tests/data/synthetic/nis_gt_1_rejected.endf");
 
         let err = parse_endf_file2(ENDF).unwrap_err();
         match &err {
@@ -2840,50 +2577,8 @@ mod tests {
     /// each resonance carries 5 partial widths.
     #[test]
     fn test_parse_lrf7_l2_holds_nrs_with_nx_neq_nrs() {
-        const ENDF: &str = concat!(
-            // ── HEAD: ZA=74184, AWR=182, NIS=1 ──────────────────────────────
-            " 7.418400+4 1.820000+2          0          0          1          07437 2151    1\n",
-            // ── Isotope CONT: NER=1 ─────────────────────────────────────────
-            " 7.418400+4 1.000000+0          0          0          1          07437 2151    2\n",
-            // ── Range CONT: LRU=1, LRF=7, NRO=0, NAPS=0 ─────────────────────
-            " 1.000000-5 1.000000+3          1          7          0          07437 2151    3\n",
-            // ── LRF=7 CONT: SPI=0, AP=0.7, IFG=0, KRM=3, NJS=1, KRL=0 ───────
-            " 0.000000+0 7.000000-1          0          3          1          07437 2151    4\n",
-            // ── Particle-pair LIST CONT: NPP=1, N1=12, N2=1 ─────────────────
-            " 0.000000+0 0.000000+0          1          0         12          17437 2151    5\n",
-            // Particle pair 1: MA=1, MB=182, ZA=0, ZB=0, IA=0.5, IB=0
-            " 1.000000+0 1.820000+2 0.000000+0 0.000000+0 5.000000-1 0.000000+07437 2151    6\n",
-            // Q=0, PNT=1, SHF=0, MT=2, PA=1, PB=1
-            " 0.000000+0 1.000000+0 0.000000+0 2.000000+0 1.000000+0 1.000000+07437 2151    7\n",
-            // ── Spin-group LIST CONT: AJ=0.5, KBK=0, KPS=0, NPL=36, NCH+1=6 ─
-            // header row + 5 channel rows = 6 rows of 6 floats = NPL=36.
-            " 5.000000-1 0.000000+0          0          0         36          67437 2151    8\n",
-            // Header row (6 zeros, ignored by parser)
-            " 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+07437 2151    9\n",
-            // Channel 0: IPP=1, L=0, SCH=0.5, BND=0, APE=0.7, APT=0.7
-            " 1.000000+0 0.000000+0 5.000000-1 0.000000+0 7.000000-1 7.000000-17437 2151   10\n",
-            // Channel 1
-            " 1.000000+0 0.000000+0 5.000000-1 0.000000+0 7.000000-1 7.000000-17437 2151   11\n",
-            // Channel 2
-            " 1.000000+0 0.000000+0 5.000000-1 0.000000+0 7.000000-1 7.000000-17437 2151   12\n",
-            // Channel 3
-            " 1.000000+0 0.000000+0 5.000000-1 0.000000+0 7.000000-1 7.000000-17437 2151   13\n",
-            // Channel 4
-            " 1.000000+0 0.000000+0 5.000000-1 0.000000+0 7.000000-1 7.000000-17437 2151   14\n",
-            // ── Resonance LIST CONT: NRS=2 (L2), NPL=24 (N1), NX=4 (N2) ─────
-            // ENDF-6 §2.2.1.6: [0.0, 0.0, 0, L2=NRS, N1=6*NX, N2=NX].
-            // Per-resonance stride = NCH+2 = 7 floats → 2 packed rows of 6
-            // (12 floats per resonance, last 5 padding zeros), so NX = 2·2 = 4.
-            " 0.000000+0 0.000000+0          0          2         24          47437 2151   15\n",
-            // res0 row A: ER=10 eV, Γγ=0.025 eV, Γ_1=0.001, Γ_2=0.002, Γ_3=0.003, Γ_4=0.004
-            " 1.000000+1 2.500000-2 1.000000-3 2.000000-3 3.000000-3 4.000000-37437 2151   16\n",
-            // res0 row B: Γ_5=0.005, 5 padding zeros
-            " 5.000000-3 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+07437 2151   17\n",
-            // res1 row A: ER=20 eV, Γγ=0.030 eV, Γ_1=0.010, Γ_2=0.020, Γ_3=0.030, Γ_4=0.040
-            " 2.000000+1 3.000000-2 1.000000-2 2.000000-2 3.000000-2 4.000000-27437 2151   18\n",
-            // res1 row B: Γ_5=0.050, 5 padding zeros
-            " 5.000000-2 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+07437 2151   19\n",
-        );
+        const ENDF: &str =
+            include_str!("../../../tests/data/synthetic/lrf7_l2_holds_nrs_with_nx_neq_nrs.endf");
 
         let data = parse_endf_file2(ENDF).expect(
             "LRF=7 fixture with NX != NRS must parse without error after the NRS-from-L2 fix",
@@ -2950,27 +2645,8 @@ mod tests {
     /// the offending spin group.
     #[test]
     fn test_parse_lrf7_rejects_nonzero_kbk() {
-        const ENDF: &str = concat!(
-            // ── HEAD: ZA=74184, AWR=182, NIS=1 ──────────────────────────────
-            " 7.418400+4 1.820000+2          0          0          1          07437 2151    1\n",
-            // ── Isotope CONT: NER=1 ─────────────────────────────────────────
-            " 7.418400+4 1.000000+0          0          0          1          07437 2151    2\n",
-            // ── Range CONT: LRU=1, LRF=7, NRO=0, NAPS=0 ─────────────────────
-            " 1.000000-5 1.000000+3          1          7          0          07437 2151    3\n",
-            // ── LRF=7 CONT: SPI=0, AP=0.7, IFG=0, KRM=3, NJS=1, KRL=0 ───────
-            " 0.000000+0 7.000000-1          0          3          1          07437 2151    4\n",
-            // ── Particle-pair LIST CONT: NPP=1, N1=12, N2=1 ─────────────────
-            " 0.000000+0 0.000000+0          1          0         12          17437 2151    5\n",
-            " 1.000000+0 1.820000+2 0.000000+0 0.000000+0 5.000000-1 0.000000+07437 2151    6\n",
-            " 0.000000+0 1.000000+0 0.000000+0 2.000000+0 1.000000+0 1.000000+07437 2151    7\n",
-            // ── Spin-group LIST CONT: AJ=0.5, KBK=1 (L1), KPS=0, NPL=12, NCH+1=2
-            " 5.000000-1 0.000000+0          1          0         12          27437 2151    8\n",
-            " 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+07437 2151    9\n",
-            " 1.000000+0 0.000000+0 5.000000-1 0.000000+0 7.000000-1 7.000000-17437 2151   10\n",
-            // ── Resonance LIST CONT: NRS=1 (L2), NPL=6 (N1), NX=1 (N2) ──────
-            " 0.000000+0 0.000000+0          0          1          6          17437 2151   11\n",
-            " 1.000000+1 2.500000-2 1.000000-3 0.000000+0 0.000000+0 0.000000+07437 2151   12\n",
-        );
+        const ENDF: &str =
+            include_str!("../../../tests/data/synthetic/lrf7_nonzero_kbk_rejected.endf");
 
         let err = parse_endf_file2(ENDF).unwrap_err();
         match &err {
@@ -2991,27 +2667,8 @@ mod tests {
     /// NEREIDS adopts the same behaviour rather than guess at a layout.
     #[test]
     fn test_parse_lrf7_rejects_nonzero_kps() {
-        const ENDF: &str = concat!(
-            // ── HEAD: ZA=74184, AWR=182, NIS=1 ──────────────────────────────
-            " 7.418400+4 1.820000+2          0          0          1          07437 2151    1\n",
-            // ── Isotope CONT: NER=1 ─────────────────────────────────────────
-            " 7.418400+4 1.000000+0          0          0          1          07437 2151    2\n",
-            // ── Range CONT: LRU=1, LRF=7, NRO=0, NAPS=0 ─────────────────────
-            " 1.000000-5 1.000000+3          1          7          0          07437 2151    3\n",
-            // ── LRF=7 CONT: SPI=0, AP=0.7, IFG=0, KRM=3, NJS=1, KRL=0 ───────
-            " 0.000000+0 7.000000-1          0          3          1          07437 2151    4\n",
-            // ── Particle-pair LIST CONT: NPP=1, N1=12, N2=1 ─────────────────
-            " 0.000000+0 0.000000+0          1          0         12          17437 2151    5\n",
-            " 1.000000+0 1.820000+2 0.000000+0 0.000000+0 5.000000-1 0.000000+07437 2151    6\n",
-            " 0.000000+0 1.000000+0 0.000000+0 2.000000+0 1.000000+0 1.000000+07437 2151    7\n",
-            // ── Spin-group LIST CONT: AJ=0.5, KBK=0, KPS=1 (L2), NPL=12, NCH+1=2
-            " 5.000000-1 0.000000+0          0          1         12          27437 2151    8\n",
-            " 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+07437 2151    9\n",
-            " 1.000000+0 0.000000+0 5.000000-1 0.000000+0 7.000000-1 7.000000-17437 2151   10\n",
-            // ── Resonance LIST CONT: NRS=1 (L2), NPL=6 (N1), NX=1 (N2) ──────
-            " 0.000000+0 0.000000+0          0          1          6          17437 2151   11\n",
-            " 1.000000+1 2.500000-2 1.000000-3 0.000000+0 0.000000+0 0.000000+07437 2151   12\n",
-        );
+        const ENDF: &str =
+            include_str!("../../../tests/data/synthetic/lrf7_nonzero_kps_rejected.endf");
 
         let err = parse_endf_file2(ENDF).unwrap_err();
         match &err {
@@ -3039,8 +2696,7 @@ mod tests {
         // ZA=74184 (W-184) is a valid identifier, so any error must come
         // from the NIS=0 guard, not from `isotope_from_za`.
         // HEAD: ZA=74184, AWR=182, NIS=0
-        const ENDF: &str =
-            " 7.418400+4 1.820000+2          0          0          0          07437 2151    1\n";
+        const ENDF: &str = include_str!("../../../tests/data/synthetic/nis_zero_rejected.endf");
 
         let err = parse_endf_file2(ENDF).unwrap_err();
         match &err {
@@ -3071,34 +2727,8 @@ mod tests {
     /// bogus stride. The new guard catches this directly.
     #[test]
     fn test_parse_lrf7_rejects_nx_not_multiple_of_nrs() {
-        const ENDF: &str = concat!(
-            // ── HEAD: ZA=74184, AWR=182, NIS=1 ──────────────────────────────
-            " 7.418400+4 1.820000+2          0          0          1          07437 2151    1\n",
-            // ── Isotope CONT: NER=1 ─────────────────────────────────────────
-            " 7.418400+4 1.000000+0          0          0          1          07437 2151    2\n",
-            // ── Range CONT: LRU=1, LRF=7, NRO=0, NAPS=0 ─────────────────────
-            " 1.000000-5 1.000000+3          1          7          0          07437 2151    3\n",
-            // ── LRF=7 CONT: SPI=0, AP=0.7, IFG=0, KRM=3, NJS=1, KRL=0 ───────
-            " 0.000000+0 7.000000-1          0          3          1          07437 2151    4\n",
-            // ── Particle-pair LIST CONT: NPP=1, N1=12, N2=1 ─────────────────
-            " 0.000000+0 0.000000+0          1          0         12          17437 2151    5\n",
-            " 1.000000+0 1.820000+2 0.000000+0 0.000000+0 5.000000-1 0.000000+07437 2151    6\n",
-            " 0.000000+0 1.000000+0 0.000000+0 2.000000+0 1.000000+0 1.000000+07437 2151    7\n",
-            // ── Spin-group LIST CONT: AJ=0.5, KBK=0, KPS=0, NPL=12, NCH+1=2 ─
-            " 5.000000-1 0.000000+0          0          0         12          27437 2151    8\n",
-            // Header row + 1 channel row.
-            " 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+07437 2151    9\n",
-            " 1.000000+0 0.000000+0 5.000000-1 0.000000+0 7.000000-1 7.000000-17437 2151   10\n",
-            // ── Resonance LIST CONT: NRS=4 (L2), NPL=12 (N1), NX=2 (N2) ─────
-            // Invalid: NX=2 is not a multiple of NRS=4. NPL=6*NX=12 passes
-            // the existing res_npl==6*nx guard; only the new nx%nrs guard
-            // catches this.
-            " 0.000000+0 0.000000+0          0          4         12          27437 2151   11\n",
-            // 12 floats of (would-be) resonance data; never reached since the
-            // reject fires immediately after the resonance LIST CONT.
-            " 1.000000+1 2.500000-2 1.000000-3 0.000000+0 0.000000+0 0.000000+07437 2151   12\n",
-            " 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+07437 2151   13\n",
-        );
+        const ENDF: &str =
+            include_str!("../../../tests/data/synthetic/lrf7_nx_not_multiple_of_nrs_rejected.endf");
 
         let err = parse_endf_file2(ENDF).unwrap_err();
         match &err {
@@ -3146,31 +2776,8 @@ mod tests {
     /// malformed shapes such as NRS=0/NX=2.
     #[test]
     fn test_parse_lrf7_accepts_nrs_zero_nx_one_canonical_empty() {
-        const ENDF: &str = concat!(
-            // ── HEAD: ZA=74184, AWR=182, NIS=1 ──────────────────────────────
-            " 7.418400+4 1.820000+2          0          0          1          07437 2151    1\n",
-            // ── Isotope CONT: NER=1 ─────────────────────────────────────────
-            " 7.418400+4 1.000000+0          0          0          1          07437 2151    2\n",
-            // ── Range CONT: LRU=1, LRF=7, NRO=0, NAPS=0 ─────────────────────
-            " 1.000000-5 1.000000+3          1          7          0          07437 2151    3\n",
-            // ── LRF=7 CONT: SPI=0, AP=0.7, IFG=0, KRM=3, NJS=1, KRL=0 ───────
-            " 0.000000+0 7.000000-1          0          3          1          07437 2151    4\n",
-            // ── Particle-pair LIST CONT: NPP=1, N1=12, N2=1 ─────────────────
-            " 0.000000+0 0.000000+0          1          0         12          17437 2151    5\n",
-            " 1.000000+0 1.820000+2 0.000000+0 0.000000+0 5.000000-1 0.000000+07437 2151    6\n",
-            " 0.000000+0 1.000000+0 0.000000+0 2.000000+0 1.000000+0 1.000000+07437 2151    7\n",
-            // ── Spin-group LIST CONT: AJ=0.5, KBK=0, KPS=0, NPL=12, NCH+1=2 ─
-            " 5.000000-1 0.000000+0          0          0         12          27437 2151    8\n",
-            " 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+07437 2151    9\n",
-            " 1.000000+0 0.000000+0 5.000000-1 0.000000+0 7.000000-1 7.000000-17437 2151   10\n",
-            // ── Resonance LIST CONT: NRS=0 (L2), NPL=6 (N1=6*NX), NX=1 (N2) ─
-            // Canonical empty spin group per ENDF-6 §2.2.1.6 + OpenScale
-            // File2.cpp:683-697: a single six-float zero-filler row keeps the
-            // LIST body non-degenerate even when no resonances are present.
-            " 0.000000+0 0.000000+0          0          0          6          17437 2151   11\n",
-            // Six-float zero-filler row (NX=1 row of 6 zeros).
-            " 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+07437 2151   12\n",
-        );
+        const ENDF: &str =
+            include_str!("../../../tests/data/synthetic/lrf7_nrs_zero_nx_one_canonical_empty.endf");
 
         let data = parse_endf_file2(ENDF)
             .expect("LRF=7 fixture with NRS=0/NX=1 canonical empty spin group must parse cleanly");
@@ -3207,29 +2814,8 @@ mod tests {
     /// interpret as resonance parameters.
     #[test]
     fn test_parse_lrf7_rejects_nrs_zero_nx_two_malformed() {
-        const ENDF: &str = concat!(
-            // ── HEAD: ZA=74184, AWR=182, NIS=1 ──────────────────────────────
-            " 7.418400+4 1.820000+2          0          0          1          07437 2151    1\n",
-            // ── Isotope CONT: NER=1 ─────────────────────────────────────────
-            " 7.418400+4 1.000000+0          0          0          1          07437 2151    2\n",
-            // ── Range CONT: LRU=1, LRF=7, NRO=0, NAPS=0 ─────────────────────
-            " 1.000000-5 1.000000+3          1          7          0          07437 2151    3\n",
-            // ── LRF=7 CONT: SPI=0, AP=0.7, IFG=0, KRM=3, NJS=1, KRL=0 ───────
-            " 0.000000+0 7.000000-1          0          3          1          07437 2151    4\n",
-            // ── Particle-pair LIST CONT: NPP=1, N1=12, N2=1 ─────────────────
-            " 0.000000+0 0.000000+0          1          0         12          17437 2151    5\n",
-            " 1.000000+0 1.820000+2 0.000000+0 0.000000+0 5.000000-1 0.000000+07437 2151    6\n",
-            " 0.000000+0 1.000000+0 0.000000+0 2.000000+0 1.000000+0 1.000000+07437 2151    7\n",
-            // ── Spin-group LIST CONT: AJ=0.5, KBK=0, KPS=0, NPL=12, NCH+1=2 ─
-            " 5.000000-1 0.000000+0          0          0         12          27437 2151    8\n",
-            " 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+07437 2151    9\n",
-            " 1.000000+0 0.000000+0 5.000000-1 0.000000+0 7.000000-1 7.000000-17437 2151   10\n",
-            // ── Resonance LIST CONT: NRS=0 (L2), NPL=12 (N1=6*NX), NX=2 (N2) ─
-            // Malformed: OpenScale requires NX=1 when NRS=0.
-            " 0.000000+0 0.000000+0          0          0         12          27437 2151   11\n",
-            " 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+07437 2151   12\n",
-            " 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+07437 2151   13\n",
-        );
+        const ENDF: &str =
+            include_str!("../../../tests/data/synthetic/lrf7_nrs_zero_nx_two_malformed.endf");
 
         let err = parse_endf_file2(ENDF).unwrap_err();
         match &err {
