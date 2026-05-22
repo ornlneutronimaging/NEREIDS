@@ -21,115 +21,15 @@
 mod common;
 
 use nereids_physics::resolution::{
-    ResolutionError, ResolutionMatrix, ResolutionPlan, TabulatedResolution, apply_r,
-    apply_resolution_with_matrix, test_support,
+    ResolutionError, ResolutionMatrix, ResolutionPlan, apply_r, apply_resolution_with_matrix,
+    test_support,
 };
 
-// ── Helpers (duplicated from `src/resolution.rs` tests — keeping
-//    the crate's public surface minimal per issue #497 scope) ─────
-
-fn interp_spectrum(energies: &[f64], spectrum: &[f64], e: f64) -> Option<f64> {
-    // Verbatim copy of the canonical helper at
-    // crates/nereids-physics/src/resolution.rs:2541 (used by the
-    // in-src `broaden_presorted_reference` oracle).  Codex flagged
-    // an earlier rewritten variant in PR #545 round-1 review as
-    // semantically divergent (binary_search_by + early-return on
-    // exact hits vs upper-bound search + always-interpolate) —
-    // either path of divergence can flip the bit-exact comparison
-    // on exact-grid-hit / duplicate-grid edge cases.  Keep this in
-    // sync with the in-src version verbatim; if the production
-    // helper changes, mirror the change here.
-    let n = energies.len();
-    if n == 0 {
-        return None;
-    }
-    if e < energies[0] || e > energies[n - 1] {
-        return None;
-    }
-    let mut lo = 0;
-    let mut hi = n - 1;
-    while hi - lo > 1 {
-        let mid = (lo + hi) / 2;
-        if energies[mid] <= e {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-    let span = energies[hi] - energies[lo];
-    if span.abs() < nereids_core::constants::NEAR_ZERO_FLOOR {
-        return Some(spectrum[lo]);
-    }
-    let frac = (e - energies[lo]) / span;
-    Some(spectrum[lo] + frac * (spectrum[hi] - spectrum[lo]))
-}
-
-/// Reference implementation — the pre-optimization
-/// `broaden_presorted`.  Used solely as the equivalence oracle in
-/// the bit-exact test below.  Duplicated from `src/resolution.rs`
-/// rather than promoting the crate-internal helper to `pub`; uses
-/// `test_support::TOF_FACTOR` + `test_support::interpolated_kernel`
-/// so the oracle and SUT share the exact same constants and
-/// interior math.
-fn broaden_presorted_reference(
-    tab: &TabulatedResolution,
-    energies: &[f64],
-    spectrum: &[f64],
-) -> Vec<f64> {
-    use nereids_core::constants::DIVISION_FLOOR;
-    let tof_factor = test_support::TOF_FACTOR;
-
-    let n = energies.len();
-    if n == 0 {
-        return vec![];
-    }
-    let mut result = vec![0.0f64; n];
-    for i in 0..n {
-        let e = energies[i];
-        if e <= 0.0 {
-            result[i] = spectrum[i];
-            continue;
-        }
-        let tof_center = tof_factor * tab.flight_path_m() / e.sqrt();
-        let (offsets, weights) = test_support::interpolated_kernel(tab, e);
-        let mut sum = 0.0;
-        let mut norm = 0.0;
-        for k in 0..offsets.len() {
-            let dt = offsets[k];
-            let w = weights[k];
-            if w <= 0.0 {
-                continue;
-            }
-            let tof_prime = tof_center + dt;
-            if tof_prime <= 0.0 {
-                continue;
-            }
-            let e_prime = (tof_factor * tab.flight_path_m() / tof_prime).powi(2);
-            let s = match interp_spectrum(energies, spectrum, e_prime) {
-                Some(v) => v,
-                None => continue,
-            };
-            let dt_width = if k > 0 && k < offsets.len() - 1 {
-                (offsets[k + 1] - offsets[k - 1]) * 0.5
-            } else if k == 0 && offsets.len() > 1 {
-                offsets[1] - offsets[0]
-            } else if k == offsets.len() - 1 && offsets.len() > 1 {
-                offsets[k] - offsets[k - 1]
-            } else {
-                1.0
-            };
-            let weight = w * dt_width.abs();
-            sum += weight * s;
-            norm += weight;
-        }
-        result[i] = if norm > DIVISION_FLOOR {
-            sum / norm
-        } else {
-            spectrum[i]
-        };
-    }
-    result
-}
+// The `interp_spectrum` + `broaden_presorted_reference` oracles were
+// promoted to `nereids_physics::resolution::test_support` so this
+// integration test shares the byte-identical reference with the in-src
+// tests and the microbench.  Imported via the `test_support` module
+// already in scope above.
 
 fn assert_bit_exact(reference: &[f64], actual: &[f64], label: &str) {
     assert_eq!(reference.len(), actual.len(), "{label}: length mismatch");
@@ -209,7 +109,7 @@ fn test_broaden_presorted_bit_exact_on_venus_usr() {
         })
         .collect();
 
-    let reference = broaden_presorted_reference(&tab, &energies, &spectrum);
+    let reference = test_support::broaden_presorted_reference(&tab, &energies, &spectrum);
     let actual = test_support::broaden_presorted(&tab, &energies, &spectrum);
     assert_bit_exact(&reference, &actual, "venus_usr_synthetic_resolution");
 }
