@@ -1474,46 +1474,8 @@ mod tests {
     #[test]
     fn test_deviance_per_dof_asymptote() {
         // Deterministic generator (xorshift) so the test is reproducible.
-        struct Xorshift(u64);
-        impl Xorshift {
-            fn next_u64(&mut self) -> u64 {
-                let mut x = self.0;
-                x ^= x << 13;
-                x ^= x >> 7;
-                x ^= x << 17;
-                self.0 = x;
-                x
-            }
-            // Knuth-style Poisson sampler (good enough for rate ≤ ~100).
-            fn poisson(&mut self, lambda: f64) -> f64 {
-                if lambda <= 0.0 {
-                    return 0.0;
-                }
-                if lambda > 30.0 {
-                    // Gaussian approx for moderate rates — test cells all
-                    // use small λ, but keep the branch for robustness.
-                    let u1 = (self.next_u64() as f64) / (u64::MAX as f64);
-                    let u2 = (self.next_u64() as f64) / (u64::MAX as f64);
-                    let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
-                    return (lambda + z * lambda.sqrt()).round().max(0.0);
-                }
-                let l = (-lambda).exp();
-                let mut k: f64 = 0.0;
-                let mut p: f64 = 1.0;
-                loop {
-                    k += 1.0;
-                    let u = (self.next_u64() as f64) / (u64::MAX as f64);
-                    p *= u;
-                    if p <= l {
-                        return k - 1.0;
-                    }
-                    if k > 1000.0 {
-                        return k - 1.0;
-                    }
-                }
-            }
-        }
-
+        // `Xorshift` is defined at the module level below — Rust item order
+        // is not significant inside a module.
         let n_bins = 200;
         let t_true = 0.35_f64;
         let c = 2.0;
@@ -1773,7 +1735,8 @@ mod tests {
     }
 
     /// Deterministic Poisson generator (Knuth for small λ, Gaussian for
-    /// large).  Duplicated from asymptote test so each test is self-contained.
+    /// large).  Shared across the stochastic-asymptote and joint-Poisson
+    /// fit tests in this module.
     struct Xorshift(u64);
     impl Xorshift {
         fn next_u64(&mut self) -> u64 {

@@ -8,3 +8,18 @@ tests/data/samtry/**/*.dat linguist-generated
 tests/data/samtry/**/*.par linguist-generated
 tests/data/samtry/**/*.inp linguist-generated
 tests/data/samtry/**/*.plt linguist-generated
+
+# Force LF line endings on test-fixture text files across all platforms.
+# These files are parsed byte-exactly by Rust integration tests; on
+# Windows, the default `core.autocrlf=true` would convert LF→CRLF on
+# checkout, breaking byte-pattern matches like the
+# `tr007_with_observation_type` helper in `crates/nereids-endf/src/sammy.rs`
+# (see PR #587 Windows CI failure: `.replace("\nTRANSMISSION\n", ...)`
+# silently no-ops when the file is checked out as CRLF).
+tests/data/samtry/**/*.dat text eol=lf
+tests/data/samtry/**/*.par text eol=lf
+tests/data/samtry/**/*.inp text eol=lf
+tests/data/samtry/**/*.plt text eol=lf
+tests/data/samtry/**/*.dcv text eol=lf
+tests/data/endf/**/*.endf text eol=lf
+tests/data/synthetic/**/*.endf text eol=lf
