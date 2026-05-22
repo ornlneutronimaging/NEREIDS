@@ -938,3 +938,399 @@ mod tests {
         assert_eq!(j05.1.len(), 2);
     }
 }
+
+/// Synthetic [`ResonanceData`] / [`ResonanceRange`] builders for cross-crate
+/// tests.  Gated on `#[cfg(any(test, feature = "test-support"))]`: visible to
+/// in-crate `#[cfg(test)] mod tests` AND to integration tests in sibling crates
+/// that enable the `test-support` feature in their `[dev-dependencies]`.  Never
+/// compiled into release builds.  Consolidates previously-scattered ad-hoc
+/// builders into one named API, mirroring PR #545's
+/// `nereids_physics::resolution::test_support`.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
+    use super::{LGroup, Resonance, ResonanceData, ResonanceFormalism, ResonanceRange};
+    use nereids_core::types::Isotope;
+
+    /// Parameters for [`single_resonance`].  No `Default`: every field is
+    /// required because different absorbing sites used different "defaults",
+    /// and forcing callers to be explicit prevents silent drift.
+    pub struct SingleResonanceParams {
+        pub energy: f64,
+        pub gamma_n: f64,
+        pub gamma_g: f64,
+        pub j: f64,
+        pub l: u32,
+        pub awr: f64,
+        pub target_spin: f64,
+        pub scattering_radius: f64,
+    }
+
+    // --- Private structural helpers ---
+    //
+    // The public fixtures below all build a single `ResonanceRange` with one
+    // `LGroup` whose body varies only in well-defined ways.  The two private
+    // helpers below absorb the structural skeleton (resolved/rml/urr/ap_table/
+    // r_external/qx/lrx/gfa/gfb) so each public helper carries only the
+    // physically-meaningful parameters.
+
+    /// One resolved `ResonanceRange` with a single L-group.  All "structural
+    /// invariants" (resolved, `rml`/`urr`/`ap_table`/`r_external`,
+    /// `qx`/`lrx`) get the minimal-fixture defaults.
+    #[allow(clippy::too_many_arguments)]
+    fn make_range(
+        energy_low: f64,
+        energy_high: f64,
+        formalism: ResonanceFormalism,
+        target_spin: f64,
+        scattering_radius: f64,
+        naps: i32,
+        l: u32,
+        lgroup_awr: f64,
+        apl: f64,
+        resonances: Vec<Resonance>,
+    ) -> ResonanceRange {
+        ResonanceRange {
+            energy_low,
+            energy_high,
+            resolved: true,
+            formalism,
+            target_spin,
+            scattering_radius,
+            naps,
+            l_groups: vec![LGroup {
+                l,
+                awr: lgroup_awr,
+                apl,
+                qx: 0.0,
+                lrx: 0,
+                resonances,
+            }],
+            rml: None,
+            urr: None,
+            ap_table: None,
+            r_external: vec![],
+        }
+    }
+
+    /// Wrap a `ResonanceRange` in a `ResonanceData` for caller-chosen `(z, a, awr)`.
+    fn wrap(z: u32, a: u32, awr: f64, range: ResonanceRange) -> ResonanceData {
+        ResonanceData {
+            isotope: Isotope::new(z, a).unwrap(),
+            za: z * 1000 + a,
+            awr,
+            ranges: vec![range],
+        }
+    }
+
+    /// One `Resonance` with `gfa = gfb = 0` (the common minimal-fixture case).
+    fn res(energy: f64, j: f64, gn: f64, gg: f64) -> Resonance {
+        Resonance {
+            energy,
+            j,
+            gn,
+            gg,
+            gfa: 0.0,
+            gfb: 0.0,
+        }
+    }
+
+    // --- Public fixtures ---
+
+    /// Canonical U-238 6.674 eV Reich-Moore single-resonance.  Byte-identical
+    /// anchor for the most common synthetic case; absorbs four previously-
+    /// duplicated copies across pipeline / physics / fitting.
+    pub fn u238_single_resonance() -> ResonanceData {
+        u238_with_formalism(ResonanceFormalism::ReichMoore)
+    }
+
+    /// Same as [`u238_single_resonance`] with a caller-chosen formalism.
+    /// Default RM-style range `1e-5 .. 1e4` eV.
+    pub fn u238_with_formalism(formalism: ResonanceFormalism) -> ResonanceData {
+        wrap(
+            92,
+            238,
+            236.006,
+            make_range(
+                1e-5,
+                1e4,
+                formalism,
+                0.0,
+                9.4285,
+                1,
+                0,
+                236.006,
+                0.0,
+                vec![res(6.674, 0.5, 1.493e-3, 23.0e-3)],
+            ),
+        )
+    }
+
+    /// As [`u238_with_formalism`] with wider range `1e-6 .. 1e5` eV for the
+    /// velocity-factor regression suite (`slbw_velocity_factor.rs`).
+    pub fn u238_with_formalism_wide_range(formalism: ResonanceFormalism) -> ResonanceData {
+        wrap(
+            92,
+            238,
+            236.006,
+            make_range(
+                1e-6,
+                1e5,
+                formalism,
+                0.0,
+                9.4285,
+                1,
+                0,
+                236.006,
+                0.0,
+                vec![res(6.674, 0.5, 1.493e-3, 23.0e-3)],
+            ),
+        )
+    }
+
+    /// Fully-parameterized U-238 ZA single-resonance, Reich-Moore.  For the
+    /// RM-harness tests that vary (E_r, Γn, Γγ, J, L, AWR, I, AP) per case.
+    pub fn single_resonance(p: SingleResonanceParams) -> ResonanceData {
+        wrap(
+            92,
+            238,
+            p.awr,
+            make_range(
+                1e-5,
+                1e4,
+                ResonanceFormalism::ReichMoore,
+                p.target_spin,
+                p.scattering_radius,
+                1,
+                p.l,
+                p.awr,
+                0.0,
+                vec![res(p.energy, p.j, p.gamma_n, p.gamma_g)],
+            ),
+        )
+    }
+
+    /// Synthetic single-resonance for an arbitrary `(z, a, awr, energy)`.
+    /// Hard-codes RM, AP=5, I=0, L=0, J=0.5, Γn=1e-3, Γγ=1e-2.  Used by
+    /// multi-isotope group-fit / calibration tests.
+    pub fn synthetic_single_resonance(z: u32, a: u32, awr: f64, energy: f64) -> ResonanceData {
+        wrap(
+            z,
+            a,
+            awr,
+            make_range(
+                1e-5,
+                1e4,
+                ResonanceFormalism::ReichMoore,
+                0.0,
+                5.0,
+                1,
+                0,
+                awr,
+                0.0,
+                vec![res(energy, 0.5, 1e-3, 1e-2)],
+            ),
+        )
+    }
+
+    /// U-238-ZA single s-wave SLBW over the wider `1e-5 .. 1e6` eV range used
+    /// by the elastic-oracle regression test (`slbw_elastic_oracle.rs`).
+    /// I=0 so `g_J = 1` for J=1/2.
+    pub fn synthetic_swave_slbw(
+        awr: f64,
+        e_r_ev: f64,
+        gn_ev: f64,
+        gg_ev: f64,
+        scattering_radius_fm: f64,
+    ) -> ResonanceData {
+        wrap(
+            92,
+            238,
+            awr,
+            make_range(
+                1e-5,
+                1e6,
+                ResonanceFormalism::SLBW,
+                0.0,
+                scattering_radius_fm,
+                1,
+                0,
+                awr,
+                0.0,
+                vec![res(e_r_ev, 0.5, gn_ev, gg_ev)],
+            ),
+        )
+    }
+
+    /// Minimal single-resonance for offline detectability tests.  Auto-derives
+    /// `awr ≈ a - 0.009` (rough neutron-mass correction); hard-codes RM, AP=6,
+    /// I=0, L=0, J=0.5.
+    pub fn synthetic_isotope(z: u32, a: u32, res_energy: f64, gn: f64, gg: f64) -> ResonanceData {
+        let awr = a as f64 - 0.009;
+        wrap(
+            z,
+            a,
+            awr,
+            make_range(
+                1e-5,
+                1e4,
+                ResonanceFormalism::ReichMoore,
+                0.0,
+                6.0,
+                1,
+                0,
+                awr,
+                0.0,
+                vec![res(res_energy, 0.5, gn, gg)],
+            ),
+        )
+    }
+
+    /// Hf-178 MLBW: two s-waves at 7.8 and 16.9 eV in the same J=1/2 group.
+    /// Range `0 .. 100` eV, AP=9.48, NAPS=0.  MLBW positivity and
+    /// total-vs-components regression tests in `slbw.rs`.
+    pub fn hf178_mlbw_two_resonances() -> ResonanceData {
+        wrap(
+            72,
+            178,
+            177.94,
+            make_range(
+                0.0,
+                100.0,
+                ResonanceFormalism::MLBW,
+                0.0,
+                9.48,
+                0,
+                0,
+                177.94,
+                0.0,
+                vec![res(7.8, 0.5, 0.002, 0.060), res(16.9, 0.5, 0.004, 0.055)],
+            ),
+        )
+    }
+
+    /// Hf-177 MLBW: two s-waves at 2.386 and 5.89 eV in the same high-J group
+    /// (J=4.0), target spin I=3.5.  Range `1e-5 .. 1e3` eV, AP=7.0, NAPS=0.
+    /// MLBW coherent-vs-incoherent dispatcher regression (PR #465 root cause).
+    pub fn hf177_mlbw_two_resonances_high_j() -> ResonanceData {
+        wrap(
+            72,
+            177,
+            175.4232,
+            make_range(
+                1e-5,
+                1e3,
+                ResonanceFormalism::MLBW,
+                3.5,
+                7.0,
+                0,
+                0,
+                175.4232,
+                0.0,
+                vec![
+                    res(2.386, 4.0, 2.0e-3, 60.0e-3),
+                    res(5.89, 4.0, 3.5e-3, 62.0e-3),
+                ],
+            ),
+        )
+    }
+
+    /// SAMMY ex001 hydrogen-anchor: SLBW single resonance at 10 eV on the
+    /// synthetic ZA=1010 (AWR=10).  Doppler-broadening reference suite.
+    /// Widths are in eV (SAMMY par file has them in meV; conversion baked in).
+    pub fn ex001_hydrogen_single_resonance() -> ResonanceData {
+        wrap(
+            1,
+            10,
+            10.0,
+            make_range(
+                0.0,
+                100.0,
+                ResonanceFormalism::SLBW,
+                0.0,
+                2.908,
+                1,
+                0,
+                10.0,
+                2.908,
+                vec![res(10.0, 0.5, 0.5e-3, 1.0e-3)],
+            ),
+        )
+    }
+
+    /// Minimal SLBW `ResonanceRange` (not a full `ResonanceData`) using
+    /// U-238-like parameters with a single 6.674 eV s-wave.  For
+    /// `slbw_cross_sections_for_range` panic tests at the range-level entry.
+    pub fn minimal_slbw_range() -> ResonanceRange {
+        make_range(
+            1e-5,
+            1e4,
+            ResonanceFormalism::SLBW,
+            0.0,
+            9.4285,
+            1,
+            0,
+            236.006,
+            0.0,
+            vec![res(6.674, 0.5, 1.493e-3, 23.0e-3)],
+        )
+    }
+}
+
+#[cfg(test)]
+mod test_support_tests {
+    use super::ResonanceFormalism;
+    use super::test_support::*;
+
+    #[test]
+    fn u238_single_resonance_has_canonical_za_and_energy() {
+        let d = u238_single_resonance();
+        assert_eq!(d.za, 92238);
+        assert_eq!(d.ranges[0].l_groups[0].resonances[0].energy, 6.674);
+    }
+
+    #[test]
+    fn u238_with_formalism_slbw_returns_slbw() {
+        let d = u238_with_formalism(ResonanceFormalism::SLBW);
+        assert_eq!(d.ranges[0].formalism, ResonanceFormalism::SLBW);
+        assert_eq!(d.ranges[0].energy_low, 1e-5);
+        assert_eq!(d.ranges[0].energy_high, 1e4);
+    }
+
+    #[test]
+    fn u238_with_formalism_wide_range_uses_wide_bounds() {
+        let d = u238_with_formalism_wide_range(ResonanceFormalism::MLBW);
+        assert_eq!(d.ranges[0].energy_low, 1e-6);
+        assert_eq!(d.ranges[0].energy_high, 1e5);
+        assert_eq!(d.ranges[0].formalism, ResonanceFormalism::MLBW);
+    }
+
+    #[test]
+    fn single_resonance_param_struct_builds_rm() {
+        let d = single_resonance(SingleResonanceParams {
+            energy: 6.674,
+            gamma_n: 1.493e-3,
+            gamma_g: 23.0e-3,
+            j: 0.5,
+            l: 0,
+            awr: 236.006,
+            target_spin: 0.0,
+            scattering_radius: 9.4285,
+        });
+        assert_eq!(d.ranges[0].formalism, ResonanceFormalism::ReichMoore);
+        assert_eq!(d.za, 92238);
+    }
+
+    #[test]
+    fn hf178_mlbw_two_resonances_returns_two() {
+        let d = hf178_mlbw_two_resonances();
+        assert_eq!(d.ranges[0].l_groups[0].resonances.len(), 2);
+        assert_eq!(d.za, 72178);
+    }
+
+    #[test]
+    fn synthetic_isotope_uses_caller_za() {
+        let d = synthetic_isotope(74, 184, 10.0, 1e-3, 1e-2);
+        assert_eq!(d.za, 74184);
+        assert_eq!(d.ranges[0].l_groups[0].resonances[0].energy, 10.0);
+    }
+}

@@ -1369,7 +1369,9 @@ mod tests {
     use nereids_fitting::transmission_model::PrecomputedTransmissionModel;
 
     use crate::pipeline::{SolverConfig, UnifiedFitConfig};
-    use crate::test_helpers::{synthetic_single_resonance, u238_single_resonance};
+    use nereids_endf::resonance::test_support::{
+        synthetic_single_resonance, u238_single_resonance,
+    };
 
     /// Build a 4x4 synthetic transmission stack from known density.
     fn synthetic_4x4_transmission(

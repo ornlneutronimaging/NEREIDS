@@ -15,3 +15,6 @@ nereids-physics = { workspace = true }
 
 [dev-dependencies]
 nereids-physics = { workspace = true, features = ["test-support"] }
+# Exposes `nereids_endf::resonance::test_support` — synthetic
+# `ResonanceData` builders shared with sibling crates' tests.
+nereids-endf = { workspace = true, features = ["test-support"] }

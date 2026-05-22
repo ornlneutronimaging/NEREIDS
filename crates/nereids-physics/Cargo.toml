@@ -37,4 +37,7 @@ microlp = { workspace = true }
 # version) breaks `cargo publish` because crates.io rejects
 # manifests whose declared deps lack version constraints.
 nereids-physics = { workspace = true, features = ["test-support"] }
+# Exposes `nereids_endf::resonance::test_support` — synthetic
+# `ResonanceData` builders shared with sibling crates' tests.
+nereids-endf = { workspace = true, features = ["test-support"] }
 

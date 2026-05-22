@@ -15,6 +15,3 @@ pub mod detectability;
 pub mod error;
 pub mod pipeline;
 pub mod spatial;
-
-#[cfg(test)]
-mod test_helpers;

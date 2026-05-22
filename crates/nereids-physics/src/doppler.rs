@@ -1005,46 +1005,10 @@ mod tests {
     /// AWR = 10.0, radius = 2.908 fm, T = 300 K
     #[test]
     fn test_sammy_ex001_fgm_doppler() {
-        use nereids_core::types::Isotope;
-        use nereids_endf::resonance::{
-            LGroup, Resonance, ResonanceData, ResonanceFormalism, ResonanceRange,
-        };
-
-        // Build the ex001 resonance data: single resonance at 10 eV.
-        // SAMMY par file widths are in meV — convert to eV (×0.001).
-        let data = ResonanceData {
-            isotope: Isotope::new(1, 10).unwrap(),
-            za: 1010,
-            awr: 10.0,
-            ranges: vec![ResonanceRange {
-                energy_low: 0.0,
-                energy_high: 100.0,
-                resolved: true,
-                formalism: ResonanceFormalism::SLBW,
-                target_spin: 0.0,
-                scattering_radius: 2.908,
-                naps: 1,
-                l_groups: vec![LGroup {
-                    l: 0,
-                    awr: 10.0,
-                    apl: 2.908,
-                    qx: 0.0,
-                    lrx: 0,
-                    resonances: vec![Resonance {
-                        energy: 10.0,
-                        j: 0.5,
-                        gn: 0.5e-3, // 0.5 meV → eV
-                        gg: 1.0e-3, // 1.0 meV → eV
-                        gfa: 0.0,
-                        gfb: 0.0,
-                    }],
-                }],
-                rml: None,
-                urr: None,
-                ap_table: None,
-                r_external: vec![],
-            }],
-        };
+        // Build the ex001 resonance data: single SLBW resonance at 10 eV,
+        // ZA=1010, AWR=10.0, AP=2.908 fm (SAMMY par-file widths in meV are
+        // pre-converted to eV inside `ex001_hydrogen_single_resonance`).
+        let data = nereids_endf::resonance::test_support::ex001_hydrogen_single_resonance();
 
         // Generate unbroadened cross-sections on a non-uniform grid.
         // The resonance is very narrow (Γ ≈ 1.5 meV) — we need fine spacing

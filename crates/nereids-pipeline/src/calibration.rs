@@ -619,11 +619,11 @@ fn compute_chi2(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::synthetic_single_resonance;
+    use nereids_endf::resonance::test_support::synthetic_single_resonance;
 
     /// Round-trip exercise of the public `calibrate_energy` API on a
     /// synthetic spectrum.  Uses `synthetic_single_resonance` from
-    /// `test_helpers` so the test does not require network access and
+    /// `nereids_endf::resonance::test_support` so the test does not require network access and
     /// runs in every CI invocation.
     ///
     /// Note on tolerances: the grid-search calibrator's L resolution

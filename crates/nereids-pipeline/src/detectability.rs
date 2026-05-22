@@ -291,46 +291,9 @@ pub fn trace_detectability_survey(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nereids_endf::resonance::{LGroup, Resonance, ResonanceFormalism, ResonanceRange};
+    use nereids_endf::resonance::test_support::synthetic_isotope;
 
     // --- Offline synthetic tests (no network required) ---
-
-    /// Build a minimal single-resonance isotope for offline testing.
-    fn synthetic_isotope(z: u32, a: u32, res_energy: f64, gn: f64, gg: f64) -> ResonanceData {
-        ResonanceData {
-            isotope: nereids_core::types::Isotope::new(z, a).unwrap(),
-            za: z * 1000 + a,
-            awr: a as f64 - 0.009, // approximate
-            ranges: vec![ResonanceRange {
-                energy_low: 1e-5,
-                energy_high: 1e4,
-                resolved: true,
-                formalism: ResonanceFormalism::ReichMoore,
-                target_spin: 0.0,
-                scattering_radius: 6.0,
-                naps: 1,
-                l_groups: vec![LGroup {
-                    l: 0,
-                    awr: a as f64 - 0.009,
-                    apl: 0.0,
-                    qx: 0.0,
-                    lrx: 0,
-                    resonances: vec![Resonance {
-                        energy: res_energy,
-                        j: 0.5,
-                        gn,
-                        gg,
-                        gfa: 0.0,
-                        gfb: 0.0,
-                    }],
-                }],
-                rml: None,
-                urr: None,
-                ap_table: None,
-                r_external: vec![],
-            }],
-        }
-    }
 
     /// Peak selection and SNR computation with synthetic data (offline).
     #[test]

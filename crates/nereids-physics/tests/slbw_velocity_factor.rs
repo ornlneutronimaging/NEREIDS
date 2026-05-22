@@ -20,60 +20,10 @@
 //! double-counted velocity factor on day one of the SLBW evaluator's
 //! existence.
 
-use nereids_core::types::Isotope;
-use nereids_endf::resonance::{
-    LGroup, Resonance, ResonanceData, ResonanceFormalism, ResonanceRange,
-};
+use nereids_endf::resonance::ResonanceFormalism;
+use nereids_endf::resonance::test_support::u238_with_formalism_wide_range;
 use nereids_physics::reich_moore;
 use nereids_physics::slbw::slbw_cross_sections;
-
-/// Single isolated s-wave U-238 6.674 eV resonance, SLBW formalism.
-///
-/// I = 0 so g_J = 1 for J = 1/2. Naps = 1 (use AP for everything).
-fn u238_slbw_single_resonance() -> ResonanceData {
-    ResonanceData {
-        isotope: Isotope::new(92, 238).unwrap(),
-        za: 92238,
-        awr: 236.006,
-        ranges: vec![ResonanceRange {
-            energy_low: 1e-6,
-            energy_high: 1e5,
-            resolved: true,
-            formalism: ResonanceFormalism::SLBW,
-            target_spin: 0.0,
-            scattering_radius: 9.4285,
-            naps: 1,
-            ap_table: None,
-            l_groups: vec![LGroup {
-                l: 0,
-                awr: 236.006,
-                apl: 0.0,
-                qx: 0.0,
-                lrx: 0,
-                resonances: vec![Resonance {
-                    energy: 6.674,
-                    j: 0.5,
-                    gn: 1.493e-3,
-                    gg: 23.0e-3,
-                    gfa: 0.0,
-                    gfb: 0.0,
-                }],
-            }],
-            rml: None,
-            urr: None,
-            r_external: vec![],
-        }],
-    }
-}
-
-/// Same isolated resonance but as Reich-Moore. This is the "ground-truth"
-/// formalism — its width formula is independently implemented and known
-/// to match SAMMY/NJOY for isolated resonances.
-fn u238_rm_single_resonance() -> ResonanceData {
-    let mut data = u238_slbw_single_resonance();
-    data.ranges[0].formalism = ResonanceFormalism::ReichMoore;
-    data
-}
 
 /// At E = E_r the penetrability ratio is 1 by construction, so Γ_n(E_r) = GN.
 /// Below the resonance, in the 1/v regime, capture must scale as 1/√E for an
@@ -84,7 +34,7 @@ fn u238_rm_single_resonance() -> ResonanceData {
 /// Buggy formula would give a ratio ≈ 1.
 #[test]
 fn slbw_capture_scales_as_one_over_v_below_resonance() {
-    let data = u238_slbw_single_resonance();
+    let data = u238_with_formalism_wide_range(ResonanceFormalism::SLBW);
 
     // Use thermal-energy probes far below the 6.674 eV resonance, where
     // the resonant denominator is dominated by (E-E_r)² ≈ E_r², so the
@@ -128,8 +78,8 @@ fn slbw_capture_scales_as_one_over_v_below_resonance() {
 /// by a factor of √(E/E_r) below the peak.
 #[test]
 fn slbw_matches_reich_moore_capture_below_resonance() {
-    let slbw_data = u238_slbw_single_resonance();
-    let rm_data = u238_rm_single_resonance();
+    let slbw_data = u238_with_formalism_wide_range(ResonanceFormalism::SLBW);
+    let rm_data = u238_with_formalism_wide_range(ResonanceFormalism::ReichMoore);
 
     // Probe at thermal energies (well below the 6.674 eV peak).
     for &e in &[0.0253, 0.1, 0.5, 1.0, 3.0] {
@@ -152,15 +102,9 @@ fn slbw_matches_reich_moore_capture_below_resonance() {
 
 /// MLBW formalism: same width formula as SLBW. Use a synthetic single
 /// s-wave resonance and verify 1/v capture below the peak.
-fn u238_mlbw_single_resonance() -> ResonanceData {
-    let mut data = u238_slbw_single_resonance();
-    data.ranges[0].formalism = ResonanceFormalism::MLBW;
-    data
-}
-
 #[test]
 fn mlbw_capture_scales_as_one_over_v_below_resonance() {
-    let data = u238_mlbw_single_resonance();
+    let data = u238_with_formalism_wide_range(ResonanceFormalism::MLBW);
     let e_lo = 0.001_f64;
     let e_hi = 4.0 * e_lo;
 

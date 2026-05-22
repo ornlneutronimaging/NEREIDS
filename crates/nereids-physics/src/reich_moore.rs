@@ -1498,69 +1498,16 @@ fn invert_3x3(m: [[Complex64; 3]; 3]) -> Option<[[Complex64; 3]; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nereids_endf::resonance::test_support::{
+        SingleResonanceParams, single_resonance, u238_single_resonance, u238_with_formalism,
+    };
     use nereids_endf::resonance::{LGroup, Resonance, ResonanceRange};
-
-    /// Create a simple single-resonance test case for validation.
-    #[allow(clippy::too_many_arguments)]
-    fn make_single_resonance_data(
-        energy: f64,
-        gamma_n: f64,
-        gamma_g: f64,
-        j: f64,
-        l: u32,
-        awr: f64,
-        target_spin: f64,
-        scattering_radius: f64,
-    ) -> ResonanceData {
-        ResonanceData {
-            isotope: nereids_core::types::Isotope::new(92, 238).unwrap(),
-            za: 92238,
-            awr,
-            ranges: vec![ResonanceRange {
-                energy_low: 1e-5,
-                energy_high: 1e4,
-                resolved: true,
-                formalism: ResonanceFormalism::ReichMoore,
-                target_spin,
-                scattering_radius,
-                naps: 1,
-                l_groups: vec![LGroup {
-                    l,
-                    awr,
-                    apl: 0.0,
-                    qx: 0.0,
-                    lrx: 0,
-                    resonances: vec![Resonance {
-                        energy,
-                        j,
-                        gn: gamma_n,
-                        gg: gamma_g,
-                        gfa: 0.0,
-                        gfb: 0.0,
-                    }],
-                }],
-                rml: None,
-                ap_table: None,
-                urr: None,
-                r_external: vec![],
-            }],
-        }
-    }
 
     #[test]
     fn test_capture_peak_single_resonance() {
         // U-238 6.674 eV resonance.
         // At the resonance energy, capture cross-section should peak at ~22,000 barns.
-        let data = make_single_resonance_data(
-            6.674,    // E_r (eV)
-            1.493e-3, // Γ_n (eV)
-            23.0e-3,  // Γ_γ (eV)
-            0.5,      // J
-            0,        // L
-            236.006,  // AWR
-            0.0,      // target spin I
-            9.4285,   // scattering radius (fm)
-        );
+        let data = u238_single_resonance();
 
         let xs = cross_sections_at_energy(&data, 6.674);
 
@@ -1588,8 +1535,7 @@ mod tests {
     fn test_1_over_v_behavior() {
         // Far from resonances, capture cross-section should follow 1/v ∝ 1/√E.
         // The 6.674 eV resonance tail should dominate at low energies.
-        let data =
-            make_single_resonance_data(6.674, 1.493e-3, 23.0e-3, 0.5, 0, 236.006, 0.0, 9.4285);
+        let data = u238_single_resonance();
 
         let xs_01 = cross_sections_at_energy(&data, 0.1);
         let xs_04 = cross_sections_at_energy(&data, 0.4);
@@ -1607,8 +1553,7 @@ mod tests {
     #[test]
     fn test_cross_sections_positive() {
         // All cross-sections must be non-negative at all energies.
-        let data =
-            make_single_resonance_data(6.674, 1.493e-3, 23.0e-3, 0.5, 0, 236.006, 0.0, 9.4285);
+        let data = u238_single_resonance();
 
         for &e in &[0.01, 0.1, 1.0, 5.0, 6.0, 6.674, 7.0, 10.0, 100.0, 1000.0] {
             let xs = cross_sections_at_energy(&data, e);
@@ -1705,48 +1650,11 @@ mod tests {
         );
     }
 
-    /// Build a single-resonance `ResonanceData` with a chosen formalism.
-    fn make_slbw_data(formalism: ResonanceFormalism) -> ResonanceData {
-        ResonanceData {
-            isotope: nereids_core::types::Isotope::new(92, 238).unwrap(),
-            za: 92238,
-            awr: 236.006,
-            ranges: vec![ResonanceRange {
-                energy_low: 1e-5,
-                energy_high: 1e4,
-                resolved: true,
-                formalism,
-                target_spin: 0.0,
-                scattering_radius: 9.4285,
-                naps: 1,
-                l_groups: vec![LGroup {
-                    l: 0,
-                    awr: 236.006,
-                    apl: 0.0,
-                    qx: 0.0,
-                    lrx: 0,
-                    resonances: vec![Resonance {
-                        energy: 6.674,
-                        j: 0.5,
-                        gn: 1.493e-3,
-                        gg: 23.0e-3,
-                        gfa: 0.0,
-                        gfb: 0.0,
-                    }],
-                }],
-                rml: None,
-                ap_table: None,
-                urr: None,
-                r_external: vec![],
-            }],
-        }
-    }
-
     /// `cross_sections_at_energy` with an SLBW-formalism range must give
     /// the same result as `slbw::slbw_cross_sections`.
     #[test]
     fn test_dispatcher_slbw_matches_slbw_module() {
-        let data = make_slbw_data(ResonanceFormalism::SLBW);
+        let data = u238_with_formalism(ResonanceFormalism::SLBW);
 
         let test_energies = [0.1, 1.0, 5.0, 6.0, 6.674, 7.0, 10.0, 100.0];
         for &e in &test_energies {
@@ -1783,8 +1691,8 @@ mod tests {
     /// affects elastic).  Elastic should also match for single resonances.
     #[test]
     fn test_mlbw_single_resonance_matches_slbw() {
-        let data_mlbw = make_slbw_data(ResonanceFormalism::MLBW);
-        let data_slbw = make_slbw_data(ResonanceFormalism::SLBW);
+        let data_mlbw = u238_with_formalism(ResonanceFormalism::MLBW);
+        let data_slbw = u238_with_formalism(ResonanceFormalism::SLBW);
 
         let test_energies = [1.0, 6.674, 10.0];
         for &e in &test_energies {
@@ -1837,16 +1745,16 @@ mod tests {
         // Extremely narrow resonance: Γ_γ = 1e-15 eV forces R-matrix
         // contribution to be enormous at E = E_r, pushing Y toward
         // singularity and exercising the y_denom < LOG_FLOOR guard.
-        let data = make_single_resonance_data(
-            10.0,    // E_r
-            1.0e-3,  // Γ_n (eV)
-            1.0e-15, // Γ_γ (extremely small → near-singular Y)
-            0.5,     // J
-            0,       // L
-            236.006, // AWR
-            0.0,     // target spin
-            9.4285,  // radius
-        );
+        let data = single_resonance(SingleResonanceParams {
+            energy: 10.0,     // E_r
+            gamma_n: 1.0e-3,  // Γ_n (eV)
+            gamma_g: 1.0e-15, // Γ_γ (extremely small → near-singular Y)
+            j: 0.5,
+            l: 0,
+            awr: 236.006,
+            target_spin: 0.0,
+            scattering_radius: 9.4285,
+        });
 
         // Evaluate exactly at E_r where R is maximized.
         let xs = cross_sections_at_energy(&data, 10.0);
@@ -1873,16 +1781,16 @@ mod tests {
     /// rather than NaN/Inf.
     #[test]
     fn test_reich_moore_zero_capture_width_guard() {
-        let data = make_single_resonance_data(
-            10.0,    // E_r
-            1.0e-3,  // Γ_n (eV)
-            0.0,     // Γ_γ = 0 → guaranteed singularity
-            0.5,     // J
-            0,       // L
-            236.006, // AWR
-            0.0,     // target spin
-            9.4285,  // radius
-        );
+        let data = single_resonance(SingleResonanceParams {
+            energy: 10.0,    // E_r
+            gamma_n: 1.0e-3, // Γ_n (eV)
+            gamma_g: 0.0,    // Γ_γ = 0 → guaranteed singularity
+            j: 0.5,
+            l: 0,
+            awr: 236.006,
+            target_spin: 0.0,
+            scattering_radius: 9.4285,
+        });
 
         // At E = E_r with Γ_γ = 0, the denominator (E_r - E)² + (Γ_γ/2)² = 0,
         // so the DIVISION_FLOOR guard on the R-matrix denom fires, but even if
@@ -1966,8 +1874,7 @@ mod tests {
     /// Reich-Moore data.
     #[test]
     fn test_grid_matches_per_point_reich_moore() {
-        let data =
-            make_single_resonance_data(6.674, 1.493e-3, 23.0e-3, 0.5, 0, 236.006, 0.0, 9.4285);
+        let data = u238_single_resonance();
 
         let energies = [0.01, 0.1, 1.0, 5.0, 6.0, 6.674, 7.0, 10.0, 100.0, 1000.0];
         let grid_results = cross_sections_on_grid(&data, &energies);
@@ -2007,7 +1914,7 @@ mod tests {
     /// SLBW-formalism data too (the batch path precomputes SLBW J-groups).
     #[test]
     fn test_grid_matches_per_point_slbw() {
-        let data = make_slbw_data(ResonanceFormalism::SLBW);
+        let data = u238_with_formalism(ResonanceFormalism::SLBW);
 
         let energies = [0.1, 1.0, 5.0, 6.0, 6.674, 7.0, 10.0, 100.0];
         let grid_results = cross_sections_on_grid(&data, &energies);
@@ -2206,65 +2113,19 @@ mod tests {
     // with ≥2 resonances).  The Hf-177 test provides a real-world anchor
     // against ENDF-B-VIII.1 data committed under `tests/data/endf/`.
 
-    /// Build a minimal MLBW fixture with two closely-spaced resonances in
-    /// the same J-group.  Coherent-sum (MLBW) and incoherent-sum (SLBW)
-    /// elastic disagree here by construction: interference between the
-    /// two resonances is the signature of MLBW.
-    fn make_mlbw_two_resonance_same_j() -> ResonanceData {
-        ResonanceData {
-            isotope: nereids_core::types::Isotope::new(72, 177).unwrap(),
-            za: 72177,
-            awr: 175.4232,
-            ranges: vec![ResonanceRange {
-                energy_low: 1e-5,
-                energy_high: 1e3,
-                resolved: true,
-                formalism: ResonanceFormalism::MLBW,
-                target_spin: 3.5,
-                scattering_radius: 7.0,
-                naps: 0,
-                l_groups: vec![LGroup {
-                    l: 0,
-                    awr: 175.4232,
-                    apl: 0.0,
-                    qx: 0.0,
-                    lrx: 0,
-                    resonances: vec![
-                        Resonance {
-                            energy: 2.386,
-                            j: 4.0,
-                            gn: 2.0e-3,
-                            gg: 60.0e-3,
-                            gfa: 0.0,
-                            gfb: 0.0,
-                        },
-                        Resonance {
-                            energy: 5.89,
-                            j: 4.0, // same J as above → coherent interference
-                            gn: 3.5e-3,
-                            gg: 62.0e-3,
-                            gfa: 0.0,
-                            gfb: 0.0,
-                        },
-                    ],
-                }],
-                rml: None,
-                ap_table: None,
-                urr: None,
-                r_external: vec![],
-            }],
-        }
-    }
-
     /// Synthetic MLBW fixture: the batch API and per-point API MUST agree
     /// bit-exactly.  This is the root cause of #465 — the batch
     /// dispatcher lumped MLBW into the SLBW evaluator (incoherent sum)
     /// while the per-point dispatcher correctly routed through the
     /// coherent-sum MLBW evaluator.  Both paths now share
     /// `slbw::mlbw_evaluate_with_cached_jgroups`.
+    ///
+    /// Uses the Hf-177 high-J fixture from `test_support`: two s-wave
+    /// resonances at 2.386 eV and 5.89 eV in the same J = 4.0 group
+    /// (`hf177_mlbw_two_resonances_high_j`).
     #[test]
     fn test_batch_matches_per_point_mlbw_synthetic() {
-        let data = make_mlbw_two_resonance_same_j();
+        let data = nereids_endf::resonance::test_support::hf177_mlbw_two_resonances_high_j();
         // Sample densely across the 2.386 eV and 5.89 eV resonances and
         // their interference region; also cover tail behaviour.
         let energies: Vec<f64> = (0..101).map(|i| 0.5 + (i as f64) * 0.1).collect();
@@ -2393,65 +2254,59 @@ mod tests {
     // both Reich-Moore top-level pub fns so a future refactor cannot
     // silently drop the assert.
 
-    fn make_minimal_rm_data() -> ResonanceData {
-        // Re-use the U-238 single-resonance helper: the energy used to call
-        // the function is what matters here, not the resonance parameters.
-        make_single_resonance_data(6.674, 1.493e-3, 23.0e-3, 0.5, 0, 236.006, 0.0, 9.4285)
-    }
-
     #[test]
     #[should_panic(expected = "expected positive finite energy_ev")]
     fn cross_sections_at_energy_panics_on_nan() {
-        let data = make_minimal_rm_data();
+        let data = u238_single_resonance();
         let _ = cross_sections_at_energy(&data, f64::NAN);
     }
 
     #[test]
     #[should_panic(expected = "expected positive finite energy_ev")]
     fn cross_sections_at_energy_panics_on_infinity() {
-        let data = make_minimal_rm_data();
+        let data = u238_single_resonance();
         let _ = cross_sections_at_energy(&data, f64::INFINITY);
     }
 
     #[test]
     #[should_panic(expected = "expected positive finite energy_ev")]
     fn cross_sections_at_energy_panics_on_zero() {
-        let data = make_minimal_rm_data();
+        let data = u238_single_resonance();
         let _ = cross_sections_at_energy(&data, 0.0);
     }
 
     #[test]
     #[should_panic(expected = "expected positive finite energy_ev")]
     fn cross_sections_at_energy_panics_on_negative() {
-        let data = make_minimal_rm_data();
+        let data = u238_single_resonance();
         let _ = cross_sections_at_energy(&data, -1.0);
     }
 
     #[test]
     #[should_panic(expected = "expected positive finite energy_ev")]
     fn cross_sections_on_grid_panics_on_nan() {
-        let data = make_minimal_rm_data();
+        let data = u238_single_resonance();
         let _ = cross_sections_on_grid(&data, &[1.0, f64::NAN, 2.0]);
     }
 
     #[test]
     #[should_panic(expected = "expected positive finite energy_ev")]
     fn cross_sections_on_grid_panics_on_infinity() {
-        let data = make_minimal_rm_data();
+        let data = u238_single_resonance();
         let _ = cross_sections_on_grid(&data, &[1.0, f64::INFINITY]);
     }
 
     #[test]
     #[should_panic(expected = "expected positive finite energy_ev")]
     fn cross_sections_on_grid_panics_on_zero() {
-        let data = make_minimal_rm_data();
+        let data = u238_single_resonance();
         let _ = cross_sections_on_grid(&data, &[1.0, 0.0, 2.0]);
     }
 
     #[test]
     #[should_panic(expected = "expected positive finite energy_ev")]
     fn cross_sections_on_grid_panics_on_negative() {
-        let data = make_minimal_rm_data();
+        let data = u238_single_resonance();
         let _ = cross_sections_on_grid(&data, &[-1.0, 1.0, 2.0]);
     }
 }

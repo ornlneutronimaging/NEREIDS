@@ -21,58 +21,11 @@
 //!   U_nn = e^{−2iφ} · [1 + iΓ_n / (E_r − E − iΓ_tot/2)]
 //!   σ_el = (π/k²) · g_J · |1 − U_nn|²
 
-use nereids_core::types::Isotope;
-use nereids_endf::resonance::{
-    LGroup, Resonance, ResonanceData, ResonanceFormalism, ResonanceRange,
-};
+use nereids_endf::resonance::ResonanceData;
+use nereids_endf::resonance::test_support::synthetic_swave_slbw;
 use nereids_physics::channel::{pi_over_k_squared_barns, rho};
 use nereids_physics::penetrability::{penetrability, phase_shift};
 use nereids_physics::slbw::slbw_cross_sections;
-
-/// Build a synthetic dataset with a single s-wave SLBW resonance.
-///
-/// Uses U-238-like target spin (I=0) so g_J = 1 for J = 1/2.
-fn synthetic_swave_slbw(
-    awr: f64,
-    e_r_ev: f64,
-    gn_ev: f64,
-    gg_ev: f64,
-    scattering_radius_fm: f64,
-) -> ResonanceData {
-    ResonanceData {
-        isotope: Isotope::new(92, 238).unwrap(),
-        za: 92238,
-        awr,
-        ranges: vec![ResonanceRange {
-            energy_low: 1e-5,
-            energy_high: 1e6,
-            resolved: true,
-            formalism: ResonanceFormalism::SLBW,
-            target_spin: 0.0,
-            scattering_radius: scattering_radius_fm,
-            naps: 1,
-            ap_table: None,
-            l_groups: vec![LGroup {
-                l: 0,
-                awr,
-                apl: 0.0,
-                qx: 0.0,
-                lrx: 0,
-                resonances: vec![Resonance {
-                    energy: e_r_ev,
-                    j: 0.5,
-                    gn: gn_ev,
-                    gg: gg_ev,
-                    gfa: 0.0,
-                    gfb: 0.0,
-                }],
-            }],
-            rml: None,
-            urr: None,
-            r_external: vec![],
-        }],
-    }
-}
 
 /// Direct `|1 − U_nn|²` oracle for the elastic cross-section.
 ///

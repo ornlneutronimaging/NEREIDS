@@ -511,39 +511,8 @@ mod tests {
     fn test_slbw_capture_peak() {
         // Single resonance at 6.674 eV (U-238).
         // SLBW and RM should agree well for an isolated resonance.
-        let data = ResonanceData {
-            isotope: nereids_core::types::Isotope::new(92, 238).unwrap(),
-            za: 92238,
-            awr: 236.006,
-            ranges: vec![ResonanceRange {
-                energy_low: 1e-5,
-                energy_high: 1e4,
-                resolved: true,
-                formalism: ResonanceFormalism::SLBW,
-                target_spin: 0.0,
-                scattering_radius: 9.4285,
-                naps: 1,
-                l_groups: vec![LGroup {
-                    l: 0,
-                    awr: 236.006,
-                    apl: 0.0,
-                    qx: 0.0,
-                    lrx: 0,
-                    resonances: vec![Resonance {
-                        energy: 6.674,
-                        j: 0.5,
-                        gn: 1.493e-3,
-                        gg: 23.0e-3,
-                        gfa: 0.0,
-                        gfb: 0.0,
-                    }],
-                }],
-                rml: None,
-                urr: None,
-                ap_table: None,
-                r_external: vec![],
-            }],
-        };
+        let data =
+            nereids_endf::resonance::test_support::u238_with_formalism(ResonanceFormalism::SLBW);
 
         let xs = slbw_cross_sections(&data, 6.674);
         println!("SLBW capture at 6.674 eV: {} barns", xs.capture);
@@ -560,62 +529,10 @@ mod tests {
     fn test_slbw_vs_rm_single_resonance() {
         // For a single isolated resonance, SLBW and RM should be very close.
         use crate::reich_moore;
+        use nereids_endf::resonance::test_support::u238_with_formalism;
 
-        let resonances = vec![LGroup {
-            l: 0,
-            awr: 236.006,
-            apl: 0.0,
-            qx: 0.0,
-            lrx: 0,
-            resonances: vec![Resonance {
-                energy: 6.674,
-                j: 0.5,
-                gn: 1.493e-3,
-                gg: 23.0e-3,
-                gfa: 0.0,
-                gfb: 0.0,
-            }],
-        }];
-
-        let rm_data = ResonanceData {
-            isotope: nereids_core::types::Isotope::new(92, 238).unwrap(),
-            za: 92238,
-            awr: 236.006,
-            ranges: vec![ResonanceRange {
-                energy_low: 1e-5,
-                energy_high: 1e4,
-                resolved: true,
-                formalism: ResonanceFormalism::ReichMoore,
-                target_spin: 0.0,
-                scattering_radius: 9.4285,
-                naps: 1,
-                l_groups: resonances.clone(),
-                rml: None,
-                urr: None,
-                ap_table: None,
-                r_external: vec![],
-            }],
-        };
-
-        let slbw_data = ResonanceData {
-            isotope: nereids_core::types::Isotope::new(92, 238).unwrap(),
-            za: 92238,
-            awr: 236.006,
-            ranges: vec![ResonanceRange {
-                energy_low: 1e-5,
-                energy_high: 1e4,
-                resolved: true,
-                formalism: ResonanceFormalism::SLBW,
-                target_spin: 0.0,
-                scattering_radius: 9.4285,
-                naps: 1,
-                l_groups: resonances,
-                rml: None,
-                urr: None,
-                ap_table: None,
-                r_external: vec![],
-            }],
-        };
+        let rm_data = u238_with_formalism(ResonanceFormalism::ReichMoore);
+        let slbw_data = u238_with_formalism(ResonanceFormalism::SLBW);
 
         // Compare at several energies near the resonance peak.
         // Both formalisms apply the ENDF-6 §D.1.1 eq D.7 energy dependence
@@ -802,59 +719,12 @@ mod tests {
         );
     }
 
-    fn make_mlbw_multi_resonance_data() -> nereids_endf::resonance::ResonanceData {
-        use nereids_endf::resonance::*;
-        ResonanceData {
-            isotope: nereids_core::types::Isotope::new(72, 178).unwrap(),
-            za: 72178,
-            awr: 177.94,
-            ranges: vec![ResonanceRange {
-                energy_low: 0.0,
-                energy_high: 100.0,
-                formalism: ResonanceFormalism::MLBW,
-                naps: 0,
-                resolved: true,
-                scattering_radius: 9.48,
-                target_spin: 0.0,
-                l_groups: vec![LGroup {
-                    l: 0,
-                    awr: 177.94,
-                    apl: 0.0,
-                    qx: 0.0,
-                    lrx: 0,
-                    resonances: vec![
-                        Resonance {
-                            energy: 7.8,
-                            j: 0.5,
-                            gn: 0.002,
-                            gg: 0.060,
-                            gfa: 0.0,
-                            gfb: 0.0,
-                        },
-                        Resonance {
-                            energy: 16.9,
-                            j: 0.5,
-                            gn: 0.004,
-                            gg: 0.055,
-                            gfa: 0.0,
-                            gfb: 0.0,
-                        },
-                    ],
-                }],
-                rml: None,
-                ap_table: None,
-                urr: None,
-                r_external: vec![],
-            }],
-        }
-    }
-
     /// MLBW cross-sections must be non-negative for multi-resonance data.
     /// Guard: catches e^{+2iφ} phase convention bug (commit 5508fea, fixed f0eadc1).
     #[test]
     fn test_mlbw_multi_resonance_positive() {
         use crate::reich_moore::cross_sections_at_energy;
-        let data = make_mlbw_multi_resonance_data();
+        let data = nereids_endf::resonance::test_support::hf178_mlbw_two_resonances();
         for &e in &[1.0, 5.0, 7.0, 7.8, 8.0, 10.0, 12.0, 16.9, 17.0, 20.0, 50.0] {
             let xs = cross_sections_at_energy(&data, e);
             assert!(xs.total >= 0.0, "MLBW total < 0 at E={e}: {:.4}", xs.total);
@@ -871,7 +741,7 @@ mod tests {
     #[test]
     fn test_mlbw_total_equals_components() {
         use crate::reich_moore::cross_sections_at_energy;
-        let data = make_mlbw_multi_resonance_data();
+        let data = nereids_endf::resonance::test_support::hf178_mlbw_two_resonances();
         for &e in &[1.0, 5.0, 7.8, 10.0, 50.0] {
             let xs = cross_sections_at_energy(&data, e);
             let sum = xs.elastic + xs.capture + xs.fission;
@@ -893,62 +763,31 @@ mod tests {
     // boundary, rather than letting them propagate into `pi_over_k_squared`
     // (whose `debug_assert!` is invisible in release builds).  See issue #558.
 
-    fn make_minimal_slbw_range() -> nereids_endf::resonance::ResonanceRange {
-        ResonanceRange {
-            energy_low: 1e-5,
-            energy_high: 1e4,
-            resolved: true,
-            formalism: ResonanceFormalism::SLBW,
-            target_spin: 0.0,
-            scattering_radius: 9.4285,
-            naps: 1,
-            l_groups: vec![LGroup {
-                l: 0,
-                awr: 236.006,
-                apl: 0.0,
-                qx: 0.0,
-                lrx: 0,
-                resonances: vec![Resonance {
-                    energy: 6.674,
-                    j: 0.5,
-                    gn: 1.493e-3,
-                    gg: 23.0e-3,
-                    gfa: 0.0,
-                    gfb: 0.0,
-                }],
-            }],
-            rml: None,
-            urr: None,
-            ap_table: None,
-            r_external: vec![],
-        }
-    }
-
     #[test]
     #[should_panic(expected = "expected positive finite energy_ev")]
     fn slbw_for_range_panics_on_zero_energy() {
-        let range = make_minimal_slbw_range();
+        let range = nereids_endf::resonance::test_support::minimal_slbw_range();
         let _ = slbw_cross_sections_for_range(&range, 0.0, 236.006, 0.0);
     }
 
     #[test]
     #[should_panic(expected = "expected positive finite energy_ev")]
     fn slbw_for_range_panics_on_negative_energy() {
-        let range = make_minimal_slbw_range();
+        let range = nereids_endf::resonance::test_support::minimal_slbw_range();
         let _ = slbw_cross_sections_for_range(&range, -1.0, 236.006, 0.0);
     }
 
     #[test]
     #[should_panic(expected = "expected positive finite energy_ev")]
     fn slbw_for_range_panics_on_nan_energy() {
-        let range = make_minimal_slbw_range();
+        let range = nereids_endf::resonance::test_support::minimal_slbw_range();
         let _ = slbw_cross_sections_for_range(&range, f64::NAN, 236.006, 0.0);
     }
 
     #[test]
     #[should_panic(expected = "expected positive finite energy_ev")]
     fn slbw_for_range_panics_on_infinite_energy() {
-        let range = make_minimal_slbw_range();
+        let range = nereids_endf::resonance::test_support::minimal_slbw_range();
         let _ = slbw_cross_sections_for_range(&range, f64::INFINITY, 236.006, 0.0);
     }
 }
