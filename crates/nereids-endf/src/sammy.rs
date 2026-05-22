@@ -1888,6 +1888,24 @@ fn element_name_to_z(name: &str) -> Option<u32> {
 mod tests {
     use super::*;
 
+    /// Canonical SAMMY `.inp` fixture for the Fe-56 tr007 transmission
+    /// case.  Loaded once and reused by the TRANSMISSION test directly
+    /// and by the CAPTURE / DIRAC rejection tests via
+    /// [`tr007_with_observation_type`] which swaps the observation-type
+    /// line.  Eliminates the prior 3 inline near-duplicates.
+    const FE56_TR007_INP: &str = include_str!(
+        "../../../tests/data/samtry/tr007_fe56_transmission_doppler_resolution/t007a.inp"
+    );
+
+    /// Build a SAMMY input string with a non-TRANSMISSION observation
+    /// type for the error-path rejection tests.  Replaces the
+    /// standalone observation-type line only (the standalone match on
+    /// `\nTRANSMISSION\n` avoids the false match on the title line
+    /// `FE TRANSMISSION FROM ...`).
+    fn tr007_with_observation_type(obs_type: &str) -> String {
+        FE56_TR007_INP.replace("\nTRANSMISSION\n", &format!("\n{obs_type}\n"))
+    }
+
     #[test]
     fn test_parse_plt_header_and_data() {
         let content = "\
@@ -1932,30 +1950,7 @@ EXPLICIT
 
     #[test]
     fn test_parse_inp_tr007() {
-        let content = "\
- FE TRANSMISSION FROM 1.13 TO 1.18 KEV
-      FE56 55.9      1133.01   1170.517    99
-PRINT WEIGHTED RESIDUALS
-DATA COVARIANCE FILE IS NAMED t007a.dcv
-PRINT THEORETICAL VALUES
-PRINT ALL INPUT PARAMETERS
-PRINT INPUT DATA
-WRITE NEW INPUT FILE = temp1_thick1.inp
-#DO NOT SUPPRESS ANY INTERMEDIATE RESULTS
-GENERATE PLOT FILE AUTOMATICALLY
-
-329.      80.263     0.0301   0.0       .021994
-6.0       0.2179
-TRANSMISSION
-  1      1    0  0.5    0.9999   .0
-    1    1    0    0      .500      .000      .000
-  2      1    0 -0.5    0.9172   .0
-    1    1    0    1      .500      .000      .000
-
-BROADENING
-6.00      329.00    0.2179    0.025     0.022     0.022      1 1 1 1 1 1
-";
-        let inp = parse_sammy_inp(content).unwrap();
+        let inp = parse_sammy_inp(FE56_TR007_INP).unwrap();
         assert_eq!(inp.isotope_symbol, "FE56");
         assert!((inp.awr - 55.9).abs() < 1e-6);
         assert!((inp.energy_min_ev - 1133.01).abs() < 1e-6);
@@ -2178,17 +2173,8 @@ BROADENING
     /// Verify that CAPTURE observation type is rejected with an error.
     #[test]
     fn test_capture_observation_type_rejected() {
-        let content = "\
- FE TRANSMISSION FROM 1.13 TO 1.18 KEV
-      FE56 55.9      1133.01   1170.517    99
-
-329.      80.263     0.0301   0.0       .021994
-6.0       0.2179
-CAPTURE CROSS SECTION
-  1      1    0  0.5    0.9999   .0
-    1    1    0    0      .500      .000      .000
-";
-        let result = parse_sammy_inp(content);
+        let content = tr007_with_observation_type("CAPTURE CROSS SECTION");
+        let result = parse_sammy_inp(&content);
         assert!(result.is_err(), "CAPTURE should be rejected");
         let msg = result.unwrap_err().message;
         assert!(
@@ -2200,17 +2186,8 @@ CAPTURE CROSS SECTION
     /// Verify that DIRAC observation type is rejected with an error.
     #[test]
     fn test_dirac_observation_type_rejected() {
-        let content = "\
- FE TRANSMISSION FROM 1.13 TO 1.18 KEV
-      FE56 55.9      1133.01   1170.517    99
-
-329.      80.263     0.0301   0.0       .021994
-6.0       0.2179
-DIRAC CROSS SECTION
-  1      1    0  0.5    0.9999   .0
-    1    1    0    0      .500      .000      .000
-";
-        let result = parse_sammy_inp(content);
+        let content = tr007_with_observation_type("DIRAC CROSS SECTION");
+        let result = parse_sammy_inp(&content);
         assert!(result.is_err(), "DIRAC should be rejected");
         let msg = result.unwrap_err().message;
         assert!(

@@ -647,67 +647,15 @@ mod tests {
         // Generate synthetic data with known L and t0, then recover them.
         // Small offsets (0.05 % in L, 0.5 µs in t₀) so the chi² minimum
         // is well inside Phase-2 fine grid (±0.05 % in L, ±2 µs in t₀).
-        let true_l = 25.0125;
-        let assumed_l = 25.0;
-        let true_t0_us = 0.5;
+        //
+        // Setup (resonances, energy grid, forward-model transmission,
+        // and the `calibrate_energy` call itself) is shared with the
+        // density-band tests below via `calibrate_round_trip_at_density`;
+        // the helper returns `(result, e_true, assumed_l)` so this
+        // smoke test can also assert on corrected-energy accuracy.
         let true_n = 1.5e-4;
-        let temperature_k = 293.6;
-
-        // Two well-separated single-resonance isotopes give a broader
-        // energy lever arm than a single resonance, sharpening the
-        // chi² minimum without exploding test runtime.
-        let iso_a = synthetic_single_resonance(72, 178, 176.4, 7.8);
-        let iso_b = synthetic_single_resonance(72, 178, 176.4, 22.0);
-        let isotopes = vec![iso_a, iso_b];
-        let abundances = vec![0.5, 0.5];
-
-        // Create nominal energy grid (as if L=25.0, t0=0).  150 bins
-        // across 5–35 eV brackets both resonances with ≈0.2 eV
-        // spacing; the original 500-bin Hf-178 test was wider but
-        // most of its constraining power came from resonances we
-        // do not have in this synthetic.
-        let e_nominal: Vec<f64> = (0..150).map(|i| 5.0 + i as f64 * 0.2).collect();
-
-        // Recover TOF from nominal E at assumed L
-        let tof_s: Vec<f64> = e_nominal
-            .iter()
-            .map(|&e| assumed_l * (NEUTRON_MASS_CONSTANT / e).sqrt())
-            .collect();
-
-        // Compute "true" energies using true L and t0
-        let true_t0_s = true_t0_us * 1e-6;
-        let e_true: Vec<f64> = tof_s
-            .iter()
-            .map(|&t| NEUTRON_MASS_CONSTANT * (true_l / (t - true_t0_s)).powi(2))
-            .collect();
-
-        // Generate synthetic transmission at true energies, with the
-        // same effective density distribution we pass to the
-        // calibrator.
-        let pairs: Vec<_> = isotopes
-            .iter()
-            .zip(abundances.iter())
-            .map(|(iso, &abd)| (iso.clone(), abd * true_n))
-            .collect();
-        let sample = SampleParams::new(temperature_k, pairs).expect("SampleParams creation failed");
-        let t_model =
-            transmission::forward_model(&e_true, &sample, None).expect("forward_model failed");
-
-        // Add tiny noise (sigma = 0.01, no actual noise — just for chi2 weighting)
-        let sigma = vec![0.01; e_nominal.len()];
-
-        // Calibrate (no resolution — matches synthetic data generated without resolution)
-        let result = calibrate_energy(
-            &e_nominal,
-            &t_model,
-            &sigma,
-            &isotopes,
-            &abundances,
-            assumed_l,
-            temperature_k,
-            None,
-        )
-        .expect("Calibration failed");
+        let (result, e_true, assumed_l) =
+            calibrate_round_trip_at_density(true_n).expect("Calibration failed");
 
         // Check recovery.  Wider tolerances than the Hf-178 fixture
         // because the synthetic chi² minimum is broader (see the
@@ -1120,10 +1068,14 @@ mod tests {
 
     /// Synthetic round-trip helper parameterised on `true_n`.  Builds
     /// data with two well-separated Hf-style resonances at the given
-    /// true density, then runs `calibrate_energy` and returns the
-    /// `CalibrationResult` so individual tests can assert on density
-    /// recovery and chi² finiteness.
-    fn calibrate_round_trip_at_density(true_n: f64) -> Result<CalibrationResult, PipelineError> {
+    /// true density, runs `calibrate_energy`, and on success returns
+    /// `(result, e_true, assumed_l)` so individual tests can assert on
+    /// density recovery and chi² finiteness (most callers) or on
+    /// corrected-energy accuracy against `e_true` (the
+    /// `test_calibrate_round_trip_synthetic` smoke test).
+    fn calibrate_round_trip_at_density(
+        true_n: f64,
+    ) -> Result<(CalibrationResult, Vec<f64>, f64), PipelineError> {
         let true_l = 25.0125;
         let assumed_l = 25.0;
         let true_t0_us = 0.5;
@@ -1155,7 +1107,7 @@ mod tests {
             transmission::forward_model(&e_true, &sample, None).expect("forward_model failed");
         let sigma = vec![0.01; e_nominal.len()];
 
-        calibrate_energy(
+        let result = calibrate_energy(
             &e_nominal,
             &t_model,
             &sigma,
@@ -1164,7 +1116,8 @@ mod tests {
             assumed_l,
             temperature_k,
             None,
-        )
+        )?;
+        Ok((result, e_true, assumed_l))
     }
 
     /// Near-lower-edge density: `true_n = 2e-5` sits just inside the
@@ -1182,7 +1135,7 @@ mod tests {
     #[test]
     fn test_calibrate_energy_recovers_density_1e_5() {
         let true_n = 2e-5;
-        let result = calibrate_round_trip_at_density(true_n)
+        let (result, _, _) = calibrate_round_trip_at_density(true_n)
             .expect("calibration at true_n=2e-5 must succeed");
         assert!(
             (result.total_density - true_n).abs() / true_n < 0.3,
@@ -1211,7 +1164,7 @@ mod tests {
     #[test]
     fn test_calibrate_energy_accepts_density_at_documented_lower_bound() {
         let true_n = 1.0e-5;
-        let result = calibrate_round_trip_at_density(true_n)
+        let (result, _, _) = calibrate_round_trip_at_density(true_n)
             .expect("calibration at the documented lower edge 1e-5 must succeed");
         // Log-space tolerance because the chi² landscape is shallow at
         // this trace density (single-resonance synthetic, weak signal):
@@ -1240,7 +1193,7 @@ mod tests {
     #[test]
     fn test_calibrate_energy_accepts_density_at_documented_upper_bound() {
         let true_n = 1.0e-2;
-        let result = calibrate_round_trip_at_density(true_n)
+        let (result, _, _) = calibrate_round_trip_at_density(true_n)
             .expect("calibration at the documented upper edge 1e-2 must succeed");
         // Tighter log-space tolerance than the lower edge: at this
         // high density the resonance is saturated, the chi²
@@ -1261,7 +1214,7 @@ mod tests {
     #[test]
     fn test_calibrate_energy_recovers_density_1e_4() {
         let true_n = 1e-4;
-        let result = calibrate_round_trip_at_density(true_n)
+        let (result, _, _) = calibrate_round_trip_at_density(true_n)
             .expect("calibration at true_n=1e-4 must succeed");
         assert!(
             (result.total_density - true_n).abs() / true_n < 0.1,
@@ -1280,7 +1233,7 @@ mod tests {
     #[test]
     fn test_calibrate_energy_recovers_density_1e_3() {
         let true_n = 1e-3;
-        let result = calibrate_round_trip_at_density(true_n)
+        let (result, _, _) = calibrate_round_trip_at_density(true_n)
             .expect("calibration at true_n=1e-3 must succeed");
         assert!(
             (result.total_density - true_n).abs() / true_n < 0.1,
@@ -1299,7 +1252,7 @@ mod tests {
     #[test]
     fn test_calibrate_energy_recovers_density_5e_3() {
         let true_n = 5e-3;
-        let result = calibrate_round_trip_at_density(true_n)
+        let (result, _, _) = calibrate_round_trip_at_density(true_n)
             .expect("calibration at true_n=5e-3 must succeed");
         assert!(
             (result.total_density - true_n).abs() / true_n < 0.1,
