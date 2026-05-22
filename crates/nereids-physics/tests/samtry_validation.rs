@@ -2047,24 +2047,6 @@ fn test_tr055_natfe_unbroadened() {
     );
 }
 
-// ─── tr063: Constant cross-section mock-up ───────────────────────────────────
-
-/// tr063: Constant cross-section mock-up, "UnKnown" isotope, no resonances.
-///
-/// Deferred: the "UnKnown" isotope symbol cannot be parsed by
-/// `parse_isotope_symbol()`.  This is a SAMMY test harness mock, not real
-/// physics — it tests SAMMY's internal normalization, not resonance evaluation.
-#[test]
-#[ignore = "tr063: UnKnown isotope symbol not supported by parse_isotope_symbol"]
-fn test_tr063_constant_xs() {
-    let (_inp, _par, _plt) = load_samtry_case(
-        "tr063_co59_total_xs_constant",
-        "t063a.inp",
-        "t063a.par",
-        "raa.plt",
-    );
-}
-
 // ─── tr101: Al-27 total XS, 18 spin groups, no broadening ──────────────────
 
 /// tr101: Aluminum-27 total cross section, 760-800 keV, 18 spin groups,
@@ -2141,24 +2123,6 @@ fn test_tr101_al27_unbroadened() {
         result.mean_rel_error < 0.0003,
         "unbroadened mean error {:.6} > 0.03%",
         result.mean_rel_error
-    );
-}
-
-// ─── tr103: Ni-58 transmission, ORR resolution ──────────────────────────────
-
-/// tr103: Ni-58 transmission, 180-183 keV, ORR resolution function.
-///
-/// Deferred: requires ORR (Oak Ridge Research Reactor) resolution broadening
-/// which is not yet implemented.  The .plt reference uses ORR-broadened
-/// theoretical values that cannot be reproduced with Gaussian broadening.
-#[test]
-#[ignore = "tr103: ORR resolution function not yet implemented"]
-fn test_tr103_ni58_orr() {
-    let (_inp, _par, _plt) = load_samtry_case(
-        "tr103_ni58_transmission_orr",
-        "t103a.inp",
-        "t103a.par",
-        "raa.plt",
     );
 }
 
