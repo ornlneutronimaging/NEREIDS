@@ -24,7 +24,7 @@
 
 mod common;
 
-use nereids_physics::resolution::{TabulatedResolution, apply_r, test_support};
+use nereids_physics::resolution::{apply_r, test_support};
 
 /// Two-pointer `broaden_presorted` vs binary-search reference.  Pins
 /// the bit-exact sink equality between the two paths so a future
@@ -58,7 +58,7 @@ fn test_broaden_presorted_bench() {
     let start = std::time::Instant::now();
     let mut sink_ref = 0.0f64;
     for _ in 0..repeats {
-        let r = broaden_presorted_reference(&tab, &energies, &spectrum);
+        let r = test_support::broaden_presorted_reference(&tab, &energies, &spectrum);
         sink_ref += r.iter().sum::<f64>();
     }
     let t_ref = start.elapsed();
@@ -224,95 +224,6 @@ fn resolution_matrix_apply_microbench() {
     );
 }
 
-// ── Local helper duplicated from `src/resolution.rs` ─────────────
-
-fn interp_spectrum(energies: &[f64], spectrum: &[f64], e: f64) -> Option<f64> {
-    // Verbatim copy of crates/nereids-physics/src/resolution.rs:2541.
-    // See PR #545 round-1 review (Codex) for why a "modernized"
-    // binary_search variant is wrong here: the oracle must match
-    // the in-src helper byte for byte so the bit-exact comparison
-    // does not silently flip on exact-grid-hit edge cases.
-    let n = energies.len();
-    if n == 0 {
-        return None;
-    }
-    if e < energies[0] || e > energies[n - 1] {
-        return None;
-    }
-    let mut lo = 0;
-    let mut hi = n - 1;
-    while hi - lo > 1 {
-        let mid = (lo + hi) / 2;
-        if energies[mid] <= e {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-    let span = energies[hi] - energies[lo];
-    if span.abs() < nereids_core::constants::NEAR_ZERO_FLOOR {
-        return Some(spectrum[lo]);
-    }
-    let frac = (e - energies[lo]) / span;
-    Some(spectrum[lo] + frac * (spectrum[hi] - spectrum[lo]))
-}
-
-fn broaden_presorted_reference(
-    tab: &TabulatedResolution,
-    energies: &[f64],
-    spectrum: &[f64],
-) -> Vec<f64> {
-    use nereids_core::constants::DIVISION_FLOOR;
-    let tof_factor = test_support::TOF_FACTOR;
-
-    let n = energies.len();
-    if n == 0 {
-        return vec![];
-    }
-    let mut result = vec![0.0f64; n];
-    for i in 0..n {
-        let e = energies[i];
-        if e <= 0.0 {
-            result[i] = spectrum[i];
-            continue;
-        }
-        let tof_center = tof_factor * tab.flight_path_m() / e.sqrt();
-        let (offsets, weights) = test_support::interpolated_kernel(tab, e);
-        let mut sum = 0.0;
-        let mut norm = 0.0;
-        for k in 0..offsets.len() {
-            let dt = offsets[k];
-            let w = weights[k];
-            if w <= 0.0 {
-                continue;
-            }
-            let tof_prime = tof_center + dt;
-            if tof_prime <= 0.0 {
-                continue;
-            }
-            let e_prime = (tof_factor * tab.flight_path_m() / tof_prime).powi(2);
-            let s = match interp_spectrum(energies, spectrum, e_prime) {
-                Some(v) => v,
-                None => continue,
-            };
-            let dt_width = if k > 0 && k < offsets.len() - 1 {
-                (offsets[k + 1] - offsets[k - 1]) * 0.5
-            } else if k == 0 && offsets.len() > 1 {
-                offsets[1] - offsets[0]
-            } else if k == offsets.len() - 1 && offsets.len() > 1 {
-                offsets[k] - offsets[k - 1]
-            } else {
-                1.0
-            };
-            let weight = w * dt_width.abs();
-            sum += weight * s;
-            norm += weight;
-        }
-        result[i] = if norm > DIVISION_FLOOR {
-            sum / norm
-        } else {
-            spectrum[i]
-        };
-    }
-    result
-}
+// Helpers `interp_spectrum` + `broaden_presorted_reference` live in
+// `test_support` so this microbench, the in-src tests, and
+// `venus_usr_resolution.rs` share one byte-identical oracle.

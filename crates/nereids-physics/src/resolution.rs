@@ -2114,7 +2114,7 @@ impl std::error::Error for ResolutionParseError {}
 /// production API surface.
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support {
-    use super::{ResolutionPlan, TabulatedResolution};
+    use super::{DIVISION_FLOOR, NEAR_ZERO_FLOOR, ResolutionPlan, TabulatedResolution};
 
     /// Build a [`ResolutionPlan`] directly from its SoA fields.
     ///
@@ -2189,12 +2189,165 @@ pub mod test_support {
     /// integration-test oracle uses the exact same constant as
     /// the SUT, preserving bit-exact equivalence.
     pub const TOF_FACTOR: f64 = super::TOF_FACTOR;
+
+    /// Bit-exact regression oracle: binary-search piecewise-linear
+    /// interpolation of `spectrum` onto target energy `e`.  Mirror of
+    /// the pre-optimization in-src reference; called transitively by
+    /// [`broaden_presorted_reference`] inside its inner convolution
+    /// loop.
+    ///
+    /// **Do not "clean up" this function.** Consumers are bit-exact
+    /// equivalence tests that pin the optimized two-pointer path in
+    /// `TabulatedResolution::broaden_presorted` against this byte-
+    /// identical reference.  A rewrite that shifts edge cases by even
+    /// one bit (e.g. swapping the upper-bound binary search for
+    /// `partition_point`, or changing the `<=` to `<` in the midpoint
+    /// comparison) would flip the comparison and invalidate the
+    /// regression suite.  See `feedback_bit_exact_oracle_verbatim.md`.
+    pub fn interp_spectrum(energies: &[f64], spectrum: &[f64], e: f64) -> Option<f64> {
+        let n = energies.len();
+        if n == 0 {
+            return None;
+        }
+        if e < energies[0] || e > energies[n - 1] {
+            return None;
+        }
+        let mut lo = 0;
+        let mut hi = n - 1;
+        while hi - lo > 1 {
+            let mid = (lo + hi) / 2;
+            if energies[mid] <= e {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let span = energies[hi] - energies[lo];
+        if span.abs() < NEAR_ZERO_FLOOR {
+            return Some(spectrum[lo]);
+        }
+        let frac = (e - energies[lo]) / span;
+        Some(spectrum[lo] + frac * (spectrum[hi] - spectrum[lo]))
+    }
+
+    /// Bit-exact regression oracle: pre-optimization reference
+    /// implementation of [`TabulatedResolution::broaden_presorted`].
+    /// Used by the in-src + integration + microbench bit-exact test
+    /// suites that pin the optimized two-pointer path against this
+    /// reference.
+    ///
+    /// Same "do not refactor" caveat as [`interp_spectrum`].  Reads
+    /// `tab.flight_path_m()` via the public getter so the oracle stays
+    /// callable from integration tests (the underlying field is
+    /// private; the getter is a no-op wrapper, so byte-equivalence
+    /// against the original in-src field access is preserved).
+    pub fn broaden_presorted_reference(
+        tab: &TabulatedResolution,
+        energies: &[f64],
+        spectrum: &[f64],
+    ) -> Vec<f64> {
+        let n = energies.len();
+        if n == 0 {
+            return vec![];
+        }
+
+        let mut result = vec![0.0f64; n];
+
+        for i in 0..n {
+            let e = energies[i];
+            if e <= 0.0 {
+                result[i] = spectrum[i];
+                continue;
+            }
+
+            let tof_center = TOF_FACTOR * tab.flight_path_m() / e.sqrt();
+            let (offsets, weights) = tab.interpolated_kernel(e);
+
+            let mut sum = 0.0;
+            let mut norm = 0.0;
+
+            for k in 0..offsets.len() {
+                let dt = offsets[k];
+                let w = weights[k];
+                if w <= 0.0 {
+                    continue;
+                }
+
+                let tof_prime = tof_center + dt;
+                if tof_prime <= 0.0 {
+                    continue;
+                }
+
+                let e_prime = (TOF_FACTOR * tab.flight_path_m() / tof_prime).powi(2);
+
+                let s = match interp_spectrum(energies, spectrum, e_prime) {
+                    Some(v) => v,
+                    None => continue,
+                };
+
+                let dt_width = if k > 0 && k < offsets.len() - 1 {
+                    (offsets[k + 1] - offsets[k - 1]) * 0.5
+                } else if k == 0 && offsets.len() > 1 {
+                    offsets[1] - offsets[0]
+                } else if k == offsets.len() - 1 && offsets.len() > 1 {
+                    offsets[k] - offsets[k - 1]
+                } else {
+                    1.0
+                };
+
+                let weight = w * dt_width.abs();
+                sum += weight * s;
+                norm += weight;
+            }
+
+            result[i] = if norm > DIVISION_FLOOR {
+                sum / norm
+            } else {
+                spectrum[i]
+            };
+        }
+
+        result
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use nereids_core::constants;
+
+    // ── Smoke tests for the test_support oracles (`interp_spectrum` +
+    //    `broaden_presorted_reference`).  The 7+ bit-exact tests below
+    //    exercise the math thoroughly; these smoke tests just pin the
+    //    boundary-condition return-shape behavior of the oracles so a
+    //    future refactor that breaks empty-input or out-of-range
+    //    handling fails loudly rather than only via bit-exact diffs.
+
+    #[test]
+    fn test_support_interp_spectrum_empty_returns_none() {
+        assert_eq!(test_support::interp_spectrum(&[], &[], 1.0), None);
+    }
+
+    #[test]
+    fn test_support_interp_spectrum_out_of_range_returns_none() {
+        let energies = [1.0, 2.0, 3.0];
+        let spectrum = [10.0, 20.0, 30.0];
+        assert_eq!(
+            test_support::interp_spectrum(&energies, &spectrum, 0.5),
+            None
+        );
+        assert_eq!(
+            test_support::interp_spectrum(&energies, &spectrum, 3.5),
+            None
+        );
+    }
+
+    #[test]
+    fn test_support_broaden_presorted_reference_empty_returns_empty() {
+        let tab = test_support::trivial_tabulated_resolution(25.0);
+        let out = test_support::broaden_presorted_reference(&tab, &[], &[]);
+        assert!(out.is_empty());
+    }
 
     #[test]
     fn test_tof_factor_consistency() {
@@ -2532,105 +2685,11 @@ mod tests {
     // output against a canonical reference implementation that preserves
     // the pre-optimization code path.
 
-    /// Binary-search spectrum interpolation.  Preserved here because the
-    /// reference broaden_presorted uses it; the production inner loop now
-    /// uses a two-pointer walk and no longer needs this helper.
-    fn interp_spectrum(energies: &[f64], spectrum: &[f64], e: f64) -> Option<f64> {
-        let n = energies.len();
-        if n == 0 {
-            return None;
-        }
-        if e < energies[0] || e > energies[n - 1] {
-            return None;
-        }
-        let mut lo = 0;
-        let mut hi = n - 1;
-        while hi - lo > 1 {
-            let mid = (lo + hi) / 2;
-            if energies[mid] <= e {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        let span = energies[hi] - energies[lo];
-        if span.abs() < NEAR_ZERO_FLOOR {
-            return Some(spectrum[lo]);
-        }
-        let frac = (e - energies[lo]) / span;
-        Some(spectrum[lo] + frac * (spectrum[hi] - spectrum[lo]))
-    }
-
-    /// Reference implementation — the pre-optimization broaden_presorted.
-    /// Kept in the test module only; used solely as the equivalence oracle.
-    fn broaden_presorted_reference(
-        tab: &TabulatedResolution,
-        energies: &[f64],
-        spectrum: &[f64],
-    ) -> Vec<f64> {
-        let n = energies.len();
-        if n == 0 {
-            return vec![];
-        }
-
-        let mut result = vec![0.0f64; n];
-
-        for i in 0..n {
-            let e = energies[i];
-            if e <= 0.0 {
-                result[i] = spectrum[i];
-                continue;
-            }
-
-            let tof_center = TOF_FACTOR * tab.flight_path_m / e.sqrt();
-            let (offsets, weights) = tab.interpolated_kernel(e);
-
-            let mut sum = 0.0;
-            let mut norm = 0.0;
-
-            for k in 0..offsets.len() {
-                let dt = offsets[k];
-                let w = weights[k];
-                if w <= 0.0 {
-                    continue;
-                }
-
-                let tof_prime = tof_center + dt;
-                if tof_prime <= 0.0 {
-                    continue;
-                }
-
-                let e_prime = (TOF_FACTOR * tab.flight_path_m / tof_prime).powi(2);
-
-                let s = match interp_spectrum(energies, spectrum, e_prime) {
-                    Some(v) => v,
-                    None => continue,
-                };
-
-                let dt_width = if k > 0 && k < offsets.len() - 1 {
-                    (offsets[k + 1] - offsets[k - 1]) * 0.5
-                } else if k == 0 && offsets.len() > 1 {
-                    offsets[1] - offsets[0]
-                } else if k == offsets.len() - 1 && offsets.len() > 1 {
-                    offsets[k] - offsets[k - 1]
-                } else {
-                    1.0
-                };
-
-                let weight = w * dt_width.abs();
-                sum += weight * s;
-                norm += weight;
-            }
-
-            result[i] = if norm > DIVISION_FLOOR {
-                sum / norm
-            } else {
-                spectrum[i]
-            };
-        }
-
-        result
-    }
+    // The `interp_spectrum` + `broaden_presorted_reference` oracles
+    // were promoted to `test_support` so the integration tests
+    // (`tests/venus_usr_resolution{,_microbench}.rs`) share the same
+    // byte-identical reference.  Imported below.
+    use super::test_support::broaden_presorted_reference;
 
     /// Synthetic TabulatedResolution with 3 reference energies and a
     /// triangular kernel of varying widths.  Deterministic, no I/O.
