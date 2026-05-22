@@ -486,11 +486,8 @@ pub fn forward_model(
 /// constructed for Doppler boundary accuracy, but the resolution
 /// convolution is not performed.
 ///
-/// This is the expensive physics step that should be done **once** before
-/// fitting many pixels with the same isotopes and energy grid.  The result
-/// feeds into `nereids_fitting::transmission_model::PrecomputedTransmissionModel`,
-/// which currently applies Beer-Lambert only.  Post-Beer-Lambert resolution
-/// broadening per-pixel is not yet implemented (issue #442 Step 3).
+/// This is the expensive physics step; cache the result once before
+/// fitting many pixels on the same isotopes and energy grid.
 ///
 /// # Arguments
 /// * `energies`        — Energy grid in eV (sorted ascending).

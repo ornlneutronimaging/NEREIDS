@@ -3147,19 +3147,6 @@ mod tests {
         );
     }
 
-    // Removed as part of the counts-KL collapse (Phase 0):
-    //   - test_typed_counts_poisson_kl_with_background
-    //   - test_typed_counts_poisson_kl_with_temperature_and_background
-    //   - test_typed_counts_poisson_kl_with_counts_background_scales
-    // These tested the legacy fixed-flux `fit_counts_poisson` path with
-    // nonzero detector_background and alpha_1/alpha_2 nuisance fitting.
-    // The new counts-KL dispatch (joint-Poisson profile deviance) rejects
-    // nonzero detector_background (P3.2-deferred) and alpha_1/alpha_2
-    // (λ̂ absorbs the global flux scale; memo 35 §P1).  End-to-end
-    // counts+PoissonKL coverage is provided by
-    // `test_joint_poisson_density_recovery_c_5_98` and
-    // `test_joint_poisson_with_transmission_background`.
-
     /// Round-trip test: create a group of 2 isotopes with known ratios,
     /// generate synthetic transmission, fit with group constraints,
     /// verify the fitted group density matches the true value.
@@ -3739,8 +3726,6 @@ mod tests {
     /// with 5 free params the (n, A_n) correlation is non-trivial so we
     /// assert the *wiring* is correct (bg reaches the fit, D/dof → 0,
     /// A_n + B_A near truth, density within 10%) rather than EG2-grade
-    /// recovery.  The real VENUS evaluation in the companion memo is
-    /// the stress test.
     #[test]
     fn test_joint_poisson_with_transmission_background() {
         let data = u238_single_resonance();
@@ -3812,7 +3797,6 @@ mod tests {
         // fitter moves them off their initial values.  Density / A_n /
         // B_A recovery at unit-test scale (201 bins, 5 free params)
         // inherits the classic n ↔ A_n correlation — the realistic
-        // stress test is the VENUS evaluation in the companion memo.
 
         // Deviance-based GOF populated and → 0 on noise-free expected counts.
         // Requires polish (see `with_counts_enable_polish(Some(true))` above).

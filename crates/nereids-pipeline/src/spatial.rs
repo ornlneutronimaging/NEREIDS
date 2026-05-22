@@ -206,7 +206,7 @@ fn apply_spatial_polish_default(config: UnifiedFitConfig, n_pixels: usize) -> Un
 /// `Err(_) => failed_count += 1` swallow at the bottom of the loop.
 ///
 /// Every gate here mirrors a per-pixel `Err(PipelineError::InvalidParameter)`
-/// raised inside `fit_spectrum_typed` / `fit_transmission_kl` /
+/// raised inside `fit_spectrum_typed` / `fit_transmission_poisson` /
 /// `fit_counts_joint_poisson` whose decision depends only on
 /// `(input variant, config)` — i.e. fires identically for every pixel.
 /// Per-pixel error variants (numerical fit failure, per-pixel detector
@@ -243,8 +243,8 @@ fn validate_spatial_fit_preflight(
         || (matches!(config.solver(), SolverConfig::Auto) && is_counts);
 
     // Gate: transmission + Poisson-KL solver path does not honour
-    // `fit_energy_range` — `fit_transmission_kl` rejects this
-    // combination per-pixel (`pipeline.rs::fit_transmission_kl`).
+    // `fit_energy_range` — `fit_transmission_poisson` rejects this
+    // combination per-pixel (`pipeline.rs::fit_transmission_poisson`).
     // Without hoisting, every pixel errors and the spatial layer
     // hides the dispatch-level incompatibility.  Counts-KL (joint-
     // Poisson) and LM transmission both honour the mask correctly,
@@ -872,17 +872,6 @@ pub fn spatial_map_typed(
                 // the codex04 reference uses.  Anchor at the midpoint
                 // (0.5 × train_max).
                 //
-                // **Known limitation — deferred to PR #476**: this
-                // policy doesn't cross-check the solver's actual
-                // fit-bound constraints.  If `initial_densities`
-                // is near zero (or far from where the solver
-                // actually explores), the cubature is built for a
-                // box that may not contain the fit trajectory, and
-                // held-out forward accuracy degrades silently.
-                // PR #476 (trust-region wrapper) owns box
-                // invalidation / rebuild-on-escape and naturally
-                // replaces this static policy; see Claude round-1
-                // P2-b on PR #480.
                 let train_max: Vec<f64> = config
                     .initial_densities()
                     .iter()
@@ -983,18 +972,6 @@ pub fn spatial_map_typed(
             // to the exact path rather than install a plan that
             // could corrupt the fit.  Codex PR #475 round-2 P2.
             //
-            // **Known limitation — deferred to PR #476** (mirrors
-            // the cubature policy, see lines 578-588): if
-            // `initial_densities[0]` is near zero the floor clamps
-            // `n_max` to 2e-6, but the solver may explore well
-            // past that.  The `scalar_density_within_box` guard in
-            // `transmission_model.rs` catches this (strict
-            // `n ≤ n_max` post-round-2 P1) and falls back to the
-            // exact `ResolutionPlan` path, so the worst outcome
-            // is lost speedup — never silent accuracy loss.
-            // PR #476 (trust-region wrapper) owns
-            // box-rebuild-on-escape and replaces this static
-            // policy.  Claude round-1 P2-#5 on PR #475.
             const CHEBYSHEV_NODES: usize = 16;
             let n_max: f64 = 2.0 * config.initial_densities()[0].max(1e-6);
             match nereids_physics::surrogate::ScalarChebyshevPlan::build(
@@ -1106,11 +1083,6 @@ pub fn spatial_map_typed(
     //    `O_i` propagates directly into `λ̂_i`, which in turn inflates
     //    the deviance without improving density recovery.
     //
-    // This is a bias-variance trade: we lose the exact per-pixel paired
-    // likelihood structure in exchange for a tighter density-fidelity
-    // variance across pixels.  Empirically (evidence/37-…json), this is
-    // the right call for the VENUS-style "flat beam with a masking
-    // sample" geometry.
     //
     // **If this isn't the right assumption for your data** — e.g. you
     // have a genuinely spatially-varying beam profile and pre-estimated
@@ -1119,10 +1091,6 @@ pub fn spatial_map_typed(
     // bypasses the averaging and pairs each pixel's sample with the
     // caller-supplied per-pixel flux and bg spectra.
     //
-    // TODO(future): expose a config flag to switch the counts dispatch
-    // between "averaged OB" (current, stability-oriented) and "raw
-    // per-pixel OB" (exact paired joint-Poisson) if a use case arises
-    // where both options are needed at call sites.
     let averaged_flux: Option<Vec<f64>> = if matches!(input, InputData3D::Counts { .. }) {
         let n_e = data_b.shape()[2]; // data_b is transposed: (h, w, n_e)
         let mut flux = vec![0.0f64; n_e];
@@ -1704,18 +1672,6 @@ mod tests {
             result.n_total
         );
     }
-
-    // Removed as part of the counts-KL collapse (Phase 0):
-    //   test_spatial_map_typed_counts_with_nuisance_surfaces_background_maps
-    // Tested fit_alpha_1 / fit_alpha_2 nuisance fitting on a 4×4 spatial
-    // grid, which is no longer supported on the counts-KL dispatch (the
-    // joint-Poisson profile λ̂ absorbs alpha_1 and alpha_2 / B_det is
-    // P3.2-deferred; memo 35 §P3).  The SAMMY-style A_n + B_A/B/C wiring
-    // on counts input is covered at pipeline scale by
-    // `test_joint_poisson_with_transmission_background` (pipeline.rs);
-    // a dedicated 3D-grid counterpart is not currently a test invariant
-    // (spatial_map_typed is a thin per-pixel dispatcher over
-    // fit_spectrum_typed, which is already covered).
 
     #[test]
     fn test_spatial_map_typed_dead_pixels() {

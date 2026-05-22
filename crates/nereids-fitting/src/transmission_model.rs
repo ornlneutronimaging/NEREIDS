@@ -537,32 +537,10 @@ impl FitModel for PrecomputedTransmissionModel {
                 // Map each free param to its column in the cubature
                 // Jacobian.  `None` for any free param that isn't a
                 // density param → fall through to the exact path.
-                //
-                // **Known caveat (Codex round-5 P2 on PR #480,
-                // extended to scalar path in PR #475)**: if
-                // `free_param_indices` contains non-density slots,
-                // `col_map` is `None` and analytical_jacobian
-                // falls through to the exact derivatives — but
-                // `evaluate()` unconditionally dispatches the
-                // cubature forward when eligible.  The scalar
-                // (k = 1) Jacobian branch below has an analogous
-                // stronger guard
-                // (`free_param_indices == [density_param]`) that
-                // similarly falls through when any nuisance slot
-                // is free, while its `evaluate()` path fires on
-                // `scalar_eligible` alone — the same eval/Jac
-                // mix.  In the current layered architecture
-                // (`NormalizedTransmissionModel` /
-                // `TransmissionKLBackgroundModel` wrap the inner
-                // `PrecomputedTransmissionModel` before any
-                // non-density nuisance parameter reaches this
-                // layer), `free_param_indices` here is always the
-                // density slots, so neither mismatch can arise
-                // via the standard pipeline.  A defence-in-depth
-                // fix (route `evaluate()` through a context that
-                // knows about free params) is deferred to the
-                // trust-region PR (#476) that will revisit this
-                // dispatch surface.
+                // Wrappers (`NormalizedTransmissionModel`,
+                // `TransmissionKLBackgroundModel`) ensure only density
+                // slots reach this layer; non-density free params here
+                // would indicate a wrapper bypass.
                 let col_map: Option<Vec<usize>> = free_param_indices
                     .iter()
                     .map(|&fp| params_indices.iter().position(|&i| i == fp))

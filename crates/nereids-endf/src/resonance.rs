@@ -182,8 +182,7 @@ pub enum ResonanceFormalism {
 // LRF=1: single energy-independent width set per (L, J); Γ_n derived from
 //        reduced neutron width GNO via Γ_n = 2·P_L·GNO.
 // LRF=2: tabulated energy-dependent widths with an interpolation law per
-//        J-group (INT=2 lin-lin, INT=5 log-log; other INT codes are valid
-//        ENDF but not yet implemented and cause the URR range to be skipped).
+//        J-group; supported INT codes enforced by the parser at load time.
 //
 // Reference: ENDF-6 Formats Manual §2.2.2; SAMMY unr/munr03.f90 Csig3
 
@@ -618,22 +617,6 @@ impl ResonanceData {
     /// For LRF=7 ranges, counts resonances across all spin groups.
     pub fn total_resonance_count(&self) -> usize {
         self.ranges.iter().map(|r| r.resonance_count()).sum()
-    }
-
-    /// Get all resonances in the resolved region (LRF=1/2/3 only), sorted by energy.
-    ///
-    /// Returns an empty vec for LRF=7 ranges; use `ResonanceRange::rml` directly
-    /// to access R-Matrix Limited resonances.
-    pub fn all_resolved_resonances(&self) -> Vec<&Resonance> {
-        let mut resonances: Vec<&Resonance> = self
-            .ranges
-            .iter()
-            .filter(|r| r.resolved && r.rml.is_none())
-            .flat_map(|r| &r.l_groups)
-            .flat_map(|lg| &lg.resonances)
-            .collect();
-        resonances.sort_by(|a, b| a.energy.total_cmp(&b.energy));
-        resonances
     }
 }
 
