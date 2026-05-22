@@ -31,6 +31,8 @@ from nereids.mcp.server import (
     validate_resonance_dataset,
 )
 
+from _fixtures import _synthetic_u238_data, _synthetic_u238_entry
+
 
 @pytest.fixture(autouse=True)
 def clear_registry():
@@ -285,32 +287,6 @@ class TestInputValidation:
 # ---------------------------------------------------------------------------
 # Manifest-driven workflow tools
 # ---------------------------------------------------------------------------
-
-
-def _synthetic_u238_entry(initial_density=0.001):
-    return {
-        "isotope": "U-238",
-        "initial_density": initial_density,
-        "synthetic_resonance": {
-            "z": 92,
-            "a": 238,
-            "awr": 236.006,
-            "scattering_radius": 9.48,
-            "target_spin": 0.0,
-            "resonances": [[6.67, 0.5, 0.0015, 0.023]],
-        },
-    }
-
-
-def _synthetic_u238_data():
-    return nereids.create_resonance_data(
-        z=92,
-        a=238,
-        awr=236.006,
-        scattering_radius=9.48,
-        resonances=[(6.67, 0.5, 0.0015, 0.023)],
-        target_spin=0.0,
-    )
 
 
 def _write_json_frontmatter_manifest(tmp_path, analysis):
