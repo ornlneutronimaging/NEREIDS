@@ -12,38 +12,16 @@ import pytest
 
 import nereids
 
+from _fixtures import _make_single_resonance
+
 
 # ---------------------------------------------------------------------------
 # Helpers / fixtures
 # ---------------------------------------------------------------------------
 
-def _make_single_resonance(
-    z=92,
-    a=238,
-    awr=236.006,
-    scattering_radius=9.48,
-    energy=6.67,
-    j=0.5,
-    gn=0.0015,
-    gg=0.023,
-    target_spin=0.0,
-    formalism=None,
-):
-    """Build a minimal single-resonance isotope for testing."""
-    return nereids.create_resonance_data(
-        z=z,
-        a=a,
-        awr=awr,
-        scattering_radius=scattering_radius,
-        resonances=[(energy, j, gn, gg)],
-        target_spin=target_spin,
-        formalism=formalism,
-    )
-
-
 @pytest.fixture
 def u238_data():
-    """Single-resonance U-238-like isotope (6.67 eV resonance)."""
+    """Single-resonance U-238-like isotope (6.674 eV resonance)."""
     return _make_single_resonance()
 
 
