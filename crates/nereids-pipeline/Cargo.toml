@@ -18,3 +18,8 @@ rand = { workspace = true }
 rand_distr = { workspace = true }
 rayon = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# Exposes `nereids_endf::resonance::test_support` — synthetic
+# `ResonanceData` builders shared with sibling crates' tests.
+nereids-endf = { workspace = true, features = ["test-support"] }

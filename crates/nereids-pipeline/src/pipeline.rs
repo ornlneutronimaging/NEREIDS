@@ -2583,11 +2583,11 @@ pub struct SpectrumFitResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::synthetic_single_resonance;
+    use nereids_endf::resonance::test_support::{
+        synthetic_single_resonance, u238_single_resonance,
+    };
     use nereids_fitting::lm::FitModel;
     use nereids_physics::transmission as phys_transmission;
-
-    use crate::test_helpers::u238_single_resonance;
 
     // ── Phase 0: InputData + SolverConfig + CountsBackgroundConfig tests ──
 

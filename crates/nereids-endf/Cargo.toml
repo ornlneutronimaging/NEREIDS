@@ -8,6 +8,17 @@ repository.workspace = true
 keywords = ["endf", "nuclear", "resonance", "neutron", "parsing"]
 categories = ["science"]
 
+[features]
+default = []
+# Exposes `resonance::test_support` — a feature-gated module of synthetic
+# `ResonanceData` / `ResonanceRange` builders used by downstream crates'
+# tests to construct hand-designed fixtures (single-resonance U-238,
+# Hf-178/Hf-177 multi-resonance, generic parameterized helpers, etc.).
+# Downstream crates enable this feature in their `[dev-dependencies]`
+# block.  Never enabled in release builds; production code never sees
+# these helpers.
+test-support = []
+
 [dependencies]
 endf-mat = { workspace = true }
 nereids-core = { workspace = true }
@@ -19,3 +30,9 @@ dirs = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# Self dev-dep enables in-crate `#[cfg(test)]` blocks and integration
+# tests under `crates/nereids-endf/tests/` (a separate crate boundary)
+# to consume `resonance::test_support`.  Inherits version + path from
+# `[workspace.dependencies]`, so `scripts/bump-version.sh` keeps the
+# version pin in sync automatically.
+nereids-endf = { workspace = true, features = ["test-support"] }

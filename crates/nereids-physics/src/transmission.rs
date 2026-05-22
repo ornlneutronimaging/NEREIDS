@@ -1026,43 +1026,8 @@ pub fn forward_model_from_base_xs(
 mod tests {
     use super::*;
     use nereids_core::types::Isotope;
+    use nereids_endf::resonance::test_support::u238_single_resonance;
     use nereids_endf::resonance::{LGroup, Resonance, ResonanceFormalism, ResonanceRange};
-
-    fn u238_single_resonance() -> ResonanceData {
-        ResonanceData {
-            isotope: Isotope::new(92, 238).unwrap(),
-            za: 92238,
-            awr: 236.006,
-            ranges: vec![ResonanceRange {
-                energy_low: 1e-5,
-                energy_high: 1e4,
-                resolved: true,
-                formalism: ResonanceFormalism::ReichMoore,
-                target_spin: 0.0,
-                scattering_radius: 9.4285,
-                naps: 1,
-                l_groups: vec![LGroup {
-                    l: 0,
-                    awr: 236.006,
-                    apl: 0.0,
-                    qx: 0.0,
-                    lrx: 0,
-                    resonances: vec![Resonance {
-                        energy: 6.674,
-                        j: 0.5,
-                        gn: 1.493e-3,
-                        gg: 23.0e-3,
-                        gfa: 0.0,
-                        gfb: 0.0,
-                    }],
-                }],
-                rml: None,
-                urr: None,
-                ap_table: None,
-                r_external: vec![],
-            }],
-        }
-    }
 
     #[test]
     fn test_beer_lambert_zero_thickness() {
