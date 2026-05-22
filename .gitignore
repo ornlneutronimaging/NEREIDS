@@ -52,6 +52,7 @@ _fts_*.txt
 # (do NOT gitignore Cargo.lock)
 .prototypes/
 .research/
+.private/
 .claude/settings.local.json
 tmp/
 
