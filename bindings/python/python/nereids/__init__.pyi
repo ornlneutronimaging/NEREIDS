@@ -1014,12 +1014,11 @@ def fit_counts_spectrum_typed(
         background: Enable the SAMMY-style transmission-background
             wrapper inside the counts-KL fit (A_n + B_A + B_B/√E + B_C√E).
         detector_background: Optional detector/counts background reference
-            (for LM-converted path only; counts-KL rejects non-zero values,
-            deferred to memo 35 §P3.2).
+            (for LM-converted path only; counts-KL rejects non-zero values).
         fit_alpha_1: Research-only; rejected by the counts-KL dispatch
             because the profile λ̂ absorbs the global flux scale.
         fit_alpha_2: Research-only; rejected by the counts-KL dispatch
-            (B_det / alpha_2 wiring deferred to memo 35 §P3.2).
+            (non-zero detector background not currently wired).
         alpha_1_init: Initial value for alpha_1 (default 1.0); only
             consumed by the research Fisher helper.
         alpha_2_init: Initial value for alpha_2 (default 1.0); same.

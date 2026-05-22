@@ -372,7 +372,6 @@ fn hdf5_event_tab(ui: &mut egui::Ui, state: &mut AppState) {
 /// Optional open beam NeXus file picker for HDF5 modes.
 /// When provided, enables proper normalization (T = sample/OB) and
 /// counts-domain KL fitting.
-// TODO: async OB loading for large files
 fn hdf5_ob_picker(ui: &mut egui::Ui, state: &mut AppState) {
     design::card(ui, |ui| {
         ui.label(

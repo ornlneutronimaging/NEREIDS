@@ -280,11 +280,6 @@ impl EndfRetriever {
             .map_err(|e| EndfRetrievalError::Parse(format!("Invalid UTF-8 ENDF response: {e}")))
     }
 
-    /// Load an ENDF file from a local path (no download).
-    pub fn load_local(path: &Path) -> Result<String, EndfRetrievalError> {
-        fs::read_to_string(path).map_err(EndfRetrievalError::from)
-    }
-
     /// Peek a user-supplied ENDF source: decode the body and parse the HEAD
     /// record so the caller can route the upload to the correct isotope entry.
     ///
@@ -355,24 +350,6 @@ impl EndfRetriever {
         }
         let cache_path = self.install_endf_text(isotope, library, &endf_text)?;
         Ok((cache_path, endf_text))
-    }
-
-    /// Clear the cache for a specific library, or all if `None`.
-    pub fn clear_cache(&self, library: Option<EndfLibrary>) -> Result<(), EndfRetrievalError> {
-        match library {
-            Some(lib) => {
-                let dir = self.cache_dir(lib);
-                if dir.exists() {
-                    fs::remove_dir_all(&dir)?;
-                }
-            }
-            None => {
-                if self.cache_root.exists() {
-                    fs::remove_dir_all(&self.cache_root)?;
-                }
-            }
-        }
-        Ok(())
     }
 }
 

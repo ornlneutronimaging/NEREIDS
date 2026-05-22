@@ -799,34 +799,6 @@ pub(crate) fn resolution_broaden_presorted(
     broadened
 }
 
-/// Apply resolution broadening to transmission data.
-///
-/// This is the same Gaussian convolution but applied to transmission
-/// spectra rather than cross-sections. The distinction matters because
-/// resolution broadening of transmission is physically different from
-/// broadening cross-sections (Beer-Lambert law is nonlinear).
-///
-/// # Arguments
-/// * `energies` — Energy grid in eV (sorted ascending).
-/// * `transmission` — Transmission values (0 to 1) at each energy point.
-/// * `params` — Resolution function parameters.
-///
-/// # Returns
-/// Resolution-broadened transmission on the same energy grid.
-///
-/// # Errors
-/// Returns [`ResolutionError`] if the energy grid is unsorted or array
-/// lengths do not match.
-pub fn resolution_broaden_transmission(
-    energies: &[f64],
-    transmission: &[f64],
-    params: &ResolutionParams,
-) -> Result<Vec<f64>, ResolutionError> {
-    // The convolution kernel is the same; only the interpretation differs.
-    // Validation is handled by resolution_broaden.
-    resolution_broaden(energies, transmission, params)
-}
-
 /// A tabulated resolution function from Monte Carlo instrument simulation.
 ///
 /// Contains reference kernels R(Δt; E_ref) at discrete energies, stored in
@@ -1017,13 +989,6 @@ impl ResolutionPlan {
     /// True when the plan covers no target energies.
     pub fn is_empty(&self) -> bool {
         self.target_energies.is_empty()
-    }
-
-    /// Total number of (target, kernel-point) entries retained across
-    /// all target energies.  Exposed for diagnostics — skipped entries
-    /// (w ≤ 0, tof_prime ≤ 0, `e_prime` out of range) are not counted.
-    pub fn n_entries(&self) -> usize {
-        self.weight.len()
     }
 
     /// Target energy grid the plan was built for.

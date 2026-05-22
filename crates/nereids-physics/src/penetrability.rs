@@ -239,45 +239,6 @@ fn bessel_fg_imaginary(l: u32, kappa: f64) -> ((f64, f64), (f64, f64)) {
     (f_curr, g_curr)
 }
 
-/// Derivative of penetrability dP_l/dρ.
-///
-/// Needed for converting between observed and reduced widths when
-/// penetrability varies with energy.
-///
-/// Reference: SAMMY `rml/mrml07.f` Pf function
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "reserved for future width-conversion utilities")
-)]
-pub(crate) fn penetrability_derivative(l: u32, rho: f64) -> f64 {
-    let rho2 = rho * rho;
-    match l {
-        0 => 1.0,
-        1 => {
-            let denom = 1.0 + rho2;
-            rho2 * (3.0 + rho2) / (denom * denom)
-        }
-        2 => {
-            let rho4 = rho2 * rho2;
-            let denom = 9.0 + 3.0 * rho2 + rho4;
-            rho4 * (45.0 + 9.0 * rho2 + rho4) / (denom * denom)
-        }
-        3 => {
-            let rho4 = rho2 * rho2;
-            let rho6 = rho4 * rho2;
-            let denom = 225.0 + 45.0 * rho2 + 6.0 * rho4 + rho6;
-            // dP₃/dρ = ρ⁶(1575 + 225ρ² + 18ρ⁴ + ρ⁶) / D²
-            // SAMMY rml/mrml07.f Pgh subroutine, line 398.
-            rho6 * (1575.0 + 225.0 * rho2 + 18.0 * rho4 + rho6) / (denom * denom)
-        }
-        _ => {
-            // Numerical derivative as fallback for l >= 4
-            let h = rho * 1e-6 + 1e-12;
-            (penetrability(l, rho + h) - penetrability(l, rho - h)) / (2.0 * h)
-        }
-    }
-}
-
 /// General penetrability via recursion for l > 4.
 ///
 /// Uses the recursion relation:
@@ -447,86 +408,6 @@ mod tests {
         // φ_1(0.01) ≈ 0.01 - arctan(0.01) ≈ 3.33e-7
         let expected = 0.01 - 0.01_f64.atan();
         assert!((phase_shift(1, 0.01) - expected).abs() < 1e-15);
-    }
-
-    #[test]
-    fn test_penetrability_derivative_l0() {
-        // dP_0/dρ = 1
-        assert!((penetrability_derivative(0, 1.0) - 1.0).abs() < 1e-15);
-    }
-
-    #[test]
-    fn test_penetrability_derivative_l1() {
-        // dP_1/dρ = ρ²(3 + ρ²)/(1 + ρ²)²
-        let rho = 1.0;
-        let expected = 1.0 * (3.0 + 1.0) / (2.0 * 2.0);
-        assert!((penetrability_derivative(1, rho) - expected).abs() < 1e-14);
-    }
-
-    #[test]
-    fn test_penetrability_derivative_l2() {
-        // dP₂/dρ = ρ⁴(45 + 9ρ² + ρ⁴) / (9 + 3ρ² + ρ⁴)²
-        let rho = 2.0;
-        let rho2 = rho * rho;
-        let rho4 = rho2 * rho2;
-        let denom = 9.0 + 3.0 * rho2 + rho4;
-        let expected = rho4 * (45.0 + 9.0 * rho2 + rho4) / (denom * denom);
-        assert!(
-            (penetrability_derivative(2, rho) - expected).abs() < 1e-14,
-            "L=2 derivative: got {}, expected {}",
-            penetrability_derivative(2, rho),
-            expected
-        );
-    }
-
-    #[test]
-    fn test_penetrability_derivative_l3() {
-        // dP₃/dρ = ρ⁶(1575 + 225ρ² + 18ρ⁴ + ρ⁶) / D²
-        // where D = 225 + 45ρ² + 6ρ⁴ + ρ⁶
-        // SAMMY rml/mrml07.f Pgh subroutine, line 398.
-        let rho = 1.5;
-        let rho2 = rho * rho;
-        let rho4 = rho2 * rho2;
-        let rho6 = rho4 * rho2;
-        let denom = 225.0 + 45.0 * rho2 + 6.0 * rho4 + rho6;
-        let expected = rho6 * (1575.0 + 225.0 * rho2 + 18.0 * rho4 + rho6) / (denom * denom);
-        assert!(
-            (penetrability_derivative(3, rho) - expected).abs() < 1e-14,
-            "L=3 derivative: got {}, expected {}",
-            penetrability_derivative(3, rho),
-            expected
-        );
-    }
-
-    #[test]
-    fn test_penetrability_derivative_l3_vs_numerical() {
-        // Cross-check L=3 analytic dP₃/dρ against numerical derivative.
-        // This catches coefficient errors independent of the formula.
-        let rho = 2.0;
-        let h = 1e-6;
-        let numerical = (penetrability(3, rho + h) - penetrability(3, rho - h)) / (2.0 * h);
-        let analytic = penetrability_derivative(3, rho);
-        assert!(
-            (analytic - numerical).abs() < 1e-6,
-            "L=3 analytic={}, numerical={}",
-            analytic,
-            numerical
-        );
-    }
-
-    #[test]
-    fn test_penetrability_derivative_l2_vs_numerical() {
-        // Cross-check L=2 analytic dP₂/dρ against numerical derivative.
-        let rho = 2.0;
-        let h = 1e-6;
-        let numerical = (penetrability(2, rho + h) - penetrability(2, rho - h)) / (2.0 * h);
-        let analytic = penetrability_derivative(2, rho);
-        assert!(
-            (analytic - numerical).abs() < 1e-6,
-            "L=2 analytic={}, numerical={}",
-            analytic,
-            numerical
-        );
     }
 
     #[test]

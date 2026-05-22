@@ -371,42 +371,6 @@ pub fn coulomb_penetrability(l: u32, eta: f64, rho: f64) -> f64 {
     }
 }
 
-/// Coulomb shift factor S_L = ρ · (F_L·F'_L + G_L·G'_L) / (F_L² + G_L²).
-///
-/// Returns 0 if the wave functions cannot be computed.
-///
-/// ## SAMMY Reference
-/// `coulomb/mrml08.f90` Coulfg output:
-/// `Scoul = Xx * (Fc(L)*Fcp(L)+Gc(L)*Gcp(L)) / (Fc(L)^2+Gc(L)^2)`
-#[expect(dead_code, reason = "reserved for future charged-particle channels")]
-pub(crate) fn coulomb_shift(l: u32, eta: f64, rho: f64) -> f64 {
-    match coulomb_wave_functions(l, eta, rho) {
-        Some((fl, gl, flp, glp)) => {
-            let asq = fl * fl + gl * gl;
-            rho * (fl * flp + gl * glp) / asq
-        }
-        None => 0.0,
-    }
-}
-
-/// Coulomb hard-sphere phase: returns (sin φ_L, cos φ_L) where φ_L = atan2(F_L, G_L).
-///
-/// Returns (0, 1) (φ = 0) if the wave functions cannot be computed.
-///
-/// ## SAMMY Reference
-/// `coulomb/mrml08.f90` Coulfg output:
-/// `Sinphi = Fc(L)/A, Cosphi = Gc(L)/A` where `A = sqrt(Fc^2 + Gc^2)`
-#[expect(dead_code, reason = "reserved for future charged-particle channels")]
-pub(crate) fn coulomb_phase(l: u32, eta: f64, rho: f64) -> (f64, f64) {
-    match coulomb_wave_functions(l, eta, rho) {
-        Some((fl, gl, _, _)) => {
-            let a = (fl * fl + gl * gl).sqrt();
-            (fl / a, gl / a) // (sin φ, cos φ)
-        }
-        None => (0.0, 1.0),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
