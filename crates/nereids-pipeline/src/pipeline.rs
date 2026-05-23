@@ -1056,67 +1056,7 @@ fn fit_transmission_lm(
 
     // Build model — use EnergyScaleTransmissionModel when energy-scale is enabled
     let model: Box<dyn FitModel> = if let Some((t0_idx, ls_idx)) = energy_scale_indices {
-        // Energy-scale model needs precomputed Doppler-broadened cross-sections.
-        // Precompute them if not already available.
-        let n_params = config.n_density_params();
-        let xs = if let Some(xs) = &config.precomputed_cross_sections {
-            Arc::clone(xs)
-        } else {
-            // Precompute Doppler-broadened σ(E) on the nominal energy grid.
-            // Resolution is NOT applied here — it's done inside the model's evaluate().
-            let instrument = config
-                .resolution
-                .clone()
-                .map(|r| Arc::new(InstrumentParams { resolution: r }));
-            let xs_raw = nereids_transmission::broadened_cross_sections(
-                config.energies(),
-                &config.resonance_data,
-                config.temperature_k,
-                instrument.as_deref(),
-                None,
-            )
-            .map_err(PipelineError::Transmission)?;
-            Arc::new(xs_raw)
-        };
-        // Collapse grouped isotopes if needed
-        let effective_xs =
-            if let (Some(di), Some(dr)) = (&config.density_indices, &config.density_ratios) {
-                if xs.len() == di.len() && di.len() == dr.len() {
-                    let n_e = xs[0].len();
-                    let mut eff = vec![vec![0.0f64; n_e]; n_params];
-                    for ((&idx, &ratio), member_xs) in di.iter().zip(dr.iter()).zip(xs.iter()) {
-                        for (j, &sigma) in member_xs.iter().enumerate() {
-                            eff[idx][j] += ratio * sigma;
-                        }
-                    }
-                    Arc::new(eff)
-                } else {
-                    xs
-                }
-            } else {
-                xs
-            };
-        // After group-collapsing, effective_xs has n_params entries.
-        // Use identity mapping because each XS entry maps to its own
-        // density parameter (same as PrecomputedTransmissionModel line 1443).
-        let density_indices: Vec<usize> = (0..n_params).collect();
-        let instrument = config
-            .resolution
-            .clone()
-            .map(|r| Arc::new(InstrumentParams { resolution: r }));
-        let mut es_model = EnergyScaleTransmissionModel::new(
-            effective_xs,
-            Arc::new(density_indices),
-            config.energies.clone(),
-            config.flight_path_m,
-            t0_idx,
-            ls_idx,
-            instrument,
-        );
-        if let Some(method) = config.tzero_jacobian_method {
-            es_model = es_model.with_jacobian_method(method);
-        }
-        Box::new(es_model)
+        build_energy_scale_transmission_model(config, t0_idx, ls_idx)?
     } else {
         build_transmission_model(config, n_density_params, _temperature_index)?
     };
@@ -1268,59 +1208,7 @@ fn fit_transmission_poisson(
 
     // Build inner model (energy-scale or precomputed)
     let model: Box<dyn FitModel> = if let Some((t0_idx, ls_idx)) = energy_scale_indices {
-        let n_params = config.n_density_params();
-        let xs = if let Some(xs) = &config.precomputed_cross_sections {
-            Arc::clone(xs)
-        } else {
-            let instrument = config
-                .resolution
-                .clone()
-                .map(|r| Arc::new(InstrumentParams { resolution: r }));
-            let xs_raw = nereids_transmission::broadened_cross_sections(
-                config.energies(),
-                &config.resonance_data,
-                config.temperature_k,
-                instrument.as_deref(),
-                None,
-            )
-            .map_err(PipelineError::Transmission)?;
-            Arc::new(xs_raw)
-        };
-        let effective_xs =
-            if let (Some(di), Some(dr)) = (&config.density_indices, &config.density_ratios) {
-                if xs.len() == di.len() && di.len() == dr.len() {
-                    let n_e = xs[0].len();
-                    let mut eff = vec![vec![0.0f64; n_e]; n_params];
-                    for ((&idx, &ratio), member_xs) in di.iter().zip(dr.iter()).zip(xs.iter()) {
-                        for (j, &sigma_val) in member_xs.iter().enumerate() {
-                            eff[idx][j] += ratio * sigma_val;
-                        }
-                    }
-                    Arc::new(eff)
-                } else {
-                    xs
-                }
-            } else {
-                xs
-            };
-        let density_indices: Vec<usize> = (0..n_params).collect();
-        let instrument = config
-            .resolution
-            .clone()
-            .map(|r| Arc::new(InstrumentParams { resolution: r }));
-        let mut es_model = EnergyScaleTransmissionModel::new(
-            effective_xs,
-            Arc::new(density_indices),
-            config.energies.clone(),
-            config.flight_path_m,
-            t0_idx,
-            ls_idx,
-            instrument,
-        );
-        if let Some(method) = config.tzero_jacobian_method {
-            es_model = es_model.with_jacobian_method(method);
-        }
-        Box::new(es_model)
+        build_energy_scale_transmission_model(config, t0_idx, ls_idx)?
     } else {
         build_transmission_model(config, n_density_params, temperature_index)?
     };
@@ -1477,59 +1365,7 @@ fn fit_counts_joint_poisson(
 
     // ── Build pure transmission model ──
     let t_model: Box<dyn FitModel> = if let Some((t0_idx, ls_idx)) = energy_scale_indices {
-        let n_params = config.n_density_params();
-        let xs = if let Some(xs) = &config.precomputed_cross_sections {
-            Arc::clone(xs)
-        } else {
-            let instrument = config
-                .resolution
-                .clone()
-                .map(|r| Arc::new(InstrumentParams { resolution: r }));
-            let xs_raw = nereids_transmission::broadened_cross_sections(
-                config.energies(),
-                &config.resonance_data,
-                config.temperature_k,
-                instrument.as_deref(),
-                None,
-            )
-            .map_err(PipelineError::Transmission)?;
-            Arc::new(xs_raw)
-        };
-        let effective_xs =
-            if let (Some(di), Some(dr)) = (&config.density_indices, &config.density_ratios) {
-                if xs.len() == di.len() && di.len() == dr.len() {
-                    let n_e = xs[0].len();
-                    let mut eff = vec![vec![0.0f64; n_e]; n_params];
-                    for ((&idx, &ratio), member_xs) in di.iter().zip(dr.iter()).zip(xs.iter()) {
-                        for (j, &sigma_val) in member_xs.iter().enumerate() {
-                            eff[idx][j] += ratio * sigma_val;
-                        }
-                    }
-                    Arc::new(eff)
-                } else {
-                    xs
-                }
-            } else {
-                xs
-            };
-        let density_indices: Vec<usize> = (0..n_params).collect();
-        let instrument = config
-            .resolution
-            .clone()
-            .map(|r| Arc::new(InstrumentParams { resolution: r }));
-        let mut es_model = EnergyScaleTransmissionModel::new(
-            effective_xs,
-            Arc::new(density_indices),
-            config.energies.clone(),
-            config.flight_path_m,
-            t0_idx,
-            ls_idx,
-            instrument,
-        );
-        if let Some(method) = config.tzero_jacobian_method {
-            es_model = es_model.with_jacobian_method(method);
-        }
-        Box::new(es_model)
+        build_energy_scale_transmission_model(config, t0_idx, ls_idx)?
     } else {
         build_transmission_model(config, n_density_params, temperature_index)?
     };
@@ -1952,6 +1788,92 @@ fn append_background_params(
         back_d,
         back_f,
     }
+}
+
+/// Build an [`EnergyScaleTransmissionModel`] for the energy-scale fit branch
+/// of `fit_transmission_lm` / `fit_transmission_poisson` /
+/// `fit_counts_joint_poisson`.
+///
+/// Absorbs the 3 byte-identical construction blocks that used to live inline
+/// in each fitter (see commit `1b4131f` for the pre-extraction pattern).
+/// Stays private — internal pipeline construction detail, not part of the
+/// crate's public surface.
+///
+/// The energy-scale model needs precomputed Doppler-broadened cross-sections.
+/// If `config.precomputed_cross_sections` is `Some`, reuses them; otherwise
+/// computes σ(E) on `config.energies()` (resolution is NOT applied here — it
+/// is applied inside the model's `evaluate()` via the wrapped
+/// [`InstrumentParams`]).  When grouped isotopes are active
+/// (`config.density_indices` and `config.density_ratios` both `Some` and
+/// length-consistent), collapses the per-member cross-sections into per-group
+/// effective cross-sections using the ratio weights; the resulting
+/// `effective_xs` then carries `n_params` entries (one per density
+/// parameter), so the model's `density_indices` is the identity mapping
+/// `(0..n_params)`.
+///
+/// `t0_idx` and `ls_idx` are the parameter indices for `t0` and `l_scale`,
+/// produced by [`append_energy_scale_params`] at each fitter's setup.
+fn build_energy_scale_transmission_model(
+    config: &UnifiedFitConfig,
+    t0_idx: usize,
+    ls_idx: usize,
+) -> Result<Box<dyn FitModel>, PipelineError> {
+    let n_params = config.n_density_params();
+    let xs = if let Some(xs) = &config.precomputed_cross_sections {
+        Arc::clone(xs)
+    } else {
+        let instrument = config
+            .resolution
+            .clone()
+            .map(|r| Arc::new(InstrumentParams { resolution: r }));
+        let xs_raw = nereids_transmission::broadened_cross_sections(
+            config.energies(),
+            &config.resonance_data,
+            config.temperature_k,
+            instrument.as_deref(),
+            None,
+        )
+        .map_err(PipelineError::Transmission)?;
+        Arc::new(xs_raw)
+    };
+    let effective_xs =
+        if let (Some(di), Some(dr)) = (&config.density_indices, &config.density_ratios) {
+            if xs.len() == di.len() && di.len() == dr.len() {
+                let n_e = xs[0].len();
+                let mut eff = vec![vec![0.0f64; n_e]; n_params];
+                for ((&idx, &ratio), member_xs) in di.iter().zip(dr.iter()).zip(xs.iter()) {
+                    for (j, &sigma) in member_xs.iter().enumerate() {
+                        eff[idx][j] += ratio * sigma;
+                    }
+                }
+                Arc::new(eff)
+            } else {
+                xs
+            }
+        } else {
+            xs
+        };
+    // After group-collapsing, effective_xs has n_params entries.  Use identity
+    // mapping because each XS entry maps to its own density parameter (same as
+    // PrecomputedTransmissionModel).
+    let density_indices: Vec<usize> = (0..n_params).collect();
+    let instrument = config
+        .resolution
+        .clone()
+        .map(|r| Arc::new(InstrumentParams { resolution: r }));
+    let mut es_model = EnergyScaleTransmissionModel::new(
+        effective_xs,
+        Arc::new(density_indices),
+        config.energies.clone(),
+        config.flight_path_m,
+        t0_idx,
+        ls_idx,
+        instrument,
+    );
+    if let Some(method) = config.tzero_jacobian_method {
+        es_model = es_model.with_jacobian_method(method);
+    }
+    Ok(Box::new(es_model))
 }
 
 /// Build the transmission forward model, selecting precomputed or full path.
