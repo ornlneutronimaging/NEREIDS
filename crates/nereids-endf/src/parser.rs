@@ -661,15 +661,26 @@ fn parse_rmatrix_limited_range(
             )));
         }
         // A PNT=1 pair drives the penetrability path, which forms the reduced
-        // mass μ = MA·MB/(MA+MB) (rmatrix_limited.rs).  Require finite, strictly
-        // positive MA and MB up front so the physics never computes a non-finite
-        // μ (e.g. MA+MB = 0) and hence a NaN cross section.
-        if pp.pnt == 1 && !(pp.ma.is_finite() && pp.mb.is_finite() && pp.ma > 0.0 && pp.mb > 0.0) {
-            return Err(EndfParseError::UnsupportedFormat(format!(
-                "LRF=7 particle pair {i}: PNT=1 requires finite positive masses \
-                 (MA={}, MB={})",
-                pp.ma, pp.mb
-            )));
+        // mass μ = MA·MB/(MA+MB) (rmatrix_limited.rs).  Validate the reduced mass
+        // itself — computed exactly as the physics does — is finite and strictly
+        // positive, so the physics never sees a non-finite μ.  Checking MA/MB > 0
+        // alone is insufficient: pathological huge (but finite) masses can still
+        // overflow MA·MB to ∞.  This also covers the MA+MB = 0 / sign cases.
+        if pp.pnt == 1 {
+            let reduced_mass = pp.ma * pp.mb / (pp.ma + pp.mb);
+            if !(pp.ma.is_finite()
+                && pp.mb.is_finite()
+                && pp.ma > 0.0
+                && pp.mb > 0.0
+                && reduced_mass.is_finite()
+                && reduced_mass > 0.0)
+            {
+                return Err(EndfParseError::UnsupportedFormat(format!(
+                    "LRF=7 particle pair {i}: PNT=1 requires finite positive masses \
+                     yielding a finite reduced mass (MA={}, MB={})",
+                    pp.ma, pp.mb
+                )));
+            }
         }
         // Coulomb + SHF=1: closed-channel Coulomb shift at imaginary argument is
         // unimplemented.  Reject at parse time rather than silently producing wrong
