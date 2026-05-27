@@ -346,32 +346,31 @@ fn spin_group_cross_sections(
                 // For elastic (MA=1, MB=AWR): k_c = wave_number(E_lab, AWR) [identical].
                 let redmas = pp.ma * pp.mb / (pp.ma + pp.mb);
                 let k_c = channel::wave_number_from_cm(e_c, redmas);
-                // SAMMY radius convention (rml/mrml07.f:126-137, mrml03.f:174-177):
-                //   Rho  = Zkte·Ex  (Zkte = Z·Rdtru = APT, true radius)      → P_c, S_c
-                //   Rhof = Zkfe·Ex  (Zkfe = Z·Rdeff = APE, effective radius) → phase φ_c
-                // The TRUE radius (APT) drives penetrability and shift; the EFFECTIVE
-                // radius (APE) drives the hard-sphere phase.  (Independently confirmed
-                // by PLEIADES models.py:385-386.)
-                let rho_pen = k_c * ch.true_radius; // APT → P_c, S_c
-                let rho_phase = k_c * ch.effective_radius; // APE → φ_c
+                // SAMMY radius convention (rml/mrml07.f:118-166, mrml03.f:174-177):
+                //   Rho  = Zkte·Ex  (Zkte = Z·Rdtru = APT, true radius)
+                //   Rhof = Zkfe·Ex  (Zkfe = Z·Rdeff = APE, effective radius)
+                // Penetrability P and shift S always use APT (Rho).  The EFFECTIVE
+                // radius (APE, Rhof) drives the phase φ ONLY for the non-Coulomb
+                // (hard-sphere) branch, via Sinsix (mrml07.f:131-137).  For a Coulomb
+                // channel SAMMY passes Rho (APT) to Pghcou for P, S AND φ; Rhof/APE is
+                // computed but never used (mrml07.f:144-161 — both Pghcou calls pass
+                // Rho).  Radius roles confirmed by an independent SAMMY-source
+                // derivation; cf. PLEIADES models.py:385-386.
+                let rho_pen = k_c * ch.true_radius; // APT → P_c, S_c, and Coulomb φ_c
+                let rho_phase = k_c * ch.effective_radius; // APE → non-Coulomb φ_c only
                 // ── Coulomb vs hard-sphere routing ───────────────────────────
                 // SAMMY rml/mrml07.f Pgh — `if (Zeta(I).NE.Zero)` branch.
                 // Both particles charged → Coulomb wave functions F_L / G_L.
                 // One neutral (za=0 or zb=0) → hard-sphere Blatt-Weisskopf.
                 if pp.za.abs() > 0.5 && pp.zb.abs() > 0.5 {
                     // Coulomb channel (e.g. n+α→p+X, (n,p), fission fragments).
-                    // Two CF1+CF2 solves: rho_pen for P_c/S_c, rho_phase for φ_c
-                    // (different radii — cannot reuse the same (F,G) pair).
-                    // Reference: SAMMY rml/mrml07.f Pgh — Pghcou, then Sinsix/Pf.
+                    // SAMMY computes P_c, S_c AND φ_c from a single radius Rho (APT)
+                    // via Pghcou; the effective radius (Rhof/APE) is NOT used for a
+                    // Coulomb channel (mrml07.f:144-161 — both Pghcou calls pass Rho).
                     let eta = coulomb::sommerfeld_eta(pp.za, pp.zb, pp.ma, pp.mb, e_c);
-                    // P_c/S_c depend only on rho_pen; φ_c depends only on rho_phase.
-                    // The two solves are independent: a rho_phase failure must not
-                    // close a channel that rho_pen confirmed is open.
-                    // Reference: SAMMY rml/mrml07.f Pgh — Pghcou (rho_pen),
-                    //   then Sinsix/Pf (rho_phase).
                     match coulomb::coulomb_wave_functions(ch.l, eta, rho_pen) {
                         Some((f, g, fp, gp)) => {
-                            // rho_pen succeeded: channel is genuinely open.
+                            // rho_pen (APT) succeeded: channel is genuinely open.
                             let fg_sq = f * f + g * g;
                             ws.p_c[c] = rho_pen / fg_sq;
                             // SHF=1: Coulomb shift ρ(F·F'+G·G')/(F²+G²).
@@ -383,11 +382,20 @@ fn spin_group_cross_sections(
                             } else {
                                 ch.boundary
                             };
-                            // φ_c from rho_phase; if rho_phase ≤ acch, default to 0
-                            // (hard-sphere limit φ → 0 as ρ → 0) without closing
-                            // the channel.
-                            ws.phi_c[c] = coulomb::coulomb_wave_functions(ch.l, eta, rho_phase)
-                                .map_or(0.0, |(fl_t, gl_t, _, _)| fl_t.atan2(gl_t));
+                            // φ_c = atan2(F_L, G_L) from the SAME (F,G) solve at rho_pen
+                            // (APT).  SAMMY's second Pghcou call reuses Rho, never Rhof,
+                            // so the Coulomb phase is independent of APE.
+                            //
+                            // No dedicated regression test exists for this radius
+                            // choice because it is unobservable in the angle-integrated
+                            // cross-sections NEREIDS computes: an exit channel's phase
+                            // enters only via Ω_c = e^{-iφ_c}, and σ_total uses the
+                            // entrance U_{c0,c0} (entrance φ only) while σ_reaction uses
+                            // |U_{c0,c'}|² (phase-independent magnitude).  Coulomb
+                            // channels are always exit channels (entrance is mt=2,
+                            // non-Coulomb).  The fix is for SAMMY-faithfulness and would
+                            // matter only if angular distributions were added.
+                            ws.phi_c[c] = f.atan2(g);
                         }
                         None => {
                             // rho_pen ≤ acch (≈ 1e-8, SAMMY Coulfg threshold):
