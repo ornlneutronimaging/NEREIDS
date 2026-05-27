@@ -603,6 +603,20 @@ fn parse_rmatrix_limited_range(
     let npp = checked_count(pp_cont.l1, "NPP")?;
     let pp_values = parse_list_values(ctx.lines, ctx.pos, npp * 12)?;
 
+    // Validate-and-narrow an ENDF integer-coded particle-pair flag.  ENDF integer
+    // fields are whole numbers, so a fractional or non-finite f64 indicates a
+    // malformed record and must not be silently truncated/saturated: PNT=1.7
+    // would narrow to 1 and PNT=NaN to 0, both bypassing the {0,1} range check
+    // below.  Applied to PNT and SHF — the two flags the physics branches on.
+    fn pp_int_flag(value: f64, field: &str, idx: usize) -> Result<i32, EndfParseError> {
+        if !value.is_finite() || value.fract() != 0.0 {
+            return Err(EndfParseError::UnsupportedFormat(format!(
+                "LRF=7 particle pair {idx}: {field}={value} is not a finite integer"
+            )));
+        }
+        Ok(value as i32)
+    }
+
     let mut particle_pairs = Vec::with_capacity(npp);
     for i in 0..npp {
         let b = i * 12;
@@ -614,8 +628,8 @@ fn parse_rmatrix_limited_range(
             ia: pp_values[b + 4],
             ib: pp_values[b + 5],
             q: pp_values[b + 6],
-            pnt: pp_values[b + 7] as i32,
-            shf: pp_values[b + 8] as i32,
+            pnt: pp_int_flag(pp_values[b + 7], "PNT", i)?,
+            shf: pp_int_flag(pp_values[b + 8], "SHF", i)?,
             mt: pp_values[b + 9] as u32,
             pa: pp_values[b + 10],
             pb: pp_values[b + 11],
@@ -644,6 +658,17 @@ fn parse_rmatrix_limited_range(
                 "LRF=7 particle pair {i}: massless pair (MA={}) with PNT={} is \
                  invalid; a photon/eliminated channel must have PNT=0",
                 pp.ma, pp.pnt
+            )));
+        }
+        // A PNT=1 pair drives the penetrability path, which forms the reduced
+        // mass μ = MA·MB/(MA+MB) (rmatrix_limited.rs).  Require finite, strictly
+        // positive MA and MB up front so the physics never computes a non-finite
+        // μ (e.g. MA+MB = 0) and hence a NaN cross section.
+        if pp.pnt == 1 && !(pp.ma.is_finite() && pp.mb.is_finite() && pp.ma > 0.0 && pp.mb > 0.0) {
+            return Err(EndfParseError::UnsupportedFormat(format!(
+                "LRF=7 particle pair {i}: PNT=1 requires finite positive masses \
+                 (MA={}, MB={})",
+                pp.ma, pp.mb
             )));
         }
         // Coulomb + SHF=1: closed-channel Coulomb shift at imaginary argument is
@@ -785,9 +810,9 @@ fn parse_rmatrix_limited_range(
                 )));
             }
             // Photon channels (MA < 0.5, PNT=0) are stored as regular channels.
-            // The physics code sets P_c=1, S_c=0, φ_c=0 for massless particles
-            // (rmatrix_limited.rs, ENDF-6 §2.2.1.6 Note 4) and classifies them as
-            // capture channels via pp.mt == 102.  Their reduced width amplitudes
+            // The physics code sets P_c=1, S_c=B_c, φ_c=0 for PNT=0 channels
+            // (rmatrix_limited.rs; SAMMY rml/mrml07.f:118-122 Ymat(2)-=1) and
+            // classifies them as capture channels via pp.mt == 102.  Their reduced width amplitudes
             // appear at the corresponding column position in the resonance rows,
             // exactly like any other channel.  Reference: ENDF-6 §2.2.1.6; SAMMY
             // rml/mrml01.f (Ippx test, mrml07.f P=1 convention for massless).
@@ -2743,6 +2768,45 @@ mod tests {
                 );
             }
             other => panic!("expected UnsupportedFormat for massless PNT=1, got {other:?}"),
+        }
+    }
+
+    /// LRF=7 particle pair with a fractional PNT (1.5) is rejected before the
+    /// f64→i32 narrowing can truncate it into a spurious 0/1 that would bypass
+    /// the {0,1} range check.
+    #[test]
+    fn test_parse_lrf7_rejects_fractional_pnt() {
+        const ENDF: &str =
+            include_str!("../../../tests/data/synthetic/lrf7_pnt_fractional_rejected.endf");
+
+        let err = parse_endf_file2(ENDF).unwrap_err();
+        match &err {
+            EndfParseError::UnsupportedFormat(msg) => {
+                assert!(
+                    msg.contains("PNT=1.5") && msg.contains("not a finite integer"),
+                    "expected fractional-PNT message, got: {msg}"
+                );
+            }
+            other => panic!("expected UnsupportedFormat for fractional PNT, got {other:?}"),
+        }
+    }
+
+    /// LRF=7 PNT=1 pair with a non-positive mass (MB=0) is rejected up front:
+    /// the penetrability path would otherwise form a non-finite reduced mass.
+    #[test]
+    fn test_parse_lrf7_rejects_pnt1_zero_mass() {
+        const ENDF: &str =
+            include_str!("../../../tests/data/synthetic/lrf7_pnt1_zero_mass_rejected.endf");
+
+        let err = parse_endf_file2(ENDF).unwrap_err();
+        match &err {
+            EndfParseError::UnsupportedFormat(msg) => {
+                assert!(
+                    msg.contains("finite positive masses"),
+                    "expected PNT=1 mass-validation message, got: {msg}"
+                );
+            }
+            other => panic!("expected UnsupportedFormat for PNT=1 zero mass, got {other:?}"),
         }
     }
 

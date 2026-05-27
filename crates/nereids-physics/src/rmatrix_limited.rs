@@ -47,11 +47,14 @@
 //!   σ_capture = σ_total - σ_elastic - σ_fission
 //! ```
 //!
-//! ## Photon Channels
+//! ## No-penetrability channels (PNT / Lpent = 0)
 //!
-//! For channels involving zero-rest-mass particles (photons, MA=0), the
-//! penetrability is set to 1.0 and phase shifts to 0.0, following the
-//! standard R-matrix convention (ENDF-6 Formats Manual §2.2.1.6 Note 4).
+//! The branch is keyed on the per-pair `PNT` (SAMMY `Lpent`) flag, NOT on
+//! particle mass. For a `PNT=0` channel — the photon/eliminated channel always,
+//! plus any pair flagged no-penetrability — the penetrability is set to 1.0, the
+//! shift to `S_c = B_c` (so `S_c − B_c = 0`), and the phase to 0.0. This encodes
+//! SAMMY's `Ymat(2,Ii) -= 1` (`rml/mrml07.f:118-122`): `L_c = (S_c−B_c)+iP_c = i`
+//! so `1/L_c = −i`.
 //!
 //! ## SAMMY Reference
 //! - `rml/mrml01.f` — LRF=7 reader (Scan_File_2, particle pair loop)
@@ -1259,16 +1262,39 @@ mod tests {
     // P_c/S_c, APE (effective_radius) for the phase φ_c (SAMMY rml/mrml07.f:128-134,
     // mrml03.f:174-177,244).  Same house pattern as slbw_elastic_oracle.rs.
 
-    /// Build a single-channel (s-wave elastic, neutron + W-184), single-resonance
-    /// KRM=3 spin group with independent effective (APE) and true (APT) radii.
-    fn rml_elastic_krm3(
+    /// Parameters for a single-channel elastic KRM=3 fixture.  Named fields (vs a
+    /// long positional arg list) keep call sites unambiguous; `..Default::default()`
+    /// lets each test override only the field it varies.
+    #[derive(Clone, Copy)]
+    struct ElasticKrm3 {
+        l: u32,
         ape: f64,
         apt: f64,
         e_res: f64,
         gamma_n: f64,
         gamma_gamma: f64,
         pnt: i32,
-    ) -> RmlData {
+        shf: i32,
+    }
+
+    impl Default for ElasticKrm3 {
+        fn default() -> Self {
+            Self {
+                l: 0,
+                ape: 8.3,
+                apt: 5.0,
+                e_res: 100.0,
+                gamma_n: 2.0,
+                gamma_gamma: 0.5,
+                pnt: 1,
+                shf: 0,
+            }
+        }
+    }
+
+    /// Build a single-channel (elastic, neutron + W-184), single-resonance KRM=3
+    /// spin group with independent effective (APE) and true (APT) radii.
+    fn rml_elastic_krm3(f: ElasticKrm3) -> RmlData {
         use nereids_endf::resonance::{RmlChannel, RmlResonance};
         let pp = ParticlePair {
             ma: 1.0,
@@ -1278,35 +1304,35 @@ mod tests {
             ia: 0.5,
             ib: 0.0,
             q: 0.0,
-            pnt,
-            shf: 0, // S_c = B_c (no analytic shift): isolates the P_c / φ_c radii
+            pnt: f.pnt,
+            shf: f.shf,
             mt: 2,
             pa: 1.0,
             pb: 1.0,
         };
         let channel = RmlChannel {
             particle_pair_idx: 0,
-            l: 0,
+            l: f.l,
             channel_spin: 0.5,
             boundary: 0.0,
-            effective_radius: ape,
-            true_radius: apt,
+            effective_radius: f.ape,
+            true_radius: f.apt,
         };
         let sg = SpinGroup {
             j: 0.5,
             parity: 1.0,
             channels: vec![channel],
             resonances: vec![RmlResonance {
-                energy: e_res,
-                widths: vec![gamma_n],
-                gamma_gamma,
+                energy: f.e_res,
+                widths: vec![f.gamma_n],
+                gamma_gamma: f.gamma_gamma,
             }],
             has_background_correction: false,
         };
         RmlData {
             target_spin: 0.0,
             awr: 183.0,
-            scattering_radius: apt,
+            scattering_radius: f.apt,
             krm: 3,
             particle_pairs: vec![pp],
             spin_groups: vec![sg],
@@ -1336,8 +1362,9 @@ mod tests {
     }
 
     /// Single-channel single-resonance elastic U-matrix cross-section oracle for a
-    /// given reduced-width amplitude `gamma`.  Mirrors `spin_group_cross_sections`
-    /// with the CORRECT SAMMY radius convention (APT→P/S, APE→φ).  Returns
+    /// given reduced-width amplitude `gamma`.  Mirrors `spin_group_cross_sections`:
+    /// PNT=1 uses the SAMMY radius convention (APT→P/S, APE→φ); PNT≠1 uses the
+    /// no-penetrability encoding (P=1, S=B_c, φ=0).  Returns
     /// (σ_total, σ_elastic, σ_capture) in barns.
     fn oracle_xs(rml: &RmlData, energy_ev: f64, gamma: f64) -> (f64, f64, f64) {
         let sg = &rml.spin_groups[0];
@@ -1346,16 +1373,23 @@ mod tests {
         let res = &sg.resonances[0];
         let g_j = channel::statistical_weight(sg.j, rml.target_spin);
         let pok2 = channel::pi_over_k_squared_barns(energy_ev, rml.awr);
-        let redmas = pp.ma * pp.mb / (pp.ma + pp.mb);
-        let e_c = channel::lab_to_cm_energy(energy_ev, rml.awr) + pp.q;
-        let k_c = channel::wave_number_from_cm(e_c, redmas);
-        let p = penetrability::penetrability(ch.l, k_c * ch.true_radius); // APT
-        let s = if pp.shf == 1 {
-            penetrability::shift_factor(ch.l, k_c * ch.true_radius) // APT
+        let (p, s, phi) = if pp.pnt != 1 {
+            // No-penetrability branch (matches the evaluator's eval-path): P=1,
+            // S=B_c, φ=0 → L_c = i, the Ymat(2,Ii) -= 1 encoding.
+            (1.0, ch.boundary, 0.0)
         } else {
-            ch.boundary
+            let redmas = pp.ma * pp.mb / (pp.ma + pp.mb);
+            let e_c = channel::lab_to_cm_energy(energy_ev, rml.awr) + pp.q;
+            let k_c = channel::wave_number_from_cm(e_c, redmas);
+            let p = penetrability::penetrability(ch.l, k_c * ch.true_radius); // APT
+            let s = if pp.shf == 1 {
+                penetrability::shift_factor(ch.l, k_c * ch.true_radius) // APT
+            } else {
+                ch.boundary
+            };
+            let phi = penetrability::phase_shift(ch.l, k_c * ch.effective_radius); // APE
+            (p, s, phi)
         };
-        let phi = penetrability::phase_shift(ch.l, k_c * ch.effective_radius); // APE
         let e_tilde = Complex64::new(res.energy, -res.gamma_gamma / 2.0);
         let r = Complex64::new(gamma * gamma, 0.0) / (e_tilde - energy_ev);
         let l_c = Complex64::new(s - ch.boundary, p);
@@ -1385,32 +1419,49 @@ mod tests {
     /// so the match is meaningful and not a degenerate APE==APT pass.
     #[test]
     fn rml_lrf7_krm3_radius_roles_match_sammy_oracle() {
-        let rml = rml_elastic_krm3(8.3, 5.0, 100.0, 2.0, 0.5, 1);
-        let swapped = rml_elastic_krm3(5.0, 8.3, 100.0, 2.0, 0.5, 1); // APE/APT exchanged
-        for &e in &[50.0, 90.0, 110.0, 200.0] {
-            let (tot, elas, cap, _fis) = cross_sections_for_rml_range(&rml, e);
-            let gamma = oracle_reduced_width(&rml);
-            let (otot, oelas, ocap) = oracle_xs(&rml, e, gamma);
-            assert!(
-                rml_rel_err(tot, otot) < RML_ORACLE_REL_TOL,
-                "σ_total @ {e} eV: eval={tot}, oracle={otot}"
-            );
-            assert!(
-                rml_rel_err(elas, oelas) < RML_ORACLE_REL_TOL,
-                "σ_elastic @ {e} eV: eval={elas}, oracle={oelas}"
-            );
-            assert!(
-                rml_rel_err(cap, ocap) < RML_ORACLE_REL_TOL,
-                "σ_capture @ {e} eV: eval={cap}, oracle={ocap}"
-            );
-            // Non-vacuity: the swapped-radius convention must give a materially
-            // different σ_total, so matching the correct one above is meaningful.
-            let g_sw = oracle_reduced_width(&swapped);
-            let (stot, _, _) = oracle_xs(&swapped, e, g_sw);
-            assert!(
-                rml_rel_err(otot, stot) > 0.01,
-                "APE/APT swap is unobservable at {e} eV (otot={otot}, swapped={stot}); test would be vacuous"
-            );
+        // Two channel configs exercise both radius-bearing paths:
+        //   l=0, shf=0 → P_c and φ_c (S_c = B_c is inert)
+        //   l=1, shf=1 → P_c, S_c (analytic shift factor) and φ_c
+        for &(l, shf, label) in &[(0u32, 0i32, "l=0,shf=0"), (1u32, 1i32, "l=1,shf=1")] {
+            let rml = rml_elastic_krm3(ElasticKrm3 {
+                l,
+                shf,
+                ..Default::default()
+            });
+            // APE/APT exchanged
+            let swapped = rml_elastic_krm3(ElasticKrm3 {
+                l,
+                shf,
+                ape: 5.0,
+                apt: 8.3,
+                ..Default::default()
+            });
+            for &e in &[50.0, 90.0, 110.0, 200.0] {
+                let (tot, elas, cap, _fis) = cross_sections_for_rml_range(&rml, e);
+                let gamma = oracle_reduced_width(&rml);
+                let (otot, oelas, ocap) = oracle_xs(&rml, e, gamma);
+                assert!(
+                    rml_rel_err(tot, otot) < RML_ORACLE_REL_TOL,
+                    "[{label}] σ_total @ {e} eV: eval={tot}, oracle={otot}"
+                );
+                assert!(
+                    rml_rel_err(elas, oelas) < RML_ORACLE_REL_TOL,
+                    "[{label}] σ_elastic @ {e} eV: eval={elas}, oracle={oelas}"
+                );
+                assert!(
+                    rml_rel_err(cap, ocap) < RML_ORACLE_REL_TOL,
+                    "[{label}] σ_capture @ {e} eV: eval={cap}, oracle={ocap}"
+                );
+                // Non-vacuity: the swapped-radius convention must give a materially
+                // different σ_total, so matching the correct one above is meaningful.
+                // For l=1,shf=1 the swap moves the shift-factor radius too.
+                let g_sw = oracle_reduced_width(&swapped);
+                let (stot, _, _) = oracle_xs(&swapped, e, g_sw);
+                assert!(
+                    rml_rel_err(otot, stot) > 0.01,
+                    "[{label}] APE/APT swap unobservable at {e} eV (otot={otot}, swapped={stot}); test would be vacuous"
+                );
+            }
         }
     }
 
@@ -1420,7 +1471,10 @@ mod tests {
     /// match the buggy √|Γ| reduced width.
     #[test]
     fn rml_lrf7_krm3_bound_state_uses_penetrability_not_sqrt_gamma() {
-        let rml = rml_elastic_krm3(8.3, 5.0, -50.0, 2.0, 0.5, 1);
+        let rml = rml_elastic_krm3(ElasticKrm3 {
+            e_res: -50.0,
+            ..Default::default()
+        });
         let gamma = oracle_reduced_width(&rml);
         // Old (buggy) behaviour: γ = √|Γ| with no ½ factor and no penetrability.
         let gamma_buggy = {
@@ -1457,15 +1511,38 @@ mod tests {
     /// PNT on a massive channel produced identical cross-sections.
     #[test]
     fn rml_lrf7_pnt_flag_is_respected() {
-        let with_pen = rml_elastic_krm3(8.3, 5.0, 100.0, 2.0, 0.5, 1);
-        let no_pen = rml_elastic_krm3(8.3, 5.0, 100.0, 2.0, 0.5, 0);
+        let with_pen = rml_elastic_krm3(ElasticKrm3::default());
+        let no_pen = rml_elastic_krm3(ElasticKrm3 {
+            pnt: 0,
+            ..Default::default()
+        });
         for &e in &[50.0, 110.0, 200.0] {
             let (tot1, _, _, _) = cross_sections_for_rml_range(&with_pen, e);
-            let (tot0, _, _, _) = cross_sections_for_rml_range(&no_pen, e);
+            let (tot0, elas0, cap0, _) = cross_sections_for_rml_range(&no_pen, e);
             assert!(
                 tot0.is_finite() && tot1.is_finite(),
                 "PNT toggle produced non-finite σ at {e} eV: PNT=1 {tot1}, PNT=0 {tot0}"
             );
+            // Pin the PNT=0 path against the oracle: this covers BOTH the
+            // no-penetrability channel setup (P=1, S=B, φ=0) AND the √(½|Γ|)
+            // width conversion, so the test fails if either regresses — not just
+            // if the totals happen to differ.
+            let g0 = oracle_reduced_width(&no_pen);
+            let (otot0, oelas0, ocap0) = oracle_xs(&no_pen, e, g0);
+            assert!(
+                rml_rel_err(tot0, otot0) < RML_ORACLE_REL_TOL,
+                "PNT=0 σ_total @ {e} eV: eval={tot0}, oracle={otot0}"
+            );
+            assert!(
+                rml_rel_err(elas0, oelas0) < RML_ORACLE_REL_TOL,
+                "PNT=0 σ_elastic @ {e} eV: eval={elas0}, oracle={oelas0}"
+            );
+            assert!(
+                rml_rel_err(cap0, ocap0) < RML_ORACLE_REL_TOL,
+                "PNT=0 σ_capture @ {e} eV: eval={cap0}, oracle={ocap0}"
+            );
+            // Non-vacuity: the PNT toggle must change σ (pre-fix, branching on
+            // particle mass, gave identical results regardless of PNT).
             assert!(
                 rml_rel_err(tot1, tot0) > 0.01,
                 "PNT flag ignored at {e} eV: PNT=1 σ_total={tot1}, PNT=0 σ_total={tot0} (should differ)"
