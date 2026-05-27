@@ -622,11 +622,34 @@ fn parse_rmatrix_limited_range(
         });
     }
 
-    // Coulomb + SHF=1: closed-channel Coulomb shift at imaginary argument is
-    // unimplemented.  Reject at parse time rather than silently producing wrong
-    // dispersive terms near threshold.
-    // Reference: SAMMY rml/mrml07.f — Pghcou is only called for open channels.
     for (i, pp) in particle_pairs.iter().enumerate() {
+        // PNT (Lpent) must be 0 or 1.  SAMMY's Check_Quantum (rml/mrml03.f:22)
+        // rejects Lpent ∉ {0,1} via Wrongi; PNT=2 ("ASSIGN") is defined in the
+        // ENDF-6 spec but neither SAMMY nor NEREIDS implements it.  Validate up
+        // front so the physics code never sees an unknown penetrability flag.
+        if pp.pnt != 0 && pp.pnt != 1 {
+            return Err(EndfParseError::UnsupportedFormat(format!(
+                "LRF=7 particle pair {i}: PNT={} is not supported (only PNT=0 \
+                 and PNT=1; SAMMY rejects Lpent outside {{0,1}})",
+                pp.pnt
+            )));
+        }
+        // A massless pair (photon/eliminated channel, MA=0) must carry PNT=0:
+        // SAMMY always assigns Lpent=0 to the photon channel, and the physics
+        // evaluator's penetrability branch (which divides by a reduced mass)
+        // is only entered for PNT=1.  Reject the inconsistent combination so a
+        // massless PNT=1 pair can never reach a divide-by-zero reduced mass.
+        if pp.ma < 0.5 && pp.pnt != 0 {
+            return Err(EndfParseError::UnsupportedFormat(format!(
+                "LRF=7 particle pair {i}: massless pair (MA={}) with PNT={} is \
+                 invalid; a photon/eliminated channel must have PNT=0",
+                pp.ma, pp.pnt
+            )));
+        }
+        // Coulomb + SHF=1: closed-channel Coulomb shift at imaginary argument is
+        // unimplemented.  Reject at parse time rather than silently producing wrong
+        // dispersive terms near threshold.
+        // Reference: SAMMY rml/mrml07.f — Pghcou is only called for open channels.
         if pp.za.abs() > 0.5 && pp.zb.abs() > 0.5 && pp.shf == 1 {
             return Err(EndfParseError::UnsupportedFormat(format!(
                 "LRF=7 particle pair {i}: Coulomb channel (za={}, zb={}) with \
@@ -638,7 +661,7 @@ fn parse_rmatrix_limited_range(
     }
 
     // All particle-pair types are now fully supported (with the SHF=1 restriction above):
-    // - PNT 0/1: distinguished by pp.ma in rmatrix_limited.rs.
+    // - PNT 0/1: branched on pp.pnt in rmatrix_limited.rs (SAMMY Lpent); PNT∉{0,1} rejected above.
     // - SHF 0/1: respected by the shf field in rmatrix_limited.rs.
     // - Coulomb channels (pp.za > 0 && pp.zb > 0): routed through
     //   nereids_physics::coulomb (Steed's CF1+CF2, SAMMY coulomb/mrml08.f90).
@@ -2679,6 +2702,47 @@ mod tests {
                 );
             }
             other => panic!("expected UnsupportedFormat for KPS != 0, got {other:?}"),
+        }
+    }
+
+    /// LRF=7 particle pair with PNT=2 ("ASSIGN") is rejected at parse time.
+    /// SAMMY's Check_Quantum (rml/mrml03.f:22) rejects Lpent outside {0,1};
+    /// neither SAMMY nor NEREIDS implements PNT=2.  Validating up front keeps
+    /// the unknown penetrability flag out of the physics evaluator.
+    #[test]
+    fn test_parse_lrf7_rejects_pnt_two() {
+        const ENDF: &str = include_str!("../../../tests/data/synthetic/lrf7_pnt2_rejected.endf");
+
+        let err = parse_endf_file2(ENDF).unwrap_err();
+        match &err {
+            EndfParseError::UnsupportedFormat(msg) => {
+                assert!(
+                    msg.contains("PNT=2"),
+                    "expected PNT=2 in error message, got: {msg}"
+                );
+            }
+            other => panic!("expected UnsupportedFormat for PNT=2, got {other:?}"),
+        }
+    }
+
+    /// LRF=7 massless particle pair (MA=0, photon/eliminated channel) declared
+    /// with PNT=1 is rejected: SAMMY always assigns Lpent=0 to the photon
+    /// channel, and the physics evaluator's PNT=1 penetrability branch would
+    /// otherwise divide by a zero reduced mass.
+    #[test]
+    fn test_parse_lrf7_rejects_massless_pnt_one() {
+        const ENDF: &str =
+            include_str!("../../../tests/data/synthetic/lrf7_massless_pnt1_rejected.endf");
+
+        let err = parse_endf_file2(ENDF).unwrap_err();
+        match &err {
+            EndfParseError::UnsupportedFormat(msg) => {
+                assert!(
+                    msg.contains("must have PNT=0"),
+                    "expected massless-PNT consistency message, got: {msg}"
+                );
+            }
+            other => panic!("expected UnsupportedFormat for massless PNT=1, got {other:?}"),
         }
     }
 
