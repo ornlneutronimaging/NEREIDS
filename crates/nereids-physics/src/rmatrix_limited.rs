@@ -47,11 +47,14 @@
 //!   σ_capture = σ_total - σ_elastic - σ_fission
 //! ```
 //!
-//! ## Photon Channels
+//! ## No-penetrability channels (PNT / Lpent = 0)
 //!
-//! For channels involving zero-rest-mass particles (photons, MA=0), the
-//! penetrability is set to 1.0 and phase shifts to 0.0, following the
-//! standard R-matrix convention (ENDF-6 Formats Manual §2.2.1.6 Note 4).
+//! The branch is keyed on the per-pair `PNT` (SAMMY `Lpent`) flag, NOT on
+//! particle mass. For a `PNT=0` channel — the photon/eliminated channel always,
+//! plus any pair flagged no-penetrability — the penetrability is set to 1.0, the
+//! shift to `S_c = B_c` (so `S_c − B_c = 0`), and the phase to 0.0. This encodes
+//! SAMMY's `Ymat(2,Ii) -= 1` (`rml/mrml07.f:118-122`): `L_c = (S_c−B_c)+iP_c = i`
+//! so `1/L_c = −i`.
 //!
 //! ## SAMMY Reference
 //! - `rml/mrml01.f` — LRF=7 reader (Scan_File_2, particle pair loop)
@@ -294,12 +297,18 @@ fn spin_group_cross_sections(
         ws.is_inelastic[c] =
             pp.ma >= 0.5 && !ws.is_entrance[c] && !ws.is_fission[c] && !ws.is_capture[c];
 
-        if pp.ma < 0.5 {
-            // Photon channel (MA = 0): P=1, S=0, φ=0.
-            // Convention per ENDF-6 Formats Manual §2.2.1.6 Note 4.
-            // SAMMY: rml/mrml07.f sets penetrability = 1 for massless particles.
+        // SAMMY rml/mrml07.f:118-122 (and mrml03.f:235) branch on the per-pair
+        // penetrability flag Lpent (= pp.pnt), NOT on particle mass.  PNT≠1 is
+        // the "no penetrability" branch: it covers photon/eliminated channels
+        // (MA=0) and any pair the evaluation flags PNT=0.  SAMMY implements it as
+        // `Ymat(2,Ii) -= 1`; NEREIDS encodes the same thing as P_c=1, S_c=B_c
+        // (so S_c−B_c=0), φ_c=0 → L_c = (S_c−B_c)+iP_c = i → 1/L_c = −i, i.e. −1
+        // on the imaginary level-matrix diagonal.  The parser guarantees a
+        // massless pair carries PNT=0, so the massive-kinematics branch below
+        // (which needs a nonzero reduced mass) is never reached by a photon.
+        if pp.pnt != 1 {
             ws.p_c[c] = 1.0;
-            ws.s_c[c] = 0.0;
+            ws.s_c[c] = ch.boundary;
             ws.phi_c[c] = 0.0;
         } else {
             // Massive particle channel: channel-specific kinematics (P1).
@@ -329,7 +338,9 @@ fn spin_group_cross_sections(
                 ws.s_c[c] = if pp.shf == 1 && !is_coulomb {
                     let redmas = pp.ma * pp.mb / (pp.ma + pp.mb);
                     let kappa = channel::wave_number_from_cm(e_c.abs(), redmas);
-                    penetrability::shift_factor_closed(ch.l, kappa * ch.effective_radius)
+                    // Shift factor uses APT (true radius), per SAMMY rml/mrml07.f
+                    // Rho = Zkte·Ex with Zkte = Z·Rdtru (mrml03.f:174-177).
+                    penetrability::shift_factor_closed(ch.l, kappa * ch.true_radius)
                 } else {
                     ch.boundary
                 };
@@ -338,47 +349,59 @@ fn spin_group_cross_sections(
                 // For elastic (MA=1, MB=AWR): k_c = wave_number(E_lab, AWR) [identical].
                 let redmas = pp.ma * pp.mb / (pp.ma + pp.mb);
                 let k_c = channel::wave_number_from_cm(e_c, redmas);
-                // APE (effective radius) for P_c, S_c; APT (true radius) for φ_c.
-                // Reference: SAMMY rml/mrml07.f (Pgh, Sinsix, Pf subroutines)
-                let rho_eff = k_c * ch.effective_radius;
-                let rho_true = k_c * ch.true_radius;
+                // SAMMY radius convention (rml/mrml07.f:118-166, mrml03.f:174-177):
+                //   Rho  = Zkte·Ex  (Zkte = Z·Rdtru = APT, true radius)
+                //   Rhof = Zkfe·Ex  (Zkfe = Z·Rdeff = APE, effective radius)
+                // Penetrability P and shift S always use APT (Rho).  The EFFECTIVE
+                // radius (APE, Rhof) drives the phase φ ONLY for the non-Coulomb
+                // (hard-sphere) branch, via Sinsix (mrml07.f:131-137).  For a Coulomb
+                // channel SAMMY passes Rho (APT) to Pghcou for P, S AND φ; Rhof/APE is
+                // computed but never used (mrml07.f:144-161 — both Pghcou calls pass
+                // Rho).  Radius roles confirmed by an independent SAMMY-source
+                // derivation; cf. PLEIADES models.py:385-386.
+                let rho_pen = k_c * ch.true_radius; // APT → P_c, S_c, and Coulomb φ_c
+                let rho_phase = k_c * ch.effective_radius; // APE → non-Coulomb φ_c only
                 // ── Coulomb vs hard-sphere routing ───────────────────────────
                 // SAMMY rml/mrml07.f Pgh — `if (Zeta(I).NE.Zero)` branch.
                 // Both particles charged → Coulomb wave functions F_L / G_L.
                 // One neutral (za=0 or zb=0) → hard-sphere Blatt-Weisskopf.
                 if pp.za.abs() > 0.5 && pp.zb.abs() > 0.5 {
                     // Coulomb channel (e.g. n+α→p+X, (n,p), fission fragments).
-                    // Two CF1+CF2 solves: rho_eff for P_c/S_c, rho_true for φ_c
-                    // (different radii — cannot reuse the same (F,G) pair).
-                    // Reference: SAMMY rml/mrml07.f Pgh — Pghcou, then Sinsix/Pf.
+                    // SAMMY computes P_c, S_c AND φ_c from a single radius Rho (APT)
+                    // via Pghcou; the effective radius (Rhof/APE) is NOT used for a
+                    // Coulomb channel (mrml07.f:144-161 — both Pghcou calls pass Rho).
                     let eta = coulomb::sommerfeld_eta(pp.za, pp.zb, pp.ma, pp.mb, e_c);
-                    // P_c/S_c depend only on rho_eff; φ_c depends only on rho_true.
-                    // The two solves are independent: a rho_true failure must not
-                    // close a channel that rho_eff confirmed is open.
-                    // Reference: SAMMY rml/mrml07.f Pgh — Pghcou (rho_eff),
-                    //   then Sinsix/Pf (rho_true).
-                    match coulomb::coulomb_wave_functions(ch.l, eta, rho_eff) {
+                    match coulomb::coulomb_wave_functions(ch.l, eta, rho_pen) {
                         Some((f, g, fp, gp)) => {
-                            // rho_eff succeeded: channel is genuinely open.
+                            // rho_pen (APT) succeeded: channel is genuinely open.
                             let fg_sq = f * f + g * g;
-                            ws.p_c[c] = rho_eff / fg_sq;
+                            ws.p_c[c] = rho_pen / fg_sq;
                             // SHF=1: Coulomb shift ρ(F·F'+G·G')/(F²+G²).
                             // SHF=0: S_c = B_c so (S_c − B_c) = 0 in level matrix.
                             // Note: parser rejects Coulomb + SHF=1, so this arm is
                             // only reachable if that validation is later relaxed.
                             ws.s_c[c] = if pp.shf == 1 {
-                                rho_eff * (f * fp + g * gp) / fg_sq
+                                rho_pen * (f * fp + g * gp) / fg_sq
                             } else {
                                 ch.boundary
                             };
-                            // φ_c from rho_true; if rho_true ≤ acch, default to 0
-                            // (hard-sphere limit φ → 0 as ρ → 0) without closing
-                            // the channel.
-                            ws.phi_c[c] = coulomb::coulomb_wave_functions(ch.l, eta, rho_true)
-                                .map_or(0.0, |(fl_t, gl_t, _, _)| fl_t.atan2(gl_t));
+                            // φ_c = atan2(F_L, G_L) from the SAME (F,G) solve at rho_pen
+                            // (APT).  SAMMY's second Pghcou call reuses Rho, never Rhof,
+                            // so the Coulomb phase is independent of APE.
+                            //
+                            // No dedicated regression test exists for this radius
+                            // choice because it is unobservable in the angle-integrated
+                            // cross-sections NEREIDS computes: an exit channel's phase
+                            // enters only via Ω_c = e^{-iφ_c}, and σ_total uses the
+                            // entrance U_{c0,c0} (entrance φ only) while σ_reaction uses
+                            // |U_{c0,c'}|² (phase-independent magnitude).  Coulomb
+                            // channels are always exit channels (entrance is mt=2,
+                            // non-Coulomb).  The fix is for SAMMY-faithfulness and would
+                            // matter only if angular distributions were added.
+                            ws.phi_c[c] = f.atan2(g);
                         }
                         None => {
-                            // rho_eff ≤ acch (≈ 1e-8, SAMMY Coulfg threshold):
+                            // rho_pen ≤ acch (≈ 1e-8, SAMMY Coulfg threshold):
                             // penetrability → 0 at threshold; treat as closed.
                             // Reference: SAMMY coulomb/mrml08.f90 Coulfg — acch.
                             ws.p_c[c] = 0.0;
@@ -389,17 +412,17 @@ fn spin_group_cross_sections(
                     }
                 } else {
                     // Hard-sphere (Blatt-Weisskopf) channel.
-                    ws.p_c[c] = penetrability::penetrability(ch.l, rho_eff);
+                    ws.p_c[c] = penetrability::penetrability(ch.l, rho_pen);
                     // SHF=0: shift factor not calculated; S_c = B_c so (S_c - B_c) = 0
                     // in the level matrix diagonal.
                     // SHF=1: calculate S_c analytically (Blatt-Weisskopf).
                     // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml07.f Pgh (Ishift check)
                     ws.s_c[c] = if pp.shf == 1 {
-                        penetrability::shift_factor(ch.l, rho_eff)
+                        penetrability::shift_factor(ch.l, rho_pen)
                     } else {
                         ch.boundary
                     };
-                    ws.phi_c[c] = penetrability::phase_shift(ch.l, rho_true);
+                    ws.phi_c[c] = penetrability::phase_shift(ch.l, rho_phase);
                 }
             }
         }
@@ -419,88 +442,59 @@ fn spin_group_cross_sections(
     // ws.r_cplx is already zeroed by resize_and_clear.
     for res in &sg.resonances {
         let e_tilde = if krm == 3 {
-            // KRM=3: convert formal partial widths to reduced amplitudes.
-            // γ_nc = √(|Γ_nc| / (2·P_c(E_n))).  Sign preserved from Γ_nc.
-            // For closed channels or P=0 (e.g. bound states at E_n<0): use
-            // γ_nc = √(|Γ_nc|) directly (SAMMY convention for bound states).
-            // Complex energy Ẽ_n = E_n - i·Γ_γ/2.
-            // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f
+            // KRM=3 (Reich-Moore): convert formal partial widths Γ_nc to reduced
+            // amplitudes γ_nc and form the complex pole energy Ẽ_n = E_n − i·Γ_γ/2
+            // (the −iΓ_γ/2 makes capture implicit).  Reference: ENDF-6 §2.2.1.6;
+            // SAMMY rml/mrml01.f, rml/mrml03.f (Betset).
             let e_tilde = Complex64::new(res.energy, -res.gamma_gamma / 2.0);
-            // P_c must be evaluated at the resonance energy E_n, not at the
-            // incident energy E.  γ_nc = √(Γ_nc / (2·P_c(E_n))) is a property
-            // of the resonance and must be energy-independent.  Using P_c(E)
-            // would make γ_nc depend on the evaluation point, distorting the
-            // resonance shape away from the peak.
-            // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f (reads Γ_nc then
-            // converts via P at resonance energy in Pgh subroutine).
+            // γ_nc is a property of the resonance, evaluated at the resonance
+            // energy E_n (not the incident energy E), so it is energy-independent.
+            // SAMMY Betset (rml/mrml03.f:235-274) branches on the per-pair
+            // penetrability flag Lpent (= pp.pnt), NOT on particle mass:
+            //   PNT=0: γ_nc = √(½|Γ|)                                 (mrml03.f:236)
+            //   PNT=1: γ_nc = √(½|Γ| / P),  P at ρ = κ·APT, κ from |Eres−Echan|
+            //                                                         (mrml03.f:241-273)
+            // The |Eres−Echan| absolute value means bound/subthreshold resonances
+            // (e_cm_n ≤ 0) still receive a real, positive penetrability — they are
+            // NOT treated as closed channels.  The sign of Γ is preserved either way.
             for c in 0..nch {
                 let gamma_formal = res.widths[c];
                 let ch = &sg.channels[c];
                 let pp_c = &particle_pairs[ch.particle_pair_idx];
-                // P_c at the resonance energy E_n.  Returns None when the channel
-                // is closed at E_n (bound-state resonance), Some(P) otherwise.
-                //
-                // The fallback must be gated on whether e_cm_n ≤ 0, NOT on
-                // whether P is numerically small.  For genuinely open channels
-                // near threshold (high-l, small ρ), P is positive but tiny;
-                // a magnitude guard would replace √(|Γ|/(2P)) ≫ 1 with √|Γ| ≪ 1,
-                // underestimating the reduced amplitude by orders of magnitude.
-                // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f Pgh.
-                let p_at_en: Option<f64> = if pp_c.ma < 0.5 {
-                    Some(1.0) // photon: P = 1 by convention
+                let magnitude = if pp_c.pnt != 1 {
+                    // No-penetrability branch (Lpent=0): photon/eliminated channels
+                    // and any pair flagged PNT=0.  γ = √(½|Γ|).  mrml03.f:236.
+                    (0.5 * gamma_formal.abs()).sqrt()
                 } else {
-                    // P1: res.energy is lab-frame; convert to CM before adding Q.
-                    // Reference: SAMMY rml/mrml03.f Fxradi; ENDF-6 §2.2.1.6.
+                    // Penetrability branch (Lpent=1).  ρ = κ·APT evaluated at the
+                    // absolute CM-energy separation |Eres−Echan| = |e_cm_n|, so a
+                    // bound state (e_cm_n < 0) still gets a real P.  Radius is APT
+                    // (true_radius) per Betset's Zkte = Z·Rdtru (mrml03.f:244).
                     let e_cm_n = channel::lab_to_cm_energy(res.energy, awr) + pp_c.q;
-                    if e_cm_n <= 0.0 {
-                        None // channel closed at resonance energy (bound state)
+                    let ex = e_cm_n.abs();
+                    let redmas = pp_c.ma * pp_c.mb / (pp_c.ma + pp_c.mb);
+                    let k_cn = channel::wave_number_from_cm(ex, redmas);
+                    let rho_pen_n = k_cn * ch.true_radius; // APT
+                    // Same Coulomb-vs-hard-sphere routing as the open-channel block
+                    // so the normalisation is self-consistent.  SAMMY rml/mrml07.f
+                    // Pgh — same Zeta check applies here.
+                    let p = if pp_c.za.abs() > 0.5 && pp_c.zb.abs() > 0.5 {
+                        let eta = coulomb::sommerfeld_eta(pp_c.za, pp_c.zb, pp_c.ma, pp_c.mb, ex);
+                        coulomb::coulomb_wave_functions(ch.l, eta, rho_pen_n)
+                            .map_or(0.0, |(fl, gl, _, _)| rho_pen_n / (fl * fl + gl * gl))
                     } else {
-                        let redmas = pp_c.ma * pp_c.mb / (pp_c.ma + pp_c.mb);
-                        let k_cn = channel::wave_number_from_cm(e_cm_n, redmas);
-                        let rho_eff_n = k_cn * ch.effective_radius;
-                        // Must use the same penetrability type as the open-channel
-                        // block: Coulomb P_c(E_n) for charged pairs, hard-sphere
-                        // otherwise.  Mixing them produces inconsistent γ_nc
-                        // normalisation: γ_nc = √(Γ_nc / (2·P_c(E_n))).
-                        // SAMMY rml/mrml07.f Pgh — same Zeta check applies here.
-                        let p = if pp_c.za.abs() > 0.5 && pp_c.zb.abs() > 0.5 {
-                            // If rho_eff_n ≤ acch (SAMMY Coulfg threshold,
-                            // ≈ 1e-8) wave functions return None and P = 0.0
-                            // is used.  The filter(p > 0.0) below then maps
-                            // P = 0 → None, applying the closed-channel
-                            // √(|Γ|) normalisation — correct physical limit
-                            // for a resonance barely above its Coulomb
-                            // channel threshold.
-                            // Reference: SAMMY coulomb/mrml08.f90 Coulfg.
-                            let eta =
-                                coulomb::sommerfeld_eta(pp_c.za, pp_c.zb, pp_c.ma, pp_c.mb, e_cm_n);
-                            coulomb::coulomb_wave_functions(ch.l, eta, rho_eff_n)
-                                .map_or(0.0, |(fl, gl, _, _)| rho_eff_n / (fl * fl + gl * gl))
-                        } else {
-                            penetrability::penetrability(ch.l, rho_eff_n)
-                        };
-                        Some(p)
+                        penetrability::penetrability(ch.l, rho_pen_n)
+                    };
+                    // P = 0 only at the exact channel threshold (Ex = 0) or below
+                    // the Coulomb acch cutoff — a measure-zero singularity.  Fall
+                    // back to the no-penetrability form √(½|Γ|) to keep γ finite.
+                    if p > 0.0 {
+                        (0.5 * gamma_formal.abs() / p).sqrt()
+                    } else {
+                        (0.5 * gamma_formal.abs()).sqrt()
                     }
                 };
-                // Guard: prevent division by zero if P_c = 0.  Covers both
-                // non-Coulomb channels at rho → 0 and Coulomb channels below
-                // SAMMY's acch threshold (coulomb_wave_functions returns None
-                // → P = 0.0).  Collapsing to None uses the closed-channel
-                // √(|Γ|) normalisation, which is the correct limit when the
-                // channel has effectively zero penetrability.
-                let p_at_en = p_at_en.filter(|&p| p > 0.0);
-                ws.gamma_vals[c] = match p_at_en {
-                    None => {
-                        // Closed or non-computable channel at E_n: formal width used
-                        // directly as reduced amplitude (SAMMY bound-state convention).
-                        gamma_formal.abs().sqrt().copysign(gamma_formal)
-                    }
-                    Some(p) => {
-                        // Open channel: γ = √(|Γ| / (2·P_c(E_n))) with sign of Γ.
-                        let magnitude = (gamma_formal.abs() / (2.0 * p)).sqrt();
-                        magnitude.copysign(gamma_formal)
-                    }
-                };
+                ws.gamma_vals[c] = magnitude.copysign(gamma_formal);
             }
             e_tilde
         } else {
@@ -1249,5 +1243,310 @@ mod tests {
     fn rml_for_range_panics_on_infinite_energy() {
         let rml = make_empty_rml();
         let _ = cross_sections_for_rml_range(&rml, f64::INFINITY);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // LRF=7 KRM=3 SAMMY-parity regression tests.
+    //
+    // These guard three SAMMY-divergence bugs that were INVISIBLE to every prior
+    // RML test: all existing fixtures set effective_radius == true_radius (so the
+    // APE/APT roles were indistinguishable), used all-positive resonance energies
+    // (so the KRM=3 bound-state path never ran), and used PNT=1 (so the PNT flag
+    // was never exercised).  The fixtures below deliberately use APE ≠ APT, a
+    // negative-energy (bound) resonance, and a PNT toggle, with an explicit
+    // non-vacuity guard in each test proving the fix is observable.
+    //
+    // Oracle: a hand re-derivation of the single-channel single-resonance elastic
+    // U-matrix algebra (mirrors `spin_group_cross_sections`) using NEREIDS
+    // primitives but the CORRECT SAMMY radius convention — APT (true_radius) for
+    // P_c/S_c, APE (effective_radius) for the phase φ_c (SAMMY rml/mrml07.f:128-134,
+    // mrml03.f:174-177,244).  Same house pattern as slbw_elastic_oracle.rs.
+
+    /// Parameters for a single-channel elastic KRM=3 fixture.  Named fields (vs a
+    /// long positional arg list) keep call sites unambiguous; `..Default::default()`
+    /// lets each test override only the field it varies.
+    #[derive(Clone, Copy)]
+    struct ElasticKrm3 {
+        l: u32,
+        ape: f64,
+        apt: f64,
+        e_res: f64,
+        gamma_n: f64,
+        gamma_gamma: f64,
+        pnt: i32,
+        shf: i32,
+    }
+
+    impl Default for ElasticKrm3 {
+        fn default() -> Self {
+            Self {
+                l: 0,
+                ape: 8.3,
+                apt: 5.0,
+                e_res: 100.0,
+                gamma_n: 2.0,
+                gamma_gamma: 0.5,
+                pnt: 1,
+                shf: 0,
+            }
+        }
+    }
+
+    /// Build a single-channel (elastic, neutron + W-184), single-resonance KRM=3
+    /// spin group with independent effective (APE) and true (APT) radii.
+    fn rml_elastic_krm3(f: ElasticKrm3) -> RmlData {
+        use nereids_endf::resonance::{RmlChannel, RmlResonance};
+        let pp = ParticlePair {
+            ma: 1.0,
+            mb: 184.0,
+            za: 0.0,  // neutron Z=0 → non-Coulomb (hard-sphere) entrance channel
+            zb: 74.0, // W-184 Z=74
+            ia: 0.5,
+            ib: 0.0,
+            q: 0.0,
+            pnt: f.pnt,
+            shf: f.shf,
+            mt: 2,
+            pa: 1.0,
+            pb: 1.0,
+        };
+        let channel = RmlChannel {
+            particle_pair_idx: 0,
+            l: f.l,
+            channel_spin: 0.5,
+            boundary: 0.0,
+            effective_radius: f.ape,
+            true_radius: f.apt,
+        };
+        let sg = SpinGroup {
+            j: 0.5,
+            parity: 1.0,
+            channels: vec![channel],
+            resonances: vec![RmlResonance {
+                energy: f.e_res,
+                widths: vec![f.gamma_n],
+                gamma_gamma: f.gamma_gamma,
+            }],
+            has_background_correction: false,
+        };
+        RmlData {
+            target_spin: 0.0,
+            awr: 183.0,
+            scattering_radius: f.apt,
+            krm: 3,
+            particle_pairs: vec![pp],
+            spin_groups: vec![sg],
+        }
+    }
+
+    /// SAMMY Betset reduced-width amplitude for the single elastic channel,
+    /// branching on PNT exactly as `mrml03.f:235-274`: PNT=1 evaluates the
+    /// penetrability at |Eres−Echan| using APT; PNT≠1 uses √(½|Γ|).
+    fn oracle_reduced_width(rml: &RmlData) -> f64 {
+        let pp = &rml.particle_pairs[0];
+        let ch = &rml.spin_groups[0].channels[0];
+        let res = &rml.spin_groups[0].resonances[0];
+        let g = res.widths[0];
+        if pp.pnt != 1 {
+            return (0.5 * g.abs()).sqrt().copysign(g);
+        }
+        let e_cm_n = channel::lab_to_cm_energy(res.energy, rml.awr) + pp.q;
+        let redmas = pp.ma * pp.mb / (pp.ma + pp.mb);
+        let k_cn = channel::wave_number_from_cm(e_cm_n.abs(), redmas);
+        let p = penetrability::penetrability(ch.l, k_cn * ch.true_radius); // APT
+        if p > 0.0 {
+            (0.5 * g.abs() / p).sqrt().copysign(g)
+        } else {
+            (0.5 * g.abs()).sqrt().copysign(g)
+        }
+    }
+
+    /// Single-channel single-resonance elastic U-matrix cross-section oracle for a
+    /// given reduced-width amplitude `gamma`.  Mirrors `spin_group_cross_sections`:
+    /// PNT=1 uses the SAMMY radius convention (APT→P/S, APE→φ); PNT≠1 uses the
+    /// no-penetrability encoding (P=1, S=B_c, φ=0).  Returns
+    /// (σ_total, σ_elastic, σ_capture) in barns.
+    fn oracle_xs(rml: &RmlData, energy_ev: f64, gamma: f64) -> (f64, f64, f64) {
+        let sg = &rml.spin_groups[0];
+        let pp = &rml.particle_pairs[0];
+        let ch = &sg.channels[0];
+        let res = &sg.resonances[0];
+        let g_j = channel::statistical_weight(sg.j, rml.target_spin);
+        let pok2 = channel::pi_over_k_squared_barns(energy_ev, rml.awr);
+        let (p, s, phi) = if pp.pnt != 1 {
+            // No-penetrability branch (matches the evaluator's eval-path): P=1,
+            // S=B_c, φ=0 → L_c = i, the Ymat(2,Ii) -= 1 encoding.
+            (1.0, ch.boundary, 0.0)
+        } else {
+            let redmas = pp.ma * pp.mb / (pp.ma + pp.mb);
+            let e_c = channel::lab_to_cm_energy(energy_ev, rml.awr) + pp.q;
+            let k_c = channel::wave_number_from_cm(e_c, redmas);
+            let p = penetrability::penetrability(ch.l, k_c * ch.true_radius); // APT
+            let s = if pp.shf == 1 {
+                penetrability::shift_factor(ch.l, k_c * ch.true_radius) // APT
+            } else {
+                ch.boundary
+            };
+            let phi = penetrability::phase_shift(ch.l, k_c * ch.effective_radius); // APE
+            (p, s, phi)
+        };
+        let e_tilde = Complex64::new(res.energy, -res.gamma_gamma / 2.0);
+        let r = Complex64::new(gamma * gamma, 0.0) / (e_tilde - energy_ev);
+        let l_c = Complex64::new(s - ch.boundary, p);
+        let y_tilde = l_c.inv() - r;
+        let xq = y_tilde.inv() * r;
+        let sqrt_p = p.sqrt();
+        let xxxx = (sqrt_p / l_c) * xq * sqrt_p;
+        let w = Complex64::new(1.0, 0.0) + Complex64::new(0.0, 2.0) * xxxx;
+        let omega = Complex64::from_polar(1.0, -phi);
+        let u = omega * w * omega;
+        let tot = 2.0 * pok2 * g_j * (1.0 - u.re);
+        let elas = pok2 * g_j * (Complex64::new(1.0, 0.0) - u).norm_sqr();
+        (tot, elas, (tot - elas).max(0.0))
+    }
+
+    fn rml_rel_err(a: f64, b: f64) -> f64 {
+        (a - b).abs() / b.abs().max(1e-300)
+    }
+
+    /// Shared-primitive tolerance: the oracle and evaluator use the same P_l/φ_l
+    /// primitives and identical algebra, so any disagreement is FP noise.
+    const RML_ORACLE_REL_TOL: f64 = 1e-9;
+
+    /// F2: APT (true_radius) drives P_c/S_c, APE (effective_radius) drives φ_c.
+    /// The evaluator must match the correct-convention oracle; the explicit
+    /// non-vacuity guard proves that swapping the two radii changes the result,
+    /// so the match is meaningful and not a degenerate APE==APT pass.
+    #[test]
+    fn rml_lrf7_krm3_radius_roles_match_sammy_oracle() {
+        // Two channel configs exercise both radius-bearing paths:
+        //   l=0, shf=0 → P_c and φ_c (S_c = B_c is inert)
+        //   l=1, shf=1 → P_c, S_c (analytic shift factor) and φ_c
+        for &(l, shf, label) in &[(0u32, 0i32, "l=0,shf=0"), (1u32, 1i32, "l=1,shf=1")] {
+            let rml = rml_elastic_krm3(ElasticKrm3 {
+                l,
+                shf,
+                ..Default::default()
+            });
+            // APE/APT exchanged
+            let swapped = rml_elastic_krm3(ElasticKrm3 {
+                l,
+                shf,
+                ape: 5.0,
+                apt: 8.3,
+                ..Default::default()
+            });
+            for &e in &[50.0, 90.0, 110.0, 200.0] {
+                let (tot, elas, cap, _fis) = cross_sections_for_rml_range(&rml, e);
+                let gamma = oracle_reduced_width(&rml);
+                let (otot, oelas, ocap) = oracle_xs(&rml, e, gamma);
+                assert!(
+                    rml_rel_err(tot, otot) < RML_ORACLE_REL_TOL,
+                    "[{label}] σ_total @ {e} eV: eval={tot}, oracle={otot}"
+                );
+                assert!(
+                    rml_rel_err(elas, oelas) < RML_ORACLE_REL_TOL,
+                    "[{label}] σ_elastic @ {e} eV: eval={elas}, oracle={oelas}"
+                );
+                assert!(
+                    rml_rel_err(cap, ocap) < RML_ORACLE_REL_TOL,
+                    "[{label}] σ_capture @ {e} eV: eval={cap}, oracle={ocap}"
+                );
+                // Non-vacuity: the swapped-radius convention must give a materially
+                // different σ_total, so matching the correct one above is meaningful.
+                // For l=1,shf=1 the swap moves the shift-factor radius too.
+                let g_sw = oracle_reduced_width(&swapped);
+                let (stot, _, _) = oracle_xs(&swapped, e, g_sw);
+                assert!(
+                    rml_rel_err(otot, stot) > 0.01,
+                    "[{label}] APE/APT swap unobservable at {e} eV (otot={otot}, swapped={stot}); test would be vacuous"
+                );
+            }
+        }
+    }
+
+    /// F1: a KRM=3 bound-state resonance (E_res < 0) must receive a real
+    /// penetrability at |Eres−Echan| and the √(½|Γ|/P) normalisation — NOT the
+    /// old √|Γ| fallback.  The non-vacuity guard asserts the evaluator does NOT
+    /// match the buggy √|Γ| reduced width.
+    #[test]
+    fn rml_lrf7_krm3_bound_state_uses_penetrability_not_sqrt_gamma() {
+        let rml = rml_elastic_krm3(ElasticKrm3 {
+            e_res: -50.0,
+            ..Default::default()
+        });
+        let gamma = oracle_reduced_width(&rml);
+        // Old (buggy) behaviour: γ = √|Γ| with no ½ factor and no penetrability.
+        let gamma_buggy = {
+            let g = rml.spin_groups[0].resonances[0].widths[0];
+            g.abs().sqrt().copysign(g)
+        };
+        for &e in &[10.0, 50.0, 150.0] {
+            let (tot, elas, cap, _fis) = cross_sections_for_rml_range(&rml, e);
+            let (otot, oelas, ocap) = oracle_xs(&rml, e, gamma);
+            assert!(
+                rml_rel_err(tot, otot) < RML_ORACLE_REL_TOL,
+                "bound σ_total @ {e} eV: eval={tot}, oracle={otot}"
+            );
+            assert!(
+                rml_rel_err(elas, oelas) < RML_ORACLE_REL_TOL,
+                "bound σ_elastic @ {e} eV: eval={elas}, oracle={oelas}"
+            );
+            assert!(
+                rml_rel_err(cap, ocap) < RML_ORACLE_REL_TOL,
+                "bound σ_capture @ {e} eV: eval={cap}, oracle={ocap}"
+            );
+            // Non-vacuity: the pre-fix √|Γ| reduced width gives a materially
+            // different result, so the match above proves the new normalisation.
+            let (btot, _, _) = oracle_xs(&rml, e, gamma_buggy);
+            assert!(
+                rml_rel_err(otot, btot) > 0.01,
+                "√|Γ| vs √(½|Γ|/P) indistinguishable at {e} eV (otot={otot}, buggy={btot}); test would be vacuous"
+            );
+        }
+    }
+
+    /// F3: the per-pair PNT flag must change the physics.  Before the fix the
+    /// evaluator branched on particle mass and ignored PNT entirely, so toggling
+    /// PNT on a massive channel produced identical cross-sections.
+    #[test]
+    fn rml_lrf7_pnt_flag_is_respected() {
+        let with_pen = rml_elastic_krm3(ElasticKrm3::default());
+        let no_pen = rml_elastic_krm3(ElasticKrm3 {
+            pnt: 0,
+            ..Default::default()
+        });
+        for &e in &[50.0, 110.0, 200.0] {
+            let (tot1, _, _, _) = cross_sections_for_rml_range(&with_pen, e);
+            let (tot0, elas0, cap0, _) = cross_sections_for_rml_range(&no_pen, e);
+            assert!(
+                tot0.is_finite() && tot1.is_finite(),
+                "PNT toggle produced non-finite σ at {e} eV: PNT=1 {tot1}, PNT=0 {tot0}"
+            );
+            // Pin the PNT=0 path against the oracle: this covers BOTH the
+            // no-penetrability channel setup (P=1, S=B, φ=0) AND the √(½|Γ|)
+            // width conversion, so the test fails if either regresses — not just
+            // if the totals happen to differ.
+            let g0 = oracle_reduced_width(&no_pen);
+            let (otot0, oelas0, ocap0) = oracle_xs(&no_pen, e, g0);
+            assert!(
+                rml_rel_err(tot0, otot0) < RML_ORACLE_REL_TOL,
+                "PNT=0 σ_total @ {e} eV: eval={tot0}, oracle={otot0}"
+            );
+            assert!(
+                rml_rel_err(elas0, oelas0) < RML_ORACLE_REL_TOL,
+                "PNT=0 σ_elastic @ {e} eV: eval={elas0}, oracle={oelas0}"
+            );
+            assert!(
+                rml_rel_err(cap0, ocap0) < RML_ORACLE_REL_TOL,
+                "PNT=0 σ_capture @ {e} eV: eval={cap0}, oracle={ocap0}"
+            );
+            // Non-vacuity: the PNT toggle must change σ (pre-fix, branching on
+            // particle mass, gave identical results regardless of PNT).
+            assert!(
+                rml_rel_err(tot1, tot0) > 0.01,
+                "PNT flag ignored at {e} eV: PNT=1 σ_total={tot1}, PNT=0 σ_total={tot0} (should differ)"
+            );
+        }
     }
 }

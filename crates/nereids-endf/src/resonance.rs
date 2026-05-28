@@ -491,11 +491,15 @@ pub struct ParticlePair {
     pub ib: f64,
     /// Q-value for this reaction (eV). 0 for elastic.
     pub q: f64,
-    /// Penetrability flag.
+    /// Penetrability flag (ENDF `PNT`, SAMMY `Lpent`).
     ///
-    /// `PNT=1`: calculate penetrability P_c analytically (Blatt-Weisskopf).
-    /// Used for massive-particle channels (neutron elastic).
-    /// `PNT=0`: do not calculate penetrability; set P_c = 0 (photon/massless channels).
+    /// `PNT=1`: calculate penetrability P_c and shift S_c analytically
+    /// (Blatt-Weisskopf / Coulomb). Used for open particle channels.
+    /// `PNT=0`: no penetrability — the channel contributes only the
+    /// `Ymat(2,Ii) -= 1` term (SAMMY `rml/mrml07.f:118-122`), encoded here as
+    /// `P_c=1, S_c=B_c`. Always the case for the photon/eliminated channel.
+    /// `PNT∉{0,1}` is rejected at parse time (SAMMY `Check_Quantum`,
+    /// `rml/mrml03.f:22`).
     pub pnt: i32,
     /// Shift factor flag.
     ///
@@ -526,9 +530,19 @@ pub struct RmlChannel {
     pub channel_spin: f64,
     /// Boundary condition B (usually 0.0; shifts the shift factor reference).
     pub boundary: f64,
-    /// Effective channel radius APE (fm), used to compute P_l and S_l.
+    /// Effective channel radius APE (fm), used to compute the hard-sphere phase φ_l.
+    ///
+    /// Per SAMMY `rml/mrml07.f:129,134` (`Rhof = Zkfe·Ex`, `Zkfe = Z·Rdeff`) the
+    /// EFFECTIVE radius feeds the phase shift (Sinsix), not the penetrability.
+    /// Independently corroborated by PLEIADES `models.py:385` ("Radius for
+    /// potential scattering").
     pub effective_radius: f64,
-    /// True channel radius APT (fm), used to compute hard-sphere phase φ_l.
+    /// True channel radius APT (fm), used to compute penetrability P_l and shift S_l.
+    ///
+    /// Per SAMMY `rml/mrml07.f:128,136` (`Rho = Zkte·Ex`, `Zkte = Z·Rdtru`) and
+    /// `rml/mrml03.f:244` (Betset width conversion), the TRUE radius feeds the
+    /// penetrability and shift (Pgh). Corroborated by PLEIADES `models.py:386`
+    /// ("Radius for penetrabilities and shifts").
     pub true_radius: f64,
 }
 
