@@ -352,6 +352,188 @@ fn validate_spatial_fit_preflight(
     Ok(())
 }
 
+/// Validity domain for an up-front detector-cube value check.
+///
+/// Each variant encodes the physically-meaningful constraint for one class of
+/// cube (see [`validate_spatial_data_values`]).
+#[derive(Clone, Copy)]
+enum CubeDomain {
+    /// Finite (NaN / ±∞ rejected); sign unconstrained.  Used for the
+    /// transmission **value**: SAMMY does not reject negative transmission —
+    /// measurement noise / open-beam over-subtraction can push a measured
+    /// point below 0 — so only finiteness is required.
+    Finite,
+    /// Finite **and strictly > 0**.  Used for the 1-σ uncertainty: a zero or
+    /// negative error bar is a singular weight (SAMMY: zero uncertainties are
+    /// never allowed).  Without this guard the old `σ.max(1e-10)` floor turned
+    /// a bad σ into a `1/(1e-10)² = 1e20` maximum-confidence bin — the
+    /// opposite of the LM core's `s <= 0.0 => 1/1e30` negligible-weight rule.
+    FinitePositive,
+    /// Finite **and ≥ 0**.  Used for raw detector counts / open-beam / flux:
+    /// non-negative by construction (zero is legitimate — "no counts in this
+    /// bin"), so a negative or non-finite value signals an upstream loader /
+    /// TOF-normalisation bug, exactly as the `validate_counts` docstring in
+    /// `nereids_fitting::joint_poisson` describes.
+    FiniteNonNegative,
+}
+
+impl CubeDomain {
+    #[inline]
+    fn accepts(self, v: f64) -> bool {
+        match self {
+            CubeDomain::Finite => v.is_finite(),
+            CubeDomain::FinitePositive => v.is_finite() && v > 0.0,
+            CubeDomain::FiniteNonNegative => v.is_finite() && v >= 0.0,
+        }
+    }
+
+    fn describe(self) -> &'static str {
+        match self {
+            CubeDomain::Finite => "finite",
+            CubeDomain::FinitePositive => "finite and > 0",
+            CubeDomain::FiniteNonNegative => "finite and >= 0",
+        }
+    }
+}
+
+/// Check every relevant element of one detector cube, returning the first
+/// violation as a typed `InvalidParameter` naming the cube and the offending
+/// `(y, x, e)`.
+///
+/// Iterates in memory order — energy plane `e` outer (a contiguous `h × w`
+/// block in the `(n_energies, height, width)` input layout), live pixels
+/// inner — and short-circuits on the first bad value.  When `active_mask` is
+/// `Some`, bins outside the user's `fit_energy_range` are skipped: those bins
+/// are excluded from the fit (both the LM core and the joint-Poisson deviance
+/// skip them) so their values are irrelevant.  Pass `None` to check all bins.
+fn check_cube(
+    cube: &ArrayView3<'_, f64>,
+    field: &'static str,
+    domain: CubeDomain,
+    live_pixels: &[(usize, usize)],
+    active_mask: Option<&[bool]>,
+) -> Result<(), PipelineError> {
+    let n_energies = cube.shape()[0];
+    for e in 0..n_energies {
+        if active_mask.is_some_and(|m| !m[e]) {
+            continue;
+        }
+        for &(y, x) in live_pixels {
+            let v = cube[[e, y, x]];
+            if !domain.accepts(v) {
+                return Err(PipelineError::InvalidParameter(format!(
+                    "{field} at (y={y}, x={x}, e={e}) must be {}, got {v}",
+                    domain.describe(),
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reject non-finite / out-of-domain detector-cube **values** up front, so bad
+/// input fails with a typed `InvalidParameter` (mapped to `PyValueError` at
+/// the Python boundary) instead of being silently transformed by the
+/// per-pixel sanitation that used to run inside the rayon closure
+/// (`v.max(0.0)` on counts, `σ.max(1e-10)` on uncertainty).  That sanitation
+/// defeated the downstream joint-Poisson `validate_counts` guard
+/// (`NaN.max(0.0) == 0.0` passes silently) and turned a bad σ into a
+/// maximum-confidence bin — concealing precisely the upstream TOF-norm /
+/// loader bugs the guards exist to surface.
+///
+/// Only **live** pixels are checked: a `dead_pixels`-masked pixel is excluded
+/// from the fit and from the averaged open-beam flux, so its data is never
+/// read and may legitimately hold detector garbage.
+///
+/// Bin scope differs by quantity, matching each path's existing downstream
+/// contract so that no currently-passing fit changes behaviour:
+/// - **transmission / uncertainty** are checked on **active bins only**.
+///   Transmission is derived (`sample / open_beam`) and is legitimately
+///   undefined where open-beam → 0; the LM core deliberately *skips* inactive
+///   bins (`nereids_fitting::lm` — "y_obs is NaN outside the user's
+///   fit-energy range"), so a NaN in an out-of-`fit_energy_range` bin is
+///   harmless and must not be rejected.
+/// - **counts / open-beam / flux** are checked on **all bins** — raw detector
+///   quantities, where a bad value anywhere is an upstream bug (matching the
+///   all-bins `validate_counts`).
+/// - **background** (CountsWithNuisance) is checked **finite, all bins**,
+///   closing the `NaN.abs() > 1e-12 == false` finiteness leak in the
+///   per-pixel detector-background gate.
+fn validate_spatial_data_values(
+    input: &InputData3D<'_>,
+    live_pixels: &[(usize, usize)],
+    active_mask: Option<&[bool]>,
+) -> Result<(), PipelineError> {
+    match input {
+        InputData3D::Transmission {
+            transmission,
+            uncertainty,
+        } => {
+            check_cube(
+                transmission,
+                "transmission",
+                CubeDomain::Finite,
+                live_pixels,
+                active_mask,
+            )?;
+            check_cube(
+                uncertainty,
+                "uncertainty",
+                CubeDomain::FinitePositive,
+                live_pixels,
+                active_mask,
+            )?;
+        }
+        InputData3D::Counts {
+            sample_counts,
+            open_beam_counts,
+        } => {
+            check_cube(
+                sample_counts,
+                "sample_counts",
+                CubeDomain::FiniteNonNegative,
+                live_pixels,
+                None,
+            )?;
+            check_cube(
+                open_beam_counts,
+                "open_beam_counts",
+                CubeDomain::FiniteNonNegative,
+                live_pixels,
+                None,
+            )?;
+        }
+        InputData3D::CountsWithNuisance {
+            sample_counts,
+            flux,
+            background,
+        } => {
+            check_cube(
+                sample_counts,
+                "sample_counts",
+                CubeDomain::FiniteNonNegative,
+                live_pixels,
+                None,
+            )?;
+            check_cube(
+                flux,
+                "flux",
+                CubeDomain::FiniteNonNegative,
+                live_pixels,
+                None,
+            )?;
+            check_cube(
+                background,
+                "background",
+                CubeDomain::Finite,
+                live_pixels,
+                None,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 pub fn spatial_map_typed(
     input: &InputData3D<'_>,
     config: &UnifiedFitConfig,
@@ -677,6 +859,20 @@ pub fn spatial_map_typed(
             n_failed: 0,
         });
     }
+
+    // Reject non-finite / out-of-domain detector-cube VALUES up front —
+    // before the (potentially multi-GB) transpose below and the shared
+    // cross-section precompute — so bad input fails with a clear
+    // `InvalidParameter` instead of being silently sanitised per-pixel.
+    // `pixel_coords` is non-empty here (the all-dead case returned above), so
+    // only live pixels are checked.  The mask scopes the transmission /
+    // uncertainty check to the user's fit-energy range; see
+    // `validate_spatial_data_values` for the per-cube domains and rationale.
+    let value_active_mask = nereids_fitting::active_mask::build_active_mask(
+        config.energies(),
+        config.fit_energy_range(),
+    );
+    validate_spatial_data_values(input, &pixel_coords, value_active_mask.as_deref())?;
 
     // Transpose data to (height, width, n_energies) for cache locality.
     let (data_a, data_b, data_c) = match input {
@@ -1130,19 +1326,25 @@ pub fn spatial_map_typed(
             // Build per-pixel 1D InputData
             let pixel_input = match input {
                 InputData3D::Counts { .. } => {
-                    let sample_clamped: Vec<f64> = spectrum_a.iter().map(|&v| v.max(0.0)).collect();
                     let ob_spectrum: Vec<f64> = data_b.slice(s![y, x, ..]).to_vec();
 
+                    // Sample counts flow through unsanitised: NaN / negative
+                    // values are rejected up-front by
+                    // `validate_spatial_data_values`, so the per-pixel
+                    // `v.max(0.0)` clamp that used to conceal them (and pass a
+                    // bogus 0 through the joint-Poisson `validate_counts`
+                    // guard) is gone.
+                    //
                     // Check effective solver: KL uses CountsWithNuisance
                     // (averaged flux), LM uses raw Counts (auto-converts to
                     // transmission inside fit_spectrum_typed).
                     let effective = fast_config.effective_solver(&InputData::Counts {
-                        sample_counts: sample_clamped.clone(),
+                        sample_counts: spectrum_a.clone(),
                         open_beam_counts: ob_spectrum.clone(),
                     });
                     match effective {
                         SolverConfig::PoissonKL(_) => InputData::CountsWithNuisance {
-                            sample_counts: sample_clamped,
+                            sample_counts: spectrum_a,
                             flux: averaged_flux.as_ref().unwrap().clone(),
                             // Raw-count spatial path currently assumes zero
                             // detector background unless the caller provides
@@ -1150,13 +1352,15 @@ pub fn spatial_map_typed(
                             background: background_zeros.clone(),
                         },
                         _ => InputData::Counts {
-                            sample_counts: sample_clamped,
+                            sample_counts: spectrum_a,
                             open_beam_counts: ob_spectrum,
                         },
                     }
                 }
                 InputData3D::CountsWithNuisance { .. } => InputData::CountsWithNuisance {
-                    sample_counts: spectrum_a.iter().map(|&v| v.max(0.0)).collect(),
+                    // Sample flows through unsanitised — bad values are
+                    // rejected up-front by `validate_spatial_data_values`.
+                    sample_counts: spectrum_a,
                     flux: data_b.slice(s![y, x, ..]).to_vec(),
                     background: data_c
                         .as_ref()
@@ -1165,11 +1369,14 @@ pub fn spatial_map_typed(
                         .to_vec(),
                 },
                 InputData3D::Transmission { .. } => {
-                    let spectrum_b: Vec<f64> = data_b
-                        .slice(s![y, x, ..])
-                        .iter()
-                        .map(|&v| v.max(1e-10))
-                        .collect();
+                    // Uncertainty flows through unsanitised: a zero / negative
+                    // / non-finite σ in an active bin is rejected up-front by
+                    // `validate_spatial_data_values`, so the per-pixel
+                    // `σ.max(1e-10)` floor (which turned a bad σ into a 1e20
+                    // maximum-confidence weight) is gone.  This matches the
+                    // single-spectrum path, which passes σ straight to the LM
+                    // core (`pipeline::fit_transmission_lm`).
+                    let spectrum_b: Vec<f64> = data_b.slice(s![y, x, ..]).to_vec();
                     InputData::Transmission {
                         transmission: spectrum_a,
                         uncertainty: spectrum_b,
@@ -3399,5 +3606,326 @@ mod tests {
                 && msg.contains("underdetermined"),
             "error must explain the underdetermined condition, got: {msg}"
         );
+    }
+
+    // ── Up-front detector-cube VALUE validation ─────────────────────────
+    //
+    // These tests exercise bad *values* (NaN / +inf / negative / zero σ) in
+    // each detector cube — the path `validate_spatial_data_values` guards.
+    // Before that guard existed the per-pixel `v.max(0.0)` / `σ.max(1e-10)`
+    // clamps silently transformed bad input into a plausible-but-wrong or
+    // all-NaN map; the asserts below lock in a hard `InvalidParameter`
+    // instead.  The earlier spatial tests cover only bad *config*.
+
+    fn lm_transmission_config(
+        energies: Vec<f64>,
+        data: nereids_endf::resonance::ResonanceData,
+    ) -> UnifiedFitConfig {
+        UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
+    }
+
+    fn kl_counts_config(
+        energies: Vec<f64>,
+        data: nereids_endf::resonance::ResonanceData,
+    ) -> UnifiedFitConfig {
+        UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
+    }
+
+    #[test]
+    fn test_spatial_rejects_bad_transmission_value() {
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let data = u238_single_resonance();
+            let (mut t_3d, u_3d) = synthetic_4x4_transmission(&data, 0.0005, &energies);
+            t_3d[[10, 1, 2]] = bad;
+            let config = lm_transmission_config(energies.clone(), data);
+            let input = InputData3D::Transmission {
+                transmission: t_3d.view(),
+                uncertainty: u_3d.view(),
+            };
+            let err = spatial_map_typed(&input, &config, None, None, None)
+                .expect_err("non-finite transmission value must be rejected up-front");
+            assert!(
+                matches!(err, PipelineError::InvalidParameter(_)),
+                "got {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains("transmission") && msg.contains("(y="),
+                "error must name the cube and (y, x, e): {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_spatial_rejects_bad_uncertainty() {
+        // NaN / +inf / zero / negative σ are all rejected (finite and > 0):
+        // a zero σ is a singular weight, and the old floor turned it into a
+        // 1e20 maximum-confidence bin.
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        for bad in [f64::NAN, f64::INFINITY, 0.0, -1.0] {
+            let data = u238_single_resonance();
+            let (t_3d, mut u_3d) = synthetic_4x4_transmission(&data, 0.0005, &energies);
+            u_3d[[9, 1, 0]] = bad;
+            let config = lm_transmission_config(energies.clone(), data);
+            let input = InputData3D::Transmission {
+                transmission: t_3d.view(),
+                uncertainty: u_3d.view(),
+            };
+            let err = spatial_map_typed(&input, &config, None, None, None)
+                .expect_err("bad uncertainty must be rejected up-front");
+            assert!(
+                matches!(err, PipelineError::InvalidParameter(_)),
+                "got {err:?}"
+            );
+            assert!(
+                err.to_string().contains("uncertainty"),
+                "error must name the uncertainty cube, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_spatial_accepts_negative_transmission_value() {
+        // SAMMY does not reject negative transmission (noise / open-beam
+        // over-subtraction); only finiteness is required.
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        let (mut t_3d, u_3d) = synthetic_4x4_transmission(&data, 0.0005, &energies);
+        t_3d[[12, 2, 2]] = -0.05;
+        let config = lm_transmission_config(energies, data);
+        let input = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+        let result = spatial_map_typed(&input, &config, None, None, None)
+            .expect("a finite negative transmission value must not be rejected");
+        assert_eq!(result.n_total, 16);
+    }
+
+    #[test]
+    fn test_spatial_rejects_bad_sample_counts() {
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        for bad in [f64::NAN, f64::INFINITY, -1.0] {
+            let data = u238_single_resonance();
+            let (mut sample, ob) = synthetic_4x4_counts(&data, 0.0005, &energies, 1000.0);
+            sample[[8, 0, 3]] = bad;
+            let config = kl_counts_config(energies.clone(), data);
+            let input = InputData3D::Counts {
+                sample_counts: sample.view(),
+                open_beam_counts: ob.view(),
+            };
+            let err = spatial_map_typed(&input, &config, None, None, None)
+                .expect_err("bad sample count must be rejected up-front");
+            assert!(
+                matches!(err, PipelineError::InvalidParameter(_)),
+                "got {err:?}"
+            );
+            assert!(
+                err.to_string().contains("sample_counts"),
+                "error must name the sample_counts cube, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_spatial_rejects_bad_open_beam() {
+        // A single bad open-beam bin would otherwise poison the spatially-
+        // averaged flux for ALL pixels (KL path); it must surface as a hard
+        // error rather than a silently all-NaN map.
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        for bad in [f64::NAN, f64::INFINITY, -1.0] {
+            let data = u238_single_resonance();
+            let (sample, mut ob) = synthetic_4x4_counts(&data, 0.0005, &energies, 1000.0);
+            ob[[6, 3, 1]] = bad;
+            let config = kl_counts_config(energies.clone(), data);
+            let input = InputData3D::Counts {
+                sample_counts: sample.view(),
+                open_beam_counts: ob.view(),
+            };
+            let err = spatial_map_typed(&input, &config, None, None, None)
+                .expect_err("bad open-beam must be rejected up-front");
+            assert!(
+                matches!(err, PipelineError::InvalidParameter(_)),
+                "got {err:?}"
+            );
+            assert!(
+                err.to_string().contains("open_beam_counts"),
+                "error must name the open_beam_counts cube, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_spatial_counts_with_nuisance_rejects_bad_flux() {
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        for bad in [f64::NAN, -1.0] {
+            let data = u238_single_resonance();
+            let (sample, _ob) = synthetic_4x4_counts(&data, 0.0005, &energies, 1000.0);
+            let mut flux = Array3::from_elem((energies.len(), 4, 4), 1000.0);
+            let background = Array3::from_elem((energies.len(), 4, 4), 0.0);
+            flux[[4, 2, 1]] = bad;
+            let config = kl_counts_config(energies.clone(), data);
+            let input = InputData3D::CountsWithNuisance {
+                sample_counts: sample.view(),
+                flux: flux.view(),
+                background: background.view(),
+            };
+            let err = spatial_map_typed(&input, &config, None, None, None)
+                .expect_err("bad flux must be rejected up-front");
+            assert!(
+                matches!(err, PipelineError::InvalidParameter(_)),
+                "got {err:?}"
+            );
+            assert!(
+                err.to_string().contains("flux"),
+                "error must name the flux cube, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_spatial_counts_with_nuisance_rejects_nonfinite_background() {
+        // Background is validated finite (sign deferred to the per-pixel
+        // detector-background gate); this closes the `NaN.abs() > 1e-12 ==
+        // false` finiteness leak in that gate at the boundary.
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        for bad in [f64::NAN, f64::INFINITY] {
+            let data = u238_single_resonance();
+            let (sample, _ob) = synthetic_4x4_counts(&data, 0.0005, &energies, 1000.0);
+            let flux = Array3::from_elem((energies.len(), 4, 4), 1000.0);
+            let mut background = Array3::from_elem((energies.len(), 4, 4), 0.0);
+            background[[2, 3, 3]] = bad;
+            let config = kl_counts_config(energies.clone(), data);
+            let input = InputData3D::CountsWithNuisance {
+                sample_counts: sample.view(),
+                flux: flux.view(),
+                background: background.view(),
+            };
+            let err = spatial_map_typed(&input, &config, None, None, None)
+                .expect_err("non-finite background must be rejected up-front");
+            assert!(
+                matches!(err, PipelineError::InvalidParameter(_)),
+                "got {err:?}"
+            );
+            assert!(
+                err.to_string().contains("background"),
+                "error must name the background cube, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_spatial_transmission_tolerates_nan_in_inactive_bin() {
+        // A NaN in an out-of-`fit_energy_range` (inactive) bin is legitimate
+        // (transmission is undefined where open-beam → 0) and is skipped by
+        // the LM core, so it must NOT be rejected — the canonical "set
+        // fit_energy_range to exclude a bad region" workflow.
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        let (mut t_3d, u_3d) = synthetic_4x4_transmission(&data, 0.0005, &energies);
+        // energies[0] = 1.0 eV is below E_min = 3.0 → inactive.
+        t_3d[[0, 1, 1]] = f64::NAN;
+        let config = lm_transmission_config(energies, data)
+            .with_fit_energy_range(Some((3.0, 9.0)))
+            .unwrap();
+        let input = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+        let result = spatial_map_typed(&input, &config, None, None, None)
+            .expect("NaN in an inactive (out-of-range) bin must be tolerated");
+        assert!(
+            result.n_converged > 0,
+            "the active-bin fit should still converge"
+        );
+    }
+
+    #[test]
+    fn test_spatial_rejects_nan_transmission_in_active_bin_with_range() {
+        // The mirror of the previous test: a NaN inside the active window
+        // must still be rejected.
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        let (mut t_3d, u_3d) = synthetic_4x4_transmission(&data, 0.0005, &energies);
+        // energies[20] = 5.0 eV is inside [3.0, 9.0] → active.
+        t_3d[[20, 0, 0]] = f64::NAN;
+        let config = lm_transmission_config(energies, data)
+            .with_fit_energy_range(Some((3.0, 9.0)))
+            .unwrap();
+        let input = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+        let err = spatial_map_typed(&input, &config, None, None, None)
+            .expect_err("NaN in an active bin must be rejected up-front");
+        assert!(
+            matches!(err, PipelineError::InvalidParameter(_)),
+            "got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("transmission"),
+            "error must name the transmission cube, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_spatial_accepts_bad_value_in_dead_pixel() {
+        // A `dead_pixels`-masked pixel is never read, so detector garbage in
+        // it must not reject the whole map (live-pixels-only validation).
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        let (mut sample, ob) = synthetic_4x4_counts(&data, 0.0005, &energies, 1000.0);
+        sample[[5, 0, 0]] = f64::NAN;
+        let config = kl_counts_config(energies, data);
+        let mut dead = Array2::from_elem((4, 4), false);
+        dead[[0, 0]] = true;
+        let input = InputData3D::Counts {
+            sample_counts: sample.view(),
+            open_beam_counts: ob.view(),
+        };
+        let result = spatial_map_typed(&input, &config, Some(&dead), None, None)
+            .expect("a bad value in a dead-masked pixel must be tolerated");
+        assert!(
+            result.n_converged > 0,
+            "the remaining live pixels should still fit"
+        );
+    }
+
+    #[test]
+    fn test_spatial_accepts_zero_counts_and_open_beam() {
+        // Zero is legitimate ("no counts in this bin"); the joint-Poisson
+        // xlogy_ratio zero-branch handles it.  Must not be rejected.
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        let (mut sample, mut ob) = synthetic_4x4_counts(&data, 0.0005, &energies, 1000.0);
+        sample[[3, 2, 2]] = 0.0;
+        ob[[7, 1, 1]] = 0.0;
+        let config = kl_counts_config(energies, data);
+        let input = InputData3D::Counts {
+            sample_counts: sample.view(),
+            open_beam_counts: ob.view(),
+        };
+        let result = spatial_map_typed(&input, &config, None, None, None)
+            .expect("zero counts / zero open-beam are legitimate and must not be rejected");
+        assert_eq!(result.n_total, 16);
     }
 }
