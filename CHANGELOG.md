@@ -20,7 +20,106 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   breaking change at this stage of the project; no external consumers
   of this field have been identified in the workspace or sibling repos.
 
-## [0.1.5] - 2025-03-11
+## [0.1.8] - 2026-04-27
+
+### Added
+
+- TENDL-2023 ENDF library with full MAT-table coverage (#508)
+- GUI: optional fitting of the energy scale — TZERO + flight-path L scale (#501)
+- GUI: vertically stacked image + spectrum layout in the Analyze step (#506)
+- Counts-domain joint-Poisson (KL) fitting with 2D spatial-map integration and
+  Python API parity (#450)
+- Sparse empirical-cubature forward-model surrogate for multi-isotope fits, plus
+  a scalar k=1 Chebyshev surrogate (epic #472: #479, #481, #482)
+- VENUS Hf 120-min NeXus test fixtures (via the PLEIADES submodule)
+
+### Changed
+
+- Resolution broadening rebuilt around a reusable `ResolutionPlan`, compiled to a
+  CSR `ResolutionMatrix` (~4.2× faster apply, bit-exact) and wired through the
+  fixed-grid fit models (#467, #468, #470, #478)
+- Two-pointer walk in `broaden_presorted` (~4.2× on VENUS) (#464)
+- Energy-scale (TZERO) Jacobian: density-column plan cache + partial-GAL
+  default (#469, #484, #498)
+- KL "polish" pass now off by default (~100× faster single-spectrum fits) (#487)
+
+### Fixed
+
+- MLBW batch-API correctness + dispatch consolidation, gated against VENUS (#466)
+- GUI: invalidate the cached fit when solver controls change (#507)
+- ENDF: use the OS trust roots for IAEA fetches (#505)
+- Spatial map: NaN-on-failure handling, config guards, and binding
+  validation (#461)
+- Refuse to silently collapse multiple rotation angles in the NeXus histogram
+  loader (#463)
+
+### Build
+
+- Bump `rustls-webpki` (#477) and `rand` (#449)
+
+## [0.1.7] - 2026-04-04
+
+### Added
+
+- Uncertainty estimation and propagation, Phases 1-4 (#446)
+- Python bindings for NeXus histogram and event loading (#447)
+- Resolution-aware analytical Jacobians (#445)
+
+### Fixed
+
+- Apply resolution broadening *after* Beer-Lambert, including the temperature
+  path of `TransmissionFitModel` (#442 → #443, #444)
+
+## [0.1.6] - 2026-03-23
+
+### Added
+
+- Unified typed fitting pipeline: a solver-agnostic `ForwardModel` trait, typed
+  `InputData` constructors (`from_counts` / `from_transmission`),
+  `UnifiedFitConfig`, and the `fit_spectrum_typed` / `spatial_map_typed` entry
+  points (Python + Rust)
+- True multi-level Breit-Wigner (MLBW) with a coherent U-matrix, replacing the
+  prior SLBW-dispatch approximation
+- SAMMY-style normalization and background fitting for transmission, plus a
+  KL-native background model for counts data
+- Counts + KL temperature fitting with analytical Doppler temperature derivatives
+- Unresolved-resonance region: LFW=1 (energy-dependent fission widths) and all
+  five ENDF interpolation laws (INT=1..5)
+- Energy calibration (`calibrate_energy`) with resolution broadening
+- Constrained isotope-group fitting (core, GUI, and a tutorial notebook)
+- Analytical Jacobian for the Poisson solver (incl. a temperature derivative)
+
+### Changed
+
+- Consolidated the fitting stack on a single optimizer and API: removed the
+  external L-BFGS-B solver and the legacy pre-typed fitting/spatial API (the
+  Poisson/KL path now uses an analytic Gauss-Newton step with an internal
+  finite-difference L-BFGS fallback)
+- ROI spectrum averaging now uses inverse-variance weighting instead of an
+  arithmetic mean
+- `spatial_map` / `sparse_reconstruct` `n_total` now count *attempted* pixels,
+  not only successes
+- Wrapped large shared buffers (`sample_data`, `open_beam_data`,
+  `spectrum_values`) in `Arc` to avoid per-pixel clones (#374)
+- Project files now persist normalized uncertainty, dead-pixel masks, and the
+  anorm / background maps
+
+### Fixed
+
+- RML phase-convention correction (+ documented SAMMY truth sources); MLBW phase
+  convention + total cross-section regression
+- JENDL-5 Eu-151/153 parse failure: deduplicated URR energy grid (#402, #411)
+- Detectability SNR computation and resolution-grid handling
+- GUI ENDF-fetch defects and chip layout (#403, #410)
+- Data-integrity hardening: reject synthetic energy axes, count load errors,
+  eliminate silent pixel drops
+
+### Project
+
+- Added `CITATION.cff`, `CONTRIBUTING.md`, `CHANGELOG.md`, a Code of Conduct, and
+  a Zenodo DOI badge
+
+## [0.1.5] - 2026-03-11
 
 ### Fixed
 - Switched HTTP backend from `native-tls` to `rustls-tls` to eliminate
@@ -29,7 +128,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Fixed PyPI sdist LICENSE file path
 - Built Python wheels for all supported versions (3.10-3.13) on all platforms
 
-## [0.1.0] - 2025-03-10
+## [0.1.0] - 2026-03-11
 
 ### Added
 
@@ -90,5 +189,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Documentation site: mdBook user guide + rustdoc API reference on GitHub Pages
 - SAMMY validation suite: 43 test cases validated against SAMMY reference code
 
+[Unreleased]: https://github.com/ornlneutronimaging/NEREIDS/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/ornlneutronimaging/NEREIDS/compare/v0.1.7...v0.1.8
+[0.1.7]: https://github.com/ornlneutronimaging/NEREIDS/compare/v0.1.6...v0.1.7
+[0.1.6]: https://github.com/ornlneutronimaging/NEREIDS/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/ornlneutronimaging/NEREIDS/compare/v0.1.0...v0.1.5
 [0.1.0]: https://github.com/ornlneutronimaging/NEREIDS/releases/tag/v0.1.0
