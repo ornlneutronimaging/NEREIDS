@@ -11,7 +11,10 @@
 #   3. pyproject.toml  (Python bindings)
 #   4. apps/gui/pyproject.toml  (GUI wheel)
 #   5. homebrew/nereids.rb  (local template)
-#   6. Cargo.lock  (via cargo update --workspace)
+#   6. pyproject.toml  — nereids-gui optional-dependency pin
+#   7. CITATION.cff  — version + date-released
+#   8. CHANGELOG.md  — roll [Unreleased] → new dated section + link-refs
+#   9. Cargo.lock  (via cargo update --workspace)
 #
 # The script does NOT touch:
 #   - Test fixtures with hardcoded versions (those are test data)
@@ -21,6 +24,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+REPO_URL="https://github.com/ornlneutronimaging/NEREIDS"
+RELEASE_DATE="$(date +%F)" # YYYY-MM-DD; portable on BSD + GNU date
 
 # --- Parse arguments ---
 NEW_VERSION=""
@@ -85,6 +90,43 @@ apply_sed() {
     echo "  updated: $file"
 }
 
+# --- Helper: roll the CHANGELOG [Unreleased] section to the new version ---
+# Freezes the curated `## [Unreleased]` notes into a dated `## [NEW]` section
+# (Keep a Changelog workflow) and fixes the link-reference definitions.
+# Guarded: only touches a well-formed file, so it can never corrupt a
+# hand-maintained CHANGELOG. awk (not sed) because inserting lines portably
+# is awkward in sed — `\n` in a replacement is a GNU-only extension.
+roll_changelog() {
+    local file="$1"
+    if [ ! -f "$file" ] \
+        || ! grep -qE '^## \[Unreleased\]$' "$file" \
+        || ! grep -qE "^\[Unreleased\]: .*compare/v${CURRENT_VERSION}\.\.\.HEAD$" "$file"; then
+        echo "  skipped: $file ([Unreleased] section not in expected shape — roll manually)"
+        return
+    fi
+    if $DRY_RUN; then
+        echo "  would update: $file (roll [Unreleased] → $NEW_VERSION)"
+        return
+    fi
+    local tmp
+    tmp="$(mktemp)"
+    awk -v cur="$CURRENT_VERSION" -v new="$NEW_VERSION" -v date="$RELEASE_DATE" -v url="$REPO_URL" '
+        /^## \[Unreleased\]$/ {
+            print
+            print ""
+            print "## [" new "] - " date
+            next
+        }
+        /^\[Unreleased\]: / {
+            print "[Unreleased]: " url "/compare/v" new "...HEAD"
+            print "[" new "]: " url "/compare/v" cur "...v" new
+            next
+        }
+        { print }
+    ' "$file" >"$tmp" && mv "$tmp" "$file"
+    echo "  updated: $file (rolled [Unreleased] → $NEW_VERSION)"
+}
+
 # 1. Cargo.toml — workspace.package version
 #    This is the only bare `version = "X.Y.Z"` line (deps have `, path =` after)
 apply_sed "$REPO_ROOT/Cargo.toml" \
@@ -111,7 +153,18 @@ apply_sed "$REPO_ROOT/homebrew/nereids.rb" \
 apply_sed "$REPO_ROOT/pyproject.toml" \
     "s/nereids-gui==$CURRENT_VERSION/nereids-gui==$NEW_VERSION/"
 
-# 7. Cargo.lock — regenerate from updated Cargo.toml
+# 7. CITATION.cff — version + date-released
+#    `^version:` is anchored so it never matches the `cff-version:` line.
+#    The date-released line is updated in place; harmless no-op if absent.
+apply_sed "$REPO_ROOT/CITATION.cff" \
+    "s/^version: $CURRENT_VERSION$/version: $NEW_VERSION/"
+apply_sed "$REPO_ROOT/CITATION.cff" \
+    "s/^date-released:.*/date-released: $RELEASE_DATE/"
+
+# 8. CHANGELOG.md — roll [Unreleased] to the new dated version + link-refs
+roll_changelog "$REPO_ROOT/CHANGELOG.md"
+
+# 9. Cargo.lock — regenerate from updated Cargo.toml
 if ! $DRY_RUN; then
     echo "  updating Cargo.lock..."
     (cd "$REPO_ROOT" && cargo update --workspace 2>/dev/null)
