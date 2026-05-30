@@ -64,6 +64,12 @@ if [ -z "$CURRENT_VERSION" ]; then
     exit 1
 fi
 
+# Regex-safe form of the current version for sed/grep PATTERN contexts: dots are
+# regex any-char, so escape them (e.g. a pre-release like 0.2.0-rc.1 then matches
+# literally, never an unintended 0x2x0-rcx1). NEW_VERSION needs no such form — it
+# only ever appears on sed replacement sides or as literal awk string concatenation.
+CURRENT_RE="${CURRENT_VERSION//./\\.}"
+
 if [ "$CURRENT_VERSION" = "$NEW_VERSION" ]; then
     echo "Already at version $NEW_VERSION — nothing to do."
     exit 0
@@ -75,6 +81,10 @@ if $DRY_RUN; then
 fi
 
 # --- Helper: apply sed in-place (macOS + Linux compatible) ---
+# Reports "unchanged" when the pattern matched nothing, rather than a misleading
+# "updated" — a silent no-op on release metadata (a drifted version-line format)
+# would otherwise look successful. Not a hard error: some calls (CITATION.cff
+# date-released when absent) are intentional no-ops.
 apply_sed() {
     local file="$1"
     local pattern="$2"
@@ -82,12 +92,18 @@ apply_sed() {
         echo "  would update: $file"
         return
     fi
+    local before
+    before="$(cat "$file")"
     if [[ "$OSTYPE" == darwin* ]]; then
         sed -i '' "$pattern" "$file"
     else
         sed -i "$pattern" "$file"
     fi
-    echo "  updated: $file"
+    if [ "$before" = "$(cat "$file")" ]; then
+        echo "  unchanged: $file (pattern not matched)"
+    else
+        echo "  updated: $file"
+    fi
 }
 
 # --- Helper: roll the CHANGELOG [Unreleased] section to the new version ---
@@ -98,10 +114,18 @@ apply_sed() {
 # is awkward in sed — `\n` in a replacement is a GNU-only extension.
 roll_changelog() {
     local file="$1"
-    if [ ! -f "$file" ] \
-        || ! grep -qE '^## \[Unreleased\]$' "$file" \
-        || ! grep -qE "^\[Unreleased\]: .*compare/v${CURRENT_VERSION}\.\.\.HEAD$" "$file"; then
-        echo "  skipped: $file ([Unreleased] section not in expected shape — roll manually)"
+    if [ ! -f "$file" ]; then
+        echo "  skipped: $file (not found)"
+        return
+    fi
+    # Require EXACTLY one '## [Unreleased]' heading and one matching link-ref.
+    # awk rewrites every match, so a malformed file with duplicates must be
+    # refused (not corrupted) — presence alone is not enough.
+    local n_head n_link
+    n_head=$(grep -cE '^## \[Unreleased\]$' "$file" || true)
+    n_link=$(grep -cE "^\[Unreleased\]: .*compare/v${CURRENT_RE}\.\.\.HEAD$" "$file" || true)
+    if [ "${n_head:-0}" -ne 1 ] || [ "${n_link:-0}" -ne 1 ]; then
+        echo "  skipped: $file (need exactly one '## [Unreleased]' heading and one matching '[Unreleased]:' link — roll manually)"
         return
     fi
     if $DRY_RUN; then
@@ -110,7 +134,7 @@ roll_changelog() {
     fi
     local tmp
     tmp="$(mktemp)"
-    awk -v cur="$CURRENT_VERSION" -v new="$NEW_VERSION" -v date="$RELEASE_DATE" -v url="$REPO_URL" '
+    if awk -v cur="$CURRENT_VERSION" -v new="$NEW_VERSION" -v date="$RELEASE_DATE" -v url="$REPO_URL" '
         /^## \[Unreleased\]$/ {
             print
             print ""
@@ -123,41 +147,47 @@ roll_changelog() {
             next
         }
         { print }
-    ' "$file" >"$tmp" && mv "$tmp" "$file"
-    echo "  updated: $file (rolled [Unreleased] → $NEW_VERSION)"
+    ' "$file" >"$tmp"; then
+        mv "$tmp" "$file"
+        echo "  updated: $file (rolled [Unreleased] → $NEW_VERSION)"
+    else
+        rm -f "$tmp"
+        echo "  ERROR: failed to roll $file" >&2
+        return 1
+    fi
 }
 
 # 1. Cargo.toml — workspace.package version
 #    This is the only bare `version = "X.Y.Z"` line (deps have `, path =` after)
 apply_sed "$REPO_ROOT/Cargo.toml" \
-    "s/^version = \"$CURRENT_VERSION\"$/version = \"$NEW_VERSION\"/"
+    "s/^version = \"$CURRENT_RE\"$/version = \"$NEW_VERSION\"/"
 
 # 2. Cargo.toml — workspace.dependencies internal crate versions
 #    These lines look like: endf-mat = { version = "0.1.0", path = "..." }
 apply_sed "$REPO_ROOT/Cargo.toml" \
-    "s/version = \"$CURRENT_VERSION\", path =/version = \"$NEW_VERSION\", path =/g"
+    "s/version = \"$CURRENT_RE\", path =/version = \"$NEW_VERSION\", path =/g"
 
 # 3. pyproject.toml (Python bindings)
 apply_sed "$REPO_ROOT/pyproject.toml" \
-    "s/^version = \"$CURRENT_VERSION\"/version = \"$NEW_VERSION\"/"
+    "s/^version = \"$CURRENT_RE\"/version = \"$NEW_VERSION\"/"
 
 # 4. apps/gui/pyproject.toml (GUI wheel)
 apply_sed "$REPO_ROOT/apps/gui/pyproject.toml" \
-    "s/^version = \"$CURRENT_VERSION\"/version = \"$NEW_VERSION\"/"
+    "s/^version = \"$CURRENT_RE\"/version = \"$NEW_VERSION\"/"
 
 # 5. homebrew/nereids.rb (local template)
 apply_sed "$REPO_ROOT/homebrew/nereids.rb" \
-    "s/version \"$CURRENT_VERSION\"/version \"$NEW_VERSION\"/"
+    "s/version \"$CURRENT_RE\"/version \"$NEW_VERSION\"/"
 
 # 6. pyproject.toml — gui optional dependency version
 apply_sed "$REPO_ROOT/pyproject.toml" \
-    "s/nereids-gui==$CURRENT_VERSION/nereids-gui==$NEW_VERSION/"
+    "s/nereids-gui==$CURRENT_RE/nereids-gui==$NEW_VERSION/"
 
 # 7. CITATION.cff — version + date-released
 #    `^version:` is anchored so it never matches the `cff-version:` line.
 #    The date-released line is updated in place; harmless no-op if absent.
 apply_sed "$REPO_ROOT/CITATION.cff" \
-    "s/^version: $CURRENT_VERSION$/version: $NEW_VERSION/"
+    "s/^version: $CURRENT_RE$/version: $NEW_VERSION/"
 apply_sed "$REPO_ROOT/CITATION.cff" \
     "s/^date-released:.*/date-released: $RELEASE_DATE/"
 
