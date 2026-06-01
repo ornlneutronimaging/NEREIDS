@@ -403,9 +403,10 @@ impl CubeDomain {
 /// Iterates in memory order — energy plane `e` outer (a contiguous `h × w`
 /// block in the `(n_energies, height, width)` input layout), live pixels
 /// inner — and short-circuits on the first bad value.  When `active_mask` is
-/// `Some`, bins outside the user's `fit_energy_range` are skipped: those bins
-/// are excluded from the fit (both the LM core and the joint-Poisson deviance
-/// skip them) so their values are irrelevant.  Pass `None` to check all bins.
+/// `Some` (the transmission / uncertainty cubes), bins outside the user's
+/// `fit_energy_range` are skipped: the LM core excludes them from the fit, so
+/// a non-finite value there is irrelevant.  The raw-count cubes pass `None` to
+/// check every bin (see [`validate_spatial_data_values`] for the rationale).
 fn check_cube(
     cube: &ArrayView3<'_, f64>,
     field: &'static str,
@@ -1300,6 +1301,19 @@ pub fn spatial_map_typed(
             }
             for v in &mut flux {
                 *v /= n_live;
+            }
+            // Each open-beam bin is individually finite (validated above),
+            // but summing many large finite values can still overflow to
+            // ±inf.  Surface that as the same up-front `InvalidParameter`
+            // rather than letting a non-finite averaged flux degrade
+            // silently into all-NaN pixels downstream.
+            if let Some(e) = flux.iter().position(|v| !v.is_finite()) {
+                return Err(PipelineError::InvalidParameter(format!(
+                    "spatially-averaged open-beam flux is non-finite at energy \
+                     bin e={e} (got {}); summed open-beam counts overflowed. \
+                     Check the open-beam cube magnitude.",
+                    flux[e],
+                )));
             }
         }
         Some(flux)
@@ -3927,5 +3941,38 @@ mod tests {
         let result = spatial_map_typed(&input, &config, None, None, None)
             .expect("zero counts / zero open-beam are legitimate and must not be rejected");
         assert_eq!(result.n_total, 16);
+    }
+
+    #[test]
+    fn test_spatial_rejects_open_beam_flux_overflow() {
+        // Each open-beam bin is individually finite (passes the up-front
+        // FiniteNonNegative check), but summing `f64::MAX` across live pixels
+        // overflows the spatially-averaged flux to +inf.  That must surface as
+        // an up-front `InvalidParameter` rather than a silently all-NaN map
+        // (the averaged flux would otherwise fail inside each per-pixel fit and
+        // be swallowed as `n_failed`).
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        let (sample, mut ob) = synthetic_4x4_counts(&data, 0.0005, &energies, 1000.0);
+        for y in 0..4 {
+            for x in 0..4 {
+                ob[[5, y, x]] = f64::MAX;
+            }
+        }
+        let config = kl_counts_config(energies, data);
+        let input = InputData3D::Counts {
+            sample_counts: sample.view(),
+            open_beam_counts: ob.view(),
+        };
+        let err = spatial_map_typed(&input, &config, None, None, None)
+            .expect_err("an overflowing averaged open-beam flux must be rejected up-front");
+        assert!(
+            matches!(err, PipelineError::InvalidParameter(_)),
+            "got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("averaged open-beam flux"),
+            "error must name the averaged-flux overflow, got: {err}"
+        );
     }
 }
