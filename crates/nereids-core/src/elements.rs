@@ -134,6 +134,31 @@ mod tests {
     }
 
     #[test]
+    fn prop_za_roundtrip_over_accepted_domain() {
+        // Property: for every isotope `Isotope::new` accepts, the ZA
+        // encode→decode round-trip is lossless:
+        //     isotope_from_za(za_from_isotope(iso)) == iso
+        //
+        // This holds precisely because `Isotope::new` now rejects A >= 1000
+        // (which would carry into the Z field of `Z×1000 + A`). Exhaustively
+        // sweep the accepted domain (Z in 0..=118, A in 1..=999, Z <= A) so a
+        // future relaxation of the A bound breaks this test immediately.
+        for z in 0u32..=118 {
+            for a in 1u32..=999 {
+                let Ok(iso) = Isotope::new(z, a) else {
+                    // Skip pairs `new` rejects (e.g. Z > A); the property is
+                    // only claimed over the *accepted* domain.
+                    continue;
+                };
+                let za = za_from_isotope(&iso);
+                let back = isotope_from_za(za)
+                    .unwrap_or_else(|e| panic!("ZA {za} failed to decode for {iso}: {e}"));
+                assert_eq!(back, iso, "round-trip mismatch at Z={z}, A={a} (ZA={za})");
+            }
+        }
+    }
+
+    #[test]
     fn test_isotope_from_za_natural_element_returns_error() {
         // ZA=26000 → Z=26, A=0 (natural iron). A==0 fails validation.
         let result = isotope_from_za(26000);
