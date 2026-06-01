@@ -1,9 +1,9 @@
 # Release Pipeline
 
-Cut a new NEREIDS release. The work is mostly bumping versions in 4 files,
-tagging, and pushing — the actual building / publishing / homebrew update
-happens on CI when the tag arrives. This skill is the wrapper that gets
-the bumps right and verifies CI succeeded.
+Cut a new NEREIDS release. The work is mostly bumping versions across the
+workspace, rolling the changelog, tagging, and pushing — the actual building /
+publishing / homebrew update happens on CI when the tag arrives. This skill is
+the wrapper that gets the bumps right and verifies CI succeeded.
 
 ## Arguments
 
@@ -31,7 +31,9 @@ the bumps right and verifies CI succeeded.
 
 ## Step 2: Bump versions
 
-Five files (treat as a single atomic edit; do not commit each separately):
+Six files (treat as a single atomic edit; do not commit each separately).
+`pixi run bump-version <NEW>` (`scripts/bump-version.sh`) automates all six, plus
+the Cargo.lock refresh (Step 3) — so seven files are staged together in Step 5:
 
 - [Cargo.toml](Cargo.toml)
   - `workspace.package.version = "<NEW>"` (around L16)
@@ -48,9 +50,18 @@ Five files (treat as a single atomic edit; do not commit each separately):
     the CI's `update-homebrew` job substitutes into the *separate*
     `homebrew-nereids` tap repo (`Casks/nereids.rb`). Bumping the in-repo
     template anyway keeps it as a useful reference.
+- [CITATION.cff](CITATION.cff)
+  - `version: <NEW>` (around L6) and `date-released: <today>` (L7) — both
+    stamped by the bump script (the date line is updated in place; it must
+    already exist, which it does as of v0.1.8)
+- [CHANGELOG.md](CHANGELOG.md)
+  - the bump script rolls `## [Unreleased]` into a dated `## [<NEW>]` section
+    and updates the `compare/...` link-refs. Curate the release notes *under
+    `[Unreleased]`* **before** running the bump so they land in the new section.
 
-Reference: see commit `973bdf2` (Release v0.1.7) for the exact diff
-shape — five files, ~26 line changes total.
+Reference: commit `973bdf2` (Release v0.1.7) shows the historical five-file
+version-bump diff shape; releases now also touch `CITATION.cff` +
+`CHANGELOG.md` (~7 files total).
 
 **Skip in the bump** anything matching `0.1.<old>` in code/docs that isn't
 a version declaration (e.g. example notebooks may have hardcoded version
@@ -127,7 +138,7 @@ runs — `rm -rf target/wheels` at the top is the cleaner reset path.
 ## Step 5: Commit + tag
 
 ```
-git add Cargo.toml Cargo.lock pyproject.toml apps/gui/pyproject.toml homebrew/nereids.rb
+git add Cargo.toml Cargo.lock pyproject.toml apps/gui/pyproject.toml homebrew/nereids.rb CITATION.cff CHANGELOG.md
 git commit -S -m "Release v<NEW>"
 git tag -s v<NEW> -m "Release v<NEW>"
 ```
