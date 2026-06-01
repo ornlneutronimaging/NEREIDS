@@ -31,8 +31,9 @@ the wrapper that gets the bumps right and verifies CI succeeded.
 
 ## Step 2: Bump versions
 
-Seven files (treat as a single atomic edit; do not commit each separately).
-`pixi run bump-version <NEW>` (`scripts/bump-version.sh`) automates all of them:
+Six files (treat as a single atomic edit; do not commit each separately).
+`pixi run bump-version <NEW>` (`scripts/bump-version.sh`) automates all six, plus
+the Cargo.lock refresh (Step 3) — so seven files are staged together in Step 5:
 
 - [Cargo.toml](Cargo.toml)
   - `workspace.package.version = "<NEW>"` (around L16)

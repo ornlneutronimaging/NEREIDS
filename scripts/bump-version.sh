@@ -137,7 +137,10 @@ roll_changelog() {
         return
     fi
     local tmp
-    tmp="$(mktemp)"
+    # Explicit path template (ends in X's): works identically on GNU and BSD
+    # mktemp. (Bare `mktemp` also works on both, but the template form is
+    # unambiguous and matches the pattern used elsewhere in .claude/skills.)
+    tmp="$(mktemp "${TMPDIR:-/tmp}/bump-version-changelog.XXXXXX")"
     if awk -v cur="$CURRENT_VERSION" -v new="$NEW_VERSION" -v date="$RELEASE_DATE" -v url="$REPO_URL" '
         /^## \[Unreleased\]$/ {
             print
@@ -189,7 +192,9 @@ apply_sed "$REPO_ROOT/pyproject.toml" \
 
 # 7. CITATION.cff — version + date-released
 #    `^version:` is anchored so it never matches the `cff-version:` line.
-#    The date-released line is updated in place; harmless no-op if absent.
+#    The date-released line is rewritten in place and must already exist (it
+#    does as of v0.1.8). If the field is absent the sed is a silent no-op — the
+#    script does NOT insert it, so the date simply would not be stamped.
 apply_sed "$REPO_ROOT/CITATION.cff" \
     "s/^version: $CURRENT_RE$/version: $NEW_VERSION/"
 apply_sed "$REPO_ROOT/CITATION.cff" \
