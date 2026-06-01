@@ -362,6 +362,19 @@ pub fn load_nexus_histogram_with_mode(
                 .into(),
         ));
     }
+    // Mirror the rotation-angle guard for the sibling y / x / tof axes
+    // (counts layout is [rot_angle, y, x, tof]).  A zero-sized y, x, or tof
+    // axis is just as degenerate: it would produce an empty detector plane or
+    // an empty energy series that looks like a valid-but-empty measurement
+    // downstream instead of a clear load error.
+    for (axis, name) in [(1usize, "y"), (2, "x"), (3, "tof")] {
+        if shape[axis] == 0 {
+            return Err(IoError::InvalidParameter(format!(
+                "NeXus histogram has a zero-sized {name} axis; \
+                 /entry/histogram/counts axis {axis} must be >= 1 (shape {shape:?})"
+            )));
+        }
+    }
     match mode {
         MultiAngleMode::Error if n_rot > 1 => {
             return Err(IoError::InvalidParameter(format!(
@@ -447,8 +460,9 @@ pub fn load_nexus_histogram_with_mode(
     let flight_path_m = read_f64_attr(&hist_group, "flight_path_m")
         .or_else(|| read_f64_attr(&entry, "flight_path_m"));
 
-    // Read dead pixel mask
-    let dead_pixels = read_dead_pixel_mask(&entry);
+    // Read dead pixel mask, validated against the detector's spatial dims.
+    // counts_f64 is [tof, y, x], so (height, width) = (shape[1], shape[2]).
+    let dead_pixels = read_dead_pixel_mask(&entry, (counts_f64.shape()[1], counts_f64.shape()[2]))?;
 
     Ok(NexusHistogramData {
         counts: counts_f64,
@@ -630,8 +644,8 @@ pub fn load_nexus_events(
     let flight_path_m = read_f64_attr(&neutrons, "flight_path_m")
         .or_else(|| read_f64_attr(&entry, "flight_path_m"));
 
-    // Read dead pixel mask
-    let dead_pixels = read_dead_pixel_mask(&entry);
+    // Read dead pixel mask, validated against the requested detector dims.
+    let dead_pixels = read_dead_pixel_mask(&entry, (params.height, params.width))?;
 
     debug_assert_eq!(
         total,
@@ -740,7 +754,26 @@ fn read_tof_axis(hist_group: &hdf5::Group) -> Result<Vec<f64>, IoError> {
     let units = read_string_attr(&tof_ds, "units")?;
     let scale = tof_scale_to_us(units.as_deref())?;
 
-    Ok(raw.iter().map(|&v| v * scale).collect())
+    let edges: Vec<f64> = raw.iter().map(|&v| v * scale).collect();
+
+    // Validate the TOF axis is strictly monotonic and positive, mirroring the
+    // spectrum-file load path (`guided::load` runs `validate_monotonic` on the
+    // parsed spectrum before use).  A non-increasing, NaN, or non-positive TOF
+    // edge produces a `tof_to_energy` NaN / negative-energy downstream; reject
+    // it here at the I/O boundary instead.  Run `validate_monotonic` first — it
+    // rejects equal / decreasing / NaN, so afterwards every edge is finite and
+    // strictly increasing, and a single positivity check on the first edge
+    // proves the whole axis is positive.
+    crate::spectrum::validate_monotonic(&edges)?;
+    if let Some(&first) = edges.first()
+        && first <= 0.0
+    {
+        return Err(IoError::InvalidParameter(format!(
+            "NeXus TOF axis must be positive, but first edge is {first}"
+        )));
+    }
+
+    Ok(edges)
 }
 
 /// Read a scalar f64 attribute from a group.
@@ -751,12 +784,35 @@ fn read_f64_attr(group: &hdf5::Group, name: &str) -> Option<f64> {
         .and_then(|a| a.read_scalar::<f64>().ok())
 }
 
-/// Read dead pixel mask from `/entry/pixel_masks/dead`.
-fn read_dead_pixel_mask(entry: &hdf5::Group) -> Option<ndarray::Array2<bool>> {
-    let masks = entry.group("pixel_masks").ok()?;
-    let dead_ds = masks.dataset("dead").ok()?;
-    let dead_u8: ndarray::Array2<u8> = dead_ds.read().ok()?;
-    Some(dead_u8.mapv(|v| v != 0))
+/// Read the dead-pixel mask from `/entry/pixel_masks/dead`, validating its
+/// shape against the detector's `(height, width)`.
+///
+/// Returns `Ok(None)` when the mask group / dataset is simply absent (a file
+/// without a dead-pixel mask is valid).  Returns `Err(ShapeMismatch)` when the
+/// mask is present but does not match the counts' spatial dimensions: applying
+/// a mismatched mask would silently mask the wrong pixels (or be dropped
+/// entirely), so the mismatch is surfaced at the I/O boundary instead.
+fn read_dead_pixel_mask(
+    entry: &hdf5::Group,
+    expected_hw: (usize, usize),
+) -> Result<Option<ndarray::Array2<bool>>, IoError> {
+    let Ok(masks) = entry.group("pixel_masks") else {
+        return Ok(None);
+    };
+    let Ok(dead_ds) = masks.dataset("dead") else {
+        return Ok(None);
+    };
+    let dead_u8: ndarray::Array2<u8> = dead_ds.read().map_err(|e| {
+        IoError::InvalidParameter(format!("Failed to read /entry/pixel_masks/dead: {e}"))
+    })?;
+    let (eh, ew) = expected_hw;
+    if dead_u8.dim() != (eh, ew) {
+        return Err(IoError::ShapeMismatch(format!(
+            "dead-pixel mask shape {:?} != detector spatial dimensions ({eh}, {ew})",
+            dead_u8.dim(),
+        )));
+    }
+    Ok(Some(dead_u8.mapv(|v| v != 0)))
 }
 
 /// List the group/dataset tree structure of an HDF5 file.
@@ -1066,6 +1122,126 @@ mod tests {
                 "mode {mode:?} zero-angle rejection should name the axis, got: {msg}"
             );
         }
+    }
+
+    /// A zero-sized y / x / tof axis is just as degenerate as a zero-angle
+    /// axis and must be rejected the same way, rather than producing an empty
+    /// detector plane / energy series downstream.
+    #[test]
+    fn test_load_nexus_histogram_zero_sibling_axes_rejected() {
+        for (shape, axis_name) in [
+            ([1usize, 0, 3, 2], "y"),
+            ([1, 2, 0, 2], "x"),
+            ([1, 2, 3, 0], "tof"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(format!("zero_{axis_name}.h5"));
+            let counts: Vec<u64> = Vec::new(); // any axis is 0 → empty cube
+            let tof_ns = vec![1000.0, 2000.0, 3000.0];
+            create_test_histogram(&path, &counts, shape, &tof_ns, None);
+
+            let err = load_nexus_histogram(&path).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!("zero-sized {axis_name} axis")),
+                "axis {axis_name} ({shape:?}) should be rejected by name, got: {msg}"
+            );
+        }
+    }
+
+    /// The NeXus TOF axis must be strictly monotonic and positive, mirroring
+    /// the spectrum-file path.  A non-increasing or non-positive axis would
+    /// silently feed `tof_to_energy` a bad value downstream.
+    #[test]
+    fn test_load_nexus_histogram_rejects_non_monotonic_tof() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nonmono_tof.h5");
+        // 1 angle, 1×1 spatial, 2 TOF bins → 3 edges, but they decrease.
+        let counts = vec![1u64, 2u64];
+        let tof_ns = vec![3000.0, 2000.0, 1000.0];
+        create_test_histogram(&path, &counts, [1, 1, 1, 2], &tof_ns, None);
+
+        let err = load_nexus_histogram(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("strictly increasing"),
+            "non-monotonic TOF should be rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_load_nexus_histogram_rejects_non_positive_tof() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nonpos_tof.h5");
+        // First edge is zero → non-positive TOF axis.
+        let counts = vec![1u64, 2u64];
+        let tof_ns = vec![0.0, 1000.0, 2000.0];
+        create_test_histogram(&path, &counts, [1, 1, 1, 2], &tof_ns, None);
+
+        let err = load_nexus_histogram(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("must be positive"),
+            "non-positive TOF should be rejected, got: {err}"
+        );
+    }
+
+    /// Create a histogram fixture that also carries a `/entry/pixel_masks/dead`
+    /// mask of the given shape, for dead-mask shape-validation tests.
+    fn create_test_histogram_with_dead_mask(
+        path: &Path,
+        counts: &[u64],
+        shape: [usize; 4],
+        tof_ns: &[f64],
+        dead: &[u8],
+        dead_shape: [usize; 2],
+    ) {
+        create_test_histogram(path, counts, shape, tof_ns, None);
+        let file = hdf5::File::append(path).expect("reopen test file");
+        let entry = file.group("entry").expect("entry");
+        let masks = entry.create_group("pixel_masks").expect("pixel_masks");
+        masks
+            .new_dataset::<u8>()
+            .shape(dead_shape)
+            .create("dead")
+            .expect("create dead")
+            .write_raw(dead)
+            .expect("write dead");
+    }
+
+    /// A dead-pixel mask whose shape does not match the detector's spatial
+    /// dimensions must be rejected — applying it would mask the wrong pixels.
+    #[test]
+    fn test_load_nexus_histogram_rejects_mismatched_dead_mask() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad_mask.h5");
+        // counts shape [1, 2, 3, 2] → detector is 2×3; write a 5×5 mask.
+        let counts = vec![1u64; 2 * 3 * 2];
+        let tof_ns = vec![1000.0, 2000.0, 3000.0];
+        let dead = vec![0u8; 25];
+        create_test_histogram_with_dead_mask(&path, &counts, [1, 2, 3, 2], &tof_ns, &dead, [5, 5]);
+
+        let err = load_nexus_histogram(&path).unwrap_err();
+        assert!(
+            matches!(err, IoError::ShapeMismatch(_)),
+            "expected ShapeMismatch, got {err:?}"
+        );
+        assert!(err.to_string().contains("dead-pixel mask shape"));
+    }
+
+    /// A correctly-shaped dead-pixel mask still loads (no false rejection).
+    #[test]
+    fn test_load_nexus_histogram_accepts_matching_dead_mask() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ok_mask.h5");
+        let counts = vec![1u64; 2 * 3 * 2];
+        let tof_ns = vec![1000.0, 2000.0, 3000.0];
+        // 2×3 mask matching the detector; mark one pixel (row 0, col 1) dead.
+        let dead = vec![0u8, 1, 0, 0, 0, 0];
+        create_test_histogram_with_dead_mask(&path, &counts, [1, 2, 3, 2], &tof_ns, &dead, [2, 3]);
+
+        let data = load_nexus_histogram(&path).expect("matching mask should load");
+        let mask = data.dead_pixels.expect("mask present");
+        assert_eq!(mask.dim(), (2, 3));
+        assert!(mask[[0, 1]]);
     }
 
     /// Codex review: `MultiAngleMode::Error` must reject multi-angle
