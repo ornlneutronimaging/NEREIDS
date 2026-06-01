@@ -175,17 +175,23 @@ After all fix agents complete:
 
 ## Step 5: Iteration Decision
 
-After pushing, decide:
+After pushing, decide. **"Blocking findings" this round** =
+`counts.verifiedP0 + counts.verifiedP1 + counts.needsVerification` — i.e. every
+VERIFIED **and** NEEDS-VERIFICATION P0/P1. NEEDS-VERIFICATION findings (single
+LLM family / split vote / codex unavailable) BLOCK exactly like VERIFIED ones;
+they must be fixed or **explicitly user-dismissed** before push. (P2s never block.)
 
-- **Zero P0s and zero P1s this round?** → Phase A complete. Proceed to Step 6 (Phase B).
-- **P0s/P1s found and fixed, round < 4?** → Loop back to Step 1 for round N+1.
+- **Zero blocking findings this round?** → Phase A complete. Proceed to Step 6 (Phase B).
+- **Blocking findings found and fixed, round < 4?** → Loop back to Step 1 for round N+1.
   Pass `priorFindings` = this round's findings (each as
   `{branch, file, line, title}`) so `review-core` tags **RECURRING**.
-- **Round == 4 and P0s/P1s still found?** → STOP. Report: "Iteration limit
+- **Round == 4 and blocking findings remain?** → STOP. Report: "Iteration limit
   reached (4 rounds). P0s/P1s persist — escalating to human."
 
-(P0 is the must-fix tier the `dual-family-review` engine assigns; the gate must
-cover P0+P1, not P1 alone — a verified P0 with zero P1s must NOT pass.)
+Why bind to NEEDS-VERIFICATION: P0 is the engine's must-fix tier, and in
+`--skip-codex` single-family mode every P0/P1 lands in NEEDS-VERIFICATION
+(verifiedP0/verifiedP1 are 0). Gating on verified counts alone would let
+un-cross-verified P0s pass.
 
 **Re-run between rounds, not just once.** File overlap can appear mid-pipeline
 (a fix lands in a file another branch also touches); the fresh `mergeOrder`

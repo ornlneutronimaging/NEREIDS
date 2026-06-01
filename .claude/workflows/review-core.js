@@ -8,7 +8,7 @@ export const meta = {
     { title: 'Discover', detail: 'enumerate diverged branches, diffs, file-overlap, merge order' },
     { title: 'Find', detail: 'Claude + Codex finder per branch diff (dual-family-review engine)' },
     { title: 'Verify', detail: 'cross-LLM-family confirmation (dual-family-review engine)' },
-    { title: 'Consolidate', detail: 'dedup, suggested disposition, RECURRING, merge order (deterministic JS)' },
+    { title: 'Consolidate', detail: 'suggested disposition, RECURRING tags, merge order (deterministic JS)' },
   ],
 }
 
@@ -85,11 +85,13 @@ function basename(f) {
 }
 // Slug a branch name into something safe for finding-ids and the engine's
 // `/tmp/bughunt-<slug>.prompt` codex temp path (branch names contain '/').
-// INJECTIVE: a short stable hash of the FULL name is appended so distinct
-// branches (e.g. `fix/foo-bar` vs `fix/foo/bar`) never collide to one key — a
-// collision would attach wrong crate metadata to one branch's findings and race
-// the two branches' codex temp files. djb2-style; deterministic (Date/random
-// are unavailable in workflow scripts).
+// COLLISION-RESISTANT: a short stable hash of the FULL name is appended so
+// distinct branches (e.g. `fix/foo-bar` vs `fix/foo/bar`) do not collide to one
+// key — a collision would attach wrong crate metadata to one branch's findings
+// and race the two branches' codex temp files. The 32-bit djb2 hash is not
+// provably injective (a hash CAN collide), but across the handful of branches in
+// a review batch the probability is negligible. Deterministic (Date/random are
+// unavailable in workflow scripts).
 function slug(b) {
   const s = String(b || '')
   const base = s.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'branch'
@@ -205,6 +207,20 @@ if (A.repoRoot) discover.repoRoot = A.repoRoot
 const sammyRoot = A.sammyRoot || discover.sammyRoot || ''
 const codexUsable = discover.codexAvailable && !SKIP_CODEX
 
+// Fail closed on a requested branch that discovery did not return (mistyped /
+// unresolvable ref, or a failed git command): a dropped EXPLICITLY-requested
+// branch must abort, not masquerade as "nothing to review". (Auto-discover
+// finding nothing is a valid no-op; an explicit request going missing is not.)
+if (BRANCHES) {
+  const found = new Set((discover.branches || []).map((b) => b.branch))
+  const missing = BRANCHES.filter((b) => !found.has(b))
+  if (missing.length) {
+    throw new Error(
+      `review-core: discovery did not return requested branch(es) [${missing.join(', ')}] vs base '${BASE}' — aborting rather than report a false all-clear. Check the branch name(s) and that '${BASE}' resolves.`,
+    )
+  }
+}
+
 // Only review branches that actually diverged from base (have new commits).
 const reviewable = (discover.branches || []).filter((b) => b.diverged && (b.changedFiles || []).length)
 log(
@@ -312,11 +328,13 @@ const perBranch = perTarget.map((r) => {
   const verified = (r.verified || []).map(tag)
   const verifiedP0 = verified.filter((f) => (f.verifierTier || f.tier) === 'P0')
   const verifiedP1 = verified.filter((f) => (f.verifierTier || f.tier) === 'P1')
-  // Cross-family-CONFIRMED findings the verifier downgraded to effective P2 are
-  // real defects; route them into the P2 disposition channel below so they are
-  // surfaced (with a disposition + their VERIFIED status) rather than dropped
-  // between the P0/P1 buckets and r.p2s (which holds only original-tier P2s).
-  const verifiedP2 = verified.filter((f) => (f.verifierTier || f.tier) === 'P2')
+  // Cross-family-CONFIRMED findings the verifier DOWNGRADED to effective P2
+  // (original tier P0/P1) are real defects; route them into the P2 disposition
+  // channel below so they are surfaced (with a disposition + their VERIFIED
+  // status) rather than dropped between the P0/P1 buckets and r.p2s. Restrict to
+  // GENUINELY-downgraded findings (verifierTier === 'P2' && tier !== 'P2'): a
+  // born-P2 finding is already in r.p2s, so matching it here would double-count it.
+  const verifiedP2 = verified.filter((f) => f.verifierTier === 'P2' && f.tier !== 'P2')
   const needsVerification = (r.needsVerification || []).map(tag)
   const refuted = (r.refuted || []).map(tag)
   const circular = r.circular || []
@@ -334,6 +352,12 @@ const perBranch = perTarget.map((r) => {
     return entry
   })
 
+  // Dedupe the recurring set by finding id: a verifier-downgraded P2 lives in
+  // both `verified` and the folded `p2s`, so a naive concat would count it twice.
+  const recurring = [
+    ...new Map([...verified, ...needsVerification, ...p2s].filter((f) => f.recurring).map((f) => [f.id, f])).values(),
+  ]
+
   return {
     branch,
     crates: meta.crates,
@@ -346,7 +370,7 @@ const perBranch = perTarget.map((r) => {
     refuted,
     p2s,
     circular,
-    recurring: [...verified, ...needsVerification, ...p2s].filter((f) => f.recurring),
+    recurring,
   }
 })
 
