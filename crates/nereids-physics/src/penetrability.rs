@@ -96,21 +96,49 @@ pub fn phase_shift(l: u32, rho: f64) -> f64 {
     let rho2 = rho * rho;
     match l {
         0 => rho,
-        1 => rho - rho.atan(),
-        2 => rho - (3.0 * rho / (3.0 - rho2)).atan(),
-        3 => {
-            let num = rho * (15.0 - rho2);
-            let den = 15.0 - 6.0 * rho2;
-            rho - (num / den).atan()
-        }
+        // For l = 1..=4 the phase is conceptually φ = ρ − atan(X/Y), but
+        // forming `ρ − (X/Y).atan()` directly introduces a spurious −π jump
+        // whenever the rational denominator Y crosses zero (the atan pole at
+        // X/Y → ±∞).  SAMMY's `Sinsix` (rml/mrml07.f:254-342) never forms that
+        // difference: it computes cos φ = (C·Y + S·X)/√G and sin φ =
+        // (S·Y − C·X)/√G with G = X² + Y², C = cos ρ, S = sin ρ, which are
+        // continuous through Y = 0.  Recovering φ = atan2(sin φ, cos φ) gives a
+        // pole-free phase that is identical (mod 2π) to ρ − atan(X/Y) away from
+        // the pole — the same continuous form the l > 4 path already uses.
+        // l=1: φ = ρ − atan(ρ), i.e. X = ρ, Y = 1 (SAMMY uses G = 1 + X²,
+        // Sinphi = (S − C·ρ)/√G, Cosphi = (C + S·ρ)/√G).  atan(ρ) has no pole,
+        // so l=1 was already continuous; routing it through the same helper
+        // keeps a single code path.
+        1 => phase_shift_rational(rho, rho, 1.0),
+        2 => phase_shift_rational(rho, 3.0 * rho, 3.0 - rho2),
+        3 => phase_shift_rational(rho, rho * (15.0 - rho2), 15.0 - 6.0 * rho2),
         4 => {
             let rho4 = rho2 * rho2;
-            let num = rho * (105.0 - 10.0 * rho2);
-            let den = 105.0 - 45.0 * rho2 + rho4;
-            rho - (num / den).atan()
+            phase_shift_rational(rho, rho * (105.0 - 10.0 * rho2), 105.0 - 45.0 * rho2 + rho4)
         }
         _ => phase_shift_general(l, rho),
     }
+}
+
+/// Continuous hard-sphere phase shift from the SAMMY `Sinsix` (X, Y) rational
+/// form, avoiding the −π jump of `ρ − atan(X/Y)` at the Y = 0 pole.
+///
+/// Given the orbital rational numerator `x` and denominator `y` (the SAMMY `X`
+/// and `Y` for this l), returns
+///   φ = atan2(S·Y − C·X,  C·Y + S·X),   S = sin ρ,  C = cos ρ,
+/// which equals ρ − atan(X/Y) modulo 2π but is continuous across Y = 0.
+///
+/// Because every consumer uses the phase only through π-invariant combinations
+/// (sin²φ, sin 2φ, |U|²), removing the −π jump leaves all cross-sections
+/// unchanged; it removes a discontinuity that would corrupt any future
+/// phase-sensitive observable (e.g. angular distributions).
+///
+/// Reference: SAMMY `rml/mrml07.f` `Sinsix` (lines 254-342) —
+/// `Cosphi = (C*Y+S*X)/√G`, `Sinphi = (S*Y-C*X)/√G`.
+#[inline]
+fn phase_shift_rational(rho: f64, x: f64, y: f64) -> f64 {
+    let (s, c) = rho.sin_cos();
+    (s * y - c * x).atan2(c * y + s * x)
 }
 
 /// Shift factor at imaginary channel argument S_l(iκ) for a closed channel.
@@ -488,5 +516,88 @@ mod tests {
             p_explicit,
             p_general
         );
+    }
+
+    // ── Fix #4: phase_shift continuity across the rational-form pole ──────────
+
+    /// The old one-argument `ρ − atan(X/Y)` form jumps by −π whenever the
+    /// rational denominator Y crosses zero.  The Sinsix `atan2` form must be
+    /// continuous there.  The poles are: l=2 at ρ=√3, l=3 at ρ=√2.5,
+    /// l=4 at ρ²=(45−√1605)/2 (≈1.572) and ρ²=(45+√1605)/2 (≈6.52).
+    #[test]
+    fn test_phase_shift_continuous_across_pole() {
+        // (l, ρ_pole) pairs.
+        let poles = [
+            (2u32, 3.0_f64.sqrt()),
+            (3u32, 2.5_f64.sqrt()),
+            (4u32, ((45.0 - 1605.0_f64.sqrt()) / 2.0).sqrt()),
+            (4u32, ((45.0 + 1605.0_f64.sqrt()) / 2.0).sqrt()),
+        ];
+        for (l, rho_pole) in poles {
+            let delta = 1e-6;
+            let below = phase_shift(l, rho_pole - delta);
+            let above = phase_shift(l, rho_pole + delta);
+            let jump = (above - below).abs();
+            // A continuous φ varies by O(delta) across the pole; the buggy
+            // form jumps by ≈ π.  Require the jump to be far below π.
+            assert!(
+                jump < 1e-3,
+                "phase_shift(l={l}) discontinuous at ρ={rho_pole}: \
+                 below={below}, above={above}, jump={jump} (expected ≈ 0, not ≈ π)"
+            );
+        }
+    }
+
+    /// The continuous Sinsix form must agree with the original
+    /// `ρ − atan(X/Y)` form modulo 2π everywhere away from the pole, so every
+    /// cross-section observable (which consumes φ only via sin²φ / sin2φ /
+    /// |U|²) is bit-for-bit unchanged.  We assert the π-invariant combinations
+    /// match the old closed form to round-off.
+    #[test]
+    fn test_phase_shift_matches_old_form_on_invariants() {
+        // Old (discontinuous) reference: ρ − atan(X/Y).
+        fn old_phase(l: u32, rho: f64) -> f64 {
+            let rho2 = rho * rho;
+            match l {
+                1 => rho - rho.atan(),
+                2 => rho - (3.0 * rho / (3.0 - rho2)).atan(),
+                3 => {
+                    let num = rho * (15.0 - rho2);
+                    let den = 15.0 - 6.0 * rho2;
+                    rho - (num / den).atan()
+                }
+                4 => {
+                    let rho4 = rho2 * rho2;
+                    let num = rho * (105.0 - 10.0 * rho2);
+                    let den = 105.0 - 45.0 * rho2 + rho4;
+                    rho - (num / den).atan()
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        for l in 1u32..=4 {
+            // Sample ρ across a range that brackets every pole, skipping a
+            // tiny neighbourhood of each pole (where the OLD form is ill-defined
+            // but the NEW form is fine).
+            let poles = [3.0_f64.sqrt(), 2.5_f64.sqrt(), 1.572, 6.52];
+            for i in 1..=800 {
+                let rho = i as f64 * 0.01; // 0.01 .. 8.0
+                if poles.iter().any(|&p| (rho - p).abs() < 5e-3) {
+                    continue;
+                }
+                let new = phase_shift(l, rho);
+                let old = old_phase(l, rho);
+                // π-invariant observables consumed downstream:
+                let d_sin2 = (new.sin().powi(2) - old.sin().powi(2)).abs();
+                let d_sin2ph = ((2.0 * new).sin() - (2.0 * old).sin()).abs();
+                let d_cos2ph = ((2.0 * new).cos() - (2.0 * old).cos()).abs();
+                assert!(
+                    d_sin2 < 1e-9 && d_sin2ph < 1e-9 && d_cos2ph < 1e-9,
+                    "l={l} ρ={rho}: new φ disagrees with old on invariants \
+                     (sin²Δ={d_sin2}, sin2φΔ={d_sin2ph}, cos2φΔ={d_cos2ph})"
+                );
+            }
+        }
     }
 }
