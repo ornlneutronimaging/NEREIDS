@@ -1302,11 +1302,11 @@ pub fn spatial_map_typed(
             for v in &mut flux {
                 *v /= n_live;
             }
-            // Each open-beam bin is individually finite (validated above),
-            // but summing many large finite values can still overflow to
-            // ±inf.  Surface that as the same up-front `InvalidParameter`
-            // rather than letting a non-finite averaged flux degrade
-            // silently into all-NaN pixels downstream.
+            // Each open-beam bin is individually finite and non-negative
+            // (validated above), but summing many large finite values can
+            // still overflow to +inf.  Surface that as the same up-front
+            // `InvalidParameter` rather than letting a non-finite averaged
+            // flux degrade silently into all-NaN pixels downstream.
             if let Some(e) = flux.iter().position(|v| !v.is_finite()) {
                 return Err(PipelineError::InvalidParameter(format!(
                     "spatially-averaged open-beam flux is non-finite at energy \
