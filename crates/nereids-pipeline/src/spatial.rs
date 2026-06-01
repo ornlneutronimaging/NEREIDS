@@ -746,6 +746,12 @@ pub fn spatial_map_typed(
     // counts-domain solver" diagnostic.
     validate_spatial_fit_preflight(input, config)?;
 
+    // Reject a malformed caller-supplied precomputed cross-section stack once,
+    // before the per-pixel rayon loop (and before the σ_eff group-collapse
+    // below, which indexes `xs[0]`).  A freshly-computed stack carries no
+    // `precomputed_cross_sections`, so this is a no-op on the common path.
+    crate::pipeline::validate_precomputed_cross_sections(config)?;
+
     // Collect live pixel coordinates
     let mut pixel_coords: Vec<(usize, usize)> = Vec::new();
     for y in 0..height {
@@ -1412,7 +1418,17 @@ pub fn spatial_map_typed(
         })
         .collect();
 
-    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) && results.is_empty() {
+    // If cancellation was requested at any point, return `Err(Cancelled)` —
+    // NOT a partial `Ok(SpatialResult)`. The rayon closure stops launching new
+    // pixel fits once `cancel` is set, so by the time we get here `results`
+    // holds only the pixels that finished before cancellation; every other
+    // pixel would be left as a NaN hole, indistinguishable from a genuinely
+    // failed fit. A non-GUI caller (e.g. the Python binding) has no other
+    // signal that the map is incomplete, so a partial map is silently wrong.
+    // The previous `&& results.is_empty()` guard only caught the rare case
+    // where cancellation beat *every* pixel; mid-run cancellation slipped
+    // through and produced a partial map.
+    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
         return Err(PipelineError::Cancelled);
     }
 
@@ -1594,11 +1610,14 @@ mod tests {
         synthetic_single_resonance, u238_single_resonance,
     };
 
-    /// Build a 4x4 synthetic transmission stack from known density.
-    fn synthetic_4x4_transmission(
+    /// Build a synthetic transmission stack of shape `(n_e, height, width)`
+    /// where every pixel holds the same spectrum for a known density.
+    fn synthetic_grid_transmission(
         res_data: &nereids_endf::resonance::ResonanceData,
         true_density: f64,
         energies: &[f64],
+        height: usize,
+        width: usize,
     ) -> (Array3<f64>, Array3<f64>) {
         let n_e = energies.len();
         let xs = nereids_physics::transmission::broadened_cross_sections(
@@ -1621,11 +1640,10 @@ mod tests {
         let t_1d = model.evaluate(&[true_density]).unwrap();
         let sigma_1d: Vec<f64> = t_1d.iter().map(|&v| 0.01 * v.max(0.01)).collect();
 
-        // Fill a 4x4 grid with the same spectrum
-        let mut t_3d = Array3::zeros((n_e, 4, 4));
-        let mut u_3d = Array3::zeros((n_e, 4, 4));
-        for y in 0..4 {
-            for x in 0..4 {
+        let mut t_3d = Array3::zeros((n_e, height, width));
+        let mut u_3d = Array3::zeros((n_e, height, width));
+        for y in 0..height {
+            for x in 0..width {
                 for (i, (&t, &s)) in t_1d.iter().zip(sigma_1d.iter()).enumerate() {
                     t_3d[[i, y, x]] = t;
                     u_3d[[i, y, x]] = s;
@@ -1633,6 +1651,15 @@ mod tests {
             }
         }
         (t_3d, u_3d)
+    }
+
+    /// Build a 4x4 synthetic transmission stack from known density.
+    fn synthetic_4x4_transmission(
+        res_data: &nereids_endf::resonance::ResonanceData,
+        true_density: f64,
+        energies: &[f64],
+    ) -> (Array3<f64>, Array3<f64>) {
+        synthetic_grid_transmission(res_data, true_density, energies, 4, 4)
     }
 
     /// Build a 4x4 synthetic counts stack from known density.
@@ -1742,6 +1769,105 @@ mod tests {
         assert!(
             (mean - true_density).abs() / true_density < 0.10,
             "KL mean density: {mean}, true: {true_density}"
+        );
+    }
+
+    /// A caller-supplied precomputed cross-section stack with the wrong shape
+    /// must be rejected up front (before the rayon loop), not panic on
+    /// `xs[0]` in the σ_eff collapse / forward-model builder or be swallowed
+    /// per-pixel as `n_failed`.
+    #[test]
+    fn test_spatial_map_rejects_wrong_shape_precomputed_cross_sections() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..21).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let (t_3d, u_3d) = synthetic_4x4_transmission(&data, 0.0005, &energies);
+
+        // 1 isotope → 1 σ row expected; inject 2 rows of the right length.
+        let n_e = energies.len();
+        let bad_xs = Arc::new(vec![vec![1.0; n_e], vec![1.0; n_e]]);
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
+        .with_precomputed_cross_sections(bad_xs);
+
+        let input = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+
+        let err = spatial_map_typed(&input, &config, None, None, None)
+            .expect_err("wrong-shape precomputed XS must be rejected up front");
+        assert!(
+            matches!(err, PipelineError::ShapeMismatch(_)),
+            "expected ShapeMismatch, got {err:?}"
+        );
+    }
+
+    /// Mid-run cancellation must return `Err(Cancelled)`, not a partial
+    /// `Ok(SpatialResult)` whose cancelled pixels are left as NaN holes
+    /// (indistinguishable from genuine fit failures, with no signal to a
+    /// non-GUI caller that the map is incomplete).
+    ///
+    /// The previous post-loop guard only fired when cancellation beat *every*
+    /// pixel (`results.is_empty()`); a cancellation that lands after the first
+    /// pixel completes slipped through and produced a partial map.  This test
+    /// reproduces exactly that: a watcher thread flips `cancel` as soon as the
+    /// `progress` counter shows the first pixel finished, while the remaining
+    /// pixels are still fitting.  The pre-loop guard sees `cancel == false`
+    /// (so it does not short-circuit), pixels complete into `results`, and the
+    /// post-loop guard then observes `cancel == true` with `results`
+    /// non-empty.
+    #[test]
+    fn test_spatial_map_mid_run_cancellation_returns_err() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..101).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        // A wide grid: many real LM fits, so the watcher reliably flips
+        // `cancel` mid-run (after pixel 1, with dozens of pixels left to skip).
+        let (t_3d, u_3d) = synthetic_grid_transmission(&data, 0.0005, &energies, 1, 64);
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()));
+
+        let input = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+
+        let cancel = AtomicBool::new(false);
+        let progress = AtomicUsize::new(0);
+
+        let result = std::thread::scope(|s| {
+            // Watcher: once at least one pixel has finished, request
+            // cancellation while the rest are still being fit.
+            s.spawn(|| {
+                while progress.load(Ordering::Relaxed) < 1 {
+                    std::hint::spin_loop();
+                }
+                cancel.store(true, Ordering::Relaxed);
+            });
+            spatial_map_typed(&input, &config, None, Some(&cancel), Some(&progress))
+        });
+
+        assert!(
+            matches!(result, Err(PipelineError::Cancelled)),
+            "mid-run cancellation must return Err(Cancelled), got {result:?}"
         );
     }
 

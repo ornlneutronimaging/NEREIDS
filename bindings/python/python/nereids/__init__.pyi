@@ -468,11 +468,19 @@ def forward_model(
     ...
 
 def tof_to_energy(tof_us: float, flight_path_m: float) -> float:
-    """Convert time-of-flight (us) to energy (eV)."""
+    """Convert time-of-flight (us) to energy (eV).
+
+    Raises ``ValueError`` if ``tof_us`` or ``flight_path_m`` is non-positive
+    or non-finite.
+    """
     ...
 
 def energy_to_tof(energy_ev: float, flight_path_m: float) -> float:
-    """Convert energy (eV) to time-of-flight (us)."""
+    """Convert energy (eV) to time-of-flight (us).
+
+    Raises ``ValueError`` if ``energy_ev`` or ``flight_path_m`` is
+    non-positive or non-finite.
+    """
     ...
 
 def load_endf(

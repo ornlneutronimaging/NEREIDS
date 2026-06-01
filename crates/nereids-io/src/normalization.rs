@@ -96,6 +96,20 @@ pub fn normalize(
         }
     }
 
+    // Reject non-finite / negative raw counts up front.  These are detector
+    // counts (and a dark-current estimate), so a NaN or a negative value
+    // signals an upstream loader / TOF-normalisation bug.  Validating here —
+    // rather than letting the per-bin `(x - dc).max(0.0)` clamp below absorb
+    // it — is the whole point of this guard: `NaN.max(0.0) == 0.0` would have
+    // silently turned a corrupt frame into a plausible "zero counts" bin,
+    // exactly the masking the sibling `nereids_fitting::joint_poisson`
+    // `validate_counts` exists to prevent.
+    validate_counts(sample, "sample")?;
+    validate_counts(open_beam, "open_beam")?;
+    if let Some(dc) = dark_current {
+        validate_counts(dc, "dark_current")?;
+    }
+
     let shape = sample.shape();
     let (n_tof, height, width) = (shape[0], shape[1], shape[2]);
 
@@ -113,6 +127,15 @@ pub fn normalize(
                 // is small relative to signal counts (typical for VENUS MCP
                 // detectors), but underestimates σ_T for very low-signal bins
                 // where DC is comparable to the sample or OB counts.
+                //
+                // Inputs are validated finite & non-negative above, so the
+                // subtraction is always finite here; the only way it can go
+                // negative is the legitimate `dc > counts` low-count noise
+                // case (the DC estimate overshoots the measured counts in a
+                // single bin).  Floor that physical edge at 0 — this is NOT
+                // masking bad input (a NaN / negative loader bug was already
+                // rejected), it is the Method-2 convention for a dark-frame
+                // estimate that exceeds the raw counts.
                 let dc = dark_current.map_or(0.0, |dc| dc[[y, x]]);
                 let c_s = (sample[[t, y, x]] - dc).max(0.0);
                 let c_o = (open_beam[[t, y, x]] - dc).max(0.0);
@@ -152,6 +175,32 @@ pub fn normalize(
         transmission,
         uncertainty,
     })
+}
+
+/// Reject a raw-counts array that contains a non-finite or negative value.
+///
+/// Detector counts are non-negative by construction (zero is legitimate), so a
+/// NaN, ±∞, or negative entry signals an upstream loader / normalisation bug
+/// that must be surfaced rather than silently clamped.  Reports the first
+/// offending flat index and value.
+///
+/// The finite-&-non-negative invariant itself lives in
+/// [`nereids_core::validation::first_non_finite_or_negative`] so that the
+/// `nereids-fitting` joint-Poisson and this I/O loader enforce *identical*
+/// semantics (`NaN < 0.0` is `false`, so the check pairs `is_finite()` with
+/// the order comparison); this wrapper only maps the offending element onto
+/// the `IoError` message wording.
+fn validate_counts<D: ndarray::Dimension>(
+    counts: &ndarray::ArrayBase<impl ndarray::Data<Elem = f64>, D>,
+    field: &str,
+) -> Result<(), IoError> {
+    nereids_core::validation::first_non_finite_or_negative(counts.iter().copied()).map_err(
+        |(i, v)| {
+            IoError::InvalidParameter(format!(
+                "{field} counts at flat index {i} must be finite and >= 0, got {v}"
+            ))
+        },
+    )
 }
 
 /// Extract a single spectrum (all TOF bins) from a pixel in the 3D array.
@@ -315,6 +364,67 @@ mod tests {
 
         let result = normalize(&sample, &ob, &params, None);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_normalize_rejects_nan_sample() {
+        // A NaN in the sample frame used to be swallowed by
+        // `(NaN - 0).max(0.0) == 0.0`, silently producing T = 0 as if the
+        // bin had genuinely zero counts.  It must now be rejected up front.
+        let mut sample = Array3::from_elem((1, 1, 1), 50.0);
+        sample[[0, 0, 0]] = f64::NAN;
+        let ob = Array3::from_elem((1, 1, 1), 100.0);
+        let params = NormalizationParams {
+            proton_charge_sample: 1.0,
+            proton_charge_ob: 1.0,
+        };
+        let err = normalize(&sample, &ob, &params, None).unwrap_err();
+        assert!(
+            matches!(err, IoError::InvalidParameter(_)),
+            "expected InvalidParameter, got {err:?}"
+        );
+        assert!(err.to_string().contains("sample"));
+    }
+
+    #[test]
+    fn test_normalize_rejects_negative_sample() {
+        // Negative raw counts (loader bug) used to be clamped to 0.
+        let mut sample = Array3::from_elem((1, 1, 1), 50.0);
+        sample[[0, 0, 0]] = -5.0;
+        let ob = Array3::from_elem((1, 1, 1), 100.0);
+        let params = NormalizationParams {
+            proton_charge_sample: 1.0,
+            proton_charge_ob: 1.0,
+        };
+        let err = normalize(&sample, &ob, &params, None).unwrap_err();
+        assert!(err.to_string().contains("sample"));
+    }
+
+    #[test]
+    fn test_normalize_rejects_nan_open_beam() {
+        let sample = Array3::from_elem((1, 1, 1), 50.0);
+        let mut ob = Array3::from_elem((1, 1, 1), 100.0);
+        ob[[0, 0, 0]] = f64::INFINITY;
+        let params = NormalizationParams {
+            proton_charge_sample: 1.0,
+            proton_charge_ob: 1.0,
+        };
+        let err = normalize(&sample, &ob, &params, None).unwrap_err();
+        assert!(err.to_string().contains("open_beam"));
+    }
+
+    #[test]
+    fn test_normalize_rejects_negative_dark_current() {
+        let sample = Array3::from_elem((1, 1, 1), 60.0);
+        let ob = Array3::from_elem((1, 1, 1), 110.0);
+        let mut dc = Array2::from_elem((1, 1), 10.0);
+        dc[[0, 0]] = -1.0;
+        let params = NormalizationParams {
+            proton_charge_sample: 1.0,
+            proton_charge_ob: 1.0,
+        };
+        let err = normalize(&sample, &ob, &params, Some(&dc)).unwrap_err();
+        assert!(err.to_string().contains("dark_current"));
     }
 
     #[test]

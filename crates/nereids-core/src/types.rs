@@ -37,17 +37,37 @@ impl<'de> serde::Deserialize<'de> for Isotope {
 }
 
 impl Isotope {
+    /// Maximum encodable mass number A.
+    ///
+    /// The ENDF ZA identifier packs an isotope as `Z×1000 + A` (see
+    /// `endf_mat::za`), so A must occupy fewer than three decimal digits for
+    /// the encode/decode round-trip to be lossless. `A ≥ 1000` would carry
+    /// into the Z field — e.g. `(Z=92, A=1000)` encodes to `93000`, which
+    /// decodes back to `(Z=93, A=0)`, silently corrupting the isotope. The
+    /// heaviest synthesised nuclide has A ≈ 295, so this bound never rejects a
+    /// physically real isotope.
+    pub const MAX_MASS_NUMBER: u32 = 999;
+
     /// Create a new isotope with validation.
     ///
     /// # Errors
     /// Returns `NereidsError::InvalidParameter` if:
     /// - `a` is zero (mass number must be positive)
+    /// - `a > 999` (not ENDF-ZA-encodable; would corrupt the `Z×1000 + A`
+    ///   round-trip — see [`Self::MAX_MASS_NUMBER`])
     /// - `z > a` (atomic number cannot exceed mass number)
     pub fn new(z: u32, a: u32) -> Result<Self, NereidsError> {
         if a == 0 {
             return Err(NereidsError::InvalidParameter(
                 "mass number A must be positive".to_string(),
             ));
+        }
+        if a > Self::MAX_MASS_NUMBER {
+            return Err(NereidsError::InvalidParameter(format!(
+                "mass number A ({a}) must be <= {} to be ENDF-ZA-encodable \
+                 (Z×1000 + A would otherwise overflow the Z field)",
+                Self::MAX_MASS_NUMBER,
+            )));
         }
         if z > a {
             return Err(NereidsError::InvalidParameter(format!(
@@ -90,6 +110,34 @@ mod tests {
     fn test_isotope_rejects_zero_mass_number() {
         let err = Isotope::new(0, 0).unwrap_err();
         assert!(err.to_string().contains("must be positive"));
+    }
+
+    #[test]
+    fn test_isotope_rejects_mass_number_too_large() {
+        // A >= 1000 breaks the ENDF ZA round-trip (Z×1000 + A overflows
+        // into the Z field). Z=92, A=1000 would encode to 93000 → decode
+        // to (Z=93, A=0).
+        let err = Isotope::new(92, 1000).unwrap_err();
+        assert!(
+            err.to_string().contains("ENDF-ZA-encodable"),
+            "expected ZA-encodability message, got: {err}"
+        );
+        // The boundary A = 999 is still accepted.
+        assert!(Isotope::new(0, 999).is_ok());
+    }
+
+    #[test]
+    fn test_deserialize_rejects_mass_number_too_large() {
+        // The ZA-encodability guard must also fire through serde.
+        let json = r#"{"z": 92, "a": 1000}"#;
+        let result: Result<Isotope, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("ENDF-ZA-encodable")
+        );
     }
 
     #[test]
@@ -272,6 +320,21 @@ mod tests {
     fn test_subset_group_empty() {
         let err = IsotopeGroup::subset(63, &[]).unwrap_err();
         assert!(err.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn test_subset_group_rejects_duplicate_mass() {
+        // A repeated mass number used to be selected twice and its natural
+        // abundance double-counted in the re-normalisation, silently
+        // re-weighting the group. It must now be rejected.
+        let err = IsotopeGroup::subset(63, &[151, 151]).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate mass number"),
+            "expected duplicate-mass message, got: {err}"
+        );
+        // A duplicate anywhere in the list is caught, not just adjacent.
+        let err = IsotopeGroup::subset(63, &[151, 153, 151]).unwrap_err();
+        assert!(err.to_string().contains("duplicate mass number"));
     }
 
     #[test]
@@ -504,6 +567,7 @@ impl IsotopeGroup {
     ///
     /// # Errors
     /// - Empty `mass_numbers`
+    /// - Duplicate mass number in `mass_numbers`
     /// - Any mass number not found among natural isotopes of Z
     /// - Unknown element Z
     pub fn subset(z: u32, mass_numbers: &[u32]) -> Result<Self, NereidsError> {
@@ -511,6 +575,18 @@ impl IsotopeGroup {
             return Err(NereidsError::InvalidParameter(
                 "mass_numbers must not be empty".into(),
             ));
+        }
+        // Reject duplicate mass numbers. A repeated A would otherwise be
+        // selected twice and its natural abundance double-counted in the
+        // re-normalisation below, silently inflating that isotope's weight
+        // (e.g. `subset(63, &[151, 151])` would yield Eu-151 at ratio 1.0
+        // with Eu-153 absent — not what the caller asked for).
+        for (i, &a) in mass_numbers.iter().enumerate() {
+            if mass_numbers[..i].contains(&a) {
+                return Err(NereidsError::InvalidParameter(format!(
+                    "duplicate mass number A={a} in subset of Z={z}"
+                )));
+            }
         }
         let all_natural = elements::natural_isotopes(z);
         if all_natural.is_empty() {
