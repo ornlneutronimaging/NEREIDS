@@ -374,6 +374,23 @@ const LENSES = [
 // with another target's Find, explicit phase() boundaries would misrepresent the
 // interleaving. meta.phases still declares Find/Verify for the /workflows display.
 // ---------------------------------------------------------------------------
+
+// Fail loudly on a malformed target rather than degrade silently. A target
+// missing `scopeDirective` would otherwise inject the literal string "undefined"
+// into the audit prompt (missing `paths`/`lookFor` already throw in
+// buildAuditPrompt -> the pipeline drops that target -> the caller's
+// count-mismatch guard aborts; the missing-scopeDirective case is the silent one).
+// Not reachable from the current callers (both always set scopeDirective) — this
+// is defensive depth for future callers.
+for (const t of TARGETS) {
+  const key = (t && t.key) || '(unknown)'
+  if (!t || typeof t.key !== 'string' || !t.key) throw new Error('dual-family-review: a target is missing a string `key`')
+  if (typeof t.scopeDirective !== 'string' || !t.scopeDirective)
+    throw new Error(`dual-family-review: target '${key}' is missing a non-empty 'scopeDirective'`)
+  if (!Array.isArray(t.paths) || !t.paths.length) throw new Error(`dual-family-review: target '${key}' is missing non-empty 'paths'`)
+  if (!Array.isArray(t.lookFor)) throw new Error(`dual-family-review: target '${key}' 'lookFor' must be an array`)
+}
+
 const perTargetRaw = await pipeline(
   TARGETS,
 

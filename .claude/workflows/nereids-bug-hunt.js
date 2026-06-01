@@ -336,10 +336,12 @@ phase('Consolidate')
 const allVerified = domainResults.flatMap((r) => r.verified)
 const verifiedP0 = allVerified.filter((f) => (f.verifierTier || f.tier) === 'P0').sort((a, b) => tierRank(a.tier) - tierRank(b.tier))
 const verifiedP1 = allVerified.filter((f) => (f.verifierTier || f.tier) === 'P1')
-// A cross-family-CONFIRMED finding the verifier downgraded to effective P2 is a
-// real (if low-severity) defect; fold it into the P2 backlog so it is counted,
-// not dropped between the P0/P1 buckets and r.p2s (original-tier P2s only).
-const verifiedP2 = allVerified.filter((f) => (f.verifierTier || f.tier) === 'P2')
+// A cross-family-CONFIRMED finding the verifier DOWNGRADED to effective P2
+// (original tier P0/P1) is real but low-severity; fold it into the P2 backlog so
+// it is counted, not dropped between the P0/P1 buckets and r.p2s. Restrict to
+// GENUINELY-downgraded findings (verifierTier === 'P2' && tier !== 'P2'): a
+// born-P2 finding is already in r.p2s, so matching it here would double-count it.
+const verifiedP2 = allVerified.filter((f) => f.verifierTier === 'P2' && f.tier !== 'P2')
 const needsVerification = domainResults.flatMap((r) => r.needsVerification)
 const refuted = domainResults.flatMap((r) => r.refuted)
 const circular = domainResults.flatMap((r) => r.circular)
