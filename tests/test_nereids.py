@@ -150,6 +150,31 @@ class TestTofConversion:
         for i in range(len(centers) - 1):
             assert centers[i] < centers[i + 1], f"Expected ascending energy: centers[{i}]={centers[i]} >= centers[{i+1}]={centers[i+1]}"
 
+    def test_tof_to_energy_rejects_non_positive_and_non_finite(self):
+        """Non-positive / non-finite TOF or flight path must raise ValueError.
+
+        Without the guard the conversion silently returned a positive energy
+        for negative TOF (v**2 hides the sign) or +inf at zero TOF, masking a
+        bad TOF axis downstream.
+        """
+        fp = 20.0
+        for bad in (-100.0, 0.0, float("nan"), float("inf")):
+            with pytest.raises(ValueError):
+                nereids.tof_to_energy(bad, fp)
+        for bad_fp in (-1.0, 0.0, float("nan"), float("inf")):
+            with pytest.raises(ValueError):
+                nereids.tof_to_energy(100.0, bad_fp)
+
+    def test_energy_to_tof_rejects_non_positive_and_non_finite(self):
+        """Non-positive / non-finite energy or flight path must raise ValueError."""
+        fp = 20.0
+        for bad in (-1.0, 0.0, float("nan"), float("inf")):
+            with pytest.raises(ValueError):
+                nereids.energy_to_tof(bad, fp)
+        for bad_fp in (-1.0, 0.0, float("nan"), float("inf")):
+            with pytest.raises(ValueError):
+                nereids.energy_to_tof(10.0, bad_fp)
+
 
 # ===========================================================================
 # ResonanceData creation

@@ -952,27 +952,63 @@ fn forward_model<'py>(
 /// Convert time-of-flight (μs) to energy (eV).
 ///
 /// Args:
-///     tof_us: Time-of-flight in microseconds.
-///     flight_path_m: Flight path in meters.
+///     tof_us: Time-of-flight in microseconds (must be positive and finite).
+///     flight_path_m: Flight path in meters (must be positive and finite).
 ///
 /// Returns:
 ///     Energy in eV.
+///
+/// Raises:
+///     ValueError: If ``tof_us`` or ``flight_path_m`` is non-positive or
+///         non-finite. The underlying conversion returns NaN for such input;
+///         the binding rejects it explicitly so a bad TOF axis surfaces as an
+///         error here rather than silently poisoning a downstream energy grid.
 #[pyfunction]
-fn tof_to_energy(tof_us: f64, flight_path_m: f64) -> f64 {
-    nereids_core::constants::tof_to_energy(tof_us, flight_path_m)
+fn tof_to_energy(tof_us: f64, flight_path_m: f64) -> PyResult<f64> {
+    if !tof_us.is_finite() || tof_us <= 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "tof_us must be positive and finite, got {tof_us}"
+        )));
+    }
+    if !flight_path_m.is_finite() || flight_path_m <= 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "flight_path_m must be positive and finite, got {flight_path_m}"
+        )));
+    }
+    Ok(nereids_core::constants::tof_to_energy(
+        tof_us,
+        flight_path_m,
+    ))
 }
 
 /// Convert energy (eV) to time-of-flight (μs).
 ///
 /// Args:
-///     energy_ev: Energy in eV.
-///     flight_path_m: Flight path in meters.
+///     energy_ev: Energy in eV (must be positive and finite).
+///     flight_path_m: Flight path in meters (must be positive and finite).
 ///
 /// Returns:
 ///     Time-of-flight in microseconds.
+///
+/// Raises:
+///     ValueError: If ``energy_ev`` or ``flight_path_m`` is non-positive or
+///         non-finite (mirrors ``tof_to_energy``).
 #[pyfunction]
-fn energy_to_tof(energy_ev: f64, flight_path_m: f64) -> f64 {
-    nereids_core::constants::energy_to_tof(energy_ev, flight_path_m)
+fn energy_to_tof(energy_ev: f64, flight_path_m: f64) -> PyResult<f64> {
+    if !energy_ev.is_finite() || energy_ev <= 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "energy_ev must be positive and finite, got {energy_ev}"
+        )));
+    }
+    if !flight_path_m.is_finite() || flight_path_m <= 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "flight_path_m must be positive and finite, got {flight_path_m}"
+        )));
+    }
+    Ok(nereids_core::constants::energy_to_tof(
+        energy_ev,
+        flight_path_m,
+    ))
 }
 
 /// Load ENDF resonance data for an isotope from the IAEA database.
