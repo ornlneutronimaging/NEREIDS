@@ -1662,6 +1662,18 @@ pub(crate) fn validate_precomputed_cross_sections(
                 row.len(),
             )));
         }
+        // A correctly-shaped row of NaN / ±∞ σ passes the shape checks but
+        // poisons the forward model: every transmission sample picks up the
+        // non-finite σ and the LM residual / Fisher matrix becomes NaN, which
+        // the per-pixel dispatch then silently swallows as a failed fit.
+        // Reject non-finite σ at the boundary (`is_finite()` excludes both NaN
+        // and ±∞; a bare order comparison would let NaN through).
+        if let Some(j) = row.iter().position(|s| !s.is_finite()) {
+            return Err(PipelineError::ShapeMismatch(format!(
+                "precomputed_cross_sections row {i} has non-finite σ at energy index {j}: {}",
+                row[j],
+            )));
+        }
     }
 
     let n_params = config.n_density_params();
@@ -2202,11 +2214,26 @@ pub struct ModelJacobianResult {
 /// Density evaluation values come from `config.initial_densities`.
 /// Temperature evaluation value comes from `config.temperature_k`.
 /// α₁/α₂ evaluation values come from `config.counts_background` init fields.
+///
+/// # Errors
+/// Returns [`PipelineError::ShapeMismatch`] if `config.precomputed_cross_sections`
+/// is set but malformed (empty, wrong row count, wrong row length, or contains a
+/// non-finite σ), consistent with `fit_spectrum_typed` and `spatial_map_typed`.
 pub fn evaluate_jacobian_and_fisher(
     config: &UnifiedFitConfig,
     flux: &[f64],
     background: &[f64],
 ) -> Result<ModelJacobianResult, PipelineError> {
+    // Reject a malformed caller-supplied precomputed cross-section stack here,
+    // before it reaches `build_transmission_model`.  Without this, an empty
+    // stack is caught only deep in `PrecomputedTransmissionModel` (as an
+    // `InvalidConfig`, not a `ShapeMismatch`) and a wrong-shaped / non-finite
+    // stack indexes `xs[0]` / `neg_opt[j]` directly.  This is the third public
+    // entry point that consumes `config.precomputed_cross_sections`; it must
+    // guard the same way as `fit_spectrum_typed` / `spatial_map_typed` so all
+    // three surface the same typed `ShapeMismatch` at the boundary.
+    validate_precomputed_cross_sections(config)?;
+
     let n_density_params = config.n_density_params();
 
     // ── Build parameter vector — preserves the pre-collapse fixed-flux
@@ -2793,6 +2820,74 @@ mod tests {
             result.is_ok(),
             "correctly-shaped precomputed XS must pass validation, got {result:?}"
         );
+    }
+
+    #[test]
+    fn test_fit_rejects_non_finite_precomputed_cross_sections() {
+        // A correctly-shaped row whose σ values are NaN passes the shape
+        // checks but poisons the forward model (NaN residual swallowed as a
+        // failed pixel).  It must be rejected at the boundary.  `NaN < x` is
+        // `false`, so a bare order comparison would let it through — the
+        // `is_finite()` half of the guard is what catches it.
+        let (config, input) = precomputed_xs_fixture();
+        let n_e = config.energies().len();
+        let bad = vec![vec![f64::NAN; n_e]];
+        let config = config.with_precomputed_cross_sections(Arc::new(bad));
+        let err = fit_spectrum_typed(&input, &config).unwrap_err();
+        assert!(
+            matches!(err, PipelineError::ShapeMismatch(_)),
+            "expected ShapeMismatch, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("non-finite"),
+            "error should mention non-finite σ, got: {err}"
+        );
+
+        // ±∞ is equally rejected.
+        let (config, input) = precomputed_xs_fixture();
+        let mut row = vec![1.0; n_e];
+        row[n_e / 2] = f64::INFINITY;
+        let config = config.with_precomputed_cross_sections(Arc::new(vec![row]));
+        let err = fit_spectrum_typed(&input, &config).unwrap_err();
+        assert!(
+            matches!(err, PipelineError::ShapeMismatch(_)),
+            "expected ShapeMismatch for +inf σ, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_evaluate_jacobian_rejects_malformed_precomputed_cross_sections() {
+        // `evaluate_jacobian_and_fisher` is a third public entry point that
+        // consumes `config.precomputed_cross_sections`.  An empty stack used
+        // to reach `build_transmission_model` and panic on `xs[0].len()`; it
+        // must now fail the shared up-front validator instead.
+        let (config, _input) = precomputed_xs_fixture();
+        let n_e = config.energies().len();
+        let flux = vec![1.0; n_e];
+        let background = vec![0.0; n_e];
+
+        // `ModelJacobianResult` (the Ok type) is not `Debug`, so match on the
+        // result rather than calling `unwrap_err()`.
+        let empty = config
+            .clone()
+            .with_precomputed_cross_sections(Arc::new(Vec::new()));
+        match evaluate_jacobian_and_fisher(&empty, &flux, &background) {
+            Err(PipelineError::ShapeMismatch(msg)) => {
+                assert!(msg.contains("must not be empty"), "got: {msg}");
+            }
+            Err(other) => panic!("expected ShapeMismatch for empty XS, got {other:?}"),
+            Ok(_) => panic!("empty precomputed XS must be rejected"),
+        }
+
+        // Non-finite σ is rejected on this path too.
+        let nan = config.with_precomputed_cross_sections(Arc::new(vec![vec![f64::NAN; n_e]]));
+        match evaluate_jacobian_and_fisher(&nan, &flux, &background) {
+            Err(PipelineError::ShapeMismatch(msg)) => {
+                assert!(msg.contains("non-finite"), "got: {msg}");
+            }
+            Err(other) => panic!("expected ShapeMismatch for NaN σ, got {other:?}"),
+            Ok(_) => panic!("non-finite precomputed σ must be rejected"),
+        }
     }
 
     #[test]
