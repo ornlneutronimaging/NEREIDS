@@ -15,290 +15,207 @@ The standalone `/self-review` and `/codex-review` skills have been merged
 into this single pipeline. When the user says "review", "run reviews",
 or any variation, invoke THIS skill.
 
+## Architecture: deterministic core + human-gated orchestration
+
+The non-interactive heart of each review round — **discover branches →
+two-LLM-family review → consolidate** — is the `review-core` **Workflow**
+(`.claude/workflows/review-core.js`), which runs the shared
+`dual-family-review` engine. This skill is the **orchestrator**: it invokes
+`review-core` once per round and owns everything interactive or
+state-changing (the user gates, fixes, pushes, the Copilot phase, merges,
+and issue-filing).
+
+Why this split — and why the gates live here, not in the workflow:
+
+- **Consistent format across models.** Inside `review-core`, every reviewer
+  (Claude finder, Codex finder, and every cross-family verifier) emits the
+  **same schema**; cross-confirmation and dedup are deterministic JS, not the
+  main agent eyeballing prose. Claude and Codex findings come back in one
+  shape every round.
+- **No silently-skipped steps.** discover → find(2 families) → verify →
+  consolidate is JS control flow run for every branch every round — not prose
+  an LLM may under-execute. The deferred-P2 list comes back **as data**
+  (Step 9 can no longer be "forgotten").
+- **A Workflow cannot pause for user input.** It runs unattended to
+  completion. So every mandatory STOP gate must fall on a workflow boundary —
+  which is exactly why fix/push/merge and the three gates stay in this skill,
+  with `review-core` invoked between them.
+
+Invoking `review-core` from this skill is the sanctioned Workflow opt-in
+(a skill whose instructions call the Workflow tool).
+
 ## Arguments
 
-- No arguments: auto-discover all `.claude/worktrees/*/` branches diverged from main
-- Branch name: scope to a single branch (e.g., `review-pipeline fix/my-branch`)
-- `--skip-codex`: skip the Codex external review stage
+- No arguments: `review-core` auto-discovers all `.claude/worktrees/*/`
+  branches diverged from main.
+- Branch name: scope to a single branch — pass it through as
+  `branches: ["<name>"]`.
+- `--skip-codex`: pass `skipCodex: true` (single-LLM-family; all findings
+  return as NEEDS-VERIFICATION).
 
 ## Iteration Policy
 
-- **Goal**: Zero P1s before pushing to remote
-- **Max iterations**: 4 per branch
+- **Goal**: Zero P1s before pushing to remote.
+- **Max iterations**: 4 per branch.
 - **Escalation**: If P1s persist after 4 rounds, stop and report to the user.
   Do NOT attempt a 5th round. The user must decide whether to continue,
   restructure the task, or conduct manual review.
 
-Track the current iteration number and report it in each consolidation
-(e.g., "Round 2 of 4").
+Track the current round number and report it in each consolidation
+(e.g., "Review Round 2 of 4"). Pass it to `review-core` as `round: N`.
 
 ---
 
-## Step 1: Discover Targets & Merge Order
+## Step 1: Invoke `review-core` (one round)
 
-Identify worktrees to review:
+Call the **Workflow** tool:
 
-```bash
-git worktree list
+```
+Workflow(name="review-core", args={
+  round: <N>,                      // 1 on the first round
+  base: "main",
+  branches: <["branch"] | omit to auto-discover>,
+  skipCodex: <true if --skip-codex>,
+  priorFindings: <prev round's findings, or omit on round 1>,  // see Step 5
+})
 ```
 
-For each worktree under `.claude/worktrees/`, check if the branch has diverged
-from main (`git log main..HEAD --oneline`). Skip worktrees with no new commits.
+`review-core` runs in the background and returns a structured payload:
 
-If `$ARGUMENTS` specifies a branch name, filter to just that one.
-
-### File Overlap Analysis (Merge Order)
-
-For each discovered branch, collect changed files:
-
-```bash
-cd {worktree_path} && git diff --name-only main...HEAD
+```
+{ meta: { round, base, repoRoot, headSha, codexUsable, sammyRoot, isWorktree },
+  mergeOrder: ["branch", ...],            // smallest-diff-first; parallel-safe if no overlap
+  overlaps:   [{ a, b, sharedFiles[] }],
+  perBranch:  [{ branch, crates, claudeAssessment, codexAssessment, tierCounts,
+                 verifiedP0[], verifiedP1[], needsVerification[], refuted[],
+                 p2s[] (each with .disposition: fix-now|defer), circular[], recurring[] }],
+  deferredP2s: [...],                      // P2s outside the changed crates (Step 9)
+  counts: { branches, verifiedP0, verifiedP1, needsVerification, refuted, p2, recurring } }
 ```
 
-Build a file overlap matrix and suggest merge order:
+Each finding carries `status` (VERIFIED = ≥2 LLM families agreed;
+NEEDS-VERIFICATION = single-family / split / codex unavailable; REFUTED =
+cross-family refuted), `file`, `line`, `claim`, `reasoning`, `primarySource`,
+`suggestedFix`, `confidence`, and `recurring` (matched a prior round).
 
-1. **No overlap** branches can merge in any order (parallel-safe)
-2. **Overlapping** branches should merge in order of increasing diff size
-   (smallest first — the larger diff is more likely to need rebasing)
-3. Report the suggested merge order in the Step 4 consolidation
+**Codex note:** `review-core` runs Codex as the second family via the engine.
+If `meta.codexUsable` is false (codex absent / `--skip-codex`), the round is
+single-family and *every* finding is NEEDS-VERIFICATION — say so. If codex was
+expected but consistently fails, check `codex --version` / upgrade
+(`brew upgrade codex` or `npm i -g @openai/codex@latest`); do not work around
+with model overrides. Codex is supplementary, not blocking.
 
 ---
 
-## Steps 2 + 3: Self-Audit & External Review (launch together)
+## Step 2: Consolidation Gate
 
-Launch **all** review tasks in a **single message** (background mode) so
-they run concurrently. N worktrees produce up to 2N parallel tasks
-(N Claude subagents + N Codex commands).
+Render the returned payload as a consistent per-branch report:
 
-### Self-Audit (Claude Subagents)
-
-Launch one `Agent(subagent_type="general-purpose", run_in_background=true)`
-per worktree with this prompt:
-
-> You are auditing the branch `{branch}` at `{worktree_path}`.
->
-> 1. Run `git diff main...HEAD` to see all changes
-> 2. Read each changed file in full
-> 3. Audit for:
->    - Logic bugs, panics (`unwrap`, `expect`, array indexing)
->    - Missing input validation
->    - Numerical stability (division by zero, NaN propagation, overflow)
->    - Physics correctness (for nereids-physics/nereids-endf)
->    - API consistency with existing patterns
->    - Edge cases (empty inputs, zero counts, exactly-determined systems)
-> 4. Report findings as:
->    - **P1** (must fix) — correctness bugs, panics, data corruption
->    - **P2** (should fix) — robustness, style, minor improvements
->    - Include `file:line` references for each finding
-> 5. Run `cargo test --workspace --exclude nereids-python` to verify tests pass
->    (workspace-wide, because changes often ripple across crates)
-
-### External Review (Codex CLI)
-
-Unless `--skip-codex` is in `$ARGUMENTS`, also launch one `Bash` command
-per worktree in the **same message** as the Claude self-audit so they
-run concurrently.
-
-codex-cli 0.130+ ships **both** a top-level `codex review` subcommand
-and `codex exec review` under `exec` (tracked in
-[openai/codex#6432](https://github.com/openai/codex/issues/6432)); the
-interactive `/review` slash command is separate and cannot be driven
-from `codex exec`.  Either native subcommand would work as a higher-
-level invocation, but **this skill uses the manual `codex exec` +
-explicit review prompt pattern below** because it is portable across
-all codex-cli versions (including environments stuck on older
-binaries) and gives us direct control over the prompt body, sandbox
-flags, and output capture.  Adopting the native `codex review --base
-<BRANCH>` workflow-wide is tracked as a separate follow-up.
-
-Use this pattern (one Bash call per worktree). The prompt is written to a
-temp file and fed to `codex exec` via stdin redirection (`- < "$PROMPT_FILE"`)
-to avoid the heredoc-inside-command-substitution form (`codex exec
-"$(cat <<'EOF' ... EOF)"`), which has truncated or mangled prompts on
-recent PRs under certain shell snapshots — see #536. Temp file + stdin
-delivers the body verbatim across `codex-cli` versions.
-
-```bash
-PROMPT_FILE=$(mktemp -t codex-review-{branch_slug}.XXXXXX)
-trap 'rm -f "$PROMPT_FILE"' EXIT
-cat > "$PROMPT_FILE" <<'PROMPT'
-You are reviewing the changes on the current branch (HEAD) against `main`
-in the NEREIDS repository.
-
-1. Run `git diff main...HEAD` to see all changes.
-2. Read each changed file in full.
-3. Audit for:
-   - Logic bugs, panics (unwrap, expect, array indexing)
-   - Missing input validation
-   - Numerical stability (division by zero, NaN propagation, overflow)
-   - Physics correctness (for nereids-physics / nereids-endf)
-   - API consistency with existing patterns
-   - Edge cases (empty inputs, zero counts, exactly-determined systems)
-4. Report findings as:
-   - **P1** (must fix) — correctness bugs, panics, data corruption
-   - **P2** (should fix) — robustness, style, minor improvements
-   - Include `file:line` references for each finding.
-5. If you find nothing significant, say so explicitly. Be terse.
-PROMPT
-
-codex exec --sandbox read-only --skip-git-repo-check \
-  -C {worktree_path} \
-  --output-last-message /tmp/codex-review-{branch_slug}.md \
-  - < "$PROMPT_FILE"
-```
-
-Then read the file at `/tmp/codex-review-{branch_slug}.md` for the final
-review verdict; the JSONL on stdout is the streaming transcript and is
-mostly noise for our purposes.
-
-**Why these flags:**
-- `--sandbox read-only` — review only reads code; no need for write access.
-- `--skip-git-repo-check` — defensive; we always invoke from inside a repo
-  but this avoids friction in nested-worktree edge cases.
-- `-C {worktree_path}` — sets working dir explicitly so `git diff main...HEAD`
-  resolves correctly per worktree.
-- `--output-last-message <file>` — captures the agent's final message
-  cleanly; far easier than parsing JSONL.
-
-**Known pitfalls** (verified against codex-cli 0.130, May 2026):
-
-- **Native review subcommands**: codex-cli 0.130+ ships **both**
-  `codex review --base <BRANCH>` (top-level) and `codex exec review
-  --base <BRANCH>` (under `exec`).  Either accepts the prompt via
-  stdin (`-`) and supports `--uncommitted`, `--commit <SHA>`.  This
-  was tracked in
-  [openai/codex#6432](https://github.com/openai/codex/issues/6432).
-  The error `unexpected argument '--base' found / Usage: codex
-  <PROMPT>` is from pre-0.130 codex-cli where `review` was parsed as
-  a positional prompt instead of a subcommand.  If you want to drive
-  the native `codex review --base <BRANCH>` workflow directly,
-  upgrade codex-cli to 0.130+.  **For this skill**, that upgrade is
-  not required — the manual `codex exec` + stdin prompt pattern
-  below is the canonical fallback and works across all codex-cli
-  versions (including environments where upgrading is not feasible).
-  Adopting the native subcommand workflow-wide is tracked as a
-  separate follow-up.
-- Slash commands (`/review`, `/test`, etc.) work only in interactive
-  TUI sessions; they cannot be invoked from `codex exec`.
-- **codex-cli + API model gating drift fast.** Earlier this year the
-  installed 0.46 binary was rejected by the API as *"requires a newer
-  version of Codex"* for the default `gpt-5.5` model, and overriding
-  with `-m gpt-5` failed on ChatGPT-account auth (*"not supported when
-  using Codex with a ChatGPT account"*). If you see either of those
-  errors, the fix is to upgrade codex-cli (`brew upgrade codex` or
-  `npm i -g @openai/codex@latest`). Do NOT spend time trying to work
-  around with model overrides — keep the binary current.
-- **Prompt delivery**: write the prompt to a temp file and pipe via stdin
-  (`codex exec ... - < "$PROMPT_FILE"`). The heredoc-inside-command-
-  substitution form (`codex exec "$(cat <<'EOF' ... EOF)"`) has been
-  observed to truncate/mangle prompts under certain shell snapshots —
-  see #536. Temp file + stdin is robust across versions.
-- Avoid `--full-auto` for review — it grants `workspace-write` sandbox,
-  which is broader than the read-only review needs.
-
-If Codex fails (network, license, model rejection, binary out of date),
-note the failure and continue. Codex is supplementary, not blocking. The
-Claude self-audit is the load-bearing reviewer; Codex provides
-cross-confirmation when available.
-
----
-
-## Step 4: Consolidate Findings
-
-After all reviews complete:
-
-1. Collect self-audit findings (from Agent results) and Codex findings (from Bash output)
-2. Merge into a unified report grouped by worktree/branch:
-   - **Cross-confirmed** issues (found by both Claude and Codex) — highest confidence
-   - **Claude-only** issues
-   - **Codex-only** issues
-3. For each finding, classify as:
-   - **Fix now** — P1s and high-confidence P2s
-   - **Defer** — P2s genuinely out of scope (different crate/subsystem,
-     pre-existing issue not introduced by this PR)
-   - **Dismiss** — false positives, style-only, or impossible edge cases
+1. **Per-branch table**: for each branch, Claude vs Codex tier counts and
+   VERIFIED P0 / VERIFIED P1 / NEEDS-VERIFICATION / REFUTED / P2 / RECURRING.
+2. **Findings detail**, grouped by branch and confidence:
+   - **VERIFIED** (cross-confirmed) — highest confidence, fix now.
+   - **NEEDS-VERIFICATION** (single-family) — call out that these did NOT meet
+     the ≥2-LLM-family bar.
+   - **REFUTED** — list with the refuter's reasoning so they are not
+     re-litigated.
+3. **Suggested disposition** (from each finding's `.disposition` / tier) — the
+   workflow proposes fix-now / defer / dismiss; **the user decides**:
+   - **Fix now** — VERIFIED P0/P1 and same-crate P2s.
+   - **Defer** — P2s outside the changed crate(s) (already in `deferredP2s`).
+   - **Dismiss** — false positives / impossible edge cases.
+4. **Suggested Merge Order** from `meta`/`mergeOrder` (+ any `overlaps`).
+5. Report the round: "Review Round N of 4".
+6. **RECURRING**: any finding tagged `recurring` reappeared after a prior
+   "fix" — flag it explicitly; the user must decide the approach.
 
 ### P2 Deferral Discipline
 
-**IMPORTANT**: If the PR's purpose is P2 burndown or tech debt reduction,
-the "Defer" category is restricted to findings in a *different crate or
-subsystem* than the one being fixed. Same-crate P2s MUST be classified as
-"Fix now" — otherwise P2 debt accumulates faster than it is paid down.
+If the PR's purpose is P2 burndown / tech-debt reduction, "Defer" is
+restricted to a *different crate or subsystem* than the one being fixed.
+`review-core` already marks same-crate P2s `disposition: fix-now`; honor that —
+do not defer same-crate P2s, or debt accrues faster than it is paid down.
 
-4. Report the iteration number: "Review Round N of 4"
-5. Include the **Suggested Merge Order** from Step 1
-6. **Present the consolidated report to the user and STOP.**
-
-**MANDATORY GATE**: Do NOT proceed to Step 5 without user approval.
-The user must review the consolidation and tell you which findings to fix.
+**MANDATORY GATE — present the consolidation and STOP.** Do NOT proceed to
+Step 3 without user approval. The user must tell you which findings to fix.
 End your turn after presenting the report.
 
-**Oscillating findings**: If a finding reappears after being "fixed", flag
-it as **RECURRING** — the user must decide the approach.
+---
+
+## Step 3: Fix
+
+After the user approves the fix list, launch one fix subagent per worktree
+**in parallel**, using `.claude/templates/fix-subagent-prompt.md` (it encodes
+the DRY pre-step and no-scope-dodging rules). Each fix agent must:
+
+1. Apply the approved fixes.
+2. **Check downstream consumers** — if a fix changes a public API, grep for
+   all call sites across the workspace and update them.
+3. Run `cargo fmt --all`.
+4. Run `cargo clippy --workspace --exclude nereids-python --all-targets -- -D warnings`.
+5. Run `cargo test --workspace --exclude nereids-python`.
+6. For physics-correctness fixes (SLBW/MLBW/RM/RML, Doppler, resolution,
+   fitting math), also run `pixi run test-python` — `cargo test` cannot catch
+   `pytest.approx` baseline regressions.
+7. Commit with `scripts/worktree-commit.sh <worktree-name> "<msg>" [files]`
+   (GPG-signed).
 
 ---
 
-## Step 5: Fix
-
-After user approves the fix list, launch one
-`Agent(subagent_type="general-purpose")` per worktree **in parallel**.
-
-Each fix agent must:
-1. Apply the approved fixes
-2. **Check downstream consumers** — if the fix changes a public API,
-   grep for all call sites across the workspace and update them
-3. Run `cargo fmt --all`
-4. Run `cargo clippy --workspace --exclude nereids-python --all-targets -- -D warnings`
-5. Run `cargo test --workspace --exclude nereids-python`
-6. Commit with `scripts/worktree-commit.sh` (GPG-signed)
-
-## Step 6: Verify & Push
+## Step 4: Verify & Push
 
 After all fix agents complete:
-1. Verify each worktree has clean `git status`
-2. Push each branch: `git push origin {branch}`
-3. Report commit hashes and branch status
+1. Verify each worktree has clean `git status`.
+2. If a fix touched a shared symbol, `cargo check` after any rebase before push.
+3. Push each branch: `git push origin {branch}`.
+4. Report commit hashes and branch status.
 
 ---
 
-## Step 7: Iteration Decision
+## Step 5: Iteration Decision
 
-After pushing, check:
+After pushing, decide:
 
-- **Zero P1s found this round?** → Phase A complete. Proceed to Phase B.
-- **P1s found and fixed, iteration < 4?** → Loop back to Step 2.
-- **Iteration == 4 and P1s still found?** → STOP. Report:
-  "Iteration limit reached (4 rounds). P1s persist — escalating to human."
+- **Zero P1s this round?** → Phase A complete. Proceed to Step 6 (Phase B).
+- **P1s found and fixed, round < 4?** → Loop back to Step 1 for round N+1.
+  Pass `priorFindings` = this round's findings (each as
+  `{branch, file, line, title}`) so `review-core` tags **RECURRING**.
+- **Round == 4 and P1s still found?** → STOP. Report: "Iteration limit
+  reached (4 rounds). P1s persist — escalating to human."
+
+**Re-run between rounds, not just once.** File overlap can appear mid-pipeline
+(a fix lands in a file another branch also touches); the fresh `mergeOrder`
+each round reflects this.
 
 ---
 
-## Step 8: Phase B — Copilot Review (after push)
+## Step 6: Phase B — Copilot Review (after push)
 
 After Phase A completes (zero P1s) and branches are pushed:
 
-1. Inform the user that Phase A is complete and branches are pushed.
-   Ask them to trigger Copilot review on GitHub. **STOP and wait.**
+1. Inform the user Phase A is complete and branches are pushed. Ask them to
+   trigger Copilot review on GitHub. **STOP and wait.**
 2. When the user says Copilot reviews are in, fetch comments:
 
-```bash
-pixi run copilot-reviews {pr_numbers...} --dedup
-```
+   ```bash
+   pixi run copilot-reviews {pr_numbers...} --dedup
+   ```
 
-3. Classify each Copilot comment as P1 or P2
+3. Classify each Copilot comment as P1 or P2.
 4. **Decision criteria**:
-   - 3+ P1s OR P1 ratio > 40% → re-iterate (back to Step 2)
-   - Otherwise → fix P2s inline, commit, push
+   - 3+ P1s OR P1 ratio > 40% → re-iterate (back to Step 1).
+   - Otherwise → fix P2s inline, commit, push.
 5. Dismiss Copilot comments that rehash already-addressed issues or flag
-   impossible edge cases
-6. Present Copilot resolution summary to the user.
+   impossible edge cases.
+6. Present the Copilot resolution summary to the user.
 
 ---
 
-## Step 9: Pre-Merge Checkpoint
+## Step 7: Pre-Merge Checkpoint
 
 **MANDATORY: End your turn here and wait for user approval.**
 
-Present the user with a concise summary table:
+Present a concise summary table:
 
 ```markdown
 ### Pre-Merge Summary — Batch {name}
@@ -307,53 +224,53 @@ Present the user with a concise summary table:
 |----|--------|-------|-------------|---------------|
 | #{n} | {branch} | #{issue} | {1-line summary} | Phase A ✓ Phase B ✓ |
 
-**Merge order**: {recommendation}
+**Merge order**: {from review-core meta.mergeOrder}
 **Review rounds**: Phase A: {N} round(s), Phase B: {N} Copilot comment(s)
 **Findings resolved**: {X} P1s fixed, {Y} P2s fixed, {Z} P2s deferred
 **Tests on branches**: {N} Rust tests — all pass
-
-Ready to merge? (User must explicitly approve.)
 ```
 
 **Do NOT run `gh pr merge` until the user responds with explicit approval.**
 
 ---
 
-## Step 10: Merge & Post-Merge
+## Step 8: Merge & Post-Merge
 
-After user approves:
+After the user approves:
 
-1. Merge PRs in recommended order using `gh pr merge --squash --delete-branch`
-2. Clean up worktrees: `git worktree remove {path} --force` for each merged branch
-3. Delete local branches: `git branch -D {branch}` for each
-4. Run `/post-merge` which handles: pull main, `cargo clean && pixi run build`,
-   workspace tests, Python tests, issue verification, memory updates
+1. Merge PRs in `mergeOrder` using `gh pr merge --squash --delete-branch`.
+2. Clean up worktrees: `git worktree remove {path} --force` per merged branch.
+3. Delete local branches: `git branch -D {branch}` per branch.
+4. Run `/post-merge` (pulls main, `cargo clean && pixi run build`, workspace
+   tests, Python tests, issue verification, memory updates).
 
-**IMPORTANT**: `pixi run build` must run first after `cargo clean`. It catches
+**IMPORTANT**: `pixi run build` must run first after `cargo clean` — it catches
 cross-PR signature mismatches that per-branch reviews miss.
 
 ---
 
-## Step 11: Track Deferred P2 Findings
+## Step 9: Track Deferred P2 Findings
 
-**Do NOT skip this step.** Create GitHub issues for every P2 finding deferred
-during consolidation:
+**Do NOT skip this step.** `review-core` returns `deferredP2s` — file them so
+nothing is lost:
 
-1. Group deferred P2s by branch/crate
-2. Create one issue per group with `file:line` references
-3. Add to project tracker (project #8)
-4. Report created issue numbers to the user
+1. Group `deferredP2s` by branch/crate.
+2. Create one issue per group with `file:line` references.
+3. Add to the project tracker (project #8).
+4. Report the created issue numbers to the user.
 
 ---
 
 ## Subagent Prompt Requirements
 
-When launching implementation or fix subagents, ALWAYS include:
+When launching fix subagents, ALWAYS include (and use
+`.claude/templates/fix-subagent-prompt.md`):
 
-- **Tooling**: "Use `pixi run build` / `pixi run test-python` — never
-  raw `maturin develop` or `pip install`."
+- **Tooling**: "Use `pixi run build` / `pixi run test-python` — never raw
+  `maturin develop` or `pip install`."
 - **Commits**: "Use `scripts/worktree-commit.sh <worktree-name> '<message>' [files]`
   for all commits."
 - **GitHub issues**: "Use `pixi run gh-issues` for issue/PR queries."
 - **Pattern matching**: "Match patterns already used in the file you're editing."
+- **DRY pre-step**: "ripgrep for existing logic before adding a new helper."
 - **Pre-commit**: "Run the pre-commit checklist from CLAUDE.md."
