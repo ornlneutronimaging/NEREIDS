@@ -46,7 +46,7 @@ impl Isotope {
     /// decodes back to `(Z=93, A=0)`, silently corrupting the isotope. The
     /// heaviest synthesised nuclide has A ≈ 295, so this bound never rejects a
     /// physically real isotope.
-    const MAX_MASS_NUMBER: u32 = 999;
+    pub const MAX_MASS_NUMBER: u32 = 999;
 
     /// Create a new isotope with validation.
     ///
