@@ -2690,18 +2690,71 @@ fn test_tr129c_na23_endf_total_xs() {
 }
 
 #[test]
-fn test_tr129e_pu240_endf_total_xs() {
-    // Pu-240 ENDF file (tape128_9440_2) has NER=2 with LFW=1+LRF=2 URR.
-    // The URR skipper does not correctly handle this layout, so
-    // parse_endf_file2 reports "Multiple materials detected".
-    // Skip until the URR LFW=1+LRF=2 parser is fixed.
+fn test_tr129e_pu240_lfw1_lrf1_urr_parsed() {
+    // Pu-240 ENDF file (tape128_9440_2) is a real-world LFW=1/LRF=1
+    // (ENDF-6 §2.2.2.1 "Case B") URR tape: the isotope CONT carries LFW=1
+    // and NER=2 — range 1 is a resolved MLBW (LRU=1, LRF=2) region and
+    // range 2 is the unresolved (LRU=2, LRF=1) region with energy-dependent
+    // fission widths on a shared NE=14 energy grid.
+    //
+    // Each per-(L,J) record is a full LIST: a control line
+    // [0.0, 0.0, L, MUF, NE+6=20, 0] followed by [D, AJ, AMUN, GNO, GG, 0]
+    // and NE=14 fission widths.  Consuming the per-J control line is what
+    // keeps the line stream aligned; before that read was added this file
+    // mis-parsed and tripped the "multiple materials" guard.
+    //
+    // This is a gold-standard NON-circular regression fixture: the bytes
+    // come from a real evaluation, not from a hand-built snippet shaped to
+    // match the parser.
     let dir = samtry_data_dir().join("tr129_multi_isotope_endf_total_xs");
     let endf_content = std::fs::read_to_string(dir.join("tape128_9440_2")).unwrap();
-    let result = parse_endf_file2(&endf_content);
+    let rd = parse_endf_file2(&endf_content)
+        .expect("Pu-240 LFW=1/LRF=1 Case-B tape must parse end-to-end");
+
+    // NER=2: one resolved range + one URR range.
+    assert_eq!(rd.ranges.len(), 2, "Pu-240 has NER=2 (resolved + URR)");
+    let urr_range = rd
+        .ranges
+        .iter()
+        .find(|r| r.urr.is_some())
+        .expect("the URR (LRU=2) range must carry parsed UrrData");
+    let urr = urr_range.urr.as_ref().unwrap();
+    assert_eq!(urr.lrf, 1, "URR formalism is LRF=1 (Case B)");
+    // CONT (line 539): SPI=0, AP=0.888, NE=14, NLS=3.
+    assert_eq!(urr.l_groups.len(), 3, "NLS=3 L-groups");
+
+    // First L-group (L=0, line 543): one J-group.
+    let lg0 = &urr.l_groups[0];
+    assert_eq!(lg0.l, 0, "first L-group is L=0");
+    assert_eq!(lg0.j_groups.len(), 1, "L=0 has NJS=1");
+
+    // First J-group body (lines 545-548) + per-J control (line 544).
+    let jg = &lg0.j_groups[0];
+    assert!((jg.j - 0.5).abs() < 1e-6, "AJ = {}", jg.j);
+    assert!((jg.amun - 1.0).abs() < 1e-6, "AMUN = {}", jg.amun);
+    // MUF (fission DOF) from the per-J control L2 field.
+    assert!((jg.amuf - 1.0).abs() < 1e-6, "AMUF (MUF) = {}", jg.amuf);
+    assert!((jg.d[0] - 13.10).abs() < 1e-6, "D = {}", jg.d[0]);
+    assert!((jg.gn[0] - 1.572e-3).abs() < 1e-9, "GNO = {}", jg.gn[0]);
+    assert!((jg.gg[0] - 3.100e-2).abs() < 1e-9, "GG = {}", jg.gg[0]);
+
+    // Shared energy grid (lines 540-542): NE=14 points, 5700..40000 eV.
+    assert_eq!(jg.energies.len(), 14, "NE=14 shared energy points");
+    assert!((jg.energies[0] - 5700.0).abs() < 1e-3);
+    assert!((jg.energies[13] - 40000.0).abs() < 1e-3);
+
+    // Energy-dependent fission widths: NE=14 values, first and last checked.
+    assert_eq!(jg.gf.len(), 14, "NE=14 fission widths");
+    assert!((jg.gf[0] - 1.256e-3).abs() < 1e-9, "GF[0] = {}", jg.gf[0]);
     assert!(
-        result.is_err(),
-        "tr129e: expected parse error for LFW=1+LRF=2 dual-range file"
+        (jg.gf[13] - 1.403e-3).abs() < 1e-9,
+        "GF[13] = {}",
+        jg.gf[13]
     );
+
+    // Sanity on the other L-groups' NJS (lines 549, 560: NJS=2 each).
+    assert_eq!(urr.l_groups[1].j_groups.len(), 2, "L=1 has NJS=2");
+    assert_eq!(urr.l_groups[2].j_groups.len(), 2, "L=2 has NJS=2");
 }
 
 #[test]

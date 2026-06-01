@@ -1290,13 +1290,23 @@ fn parse_endf_int(line: &str, field_index: usize) -> Result<i32, EndfParseError>
 /// For each L:
 ///   CONT: AWRI, 0, L, 0, NJS, 0
 ///   For each J:
-///     LIST: [D, AJ, AMUN, GNO, GG, 0] + NE fission widths
+///     LIST control: 0.0, 0.0, L, MUF, NE+6, 0
+///     LIST body:    [D, AJ, AMUN, GNO, GG, 0] + NE fission widths
 /// ```
+///
+/// Each per-J record is a full ENDF LIST: a control line carrying the data
+/// count `N1 = NE+6` and the fission degrees-of-freedom `MUF` (the L2 field),
+/// followed by `NE+6` data values.  The control line MUST be consumed before
+/// the body — omitting it misaligns the line stream by one record per J-group.
 ///
 /// Other widths (D, GNO, GG) are energy-independent (single values).
 /// Only fission widths (GF) are tabulated at the shared energy grid.
 ///
-/// Reference: ENDF-6 §2.2.2.1 Case B; SAMMY File2Unres.f90 l.165
+/// Reference: ENDF-6 §2.2.2.1 Case B; SCALE/openScale `File2.cpp`
+/// (`lfw==1 && lrf==1` branch, per-J `list.readData`/`cont.readData`) and
+/// `File2Unres.f90` (read loop, per-J `ControlEndf_read` + `ListEndf_read`;
+/// `File2Unres_getMuf` reads MUF from the control L2 field, `getNeJ` reads
+/// `N1 = NE+6`).
 fn parse_urr_lfw1_lrf1(ctx: &mut RangeParseContext<'_>) -> Result<ResonanceRange, EndfParseError> {
     // CONT: SPI, AP, LSSF, 0, NE, NLS
     let header = parse_cont(ctx.lines, ctx.pos)?;
@@ -1320,7 +1330,22 @@ fn parse_urr_lfw1_lrf1(ctx: &mut RangeParseContext<'_>) -> Result<ResonanceRange
         let mut j_groups = Vec::with_capacity(njs);
 
         for _ in 0..njs {
-            // LIST: [D, AJ, AMUN, GNO, GG, 0] + NE fission widths
+            // Per-J LIST control: 0.0, 0.0, L, MUF, NE+6, 0
+            // MUF (fission degrees of freedom) is the L2 field; the data
+            // count N1 must equal NE+6.  Consuming this control record keeps
+            // the line stream aligned — the body follows on the next lines.
+            let j_cont = parse_cont(ctx.lines, ctx.pos)?;
+            let muf = j_cont.l2;
+            let n1 = checked_count(j_cont.n1, "N1")?;
+            // SCALE validates this exact relation (File2.cpp: N1-6 == NE).
+            if n1 != ne + 6 {
+                return Err(EndfParseError::UnsupportedFormat(format!(
+                    "URR LFW=1/LRF=1: per-J N1={n1} ≠ NE+6={} (NE={ne})",
+                    ne + 6
+                )));
+            }
+
+            // LIST body: [D, AJ, AMUN, GNO, GG, 0] + NE fission widths
             let values = parse_list_values(ctx.lines, ctx.pos, ne + 6)?;
 
             let d = values[0];
@@ -1336,7 +1361,9 @@ fn parse_urr_lfw1_lrf1(ctx: &mut RangeParseContext<'_>) -> Result<ResonanceRange
             j_groups.push(UrrJGroup {
                 j: aj,
                 amun,
-                amuf: 0.0, // LRF=1 doesn't have AMUF
+                // Case B carries the fission degrees of freedom MUF in the
+                // per-J control record's L2 field; store it as AMUF.
+                amuf: muf as f64,
                 energies: fission_energies.clone(),
                 d: vec![d],
                 gx: vec![0.0],
@@ -2453,31 +2480,80 @@ mod tests {
         );
     }
 
-    /// LFW=1 (energy-dependent fission widths) URR is gracefully skipped.
+    /// LFW=1/LRF=1 (energy-dependent fission widths) URR is fully parsed.
     ///
-    /// ENDF-6 §2.2.2.1 Case B: LFW=1, LRF=1 has a shared energy grid
-    /// followed by per-J LIST blocks of NE+6 values.  The parser skips this
-    /// layout correctly and returns no URR data.
+    /// ENDF-6 §2.2.2.1 Case B: a shared NE-point energy grid is followed,
+    /// for each (L, J), by a full LIST record — a control line
+    /// `[0.0, 0.0, L, MUF, NE+6, 0]` and then a body
+    /// `[D, AJ, AMUN, GNO, GG, 0] + GF(1..NE)`.  The per-J control line MUST
+    /// be consumed before the body; otherwise the line stream misaligns by
+    /// one record per J-group and the wrong values are read.
     ///
-    /// This synthetic snippet has: NE=2, NLS=1, NJS=1.
+    /// This fixture is standards-compliant (it includes the per-J control
+    /// line), so it fails against a parser that omits that read: the body
+    /// `[D, AJ, ...]` would be misread from the control line, yielding
+    /// `AJ=0` and `GF=[10, 3]` instead of the values asserted below.
+    ///
+    /// The fixture has NE=2, NLS=1, NJS=1, MUF=1.
     #[test]
-    fn test_lfw1_urr_gracefully_skipped() {
+    fn test_lfw1_lrf1_urr_fully_parsed() {
         const ENDF: &str =
             include_str!("../../../tests/data/synthetic/lfw1_urr_gracefully_skipped.endf");
 
         let data = parse_endf_file2(ENDF).expect("LFW=1 URR parse should succeed");
-        // LFW=1/LRF=1 is now fully parsed — URR data should be present.
+        // LFW=1/LRF=1 is fully parsed — URR data should be present.
         let urr_count = data.ranges.iter().filter(|r| r.urr.is_some()).count();
         assert_eq!(urr_count, 1, "LFW=1/LRF=1 URR should be parsed");
         let urr = data.ranges.iter().find(|r| r.urr.is_some()).unwrap();
         let urr_data = urr.urr.as_ref().unwrap();
         assert_eq!(urr_data.lrf, 1);
         assert_eq!(urr_data.l_groups.len(), 1);
+        assert_eq!(urr_data.l_groups[0].l, 0, "L-value");
+        assert_eq!(urr_data.l_groups[0].j_groups.len(), 1, "one J-group");
+
         let jg = &urr_data.l_groups[0].j_groups[0];
-        // Fission widths should be energy-dependent (2 values from NE=2)
+        // Scalar (energy-independent) parameters from the LIST body row 0.
+        assert!((jg.j - 3.0).abs() < 1e-6, "AJ = {}", jg.j);
+        assert!((jg.amun - 1.0).abs() < 1e-6, "AMUN = {}", jg.amun);
+        // MUF (fission degrees of freedom) comes from the per-J control L2.
+        assert!((jg.amuf - 1.0).abs() < 1e-6, "AMUF (MUF) = {}", jg.amuf);
+        assert_eq!(jg.d.len(), 1);
+        assert!((jg.d[0] - 10.0).abs() < 1e-6, "D = {}", jg.d[0]);
+        assert_eq!(jg.gn.len(), 1);
+        assert!((jg.gn[0] - 0.05).abs() < 1e-6, "GNO = {}", jg.gn[0]);
+        assert_eq!(jg.gg.len(), 1);
+        assert!((jg.gg[0] - 0.04).abs() < 1e-6, "GG = {}", jg.gg[0]);
+
+        // Fission widths are energy-dependent (NE=2 values on the shared grid).
+        assert_eq!(jg.energies.len(), 2, "shared energy grid has NE points");
+        assert!(
+            (jg.energies[0] - 600.0).abs() < 1e-3,
+            "E[0] = {}",
+            jg.energies[0]
+        );
+        assert!(
+            (jg.energies[1] - 30000.0).abs() < 1e-3,
+            "E[1] = {}",
+            jg.energies[1]
+        );
         assert_eq!(jg.gf.len(), 2, "LFW=1 should have NE fission widths");
         assert!((jg.gf[0] - 0.1).abs() < 1e-6, "GF[0] = {}", jg.gf[0]);
         assert!((jg.gf[1] - 0.2).abs() < 1e-6, "GF[1] = {}", jg.gf[1]);
+    }
+
+    /// A per-J LIST control whose `N1 != NE+6` is a malformed Case-B record.
+    /// The parser must reject it — this covers the per-J N1 validation guard
+    /// (the SCALE `list.getN1()-6 == ener.getNtot()` relation). The fixture is
+    /// byte-identical to the valid one except the per-J control N1 (8 -> 7).
+    #[test]
+    fn test_lfw1_lrf1_urr_rejects_bad_perj_n1() {
+        const ENDF: &str = include_str!("../../../tests/data/synthetic/lfw1_urr_bad_perj_n1.endf");
+
+        let err = parse_endf_file2(ENDF).unwrap_err();
+        assert!(
+            err.to_string().contains("N1=") && err.to_string().contains("NE+6"),
+            "expected per-J N1 != NE+6 rejection, got: {err}"
+        );
     }
 
     /// LRU=0 range with non-zero L1 in SPI/AP CONT is rejected.
