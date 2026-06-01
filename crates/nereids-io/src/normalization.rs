@@ -179,23 +179,28 @@ pub fn normalize(
 
 /// Reject a raw-counts array that contains a non-finite or negative value.
 ///
-/// Mirrors `nereids_fitting::joint_poisson::validate_counts`: detector counts
-/// are non-negative by construction (zero is legitimate), so a NaN, ±∞, or
-/// negative entry signals an upstream loader / normalisation bug that must be
-/// surfaced rather than silently clamped.  Reports the first offending flat
-/// index and value.
+/// Detector counts are non-negative by construction (zero is legitimate), so a
+/// NaN, ±∞, or negative entry signals an upstream loader / normalisation bug
+/// that must be surfaced rather than silently clamped.  Reports the first
+/// offending flat index and value.
+///
+/// The finite-&-non-negative invariant itself lives in
+/// [`nereids_core::validation::first_non_finite_or_negative`] so that the
+/// `nereids-fitting` joint-Poisson and this I/O loader enforce *identical*
+/// semantics (`NaN < 0.0` is `false`, so the check pairs `is_finite()` with
+/// the order comparison); this wrapper only maps the offending element onto
+/// the `IoError` message wording.
 fn validate_counts<D: ndarray::Dimension>(
     counts: &ndarray::ArrayBase<impl ndarray::Data<Elem = f64>, D>,
     field: &str,
 ) -> Result<(), IoError> {
-    for (i, &v) in counts.iter().enumerate() {
-        if !v.is_finite() || v < 0.0 {
-            return Err(IoError::InvalidParameter(format!(
+    nereids_core::validation::first_non_finite_or_negative(counts.iter().copied()).map_err(
+        |(i, v)| {
+            IoError::InvalidParameter(format!(
                 "{field} counts at flat index {i} must be finite and >= 0, got {v}"
-            )));
-        }
-    }
-    Ok(())
+            ))
+        },
+    )
 }
 
 /// Extract a single spectrum (all TOF bins) from a pixel in the 3D array.

@@ -756,22 +756,27 @@ fn read_tof_axis(hist_group: &hdf5::Group) -> Result<Vec<f64>, IoError> {
 
     let edges: Vec<f64> = raw.iter().map(|&v| v * scale).collect();
 
-    // Validate the TOF axis is strictly monotonic and positive, mirroring the
-    // spectrum-file load path (`guided::load` runs `validate_monotonic` on the
-    // parsed spectrum before use).  A non-increasing, NaN, or non-positive TOF
-    // edge produces a `tof_to_energy` NaN / negative-energy downstream; reject
-    // it here at the I/O boundary instead.  Run `validate_monotonic` first — it
-    // rejects equal / decreasing / NaN, so afterwards every edge is finite and
-    // strictly increasing, and a single positivity check on the first edge
-    // proves the whole axis is positive.
-    crate::spectrum::validate_monotonic(&edges)?;
-    if let Some(&first) = edges.first()
-        && first <= 0.0
-    {
-        return Err(IoError::InvalidParameter(format!(
-            "NeXus TOF axis must be positive, but first edge is {first}"
-        )));
+    // Validate the TOF axis is finite, strictly positive, and strictly
+    // increasing, mirroring the spectrum-file load path (`guided::load` runs
+    // `validate_monotonic` on the parsed spectrum before use).  A non-finite,
+    // non-positive, or non-increasing TOF edge produces a `tof_to_energy` NaN /
+    // negative-energy downstream; reject it here at the I/O boundary instead.
+    //
+    // `validate_monotonic` alone is *not* sufficient for the finite/positive
+    // half: a trailing `+∞` satisfies `prev < +∞` (so monotonicity passes), a
+    // single-edge axis never enters `windows(2)` at all, and `first <= 0.0` is
+    // bypassed by `NaN` (`NaN <= 0.0` is `false`).  Check every scaled edge
+    // explicitly with `is_finite() && > 0.0` (the `is_finite()` half is what
+    // catches `NaN` / `±∞`, which order comparisons silently pass), then defer
+    // the strictly-increasing requirement to `validate_monotonic`.
+    for (i, &edge) in edges.iter().enumerate() {
+        if !edge.is_finite() || edge <= 0.0 {
+            return Err(IoError::InvalidParameter(format!(
+                "NeXus TOF axis edge {i} must be finite and positive, got {edge}"
+            )));
+        }
     }
+    crate::spectrum::validate_monotonic(&edges)?;
 
     Ok(edges)
 }
@@ -787,21 +792,51 @@ fn read_f64_attr(group: &hdf5::Group, name: &str) -> Option<f64> {
 /// Read the dead-pixel mask from `/entry/pixel_masks/dead`, validating its
 /// shape against the detector's `(height, width)`.
 ///
-/// Returns `Ok(None)` when the mask group / dataset is simply absent (a file
-/// without a dead-pixel mask is valid).  Returns `Err(ShapeMismatch)` when the
-/// mask is present but does not match the counts' spatial dimensions: applying
-/// a mismatched mask would silently mask the wrong pixels (or be dropped
-/// entirely), so the mismatch is surfaced at the I/O boundary instead.
+/// Returns `Ok(None)` when the mask group / dataset is simply *absent* (a file
+/// without a dead-pixel mask is valid).  Returns `Err` when the mask is
+/// *present but malformed*:
+/// * `pixel_masks` exists but is not a group, or `dead` exists but is not a
+///   readable dataset — surfaced as `InvalidParameter` rather than silently
+///   treated as absence (a malformed mask is an upstream-writer bug, and
+///   silently dropping it would mask the wrong pixels or none at all);
+/// * the mask shape does not match the counts' spatial dimensions — surfaced
+///   as `ShapeMismatch`.
+///
+/// Absence vs malformed is decided by link existence (`member_names`), not by
+/// whether `group()` / `dataset()` *succeed*: those collapse "the link is not
+/// there" and "the link is there but the wrong object kind / unreadable" into
+/// the same `Err`, which would otherwise mask real corruption as absence.
 fn read_dead_pixel_mask(
     entry: &hdf5::Group,
     expected_hw: (usize, usize),
 ) -> Result<Option<ndarray::Array2<bool>>, IoError> {
-    let Ok(masks) = entry.group("pixel_masks") else {
+    // `pixel_masks` link absent → no mask (valid file).
+    let entry_members = entry
+        .member_names()
+        .map_err(|e| IoError::InvalidParameter(format!("Failed to list /entry members: {e}")))?;
+    if !entry_members.iter().any(|n| n == "pixel_masks") {
         return Ok(None);
-    };
-    let Ok(dead_ds) = masks.dataset("dead") else {
+    }
+    // Link present but not openable as a group → malformed, not absent.
+    let masks = entry.group("pixel_masks").map_err(|e| {
+        IoError::InvalidParameter(format!(
+            "/entry/pixel_masks is present but is not a readable group: {e}"
+        ))
+    })?;
+
+    // `dead` link absent → no mask (valid file).
+    let mask_members = masks.member_names().map_err(|e| {
+        IoError::InvalidParameter(format!("Failed to list /entry/pixel_masks members: {e}"))
+    })?;
+    if !mask_members.iter().any(|n| n == "dead") {
         return Ok(None);
-    };
+    }
+    // Link present but not openable as a dataset → malformed, not absent.
+    let dead_ds = masks.dataset("dead").map_err(|e| {
+        IoError::InvalidParameter(format!(
+            "/entry/pixel_masks/dead is present but is not a readable dataset: {e}"
+        ))
+    })?;
     let dead_u8: ndarray::Array2<u8> = dead_ds.read().map_err(|e| {
         IoError::InvalidParameter(format!("Failed to read /entry/pixel_masks/dead: {e}"))
     })?;
@@ -1179,9 +1214,68 @@ mod tests {
 
         let err = load_nexus_histogram(&path).unwrap_err();
         assert!(
-            err.to_string().contains("must be positive"),
+            err.to_string().contains("finite and positive"),
             "non-positive TOF should be rejected, got: {err}"
         );
+    }
+
+    /// A trailing `+∞` TOF edge satisfies `prev < +∞` so it passes a
+    /// monotonicity-only check, but it is not a real time — the per-edge
+    /// `is_finite()` guard must reject it.
+    #[test]
+    fn test_load_nexus_histogram_rejects_trailing_infinite_tof() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inf_tail_tof.h5");
+        // 1 angle, 1×1 spatial, 2 TOF bins → 3 edges, last is +∞.
+        let counts = vec![1u64, 2u64];
+        let tof_ns = vec![1000.0, 2000.0, f64::INFINITY];
+        create_test_histogram(&path, &counts, [1, 1, 1, 2], &tof_ns, None);
+
+        let err = load_nexus_histogram(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("finite and positive"),
+            "trailing +inf TOF edge should be rejected, got: {err}"
+        );
+    }
+
+    /// A single-bin axis has only 2 edges; if a malformed scale yields a
+    /// degenerate axis the per-edge guard still fires.  A 1-edge axis never
+    /// enters `windows(2)` at all, so `validate_monotonic` is vacuously OK —
+    /// the per-edge `is_finite() && > 0` check is the only thing that rejects
+    /// a lone `NaN` / `+∞` edge.  Exercise `read_tof_axis` directly so the
+    /// single-edge case is reachable without tripping the bin-count
+    /// cross-check in `load_nexus_histogram`.
+    #[test]
+    fn test_read_tof_axis_rejects_single_nan_or_inf_edge() {
+        let dir = tempfile::tempdir().unwrap();
+
+        for (name, edge) in [("nan", f64::NAN), ("inf", f64::INFINITY)] {
+            let path = dir.path().join(format!("single_{name}_edge.h5"));
+            let file = hdf5::File::create(&path).expect("create");
+            let entry = file.create_group("entry").expect("entry");
+            let hist = entry.create_group("histogram").expect("histogram");
+            hist.new_dataset::<f64>()
+                .shape([1])
+                .create("time_of_flight")
+                .expect("create tof")
+                .write_raw(&[edge])
+                .expect("write tof");
+            // No `units` attr → legacy-ns scale (finite, so the bad edge is
+            // preserved as bad, not normalised away).
+            drop(file);
+
+            let file = hdf5::File::open(&path).expect("reopen");
+            let hist_group = file
+                .group("entry")
+                .expect("entry")
+                .group("histogram")
+                .expect("histogram");
+            let err = read_tof_axis(&hist_group).expect_err("single bad edge must reject");
+            assert!(
+                err.to_string().contains("finite and positive"),
+                "single {name} edge should be rejected, got: {err}"
+            );
+        }
     }
 
     /// Create a histogram fixture that also carries a `/entry/pixel_masks/dead`
@@ -1242,6 +1336,53 @@ mod tests {
         let mask = data.dead_pixels.expect("mask present");
         assert_eq!(mask.dim(), (2, 3));
         assert!(mask[[0, 1]]);
+    }
+
+    /// A file with *no* `pixel_masks` group is valid: the mask is absent, not
+    /// malformed, so the load succeeds with `dead_pixels == None`.
+    #[test]
+    fn test_load_nexus_histogram_absent_dead_mask_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no_mask.h5");
+        let counts = vec![1u64; 2 * 3 * 2];
+        let tof_ns = vec![1000.0, 2000.0, 3000.0];
+        create_test_histogram(&path, &counts, [1, 2, 3, 2], &tof_ns, None);
+
+        let data = load_nexus_histogram(&path).expect("absent mask should load");
+        assert!(
+            data.dead_pixels.is_none(),
+            "absent dead mask must map to None"
+        );
+    }
+
+    /// A `/entry/pixel_masks/dead` link that exists but is the wrong object
+    /// kind (a group, not a dataset) is *present-but-malformed*: it must be
+    /// surfaced as an error, not silently swallowed as absence (which would
+    /// drop a real-but-corrupt mask and mask no pixels).
+    #[test]
+    fn test_load_nexus_histogram_rejects_present_but_invalid_dead_mask() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invalid_mask.h5");
+        let counts = vec![1u64; 2 * 3 * 2];
+        let tof_ns = vec![1000.0, 2000.0, 3000.0];
+        create_test_histogram(&path, &counts, [1, 2, 3, 2], &tof_ns, None);
+
+        // Write `dead` as a *group*, not a dataset — present but malformed.
+        let file = hdf5::File::append(&path).expect("reopen");
+        let entry = file.group("entry").expect("entry");
+        let masks = entry.create_group("pixel_masks").expect("pixel_masks");
+        masks.create_group("dead").expect("dead-as-group");
+        drop(file);
+
+        let err = load_nexus_histogram(&path).unwrap_err();
+        assert!(
+            matches!(err, IoError::InvalidParameter(_)),
+            "present-but-malformed dead mask must be InvalidParameter, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("dead") && err.to_string().contains("not a readable dataset"),
+            "error should identify the malformed dead dataset, got: {err}"
+        );
     }
 
     /// Codex review: `MultiAngleMode::Error` must reject multi-angle
