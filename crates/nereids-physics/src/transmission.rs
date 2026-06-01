@@ -144,6 +144,35 @@ fn extract_resonance_widths(resonance_data: &[&ResonanceData]) -> Vec<(f64, f64)
     pairs
 }
 
+/// Build the unbroadened cross-section vector on the extended/auxiliary grid
+/// from cached data-grid values.
+///
+/// Data-grid positions are copied verbatim from `xs_raw` (the cached
+/// unbroadened σ for this isotope); the auxiliary-only positions (boundary
+/// extension + fine-structure points) are evaluated fresh.  `is_data_point`
+/// marks which extended-grid indices are data-grid points.
+///
+/// This is the cheap reuse of cached XS that the base-XS family relies on: only
+/// the few hundred auxiliary points are recomputed, not the full grid.
+fn build_extended_xs_from_base(
+    ext_energies: &[f64],
+    data_indices: &[usize],
+    is_data_point: &[bool],
+    xs_raw: &[f64],
+    rd: &ResonanceData,
+) -> Vec<f64> {
+    let mut xs_ext = vec![0.0f64; ext_energies.len()];
+    for (data_i, &ext_i) in data_indices.iter().enumerate() {
+        xs_ext[ext_i] = xs_raw[data_i];
+    }
+    for (j, &e) in ext_energies.iter().enumerate() {
+        if !is_data_point[j] {
+            xs_ext[j] = reich_moore::cross_sections_at_energy(rd, e).total;
+        }
+    }
+    xs_ext
+}
+
 /// Errors from the transmission forward model.
 #[derive(Debug)]
 pub enum TransmissionError {
@@ -623,6 +652,15 @@ pub fn broadened_cross_sections_for_transmission(
     thickness_atoms_barn: f64,
     cancel: Option<&AtomicBool>,
 ) -> Result<Vec<Vec<f64>>, TransmissionError> {
+    // The Beer-Lambert→σ_eff inversion (step 5: σ_eff = −ln(T)/nd) divides by
+    // the thickness, so a non-positive or non-finite nd would yield ±∞/NaN
+    // cross-sections.  The docstring contract requires nd > 0; enforce it
+    // up-front before any work, matching the module's `InputMismatch` style.
+    if !thickness_atoms_barn.is_finite() || thickness_atoms_barn <= 0.0 {
+        return Err(TransmissionError::InputMismatch(format!(
+            "thickness_atoms_barn must be finite and > 0, got {thickness_atoms_barn}"
+        )));
+    }
     if !energies.windows(2).all(|w| w[0] <= w[1]) {
         return Err(ResolutionError::UnsortedEnergies.into());
     }
@@ -819,16 +857,8 @@ pub fn broadened_cross_sections_from_base(
             if let Some((ref ext_energies, ref data_indices)) = ext_grid {
                 let mask = is_data_point.as_ref().unwrap();
 
-                // Build extended XS: copy cached data-grid values, evaluate new points.
-                let mut xs_ext = vec![0.0f64; ext_energies.len()];
-                for (data_i, &ext_i) in data_indices.iter().enumerate() {
-                    xs_ext[ext_i] = xs_raw[data_i];
-                }
-                for (j, &e) in ext_energies.iter().enumerate() {
-                    if !mask[j] {
-                        xs_ext[j] = reich_moore::cross_sections_at_energy(rd, e).total;
-                    }
-                }
+                let xs_ext =
+                    build_extended_xs_from_base(ext_energies, data_indices, mask, xs_raw, rd);
 
                 let after_doppler = if temperature_k > 0.0 {
                     let params = DopplerParams::new(temperature_k, rd.awr)?;
@@ -910,16 +940,8 @@ pub fn broadened_cross_sections_with_analytical_derivative_from_base(
             if let Some((ref ext_energies, ref data_indices)) = ext_grid {
                 let mask = is_data_point.as_ref().unwrap();
 
-                // Build extended XS on auxiliary grid.
-                let mut xs_ext = vec![0.0f64; ext_energies.len()];
-                for (data_i, &ext_i) in data_indices.iter().enumerate() {
-                    xs_ext[ext_i] = xs_raw[data_i];
-                }
-                for (j, &e) in ext_energies.iter().enumerate() {
-                    if !mask[j] {
-                        xs_ext[j] = reich_moore::cross_sections_at_energy(rd, e).total;
-                    }
-                }
+                let xs_ext =
+                    build_extended_xs_from_base(ext_energies, data_indices, mask, xs_raw, rd);
 
                 // Doppler broaden + analytical derivative in one pass.
                 // Resolution is NOT applied (issue #442).
@@ -960,17 +982,27 @@ pub fn broadened_cross_sections_with_analytical_derivative_from_base(
 
 /// Compute a transmission spectrum from precomputed unbroadened cross-sections.
 ///
-/// Applies Doppler broadening and Beer-Lambert using cached base XS,
-/// then resolution broadening on the total transmission (issue #442).
-/// This skips the expensive Reich-Moore calculation, making it suitable
-/// for use inside `TransmissionFitModel::evaluate()` when temperature
-/// is a free parameter.
+/// Applies Doppler broadening and Beer-Lambert using cached base XS, then
+/// resolution broadening on the total transmission (issue #442).  This skips
+/// the expensive Reich-Moore calculation, making it suitable for use inside
+/// `TransmissionFitModel::evaluate()` when temperature is a free parameter.
+///
+/// The full pipeline runs on the **auxiliary extended grid** (boundary
+/// extension + resonance fine-structure points) so that Doppler AND resolution
+/// broadening have adequate quadrature support and correct boundary handling;
+/// the data-grid points are extracted LAST.  This mirrors the non-cached
+/// [`forward_model`] and [`broadened_cross_sections_for_transmission`] exactly
+/// — previously this cached path collapsed σ to the coarse data grid before
+/// resolution broadening, degrading the convolution near the grid edges and
+/// around narrow resonances.
 ///
 /// Pipeline:
-///   1. Doppler-broaden base σ (via `broadened_cross_sections_from_base`)
-///   2. Accumulate total attenuation: Σᵢ nᵢ·σ_{D,i}
-///   3. Beer-Lambert: T = exp(−attenuation)
-///   4. Resolution: T_broad = R ⊗ T  (when instrument is present)
+///   1. Per isotope: build σ on the extended grid (cached data-grid values +
+///      freshly-evaluated auxiliary points), Doppler-broaden on the extended grid
+///   2. Accumulate total attenuation on the extended grid: Σᵢ nᵢ·σ_{D,i}
+///   3. Beer-Lambert: T = exp(−attenuation) on the extended grid
+///   4. Resolution: T_broad = R ⊗ T on the extended grid (when instrument present)
+///   5. Extract the data-grid points
 pub fn forward_model_from_base_xs(
     energies: &[f64],
     base_xs: &[Vec<f64>],
@@ -987,36 +1019,91 @@ pub fn forward_model_from_base_xs(
             resonance_data.len(),
         )));
     }
+    for (i, row) in base_xs.iter().enumerate() {
+        if row.len() != energies.len() {
+            return Err(TransmissionError::InputMismatch(format!(
+                "base_xs[{i}] has {} energies but expected {}",
+                row.len(),
+                energies.len(),
+            )));
+        }
+    }
     let n = energies.len();
     if n == 0 {
         return Ok(vec![]);
     }
 
-    // Step 1: Doppler-only σ (resolution NOT applied — issue #442).
-    let doppler_xs = broadened_cross_sections_from_base(
-        energies,
-        base_xs,
-        resonance_data,
-        temperature_k,
-        instrument,
-    )?;
+    // Validate the data grid once before the per-isotope loop so resolution can
+    // use the presorted (unchecked) path, matching forward_model.
+    if instrument.is_some() && !energies.windows(2).all(|w| w[0] <= w[1]) {
+        return Err(ResolutionError::UnsortedEnergies.into());
+    }
 
-    // Step 2-3: accumulate attenuation, Beer-Lambert.
-    let mut total_attenuation = vec![0.0f64; n];
+    // Build the auxiliary extended grid (boundary + resonance fine-structure).
+    // SAMMY Ref: dat/mdat4.f90 Escale+Fspken+Add_Pnts.
+    let rd_refs: Vec<&ResonanceData> = resonance_data.iter().collect();
+    let ext_grid = build_aux_grid(energies, instrument, &rd_refs);
+    let is_data_point: Option<Vec<bool>> = ext_grid.as_ref().map(|(ext_e, di)| {
+        let mut mask = vec![false; ext_e.len()];
+        for &idx in di {
+            mask[idx] = true;
+        }
+        mask
+    });
+
+    // Working grid: the extended grid when available, else the data grid.
+    let (work_energies, work_len): (&[f64], usize) = if let Some((ref ext_e, _)) = ext_grid {
+        (ext_e.as_slice(), ext_e.len())
+    } else {
+        (energies, n)
+    };
+
+    // Step 1: per-isotope Doppler-broadened σ on the WORKING (extended) grid.
+    // Resolution is NOT applied here (issue #442) — it goes on total T below.
+    let doppler_xs: Result<Vec<Vec<f64>>, TransmissionError> = base_xs
+        .par_iter()
+        .zip(resonance_data.par_iter())
+        .map(|(xs_raw, rd)| {
+            let xs_ext = if let Some((ref ext_energies, ref data_indices)) = ext_grid {
+                let mask = is_data_point.as_ref().unwrap();
+                build_extended_xs_from_base(ext_energies, data_indices, mask, xs_raw, rd)
+            } else {
+                xs_raw.clone()
+            };
+            if temperature_k > 0.0 {
+                let params = DopplerParams::new(temperature_k, rd.awr)?;
+                doppler::doppler_broaden(work_energies, &xs_ext, &params).map_err(Into::into)
+            } else {
+                Ok(xs_ext)
+            }
+        })
+        .collect();
+    let doppler_xs = doppler_xs?;
+
+    // Step 2-3: accumulate attenuation on the working grid, then Beer-Lambert.
+    let mut total_attenuation = vec![0.0f64; work_len];
     for (xs, &thickness) in doppler_xs.iter().zip(thicknesses.iter()) {
         if thickness <= 0.0 {
             continue;
         }
-        for i in 0..n {
+        for i in 0..work_len {
             total_attenuation[i] += thickness * xs[i];
         }
     }
     let transmission: Vec<f64> = total_attenuation.iter().map(|&att| (-att).exp()).collect();
 
-    // Step 4: resolution broadening on total transmission.
+    // Step 4-5: resolution broadening on total transmission (on the working
+    // grid), then extract the data-grid points last.  When `instrument` is
+    // `None`, `build_aux_grid` returns `None`, so the working grid IS the data
+    // grid and `transmission` is returned directly (matching `forward_model`).
     if let Some(inst) = instrument {
-        resolution::apply_resolution(energies, &transmission, &inst.resolution)
-            .map_err(TransmissionError::from)
+        let t_broadened =
+            resolution::apply_resolution_presorted(work_energies, &transmission, &inst.resolution);
+        if let Some((_, ref data_indices)) = ext_grid {
+            Ok(data_indices.iter().map(|&i| t_broadened[i]).collect())
+        } else {
+            Ok(t_broadened)
+        }
     } else {
         Ok(transmission)
     }
@@ -1785,18 +1872,22 @@ mod tests {
         )
         .unwrap();
 
-        // Both use resolution after Beer-Lambert but may differ slightly
-        // due to extended-grid Doppler in forward_model vs data-grid Doppler
-        // in broadened_cross_sections_from_base.
+        // Both now run the IDENTICAL pipeline on the auxiliary extended grid
+        // (Doppler → Beer-Lambert → resolution, data points extracted last), so
+        // they must agree to floating-point round-off.  The cached path reuses
+        // the data-grid base XS, which is bit-identical to forward_model's fresh
+        // evaluation at those points; the auxiliary-only points are evaluated the
+        // same way in both.  (Before Fix #7 the cached path applied resolution on
+        // the coarse data grid and the two differed by ~1%.)
         let interior = 20..energies.len() - 20;
         let mut max_err = 0.0f64;
         for i in interior.clone() {
             max_err = max_err.max((t_ref[i] - t_base[i]).abs());
         }
         assert!(
-            max_err < 0.02,
-            "forward_model_from_base_xs with resolution should match \
-             forward_model.  Max error = {max_err}"
+            max_err < 1e-12,
+            "forward_model_from_base_xs with resolution must match forward_model \
+             to round-off (identical aux-grid pipeline).  Max error = {max_err}"
         );
 
         // Verify resolution actually made a difference (not a vacuous test).
@@ -1978,5 +2069,48 @@ mod tests {
         for &d in &dxs[0] {
             assert!(d.is_finite(), "∂σ/∂T must be finite");
         }
+    }
+
+    // ── Fix #8: broadened_cross_sections_for_transmission thickness guard ──
+
+    /// `broadened_cross_sections_for_transmission` divides by the thickness in
+    /// the σ_eff = −ln(T)/nd inversion, so a non-positive or non-finite
+    /// thickness must be rejected up-front (the docstring requires nd > 0).
+    #[test]
+    fn test_broadened_for_transmission_rejects_bad_thickness() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 5.0 + (i as f64) * 0.1).collect();
+        let inst = InstrumentParams {
+            resolution: resolution::ResolutionFunction::Gaussian(
+                resolution::ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
+            ),
+        };
+
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let err = broadened_cross_sections_for_transmission(
+                &energies,
+                std::slice::from_ref(&data),
+                300.0,
+                &inst,
+                bad,
+                None,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, TransmissionError::InputMismatch(_)),
+                "thickness = {bad} should be rejected with InputMismatch, got {err:?}"
+            );
+        }
+
+        // A valid positive thickness still succeeds.
+        let ok = broadened_cross_sections_for_transmission(
+            &energies,
+            std::slice::from_ref(&data),
+            300.0,
+            &inst,
+            0.001,
+            None,
+        );
+        assert!(ok.is_ok(), "valid thickness should succeed: {ok:?}");
     }
 }
