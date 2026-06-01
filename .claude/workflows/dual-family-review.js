@@ -18,8 +18,9 @@ export const meta = {
 // methodology this project converged on:
 //   - 2 independent LLM families per target: Claude (agent()) + Codex (codex exec)
 //   - P0/P1/P2 tiers (P3 excluded), file:line + primary-source evidence
-//   - a cross-LLM-family confirmation pass on every SINGLE-family finding
-//     (Claude findings verified by Codex; Codex findings verified by Claude)
+//   - a cross-LLM-family confirmation pass on every SINGLE-family P0/P1 finding
+//     (Claude findings verified by Codex and vice versa; P2s are reported as-is,
+//     NOT cross-verified — verifyVotes() returns 0 for P2)
 //
 // Why the cross-family pass is load-bearing (see memory):
 //   - "parent-agent re-derivation of a subagent's claim is NOT independent
@@ -35,12 +36,18 @@ export const meta = {
 // that physically lack spawn_task/Task*/MCP/PR-issue tools — enable with
 // config.hardEnforce=true from a session started AFTER those agent defs exist.
 //
-// Generalization vs the original inline bug-hunt code (the ONLY two changes):
+// Two SEMANTIC generalizations vs the original inline bug-hunt code:
 //   - the global MODE/DIFF_SPEC scope ternary is replaced by a per-target
 //     `scopeDirective` string (each caller decides full-crate vs diff scope);
 //   - the SAMMY-root override reads config.sammyRootOverride instead of A.sammyRoot.
-// Everything else (schemas, prompt builders, dedup/verify helpers, the
-// Find->Verify pipeline) is byte-for-byte the original logic.
+// Plus behaviour-neutral re-plumbing: CONTEXT_NOTE / ROUND_NOTE / SKIP_CODEX /
+// HARD now come from the passed-in `config` (not the caller's `A.*`),
+// `codexUsable` is computed at module scope, and the engine RETURNS structured
+// per-target results instead of continuing inline to a consolidation phase
+// (preflight + consolidation now live in each wrapper).
+// The prompt builders, schemas, dedup/verify helpers, and the Find->Verify
+// pipeline are byte-for-byte the original logic (verified by a prompt-equivalence
+// harness: 47/47 byte-identical agent prompts).
 //
 // args (passed in by the calling wrapper):
 //   args.pf      : { repoRoot, sammyRoot, codexAvailable, codexVersion, headSha, isWorktree }
@@ -361,6 +368,11 @@ const LENSES = [
 // Find -> Verify (pipelined per target; no barrier between them).
 // As soon as target X's two finders complete, X's findings are cross-verified
 // while target Y is still finding.
+//
+// Progress grouping uses each agent's `phase:` opt (not top-level phase('Find')
+// / phase('Verify') calls): because the pipeline interleaves one target's Verify
+// with another target's Find, explicit phase() boundaries would misrepresent the
+// interleaving. meta.phases still declares Find/Verify for the /workflows display.
 // ---------------------------------------------------------------------------
 const perTargetRaw = await pipeline(
   TARGETS,
@@ -525,4 +537,17 @@ const perTargetRaw = await pipeline(
 // Return structured per-target findings to the calling wrapper. The wrapper
 // owns final consolidation (cross-target dedup, report writing, disposition,
 // RECURRING tagging) — this engine is detection + per-target structuring only.
-return { perTarget: perTargetRaw.filter(Boolean), codexUsable }
+//
+// Surface dropped targets (a per-target pipeline that threw -> null) so the
+// wrapper can reconcile perTarget.length against its target count and fail
+// closed rather than silently under-report. The wrapper (not the engine) owns
+// the empty-targets policy: a sweep with no matching targets is an error there,
+// while a review round with no diverged branches is a valid no-op.
+const perTarget = perTargetRaw.filter(Boolean)
+const droppedTargets = perTargetRaw.length - perTarget.length
+if (droppedTargets > 0) {
+  log(
+    `WARNING: ${droppedTargets}/${perTargetRaw.length} target(s) produced no result (pipeline error) and were dropped — the caller should fail closed.`,
+  )
+}
+return { perTarget, droppedTargets, codexUsable }

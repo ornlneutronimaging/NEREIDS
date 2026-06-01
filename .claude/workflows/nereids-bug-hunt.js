@@ -226,6 +226,12 @@ function tierRank(t) {
 phase('Preflight')
 const domainKeys = Array.isArray(A.domains) && A.domains.length ? A.domains : ALL_DOMAINS.map((d) => d.key)
 const DOMAINS = ALL_DOMAINS.filter((d) => domainKeys.includes(d.key))
+// Fail closed on a misspelled args.domains key: an empty domain set must abort,
+// not sail through the engine to a "0 findings" all-clear report.
+if (!DOMAINS.length) {
+  log(`No domains matched ${JSON.stringify(domainKeys)} — check args.domains spelling. Aborting rather than emit a 0-findings all-clear.`)
+  return { aborted: true, reason: 'no domains matched (check args.domains)' }
+}
 
 const pf = await agent(
   `Resolve the environment for a NEREIDS bug-hunt. Run these and report via structured output:
@@ -308,7 +314,19 @@ const engineOut = await workflow('dual-family-review', {
   },
 })
 
-const domainResults = (engineOut && engineOut.perTarget) || []
+// Fail closed: the engine owns the entire Find/Verify phase, so a missing,
+// malformed, or count-mismatched result must abort loudly — never degrade to a
+// "0 findings" all-clear report the user might read as paper-ready.
+if (!engineOut || !Array.isArray(engineOut.perTarget)) {
+  throw new Error('dual-family-review returned no usable result (engineOut.perTarget missing) — aborting rather than emit a false all-clear.')
+}
+if (engineOut.perTarget.length !== targets.length) {
+  throw new Error(
+    `dual-family-review returned ${engineOut.perTarget.length} result(s) for ${targets.length} target(s)` +
+      `${engineOut.droppedTargets ? ` (${engineOut.droppedTargets} dropped to a pipeline error)` : ''} — aborting rather than under-report.`,
+  )
+}
+const domainResults = engineOut.perTarget
 
 // ---------------------------------------------------------------------------
 // Phase: Consolidate (barrier — needs every domain to dedup across domains)
@@ -318,10 +336,14 @@ phase('Consolidate')
 const allVerified = domainResults.flatMap((r) => r.verified)
 const verifiedP0 = allVerified.filter((f) => (f.verifierTier || f.tier) === 'P0').sort((a, b) => tierRank(a.tier) - tierRank(b.tier))
 const verifiedP1 = allVerified.filter((f) => (f.verifierTier || f.tier) === 'P1')
+// A cross-family-CONFIRMED finding the verifier downgraded to effective P2 is a
+// real (if low-severity) defect; fold it into the P2 backlog so it is counted,
+// not dropped between the P0/P1 buckets and r.p2s (original-tier P2s only).
+const verifiedP2 = allVerified.filter((f) => (f.verifierTier || f.tier) === 'P2')
 const needsVerification = domainResults.flatMap((r) => r.needsVerification)
 const refuted = domainResults.flatMap((r) => r.refuted)
 const circular = domainResults.flatMap((r) => r.circular)
-const p2Backlog = domainResults.flatMap((r) => r.p2s)
+const p2Backlog = [...domainResults.flatMap((r) => r.p2s), ...verifiedP2]
 
 const tierTable = domainResults.map((r) => ({
   domain: r.domainKey,
