@@ -42,7 +42,8 @@ export const meta = {
 //   args.round        : integer   review round number, for the header (default 1)
 //   args.priorFindings: object[]  last round's findings ({branch,file,line,title})
 //                                  used to tag RECURRING (default none)
-//   args.skipCodex    : boolean   Claude-only (single-family -> NEEDS-VERIFICATION)
+//   args.skipCodex    : boolean   Claude-only (single-family -> P0/P1 NEEDS-VERIFICATION;
+//                                  P2s are single-family-reported either way)
 //   args.hardEnforce  : boolean   use restricted bug-hunt-{reader,runner} agents
 //   args.repoRoot     : string    explicit canonical root (overrides git-detected)
 //   args.sammyRoot    : string    override SAMMY source root for physics checks
@@ -84,10 +85,17 @@ function basename(f) {
 }
 // Slug a branch name into something safe for finding-ids and the engine's
 // `/tmp/bughunt-<slug>.prompt` codex temp path (branch names contain '/').
+// INJECTIVE: a short stable hash of the FULL name is appended so distinct
+// branches (e.g. `fix/foo-bar` vs `fix/foo/bar`) never collide to one key — a
+// collision would attach wrong crate metadata to one branch's findings and race
+// the two branches' codex temp files. djb2-style; deterministic (Date/random
+// are unavailable in workflow scripts).
 function slug(b) {
-  return String(b || '')
-    .replace(/[^A-Za-z0-9._-]+/g, '-')
-    .replace(/^-+|-+$/g, '')
+  const s = String(b || '')
+  const base = s.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'branch'
+  let h = 5381
+  for (let i = 0; i < s.length; i++) h = (((h << 5) + h) ^ s.charCodeAt(i)) | 0
+  return `${base}-${(h >>> 0).toString(36)}`
 }
 // Which crate (top-2 path segments) a changed file belongs to, for the blurb.
 function crateOf(f) {
@@ -201,14 +209,14 @@ const codexUsable = discover.codexAvailable && !SKIP_CODEX
 const reviewable = (discover.branches || []).filter((b) => b.diverged && (b.changedFiles || []).length)
 log(
   `round ${ROUND} | base=${BASE} | branches=${reviewable.length}/${(discover.branches || []).length} reviewable | ` +
-    `codex=${codexUsable ? discover.codexVersion || 'yes' : 'DISABLED (single-family — findings NEEDS-VERIFICATION)'} | ` +
+    `codex=${codexUsable ? discover.codexVersion || 'yes' : 'DISABLED (single-family — P0/P1 findings NEEDS-VERIFICATION)'} | ` +
     `sammy=${sammyRoot || 'NOT FOUND (physics findings lower-confidence)'}`,
 )
 
 if (!reviewable.length) {
   log('No diverged branches with changes — nothing to review.')
   return {
-    meta: { round: ROUND, base: BASE, repoRoot: discover.repoRoot, headSha: discover.headSha, codexUsable, sammyRoot, isWorktree: discover.isWorktree },
+    meta: { round: ROUND, base: BASE, repoRoot: discover.repoRoot, headSha: discover.headSha, codexUsable, sammyRoot: sammyRoot || '(not found)', isWorktree: discover.isWorktree },
     perBranch: [],
     mergeOrder: [],
     overlaps: [],
@@ -274,7 +282,19 @@ const engineOut = await workflow('dual-family-review', {
   },
 })
 
-const perTarget = (engineOut && engineOut.perTarget) || []
+// Fail closed: a missing/malformed or count-mismatched engine result must abort,
+// not silently become "zero reviewed branches". The engine surfaces droppedTargets
+// (a per-target pipeline that threw) so we reconcile against the target count.
+if (!engineOut || !Array.isArray(engineOut.perTarget)) {
+  throw new Error('dual-family-review returned no usable result (engineOut.perTarget missing) — aborting rather than report zero reviewed branches.')
+}
+if (engineOut.perTarget.length !== targets.length) {
+  throw new Error(
+    `dual-family-review returned ${engineOut.perTarget.length} result(s) for ${targets.length} target(s)` +
+      `${engineOut.droppedTargets ? ` (${engineOut.droppedTargets} dropped to a pipeline error)` : ''} — aborting rather than under-report.`,
+  )
+}
+const perTarget = engineOut.perTarget
 
 // ---------------------------------------------------------------------------
 // Phase: Consolidate (deterministic JS) — per-branch findings, suggested
@@ -292,6 +312,11 @@ const perBranch = perTarget.map((r) => {
   const verified = (r.verified || []).map(tag)
   const verifiedP0 = verified.filter((f) => (f.verifierTier || f.tier) === 'P0')
   const verifiedP1 = verified.filter((f) => (f.verifierTier || f.tier) === 'P1')
+  // Cross-family-CONFIRMED findings the verifier downgraded to effective P2 are
+  // real defects; route them into the P2 disposition channel below so they are
+  // surfaced (with a disposition + their VERIFIED status) rather than dropped
+  // between the P0/P1 buckets and r.p2s (which holds only original-tier P2s).
+  const verifiedP2 = verified.filter((f) => (f.verifierTier || f.tier) === 'P2')
   const needsVerification = (r.needsVerification || []).map(tag)
   const refuted = (r.refuted || []).map(tag)
   const circular = r.circular || []
@@ -301,7 +326,7 @@ const perBranch = perTarget.map((r) => {
   //  - P2 in a crate this branch already changes -> fix-now (same-crate P2 discipline)
   //  - P2 elsewhere    -> defer (collected into deferredP2s for issue-filing)
   //  - refuted         -> dismiss
-  const p2s = (r.p2s || []).map((f) => {
+  const p2s = [...(r.p2s || []), ...verifiedP2].map((f) => {
     const sameCrate = fileInChangedCrates(f.file, meta.crates)
     const disposition = sameCrate ? 'fix-now' : 'defer'
     const entry = { ...f, branch, recurring: isRecurring(branch, f), disposition }
@@ -321,7 +346,7 @@ const perBranch = perTarget.map((r) => {
     refuted,
     p2s,
     circular,
-    recurring: [...verified, ...needsVerification].filter((f) => f.recurring),
+    recurring: [...verified, ...needsVerification, ...p2s].filter((f) => f.recurring),
   }
 })
 

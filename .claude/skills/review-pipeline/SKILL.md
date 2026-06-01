@@ -7,7 +7,7 @@ user-invokable: true
 # Multi-Stage Review Pipeline
 
 Run an iterative review pipeline on active worktree branches. Repeats
-until zero P1s remain or the iteration limit is reached.
+until zero P0s and P1s remain or the iteration limit is reached.
 
 **This is the ONLY review mechanism.** Do not substitute with ad-hoc
 self-review agents, custom subagents, or any improvised review approach.
@@ -55,9 +55,9 @@ Invoking `review-core` from this skill is the sanctioned Workflow opt-in
 
 ## Iteration Policy
 
-- **Goal**: Zero P1s before pushing to remote.
+- **Goal**: Zero P0s and P1s before pushing to remote.
 - **Max iterations**: 4 per branch.
-- **Escalation**: If P1s persist after 4 rounds, stop and report to the user.
+- **Escalation**: If P0s/P1s persist after 4 rounds, stop and report to the user.
   Do NOT attempt a 5th round. The user must decide whether to continue,
   restructure the task, or conduct manual review.
 
@@ -100,7 +100,8 @@ cross-family refuted), `file`, `line`, `claim`, `reasoning`, `primarySource`,
 
 **Codex note:** `review-core` runs Codex as the second family via the engine.
 If `meta.codexUsable` is false (codex absent / `--skip-codex`), the round is
-single-family and *every* finding is NEEDS-VERIFICATION — say so. If codex was
+single-family and every **P0/P1** finding is NEEDS-VERIFICATION (P2s are
+single-family-reported either way) — say so. If codex was
 expected but consistently fails, check `codex --version` / upgrade
 (`brew upgrade codex` or `npm i -g @openai/codex@latest`); do not work around
 with model overrides. Codex is supplementary, not blocking.
@@ -176,12 +177,15 @@ After all fix agents complete:
 
 After pushing, decide:
 
-- **Zero P1s this round?** → Phase A complete. Proceed to Step 6 (Phase B).
-- **P1s found and fixed, round < 4?** → Loop back to Step 1 for round N+1.
+- **Zero P0s and zero P1s this round?** → Phase A complete. Proceed to Step 6 (Phase B).
+- **P0s/P1s found and fixed, round < 4?** → Loop back to Step 1 for round N+1.
   Pass `priorFindings` = this round's findings (each as
   `{branch, file, line, title}`) so `review-core` tags **RECURRING**.
-- **Round == 4 and P1s still found?** → STOP. Report: "Iteration limit
-  reached (4 rounds). P1s persist — escalating to human."
+- **Round == 4 and P0s/P1s still found?** → STOP. Report: "Iteration limit
+  reached (4 rounds). P0s/P1s persist — escalating to human."
+
+(P0 is the must-fix tier the `dual-family-review` engine assigns; the gate must
+cover P0+P1, not P1 alone — a verified P0 with zero P1s must NOT pass.)
 
 **Re-run between rounds, not just once.** File overlap can appear mid-pipeline
 (a fix lands in a file another branch also touches); the fresh `mergeOrder`
@@ -191,7 +195,7 @@ each round reflects this.
 
 ## Step 6: Phase B — Copilot Review (after push)
 
-After Phase A completes (zero P1s) and branches are pushed:
+After Phase A completes (zero P0s/P1s) and branches are pushed:
 
 1. Inform the user Phase A is complete and branches are pushed. Ask them to
    trigger Copilot review on GitHub. **STOP and wait.**
@@ -226,7 +230,7 @@ Present a concise summary table:
 
 **Merge order**: {from review-core meta.mergeOrder}
 **Review rounds**: Phase A: {N} round(s), Phase B: {N} Copilot comment(s)
-**Findings resolved**: {X} P1s fixed, {Y} P2s fixed, {Z} P2s deferred
+**Findings resolved**: {W} P0s fixed, {X} P1s fixed, {Y} P2s fixed, {Z} P2s deferred
 **Tests on branches**: {N} Rust tests — all pass
 ```
 
