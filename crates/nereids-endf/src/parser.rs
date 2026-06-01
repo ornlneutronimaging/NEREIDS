@@ -2541,6 +2541,21 @@ mod tests {
         assert!((jg.gf[1] - 0.2).abs() < 1e-6, "GF[1] = {}", jg.gf[1]);
     }
 
+    /// A per-J LIST control whose `N1 != NE+6` is a malformed Case-B record.
+    /// The parser must reject it — this covers the per-J N1 validation guard
+    /// (the SCALE `list.getN1()-6 == ener.getNtot()` relation). The fixture is
+    /// byte-identical to the valid one except the per-J control N1 (8 -> 7).
+    #[test]
+    fn test_lfw1_lrf1_urr_rejects_bad_perj_n1() {
+        const ENDF: &str = include_str!("../../../tests/data/synthetic/lfw1_urr_bad_perj_n1.endf");
+
+        let err = parse_endf_file2(ENDF).unwrap_err();
+        assert!(
+            err.to_string().contains("N1=") && err.to_string().contains("NE+6"),
+            "expected per-J N1 != NE+6 rejection, got: {err}"
+        );
+    }
+
     /// LRU=0 range with non-zero L1 in SPI/AP CONT is rejected.
     ///
     /// ENDF-6 §2.2: the SPI/AP CONT record for LRU=0 must be
