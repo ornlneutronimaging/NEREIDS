@@ -103,7 +103,7 @@ pub fn phase_shift(l: u32, rho: f64) -> f64 {
         // difference: it computes cos φ = (C·Y + S·X)/√G and sin φ =
         // (S·Y − C·X)/√G with G = X² + Y², C = cos ρ, S = sin ρ, which are
         // continuous through Y = 0.  Recovering φ = atan2(sin φ, cos φ) gives a
-        // pole-free phase that is identical (mod 2π) to ρ − atan(X/Y) away from
+        // pole-free phase that is identical (mod π) to ρ − atan(X/Y) away from
         // the pole — the same continuous form the l > 4 path already uses.
         // l=1: φ = ρ − atan(ρ), i.e. X = ρ, Y = 1 (SAMMY uses G = 1 + X²,
         // Sinphi = (S − C·ρ)/√G, Cosphi = (C + S·ρ)/√G).  atan(ρ) has no pole,
@@ -126,7 +126,8 @@ pub fn phase_shift(l: u32, rho: f64) -> f64 {
 /// Given the orbital rational numerator `x` and denominator `y` (the SAMMY `X`
 /// and `Y` for this l), returns
 ///   φ = atan2(S·Y − C·X,  C·Y + S·X),   S = sin ρ,  C = cos ρ,
-/// which equals ρ − atan(X/Y) modulo 2π but is continuous across Y = 0.
+/// which equals ρ − atan(X/Y) for Y > 0 and differs by π for Y < 0 (so they
+/// agree modulo π), and is continuous across Y = 0.
 ///
 /// Because every consumer uses the phase only through π-invariant combinations
 /// (sin²φ, sin 2φ, |U|²), removing the −π jump leaves all cross-sections
@@ -549,7 +550,8 @@ mod tests {
     }
 
     /// The continuous Sinsix form must agree with the original
-    /// `ρ − atan(X/Y)` form modulo 2π everywhere away from the pole, so every
+    /// `ρ − atan(X/Y)` form modulo π (they coincide for Y > 0 and differ by π
+    /// for Y < 0) everywhere away from the pole, so every
     /// cross-section observable (which consumes φ only via sin²φ / sin2φ /
     /// |U|²) is bit-for-bit unchanged.  We assert the π-invariant combinations
     /// match the old closed form to round-off.
