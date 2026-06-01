@@ -889,6 +889,96 @@ class TestSpatialMapCounts:
         )
 
 
+class TestSpatialMapBadValues:
+    """spatial_map_typed must reject non-finite / out-of-domain detector-cube
+    VALUES up front with a ``ValueError`` instead of silently clamping them via
+    the per-pixel ``v.max(0.0)`` / ``sigma.max(1e-10)`` sanitation.  The Rust
+    core raises ``InvalidParameter``, mapped to ``ValueError`` at the binding
+    boundary.  Shapes are valid, so the only possible ``ValueError`` is the
+    value check."""
+
+    @staticmethod
+    def _energies(n=20):
+        return np.linspace(1.0, 10.0, n)
+
+    def test_rejects_nan_sample(self, u238_data):
+        energies = self._energies()
+        n_e = len(energies)
+        sample = np.full((n_e, 2, 2), 100.0)
+        ob = np.full((n_e, 2, 2), 200.0)
+        sample[5, 0, 1] = np.nan
+        data = nereids.from_counts(sample, ob)
+        with pytest.raises(ValueError, match="sample_counts"):
+            nereids.spatial_map_typed(data, energies, [u238_data], max_iter=10)
+
+    def test_rejects_negative_sample(self, u238_data):
+        energies = self._energies()
+        n_e = len(energies)
+        sample = np.full((n_e, 2, 2), 100.0)
+        ob = np.full((n_e, 2, 2), 200.0)
+        sample[3, 1, 0] = -1.0
+        data = nereids.from_counts(sample, ob)
+        with pytest.raises(ValueError, match="sample_counts"):
+            nereids.spatial_map_typed(data, energies, [u238_data], max_iter=10)
+
+    def test_rejects_inf_open_beam(self, u238_data):
+        # A single bad open-beam bin would poison the spatially-averaged flux
+        # for every pixel; it must surface as a hard error.
+        energies = self._energies()
+        n_e = len(energies)
+        sample = np.full((n_e, 2, 2), 100.0)
+        ob = np.full((n_e, 2, 2), 200.0)
+        ob[7, 0, 0] = np.inf
+        data = nereids.from_counts(sample, ob)
+        with pytest.raises(ValueError, match="open_beam_counts"):
+            nereids.spatial_map_typed(data, energies, [u238_data], max_iter=10)
+
+    def test_rejects_nan_transmission(self, u238_data):
+        energies = self._energies()
+        n_e = len(energies)
+        trans = np.full((n_e, 2, 2), 0.8)
+        unc = np.full((n_e, 2, 2), 0.01)
+        trans[4, 1, 1] = np.nan
+        data = nereids.from_transmission(trans, unc)
+        with pytest.raises(ValueError, match="transmission"):
+            nereids.spatial_map_typed(data, energies, [u238_data], max_iter=10)
+
+    def test_rejects_zero_uncertainty(self, u238_data):
+        energies = self._energies()
+        n_e = len(energies)
+        trans = np.full((n_e, 2, 2), 0.8)
+        unc = np.full((n_e, 2, 2), 0.01)
+        unc[2, 0, 0] = 0.0
+        data = nereids.from_transmission(trans, unc)
+        with pytest.raises(ValueError, match="uncertainty"):
+            nereids.spatial_map_typed(data, energies, [u238_data], max_iter=10)
+
+    def test_rejects_nan_flux(self, u238_data):
+        energies = self._energies()
+        n_e = len(energies)
+        sample = np.full((n_e, 2, 2), 100.0)
+        flux = np.full((n_e, 2, 2), 200.0)
+        background = np.zeros((n_e, 2, 2))
+        flux[6, 1, 0] = np.nan
+        data = nereids.from_counts_with_nuisance(sample, flux, background)
+        with pytest.raises(ValueError, match="flux"):
+            nereids.spatial_map_typed(data, energies, [u238_data], max_iter=10)
+
+    def test_accepts_negative_transmission(self, u238_data):
+        # SAMMY does not reject negative transmission (noise / over-
+        # subtraction); only finiteness is required, so this must NOT raise.
+        energies = self._energies()
+        n_e = len(energies)
+        trans = np.full((n_e, 2, 2), 0.8)
+        unc = np.full((n_e, 2, 2), 0.01)
+        trans[4, 1, 1] = -0.05
+        data = nereids.from_transmission(trans, unc)
+        result = nereids.spatial_map_typed(
+            data, energies, [u238_data], max_iter=10
+        )
+        assert result.n_total == 4
+
+
 # ===========================================================================
 # fit_counts_spectrum_typed — single-spectrum counts-KL bindings
 # ===========================================================================
