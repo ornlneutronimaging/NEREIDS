@@ -118,13 +118,17 @@ roll_changelog() {
         echo "  skipped: $file (not found)"
         return
     fi
-    # Require EXACTLY one '## [Unreleased]' heading and one matching link-ref.
-    # awk rewrites every match, so a malformed file with duplicates must be
-    # refused (not corrupted) — presence alone is not enough.
-    local n_head n_link
+    # Require EXACTLY one '## [Unreleased]' heading and one '[Unreleased]:' link,
+    # and that the single link matches the current version. awk rewrites *every*
+    # '## [Unreleased]' heading and *every* '[Unreleased]: ' line, so the guard
+    # must count the same broad sets it acts on (n_link_any) — not just the
+    # version-matching subset (n_link_ok) — or a file with one correct link plus
+    # a stale duplicate would pass yet get double-rewritten.
+    local n_head n_link_any n_link_ok
     n_head=$(grep -cE '^## \[Unreleased\]$' "$file" || true)
-    n_link=$(grep -cE "^\[Unreleased\]: .*compare/v${CURRENT_RE}\.\.\.HEAD$" "$file" || true)
-    if [ "${n_head:-0}" -ne 1 ] || [ "${n_link:-0}" -ne 1 ]; then
+    n_link_any=$(grep -cE '^\[Unreleased\]: ' "$file" || true)
+    n_link_ok=$(grep -cE "^\[Unreleased\]: .*compare/v${CURRENT_RE}\.\.\.HEAD$" "$file" || true)
+    if [ "${n_head:-0}" -ne 1 ] || [ "${n_link_any:-0}" -ne 1 ] || [ "${n_link_ok:-0}" -ne 1 ]; then
         echo "  skipped: $file (need exactly one '## [Unreleased]' heading and one matching '[Unreleased]:' link — roll manually)"
         return
     fi
