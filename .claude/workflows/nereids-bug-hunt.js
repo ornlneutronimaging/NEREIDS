@@ -226,11 +226,17 @@ function tierRank(t) {
 phase('Preflight')
 const domainKeys = Array.isArray(A.domains) && A.domains.length ? A.domains : ALL_DOMAINS.map((d) => d.key)
 const DOMAINS = ALL_DOMAINS.filter((d) => domainKeys.includes(d.key))
-// Fail closed on a misspelled args.domains key: an empty domain set must abort,
-// not sail through the engine to a "0 findings" all-clear report.
-if (!DOMAINS.length) {
-  log(`No domains matched ${JSON.stringify(domainKeys)} — check args.domains spelling. Aborting rather than emit a 0-findings all-clear.`)
-  return { aborted: true, reason: 'no domains matched (check args.domains)' }
+// Fail closed on a misspelled args.domains key. Validate EVERY explicitly
+// requested key (not just the all-invalid case): a partial list like
+// ['03-physics','03-phsyics'] must abort, not silently audit the valid subset
+// and drop the typo. (The default all-domains path has nothing to validate.)
+if (Array.isArray(A.domains) && A.domains.length) {
+  const known = new Set(ALL_DOMAINS.map((d) => d.key))
+  const unknown = A.domains.filter((k) => !known.has(k))
+  if (unknown.length) {
+    log(`Unknown args.domains key(s) ${JSON.stringify(unknown)} (valid: ${ALL_DOMAINS.map((d) => d.key).join(', ')}) — aborting rather than silently auditing a subset.`)
+    return { aborted: true, reason: `unknown domain(s): ${unknown.join(', ')}` }
+  }
 }
 
 const pf = await agent(
