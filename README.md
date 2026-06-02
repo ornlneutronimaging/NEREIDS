@@ -165,6 +165,12 @@ pixi run test-python
 pixi run test-rust
 ```
 
+A full repo check can be run with:
+
+```bash
+pixi run test
+```
+
 ### Install NEREIDS from source
 
 Source builds require Rust and Cargo.
