@@ -37,14 +37,15 @@ output spatially resolved isotopic composition maps.
 
 ## Installation
 
-Choose the install path that matches how you want to use NEREIDS. Python users
-do not need to install Rust when a prebuilt wheel is available.
+NEREIDS is published as separate packages. Choose the package that matches the
+interface you want to use. Python users do not need to install Rust when a
+prebuilt wheel is available.
 
 ### Package overview
 
 | Package | What it installs | Use it for |
 | --- | --- | --- |
-| `nereids` | Python bindings for the NEREIDS analysis library | Python scripts, notebooks, and the MCP server |
+| `nereids` | Python bindings for the core NEREIDS analysis library | Python scripts, notebooks, and the MCP server |
 | `nereids-gui` | Standalone desktop GUI executable | Guided point-and-click analysis workflows |
 | `nereids[mcp]` | `nereids` plus MCP server dependencies | Running `nereids-mcp` for AI-agent workflows |
 | `nereids-core`, `nereids-endf`, `nereids-physics`, ... | Rust crates | Rust applications and libraries |
@@ -53,7 +54,9 @@ The GUI is separate from the Python import package. Install `nereids` for
 `import nereids`; install `nereids-gui` only if you want the desktop
 application.
 
-### Python package (recommended)
+### Python bindings (core library)
+
+Install the core Python package for notebooks, scripts, and direct API use:
 
 ```bash
 pip install nereids
@@ -63,27 +66,6 @@ Requires Python >= 3.10. Prebuilt wheels are available for Linux (x86_64),
 macOS (ARM), and Windows (x86_64). If `pip` falls back to building from source,
 install Rust and Cargo or use a Python/platform combination with a published
 wheel.
-
-**Pixi:**
-
-```bash
-pixi init
-pixi add python=3.13
-pixi add --pypi nereids
-```
-
-### Rust crates
-
-For Rust projects, add individual crates to your `Cargo.toml`:
-
-```toml
-[dependencies]
-nereids-core = "0.1"
-nereids-endf = "0.1"
-nereids-physics = "0.1"
-```
-
-This path requires a Rust toolchain.
 
 ### GUI application
 
@@ -118,7 +100,115 @@ spatial density-map workflows through the Python bindings.
 
 ```bash
 pip install "nereids[mcp]"
+```
+
+See [Quick Start (MCP)](#quick-start-mcp) for the server command, client
+configuration, and manifest format.
+
+### Install with Pixi
+
+If you use [Pixi](https://pixi.sh/), install the same Python packages as PyPI
+dependencies in the Pixi environment:
+
+```bash
+pixi init
+pixi add python=3.13
+pixi add --pypi nereids
+pixi run python -c "import nereids"
+```
+
+Install optional packages the same way:
+
+```bash
+# Desktop GUI
+pixi add --pypi nereids-gui
+pixi run nereids-gui
+
+# MCP server
+pixi add --pypi "nereids[mcp]"
+```
+
+To remove packages from the Pixi environment:
+
+```bash
+pixi remove --pypi nereids
+pixi remove --pypi nereids-gui
+```
+
+### From source
+
+Source builds require Rust and Cargo.
+
+```bash
+git clone https://github.com/ornlneutronimaging/NEREIDS.git
+cd NEREIDS
+cargo build --workspace --release
+cargo test --workspace --exclude nereids-python
+```
+
+Building the Python bindings from source also requires
+[maturin](https://www.maturin.rs/):
+
+```bash
+pip install maturin
+maturin develop --release -m bindings/python/Cargo.toml
+```
+
+For Rust applications, you can also depend on individual crates directly:
+
+```toml
+[dependencies]
+nereids-core = "0.1"
+nereids-endf = "0.1"
+nereids-physics = "0.1"
+```
+
+This path requires a Rust toolchain.
+
+## Quick Start (Python)
+
+```python
+import numpy as np
+import nereids
+
+# Load ENDF resonance data
+u238 = nereids.load_endf(92, 238)
+fe56 = nereids.load_endf(26, 56)
+
+# Energy grid (1-200 eV covers the strong U-238 resonances)
+energies = np.linspace(1.0, 200.0, 5000)
+
+# Forward model: transmission through a mixed sample
+transmission = nereids.forward_model(
+    energies,
+    isotopes=[(u238, 0.005), (fe56, 0.01)],  # (data, areal density in at/barn)
+    temperature_k=293.6,
+)
+
+# Spatial mapping with typed API
+trans_3d = transmission[:, None, None] * np.ones((1, 4, 4))  # (n_e, ny, nx)
+sigma_3d = np.full_like(trans_3d, 0.01)
+data = nereids.from_transmission(trans_3d, sigma_3d)
+result = nereids.spatial_map_typed(data, energies, [u238, fe56])
+
+print(f"Converged: {result.n_converged}/{result.n_total} pixels")
+```
+
+See the [examples/notebooks/](examples/notebooks/) directory for 17 tutorial
+notebooks covering foundations, building blocks, workflows, and applications.
+
+## Quick Start (MCP)
+
+After installing `nereids[mcp]`, start the server:
+
+```bash
 nereids-mcp
+```
+
+If NEREIDS is installed in a Pixi environment, run the server through Pixi:
+
+```bash
+pixi run nereids-mcp
 ```
 
 Example MCP client configuration:
@@ -181,57 +271,6 @@ Minimal spectrum manifest:
 }
 ---
 ```
-
-### From source
-
-Source builds require Rust and Cargo.
-
-```bash
-git clone https://github.com/ornlneutronimaging/NEREIDS.git
-cd NEREIDS
-cargo build --workspace --release
-cargo test --workspace --exclude nereids-python
-```
-
-Building the Python bindings from source also requires
-[maturin](https://www.maturin.rs/):
-
-```bash
-pip install maturin
-maturin develop --release -m bindings/python/Cargo.toml
-```
-
-## Quick Start (Python)
-
-```python
-import numpy as np
-import nereids
-
-# Load ENDF resonance data
-u238 = nereids.load_endf(92, 238)
-fe56 = nereids.load_endf(26, 56)
-
-# Energy grid (1-200 eV covers the strong U-238 resonances)
-energies = np.linspace(1.0, 200.0, 5000)
-
-# Forward model: transmission through a mixed sample
-transmission = nereids.forward_model(
-    energies,
-    isotopes=[(u238, 0.005), (fe56, 0.01)],  # (data, areal density in at/barn)
-    temperature_k=293.6,
-)
-
-# Spatial mapping with typed API
-trans_3d = transmission[:, None, None] * np.ones((1, 4, 4))  # (n_e, ny, nx)
-sigma_3d = np.full_like(trans_3d, 0.01)
-data = nereids.from_transmission(trans_3d, sigma_3d)
-result = nereids.spatial_map_typed(data, energies, [u238, fe56])
-
-print(f"Converged: {result.n_converged}/{result.n_total} pixels")
-```
-
-See the [examples/notebooks/](examples/notebooks/) directory for 17 tutorial
-notebooks covering foundations, building blocks, workflows, and applications.
 
 ## Architecture
 
