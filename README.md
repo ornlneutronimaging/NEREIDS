@@ -135,7 +135,7 @@ pixi remove --pypi nereids
 pixi remove --pypi nereids-gui
 ```
 
-### From source
+### Install From source
 
 Source builds require Rust and Cargo.
 
