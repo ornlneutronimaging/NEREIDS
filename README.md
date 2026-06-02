@@ -105,7 +105,7 @@ pip install "nereids[mcp]"
 See [Quick Start (MCP)](#quick-start-mcp) for the server command, client
 configuration, and manifest format.
 
-### Install with Pixi
+### Install everything with Pixi
 
 If you use [Pixi](https://pixi.sh/), install the same Python packages as PyPI
 dependencies in the Pixi environment:
