@@ -154,6 +154,17 @@ To remove the local Pixi environment, delete `.pixi/`:
 rm -rf .pixi
 ```
 
+#### Running tests with Pixi
+Run Python and Rust tests with pixi from the repo with:
+
+```bash
+pixi run test-python
+```
+
+```bash
+pixi run test-rust
+```
+
 ### Install NEREIDS from source
 
 Source builds require Rust and Cargo.
