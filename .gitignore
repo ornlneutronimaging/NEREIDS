@@ -58,3 +58,6 @@ tmp/
 
 # do not track manuscript folders
 .manuscripts/
+
+# ignore any scratch space
+.scratch/
