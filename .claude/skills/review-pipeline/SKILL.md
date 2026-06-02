@@ -50,8 +50,8 @@ Invoking `review-core` from this skill is the sanctioned Workflow opt-in
   branches diverged from main.
 - Branch name: scope to a single branch — pass it through as
   `branches: ["<name>"]`.
-- `--skip-codex`: pass `skipCodex: true` (single-LLM-family; all findings
-  return as NEEDS-VERIFICATION).
+- `--skip-codex`: pass `skipCodex: true` (single-LLM-family; every **P0/P1**
+  finding returns as NEEDS-VERIFICATION — P2s are single-family-reported either way).
 
 ## Iteration Policy
 
@@ -93,10 +93,12 @@ Workflow(name="review-core", args={
   counts: { branches, verifiedP0, verifiedP1, needsVerification, refuted, p2, recurring } }
 ```
 
-Each finding carries `status` (VERIFIED = ≥2 LLM families agreed;
-NEEDS-VERIFICATION = single-family / split / codex unavailable; REFUTED =
-cross-family refuted), `file`, `line`, `claim`, `reasoning`, `primarySource`,
-`suggestedFix`, `confidence`, and `recurring` (matched a prior round).
+Each VERIFIED / NEEDS-VERIFICATION / REFUTED finding carries `status` (VERIFIED
+= ≥2 LLM families agreed; NEEDS-VERIFICATION = single-family / split / codex
+unavailable; REFUTED = cross-family refuted); born-P2 findings (`p2s`) carry a
+`disposition` rather than a `status`. All findings carry `file`, `line`, `claim`,
+`reasoning`, `primarySource`, `suggestedFix`, `confidence`, and `recurring`
+(matched a prior round).
 
 **Codex note:** `review-core` runs Codex as the second family via the engine.
 If `meta.codexUsable` is false (codex absent / `--skip-codex`), the round is
@@ -113,7 +115,7 @@ with model overrides. Codex is supplementary, not blocking.
 Render the returned payload as a consistent per-branch report:
 
 1. **Per-branch table**: for each branch, Claude vs Codex tier counts and
-   VERIFIED P0 / VERIFIED P1 / NEEDS-VERIFICATION / REFUTED / P2 / RECURRING.
+   VERIFIED P0 / VERIFIED P1 / NEEDS-VERIFICATION / REFUTED / P2 / RECURRING / CIRCULAR.
 2. **Findings detail**, grouped by branch and confidence:
    - **VERIFIED** (cross-confirmed) — highest confidence, fix now.
    - **NEEDS-VERIFICATION** (single-family) — call out that these did NOT meet
@@ -125,10 +127,14 @@ Render the returned payload as a consistent per-branch report:
    - **Fix now** — VERIFIED P0/P1 and same-crate P2s.
    - **Defer** — P2s outside the changed crate(s) (already in `deferredP2s`).
    - **Dismiss** — false positives / impossible edge cases.
-4. **Suggested Merge Order** from `meta`/`mergeOrder` (+ any `overlaps`).
+4. **Suggested Merge Order** from the top-level `mergeOrder` (+ any `overlaps`).
 5. Report the round: "Review Round N of 4".
 6. **RECURRING**: any finding tagged `recurring` reappeared after a prior
    "fix" — flag it explicitly; the user must decide the approach.
+7. **Circular-validation risks**: surface every non-empty `circular[]` entry
+   (its `note`, `file:line`, family) — a test whose oracle may mirror buggy
+   behaviour is a HIGH-PRIORITY signal the engine computes but the gate must not
+   silently drop.
 
 ### P2 Deferral Discipline
 
@@ -234,7 +240,7 @@ Present a concise summary table:
 |----|--------|-------|-------------|---------------|
 | #{n} | {branch} | #{issue} | {1-line summary} | Phase A ✓ Phase B ✓ |
 
-**Merge order**: {from review-core meta.mergeOrder}
+**Merge order**: {from review-core's top-level mergeOrder}
 **Review rounds**: Phase A: {N} round(s), Phase B: {N} Copilot comment(s)
 **Findings resolved**: {W} P0s fixed, {X} P1s fixed, {Y} P2s fixed, {Z} P2s deferred
 **Tests on branches**: {N} Rust tests — all pass

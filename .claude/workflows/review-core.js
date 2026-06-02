@@ -221,8 +221,14 @@ if (BRANCHES) {
   }
 }
 
-// Only review branches that actually diverged from base (have new commits).
-const reviewable = (discover.branches || []).filter((b) => b.diverged && (b.changedFiles || []).length)
+// Dedupe discovered branches by name before filtering: if the discover agent
+// emits a branch twice (e.g. the same branch checked out in two worktrees with
+// shared refs), two same-`slug` targets would slip past the engine's
+// count-mismatch guard (N in, N out) and the branch would be presented + counted
+// twice. Only review branches that actually diverged from base (have new commits).
+const reviewable = [...new Map((discover.branches || []).map((b) => [b.branch, b])).values()].filter(
+  (b) => b.diverged && (b.changedFiles || []).length,
+)
 log(
   `round ${ROUND} | base=${BASE} | branches=${reviewable.length}/${(discover.branches || []).length} reviewable | ` +
     `codex=${codexUsable ? discover.codexVersion || 'yes' : 'DISABLED (single-family — P0/P1 findings NEEDS-VERIFICATION)'} | ` +
