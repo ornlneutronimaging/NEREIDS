@@ -37,18 +37,44 @@ output spatially resolved isotopic composition maps.
 
 ## Installation
 
-### Python (recommended)
+Choose the install path that matches how you want to use NEREIDS. Python users
+do not need to install Rust when a prebuilt wheel is available.
+
+### Package overview
+
+| Package | What it installs | Use it for |
+| --- | --- | --- |
+| `nereids` | Python bindings for the NEREIDS analysis library | Python scripts, notebooks, and the MCP server |
+| `nereids-gui` | Standalone desktop GUI executable | Guided point-and-click analysis workflows |
+| `nereids[mcp]` | `nereids` plus MCP server dependencies | Running `nereids-mcp` for AI-agent workflows |
+| `nereids-core`, `nereids-endf`, `nereids-physics`, ... | Rust crates | Rust applications and libraries |
+
+The GUI is separate from the Python import package. Install `nereids` for
+`import nereids`; install `nereids-gui` only if you want the desktop
+application.
+
+### Python package (recommended)
 
 ```bash
 pip install nereids
 ```
 
 Requires Python >= 3.10. Prebuilt wheels are available for Linux (x86_64),
-macOS (ARM), and Windows (x86_64).
+macOS (ARM), and Windows (x86_64). If `pip` falls back to building from source,
+install Rust and Cargo or use a Python/platform combination with a published
+wheel.
 
-### Rust
+**Pixi:**
 
-Add individual crates to your `Cargo.toml`:
+```bash
+pixi init
+pixi add python=3.13
+pixi add --pypi nereids
+```
+
+### Rust crates
+
+For Rust projects, add individual crates to your `Cargo.toml`:
 
 ```toml
 [dependencies]
@@ -57,7 +83,12 @@ nereids-endf = "0.1"
 nereids-physics = "0.1"
 ```
 
+This path requires a Rust toolchain.
+
 ### GUI application
+
+The GUI package installs the `nereids-gui` desktop executable. It is not needed
+for Python notebooks or scripts that use `import nereids`.
 
 **macOS (Homebrew):**
 
@@ -71,6 +102,12 @@ brew install --cask nereids
 ```bash
 pip install nereids-gui
 nereids-gui
+```
+
+To install both the Python package and GUI with `pip`:
+
+```bash
+pip install "nereids[gui]"
 ```
 
 ### MCP server for AI agents
@@ -147,6 +184,8 @@ Minimal spectrum manifest:
 
 ### From source
 
+Source builds require Rust and Cargo.
+
 ```bash
 git clone https://github.com/ornlneutronimaging/NEREIDS.git
 cd NEREIDS
@@ -154,7 +193,8 @@ cargo build --workspace --release
 cargo test --workspace --exclude nereids-python
 ```
 
-Python bindings require [maturin](https://www.maturin.rs/):
+Building the Python bindings from source also requires
+[maturin](https://www.maturin.rs/):
 
 ```bash
 pip install maturin
