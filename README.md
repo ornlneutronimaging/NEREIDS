@@ -105,34 +105,43 @@ pip install "nereids[mcp]"
 See [Quick Start (MCP)](#quick-start-mcp) for the server command, client
 configuration, and manifest format.
 
-### Install everything with Pixi
+### Install in this repo with Pixi
 
-If you use [Pixi](https://pixi.sh/), install the same Python packages as PyPI
-dependencies in the Pixi environment:
+This repository includes a Pixi configuration. From a checkout, create the
+development environment with:
 
 ```bash
-pixi init
-pixi add python=3.13
-pixi add --pypi nereids
+pixi install
+```
+
+Build and install the local Python bindings in that environment:
+
+```bash
+pixi run build
 pixi run python -c "import nereids"
 ```
 
-Install optional packages the same way:
+The build step compiles the local Rust/Python extension. The Pixi environment
+provides Rust and Cargo for this repo.
+
+Run the GUI through the repo task:
 
 ```bash
-# Desktop GUI
-pixi add --pypi nereids-gui
-pixi run nereids-gui
-
-# MCP server
-pixi add --pypi "nereids[mcp]"
+pixi run gui
 ```
 
-To remove packages from the Pixi environment:
+The default Pixi environment does not include the MCP extra. Add it before
+running the MCP server from the repo:
 
 ```bash
-pixi remove --pypi nereids
-pixi remove --pypi nereids-gui
+pixi add --pypi fastmcp
+pixi run nereids-mcp
+```
+
+To remove the local Pixi environment, delete `.pixi/`:
+
+```bash
+rm -rf .pixi
 ```
 
 ### Install NEREIDS from source
