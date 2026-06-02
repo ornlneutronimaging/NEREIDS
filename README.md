@@ -105,7 +105,17 @@ pip install "nereids[mcp]"
 See [Quick Start (MCP)](#quick-start-mcp) for the server command, client
 configuration, and manifest format.
 
-### Install in this repo with Pixi
+### Install everything with Pixi
+
+[Pixi](https://pixi.sh/) is a project environment manager. If you use Pixi, you can install and run
+the NEREIDS Python bindings, GUI, MCP server dependencies, Rust toolchain, and
+developer tools from one reproducible repo environment.
+
+Install Pixi first:
+
+```bash
+curl -fsSL https://pixi.sh/install.sh | sh
+```
 
 This repository includes a Pixi configuration. From a checkout, create the
 development environment with:
