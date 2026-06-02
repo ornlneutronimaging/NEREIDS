@@ -54,7 +54,7 @@ The GUI is separate from the Python import package. Install `nereids` for
 `import nereids`; install `nereids-gui` only if you want the desktop
 application.
 
-### Python bindings (core library)
+### Install NEREIDS Python bindings
 
 Install the core Python package for notebooks, scripts, and direct API use:
 
@@ -67,7 +67,7 @@ macOS (ARM), and Windows (x86_64). If `pip` falls back to building from source,
 install Rust and Cargo or use a Python/platform combination with a published
 wheel.
 
-### GUI application
+### Install NEREIDS GUI application
 
 The GUI package installs the `nereids-gui` desktop executable. It is not needed
 for Python notebooks or scripts that use `import nereids`.
@@ -92,7 +92,7 @@ To install both the Python package and GUI with `pip`:
 pip install "nereids[gui]"
 ```
 
-### MCP server for AI agents
+### Install NEREIDS MCP server for AI agents
 
 NEREIDS can run as a local [Model Context Protocol](https://modelcontextprotocol.io/)
 server so AI agents can inspect neutron-resonance data, fit spectra, and run
@@ -135,7 +135,7 @@ pixi remove --pypi nereids
 pixi remove --pypi nereids-gui
 ```
 
-### Install From source
+### Install NEREIDS from source
 
 Source builds require Rust and Cargo.
 
