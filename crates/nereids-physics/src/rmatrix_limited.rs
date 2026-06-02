@@ -519,8 +519,29 @@ fn spin_group_cross_sections(
             denom.inv()
         };
         for c in 0..nch {
+            // SAMMY gates the R-matrix accumulation on BOTH channels being
+            // open: rml/mrml07.f Setr lines 67-71 —
+            //   IF (Su.GT.Echan(K) .AND. Su.GT.Echan(L) .AND.
+            //     Beta(KL,Ires).NE.Zero) THEN
+            //       Rmat(1,KL) = Rmat(1,KL) + Alphar(Ires)*Beta(KL,Ires)
+            //       ...
+            // `Su.GT.Echan(K)` is exactly the open-channel test (line 118), which
+            // NEREIDS encodes as `!ws.is_closed[K]` (set in the channel-setup
+            // loop above for e_c ≤ 0 and the Coulomb-threshold case).  A channel
+            // below its threshold contributes nothing to R, including off-diagonal
+            // terms via a shared resonance width.  Skipping the whole row when c
+            // is closed avoids forming R[c,cp] for any cp.
+            if ws.is_closed[c] {
+                continue;
+            }
             let gc = ws.gamma_vals[c];
             for cp in 0..nch {
+                // Gate the off-/on-diagonal term on the partner channel cp also
+                // being open (the Su.GT.Echan(L) half of the SAMMY condition).
+                // (The Beta≠0 half is automatic: a zero width product adds 0.)
+                if ws.is_closed[cp] {
+                    continue;
+                }
                 ws.r_cplx[c * nch + cp] += gc * ws.gamma_vals[cp] * inv_denom;
             }
         }
@@ -1129,6 +1150,291 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Fix #6 (non-vacuous): a CLOSED channel must contribute nothing to the
+    /// R-matrix, even when a resonance carries a shared off-diagonal width that
+    /// couples it to an OPEN channel.
+    ///
+    /// SAMMY gates the R accumulation on both channels open (rml/mrml07.f Setr
+    /// lines 67-71: `IF (Su.GT.Echan(K) .AND. Su.GT.Echan(L) ...)`).  Before
+    /// this fix the un-gated loop formed R[open,closed] = γ_open·γ_closed/(E_n−E)
+    /// ≠ 0, which leaks into the open-channel cross-section through the level-
+    /// matrix inversion (XQ = Ỹ⁻¹·R picks up Ỹ⁻¹[0,1]·R[1,0]).
+    ///
+    /// This test (unlike the `resonances: vec![]` no-panic test, where R ≡ 0)
+    /// carries a resonance with a large off-diagonal width into a closed
+    /// channel, and asserts:
+    ///   (a) the gated cross-section equals the open-only-submatrix result
+    ///       (the same group with the closed channel's width zeroed); and
+    ///   (b) it differs from the pre-fix un-gated value (reconstructed here by
+    ///       building the full R including the closed-channel coupling and
+    ///       running the rest of the pipeline), so the gate is load-bearing.
+    #[test]
+    fn test_rml_closed_channel_excluded_from_rmatrix() {
+        use nereids_endf::resonance::{ParticlePair, RmlChannel, RmlData, RmlResonance, SpinGroup};
+
+        // Entrance: neutron (Z=0) + target (Z=74), l=0 so the open channel has
+        // full penetrability P_0 = ρ and a healthy cross-section.
+        let pp_entrance = ParticlePair {
+            ma: 1.0,
+            mb: 183.0,
+            za: 0.0,
+            zb: 74.0,
+            ia: 0.5,
+            ib: 0.0,
+            q: 0.0,
+            pnt: 1,
+            shf: 0, // l=0: shift is 0 regardless; L_0 = i·P_0 (finite, nonzero)
+            mt: 2,
+            pa: 1.0,
+            pb: 1.0,
+        };
+        // Inelastic neutron exit channel (MT=51), massive, with a very negative
+        // Q so e_c = e_cm + Q < 0 → CLOSED at the test energy.  l=1 with SHF=1 so
+        // the closed channel keeps a finite analytic shift S_1(iκ) = −1/(1−(κa)²)
+        // and L_c does NOT collapse to the 1/L_c → 1e30 decoupling sentinel.
+        // That sentinel (used for L_c ≈ 0) would otherwise numerically swamp the
+        // off-diagonal leak and make the test vacuous; a finite L_c keeps
+        // Ỹ⁻¹[0,1]·R[1,0] observable in the open channel.
+        let pp_closed = ParticlePair {
+            ma: 1.0,
+            mb: 183.0,
+            za: 0.0,
+            zb: 74.0,
+            ia: 0.5,
+            ib: 0.0,
+            // E_cm ≈ 100·183/184 ≈ 99.5 eV at E_lab=100; Q=−200 → e_c ≈ −100.5 eV
+            // (CLOSED), with |e_c| comparable so S_1(iκ) is moderate (not a pole).
+            q: -200.0,
+            pnt: 1,
+            shf: 1,
+            mt: 51,
+            pa: 1.0,
+            pb: 1.0,
+        };
+
+        let ch_open = RmlChannel {
+            particle_pair_idx: 0,
+            l: 0,
+            channel_spin: 0.5,
+            boundary: 0.0,
+            effective_radius: 8.3,
+            true_radius: 8.3,
+        };
+        let ch_closed = RmlChannel {
+            particle_pair_idx: 1,
+            l: 1,
+            channel_spin: 0.5,
+            boundary: 0.0,
+            effective_radius: 8.3,
+            true_radius: 8.3,
+        };
+
+        // KRM=2: widths ARE reduced amplitudes (copied verbatim), so the closed
+        // channel keeps a nonzero γ and the off-diagonal coupling γ_0·γ_1 is
+        // real and large pre-fix.
+        let res_full = RmlResonance {
+            energy: 120.0,
+            gamma_gamma: 0.0,       // KRM=2: no implicit capture
+            widths: vec![3.0, 5.0], // [open, closed]; large shared off-diagonal
+        };
+        // Open-only submatrix reference: zero the closed channel's width.
+        let res_open_only = RmlResonance {
+            energy: 120.0,
+            gamma_gamma: 0.0,
+            widths: vec![3.0, 0.0],
+        };
+
+        let make_rml = |res: RmlResonance| RmlData {
+            target_spin: 0.0,
+            awr: 183.0,
+            scattering_radius: 8.3,
+            krm: 2,
+            particle_pairs: vec![pp_entrance.clone(), pp_closed.clone()],
+            spin_groups: vec![SpinGroup {
+                j: 0.5,
+                parity: 1.0,
+                channels: vec![ch_open.clone(), ch_closed.clone()],
+                resonances: vec![res],
+                has_background_correction: false,
+            }],
+        };
+
+        // Evaluate off the pole (E ≠ E_n) so the result is well-conditioned.
+        let energy = 100.0;
+        let rml_full = make_rml(res_full.clone());
+        let rml_open_only = make_rml(res_open_only);
+
+        let (tot_g, elas_g, cap_g, fis_g) = cross_sections_for_rml_range(&rml_full, energy);
+        let (tot_ref, elas_ref, cap_ref, fis_ref) =
+            cross_sections_for_rml_range(&rml_open_only, energy);
+
+        // (a) Gated full-width result == open-only-submatrix result.
+        for (g, r, name) in [
+            (tot_g, tot_ref, "total"),
+            (elas_g, elas_ref, "elastic"),
+            (cap_g, cap_ref, "capture"),
+            (fis_g, fis_ref, "fission"),
+        ] {
+            assert!(
+                (g - r).abs() <= 1e-9 * r.abs().max(1.0),
+                "{name}: gated σ ({g}) must equal open-only-submatrix σ ({r}); \
+                 a closed channel must not couple into R"
+            );
+        }
+
+        // (b) The gate is load-bearing: reconstruct the PRE-FIX un-gated value
+        // by computing the full collision matrix WITHOUT the both-open gate, and
+        // confirm it differs from the gated result at the open entrance channel.
+        let ungated_tot = ungated_total_for_two_channel(&rml_full, energy);
+        // For this configuration the leak is large (gated ≈ 2.62 b vs un-gated
+        // ≈ 5.54 b, a >100% difference), so the gate is decisively load-bearing.
+        assert!(
+            (ungated_tot - tot_g).abs() > 1e-3,
+            "un-gated σ_total ({ungated_tot}) should differ from gated σ_total \
+             ({tot_g}); if equal, the off-diagonal closed-channel coupling does \
+             not affect the open channel and the test is vacuous"
+        );
+    }
+
+    /// Reconstruct the pre-fix (un-gated) σ_total for a 2-channel KRM=2 spin
+    /// group: builds the full complex R-matrix INCLUDING the closed-channel
+    /// off-diagonal coupling, then runs the same Ỹ⁻¹/XXXX/U pipeline as the
+    /// production code.  Used only to prove the Fix #6 gate is load-bearing.
+    fn ungated_total_for_two_channel(rml: &RmlData, energy_ev: f64) -> f64 {
+        use num_complex::Complex64;
+
+        let awr = rml.awr;
+        let sg = &rml.spin_groups[0];
+        let nch = sg.channels.len();
+        assert_eq!(nch, 2, "helper is specialised to 2 channels");
+        let pps = &rml.particle_pairs;
+
+        let e_cm = channel::lab_to_cm_energy(energy_ev, awr);
+        let mut p_c = vec![0.0f64; nch];
+        let mut s_c = vec![0.0f64; nch];
+        let mut phi_c = vec![0.0f64; nch];
+        let mut is_closed = vec![false; nch];
+        let mut is_entrance = vec![false; nch];
+
+        for (c, ch) in sg.channels.iter().enumerate() {
+            let pp = &pps[ch.particle_pair_idx];
+            is_entrance[c] = pp.mt == 2;
+            let e_c = e_cm + pp.q;
+            if e_c <= 0.0 {
+                // Closed channel.  Honour SHF like production (lines 338-346):
+                // SHF=1 → finite analytic shift at imaginary argument, so L_c is
+                // finite and the off-diagonal R coupling is NOT swamped by the
+                // 1/L_c → 1e30 sentinel.  This is what makes the leak observable.
+                p_c[c] = 0.0;
+                phi_c[c] = 0.0;
+                is_closed[c] = true;
+                let is_coulomb = pp.za.abs() > 0.5 && pp.zb.abs() > 0.5;
+                s_c[c] = if pp.shf == 1 && !is_coulomb {
+                    let redmas = pp.ma * pp.mb / (pp.ma + pp.mb);
+                    let kappa = channel::wave_number_from_cm(e_c.abs(), redmas);
+                    penetrability::shift_factor_closed(ch.l, kappa * ch.true_radius)
+                } else {
+                    ch.boundary
+                };
+            } else {
+                let redmas = pp.ma * pp.mb / (pp.ma + pp.mb);
+                let k_c = channel::wave_number_from_cm(e_c, redmas);
+                let rho_pen = k_c * ch.true_radius;
+                let rho_phase = k_c * ch.effective_radius;
+                p_c[c] = penetrability::penetrability(ch.l, rho_pen);
+                s_c[c] = if pp.shf == 1 {
+                    penetrability::shift_factor(ch.l, rho_pen)
+                } else {
+                    ch.boundary
+                };
+                phi_c[c] = penetrability::phase_shift(ch.l, rho_phase);
+            }
+        }
+
+        // Full R-matrix, NO both-open gate (the pre-fix behaviour).
+        let mut r = vec![Complex64::ZERO; nch * nch];
+        for res in &sg.resonances {
+            let denom = Complex64::new(res.energy, 0.0) - Complex64::new(energy_ev, 0.0);
+            let inv_denom = if denom.norm() < QUANTUM_NUMBER_EPS {
+                (denom + Complex64::new(0.0, QUANTUM_NUMBER_EPS)).inv()
+            } else {
+                denom.inv()
+            };
+            for c in 0..nch {
+                let gc = res.widths[c];
+                for cp in 0..nch {
+                    r[c * nch + cp] += gc * res.widths[cp] * inv_denom;
+                }
+            }
+        }
+
+        // L_c, Ỹ = diag(1/L_c) − R.
+        let mut y = vec![Complex64::ZERO; nch * nch];
+        for c in 0..nch {
+            let l_c = Complex64::new(s_c[c] - sg.channels[c].boundary, p_c[c]);
+            let inv_l = if l_c.norm_sqr() < NEAR_ZERO_FLOOR {
+                Complex64::new(1e30, 0.0)
+            } else {
+                Complex64::new(1.0, 0.0) / l_c
+            };
+            for cp in 0..nch {
+                let diag = if c == cp { inv_l } else { Complex64::ZERO };
+                y[c * nch + cp] = diag - r[c * nch + cp];
+            }
+        }
+
+        // Invert Ỹ (2×2 closed form).
+        let det = y[0] * y[3] - y[1] * y[2];
+        let yinv = [y[3] / det, -y[1] / det, -y[2] / det, y[0] / det];
+
+        // XQ = Ỹ⁻¹·R.
+        let mut xq = [Complex64::ZERO; 4];
+        for c in 0..nch {
+            for cp in 0..nch {
+                let mut sum = Complex64::ZERO;
+                for k in 0..nch {
+                    sum += yinv[c * nch + k] * r[k * nch + cp];
+                }
+                xq[c * nch + cp] = sum;
+            }
+        }
+
+        // XXXX, with the closed-channel √P-kill (matches production line 655).
+        let sqrt_p: Vec<Complex64> = p_c.iter().map(|&p| Complex64::new(p, 0.0).sqrt()).collect();
+        let mut xxxx = [Complex64::ZERO; 4];
+        for c in 0..nch {
+            let l_c = Complex64::new(s_c[c] - sg.channels[c].boundary, p_c[c]);
+            let sqrt_p_over_l = if is_closed[c] || l_c.norm() < PIVOT_FLOOR {
+                Complex64::ZERO
+            } else {
+                sqrt_p[c] / l_c
+            };
+            for cp in 0..nch {
+                xxxx[c * nch + cp] = sqrt_p_over_l * xq[c * nch + cp] * sqrt_p[cp];
+            }
+        }
+
+        // U and σ_total via the optical theorem on the open entrance channel.
+        let omega: Vec<Complex64> = phi_c
+            .iter()
+            .map(|&phi| Complex64::from_polar(1.0, -phi))
+            .collect();
+        let pok2 = channel::pi_over_k_squared_barns(energy_ev, awr);
+        // Use the SAME statistical weight as production so the only difference
+        // between this helper and `cross_sections_for_rml_range` is the gate.
+        let g_j = channel::statistical_weight(sg.j, rml.target_spin);
+        let mut tot = 0.0;
+        for c0 in 0..nch {
+            if !is_entrance[c0] {
+                continue;
+            }
+            let w_cc = Complex64::new(1.0, 0.0) + Complex64::new(0.0, 2.0) * xxxx[c0 * nch + c0];
+            let u_diag = omega[c0] * w_cc * omega[c0];
+            tot += 2.0 * pok2 * g_j * (1.0 - u_diag.re);
+        }
+        tot
     }
 
     /// Singular Y-matrix regularization: construct a KRM=2 spin group where
