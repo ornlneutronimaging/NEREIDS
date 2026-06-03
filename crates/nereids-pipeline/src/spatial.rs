@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use nereids_physics::resolution::build_resolution_plan;
 use nereids_physics::transmission::{
-    InstrumentParams, broadened_cross_sections, unbroadened_cross_sections,
+    InstrumentParams, broadened_cross_sections_on_working_grid, unbroadened_cross_sections,
 };
 
 use crate::error::PipelineError;
@@ -932,44 +932,109 @@ pub fn spatial_map_typed(
         }
     };
 
-    // Precompute cross-sections once (shared across all pixels)
-    let xs: Arc<Vec<Vec<f64>>> = match config.precomputed_cross_sections().cloned() {
-        Some(cached) => cached,
-        None => {
-            let instrument = config.resolution().map(|r| InstrumentParams {
-                resolution: r.clone(),
-            });
-            let xs_raw = broadened_cross_sections(
+    // Precompute cross-sections once (shared across all pixels).
+    //
+    // Issue #608: broaden σ on the WORKING grid (auxiliary extended grid when a
+    // Gaussian resolution function is active, else the data grid) so each
+    // per-pixel `PrecomputedTransmissionModel` applies Beer-Lambert +
+    // resolution on the working grid and extracts the data points last —
+    // matching `forward_model`.  `xs` (data-grid σ) is still needed for the
+    // cubature / scalar surrogate builders and shape validation; `work_xs`
+    // carries the working-grid σ.  For tabulated / no resolution the working
+    // grid IS the data grid, the layout is the identity, and `work_xs` is left
+    // unset (the model falls back to the data-grid σ, preserving the surrogate
+    // fast paths byte-for-byte).
+    let instrument = config.resolution().map(|r| InstrumentParams {
+        resolution: r.clone(),
+    });
+    // (xs = data-grid σ, work_xs = working-grid σ when an aux grid exists).
+    let (xs, work_xs) = match config.precomputed_cross_sections().cloned() {
+        // Caller supplied data-grid σ.  When a Gaussian aux grid would
+        // exist we still need working-grid σ for the #608-correct path, so
+        // recompute it from resonance data (the data-grid σ alone cannot be
+        // de-extracted back onto the aux grid).  When no aux grid exists the
+        // supplied σ is already the working-grid σ.
+        Some(cached) => {
+            let working = broadened_cross_sections_on_working_grid(
                 config.energies(),
                 config.resonance_data(),
                 config.temperature_k(),
                 instrument.as_ref(),
                 cancel,
             )?;
-            Arc::new(xs_raw)
+            if working.layout.is_identity() {
+                (cached, None)
+            } else {
+                (cached, Some(Arc::new(working.sigma)))
+            }
+        }
+        None => {
+            let working = broadened_cross_sections_on_working_grid(
+                config.energies(),
+                config.resonance_data(),
+                config.temperature_k(),
+                instrument.as_ref(),
+                cancel,
+            )?;
+            if working.layout.is_identity() {
+                // Working grid == data grid: σ is the data-grid σ directly.
+                (Arc::new(working.sigma), None)
+            } else {
+                // Aux grid: extract the data-grid σ; keep the working σ.
+                let data_xs: Vec<Vec<f64>> = working
+                    .sigma
+                    .iter()
+                    .map(|s| working.layout.extract(s))
+                    .collect();
+                (Arc::new(data_xs), Some(Arc::new(working.sigma)))
+            }
         }
     };
+
+    // Working-grid layout (energies + data-index map) shared across pixels.
+    // Built once here so the per-pixel precomputed model can extract data
+    // points after resolution.  Empty resonance fine-structure is fine — the
+    // layout is identity for tabulated / no resolution.
+    let work_layout: Option<Arc<nereids_physics::transmission::WorkingGridLayout>> =
+        if work_xs.is_some() {
+            let rd_refs: Vec<&_> = config.resonance_data().iter().collect();
+            Some(Arc::new(
+                nereids_physics::transmission::resolution_working_grid(
+                    config.energies(),
+                    instrument.as_ref(),
+                    &rd_refs,
+                )
+                .map_err(PipelineError::Transmission)?,
+            ))
+        } else {
+            None
+        };
 
     // When groups are active and temperature is NOT being fitted, collapse
     // per-member broadened XS into per-group σ_eff once here.  This avoids
     // redundant O(n_members × n_energies) collapsing inside
-    // build_transmission_model on every per-pixel call.
-    let xs = if !config.fit_temperature()
-        && let (Some(di), Some(dr)) = (&config.density_indices, &config.density_ratios)
-        && xs.len() == di.len()
-        && di.len() == dr.len()
-    {
-        let n_e = xs[0].len();
-        let mut eff = vec![vec![0.0f64; n_e]; n_maps];
-        for ((&idx, &ratio), member_xs) in di.iter().zip(dr.iter()).zip(xs.iter()) {
-            for (j, &sigma) in member_xs.iter().enumerate() {
-                eff[idx][j] += ratio * sigma;
+    // build_transmission_model on every per-pixel call.  Applied to BOTH the
+    // data-grid σ and the working-grid σ so they stay aligned (issue #608).
+    let collapse = |xs: &Arc<Vec<Vec<f64>>>| -> Arc<Vec<Vec<f64>>> {
+        if !config.fit_temperature()
+            && let (Some(di), Some(dr)) = (&config.density_indices, &config.density_ratios)
+            && xs.len() == di.len()
+            && di.len() == dr.len()
+        {
+            let n_e = xs[0].len();
+            let mut eff = vec![vec![0.0f64; n_e]; n_maps];
+            for ((&idx, &ratio), member_xs) in di.iter().zip(dr.iter()).zip(xs.iter()) {
+                for (j, &sigma) in member_xs.iter().enumerate() {
+                    eff[idx][j] += ratio * sigma;
+                }
             }
+            Arc::new(eff)
+        } else {
+            Arc::clone(xs)
         }
-        Arc::new(eff)
-    } else {
-        xs
     };
+    let xs = collapse(&xs);
+    let work_xs = work_xs.as_ref().map(collapse);
 
     // Build the resolution broadening plan once for the shared grid.
     //
@@ -1249,6 +1314,15 @@ pub fn spatial_map_typed(
         let mut cfg = cfg
             .with_precomputed_cross_sections(xs)
             .with_compute_covariance(true);
+        // Issue #608: attach the working-grid σ + layout for the Gaussian
+        // aux-grid path so each per-pixel `PrecomputedTransmissionModel` applies
+        // resolution on the working grid and extracts the data points last.
+        // `with_precomputed_cross_sections` (above) clears any stale work σ, so
+        // this must come AFTER it.  `None` for tabulated / no resolution (the
+        // model uses the data-grid σ directly).
+        if let (Some(work_xs), Some(layout)) = (work_xs.clone(), work_layout.clone()) {
+            cfg = cfg.with_precomputed_work_cross_sections(work_xs, layout);
+        }
         if let Some(plan) = resolution_plan.clone() {
             cfg = cfg.with_precomputed_resolution_plan(plan);
         }
@@ -1636,6 +1710,7 @@ mod tests {
             resolution_plan: None,
             sparse_cubature_plan: None,
             sparse_scalar_plan: None,
+            work_layout: None,
         };
         let t_1d = model.evaluate(&[true_density]).unwrap();
         let sigma_1d: Vec<f64> = t_1d.iter().map(|&v| 0.01 * v.max(0.01)).collect();

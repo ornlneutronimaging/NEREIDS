@@ -57,8 +57,16 @@ const L_SCALE_EPSILON: f64 = 1.0e-12;
 /// then wrap in `Arc` so the same precomputed data is shared read-only
 /// across all rayon worker threads.
 pub struct PrecomputedTransmissionModel {
-    /// Doppler-broadened cross-sections σ_D(E) per isotope,
-    /// shape \[n_isotopes\]\[n_energies\].
+    /// Doppler-broadened cross-sections σ_D(E) per isotope, on the **working
+    /// grid**, shape \[n_isotopes\]\[n_working_energies\].
+    ///
+    /// Issue #608: when a Gaussian resolution function is active the spatial
+    /// builder pre-stores σ on the auxiliary extended grid (see
+    /// [`work_layout`](Self::work_layout)) so `evaluate()` /
+    /// `analytical_jacobian()` apply Beer-Lambert + resolution on the working
+    /// grid and extract the data points LAST — matching `forward_model`.  For
+    /// tabulated resolution (and no resolution) the working grid IS the data
+    /// grid, so this is the data-grid σ exactly as before.
     pub cross_sections: Arc<Vec<Vec<f64>>>,
     /// Mapping: `params[density_indices[i]]` is the density of isotope `i`.
     ///
@@ -109,6 +117,17 @@ pub struct PrecomputedTransmissionModel {
     /// both the accuracy and wall-time axes; see
     /// `nereids_physics::surrogate` module docs).
     pub sparse_scalar_plan: Option<Arc<ScalarSurrogatePlan>>,
+    /// Working-grid layout matching [`cross_sections`](Self::cross_sections).
+    ///
+    /// Issue #608: when `cross_sections` is stored on the auxiliary extended
+    /// grid (Gaussian resolution), this maps the working grid back to the data
+    /// grid so `evaluate()` / `analytical_jacobian()` apply resolution on the
+    /// working grid and extract the data points last.  `None` ⇒ the working
+    /// grid is the data grid (tabulated / no resolution): Beer-Lambert and
+    /// resolution run directly on `energies` and no extraction is needed, which
+    /// keeps the surrogate fast paths and the data-grid `resolution_plan`
+    /// byte-identical to before.
+    pub work_layout: Option<Arc<transmission::WorkingGridLayout>>,
 }
 
 /// Deduplicate `density_indices` and return the distinct density-
@@ -395,6 +414,32 @@ fn cubature_eligible(
     true
 }
 
+impl PrecomputedTransmissionModel {
+    /// Working-grid energies for resolution broadening (issue #608).
+    ///
+    /// Returns the auxiliary extended grid when `work_layout` is set (Gaussian
+    /// resolution), otherwise the data grid (`energies`).  Returns `None` only
+    /// when no instrument is configured (Beer-Lambert-only path).
+    fn work_energies(&self) -> Option<&[f64]> {
+        match (&self.work_layout, &self.energies) {
+            (Some(layout), _) => Some(layout.energies.as_slice()),
+            (None, Some(energies)) => Some(energies.as_slice()),
+            (None, None) => None,
+        }
+    }
+
+    /// Extract the data-grid points from a working-grid spectrum (issue #608).
+    ///
+    /// When `work_layout` is `None` the working grid IS the data grid, so this
+    /// is the identity (a plain clone).
+    fn extract_data_points(&self, working: &[f64]) -> Vec<f64> {
+        match &self.work_layout {
+            Some(layout) => layout.extract(working),
+            None => working.to_vec(),
+        }
+    }
+}
+
 impl FitModel for PrecomputedTransmissionModel {
     fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
         if self.cross_sections.is_empty() {
@@ -462,6 +507,10 @@ impl FitModel for PrecomputedTransmissionModel {
             }
         }
 
+        // Beer-Lambert on the WORKING grid (issue #608): `cross_sections` are
+        // stored on the working grid (auxiliary extended grid for Gaussian
+        // resolution; the data grid for tabulated / no resolution), so `n_e`
+        // is the working-grid length.
         let mut neg_opt = vec![0.0f64; n_e];
         // #109.1: No density > 0 guard — let Beer-Lambert handle all densities
         // naturally.  exp(−n·σ) is well-defined for negative n (gives T > 1,
@@ -477,19 +526,28 @@ impl FitModel for PrecomputedTransmissionModel {
         }
         let transmission: Vec<f64> = neg_opt.iter().map(|&d| d.exp()).collect();
 
-        // Issue #442: apply resolution broadening to total transmission
-        // AFTER Beer-Lambert.  This is the SAMMY-correct ordering.
+        // Issue #442 + #608: apply resolution broadening to the total
+        // transmission AFTER Beer-Lambert, on the WORKING grid, then extract
+        // the data points LAST.  When `work_layout` is `None` (tabulated / no
+        // resolution) the working grid IS the data grid (`self.energies`), the
+        // extraction is the identity, and the data-grid `resolution_plan` still
+        // matches — byte-identical to the pre-#608 path.
         if let (Some(inst), Some(energies)) = (&self.instrument, &self.energies) {
+            let work_energies: &[f64] = self
+                .work_layout
+                .as_deref()
+                .map(|l| l.energies.as_slice())
+                .unwrap_or(energies);
             let t_broadened = resolution::apply_resolution_with_plan(
                 self.resolution_plan.as_deref(),
-                energies,
+                work_energies,
                 &transmission,
                 &inst.resolution,
             )
             .map_err(|e| FittingError::EvaluationFailed(format!("resolution broadening: {e}")))?;
-            Ok(t_broadened)
+            Ok(self.extract_data_points(&t_broadened))
         } else {
-            Ok(transmission)
+            Ok(self.extract_data_points(&transmission))
         }
     }
 
@@ -598,7 +656,8 @@ impl FitModel for PrecomputedTransmissionModel {
         }
 
         // For each free parameter, sum the cross-sections of every isotope
-        // tied to that parameter index.
+        // tied to that parameter index.  σ (and the sums) are on the WORKING
+        // grid (issue #608), so `n_e` is the working-grid length.
         //   ∂T/∂N_g = -(Σ_{iso∈g} σ_iso(E)) · T(E)
         let fp_xs_sums: Vec<Vec<f64>> = free_param_indices
             .iter()
@@ -615,11 +674,19 @@ impl FitModel for PrecomputedTransmissionModel {
             })
             .collect();
 
+        // The Jacobian has one row per DATA point; `y_current` is on the data
+        // grid.  When resolution is enabled the inner derivative is formed on
+        // the working grid, resolution-broadened there, and the data points
+        // extracted last (issue #608).
+        let n_data = y_current.len();
+
         // When resolution is enabled, we need the UNRESOLVED T(E) = exp(-Σnσ)
-        // to form the inner derivative -σ·T, then apply resolution.
-        // y_current is T_obs = R[T], which is NOT the same as T.
-        if let (Some(inst), Some(energies)) = (&self.instrument, &self.energies) {
-            // Recompute unresolved T from cross-sections and current params.
+        // on the WORKING grid to form the inner derivative -σ·T, then apply
+        // resolution on the working grid and extract the data points.
+        // y_current is T_obs = R[T] on the DATA grid, which is NOT the same.
+        if let Some(inst) = &self.instrument {
+            let work_energies = self.work_energies()?;
+            // Recompute unresolved T on the working grid from σ and params.
             let mut neg_opt = vec![0.0f64; n_e];
             for (i, xs) in self.cross_sections.iter().enumerate() {
                 let density = params[self.density_indices[i]];
@@ -629,28 +696,30 @@ impl FitModel for PrecomputedTransmissionModel {
             }
             let t_unresolved: Vec<f64> = neg_opt.iter().map(|&d| d.exp()).collect();
 
-            // ∂T_obs/∂N_g = R[-σ_sum(E) · T_unresolved(E)]
-            let mut jacobian = FlatMatrix::zeros(n_e, n_free);
+            // ∂T_obs/∂N_g = extract(R[-σ_sum(E) · T_unresolved(E)])
+            let mut jacobian = FlatMatrix::zeros(n_data, n_free);
             for (col, xs_sum) in fp_xs_sums.iter().enumerate() {
                 let inner_deriv: Vec<f64> =
                     (0..n_e).map(|i| -xs_sum[i] * t_unresolved[i]).collect();
                 let resolved_deriv = resolution::apply_resolution_with_plan(
                     self.resolution_plan.as_deref(),
-                    energies,
+                    work_energies,
                     &inner_deriv,
                     &inst.resolution,
                 )
                 .ok()?;
+                let resolved_deriv = self.extract_data_points(&resolved_deriv);
                 for (i, &val) in resolved_deriv.iter().enumerate() {
                     *jacobian.get_mut(i, col) = val;
                 }
             }
             Some(jacobian)
         } else {
-            // No resolution: ∂T/∂N_g = -σ_sum(E) · T(E)
-            // y_current IS T(E) directly.
-            let mut jacobian = FlatMatrix::zeros(n_e, n_free);
-            for i in 0..n_e {
+            // No resolution → no auxiliary grid: the working grid IS the data
+            // grid (`n_e == n_data`), and y_current IS T(E) directly.
+            //   ∂T/∂N_g = -σ_sum(E) · T(E)
+            let mut jacobian = FlatMatrix::zeros(n_data, n_free);
+            for i in 0..n_data {
                 for (j, xs_sum) in fp_xs_sums.iter().enumerate() {
                     *jacobian.get_mut(i, j) = -xs_sum[i] * y_current[i];
                 }
@@ -707,16 +776,25 @@ pub struct TransmissionFitModel {
     /// Wrapped in `Arc` so `spatial_map` can share a single allocation across
     /// all per-pixel `TransmissionFitModel` instances without deep cloning.
     base_xs: Option<Arc<Vec<Vec<f64>>>>,
-    /// Cached broadened cross-sections from the last `evaluate()` call.
-    /// Used by `analytical_jacobian()` to provide density columns without
-    /// rebroadening.  Interior mutability via `RefCell` is needed because
+    /// Cached broadened cross-sections from the last `evaluate()` call, on the
+    /// **working grid** (auxiliary extended grid when Gaussian resolution is
+    /// active, else the data grid).  Used by `analytical_jacobian()` to provide
+    /// density columns without rebroadening AND to build the inner derivative
+    /// `−σ·T` on the working grid before resolution + data-point extraction
+    /// (issue #608).  Interior mutability via `RefCell` is needed because
     /// `FitModel::evaluate` takes `&self`.  Safe because `TransmissionFitModel`
     /// is constructed per-pixel and never shared across threads.
     cached_broadened_xs: RefCell<Option<Rc<Vec<Vec<f64>>>>>,
-    /// Cached analytical temperature derivative ∂σ/∂T, computed on-demand
-    /// by `analytical_jacobian()` when the temperature column is needed.
-    /// Invalidated when temperature changes (cleared in `evaluate()`).
+    /// Cached analytical temperature derivative ∂σ/∂T, on the **working grid**,
+    /// computed on-demand by `analytical_jacobian()` when the temperature
+    /// column is needed.  Invalidated when temperature changes (cleared in
+    /// `evaluate()`).
     cached_dxs_dt: RefCell<Option<Rc<Vec<Vec<f64>>>>>,
+    /// Working-grid layout (energies + data-index map) matching
+    /// `cached_broadened_xs` / `cached_dxs_dt`.  Resolution broadening is
+    /// applied on `layout.energies` and the data points are extracted last
+    /// (issue #608).  Set in `evaluate()` alongside the broadened σ cache.
+    cached_work_layout: RefCell<Option<Rc<transmission::WorkingGridLayout>>>,
     /// Temperature at which `cached_broadened_xs` was computed.
     /// `Cell` is sufficient because `f64` is `Copy`.
     cached_temperature: Cell<f64>,
@@ -826,6 +904,7 @@ impl TransmissionFitModel {
             base_xs,
             cached_broadened_xs: RefCell::new(None),
             cached_dxs_dt: RefCell::new(None),
+            cached_work_layout: RefCell::new(None),
             cached_temperature: Cell::new(f64::NAN),
             resolution_plan: None,
             sparse_cubature_plan: None,
@@ -939,38 +1018,53 @@ impl FitModel for TransmissionFitModel {
                 )));
             }
 
-            // Compute broadened XS (or reuse cache if temperature unchanged).
-            // Caching avoids redundant Doppler broadening on rejected LM steps
-            // (same T, different lambda) and enables analytical_jacobian() to
-            // read the broadened σ for density columns.
+            // Compute broadened XS on the WORKING grid (or reuse cache if
+            // temperature unchanged).  Caching avoids redundant Doppler
+            // broadening on rejected LM steps (same T, different lambda) and
+            // enables analytical_jacobian() to read the broadened σ for the
+            // density columns AND to build the inner derivative on the same
+            // working grid.
+            //
+            // Issue #608: Doppler + Beer-Lambert + resolution all run on the
+            // working grid (auxiliary extended grid when Gaussian resolution is
+            // active), with the data points extracted LAST — matching
+            // forward_model.  The previous cached path collapsed σ to the
+            // coarse data grid before resolution, degrading the convolution.
             //
             // Derivative ∂σ/∂T is computed on-demand in analytical_jacobian(),
             // NOT here — evaluate() is called many times during line search
             // trials, and the derivative overhead would dominate.
-            let broadened_xs = if (temperature_k - self.cached_temperature.get()).abs() < 1e-15 {
-                Rc::clone(self.cached_broadened_xs.borrow().as_ref().unwrap())
+            let (broadened_xs, layout) = if (temperature_k - self.cached_temperature.get()).abs()
+                < 1e-15
+                && self.cached_broadened_xs.borrow().is_some()
+            {
+                (
+                    Rc::clone(self.cached_broadened_xs.borrow().as_ref().unwrap()),
+                    Rc::clone(self.cached_work_layout.borrow().as_ref().unwrap()),
+                )
             } else {
-                let xs = Rc::new(
-                    transmission::broadened_cross_sections_from_base(
-                        &self.energies,
-                        base_xs,
-                        &self.resonance_data,
-                        temperature_k,
-                        self.instrument.as_deref(),
-                    )
-                    .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?,
-                );
+                let working = transmission::broadened_cross_sections_from_base_on_working_grid(
+                    &self.energies,
+                    base_xs,
+                    &self.resonance_data,
+                    temperature_k,
+                    self.instrument.as_deref(),
+                )
+                .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?;
+                let xs = Rc::new(working.sigma);
+                let layout = Rc::new(working.layout);
                 *self.cached_broadened_xs.borrow_mut() = Some(Rc::clone(&xs));
+                *self.cached_work_layout.borrow_mut() = Some(Rc::clone(&layout));
                 // Invalidate derivative cache — temperature changed, old ∂σ/∂T stale.
                 *self.cached_dxs_dt.borrow_mut() = None;
                 self.cached_temperature.set(temperature_k);
-                xs
+                (xs, layout)
             };
 
-            // Beer-Lambert: T(E) = exp(-Σᵢ nᵢ · rᵢ · σᵢ(E))
+            // Beer-Lambert on the working grid: T(E) = exp(-Σᵢ nᵢ · rᵢ · σᵢ(E))
             // where rᵢ is the fractional ratio (1.0 for ungrouped isotopes).
-            let n_e = self.energies.len();
-            let mut neg_opt = vec![0.0f64; n_e];
+            let work_len = layout.energies.len();
+            let mut neg_opt = vec![0.0f64; work_len];
             for (i, xs) in broadened_xs.iter().enumerate() {
                 let density = params[self.density_indices[i]];
                 let ratio = self.density_ratios[i];
@@ -980,18 +1074,25 @@ impl FitModel for TransmissionFitModel {
             }
             let transmission: Vec<f64> = neg_opt.iter().map(|&d| d.exp()).collect();
 
-            // Issue #442: apply resolution broadening to total transmission
-            // AFTER Beer-Lambert.
+            // Issue #442: apply resolution broadening to the total transmission
+            // AFTER Beer-Lambert, on the working grid; then extract the data
+            // points last (issue #608).  For Gaussian resolution `resolution_plan`
+            // is `None` (the planned path is tabulated-only) and broadening runs
+            // on `layout.energies`; for tabulated resolution the working grid IS
+            // the data grid so the data-grid plan still matches.
             if let Some(ref inst) = self.instrument {
-                resolution::apply_resolution_with_plan(
+                let t_broadened = resolution::apply_resolution_with_plan(
                     self.resolution_plan.as_deref(),
-                    &self.energies,
+                    &layout.energies,
                     &transmission,
                     &inst.resolution,
                 )
-                .map_err(|e| FittingError::EvaluationFailed(format!("resolution broadening: {e}")))
+                .map_err(|e| {
+                    FittingError::EvaluationFailed(format!("resolution broadening: {e}"))
+                })?;
+                Ok(layout.extract(&t_broadened))
             } else {
-                Ok(transmission)
+                Ok(layout.extract(&transmission))
             }
         } else {
             // Original path: full forward model (no temperature fitting).
@@ -1096,6 +1197,11 @@ impl FitModel for TransmissionFitModel {
         let _base_xs_guard = self.base_xs.as_ref()?;
         let cached_xs = self.cached_broadened_xs.borrow();
         let broadened_xs = cached_xs.as_ref()?;
+        // Working-grid layout matching the cached σ (issue #608).  Inner
+        // derivatives are formed on this grid, resolution-broadened there, and
+        // the data points are extracted LAST.
+        let cached_layout = self.cached_work_layout.borrow();
+        let layout = cached_layout.as_ref()?;
 
         // Guard: verify the cache matches the current parameter temperature.
         if let Some(ti) = self.temperature_index {
@@ -1106,6 +1212,7 @@ impl FitModel for TransmissionFitModel {
         }
 
         let n_e = y_current.len();
+        let work_len = layout.energies.len();
         let n_free = free_param_indices.len();
         let mut jacobian = FlatMatrix::zeros(n_e, n_free);
 
@@ -1113,10 +1220,14 @@ impl FitModel for TransmissionFitModel {
             .temperature_index
             .and_then(|ti| free_param_indices.iter().position(|&fp| fp == ti));
 
-        // When resolution is enabled, we need the UNRESOLVED T to form
-        // inner derivatives, then apply resolution.  y_current is T_obs = R[T].
+        // The UNRESOLVED transmission T(E) on the WORKING grid, used to form
+        // inner derivatives before resolution.  Issue #608: with resolution,
+        // y_current is T_obs = R[T] on the DATA grid — not usable as the inner
+        // T on the working grid — so recompute T from the cached working-grid
+        // σ.  Without resolution the working grid is the data grid (identity
+        // layout) and y_current IS T, so reuse it to stay bit-identical.
         let t_unresolved: Option<Vec<f64>> = if self.instrument.is_some() {
-            let mut neg_opt = vec![0.0f64; n_e];
+            let mut neg_opt = vec![0.0f64; work_len];
             for (iso, xs) in broadened_xs.iter().enumerate() {
                 let density = params[self.density_indices[iso]];
                 let ratio = self.density_ratios[iso];
@@ -1128,9 +1239,7 @@ impl FitModel for TransmissionFitModel {
         } else {
             None
         };
-
-        // Helper: the T(E) to use for inner derivatives.
-        // With resolution: unresolved T.  Without: y_current IS T.
+        // T(E) on the working grid for the inner derivatives.
         let t_for_deriv: &[f64] = t_unresolved.as_deref().unwrap_or(y_current);
 
         // ── Density columns: ∂T/∂N_g or ∂T_obs/∂N_g ──
@@ -1138,7 +1247,7 @@ impl FitModel for TransmissionFitModel {
             if temp_col == Some(col) {
                 continue;
             }
-            let mut sigma_sum = vec![0.0f64; n_e];
+            let mut sigma_sum = vec![0.0f64; work_len];
             for (iso, &di) in self.density_indices.iter().enumerate() {
                 if di == fp_idx {
                     let ratio = self.density_ratios[iso];
@@ -1147,22 +1256,27 @@ impl FitModel for TransmissionFitModel {
                     }
                 }
             }
-            // Inner derivative: -σ_sum · T_unresolved
-            let inner: Vec<f64> = (0..n_e).map(|i| -sigma_sum[i] * t_for_deriv[i]).collect();
+            // Inner derivative on the working grid: -σ_sum · T_unresolved.
+            let inner: Vec<f64> = (0..work_len)
+                .map(|i| -sigma_sum[i] * t_for_deriv[i])
+                .collect();
 
             if let Some(ref inst) = self.instrument {
-                // ∂T_obs/∂N_g = R[inner]
+                // ∂T_obs/∂N_g = extract(R[inner]) — resolution on the working
+                // grid, data points extracted last (issue #608).
                 let resolved = resolution::apply_resolution_with_plan(
                     self.resolution_plan.as_deref(),
-                    &self.energies,
+                    &layout.energies,
                     &inner,
                     &inst.resolution,
                 )
                 .ok()?;
+                let resolved = layout.extract(&resolved);
                 for (i, &val) in resolved.iter().enumerate() {
                     *jacobian.get_mut(i, col) = val;
                 }
             } else {
+                // No resolution → identity layout, inner is already data grid.
                 for (i, &val) in inner.iter().enumerate() {
                     *jacobian.get_mut(i, col) = val;
                 }
@@ -1171,14 +1285,14 @@ impl FitModel for TransmissionFitModel {
 
         // ── Temperature column: ∂T/∂Temp or ∂T_obs/∂Temp ──
         if let Some(col) = temp_col {
-            // Compute ∂σ/∂T on-demand if not cached.
+            // Compute ∂σ/∂T (on the working grid) on-demand if not cached.
             {
                 let needs_compute = self.cached_dxs_dt.borrow().as_ref().is_none();
                 if needs_compute {
                     let base_xs = self.base_xs.as_ref()?;
                     let temperature_k = self.cached_temperature.get();
-                    let (_, dxs_vec) =
-                        transmission::broadened_cross_sections_with_analytical_derivative_from_base(
+                    let working =
+                        transmission::broadened_cross_sections_with_analytical_derivative_from_base_on_working_grid(
                             &self.energies,
                             base_xs,
                             &self.resonance_data,
@@ -1186,14 +1300,14 @@ impl FitModel for TransmissionFitModel {
                             self.instrument.as_deref(),
                         )
                         .ok()?;
-                    *self.cached_dxs_dt.borrow_mut() = Some(Rc::new(dxs_vec));
+                    *self.cached_dxs_dt.borrow_mut() = Some(Rc::new(working.dsigma_dt));
                 }
             }
             let cached_dxs = self.cached_dxs_dt.borrow();
             let dxs_dt = cached_dxs.as_ref()?;
 
-            // Inner derivative: -T · Σᵢ nᵢ rᵢ ∂σᵢ/∂T
-            let inner: Vec<f64> = (0..n_e)
+            // Inner derivative on the working grid: -T · Σᵢ nᵢ rᵢ ∂σᵢ/∂T.
+            let inner: Vec<f64> = (0..work_len)
                 .map(|i| {
                     let mut sum_n_dsigma = 0.0f64;
                     for (iso, dxs) in dxs_dt.iter().enumerate() {
@@ -1208,11 +1322,12 @@ impl FitModel for TransmissionFitModel {
             if let Some(ref inst) = self.instrument {
                 let resolved = resolution::apply_resolution_with_plan(
                     self.resolution_plan.as_deref(),
-                    &self.energies,
+                    &layout.energies,
                     &inner,
                     &inst.resolution,
                 )
                 .ok()?;
+                let resolved = layout.extract(&resolved);
                 for (i, &val) in resolved.iter().enumerate() {
                     *jacobian.get_mut(i, col) = val;
                 }
@@ -1869,6 +1984,26 @@ impl EnergyScaleTransmissionModel {
         (de_dt0, de_dl)
     }
 
+    /// Build the working grid for resolution broadening from the corrected
+    /// energy grid (issue #608).
+    ///
+    /// When a Gaussian resolution function is active this is the auxiliary
+    /// extended grid built on `e_corr` (boundary extension only — the
+    /// energy-scale model has no resonance data of its own); for tabulated / no
+    /// resolution it is `e_corr` itself with identity indices.  The corrected
+    /// grid is re-derived per `(t0, L_scale)` probe, so the auxiliary grid is
+    /// rebuilt each time — matching `forward_model`, which builds the auxiliary
+    /// grid on whatever energy grid it is handed.
+    fn working_grid_for_corrected(
+        &self,
+        e_corr: &[f64],
+    ) -> Result<transmission::WorkingGridLayout, FittingError> {
+        let instrument = self.instrument.as_deref();
+        // No resonance data: boundary extension only (empty fine-structure).
+        transmission::resolution_working_grid(e_corr, instrument, &[])
+            .map_err(|e| FittingError::EvaluationFailed(e.to_string()))
+    }
+
     /// Interpolate a cross-section array from nominal grid to corrected grid.
     fn interpolate_xs(nominal_e: &[f64], xs: &[f64], corrected_e: &[f64]) -> Vec<f64> {
         corrected_e
@@ -1992,38 +2127,57 @@ impl EnergyScaleTransmissionModel {
         e_corr: &[f64],
         use_plan_cache: bool,
     ) -> Result<Vec<f64>, FittingError> {
-        let n_e = self.nominal_energies.len();
+        if self.instrument.is_none() {
+            // No resolution → no auxiliary grid: Beer-Lambert on the corrected
+            // grid directly (byte-identical to the pre-#608 path).
+            let n_e = self.nominal_energies.len();
+            let mut neg_opt = vec![0.0f64; n_e];
+            for (i, xs) in self.cross_sections.iter().enumerate() {
+                let density = params[self.density_indices[i]];
+                let xs_interp = Self::interpolate_xs(&self.nominal_energies, xs, e_corr);
+                for (j, &sigma) in xs_interp.iter().enumerate() {
+                    neg_opt[j] -= density * sigma;
+                }
+            }
+            return Ok(neg_opt.iter().map(|&d| d.exp()).collect());
+        }
 
-        // Interpolate cross-sections to corrected energy grid
-        let mut neg_opt = vec![0.0f64; n_e];
+        // Issue #608: build the working grid on the CORRECTED grid (auxiliary
+        // extended grid for Gaussian resolution), interpolate σ onto it,
+        // Beer-Lambert + resolution on the working grid, extract the data
+        // points last — matching `forward_model`.
+        let inst = self.instrument.as_ref().unwrap();
+        let layout = self.working_grid_for_corrected(e_corr)?;
+        let work_e = &layout.energies;
+        let mut neg_opt = vec![0.0f64; work_e.len()];
         for (i, xs) in self.cross_sections.iter().enumerate() {
             let density = params[self.density_indices[i]];
-            let xs_interp = Self::interpolate_xs(&self.nominal_energies, xs, e_corr);
+            let xs_interp = Self::interpolate_xs(&self.nominal_energies, xs, work_e);
             for (j, &sigma) in xs_interp.iter().enumerate() {
                 neg_opt[j] -= density * sigma;
             }
         }
         let transmission: Vec<f64> = neg_opt.iter().map(|&d| d.exp()).collect();
 
-        if let Some(inst) = &self.instrument {
-            let plan = if use_plan_cache {
-                let t0 = params[self.t0_index];
-                let l_scale = params[self.l_scale_index];
-                self.cached_resolution_plan(t0, l_scale, e_corr)
-            } else {
-                None
-            };
-            let t_broadened = resolution::apply_resolution_with_plan(
-                plan.as_deref(),
-                e_corr,
-                &transmission,
-                &inst.resolution,
-            )
-            .map_err(|e| FittingError::EvaluationFailed(format!("resolution broadening: {e}")))?;
-            Ok(t_broadened)
+        // For tabulated resolution the working grid IS `e_corr`, so the
+        // `(t0, L_scale)`-keyed plan (built on `e_corr`) still matches.  For
+        // Gaussian resolution the plan is `None` and broadening runs on the
+        // auxiliary grid via `apply_resolution`.
+        let plan = if use_plan_cache {
+            let t0 = params[self.t0_index];
+            let l_scale = params[self.l_scale_index];
+            self.cached_resolution_plan(t0, l_scale, work_e)
         } else {
-            Ok(transmission)
-        }
+            None
+        };
+        let t_broadened = resolution::apply_resolution_with_plan(
+            plan.as_deref(),
+            work_e,
+            &transmission,
+            &inst.resolution,
+        )
+        .map_err(|e| FittingError::EvaluationFailed(format!("resolution broadening: {e}")))?;
+        Ok(layout.extract(&t_broadened))
     }
 }
 
@@ -2143,20 +2297,23 @@ impl FitModel for EnergyScaleTransmissionModel {
             None
         };
 
-        // Compute unresolved T and interpolated cross-sections for density derivatives
-        let mut neg_opt = vec![0.0f64; n_e];
+        // Issue #608: the density columns are formed on the WORKING grid
+        // (auxiliary extended grid for Gaussian resolution; `e_corr` for
+        // tabulated / no resolution), resolution-broadened there, and the data
+        // points extracted last — matching `forward_model` and `evaluate`.
+        let work_layout = match self.working_grid_for_corrected(&e_corr) {
+            Ok(l) => l,
+            Err(_) => return None,
+        };
+        let work_e = &work_layout.energies;
+
+        // Unresolved T + interpolated σ on the WORKING grid for the density
+        // derivatives.
+        let mut neg_opt = vec![0.0f64; work_e.len()];
         let mut interp_xs_all: Vec<Vec<f64>> = Vec::new();
-        let mut interp_slopes_all: Vec<Vec<f64>> = Vec::new();
         for (i, xs) in self.cross_sections.iter().enumerate() {
             let density = params[self.density_indices[i]];
-            let xs_interp = if need_energy_scale_chain {
-                let (values, slopes) =
-                    Self::interpolate_xs_and_slope(&self.nominal_energies, xs, &e_corr);
-                interp_slopes_all.push(slopes);
-                values
-            } else {
-                Self::interpolate_xs(&self.nominal_energies, xs, &e_corr)
-            };
+            let xs_interp = Self::interpolate_xs(&self.nominal_energies, xs, work_e);
             for (j, &sigma) in xs_interp.iter().enumerate() {
                 neg_opt[j] -= density * sigma;
             }
@@ -2165,14 +2322,11 @@ impl FitModel for EnergyScaleTransmissionModel {
         let t_unresolved: Vec<f64> = neg_opt.iter().map(|&d| d.exp()).collect();
 
         // Density-column plan: Issue #483 A1 routes through the
-        // struct-level `(t0, L_scale)`-keyed cache.  When
-        // `self.evaluate(params)` ran earlier in the same KL outer
-        // iteration (for deviance or the forward at the line-search
-        // point), the cache was already populated at the current
+        // struct-level `(t0, L_scale)`-keyed cache.  Built on the working grid
+        // (== `e_corr` for tabulated, where the plan is meaningful; `None` for
+        // Gaussian).  When `self.evaluate(params)` ran earlier in the same KL
+        // outer iteration the cache was already populated at the current
         // `(t0, L_scale)` and this lookup is a cheap Arc clone.
-        // When the Jacobian runs stand-alone (no prior evaluate) the
-        // lookup misses once and the returned plan is installed for
-        // any subsequent evaluate / jacobian at the same probe.
         //
         // The `n_density_cols >= 2` gate from the PR #469 era is
         // dropped here: the cache makes the plan build a one-shot
@@ -2183,14 +2337,36 @@ impl FitModel for EnergyScaleTransmissionModel {
         // The non-tabulated / build-failure branches still return
         // `None` → `apply_resolution_with_plan(None, …)` forwards
         // byte-identically to `apply_resolution`.
-        let density_plan = self.cached_resolution_plan(t0, l_scale, &e_corr);
+        let density_plan = self.cached_resolution_plan(t0, l_scale, work_e);
+
+        // FrozenResolutionChainRule energy-scale columns (opt-in research
+        // method, `NEREIDS_TZERO_JACOBIAN=chain`).  These are computed on the
+        // data-grid `e_corr` rather than the working grid: the chain rule needs
+        // dE_corr/d(t0,L_scale), which is defined only at the nominal TOF
+        // samples — the auxiliary boundary points have no nominal TOF.  The
+        // production default (PartialGal) and the density columns above are
+        // aux-correct; this branch retains the pre-#608 data-grid resolution
+        // for the energy-scale columns of the opt-in method only.
         let energy_scale_chain_columns = if need_energy_scale_chain {
+            let mut neg_opt_data = vec![0.0f64; n_e];
+            let mut interp_slopes_all: Vec<Vec<f64>> = Vec::new();
+            for (i, xs) in self.cross_sections.iter().enumerate() {
+                let density = params[self.density_indices[i]];
+                let (values, slopes) =
+                    Self::interpolate_xs_and_slope(&self.nominal_energies, xs, &e_corr);
+                interp_slopes_all.push(slopes);
+                for (j, &sigma) in values.iter().enumerate() {
+                    neg_opt_data[j] -= density * sigma;
+                }
+            }
+            let t_unresolved_data: Vec<f64> = neg_opt_data.iter().map(|&d| d.exp()).collect();
+            let chain_plan = self.cached_resolution_plan(t0, l_scale, &e_corr);
             match self.frozen_resolution_energy_scale_columns(
                 params,
                 &e_corr,
-                &t_unresolved,
+                &t_unresolved_data,
                 &interp_slopes_all,
-                density_plan.as_deref(),
+                chain_plan.as_deref(),
             ) {
                 Ok(cols) => Some(cols),
                 Err(_) => return None,
@@ -2317,9 +2493,11 @@ impl FitModel for EnergyScaleTransmissionModel {
                     // else: leave at zero-default.
                 }
             } else {
-                // Density parameter: analytical derivative
-                // ∂T/∂n_g = -(Σ_{iso∈g} σ_iso(E)) · T_unresolved(E)
-                let mut sigma_sum = vec![0.0f64; n_e];
+                // Density parameter: analytical derivative on the WORKING grid
+                // (issue #608), resolution-broadened there, data points
+                // extracted last.
+                // ∂T/∂n_g = extract(R[-(Σ_{iso∈g} σ_iso(E)) · T_unresolved(E)])
+                let mut sigma_sum = vec![0.0f64; work_e.len()];
                 for (iso, &di) in self.density_indices.iter().enumerate() {
                     if di == fp_idx {
                         for (j, &sigma) in interp_xs_all[iso].iter().enumerate() {
@@ -2327,14 +2505,16 @@ impl FitModel for EnergyScaleTransmissionModel {
                         }
                     }
                 }
-                let inner_deriv: Vec<f64> =
-                    (0..n_e).map(|i| -sigma_sum[i] * t_unresolved[i]).collect();
+                let inner_deriv: Vec<f64> = (0..work_e.len())
+                    .map(|i| -sigma_sum[i] * t_unresolved[i])
+                    .collect();
 
                 // Apply resolution to derivative if enabled.
                 //
                 // When `density_plan` is `Some` (tabulated resolution
                 // + populated cache) we hit the struct-level
-                // `(t0, L_scale)`-keyed plan.  When `None` (Gaussian
+                // `(t0, L_scale)`-keyed plan (built on the working grid, which
+                // equals `e_corr` for tabulated).  When `None` (Gaussian
                 // resolution or build failure),
                 // `apply_resolution_with_plan(None, …)` transparently
                 // forwards to `apply_resolution` — bit-exact with
@@ -2342,17 +2522,19 @@ impl FitModel for EnergyScaleTransmissionModel {
                 if let Some(inst) = &self.instrument {
                     let resolved_deriv = match resolution::apply_resolution_with_plan(
                         density_plan.as_deref(),
-                        &e_corr,
+                        work_e,
                         &inner_deriv,
                         &inst.resolution,
                     ) {
                         Ok(v) => v,
                         Err(_) => return None,
                     };
+                    let resolved_deriv = work_layout.extract(&resolved_deriv);
                     for (i, &val) in resolved_deriv.iter().enumerate() {
                         *jacobian.get_mut(i, col) = val;
                     }
                 } else {
+                    // No resolution → identity layout, inner is already data grid.
                     for (i, &val) in inner_deriv.iter().enumerate() {
                         *jacobian.get_mut(i, col) = val;
                     }
@@ -3018,6 +3200,7 @@ mod tests {
             resolution_plan: None,
             sparse_cubature_plan: None,
             sparse_scalar_plan: None,
+            work_layout: None,
         }
     }
 
@@ -3154,6 +3337,7 @@ mod tests {
             resolution_plan: Some(Arc::clone(&plan)),
             sparse_cubature_plan: Some(Arc::clone(&cubature)),
             sparse_scalar_plan: None,
+            work_layout: None,
         };
 
         // Evaluate at a training density: cubature ≡ exact to LP
@@ -3235,6 +3419,7 @@ mod tests {
             resolution_plan: None,
             sparse_cubature_plan: Some(Arc::clone(&cubature_k2)),
             sparse_scalar_plan: None,
+            work_layout: None,
         };
         let model_without_plan = PrecomputedTransmissionModel {
             cross_sections: Arc::new(sigmas_k1.clone()),
@@ -3244,6 +3429,7 @@ mod tests {
             resolution_plan: None,
             sparse_cubature_plan: None,
             sparse_scalar_plan: None,
+            work_layout: None,
         };
 
         let n = [1e-4_f64];
@@ -3280,6 +3466,7 @@ mod tests {
             resolution_plan: None,
             sparse_cubature_plan: None,
             sparse_scalar_plan: None,
+            work_layout: None,
         };
 
         let n = [1e-4_f64, 1e-4];
@@ -3317,6 +3504,7 @@ mod tests {
             resolution_plan: Some(Arc::clone(&plan)),
             sparse_cubature_plan: Some(Arc::clone(&cubature)),
             sparse_scalar_plan: None,
+            work_layout: None,
         };
 
         // Use anchor density: LP pins Jacobian exactly here.
@@ -3621,6 +3809,7 @@ mod tests {
             resolution_plan,
             sparse_cubature_plan: None,
             sparse_scalar_plan: scalar_plan,
+            work_layout: None,
         }
     }
 
@@ -4217,6 +4406,7 @@ mod tests {
             resolution_plan: None,
             sparse_cubature_plan: None,
             sparse_scalar_plan: None,
+            work_layout: None,
         };
         let t_precomputed = model.evaluate(&[thickness]).unwrap();
 
@@ -4301,6 +4491,7 @@ mod tests {
             resolution_plan: None,
             sparse_cubature_plan: None,
             sparse_scalar_plan: None,
+            work_layout: None,
         };
 
         let params = [0.0005f64];
@@ -4352,6 +4543,7 @@ mod tests {
             resolution_plan: None,
             sparse_cubature_plan: None,
             sparse_scalar_plan: None,
+            work_layout: None,
         };
 
         let params = [0.001f64];

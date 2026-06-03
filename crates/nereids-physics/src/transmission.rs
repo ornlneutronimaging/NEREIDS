@@ -173,6 +173,99 @@ fn build_extended_xs_from_base(
     xs_ext
 }
 
+/// Validate `base_xs` shape against `resonance_data` and `energies`.
+///
+/// Shared by the base-XS broadening family so the same `InputMismatch`
+/// diagnostics are produced from one place.
+fn validate_base_xs(
+    energies: &[f64],
+    base_xs: &[Vec<f64>],
+    resonance_data: &[ResonanceData],
+) -> Result<(), TransmissionError> {
+    if base_xs.len() != resonance_data.len() {
+        return Err(TransmissionError::InputMismatch(format!(
+            "base_xs has {} isotopes but resonance_data has {}",
+            base_xs.len(),
+            resonance_data.len(),
+        )));
+    }
+    for (i, row) in base_xs.iter().enumerate() {
+        if row.len() != energies.len() {
+            return Err(TransmissionError::InputMismatch(format!(
+                "base_xs[{i}] has {} energies but expected {}",
+                row.len(),
+                energies.len(),
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Build a bool mask identifying data-grid positions within the extended grid.
+///
+/// `None` when no auxiliary grid was built (the working grid is the data grid).
+fn data_point_mask(ext_grid: Option<&(Vec<f64>, Vec<usize>)>) -> Option<Vec<bool>> {
+    ext_grid.map(|(ext_e, di)| {
+        let mut mask = vec![false; ext_e.len()];
+        for &idx in di {
+            mask[idx] = true;
+        }
+        mask
+    })
+}
+
+/// Resolve the working grid (extended grid when available, else the data grid)
+/// and the [`WorkingGridLayout`] mapping data points back into it.
+fn working_grid_layout<'a>(
+    energies: &'a [f64],
+    ext_grid: Option<&'a (Vec<f64>, Vec<usize>)>,
+) -> (&'a [f64], WorkingGridLayout) {
+    match ext_grid {
+        Some((ext_e, di)) => (
+            ext_e.as_slice(),
+            WorkingGridLayout {
+                energies: ext_e.clone(),
+                data_indices: di.clone(),
+            },
+        ),
+        None => (
+            energies,
+            WorkingGridLayout {
+                energies: energies.to_vec(),
+                data_indices: (0..energies.len()).collect(),
+            },
+        ),
+    }
+}
+
+/// Compute the working-grid layout for `(energies, instrument, resonance_data)`.
+///
+/// Returns the auxiliary extended grid (boundary extension + resonance
+/// fine-structure) when a Gaussian resolution function is active, otherwise the
+/// data grid with identity indices.  Fitting models use this to apply
+/// resolution on the same working grid [`forward_model`] uses and extract the
+/// data points last (issue #608).
+///
+/// `resonance_data` may be empty (e.g. the energy-scale model has no resonance
+/// data of its own); the auxiliary grid then carries boundary extension only,
+/// with no resonance fine-structure densification.
+///
+/// # Errors
+/// * [`TransmissionError::Resolution`] — if `instrument` is `Some` and
+///   `energies` is not sorted ascending.
+pub fn resolution_working_grid(
+    energies: &[f64],
+    instrument: Option<&InstrumentParams>,
+    resonance_data: &[&ResonanceData],
+) -> Result<WorkingGridLayout, TransmissionError> {
+    if instrument.is_some() && !energies.windows(2).all(|w| w[0] <= w[1]) {
+        return Err(ResolutionError::UnsortedEnergies.into());
+    }
+    let ext_grid = build_aux_grid(energies, instrument, resonance_data);
+    let (_, layout) = working_grid_layout(energies, ext_grid.as_ref());
+    Ok(layout)
+}
+
 /// Errors from the transmission forward model.
 #[derive(Debug)]
 pub enum TransmissionError {
@@ -236,6 +329,84 @@ impl From<crate::doppler::DopplerError> for TransmissionError {
 /// `k` at energy index `e`; `dxs_dt[k][e]` is the analytical derivative
 /// with respect to temperature.
 pub type BroadenedXsWithDerivative = (Vec<Vec<f64>>, Vec<Vec<f64>>);
+
+/// The working energy grid used for broadening, plus the map back to the
+/// data grid.
+///
+/// `forward_model` and the Beer-Lambert-aware transmission pipeline run
+/// Doppler/Beer-Lambert/resolution on a *working* grid — the auxiliary
+/// extended grid (boundary extension + resonance fine-structure) when a
+/// Gaussian resolution function is active, otherwise the data grid itself —
+/// and extract the data points LAST.  Fitting models that cache broadened σ
+/// for reuse across LM steps need this layout so they can reproduce the same
+/// "broaden-on-working-grid, extract-last" ordering (issue #608): the LM fit's
+/// cached / precomputed paths previously collapsed σ to the coarse data grid
+/// *before* resolution broadening, degrading the convolution near grid edges
+/// and around narrow resonances relative to [`forward_model`].
+///
+/// **Tabulated resolution has no auxiliary grid.**  [`build_aux_grid`] only
+/// extends the grid for [`ResolutionFunction::Gaussian`]; for tabulated
+/// kernels (and when no instrument is present) `energies` equals the data
+/// grid and `data_indices` is the identity `0..n`.  Callers can therefore
+/// continue to use a data-grid [`crate::resolution::ResolutionPlan`] for
+/// tabulated kernels — the working grid and the data grid coincide, so the
+/// plan's grid-identity check still passes.
+#[derive(Debug, Clone)]
+pub struct WorkingGridLayout {
+    /// Working-grid energies (eV, ascending).  Equals the input data grid
+    /// when no auxiliary grid was built (tabulated/no resolution).
+    pub energies: Vec<f64>,
+    /// `data_indices[i]` is the index of data energy `i` within
+    /// [`Self::energies`].  Identity (`0..n`) when no auxiliary grid.
+    pub data_indices: Vec<usize>,
+}
+
+impl WorkingGridLayout {
+    /// `true` when the working grid is the data grid itself (no auxiliary
+    /// extension was built).  In that case [`Self::extract`] is a no-op clone.
+    pub fn is_identity(&self) -> bool {
+        self.data_indices.len() == self.energies.len()
+            && self
+                .data_indices
+                .iter()
+                .enumerate()
+                .all(|(i, &idx)| i == idx)
+    }
+
+    /// Extract the data-grid points from a working-grid spectrum.
+    pub fn extract(&self, working: &[f64]) -> Vec<f64> {
+        self.data_indices.iter().map(|&i| working[i]).collect()
+    }
+}
+
+/// Working-grid Doppler-broadened cross-sections plus the data-grid map.
+///
+/// Resolution broadening is **not** applied (issue #442: resolution is applied
+/// to the total transmission after Beer-Lambert).  The caller applies
+/// Beer-Lambert + resolution on [`WorkingGridLayout::energies`] and extracts
+/// the data points last via [`WorkingGridLayout::extract`].
+pub struct WorkingGridXs {
+    /// Doppler-broadened σ per isotope, on the working grid.
+    pub sigma: Vec<Vec<f64>>,
+    /// Working-grid layout (energies + data-grid index map).
+    pub layout: WorkingGridLayout,
+}
+
+/// Working-grid Doppler-broadened cross-sections and their analytical
+/// temperature derivative, plus the data-grid map.
+///
+/// Like [`WorkingGridXs`] but additionally carries `∂σ/∂T` on the working
+/// grid so the analytical Jacobian can form `−T·Σᵢ nᵢ·rᵢ·∂σᵢ/∂T` on the
+/// working grid, resolution-broaden it there, and extract the data points
+/// last (issue #608).
+pub struct WorkingGridXsWithDerivative {
+    /// Doppler-broadened σ per isotope, on the working grid.
+    pub sigma: Vec<Vec<f64>>,
+    /// `∂σ/∂T` per isotope, on the working grid.
+    pub dsigma_dt: Vec<Vec<f64>>,
+    /// Working-grid layout (energies + data-grid index map).
+    pub layout: WorkingGridLayout,
+}
 
 /// Compute transmission from cross-sections via Beer-Lambert law.
 ///
@@ -548,6 +719,34 @@ pub fn broadened_cross_sections(
     instrument: Option<&InstrumentParams>,
     cancel: Option<&AtomicBool>,
 ) -> Result<Vec<Vec<f64>>, TransmissionError> {
+    // Delegate to the working-grid variant and extract the data points.
+    // Doppler runs on the working (aux) grid for boundary accuracy.
+    let WorkingGridXs { sigma, layout } = broadened_cross_sections_on_working_grid(
+        energies,
+        resonance_data,
+        temperature_k,
+        instrument,
+        cancel,
+    )?;
+    Ok(sigma.iter().map(|s| layout.extract(s)).collect())
+}
+
+/// Like [`broadened_cross_sections`] but returns the Doppler-broadened σ on the
+/// **working grid** (auxiliary extended grid when Gaussian resolution is active,
+/// else the data grid) together with the [`WorkingGridLayout`].
+///
+/// The spatial production pipeline (`spatial_map_typed`) uses this to pre-store
+/// σ on the working grid so each per-pixel `PrecomputedTransmissionModel`
+/// applies Beer-Lambert + resolution on the working grid and extracts the data
+/// points last — matching [`forward_model`] (issue #608).  Resolution is NOT
+/// applied (issue #442).
+pub fn broadened_cross_sections_on_working_grid(
+    energies: &[f64],
+    resonance_data: &[ResonanceData],
+    temperature_k: f64,
+    instrument: Option<&InstrumentParams>,
+    cancel: Option<&AtomicBool>,
+) -> Result<WorkingGridXs, TransmissionError> {
     // Validate energy grid once before the per-isotope loop.
     if instrument.is_some() && !energies.windows(2).all(|w| w[0] <= w[1]) {
         return Err(ResolutionError::UnsortedEnergies.into());
@@ -560,10 +759,12 @@ pub fn broadened_cross_sections(
     // SAMMY Ref: dat/mdat4.f90 Escale+Fspken+Add_Pnts, dat/mdata.f90 Vqcon
     let rd_refs: Vec<&ResonanceData> = resonance_data.iter().collect();
     let ext_grid = build_aux_grid(energies, instrument, &rd_refs);
+    let (work_energies, layout) = working_grid_layout(energies, ext_grid.as_ref());
 
     // Parallelize across isotopes — Doppler broadening for each isotope is
     // independent.  Resolution is NOT applied here (issue #442: resolution
-    // must be applied after Beer-Lambert on total transmission).
+    // must be applied after Beer-Lambert on total transmission).  σ is returned
+    // on the working grid WITHOUT extracting the data points.
     // Cancellation is checked per-isotope inside the parallel map.
     let result: Result<Vec<Vec<f64>>, TransmissionError> = resonance_data
         .par_iter()
@@ -573,37 +774,16 @@ pub fn broadened_cross_sections(
                 return Err(TransmissionError::Cancelled);
             }
 
-            // When an extended grid is available, evaluate XS + Doppler on
-            // the extended grid, then extract at data positions.  The
-            // boundary extension improves Doppler broadening accuracy near
-            // grid edges and narrow resonances.
-            let xs = if let Some((ref ext_energies, ref data_indices)) = ext_grid {
-                let unbroadened: Vec<f64> = ext_energies
-                    .iter()
-                    .map(|&e| reich_moore::cross_sections_at_energy(rd, e).total)
-                    .collect();
-                let after_doppler = if temperature_k > 0.0 {
-                    let params = DopplerParams::new(temperature_k, rd.awr)?;
-                    doppler::doppler_broaden(ext_energies, &unbroadened, &params)?
-                } else {
-                    unbroadened
-                };
-                data_indices.iter().map(|&i| after_doppler[i]).collect()
+            let unbroadened: Vec<f64> = work_energies
+                .iter()
+                .map(|&e| reich_moore::cross_sections_at_energy(rd, e).total)
+                .collect();
+            if temperature_k > 0.0 {
+                let params = DopplerParams::new(temperature_k, rd.awr)?;
+                doppler::doppler_broaden(work_energies, &unbroadened, &params).map_err(Into::into)
             } else {
-                // No extended grid: Doppler on data grid only.
-                let unbroadened: Vec<f64> = energies
-                    .iter()
-                    .map(|&e| reich_moore::cross_sections_at_energy(rd, e).total)
-                    .collect();
-                if temperature_k > 0.0 {
-                    let params = DopplerParams::new(temperature_k, rd.awr)?;
-                    doppler::doppler_broaden(energies, &unbroadened, &params)?
-                } else {
-                    unbroadened
-                }
-            };
-
-            Ok(xs)
+                Ok(unbroadened)
+            }
         })
         .collect();
 
@@ -613,7 +793,10 @@ pub fn broadened_cross_sections(
         return Err(TransmissionError::Cancelled);
     }
 
-    result
+    Ok(WorkingGridXs {
+        sigma: result?,
+        layout,
+    })
 }
 
 /// Compute Doppler+resolution-broadened cross-sections using SAMMY's
@@ -812,22 +995,36 @@ pub fn broadened_cross_sections_from_base(
     temperature_k: f64,
     instrument: Option<&InstrumentParams>,
 ) -> Result<Vec<Vec<f64>>, TransmissionError> {
-    if base_xs.len() != resonance_data.len() {
-        return Err(TransmissionError::InputMismatch(format!(
-            "base_xs has {} isotopes but resonance_data has {}",
-            base_xs.len(),
-            resonance_data.len(),
-        )));
-    }
-    for (i, row) in base_xs.iter().enumerate() {
-        if row.len() != energies.len() {
-            return Err(TransmissionError::InputMismatch(format!(
-                "base_xs[{i}] has {} energies but expected {}",
-                row.len(),
-                energies.len(),
-            )));
-        }
-    }
+    // Delegate to the working-grid variant and extract the data points.
+    // Doppler runs on the working (aux) grid for boundary accuracy; resolution
+    // is NOT applied here (issue #442).  Extracting the data points here keeps
+    // this function's contract (data-grid σ) unchanged.
+    let WorkingGridXs { sigma, layout } = broadened_cross_sections_from_base_on_working_grid(
+        energies,
+        base_xs,
+        resonance_data,
+        temperature_k,
+        instrument,
+    )?;
+    Ok(sigma.iter().map(|s| layout.extract(s)).collect())
+}
+
+/// Like [`broadened_cross_sections_from_base`] but returns the Doppler-broadened
+/// σ on the **working grid** (auxiliary extended grid when Gaussian resolution
+/// is active, else the data grid) together with the [`WorkingGridLayout`].
+///
+/// This is the building block the LM fit's cached / precomputed paths use to
+/// apply resolution broadening on the working grid and extract the data points
+/// last — matching [`forward_model`] (issue #608).  Resolution is NOT applied
+/// (issue #442).
+pub fn broadened_cross_sections_from_base_on_working_grid(
+    energies: &[f64],
+    base_xs: &[Vec<f64>],
+    resonance_data: &[ResonanceData],
+    temperature_k: f64,
+    instrument: Option<&InstrumentParams>,
+) -> Result<WorkingGridXs, TransmissionError> {
+    validate_base_xs(energies, base_xs, resonance_data)?;
     if instrument.is_some() && !energies.windows(2).all(|w| w[0] <= w[1]) {
         return Err(ResolutionError::UnsortedEnergies.into());
     }
@@ -839,46 +1036,34 @@ pub fn broadened_cross_sections_from_base(
     // SAMMY Ref: dat/mdat4.f90 Escale+Fspken+Add_Pnts
     let rd_refs: Vec<&ResonanceData> = resonance_data.iter().collect();
     let ext_grid = build_aux_grid(energies, instrument, &rd_refs);
+    let is_data_point = data_point_mask(ext_grid.as_ref());
+    let (work_energies, layout) = working_grid_layout(energies, ext_grid.as_ref());
 
-    // Build a bool mask to identify data-grid positions in the extended grid.
-    let is_data_point: Option<Vec<bool>> = ext_grid.as_ref().map(|(ext_e, di)| {
-        let mut mask = vec![false; ext_e.len()];
-        for &idx in di {
-            mask[idx] = true;
-        }
-        mask
-    });
-
-    // Resolution is NOT applied (issue #442).  Doppler broadening only.
-    base_xs
+    // Resolution is NOT applied (issue #442).  Doppler broadening on the
+    // working grid, returned WITHOUT extracting the data points.
+    let sigma: Result<Vec<Vec<f64>>, TransmissionError> = base_xs
         .par_iter()
         .zip(resonance_data.par_iter())
         .map(|(xs_raw, rd)| {
-            if let Some((ref ext_energies, ref data_indices)) = ext_grid {
+            let xs_work = if let Some((ref ext_energies, ref data_indices)) = ext_grid {
                 let mask = is_data_point.as_ref().unwrap();
-
-                let xs_ext =
-                    build_extended_xs_from_base(ext_energies, data_indices, mask, xs_raw, rd);
-
-                let after_doppler = if temperature_k > 0.0 {
-                    let params = DopplerParams::new(temperature_k, rd.awr)?;
-                    doppler::doppler_broaden(ext_energies, &xs_ext, &params)?
-                } else {
-                    xs_ext
-                };
-                Ok(data_indices.iter().map(|&i| after_doppler[i]).collect())
+                build_extended_xs_from_base(ext_energies, data_indices, mask, xs_raw, rd)
             } else {
-                // No auxiliary grid — Doppler on data grid only.
-                let after_doppler = if temperature_k > 0.0 {
-                    let params = DopplerParams::new(temperature_k, rd.awr)?;
-                    doppler::doppler_broaden(energies, xs_raw, &params)?
-                } else {
-                    xs_raw.clone()
-                };
-                Ok(after_doppler)
+                xs_raw.clone()
+            };
+            if temperature_k > 0.0 {
+                let params = DopplerParams::new(temperature_k, rd.awr)?;
+                doppler::doppler_broaden(work_energies, &xs_work, &params).map_err(Into::into)
+            } else {
+                Ok(xs_work)
             }
         })
-        .collect()
+        .collect();
+
+    Ok(WorkingGridXs {
+        sigma: sigma?,
+        layout,
+    })
 }
 
 /// Compute Doppler-broadened cross-sections and their **analytical**
@@ -899,22 +1084,40 @@ pub fn broadened_cross_sections_with_analytical_derivative_from_base(
     temperature_k: f64,
     instrument: Option<&InstrumentParams>,
 ) -> Result<BroadenedXsWithDerivative, TransmissionError> {
-    if base_xs.len() != resonance_data.len() {
-        return Err(TransmissionError::InputMismatch(format!(
-            "base_xs has {} isotopes but resonance_data has {}",
-            base_xs.len(),
-            resonance_data.len(),
-        )));
-    }
-    for (i, row) in base_xs.iter().enumerate() {
-        if row.len() != energies.len() {
-            return Err(TransmissionError::InputMismatch(format!(
-                "base_xs[{i}] has {} energies but expected {}",
-                row.len(),
-                energies.len(),
-            )));
-        }
-    }
+    // Delegate to the working-grid variant and extract the data points for
+    // both σ and ∂σ/∂T.  Keeps this function's data-grid contract unchanged.
+    let WorkingGridXsWithDerivative {
+        sigma,
+        dsigma_dt,
+        layout,
+    } = broadened_cross_sections_with_analytical_derivative_from_base_on_working_grid(
+        energies,
+        base_xs,
+        resonance_data,
+        temperature_k,
+        instrument,
+    )?;
+    let xs_all = sigma.iter().map(|s| layout.extract(s)).collect();
+    let dxs_all = dsigma_dt.iter().map(|d| layout.extract(d)).collect();
+    Ok((xs_all, dxs_all))
+}
+
+/// Like [`broadened_cross_sections_with_analytical_derivative_from_base`] but
+/// returns σ and ∂σ/∂T on the **working grid** (auxiliary extended grid when
+/// Gaussian resolution is active, else the data grid) together with the
+/// [`WorkingGridLayout`].
+///
+/// The analytical Jacobian uses this so it can form `−T·Σᵢ nᵢ·rᵢ·∂σᵢ/∂T` on
+/// the working grid, resolution-broaden it there, and extract the data points
+/// last (issue #608).  Resolution is NOT applied (issue #442).
+pub fn broadened_cross_sections_with_analytical_derivative_from_base_on_working_grid(
+    energies: &[f64],
+    base_xs: &[Vec<f64>],
+    resonance_data: &[ResonanceData],
+    temperature_k: f64,
+    instrument: Option<&InstrumentParams>,
+) -> Result<WorkingGridXsWithDerivative, TransmissionError> {
+    validate_base_xs(energies, base_xs, resonance_data)?;
     if instrument.is_some() && !energies.windows(2).all(|w| w[0] <= w[1]) {
         return Err(ResolutionError::UnsortedEnergies.into());
     }
@@ -922,62 +1125,47 @@ pub fn broadened_cross_sections_with_analytical_derivative_from_base(
     // Build auxiliary grid (same as broadened_cross_sections_from_base).
     let rd_refs: Vec<&ResonanceData> = resonance_data.iter().collect();
     let ext_grid = build_aux_grid(energies, instrument, &rd_refs);
-    let is_data_point: Option<Vec<bool>> = ext_grid.as_ref().map(|(ext_e, di)| {
-        let mut mask = vec![false; ext_e.len()];
-        for &idx in di {
-            mask[idx] = true;
-        }
-        mask
-    });
+    let is_data_point = data_point_mask(ext_grid.as_ref());
+    let (work_energies, layout) = working_grid_layout(energies, ext_grid.as_ref());
 
-    // Per-isotope: Doppler broaden with analytical derivative.
+    // Per-isotope: Doppler broaden with analytical derivative on the WORKING
+    // grid, returned WITHOUT extracting the data points.
     // Resolution is NOT applied (issue #442).
     type IsotopeXsDxs = Result<(Vec<f64>, Vec<f64>), TransmissionError>;
     let results: Vec<IsotopeXsDxs> = base_xs
         .par_iter()
         .zip(resonance_data.par_iter())
         .map(|(xs_raw, rd)| {
-            if let Some((ref ext_energies, ref data_indices)) = ext_grid {
+            let xs_work = if let Some((ref ext_energies, ref data_indices)) = ext_grid {
                 let mask = is_data_point.as_ref().unwrap();
-
-                let xs_ext =
-                    build_extended_xs_from_base(ext_energies, data_indices, mask, xs_raw, rd);
-
-                // Doppler broaden + analytical derivative in one pass.
-                // Resolution is NOT applied (issue #442).
-                let (after_doppler, dxs_dt_doppler) = if temperature_k > 0.0 {
-                    let params = DopplerParams::new(temperature_k, rd.awr)?;
-                    doppler::doppler_broaden_with_derivative(ext_energies, &xs_ext, &params)?
-                } else {
-                    (xs_ext, vec![0.0; ext_energies.len()])
-                };
-
-                // Extract data-grid points from extended grid.
-                let xs: Vec<f64> = data_indices.iter().map(|&i| after_doppler[i]).collect();
-                let dxs: Vec<f64> = data_indices.iter().map(|&i| dxs_dt_doppler[i]).collect();
-                Ok((xs, dxs))
+                build_extended_xs_from_base(ext_energies, data_indices, mask, xs_raw, rd)
             } else {
-                // No auxiliary grid — Doppler on data grid only.
-                let (after_doppler, dxs_dt_doppler) = if temperature_k > 0.0 {
-                    let params = DopplerParams::new(temperature_k, rd.awr)?;
-                    doppler::doppler_broaden_with_derivative(energies, xs_raw, &params)?
-                } else {
-                    (xs_raw.clone(), vec![0.0; energies.len()])
-                };
-                Ok((after_doppler, dxs_dt_doppler))
+                xs_raw.clone()
+            };
+            if temperature_k > 0.0 {
+                let params = DopplerParams::new(temperature_k, rd.awr)?;
+                doppler::doppler_broaden_with_derivative(work_energies, &xs_work, &params)
+                    .map_err(Into::into)
+            } else {
+                let zeros = vec![0.0; work_energies.len()];
+                Ok((xs_work, zeros))
             }
         })
         .collect();
 
-    // Separate into (xs_all, dxs_all).
-    let mut xs_all = Vec::with_capacity(base_xs.len());
-    let mut dxs_all = Vec::with_capacity(base_xs.len());
+    // Separate into (sigma, dsigma_dt) on the working grid.
+    let mut sigma = Vec::with_capacity(base_xs.len());
+    let mut dsigma_dt = Vec::with_capacity(base_xs.len());
     for r in results {
         let (xs, dxs) = r?;
-        xs_all.push(xs);
-        dxs_all.push(dxs);
+        sigma.push(xs);
+        dsigma_dt.push(dxs);
     }
-    Ok((xs_all, dxs_all))
+    Ok(WorkingGridXsWithDerivative {
+        sigma,
+        dsigma_dt,
+        layout,
+    })
 }
 
 /// Compute a transmission spectrum from precomputed unbroadened cross-sections.

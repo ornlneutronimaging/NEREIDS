@@ -24,6 +24,15 @@ use nereids_physics::transmission::{self as nereids_transmission, InstrumentPara
 
 use crate::error::PipelineError;
 
+/// Working-grid σ + its layout (issue #608): Doppler-broadened σ on the working
+/// grid paired with the data-index map back to the data grid.  Injected by
+/// [`spatial_map_typed`] into [`UnifiedFitConfig`] for the precomputed
+/// Gaussian-resolution path.
+type PrecomputedWorkXs = (
+    Arc<Vec<Vec<f64>>>,
+    Arc<nereids_physics::transmission::WorkingGridLayout>,
+);
+
 /// SAMMY-style normalization and background configuration.
 ///
 /// When enabled, the transmission model becomes:
@@ -299,6 +308,24 @@ pub struct UnifiedFitConfig {
 
     // ── Precomputed caches (injected by spatial_map_typed) ──
     precomputed_cross_sections: Option<Arc<Vec<Vec<f64>>>>,
+    /// Doppler-broadened σ on the **working grid** + the working-grid layout,
+    /// injected by [`spatial_map_typed`] for the fixed-calibration /
+    /// fixed-temperature precomputed path (issue #608).
+    ///
+    /// When a Gaussian resolution function is active, the working grid is the
+    /// auxiliary extended grid (boundary extension + resonance fine-structure);
+    /// storing σ there lets each per-pixel [`PrecomputedTransmissionModel`]
+    /// apply Beer-Lambert + resolution on the working grid and extract the data
+    /// points last — matching `forward_model`.  For tabulated / no resolution
+    /// the working grid IS the data grid and this is `None` (the model uses the
+    /// data-grid `precomputed_cross_sections` directly, preserving the cubature
+    /// / scalar surrogate fast paths).
+    ///
+    /// `precomputed_cross_sections` still carries the **data-grid** σ for the
+    /// surrogate-plan builders and shape validation; this field is the separate
+    /// working-grid copy consumed only by `build_transmission_model`'s
+    /// precomputed branch.
+    precomputed_work_cross_sections: Option<PrecomputedWorkXs>,
     precomputed_base_xs: Option<Arc<Vec<Vec<f64>>>>,
     /// Resolution broadening plan built once for `(energies, resolution)`.
     ///
@@ -420,6 +447,7 @@ impl UnifiedFitConfig {
             counts_background: None,
             counts_enable_polish: None,
             precomputed_cross_sections: None,
+            precomputed_work_cross_sections: None,
             precomputed_base_xs: None,
             precomputed_resolution_plan: None,
             precomputed_sparse_cubature_plan: None,
@@ -552,6 +580,31 @@ impl UnifiedFitConfig {
         // values for the new σ (Codex round-3 P3 on PR #480).
         self.precomputed_sparse_cubature_plan = None;
         self.precomputed_sparse_scalar_plan = None;
+        // A new data-grid σ also invalidates the working-grid σ copy
+        // (issue #608): it was Doppler-broadened from the OLD σ on the
+        // OLD grid layout, so reusing it would mix grids.
+        self.precomputed_work_cross_sections = None;
+        self
+    }
+
+    /// Attach the **working-grid** Doppler-broadened σ + its layout for the
+    /// fixed-calibration / fixed-temperature precomputed path (issue #608).
+    ///
+    /// When set, `build_transmission_model` builds a
+    /// [`PrecomputedTransmissionModel`] whose σ live on the working grid and
+    /// whose `evaluate` / `analytical_jacobian` apply resolution on the working
+    /// grid and extract the data points last — matching `forward_model`.  The
+    /// data-grid `precomputed_cross_sections` must still be set (for the
+    /// surrogate-plan builders and shape validation); for tabulated / no
+    /// resolution the working grid equals the data grid and this is left
+    /// `None`.
+    #[must_use]
+    pub fn with_precomputed_work_cross_sections(
+        mut self,
+        xs: Arc<Vec<Vec<f64>>>,
+        layout: Arc<nereids_physics::transmission::WorkingGridLayout>,
+    ) -> Self {
+        self.precomputed_work_cross_sections = Some((xs, layout));
         self
     }
 
@@ -681,6 +734,7 @@ impl UnifiedFitConfig {
         self.density_ratios = Some(all_ratios);
         // Clear stale caches — the isotope set changed.
         self.precomputed_cross_sections = None;
+        self.precomputed_work_cross_sections = None;
         self.precomputed_base_xs = None;
         // Clear the cubature plan too: atoms are σ-coordinates in
         // ℝ^k and `k` / σ-stack change when groups are reconfigured,
@@ -1964,25 +2018,39 @@ fn build_transmission_model(
     {
         // When groups are active, compute σ_eff per group from member XS.
         // For ungrouped isotopes, this is a no-op (identity mapping, ratio=1.0).
-        let effective_xs =
-            if let (Some(di), Some(dr)) = (&config.density_indices, &config.density_ratios) {
-                // Only collapse when XS is per-member (shape matches mapping).
-                // If XS is already group-collapsed (len == n_params), skip.
-                if xs.len() == di.len() && di.len() == dr.len() {
-                    let n_e = xs[0].len();
-                    let mut eff = vec![vec![0.0f64; n_e]; n_params];
-                    for ((&idx, &ratio), member_xs) in di.iter().zip(dr.iter()).zip(xs.iter()) {
-                        for (j, &sigma) in member_xs.iter().enumerate() {
-                            eff[idx][j] += ratio * sigma;
-                        }
+        // Only collapse when XS is per-member (shape matches mapping); if XS is
+        // already group-collapsed (len == n_params), this is a clone.
+        let collapse_by_groups = |xs: &Arc<Vec<Vec<f64>>>| -> Arc<Vec<Vec<f64>>> {
+            if let (Some(di), Some(dr)) = (&config.density_indices, &config.density_ratios)
+                && xs.len() == di.len()
+                && di.len() == dr.len()
+            {
+                let n_e = xs[0].len();
+                let mut eff = vec![vec![0.0f64; n_e]; n_params];
+                for ((&idx, &ratio), member_xs) in di.iter().zip(dr.iter()).zip(xs.iter()) {
+                    for (j, &sigma) in member_xs.iter().enumerate() {
+                        eff[idx][j] += ratio * sigma;
                     }
-                    Arc::new(eff)
-                } else {
-                    Arc::clone(xs)
                 }
-            } else {
-                Arc::clone(xs)
-            };
+                return Arc::new(eff);
+            }
+            Arc::clone(xs)
+        };
+
+        // Issue #608: prefer the WORKING-grid σ + layout when the spatial
+        // builder injected it (Gaussian resolution → auxiliary extended grid).
+        // The model then applies resolution on the working grid and extracts
+        // the data points last.  When absent (tabulated / no resolution) the
+        // working grid is the data grid: use the data-grid σ with no layout, so
+        // the surrogate fast paths and data-grid `resolution_plan` are
+        // unaffected.
+        let (effective_xs, work_layout): (
+            Arc<Vec<Vec<f64>>>,
+            Option<Arc<nereids_physics::transmission::WorkingGridLayout>>,
+        ) = match &config.precomputed_work_cross_sections {
+            Some((work_xs, layout)) => (collapse_by_groups(work_xs), Some(Arc::clone(layout))),
+            None => (collapse_by_groups(xs), None),
+        };
         // Issue #442: pass energies + instrument so evaluate() applies
         // resolution after Beer-Lambert on total transmission.
         let instrument = config
@@ -2014,6 +2082,7 @@ fn build_transmission_model(
             resolution_plan,
             sparse_cubature_plan,
             sparse_scalar_plan,
+            work_layout,
         }));
     }
 
@@ -2678,6 +2747,7 @@ mod tests {
             resolution_plan: None,
             sparse_cubature_plan: None,
             sparse_scalar_plan: None,
+            work_layout: None,
         };
         let t = model.evaluate(&[true_density]).unwrap();
         let sigma: Vec<f64> = t.iter().map(|&v| 0.01 * v.max(0.01)).collect();
@@ -3190,6 +3260,7 @@ mod tests {
             resolution_plan: None,
             sparse_cubature_plan: None,
             sparse_scalar_plan: None,
+            work_layout: None,
         };
         let t = model.evaluate(&[true_density]).unwrap();
         let sigma: Vec<f64> = t.iter().map(|&v| 0.01 * v.max(0.01)).collect();
