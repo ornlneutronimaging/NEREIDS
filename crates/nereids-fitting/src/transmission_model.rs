@@ -2691,6 +2691,20 @@ mod tests {
     use nereids_endf::resonance::test_support::u238_single_resonance;
     use nereids_endf::resonance::{LGroup, Resonance, ResonanceFormalism, ResonanceRange};
 
+    /// ∞-norm of the residual between two equal-length spectra.
+    /// (Issue #608 aux-grid regression-test helper.)
+    fn max_abs_diff(a: &[f64], b: &[f64]) -> f64 {
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f64, f64::max)
+    }
+
+    /// ∞-norm (max |value|) of a spectrum — a scale for relative thresholds.
+    fn max_abs(a: &[f64]) -> f64 {
+        a.iter().map(|x| x.abs()).fold(0.0f64, f64::max)
+    }
+
     // ── PrecomputedTransmissionModel ─────────────────────────────────────────
 
     /// Verify Beer-Lambert: T(E) = exp(-Σᵢ nᵢ·σᵢ(E)).
@@ -4748,6 +4762,413 @@ mod tests {
                 energies[i]
             );
         }
+    }
+
+    // ── Issue #608: LM-fit resolution must use the auxiliary grid ────────────
+    //
+    // The pre-#608 cached / precomputed / energy-scale paths applied resolution
+    // broadening on the COARSE data grid, unlike `forward_model`, which broadens
+    // on the auxiliary extended grid and extracts the data points last.  The
+    // tests below pin every fixed path to `forward_model` — an INDEPENDENT
+    // oracle: it computes σ inline (`reich_moore::cross_sections_at_energy`) and
+    // never calls the `broadened_cross_sections` family this fix touches — to
+    // MACHINE PRECISION over the FULL grid, including the boundary points the
+    // earlier #442 tests (tol 2e-2, interior-only) excluded.  Each test verifies
+    // the kernel actually broadens the spectrum (non-vacuity, per
+    // feedback_synthetic_resolution_test_design) and, where it can construct the
+    // old path, shows the old coarse-grid result differed materially — proving
+    // the fix is a real correction, not a no-op.  Jacobian columns are checked
+    // against central finite differences of the (now aux-correct) `evaluate`.
+
+    /// Issue #608: the spatial production path (`PrecomputedTransmissionModel`)
+    /// must broaden resolution on the auxiliary grid, matching `forward_model`.
+    #[test]
+    fn issue_608_precomputed_aux_grid_resolution_matches_forward_model() {
+        use nereids_physics::resolution::ResolutionFunction;
+
+        let data = u238_single_resonance();
+        let thickness = 0.0005;
+        let temperature = 300.0;
+        let energies: Vec<f64> = (0..401).map(|i| 4.0 + (i as f64) * 0.015).collect();
+        let inst = Arc::new(InstrumentParams {
+            resolution: ResolutionFunction::Gaussian(
+                nereids_physics::resolution::ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
+            ),
+        });
+
+        // Independent oracle (computes σ inline; broadens on the aux grid).
+        let sample = SampleParams::new(temperature, vec![(data.clone(), thickness)]).unwrap();
+        let t_ref = transmission::forward_model(&energies, &sample, Some(&inst)).unwrap();
+
+        // Non-vacuity: the kernel must actually broaden the spectrum, else
+        // aux-grid vs data-grid broadening would be indistinguishable.
+        let t_nores = transmission::forward_model(&energies, &sample, None).unwrap();
+        let broaden = max_abs_diff(&t_ref, &t_nores);
+        assert!(
+            broaden > 1e-3 * max_abs(&t_nores),
+            "resolution kernel must broaden the spectrum non-trivially (got {broaden:.3e})"
+        );
+
+        // FIXED path: working-grid σ + layout, exactly as `spatial_map_typed` builds it.
+        let working = transmission::broadened_cross_sections_on_working_grid(
+            &energies,
+            std::slice::from_ref(&data),
+            temperature,
+            Some(&inst),
+            None,
+        )
+        .unwrap();
+        assert!(
+            !working.layout.is_identity(),
+            "Gaussian resolution must build a non-identity auxiliary grid — else \
+             this test does not exercise the #608 fix"
+        );
+        let model_fixed = PrecomputedTransmissionModel {
+            cross_sections: Arc::new(working.sigma),
+            density_indices: Arc::new(vec![0]),
+            energies: Some(Arc::new(energies.clone())),
+            instrument: Some(Arc::clone(&inst)),
+            resolution_plan: None,
+            sparse_cubature_plan: None,
+            sparse_scalar_plan: None,
+            work_layout: Some(Arc::new(working.layout)),
+        };
+        let t_fixed = model_fixed.evaluate(&[thickness]).unwrap();
+
+        // OLD path: data-grid σ, no layout — broadens on the coarse data grid
+        // (the configuration the pre-#608 spatial pipeline produced).
+        let xs_data = transmission::broadened_cross_sections(
+            &energies,
+            std::slice::from_ref(&data),
+            temperature,
+            Some(&inst),
+            None,
+        )
+        .unwrap();
+        let model_old = PrecomputedTransmissionModel {
+            cross_sections: Arc::new(xs_data),
+            density_indices: Arc::new(vec![0]),
+            energies: Some(Arc::new(energies.clone())),
+            instrument: Some(Arc::clone(&inst)),
+            resolution_plan: None,
+            sparse_cubature_plan: None,
+            sparse_scalar_plan: None,
+            work_layout: None,
+        };
+        let t_old = model_old.evaluate(&[thickness]).unwrap();
+
+        let err_fixed = max_abs_diff(&t_fixed, &t_ref);
+        let err_old = max_abs_diff(&t_old, &t_ref);
+
+        assert!(
+            err_fixed < 1e-9,
+            "aux-grid PrecomputedTransmissionModel must match forward_model to \
+             machine precision over the full grid (got {err_fixed:.3e})"
+        );
+        assert!(
+            err_old > 1e-4 && err_old > 1e4 * err_fixed.max(1e-15),
+            "old coarse-grid path should differ from forward_model far more than \
+             the fixed path (old={err_old:.3e}, fixed={err_fixed:.3e})"
+        );
+    }
+
+    /// Issue #608: `PrecomputedTransmissionModel::analytical_jacobian` forms the
+    /// inner derivative on the auxiliary grid; it must match central finite
+    /// differences of the (aux-correct) `evaluate`.
+    #[test]
+    fn issue_608_precomputed_aux_grid_jacobian_matches_fd() {
+        use nereids_physics::resolution::ResolutionFunction;
+
+        let data = u238_single_resonance();
+        let thickness = 0.0005;
+        let temperature = 300.0;
+        let energies: Vec<f64> = (0..401).map(|i| 4.0 + (i as f64) * 0.015).collect();
+        let inst = Arc::new(InstrumentParams {
+            resolution: ResolutionFunction::Gaussian(
+                nereids_physics::resolution::ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
+            ),
+        });
+        let working = transmission::broadened_cross_sections_on_working_grid(
+            &energies,
+            std::slice::from_ref(&data),
+            temperature,
+            Some(&inst),
+            None,
+        )
+        .unwrap();
+        let model = PrecomputedTransmissionModel {
+            cross_sections: Arc::new(working.sigma),
+            density_indices: Arc::new(vec![0]),
+            energies: Some(Arc::new(energies.clone())),
+            instrument: Some(Arc::clone(&inst)),
+            resolution_plan: None,
+            sparse_cubature_plan: None,
+            sparse_scalar_plan: None,
+            work_layout: Some(Arc::new(working.layout)),
+        };
+
+        let params = [thickness];
+        let free = [0usize];
+        let y0 = model.evaluate(&params).unwrap();
+        let jac = model
+            .analytical_jacobian(&params, &free, &y0)
+            .expect("analytical jacobian must be available with resolution + aux grid");
+
+        let h = 1e-7;
+        let mut pp = params;
+        let mut pm = params;
+        pp[0] += h;
+        pm[0] -= h;
+        let yp = model.evaluate(&pp).unwrap();
+        let ym = model.evaluate(&pm).unwrap();
+
+        let mut scale = 0.0f64;
+        let mut max_err = 0.0f64;
+        for i in 0..y0.len() {
+            let fd = (yp[i] - ym[i]) / (2.0 * h);
+            let an = jac.get(i, 0);
+            scale = scale.max(an.abs());
+            max_err = max_err.max((fd - an).abs());
+        }
+        let rel = max_err / scale.max(1e-30);
+        assert!(
+            rel < 1e-6,
+            "analytical density Jacobian must match central FD (rel err {rel:.3e})"
+        );
+    }
+
+    /// Issue #608: `TransmissionFitModel`'s cached temperature-fit `evaluate`
+    /// must broaden on the auxiliary grid, matching `forward_model` to machine
+    /// precision over the full grid (the #442 test tolerated 2e-2, interior-only).
+    #[test]
+    fn issue_608_transmission_fit_temp_path_aux_grid_matches_forward_model() {
+        use nereids_physics::resolution::ResolutionFunction;
+
+        let data = u238_single_resonance();
+        let thickness = 0.0005;
+        let temperature = 300.0;
+        let energies: Vec<f64> = (0..401).map(|i| 4.0 + (i as f64) * 0.015).collect();
+        let inst = Arc::new(InstrumentParams {
+            resolution: ResolutionFunction::Gaussian(
+                nereids_physics::resolution::ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
+            ),
+        });
+
+        let sample = SampleParams::new(temperature, vec![(data.clone(), thickness)]).unwrap();
+        let t_ref = transmission::forward_model(&energies, &sample, Some(&inst)).unwrap();
+        let t_nores = transmission::forward_model(&energies, &sample, None).unwrap();
+        let broaden = max_abs_diff(&t_ref, &t_nores);
+        assert!(
+            broaden > 1e-3 * max_abs(&t_nores),
+            "resolution kernel must broaden the spectrum non-trivially (got {broaden:.3e})"
+        );
+
+        let model = TransmissionFitModel::new(
+            energies.clone(),
+            vec![data],
+            temperature,
+            Some(Arc::clone(&inst)),
+            (vec![0], vec![1.0]),
+            Some(1), // temperature_index → exercises the cached temperature path
+            None,
+        )
+        .unwrap();
+        let t_model = model.evaluate(&[thickness, temperature]).unwrap();
+
+        let err = max_abs_diff(&t_model, &t_ref);
+        assert!(
+            err < 1e-9,
+            "aux-grid TransmissionFitModel temperature path must match \
+             forward_model over the full grid (got {err:.3e})"
+        );
+    }
+
+    /// Issue #608: `TransmissionFitModel::analytical_jacobian` (cached temp path)
+    /// forms density and temperature inner derivatives on the auxiliary grid;
+    /// both columns must match central finite differences of `evaluate`.
+    #[test]
+    fn issue_608_transmission_fit_temp_path_jacobian_matches_fd() {
+        use nereids_physics::resolution::ResolutionFunction;
+
+        let data = u238_single_resonance();
+        let thickness = 0.0005;
+        let temperature = 300.0;
+        let energies: Vec<f64> = (0..401).map(|i| 4.0 + (i as f64) * 0.015).collect();
+        let inst = Arc::new(InstrumentParams {
+            resolution: ResolutionFunction::Gaussian(
+                nereids_physics::resolution::ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
+            ),
+        });
+
+        let model = TransmissionFitModel::new(
+            energies.clone(),
+            vec![data],
+            temperature,
+            Some(Arc::clone(&inst)),
+            (vec![0], vec![1.0]),
+            Some(1),
+            None,
+        )
+        .unwrap();
+
+        let params = [thickness, temperature];
+        // evaluate() populates the broadened-σ cache at these params; the
+        // analytical jacobian reads that cache, so compute it BEFORE any FD
+        // perturbation mutates the cache.
+        let y0 = model.evaluate(&params).unwrap();
+        let free = [0usize, 1usize];
+        let jac = model
+            .analytical_jacobian(&params, &free, &y0)
+            .expect("analytical jacobian must be available with resolution + aux grid");
+
+        // Per-parameter central-FD step (absolute): density ~5e-4, temperature 300 K.
+        let steps = [1e-7, 1e-2];
+        for (col, &p_idx) in free.iter().enumerate() {
+            let h = steps[col];
+            let mut pp = params;
+            let mut pm = params;
+            pp[p_idx] += h;
+            pm[p_idx] -= h;
+            let yp = model.evaluate(&pp).unwrap();
+            let ym = model.evaluate(&pm).unwrap();
+            let mut scale = 0.0f64;
+            let mut max_err = 0.0f64;
+            for i in 0..y0.len() {
+                let fd = (yp[i] - ym[i]) / (2.0 * h);
+                let an = jac.get(i, col);
+                scale = scale.max(an.abs());
+                max_err = max_err.max((fd - an).abs());
+            }
+            let rel = max_err / scale.max(1e-30);
+            assert!(
+                rel < 1e-5,
+                "analytical Jacobian column {col} must match central FD (rel err {rel:.3e})"
+            );
+        }
+    }
+
+    /// Issue #608: `EnergyScaleTransmissionModel` applies resolution on the
+    /// auxiliary grid built from the (energy-scale-corrected) grid.  At identity
+    /// calibration with a PIECEWISE-LINEAR σ (so the model's linear σ
+    /// interpolation onto the working grid is exact), its `evaluate` must match a
+    /// `PrecomputedTransmissionModel` broadening the SAME interpolated σ on the
+    /// SAME aux grid (that model is pinned bit-exactly to `forward_model` above).
+    /// The oracle replicates the model's clamp-linear `interpolate_xs`, so the
+    /// only behavioural variable is the grid on which resolution is applied — the
+    /// #608 fix.  A data-grid-only broadening (the pre-#608 behaviour) differs
+    /// materially.
+    #[test]
+    fn issue_608_energy_scale_aux_grid_resolution_matches_precomputed_oracle() {
+        use nereids_physics::resolution::ResolutionFunction;
+
+        // Clamp-linear interpolation mirroring EnergyScaleTransmissionModel::
+        // interpolate_xs (edge-clamp outside the nominal range, linear inside).
+        fn interp_clamp_linear(nominal_e: &[f64], xs: &[f64], e: f64) -> f64 {
+            let n = nominal_e.len();
+            if e <= nominal_e[0] {
+                return xs[0];
+            }
+            if e >= nominal_e[n - 1] {
+                return xs[n - 1];
+            }
+            let pos = nominal_e.partition_point(|&v| v < e);
+            let i = if pos == 0 { 0 } else { pos - 1 };
+            let frac = (e - nominal_e[i]) / (nominal_e[i + 1] - nominal_e[i]);
+            xs[i] + frac * (xs[i + 1] - xs[i])
+        }
+
+        // Piecewise-linear σ: a sharp triangular peak (apex at grid index 40,
+        // back to baseline ±4 bins away) so resolution broadens it substantially
+        // while linear interpolation between nominal points stays exact.
+        let nominal_e: Vec<f64> = (0..81).map(|i| 4.0 + (i as f64) * 0.05).collect();
+        let sigma_nominal: Vec<f64> = (0..81_i32)
+            .map(|i| {
+                let d = f64::from((i - 40).unsigned_abs());
+                50.0 + 750.0 * (1.0 - d / 4.0).max(0.0)
+            })
+            .collect();
+        let density = 0.01;
+        let inst = Arc::new(InstrumentParams {
+            resolution: ResolutionFunction::Gaussian(
+                nereids_physics::resolution::ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
+            ),
+        });
+
+        // Aux grid for the identity-corrected nominal grid (no resonance data).
+        let layout = transmission::resolution_working_grid(&nominal_e, Some(&inst), &[]).unwrap();
+        assert!(
+            !layout.is_identity(),
+            "Gaussian resolution must build a non-identity auxiliary grid"
+        );
+
+        // Oracle: PrecomputedTransmissionModel broadening the SAME σ on the SAME
+        // aux grid (pinned bit-exactly to forward_model in the test above).
+        let sigma_aux: Vec<f64> = layout
+            .energies
+            .iter()
+            .map(|&e| interp_clamp_linear(&nominal_e, &sigma_nominal, e))
+            .collect();
+        let oracle = PrecomputedTransmissionModel {
+            cross_sections: Arc::new(vec![sigma_aux]),
+            density_indices: Arc::new(vec![0]),
+            energies: Some(Arc::new(nominal_e.clone())),
+            instrument: Some(Arc::clone(&inst)),
+            resolution_plan: None,
+            sparse_cubature_plan: None,
+            sparse_scalar_plan: None,
+            work_layout: Some(Arc::new(layout)),
+        };
+        let t_oracle = oracle.evaluate(&[density]).unwrap();
+
+        // EnergyScale at identity calibration (t0 = 0, l_scale = 1).
+        let es = EnergyScaleTransmissionModel::new(
+            Arc::new(vec![sigma_nominal.clone()]),
+            Arc::new(vec![0]),
+            nominal_e.clone(),
+            25.0,
+            1, // t0_index
+            2, // l_scale_index
+            Some(Arc::clone(&inst)),
+        );
+        let t_es = es.evaluate(&[density, 0.0, 1.0]).unwrap();
+
+        let err = max_abs_diff(&t_es, &t_oracle);
+
+        // Non-vacuity + the fix matters: pre-#608 broadening on the COARSE data
+        // grid differs materially from the aux-grid result.
+        let t_unbroadened: Vec<f64> = sigma_nominal
+            .iter()
+            .map(|&s| (-density * s).exp())
+            .collect();
+        let t_datagrid = nereids_physics::resolution::apply_resolution(
+            &nominal_e,
+            &t_unbroadened,
+            &inst.resolution,
+        )
+        .unwrap();
+        // The aux-grid broadening is the CORRECT effect.  Here the resolution
+        // kernel is narrower than the coarse bin spacing, so broadening ON THE
+        // DATA GRID is a near-passthrough (`t_datagrid ≈ t_unbroadened`) —
+        // precisely the #608 failure mode.  Non-vacuity therefore checks that
+        // the AUX-grid result broadens; "the fix matters" checks that the
+        // data-grid result is materially wrong.
+        let broaden_aux = max_abs_diff(&t_oracle, &t_unbroadened);
+        let err_datagrid = max_abs_diff(&t_datagrid, &t_oracle);
+
+        assert!(
+            err < 1e-6,
+            "EnergyScale identity-calibration evaluate must match the aux-grid \
+             precomputed oracle (got {err:.3e})"
+        );
+        assert!(
+            broaden_aux > 1e-3 * max_abs(&t_unbroadened),
+            "aux-grid resolution must broaden the spectrum non-trivially (got {broaden_aux:.3e})"
+        );
+        assert!(
+            err_datagrid > 1e-3,
+            "data-grid resolution (pre-#608) must differ materially from the \
+             aux-grid result (got {err_datagrid:.3e}) — confirming the fix changes behaviour"
+        );
     }
 
     /// Resolution-enabled temperature path must produce measurably different
