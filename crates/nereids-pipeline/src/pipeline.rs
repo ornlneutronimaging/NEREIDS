@@ -598,6 +598,13 @@ impl UnifiedFitConfig {
     /// surrogate-plan builders and shape validation); for tabulated / no
     /// resolution the working grid equals the data grid and this is left
     /// `None`.
+    ///
+    /// The σ + layout are not validated here (this is an infallible builder
+    /// setter); shape/consistency are checked once up front in
+    /// [`validate_precomputed_cross_sections`], which every public entry point
+    /// (`fit_spectrum_typed`, `fit_transmission_poisson`, `spatial_map_typed`)
+    /// calls before any forward-model build or per-pixel loop — mirroring how
+    /// [`Self::with_precomputed_cross_sections`] is validated.
     #[must_use]
     pub fn with_precomputed_work_cross_sections(
         mut self,
@@ -1695,6 +1702,14 @@ pub(crate) fn validate_transmission_background(bg: &BackgroundConfig) -> Result<
 /// * row count is either `n_density_params` (already group-collapsed / identity)
 ///   or, when groups are active, `density_indices.len()` (per-member, collapsed
 ///   downstream).
+///
+/// When `precomputed_work_cross_sections` is also set (issue #608, Gaussian
+/// aux-grid path) its working-grid σ + layout are validated against the same
+/// invariants: non-empty, each row length == `work_layout.energies.len()`,
+/// finite σ, row count == the data-grid σ row count (same density mapping), and
+/// a layout whose `data_indices` length == `energies.len()` with every index in
+/// range for the working grid — so `build_transmission_model`'s Beer-Lambert
+/// accumulation and `work_layout.extract(..)` cannot write/read out of bounds.
 pub(crate) fn validate_precomputed_cross_sections(
     config: &UnifiedFitConfig,
 ) -> Result<(), PipelineError> {
@@ -1744,6 +1759,70 @@ pub(crate) fn validate_precomputed_cross_sections(
             "precomputed_cross_sections has {} rows but expected {expected}",
             xs.len(),
         )));
+    }
+
+    // Issue #608: the working-grid σ + layout attached via
+    // `with_precomputed_work_cross_sections` flows into
+    // `build_transmission_model`, where the model applies Beer-Lambert +
+    // resolution on `work_layout.energies` and then `work_layout.extract(..)`
+    // indexes the broadened spectrum by `work_layout.data_indices`.  An empty
+    // σ panics on `xs[0].len()`; a row whose length ≠ the working-grid length
+    // writes out of bounds in the Beer-Lambert accumulation; a layout whose
+    // `data_indices` length ≠ the data grid, or that indexes past the working
+    // grid, panics in `extract`.  Validate the same shape/consistency
+    // invariants as the data-grid σ above so a malformed setter call surfaces
+    // as a typed `ShapeMismatch` here rather than a per-pixel panic / swallowed
+    // failed fit.
+    if let Some((work_xs, layout)) = &config.precomputed_work_cross_sections {
+        let n_work = layout.energies.len();
+        if work_xs.is_empty() {
+            return Err(PipelineError::ShapeMismatch(
+                "precomputed_work_cross_sections must not be empty".into(),
+            ));
+        }
+        for (i, row) in work_xs.iter().enumerate() {
+            if row.len() != n_work {
+                return Err(PipelineError::ShapeMismatch(format!(
+                    "precomputed_work_cross_sections row {i} has length {} but \
+                     work_layout has {n_work} working-grid energies",
+                    row.len(),
+                )));
+            }
+            if let Some(j) = row.iter().position(|s| !s.is_finite()) {
+                return Err(PipelineError::ShapeMismatch(format!(
+                    "precomputed_work_cross_sections row {i} has non-finite σ at \
+                     working-grid index {j}: {}",
+                    row[j],
+                )));
+            }
+        }
+        // Row count must match the data-grid σ row count (same density mapping):
+        // both feed the SAME `density_indices` in `build_transmission_model`.
+        if work_xs.len() != xs.len() {
+            return Err(PipelineError::ShapeMismatch(format!(
+                "precomputed_work_cross_sections has {} rows but \
+                 precomputed_cross_sections has {} — both index the same density \
+                 mapping and must agree",
+                work_xs.len(),
+                xs.len(),
+            )));
+        }
+        // The layout maps each data energy to a working-grid index.  Its length
+        // must equal the data grid, and every index must be in range so
+        // `extract` cannot panic.
+        if layout.data_indices.len() != n_e {
+            return Err(PipelineError::ShapeMismatch(format!(
+                "precomputed_work_cross_sections layout maps {} data points but \
+                 config.energies has {n_e}",
+                layout.data_indices.len(),
+            )));
+        }
+        if let Some(&bad) = layout.data_indices.iter().find(|&&idx| idx >= n_work) {
+            return Err(PipelineError::ShapeMismatch(format!(
+                "precomputed_work_cross_sections layout index {bad} is out of \
+                 range for {n_work} working-grid energies",
+            )));
+        }
     }
     Ok(())
 }

@@ -57,16 +57,24 @@ const L_SCALE_EPSILON: f64 = 1.0e-12;
 /// then wrap in `Arc` so the same precomputed data is shared read-only
 /// across all rayon worker threads.
 pub struct PrecomputedTransmissionModel {
-    /// Doppler-broadened cross-sections σ_D(E) per isotope, on the **working
-    /// grid**, shape \[n_isotopes\]\[n_working_energies\].
+    /// Doppler-broadened cross-sections σ_D(E) per isotope, shape
+    /// \[n_isotopes\]\[n_grid_energies\].
     ///
-    /// Issue #608: when a Gaussian resolution function is active the spatial
-    /// builder pre-stores σ on the auxiliary extended grid (see
-    /// [`work_layout`](Self::work_layout)) so `evaluate()` /
-    /// `analytical_jacobian()` apply Beer-Lambert + resolution on the working
-    /// grid and extract the data points LAST — matching `forward_model`.  For
-    /// tabulated resolution (and no resolution) the working grid IS the data
-    /// grid, so this is the data-grid σ exactly as before.
+    /// **The grid these σ live on is determined by
+    /// [`work_layout`](Self::work_layout):**
+    ///
+    /// * `work_layout` is `Some` (Gaussian resolution → auxiliary extended
+    ///   grid): σ live on the **working grid**, i.e.
+    ///   `work_layout.energies`, with `n_grid_energies ==
+    ///   work_layout.energies.len()`.  `evaluate()` / `analytical_jacobian()`
+    ///   apply Beer-Lambert + resolution on this working grid and extract the
+    ///   data points LAST via `work_layout.extract(..)` — matching
+    ///   `forward_model` (issue #608).
+    /// * `work_layout` is `None` (tabulated resolution, or no resolution): the
+    ///   working grid IS the data grid, so σ live on the **data grid**
+    ///   (`energies`), with `n_grid_energies == energies.len()`.  No extraction
+    ///   is needed and the surrogate fast paths + data-grid `resolution_plan`
+    ///   behave exactly as before.
     pub cross_sections: Arc<Vec<Vec<f64>>>,
     /// Mapping: `params[density_indices[i]]` is the density of isotope `i`.
     ///

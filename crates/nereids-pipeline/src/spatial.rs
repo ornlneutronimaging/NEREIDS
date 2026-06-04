@@ -947,13 +947,33 @@ pub fn spatial_map_typed(
     let instrument = config.resolution().map(|r| InstrumentParams {
         resolution: r.clone(),
     });
+
+    // Determine the working-grid layout FIRST, cheaply (no Doppler
+    // broadening): `resolution_working_grid` only builds the auxiliary grid
+    // geometry (boundary extension + resonance fine-structure) — it does NOT
+    // evaluate or broaden σ.  When the layout is the identity (tabulated / no
+    // resolution) the working grid IS the data grid, so no working-grid σ is
+    // needed and we must NOT pay for the full per-isotope
+    // `broadened_cross_sections_on_working_grid` just to discover the layout
+    // is trivial.  Only the genuine Gaussian aux-grid case below runs the
+    // expensive broadening.
+    let rd_refs: Vec<&_> = config.resonance_data().iter().collect();
+    let layout = nereids_physics::transmission::resolution_working_grid(
+        config.energies(),
+        instrument.as_ref(),
+        &rd_refs,
+    )
+    .map_err(PipelineError::Transmission)?;
+    let aux_grid_active = !layout.is_identity();
+
     // (xs = data-grid σ, work_xs = working-grid σ when an aux grid exists).
     let (xs, work_xs) = match config.precomputed_cross_sections().cloned() {
-        // Caller supplied data-grid σ.  When a Gaussian aux grid would
-        // exist we still need working-grid σ for the #608-correct path, so
-        // recompute it from resonance data (the data-grid σ alone cannot be
-        // de-extracted back onto the aux grid).  When no aux grid exists the
-        // supplied σ is already the working-grid σ.
+        // Caller supplied data-grid σ.  When a Gaussian aux grid exists we
+        // still need working-grid σ for the #608-correct path, so recompute it
+        // from resonance data (the data-grid σ alone cannot be de-extracted
+        // back onto the aux grid).  When no aux grid exists the supplied σ is
+        // already the working-grid σ and we skip Doppler broadening entirely.
+        Some(cached) if !aux_grid_active => (cached, None),
         Some(cached) => {
             let working = broadened_cross_sections_on_working_grid(
                 config.energies(),
@@ -962,11 +982,7 @@ pub fn spatial_map_typed(
                 instrument.as_ref(),
                 cancel,
             )?;
-            if working.layout.is_identity() {
-                (cached, None)
-            } else {
-                (cached, Some(Arc::new(working.sigma)))
-            }
+            (cached, Some(Arc::new(working.sigma)))
         }
         None => {
             let working = broadened_cross_sections_on_working_grid(
@@ -976,10 +992,7 @@ pub fn spatial_map_typed(
                 instrument.as_ref(),
                 cancel,
             )?;
-            if working.layout.is_identity() {
-                // Working grid == data grid: σ is the data-grid σ directly.
-                (Arc::new(working.sigma), None)
-            } else {
+            if aux_grid_active {
                 // Aux grid: extract the data-grid σ; keep the working σ.
                 let data_xs: Vec<Vec<f64>> = working
                     .sigma
@@ -987,25 +1000,20 @@ pub fn spatial_map_typed(
                     .map(|s| working.layout.extract(s))
                     .collect();
                 (Arc::new(data_xs), Some(Arc::new(working.sigma)))
+            } else {
+                // Working grid == data grid: σ is the data-grid σ directly.
+                (Arc::new(working.sigma), None)
             }
         }
     };
 
-    // Working-grid layout (energies + data-index map) shared across pixels.
-    // Built once here so the per-pixel precomputed model can extract data
-    // points after resolution.  Empty resonance fine-structure is fine — the
-    // layout is identity for tabulated / no resolution.
+    // Working-grid layout (energies + data-index map) shared across pixels,
+    // reusing the layout computed above.  Only attached when a Gaussian aux
+    // grid is active so the per-pixel precomputed model extracts data points
+    // after resolution; `None` for tabulated / no resolution.
     let work_layout: Option<Arc<nereids_physics::transmission::WorkingGridLayout>> =
         if work_xs.is_some() {
-            let rd_refs: Vec<&_> = config.resonance_data().iter().collect();
-            Some(Arc::new(
-                nereids_physics::transmission::resolution_working_grid(
-                    config.energies(),
-                    instrument.as_ref(),
-                    &rd_refs,
-                )
-                .map_err(PipelineError::Transmission)?,
-            ))
+            Some(Arc::new(layout))
         } else {
             None
         };
