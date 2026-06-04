@@ -10,6 +10,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use nereids_core::constants::{EV_TO_JOULES, NEUTRON_MASS_KG};
 use nereids_endf::resonance::ResonanceData;
 use nereids_fitting::joint_poisson::{self, JointPoissonFitConfig, JointPoissonObjective};
 use nereids_fitting::lm::{self, FitModel, LmConfig, LmResult};
@@ -20,7 +21,7 @@ use nereids_fitting::transmission_model::{
     TransmissionFitModel,
 };
 use nereids_physics::resolution::ResolutionFunction;
-use nereids_physics::transmission::{self as nereids_transmission, InstrumentParams};
+use nereids_physics::transmission::InstrumentParams;
 
 use crate::error::PipelineError;
 
@@ -1106,6 +1107,11 @@ fn fit_transmission_lm(
     let _temperature_index = append_temperature_param(&mut param_vec, config);
     let energy_scale_indices = append_energy_scale_params(&mut param_vec, config);
 
+    // Issue #608: seed (t0, L_scale) via resonance peak-matching so the
+    // production cold start lands in the global-min basin of the sharply
+    // non-convex calibration χ² (the true-σ model's basins are razor-thin).
+    seed_energy_scale_in_params(&mut param_vec, energy_scale_indices, measured_t, config);
+
     // Background parameters (rejects partial BackD/BackF; see
     // validate_transmission_background docstring).
     if let Some(bg) = config.transmission_background.as_ref() {
@@ -1259,6 +1265,9 @@ fn fit_transmission_poisson(
     }
     let temperature_index = append_temperature_param(&mut param_vec, config);
     let energy_scale_indices = append_energy_scale_params(&mut param_vec, config);
+
+    // Issue #608: peak-match seed for (t0, L_scale) — see fit_transmission_lm.
+    seed_energy_scale_in_params(&mut param_vec, energy_scale_indices, measured_t, config);
 
     // Background parameters — use same SAMMY-style model as LM, with the
     // same partial-BackD/BackF rejection.
@@ -1418,6 +1427,27 @@ fn fit_counts_joint_poisson(
     }
     let temperature_index = append_temperature_param(&mut param_vec, config);
     let energy_scale_indices = append_energy_scale_params(&mut param_vec, config);
+
+    // Issue #608: peak-match seed for (t0, L_scale).  The KL/counts path fits
+    // the same sharply non-convex calibration landscape as the LM path, so it
+    // needs the same seed; run it on a (sample − bg)/(flux − bg) transmission
+    // proxy (the resonance-dip positions are all the seed needs).
+    if energy_scale_indices.is_some() {
+        let t_proxy: Vec<f64> = sample_counts
+            .iter()
+            .zip(flux.iter())
+            .zip(detector_background.iter())
+            .map(|((&s, &f), &b)| {
+                let den = f - b;
+                if den > 0.0 {
+                    ((s - b).max(0.0) / den).min(2.0)
+                } else {
+                    1.0
+                }
+            })
+            .collect();
+        seed_energy_scale_in_params(&mut param_vec, energy_scale_indices, &t_proxy, config);
+    }
 
     // ── Transmission background (A_n + B_A/B/C) parameters, P2.2 ──
     // Use the same SAMMY-style param block as the LM transmission path.
@@ -1628,6 +1658,165 @@ fn append_temperature_param(
 ///
 /// Bounds: `t_0 ∈ [-10.0, 10.0] μs` and `L_scale ∈ [0.99, 1.01]`
 /// (dimensionless).  Matches the LM / KL transmission paths.
+/// Detect significant transmission dips (resonance signatures) in a measured
+/// spectrum: returns `(energy_eV, depth)` for each local minimum whose depth
+/// below the no-absorption baseline is a meaningful fraction of the deepest
+/// dip.  Light 3-point smoothing suppresses single-bin noise.  Used to seed the
+/// energy-scale calibration (issue #608).
+fn detect_transmission_dips(measured: &[f64], energies: &[f64]) -> Vec<(f64, f64)> {
+    let n = measured.len();
+    if n < 5 || energies.len() != n {
+        return Vec::new();
+    }
+    let mut sm = measured.to_vec();
+    for i in 1..n - 1 {
+        sm[i] = (measured[i - 1] + measured[i] + measured[i + 1]) / 3.0;
+    }
+    // No-absorption baseline ≈ a high percentile of the (smoothed) signal.
+    let mut sorted = sm.clone();
+    sorted.sort_by(f64::total_cmp);
+    let baseline = sorted[((0.9 * (n as f64 - 1.0)).round() as usize).min(n - 1)];
+    let mut dips: Vec<(f64, f64)> = Vec::new();
+    let mut max_depth = 0.0f64;
+    for i in 1..n - 1 {
+        if sm[i] < sm[i - 1] && sm[i] <= sm[i + 1] {
+            let depth = baseline - sm[i];
+            if depth > 0.0 {
+                dips.push((energies[i], depth));
+                max_depth = max_depth.max(depth);
+            }
+        }
+    }
+    // Keep dips that are a meaningful fraction of the deepest — filters noise
+    // wiggles while retaining genuine (even weak) resonance dips.
+    dips.retain(|&(_, d)| d >= 0.2 * max_depth);
+    dips
+}
+
+/// Seed `(t0, L_scale)` for the energy-scale fit by resonance peak-matching.
+///
+/// A TOF calibration is linear: `tof_measured = t0 + L_scale · tof_nominal`.
+/// We detect the transmission dips in the measured spectrum, match each to its
+/// nearest known resonance energy (under the nominal calibration), and
+/// least-squares-fit the matched `(tof_nominal, tof_measured)` pairs for
+/// `(t0, L_scale)`.  This is landscape-independent — it seeds the LM into the
+/// global-minimum basin of the sharply non-convex post-#608 calibration χ²,
+/// which a cold start (t0=0, L_scale=1) or a grid scan cannot reliably find
+/// (the physically-exact true-σ model's basins are razor-thin).  The physics is
+/// unchanged; this only chooses the LM's starting point.
+///
+/// Returns `None` (→ caller keeps the configured cold start) when fewer than
+/// two distinct resonances can be matched, so it is a safe enhancement: it
+/// improves the seed when it can and never degrades the existing behaviour.
+fn peak_match_energy_scale_seed(
+    measured: &[f64],
+    energies: &[f64],
+    config: &UnifiedFitConfig,
+    flight_path_m: f64,
+    t0_bounds: (f64, f64),
+    l_scale_bounds: (f64, f64),
+) -> Option<(f64, f64)> {
+    let n = energies.len();
+    if n < 5 || measured.len() != n {
+        return None;
+    }
+    // Resonance centers within the measured energy range (true frame).
+    let refs: Vec<&ResonanceData> = config.resonance_data().iter().collect();
+    let (e_lo, e_hi) = (
+        energies[0].min(energies[n - 1]),
+        energies[0].max(energies[n - 1]),
+    );
+    let res_e: Vec<f64> = nereids_physics::transmission::resonance_center_energies(&refs)
+        .into_iter()
+        .filter(|&e| e > e_lo && e < e_hi)
+        .collect();
+    if res_e.len() < 2 {
+        return None;
+    }
+    let dips = detect_transmission_dips(measured, energies);
+    if dips.len() < 2 {
+        return None;
+    }
+    // Match each dip to its nearest resonance (nominal calibration ⇒
+    // corrected ≈ measured), keeping the deepest dip per resonance.
+    let mut best: Vec<Option<(f64, f64)>> = vec![None; res_e.len()];
+    for &(e_dip, depth) in &dips {
+        let Some((k, _)) = res_e
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| (*a - e_dip).abs().total_cmp(&(*b - e_dip).abs()))
+        else {
+            continue;
+        };
+        match best[k] {
+            Some((_, d)) if d >= depth => {}
+            _ => best[k] = Some((e_dip, depth)),
+        }
+    }
+    // Matched (tof_nominal, tof_measured) pairs.  The common factor
+    // `tof_factor · flight_path` must match `EnergyScaleTransmissionModel`'s
+    // `corrected_energies` (it cancels in the slope but sets the intercept t0).
+    let tof_factor = (0.5 * NEUTRON_MASS_KG / EV_TO_JOULES).sqrt() * 1.0e6;
+    let c = tof_factor * flight_path_m;
+    let pairs: Vec<(f64, f64)> = res_e
+        .iter()
+        .zip(best.iter())
+        .filter_map(|(&re, b)| b.map(|(e_dip, _)| (c / re.sqrt(), c / e_dip.sqrt())))
+        .collect();
+    if pairs.len() < 2 {
+        return None;
+    }
+    // Linear least squares: tof_meas = t0 + L_scale · tof_nom.
+    let m = pairs.len() as f64;
+    let mean_x = pairs.iter().map(|p| p.0).sum::<f64>() / m;
+    let mean_y = pairs.iter().map(|p| p.1).sum::<f64>() / m;
+    let mut sxx = 0.0f64;
+    let mut sxy = 0.0f64;
+    for &(x, y) in &pairs {
+        sxx += (x - mean_x) * (x - mean_x);
+        sxy += (x - mean_x) * (y - mean_y);
+    }
+    if sxx <= 0.0 {
+        return None;
+    }
+    let l_scale = sxy / sxx;
+    let t0 = mean_y - l_scale * mean_x;
+    if !t0.is_finite() || !l_scale.is_finite() {
+        return None;
+    }
+    Some((
+        t0.clamp(t0_bounds.0, t0_bounds.1),
+        l_scale.clamp(l_scale_bounds.0, l_scale_bounds.1),
+    ))
+}
+
+/// Apply the peak-matching seed to the `(t0, L_scale)` entries of `param_vec`
+/// in place, when energy-scale fitting is enabled (issue #608).  No-op when the
+/// seed cannot be computed (→ the configured cold start is kept).
+fn seed_energy_scale_in_params(
+    param_vec: &mut [FitParameter],
+    energy_scale_indices: Option<(usize, usize)>,
+    measured_transmission: &[f64],
+    config: &UnifiedFitConfig,
+) {
+    let Some((t0_idx, ls_idx)) = energy_scale_indices else {
+        return;
+    };
+    let t0_b = (param_vec[t0_idx].lower, param_vec[t0_idx].upper);
+    let ls_b = (param_vec[ls_idx].lower, param_vec[ls_idx].upper);
+    if let Some((t0_seed, ls_seed)) = peak_match_energy_scale_seed(
+        measured_transmission,
+        config.energies(),
+        config,
+        config.flight_path_m,
+        t0_b,
+        ls_b,
+    ) {
+        param_vec[t0_idx].value = t0_seed;
+        param_vec[ls_idx].value = ls_seed;
+    }
+}
+
 fn append_energy_scale_params(
     param_vec: &mut Vec<FitParameter>,
     config: &UnifiedFitConfig,
@@ -2027,52 +2216,29 @@ fn build_energy_scale_transmission_model(
     t0_idx: usize,
     ls_idx: usize,
 ) -> Result<Box<dyn FitModel>, PipelineError> {
-    let n_params = config.n_density_params();
-    let xs = if let Some(xs) = &config.precomputed_cross_sections {
-        Arc::clone(xs)
-    } else {
-        let instrument = config
-            .resolution
-            .clone()
-            .map(|r| Arc::new(InstrumentParams { resolution: r }));
-        let xs_raw = nereids_transmission::broadened_cross_sections(
-            config.energies(),
-            &config.resonance_data,
-            config.temperature_k,
-            instrument.as_deref(),
-            None,
-        )
-        .map_err(PipelineError::Transmission)?;
-        Arc::new(xs_raw)
-    };
-    let effective_xs =
-        if let (Some(di), Some(dr)) = (&config.density_indices, &config.density_ratios) {
-            if xs.len() == di.len() && di.len() == dr.len() {
-                let n_e = xs[0].len();
-                let mut eff = vec![vec![0.0f64; n_e]; n_params];
-                for ((&idx, &ratio), member_xs) in di.iter().zip(dr.iter()).zip(xs.iter()) {
-                    for (j, &sigma) in member_xs.iter().enumerate() {
-                        eff[idx][j] += ratio * sigma;
-                    }
-                }
-                Arc::new(eff)
-            } else {
-                xs
-            }
-        } else {
-            xs
-        };
-    // After group-collapsing, effective_xs has n_params entries.  Use identity
-    // mapping because each XS entry maps to its own density parameter (same as
-    // PrecomputedTransmissionModel).
-    let density_indices: Vec<usize> = (0..n_params).collect();
     let instrument = config
         .resolution
         .clone()
         .map(|r| Arc::new(InstrumentParams { resolution: r }));
+    // Issue #608: EnergyScale evaluates the TRUE σ at the corrected energies
+    // from resonance data (matching forward_model) rather than interpolating a
+    // precomputed σ grid, so it takes the per-isotope resonance data + density
+    // mapping + temperature.  When no groups are configured, each isotope is its
+    // own density parameter (identity mapping, ratio 1.0).
+    let n_iso = config.resonance_data.len();
+    let density_indices = config
+        .density_indices
+        .clone()
+        .unwrap_or_else(|| (0..n_iso).collect());
+    let density_ratios = config
+        .density_ratios
+        .clone()
+        .unwrap_or_else(|| vec![1.0; n_iso]);
     let mut es_model = EnergyScaleTransmissionModel::new(
-        effective_xs,
+        Arc::new(config.resonance_data.clone()),
         Arc::new(density_indices),
+        Arc::new(density_ratios),
+        config.temperature_k,
         config.energies.clone(),
         config.flight_path_m,
         t0_idx,
@@ -2745,10 +2911,79 @@ pub struct SpectrumFitResult {
 mod tests {
     use super::*;
     use nereids_endf::resonance::test_support::{
-        synthetic_single_resonance, u238_single_resonance,
+        hf178_mlbw_two_resonances, synthetic_single_resonance, u238_single_resonance,
     };
     use nereids_fitting::lm::FitModel;
     use nereids_physics::transmission as phys_transmission;
+
+    /// Issue #608: the dip detector finds the resonance signatures (local
+    /// transmission minima) the energy-scale peak-match seed needs.
+    #[test]
+    fn detect_transmission_dips_finds_clear_dips() {
+        let energies: Vec<f64> = (0..120).map(|i| 1.0 + (i as f64) * 0.5).collect();
+        let mut t = vec![1.0_f64; 120];
+        // Two clear, multi-bin dips so 3-point smoothing keeps them as minima.
+        for v in t.iter_mut().take(33).skip(28) {
+            *v = 0.4;
+        }
+        for v in t.iter_mut().take(83).skip(78) {
+            *v = 0.6;
+        }
+        let dips = detect_transmission_dips(&t, &energies);
+        assert_eq!(dips.len(), 2, "expected 2 dips, got {dips:?}");
+        let mut de: Vec<f64> = dips.iter().map(|&(e, _)| e).collect();
+        de.sort_by(f64::total_cmp);
+        // Centres near energies[30] (16.0 eV) and energies[80] (41.0 eV).
+        assert!(
+            (de[0] - energies[30]).abs() <= 1.0,
+            "first dip at {} eV",
+            de[0]
+        );
+        assert!(
+            (de[1] - energies[80]).abs() <= 1.0,
+            "second dip at {} eV",
+            de[1]
+        );
+    }
+
+    /// Issue #608: the energy-scale peak-match seed recovers the identity
+    /// calibration (t0≈0, L_scale≈1) when the transmission dips sit at the known
+    /// resonance energies — exercising the full seed path (dip detection,
+    /// nearest-resonance matching, linear TOF fit).
+    #[test]
+    fn peak_match_energy_scale_seed_identity() {
+        let data = hf178_mlbw_two_resonances(); // s-waves at 7.8 and 16.9 eV
+        let energies: Vec<f64> = (0..400).map(|i| 4.0 + (i as f64) * 0.05).collect();
+        let (t_obs, _sigma) = synthetic_transmission(&data, 0.1, &energies);
+        let config = UnifiedFitConfig::new(
+            energies.clone(),
+            vec![data],
+            vec!["Hf-178".into()],
+            293.6,
+            None,
+            vec![0.1],
+        )
+        .unwrap()
+        .with_energy_scale(0.0, 1.0, 25.0);
+        let (t0, l_scale) = peak_match_energy_scale_seed(
+            &t_obs,
+            config.energies(),
+            &config,
+            25.0,
+            (-10.0, 10.0),
+            (0.99, 1.01),
+        )
+        .expect("seed should be Some with 2 resonances and detectable dips");
+        // Dips at the un-shifted resonance energies ⇒ identity calibration.
+        assert!(
+            t0.abs() < 0.5,
+            "t0 should be ≈0 for un-shifted data, got {t0}"
+        );
+        assert!(
+            (l_scale - 1.0).abs() < 5e-3,
+            "L_scale should be ≈1 for un-shifted data, got {l_scale}"
+        );
+    }
 
     // ── Phase 0: InputData + SolverConfig + CountsBackgroundConfig tests ──
 

@@ -2850,7 +2850,10 @@ fn validate_energy_scale_params(
 /// Recognised values (case-insensitive):
 /// - `"fd2"`, `"finite-difference"`, `"finite_difference"` → FiniteDifference.
 /// - `"partial-gal"`, `"partial_gal"`                      → PartialGal.
-/// - `"chain"`, `"frozen-r"`, `"frozen_r"`                 → FrozenResolutionChainRule.
+///
+/// The legacy `"chain"` / `"frozen-r"` FrozenResolutionChainRule method was
+/// removed in #608 (it interpolated a precomputed σ on the data grid,
+/// incompatible with the true-σ aux-grid `evaluate`); use `"partial-gal"`.
 ///
 /// `None` returns `Ok(None)`, deferring to the Rust model's
 /// `EnergyScaleJacobianMethod::from_env`: the `NEREIDS_TZERO_JACOBIAN`
@@ -2869,17 +2872,11 @@ fn parse_tzero_jacobian(
         EnergyScaleJacobianMethod::FiniteDifference
     } else if name.eq_ignore_ascii_case("partial-gal") || name.eq_ignore_ascii_case("partial_gal") {
         EnergyScaleJacobianMethod::PartialGal
-    } else if name.eq_ignore_ascii_case("chain")
-        || name.eq_ignore_ascii_case("frozen-r")
-        || name.eq_ignore_ascii_case("frozen_r")
-    {
-        EnergyScaleJacobianMethod::FrozenResolutionChainRule
     } else {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
             "tzero_jacobian must be one of: \
              \"fd2\", \"finite-difference\", \"finite_difference\"; \
-             \"partial-gal\", \"partial_gal\"; \
-             \"chain\", \"frozen-r\", \"frozen_r\"; got {name:?}"
+             \"partial-gal\", \"partial_gal\"; got {name:?}"
         )));
     };
     Ok(Some(m))

@@ -1096,8 +1096,10 @@ class TestFitCountsSpectrumTyped:
         """Issue #489: `tzero_jacobian` kwarg must be accepted on the
         Python `fit_counts_spectrum_typed` binding, default `None` must
         defer to the library default (PartialGal post-#489), explicit
-        ``"fd2"`` / ``"partial_gal"`` / ``"chain"`` must all be accepted,
-        and underscore + dash aliases must resolve identically.
+        ``"fd2"`` / ``"partial_gal"`` must be accepted, and underscore +
+        dash aliases must resolve identically.  The legacy ``"chain"`` /
+        ``"frozen-r"`` FrozenResolutionChainRule method was removed in #608
+        and must now be rejected.
 
         Guards against a future binding refactor silently dropping the
         kwarg or stranding the override plumbing — same defect class
@@ -1143,17 +1145,6 @@ class TestFitCountsSpectrumTyped:
         r_fd2_dash = nereids.fit_counts_spectrum_typed(
             **kwargs, tzero_jacobian="finite-difference"
         )
-        # Frozen-R chain rule alias variants.
-        r_chain = nereids.fit_counts_spectrum_typed(
-            **kwargs, tzero_jacobian="chain"
-        )
-        r_chain_dash = nereids.fit_counts_spectrum_typed(
-            **kwargs, tzero_jacobian="frozen-r"
-        )
-        r_chain_underscore = nereids.fit_counts_spectrum_typed(
-            **kwargs, tzero_jacobian="frozen_r"
-        )
-
         # All variants must produce a valid result.
         for r in (
             r_default,
@@ -1161,9 +1152,6 @@ class TestFitCountsSpectrumTyped:
             r_pg_dash,
             r_fd2,
             r_fd2_dash,
-            r_chain,
-            r_chain_dash,
-            r_chain_underscore,
         ):
             assert r.densities[0] > 0.0
             assert r.iterations > 0
@@ -1182,8 +1170,12 @@ class TestFitCountsSpectrumTyped:
         # Underscore / dash aliases must resolve identically.
         assert r_pg.densities[0] == r_pg_dash.densities[0]
         assert r_fd2.densities[0] == r_fd2_dash.densities[0]
-        assert r_chain.densities[0] == r_chain_dash.densities[0]
-        assert r_chain.densities[0] == r_chain_underscore.densities[0]
+
+        # The FrozenResolutionChainRule method was removed in #608; its legacy
+        # aliases must now be rejected like any other invalid value.
+        for removed in ("chain", "frozen-r", "frozen_r"):
+            with pytest.raises(ValueError, match="tzero_jacobian must be one of"):
+                nereids.fit_counts_spectrum_typed(**kwargs, tzero_jacobian=removed)
 
         # Invalid value must raise ValueError listing the supported set.
         with pytest.raises(ValueError, match="tzero_jacobian must be one of"):
@@ -2122,6 +2114,86 @@ class TestFitEnergyScaleRecovery:
         assert l_scale_rel_err < 1.0e-2, (
             f"L_scale rel err {l_scale_rel_err:.3e} exceeds 1 %: "
             f"got {float(r_calibrated.l_scale):.6f}, truth {L_SCALE_TRUE}"
+        )
+
+    def test_recovers_injected_t0_and_l_scale_counts_kl(self):
+        """Issue #608: the KL/counts energy-scale path must also recover an
+        injected (t0, L_scale) calibration from the production cold start
+        (t0=0, L_scale=1).  The physically-exact true-σ EnergyScale model makes
+        the calibration χ² razor-thin around the truth (a cold-start LM lands in
+        a wrong minimum), so the resonance peak-matching seed in `pipeline.rs`
+        puts the optimizer in the global-min basin.  This is the KL analogue of
+        `test_recovers_injected_t0_and_l_scale` (the LM path); the GUI uses KL
+        for counts data, so this path must be robust too.
+
+        Gated on the recovered *density* — a clean physical observable that only
+        recovers when the calibration does (at the wrong cold-start minimum the
+        density is tens of percent off) — plus a finite, near-truth L_scale.
+        """
+        L_NOM = 25.0
+        T0_TRUE = 0.5  # μs
+        L_SCALE_TRUE = 1.005
+        TRUE_DENSITY = 3.0e-4
+        u238 = nereids.create_resonance_data(
+            z=92,
+            a=238,
+            awr=236.006,
+            scattering_radius=9.48,
+            resonances=[
+                (6.67, 0.5, 0.0015, 0.023),
+                (20.87, 0.5, 0.0103, 0.026),
+                (36.68, 0.5, 0.0344, 0.027),
+            ],
+            target_spin=0.0,
+        )
+        tof_lo = _TOF_FACTOR * L_NOM / np.sqrt(45.0)
+        tof_hi = _TOF_FACTOR * L_NOM / np.sqrt(4.0)
+        e_true = np.sort((_TOF_FACTOR * L_NOM / np.linspace(tof_lo, tof_hi, 800)) ** 2)
+        t_clean = np.asarray(nereids.forward_model(e_true, [(u238, TRUE_DENSITY)]))
+        e_meas = _measured_energies_for_known_tzero(
+            e_true, t0_true_us=T0_TRUE, l_scale_true=L_SCALE_TRUE, l_nom_m=L_NOM
+        )
+
+        rng = np.random.default_rng(20260601)
+        flux = 5000.0
+        open_beam = np.maximum(
+            rng.poisson(np.full_like(t_clean, flux)).astype(float), 1.0
+        )
+        sample = rng.poisson(flux * t_clean).astype(float)
+
+        r = nereids.fit_counts_spectrum_typed(
+            sample_counts=sample,
+            open_beam_counts=open_beam,
+            energies=e_meas,
+            isotopes=[(u238, TRUE_DENSITY)],
+            solver="kl",
+            c=1.0,
+            temperature_k=293.6,
+            max_iter=200,
+            fit_energy_scale=True,
+            t0_init_us=0.0,
+            l_scale_init=1.0,
+            energy_scale_flight_path_m=L_NOM,
+        )
+
+        assert bool(r.converged) is True, (
+            f"KL calibrated fit did not converge: iters={int(r.iterations)}"
+        )
+        assert r.t0_us is not None and np.isfinite(float(r.t0_us))
+        assert r.l_scale is not None and np.isfinite(float(r.l_scale))
+        # Density recovers only if the calibration does; at the wrong
+        # cold-start minimum it is tens of percent off, so this fires if the
+        # peak-match seed fails to reach the global-min basin.
+        dens_rel_err = abs(float(r.densities[0]) - TRUE_DENSITY) / TRUE_DENSITY
+        assert dens_rel_err < 0.05, (
+            f"recovered density {float(r.densities[0]):.4e} is {dens_rel_err:.1%} from "
+            f"truth {TRUE_DENSITY:.1e} — energy-scale calibration not recovered from "
+            f"the cold start (peak-match seed regression?)"
+        )
+        l_scale_rel_err = abs(float(r.l_scale) - L_SCALE_TRUE) / L_SCALE_TRUE
+        assert l_scale_rel_err < 1.0e-2, (
+            f"L_scale rel err {l_scale_rel_err:.3e} exceeds 1 %: "
+            f"got {float(r.l_scale):.6f}, truth {L_SCALE_TRUE}"
         )
 
 

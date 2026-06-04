@@ -144,6 +144,24 @@ fn extract_resonance_widths(resonance_data: &[&ResonanceData]) -> Vec<(f64, f64)
     pairs
 }
 
+/// Resonance center energies (eV) across every isotope and formalism, sorted
+/// ascending.
+///
+/// Used by the energy-scale calibration peak-matching seed (issue #608): the
+/// (t0, L_scale) calibration is recovered by matching measured transmission-dip
+/// positions to these known resonance energies via the linear TOF relation
+/// `tof_measured = t0 + L_scale · tof_nominal`, which seeds the LM into the
+/// global-minimum basin of the (sharply non-convex, post-#608) calibration χ²
+/// surface — a basin too thin for a cold start or grid scan to find reliably.
+pub fn resonance_center_energies(resonance_data: &[&ResonanceData]) -> Vec<f64> {
+    let mut e: Vec<f64> = extract_resonance_widths(resonance_data)
+        .into_iter()
+        .map(|(energy, _gd)| energy)
+        .collect();
+    e.sort_by(f64::total_cmp);
+    e
+}
+
 /// Build the unbroadened cross-section vector on the extended/auxiliary grid
 /// from cached data-grid values.
 ///
