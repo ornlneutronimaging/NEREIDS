@@ -540,12 +540,11 @@ impl FitModel for PrecomputedTransmissionModel {
         // resolution) the working grid IS the data grid (`self.energies`), the
         // extraction is the identity, and the data-grid `resolution_plan` still
         // matches — byte-identical to the pre-#608 path.
-        if let (Some(inst), Some(energies)) = (&self.instrument, &self.energies) {
-            let work_energies: &[f64] = self
-                .work_layout
-                .as_deref()
-                .map(|l| l.energies.as_slice())
-                .unwrap_or(energies);
+        // Resolution applies iff there is an instrument AND a working grid to
+        // apply it on (`work_energies()` = the layout grid when present, else the
+        // data grid).  `evaluate` and `analytical_jacobian` share this exact
+        // guard so the two paths cannot diverge (issue #608 R2).
+        if let (Some(inst), Some(work_energies)) = (&self.instrument, self.work_energies()) {
             let t_broadened = resolution::apply_resolution_with_plan(
                 self.resolution_plan.as_deref(),
                 work_energies,
@@ -692,8 +691,9 @@ impl FitModel for PrecomputedTransmissionModel {
         // on the WORKING grid to form the inner derivative -σ·T, then apply
         // resolution on the working grid and extract the data points.
         // y_current is T_obs = R[T] on the DATA grid, which is NOT the same.
-        if let Some(inst) = &self.instrument {
-            let work_energies = self.work_energies()?;
+        // Same resolution guard as `evaluate` (issue #608 R2) so the two paths
+        // agree by construction; the else branch is the no-resolution Jacobian.
+        if let (Some(inst), Some(work_energies)) = (&self.instrument, self.work_energies()) {
             // Recompute unresolved T on the working grid from σ and params.
             let mut neg_opt = vec![0.0f64; n_e];
             for (i, xs) in self.cross_sections.iter().enumerate() {
@@ -1705,6 +1705,12 @@ pub struct EnergyScaleTransmissionModel {
     /// `RefCell` is safe: `TransmissionFitModel`-family models are
     /// rebuilt per-pixel and never shared across rayon workers.
     cached_plans: RefCell<CachedPlanRing>,
+    /// Capacity-1 cache of the working-grid σ keyed on `(t0_bits, L_scale_bits)`
+    /// (issue #608 R2 perf): a base-point `evaluate` + the Jacobian's density
+    /// columns at the same probe reuse one reich_moore+Doppler build instead of
+    /// rebuilding it twice.  `RefCell` is safe — the model is rebuilt per pixel
+    /// and never shared across threads.
+    cached_work_xs: RefCell<CachedWorkXs>,
     /// Method for the t0 / L_scale Jacobian columns. Initialised from
     /// [`EnergyScaleJacobianMethod::from_env`] in [`Self::new`], which
     /// defaults to `PartialGal` since issue #489 (and respects the
@@ -1712,6 +1718,11 @@ pub struct EnergyScaleTransmissionModel {
     /// overridden per-instance via [`Self::with_jacobian_method`].
     jacobian_method: EnergyScaleJacobianMethod,
 }
+
+/// Capacity-1 working-grid σ cache entry, keyed on `(t0_bits, l_scale_bits)`.
+/// Named alias to keep the field type within clippy's `type_complexity` budget
+/// (issue #608 R2).
+type CachedWorkXs = Option<((u64, u64), Rc<transmission::WorkingGridXs>)>;
 
 /// One `(t0_bits, l_scale_bits)` → `ResolutionPlan` entry.  Named
 /// struct to keep the cache field type within clippy's
@@ -1867,6 +1878,7 @@ impl EnergyScaleTransmissionModel {
             l_scale_index,
             instrument,
             cached_plans: RefCell::new(CachedPlanRing::default()),
+            cached_work_xs: RefCell::new(None),
             jacobian_method: EnergyScaleJacobianMethod::from_env(),
         }
     }
@@ -1981,6 +1993,19 @@ impl EnergyScaleTransmissionModel {
     /// (boundary + fine-structure fidelity).  For tabulated / no resolution the
     /// working grid is `e_corr` itself with an identity layout.
     fn working_xs(&self, e_corr: &[f64]) -> Result<transmission::WorkingGridXs, FittingError> {
+        // Issue #608 R2: a degenerate calibration can drive corrected energies to
+        // 0 (l_scale → 0) or non-finite (l_scale → ∞).  `reich_moore` asserts
+        // positive finite energy (an always-on `assert!`), so without this guard
+        // such inputs PANIC inside `broadened_cross_sections_on_working_grid` —
+        // a process abort across the PyO3 boundary.  Return a graceful Err so the
+        // LM/KL/Python callers see a failed evaluate instead (matches the
+        // pre-#608 model, which interpolated + clamped without panicking).
+        if let Some(&bad) = e_corr.iter().find(|&&e| !e.is_finite() || e <= 0.0) {
+            return Err(FittingError::EvaluationFailed(format!(
+                "energy-scale corrected energy is non-positive or non-finite ({bad}); \
+                 t0 / L_scale give a degenerate calibration"
+            )));
+        }
         transmission::broadened_cross_sections_on_working_grid(
             e_corr,
             &self.resonance_data,
@@ -1989,6 +2014,33 @@ impl EnergyScaleTransmissionModel {
             None,
         )
         .map_err(|e| FittingError::EvaluationFailed(e.to_string()))
+    }
+
+    /// Working-grid σ for the current probe, cached (capacity 1, keyed on
+    /// `(t0, L_scale)` bits) so a base-point `evaluate` and the Jacobian's
+    /// density columns at the SAME probe share one reich_moore+Doppler build
+    /// instead of rebuilding it twice (issue #608 R2 perf).  FD probes at
+    /// perturbed `(t0, L_scale)` miss and rebuild, as required.
+    fn working_xs_for(
+        &self,
+        params: &[f64],
+        e_corr: &[f64],
+    ) -> Result<Rc<transmission::WorkingGridXs>, FittingError> {
+        let key = (
+            params[self.t0_index].to_bits(),
+            params[self.l_scale_index].to_bits(),
+        );
+        let hit = self
+            .cached_work_xs
+            .borrow()
+            .as_ref()
+            .and_then(|(k, xs)| (*k == key).then(|| Rc::clone(xs)));
+        if let Some(xs) = hit {
+            return Ok(xs);
+        }
+        let xs = Rc::new(self.working_xs(e_corr)?);
+        *self.cached_work_xs.borrow_mut() = Some((key, Rc::clone(&xs)));
+        Ok(xs)
     }
 
     /// Evaluate transmission at given parameters (densities + t0 + l_scale).
@@ -2014,7 +2066,7 @@ impl EnergyScaleTransmissionModel {
         // last — exactly as `forward_model` does.  This replaces interpolating
         // a precomputed σ, which clamped at the auxiliary boundary and dropped
         // resonance fine-structure (a forward_model-fidelity gap; #608 review).
-        let work = self.working_xs(e_corr)?;
+        let work = self.working_xs_for(params, e_corr)?;
         let work_e = &work.layout.energies;
 
         // Beer-Lambert on the working grid: T = exp(-Σᵢ nᵢ·rᵢ·σᵢ(E)), where rᵢ
@@ -2176,7 +2228,7 @@ impl FitModel for EnergyScaleTransmissionModel {
         // resolution) from the TRUE σ at the corrected energies (reich_moore +
         // Doppler), resolution-broadened there, and the data points extracted
         // last — matching `forward_model` and `evaluate`.
-        let work = match self.working_xs(&e_corr) {
+        let work = match self.working_xs_for(params, &e_corr) {
             Ok(w) => w,
             Err(_) => return None,
         };
@@ -2400,7 +2452,13 @@ impl ForwardModel for PrecomputedTransmissionModel {
     }
 
     fn n_data(&self) -> usize {
-        if self.cross_sections.is_empty() {
+        // Issue #608 R2: when a Gaussian working-grid layout is attached,
+        // `cross_sections` lives on the (longer) working grid, but the number of
+        // DATA points the model predicts is the layout's data-index count.
+        // Without a layout the working grid IS the data grid.
+        if let Some(layout) = &self.work_layout {
+            layout.data_indices.len()
+        } else if self.cross_sections.is_empty() {
             0
         } else {
             self.cross_sections[0].len()

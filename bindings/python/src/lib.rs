@@ -2830,9 +2830,15 @@ fn validate_energy_scale_params(
             "t0_init_us must be finite when fit_energy_scale=True, got {t0_init_us}"
         )));
     }
-    if !l_scale_init.is_finite() {
+    if !l_scale_init.is_finite() || l_scale_init <= 0.0 {
+        // Must be positive: l_scale is a multiplicative flight-path scale, and a
+        // non-positive value drives the corrected energies to 0 / non-finite,
+        // which the true-σ energy-scale model (issue #608) cannot evaluate
+        // (reich_moore requires positive energy).  Mirrors the flight_path check
+        // below.
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "l_scale_init must be finite when fit_energy_scale=True, got {l_scale_init}"
+            "l_scale_init must be finite and positive when fit_energy_scale=True, \
+             got {l_scale_init}"
         )));
     }
     if !energy_scale_flight_path_m.is_finite() || energy_scale_flight_path_m <= 0.0 {

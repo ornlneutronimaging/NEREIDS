@@ -1738,16 +1738,27 @@ fn peak_match_energy_scale_seed(
         return None;
     }
     // Match each dip to its nearest resonance (nominal calibration ⇒
-    // corrected ≈ measured), keeping the deepest dip per resonance.
+    // corrected ≈ measured), keeping the deepest dip per resonance.  Reject a
+    // dip that does not sit UNAMBIGUOUSLY near a resonance — within half the
+    // minimum inter-resonance spacing — so a spurious/mis-matched dip drops out
+    // rather than poisoning the linear fit (issue #608 R2).  `res_e` is sorted.
+    let match_tol = 0.5
+        * res_e
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(f64::INFINITY, f64::min);
     let mut best: Vec<Option<(f64, f64)>> = vec![None; res_e.len()];
     for &(e_dip, depth) in &dips {
-        let Some((k, _)) = res_e
+        let Some((k, &re)) = res_e
             .iter()
             .enumerate()
             .min_by(|(_, a), (_, b)| (*a - e_dip).abs().total_cmp(&(*b - e_dip).abs()))
         else {
             continue;
         };
+        if (re - e_dip).abs() > match_tol {
+            continue;
+        }
         match best[k] {
             Some((_, d)) if d >= depth => {}
             _ => best[k] = Some((e_dip, depth)),
@@ -1784,10 +1795,18 @@ fn peak_match_energy_scale_seed(
     if !t0.is_finite() || !l_scale.is_finite() {
         return None;
     }
-    Some((
-        t0.clamp(t0_bounds.0, t0_bounds.1),
-        l_scale.clamp(l_scale_bounds.0, l_scale_bounds.1),
-    ))
+    // Reject (→ keep the configured cold start) when the fitted seed falls
+    // outside the parameter bounds.  Clamping an out-of-range fit onto a bound
+    // would seed the LM worse than its cold start — the opposite of this seed's
+    // purpose (issue #608 R2).  An in-range fit is the high-confidence case.
+    if t0 < t0_bounds.0
+        || t0 > t0_bounds.1
+        || l_scale < l_scale_bounds.0
+        || l_scale > l_scale_bounds.1
+    {
+        return None;
+    }
+    Some((t0, l_scale))
 }
 
 /// Apply the peak-matching seed to the `(t0, L_scale)` entries of `param_vec`
@@ -2647,7 +2666,14 @@ pub fn evaluate_jacobian_and_fisher(
             .resolution
             .clone()
             .map(|r| Arc::new(InstrumentParams { resolution: r }));
-        let xs = nereids_physics::transmission::broadened_cross_sections(
+        // Issue #608 R2: compute σ on the WORKING grid (auxiliary extended grid
+        // for Gaussian resolution) so the Jacobian/Fisher use the SAME #608
+        // resolution path as production fitting + spatial mapping, not the old
+        // coarse data-grid path.  Keep the extracted data-grid σ for the
+        // surrogate-plan builders + shape validation; attach the working-grid σ
+        // + layout when an aux grid exists (AFTER with_precomputed_cross_sections,
+        // which clears stale work σ).
+        let working = nereids_physics::transmission::broadened_cross_sections_on_working_grid(
             config.energies(),
             &config.resonance_data,
             config.temperature_k,
@@ -2655,7 +2681,24 @@ pub fn evaluate_jacobian_and_fisher(
             None,
         )
         .map_err(PipelineError::Transmission)?;
-        config_with_xs = config.clone().with_precomputed_cross_sections(Arc::new(xs));
+        config_with_xs = if working.layout.is_identity() {
+            config
+                .clone()
+                .with_precomputed_cross_sections(Arc::new(working.sigma))
+        } else {
+            let data_xs: Vec<Vec<f64>> = working
+                .sigma
+                .iter()
+                .map(|s| working.layout.extract(s))
+                .collect();
+            config
+                .clone()
+                .with_precomputed_cross_sections(Arc::new(data_xs))
+                .with_precomputed_work_cross_sections(
+                    Arc::new(working.sigma),
+                    Arc::new(working.layout),
+                )
+        };
         &config_with_xs
     } else {
         config

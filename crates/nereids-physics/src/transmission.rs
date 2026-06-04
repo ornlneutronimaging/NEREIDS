@@ -1322,6 +1322,53 @@ mod tests {
     use nereids_endf::resonance::test_support::u238_single_resonance;
     use nereids_endf::resonance::{LGroup, Resonance, ResonanceFormalism, ResonanceRange};
 
+    /// Issue #608 R2: the spatial pipeline builds the working-grid σ
+    /// (`broadened_cross_sections_on_working_grid`) and the shared layout
+    /// (`resolution_working_grid`) via SEPARATE calls — they must produce
+    /// bit-identical layouts, or per-pixel σ and the shared layout would
+    /// disagree.  Both route through `build_aux_grid` with the same arguments;
+    /// this pins that determinism against a future divergence.
+    #[test]
+    fn working_grid_layout_matches_across_separate_calls() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..401).map(|i| 4.0 + (i as f64) * 0.015).collect();
+        let inst = InstrumentParams {
+            resolution: crate::resolution::ResolutionFunction::Gaussian(
+                crate::resolution::ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
+            ),
+        };
+        let layout_a = resolution_working_grid(&energies, Some(&inst), &[&data]).unwrap();
+        let working = broadened_cross_sections_on_working_grid(
+            &energies,
+            std::slice::from_ref(&data),
+            300.0,
+            Some(&inst),
+            None,
+        )
+        .unwrap();
+        let layout_b = working.layout;
+        assert!(
+            !layout_a.is_identity(),
+            "Gaussian resolution should build a non-identity auxiliary grid"
+        );
+        assert_eq!(
+            layout_a.data_indices, layout_b.data_indices,
+            "data-index maps must match across the two builders"
+        );
+        assert_eq!(
+            layout_a.energies.len(),
+            layout_b.energies.len(),
+            "working-grid length must match"
+        );
+        for (a, b) in layout_a.energies.iter().zip(layout_b.energies.iter()) {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "working-grid energies must be bit-identical"
+            );
+        }
+    }
+
     #[test]
     fn test_beer_lambert_zero_thickness() {
         let xs = vec![100.0, 200.0, 300.0];
