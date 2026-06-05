@@ -602,7 +602,7 @@ impl UnifiedFitConfig {
     ///
     /// The σ + layout are not validated here (this is an infallible builder
     /// setter); shape/consistency are checked once up front in
-    /// [`validate_precomputed_cross_sections`], which every public entry point
+    /// `validate_precomputed_cross_sections`, which every public entry point
     /// (`fit_spectrum_typed`, `fit_transmission_poisson`, `spatial_map_typed`)
     /// calls before any forward-model build or per-pixel loop — mirroring how
     /// [`Self::with_precomputed_cross_sections`] is validated.
@@ -1653,11 +1653,6 @@ fn append_temperature_param(
     Some(idx)
 }
 
-/// Append SAMMY TZERO energy-scale parameters (t_0 and L_scale) when
-/// `config.fit_energy_scale` is `true`.  Returns `(t0_idx, l_scale_idx)`.
-///
-/// Bounds: `t_0 ∈ [-10.0, 10.0] μs` and `L_scale ∈ [0.99, 1.01]`
-/// (dimensionless).  Matches the LM / KL transmission paths.
 /// Detect significant transmission dips (resonance signatures) in a measured
 /// spectrum: returns `(energy_eV, depth)` for each local minimum whose depth
 /// below the no-absorption baseline is a meaningful fraction of the deepest
@@ -1836,6 +1831,11 @@ fn seed_energy_scale_in_params(
     }
 }
 
+/// Append SAMMY TZERO energy-scale parameters (t_0 and L_scale) when
+/// `config.fit_energy_scale` is `true`.  Returns `(t0_idx, l_scale_idx)`.
+///
+/// Bounds: `t_0 ∈ [-10.0, 10.0] μs` and `L_scale ∈ [0.99, 1.01]`
+/// (dimensionless).  Matches the LM / KL transmission paths.
 fn append_energy_scale_params(
     param_vec: &mut Vec<FitParameter>,
     config: &UnifiedFitConfig,
@@ -2216,17 +2216,17 @@ fn append_background_params(
 /// Stays private — internal pipeline construction detail, not part of the
 /// crate's public surface.
 ///
-/// The energy-scale model needs precomputed Doppler-broadened cross-sections.
-/// If `config.precomputed_cross_sections` is `Some`, reuses them; otherwise
-/// computes σ(E) on `config.energies()` (resolution is NOT applied here — it
-/// is applied inside the model's `evaluate()` via the wrapped
-/// [`InstrumentParams`]).  When grouped isotopes are active
-/// (`config.density_indices` and `config.density_ratios` both `Some` and
-/// length-consistent), collapses the per-member cross-sections into per-group
-/// effective cross-sections using the ratio weights; the resulting
-/// `effective_xs` then carries `n_params` entries (one per density
-/// parameter), so the model's `density_indices` is the identity mapping
-/// `(0..n_params)`.
+/// Issue #608: the energy-scale model evaluates the TRUE cross-section at the
+/// corrected energies from resonance data (matching `forward_model`) rather
+/// than interpolating a precomputed σ grid, so it is constructed from the
+/// per-isotope `config.resonance_data`, the density mapping
+/// (`config.density_indices` / `config.density_ratios`, defaulting to the
+/// identity mapping with ratio 1.0 when no groups are configured), and
+/// `config.temperature_k` for Doppler broadening.  Resolution is NOT applied
+/// here — the model applies it inside `evaluate()` on the working grid via the
+/// wrapped [`InstrumentParams`].  The per-isotope density accumulation
+/// (`params[density_indices[i]] * density_ratios[i]`) happens inside the model,
+/// so no cross-section pre-collapse is done here.
 ///
 /// `t0_idx` and `ls_idx` are the parameter indices for `t0` and `l_scale`,
 /// produced by [`append_energy_scale_params`] at each fitter's setup.
@@ -3041,6 +3041,106 @@ mod tests {
         assert!(
             (l_scale - 1.0).abs() < 5e-3,
             "L_scale should be ≈1 for un-shifted data, got {l_scale}"
+        );
+    }
+
+    /// Issue #608 (R4): the peak-match seed must recover a NON-identity
+    /// calibration, not just confirm identity.  Generate measured data with a
+    /// known injected `(t0, L_scale)` via the `EnergyScaleTransmissionModel`
+    /// (which shifts the resonance positions), then assert the seed recovers it.
+    #[test]
+    fn peak_match_energy_scale_seed_recovers_nonidentity() {
+        let data = hf178_mlbw_two_resonances(); // s-waves at 7.8 and 16.9 eV
+        // Finer grid than the identity test so the discrete dip positions pin
+        // the slope (L_scale) tightly enough to distinguish it from 1.0.
+        let energies: Vec<f64> = (0..900).map(|i| 4.0 + (i as f64) * 0.02).collect();
+        let density = 0.1_f64;
+        let flight_path = 25.0_f64;
+        let (t0_true, l_scale_true) = (2.0_f64, 1.006_f64);
+        // EnergyScale model (no resolution: dip POSITIONS, not shapes, drive the
+        // seed) evaluated at the injected calibration ⇒ shifted measured data.
+        let model = EnergyScaleTransmissionModel::new(
+            Arc::new(vec![data.clone()]),
+            Arc::new(vec![0]),
+            Arc::new(vec![1.0]),
+            293.6,
+            energies.clone(),
+            flight_path,
+            1, // t0 index
+            2, // l_scale index
+            None,
+        );
+        let t_obs = model.evaluate(&[density, t0_true, l_scale_true]).unwrap();
+        let config = UnifiedFitConfig::new(
+            energies.clone(),
+            vec![data],
+            vec!["Hf-178".into()],
+            293.6,
+            None,
+            vec![density],
+        )
+        .unwrap()
+        .with_energy_scale(0.0, 1.0, flight_path);
+        let (t0, l_scale) = peak_match_energy_scale_seed(
+            &t_obs,
+            config.energies(),
+            &config,
+            flight_path,
+            (-10.0, 10.0),
+            (0.99, 1.01),
+        )
+        .expect("seed should be Some for a clean shifted two-resonance spectrum");
+        // The seed is a coarse peak-match (dip energies quantized to the grid),
+        // so tolerances are looser than a converged LM — it just needs to land
+        // in the global-min basin, clearly distinct from the cold start (0, 1).
+        assert!(
+            (t0 - t0_true).abs() < 0.6,
+            "seed should recover t0 ≈ {t0_true}, got {t0}"
+        );
+        assert!(
+            (l_scale - l_scale_true).abs() < 4e-3,
+            "seed should recover L_scale ≈ {l_scale_true}, got {l_scale}"
+        );
+        // Sanity: the recovered seed is strictly closer to truth than cold start.
+        assert!(
+            (t0 - t0_true).abs() < (0.0 - t0_true).abs()
+                && (l_scale - l_scale_true).abs() < (1.0 - l_scale_true).abs(),
+            "seed must improve on the cold start"
+        );
+    }
+
+    /// Issue #608 (R4): a heavily-absorbing but FEATURELESS spectrum (no
+    /// resonance dips) yields fewer than two detectable dips, so the seed must
+    /// return `None` and the caller keeps the cold start rather than fitting a
+    /// spurious calibration.
+    #[test]
+    fn peak_match_energy_scale_seed_none_on_featureless_spectrum() {
+        let data = hf178_mlbw_two_resonances(); // 2 resonances in range (gate passes)
+        let energies: Vec<f64> = (0..400).map(|i| 4.0 + (i as f64) * 0.05).collect();
+        // Strong smooth 1/√E absorption, monotonic ⇒ NO local minima ⇒ < 2 dips.
+        let t_obs: Vec<f64> = energies.iter().map(|&e| (-5.0 / e.sqrt()).exp()).collect();
+        let config = UnifiedFitConfig::new(
+            energies.clone(),
+            vec![data],
+            vec!["Hf-178".into()],
+            293.6,
+            None,
+            vec![0.1],
+        )
+        .unwrap()
+        .with_energy_scale(0.0, 1.0, 25.0);
+        assert!(
+            peak_match_energy_scale_seed(
+                &t_obs,
+                config.energies(),
+                &config,
+                25.0,
+                (-10.0, 10.0),
+                (0.99, 1.01),
+            )
+            .is_none(),
+            "a featureless heavily-absorbing spectrum has no resonance dips ⇒ \
+             seed must return None (cold-start fallback)"
         );
     }
 

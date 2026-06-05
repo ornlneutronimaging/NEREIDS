@@ -1939,11 +1939,18 @@ impl EnergyScaleTransmissionModel {
     /// or when the `build_resolution_plan` call fails (unsorted grid) —
     /// both cases transparently fall back to the non-plan
     /// `apply_resolution` path via `apply_resolution_with_plan(None, …)`.
+    ///
+    /// `working_energies` is the broadening grid the plan is built on — the
+    /// model's WORKING grid (`work.layout.energies`), which every caller passes
+    /// post-#608.  For tabulated resolution (the only case that builds a plan)
+    /// the working grid IS the corrected data grid; for Gaussian it is the
+    /// auxiliary extended grid, but that path returns `None` above before the
+    /// grid is used.
     fn cached_resolution_plan(
         &self,
         t0_us: f64,
         l_scale: f64,
-        e_corr: &[f64],
+        working_energies: &[f64],
     ) -> Option<Arc<ResolutionPlan>> {
         let inst = self.instrument.as_ref()?;
         // Match on a reference to `inst.resolution` defensively so the
@@ -1961,7 +1968,7 @@ impl EnergyScaleTransmissionModel {
             return Some(plan);
         }
         // Miss: build, insert, return.
-        let plan = resolution::build_resolution_plan(e_corr, &inst.resolution)
+        let plan = resolution::build_resolution_plan(working_energies, &inst.resolution)
             .ok()
             .flatten()?;
         let arc = Arc::new(plan);
@@ -4708,6 +4715,16 @@ mod tests {
     // old path, shows the old coarse-grid result differed materially — proving
     // the fix is a real correction, not a no-op.  Jacobian columns are checked
     // against central finite differences of the (now aux-correct) `evaluate`.
+    //
+    // SCOPE of the 1e-9 bound (R4 review): these tests pin GRID FIDELITY — that
+    // each fixed path builds the same auxiliary grid + layout as `forward_model`
+    // and extracts the data points identically.  The resolution KERNEL primitive
+    // itself (`apply_resolution_*`, `build_aux_grid`, `doppler::doppler_broaden`)
+    // is SHARED with the oracle, so a kernel error common to both would pass
+    // here; the kernel's physics is validated independently against SAMMY in
+    // `nereids-physics` (`resolution.rs`, `samtry_validation.rs`).  The
+    // non-vacuity `‖kernel − none‖` guards keep this shared-primitive oracle
+    // non-circular for what it asserts (the #608 grid wiring).
 
     /// Issue #608: the spatial production path (`PrecomputedTransmissionModel`)
     /// must broaden resolution on the auxiliary grid, matching `forward_model`.

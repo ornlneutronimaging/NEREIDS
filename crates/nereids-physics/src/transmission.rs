@@ -362,7 +362,7 @@ pub type BroadenedXsWithDerivative = (Vec<Vec<f64>>, Vec<Vec<f64>>);
 /// *before* resolution broadening, degrading the convolution near grid edges
 /// and around narrow resonances relative to [`forward_model`].
 ///
-/// **Tabulated resolution has no auxiliary grid.**  [`build_aux_grid`] only
+/// **Tabulated resolution has no auxiliary grid.**  `build_aux_grid` only
 /// extends the grid for [`ResolutionFunction::Gaussian`]; for tabulated
 /// kernels (and when no instrument is present) `energies` equals the data
 /// grid and `data_indices` is the identity `0..n`.  Callers can therefore
