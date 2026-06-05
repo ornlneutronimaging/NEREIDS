@@ -2659,50 +2659,66 @@ pub fn evaluate_jacobian_and_fisher(
     // For the temperature case, TransmissionFitModel computes base_xs in
     // its constructor.  Either way, precomputing here ensures the analytical
     // Jacobian path is always available.
+    // Issue #608: the non-temperature path uses `PrecomputedTransmissionModel`,
+    // which must apply resolution on the WORKING grid (auxiliary extended grid
+    // under Gaussian resolution) and extract the data points last — the same
+    // #608 path as production fitting + spatial mapping, not the old coarse
+    // data-grid path.  Derive σ from `resonance_data` (the source of truth) on
+    // the working grid here whenever it is not already set up:
+    //   * `fit_temperature` → skip: `TransmissionFitModel` builds its own
+    //     working-grid base σ internally.
+    //   * working-grid σ already attached (a caller did the #608 setup) → skip.
+    //   * otherwise (caller passed no σ, OR only a data-grid σ) → (re)build the
+    //     data-grid σ = `extract(work σ)` AND the working-grid σ + layout from
+    //     `resonance_data`.  A malformed caller-supplied data-grid σ has already
+    //     been rejected by the up-front `validate_precomputed_cross_sections`;
+    //     here a valid caller σ is superseded by the resonance-data-derived
+    //     working-grid σ — the only #608-correct source under Gaussian
+    //     resolution.  Without this, a caller that pre-supplied a data-grid σ
+    //     plus Gaussian resolution silently got coarse-grid broadening in the
+    //     Jacobian/Fisher (R3 finding).
     let config_with_xs;
-    let effective_config = if config.precomputed_cross_sections.is_none() && !config.fit_temperature
-    {
-        let instrument = config
-            .resolution
-            .clone()
-            .map(|r| Arc::new(InstrumentParams { resolution: r }));
-        // Issue #608 R2: compute σ on the WORKING grid (auxiliary extended grid
-        // for Gaussian resolution) so the Jacobian/Fisher use the SAME #608
-        // resolution path as production fitting + spatial mapping, not the old
-        // coarse data-grid path.  Keep the extracted data-grid σ for the
-        // surrogate-plan builders + shape validation; attach the working-grid σ
-        // + layout when an aux grid exists (AFTER with_precomputed_cross_sections,
-        // which clears stale work σ).
-        let working = nereids_physics::transmission::broadened_cross_sections_on_working_grid(
-            config.energies(),
-            &config.resonance_data,
-            config.temperature_k,
-            instrument.as_deref(),
-            None,
-        )
-        .map_err(PipelineError::Transmission)?;
-        config_with_xs = if working.layout.is_identity() {
+    let effective_config =
+        if config.fit_temperature || config.precomputed_work_cross_sections.is_some() {
             config
-                .clone()
-                .with_precomputed_cross_sections(Arc::new(working.sigma))
         } else {
-            let data_xs: Vec<Vec<f64>> = working
-                .sigma
-                .iter()
-                .map(|s| working.layout.extract(s))
-                .collect();
-            config
+            let instrument = config
+                .resolution
                 .clone()
-                .with_precomputed_cross_sections(Arc::new(data_xs))
-                .with_precomputed_work_cross_sections(
-                    Arc::new(working.sigma),
-                    Arc::new(working.layout),
-                )
+                .map(|r| Arc::new(InstrumentParams { resolution: r }));
+            let working = nereids_physics::transmission::broadened_cross_sections_on_working_grid(
+                config.energies(),
+                &config.resonance_data,
+                config.temperature_k,
+                instrument.as_deref(),
+                None,
+            )
+            .map_err(PipelineError::Transmission)?;
+            config_with_xs = if working.layout.is_identity() {
+                // Tabulated / no resolution: the working grid IS the data grid.
+                config
+                    .clone()
+                    .with_precomputed_cross_sections(Arc::new(working.sigma))
+            } else {
+                // Gaussian aux grid: attach BOTH the extracted data-grid σ (for the
+                // surrogate-plan builders + shape validation) and the working-grid σ
+                // + layout (AFTER `with_precomputed_cross_sections`, which clears any
+                // stale work σ).
+                let data_xs: Vec<Vec<f64>> = working
+                    .sigma
+                    .iter()
+                    .map(|s| working.layout.extract(s))
+                    .collect();
+                config
+                    .clone()
+                    .with_precomputed_cross_sections(Arc::new(data_xs))
+                    .with_precomputed_work_cross_sections(
+                        Arc::new(working.sigma),
+                        Arc::new(working.layout),
+                    )
+            };
+            &config_with_xs
         };
-        &config_with_xs
-    } else {
-        config
-    };
 
     // ── Build transmission model (same as production path) ──────────
     let t_model = build_transmission_model(effective_config, n_density_params, temperature_index)?;

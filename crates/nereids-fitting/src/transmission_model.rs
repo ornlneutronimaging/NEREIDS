@@ -1635,12 +1635,19 @@ impl<M: FitModel> FitModel for NormalizedTransmissionModel<M> {
 
 /// Transmission model with energy-scale calibration parameters (t₀, L_scale).
 ///
-/// Wraps precomputed cross-sections and re-maps the energy grid at each
-/// evaluation:
+/// Carries per-isotope resonance data (NOT a precomputed σ grid) and rebuilds
+/// the TRUE cross-section at the corrected energies on each evaluation
+/// (issue #608), matching `forward_model`:
 ///   1. Convert nominal energy → TOF: `t = TOF_FACTOR * L / √E_nom`
-///   2. Apply calibration: `t_corr = t - t₀`, `E_corr = (TOF_FACTOR * L * L_scale / t_corr)²`
-///   3. Interpolate cross-sections σ(E_nom) → σ(E_corr)
-///   4. Beer-Lambert + resolution on the corrected grid
+///   2. Apply calibration: `t_corr = t - t₀`,
+///      `E_corr = (TOF_FACTOR * L * L_scale / t_corr)²`
+///   3. Evaluate σ(E_corr) directly via `reich_moore` + Doppler on a working
+///      grid built from `E_corr` (auxiliary extended grid under Gaussian
+///      resolution; `E_corr` itself for tabulated / no resolution) — NOT
+///      interpolation of a fixed σ grid, which clamps at the auxiliary
+///      boundary and drops resonance fine-structure.
+///   4. Beer-Lambert + resolution on the working grid, then extract the data
+///      points last.
 ///
 /// This is equivalent to SAMMY's TZERO parameters.
 ///
@@ -1808,6 +1815,13 @@ impl EnergyScaleJacobianMethod {
     /// `EnergyScaleTransmissionModel::with_jacobian_method` (which
     /// bypasses the cache); changing the env var mid-process has no
     /// effect.
+    ///
+    /// An unrecognized or removed value (e.g. the `"chain"` method dropped in
+    /// #608) emits a one-time `eprintln` warning and falls back to the
+    /// `PartialGal` default rather than being silently masked.  It does not
+    /// panic — `new` is a hot, infallible, per-pixel constructor across the
+    /// PyO3 boundary; the Python `tzero_jacobian=` kwarg is the strict
+    /// (hard-erroring) override path.
     fn from_env() -> Self {
         use std::sync::OnceLock;
         static CACHED: OnceLock<EnergyScaleJacobianMethod> = OnceLock::new();
@@ -1815,21 +1829,39 @@ impl EnergyScaleJacobianMethod {
     }
 
     fn resolve_env_uncached() -> Self {
-        match std::env::var("NEREIDS_TZERO_JACOBIAN") {
-            Ok(v)
-                if v.eq_ignore_ascii_case("fd2")
-                    || v.eq_ignore_ascii_case("finite-difference")
-                    || v.eq_ignore_ascii_case("finite_difference") =>
-            {
-                Self::FiniteDifference
-            }
-            // Default (and explicit `"partial-gal"` / `"partial_gal"`) route to
-            // `PartialGal` per issue #489.  The legacy `"chain"` / `"frozen-r"`
-            // FrozenResolutionChainRule method was removed in #608: it
-            // interpolated a precomputed σ on the data grid, incompatible with
-            // the true-σ aux-grid `evaluate`; FD/PartialGal of the corrected
-            // evaluate is the exact replacement.
-            _ => Self::PartialGal,
+        let Ok(v) = std::env::var("NEREIDS_TZERO_JACOBIAN") else {
+            // Unset → the documented #489 default, silently.
+            return Self::PartialGal;
+        };
+        if v.eq_ignore_ascii_case("fd2")
+            || v.eq_ignore_ascii_case("finite-difference")
+            || v.eq_ignore_ascii_case("finite_difference")
+        {
+            Self::FiniteDifference
+        } else if v.eq_ignore_ascii_case("partial-gal") || v.eq_ignore_ascii_case("partial_gal") {
+            Self::PartialGal
+        } else {
+            // Set to an unrecognized / removed method name.  The legacy
+            // `"chain"` / `"frozen-r"` / `"frozen_r"` FrozenResolutionChainRule
+            // method was removed in #608 (it interpolated a precomputed σ on the
+            // data grid, incompatible with the true-σ aux-grid `evaluate`;
+            // FD / PartialGal of the corrected evaluate is the exact
+            // replacement).  The Python `tzero_jacobian=` kwarg HARD-ERRORS on
+            // these names (bindings/python `parse_tzero_jacobian`); `from_env` is
+            // an infallible, process-cached, per-pixel constructor path that must
+            // not panic across the PyO3 boundary (cf. the #608 `working_xs`
+            // Err-not-panic guard), so it cannot itself return an error.  Warn
+            // loudly (once, via the `OnceLock` in `from_env`) so the override is
+            // NOT silently masked, then fall back to the PartialGal default —
+            // matching the kwarg in *surfacing* the bad value while staying
+            // non-fatal on this hot, infallible path.
+            eprintln!(
+                "warning: NEREIDS_TZERO_JACOBIAN=\"{v}\" is not a recognized \
+                 Jacobian method (\"chain\" / \"frozen-r\" were removed in #608); \
+                 using the default \"partial-gal\". Valid values: \"fd2\", \
+                 \"partial-gal\"."
+            );
+            Self::PartialGal
         }
     }
 }
@@ -1998,8 +2030,16 @@ impl EnergyScaleTransmissionModel {
         // positive finite energy (an always-on `assert!`), so without this guard
         // such inputs PANIC inside `broadened_cross_sections_on_working_grid` —
         // a process abort across the PyO3 boundary.  Return a graceful Err so the
-        // LM/KL/Python callers see a failed evaluate instead (matches the
-        // pre-#608 model, which interpolated + clamped without panicking).
+        // LM/KL/Python callers see a failed evaluate instead of a panic.
+        //
+        // BEHAVIOR CHANGE vs pre-#608: the old model interpolated a precomputed σ
+        // and CLAMPED a degenerate corrected energy to the grid edge, continuing
+        // the fit with a (finite but unphysical) value; the true-σ model instead
+        // FAILS the evaluate rather than fabricating σ at a non-positive energy.
+        // Reachable only by a degenerate calibration, which production keeps out
+        // of reach: `validate_energy_scale_params` rejects `l_scale_init <= 0` at
+        // setup and `corrected_energies` clamps `t0` below the min TOF, so a real
+        // fit never drives `e_corr` to 0 / ∞; this guard is the runtime backstop.
         if let Some(&bad) = e_corr.iter().find(|&&e| !e.is_finite() || e <= 0.0) {
             return Err(FittingError::EvaluationFailed(format!(
                 "energy-scale corrected energy is non-positive or non-finite ({bad}); \
@@ -4984,6 +5024,123 @@ mod tests {
             "EnergyScale identity-calibration evaluate must match forward_model to \
              machine precision over the full grid (got {err:.3e})"
         );
+    }
+
+    /// Issue #608 (R3): the GROUPED energy-scale path — multiple isotopes mapped
+    /// to ONE density parameter with non-unity ratios — is reachable in
+    /// production (`with_groups` + `fit_energy_scale`) but was exercised by no
+    /// test; every other energy-scale test used a single isotope
+    /// (`density_indices=[0]`, ratio 1.0).  Build two DISTINCT isotopes sharing
+    /// density param 0 with ratios (0.7, 0.3) and verify the per-member
+    /// Beer-Lambert accumulation (`Σᵢ n·ratioᵢ·σᵢ`) matches `forward_model` with
+    /// per-isotope effective densities — plus an FD check on the single shared
+    /// density column.
+    #[test]
+    fn issue_608_energy_scale_grouped_density_matches_forward_model() {
+        use nereids_endf::resonance::test_support::synthetic_single_resonance;
+        use nereids_physics::resolution::ResolutionFunction;
+
+        let iso0 = u238_single_resonance(); // resonance @ ~6.674 eV
+        let iso1 = synthetic_single_resonance(72, 178, 176.0, 7.5); // distinct @ 7.5 eV
+        let density = 0.01_f64;
+        let ratios = [0.7_f64, 0.3_f64];
+        // Grid overlapping BOTH resonances so σ0 ≠ σ1 (a swapped ratio / wrong
+        // index shifts T detectably — proven by the swap guard below).
+        let energies: Vec<f64> = (0..201).map(|i| 5.0 + (i as f64) * 0.02).collect();
+        let inst = Arc::new(InstrumentParams {
+            resolution: ResolutionFunction::Gaussian(
+                nereids_physics::resolution::ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
+            ),
+        });
+
+        let model = EnergyScaleTransmissionModel::new(
+            Arc::new(vec![iso0.clone(), iso1.clone()]),
+            Arc::new(vec![0, 0]), // both isotopes → density param 0 (grouped)
+            Arc::new(vec![ratios[0], ratios[1]]),
+            300.0,
+            energies.clone(),
+            25.0,
+            1, // t0 index
+            2, // l_scale index
+            Some(Arc::clone(&inst)),
+        );
+        let params = [density, 0.0, 1.0]; // identity calibration (t0=0, l_scale=1)
+        let t_es = model.evaluate(&params).unwrap();
+
+        // Independent oracle: forward_model with per-isotope effective areal
+        // densities n·ratioᵢ.  Beer-Lambert is additive over isotopes, so the
+        // grouped model (one density param × per-iso ratio) must equal a two-
+        // isotope sample with densities (n·0.7, n·0.3).
+        let sample = SampleParams::new(
+            300.0,
+            vec![
+                (iso0.clone(), density * ratios[0]),
+                (iso1.clone(), density * ratios[1]),
+            ],
+        )
+        .unwrap();
+        let t_ref = transmission::forward_model(&energies, &sample, Some(&inst)).unwrap();
+
+        // Non-vacuity: the kernel must broaden the grouped spectrum.
+        let t_nores = transmission::forward_model(&energies, &sample, None).unwrap();
+        assert!(
+            max_abs_diff(&t_ref, &t_nores) > 1e-3 * max_abs(&t_nores),
+            "resolution kernel must broaden the grouped spectrum non-trivially"
+        );
+
+        // Discrimination: swapping the two ratios MUST change T (proves σ0 ≠ σ1
+        // over the grid, so the match assertion below is sensitive to a ratio /
+        // index mix-up in the per-member accumulation — i.e. non-vacuous).
+        let model_swapped = EnergyScaleTransmissionModel::new(
+            Arc::new(vec![iso0.clone(), iso1.clone()]),
+            Arc::new(vec![0, 0]),
+            Arc::new(vec![ratios[1], ratios[0]]), // swapped
+            300.0,
+            energies.clone(),
+            25.0,
+            1,
+            2,
+            Some(Arc::clone(&inst)),
+        );
+        let t_swapped = model_swapped.evaluate(&params).unwrap();
+        assert!(
+            max_abs_diff(&t_es, &t_swapped) > 1e-4,
+            "swapping the two density ratios must change T (else the test could \
+             not distinguish the ratio→isotope assignment)"
+        );
+
+        // Grouped evaluate matches the independent oracle to machine precision.
+        let err = max_abs_diff(&t_es, &t_ref);
+        assert!(
+            err < 1e-9,
+            "grouped EnergyScale (2 isotopes → 1 density param, ratios {ratios:?}) \
+             must match forward_model with per-isotope effective densities to \
+             machine precision (got {err:.3e})"
+        );
+
+        // FD check on the single shared density column: ∂T/∂n accumulates
+        // ratioᵢ·σᵢ over BOTH grouped isotopes.
+        let free = vec![0usize];
+        let jac = model
+            .analytical_jacobian(&params, &free, &t_es)
+            .expect("Jacobian should be available");
+        let h = 1e-7;
+        let mut pp = params;
+        let mut pm = params;
+        pp[0] += h;
+        pm[0] -= h;
+        let yp = model.evaluate(&pp).unwrap();
+        let ym = model.evaluate(&pm).unwrap();
+        for row in 0..energies.len() {
+            let fd = (yp[row] - ym[row]) / (2.0 * h);
+            let anal = jac.get(row, 0);
+            let abs_err = (anal - fd).abs();
+            let rel_err = abs_err / fd.abs().max(1e-15);
+            assert!(
+                rel_err < 1e-3 || abs_err < 1e-8,
+                "grouped density col bin {row}: anal={anal:.6e} fd={fd:.6e} rel={rel_err:.2e}"
+            );
+        }
     }
 
     /// Resolution-enabled temperature path must produce measurably different
