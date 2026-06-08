@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use nereids_physics::resolution::build_resolution_plan;
 use nereids_physics::transmission::{
-    InstrumentParams, broadened_cross_sections, unbroadened_cross_sections,
+    InstrumentParams, broadened_cross_sections_on_working_grid, unbroadened_cross_sections,
 };
 
 use crate::error::PipelineError;
@@ -932,44 +932,117 @@ pub fn spatial_map_typed(
         }
     };
 
-    // Precompute cross-sections once (shared across all pixels)
-    let xs: Arc<Vec<Vec<f64>>> = match config.precomputed_cross_sections().cloned() {
-        Some(cached) => cached,
-        None => {
-            let instrument = config.resolution().map(|r| InstrumentParams {
-                resolution: r.clone(),
-            });
-            let xs_raw = broadened_cross_sections(
+    // Precompute cross-sections once (shared across all pixels).
+    //
+    // Issue #608: broaden σ on the WORKING grid (auxiliary extended grid when a
+    // Gaussian resolution function is active, else the data grid) so each
+    // per-pixel `PrecomputedTransmissionModel` applies Beer-Lambert +
+    // resolution on the working grid and extracts the data points last —
+    // matching `forward_model`.  `xs` (data-grid σ) is still needed for the
+    // cubature / scalar surrogate builders and shape validation; `work_xs`
+    // carries the working-grid σ.  For tabulated / no resolution the working
+    // grid IS the data grid, the layout is the identity, and `work_xs` is left
+    // unset (the model falls back to the data-grid σ, preserving the surrogate
+    // fast paths byte-for-byte).
+    let instrument = config.resolution().map(|r| InstrumentParams {
+        resolution: r.clone(),
+    });
+
+    // Determine the working-grid layout FIRST, cheaply (no Doppler
+    // broadening): `resolution_working_grid` only builds the auxiliary grid
+    // geometry (boundary extension + resonance fine-structure) — it does NOT
+    // evaluate or broaden σ.  When the layout is the identity (tabulated / no
+    // resolution) the working grid IS the data grid, so no working-grid σ is
+    // needed and we must NOT pay for the full per-isotope
+    // `broadened_cross_sections_on_working_grid` just to discover the layout
+    // is trivial.  Only the genuine Gaussian aux-grid case below runs the
+    // expensive broadening.
+    let rd_refs: Vec<&_> = config.resonance_data().iter().collect();
+    let layout = nereids_physics::transmission::resolution_working_grid(
+        config.energies(),
+        instrument.as_ref(),
+        &rd_refs,
+    )
+    .map_err(PipelineError::Transmission)?;
+    let aux_grid_active = !layout.is_identity();
+
+    // (xs = data-grid σ, work_xs = working-grid σ when an aux grid exists).
+    let (xs, work_xs) = match config.precomputed_cross_sections().cloned() {
+        // Caller supplied data-grid σ.  When a Gaussian aux grid exists we
+        // still need working-grid σ for the #608-correct path, so recompute it
+        // from resonance data (the data-grid σ alone cannot be de-extracted
+        // back onto the aux grid).  When no aux grid exists the supplied σ is
+        // already the working-grid σ and we skip Doppler broadening entirely.
+        Some(cached) if !aux_grid_active => (cached, None),
+        Some(cached) => {
+            let working = broadened_cross_sections_on_working_grid(
                 config.energies(),
                 config.resonance_data(),
                 config.temperature_k(),
                 instrument.as_ref(),
                 cancel,
             )?;
-            Arc::new(xs_raw)
+            (cached, Some(Arc::new(working.sigma)))
+        }
+        None => {
+            let working = broadened_cross_sections_on_working_grid(
+                config.energies(),
+                config.resonance_data(),
+                config.temperature_k(),
+                instrument.as_ref(),
+                cancel,
+            )?;
+            if aux_grid_active {
+                // Aux grid: extract the data-grid σ; keep the working σ.
+                let data_xs: Vec<Vec<f64>> = working
+                    .sigma
+                    .iter()
+                    .map(|s| working.layout.extract(s))
+                    .collect();
+                (Arc::new(data_xs), Some(Arc::new(working.sigma)))
+            } else {
+                // Working grid == data grid: σ is the data-grid σ directly.
+                (Arc::new(working.sigma), None)
+            }
         }
     };
+
+    // Working-grid layout (energies + data-index map) shared across pixels,
+    // reusing the layout computed above.  Only attached when a Gaussian aux
+    // grid is active so the per-pixel precomputed model extracts data points
+    // after resolution; `None` for tabulated / no resolution.
+    let work_layout: Option<Arc<nereids_physics::transmission::WorkingGridLayout>> =
+        if work_xs.is_some() {
+            Some(Arc::new(layout))
+        } else {
+            None
+        };
 
     // When groups are active and temperature is NOT being fitted, collapse
     // per-member broadened XS into per-group σ_eff once here.  This avoids
     // redundant O(n_members × n_energies) collapsing inside
-    // build_transmission_model on every per-pixel call.
-    let xs = if !config.fit_temperature()
-        && let (Some(di), Some(dr)) = (&config.density_indices, &config.density_ratios)
-        && xs.len() == di.len()
-        && di.len() == dr.len()
-    {
-        let n_e = xs[0].len();
-        let mut eff = vec![vec![0.0f64; n_e]; n_maps];
-        for ((&idx, &ratio), member_xs) in di.iter().zip(dr.iter()).zip(xs.iter()) {
-            for (j, &sigma) in member_xs.iter().enumerate() {
-                eff[idx][j] += ratio * sigma;
+    // build_transmission_model on every per-pixel call.  Applied to BOTH the
+    // data-grid σ and the working-grid σ so they stay aligned (issue #608).
+    let collapse = |xs: &Arc<Vec<Vec<f64>>>| -> Arc<Vec<Vec<f64>>> {
+        if !config.fit_temperature()
+            && let (Some(di), Some(dr)) = (&config.density_indices, &config.density_ratios)
+            && xs.len() == di.len()
+            && di.len() == dr.len()
+        {
+            let n_e = xs[0].len();
+            let mut eff = vec![vec![0.0f64; n_e]; n_maps];
+            for ((&idx, &ratio), member_xs) in di.iter().zip(dr.iter()).zip(xs.iter()) {
+                for (j, &sigma) in member_xs.iter().enumerate() {
+                    eff[idx][j] += ratio * sigma;
+                }
             }
+            Arc::new(eff)
+        } else {
+            Arc::clone(xs)
         }
-        Arc::new(eff)
-    } else {
-        xs
     };
+    let xs = collapse(&xs);
+    let work_xs = work_xs.as_ref().map(collapse);
 
     // Build the resolution broadening plan once for the shared grid.
     //
@@ -1249,6 +1322,15 @@ pub fn spatial_map_typed(
         let mut cfg = cfg
             .with_precomputed_cross_sections(xs)
             .with_compute_covariance(true);
+        // Issue #608: attach the working-grid σ + layout for the Gaussian
+        // aux-grid path so each per-pixel `PrecomputedTransmissionModel` applies
+        // resolution on the working grid and extracts the data points last.
+        // `with_precomputed_cross_sections` (above) clears any stale work σ, so
+        // this must come AFTER it.  `None` for tabulated / no resolution (the
+        // model uses the data-grid σ directly).
+        if let (Some(work_xs), Some(layout)) = (work_xs.clone(), work_layout.clone()) {
+            cfg = cfg.with_precomputed_work_cross_sections(work_xs, layout);
+        }
         if let Some(plan) = resolution_plan.clone() {
             cfg = cfg.with_precomputed_resolution_plan(plan);
         }
@@ -1636,6 +1718,7 @@ mod tests {
             resolution_plan: None,
             sparse_cubature_plan: None,
             sparse_scalar_plan: None,
+            work_layout: None,
         };
         let t_1d = model.evaluate(&[true_density]).unwrap();
         let sigma_1d: Vec<f64> = t_1d.iter().map(|&v| 0.01 * v.max(0.01)).collect();
@@ -1986,6 +2069,205 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Issue #608 (R4): the GAUSSIAN-resolution spatial path — `spatial_map_typed`'s
+    /// `aux_grid_active` branch (work σ via `broadened_cross_sections_on_working_grid`,
+    /// per-pixel injection through `with_precomputed_work_cross_sections`) plus
+    /// `build_transmission_model`'s working-grid selection — is the bulk of the
+    /// #608 wiring but had no integration test (only the Tabulated/plan path,
+    /// above, was covered).  Mirror that test with `ResolutionFunction::Gaussian`,
+    /// data generated by `forward_model` WITH the same Gaussian (so the fit can
+    /// recover density), a ‖kernel − none‖ non-vacuity pre-check, and per-pixel
+    /// density recovery + determinism assertions.
+    #[test]
+    fn test_spatial_map_typed_gaussian_aux_grid_recovers_density() {
+        use nereids_physics::resolution::{ResolutionFunction, ResolutionParams};
+        use nereids_physics::transmission::{SampleParams, forward_model};
+
+        let data = u238_single_resonance(); // resonance @ ~6.674 eV
+        let true_density = 0.0005;
+        let temperature = 300.0;
+        let energies: Vec<f64> = (0..101).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let inst = Arc::new(InstrumentParams {
+            resolution: ResolutionFunction::Gaussian(
+                ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
+            ),
+        });
+
+        // Synthetic data CONSISTENT with a Gaussian-broadened forward model, so
+        // the fit (which also broadens on the aux grid) can recover the density.
+        let sample = SampleParams::new(temperature, vec![(data.clone(), true_density)]).unwrap();
+        let t_1d = forward_model(&energies, &sample, Some(&inst)).unwrap();
+
+        // ‖kernel − none‖ non-vacuity: the Gaussian must broaden the spectrum,
+        // else the aux-grid path is a no-op and the test is vacuous.
+        let t_none = forward_model(&energies, &sample, None).unwrap();
+        let broaden = t_1d
+            .iter()
+            .zip(t_none.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f64, f64::max);
+        assert!(
+            broaden > 1e-4,
+            "Gaussian kernel must broaden the spectrum non-trivially (got {broaden:.3e})"
+        );
+
+        // Replicate to a 4x4 cube — identical pixels double as a determinism check.
+        let n_e = energies.len();
+        let sigma_1d: Vec<f64> = t_1d.iter().map(|&v| 0.01 * v.max(0.01)).collect();
+        let mut t_3d = Array3::zeros((n_e, 4, 4));
+        let mut u_3d = Array3::zeros((n_e, 4, 4));
+        for y in 0..4 {
+            for x in 0..4 {
+                for (i, (&t, &s)) in t_1d.iter().zip(sigma_1d.iter()).enumerate() {
+                    t_3d[[i, y, x]] = t;
+                    u_3d[[i, y, x]] = s;
+                }
+            }
+        }
+
+        let config = UnifiedFitConfig::new(
+            energies.clone(),
+            vec![data],
+            vec!["U-238".into()],
+            temperature,
+            Some(ResolutionFunction::Gaussian(
+                ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
+            )),
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()));
+
+        let input = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+        let result = spatial_map_typed(&input, &config, None, None, None).unwrap();
+        assert_eq!(result.n_total, 16);
+        assert!(
+            result.n_converged >= 14,
+            "Gaussian aux-grid path: {} / 16 pixels converged",
+            result.n_converged,
+        );
+
+        // Per-pixel density recovery against the forward_model-generated synthetic.
+        let d = &result.density_maps[0];
+        let conv = &result.converged_map;
+        let mean: f64 = d
+            .iter()
+            .zip(conv.iter())
+            .filter(|(_, c)| **c)
+            .map(|(d, _)| *d)
+            .sum::<f64>()
+            / result.n_converged.max(1) as f64;
+        assert!(
+            (mean - true_density).abs() / true_density < 0.10,
+            "Gaussian aux-grid mean density: {mean}, true: {true_density}"
+        );
+
+        // Determinism: identical pixels ⇒ bit-equal density across the rayon
+        // fanout (catches aux-grid work-σ / layout state leaking across pixels).
+        let reference = d
+            .iter()
+            .zip(conv.iter())
+            .find(|(_, c)| **c)
+            .map(|(d, _)| *d)
+            .expect("at least one pixel converged");
+        for (&cell, &c) in d.iter().zip(conv.iter()) {
+            if c {
+                assert_eq!(
+                    cell.to_bits(),
+                    reference.to_bits(),
+                    "aux-grid path leaked pixel-specific state: density cell {cell} != reference {reference}"
+                );
+            }
+        }
+    }
+
+    /// Issue #608 (PR #609 coverage): `spatial_map_typed`'s `Some(cached)` +
+    /// aux-grid arm — when a caller PRE-SUPPLIES data-grid σ AND a Gaussian aux
+    /// grid is active, the working-grid σ is recomputed from resonance data (the
+    /// cached data σ cannot be de-extracted back onto the aux grid).  The
+    /// sibling Gaussian test exercises the `None` arm; this supplies precomputed
+    /// σ to hit the `Some(cached)` arm.
+    #[test]
+    fn test_spatial_map_typed_gaussian_aux_grid_with_precomputed_sigma() {
+        use nereids_physics::resolution::{ResolutionFunction, ResolutionParams};
+        use nereids_physics::transmission::{
+            SampleParams, broadened_cross_sections, forward_model,
+        };
+
+        let data = u238_single_resonance();
+        let true_density = 0.0005;
+        let temperature = 300.0;
+        let energies: Vec<f64> = (0..101).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let inst = Arc::new(InstrumentParams {
+            resolution: ResolutionFunction::Gaussian(
+                ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
+            ),
+        });
+        let sample = SampleParams::new(temperature, vec![(data.clone(), true_density)]).unwrap();
+        let t_1d = forward_model(&energies, &sample, Some(&inst)).unwrap();
+        let n_e = energies.len();
+        let sigma_1d: Vec<f64> = t_1d.iter().map(|&v| 0.01 * v.max(0.01)).collect();
+        let mut t_3d = Array3::zeros((n_e, 4, 4));
+        let mut u_3d = Array3::zeros((n_e, 4, 4));
+        for y in 0..4 {
+            for x in 0..4 {
+                for (i, (&t, &s)) in t_1d.iter().zip(sigma_1d.iter()).enumerate() {
+                    t_3d[[i, y, x]] = t;
+                    u_3d[[i, y, x]] = s;
+                }
+            }
+        }
+        // Pre-supply the Doppler-broadened, data-grid σ ⇒ the Some(cached) arm.
+        let data_sigma = broadened_cross_sections(
+            &energies,
+            std::slice::from_ref(&data),
+            temperature,
+            None,
+            None,
+        )
+        .unwrap();
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            temperature,
+            Some(ResolutionFunction::Gaussian(
+                ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
+            )),
+            vec![0.001],
+        )
+        .unwrap()
+        .with_precomputed_cross_sections(Arc::new(data_sigma))
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()));
+        let input = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+        let result = spatial_map_typed(&input, &config, None, None, None).unwrap();
+        assert_eq!(result.n_total, 16);
+        assert!(
+            result.n_converged >= 14,
+            "Some(cached)+aux path: {} / 16 pixels converged",
+            result.n_converged,
+        );
+        let d = &result.density_maps[0];
+        let conv = &result.converged_map;
+        let mean: f64 = d
+            .iter()
+            .zip(conv.iter())
+            .filter(|(_, c)| **c)
+            .map(|(d, _)| *d)
+            .sum::<f64>()
+            / result.n_converged.max(1) as f64;
+        assert!(
+            (mean - true_density).abs() / true_density < 0.10,
+            "Some(cached)+aux mean density: {mean}, true: {true_density}"
+        );
     }
 
     #[test]

@@ -57,8 +57,24 @@ const L_SCALE_EPSILON: f64 = 1.0e-12;
 /// then wrap in `Arc` so the same precomputed data is shared read-only
 /// across all rayon worker threads.
 pub struct PrecomputedTransmissionModel {
-    /// Doppler-broadened cross-sections σ_D(E) per isotope,
-    /// shape \[n_isotopes\]\[n_energies\].
+    /// Doppler-broadened cross-sections σ_D(E) per isotope, shape
+    /// \[n_isotopes\]\[n_grid_energies\].
+    ///
+    /// **The grid these σ live on is determined by
+    /// [`work_layout`](Self::work_layout):**
+    ///
+    /// * `work_layout` is `Some` (Gaussian resolution → auxiliary extended
+    ///   grid): σ live on the **working grid**, i.e.
+    ///   `work_layout.energies`, with `n_grid_energies ==
+    ///   work_layout.energies.len()`.  `evaluate()` / `analytical_jacobian()`
+    ///   apply Beer-Lambert + resolution on this working grid and extract the
+    ///   data points LAST via `work_layout.extract(..)` — matching
+    ///   `forward_model` (issue #608).
+    /// * `work_layout` is `None` (tabulated resolution, or no resolution): the
+    ///   working grid IS the data grid, so σ live on the **data grid**
+    ///   (`energies`), with `n_grid_energies == energies.len()`.  No extraction
+    ///   is needed and the surrogate fast paths + data-grid `resolution_plan`
+    ///   behave exactly as before.
     pub cross_sections: Arc<Vec<Vec<f64>>>,
     /// Mapping: `params[density_indices[i]]` is the density of isotope `i`.
     ///
@@ -109,6 +125,17 @@ pub struct PrecomputedTransmissionModel {
     /// both the accuracy and wall-time axes; see
     /// `nereids_physics::surrogate` module docs).
     pub sparse_scalar_plan: Option<Arc<ScalarSurrogatePlan>>,
+    /// Working-grid layout matching [`cross_sections`](Self::cross_sections).
+    ///
+    /// Issue #608: when `cross_sections` is stored on the auxiliary extended
+    /// grid (Gaussian resolution), this maps the working grid back to the data
+    /// grid so `evaluate()` / `analytical_jacobian()` apply resolution on the
+    /// working grid and extract the data points last.  `None` ⇒ the working
+    /// grid is the data grid (tabulated / no resolution): Beer-Lambert and
+    /// resolution run directly on `energies` and no extraction is needed, which
+    /// keeps the surrogate fast paths and the data-grid `resolution_plan`
+    /// byte-identical to before.
+    pub work_layout: Option<Arc<transmission::WorkingGridLayout>>,
 }
 
 /// Deduplicate `density_indices` and return the distinct density-
@@ -395,6 +422,32 @@ fn cubature_eligible(
     true
 }
 
+impl PrecomputedTransmissionModel {
+    /// Working-grid energies for resolution broadening (issue #608).
+    ///
+    /// Returns the auxiliary extended grid when `work_layout` is set (Gaussian
+    /// resolution), otherwise the data grid (`energies`).  Returns `None` only
+    /// when no instrument is configured (Beer-Lambert-only path).
+    fn work_energies(&self) -> Option<&[f64]> {
+        match (&self.work_layout, &self.energies) {
+            (Some(layout), _) => Some(layout.energies.as_slice()),
+            (None, Some(energies)) => Some(energies.as_slice()),
+            (None, None) => None,
+        }
+    }
+
+    /// Extract the data-grid points from a working-grid spectrum (issue #608).
+    ///
+    /// When `work_layout` is `None` the working grid IS the data grid, so this
+    /// is the identity (a plain clone).
+    fn extract_data_points(&self, working: &[f64]) -> Vec<f64> {
+        match &self.work_layout {
+            Some(layout) => layout.extract(working),
+            None => working.to_vec(),
+        }
+    }
+}
+
 impl FitModel for PrecomputedTransmissionModel {
     fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
         if self.cross_sections.is_empty() {
@@ -462,6 +515,10 @@ impl FitModel for PrecomputedTransmissionModel {
             }
         }
 
+        // Beer-Lambert on the WORKING grid (issue #608): `cross_sections` are
+        // stored on the working grid (auxiliary extended grid for Gaussian
+        // resolution; the data grid for tabulated / no resolution), so `n_e`
+        // is the working-grid length.
         let mut neg_opt = vec![0.0f64; n_e];
         // #109.1: No density > 0 guard — let Beer-Lambert handle all densities
         // naturally.  exp(−n·σ) is well-defined for negative n (gives T > 1,
@@ -477,19 +534,27 @@ impl FitModel for PrecomputedTransmissionModel {
         }
         let transmission: Vec<f64> = neg_opt.iter().map(|&d| d.exp()).collect();
 
-        // Issue #442: apply resolution broadening to total transmission
-        // AFTER Beer-Lambert.  This is the SAMMY-correct ordering.
-        if let (Some(inst), Some(energies)) = (&self.instrument, &self.energies) {
+        // Issue #442 + #608: apply resolution broadening to the total
+        // transmission AFTER Beer-Lambert, on the WORKING grid, then extract
+        // the data points LAST.  When `work_layout` is `None` (tabulated / no
+        // resolution) the working grid IS the data grid (`self.energies`), the
+        // extraction is the identity, and the data-grid `resolution_plan` still
+        // matches — byte-identical to the pre-#608 path.
+        // Resolution applies iff there is an instrument AND a working grid to
+        // apply it on (`work_energies()` = the layout grid when present, else the
+        // data grid).  `evaluate` and `analytical_jacobian` share this exact
+        // guard so the two paths cannot diverge (issue #608 R2).
+        if let (Some(inst), Some(work_energies)) = (&self.instrument, self.work_energies()) {
             let t_broadened = resolution::apply_resolution_with_plan(
                 self.resolution_plan.as_deref(),
-                energies,
+                work_energies,
                 &transmission,
                 &inst.resolution,
             )
             .map_err(|e| FittingError::EvaluationFailed(format!("resolution broadening: {e}")))?;
-            Ok(t_broadened)
+            Ok(self.extract_data_points(&t_broadened))
         } else {
-            Ok(transmission)
+            Ok(self.extract_data_points(&transmission))
         }
     }
 
@@ -598,7 +663,8 @@ impl FitModel for PrecomputedTransmissionModel {
         }
 
         // For each free parameter, sum the cross-sections of every isotope
-        // tied to that parameter index.
+        // tied to that parameter index.  σ (and the sums) are on the WORKING
+        // grid (issue #608), so `n_e` is the working-grid length.
         //   ∂T/∂N_g = -(Σ_{iso∈g} σ_iso(E)) · T(E)
         let fp_xs_sums: Vec<Vec<f64>> = free_param_indices
             .iter()
@@ -615,11 +681,20 @@ impl FitModel for PrecomputedTransmissionModel {
             })
             .collect();
 
+        // The Jacobian has one row per DATA point; `y_current` is on the data
+        // grid.  When resolution is enabled the inner derivative is formed on
+        // the working grid, resolution-broadened there, and the data points
+        // extracted last (issue #608).
+        let n_data = y_current.len();
+
         // When resolution is enabled, we need the UNRESOLVED T(E) = exp(-Σnσ)
-        // to form the inner derivative -σ·T, then apply resolution.
-        // y_current is T_obs = R[T], which is NOT the same as T.
-        if let (Some(inst), Some(energies)) = (&self.instrument, &self.energies) {
-            // Recompute unresolved T from cross-sections and current params.
+        // on the WORKING grid to form the inner derivative -σ·T, then apply
+        // resolution on the working grid and extract the data points.
+        // y_current is T_obs = R[T] on the DATA grid, which is NOT the same.
+        // Same resolution guard as `evaluate` (issue #608 R2) so the two paths
+        // agree by construction; the else branch is the no-resolution Jacobian.
+        if let (Some(inst), Some(work_energies)) = (&self.instrument, self.work_energies()) {
+            // Recompute unresolved T on the working grid from σ and params.
             let mut neg_opt = vec![0.0f64; n_e];
             for (i, xs) in self.cross_sections.iter().enumerate() {
                 let density = params[self.density_indices[i]];
@@ -629,28 +704,30 @@ impl FitModel for PrecomputedTransmissionModel {
             }
             let t_unresolved: Vec<f64> = neg_opt.iter().map(|&d| d.exp()).collect();
 
-            // ∂T_obs/∂N_g = R[-σ_sum(E) · T_unresolved(E)]
-            let mut jacobian = FlatMatrix::zeros(n_e, n_free);
+            // ∂T_obs/∂N_g = extract(R[-σ_sum(E) · T_unresolved(E)])
+            let mut jacobian = FlatMatrix::zeros(n_data, n_free);
             for (col, xs_sum) in fp_xs_sums.iter().enumerate() {
                 let inner_deriv: Vec<f64> =
                     (0..n_e).map(|i| -xs_sum[i] * t_unresolved[i]).collect();
                 let resolved_deriv = resolution::apply_resolution_with_plan(
                     self.resolution_plan.as_deref(),
-                    energies,
+                    work_energies,
                     &inner_deriv,
                     &inst.resolution,
                 )
                 .ok()?;
+                let resolved_deriv = self.extract_data_points(&resolved_deriv);
                 for (i, &val) in resolved_deriv.iter().enumerate() {
                     *jacobian.get_mut(i, col) = val;
                 }
             }
             Some(jacobian)
         } else {
-            // No resolution: ∂T/∂N_g = -σ_sum(E) · T(E)
-            // y_current IS T(E) directly.
-            let mut jacobian = FlatMatrix::zeros(n_e, n_free);
-            for i in 0..n_e {
+            // No resolution → no auxiliary grid: the working grid IS the data
+            // grid (`n_e == n_data`), and y_current IS T(E) directly.
+            //   ∂T/∂N_g = -σ_sum(E) · T(E)
+            let mut jacobian = FlatMatrix::zeros(n_data, n_free);
+            for i in 0..n_data {
                 for (j, xs_sum) in fp_xs_sums.iter().enumerate() {
                     *jacobian.get_mut(i, j) = -xs_sum[i] * y_current[i];
                 }
@@ -707,16 +784,25 @@ pub struct TransmissionFitModel {
     /// Wrapped in `Arc` so `spatial_map` can share a single allocation across
     /// all per-pixel `TransmissionFitModel` instances without deep cloning.
     base_xs: Option<Arc<Vec<Vec<f64>>>>,
-    /// Cached broadened cross-sections from the last `evaluate()` call.
-    /// Used by `analytical_jacobian()` to provide density columns without
-    /// rebroadening.  Interior mutability via `RefCell` is needed because
+    /// Cached broadened cross-sections from the last `evaluate()` call, on the
+    /// **working grid** (auxiliary extended grid when Gaussian resolution is
+    /// active, else the data grid).  Used by `analytical_jacobian()` to provide
+    /// density columns without rebroadening AND to build the inner derivative
+    /// `−σ·T` on the working grid before resolution + data-point extraction
+    /// (issue #608).  Interior mutability via `RefCell` is needed because
     /// `FitModel::evaluate` takes `&self`.  Safe because `TransmissionFitModel`
     /// is constructed per-pixel and never shared across threads.
     cached_broadened_xs: RefCell<Option<Rc<Vec<Vec<f64>>>>>,
-    /// Cached analytical temperature derivative ∂σ/∂T, computed on-demand
-    /// by `analytical_jacobian()` when the temperature column is needed.
-    /// Invalidated when temperature changes (cleared in `evaluate()`).
+    /// Cached analytical temperature derivative ∂σ/∂T, on the **working grid**,
+    /// computed on-demand by `analytical_jacobian()` when the temperature
+    /// column is needed.  Invalidated when temperature changes (cleared in
+    /// `evaluate()`).
     cached_dxs_dt: RefCell<Option<Rc<Vec<Vec<f64>>>>>,
+    /// Working-grid layout (energies + data-index map) matching
+    /// `cached_broadened_xs` / `cached_dxs_dt`.  Resolution broadening is
+    /// applied on `layout.energies` and the data points are extracted last
+    /// (issue #608).  Set in `evaluate()` alongside the broadened σ cache.
+    cached_work_layout: RefCell<Option<Rc<transmission::WorkingGridLayout>>>,
     /// Temperature at which `cached_broadened_xs` was computed.
     /// `Cell` is sufficient because `f64` is `Copy`.
     cached_temperature: Cell<f64>,
@@ -826,6 +912,7 @@ impl TransmissionFitModel {
             base_xs,
             cached_broadened_xs: RefCell::new(None),
             cached_dxs_dt: RefCell::new(None),
+            cached_work_layout: RefCell::new(None),
             cached_temperature: Cell::new(f64::NAN),
             resolution_plan: None,
             sparse_cubature_plan: None,
@@ -939,38 +1026,53 @@ impl FitModel for TransmissionFitModel {
                 )));
             }
 
-            // Compute broadened XS (or reuse cache if temperature unchanged).
-            // Caching avoids redundant Doppler broadening on rejected LM steps
-            // (same T, different lambda) and enables analytical_jacobian() to
-            // read the broadened σ for density columns.
+            // Compute broadened XS on the WORKING grid (or reuse cache if
+            // temperature unchanged).  Caching avoids redundant Doppler
+            // broadening on rejected LM steps (same T, different lambda) and
+            // enables analytical_jacobian() to read the broadened σ for the
+            // density columns AND to build the inner derivative on the same
+            // working grid.
+            //
+            // Issue #608: Doppler + Beer-Lambert + resolution all run on the
+            // working grid (auxiliary extended grid when Gaussian resolution is
+            // active), with the data points extracted LAST — matching
+            // forward_model.  The previous cached path collapsed σ to the
+            // coarse data grid before resolution, degrading the convolution.
             //
             // Derivative ∂σ/∂T is computed on-demand in analytical_jacobian(),
             // NOT here — evaluate() is called many times during line search
             // trials, and the derivative overhead would dominate.
-            let broadened_xs = if (temperature_k - self.cached_temperature.get()).abs() < 1e-15 {
-                Rc::clone(self.cached_broadened_xs.borrow().as_ref().unwrap())
+            let (broadened_xs, layout) = if (temperature_k - self.cached_temperature.get()).abs()
+                < 1e-15
+                && self.cached_broadened_xs.borrow().is_some()
+            {
+                (
+                    Rc::clone(self.cached_broadened_xs.borrow().as_ref().unwrap()),
+                    Rc::clone(self.cached_work_layout.borrow().as_ref().unwrap()),
+                )
             } else {
-                let xs = Rc::new(
-                    transmission::broadened_cross_sections_from_base(
-                        &self.energies,
-                        base_xs,
-                        &self.resonance_data,
-                        temperature_k,
-                        self.instrument.as_deref(),
-                    )
-                    .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?,
-                );
+                let working = transmission::broadened_cross_sections_from_base_on_working_grid(
+                    &self.energies,
+                    base_xs,
+                    &self.resonance_data,
+                    temperature_k,
+                    self.instrument.as_deref(),
+                )
+                .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?;
+                let xs = Rc::new(working.sigma);
+                let layout = Rc::new(working.layout);
                 *self.cached_broadened_xs.borrow_mut() = Some(Rc::clone(&xs));
+                *self.cached_work_layout.borrow_mut() = Some(Rc::clone(&layout));
                 // Invalidate derivative cache — temperature changed, old ∂σ/∂T stale.
                 *self.cached_dxs_dt.borrow_mut() = None;
                 self.cached_temperature.set(temperature_k);
-                xs
+                (xs, layout)
             };
 
-            // Beer-Lambert: T(E) = exp(-Σᵢ nᵢ · rᵢ · σᵢ(E))
+            // Beer-Lambert on the working grid: T(E) = exp(-Σᵢ nᵢ · rᵢ · σᵢ(E))
             // where rᵢ is the fractional ratio (1.0 for ungrouped isotopes).
-            let n_e = self.energies.len();
-            let mut neg_opt = vec![0.0f64; n_e];
+            let work_len = layout.energies.len();
+            let mut neg_opt = vec![0.0f64; work_len];
             for (i, xs) in broadened_xs.iter().enumerate() {
                 let density = params[self.density_indices[i]];
                 let ratio = self.density_ratios[i];
@@ -980,18 +1082,25 @@ impl FitModel for TransmissionFitModel {
             }
             let transmission: Vec<f64> = neg_opt.iter().map(|&d| d.exp()).collect();
 
-            // Issue #442: apply resolution broadening to total transmission
-            // AFTER Beer-Lambert.
+            // Issue #442: apply resolution broadening to the total transmission
+            // AFTER Beer-Lambert, on the working grid; then extract the data
+            // points last (issue #608).  For Gaussian resolution `resolution_plan`
+            // is `None` (the planned path is tabulated-only) and broadening runs
+            // on `layout.energies`; for tabulated resolution the working grid IS
+            // the data grid so the data-grid plan still matches.
             if let Some(ref inst) = self.instrument {
-                resolution::apply_resolution_with_plan(
+                let t_broadened = resolution::apply_resolution_with_plan(
                     self.resolution_plan.as_deref(),
-                    &self.energies,
+                    &layout.energies,
                     &transmission,
                     &inst.resolution,
                 )
-                .map_err(|e| FittingError::EvaluationFailed(format!("resolution broadening: {e}")))
+                .map_err(|e| {
+                    FittingError::EvaluationFailed(format!("resolution broadening: {e}"))
+                })?;
+                Ok(layout.extract(&t_broadened))
             } else {
-                Ok(transmission)
+                Ok(layout.extract(&transmission))
             }
         } else {
             // Original path: full forward model (no temperature fitting).
@@ -1096,6 +1205,11 @@ impl FitModel for TransmissionFitModel {
         let _base_xs_guard = self.base_xs.as_ref()?;
         let cached_xs = self.cached_broadened_xs.borrow();
         let broadened_xs = cached_xs.as_ref()?;
+        // Working-grid layout matching the cached σ (issue #608).  Inner
+        // derivatives are formed on this grid, resolution-broadened there, and
+        // the data points are extracted LAST.
+        let cached_layout = self.cached_work_layout.borrow();
+        let layout = cached_layout.as_ref()?;
 
         // Guard: verify the cache matches the current parameter temperature.
         if let Some(ti) = self.temperature_index {
@@ -1106,6 +1220,7 @@ impl FitModel for TransmissionFitModel {
         }
 
         let n_e = y_current.len();
+        let work_len = layout.energies.len();
         let n_free = free_param_indices.len();
         let mut jacobian = FlatMatrix::zeros(n_e, n_free);
 
@@ -1113,10 +1228,14 @@ impl FitModel for TransmissionFitModel {
             .temperature_index
             .and_then(|ti| free_param_indices.iter().position(|&fp| fp == ti));
 
-        // When resolution is enabled, we need the UNRESOLVED T to form
-        // inner derivatives, then apply resolution.  y_current is T_obs = R[T].
+        // The UNRESOLVED transmission T(E) on the WORKING grid, used to form
+        // inner derivatives before resolution.  Issue #608: with resolution,
+        // y_current is T_obs = R[T] on the DATA grid — not usable as the inner
+        // T on the working grid — so recompute T from the cached working-grid
+        // σ.  Without resolution the working grid is the data grid (identity
+        // layout) and y_current IS T, so reuse it to stay bit-identical.
         let t_unresolved: Option<Vec<f64>> = if self.instrument.is_some() {
-            let mut neg_opt = vec![0.0f64; n_e];
+            let mut neg_opt = vec![0.0f64; work_len];
             for (iso, xs) in broadened_xs.iter().enumerate() {
                 let density = params[self.density_indices[iso]];
                 let ratio = self.density_ratios[iso];
@@ -1128,9 +1247,7 @@ impl FitModel for TransmissionFitModel {
         } else {
             None
         };
-
-        // Helper: the T(E) to use for inner derivatives.
-        // With resolution: unresolved T.  Without: y_current IS T.
+        // T(E) on the working grid for the inner derivatives.
         let t_for_deriv: &[f64] = t_unresolved.as_deref().unwrap_or(y_current);
 
         // ── Density columns: ∂T/∂N_g or ∂T_obs/∂N_g ──
@@ -1138,7 +1255,7 @@ impl FitModel for TransmissionFitModel {
             if temp_col == Some(col) {
                 continue;
             }
-            let mut sigma_sum = vec![0.0f64; n_e];
+            let mut sigma_sum = vec![0.0f64; work_len];
             for (iso, &di) in self.density_indices.iter().enumerate() {
                 if di == fp_idx {
                     let ratio = self.density_ratios[iso];
@@ -1147,22 +1264,27 @@ impl FitModel for TransmissionFitModel {
                     }
                 }
             }
-            // Inner derivative: -σ_sum · T_unresolved
-            let inner: Vec<f64> = (0..n_e).map(|i| -sigma_sum[i] * t_for_deriv[i]).collect();
+            // Inner derivative on the working grid: -σ_sum · T_unresolved.
+            let inner: Vec<f64> = (0..work_len)
+                .map(|i| -sigma_sum[i] * t_for_deriv[i])
+                .collect();
 
             if let Some(ref inst) = self.instrument {
-                // ∂T_obs/∂N_g = R[inner]
+                // ∂T_obs/∂N_g = extract(R[inner]) — resolution on the working
+                // grid, data points extracted last (issue #608).
                 let resolved = resolution::apply_resolution_with_plan(
                     self.resolution_plan.as_deref(),
-                    &self.energies,
+                    &layout.energies,
                     &inner,
                     &inst.resolution,
                 )
                 .ok()?;
+                let resolved = layout.extract(&resolved);
                 for (i, &val) in resolved.iter().enumerate() {
                     *jacobian.get_mut(i, col) = val;
                 }
             } else {
+                // No resolution → identity layout, inner is already data grid.
                 for (i, &val) in inner.iter().enumerate() {
                     *jacobian.get_mut(i, col) = val;
                 }
@@ -1171,14 +1293,14 @@ impl FitModel for TransmissionFitModel {
 
         // ── Temperature column: ∂T/∂Temp or ∂T_obs/∂Temp ──
         if let Some(col) = temp_col {
-            // Compute ∂σ/∂T on-demand if not cached.
+            // Compute ∂σ/∂T (on the working grid) on-demand if not cached.
             {
                 let needs_compute = self.cached_dxs_dt.borrow().as_ref().is_none();
                 if needs_compute {
                     let base_xs = self.base_xs.as_ref()?;
                     let temperature_k = self.cached_temperature.get();
-                    let (_, dxs_vec) =
-                        transmission::broadened_cross_sections_with_analytical_derivative_from_base(
+                    let working =
+                        transmission::broadened_cross_sections_with_analytical_derivative_from_base_on_working_grid(
                             &self.energies,
                             base_xs,
                             &self.resonance_data,
@@ -1186,14 +1308,14 @@ impl FitModel for TransmissionFitModel {
                             self.instrument.as_deref(),
                         )
                         .ok()?;
-                    *self.cached_dxs_dt.borrow_mut() = Some(Rc::new(dxs_vec));
+                    *self.cached_dxs_dt.borrow_mut() = Some(Rc::new(working.dsigma_dt));
                 }
             }
             let cached_dxs = self.cached_dxs_dt.borrow();
             let dxs_dt = cached_dxs.as_ref()?;
 
-            // Inner derivative: -T · Σᵢ nᵢ rᵢ ∂σᵢ/∂T
-            let inner: Vec<f64> = (0..n_e)
+            // Inner derivative on the working grid: -T · Σᵢ nᵢ rᵢ ∂σᵢ/∂T.
+            let inner: Vec<f64> = (0..work_len)
                 .map(|i| {
                     let mut sum_n_dsigma = 0.0f64;
                     for (iso, dxs) in dxs_dt.iter().enumerate() {
@@ -1208,11 +1330,12 @@ impl FitModel for TransmissionFitModel {
             if let Some(ref inst) = self.instrument {
                 let resolved = resolution::apply_resolution_with_plan(
                     self.resolution_plan.as_deref(),
-                    &self.energies,
+                    &layout.energies,
                     &inner,
                     &inst.resolution,
                 )
                 .ok()?;
+                let resolved = layout.extract(&resolved);
                 for (i, &val) in resolved.iter().enumerate() {
                     *jacobian.get_mut(i, col) = val;
                 }
@@ -1512,12 +1635,19 @@ impl<M: FitModel> FitModel for NormalizedTransmissionModel<M> {
 
 /// Transmission model with energy-scale calibration parameters (t₀, L_scale).
 ///
-/// Wraps precomputed cross-sections and re-maps the energy grid at each
-/// evaluation:
+/// Carries per-isotope resonance data (NOT a precomputed σ grid) and rebuilds
+/// the TRUE cross-section at the corrected energies on each evaluation
+/// (issue #608), matching `forward_model`:
 ///   1. Convert nominal energy → TOF: `t = TOF_FACTOR * L / √E_nom`
-///   2. Apply calibration: `t_corr = t - t₀`, `E_corr = (TOF_FACTOR * L * L_scale / t_corr)²`
-///   3. Interpolate cross-sections σ(E_nom) → σ(E_corr)
-///   4. Beer-Lambert + resolution on the corrected grid
+///   2. Apply calibration: `t_corr = t - t₀`,
+///      `E_corr = (TOF_FACTOR * L * L_scale / t_corr)²`
+///   3. Evaluate σ(E_corr) directly via `reich_moore` + Doppler on a working
+///      grid built from `E_corr` (auxiliary extended grid under Gaussian
+///      resolution; `E_corr` itself for tabulated / no resolution) — NOT
+///      interpolation of a fixed σ grid, which clamps at the auxiliary
+///      boundary and drops resonance fine-structure.
+///   4. Beer-Lambert + resolution on the working grid, then extract the data
+///      points last.
 ///
 /// This is equivalent to SAMMY's TZERO parameters.
 ///
@@ -1528,10 +1658,23 @@ impl<M: FitModel> FitModel for NormalizedTransmissionModel<M> {
 /// `NEREIDS_TZERO_JACOBIAN=fd2`, or `tzero_jacobian="fd2"` Python kwarg.
 /// See [`EnergyScaleJacobianMethod`] for full method documentation.
 pub struct EnergyScaleTransmissionModel {
-    /// Precomputed cross-sections on the NOMINAL energy grid.
-    cross_sections: Arc<Vec<Vec<f64>>>,
-    /// Density parameter indices (same as PrecomputedTransmissionModel).
+    /// Resonance parameters per isotope.  Issue #608: the energy-scale model
+    /// evaluates the TRUE cross-section at the corrected energies (matching
+    /// `forward_model`) instead of interpolating a precomputed σ grid, so it
+    /// carries resonance data and rebuilds σ on the corrected working grid each
+    /// `evaluate`.  This is the only way to reproduce SAMMY's σ(E_corr) under
+    /// the energy-scale shift with full boundary + resonance-fine-structure
+    /// fidelity; interpolating a fixed precomputed σ cannot (it clamps at the
+    /// auxiliary boundary and misses fine-structure).
+    resonance_data: Arc<Vec<ResonanceData>>,
+    /// Density parameter index per isotope (same convention as
+    /// `PrecomputedTransmissionModel`).
     density_indices: Arc<Vec<usize>>,
+    /// Fractional ratio per isotope (1.0 when ungrouped).  Per-isotope
+    /// thickness is `params[density_indices[i]] * density_ratios[i]`.
+    density_ratios: Arc<Vec<f64>>,
+    /// Sample temperature (K) for Doppler broadening at the corrected energies.
+    temperature_k: f64,
     /// Nominal energy grid (eV, ascending).
     nominal_energies: Vec<f64>,
     /// Flight path length in meters (used for TOF↔energy conversion).
@@ -1569,6 +1712,12 @@ pub struct EnergyScaleTransmissionModel {
     /// `RefCell` is safe: `TransmissionFitModel`-family models are
     /// rebuilt per-pixel and never shared across rayon workers.
     cached_plans: RefCell<CachedPlanRing>,
+    /// Capacity-1 cache of the working-grid σ keyed on `(t0_bits, L_scale_bits)`
+    /// (issue #608 R2 perf): a base-point `evaluate` + the Jacobian's density
+    /// columns at the same probe reuse one reich_moore+Doppler build instead of
+    /// rebuilding it twice.  `RefCell` is safe — the model is rebuilt per pixel
+    /// and never shared across threads.
+    cached_work_xs: RefCell<CachedWorkXs>,
     /// Method for the t0 / L_scale Jacobian columns. Initialised from
     /// [`EnergyScaleJacobianMethod::from_env`] in [`Self::new`], which
     /// defaults to `PartialGal` since issue #489 (and respects the
@@ -1576,6 +1725,11 @@ pub struct EnergyScaleTransmissionModel {
     /// overridden per-instance via [`Self::with_jacobian_method`].
     jacobian_method: EnergyScaleJacobianMethod,
 }
+
+/// Capacity-1 working-grid σ cache entry, keyed on `(t0_bits, l_scale_bits)`.
+/// Named alias to keep the field type within clippy's `type_complexity` budget
+/// (issue #608 R2).
+type CachedWorkXs = Option<((u64, u64), Rc<transmission::WorkingGridXs>)>;
 
 /// One `(t0_bits, l_scale_bits)` → `ResolutionPlan` entry.  Named
 /// struct to keep the cache field type within clippy's
@@ -1643,15 +1797,9 @@ impl CachedPlanRing {
 ///   The pre-#489 production default; reachable via
 ///   `NEREIDS_TZERO_JACOBIAN=fd2` env var or `tzero_jacobian="fd2"`
 ///   Python kwarg.
-/// - `FrozenResolutionChainRule`: chain rule through the corrected-grid
-///   sigma interpolation, applied to the cached resolution operator.
-///   Drops the kernel-motion term `(dR/dp) * T_un`. Faster than FD2
-///   but biased — round-2/round-3 research showed CR underperforms
-///   PartialGal on real VENUS data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnergyScaleJacobianMethod {
     FiniteDifference,
-    FrozenResolutionChainRule,
     PartialGal,
 }
 
@@ -1667,6 +1815,13 @@ impl EnergyScaleJacobianMethod {
     /// `EnergyScaleTransmissionModel::with_jacobian_method` (which
     /// bypasses the cache); changing the env var mid-process has no
     /// effect.
+    ///
+    /// An unrecognized or removed value (e.g. the `"chain"` method dropped in
+    /// #608) emits a one-time `eprintln` warning and falls back to the
+    /// `PartialGal` default rather than being silently masked.  It does not
+    /// panic — `new` is a hot, infallible, per-pixel constructor across the
+    /// PyO3 boundary; the Python `tzero_jacobian=` kwarg is the strict
+    /// (hard-erroring) override path.
     fn from_env() -> Self {
         use std::sync::OnceLock;
         static CACHED: OnceLock<EnergyScaleJacobianMethod> = OnceLock::new();
@@ -1674,24 +1829,39 @@ impl EnergyScaleJacobianMethod {
     }
 
     fn resolve_env_uncached() -> Self {
-        match std::env::var("NEREIDS_TZERO_JACOBIAN") {
-            Ok(v)
-                if v.eq_ignore_ascii_case("fd2")
-                    || v.eq_ignore_ascii_case("finite-difference")
-                    || v.eq_ignore_ascii_case("finite_difference") =>
-            {
-                Self::FiniteDifference
-            }
-            Ok(v)
-                if v.eq_ignore_ascii_case("chain")
-                    || v.eq_ignore_ascii_case("frozen-r")
-                    || v.eq_ignore_ascii_case("frozen_r") =>
-            {
-                Self::FrozenResolutionChainRule
-            }
-            // Default (and explicit `"partial-gal"` / `"partial_gal"`)
-            // route to `PartialGal` per issue #489.
-            _ => Self::PartialGal,
+        let Ok(v) = std::env::var("NEREIDS_TZERO_JACOBIAN") else {
+            // Unset → the documented #489 default, silently.
+            return Self::PartialGal;
+        };
+        if v.eq_ignore_ascii_case("fd2")
+            || v.eq_ignore_ascii_case("finite-difference")
+            || v.eq_ignore_ascii_case("finite_difference")
+        {
+            Self::FiniteDifference
+        } else if v.eq_ignore_ascii_case("partial-gal") || v.eq_ignore_ascii_case("partial_gal") {
+            Self::PartialGal
+        } else {
+            // Set to an unrecognized / removed method name.  The legacy
+            // `"chain"` / `"frozen-r"` / `"frozen_r"` FrozenResolutionChainRule
+            // method was removed in #608 (it interpolated a precomputed σ on the
+            // data grid, incompatible with the true-σ aux-grid `evaluate`;
+            // FD / PartialGal of the corrected evaluate is the exact
+            // replacement).  The Python `tzero_jacobian=` kwarg HARD-ERRORS on
+            // these names (bindings/python `parse_tzero_jacobian`); `from_env` is
+            // an infallible, process-cached, per-pixel constructor path that must
+            // not panic across the PyO3 boundary (cf. the #608 `working_xs`
+            // Err-not-panic guard), so it cannot itself return an error.  Warn
+            // loudly (once, via the `OnceLock` in `from_env`) so the override is
+            // NOT silently masked, then fall back to the PartialGal default —
+            // matching the kwarg in *surfacing* the bad value while staying
+            // non-fatal on this hot, infallible path.
+            eprintln!(
+                "warning: NEREIDS_TZERO_JACOBIAN=\"{v}\" is not a recognized \
+                 Jacobian method (\"chain\" / \"frozen-r\" were removed in #608); \
+                 using the default \"partial-gal\". Valid values: \"fd2\", \
+                 \"partial-gal\"."
+            );
+            Self::PartialGal
         }
     }
 }
@@ -1700,8 +1870,11 @@ impl EnergyScaleTransmissionModel {
     /// Create a new energy-scale transmission model.
     ///
     /// # Arguments
-    /// * `cross_sections` — Precomputed σ(E) on the nominal grid.
-    /// * `density_indices` — Maps isotope index → parameter index.
+    /// * `resonance_data` — Resonance parameters per isotope; σ is evaluated at
+    ///   the corrected energies via `reich_moore` + Doppler (issue #608).
+    /// * `density_indices` — Maps isotope index → density parameter index.
+    /// * `density_ratios` — Fractional ratio per isotope (1.0 when ungrouped).
+    /// * `temperature_k` — Sample temperature (K) for Doppler broadening.
     /// * `nominal_energies` — Energy grid in eV (ascending).
     /// * `flight_path_m` — Nominal flight path in meters.
     /// * `t0_index` — Index of t₀ parameter.
@@ -1709,8 +1882,10 @@ impl EnergyScaleTransmissionModel {
     /// * `instrument` — Optional resolution function.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        cross_sections: Arc<Vec<Vec<f64>>>,
+        resonance_data: Arc<Vec<ResonanceData>>,
         density_indices: Arc<Vec<usize>>,
+        density_ratios: Arc<Vec<f64>>,
+        temperature_k: f64,
         nominal_energies: Vec<f64>,
         flight_path_m: f64,
         t0_index: usize,
@@ -1724,8 +1899,10 @@ impl EnergyScaleTransmissionModel {
         // by ~5e-5 relative, enough to visibly shift sharp resonances).
         let tof_factor = (0.5 * NEUTRON_MASS_KG / EV_TO_JOULES).sqrt() * 1.0e6;
         Self {
-            cross_sections,
+            resonance_data,
             density_indices,
+            density_ratios,
+            temperature_k,
             nominal_energies,
             flight_path_m,
             tof_factor,
@@ -1733,6 +1910,7 @@ impl EnergyScaleTransmissionModel {
             l_scale_index,
             instrument,
             cached_plans: RefCell::new(CachedPlanRing::default()),
+            cached_work_xs: RefCell::new(None),
             jacobian_method: EnergyScaleJacobianMethod::from_env(),
         }
     }
@@ -1761,11 +1939,18 @@ impl EnergyScaleTransmissionModel {
     /// or when the `build_resolution_plan` call fails (unsorted grid) —
     /// both cases transparently fall back to the non-plan
     /// `apply_resolution` path via `apply_resolution_with_plan(None, …)`.
+    ///
+    /// `working_energies` is the broadening grid the plan is built on — the
+    /// model's WORKING grid (`work.layout.energies`), which every caller passes
+    /// post-#608.  For tabulated resolution (the only case that builds a plan)
+    /// the working grid IS the corrected data grid; for Gaussian it is the
+    /// auxiliary extended grid, but that path returns `None` above before the
+    /// grid is used.
     fn cached_resolution_plan(
         &self,
         t0_us: f64,
         l_scale: f64,
-        e_corr: &[f64],
+        working_energies: &[f64],
     ) -> Option<Arc<ResolutionPlan>> {
         let inst = self.instrument.as_ref()?;
         // Match on a reference to `inst.resolution` defensively so the
@@ -1783,7 +1968,7 @@ impl EnergyScaleTransmissionModel {
             return Some(plan);
         }
         // Miss: build, insert, return.
-        let plan = resolution::build_resolution_plan(e_corr, &inst.resolution)
+        let plan = resolution::build_resolution_plan(working_energies, &inst.resolution)
             .ok()
             .flatten()?;
         let arc = Arc::new(plan);
@@ -1835,145 +2020,74 @@ impl EnergyScaleTransmissionModel {
             .collect()
     }
 
-    fn corrected_energy_derivatives(
-        &self,
-        t0_us: f64,
-        l_scale: f64,
-        corrected_e: &[f64],
-    ) -> (Vec<f64>, Vec<f64>) {
-        if self.nominal_energies.is_empty() {
-            return (Vec::new(), Vec::new());
+    /// Doppler-broadened TRUE σ per isotope on the working grid built from the
+    /// corrected energies, plus the data-grid layout (issue #608).
+    ///
+    /// Mirrors `forward_model`: builds the auxiliary extended grid on `e_corr`
+    /// WITH the model's resonance data (boundary extension + resonance
+    /// fine-structure), evaluates σ via `reich_moore` at those energies, and
+    /// Doppler-broadens there.  The corrected grid is re-derived per
+    /// `(t0, L_scale)` probe, so the working grid + σ are rebuilt each call —
+    /// the only way to reproduce SAMMY's σ(E_corr) under the energy-scale shift
+    /// (boundary + fine-structure fidelity).  For tabulated / no resolution the
+    /// working grid is `e_corr` itself with an identity layout.
+    fn working_xs(&self, e_corr: &[f64]) -> Result<transmission::WorkingGridXs, FittingError> {
+        // Issue #608 R2: a degenerate calibration can drive corrected energies to
+        // 0 (l_scale → 0) or non-finite (l_scale → ∞).  `reich_moore` asserts
+        // positive finite energy (an always-on `assert!`), so without this guard
+        // such inputs PANIC inside `broadened_cross_sections_on_working_grid` —
+        // a process abort across the PyO3 boundary.  Return a graceful Err so the
+        // LM/KL/Python callers see a failed evaluate instead of a panic.
+        //
+        // BEHAVIOR CHANGE vs pre-#608: the old model interpolated a precomputed σ
+        // and CLAMPED a degenerate corrected energy to the grid edge, continuing
+        // the fit with a (finite but unphysical) value; the true-σ model instead
+        // FAILS the evaluate rather than fabricating σ at a non-positive energy.
+        // Reachable only by a degenerate calibration, which production keeps out
+        // of reach: `validate_energy_scale_params` rejects `l_scale_init <= 0` at
+        // setup and `corrected_energies` clamps `t0` below the min TOF, so a real
+        // fit never drives `e_corr` to 0 / ∞; this guard is the runtime backstop.
+        if let Some(&bad) = e_corr.iter().find(|&&e| !e.is_finite() || e <= 0.0) {
+            return Err(FittingError::EvaluationFailed(format!(
+                "energy-scale corrected energy is non-positive or non-finite ({bad}); \
+                 t0 / L_scale give a degenerate calibration"
+            )));
         }
-        let min_tof = self
-            .nominal_energies
-            .iter()
-            .copied()
-            .fold(f64::INFINITY, |acc, e| {
-                acc.min(self.tof_factor * self.flight_path_m / e.sqrt())
-            });
-        let t0_limit = min_tof * (1.0 - 1.0e-12);
-        let t0_clamped = t0_us.min(t0_limit);
-        let t0_is_clamped = t0_us > t0_limit;
-        let mut de_dt0 = Vec::with_capacity(corrected_e.len());
-        let mut de_dl = Vec::with_capacity(corrected_e.len());
-        for (&e_nom, &e_corr) in self.nominal_energies.iter().zip(corrected_e.iter()) {
-            let tof = self.tof_factor * self.flight_path_m / e_nom.sqrt();
-            let tof_corr = tof - t0_clamped;
-            de_dt0.push(if t0_is_clamped {
-                0.0
-            } else {
-                2.0 * e_corr / tof_corr
-            });
-            de_dl.push(2.0 * e_corr / l_scale);
-        }
-        (de_dt0, de_dl)
+        transmission::broadened_cross_sections_on_working_grid(
+            e_corr,
+            &self.resonance_data,
+            self.temperature_k,
+            self.instrument.as_deref(),
+            None,
+        )
+        .map_err(|e| FittingError::EvaluationFailed(e.to_string()))
     }
 
-    /// Interpolate a cross-section array from nominal grid to corrected grid.
-    fn interpolate_xs(nominal_e: &[f64], xs: &[f64], corrected_e: &[f64]) -> Vec<f64> {
-        corrected_e
-            .iter()
-            .map(|&e_corr| {
-                // Binary search in the nominal (ascending) grid
-                let n = nominal_e.len();
-                if e_corr <= nominal_e[0] {
-                    return xs[0];
-                }
-                if e_corr >= nominal_e[n - 1] {
-                    return xs[n - 1];
-                }
-                let pos = nominal_e.partition_point(|&e| e < e_corr);
-                let i = if pos == 0 { 0 } else { pos - 1 };
-                let frac = (e_corr - nominal_e[i]) / (nominal_e[i + 1] - nominal_e[i]);
-                xs[i] + frac * (xs[i + 1] - xs[i])
-            })
-            .collect()
-    }
-
-    /// Interpolate a cross-section array and return the local piecewise-linear slope.
-    fn interpolate_xs_and_slope(
-        nominal_e: &[f64],
-        xs: &[f64],
-        corrected_e: &[f64],
-    ) -> (Vec<f64>, Vec<f64>) {
-        let n = nominal_e.len();
-        let mut values = Vec::with_capacity(corrected_e.len());
-        let mut slopes = Vec::with_capacity(corrected_e.len());
-        for &e_corr in corrected_e {
-            if e_corr <= nominal_e[0] {
-                values.push(xs[0]);
-                slopes.push(0.0);
-                continue;
-            }
-            if e_corr >= nominal_e[n - 1] {
-                values.push(xs[n - 1]);
-                slopes.push(0.0);
-                continue;
-            }
-            let pos = nominal_e.partition_point(|&e| e < e_corr);
-            let i = if pos == 0 { 0 } else { pos - 1 };
-            let span = nominal_e[i + 1] - nominal_e[i];
-            let slope = (xs[i + 1] - xs[i]) / span;
-            let frac = (e_corr - nominal_e[i]) / span;
-            values.push(xs[i] + frac * (xs[i + 1] - xs[i]));
-            slopes.push(slope);
-        }
-        (values, slopes)
-    }
-
-    fn frozen_resolution_energy_scale_columns(
+    /// Working-grid σ for the current probe, cached (capacity 1, keyed on
+    /// `(t0, L_scale)` bits) so a base-point `evaluate` and the Jacobian's
+    /// density columns at the SAME probe share one reich_moore+Doppler build
+    /// instead of rebuilding it twice (issue #608 R2 perf).  FD probes at
+    /// perturbed `(t0, L_scale)` miss and rebuild, as required.
+    fn working_xs_for(
         &self,
         params: &[f64],
         e_corr: &[f64],
-        t_unresolved: &[f64],
-        interp_slopes_all: &[Vec<f64>],
-        density_plan: Option<&ResolutionPlan>,
-    ) -> Result<(Vec<f64>, Vec<f64>), FittingError> {
-        let n_e = self.nominal_energies.len();
-        let t0 = params[self.t0_index];
-        let l_scale = params[self.l_scale_index];
-        let (de_dt0, de_dl) = self.corrected_energy_derivatives(t0, l_scale, e_corr);
-
-        let mut du_dt0 = vec![0.0f64; n_e];
-        let mut du_dl = vec![0.0f64; n_e];
-        for j in 0..n_e {
-            let mut attenuation_slope = 0.0f64;
-            for (iso, slopes) in interp_slopes_all.iter().enumerate() {
-                let density = params[self.density_indices[iso]];
-                attenuation_slope += density * slopes[j];
-            }
-            let base = -t_unresolved[j] * attenuation_slope;
-            du_dt0[j] = base * de_dt0[j];
-            du_dl[j] = base * de_dl[j];
+    ) -> Result<Rc<transmission::WorkingGridXs>, FittingError> {
+        let key = (
+            params[self.t0_index].to_bits(),
+            params[self.l_scale_index].to_bits(),
+        );
+        let hit = self
+            .cached_work_xs
+            .borrow()
+            .as_ref()
+            .and_then(|(k, xs)| (*k == key).then(|| Rc::clone(xs)));
+        if let Some(xs) = hit {
+            return Ok(xs);
         }
-
-        if let Some(inst) = &self.instrument {
-            let j_t0 = resolution::apply_resolution_with_plan(
-                density_plan,
-                e_corr,
-                &du_dt0,
-                &inst.resolution,
-            )
-            .map_err(|e| {
-                FittingError::EvaluationFailed(format!(
-                    "resolution broadening for chain-rule t0 column: {e}"
-                ))
-            })?;
-            let j_l = resolution::apply_resolution_with_plan(
-                density_plan,
-                e_corr,
-                &du_dl,
-                &inst.resolution,
-            )
-            .map_err(|e| {
-                FittingError::EvaluationFailed(format!(
-                    "resolution broadening for chain-rule L_scale column: {e}"
-                ))
-            })?;
-            Ok((j_t0, j_l))
-        } else {
-            Ok((du_dt0, du_dl))
-        }
+        let xs = Rc::new(self.working_xs(e_corr)?);
+        *self.cached_work_xs.borrow_mut() = Some((key, Rc::clone(&xs)));
+        Ok(xs)
     }
 
     /// Evaluate transmission at given parameters (densities + t0 + l_scale).
@@ -1992,38 +2106,56 @@ impl EnergyScaleTransmissionModel {
         e_corr: &[f64],
         use_plan_cache: bool,
     ) -> Result<Vec<f64>, FittingError> {
-        let n_e = self.nominal_energies.len();
+        // Issue #608: evaluate the TRUE σ at the corrected energies on the
+        // working grid (auxiliary extended grid for Gaussian resolution; the
+        // data grid for tabulated / no resolution) — reich_moore + Doppler on
+        // the working grid, Beer-Lambert, resolution, extract the data points
+        // last — exactly as `forward_model` does.  This replaces interpolating
+        // a precomputed σ, which clamped at the auxiliary boundary and dropped
+        // resonance fine-structure (a forward_model-fidelity gap; #608 review).
+        let work = self.working_xs_for(params, e_corr)?;
+        let work_e = &work.layout.energies;
 
-        // Interpolate cross-sections to corrected energy grid
-        let mut neg_opt = vec![0.0f64; n_e];
-        for (i, xs) in self.cross_sections.iter().enumerate() {
-            let density = params[self.density_indices[i]];
-            let xs_interp = Self::interpolate_xs(&self.nominal_energies, xs, e_corr);
-            for (j, &sigma) in xs_interp.iter().enumerate() {
-                neg_opt[j] -= density * sigma;
+        // Beer-Lambert on the working grid: T = exp(-Σᵢ nᵢ·rᵢ·σᵢ(E)), where rᵢ
+        // is the fractional ratio (1.0 for ungrouped isotopes).  No density > 0
+        // guard — exp(−n·σ) is well-defined for negative n, matching
+        // PrecomputedTransmissionModel (issue #109.1).
+        let mut neg_opt = vec![0.0f64; work_e.len()];
+        for (iso, xs) in work.sigma.iter().enumerate() {
+            let density = params[self.density_indices[iso]];
+            let ratio = self.density_ratios[iso];
+            for (j, &sigma) in xs.iter().enumerate() {
+                neg_opt[j] -= density * ratio * sigma;
             }
         }
-        let transmission: Vec<f64> = neg_opt.iter().map(|&d| d.exp()).collect();
+        let t_unbroadened: Vec<f64> = neg_opt.iter().map(|&d| d.exp()).collect();
 
-        if let Some(inst) = &self.instrument {
-            let plan = if use_plan_cache {
-                let t0 = params[self.t0_index];
-                let l_scale = params[self.l_scale_index];
-                self.cached_resolution_plan(t0, l_scale, e_corr)
-            } else {
-                None
-            };
-            let t_broadened = resolution::apply_resolution_with_plan(
-                plan.as_deref(),
-                e_corr,
-                &transmission,
-                &inst.resolution,
-            )
-            .map_err(|e| FittingError::EvaluationFailed(format!("resolution broadening: {e}")))?;
-            Ok(t_broadened)
+        let Some(inst) = self.instrument.as_ref() else {
+            // No resolution: the working grid IS the data grid (identity
+            // layout), so `extract` is a no-op clone.
+            return Ok(work.layout.extract(&t_unbroadened));
+        };
+
+        // Resolution on the working grid, then extract the data points last
+        // (issue #442 + #608).  For tabulated resolution the working grid IS
+        // `e_corr`, so the `(t0, L_scale)`-keyed plan (built on `e_corr`) still
+        // matches; for Gaussian the plan is `None` and broadening runs on the
+        // auxiliary grid via `apply_resolution`.
+        let plan = if use_plan_cache {
+            let t0 = params[self.t0_index];
+            let l_scale = params[self.l_scale_index];
+            self.cached_resolution_plan(t0, l_scale, work_e)
         } else {
-            Ok(transmission)
-        }
+            None
+        };
+        let t_broadened = resolution::apply_resolution_with_plan(
+            plan.as_deref(),
+            work_e,
+            &t_unbroadened,
+            &inst.resolution,
+        )
+        .map_err(|e| FittingError::EvaluationFailed(format!("resolution broadening: {e}")))?;
+        Ok(work.layout.extract(&t_broadened))
     }
 }
 
@@ -2060,11 +2192,6 @@ impl FitModel for EnergyScaleTransmissionModel {
         let l_scale = params[self.l_scale_index];
         let e_corr = self.corrected_energies(t0, l_scale);
         let energy_scale_method = self.jacobian_method;
-        let need_energy_scale_chain = energy_scale_method
-            == EnergyScaleJacobianMethod::FrozenResolutionChainRule
-            && free_param_indices
-                .iter()
-                .any(|&idx| idx == self.t0_index || idx == self.l_scale_index);
         let t0_free_pos = free_param_indices
             .iter()
             .position(|&idx| idx == self.t0_index);
@@ -2143,36 +2270,35 @@ impl FitModel for EnergyScaleTransmissionModel {
             None
         };
 
-        // Compute unresolved T and interpolated cross-sections for density derivatives
-        let mut neg_opt = vec![0.0f64; n_e];
-        let mut interp_xs_all: Vec<Vec<f64>> = Vec::new();
-        let mut interp_slopes_all: Vec<Vec<f64>> = Vec::new();
-        for (i, xs) in self.cross_sections.iter().enumerate() {
-            let density = params[self.density_indices[i]];
-            let xs_interp = if need_energy_scale_chain {
-                let (values, slopes) =
-                    Self::interpolate_xs_and_slope(&self.nominal_energies, xs, &e_corr);
-                interp_slopes_all.push(slopes);
-                values
-            } else {
-                Self::interpolate_xs(&self.nominal_energies, xs, &e_corr)
-            };
-            for (j, &sigma) in xs_interp.iter().enumerate() {
-                neg_opt[j] -= density * sigma;
+        // Issue #608: density columns are formed on the WORKING grid (auxiliary
+        // extended grid for Gaussian resolution; `e_corr` for tabulated / no
+        // resolution) from the TRUE σ at the corrected energies (reich_moore +
+        // Doppler), resolution-broadened there, and the data points extracted
+        // last — matching `forward_model` and `evaluate`.
+        let work = match self.working_xs_for(params, &e_corr) {
+            Ok(w) => w,
+            Err(_) => return None,
+        };
+        let work_layout = &work.layout;
+        let work_e = &work_layout.energies;
+
+        // Unresolved T on the WORKING grid: T = exp(-Σᵢ nᵢ·rᵢ·σᵢ).
+        let mut neg_opt = vec![0.0f64; work_e.len()];
+        for (iso, xs) in work.sigma.iter().enumerate() {
+            let density = params[self.density_indices[iso]];
+            let ratio = self.density_ratios[iso];
+            for (j, &sigma) in xs.iter().enumerate() {
+                neg_opt[j] -= density * ratio * sigma;
             }
-            interp_xs_all.push(xs_interp);
         }
         let t_unresolved: Vec<f64> = neg_opt.iter().map(|&d| d.exp()).collect();
 
         // Density-column plan: Issue #483 A1 routes through the
-        // struct-level `(t0, L_scale)`-keyed cache.  When
-        // `self.evaluate(params)` ran earlier in the same KL outer
-        // iteration (for deviance or the forward at the line-search
-        // point), the cache was already populated at the current
+        // struct-level `(t0, L_scale)`-keyed cache.  Built on the working grid
+        // (== `e_corr` for tabulated, where the plan is meaningful; `None` for
+        // Gaussian).  When `self.evaluate(params)` ran earlier in the same KL
+        // outer iteration the cache was already populated at the current
         // `(t0, L_scale)` and this lookup is a cheap Arc clone.
-        // When the Jacobian runs stand-alone (no prior evaluate) the
-        // lookup misses once and the returned plan is installed for
-        // any subsequent evaluate / jacobian at the same probe.
         //
         // The `n_density_cols >= 2` gate from the PR #469 era is
         // dropped here: the cache makes the plan build a one-shot
@@ -2183,31 +2309,10 @@ impl FitModel for EnergyScaleTransmissionModel {
         // The non-tabulated / build-failure branches still return
         // `None` → `apply_resolution_with_plan(None, …)` forwards
         // byte-identically to `apply_resolution`.
-        let density_plan = self.cached_resolution_plan(t0, l_scale, &e_corr);
-        let energy_scale_chain_columns = if need_energy_scale_chain {
-            match self.frozen_resolution_energy_scale_columns(
-                params,
-                &e_corr,
-                &t_unresolved,
-                &interp_slopes_all,
-                density_plan.as_deref(),
-            ) {
-                Ok(cols) => Some(cols),
-                Err(_) => return None,
-            }
-        } else {
-            None
-        };
+        let density_plan = self.cached_resolution_plan(t0, l_scale, work_e);
 
         for (col, &fp_idx) in free_param_indices.iter().enumerate() {
             if fp_idx == self.t0_index || fp_idx == self.l_scale_index {
-                if let Some((j_t0, j_l)) = &energy_scale_chain_columns {
-                    let source = if fp_idx == self.t0_index { j_t0 } else { j_l };
-                    for (i, &val) in source.iter().enumerate() {
-                        *jacobian.get_mut(i, col) = val;
-                    }
-                    continue;
-                }
                 // partial-GAL: when both t0 and L_scale are free, the t0
                 // column comes from a single pre-computed FD pair (above),
                 // and the L_scale column is the per-bin rank-1 derivation
@@ -2317,24 +2422,29 @@ impl FitModel for EnergyScaleTransmissionModel {
                     // else: leave at zero-default.
                 }
             } else {
-                // Density parameter: analytical derivative
-                // ∂T/∂n_g = -(Σ_{iso∈g} σ_iso(E)) · T_unresolved(E)
-                let mut sigma_sum = vec![0.0f64; n_e];
+                // Density parameter: analytical derivative on the WORKING grid
+                // (issue #608) from the TRUE σ, resolution-broadened there,
+                // data points extracted last.
+                // ∂T/∂n_g = extract(R[-(Σ_{iso∈g} rᵢ·σ_iso(E)) · T_unresolved(E)])
+                let mut sigma_sum = vec![0.0f64; work_e.len()];
                 for (iso, &di) in self.density_indices.iter().enumerate() {
                     if di == fp_idx {
-                        for (j, &sigma) in interp_xs_all[iso].iter().enumerate() {
-                            sigma_sum[j] += sigma;
+                        let ratio = self.density_ratios[iso];
+                        for (j, &sigma) in work.sigma[iso].iter().enumerate() {
+                            sigma_sum[j] += ratio * sigma;
                         }
                     }
                 }
-                let inner_deriv: Vec<f64> =
-                    (0..n_e).map(|i| -sigma_sum[i] * t_unresolved[i]).collect();
+                let inner_deriv: Vec<f64> = (0..work_e.len())
+                    .map(|i| -sigma_sum[i] * t_unresolved[i])
+                    .collect();
 
                 // Apply resolution to derivative if enabled.
                 //
                 // When `density_plan` is `Some` (tabulated resolution
                 // + populated cache) we hit the struct-level
-                // `(t0, L_scale)`-keyed plan.  When `None` (Gaussian
+                // `(t0, L_scale)`-keyed plan (built on the working grid, which
+                // equals `e_corr` for tabulated).  When `None` (Gaussian
                 // resolution or build failure),
                 // `apply_resolution_with_plan(None, …)` transparently
                 // forwards to `apply_resolution` — bit-exact with
@@ -2342,17 +2452,19 @@ impl FitModel for EnergyScaleTransmissionModel {
                 if let Some(inst) = &self.instrument {
                     let resolved_deriv = match resolution::apply_resolution_with_plan(
                         density_plan.as_deref(),
-                        &e_corr,
+                        work_e,
                         &inner_deriv,
                         &inst.resolution,
                     ) {
                         Ok(v) => v,
                         Err(_) => return None,
                     };
+                    let resolved_deriv = work_layout.extract(&resolved_deriv);
                     for (i, &val) in resolved_deriv.iter().enumerate() {
                         *jacobian.get_mut(i, col) = val;
                     }
                 } else {
+                    // No resolution → identity layout, inner is already data grid.
                     for (i, &val) in inner_deriv.iter().enumerate() {
                         *jacobian.get_mut(i, col) = val;
                     }
@@ -2387,7 +2499,13 @@ impl ForwardModel for PrecomputedTransmissionModel {
     }
 
     fn n_data(&self) -> usize {
-        if self.cross_sections.is_empty() {
+        // Issue #608 R2: when a Gaussian working-grid layout is attached,
+        // `cross_sections` lives on the (longer) working grid, but the number of
+        // DATA points the model predicts is the layout's data-index count.
+        // Without a layout the working grid IS the data grid.
+        if let Some(layout) = &self.work_layout {
+            layout.data_indices.len()
+        } else if self.cross_sections.is_empty() {
             0
         } else {
             self.cross_sections[0].len()
@@ -2508,6 +2626,20 @@ mod tests {
     use nereids_core::types::Isotope;
     use nereids_endf::resonance::test_support::u238_single_resonance;
     use nereids_endf::resonance::{LGroup, Resonance, ResonanceFormalism, ResonanceRange};
+
+    /// ∞-norm of the residual between two equal-length spectra.
+    /// (Issue #608 aux-grid regression-test helper.)
+    fn max_abs_diff(a: &[f64], b: &[f64]) -> f64 {
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f64, f64::max)
+    }
+
+    /// ∞-norm (max |value|) of a spectrum — a scale for relative thresholds.
+    fn max_abs(a: &[f64]) -> f64 {
+        a.iter().map(|x| x.abs()).fold(0.0f64, f64::max)
+    }
 
     // ── PrecomputedTransmissionModel ─────────────────────────────────────────
 
@@ -3018,6 +3150,7 @@ mod tests {
             resolution_plan: None,
             sparse_cubature_plan: None,
             sparse_scalar_plan: None,
+            work_layout: None,
         }
     }
 
@@ -3154,6 +3287,7 @@ mod tests {
             resolution_plan: Some(Arc::clone(&plan)),
             sparse_cubature_plan: Some(Arc::clone(&cubature)),
             sparse_scalar_plan: None,
+            work_layout: None,
         };
 
         // Evaluate at a training density: cubature ≡ exact to LP
@@ -3235,6 +3369,7 @@ mod tests {
             resolution_plan: None,
             sparse_cubature_plan: Some(Arc::clone(&cubature_k2)),
             sparse_scalar_plan: None,
+            work_layout: None,
         };
         let model_without_plan = PrecomputedTransmissionModel {
             cross_sections: Arc::new(sigmas_k1.clone()),
@@ -3244,6 +3379,7 @@ mod tests {
             resolution_plan: None,
             sparse_cubature_plan: None,
             sparse_scalar_plan: None,
+            work_layout: None,
         };
 
         let n = [1e-4_f64];
@@ -3280,6 +3416,7 @@ mod tests {
             resolution_plan: None,
             sparse_cubature_plan: None,
             sparse_scalar_plan: None,
+            work_layout: None,
         };
 
         let n = [1e-4_f64, 1e-4];
@@ -3317,6 +3454,7 @@ mod tests {
             resolution_plan: Some(Arc::clone(&plan)),
             sparse_cubature_plan: Some(Arc::clone(&cubature)),
             sparse_scalar_plan: None,
+            work_layout: None,
         };
 
         // Use anchor density: LP pins Jacobian exactly here.
@@ -3621,6 +3759,7 @@ mod tests {
             resolution_plan,
             sparse_cubature_plan: None,
             sparse_scalar_plan: scalar_plan,
+            work_layout: None,
         }
     }
 
@@ -4217,6 +4356,7 @@ mod tests {
             resolution_plan: None,
             sparse_cubature_plan: None,
             sparse_scalar_plan: None,
+            work_layout: None,
         };
         let t_precomputed = model.evaluate(&[thickness]).unwrap();
 
@@ -4301,6 +4441,7 @@ mod tests {
             resolution_plan: None,
             sparse_cubature_plan: None,
             sparse_scalar_plan: None,
+            work_layout: None,
         };
 
         let params = [0.0005f64];
@@ -4352,6 +4493,7 @@ mod tests {
             resolution_plan: None,
             sparse_cubature_plan: None,
             sparse_scalar_plan: None,
+            work_layout: None,
         };
 
         let params = [0.001f64];
@@ -4554,6 +4696,466 @@ mod tests {
                 (r - m).abs() < 1e-12,
                 "No-resolution mismatch at E[{i}]={}: ref={r}, model={m}",
                 energies[i]
+            );
+        }
+    }
+
+    // ── Issue #608: LM-fit resolution must use the auxiliary grid ────────────
+    //
+    // The pre-#608 cached / precomputed / energy-scale paths applied resolution
+    // broadening on the COARSE data grid, unlike `forward_model`, which broadens
+    // on the auxiliary extended grid and extracts the data points last.  The
+    // tests below pin every fixed path to `forward_model` — an INDEPENDENT
+    // oracle: it computes σ inline (`reich_moore::cross_sections_at_energy`) and
+    // never calls the `broadened_cross_sections` family this fix touches — to
+    // MACHINE PRECISION over the FULL grid, including the boundary points the
+    // earlier #442 tests (tol 2e-2, interior-only) excluded.  Each test verifies
+    // the kernel actually broadens the spectrum (non-vacuity, per
+    // feedback_synthetic_resolution_test_design) and, where it can construct the
+    // old path, shows the old coarse-grid result differed materially — proving
+    // the fix is a real correction, not a no-op.  Jacobian columns are checked
+    // against central finite differences of the (now aux-correct) `evaluate`.
+    //
+    // SCOPE of the 1e-9 bound (R4 review): these tests pin GRID FIDELITY — that
+    // each fixed path builds the same auxiliary grid + layout as `forward_model`
+    // and extracts the data points identically.  The resolution KERNEL primitive
+    // itself (`apply_resolution_*`, `build_aux_grid`, `doppler::doppler_broaden`)
+    // is SHARED with the oracle, so a kernel error common to both would pass
+    // here; the kernel's physics is validated independently against SAMMY in
+    // `nereids-physics` (`resolution.rs`, `samtry_validation.rs`).  The
+    // non-vacuity `‖kernel − none‖` guards keep this shared-primitive oracle
+    // non-circular for what it asserts (the #608 grid wiring).
+
+    /// Issue #608: the spatial production path (`PrecomputedTransmissionModel`)
+    /// must broaden resolution on the auxiliary grid, matching `forward_model`.
+    #[test]
+    fn issue_608_precomputed_aux_grid_resolution_matches_forward_model() {
+        use nereids_physics::resolution::ResolutionFunction;
+
+        let data = u238_single_resonance();
+        let thickness = 0.0005;
+        let temperature = 300.0;
+        let energies: Vec<f64> = (0..401).map(|i| 4.0 + (i as f64) * 0.015).collect();
+        let inst = Arc::new(InstrumentParams {
+            resolution: ResolutionFunction::Gaussian(
+                nereids_physics::resolution::ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
+            ),
+        });
+
+        // Independent oracle (computes σ inline; broadens on the aux grid).
+        let sample = SampleParams::new(temperature, vec![(data.clone(), thickness)]).unwrap();
+        let t_ref = transmission::forward_model(&energies, &sample, Some(&inst)).unwrap();
+
+        // Non-vacuity: the kernel must actually broaden the spectrum, else
+        // aux-grid vs data-grid broadening would be indistinguishable.
+        let t_nores = transmission::forward_model(&energies, &sample, None).unwrap();
+        let broaden = max_abs_diff(&t_ref, &t_nores);
+        assert!(
+            broaden > 1e-3 * max_abs(&t_nores),
+            "resolution kernel must broaden the spectrum non-trivially (got {broaden:.3e})"
+        );
+
+        // FIXED path: working-grid σ + layout, exactly as `spatial_map_typed` builds it.
+        let working = transmission::broadened_cross_sections_on_working_grid(
+            &energies,
+            std::slice::from_ref(&data),
+            temperature,
+            Some(&inst),
+            None,
+        )
+        .unwrap();
+        assert!(
+            !working.layout.is_identity(),
+            "Gaussian resolution must build a non-identity auxiliary grid — else \
+             this test does not exercise the #608 fix"
+        );
+        let model_fixed = PrecomputedTransmissionModel {
+            cross_sections: Arc::new(working.sigma),
+            density_indices: Arc::new(vec![0]),
+            energies: Some(Arc::new(energies.clone())),
+            instrument: Some(Arc::clone(&inst)),
+            resolution_plan: None,
+            sparse_cubature_plan: None,
+            sparse_scalar_plan: None,
+            work_layout: Some(Arc::new(working.layout)),
+        };
+        let t_fixed = model_fixed.evaluate(&[thickness]).unwrap();
+
+        // OLD path: data-grid σ, no layout — broadens on the coarse data grid
+        // (the configuration the pre-#608 spatial pipeline produced).
+        let xs_data = transmission::broadened_cross_sections(
+            &energies,
+            std::slice::from_ref(&data),
+            temperature,
+            Some(&inst),
+            None,
+        )
+        .unwrap();
+        let model_old = PrecomputedTransmissionModel {
+            cross_sections: Arc::new(xs_data),
+            density_indices: Arc::new(vec![0]),
+            energies: Some(Arc::new(energies.clone())),
+            instrument: Some(Arc::clone(&inst)),
+            resolution_plan: None,
+            sparse_cubature_plan: None,
+            sparse_scalar_plan: None,
+            work_layout: None,
+        };
+        let t_old = model_old.evaluate(&[thickness]).unwrap();
+
+        let err_fixed = max_abs_diff(&t_fixed, &t_ref);
+        let err_old = max_abs_diff(&t_old, &t_ref);
+
+        assert!(
+            err_fixed < 1e-9,
+            "aux-grid PrecomputedTransmissionModel must match forward_model to \
+             machine precision over the full grid (got {err_fixed:.3e})"
+        );
+        assert!(
+            err_old > 1e-4 && err_old > 1e4 * err_fixed.max(1e-15),
+            "old coarse-grid path should differ from forward_model far more than \
+             the fixed path (old={err_old:.3e}, fixed={err_fixed:.3e})"
+        );
+    }
+
+    /// Issue #608: `PrecomputedTransmissionModel::analytical_jacobian` forms the
+    /// inner derivative on the auxiliary grid; it must match central finite
+    /// differences of the (aux-correct) `evaluate`.
+    #[test]
+    fn issue_608_precomputed_aux_grid_jacobian_matches_fd() {
+        use nereids_physics::resolution::ResolutionFunction;
+
+        let data = u238_single_resonance();
+        let thickness = 0.0005;
+        let temperature = 300.0;
+        let energies: Vec<f64> = (0..401).map(|i| 4.0 + (i as f64) * 0.015).collect();
+        let inst = Arc::new(InstrumentParams {
+            resolution: ResolutionFunction::Gaussian(
+                nereids_physics::resolution::ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
+            ),
+        });
+        let working = transmission::broadened_cross_sections_on_working_grid(
+            &energies,
+            std::slice::from_ref(&data),
+            temperature,
+            Some(&inst),
+            None,
+        )
+        .unwrap();
+        let model = PrecomputedTransmissionModel {
+            cross_sections: Arc::new(working.sigma),
+            density_indices: Arc::new(vec![0]),
+            energies: Some(Arc::new(energies.clone())),
+            instrument: Some(Arc::clone(&inst)),
+            resolution_plan: None,
+            sparse_cubature_plan: None,
+            sparse_scalar_plan: None,
+            work_layout: Some(Arc::new(working.layout)),
+        };
+
+        let params = [thickness];
+        let free = [0usize];
+        let y0 = model.evaluate(&params).unwrap();
+        let jac = model
+            .analytical_jacobian(&params, &free, &y0)
+            .expect("analytical jacobian must be available with resolution + aux grid");
+
+        let h = 1e-7;
+        let mut pp = params;
+        let mut pm = params;
+        pp[0] += h;
+        pm[0] -= h;
+        let yp = model.evaluate(&pp).unwrap();
+        let ym = model.evaluate(&pm).unwrap();
+
+        let mut scale = 0.0f64;
+        let mut max_err = 0.0f64;
+        for i in 0..y0.len() {
+            let fd = (yp[i] - ym[i]) / (2.0 * h);
+            let an = jac.get(i, 0);
+            scale = scale.max(an.abs());
+            max_err = max_err.max((fd - an).abs());
+        }
+        let rel = max_err / scale.max(1e-30);
+        assert!(
+            rel < 1e-6,
+            "analytical density Jacobian must match central FD (rel err {rel:.3e})"
+        );
+    }
+
+    /// Issue #608: `TransmissionFitModel`'s cached temperature-fit `evaluate`
+    /// must broaden on the auxiliary grid, matching `forward_model` to machine
+    /// precision over the full grid (the #442 test tolerated 2e-2, interior-only).
+    #[test]
+    fn issue_608_transmission_fit_temp_path_aux_grid_matches_forward_model() {
+        use nereids_physics::resolution::ResolutionFunction;
+
+        let data = u238_single_resonance();
+        let thickness = 0.0005;
+        let temperature = 300.0;
+        let energies: Vec<f64> = (0..401).map(|i| 4.0 + (i as f64) * 0.015).collect();
+        let inst = Arc::new(InstrumentParams {
+            resolution: ResolutionFunction::Gaussian(
+                nereids_physics::resolution::ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
+            ),
+        });
+
+        let sample = SampleParams::new(temperature, vec![(data.clone(), thickness)]).unwrap();
+        let t_ref = transmission::forward_model(&energies, &sample, Some(&inst)).unwrap();
+        let t_nores = transmission::forward_model(&energies, &sample, None).unwrap();
+        let broaden = max_abs_diff(&t_ref, &t_nores);
+        assert!(
+            broaden > 1e-3 * max_abs(&t_nores),
+            "resolution kernel must broaden the spectrum non-trivially (got {broaden:.3e})"
+        );
+
+        let model = TransmissionFitModel::new(
+            energies.clone(),
+            vec![data],
+            temperature,
+            Some(Arc::clone(&inst)),
+            (vec![0], vec![1.0]),
+            Some(1), // temperature_index → exercises the cached temperature path
+            None,
+        )
+        .unwrap();
+        let t_model = model.evaluate(&[thickness, temperature]).unwrap();
+
+        let err = max_abs_diff(&t_model, &t_ref);
+        assert!(
+            err < 1e-9,
+            "aux-grid TransmissionFitModel temperature path must match \
+             forward_model over the full grid (got {err:.3e})"
+        );
+    }
+
+    /// Issue #608: `TransmissionFitModel::analytical_jacobian` (cached temp path)
+    /// forms density and temperature inner derivatives on the auxiliary grid;
+    /// both columns must match central finite differences of `evaluate`.
+    #[test]
+    fn issue_608_transmission_fit_temp_path_jacobian_matches_fd() {
+        use nereids_physics::resolution::ResolutionFunction;
+
+        let data = u238_single_resonance();
+        let thickness = 0.0005;
+        let temperature = 300.0;
+        let energies: Vec<f64> = (0..401).map(|i| 4.0 + (i as f64) * 0.015).collect();
+        let inst = Arc::new(InstrumentParams {
+            resolution: ResolutionFunction::Gaussian(
+                nereids_physics::resolution::ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
+            ),
+        });
+
+        let model = TransmissionFitModel::new(
+            energies.clone(),
+            vec![data],
+            temperature,
+            Some(Arc::clone(&inst)),
+            (vec![0], vec![1.0]),
+            Some(1),
+            None,
+        )
+        .unwrap();
+
+        let params = [thickness, temperature];
+        // evaluate() populates the broadened-σ cache at these params; the
+        // analytical jacobian reads that cache, so compute it BEFORE any FD
+        // perturbation mutates the cache.
+        let y0 = model.evaluate(&params).unwrap();
+        let free = [0usize, 1usize];
+        let jac = model
+            .analytical_jacobian(&params, &free, &y0)
+            .expect("analytical jacobian must be available with resolution + aux grid");
+
+        // Per-parameter central-FD step (absolute): density ~5e-4, temperature 300 K.
+        let steps = [1e-7, 1e-2];
+        for (col, &p_idx) in free.iter().enumerate() {
+            let h = steps[col];
+            let mut pp = params;
+            let mut pm = params;
+            pp[p_idx] += h;
+            pm[p_idx] -= h;
+            let yp = model.evaluate(&pp).unwrap();
+            let ym = model.evaluate(&pm).unwrap();
+            let mut scale = 0.0f64;
+            let mut max_err = 0.0f64;
+            for i in 0..y0.len() {
+                let fd = (yp[i] - ym[i]) / (2.0 * h);
+                let an = jac.get(i, col);
+                scale = scale.max(an.abs());
+                max_err = max_err.max((fd - an).abs());
+            }
+            let rel = max_err / scale.max(1e-30);
+            assert!(
+                rel < 1e-5,
+                "analytical Jacobian column {col} must match central FD (rel err {rel:.3e})"
+            );
+        }
+    }
+
+    /// Issue #608 (review round 1): EnergyScale must evaluate the TRUE σ at the
+    /// corrected energies on the auxiliary grid — INCLUDING the boundary
+    /// extension points — exactly like `forward_model`, not clamp a precomputed
+    /// σ.  With the U-238 resonance near the grid EDGE (where the pre-fix clamp
+    /// deviated most) and Gaussian resolution active, EnergyScale at identity
+    /// calibration must match `forward_model` — an independent oracle that
+    /// evaluates σ inline — to machine precision over the FULL grid.  This is the
+    /// non-circular replacement for the previous flat-σ/clamp-oracle test (which
+    /// could not detect the boundary deviation).
+    #[test]
+    fn issue_608_energy_scale_aux_grid_true_sigma_matches_forward_model() {
+        use nereids_physics::resolution::ResolutionFunction;
+
+        let data = u238_single_resonance();
+        let density = 0.01;
+        // Grid placing the U-238 resonance (~6.67 eV) near the UPPER edge, so σ
+        // is strongly non-flat at the boundary — exactly where clamping (the
+        // pre-#608 behaviour) deviated from true physics.
+        let energies: Vec<f64> = (0..121).map(|i| 5.0 + (i as f64) * 0.015).collect();
+        let inst = Arc::new(InstrumentParams {
+            resolution: ResolutionFunction::Gaussian(
+                nereids_physics::resolution::ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
+            ),
+        });
+
+        let model = make_energy_scale_u238(energies.clone(), Some(Arc::clone(&inst)));
+        let t_es = model.evaluate(&[density, 0.0, 1.0]).unwrap();
+
+        // Independent oracle: forward_model evaluates σ inline on the aux grid.
+        let sample = SampleParams::new(300.0, vec![(data, density)]).unwrap();
+        let t_ref = transmission::forward_model(&energies, &sample, Some(&inst)).unwrap();
+
+        // Non-vacuity: the resolution kernel must broaden the spectrum.
+        let t_nores = transmission::forward_model(&energies, &sample, None).unwrap();
+        let broaden = max_abs_diff(&t_ref, &t_nores);
+        assert!(
+            broaden > 1e-3 * max_abs(&t_nores),
+            "resolution kernel must broaden the spectrum non-trivially (got {broaden:.3e})"
+        );
+
+        // True-σ aux-grid EnergyScale matches forward_model over the FULL grid,
+        // including the resonance-near-edge boundary where the old clamp failed.
+        let err = max_abs_diff(&t_es, &t_ref);
+        assert!(
+            err < 1e-9,
+            "EnergyScale identity-calibration evaluate must match forward_model to \
+             machine precision over the full grid (got {err:.3e})"
+        );
+    }
+
+    /// Issue #608 (R3): the GROUPED energy-scale path — multiple isotopes mapped
+    /// to ONE density parameter with non-unity ratios — is reachable in
+    /// production (`with_groups` + `fit_energy_scale`) but was exercised by no
+    /// test; every other energy-scale test used a single isotope
+    /// (`density_indices=[0]`, ratio 1.0).  Build two DISTINCT isotopes sharing
+    /// density param 0 with ratios (0.7, 0.3) and verify the per-member
+    /// Beer-Lambert accumulation (`Σᵢ n·ratioᵢ·σᵢ`) matches `forward_model` with
+    /// per-isotope effective densities — plus an FD check on the single shared
+    /// density column.
+    #[test]
+    fn issue_608_energy_scale_grouped_density_matches_forward_model() {
+        use nereids_endf::resonance::test_support::synthetic_single_resonance;
+        use nereids_physics::resolution::ResolutionFunction;
+
+        let iso0 = u238_single_resonance(); // resonance @ ~6.674 eV
+        let iso1 = synthetic_single_resonance(72, 178, 176.0, 7.5); // distinct @ 7.5 eV
+        let density = 0.01_f64;
+        let ratios = [0.7_f64, 0.3_f64];
+        // Grid overlapping BOTH resonances so σ0 ≠ σ1 (a swapped ratio / wrong
+        // index shifts T detectably — proven by the swap guard below).
+        let energies: Vec<f64> = (0..201).map(|i| 5.0 + (i as f64) * 0.02).collect();
+        let inst = Arc::new(InstrumentParams {
+            resolution: ResolutionFunction::Gaussian(
+                nereids_physics::resolution::ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
+            ),
+        });
+
+        let model = EnergyScaleTransmissionModel::new(
+            Arc::new(vec![iso0.clone(), iso1.clone()]),
+            Arc::new(vec![0, 0]), // both isotopes → density param 0 (grouped)
+            Arc::new(vec![ratios[0], ratios[1]]),
+            300.0,
+            energies.clone(),
+            25.0,
+            1, // t0 index
+            2, // l_scale index
+            Some(Arc::clone(&inst)),
+        );
+        let params = [density, 0.0, 1.0]; // identity calibration (t0=0, l_scale=1)
+        let t_es = model.evaluate(&params).unwrap();
+
+        // Independent oracle: forward_model with per-isotope effective areal
+        // densities n·ratioᵢ.  Beer-Lambert is additive over isotopes, so the
+        // grouped model (one density param × per-iso ratio) must equal a two-
+        // isotope sample with densities (n·0.7, n·0.3).
+        let sample = SampleParams::new(
+            300.0,
+            vec![
+                (iso0.clone(), density * ratios[0]),
+                (iso1.clone(), density * ratios[1]),
+            ],
+        )
+        .unwrap();
+        let t_ref = transmission::forward_model(&energies, &sample, Some(&inst)).unwrap();
+
+        // Non-vacuity: the kernel must broaden the grouped spectrum.
+        let t_nores = transmission::forward_model(&energies, &sample, None).unwrap();
+        assert!(
+            max_abs_diff(&t_ref, &t_nores) > 1e-3 * max_abs(&t_nores),
+            "resolution kernel must broaden the grouped spectrum non-trivially"
+        );
+
+        // Discrimination: swapping the two ratios MUST change T (proves σ0 ≠ σ1
+        // over the grid, so the match assertion below is sensitive to a ratio /
+        // index mix-up in the per-member accumulation — i.e. non-vacuous).
+        let model_swapped = EnergyScaleTransmissionModel::new(
+            Arc::new(vec![iso0.clone(), iso1.clone()]),
+            Arc::new(vec![0, 0]),
+            Arc::new(vec![ratios[1], ratios[0]]), // swapped
+            300.0,
+            energies.clone(),
+            25.0,
+            1,
+            2,
+            Some(Arc::clone(&inst)),
+        );
+        let t_swapped = model_swapped.evaluate(&params).unwrap();
+        assert!(
+            max_abs_diff(&t_es, &t_swapped) > 1e-4,
+            "swapping the two density ratios must change T (else the test could \
+             not distinguish the ratio→isotope assignment)"
+        );
+
+        // Grouped evaluate matches the independent oracle to machine precision.
+        let err = max_abs_diff(&t_es, &t_ref);
+        assert!(
+            err < 1e-9,
+            "grouped EnergyScale (2 isotopes → 1 density param, ratios {ratios:?}) \
+             must match forward_model with per-isotope effective densities to \
+             machine precision (got {err:.3e})"
+        );
+
+        // FD check on the single shared density column: ∂T/∂n accumulates
+        // ratioᵢ·σᵢ over BOTH grouped isotopes.
+        let free = vec![0usize];
+        let jac = model
+            .analytical_jacobian(&params, &free, &t_es)
+            .expect("Jacobian should be available");
+        let h = 1e-7;
+        let mut pp = params;
+        let mut pm = params;
+        pp[0] += h;
+        pm[0] -= h;
+        let yp = model.evaluate(&pp).unwrap();
+        let ym = model.evaluate(&pm).unwrap();
+        for row in 0..energies.len() {
+            let fd = (yp[row] - ym[row]) / (2.0 * h);
+            let anal = jac.get(row, 0);
+            let abs_err = (anal - fd).abs();
+            let rel_err = abs_err / fd.abs().max(1e-15);
+            assert!(
+                rel_err < 1e-3 || abs_err < 1e-8,
+                "grouped density col bin {row}: anal={anal:.6e} fd={fd:.6e} rel={rel_err:.2e}"
             );
         }
     }
@@ -4806,19 +5408,32 @@ mod tests {
     // ── EnergyScaleTransmissionModel tests ──
 
     /// Verify that corrected_energies shifts the grid correctly.
+    /// Build a single-isotope (U-238) EnergyScale model for tests: density at
+    /// param 0, t0 at param 1, l_scale at param 2.  Issue #608: σ is evaluated
+    /// from the resonance at the corrected energies (matching forward_model), so
+    /// test grids should overlap the U-238 resonance (~6.67 eV) for non-trivial
+    /// σ.  Temperature 300 K, flight path 25 m.
+    fn make_energy_scale_u238(
+        energies: Vec<f64>,
+        instrument: Option<Arc<InstrumentParams>>,
+    ) -> EnergyScaleTransmissionModel {
+        EnergyScaleTransmissionModel::new(
+            Arc::new(vec![u238_single_resonance()]),
+            Arc::new(vec![0]),
+            Arc::new(vec![1.0]),
+            300.0,
+            energies,
+            25.0,
+            1,
+            2,
+            instrument,
+        )
+    }
+
     #[test]
     fn energy_scale_corrected_energies() {
-        let xs = vec![vec![1.0; 5]];
         let energies = vec![10.0, 20.0, 50.0, 100.0, 200.0];
-        let model = EnergyScaleTransmissionModel::new(
-            std::sync::Arc::new(xs),
-            std::sync::Arc::new(vec![0]),
-            energies.clone(),
-            25.0,
-            1, // t0_index
-            2, // l_scale_index
-            None,
-        );
+        let model = make_energy_scale_u238(energies.clone(), None);
 
         // With t0=0, l_scale=1: corrected energies should equal nominal
         let e_corr = model.corrected_energies(0.0, 1.0);
@@ -4848,58 +5463,23 @@ mod tests {
         }
     }
 
-    /// Verify interpolate_xs produces correct results.
-    #[test]
-    fn energy_scale_interpolate_xs() {
-        let nominal_e = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-        let xs = vec![10.0, 20.0, 30.0, 40.0, 50.0];
-
-        // Exact grid points
-        let result =
-            EnergyScaleTransmissionModel::interpolate_xs(&nominal_e, &xs, &[1.0, 3.0, 5.0]);
-        assert!((result[0] - 10.0).abs() < 1e-10);
-        assert!((result[1] - 30.0).abs() < 1e-10);
-        assert!((result[2] - 50.0).abs() < 1e-10);
-
-        // Midpoints
-        let result = EnergyScaleTransmissionModel::interpolate_xs(&nominal_e, &xs, &[1.5, 2.5]);
-        assert!((result[0] - 15.0).abs() < 1e-10);
-        assert!((result[1] - 25.0).abs() < 1e-10);
-
-        // Out of range: clamp
-        let result = EnergyScaleTransmissionModel::interpolate_xs(&nominal_e, &xs, &[0.5, 6.0]);
-        assert!((result[0] - 10.0).abs() < 1e-10); // below range
-        assert!((result[1] - 50.0).abs() < 1e-10); // above range
-    }
-
-    /// Verify evaluate returns identity at t0=0, l_scale=1.
+    /// Issue #608: at identity calibration (t0=0, l_scale=1) the corrected grid
+    /// equals the nominal grid, so EnergyScale must evaluate the SAME true σ as
+    /// `forward_model` — the independent oracle — to machine precision.
     #[test]
     fn energy_scale_evaluate_identity() {
-        let xs = vec![vec![1.0, 2.0, 3.0, 2.0, 1.5]];
-        let energies = vec![4.0, 9.0, 16.0, 25.0, 36.0];
-        let model_es = EnergyScaleTransmissionModel::new(
-            std::sync::Arc::new(xs.clone()),
-            std::sync::Arc::new(vec![0]),
-            energies.clone(),
-            25.0,
-            1, // t0_index
-            2, // l_scale_index
-            None,
-        );
+        let energies: Vec<f64> = (0..201).map(|i| 4.0 + (i as f64) * 0.03).collect();
+        let density = 0.01;
+        let model_es = make_energy_scale_u238(energies.clone(), None);
+        let y_es = model_es.evaluate(&[density, 0.0, 1.0]).unwrap();
 
-        let model_pre = make_precomputed(xs, vec![0]);
+        let sample = SampleParams::new(300.0, vec![(u238_single_resonance(), density)]).unwrap();
+        let y_ref = transmission::forward_model(&energies, &sample, None).unwrap();
 
-        let density = 0.1;
-        let params_es = [density, 0.0, 1.0]; // t0=0, l_scale=1
-        let params_pre = [density];
-
-        let y_es = model_es.evaluate(&params_es).unwrap();
-        let y_pre = model_pre.evaluate(&params_pre).unwrap();
-
-        for (i, (&a, &b)) in y_es.iter().zip(y_pre.iter()).enumerate() {
+        for (i, (&a, &b)) in y_es.iter().zip(y_ref.iter()).enumerate() {
             assert!(
                 (a - b).abs() < 1e-10,
-                "bin {i}: energy_scale={a}, precomputed={b}"
+                "bin {i}: energy_scale={a}, forward_model={b}"
             );
         }
     }
@@ -4907,21 +5487,18 @@ mod tests {
     /// Jacobian for energy-scale model: density columns must match FD.
     #[test]
     fn energy_scale_jacobian_density_matches_fd() {
-        let xs = vec![vec![1.0, 2.0, 3.0, 2.0, 1.5]];
-        let energies = vec![4.0, 9.0, 16.0, 25.0, 36.0];
-        let model = EnergyScaleTransmissionModel::new(
-            std::sync::Arc::new(xs),
-            std::sync::Arc::new(vec![0]),
-            energies.clone(),
-            25.0,
-            1,
-            2,
-            None,
-        );
+        let energies: Vec<f64> = (0..101).map(|i| 4.0 + (i as f64) * 0.06).collect();
+        let model = make_energy_scale_u238(energies.clone(), None);
 
-        let params = [0.1, 0.5, 1.002]; // density, t0, l_scale
+        let params = [0.01, 0.5, 1.002]; // density, t0, l_scale
         let y = model.evaluate(&params).unwrap();
-        let free = vec![0, 1, 2];
+        // Density column only (matching this test's name).  The energy-scale
+        // (t0 / L_scale) columns are FD-based and method-dependent; they are
+        // covered against a matching-h FD2 reference by the partial_gal_* tests.
+        // Comparing them to a different-h FD here would be apples-to-oranges,
+        // especially on the sharp U-238 resonance (#608 review-round-1 migration
+        // to true-σ resonance data).
+        let free = vec![0];
         let jac = model
             .analytical_jacobian(&params, &free, &y)
             .expect("Jacobian should be available");
@@ -4954,26 +5531,14 @@ mod tests {
     /// at 0) to avoid degenerate local minima.
     #[test]
     fn energy_scale_fit_recovers_l_scale() {
-        let n = 200;
-        let energies: Vec<f64> = (0..n).map(|i| 10.0 + (i as f64) * 0.5).collect();
-        // Breit-Wigner-like cross-section: σ = 100 / ((E-50)^2 + 1)
-        let xs: Vec<f64> = energies
-            .iter()
-            .map(|&e| 100.0 / ((e - 50.0).powi(2) + 1.0))
-            .collect();
+        // Dense grid over the sharp U-238 resonance (~6.67 eV) so the energy
+        // shift is unambiguous.  Only l_scale is varied (t0 fixed at 0).
+        let energies: Vec<f64> = (0..200).map(|i| 4.0 + (i as f64) * 0.03).collect();
 
         let true_density = 0.001;
         let true_ls = 1.003;
 
-        let model = EnergyScaleTransmissionModel::new(
-            std::sync::Arc::new(vec![xs]),
-            std::sync::Arc::new(vec![0]),
-            energies,
-            25.0,
-            1, // t0_index (fixed at 0)
-            2, // l_scale_index
-            None,
-        );
+        let model = make_energy_scale_u238(energies, None);
         let true_params = [true_density, 0.0, true_ls];
         let y_obs = model.evaluate(&true_params).unwrap();
         let sigma = vec![0.001; y_obs.len()];
@@ -5019,27 +5584,17 @@ mod tests {
     /// dependence).  Issue #489.
     #[test]
     fn partial_gal_no_resolution_matches_fd2() {
-        let xs = vec![vec![1.0, 2.0, 3.0, 2.0, 1.5]];
-        let energies = vec![4.0, 9.0, 16.0, 25.0, 36.0];
+        let energies: Vec<f64> = (0..101).map(|i| 4.0 + (i as f64) * 0.06).collect();
         // Pin both reference and alt models explicitly via
         // `with_jacobian_method` so the test is independent of the
         // process-global `NEREIDS_TZERO_JACOBIAN` env var.  Without
         // pinning, the post-#489 default of `PartialGal` would make
         // the "FD2 reference" actually run partial-GAL (vacuous
-        // self-comparison), and `NEREIDS_TZERO_JACOBIAN=chain` would
-        // run chain-rule against partial-GAL (wrong comparison).
-        let mut model = EnergyScaleTransmissionModel::new(
-            std::sync::Arc::new(xs),
-            std::sync::Arc::new(vec![0]),
-            energies.clone(),
-            25.0,
-            1, // t0_index
-            2, // l_scale_index
-            None,
-        )
-        .with_jacobian_method(EnergyScaleJacobianMethod::FiniteDifference);
+        // self-comparison).
+        let mut model = make_energy_scale_u238(energies.clone(), None)
+            .with_jacobian_method(EnergyScaleJacobianMethod::FiniteDifference);
 
-        let params = [0.1, 0.05, 1.002]; // density, t0, l_scale
+        let params = [0.001, 0.05, 1.002]; // density, t0, l_scale
         let free = vec![0, 1, 2];
 
         // FD2 reference Jacobian (explicitly pinned above).
@@ -5073,20 +5628,31 @@ mod tests {
                 "t0 bin {i}: fd2={fd2:.6e} pg={pg:.6e}"
             );
         }
-        // L_scale column: identical to FD2 within FD truncation noise
-        // when there is no resolution. The rank-1 derivation is exact
-        // for this configuration; the residual L₂ error reflects only
-        // the central-FD `O(h²)` floor on each method's t0 column.
+        // L_scale column: the rank-1 derivation is analytically exact without
+        // resolution.  The only residual vs FD2 is the difference in central-FD
+        // truncation — PartialGal's L_scale inherits the t0 step (h=1e-4), FD2
+        // takes a direct L_scale step (h=1e-7).  On the sharp U-238 resonance
+        // that truncation dominates small-derivative TAIL bins (per-bin rel can
+        // hit a few % there while contributing negligibly to the spectrum), so
+        // compare the aggregate relative L₂ — the same robust metric the
+        // with-resolution sister test uses.  Measured ~8.0e-3 here; the bound
+        // (2.5e-2) gives ~3× headroom yet is far below the O(1) a broken rank-1
+        // identity would produce.
+        let mut num_sq = 0.0_f64;
+        let mut den_sq = 0.0_f64;
         for i in 0..energies.len() {
             let fd2 = jac_fd2.get(i, 2);
             let pg = jac_pg.get(i, 2);
-            let abs_err = (fd2 - pg).abs();
-            let rel_err = abs_err / fd2.abs().max(1e-15);
-            assert!(
-                rel_err < 1e-3 || abs_err < 1e-8,
-                "L_scale bin {i}: fd2={fd2:.6e} pg={pg:.6e} rel={rel_err:.2e}"
-            );
+            let diff = pg - fd2;
+            num_sq += diff * diff;
+            den_sq += fd2 * fd2;
         }
+        let rel_l2 = (num_sq / den_sq.max(1e-30)).sqrt();
+        assert!(
+            rel_l2 < 2.5e-2,
+            "L_scale rank-1 vs FD2 rel L₂ = {rel_l2:.3e} (expected ≪ 1 without \
+             resolution — the rank-1 identity is exact up to FD truncation)"
+        );
     }
 
     /// When only L_scale is free (t0 fixed), partial-GAL falls through
@@ -5095,20 +5661,11 @@ mod tests {
     /// dispatch logic correctly handles this case.
     #[test]
     fn partial_gal_l_scale_only_falls_through_to_fd() {
-        let xs = vec![vec![1.0, 2.0, 3.0, 2.0, 1.5]];
-        let energies = vec![4.0, 9.0, 16.0, 25.0, 36.0];
-        let model = EnergyScaleTransmissionModel::new(
-            std::sync::Arc::new(xs),
-            std::sync::Arc::new(vec![0]),
-            energies.clone(),
-            25.0,
-            1, // t0_index (fixed)
-            2, // l_scale_index (free)
-            None,
-        )
-        .with_jacobian_method(EnergyScaleJacobianMethod::PartialGal);
+        let energies: Vec<f64> = (0..101).map(|i| 4.0 + (i as f64) * 0.06).collect();
+        let model = make_energy_scale_u238(energies.clone(), None)
+            .with_jacobian_method(EnergyScaleJacobianMethod::PartialGal);
 
-        let params = [0.1, 0.0, 1.002];
+        let params = [0.001, 0.0, 1.002];
         let free = vec![0, 2]; // density + L_scale (no t0)
         let y = model.evaluate(&params).unwrap();
         let jac = model
@@ -5147,18 +5704,9 @@ mod tests {
     /// FD-tolerance comparison against FD2 stays apples-to-apples.
     #[test]
     fn partial_gal_l_scale_zero_falls_through_to_finite_jacobian() {
-        let xs = vec![vec![1.0, 2.0, 3.0, 2.0, 1.5]];
-        let energies = vec![4.0, 9.0, 16.0, 25.0, 36.0];
-        let mut model = EnergyScaleTransmissionModel::new(
-            std::sync::Arc::new(xs),
-            std::sync::Arc::new(vec![0]),
-            energies.clone(),
-            25.0,
-            1, // t0_index
-            2, // l_scale_index
-            None,
-        )
-        .with_jacobian_method(EnergyScaleJacobianMethod::FiniteDifference);
+        let energies: Vec<f64> = (0..101).map(|i| 4.0 + (i as f64) * 0.06).collect();
+        let mut model = make_energy_scale_u238(energies.clone(), None)
+            .with_jacobian_method(EnergyScaleJacobianMethod::FiniteDifference);
 
         // l_scale = 0.0 — well below `L_SCALE_EPSILON = 1e-12` — so the
         // partial-GAL guard fires and falls through to FD.
@@ -5168,8 +5716,8 @@ mod tests {
         // *not* the older `t0 + h >= t0_limit` precompute fallthrough
         // (PR #498).  Specifically:
         //
-        //   - `min_tof_us = tof_factor * 25.0 / sqrt(36.0) ≈ 301 µs`
-        //   - `t0 + h = 0.05 + 1e-4 = 0.0501 µs ≪ 301 * (1 - 1e-12)`
+        //   - `min_tof_us = tof_factor * 25.0 / sqrt(max_E ≈ 10.0) ≈ 5.7e2 µs`
+        //   - `t0 + h = 0.05 + 1e-4 = 0.0501 µs ≪ min_tof * (1 - 1e-12)`
         //
         // So `partial_gal_t0_column = Some(...)` (not `None`), the
         // partial-GAL block at line ~2208 enters, and the L_scale
@@ -5180,7 +5728,7 @@ mod tests {
         // `partial_gal_t0_column.is_some()` still holds for this test
         // — otherwise the regression target shifts to a different
         // code path.
-        let params = [0.1, 0.05, 0.0]; // density, t0, l_scale = 0
+        let params = [0.001, 0.05, 1e-13]; // density, t0, l_scale ≈ 0 (< L_SCALE_EPSILON)
         let free = vec![0, 1, 2];
 
         // FD2 reference Jacobian.  FD2 computes each column via its
@@ -5254,11 +5802,10 @@ mod tests {
     /// bound as the no-resolution test (the resolution operator does
     /// not couple into those columns differently).  The L_scale column
     /// is checked via relative L₂ norm against the FD2 reference with
-    /// tolerance `PARTIAL_GAL_REL_L2_TOLERANCE = 3e-3`.  On the
-    /// synthetic grid below (kernel widened in round-1 review so the
-    /// kernel spans several bins and meaningfully broadens the
-    /// resonance) the measured relative L₂ is `~9.3e-4` — the
-    /// tolerance gives roughly 3× headroom over the current
+    /// tolerance `PARTIAL_GAL_REL_L2_TOLERANCE = 1.5e-5`.  On the U-238
+    /// resonance grid below (kernel sized so it spans several bins and
+    /// meaningfully broadens the resonance) the measured relative L₂ is
+    /// `~4.3e-6` — the tolerance gives roughly 3× headroom over the current
     /// measurement, tight enough to catch a non-trivial regression
     /// of the rank-1 simplification while loose enough to absorb
     /// FD-truncation noise.  An upstream pre-check (see below)
@@ -5279,75 +5826,36 @@ mod tests {
         // loose enough to absorb FD truncation noise.  See rustdoc
         // above for why this bound is conservative rather than the
         // tighter empirical 0.1·σ_Fisher seen on real workloads.
-        const PARTIAL_GAL_REL_L2_TOLERANCE: f64 = 3e-3;
+        const PARTIAL_GAL_REL_L2_TOLERANCE: f64 = 1.5e-5;
 
-        // 64-point uniform energy grid spanning 4.0–36.0 eV.
-        let n: usize = 64;
-        let e_lo = 4.0_f64;
-        let e_hi = 36.0_f64;
-        let step = (e_hi - e_lo) / (n as f64 - 1.0);
-        let energies: Vec<f64> = (0..n).map(|i| e_lo + (i as f64) * step).collect();
+        // Dense grid over the sharp U-238 resonance (~6.67 eV) so the σ feature
+        // is well resolved and the resolution kernel meaningfully broadens it.
+        let energies: Vec<f64> = (0..101).map(|i| 4.0 + (i as f64) * 0.06).collect();
 
-        // Synthetic "spiky" cross-section: 1 + 10 * exp(-(E - 20)² / 4).
-        // Gaussian "resonance" centred at 20 eV with σ² = 2 (FWHM ≈ 3.33 eV).
-        let xs_vec: Vec<f64> = energies
-            .iter()
-            .map(|&e| {
-                let d = e - 20.0;
-                1.0 + 10.0 * (-(d * d) / 4.0).exp()
-            })
-            .collect();
-        let xs = vec![xs_vec];
-
-        // Gaussian resolution kernel — sized to be NON-TRIVIAL on the
-        // chosen grid.  Original review (PR #544 round 1) found that
-        // the existing-test parameters (0.5 µs / 0.005 m) produced a
-        // kernel σ_E ≈ 0.05 eV at 20 eV, smaller than one grid bin
-        // (0.5 eV) — the `resolution_broaden_presorted` fast path
-        // then fell back to passthrough and the comparison was
-        // vacuous.  These widened values (5.0 µs / 0.05 m) give
-        // σ_E ≈ 0.5 eV ≈ 1 bin, so the kernel spans several bins and
-        // actually broadens the resonance feature.
+        // Gaussian resolution kernel sized to be NON-TRIVIAL on this grid (it
+        // broadens the U-238 resonance by ~1%, verified by the pre-check below).
+        // PR #544 round 1 caught a kernel-too-narrow vacuous-test regression;
+        // the pre-check guards against re-introducing it.
         let instrument = Some(Arc::new(InstrumentParams {
             resolution: ResolutionFunction::Gaussian(
-                ResolutionParams::new(25.0, 5.0, 0.05, 0.0).unwrap(),
+                ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
             ),
         }));
 
         // Pin FD2 first so the comparison is independent of the
         // process-global `NEREIDS_TZERO_JACOBIAN` env var, matching
         // the pattern used by `partial_gal_no_resolution_matches_fd2`.
-        let mut model = EnergyScaleTransmissionModel::new(
-            std::sync::Arc::new(xs.clone()),
-            std::sync::Arc::new(vec![0]),
-            energies.clone(),
-            25.0,
-            1, // t0_index
-            2, // l_scale_index
-            instrument,
-        )
-        .with_jacobian_method(EnergyScaleJacobianMethod::FiniteDifference);
+        let mut model = make_energy_scale_u238(energies.clone(), instrument)
+            .with_jacobian_method(EnergyScaleJacobianMethod::FiniteDifference);
 
-        let params = [0.1, 0.05, 1.002]; // density, t0, l_scale
+        let params = [0.001, 0.05, 1.002]; // density, t0, l_scale
         let free = vec![0, 1, 2];
 
-        // Pre-check: confirm the resolution kernel actually broadens
-        // the spectrum on this grid.  Round-1 review (PR #544) caught
-        // a kernel-too-narrow regression where this assertion would
-        // have failed; pin it explicitly so any future tuning of the
-        // grid or kernel parameters that re-introduces a vacuous
-        // kernel fails fast with a clear message rather than
-        // silently degrading into a no-resolution test.
-        let model_no_resolution = EnergyScaleTransmissionModel::new(
-            std::sync::Arc::new(xs),
-            std::sync::Arc::new(vec![0]),
-            energies.clone(),
-            25.0,
-            1,
-            2,
-            None,
-        )
-        .with_jacobian_method(EnergyScaleJacobianMethod::FiniteDifference);
+        // Pre-check: confirm the resolution kernel actually broadens the
+        // spectrum on this grid, so the comparison is not a vacuous
+        // no-resolution-in-disguise test (PR #544 round 1).
+        let model_no_resolution = make_energy_scale_u238(energies.clone(), None)
+            .with_jacobian_method(EnergyScaleJacobianMethod::FiniteDifference);
         let t_no_res = model_no_resolution.evaluate(&params).unwrap();
         let t_with_res = model.evaluate(&params).unwrap();
         let diff_inf = t_no_res
