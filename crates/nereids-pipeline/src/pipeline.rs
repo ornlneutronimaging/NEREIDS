@@ -1736,12 +1736,24 @@ fn peak_match_energy_scale_seed(
     // corrected ≈ measured), keeping the deepest dip per resonance.  Reject a
     // dip that does not sit UNAMBIGUOUSLY near a resonance — within half the
     // minimum inter-resonance spacing — so a spurious/mis-matched dip drops out
-    // rather than poisoning the linear fit (issue #608 R2).  `res_e` is sorted.
-    let match_tol = 0.5
-        * res_e
-            .windows(2)
-            .map(|w| (w[1] - w[0]).abs())
-            .fold(f64::INFINITY, f64::min);
+    // rather than poisoning the linear fit (issue #608 R2).  `res_e` is sorted
+    // and de-duplicated.
+    //
+    // Floor `match_tol` at the energy-grid resolution (Copilot PR #609): a dip
+    // is localized to ~one grid step, so a single closely-spaced resonance pair
+    // must not collapse the GLOBAL tolerance toward 0 and reject dips at
+    // well-separated resonances.  Dedup already stops exact duplicates from
+    // zeroing it; the floor additionally guards distinct near-degenerate
+    // energies.  Well-separated resonances keep `0.5·min_spacing ≫ grid_res`, so
+    // the floor is inert in the common case.
+    let min_spacing = res_e
+        .windows(2)
+        .map(|w| (w[1] - w[0]).abs())
+        .fold(f64::INFINITY, f64::min);
+    let mut grid_steps: Vec<f64> = energies.windows(2).map(|w| (w[1] - w[0]).abs()).collect();
+    grid_steps.sort_by(f64::total_cmp);
+    let grid_res = grid_steps.get(grid_steps.len() / 2).copied().unwrap_or(0.0);
+    let match_tol = (0.5 * min_spacing).max(grid_res);
     let mut best: Vec<Option<(f64, f64)>> = vec![None; res_e.len()];
     for &(e_dip, depth) in &dips {
         let Some((k, &re)) = res_e
@@ -3141,6 +3153,61 @@ mod tests {
             .is_none(),
             "a featureless heavily-absorbing spectrum has no resonance dips ⇒ \
              seed must return None (cold-start fallback)"
+        );
+    }
+
+    /// Issue #608 (Copilot PR #609): duplicate resonance center energies — two
+    /// isotopes with a resonance at the SAME energy in a grouped fit — must not
+    /// collapse the seed's `match_tol` to 0.  Pre-fix `resonance_center_energies`
+    /// returned `[7.8, 7.8, 16.9]` ⇒ minimum spacing 0 ⇒ `match_tol` 0 ⇒ every
+    /// dip rejected ⇒ seed silently `None` (cold start).  With the dedup + grid
+    /// floor the seed recovers the (identity) calibration.
+    #[test]
+    fn peak_match_energy_scale_seed_handles_duplicate_resonance_energies() {
+        use nereids_physics::transmission::{SampleParams, forward_model};
+
+        // Two isotopes share an EXACT resonance energy (7.8); a third is distinct.
+        let iso_a = synthetic_single_resonance(72, 178, 176.0, 7.8);
+        let iso_b = synthetic_single_resonance(74, 184, 182.0, 7.8); // duplicate energy
+        let iso_c = synthetic_single_resonance(40, 90, 89.0, 16.9); // distinct
+        let energies: Vec<f64> = (0..900).map(|i| 4.0 + (i as f64) * 0.02).collect();
+        let density = 0.05_f64;
+        let sample = SampleParams::new(
+            293.6,
+            vec![
+                (iso_a.clone(), density),
+                (iso_b.clone(), density),
+                (iso_c.clone(), density),
+            ],
+        )
+        .unwrap();
+        let t_obs = forward_model(&energies, &sample, None).unwrap();
+        let config = UnifiedFitConfig::new(
+            energies.clone(),
+            vec![iso_a, iso_b, iso_c],
+            vec!["A".into(), "B".into(), "C".into()],
+            293.6,
+            None,
+            vec![density, density, density],
+        )
+        .unwrap()
+        .with_energy_scale(0.0, 1.0, 25.0);
+        let (t0, l_scale) = peak_match_energy_scale_seed(
+            &t_obs,
+            config.energies(),
+            &config,
+            25.0,
+            (-10.0, 10.0),
+            (0.99, 1.01),
+        )
+        .expect(
+            "duplicate resonance energies must not collapse match_tol to 0 — \
+             seed should be Some (was silently None pre-fix)",
+        );
+        assert!(t0.abs() < 0.5, "identity calibration: t0 ≈ 0, got {t0}");
+        assert!(
+            (l_scale - 1.0).abs() < 5e-3,
+            "identity calibration: L_scale ≈ 1, got {l_scale}"
         );
     }
 

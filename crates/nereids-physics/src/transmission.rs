@@ -144,8 +144,8 @@ fn extract_resonance_widths(resonance_data: &[&ResonanceData]) -> Vec<(f64, f64)
     pairs
 }
 
-/// Resonance center energies (eV) across every isotope and formalism, sorted
-/// ascending.
+/// Distinct resonance center energies (eV) across every isotope and formalism,
+/// sorted ascending.
 ///
 /// Used by the energy-scale calibration peak-matching seed (issue #608): the
 /// (t0, L_scale) calibration is recovered by matching measured transmission-dip
@@ -153,12 +153,20 @@ fn extract_resonance_widths(resonance_data: &[&ResonanceData]) -> Vec<(f64, f64)
 /// `tof_measured = t0 + L_scale · tof_nominal`, which seeds the LM into the
 /// global-minimum basin of the (sharply non-convex, post-#608) calibration χ²
 /// surface — a basin too thin for a cold start or grid scan to find reliably.
+///
+/// **Deduplicated** (Copilot PR #609): two resonances at the same center energy
+/// (e.g. across isotopes in a grouped fit) are a single POSITION for dip
+/// matching — multiplicity is irrelevant — and a duplicate would drive the
+/// minimum inter-resonance spacing, and hence the seed's `match_tol`, to 0,
+/// rejecting every dip and silently dropping the seed to a cold start.
 pub fn resonance_center_energies(resonance_data: &[&ResonanceData]) -> Vec<f64> {
     let mut e: Vec<f64> = extract_resonance_widths(resonance_data)
         .into_iter()
         .map(|(energy, _gd)| energy)
         .collect();
     e.sort_by(f64::total_cmp);
+    // Sorted ⇒ exact duplicates are adjacent; `dedup` removes them.
+    e.dedup();
     e
 }
 
