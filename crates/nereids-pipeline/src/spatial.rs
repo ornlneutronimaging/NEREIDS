@@ -2186,6 +2186,90 @@ mod tests {
         }
     }
 
+    /// Issue #608 (PR #609 coverage): `spatial_map_typed`'s `Some(cached)` +
+    /// aux-grid arm — when a caller PRE-SUPPLIES data-grid σ AND a Gaussian aux
+    /// grid is active, the working-grid σ is recomputed from resonance data (the
+    /// cached data σ cannot be de-extracted back onto the aux grid).  The
+    /// sibling Gaussian test exercises the `None` arm; this supplies precomputed
+    /// σ to hit the `Some(cached)` arm.
+    #[test]
+    fn test_spatial_map_typed_gaussian_aux_grid_with_precomputed_sigma() {
+        use nereids_physics::resolution::{ResolutionFunction, ResolutionParams};
+        use nereids_physics::transmission::{
+            SampleParams, broadened_cross_sections, forward_model,
+        };
+
+        let data = u238_single_resonance();
+        let true_density = 0.0005;
+        let temperature = 300.0;
+        let energies: Vec<f64> = (0..101).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let inst = Arc::new(InstrumentParams {
+            resolution: ResolutionFunction::Gaussian(
+                ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
+            ),
+        });
+        let sample = SampleParams::new(temperature, vec![(data.clone(), true_density)]).unwrap();
+        let t_1d = forward_model(&energies, &sample, Some(&inst)).unwrap();
+        let n_e = energies.len();
+        let sigma_1d: Vec<f64> = t_1d.iter().map(|&v| 0.01 * v.max(0.01)).collect();
+        let mut t_3d = Array3::zeros((n_e, 4, 4));
+        let mut u_3d = Array3::zeros((n_e, 4, 4));
+        for y in 0..4 {
+            for x in 0..4 {
+                for (i, (&t, &s)) in t_1d.iter().zip(sigma_1d.iter()).enumerate() {
+                    t_3d[[i, y, x]] = t;
+                    u_3d[[i, y, x]] = s;
+                }
+            }
+        }
+        // Pre-supply the Doppler-broadened, data-grid σ ⇒ the Some(cached) arm.
+        let data_sigma = broadened_cross_sections(
+            &energies,
+            std::slice::from_ref(&data),
+            temperature,
+            None,
+            None,
+        )
+        .unwrap();
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            temperature,
+            Some(ResolutionFunction::Gaussian(
+                ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
+            )),
+            vec![0.001],
+        )
+        .unwrap()
+        .with_precomputed_cross_sections(Arc::new(data_sigma))
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()));
+        let input = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+        let result = spatial_map_typed(&input, &config, None, None, None).unwrap();
+        assert_eq!(result.n_total, 16);
+        assert!(
+            result.n_converged >= 14,
+            "Some(cached)+aux path: {} / 16 pixels converged",
+            result.n_converged,
+        );
+        let d = &result.density_maps[0];
+        let conv = &result.converged_map;
+        let mean: f64 = d
+            .iter()
+            .zip(conv.iter())
+            .filter(|(_, c)| **c)
+            .map(|(d, _)| *d)
+            .sum::<f64>()
+            / result.n_converged.max(1) as f64;
+        assert!(
+            (mean - true_density).abs() / true_density < 0.10,
+            "Some(cached)+aux mean density: {mean}, true: {true_density}"
+        );
+    }
+
     #[test]
     fn test_spatial_map_typed_counts_kl_low_counts() {
         // I0=10: the regime where KL excels

@@ -2374,4 +2374,53 @@ mod tests {
         );
         assert!(ok.is_ok(), "valid thickness should succeed: {ok:?}");
     }
+
+    /// Issue #608 (PR #609 coverage): the working-grid `*_from_base` path's
+    /// input validation — `validate_base_xs` shape errors and the unsorted-grid
+    /// guard.  These error branches were untested (the temperature fit always
+    /// supplies well-formed, sorted inputs).
+    #[test]
+    fn from_base_working_grid_rejects_malformed_inputs() {
+        let rd = vec![u238_single_resonance()];
+        let energies: Vec<f64> = (0..21).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let n_e = energies.len();
+        let good_base = vec![vec![10.0f64; n_e]];
+        // base_xs isotope-count mismatch (2 rows vs 1 isotope).
+        let e1 = broadened_cross_sections_with_analytical_derivative_from_base(
+            &energies,
+            &[vec![10.0; n_e], vec![10.0; n_e]],
+            &rd,
+            300.0,
+            None,
+        )
+        .unwrap_err();
+        assert!(e1.to_string().contains("isotopes"), "got: {e1}");
+        // base_xs row-length mismatch.
+        let e2 = broadened_cross_sections_with_analytical_derivative_from_base(
+            &energies,
+            &[vec![10.0; n_e - 1]],
+            &rd,
+            300.0,
+            None,
+        )
+        .unwrap_err();
+        assert!(e2.to_string().contains("energies"), "got: {e2}");
+        // Unsorted energies + an instrument ⇒ the sorted-grid guard fires.
+        let inst = InstrumentParams {
+            resolution: resolution::ResolutionFunction::Gaussian(
+                resolution::ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
+            ),
+        };
+        let mut unsorted = energies.clone();
+        unsorted.swap(0, 1);
+        let e3 = broadened_cross_sections_with_analytical_derivative_from_base(
+            &unsorted,
+            &good_base,
+            &rd,
+            300.0,
+            Some(&inst),
+        )
+        .unwrap_err();
+        assert!(e3.to_string().contains("sorted"), "got: {e3}");
+    }
 }

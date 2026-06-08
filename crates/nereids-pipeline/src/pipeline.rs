@@ -5050,4 +5050,388 @@ mod tests {
             "expected too-narrow-range rejection; got: {msg}"
         );
     }
+
+    // ── Issue #608 (PR #609): Rust coverage for paths previously exercised only
+    //    via Python / the spatial-identity path (codecov/patch gap) ───────────
+
+    /// `evaluate_jacobian_and_fisher` (the research Fisher / `compute_model_jacobian`
+    /// entry point) was exercised only through the Python bindings, which the
+    /// Rust-only coverage run excludes — so its body, and the #608
+    /// compute-working-grid-σ branch, were uncovered.  Drive it with a
+    /// Gaussian-resolution config carrying NO precomputed σ: that exercises the
+    /// aux-grid σ build + the model construction + the analytical Jacobian /
+    /// Fisher assembly.
+    #[test]
+    fn evaluate_jacobian_and_fisher_gaussian_aux_grid() {
+        use nereids_physics::resolution::{ResolutionFunction, ResolutionParams};
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..101).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let n_e = energies.len();
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            300.0,
+            Some(ResolutionFunction::Gaussian(
+                ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
+            )),
+            vec![0.001],
+        )
+        .unwrap();
+        let flux = vec![5000.0; n_e];
+        let background = vec![10.0; n_e];
+        let result = evaluate_jacobian_and_fisher(&config, &flux, &background).unwrap();
+        assert_eq!(result.model_prediction.len(), n_e);
+        assert!(result.model_prediction.iter().all(|v| v.is_finite()));
+        assert_eq!(result.param_names.len(), 1, "one free density parameter");
+        // Density Fisher information must be finite + positive (well-posed
+        // measurement); the Jacobian endpoints must be finite.
+        let f00 = result.fisher.get(0, 0);
+        assert!(f00.is_finite() && f00 > 0.0, "Fisher[0,0] = {f00}");
+        assert!(result.jacobian.get(0, 0).is_finite());
+        assert!(result.jacobian.get(n_e - 1, 0).is_finite());
+    }
+
+    /// Non-spatial energy-scale fit through `fit_spectrum_typed` (LM
+    /// transmission): exercises `seed_energy_scale_in_params` +
+    /// `build_energy_scale_transmission_model` + the energy-scale LM path +
+    /// `t0_us` / `l_scale` result population.  Prior Rust coverage was
+    /// spatial-only on IDENTITY data; here we inject a NON-identity (t0,
+    /// L_scale) and confirm the wiring recovers the density (the (t0, L_scale)
+    /// valley is shallow, so we assert the physically-observable density, not
+    /// tight individual parameters — cf. the Python `TestFitEnergyScaleRecovery`
+    /// rationale).
+    #[test]
+    fn fit_spectrum_typed_energy_scale_lm_recovers_calibration() {
+        let data = hf178_mlbw_two_resonances(); // s-waves @ 7.8 + 16.9 eV
+        let energies: Vec<f64> = (0..700).map(|i| 4.0 + (i as f64) * 0.025).collect();
+        let true_density = 0.05_f64;
+        let (t0_true, ls_true) = (1.5_f64, 1.004_f64);
+        // Synthesize measured data with the injected calibration via the model
+        // (no resolution: dip POSITIONS drive the seed).
+        let model = EnergyScaleTransmissionModel::new(
+            Arc::new(vec![data.clone()]),
+            Arc::new(vec![0]),
+            Arc::new(vec![1.0]),
+            293.6,
+            energies.clone(),
+            25.0,
+            1,
+            2,
+            None,
+        );
+        let measured = model.evaluate(&[true_density, t0_true, ls_true]).unwrap();
+        let uncertainty = vec![1e-3; energies.len()];
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["Hf-178".into()],
+            293.6,
+            None,
+            vec![0.04], // start density away from truth (0.05) so recovery is real
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
+        .with_energy_scale(0.0, 1.0, 25.0); // cold (t0,L) start ⇒ the seed must correct it
+        let input = InputData::Transmission {
+            transmission: measured,
+            uncertainty,
+        };
+        let result = fit_spectrum_typed(&input, &config).unwrap();
+        let t0 = result
+            .t0_us
+            .expect("t0_us populated when fit_energy_scale=true");
+        let ls = result
+            .l_scale
+            .expect("l_scale populated when fit_energy_scale=true");
+        assert!(t0.is_finite() && ls.is_finite(), "t0={t0}, L={ls}");
+        assert!(result.converged, "energy-scale LM fit should converge");
+        assert!(
+            (result.densities[0] - true_density).abs() / true_density < 0.10,
+            "density: fitted={}, true={true_density}",
+            result.densities[0]
+        );
+    }
+
+    /// Non-spatial counts-KL energy-scale fit through `fit_spectrum_typed`:
+    /// exercises `seed_energy_scale_in_params`' KL transmission proxy
+    /// `(sample − bg)/(flux − bg)` + the counts-KL energy-scale dispatch —
+    /// uncovered by the Rust suite (Python + spatial-identity only).
+    #[test]
+    fn fit_spectrum_typed_energy_scale_counts_kl_seeds_via_proxy() {
+        let data = hf178_mlbw_two_resonances();
+        let energies: Vec<f64> = (0..700).map(|i| 4.0 + (i as f64) * 0.025).collect();
+        let true_density = 0.05_f64;
+        let (t0_true, ls_true) = (1.0_f64, 1.003_f64);
+        let model = EnergyScaleTransmissionModel::new(
+            Arc::new(vec![data.clone()]),
+            Arc::new(vec![0]),
+            Arc::new(vec![1.0]),
+            293.6,
+            energies.clone(),
+            25.0,
+            1,
+            2,
+            None,
+        );
+        let t = model.evaluate(&[true_density, t0_true, ls_true]).unwrap();
+        // Counts: sample = flux·T.  Zero detector background — the joint-Poisson
+        // KL path does not yet wire B_det (memo 35 §P3.2); the seed proxy
+        // (sample − 0)/(flux − 0) = T still reconstructs the dip positions.
+        let flux: Vec<f64> = vec![5000.0; energies.len()];
+        let background: Vec<f64> = vec![0.0; energies.len()];
+        let sample: Vec<f64> = t
+            .iter()
+            .zip(flux.iter())
+            .map(|(&ti, &fi)| fi * ti)
+            .collect();
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["Hf-178".into()],
+            293.6,
+            None,
+            vec![0.04],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
+        .with_energy_scale(0.0, 1.0, 25.0);
+        let input = InputData::CountsWithNuisance {
+            sample_counts: sample,
+            flux,
+            background,
+        };
+        let result = fit_spectrum_typed(&input, &config).unwrap();
+        let t0 = result
+            .t0_us
+            .expect("t0_us populated when fit_energy_scale=true");
+        let ls = result
+            .l_scale
+            .expect("l_scale populated when fit_energy_scale=true");
+        assert!(t0.is_finite() && ls.is_finite(), "t0={t0}, L={ls}");
+    }
+
+    /// The #608 working-grid σ + layout validation in
+    /// `validate_precomputed_cross_sections` (the up-front guard for the
+    /// Gaussian aux-grid path) — every malformed-input error branch, so a bad
+    /// `with_precomputed_work_cross_sections` setter call surfaces a typed
+    /// `ShapeMismatch` instead of a per-pixel panic.
+    #[test]
+    fn validate_precomputed_work_cross_sections_error_branches() {
+        use nereids_physics::transmission::WorkingGridLayout;
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..11).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let n_e = energies.len();
+        let n_work = n_e + 2; // a non-identity aux grid
+        let good_layout = || {
+            Arc::new(WorkingGridLayout {
+                energies: (0..n_work).map(|i| 1.0 + (i as f64) * 0.09).collect(),
+                data_indices: (0..n_e).collect(),
+            })
+        };
+        let cfg = |work_xs: Vec<Vec<f64>>, layout: Arc<WorkingGridLayout>| {
+            UnifiedFitConfig::new(
+                energies.clone(),
+                vec![data.clone()],
+                vec!["U-238".into()],
+                0.0,
+                None,
+                vec![0.001],
+            )
+            .unwrap()
+            .with_precomputed_cross_sections(Arc::new(vec![vec![1.0f64; n_e]])) // valid data-grid σ
+            .with_precomputed_work_cross_sections(Arc::new(work_xs), layout)
+        };
+        let expect =
+            |c: &UnifiedFitConfig, needle: &str| match validate_precomputed_cross_sections(c) {
+                Err(PipelineError::ShapeMismatch(m)) => {
+                    assert!(m.contains(needle), "expected {needle:?}, got: {m}")
+                }
+                other => panic!("expected ShapeMismatch({needle:?}), got {other:?}"),
+            };
+        // empty working σ
+        expect(&cfg(vec![], good_layout()), "must not be empty");
+        // working-σ row length != working-grid length
+        expect(
+            &cfg(vec![vec![1.0; n_work - 1]], good_layout()),
+            "working-grid energies",
+        );
+        // non-finite working σ
+        let mut nan_row = vec![1.0; n_work];
+        nan_row[3] = f64::NAN;
+        expect(&cfg(vec![nan_row], good_layout()), "non-finite");
+        // working-σ row count != data-grid σ row count (2 work rows vs 1 data row)
+        expect(
+            &cfg(vec![vec![1.0; n_work], vec![1.0; n_work]], good_layout()),
+            "rows but",
+        );
+        // layout maps a different number of data points than config.energies
+        let short = Arc::new(WorkingGridLayout {
+            energies: (0..n_work).map(|i| 1.0 + (i as f64) * 0.09).collect(),
+            data_indices: (0..n_e - 1).collect(),
+        });
+        expect(&cfg(vec![vec![1.0; n_work]], short), "layout maps");
+        // layout index out of range for the working grid
+        let oor = Arc::new(WorkingGridLayout {
+            energies: (0..n_work).map(|i| 1.0 + (i as f64) * 0.09).collect(),
+            data_indices: {
+                let mut v: Vec<usize> = (0..n_e).collect();
+                v[0] = n_work + 5;
+                v
+            },
+        });
+        expect(&cfg(vec![vec![1.0; n_work]], oor), "out of");
+    }
+
+    /// Cover the OTHER branches of the #608 `evaluate_jacobian_and_fisher` σ
+    /// restructure: the identity-layout path (no resolution ⇒ working grid ==
+    /// data grid) and the early-return when `fit_temperature` is set (the
+    /// `TransmissionFitModel` builds its own working-grid base σ).
+    #[test]
+    fn evaluate_jacobian_and_fisher_identity_and_temperature_paths() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..101).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let n_e = energies.len();
+        let flux = vec![5000.0; n_e];
+        let background = vec![10.0; n_e];
+        // (a) No resolution ⇒ identity working-grid layout.
+        let cfg_id = UnifiedFitConfig::new(
+            energies.clone(),
+            vec![data.clone()],
+            vec!["U-238".into()],
+            300.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap();
+        let r_id = evaluate_jacobian_and_fisher(&cfg_id, &flux, &background).unwrap();
+        assert_eq!(r_id.model_prediction.len(), n_e);
+        let f00 = r_id.fisher.get(0, 0);
+        assert!(
+            f00.is_finite() && f00 > 0.0,
+            "identity-path Fisher[0,0]={f00}"
+        );
+        // (b) fit_temperature ⇒ the σ-branch early-returns `config`;
+        //     TransmissionFitModel builds its own working-grid base σ.
+        let cfg_t = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            300.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_fit_temperature(true);
+        let r_t = evaluate_jacobian_and_fisher(&cfg_t, &flux, &background).unwrap();
+        assert_eq!(
+            r_t.param_names.len(),
+            2,
+            "density + temperature free params"
+        );
+        assert!(r_t.model_prediction.iter().all(|v| v.is_finite()));
+    }
+
+    /// Cover `build_transmission_model`'s group-collapse path: a grouped config
+    /// (two isotopes → one density param) carrying PRECOMPUTED per-member σ is
+    /// collapsed to per-group effective σ before the model build (the grouped +
+    /// precomputed path the spatial pipeline drives per pixel).
+    #[test]
+    fn fit_spectrum_typed_grouped_precomputed_collapses_by_groups() {
+        use nereids_core::types::{Isotope, IsotopeGroup};
+        let rd1 = synthetic_single_resonance(92, 235, 233.025, 5.0);
+        let rd2 = synthetic_single_resonance(92, 238, 236.006, 7.0);
+        let energies: Vec<f64> = (0..301).map(|i| 1.0 + (i as f64) * 0.05).collect();
+        let true_density = 0.0005_f64;
+        let sample = phys_transmission::SampleParams::new(
+            0.0,
+            vec![
+                (rd1.clone(), true_density * 0.6),
+                (rd2.clone(), true_density * 0.4),
+            ],
+        )
+        .unwrap();
+        let transmission = phys_transmission::forward_model(&energies, &sample, None).unwrap();
+        let uncertainty: Vec<f64> = transmission.iter().map(|&t| 0.01 * t.max(0.01)).collect();
+        // Per-member precomputed σ (2 rows) ⇒ triggers the group collapse.
+        let per_member = phys_transmission::broadened_cross_sections(
+            &energies,
+            &[rd1.clone(), rd2.clone()],
+            0.0,
+            None,
+            None,
+        )
+        .unwrap();
+        let iso1 = Isotope::new(92, 235).unwrap();
+        let iso2 = Isotope::new(92, 238).unwrap();
+        let group = IsotopeGroup::custom("U".into(), vec![(iso1, 0.6), (iso2, 0.4)]).unwrap();
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![rd1.clone()],
+            vec!["placeholder".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_groups(&[(&group, &[rd1, rd2])], vec![0.001])
+        .unwrap()
+        .with_precomputed_cross_sections(Arc::new(per_member))
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()));
+        let input = InputData::Transmission {
+            transmission,
+            uncertainty,
+        };
+        let result = fit_spectrum_typed(&input, &config).unwrap();
+        assert_eq!(result.densities.len(), 1, "one group density");
+        assert!(
+            (result.densities[0] - true_density).abs() / true_density < 0.01,
+            "grouped+precomputed density: fitted={}, true={true_density}",
+            result.densities[0]
+        );
+    }
+
+    /// `peak_match_energy_scale_seed` rejects (→ keeps the cold start) a fit that
+    /// lands OUTSIDE the parameter bounds rather than clamping onto a bound
+    /// (issue #608 R2): inject an L_scale (1.03) beyond the seed's (0.99, 1.01).
+    #[test]
+    fn peak_match_energy_scale_seed_rejects_out_of_bounds() {
+        let data = hf178_mlbw_two_resonances();
+        let energies: Vec<f64> = (0..900).map(|i| 4.0 + (i as f64) * 0.02).collect();
+        let model = EnergyScaleTransmissionModel::new(
+            Arc::new(vec![data.clone()]),
+            Arc::new(vec![0]),
+            Arc::new(vec![1.0]),
+            293.6,
+            energies.clone(),
+            25.0,
+            1,
+            2,
+            None,
+        );
+        // L_scale = 1.03 is well outside (0.99, 1.01); the seed would fit ≈1.03.
+        let t_obs = model.evaluate(&[0.05, 0.0, 1.03]).unwrap();
+        let config = UnifiedFitConfig::new(
+            energies.clone(),
+            vec![data],
+            vec!["Hf-178".into()],
+            293.6,
+            None,
+            vec![0.05],
+        )
+        .unwrap()
+        .with_energy_scale(0.0, 1.0, 25.0);
+        assert!(
+            peak_match_energy_scale_seed(
+                &t_obs,
+                config.energies(),
+                &config,
+                25.0,
+                (-10.0, 10.0),
+                (0.99, 1.01),
+            )
+            .is_none(),
+            "an out-of-bounds calibration fit must be rejected (cold-start fallback)"
+        );
+    }
 }
