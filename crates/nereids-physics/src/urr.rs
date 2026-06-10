@@ -137,15 +137,13 @@ pub fn urr_cross_sections(urr: &UrrData, e_ev: f64, ap_fm: f64) -> (f64, f64, f6
             // Target spin I = urr.spi, neutron spin s = 1/2.
             let g_j = channel::statistical_weight(jg.j, urr.spi);
 
-            // Obtain effective widths at energy e_ev.
+            // Obtain effective widths at energy e_ev (module formula block).
             //
-            // LRF=1: Γ_n = 2·P_L(ρ)·GNO  (GNO = reduced neutron width, eV)
+            // LRF=1: Γ_n(E) = 2·P_L(ρ(E))·GNO  (GNO = reduced neutron width, eV);
             //        D, GG, GF are energy-independent (single-element vecs).
             // LRF=2: widths interpolated from the energy table using the
-            //        INT code stored per J-group.
-            //        INT=2 (lin-lin) and INT=5 (log-log) are both supported.
-            //
-            // LRF=1: Γ_n(E) = 2 · P_L(ρ(E)) · GNO (module formula block).
+            //        INT code stored per J-group; all five ENDF INT codes
+            //        (1-5) are supported (see the dispatch below).
             let (gn_eff, d_eff, gx_eff, gg_eff, gf_eff) = if urr.lrf == 1 {
                 let gno = jg.gn[0]; // reduced neutron width (eV)
                 // LFW=1: fission widths are energy-dependent (tabulated).

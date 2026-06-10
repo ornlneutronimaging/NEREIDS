@@ -1936,8 +1936,8 @@ const FIT_RANGE_MARGIN_FWHM: f64 = 5.0;
 ///
 /// - **None**: no resolution → no broadening footprint → `0.0`.
 /// - **Gaussian**: extend by `FIT_RANGE_MARGIN_FWHM × FWHM(E)`.  The
-///   kernel has infinite tails; 5×FWHM puts the residual amplitude
-///   below 10⁻¹³ of peak.
+///   kernel has infinite tails; 5×FWHM (≈ 11.8σ) puts the residual
+///   amplitude at ~10⁻³⁰ of peak (see [`FIT_RANGE_MARGIN_FWHM`]).
 /// - **Tabulated**: use `TabulatedResolution::kernel_support_ev(E)`,
 ///   the eV distance over which the discrete kernel has positive
 ///   weight at `E`.  Past this distance the kernel is exactly zero,

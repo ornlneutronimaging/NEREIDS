@@ -7,17 +7,27 @@
 //!
 //! ## SAMMY Reference
 //! - Manual Section III.B.1 (Free-Gas Model of Doppler Broadening)
-//! - `fgm/` module (`FreeGasDopplerBroadening_M.f90`, subroutine `Dopfgm`)
+//! - `fgm/mfgm1.f90` subroutine `Dopfgm` (quadrature in `mfgm2.f90`
+//!   Modsmp/Modfpl)
 //!
 //! ## Method
 //!
-//! We implement the exact FGM integral in velocity space (SAMMY Eq. III B1.7):
+//! Velocity-space Gaussian broadening of v·σ:
 //!
 //!   v·σ_D(v²) = (1/(u√π)) ∫ exp(-(v-w)²/u²) · w · s(w) dw
 //!
 //! where v = √E, u = √(k_B·T / AWR), and:
 //!   s(w) =  σ(w²)  for w > 0
 //!   s(w) = -σ(w²)  for w < 0
+//!
+//! This is SAMMY Eq. III B1.7 **without** the (w/v) integrand weight the
+//! full FGM kernel carries — SAMMY's `Dopfgm` weights by w² and divides by
+//! v² (`fgm/mfgm2.f90` Modsmp/Modfpl, `mfgm4.f90`).  The omission preserves
+//! a constant cross-section exactly, whereas the full kernel yields
+//! σ·(1 + u²/2v²); the relative deviation is O(kT/(AWR·E)) — ~1.6×10⁻⁵ for
+//! U-238 at 6.67 eV / 300 K — negligible for heavy isotopes at epithermal
+//! energies and growing toward thermal energies and light targets.
+//! Exact-kernel (w²/v²) migration is planned.
 //!
 //! The key advantage of the velocity-space formulation is that u is
 //! independent of energy, making it a true convolution.
