@@ -190,7 +190,8 @@ pub enum ResonanceFormalism {
 ///
 /// For LRF=1: `energies` is empty; each width vector has exactly one element.
 /// For LRF=2: all vectors have length NE; `int_code` selects the interpolation
-/// law (INT=2 lin-lin or INT=5 log-log).
+/// law (INT=1..=5 per ENDF-6 §0.5; validated by the parser, dispatched in
+/// `nereids_physics::urr`).
 ///
 /// Reference: ENDF-6 Formats Manual §2.2.2
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -215,7 +216,8 @@ pub struct UrrJGroup {
     /// Average fission width GF (eV). Single-element for LRF=1.
     pub gf: Vec<f64>,
     /// Interpolation law for the energy table (LRF=2 only).
-    /// 2 = lin-lin, 5 = log-log.  Ignored for LRF=1 (no table).
+    /// INT=1..=5 per ENDF-6 §0.5 (1 histogram, 2 lin-lin, 3 log-lin,
+    /// 4 lin-log, 5 log-log).  Ignored for LRF=1 (no table).
     #[serde(default = "default_int_code")]
     pub int_code: u32,
 }

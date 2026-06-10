@@ -33,7 +33,8 @@
 //! The kernel above is the energy-averaged Hauser-Feshbach expression in the
 //! W = 1 limit: no width-fluctuation (Porter-Thomas / Moldauer / Dresner)
 //! factor is applied.  The χ² degrees of freedom `AMUN` / `AMUF` are parsed
-//! from ENDF File 2 and stored on `UrrData`, but are not yet consumed here.
+//! from ENDF File 2 and stored on `UrrJGroup` (within `UrrData`), but are
+//! not yet consumed here.
 //! SAMMY's URR treatment (FITACS, manual Section VIII) includes the
 //! fluctuation integrals, so NEREIDS URR cross-sections will differ from
 //! SAMMY's where fluctuation effects are significant.

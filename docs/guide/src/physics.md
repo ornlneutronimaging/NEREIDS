@@ -36,10 +36,11 @@ Free Gas Model (FGM) convolution accounting for thermal motion of target nuclei.
 - Module: [`doppler`](api/nereids_physics/doppler/)
 - SAMMY reference: `fgm/` module (Dopfgm), manual Sec. III.B.1
 - Key function: `doppler_broaden()` — velocity-space Gaussian convolution of
-  v·σ (manual Eq. III B1.7 without the w/v integrand weight; relative
-  deviation ≲ kT/(AWR·E), negligible for heavy isotopes at epithermal
-  energies; exact-kernel migration planned); no psi/chi (Voigt)
-  approximation is used
+  v·σ (manual Eq. III B1.7 without the w/v integrand weight: second-order
+  kT/(2·AWR·E) deviation for smooth cross-sections, but a first-order
+  √(kT/(AWR·E)) antisymmetric flank skew on resonance line shapes, ≈ 0.4%
+  for U-238 at 6.67 eV / 300 K; exact-kernel migration planned); no psi/chi
+  (Voigt) approximation is used
 
 ### Resolution Broadening
 

@@ -22,12 +22,20 @@
 //!
 //! This is SAMMY Eq. III B1.7 **without** the (w/v) integrand weight the
 //! full FGM kernel carries — SAMMY's `Dopfgm` weights by w² and divides by
-//! v² (`fgm/mfgm2.f90` Modsmp/Modfpl, `mfgm4.f90`).  The omission preserves
-//! a constant cross-section exactly, whereas the full kernel yields
-//! σ·(1 + u²/2v²); the relative deviation is O(kT/(AWR·E)) — ~1.6×10⁻⁵ for
-//! U-238 at 6.67 eV / 300 K — negligible for heavy isotopes at epithermal
-//! energies and growing toward thermal energies and light targets.
-//! Exact-kernel (w²/v²) migration is planned.
+//! v² (`fgm/mfgm2.f90` Modsmp/Modfpl, `mfgm4.f90`).  Error scales of the
+//! omission, in terms of u/v = √(kT/(AWR·E)):
+//!
+//! - **Smooth cross-sections** (second order): the full kernel maps a
+//!   constant σ to σ·(1 + u²/2v²) while this kernel preserves it (up to
+//!   exponentially small e^(-(v/u)²) image terms) — relative deviation
+//!   kT/(2·AWR·E) ≈ 8.2×10⁻⁶ for U-238 at 6.67 eV / 300 K.
+//! - **Resonance line shapes** (first order): an antisymmetric flank skew
+//!   of order u/v — up to ≈ 0.4% on the Doppler-broadened flanks of the
+//!   U-238 6.67 eV resonance at 300 K, vanishing at the peak — which can
+//!   alias into fitted energy-scale and density parameters.
+//!
+//! Exact-kernel (w²/v²) migration is planned, with a flank-discriminating
+//! kernel test.
 //!
 //! The key advantage of the velocity-space formulation is that u is
 //! independent of energy, making it a true convolution.
@@ -276,8 +284,9 @@ fn erfc_val(x: f64) -> f64 {
 
 /// Apply FGM Doppler broadening to cross-section data.
 ///
-/// The cross-sections are broadened in velocity space using the exact
-/// Free Gas Model integral from SAMMY manual Eq. III B1.7.
+/// The cross-sections are broadened in velocity space via Gaussian
+/// convolution of v·σ — SAMMY manual Eq. III B1.7 without the (w/v)
+/// integrand weight; see the module docs for the error characterization.
 ///
 /// # Arguments
 /// * `energies` — Energy grid in eV. Every entry must satisfy
