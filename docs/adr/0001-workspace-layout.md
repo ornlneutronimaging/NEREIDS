@@ -52,3 +52,17 @@ All physics implementations reference SAMMY (ORNL/TM-9179) with:
 - GUI can be developed independently of the core library
 - Worklog directory (gitignored) prevents temp file pollution
 - Atomic commits at each phase enable early detection of issues
+
+## Addendum (2026-06)
+
+The decision above stands; two details have evolved since it was written:
+
+- A seventh core library crate, `endf-mat` (ENDF MAT-number lookup, element
+  symbols, and natural isotopic abundances), was extracted from
+  `nereids-endf` as a standalone, zero-dependency crate.
+- The fitting stack listed under `nereids-fitting` has evolved: the external
+  BFGS solver was removed; the current engines are Levenberg-Marquardt,
+  a transmission-domain Poisson/KL optimizer, and a counts-domain
+  joint-Poisson (conditional binomial deviance) solver.
+
+The SAMMY reference document is ORNL/TM-9179/R8.

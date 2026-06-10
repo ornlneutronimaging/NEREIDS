@@ -28,6 +28,16 @@
 //! returned `total` and `elastic` so that the URR band produces a physically
 //! consistent cross-section without requiring special handling at the call site.
 //!
+//! ## Width-Fluctuation Correction — not yet implemented
+//!
+//! The kernel above is the energy-averaged Hauser-Feshbach expression in the
+//! W = 1 limit: no width-fluctuation (Porter-Thomas / Moldauer / Dresner)
+//! factor is applied.  The χ² degrees of freedom `AMUN` / `AMUF` are parsed
+//! from ENDF File 2 and stored on `UrrData`, but are not yet consumed here.
+//! SAMMY's URR treatment (FITACS, manual Section VIII) includes the
+//! fluctuation integrals, so NEREIDS URR cross-sections will differ from
+//! SAMMY's where fluctuation effects are significant.
+//!
 //! ## Units
 //! All energies in eV, all lengths (AP, channel radii) in fm (true physics
 //! femtometers, 10⁻¹⁵ m), cross-sections in barns.
@@ -38,7 +48,7 @@
 //!
 //! ## SAMMY Reference
 //! - `unr/munr03.f90` Csig3 subroutine
-//! - SAMMY manual Section 4 (URR treatment)
+//! - SAMMY manual Section VIII.A (equations for the Unresolved Resonance Region)
 //!
 //! ## References
 //! - ENDF-6 Formats Manual §2.2.2
@@ -49,7 +59,9 @@ use nereids_endf::resonance::UrrData;
 use crate::channel;
 use crate::penetrability;
 
-/// Compute Hauser-Feshbach average cross-sections in the Unresolved Resonance Region.
+/// Compute energy-averaged Hauser-Feshbach cross-sections in the Unresolved
+/// Resonance Region (width-fluctuation correction not yet applied; see the
+/// module docs).
 ///
 /// Returns `(total, elastic, capture, fission)` in barns.
 /// All four are zero when `e_ev` falls outside the URR energy band

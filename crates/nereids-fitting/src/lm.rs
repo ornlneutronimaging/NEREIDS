@@ -8,7 +8,7 @@
 //! and λ is the damping parameter.
 //!
 //! ## SAMMY Reference
-//! - `fit/` module, manual Sec 4 (Bayes equations / generalized least-squares)
+//! - `fit/` module, manual Sec. IV (Bayes equations / generalized least-squares)
 
 use nereids_core::constants::{LM_DIAGONAL_FLOOR, PIVOT_FLOOR};
 
@@ -190,7 +190,7 @@ impl<M: FitModel + ?Sized> FitModel for &M {
 /// matters when masked bins may contain non-finite residuals (e.g. NaN
 /// outside the user's fit-energy range): `0.0 * NaN = NaN`, so a
 /// zero-weight strategy would propagate NaN through the χ² accumulator
-/// even though the bin contributes no information.  See SAMMY REGION
+/// even though the bin contributes no information.  See SAMMY EMIN/EMAX
 /// semantics (#514) and lm.rs Fix 4.
 fn chi_squared(residuals: &[f64], weights: &[f64], active_mask: Option<&[bool]>) -> f64 {
     let mut sum = 0.0;
@@ -494,7 +494,7 @@ pub fn levenberg_marquardt(
 }
 
 /// Run the Levenberg-Marquardt optimizer with an optional per-bin
-/// active mask (SAMMY REGION-equivalent fit-energy-range restriction).
+/// active mask (SAMMY EMIN/EMAX-equivalent fit-energy-range restriction).
 ///
 /// When `active_mask` is `Some(m)`:
 /// - bins where `m[i]` is `false` are excluded from χ² and the normal
@@ -537,7 +537,7 @@ pub fn levenberg_marquardt_with_mask(
     }
     let n_active = crate::active_mask::active_count(active_mask, n_data);
 
-    // SAMMY REGION-equivalent fit-energy-range (#514): a mask with
+    // SAMMY EMIN/EMAX-equivalent fit-energy-range (#514): a mask with
     // zero active bins means the user's `[E_min, E_max]` does not
     // overlap the energy grid.  No data contributes to the cost
     // function — return non-converged with NaN χ² rather than
@@ -567,7 +567,7 @@ pub fn levenberg_marquardt_with_mask(
             .iter()
             .enumerate()
             .map(|(i, &s)| {
-                // Active-bin masking (SAMMY REGION): bins outside the
+                // Active-bin masking (SAMMY EMIN/EMAX): bins outside the
                 // user range contribute zero to χ².
                 if active_mask.is_some_and(|m| !m[i]) {
                     return 0.0;
@@ -586,7 +586,7 @@ pub fn levenberg_marquardt_with_mask(
         // Covariance/uncertainties are None because the fit did not converge —
         // an unconverged result has no meaningful covariance to report.
         //
-        // SAMMY REGION-equivalent fit-energy-range (#514): masked rows are
+        // SAMMY EMIN/EMAX-equivalent fit-energy-range (#514): masked rows are
         // skipped throughout the cost / normal-equation accumulators, so a
         // non-finite model output at a masked bin should not abort the fit
         // — only check finiteness on active rows.
@@ -616,7 +616,7 @@ pub fn levenberg_marquardt_with_mask(
         // when no mask is set) to mirror the main path and keep a single
         // visible formula.  When a fit-energy-range mask is in effect,
         // `n_active` reflects the count of bins that actually contributed
-        // to χ² (SAMMY REGION semantics).
+        // to χ² (SAMMY EMIN/EMAX semantics).
         let dof = n_active.saturating_sub(n_free);
         let reduced = if dof > 0 { chi2 / dof as f64 } else { f64::NAN };
         return Ok(LmResult {
@@ -637,7 +637,7 @@ pub fn levenberg_marquardt_with_mask(
     // we allow it and report reduced_chi_squared = NaN (0/0).
     //
     // When a fit-energy-range mask is in effect, the underdetermined
-    // check uses the active-bin count (SAMMY REGION semantics) — masked
+    // check uses the active-bin count (SAMMY EMIN/EMAX semantics) — masked
     // bins do not contribute information to the fit.
     if n_active < n_free {
         return Ok(LmResult {
@@ -657,7 +657,7 @@ pub fn levenberg_marquardt_with_mask(
     // floor instead of rejecting outright, so callers with a few zero-sigma
     // bins still get a usable fit.
     //
-    // Active-bin masking (SAMMY REGION): bins outside the user range
+    // Active-bin masking (SAMMY EMIN/EMAX): bins outside the user range
     // get weight 0 here, which propagates through χ² and the JᵀWJ /
     // JᵀWr normal-equation assembly to contribute exactly zero —
     // covering both residual and gradient masking with no further
@@ -721,7 +721,7 @@ pub fn levenberg_marquardt_with_mask(
 
         // Build normal equations: JᵀWJ and JᵀWr.
         //
-        // Active-bin masking (SAMMY REGION, #514): explicitly skip
+        // Active-bin masking (SAMMY EMIN/EMAX, #514): explicitly skip
         // masked rows rather than relying on weights[i] == 0 — the
         // model or the residual at a masked margin bin may be NaN
         // (e.g. when y_obs is NaN outside the user's fit-energy range),
@@ -783,7 +783,7 @@ pub fn levenberg_marquardt_with_mask(
 
         // #113: If the model produced NaN/Inf at any *active* bin, treat as
         // a bad step (same as chi2 increase) — increase lambda and try again.
-        // SAMMY REGION-equivalent fit-energy-range (#514): masked rows are
+        // SAMMY EMIN/EMAX-equivalent fit-energy-range (#514): masked rows are
         // skipped from χ² / JᵀWJ / JᵀWr / covariance, so a non-finite model
         // output at a masked margin bin must not penalise the trial step.
         let trial_has_active_nonfinite = y_trial
@@ -1526,7 +1526,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Active-bin mask (SAMMY REGION-equivalent fit-energy-range, #514).
+    // Active-bin mask (SAMMY EMIN/EMAX-equivalent fit-energy-range, #514).
     // ------------------------------------------------------------------
 
     /// LM with an `active_mask` that restricts to a subset of bins must

@@ -1,6 +1,6 @@
 //! Active-bin masking for fit-energy-range restriction.
 //!
-//! SAMMY REGION equivalent (`MIN ENERGY` / `MAX ENERGY` SAM52 cards).
+//! SAMMY EMIN/EMAX equivalent (INPut-file card set 2, manual Table VI A.1).
 //! When a user restricts the fit to `[E_min, E_max]`, the GUI extends
 //! the energy grid by ~5×FWHM beyond each boundary so resonances near
 //! the boundaries are correctly broadened, and the cost-function paths

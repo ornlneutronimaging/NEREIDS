@@ -18,8 +18,10 @@ output spatially resolved isotopic composition maps.
 
 ## Features
 
-- **R-matrix cross-sections** -- Reich-Moore, SLBW, R-Matrix Limited (LRF=7),
-  Unresolved Resonance Region (URR/Hauser-Feshbach), Coulomb channels
+- **R-matrix cross-sections** -- Reich-Moore, Breit-Wigner (single- and
+  multi-level), R-Matrix Limited (LRF=7), Coulomb channels
+- **Unresolved Resonance Region** -- energy-averaged Hauser-Feshbach
+  cross-sections (width-fluctuation correction planned, not yet implemented)
 - **Doppler broadening** -- Free Gas Model (crystal-lattice model planned, not yet implemented)
 - **Resolution broadening** -- Gaussian (channel width + flight path) and
   tabulated instrument functions
@@ -33,7 +35,7 @@ output spatially resolved isotopic composition maps.
 - **Detectability analysis** -- energy-window optimization for trace
   element sensitivity
 - **Python bindings** -- full API via PyO3, pip-installable
-- **Desktop GUI** -- egui application with guided workflow and studio mode
+- **Desktop GUI** -- egui application with Guided and Studio modes
 
 ## Installation
 
@@ -190,7 +192,7 @@ result = nereids.spatial_map_typed(data, energies, [u238, fe56])
 print(f"Converged: {result.n_converged}/{result.n_total} pixels")
 ```
 
-See the [examples/notebooks/](examples/notebooks/) directory for 17 tutorial
+See the [examples/notebooks/](examples/notebooks/) directory for 18 tutorial
 notebooks covering foundations, building blocks, workflows, and applications.
 
 ## Architecture
@@ -229,7 +231,7 @@ nereids-pipeline      End-to-end orchestration, spatial mapping (rayon)
 
 - **[User Guide](https://ornlneutronimaging.github.io/NEREIDS/)** -- Installation, quickstart, architecture
 - **[API Reference](https://ornlneutronimaging.github.io/NEREIDS/api/nereids_pipeline/)** -- Rustdoc for all crates
-- **[Jupyter Notebooks](examples/notebooks/)** -- 17 tutorials organized by complexity
+- **[Jupyter Notebooks](examples/notebooks/)** -- 18 tutorials organized by complexity
 
 ## Troubleshooting
 

@@ -12,7 +12,8 @@
 //! - `rsl/mrsl5.f90` — Exponential tail peak shift (Shftge)
 //! - `fnc/exerfc.f90` — Scaled complementary error function
 //! - `convolution/DopplerAndResolutionBroadener.cpp` — Xcoef quadrature weights
-//! - Manual Section 3.2 (Resolution Broadening), Eq. IV B 3.8
+//! - Manual Section III.C (Resolution Broadening); quadrature Eq. IV B 3.8
+//!   (R3-revision numbering — see `broaden`)
 //!
 //! ## Physics
 //!
@@ -870,7 +871,7 @@ impl TabulatedResolution {
     /// Returns `0.0` for non-positive `e_ev`, an empty kernel set, or
     /// a non-positive flight path.  Used by the GUI's
     /// fit-energy-range slicing to extend the model-evaluation grid
-    /// beyond the user's `[E_min, E_max]` so the SAMMY REGION-
+    /// beyond the user's `[E_min, E_max]` so the SAMMY EMIN/EMAX-
     /// equivalent broadening at the boundaries is correct (#514).
     #[must_use]
     pub fn kernel_support_ev(&self, e_ev: f64) -> f64 {
@@ -3649,7 +3650,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // TabulatedResolution::kernel_support_ev — used by SAMMY REGION
+    // TabulatedResolution::kernel_support_ev — used by SAMMY EMIN/EMAX
     // -equivalent fit-energy-range margin computation (#514).
     // ------------------------------------------------------------------
 

@@ -32,7 +32,8 @@
 //! Intermediate matrix (SAMMY "XXXX"):
 //!   Ξ_cc'(E) = (√P_c / L_c) · (Ỹinv · R)_cc' · √P_c'
 //!
-//! Collision matrix (SAMMY manual eq. III.D.4):
+//! Collision matrix (eq. III.D.4 in SAMMY-manual-R3 numbering, as cited by
+//! `rml/mrml11.f`; in the R8 manual this is Eqs. (II B1.3)-(II B1.4)):
 //!   W_cc' = δ_cc' + 2i·Ξ_cc'
 //!   U_cc' = Ω_c · W_cc' · Ω_c'    where Ω_c = exp(-iφ_c)
 //!

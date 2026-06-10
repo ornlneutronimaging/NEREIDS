@@ -84,8 +84,8 @@ pub struct ProjectSnapshot {
     /// `L_scale`).  `Option` for backwards compatibility — projects
     /// saved before this field was introduced load as `None` (= false).
     pub fit_energy_scale: Option<bool>,
-    /// User-specified fit energy range `[min_eV, max_eV]` (SAMMY REGION
-    /// equivalent, `MIN ENERGY` / `MAX ENERGY` SAM52 cards).
+    /// User-specified fit energy range `[min_eV, max_eV]` (SAMMY EMIN/EMAX
+    /// equivalent — INPut-file card set 2, manual Table VI A.1).
     /// `None` (default) = full grid.  Projects saved before this field
     /// was introduced load as `None` via the HDF5 reader's missing-
     /// attribute handling — the bounds are stored as two scalar
@@ -579,7 +579,7 @@ fn write_config(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoError
         write_bool_attr(&solver, "fit_energy_scale", fes)?;
     }
     if let Some((fr_min, fr_max)) = snap.fit_energy_range {
-        // SAMMY REGION-equivalent fit-energy-range bounds (#514).
+        // SAMMY EMIN/EMAX-equivalent fit-energy-range bounds (#514).
         // Stored as two scalar attributes so HDF5 introspection tools
         // can read the values directly without parsing a packed tuple.
         write_f64_attr(&solver, "fit_energy_range_min_ev", fr_min)?;
@@ -1265,7 +1265,7 @@ fn read_config(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoEr
     snap.temperature_k = read_f64_attr(&solver, "temperature_k")?;
     snap.fit_temperature = read_bool_attr(&solver, "fit_temperature")?;
     snap.fit_energy_scale = read_bool_attr(&solver, "fit_energy_scale").ok();
-    // SAMMY REGION-equivalent fit-energy-range bounds (#514).  Both
+    // SAMMY EMIN/EMAX-equivalent fit-energy-range bounds (#514).  Both
     // attributes must be present to populate the field; older project
     // files load as `None` (= full-grid fit, the prior default).
     snap.fit_energy_range = match (

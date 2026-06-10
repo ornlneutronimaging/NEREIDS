@@ -277,7 +277,7 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState, available_height_hint: 
                  \u{03BC}s, L_scale \u{2208} [0.99, 1.01].  Mutually \
                  exclusive with Fit temperature.",
                 );
-                // SAMMY REGION-equivalent fit-energy-range restriction (#514).
+                // SAMMY EMIN/EMAX-equivalent fit-energy-range restriction (#514).
                 // The checkbox toggles the `Option<(f64, f64)>` state field;
                 // toggling on initialises from the current full grid bounds
                 // so the user can narrow incrementally.  When set, the
@@ -287,11 +287,11 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState, available_height_hint: 
                 let cb = ui
                     .checkbox(
                         &mut restrict_enabled,
-                        "Restrict fit energy range (SAMMY REGION)",
+                        "Restrict fit energy range (SAMMY EMIN/EMAX)",
                     )
                     .on_hover_text(
                         "Restrict the cost function to bins inside [min, max] eV \
-                         (SAMMY REGION / `MIN ENERGY` / `MAX ENERGY` cards).  \
+                         (equivalent to SAMMY's EMIN/EMAX analysis limits).  \
                          The resolution-kernel margin (~5×FWHM beyond each \
                          boundary) is applied automatically so resonances \
                          near the boundaries remain correctly broadened.  \
@@ -1589,7 +1589,7 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 );
             }
 
-            // SAMMY REGION fit-energy-range guides (#514).  Only render
+            // SAMMY EMIN/EMAX fit-energy-range guides (#514).  Only render
             // on the energy axis — the bounds are stored in eV and the
             // TOF projection would require an extra energy↔TOF
             // conversion for marginal user value.  Users can toggle to
@@ -1923,14 +1923,16 @@ fn fit_results_panel(ui: &mut egui::Ui, state: &AppState, result: &SpectrumFitRe
 
 /// Number of resolution-FWHM widths to extend the fit-energy-range
 /// slice on each side as a "kernel margin" for **Gaussian** resolution.
-/// SAMMY user manual §IIID.6 (REGION) recommends 3–5×FWHM; we pick 5×
-/// for safety so resonance shoulders just inside the boundaries are
-/// correctly broadened.  At 5×FWHM ≈ 5.9σ the Gaussian kernel is below
-/// 10⁻¹³ of peak — well past the broadening footprint.
+/// Mirrors SAMMY's auxiliary-grid construction (manual Sec. III.B.2:
+/// the broadening grid extends beyond `[Emin − Wmin, Emax + Wmax]`,
+/// where W is the resolution width at each limit); we pick 5×FWHM so
+/// resonance shoulders just inside the boundaries are correctly
+/// broadened.  At 5×FWHM ≈ 5.9σ the Gaussian kernel is below 10⁻¹³ of
+/// peak — well past the broadening footprint.
 const FIT_RANGE_MARGIN_FWHM: f64 = 5.0;
 
 /// Resolution-kernel margin (eV) to add at energy `e_ev` when slicing
-/// for the fit-energy-range filter (SAMMY REGION-equivalent, #514).
+/// for the fit-energy-range filter (SAMMY EMIN/EMAX-equivalent, #514).
 ///
 /// - **None**: no resolution → no broadening footprint → `0.0`.
 /// - **Gaussian**: extend by `FIT_RANGE_MARGIN_FWHM × FWHM(E)`.  The
@@ -2077,7 +2079,7 @@ fn build_fit_config(state: &AppState) -> Result<(UnifiedFitConfig, Range<usize>)
     // Otherwise we extend the active `[E_min, E_max]` by a kernel-FWHM
     // margin so resonance broadening at the boundaries remains correct;
     // the solver cost paths then mask residuals back to the inner
-    // active range (SAMMY REGION semantics, #514).
+    // active range (SAMMY EMIN/EMAX semantics, #514).
     let resolution = design::build_resolution_function(
         state.resolution_enabled,
         &state.resolution_mode,
@@ -2324,7 +2326,7 @@ fn fit_pixel(state: &mut AppState) {
     }
 
     // Slice per-bin data to the same `energy_range` produced by
-    // `build_fit_config` (SAMMY REGION-equivalent fit-energy-range
+    // `build_fit_config` (SAMMY EMIN/EMAX-equivalent fit-energy-range
     // restriction with kernel-margin extension, #514).  When the user
     // hasn't restricted the range, `energy_range` is `0..n_energies`,
     // so this is identical to the previous full-grid behaviour.
@@ -2495,7 +2497,7 @@ fn fit_roi(state: &mut AppState) {
     // Weighted average transmission and propagated uncertainty.
     //
     // We build the full-grid averaged arrays first, then slice to
-    // `energy_range` for the fit (SAMMY REGION-equivalent fit-energy-
+    // `energy_range` for the fit (SAMMY EMIN/EMAX-equivalent fit-energy-
     // range restriction with kernel-margin extension, #514).  The
     // ROI averaging is unaffected by the slice — it's the same
     // `n_tof` arithmetic regardless of which bins end up in the fit.
@@ -2531,7 +2533,7 @@ fn fit_roi(state: &mut AppState) {
         && let (Some(sample), Some(open_beam)) = (&state.sample_data, &state.open_beam_data)
     {
         // Counts paths slice the energy axis to `energy_range` — same
-        // SAMMY REGION semantics as the LM transmission path above.
+        // SAMMY EMIN/EMAX semantics as the LM transmission path above.
         let sample_counts: Vec<f64> = energy_range
             .clone()
             .map(|t| {
@@ -2731,7 +2733,7 @@ pub fn run_spatial_map(state: &mut AppState) {
         // Use counts-domain only when the solver is Poisson KL AND both
         // sample and open beam are available. LM always uses Transmission.
         //
-        // SAMMY REGION-equivalent fit-energy-range restriction (#514):
+        // SAMMY EMIN/EMAX-equivalent fit-energy-range restriction (#514):
         // when `state.fit_energy_range` is set, `build_fit_config` slices
         // the energy grid to `energy_range` (with kernel-margin extension);
         // here we slice the per-pixel data views to the same axis-0 range

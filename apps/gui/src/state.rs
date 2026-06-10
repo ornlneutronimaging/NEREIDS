@@ -77,7 +77,7 @@ pub struct SessionCache {
     /// as free parameters.  Mutually exclusive with `fit_temperature`.
     #[serde(default)]
     pub fit_energy_scale: bool,
-    /// Fit energy range restriction (SAMMY REGION equivalent).
+    /// Fit energy range restriction (SAMMY EMIN/EMAX equivalent).
     /// `None` (default) = full grid.
     #[serde(default)]
     pub fit_energy_range: Option<(f64, f64)>,
@@ -744,8 +744,8 @@ pub struct AppState {
     /// represents the residual offset on top of the corrected grid;
     /// `L_scale` multiplies the nominal `flight_path_m`.
     pub fit_energy_scale: bool,
-    /// Restrict the fit to `[min_eV, max_eV]` (SAMMY REGION equivalent,
-    /// SAMMY user manual §IIID.6 / SAM52 `MIN ENERGY` / `MAX ENERGY`).
+    /// Restrict the fit to `[min_eV, max_eV]` (SAMMY EMIN/EMAX equivalent —
+    /// INPut-file card set 2, manual Table VI A.1).
     /// `None` = full grid (default).  Both bounds must lie inside the
     /// loaded energy grid; the resolution-kernel margin (~5×FWHM beyond
     /// each boundary) is applied automatically in `build_fit_config`

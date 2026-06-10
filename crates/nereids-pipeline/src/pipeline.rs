@@ -372,7 +372,7 @@ pub struct UnifiedFitConfig {
     /// `Some(_)` bypasses both the env var and the default.
     tzero_jacobian_method: Option<nereids_fitting::transmission_model::EnergyScaleJacobianMethod>,
 
-    // ── Fit energy range restriction (SAMMY REGION equivalent) ──
+    // ── Fit energy range restriction (SAMMY EMIN/EMAX equivalent) ──
     /// User-specified fit-energy-range restriction.  When `Some((min,
     /// max))`, the configured `energies` grid is expected to extend
     /// beyond `[min, max]` by a kernel-margin (~5×FWHM); the GUI / pre-
@@ -384,8 +384,11 @@ pub struct UnifiedFitConfig {
     ///
     /// `None` (default) = full grid, no masking.  Reduced χ² / dof
     /// counts are computed against the active bin count when masking
-    /// is in effect.  See SAMMY user manual §IIID.6 ("REGION") and the
-    /// `MIN ENERGY` / `MAX ENERGY` SAM52 cards.
+    /// is in effect.  SAMMY equivalent: the `EMIN` / `EMAX` analysis
+    /// limits (INPut-file card set 2, manual Table VI A.1); the kernel
+    /// margin matches the auxiliary-grid construction of manual
+    /// Sec. III.B.2, which extends the grid beyond
+    /// `[Emin − Wmin, Emax + Wmax]` (W = resolution width at the limit).
     fit_energy_range: Option<(f64, f64)>,
 
     // ── Isotope group mapping (optional) ──
@@ -519,7 +522,7 @@ impl UnifiedFitConfig {
     }
 
     /// Restrict the fit cost function to bins inside `[min_eV, max_eV]`
-    /// (SAMMY REGION equivalent).  The configured `energies` grid is
+    /// (SAMMY EMIN/EMAX equivalent).  The configured `energies` grid is
     /// expected to extend by ~5×FWHM beyond `[min, max]` on each side
     /// (the GUI / pre-processing layer handles this); the LM and
     /// joint-Poisson cost paths mask residuals outside `[min, max]` to
@@ -814,7 +817,7 @@ impl UnifiedFitConfig {
     pub fn fit_energy_scale(&self) -> bool {
         self.fit_energy_scale
     }
-    /// User-specified fit-energy-range restriction (SAMMY REGION
+    /// User-specified fit-energy-range restriction (SAMMY EMIN/EMAX
     /// equivalent), or `None` for full-grid fitting.
     /// See [`Self::with_fit_energy_range`].
     pub fn fit_energy_range(&self) -> Option<(f64, f64)> {
@@ -1133,7 +1136,7 @@ fn fit_transmission_lm(
         build_transmission_model(config, n_density_params, _temperature_index)?
     };
 
-    // Build the per-bin active mask (SAMMY REGION-equivalent fit-energy
+    // Build the per-bin active mask (SAMMY EMIN/EMAX-equivalent fit-energy
     // -range restriction).  `None` when no range is configured — the
     // LM core treats that as "all bins active".
     let active_mask = nereids_fitting::active_mask::build_active_mask(
@@ -1233,7 +1236,7 @@ fn fit_transmission_poisson(
     config: &UnifiedFitConfig,
     poisson_cfg: &PoissonConfig,
 ) -> Result<SpectrumFitResult, PipelineError> {
-    // SAMMY REGION-equivalent fit-energy-range (#514): the legacy
+    // SAMMY EMIN/EMAX-equivalent fit-energy-range (#514): the legacy
     // transmission-domain `poisson_fit` does not honour an active mask,
     // so silently routing the data here when the user set a fit range
     // would bias the fit by including out-of-range bins (margin region)
@@ -1473,7 +1476,7 @@ fn fit_counts_joint_poisson(
     // so JointPoissonObjective picks up gradients for both density and
     // background parameters without further wiring.
 
-    // Build the per-bin active mask (SAMMY REGION-equivalent fit-energy
+    // Build the per-bin active mask (SAMMY EMIN/EMAX-equivalent fit-energy
     // -range restriction).  `None` when no range is configured — the
     // JP objective treats that as "all bins active".
     let active_mask = nereids_fitting::active_mask::build_active_mask(
@@ -4890,7 +4893,7 @@ mod tests {
     /// LM fit with `fit_energy_range = Some((min, max))` on the full
     /// grid must yield the same density as the same fit run on the
     /// `[min, max]` slice directly when the residual outside the range
-    /// is negligible (SAMMY REGION semantics, paper-acceptance test).
+    /// is negligible (SAMMY EMIN/EMAX semantics, paper-acceptance test).
     #[test]
     fn test_fit_energy_range_lm_matches_subset_when_outside_negligible() {
         let data = u238_single_resonance();

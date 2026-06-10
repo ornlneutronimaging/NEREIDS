@@ -414,11 +414,6 @@ pub fn cross_sections_at_energy(data: &ResonanceData, energy_ev: f64) -> CrossSe
 /// Issue #87: the precompute is hoisted above the energy loop so that
 /// `precompute_jgroups_*` runs O(ranges) times total, not O(ranges × energies).
 ///
-/// # Limitations
-/// MLBW (Multi-Level Breit-Wigner, LRF=2) ranges use true MLBW with interference.
-/// formulas as an approximation, ignoring resonance-resonance interference.
-/// Results may be inaccurate for closely spaced or overlapping resonances.
-///
 /// # Arguments
 /// * `data` — Parsed resonance parameters from ENDF.
 /// * `energies` — Slice of neutron energies in eV.
