@@ -12,8 +12,8 @@
 //!
 //! LRF=1: Γ_n(E) = 2 · P_L(ρ(E)) · GNO    [GNO = reduced neutron width]
 //! LRF=2: Γ_n(E) from tabulated energy grid using INT interpolation
-//!         INT=1 histogram, INT=2 lin-lin, INT=3 log-lin,
-//!         INT=4 lin-log, INT=5 log-log (all 5 ENDF codes supported)
+//!         INT=1 histogram, INT=2 lin-lin, INT=3 log-x/lin-y,
+//!         INT=4 lin-x/log-y, INT=5 log-log (all 5 ENDF codes supported)
 //!
 //! Γ_tot = Γ_n + GG + GF + GX
 //!
@@ -158,8 +158,8 @@ pub fn urr_cross_sections(urr: &UrrData, e_ev: f64, ap_fm: f64) -> (f64, f64, f6
                 (2.0 * p_l * gno, jg.d[0], 0.0_f64, jg.gg[0], gf)
             } else {
                 // LRF=2: dispatch on the stored interpolation law.
-                // ENDF-6 §0.5: INT=1 histogram, 2 lin-lin, 3 log-lin,
-                // 4 lin-log, 5 log-log.
+                // ENDF-6 §0.5: INT=1 histogram, 2 lin-lin, 3 log-x/lin-y,
+                // 4 lin-x/log-y, 5 log-log.
                 let interp: fn(&[f64], &[f64], f64) -> f64 = match jg.int_code {
                     1 => histogram_interp,
                     3 => log_lin_interp,

@@ -1524,6 +1524,17 @@ mod tests {
         let broadened_ref = |sigma: &dyn Fn(f64) -> f64, e: f64, full: bool| -> f64 {
             let v = e.sqrt();
             let (lo, hi) = (v - 12.0 * u, v + 12.0 * u);
+            // Enforce the image-branch-omission precondition: the window must
+            // stay in positive-w territory, which also bounds the omitted
+            // image term at ≤ exp(−(v/u)²) ≤ exp(−144) — far below quadrature
+            // noise.  If the test parameters (E, T, AWR) ever change such that
+            // this fails, implement the negative-w branch instead.
+            assert!(
+                lo > 0.0,
+                "reference quadrature window crosses w = 0 (v/u = {:.1} < 12); \
+                 the omitted image branch is no longer negligible",
+                v / u
+            );
             let n = 4800usize; // even (Simpson); h = 0.005·u
             let h = (hi - lo) / n as f64;
             let f = |w: f64| -> f64 {

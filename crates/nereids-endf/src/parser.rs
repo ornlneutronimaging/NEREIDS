@@ -1532,8 +1532,8 @@ fn parse_urr_range(
 
                 // All ENDF interpolation laws (INT=1..5) are now supported
                 // in the URR physics module (urr.rs).
-                // INT=1: histogram, INT=2: lin-lin, INT=3: log-lin,
-                // INT=4: lin-log, INT=5: log-log.
+                // INT=1: histogram, INT=2: lin-lin, INT=3: log-x/lin-y,
+                // INT=4: lin-x/log-y, INT=5: log-log.
                 // ENDF-6 §2.2.2.2.
 
                 let values = parse_list_values(ctx.lines, ctx.pos, n1)?;
