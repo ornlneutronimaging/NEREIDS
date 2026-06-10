@@ -1923,12 +1923,14 @@ fn fit_results_panel(ui: &mut egui::Ui, state: &AppState, result: &SpectrumFitRe
 
 /// Number of resolution-FWHM widths to extend the fit-energy-range
 /// slice on each side as a "kernel margin" for **Gaussian** resolution.
-/// Mirrors SAMMY's auxiliary-grid construction (manual Sec. III.B.2:
-/// the broadening grid extends beyond `[Emin − Wmin, Emax + Wmax]`,
-/// where W is the resolution width at each limit); we pick 5×FWHM so
-/// resonance shoulders just inside the boundaries are correctly
-/// broadened.  At 5×FWHM ≈ 11.8σ (FWHM = 2.3548σ) the Gaussian kernel
-/// is ~10⁻³⁰ of peak — far past the broadening footprint.
+/// Follows the same endpoint-extension principle as SAMMY's auxiliary
+/// grid (general construction: manual Sec. III.A.2(c); the quantitative
+/// `[Emin − Wmin, Emax + Wmax]` statement, W = resolution width at each
+/// limit, appears in the Leal-Hwang procedure, Sec. III.B.2).  NEREIDS
+/// deliberately uses a conservative 5×FWHM margin so resonance
+/// shoulders just inside the boundaries are correctly broadened.  At
+/// 5×FWHM ≈ 11.8σ (FWHM = 2.3548σ) the Gaussian kernel is ~10⁻³⁰ of
+/// peak — far past the broadening footprint.
 const FIT_RANGE_MARGIN_FWHM: f64 = 5.0;
 
 /// Resolution-kernel margin (eV) to add at energy `e_ev` when slicing

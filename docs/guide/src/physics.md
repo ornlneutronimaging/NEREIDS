@@ -88,7 +88,8 @@ Maximum-likelihood fitting for low-count data where Gaussian statistics break do
 
 ## ENDF Nuclear Data
 
-Resonance parameters are sourced from the ENDF/B library via the IAEA API:
+Resonance parameters are sourced from evaluated nuclear data libraries
+(ENDF/B from NNDC with IAEA fallback; the other libraries from IAEA):
 
 - Module: [`retrieval`](api/nereids_endf/retrieval/) -- download and cache
 - Module: [`parser`](api/nereids_endf/parser/) -- parse ENDF-6 File 2

@@ -106,10 +106,12 @@ the active range.
 contributions from outside the user range. NEREIDS handles this transparently
 by extending the data slice by ~5×FWHM on each side and masking the cost
 function back to `[E_min, E_max]` — so resonances near the boundaries are
-correctly broadened without the user picking a custom margin. This mirrors
-SAMMY's auxiliary-grid construction (user manual Sec. III.B.2: the broadening
-grid extends beyond `[Emin − Wmin, Emax + Wmax]`, where `W` is the resolution
-width at each limit); NEREIDS uses ~5×FWHM for safety.
+correctly broadened without the user picking a custom margin. This follows
+the same endpoint-extension principle as SAMMY's auxiliary grid (general
+construction: user manual Sec. III.A.2(c); the quantitative
+`[Emin − Wmin, Emax + Wmax]` statement, with `W` the resolution width at each
+limit, appears in the Leal-Hwang procedure of Sec. III.B.2); NEREIDS uses a
+deliberately conservative ~5×FWHM margin.
 
 The setting persists in `.nrd.h5` project files (`Option<(f64, f64)>`,
 default `None` = full grid for backwards compatibility).

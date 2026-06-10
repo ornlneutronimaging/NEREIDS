@@ -216,8 +216,9 @@ pub struct UrrJGroup {
     /// Average fission width GF (eV). Single-element for LRF=1.
     pub gf: Vec<f64>,
     /// Interpolation law for the energy table (LRF=2 only).
-    /// INT=1..=5 per ENDF-6 §0.5 (1 histogram, 2 lin-lin, 3 log-lin,
-    /// 4 lin-log, 5 log-log).  Ignored for LRF=1 (no table).
+    /// INT=1..=5 per ENDF-6 §0.5 (1: histogram; 2: y linear in E;
+    /// 3: y linear in ln E; 4: ln y linear in E; 5: ln y linear in ln E).
+    /// Ignored for LRF=1 (no table).
     #[serde(default = "default_int_code")]
     pub int_code: u32,
 }

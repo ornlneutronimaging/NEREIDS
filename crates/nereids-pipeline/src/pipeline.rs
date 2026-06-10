@@ -386,9 +386,11 @@ pub struct UnifiedFitConfig {
     /// counts are computed against the active bin count when masking
     /// is in effect.  SAMMY equivalent: the `EMIN` / `EMAX` analysis
     /// limits (INPut-file card set 2, manual Table VI A.1); the kernel
-    /// margin matches the auxiliary-grid construction of manual
-    /// Sec. III.B.2, which extends the grid beyond
-    /// `[Emin − Wmin, Emax + Wmax]` (W = resolution width at the limit).
+    /// margin follows the same endpoint-extension principle as SAMMY's
+    /// auxiliary grid (general construction Sec. III.A.2(c); the
+    /// quantitative `[Emin − Wmin, Emax + Wmax]` statement is in the
+    /// Leal-Hwang procedure, Sec. III.B.2), with a deliberately
+    /// conservative 5×FWHM margin.
     fit_energy_range: Option<(f64, f64)>,
 
     // ── Isotope group mapping (optional) ──

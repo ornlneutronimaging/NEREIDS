@@ -25,8 +25,9 @@ output spatially resolved isotopic composition maps.
 - **Doppler broadening** -- Free Gas Model (crystal-lattice model planned, not yet implemented)
 - **Resolution broadening** -- Gaussian (channel width + flight path) and
   tabulated instrument functions
-- **ENDF/B data** -- automatic retrieval and caching from IAEA
-  (ENDF/B-VIII.0, ENDF/B-VIII.1, JEFF-3.3, JENDL-5, TENDL-2023, CENDL-3.2)
+- **ENDF nuclear data** -- automatic retrieval and caching (ENDF/B-VIII.0
+  and VIII.1 from NNDC with IAEA fallback; JEFF-3.3, JENDL-5, TENDL-2023,
+  and CENDL-3.2 from IAEA)
 - **Spectrum fitting** -- Levenberg-Marquardt and Poisson/KL divergence
   optimizers with analytical Jacobians
 - **Spatial mapping** -- parallel per-pixel fitting via rayon for 2D

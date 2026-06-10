@@ -1745,7 +1745,7 @@ class TestVenusMlbwRegression:
 
 
 class TestFitEnergyRangeBindingParameter:
-    """Tests for the SAMMY REGION-equivalent `fit_energy_range` parameter
+    """Tests for the SAMMY EMIN/EMAX-equivalent `fit_energy_range` parameter
     on `fit_spectrum_typed`.  The other two binding entry points
     (`fit_counts_spectrum_typed`, `spatial_map_typed`) share the same
     config-builder code path (`with_fit_energy_range(...).map_err(...)?`

@@ -58,8 +58,10 @@ All physics implementations reference SAMMY (ORNL/TM-9179) with:
 The decision above stands; two details have evolved since it was written:
 
 - A seventh core library crate, `endf-mat` (ENDF MAT-number lookup, element
-  symbols, and natural isotopic abundances), was extracted from
-  `nereids-endf` as a standalone, zero-dependency crate.
+  symbols, and natural isotopic abundances), was created as a standalone,
+  zero-dependency crate — consolidating `nereids-core::elements` and
+  `nereids-endf`'s MAT-number table, with newly added natural-abundance
+  data.
 - The fitting stack listed under `nereids-fitting` has evolved: the
   standalone L-BFGS-B solver path (internal to `poisson.rs`) was deleted
   (an L-BFGS-history fallback remains inside the transmission-domain
