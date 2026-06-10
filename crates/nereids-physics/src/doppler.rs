@@ -7,17 +7,35 @@
 //!
 //! ## SAMMY Reference
 //! - Manual Section III.B.1 (Free-Gas Model of Doppler Broadening)
-//! - `dop/` module (Leal-Hwang implementation)
+//! - `fgm/mfgm1.f90` subroutine `Dopfgm` (quadrature in `mfgm2.f90`
+//!   Modsmp/Modfpl)
 //!
 //! ## Method
 //!
-//! We implement the exact FGM integral in velocity space (SAMMY Eq. III B1.7):
+//! Velocity-space Gaussian broadening of v·σ:
 //!
 //!   v·σ_D(v²) = (1/(u√π)) ∫ exp(-(v-w)²/u²) · w · s(w) dw
 //!
 //! where v = √E, u = √(k_B·T / AWR), and:
 //!   s(w) =  σ(w²)  for w > 0
 //!   s(w) = -σ(w²)  for w < 0
+//!
+//! This is SAMMY Eq. III B1.7 **without** the (w/v) integrand weight the
+//! full FGM kernel carries — SAMMY's `Dopfgm` weights by w² and divides by
+//! v² (`fgm/mfgm2.f90` Modsmp/Modfpl, `mfgm4.f90`).  Error scales of the
+//! omission, in terms of u/v = √(kT/(AWR·E)):
+//!
+//! - **Smooth cross-sections** (second order): the full kernel maps a
+//!   constant σ to σ·(1 + u²/2v²) while this kernel preserves it (up to
+//!   exponentially small e^(-(v/u)²) image terms) — relative deviation
+//!   kT/(2·AWR·E) ≈ 8.2×10⁻⁶ for U-238 at 6.67 eV / 300 K.
+//! - **Resonance line shapes** (first order): an antisymmetric flank skew
+//!   of order u/v — up to ≈ 0.4% on the Doppler-broadened flanks of the
+//!   U-238 6.67 eV resonance at 300 K, vanishing at the peak — which can
+//!   alias into fitted energy-scale and density parameters.
+//!
+//! Exact-kernel (w²/v²) migration is planned, with a flank-discriminating
+//! kernel test.
 //!
 //! The key advantage of the velocity-space formulation is that u is
 //! independent of energy, making it a true convolution.
@@ -266,8 +284,9 @@ fn erfc_val(x: f64) -> f64 {
 
 /// Apply FGM Doppler broadening to cross-section data.
 ///
-/// The cross-sections are broadened in velocity space using the exact
-/// Free Gas Model integral from SAMMY manual Eq. III B1.7.
+/// The cross-sections are broadened in velocity space via Gaussian
+/// convolution of v·σ — SAMMY manual Eq. III B1.7 without the (w/v)
+/// integrand weight; see the module docs for the error characterization.
 ///
 /// # Arguments
 /// * `energies` — Energy grid in eV. Every entry must satisfy
@@ -1463,5 +1482,145 @@ mod tests {
             max_rel_err < 1e-3,
             "analytical vs SAMMY-style FD max rel error = {max_rel_err:.2e}, expected < 1e-3"
         );
+    }
+
+    /// Pin the documented error scales of the implemented kernel (module
+    /// docs: Eq. III B1.7 WITHOUT the (w/v) integrand weight) against an
+    /// in-test full-kernel reference, so the published numbers are tested,
+    /// not free-floating.  The existing SAMMY ex001 oracle (6% tolerance)
+    /// is blind to this error class.
+    ///
+    /// (a) Smooth limit: the implemented kernel preserves a constant σ
+    ///     (quadrature-noise level), while the full kernel yields
+    ///     σ·(1 + u²/2v²) — the documented kT/(2·AWR·E) deviation.
+    /// (b) Resonance line shape (U-238-like Lorentzian: E_r = 6.674 eV,
+    ///     Γ = 0.027 eV, AWR = 236.0058, 300 K): the implemented-vs-full
+    ///     deviation at the ±Δ_D flanks is FIRST order — antisymmetric,
+    ///     within [0.1%, 1%], pinning the documented "~0.4%" — and second-
+    ///     order small at the peak.
+    /// (c) The production `doppler_broaden` agrees with the reference
+    ///     implemented-kernel quadrature at those points, so the pin holds
+    ///     for the shipping code path.
+    ///
+    /// When the exact-kernel (w²/v²) migration lands, expectation (b)
+    /// inverts: production moves to the full-kernel reference and the
+    /// flank deviation vs `sigma_full` drops to quadrature level.
+    #[test]
+    fn kernel_error_scales_pinned_vs_full_fgm_reference() {
+        use std::f64::consts::PI;
+
+        let awr = 236.0058;
+        let t_k = 300.0;
+        let e_r = 6.674; // eV
+        let gamma = 0.027; // eV (total width scale; Lorentzian discriminator)
+        let params = DopplerParams::new(t_k, awr).unwrap();
+        let u = params.u();
+
+        // Reference quadrature of the analytic integrand on [v−12u, v+12u]
+        // (Simpson).  The negative-velocity image branch is omitted: it is
+        // suppressed by exp(−(v/u)²) with v/u ≈ 247 here.  `power` selects
+        // the implemented kernel (w¹, divide by v) vs the full FGM kernel
+        // (w², divide by v²).
+        let broadened_ref = |sigma: &dyn Fn(f64) -> f64, e: f64, full: bool| -> f64 {
+            let v = e.sqrt();
+            let (lo, hi) = (v - 12.0 * u, v + 12.0 * u);
+            // Enforce the image-branch-omission precondition: the window must
+            // stay in positive-w territory, which also bounds the omitted
+            // image term at ≤ exp(−(v/u)²) ≤ exp(−144) — far below quadrature
+            // noise.  If the test parameters (E, T, AWR) ever change such that
+            // this fails, implement the negative-w branch instead.
+            assert!(
+                lo > 0.0,
+                "reference quadrature window crosses w = 0 (v/u = {:.1} < 12); \
+                 the omitted image branch is no longer negligible",
+                v / u
+            );
+            let n = 4800usize; // even (Simpson); h = 0.005·u
+            let h = (hi - lo) / n as f64;
+            let f = |w: f64| -> f64 {
+                let g = (-((v - w) / u).powi(2)).exp();
+                let wp = if full { w * w } else { w };
+                g * wp * sigma(w * w)
+            };
+            let mut s = f(lo) + f(hi);
+            for i in 1..n {
+                let w = lo + i as f64 * h;
+                s += f(w) * if i % 2 == 1 { 4.0 } else { 2.0 };
+            }
+            let integral = s * h / 3.0;
+            let norm = u * PI.sqrt() * if full { v * v } else { v };
+            integral / norm
+        };
+
+        // (a) Constant cross-section.
+        let const_sigma = |_e: f64| 1.0_f64;
+        let apx_const = broadened_ref(&const_sigma, e_r, false);
+        let full_const = broadened_ref(&const_sigma, e_r, true);
+        let u2_over_2v2 = u * u / (2.0 * e_r); // v² = E
+        assert!(
+            (apx_const - 1.0).abs() < 1e-8,
+            "implemented kernel must preserve constant σ (got dev {:.3e})",
+            apx_const - 1.0
+        );
+        assert!(
+            ((full_const - 1.0) - u2_over_2v2).abs() < 0.05 * u2_over_2v2,
+            "full kernel on constant σ must give 1 + u²/2v² = 1 + {:.3e} (got 1 + {:.3e})",
+            u2_over_2v2,
+            full_const - 1.0
+        );
+
+        // (b) Lorentzian line shape: first-order antisymmetric flank skew.
+        let lorentzian = |e: f64| {
+            let x = (e - e_r) / (gamma / 2.0);
+            1.0 / (1.0 + x * x)
+        };
+        let delta_d = params.doppler_width(e_r);
+        let dev_at = |e: f64| -> f64 {
+            let apx = broadened_ref(&lorentzian, e, false);
+            let full = broadened_ref(&lorentzian, e, true);
+            (full - apx) / full
+        };
+        let dev_lo = dev_at(e_r - delta_d);
+        let dev_hi = dev_at(e_r + delta_d);
+        let dev_peak = dev_at(e_r);
+        assert!(
+            dev_lo > 1.0e-3 && dev_lo < 1.0e-2,
+            "low-flank deviation must be first-order positive (~0.3%), got {dev_lo:.3e}"
+        );
+        assert!(
+            dev_hi < -1.0e-3 && dev_hi > -1.0e-2,
+            "high-flank deviation must be first-order negative (~−0.3%), got {dev_hi:.3e}"
+        );
+        assert!(
+            dev_peak.abs() < 5.0e-5,
+            "peak deviation must be second-order small, got {dev_peak:.3e}"
+        );
+
+        // (c) The shipping doppler_broaden matches the implemented-kernel
+        // reference at the same energies (grid fine enough that production
+        // quadrature error ≪ the 0.3% flank signal).
+        let n_grid = 3001usize;
+        let (e_lo, e_hi) = (e_r - 1.2, e_r + 1.2);
+        let energies: Vec<f64> = (0..n_grid)
+            .map(|i| e_lo + (e_hi - e_lo) * i as f64 / (n_grid - 1) as f64)
+            .collect();
+        let xs: Vec<f64> = energies.iter().map(|&e| lorentzian(e)).collect();
+        let broadened = doppler_broaden(&energies, &xs, &params).unwrap();
+        for target in [e_r - delta_d, e_r, e_r + delta_d] {
+            let idx = energies
+                .iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| (*a - target).abs().total_cmp(&(*b - target).abs()))
+                .map(|(i, _)| i)
+                .unwrap();
+            let e_eval = energies[idx];
+            let ref_apx = broadened_ref(&lorentzian, e_eval, false);
+            let rel = (broadened[idx] - ref_apx).abs() / ref_apx;
+            assert!(
+                rel < 5.0e-4,
+                "production doppler_broaden vs implemented-kernel reference at \
+                 E = {e_eval:.4} eV: rel dev {rel:.3e} (must be ≪ the 3e-3 flank signal)"
+            );
+        }
     }
 }

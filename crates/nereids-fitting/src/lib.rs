@@ -11,7 +11,7 @@
 //! - [`transmission_model`] — Transmission forward model adapter for fitting
 //!
 //! ## SAMMY Reference
-//! - Fitting: `fit/` module, `fitAPI/`, manual Sec 4
+//! - Fitting: `fit/` module, `fitAPI/`, manual Sec. IV
 //!
 //! ## TRINIDI Reference
 //! - `trinidi/reconstruct.py` for Poisson-likelihood and APGM approach

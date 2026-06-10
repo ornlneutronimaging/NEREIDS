@@ -24,7 +24,7 @@
 //!   accumulators consumed by Elastc_Mlb.
 //! - `xxx/mxxx9.f90` lines 68-71 (`Cs2sn2`) — confirms SAMMY's `Cs/Si` arrays
 //!   hold `cos(2φ)/sin(2φ)`, not `cos(φ)/sin(φ)`.
-//! - SAMMY manual Section 2.1.1.
+//! - SAMMY manual Section II.B.3 (Breit-Wigner approximations).
 //!
 //! ## Formulas
 //! For each resonance at energy E_r with total J, write Δ = E − E_r and

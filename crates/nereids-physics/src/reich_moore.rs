@@ -36,7 +36,7 @@
 //! - `rml/mrml09.f` Yinvrs: level matrix inversion
 //! - `rml/mrml11.f` Setxqx: X-matrix, Sectio: cross-sections
 //! - `rml/mrml03.f` Betset: ENDF widths → reduced width amplitudes
-//! - SAMMY manual Section 2.1 (R-matrix theory)
+//! - SAMMY manual Section II.B.1 (Reich-Moore approximation)
 
 use num_complex::Complex64;
 
@@ -413,11 +413,6 @@ pub fn cross_sections_at_energy(data: &ResonanceData, energy_ev: f64) -> CrossSe
 ///
 /// Issue #87: the precompute is hoisted above the energy loop so that
 /// `precompute_jgroups_*` runs O(ranges) times total, not O(ranges × energies).
-///
-/// # Limitations
-/// MLBW (Multi-Level Breit-Wigner, LRF=2) ranges use true MLBW with interference.
-/// formulas as an approximation, ignoring resonance-resonance interference.
-/// Results may be inaccurate for closely spaced or overlapping resonances.
 ///
 /// # Arguments
 /// * `data` — Parsed resonance parameters from ENDF.

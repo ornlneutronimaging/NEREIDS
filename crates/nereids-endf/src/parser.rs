@@ -132,7 +132,7 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
 
                 // NRO=range_cont.n1: if non-zero a TAB1 AP(E) record immediately follows
                 // the range CONT before the URR SPI/AP/NLS CONT.
-                // ENDF-6 §2.2.2; SAMMY unr/munr01.f90.
+                // ENDF-6 §2.2.2.
                 let nro_urr = range_cont.n1;
                 let naps_urr = range_cont.n2; // scattering radius calculation flag
                 let ap_table_urr = if nro_urr != 0 {
@@ -1413,7 +1413,7 @@ fn parse_urr_lfw1_lrf1(ctx: &mut RangeParseContext<'_>) -> Result<ResonanceRange
 /// LFW=1 / LRF=1 (energy-dependent fission widths with the shared-grid
 /// layout) is handled separately by `parse_urr_lfw1_lrf1`.
 ///
-/// Reference: ENDF-6 Formats Manual §2.2.2; SAMMY `unr/munr03.f90`
+/// Reference: ENDF-6 Formats Manual §2.2.2
 fn parse_urr_range(
     ctx: &mut RangeParseContext<'_>,
     lrf: i32,
@@ -1532,9 +1532,9 @@ fn parse_urr_range(
 
                 // All ENDF interpolation laws (INT=1..5) are now supported
                 // in the URR physics module (urr.rs).
-                // INT=1: histogram, INT=2: lin-lin, INT=3: log-lin,
-                // INT=4: lin-log, INT=5: log-log.
-                // ENDF-6 §2.2.2.2; SAMMY unr/munr01.f90.
+                // INT=1: histogram, INT=2: lin-lin, INT=3: log-x/lin-y,
+                // INT=4: lin-x/log-y, INT=5: log-log.
+                // ENDF-6 §2.2.2.2.
 
                 let values = parse_list_values(ctx.lines, ctx.pos, n1)?;
 

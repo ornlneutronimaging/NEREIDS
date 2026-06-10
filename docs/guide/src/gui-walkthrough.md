@@ -37,8 +37,9 @@ The landing page presents three entry points:
 After selecting **Load & Fit Data**, a short wizard asks:
 
 1. **Fitting type**: Single spectrum or spatial map
-2. **Data format**: Raw Events (HDF5/NeXus), Histogram, Pre-Normalization,
-   or Transmission (Already Normalized)
+2. **Data format**: "Raw Events (HDF5/NeXus)", "Histogram, Pre-Normalization",
+   or "Transmission (Already Normalized)" — quoted as the wizard cards
+   label them
 
 The wizard configures a dynamic pipeline with only the steps relevant to your
 data format. Six distinct pipelines are available.
@@ -82,18 +83,18 @@ with move, select, and delete operations.
 
 ![Analyze step](images/analyze-step.png)
 
-#### Restricting the fit energy range (SAMMY REGION)
+#### Restricting the fit energy range (SAMMY EMIN/EMAX)
 
 By default NEREIDS fits the entire loaded energy grid. The advanced solver
-panel exposes a **"Restrict fit energy range"** checkbox (SAMMY REGION
-equivalent — `MIN ENERGY` / `MAX ENERGY` SAM52 cards) that limits the cost
+panel exposes a **"Restrict fit energy range"** checkbox (equivalent to
+SAMMY's EMIN/EMAX analysis limits) that limits the cost
 function to a user-specified `[E_min, E_max]` window in eV. Common uses:
 
 - **Resolved-resonance region only** — exclude the unresolved-resonance and
   high-energy tails where the model can't fit;
 - **Single resonance triplet** — focus on a specific feature for fine-grained
   density / temperature work;
-- **SAMMY parity** — match the REGION restriction used in a reference SAMMY
+- **SAMMY parity** — match the EMIN/EMAX restriction used in a reference SAMMY
   fit so the comparison is apples-to-apples.
 
 When the checkbox is on, two grey dashed vertical lines on the spectrum plot
@@ -105,8 +106,12 @@ the active range.
 contributions from outside the user range. NEREIDS handles this transparently
 by extending the data slice by ~5×FWHM on each side and masking the cost
 function back to `[E_min, E_max]` — so resonances near the boundaries are
-correctly broadened without the user picking a custom margin. SAMMY user
-manual §IIID.6 recommends 3–5×FWHM; we use 5× for safety.
+correctly broadened without the user picking a custom margin. This follows
+the same endpoint-extension principle as SAMMY's auxiliary grid (general
+construction: user manual Sec. III.A.2(c); the quantitative
+`[Emin − Wmin, Emax + Wmax]` statement, with `W` the resolution width at each
+limit, appears in the Leal-Hwang procedure of Sec. III.B.2); NEREIDS uses a
+deliberately conservative ~5×FWHM margin.
 
 The setting persists in `.nrd.h5` project files (`Option<(f64, f64)>`,
 default `None` = full grid for backwards compatibility).

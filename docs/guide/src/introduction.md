@@ -42,7 +42,7 @@ and equation numbers in their documentation.
 Key formalisms from SAMMY:
 
 - Reich-Moore R-matrix (LRF=3)
-- Single-Level Breit-Wigner (LRF=1/2)
+- Breit-Wigner, single- and multi-level (LRF=1/2)
 - R-Matrix Limited (LRF=7)
 - Free Gas Model Doppler broadening
 - Gaussian + exponential resolution broadening

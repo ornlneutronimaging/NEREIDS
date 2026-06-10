@@ -62,7 +62,7 @@ pub struct JointPoissonObjective<'a> {
     pub s: &'a [f64],
     /// Proton-charge ratio `c = Q_s / Q_ob`.  Must be strictly positive.
     pub c: f64,
-    /// Optional per-bin active mask (SAMMY REGION-equivalent
+    /// Optional per-bin active mask (SAMMY EMIN/EMAX-equivalent
     /// fit-energy-range restriction).  When `Some(m)`, only bins where
     /// `m[i]` is `true` contribute to the deviance / gradient / Fisher
     /// information; the model is still evaluated on the full grid so
@@ -784,7 +784,7 @@ pub struct JointPoissonResult {
     /// set, or the count of `true` entries in the objective's
     /// `active_mask` otherwise.  The deviance / dof ratio uses
     /// `(n_active − n_free)` so reduced deviance is unbiased when a
-    /// fit-energy-range mask is in effect (SAMMY REGION semantics, #514).
+    /// fit-energy-range mask is in effect (SAMMY EMIN/EMAX semantics, #514).
     pub n_active: usize,
     /// Number of free parameters (k).
     pub n_free: usize,
@@ -886,7 +886,7 @@ pub fn joint_poisson_fit(
         });
     }
 
-    // SAMMY REGION-equivalent fit-energy-range (#514): zero active
+    // SAMMY EMIN/EMAX-equivalent fit-energy-range (#514): zero active
     // bins means the user's `[E_min, E_max]` does not overlap the
     // configured grid.  No data contributes to the deviance — return
     // non-converged with NaN before falling through.  Without this
@@ -1002,7 +1002,7 @@ pub fn joint_poisson_fit(
     let final_values = params.all_values();
     let final_deviance = objective.deviance(&final_values)?;
     let n_free = params.n_free();
-    // Active-bin masking (SAMMY REGION): when a fit-energy-range mask
+    // Active-bin masking (SAMMY EMIN/EMAX): when a fit-energy-range mask
     // is in effect, dof must use the count of bins that contributed to
     // the deviance — otherwise deviance-per-dof is biased low by the
     // ratio (n_active / n_data).  The `n_active < n_free` case has
@@ -2050,7 +2050,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Active-bin mask (SAMMY REGION-equivalent fit-energy-range, #514).
+    // Active-bin mask (SAMMY EMIN/EMAX-equivalent fit-energy-range, #514).
     // ------------------------------------------------------------------
 
     /// `deviance_from_transmission` with `active_mask` set must equal

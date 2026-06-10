@@ -12,8 +12,8 @@
 //!
 //! LRF=1: Γ_n(E) = 2 · P_L(ρ(E)) · GNO    [GNO = reduced neutron width]
 //! LRF=2: Γ_n(E) from tabulated energy grid using INT interpolation
-//!         INT=1 histogram, INT=2 lin-lin, INT=3 log-lin,
-//!         INT=4 lin-log, INT=5 log-log (all 5 ENDF codes supported)
+//!         INT=1 histogram, INT=2 lin-lin, INT=3 log-x/lin-y,
+//!         INT=4 lin-x/log-y, INT=5 log-log (all 5 ENDF codes supported)
 //!
 //! Γ_tot = Γ_n + GG + GF + GX
 //!
@@ -28,6 +28,17 @@
 //! returned `total` and `elastic` so that the URR band produces a physically
 //! consistent cross-section without requiring special handling at the call site.
 //!
+//! ## Width-Fluctuation Correction — not yet implemented
+//!
+//! The kernel above is the energy-averaged Hauser-Feshbach expression in the
+//! W = 1 limit: no width-fluctuation (Porter-Thomas / Moldauer / Dresner)
+//! factor is applied.  The χ² degrees of freedom `AMUN` / `AMUF` are parsed
+//! from ENDF File 2 and stored on `UrrJGroup` (within `UrrData`), but are
+//! not yet consumed here.
+//! SAMMY's URR treatment (FITACS, manual Section VIII) includes the
+//! fluctuation integrals, so NEREIDS URR cross-sections will differ from
+//! SAMMY's where fluctuation effects are significant.
+//!
 //! ## Units
 //! All energies in eV, all lengths (AP, channel radii) in fm (true physics
 //! femtometers, 10⁻¹⁵ m), cross-sections in barns.
@@ -37,8 +48,9 @@
 //! matching SAMMY's `FillSammyRmatrixFromRMat.cpp` line 422.
 //!
 //! ## SAMMY Reference
-//! - `unr/munr03.f90` Csig3 subroutine
-//! - SAMMY manual Section 4 (URR treatment)
+//! - SAMMY manual Section VIII.A (equations for the Unresolved Resonance Region)
+//! - SAMMY's URR analysis code is FITACS (`acs/` in the SAMMY source tree),
+//!   which includes the width-fluctuation corrections this module omits
 //!
 //! ## References
 //! - ENDF-6 Formats Manual §2.2.2
@@ -49,7 +61,9 @@ use nereids_endf::resonance::UrrData;
 use crate::channel;
 use crate::penetrability;
 
-/// Compute Hauser-Feshbach average cross-sections in the Unresolved Resonance Region.
+/// Compute energy-averaged Hauser-Feshbach cross-sections in the Unresolved
+/// Resonance Region (width-fluctuation correction not yet applied; see the
+/// module docs).
 ///
 /// Returns `(total, elastic, capture, fission)` in barns.
 /// All four are zero when `e_ev` falls outside the URR energy band
@@ -58,11 +72,11 @@ use crate::penetrability;
 /// `elastic` = compound-nuclear elastic + smooth potential scattering.
 /// `total`   = elastic + capture + fission + competitive (GX).
 /// Potential scattering `σ_pot = 4π·AP²/100` (AP in fm, result in barns)
-/// is folded in here rather than at the call site.
-/// SAMMY ref: `unr/munr03.f90` includes the hard-sphere background.
+/// is folded in here rather than at the call site, so the URR band yields a
+/// physically complete elastic cross-section.
 ///
 /// ## SAMMY Reference
-/// `unr/munr03.f90` Csig3 — Hauser-Feshbach cross-section kernel.
+/// SAMMY manual Section VIII.A — energy-averaged cross-section equations.
 ///
 /// # Arguments
 /// * `urr` — Parsed URR parameters (LRF=1 or LRF=2).
@@ -124,15 +138,13 @@ pub fn urr_cross_sections(urr: &UrrData, e_ev: f64, ap_fm: f64) -> (f64, f64, f6
             // Target spin I = urr.spi, neutron spin s = 1/2.
             let g_j = channel::statistical_weight(jg.j, urr.spi);
 
-            // Obtain effective widths at energy e_ev.
+            // Obtain effective widths at energy e_ev (module formula block).
             //
-            // LRF=1: Γ_n = 2·P_L(ρ)·GNO  (GNO = reduced neutron width, eV)
+            // LRF=1: Γ_n(E) = 2·P_L(ρ(E))·GNO  (GNO = reduced neutron width, eV);
             //        D, GG, GF are energy-independent (single-element vecs).
             // LRF=2: widths interpolated from the energy table using the
-            //        INT code stored per J-group.
-            //        INT=2 (lin-lin) and INT=5 (log-log) are both supported.
-            //
-            // SAMMY ref: unr/munr03.f90 Csig3 — `Gn = Two*Pene*Gno` for LRF=1.
+            //        INT code stored per J-group; all five ENDF INT codes
+            //        (1-5) are supported (see the dispatch below).
             let (gn_eff, d_eff, gx_eff, gg_eff, gf_eff) = if urr.lrf == 1 {
                 let gno = jg.gn[0]; // reduced neutron width (eV)
                 // LFW=1: fission widths are energy-dependent (tabulated).
@@ -146,8 +158,8 @@ pub fn urr_cross_sections(urr: &UrrData, e_ev: f64, ap_fm: f64) -> (f64, f64, f6
                 (2.0 * p_l * gno, jg.d[0], 0.0_f64, jg.gg[0], gf)
             } else {
                 // LRF=2: dispatch on the stored interpolation law.
-                // ENDF-6 §0.5: INT=1 histogram, 2 lin-lin, 3 log-lin,
-                // 4 lin-log, 5 log-log.
+                // ENDF-6 §0.5: INT=1 histogram, 2 lin-lin, 3 log-x/lin-y,
+                // 4 lin-x/log-y, 5 log-log.
                 let interp: fn(&[f64], &[f64], f64) -> f64 = match jg.int_code {
                     1 => histogram_interp,
                     3 => log_lin_interp,
@@ -176,8 +188,8 @@ pub fn urr_cross_sections(urr: &UrrData, e_ev: f64, ap_fm: f64) -> (f64, f64, f6
             // Hauser-Feshbach kernel:
             //   (π/k²) · g_J · (2π · Γ_n / D) · Γ_x / Γ_tot
             //
-            // The 2π/D factor is the average level density times 2π.
-            // SAMMY ref: unr/munr03.f90 `Two*Pi*Gn/D` prefactor.
+            // The 2π/D factor is the average level density times 2π
+            // (module formula block; manual Sec. VIII.A).
             let prefactor = pi_over_k2 * g_j * (2.0 * std::f64::consts::PI * gn_eff) / d_eff;
 
             sig_cap += prefactor * gg_eff / gamma_tot;
@@ -186,20 +198,20 @@ pub fn urr_cross_sections(urr: &UrrData, e_ev: f64, ap_fm: f64) -> (f64, f64, f6
             // nucleus and re-emitted as a neutron.  The probability of re-emission
             // into the neutron channel is Γ_n / Γ_tot, giving:
             //   σ_cn = (π/k²) · g_J · (2π·Γ_n/D) · Γ_n / Γ_tot
-            // SAMMY ref: unr/munr03.f90 — `Sigxxx` uses Gn for both transmission
-            // coefficients in the neutron elastic formula.
+            // Compound-elastic: Γ_n appears as both the entrance and the exit
+            // width (module formula block).
             sig_compound_n += prefactor * gn_eff / gamma_tot;
             // Competitive (inelastic) channel: GX is included in Γ_tot but goes
             // into neither capture nor fission.  It contributes to the total
             // cross section without appearing in elastic, capture, or fission.
-            // SAMMY ref: unr/munr03.f90 — GX field in Gamma_total.
+            // GX enters Γ_tot only (module formula block).
             sig_competitive += prefactor * gx_eff / gamma_tot;
         }
     }
 
     // Smooth potential scattering: σ_pot = 4π·AP²
     // AP is in fm; 1 barn = 100 fm².
-    // SAMMY ref: unr/munr03.f90 adds hard-sphere background to elastic.
+    // Folded into `elastic` per the function contract (see fn doc).
     let sig_pot = 4.0 * std::f64::consts::PI * ap_fm * ap_fm / 100.0;
     let elastic = sig_compound_n + sig_pot;
     let total = elastic + sig_cap + sig_fiss + sig_competitive;

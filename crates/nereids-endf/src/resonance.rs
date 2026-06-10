@@ -184,15 +184,16 @@ pub enum ResonanceFormalism {
 // LRF=2: tabulated energy-dependent widths with an interpolation law per
 //        J-group; supported INT codes enforced by the parser at load time.
 //
-// Reference: ENDF-6 Formats Manual §2.2.2; SAMMY unr/munr03.f90 Csig3
+// Reference: ENDF-6 Formats Manual §2.2.2
 
 /// Average widths for one (L, J) combination in the Unresolved Resonance Region.
 ///
 /// For LRF=1: `energies` is empty; each width vector has exactly one element.
 /// For LRF=2: all vectors have length NE; `int_code` selects the interpolation
-/// law (INT=2 lin-lin or INT=5 log-log).
+/// law (INT=1..=5 per ENDF-6 §0.5; validated by the parser, dispatched in
+/// `nereids_physics::urr`).
 ///
-/// Reference: ENDF-6 Formats Manual §2.2.2; SAMMY `unr/munr03.f90`
+/// Reference: ENDF-6 Formats Manual §2.2.2
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UrrJGroup {
     /// Total angular momentum J.
@@ -215,7 +216,9 @@ pub struct UrrJGroup {
     /// Average fission width GF (eV). Single-element for LRF=1.
     pub gf: Vec<f64>,
     /// Interpolation law for the energy table (LRF=2 only).
-    /// 2 = lin-lin, 5 = log-log.  Ignored for LRF=1 (no table).
+    /// INT=1..=5 per ENDF-6 §0.5 (1: histogram; 2: y linear in E;
+    /// 3: y linear in ln E; 4: ln y linear in E; 5: ln y linear in ln E).
+    /// Ignored for LRF=1 (no table).
     #[serde(default = "default_int_code")]
     pub int_code: u32,
 }
@@ -241,7 +244,7 @@ pub struct UrrLGroup {
 ///
 /// Stored in `ResonanceRange::urr` when the range is an URR range.
 ///
-/// Reference: ENDF-6 Formats Manual §2.2.2; SAMMY `unr/munr03.f90`
+/// Reference: ENDF-6 Formats Manual §2.2.2
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UrrData {
     /// LRF flag: 1 = single-level BWR (energy-independent widths),

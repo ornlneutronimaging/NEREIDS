@@ -6,7 +6,7 @@
 //!
 //! ## SAMMY Reference
 //! - `rml/mrml03.f` Fxradi: wave number and radius computations
-//! - SAMMY manual Section 2 (kinematics)
+//! - SAMMY manual Section II.A (scattering-theory equations and kinematics)
 //!
 //! ## Units
 //! All quantities in natural units: energies in eV, lengths in fm.

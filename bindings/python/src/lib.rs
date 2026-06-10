@@ -3375,7 +3375,7 @@ fn py_spatial_map_typed<'py>(
     // Dead pixels
     let dead_arr = dead_pixels.map(|dp| dp.as_array().to_owned());
 
-    // SAMMY REGION-equivalent fit-energy-range (#514): mask residuals
+    // SAMMY EMIN/EMAX-equivalent fit-energy-range (#514): mask residuals
     // to bins inside [E_min, E_max] in both LM and joint-Poisson per-
     // pixel cost paths.  The model is evaluated on the full grid so
     // resolution broadening at the boundaries is correct.
@@ -3703,7 +3703,7 @@ fn py_fit_counts_spectrum_typed<'py>(
         config = config.with_counts_enable_polish(Some(v));
     }
 
-    // SAMMY REGION-equivalent fit-energy-range (#514): mask residuals
+    // SAMMY EMIN/EMAX-equivalent fit-energy-range (#514): mask residuals
     // to bins inside [E_min, E_max]; the joint-Poisson cost path
     // honours the mask in deviance / gradient / Fisher loops.  No
     // Python-side data slicing required — the model is evaluated on
@@ -4203,7 +4203,7 @@ fn py_fit_spectrum_typed<'py>(
         config = config.with_tzero_jacobian_method(tzero_method);
     }
 
-    // SAMMY REGION-equivalent fit-energy-range (#514): when set, the
+    // SAMMY EMIN/EMAX-equivalent fit-energy-range (#514): when set, the
     // LM cost-function masks residuals to bins inside [E_min, E_max].
     // The Python caller is expected to pass full grid + per-bin data
     // and let the solver-side mask handle the restriction; the model

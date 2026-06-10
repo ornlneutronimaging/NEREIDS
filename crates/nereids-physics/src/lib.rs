@@ -4,22 +4,29 @@
 //! forward model for neutron resonance imaging.
 //!
 //! ## Modules
-//! - [`penetrability`] — Hard-sphere penetrability, shift, and phase shift functions
+//! - [`auxiliary_grid`] — Auxiliary energy-grid construction for resolution broadening
 //! - [`channel`] — Wave number, ρ parameter, statistical weight calculations
-//! - [`reich_moore`] — Reich-Moore R-matrix cross-section formalism
-//! - [`slbw`] — Single-Level Breit-Wigner formalism (validation/comparison)
+//! - [`coulomb`] — Coulomb wave functions (Steed's CF1+CF2) for charged-particle channels
 //! - [`doppler`] — Free Gas Model Doppler broadening
+//! - [`penetrability`] — Hard-sphere penetrability, shift, and phase shift functions
+//! - [`reich_moore`] — Reich-Moore R-matrix cross-section formalism
 //! - [`resolution`] — Instrument resolution broadening (Gaussian convolution)
+//! - [`rmatrix_limited`] — R-Matrix Limited (LRF=7) multi-channel formalism
+//! - [`slbw`] — Breit-Wigner formalisms, single- and multi-level (LRF=1/2)
+//! - [`surrogate`] — Forward-model surrogates for multi-isotope accelerated fits
 //! - [`transmission`] — Beer-Lambert transmission forward model
-//! - [`urr`] — Unresolved Resonance Region (LRU=2) Hauser-Feshbach cross-sections
+//! - [`urr`] — Unresolved Resonance Region (LRU=2) energy-averaged
+//!   Hauser-Feshbach cross-sections (width-fluctuation correction not yet
+//!   implemented)
 //!
 //! ## SAMMY Reference
-//! - Cross-sections: `rml/` (Reich-Moore), `mlb/` (SLBW/MLBW), manual Sec 2
+//! - Cross-sections: `rml/` (Reich-Moore), `mlb/` (SLBW/MLBW), manual Sec. II
 //! - Penetrability: `rml/mrml07.f` (Pgh, Sinsix, Pf)
 //! - Coulomb: `coulomb/mrml08.f90` (Coulfg, Steed's CF1+CF2)
-//! - Doppler: `dop/` module, manual Sec 3.1
-//! - Resolution: `convolution/` module, manual Sec 3.2
-//! - Transmission: `cro/`, `xxx/` modules, manual Sec 2, Sec 5
+//! - Doppler: `fgm/` module (Dopfgm), manual Sec. III.B.1
+//! - Resolution: `convolution/` module, manual Sec. III.C
+//! - Transmission: `cro/`, `xxx/` modules, manual Sec. II; transmission
+//!   experiments Sec. III.E.1
 
 pub mod auxiliary_grid;
 pub mod channel;
