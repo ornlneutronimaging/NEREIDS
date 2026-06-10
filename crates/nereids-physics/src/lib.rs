@@ -23,7 +23,7 @@
 //! - Cross-sections: `rml/` (Reich-Moore), `mlb/` (SLBW/MLBW), manual Sec. II
 //! - Penetrability: `rml/mrml07.f` (Pgh, Sinsix, Pf)
 //! - Coulomb: `coulomb/mrml08.f90` (Coulfg, Steed's CF1+CF2)
-//! - Doppler: `dop/` module, manual Sec. III.B.1-2
+//! - Doppler: `fgm/` module (Dopfgm), manual Sec. III.B.1
 //! - Resolution: `convolution/` module, manual Sec. III.C
 //! - Transmission: `cro/`, `xxx/` modules, manual Sec. II; transmission
 //!   experiments Sec. III.E.1

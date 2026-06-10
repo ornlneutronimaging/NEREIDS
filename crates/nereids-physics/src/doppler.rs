@@ -7,7 +7,7 @@
 //!
 //! ## SAMMY Reference
 //! - Manual Section III.B.1 (Free-Gas Model of Doppler Broadening)
-//! - `dop/` module (Leal-Hwang implementation)
+//! - `fgm/` module (`FreeGasDopplerBroadening_M.f90`, subroutine `Dopfgm`)
 //!
 //! ## Method
 //!

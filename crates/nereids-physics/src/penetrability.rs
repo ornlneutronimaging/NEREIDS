@@ -6,7 +6,8 @@
 //! ## SAMMY Reference
 //! - `rml/mrml07.f`: `Sinsix` (phase shifts), `Pgh` (penetrability + shift),
 //!   `Pf` (penetrability only)
-//! - SAMMY manual Section 2 (R-matrix theory)
+//! - SAMMY manual Section II.A, Table II A.1 (penetrability, level-shift, and
+//!   phase-shift formulas)
 //!
 //! ## Definitions
 //! For channel radius a and neutron wave number k:

@@ -60,9 +60,11 @@ The decision above stands; two details have evolved since it was written:
 - A seventh core library crate, `endf-mat` (ENDF MAT-number lookup, element
   symbols, and natural isotopic abundances), was extracted from
   `nereids-endf` as a standalone, zero-dependency crate.
-- The fitting stack listed under `nereids-fitting` has evolved: the external
-  BFGS solver was removed; the current engines are Levenberg-Marquardt,
-  a transmission-domain Poisson/KL optimizer, and a counts-domain
-  joint-Poisson (conditional binomial deviance) solver.
+- The fitting stack listed under `nereids-fitting` has evolved: the
+  standalone L-BFGS-B solver path (internal to `poisson.rs`) was deleted
+  (an L-BFGS-history fallback remains inside the transmission-domain
+  Poisson/KL optimizer); the current engines are Levenberg-Marquardt, the
+  Poisson/KL optimizer, and a counts-domain joint-Poisson (conditional
+  binomial deviance) solver.
 
 The SAMMY reference document is ORNL/TM-9179/R8.

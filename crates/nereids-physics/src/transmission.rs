@@ -20,7 +20,8 @@
 //!
 //! ## SAMMY Reference
 //! - `cro/` and `xxx/` modules — cross-section to transmission conversion
-//! - Manual Section 2 (transmission definition), Section 5 (experimental corrections)
+//! - Manual Section II (cross-section theory); transmission experiments
+//!   Section III.E.1
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};

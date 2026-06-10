@@ -33,7 +33,8 @@
 //!   Ξ_cc'(E) = (√P_c / L_c) · (Ỹinv · R)_cc' · √P_c'
 //!
 //! Collision matrix (eq. III.D.4 in SAMMY-manual-R3 numbering, as cited by
-//! `rml/mrml11.f`; in the R8 manual this is Eqs. (II B1.3)-(II B1.4)):
+//! `rml/mrml11.f`; R8: W is Eqs. (II B1.3)-(II B1.4), and U = Ω·W·Ω′ is
+//! Eq. (II A.4) with Ω from Eq. (II A.5)):
 //!   W_cc' = δ_cc' + 2i·Ξ_cc'
 //!   U_cc' = Ω_c · W_cc' · Ω_c'    where Ω_c = exp(-iφ_c)
 //!

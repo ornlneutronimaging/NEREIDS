@@ -36,7 +36,7 @@
 //! - `rml/mrml09.f` Yinvrs: level matrix inversion
 //! - `rml/mrml11.f` Setxqx: X-matrix, Sectio: cross-sections
 //! - `rml/mrml03.f` Betset: ENDF widths → reduced width amplitudes
-//! - SAMMY manual Section 2.1 (R-matrix theory)
+//! - SAMMY manual Section II.B.1 (Reich-Moore approximation)
 
 use num_complex::Complex64;
 

@@ -15,7 +15,7 @@ equations and citations.
 | Reich-Moore | LRF=3 | [`reich_moore`](api/nereids_physics/reich_moore/) | Manual Sec. II, `rml/` |
 | Breit-Wigner (single- and multi-level) | LRF=1,2 | [`slbw`](api/nereids_physics/slbw/) | Manual Sec. II, `mlb/` |
 | R-Matrix Limited | LRF=7 | [`rmatrix_limited`](api/nereids_physics/rmatrix_limited/) | Manual Sec. II |
-| Unresolved Resonance Region | LRU=2 | [`urr`](api/nereids_physics/urr/) | Manual Sec. VIII.A, `unr/` |
+| Unresolved Resonance Region | LRU=2 | [`urr`](api/nereids_physics/urr/) | Manual Sec. VIII.A, `acs/` (FITACS) |
 
 The `urr` module computes energy-averaged Hauser-Feshbach cross-sections from
 the average resonance parameters. The width-fluctuation correction is not yet
@@ -34,7 +34,7 @@ and statistical spin weights.
 Free Gas Model (FGM) convolution accounting for thermal motion of target nuclei.
 
 - Module: [`doppler`](api/nereids_physics/doppler/)
-- SAMMY reference: `dop/` module, manual Sec. III.B.1-2
+- SAMMY reference: `fgm/` module (Dopfgm), manual Sec. III.B.1
 - Key function: `doppler_broaden()` — exact Free Gas Model convolution
   integral in velocity space (manual Eq. III B1.7); no psi/chi (Voigt)
   approximation is used

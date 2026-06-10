@@ -1927,8 +1927,8 @@ fn fit_results_panel(ui: &mut egui::Ui, state: &AppState, result: &SpectrumFitRe
 /// the broadening grid extends beyond `[Emin − Wmin, Emax + Wmax]`,
 /// where W is the resolution width at each limit); we pick 5×FWHM so
 /// resonance shoulders just inside the boundaries are correctly
-/// broadened.  At 5×FWHM ≈ 5.9σ the Gaussian kernel is below 10⁻¹³ of
-/// peak — well past the broadening footprint.
+/// broadened.  At 5×FWHM ≈ 11.8σ (FWHM = 2.3548σ) the Gaussian kernel
+/// is ~10⁻³⁰ of peak — far past the broadening footprint.
 const FIT_RANGE_MARGIN_FWHM: f64 = 5.0;
 
 /// Resolution-kernel margin (eV) to add at energy `e_ev` when slicing

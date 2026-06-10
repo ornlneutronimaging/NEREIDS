@@ -37,8 +37,9 @@ The landing page presents three entry points:
 After selecting **Load & Fit Data**, a short wizard asks:
 
 1. **Fitting type**: Single spectrum or spatial map
-2. **Data format**: Raw Events (HDF5/NeXus), Histogram / Pre-Normalization,
-   or Transmission (Already Normalized)
+2. **Data format**: "Raw Events (HDF5/NeXus)", "Histogram, Pre-Normalization",
+   or "Transmission (Already Normalized)" — quoted as the wizard cards
+   label them
 
 The wizard configures a dynamic pipeline with only the steps relevant to your
 data format. Six distinct pipelines are available.

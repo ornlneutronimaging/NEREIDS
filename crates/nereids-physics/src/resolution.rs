@@ -13,7 +13,8 @@
 //! - `fnc/exerfc.f90` — Scaled complementary error function
 //! - `convolution/DopplerAndResolutionBroadener.cpp` — Xcoef quadrature weights
 //! - Manual Section III.C (Resolution Broadening); quadrature Eq. IV B 3.8
-//!   (R3-revision numbering — see `broaden`)
+//!   (R3-revision numbering — see `compute_xcoef_weights` and the
+//!   Gaussian+exponential path in `resolution_broaden_presorted`)
 //!
 //! ## Physics
 //!
