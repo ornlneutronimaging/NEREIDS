@@ -616,11 +616,12 @@ pub fn doppler_broaden(
         }
     }
 
-    // SAMMY parity diagnostic (`fgm/mfgm1.f90`: "No Doppler broadening
-    // occured N times of a possible M"): notify when the sparse-edge
-    // passthrough fired, ONCE per process — this function is hot under
-    // per-pixel spatial fits, so a per-call notice could flood stderr.
-    // Dense production grids never trigger it.
+    // SAMMY parity diagnostic (`fgm/mfgm1.f90:240`: "No Doppler broadening
+    // occured [sic] N times of a possible M" — spelling verbatim from the
+    // Fortran FORMAT statement): notify when the sparse-edge passthrough
+    // fired, ONCE per process — this function is hot under per-pixel
+    // spatial fits, so a per-call notice could flood stderr.  Dense
+    // production grids never trigger it.
     if n_passthrough > 0 {
         static SPARSE_PASSTHROUGH_NOTICE: std::sync::Once = std::sync::Once::new();
         SPARSE_PASSTHROUGH_NOTICE.call_once(|| {
