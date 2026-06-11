@@ -43,7 +43,7 @@ tempfile = { workspace = true }
 name = "NEREIDS"
 identifier = "gov.ornl.nereids"
 icon = ["icons/nereids.icns"]
-short_description = "Neutron Resonance Imaging Data Analysis"
+short_description = "Neutron Resonance Resolved Imaging Data Analysis"
 long_description = """
 NEREIDS is a high-performance library and GUI for neutron resonance imaging
 data analysis. It provides cross-section computation, Levenberg-Marquardt

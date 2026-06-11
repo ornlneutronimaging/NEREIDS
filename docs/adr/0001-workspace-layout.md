@@ -28,7 +28,7 @@ nereids-core       Core types, physical constants, error types, traits
 nereids-endf       ENDF file retrieval, caching, resonance parameter parsing
 nereids-physics    Cross-section (Reich-Moore), broadening, transmission model
 nereids-io         TIFF/NeXus data loading, VENUS normalization
-nereids-fitting    Optimization (LM least-squares, Poisson/BFGS)
+nereids-fitting    Optimization (LM least-squares, Poisson/KL)
 nereids-pipeline   End-to-end orchestration, spatial mapping, sparsity handling
 nereids-python     PyO3 thin wrapper (bindings/python)
 nereids-gui        egui desktop application (apps/gui)

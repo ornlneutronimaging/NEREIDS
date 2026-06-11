@@ -1,7 +1,7 @@
 [project]
 name = "nereids"
 version = "0.1.8"
-description = "Neutron Resonance Imaging Data Analysis Library"
+description = "Neutron Resonance Resolved Imaging Data Analysis System — Python bindings"
 requires-python = ">= 3.10"
 license = "MIT"
 authors = [{ name = "ORNL Neutron Imaging", email = "neutronimaging@ornl.gov" }]
