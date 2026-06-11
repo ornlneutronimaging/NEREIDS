@@ -6,7 +6,7 @@
 [![CI](https://github.com/ornlneutronimaging/NEREIDS/actions/workflows/ci.yml/badge.svg)](https://github.com/ornlneutronimaging/NEREIDS/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/nereids)](https://pypi.org/project/nereids/)
 [![crates.io](https://img.shields.io/crates/v/nereids-core)](https://crates.io/crates/nereids-core)
-[![License](https://img.shields.io/badge/license-BSD--3--Clause-blue)](LICENSE)
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Docs](https://img.shields.io/badge/docs-guide-blue)](https://ornlneutronimaging.github.io/NEREIDS/)
 [![API](https://img.shields.io/badge/docs-rustdoc-orange)](https://ornlneutronimaging.github.io/NEREIDS/api/nereids_pipeline/)
 
@@ -285,6 +285,6 @@ and the PR process.
 
 ## License
 
-BSD-3-Clause. See [LICENSE](LICENSE) for details.
+MIT. See [LICENSE](LICENSE) for details.
 
-Copyright (c) 2025, UT-Battelle, LLC, Oak Ridge National Laboratory.
+Copyright (c) 2025-2026, UT-Battelle, LLC, Oak Ridge National Laboratory.
