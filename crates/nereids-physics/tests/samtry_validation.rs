@@ -3235,10 +3235,21 @@ fn test_tr165_pseudo_al_broadened() {
         "tr165: max_rel={:.6}, mean_rel={:.6}, n={}, worst@{:.4} keV",
         result.max_rel_error, result.mean_rel_error, result.n_points, result.worst_energy_kev
     );
+    // Light pseudo-Al target: u/v is large here, so this case is first-order
+    // sensitive to the FGM kernel's w² integrand weight.  With the exact
+    // kernel the agreement is mean 8.7e-4 / max 7.4e-3 (it was 7.7e-2 /
+    // 5.0e-1 under the legacy w¹ kernel).  Gate BOTH mean and max per the
+    // T-2 policy above — the mean alone has enough headroom to hide a
+    // localized flank regression.
     assert!(
-        result.mean_rel_error < 0.10,
-        "mean {:.4} > 10%",
+        result.mean_rel_error < 0.002,
+        "mean {:.4} > 0.2%",
         result.mean_rel_error
+    );
+    assert!(
+        result.max_rel_error < 0.015,
+        "max {:.4} > 1.5%",
+        result.max_rel_error
     );
 }
 

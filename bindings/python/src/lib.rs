@@ -1339,6 +1339,15 @@ fn build_resolution(
 ///
 /// Reference:
 ///     SAMMY Manual Section III.B.1 (Free-Gas Model of Doppler Broadening).
+///     Exact FGM kernel: Eq. III B1.7 with the w²-weighted integrand —
+///     the same weighting as SAMMY's Dopfgm (the numerical quadrature
+///     differs).
+///
+/// Edge behavior:
+///     Near both grid edges, sigma beyond the supplied grid is
+///     extrapolated by the 1/v law; edge points whose Doppler window is
+///     both grid-truncated and under-resolved (fewer than 3 nodes) are
+///     returned unbroadened, matching SAMMY.
 #[pyfunction]
 #[pyo3(signature = (energies, cross_sections, awr, temperature_k))]
 fn doppler_broaden<'py>(

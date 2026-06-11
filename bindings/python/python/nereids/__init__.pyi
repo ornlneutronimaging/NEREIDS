@@ -522,7 +522,15 @@ def doppler_broaden(
     awr: float,
     temperature_k: float,
 ) -> NDArray[np.float64]:
-    """Apply Free Gas Model (FGM) Doppler broadening to a cross-section array."""
+    """Apply Free Gas Model (FGM) Doppler broadening to a cross-section array.
+
+    Exact FGM kernel (SAMMY manual Eq. III B1.7, w²-weighted integrand —
+    the same weighting as SAMMY's Dopfgm; the numerical quadrature differs).
+    Near the grid edges sigma is 1/v-extrapolated beyond the supplied grid;
+    edge points whose Doppler window is both grid-truncated and
+    under-resolved (fewer than 3 nodes) are returned unbroadened, matching
+    SAMMY.
+    """
     ...
 
 def resolution_broaden(
