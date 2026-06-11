@@ -482,6 +482,7 @@ pub fn doppler_broaden(
     let (ext_v, ext_y) = build_extended_fgm_grid(energies, cross_sections, &velocities, u);
 
     let n_ext = ext_v.len();
+    let mut n_passthrough = 0usize;
 
     // The extended velocity grid must be sorted ascending (negative → 0 → positive)
     // for the partition_point binary searches below to work correctly.
@@ -543,6 +544,7 @@ pub fn doppler_broaden(
         let window_truncated = v_lo < ext_v[0] || v_hi > ext_v[n_ext - 1];
         if window_truncated && j_hi - j_lo < 3 {
             broadened[i] = cross_sections[i];
+            n_passthrough += 1;
             continue;
         }
 
@@ -612,6 +614,22 @@ pub fn doppler_broaden(
         if broadened[i] < 0.0 {
             broadened[i] = 0.0;
         }
+    }
+
+    // SAMMY parity diagnostic (`fgm/mfgm1.f90`: "No Doppler broadening
+    // occured N times of a possible M"): notify when the sparse-edge
+    // passthrough fired, ONCE per process — this function is hot under
+    // per-pixel spatial fits, so a per-call notice could flood stderr.
+    // Dense production grids never trigger it.
+    if n_passthrough > 0 {
+        static SPARSE_PASSTHROUGH_NOTICE: std::sync::Once = std::sync::Once::new();
+        SPARSE_PASSTHROUGH_NOTICE.call_once(|| {
+            eprintln!(
+                "note: Doppler sparse-edge passthrough — {n_passthrough} of {n} point(s) \
+                 returned unbroadened (grid coarser than the Doppler window at the edge; \
+                 further occurrences in this process are not repeated)"
+            );
+        });
     }
 
     Ok(broadened)
@@ -1742,13 +1760,16 @@ mod tests {
     }
 
     /// Low-energy / light-target derivative check that EXERCISES the
-    /// negative-velocity image branch in `doppler_broaden_with_derivative`
-    /// (its rebuilt extended grid duplicates `doppler_broaden`'s; every
+    /// negative-velocity image branch through the DERIVATIVE path (every
     /// other derivative test runs at E ≥ 1 eV with AWR ≥ 177, where the
-    /// branch is unreachable).  The FD side of the comparison goes through
-    /// `doppler_broaden`'s copy of the branch — which the tr165 SAMMY
-    /// baseline anchors at low energies — so a sign or weight defect in
-    /// the derivative twin's copy breaks the FD agreement here.
+    /// branch is unreachable).  Both entry points now share
+    /// `build_extended_fgm_grid`, so this test pins the odd image-branch
+    /// integrand (Y = −w²·σ) end-to-end through the derivative machinery —
+    /// the M₀/M₁ quotient-rule terms over negative-w segments, which no
+    /// other test reaches.  The FD side anchors to `doppler_broaden`
+    /// (whose image branch the tr165 SAMMY baseline validates at its
+    /// lowest energies), so an integrand or normalization defect specific
+    /// to the derivative assembly breaks the FD agreement here.
     #[test]
     fn test_analytical_derivative_vs_fd_low_energy_image_branch() {
         // AWR = 1, 300 K: u ≈ 0.161 √eV, so 6u ≈ 0.965 √eV and grids
