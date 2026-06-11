@@ -1028,6 +1028,142 @@ mod tests {
     }
 
     #[test]
+    fn test_length_mismatch_error() {
+        // Input-validation contract: mismatched array lengths are rejected
+        // with the actual lengths echoed back — by the forward API and by
+        // the derivative twin (which inherits the check through its
+        // internal doppler_broaden call).
+        let energies = vec![1.0, 2.0, 3.0];
+        let xs = vec![10.0, 20.0];
+        let params = DopplerParams::new(300.0, 238.0).unwrap();
+
+        let err = doppler_broaden(&energies, &xs, &params).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DopplerError::LengthMismatch {
+                    energies: 3,
+                    cross_sections: 2,
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+
+        let err = doppler_broaden_with_derivative(&energies, &xs, &params).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DopplerError::LengthMismatch {
+                    energies: 3,
+                    cross_sections: 2,
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_below_floor_u_identity_and_zero_derivative() {
+        // A positive temperature so small that u = √(k_B·T/AWR) falls below
+        // NEAR_ZERO_FLOOR means "numerically no broadening": the forward
+        // call returns the input unchanged (an exact passthrough, not a
+        // degenerate integration) and the derivative twin reports
+        // ∂σ_D/∂T = 0 everywhere.
+        let energies = vec![1.0, 2.0, 3.0];
+        let xs = vec![10.0, 20.0, 15.0];
+        let params = DopplerParams::new(1e-118, 238.0).unwrap();
+        assert!(
+            params.u() < NEAR_ZERO_FLOOR,
+            "precondition: u = {:e} must be below NEAR_ZERO_FLOOR = {NEAR_ZERO_FLOOR:e}",
+            params.u()
+        );
+
+        let broadened = doppler_broaden(&energies, &xs, &params).unwrap();
+        assert_eq!(broadened, xs);
+
+        let (broadened, derivative) =
+            doppler_broaden_with_derivative(&energies, &xs, &params).unwrap();
+        assert_eq!(broadened, xs);
+        assert_eq!(derivative, vec![0.0; xs.len()]);
+
+        // Empty input is equally degenerate: both APIs return empty
+        // vectors rather than erroring or panicking.
+        let params_300 = DopplerParams::new(300.0, 238.0).unwrap();
+        let (broadened, derivative) =
+            doppler_broaden_with_derivative(&[], &[], &params_300).unwrap();
+        assert!(broadened.is_empty());
+        assert!(derivative.is_empty());
+    }
+
+    #[test]
+    fn test_single_point_grid_preserves_one_over_v() {
+        // A single-point grid takes the n == 1 fallback arms in
+        // build_extended_fgm_grid (dv_lo = dv_hi = u/2): every other node
+        // of the extended grid comes from interpolate_cross_section, whose
+        // off-grid extrapolation is the 1/v law on both sides.  A pure 1/v
+        // cross-section makes the integrand Y(w) = w²·σ(w²) = σ₀·v₀·w
+        // globally linear and odd, for which two properties are analytic:
+        //   * the FGM preserves 1/v: σ_D(v₀) = σ(v₀) (Eq. III B1.7 with
+        //     Y linear — see the module docs),
+        //   * ∂σ_D/∂T = 0: a 1/v shape is a temperature fixed point.
+        // The PW-linear segment quadrature is exact for linear Y, so both
+        // hold to roundoff; the ±6u window truncation contributes only
+        // O(e⁻³⁰) relative.  Measured: σ_D = σ exactly in f64 (rel = 0),
+        // ∂σ_D/∂T = 2.3e-19 b/K — the gates below leave ≥ 10⁸× headroom
+        // while still catching any real quadrature or weighting defect.
+        let energies = vec![1.0];
+        let xs = vec![10.0];
+        let params = DopplerParams::new(300.0, 10.0).unwrap();
+
+        let broadened = doppler_broaden(&energies, &xs, &params).unwrap();
+        let rel = (broadened[0] - xs[0]).abs() / xs[0];
+        assert!(
+            rel < 1e-12,
+            "1/v not preserved on a single-point grid: σ_D = {}, rel err {rel:e}",
+            broadened[0]
+        );
+
+        let (_broadened, derivative) =
+            doppler_broaden_with_derivative(&energies, &xs, &params).unwrap();
+        assert!(
+            derivative[0].abs() < 1e-10,
+            "∂σ_D/∂T must vanish for a 1/v cross-section, got {:e}",
+            derivative[0]
+        );
+    }
+
+    #[test]
+    fn test_sub_ulp_u_numerical_identity() {
+        // u above NEAR_ZERO_FLOOR — so the integration path runs, not the
+        // passthrough shortcut — but with 6u below one ulp of the velocity
+        // grid: the window edges collapse onto the nodes (v ± 6u == v in
+        // f64) and the extended grid gains no padding (v_max + 6u == v_max
+        // exercises the n_hi = 0 arm).  The u → 0⁺ limit must stay
+        // continuous: finite output, σ_D == σ to roundoff.  This is the
+        // regime a fit drives the kernel into when the temperature
+        // parameter runs to a very small bound.  Measured: σ_D = σ exactly
+        // in f64 (rel = 0; the one-sided O(u·slope) residual ~ 1e-57 is
+        // far below one ulp of σ).
+        let energies = vec![1.0, 4.0];
+        let xs = vec![10.0, 20.0];
+        let params = DopplerParams::new(1e-110, 238.0).unwrap();
+        let u = params.u();
+        assert!(
+            u >= NEAR_ZERO_FLOOR && DOPPLER_N_SIGMA * u < f64::EPSILON,
+            "precondition: u = {u:e} must be ≥ NEAR_ZERO_FLOOR with 6u below one ulp"
+        );
+
+        let broadened = doppler_broaden(&energies, &xs, &params).unwrap();
+        for (i, (&b, &x)) in broadened.iter().zip(xs.iter()).enumerate() {
+            let rel = (b - x).abs() / x;
+            assert!(
+                rel < 1e-12,
+                "point {i}: σ_D = {b} vs σ = {x}, rel err {rel:e}"
+            );
+        }
+    }
+
+    #[test]
     fn test_broadening_reduces_peak() {
         // Doppler broadening should reduce the peak height and spread it out.
         // Create a sharp resonance peak.
