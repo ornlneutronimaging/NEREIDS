@@ -1339,6 +1339,8 @@ fn build_resolution(
 ///
 /// Reference:
 ///     SAMMY Manual Section III.B.1 (Free-Gas Model of Doppler Broadening).
+///     Exact kernel: Eq. III B1.7 with the w²-weighted integrand (matches
+///     SAMMY's Dopfgm).
 #[pyfunction]
 #[pyo3(signature = (energies, cross_sections, awr, temperature_k))]
 fn doppler_broaden<'py>(

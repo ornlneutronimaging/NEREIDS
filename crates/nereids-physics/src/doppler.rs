@@ -1079,7 +1079,7 @@ mod tests {
         eprintln!("ex001 FGM: max_rel_err={max_rel_err:.6}");
         // PW-linear segment integration differs from SAMMY's quadrature at
         // grid-spacing transitions (wing region).  Measured with the exact
-        // w²-weighted kernel: 2.37%; the legacy w¹ kernel measured 5.55%
+        // w²-weighted kernel: 2.37%; the legacy w¹ kernel measured 5.48%
         // (the A=10 target makes u/v large, so the kernel's first-order
         // term was a visible part of the old error).
         assert!(
@@ -1516,9 +1516,9 @@ mod tests {
 
         // Reference quadrature of the analytic integrand on [v−12u, v+12u]
         // (Simpson).  The negative-velocity image branch is omitted: it is
-        // suppressed by exp(−(v/u)²) with v/u ≈ 247 here.  `power` selects
-        // the implemented kernel (w¹, divide by v) vs the full FGM kernel
-        // (w², divide by v²).
+        // suppressed by exp(−(v/u)²) with v/u ≈ 247 here.  `full` selects
+        // the full FGM kernel (w², divide by v² — the production kernel)
+        // vs the legacy w¹ kernel (divide by v).
         let broadened_ref = |sigma: &dyn Fn(f64) -> f64, e: f64, full: bool| -> f64 {
             let v = e.sqrt();
             let (lo, hi) = (v - 12.0 * u, v + 12.0 * u);
@@ -1557,7 +1557,7 @@ mod tests {
         let u2_over_2v2 = u * u / (2.0 * e_r); // v² = E
         assert!(
             (apx_const - 1.0).abs() < 1e-8,
-            "implemented kernel must preserve constant σ (got dev {:.3e})",
+            "legacy w¹ kernel reference must preserve constant σ (got dev {:.3e})",
             apx_const - 1.0
         );
         assert!(
@@ -1648,5 +1648,120 @@ mod tests {
                 ),
             }
         }
+
+        // (d) Production-level pins on the two analytic full-kernel
+        // signatures stated in the module docs.
+        //
+        // 1/v: Y₂(w) = w²·(c/w) = c·w is linear in w, so the PW-linear
+        // quadrature integrates it exactly and the self-normalization
+        // returns c/v unchanged (the grid extension also extrapolates by
+        // 1/v, so even the window edges are exact).
+        let inv_v_xs: Vec<f64> = energies.iter().map(|&e| 3.0 / e.sqrt()).collect();
+        let inv_v_broad = doppler_broaden(&energies, &inv_v_xs, &params).unwrap();
+        for i in (n_grid / 10)..(9 * n_grid / 10) {
+            let rel = (inv_v_broad[i] - inv_v_xs[i]).abs() / inv_v_xs[i];
+            assert!(
+                rel < 1.0e-9,
+                "1/v cross-section must be preserved exactly at E = {:.4} eV \
+                 (got rel dev {rel:.3e})",
+                energies[i]
+            );
+        }
+        // Constant σ: the full kernel produces the physical low-energy
+        // upturn σ·(1 + u²/2v²); at these parameters u²/2E ≈ 8.2e-6.
+        let const_xs = vec![2.0f64; n_grid];
+        let const_broad = doppler_broaden(&energies, &const_xs, &params).unwrap();
+        for i in (n_grid / 10)..(9 * n_grid / 10) {
+            let e_i = energies[i];
+            let expected = 2.0 * (1.0 + u * u / (2.0 * e_i));
+            let rel = (const_broad[i] - expected).abs() / expected;
+            assert!(
+                rel < 1.0e-7,
+                "constant σ must broaden to σ·(1 + u²/2v²) at E = {:.4} eV \
+                 (got rel dev {rel:.3e} from the expected upturn)",
+                e_i
+            );
+        }
+    }
+
+    /// Low-energy / light-target derivative check that EXERCISES the
+    /// negative-velocity image branch in `doppler_broaden_with_derivative`
+    /// (its rebuilt extended grid duplicates `doppler_broaden`'s; every
+    /// other derivative test runs at E ≥ 1 eV with AWR ≥ 177, where the
+    /// branch is unreachable).  The FD side of the comparison goes through
+    /// `doppler_broaden`'s copy of the branch — which the tr165 SAMMY
+    /// baseline anchors at low energies — so a sign or weight defect in
+    /// the derivative twin's copy breaks the FD agreement here.
+    #[test]
+    fn test_analytical_derivative_vs_fd_low_energy_image_branch() {
+        // AWR = 1, 300 K: u ≈ 0.161 √eV, so 6u ≈ 0.965 √eV and grids
+        // starting below E = (6u)² ≈ 0.93 eV enter the image branch.
+        let energies: Vec<f64> = (0..400).map(|i| 0.05 + i as f64 * 0.005).collect();
+        let xs = test_resonance_xs(&energies, 1.0, 0.05, 100.0);
+        let params = DopplerParams::new(300.0, 1.0).unwrap();
+
+        // Precondition: the extended grid must actually reach w < 0.
+        assert!(
+            energies[0].sqrt() < DOPPLER_N_SIGMA * params.u(),
+            "grid must enter the negative-velocity image branch \
+             (v_min = {:.4}, 6u = {:.4})",
+            energies[0].sqrt(),
+            DOPPLER_N_SIGMA * params.u()
+        );
+
+        let (_broadened, dxs_dt) =
+            doppler_broaden_with_derivative(&energies, &xs, &params).unwrap();
+
+        let dt = 1e-4 * (1.0 + params.temperature_k());
+        let params_up = DopplerParams::new(params.temperature_k() + dt, params.awr()).unwrap();
+        let params_down =
+            DopplerParams::new((params.temperature_k() - dt).max(0.1), params.awr()).unwrap();
+        let actual_2dt = (params.temperature_k() + dt) - (params.temperature_k() - dt).max(0.1);
+
+        let xs_up = doppler_broaden(&energies, &xs, &params_up).unwrap();
+        let xs_down = doppler_broaden(&energies, &xs, &params_down).unwrap();
+
+        let max_deriv: f64 = (0..energies.len())
+            .map(|i| ((xs_up[i] - xs_down[i]) / actual_2dt).abs())
+            .fold(0.0f64, f64::max);
+        let abs_tol = max_deriv * 1e-4;
+
+        let mut max_rel_err = 0.0f64;
+        let mut n_significant = 0;
+        for i in 0..energies.len() {
+            let fd = (xs_up[i] - xs_down[i]) / actual_2dt;
+            if fd.abs() < 1e-15 {
+                continue;
+            }
+            if fd.abs() > max_deriv * 0.01 {
+                let rel_err = ((dxs_dt[i] - fd) / fd).abs();
+                max_rel_err = max_rel_err.max(rel_err);
+                n_significant += 1;
+            } else {
+                let abs_err = (dxs_dt[i] - fd).abs();
+                assert!(
+                    abs_err < abs_tol,
+                    "E={:.3}: abs error {:.2e} exceeds tol {:.2e}",
+                    energies[i],
+                    abs_err,
+                    abs_tol
+                );
+            }
+        }
+        assert!(n_significant > 50, "too few significant-derivative points");
+        // Tolerance is the FD noise floor on this grid, not 1e-6 as in the
+        // high-energy tests: the extended velocity grid is itself
+        // u-dependent (v_min − 6u start, u-scaled spacing, ceil()'d node
+        // count), so the two FD evaluations at T ± dt integrate over
+        // slightly different node sets — measured noise 4.0e-5 here, where
+        // u/v reaches ~0.7.  A sign or weight defect in the image branch
+        // would appear at ≥ 1e-3 (the negative-w contribution is
+        // ~1e-3–1e-2 of σ_D on this grid), so the 1e-4 gate still
+        // discriminates by ≥ 10×.
+        assert!(
+            max_rel_err < 1e-4,
+            "analytical vs FD max rel error = {max_rel_err:.2e} on the \
+             image-branch grid, expected < 1e-4"
+        );
     }
 }
