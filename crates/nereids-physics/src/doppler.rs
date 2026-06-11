@@ -21,9 +21,13 @@
 //!   s(w) =  σ(w²)  for w > 0
 //!   s(w) = -σ(w²)  for w < 0
 //!
-//! This matches SAMMY's `Dopfgm`, which multiplies the normalized Gaussian
-//! quadrature weights by w² and divides the integral by E = v²
-//! (`fgm/mfgm2.f90` Modsmp/Modfpl `Wts·Velcty**2`, `mfgm4.f90` `val/Em`).
+//! This is the same kernel weighting as SAMMY's `Dopfgm`, which multiplies
+//! the normalized Gaussian quadrature weights by w² and divides the
+//! integral by E = v² (`fgm/mfgm2.f90` Modsmp/Modfpl `Wts·Velcty**2`,
+//! `mfgm4.f90` `val/Em`).  The quadrature itself differs: NEREIDS
+//! integrates the Gaussian exactly over piecewise-linear segments of Y,
+//! while SAMMY uses the Modsmp/Modfpl point rules — both discretize the
+//! same Eq. III B1.7 integral.
 //! Two analytic consequences (both pinned by
 //! `kernel_error_scales_pinned_vs_full_fgm_reference`): a constant σ is
 //! broadened to σ·(1 + u²/2v²) — the physical low-energy upturn — and a
@@ -401,13 +405,17 @@ pub fn doppler_broaden(
         ext_y.push(0.0);
     }
 
-    // Low-side positive extension: ALWAYS pad (max(v_neg_limit, 0), v_min)
-    // with nodes so the Gaussian window of the lowest output points is never
-    // truncated at the data edge (the high side below already always
-    // extends).  SAMMY's FGM grid is likewise always padded below the data
-    // range (manual Sec. III.B.1: "Negative velocities are included as
-    // needed, in order to properly evaluate the integral at low values of
-    // E"; `dat/mdat7.f90` Llgrid).  σ below the data grid follows
+    // Low-side positive extension: pad (max(v_neg_limit, 0), v_min) with
+    // any dv_lo-spaced nodes that fit, so the Gaussian window of the lowest
+    // output points is not truncated at the data edge (the high side below
+    // already always extends).  When dv_lo ≥ 6u no node fits and the edge
+    // stays one-sided — in that regime the kernel is below grid resolution
+    // and the self-normalization absorbs the truncation.  SAMMY's FGM grid
+    // is likewise padded below the data range (manual Sec. III.B.1:
+    // "Negative velocities are included as needed, in order to properly
+    // evaluate the integral at low values of E"; `dat/mdat4.f90` Escale —
+    // the bType==2 velocity-spaced grid — with `Vstart` building the
+    // negative-velocity nodes).  σ below the data grid follows
     // `interpolate_cross_section`'s 1/v extrapolation, which keeps physical
     // 1/v-like low edges exact (Y(w) = w²·(c/w) = c·w stays linear).
     {
@@ -664,8 +672,8 @@ pub fn doppler_broaden_with_derivative(
     }
 
     // Low-side positive extension — identical to doppler_broaden's (see the
-    // rationale there): always pad below v_min so the lowest output windows
-    // are never truncated at the data edge.
+    // rationale there): pad below v_min with any dv_lo-spaced nodes that
+    // fit, so the lowest output windows are not truncated at the data edge.
     {
         let lower_bound = v_neg_limit.max(NEGATIVE_VELOCITY_FLOOR);
         let mut low_nodes: Vec<f64> = Vec::new();

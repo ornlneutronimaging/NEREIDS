@@ -524,7 +524,8 @@ def doppler_broaden(
 ) -> NDArray[np.float64]:
     """Apply Free Gas Model (FGM) Doppler broadening to a cross-section array.
 
-    Exact SAMMY kernel (manual Eq. III B1.7, w²-weighted integrand).
+    Exact FGM kernel (SAMMY manual Eq. III B1.7, w²-weighted integrand —
+    the same weighting as SAMMY's Dopfgm; the numerical quadrature differs).
     """
     ...
 
