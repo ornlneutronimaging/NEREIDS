@@ -281,11 +281,145 @@ fn erfc_val(x: f64) -> f64 {
     }
 }
 
+/// Build the extended velocity grid and the FGM integrand Y(w) = w²·s(w)
+/// shared by [`doppler_broaden`] and [`doppler_broaden_with_derivative`] —
+/// one implementation so the forward and derivative paths cannot diverge.
+///
+/// From Eq. III B1.6: s(w) = σ(w²) for w > 0 and −σ(w²) for w < 0, so Y is
+/// an ODD function passing smoothly through Y(0) = 0.  The grid is the
+/// caller's velocity nodes plus:
+///
+/// - the negative-velocity image branch (Y(w) = −w²·σ(w²)) and the v = 0
+///   anchor, when the Doppler window crosses zero;
+/// - a low-side positive extension over (max(v_min − 6u, 0), v_min) with
+///   any dv_lo-spaced nodes that fit, so the lowest output windows are not
+///   truncated at the data edge.  SAMMY's FGM grid is likewise padded
+///   below the data range (manual Sec. III.B.1: "Negative velocities are
+///   included as needed, in order to properly evaluate the integral at low
+///   values of E"; `dat/mdat4.f90` Escale — the bType==2 velocity-spaced
+///   grid — with `Vstart` building the negative-velocity nodes);
+/// - a high-side extension up to v_max + 6u.
+///
+/// σ beyond the data grid follows `interpolate_cross_section`'s 1/v
+/// extrapolation, which keeps physical 1/v-like edges exact
+/// (Y(w) = w²·(c/w) = c·w stays linear).  On grids so sparse that no
+/// padding node fits (dv ≥ 6u), the convolution loops pass the affected
+/// points through unbroadened instead — see the sparse-grid guard there.
+fn build_extended_fgm_grid(
+    energies: &[f64],
+    cross_sections: &[f64],
+    velocities: &[f64],
+    u: f64,
+) -> (Vec<f64>, Vec<f64>) {
+    let n = velocities.len();
+    let v_min = velocities[0];
+    let v_neg_limit = v_min - DOPPLER_N_SIGMA * u;
+
+    let dv_lo = if n > 1 {
+        (velocities[1] - velocities[0]).max(u * 0.1)
+    } else {
+        u * 0.5
+    };
+    let dv_hi = if n > 1 {
+        (velocities[n - 1] - velocities[n - 2]).max(u * 0.1)
+    } else {
+        u * 0.5
+    };
+    let n_neg = if v_neg_limit < 0.0 {
+        // Points from v_neg_limit to just below zero, plus the v=0 anchor.
+        (((-v_neg_limit - NEGATIVE_VELOCITY_FLOOR) / dv_lo).ceil() as usize).saturating_add(1)
+    } else {
+        0
+    };
+    let v_max = velocities[n - 1];
+    let v_max_limit = v_max + DOPPLER_N_SIGMA * u;
+    let n_hi = if v_max < v_max_limit {
+        ((v_max_limit - v_max) / dv_hi).ceil() as usize
+    } else {
+        0
+    };
+    let n_low = (((v_min - v_neg_limit.max(0.0)).max(0.0) / dv_lo).ceil() as usize) + 1;
+    let capacity = n_neg + n_low + n + n_hi;
+    let mut ext_v: Vec<f64> = Vec::with_capacity(capacity);
+    let mut ext_y: Vec<f64> = Vec::with_capacity(capacity);
+
+    if v_neg_limit < 0.0 {
+        // Negative-velocity image branch, in the same spacing as the
+        // low-energy end of the positive grid (uniform dv in velocity).
+        let mut v = v_neg_limit;
+        while v < -NEGATIVE_VELOCITY_FLOOR {
+            ext_v.push(v);
+            // Y(w) = -w² * σ(w²) for negative w (odd integrand);
+            // σ at E = w² — interpolate from the positive grid.
+            let e = v * v;
+            let sigma = interpolate_cross_section(energies, cross_sections, e);
+            ext_y.push(-(v * v) * sigma);
+            v += dv_lo;
+        }
+
+        // Add v = 0 point
+        ext_v.push(0.0);
+        ext_y.push(0.0);
+    }
+
+    // Low-side positive extension (see the fn doc).
+    {
+        let lower_bound = v_neg_limit.max(NEGATIVE_VELOCITY_FLOOR);
+        let mut low_nodes: Vec<f64> = Vec::new();
+        let mut k = 1usize;
+        loop {
+            let v = v_min - (k as f64) * dv_lo;
+            if v <= lower_bound {
+                break;
+            }
+            low_nodes.push(v);
+            k += 1;
+        }
+        for &v in low_nodes.iter().rev() {
+            let e = v * v;
+            let sigma = interpolate_cross_section(energies, cross_sections, e);
+            ext_v.push(v);
+            ext_y.push(v * v * sigma);
+        }
+    }
+
+    // The caller's positive velocity points.
+    for i in 0..n {
+        ext_v.push(velocities[i]);
+        ext_y.push(velocities[i] * velocities[i] * cross_sections[i]);
+    }
+
+    // High-side extension beyond the highest velocity.
+    if v_max < v_max_limit {
+        let mut v = v_max + dv_hi;
+        while v <= v_max_limit {
+            ext_v.push(v);
+            let e = v * v;
+            let sigma = interpolate_cross_section(energies, cross_sections, e);
+            ext_y.push(v * v * sigma);
+            v += dv_hi;
+        }
+    }
+
+    (ext_v, ext_y)
+}
+
 /// Apply FGM Doppler broadening to cross-section data.
 ///
 /// The cross-sections are broadened in velocity space using the exact
 /// Free Gas Model integral from SAMMY manual Eq. III B1.7 (w²-weighted
 /// integrand; see the module docs).
+///
+/// # Edge behavior
+/// Within ~6u (in velocity, u = √(k_B·T/AWR)) of either end of the grid,
+/// the convolution depends on σ beyond the supplied grid, which is
+/// extrapolated by the 1/v law — exact for physical 1/v-like tails; a
+/// constant σ deviates by the extrapolation mismatch (≲ u/v relative) at
+/// the outermost points.  Edge points whose window is both truncated by
+/// the grid AND under-resolved (fewer than 3 nodes inside the 6u window)
+/// are returned unbroadened, matching SAMMY (`fgm/mfgm1.f90`: "IF too few
+/// points, do not broaden"); interior under-resolved points broaden
+/// normally (the kernel degenerates smoothly toward a delta).
 ///
 /// # Arguments
 /// * `energies` — Energy grid in eV. Every entry must satisfy
@@ -342,119 +476,10 @@ pub fn doppler_broaden(
     // Convert to velocity grid: v_i = sqrt(E_i)
     let velocities: Vec<f64> = energies.iter().map(|&e| e.sqrt()).collect();
 
-    // Build the integrand Y(w) = w² * s(w) on the velocity grid
-    // (Eq. III B1.7 with the w/v weight folded in; the 1/v is applied at
-    // the end as the 1/E division).
-    // From Eq. III B1.6: s(w) = σ(w²) for w>0, s(w) = -σ(w²) for w<0, so
-    //   Y(w) =  w² * σ(w²)  for w > 0
-    //   Y(w) = -w² * σ(w²)  for w < 0
-    // i.e. Y is an ODD function passing smoothly through Y(0) = 0.
-
-    // Determine how many negative velocity points we need.
-    // We need points down to v_min - N_sigma * u, which may go negative.
-    let v_min = velocities[0];
-    let v_neg_limit = v_min - DOPPLER_N_SIGMA * u;
-
-    // Build extended velocity grid: negative points (if needed) + positive points.
-    // Pre-compute total capacity: negative points + zero + positive + upper extension.
-    let dv_lo = if n > 1 {
-        (velocities[1] - velocities[0]).max(u * 0.1)
-    } else {
-        u * 0.5
-    };
-    let dv_hi = if n > 1 {
-        (velocities[n - 1] - velocities[n - 2]).max(u * 0.1)
-    } else {
-        u * 0.5
-    };
-    let n_neg = if v_neg_limit < 0.0 {
-        // Points from v_neg_limit to just below zero, plus the v=0 anchor.
-        (((-v_neg_limit - NEGATIVE_VELOCITY_FLOOR) / dv_lo).ceil() as usize).saturating_add(1)
-    } else {
-        0
-    };
-    let v_max = velocities[n - 1];
-    let v_max_limit = v_max + DOPPLER_N_SIGMA * u;
-    let n_hi = if v_max < v_max_limit {
-        ((v_max_limit - v_max) / dv_hi).ceil() as usize
-    } else {
-        0
-    };
-    let n_low = (((v_min - v_neg_limit.max(0.0)).max(0.0) / dv_lo).ceil() as usize) + 1;
-    let capacity = n_neg + n_low + n + n_hi;
-    let mut ext_v: Vec<f64> = Vec::with_capacity(capacity);
-    let mut ext_y: Vec<f64> = Vec::with_capacity(capacity);
-
-    if v_neg_limit < 0.0 {
-        // We need negative velocity points.
-        // Use the same spacing as the low-energy end of the positive grid,
-        // but in velocity space (uniform dv).
-        let mut v = v_neg_limit;
-        while v < -NEGATIVE_VELOCITY_FLOOR {
-            ext_v.push(v);
-            // Y(w) = -w² * σ(w²) for negative w (odd integrand)
-            // σ at E = w² — interpolate from the positive grid
-            let e = v * v;
-            let sigma = interpolate_cross_section(energies, cross_sections, e);
-            ext_y.push(-(v * v) * sigma);
-            v += dv_lo;
-        }
-
-        // Add v = 0 point
-        ext_v.push(0.0);
-        ext_y.push(0.0);
-    }
-
-    // Low-side positive extension: pad (max(v_neg_limit, 0), v_min) with
-    // any dv_lo-spaced nodes that fit, so the Gaussian window of the lowest
-    // output points is not truncated at the data edge (the high side below
-    // already always extends).  When dv_lo ≥ 6u no node fits and the edge
-    // stays one-sided — in that regime the kernel is below grid resolution
-    // and the self-normalization absorbs the truncation.  SAMMY's FGM grid
-    // is likewise padded below the data range (manual Sec. III.B.1:
-    // "Negative velocities are included as needed, in order to properly
-    // evaluate the integral at low values of E"; `dat/mdat4.f90` Escale —
-    // the bType==2 velocity-spaced grid — with `Vstart` building the
-    // negative-velocity nodes).  σ below the data grid follows
-    // `interpolate_cross_section`'s 1/v extrapolation, which keeps physical
-    // 1/v-like low edges exact (Y(w) = w²·(c/w) = c·w stays linear).
-    {
-        let lower_bound = v_neg_limit.max(NEGATIVE_VELOCITY_FLOOR);
-        let mut low_nodes: Vec<f64> = Vec::new();
-        let mut k = 1usize;
-        loop {
-            let v = v_min - (k as f64) * dv_lo;
-            if v <= lower_bound {
-                break;
-            }
-            low_nodes.push(v);
-            k += 1;
-        }
-        for &v in low_nodes.iter().rev() {
-            let e = v * v;
-            let sigma = interpolate_cross_section(energies, cross_sections, e);
-            ext_v.push(v);
-            ext_y.push(v * v * sigma);
-        }
-    }
-
-    // Add the positive velocity points
-    for i in 0..n {
-        ext_v.push(velocities[i]);
-        ext_y.push(velocities[i] * velocities[i] * cross_sections[i]);
-    }
-
-    // Add points beyond the highest velocity if needed
-    if v_max < v_max_limit {
-        let mut v = v_max + dv_hi;
-        while v <= v_max_limit {
-            ext_v.push(v);
-            let e = v * v;
-            let sigma = interpolate_cross_section(energies, cross_sections, e);
-            ext_y.push(v * v * sigma);
-            v += dv_hi;
-        }
-    }
+    // Integrand Y(w) = w² · s(w) (Eq. III B1.7 with the w/v weight folded
+    // in; the 1/v is applied at the end as the 1/E division) on the shared
+    // extended grid.
+    let (ext_v, ext_y) = build_extended_fgm_grid(energies, cross_sections, &velocities, u);
 
     let n_ext = ext_v.len();
 
@@ -504,7 +529,19 @@ pub fn doppler_broaden(
         let j_lo = ext_v.partition_point(|&w| w < v_lo);
         let j_hi = ext_v.partition_point(|&w| w <= v_hi);
 
-        if j_lo >= j_hi {
+        // Sparse EDGE passthrough (SAMMY `fgm/mfgm1.f90`: "IF too few
+        // points, do not broaden"): when the Gaussian window is truncated
+        // by the end of the extended grid AND holds fewer than 3 nodes,
+        // the one-sided J₁ slope term integrates a single coarse chord of
+        // w²·σ with no cancellation — up to ~2× error at a sparse low
+        // edge — so transfer the unbroadened value instead.  INTERIOR
+        // under-resolved windows (kernel narrower than the grid, u ≪ dv)
+        // must keep broadening: there the output sits on a node where
+        // C_j = Y_j exactly and the two-sided J₁ contributions cancel, so
+        // the result smoothly approaches the unbroadened value as u → 0 —
+        // and the temperature derivative stays well-defined for T-fits.
+        let window_truncated = v_lo < ext_v[0] || v_hi > ext_v[n_ext - 1];
+        if window_truncated && j_hi - j_lo < 3 {
             broadened[i] = cross_sections[i];
             continue;
         }
@@ -635,80 +672,12 @@ pub fn doppler_broaden_with_derivative(
     let u = params.u();
     let temperature_k = params.temperature_k;
 
-    // Rebuild the same extended grid as doppler_broaden.
-    // This duplicates the grid construction, but guarantees consistency
-    // with the forward pass. The cost is O(n) — negligible compared to
-    // the O(n × n_segments) integration.
+    // The same extended grid as doppler_broaden — built by the shared
+    // helper, so the forward and derivative paths cannot diverge.  The
+    // cost is O(n) — negligible compared to the O(n × n_segments)
+    // integration.
     let velocities: Vec<f64> = energies.iter().map(|&e| e.sqrt()).collect();
-    let v_min = velocities[0];
-    let v_neg_limit = v_min - DOPPLER_N_SIGMA * u;
-    let dv_lo = if n > 1 {
-        (velocities[1] - velocities[0]).max(u * 0.1)
-    } else {
-        u * 0.5
-    };
-    let dv_hi = if n > 1 {
-        (velocities[n - 1] - velocities[n - 2]).max(u * 0.1)
-    } else {
-        u * 0.5
-    };
-    let v_max = velocities[n - 1];
-    let v_max_limit = v_max + DOPPLER_N_SIGMA * u;
-
-    let mut ext_v: Vec<f64> = Vec::new();
-    let mut ext_y: Vec<f64> = Vec::new();
-
-    if v_neg_limit < 0.0 {
-        let mut v = v_neg_limit;
-        while v < -NEGATIVE_VELOCITY_FLOOR {
-            ext_v.push(v);
-            let e = v * v;
-            let sigma = interpolate_cross_section(energies, cross_sections, e);
-            ext_y.push(-(v * v) * sigma); // odd integrand: Y(w) = w²·s(w)
-            v += dv_lo;
-        }
-        ext_v.push(0.0);
-        ext_y.push(0.0);
-    }
-
-    // Low-side positive extension — identical to doppler_broaden's (see the
-    // rationale there): pad below v_min with any dv_lo-spaced nodes that
-    // fit, so the lowest output windows are not truncated at the data edge.
-    {
-        let lower_bound = v_neg_limit.max(NEGATIVE_VELOCITY_FLOOR);
-        let mut low_nodes: Vec<f64> = Vec::new();
-        let mut k = 1usize;
-        loop {
-            let v = v_min - (k as f64) * dv_lo;
-            if v <= lower_bound {
-                break;
-            }
-            low_nodes.push(v);
-            k += 1;
-        }
-        for &v in low_nodes.iter().rev() {
-            let e = v * v;
-            let sigma = interpolate_cross_section(energies, cross_sections, e);
-            ext_v.push(v);
-            ext_y.push(v * v * sigma);
-        }
-    }
-
-    for i in 0..n {
-        ext_v.push(velocities[i]);
-        ext_y.push(velocities[i] * velocities[i] * cross_sections[i]);
-    }
-
-    if v_max < v_max_limit {
-        let mut v = v_max + dv_hi;
-        while v <= v_max_limit {
-            ext_v.push(v);
-            let e = v * v;
-            let sigma = interpolate_cross_section(energies, cross_sections, e);
-            ext_y.push(v * v * sigma);
-            v += dv_hi;
-        }
-    }
+    let (ext_v, ext_y) = build_extended_fgm_grid(energies, cross_sections, &velocities, u);
 
     let n_ext = ext_v.len();
 
@@ -728,7 +697,11 @@ pub fn doppler_broaden_with_derivative(
         let j_lo = ext_v.partition_point(|&w| w < v_lo);
         let j_hi = ext_v.partition_point(|&w| w <= v_hi);
 
-        if j_lo >= j_hi {
+        // Sparse EDGE passthrough — same guard as doppler_broaden: points
+        // returned unbroadened are temperature-independent, so their
+        // derivative is exactly zero.
+        let window_truncated = v_lo < ext_v[0] || v_hi > ext_v[n_ext - 1];
+        if window_truncated && j_hi - j_lo < 3 {
             derivative[i] = 0.0;
             continue;
         }
@@ -1847,5 +1820,51 @@ mod tests {
             "analytical vs FD max rel error = {max_rel_err:.2e} on the \
              image-branch grid, expected < 1e-4"
         );
+    }
+
+    /// Sparse EDGE passthrough (SAMMY `fgm/mfgm1.f90`: "IF too few points,
+    /// do not broaden"): when the Gaussian window is truncated by the end
+    /// of the extended grid AND holds fewer than 3 nodes, the point is
+    /// returned unbroadened.  Before this guard the kernel chord-integrated
+    /// across the gap at the edge: constant σ on a valid [1, 100] eV grid
+    /// (AWR = 1, 300 K) returned 1.998 at the low edge (analytic
+    /// full-kernel value 1.0129) — a silent +97% error.  INTERIOR
+    /// under-resolved points keep broadening (exact at nodes; two-sided J₁
+    /// cancellation) so the u → 0 limit — and the temperature derivative
+    /// that T-fits rely on — stays smooth.
+    #[test]
+    fn test_sparse_grid_edge_passthrough_matches_sammy() {
+        // Two-point grid: both output windows are edge-truncated with a
+        // single node each → passthrough.
+        let energies = vec![1.0, 100.0];
+        let xs = vec![1.0, 1.0];
+        let params = DopplerParams::new(300.0, 1.0).unwrap();
+        let b = doppler_broaden(&energies, &xs, &params).unwrap();
+        assert_eq!(b, xs, "sparse two-point grid must pass through unbroadened");
+
+        // Moderately coarse grid (AWR = 238): velocity spacing ≈ 0.22 √eV
+        // ≫ 6u ≈ 0.063 √eV.  The two EDGE points are truncated+sparse →
+        // passthrough; the three INTERIOR points broaden sub-resolution
+        // (exact at the node up to the chord-curvature term, measured
+        // ≤ 9.8e-4 here).
+        let energies2 = vec![1.0, 1.5, 2.25, 3.375, 5.0];
+        let xs2 = vec![1.0f64; 5];
+        let params2 = DopplerParams::new(300.0, 238.0).unwrap();
+        let b2 = doppler_broaden(&energies2, &xs2, &params2).unwrap();
+        assert_eq!(b2[0], 1.0, "low edge must pass through");
+        assert_eq!(b2[4], 1.0, "high edge must pass through");
+        for (i, &v) in b2.iter().enumerate().take(4).skip(1) {
+            assert!(
+                (v - 1.0).abs() < 2.0e-3,
+                "interior sub-resolution point {i} must stay near σ \
+                 (chord-curvature scale): got {v}"
+            );
+        }
+
+        // Derivative twin shares the guard; passthrough points are
+        // temperature-independent, so their derivative is exactly zero.
+        let (b3, d3) = doppler_broaden_with_derivative(&energies, &xs, &params).unwrap();
+        assert_eq!(b3, xs);
+        assert_eq!(d3, vec![0.0, 0.0]);
     }
 }
