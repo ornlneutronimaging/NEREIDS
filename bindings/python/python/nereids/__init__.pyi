@@ -522,7 +522,10 @@ def doppler_broaden(
     awr: float,
     temperature_k: float,
 ) -> NDArray[np.float64]:
-    """Apply Free Gas Model (FGM) Doppler broadening to a cross-section array."""
+    """Apply Free Gas Model (FGM) Doppler broadening to a cross-section array.
+
+    Exact SAMMY kernel (manual Eq. III B1.7, w²-weighted integrand).
+    """
     ...
 
 def resolution_broaden(

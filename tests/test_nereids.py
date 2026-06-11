@@ -1710,8 +1710,16 @@ class TestVenusMlbwRegression:
         # ~28 % lower density (1.122e-4 → 8.110e-5 atoms/barn) — the
         # physically correct direction. Iteration count also dropped
         # (27 → 14) because the corrected objective is less ill-conditioned.
-        EXPECTED_DENSITY = 8.110428369849131e-05
-        EXPECTED_CHI2_R = 219657.76973394692
+        #
+        # Baseline regenerated again after the exact-FGM Doppler kernel
+        # fix: doppler_broaden now carries Eq. III B1.7's w² integrand
+        # weight (was w¹, a first-order flank skew). On this Hf-177
+        # workload the antisymmetric skew largely cancels in the fitted
+        # density: density −6.6e-5 rel, χ²_r −2.0e-6 rel (the exact
+        # kernel fits the measured data marginally BETTER), iteration
+        # count unchanged.
+        EXPECTED_DENSITY = 8.10988952711149e-05
+        EXPECTED_CHI2_R = 219657.33917272429
         EXPECTED_ITERATIONS = 14
 
         FLOAT_TOL = pytest.approx

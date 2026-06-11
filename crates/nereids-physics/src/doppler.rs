@@ -12,30 +12,25 @@
 //!
 //! ## Method
 //!
-//! Velocity-space Gaussian broadening of v·σ:
+//! We implement the exact FGM integral in velocity space (SAMMY
+//! Eq. III B1.7), including its w/v integrand weight:
 //!
-//!   v·σ_D(v²) = (1/(u√π)) ∫ exp(-(v-w)²/u²) · w · s(w) dw
+//!   v²·σ_D(v²) = (1/(u√π)) ∫ exp(-(v-w)²/u²) · w² · s(w) dw
 //!
 //! where v = √E, u = √(k_B·T / AWR), and:
 //!   s(w) =  σ(w²)  for w > 0
 //!   s(w) = -σ(w²)  for w < 0
 //!
-//! This is SAMMY Eq. III B1.7 **without** the (w/v) integrand weight the
-//! full FGM kernel carries — SAMMY's `Dopfgm` weights by w² and divides by
-//! v² (`fgm/mfgm2.f90` Modsmp/Modfpl, `mfgm4.f90`).  Error scales of the
-//! omission, in terms of u/v = √(kT/(AWR·E)):
-//!
-//! - **Smooth cross-sections** (second order): the full kernel maps a
-//!   constant σ to σ·(1 + u²/2v²) while this kernel preserves it (up to
-//!   exponentially small e^(-(v/u)²) image terms) — relative deviation
-//!   kT/(2·AWR·E) ≈ 8.2×10⁻⁶ for U-238 at 6.67 eV / 300 K.
-//! - **Resonance line shapes** (first order): an antisymmetric flank skew
-//!   of order u/v — up to ≈ 0.4% on the Doppler-broadened flanks of the
-//!   U-238 6.67 eV resonance at 300 K, vanishing at the peak — which can
-//!   alias into fitted energy-scale and density parameters.
-//!
-//! Exact-kernel (w²/v²) migration is planned, with a flank-discriminating
-//! kernel test.
+//! This matches SAMMY's `Dopfgm`, which multiplies the normalized Gaussian
+//! quadrature weights by w² and divides the integral by E = v²
+//! (`fgm/mfgm2.f90` Modsmp/Modfpl `Wts·Velcty**2`, `mfgm4.f90` `val/Em`).
+//! Two analytic consequences (both pinned by
+//! `kernel_error_scales_pinned_vs_full_fgm_reference`): a constant σ is
+//! broadened to σ·(1 + u²/2v²) — the physical low-energy upturn — and a
+//! 1/v cross-section is preserved exactly.  (An earlier revision omitted
+//! the w/v weight, which skewed Doppler-broadened resonance flanks by a
+//! first-order ~u/v; the pinning test fails loudly on any regression to
+//! that kernel.)
 //!
 //! The key advantage of the velocity-space formulation is that u is
 //! independent of energy, making it a true convolution.
@@ -284,9 +279,9 @@ fn erfc_val(x: f64) -> f64 {
 
 /// Apply FGM Doppler broadening to cross-section data.
 ///
-/// The cross-sections are broadened in velocity space via Gaussian
-/// convolution of v·σ — SAMMY manual Eq. III B1.7 without the (w/v)
-/// integrand weight; see the module docs for the error characterization.
+/// The cross-sections are broadened in velocity space using the exact
+/// Free Gas Model integral from SAMMY manual Eq. III B1.7 (w²-weighted
+/// integrand; see the module docs).
 ///
 /// # Arguments
 /// * `energies` — Energy grid in eV. Every entry must satisfy
@@ -307,9 +302,9 @@ fn erfc_val(x: f64) -> f64 {
 /// # Algorithm
 /// 1. Convert energy grid to velocity space (v = √E).
 /// 2. Build extended grid including negative velocities for the FGM integral.
-/// 3. Compute the integrand Y(w) = w · s(w) on the extended grid.
+/// 3. Compute the integrand Y(w) = w² · s(w) on the extended grid.
 /// 4. For each output velocity, evaluate the Gaussian convolution integral.
-/// 5. Transform back: σ_D(E) = result / √E.
+/// 5. Transform back: σ_D(E) = result / E.
 pub fn doppler_broaden(
     energies: &[f64],
     cross_sections: &[f64],
@@ -343,14 +338,13 @@ pub fn doppler_broaden(
     // Convert to velocity grid: v_i = sqrt(E_i)
     let velocities: Vec<f64> = energies.iter().map(|&e| e.sqrt()).collect();
 
-    // Build the integrand Y(w) = w * s(w) on the velocity grid.
-    // For positive v: Y(v) = v * σ(v²)
-    // We also need negative velocity points where Y(-v) = -v * s(-v) = -v * (-σ(v²)) = v * σ(v²)
-    // So Y(w) = |w| * σ(w²) for both positive and negative w.
-    // Actually from Eq. III B1.6: s(w) = σ(w²) for w>0, s(w) = -σ(w²) for w<0
-    // So Y(w) = w * s(w) = w * σ(w²) for w>0, Y(w) = w * (-σ(w²)) = -w * σ(w²) for w<0
-    // But since w<0, -w>0, so Y(w) = |w| * σ(w²) = |w| * σ(|w|²)
-    // This means Y(w) = |w| * σ(|w|²) for all w, i.e., Y is an even function.
+    // Build the integrand Y(w) = w² * s(w) on the velocity grid
+    // (Eq. III B1.7 with the w/v weight folded in; the 1/v is applied at
+    // the end as the 1/E division).
+    // From Eq. III B1.6: s(w) = σ(w²) for w>0, s(w) = -σ(w²) for w<0, so
+    //   Y(w) =  w² * σ(w²)  for w > 0
+    //   Y(w) = -w² * σ(w²)  for w < 0
+    // i.e. Y is an ODD function passing smoothly through Y(0) = 0.
 
     // Determine how many negative velocity points we need.
     // We need points down to v_min - N_sigma * u, which may go negative.
@@ -393,11 +387,11 @@ pub fn doppler_broaden(
         let mut v = v_neg_limit;
         while v < -NEGATIVE_VELOCITY_FLOOR {
             ext_v.push(v);
-            // Y(w) = |w| * σ(|w|²) for negative w
+            // Y(w) = -w² * σ(w²) for negative w (odd integrand)
             // σ at E = w² — interpolate from the positive grid
             let e = v * v;
             let sigma = interpolate_cross_section(energies, cross_sections, e);
-            ext_y.push(v.abs() * sigma); // Y is even
+            ext_y.push(-(v * v) * sigma);
             v += dv_lo;
         }
 
@@ -409,7 +403,7 @@ pub fn doppler_broaden(
     // Add the positive velocity points
     for i in 0..n {
         ext_v.push(velocities[i]);
-        ext_y.push(velocities[i] * cross_sections[i]);
+        ext_y.push(velocities[i] * velocities[i] * cross_sections[i]);
     }
 
     // Add points beyond the highest velocity if needed
@@ -419,7 +413,7 @@ pub fn doppler_broaden(
             ext_v.push(v);
             let e = v * v;
             let sigma = interpolate_cross_section(energies, cross_sections, e);
-            ext_y.push(v * sigma);
+            ext_y.push(v * v * sigma);
             v += dv_hi;
         }
     }
@@ -434,7 +428,7 @@ pub fn doppler_broaden(
     );
 
     // For each output energy point, compute the broadened cross-section
-    // using piecewise-linear interpolation of Y(w) = |w|×σ(w²) combined
+    // using piecewise-linear interpolation of Y(w) = w²·s(w) combined
     // with exact Gaussian integration over each segment.
     //
     // SAMMY Ref: `fgm/mfgm2.f90` Modsmp (linear), Modfpl (4-point Lagrange).
@@ -479,11 +473,13 @@ pub fn doppler_broaden(
 
         // PW-linear FGM integral: segment-by-segment exact integration.
         //
-        // v × σ_D(v²) = Σ [C_j × J₀_j − u × slope_j × J₁_j] / Σ J₀_j
-        // σ_D(E) = (v × σ_D(v²)) / v² = Σ[…] / (Σ J₀ × v)
+        // v² × σ_D(v²) = Σ [C_j × J₀_j − u × slope_j × J₁_j] / Σ J₀_j
+        // σ_D(E) = Σ[…] / (Σ J₀ × E)        (E = v²)
         //
         // SAMMY Ref: `fgm/mfgm2.f90` Modsmp lines 80-87 (linear weights
-        // with Abcerf B-coefficient = first moment correction).
+        // with Abcerf B-coefficient = first moment correction; final
+        // weights carry the w² factor, lines 101/203) and `mfgm4.f90`
+        // (division by Em).
         let mut sum_y = 0.0f64; // Numerator: Σ [C × J₀ − u × slope × J₁]
         let mut sum_g = 0.0f64; // Denominator: Σ J₀
 
@@ -534,8 +530,8 @@ pub fn doppler_broaden(
             continue;
         }
 
-        // σ_D(E) = Σ(C × J₀ − u × slope × J₁) / (Σ J₀ × v)
-        broadened[i] = sum_y / (sum_g * v);
+        // σ_D(E) = Σ(C × J₀ − u × slope × J₁) / (Σ J₀ × E)
+        broadened[i] = sum_y / (sum_g * e);
 
         // Ensure non-negative
         if broadened[i] < 0.0 {
@@ -564,8 +560,9 @@ pub fn doppler_broaden(
 ///   M₁_j = b_{j+1}²·exp(-b_{j+1}²) - b_j²·exp(-b_j²)
 ///   ∂I_j/∂u = (C_j/u)·M₀_j - slope_j·J₁_j - slope_j·M₁_j
 ///
-/// Full result (quotient rule on sum_y / (sum_g · v)):
-///   ∂σ_D/∂T = u/(2T·v) · (dsum_y·sum_g - sum_y·dsum_g) / sum_g²
+/// Full result (quotient rule on sum_y / (sum_g · E), E = v² being
+/// temperature-independent):
+///   ∂σ_D/∂T = u/(2T·E) · (dsum_y·sum_g - sum_y·dsum_g) / sum_g²
 ///
 /// SAMMY uses finite differences for this (mfgm4.f90 Xdofgm, Del=0.02).
 /// Our analytical approach is exact and avoids the 3× broadening cost.
@@ -629,7 +626,7 @@ pub fn doppler_broaden_with_derivative(
             ext_v.push(v);
             let e = v * v;
             let sigma = interpolate_cross_section(energies, cross_sections, e);
-            ext_y.push(v.abs() * sigma);
+            ext_y.push(-(v * v) * sigma); // odd integrand: Y(w) = w²·s(w)
             v += dv_lo;
         }
         ext_v.push(0.0);
@@ -638,7 +635,7 @@ pub fn doppler_broaden_with_derivative(
 
     for i in 0..n {
         ext_v.push(velocities[i]);
-        ext_y.push(velocities[i] * cross_sections[i]);
+        ext_y.push(velocities[i] * velocities[i] * cross_sections[i]);
     }
 
     if v_max < v_max_limit {
@@ -647,7 +644,7 @@ pub fn doppler_broaden_with_derivative(
             ext_v.push(v);
             let e = v * v;
             let sigma = interpolate_cross_section(energies, cross_sections, e);
-            ext_y.push(v * sigma);
+            ext_y.push(v * v * sigma);
             v += dv_hi;
         }
     }
@@ -729,9 +726,9 @@ pub fn doppler_broaden_with_derivative(
             continue;
         }
 
-        // ∂σ_D/∂T = (u · dsum_y · sum_g - sum_y · sum_m0) / (2T · v · sum_g²)
+        // ∂σ_D/∂T = (u · dsum_y · sum_g - sum_y · sum_m0) / (2T · E · sum_g²)
         let numerator = u * dsum_y * sum_g - sum_y * sum_m0;
-        let denominator = 2.0 * temperature_k * v * sum_g * sum_g;
+        let denominator = 2.0 * temperature_k * e * sum_g * sum_g;
         if denominator.abs() > NEAR_ZERO_FLOOR {
             derivative[i] = numerator / denominator;
         } else {
@@ -1079,12 +1076,15 @@ mod tests {
             let rel_err = (sigma_us - sigma_ref).abs() / sigma_ref;
             max_rel_err = max_rel_err.max(rel_err);
         }
-        // Allow up to 6% relative error.  PW-linear segment integration is
-        // generally more accurate than Voronoi-cell weighting, but can differ
-        // at grid-spacing transitions (wing region).  Measured: 5.55%.
+        eprintln!("ex001 FGM: max_rel_err={max_rel_err:.6}");
+        // PW-linear segment integration differs from SAMMY's quadrature at
+        // grid-spacing transitions (wing region).  Measured with the exact
+        // w²-weighted kernel: 2.37%; the legacy w¹ kernel measured 5.55%
+        // (the A=10 target makes u/v large, so the kernel's first-order
+        // term was a visible part of the old error).
         assert!(
-            max_rel_err < 0.06,
-            "Max relative error = {:.2}% (exceeds 6%)",
+            max_rel_err < 0.03,
+            "Max relative error = {:.2}% (exceeds 3%)",
             max_rel_err * 100.0
         );
 
@@ -1484,27 +1484,25 @@ mod tests {
         );
     }
 
-    /// Pin the documented error scales of the implemented kernel (module
-    /// docs: Eq. III B1.7 WITHOUT the (w/v) integrand weight) against an
-    /// in-test full-kernel reference, so the published numbers are tested,
-    /// not free-floating.  The existing SAMMY ex001 oracle (6% tolerance)
-    /// is blind to this error class.
+    /// Kernel-discrimination pin: the production kernel must be the FULL
+    /// FGM kernel (Eq. III B1.7, w²-weighted), verified against in-test
+    /// Simpson references for BOTH kernels.  The SAMMY ex001 oracle alone
+    /// is too loose (grid artifacts dominate) to detect a kernel-form
+    /// regression; this test fails loudly on one.
     ///
-    /// (a) Smooth limit: the implemented kernel preserves a constant σ
+    /// (a) Smooth limit: the w¹ (legacy) kernel preserves a constant σ
     ///     (quadrature-noise level), while the full kernel yields
-    ///     σ·(1 + u²/2v²) — the documented kT/(2·AWR·E) deviation.
+    ///     σ·(1 + u²/2v²) — the kT/(2·AWR·E) physical low-energy upturn.
     /// (b) Resonance line shape (U-238-like Lorentzian: E_r = 6.674 eV,
-    ///     Γ = 0.027 eV, AWR = 236.0058, 300 K): the implemented-vs-full
-    ///     deviation at the ±Δ_D flanks is FIRST order — antisymmetric,
-    ///     within [0.1%, 1%], pinning the documented "~0.4%" — and second-
-    ///     order small at the peak.
-    /// (c) The production `doppler_broaden` agrees with the reference
-    ///     implemented-kernel quadrature at those points, so the pin holds
-    ///     for the shipping code path.
-    ///
-    /// When the exact-kernel (w²/v²) migration lands, expectation (b)
-    /// inverts: production moves to the full-kernel reference and the
-    /// flank deviation vs `sigma_full` drops to quadrature level.
+    ///     Γ = 0.027 eV, AWR = 236.0058, 300 K): the w¹-vs-full deviation
+    ///     at the ±Δ_D flanks is FIRST order — antisymmetric, within
+    ///     [0.1%, 1%] — and second-order small at the peak.  These two
+    ///     reference-vs-reference pins are kernel-independent analytics.
+    /// (c) The production `doppler_broaden` agrees with the FULL-kernel
+    ///     reference at those points (< 5e-4) AND differs from the legacy
+    ///     w¹ reference by the first-order flank skew with the correct
+    ///     signs — so a silent regression to the legacy kernel fails this
+    ///     test in the discrimination direction.
     #[test]
     fn kernel_error_scales_pinned_vs_full_fgm_reference() {
         use std::f64::consts::PI;
@@ -1596,9 +1594,11 @@ mod tests {
             "peak deviation must be second-order small, got {dev_peak:.3e}"
         );
 
-        // (c) The shipping doppler_broaden matches the implemented-kernel
-        // reference at the same energies (grid fine enough that production
-        // quadrature error ≪ the 0.3% flank signal).
+        // (c) The shipping doppler_broaden matches the FULL-kernel reference
+        // at the same energies (grid fine enough that production quadrature
+        // error ≪ the 0.3% flank signal), and DIFFERS from the legacy w¹
+        // reference by the first-order flank skew with the correct signs —
+        // a silent regression to the legacy kernel trips the second check.
         let n_grid = 3001usize;
         let (e_lo, e_hi) = (e_r - 1.2, e_r + 1.2);
         let energies: Vec<f64> = (0..n_grid)
@@ -1606,7 +1606,14 @@ mod tests {
             .collect();
         let xs: Vec<f64> = energies.iter().map(|&e| lorentzian(e)).collect();
         let broadened = doppler_broaden(&energies, &xs, &params).unwrap();
-        for target in [e_r - delta_d, e_r, e_r + delta_d] {
+        // expect_skew: Some(true) = low flank (production above the legacy
+        // kernel), Some(false) = high flank (below), None = peak (no
+        // first-order term).
+        for (target, expect_skew) in [
+            (e_r - delta_d, Some(true)),
+            (e_r, None),
+            (e_r + delta_d, Some(false)),
+        ] {
             let idx = energies
                 .iter()
                 .enumerate()
@@ -1614,13 +1621,32 @@ mod tests {
                 .map(|(i, _)| i)
                 .unwrap();
             let e_eval = energies[idx];
-            let ref_apx = broadened_ref(&lorentzian, e_eval, false);
-            let rel = (broadened[idx] - ref_apx).abs() / ref_apx;
+            let ref_full = broadened_ref(&lorentzian, e_eval, true);
+            let rel_full = (broadened[idx] - ref_full).abs() / ref_full;
             assert!(
-                rel < 5.0e-4,
-                "production doppler_broaden vs implemented-kernel reference at \
-                 E = {e_eval:.4} eV: rel dev {rel:.3e} (must be ≪ the 3e-3 flank signal)"
+                rel_full < 5.0e-4,
+                "production doppler_broaden vs FULL-kernel reference at \
+                 E = {e_eval:.4} eV: rel dev {rel_full:.3e} (must be ≪ the 3e-3 flank signal)"
             );
+            let ref_legacy = broadened_ref(&lorentzian, e_eval, false);
+            let dev_legacy = (broadened[idx] - ref_legacy) / ref_legacy;
+            match expect_skew {
+                Some(true) => assert!(
+                    dev_legacy > 1.0e-3 && dev_legacy < 1.0e-2,
+                    "low flank: production must sit first-order ABOVE the \
+                     legacy w¹ kernel (got {dev_legacy:.3e})"
+                ),
+                Some(false) => assert!(
+                    dev_legacy < -1.0e-3 && dev_legacy > -1.0e-2,
+                    "high flank: production must sit first-order BELOW the \
+                     legacy w¹ kernel (got {dev_legacy:.3e})"
+                ),
+                None => assert!(
+                    dev_legacy.abs() < 1.0e-3,
+                    "peak: production-vs-legacy must have no first-order term \
+                     (got {dev_legacy:.3e})"
+                ),
+            }
         }
     }
 }
