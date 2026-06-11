@@ -1712,14 +1712,19 @@ class TestVenusMlbwRegression:
         # (27 → 14) because the corrected objective is less ill-conditioned.
         #
         # Baseline regenerated again after the exact-FGM Doppler kernel
-        # fix: doppler_broaden now carries Eq. III B1.7's w² integrand
-        # weight (was w¹, a first-order flank skew). On this Hf-177
-        # workload the antisymmetric skew largely cancels in the fitted
-        # density: density −6.6e-5 rel, χ²_r −2.0e-6 rel (the exact
-        # kernel fits the measured data marginally BETTER), iteration
-        # count unchanged.
-        EXPECTED_DENSITY = 8.10988952711149e-05
-        EXPECTED_CHI2_R = 219657.33917272429
+        # fix (Eq. III B1.7's w² integrand weight, was w¹ — a first-order
+        # flank skew) plus the always-on low-edge velocity padding. On
+        # this Hf-177 workload the net effect is small (the antisymmetric
+        # skew largely cancels in the fitted density): density −3.6e-5
+        # rel, χ²_r −2.4e-6 rel — the exact kernel fits the measured data
+        # marginally BETTER — iteration count unchanged.
+        #
+        # These pinned values are machine-generated regression anchors
+        # (produced by the code under test); the correctness burden is
+        # carried by the SAMMY-oracle suites (samtry, ex001) and the
+        # analytic kernel pins in doppler.rs.
+        EXPECTED_DENSITY = 8.110140236608694e-05
+        EXPECTED_CHI2_R = 219657.24372935892
         EXPECTED_ITERATIONS = 14
 
         FLOAT_TOL = pytest.approx

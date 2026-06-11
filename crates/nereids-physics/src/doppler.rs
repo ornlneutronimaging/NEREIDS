@@ -376,7 +376,8 @@ pub fn doppler_broaden(
     } else {
         0
     };
-    let capacity = n_neg + n + n_hi;
+    let n_low = (((v_min - v_neg_limit.max(0.0)).max(0.0) / dv_lo).ceil() as usize) + 1;
+    let capacity = n_neg + n_low + n + n_hi;
     let mut ext_v: Vec<f64> = Vec::with_capacity(capacity);
     let mut ext_y: Vec<f64> = Vec::with_capacity(capacity);
 
@@ -398,6 +399,35 @@ pub fn doppler_broaden(
         // Add v = 0 point
         ext_v.push(0.0);
         ext_y.push(0.0);
+    }
+
+    // Low-side positive extension: ALWAYS pad (max(v_neg_limit, 0), v_min)
+    // with nodes so the Gaussian window of the lowest output points is never
+    // truncated at the data edge (the high side below already always
+    // extends).  SAMMY's FGM grid is likewise always padded below the data
+    // range (manual Sec. III.B.1: "Negative velocities are included as
+    // needed, in order to properly evaluate the integral at low values of
+    // E"; `dat/mdat7.f90` Llgrid).  σ below the data grid follows
+    // `interpolate_cross_section`'s 1/v extrapolation, which keeps physical
+    // 1/v-like low edges exact (Y(w) = w²·(c/w) = c·w stays linear).
+    {
+        let lower_bound = v_neg_limit.max(NEGATIVE_VELOCITY_FLOOR);
+        let mut low_nodes: Vec<f64> = Vec::new();
+        let mut k = 1usize;
+        loop {
+            let v = v_min - (k as f64) * dv_lo;
+            if v <= lower_bound {
+                break;
+            }
+            low_nodes.push(v);
+            k += 1;
+        }
+        for &v in low_nodes.iter().rev() {
+            let e = v * v;
+            let sigma = interpolate_cross_section(energies, cross_sections, e);
+            ext_v.push(v);
+            ext_y.push(v * v * sigma);
+        }
     }
 
     // Add the positive velocity points
@@ -631,6 +661,29 @@ pub fn doppler_broaden_with_derivative(
         }
         ext_v.push(0.0);
         ext_y.push(0.0);
+    }
+
+    // Low-side positive extension — identical to doppler_broaden's (see the
+    // rationale there): always pad below v_min so the lowest output windows
+    // are never truncated at the data edge.
+    {
+        let lower_bound = v_neg_limit.max(NEGATIVE_VELOCITY_FLOOR);
+        let mut low_nodes: Vec<f64> = Vec::new();
+        let mut k = 1usize;
+        loop {
+            let v = v_min - (k as f64) * dv_lo;
+            if v <= lower_bound {
+                break;
+            }
+            low_nodes.push(v);
+            k += 1;
+        }
+        for &v in low_nodes.iter().rev() {
+            let e = v * v;
+            let sigma = interpolate_cross_section(energies, cross_sections, e);
+            ext_v.push(v);
+            ext_y.push(v * v * sigma);
+        }
     }
 
     for i in 0..n {
@@ -1650,25 +1703,37 @@ mod tests {
         }
 
         // (d) Production-level pins on the two analytic full-kernel
-        // signatures stated in the module docs.
+        // signatures stated in the module docs — over the FULL grid
+        // including both edges (the low-side extension keeps the lowest
+        // output windows unpadded-truncation-free; see the grid-construction
+        // comment in doppler_broaden).
         //
         // 1/v: Y₂(w) = w²·(c/w) = c·w is linear in w, so the PW-linear
-        // quadrature integrates it exactly and the self-normalization
-        // returns c/v unchanged (the grid extension also extrapolates by
-        // 1/v, so even the window edges are exact).
+        // quadrature integrates it exactly, and the grid extensions
+        // extrapolate by exactly 1/v — both edges are exact.
         let inv_v_xs: Vec<f64> = energies.iter().map(|&e| 3.0 / e.sqrt()).collect();
         let inv_v_broad = doppler_broaden(&energies, &inv_v_xs, &params).unwrap();
-        for i in (n_grid / 10)..(9 * n_grid / 10) {
+        let mut inv_v_max_rel = 0.0f64;
+        for i in 0..n_grid {
             let rel = (inv_v_broad[i] - inv_v_xs[i]).abs() / inv_v_xs[i];
-            assert!(
-                rel < 1.0e-9,
-                "1/v cross-section must be preserved exactly at E = {:.4} eV \
-                 (got rel dev {rel:.3e})",
-                energies[i]
-            );
+            inv_v_max_rel = inv_v_max_rel.max(rel);
         }
+        eprintln!(
+            "pin(d) 1/v: edge0 rel={:.3e}, max rel={inv_v_max_rel:.3e}",
+            (inv_v_broad[0] - inv_v_xs[0]).abs() / inv_v_xs[0]
+        );
+        assert!(
+            inv_v_max_rel < 1.0e-9,
+            "1/v cross-section must be preserved exactly over the FULL grid \
+             including edges (got max rel dev {inv_v_max_rel:.3e})"
+        );
         // Constant σ: the full kernel produces the physical low-energy
         // upturn σ·(1 + u²/2v²); at these parameters u²/2E ≈ 8.2e-6.
+        // INTERIOR points match the analytic value at quadrature level; at
+        // the two grid EDGES the extension extrapolates σ by 1/v (the
+        // documented contract), so a constant σ — which violates that
+        // asymptotic — picks up an extrapolation-mismatch deviation there.
+        // Both are pinned at their measured values.
         let const_xs = vec![2.0f64; n_grid];
         let const_broad = doppler_broaden(&energies, &const_xs, &params).unwrap();
         for i in (n_grid / 10)..(9 * n_grid / 10) {
@@ -1682,6 +1747,17 @@ mod tests {
                 e_i
             );
         }
+        let edge_dev = |i: usize| -> f64 {
+            let expected = 2.0 * (1.0 + u * u / (2.0 * energies[i]));
+            (const_broad[i] - expected).abs() / expected
+        };
+        let (lo_dev, hi_dev) = (edge_dev(0), edge_dev(n_grid - 1));
+        eprintln!("pin(d) const: edge devs lo={lo_dev:.3e}, hi={hi_dev:.3e}");
+        assert!(
+            lo_dev < 2.0e-3 && hi_dev < 2.0e-3,
+            "constant-σ edge deviations must stay at the 1/v-extrapolation \
+             mismatch scale (got lo {lo_dev:.3e}, hi {hi_dev:.3e})"
+        );
     }
 
     /// Low-energy / light-target derivative check that EXERCISES the
