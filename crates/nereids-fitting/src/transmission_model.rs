@@ -37,8 +37,8 @@ use crate::lm::{FitModel, FlatMatrix};
 /// while this constant is an *absolute* magnitude bound.  Both
 /// guards protect against the same `(tof - t0) / l_eff` blow-up at
 /// the energy-scale-degenerate corner; the value choice is
-/// coincident, not tied.  See PR #498 for the parallel t0
-/// fallthrough and issue #500 for the L_scale gap closure.
+/// coincident, not tied.  See issue #500 for the L_scale gap
+/// closure.
 const L_SCALE_EPSILON: f64 = 1.0e-12;
 
 /// Transmission model backed by precomputed Doppler-broadened cross-sections.
@@ -101,7 +101,7 @@ pub struct PrecomputedTransmissionModel {
     /// `None` ⇒ fall back to the per-call broadening path, byte-
     /// identical output.
     pub resolution_plan: Option<Arc<ResolutionPlan>>,
-    /// Optional sparse empirical cubature plan (epic #472).
+    /// Optional sparse empirical cubature plan.
     ///
     /// When the plan is present AND its `target_energies` match this
     /// model's energy grid AND `cubature.k() == n_density_params`
@@ -112,7 +112,7 @@ pub struct PrecomputedTransmissionModel {
     /// back to the exact path, so the default behaviour is
     /// byte-identical to main.
     pub sparse_cubature_plan: Option<Arc<SparseEmpiricalCubaturePlan>>,
-    /// Optional scalar (k = 1) surrogate plan (epic #472, PR #475).
+    /// Optional scalar (k = 1) surrogate plan.
     ///
     /// Mutually exclusive with `sparse_cubature_plan` in practice —
     /// the cubature dispatch fires only for `k ≥ 2` and the scalar
@@ -120,7 +120,7 @@ pub struct PrecomputedTransmissionModel {
     /// `ScalarSurrogatePlan = ScalarChebyshevPlan` is kept as a
     /// stable public name so a future scalar surrogate can swap in
     /// without touching this field or any dispatch call site.
-    /// PR #475 picked Chebyshev-in-density over Lanczos Gauss
+    /// Chebyshev-in-density was picked over Lanczos Gauss
     /// quadrature after a real-VENUS bench-off (Chebyshev won on
     /// both the accuracy and wall-time axes; see
     /// `nereids_physics::surrogate` module docs).
@@ -154,14 +154,13 @@ pub struct PrecomputedTransmissionModel {
 /// at column `j` regardless of the user's `density_indices`
 /// ordering.  First-appearance order would swap columns for
 /// non-monotonic mappings, returning wrong transmissions and
-/// wrong Jacobians.  Codex round-4 P2 on PR #480.
+/// wrong Jacobians.
 fn density_param_indices(density_indices: &[usize]) -> Vec<usize> {
     // `sort_unstable` + `dedup` is O(n log n) and avoids the O(n²)
     // cost of repeated `Vec::contains` scans.  This runs on every
     // `evaluate()` / `analytical_jacobian()` call, so the linear-
     // scan version showed up in spatial-map profiling once the
-    // per-pixel cubature dispatch started firing.  Copilot Phase B
-    // finding on PR #481.
+    // per-pixel cubature dispatch started firing.
     let mut seen: Vec<usize> = density_indices.to_vec();
     seen.sort_unstable();
     seen.dedup();
@@ -179,8 +178,7 @@ fn density_param_indices(density_indices: &[usize]) -> Vec<usize> {
 /// would silently return forward/Jacobian values for the stale grid.
 /// We compare `plan.target_energies()` against the model's `energies`
 /// via `to_bits()` per element (same contract
-/// `apply_resolution_with_plan` already enforces — Codex round-1 P1
-/// on PR #480).
+/// `apply_resolution_with_plan` already enforces).
 ///
 /// **Tabulated-kernel tie**: the cubature fast path folds
 /// `apply_resolution*` into its atom sweep — skipping it when the
@@ -188,8 +186,7 @@ fn density_param_indices(density_indices: &[usize]) -> Vec<usize> {
 /// silent wrong-answer path.  We require
 /// `matches!(instrument_resolution, ResolutionFunction::Tabulated(_))`
 /// so Gaussian-resolution models never hit the cubature path (a
-/// plan is only ever built against a tabulated kernel).  Codex
-/// round-3 P2 on PR #480.
+/// plan is only ever built against a tabulated kernel).
 ///
 /// **Optional `resolution_plan` cross-check**: when a prebuilt
 /// `ResolutionPlan` is attached (e.g., via
@@ -212,8 +209,8 @@ fn density_param_indices(density_indices: &[usize]) -> Vec<usize> {
 /// same energy grid without rebuilding the cubature, the grid
 /// bit-check here passes but the atom weights still encode the
 /// OLD operator.  Guarding against this requires a kernel
-/// fingerprint on the cubature plan, which is out of scope for
-/// this PR (Codex round-4 P2 on PR #480).  Upstream callers are
+/// fingerprint on the cubature plan, which is not implemented
+/// here.  Upstream callers are
 /// responsible for clearing the cubature when they swap kernels;
 /// in spatial dispatch this is enforced by
 /// `UnifiedFitConfig::with_precomputed_cross_sections` /
@@ -227,10 +224,10 @@ fn density_param_indices(density_indices: &[usize]) -> Vec<usize> {
 /// the multi-isotope path on grid-identity + `Tabulated(_)` guard,
 /// and **additionally** enforces content identity via the
 /// source-`ResolutionPlan` `Arc::ptr_eq` check and a σ
-/// fingerprint — closing the same-grid stale-plan correctness hole
-/// an independent review surfaced on PR #475: a plan built from
-/// different σ or a different kernel but attached on the same
-/// energy grid must never dispatch the surrogate.
+/// fingerprint — closing a same-grid stale-plan correctness hole:
+/// a plan built from different σ or a different kernel but
+/// attached on the same energy grid must never dispatch the
+/// surrogate.
 fn scalar_eligible(
     plan: &ScalarSurrogatePlan,
     energies: &[f64],
@@ -256,12 +253,11 @@ fn scalar_eligible(
     }
     // Source-`ResolutionPlan` identity via `Arc::ptr_eq` — O(1)
     // check that the plan was built from the SAME resolution
-    // kernel the model is currently using.  An independent
-    // review reproduction on PR #475 showed that the grid-only
+    // kernel the model is currently using.  The grid-only
     // check was insufficient: a plan built for a different
     // tabulated kernel on an identical grid would silently
     // dispatch and return transmissions shifted by ~0.13
-    // absolute.  Requiring the model to attach the exact same
+    // absolute (measured).  Requiring the model to attach the exact same
     // `Arc<ResolutionPlan>` the scalar plan was built from
     // closes that hole.
     let Some(model_plan) = resolution_plan else {
@@ -302,8 +298,8 @@ fn scalar_eligible(
 /// Chebyshev-in-density is a polynomial interpolant.  Inside
 /// `[0, n_max]` it is exact at the M = 16 nodes and tight (≤ 1e-15
 /// rel err) between them; outside, the interpolant diverges
-/// exponentially in `(n - n_max) / n_max`.  Codex PR #475 round 2
-/// measured **73 % relative error at `1.5 × n_max`** and catastrophic
+/// exponentially in `(n - n_max) / n_max` — measured:
+/// **73 % relative error at `1.5 × n_max`** and catastrophic
 /// divergence beyond — exactly the "silently wrong forward"
 /// failure mode that would corrupt a fit without the solver
 /// ever seeing an error flag.
@@ -334,8 +330,8 @@ fn scalar_density_within_box(plan: &ScalarSurrogatePlan, n: f64) -> bool {
 /// (caller is responsible; legacy code path).
 ///
 /// Returns `false` when any component escapes the tolerance-
-/// expanded box OR is negative, OR is not finite.  Codex round-4
-/// P1 on PR #480: without this, a spatial fit whose per-pixel
+/// expanded box OR is negative, OR is not finite.  Without this,
+/// a spatial fit whose per-pixel
 /// optimum drifts beyond `2 × initial_densities` silently runs the
 /// surrogate out of domain.
 fn density_within_box(plan: &SparseEmpiricalCubaturePlan, n: &[f64]) -> bool {
@@ -365,7 +361,7 @@ fn cubature_eligible(
     resolution_plan: Option<&ResolutionPlan>,
     n_density_params: usize,
 ) -> bool {
-    // k ≥ 2: PR #475 (scalar k=1 branch) handles the grouped case.
+    // k ≥ 2: the scalar k=1 branch handles the grouped case.
     if n_density_params < 2 {
         return false;
     }
@@ -380,7 +376,7 @@ fn cubature_eligible(
     // (it's the only kernel `ResolutionPlan::compile_to_matrix`
     // accepts), so firing it on a Gaussian-active model would
     // silently replace Gaussian broadening with a tabulated
-    // surrogate.  Codex round-3 P2 on PR #480.
+    // surrogate.
     if !matches!(instrument_resolution, ResolutionFunction::Tabulated(_)) {
         return false;
     }
@@ -403,9 +399,8 @@ fn cubature_eligible(
     // `fit_spectrum_typed` / `build_transmission_model` don't
     // synthesize one by default), the in-model resolution broaden
     // path falls back to per-call `apply_resolution` and the
-    // cubature's self-check above is the grid guard.  Codex
-    // separate-review finding on PR #481 inception: the round-2
-    // "resolution_plan.is_some() required" was over-strict and
+    // cubature's self-check above is the grid guard.  An earlier
+    // "resolution_plan.is_some() required" rule was over-strict and
     // silently disabled the fast path on the single-spectrum
     // surface.
     if let Some(res_plan) = resolution_plan {
@@ -460,7 +455,7 @@ impl FitModel for PrecomputedTransmissionModel {
         // Cubature fast path: when the plan is installed, matches
         // the grid + isotope count, and instrument resolution is
         // enabled (cubature folds both `exp(-Σ n σ)` and `apply_R`
-        // into a single per-row atom sweep).  See epic #472.
+        // into a single per-row atom sweep).
         if let (Some(cubature), Some(inst), Some(energies)) =
             (&self.sparse_cubature_plan, &self.instrument, &self.energies)
         {
@@ -484,10 +479,9 @@ impl FitModel for PrecomputedTransmissionModel {
 
         // Scalar (k = 1) surrogate fast path — same eligibility
         // stack as the cubature, gated on `n_density_params == 1`.
-        // Epic #472, PR #475.  The content-identity guards
+        // The content-identity guards
         // (σ-fingerprint + Arc::ptr_eq on source resolution plan)
-        // close the same-grid stale-plan hole the independent
-        // review surfaced.
+        // close the same-grid stale-plan hole.
         if let (Some(scalar), Some(inst), Some(energies)) =
             (&self.sparse_scalar_plan, &self.instrument, &self.energies)
         {
@@ -543,7 +537,7 @@ impl FitModel for PrecomputedTransmissionModel {
         // Resolution applies iff there is an instrument AND a working grid to
         // apply it on (`work_energies()` = the layout grid when present, else the
         // data grid).  `evaluate` and `analytical_jacobian` share this exact
-        // guard so the two paths cannot diverge (issue #608 R2).
+        // guard so the two paths cannot diverge (issue #608).
         if let (Some(inst), Some(work_energies)) = (&self.instrument, self.work_energies()) {
             let t_broadened = resolution::apply_resolution_with_plan(
                 self.resolution_plan.as_deref(),
@@ -629,8 +623,8 @@ impl FitModel for PrecomputedTransmissionModel {
             }
         }
 
-        // Scalar (k = 1) surrogate Jacobian fast path — epic #472 PR
-        // #475.  For a scalar fit `free_param_indices = [0]`, so
+        // Scalar (k = 1) surrogate Jacobian fast path.  For a
+        // scalar fit `free_param_indices = [0]`, so
         // the Jacobian has one column.
         if let (Some(scalar), Some(inst), Some(energies)) =
             (&self.sparse_scalar_plan, &self.instrument, &self.energies)
@@ -691,7 +685,7 @@ impl FitModel for PrecomputedTransmissionModel {
         // on the WORKING grid to form the inner derivative -σ·T, then apply
         // resolution on the working grid and extract the data points.
         // y_current is T_obs = R[T] on the DATA grid, which is NOT the same.
-        // Same resolution guard as `evaluate` (issue #608 R2) so the two paths
+        // Same resolution guard as `evaluate` (issue #608) so the two paths
         // agree by construction; the else branch is the no-resolution Jacobian.
         if let (Some(inst), Some(work_energies)) = (&self.instrument, self.work_energies()) {
             // Recompute unresolved T on the working grid from σ and params.
@@ -814,7 +808,7 @@ pub struct TransmissionFitModel {
     /// TOF / kernel-interp / bracket work.  `None` ⇒ per-call
     /// broadening (same output as pre-plan main).
     resolution_plan: Option<Arc<ResolutionPlan>>,
-    /// Optional sparse empirical cubature plan (epic #472).
+    /// Optional sparse empirical cubature plan.
     ///
     /// See [`PrecomputedTransmissionModel::sparse_cubature_plan`]
     /// for the dispatch contract.  In this per-pixel model the
@@ -823,7 +817,7 @@ pub struct TransmissionFitModel {
     /// the σ the cubature was built against becomes stale so the
     /// dispatch silently falls back.
     sparse_cubature_plan: Option<Arc<SparseEmpiricalCubaturePlan>>,
-    /// Optional scalar (k = 1) surrogate plan (epic #472, PR #475).
+    /// Optional scalar (k = 1) surrogate plan.
     /// Parallel to `sparse_cubature_plan` but dispatches only for
     /// `n_density_params == 1`.
     sparse_scalar_plan: Option<Arc<ScalarSurrogatePlan>>,
@@ -947,7 +941,7 @@ impl TransmissionFitModel {
 
     /// Attach a prebuilt scalar (k = 1) surrogate plan.  See
     /// [`PrecomputedTransmissionModel::sparse_scalar_plan`] for the
-    /// dispatch conditions.  Epic #472 PR #475.
+    /// dispatch conditions.
     #[must_use]
     pub fn with_sparse_scalar_plan(mut self, plan: Option<Arc<ScalarSurrogatePlan>>) -> Self {
         self.sparse_scalar_plan = plan;
@@ -971,7 +965,7 @@ impl FitModel for TransmissionFitModel {
         // Cubature fast path: plan present, resolution on, no
         // temperature fit (σ the cubature was built against must not
         // change at runtime).  k=1 grouped case and per-isotope T-fit
-        // falls through to the exact path.  See epic #472.
+        // falls through to the exact path.
         if let (Some(cubature), Some(inst)) = (&self.sparse_cubature_plan, &self.instrument)
             && self.temperature_index.is_none()
         {
@@ -998,8 +992,7 @@ impl FitModel for TransmissionFitModel {
         }
 
         // Scalar (k = 1) surrogate fast path was removed from this
-        // model in PR #475's round-4 fixes: the independent review
-        // showed that `TransmissionFitModel`'s on-the-fly σ compute
+        // model: `TransmissionFitModel`'s on-the-fly σ compute
         // couldn't be cheaply fingerprint-checked against the
         // plan's σ, leaving a same-grid stale-plan correctness
         // hole.  Production spatial dispatch attaches scalar plans
@@ -1196,8 +1189,8 @@ impl FitModel for TransmissionFitModel {
             }
         }
 
-        // Scalar (k = 1) surrogate Jacobian fast path removed in
-        // PR #475 round-4 — see the docstring at the corresponding
+        // Scalar (k = 1) surrogate Jacobian fast path removed —
+        // see the docstring at the corresponding
         // site in `TransmissionFitModel::evaluate()` above.
 
         // Only provide analytical Jacobian when base_xs is available
@@ -1706,14 +1699,13 @@ pub struct EnergyScaleTransmissionModel {
     /// alongside the trial plan; if the trial is rejected, the next
     /// iteration's evaluate at the accepted `(t0, L)` still hits.
     /// Only when a genuine new accepted step lands do we start
-    /// aging the oldest entry out.  Independent-review catch on
-    /// PR #484 (#483 A1).
+    /// aging the oldest entry out (#483 A1).
     ///
     /// `RefCell` is safe: `TransmissionFitModel`-family models are
     /// rebuilt per-pixel and never shared across rayon workers.
     cached_plans: RefCell<CachedPlanRing>,
     /// Capacity-1 cache of the working-grid σ keyed on `(t0_bits, L_scale_bits)`
-    /// (issue #608 R2 perf): a base-point `evaluate` + the Jacobian's density
+    /// (issue #608 perf): a base-point `evaluate` + the Jacobian's density
     /// columns at the same probe reuse one reich_moore+Doppler build instead of
     /// rebuilding it twice.  `RefCell` is safe — the model is rebuilt per pixel
     /// and never shared across threads.
@@ -1728,7 +1720,7 @@ pub struct EnergyScaleTransmissionModel {
 
 /// Capacity-1 working-grid σ cache entry, keyed on `(t0_bits, l_scale_bits)`.
 /// Named alias to keep the field type within clippy's `type_complexity` budget
-/// (issue #608 R2).
+/// (issue #608).
 type CachedWorkXs = Option<((u64, u64), Rc<transmission::WorkingGridXs>)>;
 
 /// One `(t0_bits, l_scale_bits)` → `ResolutionPlan` entry.  Named
@@ -1744,7 +1736,7 @@ struct CachedPlanEntry {
 /// survive a single-trial LM backtrack (accepted + trial); deeper
 /// backtracking chains still lose the accepted plan eventually, but
 /// those are rare in production and cheaper to miss than the default
-/// non-plan path.  Issue #483 A1, independent-review hardening.
+/// non-plan path.  Issue #483 A1.
 #[derive(Debug, Default)]
 struct CachedPlanRing {
     /// Slot 0 is the most-recently-inserted entry; slot 1 is the
@@ -1932,8 +1924,7 @@ impl EnergyScaleTransmissionModel {
     /// Capacity 2 survives one LM backtrack rejection: the previous
     /// (accepted) entry stays in slot 1 while the trial-step entry
     /// occupies slot 0, so a rejection followed by an evaluate at the
-    /// restored accepted `(t0, L)` still hits.  Independent-review
-    /// catch on PR #484 (#483 A1).
+    /// restored accepted `(t0, L)` still hits (#483 A1).
     ///
     /// Returns `None` for Gaussian resolution (no plan representation)
     /// or when the `build_resolution_plan` call fails (unsorted grid) —
@@ -1955,7 +1946,7 @@ impl EnergyScaleTransmissionModel {
         let inst = self.instrument.as_ref()?;
         // Match on a reference to `inst.resolution` defensively so the
         // check never attempts to move a non-`Copy` `ResolutionFunction`
-        // out of a shared `Arc<InstrumentParams>` (Copilot PR #484 P2).
+        // out of a shared `Arc<InstrumentParams>`.
         if !matches!(
             &inst.resolution,
             nereids_physics::resolution::ResolutionFunction::Tabulated(_)
@@ -2032,7 +2023,7 @@ impl EnergyScaleTransmissionModel {
     /// (boundary + fine-structure fidelity).  For tabulated / no resolution the
     /// working grid is `e_corr` itself with an identity layout.
     fn working_xs(&self, e_corr: &[f64]) -> Result<transmission::WorkingGridXs, FittingError> {
-        // Issue #608 R2: a degenerate calibration can drive corrected energies to
+        // Issue #608: a degenerate calibration can drive corrected energies to
         // 0 (l_scale → 0) or non-finite (l_scale → ∞).  `reich_moore` asserts
         // positive finite energy (an always-on `assert!`), so without this guard
         // such inputs PANIC inside `broadened_cross_sections_on_working_grid` —
@@ -2066,7 +2057,7 @@ impl EnergyScaleTransmissionModel {
     /// Working-grid σ for the current probe, cached (capacity 1, keyed on
     /// `(t0, L_scale)` bits) so a base-point `evaluate` and the Jacobian's
     /// density columns at the SAME probe share one reich_moore+Doppler build
-    /// instead of rebuilding it twice (issue #608 R2 perf).  FD probes at
+    /// instead of rebuilding it twice (issue #608 perf).  FD probes at
     /// perturbed `(t0, L_scale)` miss and rebuild, as required.
     fn working_xs_for(
         &self,
@@ -2112,7 +2103,7 @@ impl EnergyScaleTransmissionModel {
         // the working grid, Beer-Lambert, resolution, extract the data points
         // last — exactly as `forward_model` does.  This replaces interpolating
         // a precomputed σ, which clamped at the auxiliary boundary and dropped
-        // resonance fine-structure (a forward_model-fidelity gap; #608 review).
+        // resonance fine-structure (a forward_model-fidelity gap; #608).
         let work = self.working_xs_for(params, e_corr)?;
         let work_e = &work.layout.energies;
 
@@ -2210,7 +2201,7 @@ impl FitModel for EnergyScaleTransmissionModel {
         //   even though `corrected_energies` does NOT clamp on
         //   `L_scale`. Falling through here lets the standard
         //   per-coordinate FD path below compute the L_scale column
-        //   correctly. Issue #489 review L5.
+        //   correctly. Issue #489.
         let partial_gal_t0_column = if energy_scale_method == EnergyScaleJacobianMethod::PartialGal
             && t0_free_pos.is_some()
             && l_scale_free_pos.is_some()
@@ -2300,7 +2291,7 @@ impl FitModel for EnergyScaleTransmissionModel {
         // outer iteration the cache was already populated at the current
         // `(t0, L_scale)` and this lookup is a cheap Arc clone.
         //
-        // The `n_density_cols >= 2` gate from the PR #469 era is
+        // An earlier `n_density_cols >= 2` gate is
         // dropped here: the cache makes the plan build a one-shot
         // cost amortized across every evaluate at `(t0, L_scale)` in
         // the surrounding KL iteration, so even the N_density = 1
@@ -2345,7 +2336,7 @@ impl FitModel for EnergyScaleTransmissionModel {
                         // same boundary).  Skip the partial-GAL path
                         // and fall through to the per-coordinate FD
                         // section below — mirrors the t0 clamp-boundary
-                        // fallthrough PR #498 added (when
+                        // fallthrough (when
                         // `partial_gal_t0_column` is `None`, the entire
                         // partial-GAL block is skipped).  Production
                         // L_scale bounds are typically `[0.99, 1.01]`,
@@ -2499,7 +2490,7 @@ impl ForwardModel for PrecomputedTransmissionModel {
     }
 
     fn n_data(&self) -> usize {
-        // Issue #608 R2: when a Gaussian working-grid layout is attached,
+        // Issue #608: when a Gaussian working-grid layout is attached,
         // `cross_sections` lives on the (longer) working grid, but the number of
         // DATA points the model predicts is the layout's data-index count.
         // Without a layout the working grid IS the data grid.
@@ -3154,7 +3145,7 @@ mod tests {
         }
     }
 
-    // ── Cubature dispatch tests (epic #472, PR #474b) ───────────────────
+    // ── Cubature dispatch tests ─────────────────────────────────────────
 
     /// Helper: build a synthetic resolution kernel + plan + matrix.
     /// CI-hermetic (no PLEIADES fixture) using the same synthetic-
@@ -3250,7 +3241,7 @@ mod tests {
     fn make_trivial_instrument() -> Arc<InstrumentParams> {
         use nereids_physics::resolution::ResolutionFunction;
         // Tabulated resolution required for cubature-dispatch tests:
-        // round-3 P2 guard refuses the dispatch when the active
+        // the eligibility guard refuses the dispatch when the active
         // instrument resolution isn't `ResolutionFunction::Tabulated`.
         // The test_support helper builds a minimal delta-like kernel;
         // the broadening never actually runs on the cubature path
@@ -3277,8 +3268,7 @@ mod tests {
         // plan MUST also be installed for the cubature dispatch to
         // fire — without it, `cubature_eligible` refuses the plan
         // on the grounds that the cubature would be silently
-        // bypassing an unknown resolution operator (Codex round-2
-        // P2 guard).
+        // bypassing an unknown resolution operator.
         let mut model = PrecomputedTransmissionModel {
             cross_sections: Arc::new(sigmas.clone()),
             density_indices: Arc::new(vec![0, 1]),
@@ -3401,8 +3391,9 @@ mod tests {
 
     #[test]
     fn precomputed_cubature_no_plan_means_exact_path() {
-        // No cubature installed → byte-identical to pre-PR #474b
-        // main.  This is the regression guard: the dispatch addition
+        // No cubature installed → byte-identical to the
+        // pre-cubature-dispatch path.  This is the regression guard:
+        // the dispatch addition
         // must not change the default forward path.
         let n_grid = 40_usize;
         let (_energies, _plan, _matrix) = synthetic_resolution_setup(n_grid, 4);
@@ -3485,7 +3476,7 @@ mod tests {
     // with extra guards (`temperature_index.is_none()` for σ stack
     // stability).  These tests exercise BOTH `evaluate()` and
     // `analytical_jacobian()` directly on `TransmissionFitModel`,
-    // not the precomputed variant.  Claude round-1 P1 on PR #480.
+    // not the precomputed variant.
 
     /// Build a minimal `TransmissionFitModel` with a single trivial
     /// resonance per isotope + the synthetic σ used for the
@@ -3541,9 +3532,9 @@ mod tests {
         let cubature = build_cubature(&matrix, &sigmas, train_max.clone());
 
         // Install BOTH the resolution plan and the cubature plan:
-        // the round-2 eligibility guard requires `resolution_plan.is_some()`
+        // the eligibility guard requires `resolution_plan.is_some()`
         // so the cubature doesn't silently bypass an unknown
-        // resolution operator (Codex round-2 P2 on PR #480).
+        // resolution operator.
         let model = make_trivial_fit_model(energies.clone(), 2)
             .with_resolution_plan(Some(Arc::clone(&plan)))
             .with_sparse_cubature_plan(Some(cubature.clone()));
@@ -3624,8 +3615,7 @@ mod tests {
             assert_eq!(
                 a.to_bits(),
                 b.to_bits(),
-                "stale-grid cubature plan MUST NOT fire; evaluate() must match no-plan byte-exactly \
-                 (Codex PR #480 round-1 P1 regression guard)",
+                "stale-grid cubature plan MUST NOT fire; evaluate() must match no-plan byte-exactly",
             );
         }
     }
@@ -3636,8 +3626,7 @@ mod tests {
         // the density_box, then call evaluate() with a density
         // WELL beyond the 1.5× tolerance.  Dispatch must fall back
         // to the exact path rather than silently extrapolate the
-        // surrogate outside its trained region.  Codex round-4 P1
-        // on PR #480.
+        // surrogate outside its trained region.
         let n_grid = 40_usize;
         let (energies, plan, matrix) = synthetic_resolution_setup(n_grid, 4);
         let sigmas = synthetic_sigmas(n_grid, 2);
@@ -3685,10 +3674,9 @@ mod tests {
         // `UnifiedFitConfig::with_precomputed_sparse_cubature_plan`
         // but typically don't also pre-build a `ResolutionPlan` (the
         // per-call `apply_resolution` broaden path is used
-        // otherwise).  The cubature fast path MUST still fire — the
-        // prior round-2 `resolution_plan.is_some()` requirement
-        // made the new API inert on this surface.  Codex separate-
-        // review finding on PR #481.
+        // otherwise).  The cubature fast path MUST still fire — a
+        // prior `resolution_plan.is_some()` requirement
+        // made the new API inert on this surface.
         let n_grid = 40_usize;
         let (energies, _plan, matrix) = synthetic_resolution_setup(n_grid, 4);
         let sigmas = synthetic_sigmas(n_grid, 2);
@@ -3714,20 +3702,20 @@ mod tests {
 
     // ── Scalar (k = 1) dispatch-guard tests ───────────────────────────
     //
-    // Claude round-1 P2-#8 on PR #475.  The cubature tests above cover
+    // The cubature tests above cover
     // the k ≥ 2 path; the scalar path is a separate surrogate with its
     // own eligibility guard (`scalar_eligible`) and its own
     // density-box guard (`scalar_density_within_box`).  These tests
     // exercise the scalar-specific guards: k=1-only, grid-identity
     // via `to_bits()`, tabulated-only instrument resolution,
     // density-box escape, and that the pure no-plan path remains
-    // byte-identical to pre-PR #475 main.
+    // byte-identical to the pre-surrogate path.
 
     /// Helper: build a synthetic scalar (k = 1) Chebyshev plan on
     /// the same grid as the cubature helpers.  Takes an
     /// `Arc<ResolutionPlan>` so tests can share the same Arc
     /// pointer with the model's `resolution_plan` (required by the
-    /// post-round-4 `Arc::ptr_eq` dispatch guard).
+    /// `Arc::ptr_eq` dispatch guard).
     fn build_scalar_plan(
         res_plan: Arc<ResolutionPlan>,
         sigma_k1: &[f64],
@@ -3869,7 +3857,7 @@ mod tests {
 
     #[test]
     fn precomputed_scalar_falls_back_on_stale_resolution_plan() {
-        // Independent review P1 reproduction on PR #475: same-grid
+        // Same-grid
         // DIFFERENT-kernel ResolutionPlan swap must not silently
         // dispatch.  The `Arc::ptr_eq` guard on the scalar plan's
         // stored source plan is the O(1) check that closes this.
@@ -3908,7 +3896,7 @@ mod tests {
 
     #[test]
     fn precomputed_scalar_falls_back_on_stale_sigma() {
-        // Independent review P1 reproduction on PR #475: plan built
+        // Plan built
         // from σ_A, attached to a model whose cross_sections[0] is
         // σ_B on the same grid with the same resolution plan →
         // σ-fingerprint mismatch forces fallback.
@@ -4008,7 +3996,7 @@ mod tests {
         // Unit-test the scalar_density_within_box helper directly
         // without going through the model dispatch.  Chebyshev is a
         // polynomial interpolant that diverges exponentially outside
-        // `[0, n_max]` — Codex PR #475 round 2 measured 73 % rel err
+        // `[0, n_max]` — measured: 73 % rel err
         // at `1.5 × n_max`.  The guard is therefore **strict**
         // `n ≤ train_max`, not the cubature's 1.5× tolerance.
         let n_grid = 16_usize;
@@ -4023,8 +4011,8 @@ mod tests {
         assert!(scalar_density_within_box(&plan, 0.0));
         assert!(scalar_density_within_box(&plan, 0.5 * n_max));
         assert!(scalar_density_within_box(&plan, n_max));
-        // Any positive excursion past the box is rejected (Codex
-        // round-2 P1 fix on PR #475 — no more 1.5× tolerance).
+        // Any positive excursion past the box is rejected (no
+        // 1.5× tolerance).
         assert!(!scalar_density_within_box(
             &plan,
             n_max * (1.0 + f64::EPSILON)
@@ -4045,7 +4033,7 @@ mod tests {
         // monotonic group layouts like [1, 0, 1].  Sorted-by-value
         // keeps dispatch aligned with the cubature's σ-stack
         // indexing (`sigmas[j * n_rows + ℓ]` = σ for density param
-        // j).  Codex round-4 P2 on PR #480.
+        // j).
         assert_eq!(density_param_indices(&[0, 0, 0]), vec![0]);
         assert_eq!(density_param_indices(&[0, 1, 2, 3]), vec![0, 1, 2, 3]);
         assert_eq!(density_param_indices(&[1, 0, 1]), vec![0, 1]);
@@ -4716,7 +4704,7 @@ mod tests {
     // the fix is a real correction, not a no-op.  Jacobian columns are checked
     // against central finite differences of the (now aux-correct) `evaluate`.
     //
-    // SCOPE of the 1e-9 bound (R4 review): these tests pin GRID FIDELITY — that
+    // SCOPE of the 1e-9 bound: these tests pin GRID FIDELITY — that
     // each fixed path builds the same auxiliary grid + layout as `forward_model`
     // and extracts the data points identically.  The resolution KERNEL primitive
     // itself (`apply_resolution_*`, `build_aux_grid`, `doppler::doppler_broaden`)
@@ -4993,7 +4981,7 @@ mod tests {
         }
     }
 
-    /// Issue #608 (review round 1): EnergyScale must evaluate the TRUE σ at the
+    /// Issue #608: EnergyScale must evaluate the TRUE σ at the
     /// corrected energies on the auxiliary grid — INCLUDING the boundary
     /// extension points — exactly like `forward_model`, not clamp a precomputed
     /// σ.  With the U-238 resonance near the grid EDGE (where the pre-fix clamp
@@ -5043,7 +5031,7 @@ mod tests {
         );
     }
 
-    /// Issue #608 (R3): the GROUPED energy-scale path — multiple isotopes mapped
+    /// Issue #608: the GROUPED energy-scale path — multiple isotopes mapped
     /// to ONE density parameter with non-unity ratios — is reachable in
     /// production (`with_groups` + `fit_energy_scale`) but was exercised by no
     /// test; every other energy-scale test used a single isotope
@@ -5496,7 +5484,7 @@ mod tests {
         // (t0 / L_scale) columns are FD-based and method-dependent; they are
         // covered against a matching-h FD2 reference by the partial_gal_* tests.
         // Comparing them to a different-h FD here would be apples-to-oranges,
-        // especially on the sharp U-238 resonance (#608 review-round-1 migration
+        // especially on the sharp U-238 resonance (#608 migration
         // to true-σ resonance data).
         let free = vec![0];
         let jac = model
@@ -5713,8 +5701,8 @@ mod tests {
         //
         // **Active code path (regression target):** the test inputs
         // are chosen so the new `L_SCALE_EPSILON` guard is what fires,
-        // *not* the older `t0 + h >= t0_limit` precompute fallthrough
-        // (PR #498).  Specifically:
+        // *not* the older `t0 + h >= t0_limit` precompute fallthrough.
+        // Specifically:
         //
         //   - `min_tof_us = tof_factor * 25.0 / sqrt(max_E ≈ 10.0) ≈ 5.7e2 µs`
         //   - `t0 + h = 0.05 + 1e-4 = 0.0501 µs ≪ min_tof * (1 - 1e-12)`
@@ -5812,7 +5800,7 @@ mod tests {
     /// asserts the kernel itself is non-trivial so a future tweak
     /// to grid spacing or kernel parameters cannot silently degrade
     /// this back into a vacuous "no-resolution-in-disguise" test
-    /// (PR #544 round 1 caught exactly that regression).  The
+    /// (a regression that has occurred before).  The
     /// measured relative L₂ surfaces in the assert message if the
     /// bound is ever exceeded so future tightening is straightforward.
     #[test]
@@ -5834,7 +5822,7 @@ mod tests {
 
         // Gaussian resolution kernel sized to be NON-TRIVIAL on this grid (it
         // broadens the U-238 resonance by ~1%, verified by the pre-check below).
-        // PR #544 round 1 caught a kernel-too-narrow vacuous-test regression;
+        // A kernel-too-narrow vacuous-test regression has occurred before;
         // the pre-check guards against re-introducing it.
         let instrument = Some(Arc::new(InstrumentParams {
             resolution: ResolutionFunction::Gaussian(
@@ -5853,7 +5841,7 @@ mod tests {
 
         // Pre-check: confirm the resolution kernel actually broadens the
         // spectrum on this grid, so the comparison is not a vacuous
-        // no-resolution-in-disguise test (PR #544 round 1).
+        // no-resolution-in-disguise test.
         let model_no_resolution = make_energy_scale_u238(energies.clone(), None)
             .with_jacobian_method(EnergyScaleJacobianMethod::FiniteDifference);
         let t_no_res = model_no_resolution.evaluate(&params).unwrap();

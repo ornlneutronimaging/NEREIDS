@@ -72,8 +72,8 @@ pub struct SpatialResult {
     /// the SAMMY 6-term form
     /// `bg(E) = BackA + BackB/√E + BackC·√E + BackD·exp(-BackF/√E)`.
     /// Both LM-transmission and counts-KL paths use these semantics
-    /// (legacy alpha-fitting `[b0, b1, alpha_2]` layout was retired with
-    /// `fit_counts_poisson` in PR #450).
+    /// (legacy alpha-fitting `[b0, b1, alpha_2]` layout was retired
+    /// together with `fit_counts_poisson`).
     ///
     /// The exponential `BackD`/`BackF` terms are surfaced separately
     /// in [`Self::back_d_map`] / [`Self::back_f_map`] — both `None`
@@ -638,7 +638,7 @@ pub fn spatial_map_typed(
         ));
     }
 
-    // Issue #458 (Codex review): `fit_energy_scale` + `fit_temperature`
+    // Issue #458: `fit_energy_scale` + `fit_temperature`
     // is not a supported combination — `EnergyScaleTransmissionModel`
     // and the temperature-fitting path are mutually exclusive at the
     // single-spectrum fitter (`pipeline.rs:830, 976, 1183`).  Without
@@ -797,7 +797,7 @@ pub fn spatial_map_typed(
     }
     if pixel_coords.is_empty() {
         // All pixels filtered out (typically by `dead_pixels` mask).  Per
-        // the NaN-on-failure contract (issue #458 B1 + Copilot review),
+        // the NaN-on-failure contract (issue #458 B1),
         // every parameter map must be NaN at every pixel — including
         // density, which was previously initialised with zeros here.
         // `converged_map` is all `false`, which is the caller's signal
@@ -1071,7 +1071,7 @@ pub fn spatial_map_typed(
                 // the same error variant whether or not
                 // `precomputed_cross_sections` is cached (the non-
                 // cached path already surfaces this via
-                // `broadened_cross_sections`).  Copilot #7.
+                // `broadened_cross_sections`).
                 Some(res) => build_resolution_plan(config.energies(), res)
                     .map_err(|e| {
                         PipelineError::Transmission(
@@ -1094,16 +1094,15 @@ pub fn spatial_map_typed(
     //   * no resolution plan (Gaussian or missing);
     //   * temperature or energy-scale fitting is active (σ / grid
     //     can change at runtime, invalidating atoms);
-    //   * k == 1 (scalar fast-path is PR #475's scope);
+    //   * k == 1 (handled by the separate scalar surrogate plan below);
     //   * xs is not pre-collapsed to per-group σ (cubature needs the
     //     final σ stack, not per-isotope σ × ratios).
     // Capture any caller-supplied cubature plan BEFORE the local
     // rebuild pathway — the `with_precomputed_cross_sections` setter
     // clears `precomputed_sparse_cubature_plan` as a defence against
-    // stale-XS dispatch (Codex round-3 P3 on PR #480), so without
-    // this snapshot a plan the caller attached via
-    // `UnifiedFitConfig::with_precomputed_sparse_cubature_plan` would
-    // be dropped and lost on every call.  Codex round-5 P3 on PR #480.
+    // stale-XS dispatch, so without this snapshot a plan the caller
+    // attached via `UnifiedFitConfig::with_precomputed_sparse_cubature_plan`
+    // would be dropped and lost on every call.
     let caller_cubature = config.precomputed_sparse_cubature_plan().cloned();
     let sparse_cubature_plan: Option<Arc<nereids_physics::surrogate::SparseEmpiricalCubaturePlan>> =
         if !config.fit_temperature()
@@ -1136,7 +1135,7 @@ pub fn spatial_map_typed(
                 // different σ mutation after this point, or the
                 // collapse stops running first, the builder will
                 // receive wrong σ and this assertion catches it in
-                // debug builds.  Codex/Claude round-1 P2 on PR #480.
+                // debug builds.
                 debug_assert_eq!(
                     sigmas_flat.len(),
                     k * n_rows,
@@ -1174,7 +1173,6 @@ pub fn spatial_map_typed(
                         // to fire when a fit iterate escapes the
                         // trained region — rather than silently
                         // running the surrogate out-of-domain.
-                        // Codex round-4 P1 on PR #480.
                         Some(Arc::new(plan.with_density_box(train_max.clone())))
                     }
                     Err(e) => {
@@ -1183,8 +1181,7 @@ pub fn spatial_map_typed(
                         // continue via the exact path, but a missing
                         // cubature on a supposedly-eligible call is
                         // a debugging signal that deserves
-                        // visibility.  Codex/Claude round-1 P2 on
-                        // PR #480.
+                        // visibility.
                         eprintln!(
                             "spatial_map_typed: sparse cubature build failed ({e}); \
                              falling back to exact ResolutionPlan path for this call",
@@ -1219,7 +1216,7 @@ pub fn spatial_map_typed(
     // isotope).  Reuses the compiled ResolutionMatrix from the
     // resolution plan.  Falls back silently on build failure; no
     // local plan means the exact `apply_resolution_with_plan` path
-    // runs as today.  PR #475 benched both Lanczos σ-pushforward
+    // runs as today.  A bench-off compared Lanczos σ-pushforward
     // Gauss quadrature and Chebyshev-in-density on real VENUS
     // (3471-bin production grid); Chebyshev won on both the
     // accuracy (≤ 2e-15 vs ≤ 4e-15) and wall-time axes.  Lanczos
@@ -1235,8 +1232,8 @@ pub fn spatial_map_typed(
             && xs.len() == 1
         {
             let sigma_row = &xs[0];
-            // Chebyshev-in-density at M = 16 (PR #475 bench-off
-            // winner).  Training box: 2 × the initial density;
+            // Chebyshev-in-density at M = 16 (bench-off winner).
+            // Training box: 2 × the initial density;
             // Chebyshev's interpolant is exact at its nodes and
             // tight (≤ 1e-15 rel err) across a well-chosen box.
             //
@@ -1246,7 +1243,7 @@ pub fn spatial_map_typed(
             // build's midpoint self-check fires and returns
             // `InsufficientAccuracyOnBox`; we log and fall back
             // to the exact path rather than install a plan that
-            // could corrupt the fit.  Codex PR #475 round-2 P2.
+            // could corrupt the fit.
             //
             const CHEBYSHEV_NODES: usize = 16;
             let n_max: f64 = 2.0 * config.initial_densities()[0].max(1e-6);
@@ -1272,7 +1269,7 @@ pub fn spatial_map_typed(
     // Grid-identity check uses `to_bits()` per element (matches
     // `scalar_eligible` / `cubature_eligible`), not `==`, so `-0.0`
     // vs `+0.0` and NaN-bit mismatches can't silently slip through
-    // the caller-fallback pre-filter.  Claude round-1 P2 on PR #475.
+    // the caller-fallback pre-filter.
     let sparse_scalar_plan = sparse_scalar_plan.or_else(|| {
         caller_scalar.filter(|p| {
             let expected_len = xs.first().map(|r| r.len()).unwrap_or(0);
@@ -2071,7 +2068,7 @@ mod tests {
         }
     }
 
-    /// Issue #608 (R4): the GAUSSIAN-resolution spatial path — `spatial_map_typed`'s
+    /// Issue #608: the GAUSSIAN-resolution spatial path — `spatial_map_typed`'s
     /// `aux_grid_active` branch (work σ via `broadened_cross_sections_on_working_grid`,
     /// per-pixel injection through `with_precomputed_work_cross_sections`) plus
     /// `build_transmission_model`'s working-grid selection — is the bulk of the
@@ -2186,7 +2183,7 @@ mod tests {
         }
     }
 
-    /// Issue #608 (PR #609 coverage): `spatial_map_typed`'s `Some(cached)` +
+    /// Issue #608: `spatial_map_typed`'s `Some(cached)` +
     /// aux-grid arm — when a caller PRE-SUPPLIES data-grid σ AND a Gaussian aux
     /// grid is active, the working-grid σ is recomputed from resonance data (the
     /// cached data σ cannot be de-extracted back onto the aux grid).  The
@@ -3652,7 +3649,7 @@ mod tests {
     }
 
     /// `fit_energy_scale + fit_temperature` must be rejected at
-    /// spatial entry (Codex review follow-up to #458).  The
+    /// spatial entry (follow-up to #458).  The
     /// single-spectrum fitter errors on this combination, but without
     /// a spatial-layer guard every pixel would error and
     /// `spatial_map_typed` would silently return `n_failed == n_total`

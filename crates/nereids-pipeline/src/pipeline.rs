@@ -351,7 +351,7 @@ pub struct UnifiedFitConfig {
         Option<Arc<nereids_physics::surrogate::SparseEmpiricalCubaturePlan>>,
     /// Scalar (k = 1) surrogate plan for the grouped-Hf / single-
     /// isotope path.  Parallel to `precomputed_sparse_cubature_plan`
-    /// but dispatches at `k == 1`.  Epic #472, PR #475.
+    /// but dispatches at `k == 1`.
     precomputed_sparse_scalar_plan: Option<Arc<nereids_physics::surrogate::ScalarSurrogatePlan>>,
 
     // ── Energy-scale calibration (SAMMY TZERO equivalent) ──
@@ -583,7 +583,7 @@ impl UnifiedFitConfig {
         // A new XS cache invalidates any prebuilt cubature — the
         // cubature's atoms encode the OLD σ stack, so reusing the
         // plan would silently produce wrong forward / Jacobian
-        // values for the new σ (Codex round-3 P3 on PR #480).
+        // values for the new σ.
         self.precomputed_sparse_cubature_plan = None;
         self.precomputed_sparse_scalar_plan = None;
         // A new data-grid σ also invalidates the working-grid σ copy
@@ -658,8 +658,8 @@ impl UnifiedFitConfig {
     /// * `plan.k() != n_density_params` (isotope-set mismatch).
     /// * `self.fit_temperature == true` (σ changes → atoms stale).
     /// * `self.fit_energy_scale == true` (grid changes → plan stale).
-    /// * `n_density_params == 1` (scalar fast-path belongs to PR #475;
-    ///   for now this path still falls back).
+    /// * `n_density_params == 1` (the scalar fast-path is handled
+    ///   separately — see the `k == 1` dispatch).
     ///
     /// Callers (typically `spatial_map_typed`) are responsible for
     /// ensuring the plan was built against compatible `sigmas` /
@@ -674,10 +674,10 @@ impl UnifiedFitConfig {
         self
     }
 
-    /// Attach a prebuilt scalar (k = 1) surrogate plan.  Epic #472,
-    /// PR #475.  Same invalidation discipline as the cubature: the
-    /// plan is cleared on `with_groups` / `with_precomputed_cross_sections`
-    /// / `with_precomputed_base_xs`, so a stale σ cannot silently
+    /// Attach a prebuilt scalar (k = 1) surrogate plan.  Same
+    /// invalidation discipline as the cubature: the plan is cleared on
+    /// `with_groups` / `with_precomputed_cross_sections` /
+    /// `with_precomputed_base_xs`, so a stale σ cannot silently
     /// dispatch.
     #[must_use]
     pub fn with_precomputed_sparse_scalar_plan(
@@ -753,8 +753,7 @@ impl UnifiedFitConfig {
         // ℝ^k and `k` / σ-stack change when groups are reconfigured,
         // so a stale plan would silently produce wrong forward /
         // Jacobian values for the new isotope set even if
-        // `cubature_eligible` accepts the same k + grid (Codex round 1
-        // P2 on PR #480).
+        // `cubature_eligible` accepts the same k + grid.
         self.precomputed_sparse_cubature_plan = None;
         self.precomputed_sparse_scalar_plan = None;
         Ok(self)
@@ -765,15 +764,14 @@ impl UnifiedFitConfig {
     /// Caller-attached sparse empirical cubature plan, if any.
     /// `spatial_map_typed` reads this so a pre-existing plan is
     /// preserved instead of being clobbered by the local rebuild
-    /// pathway (Codex round-5 P3 on PR #480).
+    /// pathway.
     pub fn precomputed_sparse_cubature_plan(
         &self,
     ) -> Option<&Arc<nereids_physics::surrogate::SparseEmpiricalCubaturePlan>> {
         self.precomputed_sparse_cubature_plan.as_ref()
     }
 
-    /// Caller-attached scalar (k = 1) surrogate plan, if any.  Epic
-    /// #472, PR #475.
+    /// Caller-attached scalar (k = 1) surrogate plan, if any.
     pub fn precomputed_sparse_scalar_plan(
         &self,
     ) -> Option<&Arc<nereids_physics::surrogate::ScalarSurrogatePlan>> {
@@ -1741,10 +1739,10 @@ fn peak_match_energy_scale_seed(
     // corrected ≈ measured), keeping the deepest dip per resonance.  Reject a
     // dip that does not sit UNAMBIGUOUSLY near a resonance — within half the
     // minimum inter-resonance spacing — so a spurious/mis-matched dip drops out
-    // rather than poisoning the linear fit (issue #608 R2).  `res_e` is sorted
+    // rather than poisoning the linear fit (issue #608).  `res_e` is sorted
     // and de-duplicated.
     //
-    // Floor `match_tol` at the energy-grid resolution (Copilot PR #609): a dip
+    // Floor `match_tol` at the energy-grid resolution: a dip
     // is localized to ~one grid step, so a single closely-spaced resonance pair
     // must not collapse the GLOBAL tolerance toward 0 and reject dips at
     // well-separated resonances.  Dedup already stops exact duplicates from
@@ -1810,7 +1808,7 @@ fn peak_match_energy_scale_seed(
     // Reject (→ keep the configured cold start) when the fitted seed falls
     // outside the parameter bounds.  Clamping an out-of-range fit onto a bound
     // would seed the LM worse than its cold start — the opposite of this seed's
-    // purpose (issue #608 R2).  An in-range fit is the high-confidence case.
+    // purpose (issue #608).  An in-range fit is the high-confidence case.
     if t0 < t0_bounds.0
         || t0 > t0_bounds.1
         || l_scale < l_scale_bounds.0
@@ -2693,7 +2691,7 @@ pub fn evaluate_jacobian_and_fisher(
     //     working-grid σ — the only #608-correct source under Gaussian
     //     resolution.  Without this, a caller that pre-supplied a data-grid σ
     //     plus Gaussian resolution silently got coarse-grid broadening in the
-    //     Jacobian/Fisher (R3 finding).
+    //     Jacobian/Fisher.
     let config_with_xs;
     let effective_config =
         if config.fit_temperature || config.precomputed_work_cross_sections.is_some() {
@@ -2948,7 +2946,7 @@ pub struct SpectrumFitResult {
     /// Both LM-transmission and counts-KL solver paths use the same
     /// SAMMY semantics here — the legacy alpha-fitting `[b0, b1,
     /// alpha_2]` layout was removed when `fit_counts_poisson` was
-    /// retired in PR #450.  When background fitting is disabled, the
+    /// retired.  When background fitting is disabled, the
     /// pipeline emits `[0.0, 0.0, 0.0]`.
     pub background: [f64; 3],
     /// Fitted exponential background amplitude (SAMMY BackD).
@@ -3061,7 +3059,7 @@ mod tests {
         );
     }
 
-    /// Issue #608 (R4): the peak-match seed must recover a NON-identity
+    /// Issue #608: the peak-match seed must recover a NON-identity
     /// calibration, not just confirm identity.  Generate measured data with a
     /// known injected `(t0, L_scale)` via the `EnergyScaleTransmissionModel`
     /// (which shifts the resonance positions), then assert the seed recovers it.
@@ -3126,7 +3124,7 @@ mod tests {
         );
     }
 
-    /// Issue #608 (R4): a heavily-absorbing but FEATURELESS spectrum (no
+    /// Issue #608: a heavily-absorbing but FEATURELESS spectrum (no
     /// resonance dips) yields fewer than two detectable dips, so the seed must
     /// return `None` and the caller keeps the cold start rather than fitting a
     /// spurious calibration.
@@ -3161,7 +3159,7 @@ mod tests {
         );
     }
 
-    /// Issue #608 (Copilot PR #609): duplicate resonance center energies — two
+    /// Issue #608: duplicate resonance center energies — two
     /// isotopes with a resonance at the SAME energy in a grouped fit — must not
     /// collapse the seed's `match_tol` to 0.  Pre-fix `resonance_center_energies`
     /// returned `[7.8, 7.8, 16.9]` ⇒ minimum spacing 0 ⇒ `match_tol` 0 ⇒ every
@@ -4702,7 +4700,7 @@ mod tests {
     }
 
     /// Partial BackD/BackF configurations are rejected with a clear error
-    /// on the LM transmission path.  Regression for code-review finding:
+    /// on the LM transmission path.  Regression:
     /// pre-fix, `append_background_params` allocated a free index for the
     /// enabled tail parameter but `NormalizedTransmissionModel::new`
     /// (4-term wrapper, fall-back when only one of back_d/back_f was
@@ -4992,7 +4990,7 @@ mod tests {
     /// LM dispatcher must reject `fit_energy_range` that selects fewer
     /// than 2 active bins on the configured grid with a clear
     /// "range too narrow" error — instead of a confusing non-converged
-    /// LM result.  Regression for #517 R3 P2 (Copilot finding #2).
+    /// LM result.  Regression for #517.
     #[test]
     fn test_fit_energy_range_lm_rejects_too_narrow() {
         let data = u238_single_resonance();
@@ -5026,7 +5024,7 @@ mod tests {
     }
 
     /// Joint-Poisson dispatcher must reject too-narrow ranges with the
-    /// same clear error.  Regression for #517 R3 P2 (Copilot #3).
+    /// same clear error.  Regression for #517.
     #[test]
     fn test_fit_energy_range_jp_rejects_too_narrow() {
         let data = u238_single_resonance();
@@ -5056,7 +5054,7 @@ mod tests {
         );
     }
 
-    // ── Issue #608 (PR #609): Rust coverage for paths previously exercised only
+    // ── Issue #608: Rust coverage for paths previously exercised only
     //    via Python / the spatial-identity path (codecov/patch gap) ───────────
 
     /// `evaluate_jacobian_and_fisher` (the research Fisher / `compute_model_jacobian`
@@ -5398,7 +5396,7 @@ mod tests {
 
     /// `peak_match_energy_scale_seed` rejects (→ keeps the cold start) a fit that
     /// lands OUTSIDE the parameter bounds rather than clamping onto a bound
-    /// (issue #608 R2): inject an L_scale (1.03) beyond the seed's (0.99, 1.01).
+    /// (issue #608): inject an L_scale (1.03) beyond the seed's (0.99, 1.01).
     #[test]
     fn peak_match_energy_scale_seed_rejects_out_of_bounds() {
         let data = hf178_mlbw_two_resonances();

@@ -120,7 +120,7 @@ fn tof_scale_to_us(units: Option<&str>) -> Result<f64, IoError> {
 /// catching any error from [`Location::attr`]) so that genuine HDF5
 /// errors — corrupt file, permission denied, internal failure —
 /// surface as [`IoError::InvalidParameter`] instead of silently
-/// becoming "attribute missing".  This was a latent bug pre-Round 2:
+/// becoming "attribute missing".  This was a latent bug:
 /// the previous implementation mapped *every* `attr()` failure to
 /// `Ok(None)`, including non-"not found" errors.
 fn read_string_attr(loc: &hdf5::Location, name: &str) -> Result<Option<String>, IoError> {
@@ -347,11 +347,11 @@ pub fn load_nexus_histogram_with_mode(
     }
 
     // Validate the rotation-angle policy BEFORE reading the full 4D
-    // counts dataset (Codex review on PR-B): the check is purely
-    // metadata-driven and the rejection paths should be cheap.  Reading
-    // the full u64 cube just to error out is wasteful on production
-    // multi-angle NeXus files (easily multi-GB), and historically
-    // caused OOM-before-error on the default "refuse" code path.
+    // counts dataset: the check is purely metadata-driven and the
+    // rejection paths should be cheap.  Reading the full u64 cube just
+    // to error out is wasteful on production multi-angle NeXus files
+    // (easily multi-GB), and historically caused OOM-before-error on
+    // the default "refuse" code path.
     let n_rot = shape[0];
     if n_rot == 0 {
         // Degenerate file with a zero-sized rotation-angle axis.
@@ -396,10 +396,10 @@ pub fn load_nexus_histogram_with_mode(
         _ => {}
     }
 
-    // Read only the rotation-angle slice(s) the caller actually needs
-    // (Copilot review on PR-B).  Reading the full 4D cube when the
-    // caller wants one projection is wasteful on production
-    // multi-angle files (multi-GB per acquisition).
+    // Read only the rotation-angle slice(s) the caller actually needs.
+    // Reading the full 4D cube when the caller wants one projection is
+    // wasteful on production multi-angle files (multi-GB per
+    // acquisition).
     //
     // - `Error` is guaranteed to have `n_rot == 1` (validated above),
     //   so we hyperslab-read the single projection.
@@ -680,10 +680,10 @@ pub fn load_nexus_events(
 /// attribute is unparseable, the TOF axis is dropped entirely
 /// (returned as `None`) rather than silently propagated at the wrong
 /// scale, matching the function's "any failure → no data for that
-/// field" contract.  Round 2 review (PR #561) found that the
-/// previous implementation returned the raw values verbatim — a
-/// silent 1000× error for any file written with `units = "us"`,
-/// symmetric with the load-path bug closed by issue #554.
+/// field" contract.  The previous implementation returned the raw
+/// values verbatim — a silent 1000× error for any file written with
+/// `units = "us"`, symmetric with the load-path bug closed by issue
+/// #554.
 fn probe_histogram_group(entry: &hdf5::Group) -> (bool, Option<[usize; 4]>, Option<Vec<f64>>) {
     let hist = match entry.group("histogram") {
         Ok(g) => g,

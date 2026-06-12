@@ -174,7 +174,7 @@ pub struct SparseEmpiricalCubaturePlan {
     /// the box (with a tolerance multiplier to avoid thrashing).
     /// `None` means "no box information available; dispatch cannot
     /// safety-check against it".  Set via
-    /// [`Self::with_density_box`].  Codex round-4 P1 on PR #480.
+    /// [`Self::with_density_box`].
     density_box: Option<Vec<f64>>,
 }
 
@@ -184,8 +184,8 @@ impl SparseEmpiricalCubaturePlan {
     /// `train_max ∈ ℝ^k`, return `S = 2 + k` training points
     /// consisting of `0.25 * train_max`, `0.75 * train_max`, and the
     /// k axis-aligned "unit" points `train_max[i] · e_i` (all other
-    /// components zero).  Exposed as a helper so callers — including
-    /// the wiring in PR #474b — don't have to hand-roll the rule.
+    /// components zero).  Exposed as a helper so callers don't have
+    /// to hand-roll the rule.
     ///
     /// Duplicates are NOT removed.  In practice the rule produces
     /// `S = k + 2` distinct points for any `k ≥ 1` with all
@@ -362,7 +362,7 @@ impl SparseEmpiricalCubaturePlan {
             // predictions can pick up mass at energies the exact
             // resolution operator never samples.  Filter them here
             // so no zero-R column ever becomes an LP variable or a
-            // stored atom.  Codex round-3 finding on PR #474a.
+            // stored atom.
             //
             // Row sum guard: the source matrix is row-stochastic
             // (Σ_q R_{iq} = 1 to machine precision), so dropping
@@ -709,16 +709,16 @@ impl SparseEmpiricalCubaturePlan {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// Scalar (k = 1) surrogate — epic #472, PR #475.
+// Scalar (k = 1) surrogate — epic #472.
 // ═══════════════════════════════════════════════════════════════════
 //
 // The [`SparseEmpiricalCubaturePlan`] above is the k ≥ 2 production
 // winner, but its generic atom construction over-damps the grouped
 // Hf k = 1 KL scatter by ~27 % (codex04 round-2 measurement).  The
-// scalar path gets a dedicated surrogate.  PR #475 built both
+// scalar path gets a dedicated surrogate.  Both
 // round-2 candidates (Lanczos σ-pushforward Gauss quadrature,
-// Chebyshev-in-density) side-by-side and benched them on the real
-// VENUS 3471-bin production grid.  Chebyshev won both the
+// Chebyshev-in-density) were built side-by-side and benched on
+// the real VENUS 3471-bin production grid.  Chebyshev won both the
 // accuracy (max_err ≤ 2e-15 vs ≤ 4e-15) **and** the wall-time
 // axis by a wide margin — the ordering is stable across
 // hardware, even though absolute µs-per-row numbers aren't.
@@ -751,7 +751,7 @@ pub enum ScalarSurrogateBuildError {
     /// `M` for smooth `T(n) = exp(-n σ)`, but if `max(n_max · σ)` is
     /// large the interpolant loses precision.  Callers should either
     /// shrink `n_max` (preferred — tighter fit-exploration bounds
-    /// fix this) or increase `M`.  Codex PR #475 round-2 P2.
+    /// fix this) or increase `M`.
     InsufficientAccuracyOnBox {
         /// Requested density box upper bound.
         n_max: f64,
@@ -823,7 +823,7 @@ pub struct ScalarChebyshevPlan {
     /// the plan was built from.  Dispatch uses `Arc::ptr_eq` between
     /// this and the model's currently attached resolution plan as
     /// an O(1) identity check to refuse stale plans on the same
-    /// energy grid.  Independent review on PR #475.
+    /// energy grid.
     source_resolution_plan: std::sync::Arc<crate::resolution::ResolutionPlan>,
     /// FNV-1a-64 fingerprint of the σ slice (`to_bits()` per
     /// element) the plan was built from.  Dispatch recomputes
@@ -852,8 +852,8 @@ impl ScalarChebyshevPlan {
     ///
     /// The `source_resolution_plan` `Arc` is **stored on the plan**
     /// so the dispatch-time eligibility check can use
-    /// `Arc::ptr_eq` to refuse stale plans on the same grid
-    /// (independent review on PR #475).  A matching σ fingerprint
+    /// `Arc::ptr_eq` to refuse stale plans on the same grid.
+    /// A matching σ fingerprint
     /// is also computed and stored for the same reason: same-grid
     /// σ-mismatch would otherwise trigger silently-wrong
     /// transmissions.
@@ -924,7 +924,7 @@ impl ScalarChebyshevPlan {
             }
         }
 
-        // Build-time accuracy self-check — Codex PR #475 round-2 P2.
+        // Build-time accuracy self-check.
         //
         // Chebyshev interpolants are exact at their nodes by
         // construction; the test points that reveal how wide the
@@ -961,7 +961,7 @@ impl ScalarChebyshevPlan {
             let t_exact = crate::resolution::apply_r(&matrix, &t_un);
             // Plain relative error with a 1e-15 denominator floor
             // (matches `max_hybrid_err` conventions elsewhere in
-            // the crate).  Copilot PR #475 round-3 P2: the previous
+            // the crate).  The previous
             // `abs.min(rel)` could dramatically under-report when
             // `|a|, |b|` are both small, hiding catastrophic
             // divergence where the interpolant drifts to O(1)
@@ -1116,7 +1116,7 @@ impl ScalarChebyshevPlan {
 /// Scalar (k = 1) surrogate used by the downstream dispatch
 /// layers (see `TransmissionFitModel` / `PrecomputedTransmissionModel`).
 ///
-/// This was an enum of `Gauss` vs `Chebyshev` during PR #475's
+/// This was an enum of `Gauss` vs `Chebyshev` during the
 /// bench-off period; Chebyshev won the real-VENUS bench on both
 /// accuracy (≤ 2e-15 vs ≤ 4e-15) and wall-time axes, and Lanczos
 /// Gauss was deleted per the issue's "drop the loser" contract.
@@ -1361,8 +1361,8 @@ mod tests {
     /// [`crate::resolution::ResolutionPlan::compile_to_matrix`] for
     /// NaN-safety (the `frac == +0.0` branch) MUST NOT become
     /// cubature atoms, even though the LP's zero objective would let
-    /// the simplex put arbitrary mass on them.  Codex round-3 finding
-    /// on PR #474a — this test guards against regression.
+    /// the simplex put arbitrary mass on them.  This test guards
+    /// against regression.
     #[test]
     fn cubature_rejects_zero_weight_csr_cells_as_atoms() {
         // Hand-construct a 5-cell synthetic plan where every
@@ -1684,7 +1684,7 @@ mod tests {
     // kernel via `common::synthetic_venus_usr_tab()`.
     // ---------------------------------------------------------------
 
-    // ── Scalar (k = 1) surrogate tests — PR #475 ───────────────────
+    // ── Scalar (k = 1) surrogate tests ─────────────────────────────
 
     /// Build a 1-isotope synthetic σ + matrix pair, shared by both
     /// scalar surrogate tests.
@@ -1766,7 +1766,7 @@ mod tests {
 
     #[test]
     fn scalar_chebyshev_rejects_overwide_box() {
-        // Codex PR #475 round-2 P2: build-time self-check refuses
+        // The build-time self-check refuses
         // boxes where 16-node Chebyshev can't resolve the
         // exp(-n · σ) surface.  A pathologically wide box on the
         // synthetic σ used by scalar_setup exceeds the 1e-6

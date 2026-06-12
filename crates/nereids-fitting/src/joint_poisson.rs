@@ -1034,7 +1034,7 @@ pub fn joint_poisson_fit(
     // For the asymptotic MLE covariance, however, the Cramér-Rao bound is
     // `Cov(θ̂) = I^{-1}`, NOT `H_D^{-1} = (2I)^{-1} = I^{-1}/2`.  Inverting
     // `H_D` and using it directly would under-report variance by 2× and
-    // standard errors by √2 × — a real bug caught in review.  We rescale
+    // standard errors by √2 × — a real ½-scaling bug.  We rescale
     // the inverse here: `I^{-1} = 2 · H_D^{-1}`.
     let (covariance, uncertainties) = if config.compute_covariance {
         let free_idx = params.free_indices();
@@ -1997,7 +1997,7 @@ mod tests {
     // ------------------------------------------------------------------
     // Reported uncertainty matches the analytical Cramér-Rao bound
     // I^{-1} (NOT (2I)^{-1} — the Hessian-of-D inverse, which would
-    // under-report σ by √2).  Caught in code review of memo-35 §P1
+    // under-report σ by √2).  A real bug in the original memo-35 §P1
     // implementation; see `joint_poisson_fit` covariance-extraction
     // doc-comment for the rescaling rationale.
     // ------------------------------------------------------------------
@@ -2211,7 +2211,7 @@ mod tests {
     /// fall through to the main loop, compute `deviance = 0` from the
     /// empty sum, and `dof = 0` → `deviance_per_dof = NaN` — but
     /// `gn_converged` could still be `true`, masquerading as a
-    /// successful fit on no data.  Regression for #517 R3 P1 (#514).
+    /// successful fit on no data.  Regression for #517 (#514).
     #[test]
     fn test_joint_poisson_rejects_zero_active_with_no_free_params() {
         let n_bins = 5;

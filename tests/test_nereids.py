@@ -576,7 +576,7 @@ class TestSpatialMapTransmission:
         SimpleNamespace stub) per the project's PyO3-contract testing
         convention.
 
-        Round-2 review (Codex): the original fixture was resonance-only
+        The original fixture was resonance-only
         (no exponential tail injected), which made BackD/BackF
         unidentifiable — ``anorm`` absorbed them and LM stalled at
         ``back_d ≈ 0`` with `converged = false` per pixel, so the
@@ -728,7 +728,7 @@ class TestSpatialMapCounts:
                 )
 
     def test_spatial_c_validation_scoped_to_counts(self, u238_data):
-        """Issue #458 V1 (Codex follow-up): `c` is only consumed on counts
+        """Issue #458 V1: `c` is only consumed on counts
         inputs.  A transmission caller who passes `c=0.0` should NOT be
         rejected — the value is ignored on their path.  Rejecting it would
         produce a misleading error that doesn't apply to their input type.
@@ -791,7 +791,7 @@ class TestSpatialMapCounts:
             )
 
     def test_spatial_rejects_bad_tzero_params(self, u238_data):
-        """Issue #458 (Copilot review on PR #461): when `fit_energy_scale=True`,
+        """Issue #458: when `fit_energy_scale=True`,
         the TZERO kwargs `t0_init_us`, `l_scale_init`, and
         `energy_scale_flight_path_m` must be validated at the binding
         boundary.  Non-finite or non-positive values (for flight path)
@@ -838,7 +838,7 @@ class TestSpatialMapCounts:
                 )
 
     def test_spatial_all_dead_pixels_returns_nan_density(self, u238_data):
-        """Issue #458 (Copilot review on PR #461): when every pixel is
+        """Issue #458: when every pixel is
         masked dead, the early-return path must honour the NaN-on-failure
         contract — density_maps must be NaN, not zeros.
         """
@@ -1021,7 +1021,7 @@ class TestFitCountsSpectrumTyped:
 
         This is the regression test guarding against a future binding
         refactor silently dropping the kwarg or stranding the override
-        plumbing — Copilot Phase B catch on PR #487.
+        plumbing.
         """
         # Tiny synthetic counts setup — uses the U-238 single-resonance
         # fixture so the test runs without ENDF retrieval.
@@ -1103,7 +1103,7 @@ class TestFitCountsSpectrumTyped:
 
         Guards against a future binding refactor silently dropping the
         kwarg or stranding the override plumbing — same defect class
-        Copilot caught on PR #487 polish-off.
+        as the ``enable_polish`` kwarg test above.
         """
         energies = np.linspace(1.0, 30.0, 200)
         true_density = 0.0008
@@ -1753,7 +1753,7 @@ class TestVenusMlbwRegression:
 
 
 # ===========================================================================
-# fit_energy_range Python parameter (#514 / PR #519)
+# fit_energy_range Python parameter (#514)
 # ===========================================================================
 
 
@@ -2220,9 +2220,9 @@ class TestFitEnergyScaleRecovery:
 # any energy reaches those leaves so callers see a clean
 # ``ValueError`` instead of a ``pyo3_runtime.PanicException`` (which is
 # not a subclass of ``ValueError`` and bypasses normal Python error
-# handling).  These tests cover the PyO3 entries hardened in Round 3 of
-# PR #559 — ``forward_model``, ``spatial_map_typed``, and
-# ``calibrate_energy`` — and re-cover the earlier-rounds entries to
+# handling).  These tests cover the most recently hardened entries
+# — ``forward_model``, ``spatial_map_typed``, and
+# ``calibrate_energy`` — and re-cover the previously hardened entries to
 # document the contract.
 
 class TestEnergyGridValidation:

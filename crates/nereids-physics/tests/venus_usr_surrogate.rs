@@ -122,7 +122,7 @@ fn cubature_venus_like_k1_forward_equivalence() {
 /// VENUS-like regression test for the Chebyshev scalar surrogate on
 /// the 3471-bin VENUS production grid with synthetic Hf-like σ.
 /// Asserts forward accuracy ≤ 1e-5 at VENUS density (issue #475
-/// success criterion) and logs per-call wall time.  PR #475 benched
+/// success criterion) and logs per-call wall time.  A bench-off ran
 /// this against a Lanczos σ-pushforward Gauss quadrature on the
 /// same kernel and picked Chebyshev — it won on both accuracy
 /// (≤ 2e-15 vs ≤ 4e-15) and wall-time.  Exact speedup ratios are
@@ -156,7 +156,7 @@ fn scalar_chebyshev_venus_like_k1_regression() {
         .collect();
 
     // Training box: 2 × VENUS density.  M = 16 Chebyshev nodes —
-    // PR #475 bench showed this achieves 1e-15 forward accuracy on
+    // a bench run showed this achieves 1e-15 forward accuracy on
     // the whole box.
     let n_max = 2e-4_f64;
     let t_build = std::time::Instant::now();

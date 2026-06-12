@@ -1793,8 +1793,8 @@ mod tests {
         assert!(r_free.chi_squared.is_nan());
         assert!(r_free.reduced_chi_squared.is_nan());
 
-        // (b) All parameters fixed → n_free == 0 (the path #517 R3
-        //     specifically failed before the n_active==0 early-return).
+        // (b) All parameters fixed → n_free == 0 (the path that
+        //     failed in #517 before the n_active==0 early-return).
         let mut params_fixed = ParameterSet::new(vec![
             FitParameter::fixed("a", 1.0),
             FitParameter::fixed("b", 0.0),
