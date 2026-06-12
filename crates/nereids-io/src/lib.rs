@@ -5,9 +5,10 @@
 //! ## Modules
 //! - [`error`] — Error types for I/O operations
 //! - [`export`] — Export spatial mapping results to TIFF, HDF5, and Markdown
-//! - [`nexus`] — NeXus/HDF5 reading for rustpix-processed data (`hdf5` feature)
+//! - `nexus` — NeXus/HDF5 reading for rustpix-processed data (`hdf5` feature;
+//!   not an intra-doc link so default-feature doc builds stay warning-free)
 //! - [`normalization`] — Raw + open beam → transmission (Method 2), dead pixel detection, ROI
-//! - [`project`] — Project file save/load for `.nrd.h5` archives (`hdf5` feature)
+//! - `project` — Project file save/load for `.nrd.h5` archives (`hdf5` feature)
 //! - [`rebin`] — Energy rebinning (coarsen the TOF/energy axis by an integer factor)
 //! - [`spectrum`] — Spectrum file parser for TOF/energy bin edges or centers
 //! - [`tiff_stack`] — Multi-frame TIFF stack loading → 3D arrays (tof, y, x)

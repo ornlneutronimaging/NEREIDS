@@ -558,9 +558,11 @@ fn validate_spatial_data_values(
 /// * The cube's spectral axis must match `config.energies()`, the
 ///   mode's companion cubes must match the primary cube's shape, and
 ///   `dead_pixels` (when given) must be `(height, width)`.
-/// * Cube *values* are validated on live pixels (finite; non-negative
-///   where the domain requires it) so a corrupt cube fails loudly
-///   instead of producing a quietly-NaN map.  For transmission inputs
+/// * Cube *values* are validated on live pixels, each against its
+///   domain — transmission finite, uncertainty finite and strictly
+///   positive, counts/flux finite and non-negative, background finite —
+///   so a corrupt cube fails loudly instead of producing a quietly-NaN
+///   map.  For transmission inputs
 ///   with a `fit_energy_range`, the value checks are scoped to the
 ///   active bins — out-of-range bins may contain NaN by design.
 /// * Known-degenerate configurations are rejected with a diagnostic

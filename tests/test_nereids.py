@@ -1820,6 +1820,16 @@ class TestVenusMlbwRegression:
             f"counts-KL density drifted: got {float(result.densities[0])!r}, "
             f"expected {EXPECTED_DENSITY!r} (±1e-6 rel)"
         )
+        # Coarse physical bracket, independent of the machine-generated
+        # anchor above: both solver families land in (2.9-8.1)e-5
+        # atoms/barn on this measured Hf spectrum, so any value outside
+        # [1e-5, 1e-4] means solver breakage, not sample physics.  This
+        # prevents a future wholesale re-anchoring commit from silently
+        # absorbing an order-of-magnitude regression.
+        assert 1e-5 < float(result.densities[0]) < 1e-4, (
+            f"counts-KL density {float(result.densities[0])!r} fell outside "
+            f"the physical bracket [1e-5, 1e-4] for this measured sample"
+        )
         assert result.deviance_per_dof is not None, (
             "counts-KL dispatch must populate deviance_per_dof (primary GOF)"
         )
