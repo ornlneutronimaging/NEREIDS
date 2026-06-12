@@ -57,8 +57,9 @@
 //! | anything else           | hard error    |
 //!
 //! The "missing → assume ns" fallback preserves backward compatibility
-//! with the rustpix producer (`scripts/fixtures/extract_venus_hf_nexus.py`)
-//! which writes nanoseconds without a `units` attribute.  Any file
+//! with the rustpix producer and the maintainers' VENUS fixture
+//! extraction tooling, which write nanoseconds without a `units`
+//! attribute.  Any file
 //! that *does* set `units` is parsed strictly: an unrecognised value
 //! is rejected rather than silently mis-scaled.  This closes a
 //! 1000× silent-rescale bug on `units = "us"` (issue #554).
@@ -81,8 +82,8 @@ use crate::error::IoError;
 /// an error rather than silently mis-scaling.
 fn tof_scale_to_us(units: Option<&str>) -> Result<f64, IoError> {
     match units {
-        // Absent attribute — rustpix legacy default.  The repository's
-        // own producers (`scripts/fixtures/extract_venus_hf_nexus.py`)
+        // Absent attribute — rustpix legacy default.  The project's own
+        // fixture producers (the maintainers' VENUS extraction tooling)
         // write nanoseconds without a `units` attribute, so we
         // preserve that contract for backward compatibility.
         None => Ok(1e-3),
@@ -1908,9 +1909,9 @@ mod tests {
 
     /// Histogram path: missing `units` attribute is allowed and
     /// preserves the rustpix-legacy ns assumption.  This is the
-    /// backward-compatibility guarantee for files produced by
-    /// `scripts/fixtures/extract_venus_hf_nexus.py` etc., which write
-    /// nanoseconds without a `units` attribute.
+    /// backward-compatibility guarantee for files produced by the
+    /// rustpix-era extraction tooling, which writes nanoseconds
+    /// without a `units` attribute.
     #[test]
     fn test_load_nexus_histogram_units_missing_legacy_ns() {
         let dir = tempfile::tempdir().unwrap();

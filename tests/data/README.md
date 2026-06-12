@@ -59,14 +59,11 @@ ob = nereids.load_nexus_histogram(
 
 ### Regenerating
 
-The fixtures are produced from the private 38 GB cube
-`.research/spatial-regularization/data/counts/resonance_data_2cm.h5`
-by `scripts/fixtures/extract_venus_hf_nexus.py`. The source is not
-redistributable. To regenerate locally:
-
-```bash
-pixi run python scripts/fixtures/extract_venus_hf_nexus.py
-```
+The fixtures are extracted from a private 38 GB VENUS measurement cube
+(Au/Hf/W samples, 512×512 spatial, 4367 TOF bins) that is not
+redistributable. The extraction script lives alongside that data in the
+maintainers' research archive, outside this repository — regeneration is
+a maintainer task.
 
 ## LANL-ORNL_example.tif
 

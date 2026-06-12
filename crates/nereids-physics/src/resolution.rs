@@ -1144,8 +1144,8 @@ impl ResolutionPlan {
                 // IEEE-754 addition is not associative; changing the
                 // order would break bit-exactness with
                 // `broaden_presorted_reference` (and all
-                // `*_bit_exact_*` unit tests + real-VENUS
-                // `baseline_dump.py --verify`).
+                // `*_bit_exact_*` unit tests + the maintainers'
+                // real-VENUS bit-exact baseline harness).
                 sum += w * s;
             }
             result[i] = sum / norm_i;

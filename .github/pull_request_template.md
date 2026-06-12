@@ -2,10 +2,10 @@
 NEREIDS PR template — keep this template visible in your PR body.
 Replace each section's placeholder with your specific content.
 
-The LOC-delta and existing-logic check exist because the audit-R2/R3 fix
-sprints accumulated duck-tape patches that were caught in the architecture
-audit (.research/audit-r4-architecture/). Filling these in honestly is
-the load-bearing control, not the template existing.
+The LOC-delta and existing-logic check exist because earlier fix sprints
+accumulated duck-tape patches that a later architecture audit had to
+unwind. Filling these in honestly is the load-bearing control, not the
+template existing.
 -->
 
 ## Summary
@@ -42,14 +42,14 @@ If any box above could not be checked, the PR body explains why.
 <!--
 - Closes #N (must be a real issue; do not invent numbers)
 - Refs #M (related but not closed)
-- Refs .research/audit-r4-architecture/{report}.md  (if motivated by the architecture audit)
+- Name the audit finding (e.g. "architecture-audit F13") if one motivated the change
 -->
 
 ---
 
 <!--
 For AI-assisted PRs:
-- Cite the session ID and link to the .research/audit-* reports the change is based on
+- Cite the session ID and name the audit findings the change is based on
 - The agent must include the LOC-delta numbers; "I'll let you compute them" is not acceptable
 
 Trailer for AI-coauthored commits is added by ./scripts/worktree-commit.sh.
