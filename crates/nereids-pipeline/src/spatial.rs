@@ -1995,24 +1995,54 @@ mod tests {
             uncertainty: u_3d.view(),
         };
 
-        let cancel = AtomicBool::new(false);
-        let progress = AtomicUsize::new(0);
+        // The watcher race is inherently lossy: on a fast or oversubscribed
+        // runner the whole 64-pixel sweep (and the post-loop cancel check)
+        // can finish before the watcher thread's store becomes visible, in
+        // which case the run observed no cancellation at all and a COMPLETE
+        // Ok map is the correct output.  That outcome carries no information
+        // about the regression under test, so it retries; the regression —
+        // a PARTIAL Ok map (cancellation observed mid-loop but swallowed) —
+        // fails immediately on any attempt.
+        let mut saw_cancelled = false;
+        for _attempt in 0..5 {
+            let cancel = AtomicBool::new(false);
+            let progress = AtomicUsize::new(0);
 
-        let result = std::thread::scope(|s| {
-            // Watcher: once at least one pixel has finished, request
-            // cancellation while the rest are still being fit.
-            s.spawn(|| {
-                while progress.load(Ordering::Relaxed) < 1 {
-                    std::hint::spin_loop();
-                }
-                cancel.store(true, Ordering::Relaxed);
+            let result = std::thread::scope(|s| {
+                // Watcher: once at least one pixel has finished, request
+                // cancellation while the rest are still being fit.
+                s.spawn(|| {
+                    while progress.load(Ordering::Relaxed) < 1 {
+                        // yield instead of spinning: on a fully subscribed
+                        // CI box a busy-spin can be starved for the whole
+                        // sweep, losing the race every time.
+                        std::thread::yield_now();
+                    }
+                    cancel.store(true, Ordering::Relaxed);
+                });
+                spatial_map_typed(&input, &config, None, Some(&cancel), Some(&progress))
             });
-            spatial_map_typed(&input, &config, None, Some(&cancel), Some(&progress))
-        });
 
+            match result {
+                Err(PipelineError::Cancelled) => {
+                    saw_cancelled = true;
+                    break;
+                }
+                Ok(r) if r.n_converged == r.n_total && r.n_failed == 0 => {
+                    // Sweep finished before the flip became visible —
+                    // inconclusive; try again.
+                    continue;
+                }
+                other => panic!(
+                    "mid-run cancellation must return Err(Cancelled) (or lose \
+                     the race with a COMPLETE map), got {other:?}"
+                ),
+            }
+        }
         assert!(
-            matches!(result, Err(PipelineError::Cancelled)),
-            "mid-run cancellation must return Err(Cancelled), got {result:?}"
+            saw_cancelled,
+            "all 5 attempts completed the whole sweep before the cancellation \
+             flip became visible — enlarge the pixel grid for this runner"
         );
     }
 

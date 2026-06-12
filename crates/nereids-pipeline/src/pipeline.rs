@@ -4660,6 +4660,47 @@ mod tests {
         );
     }
 
+    /// Joint-Poisson rejects a non-zero detector-background nuisance arm
+    /// (B_det wiring is deferred): the profiled flux cannot represent a
+    /// constant additive term, so the gate fails loudly up-front instead
+    /// of silently mis-fitting.
+    #[test]
+    fn test_joint_poisson_rejects_nonzero_detector_background() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.05).collect();
+        let (t, _) = synthetic_transmission(&data, 0.0005, &energies);
+        let flux: Vec<f64> = vec![500.0; energies.len()];
+        let s: Vec<f64> = t.iter().map(|&ti| 500.0 * ti).collect();
+        let background: Vec<f64> = vec![5.0; energies.len()];
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
+        .with_counts_background(CountsBackgroundConfig {
+            c: 1.0,
+            ..Default::default()
+        });
+
+        let input = InputData::CountsWithNuisance {
+            sample_counts: s,
+            flux,
+            background,
+        };
+        let err = fit_spectrum_typed(&input, &config).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("B_det"),
+            "expected deferred-B_det rejection message, got: {msg}"
+        );
+    }
+
     /// Joint-Poisson rejects BackD/BackF exponential tail (support is deferred).
     #[test]
     fn test_joint_poisson_rejects_back_d_f() {
