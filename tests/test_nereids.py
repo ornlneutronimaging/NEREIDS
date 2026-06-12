@@ -1781,6 +1781,14 @@ class TestVenusMlbwRegression:
         counts-domain deviance weight bins differently and converge to
         different biased optima.  Both anchors move only when their
         respective solver paths change.
+
+        Tolerances follow the LM gate's cross-backend rationale: anchors
+        were captured on macOS (Accelerate); ``rel=1e-6`` absorbs
+        BLAS/libm sum-ordering differences on Linux CI while staying
+        orders of magnitude tighter than any real dispatch regression.
+        If this gate ever flaps across backends, relax the deviance
+        anchor first — the sum over ~4e3 bins amplifies bin-level libm
+        differences far more than the converged density does.
         """
         E, S_agg, O_agg, c, hf177 = venus_data
 

@@ -560,7 +560,9 @@ fn validate_spatial_data_values(
 ///   `dead_pixels` (when given) must be `(height, width)`.
 /// * Cube *values* are validated on live pixels (finite; non-negative
 ///   where the domain requires it) so a corrupt cube fails loudly
-///   instead of producing a quietly-NaN map.
+///   instead of producing a quietly-NaN map.  For transmission inputs
+///   with a `fit_energy_range`, the value checks are scoped to the
+///   active bins — out-of-range bins may contain NaN by design.
 /// * Known-degenerate configurations are rejected with a diagnostic
 ///   rather than letting every pixel fail into an all-NaN map:
 ///   counts + LM + `fit_energy_scale` (numerically ill-conditioned
@@ -1348,9 +1350,14 @@ pub fn spatial_map_typed(
     // This avoids 74× overhead from redundant Reich-Moore evaluation per
     // KL iteration (112ms Reich-Moore vs 1.5ms Doppler rebroadening).
     let fast_config = if config.fit_temperature() {
+        // Bare `?`: the `From<TransmissionError>` impl maps
+        // `TransmissionError::Cancelled` to `PipelineError::Cancelled`,
+        // keeping the documented uniform-Cancelled contract when the user
+        // cancels during this (expensive) Reich-Moore precompute.  A
+        // `.map_err(PipelineError::Transmission)` here would bypass that
+        // conversion and surface cancellation as an error.
         let base_xs: Vec<Vec<f64>> =
-            unbroadened_cross_sections(config.energies(), config.resonance_data(), cancel)
-                .map_err(PipelineError::Transmission)?;
+            unbroadened_cross_sections(config.energies(), config.resonance_data(), cancel)?;
         let mut cfg = config
             .clone()
             .with_precomputed_cross_sections(xs)
@@ -2004,6 +2011,80 @@ mod tests {
         assert!(
             matches!(result, Err(PipelineError::Cancelled)),
             "mid-run cancellation must return Err(Cancelled), got {result:?}"
+        );
+    }
+
+    /// Cancellation during the `fit_temperature` precompute must surface
+    /// as `Err(Cancelled)`, not `Err(Transmission(Cancelled))`.
+    ///
+    /// The expensive Reich-Moore base-XS precompute
+    /// (`unbroadened_cross_sections`) polls `cancel` internally and
+    /// returns `TransmissionError::Cancelled`; the documented contract is
+    /// that every cancellation path yields `PipelineError::Cancelled`
+    /// (the `From<TransmissionError>` impl performs that mapping — a
+    /// `.map_err(PipelineError::Transmission)` on the call site would
+    /// bypass it and turn a clean user cancel into an error toast).
+    ///
+    /// Window engineering, so the flip deterministically lands inside
+    /// the `unbroadened_cross_sections` call rather than some other
+    /// (already correctly mapped) cancellation poll: the caller supplies
+    /// precomputed broadened cross-sections, which removes the earlier
+    /// expensive broadened-XS window entirely, and the energy grid is
+    /// dense enough that the base-XS precompute takes tens of
+    /// milliseconds while the watcher flips `cancel` a few ms in.
+    /// Wherever the flip lands the correct result is `Err(Cancelled)`,
+    /// so the assertion can never flake — only the discrimination
+    /// margin varies.  (Mutation-checked: restoring the `map_err` makes
+    /// this test fail.)
+    #[test]
+    fn test_fit_temperature_precompute_cancellation_maps_to_cancelled() {
+        use std::sync::atomic::AtomicBool;
+
+        let data = u238_single_resonance();
+        // Dense grid: make the base-XS (Reich-Moore) precompute long
+        // enough that a few-ms cancel lands inside it on any realistic
+        // machine.
+        let n_e = 100_001usize;
+        let energies: Vec<f64> = (0..n_e).map(|i| 1.0 + (i as f64) * 2e-4).collect();
+        let (t_3d, u_3d) = synthetic_grid_transmission(&data, 0.0005, &energies, 2, 2);
+
+        // Caller-supplied broadened XS (values irrelevant — the fit is
+        // cancelled before any pixel is evaluated) skip the broadened
+        // precompute, so the only long-running pre-sweep stage left is
+        // the fit_temperature base-XS precompute under test.
+        let precomputed_xs = vec![vec![0.0f64; n_e]];
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            293.6,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
+        .with_fit_temperature(true)
+        .with_precomputed_cross_sections(precomputed_xs.into());
+
+        let input = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+
+        let cancel = AtomicBool::new(false);
+        let result = std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                cancel.store(true, Ordering::Relaxed);
+            });
+            spatial_map_typed(&input, &config, None, Some(&cancel), None)
+        });
+
+        assert!(
+            matches!(result, Err(PipelineError::Cancelled)),
+            "cancellation during the fit_temperature precompute must map to \
+             Err(Cancelled), got {result:?}"
         );
     }
 
