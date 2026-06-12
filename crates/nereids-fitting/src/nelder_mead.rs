@@ -1,12 +1,16 @@
 //! Bounded Nelder-Mead simplex minimizer.
 //!
 //! Derivative-free polish optimizer used after a gradient-based stage to
-//! escape stall points.  Benchmarking on backgrounded counts-path fits of
-//! real VENUS data established the need: a single L-BFGS start frequently
-//! stalls at the initial guess (1/20 self-flagged convergence on the
-//! hardest backgrounded regime tested), while a Nelder-Mead polish from
-//! that stall point resolves the failure cleanly (10/20 convergence,
-//! density bias from −5.94% to +0.013%, D/DOF from 905 to 1.001).
+//! escape stall points.  Benchmarking of backgrounded counts-path fits on
+//! the synthetic counts benchmark established the need: a single L-BFGS
+//! start frequently stalls at the initial guess (1/20 self-flagged
+//! convergence on the hardest backgrounded regime tested), while a
+//! Nelder-Mead polish from that stall point resolves the failure cleanly
+//! (10/20 convergence, density bias from −5.94% to +0.013%, D/DOF from
+//! 905 to 1.001).  On real VENUS counts D saturates at 10⁴–10⁵ from
+//! un-modelled upstream physics and polish cannot self-terminate, which
+//! is why it is disabled by default — see
+//! `JointPoissonFitConfig::enable_polish` in `joint_poisson`.
 //!
 //! ## Algorithm
 //!

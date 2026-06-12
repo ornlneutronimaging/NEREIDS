@@ -579,15 +579,18 @@ fn validate_spatial_data_values(
 /// `cancel` is polled before the sweep and at every pixel; once set,
 /// remaining pixels are skipped and the call returns
 /// [`PipelineError::Cancelled`] (partial results are discarded).
-/// `progress` is incremented once per completed pixel, so a UI thread
-/// can poll it against `height × width`.
+/// `progress` is incremented once per completed live pixel, so a UI
+/// thread can poll it against the number of live pixels
+/// (`height × width` minus the `dead_pixels`-masked count).
 ///
 /// # Errors
 ///
 /// [`PipelineError::ShapeMismatch`] for axis/shape disagreements,
 /// [`PipelineError::InvalidParameter`] for rejected configurations and
-/// invalid cube values, and [`PipelineError::Cancelled`] when `cancel`
-/// was set.
+/// invalid cube values, [`PipelineError::Transmission`] when the shared
+/// cross-section / resolution-plan precompute fails (e.g. a
+/// resolution-kernel or working-grid build error), and
+/// [`PipelineError::Cancelled`] when `cancel` was set.
 pub fn spatial_map_typed(
     input: &InputData3D<'_>,
     config: &UnifiedFitConfig,
@@ -693,8 +696,8 @@ pub fn spatial_map_typed(
 
     // Issue #458: `fit_energy_scale` + `fit_temperature`
     // is not a supported combination — `EnergyScaleTransmissionModel`
-    // and the temperature-fitting path are mutually exclusive at the
-    // single-spectrum fitter (`pipeline.rs:830, 976, 1183`).  Without
+    // and the temperature-fitting path are mutually exclusive in every
+    // solver dispatch arm of `fit_spectrum_typed`.  Without
     // this spatial-layer guard, every per-pixel call would error and
     // `spatial_map_typed` would report `n_failed == n_total` with an
     // all-NaN map — a silently-failed map is worse than a clear error.

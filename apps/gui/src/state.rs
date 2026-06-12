@@ -767,7 +767,7 @@ pub struct AppState {
     /// KL background: SAMMY 4-term wrapper (joint-Poisson compatible).
     /// Model: Anorm * T_inner(E) + BackA + BackB/sqrt(E) + BackC*sqrt(E)
     pub kl_background_enabled: bool,
-    /// Proton-charge ratio c = Q_s / Q_ob for the counts-KL solver
+    /// Proton-charge ratio c = Q_s / Q_ob for the counts-KL solver.
     /// Default 1.0 = caller PC-normalized the flux
     /// upstream.  For raw-count VENUS data, set to the actual
     /// Q_sample/Q_open_beam ratio (typically ~5–6).

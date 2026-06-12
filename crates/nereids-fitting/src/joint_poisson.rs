@@ -2,8 +2,9 @@
 //!
 //! This module implements the **joint-Poisson conditional binomial deviance**:
 //! the per-bin flux is profiled out of a two-arm Poisson model analytically
-//! (derivation below), and the resulting deviance was validated
-//! experimentally on synthetic and real VENUS counts data.  It supersedes
+//! (derivation below).  The deviance is validated against synthetic
+//! counts benchmarks and locked by a real-VENUS counts regression test
+//! on the committed aggregated-Hf fixture.  It supersedes
 //! the fixed-flux Poisson NLL (`poisson.rs`) for the counts-path fitter.
 //!
 //! ## Model
@@ -1833,7 +1834,8 @@ mod tests {
     //
     // Note: on this over-parameterized (5-free-param) synthetic with only
     // 150 bins, the deviance surface has multiple near-equal minima —
-    // exactly the identifiability ambiguity §P2.2 targets.  Density
+    // exactly the over-parameterization identifiability ambiguity the
+    // B_A-pairing rule targets.  Density
     // recovery under over-parameterization is therefore *not* a unit-test
     // contract here; it is tested end-to-end with the single-parameter
     // matched-model test above.

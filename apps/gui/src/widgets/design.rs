@@ -1088,8 +1088,9 @@ pub(crate) fn build_fit_line(p: &FitLineParams<'_>) -> Option<Line<'static>> {
     //
     // Then `y_multiplier` (= c·OB[i] in counts mode) scales the result to
     // the displayed y-axis.  When bg fit was absent, the pipeline emits
-    // `anorm = 1.0` and `background = [0, 0, 0]` (the joint-Poisson convention,
-    // pipeline.rs:1488-1499), so this reduces to bare T·multiplier — i.e.
+    // `anorm = 1.0` and `background = [0, 0, 0]` (the joint-Poisson
+    // convention — see `fit_counts_joint_poisson`'s background readout
+    // fallback in pipeline.rs), so this reduces to bare T·multiplier — i.e.
     // identical to the pre-fix overlay for fits without background.
     let fit_points: PlotPoints = (0..n_fit)
         .filter(|&i| p.x_values[i].is_finite())

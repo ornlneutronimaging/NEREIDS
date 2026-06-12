@@ -187,8 +187,9 @@ pub enum SolverConfig {
     /// Poisson-KL counts-domain fitter.
     ///
     /// For **counts** inputs this dispatches to the joint-Poisson profile-
-    /// binomial-deviance path (`joint_poisson_fit`), validated experimentally
-    /// on synthetic and real VENUS counts data.  Uses an explicit
+    /// binomial-deviance path (`joint_poisson_fit`), validated against
+    /// synthetic counts benchmarks and locked by a real-VENUS counts
+    /// regression test on the committed aggregated-Hf fixture.  Uses an explicit
     /// `c = Q_s/Q_ob` from `CountsBackgroundConfig::c` and reports
     /// `D/(n − k)` as the primary
     /// GOF.  Stage-1 damped Fisher + optional Nelder-Mead polish (see
@@ -958,7 +959,7 @@ pub fn fit_spectrum_typed(
         // ── Counts + KL: joint-Poisson profile-binomial-deviance path ──
         //
         // The counts-KL solver is now the joint-Poisson fitter, validated
-        // experimentally on synthetic and real VENUS counts data.  Uses the
+        // against synthetic benchmarks and a real-VENUS regression gate.  Uses the
         // explicit `c = Q_s/Q_ob` from `CountsBackgroundConfig::c` and
         // reports `D/(n − k)` as the primary
         // GOF.  Detector-space counts background `B_det` is assumed zero

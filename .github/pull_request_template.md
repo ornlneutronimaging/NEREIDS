@@ -3,7 +3,7 @@ NEREIDS PR template — keep this template visible in your PR body.
 Replace each section's placeholder with your specific content.
 
 The LOC-delta and existing-logic check exist because earlier fix sprints
-accumulated duck-tape patches that a later architecture audit had to
+accumulated duct-tape patches that a later architecture audit had to
 unwind. Filling these in honestly is the load-bearing control, not the
 template existing.
 -->
@@ -24,7 +24,7 @@ template existing.
 
 - [ ] I searched the crate(s) I touched for similar logic before adding new code
 - [ ] If similar logic exists, this PR refactors/consolidates it rather than duplicating
-- [ ] If this PR has positive net LOC, the new code is load-bearing structure (a newtype carrying an invariant, a centralized validator replacing scattered ones, a feature, etc.) — not a defensive guard or duck-tape patch around a symptom
+- [ ] If this PR has positive net LOC, the new code is load-bearing structure (a newtype carrying an invariant, a centralized validator replacing scattered ones, a feature, etc.) — not a defensive guard or duct-tape patch around a symptom
 - [ ] No new `validate_*` or `*_helper` function was added if a similar one already exists in the same crate
 
 If any box above could not be checked, the PR body explains why.

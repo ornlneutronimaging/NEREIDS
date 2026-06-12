@@ -861,8 +861,10 @@ def spatial_map_typed(
 
     Dispatches per-pixel fitting based on InputData type:
       - from_counts / from_counts_with_nuisance + solver="kl" / "auto"
-        -> counts-KL (joint-Poisson deviance) — the counts-path solver
-        validated experimentally on synthetic and real VENUS counts data.
+        -> counts-KL (joint-Poisson deviance) — the counts-path solver,
+        validated against synthetic counts benchmarks and locked by a
+        real-VENUS counts regression test on the committed aggregated-Hf
+        fixture.
       - from_transmission + solver="lm" (default for transmission) -> LM.
       - from_transmission + solver="kl" -> Poisson NLL on transmission values
         (legacy niche).

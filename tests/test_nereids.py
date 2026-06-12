@@ -1751,6 +1751,82 @@ class TestVenusMlbwRegression:
             f"A dispatch regression can prevent convergence entirely — investigate."
         )
 
+    def test_counts_kl_fit_matches_baseline(self, venus_data):
+        """Counts-KL (joint-Poisson) fit on the same real VENUS spectrum.
+
+        This is the real-data regression gate for the counts-path solver:
+        it substantiates, in-tree, the docs' claim that the joint-Poisson
+        deviance path is exercised against real VENUS counts — the
+        synthetic counts-KL tests elsewhere use NEREIDS-generated
+        observations and cannot do that.
+
+        Two properties are pinned:
+
+        * The fit converges with the anchored density.  As with the LM
+          gate above, the pinned values are machine-generated regression
+          anchors (produced by the code under test); correctness of the
+          deviance math is carried by the analytic joint-Poisson unit
+          tests in nereids-fitting.
+        * ``deviance_per_dof`` lands in the >> 1 regime (measured ~3.1e4).
+          Real VENUS counts carry un-modelled upstream physics, so D/dof
+          saturates at 10^4-10^5 — exactly the regime documented on
+          ``JointPoissonFitConfig::enable_polish`` (and the reason polish
+          is off by default).  A sudden drop to O(1) would mean the gate
+          silently switched to a synthetic-like input, not that the model
+          got better.
+
+        The KL density (~2.9e-5) deliberately differs from the LM gate's
+        (~8.1e-5): with a mis-specified no-background single-isotope model
+        on real data, the transmission-domain least-squares and the
+        counts-domain deviance weight bins differently and converge to
+        different biased optima.  Both anchors move only when their
+        respective solver paths change.
+        """
+        E, S_agg, O_agg, c, hf177 = venus_data
+
+        result = nereids.fit_counts_spectrum_typed(
+            S_agg,
+            O_agg,
+            E,
+            isotopes=[(hf177, 1.0e-5)],
+            solver="kl",
+            temperature_k=293.6,
+            max_iter=200,
+            background=False,
+            c=c,
+            flight_path_m=25.0,
+            delta_t_us=0.5,
+            delta_l_m=0.005,
+        )
+
+        EXPECTED_DENSITY = 2.9110452985323965e-05
+        EXPECTED_DEVIANCE_PER_DOF = 31445.956656870774
+
+        assert bool(result.converged) is True, (
+            f"counts-KL fit did not converge on the real VENUS fixture "
+            f"(converged={bool(result.converged)})"
+        )
+        assert float(result.densities[0]) == pytest.approx(
+            EXPECTED_DENSITY, rel=1e-6
+        ), (
+            f"counts-KL density drifted: got {float(result.densities[0])!r}, "
+            f"expected {EXPECTED_DENSITY!r} (±1e-6 rel)"
+        )
+        assert result.deviance_per_dof is not None, (
+            "counts-KL dispatch must populate deviance_per_dof (primary GOF)"
+        )
+        assert float(result.deviance_per_dof) == pytest.approx(
+            EXPECTED_DEVIANCE_PER_DOF, rel=1e-6
+        ), (
+            f"deviance/dof drifted: got {float(result.deviance_per_dof)!r}, "
+            f"expected {EXPECTED_DEVIANCE_PER_DOF!r} (±1e-6 rel)"
+        )
+        assert float(result.deviance_per_dof) > 1e3, (
+            "real-data regime check: D/dof should be >> 1 on raw VENUS "
+            "counts (un-modelled upstream physics); an O(1) value means "
+            "the gate is no longer fitting real data"
+        )
+
 
 # ===========================================================================
 # fit_energy_range Python parameter (#514)

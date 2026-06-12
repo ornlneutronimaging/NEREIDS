@@ -63,7 +63,7 @@ IsotopeGroup
 detect_dead_pixels
 
 # ---------------------------------------------------------------------------
-# Research-only Jacobian/Fisher evaluator (memo 38 follow-up work); no
+# Research-only Jacobian/Fisher evaluator (research follow-up work); no
 # narrative section yet — pdoc reference covers the signature.
 # ---------------------------------------------------------------------------
 compute_model_jacobian
