@@ -17,7 +17,7 @@ pub fn landing_step(ui: &mut egui::Ui, state: &mut AppState) {
         ui.label(RichText::new("NEREIDS").size(28.0).strong());
         ui.add_space(4.0);
         ui.label(
-            RichText::new("Neutron Resonance Imaging & Elemental Density Identification System")
+            RichText::new("Neutron Resonance Resolved Imaging Data Analysis System")
                 .size(13.0)
                 .color(tc.fg2),
         );

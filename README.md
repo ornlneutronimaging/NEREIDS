@@ -200,7 +200,7 @@ notebooks covering foundations, building blocks, workflows, and applications.
 NEREIDS is organized as a Rust workspace with layered crates:
 
 ```
-endf-mat              ENDF MAT lookup tables (standalone, no dependencies)
+endf-mat              ENDF MAT lookup tables (no deps of its own; used by core + endf)
 
 nereids-core          Shared types, physical constants, isotope registry
     |
@@ -220,6 +220,7 @@ nereids-pipeline      End-to-end orchestration, spatial mapping (rayon)
 
 | Crate | Description |
 |-------|-------------|
+| `endf-mat` | ENDF MAT number lookup, element symbols, natural isotopic abundances |
 | `nereids-core` | Core types, physical constants, traits |
 | `nereids-endf` | ENDF file retrieval, caching, resonance parameter parsing |
 | `nereids-physics` | Cross-section calculation, broadening, transmission model |
@@ -289,4 +290,4 @@ and the PR process.
 
 MIT. See [LICENSE](LICENSE) for details.
 
-Copyright (c) 2025-2026, UT-Battelle, LLC, Oak Ridge National Laboratory.
+Copyright (c) 2025-2026, UT-Battelle, LLC (Oak Ridge National Laboratory).

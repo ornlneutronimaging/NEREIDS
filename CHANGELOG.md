@@ -17,9 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `nereids-gui`), `CITATION.cff`, the README badge/License section, and the
   CONTRIBUTING contributor-license statement all updated to match. Copyright
   years are now 2025-2026, and the copyright holder reads
-  "UT-Battelle, LLC (Oak Ridge National Laboratory)" everywhere. Artifacts
-  already published as 0.1.8 remain under BSD-3-Clause; MIT applies from the
-  next published version.
+  "UT-Battelle, LLC (Oak Ridge National Laboratory)" everywhere. Per the
+  repository's bump-at-release convention, in-tree metadata (manifests,
+  CITATION.cff) describes the current source tree — which is MIT — while
+  still carrying the last released version number until the next release
+  commit bumps it; the 0.1.8 artifacts already on crates.io, PyPI, and
+  Zenodo were published under BSD-3-Clause and are unaffected. MIT applies
+  to every version published from here on.
 
 ### Changed (breaking — `nereids-io`)
 
