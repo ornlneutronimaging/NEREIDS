@@ -101,13 +101,14 @@ cargo test --workspace --exclude nereids-python
 
 ```
 crates/
+  endf-mat/           ENDF MAT lookup tables (standalone)
   nereids-core/       Shared types, constants, isotope registry
   nereids-endf/       ENDF file retrieval and resonance parsing
   nereids-physics/    Cross-section calculation and broadening
-  nereids-fitting/    LM and Poisson optimizers
+  nereids-fitting/    LM and Poisson/KL optimizers
   nereids-io/         TIFF/NeXus I/O, normalization
   nereids-pipeline/   Spatial mapping orchestration
-  nereids-python/     PyO3 Python bindings (excluded from workspace clippy/test)
+bindings/python/      PyO3 Python bindings (excluded from workspace clippy/test)
 apps/gui/             egui desktop application
 examples/notebooks/   Jupyter tutorials (4 tiers)
 tests/                Integration tests and SAMMY validation data
@@ -116,4 +117,4 @@ tests/                Integration tests and SAMMY validation data
 ## License
 
 By contributing, you agree that your contributions will be licensed under the
-BSD-3-Clause license (see [LICENSE](LICENSE)).
+MIT license (see [LICENSE](LICENSE)).

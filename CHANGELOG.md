@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- License switched from BSD-3-Clause to MIT across the entire workspace —
+  the root `LICENSE` text, the workspace `Cargo.toml` license field inherited
+  by every crate, and `endf-mat`'s former `MIT OR Apache-2.0` dual license
+  (now also inherits the workspace MIT field). Python wheel metadata
+  (`pyproject.toml` license + classifier for both `nereids` and
+  `nereids-gui`), `CITATION.cff`, the README badge/License section, and the
+  CONTRIBUTING contributor-license statement all updated to match. Copyright
+  years are now 2025-2026, and the copyright holder reads
+  "UT-Battelle, LLC (Oak Ridge National Laboratory)" everywhere. Per the
+  repository's bump-at-release convention, in-tree metadata (manifests,
+  CITATION.cff) describes the current source tree — which is MIT — while
+  still carrying the last released version number until the next release
+  commit bumps it; the 0.1.8 artifacts already on crates.io, PyPI, and
+  Zenodo were published under BSD-3-Clause (endf-mat: MIT OR Apache-2.0)
+  and are unaffected. MIT applies to every version published from here on.
+  Each publishable crate directory (and `apps/gui` for the wheel) now
+  carries a copy of the LICENSE text, so published artifacts ship the MIT
+  permission notice they are licensed under.
+
 ### Changed (breaking — `nereids-io`)
 
 - `NexusMetadata.tof_edges_ns: Option<Vec<f64>>` has been renamed to

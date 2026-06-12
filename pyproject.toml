@@ -1,15 +1,15 @@
 [project]
 name = "nereids"
 version = "0.1.8"
-description = "Neutron Resonance Imaging Data Analysis Library"
+description = "Neutron Resonance Resolved Imaging Data Analysis System — Python bindings"
 requires-python = ">= 3.10"
-license = "BSD-3-Clause"
+license = "MIT"
 authors = [{ name = "ORNL Neutron Imaging", email = "neutronimaging@ornl.gov" }]
 readme = "README.md"
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Science/Research",
-  "License :: OSI Approved :: BSD License",
+  "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",

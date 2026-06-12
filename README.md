@@ -1,12 +1,12 @@
 # NEREIDS
 
-**N**eutron r**E**sonance **RE**solved **I**maging **D**ata analysis **S**ystem
+**N**eutron r**E**sonance **RE**solved **I**maging **D**ata Analysis **S**ystem
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.18973054.svg)](https://doi.org/10.5281/zenodo.18973054)
 [![CI](https://github.com/ornlneutronimaging/NEREIDS/actions/workflows/ci.yml/badge.svg)](https://github.com/ornlneutronimaging/NEREIDS/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/nereids)](https://pypi.org/project/nereids/)
 [![crates.io](https://img.shields.io/crates/v/nereids-core)](https://crates.io/crates/nereids-core)
-[![License](https://img.shields.io/badge/license-BSD--3--Clause-blue)](LICENSE)
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Docs](https://img.shields.io/badge/docs-guide-blue)](https://ornlneutronimaging.github.io/NEREIDS/)
 [![API](https://img.shields.io/badge/docs-rustdoc-orange)](https://ornlneutronimaging.github.io/NEREIDS/api/nereids_pipeline/)
 
@@ -200,6 +200,8 @@ notebooks covering foundations, building blocks, workflows, and applications.
 NEREIDS is organized as a Rust workspace with layered crates:
 
 ```
+endf-mat              ENDF MAT lookup tables (no deps of its own; used by core + endf)
+
 nereids-core          Shared types, physical constants, isotope registry
     |
 nereids-endf          ENDF file retrieval, parsing, resonance data
@@ -212,12 +214,13 @@ nereids-io            TIFF/NeXus I/O, TOF normalization, rebinning
     |
 nereids-pipeline      End-to-end orchestration, spatial mapping (rayon)
     |
-    +-- nereids-python    PyO3 Python bindings
-    +-- nereids-gui       egui desktop application
+    +-- nereids-python    PyO3 Python bindings (bindings/python)
+    +-- nereids-gui       egui desktop application (apps/gui)
 ```
 
 | Crate | Description |
 |-------|-------------|
+| `endf-mat` | ENDF MAT number lookup, element symbols, natural isotopic abundances |
 | `nereids-core` | Core types, physical constants, traits |
 | `nereids-endf` | ENDF file retrieval, caching, resonance parameter parsing |
 | `nereids-physics` | Cross-section calculation, broadening, transmission model |
@@ -268,10 +271,10 @@ the relevant log file when reporting bugs.
 If you use NEREIDS in your research, please cite:
 
 ```bibtex
-@software{nereids2025,
-  author    = {{ORNL Neutron Imaging Team}},
+@software{nereids2026,
+  author    = {Zhang, Chen and Bilheux, Jean-Christophe and Tang, Shiming and Bilheux, Hassina},
   title     = {{NEREIDS}: Neutron Resonance Resolved Imaging Data Analysis System},
-  year      = {2025},
+  year      = {2026},
   publisher = {Zenodo},
   doi       = {10.5281/zenodo.18973054},
   url       = {https://doi.org/10.5281/zenodo.18973054}
@@ -285,6 +288,6 @@ and the PR process.
 
 ## License
 
-BSD-3-Clause. See [LICENSE](LICENSE) for details.
+MIT. See [LICENSE](LICENSE) for details.
 
-Copyright (c) 2025, UT-Battelle, LLC, Oak Ridge National Laboratory.
+Copyright (c) 2025-2026, UT-Battelle, LLC (Oak Ridge National Laboratory).

@@ -7,7 +7,7 @@ name = "nereids-gui"
 version = "0.1.8"
 description = "GUI application for NEREIDS neutron resonance imaging"
 requires-python = ">= 3.10"
-license = "BSD-3-Clause"
+license = "MIT"
 authors = [{ name = "ORNL Neutron Imaging", email = "neutronimaging@ornl.gov" }]
 keywords = ["neutron", "resonance", "imaging", "GUI"]
 classifiers = [
@@ -15,7 +15,7 @@ classifiers = [
   "Environment :: X11 Applications",
   "Environment :: MacOS X :: Cocoa",
   "Intended Audience :: Science/Research",
-  "License :: OSI Approved :: BSD License",
+  "License :: OSI Approved :: MIT License",
   "Operating System :: POSIX :: Linux",
   "Operating System :: MacOS",
   "Programming Language :: Rust",

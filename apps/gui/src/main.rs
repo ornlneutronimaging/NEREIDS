@@ -1,4 +1,4 @@
-//! NEREIDS — Neutron Resonance Imaging Data Analysis
+//! NEREIDS — Neutron Resonance Resolved Imaging Data Analysis
 //!
 //! Desktop GUI application for interactive neutron transmission analysis,
 //! isotope identification, and spatial composition mapping.
@@ -25,7 +25,7 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
-            .with_title("NEREIDS — Neutron Resonance Imaging"),
+            .with_title("NEREIDS — Neutron Resonance Resolved Imaging"),
         ..Default::default()
     };
 

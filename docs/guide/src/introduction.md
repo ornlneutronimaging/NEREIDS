@@ -1,6 +1,6 @@
 # Introduction
 
-**NEREIDS** (**N**eutron r**E**sonance **RE**solved **I**maging **D**ata analysis
+**NEREIDS** (**N**eutron r**E**sonance **RE**solved **I**maging **D**ata Analysis
 **S**ystem) is a Rust-based library for neutron resonance imaging at the
 [VENUS beamline](https://neutrons.ornl.gov/venus), Spallation Neutron Source (SNS),
 Oak Ridge National Laboratory (ORNL).
