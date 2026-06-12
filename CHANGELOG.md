@@ -22,8 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   CITATION.cff) describes the current source tree — which is MIT — while
   still carrying the last released version number until the next release
   commit bumps it; the 0.1.8 artifacts already on crates.io, PyPI, and
-  Zenodo were published under BSD-3-Clause and are unaffected. MIT applies
-  to every version published from here on.
+  Zenodo were published under BSD-3-Clause (endf-mat: MIT OR Apache-2.0)
+  and are unaffected. MIT applies to every version published from here on.
+  Each publishable crate directory (and `apps/gui` for the wheel) now
+  carries a copy of the LICENSE text, so published artifacts ship the MIT
+  permission notice they are licensed under.
 
 ### Changed (breaking — `nereids-io`)
 
