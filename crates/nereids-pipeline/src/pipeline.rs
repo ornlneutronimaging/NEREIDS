@@ -187,9 +187,10 @@ pub enum SolverConfig {
     /// Poisson-KL counts-domain fitter.
     ///
     /// For **counts** inputs this dispatches to the joint-Poisson profile-
-    /// binomial-deviance path (`joint_poisson_fit`) validated in memo 35
-    /// §P1/§P2 and memo 38.  Uses an explicit `c = Q_s/Q_ob` from
-    /// `CountsBackgroundConfig::c` and reports `D/(n − k)` as the primary
+    /// binomial-deviance path (`joint_poisson_fit`), validated experimentally
+    /// on synthetic and real VENUS counts data.  Uses an explicit
+    /// `c = Q_s/Q_ob` from `CountsBackgroundConfig::c` and reports
+    /// `D/(n − k)` as the primary
     /// GOF.  Stage-1 damped Fisher + optional Nelder-Mead polish (see
     /// [`nereids_fitting::joint_poisson::JointPoissonFitConfig`]).
     ///
@@ -248,8 +249,7 @@ pub struct CountsBackgroundConfig {
     pub fit_alpha_1: bool,
     /// **Research-only.** Fit α₂ flag — see `fit_alpha_1`.
     pub fit_alpha_2: bool,
-    /// Proton-charge ratio `c = Q_s / Q_ob` for the counts-KL solver
-    /// (memo 35 §P1.3 — "make `c` a first-class API parameter").
+    /// Proton-charge ratio `c = Q_s / Q_ob` for the counts-KL solver.
     ///
     /// Default `1.0`, correct only when the caller has already PC-
     /// normalized the open-beam counts so that `flux = c · O`.  For the
@@ -304,7 +304,7 @@ pub struct UnifiedFitConfig {
     /// (stage-1 damped Fisher only).  When `Some(true)`, polish is forced on
     /// regardless of context.  When `None`, the dispatcher picks a default:
     /// polish on for single-spectrum fits, off for per-pixel spatial maps
-    /// (memo 38 §6 recommendation — 17 min polish per pixel is untenable).
+    /// (17 min polish per pixel is untenable).
     counts_enable_polish: Option<bool>,
 
     // ── Precomputed caches (injected by spatial_map_typed) ──
@@ -570,7 +570,7 @@ impl UnifiedFitConfig {
     /// Override the Nelder-Mead polish flag for the counts-KL dispatch.
     /// `Some(true)` forces polish on, `Some(false)` forces it off, `None`
     /// (the default) lets the dispatcher pick (polish on for single-spectrum,
-    /// off for spatial maps per memo 38 §6).
+    /// off for spatial maps).
     #[must_use]
     pub fn with_counts_enable_polish(mut self, v: Option<bool>) -> Self {
         self.counts_enable_polish = v;
@@ -957,9 +957,10 @@ pub fn fit_spectrum_typed(
 
         // ── Counts + KL: joint-Poisson profile-binomial-deviance path ──
         //
-        // The counts-KL solver is now the joint-Poisson fitter validated in
-        // memo 35 §P1/§P2 and memo 38.  Uses the explicit `c = Q_s/Q_ob` from
-        // `CountsBackgroundConfig::c` and reports `D/(n − k)` as the primary
+        // The counts-KL solver is now the joint-Poisson fitter, validated
+        // experimentally on synthetic and real VENUS counts data.  Uses the
+        // explicit `c = Q_s/Q_ob` from `CountsBackgroundConfig::c` and
+        // reports `D/(n − k)` as the primary
         // GOF.  Detector-space counts background `B_det` is assumed zero
         // here; the `CountsWithNuisance` arm lets callers supply a
         // detector-bg spectrum.
@@ -1003,7 +1004,7 @@ pub fn fit_spectrum_typed(
         // as a simplified Poisson-to-Gaussian conversion.  Poisson structure
         // is lost.  For statistically correct low-count fitting, use the
         // Poisson KL solver (`solver="kl"` or `SolverConfig::Auto`), which
-        // now routes to the joint-Poisson path per memo 35 §P1.
+        // now routes to the joint-Poisson path.
         (
             InputData::Counts {
                 sample_counts,
@@ -1343,24 +1344,24 @@ fn fit_transmission_poisson(
     Ok(sr)
 }
 
-/// Joint-Poisson counts-path fitter (memo 35 §P1/§P2).
+/// Joint-Poisson counts-path fitter.
 ///
 /// Builds a pure transmission `FitModel` (density + optional temperature +
 /// optional energy-scale) and feeds it to [`joint_poisson::joint_poisson_fit`]
 /// together with explicit `(O, S, c)`.  Returns a [`SpectrumFitResult`] with
-/// `deviance_per_dof = Some(...)` as the primary GOF (memo 35 §P1.2).
+/// `deviance_per_dof = Some(...)` as the primary GOF.
 /// `reduced_chi_squared` is set to the same value so GUI consumers that
 /// still read the legacy field see a deviance-based metric.
 ///
-/// Current scope (P1 + P2, including P2.2): `fit_alpha_1`, `fit_alpha_2`,
+/// Current scope: `fit_alpha_1`, `fit_alpha_2`,
 /// and non-zero `detector_background` remain rejected (`λ̂` absorbs the
-/// global flux scale, `B_det` / alpha_2 wiring is memo 35 §P3.2 deferred).
+/// global flux scale; `B_det` / alpha_2 wiring is not yet implemented).
 /// `transmission_background` with `A_n` + `B_A` / `B_B` / `B_C` is
-/// supported as of P2.2, subject to the operational rule that `B_A` must
-/// be enabled if any of `B_A` / `B_B` / `B_C` is enabled (memo 35 §P2.2,
-/// EG2 S2 C_An shows A_n alone cannot absorb a constant offset — density
+/// supported, subject to the operational rule that `B_A` must
+/// be enabled if any of `B_A` / `B_B` / `B_C` is enabled (benchmarked:
+/// A_n alone cannot absorb a constant offset — density
 /// bias −23%).  Exponential-tail terms `BackD` / `BackF` are rejected
-/// (memo 35 §P4-deferred).
+/// (support is deferred).
 fn fit_counts_joint_poisson(
     sample_counts: &[f64],
     flux: &[f64],
@@ -1368,40 +1369,39 @@ fn fit_counts_joint_poisson(
     config: &UnifiedFitConfig,
     jp_cfg: &JointPoissonFitConfig,
 ) -> Result<SpectrumFitResult, PipelineError> {
-    // ── Compatibility gates (memo 35 §P3 items are out of scope here) ──
+    // ── Compatibility gates (deferred features are out of scope here) ──
     if let Some(bg) = config.counts_background()
         && (bg.fit_alpha_1 || bg.fit_alpha_2)
     {
         return Err(PipelineError::InvalidParameter(
             "joint-Poisson solver does not support fit_alpha_1/fit_alpha_2: \
              the profile lambda-hat absorbs the global flux scale (alpha_1 redundant); \
-             alpha_2 / B_det wiring is deferred to memo 35 §P3."
+             alpha_2 / B_det wiring is not yet implemented."
                 .into(),
         ));
     }
     if detector_background.iter().any(|&v| v.abs() > 1e-12) {
         return Err(PipelineError::InvalidParameter(
             "joint-Poisson solver with non-zero detector_background is not yet supported \
-             (B_det wiring deferred to memo 35 §P3.2)."
+             (B_det wiring is deferred)."
                 .into(),
         ));
     }
 
-    // ── §P2.2 operational rule: B_A required if any additive term enabled ──
+    // ── Operational rule: B_A required if any additive term enabled ──
     if let Some(bg) = config.transmission_background.as_ref() {
         if bg.fit_back_d || bg.fit_back_f {
             return Err(PipelineError::InvalidParameter(
                 "joint-Poisson solver does not support the BackD/BackF exponential \
-                 tail (memo 35 §P4-deferred)."
+                 tail (support is deferred)."
                     .into(),
             ));
         }
         if (bg.fit_back_b || bg.fit_back_c) && !bg.fit_back_a {
             return Err(PipelineError::InvalidParameter(
                 "joint-Poisson transmission_background: B_A (fit_back_a) must be \
-                 enabled whenever any of B_B / B_C is enabled (memo 35 §P2.2 — \
-                 A_n alone cannot absorb a constant offset; EG2 S2 C_An → −23% \
-                 density bias)."
+                 enabled whenever any of B_B / B_C is enabled (A_n alone cannot \
+                 absorb a constant offset — benchmarked at −23% density bias)."
                     .into(),
             ));
         }
@@ -1452,7 +1452,7 @@ fn fit_counts_joint_poisson(
         seed_energy_scale_in_params(&mut param_vec, energy_scale_indices, &t_proxy, config);
     }
 
-    // ── Transmission background (A_n + B_A/B/C) parameters, P2.2 ──
+    // ── Transmission background (A_n + B_A/B/C) parameters ──
     // Use the same SAMMY-style param block as the LM transmission path.
     // If BackD/BackF were enabled, we would have already errored out above.
     let bg_indices = config
@@ -1469,7 +1469,7 @@ fn fit_counts_joint_poisson(
         build_transmission_model(config, n_density_params, temperature_index)?
     };
 
-    // ── Wrap with NormalizedTransmissionModel if bg is active (P2.2) ──
+    // ── Wrap with NormalizedTransmissionModel if bg is active ──
     // The wrapper adds `T_out = A_n · T_inner + B_A + B_B/√E + B_C·√E`,
     // exactly matching the SAMMY form used by the LM transmission path.
     // Its analytical Jacobian chains through the inner model correctly,
@@ -1566,7 +1566,7 @@ fn fit_counts_joint_poisson(
     };
     let fitted_temp = temperature_index.map(|idx| result.params[idx]);
 
-    // Convergence signal per memo 35 §P2.3: the deviance value is the
+    // Convergence signal: the deviance value is the
     // acceptance criterion, but we expose a boolean to preserve the
     // existing SpectrumFitResult shape.  Report True when EITHER stage
     // self-flagged convergence (whichever accepts).
@@ -1575,7 +1575,7 @@ fn fit_counts_joint_poisson(
     // ── Background parameter readout ──
     // When bg is active, read A_n / B_A / B_B / B_C from the fitted
     // parameter vector at their registered indices.  When bg is absent,
-    // use the memo 35 §P1 convention: A_n = 1 (subsumed into λ̂), bg = 0.
+    // use the convention A_n = 1 (subsumed into λ̂), bg = 0.
     let (anorm_out, bg_abc_out) = if let Some(bi) = bg_indices {
         (
             result.params[bi.anorm],
@@ -1593,7 +1593,8 @@ fn fit_counts_joint_poisson(
         densities,
         uncertainties,
         // Back-compat bridge: reduced_chi_squared carries D/(n−k) for the
-        // joint-Poisson path.  Memo 35 §P1.2 — Pearson χ² is secondary.
+        // joint-Poisson path.  The deviance is the primary GOF; Pearson
+        // χ² is secondary.
         reduced_chi_squared: result.deviance_per_dof,
         converged,
         iterations: result.gn_iterations + result.polish_iterations,
@@ -2933,8 +2934,8 @@ pub struct SpectrumFitResult {
     /// 1-sigma uncertainty on the fitted temperature (from covariance matrix).
     pub temperature_k_unc: Option<f64>,
     /// Fitted normalization scale (SAMMY `Anorm`).  When background
-    /// fitting is disabled, the pipeline emits `1.0` (memo 35 §P1
-    /// convention — `λ̂` absorbs the scale).
+    /// fitting is disabled, the pipeline emits `1.0` (`λ̂` absorbs
+    /// the scale).
     pub anorm: f64,
     /// Fitted background polynomial coefficients `[BackA, BackB, BackC]`
     /// for the SAMMY-style 6-term background:
@@ -2971,7 +2972,7 @@ pub struct SpectrumFitResult {
     /// `None` when energy-scale fitting is not enabled.
     pub l_scale: Option<f64>,
     /// Conditional binomial deviance divided by `(n − k)`
-    /// (memo 35 §P1.2 — primary GOF for the counts-KL dispatch, i.e.
+    /// (primary GOF for the counts-KL dispatch, i.e.
     /// `SolverConfig::PoissonKL` on `InputData::Counts` or
     /// `InputData::CountsWithNuisance`).
     ///
@@ -4365,12 +4366,12 @@ mod tests {
     }
 
     // ==================================================================
-    // Joint-Poisson solver integration tests (memo 35 §P1/§P2)
+    // Joint-Poisson solver integration tests
     // ==================================================================
 
     /// End-to-end: joint-Poisson density recovery at c = 5.98 on synthetic
     /// matched-model counts, via `fit_spectrum_typed`.  Verifies that
-    /// `SpectrumFitResult.deviance_per_dof` is populated (P1.2) and that
+    /// `SpectrumFitResult.deviance_per_dof` is populated and that
     /// density is recovered to within 5% on a single-resonance spectrum
     /// under expected (noise-free) counts.
     #[test]
@@ -4408,7 +4409,7 @@ mod tests {
         };
         let result = fit_spectrum_typed(&input, &config).unwrap();
 
-        // Deviance-based GOF is populated (P1.2).
+        // Deviance-based GOF is populated.
         let d_per_dof = result
             .deviance_per_dof
             .expect("joint-Poisson solver must populate deviance_per_dof");
@@ -4436,7 +4437,7 @@ mod tests {
 
     /// Counts-KL dispatch rejects `fit_alpha_1` / `fit_alpha_2` — the
     /// profile `λ̂` absorbs the global flux scale (alpha_1 redundant);
-    /// alpha_2 / B_det wiring is P3-deferred per memo 35 §P3.
+    /// alpha_2 / B_det wiring is not yet implemented (deferred).
     #[test]
     fn test_joint_poisson_rejects_alpha_fit() {
         let data = u238_single_resonance();
@@ -4506,14 +4507,14 @@ mod tests {
     }
 
     // ──────────────────────────────────────────────────────────────────
-    // P2.2: transmission_background through the joint-Poisson path.
+    // transmission_background through the joint-Poisson path.
     // ──────────────────────────────────────────────────────────────────
 
     /// End-to-end: joint-Poisson with A_n + B_A + B_B + B_C free on
     /// noise-free synthetic counts with known background.  On 201 bins
     /// with 5 free params the (n, A_n) correlation is non-trivial so we
     /// assert the *wiring* is correct (bg reaches the fit, D/dof → 0,
-    /// A_n + B_A near truth, density within 10%) rather than EG2-grade
+    /// A_n + B_A near truth, density within 10%) rather than benchmark-grade
     #[test]
     fn test_joint_poisson_with_transmission_background() {
         let data = u238_single_resonance();
@@ -4579,7 +4580,7 @@ mod tests {
         };
         let r = fit_spectrum_typed(&input, &config).unwrap();
 
-        // The invariant P2.2 wiring is supposed to produce is: the 4 bg
+        // The invariant the background wiring is supposed to produce is: the 4 bg
         // parameters *actually reach the objective* (the fit produces a
         // near-zero deviance on noise-free expected counts) and the
         // fitter moves them off their initial values.  Density / A_n /
@@ -4610,9 +4611,9 @@ mod tests {
         );
     }
 
-    /// §P2.2 operational rule: `B_B` or `B_C` free → `B_A` must be free too.
+    /// Operational rule: `B_B` or `B_C` free → `B_A` must be free too.
     #[test]
-    fn test_joint_poisson_p2_2_requires_back_a_when_back_b_enabled() {
+    fn test_joint_poisson_requires_back_a_when_back_b_enabled() {
         let data = u238_single_resonance();
         let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.05).collect();
         let (t, _) = synthetic_transmission(&data, 0.0005, &energies);
@@ -4653,12 +4654,12 @@ mod tests {
         let err = fit_spectrum_typed(&input, &config).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("§P2.2") || msg.contains("B_A"),
-            "expected §P2.2 rejection message, got: {msg}"
+            msg.contains("B_A"),
+            "expected B_A pairing-rule rejection message, got: {msg}"
         );
     }
 
-    /// Joint-Poisson rejects BackD/BackF exponential tail (§P4-deferred).
+    /// Joint-Poisson rejects BackD/BackF exponential tail (support is deferred).
     #[test]
     fn test_joint_poisson_rejects_back_d_f() {
         let data = u238_single_resonance();
@@ -4694,7 +4695,7 @@ mod tests {
         };
         let err = fit_spectrum_typed(&input, &config).unwrap_err();
         assert!(
-            err.to_string().contains("BackD") || err.to_string().contains("§P4"),
+            err.to_string().contains("BackD"),
             "expected BackD/BackF rejection, got: {err}"
         );
     }
@@ -5179,7 +5180,7 @@ mod tests {
         );
         let t = model.evaluate(&[true_density, t0_true, ls_true]).unwrap();
         // Counts: sample = flux·T.  Zero detector background — the joint-Poisson
-        // KL path does not yet wire B_det (memo 35 §P3.2); the seed proxy
+        // KL path does not yet wire B_det; the seed proxy
         // (sample − 0)/(flux − 0) = T still reconstructs the dip positions.
         let flux: Vec<f64> = vec![5000.0; energies.len()];
         let background: Vec<f64> = vec![0.0; energies.len()];

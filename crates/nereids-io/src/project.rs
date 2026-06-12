@@ -180,11 +180,11 @@ pub struct ProjectSnapshot {
     pub lm_background_enabled: Option<bool>,
     /// Whether KL background fitting (b0 + b1/sqrt(E)) is enabled.
     pub kl_background_enabled: Option<bool>,
-    /// Counts-KL proton-charge ratio `c = Q_s / Q_ob` (memo 35 §P1.3).
+    /// Counts-KL proton-charge ratio `c = Q_s / Q_ob`.
     /// `None` for project files predating the field; restore-side
     /// defaults to 1.0.
     pub kl_c_ratio: Option<f64>,
-    /// Counts-KL Nelder-Mead polish override (memo 38 §6).  `None` =
+    /// Counts-KL Nelder-Mead polish override.  `None` =
     /// dispatcher auto-disable for multi-pixel; `Some(true/false)` =
     /// forced.  Outer `Option` distinguishes "not stored" from
     /// "explicitly None".

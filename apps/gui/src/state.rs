@@ -64,12 +64,12 @@ pub struct SessionCache {
     /// KL background enabled (b₀ + b₁/√E).
     #[serde(default)]
     pub kl_background_enabled: bool,
-    /// Counts-KL proton-charge ratio `c = Q_s / Q_ob` (memo 35 §P1.3).
+    /// Counts-KL proton-charge ratio `c = Q_s / Q_ob`.
     /// Defaults to 1.0 (caller PC-normalized the flux upstream).
     #[serde(default = "default_kl_c_ratio")]
     pub kl_c_ratio: f64,
     /// Counts-KL Nelder-Mead polish override.  `None` = dispatcher
-    /// auto-disables polish for multi-pixel spatial fits (memo 38 §6).
+    /// auto-disables polish for multi-pixel spatial fits.
     /// `Some(true/false)` forces polish on/off.
     #[serde(default)]
     pub kl_enable_polish_override: Option<bool>,
@@ -768,13 +768,13 @@ pub struct AppState {
     /// Model: Anorm * T_inner(E) + BackA + BackB/sqrt(E) + BackC*sqrt(E)
     pub kl_background_enabled: bool,
     /// Proton-charge ratio c = Q_s / Q_ob for the counts-KL solver
-    /// (memo 35 §P1.3).  Default 1.0 = caller PC-normalized the flux
+    /// Default 1.0 = caller PC-normalized the flux
     /// upstream.  For raw-count VENUS data, set to the actual
     /// Q_sample/Q_open_beam ratio (typically ~5–6).
     pub kl_c_ratio: f64,
     /// Override for Nelder-Mead polish on the counts-KL path.  `None`
     /// lets `spatial_map_typed` auto-disable polish when n_pixels > 1
-    /// (memo 38 §6 — 17 min/pixel polish cost).  `Some(true)` forces
+    /// (measured ~17 min/pixel polish cost).  `Some(true)` forces
     /// polish on even at spatial scale (research use only);
     /// `Some(false)` forces off.
     pub kl_enable_polish_override: Option<bool>,

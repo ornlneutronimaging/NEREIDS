@@ -1137,13 +1137,13 @@ pub fn poisson_fit(
 /// The production counts-KL dispatch (`SolverConfig::PoissonKL` on
 /// `InputData::Counts` / `InputData::CountsWithNuisance`) goes through
 /// the joint-Poisson conditional-binomial-deviance path in
-/// [`crate::joint_poisson`] per memo 35 §P1/§P2.  `CountsModel` and
+/// [`crate::joint_poisson`].  `CountsModel` and
 /// [`CountsBackgroundScaleModel`] below are consumed only by
 /// `nereids_pipeline::pipeline::evaluate_jacobian_and_fisher` (the
 /// Fisher-info research helper used by the spatial-regularization
 /// epic #394) and by this module's `#[cfg(test)]` tests.  They assume
 /// the caller has pre-computed `flux = c · O` (i.e. `c` is baked into
-/// `flux` — the convention that memo 35 §P1 flagged as error-prone for
+/// `flux` — a convention that proved error-prone for
 /// end users, which is precisely why the production path no longer
 /// uses this struct).
 ///

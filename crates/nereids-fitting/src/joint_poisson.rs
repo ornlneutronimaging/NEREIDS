@@ -815,17 +815,17 @@ pub struct JointPoissonResult {
 /// Two-stage joint-Poisson fit: damped Fisher stage followed by
 /// Nelder-Mead polish.
 ///
-/// **Memo 35 §P1 + §P2 requirements** this function satisfies:
+/// **Counts-path contract** this function satisfies:
 ///
 /// - Minimizes the **conditional binomial deviance** `D(θ)`
 ///   ([`JointPoissonObjective::deviance`]), not fixed-flux Poisson NLL.
-/// - Reports `D / (n − k)` as the primary GOF (P1.2).
-/// - Honours an **explicit `c = Q_s/Q_ob`** stored in the objective (P1.3).
+/// - Reports `D / (n − k)` as the primary GOF.
+/// - Honours an **explicit `c = Q_s/Q_ob`** stored in the objective.
 /// - Runs Nelder-Mead **polish** after the gradient stage to escape the
-///   EG2-S1 C_full initial-point stall (P2.1).
+///   initial-point stall seen on backgrounded fits.
 /// - Exposes `gn_converged` and `polish_converged` separately so callers
 ///   do not rely on a single "success" flag — acceptance is meant to come
-///   from the deviance value (P2.3).
+///   from the deviance value.
 ///
 /// The damped-Fisher stage uses LM-style acceptance: a step is accepted if
 /// it satisfies an Armijo condition on D; on rejection, λ is increased and
@@ -1780,7 +1780,7 @@ mod tests {
 
     // ------------------------------------------------------------------
     // Matched-model single-parameter recovery at c = 5.98.
-    // This is the EG1 "proposed" cell in miniature — verify |bias| < 1%
+    // A miniature of the validated matched-model configuration — verify |bias| < 1%
     // and D / (n − k) ∈ [0.85, 1.15] without needing the polish.
     // ------------------------------------------------------------------
     #[test]
@@ -1826,8 +1826,8 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Polish-never-worsens invariant on a backgrounded fit.  Memo 35 §P2.1
-    // claims NM polish reduces D materially when stage-1 stalls.  At the
+    // Polish-never-worsens invariant on a backgrounded fit.  NM polish
+    // is meant to reduce D materially when stage-1 stalls.  At the
     // unit-test scale we verify the testable invariant: enabling polish
     // never produces a larger final D than disabling it on the same data.
     //
@@ -1877,7 +1877,7 @@ mod tests {
             active_mask: None,
         };
 
-        // x0 analogous to EG2-S1 regime: n near truth, A_n = 1, all
+        // x0 analogous to the stall-prone backgrounded regime: n near truth, A_n = 1, all
         // additive bg at 0, bg bounds tight to curb degeneracy.
         let mk_params = || {
             ParameterSet::new(vec![

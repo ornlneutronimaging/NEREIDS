@@ -56,8 +56,8 @@ pub struct NelderMeadConfig {
 impl Default for NelderMeadConfig {
     fn default() -> Self {
         // Defaults match scipy.optimize.minimize(method='Nelder-Mead'):
-        // xatol = 1e-4, fatol = 1e-4.  For the polish regime described in
-        // EG5 we use tighter tolerances (1e-9 / 1e-10) on the caller side.
+        // xatol = 1e-4, fatol = 1e-4.  The counts-path polish regime uses
+        // tighter tolerances (1e-9 / 1e-10) on the caller side.
         Self {
             xatol: 1e-4,
             fatol: 1e-4,
@@ -80,8 +80,8 @@ pub struct NelderMeadResult {
     /// Total objective evaluations (including initial simplex).
     pub n_evals: usize,
     /// `true` if both `xatol` and `fatol` were satisfied before hitting
-    /// `max_iter`.  Per memo 35 §P2.3, acceptance should be judged from
-    /// the deviance value, not this flag.
+    /// `max_iter`.  Acceptance should be judged from the deviance
+    /// value, not this flag.
     pub self_converged: bool,
 }
 

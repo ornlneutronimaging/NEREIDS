@@ -38,7 +38,7 @@ pub fn summary_card(
 
             // Mean GOF.  Label swaps to "D/dof" for the counts-KL
             // dispatch (when deviance_per_dof_map is populated) —
-            // memo 35 §P1.2 naming.
+            // the counts-path GOF naming.
             let gof_label = if result.deviance_per_dof_map.is_some() {
                 "D/dof"
             } else {

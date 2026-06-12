@@ -40,7 +40,7 @@ pub struct SpatialResult {
     /// NaN at pixels where `converged_map` is `false`.
     pub uncertainty_maps: Vec<Array2<f64>>,
     /// Reduced chi-squared map.  For the counts-KL dispatch (joint-Poisson
-    /// deviance per memo 35 §P1.2) this is back-compat-mirrored to
+    /// deviance) this is back-compat-mirrored to
     /// `D/(n−k)`; the semantically-correct per-pixel value is also
     /// exposed as [`Self::deviance_per_dof_map`].
     /// NaN at pixels where `converged_map` is `false`.
@@ -172,7 +172,7 @@ impl InputData3D<'_> {
 /// Dispatches per-pixel fitting based on the `InputData3D` variant:
 /// - **Transmission**: per-pixel LM (or KL, opt-in) on transmission values.
 /// - **Counts**: per-pixel counts-KL dispatch (joint-Poisson conditional
-///   binomial deviance per memo 35 §P1) on the sample cube, paired
+///   binomial deviance) on the sample cube, paired
 ///   against the **spatially-averaged open-beam flux**.  See the inline
 ///   comment on `averaged_flux` for the rationale: this is a deliberate
 ///   bias-variance trade that reduces per-pixel OB shot-noise at the
@@ -183,7 +183,7 @@ impl InputData3D<'_> {
 ///   caller-supplied per-pixel flux and background cubes.  No averaging.
 ///
 /// Always returns [`SpatialResult`].
-/// Apply the multi-pixel polish auto-disable rule (memo 38 §6).
+/// Apply the multi-pixel polish auto-disable rule.
 ///
 /// For `n_pixels > 1`, return a config with `counts_enable_polish`
 /// forced to `Some(false)` UNLESS the caller already set an explicit
@@ -318,7 +318,7 @@ fn validate_spatial_fit_preflight(
                 return Err(PipelineError::InvalidParameter(
                     "joint-Poisson solver does not support fit_alpha_1/fit_alpha_2: \
                      the profile lambda-hat absorbs the global flux scale (alpha_1 redundant); \
-                     alpha_2 / B_det wiring is deferred to memo 35 §P3."
+                     alpha_2 / B_det wiring is not yet implemented."
                         .into(),
                 ));
             }
@@ -341,9 +341,8 @@ fn validate_spatial_fit_preflight(
         {
             return Err(PipelineError::InvalidParameter(
                 "joint-Poisson transmission_background: B_A (fit_back_a) must be \
-                 enabled whenever any of B_B / B_C is enabled (memo 35 §P2.2 — \
-                 A_n alone cannot absorb a constant offset; EG2 S2 C_An → −23% \
-                 density bias)."
+                 enabled whenever any of B_B / B_C is enabled (A_n alone cannot \
+                 absorb a constant offset — benchmarked at −23% density bias)."
                     .into(),
             ));
         }
@@ -1198,8 +1197,8 @@ pub fn spatial_map_typed(
                     sigmas_flat.len(),
                 );
                 // Training box: 2 × the initial density — same convention
-                // the codex04 reference uses.  Anchor at the midpoint
-                // (0.5 × train_max).
+                // the design study's reference implementation uses.
+                // Anchor at the midpoint (0.5 × train_max).
                 //
                 let train_max: Vec<f64> = config
                     .initial_densities()
@@ -1395,7 +1394,7 @@ pub fn spatial_map_typed(
     };
 
     // Auto-disable Nelder-Mead polish for multi-pixel counts-KL spatial
-    // maps (memo 38 §6 recommendation).  Polish is a single-spectrum
+    // maps.  Polish is a single-spectrum
     // research knob — on the VENUS Hf 120min aggregated fit it took
     // ~1 000 s; at 512 × 512 pixels that is untenable even with rayon.
     // Per-pixel fits also rarely hit the over-parameterized stall regime
@@ -3981,7 +3980,7 @@ mod tests {
             open_beam_counts: ob.view(),
         };
         // B_B fitted but B_A not fitted is rejected by the
-        // joint-Poisson dispatch (memo 35 §P2.2): A_n alone cannot
+        // joint-Poisson dispatch: A_n alone cannot
         // absorb a constant offset.  Test the B_B branch; the B_C
         // branch shares the same code path.
         let bg = crate::pipeline::BackgroundConfig {
