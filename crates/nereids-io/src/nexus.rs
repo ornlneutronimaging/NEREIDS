@@ -984,7 +984,7 @@ mod tests {
         }
     }
 
-    /// Round 2 review: `probe_nexus` must respect the `units`
+    /// `probe_nexus` must respect the `units`
     /// attribute on `time_of_flight` the same way `load_nexus_histogram`
     /// does.  A file written with `units = "us"` must surface µs
     /// values verbatim through the probe (no 1000× silent rescale).
@@ -1386,7 +1386,7 @@ mod tests {
         );
     }
 
-    /// Codex review: `MultiAngleMode::Error` must reject multi-angle
+    /// `MultiAngleMode::Error` must reject multi-angle
     /// files BEFORE reading the full 4D counts dataset.  On a real
     /// multi-angle file this dataset can be multi-GB; wasting a read
     /// to then error out is prohibitive.  This test uses metadata

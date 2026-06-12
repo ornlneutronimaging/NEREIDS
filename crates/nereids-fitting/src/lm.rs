@@ -1645,7 +1645,6 @@ mod tests {
     /// JᵀWJ / JᵀWr.  Without explicit row-skip in the accumulator
     /// loops, `0.0 (weight) * NaN (residual) = NaN` would propagate
     /// through the fit despite the masked weight being zero.
-    /// Regression for Round-2 review fix #4.
     #[test]
     fn test_lm_active_mask_tolerates_nan_outside_range() {
         // y = 2x + 3 inside the active mask; NaN outside.  A naive
@@ -1698,10 +1697,9 @@ mod tests {
         );
     }
 
-    /// Regression for Round-2-pass-2 review: the global finite checks
-    /// on `y_model` / `y_trial` must skip masked bins.  A model that
-    /// returns NaN only at masked margin bins should not abort the fit
-    /// or get its trial step rejected.
+    /// The global finite checks on `y_model` / `y_trial` must skip
+    /// masked bins.  A model that returns NaN only at masked margin
+    /// bins should not abort the fit or get its trial step rejected.
     #[test]
     fn test_lm_active_mask_tolerates_model_nan_outside_range() {
         // Linear model that injects NaN into masked bins.  The fit

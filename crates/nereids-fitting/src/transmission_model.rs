@@ -109,8 +109,8 @@ pub struct PrecomputedTransmissionModel {
     /// `evaluate()` / `analytical_jacobian()` fast path calls
     /// `cubature.forward_and_jacobian(n)` directly instead of
     /// `exp(-Σ n σ) + apply_resolution`.  Any guard failure falls
-    /// back to the exact path, so the default behaviour is
-    /// byte-identical to main.
+    /// back to the exact path, so installing a plan cannot change
+    /// results unless every guard passes.
     pub sparse_cubature_plan: Option<Arc<SparseEmpiricalCubaturePlan>>,
     /// Optional scalar (k = 1) surrogate plan.
     ///
@@ -3211,7 +3211,7 @@ mod tests {
     }
 
     /// Helper: build a sparse cubature plan against a known
-    /// (matrix, σ stack) pair, with the canonical codex04 training
+    /// (matrix, σ stack) pair, with the canonical design-study training
     /// rule.
     fn build_cubature(
         matrix: &nereids_physics::resolution::ResolutionMatrix,
@@ -4698,8 +4698,8 @@ mod tests {
     // never calls the `broadened_cross_sections` family this fix touches — to
     // MACHINE PRECISION over the FULL grid, including the boundary points the
     // earlier #442 tests (tol 2e-2, interior-only) excluded.  Each test verifies
-    // the kernel actually broadens the spectrum (non-vacuity, per
-    // feedback_synthetic_resolution_test_design) and, where it can construct the
+    // the kernel actually broadens the spectrum (a non-vacuity pre-check, so a
+    // shared-primitive oracle cannot pass vacuously) and, where it can construct the
     // old path, shows the old coarse-grid result differed materially — proving
     // the fix is a real correction, not a no-op.  Jacobian columns are checked
     // against central finite differences of the (now aux-correct) `evaluate`.
@@ -5772,11 +5772,11 @@ mod tests {
     /// default flip to `PartialGal` was measured on real VENUS Hf
     /// 120-min KL+per-iso+TZERO 4×4 data: 15 of 16 fitted pixels landed
     /// within 0.1·σ_Fisher of the FD2 reference for the L_scale
-    /// column.  That measurement lives in `.research/489_rust_validation/`
-    /// (gitignored), and uses the production USR/FTS tabulated
-    /// resolution kernel that ORNL release policy keeps out of the
-    /// repository.  Without an in-tree analogue, a future refactor
-    /// could silently regress the rank-1 bound on real workloads.
+    /// column.  That measurement was made against the production
+    /// USR/FTS tabulated resolution kernel, which ORNL release policy
+    /// keeps out of the repository — so it cannot ship as an in-tree
+    /// fixture.  Without an in-tree analogue, a future refactor could
+    /// silently regress the rank-1 bound on real workloads.
     ///
     /// **Synthetic stand-in.**  This test exercises the same code path
     /// with a sharp Gaussian "resonance" cross-section convolved by a

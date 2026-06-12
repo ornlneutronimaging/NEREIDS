@@ -42,7 +42,7 @@ fn max_hybrid_err(a: &[f64], b: &[f64]) -> f64 {
 /// k = 1 grouped case: the cubature should match the exact
 /// `ResolutionMatrix @ exp(-n σ)` forward output to LP precision at
 /// the training densities, and produce bounded error at held-out
-/// densities inside the training box.  Codex04's 20-seed KL
+/// densities inside the training box.  The design study's 20-seed KL
 /// follow-up showed 1.27× scatter inflation on grouped-Hf k=1 — this
 /// test does not re-measure that; it only checks forward-model
 /// correctness.
@@ -91,7 +91,7 @@ fn cubature_venus_like_k1_forward_equivalence() {
     }
 
     // At held-out density (VENUS production ~ 1.6e-4), bounded
-    // error.  Codex04's real-VENUS Hf aggregated fit showed a density
+    // error.  The design study's real-VENUS Hf aggregated fit showed a density
     // shift of 1.66e-4 relative — which means forward error at the
     // optimum is at least that small.  Here we allow 1e-3 max abs
     // error as a generous ceiling; the actual value on the

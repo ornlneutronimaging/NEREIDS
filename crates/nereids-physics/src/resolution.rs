@@ -2203,7 +2203,7 @@ pub mod test_support {
     /// one bit (e.g. swapping the upper-bound binary search for
     /// `partition_point`, or changing the `<=` to `<` in the midpoint
     /// comparison) would flip the comparison and invalidate the
-    /// regression suite.  See `feedback_bit_exact_oracle_verbatim.md`.
+    /// regression suite.
     pub fn interp_spectrum(energies: &[f64], spectrum: &[f64], e: f64) -> Option<f64> {
         let n = energies.len();
         if n == 0 {
@@ -3395,10 +3395,10 @@ mod tests {
     /// Hand-construct a `ResolutionPlan` that deliberately exercises
     /// both the passthrough branch (`norm ≤ DIVISION_FLOOR`) and the
     /// `-0.0` degenerate-bracket sentinel — neither of which is
-    /// reached on the VENUS fixture at the tested grid sizes.  The
-    /// Round-1 audit flagged the earlier fixture-based passthrough
-    /// test as vacuous, so this replacement verifies the two unreached
-    /// branches with direct assertions on the resulting CSR.
+    /// reached on the VENUS fixture at the tested grid sizes, which
+    /// made the earlier fixture-based passthrough test vacuous.  This
+    /// replacement verifies the two unreached branches with direct
+    /// assertions on the resulting CSR.
     fn make_synthetic_plan(target_energies: Vec<f64>, rows: Vec<SyntheticRow>) -> ResolutionPlan {
         let n = target_energies.len();
         assert_eq!(rows.len(), n);
@@ -3447,8 +3447,7 @@ mod tests {
         // Grid has 4 cells so `lo ∈ [0, n-2] = [0, 2]` holds for all
         // entries — this preserves the `ResolutionPlan::apply` SAFETY
         // invariant that `lo + 1 < n` even if a future refactor
-        // weakens the `-0.0` sentinel short-circuit (round-2 self-
-        // audit NEW-P2 #1).
+        // weakens the `-0.0` sentinel short-circuit.
         let plan = make_synthetic_plan(
             vec![10.0, 20.0, 30.0, 40.0],
             vec![
@@ -3591,7 +3590,7 @@ mod tests {
         assert!(matrix_out[1].is_infinite());
     }
 
-    /// Round-2 Codex P3: documents (and guards) the analogous
+    /// Documents (and guards) the analogous
     /// divergence on **finite spectra near f64 overflow**.  With
     /// opposite-sign neighboring bins at f64::MAX, `plan.apply`'s
     /// `s_lo + frac * (s_hi - s_lo)` overflows in the subtraction

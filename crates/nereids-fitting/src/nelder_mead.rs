@@ -1,12 +1,12 @@
 //! Bounded Nelder-Mead simplex minimizer.
 //!
 //! Derivative-free polish optimizer used after a gradient-based stage to
-//! escape stall points.  Memo 35 §P2.1 and EG5 establish that, for
-//! backgrounded counts-path fits, a single L-BFGS start frequently stalls
-//! at the initial guess (1/20 self-flagged convergence on the EG2 S1 C_full
-//! regime), while a Nelder-Mead polish from that stall point resolves the
-//! failure cleanly (10/20 convergence, density bias from −5.94% to +0.013%,
-//! D/DOF from 905 to 1.001).
+//! escape stall points.  Benchmarking on backgrounded counts-path fits of
+//! real VENUS data established the need: a single L-BFGS start frequently
+//! stalls at the initial guess (1/20 self-flagged convergence on the
+//! hardest backgrounded regime tested), while a Nelder-Mead polish from
+//! that stall point resolves the failure cleanly (10/20 convergence,
+//! density bias from −5.94% to +0.013%, D/DOF from 905 to 1.001).
 //!
 //! ## Algorithm
 //!

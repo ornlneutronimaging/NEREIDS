@@ -4952,7 +4952,7 @@ mod tests {
     /// honour the active-bin mask, so silently fitting on the
     /// (margin-extended) grid would bias the result.  Joint-Poisson
     /// (counts) and LM transmission both honour the mask correctly.
-    /// Regression for Round-2 review fix #1 (#514).
+    /// Regression for #514.
     #[test]
     fn test_fit_energy_range_rejected_on_transmission_poisson_path() {
         let data = u238_single_resonance();
