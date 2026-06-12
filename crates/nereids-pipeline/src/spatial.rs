@@ -535,6 +535,60 @@ fn validate_spatial_data_values(
     Ok(())
 }
 
+/// Fit every pixel of a 3-D data cube and return per-pixel maps — the
+/// spatial-mapping entry point of the pipeline.
+///
+/// Runs the single-spectrum fitter once per `(y, x)` pixel of `input`
+/// (shape `(n_energies, height, width)`), in parallel over pixels with
+/// rayon, and assembles the results into [`SpatialResult`]: one areal
+/// density map and uncertainty map per fitted isotope/group, the χ²
+/// (or deviance-per-dof) map, the convergence mask, and any optional
+/// maps the configuration enables (temperature, normalization,
+/// background terms, t0 / flight-path scale).
+///
+/// # Input modes
+///
+/// `input` selects the per-pixel objective: pre-normalized
+/// [`InputData3D::Transmission`] (+ per-bin uncertainty),
+/// [`InputData3D::Counts`] (sample + open-beam), or
+/// [`InputData3D::CountsWithNuisance`] (sample + flux + background
+/// nuisance arms; counts-domain solvers only).
+///
+/// # Validation (all up-front, before any pixel is fitted)
+///
+/// * The cube's spectral axis must match `config.energies()`, the
+///   mode's companion cubes must match the primary cube's shape, and
+///   `dead_pixels` (when given) must be `(height, width)`.
+/// * Cube *values* are validated on live pixels (finite; non-negative
+///   where the domain requires it) so a corrupt cube fails loudly
+///   instead of producing a quietly-NaN map.
+/// * Known-degenerate configurations are rejected with a diagnostic
+///   rather than letting every pixel fail into an all-NaN map:
+///   counts + LM + `fit_energy_scale` (numerically ill-conditioned
+///   per-pixel — issue #458 B3), `fit_energy_scale` together with
+///   `fit_temperature` (mutually exclusive model paths), and
+///   `CountsWithNuisance` with an LM solver (requires a counts-domain
+///   solver).  `transmission_background` settings are validated here
+///   for the same reason.
+///
+/// Per-pixel fit *failures* after validation are not errors: the pixel
+/// is recorded as NaN in the maps, `converged_map` is `false` there,
+/// and `n_failed` counts it.
+///
+/// # Cancellation and progress
+///
+/// `cancel` is polled before the sweep and at every pixel; once set,
+/// remaining pixels are skipped and the call returns
+/// [`PipelineError::Cancelled`] (partial results are discarded).
+/// `progress` is incremented once per completed pixel, so a UI thread
+/// can poll it against `height × width`.
+///
+/// # Errors
+///
+/// [`PipelineError::ShapeMismatch`] for axis/shape disagreements,
+/// [`PipelineError::InvalidParameter`] for rejected configurations and
+/// invalid cube values, and [`PipelineError::Cancelled`] when `cancel`
+/// was set.
 pub fn spatial_map_typed(
     input: &InputData3D<'_>,
     config: &UnifiedFitConfig,

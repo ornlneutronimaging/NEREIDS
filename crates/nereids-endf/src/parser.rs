@@ -1940,16 +1940,15 @@ mod tests {
             first_positive.gg
         );
 
+        // The aggregate accessor must cover at least the resolved range's
+        // resonances (it sums over every range, including any unresolved
+        // range the file carries).
         let total = data.total_resonance_count();
-        println!(
-            "U-238 ENDF parsed successfully: {} total resonances across {} L-groups",
-            total,
-            range.l_groups.len()
-        );
-        println!(
-            "  L=0: {} resonances, L=1: {} resonances",
-            l0.resonances.len(),
-            range.l_groups[1].resonances.len()
+        let resolved_sum: usize = range.l_groups.iter().map(|g| g.resonances.len()).sum();
+        assert!(
+            total >= resolved_sum && resolved_sum > 500,
+            "total_resonance_count ({total}) must cover the resolved range's \
+             {resolved_sum} resonances"
         );
     }
 

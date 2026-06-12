@@ -6,9 +6,11 @@
 //! data loading → normalization → forward model → fitting → spatial mapping.
 //!
 //! ## Modules
+//! - [`calibration`] — Energy calibration for TOF neutron instruments (t0 + flight-path scale)
+//! - [`detectability`] — Trace-detectability analysis (pre-experiment SNR check)
+//! - [`error`] — Pipeline error types
 //! - [`pipeline`] — Single-spectrum analysis pipeline (fit_spectrum_typed)
 //! - [`spatial`] — Per-pixel parallel mapping with rayon (spatial_map_typed)
-//! - [`detectability`] — Trace-detectability analysis (pre-experiment SNR check)
 
 pub mod calibration;
 pub mod detectability;

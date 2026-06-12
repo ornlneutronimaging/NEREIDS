@@ -3,11 +3,14 @@
 //! Optimization engine for fitting resonance models to measured transmission data.
 //!
 //! ## Modules
-//! - [`parameters`] — Fit parameter types, bounds, constraints
-//! - [`lm`] — Levenberg-Marquardt least-squares optimizer
-//! - [`poisson`] — Poisson-likelihood optimizer for low-count data
+//! - [`active_mask`] — Active-bin masking for fit-energy-range restriction
+//! - [`error`] — Error types for the fitting crate
+//! - [`forward_model`] — Solver-agnostic forward model trait
 //! - [`joint_poisson`] — Joint-Poisson profile binomial deviance (counts path)
+//! - [`lm`] — Levenberg-Marquardt least-squares optimizer
 //! - [`nelder_mead`] — Bounded Nelder-Mead polish optimizer
+//! - [`parameters`] — Fit parameter types, bounds, constraints
+//! - [`poisson`] — Poisson-likelihood optimizer for low-count data
 //! - [`transmission_model`] — Transmission forward model adapter for fitting
 //!
 //! ## SAMMY Reference

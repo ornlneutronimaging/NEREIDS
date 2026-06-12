@@ -1512,10 +1512,6 @@ mod tests {
         // g_J = 1.0, π/k² ≈ 98,200 barns, Γ = 0.024493
         // σ_c ≈ 1.0 × 98200 × 4 × 1.493e-3 × 23.0e-3 / (24.493e-3)²
         //     ≈ 98200 × 0.2289 ≈ 22,478 barns
-        println!("Capture at 6.674 eV: {} barns", xs.capture);
-        println!("Total at 6.674 eV: {} barns", xs.total);
-        println!("Elastic at 6.674 eV: {} barns", xs.elastic);
-
         assert!(
             xs.capture > 15000.0 && xs.capture < 30000.0,
             "Capture should be ~22000 barns, got {}",
@@ -1537,7 +1533,6 @@ mod tests {
 
         // At low E, σ ∝ 1/√E, so σ(0.1)/σ(0.4) ≈ √(0.4/0.1) = 2.0
         let ratio = xs_01.capture / xs_04.capture;
-        println!("1/v ratio test: σ(0.1)/σ(0.4) = {}", ratio);
         assert!(
             (ratio - 2.0).abs() < 0.3,
             "Expected ~2.0 for 1/v behavior, got {}",
@@ -1589,19 +1584,8 @@ mod tests {
         // Compute cross-sections at several energies near the 6.674 eV resonance.
         let energies = [1.0, 5.0, 6.0, 6.5, 6.674, 7.0, 8.0, 10.0, 20.0, 50.0, 100.0];
 
-        println!("\nU-238 Reich-Moore cross-sections (unbroadened):");
-        println!(
-            "{:>10} {:>12} {:>12} {:>12} {:>12}",
-            "E (eV)", "Total", "Elastic", "Capture", "Fission"
-        );
-
         for &e in &energies {
             let xs = cross_sections_at_energy(&data, e);
-            println!(
-                "{:>10.3} {:>12.3} {:>12.3} {:>12.3} {:>12.6}",
-                e, xs.total, xs.elastic, xs.capture, xs.fission
-            );
-
             // Basic sanity: all cross-sections non-negative.
             assert!(xs.total >= 0.0, "Total negative at E={}", e);
             assert!(xs.elastic >= 0.0, "Elastic negative at E={}", e);
@@ -1635,10 +1619,6 @@ mod tests {
         // SAMMY ex027 broadened output at ~6.674 eV gives ~339 barns capture.
         // Our UNBROADENED result should be MUCH larger (since Doppler broadening
         // spreads the peak). This confirms we're computing the correct physics.
-        println!(
-            "\n6.674 eV peak: capture={:.0} barns (unbroadened), SAMMY broadened ~339 barns",
-            xs_peak.capture
-        );
         assert!(
             xs_peak.capture > 339.0,
             "Unbroadened peak must exceed SAMMY broadened value"
@@ -2186,7 +2166,7 @@ mod tests {
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
             Err(e) => {
-                println!(
+                eprintln!(
                     "skipping test_batch_matches_per_point_hf177_real_endf: \
                      fixture not available at {path:?}: {e}. \
                      Run from the full NEREIDS workspace to exercise this regression gate."
