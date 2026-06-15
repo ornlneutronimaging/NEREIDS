@@ -876,7 +876,7 @@ class TestManifestWorkflowTools:
         assert "background" in summary
 
     def test_fit_summary_omits_back_d_back_f_when_background_disabled(self):
-        """Codex Round 1 follow-up: ``fit_back_d=True, fit_back_f=True`` with
+        """``fit_back_d=True, fit_back_f=True`` with
         ``background=False`` is a nonsensical-but-legal kwarg combination
         — the ``if background { ... }`` block in
         ``py_fit_spectrum_typed`` never attaches the bg model, so the
@@ -899,7 +899,7 @@ class TestManifestWorkflowTools:
             solver="lm",
             temperature_k=293.6,
             max_iter=80,
-            # The contradictory combination Codex flagged: per-term
+            # The contradictory combination under test: per-term
             # flags on, polynomial background OFF.  Should produce
             # None on the binding regardless of fit_back_d / fit_back_f.
             background=False,

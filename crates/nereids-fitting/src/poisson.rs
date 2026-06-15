@@ -14,14 +14,12 @@
 //! for the **transmission + PoissonKL** path (via
 //! `crate::transmission_model::TransmissionKLBackgroundModel`).  The
 //! **counts** path uses the joint-Poisson conditional-binomial-deviance
-//! solver in [`crate::joint_poisson`] (memo 35 §P1/§P2), which replaces
-//! the older fixed-flux counts NLL that lived here before the P2.2 /
-//! counts-KL collapse.  The helpers [`CountsModel`] and
-//! [`CountsBackgroundScaleModel`] exposed from this module are retained
-//! for the Fisher-info research helper
-//! [`crate::lm`]-side `evaluate_jacobian_and_fisher` and the spatial-
-//! regularization prototype scripts (Epic #394); they are not part of
-//! the production fit path.
+//! solver in [`crate::joint_poisson`], which replaced the older
+//! fixed-flux counts NLL that lived here.  The helpers [`CountsModel`]
+//! and [`CountsBackgroundScaleModel`] exposed from this module are
+//! retained for the [`crate::lm`]-side `evaluate_jacobian_and_fisher`
+//! Fisher-information helper and for spatial-regularization research
+//! drivers; they are not part of the production fit path.
 //!
 //! ## TRINIDI Reference
 //! - `trinidi/reconstruct.py` — Poisson NLL and APGM optimizer
@@ -1139,13 +1137,13 @@ pub fn poisson_fit(
 /// The production counts-KL dispatch (`SolverConfig::PoissonKL` on
 /// `InputData::Counts` / `InputData::CountsWithNuisance`) goes through
 /// the joint-Poisson conditional-binomial-deviance path in
-/// [`crate::joint_poisson`] per memo 35 §P1/§P2.  `CountsModel` and
+/// [`crate::joint_poisson`].  `CountsModel` and
 /// [`CountsBackgroundScaleModel`] below are consumed only by
 /// `nereids_pipeline::pipeline::evaluate_jacobian_and_fisher` (the
 /// Fisher-info research helper used by the spatial-regularization
 /// epic #394) and by this module's `#[cfg(test)]` tests.  They assume
 /// the caller has pre-computed `flux = c · O` (i.e. `c` is baked into
-/// `flux` — the convention that memo 35 §P1 flagged as error-prone for
+/// `flux` — a convention that proved error-prone for
 /// end users, which is precisely why the production path no longer
 /// uses this struct).
 ///

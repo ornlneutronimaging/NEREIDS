@@ -155,7 +155,7 @@ fn extract_resonance_widths(resonance_data: &[&ResonanceData]) -> Vec<(f64, f64)
 /// global-minimum basin of the (sharply non-convex, post-#608) calibration χ²
 /// surface — a basin too thin for a cold start or grid scan to find reliably.
 ///
-/// **Deduplicated** (Copilot PR #609): two resonances at the same center energy
+/// **Deduplicated**: two resonances at the same center energy
 /// (e.g. across isotopes in a grouped fit) are a single POSITION for dip
 /// matching — multiplicity is irrelevant — and a duplicate would drive the
 /// minimum inter-resonance spacing, and hence the seed's `match_tol`, to 0,
@@ -2376,7 +2376,7 @@ mod tests {
         assert!(ok.is_ok(), "valid thickness should succeed: {ok:?}");
     }
 
-    /// Issue #608 (PR #609 coverage): the working-grid `*_from_base` path's
+    /// Issue #608: the working-grid `*_from_base` path's
     /// input validation — `validate_base_xs` shape errors and the unsorted-grid
     /// guard.  These error branches were untested (the temperature fit always
     /// supplies well-formed, sorted inputs).

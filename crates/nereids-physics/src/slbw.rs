@@ -515,7 +515,6 @@ mod tests {
             nereids_endf::resonance::test_support::u238_with_formalism(ResonanceFormalism::SLBW);
 
         let xs = slbw_cross_sections(&data, 6.674);
-        println!("SLBW capture at 6.674 eV: {} barns", xs.capture);
 
         // Same estimate as RM: ~22,000 barns.
         assert!(
@@ -558,11 +557,6 @@ mod tests {
 
             let rel_diff_cap =
                 (rm.capture - slbw.capture).abs() / rm.capture.max(slbw.capture).max(1e-10);
-
-            println!(
-                "E={:.3}: RM_cap={:.2}, SLBW_cap={:.2}, rel_diff={:.4}",
-                e, rm.capture, slbw.capture, rel_diff_cap
-            );
 
             // Near the peak, the formalisms should agree within ~5%.
             assert!(

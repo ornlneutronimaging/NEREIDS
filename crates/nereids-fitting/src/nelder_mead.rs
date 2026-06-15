@@ -1,12 +1,16 @@
 //! Bounded Nelder-Mead simplex minimizer.
 //!
 //! Derivative-free polish optimizer used after a gradient-based stage to
-//! escape stall points.  Memo 35 §P2.1 and EG5 establish that, for
-//! backgrounded counts-path fits, a single L-BFGS start frequently stalls
-//! at the initial guess (1/20 self-flagged convergence on the EG2 S1 C_full
-//! regime), while a Nelder-Mead polish from that stall point resolves the
-//! failure cleanly (10/20 convergence, density bias from −5.94% to +0.013%,
-//! D/DOF from 905 to 1.001).
+//! escape stall points.  Benchmarking of backgrounded counts-path fits on
+//! the synthetic counts benchmark established the need: a single L-BFGS
+//! start frequently stalls at the initial guess (1/20 self-flagged
+//! convergence on the hardest backgrounded regime tested), while a
+//! Nelder-Mead polish from that stall point resolves the failure cleanly
+//! (10/20 convergence, density bias from −5.94% to +0.013%, D/DOF from
+//! 905 to 1.001).  On real VENUS counts D saturates at 10⁴–10⁵ from
+//! un-modelled upstream physics and polish cannot self-terminate, which
+//! is why it is disabled by default — see
+//! `JointPoissonFitConfig::enable_polish` in `joint_poisson`.
 //!
 //! ## Algorithm
 //!
@@ -56,8 +60,8 @@ pub struct NelderMeadConfig {
 impl Default for NelderMeadConfig {
     fn default() -> Self {
         // Defaults match scipy.optimize.minimize(method='Nelder-Mead'):
-        // xatol = 1e-4, fatol = 1e-4.  For the polish regime described in
-        // EG5 we use tighter tolerances (1e-9 / 1e-10) on the caller side.
+        // xatol = 1e-4, fatol = 1e-4.  The counts-path polish regime uses
+        // tighter tolerances (1e-9 / 1e-10) on the caller side.
         Self {
             xatol: 1e-4,
             fatol: 1e-4,
@@ -80,8 +84,8 @@ pub struct NelderMeadResult {
     /// Total objective evaluations (including initial simplex).
     pub n_evals: usize,
     /// `true` if both `xatol` and `fatol` were satisfied before hitting
-    /// `max_iter`.  Per memo 35 §P2.3, acceptance should be judged from
-    /// the deviance value, not this flag.
+    /// `max_iter`.  Acceptance should be judged from the deviance
+    /// value, not this flag.
     pub self_converged: bool,
 }
 

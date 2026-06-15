@@ -425,7 +425,7 @@ struct PyFitResult {
     /// None when energy-scale fitting is not enabled.
     l_scale: Option<f64>,
     /// Conditional binomial deviance / (n − k).  `Some(...)` only for the
-    /// counts-KL dispatch (`solver="kl"` on counts input); memo 35 §P1.2.
+    /// counts-KL dispatch (`solver="kl"` on counts input).
     deviance_per_dof: Option<f64>,
 }
 
@@ -524,7 +524,7 @@ impl PyFitResult {
     }
 
     /// Conditional binomial deviance divided by (n − k) from the counts-KL
-    /// dispatch (joint-Poisson profile-deviance fitter per memo 35 §P1.2).
+    /// dispatch (joint-Poisson profile-deviance fitter).
     ///
     /// Primary goodness-of-fit statistic for ``solver="kl"`` on counts
     /// data — replaces the fixed-flux Pearson χ² that scaled with ``c``.
@@ -615,8 +615,8 @@ struct PySpatialResult {
     density_maps: Vec<Py<PyArray2<f64>>>,
     uncertainty_maps: Vec<Py<PyArray2<f64>>>,
     chi_squared_map: Py<PyArray2<f64>>,
-    /// Counts-KL conditional binomial deviance / (n − k) per pixel
-    /// (memo 35 §P1.2).  None for transmission-only and LM-only runs.
+    /// Counts-KL conditional binomial deviance / (n − k) per pixel.
+    /// None for transmission-only and LM-only runs.
     deviance_per_dof_map: Option<Py<PyArray2<f64>>>,
     converged_map: Py<PyArray2<bool>>,
     n_converged: usize,
@@ -673,7 +673,7 @@ impl PySpatialResult {
     /// Counts-KL conditional binomial deviance per degree of freedom.
     ///
     /// Primary goodness-of-fit for ``solver="kl"`` on counts data
-    /// (memo 35 §P1.2 — replaces the fixed-flux Pearson that scaled
+    /// (replaces the fixed-flux Pearson that scaled
     /// with ``c``).  Returns ``None`` for LM fits and transmission +
     /// PoissonKL; those populate ``chi_squared_map`` with Pearson χ² /
     /// (n − k) instead.
@@ -2823,7 +2823,7 @@ fn parse_solver_config(
 /// `py_spatial_map_typed`, `py_fit_spectrum_typed`, and
 /// `py_fit_counts_spectrum_typed`.
 ///
-/// Issue #458 (Copilot review on PR #461): without these checks, NaN /
+/// Issue #458: without these checks, NaN /
 /// Inf / non-positive values flowed into
 /// `EnergyScaleTransmissionModel::corrected_energies`, which divides
 /// by TOF values derived from `flight_path_m`.  Garbage inputs yielded
@@ -3341,7 +3341,7 @@ fn py_spatial_map_typed<'py>(
             });
     }
 
-    // Polish override (memo 35 §P2.1; memo 38 §6).  None = auto-disable
+    // Polish override.  None = auto-disable
     // when n_pixels > 1 inside spatial_map_typed.
     if let Some(v) = enable_polish {
         config = config.with_counts_enable_polish(Some(v));
@@ -3349,8 +3349,8 @@ fn py_spatial_map_typed<'py>(
 
     // Energy-scale calibration (SAMMY TZERO equivalent).  Required for
     // real VENUS data — without it, sharp resonances are offset ~0.5 us
-    // in TOF and per-pixel chi2 explodes (see memo on NEREIDS↔SAMMY
-    // parity for VENUS Hf 120min).
+    // in TOF and per-pixel chi2 explodes (observed on the VENUS Hf
+    // 120min NEREIDS↔SAMMY parity comparison).
     if fit_energy_scale {
         validate_energy_scale_params(t0_init_us, l_scale_init, energy_scale_flight_path_m)?;
         config = config.with_energy_scale(t0_init_us, l_scale_init, energy_scale_flight_path_m);
@@ -3671,7 +3671,7 @@ fn py_fit_counts_spectrum_typed<'py>(
     }
     // Attach CountsBackgroundConfig whenever any of its fields deviates from
     // the default — including c, which is the explicit proton-charge ratio
-    // (memo 35 §P1.3) consumed by the counts-KL (joint-Poisson) dispatch.
+    // consumed by the counts-KL (joint-Poisson) dispatch.
     if fit_alpha_1
         || fit_alpha_2
         || alpha_1_init != 1.0

@@ -42,7 +42,7 @@ fn max_hybrid_err(a: &[f64], b: &[f64]) -> f64 {
 /// k = 1 grouped case: the cubature should match the exact
 /// `ResolutionMatrix @ exp(-n σ)` forward output to LP precision at
 /// the training densities, and produce bounded error at held-out
-/// densities inside the training box.  Codex04's 20-seed KL
+/// densities inside the training box.  The design study's 20-seed KL
 /// follow-up showed 1.27× scatter inflation on grouped-Hf k=1 — this
 /// test does not re-measure that; it only checks forward-model
 /// correctness.
@@ -91,7 +91,7 @@ fn cubature_venus_like_k1_forward_equivalence() {
     }
 
     // At held-out density (VENUS production ~ 1.6e-4), bounded
-    // error.  Codex04's real-VENUS Hf aggregated fit showed a density
+    // error.  The design study's real-VENUS Hf aggregated fit showed a density
     // shift of 1.66e-4 relative — which means forward error at the
     // optimum is at least that small.  Here we allow 1e-3 max abs
     // error as a generous ceiling; the actual value on the
@@ -122,7 +122,7 @@ fn cubature_venus_like_k1_forward_equivalence() {
 /// VENUS-like regression test for the Chebyshev scalar surrogate on
 /// the 3471-bin VENUS production grid with synthetic Hf-like σ.
 /// Asserts forward accuracy ≤ 1e-5 at VENUS density (issue #475
-/// success criterion) and logs per-call wall time.  PR #475 benched
+/// success criterion) and logs per-call wall time.  A bench-off ran
 /// this against a Lanczos σ-pushforward Gauss quadrature on the
 /// same kernel and picked Chebyshev — it won on both accuracy
 /// (≤ 2e-15 vs ≤ 4e-15) and wall-time.  Exact speedup ratios are
@@ -156,7 +156,7 @@ fn scalar_chebyshev_venus_like_k1_regression() {
         .collect();
 
     // Training box: 2 × VENUS density.  M = 16 Chebyshev nodes —
-    // PR #475 bench showed this achieves 1e-15 forward accuracy on
+    // a bench run showed this achieves 1e-15 forward accuracy on
     // the whole box.
     let n_max = 2e-4_f64;
     let t_build = std::time::Instant::now();

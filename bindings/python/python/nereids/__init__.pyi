@@ -165,8 +165,8 @@ class FitResult:
         dispatch (joint-Poisson profile-deviance fitter).
 
         Primary goodness-of-fit for ``solver='kl'`` (or the
-        ``'poisson'`` / ``'joint_poisson'`` aliases) on counts data,
-        per memo 35 §P1.2 — replaces the fixed-flux Pearson chi-squared
+        ``'poisson'`` / ``'joint_poisson'`` aliases) on counts data —
+        replaces the fixed-flux Pearson chi-squared
         that scaled with ``c``.  ``None`` for LM fits and for
         transmission + PoissonKL (those populate
         ``reduced_chi_squared`` with Pearson chi-squared / (n - k)).
@@ -245,8 +245,8 @@ class SpatialResult:
 
     @property
     def deviance_per_dof_map(self) -> NDArray[np.float64] | None:
-        """Counts-KL conditional binomial deviance / (n − k) per pixel
-        (memo 35 §P1.2).  ``None`` for LM-only runs and for transmission +
+        """Counts-KL conditional binomial deviance / (n − k) per pixel.
+        ``None`` for LM-only runs and for transmission +
         PoissonKL (those populate ``chi_squared_map`` with Pearson χ²/dof)."""
         ...
 
@@ -861,8 +861,10 @@ def spatial_map_typed(
 
     Dispatches per-pixel fitting based on InputData type:
       - from_counts / from_counts_with_nuisance + solver="kl" / "auto"
-        -> counts-KL (joint-Poisson deviance) — the counts-path solver
-        validated in memo 35 §P1/§P2 and memo 38.
+        -> counts-KL (joint-Poisson deviance) — the counts-path solver,
+        validated against synthetic counts benchmarks and locked by a
+        real-VENUS counts regression test on the committed aggregated-Hf
+        fixture.
       - from_transmission + solver="lm" (default for transmission) -> LM.
       - from_transmission + solver="kl" -> Poisson NLL on transmission values
         (legacy niche).
@@ -881,12 +883,12 @@ def spatial_map_typed(
             are set (BackF's Jacobian column zeros out at BackD ≈ 0,
             and BackD becomes a constant duplicate of BackA at
             BackF ≈ 0).
-        c: Proton-charge ratio ``Q_s / Q_ob`` for the counts-KL dispatch
-            (memo 35 §P1.3).  Default 1.0 (assumes caller PC-normalized
+        c: Proton-charge ratio ``Q_s / Q_ob`` for the counts-KL dispatch.
+            Default 1.0 (assumes caller PC-normalized
             the flux already).  Ignored for LM / transmission-KL paths.
         enable_polish: Override the Nelder-Mead polish flag.  ``None``
             (default) = the dispatcher auto-disables polish when
-            ``n_pixels > 1`` (memo 38 §6 — polish costs ~1000 s per pixel
+            ``n_pixels > 1`` (polish costs ~1000 s per pixel
             on realistic data).  ``True`` forces polish on, ``False`` off.
         fit_energy_scale: Fit per-pixel SAMMY TZERO calibration
             (t0 and L_scale).  Required for real VENUS data to match SAMMY
@@ -1001,8 +1003,7 @@ def fit_counts_spectrum_typed(
 
     - ``'auto'`` (default), ``'kl'``, ``'poisson'``, and ``'joint_poisson'``
       all route to the **counts-KL dispatch**: the joint-Poisson profile
-      binomial-deviance fitter (memo 35 §P1/§P2; collapsed to a single
-      path in this PR).  Uses the explicit proton-charge ratio
+      binomial-deviance fitter.  Uses the explicit proton-charge ratio
       ``c = Q_s / Q_ob`` from the ``c`` kwarg and populates
       ``FitResult.deviance_per_dof`` as the primary GOF.
       ``'joint_poisson'`` is kept as a compatibility alias; prefer ``'kl'``
@@ -1038,7 +1039,7 @@ def fit_counts_spectrum_typed(
         alpha_1_init: Initial value for alpha_1 (default 1.0); only
             consumed by the research Fisher helper.
         alpha_2_init: Initial value for alpha_2 (default 1.0); same.
-        c: Proton-charge ratio ``Q_s / Q_ob`` (memo 35 §P1.3).  Default
+        c: Proton-charge ratio ``Q_s / Q_ob``.  Default
             1.0 assumes the caller has already PC-normalized the flux.
             For raw VENUS-style counts, set this to the actual ratio
             (typically ~5–6).  Used by the counts-KL dispatch; ignored

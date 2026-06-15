@@ -40,7 +40,7 @@ pub struct SpatialResult {
     /// NaN at pixels where `converged_map` is `false`.
     pub uncertainty_maps: Vec<Array2<f64>>,
     /// Reduced chi-squared map.  For the counts-KL dispatch (joint-Poisson
-    /// deviance per memo 35 §P1.2) this is back-compat-mirrored to
+    /// deviance) this is back-compat-mirrored to
     /// `D/(n−k)`; the semantically-correct per-pixel value is also
     /// exposed as [`Self::deviance_per_dof_map`].
     /// NaN at pixels where `converged_map` is `false`.
@@ -72,8 +72,8 @@ pub struct SpatialResult {
     /// the SAMMY 6-term form
     /// `bg(E) = BackA + BackB/√E + BackC·√E + BackD·exp(-BackF/√E)`.
     /// Both LM-transmission and counts-KL paths use these semantics
-    /// (legacy alpha-fitting `[b0, b1, alpha_2]` layout was retired with
-    /// `fit_counts_poisson` in PR #450).
+    /// (legacy alpha-fitting `[b0, b1, alpha_2]` layout was retired
+    /// together with `fit_counts_poisson`).
     ///
     /// The exponential `BackD`/`BackF` terms are surfaced separately
     /// in [`Self::back_d_map`] / [`Self::back_f_map`] — both `None`
@@ -172,7 +172,7 @@ impl InputData3D<'_> {
 /// Dispatches per-pixel fitting based on the `InputData3D` variant:
 /// - **Transmission**: per-pixel LM (or KL, opt-in) on transmission values.
 /// - **Counts**: per-pixel counts-KL dispatch (joint-Poisson conditional
-///   binomial deviance per memo 35 §P1) on the sample cube, paired
+///   binomial deviance) on the sample cube, paired
 ///   against the **spatially-averaged open-beam flux**.  See the inline
 ///   comment on `averaged_flux` for the rationale: this is a deliberate
 ///   bias-variance trade that reduces per-pixel OB shot-noise at the
@@ -183,7 +183,7 @@ impl InputData3D<'_> {
 ///   caller-supplied per-pixel flux and background cubes.  No averaging.
 ///
 /// Always returns [`SpatialResult`].
-/// Apply the multi-pixel polish auto-disable rule (memo 38 §6).
+/// Apply the multi-pixel polish auto-disable rule.
 ///
 /// For `n_pixels > 1`, return a config with `counts_enable_polish`
 /// forced to `Some(false)` UNLESS the caller already set an explicit
@@ -318,7 +318,7 @@ fn validate_spatial_fit_preflight(
                 return Err(PipelineError::InvalidParameter(
                     "joint-Poisson solver does not support fit_alpha_1/fit_alpha_2: \
                      the profile lambda-hat absorbs the global flux scale (alpha_1 redundant); \
-                     alpha_2 / B_det wiring is deferred to memo 35 §P3."
+                     alpha_2 / B_det wiring is not yet implemented."
                         .into(),
                 ));
             }
@@ -341,9 +341,8 @@ fn validate_spatial_fit_preflight(
         {
             return Err(PipelineError::InvalidParameter(
                 "joint-Poisson transmission_background: B_A (fit_back_a) must be \
-                 enabled whenever any of B_B / B_C is enabled (memo 35 §P2.2 — \
-                 A_n alone cannot absorb a constant offset; EG2 S2 C_An → −23% \
-                 density bias)."
+                 enabled whenever any of B_B / B_C is enabled (A_n alone cannot \
+                 absorb a constant offset — benchmarked at −23% density bias)."
                     .into(),
             ));
         }
@@ -535,6 +534,67 @@ fn validate_spatial_data_values(
     Ok(())
 }
 
+/// Fit every pixel of a 3-D data cube and return per-pixel maps — the
+/// spatial-mapping entry point of the pipeline.
+///
+/// Runs the single-spectrum fitter once per `(y, x)` pixel of `input`
+/// (shape `(n_energies, height, width)`), in parallel over pixels with
+/// rayon, and assembles the results into [`SpatialResult`]: one areal
+/// density map and uncertainty map per fitted isotope/group, the χ²
+/// (or deviance-per-dof) map, the convergence mask, and any optional
+/// maps the configuration enables (temperature, normalization,
+/// background terms, t0 / flight-path scale).
+///
+/// # Input modes
+///
+/// `input` selects the per-pixel objective: pre-normalized
+/// [`InputData3D::Transmission`] (+ per-bin uncertainty),
+/// [`InputData3D::Counts`] (sample + open-beam), or
+/// [`InputData3D::CountsWithNuisance`] (sample + flux + background
+/// nuisance arms; counts-domain solvers only).
+///
+/// # Validation (all up-front, before any pixel is fitted)
+///
+/// * The cube's spectral axis must match `config.energies()`, the
+///   mode's companion cubes must match the primary cube's shape, and
+///   `dead_pixels` (when given) must be `(height, width)`.
+/// * Cube *values* are validated on live pixels, each against its
+///   domain — transmission finite, uncertainty finite and strictly
+///   positive, counts/flux finite and non-negative, background finite —
+///   so a corrupt cube fails loudly instead of producing a quietly-NaN
+///   map.  For transmission inputs
+///   with a `fit_energy_range`, the value checks are scoped to the
+///   active bins — out-of-range bins may contain NaN by design.
+/// * Known-degenerate configurations are rejected with a diagnostic
+///   rather than letting every pixel fail into an all-NaN map:
+///   counts + LM + `fit_energy_scale` (numerically ill-conditioned
+///   per-pixel — issue #458 B3), `fit_energy_scale` together with
+///   `fit_temperature` (mutually exclusive model paths), and
+///   `CountsWithNuisance` with an LM solver (requires a counts-domain
+///   solver).  `transmission_background` settings are validated here
+///   for the same reason.
+///
+/// Per-pixel fit *failures* after validation are not errors: the pixel
+/// is recorded as NaN in the maps, `converged_map` is `false` there,
+/// and `n_failed` counts it.
+///
+/// # Cancellation and progress
+///
+/// `cancel` is polled before the sweep and at every pixel; once set,
+/// remaining pixels are skipped and the call returns
+/// [`PipelineError::Cancelled`] (partial results are discarded).
+/// `progress` is incremented once per completed live pixel, so a UI
+/// thread can poll it against the number of live pixels
+/// (`height × width` minus the `dead_pixels`-masked count).
+///
+/// # Errors
+///
+/// [`PipelineError::ShapeMismatch`] for axis/shape disagreements,
+/// [`PipelineError::InvalidParameter`] for rejected configurations and
+/// invalid cube values, [`PipelineError::Transmission`] when the shared
+/// cross-section / resolution-plan precompute fails (e.g. a
+/// resolution-kernel or working-grid build error), and
+/// [`PipelineError::Cancelled`] when `cancel` was set.
 pub fn spatial_map_typed(
     input: &InputData3D<'_>,
     config: &UnifiedFitConfig,
@@ -638,10 +698,10 @@ pub fn spatial_map_typed(
         ));
     }
 
-    // Issue #458 (Codex review): `fit_energy_scale` + `fit_temperature`
+    // Issue #458: `fit_energy_scale` + `fit_temperature`
     // is not a supported combination — `EnergyScaleTransmissionModel`
-    // and the temperature-fitting path are mutually exclusive at the
-    // single-spectrum fitter (`pipeline.rs:830, 976, 1183`).  Without
+    // and the temperature-fitting path are mutually exclusive in every
+    // solver dispatch arm of `fit_spectrum_typed`.  Without
     // this spatial-layer guard, every per-pixel call would error and
     // `spatial_map_typed` would report `n_failed == n_total` with an
     // all-NaN map — a silently-failed map is worse than a clear error.
@@ -797,7 +857,7 @@ pub fn spatial_map_typed(
     }
     if pixel_coords.is_empty() {
         // All pixels filtered out (typically by `dead_pixels` mask).  Per
-        // the NaN-on-failure contract (issue #458 B1 + Copilot review),
+        // the NaN-on-failure contract (issue #458 B1),
         // every parameter map must be NaN at every pixel — including
         // density, which was previously initialised with zeros here.
         // `converged_map` is all `false`, which is the caller's signal
@@ -1071,7 +1131,7 @@ pub fn spatial_map_typed(
                 // the same error variant whether or not
                 // `precomputed_cross_sections` is cached (the non-
                 // cached path already surfaces this via
-                // `broadened_cross_sections`).  Copilot #7.
+                // `broadened_cross_sections`).
                 Some(res) => build_resolution_plan(config.energies(), res)
                     .map_err(|e| {
                         PipelineError::Transmission(
@@ -1094,16 +1154,15 @@ pub fn spatial_map_typed(
     //   * no resolution plan (Gaussian or missing);
     //   * temperature or energy-scale fitting is active (σ / grid
     //     can change at runtime, invalidating atoms);
-    //   * k == 1 (scalar fast-path is PR #475's scope);
+    //   * k == 1 (handled by the separate scalar surrogate plan below);
     //   * xs is not pre-collapsed to per-group σ (cubature needs the
     //     final σ stack, not per-isotope σ × ratios).
     // Capture any caller-supplied cubature plan BEFORE the local
     // rebuild pathway — the `with_precomputed_cross_sections` setter
     // clears `precomputed_sparse_cubature_plan` as a defence against
-    // stale-XS dispatch (Codex round-3 P3 on PR #480), so without
-    // this snapshot a plan the caller attached via
-    // `UnifiedFitConfig::with_precomputed_sparse_cubature_plan` would
-    // be dropped and lost on every call.  Codex round-5 P3 on PR #480.
+    // stale-XS dispatch, so without this snapshot a plan the caller
+    // attached via `UnifiedFitConfig::with_precomputed_sparse_cubature_plan`
+    // would be dropped and lost on every call.
     let caller_cubature = config.precomputed_sparse_cubature_plan().cloned();
     let sparse_cubature_plan: Option<Arc<nereids_physics::surrogate::SparseEmpiricalCubaturePlan>> =
         if !config.fit_temperature()
@@ -1136,7 +1195,7 @@ pub fn spatial_map_typed(
                 // different σ mutation after this point, or the
                 // collapse stops running first, the builder will
                 // receive wrong σ and this assertion catches it in
-                // debug builds.  Codex/Claude round-1 P2 on PR #480.
+                // debug builds.
                 debug_assert_eq!(
                     sigmas_flat.len(),
                     k * n_rows,
@@ -1145,8 +1204,8 @@ pub fn spatial_map_typed(
                     sigmas_flat.len(),
                 );
                 // Training box: 2 × the initial density — same convention
-                // the codex04 reference uses.  Anchor at the midpoint
-                // (0.5 × train_max).
+                // the design study's reference implementation uses.
+                // Anchor at the midpoint (0.5 × train_max).
                 //
                 let train_max: Vec<f64> = config
                     .initial_densities()
@@ -1174,7 +1233,6 @@ pub fn spatial_map_typed(
                         // to fire when a fit iterate escapes the
                         // trained region — rather than silently
                         // running the surrogate out-of-domain.
-                        // Codex round-4 P1 on PR #480.
                         Some(Arc::new(plan.with_density_box(train_max.clone())))
                     }
                     Err(e) => {
@@ -1183,8 +1241,7 @@ pub fn spatial_map_typed(
                         // continue via the exact path, but a missing
                         // cubature on a supposedly-eligible call is
                         // a debugging signal that deserves
-                        // visibility.  Codex/Claude round-1 P2 on
-                        // PR #480.
+                        // visibility.
                         eprintln!(
                             "spatial_map_typed: sparse cubature build failed ({e}); \
                              falling back to exact ResolutionPlan path for this call",
@@ -1219,7 +1276,7 @@ pub fn spatial_map_typed(
     // isotope).  Reuses the compiled ResolutionMatrix from the
     // resolution plan.  Falls back silently on build failure; no
     // local plan means the exact `apply_resolution_with_plan` path
-    // runs as today.  PR #475 benched both Lanczos σ-pushforward
+    // runs as today.  A bench-off compared Lanczos σ-pushforward
     // Gauss quadrature and Chebyshev-in-density on real VENUS
     // (3471-bin production grid); Chebyshev won on both the
     // accuracy (≤ 2e-15 vs ≤ 4e-15) and wall-time axes.  Lanczos
@@ -1235,8 +1292,8 @@ pub fn spatial_map_typed(
             && xs.len() == 1
         {
             let sigma_row = &xs[0];
-            // Chebyshev-in-density at M = 16 (PR #475 bench-off
-            // winner).  Training box: 2 × the initial density;
+            // Chebyshev-in-density at M = 16 (bench-off winner).
+            // Training box: 2 × the initial density;
             // Chebyshev's interpolant is exact at its nodes and
             // tight (≤ 1e-15 rel err) across a well-chosen box.
             //
@@ -1246,7 +1303,7 @@ pub fn spatial_map_typed(
             // build's midpoint self-check fires and returns
             // `InsufficientAccuracyOnBox`; we log and fall back
             // to the exact path rather than install a plan that
-            // could corrupt the fit.  Codex PR #475 round-2 P2.
+            // could corrupt the fit.
             //
             const CHEBYSHEV_NODES: usize = 16;
             let n_max: f64 = 2.0 * config.initial_densities()[0].max(1e-6);
@@ -1272,7 +1329,7 @@ pub fn spatial_map_typed(
     // Grid-identity check uses `to_bits()` per element (matches
     // `scalar_eligible` / `cubature_eligible`), not `==`, so `-0.0`
     // vs `+0.0` and NaN-bit mismatches can't silently slip through
-    // the caller-fallback pre-filter.  Claude round-1 P2 on PR #475.
+    // the caller-fallback pre-filter.
     let sparse_scalar_plan = sparse_scalar_plan.or_else(|| {
         caller_scalar.filter(|p| {
             let expected_len = xs.first().map(|r| r.len()).unwrap_or(0);
@@ -1295,9 +1352,14 @@ pub fn spatial_map_typed(
     // This avoids 74× overhead from redundant Reich-Moore evaluation per
     // KL iteration (112ms Reich-Moore vs 1.5ms Doppler rebroadening).
     let fast_config = if config.fit_temperature() {
+        // Bare `?`: the `From<TransmissionError>` impl maps
+        // `TransmissionError::Cancelled` to `PipelineError::Cancelled`,
+        // keeping the documented uniform-Cancelled contract when the user
+        // cancels during this (expensive) Reich-Moore precompute.  A
+        // `.map_err(PipelineError::Transmission)` here would bypass that
+        // conversion and surface cancellation as an error.
         let base_xs: Vec<Vec<f64>> =
-            unbroadened_cross_sections(config.energies(), config.resonance_data(), cancel)
-                .map_err(PipelineError::Transmission)?;
+            unbroadened_cross_sections(config.energies(), config.resonance_data(), cancel)?;
         let mut cfg = config
             .clone()
             .with_precomputed_cross_sections(xs)
@@ -1344,7 +1406,7 @@ pub fn spatial_map_typed(
     };
 
     // Auto-disable Nelder-Mead polish for multi-pixel counts-KL spatial
-    // maps (memo 38 §6 recommendation).  Polish is a single-spectrum
+    // maps.  Polish is a single-spectrum
     // research knob — on the VENUS Hf 120min aggregated fit it took
     // ~1 000 s; at 512 × 512 pixels that is untenable even with rayon.
     // Per-pixel fits also rarely hit the over-parameterized stall regime
@@ -1933,24 +1995,128 @@ mod tests {
             uncertainty: u_3d.view(),
         };
 
-        let cancel = AtomicBool::new(false);
-        let progress = AtomicUsize::new(0);
+        // The watcher race is inherently lossy: on a fast or oversubscribed
+        // runner the whole 64-pixel sweep (and the post-loop cancel check)
+        // can finish before the watcher thread's store becomes visible, in
+        // which case the run observed no cancellation at all and a COMPLETE
+        // Ok map is the correct output.  That outcome carries no information
+        // about the regression under test, so it retries; the regression —
+        // a PARTIAL Ok map (cancellation observed mid-loop but swallowed) —
+        // fails immediately on any attempt.
+        let mut saw_cancelled = false;
+        for _attempt in 0..5 {
+            let cancel = AtomicBool::new(false);
+            let progress = AtomicUsize::new(0);
 
-        let result = std::thread::scope(|s| {
-            // Watcher: once at least one pixel has finished, request
-            // cancellation while the rest are still being fit.
-            s.spawn(|| {
-                while progress.load(Ordering::Relaxed) < 1 {
-                    std::hint::spin_loop();
+            let result = std::thread::scope(|s| {
+                // Watcher: once at least one pixel has finished, request
+                // cancellation while the rest are still being fit.
+                s.spawn(|| {
+                    while progress.load(Ordering::Relaxed) < 1 {
+                        // yield instead of spinning: on a fully subscribed
+                        // CI box a busy-spin can be starved for the whole
+                        // sweep, losing the race every time.
+                        std::thread::yield_now();
+                    }
+                    cancel.store(true, Ordering::Relaxed);
+                });
+                spatial_map_typed(&input, &config, None, Some(&cancel), Some(&progress))
+            });
+
+            match result {
+                Err(PipelineError::Cancelled) => {
+                    saw_cancelled = true;
+                    break;
                 }
+                Ok(r) if r.n_converged == r.n_total && r.n_failed == 0 => {
+                    // Sweep finished before the flip became visible —
+                    // inconclusive; try again.
+                    continue;
+                }
+                other => panic!(
+                    "mid-run cancellation must return Err(Cancelled) (or lose \
+                     the race with a COMPLETE map), got {other:?}"
+                ),
+            }
+        }
+        assert!(
+            saw_cancelled,
+            "all 5 attempts completed the whole sweep before the cancellation \
+             flip became visible — enlarge the pixel grid for this runner"
+        );
+    }
+
+    /// Cancellation during the `fit_temperature` precompute must surface
+    /// as `Err(Cancelled)`, not `Err(Transmission(Cancelled))`.
+    ///
+    /// The expensive Reich-Moore base-XS precompute
+    /// (`unbroadened_cross_sections`) polls `cancel` internally and
+    /// returns `TransmissionError::Cancelled`; the documented contract is
+    /// that every cancellation path yields `PipelineError::Cancelled`
+    /// (the `From<TransmissionError>` impl performs that mapping — a
+    /// `.map_err(PipelineError::Transmission)` on the call site would
+    /// bypass it and turn a clean user cancel into an error toast).
+    ///
+    /// Window engineering, so the flip deterministically lands inside
+    /// the `unbroadened_cross_sections` call rather than some other
+    /// (already correctly mapped) cancellation poll: the caller supplies
+    /// precomputed broadened cross-sections, which removes the earlier
+    /// expensive broadened-XS window entirely, and the energy grid is
+    /// dense enough that the base-XS precompute takes tens of
+    /// milliseconds while the watcher flips `cancel` a few ms in.
+    /// Wherever the flip lands the correct result is `Err(Cancelled)`,
+    /// so the assertion can never flake — only the discrimination
+    /// margin varies.  (Mutation-checked: restoring the `map_err` makes
+    /// this test fail.)
+    #[test]
+    fn test_fit_temperature_precompute_cancellation_maps_to_cancelled() {
+        use std::sync::atomic::AtomicBool;
+
+        let data = u238_single_resonance();
+        // Dense grid: make the base-XS (Reich-Moore) precompute long
+        // enough that a few-ms cancel lands inside it on any realistic
+        // machine.
+        let n_e = 100_001usize;
+        let energies: Vec<f64> = (0..n_e).map(|i| 1.0 + (i as f64) * 2e-4).collect();
+        let (t_3d, u_3d) = synthetic_grid_transmission(&data, 0.0005, &energies, 2, 2);
+
+        // Caller-supplied broadened XS (values irrelevant — the fit is
+        // cancelled before any pixel is evaluated) skip the broadened
+        // precompute, so the only long-running pre-sweep stage left is
+        // the fit_temperature base-XS precompute under test.
+        let precomputed_xs = vec![vec![0.0f64; n_e]];
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            293.6,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
+        .with_fit_temperature(true)
+        .with_precomputed_cross_sections(precomputed_xs.into());
+
+        let input = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+
+        let cancel = AtomicBool::new(false);
+        let result = std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(5));
                 cancel.store(true, Ordering::Relaxed);
             });
-            spatial_map_typed(&input, &config, None, Some(&cancel), Some(&progress))
+            spatial_map_typed(&input, &config, None, Some(&cancel), None)
         });
 
         assert!(
             matches!(result, Err(PipelineError::Cancelled)),
-            "mid-run cancellation must return Err(Cancelled), got {result:?}"
+            "cancellation during the fit_temperature precompute must map to \
+             Err(Cancelled), got {result:?}"
         );
     }
 
@@ -2071,7 +2237,7 @@ mod tests {
         }
     }
 
-    /// Issue #608 (R4): the GAUSSIAN-resolution spatial path — `spatial_map_typed`'s
+    /// Issue #608: the GAUSSIAN-resolution spatial path — `spatial_map_typed`'s
     /// `aux_grid_active` branch (work σ via `broadened_cross_sections_on_working_grid`,
     /// per-pixel injection through `with_precomputed_work_cross_sections`) plus
     /// `build_transmission_model`'s working-grid selection — is the bulk of the
@@ -2186,7 +2352,7 @@ mod tests {
         }
     }
 
-    /// Issue #608 (PR #609 coverage): `spatial_map_typed`'s `Some(cached)` +
+    /// Issue #608: `spatial_map_typed`'s `Some(cached)` +
     /// aux-grid arm — when a caller PRE-SUPPLIES data-grid σ AND a Gaussian aux
     /// grid is active, the working-grid σ is recomputed from resonance data (the
     /// cached data σ cannot be de-extracted back onto the aux grid).  The
@@ -3652,7 +3818,7 @@ mod tests {
     }
 
     /// `fit_energy_scale + fit_temperature` must be rejected at
-    /// spatial entry (Codex review follow-up to #458).  The
+    /// spatial entry (follow-up to #458).  The
     /// single-spectrum fitter errors on this combination, but without
     /// a spatial-layer guard every pixel would error and
     /// `spatial_map_typed` would silently return `n_failed == n_total`
@@ -3930,7 +4096,7 @@ mod tests {
             open_beam_counts: ob.view(),
         };
         // B_B fitted but B_A not fitted is rejected by the
-        // joint-Poisson dispatch (memo 35 §P2.2): A_n alone cannot
+        // joint-Poisson dispatch: A_n alone cannot
         // absorb a constant offset.  Test the B_B branch; the B_C
         // branch shares the same code path.
         let bg = crate::pipeline::BackgroundConfig {

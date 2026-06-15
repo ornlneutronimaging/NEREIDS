@@ -575,7 +575,7 @@ mod tests {
                     let den = 105.0 - 45.0 * rho2 + rho4;
                     rho - (num / den).atan()
                 }
-                _ => unreachable!(),
+                _ => unreachable!("old_phase reference covers l = 1..=4 only"),
             }
         }
 

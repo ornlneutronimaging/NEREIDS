@@ -57,8 +57,9 @@
 //! | anything else           | hard error    |
 //!
 //! The "missing → assume ns" fallback preserves backward compatibility
-//! with the rustpix producer (`scripts/fixtures/extract_venus_hf_nexus.py`)
-//! which writes nanoseconds without a `units` attribute.  Any file
+//! with the rustpix producer and the maintainers' VENUS fixture
+//! extraction tooling, which write nanoseconds without a `units`
+//! attribute.  Any file
 //! that *does* set `units` is parsed strictly: an unrecognised value
 //! is rejected rather than silently mis-scaled.  This closes a
 //! 1000× silent-rescale bug on `units = "us"` (issue #554).
@@ -81,8 +82,8 @@ use crate::error::IoError;
 /// an error rather than silently mis-scaling.
 fn tof_scale_to_us(units: Option<&str>) -> Result<f64, IoError> {
     match units {
-        // Absent attribute — rustpix legacy default.  The repository's
-        // own producers (`scripts/fixtures/extract_venus_hf_nexus.py`)
+        // Absent attribute — rustpix legacy default.  The project's own
+        // fixture producers (the maintainers' VENUS extraction tooling)
         // write nanoseconds without a `units` attribute, so we
         // preserve that contract for backward compatibility.
         None => Ok(1e-3),
@@ -119,7 +120,7 @@ fn tof_scale_to_us(units: Option<&str>) -> Result<f64, IoError> {
 /// catching any error from [`Location::attr`]) so that genuine HDF5
 /// errors — corrupt file, permission denied, internal failure —
 /// surface as [`IoError::InvalidParameter`] instead of silently
-/// becoming "attribute missing".  This was a latent bug pre-Round 2:
+/// becoming "attribute missing".  This was a latent bug:
 /// the previous implementation mapped *every* `attr()` failure to
 /// `Ok(None)`, including non-"not found" errors.
 fn read_string_attr(loc: &hdf5::Location, name: &str) -> Result<Option<String>, IoError> {
@@ -346,11 +347,11 @@ pub fn load_nexus_histogram_with_mode(
     }
 
     // Validate the rotation-angle policy BEFORE reading the full 4D
-    // counts dataset (Codex review on PR-B): the check is purely
-    // metadata-driven and the rejection paths should be cheap.  Reading
-    // the full u64 cube just to error out is wasteful on production
-    // multi-angle NeXus files (easily multi-GB), and historically
-    // caused OOM-before-error on the default "refuse" code path.
+    // counts dataset: the check is purely metadata-driven and the
+    // rejection paths should be cheap.  Reading the full u64 cube just
+    // to error out is wasteful on production multi-angle NeXus files
+    // (easily multi-GB), and historically caused OOM-before-error on
+    // the default "refuse" code path.
     let n_rot = shape[0];
     if n_rot == 0 {
         // Degenerate file with a zero-sized rotation-angle axis.
@@ -395,10 +396,10 @@ pub fn load_nexus_histogram_with_mode(
         _ => {}
     }
 
-    // Read only the rotation-angle slice(s) the caller actually needs
-    // (Copilot review on PR-B).  Reading the full 4D cube when the
-    // caller wants one projection is wasteful on production
-    // multi-angle files (multi-GB per acquisition).
+    // Read only the rotation-angle slice(s) the caller actually needs.
+    // Reading the full 4D cube when the caller wants one projection is
+    // wasteful on production multi-angle files (multi-GB per
+    // acquisition).
     //
     // - `Error` is guaranteed to have `n_rot == 1` (validated above),
     //   so we hyperslab-read the single projection.
@@ -679,10 +680,10 @@ pub fn load_nexus_events(
 /// attribute is unparseable, the TOF axis is dropped entirely
 /// (returned as `None`) rather than silently propagated at the wrong
 /// scale, matching the function's "any failure → no data for that
-/// field" contract.  Round 2 review (PR #561) found that the
-/// previous implementation returned the raw values verbatim — a
-/// silent 1000× error for any file written with `units = "us"`,
-/// symmetric with the load-path bug closed by issue #554.
+/// field" contract.  The previous implementation returned the raw
+/// values verbatim — a silent 1000× error for any file written with
+/// `units = "us"`, symmetric with the load-path bug closed by issue
+/// #554.
 fn probe_histogram_group(entry: &hdf5::Group) -> (bool, Option<[usize; 4]>, Option<Vec<f64>>) {
     let hist = match entry.group("histogram") {
         Ok(g) => g,
@@ -983,7 +984,7 @@ mod tests {
         }
     }
 
-    /// Round 2 review: `probe_nexus` must respect the `units`
+    /// `probe_nexus` must respect the `units`
     /// attribute on `time_of_flight` the same way `load_nexus_histogram`
     /// does.  A file written with `units = "us"` must surface µs
     /// values verbatim through the probe (no 1000× silent rescale).
@@ -1385,7 +1386,7 @@ mod tests {
         );
     }
 
-    /// Codex review: `MultiAngleMode::Error` must reject multi-angle
+    /// `MultiAngleMode::Error` must reject multi-angle
     /// files BEFORE reading the full 4D counts dataset.  On a real
     /// multi-angle file this dataset can be multi-GB; wasting a read
     /// to then error out is prohibitive.  This test uses metadata
@@ -1908,9 +1909,9 @@ mod tests {
 
     /// Histogram path: missing `units` attribute is allowed and
     /// preserves the rustpix-legacy ns assumption.  This is the
-    /// backward-compatibility guarantee for files produced by
-    /// `scripts/fixtures/extract_venus_hf_nexus.py` etc., which write
-    /// nanoseconds without a `units` attribute.
+    /// backward-compatibility guarantee for files produced by the
+    /// rustpix-era extraction tooling, which writes nanoseconds
+    /// without a `units` attribute.
     #[test]
     fn test_load_nexus_histogram_units_missing_legacy_ns() {
         let dir = tempfile::tempdir().unwrap();

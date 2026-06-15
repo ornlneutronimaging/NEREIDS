@@ -346,12 +346,12 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState, available_height_hint: 
                                 .range(1e-4..=100.0),
                         )
                         .on_hover_text(
-                            "Proton-charge ratio for the counts-KL solver \
-                         (memo 35 §P1.3).  Leave at 1.0 when the \
-                         caller has already PC-normalized the flux.",
+                            "Proton-charge ratio for the counts-KL solver.  \
+                         Leave at 1.0 when the caller has already \
+                         PC-normalized the flux.",
                         );
                     });
-                    // Polish override (memo 38 §6).  For spatial maps the
+                    // Polish override.  For spatial maps the
                     // default (None = auto-disable when n_pixels > 1) is the
                     // right choice.  Exposing an explicit toggle is
                     // research-oriented; wire as a tri-state via ComboBox
@@ -1844,7 +1844,7 @@ fn fit_results_panel(ui: &mut egui::Ui, state: &AppState, result: &SpectrumFitRe
             ("NOT converged", crate::theme::semantic::RED)
         };
         ui.label(egui::RichText::new(label).color(color).strong());
-        // Memo 35 §P1.2: when the joint-Poisson solver populated
+        // When the joint-Poisson solver populated
         // deviance_per_dof, label as D/dof; else keep chi2_r.
         let gof_label = if result.deviance_per_dof.is_some() {
             "D/dof"

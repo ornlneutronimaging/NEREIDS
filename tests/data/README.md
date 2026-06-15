@@ -59,14 +59,23 @@ ob = nereids.load_nexus_histogram(
 
 ### Regenerating
 
-The fixtures are produced from the private 38 GB cube
-`.research/spatial-regularization/data/counts/resonance_data_2cm.h5`
-by `scripts/fixtures/extract_venus_hf_nexus.py`. The source is not
-redistributable. To regenerate locally:
+The fixtures are extracted from a private 38 GB VENUS measurement cube
+(Au/Hf/W samples, 512×512 spatial, 4367 TOF bins) that is not
+redistributable. The extraction script lives alongside that data in the
+maintainers' research archive, outside this repository — regeneration is
+a maintainer task.
 
-```bash
-pixi run python scripts/fixtures/extract_venus_hf_nexus.py
-```
+## venus/aggregated_hf_120min.npz
+
+Aggregated (full-frame-summed) VENUS Hf 120 min spectrum used by the
+real-data regression gates in `tests/test_nereids.py`
+(`TestVenusMlbwRegression` — one LM/MLBW gate and one counts-KL gate).
+Contents: `energies_ev` (7–200 eV window, ascending), `sample_counts`
+and `open_beam_counts` (full-frame pixel sums over the cube), and
+`pc_ratio` (the proton-charge ratio `c = Q_s / Q_ob`, ≈ 5.98). Same
+provenance as the NeXus fixtures above: extracted from the private
+VENUS cube by maintainer tooling kept in the research archive;
+regeneration is a maintainer task.
 
 ## LANL-ORNL_example.tif
 

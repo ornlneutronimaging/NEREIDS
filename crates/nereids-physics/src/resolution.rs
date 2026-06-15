@@ -1064,7 +1064,7 @@ impl ResolutionPlan {
         // slice binding, so a future change to `plan_presorted` that
         // silently violates the `unsafe { get_unchecked }` SAFETY
         // claims below fails loudly in debug builds.  Zero release-
-        // build cost.  Copilot review finding on PR #470.
+        // build cost.
         debug_assert_eq!(starts.len(), n + 1);
         debug_assert_eq!(
             starts.last().copied(),
@@ -1123,8 +1123,7 @@ impl ResolutionPlan {
                 // trigger.  `+0.0 == -0.0` returns `true` but
                 // `(+0.0).to_bits() != (-0.0).to_bits()`, so the
                 // bit-pattern check disambiguates exactly which
-                // semantic `plan_presorted` meant.  Copilot review
-                // finding on PR #470.
+                // semantic `plan_presorted` meant.
                 let s = if frac.to_bits() == (-0.0_f64).to_bits() {
                     // SAFETY: `lo < n` by plan invariant.
                     // `plan_presorted` only pushes `lo = bracket_hi - 1`
@@ -1144,8 +1143,8 @@ impl ResolutionPlan {
                 // IEEE-754 addition is not associative; changing the
                 // order would break bit-exactness with
                 // `broaden_presorted_reference` (and all
-                // `*_bit_exact_*` unit tests + real-VENUS
-                // `baseline_dump.py --verify`).
+                // `*_bit_exact_*` unit tests + the maintainers'
+                // real-VENUS bit-exact baseline harness).
                 sum += w * s;
             }
             result[i] = sum / norm_i;
@@ -1164,7 +1163,7 @@ impl ResolutionPlan {
     /// 's `norm ≤ DIVISION_FLOOR` fallback).
     ///
     /// Degenerate-bracket handling uses the `-0.0` sentinel
-    /// convention introduced in PR #470: if `plan.frac[e]` has the
+    /// convention from `plan_presorted`: if `plan.frac[e]` has the
     /// bit pattern of `-0.0`, the entry contributes `weight / norm`
     /// at column `lo` only (no `lo+1` bracket).  A regular `+0.0`
     /// frac contributes `weight * 1.0 / norm` at `lo` and
@@ -1188,8 +1187,8 @@ impl ResolutionPlan {
     /// # Non-finite and near-overflow spectra
     ///
     /// The equivalence bound does **NOT** extend to spectra with
-    /// `NaN` / `±∞` values, **nor to near-f64::MAX overflow inputs**
-    /// (Codex round-2 P3).  Both divergences trace back to the same
+    /// `NaN` / `±∞` values, **nor to near-f64::MAX overflow
+    /// inputs**.  Both divergences trace back to the same
     /// algebraic rewrite:
     ///
     /// * [`Self::apply`] computes each entry as `spec[lo] + frac *
@@ -1852,7 +1851,6 @@ impl TabulatedResolution {
                 // there), so the apply path MUST do the same.  `+0.0`
                 // and `-0.0` compare equal under `==` but differ in
                 // `to_bits()`, which is what apply uses to disambiguate.
-                //  Copilot review finding on PR #470.
                 let entry_frac = if span.abs() < NEAR_ZERO_FLOOR {
                     -0.0_f64
                 } else {
@@ -2205,7 +2203,7 @@ pub mod test_support {
     /// one bit (e.g. swapping the upper-bound binary search for
     /// `partition_point`, or changing the `<=` to `<` in the midpoint
     /// comparison) would flip the comparison and invalidate the
-    /// regression suite.  See `feedback_bit_exact_oracle_verbatim.md`.
+    /// regression suite.
     pub fn interp_spectrum(energies: &[f64], spectrum: &[f64], e: f64) -> Option<f64> {
         let n = energies.len();
         if n == 0 {
@@ -3002,7 +3000,7 @@ mod tests {
 
     #[test]
     fn test_plan_apply_exact_match_frac_plus_zero_propagates_nan() {
-        // Regression gate for the subtle P1 Copilot caught on PR #470.
+        // Regression gate for a subtle sign-of-zero short-circuit bug.
         //
         // When `e_prime` aligns EXACTLY with a grid point `energies[lo]`,
         // `plan_presorted`'s interp fraction computes to `+0.0`, yet the
@@ -3138,7 +3136,7 @@ mod tests {
 
     #[test]
     fn test_apply_resolution_with_plan_rejects_same_length_different_grid() {
-        // Codex finding: `p.len() == energies.len()` is necessary
+        // `p.len() == energies.len()` is necessary
         // but not sufficient.  A plan built for one grid and applied
         // to a different same-length grid would silently gather
         // spectrum values at brackets belonging to the original grid
@@ -3397,10 +3395,10 @@ mod tests {
     /// Hand-construct a `ResolutionPlan` that deliberately exercises
     /// both the passthrough branch (`norm ≤ DIVISION_FLOOR`) and the
     /// `-0.0` degenerate-bracket sentinel — neither of which is
-    /// reached on the VENUS fixture at the tested grid sizes.  The
-    /// Round-1 audit flagged the earlier fixture-based passthrough
-    /// test as vacuous, so this replacement verifies the two unreached
-    /// branches with direct assertions on the resulting CSR.
+    /// reached on the VENUS fixture at the tested grid sizes, which
+    /// made the earlier fixture-based passthrough test vacuous.  This
+    /// replacement verifies the two unreached branches with direct
+    /// assertions on the resulting CSR.
     fn make_synthetic_plan(target_energies: Vec<f64>, rows: Vec<SyntheticRow>) -> ResolutionPlan {
         let n = target_energies.len();
         assert_eq!(rows.len(), n);
@@ -3449,8 +3447,7 @@ mod tests {
         // Grid has 4 cells so `lo ∈ [0, n-2] = [0, 2]` holds for all
         // entries — this preserves the `ResolutionPlan::apply` SAFETY
         // invariant that `lo + 1 < n` even if a future refactor
-        // weakens the `-0.0` sentinel short-circuit (round-2 self-
-        // audit NEW-P2 #1).
+        // weakens the `-0.0` sentinel short-circuit.
         let plan = make_synthetic_plan(
             vec![10.0, 20.0, 30.0, 40.0],
             vec![
@@ -3593,7 +3590,7 @@ mod tests {
         assert!(matrix_out[1].is_infinite());
     }
 
-    /// Round-2 Codex P3: documents (and guards) the analogous
+    /// Documents (and guards) the analogous
     /// divergence on **finite spectra near f64 overflow**.  With
     /// opposite-sign neighboring bins at f64::MAX, `plan.apply`'s
     /// `s_lo + frac * (s_hi - s_lo)` overflows in the subtraction

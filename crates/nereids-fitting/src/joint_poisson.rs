@@ -1,10 +1,11 @@
 //! Joint-Poisson counts-path objective with profiled flux.
 //!
-//! This module implements the **joint-Poisson conditional binomial deviance**
-//! derived in `.research/spatial-regularization/evidence/32-counts-path-governing-equations-v2.md`
-//! (equations §4.1, §5.7, §6.2b) and validated experimentally in memo 35
-//! §P1.  It supersedes the fixed-flux Poisson NLL (`poisson.rs`) for the
-//! counts-path fitter.
+//! This module implements the **joint-Poisson conditional binomial deviance**:
+//! the per-bin flux is profiled out of a two-arm Poisson model analytically
+//! (derivation below).  The deviance is validated against synthetic
+//! counts benchmarks and locked by a real-VENUS counts regression test
+//! on the committed aggregated-Hf fixture.  It supersedes
+//! the fixed-flux Poisson NLL (`poisson.rs`) for the counts-path fitter.
 //!
 //! ## Model
 //!
@@ -37,7 +38,7 @@
 //!
 //! Under the correct model, `D / (n − k)` → 1 as n → ∞ — this replaces the
 //! fixed-flux Pearson χ²/dof reported from the old Poisson path (which
-//! scaled with `c` at constant density fidelity; see memo 35 headline).
+//! scaled with the proton-charge ratio `c` at constant density fidelity).
 
 use nereids_core::constants::{PIVOT_FLOOR, POISSON_EPSILON};
 
@@ -693,11 +694,11 @@ pub struct JointPoissonFitConfig {
     /// Enable Nelder-Mead polish after stage 1.
     ///
     /// Default `false` as of #486.  The polish tolerances
-    /// (`xatol = 1e-9, fatol = 1e-10`) were originally matched to the
-    /// EG5 synthetic benchmark (memo 35 §P2.1) where D stays O(1), so
-    /// `fatol` is physically meaningful.  On real-data regimes where
-    /// D saturates at 10⁴–10⁵ (un-modelled upstream physics —
-    /// memo 35 §P3/§P4), `fatol / D` drops below f64 ULP and polish
+    /// (`xatol = 1e-9, fatol = 1e-10`) were originally matched to a
+    /// synthetic counts benchmark where D stays O(1), so `fatol` is
+    /// physically meaningful.  On real-data regimes where D saturates
+    /// at 10⁴–10⁵ (un-modelled upstream physics), `fatol / D` drops
+    /// below f64 ULP and polish
     /// cannot self-terminate — it burns its full `max_iter = 5000`
     /// every fit at 70–260× wall cost, and the three-scenario
     /// ablation on real VENUS Hf 120-min data (issue #486) showed
@@ -718,10 +719,10 @@ pub struct JointPoissonFitConfig {
     pub enable_polish: bool,
     /// Polish (Nelder-Mead) configuration.  Used only when
     /// `enable_polish == true`.  Default `xatol = 1e-9`, `fatol = 1e-10`
-    /// match the EG5 synthetic benchmark tolerances from memo 35 §P2.1
-    /// — physically meaningful when `D ≈ 1` (clean data) but sub-f64-
-    /// ULP on real counts where `D ≈ 10⁴`–`10⁵`, which is why
-    /// `enable_polish` defaults to `false`.  See #486.
+    /// match the synthetic counts-benchmark tolerances — physically
+    /// meaningful when `D ≈ 1` (clean data) but sub-f64-ULP on real
+    /// counts where `D ≈ 10⁴`–`10⁵`, which is why `enable_polish`
+    /// defaults to `false`.  See #486.
     pub polish: NelderMeadConfig,
     /// Compute and return the Fisher covariance and parameter uncertainties.
     pub compute_covariance: bool,
@@ -750,8 +751,8 @@ impl Default for JointPoissonFitConfig {
             // field doc on `enable_polish` for details.
             enable_polish: false,
             polish: NelderMeadConfig {
-                // Tolerances tuned for the EG5 synthetic regime (memo 35
-                // §P2.1) — `fatol = 1e-10` vs D ≈ 1 is a physically
+                // Tolerances tuned for the synthetic D ≈ 1 regime —
+                // `fatol = 1e-10` vs D ≈ 1 is a physically
                 // meaningful "deviance isn't budging" check.  On real
                 // counts data where D ≈ 10⁵ the same absolute value is
                 // sub-ULP; polish can't self-terminate and is disabled
@@ -773,7 +774,7 @@ impl Default for JointPoissonFitConfig {
 pub struct JointPoissonResult {
     /// Final deviance D at the fitted parameters.
     pub deviance: f64,
-    /// D / (n − k).  Primary GOF statistic per memo 35 §P1.2.
+    /// D / (n − k).  The primary goodness-of-fit statistic for the counts path.
     pub deviance_per_dof: f64,
     /// Number of data bins on the configured grid (n).  This is the
     /// total bin count; when a fit-energy-range mask is in effect, the
@@ -815,17 +816,17 @@ pub struct JointPoissonResult {
 /// Two-stage joint-Poisson fit: damped Fisher stage followed by
 /// Nelder-Mead polish.
 ///
-/// **Memo 35 §P1 + §P2 requirements** this function satisfies:
+/// **Counts-path contract** this function satisfies:
 ///
 /// - Minimizes the **conditional binomial deviance** `D(θ)`
 ///   ([`JointPoissonObjective::deviance`]), not fixed-flux Poisson NLL.
-/// - Reports `D / (n − k)` as the primary GOF (P1.2).
-/// - Honours an **explicit `c = Q_s/Q_ob`** stored in the objective (P1.3).
+/// - Reports `D / (n − k)` as the primary GOF.
+/// - Honours an **explicit `c = Q_s/Q_ob`** stored in the objective.
 /// - Runs Nelder-Mead **polish** after the gradient stage to escape the
-///   EG2-S1 C_full initial-point stall (P2.1).
+///   initial-point stall seen on backgrounded fits.
 /// - Exposes `gn_converged` and `polish_converged` separately so callers
 ///   do not rely on a single "success" flag — acceptance is meant to come
-///   from the deviance value (P2.3).
+///   from the deviance value.
 ///
 /// The damped-Fisher stage uses LM-style acceptance: a step is accepted if
 /// it satisfies an Armijo condition on D; on rejection, λ is increased and
@@ -1034,7 +1035,7 @@ pub fn joint_poisson_fit(
     // For the asymptotic MLE covariance, however, the Cramér-Rao bound is
     // `Cov(θ̂) = I^{-1}`, NOT `H_D^{-1} = (2I)^{-1} = I^{-1}/2`.  Inverting
     // `H_D` and using it directly would under-report variance by 2× and
-    // standard errors by √2 × — a real bug caught in review.  We rescale
+    // standard errors by √2 × — a real ½-scaling bug.  We rescale
     // the inverse here: `I^{-1} = 2 · H_D^{-1}`.
     let (covariance, uncertainties) = if config.compute_covariance {
         let free_idx = params.free_indices();
@@ -1665,7 +1666,8 @@ mod tests {
     // ==================================================================
 
     /// A wrapped transmission model: T_out = A_n · T_inner + B_A + B_B/√E + B_C·√E.
-    /// Models the full counts-path background structure of memo 35 §P2.2.
+    /// Models the full counts-path background structure (normalization
+    /// plus the three-term energy-dependent background).
     struct BackgroundedTransmission<'a> {
         inner: &'a dyn FitModel,
         energies: &'a [f64],
@@ -1696,8 +1698,8 @@ mod tests {
                 .collect())
         }
         // No analytical jacobian — forces the fitter onto FD fallback, which
-        // is the stress test (memo 35 §P2.1 notes FD + over-parameterization
-        // as the stall trigger).
+        // is the stress test (FD + over-parameterization is the
+        // empirically established stall trigger).
     }
 
     /// Exponential-in-E model: T_inner = exp(−n · σ(E)), σ(E) = 1.
@@ -1779,7 +1781,7 @@ mod tests {
 
     // ------------------------------------------------------------------
     // Matched-model single-parameter recovery at c = 5.98.
-    // This is the EG1 "proposed" cell in miniature — verify |bias| < 1%
+    // A miniature of the validated matched-model configuration — verify |bias| < 1%
     // and D / (n − k) ∈ [0.85, 1.15] without needing the polish.
     // ------------------------------------------------------------------
     #[test]
@@ -1825,14 +1827,15 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Polish-never-worsens invariant on a backgrounded fit.  Memo 35 §P2.1
-    // claims NM polish reduces D materially when stage-1 stalls.  At the
+    // Polish-never-worsens invariant on a backgrounded fit.  NM polish
+    // is meant to reduce D materially when stage-1 stalls.  At the
     // unit-test scale we verify the testable invariant: enabling polish
     // never produces a larger final D than disabling it on the same data.
     //
     // Note: on this over-parameterized (5-free-param) synthetic with only
     // 150 bins, the deviance surface has multiple near-equal minima —
-    // exactly the identifiability ambiguity §P2.2 targets.  Density
+    // exactly the over-parameterization identifiability ambiguity the
+    // B_A-pairing rule targets.  Density
     // recovery under over-parameterization is therefore *not* a unit-test
     // contract here; it is tested end-to-end with the single-parameter
     // matched-model test above.
@@ -1876,7 +1879,7 @@ mod tests {
             active_mask: None,
         };
 
-        // x0 analogous to EG2-S1 regime: n near truth, A_n = 1, all
+        // x0 analogous to the stall-prone backgrounded regime: n near truth, A_n = 1, all
         // additive bg at 0, bg bounds tight to curb degeneracy.
         let mk_params = || {
             ParameterSet::new(vec![
@@ -1952,7 +1955,7 @@ mod tests {
 
     // ------------------------------------------------------------------
     // Fit result carries gn_converged and polish_converged separately
-    // (memo 35 §P2.3 — acceptance from deviance value, not one flag).
+    // (acceptance is judged from the deviance value, not one flag).
     // ------------------------------------------------------------------
     #[test]
     fn test_joint_poisson_fit_exposes_separate_converged_flags() {
@@ -1997,14 +2000,14 @@ mod tests {
     // ------------------------------------------------------------------
     // Reported uncertainty matches the analytical Cramér-Rao bound
     // I^{-1} (NOT (2I)^{-1} — the Hessian-of-D inverse, which would
-    // under-report σ by √2).  Caught in code review of memo-35 §P1
+    // under-report σ by √2).  A real bug in the original
     // implementation; see `joint_poisson_fit` covariance-extraction
     // doc-comment for the rescaling rationale.
     // ------------------------------------------------------------------
     #[test]
     fn test_uncertainty_matches_analytical_fisher_inverse() {
         // Construct a single-parameter constant-T model on noise-free
-        // expected counts: O_i = λ/c, S_i = λ·T (per memo 35 §4.1).
+        // expected counts: O_i = λ/c, S_i = λ·T (the module-doc model).
         // With ConstModel (J_i = ∂T/∂θ = 1), the analytical Fisher is
         //   I(T) = Σ_i (O_i + S_i)·c / (T·(1+cT)²)
         //        = N · λ · (1+cT)/c · c / (T·(1+cT)²)
@@ -2164,7 +2167,7 @@ mod tests {
     /// active mask is the extreme case (`n_active == 0 < n_free`);
     /// the prior `.max(1)` divisor produced a deceptive
     /// finite-looking deviance-per-dof for empty / too-narrow masks.
-    /// Regression for Round-2 review fix #2 (#514).
+    /// Regression for #514.
     #[test]
     fn test_joint_poisson_rejects_zero_active_mask() {
         let n_bins = 10;
@@ -2211,7 +2214,7 @@ mod tests {
     /// fall through to the main loop, compute `deviance = 0` from the
     /// empty sum, and `dof = 0` → `deviance_per_dof = NaN` — but
     /// `gn_converged` could still be `true`, masquerading as a
-    /// successful fit on no data.  Regression for #517 R3 P1 (#514).
+    /// successful fit on no data.  Regression for #517 (#514).
     #[test]
     fn test_joint_poisson_rejects_zero_active_with_no_free_params() {
         let n_bins = 5;
@@ -2240,7 +2243,7 @@ mod tests {
     /// returns `LengthMismatch` rather than relying on a debug-assert
     /// deep in the deviance routines (which silently passes through in
     /// release builds, then panics on out-of-bounds index reads).
-    /// Regression for Round-2 review fix #5 (#514).
+    /// Regression for #514.
     #[test]
     fn test_joint_poisson_rejects_active_mask_length_mismatch() {
         let n_bins = 5;
@@ -2773,14 +2776,15 @@ mod tests {
     // ==================================================================
     // Per-element count validation propagates through `validate_inputs`.
     //
-    // Round-2 added `validate_counts` only at the `joint_poisson_fit`
-    // entry point.  Direct callers of `deviance_from_transmission` /
-    // `fisher_information_fd` / `profile_lambda_per_bin` (diagnostics
-    // paths) bypassed that check, so a NaN in `o` would propagate
-    // straight into the deviance sum via `NaN <= 0.0 == false` slipping
-    // past `xlogy_ratio`'s zero-branch, and a negative count would be
-    // silently swallowed as zero.  Round-3 lifts the per-element check
-    // into `validate_inputs`, which every public method already calls.
+    // An earlier version ran `validate_counts` only at the
+    // `joint_poisson_fit` entry point.  Direct callers of
+    // `deviance_from_transmission` / `fisher_information_fd` /
+    // `profile_lambda_per_bin` (diagnostics paths) bypassed that check,
+    // so a NaN in `o` would propagate straight into the deviance sum
+    // via `NaN <= 0.0 == false` slipping past `xlogy_ratio`'s
+    // zero-branch, and a negative count would be silently swallowed as
+    // zero.  The per-element check therefore lives in
+    // `validate_inputs`, which every public method already calls.
     // These tests run in release mode (no `debug_assert!`) and verify
     // the typed error reaches the caller.
     // ==================================================================
@@ -2788,8 +2792,9 @@ mod tests {
     /// `deviance_from_transmission` must reject a NaN open-beam count
     /// with `InvalidConfig` rather than returning `Ok(NaN)` (or, worse,
     /// `Ok(finite)` if a future `xlogy_ratio` rewrite handled NaN by
-    /// falling through to the zero branch).  Regression for Round-3
-    /// fix #1 — the inner `debug_assert!` is a no-op in release builds.
+    /// falling through to the zero branch).  The inner `debug_assert!`
+    /// is a no-op in release builds, so the typed error is the only
+    /// real guard.
     #[test]
     fn test_deviance_from_transmission_rejects_non_finite_counts() {
         let n_bins = 4;
@@ -2908,8 +2913,7 @@ mod tests {
     /// mismatches with `field = "transmission"` and `expected = o.len()`.
     /// Pre-fix this used `field = "open_beam_counts"` with reversed
     /// expected/actual, which read as "the open-beam array is wrong"
-    /// when the actual fault was the caller's `t` slice.  Regression
-    /// for Round-3 fix #2.
+    /// when the actual fault was the caller's `t` slice.
     #[test]
     fn test_validate_inputs_reports_transmission_length_mismatch_correctly() {
         let n_bins = 5;
