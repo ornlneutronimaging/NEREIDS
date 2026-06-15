@@ -2225,7 +2225,7 @@ fn py_calibrate_energy(
 ) -> PyResult<PyCalibrationResult> {
     // Copy NumPy slices to owned `Vec<f64>` *before* `py.detach` so the
     // closure does not hold borrows into NumPy-owned memory across the GIL
-    // release.  rust-numpy 0.28 only guards borrows while the GIL is held;
+    // release.  rust-numpy only guards borrows while the GIL is held;
     // once detached another Python thread could mutate/reallocate the
     // arrays and the inner Rust slices would dangle.  Every other
     // `py.detach` site in this file follows the same `.as_slice()?.to_vec()`

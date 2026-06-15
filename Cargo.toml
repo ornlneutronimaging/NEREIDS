@@ -40,8 +40,8 @@ zip = "2"
 dirs = "6"
 tiff = "0.11"
 image = "0.25"
-pyo3 = { version = "0.28", features = ["extension-module"] }
-numpy = "0.28"
+pyo3 = { version = "0.29", features = ["extension-module"] }
+numpy = "0.29"
 eframe = { version = "0.33", features = ["persistence"] }
 egui = "0.33"
 egui_extras = { version = "0.33", features = ["image", "svg"] }
