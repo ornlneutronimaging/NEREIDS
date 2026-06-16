@@ -1569,7 +1569,7 @@ impl Default for AppState {
             detect_matrix_entries: Vec::new(),
             detect_trace_entries: Vec::new(),
             detect_snr_threshold: 3.0,
-            detect_i0: 10_000.0,
+            detect_i0: 100_000.0,
             detect_energy_min: 1.0,
             detect_energy_max: 100.0,
             detect_n_energy_points: 2000,
