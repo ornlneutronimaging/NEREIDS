@@ -67,16 +67,18 @@ Select isotopes of interest from the periodic table. ENDF nuclear data is
 fetched automatically from IAEA servers and cached locally. Each isotope shows
 a status badge (Pending, Fetching, Loaded, Failed).
 
-Configure beamline parameters (flight path, timing resolution) and solver
-settings (Levenberg-Marquardt or Poisson KL divergence).
+Configure beamline parameters (flight path, timing resolution) and toggle
+instrument-resolution broadening. (The solver choice — Levenberg-Marquardt or
+Poisson KL divergence — is set on the Analyze step.)
 
 ![Configure step](images/configure-step.png)
 
 ### Analyze
 
-Run the fit. For spatial maps, a progress bar tracks per-pixel fitting with
-rayon parallelism. Click any pixel to inspect its individual fit. Fit feedback
-shows green (good fit) or red (failed) status.
+Choose the solver (Levenberg-Marquardt or Poisson KL divergence), then run the
+fit. For spatial maps, a progress bar tracks per-pixel fitting with rayon
+parallelism. Click any pixel to inspect its individual fit. Fit feedback shows
+green (good fit) or red (failed) status.
 
 Draw regions of interest (ROI) with Shift+drag. Multiple ROIs are supported
 with move, select, and delete operations.
