@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-16
+
 ### Changed
 
 - License switched from BSD-3-Clause to MIT across the entire workspace —
@@ -27,6 +29,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Each publishable crate directory (and `apps/gui` for the wheel) now
   carries a copy of the LICENSE text, so published artifacts ship the MIT
   permission notice they are licensed under.
+- **Detectability tool defaults** are less pessimistic: the default matrix
+  areal density is now `0.005` at/barn (a realistic ~mm-scale sample rather
+  than a vanishingly thin one) and the default expected counts/bin (I₀) is
+  now `100_000`, so a typical first run lands near the detection boundary
+  instead of always reading "NOT DETECTABLE". The verdict math is unchanged
+  and both remain user-adjustable in the Advanced panel. (#620)
+- Input validation hardened across the public API: energy grids,
+  cross-section entry points, NeXus/IO inputs, and the spatial detector cube
+  now reject NaN / non-finite / non-physical values with typed errors in
+  release builds (not debug-assert-gated). (#559, #565, #592, #602)
+- Internal architecture refactor (net ~−1600 LOC, no behavior change):
+  dead-code and unused-API removal, test-fixture/oracle consolidation, and a
+  shared `ResolutionPlan` helper extraction. (#580–#589)
 
 ### Changed (breaking — `nereids-io`)
 
@@ -40,6 +55,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Per semantic versioning for `0.x` crates, this is an acceptable
   breaking change at this stage of the project; no external consumers
   of this field have been identified in the workspace or sibling repos.
+
+### Fixed
+
+- **Doppler broadening** now uses the exact SAMMY Free-Gas-Model kernel
+  (manual Eq. III B1.7: a `w²`-weighted integrand divided by `E`) in both the
+  forward pass and the analytical temperature-derivative path, replacing a
+  kernel that omitted the `(w/v)` weight — a first-order antisymmetric skew on
+  resonance flanks. Includes two latent edge-case fixes (always-on low-side
+  velocity-grid padding; a SAMMY-faithful sparse-edge passthrough). SAMMY-oracle
+  errors improved across the validation suite. (#611)
+- **SLBW / MLBW cross-sections**: corrected the sign of the `Γ·sin²φ` elastic
+  interference term (#549, #550) and removed an s-wave velocity-factor
+  double-count (#577); both tighten agreement with SAMMY reference cases.
+- **R-Matrix Limited (LRF=7) KRM=3**: SAMMY-parity fixes to the APE/APT radius
+  roles, subthreshold channel widths, and the per-pair PNT penetrability flag.
+  (#589)
+- **Resolution broadening** is applied on the auxiliary (margin-extended) energy
+  grid across all transmission-model fit paths, removing edge bias near
+  fit-range boundaries. (#608)
+- Further physics/robustness fixes: phase-shift continuity, RML closed-channel
+  gating, and a sample-thickness guard (#599, #607); joint-Poisson no longer
+  reports convergence on an all-fixed-parameter fit (#575); energy-calibration
+  coverage and a zero-valid-bin guard (#563).
+- **ENDF parsing**: fixed a URR Case-B (LFW=1 / LRF=1) resonance-stream
+  misalignment (#606), and now hard-reject unsupported MF=2 NIS>1 and LRF=7
+  layouts instead of mis-parsing them (#576).
+- **NeXus I/O**: validate the `time_of_flight` `units` attribute, fixing a
+  silent 1000× rescale on files written with `units = "us"` (#561).
+
+### Security
+
+- Bumped `pyo3` and `numpy` 0.28 → 0.29, clearing two Dependabot advisories:
+  **GHSA-36hh-v3qg-5jq4** (HIGH — out-of-bounds read in `PyList`/`PyTuple`
+  `nth`/`nth_back`) and **GHSA-chgr-c6px-7xpp** (MEDIUM — missing `Sync` bound
+  on `PyCFunction::new_closure`). No binding code changes were required. (#615)
+
+### Documentation
+
+- Claim-accuracy pass: every README / guide / rustdoc capability claim and
+  SAMMY citation verified against primary sources (#610). Review-process
+  metadata scrubbed from production comments; `spatial_map_typed` and the
+  crate module lists documented; research-only scripts moved out of the tree
+  (#614). Guide screenshots refreshed for the current GUI and a stale
+  solver-settings caption corrected (#617–#619).
 
 ## [0.1.8] - 2026-04-27
 
@@ -210,7 +269,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Documentation site: mdBook user guide + rustdoc API reference on GitHub Pages
 - SAMMY validation suite: 43 test cases validated against SAMMY reference code
 
-[Unreleased]: https://github.com/ornlneutronimaging/NEREIDS/compare/v0.1.8...HEAD
+[Unreleased]: https://github.com/ornlneutronimaging/NEREIDS/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/ornlneutronimaging/NEREIDS/compare/v0.1.8...v0.2.0
 [0.1.8]: https://github.com/ornlneutronimaging/NEREIDS/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/ornlneutronimaging/NEREIDS/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/ornlneutronimaging/NEREIDS/compare/v0.1.5...v0.1.6
