@@ -95,11 +95,14 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            # manylinux_2_31 (Debian 11) ships GTK 3.24.5; rfd's gtk3
-            # backend (gtk-sys 0.18, added in #539) requires gtk+-3.0
-            # >= 3.24, which manylinux_2_28 (AlmaLinux 8, GTK 3.22)
-            # cannot satisfy — the cause of the v0.2.0 build-gui failure.
-            manylinux: "2_31"
+            # rfd's gtk3 backend (gtk-sys 0.18, added in #539) hard-requires
+            # gtk+-3.0 >= 3.24.  manylinux_2_28 (AlmaLinux 8) ships GTK 3.22 —
+            # too old — which broke the v0.2.0 build-gui job.  manylinux_2_34
+            # (AlmaLinux 9) ships GTK 3.24 AND is in maturin-action's container
+            # image map.  (manylinux_2_31 is NOT in that map, so the action
+            # silently falls back to a host build where before-script runs
+            # non-root and apt-get fails — do not use it here.)
+            manylinux: "2_34"
           - os: macos-latest
             target: aarch64-apple-darwin
 
@@ -123,11 +126,11 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux || 'auto' }}
           args: --release --out dist --find-interpreter
-          # manylinux_2_31 is Debian 11 (apt), not AlmaLinux (yum).
-          # libgtk-3-dev provides gtk+-3.0.pc (3.24.5) for gtk-sys.
+          # manylinux_2_34 is AlmaLinux 9 (dnf/yum), running as root in the
+          # container.  gtk3-devel provides gtk+-3.0.pc (GTK 3.24) for gtk-sys;
+          # cmake (3.26, appstream) is needed by C build deps in the tree.
           before-script-linux: |
-            apt-get update
-            apt-get install -y --no-install-recommends cmake libgtk-3-dev
+            yum install -y gtk3-devel cmake
 
       # maturin working-directory puts output in apps/gui/dist
       - name: Upload GUI wheel
