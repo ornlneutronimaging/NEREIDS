@@ -176,7 +176,10 @@ pub(crate) fn detect_matrix_card(ui: &mut egui::Ui, state: &mut AppState, locked
                 state.periodic_table_open = true;
                 state.periodic_table_target = PeriodicTableTarget::DetectMatrix;
                 state.periodic_table_selected_z = None;
-                state.periodic_table_density = 0.001; // at/barn default
+                // ~mm-scale metal foil (~5e-3 at/barn); a realistic sample
+                // rather than a vanishingly thin one, while staying thin
+                // enough to avoid an opaque baseline for typical matrices.
+                state.periodic_table_density = 0.005; // at/barn default
             }
         });
     });
@@ -307,7 +310,10 @@ pub(crate) fn detect_advanced_config(ui: &mut egui::Ui, state: &mut AppState) {
                 );
             });
             ui.horizontal(|ui| {
-                ui.label("I\u{2080} (counts/bin):");
+                ui.label("I\u{2080} (counts/bin):").on_hover_text(
+                    "Expected counts per energy bin. Higher means better Poisson \
+                     statistics and a lower detection threshold (SNR \u{221d} \u{221a}I\u{2080}).",
+                );
                 ui.add(
                     egui::DragValue::new(&mut state.detect_i0)
                         .speed(100.0)
