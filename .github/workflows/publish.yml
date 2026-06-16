@@ -164,6 +164,11 @@ jobs:
         run: |
           VERSION=${GITHUB_REF_NAME:-dev}
           VERSION=${VERSION#v}
+          # On a real tag GITHUB_REF_NAME is e.g. "v0.2.1" (clean). On a
+          # workflow_dispatch dry-run it is the branch name, which may contain
+          # "/" (e.g. "fix/release-0.2.1") — that would put a slash in the DMG
+          # path and break `hdiutil create`. Sanitize so dry-runs succeed too.
+          VERSION=${VERSION//\//-}
           hdiutil create -volname "NEREIDS ${VERSION}" \
             -srcfolder target/release/bundle/osx/NEREIDS.app \
             -ov -format UDZO \
