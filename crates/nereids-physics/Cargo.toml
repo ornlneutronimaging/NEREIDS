@@ -31,12 +31,13 @@ microlp = { workspace = true }
 # `test-support` feature here exposes `resolution::test_support` to
 # the integration suite without leaking it into release builds.
 #
-# Inherits version + path from `[workspace.dependencies]` (see
-# workspace Cargo.toml) so `scripts/bump-version.sh` keeps the
-# version in sync automatically.  A path-only self-dep (without a
-# version) breaks `cargo publish` because crates.io rejects
-# manifests whose declared deps lack version constraints.
-nereids-physics = { workspace = true, features = ["test-support"] }
+# MUST be path-only (no version): a versioned self-dep (e.g.
+# `workspace = true`, which pins the current 0.x.y) cannot be
+# published, because `cargo publish` then tries to resolve that exact
+# version from crates.io before it exists ("failed to select a version
+# for nereids-physics = ^X").  Version-less dev-deps are dropped from
+# the published manifest, so this is safe and publishable.
+nereids-physics = { path = ".", features = ["test-support"] }
 # Exposes `nereids_endf::resonance::test_support` — synthetic
 # `ResonanceData` builders shared with sibling crates' tests.
 nereids-endf = { workspace = true, features = ["test-support"] }

@@ -95,7 +95,11 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            manylinux: "2_28"
+            # manylinux_2_31 (Debian 11) ships GTK 3.24.5; rfd's gtk3
+            # backend (gtk-sys 0.18, added in #539) requires gtk+-3.0
+            # >= 3.24, which manylinux_2_28 (AlmaLinux 8, GTK 3.22)
+            # cannot satisfy — the cause of the v0.2.0 build-gui failure.
+            manylinux: "2_31"
           - os: macos-latest
             target: aarch64-apple-darwin
 
@@ -119,10 +123,11 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux || 'auto' }}
           args: --release --out dist --find-interpreter
+          # manylinux_2_31 is Debian 11 (apt), not AlmaLinux (yum).
+          # libgtk-3-dev provides gtk+-3.0.pc (3.24.5) for gtk-sys.
           before-script-linux: |
-            yum install -y cmake3 || yum install -y cmake
-            ln -sf /usr/bin/cmake3 /usr/bin/cmake || true
-            yum install -y gtk3-devel
+            apt-get update
+            apt-get install -y --no-install-recommends cmake libgtk-3-dev
 
       # maturin working-directory puts output in apps/gui/dist
       - name: Upload GUI wheel
