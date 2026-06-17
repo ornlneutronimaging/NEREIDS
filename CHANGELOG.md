@@ -7,7 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [0.2.0] - 2026-06-16
+## [0.2.1] - 2026-06-16
+
+### Fixed
+
+- **Release packaging** — the 0.2.0 tag published only partially before
+  failing and was yanked; 0.2.1 re-publishes the complete 0.2.0 change set
+  (below) with the publish pipeline repaired:
+  - The `nereids-endf` and `nereids-physics` self dev-dependencies (which
+    expose each crate's `test-support` feature to its own integration tests)
+    are now path-only — `{ path = ".", features = [...] }` instead of carrying
+    the workspace version. The versioned form made `cargo publish` try to
+    resolve the crate's own not-yet-published current version from crates.io
+    and abort, which is what halted the 0.2.0 crates publish after `endf-mat`
+    and `nereids-core` had already gone live.
+  - The Linux GUI wheel now builds on `manylinux_2_34` (AlmaLinux 9, GTK 3.24)
+    rather than `manylinux_2_28` (AlmaLinux 8, GTK 3.22), satisfying the
+    `gtk+-3.0 >= 3.24` requirement that `gtk-sys` 0.18 (rfd's gtk3 backend,
+    added in 0.2.0) imposes. Consequently the Linux GUI wheel now requires
+    glibc ≥ 2.34 (e.g. Ubuntu 22.04+, RHEL / AlmaLinux 9+).
+
+## [0.2.0] - 2026-06-16 [YANKED]
+
+> **Yanked.** The release pipeline failed partway through: `nereids` on PyPI
+> and the `endf-mat` / `nereids-core` crates were published before a packaging
+> bug aborted the remaining crates and the Linux GUI wheel. The 0.2.0
+> artifacts that did publish have been yanked — **use 0.2.1**, which ships the
+> same change set listed here.
 
 ### Changed
 
@@ -269,7 +295,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Documentation site: mdBook user guide + rustdoc API reference on GitHub Pages
 - SAMMY validation suite: 43 test cases validated against SAMMY reference code
 
-[Unreleased]: https://github.com/ornlneutronimaging/NEREIDS/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/ornlneutronimaging/NEREIDS/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/ornlneutronimaging/NEREIDS/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/ornlneutronimaging/NEREIDS/compare/v0.1.8...v0.2.0
 [0.1.8]: https://github.com/ornlneutronimaging/NEREIDS/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/ornlneutronimaging/NEREIDS/compare/v0.1.6...v0.1.7
