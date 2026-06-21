@@ -90,3 +90,14 @@ from_counts_with_nuisance
 # ---------------------------------------------------------------------------
 EnergyLaw
 IkedaCarpenter
+
+# ---------------------------------------------------------------------------
+# Instrument-resolution calibration (epic #394).  calibrate_resolution() fits
+# the resolution parameters of a model family to a known-(rho,T) calibrant;
+# ResolutionCalibration is its result.  Covered by docs/guide (resolution
+# models / calibration section) + the example notebook; the pdoc reference
+# covers the signatures.  Move OUT of the allowlist if a dedicated
+# python-api.md narrative heading is added.
+# ---------------------------------------------------------------------------
+calibrate_resolution
+ResolutionCalibration

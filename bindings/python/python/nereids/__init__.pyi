@@ -293,6 +293,47 @@ class IkedaCarpenter:
         """Number of synthesized reference energies."""
         ...
 
+class ResolutionCalibration:
+    """Result of :func:`calibrate_resolution`."""
+
+    @property
+    def family(self) -> str:
+        """Resolution-model family (``"gaussian"`` | ``"udd_corr"`` | ``"ic"``)."""
+        ...
+
+    @property
+    def theta(self) -> list[float]:
+        """Raw fitted parameter vector (optimizer space)."""
+        ...
+
+    @property
+    def chi2(self) -> float:
+        """chi-squared per degree of freedom of the calibration fit."""
+        ...
+
+    @property
+    def converged(self) -> bool:
+        """Whether the optimizer self-converged."""
+        ...
+
+    @property
+    def iterations(self) -> int:
+        """Optimizer iterations."""
+        ...
+
+    def params(self) -> dict[str, float]:
+        """Decoded, human-readable fitted parameters."""
+        ...
+
+    def as_tabulated(self) -> TabulatedResolution | None:
+        """The calibrated resolution as a kernel to pin into a fit
+        (``udd_corr`` / ``ic``); ``None`` for the Gaussian family."""
+        ...
+
+    def gaussian_params(self) -> tuple[float, float] | None:
+        """``(delta_t_us, delta_l_m)`` for the Gaussian family; ``None`` otherwise."""
+        ...
+
 class SpatialResult:
     """Result of per-pixel spatial mapping (LM fitter)."""
 
@@ -533,6 +574,31 @@ def forward_model(
     Either ``isotopes`` or ``groups`` must be provided, but not both.
     When ``groups`` is provided, each group is expanded into its members
     with effective densities = group_density * member_ratio.
+    """
+    ...
+
+def calibrate_resolution(
+    energies: NDArray[np.float64],
+    data: NDArray[np.float64],
+    uncertainty: NDArray[np.float64],
+    family: str,
+    isotopes: list[tuple[ResonanceData, float]] | None = None,
+    groups: list[tuple[IsotopeGroup, float]] | None = None,
+    temperature_k: float = 293.6,
+    base_udd: TabulatedResolution | None = None,
+    flight_path_m: float = 25.0,
+    fit_background: bool = False,
+    restarts: int = 1,
+    ic_n_energies: int = 64,
+    ic_n_tau: int = 500,
+) -> ResolutionCalibration:
+    """Calibrate instrument-resolution parameters against a known-(rho,T) calibrant.
+
+    Fits the resolution parameters of ``family`` (``"gaussian"`` | ``"udd_corr"``
+    | ``"ic"``) while holding the calibrant density (in ``isotopes``/``groups``)
+    and ``temperature_k`` fixed. ``base_udd`` is required for ``"udd_corr"``.
+    Pin the returned resolution into a sample fit via ``.as_tabulated()`` (or
+    ``.gaussian_params()`` for the Gaussian family).
     """
     ...
 

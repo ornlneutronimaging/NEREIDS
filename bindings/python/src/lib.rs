@@ -49,6 +49,9 @@ use nereids_endf::resonance::{
     LGroup, Resonance, ResonanceData, ResonanceFormalism, ResonanceRange,
 };
 use nereids_endf::retrieval::{EndfLibrary, EndfRetriever, mat_number};
+use nereids_fitting::resolution_calib::{
+    CalibrationConfig, ResolutionFamily, calibrate_resolution as rust_calibrate_resolution,
+};
 use nereids_io::normalization::{self as norm, NormalizationParams};
 use nereids_io::tof::BeamlineParams;
 use nereids_physics::doppler::{self, DopplerParams};
@@ -1109,6 +1112,209 @@ fn forward_model<'py>(
     let t = py.detach(move || transmission::forward_model(&e_owned, &sample, instrument.as_ref()));
     let t = t.map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
     Ok(PyArray1::from_vec(py, t))
+}
+
+/// Result of an instrument-resolution calibration ([`calibrate_resolution`]).
+#[pyclass(name = "ResolutionCalibration", skip_from_py_object)]
+struct PyResolutionCalibration {
+    inner: nereids_fitting::resolution_calib::CalibrationResult,
+}
+
+#[pymethods]
+impl PyResolutionCalibration {
+    /// Family label (`"gaussian"` | `"udd_corr"` | `"ic"`).
+    #[getter]
+    fn family(&self) -> String {
+        self.inner.family.clone()
+    }
+
+    /// Raw fitted parameter vector (optimizer space).
+    #[getter]
+    fn theta(&self) -> Vec<f64> {
+        self.inner.theta.clone()
+    }
+
+    /// χ²/dof of the calibration fit.
+    #[getter]
+    fn chi2(&self) -> f64 {
+        self.inner.chi2_dof
+    }
+
+    /// Whether the optimizer self-converged.
+    #[getter]
+    fn converged(&self) -> bool {
+        self.inner.converged
+    }
+
+    /// Optimizer iterations.
+    #[getter]
+    fn iterations(&self) -> usize {
+        self.inner.iterations
+    }
+
+    /// Decoded, human-readable fitted parameters.
+    fn params<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let d = pyo3::types::PyDict::new(py);
+        match self.inner.family.as_str() {
+            "udd_corr" => {
+                let s0 = self.inner.theta[0].exp().clamp(0.2, 5.0);
+                d.set_item("s0", s0)?;
+                d.set_item("p", self.inner.theta[1])?;
+            }
+            "gaussian" => {
+                d.set_item("delta_t_us", self.inner.theta[0].abs())?;
+                d.set_item("delta_l_m", self.inner.theta[1].abs())?;
+            }
+            _ => {
+                d.set_item("a0", self.inner.theta[0].abs())?;
+                d.set_item("a1", self.inner.theta[1])?;
+                d.set_item("beta", self.inner.theta[2].abs())?;
+            }
+        }
+        Ok(d)
+    }
+
+    /// The calibrated resolution as a [`TabulatedResolution`] — pass to
+    /// `resolution=` in the fitters. `None` for the Gaussian family (use
+    /// [`Self::gaussian_params`] there).
+    fn as_tabulated(&self) -> Option<PyTabulatedResolution> {
+        match &self.inner.resolution {
+            ResolutionFunction::Tabulated(t) => Some(PyTabulatedResolution { inner: t.clone() }),
+            ResolutionFunction::IkedaCarpenter(ic) => Some(PyTabulatedResolution {
+                inner: Arc::new(ic.tabulated().clone()),
+            }),
+            ResolutionFunction::Gaussian(_) => None,
+        }
+    }
+
+    /// `(delta_t_us, delta_l_m)` for the Gaussian family; `None` otherwise.
+    fn gaussian_params(&self) -> Option<(f64, f64)> {
+        match &self.inner.resolution {
+            ResolutionFunction::Gaussian(p) => Some((p.delta_t_us(), p.delta_l_m())),
+            _ => None,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "ResolutionCalibration(family={}, chi2/dof={:.4}, converged={})",
+            self.inner.family, self.inner.chi2_dof, self.inner.converged
+        )
+    }
+}
+
+/// Calibrate instrument-resolution parameters against a known-(ρ,T) calibrant.
+///
+/// Fits the resolution parameters of `family` while holding the calibrant's
+/// density (the values in `isotopes`/`groups`) and `temperature_k` FIXED. Pin
+/// the returned resolution into a subsequent sample fit.
+///
+/// Args:
+///     energies, data, uncertainty: calibrant transmission spectrum.
+///     family: ``"gaussian"`` | ``"udd_corr"`` | ``"ic"``.
+///     isotopes / groups: known calibrant composition + density (exactly one).
+///     temperature_k: known calibrant temperature.
+///     base_udd: base UDD kernel (required for ``family="udd_corr"``).
+///     fit_background: also fit anorm + linear baseline (default anorm only).
+///     restarts: optimizer restarts (keep the best).
+///
+/// Returns:
+///     ResolutionCalibration with the fitted params, χ²/dof, and the calibrated
+///     resolution (``.as_tabulated()`` / ``.gaussian_params()``).
+#[pyfunction]
+#[pyo3(signature = (
+    energies, data, uncertainty, family, isotopes=None, groups=None,
+    temperature_k=293.6, base_udd=None, flight_path_m=25.0, fit_background=false,
+    restarts=1, ic_n_energies=64, ic_n_tau=500
+))]
+#[allow(clippy::too_many_arguments)]
+fn calibrate_resolution(
+    py: Python<'_>,
+    energies: PyReadonlyArray1<f64>,
+    data: PyReadonlyArray1<f64>,
+    uncertainty: PyReadonlyArray1<f64>,
+    family: &str,
+    isotopes: Option<Vec<(PyResonanceData, f64)>>,
+    groups: Option<Vec<(PyIsotopeGroup, f64)>>,
+    temperature_k: f64,
+    base_udd: Option<PyTabulatedResolution>,
+    flight_path_m: f64,
+    fit_background: bool,
+    restarts: usize,
+    ic_n_energies: usize,
+    ic_n_tau: usize,
+) -> PyResult<PyResolutionCalibration> {
+    if isotopes.is_some() == groups.is_some() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Provide exactly one of 'isotopes' or 'groups'.",
+        ));
+    }
+    let e = energies.as_slice()?;
+    validate_energy_grid(e)?;
+    let d = data.as_slice()?;
+    let u = uncertainty.as_slice()?;
+    if d.len() != e.len() || u.len() != e.len() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "energies, data, uncertainty must have equal length",
+        ));
+    }
+
+    let sample_isotopes: Vec<(ResonanceData, f64)> = if let Some(isotopes) = isotopes {
+        isotopes
+            .into_iter()
+            .map(|(rd, thick)| (Arc::unwrap_or_clone(rd.inner), thick))
+            .collect()
+    } else {
+        let groups = groups.unwrap();
+        let mut expanded = Vec::new();
+        for (group, group_density) in &groups {
+            if !group.is_loaded() {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "IsotopeGroup '{}' has not been fully loaded. Call load_endf() first.",
+                    group.inner.name(),
+                )));
+            }
+            for (i, (_iso, ratio)) in group.inner.members().iter().enumerate() {
+                let rd = Arc::unwrap_or_clone(group.resonance_data[i].clone().unwrap());
+                expanded.push((rd, group_density * ratio));
+            }
+        }
+        expanded
+    };
+    let sample = SampleParams::new(temperature_k, sample_isotopes)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+
+    let fam = match family {
+        "gaussian" => ResolutionFamily::Gaussian,
+        "ic" => ResolutionFamily::IkedaCarpenter,
+        "udd_corr" => {
+            let base = base_udd.ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(
+                    "family='udd_corr' requires base_udd (a TabulatedResolution).",
+                )
+            })?;
+            ResolutionFamily::UddCorr { base: base.inner }
+        }
+        other => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown family '{other}'; expected 'gaussian', 'udd_corr', or 'ic'"
+            )));
+        }
+    };
+
+    let cfg = CalibrationConfig {
+        flight_path_m,
+        fit_background,
+        restarts,
+        ic_n_energies,
+        ic_n_tau,
+        ..Default::default()
+    };
+    let (e_owned, d_owned, u_owned) = (e.to_vec(), d.to_vec(), u.to_vec());
+    let result = py
+        .detach(move || rust_calibrate_resolution(fam, &e_owned, &d_owned, &u_owned, &sample, &cfg))
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    Ok(PyResolutionCalibration { inner: result })
 }
 
 /// Convert time-of-flight (μs) to energy (eV).
@@ -2714,10 +2920,12 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTabulatedResolution>()?;
     m.add_class::<PyEnergyLaw>()?;
     m.add_class::<PyIkedaCarpenter>()?;
+    m.add_class::<PyResolutionCalibration>()?;
     m.add_class::<PySpatialResult>()?;
     m.add_class::<PyTraceDetectabilityReport>()?;
     m.add_function(wrap_pyfunction!(cross_sections, m)?)?;
     m.add_function(wrap_pyfunction!(forward_model, m)?)?;
+    m.add_function(wrap_pyfunction!(calibrate_resolution, m)?)?;
     m.add_function(wrap_pyfunction!(tof_to_energy, m)?)?;
     m.add_function(wrap_pyfunction!(energy_to_tof, m)?)?;
     m.add_function(wrap_pyfunction!(load_endf, m)?)?;
