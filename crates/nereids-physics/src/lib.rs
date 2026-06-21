@@ -32,6 +32,7 @@ pub mod auxiliary_grid;
 pub mod channel;
 pub mod coulomb;
 pub mod doppler;
+pub mod ikeda_carpenter;
 pub mod penetrability;
 pub mod reich_moore;
 pub mod resolution;

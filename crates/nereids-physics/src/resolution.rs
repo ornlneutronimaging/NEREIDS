@@ -52,7 +52,11 @@ use std::sync::Arc;
 ///   TOF_FACTOR = 1e6 / √(2 × EV_TO_JOULES / NEUTRON_MASS_KG)
 ///
 /// Uses CODATA 2018 values (both exact in the 2019 SI).
-const TOF_FACTOR: f64 = 72.298_254_398_292_8;
+///
+/// `pub(crate)` so the analytical [`crate::ikeda_carpenter`] model uses the
+/// *identical* TOF↔energy constant when it synthesizes kernels — any drift
+/// here would make the IC-vs-tabulated cross-validation unfair.
+pub(crate) const TOF_FACTOR: f64 = 72.298_254_398_292_8;
 
 /// Errors from resolution broadening operations.
 #[derive(Debug, PartialEq)]
@@ -919,16 +923,27 @@ impl TabulatedResolution {
     }
 }
 
-/// Resolution function: either analytical Gaussian or tabulated from Monte Carlo.
+/// Resolution function: analytical Gaussian, tabulated from Monte Carlo, or
+/// analytical Ikeda–Carpenter moderator model.
 ///
-/// The `Tabulated` variant wraps an `Arc` so that cloning (e.g., per-pixel in
-/// spatial mapping) is a cheap reference-count bump rather than a deep copy.
+/// The `Tabulated` and `IkedaCarpenter` variants wrap an `Arc` so that cloning
+/// (e.g., per-pixel in spatial mapping) is a cheap reference-count bump rather
+/// than a deep copy.
+///
+/// `IkedaCarpenter` synthesizes a [`TabulatedResolution`] at construction and
+/// is applied through the *same* convolution path as `Tabulated` — only the
+/// kernel *source* differs (analytic IC pulse vs Monte-Carlo file). This is
+/// deliberate: it keeps the three-way resolution cross-validation
+/// (Gaussian | tabulated-UDD | Ikeda–Carpenter) fair, with identical
+/// application machinery for the two kernel-based models.
 #[derive(Debug, Clone)]
 pub enum ResolutionFunction {
     /// Analytical Gaussian resolution from instrument parameters.
     Gaussian(ResolutionParams),
     /// Tabulated resolution from Monte Carlo instrument simulation.
     Tabulated(Arc<TabulatedResolution>),
+    /// Analytical Ikeda–Carpenter moderator resolution model.
+    IkedaCarpenter(Arc<crate::ikeda_carpenter::IkedaCarpenter>),
 }
 
 /// Pre-built resolution-broadening plan for a specific target energy grid.
@@ -1545,6 +1560,64 @@ impl TabulatedResolution {
         })
     }
 
+    /// Build a tabulated resolution directly from synthesized kernels.
+    ///
+    /// Used by the analytical [`crate::ikeda_carpenter::IkedaCarpenter`] model,
+    /// which generates `(tof_offset_µs, weight)` kernels at a set of reference
+    /// energies and then rides the exact same broadening machinery as a
+    /// Monte-Carlo file. Validates the same invariants `from_text` enforces:
+    /// non-empty, strictly ascending reference energies, one kernel per energy,
+    /// and matching offset/weight lengths within each kernel.
+    ///
+    /// # Errors
+    /// Returns [`ResolutionParseError::InvalidFormat`] if the reference
+    /// energies are empty / not strictly ascending, if the energy and kernel
+    /// counts differ, or if any kernel's offset and weight vectors differ in
+    /// length.
+    pub fn from_kernels(
+        ref_energies: Vec<f64>,
+        kernels: Vec<(Vec<f64>, Vec<f64>)>,
+        flight_path_m: f64,
+    ) -> Result<Self, ResolutionParseError> {
+        if ref_energies.is_empty() {
+            return Err(ResolutionParseError::InvalidFormat(
+                "No reference energies provided".into(),
+            ));
+        }
+        if ref_energies.len() != kernels.len() {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "Reference-energy count {} != kernel count {}",
+                ref_energies.len(),
+                kernels.len(),
+            )));
+        }
+        for i in 1..ref_energies.len() {
+            if ref_energies[i] <= ref_energies[i - 1] {
+                return Err(ResolutionParseError::InvalidFormat(format!(
+                    "Reference energies must be strictly ascending, but E[{}]={} <= E[{}]={}",
+                    i,
+                    ref_energies[i],
+                    i - 1,
+                    ref_energies[i - 1],
+                )));
+            }
+        }
+        for (i, (offsets, weights)) in kernels.iter().enumerate() {
+            if offsets.len() != weights.len() {
+                return Err(ResolutionParseError::InvalidFormat(format!(
+                    "Kernel {i} offset length {} != weight length {}",
+                    offsets.len(),
+                    weights.len(),
+                )));
+            }
+        }
+        Ok(TabulatedResolution {
+            ref_energies,
+            kernels,
+            flight_path_m,
+        })
+    }
+
     /// Parse a VENUS/FTS resolution file from disk.
     pub fn from_file(path: &str, flight_path_m: f64) -> Result<Self, ResolutionParseError> {
         let text = std::fs::read_to_string(path)
@@ -1924,14 +1997,20 @@ impl TabulatedResolution {
         let e_lo = self.ref_energies[idx];
         let e_hi = self.ref_energies[idx + 1];
 
-        // Log-space interpolation fraction
-        let frac = (energy.ln() - e_lo.ln()) / (e_hi.ln() - e_lo.ln());
+        // Linear-energy interpolation fraction — matches SAMMY's UDR kernel
+        // interpolation, which is linear in BOTH time and energy
+        // (sammy/src/udr/mudr3.f90:246-251; manual exp-conditions.tex:1914).
+        // Previously this was log-energy; with only ~25 widely-spaced references
+        // the log vs linear weight diverges most where references are far apart
+        // (7-10 eV), driving the ~2.5% overall / 5-13% local NEREIDS-vs-SAMMY
+        // broadening mismatch.
+        let frac = (energy - e_lo) / (e_hi - e_lo);
 
         let (off_lo, w_lo) = &self.kernels[idx];
         let (off_hi, w_hi) = &self.kernels[idx + 1];
 
-        // If both kernels have the same number of points, interpolate element-wise
-        if off_lo.len() == off_hi.len() {
+        let (mut offsets, weights) = if off_lo.len() == off_hi.len() {
+            // Both kernels have the same number of points: interpolate element-wise.
             let offsets: Vec<f64> = off_lo
                 .iter()
                 .zip(off_hi.iter())
@@ -1944,13 +2023,35 @@ impl TabulatedResolution {
                 .collect();
             (offsets, weights)
         } else {
-            // Different sizes: use nearest
-            if frac < 0.5 {
-                self.kernels[idx].clone()
+            // Different point counts: fall back to the nearer reference kernel.
+            let k = if frac < 0.5 {
+                &self.kernels[idx]
             } else {
-                self.kernels[idx + 1].clone()
+                &self.kernels[idx + 1]
+            };
+            (k.0.clone(), k.1.clone())
+        };
+
+        // Re-zero the interpolated kernel to its weighted centroid so resolution
+        // BROADENS without shifting the mean (SAMMY udr/mudr3.f90:268-292). The
+        // tabulated kernels are peak-centred (peak at offset 0) but carry a positive
+        // first moment from the moderator decay tail; without this, broadening
+        // introduces an energy-dependent TOF shift (~0.3% at the resonances) that the
+        // energy-scale (t0/L_scale) cannot absorb. The offset grid is uniform within
+        // each kernel, so the weighted mean is the trapezoidal centroid.
+        let wsum: f64 = weights.iter().sum();
+        if wsum > 0.0 {
+            let centroid: f64 = offsets
+                .iter()
+                .zip(weights.iter())
+                .map(|(&o, &w)| o * w)
+                .sum::<f64>()
+                / wsum;
+            for o in offsets.iter_mut() {
+                *o -= centroid;
             }
         }
+        (offsets, weights)
     }
 }
 
@@ -1967,6 +2068,7 @@ pub fn apply_resolution(
     match resolution {
         ResolutionFunction::Gaussian(params) => resolution_broaden(energies, spectrum, params),
         ResolutionFunction::Tabulated(tab) => tab.broaden(energies, spectrum),
+        ResolutionFunction::IkedaCarpenter(ic) => ic.tabulated().broaden(energies, spectrum),
     }
 }
 
@@ -1985,6 +2087,9 @@ pub(crate) fn apply_resolution_presorted(
             resolution_broaden_presorted(energies, spectrum, params)
         }
         ResolutionFunction::Tabulated(tab) => tab.broaden_presorted(energies, spectrum),
+        ResolutionFunction::IkedaCarpenter(ic) => {
+            ic.tabulated().broaden_presorted(energies, spectrum)
+        }
     }
 }
 
@@ -2020,6 +2125,7 @@ pub fn build_resolution_plan(
             Ok(None)
         }
         ResolutionFunction::Tabulated(tab) => tab.plan(energies).map(Some),
+        ResolutionFunction::IkedaCarpenter(ic) => ic.tabulated().plan(energies).map(Some),
     }
 }
 
@@ -2053,7 +2159,10 @@ pub fn apply_resolution_with_plan(
     resolution: &ResolutionFunction,
 ) -> Result<Vec<f64>, ResolutionError> {
     if let Some(p) = plan
-        && matches!(resolution, ResolutionFunction::Tabulated(_))
+        && matches!(
+            resolution,
+            ResolutionFunction::Tabulated(_) | ResolutionFunction::IkedaCarpenter(_)
+        )
     {
         validate_inputs(energies, spectrum)?;
         if p.len() != energies.len() {
