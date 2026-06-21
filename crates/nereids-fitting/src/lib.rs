@@ -27,4 +27,5 @@ pub mod lm;
 pub mod nelder_mead;
 pub mod parameters;
 pub mod poisson;
+pub mod resolution_calib;
 pub mod transmission_model;

@@ -851,6 +851,48 @@ impl TabulatedResolution {
         self.flight_path_m
     }
 
+    /// Width-corrected copy of this tabulated kernel.
+    ///
+    /// Shape-preserving instrument-resolution calibration knob: each
+    /// reference-energy block's TOF offsets are scaled by
+    /// `s(E) = s0 · (E / e_ref)^p` **about the block's intensity centroid**, so
+    /// the kernel widens/narrows without moving the resonance position. Weights
+    /// are unchanged (the apply-time trapezoidal renormalization preserves unit
+    /// area, and the apply-time mean-centering — see `interpolated_kernel` —
+    /// makes the absolute offset position irrelevant, so width and position stay
+    /// orthogonal; `t0`/`L` handle absolute position).
+    ///
+    /// `s0 = 1, p = 0` returns a width-identical copy. This is the fittable model
+    /// behind the `udd_corr` resolution-calibration family: it trusts the
+    /// Monte-Carlo *shape* and calibrates only its width / energy-dependence.
+    #[must_use]
+    pub fn width_corrected(&self, s0: f64, p: f64, e_ref: f64) -> TabulatedResolution {
+        let kernels = self
+            .ref_energies
+            .iter()
+            .zip(self.kernels.iter())
+            .map(|(&e, (offsets, weights))| {
+                let s = s0 * (e / e_ref).powf(p);
+                let wsum: f64 = weights.iter().sum();
+                let centroid = if wsum > 0.0 {
+                    offsets.iter().zip(weights).map(|(o, w)| o * w).sum::<f64>() / wsum
+                } else {
+                    0.0
+                };
+                let scaled = offsets
+                    .iter()
+                    .map(|&o| centroid + s * (o - centroid))
+                    .collect();
+                (scaled, weights.clone())
+            })
+            .collect();
+        TabulatedResolution {
+            ref_energies: self.ref_energies.clone(),
+            kernels,
+            flight_path_m: self.flight_path_m,
+        }
+    }
+
     /// Kernel support at energy `e_ev`, in eV.
     ///
     /// Returns the maximum energy offset over which the tabulated
@@ -2424,6 +2466,63 @@ pub mod test_support {
 mod tests {
     use super::*;
     use nereids_core::constants;
+
+    fn kernel_centroid_std(offs: &[f64], wts: &[f64]) -> (f64, f64) {
+        let wsum: f64 = wts.iter().sum();
+        let c = offs.iter().zip(wts).map(|(o, w)| o * w).sum::<f64>() / wsum;
+        let var = offs
+            .iter()
+            .zip(wts)
+            .map(|(o, w)| w * (o - c).powi(2))
+            .sum::<f64>()
+            / wsum;
+        (c, var.sqrt())
+    }
+
+    #[test]
+    fn width_corrected_preserves_centroid_scales_width_and_energy_dependence() {
+        // asymmetric kernel straddling 0 (peak off-centre), two ref energies.
+        let offs = vec![-2.0, -1.0, 0.0, 1.0, 2.0, 3.0, 4.0];
+        let wts = vec![0.1, 0.3, 1.0, 0.8, 0.5, 0.3, 0.1];
+        let tab = TabulatedResolution::from_kernels(
+            vec![5.0, 50.0],
+            vec![(offs.clone(), wts.clone()), (offs.clone(), wts.clone())],
+            25.0,
+        )
+        .unwrap();
+
+        // Uniform 2.5x width scale (p=0): centroid fixed, std scales by s0, weights unchanged.
+        let s0 = 2.5;
+        let wc = tab.width_corrected(s0, 0.0, 10.0);
+        for (orig, scaled) in tab.kernels().iter().zip(wc.kernels()) {
+            let (c0, std0) = kernel_centroid_std(&orig.0, &orig.1);
+            let (c1, std1) = kernel_centroid_std(&scaled.0, &scaled.1);
+            assert!((c0 - c1).abs() < 1e-12, "centroid moved {c0} -> {c1}");
+            assert!(
+                (std1 / std0 - s0).abs() < 1e-12,
+                "width ratio {} != {s0}",
+                std1 / std0
+            );
+        }
+        assert_eq!(
+            tab.kernels()[0].1,
+            wc.kernels()[0].1,
+            "weights must be unchanged"
+        );
+
+        // s0=1,p=0 is an exact width-identical copy.
+        let id = tab.width_corrected(1.0, 0.0, 10.0);
+        assert_eq!(id.kernels()[0].0, tab.kernels()[0].0);
+
+        // p<0 -> higher energy is narrower (energy-dependent width).
+        let wc2 = tab.width_corrected(1.0, -0.5, 10.0);
+        let (_, std_lo) = kernel_centroid_std(&wc2.kernels()[0].0, &wc2.kernels()[0].1); // 5 eV
+        let (_, std_hi) = kernel_centroid_std(&wc2.kernels()[1].0, &wc2.kernels()[1].1); // 50 eV
+        assert!(
+            std_hi < std_lo,
+            "p<0 should narrow higher E: {std_hi} !< {std_lo}"
+        );
+    }
 
     // ── Smoke tests for the test_support oracles (`interp_spectrum` +
     //    `broaden_presorted_reference`).  The 7+ bit-exact tests below
