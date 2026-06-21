@@ -52,6 +52,9 @@ use nereids_endf::retrieval::{EndfLibrary, EndfRetriever, mat_number};
 use nereids_io::normalization::{self as norm, NormalizationParams};
 use nereids_io::tof::BeamlineParams;
 use nereids_physics::doppler::{self, DopplerParams};
+use nereids_physics::ikeda_carpenter::{
+    EnergyLaw, IkedaCarpenter, IkedaCarpenterParams, SynthesisGrid,
+};
 use nereids_physics::resolution::{
     self, ResolutionFunction, ResolutionParams, TabulatedResolution,
 };
@@ -601,6 +604,165 @@ impl PyTabulatedResolution {
             self.n_energies(),
             lo,
             hi,
+            self.inner.flight_path_m(),
+        )
+    }
+}
+
+/// Energy-dependence law for an Ikeda–Carpenter parameter.
+///
+/// Build via the static constructors:
+/// `EnergyLaw.const(c)`, `EnergyLaw.sqrt_e(a0, a1)`,
+/// `EnergyLaw.inverse_lambda(a0, a1)`, `EnergyLaw.exp_mev(kappa)`.
+#[pyclass(name = "EnergyLaw", from_py_object)]
+#[derive(Clone)]
+struct PyEnergyLaw {
+    inner: EnergyLaw,
+}
+
+#[pymethods]
+impl PyEnergyLaw {
+    /// Energy-independent constant value.
+    #[staticmethod]
+    #[pyo3(name = "const")]
+    fn const_law(value: f64) -> Self {
+        Self {
+            inner: EnergyLaw::Const(value),
+        }
+    }
+
+    /// `a0·√(E[eV]) + a1` — leading epithermal scaling of the fast rate α(E).
+    #[staticmethod]
+    fn sqrt_e(a0: f64, a1: f64) -> Self {
+        Self {
+            inner: EnergyLaw::SqrtE { a0, a1 },
+        }
+    }
+
+    /// Mantid IC form `1/(a0 + a1·λ)`, λ[Å] ∝ 1/√E (α ∝ √E low-E, → 1/a0 high-E).
+    #[staticmethod]
+    fn inverse_lambda(a0: f64, a1: f64) -> Self {
+        Self {
+            inner: EnergyLaw::InverseLambda { a0, a1 },
+        }
+    }
+
+    /// `exp(−E[meV]/kappa)` — storage fraction R(E), → 0 in the eV regime.
+    #[staticmethod]
+    fn exp_mev(kappa: f64) -> Self {
+        Self {
+            inner: EnergyLaw::ExpMilliEv { kappa },
+        }
+    }
+
+    /// Evaluate the law at `energy_ev` (eV).
+    fn eval(&self, energy_ev: f64) -> f64 {
+        self.inner.eval(energy_ev)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("EnergyLaw({:?})", self.inner)
+    }
+}
+
+/// Analytical Ikeda–Carpenter instrument-resolution model.
+///
+/// Synthesizes a dense tabulated kernel at construction; pass
+/// [`IkedaCarpenter.as_tabulated`] anywhere a loaded resolution file is
+/// accepted (e.g. `precompute_cross_sections`, `fit_spectrum`). The synthesized
+/// kernel rides the *same* broadening path as a Monte-Carlo file, so the
+/// IC-vs-tabulated comparison differs only in kernel source.
+///
+/// Parameters: `alpha`/`r` are [`EnergyLaw`]s (fixed-or-fit general case),
+/// `beta` (1/µs) is the storage rate; optional `burst_sigma_us` (Gaussian) and
+/// `channel_fwhm_us` (triangle) fold in the proton-burst and chopper terms.
+#[pyclass(name = "IkedaCarpenter", skip_from_py_object)]
+#[derive(Clone)]
+struct PyIkedaCarpenter {
+    inner: Arc<IkedaCarpenter>,
+}
+
+#[pymethods]
+impl PyIkedaCarpenter {
+    #[new]
+    #[pyo3(signature = (
+        flight_path_m,
+        e_min_ev,
+        e_max_ev,
+        alpha,
+        beta,
+        r,
+        n_energies = 64,
+        n_tau = 600,
+        burst_sigma_us = None,
+        channel_fwhm_us = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        flight_path_m: f64,
+        e_min_ev: f64,
+        e_max_ev: f64,
+        alpha: PyEnergyLaw,
+        beta: f64,
+        r: PyEnergyLaw,
+        n_energies: usize,
+        n_tau: usize,
+        burst_sigma_us: Option<f64>,
+        channel_fwhm_us: Option<f64>,
+    ) -> PyResult<Self> {
+        let params = IkedaCarpenterParams {
+            alpha: alpha.inner,
+            beta,
+            r: r.inner,
+            burst_sigma_us,
+            channel_fwhm_us,
+        };
+        let grid = SynthesisGrid {
+            e_min_ev,
+            e_max_ev,
+            n_energies,
+            n_tau,
+        };
+        let ic = IkedaCarpenter::new(params, flight_path_m, &grid)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(Self {
+            inner: Arc::new(ic),
+        })
+    }
+
+    /// The synthesized tabulated kernel — pass this anywhere a loaded
+    /// resolution file (`TabulatedResolution`) is accepted.
+    fn as_tabulated(&self) -> PyTabulatedResolution {
+        PyTabulatedResolution {
+            inner: Arc::new(self.inner.tabulated().clone()),
+        }
+    }
+
+    /// `(tof_offsets_us, weights)` kernel at a single energy (eV); offsets
+    /// ascending with the mode at 0, weights peak-normalized.
+    fn kernel_at(&self, energy_ev: f64) -> (Vec<f64>, Vec<f64>) {
+        self.inner.kernel_at(energy_ev)
+    }
+
+    /// Flight path length in meters.
+    #[getter]
+    fn flight_path_m(&self) -> f64 {
+        self.inner.flight_path_m()
+    }
+
+    /// Number of synthesized reference energies.
+    #[getter]
+    fn n_energies(&self) -> usize {
+        self.inner.ref_energies().len()
+    }
+
+    fn __repr__(&self) -> String {
+        let e = self.inner.ref_energies();
+        format!(
+            "IkedaCarpenter(n_energies={}, range=[{:.4e}, {:.4e}] eV, flight_path={:.1} m)",
+            e.len(),
+            e.first().copied().unwrap_or(0.0),
+            e.last().copied().unwrap_or(0.0),
             self.inner.flight_path_m(),
         )
     }
@@ -2550,6 +2712,8 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyResonanceData>()?;
     m.add_class::<PyFitResult>()?;
     m.add_class::<PyTabulatedResolution>()?;
+    m.add_class::<PyEnergyLaw>()?;
+    m.add_class::<PyIkedaCarpenter>()?;
     m.add_class::<PySpatialResult>()?;
     m.add_class::<PyTraceDetectabilityReport>()?;
     m.add_function(wrap_pyfunction!(cross_sections, m)?)?;

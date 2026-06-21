@@ -224,6 +224,75 @@ class TabulatedResolution:
         """Number of points per kernel."""
         ...
 
+class EnergyLaw:
+    """Energy-dependence law for an Ikeda-Carpenter parameter.
+
+    Build via the static constructors; pass to :class:`IkedaCarpenter`.
+    """
+
+    @staticmethod
+    def const(value: float) -> EnergyLaw:
+        """Energy-independent constant value."""
+        ...
+
+    @staticmethod
+    def sqrt_e(a0: float, a1: float) -> EnergyLaw:
+        """``a0*sqrt(E[eV]) + a1`` — leading epithermal scaling of alpha(E)."""
+        ...
+
+    @staticmethod
+    def inverse_lambda(a0: float, a1: float) -> EnergyLaw:
+        """Mantid IC form ``1/(a0 + a1*lambda)`` (alpha ~ sqrt(E) low-E)."""
+        ...
+
+    @staticmethod
+    def exp_mev(kappa: float) -> EnergyLaw:
+        """``exp(-E[meV]/kappa)`` — storage fraction R(E), ->0 in the eV regime."""
+        ...
+
+    def eval(self, energy_ev: float) -> float:
+        """Evaluate the law at ``energy_ev`` (eV)."""
+        ...
+
+class IkedaCarpenter:
+    """Analytical Ikeda-Carpenter instrument-resolution model.
+
+    Synthesizes a dense tabulated kernel at construction; pass
+    :meth:`as_tabulated` anywhere a loaded resolution file is accepted
+    (e.g. ``precompute_cross_sections``, ``forward_model``, the fitters).
+    """
+
+    def __init__(
+        self,
+        flight_path_m: float,
+        e_min_ev: float,
+        e_max_ev: float,
+        alpha: EnergyLaw,
+        beta: float,
+        r: EnergyLaw,
+        n_energies: int = 64,
+        n_tau: int = 600,
+        burst_sigma_us: float | None = None,
+        channel_fwhm_us: float | None = None,
+    ) -> None: ...
+    def as_tabulated(self) -> TabulatedResolution:
+        """The synthesized tabulated kernel (usable as a resolution file)."""
+        ...
+
+    def kernel_at(self, energy_ev: float) -> tuple[list[float], list[float]]:
+        """``(tof_offsets_us, weights)`` at one energy; mode at offset 0."""
+        ...
+
+    @property
+    def flight_path_m(self) -> float:
+        """Flight path length in meters."""
+        ...
+
+    @property
+    def n_energies(self) -> int:
+        """Number of synthesized reference energies."""
+        ...
+
 class SpatialResult:
     """Result of per-pixel spatial mapping (LM fitter)."""
 

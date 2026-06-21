@@ -79,3 +79,14 @@ ModelJacobianResult
 # explicit background" subsection.
 # ---------------------------------------------------------------------------
 from_counts_with_nuisance
+
+# ---------------------------------------------------------------------------
+# Ikeda-Carpenter analytical resolution model + its EnergyLaw parameter
+# helper (epic #394 resolution cross-validation).  Research-stage API used
+# to adjudicate the VENUS resolution (Gaussian vs tabulated-UDD vs IC); not
+# yet part of the curated user narrative.  Move OUT of the allowlist once
+# the resolution cross-validation feature/paper lands and
+# docs/guide/src/python-api.md gains a "Resolution models" section.
+# ---------------------------------------------------------------------------
+EnergyLaw
+IkedaCarpenter
