@@ -427,4 +427,98 @@ mod tests {
             assert_eq!(r.theta.len(), if label == "ic" { 3 } else { 2 });
         }
     }
+
+    #[test]
+    fn n_params_matches_family() {
+        assert_eq!(ResolutionFamily::Gaussian.n_params(), 2);
+        assert_eq!(
+            ResolutionFamily::UddCorr {
+                base: Arc::new(synthetic_base_udd())
+            }
+            .n_params(),
+            2
+        );
+        assert_eq!(ResolutionFamily::IkedaCarpenter.n_params(), 3);
+    }
+
+    #[test]
+    fn rejects_empty_and_mismatched_inputs() {
+        let iso = synthetic_isotope(72, 178, 20.0, 0.05, 0.06);
+        let sample = SampleParams::new(300.0, vec![(iso, 2.0e-3)]).unwrap();
+        let cfg = CalibrationConfig::default();
+        assert!(matches!(
+            calibrate_resolution(ResolutionFamily::Gaussian, &[], &[], &[], &sample, &cfg),
+            Err(FittingError::EmptyData)
+        ));
+        let e = vec![1.0, 2.0, 3.0];
+        let d = vec![0.5, 0.5];
+        let u = vec![0.1, 0.1];
+        assert!(matches!(
+            calibrate_resolution(ResolutionFamily::Gaussian, &e, &d, &u, &sample, &cfg),
+            Err(FittingError::LengthMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn invalid_flight_path_propagates_build_error() {
+        // flight_path <= 0 makes ResolutionParams::new fail on every eval, so the
+        // calibration cannot build a resolution and returns an error.
+        let iso = synthetic_isotope(72, 178, 20.0, 0.05, 0.06);
+        let sample = SampleParams::new(300.0, vec![(iso, 2.0e-3)]).unwrap();
+        let e: Vec<f64> = (0..60).map(|i| 15.0 + i as f64 * 0.2).collect();
+        let d = vec![0.9; 60];
+        let u = vec![0.01; 60];
+        let cfg = CalibrationConfig {
+            flight_path_m: -1.0,
+            ..Default::default()
+        };
+        assert!(
+            calibrate_resolution(ResolutionFamily::Gaussian, &e, &d, &u, &sample, &cfg).is_err()
+        );
+    }
+
+    #[test]
+    fn inner_chi2_background_path_and_degenerate_model() {
+        // 3-column baseline fit (anorm + const + linear) recovers an offset exactly.
+        let model = vec![0.9, 0.7, 0.5, 0.8, 0.6];
+        let data: Vec<f64> = model.iter().map(|m| 0.5 * m + 0.1).collect();
+        let unc = vec![0.01; 5];
+        assert!(inner_chi2(&data, &unc, &model, true) < 1e-12);
+        // all-zero model -> singular normal equations -> solve_small returns zeros, finite chi2.
+        let v = inner_chi2(&data, &unc, &[0.0; 5], false);
+        assert!(v.is_finite());
+    }
+
+    #[test]
+    fn calibrate_with_background_runs() {
+        let iso = synthetic_isotope(72, 178, 20.0, 0.05, 0.06);
+        let sample = SampleParams::new(300.0, vec![(iso, 2.0e-3)]).unwrap();
+        let energies: Vec<f64> = (0..200).map(|i| 14.0 + i as f64 * 0.06).collect();
+        let base = synthetic_base_udd();
+        let truth =
+            ResolutionFunction::Tabulated(Arc::new(base.width_corrected(1.3, 0.0, UDD_E_REF)));
+        let data = forward_model(
+            &energies,
+            &sample,
+            Some(&InstrumentParams { resolution: truth }),
+        )
+        .unwrap();
+        let unc = vec![0.004; energies.len()];
+        let cfg = CalibrationConfig {
+            fit_background: true,
+            ..Default::default()
+        };
+        let r = calibrate_resolution(
+            ResolutionFamily::UddCorr {
+                base: Arc::new(base),
+            },
+            &energies,
+            &data,
+            &unc,
+            &sample,
+            &cfg,
+        )
+        .unwrap();
+        assert!(r.chi2_dof.is_finite());
+    }
 }

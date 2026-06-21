@@ -2524,6 +2524,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn width_corrected_zero_weight_block_falls_back_to_zero_pivot() {
+        // A degenerate all-zero-weight kernel has no centroid; the scale pivots
+        // about 0 rather than dividing by a zero weight sum.
+        let tab = TabulatedResolution::from_kernels(
+            vec![10.0],
+            vec![(vec![-1.0, 0.0, 2.0], vec![0.0, 0.0, 0.0])],
+            25.0,
+        )
+        .unwrap();
+        let wc = tab.width_corrected(2.0, 0.0, 10.0);
+        assert_eq!(wc.kernels()[0].0, vec![-2.0, 0.0, 4.0]); // scaled about 0
+    }
+
     // ── Smoke tests for the test_support oracles (`interp_spectrum` +
     //    `broaden_presorted_reference`).  The 7+ bit-exact tests below
     //    exercise the math thoroughly; these smoke tests just pin the

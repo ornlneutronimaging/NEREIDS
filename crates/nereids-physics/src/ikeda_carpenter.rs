@@ -35,7 +35,7 @@
 //!
 //! (re-derived and confirmed against the Codex independent derivation and the
 //! SAMMY-RPI χ²+double-exp moderator form). Both terms are individually
-//! unit-area, so `I` is unit-area for any α,β>0 and R∈[0,1], with first moment
+//! unit-area, so `I` is unit-area for any α,β>0 and 0≤R≤1, with first moment
 //! `⟨τ⟩ = 3/α + R/β`. The asymmetry — sharp rise, long tail toward larger τ
 //! (later TOF, lower apparent energy) — is the physical origin of the
 //! asymmetric MC kernel.
@@ -45,7 +45,7 @@
 //! - `α(E)` [1/µs]: fast moderation/leakage rate; sets the prompt width.
 //!   Leading epithermal scaling `α ∝ √E` (Mantid `α = 1/(α₀+α₁λ)`, λ ∝ 1/√E).
 //! - `β` [1/µs]: slow storage rate; sets the delayed tail. Energy-independent.
-//! - `R(E)` ∈ [0,1]: storage mixing fraction; `R ≈ exp(−E_meV/κ)` → **R→0 in
+//! - `R(E)`, 0 ≤ R ≤ 1: storage mixing fraction; `R ≈ exp(−E_meV/κ)` → **R→0 in
 //!   the 1–200 eV resonance regime**, so IC there is dominated by the
 //!   one-parameter prompt Gamma(3, α(E)) term.
 //!
@@ -77,7 +77,7 @@
 
 use crate::resolution::{ResolutionParseError, TabulatedResolution};
 
-/// de Broglie wavelength factor: λ[Å] = `LAMBDA_ANGSTROM_FACTOR` / √(E[eV]).
+/// de Broglie wavelength factor: λ (Å) = `LAMBDA_ANGSTROM_FACTOR` / √(E in eV).
 ///
 /// `λ = h/√(2·m_n·E)`; with CODATA 2018 `h`, `m_n` and the 2019-SI eV this is
 /// `0.285993 Å·√eV`. Used only by [`EnergyLaw::InverseLambda`]; its precise
@@ -118,7 +118,7 @@ fn h_over_cube(u: f64) -> f64 {
 ///
 /// `τ` in µs, rates `α,β` in 1/µs, mixing `r ∈ [0,1]`. Returns 0 for `τ < 0`.
 /// Unit-area over `τ ∈ [0,∞)`; first moment `3/α + r/β`. Numerically stable for
-/// all `α,β > 0` including `α ≈ β` (see [`h_over_cube`]).
+/// all `α,β > 0` including `α ≈ β` (see `h_over_cube`).
 #[must_use]
 pub fn ic_pulse(alpha: f64, beta: f64, r: f64, tau: f64) -> f64 {
     if !tau.is_finite() || tau < 0.0 {
@@ -148,7 +148,7 @@ pub enum EnergyLaw {
     Const(f64),
     /// `a0·√(E[eV]) + a1` — leading epithermal scaling of the fast rate `α(E)`.
     SqrtE { a0: f64, a1: f64 },
-    /// Mantid IC form `1/(a0 + a1·λ)`, λ[Å] = `LAMBDA_ANGSTROM_FACTOR`/√E.
+    /// Mantid IC form `1/(a0 + a1·λ)`, λ (Å) = `LAMBDA_ANGSTROM_FACTOR`/√E.
     /// Behaves as `α ∝ √E` at low E and saturates to `1/a0` at high E.
     InverseLambda { a0: f64, a1: f64 },
     /// `exp(−E[meV]/kappa)` — storage fraction `R(E)`, → 0 in the eV regime.
@@ -195,7 +195,7 @@ pub struct IkedaCarpenterParams {
     pub alpha: EnergyLaw,
     /// Slow (storage) rate `β`, 1/µs. Energy-independent, must be > 0.
     pub beta: f64,
-    /// Storage mixing fraction `R(E)` ∈ [0,1].
+    /// Storage mixing fraction `R(E)`, 0 ≤ R ≤ 1.
     pub r: EnergyLaw,
     /// Optional proton-burst Gaussian standard deviation (µs).
     pub burst_sigma_us: Option<f64>,
