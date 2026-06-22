@@ -1281,6 +1281,22 @@ fn calibrate_resolution(
         }
         expanded
     };
+    // Validate the calibrant composition: at least one isotope with a finite,
+    // positive areal density (otherwise the calibrant has no resonances to fit
+    // the resolution against, and the optimization is degenerate).
+    if sample_isotopes.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "calibrant has no isotopes/groups; provide a known composition with densities > 0",
+        ));
+    }
+    if !sample_isotopes
+        .iter()
+        .any(|(_, d)| d.is_finite() && *d > 0.0)
+    {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "calibrant densities must include at least one finite, positive value",
+        ));
+    }
     let sample = SampleParams::new(temperature_k, sample_isotopes)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 

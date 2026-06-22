@@ -1653,6 +1653,15 @@ impl TabulatedResolution {
                     weights.len(),
                 )));
             }
+            // Reject non-finite synthesized kernels (e.g. a poisoned analytic
+            // pulse) so a NaN table fails loudly here rather than silently
+            // degrading the convolution to pass-through (a NaN norm bypasses the
+            // division guard in `broaden_presorted`).
+            if offsets.iter().chain(weights.iter()).any(|v| !v.is_finite()) {
+                return Err(ResolutionParseError::InvalidFormat(format!(
+                    "Kernel {i} contains non-finite offset/weight values"
+                )));
+            }
         }
         Ok(TabulatedResolution {
             ref_energies,
@@ -2113,8 +2122,9 @@ pub(crate) fn apply_resolution_presorted(
 
 /// Build a broadening plan for `(energies, resolution)`.
 ///
-/// Returns `Some(plan)` for [`ResolutionFunction::Tabulated`] — the
-/// plan hoists the per-target TOF / kernel-interpolation / bracket
+/// Returns `Some(plan)` for [`ResolutionFunction::Tabulated`] and
+/// [`ResolutionFunction::IkedaCarpenter`] (which rides its synthesized tabulated
+/// kernel) — the plan hoists the per-target TOF / kernel-interpolation / bracket
 /// / trap-weight work that would otherwise run on every call to
 /// [`apply_resolution`].  Returns `None` for
 /// [`ResolutionFunction::Gaussian`] — the Gaussian path has no

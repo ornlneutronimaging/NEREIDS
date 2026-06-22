@@ -63,9 +63,13 @@
 //! log-energy interref interpolation still acts at apply time, but IC synthesizes
 //! a dense reference grid (default 64 energies), so the interpolation error
 //! between adjacent references is negligible. The kernel is anchored with its
-//! **mode at offset 0** (peak-centering); `interpolated_kernel` does not
-//! re-center it, so — with the TOF energy-scale `t0/L` fit separately to
-//! resonance positions — the broadened peak stays at the nominal energy.
+//! **mode at offset 0** (peak-centering), matching the UDD file convention
+//! (peak at offset 0); `interpolated_kernel` does not re-center it. Because the
+//! IC pulse is skewed, its *mean* lags its mode, so a broadened resonance's
+//! centroid carries a small TOF lag whose constant part is absorbed by the fitted
+//! `t0/L` energy-scale. Its residual energy-dependent part (the mode→mean offset
+//! varies with α(E)) is a known, bounded limitation shared with the peak-centered
+//! UDD kernel — it does not move the broadened *peak* off the nominal energy.
 //!
 //! ## Optional instrument convolutions
 //!
@@ -96,29 +100,24 @@ pub const DEFAULT_N_ENERGIES: usize = 64;
 /// Default number of τ-samples spanning the prompt core of each kernel.
 pub const DEFAULT_N_TAU: usize = 600;
 
-/// `h(u)/u³` where `h(u) = 1 − e^{−u}(1 + u + ½u²)`, evaluated stably.
-///
-/// The slow IC term is `β·α³·τ³·e^{−βτ}·h(γτ)/(γτ)³` with `γ = α−β`. Written
-/// this way it has **no catastrophic cancellation** as `γ → 0` (α → β), unlike
-/// the raw `β(α/γ)³[…]` form whose `(α/γ)³` prefactor blows up while the
-/// bracket vanishes. As `u → 0`, `h(u)/u³ → 1/6`, recovering the Gamma(4)
-/// limit `α⁴τ³/6·e^{−ατ}` at `α = β`.
+/// Taylor expansion of `h(u)/u³` where `h(u) = 1 − e^{−u}(1 + u + ½u²)`, for
+/// `|u|` small (the `α ≈ β` limit), where direct evaluation cancels
+/// catastrophically. As `u → 0`, `h(u)/u³ → 1/6`.
 #[inline]
-fn h_over_cube(u: f64) -> f64 {
-    if u.abs() < 0.05 {
-        // Taylor: h(u)/u³ = 1/6 − u/8 + u²/20 − u³/72 + O(u⁴).
-        let u2 = u * u;
-        1.0 / 6.0 - u / 8.0 + u2 / 20.0 - u2 * u / 72.0
-    } else {
-        (1.0 - (-u).exp() * (1.0 + u + 0.5 * u * u)) / (u * u * u)
-    }
+fn h_over_cube_taylor(u: f64) -> f64 {
+    // h(u)/u³ = 1/6 − u/8 + u²/20 − u³/72 + O(u⁴).
+    let u2 = u * u;
+    1.0 / 6.0 - u / 8.0 + u2 / 20.0 - u2 * u / 72.0
 }
 
 /// Ikeda–Carpenter moderator emission density `I(τ)`.
 ///
 /// `τ` in µs, rates `α,β` in 1/µs, mixing `r ∈ [0,1]`. Returns 0 for `τ < 0`.
-/// Unit-area over `τ ∈ [0,∞)`; first moment `3/α + r/β`. Numerically stable for
-/// all `α,β > 0` including `α ≈ β` (see `h_over_cube`).
+/// Unit-area over `τ ∈ [0,∞)`; first moment `3/α + r/β`. **NaN-free** for all
+/// `α,β > 0` (including `α ≈ β` and `β ≫ α`): the slow/storage term is evaluated
+/// from the bounded bracket `e^{−βτ} − e^{−ατ}(1+u+½u²)` (both exponentials ≤ 1
+/// for `τ,α,β > 0`, so no `e^{|u|}` overflow), falling back to a Taylor limit
+/// near `u = α−β·τ → 0` where that bracket cancels.
 #[must_use]
 pub fn ic_pulse(alpha: f64, beta: f64, r: f64, tau: f64) -> f64 {
     if !tau.is_finite() || tau < 0.0 {
@@ -132,8 +131,18 @@ pub fn ic_pulse(alpha: f64, beta: f64, r: f64, tau: f64) -> f64 {
     if r <= 0.0 {
         return fast;
     }
+    // slow/storage term = β(α/γ)³[e^{−βτ} − e^{−ατ}(1+u+½u²)], u = γτ = (α−β)τ.
     let u = (alpha - beta) * tau;
-    let slow = beta * alpha.powi(3) * tau.powi(3) * (-beta * tau).exp() * h_over_cube(u);
+    let coeff = beta * alpha.powi(3) * tau.powi(3);
+    let slow = if u.abs() < 0.05 {
+        // α ≈ β: bracket/u³ → e^{−βτ}·h(u)/u³ (Taylor); avoids 0/0 cancellation.
+        coeff * (-beta * tau).exp() * h_over_cube_taylor(u)
+    } else {
+        // Bounded form: both exponentials are ≤ 1, so β ≫ α (u ≪ 0) cannot
+        // overflow (the old `e^{−βτ}·h(u)` factored an `e^{|u|}` → 0·∞ = NaN).
+        let bracket = (-beta * tau).exp() - (-alpha * tau).exp() * (1.0 + u + 0.5 * u * u);
+        coeff * bracket / (u * u * u)
+    };
     (1.0 - r) * fast + r * slow
 }
 
@@ -600,6 +609,29 @@ mod tests {
         // Near-degenerate (β just below α) must also be finite and close.
         let near = ic_pulse(a, a - 1e-9, 1.0, tau);
         assert!(near.is_finite() && (near - want).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pulse_is_finite_for_beta_much_greater_than_alpha() {
+        // Regression: β ≫ α with storage active previously produced NaN (the
+        // old e^{−βτ}·h(u) form factored an e^{|u|} that overflowed → 0·∞ = NaN).
+        for &tau in &[0.0, 1.0, 50.0, 400.0, 1000.0] {
+            let v = ic_pulse(0.05, 4.0, 0.5, tau);
+            assert!(
+                v.is_finite() && v >= 0.0,
+                "ic_pulse(0.05,4,0.5,{tau}) = {v}"
+            );
+        }
+        // The synthesized kernel must contain no non-finite entries.
+        let p = IkedaCarpenterParams {
+            alpha: EnergyLaw::Const(0.05),
+            beta: 4.0,
+            r: EnergyLaw::Const(0.5),
+            burst_sigma_us: None,
+            channel_fwhm_us: None,
+        };
+        let (offs, wts) = synth_kernel(&p, 600, 1.0);
+        assert!(offs.iter().chain(wts.iter()).all(|v| v.is_finite()));
     }
 
     #[test]

@@ -120,7 +120,11 @@ pub struct CalibrationConfig {
 impl Default for CalibrationConfig {
     fn default() -> Self {
         // Matches the validated Python calibrator (fatol=1e-3, not the
-        // NelderMeadConfig default 1e-4; IC grid 64×500).
+        // NelderMeadConfig default 1e-4). The IC synthesis grid is DELIBERATELY
+        // lighter than the standalone IkedaCarpenter default (64×500 here vs the
+        // DEFAULT_N_ENERGIES×DEFAULT_N_TAU = 64×600 synthesis default): the outer
+        // loop re-synthesizes the kernel on every evaluation, and 500 τ-samples is
+        // ample for χ²/dof comparison.
         Self {
             flight_path_m: 25.0,
             fit_background: false,
@@ -219,7 +223,13 @@ fn inner_chi2(data: &[f64], unc: &[f64], model: &[f64], fit_bg: bool) -> f64 {
             }
         }
     }
-    let coef = solve_small(&ata, &atb, k);
+    // A singular normal-equations system (e.g. a degenerate/constant model
+    // column) means anorm/baseline are unfit-able for this θ — report the point
+    // as infeasible so the optimizer steps away, rather than a spuriously
+    // inflated finite χ² from a zeroed solution.
+    let Some(coef) = solve_small(&ata, &atb, k) else {
+        return f64::INFINITY;
+    };
     let mut ssr = 0.0;
     for i in 0..n {
         let w2 = 1.0 / unc[i].max(1e-9).powi(2);
@@ -240,9 +250,8 @@ fn inner_chi2(data: &[f64], unc: &[f64], model: &[f64], fit_bg: bool) -> f64 {
 }
 
 /// Solve a small `k×k` linear system `A x = b` (k ≤ 3) by Gaussian elimination
-/// with partial pivoting. Returns zeros on a singular system (the objective
-/// then reports a large residual and the optimizer steps away).
-fn solve_small(a: &[f64], b: &[f64], k: usize) -> Vec<f64> {
+/// with partial pivoting. Returns `None` on a singular system.
+fn solve_small(a: &[f64], b: &[f64], k: usize) -> Option<Vec<f64>> {
     let mut m = a.to_vec();
     let mut y = b.to_vec();
     for col in 0..k {
@@ -253,7 +262,7 @@ fn solve_small(a: &[f64], b: &[f64], k: usize) -> Vec<f64> {
             }
         }
         if m[piv * k + col].abs() < 1e-300 {
-            return vec![0.0; k];
+            return None;
         }
         if piv != col {
             for c in 0..k {
@@ -277,7 +286,7 @@ fn solve_small(a: &[f64], b: &[f64], k: usize) -> Vec<f64> {
         }
         x[col] = s / m[col * k + col];
     }
-    x
+    Some(x)
 }
 
 /// Calibrate the resolution parameters of `family` against a known-(ρ,T)
@@ -319,6 +328,19 @@ pub fn calibrate_resolution(
             "energies, data must be finite and uncertainty finite and > 0".into(),
         ));
     }
+    // Reject under-determined calibrants: need more data points than the total
+    // free parameters (resolution params + the anorm/baseline columns), else the
+    // reported χ²/dof is meaningless.
+    let baseline_cols = if config.fit_background { 3 } else { 1 };
+    if data.len() <= family.n_params() + baseline_cols {
+        return Err(FittingError::InvalidConfig(format!(
+            "calibrant has {} points but the model has {} resolution + {} baseline parameters; \
+             need strictly more data points than parameters",
+            data.len(),
+            family.n_params(),
+            baseline_cols,
+        )));
+    }
     let e_min = energies.first().copied().unwrap_or(1.0);
     let e_max = energies.last().copied().unwrap_or(1.0);
     let (x0, bounds) = family.x0_bounds();
@@ -331,7 +353,14 @@ pub fn calibrate_resolution(
 
     let mut best: Option<NelderMeadResult> = None;
     for r in 0..config.restarts.max(1) {
-        let start: Vec<f64> = x0.iter().map(|&v| v * (1.0 + 0.1 * r as f64)).collect();
+        // Additive perturbation (a fraction of each parameter's bound range) so
+        // restarts move even for zero-valued start components — a multiplicative
+        // `x0·(1+0.1r)` left `udd_corr`'s `[0, 0]` start identical every restart.
+        let start: Vec<f64> = x0
+            .iter()
+            .zip(&bounds)
+            .map(|(&v, &(lo, hi))| (v + 0.1 * r as f64 * (hi - lo)).clamp(lo, hi))
+            .collect();
         let obj = |theta: &[f64]| -> Result<f64, FittingError> {
             let res = build_resolution(&family, theta, e_min, e_max, config)?;
             let inst = InstrumentParams { resolution: res };
@@ -348,6 +377,13 @@ pub fn calibrate_resolution(
         }
     }
     let best = best.expect("at least one restart runs");
+    if !best.fun.is_finite() {
+        return Err(FittingError::EvaluationFailed(
+            "calibration found no finite-χ² resolution (the forward model failed for every \
+             parameter vector tried)"
+                .into(),
+        ));
+    }
     let resolution = build_resolution(&family, &best.x, e_min, e_max, config)?;
     Ok(CalibrationResult {
         family: family.label().to_string(),
@@ -534,9 +570,10 @@ mod tests {
         let data: Vec<f64> = model.iter().map(|m| 0.5 * m + 0.1).collect();
         let unc = vec![0.01; 5];
         assert!(inner_chi2(&data, &unc, &model, true) < 1e-12);
-        // all-zero model -> singular normal equations -> solve_small returns zeros, finite chi2.
+        // all-zero model -> singular normal equations -> infeasible (χ²=∞), so the
+        // optimizer steps away rather than seeing a spuriously inflated finite χ².
         let v = inner_chi2(&data, &unc, &[0.0; 5], false);
-        assert!(v.is_finite());
+        assert_eq!(v, f64::INFINITY);
     }
 
     #[test]
