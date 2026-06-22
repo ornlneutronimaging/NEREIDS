@@ -765,6 +765,64 @@ mod tests {
     }
 
     #[test]
+    fn cross_family_chi2_selects_the_true_shape() {
+        // Model-family discrimination: an asymmetric IC-broadened calibrant must be
+        // best-fit by the IC family and clearly worse by the symmetric Gaussian.
+        // Because the position nuisance lets the Gaussian absorb the centroid
+        // offset, the discrimination is on SHAPE, not position — the whole point of
+        // the fairness fix. Truth has NO width-correction/Gaussian generator, so the
+        // Gaussian arm is a genuinely different shape (not loop-closure).
+        let iso_lo = synthetic_isotope(72, 178, 15.0, 0.05, 0.06);
+        let iso_hi = synthetic_isotope(72, 179, 45.0, 0.05, 0.06);
+        let sample = SampleParams::new(300.0, vec![(iso_lo, 2.0e-3), (iso_hi, 2.0e-3)]).unwrap();
+        let energies: Vec<f64> = (0..700).map(|i| 8.0 + i as f64 * 0.06).collect();
+        let ic = IkedaCarpenter::new(
+            IkedaCarpenterParams {
+                alpha: EnergyLaw::SqrtE { a0: 0.30, a1: 0.0 },
+                beta: IC_FIXED_BETA,
+                r: EnergyLaw::ExpMilliEv { kappa: 25.0 },
+                burst_sigma_us: None,
+                channel_fwhm_us: None,
+            },
+            25.0,
+            &SynthesisGrid {
+                e_min_ev: 4.0,
+                e_max_ev: 100.0,
+                n_energies: 64,
+                n_tau: 500,
+            },
+        )
+        .unwrap();
+        let truth = ResolutionFunction::IkedaCarpenter(Arc::new(ic));
+        let data = forward_model(
+            &energies,
+            &sample,
+            Some(&InstrumentParams { resolution: truth }),
+        )
+        .unwrap();
+        let unc = vec![0.004; energies.len()];
+        let cfg = CalibrationConfig {
+            restarts: 3,
+            ..Default::default()
+        };
+        let chi2 = |fam| {
+            calibrate_resolution(fam, &energies, &data, &unc, &sample, &cfg)
+                .unwrap()
+                .chi2_dof
+        };
+        let ic_chi2 = chi2(ResolutionFamily::IkedaCarpenter);
+        let gau_chi2 = chi2(ResolutionFamily::Gaussian);
+        assert!(
+            ic_chi2 < gau_chi2,
+            "true (IC) shape χ²={ic_chi2} should beat the Gaussian χ²={gau_chi2}"
+        );
+        assert!(
+            ic_chi2 < 1.0,
+            "IC (true shape) should fit well: χ²={ic_chi2}"
+        );
+    }
+
+    #[test]
     fn gaussian_and_ic_families_run_and_converge() {
         let iso = synthetic_isotope(72, 178, 20.0, 0.05, 0.06);
         let sample = SampleParams::new(300.0, vec![(iso, 2.0e-3)]).unwrap();

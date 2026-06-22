@@ -1725,6 +1725,15 @@ impl TabulatedResolution {
                     "Kernel {i} contains non-finite offset/weight values"
                 )));
             }
+            // Offsets must be strictly ascending: `broaden_presorted`/`plan` walk a
+            // monotonic two-pointer bracket and derive trapezoidal `dt` widths from
+            // `offsets[k+1] − offsets[k−1]`, both of which assume sorted offsets.
+            // An unsorted kernel would otherwise broaden silently-wrong, not error.
+            if !offsets.windows(2).all(|w| w[0] < w[1]) {
+                return Err(ResolutionParseError::InvalidFormat(format!(
+                    "Kernel {i} TOF offsets must be strictly ascending"
+                )));
+            }
         }
         Ok(TabulatedResolution {
             ref_energies,
@@ -2697,6 +2706,24 @@ mod tests {
             TabulatedResolution::from_kernels(vec![10.0], vec![(vec![0.0], vec![1.0])], 25.0)
                 .is_ok()
         );
+        // Unsorted offsets are rejected — the broadener walks a monotonic two-
+        // pointer bracket and derives trapezoidal widths assuming sorted offsets.
+        let unsorted = TabulatedResolution::from_kernels(
+            vec![10.0],
+            vec![(vec![0.0, -1.0, 2.0], vec![0.2, 1.0, 0.2])],
+            25.0,
+        );
+        assert!(
+            matches!(unsorted, Err(ResolutionParseError::InvalidFormat(_))),
+            "unsorted offsets should be rejected, got {unsorted:?}"
+        );
+        // Duplicate offsets (non-strict) are also rejected.
+        let dup = TabulatedResolution::from_kernels(
+            vec![10.0],
+            vec![(vec![-1.0, 0.0, 0.0, 2.0], vec![0.1, 1.0, 1.0, 0.1])],
+            25.0,
+        );
+        assert!(matches!(dup, Err(ResolutionParseError::InvalidFormat(_))));
     }
 
     #[test]
