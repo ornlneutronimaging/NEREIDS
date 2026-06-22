@@ -1335,6 +1335,23 @@ fn calibrate_resolution(
         }
     };
 
+    // For family='ic' these size the kernel-synthesis grid; validate up front so an
+    // out-of-range value gives a precise error instead of the generic "no finite-χ²
+    // resolution" (every IkedaCarpenter::new eval would otherwise fail). They are
+    // inert for the gaussian/udd_corr families.
+    if matches!(fam, ResolutionFamily::IkedaCarpenter) {
+        if ic_n_energies < 2 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "ic_n_energies must be >= 2 for family='ic', got {ic_n_energies}"
+            )));
+        }
+        if ic_n_tau < 8 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "ic_n_tau must be >= 8 for family='ic', got {ic_n_tau}"
+            )));
+        }
+    }
+
     let cfg = CalibrationConfig {
         flight_path_m,
         fit_background,

@@ -870,6 +870,13 @@ impl TabulatedResolution {
     /// stay orthogonal (`t0`/`L` handle absolute position). Weights are unchanged;
     /// the apply-time trapezoidal renormalization preserves unit area.
     ///
+    /// The pivot is the **trapezoidal-weighted** centroid `Σ o·w·dt / Σ w·dt`,
+    /// using the *same* `dt` quadrature weights as the broadening integral (see
+    /// [`Self::broaden`]). Because `dt` is itself affine in the offsets, the width
+    /// scale multiplies every `dt` by `s`, so the integrated centroid is preserved
+    /// exactly on **any** offset grid (uniform or not) — not just on uniform grids
+    /// where the trapezoidal and plain centroids happen to coincide.
+    ///
     /// `s0 = 1, p = 0` returns a width-identical copy. This is the fittable model
     /// behind the `udd_corr` resolution-calibration family: it trusts the
     /// Monte-Carlo *shape* and calibrates only its width / energy-dependence.
@@ -900,12 +907,29 @@ impl TabulatedResolution {
                 if !(s.is_finite() && s > 0.0) {
                     return Err(ResolutionError::InvalidWidthCorrection { s0, p, e_ref });
                 }
-                let wsum: f64 = weights.iter().sum();
-                let centroid = if wsum > 0.0 {
-                    offsets.iter().zip(weights).map(|(o, w)| o * w).sum::<f64>() / wsum
-                } else {
-                    0.0
+                // Pivot about the trapezoidal-weighted centroid (matching the
+                // `dt`-weighting in `broaden_presorted`), so the *integrated*
+                // centroid is preserved on non-uniform offset grids — not only on
+                // uniform grids where this reduces to the plain centroid.
+                let n_k = offsets.len();
+                let dt_width = |k: usize| -> f64 {
+                    if n_k <= 1 {
+                        1.0
+                    } else if k == 0 {
+                        offsets[1] - offsets[0]
+                    } else if k == n_k - 1 {
+                        offsets[k] - offsets[k - 1]
+                    } else {
+                        (offsets[k + 1] - offsets[k - 1]) * 0.5
+                    }
                 };
+                let (mut cnum, mut cden) = (0.0, 0.0);
+                for (k, (&o, &w)) in offsets.iter().zip(weights).enumerate() {
+                    let tw = w * dt_width(k).abs();
+                    cnum += o * tw;
+                    cden += tw;
+                }
+                let centroid = if cden > 0.0 { cnum / cden } else { 0.0 };
                 let scaled = offsets
                     .iter()
                     .map(|&o| centroid + s * (o - centroid))
@@ -2536,6 +2560,61 @@ mod tests {
         assert!(
             std_hi < std_lo,
             "p<0 should narrow higher E: {std_hi} !< {std_lo}"
+        );
+    }
+
+    #[test]
+    fn width_corrected_preserves_trapezoidal_centroid_on_nonuniform_grid() {
+        // On a NON-uniform offset grid the trapezoidal-weighted centroid (what the
+        // broadening integral actually integrates against) differs from the plain
+        // centroid. The width scale must pivot about the former, else the fitted
+        // width leaks into position. The uniform-grid test above cannot see this —
+        // there the two centroids coincide.
+        let offs = vec![-2.0, -1.5, 0.0, 0.5, 3.0]; // deliberately non-uniform
+        let wts = vec![0.2, 0.6, 1.0, 0.7, 0.2];
+        let tab =
+            TabulatedResolution::from_kernels(vec![10.0], vec![(offs.clone(), wts.clone())], 25.0)
+                .unwrap();
+
+        // Trapezoidal-weighted centroid, mirroring broaden_presorted's dt weights.
+        let trap_centroid = |o: &[f64], w: &[f64]| -> f64 {
+            let n = o.len();
+            let dt = |k: usize| -> f64 {
+                if n <= 1 {
+                    1.0
+                } else if k == 0 {
+                    o[1] - o[0]
+                } else if k == n - 1 {
+                    o[k] - o[k - 1]
+                } else {
+                    (o[k + 1] - o[k - 1]) * 0.5
+                }
+            };
+            let (mut num, mut den) = (0.0, 0.0);
+            for (k, (&oi, &wi)) in o.iter().zip(w).enumerate() {
+                let tw = wi * dt(k).abs();
+                num += oi * tw;
+                den += tw;
+            }
+            num / den
+        };
+        let plain_centroid = |o: &[f64], w: &[f64]| -> f64 {
+            o.iter().zip(w).map(|(a, b)| a * b).sum::<f64>() / w.iter().sum::<f64>()
+        };
+
+        let c_trap_before = trap_centroid(&offs, &wts);
+        // Sanity: on this grid the trapezoidal and plain centroids genuinely differ,
+        // so the test would fail under the old plain-centroid pivot.
+        assert!(
+            (c_trap_before - plain_centroid(&offs, &wts)).abs() > 1e-3,
+            "test grid not non-uniform enough"
+        );
+
+        let wc = tab.width_corrected(2.0, 0.0, 10.0).unwrap();
+        let c_trap_after = trap_centroid(&wc.kernels()[0].0, &wc.kernels()[0].1);
+        assert!(
+            (c_trap_after - c_trap_before).abs() < 1e-12,
+            "integrated centroid leaked under width scale: {c_trap_before} -> {c_trap_after}"
         );
     }
 

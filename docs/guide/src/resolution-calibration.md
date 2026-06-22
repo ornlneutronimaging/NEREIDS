@@ -63,6 +63,13 @@ T = nereids.forward_model(energies, [(hf, 5e-5)], temperature_k=300.0, resolutio
 `ic.kernel_at(energy_ev)` returns the `(tof_offsets_us, weights)` kernel at one
 energy for inspection.
 
+> **Performance note.** The IC kernel is re-synthesized per call and is not
+> plan-cached the way a loaded `TabulatedResolution` is, so using IC as a
+> *run-time* resolution while fitting the `t0`/`L` energy-scale over a large grid
+> is slower than the tabulated path. Resolution *calibration* is
+> once-per-experiment, so this does not affect the calibrate → pin → fit workflow;
+> for production spatial maps, pin the calibrated kernel via `as_tabulated()`.
+
 ## The calibrate → pin → fit procedure
 
 Instrument resolution and flight-path geometry are **beamline constants**;

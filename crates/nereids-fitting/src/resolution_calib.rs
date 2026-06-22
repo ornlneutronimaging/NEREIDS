@@ -518,6 +518,102 @@ mod tests {
     }
 
     #[test]
+    fn udd_corr_recovers_known_width_scale_and_exponent() {
+        // Two resonances at well-separated energies make the width EXPONENT p
+        // identifiable — a single resonance constrains only s(E) at one energy (a
+        // ridge in (s0, p)). Truth: s0=1.3, p=-0.5; the calibrator must recover
+        // both (the s0-only test never exercised the p knob).
+        let iso_lo = synthetic_isotope(72, 178, 15.0, 0.05, 0.06);
+        let iso_hi = synthetic_isotope(72, 179, 45.0, 0.05, 0.06);
+        let sample = SampleParams::new(300.0, vec![(iso_lo, 2.0e-3), (iso_hi, 2.0e-3)]).unwrap();
+        let energies: Vec<f64> = (0..700).map(|i| 8.0 + i as f64 * 0.06).collect();
+        let base = synthetic_base_udd();
+        let (s0_true, p_true) = (1.3, -0.5);
+        let truth = ResolutionFunction::Tabulated(Arc::new(
+            base.width_corrected(s0_true, p_true, UDD_E_REF).unwrap(),
+        ));
+        let data = forward_model(
+            &energies,
+            &sample,
+            Some(&InstrumentParams { resolution: truth }),
+        )
+        .unwrap();
+        let unc = vec![0.004; energies.len()];
+        let cfg = CalibrationConfig {
+            restarts: 3,
+            ..Default::default()
+        };
+        let r = calibrate_resolution(
+            ResolutionFamily::UddCorr {
+                base: Arc::new(base),
+            },
+            &energies,
+            &data,
+            &unc,
+            &sample,
+            &cfg,
+        )
+        .unwrap();
+        let s0 = r.theta[0].exp().clamp(UDD_S0_MIN, UDD_S0_MAX);
+        let p = r.theta[1];
+        assert!(
+            (s0 - s0_true).abs() < 0.1,
+            "recovered s0={s0}, expected {s0_true}"
+        );
+        assert!(
+            (p - p_true).abs() < 0.2,
+            "recovered p={p}, expected {p_true}"
+        );
+        assert!(r.chi2_dof < 1e-2, "χ²/dof={} too high", r.chi2_dof);
+    }
+
+    #[test]
+    fn gaussian_recovers_known_width() {
+        // Gaussian loop-closure: a Gaussian truth must be recovered by the gaussian
+        // family (the smoke test only checked finiteness+convergence). Two
+        // resonances break the Δt/ΔL degeneracy (Δt is flat in TOF; ΔL scales with
+        // TOF ∝ 1/√E).
+        let iso_lo = synthetic_isotope(72, 178, 15.0, 0.05, 0.06);
+        let iso_hi = synthetic_isotope(72, 179, 45.0, 0.05, 0.06);
+        let sample = SampleParams::new(300.0, vec![(iso_lo, 2.0e-3), (iso_hi, 2.0e-3)]).unwrap();
+        let energies: Vec<f64> = (0..700).map(|i| 8.0 + i as f64 * 0.06).collect();
+        let (dt_true, dl_true) = (1.5, 1.0e-3);
+        let truth = ResolutionFunction::Gaussian(
+            ResolutionParams::new(25.0, dt_true, dl_true, 0.0).unwrap(),
+        );
+        let data = forward_model(
+            &energies,
+            &sample,
+            Some(&InstrumentParams { resolution: truth }),
+        )
+        .unwrap();
+        let unc = vec![0.004; energies.len()];
+        let cfg = CalibrationConfig {
+            restarts: 3,
+            ..Default::default()
+        };
+        let r = calibrate_resolution(
+            ResolutionFamily::Gaussian,
+            &energies,
+            &data,
+            &unc,
+            &sample,
+            &cfg,
+        )
+        .unwrap();
+        let (dt, dl) = (r.theta[0].abs(), r.theta[1].abs());
+        assert!(r.chi2_dof < 1e-2, "χ²/dof={} too high", r.chi2_dof);
+        assert!(
+            (dt - dt_true).abs() < 0.2,
+            "recovered Δt={dt}, expected {dt_true}"
+        );
+        assert!(
+            (dl - dl_true).abs() < 1.0e-3,
+            "recovered ΔL={dl}, expected {dl_true}"
+        );
+    }
+
+    #[test]
     fn gaussian_and_ic_families_run_and_converge() {
         let iso = synthetic_isotope(72, 178, 20.0, 0.05, 0.06);
         let sample = SampleParams::new(300.0, vec![(iso, 2.0e-3)]).unwrap();
