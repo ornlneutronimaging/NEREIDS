@@ -863,8 +863,14 @@ impl TabulatedResolution {
     /// `s0 = 1, p = 0` returns a width-identical copy. This is the fittable model
     /// behind the `udd_corr` resolution-calibration family: it trusts the
     /// Monte-Carlo *shape* and calibrates only its width / energy-dependence.
+    ///
+    /// **Precondition: `s0 > 0`.** A non-positive scale would reverse/collapse the
+    /// (ascending) offset ordering the broadening loop assumes; `s0` is clamped to
+    /// a tiny positive floor as a guard (`debug_assert` flags it in debug builds).
     #[must_use]
     pub fn width_corrected(&self, s0: f64, p: f64, e_ref: f64) -> TabulatedResolution {
+        debug_assert!(s0 > 0.0, "width_corrected requires s0 > 0, got {s0}");
+        let s0 = s0.max(f64::MIN_POSITIVE);
         let kernels = self
             .ref_energies
             .iter()

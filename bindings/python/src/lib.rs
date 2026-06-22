@@ -671,10 +671,12 @@ impl PyEnergyLaw {
 /// Analytical Ikeda–Carpenter instrument-resolution model.
 ///
 /// Synthesizes a dense tabulated kernel at construction; pass
-/// [`IkedaCarpenter.as_tabulated`] anywhere a loaded resolution file is
-/// accepted (e.g. `precompute_cross_sections`, `fit_spectrum`). The synthesized
-/// kernel rides the *same* broadening path as a Monte-Carlo file, so the
-/// IC-vs-tabulated comparison differs only in kernel source.
+/// [`IkedaCarpenter.as_tabulated`] anywhere a loaded resolution file is accepted
+/// (`forward_model`, `fit_spectrum_typed`, `calibrate_resolution`). Note that
+/// `precompute_cross_sections` does NOT take a resolution — broadening is applied
+/// after Beer–Lambert, not on the cross-sections. The synthesized kernel rides
+/// the *same* broadening path as a Monte-Carlo file, so the IC-vs-tabulated
+/// comparison differs only in kernel source.
 ///
 /// Parameters: `alpha`/`r` are [`EnergyLaw`]s (fixed-or-fit general case),
 /// `beta` (1/µs) is the storage rate; optional `burst_sigma_us` (Gaussian) and
@@ -713,6 +715,18 @@ impl PyIkedaCarpenter {
         burst_sigma_us: Option<f64>,
         channel_fwhm_us: Option<f64>,
     ) -> PyResult<Self> {
+        for (name, v) in [
+            ("burst_sigma_us", burst_sigma_us),
+            ("channel_fwhm_us", channel_fwhm_us),
+        ] {
+            if let Some(x) = v {
+                if !x.is_finite() || x < 0.0 {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "{name} must be finite and >= 0, got {x}"
+                    )));
+                }
+            }
+        }
         let params = IkedaCarpenterParams {
             alpha: alpha.inner,
             beta,

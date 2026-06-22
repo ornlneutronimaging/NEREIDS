@@ -202,8 +202,12 @@ fn build_resolution(
 }
 
 /// χ²/dof after analytically fitting `anorm` (+ optional constant+linear
-/// baseline): `data ≈ a·model (+ b0 + b1·x)`, weighted by `1/unc`.
-fn inner_chi2(data: &[f64], unc: &[f64], model: &[f64], fit_bg: bool) -> f64 {
+/// baseline): `data ≈ a·model (+ b0 + b1·x)`, weighted by `1/unc`. `n_res_params`
+/// is the number of resolution parameters fit by the outer loop; it is subtracted
+/// from the dof alongside the linear `anorm`/baseline columns so the reported
+/// χ²/dof counts *all* free parameters (the outer-loop resolution params are not
+/// in the linear system but still consume degrees of freedom).
+fn inner_chi2(data: &[f64], unc: &[f64], model: &[f64], fit_bg: bool, n_res_params: usize) -> f64 {
     let n = data.len();
     let k = if fit_bg { 3 } else { 1 };
     let mut ata = vec![0.0f64; k * k];
@@ -245,13 +249,19 @@ fn inner_chi2(data: &[f64], unc: &[f64], model: &[f64], fit_bg: bool) -> f64 {
         };
         ssr += (data[i] - pred).powi(2) * w2;
     }
-    let dof = n.saturating_sub(k).max(1) as f64;
+    let dof = n.saturating_sub(k + n_res_params).max(1) as f64;
     ssr / dof
 }
 
 /// Solve a small `k×k` linear system `A x = b` (k ≤ 3) by Gaussian elimination
 /// with partial pivoting. Returns `None` on a singular system.
 fn solve_small(a: &[f64], b: &[f64], k: usize) -> Option<Vec<f64>> {
+    // Relative pivot threshold scaled by the matrix norm, so ill-conditioned
+    // systems (not just exactly-singular ones) are reported infeasible.
+    let scale = a
+        .iter()
+        .fold(0.0_f64, |m, &v| m.max(v.abs()))
+        .max(f64::MIN_POSITIVE);
     let mut m = a.to_vec();
     let mut y = b.to_vec();
     for col in 0..k {
@@ -261,7 +271,7 @@ fn solve_small(a: &[f64], b: &[f64], k: usize) -> Option<Vec<f64>> {
                 piv = r;
             }
         }
-        if m[piv * k + col].abs() < 1e-300 {
+        if m[piv * k + col].abs() < 1e-12 * scale {
             return None;
         }
         if piv != col {
@@ -369,7 +379,13 @@ pub fn calibrate_resolution(
             if !model.iter().all(|v| v.is_finite()) {
                 return Err(FittingError::EvaluationFailed("non-finite model".into()));
             }
-            Ok(inner_chi2(data, unc, &model, config.fit_background))
+            Ok(inner_chi2(
+                data,
+                unc,
+                &model,
+                config.fit_background,
+                family.n_params(),
+            ))
         };
         let res = nelder_mead_minimize(obj, &start, Some(&bounds), &nm)?;
         if best.as_ref().is_none_or(|b| res.fun < b.fun) {
@@ -417,7 +433,7 @@ mod tests {
         let model = vec![0.9, 0.7, 0.5, 0.8];
         let data: Vec<f64> = model.iter().map(|m| 1.0 * m).collect();
         let unc = vec![0.01; 4];
-        assert!(inner_chi2(&data, &unc, &model, false) < 1e-18);
+        assert!(inner_chi2(&data, &unc, &model, false, 0) < 1e-18);
     }
 
     #[test]
@@ -569,10 +585,10 @@ mod tests {
         let model = vec![0.9, 0.7, 0.5, 0.8, 0.6];
         let data: Vec<f64> = model.iter().map(|m| 0.5 * m + 0.1).collect();
         let unc = vec![0.01; 5];
-        assert!(inner_chi2(&data, &unc, &model, true) < 1e-12);
+        assert!(inner_chi2(&data, &unc, &model, true, 0) < 1e-12);
         // all-zero model -> singular normal equations -> infeasible (χ²=∞), so the
         // optimizer steps away rather than seeing a spuriously inflated finite χ².
-        let v = inner_chi2(&data, &unc, &[0.0; 5], false);
+        let v = inner_chi2(&data, &unc, &[0.0; 5], false, 0);
         assert_eq!(v, f64::INFINITY);
     }
 
@@ -607,5 +623,57 @@ mod tests {
         )
         .unwrap();
         assert!(r.chi2_dof.is_finite());
+    }
+
+    #[test]
+    fn ic_recovers_known_alpha() {
+        // Loop-closure / optimizer test (same caveat as udd_corr): truth and fit
+        // both use the IC synthesis, so this checks the optimizer recovers a0 —
+        // the IC pulse physics is independently covered by the ic_pulse tests in
+        // nereids-physics. Truth a0 = 0.35; the calibration must recover it.
+        let iso = synthetic_isotope(72, 178, 20.0, 0.05, 0.06);
+        let sample = SampleParams::new(300.0, vec![(iso, 2.0e-3)]).unwrap();
+        let energies: Vec<f64> = (0..400).map(|i| 12.0 + i as f64 * 0.04).collect();
+        let ic_truth = IkedaCarpenter::new(
+            IkedaCarpenterParams {
+                alpha: EnergyLaw::SqrtE { a0: 0.35, a1: 0.0 },
+                beta: IC_FIXED_BETA,
+                r: EnergyLaw::ExpMilliEv { kappa: 25.0 },
+                burst_sigma_us: None,
+                channel_fwhm_us: None,
+            },
+            25.0,
+            &SynthesisGrid {
+                e_min_ev: 6.0,
+                e_max_ev: 60.0,
+                n_energies: 64,
+                n_tau: 500,
+            },
+        )
+        .unwrap();
+        let truth = ResolutionFunction::IkedaCarpenter(Arc::new(ic_truth));
+        let data = forward_model(
+            &energies,
+            &sample,
+            Some(&InstrumentParams { resolution: truth }),
+        )
+        .unwrap();
+        let unc = vec![0.004; energies.len()];
+        let cfg = CalibrationConfig {
+            restarts: 2,
+            ..Default::default()
+        };
+        let r = calibrate_resolution(
+            ResolutionFamily::IkedaCarpenter,
+            &energies,
+            &data,
+            &unc,
+            &sample,
+            &cfg,
+        )
+        .unwrap();
+        let a0 = r.theta[0].abs();
+        assert!((a0 - 0.35).abs() < 0.04, "recovered a0={a0}, expected 0.35");
+        assert!(r.chi2_dof < 1.0, "matched χ²/dof={} too high", r.chi2_dof);
     }
 }

@@ -59,10 +59,12 @@
 //! `t_r+τ`, apparent energy `E' = (TOF_FACTOR·L/(t_r+τ))²`. Sampling `I(τ)` on
 //! a τ-grid and mapping to TOF-offsets yields exactly the `(offset, weight)`
 //! kernel representation that [`crate::resolution::TabulatedResolution`]
-//! consumes — so IC rides the *same* verified broadening machinery. The
-//! log-energy interref interpolation still acts at apply time, but IC synthesizes
-//! a dense reference grid (default 64 energies), so the interpolation error
-//! between adjacent references is negligible. The kernel is anchored with its
+//! consumes — so IC rides the *same* verified broadening machinery. At apply time
+//! `interpolated_kernel` blends the two bracketing reference kernels when they
+//! have equal point counts, else it falls back to the nearer reference; because
+//! IC trims each kernel's tail independently the point counts often differ, so the
+//! nearest-reference path is common. Either way IC synthesizes a dense reference
+//! grid (default 64 energies), so the between-reference error is negligible. The kernel is anchored with its
 //! **mode at offset 0** (peak-centering), matching the UDD file convention
 //! (peak at offset 0); `interpolated_kernel` does not re-center it. Because the
 //! IC pulse is skewed, its *mean* lags its mode, so a broadened resonance's
@@ -335,6 +337,17 @@ impl IkedaCarpenter {
             return Err(ResolutionParseError::InvalidFormat(format!(
                 "Ikeda–Carpenter α(E) must be > 0, but α({bad}) = {} is not",
                 params.alpha.eval(bad)
+            )));
+        }
+        // Reject storage-fraction laws that fall outside [0, 1] (synthesis clamps
+        // R, masking a mis-specified law); a physical mixing fraction is in [0,1].
+        if let Some(&bad) = ref_energies.iter().find(|&&e| {
+            let r = params.r.eval(e);
+            !r.is_finite() || !(0.0..=1.0).contains(&r)
+        }) {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "Ikeda–Carpenter R(E) must be in [0, 1], but R({bad}) = {} is not",
+                params.r.eval(bad)
             )));
         }
 

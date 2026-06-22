@@ -259,7 +259,9 @@ class IkedaCarpenter:
 
     Synthesizes a dense tabulated kernel at construction; pass
     :meth:`as_tabulated` anywhere a loaded resolution file is accepted
-    (e.g. ``precompute_cross_sections``, ``forward_model``, the fitters).
+    (``forward_model``, ``fit_spectrum_typed``, ``calibrate_resolution``).
+    Note ``precompute_cross_sections`` does NOT take a resolution -- broadening
+    is applied after Beer-Lambert, not on the cross-sections.
     """
 
     def __init__(
