@@ -32,7 +32,9 @@ use std::sync::Arc;
 use nereids_physics::ikeda_carpenter::{
     EnergyLaw, IkedaCarpenter, IkedaCarpenterParams, SynthesisGrid,
 };
-use nereids_physics::resolution::{ResolutionFunction, ResolutionParams, TabulatedResolution};
+use nereids_physics::resolution::{
+    ResolutionFunction, ResolutionParams, TOF_FACTOR, TabulatedResolution,
+};
 use nereids_physics::transmission::{InstrumentParams, SampleParams, forward_model};
 
 use crate::error::FittingError;
@@ -50,6 +52,34 @@ pub const UDR_S0_MAX: f64 = 5.0;
 /// resonance regime makes the slow/storage term — and hence `β` — unidentifiable,
 /// so it is held fixed rather than reported as a meaningless fit result.
 const IC_FIXED_BETA: f64 = 0.1;
+/// Bound (µs) on the per-family **position nuisance** — a TOF zero-shift fit
+/// and discarded during calibration so the cross-family χ² compares *shape/width*
+/// rather than absolute position. The asymmetric IC/UDR kernels are mode-anchored,
+/// so their broadened centroid lags by ~1/α(E); at run time the fitted `t0`/`L`
+/// energy-scale absorbs that lag, but calibration holds `t0`/`L` fixed, so without
+/// this nuisance the lag would bias the model-selection χ² toward the symmetric
+/// Gaussian. ±5 µs is wide enough to absorb the constant part of the lag and tight
+/// enough not to fit real resonance positions (fixed by the known calibrant).
+const POSITION_NUISANCE_US_MAX: f64 = 5.0;
+
+/// Apply a TOF zero-shift `t0_us` to an energy grid: a feature at nominal energy
+/// `E` is observed at TOF `TOF(E) + t0`, i.e. apparent energy
+/// `E / (1 + t0·√E/(TOF_FACTOR·L))²`. Monotonic and positivity-preserving for the
+/// bounded `|t0| ≤ POSITION_NUISANCE_US_MAX`. Used as the per-family position
+/// nuisance (see [`POSITION_NUISANCE_US_MAX`]).
+fn shift_energy_grid(energies: &[f64], t0_us: f64, flight_path_m: f64) -> Vec<f64> {
+    if t0_us == 0.0 {
+        return energies.to_vec();
+    }
+    let kl = TOF_FACTOR * flight_path_m;
+    energies
+        .iter()
+        .map(|&e| {
+            let denom = 1.0 + t0_us * e.sqrt() / kl;
+            e / (denom * denom)
+        })
+        .collect()
+}
 
 /// The resolution-model family to calibrate.
 #[derive(Debug, Clone)]
@@ -158,6 +188,12 @@ pub struct CalibrationResult {
     pub iterations: usize,
     /// Whether the winning restart self-converged.
     pub converged: bool,
+    /// Fitted-and-discarded per-family **position nuisance** (TOF zero-shift, µs,
+    /// bounded to ±5). This is *not* part of the calibrated resolution; it exists
+    /// only so the cross-family χ² compares shape/width rather than the asymmetric
+    /// kernels' mode→centroid position lag. A value near the ±5 µs bound flags a
+    /// position artifact the calibrant could not otherwise reconcile.
+    pub position_nuisance_us: f64,
 }
 
 fn build_resolution(
@@ -376,21 +412,26 @@ pub fn calibrate_resolution(
         ));
     }
     // Reject under-determined calibrants: need more data points than the total
-    // free parameters (resolution params + the anorm/baseline columns), else the
-    // reported χ²/dof is meaningless.
+    // free parameters (resolution params + 1 position nuisance + the anorm/baseline
+    // columns), else the reported χ²/dof is meaningless.
+    let n_res = family.n_params();
     let baseline_cols = if config.fit_background { 3 } else { 1 };
-    if data.len() <= family.n_params() + baseline_cols {
+    if data.len() <= n_res + 1 + baseline_cols {
         return Err(FittingError::InvalidConfig(format!(
-            "calibrant has {} points but the model has {} resolution + {} baseline parameters; \
-             need strictly more data points than parameters",
+            "calibrant has {} points but the model has {} resolution + 1 position + {} baseline \
+             parameters; need strictly more data points than parameters",
             data.len(),
-            family.n_params(),
+            n_res,
             baseline_cols,
         )));
     }
     let e_min = energies.first().copied().unwrap_or(1.0);
     let e_max = energies.last().copied().unwrap_or(1.0);
-    let (x0, bounds) = family.x0_bounds();
+    // Append the per-family position nuisance (TOF shift, µs) as the last optimizer
+    // coordinate; it shifts the model grid but does not enter the resolution kernel.
+    let (mut x0, mut bounds) = family.x0_bounds();
+    x0.push(0.0);
+    bounds.push((-POSITION_NUISANCE_US_MAX, POSITION_NUISANCE_US_MAX));
     let nm = NelderMeadConfig {
         xatol: config.xatol,
         fatol: config.fatol,
@@ -409,19 +450,24 @@ pub fn calibrate_resolution(
             .map(|(&v, &(lo, hi))| (v + 0.1 * r as f64 * (hi - lo)).clamp(lo, hi))
             .collect();
         let obj = |theta: &[f64]| -> Result<f64, FittingError> {
+            // theta = [resolution params (n_res)..., position nuisance t0]. The
+            // resolution kernel uses only the first n_res; t0 shifts the model grid.
             let res = build_resolution(&family, theta, e_min, e_max, config)?;
             let inst = InstrumentParams { resolution: res };
-            let model = forward_model(energies, sample, Some(&inst))
+            let t0 = theta[n_res];
+            let grid = shift_energy_grid(energies, t0, config.flight_path_m);
+            let model = forward_model(&grid, sample, Some(&inst))
                 .map_err(|e| FittingError::EvaluationFailed(format!("forward: {e:?}")))?;
             if !model.iter().all(|v| v.is_finite()) {
                 return Err(FittingError::EvaluationFailed("non-finite model".into()));
             }
+            // +1 dof for the position nuisance.
             Ok(inner_chi2(
                 data,
                 unc,
                 &model,
                 config.fit_background,
-                family.n_params(),
+                n_res + 1,
             ))
         };
         let res = nelder_mead_minimize(obj, &start, Some(&bounds), &nm)?;
@@ -438,13 +484,19 @@ pub fn calibrate_resolution(
         ));
     }
     let resolution = build_resolution(&family, &best.x, e_min, e_max, config)?;
+    // The position nuisance is the last coordinate; report it as a diagnostic but
+    // keep `theta` the resolution params only (the nuisance is discarded — the
+    // calibrated resolution is pinned at the calibrant's real, fixed geometry).
+    let position_nuisance_us = best.x[n_res];
+    let theta = best.x[..n_res].to_vec();
     Ok(CalibrationResult {
         family: family.label().to_string(),
-        theta: best.x,
+        theta,
         chi2_dof: best.fun,
         resolution,
         iterations: best.iterations,
         converged: best.self_converged,
+        position_nuisance_us,
     })
 }
 
@@ -481,11 +533,14 @@ mod tests {
         // (centroid invariance + std scaling) is independently verified by
         // `width_corrected_preserves_centroid_scales_width_and_energy_dependence`
         // in nereids-physics.
-        // Synthetic Hf-178-like resonance at 20 eV; calibrant generated with a
-        // UDR truth scaled by s0=1.5; udr_corr must recover s0≈1.5 at χ²≈0.
-        let iso = synthetic_isotope(72, 178, 20.0, 0.05, 0.06);
-        let sample = SampleParams::new(300.0, vec![(iso, 2.0e-3)]).unwrap();
-        let energies: Vec<f64> = (0..400).map(|i| 12.0 + i as f64 * 0.04).collect();
+        // Two well-separated resonances (15 + 45 eV) so width is identifiable
+        // alongside the per-family position nuisance (a single resonance leaves a
+        // width↔position ridge). Calibrant generated with a UDR truth scaled by
+        // s0=1.5; udr_corr must recover s0≈1.5 at χ²≈0.
+        let iso_lo = synthetic_isotope(72, 178, 15.0, 0.05, 0.06);
+        let iso_hi = synthetic_isotope(72, 179, 45.0, 0.05, 0.06);
+        let sample = SampleParams::new(300.0, vec![(iso_lo, 2.0e-3), (iso_hi, 2.0e-3)]).unwrap();
+        let energies: Vec<f64> = (0..700).map(|i| 8.0 + i as f64 * 0.06).collect();
         let base = synthetic_base_udr();
         let truth = ResolutionFunction::Tabulated(Arc::new(
             base.width_corrected(1.5, 0.0, UDR_E_REF).unwrap(),
@@ -570,6 +625,48 @@ mod tests {
     }
 
     #[test]
+    fn udr_corr_recovers_independent_raw_kernel() {
+        // External-oracle coverage: the truth resolution is the RAW hand-built UDR
+        // kernel broadened directly — it does NOT pass through `width_corrected`,
+        // so truth-generation no longer shares the width-correction code with the
+        // fit. Fitting udr_corr against that base must recover the identity width
+        // (s0≈1) at χ²≈0. (The broadening OPERATOR itself is independently
+        // validated by this crate's bit-exact `broaden_presorted_reference` tests.)
+        let iso_lo = synthetic_isotope(72, 178, 15.0, 0.05, 0.06);
+        let iso_hi = synthetic_isotope(72, 179, 45.0, 0.05, 0.06);
+        let sample = SampleParams::new(300.0, vec![(iso_lo, 2.0e-3), (iso_hi, 2.0e-3)]).unwrap();
+        let energies: Vec<f64> = (0..700).map(|i| 8.0 + i as f64 * 0.06).collect();
+        let base = synthetic_base_udr();
+        // Truth = the RAW base kernel (no width_corrected call).
+        let truth = ResolutionFunction::Tabulated(Arc::new(base.clone()));
+        let data = forward_model(
+            &energies,
+            &sample,
+            Some(&InstrumentParams { resolution: truth }),
+        )
+        .unwrap();
+        let unc = vec![0.004; energies.len()];
+        let cfg = CalibrationConfig {
+            restarts: 3,
+            ..Default::default()
+        };
+        let r = calibrate_resolution(
+            ResolutionFamily::UdrCorr {
+                base: Arc::new(base),
+            },
+            &energies,
+            &data,
+            &unc,
+            &sample,
+            &cfg,
+        )
+        .unwrap();
+        let s0 = r.theta[0].exp().clamp(UDR_S0_MIN, UDR_S0_MAX);
+        assert!((s0 - 1.0).abs() < 0.1, "recovered s0={s0}, expected ~1.0");
+        assert!(r.chi2_dof < 1e-2, "χ²/dof={} too high", r.chi2_dof);
+    }
+
+    #[test]
     fn gaussian_recovers_known_width() {
         // Gaussian loop-closure: a Gaussian truth must be recovered by the gaussian
         // family (the smoke test only checked finiteness+convergence). Two
@@ -613,6 +710,58 @@ mod tests {
             (dl - dl_true).abs() < 1.0e-3,
             "recovered ΔL={dl}, expected {dl_true}"
         );
+    }
+
+    #[test]
+    fn position_nuisance_recovers_injected_tof_shift() {
+        // Inject a known TOF zero-shift into the calibrant and confirm the position
+        // nuisance recovers it while the width is still recovered — i.e. position
+        // is fit + discarded, not folded into the resolution. This is the mechanism
+        // that makes the cross-family χ² compare shape/width, not absolute position.
+        let iso_lo = synthetic_isotope(72, 178, 15.0, 0.05, 0.06);
+        let iso_hi = synthetic_isotope(72, 179, 45.0, 0.05, 0.06);
+        let sample = SampleParams::new(300.0, vec![(iso_lo, 2.0e-3), (iso_hi, 2.0e-3)]).unwrap();
+        let energies: Vec<f64> = (0..700).map(|i| 8.0 + i as f64 * 0.06).collect();
+        let base = synthetic_base_udr();
+        let (s0_true, t0_inject) = (1.4, 1.5_f64); // µs
+        let truth = ResolutionFunction::Tabulated(Arc::new(
+            base.width_corrected(s0_true, 0.0, UDR_E_REF).unwrap(),
+        ));
+        // Generate the calibrant on a TOF-shifted grid (resonances displaced by t0).
+        let shifted = shift_energy_grid(&energies, t0_inject, 25.0);
+        let data = forward_model(
+            &shifted,
+            &sample,
+            Some(&InstrumentParams { resolution: truth }),
+        )
+        .unwrap();
+        let unc = vec![0.004; energies.len()];
+        let cfg = CalibrationConfig {
+            restarts: 3,
+            ..Default::default()
+        };
+        let r = calibrate_resolution(
+            ResolutionFamily::UdrCorr {
+                base: Arc::new(base),
+            },
+            &energies,
+            &data,
+            &unc,
+            &sample,
+            &cfg,
+        )
+        .unwrap();
+        let s0 = r.theta[0].exp().clamp(UDR_S0_MIN, UDR_S0_MAX);
+        assert!(
+            (s0 - s0_true).abs() < 0.1,
+            "recovered s0={s0}, expected {s0_true}"
+        );
+        assert!(
+            (r.position_nuisance_us - t0_inject).abs() < 0.3,
+            "recovered t0={}, expected {t0_inject}",
+            r.position_nuisance_us
+        );
+        assert!(r.chi2_dof < 1e-2, "χ²/dof={} too high", r.chi2_dof);
     }
 
     #[test]

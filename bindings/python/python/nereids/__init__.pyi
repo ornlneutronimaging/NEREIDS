@@ -323,6 +323,15 @@ class ResolutionCalibration:
         """Optimizer iterations."""
         ...
 
+    @property
+    def position_nuisance_us(self) -> float:
+        """Fitted-and-discarded position nuisance (TOF zero-shift, µs). Not part
+        of the calibrated resolution; it makes the cross-family chi-squared compare
+        shape/width rather than the asymmetric kernels' mode-to-centroid position
+        lag. A value near +/-5 us flags a position artifact the calibrant could
+        not reconcile."""
+        ...
+
     def params(self) -> dict[str, float]:
         """Decoded, human-readable fitted parameters."""
         ...

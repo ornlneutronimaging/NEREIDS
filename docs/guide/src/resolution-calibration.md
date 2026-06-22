@@ -66,12 +66,14 @@ T = nereids.forward_model(energies, [(hf, 5e-5)], temperature_k=300.0, resolutio
 `ic.kernel_at(energy_ev)` returns the `(tof_offsets_us, weights)` kernel at one
 energy for inspection.
 
-> **Performance note.** The IC kernel is re-synthesized per call and is not
-> plan-cached the way a loaded `TabulatedResolution` is, so using IC as a
-> *run-time* resolution while fitting the `t0`/`L` energy-scale over a large grid
-> is slower than the tabulated path. Resolution *calibration* is
-> once-per-experiment, so this does not affect the calibrate → pin → fit workflow;
-> for production spatial maps, pin the calibrated kernel via `as_tabulated()`.
+> **Performance note.** An `IkedaCarpenter` synthesizes its kernel table **once**
+> at construction and caches it (`as_tabulated()` just clones it). The cost to know
+> about is that IC is **not plan-cached** when fitting the `t0`/`L` energy-scale at
+> run time: unlike a loaded `TabulatedResolution`, its broadening plan is rebuilt
+> each energy-scale evaluation, so an IC run-time fit over a large grid is slower
+> than the tabulated path. Resolution *calibration* is once-per-experiment, so the
+> calibrate → pin → fit workflow is unaffected; for production spatial maps, pin
+> the calibrated kernel via `as_tabulated()` (which is plan-cached).
 
 ## The calibrate → pin → fit procedure
 
@@ -141,16 +143,16 @@ calibrant yields a contaminated, non-transferable result:
 - **Density / isotopic characterization** is robust to the resolution-model
   choice; **temperature** is sensitive — calibrate carefully before trusting a
   fitted temperature.
-- **Cross-family χ² is fair on shape/width, not absolute position.** The `ic`
-  kernel anchors its *mode* at zero offset, but a right-skewed pulse's centroid
-  lags the mode by ~1/α(E) in TOF, shifting a broadened dip's apparent energy by
-  an energy-dependent amount (order 1e-2 eV in the eV regime). The `udr_corr`
-  width correction is *centroid-preserving* (it scales offsets about the kernel's
-  centroid), so it adds no position bias of its own — any residual comes from the
-  base UDR file's own mode-vs-centroid offset, held fixed during width
-  calibration. The symmetric `gaussian` has no such bias. Calibration holds
-  `t0`/`L` fixed, so unlike a run-time fit it does not absorb these lags — treat
-  the χ² comparison as a *shape/width* discriminator and recover absolute
-  position by fitting `t0`/`L` on the sample afterwards.
+- **The cross-family χ² compares shape/width fairly.** The `ic` kernel anchors its
+  *mode* at zero offset, so a right-skewed pulse's centroid lags by ~1/α(E),
+  shifting a broadened dip's apparent energy (order 1e-2 eV in the eV regime). To
+  keep the model-selection χ² from penalizing the asymmetric families on this
+  position artifact, `calibrate_resolution` fits **and discards** a small per-family
+  *position nuisance* (a TOF shift; reported as
+  `ResolutionCalibration.position_nuisance_us`), so each family's χ² reflects
+  shape/width only. (The `udr_corr` width correction is itself centroid-preserving;
+  the symmetric `gaussian` has no lag.) The nuisance is *not* part of the
+  calibrated resolution — it pins at the calibrant's real, fixed geometry; recover
+  the sample's absolute position by fitting `t0`/`L` on the sample.
 - A worked end-to-end example (build the models, calibrate, pin, fit) is in
   `examples/notebooks/workflows/06_resolution_calibration.ipynb`.

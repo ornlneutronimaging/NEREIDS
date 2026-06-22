@@ -46,17 +46,18 @@ use nereids_core::constants::{DIVISION_FLOOR, NEAR_ZERO_FLOOR};
 use std::fmt;
 use std::sync::Arc;
 
-/// TOF conversion factor: t[μs] = TOF_FACTOR × L[m] / √(E[eV]).
+/// TOF conversion factor: `t (μs) = TOF_FACTOR × L (m) / √(E in eV)`.
 ///
 /// Derived from t = L / √(2E/m_n), converting to microseconds:
 ///   TOF_FACTOR = 1e6 / √(2 × EV_TO_JOULES / NEUTRON_MASS_KG)
 ///
 /// Uses CODATA 2018 values (both exact in the 2019 SI).
 ///
-/// `pub(crate)` so the analytical [`crate::ikeda_carpenter`] model uses the
-/// *identical* TOF↔energy constant when it synthesizes kernels — any drift
-/// here would make the IC-vs-tabulated cross-validation unfair.
-pub(crate) const TOF_FACTOR: f64 = 72.298_254_398_292_8;
+/// `pub` so the analytical [`crate::ikeda_carpenter`] model and the
+/// `nereids-fitting` resolution calibrator both use the *identical* TOF↔energy
+/// constant (the calibrator's position nuisance shifts the grid in TOF) — any
+/// drift here would make the IC-vs-tabulated cross-validation unfair.
+pub const TOF_FACTOR: f64 = 72.298_254_398_292_8;
 
 /// Errors from resolution broadening operations.
 #[derive(Debug, PartialEq)]
@@ -2117,6 +2118,15 @@ impl TabulatedResolution {
         let (off_lo, w_lo) = &self.kernels[idx];
         let (off_hi, w_hi) = &self.kernels[idx + 1];
 
+        let nearest = || -> (Vec<f64>, Vec<f64>) {
+            let k = if frac < 0.5 {
+                &self.kernels[idx]
+            } else {
+                &self.kernels[idx + 1]
+            };
+            (k.0.clone(), k.1.clone())
+        };
+
         let (offsets, weights) = if off_lo.len() == off_hi.len() {
             // Both kernels have the same number of points: interpolate element-wise.
             let offsets: Vec<f64> = off_lo
@@ -2124,20 +2134,23 @@ impl TabulatedResolution {
                 .zip(off_hi.iter())
                 .map(|(&a, &b)| a + frac * (b - a))
                 .collect();
-            let weights: Vec<f64> = w_lo
-                .iter()
-                .zip(w_hi.iter())
-                .map(|(&a, &b)| a + frac * (b - a))
-                .collect();
-            (offsets, weights)
+            // A convex blend of two strictly-ascending offset arrays stays
+            // ascending; guard defensively (e.g. a degenerate input kernel) and
+            // fall back to the nearer reference rather than emit a non-monotone
+            // kernel the two-pointer broadener assumes is sorted.
+            if offsets.windows(2).all(|w| w[0] < w[1]) {
+                let weights: Vec<f64> = w_lo
+                    .iter()
+                    .zip(w_hi.iter())
+                    .map(|(&a, &b)| a + frac * (b - a))
+                    .collect();
+                (offsets, weights)
+            } else {
+                nearest()
+            }
         } else {
             // Different point counts: fall back to the nearer reference kernel.
-            let k = if frac < 0.5 {
-                &self.kernels[idx]
-            } else {
-                &self.kernels[idx + 1]
-            };
-            (k.0.clone(), k.1.clone())
+            nearest()
         };
 
         (offsets, weights)
@@ -2683,6 +2696,36 @@ mod tests {
         assert!(
             TabulatedResolution::from_kernels(vec![10.0], vec![(vec![0.0], vec![1.0])], 25.0)
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn interpolated_kernel_blend_stays_ascending_and_mode_anchored() {
+        // Two equal-length, mode-anchored kernels at bracketing energies (the
+        // element-wise blend path, common for IC). The blend must be strictly
+        // ascending (the sorted invariant the broadener relies on) and keep the
+        // mode at offset 0.
+        let off_lo = vec![-1.0, -0.4, 0.0, 0.6, 1.5, 3.0];
+        let off_hi = vec![-0.5, -0.2, 0.0, 0.3, 0.8, 1.6]; // narrower, same length
+        let wts = vec![0.1, 0.5, 1.0, 0.6, 0.3, 0.1]; // mode at index 2 (offset 0)
+        let tab = TabulatedResolution::from_kernels(
+            vec![5.0, 50.0],
+            vec![(off_lo, wts.clone()), (off_hi, wts.clone())],
+            25.0,
+        )
+        .unwrap();
+        let (blended, weights) = tab.interpolated_kernel(15.0); // between 5 and 50 eV
+        assert!(
+            blended.windows(2).all(|w| w[0] < w[1]),
+            "blended offsets not strictly ascending: {blended:?}"
+        );
+        let kmax = (0..weights.len())
+            .max_by(|&a, &b| weights[a].total_cmp(&weights[b]))
+            .unwrap();
+        assert!(
+            blended[kmax].abs() < 1e-9,
+            "mode not anchored at offset 0: {}",
+            blended[kmax]
         );
     }
 

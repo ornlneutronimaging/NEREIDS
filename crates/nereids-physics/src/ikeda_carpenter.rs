@@ -73,19 +73,22 @@
 //! ~1e-3 relative, for α≈1.5 in the eV regime; larger toward lower energy). So it
 //! *does* move the broadened dip off the nominal energy, by a small amount.
 //!
-//! Two regimes differ in whether that lag is absorbed:
+//! Two regimes handle that lag, both absorbing it so it does not bias results:
 //! - **Run-time fitting** fits the `t0`/`L` energy-scale, which absorbs the
 //!   *constant* part of the lag; only the energy-dependent residual remains — a
 //!   bounded limitation shared with the peak-centered UDR kernel.
-//! - **Resolution calibration** (the `nereids-fitting` calibrator) holds `t0`/`L`
-//!   FIXED, so the lag is *not* absorbed: it folds into the fitted α(E) and into
-//!   the cross-family χ² ranking. The symmetric Gaussian family carries no such
-//!   lag, so a Gaussian-vs-IC/UDR comparison is fair on shape/width but carries a
-//!   small *position* bias on the asymmetric families.
+//! - **Resolution calibration** (the `nereids-fitting` calibrator) holds the real
+//!   `t0`/`L` fixed but fits **and discards** a small per-family *position
+//!   nuisance* (a TOF shift) so the mode→centroid lag is absorbed and does NOT
+//!   bias the cross-family χ² model-selection. Without it the asymmetric IC/UDR
+//!   families would be unfairly penalized on position relative to the symmetric
+//!   Gaussian.
 //!
-//! `ic_centering_shifts_broadened_symmetric_dip_with_alpha` quantifies and guards
-//! this shift; re-centering the kernel on its centroid (a future convention
-//! change spanning the UDR path too) would remove it.
+//! `ic_centering_shifts_broadened_symmetric_dip_with_alpha` quantifies the bare
+//! mode→centroid shift; the calibrator's `position_nuisance_recovers_injected_tof_shift`
+//! checks the nuisance neutralizes it. Re-centering the kernel on its centroid
+//! (a future convention change spanning the UDR path too) would remove the shift
+//! at the source.
 //!
 //! ## Optional instrument convolutions
 //!
@@ -121,9 +124,11 @@ pub const DEFAULT_N_TAU: usize = 600;
 /// catastrophically. As `u → 0`, `h(u)/u³ → 1/6`.
 #[inline]
 fn h_over_cube_taylor(u: f64) -> f64 {
-    // h(u)/u³ = 1/6 − u/8 + u²/20 − u³/72 + O(u⁴).
+    // h(u)/u³ = 1/6 − u/8 + u²/20 − u³/72 + u⁴/336 + O(u⁵). Carrying the u⁴ term
+    // makes the bounded↔Taylor branch boundary (|u|=0.05) continuous to ~1e-11,
+    // below any tolerance that consumes the synthesized kernel.
     let u2 = u * u;
-    1.0 / 6.0 - u / 8.0 + u2 / 20.0 - u2 * u / 72.0
+    1.0 / 6.0 - u / 8.0 + u2 / 20.0 - u2 * u / 72.0 + u2 * u2 / 336.0
 }
 
 /// Ikeda–Carpenter moderator emission density `I(τ)`.

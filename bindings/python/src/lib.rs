@@ -1167,6 +1167,15 @@ impl PyResolutionCalibration {
         self.inner.iterations
     }
 
+    /// Fitted-and-discarded position nuisance (TOF zero-shift, µs). Not part of
+    /// the calibrated resolution; it makes the cross-family χ² compare shape/width
+    /// rather than the asymmetric kernels' mode→centroid position lag. A value
+    /// near ±5 µs flags a position artifact the calibrant could not reconcile.
+    #[getter]
+    fn position_nuisance_us(&self) -> f64 {
+        self.inner.position_nuisance_us
+    }
+
     /// Decoded, human-readable fitted parameters.
     fn params<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
         let d = pyo3::types::PyDict::new(py);
@@ -1267,7 +1276,10 @@ fn calibrate_resolution(
         ));
     }
     let e = energies.as_slice()?;
-    validate_energy_grid(e)?;
+    // Reject an empty grid up front with a precise message (validate_energy_grid
+    // tolerates empty; the Rust calibrator would otherwise reject it later as a
+    // generic EmptyData). Matches the other non-empty entry points.
+    require_non_empty_energy_grid(e)?;
     let d = data.as_slice()?;
     let u = uncertainty.as_slice()?;
     if d.len() != e.len() || u.len() != e.len() {
