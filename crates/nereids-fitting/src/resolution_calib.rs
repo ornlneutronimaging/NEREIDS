@@ -359,6 +359,20 @@ pub fn calibrate_resolution(
             "energies must be strictly ascending (no duplicates)".into(),
         ));
     }
+    // The calibrant must have at least one isotope with a finite, positive areal
+    // density. Otherwise `forward_model` skips every isotope (thickness ≤ 0) and
+    // returns a flat T≡1 that is independent of the resolution parameters, so the
+    // optimizer would converge to a finite but physically meaningless result —
+    // silently masking a whole-config error. Mirrors the Python wrapper's guard.
+    if !sample
+        .isotopes()
+        .iter()
+        .any(|(_, density)| density.is_finite() && *density > 0.0)
+    {
+        return Err(FittingError::InvalidConfig(
+            "calibrant must have at least one isotope with a finite, positive density".into(),
+        ));
+    }
     // Reject under-determined calibrants: need more data points than the total
     // free parameters (resolution params + the anorm/baseline columns), else the
     // reported χ²/dof is meaningless.
@@ -615,6 +629,38 @@ mod tests {
                     Err(FittingError::InvalidConfig(_))
                 ),
                 "expected InvalidConfig for grid {grid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_degenerate_calibrant_composition() {
+        // A calibrant with no isotopes, or only zero/negative densities, yields a
+        // flat (resolution-independent) forward model; the optimizer would return
+        // a finite but meaningless result. Reject up front (Python-sibling parity).
+        let iso = synthetic_isotope(72, 178, 20.0, 0.05, 0.06);
+        let energies: Vec<f64> = (0..64).map(|i| 5.0 + i as f64 * 0.4).collect();
+        let data = vec![0.8; energies.len()];
+        let unc = vec![0.01; energies.len()];
+        let cfg = CalibrationConfig::default();
+        for bad_sample in [
+            SampleParams::new(300.0, vec![]).unwrap(),
+            SampleParams::new(300.0, vec![(iso.clone(), 0.0)]).unwrap(),
+            SampleParams::new(300.0, vec![(iso, -1.0e-3)]).unwrap(),
+        ] {
+            assert!(
+                matches!(
+                    calibrate_resolution(
+                        ResolutionFamily::Gaussian,
+                        &energies,
+                        &data,
+                        &unc,
+                        &bad_sample,
+                        &cfg
+                    ),
+                    Err(FittingError::InvalidConfig(_))
+                ),
+                "degenerate calibrant composition should be rejected"
             );
         }
     }

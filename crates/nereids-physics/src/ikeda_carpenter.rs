@@ -364,6 +364,20 @@ impl IkedaCarpenter {
                 params.r.eval(bad)
             )));
         }
+        // Reject invalid optional instrument-convolution widths up front; synthesis
+        // otherwise masks a negative width via `.abs()` and silently swallows a NaN.
+        for (name, v) in [
+            ("burst_sigma_us", params.burst_sigma_us),
+            ("channel_fwhm_us", params.channel_fwhm_us),
+        ] {
+            if let Some(x) = v
+                && (!x.is_finite() || x < 0.0)
+            {
+                return Err(ResolutionParseError::InvalidFormat(format!(
+                    "Ikeda–Carpenter {name} must be finite and >= 0, got {x}"
+                )));
+            }
+        }
 
         let kernels: Vec<(Vec<f64>, Vec<f64>)> = ref_energies
             .iter()
@@ -438,8 +452,10 @@ fn synth_kernel(
 
     // Extend the grid to slightly negative τ so a symmetric burst/channel can
     // spread the leading edge correctly (the moderator pulse itself is 0 there).
-    let margin = params.burst_sigma_us.map_or(0.0, |s| 4.0 * s.abs())
-        + params.channel_fwhm_us.map_or(0.0, |f| f.abs());
+    // Widths are validated finite and >= 0 by `IkedaCarpenter::new`, so they are
+    // used directly (no `.abs()` masking of a sign error).
+    let margin =
+        params.burst_sigma_us.map_or(0.0, |s| 4.0 * s) + params.channel_fwhm_us.unwrap_or(0.0);
     let j_lo: isize = -((margin / dtau).ceil() as isize);
     let j_hi: isize = ((tau_max + margin) / dtau).ceil() as isize;
 
@@ -447,14 +463,14 @@ fn synth_kernel(
     let mut weights: Vec<f64> = taus.iter().map(|&t| ic_pulse(alpha, beta, r, t)).collect();
 
     if let Some(sigma) = params.burst_sigma_us
-        && sigma.abs() > 0.0
+        && sigma > 0.0
     {
-        weights = convolve_same(&weights, &gaussian_kernel(dtau, sigma.abs()));
+        weights = convolve_same(&weights, &gaussian_kernel(dtau, sigma));
     }
     if let Some(fwhm) = params.channel_fwhm_us
-        && fwhm.abs() > 0.0
+        && fwhm > 0.0
     {
-        weights = convolve_same(&weights, &triangle_kernel(dtau, fwhm.abs()));
+        weights = convolve_same(&weights, &triangle_kernel(dtau, fwhm));
     }
 
     // Anchor the mode at offset 0.
@@ -775,6 +791,26 @@ mod tests {
             ..IkedaCarpenterParams::constant(1.0, 0.1, 0.0)
         };
         assert!(IkedaCarpenter::new(neg_alpha, 25.0, &SynthesisGrid::new(1.0, 100.0)).is_err());
+        // Negative / non-finite burst or channel widths are rejected up front
+        // (not `.abs()`-masked or NaN-swallowed during synthesis).
+        for bad_width in [-1.0, f64::NAN, f64::INFINITY] {
+            let neg_burst = IkedaCarpenterParams {
+                burst_sigma_us: Some(bad_width),
+                ..IkedaCarpenterParams::constant(1.0, 0.1, 0.0)
+            };
+            assert!(
+                IkedaCarpenter::new(neg_burst, 25.0, &SynthesisGrid::new(1.0, 100.0)).is_err(),
+                "burst_sigma_us={bad_width} should be rejected"
+            );
+            let neg_chan = IkedaCarpenterParams {
+                channel_fwhm_us: Some(bad_width),
+                ..IkedaCarpenterParams::constant(1.0, 0.1, 0.0)
+            };
+            assert!(
+                IkedaCarpenter::new(neg_chan, 25.0, &SynthesisGrid::new(1.0, 100.0)).is_err(),
+                "channel_fwhm_us={bad_width} should be rejected"
+            );
+        }
     }
 
     #[test]

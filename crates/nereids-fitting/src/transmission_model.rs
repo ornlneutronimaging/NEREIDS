@@ -1951,7 +1951,10 @@ impl EnergyScaleTransmissionModel {
             &inst.resolution,
             nereids_physics::resolution::ResolutionFunction::Tabulated(_)
         ) {
-            // Gaussian resolution has no plan; nothing to cache.
+            // Only Tabulated opts into plan caching. Gaussian genuinely has no
+            // plan; IkedaCarpenter *does* have one (build_resolution_plan returns
+            // Some) but is intentionally not cached here — it falls back to the
+            // per-call resynthesis path (the W6 perf follow-up).
             return None;
         }
         let key = (t0_us.to_bits(), l_scale.to_bits());

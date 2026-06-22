@@ -893,7 +893,13 @@ impl TabulatedResolution {
             .iter()
             .zip(self.kernels.iter())
             .map(|(&e, (offsets, weights))| {
+                // The power law can overflow `s` to ±∞ for finite-but-extreme `p`;
+                // reject up front rather than build a non-finite kernel directly
+                // (which would bypass `from_kernels`' finiteness check).
                 let s = s0 * (e / e_ref).powf(p);
+                if !(s.is_finite() && s > 0.0) {
+                    return Err(ResolutionError::InvalidWidthCorrection { s0, p, e_ref });
+                }
                 let wsum: f64 = weights.iter().sum();
                 let centroid = if wsum > 0.0 {
                     offsets.iter().zip(weights).map(|(o, w)| o * w).sum::<f64>() / wsum
@@ -904,9 +910,9 @@ impl TabulatedResolution {
                     .iter()
                     .map(|&o| centroid + s * (o - centroid))
                     .collect();
-                (scaled, weights.clone())
+                Ok((scaled, weights.clone()))
             })
-            .collect();
+            .collect::<Result<Vec<_>, ResolutionError>>()?;
         Ok(TabulatedResolution {
             ref_energies: self.ref_energies.clone(),
             kernels,
