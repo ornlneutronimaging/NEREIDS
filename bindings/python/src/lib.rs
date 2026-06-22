@@ -49,9 +49,16 @@ use nereids_endf::resonance::{
     LGroup, Resonance, ResonanceData, ResonanceFormalism, ResonanceRange,
 };
 use nereids_endf::retrieval::{EndfLibrary, EndfRetriever, mat_number};
+use nereids_fitting::resolution_calib::{
+    CalibrationConfig, ResolutionFamily, UDR_S0_MAX, UDR_S0_MIN,
+    calibrate_resolution as rust_calibrate_resolution,
+};
 use nereids_io::normalization::{self as norm, NormalizationParams};
 use nereids_io::tof::BeamlineParams;
 use nereids_physics::doppler::{self, DopplerParams};
+use nereids_physics::ikeda_carpenter::{
+    EnergyLaw, IkedaCarpenter, IkedaCarpenterParams, SynthesisGrid,
+};
 use nereids_physics::resolution::{
     self, ResolutionFunction, ResolutionParams, TabulatedResolution,
 };
@@ -606,6 +613,179 @@ impl PyTabulatedResolution {
     }
 }
 
+/// Energy-dependence law for an Ikeda–Carpenter parameter.
+///
+/// Build via the static constructors:
+/// `EnergyLaw.const(c)`, `EnergyLaw.sqrt_e(a0, a1)`,
+/// `EnergyLaw.inverse_lambda(a0, a1)`, `EnergyLaw.exp_mev(kappa)`.
+#[pyclass(name = "EnergyLaw", from_py_object)]
+#[derive(Clone)]
+struct PyEnergyLaw {
+    inner: EnergyLaw,
+}
+
+#[pymethods]
+impl PyEnergyLaw {
+    /// Energy-independent constant value.
+    #[staticmethod]
+    #[pyo3(name = "const")]
+    fn const_law(value: f64) -> Self {
+        Self {
+            inner: EnergyLaw::Const(value),
+        }
+    }
+
+    /// `a0·√(E[eV]) + a1` — leading epithermal scaling of the fast rate α(E).
+    #[staticmethod]
+    fn sqrt_e(a0: f64, a1: f64) -> Self {
+        Self {
+            inner: EnergyLaw::SqrtE { a0, a1 },
+        }
+    }
+
+    /// Mantid IC form `1/(a0 + a1·λ)`, λ[Å] ∝ 1/√E (α ∝ √E low-E, → 1/a0 high-E).
+    #[staticmethod]
+    fn inverse_lambda(a0: f64, a1: f64) -> Self {
+        Self {
+            inner: EnergyLaw::InverseLambda { a0, a1 },
+        }
+    }
+
+    /// `exp(−E[meV]/kappa)` — storage fraction R(E), → 0 in the eV regime.
+    #[staticmethod]
+    fn exp_mev(kappa: f64) -> Self {
+        Self {
+            inner: EnergyLaw::ExpMilliEv { kappa },
+        }
+    }
+
+    /// Evaluate the law at `energy_ev` (eV).
+    fn eval(&self, energy_ev: f64) -> f64 {
+        self.inner.eval(energy_ev)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("EnergyLaw({:?})", self.inner)
+    }
+}
+
+/// Analytical Ikeda–Carpenter instrument-resolution model.
+///
+/// Synthesizes a dense tabulated kernel at construction; pass
+/// [`IkedaCarpenter.as_tabulated`] anywhere a loaded resolution file is accepted
+/// (`forward_model`, `fit_spectrum_typed`, `calibrate_resolution`). Note that
+/// `precompute_cross_sections` does NOT take a resolution — broadening is applied
+/// after Beer–Lambert, not on the cross-sections. The synthesized kernel rides
+/// the *same* broadening path as a Monte-Carlo file, so the IC-vs-tabulated
+/// comparison differs only in kernel source.
+///
+/// Parameters: `alpha`/`r` are [`EnergyLaw`]s (fixed-or-fit general case),
+/// `beta` (1/µs) is the storage rate; optional `burst_sigma_us` (Gaussian) and
+/// `channel_fwhm_us` (triangle) fold in the proton-burst and chopper terms.
+#[pyclass(name = "IkedaCarpenter", skip_from_py_object)]
+#[derive(Clone)]
+struct PyIkedaCarpenter {
+    inner: Arc<IkedaCarpenter>,
+}
+
+#[pymethods]
+impl PyIkedaCarpenter {
+    #[new]
+    #[pyo3(signature = (
+        flight_path_m,
+        e_min_ev,
+        e_max_ev,
+        alpha,
+        beta,
+        r,
+        n_energies = 64,
+        n_tau = 600,
+        burst_sigma_us = None,
+        channel_fwhm_us = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        flight_path_m: f64,
+        e_min_ev: f64,
+        e_max_ev: f64,
+        alpha: PyEnergyLaw,
+        beta: f64,
+        r: PyEnergyLaw,
+        n_energies: usize,
+        n_tau: usize,
+        burst_sigma_us: Option<f64>,
+        channel_fwhm_us: Option<f64>,
+    ) -> PyResult<Self> {
+        for (name, v) in [
+            ("burst_sigma_us", burst_sigma_us),
+            ("channel_fwhm_us", channel_fwhm_us),
+        ] {
+            if let Some(x) = v {
+                if !x.is_finite() || x < 0.0 {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "{name} must be finite and >= 0, got {x}"
+                    )));
+                }
+            }
+        }
+        let params = IkedaCarpenterParams {
+            alpha: alpha.inner,
+            beta,
+            r: r.inner,
+            burst_sigma_us,
+            channel_fwhm_us,
+        };
+        let grid = SynthesisGrid {
+            e_min_ev,
+            e_max_ev,
+            n_energies,
+            n_tau,
+        };
+        let ic = IkedaCarpenter::new(params, flight_path_m, &grid)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(Self {
+            inner: Arc::new(ic),
+        })
+    }
+
+    /// The synthesized tabulated kernel — pass this anywhere a loaded
+    /// resolution file (`TabulatedResolution`) is accepted.
+    fn as_tabulated(&self) -> PyTabulatedResolution {
+        PyTabulatedResolution {
+            inner: Arc::new(self.inner.tabulated().clone()),
+        }
+    }
+
+    /// `(tof_offsets_us, weights)` kernel at a single energy (eV); offsets
+    /// ascending with the mode at 0, weights peak-normalized.
+    fn kernel_at(&self, energy_ev: f64) -> (Vec<f64>, Vec<f64>) {
+        self.inner.kernel_at(energy_ev)
+    }
+
+    /// Flight path length in meters.
+    #[getter]
+    fn flight_path_m(&self) -> f64 {
+        self.inner.flight_path_m()
+    }
+
+    /// Number of synthesized reference energies.
+    #[getter]
+    fn n_energies(&self) -> usize {
+        self.inner.ref_energies().len()
+    }
+
+    fn __repr__(&self) -> String {
+        let e = self.inner.ref_energies();
+        format!(
+            "IkedaCarpenter(n_energies={}, range=[{:.4e}, {:.4e}] eV, flight_path={:.1} m)",
+            e.len(),
+            e.first().copied().unwrap_or(0.0),
+            e.last().copied().unwrap_or(0.0),
+            self.inner.flight_path_m(),
+        )
+    }
+}
+
 /// Result of spatial (per-pixel) mapping.
 ///
 /// Numpy arrays are constructed once and cached; property access returns
@@ -947,6 +1127,256 @@ fn forward_model<'py>(
     let t = py.detach(move || transmission::forward_model(&e_owned, &sample, instrument.as_ref()));
     let t = t.map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
     Ok(PyArray1::from_vec(py, t))
+}
+
+/// Result of an instrument-resolution calibration ([`calibrate_resolution`]).
+#[pyclass(name = "ResolutionCalibration", skip_from_py_object)]
+struct PyResolutionCalibration {
+    inner: nereids_fitting::resolution_calib::CalibrationResult,
+}
+
+#[pymethods]
+impl PyResolutionCalibration {
+    /// Family label (`"gaussian"` | `"udr_corr"` | `"ic"`).
+    #[getter]
+    fn family(&self) -> String {
+        self.inner.family.clone()
+    }
+
+    /// Raw fitted parameter vector (optimizer space).
+    #[getter]
+    fn theta(&self) -> Vec<f64> {
+        self.inner.theta.clone()
+    }
+
+    /// χ²/dof of the calibration fit.
+    #[getter]
+    fn chi2(&self) -> f64 {
+        self.inner.chi2_dof
+    }
+
+    /// Whether the optimizer self-converged.
+    #[getter]
+    fn converged(&self) -> bool {
+        self.inner.converged
+    }
+
+    /// Optimizer iterations.
+    #[getter]
+    fn iterations(&self) -> usize {
+        self.inner.iterations
+    }
+
+    /// Fitted-and-discarded position nuisance (TOF zero-shift, µs). Not part of
+    /// the calibrated resolution; it makes the cross-family χ² compare shape/width
+    /// rather than the asymmetric kernels' mode→centroid position lag. A value
+    /// near ±5 µs flags a position artifact the calibrant could not reconcile.
+    #[getter]
+    fn position_nuisance_us(&self) -> f64 {
+        self.inner.position_nuisance_us
+    }
+
+    /// Decoded, human-readable fitted parameters.
+    fn params<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let d = pyo3::types::PyDict::new(py);
+        match self.inner.family.as_str() {
+            "udr_corr" => {
+                // Decode against the SAME clamp bounds the Rust optimizer used
+                // (resolution_calib::UDR_S0_MIN/MAX), not duplicated literals.
+                let s0 = self.inner.theta[0].exp().clamp(UDR_S0_MIN, UDR_S0_MAX);
+                d.set_item("s0", s0)?;
+                d.set_item("p", self.inner.theta[1])?;
+            }
+            "gaussian" => {
+                d.set_item("delta_t_us", self.inner.theta[0].abs())?;
+                d.set_item("delta_l_m", self.inner.theta[1].abs())?;
+            }
+            _ => {
+                // IC fits (a0, a1); β is held fixed (unidentifiable in the eV regime).
+                d.set_item("a0", self.inner.theta[0].abs())?;
+                d.set_item("a1", self.inner.theta[1])?;
+            }
+        }
+        Ok(d)
+    }
+
+    /// The calibrated resolution as a [`TabulatedResolution`] — pass to
+    /// `resolution=` in the fitters. `None` for the Gaussian family (use
+    /// [`Self::gaussian_params`] there).
+    fn as_tabulated(&self) -> Option<PyTabulatedResolution> {
+        match &self.inner.resolution {
+            ResolutionFunction::Tabulated(t) => Some(PyTabulatedResolution { inner: t.clone() }),
+            ResolutionFunction::IkedaCarpenter(ic) => Some(PyTabulatedResolution {
+                inner: Arc::new(ic.tabulated().clone()),
+            }),
+            ResolutionFunction::Gaussian(_) => None,
+        }
+    }
+
+    /// `(delta_t_us, delta_l_m)` for the Gaussian family; `None` otherwise.
+    fn gaussian_params(&self) -> Option<(f64, f64)> {
+        match &self.inner.resolution {
+            ResolutionFunction::Gaussian(p) => Some((p.delta_t_us(), p.delta_l_m())),
+            _ => None,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "ResolutionCalibration(family={}, chi2/dof={:.4}, converged={})",
+            self.inner.family, self.inner.chi2_dof, self.inner.converged
+        )
+    }
+}
+
+/// Calibrate instrument-resolution parameters against a known-(ρ,T) calibrant.
+///
+/// Fits the resolution parameters of `family` while holding the calibrant's
+/// density (the values in `isotopes`/`groups`) and `temperature_k` FIXED. Pin
+/// the returned resolution into a subsequent sample fit.
+///
+/// Args:
+///     energies, data, uncertainty: calibrant transmission spectrum.
+///     family: ``"gaussian"`` | ``"udr_corr"`` | ``"ic"``.
+///     isotopes / groups: known calibrant composition + density (exactly one).
+///     temperature_k: known calibrant temperature.
+///     base_udr: base UDR kernel (required for ``family="udr_corr"``).
+///     fit_background: also fit anorm + linear baseline (default anorm only).
+///     restarts: optimizer restarts (keep the best).
+///
+/// Returns:
+///     ResolutionCalibration with the fitted params, χ²/dof, and the calibrated
+///     resolution (``.as_tabulated()`` / ``.gaussian_params()``).
+#[pyfunction]
+#[pyo3(signature = (
+    energies, data, uncertainty, family, isotopes=None, groups=None,
+    temperature_k=293.6, base_udr=None, flight_path_m=25.0, fit_background=false,
+    restarts=1, ic_n_energies=64, ic_n_tau=500
+))]
+#[allow(clippy::too_many_arguments)]
+fn calibrate_resolution(
+    py: Python<'_>,
+    energies: PyReadonlyArray1<f64>,
+    data: PyReadonlyArray1<f64>,
+    uncertainty: PyReadonlyArray1<f64>,
+    family: &str,
+    isotopes: Option<Vec<(PyResonanceData, f64)>>,
+    groups: Option<Vec<(PyIsotopeGroup, f64)>>,
+    temperature_k: f64,
+    base_udr: Option<PyTabulatedResolution>,
+    flight_path_m: f64,
+    fit_background: bool,
+    restarts: usize,
+    ic_n_energies: usize,
+    ic_n_tau: usize,
+) -> PyResult<PyResolutionCalibration> {
+    if isotopes.is_some() == groups.is_some() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Provide exactly one of 'isotopes' or 'groups'.",
+        ));
+    }
+    let e = energies.as_slice()?;
+    // Reject an empty grid up front with a precise message (validate_energy_grid
+    // tolerates empty; the Rust calibrator would otherwise reject it later as a
+    // generic EmptyData). Matches the other non-empty entry points.
+    require_non_empty_energy_grid(e)?;
+    let d = data.as_slice()?;
+    let u = uncertainty.as_slice()?;
+    if d.len() != e.len() || u.len() != e.len() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "energies, data, uncertainty must have equal length",
+        ));
+    }
+
+    let sample_isotopes: Vec<(ResonanceData, f64)> = if let Some(isotopes) = isotopes {
+        isotopes
+            .into_iter()
+            .map(|(rd, thick)| (Arc::unwrap_or_clone(rd.inner), thick))
+            .collect()
+    } else {
+        let groups = groups.unwrap();
+        let mut expanded = Vec::new();
+        for (group, group_density) in &groups {
+            if !group.is_loaded() {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "IsotopeGroup '{}' has not been fully loaded. Call load_endf() first.",
+                    group.inner.name(),
+                )));
+            }
+            for (i, (_iso, ratio)) in group.inner.members().iter().enumerate() {
+                let rd = Arc::unwrap_or_clone(group.resonance_data[i].clone().unwrap());
+                expanded.push((rd, group_density * ratio));
+            }
+        }
+        expanded
+    };
+    // Validate the calibrant composition: at least one isotope with a finite,
+    // positive areal density (otherwise the calibrant has no resonances to fit
+    // the resolution against, and the optimization is degenerate).
+    if sample_isotopes.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "calibrant has no isotopes/groups; provide a known composition with densities > 0",
+        ));
+    }
+    if !sample_isotopes
+        .iter()
+        .any(|(_, d)| d.is_finite() && *d > 0.0)
+    {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "calibrant densities must include at least one finite, positive value",
+        ));
+    }
+    let sample = SampleParams::new(temperature_k, sample_isotopes)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+
+    let fam = match family {
+        "gaussian" => ResolutionFamily::Gaussian,
+        "ic" => ResolutionFamily::IkedaCarpenter,
+        "udr_corr" => {
+            let base = base_udr.ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(
+                    "family='udr_corr' requires base_udr (a TabulatedResolution).",
+                )
+            })?;
+            ResolutionFamily::UdrCorr { base: base.inner }
+        }
+        other => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown family '{other}'; expected 'gaussian', 'udr_corr', or 'ic'"
+            )));
+        }
+    };
+
+    // For family='ic' these size the kernel-synthesis grid; validate up front so an
+    // out-of-range value gives a precise error instead of the generic "no finite-χ²
+    // resolution" (every IkedaCarpenter::new eval would otherwise fail). They are
+    // inert for the gaussian/udr_corr families.
+    if matches!(fam, ResolutionFamily::IkedaCarpenter) {
+        if ic_n_energies < 2 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "ic_n_energies must be >= 2 for family='ic', got {ic_n_energies}"
+            )));
+        }
+        if ic_n_tau < 8 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "ic_n_tau must be >= 8 for family='ic', got {ic_n_tau}"
+            )));
+        }
+    }
+
+    let cfg = CalibrationConfig {
+        flight_path_m,
+        fit_background,
+        restarts,
+        ic_n_energies,
+        ic_n_tau,
+        ..Default::default()
+    };
+    let (e_owned, d_owned, u_owned) = (e.to_vec(), d.to_vec(), u.to_vec());
+    let result = py
+        .detach(move || rust_calibrate_resolution(fam, &e_owned, &d_owned, &u_owned, &sample, &cfg))
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    Ok(PyResolutionCalibration { inner: result })
 }
 
 /// Convert time-of-flight (μs) to energy (eV).
@@ -2550,10 +2980,14 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyResonanceData>()?;
     m.add_class::<PyFitResult>()?;
     m.add_class::<PyTabulatedResolution>()?;
+    m.add_class::<PyEnergyLaw>()?;
+    m.add_class::<PyIkedaCarpenter>()?;
+    m.add_class::<PyResolutionCalibration>()?;
     m.add_class::<PySpatialResult>()?;
     m.add_class::<PyTraceDetectabilityReport>()?;
     m.add_function(wrap_pyfunction!(cross_sections, m)?)?;
     m.add_function(wrap_pyfunction!(forward_model, m)?)?;
+    m.add_function(wrap_pyfunction!(calibrate_resolution, m)?)?;
     m.add_function(wrap_pyfunction!(tof_to_energy, m)?)?;
     m.add_function(wrap_pyfunction!(energy_to_tof, m)?)?;
     m.add_function(wrap_pyfunction!(load_endf, m)?)?;

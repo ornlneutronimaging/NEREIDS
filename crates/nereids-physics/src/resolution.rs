@@ -46,13 +46,18 @@ use nereids_core::constants::{DIVISION_FLOOR, NEAR_ZERO_FLOOR};
 use std::fmt;
 use std::sync::Arc;
 
-/// TOF conversion factor: t[μs] = TOF_FACTOR × L[m] / √(E[eV]).
+/// TOF conversion factor: `t (μs) = TOF_FACTOR × L (m) / √(E in eV)`.
 ///
 /// Derived from t = L / √(2E/m_n), converting to microseconds:
 ///   TOF_FACTOR = 1e6 / √(2 × EV_TO_JOULES / NEUTRON_MASS_KG)
 ///
 /// Uses CODATA 2018 values (both exact in the 2019 SI).
-const TOF_FACTOR: f64 = 72.298_254_398_292_8;
+///
+/// `pub` so the analytical [`crate::ikeda_carpenter`] model and the
+/// `nereids-fitting` resolution calibrator both use the *identical* TOF↔energy
+/// constant (the calibrator's position nuisance shifts the grid in TOF) — any
+/// drift here would make the IC-vs-tabulated cross-validation unfair.
+pub const TOF_FACTOR: f64 = 72.298_254_398_292_8;
 
 /// Errors from resolution broadening operations.
 #[derive(Debug, PartialEq)]
@@ -76,6 +81,11 @@ pub enum ResolutionError {
     /// Same semantics as [`Self::PlanGridMismatch`] but for the CSR
     /// path (see [`apply_r`]).
     MatrixGridMismatch { first_diff_index: usize },
+    /// [`TabulatedResolution::width_corrected`] was called with invalid
+    /// parameters: `s0` must be finite and `> 0`, `e_ref` finite and `> 0`,
+    /// and `p` finite. A non-positive `s0` would reverse/collapse the
+    /// (ascending) offset ordering the broadening loop assumes.
+    InvalidWidthCorrection { s0: f64, p: f64, e_ref: f64 },
 }
 
 impl fmt::Display for ResolutionError {
@@ -101,6 +111,11 @@ impl fmt::Display for ResolutionError {
                 "resolution matrix was compiled for a different energy grid than was \
                  passed to apply_resolution_with_matrix (first differing index: {})",
                 first_diff_index,
+            ),
+            Self::InvalidWidthCorrection { s0, p, e_ref } => write!(
+                f,
+                "width_corrected requires finite s0 > 0, finite e_ref > 0, and finite p; \
+                 got s0={s0}, p={p}, e_ref={e_ref}"
             ),
         }
     }
@@ -847,6 +862,89 @@ impl TabulatedResolution {
         self.flight_path_m
     }
 
+    /// Width-corrected copy of this tabulated kernel.
+    ///
+    /// Shape-preserving instrument-resolution calibration knob: each
+    /// reference-energy block's TOF offsets are scaled by
+    /// `s(E) = s0 · (E / e_ref)^p` **about the block's intensity centroid**, so
+    /// the kernel widens/narrows without moving its centroid — width and position
+    /// stay orthogonal (`t0`/`L` handle absolute position). Weights are unchanged;
+    /// the apply-time trapezoidal renormalization preserves unit area.
+    ///
+    /// The pivot is the **trapezoidal-weighted** centroid `Σ o·w·dt / Σ w·dt`,
+    /// using the *same* `dt` quadrature weights as the broadening integral (see
+    /// [`Self::broaden`]). Because `dt` is itself affine in the offsets, the width
+    /// scale multiplies every `dt` by `s`, so the integrated centroid is preserved
+    /// exactly on **any** offset grid (uniform or not) — not just on uniform grids
+    /// where the trapezoidal and plain centroids happen to coincide.
+    ///
+    /// `s0 = 1, p = 0` returns a width-identical copy. This is the fittable model
+    /// behind the `udr_corr` resolution-calibration family: it trusts the
+    /// Monte-Carlo *shape* and calibrates only its width / energy-dependence.
+    ///
+    /// # Errors
+    /// Returns [`ResolutionError::InvalidWidthCorrection`] unless `s0` is finite
+    /// and `> 0`, `e_ref` is finite and `> 0`, and `p` is finite. A non-positive
+    /// `s0` would reverse/collapse the (ascending) offset ordering the broadening
+    /// loop assumes, so it is rejected up front rather than silently clamped.
+    pub fn width_corrected(
+        &self,
+        s0: f64,
+        p: f64,
+        e_ref: f64,
+    ) -> Result<TabulatedResolution, ResolutionError> {
+        if !(s0.is_finite() && s0 > 0.0 && e_ref.is_finite() && e_ref > 0.0 && p.is_finite()) {
+            return Err(ResolutionError::InvalidWidthCorrection { s0, p, e_ref });
+        }
+        let kernels = self
+            .ref_energies
+            .iter()
+            .zip(self.kernels.iter())
+            .map(|(&e, (offsets, weights))| {
+                // The power law can overflow `s` to ±∞ for finite-but-extreme `p`;
+                // reject up front rather than build a non-finite kernel directly
+                // (which would bypass `from_kernels`' finiteness check).
+                let s = s0 * (e / e_ref).powf(p);
+                if !(s.is_finite() && s > 0.0) {
+                    return Err(ResolutionError::InvalidWidthCorrection { s0, p, e_ref });
+                }
+                // Pivot about the trapezoidal-weighted centroid (matching the
+                // `dt`-weighting in `broaden_presorted`), so the *integrated*
+                // centroid is preserved on non-uniform offset grids — not only on
+                // uniform grids where this reduces to the plain centroid.
+                let n_k = offsets.len();
+                let dt_width = |k: usize| -> f64 {
+                    if n_k <= 1 {
+                        1.0
+                    } else if k == 0 {
+                        offsets[1] - offsets[0]
+                    } else if k == n_k - 1 {
+                        offsets[k] - offsets[k - 1]
+                    } else {
+                        (offsets[k + 1] - offsets[k - 1]) * 0.5
+                    }
+                };
+                let (mut cnum, mut cden) = (0.0, 0.0);
+                for (k, (&o, &w)) in offsets.iter().zip(weights).enumerate() {
+                    let tw = w * dt_width(k).abs();
+                    cnum += o * tw;
+                    cden += tw;
+                }
+                let centroid = if cden > 0.0 { cnum / cden } else { 0.0 };
+                let scaled = offsets
+                    .iter()
+                    .map(|&o| centroid + s * (o - centroid))
+                    .collect();
+                Ok((scaled, weights.clone()))
+            })
+            .collect::<Result<Vec<_>, ResolutionError>>()?;
+        Ok(TabulatedResolution {
+            ref_energies: self.ref_energies.clone(),
+            kernels,
+            flight_path_m: self.flight_path_m,
+        })
+    }
+
     /// Kernel support at energy `e_ev`, in eV.
     ///
     /// Returns the maximum energy offset over which the tabulated
@@ -919,16 +1017,30 @@ impl TabulatedResolution {
     }
 }
 
-/// Resolution function: either analytical Gaussian or tabulated from Monte Carlo.
+/// Resolution function: analytical Gaussian, tabulated from Monte Carlo, or
+/// analytical Ikeda–Carpenter moderator model.
 ///
-/// The `Tabulated` variant wraps an `Arc` so that cloning (e.g., per-pixel in
-/// spatial mapping) is a cheap reference-count bump rather than a deep copy.
+/// The `Tabulated` and `IkedaCarpenter` variants wrap an `Arc` so that cloning
+/// (e.g., per-pixel in spatial mapping) is a cheap reference-count bump rather
+/// than a deep copy.
+///
+/// `IkedaCarpenter` synthesizes a [`TabulatedResolution`] at construction and
+/// is applied through the *same* per-call convolution path as `Tabulated`
+/// (`broaden` / `broaden_presorted` / `plan`) — only the kernel *source* differs
+/// (analytic IC pulse vs Monte-Carlo file). This keeps the three-way resolution
+/// cross-validation (Gaussian | tabulated-UDR | Ikeda–Carpenter) fair on the
+/// reference broadening path. Note: `IkedaCarpenter` does **not** opt into the
+/// spatial-map surrogate fast-paths (the scalar/cubature plans gate on
+/// `Tabulated`); it falls back to the general path, which is correct but
+/// unoptimized — see the resolution-calibration notes for the W6 follow-up.
 #[derive(Debug, Clone)]
 pub enum ResolutionFunction {
     /// Analytical Gaussian resolution from instrument parameters.
     Gaussian(ResolutionParams),
     /// Tabulated resolution from Monte Carlo instrument simulation.
     Tabulated(Arc<TabulatedResolution>),
+    /// Analytical Ikeda–Carpenter moderator resolution model.
+    IkedaCarpenter(Arc<crate::ikeda_carpenter::IkedaCarpenter>),
 }
 
 /// Pre-built resolution-broadening plan for a specific target energy grid.
@@ -1545,6 +1657,91 @@ impl TabulatedResolution {
         })
     }
 
+    /// Build a tabulated resolution directly from synthesized kernels.
+    ///
+    /// Used by the analytical [`crate::ikeda_carpenter::IkedaCarpenter`] model,
+    /// which generates `(tof_offset_µs, weight)` kernels at a set of reference
+    /// energies and then rides the exact same broadening machinery as a
+    /// Monte-Carlo file. Validates the same invariants `from_text` enforces:
+    /// non-empty + strictly ascending reference energies, one kernel per energy,
+    /// each kernel non-empty with matching offset/weight lengths, and all-finite
+    /// offsets/weights.
+    ///
+    /// # Errors
+    /// Returns [`ResolutionParseError::InvalidFormat`] if the reference
+    /// energies are empty / not strictly ascending, if the energy and kernel
+    /// counts differ, if any kernel is empty, if a kernel's offset and weight
+    /// vectors differ in length, or if any offset/weight is non-finite.
+    pub fn from_kernels(
+        ref_energies: Vec<f64>,
+        kernels: Vec<(Vec<f64>, Vec<f64>)>,
+        flight_path_m: f64,
+    ) -> Result<Self, ResolutionParseError> {
+        if ref_energies.is_empty() {
+            return Err(ResolutionParseError::InvalidFormat(
+                "No reference energies provided".into(),
+            ));
+        }
+        if ref_energies.len() != kernels.len() {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "Reference-energy count {} != kernel count {}",
+                ref_energies.len(),
+                kernels.len(),
+            )));
+        }
+        for i in 1..ref_energies.len() {
+            if ref_energies[i] <= ref_energies[i - 1] {
+                return Err(ResolutionParseError::InvalidFormat(format!(
+                    "Reference energies must be strictly ascending, but E[{}]={} <= E[{}]={}",
+                    i,
+                    ref_energies[i],
+                    i - 1,
+                    ref_energies[i - 1],
+                )));
+            }
+        }
+        for (i, (offsets, weights)) in kernels.iter().enumerate() {
+            // Reject empty kernels: an empty `(offsets, weights)` passes the
+            // length-match check (0 == 0) but later makes `broaden_presorted`
+            // accumulate `norm == 0` and silently fall back to pass-through.
+            if offsets.is_empty() {
+                return Err(ResolutionParseError::InvalidFormat(format!(
+                    "Kernel {i} is empty; each kernel needs at least one (offset, weight) point"
+                )));
+            }
+            if offsets.len() != weights.len() {
+                return Err(ResolutionParseError::InvalidFormat(format!(
+                    "Kernel {i} offset length {} != weight length {}",
+                    offsets.len(),
+                    weights.len(),
+                )));
+            }
+            // Reject non-finite synthesized kernels (e.g. a poisoned analytic
+            // pulse) so a NaN table fails loudly here rather than silently
+            // degrading the convolution to pass-through (a NaN norm bypasses the
+            // division guard in `broaden_presorted`).
+            if offsets.iter().chain(weights.iter()).any(|v| !v.is_finite()) {
+                return Err(ResolutionParseError::InvalidFormat(format!(
+                    "Kernel {i} contains non-finite offset/weight values"
+                )));
+            }
+            // Offsets must be strictly ascending: `broaden_presorted`/`plan` walk a
+            // monotonic two-pointer bracket and derive trapezoidal `dt` widths from
+            // `offsets[k+1] − offsets[k−1]`, both of which assume sorted offsets.
+            // An unsorted kernel would otherwise broaden silently-wrong, not error.
+            if !offsets.windows(2).all(|w| w[0] < w[1]) {
+                return Err(ResolutionParseError::InvalidFormat(format!(
+                    "Kernel {i} TOF offsets must be strictly ascending"
+                )));
+            }
+        }
+        Ok(TabulatedResolution {
+            ref_energies,
+            kernels,
+            flight_path_m,
+        })
+    }
+
     /// Parse a VENUS/FTS resolution file from disk.
     pub fn from_file(path: &str, flight_path_m: f64) -> Result<Self, ResolutionParseError> {
         let text = std::fs::read_to_string(path)
@@ -1930,27 +2127,42 @@ impl TabulatedResolution {
         let (off_lo, w_lo) = &self.kernels[idx];
         let (off_hi, w_hi) = &self.kernels[idx + 1];
 
-        // If both kernels have the same number of points, interpolate element-wise
-        if off_lo.len() == off_hi.len() {
+        let nearest = || -> (Vec<f64>, Vec<f64>) {
+            let k = if frac < 0.5 {
+                &self.kernels[idx]
+            } else {
+                &self.kernels[idx + 1]
+            };
+            (k.0.clone(), k.1.clone())
+        };
+
+        let (offsets, weights) = if off_lo.len() == off_hi.len() {
+            // Both kernels have the same number of points: interpolate element-wise.
             let offsets: Vec<f64> = off_lo
                 .iter()
                 .zip(off_hi.iter())
                 .map(|(&a, &b)| a + frac * (b - a))
                 .collect();
-            let weights: Vec<f64> = w_lo
-                .iter()
-                .zip(w_hi.iter())
-                .map(|(&a, &b)| a + frac * (b - a))
-                .collect();
-            (offsets, weights)
-        } else {
-            // Different sizes: use nearest
-            if frac < 0.5 {
-                self.kernels[idx].clone()
+            // A convex blend of two strictly-ascending offset arrays stays
+            // ascending; guard defensively (e.g. a degenerate input kernel) and
+            // fall back to the nearer reference rather than emit a non-monotone
+            // kernel the two-pointer broadener assumes is sorted.
+            if offsets.windows(2).all(|w| w[0] < w[1]) {
+                let weights: Vec<f64> = w_lo
+                    .iter()
+                    .zip(w_hi.iter())
+                    .map(|(&a, &b)| a + frac * (b - a))
+                    .collect();
+                (offsets, weights)
             } else {
-                self.kernels[idx + 1].clone()
+                nearest()
             }
-        }
+        } else {
+            // Different point counts: fall back to the nearer reference kernel.
+            nearest()
+        };
+
+        (offsets, weights)
     }
 }
 
@@ -1967,6 +2179,7 @@ pub fn apply_resolution(
     match resolution {
         ResolutionFunction::Gaussian(params) => resolution_broaden(energies, spectrum, params),
         ResolutionFunction::Tabulated(tab) => tab.broaden(energies, spectrum),
+        ResolutionFunction::IkedaCarpenter(ic) => ic.tabulated().broaden(energies, spectrum),
     }
 }
 
@@ -1985,13 +2198,17 @@ pub(crate) fn apply_resolution_presorted(
             resolution_broaden_presorted(energies, spectrum, params)
         }
         ResolutionFunction::Tabulated(tab) => tab.broaden_presorted(energies, spectrum),
+        ResolutionFunction::IkedaCarpenter(ic) => {
+            ic.tabulated().broaden_presorted(energies, spectrum)
+        }
     }
 }
 
 /// Build a broadening plan for `(energies, resolution)`.
 ///
-/// Returns `Some(plan)` for [`ResolutionFunction::Tabulated`] — the
-/// plan hoists the per-target TOF / kernel-interpolation / bracket
+/// Returns `Some(plan)` for [`ResolutionFunction::Tabulated`] and
+/// [`ResolutionFunction::IkedaCarpenter`] (which rides its synthesized tabulated
+/// kernel) — the plan hoists the per-target TOF / kernel-interpolation / bracket
 /// / trap-weight work that would otherwise run on every call to
 /// [`apply_resolution`].  Returns `None` for
 /// [`ResolutionFunction::Gaussian`] — the Gaussian path has no
@@ -2020,6 +2237,7 @@ pub fn build_resolution_plan(
             Ok(None)
         }
         ResolutionFunction::Tabulated(tab) => tab.plan(energies).map(Some),
+        ResolutionFunction::IkedaCarpenter(ic) => ic.tabulated().plan(energies).map(Some),
     }
 }
 
@@ -2053,7 +2271,10 @@ pub fn apply_resolution_with_plan(
     resolution: &ResolutionFunction,
 ) -> Result<Vec<f64>, ResolutionError> {
     if let Some(p) = plan
-        && matches!(resolution, ResolutionFunction::Tabulated(_))
+        && matches!(
+            resolution,
+            ResolutionFunction::Tabulated(_) | ResolutionFunction::IkedaCarpenter(_)
+        )
     {
         validate_inputs(energies, spectrum)?;
         if p.len() != energies.len() {
@@ -2315,6 +2536,225 @@ pub mod test_support {
 mod tests {
     use super::*;
     use nereids_core::constants;
+
+    fn kernel_centroid_std(offs: &[f64], wts: &[f64]) -> (f64, f64) {
+        let wsum: f64 = wts.iter().sum();
+        let c = offs.iter().zip(wts).map(|(o, w)| o * w).sum::<f64>() / wsum;
+        let var = offs
+            .iter()
+            .zip(wts)
+            .map(|(o, w)| w * (o - c).powi(2))
+            .sum::<f64>()
+            / wsum;
+        (c, var.sqrt())
+    }
+
+    #[test]
+    fn width_corrected_preserves_centroid_scales_width_and_energy_dependence() {
+        // asymmetric kernel straddling 0 (peak off-centre), two ref energies.
+        let offs = vec![-2.0, -1.0, 0.0, 1.0, 2.0, 3.0, 4.0];
+        let wts = vec![0.1, 0.3, 1.0, 0.8, 0.5, 0.3, 0.1];
+        let tab = TabulatedResolution::from_kernels(
+            vec![5.0, 50.0],
+            vec![(offs.clone(), wts.clone()), (offs.clone(), wts.clone())],
+            25.0,
+        )
+        .unwrap();
+
+        // Uniform 2.5x width scale (p=0): centroid fixed, std scales by s0, weights unchanged.
+        let s0 = 2.5;
+        let wc = tab.width_corrected(s0, 0.0, 10.0).unwrap();
+        for (orig, scaled) in tab.kernels().iter().zip(wc.kernels()) {
+            let (c0, std0) = kernel_centroid_std(&orig.0, &orig.1);
+            let (c1, std1) = kernel_centroid_std(&scaled.0, &scaled.1);
+            assert!((c0 - c1).abs() < 1e-12, "centroid moved {c0} -> {c1}");
+            assert!(
+                (std1 / std0 - s0).abs() < 1e-12,
+                "width ratio {} != {s0}",
+                std1 / std0
+            );
+        }
+        assert_eq!(
+            tab.kernels()[0].1,
+            wc.kernels()[0].1,
+            "weights must be unchanged"
+        );
+
+        // s0=1,p=0 is an exact width-identical copy.
+        let id = tab.width_corrected(1.0, 0.0, 10.0).unwrap();
+        assert_eq!(id.kernels()[0].0, tab.kernels()[0].0);
+
+        // p<0 -> higher energy is narrower (energy-dependent width).
+        let wc2 = tab.width_corrected(1.0, -0.5, 10.0).unwrap();
+        let (_, std_lo) = kernel_centroid_std(&wc2.kernels()[0].0, &wc2.kernels()[0].1); // 5 eV
+        let (_, std_hi) = kernel_centroid_std(&wc2.kernels()[1].0, &wc2.kernels()[1].1); // 50 eV
+        assert!(
+            std_hi < std_lo,
+            "p<0 should narrow higher E: {std_hi} !< {std_lo}"
+        );
+    }
+
+    #[test]
+    fn width_corrected_preserves_trapezoidal_centroid_on_nonuniform_grid() {
+        // On a NON-uniform offset grid the trapezoidal-weighted centroid (what the
+        // broadening integral actually integrates against) differs from the plain
+        // centroid. The width scale must pivot about the former, else the fitted
+        // width leaks into position. The uniform-grid test above cannot see this —
+        // there the two centroids coincide.
+        let offs = vec![-2.0, -1.5, 0.0, 0.5, 3.0]; // deliberately non-uniform
+        let wts = vec![0.2, 0.6, 1.0, 0.7, 0.2];
+        let tab =
+            TabulatedResolution::from_kernels(vec![10.0], vec![(offs.clone(), wts.clone())], 25.0)
+                .unwrap();
+
+        // Trapezoidal-weighted centroid, mirroring broaden_presorted's dt weights.
+        let trap_centroid = |o: &[f64], w: &[f64]| -> f64 {
+            let n = o.len();
+            let dt = |k: usize| -> f64 {
+                if n <= 1 {
+                    1.0
+                } else if k == 0 {
+                    o[1] - o[0]
+                } else if k == n - 1 {
+                    o[k] - o[k - 1]
+                } else {
+                    (o[k + 1] - o[k - 1]) * 0.5
+                }
+            };
+            let (mut num, mut den) = (0.0, 0.0);
+            for (k, (&oi, &wi)) in o.iter().zip(w).enumerate() {
+                let tw = wi * dt(k).abs();
+                num += oi * tw;
+                den += tw;
+            }
+            num / den
+        };
+        let plain_centroid = |o: &[f64], w: &[f64]| -> f64 {
+            o.iter().zip(w).map(|(a, b)| a * b).sum::<f64>() / w.iter().sum::<f64>()
+        };
+
+        let c_trap_before = trap_centroid(&offs, &wts);
+        // Sanity: on this grid the trapezoidal and plain centroids genuinely differ,
+        // so the test would fail under the old plain-centroid pivot.
+        assert!(
+            (c_trap_before - plain_centroid(&offs, &wts)).abs() > 1e-3,
+            "test grid not non-uniform enough"
+        );
+
+        let wc = tab.width_corrected(2.0, 0.0, 10.0).unwrap();
+        let c_trap_after = trap_centroid(&wc.kernels()[0].0, &wc.kernels()[0].1);
+        assert!(
+            (c_trap_after - c_trap_before).abs() < 1e-12,
+            "integrated centroid leaked under width scale: {c_trap_before} -> {c_trap_after}"
+        );
+    }
+
+    #[test]
+    fn width_corrected_zero_weight_block_falls_back_to_zero_pivot() {
+        // A degenerate all-zero-weight kernel has no centroid; the scale pivots
+        // about 0 rather than dividing by a zero weight sum.
+        let tab = TabulatedResolution::from_kernels(
+            vec![10.0],
+            vec![(vec![-1.0, 0.0, 2.0], vec![0.0, 0.0, 0.0])],
+            25.0,
+        )
+        .unwrap();
+        let wc = tab.width_corrected(2.0, 0.0, 10.0).unwrap();
+        assert_eq!(wc.kernels()[0].0, vec![-2.0, 0.0, 4.0]); // scaled about 0
+    }
+
+    #[test]
+    fn width_corrected_rejects_invalid_params() {
+        // Public API: invalid whole-configuration inputs must hard-error up front
+        // (not silently clamp), since a non-positive s0 reverses the offset order.
+        let tab = TabulatedResolution::from_kernels(
+            vec![10.0],
+            vec![(vec![-1.0, 0.0, 2.0], vec![0.1, 1.0, 0.1])],
+            25.0,
+        )
+        .unwrap();
+        for (s0, p, e_ref) in [
+            (0.0, 0.0, 10.0),          // s0 == 0
+            (-1.0, 0.0, 10.0),         // s0 < 0
+            (f64::NAN, 0.0, 10.0),     // s0 non-finite
+            (1.0, f64::NAN, 10.0),     // p non-finite
+            (1.0, 0.0, 0.0),           // e_ref == 0
+            (1.0, 0.0, -5.0),          // e_ref < 0
+            (1.0, 0.0, f64::INFINITY), // e_ref non-finite
+        ] {
+            assert!(
+                matches!(
+                    tab.width_corrected(s0, p, e_ref),
+                    Err(ResolutionError::InvalidWidthCorrection { .. })
+                ),
+                "expected InvalidWidthCorrection for s0={s0}, p={p}, e_ref={e_ref}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_kernels_rejects_empty_kernel() {
+        // An empty kernel passes the length-match check (0 == 0) but makes
+        // broadening silently fall back to pass-through; reject it up front.
+        let err = TabulatedResolution::from_kernels(vec![10.0], vec![(vec![], vec![])], 25.0);
+        assert!(
+            matches!(err, Err(ResolutionParseError::InvalidFormat(_))),
+            "empty kernel should be rejected, got {err:?}"
+        );
+        // A non-empty kernel still constructs fine.
+        assert!(
+            TabulatedResolution::from_kernels(vec![10.0], vec![(vec![0.0], vec![1.0])], 25.0)
+                .is_ok()
+        );
+        // Unsorted offsets are rejected — the broadener walks a monotonic two-
+        // pointer bracket and derives trapezoidal widths assuming sorted offsets.
+        let unsorted = TabulatedResolution::from_kernels(
+            vec![10.0],
+            vec![(vec![0.0, -1.0, 2.0], vec![0.2, 1.0, 0.2])],
+            25.0,
+        );
+        assert!(
+            matches!(unsorted, Err(ResolutionParseError::InvalidFormat(_))),
+            "unsorted offsets should be rejected, got {unsorted:?}"
+        );
+        // Duplicate offsets (non-strict) are also rejected.
+        let dup = TabulatedResolution::from_kernels(
+            vec![10.0],
+            vec![(vec![-1.0, 0.0, 0.0, 2.0], vec![0.1, 1.0, 1.0, 0.1])],
+            25.0,
+        );
+        assert!(matches!(dup, Err(ResolutionParseError::InvalidFormat(_))));
+    }
+
+    #[test]
+    fn interpolated_kernel_blend_stays_ascending_and_mode_anchored() {
+        // Two equal-length, mode-anchored kernels at bracketing energies (the
+        // element-wise blend path, common for IC). The blend must be strictly
+        // ascending (the sorted invariant the broadener relies on) and keep the
+        // mode at offset 0.
+        let off_lo = vec![-1.0, -0.4, 0.0, 0.6, 1.5, 3.0];
+        let off_hi = vec![-0.5, -0.2, 0.0, 0.3, 0.8, 1.6]; // narrower, same length
+        let wts = vec![0.1, 0.5, 1.0, 0.6, 0.3, 0.1]; // mode at index 2 (offset 0)
+        let tab = TabulatedResolution::from_kernels(
+            vec![5.0, 50.0],
+            vec![(off_lo, wts.clone()), (off_hi, wts.clone())],
+            25.0,
+        )
+        .unwrap();
+        let (blended, weights) = tab.interpolated_kernel(15.0); // between 5 and 50 eV
+        assert!(
+            blended.windows(2).all(|w| w[0] < w[1]),
+            "blended offsets not strictly ascending: {blended:?}"
+        );
+        let kmax = (0..weights.len())
+            .max_by(|&a, &b| weights[a].total_cmp(&weights[b]))
+            .unwrap();
+        assert!(
+            blended[kmax].abs() < 1e-9,
+            "mode not anchored at offset 0: {}",
+            blended[kmax]
+        );
+    }
 
     // ── Smoke tests for the test_support oracles (`interp_spectrum` +
     //    `broaden_presorted_reference`).  The 7+ bit-exact tests below

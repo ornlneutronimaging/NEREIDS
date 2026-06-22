@@ -1953,6 +1953,9 @@ fn kernel_margin_ev(e_ev: f64, resolution: Option<&ResolutionFunction>) -> f64 {
         None => 0.0,
         Some(ResolutionFunction::Gaussian(p)) => FIT_RANGE_MARGIN_FWHM * p.fwhm(e_ev),
         Some(ResolutionFunction::Tabulated(t)) => t.kernel_support_ev(e_ev),
+        // Ikeda–Carpenter rides its synthesized tabulated kernel, so its
+        // broadening footprint is the same exact support as a Monte-Carlo file.
+        Some(ResolutionFunction::IkedaCarpenter(ic)) => ic.tabulated().kernel_support_ev(e_ev),
     }
 }
 

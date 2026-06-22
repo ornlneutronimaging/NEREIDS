@@ -79,3 +79,25 @@ ModelJacobianResult
 # explicit background" subsection.
 # ---------------------------------------------------------------------------
 from_counts_with_nuisance
+
+# ---------------------------------------------------------------------------
+# Ikeda-Carpenter analytical resolution model + its EnergyLaw parameter
+# helper (epic #394 resolution cross-validation).  Research-stage API used
+# to adjudicate the VENUS resolution (Gaussian vs tabulated-UDR vs IC); not
+# yet part of the curated user narrative.  Move OUT of the allowlist once
+# the resolution cross-validation feature/paper lands and
+# docs/guide/src/python-api.md gains a "Resolution models" section.
+# ---------------------------------------------------------------------------
+EnergyLaw
+IkedaCarpenter
+
+# ---------------------------------------------------------------------------
+# Instrument-resolution calibration (epic #394).  calibrate_resolution() fits
+# the resolution parameters of a model family to a known-(rho,T) calibrant;
+# ResolutionCalibration is its result.  Covered by docs/guide (resolution
+# models / calibration section) + the example notebook; the pdoc reference
+# covers the signatures.  Move OUT of the allowlist if a dedicated
+# python-api.md narrative heading is added.
+# ---------------------------------------------------------------------------
+calibrate_resolution
+ResolutionCalibration

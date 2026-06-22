@@ -1,0 +1,158 @@
+# Instrument Resolution: Models and Calibration
+
+A measured resonance dip is broadened by several largely separate effects: the
+**instrument resolution** (moderator pulse + flight-path + detector timing — a
+*beamline* property), **Doppler** broadening (sample temperature), the
+**background / normalization** (the measurement), and **self-shielding /
+multiple scattering** in optically-thick (black) resonances (the sample). On a
+single spectrum these trade off — too narrow a resolution looks like too hot a
+sample — so the instrument resolution must be characterized separately and then
+held fixed when fitting unknown samples.
+
+This page covers (1) the three resolution models NEREIDS provides and (2) the
+**calibrate → pin → fit** procedure that determines the resolution from a known
+standard.
+
+## The three resolution models
+
+All three are passed to [`forward_model`](./python-api.md) and the fitters the
+same way; only the kernel *source* differs.
+
+### Gaussian (analytical)
+
+Energy-dependent Gaussian from instrument timing parameters:
+
+```python
+import numpy as np, nereids
+hf = nereids.load_endf(72, 177)              # Hf-177
+energies = np.linspace(2.0, 30.0, 2000)
+
+T = nereids.forward_model(
+    energies, [(hf, 5e-5)], temperature_k=300.0,
+    flight_path_m=25.0, delta_t_us=1.0, delta_l_m=1e-3,
+)
+```
+
+### Tabulated UDR (Monte-Carlo file)
+
+**UDR** = *User-Defined Resolution* — SAMMY's term for a numerical resolution
+function supplied as a `(time/energy, weight)` table (SAMMY manual,
+"User-Defined Numerical Resolution Function"). In NEREIDS this is a
+measured/simulated asymmetric kernel, e.g. a VENUS FTS file:
+
+```python
+udr = nereids.load_resolution("fts_bl10.txt", flight_path_m=25.0)
+T = nereids.forward_model(energies, [(hf, 5e-5)], temperature_k=300.0, resolution=udr)
+```
+
+### Ikeda–Carpenter (analytical moderator model)
+
+A physically-grounded analytic moderator pulse — `α(E)` (fast rate), `β` (slow
+storage rate), `R` (storage fraction), with optional proton-burst and channel
+terms. Build parameter laws with [`EnergyLaw`](./python-api.md), then synthesize
+the kernel:
+
+```python
+ic = nereids.IkedaCarpenter(
+    flight_path_m=25.0, e_min_ev=0.5e-3, e_max_ev=1000.0,
+    alpha=nereids.EnergyLaw.sqrt_e(0.30, 0.0),   # α(E) = 0.30·√E
+    beta=0.10,
+    r=nereids.EnergyLaw.exp_mev(25.0),           # R(E) → 0 in the eV regime
+)
+tab = ic.as_tabulated()                          # a TabulatedResolution
+T = nereids.forward_model(energies, [(hf, 5e-5)], temperature_k=300.0, resolution=tab)
+```
+
+`ic.kernel_at(energy_ev)` returns the `(tof_offsets_us, weights)` kernel at one
+energy for inspection.
+
+> **Performance note.** An `IkedaCarpenter` synthesizes its kernel table **once**
+> at construction and caches it (`as_tabulated()` just clones it). The cost to know
+> about is that IC is **not plan-cached** when fitting the `t0`/`L` energy-scale at
+> run time: unlike a loaded `TabulatedResolution`, its broadening plan is rebuilt
+> each energy-scale evaluation, so an IC run-time fit over a large grid is slower
+> than the tabulated path. Resolution *calibration* is once-per-experiment, so the
+> calibrate → pin → fit workflow is unaffected; for production spatial maps, pin
+> the calibrated kernel via `as_tabulated()` (which is plan-cached).
+
+## The calibrate → pin → fit procedure
+
+Instrument resolution and flight-path geometry are **beamline constants**;
+density, temperature, background and normalization are **per-measurement**. So:
+
+1. **Calibrate** — measure a calibrant of *known* density and temperature; fit
+   the resolution parameters with `ρ, T` fixed.
+2. **Pin** — keep the calibrated resolution; switch to the sample (same geometry).
+3. **Fit** — fit the sample `ρ` / `T` / both with the resolution pinned; re-fit
+   background and normalization per measurement.
+
+### `calibrate_resolution`
+
+```python
+cal = nereids.calibrate_resolution(
+    energies, data, uncertainty,
+    family="udr_corr",                  # "gaussian" | "udr_corr" | "ic"
+    isotopes=[(hf, 5e-5)],              # KNOWN calibrant composition + density
+    temperature_k=300.0,                # KNOWN calibrant temperature
+    base_udr=udr,                       # required for family="udr_corr"
+    restarts=2,
+)
+print(cal)                # ResolutionCalibration(family=udr_corr, chi2/dof=..., converged=...)
+print(cal.params())       # decoded fitted parameters
+calibrated = cal.as_tabulated()         # pin this into the sample fit
+```
+
+The families calibrate different knobs:
+
+| family       | fits                                  | meaning                                   |
+|--------------|---------------------------------------|-------------------------------------------|
+| `gaussian`   | `Δt, ΔL`                              | analytical Gaussian width                 |
+| `udr_corr`   | `s(E)=s0·(E/E_ref)^p` on a base UDR   | trust the MC *shape*, calibrate its width |
+| `ic`         | `α(E)=a0√E+a1` (β fixed)               | free analytic shape                       |
+
+Use `.as_tabulated()` for `udr_corr` / `ic` (a `TabulatedResolution` to pass as
+`resolution=`); use `.gaussian_params()` → `(delta_t_us, delta_l_m)` for the
+Gaussian family.
+
+### Pin and fit the sample
+
+```python
+fit = nereids.fit_spectrum_typed(
+    sample_T, sample_unc, energies, [(hf, 1e-4)],
+    temperature_k=300.0, fit_temperature=True,   # recover ρ and T
+    resolution=calibrated,                        # PINNED
+)
+print(fit.densities, fit.temperature_k, fit.reduced_chi_squared)
+```
+
+## Choosing a calibrant (important)
+
+The fit absorbs *every* unmodeled broadening into the "resolution", so a poor
+calibrant yields a contaminated, non-transferable result:
+
+- **Use non-black resonances** (`T_min ≈ 0.2–0.8`). Geometric thinness is not
+  enough — at a strong resonance the cross-section is thousands of barns, so even
+  a thin foil is optically thick at the peak and its self-shielding / multiple
+  scattering would be soaked into the "resolution".
+- **Model the background / normalization** during calibration (`fit_background=True`),
+  then re-fit it per sample (it does not transfer).
+- **Same geometry** for calibrant and sample (flight path, sample-to-detector).
+
+## Guidance
+
+- **Density / isotopic characterization** is robust to the resolution-model
+  choice; **temperature** is sensitive — calibrate carefully before trusting a
+  fitted temperature.
+- **The cross-family χ² compares shape/width fairly.** The `ic` kernel anchors its
+  *mode* at zero offset, so a right-skewed pulse's centroid lags by ~1/α(E),
+  shifting a broadened dip's apparent energy (order 1e-2 eV in the eV regime). To
+  keep the model-selection χ² from penalizing the asymmetric families on this
+  position artifact, `calibrate_resolution` fits **and discards** a small per-family
+  *position nuisance* (a TOF shift; reported as
+  `ResolutionCalibration.position_nuisance_us`), so each family's χ² reflects
+  shape/width only. (The `udr_corr` width correction is itself centroid-preserving;
+  the symmetric `gaussian` has no lag.) The nuisance is *not* part of the
+  calibrated resolution — it pins at the calibrant's real, fixed geometry; recover
+  the sample's absolute position by fitting `t0`/`L` on the sample.
+- A worked end-to-end example (build the models, calibrate, pin, fit) is in
+  `examples/notebooks/workflows/06_resolution_calibration.ipynb`.

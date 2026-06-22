@@ -66,6 +66,7 @@ End-to-end analysis recipes combining multiple building blocks.
 | 3 | [Forward Model](workflows/03_forward_model_demo.ipynb) | Complete forward-modeling pipeline from ENDF data to synthetic spectra |
 | 4 | [Spatial Mapping (Synthetic)](workflows/04_spatial_mapping_synthetic.ipynb) | Per-pixel isotopic composition mapping on a synthetic phantom |
 | 5 | [Group Fitting](workflows/05_group_fitting.ipynb) | Constrained isotope group fitting — leverage natural abundance ratios |
+| 6 | [Resolution Calibration](workflows/06_resolution_calibration.ipynb) | Calibrate the instrument resolution on a known standard, pin it, then fit a sample |
 
 ## Tier 4: Applications
 

@@ -224,6 +224,127 @@ class TabulatedResolution:
         """Number of points per kernel."""
         ...
 
+class EnergyLaw:
+    """Energy-dependence law for an Ikeda-Carpenter parameter.
+
+    Build via the static constructors; pass to :class:`IkedaCarpenter`.
+    """
+
+    @staticmethod
+    def const(value: float) -> EnergyLaw:
+        """Energy-independent constant value."""
+        ...
+
+    @staticmethod
+    def sqrt_e(a0: float, a1: float) -> EnergyLaw:
+        """``a0*sqrt(E[eV]) + a1`` — leading epithermal scaling of alpha(E)."""
+        ...
+
+    @staticmethod
+    def inverse_lambda(a0: float, a1: float) -> EnergyLaw:
+        """Mantid IC form ``1/(a0 + a1*lambda)`` (alpha ~ sqrt(E) low-E)."""
+        ...
+
+    @staticmethod
+    def exp_mev(kappa: float) -> EnergyLaw:
+        """``exp(-E[meV]/kappa)`` — storage fraction R(E), ->0 in the eV regime."""
+        ...
+
+    def eval(self, energy_ev: float) -> float:
+        """Evaluate the law at ``energy_ev`` (eV)."""
+        ...
+
+class IkedaCarpenter:
+    """Analytical Ikeda-Carpenter instrument-resolution model.
+
+    Synthesizes a dense tabulated kernel at construction; pass
+    :meth:`as_tabulated` anywhere a loaded resolution file is accepted
+    (``forward_model``, ``fit_spectrum_typed``, ``calibrate_resolution``).
+    Note ``precompute_cross_sections`` does NOT take a resolution -- broadening
+    is applied after Beer-Lambert, not on the cross-sections.
+    """
+
+    def __init__(
+        self,
+        flight_path_m: float,
+        e_min_ev: float,
+        e_max_ev: float,
+        alpha: EnergyLaw,
+        beta: float,
+        r: EnergyLaw,
+        n_energies: int = 64,
+        n_tau: int = 600,
+        burst_sigma_us: float | None = None,
+        channel_fwhm_us: float | None = None,
+    ) -> None: ...
+    def as_tabulated(self) -> TabulatedResolution:
+        """The synthesized tabulated kernel (usable as a resolution file)."""
+        ...
+
+    def kernel_at(self, energy_ev: float) -> tuple[list[float], list[float]]:
+        """``(tof_offsets_us, weights)`` at one energy; mode at offset 0."""
+        ...
+
+    @property
+    def flight_path_m(self) -> float:
+        """Flight path length in meters."""
+        ...
+
+    @property
+    def n_energies(self) -> int:
+        """Number of synthesized reference energies."""
+        ...
+
+class ResolutionCalibration:
+    """Result of :func:`calibrate_resolution`."""
+
+    @property
+    def family(self) -> str:
+        """Resolution-model family (``"gaussian"`` | ``"udr_corr"`` | ``"ic"``)."""
+        ...
+
+    @property
+    def theta(self) -> list[float]:
+        """Raw fitted parameter vector (optimizer space)."""
+        ...
+
+    @property
+    def chi2(self) -> float:
+        """chi-squared per degree of freedom of the calibration fit."""
+        ...
+
+    @property
+    def converged(self) -> bool:
+        """Whether the optimizer self-converged."""
+        ...
+
+    @property
+    def iterations(self) -> int:
+        """Optimizer iterations."""
+        ...
+
+    @property
+    def position_nuisance_us(self) -> float:
+        """Fitted-and-discarded position nuisance (TOF zero-shift, µs). Not part
+        of the calibrated resolution; it makes the cross-family chi-squared compare
+        shape/width rather than the asymmetric kernels' mode-to-centroid position
+        lag. A value near +/-5 us flags a position artifact the calibrant could
+        not reconcile."""
+        ...
+
+    def params(self) -> dict[str, float]:
+        """Decoded, human-readable fitted parameters."""
+        ...
+
+    def as_tabulated(self) -> TabulatedResolution | None:
+        """The calibrated resolution as a kernel to pin into a fit
+        (``udr_corr`` / ``ic``); ``None`` for the Gaussian family."""
+        ...
+
+    def gaussian_params(self) -> tuple[float, float] | None:
+        """``(delta_t_us, delta_l_m)`` for the Gaussian family; ``None`` otherwise."""
+        ...
+
 class SpatialResult:
     """Result of per-pixel spatial mapping (LM fitter)."""
 
@@ -464,6 +585,31 @@ def forward_model(
     Either ``isotopes`` or ``groups`` must be provided, but not both.
     When ``groups`` is provided, each group is expanded into its members
     with effective densities = group_density * member_ratio.
+    """
+    ...
+
+def calibrate_resolution(
+    energies: NDArray[np.float64],
+    data: NDArray[np.float64],
+    uncertainty: NDArray[np.float64],
+    family: str,
+    isotopes: list[tuple[ResonanceData, float]] | None = None,
+    groups: list[tuple[IsotopeGroup, float]] | None = None,
+    temperature_k: float = 293.6,
+    base_udr: TabulatedResolution | None = None,
+    flight_path_m: float = 25.0,
+    fit_background: bool = False,
+    restarts: int = 1,
+    ic_n_energies: int = 64,
+    ic_n_tau: int = 500,
+) -> ResolutionCalibration:
+    """Calibrate instrument-resolution parameters against a known-(rho,T) calibrant.
+
+    Fits the resolution parameters of ``family`` (``"gaussian"`` | ``"udr_corr"``
+    | ``"ic"``) while holding the calibrant density (in ``isotopes``/``groups``)
+    and ``temperature_k`` fixed. ``base_udr`` is required for ``"udr_corr"``.
+    Pin the returned resolution into a sample fit via ``.as_tabulated()`` (or
+    ``.gaussian_params()`` for the Gaussian family).
     """
     ...
 
